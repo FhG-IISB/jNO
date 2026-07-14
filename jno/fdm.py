@@ -17,11 +17,19 @@ u(xi, yi) - u0])`` authored with ``u = domain.unknown()`` exactly as ``jno.fem([
 initial condition is *found from the constraints* (never a config flag) and ``t_span``/step-count are
 inferred from ``domain.time`` — and a low-level **function form** (:class:`FDMSystem`).
 
-v1 scope: scalar, 2-D triangular mesh, and **any mix** of steady boundary conditions — Dirichlet
-``u(region) - g``, and **any flux BC affine in the normal derivative** ``∂u/∂n`` written with that
-edge's boundary tags: Neumann ``ur.d(n) - h``, Robin ``ur.d(n) + α(u - u∞)``, a coordinate-coefficient
-``κ(x)·ur.d(n)``, either sign (``ur = u.bind(x=xr, y=yr)``, ``n = domain.variable(region, normals=True)``;
-corner nodes fall back to the PDE residual). Plus **transient** problems by method-of-lines (``M = I``;
+Scope: scalar fields on a **2-D triangular or 3-D tetrahedral mesh**. The interior operators
+(``jno.fdm.laplacian`` / ``jno.fdm.gradient``, and the constraint-list ``u.d2(x)+u.d2(y)+u.d2(z)``
+authoring) dispatch on ``domain.dimension``; the default ``cotangent`` Laplacian is the cotangent-weight
+operator in 2-D and its exact analogue, the **P1 tetrahedral finite-element** Laplace-Beltrami operator,
+in 3-D (symmetric, second-order for the solve; ``gradient_of_gradient`` is the first-order local
+alternative). **Any mix** of steady boundary conditions — Dirichlet ``u(region) - g``, and **any flux BC
+affine in the normal derivative** ``∂u/∂n`` written with that region's boundary tags: Neumann
+``ur.d(n) - h``, Robin ``ur.d(n) + α(u - u∞)``, a coordinate-coefficient ``κ(x)·ur.d(n)``, either sign
+(``ur = u.bind(x=xr, y=yr[, z=zr])``, ``n = domain.variable(region, normals=True)``). Flux normals come
+from the mesh boundary **segments in 2-D** (a corner node — undefined normal — falls back to the PDE
+residual) and boundary **faces in 3-D** (each oriented outward exactly via its owning tet's apex, so a
+flat face gives an exact axis normal, no corner heuristic). Plus **transient** problems by
+method-of-lines (``M = I``;
 a unit-coefficient ``u.t`` term, e.g. ``ui.t - νΔu``) — all with linear + nonlinear residuals. Transient
 flux BCs, periodic, a general ``u.t`` mass coefficient, and a structured-grid stencil backend are planned
 extensions (see ``plans/fdm-solver.md``). A pure-Neumann problem (no Dirichlet node) is singular
@@ -40,27 +48,44 @@ __all__ = ["fdm", "laplacian", "gradient"]
 
 
 def _mesh(domain):
+    """``(points, cells)`` for the domain — 2-D triangles or 3-D tetrahedra, dispatched on
+    ``domain.dimension``. 1-D is not exposed here (``jno.fdm`` is a 2-D/3-D collocation solver)."""
     mc = domain.mesh_connectivity
     dim = int(getattr(domain, "dimension", 2))
     pts = jnp.asarray(np.asarray(mc["points"])[:, :dim])
-    if dim != 2:
-        raise NotImplementedError("jno.fdm: only 2-D triangular meshes are supported in v1.")
-    return pts, jnp.asarray(mc["triangles"])
+    if dim == 2:
+        return pts, jnp.asarray(mc["triangles"])
+    if dim == 3:
+        return pts, jnp.asarray(mc["tetrahedra"])
+    raise NotImplementedError("jno.fdm: only 2-D triangular and 3-D tetrahedral meshes are supported.")
 
 
 def laplacian(u, domain, method: str = "cotangent"):
-    """FD Laplacian ``Δu`` of the nodal field ``u`` on the domain's mesh. ``method="cotangent"``
-    (symmetric, accurate — CG-compatible) or ``"gradient_of_gradient"`` / ``"lsq_of_gradient"``."""
-    pts, tris = _mesh(domain)
-    return _D.compute_fd_laplacian_2d_simple(u, pts, tris, dims=(0, 1), method=method)
+    """FD Laplacian ``Δu`` of the nodal field ``u`` on the domain's mesh. ``method="cotangent"`` (the
+    default) is the symmetric, CG-compatible Laplace–Beltrami stencil — the cotangent-weight operator on
+    a 2-D triangular mesh and its exact analogue, the **P1 tetrahedral finite-element** operator, on a
+    3-D tet mesh (second-order for the Galerkin solve). ``"gradient_of_gradient"`` (first-order double
+    difference) and ``"lsq_of_gradient"`` are the local alternatives; ``"lsq_of_gradient"`` is unstable
+    for the *second* derivative on tetrahedra (nested least-squares amplifies) and is not recommended in
+    3-D."""
+    pts, cells = _mesh(domain)
+    dim = int(getattr(domain, "dimension", 2))
+    if dim == 3:
+        return _D.compute_fd_laplacian_3d_simple(u, pts, cells, dims=(0, 1, 2), method=method)
+    return _D.compute_fd_laplacian_2d_simple(u, pts, cells, dims=(0, 1), method=method)
 
 
 def gradient(u, domain, method: str = "area_weighted"):
-    """FD gradient ``∇u`` of the nodal field ``u`` — shape ``(N, 2)``. ``method`` selects the stencil
-    (``"area_weighted"`` default, ``"uniform"``, ``"inverse_distance"``, ``"least_squares"``)."""
-    pts, tris = _mesh(domain)
-    gx = _D.compute_fd_gradient_2d_simple(u, pts, tris, 0, method=method)
-    gy = _D.compute_fd_gradient_2d_simple(u, pts, tris, 1, method=method)
+    """FD gradient ``∇u`` of the nodal field ``u`` — shape ``(N, dim)``. ``method`` selects the stencil
+    (``"area_weighted"`` default, ``"uniform"``, ``"inverse_distance"``, ``"least_squares"``); the same
+    names apply on a 2-D triangular or 3-D tetrahedral mesh."""
+    pts, cells = _mesh(domain)
+    dim = int(getattr(domain, "dimension", 2))
+    if dim == 3:
+        comps = [_D.compute_fd_gradient_3d_simple(u, pts, cells, d, method=method) for d in range(3)]
+        return jnp.stack(comps, axis=1)
+    gx = _D.compute_fd_gradient_2d_simple(u, pts, cells, 0, method=method)
+    gy = _D.compute_fd_gradient_2d_simple(u, pts, cells, 1, method=method)
     return jnp.stack([gx, gy], axis=1)
 
 
@@ -231,17 +256,20 @@ def _has_unknown_derivative(node, unknown):
 
 
 def _mesh_nodes_in(pts, geom):
-    """Indices of the mesh nodes ``pts`` inside a shapely region ``geom`` — resolves a geometric region
-    (registered via ``domain.region(name, geom)``) to a node subset for pinning/solving on a subdomain."""
-    from shapely.geometry import Point
+    """Indices of the mesh nodes ``pts`` inside a geometric region ``geom`` (registered via
+    ``domain.region(name, region)``) — resolves the region to a node subset for pinning/solving on a
+    subdomain. A ``jno.Shape`` uses the analytic, shapely-free :meth:`Shape.contains` (2-D and 3-D — the
+    primary path); a shapely geometry falls back to shapely (2-D mesh-conforming regions in
+    ``polygon_domain``, which stay shapely by scope)."""
+    from .geometry import Shape
 
-    g = geom.buffer(1e-9)
-    try:  # vectorized fast path (shapely >= 2.0.2), fall back to per-point containment
+    p = np.asarray(pts)
+    if isinstance(geom, Shape):
+        mask = np.asarray(geom.contains(p[:, : geom.dim]))
+    else:
         import shapely
 
-        mask = np.asarray(shapely.contains_xy(g, np.asarray(pts)[:, 0], np.asarray(pts)[:, 1]))
-    except (ImportError, AttributeError):
-        mask = np.array([g.contains(Point(float(q[0]), float(q[1]))) for q in np.asarray(pts)])
+        mask = np.asarray(shapely.contains_xy(geom.buffer(1e-9), p[:, 0], p[:, 1]))
     return np.nonzero(mask)[0].astype(int)
 
 
@@ -500,19 +528,25 @@ class _TraceFDM:
         return rows
 
     def _node_normals(self, region):
-        """Unit outward normals for the **smooth-edge** nodes of ``region``, aligned to those nodes.
+        """Unit outward normals for the flux nodes of ``region``, aligned to those nodes.
 
-        Computed from the mesh **boundary segments** (``mesh_connectivity["boundary_edges"]``): each
-        segment's exact perpendicular is averaged over the (two) segments meeting at a node, so an
+        **2-D** — computed from the mesh **boundary segments** (``mesh_connectivity["boundary_edges"]``):
+        each segment's exact perpendicular is averaged over the (two) segments meeting at a node, so an
         axis-aligned edge yields an exact ``(±1, 0)`` / ``(0, ±1)`` — much cleaner than the domain's
         smoothed per-point normal, which bleeds a tangential component near corners and would spoil the
-        flux. Outward orientation is taken (sign only) from ``domain.variable(region, normals=True)``.
-
-        A **corner** node averages two differently-oriented segment normals, so the averaged magnitude
+        flux. Outward orientation is taken (sign only) from ``domain.variable(region, normals=True)``. A
+        **corner** node averages two differently-oriented segment normals, so the averaged magnitude
         drops (≈0.71 at a right angle): the outward normal is undefined there, so corners are **dropped**
         from the flux row and keep their interior PDE residual (give a corner an explicit Dirichlet
-        condition if it needs one). Returns ``(kept_node_indices, unit_n)``."""
+        condition if it needs one).
+
+        **3-D** — see :meth:`_node_normals_3d`: the region's boundary triangles are oriented outward
+        exactly via each face's owning-tet apex, so no corner heuristic is needed.
+
+        Returns ``(kept_node_indices, unit_n)``."""
         dim = self.domain.dimension
+        if dim == 3:
+            return self._node_normals_3d(region)
         pts = np.asarray(self._pts)
         edges = np.asarray(self.domain.mesh_connectivity["boundary_edges"], dtype=int)  # (E, 2) node pairs
         tang = pts[edges[:, 1]] - pts[edges[:, 0]]
@@ -539,6 +573,28 @@ class _TraceFDM:
         idx, raw = idx[smooth], raw[smooth]
         n = raw / (np.linalg.norm(raw, axis=1, keepdims=True) + 1e-30)
         return idx, jnp.asarray(n)
+
+    def _node_normals_3d(self, region):
+        """Outward unit normals for the boundary-face nodes of ``region`` on a **tetrahedral** mesh.
+
+        The region's boundary triangles — the mesh boundary faces (a face shared by exactly one tet)
+        whose three vertices are all tagged ``region`` — are extracted from the tet connectivity
+        (:meth:`MeshUtils._boundary_faces_with_apex`). Each face normal is oriented outward **exactly**
+        via its owning tet's apex, then area-weighted and averaged per node
+        (:meth:`MeshUtils._compute_normals_from_boundary_faces`), so a flat face gives an exact axis
+        normal and a curved region an accurate one. Restricting to the region's **own** faces keeps a
+        region-edge node's normal consistent (all contributing faces are coplanar for a flat face), so —
+        unlike the 2-D path — no corner-dropping is needed. Returns ``(node_indices, unit_n)``."""
+        from .domain.mesh_utils import MeshUtils
+
+        pts = np.asarray(self._pts)
+        tets = np.asarray(self.domain.mesh_connectivity["tetrahedra"], dtype=int)
+        bfaces, bapex = MeshUtils._boundary_faces_with_apex(tets)
+        region_nodes = np.asarray(self._region_nodes(region), dtype=int)
+        on_region = np.isin(bfaces, region_nodes).all(axis=1)  # a face lies on the region ⟺ all 3 verts tagged
+        rfaces, rapex = bfaces[on_region], bapex[on_region]
+        n, idx = MeshUtils._compute_normals_from_boundary_faces(pts, rfaces, apex_points=pts[rapex])
+        return np.asarray(idx, dtype=int), jnp.asarray(n)
 
     def _flux_value_fn(self, constraint, val, extra_params=None):
         """Evaluate the flux constraint over ALL nodes with the normal derivative ``∂u/∂n`` pinned to the
@@ -634,8 +690,8 @@ class _TraceFDM:
         def residual_with_bc(u):
             r = residual_fn(u)
             # Flux rows first (`a·(∇u·n) + b`, with a = F(1)-F(0), b = F(0) — Neumann/Robin/etc.), then
-            # Dirichlet: a node shared by both (a corner touching a Dirichlet edge) resolves to the
-            # essential Dirichlet value.
+            # Dirichlet: a node carrying both (a 2-D corner, or a 3-D edge where a flux face meets a
+            # Dirichlet face) resolves to the essential Dirichlet value — the Dirichlet row is set last.
             for idx, nrm, method, v0, v1 in flux_rows:
                 grad = gradient(u, self.domain, method=method)  # (N, 2), differentiable
                 flux = jnp.sum(grad[idx] * nrm, axis=1)  # ∇u·n at the edge nodes

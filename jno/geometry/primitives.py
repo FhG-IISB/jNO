@@ -25,6 +25,8 @@ import math
 from dataclasses import dataclass
 from typing import ClassVar, Optional, Tuple
 
+import numpy as np
+
 # How close a boundary point must be to an analytic curve/surface to lie "on" it.
 TOL = 1e-6
 
@@ -53,6 +55,11 @@ class Rect:
             return "top"
         return None
 
+    def contains(self, pts, tol: float = TOL):
+        """Boolean mask (N,) — which rows of ``pts`` (N, ≥2) lie inside, inclusive within ``tol``."""
+        x, y = pts[:, 0], pts[:, 1]
+        return (x >= self.x0 - tol) & (x <= self.x1 + tol) & (y >= self.y0 - tol) & (y <= self.y1 + tol)
+
 
 @dataclass(frozen=True)
 class Disk:
@@ -70,6 +77,10 @@ class Disk:
         if abs(math.hypot(x - self.cx, y - self.cy) - self.r) < tol:
             return "arc"
         return None
+
+    def contains(self, pts, tol: float = TOL):
+        """Boolean mask (N,) — which rows of ``pts`` (N, ≥2) lie inside, inclusive within ``tol``."""
+        return (pts[:, 0] - self.cx) ** 2 + (pts[:, 1] - self.cy) ** 2 <= (self.r + tol) ** 2
 
 
 @dataclass(frozen=True)
@@ -105,6 +116,18 @@ class Box:
             return "top"
         return None
 
+    def contains(self, pts, tol: float = TOL):
+        """Boolean mask (N,) — which rows of ``pts`` (N, ≥3) lie inside, inclusive within ``tol``."""
+        x, y, z = pts[:, 0], pts[:, 1], pts[:, 2]
+        return (
+            (x >= self.x0 - tol)
+            & (x <= self.x1 + tol)
+            & (y >= self.y0 - tol)
+            & (y <= self.y1 + tol)
+            & (z >= self.z0 - tol)
+            & (z <= self.z1 + tol)
+        )
+
 
 @dataclass(frozen=True)
 class Polygon:
@@ -137,6 +160,22 @@ class Polygon:
                 if -tol <= t <= 1.0 + tol:
                     return f"e{i}"
         return None
+
+    def contains(self, pts, tol: float = TOL):
+        """Boolean mask (N,) — inside test by the even-odd crossing rule (ray-cast). Edge-exact points
+        are ambiguous (the crossing rule is exclusive on edges); ``tol`` is unused here."""
+        x, y = pts[:, 0], pts[:, 1]
+        verts = self.points
+        n = len(verts)
+        inside = np.zeros(x.shape, dtype=bool)
+        j = n - 1
+        for i in range(n):
+            xi, yi = verts[i]
+            xj, yj = verts[j]
+            crosses = ((yi > y) != (yj > y)) & (x < (xj - xi) * (y - yi) / (yj - yi + 1e-30) + xi)
+            inside ^= crosses
+            j = i
+        return inside
 
 
 @dataclass(frozen=True)
@@ -172,6 +211,16 @@ class Cylinder:
             return "side"
         return None
 
+    def contains(self, pts, tol: float = TOL):
+        """Boolean mask (N,) — inside the axial extent [0, |axis|] and within radius ``r`` (± ``tol``)."""
+        axis = np.array([self.dx, self.dy, self.dz])
+        alen = float(np.linalg.norm(axis))
+        u = axis / alen
+        w = pts[:, :3] - np.array([self.x, self.y, self.z])
+        t = w @ u
+        perp2 = np.sum(w * w, axis=1) - t * t
+        return (t >= -tol) & (t <= alen + tol) & (perp2 <= (self.r + tol) ** 2)
+
 
 @dataclass(frozen=True)
 class Sphere:
@@ -190,6 +239,11 @@ class Sphere:
         if abs(math.sqrt((x - self.cx) ** 2 + (y - self.cy) ** 2 + (z - self.cz) ** 2) - self.r) < tol:
             return "surface"
         return None
+
+    def contains(self, pts, tol: float = TOL):
+        """Boolean mask (N,) — which rows of ``pts`` (N, ≥3) lie inside, inclusive within ``tol``."""
+        c = np.array([self.cx, self.cy, self.cz])
+        return np.sum((pts[:, :3] - c) ** 2, axis=1) <= (self.r + tol) ** 2
 
 
 def _on_line(a, b, x, y, tol):

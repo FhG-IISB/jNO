@@ -28,16 +28,19 @@ import numpy as np
 
 
 def _region_mask(pts, geom):
-    """Boolean mask of points ``pts`` inside a shapely region ``geom`` (used for nodes and element centroids)."""
-    from shapely.geometry import Point
+    """Boolean mask of points ``pts`` inside a region ``geom`` (nodes or element centroids). A
+    ``jno.Shape`` is tested by the analytic, shapely-free :meth:`Shape.contains` (2-D and 3-D alike — the
+    primary, 3-D-capable path). A shapely geometry falls back to shapely containment; that path survives
+    only for 2-D regions whose mesh is conformed to the region in ``polygon_domain`` (interface /
+    partition tags), which stays shapely by scope."""
+    from jno.geometry import Shape
 
-    g = geom.buffer(1e-9)
-    try:
-        import shapely  # vectorized (shapely >= 2.0.2)
+    p = np.asarray(pts)
+    if isinstance(geom, Shape):
+        return np.asarray(geom.contains(p[:, : geom.dim]))
+    import shapely
 
-        return np.asarray(shapely.contains_xy(g, np.asarray(pts)[:, 0], np.asarray(pts)[:, 1]))
-    except (ImportError, AttributeError):
-        return np.array([g.contains(Point(float(q[0]), float(q[1]))) for q in np.asarray(pts)])
+    return np.asarray(shapely.contains_xy(geom.buffer(1e-9), p[:, 0], p[:, 1]))
 
 
 def _element_partition(pts, tris, geom0):
@@ -73,8 +76,6 @@ def _interface_edge_lengths(pts, tris, gamma):
 def _interface_normal(pts, gamma, into_geom):
     """Unit normal of the (straight) interface line, oriented to point INTO ``into_geom`` (the Neumann
     region). This is the Dirichlet region's outward normal — the direction of the flux it exports."""
-    from shapely.geometry import Point
-
     P = pts[gamma]
     c = P.mean(0)
     if len(gamma) >= 2:
@@ -84,7 +85,8 @@ def _interface_normal(pts, gamma, into_geom):
     else:
         nrm = np.array([1.0, 0.0])
     nrm = nrm / (np.linalg.norm(nrm) + 1e-30)
-    if not into_geom.buffer(1e-9).contains(Point(float(c[0] + 1e-3 * nrm[0]), float(c[1] + 1e-3 * nrm[1]))):
+    probe = np.array([[c[0] + 1e-3 * nrm[0], c[1] + 1e-3 * nrm[1]]])  # a hair into the normal direction
+    if not bool(_region_mask(probe, into_geom)[0]):
         nrm = -nrm
     return nrm
 
@@ -498,8 +500,15 @@ class _Coupled:
         Dirichlet-Neumann vs overlapping Schwarz) is inferred from whether the regions overlap."""
         probs = [p for p, _ in self._subdomains]
         geoms = [g for _, g in self._subdomains]
-        inter = geoms[0].intersection(geoms[1])
-        if float(getattr(inter, "area", 0.0)) > 1e-12:
+        # Overlap vs. single-interface (line-DN) is decided on element CENTROIDS, not nodes: a centroid
+        # never lands exactly on a shared interface line, so a centroid in BOTH regions means a genuine
+        # 2-D overlap band. (Interface nodes lie in both regions under inclusive containment, so a
+        # node-based test would misread a clean partition as an overlap.)
+        dom = probs[0].domain
+        pts = np.asarray(dom.mesh_connectivity["points"])[:, : int(getattr(dom, "dimension", 2))]
+        cells = np.asarray(dom.mesh_connectivity["triangles"])
+        cent = pts[cells].mean(1)
+        if int(np.count_nonzero(_region_mask(cent, geoms[0]) & _region_mask(cent, geoms[1]))) > 0:
             return self._solve_overlap(probs, geoms, tol=tol, max_iter=max_iter, return_info=return_info)
         return self._solve_line(probs, geoms, tol=tol, max_iter=max_iter, return_info=return_info)
 
@@ -609,7 +618,8 @@ def couple(subdomains, interface_conditions=None):
 
     ``subdomains``: a list of ``(problem, region)`` pairs, where ``problem`` is a subdomain solve
     (``jno.fdm([...])`` / ``jno.fem([...])``) authored with its PDE + outer boundary conditions, and
-    ``region`` is the shapely geometry it owns. ``interface_conditions``: optional residuals declaring the
+    ``region`` is the ``jno.Shape`` it owns (resolved to a node subset by ``Shape.contains``, no shapely).
+    ``interface_conditions``: optional residuals declaring the
     coupling in jNO syntax (value ``uA(iface)-uB(iface)`` / flux ``k*uA.d(n)-...`` on an ``interface_*``
     tag). The interface is inferred from the regions: a single line (partitioning tags) is coupled by
     Dirichlet-Neumann, an overlap by Schwarz.

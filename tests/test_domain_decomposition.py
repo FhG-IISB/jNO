@@ -399,6 +399,7 @@ def test_couple_driver_reproduces_monolithic():
 
     b1, b2 = box(0.0, 0.0, 0.6, 1.0), box(0.4, 0.0, 1.0, 1.0)
     d = jno.domain(b1.union(b2), mesh_size=0.06)
+    sA, sB = jno.Shape.rect(0.0, 0.0, 0.6, 1.0), jno.Shape.rect(0.4, 0.0, 1.0, 1.0)
     p = np.asarray(d.mesh_connectivity["points"])[:, :2]
     exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
     x, y, _ = d.variable("interior", split=True)
@@ -411,7 +412,7 @@ def test_couple_driver_reproduces_monolithic():
     b = jno.fdm([-ui.d2(x) - ui.d2(y) - f, u(xb, yb) - 0.0])
     mono = np.asarray(jno.fdm([-ui.d2(x) - ui.d2(y) - f, u(xb, yb) - 0.0]).solve()).reshape(-1)
 
-    sol, info = couple([(a, b1), (b, b2)]).solve(tol=1e-7, max_iter=60, return_info=True)
+    sol, info = couple([(a, sA), (b, sB)]).solve(tol=1e-7, max_iter=60, return_info=True)
     assert info["overlap_jump"] < 1e-6, f"driver did not converge: {info}"
     equiv = float(np.linalg.norm(np.asarray(sol) - mono) / np.linalg.norm(mono))
     assert equiv < 1e-5, f"coupled driver must reproduce the monolithic solve, got {equiv:.2e}"
@@ -573,6 +574,7 @@ def test_material_interface_via_overlap_and_kx():
     a, b = 2 * kR / (kL + kR), 2 * kL / (kL + kR)  # analytic slopes: u = 1-a·x (left), u = b·(1-x) (right)
     boxA, boxB = box(0.0, 0.0, 0.6, 1.0), box(0.5, 0.0, 1.0, 1.0)  # FEM covers the jump; overlap [0.5,0.6] uniform kR
     d = jno.domain(boxA.union(boxB), mesh_size=0.05)
+    sA, sB = jno.Shape.rect(0.0, 0.0, 0.6, 1.0), jno.Shape.rect(0.5, 0.0, 1.0, 1.0)
     p = np.asarray(d.mesh_connectivity["points"])[:, :2]
     on = np.abs(p[:, 0] - 0.5) < 1e-6
 
@@ -590,7 +592,7 @@ def test_material_interface_via_overlap_and_kx():
     uiB = u.bind(x=xi, y=yi)
     fdmB = jno.fdm([-kR * (uiB.d2(xi) + uiB.d2(yi)), u(xb, yb) - g(xb, yb)])  # uniform kR (smooth region)
 
-    sol = np.asarray(couple([(femA, boxA), (fdmB, boxB)]).solve(max_iter=200)).reshape(-1)
+    sol = np.asarray(couple([(femA, sA), (fdmB, sB)]).solve(max_iter=200)).reshape(-1)
     iface_val = float(np.mean(sol[on]))
     assert abs(iface_val - kL / (kL + kR)) < 0.03, f"material kink should be {kL / (kL + kR):.2f}, got {iface_val:.3f}"
 
@@ -617,6 +619,7 @@ def test_overlap_coupled_solve_differentiable_in_fem_coefficient():
     kR, fsrc = 3.0, 10.0
     boxA, boxB = box(0.0, 0.0, 0.6, 1.0), box(0.5, 0.0, 1.0, 1.0)  # overlap x∈[0.5,0.6]
     d = jno.domain(boxA.union(boxB), mesh_size=0.08)
+    sA, sB = jno.Shape.rect(0.0, 0.0, 0.6, 1.0), jno.Shape.rect(0.5, 0.0, 1.0, 1.0)
     p = np.asarray(d.mesh_connectivity["points"])[:, :2]
     in_a, in_b = _region_mask(p, boxA), _region_mask(p, boxB)
     overlap = jnp.asarray(in_a & in_b)
@@ -634,7 +637,7 @@ def test_overlap_coupled_solve_differentiable_in_fem_coefficient():
     uiB = u.bind(x=xi, y=yi)
     fdmB = jno.fdm([-kR * (uiB.d2(xi) + uiB.d2(yi)) - fsrc, u(xb, yb) - 0.0])
 
-    node = couple([(femA, boxA), (fdmB, boxB)]).solve(tol=1e-9, max_iter=300)
+    node = couple([(femA, sA), (fdmB, sB)]).solve(tol=1e-9, max_iter=300)
     assert isinstance(node, FunctionCall), "a trainable coefficient must make the coupled solve a differentiable node"
     assert getattr(node, "_domain", None) is d, "the coupled node must carry its domain for jno.core"
 

@@ -689,6 +689,63 @@ class DifferentialOperators:
         return jnp.where(valid, num / safe_det, 0.0)
 
     @staticmethod
+    def compute_laplacian_3d_cotangent(
+        u_values: jnp.ndarray,
+        points: jnp.ndarray,
+        tetrahedra: jnp.ndarray,
+    ) -> jnp.ndarray:
+        """P1 finite-element (Laplace–Beltrami) Laplacian on a tetrahedral mesh — the 3-D analogue of the
+        2-D :meth:`compute_laplacian_2d_cotangent` (in 2-D the cotangent weights **are** the P1 stiffness
+        off-diagonals).
+
+        Each tet's linear basis gradients ``∇φ_a`` are constant, obtained from the inverse of the element
+        Jacobian ``J = [p1-p0 | p2-p0 | p3-p0]`` (``∇λ_{1,2,3}`` are the rows of ``J⁻¹``, ``∇λ_0`` their
+        negated sum). The assembled stiffness applied to ``u`` is, matrix-free,
+        ``(K u)_i = Σ_{T∋i} V_T (∇φ_i · ∇u_T)`` with ``∇u_T = Σ_a u_a ∇φ_a`` the (constant) element
+        gradient and ``V_T`` the tet volume; normalizing by the lumped vertex volume
+        ``M_i = Σ_{T∋i} V_T / 4`` gives the strong Laplacian ``Δu_i = -(K u)_i / M_i``. Symmetric,
+        CG-compatible, and second-order for the Galerkin solution — the accurate default on tets.
+
+        Args:
+            u_values:   Function values, shape ``(N,)``.
+            points:     Coordinates, shape ``(N, 3)``.
+            tetrahedra: Tet connectivity, shape ``(M, 4)``.
+
+        Returns:
+            Laplacian at each node, shape ``(N,)``.
+        """
+        pts = jnp.asarray(points)[:, :3]
+        tets = jnp.asarray(tetrahedra)
+        n = u_values.shape[0]
+        i0, i1, i2, i3 = tets[:, 0], tets[:, 1], tets[:, 2], tets[:, 3]
+        p0 = pts[i0]
+        # Jacobian with columns e1, e2, e3 = p1-p0, p2-p0, p3-p0
+        jac = jnp.stack([pts[i1] - p0, pts[i2] - p0, pts[i3] - p0], axis=2)  # (M, 3, 3)
+        det = jnp.linalg.det(jac)
+        good = jnp.abs(det) > 1e-14  # guard sliver / degenerate tets against a singular inverse
+        vol = jnp.where(good, jnp.abs(det) / 6.0, 0.0)
+        jinv = jnp.linalg.inv(jnp.where(good[:, None, None], jac, jnp.eye(3, dtype=jac.dtype)))
+        g1, g2, g3 = jinv[:, 0, :], jinv[:, 1, :], jinv[:, 2, :]  # ∇λ_1, ∇λ_2, ∇λ_3 (rows of J⁻¹)
+        g0 = -(g1 + g2 + g3)  # ∇λ_0 = -(∇λ_1 + ∇λ_2 + ∇λ_3)  (partition of unity)
+        u0, u1, u2, u3 = u_values[i0], u_values[i1], u_values[i2], u_values[i3]
+        gradu = g0 * u0[:, None] + g1 * u1[:, None] + g2 * u2[:, None] + g3 * u3[:, None]  # ∇u on the tet
+        ku = (
+            jnp.zeros(n)
+            .at[i0]
+            .add(vol * jnp.sum(g0 * gradu, axis=1))
+            .at[i1]
+            .add(vol * jnp.sum(g1 * gradu, axis=1))
+            .at[i2]
+            .add(vol * jnp.sum(g2 * gradu, axis=1))
+            .at[i3]
+            .add(vol * jnp.sum(g3 * gradu, axis=1))
+        )
+        quarter = vol / 4.0
+        mass = jnp.zeros(n).at[i0].add(quarter).at[i1].add(quarter).at[i2].add(quarter).at[i3].add(quarter)
+        safe_mass = jnp.where(mass > 1e-14, mass, 1.0)
+        return jnp.where(mass > 1e-14, -ku / safe_mass, 0.0)
+
+    @staticmethod
     def compute_fd_laplacian_3d_simple(
         u_values: jnp.ndarray,
         points: jnp.ndarray,
@@ -703,12 +760,14 @@ class DifferentialOperators:
             points:     Coordinates, shape ``(N, 3)``.
             tetrahedra: Tet connectivity, shape ``(M, 4)``.
             dims:       Spatial dimensions to sum over, e.g. ``(0, 1, 2)``.
-            method:     ``"gradient_of_gradient"`` (default) or
-                        ``"lsq_of_gradient"``.
+            method:     ``"cotangent"`` (P1 Laplace–Beltrami — accurate, symmetric),
+                        ``"gradient_of_gradient"``, or ``"lsq_of_gradient"``.
 
         Returns:
             Laplacian, shape ``(N,)``.
         """
+        if method == "cotangent":
+            return DifferentialOperators.compute_laplacian_3d_cotangent(u_values, points, tetrahedra)
         if method == "lsq_of_gradient":
             result = jnp.zeros_like(u_values)
             for d in dims:
