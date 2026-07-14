@@ -242,6 +242,65 @@ def test_efficiency_is_differentiable_in_the_design():
 
 
 @needs_fmmax
+def test_parameter_anywhere_wavelength_and_eps_flow():
+    """A jno.np.parameter used as the wavelength (K0) — anywhere in the graph — is a differentiable knob:
+    jno.rcwa re-derives eps AND k0 from the parameterized coefficient, and jax.grad flows (matches FD)."""
+    import jax
+    import jax.numpy as jnp
+
+    P0, Lz = 0.6, 3.2
+    d = jno.domain(jno.Shape.box(0, 0, 0, P0, P0, Lz, size=0.2))
+    e = 1e-6
+    for nm, f in [
+        ("left", lambda x, y, z: x < e),
+        ("right", lambda x, y, z: x > P0 - e),
+        ("front", lambda x, y, z: y < e),
+        ("back", lambda x, y, z: y > P0 - e),
+        ("bottom", lambda x, y, z: z < e),
+        ("top", lambda x, y, z: z > Lz - e),
+    ]:
+        d.tag(nm, f)
+    u, phi = d.fem_symbols()
+    xi, yi, zi, _ = d.variable("interior", split=True)
+    ui, vi = u.bind(x=xi, y=yi, z=zi), phi.bind(x=xi, y=yi, z=zi)
+
+    def fc(nm):
+        c = d.variable(nm, split=True)
+        return u.bind(x=c[0], y=c[1], z=c[2]), phi.bind(x=c[0], y=c[1], z=c[2])
+
+    ubt, vbt = fc("bottom")
+    utp, vtp = fc("top")
+    ul, _ = fc("left")
+    ur, _ = fc("right")
+    uf, _ = fc("front")
+    ubk, _ = fc("back")
+    K0 = jno.np.parameter((), name="k0").initialize(jax.nn.initializers.constant(2 * np.pi))  # WAVELENGTH param
+    ind = jno.fn(
+        lambda x, y, z: jnp.where(((x - 0.3) ** 2 + (y - 0.3) ** 2 < 0.18**2) & (z >= 0.8) & (z < 1.15), 1.0, 0.0),
+        [xi, yi, zi],
+    )
+    eps = 1.0 + ind * (6.0 - 1.0)
+    cons = [
+        ui.x * vi.x + ui.y * vi.y + ui.z * vi.z - K0**2 * eps * (u * vi),
+        -(1j * K0 * utp) * vtp,
+        -(1j * K0 * ubt - 2j * K0) * vbt,
+        ul - ur,
+        uf - ubk,
+    ]
+    rc = jno.rcwa(cons, orders=40, grid=32, nz=40, params={"k0": 2 * np.pi})
+    assert abs(rc.spec.wavelength - 1.0) < 1e-3
+
+    def T(k0v):
+        return rc.solve(params={"k0": k0v}).efficiency("T")
+
+    k = 2 * np.pi
+    g = float(jax.grad(T)(k))
+    h = 1e-2
+    fd = (float(T(k + h)) - float(T(k - h))) / (2 * h)
+    assert g == g and abs(g - fd) < 5e-2, f"dT/dK0 autodiff {g} vs finite-diff {fd}"
+
+
+@needs_fmmax
 def test_broadband_spectrum_and_wavelength_gradient():
     """Sweeping wavelength gives a dispersion curve; T is differentiable in wavelength (matches FD)."""
     import jax

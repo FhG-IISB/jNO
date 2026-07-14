@@ -425,8 +425,10 @@ def _z_ambient_faces(domain):
     return bottom, top
 
 
-def _param_zeros(femobj, eps):
-    """{parameter_name: zeros(shape)} for every trainable parameter the operator references."""
+def _param_values(femobj, eps):
+    """{parameter_name: current value} for every trainable parameter the operator references. Uses the
+    parameter's *initialized* value (not zeros) so a parameter that is a physical constant -- e.g. K0 in
+    the source term -- doesn't vanish when the operator is assembled to read the source."""
     out = {}
     nodes = list(_model_calls(eps))
     for c in getattr(femobj, "_constraints", []):
@@ -436,9 +438,7 @@ def _param_zeros(femobj, eps):
         name = getattr(m, "_parameter_name", None)
         if name is None:
             continue
-        import jax.numpy as jnp
-
-        out[name] = jnp.zeros(m.module.value.shape, m.module.value.dtype)
+        out[name] = jnp.asarray(m.module.value)
     return out
 
 
@@ -541,25 +541,19 @@ def _has_nodal_field(node):
     return any(getattr(mc.model, "_fem_field", None) == "node" for mc in _model_calls(node))
 
 
-def _sample_grid_direct(coeff_node, grid, nz, period, z_range):
+def _sample_grid_direct(coeff_node, grid, nz, period, z_range, params=None):
     """Evaluate an analytic coefficient expression directly on the RCWA grid (exact, no mesh noise).
 
     Used when the permittivity is an analytic function of the coordinates (no per-node field); this
-    avoids the staircase/interp noise that makes z-slices look non-invariant on an unstructured mesh."""
-    import jax.numpy as jnp
-
-    from jno.trace import Variable
-    from jno.trace_evaluator import TraceEvaluator
-
+    avoids the staircase/interp noise that makes z-slices look non-invariant on an unstructured mesh.
+    ``params`` substitutes trainable-parameter values (so the eager structure/k0 inference uses valid
+    values, e.g. a K0 parameter)."""
     xs = np.linspace(0, period[0], grid, endpoint=False)
     ys = np.linspace(0, period[1], grid, endpoint=False)
     zs = np.linspace(z_range[0], z_range[1], nz)
     GX, GY, GZ = np.meshgrid(xs, ys, zs, indexing="ij")
-    pts = jnp.asarray(np.stack([GX.ravel(), GY.ravel(), GZ.ravel()], 1))
-    table = {mc.model.layer_id: mc.model.module for mc in _model_calls(coeff_node)}
-    tags = {v.tag for v in _walk_nodes(coeff_node) if isinstance(v, Variable)}
-    ctx = {t: pts for t in tags} if tags else {}
-    vals = np.asarray(TraceEvaluator(table).evaluate(coeff_node, context=ctx)).reshape(grid, grid, nz)
+    pts = np.stack([GX.ravel(), GY.ravel(), GZ.ravel()], 1)
+    vals = np.asarray(_eval_coeff_points(coeff_node, pts, params or {})).reshape(grid, grid, nz)
     return np.moveaxis(vals, 2, 0).astype(complex), zs  # -> (nz, grid, grid)
 
 
@@ -584,8 +578,9 @@ def _sample_grid(domain, eps_nodes, grid, nz, period, z_range):
     return E, zs
 
 
-def _source_kin(femobj, domain):
-    """Read the illuminated face and transverse wavevector k_in from the assembled forcing b."""
+def _source_kin(femobj, domain, params=None):
+    """Read the illuminated face and transverse wavevector k_in from the assembled forcing b.
+    ``params`` overrides trainable-parameter values used when assembling (e.g. a K0/source parameter)."""
     op = femobj.operator
     if not (isinstance(op, tuple) and len(op) == 2):
         raise RcwaError(
@@ -594,7 +589,8 @@ def _source_kin(femobj, domain):
         )
     opr, opi = op
     if hasattr(opr, "evaluate"):  # lazy (parametric) operator
-        pz = _param_zeros(femobj, femobj._constraints[0] if femobj._constraints else 0)
+        pz = _param_values(femobj, femobj._constraints[0] if femobj._constraints else 0)
+        pz.update({k: jnp.asarray(v) for k, v in (params or {}).items()})
         _, br = opr.evaluate(pz)
         _, bi = opi.evaluate(pz)
     else:  # eager (parameter-free) (A, b) legs
@@ -694,10 +690,11 @@ class _RcwaProblem:
                 "for an analytic permittivity (no per-node field). This problem uses a nodal-field "
                 "permittivity; differentiable nodal re-sampling is not implemented yet."
             )
-        return eng.solve(layers=self._resample(params), wavelength=wavelength)
+        layers, wl = self._resample(params)  # eps AND wavelength re-derived from the parameters
+        return eng.solve(layers=layers, wavelength=wavelength if wavelength is not None else wl)
 
 
-def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, formulation="JONES_DIRECT_FOURIER"):
+def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, params=None, formulation="JONES_DIRECT_FOURIER"):
     """Infer and build an RCWA problem from a jNO constraint list (or built ``FEM``).
 
     Everything is read out of the traced problem: **periodicity + period** (Floquet ties — absent ⇒
@@ -734,6 +731,11 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, formu
 
     # permittivity coefficient K0^2 * eps, recovered from the volume weak form (no assembly, no eps arg)
     coeff_node = _extract_permittivity_coeff(_volume_constraint(femobj))
+    # construction-time parameter values: the trainable parameters' current values, overridden by any
+    # `params=` the caller supplied -- so the eager inference (structure, source, k0) uses valid values
+    # (e.g. a K0 parameter that must be non-zero for the source to exist).
+    cparams = _param_values(femobj, coeff_node)
+    cparams.update({k: jnp.asarray(v) for k, v in (params or {}).items()})
     if _has_nodal_field(coeff_node):  # per-node design field -> interpolate off the mesh
         coeff_nodes = _eval_expr_nodes(coeff_node, domain)
         if np.iscomplexobj(coeff_nodes) and np.max(np.abs(coeff_nodes.imag)) < 1e-9:
@@ -741,11 +743,11 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, formu
         C, zs = _sample_grid(domain, coeff_nodes, grid, nz, period, z_range)
         zmids = None  # nodal-field path: no analytic re-sampling closure (differentiable solve unsupported)
     else:  # analytic permittivity -> sample the grid exactly
-        C, zs = _sample_grid_direct(coeff_node, grid, nz, period, z_range)
+        C, zs = _sample_grid_direct(coeff_node, grid, nz, period, z_range, cparams)
     coeff_layers = detect_layers(C, zs, slices=slices)
     zmids = detect_layers.last_zmid if not _has_nodal_field(coeff_node) else None
 
-    face_z, k_in = _source_kin(femobj, domain)
+    face_z, k_in = _source_kin(femobj, domain, cparams)
     source_at_bottom = abs(face_z - _region_centroid(domain, bottom)[2]) < abs(face_z - _region_centroid(domain, top)[2])
     source_face = bottom if source_at_bottom else top
 
@@ -775,12 +777,19 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, formu
         thicks = [t for t, _ in coeff_layers]
 
         def resample(params):
+            # Re-derive EVERYTHING RCWA reads from the (parameterized) permittivity coefficient K0^2*eps:
+            #   * k0 = sqrt(coeff in the vacuum superstrate)  -> a WAVELENGTH parameter flows here
+            #   * each layer's relative eps = coeff(z)/k0^2    -> an EPS/shape parameter flows here
+            # so a jno.np.parameter anywhere in the volume weak form is a differentiable knob.
+            sup = jnp.mean(jnp.real(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, grid, zmids[0]), params)))
+            k0 = jnp.sqrt(sup)
             out = []
             for thick, zmid in zip(thicks, zmids):
-                pts = _cell_grid_at_z(period, grid, zmid)
-                cvals = jnp.reshape(_eval_coeff_points(coeff_node, pts, params), (grid, grid))
-                out.append((thick, jnp.real(cvals) / k0sq))
-            return out
+                cvals = jnp.reshape(
+                    _eval_coeff_points(coeff_node, _cell_grid_at_z(period, grid, zmid), params), (grid, grid)
+                )
+                out.append((thick, jnp.real(cvals) / (k0 * k0)))
+            return out, 2 * jnp.pi / k0
 
     spec = RcwaSpec(
         period=period,
