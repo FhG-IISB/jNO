@@ -690,6 +690,31 @@ def _cell_grid_at_z(period, grid, z):
     return np.stack([gx.ravel(), gy.ravel(), np.full(grid * grid, z)], 1)
 
 
+def _bary_weights(node_coords, grid_pts):
+    """Precompute, for each grid point, the 4 containing-tetrahedron node ids and their **barycentric**
+    weights -- so ``rho_grid = sum_i w_i * rho[node_i]`` is a smooth, differentiable interpolation of the
+    nodal design onto the RCWA grid (points outside the mesh hull fall back to the nearest node)."""
+    from scipy.spatial import Delaunay, cKDTree
+
+    tri = Delaunay(node_coords)
+    m = len(grid_pts)
+    simplex = tri.find_simplex(grid_pts)
+    nodes = np.zeros((m, 4), np.int64)
+    w = np.zeros((m, 4), np.float64)
+    inside = simplex >= 0
+    if inside.any():
+        s = simplex[inside]
+        T = tri.transform[s]  # (k, 4, 3): [:3] inverse affine, [3] the last-vertex offset
+        b3 = np.einsum("kij,kj->ki", T[:, :3, :], grid_pts[inside] - T[:, 3, :])
+        nodes[inside] = tri.simplices[s]
+        w[inside] = np.c_[b3, 1.0 - b3.sum(axis=1)]
+    if (~inside).any():  # outside the convex hull -> nearest node (weight 1)
+        _, nn = cKDTree(node_coords).query(grid_pts[~inside])
+        nodes[~inside] = nn[:, None]
+        w[~inside, 0] = 1.0
+    return nodes, w
+
+
 def _eval_coeff_points(coeff_node, pts, params):
     """Evaluate the permittivity coefficient at ``pts``, substituting trainable parameters from
     ``params`` (jax values). Returns a JAX array -- differentiable in the design parameters."""
@@ -886,18 +911,17 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
     # (k0 = sqrt(coeff in the vacuum superstrate)) in one shot.
     #
     # A per-node (free-form / topology-optimisation) density field is interpolated to the RCWA grid by a
-    # precomputed node->grid NEAREST-index gather: the indices are fixed geometry, so ``rho_nodes[idx]`` is
-    # differentiable in the nodal density (the gradient flows to the selected nodes).
+    # precomputed node->grid BARYCENTRIC interpolation: the (node ids, weights) are fixed geometry, so
+    # ``sum_i w_i * rho_nodes[id_i]`` is a smooth, differentiable interpolation of the nodal density onto the
+    # RCWA grid (gradient flows to the 4 containing-tet nodes, weighted -- not just the single nearest node).
     thicks = [t for t, _ in coeff_layers]
     nodal_names = {
         mc.model._parameter_name for mc in _model_calls(coeff_node) if getattr(mc.model, "_fem_field", None) == "node"
     }
-    nearest = None
+    bary = None
     if nodal_names:
-        from scipy.spatial import cKDTree
-
-        tree = cKDTree(np.asarray(domain.points))
-        nearest = [np.asarray(tree.query(_cell_grid_at_z(period, grid, zm))[1]) for zm in zmids]
+        nc = np.asarray(domain.points)
+        bary = [_bary_weights(nc, _cell_grid_at_z(period, grid, zm)) for zm in zmids]  # per layer: (ids, weights)
 
     # the illuminated boundary term's forcing -> lets an incidence-ANGLE parameter in the source flow
     # (its transverse phase gradient IS k_in); None when the source has no angle to read.
@@ -907,8 +931,12 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
     src_z = float(_region_centroid(domain, source_face)[2])
 
     def resample(params):
-        def at(li):  # parameter values for layer li: nodal fields gathered to the grid, scalars as-is
-            return {k: (jnp.asarray(v)[nearest[li]] if k in nodal_names else jnp.asarray(v)) for k, v in params.items()}
+        def at(li):  # parameter values for layer li: nodal fields barycentrically interpolated, scalars as-is
+            def gather(v):
+                ids, w = bary[li]
+                return jnp.sum(jnp.asarray(w) * jnp.asarray(v).reshape(-1)[jnp.asarray(ids)], axis=1)
+
+            return {k: (gather(v) if k in nodal_names else jnp.asarray(v)) for k, v in params.items()}
 
         sup = jnp.mean(jnp.real(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, grid, zmids[0]), at(0))))
         k0 = jnp.sqrt(sup)
