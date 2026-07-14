@@ -185,6 +185,41 @@ class _Sol:
         )
         return (tf[i] + tf[i + self._nt]) / self._Pin
 
+    def jones(self, kind="T"):
+        """The 2×2 complex **Jones matrix** at the 0th diffraction order — how the structure maps incident
+        polarization to transmitted (``"T"``) or reflected (``"R"``) polarization.
+
+        ``J[q, p]`` is the 0th-order field amplitude in output polarization ``q`` for a unit-**power**
+        incident wave in input polarization ``p``, normalised so ``|J[q, p]|²`` is the (co- or cross-
+        polarised) power fraction and ``arg(J)`` carries the phase (a waveplate's retardation lives in the
+        phase difference between the two diagonal entries). The columns sum in power to the total efficiency:
+        ``sum_q |J[q, p]|² == efficiency(kind)`` for input ``p``. The two polarizations are fmmax's transverse
+        Jones basis — for the 0th order at normal incidence they are the two in-plane axes (≈ x, y); an
+        isotropic stack gives a diagonal ``J`` (no conversion), an in-plane-anisotropic one an off-diagonal
+        ``J`` (polarization conversion). Differentiable in the design. Returns a JAX ``(2, 2)`` array."""
+        fm, nt = self._fm, self._nt
+        if kind == "T":
+            smat, out_layer = self._s.s11, self._layers[-1]
+        elif kind == "R":
+            smat, out_layer = self._s.s21, self._layers[0]
+        else:
+            raise RcwaError(f"jones(kind): kind must be 'T' or 'R', got {kind!r}")
+        flux_in = jnp.abs(jnp.real(jnp.reshape(fm.eigenmode_poynting_flux(self._layers[0]), (-1,))))
+        flux_out = jnp.abs(jnp.real(jnp.reshape(fm.eigenmode_poynting_flux(out_layer), (-1,))))
+        # fmmax orders eigenmodes by eigenvalue, not by Fourier order — the 0th order's two polarizations are
+        # the two most-forward (largest-flux) ambient modes. The ambient is design-independent, so the two
+        # indices are fixed geometry (read eagerly); the amplitudes/normalisation stay JAX (differentiable).
+        order = np.argsort(-np.asarray(flux_in))
+        pa, pb = int(order[0]), int(order[1])
+        if _concrete(flux_in) and float(flux_in[pb]) <= 1e-9 * float(flux_in[pa] + 1e-30):
+            raise RcwaError("only one forward-propagating polarization at the 0th order; the Jones matrix is degenerate.")
+
+        def col(p):  # transmitted/reflected 0th-order amplitudes for a unit-power input in polarization p
+            amp = jnp.reshape(smat @ jnp.zeros((2 * nt, 1), complex).at[p, 0].set(1.0), (-1,))
+            return jnp.stack([amp[pa] * jnp.sqrt(flux_out[pa] / flux_in[p]), amp[pb] * jnp.sqrt(flux_out[pb] / flux_in[p])])
+
+        return jnp.stack([col(pa), col(pb)], axis=1)  # (out q, in p)
+
     def field(self, y_frac=0.5, nx=80, density=40.0):
         """Reconstruct the real-space electric field on a vertical (x–z) slice at ``y = y_frac·Py``.
 

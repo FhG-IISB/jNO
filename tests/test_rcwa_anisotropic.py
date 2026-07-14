@@ -13,6 +13,7 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")  # the fmmax solve OOMs on a small
 
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
+import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 
 jax.config.update("jax_enable_x64", True)
@@ -70,6 +71,22 @@ def _aniso_constraints(exx, eyy, ezz):
     return [inner(cu, cv) - K0**2 * inner(eps @ ui, vi), *bcs]
 
 
+def _tensor_constraints(flat9):
+    """A uniform slab with a full 3×3 tensor (row-major ``flat9``): diagonal defaults to 1 outside the slab,
+    off-diagonal to 0 (isotropic vacuum ambient). Lets an off-diagonal ε̂ rotate polarization."""
+    d = jno.domain(jno.Shape.box(0, 0, 0, P, P, LZ, size=0.2))
+    (xi, yi, zi), (ui, vi), (cu, cv), bcs = _common(d)
+    comps = [
+        jno.fn(
+            lambda x, y, z, vv=val, dd=(1.0 if i in (0, 4, 8) else 0.0): jnp.where((z >= Z0) & (z < Z1), vv, dd),
+            [xi, yi, zi],
+        )
+        for i, val in enumerate(flat9)
+    ]
+    eps = MatrixView(vec(*comps).expr).from_flat(3, 3)
+    return [inner(cu, cv) - K0**2 * inner(eps @ ui, vi), *bcs]
+
+
 def _scalar_constraints(e):
     """The isotropic reference: the same slab with scalar ε."""
     d = jno.domain(jno.Shape.box(0, 0, 0, P, P, LZ, size=0.2))
@@ -105,3 +122,40 @@ def test_anisotropic_conserves_energy():
     """A lossless anisotropic slab conserves energy: T + R ≈ 1."""
     cons = _aniso_constraints(8.0, 4.0, 6.0)
     assert _T(cons) + _T(cons, R=True) == pytest.approx(1.0, abs=5e-3)
+
+
+def _jones(cons):
+    sol = jno.rcwa(cons, orders=60, grid=24).solve()
+    return np.asarray(jnp.asarray(sol.jones("T"))), float(sol.efficiency("T"))
+
+
+@needs_fmmax
+def test_jones_isotropic_is_diagonal_and_energy_consistent():
+    """An isotropic stack does not convert polarization: the Jones matrix is diagonal (zero cross-pol) with
+    equal diagonal entries, and each input column's power sums to the total transmission efficiency."""
+    J, T = _jones(_scalar_constraints(6.0))
+    p = np.abs(J) ** 2
+    assert p[0, 1] < 1e-6 and p[1, 0] < 1e-6  # no cross-polarization
+    assert p[0, 0] == pytest.approx(p[1, 1], abs=1e-4)  # both polarizations transmit alike
+    assert p[:, 0].sum() == pytest.approx(T, abs=1e-4)  # |J[:,in]|² sums to efficiency("T")
+
+
+@needs_fmmax
+def test_jones_diagonal_biaxial_is_birefringent_no_conversion():
+    """A biaxial slab diag(8,4,6) whose principal axes are x,y is birefringent but does NOT convert: the
+    Jones matrix stays diagonal, with unequal diagonal entries (x-pol sees εxx=8, y-pol sees εyy=4)."""
+    J, _ = _jones(_tensor_constraints([8, 0, 0, 0, 4, 0, 0, 0, 6]))
+    p = np.abs(J) ** 2
+    assert p[0, 1] < 1e-6 and p[1, 0] < 1e-6  # diagonal ε̂ (axes = x,y) → no conversion
+    assert abs(p[0, 0] - p[1, 1]) > 1e-2  # but the two polarizations transmit differently (birefringence)
+
+
+@needs_fmmax
+def test_jones_rotated_tensor_converts_polarization():
+    """A rotated in-plane tensor [[6,2],[2,6]] (off-diagonal εxy≠0) CONVERTS polarization: the Jones matrix
+    has nonzero off-diagonal (cross-pol) entries, and stays symmetric (reciprocity for a lossless
+    reciprocal medium). This is what a scalar or diagonal ε can never do."""
+    J, _ = _jones(_tensor_constraints([6, 2, 0, 2, 6, 0, 0, 0, 6]))
+    p = np.abs(J) ** 2
+    assert p[1, 0] > 1e-2 and p[0, 1] > 1e-2  # genuine polarization conversion (cross-pol)
+    np.testing.assert_allclose(J, J.T, atol=1e-6)  # reciprocity: J is symmetric
