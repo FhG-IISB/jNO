@@ -215,6 +215,33 @@ def test_engine_requires_assume_periodic():
 
 
 @needs_fmmax
+def test_efficiency_is_differentiable_in_the_design():
+    """jax.grad of transmission w.r.t. the permittivity flows through the modal solve (matches FD)."""
+    import jax
+    import jax.numpy as jnp
+
+    from jno.rcwa import Rcwa
+
+    P, r, th, ng = 0.6, 0.18, 0.35, 32
+    xs = (np.arange(ng) + 0.5) / ng * P
+    X, Y = np.meshgrid(xs, xs, indexing="ij")
+    mask = jnp.asarray((((X - P / 2) ** 2 + (Y - P / 2) ** 2) < r**2).astype(float))
+    rc = Rcwa(
+        [(INF, 1.0), (th, jnp.ones((ng, ng))), (INF, 1.0)], period=(P, P), orders=40, wavelength=WL, assume_periodic=True
+    )
+
+    def T(epsval):  # transmission as a function of the pillar permittivity
+        g = 1.0 + mask * (epsval - 1.0)
+        return rc.solve(layers=[(INF, 1.0), (th, g), (INF, 1.0)]).efficiency("T")
+
+    grad = float(jax.grad(T)(6.0))
+    h = 1e-2
+    fd = (float(T(6.0 + h)) - float(T(6.0 - h))) / (2 * h)
+    assert grad == grad and abs(grad) > 1e-3, "gradient must be finite and non-zero"
+    assert abs(grad - fd) < 5e-3, f"autodiff {grad} vs finite-diff {fd}"  # FD is the approximation here
+
+
+@needs_fmmax
 def test_infer_and_solve_end_to_end():
     """The full path: infer from the periodic problem, then solve — energy must be conserved."""
     constraints, _ = _build_periodic_problem()

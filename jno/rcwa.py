@@ -45,7 +45,16 @@ References:
 
 from dataclasses import dataclass, field
 
+import jax
+import jax.numpy as jnp
 import numpy as np
+
+
+def _concrete(x):
+    """True when ``x`` is a real (non-traced) value, so a never-silent guard may inspect it. Under
+    jit/grad the value is a tracer -- the guard steps aside (validation ran on the eager forward pass)."""
+    return not isinstance(x, jax.core.Tracer)
+
 
 _FMMAX_HINT = (
     "jno.rcwa needs the optional fmmax backend: pip install jax-neural-operators[rcwa] "
@@ -111,7 +120,7 @@ def detect_layers(E, z, tol=1e-3, slices=None):
         idx = np.linspace(0, Nz - 1, slices + 1).round().astype(int)
         slabs = [(idx[i], idx[i + 1]) for i in range(len(idx) - 1)]
 
-    layers, report = [], []
+    layers, report, zmids = [], [], []
     for i, (a, b) in enumerate(slabs):
         mid = (a + b) // 2
         var = float(np.max(np.abs(E[a:b] - E[mid])))
@@ -123,10 +132,12 @@ def detect_layers(E, z, tol=1e-3, slices=None):
         eps_xy = E[mid]
         kind = "uniform" if np.ptp(eps_xy) < tol else "patterned"
         layers.append((thick, eps_xy))
+        zmids.append(float(z[mid]))
         report.append(
             f"  layer {i}: z=[{z[a]:.3f},{z[min(b - 1, Nz - 1)]:.3f}] {kind} eps~[{eps_xy.min():.2f},{eps_xy.max():.2f}]"
         )
     detect_layers.last_report = "detected layers:\n" + "\n".join(report)
+    detect_layers.last_zmid = zmids  # representative z of each layer -- lets a param sweep re-sample eps
     return layers
 
 
@@ -141,36 +152,38 @@ class _Sol:
         self._fwd = np.zeros((2 * nt, 1), complex)
 
     def _flux(self, amps, layer, backward=False):
-        f, b = self._fm.directional_poynting_flux(
-            amps if not backward else np.zeros_like(amps),
-            amps if backward else np.zeros_like(amps),
-            layer,
-        )
-        return np.asarray(b if backward else f).reshape(-1)  # SIGNED — energy-correct
+        zero = jnp.zeros_like(amps)
+        f, b = self._fm.directional_poynting_flux(zero if backward else amps, amps if backward else zero, layer)
+        return jnp.reshape(b if backward else f, (-1,))  # SIGNED — energy-correct; jax-native (differentiable)
 
     def efficiency(self, kind):
-        """Total transmitted (``"T"``) or reflected (``"R"``) power fraction over propagating orders."""
+        """Total transmitted (``"T"``) or reflected (``"R"``) power fraction over propagating orders.
+
+        Returns a JAX scalar -- differentiable in the design (permittivity) so ``jax.grad`` of a
+        transmission/reflection objective flows through the modal solve."""
         if kind == "T":
-            return float(np.sum(self._flux(self._s.s11 @ self._fwd, self._layers[-1]))) / self._Pin
+            return jnp.sum(self._flux(self._s.s11 @ self._fwd, self._layers[-1])) / self._Pin
         if kind == "R":
-            return float(-np.sum(self._flux(self._s.s21 @ self._fwd, self._layers[0], backward=True))) / self._Pin
+            return -jnp.sum(self._flux(self._s.s21 @ self._fwd, self._layers[0], backward=True)) / self._Pin
         raise RcwaError(f"efficiency(kind): kind must be 'T' or 'R', got {kind!r}")
 
     def order(self, m, n):
-        """Diffraction efficiency into transmitted order ``(m, n)`` (raises if outside the truncation)."""
-        bc = np.asarray(self._ex.basis_coefficients)
+        """Diffraction efficiency into transmitted order ``(m, n)`` (raises if outside the truncation).
+        Returns a differentiable JAX scalar."""
+        bc = np.asarray(self._ex.basis_coefficients)  # static (truncation geometry) -> plain numpy index
         hit = np.where((bc[:, 0] == m) & (bc[:, 1] == n))[0]
         if len(hit) == 0:
             raise RcwaError(f"order ({m},{n}) is outside the truncation ({self._nt} terms); raise orders=.")
         i = int(hit[0])
-        tf = np.abs(
-            np.asarray(
+        tf = jnp.abs(
+            jnp.reshape(
                 self._fm.directional_poynting_flux(
-                    self._s.s11 @ self._fwd, np.zeros((2 * self._nt, 1), complex), self._layers[-1]
-                )[0]
-            ).reshape(-1)
+                    self._s.s11 @ self._fwd, jnp.zeros((2 * self._nt, 1), complex), self._layers[-1]
+                )[0],
+                (-1,),
+            )
         )
-        return float(tf[i] + tf[i + self._nt]) / self._Pin
+        return (tf[i] + tf[i + self._nt]) / self._Pin
 
     def field(self, y_frac=0.5, nx=80, density=40.0):
         """Reconstruct the real-space electric field on a vertical (x–z) slice at ``y = y_frac·Py``.
@@ -245,9 +258,13 @@ class Rcwa:
         self.formulation = fm.Formulation[formulation]
         self.assume_periodic = True
 
-    def solve(self, inc=None, wavelength=None, k_in=None):
-        """Solve the stack and return a :class:`_Sol`. Raises if the wavelength is unknown or energy
-        is not conserved."""
+    def solve(self, inc=None, wavelength=None, k_in=None, layers=None):
+        """Solve the stack and return a :class:`_Sol`. Raises if the wavelength is unknown or energy is
+        not conserved.
+
+        ``layers`` optionally overrides the construction layer stack with ``[(thickness, eps), ...]`` at
+        solve time -- pass JAX permittivity grids here to differentiate the solve in the design (the
+        construction-time shape guards run once, eagerly, so the solve itself stays trace-clean)."""
         fm = self.fm
         wl = wavelength if wavelength is not None else self.wavelength
         if wl is None:
@@ -255,44 +272,47 @@ class Rcwa:
                 "wavelength is unknown: pass wavelength= to solve() or at construction; it sets every "
                 "layer's eigenmodes and is never defaulted."
             )
+        layers_spec = self.layers_spec if layers is None else layers
         kin = np.asarray(self.k_in if k_in is None else k_in, float)
         lv = fm.LatticeVectors(u=np.array([self.period[0], 0.0]), v=np.array([0.0, self.period[1]]))
         ex = fm.generate_expansion(lv, approximate_num_terms=self.orders)
         nt = ex.num_terms
 
         def solve_layer(e):
-            eg = np.asarray(e) + 0j
+            eg = jnp.asarray(e) + 0j  # jax-native: a jax permittivity grid flows -> differentiable in eps
             if eg.ndim == 0:
-                eg = np.full((1, 1), eg)
-            return fm.eigensolve_isotropic_media(np.asarray(wl), kin, lv, eg, ex, formulation=self.formulation)
+                eg = jnp.full((1, 1), eg)
+            return fm.eigensolve_isotropic_media(jnp.asarray(wl), kin, lv, eg, ex, formulation=self.formulation)
 
-        layers = [solve_layer(e) for _, e in self.layers_spec]
-        thick = [np.asarray(1.0 if t is None or t == np.inf else t) for t, _ in self.layers_spec]
+        layers = [solve_layer(e) for _, e in layers_spec]
+        thick = [jnp.asarray(1.0 if t is None or t == np.inf else t) for t, _ in layers_spec]
         s = fm.stack_s_matrix(layers, thick)
         # Incidence: excite the genuinely forward-propagating mode in the superstrate and normalise by
         # ITS flux. fmmax sorts eigenmodes by eigenvalue, so index 0 need not be the 0th forward order,
         # and a one-hot forward amplitude can carry zero forward flux -- pick the max-positive-flux mode.
-        flux_sup = np.asarray(fm.eigenmode_poynting_flux(layers[0])).reshape(-1)
-        idx = int(np.argmax(flux_sup.real))
-        Pin = float(flux_sup.real[idx])
-        if Pin <= 0:
+        # (The superstrate is design-independent, so this is effectively constant, but stays jax-native so
+        # the whole solve traces under grad/jit.)
+        flux_sup = jnp.real(jnp.reshape(fm.eigenmode_poynting_flux(layers[0]), (-1,)))
+        idx = jnp.argmax(flux_sup)
+        Pin = flux_sup[idx]
+        if _concrete(Pin) and float(Pin) <= 0:
             raise RcwaError("no forward-propagating incident mode in the superstrate; check wavelength/period.")
-        fwd = np.zeros((2 * nt, 1), complex)
-        fwd[idx, 0] = 1.0
+        fwd = jnp.zeros((2 * nt, 1), complex).at[idx, 0].set(1.0)
         sol = _Sol(fm, s, layers, ex, nt, Pin, wl, thick=thick, period=self.period)
         sol._fwd = fwd
         T, R = sol.efficiency("T"), sol.efficiency("R")
-        if not (np.isfinite(T) and np.isfinite(R)):
-            raise RcwaError(
-                "non-finite efficiency (NaN/inf): likely a Rayleigh/Wood anomaly where a diffraction "
-                "order is exactly grazing (the wavelength coincides with a period resonance, e.g. "
-                f"wavelength == period). Nudge the wavelength or period. (period={self.period}, wl={wl})"
-            )
-        if T + R > 1.0 + 5e-3:
-            raise RcwaError(
-                f"energy not conserved: T+R={T + R:.4f} > 1 at orders={self.orders}. The modal solve is "
-                f"not converged (raise orders) or the structure is unphysical."
-            )
+        if _concrete(T):  # never-silent runtime guards run on the eager forward pass; they step aside under trace
+            if not (np.isfinite(float(T)) and np.isfinite(float(R))):
+                raise RcwaError(
+                    "non-finite efficiency (NaN/inf): likely a Rayleigh/Wood anomaly where a diffraction "
+                    "order is exactly grazing (the wavelength coincides with a period resonance, e.g. "
+                    f"wavelength == period). Nudge the wavelength or period. (period={self.period}, wl={wl})"
+                )
+            if float(T) + float(R) > 1.0 + 5e-3:
+                raise RcwaError(
+                    f"energy not conserved: T+R={float(T) + float(R):.4f} > 1 at orders={self.orders}. The modal "
+                    f"solve is not converged (raise orders) or the structure is unphysical."
+                )
         return sol
 
 
@@ -605,21 +625,47 @@ def _source_kin(femobj, domain):
     return face_z, k_in
 
 
+def _cell_grid_at_z(period, grid, z):
+    xs = np.linspace(0, period[0], grid, endpoint=False)
+    ys = np.linspace(0, period[1], grid, endpoint=False)
+    gx, gy = np.meshgrid(xs, ys, indexing="ij")
+    return np.stack([gx.ravel(), gy.ravel(), np.full(grid * grid, z)], 1)
+
+
+def _eval_coeff_points(coeff_node, pts, params):
+    """Evaluate the permittivity coefficient at ``pts``, substituting trainable parameters from
+    ``params`` (jax values). Returns a JAX array -- differentiable in the design parameters."""
+    import equinox as eqx
+
+    from jno.trace import Variable
+    from jno.trace_evaluator import TraceEvaluator
+
+    table = {}
+    for mc in _model_calls(coeff_node):
+        mod, name = mc.model.module, getattr(mc.model, "_parameter_name", None)
+        if name is not None and name in params:
+            mod = eqx.tree_at(lambda m: m.value, mod, jnp.asarray(params[name]))
+        table[mc.model.layer_id] = mod
+    tags = {v.tag for v in _walk_nodes(coeff_node) if isinstance(v, Variable)}
+    ctx = {t: jnp.asarray(pts) for t in tags} if tags else {}
+    return TraceEvaluator(table).evaluate(coeff_node, context=ctx)
+
+
 class _RcwaProblem:
     """An RCWA problem inferred from a jNO constraint list / FEM problem. Holds the inferred
     :class:`RcwaSpec` and builds the fmmax engine on :meth:`solve`."""
 
-    def __init__(self, spec, orders, formulation="JONES_DIRECT_FOURIER"):
+    def __init__(self, spec, orders, formulation="JONES_DIRECT_FOURIER", resample=None):
         self.spec = spec
         self.orders = orders
         self.formulation = formulation
+        self._resample = resample  # params -> [(thickness, eps_grid), ...]  (jax; for differentiable solves)
 
     def __repr__(self):
         return f"_RcwaProblem(orders={self.orders}, {self.spec!r})"
 
-    def solve(self):
-        """Build the fmmax engine from the inferred spec and solve (needs the fmmax backend)."""
-        eng = Rcwa(
+    def _engine(self):
+        return Rcwa(
             self.spec.layers,
             period=self.spec.period,
             orders=self.orders,
@@ -628,7 +674,23 @@ class _RcwaProblem:
             formulation=self.formulation,
             assume_periodic=True,
         )
-        return eng.solve()
+
+    def solve(self, params=None):
+        """Build the fmmax engine and solve.
+
+        Pass ``params={name: value}`` (JAX values for the trainable ``jno.np.parameter`` coefficients) to
+        get a **differentiable** solve: the permittivity is re-sampled from those values and the whole
+        modal solve traces, so ``jax.grad`` of a ``sol.efficiency(...)`` objective flows to the design."""
+        eng = self._engine()
+        if params is None:
+            return eng.solve()
+        if self._resample is None:
+            raise RcwaError(
+                "differentiable solve(params=...) needs the analytic re-sampling path, which is only built "
+                "for an analytic permittivity (no per-node field). This problem uses a nodal-field "
+                "permittivity; differentiable nodal re-sampling is not implemented yet."
+            )
+        return eng.solve(layers=self._resample(params))
 
 
 def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, formulation="JONES_DIRECT_FOURIER"):
@@ -673,9 +735,11 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, formu
         if np.iscomplexobj(coeff_nodes) and np.max(np.abs(coeff_nodes.imag)) < 1e-9:
             coeff_nodes = coeff_nodes.real.astype(complex)
         C, zs = _sample_grid(domain, coeff_nodes, grid, nz, period, z_range)
+        zmids = None  # nodal-field path: no analytic re-sampling closure (differentiable solve unsupported)
     else:  # analytic permittivity -> sample the grid exactly
         C, zs = _sample_grid_direct(coeff_node, grid, nz, period, z_range)
     coeff_layers = detect_layers(C, zs, slices=slices)
+    zmids = detect_layers.last_zmid if not _has_nodal_field(coeff_node) else None
 
     face_z, k_in = _source_kin(femobj, domain)
     source_at_bottom = abs(face_z - _region_centroid(domain, bottom)[2]) < abs(face_z - _region_centroid(domain, top)[2])
@@ -684,6 +748,8 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, formu
     # orient so the incident (source-side) ambient is layers[0] = superstrate
     if not source_at_bottom:
         coeff_layers = list(reversed(coeff_layers))
+        if zmids is not None:
+            zmids = list(reversed(zmids))
     # k0 from the superstrate (vacuum ⇒ coeff = k0^2), unless wavelength is given
     super_coeff = float(np.real(coeff_layers[0][1]).mean())
     if wavelength is not None:
@@ -697,6 +763,21 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, formu
     k0sq = k0 * k0
     layers = [(t, np.asarray(e) / k0sq) for t, e in coeff_layers]  # relative permittivity
 
+    # differentiable re-sampling: re-evaluate the analytic permittivity at each layer's representative z
+    # from a parameter dict, so a design (jno.np.parameter) flows through solve(params=...). Only for the
+    # analytic path (nodal-field re-sampling would need mesh interpolation -> deferred, raises in solve).
+    resample = None
+    if zmids is not None:
+        thicks = [t for t, _ in coeff_layers]
+
+        def resample(params):
+            out = []
+            for thick, zmid in zip(thicks, zmids):
+                pts = _cell_grid_at_z(period, grid, zmid)
+                cvals = jnp.reshape(_eval_coeff_points(coeff_node, pts, params), (grid, grid))
+                out.append((thick, jnp.real(cvals) / k0sq))
+            return out
+
     spec = RcwaSpec(
         period=period,
         layers=layers,
@@ -706,4 +787,4 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, formu
         ambient_faces=(bottom, top),
         periodic_axes=axes,
     )
-    return _RcwaProblem(spec, orders=orders, formulation=formulation)
+    return _RcwaProblem(spec, orders=orders, formulation=formulation, resample=resample)
