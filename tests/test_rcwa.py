@@ -197,7 +197,9 @@ def tmm_slab(nn, h, lam):
 def test_engine_fresnel_matches_analytic(nn, h):
     from jno.rcwa import Rcwa
 
-    rc = Rcwa([(INF, 1.0), (h, nn**2), (INF, 1.0)], period=(1.0, 1.0), orders=5, wavelength=WL, assume_periodic=True)
+    # period 0.85 < wavelength 1.0 keeps all higher orders evanescent AND avoids the Rayleigh anomaly
+    # at wavelength == period (grazing order, NaN); a uniform slab is period-independent otherwise.
+    rc = Rcwa([(INF, 1.0), (h, nn**2), (INF, 1.0)], period=(0.85, 0.85), orders=5, wavelength=WL, assume_periodic=True)
     sol = rc.solve()
     T, R = sol.efficiency("T"), sol.efficiency("R")
     assert abs(T - tmm_slab(nn, h, WL)) < 2e-3

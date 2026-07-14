@@ -245,12 +245,25 @@ class Rcwa:
         layers = [solve_layer(e) for _, e in self.layers_spec]
         thick = [np.asarray(1.0 if t is None or t == np.inf else t) for t, _ in self.layers_spec]
         s = fm.stack_s_matrix(layers, thick)
+        # Incidence: excite the genuinely forward-propagating mode in the superstrate and normalise by
+        # ITS flux. fmmax sorts eigenmodes by eigenvalue, so index 0 need not be the 0th forward order,
+        # and a one-hot forward amplitude can carry zero forward flux -- pick the max-positive-flux mode.
+        flux_sup = np.asarray(fm.eigenmode_poynting_flux(layers[0])).reshape(-1)
+        idx = int(np.argmax(flux_sup.real))
+        Pin = float(flux_sup.real[idx])
+        if Pin <= 0:
+            raise RcwaError("no forward-propagating incident mode in the superstrate; check wavelength/period.")
         fwd = np.zeros((2 * nt, 1), complex)
-        fwd[0, 0] = 1.0
-        Pin = float(np.sum(np.asarray(fm.directional_poynting_flux(fwd, np.zeros_like(fwd), layers[0])[0])))
+        fwd[idx, 0] = 1.0
         sol = _Sol(fm, s, layers, ex, nt, Pin, wl)
         sol._fwd = fwd
         T, R = sol.efficiency("T"), sol.efficiency("R")
+        if not (np.isfinite(T) and np.isfinite(R)):
+            raise RcwaError(
+                "non-finite efficiency (NaN/inf): likely a Rayleigh/Wood anomaly where a diffraction "
+                "order is exactly grazing (the wavelength coincides with a period resonance, e.g. "
+                f"wavelength == period). Nudge the wavelength or period. (period={self.period}, wl={wl})"
+            )
         if T + R > 1.0 + 5e-3:
             raise RcwaError(
                 f"energy not conserved: T+R={T + R:.4f} > 1 at orders={self.orders}. The modal solve is "
@@ -479,6 +492,33 @@ def _extract_permittivity_coeff(volume_term):
     return functools.reduce(operator.add, mass)
 
 
+def _has_nodal_field(node):
+    """True if the coefficient depends on a per-node field parameter (needs mesh interpolation)."""
+    return any(getattr(mc.model, "_fem_field", None) == "node" for mc in _model_calls(node))
+
+
+def _sample_grid_direct(coeff_node, grid, nz, period, z_range):
+    """Evaluate an analytic coefficient expression directly on the RCWA grid (exact, no mesh noise).
+
+    Used when the permittivity is an analytic function of the coordinates (no per-node field); this
+    avoids the staircase/interp noise that makes z-slices look non-invariant on an unstructured mesh."""
+    import jax.numpy as jnp
+
+    from jno.trace import Variable
+    from jno.trace_evaluator import TraceEvaluator
+
+    xs = np.linspace(0, period[0], grid, endpoint=False)
+    ys = np.linspace(0, period[1], grid, endpoint=False)
+    zs = np.linspace(z_range[0], z_range[1], nz)
+    GX, GY, GZ = np.meshgrid(xs, ys, zs, indexing="ij")
+    pts = jnp.asarray(np.stack([GX.ravel(), GY.ravel(), GZ.ravel()], 1))
+    table = {mc.model.layer_id: mc.model.module for mc in _model_calls(coeff_node)}
+    tags = {v.tag for v in _walk_nodes(coeff_node) if isinstance(v, Variable)}
+    ctx = {t: pts for t in tags} if tags else {}
+    vals = np.asarray(TraceEvaluator(table).evaluate(coeff_node, context=ctx)).reshape(grid, grid, nz)
+    return np.moveaxis(vals, 2, 0).astype(complex), zs  # -> (nz, grid, grid)
+
+
 def _sample_grid(domain, eps_nodes, grid, nz, period, z_range):
     """Interpolate nodal eps onto an (nz, grid, grid) unit-cell array over the z-extent."""
     from scipy.interpolate import griddata
@@ -509,9 +549,12 @@ def _source_kin(femobj, domain):
             "(real, imag) operator pair. Author the field with complex=True."
         )
     opr, opi = op
-    pz = _param_zeros(femobj, femobj._constraints[0] if femobj._constraints else 0)
-    _, br = opr.evaluate(pz)
-    _, bi = opi.evaluate(pz)
+    if hasattr(opr, "evaluate"):  # lazy (parametric) operator
+        pz = _param_zeros(femobj, femobj._constraints[0] if femobj._constraints else 0)
+        _, br = opr.evaluate(pz)
+        _, bi = opi.evaluate(pz)
+    else:  # eager (parameter-free) (A, b) legs
+        br, bi = opr[1], opi[1]
     b = np.asarray(br).reshape(-1) + 1j * np.asarray(bi).reshape(-1)
     nz = np.where(np.abs(b) > 1e-9 * (np.abs(b).max() + 1e-30))[0]
     if len(nz) == 0:
@@ -601,10 +644,13 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, formu
 
     # permittivity coefficient K0^2 * eps, recovered from the volume weak form (no assembly, no eps arg)
     coeff_node = _extract_permittivity_coeff(_volume_constraint(femobj))
-    coeff_nodes = _eval_expr_nodes(coeff_node, domain)
-    if np.iscomplexobj(coeff_nodes) and np.max(np.abs(coeff_nodes.imag)) < 1e-9:
-        coeff_nodes = coeff_nodes.real.astype(complex)
-    C, zs = _sample_grid(domain, coeff_nodes, grid, nz, period, z_range)
+    if _has_nodal_field(coeff_node):  # per-node design field -> interpolate off the mesh
+        coeff_nodes = _eval_expr_nodes(coeff_node, domain)
+        if np.iscomplexobj(coeff_nodes) and np.max(np.abs(coeff_nodes.imag)) < 1e-9:
+            coeff_nodes = coeff_nodes.real.astype(complex)
+        C, zs = _sample_grid(domain, coeff_nodes, grid, nz, period, z_range)
+    else:  # analytic permittivity -> sample the grid exactly
+        C, zs = _sample_grid_direct(coeff_node, grid, nz, period, z_range)
     coeff_layers = detect_layers(C, zs, slices=slices)
 
     face_z, k_in = _source_kin(femobj, domain)
