@@ -788,11 +788,10 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
         if np.iscomplexobj(coeff_nodes) and np.max(np.abs(coeff_nodes.imag)) < 1e-9:
             coeff_nodes = coeff_nodes.real.astype(complex)
         C, zs = _sample_grid(domain, coeff_nodes, grid, nz, period, z_range)
-        zmids = None  # nodal-field path: no analytic re-sampling closure (differentiable solve unsupported)
     else:  # analytic permittivity -> sample the grid exactly
         C, zs = _sample_grid_direct(coeff_node, grid, nz, period, z_range, cparams)
     coeff_layers = detect_layers(C, zs, slices=slices)
-    zmids = detect_layers.last_zmid if not _has_nodal_field(coeff_node) else None
+    zmids = list(detect_layers.last_zmid)  # representative z of each layer (both paths) -> re-sampling
 
     face_z, k_in = _source_kin(femobj, domain, cparams)
     source_at_bottom = abs(face_z - _region_centroid(domain, bottom)[2]) < abs(face_z - _region_centroid(domain, top)[2])
@@ -801,8 +800,7 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
     # orient so the incident (source-side) ambient is layers[0] = superstrate
     if not source_at_bottom:
         coeff_layers = list(reversed(coeff_layers))
-        if zmids is not None:
-            zmids = list(reversed(zmids))
+        zmids = list(reversed(zmids))
     # k0 from the superstrate (vacuum ⇒ coeff = k0^2), unless wavelength is given
     super_coeff = float(np.real(coeff_layers[0][1]).mean())
     if wavelength is not None:
@@ -816,27 +814,36 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
     k0sq = k0 * k0
     layers = [(t, np.asarray(e) / k0sq) for t, e in coeff_layers]  # relative permittivity
 
-    # differentiable re-sampling: re-evaluate the analytic permittivity at each layer's representative z
-    # from a parameter dict, so a design (jno.np.parameter) flows through solve(params=...). Only for the
-    # analytic path (nodal-field re-sampling would need mesh interpolation -> deferred, raises in solve).
-    resample = None
-    if zmids is not None:
-        thicks = [t for t, _ in coeff_layers]
+    # differentiable re-sampling: re-evaluate the permittivity coefficient at each layer's representative z
+    # from a parameter dict, so a design (jno.np.parameter) flows through the solve. Re-deriving the WHOLE
+    # coefficient K0^2*eps handles an EPS/shape parameter (each layer's eps) AND a WAVELENGTH parameter
+    # (k0 = sqrt(coeff in the vacuum superstrate)) in one shot.
+    #
+    # A per-node (free-form / topology-optimisation) density field is interpolated to the RCWA grid by a
+    # precomputed node->grid NEAREST-index gather: the indices are fixed geometry, so ``rho_nodes[idx]`` is
+    # differentiable in the nodal density (the gradient flows to the selected nodes).
+    thicks = [t for t, _ in coeff_layers]
+    nodal_names = {
+        mc.model._parameter_name for mc in _model_calls(coeff_node) if getattr(mc.model, "_fem_field", None) == "node"
+    }
+    nearest = None
+    if nodal_names:
+        from scipy.spatial import cKDTree
 
-        def resample(params):
-            # Re-derive EVERYTHING RCWA reads from the (parameterized) permittivity coefficient K0^2*eps:
-            #   * k0 = sqrt(coeff in the vacuum superstrate)  -> a WAVELENGTH parameter flows here
-            #   * each layer's relative eps = coeff(z)/k0^2    -> an EPS/shape parameter flows here
-            # so a jno.np.parameter anywhere in the volume weak form is a differentiable knob.
-            sup = jnp.mean(jnp.real(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, grid, zmids[0]), params)))
-            k0 = jnp.sqrt(sup)
-            out = []
-            for thick, zmid in zip(thicks, zmids):
-                cvals = jnp.reshape(
-                    _eval_coeff_points(coeff_node, _cell_grid_at_z(period, grid, zmid), params), (grid, grid)
-                )
-                out.append((thick, jnp.real(cvals) / (k0 * k0)))
-            return out, 2 * jnp.pi / k0
+        tree = cKDTree(np.asarray(domain.points))
+        nearest = [np.asarray(tree.query(_cell_grid_at_z(period, grid, zm))[1]) for zm in zmids]
+
+    def resample(params):
+        def at(li):  # parameter values for layer li: nodal fields gathered to the grid, scalars as-is
+            return {k: (jnp.asarray(v)[nearest[li]] if k in nodal_names else jnp.asarray(v)) for k, v in params.items()}
+
+        sup = jnp.mean(jnp.real(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, grid, zmids[0]), at(0))))
+        k0 = jnp.sqrt(sup)
+        out = []
+        for li, (thick, zmid) in enumerate(zip(thicks, zmids)):
+            cvals = jnp.reshape(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, grid, zmid), at(li)), (grid, grid))
+            out.append((thick, jnp.real(cvals) / (k0 * k0)))
+        return out, 2 * jnp.pi / k0
 
     # the trainable jno.np.parameter(s) the permittivity depends on -> solve() returns trace nodes over
     # them (crux threads the values), so the parameterised constraint list is differentiable with no solve

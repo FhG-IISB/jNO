@@ -301,6 +301,38 @@ def test_parameter_anywhere_wavelength_and_eps_flow():
 
 
 @needs_fmmax
+def test_free_form_nodal_density_is_differentiable():
+    """A per-node (topology-optimisation) density — jno.np.parameter(<symbol>) — flows: solve() is a trace
+    node over the whole nodal field, and jax.grad w.r.t. it matches a directional finite-difference."""
+    import equinox as eqx
+    import jax
+    import jax.numpy as jnp
+
+    from jno.trace_evaluator import TraceEvaluator
+
+    constraints, _ = _build_periodic_problem(dx=0.4)  # eps = 1 + lay * proj(rho) * (EMAX-1), rho per node
+    rc = jno.rcwa(constraints, orders=40, grid=16, nz=33)
+    assert sorted(rc._rpe) == ["rho"]
+    node = rc.solve().efficiency("T")  # NO solve args -> trace node over the nodal density
+    mc = rc._rpe["rho"]
+    mod0 = mc.model.module
+    n = int(np.asarray(mod0.value).shape[0])
+
+    def T(rv):
+        mod = eqx.tree_at(lambda mm: mm.value, mod0, jnp.asarray(rv))
+        return TraceEvaluator({mc.model.layer_id: mod}).evaluate(node)
+
+    rng = np.random.default_rng(0)
+    rv0 = rng.standard_normal(n) * 0.5
+    g = np.asarray(jax.grad(T)(rv0))
+    assert np.all(np.isfinite(g)) and np.linalg.norm(g) > 1e-3  # a real, non-zero design gradient
+    d = rng.standard_normal(n)
+    h = 1e-3
+    fd = (float(T(rv0 + h * d)) - float(T(rv0 - h * d))) / (2 * h)
+    assert abs(float(g @ d) - fd) < 2e-2, f"directional grad {float(g @ d)} vs finite-diff {fd}"
+
+
+@needs_fmmax
 def test_parameter_is_traced_no_solve_args():
     """The jNO way: a jno.np.parameter in the constraint list makes rc.solve().efficiency() a TRACE NODE
     over that parameter -- differentiable through crux with NO solve arguments, exactly like jno.fem."""
