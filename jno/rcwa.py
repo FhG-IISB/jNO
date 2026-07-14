@@ -647,18 +647,52 @@ def _eval_coeff_points(coeff_node, pts, params):
     return TraceEvaluator(table).evaluate(coeff_node, context=ctx)
 
 
+class _ParametricSol:
+    """The solution of a parameterised RCWA problem. Its readouts are **trace nodes** over the graph's
+    ``jno.np.parameter`` values (exactly like a parametric ``jno.fem`` solve), so ``rc.solve().efficiency``
+    composes into a differentiable loss with **no solve arguments** -- the parameters live in the
+    constraint list, and crux threads them. One traced layer, any solver."""
+
+    def __init__(self, problem, rpe):
+        self._p, self._rpe = problem, rpe
+
+    def _node(self, method, *args):
+        from jno.trace import FunctionCall
+
+        names = list(self._rpe)
+        exprs = [self._rpe[n] for n in names]
+
+        def fn(*values):  # crux threads the current parameter values in here
+            return getattr(self._p._solve_at(dict(zip(names, values))), method)(*args)
+
+        return FunctionCall(fn, exprs, name=f"rcwa_{method}")
+
+    def efficiency(self, kind):
+        return self._node("efficiency", kind)
+
+    def order(self, m, n):
+        return self._node("order", m, n)
+
+    def field(self, *a, **k):
+        raise RcwaError(
+            "field() on a parameterised solve is not a scalar readout; reconstruct it at concrete values "
+            "with rc.solve(params={...}).field(...)."
+        )
+
+
 class _RcwaProblem:
     """An RCWA problem inferred from a jNO constraint list / FEM problem. Holds the inferred
     :class:`RcwaSpec` and builds the fmmax engine on :meth:`solve`."""
 
-    def __init__(self, spec, orders, formulation="JONES_DIRECT_FOURIER", resample=None):
+    def __init__(self, spec, orders, formulation="JONES_DIRECT_FOURIER", resample=None, rpe=None):
         self.spec = spec
         self.orders = orders
         self.formulation = formulation
-        self._resample = resample  # params -> [(thickness, eps_grid), ...]  (jax; for differentiable solves)
+        self._resample = resample  # params -> ([(thickness, eps_grid), ...], wavelength)  (jax)
+        self._rpe = rpe or {}  # {name: parameter-expr} for the trainable parameters in the graph
 
     def __repr__(self):
-        return f"_RcwaProblem(orders={self.orders}, {self.spec!r})"
+        return f"_RcwaProblem(orders={self.orders}, params={sorted(self._rpe)}, {self.spec!r})"
 
     def _engine(self):
         return Rcwa(
@@ -671,18 +705,29 @@ class _RcwaProblem:
             assume_periodic=True,
         )
 
+    def _solve_at(self, params):
+        """Concrete solve at explicit parameter values (JAX) -- re-derives eps AND wavelength from them."""
+        eng = self._engine()
+        if not params or self._resample is None:
+            return eng.solve()
+        layers, wl = self._resample(params)
+        return eng.solve(layers=layers, wavelength=wl)
+
     def solve(self, params=None, wavelength=None, k_in=None):
-        """Build the fmmax engine and solve.
+        """Solve.
 
-        Pass ``params={name: value}`` (JAX values for the trainable ``jno.np.parameter`` coefficients) to
-        get a **differentiable** solve: the permittivity AND the wavelength are re-derived from those
-        values and the whole modal solve traces, so ``jax.grad`` of a ``sol.efficiency(...)`` objective
-        flows to the design.
+        The jNO way (**no arguments**): if the constraint list carries ``jno.np.parameter`` coefficients
+        (ε, wavelength, ...), ``rc.solve()`` returns a solution whose ``.efficiency(...)`` / ``.order(...)``
+        are **trace nodes over those parameters** -- differentiable through crux with no solve args, so
+        the exact same parameterised constraint list is differentiable whether you hand it to ``jno.fem``
+        or ``jno.rcwa``. A parameter-free problem solves eagerly and returns concrete readouts.
 
-        Pass ``wavelength`` to override the inferred one -- sweep it for a **broadband / dispersion**
-        response. Pass ``k_in=(kx, ky)`` to set the transverse wavevector -- sweep it for an
-        **angle-resolved** response. Both are differentiable (``jax.grad`` in wavelength / incidence angle
-        flows too)."""
+        Escape hatches for a *forward sweep* (not the traced/optimised path): ``params={name: value}`` for
+        a concrete solve at explicit values, or ``wavelength`` / ``k_in`` to override those directly."""
+        if params is None and wavelength is None and k_in is None:
+            if self._rpe and self._resample is not None:
+                return _ParametricSol(self, self._rpe)  # parametric -> trace node (crux-differentiable)
+            return self._engine().solve()  # parameter-free -> eager concrete
         eng = self._engine()
         if params is None:
             return eng.solve(wavelength=wavelength, k_in=k_in)
@@ -692,7 +737,7 @@ class _RcwaProblem:
                 "for an analytic permittivity (no per-node field). This problem uses a nodal-field "
                 "permittivity; differentiable nodal re-sampling is not implemented yet."
             )
-        layers, wl = self._resample(params)  # eps AND wavelength re-derived from the parameters
+        layers, wl = self._resample(params)
         return eng.solve(layers=layers, wavelength=wavelength if wavelength is not None else wl, k_in=k_in)
 
 
@@ -793,6 +838,15 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
                 out.append((thick, jnp.real(cvals) / (k0 * k0)))
             return out, 2 * jnp.pi / k0
 
+    # the trainable jno.np.parameter(s) the permittivity depends on -> solve() returns trace nodes over
+    # them (crux threads the values), so the parameterised constraint list is differentiable with no solve
+    # args -- the same way jno.fem would differentiate it. (Collected from the bare coefficient tree; the
+    # ScalarView-wrapped raw constraints aren't traversed by the collector.)
+    from jno.utils.solver.parametric_helpers import _collect_runtime_parameter_exprs
+
+    rpe = {}
+    _collect_runtime_parameter_exprs(coeff_node, rpe)
+
     spec = RcwaSpec(
         period=period,
         layers=layers,
@@ -802,4 +856,4 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
         ambient_faces=(bottom, top),
         periodic_axes=axes,
     )
-    return _RcwaProblem(spec, orders=orders, formulation=formulation, resample=resample)
+    return _RcwaProblem(spec, orders=orders, formulation=formulation, resample=resample, rpe=rpe)

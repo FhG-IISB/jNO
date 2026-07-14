@@ -301,6 +301,72 @@ def test_parameter_anywhere_wavelength_and_eps_flow():
 
 
 @needs_fmmax
+def test_parameter_is_traced_no_solve_args():
+    """The jNO way: a jno.np.parameter in the constraint list makes rc.solve().efficiency() a TRACE NODE
+    over that parameter -- differentiable through crux with NO solve arguments, exactly like jno.fem."""
+    import equinox as eqx
+    import jax
+    import jax.numpy as jnp
+
+    from jno.trace import FunctionCall
+    from jno.trace_evaluator import TraceEvaluator
+
+    P0, Lz = 0.6, 3.2
+    d = jno.domain(jno.Shape.box(0, 0, 0, P0, P0, Lz, size=0.2))
+    e = 1e-6
+    for nm, f in [
+        ("left", lambda x, y, z: x < e),
+        ("right", lambda x, y, z: x > P0 - e),
+        ("front", lambda x, y, z: y < e),
+        ("back", lambda x, y, z: y > P0 - e),
+        ("bottom", lambda x, y, z: z < e),
+        ("top", lambda x, y, z: z > Lz - e),
+    ]:
+        d.tag(nm, f)
+    u, phi = d.fem_symbols()
+    xi, yi, zi, _ = d.variable("interior", split=True)
+    ui, vi = u.bind(x=xi, y=yi, z=zi), phi.bind(x=xi, y=yi, z=zi)
+
+    def fc(nm):
+        c = d.variable(nm, split=True)
+        return u.bind(x=c[0], y=c[1], z=c[2]), phi.bind(x=c[0], y=c[1], z=c[2])
+
+    ubt, vbt = fc("bottom")
+    utp, vtp = fc("top")
+    ul, _ = fc("left")
+    ur, _ = fc("right")
+    uf, _ = fc("front")
+    ubk, _ = fc("back")
+    K0 = 2 * jnp.pi
+    ep = jno.np.parameter((), name="ep").initialize(jax.nn.initializers.constant(6.0))  # a parameter in eps
+    ind = jno.fn(
+        lambda x, y, z: jnp.where(((x - 0.3) ** 2 + (y - 0.3) ** 2 < 0.18**2) & (z >= 0.8) & (z < 1.15), 1.0, 0.0),
+        [xi, yi, zi],
+    )
+    eps = 1.0 + ind * (ep - 1.0)
+    cons = [
+        ui.x * vi.x + ui.y * vi.y + ui.z * vi.z - K0**2 * eps * (u * vi),
+        -(1j * K0 * utp) * vtp,
+        -(1j * K0 * ubt - 2j * K0) * vbt,
+        ul - ur,
+        uf - ubk,
+    ]
+    rc = jno.rcwa(cons, orders=40, grid=32, nz=40, params={"ep": 6.0})
+
+    node = rc.solve().efficiency("T")  # NO solve arguments
+    assert isinstance(node, FunctionCall), type(node)
+
+    def T(v):  # thread the parameter value through the trace node -- what jno.core/crux does
+        mod = eqx.tree_at(lambda m: m.value, ep.model.module, jnp.asarray(v))
+        return TraceEvaluator({ep.model.layer_id: mod}).evaluate(node)
+
+    g = float(jax.grad(T)(6.0))
+    h = 1e-2
+    fd = (float(T(6.0 + h)) - float(T(6.0 - h))) / (2 * h)
+    assert abs(g - fd) < 5e-3, f"autodiff {g} vs finite-diff {fd}"
+
+
+@needs_fmmax
 def test_broadband_spectrum_and_wavelength_gradient():
     """Sweeping wavelength gives a dispersion curve; T is differentiable in wavelength (matches FD)."""
     import jax
