@@ -105,10 +105,11 @@ class CAResist:
         Uniform initial base-quencher loading ``B(t=0)``.
     tone:
         ``"positive"`` (default) returns the developed/soluble fraction ``1 − M``; ``"negative"`` returns ``M``.
-
-    First cut: the latent acid is driven by the 2-D aerial image (matching the dos Santos 2-D model). The
-    depth-resolved standing-wave bulk image is available from :meth:`_Exposure.bulk`; consuming it in a 3-D
-    (x, y, z) PEB solve is the next refinement.
+    film:
+        ``None`` (default) → **2-D** PEB driven by the aerial image (matching the dos Santos 2-D model),
+        returning a ``(n, n)`` pattern. A :class:`Film` → **3-D** ``(x, y, z)`` PEB on a ``jno.Shape`` box:
+        the acid is seeded from the depth-resolved standing-wave bulk image (:meth:`_Exposure.bulk`), the
+        species diffuse in x, y *and* z, and a developed ``(n, n, film.nz)`` volume is returned.
     """
 
     def __init__(
@@ -123,6 +124,7 @@ class CAResist:
         dose=1.0,
         quencher=0.4,
         tone="positive",
+        film=None,
     ):
         if tone not in ("positive", "negative"):
             raise ValueError(f"tone must be 'positive' or 'negative', got {tone!r}")
@@ -132,11 +134,15 @@ class CAResist:
         self.k = tuple(float(v) for v in k)
         self.rho_a, self.rho_b = (float(v) for v in diffusion_length)
         self.dill_c, self.dose, self.quencher, self.tone = float(dill_c), float(dose), float(quencher), tone
+        self.film = film
 
     def __call__(self, exposure):
-        """Develop an exposure through the reaction-diffusion PEB. Reads ``exposure.intensity()`` (the aerial
-        image) and ``exposure.period``; returns a developed ``(n, n)`` pattern in ``[0, 1]``."""
-        return _peb_develop(exposure.intensity(), exposure.period, self)
+        """Develop an exposure through the reaction-diffusion PEB. With no ``film`` this reads the 2-D aerial
+        image (``exposure.intensity()``) → ``(n, n)``; with a :class:`Film` it reads the depth-resolved bulk
+        image (``exposure.bulk(film)``) and solves the 3-D PEB → ``(n, n, film.nz)``. Both in ``[0, 1]``."""
+        if self.film is None:
+            return _peb_develop(exposure.intensity(), exposure.period, self)
+        return _peb_develop_3d(exposure.bulk(self.film), exposure.period, self.film, self)
 
 
 def _sample_periodic(img, x, y, period):
@@ -220,4 +226,106 @@ def _peb_develop(img, period, r):
     ix = np.round(coords[:, 0] / hx).astype(int) % n
     iy = np.round(coords[:, 1] / hy).astype(int) % n
     grid = jnp.zeros((n, n)).at[ix, iy].set(m_final)  # regrid M onto one period (differentiable in M)
+    return 1.0 - grid if r.tone == "positive" else grid
+
+
+def _sample_bulk(vol, x, y, z, period, thickness):
+    """Differentiable trilinear sample of a ``(G, G, nz)`` bulk image -- periodic in x, y (over ``period``),
+    clamped in z (over ``thickness``) -- at node coordinates ``(x, y, z)``."""
+    G, nz = vol.shape[0], vol.shape[2]
+    gx, gy = (x / period[0] % 1.0) * G, (y / period[1] % 1.0) * G
+    gz = jnp.clip(z / thickness, 0.0, 1.0) * (nz - 1)
+    x0, y0 = jnp.floor(gx).astype(int) % G, jnp.floor(gy).astype(int) % G
+    x1, y1 = (x0 + 1) % G, (y0 + 1) % G
+    z0 = jnp.clip(jnp.floor(gz).astype(int), 0, nz - 1)
+    z1 = jnp.clip(z0 + 1, 0, nz - 1)
+    fx, fy, fz = gx - jnp.floor(gx), gy - jnp.floor(gy), gz - jnp.floor(gz)
+
+    def face(zi):
+        return (
+            vol[x0, y0, zi] * (1 - fx) * (1 - fy)
+            + vol[x1, y0, zi] * fx * (1 - fy)
+            + vol[x0, y1, zi] * (1 - fx) * fy
+            + vol[x1, y1, zi] * fx * fy
+        )
+
+    return face(z0) * (1 - fz) + face(z1) * fz
+
+
+def _regrid3d(vals, coords, n, nz, period, thickness):
+    """Regrid unstructured node values onto a regular ``(n, n, nz)`` grid by nearest-cell scatter-mean
+    (differentiable in ``vals``); empty cells take the global mean."""
+    ix = np.clip((coords[:, 0] / period[0] * n).astype(int), 0, n - 1)
+    iy = np.clip((coords[:, 1] / period[1] * n).astype(int), 0, n - 1)
+    iz = np.clip((coords[:, 2] / thickness * nz).astype(int), 0, nz - 1)
+    flat = (ix * n + iy) * nz + iz
+    tot = jnp.zeros(n * n * nz).at[flat].add(vals)
+    cnt = jnp.zeros(n * n * nz).at[flat].add(1.0)
+    grid = jnp.where(cnt > 0, tot / jnp.where(cnt > 0, cnt, 1.0), jnp.mean(vals))
+    return grid.reshape(n, n, nz)
+
+
+def _peb_develop_3d(vol, period, film, r):
+    """3-D reaction-diffusion PEB on a ``jno.Shape`` box (periodic in x, y; free in z), seeded by the Dill
+    latent acid from the standing-wave bulk image ``vol`` (``(G, G, nz)``). The species diffuse in x, y and z;
+    returns the developed ``(n, n, film.nz)`` volume. ``jno`` is imported lazily (no package import cycle)."""
+    import jno
+    from jno.trace_evaluator import TraceEvaluator
+
+    Px, Py = period
+    d, n = float(film.thickness), r.n
+    k1, k2, k3, k4, k5 = r.k
+    d_a, d_b = r.rho_a**2 / (2.0 * r.t_peb), r.rho_b**2 / (2.0 * r.t_peb)
+    size = min(Px, Py, d) / 4.0  # isotropic tets; ≥ ~4 elements through the thinnest dimension
+
+    dom = jno.Shape.box(0.0, 0.0, 0.0, Px, Py, d, size=size).domain(
+        time=(0.0, r.t_peb, r.steps), compute_mesh_connectivity=False
+    )
+    ex, ey = 1e-6 * Px, 1e-6 * Py
+    for nm, pred in {
+        "left": lambda x, y, z: x < ex,
+        "right": lambda x, y, z: x > Px - ex,
+        "front": lambda x, y, z: y < ey,
+        "back": lambda x, y, z: y > Py - ey,
+    }.items():
+        dom.tag(nm, pred)
+    dom._remesh_periodic([("left", "right"), ("front", "back")])  # conforming x,y faces for the nodal ties
+    M, pM = dom.fem_symbols(names=("M", "pM"))
+    A, pA = dom.fem_symbols(names=("A", "pA"))
+    B, pB = dom.fem_symbols(names=("B", "pB"))
+    xi, yi, zi, ti = dom.variable("interior", split=True)
+    ci = dom.variable("initial", split=True)
+    xl, yl, zl, _ = dom.variable("left", split=True)
+    xr, yr, zr, _ = dom.variable("right", split=True)
+    xf, yf, zf, _ = dom.variable("front", split=True)
+    xk, yk, zk, _ = dom.variable("back", split=True)
+    Mi, qM = M.bind(x=xi, y=yi, z=zi, t=ti), pM.bind(x=xi, y=yi, z=zi, t=ti)
+    Ai, qA = A.bind(x=xi, y=yi, z=zi, t=ti), pA.bind(x=xi, y=yi, z=zi, t=ti)
+    Bi, qB = B.bind(x=xi, y=yi, z=zi, t=ti), pB.bind(x=xi, y=yi, z=zi, t=ti)
+
+    def acid0(x, y, z):  # Dill latent acid from the bulk image at the film nodes
+        return 1.0 - jnp.exp(-r.dill_c * r.dose * _sample_bulk(vol, x, y, z, period, d))
+
+    A0 = jno.fn(acid0, [ci[0], ci[1], ci[2]])
+    fem = jno.fem(
+        [
+            Mi.t * qM + k1 * Mi * Ai * qM + k2 * Mi * qM,  # inhibitor: immobile, reaction only
+            Ai.t * qA + d_a * (Ai.x * qA.x + Ai.y * qA.y + Ai.z * qA.z) + k3 * Ai * qA + k4 * Ai * Bi * qA,  # acid
+            Bi.t * qB + d_b * (Bi.x * qB.x + Bi.y * qB.y + Bi.z * qB.z) + k4 * Ai * Bi * qB + k5 * Bi * qB,  # quencher
+            M(xl, yl, zl) - M(xr, yr, zr),
+            M(xf, yf, zf) - M(xk, yk, zk),
+            A(xl, yl, zl) - A(xr, yr, zr),
+            A(xf, yf, zf) - A(xk, yk, zk),
+            B(xl, yl, zl) - B(xr, yr, zr),
+            B(xf, yf, zf) - B(xk, yk, zk),
+            M(ci[0], ci[1], ci[2]) - 1.0,
+            A(ci[0], ci[1], ci[2]) - A0,
+            B(ci[0], ci[1], ci[2]) - r.quencher,
+        ]
+    )
+    node = fem.solve()
+    traj = TraceEvaluator({}).evaluate(node.expr if hasattr(node, "expr") else node, context={})
+    m_final = traj[-1][fem.offsets[0] : fem.offsets[1]]
+    coords = np.asarray(fem.field_points[0])[:, :3]
+    grid = _regrid3d(m_final, coords, n, int(film.nz), period, d)
     return 1.0 - grid if r.tone == "positive" else grid

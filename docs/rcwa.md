@@ -261,9 +261,21 @@ vol = sol.expose(NA=0.33, source=0.5).bulk(jno.litho.Film(n_resist=1.7 + 0.02j, 
 
 `jno.litho.Film` carries the resist stack (`n_resist`, `thickness`, `n_substrate`, `n_top`, `nz`). At `z = 0`
 with no substrate reflection `bulk` equals the aerial image; a reflective substrate produces a vertical
-standing wave of period `λ/(2·n_resist)`. `CAResist` currently drives its acid from the 2-D aerial image;
-consuming `bulk` in a full 3-D `(x, y, z)` PEB solve is the next refinement. `bulk` is scalar (`E_x`) with a
-single-substrate-reflection model (full multilayer Airy and a vector bulk image are future work).
+standing wave of period `λ/(2·n_resist)`. `bulk` is scalar (`E_x`) with a single-substrate-reflection model
+(full multilayer Airy and a vector bulk image are future work).
+
+**3-D PEB.** Pass a `Film` to `CAResist` and it switches from the 2-D aerial-driven bake to a full **3-D
+`(x, y, z)`** reaction-diffusion PEB: the acid is seeded from the standing-wave `bulk` image, the species
+diffuse in x, y *and* z on a `jno.Shape` box (periodic in x, y via a conforming remesh; free in z), and a
+developed `(n, n, film.nz)` volume is returned:
+
+```python
+film = jno.litho.Film(n_resist=1.6, thickness=0.1, n_substrate=4.0, nz=16)
+vol  = sol.expose(NA=0.33, source=0.5).develop(jno.litho.CAResist(film=film, n=64, t_peb=45, steps=30))
+```
+
+The film mesh is isotropic tets (size = smallest box dimension / 4), so very thin films are expensive
+(anisotropic meshing is future work). Without `film`, `CAResist` stays the 2-D model.
 
 ## The backend — explicit layers
 

@@ -394,3 +394,43 @@ def test_bulk_absorption_decays():
     vol = np.asarray(exp.bulk(jno.litho.Film(n_resist=1.7 + 0.15j, thickness=2.0, n_substrate=1.7 + 0.15j, nz=12)))
     depth_mean = vol.mean((0, 1))  # mean over (x, y) at each depth
     assert depth_mean[-1] < depth_mean[0]  # absorbed with depth
+
+
+class _FakeExposure:  # a stub exposure carrying a prescribed bulk image, for testing the 3-D PEB directly
+    def __init__(self, bulk, period):
+        self._bulk, self.period = bulk, period
+
+    def bulk(self, film):
+        return self._bulk
+
+
+def test_caresist_3d_develops_exposed_stripe():
+    """The 3-D CAResist (a jno.Shape box, periodic in x,y, species diffusing in x,y AND z) develops a printed
+    pattern: seeded from a bulk image with a bright exposed stripe in x, the exposed region clears more. A stub
+    exposure gives unambiguous contrast — fast, deterministic, no RCWA solve needed."""
+    G, nz = 24, 6
+    xs = (np.arange(G) + 0.5) / G
+    band = np.where((xs > 0.3) & (xs < 0.7), 1.0, 0.05)  # bright exposed stripe in x, uniform in y and z
+    bulk = jnp.asarray(band[:, None, None] * np.ones((1, G, nz)))
+    film = jno.litho.Film(n_resist=1.6, thickness=0.6, nz=nz)
+    resist = jno.litho.CAResist(n=16, t_peb=20.0, steps=6, dill_c=4.0, diffusion_length=(0.12, 0.08), film=film)
+    dev = np.asarray(resist(_FakeExposure(bulk, (1.2, 1.2))))
+    assert dev.shape == (16, 16, nz) and np.all(np.isfinite(dev))
+    assert dev.min() >= -0.05 and dev.max() <= 1.05  # small P1 overshoot at the sharp synthetic band edge
+    prof, nn = dev.mean((1, 2)), dev.shape[0]  # x-profile
+    mid = prof[nn // 4 : 3 * nn // 4].mean()  # exposed stripe (centre in x)
+    edge = np.concatenate([prof[: nn // 4], prof[3 * nn // 4 :]]).mean()
+    assert mid > edge + 0.02  # exposed stripe clears more than the unexposed edges
+
+
+@needs_fmmax
+def test_caresist_3d_end_to_end():
+    """The 3-D PEB wires end to end through the real optics: exp.develop(CAResist(film=...)) reads the
+    standing-wave bulk image, solves the 3-D reaction-diffusion PEB on a jno.Shape box (periodic x,y via a
+    conforming remesh), and returns a finite developed (n, n, nz) volume in [0, 1]."""
+    exp = jno.rcwa(_cons(_line), orders=40, grid=40).solve().expose(NA=0.6, source=0.4)
+    film = jno.litho.Film(n_resist=1.6, thickness=0.6, n_substrate=4.0, nz=6)
+    resist = jno.litho.CAResist(n=14, t_peb=15.0, steps=4, dill_c=4.0, diffusion_length=(0.12, 0.08), film=film)
+    dev = np.asarray(exp.develop(resist))
+    assert dev.shape == (14, 14, 6) and np.all(np.isfinite(dev))
+    assert dev.min() >= -1e-3 and dev.max() <= 1.0 + 1e-3
