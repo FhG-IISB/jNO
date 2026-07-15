@@ -19,6 +19,7 @@ import os
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")  # the fmmax solve OOMs on a small GPU at these orders
 
+import equinox as eqx  # noqa: E402
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
@@ -28,6 +29,8 @@ jax.config.update("jax_enable_x64", True)
 
 import jno  # noqa: E402
 from jno.rcwa import RcwaError  # noqa: E402
+from jno.trace import FunctionCall  # noqa: E402
+from jno.trace_evaluator import TraceEvaluator  # noqa: E402
 from jno.utils.solver.fem_adapt import _domain_from_arrays  # noqa: E402
 
 HAS_FMMAX = importlib.util.find_spec("fmmax") is not None
@@ -162,6 +165,61 @@ def test_pml_absorbs_laterally_scattered_light():
     Ta, Ra = _TR(_constraints(1.4, 3.0, _scatterer))  # real absorber -> lateral loss
     assert T0 + R0 == pytest.approx(1.0, abs=1e-2)  # σ=0 supercell conserves energy
     assert Ta + Ra < 0.98  # the PML drained laterally-diffracted power
+
+
+@needs_fmmax
+def test_pml_scatterer_is_differentiable():
+    """A design parameter on the SCATTERER inside a PML supercell flows through the solve: the PML layers are
+    re-derived from the parameter (ε̂ = ε·Λ, μ̂ = Λ), rc.solve() is a trace node, and jax.grad of transmission
+    matches a finite difference. This is inverse design of an isolated scatterer."""
+    Lx = 1.4
+    w = 0.35 * Lx
+    d = _structured_box(Lx)
+    u, phi = d.fem_symbols()
+    xi, yi, zi, _ = d.variable("interior", split=True)
+    ui, vi = u.bind(x=xi, y=yi, z=zi), phi.bind(x=xi, y=yi, z=zi)
+
+    def face(n):
+        c = d.variable(n, split=True)
+        return u.bind(x=c[0], y=c[1], z=c[2]), phi.bind(x=c[0], y=c[1], z=c[2])
+
+    ubt, vbt = face("bottom")
+    utp, vtp = face("top")
+    ul, _ = face("left")
+    ur, _ = face("right")
+    uf, _ = face("front")
+    ub, _ = face("back")
+    sx = 3.0 * (relu(w - xi) ** 2 + relu(xi - (Lx - w)) ** 2) / w**2
+    sy = 3.0 * (relu(w - yi) ** 2 + relu(yi - (Lx - w)) ** 2) / w**2
+    Sx, Sy = 1.0 + 1j * sx / K0, 1.0 + 1j * sy / K0
+    ep = jno.np.parameter((), name="ep").initialize(jax.nn.initializers.constant(6.0))  # scatterer ε inside the PML
+    ind = jno.fn(
+        lambda x, y, z: jnp.where(
+            (jnp.abs(x - Lx / 2) < 0.18) & (jnp.abs(y - Lx / 2) < 0.18) & (z >= 1.0) & (z < 2.0), 1.0, 0.0
+        ),
+        [xi, yi, zi],
+    )
+    eps = 1.0 + ind * (ep - 1.0)
+    vol = (
+        (Sy / Sx) * (ui.x * vi.x)
+        + (Sx / Sy) * (ui.y * vi.y)
+        + (Sx * Sy) * (ui.z * vi.z)
+        - K0**2 * (Sx * Sy) * eps * (u * vi)
+    )
+    cons = [vol, -(1j * K0 * utp) * vtp, -(1j * K0 * ubt - 2j * K0) * vbt, ul - ur, uf - ub]
+    rc = jno.rcwa(cons, orders=60, grid=30, params={"ep": 6.0})
+    node = rc.solve().efficiency("T")
+    assert isinstance(node, FunctionCall)
+
+    def T(v):
+        mod = eqx.tree_at(lambda m: m.value, ep.model.module, jnp.asarray(v))
+        return TraceEvaluator({ep.model.layer_id: mod}).evaluate(node)
+
+    g = float(jax.grad(T)(6.0))
+    h = 1e-2
+    fd = (float(T(6.0 + h)) - float(T(6.0 - h))) / (2 * h)
+    assert g == pytest.approx(fd, rel=3e-2)
+    assert abs(g) > 1e-3
 
 
 @needs_fmmax

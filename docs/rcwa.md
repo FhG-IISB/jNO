@@ -75,9 +75,11 @@ periodic); the absorbing frame just makes the supercell walls non-coupling, so l
 neighbour is absorbed instead of recirculated, and the cell behaves like a single isolated scatterer.
 The traced stretch is honoured **exactly** — any σ profile, not a fixed built-in one.
 
-Scope: a **uniaxial** (diagonal) **in-plane** stretch on the **scalar** Helmholtz term, forward solve.
-An off-diagonal stretch, a z-stretch (meaningless for RCWA — the S-matrix already gives outgoing-wave
-z-boundaries), or a design `jno.np.parameter` routed *through* a PML each **raise**.
+A design `jno.np.parameter` on the **scatterer** inside the PML supercell **is differentiable** — the PML
+layers are re-derived from it (`ε̂ = ε·Λ`, `μ̂ = Λ`), so `jax.grad` flows and you can inverse-design an
+*isolated* structure. Scope: a **uniaxial** (diagonal) **in-plane** stretch on the **scalar** Helmholtz
+term. An off-diagonal stretch or a z-stretch (meaningless for RCWA — the S-matrix already gives
+outgoing-wave z-boundaries) each **raise**.
 
 ## Internal sources — dipole / Gaussian emitters
 
@@ -96,15 +98,16 @@ sol.extraction("up")                   # directionality = up / (up + down)
 The front door detects the trial-free / test-present volume summand, **localizes** it (centroid → point
 `dirac_delta_source` vs Gaussian `gaussian_source(fwhm)`; which z-layer it sits in), splits the stack at the
 source plane, and drives `fmmax`'s `amplitudes_for_source`. A higher-index substrate correctly biases
-emission downward (substrate-emission enhancement — the LED/OLED extraction physics). The **amplitude /
-orientation and the design ε are differentiable** (`jax.grad` of extraction or emitted power flows through),
-so you can inverse-design the environment around a fixed emitter, or recover an unknown source strength.
+emission downward (substrate-emission enhancement — the LED/OLED extraction physics). The **amplitude,
+orientation, lateral location, z-position and Gaussian width — plus the design ε — are all differentiable**
+(`jax.grad` of extraction or emitted power flows through), so you can inverse-design the environment around
+an emitter, optimize *where* it sits, or recover an unknown source strength. Only the discrete choices
+(which layer, point-vs-Gaussian) are frozen at construction.
 
 Scope: scalar Helmholtz, the source must lie in a **finite (contrast-defined) layer**, `k_in` is nudged off
-the singular Γ-point (a single Bloch point — full Brillouin-zone averaging is future work), the source
-*location* is static (amplitude/orientation are the differentiable knobs), and a boundary plane-wave
-incidence together with an internal source **raises** (author one excitation). Purcell / LDOS (total emitted
-power ÷ a homogeneous-medium reference) is not wired yet.
+the singular Γ-point (a single Bloch point — full Brillouin-zone averaging is future work), and a boundary
+plane-wave incidence together with an internal source **raises** (author one excitation). Purcell / LDOS
+(total emitted power ÷ a homogeneous-medium reference) is not wired yet.
 
 ## The backend — explicit layers
 

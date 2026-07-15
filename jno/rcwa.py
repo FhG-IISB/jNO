@@ -458,16 +458,16 @@ class Rcwa:
         fm, lv, ex = self.fm, self._lv, self._ex
         layers, thick = self._eigensolve_stack(layers_spec, wl, kin)
         si = source["layer"]
-        tu, tl = jnp.asarray(source["t_upper"]), jnp.asarray(source["t_lower"])
+        tu, tl = jnp.asarray(source["t_upper"]), jnp.asarray(source["t_lower"])  # z-split thicknesses (differentiable)
         before = layers[: si + 1]
         after = layers[si:]
         before_t = [*thick[:si], tu]
         after_t = [tl, *thick[si + 1 :]]
         s_before = fm.stack_s_matrix(before, before_t)
         s_after = fm.stack_s_matrix(after, after_t)
-        loc = jnp.asarray([[float(source["x0"]), float(source["y0"])]])
+        loc = jnp.asarray(source["loc"])  # (1, 2) lateral location -- JAX, so an emitter-placement param flows
         if source["kind"] == "gaussian":
-            base = fm.gaussian_source(jnp.asarray(float(source["fwhm"])), loc, kin, lv, ex)
+            base = fm.gaussian_source(jnp.asarray(source["fwhm"]), loc, kin, lv, ex)
         else:
             base = fm.dirac_delta_source(loc, kin, lv, ex)
         ox, oy, oz = source["orient"]
@@ -1281,8 +1281,10 @@ def _build_emitter_problem(
     ``- inner(J, v)`` forcing, split its layer, and route it to fmmax's ``amplitudes_for_source``.
 
     The Floquet-periodic supercell + absorbing z-ambients behaves as an emitter in a layered environment.
-    Scope: scalar Helmholtz layers (no tensor ε̂ / PML yet); the amplitude/orientation (and the design ε) are
-    differentiable, the source *location* is static. ``k_in`` is nudged off the singular Γ-point."""
+    Scope: scalar Helmholtz layers (no tensor ε̂ / PML yet). The amplitude, orientation, lateral location,
+    z-position (within its layer) and Gaussian width, plus the design ε, are all differentiable — only the
+    *discrete* choices (which layer, point-vs-Gaussian) are frozen at construction. ``k_in`` is nudged off
+    the singular Γ-point."""
     bottom, top = ambients
     src_node, is_vector = vsrc
     if is_aniso or is_pml:
@@ -1312,11 +1314,11 @@ def _build_emitter_problem(
     layers = [(t, np.asarray(e) / (k0 * k0)) for t, e in cl]  # scalar relative permittivity
 
     loc = _localize_source(src_node, is_vector, period, z_range, grid, nz, cparams)
-    si = tu = tl = None
+    si = lo = hi = None
     for i in range(1, len(zsp) - 1):  # the source sits in a finite (non-ambient) layer
-        lo, hi = zsp[i]
-        if lo - 1e-9 <= loc["z0"] <= hi + 1e-9:
-            si, tu, tl = i, float(hi - loc["z0"]), float(loc["z0"] - lo)
+        zlo, zhi = zsp[i]
+        if zlo - 1e-9 <= loc["z0"] <= zhi + 1e-9:
+            si, lo, hi = i, zlo, zhi
             break
     if si is None:
         raise RcwaError(
@@ -1324,22 +1326,36 @@ def _build_emitter_problem(
             "within a slab whose permittivity differs from the ambients (a layer contrast defines the slab)."
         )
 
-    def comp_at(params):  # the source field's components at the centroid -> the dipole current (jx,jy,jz)
-        val = jnp.reshape(_eval_coeff_points(src_node, np.array([[loc["x0"], loc["y0"], loc["z0"]]]), params), (-1,))
-        if is_vector:
-            return (val[0], val[1], val[2])
-        return (val[0], jnp.asarray(0.0 + 0j), jnp.asarray(0.0 + 0j))  # scalar monopole -> in-plane (x) dipole
+    # static volume grid for the DIFFERENTIABLE re-derivation of the source's centroid / width from params
+    _xs = np.linspace(0, period[0], grid, endpoint=False)
+    _ys = np.linspace(0, period[1], grid, endpoint=False)
+    _zs = np.linspace(z_range[0], z_range[1], nz)
+    _GX, _GY, _GZ = np.meshgrid(_xs, _ys, _zs, indexing="ij")
+    _pts = np.stack([_GX.ravel(), _GY.ravel(), _GZ.ravel()], 1)
 
-    def make_source(params):
+    def geom_at(params):  # differentiable centroid (x0,y0,z0) + lateral σ from the |source|² distribution
+        v = _eval_coeff_points(src_node, _pts, params)
+        mag2 = jnp.sum(jnp.abs(v) ** 2, -1) if (is_vector and jnp.ndim(v) > 1) else jnp.abs(jnp.reshape(v, (-1,))) ** 2
+        w = mag2 / jnp.sum(mag2)
+        x0, y0, z0 = (jnp.sum(w * jnp.asarray(_pts[:, k])) for k in range(3))
+        sig = 0.5 * (
+            jnp.sqrt(jnp.sum((jnp.asarray(_pts[:, 0]) - x0) ** 2 * w))
+            + jnp.sqrt(jnp.sum((jnp.asarray(_pts[:, 1]) - y0) ** 2 * w))
+        )
+        return x0, y0, z0, sig
+
+    def make_source(params):  # amplitude/orientation, location (x0,y0), z-split and fwhm all differentiable
+        x0, y0, z0, sig = geom_at(params)
+        val = jnp.reshape(_eval_coeff_points(src_node, jnp.stack([x0, y0, z0]).reshape(1, 3), params), (-1,))
+        orient = (val[0], val[1], val[2]) if is_vector else (val[0], jnp.asarray(0.0 + 0j), jnp.asarray(0.0 + 0j))
         return dict(
-            x0=loc["x0"],
-            y0=loc["y0"],
+            loc=jnp.stack([x0, y0]).reshape(1, 2),
             layer=si,
-            t_upper=tu,
-            t_lower=tl,
+            t_upper=hi - z0,  # toward the top ambient (si, lo, hi fixed eagerly; z0 differentiable within the layer)
+            t_lower=z0 - lo,
             kind=loc["kind"],
-            fwhm=loc["fwhm"],
-            orient=comp_at(params),
+            fwhm=2.35482 * sig,  # FWHM = 2.355·σ (used only when kind == "gaussian")
+            orient=orient,
             amp=1.0,
         )
 
@@ -1381,16 +1397,16 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
     is given), and the **incident wave** (illuminated face + transverse angle ``k_in``, from the
     assembled forcing). An **in-plane PML** (a complex coordinate stretch in the stiffness coefficients)
     is detected and honoured as a diagonal Maxwell ``ε̂``/``μ̂`` — the supercell then behaves as an
-    isolated scatterer. Scope: uniaxial (diagonal) in-plane stretch only, scalar Helmholtz, forward
-    solve (a design parameter *through* a PML is not yet differentiable — it raises).
+    isolated scatterer, and a design parameter on the scatterer ε **is differentiable** (inverse design of
+    an isolated structure). Scope: uniaxial (diagonal) in-plane stretch only, scalar Helmholtz.
 
     An **internal source** (a ``- f·v`` / ``- inner(J, v)`` volume forcing) switches the solve to an
     emission problem: the source is localized (point vs Gaussian; dipole orientation from ``J``), the stack
     is split at the source plane, and ``sol.power("up"|"down"|"total")`` / ``sol.extraction("up"|"down")``
-    give the radiated power and directionality. The amplitude/orientation and design ε are differentiable;
-    the source *location* is static, ``k_in`` is nudged off the singular Γ-point, and the source must sit in
-    a finite (contrast-defined) layer. Scalar Helmholtz only for now; a boundary incidence + internal source
-    together raise.
+    give the radiated power and directionality. The amplitude, orientation, lateral location, z-position and
+    Gaussian width, plus the design ε, are all differentiable (only the discrete layer choice is frozen);
+    ``k_in`` is nudged off the singular Γ-point, and the source must sit in a finite (contrast-defined) layer.
+    Scalar Helmholtz only for now; a boundary incidence + internal source together raise.
 
     Parameters
     ----------
@@ -1539,7 +1555,14 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
 
             return {k: (gather(v) if k in nodal_names else jnp.asarray(v)) for k, v in params.items()}
 
-        if is_aniso:  # k0 from the superstrate's xx (isotropic vacuum ⇒ xx = k0²); tensor components per layer
+        if is_pml:  # in-plane PML: k0 at the physical-core centre (Λ=1, ε=1 ⇒ mass = k0²); 10 ε̂/μ̂ grids per layer
+            center_pt = np.array([[period[0] * 0.5, period[1] * 0.5, zmids[0]]])
+            k0 = jnp.sqrt(jnp.real(jnp.reshape(_eval_coeff_points(coeff_node, center_pt, at(0)), (-1,))[0]))
+            out = [
+                (thick, _pml_layer_components(coeff_node, stretch, period, grid, zmid, at(li), k0 * k0))
+                for li, (thick, zmid) in enumerate(zip(thicks, zmids))
+            ]
+        elif is_aniso:  # k0 from the superstrate's xx (isotropic vacuum ⇒ xx = k0²); tensor components per layer
             sup_xx = jnp.reshape(
                 _eval_coeff_points(coeff_node, _cell_grid_at_z(period, grid, zmids[0]), at(0)), (grid, grid, 3, 3)
             )
@@ -1567,14 +1590,9 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
     from jno.utils.solver.parametric_helpers import _collect_runtime_parameter_exprs
 
     rpe = {}
-    _collect_runtime_parameter_exprs(coeff_node, rpe)  # eps / wavelength parameters
+    _collect_runtime_parameter_exprs(coeff_node, rpe)  # eps / wavelength parameters (PML: the scatterer ε too)
     if src_coeff is not None:
         _collect_runtime_parameter_exprs(src_coeff, rpe)  # an incidence-angle parameter in the source
-    if is_pml and rpe:  # the eager PML layers solve fine; a design parameter through a PML re-sample is future work
-        raise RcwaError(
-            "differentiable PML is not yet supported: a jno.np.parameter flows through an in-plane PML "
-            f"problem (parameters {sorted(rpe)}). The forward PML solve works; drop the parameter to use it."
-        )
 
     spec = RcwaSpec(
         period=period,

@@ -40,7 +40,7 @@ inner, vec = jno.np.inner, jno.np.vector
 def _engine_emit(eps_sub, orient=(1, 0, 0), amp=1.0, kind="delta", fwhm=0.2):
     layers = [(float("inf"), 1.0), (1.0, 1.0), (float("inf"), eps_sub)]  # super vac / vac slab / substrate
     rc = Rcwa(layers, period=(1.0, 1.0), orders=60, wavelength=1.0, k_in=(1e-3, 1e-3), assume_periodic=True)
-    src = dict(x0=0.5, y0=0.5, layer=1, t_upper=0.5, t_lower=0.5, kind=kind, fwhm=fwhm, orient=orient, amp=amp)
+    src = dict(loc=[[0.5, 0.5]], layer=1, t_upper=0.5, t_lower=0.5, kind=kind, fwhm=fwhm, orient=orient, amp=amp)
     s = rc.solve(source=src)
     return float(s.power("up")), float(s.power("down")), float(s.extraction("up"))
 
@@ -171,6 +171,48 @@ def test_source_amplitude_is_differentiable():
     fd = (float(P(1.3 + h)) - float(P(1.3 - h))) / (2 * h)
     assert g == pytest.approx(fd, rel=2e-3)
     assert abs(g) > 1e-6  # the amplitude genuinely drives the power
+
+
+@needs_fmmax
+def test_source_width_is_differentiable():
+    """The emitter's Gaussian WIDTH (a jno.np.parameter) flows through the localization + emission solve: a
+    wider soft source couples less into the propagating modes, and jax.grad of the emitted power w.r.t. the
+    width matches a finite difference."""
+    Lx = 1.4
+    d = _sbox(Lx)
+    u, phi = d.fem_symbols()
+    xi, yi, zi, _ = d.variable("interior", split=True)
+    ui, vi = u.bind(x=xi, y=yi, z=zi), phi.bind(x=xi, y=yi, z=zi)
+
+    def face(n):
+        c = d.variable(n, split=True)
+        return u.bind(x=c[0], y=c[1], z=c[2]), phi.bind(x=c[0], y=c[1], z=c[2])
+
+    ubt, vbt = face("bottom")
+    utp, vtp = face("top")
+    ul, _ = face("left")
+    ur, _ = face("right")
+    uf, _ = face("front")
+    ub, _ = face("back")
+    eps = jno.fn(lambda x, y, z: jnp.where((z >= 1.0) & (z < 2.0), 6.0, jnp.where(z < 1.0, 3.0, 1.0)), [xi, yi, zi])
+    w = jno.np.parameter((), name="w").initialize(jax.nn.initializers.constant(0.14))
+    src = jno.np.exp(-(((xi - Lx / 2) ** 2 + (yi - Lx / 2) ** 2 + (zi - 1.5) ** 2) / (2 * w**2)))
+    vol = ui.x * vi.x + ui.y * vi.y + ui.z * vi.z - K0**2 * eps * (u * vi) - src * vi
+    rc = jno.rcwa(
+        [vol, -(1j * K0 * utp) * vtp, -(1j * K0 * ubt) * vbt, ul - ur, uf - ub], orders=40, grid=28, params={"w": 0.14}
+    )
+    node = rc.solve().power("up")
+    assert isinstance(node, FunctionCall)
+
+    def P(v):
+        mod = eqx.tree_at(lambda m: m.value, w.model.module, jnp.asarray(v))
+        return TraceEvaluator({w.model.layer_id: mod}).evaluate(node)
+
+    g = float(jax.grad(P)(0.14))
+    h = 2e-3
+    fd = (float(P(0.14 + h)) - float(P(0.14 - h))) / (2 * h)
+    assert g == pytest.approx(fd, rel=5e-3)
+    assert abs(g) > 1e-2  # the width genuinely changes the emission
 
 
 @needs_fmmax
