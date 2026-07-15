@@ -221,28 +221,36 @@ class _Sol:
         Jones basis — for the 0th order at normal incidence they are the two in-plane axes (≈ x, y); an
         isotropic stack gives a diagonal ``J`` (no conversion), an in-plane-anisotropic one an off-diagonal
         ``J`` (polarization conversion). Differentiable in the design. Returns a JAX ``(2, 2)`` array."""
-        fm, nt = self._fm, self._nt
+        fm = self._fm
         if kind == "T":
             smat, out_layer = self._s.s11, self._layers[-1]
         elif kind == "R":
             smat, out_layer = self._s.s21, self._layers[0]
         else:
             raise RcwaError(f"jones(kind): kind must be 'T' or 'R', got {kind!r}")
-        flux_in = jnp.abs(jnp.real(jnp.reshape(fm.eigenmode_poynting_flux(self._layers[0]), (-1,))))
-        flux_out = jnp.abs(jnp.real(jnp.reshape(fm.eigenmode_poynting_flux(out_layer), (-1,))))
-        # fmmax orders eigenmodes by eigenvalue, not by Fourier order — the 0th order's two polarizations are
-        # the two most-forward (largest-flux) ambient modes. The ambient is design-independent, so the two
-        # indices are fixed geometry (read eagerly); the amplitudes/normalisation stay JAX (differentiable).
-        order = np.argsort(-np.asarray(flux_in))
-        pa, pb = int(order[0]), int(order[1])
-        if _concrete(flux_in) and float(flux_in[pb]) <= 1e-9 * float(flux_in[pa] + 1e-30):
-            raise RcwaError("only one forward-propagating polarization at the 0th order; the Jones matrix is degenerate.")
+        in_layer = self._layers[0]
+        # Work in the FIELD basis, not the eigenmode basis: the 0th order is expansion index 0 (fmmax orders
+        # the zeroth term first), but the eigenmodes are eigenvalue-sorted, so an argmax(flux) pick grabs the
+        # wrong (oblique) mode for an asymmetric structure. Instead: excite the two 0th-order input plane
+        # waves as UNIFORM real-space fields (x-pol E=x̂,H=ŷ and y-pol E=ŷ,H=-x̂, both forward), and read the
+        # 0th-order component of the output field. For vacuum ambients the flux factors cancel, so |J|² is the
+        # power fraction directly (columns sum to the 0th-order efficiency).
+        gs = fm.min_array_shape_for_expansion(self._ex)
+        _u = jnp.ones((*gs, 1), complex)
+        _z = jnp.zeros((*gs, 1), complex)
+        fwd_x = jnp.reshape(fm.amplitudes_for_fields(_u, _z, _z, _u, in_layer)[0], (2 * self._nt, 1))
+        fwd_y = jnp.reshape(fm.amplitudes_for_fields(_z, _u, -_u, _z, in_layer)[0], (2 * self._nt, 1))
 
-        def col(p):  # transmitted/reflected 0th-order amplitudes for a unit-power input in polarization p
-            amp = jnp.reshape(smat @ jnp.zeros((2 * nt, 1), complex).at[p, 0].set(1.0), (-1,))
-            return jnp.stack([amp[pa] * jnp.sqrt(flux_out[pa] / flux_in[p]), amp[pb] * jnp.sqrt(flux_out[pb] / flux_in[p])])
+        def out0(fwd_in):  # the 0th-order (E_x, E_y) of the output field for this input plane wave
+            amp = smat @ fwd_in
+            zero = jnp.zeros_like(amp)
+            fa, ba = (amp, zero) if kind == "T" else (zero, amp)  # T -> forward in substrate; R -> backward in super
+            (ex, ey, _ez), _ = fm.fields_from_wave_amplitudes(fa, ba, out_layer)
+            return jnp.reshape(ex, (-1,))[0], jnp.reshape(ey, (-1,))[0]
 
-        return jnp.stack([col(pa), col(pb)], axis=1)  # (out q, in p)
+        exx, eyx = out0(fwd_x)  # input x-pol -> output (E_x, E_y)
+        exy, eyy = out0(fwd_y)  # input y-pol -> output (E_x, E_y)
+        return jnp.array([[exx, exy], [eyx, eyy]])  # J[out q, in p]
 
     def field(self, y_frac=0.5, nx=80, density=40.0):
         """Reconstruct the real-space electric field on a vertical (x–z) slice at ``y = y_frac·Py``.
