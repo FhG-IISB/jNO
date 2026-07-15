@@ -156,6 +156,36 @@ with per-stage `TraceAnnotation`s (`rcwa:eigensolve`, `rcwa:s_matrix`), prints t
 time, and writes a Perfetto trace to `./rcwa_traces`. RCWA's cost is dominated by the `O((2·n_t)³)` per-layer
 eigensolves — the trace makes that explicit (open it at `chrome://tracing` or Perfetto UI).
 
+## Aerial imaging — `sol.aerial(...)` (computational lithography)
+
+RCWA gives the rigorous **mask diffraction**; `sol.aerial(NA, source, …)` is the **litho imaging step** on
+top of it — the partially-coherent **aerial image** (wafer-plane intensity) by **Abbe** source integration:
+
+```python
+sol = jno.rcwa(mask_constraints, orders=200).solve()   # rigorous mask (mask-3D, polarization)
+img = sol.aerial(NA=0.33, source=0.5)                  # -> (grid, grid) intensity over one period
+```
+
+The mask's diffraction orders (this solution's spectrum) are projected through a lens of numerical aperture
+`NA` and summed over the illumination `source`. Everything else — wavelength, period, the complex mask
+spectrum — is read from the solve; only the optics are yours. `source` is polymorphic: a **float** `σ`
+(conventional, partial-coherence radius), a **(σ_in, σ_out) tuple** (annular), or a raw **array** of pupil
+weights (differentiable, for source-mask optimization). `defocus=` applies the quadratic pupil phase;
+`kind="R"` handles a reflective EUV mask.
+
+Because the whole chain is JAX, the image is **differentiable in the mask design and the source** — so
+`jax.grad` of a printed-vs-target loss drives **OPC / ILT / SMO**, back through the imaging *and* the RCWA
+mask solve:
+
+```python
+loss = lambda: ((jno.rcwa(mask(rho)).solve().aerial(NA=0.33, source=src) - target) ** 2).mean()
+```
+
+Validated against the imaging limits (open frame → uniform; partial coherence reduces contrast) and by
+`jax.grad` vs finite difference. Scalar (uses `E_x`); the vector high-NA form (both `E_x, E_y` with
+polarization in the pupil) and the full angular-rigorous Abbe (re-solving the mask per source point) are
+future work.
+
 ## The backend — explicit layers
 
 `jno.Rcwa` takes a hand-built stack directly; this is what the front door constructs internally:

@@ -267,6 +267,93 @@ class _Sol:
         layer_z = list(np.cumsum([float(t) for t in self._thick]))[:-1]
         return slab, [0.0, float(self._period[0]), float(zc.min()), float(zc.max())], layer_z
 
+    def _spectrum(self, kind="T"):
+        """The complex diffraction spectrum for imaging: the transverse E-field Fourier coefficients
+        ``(ex, ey)`` per diffraction order (transmitted ``"T"`` or reflected ``"R"``), read at the corrected
+        0th-order incidence. ``(0,0)`` is expansion index 0 (fmmax orders the zeroth term first)."""
+        fm = self._fm
+        smat = self._s.s11 if kind == "T" else self._s.s21
+        layer = self._layers[-1] if kind == "T" else self._layers[0]
+        fwd = smat @ self._fwd
+        (ex, ey, _ez), _ = fm.fields_from_wave_amplitudes(fwd, jnp.zeros_like(fwd), layer)
+        return jnp.reshape(ex, (-1,)), jnp.reshape(ey, (-1,))
+
+    def aerial(self, NA, source=0.7, defocus=0.0, grid=128, kind="T"):
+        """Partially-coherent **aerial image** (wafer-plane intensity) of this mask, by **Abbe** source
+        integration -- the litho imaging step on top of the rigorous RCWA mask diffraction.
+
+        The mask's diffraction orders (this solution's spectrum) are projected through a lens of numerical
+        aperture ``NA``, summed over the illumination ``source``. Everything (wavelength, period, the complex
+        mask spectrum) is read from the solve; only the optics are yours.
+
+        Parameters
+        ----------
+        NA:
+            Numerical aperture of the projection lens (an order passes the pupil when its direction cosine
+            ``|α| ≤ NA``).
+        source:
+            Illumination. A **float** ``σ`` → conventional (a filled disk of partial-coherence radius ``σ``);
+            a **(σ_in, σ_out) tuple** → annular; a raw **array** of pupil weights (differentiable, for
+            source-mask optimization).
+        defocus:
+            Defocus (same length unit as the geometry); applies the quadratic pupil phase.
+        grid:
+            Real-space resolution of the returned image (one period).
+        kind:
+            ``"T"`` (transmissive DUV mask, default) or ``"R"`` (reflective EUV mask).
+
+        Returns
+        -------
+        A ``(grid, grid)`` JAX intensity array over one period -- differentiable in the mask design and the
+        source, so ``jax.grad`` of a printed-vs-target loss drives OPC / ILT / SMO.
+
+        Notes
+        -----
+        Scalar (uses ``E_x``); the vector (high-NA) form reads both ``E_x, E_y`` with polarization in the
+        pupil -- future work. Uses the shift-invariant (Kirchhoff-like) Abbe sum on this single solve's
+        rigorous spectrum; full angular rigor (re-solving the mask per source point) is a heavier option.
+        """
+        wl = self._wl  # may be a tracer (a wavelength parameter) -- keep jax-native
+        Px, Py = float(self._period[0]), float(self._period[1])
+        ex, _ey = self._spectrum(kind)  # scalar imaging -> E_x
+        bc = np.asarray(self._ex.basis_coefficients)  # (nt, 2) static (m, n)
+        M = int(np.abs(bc).max())
+        grid = max(int(grid), 2 * M + 2)
+        A = jnp.zeros((2 * M + 1, 2 * M + 1), complex).at[bc[:, 0] + M, bc[:, 1] + M].set(ex)
+        ms = jnp.asarray(np.arange(-M, M + 1))
+        AX, AY = jnp.meshgrid(ms * wl / Px, ms * wl / Py, indexing="ij")  # α (direction cosine) per order
+        S, W = _source_grid(source, float(NA))
+        c = grid // 2
+
+        def one(s):  # image from a single source point s (a shift of the order frequencies)
+            r2 = (AX + s[0]) ** 2 + (AY + s[1]) ** 2
+            pupil = jnp.where(r2 <= NA**2, jnp.exp(-1j * jnp.pi * wl * defocus * r2), 0.0)
+            pad = jnp.zeros((grid, grid), complex).at[c - M : c + M + 1, c - M : c + M + 1].set(A * pupil)
+            E = jnp.fft.ifft2(jnp.fft.ifftshift(pad)) * (grid * grid)
+            return jnp.abs(E) ** 2
+
+        imgs = jax.vmap(one)(S)  # (Ns, grid, grid)
+        return jnp.sum(W[:, None, None] * imgs, axis=0) / jnp.sum(W)
+
+
+def _source_grid(source, NA, ns=15):
+    """Illumination source as (points, weights) on a pupil grid, for the Abbe sum. ``source`` is a float
+    (conventional disk of coherence radius σ), a (σ_in, σ_out) tuple (annular), or a raw weight array."""
+    if not np.isscalar(source) and not isinstance(source, tuple):  # a raw pupil-weight array
+        w = jnp.asarray(source).reshape(-1)
+        ns = int(round(float(w.size) ** 0.5))
+    sp = np.linspace(-NA, NA, ns)
+    SX, SY = np.meshgrid(sp, sp, indexing="ij")
+    S = jnp.asarray(np.stack([SX.ravel(), SY.ravel()], 1))  # (ns², 2)
+    rn = np.hypot(np.asarray(SX).ravel(), np.asarray(SY).ravel()) / NA  # coherence radius σ per point
+    if np.isscalar(source):
+        W = jnp.asarray((rn <= float(source)).astype(float))  # conventional disk
+    elif isinstance(source, tuple):
+        W = jnp.asarray(((rn >= source[0]) & (rn <= source[1])).astype(float))  # annular
+    else:
+        W = jnp.asarray(source).reshape(-1)  # arbitrary (differentiable for SMO)
+    return S, W
+
 
 class _EmitterSol:
     """Readouts for an internal-source (dipole / Gaussian) emission solve: the power radiated **up** (into
@@ -1209,6 +1296,11 @@ class _ParametricSol:
 
     def extraction(self, kind="up"):
         return self._node("extraction", kind)
+
+    def aerial(self, NA, source=0.7, defocus=0.0, grid=128, kind="T"):
+        """The aerial image as a trace node over the mask's ``jno.np.parameter``\\ s -- so ``jax.grad`` of a
+        printed-vs-target loss flows back through the imaging AND the RCWA mask solve to the mask design (ILT)."""
+        return self._node("aerial", NA, source, defocus, grid, kind)
 
     def field(self, *a, **k):
         raise RcwaError(
