@@ -320,3 +320,28 @@ def test_printed_is_differentiable_ilt():
     g, fd = _grad_vs_fd(node, ep)
     assert g == pytest.approx(fd, rel=5e-3)
     assert abs(g) > 1e-3
+
+
+def test_caresist_validation():
+    """CAResist rejects a bad tone or a wrong-length rate-constant tuple (cheap — no solve)."""
+    with pytest.raises(ValueError):
+        jno.litho.CAResist(tone="sideways")
+    with pytest.raises(ValueError):
+        jno.litho.CAResist(k=(0.5, 0.005, 0.005))  # needs (k1..k5)
+
+
+@needs_fmmax
+def test_caresist_develops_exposed_band():
+    """The rigorous 3-species reaction-diffusion PEB resist plugs into the same develop() seam and prints:
+    exp.develop(CAResist) runs the coupled transient jno.fem PEB seeded by the Dill latent acid from this
+    exposure, returns a developed pattern in [0, 1], and the exposed (grating-line) band clears more than the
+    unexposed edges (positive tone: exposure -> acid -> deprotection -> soluble)."""
+    exp = jno.rcwa(_cons(_line), orders=40, grid=40).solve().expose(NA=0.6, source=0.4)
+    resist = jno.litho.CAResist(n=20, t_peb=20.0, steps=8, dill_c=4.0, diffusion_length=(0.12, 0.08))
+    dev = np.asarray(exp.develop(resist))
+    assert dev.shape == (20, 20) and np.all(np.isfinite(dev))
+    assert dev.min() >= -1e-3 and dev.max() <= 1.0 + 1e-3  # developed fraction in [0, 1]
+    prof, nn = dev.mean(1), dev.shape[0]  # x-profile (grating uniform in y)
+    mid = prof[nn // 4 : 3 * nn // 4].mean()  # the exposed line band (centre in x)
+    edge = np.concatenate([prof[: nn // 4], prof[3 * nn // 4 :]]).mean()
+    assert mid > edge + 0.02  # exposed band clears more than the unexposed edges

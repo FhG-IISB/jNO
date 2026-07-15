@@ -227,10 +227,28 @@ loss = lambda: ((jno.rcwa(mask(rho)).solve().printed(NA=0.33, source=src, resist
 
 `Threshold` is the standard linear-diffusion + constant-threshold resist (Poonawala & Milanfar, *IEEE Trans.
 Image Process.* **16**, 774, 2007; PEB diffusion after Mack, *Fundamental Principles of Optical Lithography*,
-2007). A rigorous **reaction-diffusion PEB** resist plugs into the same `develop(...)` seam — it reads the
-exposure's angular spectrum (`exp.spectrum()`) to propagate a standing-wave bulk image into the resist film,
-then runs the 3-species kinetics. That model, its 3-D development-rate profile, and bulk-absorption effects
-live in the standalone photoresist model.
+2007).
+
+For a **physical** resist, `jno.litho.CAResist` plugs into the same `develop(...)` seam — the rigorous
+3-species reaction-diffusion **post-exposure bake** (dos Santos), authored as one transient `jno.fem` system:
+
+```python
+peb = jno.litho.CAResist(n=64, t_peb=45.0, steps=30, dill_c=1.0, dose=1.0, diffusion_length=(12.0, 8.0))
+dev = sol.expose(NA=0.33, source=0.5).develop(peb)   # -> developed (n, n) pattern in [0, 1]
+```
+
+It maps the exposure's aerial intensity to a **latent acid** via Dill kinetics (`A(0) = 1 − exp(−dill_c·dose·I)`),
+then bakes inhibitor `M`, acid `A`, and quencher `B`:
+
+```
+M_t = −k1 M A − k2 M                A_t = D_A ΔA − k3 A − k4 A B                B_t = D_B ΔB − k4 A B − k5 B
+```
+
+on a doubly-periodic film mesh, and returns `1 − M` (the developed/soluble fraction, positive tone). It is
+heavier than `Threshold` (a nonlinear multifield transient solve) — for **verification**, not the fast design
+loop. First cut: the latent acid is driven by the 2-D aerial image; propagating the exposure's angular
+spectrum (`exp.spectrum()`) into the resist film for the depth-resolved **standing-wave bulk image** is the
+next refinement.
 
 ## The backend — explicit layers
 
