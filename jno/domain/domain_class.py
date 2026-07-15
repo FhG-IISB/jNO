@@ -1842,6 +1842,34 @@ class domain(MeshIOMixin):
         remesh_with_mmg(self, vertex_size, copy=False, **mmg_options)
         return self
 
+    def _remesh_periodic(self, pairs) -> bool:
+        """Re-mesh IN PLACE from the stored ``jno.Shape`` geometry, making the named opposite-face ``pairs``
+        (``[(master, slave), ...]``) conforming via gmsh ``setPeriodic`` — so a Nédélec (edge) field's
+        per-edge DOFs line up one-to-one across the periodic faces. Inferred from the constraint list (the
+        periodic ties), never requested explicitly. Idempotent: returns ``False`` (a no-op) when the domain
+        is not ``Shape``-backed (a user-supplied conforming mesh is used as-is) or the pairs are already
+        applied; ``True`` after a re-mesh."""
+        from ..geometry.shape import Shape
+
+        shape = getattr(self, "_constructor_source", None)
+        if not isinstance(shape, Shape):
+            return False  # no geometry to re-mesh; rely on the mesh as given (fails loudly if non-conforming)
+        want = frozenset(frozenset(p) for p in pairs)
+        if want <= getattr(self, "_periodic_meshed", frozenset()):
+            return False  # already conforming for these face pairs
+        from ..geometry.emit import build as _emit_build
+
+        mesh, _dim, ds = _emit_build(shape, periodic=list(pairs))
+        self.mesh, self.ds = mesh, ds
+        if hasattr(self, "_reset_custom_tag_state"):
+            self._reset_custom_tag_state()
+        self._apply_mesh(mesh)
+        for name, pred in list(getattr(self, "_tag_predicates", {}).items()):  # re-materialize predicate tags
+            self.tag(name, pred)
+        self._periodic_meshed = getattr(self, "_periodic_meshed", frozenset()) | want
+        self.log.info(f"Re-meshed periodic (conforming) for face pairs {sorted(tuple(sorted(p)) for p in pairs)}")
+        return True
+
     def _build_simplex_pools(self) -> None:
         """Populate ``self._simplex_pools`` from ``_tag_edges`` / ``_tag_triangles``.
 
@@ -2712,6 +2740,7 @@ class domain(MeshIOMixin):
         occlude=True,
         inward=False,
         r_min=None,
+        near_field=True,
     ):
         """Build an :class:`~jno.domain.enclosure.Enclosure` from radiating boundary ``tags``.
 
@@ -2736,10 +2765,20 @@ class domain(MeshIOMixin):
                 use when the radiating ``tags`` are the outer walls of a **meshed cavity** (an oven /
                 furnace filled with a transparent fluid) and radiation crosses the meshed interior, so
                 the facing walls see one another. Default ``False`` (normals out of the mesh, vacuum gap).
-            r_min: Axisymmetric only. Near-field floor for the ring view-factor kernel (``R^2 -> R^2 +
-                r_min^2``), which suppresses the spuriously large (>1) view factors that near-coincident
-                or on-axis (``r -> 0``) ring pairs otherwise produce. Defaults to half the median element
-                length (matched to the mesh resolution); pass a value to override.
+            near_field: Axisymmetric only, default ``True``. Recompute the element pairs that the uniform
+                ``n_phi`` azimuthal rule cannot resolve — near-touching surfaces (two parts meeting in a
+                narrow wedge) and every element's own ring self-view — with a graded azimuthal quadrature
+                sized to each pair's peak. The ring kernel's azimuthal integrand peaks at ``phi = 0`` with
+                width ``d/r`` (``d`` = surface separation, ``r`` = radius); when ``2*pi/n_phi`` exceeds
+                that, the rule samples the peak's crest and multiplies it by a far wider step, overshooting
+                by ``~dphi/(d/r)``. That is what otherwise drives row sums well above the physical bound of
+                1 and forces the ``r_min`` fudge. Costs a one-off build-time pass over the near pairs.
+            r_min: Axisymmetric only. Near-field FLOOR for the ring kernel (``R^2 -> R^2 + r_min^2``) — a
+                fudge that caps the kernel for near-coincident rings rather than integrating them properly.
+                Defaults to ``0`` when ``near_field`` is on (the refinement handles the near field, so any
+                floor is then a pure bias) and to half the median element length otherwise. Note that the
+                legacy default is itself a ~12% systematic error on the analytic concentric-cylinder view
+                factors; pass a value to override either way.
         """
         from .enclosure import build_enclosure
 
@@ -2756,6 +2795,7 @@ class domain(MeshIOMixin):
             occlude=occlude,
             inward=inward,
             r_min=r_min,
+            near_field=near_field,
         )
 
     def compute_enclosure_view_factor(self, tags, opaque_tags=None):

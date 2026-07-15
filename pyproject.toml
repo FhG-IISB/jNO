@@ -69,6 +69,12 @@ iree = [
     "iree-base-compiler",
     "iree-base-runtime"
 ]
+# RCWA (Fourier Modal Method) backend for jno.rcwa. fmmax is imported lazily
+# inside jno/rcwa.py, so the core install stays lean and only needs this extra
+# when the periodic-layered RCWA solver is actually used.
+rcwa = [
+    "fmmax",
+]
 
 
 [tool.setuptools]
@@ -142,6 +148,7 @@ default = { solve-group = "default" }
 dev = { features = ["dev"], solve-group = "default" }
 fem = { features = ["fem"], solve-group = "default" }
 iree = { features = ["iree"], solve-group = "default" }
+rcwa = { features = ["rcwa"], solve-group = "default" }
 
 [tool.pixi.tasks]
 fmt = "ruff format ."

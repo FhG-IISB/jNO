@@ -109,6 +109,7 @@ nav:
   - Traditional Solvers:
     - Finite Element Method: fem.md
     - Finite Difference Method: fdm.md
+    - Rigorous Coupled-Wave Analysis: rcwa.md
   - Tutorials:
     - PINN:
       - Laplace 1D: tutorials/01-basics/laplace-1d.md
