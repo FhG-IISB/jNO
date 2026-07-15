@@ -1866,6 +1866,8 @@ class domain(MeshIOMixin):
         self._apply_mesh(mesh)
         for name, pred in list(getattr(self, "_tag_predicates", {}).items()):  # re-materialize predicate tags
             self.tag(name, pred)
+        if getattr(self, "_is_time_dependent", False) and self.time is not None:
+            self._add_time_dimension(*self.time)  # re-broadcast the fresh (N, D) tags across time (idempotent)
         self._periodic_meshed = getattr(self, "_periodic_meshed", frozenset()) | want
         self.log.info(f"Re-meshed periodic (conforming) for face pairs {sorted(tuple(sorted(p)) for p in pairs)}")
         return True
