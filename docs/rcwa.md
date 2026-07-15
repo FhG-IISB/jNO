@@ -40,6 +40,7 @@ What is inferred from the problem, and from where:
 | **incident wave** (lit face + angle `k_in`) | the assembled forcing `b` — a constant-phase source ⇒ normal incidence |
 | **tensor permittivity `ε̂`** | an `inner(ε̂ @ u, v)` mass term (a 3×3 `MatrixView`) — birefringence, polarization conversion |
 | **in-plane PML** | a complex coordinate stretch `S = 1 + iσ/k` in the stiffness coefficients — see below |
+| **internal source** | a `- f·v` / `- inner(J, v)` volume forcing — a dipole / Gaussian emitter — see below |
 
 The permittivity is recovered by splitting the volume weak form `∇u·∇v − K0²·ε·u·v`: the stiffness
 summands carry trial/test inside `Jacobian` nodes, the mass summand carries them as bare values, so
@@ -77,6 +78,33 @@ The traced stretch is honoured **exactly** — any σ profile, not a fixed built
 Scope: a **uniaxial** (diagonal) **in-plane** stretch on the **scalar** Helmholtz term, forward solve.
 An off-diagonal stretch, a z-stretch (meaningless for RCWA — the S-matrix already gives outgoing-wave
 z-boundaries), or a design `jno.np.parameter` routed *through* a PML each **raise**.
+
+## Internal sources — dipole / Gaussian emitters
+
+An emitter is authored the **same way you drive `jno.fem` or a PINN** — as a forcing term in the residual,
+not a special object. A scalar monopole is `- f·v`; a vector dipole is `- inner(J, v)` (with `J` a
+current-density vector giving the orientation):
+
+```python
+profile = jno.np.exp(-(((xi-x0)**2 + (yi-y0)**2 + (zi-z0)**2) / (2*w**2)))   # localized emitter
+vol = ui.x*vi.x + ui.y*vi.y + ui.z*vi.z - K0**2*eps*(u*vi) - A*profile*vi     # `- A·profile·v` forcing
+sol = jno.rcwa([vol, absorbing_top, absorbing_bottom, u_left-u_right, u_front-u_back]).solve()
+sol.power("up"), sol.power("down")     # power radiated into each ambient
+sol.extraction("up")                   # directionality = up / (up + down)
+```
+
+The front door detects the trial-free / test-present volume summand, **localizes** it (centroid → point
+`dirac_delta_source` vs Gaussian `gaussian_source(fwhm)`; which z-layer it sits in), splits the stack at the
+source plane, and drives `fmmax`'s `amplitudes_for_source`. A higher-index substrate correctly biases
+emission downward (substrate-emission enhancement — the LED/OLED extraction physics). The **amplitude /
+orientation and the design ε are differentiable** (`jax.grad` of extraction or emitted power flows through),
+so you can inverse-design the environment around a fixed emitter, or recover an unknown source strength.
+
+Scope: scalar Helmholtz, the source must lie in a **finite (contrast-defined) layer**, `k_in` is nudged off
+the singular Γ-point (a single Bloch point — full Brillouin-zone averaging is future work), the source
+*location* is static (amplitude/orientation are the differentiable knobs), and a boundary plane-wave
+incidence together with an internal source **raises** (author one excitation). Purcell / LDOS (total emitted
+power ÷ a homogeneous-medium reference) is not wired yet.
 
 ## The backend — explicit layers
 
