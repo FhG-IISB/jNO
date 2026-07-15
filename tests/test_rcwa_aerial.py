@@ -246,13 +246,33 @@ def _aerial_band(sol, **kw):  # the (min, max, span) of this mask's aerial inten
     return lo, hi, max(hi - lo, 1e-9)
 
 
+def _aerial_band_exp(exp):  # same band, read from an exposure object's intensity
+    a = np.asarray(exp.intensity())
+    lo, hi = float(a.min()), float(a.max())
+    return lo, hi, max(hi - lo, 1e-9)
+
+
+@needs_fmmax
+def test_develop_matches_printed_shortcut():
+    """The exposure/develop seam and the printed() shortcut are the same computation: exposing then
+    developing with a Threshold resist equals printed(resist=that Threshold)."""
+    sol = jno.rcwa(_cons(_line), orders=40, grid=48).solve()
+    r = jno.litho.Threshold(threshold=0.3, diffusion=0.02, steepness=40.0)
+    exp = sol.expose(NA=0.6, source=0.4)
+    via_develop = np.asarray(exp.develop(r))
+    via_printed = np.asarray(sol.printed(NA=0.6, source=0.4, resist=r))
+    assert np.allclose(via_develop, via_printed, rtol=1e-10, atol=1e-12)
+    assert np.allclose(np.asarray(exp.intensity()), np.asarray(sol.aerial(NA=0.6, source=0.4)))  # optics = aerial
+
+
 @needs_fmmax
 def test_printed_is_in_range_and_structured():
-    """The developed resist image (sol.printed) is a soft mask in [0, 1] and thresholds the line grating into
-    a printed feature — both cleared (≈0) and remaining (≈1) resist are present."""
+    """The developed resist image (via a Threshold resist) is a soft mask in [0, 1] and thresholds the line
+    grating into a printed feature — both cleared (≈0) and remaining (≈1) resist are present."""
     sol = jno.rcwa(_cons(_line), orders=60, grid=56).solve()
     lo, hi, span = _aerial_band(sol, NA=0.6, source=0.4)
-    img = np.asarray(sol.printed(NA=0.6, source=0.4, threshold=0.5 * (lo + hi), steepness=24.0 / span))
+    r = jno.litho.Threshold(threshold=0.5 * (lo + hi), steepness=24.0 / span)
+    img = np.asarray(sol.expose(NA=0.6, source=0.4).develop(r))
     assert img.min() >= 0.0 and img.max() <= 1.0 and np.all(np.isfinite(img))
     assert img.min() < 0.05 and img.max() > 0.95  # a real bilevel pattern, not a flat grey
 
@@ -260,11 +280,11 @@ def test_printed_is_in_range_and_structured():
 @needs_fmmax
 def test_threshold_sets_linewidth():
     """Raising the dose-to-clear threshold shrinks the printed feature — the CD knob is monotone."""
-    sol = jno.rcwa(_cons(_line), orders=60, grid=56).solve()
-    lo, _hi, span = _aerial_band(sol, NA=0.6, source=0.4)
+    exp = jno.rcwa(_cons(_line), orders=60, grid=56).solve().expose(NA=0.6, source=0.4)
+    lo, _hi, span = _aerial_band_exp(exp)
     k = 24.0 / span
-    w_lo = _linewidth(sol.printed(NA=0.6, source=0.4, threshold=lo + 0.35 * span, steepness=k))
-    w_hi = _linewidth(sol.printed(NA=0.6, source=0.4, threshold=lo + 0.65 * span, steepness=k))
+    w_lo = _linewidth(exp.develop(jno.litho.Threshold(threshold=lo + 0.35 * span, steepness=k)))
+    w_hi = _linewidth(exp.develop(jno.litho.Threshold(threshold=lo + 0.65 * span, steepness=k)))
     assert w_lo > w_hi  # higher threshold -> narrower printed feature
 
 
@@ -277,11 +297,11 @@ def test_peb_diffusion_smooths():
         a = np.asarray(img)
         return float(a.max() - a.min())
 
-    sol = jno.rcwa(_cons(_line), orders=60, grid=56).solve()
-    lo, hi, span = _aerial_band(sol, NA=0.6, source=0.4)
+    exp = jno.rcwa(_cons(_line), orders=60, grid=56).solve().expose(NA=0.6, source=0.4)
+    lo, hi, span = _aerial_band_exp(exp)
     thr, k = 0.5 * (lo + hi), 12.0 / span
-    c0 = contrast(sol.printed(NA=0.6, source=0.4, threshold=thr, steepness=k, diffusion=0.0))
-    c1 = contrast(sol.printed(NA=0.6, source=0.4, threshold=thr, steepness=k, diffusion=1.0))
+    c0 = contrast(exp.develop(jno.litho.Threshold(threshold=thr, steepness=k, diffusion=0.0)))
+    c1 = contrast(exp.develop(jno.litho.Threshold(threshold=thr, steepness=k, diffusion=1.0)))
     assert c1 < c0
 
 
@@ -294,7 +314,8 @@ def test_printed_is_differentiable_ilt():
     rc = jno.rcwa(cons, orders=60, grid=56, params={"ep": 2.0})
     lo, hi, span = _aerial_band(rc.solve(params={"ep": 2.0}), NA=0.6, source=0.5)  # band at the eval point
     thr, k = 0.5 * (lo + hi), 6.0 / span  # threshold in-band + moderate contrast -> the sigmoid stays active
-    node = rc.solve().printed(NA=0.6, source=0.5, threshold=thr, diffusion=0.1, steepness=k)
+    resist = jno.litho.Threshold(threshold=thr, diffusion=0.1, steepness=k)
+    node = rc.solve().printed(NA=0.6, source=0.5, resist=resist)
     assert isinstance(node, FunctionCall)
     g, fd = _grad_vs_fd(node, ep)
     assert g == pytest.approx(fd, rel=5e-3)

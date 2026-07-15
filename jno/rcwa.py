@@ -69,6 +69,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from jno.litho import Threshold  # default resist for the .develop() / .printed() lithography readout
 from jno.utils.profiling import annotate as _annot  # stage annotator for rc.solve(profile=True)
 
 
@@ -384,59 +385,68 @@ class _Sol:
         imgs = jax.vmap(one)(S)
         return jnp.sum(W[:, None, None] * imgs, axis=0) / jnp.sum(W)
 
-    def printed(
-        self,
-        NA,
-        source=0.7,
-        defocus=0.0,
-        grid=128,
-        kind="T",
-        polarization=None,
-        threshold=0.3,
-        diffusion=0.0,
-        steepness=50.0,
-    ):
-        """Developed **resist image** (the printed pattern) of this mask -- the aerial image passed through a
-        constant-threshold resist with a linear post-exposure-bake (PEB) diffusion. Closes the computational-
-        lithography chain ``mask → aerial image → resist``, so ``jax.grad`` of a printed-vs-target loss drives
-        **OPC / ILT / SMO** all the way back through development, imaging *and* the rigorous RCWA mask solve.
+    def expose(self, NA, source=0.7, defocus=0.0, grid=128, kind="T", polarization=None):
+        """The **optical exposure** of this mask at the wafer plane -- the imaging result before any resist.
 
-        The aerial image (see :meth:`aerial`; the imaging arguments ``NA … polarization`` pass straight
-        through) is optionally blurred by the PEB acid diffusion, then developed by a soft threshold:
-        ``sigmoid(steepness · (I_bake − threshold))`` ∈ ``[0, 1]`` -- 1 = clears (positive tone), a smooth
-        stand-in for the printed contour that stays differentiable.
+        Returns an :class:`_Exposure` (optics only: :meth:`_Exposure.intensity` = the aerial image,
+        :meth:`_Exposure.spectrum` = the diffraction-order angular spectrum). Turn it into a developed
+        pattern with ``exposure.develop(resist)`` for a resist model (:class:`jno.litho.Threshold`, or a
+        rigorous PEB model). The imaging arguments ``NA … polarization`` are exactly :meth:`aerial`'s."""
+        return _Exposure(self, (NA, source, defocus, grid, kind, polarization))
 
-        Parameters
-        ----------
-        threshold:
-            Dose-to-clear fraction on the aerial-intensity scale (an open frame images to ≈ 1). Raising it
-            shrinks a bright feature -- the knob that sets printed CD.
-        diffusion:
-            PEB acid-diffusion length (same length unit as the geometry; ``0`` = no bake). Applied as a
-            periodic Gaussian blur of the aerial image [Mack 2007].
-        steepness:
-            Development contrast -- the sigmoid sharpness (larger → a harder threshold / steeper resist).
-
-        Returns a ``(grid, grid)`` JAX image in ``[0, 1]``. Linear-diffusion + constant-threshold model
-        (Poonawala & Milanfar, *IEEE TIP* **16**, 774, 2007); the full reaction-diffusion PEB and the 3-D
-        development-rate profile are out of scope here (see the standalone photoresist model).
-        """
-        img = self.aerial(NA, source, defocus, grid, kind, polarization)
-        period = (float(self._period[0]), float(self._period[1]))
-        return _develop(img, float(threshold), float(diffusion), float(steepness), period)
+    def printed(self, NA, source=0.7, defocus=0.0, grid=128, kind="T", polarization=None, resist=None):
+        """Developed **resist image** (the printed pattern) -- a one-call shortcut for
+        ``expose(...).develop(resist)``. ``resist`` defaults to :class:`jno.litho.Threshold` (the fast
+        constant-threshold + PEB-diffusion model). Differentiable in the mask + source, so ``jax.grad`` of a
+        printed-vs-target loss drives **OPC / ILT / SMO** back through development, imaging *and* the RCWA
+        mask solve. Pass a different resist model (e.g. a rigorous reaction-diffusion PEB) to swap physics
+        without changing the call."""
+        return self.expose(NA, source, defocus, grid, kind, polarization).develop(resist or Threshold())
 
 
-def _develop(img, threshold, diffusion, steepness, period):
-    """Constant-threshold resist with a linear (Gaussian) PEB diffusion: blur the aerial image by the acid-
-    diffusion length (periodic, in Fourier space -- the image is one period), then soft-threshold. Axis 0 is
-    x (period ``period[0]``), axis 1 is y. Differentiable; ``diffusion == 0`` skips the blur exactly."""
-    if diffusion > 0:  # linear PEB diffusion == a periodic Gaussian blur (heat kernel over the bake)
-        fx = jnp.fft.fftfreq(img.shape[0], d=period[0] / img.shape[0])
-        fy = jnp.fft.fftfreq(img.shape[1], d=period[1] / img.shape[1])
-        FX, FY = jnp.meshgrid(fx, fy, indexing="ij")
-        ker = jnp.exp(-2.0 * (jnp.pi * diffusion) ** 2 * (FX**2 + FY**2))
-        img = jnp.real(jnp.fft.ifft2(jnp.fft.fft2(img) * ker))
-    return jax.nn.sigmoid(steepness * (img - threshold))
+class _Exposure:
+    """The **optical exposure** at the wafer plane (from :meth:`_Sol.expose`) -- optics only, no resist. A
+    resist model (any callable ``exposure -> developed field``) is applied with :meth:`develop`; the fast
+    :class:`jno.litho.Threshold` reads :meth:`intensity`, a rigorous PEB model reads :meth:`spectrum` (the
+    angular spectrum it needs for the standing-wave bulk image). Keeping the exposure resist-agnostic is what
+    lets new resist models plug in without touching the imaging code."""
+
+    def __init__(self, sol, cfg):
+        self._sol, self._cfg = sol, cfg
+        self.period = (float(sol._period[0]), float(sol._period[1]))
+
+    def intensity(self):
+        """The **aerial image** ``|E|²`` at the wafer -- a ``(grid, grid)`` JAX array (see :meth:`_Sol.aerial`;
+        the exposure's imaging config is applied). What a constant-threshold resist develops."""
+        return self._sol.aerial(*self._cfg)
+
+    def spectrum(self, polarization="x"):
+        """The **coherent diffraction-order spectrum** entering the pupil: complex transverse fields
+        ``(ex, ey)`` per order for the given input polarization, with the order indices and wavelength. This
+        is the input a rigorous resist propagates into the resist film (Fresnel + substrate → standing-wave
+        bulk image). Partial-coherence (source) integration and the film propagation itself are the resist's
+        responsibility. Returns ``(orders(nt, 2), ex(nt,), ey(nt,), wavelength, period)``."""
+        ex, ey = self._sol._spectrum(self._cfg[4], fwd=self._sol._input_pol(polarization))
+        orders = np.asarray(self._sol._ex.basis_coefficients)
+        return _Spectrum(orders, ex, ey, self._sol._wl, self.period)
+
+    def develop(self, resist):
+        """Apply a **resist model** -- any callable ``exposure -> developed field`` (the fast
+        :class:`jno.litho.Threshold`, or a rigorous PEB model). Equivalent to ``resist(self)``."""
+        return resist(self)
+
+
+@dataclass
+class _Spectrum:
+    """The coherent diffraction-order spectrum from :meth:`_Exposure.spectrum` -- the contract a rigorous
+    (bulk-image) resist reads. ``orders`` are the (m, n) Fourier indices; ``ex``/``ey`` the complex transverse
+    fields per order; direction cosines are ``orders * wavelength / period``."""
+
+    orders: np.ndarray
+    ex: jnp.ndarray
+    ey: jnp.ndarray
+    wavelength: float
+    period: tuple
 
 
 def _source_grid(source, NA, ns=15):
@@ -1405,21 +1415,18 @@ class _ParametricSol:
         printed-vs-target loss flows back through the imaging AND the RCWA mask solve to the mask design (ILT)."""
         return self._node("aerial", NA, source, defocus, grid, kind, polarization)
 
-    def printed(
-        self,
-        NA,
-        source=0.7,
-        defocus=0.0,
-        grid=128,
-        kind="T",
-        polarization=None,
-        threshold=0.3,
-        diffusion=0.0,
-        steepness=50.0,
-    ):
+    def printed(self, NA, source=0.7, defocus=0.0, grid=128, kind="T", polarization=None, resist=None):
         """The developed resist image as a trace node over the mask's ``jno.np.parameter``\\ s -- ``jax.grad``
-        of a printed-vs-target loss flows back through development, imaging AND the RCWA solve to the mask (ILT)."""
-        return self._node("printed", NA, source, defocus, grid, kind, polarization, threshold, diffusion, steepness)
+        of a printed-vs-target loss flows back through development, imaging AND the RCWA solve to the mask (ILT).
+        ``resist`` defaults to :class:`jno.litho.Threshold`; pass another resist model to swap physics."""
+        return self._node("printed", NA, source, defocus, grid, kind, polarization, resist or Threshold())
+
+    def expose(self, *a, **k):
+        raise RcwaError(
+            "expose() returns an optics object, not a scalar readout, so it is not a parametric trace node. "
+            "For a differentiable printed-resist loss use rc.solve().printed(resist=...); to inspect an "
+            "exposure at concrete values use rc.solve(params={...}).expose(...)."
+        )
 
     def field(self, *a, **k):
         raise RcwaError(
