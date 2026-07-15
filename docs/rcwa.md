@@ -246,9 +246,24 @@ M_t = −k1 M A − k2 M                A_t = D_A ΔA − k3 A − k4 A B       
 
 on a doubly-periodic film mesh, and returns `1 − M` (the developed/soluble fraction, positive tone). It is
 heavier than `Threshold` (a nonlinear multifield transient solve) — for **verification**, not the fast design
-loop. First cut: the latent acid is driven by the 2-D aerial image; propagating the exposure's angular
-spectrum (`exp.spectrum()`) into the resist film for the depth-resolved **standing-wave bulk image** is the
-next refinement.
+loop. The whole chain stays differentiable: `jax.grad` of a developed-pattern loss w.r.t. the mask matches
+finite difference through the RCWA solve → aerial image → Dill acid → transient PEB (so you can design the
+mask against the *physically-baked* pattern, not just the aerial image).
+
+**Standing-wave bulk image.** The exposure also exposes the depth-resolved field inside the resist film via
+`exp.bulk(film)` — each diffraction order is refracted into the film and interferes with its substrate
+reflection (the vertical standing wave), with absorption from a complex resist index:
+
+```python
+vol = sol.expose(NA=0.33, source=0.5).bulk(jno.litho.Film(n_resist=1.7 + 0.02j, thickness=0.1, n_substrate=4.0, nz=16))
+# -> (grid, grid, nz) intensity |E(x, y, z)|²
+```
+
+`jno.litho.Film` carries the resist stack (`n_resist`, `thickness`, `n_substrate`, `n_top`, `nz`). At `z = 0`
+with no substrate reflection `bulk` equals the aerial image; a reflective substrate produces a vertical
+standing wave of period `λ/(2·n_resist)`. `CAResist` currently drives its acid from the 2-D aerial image;
+consuming `bulk` in a full 3-D `(x, y, z)` PEB solve is the next refinement. `bulk` is scalar (`E_x`) with a
+single-substrate-reflection model (full multilayer Airy and a vector bulk image are future work).
 
 ## The backend — explicit layers
 

@@ -5,12 +5,28 @@ any callable ``exposure -> developed field`` -- so it is applied with ``exposure
 models plug in without touching the imaging code. This module ships the fast, differentiable design-loop
 model :class:`Threshold` and the rigorous 3-species reaction-diffusion PEB model :class:`CAResist`, which
 plug into the same ``develop`` seam. ``CAResist`` currently drives its latent acid from the aerial image;
-propagating the exposure's angular spectrum into the resist film (standing-wave bulk image) is the next step.
+the exposure's :meth:`_Exposure.bulk` gives the depth-resolved standing-wave field (a :class:`Film` stack),
+so consuming it in a 3-D PEB solve is the next step.
 """
+
+from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+
+@dataclass
+class Film:
+    """Resist-film stack for the standing-wave **bulk image** (:meth:`_Exposure.bulk`): a resist of index
+    ``n_resist`` (complex ⇒ absorption) and ``thickness`` on a substrate ``n_substrate``, under a top medium
+    ``n_top``, sampled at ``nz`` depths. Same length unit as the mask period."""
+
+    n_resist: complex
+    thickness: float
+    n_substrate: complex = 1.0
+    n_top: float = 1.0
+    nz: int = 16
 
 
 class Threshold:
@@ -91,8 +107,8 @@ class CAResist:
         ``"positive"`` (default) returns the developed/soluble fraction ``1 − M``; ``"negative"`` returns ``M``.
 
     First cut: the latent acid is driven by the 2-D aerial image (matching the dos Santos 2-D model). The
-    depth-resolved standing-wave bulk image (``exposure.spectrum()`` propagated into the resist film) is the
-    next refinement -- see :meth:`_Exposure.spectrum`.
+    depth-resolved standing-wave bulk image is available from :meth:`_Exposure.bulk`; consuming it in a 3-D
+    (x, y, z) PEB solve is the next refinement.
     """
 
     def __init__(

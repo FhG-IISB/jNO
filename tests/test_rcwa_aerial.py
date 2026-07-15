@@ -360,3 +360,37 @@ def test_caresist_is_differentiable_ilt():
     g, fd = _grad_vs_fd(node, ep)
     assert g == pytest.approx(fd, rel=5e-3)
     assert abs(g) > 1e-4
+
+
+@needs_fmmax
+def test_bulk_reduces_to_aerial_at_top():
+    """The standing-wave bulk image reduces to the aerial image at the top of a vacuum film (z=0, no substrate
+    reflection): exposure.bulk(vacuum)[:, :, 0] == exposure.intensity()."""
+    exp = jno.rcwa(_cons(_line), orders=40, grid=40).solve().expose(NA=0.6, source=0.4)
+    aer = np.asarray(exp.intensity())
+    vol = np.asarray(exp.bulk(jno.litho.Film(n_resist=1.0, thickness=1.0, n_substrate=1.0, nz=6)))
+    assert vol.shape == (aer.shape[0], aer.shape[1], 6)
+    assert np.allclose(vol[:, :, 0], aer, rtol=1e-6, atol=1e-9)
+
+
+@needs_fmmax
+def test_bulk_standing_wave_period():
+    """A reflective substrate makes each order interfere with its reflection → a vertical STANDING WAVE of
+    period λ/(2·n_resist). Open frame (single order), n_resist=1.7, wl=1 (K0=2π) → period ≈ 0.294."""
+    nr, d, nz = 1.7, 2.0, 64
+    exp = jno.rcwa(_cons(_open), orders=20, grid=24).solve().expose(NA=0.4, source=0.3)
+    vol = np.asarray(exp.bulk(jno.litho.Film(n_resist=nr, thickness=d, n_substrate=4.0, nz=nz)))
+    Iz = vol[vol.shape[0] // 2, vol.shape[1] // 2, :]  # I(z) at a pixel
+    Iz = Iz - Iz.mean()
+    period = 1.0 / np.fft.rfftfreq(nz, d=d / (nz - 1))[1:][np.argmax(np.abs(np.fft.rfft(Iz))[1:])]
+    assert period == pytest.approx(1.0 / (2 * nr), rel=0.15)
+
+
+@needs_fmmax
+def test_bulk_absorption_decays():
+    """An absorbing resist (complex n_resist), index-matched to the substrate (no reflection), attenuates the
+    field with depth: the depth-averaged intensity at the film bottom is below the top."""
+    exp = jno.rcwa(_cons(_open), orders=20, grid=24).solve().expose(NA=0.4, source=0.3)
+    vol = np.asarray(exp.bulk(jno.litho.Film(n_resist=1.7 + 0.15j, thickness=2.0, n_substrate=1.7 + 0.15j, nz=12)))
+    depth_mean = vol.mean((0, 1))  # mean over (x, y) at each depth
+    assert depth_mean[-1] < depth_mean[0]  # absorbed with depth

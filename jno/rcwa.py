@@ -403,13 +403,48 @@ class _Sol:
         without changing the call."""
         return self.expose(NA, source, defocus, grid, kind, polarization).develop(resist or Threshold())
 
+    def _bulk(self, cfg, film):
+        """Standing-wave **bulk image** ``|E(x, y, z)|²`` inside the resist film. Each diffraction order (a
+        plane wave at direction cosine ``(α, β)``) is refracted into the film (``k_z = k0·√(n_r² − α² − β²)``,
+        complex ⇒ absorption) and interferes with its substrate reflection ``r_s``, producing the vertical
+        standing wave. Reuses the aerial Abbe sum with a per-order depth factor; returns ``(grid, grid, nz)``.
+        Scalar (``E_x``); single-substrate-reflection model (the dominant standing wave)."""
+        NA, source, defocus, grid, kind, _polarization = cfg
+        wl = self._wl
+        Px, Py = float(self._period[0]), float(self._period[1])
+        bc = np.asarray(self._ex.basis_coefficients)
+        M = int(np.abs(bc).max())
+        grid = max(int(grid), 2 * M + 2)
+        A = jnp.zeros((2 * M + 1, 2 * M + 1), complex).at[bc[:, 0] + M, bc[:, 1] + M].set(self._spectrum(kind)[0])
+        ms = jnp.asarray(np.arange(-M, M + 1))
+        AX, AY = jnp.meshgrid(ms * wl / Px, ms * wl / Py, indexing="ij")
+        S, W = _source_grid(source, float(NA))
+        c = grid // 2
+        k0 = 2.0 * jnp.pi / wl
+        n_r, n_s, n_top = complex(film.n_resist), complex(film.n_substrate), complex(getattr(film, "n_top", 1.0))
+        d, nz = float(film.thickness), int(getattr(film, "nz", 16))
+        zs = jnp.linspace(0.0, d, nz)
+        r_s, t_top = (n_r - n_s) / (n_r + n_s), 2.0 * n_top / (n_top + n_r)  # substrate reflection + top transmission
+
+        def plane(s, z):  # one source point, one depth -> |E(x, y, z)|²
+            a2 = (AX + s[0]) ** 2 + (AY + s[1]) ** 2
+            kz = k0 * jnp.sqrt(n_r**2 - a2 + 0j)  # z-wavevector in the resist (complex ⇒ depth absorption)
+            fz = t_top * (jnp.exp(1j * kz * z) + r_s * jnp.exp(1j * kz * (2.0 * d - z)))  # down + substrate-reflected up
+            pupil = jnp.where(a2 <= NA**2, jnp.exp(-1j * jnp.pi * wl * defocus * a2) * fz, 0.0)
+            pad = jnp.zeros((grid, grid), complex).at[c - M : c + M + 1, c - M : c + M + 1].set(A * pupil)
+            return jnp.abs(jnp.fft.ifft2(jnp.fft.ifftshift(pad)) * (grid * grid)) ** 2
+
+        imgs = jax.vmap(lambda s: jax.vmap(lambda z: plane(s, z))(zs))(S)  # (Ns, nz, grid, grid)
+        vol = jnp.sum(W[:, None, None, None] * imgs, axis=0) / jnp.sum(W)  # (nz, grid, grid)
+        return jnp.moveaxis(vol, 0, -1)  # (grid, grid, nz): x, y, depth
+
 
 class _Exposure:
     """The **optical exposure** at the wafer plane (from :meth:`_Sol.expose`) -- optics only, no resist. A
     resist model (any callable ``exposure -> developed field``) is applied with :meth:`develop`; the fast
-    :class:`jno.litho.Threshold` reads :meth:`intensity`, a rigorous PEB model reads :meth:`spectrum` (the
-    angular spectrum it needs for the standing-wave bulk image). Keeping the exposure resist-agnostic is what
-    lets new resist models plug in without touching the imaging code."""
+    :class:`jno.litho.Threshold` reads :meth:`intensity`, a depth-resolved resist reads :meth:`bulk` (the
+    standing-wave field inside the film). Keeping the exposure resist-agnostic is what lets new resist models
+    plug in without touching the imaging code."""
 
     def __init__(self, sol, cfg):
         self._sol, self._cfg = sol, cfg
@@ -420,33 +455,20 @@ class _Exposure:
         the exposure's imaging config is applied). What a constant-threshold resist develops."""
         return self._sol.aerial(*self._cfg)
 
-    def spectrum(self, polarization="x"):
-        """The **coherent diffraction-order spectrum** entering the pupil: complex transverse fields
-        ``(ex, ey)`` per order for the given input polarization, with the order indices and wavelength. This
-        is the input a rigorous resist propagates into the resist film (Fresnel + substrate → standing-wave
-        bulk image). Partial-coherence (source) integration and the film propagation itself are the resist's
-        responsibility. Returns ``(orders(nt, 2), ex(nt,), ey(nt,), wavelength, period)``."""
-        ex, ey = self._sol._spectrum(self._cfg[4], fwd=self._sol._input_pol(polarization))
-        orders = np.asarray(self._sol._ex.basis_coefficients)
-        return _Spectrum(orders, ex, ey, self._sol._wl, self.period)
+    def bulk(self, film):
+        """The **standing-wave bulk image** ``|E(x, y, z)|²`` inside the resist ``film`` -- the aerial spectrum
+        propagated into the film so each order interferes with its substrate reflection (the vertical standing
+        wave) and decays by absorption (a complex resist index). ``film`` supplies ``n_resist`` (complex for
+        absorption), ``thickness``, ``n_substrate``, optional ``n_top`` (default 1) and ``nz`` (depth samples;
+        default 16) -- e.g. :class:`jno.litho.Film`. Returns a ``(grid, grid, nz)`` JAX array. At ``z = 0`` with
+        no substrate reflection it equals :meth:`intensity`. The depth-resolved input a rigorous 3-D resist
+        develops; scalar (``E_x``), single-substrate-reflection model (full multilayer Airy is a refinement)."""
+        return self._sol._bulk(self._cfg, film)
 
     def develop(self, resist):
         """Apply a **resist model** -- any callable ``exposure -> developed field`` (the fast
         :class:`jno.litho.Threshold`, or a rigorous PEB model). Equivalent to ``resist(self)``."""
         return resist(self)
-
-
-@dataclass
-class _Spectrum:
-    """The coherent diffraction-order spectrum from :meth:`_Exposure.spectrum` -- the contract a rigorous
-    (bulk-image) resist reads. ``orders`` are the (m, n) Fourier indices; ``ex``/``ey`` the complex transverse
-    fields per order; direction cosines are ``orders * wavelength / period``."""
-
-    orders: np.ndarray
-    ex: jnp.ndarray
-    ey: jnp.ndarray
-    wavelength: float
-    period: tuple
 
 
 def _source_grid(source, NA, ns=15):
