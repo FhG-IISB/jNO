@@ -345,3 +345,18 @@ def test_caresist_develops_exposed_band():
     mid = prof[nn // 4 : 3 * nn // 4].mean()  # the exposed line band (centre in x)
     edge = np.concatenate([prof[: nn // 4], prof[3 * nn // 4 :]]).mean()
     assert mid > edge + 0.02  # exposed band clears more than the unexposed edges
+
+
+@needs_fmmax
+def test_caresist_is_differentiable_ilt():
+    """ILT through the RIGOROUS resist: jax.grad of a developed-pattern loss w.r.t. the mask permittivity
+    matches finite difference through the WHOLE chain — RCWA mask solve → aerial image → Dill latent acid →
+    transient reaction-diffusion PEB → developed M. This end-to-end gradient (design the mask against the
+    physically-baked pattern) is exactly what a forward-only litho simulator cannot provide."""
+    cons, ep = _ilt_cons()
+    resist = jno.litho.CAResist(n=12, t_peb=15.0, steps=4, dill_c=4.0, diffusion_length=(0.12, 0.08))
+    node = jno.rcwa(cons, orders=30, grid=24, params={"ep": 2.0}).solve().printed(NA=0.6, source=0.5, resist=resist)
+    assert isinstance(node, FunctionCall)
+    g, fd = _grad_vs_fd(node, ep)
+    assert g == pytest.approx(fd, rel=5e-3)
+    assert abs(g) > 1e-4
