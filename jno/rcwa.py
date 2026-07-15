@@ -292,6 +292,12 @@ class Rcwa:
         self.orders, self.wavelength, self.k_in = orders, wavelength, tuple(k_in)
         self.formulation = fm.Formulation[formulation]
         self.assume_periodic = True
+        # Precompute the (design-INDEPENDENT) Fourier expansion ONCE, eagerly. fmmax's generate_expansion
+        # mixes jnp with np.linalg.norm — fine eagerly, but under jax.jit jnp ops are tracers, so recomputing
+        # it inside the traced solve raised TracerArrayConversionError. Cached here, the design solve is jit-safe.
+        self._lv = fm.LatticeVectors(u=np.array([period[0], 0.0]), v=np.array([0.0, period[1]]))
+        self._ex = fm.generate_expansion(self._lv, approximate_num_terms=orders)
+        self._nt = self._ex.num_terms
 
     def solve(self, inc=None, wavelength=None, k_in=None, layers=None):
         """Solve the stack and return a :class:`_Sol`. Raises if the wavelength is unknown or energy is
@@ -309,9 +315,7 @@ class Rcwa:
             )
         layers_spec = self.layers_spec if layers is None else layers
         kin = jnp.asarray(self.k_in if k_in is None else k_in, float)  # jax -> incidence angle is differentiable
-        lv = fm.LatticeVectors(u=np.array([self.period[0], 0.0]), v=np.array([0.0, self.period[1]]))
-        ex = fm.generate_expansion(lv, approximate_num_terms=self.orders)
-        nt = ex.num_terms
+        lv, ex, nt = self._lv, self._ex, self._nt  # precomputed eagerly in __init__ (jit-safe)
 
         def _grid(g):
             g = jnp.asarray(g) + 0j  # jax-native so a permittivity grid flows -> differentiable in ε
@@ -892,6 +896,8 @@ class _ParametricSol:
     def _node(self, method, *args):
         from jno.trace import FunctionCall
 
+        self._p._engine()  # build the engine + its Fourier expansion EAGERLY here (outside any trace) so the
+        # FunctionCall below reuses the cached engine and stays jit-safe under jax.jit(value_and_grad(...)).
         names = list(self._rpe)
         exprs = [self._rpe[n] for n in names]
 
@@ -928,15 +934,17 @@ class _RcwaProblem:
         return f"_RcwaProblem(orders={self.orders}, params={sorted(self._rpe)}, {self.spec!r})"
 
     def _engine(self):
-        return Rcwa(
-            self.spec.layers,
-            period=self.spec.period,
-            orders=self.orders,
-            wavelength=self.spec.wavelength,
-            k_in=self.spec.k_in,
-            formulation=self.formulation,
-            assume_periodic=True,
-        )
+        if getattr(self, "_eng", None) is None:  # build ONCE (warmed eagerly in _node) so the expansion is trace-free
+            self._eng = Rcwa(
+                self.spec.layers,
+                period=self.spec.period,
+                orders=self.orders,
+                wavelength=self.spec.wavelength,
+                k_in=self.spec.k_in,
+                formulation=self.formulation,
+                assume_periodic=True,
+            )
+        return self._eng
 
     def _solve_at(self, params):
         """Concrete solve at explicit parameter values (JAX) -- re-derives eps, wavelength AND k_in."""

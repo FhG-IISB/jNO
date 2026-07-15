@@ -507,3 +507,33 @@ def test_infer_and_solve_end_to_end():
     sol = rc.solve()
     T, R = sol.efficiency("T"), sol.efficiency("R")
     assert T + R <= 1.0 + 5e-3 and T >= 0 and R >= 0
+
+
+@needs_fmmax
+def test_parametric_solve_is_jit_differentiable():
+    """The parametric RCWA solve is ``jax.jit``-able: the design-INDEPENDENT Fourier expansion is cached
+    eagerly (in the engine, warmed when the trace node is built), not recomputed inside the traced solve —
+    fmmax's ``generate_expansion`` mixes jnp with ``np.linalg.norm`` and breaks under jit otherwise.
+    ``jit(grad)`` must match the un-jitted gradient."""
+    import equinox as eqx
+    import jax
+    import jax.numpy as jnp
+
+    from jno.trace_evaluator import TraceEvaluator
+
+    constraints, _ = _build_periodic_problem(dx=0.4)
+    rc = jno.rcwa(constraints, orders=40, grid=24)
+    node = rc.solve().efficiency("T")
+    mc = rc._rpe["rho"]
+    mod0 = mc.model.module
+    n = int(np.asarray(mod0.value).shape[0])
+
+    def T(rv):
+        mod = eqx.tree_at(lambda m: m.value, mod0, jnp.asarray(rv))
+        return TraceEvaluator({mc.model.layer_id: mod}).evaluate(node)
+
+    rv0 = np.random.default_rng(0).standard_normal(n) * 0.3
+    g = np.asarray(jax.grad(T)(rv0))
+    g_jit = np.asarray(jax.jit(jax.grad(T))(rv0))  # must not raise (the fix); must match
+    assert np.all(np.isfinite(g_jit))
+    np.testing.assert_allclose(g_jit, g, rtol=1e-6, atol=1e-8)
