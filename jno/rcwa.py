@@ -422,17 +422,20 @@ class Rcwa:
             layers, thick = self._eigensolve_stack(layers_spec, wl, kin)
         with _annot("rcwa:s_matrix"):
             s = fm.stack_s_matrix(layers, thick)
-        # Incidence: excite the genuinely forward-propagating mode in the superstrate and normalise by
-        # ITS flux. fmmax sorts eigenmodes by eigenvalue, so index 0 need not be the 0th forward order,
-        # and a one-hot forward amplitude can carry zero forward flux -- pick the max-positive-flux mode.
-        # (The superstrate is design-independent, so this is effectively constant, but stays jax-native so
-        # the whole solve traces under grad/jit.)
-        flux_sup = jnp.real(jnp.reshape(fm.eigenmode_poynting_flux(layers[0]), (-1,)))
-        idx = jnp.argmax(flux_sup)
-        Pin = flux_sup[idx]
+        # Incidence: the 0th diffraction order (at k_in) -- an x-polarised plane wave whose REAL-SPACE field
+        # is uniform. `argmax(eigenmode flux)` is wrong here: the (0,0) order does NOT carry the max eigenmode
+        # flux (the oblique first-ring orders can tie higher), so argmax would excite an oblique mode and tilt
+        # the incidence -- invisible in symmetric problems but wrong for anything direction-sensitive.
+        # `amplitudes_for_fields` divides out the Bloch phase, so a uniform E_x, H_y = E_x field decomposes to
+        # the forward 0th-order amplitude at k_in (jax-native, so the solve still traces under grad/jit).
+        gs = fm.min_array_shape_for_expansion(self._ex)
+        _u = jnp.ones((*gs, 1), complex)
+        _z = jnp.zeros((*gs, 1), complex)
+        fwd_amp, _bwd = fm.amplitudes_for_fields(_u, _z, _z, _u, layers[0])  # x-pol, H=+y -> forward-going
+        fwd = jnp.reshape(fwd_amp, (2 * nt, 1))
+        Pin = jnp.sum(jnp.real(fm.directional_poynting_flux(fwd, jnp.zeros_like(fwd), layers[0])[0]))
         if _concrete(Pin) and float(Pin) <= 0:
             raise RcwaError("no forward-propagating incident mode in the superstrate; check wavelength/period.")
-        fwd = jnp.zeros((2 * nt, 1), complex).at[idx, 0].set(1.0)
         sol = _Sol(fm, s, layers, self._ex, nt, Pin, wl, thick=thick, period=self.period)
         sol._fwd = fwd
         T, R = sol.efficiency("T"), sol.efficiency("R")
