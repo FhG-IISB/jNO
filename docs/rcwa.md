@@ -109,6 +109,27 @@ the singular Γ-point (a single Bloch point — full Brillouin-zone averaging is
 plane-wave incidence together with an internal source **raises** (author one excitation). Purcell / LDOS
 (total emitted power ÷ a homogeneous-medium reference) is not wired yet.
 
+## Subpixel smoothing (for inverse design)
+
+`smoothing=k` (default `1` = off) supersamples each RCWA pixel `k×k` and **area-averages** the
+permittivity, anti-aliasing material boundaries:
+
+```python
+jno.rcwa(constraints, orders=200, smoothing=3)     # 3×3 supersample per pixel, averaged
+```
+
+Why it matters for inverse design: a point-sampled ε **staircases** as a design boundary sweeps — the
+rasterized structure is piecewise-constant and only jumps when an edge crosses a grid line, so the gradient
+w.r.t. a boundary-moving parameter is jumpy (flat, then a spike). Area-averaging makes the rasterized fill —
+and hence the gradient — vary **smoothly**. It costs `k²`× more (cheap) coefficient evaluations; the fmmax
+eigensolve size is unchanged. Fully differentiable (a plain mean), threaded through every ε path (scalar,
+tensor, PML, nodal density) in both the eager and the re-sampled (parametric) solve.
+
+This is the **arithmetic** (isotropic) form of subpixel averaging — a solid, general anti-aliasing. The
+rigorous **tensor** scheme (Farjadpour et al., *Opt. Lett.* **31**, 2972 (2006): arithmetic tangential +
+harmonic normal averaging at the interface, which additionally accelerates Fourier convergence) is future
+work. Recommended `k = 2`–`4` for topology optimization; leave it off for a fixed-geometry forward solve.
+
 ## The backend — explicit layers
 
 `jno.Rcwa` takes a hand-built stack directly; this is what the front door constructs internally:
@@ -166,6 +187,9 @@ a-Si). Correctness is checked against the analytic Fresnel/transfer-matrix trans
   stretched coordinates*, Microw. Opt. Technol. Lett. **7**, 599 (1994) — the complex coordinate stretch.
 - Z. S. Sacks, D. M. Kingsland, R. Lee & J.-F. Lee, *A perfectly matched anisotropic absorber for use as
   an absorbing boundary condition*, IEEE Trans. Antennas Propag. **43**, 1460 (1995) — the uniaxial `ε̂`/`μ̂` PML.
+- A. Farjadpour et al., *Improving accuracy by subpixel smoothing in the finite-difference time domain*,
+  Opt. Lett. **31**, 2972 (2006) — the rigorous tensor subpixel-smoothing scheme (jno.rcwa currently does
+  the arithmetic form).
 
 ## API
 

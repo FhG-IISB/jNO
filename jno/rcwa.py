@@ -784,24 +784,27 @@ def _extract_pml_stretch(volume_term):
     }
 
 
-def _pml_layer_components(mass_node, stretch, period, grid, zmid, params, k0sq):
+def _pml_layer_components(mass_node, stretch, period, grid, zmid, params, k0sq, sub=1):
     """The 10 relative-permittivity/permeability grids ``(ε_xx,ε_xy,ε_yx,ε_yy,ε_zz, μ_xx,μ_xy,μ_yx,μ_yy,μ_zz)``
     of an in-plane uniaxial PML layer at height ``zmid``.
 
     ``Λ = diag(c_xx, c_yy, c_zz)`` is read off the stiffness coefficients (``stretch``); the Maxwell PML is
     ``ε̂ = ε·Λ``, ``μ̂ = Λ`` with ``ε = (K0²·ε·SₓSᵧS_z)/k0² / (c_xx·c_yy·c_zz)`` since
-    ``SₓSᵧS_z = c_xx·c_yy·c_zz``. Off-diagonal components are zero (uniaxial)."""
-    pts = _cell_grid_at_z(period, grid, zmid)
+    ``SₓSᵧS_z = c_xx·c_yy·c_zz``. Off-diagonal components are zero (uniaxial). ``sub`` = subpixel smoothing
+    (each ε̂/μ̂ component is built at ``grid·sub`` and averaged per pixel)."""
+    g = grid * sub
+    pts = _cell_grid_at_z(period, g, zmid)
 
     def samp(node):
-        v = jnp.full((grid * grid,), node) if np.isscalar(node) else _eval_coeff_points(node, pts, params)
-        return jnp.reshape(v, (grid, grid)) + 0j
+        v = jnp.full((g * g,), node) if np.isscalar(node) else _eval_coeff_points(node, pts, params)
+        return jnp.reshape(v, (g, g)) + 0j
 
     lam = [samp(stretch[ax]) for ax in (0, 1, 2)]
-    m = jnp.reshape(_eval_coeff_points(mass_node, pts, params), (grid, grid)) + 0j
+    m = jnp.reshape(_eval_coeff_points(mass_node, pts, params), (g, g)) + 0j
     eps_rel = (m / k0sq) / (lam[0] * lam[1] * lam[2])
-    z = jnp.zeros((grid, grid), complex)
-    return (eps_rel * lam[0], z, z, eps_rel * lam[1], eps_rel * lam[2], lam[0], z, z, lam[1], lam[2])
+    z = jnp.zeros((g, g), complex)
+    comps = (eps_rel * lam[0], z, z, eps_rel * lam[1], eps_rel * lam[2], lam[0], z, z, lam[1], lam[2])
+    return tuple(_pixel_average(c, grid, sub) for c in comps)
 
 
 def _extract_volume_source(volume_term):
@@ -976,22 +979,37 @@ def _kin_from_source(src_coeff, period, z0, params):
     return jnp.stack([kx, ky])
 
 
-def _sample_grid_direct(coeff_node, grid, nz, period, z_range, params=None):
+def _pixel_average(vals, grid, sub):
+    """**Subpixel smoothing**: area-average a ``(grid·sub, grid·sub[, …])`` supersampled field down to
+    ``(grid, grid[, …])`` by averaging each pixel's ``sub×sub`` block. Anti-aliases material boundaries so
+    the Fourier expansion converges faster (less Gibbs ringing) and the gradient w.r.t. a boundary-moving
+    design parameter is smooth, not staircased. A plain mean -- differentiable, works on NumPy or JAX."""
+    if sub == 1:
+        return vals
+    tail = tuple(vals.shape[2:])
+    return vals.reshape(grid, sub, grid, sub, *tail).mean(axis=(1, 3))
+
+
+def _sample_grid_direct(coeff_node, grid, nz, period, z_range, params=None, sub=1):
     """Evaluate an analytic coefficient expression directly on the RCWA grid (exact, no mesh noise).
 
     Used when the permittivity is an analytic function of the coordinates (no per-node field); this
     avoids the staircase/interp noise that makes z-slices look non-invariant on an unstructured mesh.
     ``params`` substitutes trainable-parameter values (so the eager structure/k0 inference uses valid
-    values, e.g. a K0 parameter)."""
-    xs = np.linspace(0, period[0], grid, endpoint=False)
-    ys = np.linspace(0, period[1], grid, endpoint=False)
+    values, e.g. a K0 parameter). ``sub`` supersamples each pixel ``sub×sub`` and averages (subpixel
+    smoothing)."""
+    g = grid * sub
+    xs = np.linspace(0, period[0], g, endpoint=False)
+    ys = np.linspace(0, period[1], g, endpoint=False)
     zs = np.linspace(z_range[0], z_range[1], nz)
     GX, GY, GZ = np.meshgrid(xs, ys, zs, indexing="ij")
     pts = np.stack([GX.ravel(), GY.ravel(), GZ.ravel()], 1)
     vals = np.asarray(_eval_coeff_points(coeff_node, pts, params or {}))
     if vals.ndim >= 3 and vals.shape[-2:] == (3, 3):  # anisotropic ε̂ -> layer-detect on the xx component
         vals = vals[..., 0, 0]
-    vals = vals.reshape(grid, grid, nz)
+    vals = vals.reshape(g, g, nz)
+    if sub > 1:  # anti-alias: average each pixel's sub×sub supersamples (z untouched)
+        vals = vals.reshape(grid, sub, grid, sub, nz).mean(axis=(1, 3))
     return np.moveaxis(vals, 2, 0).astype(complex), zs  # -> (nz, grid, grid)
 
 
@@ -1003,32 +1021,36 @@ def _coeff_is_tensor(coeff_node, period, z_range, params):
     return v.ndim >= 3 and v.shape[-2:] == (3, 3)
 
 
-def _tensor_components(coeff_node, period, grid, zmid, params, k0sq):
+def _tensor_components(coeff_node, period, grid, zmid, params, k0sq, sub=1):
     """The 5 relative-permittivity component grids (ε_xx, ε_xy, ε_yx, ε_yy, ε_zz) fmmax needs, sampled on the
-    unit-cell grid at height ``zmid`` from the K0²·ε̂ tensor coefficient (divided by k0²)."""
-    T = jnp.reshape(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, grid, zmid), params), (grid, grid, 3, 3))
-    T = T / k0sq
+    unit-cell grid at height ``zmid`` from the K0²·ε̂ tensor coefficient (divided by k0²). ``sub`` = subpixel
+    smoothing factor."""
+    g = grid * sub
+    T = jnp.reshape(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, g, zmid), params), (g, g, 3, 3))
+    T = _pixel_average(T, grid, sub) / k0sq
     return (T[..., 0, 0], T[..., 0, 1], T[..., 1, 0], T[..., 1, 1], T[..., 2, 2])
 
 
-def _sample_grid(domain, eps_nodes, grid, nz, period, z_range):
-    """Interpolate nodal eps onto an (nz, grid, grid) unit-cell array over the z-extent."""
+def _sample_grid(domain, eps_nodes, grid, nz, period, z_range, sub=1):
+    """Interpolate nodal eps onto an (nz, grid, grid) unit-cell array over the z-extent (``sub`` = subpixel
+    supersampling, averaged per pixel)."""
     from scipy.interpolate import griddata
 
+    g = grid * sub
     pts = np.asarray(domain.points)
-    xs = np.linspace(0, period[0], grid, endpoint=False)
-    ys = np.linspace(0, period[1], grid, endpoint=False)
+    xs = np.linspace(0, period[0], g, endpoint=False)
+    ys = np.linspace(0, period[1], g, endpoint=False)
     zs = np.linspace(z_range[0], z_range[1], nz)
     GX, GY = np.meshgrid(xs, ys, indexing="ij")
     E = np.empty((nz, grid, grid), complex)
     for k, zz in enumerate(zs):
         sel = np.abs(pts[:, 2] - zz) < (z_range[1] - z_range[0]) / (nz - 1) * 0.75 + 1e-9
         if sel.sum() < 3:
-            j = np.argsort(np.abs(pts[:, 2] - zz))[: max(3, grid)]
+            j = np.argsort(np.abs(pts[:, 2] - zz))[: max(3, g)]
             sel = np.zeros(len(pts), bool)
             sel[j] = True
         vals = griddata(pts[sel][:, :2], eps_nodes[sel], (GX, GY), method="nearest")
-        E[k] = vals
+        E[k] = vals.reshape(grid, sub, grid, sub).mean(axis=(1, 3)) if sub > 1 else vals
     return E, zs
 
 
@@ -1276,6 +1298,7 @@ def _build_emitter_problem(
     vsrc,
     is_aniso,
     is_pml,
+    sub=1,
 ):
     """Build an internal-source (dipole / Gaussian) emission problem: localize the traced ``- f·v`` /
     ``- inner(J, v)`` forcing, split its layer, and route it to fmmax's ``amplitudes_for_source``.
@@ -1362,11 +1385,12 @@ def _build_emitter_problem(
     kin = (1e-3, 1e-3)  # nudge off the singular Γ-point (exactly-normal k_in is degenerate for an internal source)
 
     def resample(params):
-        k0p = jnp.sqrt(jnp.mean(jnp.real(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, grid, zm[0]), params))))
+        g = grid * sub  # supersampled lattice for subpixel smoothing
+        k0p = jnp.sqrt(jnp.mean(jnp.real(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, g, zm[0]), params))))
         out = []
         for (thick, _), zmid in zip(layers, zm):
-            cvals = jnp.reshape(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, grid, zmid), params), (grid, grid))
-            out.append((thick, jnp.real(cvals) / (k0p * k0p)))
+            cfine = jnp.reshape(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, g, zmid), params), (g, g))
+            out.append((thick, _pixel_average(jnp.real(cfine), grid, sub) / (k0p * k0p)))
         return out, 2 * jnp.pi / k0p, kin, make_source(params)
 
     from jno.utils.solver.parametric_helpers import _collect_runtime_parameter_exprs
@@ -1387,7 +1411,18 @@ def _build_emitter_problem(
     return _RcwaProblem(spec, orders=orders, formulation=formulation, resample=resample, rpe=rpe)
 
 
-def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, params=None, formulation="JONES_DIRECT_FOURIER"):
+def rcwa(
+    problem,
+    *,
+    orders,
+    wavelength=None,
+    grid=64,
+    nz=64,
+    slices=None,
+    params=None,
+    formulation="JONES_DIRECT_FOURIER",
+    smoothing=1,
+):
     """Infer and build an RCWA problem from a jNO constraint list (or built ``FEM``).
 
     Everything is read out of the traced problem: **periodicity + period** (Floquet ties — absent ⇒
@@ -1421,12 +1456,21 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
         Transverse resolution and number of z-samples used to detect the layer stack.
     slices:
         Staircase a continuously-varying permittivity into this many layers instead of raising.
+    smoothing:
+        Subpixel-smoothing factor (default ``1`` = off). ``smoothing=k`` supersamples each RCWA pixel
+        ``k×k`` and area-averages the permittivity, anti-aliasing material boundaries. Recommended (``2``–``4``)
+        for **inverse design**: it cuts Fourier (Gibbs) ringing so fewer ``orders`` converge, and makes the
+        gradient w.r.t. a boundary-moving design parameter smooth rather than staircased. Costs ``k²``× more
+        coefficient evaluations (cheap) — the fmmax eigensolve size is unchanged.
 
     Returns
     -------
     _RcwaProblem
         Holds the inferred :class:`RcwaSpec` (``.spec``) and a :meth:`~_RcwaProblem.solve`.
     """
+    sub = int(smoothing)
+    if sub < 1:
+        raise RcwaError(f"smoothing must be a positive integer (1 = off), got {smoothing!r}.")
     femobj = _as_fem(problem)
     domain = femobj.domain
     axes, period = _periodic_period(femobj, domain)
@@ -1450,9 +1494,9 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
         coeff_nodes = _eval_expr_nodes(coeff_node, domain)
         if np.iscomplexobj(coeff_nodes) and np.max(np.abs(coeff_nodes.imag)) < 1e-9:
             coeff_nodes = coeff_nodes.real.astype(complex)
-        C, zs = _sample_grid(domain, coeff_nodes, grid, nz, period, z_range)
+        C, zs = _sample_grid(domain, coeff_nodes, grid, nz, period, z_range, sub=sub)
     else:  # analytic permittivity -> sample the grid exactly
-        C, zs = _sample_grid_direct(coeff_node, grid, nz, period, z_range, cparams)
+        C, zs = _sample_grid_direct(coeff_node, grid, nz, period, z_range, cparams, sub=sub)
     coeff_layers = detect_layers(C, zs, slices=slices)
     zmids = list(detect_layers.last_zmid)  # representative z of each layer (both paths) -> re-sampling
     zspans = list(detect_layers.last_zspan)  # (z_lo, z_hi) per layer -> place an internal source in its layer
@@ -1480,6 +1524,7 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
             vsrc,
             is_aniso,
             is_pml,
+            sub,
         )
 
     face_z, k_in = _source_kin(femobj, domain, cparams)
@@ -1509,12 +1554,17 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
     k0sq = k0 * k0
     if is_pml:  # in-plane uniaxial PML: general-anisotropic layer (ε̂ AND μ̂), 10 grids per layer
         layers = [
-            (t, tuple(np.asarray(c) for c in _pml_layer_components(coeff_node, stretch, period, grid, zm, cparams, k0sq)))
+            (
+                t,
+                tuple(
+                    np.asarray(c) for c in _pml_layer_components(coeff_node, stretch, period, grid, zm, cparams, k0sq, sub)
+                ),
+            )
             for (t, _), zm in zip(coeff_layers, zmids)
         ]
     elif is_aniso:  # relative-permittivity TENSOR per layer: (ε_xx, ε_xy, ε_yx, ε_yy, ε_zz)
         layers = [
-            (t, tuple(np.asarray(c) for c in _tensor_components(coeff_node, period, grid, zm, cparams, k0sq)))
+            (t, tuple(np.asarray(c) for c in _tensor_components(coeff_node, period, grid, zm, cparams, k0sq, sub)))
             for (t, _), zm in zip(coeff_layers, zmids)
         ]
     else:
@@ -1534,9 +1584,9 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
         mc.model._parameter_name for mc in _model_calls(coeff_node) if getattr(mc.model, "_fem_field", None) == "node"
     }
     bary = None
-    if nodal_names:
+    if nodal_names:  # bary at grid·sub -> the nodal density is interpolated on the supersampled lattice, then averaged
         nc = np.asarray(domain.points)
-        bary = [_bary_weights(nc, _cell_grid_at_z(period, grid, zm)) for zm in zmids]  # per layer: (ids, weights)
+        bary = [_bary_weights(nc, _cell_grid_at_z(period, grid * sub, zm)) for zm in zmids]  # per layer: (ids, weights)
 
     # the illuminated boundary term's forcing -> lets an incidence-ANGLE parameter in the source flow
     # (its transverse phase gradient IS k_in); None when the source has no angle to read.
@@ -1548,6 +1598,8 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
         k_in = tuple(float(x) for x in _kin_from_source(src_coeff, period, src_z, cparams))  # corrupted for N1E)
 
     def resample(params):
+        g = grid * sub  # supersampled lattice for subpixel smoothing
+
         def at(li):  # parameter values for layer li: nodal fields barycentrically interpolated, scalars as-is
             def gather(v):
                 ids, w = bary[li]
@@ -1559,27 +1611,23 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
             center_pt = np.array([[period[0] * 0.5, period[1] * 0.5, zmids[0]]])
             k0 = jnp.sqrt(jnp.real(jnp.reshape(_eval_coeff_points(coeff_node, center_pt, at(0)), (-1,))[0]))
             out = [
-                (thick, _pml_layer_components(coeff_node, stretch, period, grid, zmid, at(li), k0 * k0))
+                (thick, _pml_layer_components(coeff_node, stretch, period, grid, zmid, at(li), k0 * k0, sub))
                 for li, (thick, zmid) in enumerate(zip(thicks, zmids))
             ]
         elif is_aniso:  # k0 from the superstrate's xx (isotropic vacuum ⇒ xx = k0²); tensor components per layer
-            sup_xx = jnp.reshape(
-                _eval_coeff_points(coeff_node, _cell_grid_at_z(period, grid, zmids[0]), at(0)), (grid, grid, 3, 3)
-            )
+            sup_xx = jnp.reshape(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, g, zmids[0]), at(0)), (g, g, 3, 3))
             k0 = jnp.sqrt(jnp.mean(jnp.real(sup_xx[..., 0, 0])))
             out = [
-                (thick, _tensor_components(coeff_node, period, grid, zmid, at(li), k0 * k0))
+                (thick, _tensor_components(coeff_node, period, grid, zmid, at(li), k0 * k0, sub))
                 for li, (thick, zmid) in enumerate(zip(thicks, zmids))
             ]
         else:
-            sup = jnp.mean(jnp.real(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, grid, zmids[0]), at(0))))
+            sup = jnp.mean(jnp.real(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, g, zmids[0]), at(0))))
             k0 = jnp.sqrt(sup)
             out = []
             for li, (thick, zmid) in enumerate(zip(thicks, zmids)):
-                cvals = jnp.reshape(
-                    _eval_coeff_points(coeff_node, _cell_grid_at_z(period, grid, zmid), at(li)), (grid, grid)
-                )
-                out.append((thick, jnp.real(cvals) / (k0 * k0)))
+                cfine = jnp.reshape(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, g, zmid), at(li)), (g, g))
+                out.append((thick, _pixel_average(jnp.real(cfine), grid, sub) / (k0 * k0)))
         kin = _kin_from_source(src_coeff, period, src_z, params) if src_coeff is not None else jnp.asarray(k_in)
         return out, 2 * jnp.pi / k0, kin, None  # source=None: plane-wave incidence, not an internal source
 
