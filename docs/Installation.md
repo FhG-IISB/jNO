@@ -14,6 +14,10 @@ The finite-element assembler additionally needs `fenics-basix` (imports as `basi
 `pip install jax-neural-operators fenics-basix`, or use the pixi `fem` environment below
 (which pulls it in).
 
+The optional [RCWA solver](rcwa.md) (`jno.rcwa`, periodic-layered electromagnetics) needs `fmmax`.
+It is imported lazily, so install it only when needed via the `rcwa` extra —
+`pip install jax-neural-operators[rcwa]`, or use the pixi `rcwa` environment.
+
 GPU support is included by default — `jax-neural-operators` depends on
 `jax[cuda]>=0.10.1,<0.11`, so a standard `pip install` already pulls a
 CUDA-capable JAX wheel. The pin is tight on purpose: jNO tracks a single

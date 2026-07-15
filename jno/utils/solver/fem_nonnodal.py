@@ -338,6 +338,22 @@ def assemble_fem_nonnodal(
             "family": "Morley" if has_morley else ("Argyris" if has_argyris else "Hermite"),
         }
 
+    # N1E (H(curl) edge) topology for periodic (Floquet/Bloch) ties: each DOF is one edge's tangential
+    # moment, so a periodic tie matches boundary edges across faces (by midpoint) with an orientation sign
+    # (the lo→hi edge direction). Read back in ``_fem._build_periodic_reduction_n1e`` when ties are present.
+    if "N1E" in spaces and top is not None:
+        _evn = np.asarray(top.edge_vertices)
+        _ptsn = np.asarray(pts)
+        domain._fem_nonnodal_topology = {
+            "n_verts": int(_ptsn.shape[0]),
+            "n_edges": int(n_edges),
+            "vertex_points": _ptsn,
+            "edge_vertices": _evn,
+            "edge_midpoints": 0.5 * (_ptsn[_evn[:, 0]] + _ptsn[_evn[:, 1]]),
+            "edge_dirs": _ptsn[_evn[:, 1]] - _ptsn[_evn[:, 0]],  # lo→hi direction (sets the tangential sign)
+            "family": "N1E",
+        }
+
     # Hermite per-cell global DOF map: 3 DOFs per vertex (value, ∂x, ∂y, in basix order) + 1 interior
     # (centroid) DOF per cell. Continuity is automatic from shared global vertex ids (point functionals --
     # no edge dedup, no orientation sign; the M(cell) transform takes that role).
@@ -517,13 +533,64 @@ def assemble_fem_nonnodal(
 
     # --- BCs computed once, separate from per-mode application: the natural BC (p_D·(v·n)) is a constant
     #     RHS load; the essential edge-trace BC is a set of (dof, value) pins (mirrors 1D Dirichlet). ---
+    # A weak boundary term is either a LOAD (trial-free → into b) or a BILINEAR surface term (trial+test →
+    # into A). The only bilinear surface term wired is the N1E tangential-trace mass `c·inner(n×u, n×v)`
+    # (the impedance / first-order absorbing Maxwell BC): split it off and assemble it into the stiffness.
+    from ..._fem import _bare as _bare_nn
+    from ...trace import FunctionCall as _FC
+    from ...trace import Literal as _Lit
+
+    # A weak boundary term is one of: an N1E tangential-trace surface MASS `c·inner(n×u, n×v)` (bilinear →
+    # into A, the impedance/absorbing BC); an N1E incident LOAD `inner(g, n×v)` (trial-free → into b, the
+    # source); or an RT pressure load `p·(v·n)` (→ into b). Split each term additively and classify each
+    # summand, so a combined `i k₀·inner(n×u,n×v) + 2 i k₀·inner(g,n×v)` (absorbing + incident on one face)
+    # is routed correctly. The complex leg wraps the whole term as `real(…)`/`imag(…)` and `.real` does NOT
+    # distribute over `+`, so peel that wrapper first, split inside, then re-wrap each summand.
+    def _signed(x, sign):  # fold a −1 summand sign into the extracted coefficient/source
+        return (_Lit(-1.0) if x is None else (-1.0) * x) if sign < 0 else x
+
+    pressure_terms, surface_terms, incident_terms = {}, {}, {}
+    for region, terms in (boundary_terms or {}).items():
+        for t in terms:
+            bt = _bare_nn(t)
+            wrap, inner_expr = None, bt
+            if isinstance(bt, _FC) and getattr(bt, "_name", None) in ("real", "imag") and len(bt.args) == 1:
+                wrap, inner_expr = bt._name, bt.args[0]
+            for sign, sub in _split_additive_terms(domain, inner_expr):
+                sub_w = sub if wrap is None else (sub.real if wrap == "real" else sub.imag)
+                if (mass := _n1e_surface_mass_spec(sub_w)) is not None:
+                    surface_terms.setdefault(region, []).append(_signed(mass[0], sign))
+                elif (load := _n1e_surface_load_spec(sub_w)) is not None:
+                    incident_terms.setdefault(region, []).append(_signed(load[0], sign))
+                else:
+                    pressure_terms.setdefault(region, []).append(_apply_sign(domain, sign, sub_w))
     nat_load = (
         _apply_natural_boundary_terms(
-            jnp.zeros(total), boundary_terms, domain, field_index, spaces, top, np.asarray(pts), offs, n_cells, quad_degree
+            jnp.zeros(total), pressure_terms, domain, field_index, spaces, top, np.asarray(pts), offs, n_cells, quad_degree
         )
-        if boundary_terms
+        if pressure_terms
         else jnp.zeros(total)
     )
+    # the N1E incident forcing added to the RHS load b (∫ g·(n×v))
+    if incident_terms:
+        nat_load = nat_load + _assemble_n1e_surface_load(
+            total, incident_terms, domain, spaces, top, np.asarray(pts), offs, quad_degree, dim
+        )
+    # the tangential-trace surface mass added to A (steady linear only; unwired compositions raise below)
+    surf_mass = (
+        _assemble_n1e_surface_mass(total, surface_terms, domain, spaces, top, np.asarray(pts), offs, quad_degree, dim)
+        if surface_terms
+        else None
+    )
+    if surf_mass is not None or incident_terms:
+        _nonlinear = any(_is_obviously_nonlinear_in_unknown(domain, t) for t in volume_terms)
+        _transient = bool(ic_residuals) or any(_contains_temporal_derivative(t) for t in volume_terms)
+        if _transient or _nonlinear or runtime_parameter_tags or neural_param_names:
+            raise NotImplementedError(
+                "jno.fem (non-nodal): the N1E tangential-trace surface terms (impedance / absorbing / incident BC) "
+                "are wired for the steady linear forward problem only — not with a transient, nonlinear, or "
+                "parametric/inverse form. (Raises rather than silently dropping the surface contribution.)"
+            )
     pins = (
         _flux_bc_pins(flux_bcs, domain, field_index, spaces, top, np.asarray(pts), offs, n_cells, quad_degree, dim=dim)
         if flux_bcs
@@ -842,10 +909,210 @@ def assemble_fem_nonnodal(
 
     # --- steady linear (non-parametric): A u = b (byte-identical to before the refactor) ---
     A = jax.jacfwd(full_residual)(zeros)
+    if surf_mass is not None:  # add the tangential-trace surface mass (impedance / absorbing BC) to the stiffness
+        A = A + surf_mass
     b = -full_residual(zeros)
     if pins:
         A, b = _apply_dirichlet_symmetric(jnp.asarray(A), jnp.asarray(b), pins)
     return (A, b), "linear", offs
+
+
+def _n1e_surface_mass_spec(bare):
+    """Recognise a tangential-trace surface-mass boundary term ``[c *] inner(n×u, n×v)`` (the natural
+    N1E impedance / first-order absorbing BC for Maxwell) → a 1-tuple ``(coeff_node,)`` (``coeff_node``
+    is ``None`` when the coefficient is 1); ``None`` if the term is not of this form.
+
+    The tangential trace ``n×u`` is authored as ``u.vector.cross(nvec)`` (a ``cross`` FunctionCall over
+    the trial and the region normal), paired with the test's ``n×v`` inside an ``inner`` FunctionCall,
+    optionally scaled by a trial/test-free scalar coefficient (e.g. ``i·k₀``). Distinct from the
+    essential PEC ``n×u = 0`` (no test function → pinned, not assembled)."""
+    from ..._fem import _contains
+    from ...trace import BinaryOp, FunctionCall, Literal, TestFunction, TrialFunction
+
+    node, coeff = bare, None
+    wrap = None  # a `.real`/`.imag` wrapper from the complex leg split (Re/Im of `c·inner(n×u,n×v)`)
+    if isinstance(node, FunctionCall) and node._name in ("real", "imag") and len(node.args) == 1:
+        wrap, node = node._name, node.args[0]
+    if isinstance(node, BinaryOp) and node.op == "*":  # peel a leading/trailing scalar coefficient
+        left, right = node.left, node.right
+        l_uv = _contains(left, TrialFunction) or _contains(left, TestFunction)
+        r_uv = _contains(right, TrialFunction) or _contains(right, TestFunction)
+        if isinstance(right, FunctionCall) and right._name == "inner" and not l_uv:
+            coeff, node = left, right
+        elif isinstance(left, FunctionCall) and left._name == "inner" and not r_uv:
+            coeff, node = right, left
+    if not (isinstance(node, FunctionCall) and node._name == "inner" and len(node.args) == 2):
+        return None
+
+    def _is_cross(x, which):
+        return isinstance(x, FunctionCall) and x._name == "cross" and len(x.args) == 2 and _contains(x, which)
+
+    a0, a1 = node.args
+    ok = (_is_cross(a0, TrialFunction) and _is_cross(a1, TestFunction)) or (
+        _is_cross(a0, TestFunction) and _is_cross(a1, TrialFunction)
+    )
+    if not ok:
+        return None
+    if wrap is not None:  # fold the leg's Re/Im into the coefficient: Re(i·k₀)=0, Im(i·k₀)=k₀
+        base = coeff if coeff is not None else Literal(1.0)
+        coeff = base.real if wrap == "real" else base.imag
+    return (coeff,)
+
+
+def _n1e_surface_load_spec(bare):
+    """Recognise an N1E incident/forcing surface term ``inner(g, n×v)`` (trial-FREE, into ``b``) → a
+    1-tuple ``(g_node,)`` (the prescribed tangential source, e.g. the incident wave ``2 i k₀ E_inc``);
+    ``None`` otherwise. Distinct from the bilinear impedance mass (which carries the trial as well)."""
+    from ..._fem import _contains
+    from ...trace import BinaryOp, FunctionCall, TestFunction, TrialFunction
+
+    def _source(x):  # trial/test-free factor (the source g or a scalar coefficient)
+        return not _contains(x, TrialFunction) and not _contains(x, TestFunction)
+
+    node, wrap, coeff = bare, None, None
+    if isinstance(node, FunctionCall) and node._name in ("real", "imag") and len(node.args) == 1:
+        wrap, node = node._name, node.args[0]
+    if isinstance(node, BinaryOp) and node.op == "*":  # peel a scalar coefficient (e.g. 2 i k₀) into the source
+        left, right = node.left, node.right
+        if isinstance(right, FunctionCall) and right._name == "inner" and _source(left):
+            coeff, node = left, right
+        elif isinstance(left, FunctionCall) and left._name == "inner" and _source(right):
+            coeff, node = right, left
+    if not (isinstance(node, FunctionCall) and node._name == "inner" and len(node.args) == 2):
+        return None
+
+    def _cross_test(x):
+        return isinstance(x, FunctionCall) and x._name == "cross" and len(x.args) == 2 and _contains(x, TestFunction)
+
+    a0, a1 = node.args
+    if _cross_test(a0) and _source(a1):
+        g = a1
+    elif _cross_test(a1) and _source(a0):
+        g = a0
+    else:
+        return None
+    if coeff is not None:  # fold the scalar coefficient into the source: c·inner(g, n×v) = inner(c·g, n×v)
+        g = coeff * g
+    if wrap is not None:  # complex leg split: Re/Im of the (complex) source
+        g = g.real if wrap == "real" else g.imag
+    return (g,)
+
+
+def _n1e_surface_precompute(domain, top, quad_degree, spaces, dim):
+    """Shared precompute for N1E boundary-face surface integrals (impedance mass + incident load): validate
+    3-D/N1E, build facet connectivity, tabulate the N1E basis at reference face-quadrature points (per local
+    face), and return the topology arrays. Returns ``(fidx, cells, fc, fqp, fqw, face_rv, signs, cell_edges)``."""
+    import basix
+    from basix import CellType, ElementFamily
+
+    from .fem_facets import _LOCAL_FACES_TET, build_facet_connectivity
+
+    if dim != 3:
+        raise NotImplementedError(
+            "jno.fem (non-nodal): N1E tangential-trace surface terms (impedance / absorbing / incident BC) are "
+            "wired for 3-D N1E (Maxwell) only — the 2-D H(curl) tangential trace is a scalar u·t, not yet wired."
+        )
+    fidx = next((i for i, s in enumerate(spaces) if s == "N1E"), None)
+    if fidx is None:
+        raise NotImplementedError("jno.fem (non-nodal): N1E surface terms are only supported on an N1E field.")
+
+    cells = np.asarray(domain.mesh.cells_dict["tetra"], dtype=np.int64)
+    fc = build_facet_connectivity(cells, "tetrahedron")
+    elem = basix.create_element(ElementFamily.N1E, CellType.tetrahedron, 1)
+    fqp, fqw = (np.asarray(a) for a in basix.make_quadrature(CellType.triangle, quad_degree))  # (nqf,2),(nqf,)
+    ref_tet = np.array([[0.0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]])
+    b0, b1 = fqp[:, 0:1], fqp[:, 1:2]  # face barycentric weights (ξ, η); the third is 1−ξ−η
+    face_rv = []  # per local face f: N1E basis (nqf, 6, 3) at the face-mapped reference points
+    for f in range(4):
+        V = ref_tet[list(_LOCAL_FACES_TET[f][:3])]
+        face_rv.append(np.asarray(elem.tabulate(0, (1.0 - b0 - b1) * V[0] + b0 * V[1] + b1 * V[2])[0]))
+    signs = np.asarray(top.cell_edge_signs.astype(np.float64))  # (nc, 6)
+    cell_edges = np.asarray(top.cell_edges)  # (nc, 6) global edge ids
+    return fidx, cells, fc, fqp, fqw, face_rv, signs, cell_edges
+
+
+def _n1e_face_geometry(bf, cells, fc, pts_np, top, face_rv, fqp, signs):
+    """Per boundary face ``bf``: the physical N1E basis (nqf, 6, 3), the OUTWARD unit normal, the face
+    measure |detJ_face| (= 2·area), and the physical quad points (nqf, 3). Covariant-Piola push with the
+    same cell Jacobian/edge signs the volume assembly uses."""
+    from .fem_elements import piola_covariant
+    from .fem_facets import _LOCAL_FACES_TET
+
+    c, f = int(fc.parent_cell[bf]), int(fc.local_face[bf])
+    cverts = pts_np[cells[c]]  # (4, 3)
+    J = np.stack([cverts[k] - cverts[0] for k in (1, 2, 3)], axis=1)
+    detJ = float(np.linalg.det(J))
+    phi = np.asarray(piola_covariant(jnp.asarray(face_rv[f]), None, jnp.asarray(J), detJ, jnp.asarray(signs[c]))[0])
+    lv = list(_LOCAL_FACES_TET[f][:3])
+    P = cverts[lv]  # physical face vertices (same local order as the reference map)
+    nrm = np.cross(P[1] - P[0], P[2] - P[0])
+    measure = float(np.linalg.norm(nrm))  # = 2·area = |det of the face map|
+    nhat = nrm / measure
+    opp = cverts[next(i for i in range(4) if i not in lv)]  # 4th vertex → orient outward
+    if np.dot(nhat, P[0] - opp) < 0:
+        nhat = -nhat
+    b0, b1 = fqp[:, 0:1], fqp[:, 1:2]
+    xq = (1.0 - b0 - b1) * P[0] + b0 * P[1] + b1 * P[2]  # physical quad points (for a spatial coeff/source)
+    return c, phi, nhat, measure, xq
+
+
+def _n1e_region_faces(fc, region_nodes):
+    """Yield the boundary-face indices whose vertices all lie in the region."""
+    for bf in range(fc.n_bfaces):
+        if all(int(v) in region_nodes for v in fc.face_nodes[bf]):
+            yield bf
+
+
+def _assemble_n1e_surface_mass(total, surface_terms, domain, spaces, top, pts_np, offs, quad_degree, dim):
+    """Assemble the tangential-trace surface mass ``∑ ∫_Γ c (n×φ_a)·(n×φ_b) dS`` (N1E impedance /
+    absorbing BC) into a dense ``(total, total)`` matrix to ADD to the stiffness ``A``.
+
+    The tangential projection ``(n×φ_a)·(n×φ_b) = φ_a·φ_b − (φ_a·n)(φ_b·n)`` is integrated over the
+    region's boundary faces with the physical face measure. 3-D N1E only."""
+    from ..._fem import _eval_value_node_at
+    from .fem_1d import _region_node_ids
+
+    fidx, cells, fc, fqp, fqw, face_rv, signs, cell_edges = _n1e_surface_precompute(domain, top, quad_degree, spaces, dim)
+    S = np.zeros((total, total))
+    for region, coeff_nodes in surface_terms.items():
+        region_nodes = {int(n) for n in _region_node_ids(domain, region)}
+        for bf in _n1e_region_faces(fc, region_nodes):
+            c, phi, nhat, measure, xq = _n1e_face_geometry(bf, cells, fc, pts_np, top, face_rv, fqp, signs)
+            pn = phi @ nhat  # (nqf, 6) normal component
+            tang = np.einsum("qai,qbi->qab", phi, phi) - np.einsum("qa,qb->qab", pn, pn)  # tangential φ·φ
+            gdofs = offs[fidx] + cell_edges[c]
+            for coeff in coeff_nodes:  # each surface term in this region adds coeff·(surface mass)
+                cval = (
+                    np.ones(len(fqw))
+                    if coeff is None
+                    else np.asarray(_eval_value_node_at(coeff, jnp.asarray(xq))).reshape(-1)
+                )
+                S[np.ix_(gdofs, gdofs)] += np.einsum("q,qab->ab", fqw * measure * cval, tang)
+    return jnp.asarray(S)
+
+
+def _assemble_n1e_surface_load(total, load_terms, domain, spaces, top, pts_np, offs, quad_degree, dim):
+    """Assemble the tangential incident/forcing surface term ``∑ ∫_Γ g·(φ_a×n) dS`` (the ``inner(g, n×v)``
+    RHS of the Silver–Müller ABC) into a dense ``(total,)`` load vector to ADD to ``b``. 3-D N1E only.
+
+    ``g`` is a prescribed (possibly complex, possibly spatial) tangential source; the test factor ``φ_a×n``
+    matches the authored ``v.vector.cross(nvec)`` and uses the same OUTWARD normal as the impedance mass."""
+    from ..._fem import _eval_value_node_at
+    from .fem_1d import _region_node_ids
+
+    fidx, cells, fc, fqp, fqw, face_rv, signs, cell_edges = _n1e_surface_precompute(domain, top, quad_degree, spaces, dim)
+    b = np.zeros(total)
+    for region, g_nodes in load_terms.items():
+        region_nodes = {int(n) for n in _region_node_ids(domain, region)}
+        for bf in _n1e_region_faces(fc, region_nodes):
+            c, phi, nhat, measure, xq = _n1e_face_geometry(bf, cells, fc, pts_np, top, face_rv, fqp, signs)
+            phi_x_n = np.cross(phi, nhat)  # (nqf, 6, 3) = φ_a × n  (the authored `v.vector.cross(nvec)`)
+            gdofs = offs[fidx] + cell_edges[c]
+            for g in g_nodes:
+                gval = np.asarray(_eval_value_node_at(g, jnp.asarray(xq))).reshape(len(fqw), 3)  # (nqf, 3)
+                integrand = np.einsum("qi,qai->qa", gval, phi_x_n)  # g·(φ_a×n)
+                b[gdofs] += np.einsum("q,qa->a", fqw * measure, integrand)
+    return jnp.asarray(b)
 
 
 def _apply_natural_boundary_terms(b, boundary_terms, domain, field_index, spaces, top, pts_np, offs, n_cells, quad_degree):

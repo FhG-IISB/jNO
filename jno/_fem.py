@@ -515,6 +515,45 @@ def _constant_of(node: Any) -> Optional[float]:
         return None
 
 
+def _scalar_const(node: Any) -> Optional[complex]:
+    """Complex-aware scalar extraction from a constant/Literal node (returns None if not a scalar)."""
+    for attr in ("value", "val", "data", "constant"):
+        if hasattr(node, attr):
+            v = getattr(node, attr)
+            try:
+                if np.ndim(v) != 0:
+                    return None
+                return complex(v)
+            except (TypeError, ValueError):
+                return None
+    try:
+        return complex(node)
+    except (TypeError, ValueError):
+        return None
+
+
+def _tie_phase(bare: Any) -> Optional[complex]:
+    """The Bloch phase of a tie ``u(A) - phase*u(B)``: ``1`` for plain periodic, a complex scalar for a
+    quasi-periodic (Bloch) tie, or ``None`` when the relation is not a valid tie (anti-periodic, etc.).
+
+    The slave side (left) must be a bare trial; the master side (right) is a bare trial (phase 1) or a
+    constant-scalar times a bare trial (the Bloch factor ``e^{i k·L}``)."""
+    if getattr(bare, "op", None) != "-":
+        return None
+    left, right = bare.left, bare.right
+    if getattr(left, "op", None) in {"+", "-", "*", "/"}:  # slave side must be a bare trial
+        return None
+    rop = getattr(right, "op", None)
+    if rop is None:
+        return 1.0 + 0.0j  # plain periodic  u(A) - u(B)
+    if rop == "*":  # Bloch  c*u(B) (either factor order), c a constant scalar
+        for a, b in ((right.left, right.right), (right.right, right.left)):
+            c = _scalar_const(a)
+            if c is not None and getattr(b, "op", None) is None:
+                return c
+    return None
+
+
 def _component_index_of(node: Any) -> Optional[int]:
     """If ``node`` is a single component of the trial (``u[..., i]``), return ``i``.
 
@@ -599,24 +638,34 @@ def _value_from_node(node: Any) -> Any:
     return const if const is not None else _coord_value_fn(node)
 
 
+def _node_has_complex_literal(node: Any) -> bool:
+    """True if a single trace node carries a complex-valued constant (a user-written ``1j``)."""
+    for attr in ("value", "val", "data", "constant"):
+        v = getattr(node, attr, None)
+        if v is None:
+            continue
+        try:
+            if jnp.iscomplexobj(jnp.asarray(v)):
+                return True
+        except Exception:  # not array-like; ignore
+            continue
+    return False
+
+
+def _bares_have_complex_coeff(bares: Any) -> bool:
+    """True if any raw weak-form bare contains a complex literal. The complex constant survives
+    lowering unchanged, so walking the raw bares is equivalent to :func:`_is_complex_form` but works
+    *before* the lowered ``ir`` is built (used to route the non-nodal path)."""
+    return any(_node_has_complex_literal(n) for b in bares for n in _walk(b))
+
+
 def _is_complex_form(domain: Any, ir: Any) -> bool:
     """True if any lowered term's expression contains a complex constant — the signal to route a
     (steady, linear) weak form through the real-equivalent complex solver instead of the plain real
     assembly. We walk the tree for a complex-valued literal (a user-written ``1j``) rather than
     evaluating, because the lowered coeff embeds the (non-evaluable) trial/test channel."""
     del domain
-    for term in ir.terms:
-        for node in _walk(term.coeff):
-            for attr in ("value", "val", "data", "constant"):
-                v = getattr(node, attr, None)
-                if v is None:
-                    continue
-                try:
-                    if jnp.iscomplexobj(jnp.asarray(v)):
-                        return True
-                except Exception:  # not array-like; ignore
-                    continue
-    return False
+    return any(_node_has_complex_literal(node) for term in ir.terms for node in _walk(term.coeff))
 
 
 def _complex_block_bcoo(A_r: Any, A_i: Any, n: int) -> Any:
@@ -663,15 +712,30 @@ def _solve_complex_block(ops: Any, solve_fn: Optional[Callable] = None, periodic
     from .trace import FemLinearSystem, FunctionCall
     from .utils.solver.fem_utils import prolong_periodic, reduce_matrix_periodic, reduce_vector_periodic
 
-    def _ab(op, args):
+    bloch = bool(periodic is not None and periodic.get("is_bloch", False))
+
+    def _ab(op, args, conj=False):
         A, b = op.evaluate(args) if isinstance(op, FemLinearSystem) else op
         b = jnp.asarray(b).reshape(-1)
         if periodic is not None:
-            A = reduce_matrix_periodic(periodic, A)  # P^T A P  (stays sparse if A is BCOO)
-            b = reduce_vector_periodic(periodic, b)  # P^T b
+            A = reduce_matrix_periodic(periodic, A, conj=conj)  # P^T A P (P^H when Bloch); stays sparse
+            b = reduce_vector_periodic(periodic, b, conj=conj)  # P^T b (P^H when Bloch)
         return A, b  # keep A sparse (BCOO) -- do NOT densify
 
+    def _bloch_solve(args):
+        # Bloch/quasi-periodic: P is complex, so the reduced operator A_c = P^H (A_r + i A_i) P mixes
+        # Re/Im and cannot be split into independent legs. Reduce Hermitian, form the complex reduced
+        # operator, solve it directly (reduced cell is small), and prolong with the complex P.
+        (A_r, b_r), (A_i, b_i) = _ab(ops[0], args, conj=True), _ab(ops[1], args, conj=True)
+        to_d = lambda M: jnp.asarray(M.todense() if hasattr(M, "todense") else M)
+        A_c = to_d(A_r) + 1j * to_d(A_i)
+        b_c = jnp.asarray(b_r) + 1j * jnp.asarray(b_i)
+        u_red = jnp.linalg.solve(A_c, b_c)
+        return prolong_periodic(periodic, u_red)
+
     def _block_solve(args):
+        if bloch:
+            return _bloch_solve(args)
         (A_r, b_r), (A_i, b_i) = _ab(ops[0], args), _ab(ops[1], args)
         n = b_r.shape[0]
         rhs = jnp.concatenate([b_r, b_i])
@@ -1475,16 +1539,15 @@ def _periodic_tie_spec(constraint: Any, domain: Any) -> Optional[Tuple[str, str,
     tie = getattr(constraint, "_periodic_tie", None)
     if tie is None:
         return None
-    # The trace stamps `_periodic_tie` on *any* trial-trial combination with clashing coords; only a
-    # plain `u(A) - u(B)` (bare trial sides, no scaling, not `+`) is a tie. Reject the rest loudly
-    # rather than silently mis-reading e.g. `u(A)+u(B)` (anti-periodic) or `2*u(A)-u(B)` as periodic.
+    # The trace stamps `_periodic_tie` on *any* trial-trial combination with clashing coords. A valid
+    # tie is `u(A) - u(B)` (plain periodic) or `u(A) - c*u(B)` with a constant scalar `c` (Bloch /
+    # quasi-periodic, `c = e^{i k·L}`). Reject the rest loudly (e.g. `u(A)+u(B)` anti-periodic).
     bare = _bare(constraint)
-    if getattr(bare, "op", None) != "-" or any(
-        getattr(side, "op", None) in {"+", "-", "*", "/"} for side in (bare.left, bare.right)
-    ):
+    phase = _tie_phase(bare)
+    if phase is None:
         raise ValueError(
-            "jno.fem: a periodic tie must be `u(A) - u(B)` with bare trial sides (no scaling, no `+`). "
-            "Anti-periodic or scaled relations between two boundaries are not supported."
+            "jno.fem: a periodic tie must be `u(A) - u(B)` (periodic) or `u(A) - c*u(B)` with a constant "
+            "scalar `c` (Bloch/quasi-periodic). Anti-periodic (`+`) or non-scalar relations are not supported."
         )
     slave_tag, master_tag = tie
     breg = getattr(domain, "_boundary_regions", {})
@@ -1495,7 +1558,7 @@ def _periodic_tie_spec(constraint: Any, domain: Any) -> Optional[Tuple[str, str,
             f"jno.fem: a periodic tie `u(A) - u(B)` must connect two distinct boundary regions; "
             f"got {slave_tag!r} and {master_tag!r} (known boundary tags: {sorted(breg)})."
         )
-    return (master_tag, slave_tag, None, _field_key_of(constraint))
+    return (master_tag, slave_tag, None, _field_key_of(constraint), phase)
 
 
 def _ref_interior_facet_dofs(ref_pts: np.ndarray, fv: np.ndarray, dim: int, tol: float = 1e-9) -> List[int]:
@@ -1622,7 +1685,7 @@ def _build_periodic_reduction(domain: Any, ties: List[Any], points: Any, cells: 
     # that case loudly rather than silently under-identify the corners and mis-solve.
     if len(ties) > 1:
         preds = getattr(domain, "_tag_predicates", {})
-        missing = sorted({t for (m, s, _c, _fk) in ties for t in (m, s) if t not in preds})
+        missing = sorted({t for (m, s, *_ignore) in ties for t in (m, s) if t not in preds})
         if missing:
             raise NotImplementedError(
                 "jno.fem: multidirectional periodicity requires each periodic face to be defined via "
@@ -1635,24 +1698,68 @@ def _build_periodic_reduction(domain: Any, ties: List[Any], points: Any, cells: 
     bfacets = _boundary_facets(points, cells, dim, ele_order) if cells is not None else None
     bnodes = np.unique(bfacets) if bfacets is not None and bfacets.size else None
 
-    pairs = [(master, slave) for (master, slave, _comp, _fk) in ties]
+    pairs = [(master, slave) for (master, slave, *_ignore) in ties]
+    # Bloch phase per pair (``e^{i k·L}``); 1.0 = plain periodic (the ties may be 4-tuples pre-Bloch).
+    phases = [complex(t[4]) if len(t) > 4 else 1.0 + 0.0j for t in ties]
     faces: dict = {}
-    for master, slave, _comp, _fk in ties:
+    for master, slave, *_ignore in ties:
         for tag in (master, slave):
             if tag not in faces and (f := _face_nodes(domain, points, bnodes, tag)) is not None:
                 faces[tag] = f
 
     facets: dict = {}
     if bfacets is not None and bfacets.size:
-        for master, _slave, _comp, _fk in ties:
+        for master, _slave, *_ignore in ties:
             fn = set(np.asarray(faces.get(master, np.empty(0, int))).tolist())
             keep = np.array([set(row.tolist()).issubset(fn) for row in bfacets], dtype=bool)
             if keep.any():
                 facets[master] = bfacets[keep]
     else:  # native 1D / no assembly cells -> flat-chain fallback
-        facets = {m: ff for (m, _s, _c, _fk) in ties if (ff := _chain_facets(points, faces.get(m, ()))) is not None}
+        facets = {m: ff for (m, _s, *_ignore) in ties if (ff := _chain_facets(points, faces.get(m, ()))) is not None}
 
-    return build_periodic_prolongation(points, pairs, faces, vec=vec, facets=facets)
+    return build_periodic_prolongation(points, pairs, faces, vec=vec, facets=facets, phases=phases)
+
+
+def _build_periodic_reduction_n1e(domain: Any, ties: List[Any], offsets: Any) -> dict:
+    """Periodic (Floquet/Bloch) reduction for a **Nédélec N1E** edge field — a DOF-level edge prolongation.
+    Each DOF is one edge's tangential moment, so a tie matches boundary edges across the periodic faces (by
+    midpoint) with an orientation sign and the Bloch phase. Uses the edge topology the non-nodal assembler
+    stashed. Every field is the same N1E element, so one per-field ``P`` is built and block-concatenated."""
+    from .utils.solver.fem_utils import build_periodic_prolongation_n1e
+
+    topo = domain._fem_nonnodal_topology
+    n_edges = int(topo["n_edges"])
+    vpts = np.asarray(topo["vertex_points"])
+    ev = np.asarray(topo["edge_vertices"])
+    emid = np.asarray(topo["edge_midpoints"])
+    edir = np.asarray(topo["edge_dirs"])
+
+    pairs = [(master, slave) for (master, slave, *_rest) in ties]
+    phases = [(t[4] if len(t) > 4 and t[4] is not None else 1.0) for t in ties]  # Bloch phase (e^{iφ}) per tie
+    etags: dict = {}
+    for tag in {t for tie in ties for t in tie[:2]}:
+        f = _face_nodes(domain, vpts, None, tag)
+        if f is None or np.asarray(f).size == 0:
+            raise ValueError(f"jno.fem periodic (N1E): boundary tag {tag!r} has no mesh vertices.")
+        vset = set(int(v) for v in np.asarray(f, dtype=int).reshape(-1))
+        # a global edge is on the boundary tag iff BOTH its canonical vertices are on that tag
+        etags[tag] = np.asarray([e for e in range(n_edges) if int(ev[e, 0]) in vset and int(ev[e, 1]) in vset], dtype=int)
+
+    red = build_periodic_prolongation_n1e(n_edges, emid, edir, etags, pairs, phases)
+    n_fields = len(offsets) - 1
+    blocks, off_full, off_red = [], [0], [0]
+    for _ in range(n_fields):
+        blocks.append({"P": red["P"], "kept": red["kept_nodes"], "vec": 1, "is_selection": red["is_selection"]})
+        off_full.append(off_full[-1] + red["n_full"])
+        off_red.append(off_red[-1] + red["n_red"])
+    return {
+        "blocks": blocks,
+        "off_full": off_full,
+        "off_red": off_red,
+        "n_full": off_full[-1],
+        "n_red": off_red[-1],
+        "is_bloch": red["is_bloch"],
+    }
 
 
 def _build_periodic_reduction_nonnodal(domain: Any, ties: List[Any], offsets: Any) -> dict:
@@ -2149,6 +2256,17 @@ def fem(
 
     domain = _discover_domain(constraints)
 
+    # Nédélec (N1E) periodic ties need a CONFORMING periodic mesh — the per-edge DOFs must line up
+    # one-to-one across the tied faces, which gmsh's default unstructured mesh does not guarantee. Infer
+    # this from the constraint list: when periodic ties are present on an N1E field, re-mesh the (Shape-
+    # backed) domain once with gmsh setPeriodic on the tied face pairs. No `periodic=` arg — driven purely
+    # by the periodic conditions the user already authored. (Nodal fields tie by interpolation and need no
+    # re-mesh, so this is gated on N1E.)
+    if "N1E" in _trial_spaces(constraints) and hasattr(domain, "_remesh_periodic"):
+        _pairs = [(s[0], s[1]) for c in constraints if (s := _periodic_tie_spec(c, domain)) is not None]
+        if _pairs:
+            domain._remesh_periodic(_pairs)
+
     # Periodic ties `u(A) - u(B)` are enforced by algebraic reduction (a prolongation P that
     # eliminates the slave-face DOFs), not by assembly. Separate them out *before* the weak/Dirichlet
     # classification (`_region_and_support` would otherwise reject a residual that spans two regions).
@@ -2296,7 +2414,11 @@ def fem(
             # (``None`` for the native 1D route, which falls back to flat-chain facets on points).
             cells = getattr(domain, "_fem_native_assembly_cells", None)
             ele_order = int(getattr(domain, "_fem_native_assembly_order", 1))
-        if getattr(domain, "_fem_nonnodal_topology", None) is not None:
+        _nonnodal_topo = getattr(domain, "_fem_nonnodal_topology", None)
+        if _nonnodal_topo is not None and _nonnodal_topo.get("family") == "N1E":
+            # Nédélec N1E (H(curl) edge): DOF-level edge prolongation (Floquet/Bloch, with orientation sign)
+            periodic = _build_periodic_reduction_n1e(domain, periodic_ties, fem_obj.offsets)
+        elif _nonnodal_topo is not None:
             # non-nodal C¹ (Morley): DOF-level reduction (value + signed edge-derivative ties)
             periodic = _build_periodic_reduction_nonnodal(domain, periodic_ties, fem_obj.offsets)
         elif multifield:
@@ -2453,6 +2575,63 @@ def fem(
     # the shared integrand evaluator (which carries space-guarded branches for the physical basis).
     if _trial_spaces(constraints) - {"Lagrange"}:
         from .utils.solver.fem_nonnodal import assemble_fem_nonnodal
+
+        # ---- complex non-nodal (RT/Nédélec/Argyris): the Re/Im coefficient split, assembled by the
+        # non-nodal push-forward assembler. The basis is real, so ``Re(c·T) = Re(c)·T``: wrapping each
+        # term in ``.real``/``.imag`` gives two ordinary real systems A_r/A_i, and FEM.solve() forms
+        # ``[[A_r,-A_i],[A_i,A_r]]`` (``mode="complex"`` → _solve_complex_block), recombining to a complex
+        # ``u`` — needed for time-harmonic Maxwell (complex ε, the ``i k₀`` impedance BC). Without this the
+        # plain real assembler would SILENTLY cast the imaginary part away, so the unwired compositions
+        # (transient/parametric/nonlinear) raise rather than mislead. ----
+        _nn_bares = volume_terms + [e for exprs in boundary_terms.values() for e in exprs]
+        if _bares_have_complex_coeff(_nn_bares):
+            from .utils.solver.parametric_helpers import _contains_runtime_parameter as _crp_nn
+            from .utils.solver.weak_form import _contains_temporal_derivative as _ctd_nn
+            from .utils.solver.weak_form import _is_obviously_nonlinear_in_unknown as _nlin_nn
+
+            if any(_ctd_nn(b) for b in _nn_bares):
+                raise NotImplementedError(
+                    "jno.fem: a complex non-nodal (RT/Nédélec/Argyris) *transient* form is not wired — only "
+                    "the steady linear complex form is. (The real assembler would silently drop the imaginary "
+                    "part, so this raises instead.)"
+                )
+            if has_neural_coeff or any(_crp_nn(b) for b in _nn_bares):
+                raise NotImplementedError(
+                    "jno.fem: a complex non-nodal *parametric/inverse* form (runtime parameter or neural "
+                    "coefficient) is not wired — the steady linear forward complex form is. (Raises rather than "
+                    "silently dropping the imaginary part.)"
+                )
+            if any(_nlin_nn(domain, b) for b in _nn_bares):
+                raise NotImplementedError(
+                    "jno.fem: a complex non-nodal *nonlinear* form is not wired — complex forms assemble as "
+                    "linear real-equivalent blocks. (Raises rather than silently dropping the imaginary part.)"
+                )
+            real_bd = {tag: [e.real for e in exprs] for tag, exprs in boundary_terms.items()}
+            imag_bd = {tag: [e.imag for e in exprs] for tag, exprs in boundary_terms.items()}
+            domain._fem_problem = None
+            op_r, _mr, offsets = assemble_fem_nonnodal(
+                domain,
+                [b.real for b in volume_terms],
+                real_bd,
+                dirichlet_raw,
+                [],
+                flux_bcs=flux_bcs,
+                rotation_bcs=rotation_bcs,
+                quad_degree=quad_degree,
+            )
+            op_i, _mi, _oi = assemble_fem_nonnodal(
+                domain,
+                [b.imag for b in volume_terms],
+                imag_bd,
+                dirichlet_raw,
+                [],
+                flux_bcs=flux_bcs,
+                rotation_bcs=rotation_bcs,
+                quad_degree=quad_degree,
+            )
+            return _finalize(
+                FEM(domain=domain, op=(op_r, op_i), classification=classification, mode="complex", offsets=offsets)
+            )
 
         op, mode, offsets = assemble_fem_nonnodal(
             domain,
