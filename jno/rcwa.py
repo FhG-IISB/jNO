@@ -322,6 +322,27 @@ class Rcwa:
             return jnp.full((1, 1), g) if g.ndim == 0 else g
 
         def solve_layer(e):
+            # general anisotropic layer: e = (ε_xx..ε_zz, μ_xx..μ_zz) -> ε AND μ tensors. Used for a uniaxial
+            # PML (an in-plane coordinate stretch is a diagonal ε̂ and μ̂), and for magnetic / magneto-optic media.
+            if isinstance(e, tuple) and len(e) == 10:
+                exx, exy, eyx, eyy, ezz, uxx, uxy, uyx, uyy, uzz = (_grid(c) for c in e)
+                return fm.eigensolve_general_anisotropic_media(
+                    jnp.asarray(wl),
+                    kin,
+                    lv,
+                    exx,
+                    exy,
+                    eyx,
+                    eyy,
+                    ezz,
+                    uxx,
+                    uxy,
+                    uyx,
+                    uyy,
+                    uzz,
+                    ex,
+                    formulation=self.formulation,
+                )
             # anisotropic layer: e = (ε_xx, ε_xy, ε_yx, ε_yy, ε_zz) grids -> fmmax's anisotropic eigensolve
             if isinstance(e, tuple) and len(e) == 5:
                 exx, exy, eyx, eyy, ezz = (_grid(c) for c in e)
