@@ -179,11 +179,9 @@ def test_vector_pol_shapes_run():
     assert np.allclose(iu, 0.5 * (ix + iy), rtol=1e-6, atol=1e-9)
 
 
-@needs_fmmax
-def test_aerial_is_differentiable_ilt():
-    """The aerial image is differentiable in the mask design (inverse lithography): rc.solve().aerial() is a
-    trace node, and jax.grad of an image functional w.r.t. a mask parameter matches a finite difference —
-    the gradient flows through the imaging AND the RCWA mask solve."""
+def _ilt_cons():
+    """A mask parameterised by the line permittivity `ep` (a jno.np.parameter), for the inverse-lithography
+    gradient tests. Returns (constraint list, the ep parameter)."""
     d = _sbox()
     u, phi = d.fem_symbols()
     xi, yi, zi, _ = d.variable("interior", split=True)
@@ -211,16 +209,93 @@ def test_aerial_is_differentiable_ilt():
         ul - ur,
         uf - ub,
     ]
-    rc = jno.rcwa(cons, orders=60, grid=56, params={"ep": 2.0})
-    node = rc.solve().aerial(NA=0.6, source=0.5)
-    assert isinstance(node, FunctionCall)
+    return cons, ep
+
+
+def _grad_vs_fd(node, ep):
+    """jax.grad of mean(node²) w.r.t. the ep parameter, and the central finite difference, at ep=2."""
 
     def loss(v):
         mod = eqx.tree_at(lambda m: m.value, ep.model.module, jnp.asarray(v))
         return jnp.mean(TraceEvaluator({ep.model.layer_id: mod}).evaluate(node) ** 2)
 
-    g = float(jax.grad(loss)(2.0))
     h = 1e-2
-    fd = (float(loss(2.0 + h)) - float(loss(2.0 - h))) / (2 * h)
+    return float(jax.grad(loss)(2.0)), (float(loss(2.0 + h)) - float(loss(2.0 - h))) / (2 * h)
+
+
+@needs_fmmax
+def test_aerial_is_differentiable_ilt():
+    """The aerial image is differentiable in the mask design (inverse lithography): rc.solve().aerial() is a
+    trace node, and jax.grad of an image functional w.r.t. a mask parameter matches a finite difference —
+    the gradient flows through the imaging AND the RCWA mask solve."""
+    cons, ep = _ilt_cons()
+    node = jno.rcwa(cons, orders=60, grid=56, params={"ep": 2.0}).solve().aerial(NA=0.6, source=0.5)
+    assert isinstance(node, FunctionCall)
+    g, fd = _grad_vs_fd(node, ep)
     assert g == pytest.approx(fd, rel=3e-3)
+    assert abs(g) > 1e-3
+
+
+def _linewidth(img):  # fraction of the (y-averaged) x-profile that prints as a feature (> 0.5)
+    return float((np.asarray(img).mean(1) > 0.5).mean())
+
+
+def _aerial_band(sol, **kw):  # the (min, max, span) of this mask's aerial intensity — a weak dielectric
+    a = np.asarray(sol.aerial(**kw))  # grating modulates around ~1, so a threshold must sit INSIDE this band
+    lo, hi = float(a.min()), float(a.max())
+    return lo, hi, max(hi - lo, 1e-9)
+
+
+@needs_fmmax
+def test_printed_is_in_range_and_structured():
+    """The developed resist image (sol.printed) is a soft mask in [0, 1] and thresholds the line grating into
+    a printed feature — both cleared (≈0) and remaining (≈1) resist are present."""
+    sol = jno.rcwa(_cons(_line), orders=60, grid=56).solve()
+    lo, hi, span = _aerial_band(sol, NA=0.6, source=0.4)
+    img = np.asarray(sol.printed(NA=0.6, source=0.4, threshold=0.5 * (lo + hi), steepness=24.0 / span))
+    assert img.min() >= 0.0 and img.max() <= 1.0 and np.all(np.isfinite(img))
+    assert img.min() < 0.05 and img.max() > 0.95  # a real bilevel pattern, not a flat grey
+
+
+@needs_fmmax
+def test_threshold_sets_linewidth():
+    """Raising the dose-to-clear threshold shrinks the printed feature — the CD knob is monotone."""
+    sol = jno.rcwa(_cons(_line), orders=60, grid=56).solve()
+    lo, _hi, span = _aerial_band(sol, NA=0.6, source=0.4)
+    k = 24.0 / span
+    w_lo = _linewidth(sol.printed(NA=0.6, source=0.4, threshold=lo + 0.35 * span, steepness=k))
+    w_hi = _linewidth(sol.printed(NA=0.6, source=0.4, threshold=lo + 0.65 * span, steepness=k))
+    assert w_lo > w_hi  # higher threshold -> narrower printed feature
+
+
+@needs_fmmax
+def test_peb_diffusion_smooths():
+    """A larger PEB diffusion length blurs the aerial image before development, so its modulation shrinks and
+    the printed pattern loses contrast (max−min) — the defining effect of acid diffusion."""
+
+    def contrast(img):
+        a = np.asarray(img)
+        return float(a.max() - a.min())
+
+    sol = jno.rcwa(_cons(_line), orders=60, grid=56).solve()
+    lo, hi, span = _aerial_band(sol, NA=0.6, source=0.4)
+    thr, k = 0.5 * (lo + hi), 12.0 / span
+    c0 = contrast(sol.printed(NA=0.6, source=0.4, threshold=thr, steepness=k, diffusion=0.0))
+    c1 = contrast(sol.printed(NA=0.6, source=0.4, threshold=thr, steepness=k, diffusion=1.0))
+    assert c1 < c0
+
+
+@needs_fmmax
+def test_printed_is_differentiable_ilt():
+    """The full computational-lithography chain is differentiable: jax.grad of a printed-resist functional
+    w.r.t. the mask permittivity matches finite difference — the gradient flows through development, imaging
+    AND the RCWA mask solve (the point of the resist model: ILT/SMO with the resist in the loop)."""
+    cons, ep = _ilt_cons()
+    rc = jno.rcwa(cons, orders=60, grid=56, params={"ep": 2.0})
+    lo, hi, span = _aerial_band(rc.solve(params={"ep": 2.0}), NA=0.6, source=0.5)  # band at the eval point
+    thr, k = 0.5 * (lo + hi), 6.0 / span  # threshold in-band + moderate contrast -> the sigmoid stays active
+    node = rc.solve().printed(NA=0.6, source=0.5, threshold=thr, diffusion=0.1, steepness=k)
+    assert isinstance(node, FunctionCall)
+    g, fd = _grad_vs_fd(node, ep)
+    assert g == pytest.approx(fd, rel=5e-3)
     assert abs(g) > 1e-3

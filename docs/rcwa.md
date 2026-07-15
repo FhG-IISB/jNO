@@ -198,6 +198,31 @@ high NA, and by `jax.grad` vs finite difference. The vector pupil follows Flagel
 *J. Opt. Soc. Am. A* **13**, 53 (1996). The full angular-rigorous Abbe (re-solving the mask per source point)
 remains future work.
 
+### Resist — `sol.printed(...)` (the developed pattern)
+
+`sol.printed(...)` takes the aerial image one step further to the **developed resist image** (the printed
+pattern), closing the computational-lithography chain `mask → aerial image → resist`:
+
+```python
+img = sol.printed(NA=0.33, source=0.5, threshold=0.3, diffusion=0.02, steepness=50)  # -> (grid, grid) in [0, 1]
+```
+
+The aerial image (all the `aerial(...)` arguments pass straight through) is optionally blurred by a linear
+**post-exposure-bake diffusion** (a periodic Gaussian of length `diffusion`) and then developed by a soft
+**constant threshold**, `sigmoid(steepness · (I − threshold))` — `1` = clears. `threshold` sets the printed
+CD; `steepness` is the development contrast. Because the whole chain stays JAX, `jax.grad` of a
+printed-vs-target loss now drives **OPC / ILT / SMO with the resist in the loop** — back through development,
+imaging, *and* the rigorous RCWA mask solve:
+
+```python
+loss = lambda: ((jno.rcwa(mask(rho)).solve().printed(NA=0.33, source=src, threshold=0.3) - target) ** 2).mean()
+```
+
+This is the standard linear-diffusion + constant-threshold resist (Poonawala & Milanfar, *IEEE Trans. Image
+Process.* **16**, 774, 2007; PEB diffusion after Mack, *Fundamental Principles of Optical Lithography*, 2007).
+The full reaction-diffusion PEB kinetics, the 3-D development-rate profile, and standing-wave/bulk-absorption
+effects are out of scope here (a separate rigorous photoresist model handles those).
+
 ## The backend — explicit layers
 
 `jno.Rcwa` takes a hand-built stack directly; this is what the front door constructs internally:
