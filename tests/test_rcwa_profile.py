@@ -94,5 +94,5 @@ def test_solve_profile_runs_and_writes_trace(tmp_path, monkeypatch, capsys):
     rc = jno.rcwa(_slab_cons(), orders=20, grid=24)
     sol = rc.solve(profile=True)
     assert 0.0 <= float(sol.efficiency("T")) <= 1.0  # a real, usable solution
-    assert "[rcwa profile]" in capsys.readouterr().out
-    assert (tmp_path / "rcwa_traces").is_dir() and any((tmp_path / "rcwa_traces").iterdir())
+    assert "rcwa profile" in capsys.readouterr().out
+    assert (tmp_path / "jno_traces").is_dir() and any((tmp_path / "jno_traces").iterdir())

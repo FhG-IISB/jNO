@@ -69,21 +69,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from jno.utils.profiling import annotate as _annot  # stage annotator for rc.solve(profile=True)
+
 
 def _concrete(x):
     """True when ``x`` is a real (non-traced) value, so a never-silent guard may inspect it. Under
     jit/grad the value is a tracer -- the guard steps aside (validation ran on the eager forward pass)."""
     return not isinstance(x, jax.core.Tracer)
-
-
-def _annot(name):
-    """A ``jax.profiler.TraceAnnotation`` labelling a solve stage in a Perfetto trace when profiling is
-    active (``rc.solve(profile=True)``); a no-op context otherwise, so it never costs anything normally."""
-    from contextlib import nullcontext
-
-    from jax._src import profiler as _jp
-
-    return jax.profiler.TraceAnnotation(name) if _jp._profile_state.profile_session is not None else nullcontext()
 
 
 _FMMAX_HINT = (
@@ -1223,29 +1215,14 @@ class _ParametricSol:
 
 
 def _profile_solve(run, eng):
-    """Run an eager RCWA solve inside a JAX Perfetto trace (per-stage annotated) and print a size/time
-    summary -- the profiling path of ``rc.solve(profile=True)``, mirroring ``jno.core.solve(profile=True)``."""
-    import os
-    import time
+    """The profiling path of ``rc.solve(profile=True)`` -- an eager, per-stage-annotated RCWA solve inside a
+    JAX Perfetto trace (shared with ``jno.fem``/``jno.fdm``). The eager solve self-blocks (its energy guard
+    reads ``efficiency`` concretely), so the shared timer sees the real O((2·n_t)³) eigensolve work."""
+    from jno.utils.profiling import profile_solve
 
-    trace_dir = os.path.join(os.getcwd(), "rcwa_traces")
-    os.makedirs(trace_dir, exist_ok=True)
-
-    def _block(sol):  # force the DAG to execute so the trace/timer sees the real work
-        jax.block_until_ready(sol.power("total") if isinstance(sol, _EmitterSol) else sol.efficiency("T"))
-        return sol
-
-    _block(run())  # warm: trigger XLA compilation so the trace times the hot solve
-    t0 = time.perf_counter()
-    with jax.profiler.trace(trace_dir, create_perfetto_trace=True):
-        sol = _block(run())
-    dt = time.perf_counter() - t0
     nt = eng._nt
-    print(
-        f"[rcwa profile] {len(eng.layers_spec)} layers · n_t={nt} Fourier orders · "
-        f"{2 * nt}×{2 * nt} eigenproblem/layer  |  solve {dt * 1e3:.1f} ms  |  Perfetto trace → {trace_dir}"
-    )
-    return sol
+    label = f"rcwa profile · {len(eng.layers_spec)} layers · n_t={nt} · {2 * nt}×{2 * nt} eigenproblem/layer"
+    return profile_solve(run, label=label)
 
 
 class _RcwaProblem:
