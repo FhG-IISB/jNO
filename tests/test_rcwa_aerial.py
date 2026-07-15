@@ -136,6 +136,49 @@ def test_source_shapes_run():
         assert im.shape == (128, 128) and np.all(np.isfinite(im)) and im.min() >= 0.0
 
 
+def _nrm(img):  # image normalised to unit mean, to compare shape/contrast independent of total energy
+    a = np.asarray(img)
+    return a / (a.mean() + 1e-12)
+
+
+@needs_fmmax
+def test_vector_reduces_to_scalar_as_na_drops():
+    """The vector (high-NA) image must reduce to the scalar one as NA→0: the pupil becomes the identity and
+    E_z→0. So the (energy-normalised) x-polarised vector image departs from the scalar image LESS at low NA
+    than at high NA -- the defining consistency check of the Richards-Wolf/Flagello vector model."""
+    sol = jno.rcwa(_cons(_line), orders=60, grid=56).solve()
+
+    def dev(NA):  # normalised L2 departure of the vector-x image from the scalar image
+        sc, vx = _nrm(sol.aerial(NA=NA, source=0.3)), _nrm(sol.aerial(NA=NA, source=0.3, polarization="x"))
+        return float(np.linalg.norm(vx - sc) / np.linalg.norm(sc))
+
+    assert dev(0.4) < dev(0.75)  # closer to scalar at lower NA (smaller ray angles)
+
+
+@needs_fmmax
+def test_vector_tm_te_contrast_split():
+    """The vector signature at high NA: for a grating periodic in x (orders spread in the x–z plane), x-pol is
+    TM (E tilts with the ray → the interfering beams lose projection → lower contrast) and y-pol is TE (E stays
+    parallel → full contrast). So TE contrast must exceed TM contrast at high NA."""
+    sol = jno.rcwa(_cons(_line), orders=60, grid=56).solve()
+    c_tm = _contrast(sol.aerial(NA=0.9, source=0.3, polarization="x"))  # TM (E in plane of incidence)
+    c_te = _contrast(sol.aerial(NA=0.9, source=0.3, polarization="y"))  # TE (E out of plane)
+    assert c_te > c_tm > 0.0
+
+
+@needs_fmmax
+def test_vector_pol_shapes_run():
+    """'x', 'y' and 'unpolarized' all form a valid image, and the unpolarized image is exactly the mean of the
+    two linear-polarization images (incoherent averaging)."""
+    sol = jno.rcwa(_cons(_line), orders=40, grid=48).solve()
+    ix = np.asarray(sol.aerial(NA=0.7, source=0.5, polarization="x"))
+    iy = np.asarray(sol.aerial(NA=0.7, source=0.5, polarization="y"))
+    iu = np.asarray(sol.aerial(NA=0.7, source=0.5, polarization="unpolarized"))
+    for im in (ix, iy, iu):
+        assert im.shape == (128, 128) and np.all(np.isfinite(im)) and im.min() >= 0.0
+    assert np.allclose(iu, 0.5 * (ix + iy), rtol=1e-6, atol=1e-9)
+
+
 @needs_fmmax
 def test_aerial_is_differentiable_ilt():
     """The aerial image is differentiable in the mask design (inverse lithography): rc.solve().aerial() is a

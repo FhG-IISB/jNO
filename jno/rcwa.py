@@ -209,6 +209,21 @@ class _Sol:
         )
         return (tf[i] + tf[i + self._nt]) / self._Pin
 
+    def _input_pol(self, pol):
+        """0th-order forward incident amplitude for an input polarization (``"x"`` or ``"y"``), built as a
+        UNIFORM real-space plane wave (x-pol E=x̂,H=ŷ; y-pol E=ŷ,H=-x̂, both forward) and decomposed at k_in.
+        Working in the field basis (not the eigenvalue-sorted eigenmode basis) avoids an argmax(flux) pick
+        grabbing the wrong oblique mode for an asymmetric structure. jax-native (traces under grad/jit)."""
+        fm = self._fm
+        gs = fm.min_array_shape_for_expansion(self._ex)
+        _u = jnp.ones((*gs, 1), complex)
+        _z = jnp.zeros((*gs, 1), complex)
+        if pol == "x":
+            return jnp.reshape(fm.amplitudes_for_fields(_u, _z, _z, _u, self._layers[0])[0], (2 * self._nt, 1))
+        if pol == "y":
+            return jnp.reshape(fm.amplitudes_for_fields(_z, _u, -_u, _z, self._layers[0])[0], (2 * self._nt, 1))
+        raise RcwaError(f"polarization must be 'x' or 'y', got {pol!r}")
+
     def jones(self, kind="T"):
         """The 2×2 complex **Jones matrix** at the 0th diffraction order — how the structure maps incident
         polarization to transmitted (``"T"``) or reflected (``"R"``) polarization.
@@ -221,35 +236,13 @@ class _Sol:
         Jones basis — for the 0th order at normal incidence they are the two in-plane axes (≈ x, y); an
         isotropic stack gives a diagonal ``J`` (no conversion), an in-plane-anisotropic one an off-diagonal
         ``J`` (polarization conversion). Differentiable in the design. Returns a JAX ``(2, 2)`` array."""
-        fm = self._fm
-        if kind == "T":
-            smat, out_layer = self._s.s11, self._layers[-1]
-        elif kind == "R":
-            smat, out_layer = self._s.s21, self._layers[0]
-        else:
-            raise RcwaError(f"jones(kind): kind must be 'T' or 'R', got {kind!r}")
-        in_layer = self._layers[0]
-        # Work in the FIELD basis, not the eigenmode basis: the 0th order is expansion index 0 (fmmax orders
-        # the zeroth term first), but the eigenmodes are eigenvalue-sorted, so an argmax(flux) pick grabs the
-        # wrong (oblique) mode for an asymmetric structure. Instead: excite the two 0th-order input plane
-        # waves as UNIFORM real-space fields (x-pol E=x̂,H=ŷ and y-pol E=ŷ,H=-x̂, both forward), and read the
-        # 0th-order component of the output field. For vacuum ambients the flux factors cancel, so |J|² is the
-        # power fraction directly (columns sum to the 0th-order efficiency).
-        gs = fm.min_array_shape_for_expansion(self._ex)
-        _u = jnp.ones((*gs, 1), complex)
-        _z = jnp.zeros((*gs, 1), complex)
-        fwd_x = jnp.reshape(fm.amplitudes_for_fields(_u, _z, _z, _u, in_layer)[0], (2 * self._nt, 1))
-        fwd_y = jnp.reshape(fm.amplitudes_for_fields(_z, _u, -_u, _z, in_layer)[0], (2 * self._nt, 1))
 
-        def out0(fwd_in):  # the 0th-order (E_x, E_y) of the output field for this input plane wave
-            amp = smat @ fwd_in
-            zero = jnp.zeros_like(amp)
-            fa, ba = (amp, zero) if kind == "T" else (zero, amp)  # T -> forward in substrate; R -> backward in super
-            (ex, ey, _ez), _ = fm.fields_from_wave_amplitudes(fa, ba, out_layer)
-            return jnp.reshape(ex, (-1,))[0], jnp.reshape(ey, (-1,))[0]
+        def out0(pol):  # the 0th-order (E_x, E_y) of the output field for this input plane wave
+            ex, ey = self._spectrum(kind, fwd=self._input_pol(pol))
+            return ex[0], ey[0]  # (0,0) is expansion index 0
 
-        exx, eyx = out0(fwd_x)  # input x-pol -> output (E_x, E_y)
-        exy, eyy = out0(fwd_y)  # input y-pol -> output (E_x, E_y)
+        exx, eyx = out0("x")  # input x-pol -> output (E_x, E_y)
+        exy, eyy = out0("y")  # input y-pol -> output (E_x, E_y)
         return jnp.array([[exx, exy], [eyx, eyy]])  # J[out q, in p]
 
     def field(self, y_frac=0.5, nx=80, density=40.0):
@@ -275,18 +268,24 @@ class _Sol:
         layer_z = list(np.cumsum([float(t) for t in self._thick]))[:-1]
         return slab, [0.0, float(self._period[0]), float(zc.min()), float(zc.max())], layer_z
 
-    def _spectrum(self, kind="T"):
+    def _spectrum(self, kind="T", fwd=None):
         """The complex diffraction spectrum for imaging: the transverse E-field Fourier coefficients
-        ``(ex, ey)`` per diffraction order (transmitted ``"T"`` or reflected ``"R"``), read at the corrected
-        0th-order incidence. ``(0,0)`` is expansion index 0 (fmmax orders the zeroth term first)."""
+        ``(ex, ey)`` per diffraction order (transmitted ``"T"`` or reflected ``"R"``), for the corrected
+        0th-order incidence (or a supplied input amplitude ``fwd``). ``(0,0)`` is expansion index 0."""
         fm = self._fm
-        smat = self._s.s11 if kind == "T" else self._s.s21
-        layer = self._layers[-1] if kind == "T" else self._layers[0]
-        fwd = smat @ self._fwd
-        (ex, ey, _ez), _ = fm.fields_from_wave_amplitudes(fwd, jnp.zeros_like(fwd), layer)
+        if kind == "T":
+            smat, layer = self._s.s11, self._layers[-1]
+        elif kind == "R":
+            smat, layer = self._s.s21, self._layers[0]
+        else:
+            raise RcwaError(f"kind must be 'T' or 'R', got {kind!r}")
+        amp = smat @ (self._fwd if fwd is None else fwd)
+        zero = jnp.zeros_like(amp)
+        fa, ba = (amp, zero) if kind == "T" else (zero, amp)  # T -> forward in substrate; R -> backward in super
+        (ex, ey, _ez), _ = fm.fields_from_wave_amplitudes(fa, ba, layer)
         return jnp.reshape(ex, (-1,)), jnp.reshape(ey, (-1,))
 
-    def aerial(self, NA, source=0.7, defocus=0.0, grid=128, kind="T"):
+    def aerial(self, NA, source=0.7, defocus=0.0, grid=128, kind="T", polarization=None):
         """Partially-coherent **aerial image** (wafer-plane intensity) of this mask, by **Abbe** source
         integration -- the litho imaging step on top of the rigorous RCWA mask diffraction.
 
@@ -309,6 +308,11 @@ class _Sol:
             Real-space resolution of the returned image (one period).
         kind:
             ``"T"`` (transmissive DUV mask, default) or ``"R"`` (reflective EUV mask).
+        polarization:
+            ``None`` (default) → **scalar** imaging (uses ``E_x``), correct at low NA. A string turns on the
+            **vector high-NA** model, which rotates each order's transverse ``(E_x, E_y)`` to the 3-D wafer
+            field through the Richards-Wolf/Flagello vector pupil (so the TM component loses contrast at large
+            angles): ``"x"`` / ``"y"`` → linearly polarized illumination; ``"unpolarized"`` → the two averaged.
 
         Returns
         -------
@@ -317,30 +321,67 @@ class _Sol:
 
         Notes
         -----
-        Scalar (uses ``E_x``); the vector (high-NA) form reads both ``E_x, E_y`` with polarization in the
-        pupil -- future work. Uses the shift-invariant (Kirchhoff-like) Abbe sum on this single solve's
-        rigorous spectrum; full angular rigor (re-solving the mask per source point) is a heavier option.
+        Uses the shift-invariant (Kirchhoff-like) Abbe sum on this single solve's rigorous spectrum; full
+        angular rigor (re-solving the mask per source point) is a heavier option. The vector pupil follows
+        Flagello, Milster & Rosenbluth, *J. Opt. Soc. Am. A* **13**, 53 (1996), with the aplanatic
+        ``1/√(cosθ)`` apodization; at NA→0 it reduces to the scalar image.
         """
         wl = self._wl  # may be a tracer (a wavelength parameter) -- keep jax-native
         Px, Py = float(self._period[0]), float(self._period[1])
-        ex, _ey = self._spectrum(kind)  # scalar imaging -> E_x
         bc = np.asarray(self._ex.basis_coefficients)  # (nt, 2) static (m, n)
         M = int(np.abs(bc).max())
         grid = max(int(grid), 2 * M + 2)
-        A = jnp.zeros((2 * M + 1, 2 * M + 1), complex).at[bc[:, 0] + M, bc[:, 1] + M].set(ex)
         ms = jnp.asarray(np.arange(-M, M + 1))
         AX, AY = jnp.meshgrid(ms * wl / Px, ms * wl / Py, indexing="ij")  # α (direction cosine) per order
         S, W = _source_grid(source, float(NA))
         c = grid // 2
 
-        def one(s):  # image from a single source point s (a shift of the order frequencies)
-            r2 = (AX + s[0]) ** 2 + (AY + s[1]) ** 2
-            pupil = jnp.where(r2 <= NA**2, jnp.exp(-1j * jnp.pi * wl * defocus * r2), 0.0)
-            pad = jnp.zeros((grid, grid), complex).at[c - M : c + M + 1, c - M : c + M + 1].set(A * pupil)
-            E = jnp.fft.ifft2(jnp.fft.ifftshift(pad)) * (grid * grid)
-            return jnp.abs(E) ** 2
+        def _grid(vals):  # scatter an order-indexed spectrum onto the (2M+1)² frequency grid
+            return jnp.zeros((2 * M + 1, 2 * M + 1), complex).at[bc[:, 0] + M, bc[:, 1] + M].set(vals)
 
-        imgs = jax.vmap(one)(S)  # (Ns, grid, grid)
+        def _place(Apad):  # embed a pupil-weighted spectrum and inverse-FFT to a real-space field
+            pad = jnp.zeros((grid, grid), complex).at[c - M : c + M + 1, c - M : c + M + 1].set(Apad)
+            return jnp.fft.ifft2(jnp.fft.ifftshift(pad)) * (grid * grid)
+
+        if polarization is None:  # scalar imaging (E_x only)
+            A = _grid(self._spectrum(kind)[0])
+
+            def one(s):  # image from a single source point s (a shift of the order frequencies)
+                r2 = (AX + s[0]) ** 2 + (AY + s[1]) ** 2
+                pupil = jnp.where(r2 <= NA**2, jnp.exp(-1j * jnp.pi * wl * defocus * r2), 0.0)
+                return jnp.abs(_place(A * pupil)) ** 2
+
+            imgs = jax.vmap(one)(S)  # (Ns, grid, grid)
+            return jnp.sum(W[:, None, None] * imgs, axis=0) / jnp.sum(W)
+
+        # Vector (high-NA) imaging: rotate each order's transverse (E_x, E_y) to the 3-D wafer field via the
+        # Richards-Wolf/Flagello vector pupil (below). Average the incoherent images of the requested input
+        # polarizations. At NA→0 the pupil is the identity and this reduces to |E_x|²+|E_y|² == the scalar image.
+        pols = ("x", "y") if polarization == "unpolarized" else (polarization,)
+        specs = [(_grid(ex), _grid(ey)) for ex, ey in (self._spectrum(kind, fwd=self._input_pol(p)) for p in pols)]
+
+        def one(s):
+            ax, ay = AX + s[0], AY + s[1]
+            r2 = ax**2 + ay**2
+            passes = r2 <= NA**2
+            rho = jnp.sqrt(jnp.clip(r2, 0.0, 1.0))  # sinθ (transverse direction-cosine magnitude)
+            cth = jnp.sqrt(jnp.clip(1.0 - r2, 0.0, 1.0))  # cosθ
+            safe = rho > 1e-9
+            cf = jnp.where(safe, ax / jnp.where(safe, rho, 1.0), 1.0)  # cosφ (azimuth)
+            sf = jnp.where(safe, ay / jnp.where(safe, rho, 1.0), 0.0)  # sinφ
+            apod = jnp.where(  # defocus phase × aplanatic 1/√(cosθ), gated by the pupil
+                passes, jnp.exp(-1j * jnp.pi * wl * defocus * r2) / jnp.sqrt(jnp.where(passes, cth, 1.0)), 0.0
+            )
+            m00, m01, m11 = cf**2 * cth + sf**2, cf * sf * (cth - 1.0), sf**2 * cth + cf**2
+            m20, m21 = -rho * cf, -rho * sf
+            tot = jnp.zeros((grid, grid))
+            for Ax, Ay in specs:
+                ux, uy = Ax * apod, Ay * apod
+                ewx, ewy, ewz = _place(m00 * ux + m01 * uy), _place(m01 * ux + m11 * uy), _place(m20 * ux + m21 * uy)
+                tot = tot + jnp.abs(ewx) ** 2 + jnp.abs(ewy) ** 2 + jnp.abs(ewz) ** 2
+            return tot / len(specs)
+
+        imgs = jax.vmap(one)(S)
         return jnp.sum(W[:, None, None] * imgs, axis=0) / jnp.sum(W)
 
 
@@ -1305,10 +1346,10 @@ class _ParametricSol:
     def extraction(self, kind="up"):
         return self._node("extraction", kind)
 
-    def aerial(self, NA, source=0.7, defocus=0.0, grid=128, kind="T"):
+    def aerial(self, NA, source=0.7, defocus=0.0, grid=128, kind="T", polarization=None):
         """The aerial image as a trace node over the mask's ``jno.np.parameter``\\ s -- so ``jax.grad`` of a
         printed-vs-target loss flows back through the imaging AND the RCWA mask solve to the mask design (ILT)."""
-        return self._node("aerial", NA, source, defocus, grid, kind)
+        return self._node("aerial", NA, source, defocus, grid, kind, polarization)
 
     def field(self, *a, **k):
         raise RcwaError(

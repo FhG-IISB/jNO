@@ -181,10 +181,22 @@ mask solve:
 loss = lambda: ((jno.rcwa(mask(rho)).solve().aerial(NA=0.33, source=src) - target) ** 2).mean()
 ```
 
-Validated against the imaging limits (open frame → uniform; partial coherence reduces contrast) and by
-`jax.grad` vs finite difference. Scalar (uses `E_x`); the vector high-NA form (both `E_x, E_y` with
-polarization in the pupil) and the full angular-rigorous Abbe (re-solving the mask per source point) are
-future work.
+By default the image is **scalar** (uses `E_x`) — correct at low NA. Pass `polarization=` to switch on the
+**vector high-NA** model, which rotates each order's transverse `(E_x, E_y)` to the 3-D wafer field through
+the Richards-Wolf/Flagello vector pupil (with the aplanatic `1/√(cosθ)` apodization), so the TM component
+loses contrast at large ray angles — the defining high-NA effect:
+
+```python
+img = sol.aerial(NA=0.9, source=0.5, polarization="x")            # linearly polarized (TM for an x-grating)
+img = sol.aerial(NA=0.9, source=0.5, polarization="unpolarized")  # mean of the two linear images
+```
+
+`"x"`/`"y"` are linear illumination; `"unpolarized"` averages the two. At NA→0 the vector pupil is the
+identity and the image reduces to the scalar one. Validated against the imaging limits (open frame → uniform;
+partial coherence reduces contrast), the vector→scalar reduction as NA drops, the TE-over-TM contrast split at
+high NA, and by `jax.grad` vs finite difference. The vector pupil follows Flagello, Milster & Rosenbluth,
+*J. Opt. Soc. Am. A* **13**, 53 (1996). The full angular-rigorous Abbe (re-solving the mask per source point)
+remains future work.
 
 ## The backend — explicit layers
 
