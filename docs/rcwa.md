@@ -38,6 +38,8 @@ What is inferred from the problem, and from where:
 | **permittivity** | the `K0²·ε` coefficient recovered from the scalar Helmholtz volume term, sampled along z, then grouped by [`detect_layers`](#layer-detection) |
 | **wavelength / `k0`** | the coefficient's value in the vacuum superstrate (`k0 = √coeff`); pass `wavelength=` to override |
 | **incident wave** (lit face + angle `k_in`) | the assembled forcing `b` — a constant-phase source ⇒ normal incidence |
+| **tensor permittivity `ε̂`** | an `inner(ε̂ @ u, v)` mass term (a 3×3 `MatrixView`) — birefringence, polarization conversion |
+| **in-plane PML** | a complex coordinate stretch `S = 1 + iσ/k` in the stiffness coefficients — see below |
 
 The permittivity is recovered by splitting the volume weak form `∇u·∇v − K0²·ε·u·v`: the stiffness
 summands carry trial/test inside `Jacobian` nodes, the mass summand carries them as bare values, so
@@ -46,9 +48,35 @@ a trainable `jno.np.parameter` carries through, so inverse design flows unchange
 numerical truncation choice) is genuinely the user's; `wavelength` is an optional override for the case
 where no ambient is vacuum.
 
-Because RCWA solves the *infinitely periodic* problem, a finite aperture (absorbing side walls, no
-ties) is **rejected** rather than silently periodicised — exactly the difference between a supercell
-and a finite metasurface.
+Because RCWA solves the *infinitely periodic* problem, a finite aperture with plain absorbing side
+walls and **no ties** is **rejected** rather than silently periodicised. To model an *isolated*
+scatterer, keep the ties and add an in-plane PML frame (below) — the standard periodic-supercell trick.
+
+## In-plane PML — an isolated scatterer from a periodic supercell
+
+A [Perfectly Matched Layer](https://en.wikipedia.org/wiki/Perfectly_matched_layer) is a complex
+coordinate stretch `S = 1 + iσ/k` (σ ramps up in an absorbing frame, `0` in the physical core). Written
+into the **scalar Helmholtz** volume term it appears as anisotropic **stiffness** coefficients (and a
+matching mass coefficient):
+
+```python
+Sx, Sy = 1 + 1j*sx/K0, 1 + 1j*sy/K0                       # sx, sy ramp near the x / y walls
+vol = (  (Sy/Sx)*(ui.x*vi.x) + (Sx/Sy)*(ui.y*vi.y) + (Sx*Sy)*(ui.z*vi.z)   # uniaxial stretch, Sz = 1
+       - K0**2 * (Sx*Sy) * eps * (u*vi) )
+constraints = [vol, absorbing_top, absorbing_incident_bottom, u_left-u_right, u_front-u_back]
+sol = jno.rcwa(constraints, orders=200).solve()
+```
+
+The front door reads the stretch `Λ = diag(Sy/Sx, Sx/Sy, Sx·Sy)` straight off the stiffness
+coefficients and forms the Maxwell uniaxial PML — a **diagonal `ε̂` *and* `μ̂`** (`ε̂ = ε·Λ`, `μ̂ = Λ`) —
+solved with `fmmax`'s general anisotropic eigensolve. The **Floquet ties stay** (`fmmax` is inherently
+periodic); the absorbing frame just makes the supercell walls non-coupling, so light diffracted toward a
+neighbour is absorbed instead of recirculated, and the cell behaves like a single isolated scatterer.
+The traced stretch is honoured **exactly** — any σ profile, not a fixed built-in one.
+
+Scope: a **uniaxial** (diagonal) **in-plane** stretch on the **scalar** Helmholtz term, forward solve.
+An off-diagonal stretch, a z-stretch (meaningless for RCWA — the S-matrix already gives outgoing-wave
+z-boundaries), or a design `jno.np.parameter` routed *through* a PML each **raise**.
 
 ## The backend — explicit layers
 
@@ -94,9 +122,8 @@ a-Si). Correctness is checked against the analytic Fresnel/transfer-matrix trans
 
 - an `as_precond` path so RCWA can serve as the layered-background preconditioner `M⁻¹ = A₀⁻¹` for the
   large 3-D FEM complex-Helmholtz solve, once the FEM↔grid transfer is wired;
-- a differentiable sampling path (currently the permittivity is evaluated on the grid with the
-  parameter's current value; threading the gradient through would let RCWA drive inverse design directly);
-- support beyond the scalar isotropic Helmholtz volume term (vector/anisotropic media).
+- a differentiable PML path (a design `jno.np.parameter` routed through a PML supercell — the forward
+  solve works today, the re-sample does not yet).
 
 ## References
 
@@ -104,6 +131,10 @@ a-Si). Correctness is checked against the analytic Fresnel/transfer-matrix trans
   J. Opt. Soc. Am. **71**, 811 (1981).
 - M. G. Moharam, D. A. Pommet, E. B. Grann & T. K. Gaylord, *Stable implementation of the enhanced
   transmittance matrix approach*, J. Opt. Soc. Am. A **12**, 1077 (1995).
+- W. C. Chew & W. H. Weedon, *A 3D perfectly matched medium from modified Maxwell's equations with
+  stretched coordinates*, Microw. Opt. Technol. Lett. **7**, 599 (1994) — the complex coordinate stretch.
+- Z. S. Sacks, D. M. Kingsland, R. Lee & J.-F. Lee, *A perfectly matched anisotropic absorber for use as
+  an absorbing boundary condition*, IEEE Trans. Antennas Propag. **43**, 1460 (1995) — the uniaxial `ε̂`/`μ̂` PML.
 
 ## API
 

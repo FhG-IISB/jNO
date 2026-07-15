@@ -35,11 +35,22 @@ concrete fix. Two `fmmax` conventions are baked in: the Poynting flux is summed 
 ``abs()`` sum over-counts and yields ``T+R>1``), and ``JONES_DIRECT_FOURIER`` is the default
 factorization (the naive rule converges poorly for high-contrast dielectrics such as a-Si).
 
+Beyond a scalar ε, the front door also infers a **tensor permittivity** ``ε̂`` (from ``inner(ε̂ @ u, v)``)
+and an **in-plane PML** (a complex coordinate stretch ``S = 1 + iσ/k`` written into the stiffness
+coefficients of the scalar Helmholtz term). A uniaxial PML is exactly a diagonal Maxwell ``ε̂`` and ``μ̂``
+(``ε̂ = ε·Λ``, ``μ̂ = Λ``, ``Λ = diag(SᵧS_z/Sₓ, SₓS_z/Sᵧ, SₓSᵧ/S_z)``), so the traced stretch is honoured
+exactly and solved via `fmmax`'s general anisotropic eigensolve — turning a periodic supercell into an
+isolated scatterer (the absorbing frame decouples the walls).
+
 References:
  * M. G. Moharam & T. K. Gaylord, "Rigorous coupled-wave analysis of planar-grating diffraction",
    J. Opt. Soc. Am. 71, 811 (1981).
  * M. G. Moharam, D. A. Pommet, E. B. Grann & T. K. Gaylord, "Stable implementation of the enhanced
    transmittance matrix approach", J. Opt. Soc. Am. A 12, 1077 (1995).
+ * W. C. Chew & W. H. Weedon, "A 3D perfectly matched medium from modified Maxwell's equations with
+   stretched coordinates", Microw. Opt. Technol. Lett. 7, 599 (1994) — the complex coordinate stretch.
+ * Z. S. Sacks, D. M. Kingsland, R. Lee & J.-F. Lee, "A perfectly matched anisotropic absorber for use
+   as an absorbing boundary condition", IEEE Trans. Antennas Propag. 43, 1460 (1995) — the uniaxial ε̂/μ̂ PML.
  * fmmax: https://github.com/facebookresearch/fmmax
 """
 
@@ -633,6 +644,72 @@ def _extract_permittivity_coeff(volume_term):
     return functools.reduce(operator.add, mass)
 
 
+def _extract_pml_stretch(volume_term):
+    """Recover an in-plane uniaxial PML coordinate-stretch from a scalar Helmholtz volume term.
+
+    A PML writes the stiffness with anisotropic diagonal coefficients::
+
+        c_xx·∂ₓu ∂ₓv + c_yy·∂ᵧu ∂ᵧv + c_zz·∂_zu ∂_zv
+
+    where ``(c_xx, c_yy, c_zz) = Λ = diag(SᵧS_z/Sₓ, SₓS_z/Sᵧ, SₓSᵧ/S_z)`` is the coordinate-stretch
+    tensor (``S_i = 1 + iσ_i/k``, ramping in the absorbing frame, ``1`` in the physical core). This is
+    exactly the Maxwell uniaxial PML: ``ε̂ = ε·Λ``, ``μ̂ = Λ``. We honour whatever stretch the user traced.
+
+    Returns ``{axis: Λ_axis_node}`` (axis ``0/1/2`` ↦ ``x/y/z``) when a stretch is present, or ``{}`` when
+    every stiffness summand is a bare ``∂u·∂v`` (no PML). Raises on an off-diagonal stiffness
+    (``∂ᵢu ∂ⱼv``, i≠j) — only a diagonal (uniaxial) stretch is supported."""
+    import functools
+    import operator
+
+    from jno.trace import Jacobian
+
+    expr = getattr(volume_term, "expr", volume_term)
+    per_axis = {}  # axis -> list of coefficient nodes (None = a bare, coefficient-less ∂u·∂v)
+    saw_stiffness = False
+    for _sign, summand in _add_split(expr):
+        fac = _mul_factors(summand)
+        jt = [f for f in fac if isinstance(f, Jacobian) and _contains_trial(f.target)]
+        je = [f for f in fac if isinstance(f, Jacobian) and _contains_test(f.target)]
+        if not (jt and je):
+            continue  # mass / source / other channel -- not a stiffness summand
+        if len(jt) != 1 or len(je) != 1:
+            raise RcwaError("RCWA PML: expected one trial-gradient and one test-gradient per stiffness term.")
+        saw_stiffness = True
+        axt, axe = jt[0].variables[0].dim[0], je[0].variables[0].dim[0]
+        if axt != axe:
+            raise RcwaError(
+                "RCWA sees an off-diagonal stiffness term (∂ᵢu ∂ⱼv, i≠j) -> a non-diagonal coordinate "
+                "stretch. Only a diagonal (uniaxial) in-plane PML is supported."
+            )
+        coeff_factors = [f for f in fac if f is not jt[0] and f is not je[0]]
+        per_axis.setdefault(axt, []).append(functools.reduce(operator.mul, coeff_factors) if coeff_factors else None)
+    if not saw_stiffness or all(c is None for cs in per_axis.values() for c in cs):
+        return {}  # no stiffness, or every stiffness term is a bare ∂u·∂v -> not a PML
+    return {  # a bare contribution on a stretched axis counts as Λ += 1
+        ax: functools.reduce(operator.add, [(c if c is not None else 1.0) for c in cs]) for ax, cs in per_axis.items()
+    }
+
+
+def _pml_layer_components(mass_node, stretch, period, grid, zmid, params, k0sq):
+    """The 10 relative-permittivity/permeability grids ``(ε_xx,ε_xy,ε_yx,ε_yy,ε_zz, μ_xx,μ_xy,μ_yx,μ_yy,μ_zz)``
+    of an in-plane uniaxial PML layer at height ``zmid``.
+
+    ``Λ = diag(c_xx, c_yy, c_zz)`` is read off the stiffness coefficients (``stretch``); the Maxwell PML is
+    ``ε̂ = ε·Λ``, ``μ̂ = Λ`` with ``ε = (K0²·ε·SₓSᵧS_z)/k0² / (c_xx·c_yy·c_zz)`` since
+    ``SₓSᵧS_z = c_xx·c_yy·c_zz``. Off-diagonal components are zero (uniaxial)."""
+    pts = _cell_grid_at_z(period, grid, zmid)
+
+    def samp(node):
+        v = jnp.full((grid * grid,), node) if np.isscalar(node) else _eval_coeff_points(node, pts, params)
+        return jnp.reshape(v, (grid, grid)) + 0j
+
+    lam = [samp(stretch[ax]) for ax in (0, 1, 2)]
+    m = jnp.reshape(_eval_coeff_points(mass_node, pts, params), (grid, grid)) + 0j
+    eps_rel = (m / k0sq) / (lam[0] * lam[1] * lam[2])
+    z = jnp.zeros((grid, grid), complex)
+    return (eps_rel * lam[0], z, z, eps_rel * lam[1], eps_rel * lam[2], lam[0], z, z, lam[1], lam[2])
+
+
 def _has_nodal_field(node):
     """True if the coefficient depends on a per-node field parameter (needs mesh interpolation)."""
     return any(getattr(mc.model, "_fem_field", None) == "node" for mc in _model_calls(node))
@@ -1012,9 +1089,13 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
 
     Everything is read out of the traced problem: **periodicity + period** (Floquet ties — absent ⇒
     raise), the **super/substrate ambients**, the **permittivity** (the ``K0**2*eps`` coefficient
-    recovered from the scalar Helmholtz volume term, sampled along z), the **wavelength** (``k0`` from
-    the vacuum superstrate, unless ``wavelength`` is given), and the **incident wave** (illuminated face
-    + transverse angle ``k_in``, from the assembled forcing).
+    recovered from the scalar Helmholtz volume term, sampled along z; a tensor ``ε̂`` from
+    ``inner(ε̂ @ u, v)``), the **wavelength** (``k0`` from the vacuum superstrate, unless ``wavelength``
+    is given), and the **incident wave** (illuminated face + transverse angle ``k_in``, from the
+    assembled forcing). An **in-plane PML** (a complex coordinate stretch in the stiffness coefficients)
+    is detected and honoured as a diagonal Maxwell ``ε̂``/``μ̂`` — the supercell then behaves as an
+    isolated scatterer. Scope: uniaxial (diagonal) in-plane stretch only, scalar Helmholtz, forward
+    solve (a design parameter *through* a PML is not yet differentiable — it raises).
 
     Parameters
     ----------
@@ -1050,6 +1131,10 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
     cparams = _param_values(femobj, coeff_node)
     cparams.update({k: jnp.asarray(v) for k, v in (params or {}).items()})
     is_aniso = _coeff_is_tensor(coeff_node, period, z_range, cparams)  # 3×3 ε̂ vs scalar ε
+    stretch = _extract_pml_stretch(_volume_constraint(femobj))  # {axis: Λ node} for an in-plane PML, else {}
+    is_pml = bool(stretch)
+    if is_pml and is_aniso:
+        raise RcwaError("RCWA sees both an in-plane PML stretch and a tensor ε̂ mass term; combine them by hand.")
     if _has_nodal_field(coeff_node):  # per-node design field -> interpolate off the mesh
         coeff_nodes = _eval_expr_nodes(coeff_node, domain)
         if np.iscomplexobj(coeff_nodes) and np.max(np.abs(coeff_nodes.imag)) < 1e-9:
@@ -1068,8 +1153,14 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
     if not source_at_bottom:
         coeff_layers = list(reversed(coeff_layers))
         zmids = list(reversed(zmids))
-    # k0 from the superstrate (vacuum ⇒ coeff = k0^2), unless wavelength is given
-    super_coeff = float(np.real(coeff_layers[0][1]).mean())
+    # k0 from the superstrate (vacuum ⇒ coeff = k0^2), unless wavelength is given. With a PML the superstrate
+    # is a vacuum framed by the absorber, so its transverse MEAN is stretched; read k0 at the physical-core
+    # centre instead (there Λ=1 and ε=1, so the mass coefficient is exactly k0²).
+    if is_pml:
+        center = np.array([[period[0] * 0.5, period[1] * 0.5, zmids[0]]])
+        super_coeff = float(np.real(_eval_coeff_points(coeff_node, center, cparams)).reshape(-1)[0])
+    else:
+        super_coeff = float(np.real(coeff_layers[0][1]).mean())
     if wavelength is not None:
         k0 = 2 * np.pi / float(wavelength)
     elif super_coeff <= 0:
@@ -1079,7 +1170,12 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
     else:
         k0 = float(np.sqrt(super_coeff))
     k0sq = k0 * k0
-    if is_aniso:  # relative-permittivity TENSOR per layer: (ε_xx, ε_xy, ε_yx, ε_yy, ε_zz)
+    if is_pml:  # in-plane uniaxial PML: general-anisotropic layer (ε̂ AND μ̂), 10 grids per layer
+        layers = [
+            (t, tuple(np.asarray(c) for c in _pml_layer_components(coeff_node, stretch, period, grid, zm, cparams, k0sq)))
+            for (t, _), zm in zip(coeff_layers, zmids)
+        ]
+    elif is_aniso:  # relative-permittivity TENSOR per layer: (ε_xx, ε_xy, ε_yx, ε_yy, ε_zz)
         layers = [
             (t, tuple(np.asarray(c) for c in _tensor_components(coeff_node, period, grid, zm, cparams, k0sq)))
             for (t, _), zm in zip(coeff_layers, zmids)
@@ -1153,6 +1249,11 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
     _collect_runtime_parameter_exprs(coeff_node, rpe)  # eps / wavelength parameters
     if src_coeff is not None:
         _collect_runtime_parameter_exprs(src_coeff, rpe)  # an incidence-angle parameter in the source
+    if is_pml and rpe:  # the eager PML layers solve fine; a design parameter through a PML re-sample is future work
+        raise RcwaError(
+            "differentiable PML is not yet supported: a jno.np.parameter flows through an in-plane PML "
+            f"problem (parameters {sorted(rpe)}). The forward PML solve works; drop the parameter to use it."
+        )
 
     spec = RcwaSpec(
         period=period,
