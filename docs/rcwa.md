@@ -130,6 +130,32 @@ rigorous **tensor** scheme (Farjadpour et al., *Opt. Lett.* **31**, 2972 (2006):
 harmonic normal averaging at the interface, which additionally accelerates Fourier convergence) is future
 work. Recommended `k = 2`–`4` for topology optimization; leave it off for a fixed-geometry forward solve.
 
+## Profiling and convergence sweeps — `solve(orders=…, profile=…)`
+
+Two escape hatches on `.solve()` for a *forward* solve (they don't affect the differentiable no-arg path):
+
+```python
+rc = jno.rcwa(constraints, orders=200)
+
+# re-solve at a different Fourier truncation (a fresh engine; the construction `orders` is untouched)
+T20  = rc.solve(orders=120).efficiency("T")
+T30  = rc.solve(orders=180).efficiency("T")     # converged if T20 ~= T30 (a Richardson check)
+
+# JAX performance profile, exactly like jno.core.solve(profile=True)
+sol = rc.solve(profile=True)
+# -> [rcwa profile] 3 layers · n_t=193 · 386×386 eigenproblem/layer | solve 1.2 s | Perfetto trace -> ./rcwa_traces
+```
+
+`orders=N` is the enabler for a **convergence sweep**: RCWA is only exact as the truncation → ∞, and how
+fast it converges is structure-dependent (a sharp, high-contrast pillar can need several ×N more orders than
+a smooth slab), so comparing `efficiency` at `N` vs `~1.5N` tells you whether `orders` is enough — solve at
+both and check they agree.
+
+`profile=True` runs the solve **eagerly** (at the current parameter values) inside a `jax.profiler.trace`
+with per-stage `TraceAnnotation`s (`rcwa:eigensolve`, `rcwa:s_matrix`), prints the problem size and wall
+time, and writes a Perfetto trace to `./rcwa_traces`. RCWA's cost is dominated by the `O((2·n_t)³)` per-layer
+eigensolves — the trace makes that explicit (open it at `chrome://tracing` or Perfetto UI).
+
 ## The backend — explicit layers
 
 `jno.Rcwa` takes a hand-built stack directly; this is what the front door constructs internally:

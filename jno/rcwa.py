@@ -76,6 +76,16 @@ def _concrete(x):
     return not isinstance(x, jax.core.Tracer)
 
 
+def _annot(name):
+    """A ``jax.profiler.TraceAnnotation`` labelling a solve stage in a Perfetto trace when profiling is
+    active (``rc.solve(profile=True)``); a no-op context otherwise, so it never costs anything normally."""
+    from contextlib import nullcontext
+
+    from jax._src import profiler as _jp
+
+    return jax.profiler.TraceAnnotation(name) if _jp._profile_state.profile_session is not None else nullcontext()
+
+
 _FMMAX_HINT = (
     "jno.rcwa needs the optional fmmax backend: pip install jax-neural-operators[rcwa] "
     "(or `pixi run -e rcwa ...`, or `pip install fmmax`)."
@@ -416,8 +426,10 @@ class Rcwa:
         nt = self._nt  # precomputed eagerly in __init__ (jit-safe)
         if source is not None:
             return self._solve_source(source, layers_spec, wl, kin)
-        layers, thick = self._eigensolve_stack(layers_spec, wl, kin)
-        s = fm.stack_s_matrix(layers, thick)
+        with _annot("rcwa:eigensolve"):
+            layers, thick = self._eigensolve_stack(layers_spec, wl, kin)
+        with _annot("rcwa:s_matrix"):
+            s = fm.stack_s_matrix(layers, thick)
         # Incidence: excite the genuinely forward-propagating mode in the superstrate and normalise by
         # ITS flux. fmmax sorts eigenmodes by eigenvalue, so index 0 need not be the 0th forward order,
         # and a one-hot forward amplitude can carry zero forward flux -- pick the max-positive-flux mode.
@@ -456,7 +468,8 @@ class Rcwa:
         ``amplitudes_for_source`` propagates it to the ambients. Returns an :class:`_EmitterSol` with the
         power radiated up / down (differentiable in ``amp``, ``orient`` and the design ε)."""
         fm, lv, ex = self.fm, self._lv, self._ex
-        layers, thick = self._eigensolve_stack(layers_spec, wl, kin)
+        with _annot("rcwa:eigensolve"):
+            layers, thick = self._eigensolve_stack(layers_spec, wl, kin)
         si = source["layer"]
         tu, tl = jnp.asarray(source["t_upper"]), jnp.asarray(source["t_lower"])  # z-split thicknesses (differentiable)
         before = layers[: si + 1]
@@ -1209,6 +1222,32 @@ class _ParametricSol:
         )
 
 
+def _profile_solve(run, eng):
+    """Run an eager RCWA solve inside a JAX Perfetto trace (per-stage annotated) and print a size/time
+    summary -- the profiling path of ``rc.solve(profile=True)``, mirroring ``jno.core.solve(profile=True)``."""
+    import os
+    import time
+
+    trace_dir = os.path.join(os.getcwd(), "rcwa_traces")
+    os.makedirs(trace_dir, exist_ok=True)
+
+    def _block(sol):  # force the DAG to execute so the trace/timer sees the real work
+        jax.block_until_ready(sol.power("total") if isinstance(sol, _EmitterSol) else sol.efficiency("T"))
+        return sol
+
+    _block(run())  # warm: trigger XLA compilation so the trace times the hot solve
+    t0 = time.perf_counter()
+    with jax.profiler.trace(trace_dir, create_perfetto_trace=True):
+        sol = _block(run())
+    dt = time.perf_counter() - t0
+    nt = eng._nt
+    print(
+        f"[rcwa profile] {len(eng.layers_spec)} layers · n_t={nt} Fourier orders · "
+        f"{2 * nt}×{2 * nt} eigenproblem/layer  |  solve {dt * 1e3:.1f} ms  |  Perfetto trace → {trace_dir}"
+    )
+    return sol
+
+
 class _RcwaProblem:
     """An RCWA problem inferred from a jNO constraint list / FEM problem. Holds the inferred
     :class:`RcwaSpec` and builds the fmmax engine on :meth:`solve`."""
@@ -1223,17 +1262,20 @@ class _RcwaProblem:
     def __repr__(self):
         return f"_RcwaProblem(orders={self.orders}, params={sorted(self._rpe)}, {self.spec!r})"
 
+    def _build_engine(self, orders):
+        return Rcwa(
+            self.spec.layers,
+            period=self.spec.period,
+            orders=orders,
+            wavelength=self.spec.wavelength,
+            k_in=self.spec.k_in,
+            formulation=self.formulation,
+            assume_periodic=True,
+        )
+
     def _engine(self):
         if getattr(self, "_eng", None) is None:  # build ONCE (warmed eagerly in _node) so the expansion is trace-free
-            self._eng = Rcwa(
-                self.spec.layers,
-                period=self.spec.period,
-                orders=self.orders,
-                wavelength=self.spec.wavelength,
-                k_in=self.spec.k_in,
-                formulation=self.formulation,
-                assume_periodic=True,
-            )
+            self._eng = self._build_engine(self.orders)
         return self._eng
 
     def _solve_at(self, params):
@@ -1245,7 +1287,7 @@ class _RcwaProblem:
         layers, wl, kin, source = self._resample(params)
         return eng.solve(layers=layers, wavelength=wl, k_in=kin, source=source)
 
-    def solve(self, params=None, wavelength=None, k_in=None):
+    def solve(self, params=None, wavelength=None, k_in=None, orders=None, profile=False):
         """Solve.
 
         The jNO way (**no arguments**): if the constraint list carries ``jno.np.parameter`` coefficients
@@ -1255,27 +1297,39 @@ class _RcwaProblem:
         or ``jno.rcwa``. A parameter-free problem solves eagerly and returns concrete readouts.
 
         Escape hatches for a *forward sweep* (not the traced/optimised path): ``params={name: value}`` for
-        a concrete solve at explicit values, or ``wavelength`` / ``k_in`` to override those directly."""
-        if params is None and wavelength is None and k_in is None:
+        a concrete solve at explicit values, or ``wavelength`` / ``k_in`` to override those directly.
+
+        ``orders=N`` re-solves at a different Fourier truncation (a fresh engine, the construction ``orders``
+        is untouched) -- for a **convergence sweep** (compare ``.efficiency`` at N vs 1.5·N) or profiling at
+        scale. ``profile=True`` runs the solve eagerly (at the current parameter values) inside a JAX
+        Perfetto trace with per-stage annotations, like ``jno.core.solve(profile=True)`` -- it prints the
+        problem size and wall time and writes the trace to ``./rcwa_traces`` (RCWA time is dominated by the
+        O((2·n_t)³) per-layer eigensolves, which the trace makes explicit)."""
+        forward = params is not None or wavelength is not None or k_in is not None or orders is not None or profile
+        if not forward:
             if self._rpe and self._resample is not None:
                 return _ParametricSol(self, self._rpe)  # parametric -> trace node (crux-differentiable)
             return self._engine().solve(source=self.spec.source)  # parameter-free -> eager concrete
-        eng = self._engine()
-        if params is None:
-            return eng.solve(wavelength=wavelength, k_in=k_in, source=self.spec.source)
-        if self._resample is None:
-            raise RcwaError(
-                "differentiable solve(params=...) needs the analytic re-sampling path, which is only built "
-                "for an analytic permittivity (no per-node field). This problem uses a nodal-field "
-                "permittivity; differentiable nodal re-sampling is not implemented yet."
+        eng = self._engine() if orders is None else self._build_engine(orders)
+
+        def run():  # a concrete (eager) solve at explicit / current values
+            if params is None:
+                return eng.solve(wavelength=wavelength, k_in=k_in, source=self.spec.source)
+            if self._resample is None:
+                raise RcwaError(
+                    "differentiable solve(params=...) needs the analytic re-sampling path, which is only built "
+                    "for an analytic permittivity (no per-node field). This problem uses a nodal-field "
+                    "permittivity; differentiable nodal re-sampling is not implemented yet."
+                )
+            layers, wl, kin, source = self._resample(params)
+            return eng.solve(
+                layers=layers,
+                wavelength=wavelength if wavelength is not None else wl,
+                k_in=k_in if k_in is not None else kin,
+                source=source,
             )
-        layers, wl, kin, source = self._resample(params)
-        return eng.solve(
-            layers=layers,
-            wavelength=wavelength if wavelength is not None else wl,
-            k_in=k_in if k_in is not None else kin,
-            source=source,
-        )
+
+        return _profile_solve(run, eng) if profile else run()
 
 
 def _build_emitter_problem(
