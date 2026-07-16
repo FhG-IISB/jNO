@@ -48,9 +48,11 @@ def test_regions_expose_variable_sets_and_external_boundary():
         d.variable(tag)  # must not raise
     assert d._mesh_pool["inclusion"].shape[0] > 0
     # the interior sub-region is NOT a boundary; the boundary is the plate's outer edges only
+    # (the material interface is a separate category, not in boundary_tags())
     tags = set(d.boundary_tags())
     assert tags == {"left", "right", "top", "bottom", "boundary"}
     assert "inclusion" not in tags and "matrix" not in tags
+    assert "inclusion|matrix" not in tags
 
 
 def test_regions_priority_is_keyword_order():
@@ -75,6 +77,7 @@ def test_regions_3d_box_with_spherical_core():
     assert d._mesh_pool["shell"].shape[0] > 0
     # 3-D outer boundary keeps the box face names; the sphere interface is not boundary
     assert set(d.boundary_tags()) == {"left", "right", "front", "back", "top", "bottom", "boundary"}
+    assert d.interface_tags() == ["core|shell"]
 
 
 def test_regions_contains_is_union():
@@ -118,6 +121,38 @@ def test_plus_is_nary_with_priority_order():
 def test_plus_requires_named_operands():
     with pytest.raises(ValueError, match=r"\.name"):
         _ = jno.Shape.disk(0, 0, 1) + jno.Shape.rect(0, 0, 1, 1)
+
+
+def test_interface_is_auto_named_by_region_pair():
+    """The facets between two materials are exposed as a tag named by the region pair, sorted."""
+    d = (jno.Shape.disk(1, 0.5, 0.3).name("inclusion") + jno.Shape.rect(0, 0, 2, 1).name("matrix")).sized(0.06).domain()
+    assert d.interface_tags() == ["inclusion|matrix"]
+    d.variable("inclusion|matrix")  # must not raise
+    assert d._mesh_pool["inclusion|matrix"].shape[0] > 0
+    # the interface is a separate category — not the outer boundary
+    assert "inclusion|matrix" not in d.boundary_tags()
+    assert "matrix|inclusion" not in d.avaiable_mesh_tags  # name is sorted, one spelling only
+
+
+def test_two_interfaces_between_same_materials_stay_separable():
+    """Two disjoint same-material inclusions give two interfaces of the same pair; they are kept
+    apart as ``a|b.0`` / ``a|b.1`` rather than collapsed into one ambiguous tag."""
+    incl = jno.Shape.disk(0.5, 0.5, 0.2) | jno.Shape.disk(1.5, 0.5, 0.2)
+    d = (incl.name("inclusion") + jno.Shape.rect(0, 0, 2, 1).name("matrix")).sized(0.05).domain()
+    ifaces = sorted(k for k in d.avaiable_mesh_tags if k.startswith("inclusion|matrix"))
+    assert ifaces == ["inclusion|matrix.0", "inclusion|matrix.1"]
+    for k in ifaces:
+        assert d._mesh_pool[k].shape[0] > 0
+
+
+def test_interface_3d_box_sphere():
+    d = (
+        jno.Shape.regions(core=jno.Shape.sphere(0.5, 0.5, 0.5, 0.25), shell=jno.Shape.box(0, 0, 0, 1, 1, 1))
+        .sized(0.12)
+        .domain()
+    )
+    assert "core|shell" in d.avaiable_mesh_tags
+    assert d._mesh_pool["core|shell"].shape[0] > 0
 
 
 def test_fem_term_restricts_to_a_shape_region():

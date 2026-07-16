@@ -426,6 +426,7 @@ class domain(MeshIOMixin):
         self._param_tags: set = set()  # tags that are parametric (TensorTag)
         self.normals_by_tag: Dict[str, np.ndarray] = {}
         self._boundary_registry: Dict[str, Dict[str, Any]] = {}
+        self._interface_registry: Dict[str, Dict[str, Any]] = {}
         self._tag_edges: Dict[str, np.ndarray] = {}
         self._tag_triangles: Dict[str, np.ndarray] = {}
         self._boundary_regions: Dict[str, BoundaryRegion] = {}
@@ -830,6 +831,14 @@ class domain(MeshIOMixin):
             Neumann conditions.
         """
         return sorted(self._boundary_registry.keys())
+
+    def interface_tags(self):
+        """Return the internal material-interface tags (``"a|b"``) from a :meth:`Shape.regions` domain.
+
+        These are facet regions between two materials — impose a coupling/flux condition on one, or
+        sample it — but they are *not* part of :meth:`boundary_tags` (the outer boundary).
+        """
+        return sorted(getattr(self, "_interface_registry", {}).keys())
 
     def dirichlet(self, tags, values=None):
         """
@@ -1743,6 +1752,7 @@ class domain(MeshIOMixin):
         self.points = points
         self._mesh_pool = {}
         self._boundary_registry = {}
+        self._interface_registry: Dict[str, Dict[str, Any]] = {}
         self.tag_indices = {}
         self._tag_edges = {}
         self._tag_triangles = {}
@@ -1940,7 +1950,12 @@ class domain(MeshIOMixin):
                             tol=tol,
                         )
 
-                        self._boundary_registry[name] = {
+                        # An internal material interface (auto-named "a|b" by Shape.regions) is a facet
+                        # region you can impose a coupling/flux condition on, but it is NOT the outer
+                        # boundary -- keep it out of boundary_tags() so `dirichlet(boundary_tags())`
+                        # never pins it. It stays queryable via d.variable("a|b") / interface_tags().
+                        registry = self._interface_registry if "|" in name else self._boundary_registry
+                        registry[name] = {
                             "tag": name,
                             "entity_kind": entity_kind,
                             "point_indices": indices_list,

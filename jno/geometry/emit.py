@@ -194,9 +194,11 @@ def _to_meshio(dim: int, labels: Dict[int, Tuple[int, str]], region_items=None):
     """Assemble the generated gmsh mesh into a ``meshio.Mesh`` with named ``cell_sets``.
 
     ``region_items`` (``((name, sub_shape), ...)``, when the plan is a :meth:`Shape.regions`
-    multi-material domain) adds one volume ``cell_set`` per region — each cell assigned to the
-    first region whose shape contains its centroid — and drops internal interface facets from the
-    boundary block (a facet shared by two volumes is not a domain boundary).
+    multi-material domain) adds one volume ``cell_set`` per region — each cell assigned to the first
+    region whose shape contains its centroid — plus one facet ``cell_set`` per material **interface**,
+    auto-named by the region pair it separates (``"a|b"``). Two *distinct* interfaces between the same
+    pair stay separable — emitted as ``"a|b.0"`` / ``"a|b.1"`` (each a single closed loop) instead of
+    one ambiguous ``"a|b"`` tag.
     """
     import gmsh
     import meshio
@@ -216,26 +218,55 @@ def _to_meshio(dim: int, labels: Dict[int, Tuple[int, str]], region_items=None):
     _vtags, vnodes = gmsh.model.mesh.getElementsByType(vtype)
     vcells = np.asarray([index[int(t)] for t in vnodes], dtype=np.int64).reshape(-1, npv)
 
+    # Which region each volume ENTITY belongs to (all its cells share one region -> classify one cell).
+    vol_region: Dict[int, str] = {}
+    if region_items is not None:
+        for _d, vtag in gmsh.model.getEntities(dim):
+            vt, _vt2, vn = gmsh.model.mesh.getElements(dim, vtag)
+            for et, en in zip(vt, vn):
+                if et != vtype:
+                    continue
+                nodes = [index[int(t)] for t in np.asarray(en[:npv], dtype=np.int64)]
+                c = coords[nodes].mean(axis=0)[None, :]
+                for name, sub in region_items:
+                    if bool(np.asarray(sub.contains(c))[0]):
+                        vol_region[int(vtag)] = name
+                        break
+                break
+
     bdim = dim - 1
     facet_rows: List[List[int]] = []
     by_name: Dict[str, List[np.ndarray]] = {}
+    external_ranges: List[np.ndarray] = []
+    iface_entities: Dict[str, List[np.ndarray]] = {}  # "a|b" -> per-entity facet index ranges
     for _edim, etag in gmsh.model.getEntities(bdim):
-        if region_items is not None and len(gmsh.model.getAdjacencies(bdim, etag)[0]) >= 2:
-            continue  # facet shared by two volumes -> internal material interface, not boundary
+        adj = gmsh.model.getAdjacencies(bdim, etag)[0] if region_items is not None else ()
+        interface_pair = None
+        if len(adj) >= 2:
+            regs = sorted({vol_region[int(v)] for v in adj if int(v) in vol_region})
+            if len(regs) < 2:
+                continue  # both sides are the same region -> not a material interface
+            interface_pair = "|".join(regs)
         label = labels.get(etag)
         # A 1-D polyline's intermediate junctions are interior points (unnamed) -- they must not
         # land in the boundary block. Higher-dim unnamed facets stay boundary (just unnamed).
         if dim == 1 and label is None:
             continue
         etypes, _etags, enodes = gmsh.model.mesh.getElements(bdim, etag)
+        start = len(facet_rows)
         for et, en in zip(etypes, enodes):
             if et != btype:
                 continue
             rows = np.asarray(en, dtype=np.int64).reshape(-1, npb)
-            start = len(facet_rows)
             facet_rows.extend([index[int(t)] for t in row] for row in rows)
+        rng = np.arange(start, len(facet_rows), dtype=np.int64)
+        if rng.size == 0:
+            continue
+        if interface_pair is not None:
+            iface_entities.setdefault(interface_pair, []).append(rng)
+        else:
+            external_ranges.append(rng)
             if label is not None:
-                rng = np.arange(start, len(facet_rows), dtype=np.int64)
                 by_name.setdefault(label[1], []).append(rng)
 
     facets = np.asarray(facet_rows, dtype=np.int64).reshape(-1, npb) if facet_rows else np.zeros((0, npb), dtype=np.int64)
@@ -244,7 +275,16 @@ def _to_meshio(dim: int, labels: Dict[int, Tuple[int, str]], region_items=None):
     cell_sets: Dict[str, list] = {"interior": [np.arange(len(vcells), dtype=np.int64), empty.copy()]}
     for name, chunks in by_name.items():
         cell_sets[name] = [empty.copy(), np.concatenate(chunks) if chunks else empty.copy()]
-    cell_sets["boundary"] = [empty.copy(), np.arange(len(facets), dtype=np.int64)]
+    # "boundary" is the OUTER boundary only (internal interfaces are separate, named tags).
+    ext = np.concatenate(external_ranges) if external_ranges else empty.copy()
+    cell_sets["boundary"] = [empty.copy(), ext]
+
+    for pair, ent_list in iface_entities.items():
+        if len(ent_list) == 1:
+            cell_sets[pair] = [empty.copy(), ent_list[0]]
+        else:  # several disjoint interfaces between the SAME materials -> keep each separable
+            for k, rng in enumerate(ent_list):
+                cell_sets[f"{pair}.{k}"] = [empty.copy(), rng]
 
     if region_items and len(vcells):
         centroids = coords[vcells].mean(axis=1)  # (M, 3) cell centroids

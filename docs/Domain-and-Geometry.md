@@ -141,6 +141,12 @@ and `inclusion` wins inside the disk because it is listed first. Use each region
 PINN. A multi-material shape is a top-level construct — call `.domain()` on it directly; it does not
 compose with boolean operators or transforms.
 
+**Interfaces** between materials are auto-named by the region pair, sorted — `d.variable("inclusion|matrix")`
+gives the facets where those two materials meet (impose a coupling/flux condition there, or sample it).
+They are listed by `d.interface_tags()`, kept **out** of `d.boundary_tags()` (an interface is not the
+outer boundary). Two distinct interfaces between the *same* pair stay separable as `"inclusion|matrix.0"`
+and `"inclusion|matrix.1"`.
+
 ---
 
 ## Worked examples
