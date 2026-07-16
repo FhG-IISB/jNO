@@ -1714,9 +1714,7 @@ def _build_periodic_reduction(domain: Any, ties: List[Any], points: Any, cells: 
                     if t in ti and t not in face_nodes:
                         face_nodes[t] = set(int(i) for i in np.asarray(ti[t]).reshape(-1))
             faces = [t for tie in ties for t in tie[:2]]
-            shared = all(
-                any((face_nodes.get(a, set()) & face_nodes.get(b, set())) for b in faces if b != a) for a in faces
-            )
+            shared = all(any((face_nodes.get(a, set()) & face_nodes.get(b, set())) for b in faces if b != a) for a in faces)
             if not (shared and len(face_nodes) == len(set(faces))):
                 raise NotImplementedError(
                     "jno.fem: multidirectional periodicity needs each periodic face to include its shared "
