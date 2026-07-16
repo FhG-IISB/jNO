@@ -35,7 +35,17 @@ from .utils.solver.solver_api import (  # noqa: F401  (PrecondContext re-exporte
 __all__ = ["PrecondContext", "jacobi", "chebyshev", "form", "inner", "block_diag", "triangular", "amg", "cached"]
 
 
-class _Jacobi:
+class _Spec:
+    """Base for ``jno.precond.*`` specs — gives every preconditioner a fluent ``.cached()``."""
+
+    def cached(self, *, refresh: bool = False):
+        """Wrap this preconditioner so its setup is built **once** and reused across solves — the
+        fluent form of :func:`cached`. E.g. ``jno.precond.amg().cached()``. ``refresh`` controls
+        invalidation (``False`` frozen, ``True`` on shape/sparsity change, or a ``ctx -> key`` callable)."""
+        return _Cached(self, refresh)
+
+
+class _Jacobi(_Spec):
     """Spec for the diagonal (Jacobi) preconditioner; see :func:`jacobi`."""
 
     def materialize(self, ctx: PrecondContext):
@@ -48,7 +58,7 @@ class _Jacobi:
         return "jno.precond.jacobi()"
 
 
-class _Chebyshev:
+class _Chebyshev(_Spec):
     """Spec for the fixed-degree Chebyshev polynomial preconditioner; see :func:`chebyshev`."""
 
     def __init__(self, degree, lmin, lmax, lmin_ratio, safety, bound_iters):
@@ -94,7 +104,7 @@ def jacobi() -> _Jacobi:
     return _Jacobi()
 
 
-class _Form:
+class _Form(_Spec):
     """Spec assembling an auxiliary weak form as the preconditioner operator; see :func:`form`."""
 
     def __init__(self, terms, inner_solver, quad_degree):
@@ -154,7 +164,7 @@ def form(terms, *, inner=None, quad_degree: int = 2) -> _Form:
     return _Form(terms, inner, quad_degree)
 
 
-class _InnerSolve:
+class _InnerSolve(_Spec):
     """Spec using a configured linear solver as the ``M^{-1}`` application; see :func:`inner`."""
 
     def __init__(self, solver):
@@ -219,7 +229,7 @@ def _prepare_pairs(pairs, fem):
             prep(fem)
 
 
-class _BlockDiag:
+class _BlockDiag(_Spec):
     def __init__(self, pairs):
         self.pairs = pairs
 
@@ -247,7 +257,7 @@ class _BlockDiag:
         return f"jno.precond.block_diag(<{len(self.pairs)} blocks>)"
 
 
-class _Triangular:
+class _Triangular(_Spec):
     def __init__(self, pairs):
         self.pairs = pairs
 
@@ -320,7 +330,7 @@ def triangular(*pairs) -> _Triangular:
     return _Triangular(list(pairs))
 
 
-class _AMG:
+class _AMG(_Spec):
     """Spec for the hybrid (pyamg-setup / pure-JAX-apply) AMG preconditioner; see :func:`amg`."""
 
     def __init__(self, cycles, max_levels, coarse_size, smoother_degree):
@@ -395,7 +405,7 @@ def amg(*, cycles: int = 1, max_levels: int = 10, coarse_size: int = 100, smooth
 _MISS = object()  # sentinel so the first materialize always builds
 
 
-class _Cached:
+class _Cached(_Spec):
     """Spec that memoises another spec's setup across solves; see :func:`cached`."""
 
     def __init__(self, spec, refresh):
@@ -403,6 +413,9 @@ class _Cached:
         self.refresh = refresh  # False → frozen | True → rebuild on sparsity change | callable ctx→key
         self._applier = None
         self._key = _MISS
+
+    def cached(self, *, refresh: bool = False):
+        return self  # already cached — .cached() is idempotent (no double-wrapping)
 
     def prepare(self, fem):  # forward the eager (out-of-trace) build hook, if the inner spec has one
         prep = getattr(self.spec, "prepare", None)

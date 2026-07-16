@@ -6,6 +6,7 @@ import jax.numpy as jnp
 import pytest
 
 import jno
+from jno.precond import _Spec  # base that grants the fluent .cached() (user specs can inherit it too)
 from jno.utils.solver.solver_api import (
     LinearOperator,
     PrecondApplier,
@@ -30,7 +31,7 @@ def _op(n=6):
     return LinearOperator(jsparse.BCOO.fromdense(dense)), dense
 
 
-class _Counting:
+class _Counting(_Spec):
     """A minimal spec that counts how many times its (notional) setup is built."""
 
     def __init__(self):
@@ -92,6 +93,34 @@ def test_cached_matches_uncached_solve():
     x_cached = solve(op, b, M=materialize_precond(jno.precond.cached(jno.precond.jacobi()), ctx))
     assert jnp.max(jnp.abs(x_cached - x_ref)) < 1e-8
     assert jnp.max(jnp.abs(x_cached - x_bare)) < 1e-10
+
+
+def test_fluent_cached_on_every_spec():
+    """Every jno.precond.* spec has a fluent .cached() equivalent to cached(spec)."""
+    for spec in (jno.precond.jacobi(), jno.precond.amg(), jno.precond.form([]), jno.precond.chebyshev()):
+        wrapped = spec.cached()
+        assert type(wrapped).__name__ == "_Cached" and wrapped.spec is spec
+
+
+def test_fluent_cached_builds_once():
+    inner = _Counting()
+    c = inner.cached()  # fluent form
+    materialize_precond(c, PrecondContext(_op()[0], None))
+    materialize_precond(c, PrecondContext(_op()[0], None))
+    assert inner.n == 1
+
+
+def test_fluent_cached_passes_refresh():
+    inner = _Counting()
+    c = inner.cached(refresh=True)
+    materialize_precond(c, PrecondContext(_op(6)[0], None))
+    materialize_precond(c, PrecondContext(_op(8)[0], None))
+    assert inner.n == 2  # refresh=True rebuilt on the structure change
+
+
+def test_cached_is_idempotent():
+    c = jno.precond.amg().cached()
+    assert c.cached() is c  # .cached() on an already-cached spec is a no-op
 
 
 def test_cached_forwards_prepare_hook():
