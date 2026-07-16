@@ -70,7 +70,7 @@ class TestJitCompatibleIntegrals:
 
     @pytest.fixture(scope="class")
     def dom_2d(self):
-        return jno.domain(constructor=jno.domain.rect(mesh_size=0.04))
+        return jno.Shape.rect(0, 0, 1, 1, size=0.04).domain()
 
     @pytest.fixture(scope="class")
     def dom_1d(self):
@@ -210,7 +210,7 @@ class TestGradientThroughIntegralLoss:
 
     @pytest.fixture(scope="class")
     def dom(self):
-        return jno.domain(constructor=jno.domain.rect(mesh_size=0.04))
+        return jno.Shape.rect(0, 0, 1, 1, size=0.04).domain()
 
     @pytest.fixture(scope="class")
     def setup(self, dom):
@@ -321,7 +321,7 @@ Covers:
 
 
 def _make_2d_rect_domain(mesh_size=0.05):
-    return jno.domain(constructor=jno.domain.rect(mesh_size=mesh_size))
+    return jno.Shape.rect(0, 0, 1, 1, size=mesh_size).domain()
 
 
 def _eval_integral_expr(expr, domain):

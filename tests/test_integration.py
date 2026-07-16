@@ -172,7 +172,7 @@ class TestRegressions:
         import jno.jnp_ops as jnn
         from jno.tuner import ArchSpace
 
-        dom = jno.domain(constructor=jno.domain.rect(mesh_size=0.5))
+        dom = jno.Shape.rect(0, 0, 1, 1, size=0.5).domain()
         x, y, _ = dom.variable("interior")
 
         net = jnn.nn.wrap(foundax.mlp(in_features=2, hidden_dims=8, num_layers=2, key=jax.random.PRNGKey(0)))
@@ -1059,7 +1059,7 @@ class TestBoundaryNormal:
     def _make_2d_domain(self):
         import jno
 
-        return jno.domain(constructor=jno.domain.rect(mesh_size=0.1), compute_mesh_connectivity=True)
+        return jno.Shape.rect(0, 0, 1, 1, size=0.1).domain(compute_mesh_connectivity=True)
 
     def _make_1d_domain(self):
         import jno

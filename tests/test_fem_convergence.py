@@ -239,7 +239,7 @@ def study_poisson_3d():
     g = lambda co: sin(PI * co[0]) * sin(PI * co[1]) * sin(PI * co[2])  # noqa: E731
 
     def solve(ms):
-        d = jno.domain(constructor=jno.domain.cube(mesh_size=ms))
+        d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=ms).domain()
         u, w = d.fem_symbols()
         xi, yi, zi = d.variable("interior", split=True)[:3]
         ui, vi = u.bind(x=xi, y=yi, z=zi), w.bind(x=xi, y=yi, z=zi)

@@ -367,7 +367,7 @@ def test_triply_periodic_3d_cube():
 
     pi = np.pi
     e = 1e-6
-    dom = jno.domain(constructor=jno.domain.cube(mesh_size=0.13))
+    dom = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.13).domain()
     faces = {
         "xlo": lambda x, y, z: x < e,
         "xhi": lambda x, y, z: x > 1 - e,
@@ -430,7 +430,7 @@ def test_triply_periodic_3d_cube_p2():
 
     pi = np.pi
     e = 1e-6
-    dom = jno.domain(constructor=jno.domain.cube(mesh_size=0.28))
+    dom = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.28).domain()
     for nm, p in {
         "xlo": lambda x, y, z: x < e,
         "xhi": lambda x, y, z: x > 1 - e,

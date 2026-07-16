@@ -410,7 +410,7 @@ def _build_l_domain():
     """Build an L-shaped domain with fine mesh and return (dom, x, y, t, pts, interior_mask)."""
     import jno
 
-    dom = jno.domain(constructor=jno.domain.l_shape(size=1.0, mesh_size=0.05))
+    dom = jno.Shape.polygon([(0, 0), (1.0, 0), (1.0, 0.5), (0.5, 0.5), (0.5, 1.0), (0, 1.0)], size=0.05).domain()
     (x, y, t) = dom.variable("interior")
 
     pts = jnp.array(dom.context["interior"][0, 0])  # (N, 2)
@@ -996,10 +996,13 @@ class TestFDOnStackedDomains:
         import jno
 
         # Two different geometries
-        dom = 3 * jno.domain.rect(mesh_size=0.1)
-        dom += 2 * jno.domain.polygon(
-            [(0, 0), (1, 0), (0.5, 1)],
-            mesh_size=0.1,
+        dom = 3 * jno.Shape.rect(0, 0, 1, 1, size=0.1).domain()
+        dom += (
+            2
+            * jno.Shape.polygon(
+                [(0, 0), (1, 0), (0.5, 1)],
+                size=0.1,
+            ).domain()
         )
         x, y, t = dom.variable("interior")
         request.cls.dom = dom

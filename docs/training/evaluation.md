@@ -11,7 +11,7 @@ After training, use `crux.eval()` to evaluate any symbolic expression:
 pred = crux.eval(u)    # shape: (B, T, N, out_dim)
 
 # On a different domain (e.g., fine test grid)
-test_domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.01))
+test_domain = jno.Shape.rect(0, 0, 1, 1, size=0.01).domain()
 pred_fine = crux.eval(u, domain=test_domain)
 
 # Prediction on arbitrary point arrays

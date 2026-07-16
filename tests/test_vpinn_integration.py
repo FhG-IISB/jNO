@@ -18,7 +18,7 @@ from jno.trace import dump_tree
 
 def make_domain(mesh_size=0.35):
     """Create a small rectangular domain for fast VPINN tests."""
-    return jno.domain(constructor=jno.domain.rect(mesh_size=mesh_size))
+    return jno.Shape.rect(0, 0, 1, 1, size=mesh_size).domain()
 
 
 def init_vpinn_fem(dom, with_neumann_tags=True):

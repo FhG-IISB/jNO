@@ -29,9 +29,9 @@ def test_polygon_domain_accepts_constant_z_vertices():
     assert "boundary_z_0" in dom.boundary_tags()
 
 
-def test_domain_poly_factory_returns_polygon_domain_without_changing_mesh_polygon():
+def test_domain_poly_factory_is_lazy_unlike_meshed_shape_polygon():
     dom = jno.domain.poly(SQUARE_A, name="a")
-    mesh_dom = jno.domain.polygon(SQUARE_A, mesh_size=0.5, compute_mesh_connectivity=False)
+    mesh_dom = jno.Shape.polygon(SQUARE_A, size=0.5).domain(compute_mesh_connectivity=False)
 
     assert isinstance(dom, jno.domain.csg)
     assert dom.mesh is None

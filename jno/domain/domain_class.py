@@ -134,70 +134,6 @@ class domain(MeshIOMixin):
         )
 
     @classmethod
-    def rect(
-        cls,
-        x_range=(0, 1),
-        y_range=(0, 1),
-        mesh_size=0.1,
-        *,
-        algorithm: int = 6,
-        time: Optional[Tuple[float, float, int]] = None,
-        compute_mesh_connectivity: bool = True,
-    ) -> "domain":
-        """Instantiate a rectangular domain.
-
-        Args:
-            x_range: Inclusive spatial extent along x.
-            y_range: Inclusive spatial extent along y.
-            mesh_size: Target mesh size passed to pygmsh.
-            algorithm: Gmsh meshing algorithm.
-            time: Optional tuple of ``(start, end, n_steps)`` for time-dependent problems.
-            compute_mesh_connectivity: Whether to precompute mesh connectivity metadata.
-        """
-        return cls._from_geometry(
-            Geometries.rect(x_range=x_range, y_range=y_range, mesh_size=mesh_size),
-            algorithm=algorithm,
-            time=time,
-            compute_mesh_connectivity=compute_mesh_connectivity,
-        )
-
-    @classmethod
-    def polygon(
-        cls,
-        vertices,
-        mesh_size=0.1,
-        *,
-        algorithm: int = 6,
-        time: Optional[Tuple[float, float, int]] = None,
-        compute_mesh_connectivity: bool = True,
-    ) -> "domain":
-        """Instantiate a 2D polygon domain from an arbitrary list of vertices."""
-        return cls._from_geometry(
-            Geometries.polygon(vertices=vertices, mesh_size=mesh_size),
-            algorithm=algorithm,
-            time=time,
-            compute_mesh_connectivity=compute_mesh_connectivity,
-        )
-
-    @classmethod
-    def triangle(
-        cls,
-        vertices=((0, 0), (1, 0), (0, 1)),
-        mesh_size=0.1,
-        *,
-        algorithm: int = 6,
-        time: Optional[Tuple[float, float, int]] = None,
-        compute_mesh_connectivity: bool = True,
-    ) -> "domain":
-        """Instantiate a triangular domain from 3 vertices."""
-        return cls._from_geometry(
-            Geometries.triangle(vertices=vertices, mesh_size=mesh_size),
-            algorithm=algorithm,
-            time=time,
-            compute_mesh_connectivity=compute_mesh_connectivity,
-        )
-
-    @classmethod
     def equi_distant_rect(
         cls,
         x_range=(0, 1),
@@ -240,142 +176,6 @@ class domain(MeshIOMixin):
         return dom
 
     @classmethod
-    def cube(
-        cls,
-        x_range=(0, 1),
-        y_range=(0, 1),
-        z_range=(0, 1),
-        mesh_size=0.1,
-        *,
-        algorithm: int = 6,
-        time: Optional[Tuple[float, float, int]] = None,
-        compute_mesh_connectivity: bool = True,
-    ) -> "domain":
-        """Instantiate a cubic 3D domain."""
-        return cls._from_geometry(
-            Geometries.cube(x_range=x_range, y_range=y_range, z_range=z_range, mesh_size=mesh_size),
-            algorithm=algorithm,
-            time=time,
-            compute_mesh_connectivity=compute_mesh_connectivity,
-        )
-
-    @classmethod
-    def disk(
-        cls,
-        center=(0, 0),
-        radius=1.0,
-        mesh_size=0.1,
-        num_points=32,
-        *,
-        algorithm: int = 6,
-        time: Optional[Tuple[float, float, int]] = None,
-        compute_mesh_connectivity: bool = True,
-    ) -> "domain":
-        """Instantiate a polygonal disk domain."""
-        return cls._from_geometry(
-            Geometries.disk(center=center, radius=radius, mesh_size=mesh_size, num_points=num_points),
-            algorithm=algorithm,
-            time=time,
-            compute_mesh_connectivity=compute_mesh_connectivity,
-        )
-
-    @classmethod
-    def l_shape(
-        cls,
-        size=1.0,
-        mesh_size=0.1,
-        separate_boundary=False,
-        *,
-        algorithm: int = 6,
-        time: Optional[Tuple[float, float, int]] = None,
-        compute_mesh_connectivity: bool = True,
-    ) -> "domain":
-        """Instantiate an L-shaped domain."""
-        return cls._from_geometry(
-            Geometries.l_shape(size=size, mesh_size=mesh_size, separate_boundary=separate_boundary),
-            algorithm=algorithm,
-            time=time,
-            compute_mesh_connectivity=compute_mesh_connectivity,
-        )
-
-    @classmethod
-    def rectangle_with_hole(
-        cls,
-        outer_size=1.0,
-        hole_size=0.4,
-        mesh_size=0.1,
-        separate_boundary=False,
-        *,
-        algorithm: int = 6,
-        time: Optional[Tuple[float, float, int]] = None,
-        compute_mesh_connectivity: bool = True,
-    ) -> "domain":
-        """Instantiate a rectangle with a single rectangular hole."""
-        return cls._from_geometry(
-            Geometries.rectangle_with_hole(
-                outer_size=outer_size,
-                hole_size=hole_size,
-                mesh_size=mesh_size,
-                separate_boundary=separate_boundary,
-            ),
-            algorithm=algorithm,
-            time=time,
-            compute_mesh_connectivity=compute_mesh_connectivity,
-        )
-
-    @classmethod
-    def rect_pml(
-        cls,
-        x_range=(0, 1),
-        y_range=(0, 1),
-        mesh_size=0.1,
-        pml_thickness_top=0.2,
-        pml_thickness_bottom=0.2,
-        *,
-        algorithm: int = 6,
-        time: Optional[Tuple[float, float, int]] = None,
-        compute_mesh_connectivity: bool = True,
-    ) -> "domain":
-        """Instantiate a rectangle with top and bottom PML regions."""
-        return cls._from_geometry(
-            Geometries.rect_pml(
-                x_range=x_range,
-                y_range=y_range,
-                mesh_size=mesh_size,
-                pml_thickness_top=pml_thickness_top,
-                pml_thickness_bottom=pml_thickness_bottom,
-            ),
-            algorithm=algorithm,
-            time=time,
-            compute_mesh_connectivity=compute_mesh_connectivity,
-        )
-
-    @classmethod
-    def rectangle_with_holes(
-        cls,
-        outer_size=(2.0, 1.0),
-        holes=None,
-        mesh_size=0.1,
-        separate_boundary=True,
-        *,
-        algorithm: int = 6,
-        time: Optional[Tuple[float, float, int]] = None,
-        compute_mesh_connectivity: bool = True,
-    ) -> "domain":
-        """Instantiate a rectangle with multiple rectangular holes."""
-        return cls._from_geometry(
-            Geometries.rectangle_with_holes(
-                outer_size=outer_size,
-                holes=holes,
-                mesh_size=mesh_size,
-                separate_boundary=separate_boundary,
-            ),
-            algorithm=algorithm,
-            time=time,
-            compute_mesh_connectivity=compute_mesh_connectivity,
-        )
-
-    @classmethod
     def poly(
         cls,
         vertices,
@@ -386,9 +186,9 @@ class domain(MeshIOMixin):
     ) -> "domain":
         """Instantiate a Shapely-backed polygon CSG domain.
 
-        This factory intentionally leaves :meth:`polygon` unchanged: the
-        historical ``domain.polygon(...)`` constructor remains mesh-backed,
-        while ``domain.poly(...)`` returns the separate lazy CSG domain class.
+        ``domain.poly(...)`` returns the lazy CSG domain class (no mesh until
+        sampled). For a meshed polygon, build one with ``jno.Shape.polygon(...)``
+        and realize it via ``.domain()``.
         """
         from .polygon_domain import PolygonDomain
 

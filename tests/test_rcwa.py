@@ -63,9 +63,7 @@ def _build_periodic_problem(dx=0.4):
     uq, cnt = np.unique(Fs, axis=0, return_counts=True)
     BF = uq[cnt == 1]
 
-    d = _domain_from_arrays(
-        jno.domain.cube(x_range=(0, Lx), y_range=(0, Ly), z_range=(0, Lz), mesh_size=1.0), P, tets, BF, copy=True
-    )
+    d = _domain_from_arrays(jno.Shape.box(0, 0, 0, Lx, Ly, Lz, size=1.0).domain(), P, tets, BF, copy=True)
     d.tag("bottom", lambda x, y, z: z < Eb)
     d.tag("top", lambda x, y, z: z > Lz - Eb)
     d.tag("left", lambda x, y, z: x < Eb)

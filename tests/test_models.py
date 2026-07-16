@@ -198,7 +198,7 @@ class TestJaxKANWrap:
             seed=0,
         )
 
-        domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.5))
+        domain = jno.Shape.rect(0, 0, 1, 1, size=0.5).domain()
         x, y, _ = domain.variable("interior")
 
         net = jnn.nn.wrap(model)

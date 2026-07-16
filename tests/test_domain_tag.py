@@ -196,7 +196,7 @@ def test_variable_where_registers_tag_and_returns_coords_3d():
     """``variable("xlo", where=pred)`` on a 3D box tags the region (predicate lands in
     ``_tag_predicates``) and returns the split coordinate tuple ``(x, y, z, t)`` -- one call for what
     used to be ``tag`` + ``variable``."""
-    d = jno.domain(constructor=jno.domain.cube(mesh_size=0.4))
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.4).domain()
     ret = d.variable("xlo", where=lambda x, y, z: x < 1e-6)
     assert isinstance(ret, tuple) and len(ret) == 4, "3D coordinate tag must return (x, y, z, t)"
     assert "xlo" in d._tag_predicates, "where= must register the tag exactly like tag()"

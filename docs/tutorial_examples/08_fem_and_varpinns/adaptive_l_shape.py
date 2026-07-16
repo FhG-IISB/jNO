@@ -46,7 +46,7 @@ def u_singular(x, y, xp, mod):
 
 
 # ``-lap u = 0`` with the singular mode as Dirichlet data on the whole boundary.
-d = jno.domain(jno.domain.l_shape(size=1.0, mesh_size=0.3))
+d = jno.Shape.polygon([(0, 0), (1.0, 0), (1.0, 0.5), (0.5, 0.5), (0.5, 1.0), (0, 1.0)], size=0.3).domain()
 u, phi = d.fem_symbols()
 xi, yi, _ = d.variable("interior", split=True)
 xb, yb, _ = d.variable("boundary", split=True)

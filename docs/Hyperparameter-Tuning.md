@@ -97,7 +97,7 @@ class MyMLP(eqx.Module):
         return self.out_layer(h)
 
 
-domain = jno.domain(constructor=jno.domain.disk(mesh_size=0.05))
+domain = jno.Shape.disk(0, 0, 1.0, size=0.05).domain()
 x, y = domain.variable("interior")
 
 u = jnn.nn.wrap(MyMLP, space=a_space)(x, y)
@@ -180,7 +180,7 @@ import jax.numpy as jnp
 import equinox as eqx
 
 dire = jno.setup(__file__)
-domain = jno.domain(constructor=jno.domain.disk(mesh_size=0.05))
+domain = jno.Shape.disk(0, 0, 1.0, size=0.05).domain()
 x, y = domain.variable("interior")
 
 # Architecture search space

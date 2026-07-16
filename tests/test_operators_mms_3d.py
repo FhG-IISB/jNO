@@ -41,8 +41,7 @@ from jno.differential_operators import DifferentialOperators
 
 
 def _build_cube(mesh_size: float = 0.10):
-    return jno.domain(
-        constructor=jno.domain.cube(mesh_size=mesh_size),
+    return jno.Shape.box(0, 0, 0, 1, 1, 1, size=mesh_size).domain(
         compute_mesh_connectivity=True,
     )
 

@@ -85,8 +85,7 @@ def _build_chamber_with_obstacle(mesh_size: float = 0.06):
 
 def _build_cube_3d(mesh_size: float = 0.10):
     """3-D unit cube via the existing Geometries.cube path (tetrahedral)."""
-    return jno.domain(
-        constructor=jno.domain.cube(mesh_size=mesh_size),
+    return jno.Shape.box(0, 0, 0, 1, 1, 1, size=mesh_size).domain(
         compute_mesh_connectivity=True,
     )
 

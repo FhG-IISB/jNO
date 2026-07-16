@@ -282,8 +282,7 @@ class TestPeriodicMeshGuard:
         the shared corners (a slave in two directions) are recovered. Auto-generated face tags (no
         predicate) cannot resolve the corners, so jno.fem rejects them loudly rather than silently
         under-identifying the corners and mis-solving."""
-        dom = jno.domain(
-            constructor=jno.domain.rect(mesh_size=0.3),  # auto-generated left/right/... tags (no predicate)
+        dom = jno.Shape.rect(0, 0, 1, 1, size=0.3).domain(  # auto-generated left/right/... tags (no predicate)
             time=(0.0, T_END, N_TIME),
             compute_mesh_connectivity=False,
         )
