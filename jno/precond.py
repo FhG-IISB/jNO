@@ -29,9 +29,10 @@ import jax.numpy as jnp
 from .utils.solver.solver_api import (  # noqa: F401  (PrecondContext re-exported for user specs)
     PrecondApplier,
     PrecondContext,
+    materialize_precond,
 )
 
-__all__ = ["PrecondContext", "jacobi", "chebyshev", "form", "inner", "block_diag", "triangular", "amg"]
+__all__ = ["PrecondContext", "jacobi", "chebyshev", "form", "inner", "block_diag", "triangular", "amg", "cached"]
 
 
 class _Jacobi:
@@ -389,6 +390,66 @@ def amg(*, cycles: int = 1, max_levels: int = 10, coarse_size: int = 100, smooth
     spec for very large ones.
     """
     return _AMG(cycles, max_levels, coarse_size, smoother_degree)
+
+
+_MISS = object()  # sentinel so the first materialize always builds
+
+
+class _Cached:
+    """Spec that memoises another spec's setup across solves; see :func:`cached`."""
+
+    def __init__(self, spec, refresh):
+        self.spec = spec
+        self.refresh = refresh  # False → frozen | True → rebuild on sparsity change | callable ctx→key
+        self._applier = None
+        self._key = _MISS
+
+    def prepare(self, fem):  # forward the eager (out-of-trace) build hook, if the inner spec has one
+        prep = getattr(self.spec, "prepare", None)
+        if callable(prep):
+            prep(fem)
+
+    def _key_of(self, ctx):
+        if self.refresh is False:
+            return "frozen"
+        if callable(self.refresh):
+            return self.refresh(ctx)
+        A = ctx.A  # refresh=True → key on the operator's shape + sparsity size
+        return (A.shape, int(A.bcoo.nse)) if A.bcoo is not None else (A.shape,)
+
+    def materialize(self, ctx: PrecondContext):
+        key = self._key_of(ctx)
+        if self._applier is None or key != self._key:
+            self._applier = materialize_precond(self.spec, ctx)  # build the wrapped preconditioner once
+            self._key = key
+        return self._applier  # same applier object (and its .T) reused on later solves
+
+    def __repr__(self):
+        return f"jno.precond.cached({self.spec!r}, refresh={self.refresh}, built={self._applier is not None})"
+
+
+def cached(spec, *, refresh: bool = False):
+    """Memoise any preconditioner's setup so it is built **once** and reused across solves — the
+    plug-and-play way to amortise an expensive setup (a multigrid hierarchy, an assembled auxiliary
+    operator, a jaxamg/AmgX coloring) over a frequency sweep, a Newton loop, or an inverse-problem
+    optimisation, *regardless of which backend does the work*.
+
+    Wraps any spec (``jacobi``, ``amg``, ``form``, a jaxamg-backed preconditioner, or a user
+    ``ctx -> M⁻¹`` callable). ``refresh=False`` (default) freezes the setup from the first solve and
+    reuses it forever — the standard frozen-preconditioner trade (a preconditioner only changes
+    convergence *speed*, never the solution, so reusing a slightly-stale setup is always correct and
+    usually cheap). ``refresh=True`` rebuilds when the operator's shape/sparsity changes (values may
+    still drift under the frozen setup); pass a callable ``ctx -> hashable`` for a custom invalidation
+    key. The wrapped spec's eager ``prepare(fem)`` hook (if any) is forwarded, so it composes with the
+    ``jit``/``vmap``/parametric-inverse build-eagerly requirement unchanged.
+
+    Reuse the SAME ``cached(...)`` object across the solves you want to share the setup::
+
+        M = jno.precond.cached(jno.precond.amg())          # backend-agnostic — pyamg or jaxamg alike
+        for f in freqs:
+            u = build_fem(f).solve(linear=jno.solve.fgmres(), precond=M)   # hierarchy built once
+    """
+    return _Cached(spec, refresh)
 
 
 def chebyshev(
