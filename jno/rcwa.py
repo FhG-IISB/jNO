@@ -579,9 +579,12 @@ class Rcwa:
         """Eigensolve every layer (isotropic / anisotropic-ε / general ε&μ, by tuple length) and return the
         ``LayerSolveResult`` list plus the thickness list. Shared by the plane-wave and internal-source paths."""
         fm, lv, ex = self.fm, self._lv, self._ex
+        kin = jnp.asarray(kin)
+        wl = jnp.asarray(wl).astype(kin.dtype)  # wl at the incidence real precision
+        cdt = jnp.result_type(kin.dtype, jnp.complex64)  # one complex dtype for the eigensolve (robust to a
 
-        def _grid(g):
-            g = jnp.asarray(g) + 0j  # jax-native so a permittivity grid flows -> differentiable in ε
+        def _grid(g):  # float32 design parameter, e.g. when trained through jno.core, vs float64 wavevectors)
+            g = jnp.asarray(g).astype(cdt)  # jax-native so a permittivity grid flows -> differentiable in ε
             return jnp.full((1, 1), g) if g.ndim == 0 else g
 
         def solve_layer(e):
