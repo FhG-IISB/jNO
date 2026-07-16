@@ -322,6 +322,24 @@ def test_printed_is_differentiable_ilt():
     assert abs(g) > 1e-3
 
 
+@needs_fmmax
+def test_vector_printed_is_differentiable_ilt():
+    """**Vector high-NA** imaging is differentiable inside the parametric ILT node: jax.grad of an
+    unpolarized (TE+TM) printed-resist functional w.r.t. the mask permittivity matches finite difference —
+    so vector high-NA ILT/SMO trains, not just the scalar model. Guards the vector-pupil sqrt(0) safe-guard
+    (the gradient is NaN without it) and, at a converged truncation, the (hypersensitive) y-polarization path."""
+    cons, ep = _ilt_cons()
+    rc = jno.rcwa(cons, orders=60, grid=56, params={"ep": 2.0})
+    lo, hi, span = _aerial_band(rc.solve(params={"ep": 2.0}), NA=0.6, source=0.5, polarization="unpolarized")
+    resist = jno.litho.Threshold(threshold=0.5 * (lo + hi), diffusion=0.1, steepness=6.0 / span)
+    node = rc.solve().printed(NA=0.6, source=0.5, polarization="unpolarized", resist=resist)
+    assert isinstance(node, FunctionCall)
+    g, fd = _grad_vs_fd(node, ep)
+    assert np.isfinite(g)  # sqrt(0) in the vector pupil makes this NaN without the safe-sqrt guard
+    assert g == pytest.approx(fd, rel=1e-2)
+    assert abs(g) > 1e-3
+
+
 def test_caresist_validation():
     """CAResist rejects a bad tone or a wrong-length rate-constant tuple (cheap — no solve)."""
     with pytest.raises(ValueError):

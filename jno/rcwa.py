@@ -365,8 +365,13 @@ class _Sol:
             ax, ay = AX + s[0], AY + s[1]
             r2 = ax**2 + ay**2
             passes = r2 <= NA**2
-            rho = jnp.sqrt(jnp.clip(r2, 0.0, 1.0))  # sinθ (transverse direction-cosine magnitude)
-            cth = jnp.sqrt(jnp.clip(1.0 - r2, 0.0, 1.0))  # cosθ
+            # sinθ / cosθ via a double-`where` safe sqrt: √ is only ever evaluated at a strictly-positive
+            # argument, so its reverse-mode `1/(2√·)` never hits the 0th-order (r2=0) or grazing (r2=1)
+            # singularity. rho/cth are constant in the design, but an unguarded √0 grad still poisons the sum.
+            s2 = jnp.clip(r2, 0.0, 1.0)
+            rho = jnp.where(s2 > 0.0, jnp.sqrt(jnp.where(s2 > 0.0, s2, 1.0)), 0.0)  # sinθ
+            c2 = jnp.clip(1.0 - r2, 0.0, 1.0)
+            cth = jnp.where(c2 > 0.0, jnp.sqrt(jnp.where(c2 > 0.0, c2, 1.0)), 0.0)  # cosθ
             safe = rho > 1e-9
             cf = jnp.where(safe, ax / jnp.where(safe, rho, 1.0), 1.0)  # cosφ (azimuth)
             sf = jnp.where(safe, ay / jnp.where(safe, rho, 1.0), 0.0)  # sinφ
