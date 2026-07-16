@@ -1691,3 +1691,50 @@ def n1e_field_at_centroids(points: np.ndarray, cells: np.ndarray, top: EdgeTopol
         return jnp.einsum("a,ad->d", c, phi[0])  # (2,)
 
     return jax.vmap(_val)(cells_j, signs, coeffs)
+
+
+def n1e_field_at_tet_centroids(
+    points: np.ndarray, cells: np.ndarray, top: EdgeTopology, u_edge: jnp.ndarray, *, curl: bool = False
+):
+    """Evaluate the 3-D Nédélec (H(curl)) field ``u_h`` (and optionally its curl) at each tet centroid.
+
+    The tetrahedral counterpart of :func:`n1e_field_at_centroids`. Tabulates the 6-DOF N1E tet basis at
+    the reference centroid, covariant-Piola-maps value and (physical) gradient per cell with the same
+    edge-orientation signs used in assembly, and contracts with the cell's six edge-DOF coefficients
+    ``u_edge[cell_edges]``. With ``curl=True`` the vector curl is recovered from the antisymmetric parts
+    of the physical gradient (the invariant :func:`piola_covariant_grad` provides) — this is how one reads
+    ``B = curl A`` off a magnetic-vector-potential solve.
+
+    Returns ``values`` ``(n_cells, 3)``, or ``(values, curls)`` (each ``(n_cells, 3)``) when ``curl=True``.
+    Complex ``u_edge`` gives complex outputs (the map is linear).
+    """
+    import basix
+
+    from .fem_elements import piola_covariant, piola_covariant_grad
+
+    elem = basix.create_element(basix.ElementFamily.N1E, basix.CellType.tetrahedron, 1)
+    tab = elem.tabulate(1, np.array([[0.25, 0.25, 0.25]]))  # (4, 1, 6, 3): [values, d/dξ0, d/dξ1, d/dξ2]
+    rv = jnp.asarray(tab[0])  # (1, 6, 3)
+    rg = jnp.asarray(np.stack([tab[1], tab[2], tab[3]], axis=-1))  # (1, 6, 3, 3): ref grad d(Phi)_i/dξ_m
+    pts = jnp.asarray(points)
+    cells_j = jnp.asarray(np.asarray(cells), dtype=jnp.int32)
+    signs = jnp.asarray(top.cell_edge_signs.astype(np.float64))
+    ce = jnp.asarray(top.cell_edges, dtype=jnp.int32)
+    coeffs = u_edge[ce]  # (n_cells, 6)
+
+    def _tet_jac(verts):
+        J = jnp.stack([verts[1] - verts[0], verts[2] - verts[0], verts[3] - verts[0]], axis=1)  # (3, 3)
+        return J, jnp.linalg.det(J)
+
+    def _val(cell, sgn, c):
+        J, detJ = _tet_jac(pts[cell])
+        phi, _ = piola_covariant(rv, None, J, detJ, sgn)  # (1, 6, 3)
+        val = jnp.einsum("a,ad->d", c, phi[0])  # (3,)
+        if not curl:
+            return val
+        grad = piola_covariant_grad(rg, J, detJ, sgn)  # (1, 6, 3, 3): d(Phi)_i/dx_l
+        g = jnp.einsum("a,ail->il", c, grad[0])  # (3, 3) physical gradient of u_h
+        crl = jnp.stack([g[2, 1] - g[1, 2], g[0, 2] - g[2, 0], g[1, 0] - g[0, 1]])  # curl = antisymmetric parts
+        return val, crl
+
+    return jax.vmap(_val)(cells_j, signs, coeffs)
