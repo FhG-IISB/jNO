@@ -142,10 +142,12 @@ PINN. A multi-material shape is a top-level construct — call `.domain()` on it
 compose with boolean operators or transforms.
 
 **Interfaces** between materials are auto-named by the region pair, sorted — `d.variable("inclusion|matrix")`
-gives the facets where those two materials meet (impose a coupling/flux condition there, or sample it).
-They are listed by `d.interface_tags()`, kept **out** of `d.boundary_tags()` (an interface is not the
-outer boundary). Two distinct interfaces between the *same* pair stay separable as `"inclusion|matrix.0"`
-and `"inclusion|matrix.1"`.
+gives *every* facet where those two materials meet (however many flat faces that spans — an E-core's
+`air|core` boundary is one tag, not one per face). Impose a coupling/flux condition there, or sample it.
+Interfaces are listed by `d.interface_tags()` and kept **out** of `d.boundary_tags()` (an interface is not
+the outer boundary). When an interface is *topologically disjoint* — two separate inclusions, or the two
+stacked layers of a winding — the connected pieces are additionally exposed as `"a|b.0"`, `"a|b.1"`, …
+alongside the union `"a|b"`.
 
 ---
 

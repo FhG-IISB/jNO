@@ -135,14 +135,24 @@ def test_interface_is_auto_named_by_region_pair():
 
 
 def test_two_interfaces_between_same_materials_stay_separable():
-    """Two disjoint same-material inclusions give two interfaces of the same pair; they are kept
-    apart as ``a|b.0`` / ``a|b.1`` rather than collapsed into one ambiguous tag."""
+    """Two disjoint same-material inclusions give two topologically separate interfaces of the same
+    pair: the union ``a|b`` plus the connected components ``a|b.0`` / ``a|b.1`` (kept separable)."""
     incl = jno.Shape.disk(0.5, 0.5, 0.2) | jno.Shape.disk(1.5, 0.5, 0.2)
     d = (incl.name("inclusion") + jno.Shape.rect(0, 0, 2, 1).name("matrix")).sized(0.05).domain()
-    ifaces = sorted(k for k in d.avaiable_mesh_tags if k.startswith("inclusion|matrix"))
-    assert ifaces == ["inclusion|matrix.0", "inclusion|matrix.1"]
-    for k in ifaces:
+    ifaces = sorted(k for k in d.interface_tags() if k.startswith("inclusion|matrix"))
+    assert ifaces == ["inclusion|matrix", "inclusion|matrix.0", "inclusion|matrix.1"]
+    for k in ("inclusion|matrix.0", "inclusion|matrix.1"):
         assert d._mesh_pool[k].shape[0] > 0
+
+
+def test_interface_multiface_boundary_is_one_tag():
+    """A box inclusion has SIX faces but ONE connected interface with the surrounding material —
+    grouping is by topology, so it is a single ``inner|outer`` tag, not six per-face tags."""
+    inner = jno.Shape.box(0.3, 0.3, 0.3, 0.7, 0.7, 0.7)
+    outer = jno.Shape.box(0, 0, 0, 1, 1, 1)
+    d = jno.Shape.regions(inner=inner, outer=outer).sized(0.13).domain()
+    assert [k for k in d.interface_tags() if k.startswith("inner|outer")] == ["inner|outer"]
+    assert d._mesh_pool["inner|outer"].shape[0] > 0
 
 
 def test_interface_3d_box_sphere():

@@ -190,15 +190,48 @@ def _apply_size_fields(dim: int, leaves, labels: Dict[int, Tuple[int, str]], sha
     return float(min(scalars)) if scalars else None
 
 
+def _facet_components(facet_idx, facet_nodes):
+    """Group facets into connected components (share a node -> same component), returning a list of
+    global-index arrays. A material interface spans many gmsh faces but is usually ONE connected
+    patch; only genuinely disjoint patches (e.g. two separate inclusions) split into several."""
+    from collections import defaultdict
+
+    import numpy as np
+
+    n = len(facet_idx)
+    parent = list(range(n))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    node_first: Dict[int, int] = {}
+    for fi in range(n):
+        for node in facet_nodes[fi]:
+            node = int(node)
+            if node in node_first:
+                ri, rj = find(fi), find(node_first[node])
+                if ri != rj:
+                    parent[ri] = rj
+            else:
+                node_first[node] = fi
+    groups = defaultdict(list)
+    for fi in range(n):
+        groups[find(fi)].append(fi)
+    return [np.asarray(facet_idx)[g] for g in groups.values()]
+
+
 def _to_meshio(dim: int, labels: Dict[int, Tuple[int, str]], region_items=None):
     """Assemble the generated gmsh mesh into a ``meshio.Mesh`` with named ``cell_sets``.
 
     ``region_items`` (``((name, sub_shape), ...)``, when the plan is a :meth:`Shape.regions`
     multi-material domain) adds one volume ``cell_set`` per region — each cell assigned to the first
     region whose shape contains its centroid — plus one facet ``cell_set`` per material **interface**,
-    auto-named by the region pair it separates (``"a|b"``). Two *distinct* interfaces between the same
-    pair stay separable — emitted as ``"a|b.0"`` / ``"a|b.1"`` (each a single closed loop) instead of
-    one ambiguous ``"a|b"`` tag.
+    auto-named by the region pair it separates (``"a|b"`` = every facet between those two materials,
+    however many gmsh faces that spans). Only *topologically disjoint* interfaces of the same pair
+    (e.g. two separate inclusions) additionally split into connected components ``"a|b.0"`` / ``"a|b.1"``.
     """
     import gmsh
     import meshio
@@ -280,11 +313,12 @@ def _to_meshio(dim: int, labels: Dict[int, Tuple[int, str]], region_items=None):
     cell_sets["boundary"] = [empty.copy(), ext]
 
     for pair, ent_list in iface_entities.items():
-        if len(ent_list) == 1:
-            cell_sets[pair] = [empty.copy(), ent_list[0]]
-        else:  # several disjoint interfaces between the SAME materials -> keep each separable
-            for k, rng in enumerate(ent_list):
-                cell_sets[f"{pair}.{k}"] = [empty.copy(), rng]
+        all_idx = np.concatenate(ent_list)  # every facet between this pair (across all its faces)
+        cell_sets[pair] = [empty.copy(), all_idx]
+        comps = _facet_components(all_idx, facets[all_idx])  # group by TOPOLOGY, not gmsh face
+        if len(comps) > 1:  # genuinely disjoint interfaces of the SAME pair -> keep each separable
+            for k, comp in enumerate(comps):
+                cell_sets[f"{pair}.{k}"] = [empty.copy(), comp]
 
     if region_items and len(vcells):
         centroids = coords[vcells].mean(axis=1)  # (M, 3) cell centroids
