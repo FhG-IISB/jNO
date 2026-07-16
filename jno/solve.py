@@ -45,6 +45,7 @@ __all__ = [
     "fgmres",
     "minres",
     "chebyshev",
+    "amg",
     "newton",
     "picard",
 ]
@@ -204,6 +205,69 @@ def chebyshev(
         return _firewalled(raw, op, b, M=M, x0=x0, symmetric=True, name="chebyshev")
 
     return LinearSolver(_fn, name="chebyshev")
+
+
+def _require_jaxamg():
+    try:
+        import jaxamg
+    except ImportError as e:  # optional GPU dependency — see the message for the system requirements
+        raise ImportError(
+            "jno.solve.amg() needs the optional dependency `jaxamg` (NVIDIA AmgX wrapped as a JAX "
+            "primitive). It requires a prebuilt AmgX 2.5+, CUDA Toolkit 12+, JAX-with-CUDA, and an MPI "
+            "stack (mpi4py / mpi4jax). Install those into your environment, then retry."
+        ) from e
+    return jaxamg
+
+
+def amg(
+    *, tol: float = 1e-6, maxiter: int = 500, krylov: Optional[str] = "PBICGSTAB", config: Optional[dict] = None
+) -> LinearSolver:
+    """GPU algebraic-multigrid solve via **jaxamg** (NVIDIA AmgX wrapped as a JAX primitive).
+
+    A self-contained solver: it runs an AMG-preconditioned Krylov iteration (or pure AMG) entirely on
+    the GPU/device — the on-device counterpart to the host-side pyamg used by ``jno.precond.amg``.
+    Ideal for large H¹-elliptic systems (Poisson, diffusion, elasticity) and, via
+    ``jno.precond.inner(jno.solve.amg(...))``, as the smoother inside an outer flexible-Krylov solve
+    (e.g. the auxiliary nodal solves of a future H(curl) AMS preconditioner). Plain AMG will **not**
+    converge on a raw curl-curl (H(curl)) system — that needs AMS on top.
+
+    ``config`` (a full AmgX-format dict) overrides the convenience args entirely; otherwise a config is
+    built from ``tol``/``maxiter``/``krylov`` (``krylov=None`` → pure AMG, else an AMG-preconditioned
+    ``krylov`` Krylov, e.g. ``"PBICGSTAB"``/``"GMRES"``/``"PCG"``). Needs an **assembled** operator
+    (hands the sparse matrix to jaxamg); errors on a matrix-free operator. Direct-style: takes no outer
+    ``precond=`` (it owns its AMG preconditioner) and ignores ``x0``.
+
+    Optional dependency — jaxamg is imported lazily; see :func:`_require_jaxamg` for the requirements.
+
+    Reference: Liu, Fan & Wang, *JAX-AMG: A GPU-Accelerated Differentiable Sparse Linear Solver Library
+    for JAX*, arXiv:2606.09001 (2026); wraps NVIDIA AmgX (Naumov et al., 2015).
+    """
+
+    def _fn(op: LinearOperator, b, *, M, x0):
+        A = op.bcoo
+        if A is None:
+            raise ValueError(
+                "jno.solve.amg() needs an assembled (sparse) operator — it cannot solve a matrix-free "
+                "operator. Use a Krylov solver (cg/bicgstab/fgmres) for matrix-free systems."
+            )
+        jaxamg = _require_jaxamg()
+        if config is not None:
+            cfg = dict(config)
+        elif krylov:
+            cfg = {
+                "solver": krylov,
+                "preconditioner": {"solver": "AMG"},
+                "tolerance": float(tol),
+                "max_iters": int(maxiter),
+            }
+        else:
+            cfg = {"solver": "AMG", "tolerance": float(tol), "max_iters": int(maxiter)}
+        x, _info = jaxamg.solve(A, b, config=cfg)
+        return jnp.asarray(x).reshape(-1)
+
+    # AmgX owns the solve; treat as direct (no outer preconditioner). vmap left "no" (AmgX/MPI primitive
+    # is not a pure-JAX batching op) — loop for batched solves.
+    return LinearSolver(_fn, name="amg", direct=True, traits={"vmap": "no"})
 
 
 def _root_driver(
