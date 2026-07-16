@@ -497,11 +497,21 @@ def ams(*, aux=None) -> _AMS:
 
     ``G`` and ``Π`` come from the N1E edge topology (:mod:`jno.utils.solver.ams`); the auxiliary
     operators are assembled once on the host from the concrete matrix and solved with ``aux`` —
-    **any** ``jno.solve`` solver (default :func:`jno.solve.lu`). Passing a multigrid inner solver
-    makes the whole preconditioner scalable (the auxiliary problems are ordinary nodal Poisson-like
-    systems). The same spec handles the **real** curl-curl+mass and the **complex** eddy operator
-    ``νK + jωσM`` — dtype follows the assembled matrix; pair it with :func:`jno.solve.gmres`
-    (complex-correct) for the eddy case.
+    **any** ``jno.solve`` solver (default :func:`jno.solve.lu`). Because the auxiliary problems are
+    ordinary **nodal Poisson-like** systems, an algebraic-multigrid ``aux`` makes the whole
+    preconditioner scalable at ``O(n)``. A GPU realisation is NVIDIA AmgX via ``jaxamg``: build each
+    auxiliary hierarchy **once per operator** (``jaxamg.with_cache(A, is_symmetric=True)``) and reuse
+    it across outer iterations — the AMS applier calls ``aux`` with the same operator each iteration,
+    so caching on the operator gives factor-once setup with a pure-JAX apply.
+
+    **Outer solver.** An *exact* ``aux`` (``lu``) is a fixed linear map, so it pairs with ``cg``; an
+    *inexact/iterative* ``aux`` (multigrid, an inexact ``cg``) is a **variable** preconditioner and
+    needs a **flexible** outer solver — :func:`jno.solve.fgmres` (real) — or ``cg`` stalls.
+
+    The same spec handles the **real** curl-curl+mass and the **complex** eddy operator ``νK + jωσM``
+    — dtype follows the assembled matrix; pair it with :func:`jno.solve.gmres` (complex-correct) for
+    the eddy case. (An AmgX ``aux`` is real-only, so a complex auxiliary needs a real reformulation —
+    factor ``jω`` out of the gradient block; a real proxy for the Π block.)
 
     Requirements & scope:
 

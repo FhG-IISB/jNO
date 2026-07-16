@@ -106,6 +106,18 @@ def test_ams_custom_aux_solver():
     assert np.linalg.norm(x - x_lu) / np.linalg.norm(x_lu) < 1e-6
 
 
+def test_ams_inexact_aux_pairs_with_flexible_outer():
+    """M5 mechanism: an *inexact/iterative* auxiliary solver (here a loose CG — a stand-in for a
+    multigrid ``aux`` such as jaxamg/AmgX) is a **variable** preconditioner, so it must be driven by a
+    **flexible** outer solver (fgmres). This is the exact path the scalable GPU AMG aux runs through;
+    the real jaxamg aux is verified separately (it needs a GPU + the AmgX stack)."""
+    fem = _curlcurl_source(0.3, beta=1e-4)
+    x_lu = _solve(fem, linear=jno.solve.lu())
+    inexact_aux = jno.solve.cg(tol=1e-3, maxiter=80)  # solved loosely → M varies iteration to iteration
+    x = _solve(fem, linear=jno.solve.fgmres(tol=1e-7, restart=80, maxiter=400), precond=jno.precond.ams(aux=inexact_aux))
+    assert np.linalg.norm(x - x_lu) / np.linalg.norm(x_lu) < 1e-5
+
+
 def test_ams_requires_a_gauge_on_pure_curl_curl():
     """A bare curl-curl has GᵀAG ≡ 0 (curl∘grad = 0) — no coercivity on the gradient space. The spec
     must refuse with actionable guidance rather than silently forming a singular auxiliary solve."""
