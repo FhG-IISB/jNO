@@ -128,6 +128,34 @@ def test_ams_requires_a_gauge_on_pure_curl_curl():
         _solve(fem, linear=jno.solve.cg(maxiter=50), precond=jno.precond.ams())
 
 
+def test_ams_build_makes_the_solve_differentiable():
+    """The eager ``.build(fem)`` hook runs the host aux-assembly ONCE outside the trace and freezes it,
+    so an AMS-preconditioned solve runs — and **differentiates** — under a trace. The gradient flows by
+    implicit differentiation through the traced operator (the frozen preconditioner only accelerates);
+    it matches finite differences and the analytic ``d/ds ‖(sA)⁻¹b‖² = -2‖A⁻¹b‖²`` at ``s=1``."""
+    import jax.experimental.sparse as jsp
+
+    from jno.utils.solver.solver_api import LinearOperator, PrecondContext, materialize_precond
+
+    fem = _curlcurl_source(0.3, beta=1e-4)
+    A0 = fem.operator[0]
+    A0b = A0 if hasattr(A0, "indices") else jsp.BCOO.fromdense(jnp.asarray(A0))
+    b = jnp.asarray(fem.operator[1]).reshape(-1)
+    spec = jno.precond.ams().build(fem)  # eager host setup → frozen auxiliaries
+
+    def loss(s):  # the operator s·A is traced in s → materialize must not host-assemble
+        op = LinearOperator(jsp.BCOO((A0b.data * s, A0b.indices), shape=A0b.shape))
+        M = materialize_precond(spec, PrecondContext(op, fem))
+        return jnp.sum(jno.solve.fgmres(tol=1e-10, restart=100, maxiter=600)(op, b, M=M) ** 2)
+
+    with _ON_CPU:
+        val = float(loss(1.0))
+        g = float(jax.grad(loss)(1.0))
+        fd = float((loss(1.0 + 1e-5) - loss(1.0 - 1e-5)) / 2e-5)
+    assert abs(g - fd) / abs(fd) < 1e-3  # matches finite differences
+    assert abs(g - (-2.0 * val)) / abs(2.0 * val) < 1e-3  # and the analytic -2‖A⁻¹b‖²
+
+
 def test_ams_needs_the_owning_fem():
     """Materialised on a bare operator (no ctx.fem → no edge topology) it errors clearly, since G/Π
     are mesh objects, not recoverable from the matrix alone."""

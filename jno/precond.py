@@ -391,6 +391,24 @@ def amg(*, cycles: int = 1, max_levels: int = 10, coarse_size: int = 100, smooth
     return _AMG(cycles, max_levels, coarse_size, smoother_degree)
 
 
+def _fem_concrete_operator(fem):
+    """Concrete assembled operator of a linear/complex ``fem`` (real: the BCOO/dense matrix; complex:
+    ``A_r + i·A_i``), evaluated at the current parameters — for eager preconditioner setup (``.build``)."""
+
+    def _leg(o):  # a raw (A, b) or a parametric FemLinearSystem → its concrete matrix A
+        A, _ = o.evaluate(None) if hasattr(o, "evaluate") else o
+        return A
+
+    op = fem.operator
+    if getattr(fem, "_mode", None) == "complex":
+        from ._fem import _complex_operator
+
+        return _complex_operator(_leg(op[0]), _leg(op[1]))
+    if hasattr(op, "evaluate"):  # a bare parametric FemLinearSystem
+        return _leg(op)
+    return _leg(op[0]) if hasattr(op[0], "evaluate") else op[0]  # (A, b) or (FemLinearSystem, …)
+
+
 class _AMS:
     """Spec for the H(curl) auxiliary-space Maxwell (AMS) preconditioner; see :func:`ams`."""
 
@@ -400,10 +418,25 @@ class _AMS:
         self.aux = aux  # jno.solve LinearSolver for the nodal auxiliary solves (None -> lu())
         self._G = None  # discrete gradient (node->edge), built once from the mesh topology
         self._Pis = None  # (Π_x, Π_y, Π_z) nodal->edge vector interpolation
+        self._frozen = None  # host-assembled auxiliary operators, set by .build() for traced solves
 
     def prepare(self, fem):
         """Eager one-time build of the mesh-only transfer operators G, Π (parameter-independent)."""
         self._transfer(fem.domain)
+
+    def build(self, fem) -> "_AMS":
+        """Eager host setup from a **concrete** ``fem`` — required to use AMS inside a **traced** solve
+        (``jit`` / ``vmap`` / a **parametric-inverse** design loop), where the host scipy assembly of the
+        nodal auxiliaries cannot run under the trace. It freezes the auxiliary operators once (from the
+        operator at the current parameters); the frozen preconditioner stays valid while ``A(θ)`` drifts
+        (speed degrades gracefully, correctness never), so the solve — **and its gradient**, which flows
+        through the traced operator by implicit differentiation, not through the preconditioner — runs
+        differentiably. Returns ``self`` (chainable): ``fem.solve(precond=jno.precond.ams().build(fem))``."""
+        self._transfer(fem.domain)
+        from .utils.solver.solver_api import LinearOperator, PrecondContext
+
+        self._frozen = self._assemble_aux(PrecondContext(LinearOperator(_fem_concrete_operator(fem)), fem))
+        return self
 
     def _transfer(self, domain):
         from .utils.solver.ams import discrete_gradient, nodal_vector_interpolation
@@ -412,12 +445,14 @@ class _AMS:
         self._G = discrete_gradient(topo)
         self._Pis = nodal_vector_interpolation(topo)
 
-    def materialize(self, ctx: PrecondContext):
+    def _assemble_aux(self, ctx: PrecondContext) -> dict:
+        """Host (scipy) assembly of the nodal auxiliary operators from a **concrete** matrix — the part
+        that cannot run under a trace. Returns frozen jno ``LinearOperator``s; :meth:`materialize` builds
+        the (pure-JAX, differentiable) applier from these plus the smoother diagonal."""
         import numpy as np
         import scipy.sparse as sp
         from jax.experimental import sparse as jsp
 
-        from . import solve as _solve
         from .utils.solver.solver_api import LinearOperator
 
         if self._G is None:
@@ -427,15 +462,15 @@ class _AMS:
                     "use it via fem.solve(precond=jno.precond.ams()), not on a bare operator."
                 )
             self._transfer(ctx.fem.domain)
-        aux = self.aux if self.aux is not None else _solve.lu()
 
         A = ctx.A.bcoo if ctx.A.bcoo is not None else ctx.A.dense()
         try:
             A_sp = sp.csr_matrix(np.asarray(A.todense() if hasattr(A, "todense") else A))
         except Exception as e:  # a traced operator (parametric/complex-inverse) can't be host-assembled
             raise RuntimeError(
-                "jno.precond.ams assembles the nodal auxiliary operators on the host from a concrete "
-                "matrix; it does not run under a trace (jit/vmap/parametric-inverse solve)."
+                "jno.precond.ams assembles the nodal auxiliaries on the host from a concrete matrix, so it "
+                "cannot run under a trace (jit/vmap/parametric-inverse). Build it once eagerly first — "
+                "jno.precond.ams().build(fem) — and the frozen preconditioner then differentiates through."
             ) from e
         G_sp = sp.csr_matrix(np.asarray(self._G.todense()))
         Pi_sp = [sp.csr_matrix(np.asarray(P.todense())) for P in self._Pis]
@@ -461,15 +496,36 @@ class _AMS:
             idx = jnp.asarray(np.stack([coo.row, coo.col], axis=1))
             return LinearOperator(jsp.BCOO((jnp.asarray(coo.data), idx), shape=coo.shape))
 
-        G, Pis = self._G, self._Pis
-        GT, PisT = G.T, [P.T for P in Pis]
-        dinv = 1.0 / ctx.diag()  # Jacobi smoother (complex diagonal on a complex operator)
-
         # G's constant null-space (G·1 = 0) is exact; each Π_α's constant mode is redundant with it
         # (Π_α·1 = G·coordₐ is a gradient), so pinning node 0 in every auxiliary operator is correct.
         if not np.iscomplexobj(A_sp.data):
-            g_op = to_op(pin0(A_G))
-            p_ops = [to_op(pin0((P.T @ A_sp @ P).tocsr())) for P in Pi_sp]
+            return {
+                "complex": False,
+                "g_op": to_op(pin0(A_G)),
+                "p_ops": [to_op(pin0((P.T @ A_sp @ P).tocsr())) for P in Pi_sp],
+            }
+        # Complex eddy operator (νK + jωσM): AmgX-style multigrid aux solvers are real-only, so each complex
+        # auxiliary is reformulated as a REAL problem the aux solves *exactly* — gradient GᵀA_cG = jω·R
+        # (Re=0, GᵀKG=0) → -j·(Im A_G)⁻¹; solenoidal ΠᵀA_cΠ = S+jT → the real 2n block [[S,-T],[T,S]].
+        b_ops, nvs = [], []
+        for P in Pi_sp:
+            Ap = pin0((P.T @ A_sp @ P).tocsr())
+            b_ops.append(to_op(sp.bmat([[Ap.real, -Ap.imag], [Ap.imag, Ap.real]]).tocsr()))
+            nvs.append(Ap.shape[0])
+        return {"complex": True, "rg_op": to_op(pin0(sp.csr_matrix(A_G.imag))), "b_ops": b_ops, "nvs": nvs}
+
+    def materialize(self, ctx: PrecondContext):
+        from . import solve as _solve
+
+        aux = self.aux if self.aux is not None else _solve.lu()
+        f = self._frozen if self._frozen is not None else self._assemble_aux(ctx)  # frozen (built) or eager
+
+        G, Pis = self._G, self._Pis
+        GT, PisT = G.T, [P.T for P in Pis]
+        dinv = 1.0 / ctx.diag()  # Jacobi smoother — the traced diagonal carries A(θ) under a trace
+
+        if not f["complex"]:
+            g_op, p_ops = f["g_op"], f["p_ops"]
 
             def apply(r):
                 x = dinv * r
@@ -478,16 +534,7 @@ class _AMS:
                     x = x + P @ aux(p_op, (PT @ r).at[0].set(0.0))  # solenoidal correction (per component)
                 return x
         else:
-            # Complex eddy operator (νK + jωσM): AmgX-style multigrid aux solvers are real-only, so each
-            # complex auxiliary is reformulated as a REAL problem the aux solves *exactly*:
-            #   • gradient   GᵀA_cG = jω·R  (real part vanishes, GᵀKG = 0) → A_G⁻¹ = -j·(Im A_G)⁻¹  [real AMG on Im A_G]
-            #   • solenoidal ΠᵀA_cΠ = S + jT → the real-equivalent 2n block [[S,-T],[T,S]]
-            rg_op = to_op(pin0(sp.csr_matrix(A_G.imag)))
-            b_ops, nvs = [], []
-            for P in Pi_sp:
-                Ap = pin0((P.T @ A_sp @ P).tocsr())
-                b_ops.append(to_op(sp.bmat([[Ap.real, -Ap.imag], [Ap.imag, Ap.real]]).tocsr()))
-                nvs.append(Ap.shape[0])
+            rg_op, b_ops, nvs = f["rg_op"], f["b_ops"], f["nvs"]
 
             def apply(r):
                 x = dinv * r
@@ -529,6 +576,12 @@ def ams(*, aux=None) -> _AMS:
     **Outer solver.** An *exact* ``aux`` (``lu``) is a fixed linear map, so it pairs with ``cg``; an
     *inexact/iterative* ``aux`` (multigrid, an inexact ``cg``) is a **variable** preconditioner and
     needs a **flexible** outer solver — :func:`jno.solve.fgmres` (real) — or ``cg`` stalls.
+
+    **Differentiable / traced solves.** The host aux-assembly cannot run under a trace, so for a
+    ``jit`` / ``vmap`` / **parametric-inverse** (design-loop) solve, build it once eagerly first —
+    ``jno.precond.ams().build(fem)`` — freezing the auxiliaries; the solve then runs *and*
+    differentiates (the gradient flows through the traced operator by implicit differentiation, not
+    through the frozen preconditioner). Without ``.build`` the forward (concrete) solve still works.
 
     The same spec handles the **real** curl-curl+mass and the **complex** eddy operator ``νK + jωσM``
     — dtype follows the assembled matrix; pair it with :func:`jno.solve.gmres` (complex-correct) for
