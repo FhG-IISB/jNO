@@ -31,7 +31,7 @@ from .utils.solver.solver_api import (  # noqa: F401  (PrecondContext re-exporte
     PrecondContext,
 )
 
-__all__ = ["PrecondContext", "jacobi", "chebyshev", "form", "inner", "block_diag", "triangular", "amg"]
+__all__ = ["PrecondContext", "jacobi", "chebyshev", "form", "inner", "block_diag", "triangular", "amg", "ams"]
 
 
 class _Jacobi:
@@ -389,6 +389,127 @@ def amg(*, cycles: int = 1, max_levels: int = 10, coarse_size: int = 100, smooth
     spec for very large ones.
     """
     return _AMG(cycles, max_levels, coarse_size, smoother_degree)
+
+
+class _AMS:
+    """Spec for the H(curl) auxiliary-space Maxwell (AMS) preconditioner; see :func:`ams`."""
+
+    def __init__(self, aux):
+        self.aux = aux  # jno.solve LinearSolver for the nodal auxiliary solves (None -> lu())
+        self._G = None  # discrete gradient (node->edge), built once from the mesh topology
+        self._Pis = None  # (Π_x, Π_y, Π_z) nodal->edge vector interpolation
+
+    def prepare(self, fem):
+        """Eager one-time build of the mesh-only transfer operators G, Π (parameter-independent)."""
+        self._transfer(fem.domain)
+
+    def _transfer(self, domain):
+        from .utils.solver.ams import discrete_gradient, nodal_vector_interpolation
+
+        topo = domain._fem_nonnodal_topology
+        self._G = discrete_gradient(topo)
+        self._Pis = nodal_vector_interpolation(topo)
+
+    def materialize(self, ctx: PrecondContext):
+        import numpy as np
+        import scipy.sparse as sp
+        from jax.experimental import sparse as jsp
+
+        from . import solve as _solve
+        from .utils.solver.solver_api import LinearOperator
+
+        if self._G is None:
+            if ctx.fem is None:
+                raise TypeError(
+                    "jno.precond.ams needs the owning FEM to read the N1E edge topology — "
+                    "use it via fem.solve(precond=jno.precond.ams()), not on a bare operator."
+                )
+            self._transfer(ctx.fem.domain)
+        aux = self.aux if self.aux is not None else _solve.lu()
+
+        A = ctx.A.bcoo if ctx.A.bcoo is not None else ctx.A.dense()
+        try:
+            A_sp = sp.csr_matrix(np.asarray(A.todense() if hasattr(A, "todense") else A))
+        except Exception as e:  # a traced operator (parametric/complex-inverse) can't be host-assembled
+            raise RuntimeError(
+                "jno.precond.ams assembles the nodal auxiliary operators on the host from a concrete "
+                "matrix; it does not run under a trace (jit/vmap/parametric-inverse solve)."
+            ) from e
+        G_sp = sp.csr_matrix(np.asarray(self._G.todense()))
+        Pi_sp = [sp.csr_matrix(np.asarray(P.todense())) for P in self._Pis]
+
+        A_G = (G_sp.T @ A_sp @ G_sp).tocsr()  # gradient-space auxiliary operator GᵀAG
+        g_scale = float(np.abs(A_G.data).max()) if A_G.nnz else 0.0
+        if g_scale < 1e-12 * (float(np.abs(A_sp.data).max()) or 1.0):
+            raise ValueError(
+                "jno.precond.ams: the gradient auxiliary GᵀAG is ~0 — a pure curl-curl operator has no "
+                "coercivity on the gradient space. Add a mass term (σ/ε-gauge: jω·ε·⟨A,v⟩) so it is "
+                "non-singular; see the AMS docs."
+            )
+
+        def pin0(M):  # pin node 0 → remove the constant nodal mode so an exact aux solve is non-singular
+            L = M.tolil()
+            L[0, :] = 0.0
+            L[:, 0] = 0.0
+            L[0, 0] = 1.0
+            return L.tocsr()
+
+        def to_op(M):  # scipy -> jno LinearOperator over a BCOO
+            coo = pin0(M).tocoo()
+            idx = jnp.asarray(np.stack([coo.row, coo.col], axis=1))
+            return LinearOperator(jsp.BCOO((jnp.asarray(coo.data), idx), shape=coo.shape))
+
+        # G's constant null-space (G·1 = 0) is exact; each Π_α's constant mode is redundant with it
+        # (Π_α·1 = G·coordₐ is a gradient), so pinning node 0 in every auxiliary operator is correct.
+        g_op = to_op(A_G)
+        p_ops = [to_op((P.T @ A_sp @ P).tocsr()) for P in Pi_sp]
+
+        G, Pis = self._G, self._Pis
+        GT, PisT = G.T, [P.T for P in Pis]
+        dinv = 1.0 / ctx.diag()  # Jacobi smoother (complex diagonal on a complex operator)
+
+        def apply(r):
+            x = dinv * r
+            x = x + G @ aux(g_op, (GT @ r).at[0].set(0.0))  # gradient-space correction
+            for P, PT, p_op in zip(Pis, PisT, p_ops):
+                x = x + P @ aux(p_op, (PT @ r).at[0].set(0.0))  # solenoidal correction (per component)
+            return x
+
+        return PrecondApplier(apply)
+
+    def __repr__(self):
+        return f"jno.precond.ams(aux={self.aux!r})"
+
+
+def ams(*, aux=None) -> _AMS:
+    """**AMS** — the auxiliary-space Maxwell preconditioner for H(curl) (Nédélec/N1E) curl-curl
+    systems (Hiptmair & Xu, *SIAM J. Numer. Anal.* 45(6):2483, 2007; Kolev & Vassilevski,
+    *J. Comput. Math.* 27(5):604, 2009).
+
+    Plain point/AMG smoothing cannot damp the huge **gradient near-null-space** of a curl-curl
+    operator (``curl∘grad = 0``), so its condition number leaks into the iteration count. AMS adds
+    two corrections on cheaper **nodal** auxiliary problems — one on the discrete-gradient space
+    ``G``, one on the vector-nodal space ``Π`` — restoring near mesh-independent convergence::
+
+        M⁻¹ r = D⁻¹ r  +  G (GᵀAG)⁻¹ Gᵀ r  +  Σ_α Π_α (Π_αᵀAΠ_α)⁻¹ Π_αᵀ r
+
+    ``G`` and ``Π`` come from the N1E edge topology (:mod:`jno.utils.solver.ams`); the auxiliary
+    operators are assembled once on the host from the concrete matrix and solved with ``aux`` —
+    **any** ``jno.solve`` solver (default :func:`jno.solve.lu`). Passing a multigrid inner solver
+    makes the whole preconditioner scalable (the auxiliary problems are ordinary nodal Poisson-like
+    systems). The same spec handles the **real** curl-curl+mass and the **complex** eddy operator
+    ``νK + jωσM`` — dtype follows the assembled matrix; pair it with :func:`jno.solve.gmres`
+    (complex-correct) for the eddy case.
+
+    Requirements & scope:
+
+    * The operator must be **coercive on the gradient space** — a bare curl-curl is singular there;
+      a mass term (conductivity, or the σ=0-in-air **ε-gauge** ``jω·ε·⟨A,v⟩``) is what makes
+      ``GᵀAG`` invertible. The spec raises if that term is missing.
+    * ``G``/``Π`` are built from the **full** edge topology, so this targets weak/penalty (PEC-style)
+      boundary terms; Dirichlet-**eliminated** DOFs would need row-masking — out of scope here.
+    """
+    return _AMS(aux)
 
 
 def chebyshev(
