@@ -156,6 +156,27 @@ def test_ams_build_makes_the_solve_differentiable():
     assert abs(g - (-2.0 * val)) / abs(2.0 * val) < 1e-3  # and the analytic -2‖A⁻¹b‖²
 
 
+def test_ams_reference_build_preconditions_a_parametric_solve():
+    """Parametric-inverse (design-loop) use: the operator ``A(θ)`` is traced, so freeze the AMS
+    auxiliaries once from a **concrete reference** at ``θ₀`` — ``jno.precond.ams().build(fem0)`` — and
+    reuse that spec for the parametric solve. The parametric node evaluates to the forward solution (so
+    the frozen preconditioner solved it correctly); it is a trace node, so ``∂/∂θ`` flows through it."""
+    spec = jno.precond.ams().build(_curlcurl_source(0.35, beta=1e-3))  # concrete reference
+    assert spec._frozen is not None
+
+    beta = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="beta_ams")
+    beta.initialize(jax.nn.initializers.constant(1e-3))
+    beta.dtype(jnp.float64)
+    fem_p = _curlcurl_source(0.35, beta)  # β is now a jno.np.parameter → parametric FemLinearSystem
+
+    with _ON_CPU:
+        node = fem_p.solve(linear=jno.solve.fgmres(tol=1e-9, restart=80, maxiter=400), precond=spec)
+        assert not isinstance(node, jax.Array), "a parametric solve must be a differentiable trace node"
+        u_ref = np.asarray(_curlcurl_source(0.35, 1e-3).solve(linear=jno.solve.lu())).reshape(-1)
+        u = np.asarray(jno.core([(node - jnp.asarray(u_ref)).mae], domain=None).eval([node])).reshape(-1)
+    assert np.linalg.norm(u - u_ref) / np.linalg.norm(u_ref) < 1e-6
+
+
 def test_ams_needs_the_owning_fem():
     """Materialised on a bare operator (no ctx.fem → no edge topology) it errors clearly, since G/Π
     are mesh objects, not recoverable from the matrix alone."""

@@ -421,8 +421,18 @@ class _AMS:
         self._frozen = None  # host-assembled auxiliary operators, set by .build() for traced solves
 
     def prepare(self, fem):
-        """Eager one-time build of the mesh-only transfer operators G, Π (parameter-independent)."""
+        """Eager setup at compose time (outside any trace): the mesh transfer operators G, Π, **and** —
+        whenever the operator is concrete here (the forward *and* native parametric-inverse solves) — the
+        frozen auxiliaries too, so an AMS-preconditioned solve is differentiable **automatically**, no
+        explicit ``.build`` required. If only a tracer is available at this point (a raw ``jit``/``vmap``
+        of ``fem.solve``, where there is no concrete operator to freeze from), freezing is deferred and
+        :meth:`build` is the escape hatch — :meth:`materialize` says so."""
         self._transfer(fem.domain)
+        if self._frozen is None:
+            try:
+                self.build(fem)  # auto-freeze when the operator is concrete & complete here
+            except Exception:  # noqa: BLE001 — a tracer / a parameter-incomplete operator: fall through,
+                pass  # and materialize either assembles from the concrete ctx or asks for an explicit .build
 
     def build(self, fem) -> "_AMS":
         """Eager host setup from a **concrete** ``fem`` — required to use AMS inside a **traced** solve
@@ -469,8 +479,10 @@ class _AMS:
         except Exception as e:  # a traced operator (parametric/complex-inverse) can't be host-assembled
             raise RuntimeError(
                 "jno.precond.ams assembles the nodal auxiliaries on the host from a concrete matrix, so it "
-                "cannot run under a trace (jit/vmap/parametric-inverse). Build it once eagerly first — "
-                "jno.precond.ams().build(fem) — and the frozen preconditioner then differentiates through."
+                "cannot run under a trace (jit/vmap/parametric-inverse). Freeze it once from a CONCRETE "
+                "reference first — spec = jno.precond.ams().build(fem0), with fem0 the (non-parametric) fem "
+                "at your reference parameters — then reuse that spec; the frozen preconditioner then runs "
+                "and differentiates through (the gradient flows through the operator, not the preconditioner)."
             ) from e
         G_sp = sp.csr_matrix(np.asarray(self._G.todense()))
         Pi_sp = [sp.csr_matrix(np.asarray(P.todense())) for P in self._Pis]
@@ -577,11 +589,20 @@ def ams(*, aux=None) -> _AMS:
     *inexact/iterative* ``aux`` (multigrid, an inexact ``cg``) is a **variable** preconditioner and
     needs a **flexible** outer solver — :func:`jno.solve.fgmres` (real) — or ``cg`` stalls.
 
-    **Differentiable / traced solves.** The host aux-assembly cannot run under a trace, so for a
-    ``jit`` / ``vmap`` / **parametric-inverse** (design-loop) solve, build it once eagerly first —
-    ``jno.precond.ams().build(fem)`` — freezing the auxiliaries; the solve then runs *and*
-    differentiates (the gradient flows through the traced operator by implicit differentiation, not
-    through the frozen preconditioner). Without ``.build`` the forward (concrete) solve still works.
+    **Differentiable / traced solves.** The host aux-assembly cannot run under a trace. A **forward**
+    (concrete) solve freezes the auxiliaries automatically at compose time, so it is already
+    differentiable-ready — nothing to do. For a solve whose **operator itself is traced** — a ``jit`` /
+    ``vmap``, or a **parametric-inverse** design loop where ``A(θ)`` carries a ``jno.np.parameter`` —
+    freeze once from a **concrete reference** and reuse it::
+
+        spec = jno.precond.ams().build(fem0)          # fem0 = the fem at your reference parameters θ₀
+        node = fem_of(theta).solve(precond=spec)      # parametric solve; node is differentiable
+
+    The frozen preconditioner stays valid as ``A(θ)`` drifts (speed degrades, correctness never), and
+    ``∂/∂θ`` flows through the **operator** by implicit differentiation — never through the
+    preconditioner (a preconditioner cannot change the solution, so differentiating its setup would be
+    pure waste). You cannot auto-freeze from the parametric fem itself because ``θ₀`` is only resolved
+    at solve time; the one-line concrete reference is that choice made explicit.
 
     The same spec handles the **real** curl-curl+mass and the **complex** eddy operator ``νK + jωσM``
     — dtype follows the assembled matrix; pair it with :func:`jno.solve.gmres` (complex-correct) for
