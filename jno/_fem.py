@@ -1414,6 +1414,25 @@ class FEM:
             raise AttributeError(f"FEM is {self._mode}; .b is only for a steady linear problem (see .operator / .M).")
         return _as_flat(self._b)
 
+    def eigs(self, *, mass, k: int = 6, which: str = "smallest"):
+        """Generalized eigenproblem ``K x = λ M x`` on this fem: ``K`` is this **source-less** fem's
+        operator (its stiffness bilinear form) and ``M`` is the ``mass`` bilinear form assembled on the
+        same space. Returns ``(λ, X)`` — the ``k`` eigenvalues at ``which`` (``'smallest'``/``'largest'``)
+        and their **M-orthonormal** eigenvectors. Eigenvalues are differentiable (see :func:`jno.solve.eigs`).
+
+        Modal analysis, buckling, EM cavity/waveguide resonances, photonic band structure::
+
+            u, v = d.fem_symbols(); ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+            K = jno.fem([ui.x * vi.x + ui.y * vi.y])      # stiffness (no source term)
+            lam, X = K.eigs(mass=[ui * vi], k=6)          # K x = λ M x  → λ = ω² (Neumann box)
+        """
+        if self._mode != "linear":
+            raise AttributeError(f"FEM.eigs needs a steady-linear (source-less) bilinear form; this fem is {self._mode}.")
+        from . import solve as _solve
+
+        M = fem(list(mass)).operator[0]  # mass matrix on the same FE space
+        return _solve.eigs(k=k, which=which)(self.operator[0], M)
+
     # -- domain-decomposition coupling (`jno.core([...])`): the region this subdomain owns + a pinned solve --
     def _dd_region(self):
         # The weak-form coordinates are retagged for quadrature, so read the region from `classification`

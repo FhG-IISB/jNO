@@ -48,6 +48,7 @@ __all__ = [
     "amg",
     "newton",
     "picard",
+    "eigs",
 ]
 
 
@@ -370,3 +371,29 @@ def picard(
         ls_max=ls_max,
         ls_c=ls_c,
     )
+
+
+def eigs(*, k: int = 6, which: str = "smallest"):
+    """Generalized **symmetric eigensolver** ``K x = λ M x`` (K symmetric, M SPD). Returns a callable
+    ``(K, M=None) -> (λ, X)``: the ``k`` eigenvalues at the requested end (``which='smallest'`` /
+    ``'largest'``) and their **M-orthonormal** eigenvectors (``Xᵀ M X = I``). ``M=None`` is the standard
+    problem ``K x = λ x``.
+
+    Use it for modal analysis (vibration), buckling, EM cavity/waveguide resonances and photonic band
+    structure — everything that is ``Kx=λMx`` rather than ``Ax=b``. Build ``K``/``M`` as source-less
+    ``jno.fem`` bilinear forms (or via :meth:`FEM.eigs`).
+
+    **Differentiable.** V1a reduces the pencil densely (Cholesky ``M=LLᵀ`` → ``jnp.linalg.eigh`` on
+    ``L⁻¹KL⁻ᵀ``), so ``∂λ/∂θ`` flows for free — for **simple** eigenvalues (degenerate/crossing
+    eigenvalues make the eigen-JVP singular; use the trace of a degenerate cluster there). Preconditioned
+    LOBPCG (reusing ``jno.precond.*``) and shift-invert to a target ``σ`` are the planned scale paths.
+    """
+    if which not in ("smallest", "largest", "SM", "LM", "SA", "LA"):
+        raise ValueError(f"jno.solve.eigs: which={which!r} — use 'smallest' or 'largest'.")
+
+    def _fn(K, M=None):
+        from .utils.solver.eigen import dense_geneigh
+
+        return dense_geneigh(K, M, k, which)
+
+    return _fn
