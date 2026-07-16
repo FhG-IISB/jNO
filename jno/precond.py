@@ -32,7 +32,7 @@ from .utils.solver.solver_api import (  # noqa: F401  (PrecondContext re-exporte
     materialize_precond,
 )
 
-__all__ = ["PrecondContext", "jacobi", "chebyshev", "form", "inner", "block_diag", "triangular", "amg", "cached"]
+__all__ = ["PrecondContext", "jacobi", "chebyshev", "form", "inner", "block_diag", "triangular", "amg", "jaxamg", "cached"]
 
 
 class _Spec:
@@ -400,6 +400,49 @@ def amg(*, cycles: int = 1, max_levels: int = 10, coarse_size: int = 100, smooth
     spec for very large ones.
     """
     return _AMG(cycles, max_levels, coarse_size, smoother_degree)
+
+
+class _JaxAMG(_Spec):
+    """Spec for the GPU AMG preconditioner via jaxamg (NVIDIA AmgX); see :func:`jaxamg`."""
+
+    def __init__(self, config):
+        self.config = config
+
+    def materialize(self, ctx: PrecondContext):
+        from .solve import _require_jaxamg  # reuse the lazy import + install-requirements error
+
+        A = ctx.A.bcoo
+        if A is None:
+            raise ValueError(
+                "jno.precond.jaxamg needs an assembled (sparse) operator — it cannot build an AMG "
+                "hierarchy from a matrix-free operator."
+            )
+        jax_amg = _require_jaxamg()
+        cfg = dict(self.config) if self.config is not None else {"solver": "AMG"}
+        apply = jax_amg.make_preconditioner(A, config=cfg)  # build-once M⁻¹ apply (single AMG cycle)
+        return PrecondApplier(lambda v: apply(v))
+
+    def __repr__(self):
+        return "jno.precond.jaxamg()"
+
+
+def jaxamg(*, config: "dict | None" = None) -> _JaxAMG:
+    """GPU AMG **preconditioner** via jaxamg (NVIDIA AmgX wrapped as a JAX primitive) — the
+    on-device counterpart of :func:`amg`, and the natural smoother for large elliptic blocks or the
+    auxiliary nodal solves of an H(curl) AMS preconditioner on the GPU.
+
+    Builds the AMG hierarchy with ``jaxamg.make_preconditioner`` and applies a single cycle as
+    ``M⁻¹`` — a proper build-once/apply-many preconditioner (unlike ``jno.precond.inner(jno.solve.amg())``,
+    which re-solves each application). Wrap in ``.cached()`` to reuse the hierarchy across solves::
+
+        fem.solve(linear=jno.solve.fgmres(), precond=jno.precond.jaxamg().cached())
+
+    ``config`` is a full AmgX-format dict (default ``{"solver": "AMG"}``). Needs an **assembled**
+    operator. Optional dependency — jaxamg (AmgX 2.5+, CUDA 12+, mpi4py/mpi4jax) is imported lazily.
+
+    Reference: Liu, Fan & Wang, arXiv:2606.09001 (2026), wrapping NVIDIA AmgX (Naumov et al., 2015).
+    """
+    return _JaxAMG(config)
 
 
 _MISS = object()  # sentinel so the first materialize always builds

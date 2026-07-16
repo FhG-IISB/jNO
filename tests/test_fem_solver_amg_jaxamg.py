@@ -82,3 +82,44 @@ def test_amg_composes_as_preconditioner():
     solve = jno.solve.cg(tol=1e-10)
     x = solve(op, b, M=jno.precond.inner(jno.solve.amg(maxiter=1, krylov=None)))
     assert jnp.max(jnp.abs(x - x_ref)) < 1e-6
+
+
+# ── jno.precond.jaxamg() — the GPU AMG preconditioner (build-once/apply-many via make_preconditioner) ──
+
+
+def test_jaxamg_precond_constructs_and_is_cacheable():
+    p = jno.precond.jaxamg()
+    assert "jaxamg" in jno.precond.__all__
+    assert type(p.cached()).__name__ == "_Cached"  # inherits _Spec → fluent .cached() for free
+
+
+def test_jaxamg_precond_rejects_matrix_free():
+    from jno.utils.solver.solver_api import PrecondContext
+
+    n = 6
+    op = LinearOperator.from_matvec(lambda v: 2.0 * v, shape=(n, n))
+    with pytest.raises(ValueError, match="matrix-free"):
+        jno.precond.jaxamg().materialize(PrecondContext(op, None))
+
+
+@pytest.mark.skipif(_HAS_JAXAMG, reason="jaxamg installed; this checks the missing-dependency message")
+def test_jaxamg_precond_missing_dependency_message():
+    from jno.utils.solver.solver_api import PrecondContext
+
+    op, _ = _spd_operator()
+    with pytest.raises(ImportError, match="jaxamg"):
+        jno.precond.jaxamg().materialize(PrecondContext(op, None))
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not _HAS_JAXAMG, reason="requires jaxamg + AmgX + CUDA")
+def test_jaxamg_precond_solves_poisson():
+    """AMG-preconditioned CG (with the cached jaxamg preconditioner) matches the direct solve."""
+    from jno.utils.solver.solver_api import PrecondContext, materialize_precond
+
+    op, dense = _spd_operator(64)
+    b = jnp.ones(op.shape[0])
+    x_ref = jnp.linalg.solve(dense, b)
+    M = materialize_precond(jno.precond.jaxamg().cached(), PrecondContext(op, None))
+    x = jno.solve.cg(tol=1e-10)(op, b, M=M)
+    assert jnp.max(jnp.abs(x - x_ref)) < 1e-6
