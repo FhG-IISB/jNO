@@ -2441,13 +2441,19 @@ class domain(MeshIOMixin):
 
     @staticmethod
     def _chain_edges_to_loop(edges):
-        """Chain a set of (a, b) edge pairs into an ordered loop.
+        """Chain a set of ``(a, b)`` edge pairs into one ordered path of point indices.
+
+        Handles both a **closed loop** (every node degree 2 -> N edges give N nodes) and an **open
+        chain** (a box face: two endpoints of degree 1 -> N edges give N+1 nodes). The open case must
+        keep *both* endpoints: a shared corner is an endpoint of a face's chain, and dropping it (the
+        old closed-loop-only walk did) removes the corner from that face's tag -- which silently breaks
+        multidirectional periodicity, where a corner must belong to every face it lies on.
 
         Args:
-            edges: List of 2-tuples (global point indices) forming a closed loop.
+            edges: List of 2-tuples (global point indices) forming a single connected path/loop.
 
         Returns:
-            np.ndarray of global point indices in loop order.
+            np.ndarray of global point indices in traversal order.
         """
         from collections import defaultdict
 
@@ -2456,18 +2462,19 @@ class domain(MeshIOMixin):
             adj[a].append(b)
             adj[b].append(a)
 
-        # Walk the graph
-        start = edges[0][0]
+        # Start at an endpoint (degree 1) for an open chain; anywhere for a closed loop.
+        endpoints = [n for n, nbrs in adj.items() if len(nbrs) == 1]
+        start = endpoints[0] if endpoints else edges[0][0]
         visited = {start}
         order = [start]
         current = start
-        for _ in range(len(edges) - 1):
-            for nb in adj[current]:
-                if nb not in visited:
-                    visited.add(nb)
-                    order.append(nb)
-                    current = nb
-                    break
+        while True:
+            nxt = next((nb for nb in adj[current] if nb not in visited), None)
+            if nxt is None:
+                break
+            visited.add(nxt)
+            order.append(nxt)
+            current = nxt
         return np.array(order, dtype=int)
 
     @staticmethod

@@ -1682,21 +1682,32 @@ def _build_periodic_reduction(domain: Any, ties: List[Any], points: Any, cells: 
     ``cells``; ``cells=None`` for the native 1D route falls back to flat-chain facets)."""
     from .utils.solver.fem_utils import build_periodic_prolongation
 
-    # Multidirectional periodicity needs each face to carry its shared corners (a corner is a slave
-    # in several directions). ``domain.tag`` partitions a corner into one edge, so we recover full
-    # faces from the tag predicate -- which an auto-generated tag (no `domain.tag` call) lacks. Reject
-    # that case loudly rather than silently under-identify the corners and mis-solve.
-    if len(ties) > 1:
-        preds = getattr(domain, "_tag_predicates", {})
-        missing = sorted({t for (m, s, *_ignore) in ties for t in (m, s) if t not in preds})
-        if missing:
-            raise NotImplementedError(
-                "jno.fem: multidirectional periodicity requires each periodic face to be defined via "
-                f"`domain.tag(name, predicate)` so shared corners are included in every face; tag(s) "
-                f"{missing} are auto-generated (no predicate). Define them with domain.tag(...)."
-            )
-
     points = np.asarray(points)
+
+    # Multidirectional periodicity needs each face to carry its shared corners (a corner is a slave in
+    # several directions). A ``domain.tag`` predicate face includes corners by construction. An auto face
+    # (from Shape/emit) does too now that a face chain keeps both endpoints (``_chain_edges_to_loop``) --
+    # accept it when the mesh confirms corners are shared: every pair of perpendicular periodic faces
+    # must share a node. Otherwise (older partitioned tagging) reject rather than silently mis-solve.
+    if len(ties) > 1:
+        preds = getattr(domain, "_tag_predicates", {}) or {}
+        if not all(t in preds for (m, s, *_i) in ties for t in (m, s)):
+            ti = getattr(domain, "tag_indices", {}) or {}
+            face_nodes = {}
+            for m, s, *_ignore in ties:
+                for t in (m, s):
+                    if t in ti and t not in face_nodes:
+                        face_nodes[t] = set(int(i) for i in np.asarray(ti[t]).reshape(-1))
+            faces = [t for tie in ties for t in tie[:2]]
+            shared = all(
+                any((face_nodes.get(a, set()) & face_nodes.get(b, set())) for b in faces if b != a) for a in faces
+            )
+            if not (shared and len(face_nodes) == len(set(faces))):
+                raise NotImplementedError(
+                    "jno.fem: multidirectional periodicity needs each periodic face to include its shared "
+                    "corners. Define the faces via `domain.tag(name, predicate)` so a corner lies on every "
+                    "face it touches (an axis-aligned predicate like `lambda x, y: x < tol` includes corners)."
+                )
     dim = int(getattr(domain, "dimension", points.shape[1]) or points.shape[1])
     bfacets = _boundary_facets(points, cells, dim, ele_order) if cells is not None else None
     bnodes = np.unique(bfacets) if bfacets is not None and bfacets.size else None
