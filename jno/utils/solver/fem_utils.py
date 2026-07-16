@@ -565,16 +565,20 @@ def _cell_region_mask(domain, region):
     centroids = pts[cells].mean(axis=1)  # (num_cells, dim)
     src = getattr(domain, "_source_regions", {}) or {}
     preds = getattr(domain, "_tag_predicates", {}) or {}
+    shape_regions = getattr(domain, "_shape_regions", {}) or {}
     if region in src:
         from shapely import contains_xy
 
         m = np.asarray(contains_xy(src[region], centroids[:, 0], centroids[:, 1]))
     elif region in preds:
         m = np.asarray(preds[region](*[centroids[:, i] for i in range(dim)]))
+    elif region in shape_regions:
+        # A Shape.regions sub-region: analytic CSG membership of the cell centroid (2-D and 3-D).
+        m = np.asarray(shape_regions[region].contains(centroids))
     else:
         raise ValueError(
             f"jno.fem per-region integration: unknown region {region!r}. Define it with "
-            f"domain.tag(name, predicate) or as a geometry part (domain._source_regions)."
+            f"domain.tag(name, predicate), a Shape.regions() sub-region, or a geometry part."
         )
     return np.asarray(m, dtype=bool).astype(np.float64)
 

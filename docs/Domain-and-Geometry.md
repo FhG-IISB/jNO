@@ -115,6 +115,29 @@ solid.sized(lambda x, y, z: 0.03 + 0.10 * y)    # graded: denser where the funct
 So "denser in a region" = give a small `size=` to the shape covering it, or a callable that is small
 there.
 
+### Multi-material regions
+
+`Shape.regions(**named)` builds a **multi-material** domain: the named sub-shapes are fragmented so
+element edges align exactly with every material interface (a *conforming* mesh), and each cell is
+assigned to the first region — keyword order is priority — whose shape contains its centroid. Each
+region becomes its own variable set; the outer boundary keeps its auto-names and internal interface
+facets are not boundary.
+
+```python
+plate = Shape.rect(0, 0, 2, 1)
+core  = Shape.disk(1, 0.5, 0.3)
+d = Shape.regions(inclusion=core, matrix=plate).sized(0.05).domain()
+
+d.variable("inclusion")     # the disk's cells/points (a distinct material)
+d.variable("matrix")        # everything else
+d.boundary_tags()           # {left, right, top, bottom, boundary} — the plate's outer edges only
+```
+
+Regions may overlap: here the disk overlaps the plate, and `inclusion` wins inside the disk because
+it is listed first. Use each region tag to restrict a `jno.fem` term or coefficient to that material
+(per-region volume integration), or to sample it in a PINN. `Shape.regions` is a top-level construct
+— call `.domain()` on it directly; it does not compose with boolean operators or transforms.
+
 ---
 
 ## Worked examples
@@ -166,10 +189,11 @@ d = jno.domain("part.msh")     # .msh / .vtk / .med … built anywhere (gmsh, CA
 d = jno.domain.from_array({"interior": interior_coords, "boundary": boundary_coords})
 ```
 
-**1-D domains**, which `Shape` doesn't cover, use the `jno.domain.line(...)` shorthand (`jno.domain`
-also keeps `equi_distant_rect`, `poseidon`, and `from_array`). For 2-D/3-D geometry build the shape
-with `Shape` — `Shape.rect(...).domain()`, `Shape.box(...).domain()`, and so on. (Shapely geometries
-and vertex lists are also still accepted.)
+**1-D domains** — either the `jno.domain.line(...)` shorthand or, `Shape`-native, an open path:
+`jno.Path(0, 0).line_to(1, 0).curve(size=0.01).domain()` (ends named `left`/`right`). `jno.domain`
+also keeps the structured grids `equi_distant_rect` / `poseidon` and the point-cloud `from_array`.
+For 2-D/3-D geometry build the shape with `Shape` — `Shape.rect(...).domain()`,
+`Shape.box(...).domain()`, and so on. (Shapely geometries and vertex lists are also still accepted.)
 
 ---
 

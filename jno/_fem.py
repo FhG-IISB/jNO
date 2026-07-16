@@ -432,6 +432,7 @@ def _region_and_support(constraint: Any, domain: Any) -> Tuple[str, str]:
     # The default whole-domain interior tags normalize to "volume", so they never match here.
     src_regions = getattr(domain, "_source_regions", {}) or {}
     tag_preds = getattr(domain, "_tag_predicates", {}) or {}
+    shape_regions = getattr(domain, "_shape_regions", {}) or {}
 
     def _subregion_id(t: str):
         # `from_regions` registers a geometry part's interior under the tag ``interior_<name>`` (see
@@ -445,6 +446,8 @@ def _region_and_support(constraint: Any, domain: Any) -> Tuple[str, str]:
         if t.startswith("interior_") and t[len("interior_") :] in src_regions:
             return t[len("interior_") :]
         if t in tag_preds and t not in _bregions:
+            return t
+        if t in shape_regions:
             return t
         return None
 

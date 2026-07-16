@@ -121,6 +121,12 @@ def _classify(node, x: float, y: float, z: float, tol: float = 1e-6):
         return (node[2], name) if name is not None else None
     if kind in ("cut", "fuse", "inter"):
         return _classify(node[1]._node, x, y, z, tol) or _classify(node[2]._node, x, y, z, tol)
+    if kind == "regions":
+        for _name, sub in node[1]:
+            label = _classify(sub._node, x, y, z, tol)
+            if label is not None:
+                return label
+        return None
     if kind == "translate":
         dx, dy, dz = node[2]
         return _classify(node[1]._node, x - dx, y - dy, z - dz, tol)

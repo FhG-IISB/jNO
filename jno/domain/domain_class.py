@@ -366,6 +366,11 @@ class domain(MeshIOMixin):
         elif callable(constructor):
             self._generate_mesh(constructor, algorithm)
             self.log.info(f"Loaded mesh from {constructor}")  # type: ignore[attr-defined]
+            # A Shape.regions() plan carries named sub-region shapes; remember them so jno.fem
+            # per-region integration can restrict a term to a region's cells (centroid membership
+            # via the region shape's ``contains`` — see ``_cell_region_mask``).
+            if getattr(constructor, "_node", (None,))[0] == "regions":
+                self._shape_regions = {name: sub for name, sub in constructor._node[1]}
         else:
             raise ValueError("Must provide either geometry_func, mesh file, or NPZ tag file")
 
@@ -1780,6 +1785,14 @@ class domain(MeshIOMixin):
                 tag_points = set()
                 tag_edges = []
                 tag_tris = []
+                # A tag backed by volume cells (block 0 = the spatial-fill element for this
+                # dimension) is a region/interior, never a boundary — so it must not pick up PCA
+                # "boundary" normals (that would mislabel an interior sub-region as a boundary tag).
+                # Boundary tags live in the facet block (block 1); point clouds (block 0 = vertex)
+                # are not volume-filling, so they still get PCA normals.
+                _vol_elem = {1: "line", 2: "triangle", 3: "tetra"}.get(self.dimension)
+                block0_is_volume = bool(mesh.cells) and mesh.cells[0].type == _vol_elem
+                has_volume_cells = False
 
                 if isinstance(cell_data, dict):
                     for cell_type, indices in cell_data.items():
@@ -1797,6 +1810,8 @@ class domain(MeshIOMixin):
                                             point_idx = int(cell_block.data[local_idx].flatten()[0])
                                             tag_points.add(point_idx)
                         else:
+                            if block0_is_volume and cell_type == _vol_elem and len(indices) > 0:
+                                has_volume_cells = True
                             for b_idx, cell_block in enumerate(mesh.cells):
                                 if cell_block.type == cell_type:
                                     offset = block_offsets.get((b_idx, cell_type), 0)
@@ -1822,6 +1837,8 @@ class domain(MeshIOMixin):
                     for block_idx, indices in enumerate(cell_data):
                         if indices is None or len(indices) == 0:
                             continue
+                        if block_idx == 0 and block0_is_volume:
+                            has_volume_cells = True
                         if block_idx < len(mesh.cells):
                             cell_block = mesh.cells[block_idx]
                             block_len = len(cell_block.data)
@@ -1872,7 +1889,7 @@ class domain(MeshIOMixin):
                     normal_positions = np.array([index_to_normal_pos[i] for i in indices_list if i in index_to_normal_pos])
                     if len(normal_positions) == len(indices_list) and len(indices_list) > 0:
                         self.normals_by_tag[name] = boundary_normals[normal_positions]
-                    elif len(normal_positions) == 0:
+                    elif len(normal_positions) == 0 and not has_volume_cells:
                         tag_pt_coords = points[indices_list, : self.dimension]
                         if len(tag_pt_coords) > 1:
                             tag_normals, _ = self._compute_normals_pca(

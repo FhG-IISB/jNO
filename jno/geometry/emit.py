@@ -37,6 +37,14 @@ def _emit_node(node, occ, split_full=False):
     kind = node[0]
     if kind == "leaf":
         return [node[1].build(occ)]
+    if kind == "regions":
+        pieces: List[tuple] = []
+        for _name, sub in node[1]:
+            pieces.extend(_emit_node(sub._node, occ, split_full))
+        # Fragment every piece against the others: shared interfaces become conforming
+        # (element edges align), and each material region survives as its own volume entity.
+        out, _ = occ.fragment(pieces[:1], pieces[1:])
+        return out
     if kind in ("cut", "fuse", "inter"):
         a = _emit_node(node[1]._node, occ, split_full)
         b = _emit_node(node[2]._node, occ, split_full)
@@ -118,6 +126,9 @@ def _plan_sizes(shape):
             walk(node[2])
         elif kind in ("extrude", "revolve", "translate", "rotate", "fillet", "sweep"):
             walk(node[1])
+        elif kind == "regions":
+            for _name, sub in node[1]:
+                walk(sub)
 
     walk(shape)
     return out
@@ -179,8 +190,14 @@ def _apply_size_fields(dim: int, leaves, labels: Dict[int, Tuple[int, str]], sha
     return float(min(scalars)) if scalars else None
 
 
-def _to_meshio(dim: int, labels: Dict[int, Tuple[int, str]]):
-    """Assemble the generated gmsh mesh into a ``meshio.Mesh`` with named ``cell_sets``."""
+def _to_meshio(dim: int, labels: Dict[int, Tuple[int, str]], region_items=None):
+    """Assemble the generated gmsh mesh into a ``meshio.Mesh`` with named ``cell_sets``.
+
+    ``region_items`` (``((name, sub_shape), ...)``, when the plan is a :meth:`Shape.regions`
+    multi-material domain) adds one volume ``cell_set`` per region — each cell assigned to the
+    first region whose shape contains its centroid — and drops internal interface facets from the
+    boundary block (a facet shared by two volumes is not a domain boundary).
+    """
     import gmsh
     import meshio
     import numpy as np
@@ -203,6 +220,8 @@ def _to_meshio(dim: int, labels: Dict[int, Tuple[int, str]]):
     facet_rows: List[List[int]] = []
     by_name: Dict[str, List[np.ndarray]] = {}
     for _edim, etag in gmsh.model.getEntities(bdim):
+        if region_items is not None and len(gmsh.model.getAdjacencies(bdim, etag)[0]) >= 2:
+            continue  # facet shared by two volumes -> internal material interface, not boundary
         label = labels.get(etag)
         # A 1-D polyline's intermediate junctions are interior points (unnamed) -- they must not
         # land in the boundary block. Higher-dim unnamed facets stay boundary (just unnamed).
@@ -226,6 +245,15 @@ def _to_meshio(dim: int, labels: Dict[int, Tuple[int, str]]):
     for name, chunks in by_name.items():
         cell_sets[name] = [empty.copy(), np.concatenate(chunks) if chunks else empty.copy()]
     cell_sets["boundary"] = [empty.copy(), np.arange(len(facets), dtype=np.int64)]
+
+    if region_items and len(vcells):
+        centroids = coords[vcells].mean(axis=1)  # (M, 3) cell centroids
+        assigned = np.full(len(vcells), -1, dtype=np.int64)
+        for ri, (name, sub) in enumerate(region_items):
+            take = np.asarray(sub.contains(centroids), dtype=bool) & (assigned < 0)  # first match wins
+            assigned[take] = ri
+        for ri, (name, _sub) in enumerate(region_items):
+            cell_sets[name] = [np.where(assigned == ri)[0].astype(np.int64), empty.copy()]
 
     return meshio.Mesh(points=coords, cells=cells, cell_sets=cell_sets)
 
@@ -277,7 +305,8 @@ def _build_once(shape, split_full, periodic=None):
         if periodic:  # make named opposite faces conform (edge-element periodic ties need it)
             _apply_periodic(dim, labels, periodic)
         gmsh.model.mesh.generate(dim)
-        mesh = _to_meshio(dim, labels)
+        region_items = shape._node[1] if shape._node[0] == "regions" else None
+        mesh = _to_meshio(dim, labels, region_items)
         return mesh, dim, ds
     finally:
         gmsh.model.remove()

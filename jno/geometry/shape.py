@@ -36,6 +36,11 @@ def _node_contains(node, pts, tol):
         return _node_contains(node[1]._node, pts, tol) | _node_contains(node[2]._node, pts, tol)
     if kind == "inter":
         return _node_contains(node[1]._node, pts, tol) & _node_contains(node[2]._node, pts, tol)
+    if kind == "regions":
+        mask = np.zeros(len(pts), dtype=bool)
+        for _name, sub in node[1]:
+            mask |= _node_contains(sub._node, pts, tol)
+        return mask
     raise NotImplementedError(
         f"Shape.contains supports the analytic CSG subset — primitive leaves combined by "
         f"'-'/'|'/'&' (cut/fuse/inter); a {kind!r} solid (extrude/revolve/sweep/fillet/translate/"
@@ -106,6 +111,29 @@ class Shape:
     def sphere(cls, cx: float, cy: float, cz: float, r: float, size: Size = None) -> "Shape":
         """Sphere centred ``(cx,cy,cz)`` radius ``r``."""
         return cls(("leaf", Sphere(cx, cy, cz, r), next(_LEAF_KEYS)), 3, size)
+
+    @classmethod
+    def regions(cls, **named: "Shape") -> "Shape":
+        """A multi-material domain: named sub-regions meshed **conforming** to their interfaces.
+
+        Each keyword names a sub-region shape (all same ``dim``); the pieces are fragmented
+        (``occ.fragment``) so element edges align exactly with every material interface, then each
+        volume cell is assigned to the **first** region (keyword order = priority) whose shape
+        contains its centroid — exact, because the mesh conforms. The realized domain exposes each
+        region as its own variable set (``d.variable("core")``) alongside ``interior``/``boundary``,
+        and the outer boundary keeps its auto-names; internal interface facets are not boundary.
+
+        Regions may overlap: ``Shape.regions(inclusion=disk, matrix=plate)`` labels the disk
+        ``inclusion`` (higher priority) and the remainder ``matrix``. Must be the top-level shape
+        (call ``.domain()`` on it directly); it is not composable with boolean operators/transforms.
+        """
+        if len(named) < 2:
+            raise ValueError("Shape.regions needs at least two named regions")
+        items = tuple(named.items())
+        dims = {sub.dim for _n, sub in items}
+        if len(dims) != 1:
+            raise ValueError(f"all regions must share one dimension, got {sorted(dims)}")
+        return cls(("regions", items), items[0][1].dim, None)
 
     # ----- boolean operators -----------------------------------------------------
     def __sub__(self, other: "Shape") -> "Shape":
@@ -220,6 +248,11 @@ class Shape:
             return node[1].leaves() + node[2].leaves()
         if kind in ("extrude", "revolve", "translate", "rotate", "fillet", "sweep"):
             return node[1].leaves()
+        if kind == "regions":
+            out: Tuple[Tuple[object, Size, int], ...] = ()
+            for _name, sub in node[1]:
+                out += sub.leaves()
+            return out
         raise ValueError(f"unknown node kind {kind!r}")
 
     def keys(self) -> FrozenSet[int]:
