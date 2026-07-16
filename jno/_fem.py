@@ -1087,7 +1087,9 @@ class FEM:
             raise KeyError(f"FEM.block_index: trial field {getattr(field, 'name', fk)!r} is not part of this system.")
         return keys.index(fk)
 
-    def solve(self, solve_fn=None, *, adapt=None, x0=None, nonlinear=None, linear=None, precond=None, **kwargs) -> Any:
+    def solve(
+        self, solve_fn=None, *, adapt=None, x0=None, nonlinear=None, linear=None, precond=None, profile=False, **kwargs
+    ) -> Any:
         """Differentiable forward solve as a trace node — the inverse-problem entry.
 
         Pass ``adapt=AdaptSpec(...)`` to run the **adaptive** loop
@@ -1161,15 +1163,28 @@ class FEM:
         (``x0`` is rejected — the ICs own the initial state). Not yet supported: slots on
         complex/complex-transient problems, and slots combined with ``adapt=`` (remeshing
         invalidates warm starts and cached preconditioner setups — pass ``solve_fn=`` there).
+
+        ``profile=True`` runs the (eager, non-parametric) solve inside a JAX Perfetto trace, prints the DOF
+        count + wall time, and writes the trace to ``./jno_traces`` — like ``jno.core.solve(profile=True)``.
+        Profile a *concrete* forward solve; a parametric solve returns a deferred trace node with no numeric
+        work to time.
         """
-        result = self._solve_dispatch(
-            solve_fn, adapt=adapt, x0=x0, nonlinear=nonlinear, linear=linear, precond=precond, **kwargs
-        )
-        if isinstance(result, Placeholder):
-            # Tag the solve node with its domain so jno.core can infer the domain straight from the graph
-            # (a data-misfit inverse `jno.core([(fem.solve() - u_obs).mse])` needs no explicit `domain=`).
-            result._domain = self.domain
-        return result
+
+        def _run():
+            result = self._solve_dispatch(
+                solve_fn, adapt=adapt, x0=x0, nonlinear=nonlinear, linear=linear, precond=precond, **kwargs
+            )
+            if isinstance(result, Placeholder):
+                # Tag the solve node with its domain so jno.core can infer the domain straight from the graph
+                # (a data-misfit inverse `jno.core([(fem.solve() - u_obs).mse])` needs no explicit `domain=`).
+                result._domain = self.domain
+            return result
+
+        if not profile:  # profile=True: run the (eager) solve inside a JAX Perfetto trace + print a summary
+            return _run()
+        from .utils.profiling import profile_solve
+
+        return profile_solve(_run, label=f"fem profile · {self.dofs} DOFs · {self._mode}", warm=(adapt is None))
 
     def _solve_dispatch(self, solve_fn=None, *, adapt=None, x0=None, nonlinear=None, linear=None, precond=None, **kwargs):
         """Mode dispatch for :meth:`solve` — returns the solution array or a differentiable trace node."""
