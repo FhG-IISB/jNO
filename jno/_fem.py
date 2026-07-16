@@ -685,7 +685,24 @@ def _complex_block_bcoo(A_r: Any, A_i: Any, n: int) -> Any:
     return jsp.BCOO((data, indices), shape=(2 * n, 2 * n))
 
 
-def _solve_complex_block(ops: Any, solve_fn: Optional[Callable] = None, periodic: Optional[dict] = None) -> Any:
+def _complex_operator(A_r: Any, A_i: Any) -> Any:
+    """Fuse the real/imag legs into one complex operator ``A_r + i·A_i`` — as a **complex BCOO** when
+    the legs are sparse (so an iterative complex solve never densifies), else a dense complex array.
+    This is the operator a slot-composed complex solver (``linear=gmres, precond=ams``) runs on."""
+    if hasattr(A_r, "indices") and hasattr(A_i, "indices"):
+        from jax.experimental import sparse as jsp
+
+        indices = jnp.concatenate([A_r.indices, A_i.indices], axis=0)
+        data = jnp.concatenate([A_r.data + 0j, 1j * A_i.data])  # +0j promotes to the complex dtype
+        return jsp.BCOO((data, indices), shape=A_r.shape).sum_duplicates()
+    Ar = A_r.todense() if hasattr(A_r, "todense") else A_r
+    Ai = A_i.todense() if hasattr(A_i, "todense") else A_i
+    return jnp.asarray(Ar) + 1j * jnp.asarray(Ai)
+
+
+def _solve_complex_block(
+    ops: Any, solve_fn: Optional[Callable] = None, periodic: Optional[dict] = None, complex_solve: Optional[Callable] = None
+) -> Any:
     """Solve a complex linear FEM system via the real-equivalent block (everything was
     assembled as two *real* systems)::
 
@@ -738,6 +755,18 @@ def _solve_complex_block(ops: Any, solve_fn: Optional[Callable] = None, periodic
             return _bloch_solve(args)
         (A_r, b_r), (A_i, b_i) = _ab(ops[0], args), _ab(ops[1], args)
         n = b_r.shape[0]
+
+        if complex_solve is not None:
+            # Slot-composed iterative path (linear=/precond=): solve the COMPLEX system directly on the
+            # sparse operator A_r + i·A_i (never the dense 2n block), e.g. gmres + jno.precond.ams.
+            A_c = _complex_operator(A_r, A_i)
+            u = complex_solve(A_c, b_r + 1j * b_i)
+            return (
+                u
+                if periodic is None
+                else prolong_periodic(periodic, jnp.real(u)) + 1j * prolong_periodic(periodic, jnp.imag(u))
+            )
+
         rhs = jnp.concatenate([b_r, b_i])
         is_sparse = hasattr(A_r, "indices") and hasattr(A_i, "indices")
 
@@ -1192,6 +1221,10 @@ class FEM:
         else:
             from_slots = False
         if self._mode == "complex":
+            # A complex-native preconditioner (AMS) solves the sparse COMPLEX operator directly (never
+            # densified); real-equivalent preconditioners (form/jacobi/…) stay on the 2n-block path.
+            if from_slots and getattr(precond, "complex_native", False):
+                return _solve_complex_block(self._op, periodic=self._periodic, complex_solve=solve_fn)
             return _solve_complex_block(self._op, solve_fn, periodic=self._periodic)
         if self._mode == "complex_transient":
             return _solve_complex_transient(self._op, save_ts=kwargs.get("save_ts"), periodic=self._periodic)

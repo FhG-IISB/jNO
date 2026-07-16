@@ -50,6 +50,32 @@ def _curlcurl_source(mesh_size, beta):
     return jno.fem([term])
 
 
+def _complex_eddy(mesh_size, freq, eps):
+    """A complex eddy operator νK + jω(σ+ε)M with σ nonzero only on a sub-region (copper analog) and a
+    small ε mass floor everywhere (the σ=0-in-air ε-gauge), plus a source in the conductor."""
+    d = jno.domain(constructor=jno.domain.cube(mesh_size=mesh_size))
+    u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
+    c = d.variable("interior", split=True)
+    x, y, z = c[0], c[1], c[2]
+    ui, vi = u.bind(x=x, y=y, z=z), v.bind(x=x, y=y, z=z)
+    cu, cv = u.vector.curl(x, y, z), v.vector.curl(x, y, z)
+    sig = jno.np.where(x > 0.5, 1.0, 0.0)
+    Js = vec(0.0 * x, 0.0 * x, sig)
+    omega = 2 * np.pi * freq
+    return jno.fem([inner(cu, cv) + 1j * omega * (sig + eps) * inner(ui, vi) - inner(Js, vi)])
+
+
+def test_ams_complex_eddy_matches_sparse_lu():
+    """M4b: the complex eddy operator solved by complex GMRES + AMS (through the new complex-direct
+    wiring — sparse ``A_r + i·A_i``, never the dense 2n block) matches the sparse-direct solve. This is
+    the σ=0-in-air ε-gauge regime, complex-symmetric ⇒ GMRES (not CG)."""
+    fem = _complex_eddy(0.3, freq=1e6, eps=1e-3)
+    x_lu = _solve(fem)  # default: complex sparse-LU on the real-equivalent block
+    x_ams = _solve(fem, linear=jno.solve.gmres(tol=1e-8, restart=120, maxiter=600), precond=jno.precond.ams())
+    assert x_ams.dtype == np.complex128
+    assert np.linalg.norm(x_ams - x_lu) / np.linalg.norm(x_lu) < 1e-8
+
+
 def test_ams_matches_direct_solve_through_fem_solve():
     """fem.solve(linear=cg, precond=ams()) reproduces the sparse-direct solve — the spec is wired
     end-to-end (prepare builds G/Π from the mesh, materialize assembles the nodal aux, CG converges)."""

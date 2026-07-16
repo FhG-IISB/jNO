@@ -394,6 +394,8 @@ def amg(*, cycles: int = 1, max_levels: int = 10, coarse_size: int = 100, smooth
 class _AMS:
     """Spec for the H(curl) auxiliary-space Maxwell (AMS) preconditioner; see :func:`ams`."""
 
+    complex_native = True  # solve the COMPLEX operator directly (not the real-equivalent 2n block)
+
     def __init__(self, aux):
         self.aux = aux  # jno.solve LinearSolver for the nodal auxiliary solves (None -> lu())
         self._G = None  # discrete gradient (node->edge), built once from the mesh topology
