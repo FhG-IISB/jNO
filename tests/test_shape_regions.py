@@ -90,6 +90,36 @@ def test_regions_requires_two_regions_of_same_dim():
         jno.Shape.regions(a=jno.Shape.rect(0, 0, 1, 1), b=jno.Shape.box(0, 0, 0, 1, 1, 1))
 
 
+def test_name_plus_operator_matches_regions():
+    """``a.name(x) + b.name(y)`` is sugar for ``Shape.regions(x=a, y=b)`` — same plan."""
+    core = jno.Shape.disk(1, 0.5, 0.3)
+    plate = jno.Shape.rect(0, 0, 2, 1)
+    plus = core.name("inclusion") + plate.name("matrix")
+    kw = jno.Shape.regions(inclusion=core, matrix=plate)
+    assert plus._node[0] == "regions"
+    assert [n for n, _ in plus._node[1]] == [n for n, _ in kw._node[1]] == ["inclusion", "matrix"]
+
+
+def test_name_survives_sized():
+    """``.sized()`` after ``.name()`` keeps the region label (mesh size rides along)."""
+    d = (jno.Shape.disk(1, 0.5, 0.3).name("core").sized(0.05) + jno.Shape.rect(0, 0, 2, 1).name("bg")).domain()
+    assert d._mesh_pool["core"].shape[0] > 0
+    assert d._mesh_pool["bg"].shape[0] > 0
+
+
+def test_plus_is_nary_with_priority_order():
+    a = jno.Shape.disk(0.5, 0.5, 0.2).name("a")
+    b = jno.Shape.disk(1.5, 0.5, 0.2).name("b")
+    bg = jno.Shape.rect(0, 0, 2, 1).name("bg")
+    d = (a + b + bg).sized(0.08).domain()
+    assert {"a", "b", "bg"}.issubset(d._mesh_pool)
+
+
+def test_plus_requires_named_operands():
+    with pytest.raises(ValueError, match=r"\.name"):
+        _ = jno.Shape.disk(0, 0, 1) + jno.Shape.rect(0, 0, 1, 1)
+
+
 def test_fem_term_restricts_to_a_shape_region():
     """A ``jno.fem`` load written on the ``inclusion`` region integrates over that region's cells
     only: ``sum(b) ≈ area(disk)`` — exact because the mesh conforms to the interface."""

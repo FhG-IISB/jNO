@@ -18,7 +18,7 @@ from __future__ import annotations
 import itertools
 import math
 from dataclasses import dataclass, field
-from typing import Callable, FrozenSet, Tuple, Union
+from typing import Callable, FrozenSet, Optional, Tuple, Union
 
 import numpy as np
 
@@ -80,6 +80,7 @@ class Shape:
     _node: tuple
     dim: int
     _size: Size = field(default=None, compare=False)
+    _region_name: Optional[str] = field(default=None, compare=False)
 
     # ----- primitive constructors ------------------------------------------------
     @classmethod
@@ -124,16 +125,48 @@ class Shape:
         and the outer boundary keeps its auto-names; internal interface facets are not boundary.
 
         Regions may overlap: ``Shape.regions(inclusion=disk, matrix=plate)`` labels the disk
-        ``inclusion`` (higher priority) and the remainder ``matrix``. Must be the top-level shape
-        (call ``.domain()`` on it directly); it is not composable with boolean operators/transforms.
+        ``inclusion`` (higher priority) and the remainder ``matrix``. Equivalent to combining named
+        shapes with ``+`` — ``disk.name("inclusion") + plate.name("matrix")``. Must be the top-level
+        shape (call ``.domain()`` on it); it is not composable with boolean operators/transforms.
         """
-        if len(named) < 2:
-            raise ValueError("Shape.regions needs at least two named regions")
-        items = tuple(named.items())
+        return cls._from_region_items(tuple(named.items()))
+
+    @classmethod
+    def _from_region_items(cls, items) -> "Shape":
+        if len(items) < 2:
+            raise ValueError("a multi-material domain needs at least two named regions")
+        names = [n for n, _ in items]
+        if len(set(names)) != len(names):
+            raise ValueError(f"duplicate region name in {names}")
         dims = {sub.dim for _n, sub in items}
         if len(dims) != 1:
             raise ValueError(f"all regions must share one dimension, got {sorted(dims)}")
-        return cls(("regions", items), items[0][1].dim, None)
+        return cls(("regions", tuple(items)), items[0][1].dim, None)
+
+    def name(self, name: str) -> "Shape":
+        """Label this shape as a named material region, for combining with ``+`` (see :meth:`regions`).
+
+        ``core.name("core") + clad.name("clad")`` builds a multi-material domain whose regions are
+        ``core`` and ``clad``. Apply ``name`` last (a later transform drops the label)."""
+        return Shape(self._node, self.dim, self._size, str(name))
+
+    def _region_items(self):
+        """This shape as ``((name, shape), ...)`` region items — its own group, or a single named leaf."""
+        if self._node[0] == "regions":
+            return self._node[1]
+        if self._region_name is None:
+            raise ValueError("combine regions with '+' only after naming each with .name('...')")
+        return ((self._region_name, self),)
+
+    def __add__(self, other: "Shape") -> "Shape":
+        """Combine named regions into a conforming multi-material domain (sugar for :meth:`regions`).
+
+        ``a.name("x") + b.name("y")`` keeps ``a`` and ``b`` as distinct materials with a conforming
+        interface — unlike ``a | b`` (fuse), which merges them into one. Left-to-right order is region
+        priority; composes n-ary (``a + b + c``)."""
+        if not isinstance(other, Shape):
+            return NotImplemented
+        return Shape._from_region_items(self._region_items() + other._region_items())
 
     # ----- boolean operators -----------------------------------------------------
     def __sub__(self, other: "Shape") -> "Shape":
@@ -234,7 +267,7 @@ class Shape:
 
     def sized(self, size: Size) -> "Shape":
         """Return a copy of this shape with its target mesh size set (scalar or ``f(x,y,z)``)."""
-        return Shape(self._node, self.dim, size)
+        return Shape(self._node, self.dim, size, self._region_name)
 
     # ----- introspection (pure; used by emit + selection) ------------------------
     def leaves(self) -> Tuple[Tuple[object, Size, int], ...]:

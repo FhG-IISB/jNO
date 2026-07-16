@@ -117,26 +117,29 @@ there.
 
 ### Multi-material regions
 
-`Shape.regions(**named)` builds a **multi-material** domain: the named sub-shapes are fragmented so
-element edges align exactly with every material interface (a *conforming* mesh), and each cell is
-assigned to the first region — keyword order is priority — whose shape contains its centroid. Each
-region becomes its own variable set; the outer boundary keeps its auto-names and internal interface
-facets are not boundary.
+Name each material with `.name(...)` and combine with `+` to build a **multi-material** domain: the
+sub-shapes are fragmented so element edges align exactly with every material interface (a *conforming*
+mesh), and each cell is assigned to the first region — left-to-right order is priority — whose shape
+contains its centroid. Each region becomes its own variable set; the outer boundary keeps its
+auto-names and internal interface facets are not boundary.
 
 ```python
 plate = Shape.rect(0, 0, 2, 1)
 core  = Shape.disk(1, 0.5, 0.3)
-d = Shape.regions(inclusion=core, matrix=plate).sized(0.05).domain()
+d = (core.name("inclusion") + plate.name("matrix")).sized(0.05).domain()
 
 d.variable("inclusion")     # the disk's cells/points (a distinct material)
 d.variable("matrix")        # everything else
 d.boundary_tags()           # {left, right, top, bottom, boundary} — the plate's outer edges only
 ```
 
-Regions may overlap: here the disk overlaps the plate, and `inclusion` wins inside the disk because
-it is listed first. Use each region tag to restrict a `jno.fem` term or coefficient to that material
-(per-region volume integration), or to sample it in a PINN. `Shape.regions` is a top-level construct
-— call `.domain()` on it directly; it does not compose with boolean operators or transforms.
+`+` keeps the pieces as distinct materials with a conforming interface — unlike `|` (fuse), which
+merges them into one. It composes n-ary (`a + b + c`), and `Shape.regions(inclusion=core,
+matrix=plate)` is the equivalent keyword form. Regions may overlap: here the disk overlaps the plate,
+and `inclusion` wins inside the disk because it is listed first. Use each region tag to restrict a
+`jno.fem` term or coefficient to that material (per-region volume integration), or to sample it in a
+PINN. A multi-material shape is a top-level construct — call `.domain()` on it directly; it does not
+compose with boolean operators or transforms.
 
 ---
 
