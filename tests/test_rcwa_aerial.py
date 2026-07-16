@@ -434,3 +434,18 @@ def test_caresist_3d_end_to_end():
     dev = np.asarray(exp.develop(resist))
     assert dev.shape == (14, 14, 6) and np.all(np.isfinite(dev))
     assert dev.min() >= -1e-3 and dev.max() <= 1.0 + 1e-3
+
+
+@needs_fmmax
+def test_caresist_3d_is_differentiable_ilt():
+    """ILT through the 3-D PEB: jax.grad of a developed-volume loss w.r.t. the mask permittivity matches
+    finite difference through the WHOLE chain — RCWA solve → standing-wave bulk image → 3-D reaction-diffusion
+    PEB on a jno.Shape box → developed volume. The rigorous depth-resolved resist stays fully differentiable."""
+    cons, ep = _ilt_cons()
+    film = jno.litho.Film(n_resist=1.6, thickness=0.6, n_substrate=4.0, nz=4)
+    resist = jno.litho.CAResist(n=8, t_peb=10.0, steps=3, dill_c=4.0, diffusion_length=(0.12, 0.08), film=film)
+    node = jno.rcwa(cons, orders=30, grid=24, params={"ep": 2.0}).solve().printed(NA=0.6, source=0.5, resist=resist)
+    assert isinstance(node, FunctionCall)
+    g, fd = _grad_vs_fd(node, ep)
+    assert g == pytest.approx(fd, rel=5e-3)
+    assert abs(g) > 1e-4
