@@ -492,12 +492,14 @@ class TestDomainInference:
         crux = jno.core([pde])
         assert crux.domain is dom
 
-    def test_no_variables_raises(self):
-        # Pure parametric loss — no Variables means no domain to resolve.
+    def test_no_variables_uses_trivial_domain(self):
+        # Pure parametric / data-fit loss — no Variables, so no domain to sample. jno.core now treats this
+        # as a parameter-only fit (an inverse problem, or an ILT loss over a jno.fn-wrapped solver) and
+        # supplies a trivial domain instead of raising, so no placeholder domain is needed.
         param = jnn.parameter((1,), key=jax.random.PRNGKey(0), name="a")
         loss = (param - 1.0).mse
-        with pytest.raises(ValueError, match="no Variables or TensorTags"):
-            jno.core([loss])
+        crux = jno.core([loss])  # must NOT raise
+        assert crux.domain is not None  # a trivial domain was supplied
 
     def test_multi_domain_raises(self):
         dom_a, pde_a = self._tiny_domain_and_loss(mesh_size=0.1, key_seed=1)

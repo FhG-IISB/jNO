@@ -165,12 +165,29 @@ def _find_temporal_variable(expr: Placeholder):
     return visit(expr)
 
 
+_TRIVIAL_DOMAIN = None
+
+
+def _trivial_domain():
+    """A tiny placeholder domain for a **parameter-only fit** — a loss that references no domain Variable, e.g.
+    a pure data fit ``(pred(params) - obs).mse`` (an inverse problem, or an ILT loss over a solver wrapped as a
+    ``jno.fn``). There are no collocation coordinates to sample, so any domain works; this just satisfies the
+    collocation machinery. Built once and reused (read-only)."""
+    global _TRIVIAL_DOMAIN
+    if _TRIVIAL_DOMAIN is None:
+        from .geometry.shape import Shape
+
+        _TRIVIAL_DOMAIN = Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain()
+    return _TRIVIAL_DOMAIN
+
+
 def _infer_domain_from_constraints(constraints: List[Placeholder]):
     """Walk the constraint trees and return the unique domain referenced by
-    every Variable / TensorTag inside.
+    every Variable / TensorTag inside, or ``None`` when there is no domain
+    Variable at all (a parameter-only fit — the caller supplies a trivial domain).
 
-    Raises ``ValueError`` if zero (no Variables at all) or more than one
-    distinct domain is found — the caller must then pass ``domain=`` explicitly.
+    Raises ``ValueError`` if more than one distinct domain is found — the caller
+    must then pass ``domain=`` explicitly.
     """
     domains: list = []  # preserve insertion order for nicer error messages
     seen_domains: set = set()
@@ -215,11 +232,7 @@ def _infer_domain_from_constraints(constraints: List[Placeholder]):
     if not constraints:
         raise ValueError("jno.core requires at least one constraint.")
     if not domains:
-        raise ValueError(
-            "Cannot infer domain: no Variables or TensorTags were found in the "
-            "constraints. Every loss must reference at least one Variable so the "
-            "core can resolve its domain."
-        )
+        return None  # no domain Variable -> a parameter-only fit; the caller supplies a trivial domain
     raise ValueError(
         f"Cannot infer domain: constraints reference {len(domains)} distinct "
         f"domains ({domains!r}). All constraints must share a single domain."
@@ -492,6 +505,13 @@ class core:
             self.domain = domain
         elif constraints:
             self.domain = _infer_domain_from_constraints(constraints)
+            if self.domain is None:  # no domain Variable -> a parameter-only fit (e.g. an ILT/data-fit loss)
+                self.log.warning(
+                    "No domain Variable found in the constraints — treating this as a parameter-only fit and "
+                    "using a trivial domain. If the loss was meant to sample a domain, ensure it references a "
+                    "Variable or pass domain= explicitly."
+                )
+                self.domain = _trivial_domain()
         else:
             self.domain = None
         self.models: Dict[int, Any] = {}

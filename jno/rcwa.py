@@ -35,11 +35,31 @@ concrete fix. Two `fmmax` conventions are baked in: the Poynting flux is summed 
 ``abs()`` sum over-counts and yields ``T+R>1``), and ``JONES_DIRECT_FOURIER`` is the default
 factorization (the naive rule converges poorly for high-contrast dielectrics such as a-Si).
 
+Beyond a scalar ε, the front door also infers a **tensor permittivity** ``ε̂`` (from ``inner(ε̂ @ u, v)``)
+and an **in-plane PML** (a complex coordinate stretch ``S = 1 + iσ/k`` written into the stiffness
+coefficients of the scalar Helmholtz term). A uniaxial PML is exactly a diagonal Maxwell ``ε̂`` and ``μ̂``
+(``ε̂ = ε·Λ``, ``μ̂ = Λ``, ``Λ = diag(SᵧS_z/Sₓ, SₓS_z/Sᵧ, SₓSᵧ/S_z)``), so the traced stretch is honoured
+exactly and solved via `fmmax`'s general anisotropic eigensolve — turning a periodic supercell into an
+isolated scatterer (the absorbing frame decouples the walls).
+
+An **internal source** — a dipole / Gaussian emitter — is authored the same way you would drive `jno.fem`
+or a PINN: a forcing term in the residual, ``- f·v`` (scalar) or ``- inner(J, v)`` (vector current). The
+front door detects the trial-free/test-present volume summand, localizes it (centroid → point vs Gaussian
+width; which z-layer), splits the stack at the source plane, and drives `fmmax`'s ``amplitudes_for_source``.
+Then ``sol.power("up"|"down")`` and ``sol.extraction(...)`` give the emitted power and directionality (LED /
+Purcell physics) instead of plane-wave ``T``/``R``.
+
 References:
  * M. G. Moharam & T. K. Gaylord, "Rigorous coupled-wave analysis of planar-grating diffraction",
    J. Opt. Soc. Am. 71, 811 (1981).
  * M. G. Moharam, D. A. Pommet, E. B. Grann & T. K. Gaylord, "Stable implementation of the enhanced
    transmittance matrix approach", J. Opt. Soc. Am. A 12, 1077 (1995).
+ * W. C. Chew & W. H. Weedon, "A 3D perfectly matched medium from modified Maxwell's equations with
+   stretched coordinates", Microw. Opt. Technol. Lett. 7, 599 (1994) — the complex coordinate stretch.
+ * Z. S. Sacks, D. M. Kingsland, R. Lee & J.-F. Lee, "A perfectly matched anisotropic absorber for use
+   as an absorbing boundary condition", IEEE Trans. Antennas Propag. 43, 1460 (1995) — the uniaxial ε̂/μ̂ PML.
+ * A. Taflove et al. (eds.), "Advances in FDTD Computational Electrodynamics", Artech House (2013), ch. on
+   modal dipole sources in periodic media — the internal-source (``amplitudes_for_source``) formulation.
  * fmmax: https://github.com/facebookresearch/fmmax
 """
 
@@ -48,6 +68,9 @@ from dataclasses import dataclass, field
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+from jno.litho import Threshold  # default resist for the .develop() / .printed() lithography readout
+from jno.utils.profiling import annotate as _annot  # stage annotator for rc.solve(profile=True)
 
 
 def _concrete(x):
@@ -120,7 +143,7 @@ def detect_layers(E, z, tol=1e-3, slices=None):
         idx = np.linspace(0, Nz - 1, slices + 1).round().astype(int)
         slabs = [(idx[i], idx[i + 1]) for i in range(len(idx) - 1)]
 
-    layers, report, zmids = [], [], []
+    layers, report, zmids, zspans = [], [], [], []
     for i, (a, b) in enumerate(slabs):
         mid = (a + b) // 2
         var = float(np.max(np.abs(E[a:b] - E[mid])))
@@ -133,11 +156,13 @@ def detect_layers(E, z, tol=1e-3, slices=None):
         kind = "uniform" if np.ptp(eps_xy) < tol else "patterned"
         layers.append((thick, eps_xy))
         zmids.append(float(z[mid]))
+        zspans.append((float(z[a]), float(z[min(b - 1, Nz - 1)])))  # (z_lo, z_hi) -> place an internal source
         report.append(
             f"  layer {i}: z=[{z[a]:.3f},{z[min(b - 1, Nz - 1)]:.3f}] {kind} eps~[{eps_xy.min():.2f},{eps_xy.max():.2f}]"
         )
     detect_layers.last_report = "detected layers:\n" + "\n".join(report)
     detect_layers.last_zmid = zmids  # representative z of each layer -- lets a param sweep re-sample eps
+    detect_layers.last_zspan = zspans  # (z_lo, z_hi) per layer -- lets an internal source split its layer
     return layers
 
 
@@ -185,6 +210,21 @@ class _Sol:
         )
         return (tf[i] + tf[i + self._nt]) / self._Pin
 
+    def _input_pol(self, pol):
+        """0th-order forward incident amplitude for an input polarization (``"x"`` or ``"y"``), built as a
+        UNIFORM real-space plane wave (x-pol E=x̂,H=ŷ; y-pol E=ŷ,H=-x̂, both forward) and decomposed at k_in.
+        Working in the field basis (not the eigenvalue-sorted eigenmode basis) avoids an argmax(flux) pick
+        grabbing the wrong oblique mode for an asymmetric structure. jax-native (traces under grad/jit)."""
+        fm = self._fm
+        gs = fm.min_array_shape_for_expansion(self._ex)
+        _u = jnp.ones((*gs, 1), complex)
+        _z = jnp.zeros((*gs, 1), complex)
+        if pol == "x":
+            return jnp.reshape(fm.amplitudes_for_fields(_u, _z, _z, _u, self._layers[0])[0], (2 * self._nt, 1))
+        if pol == "y":
+            return jnp.reshape(fm.amplitudes_for_fields(_z, _u, -_u, _z, self._layers[0])[0], (2 * self._nt, 1))
+        raise RcwaError(f"polarization must be 'x' or 'y', got {pol!r}")
+
     def jones(self, kind="T"):
         """The 2×2 complex **Jones matrix** at the 0th diffraction order — how the structure maps incident
         polarization to transmitted (``"T"``) or reflected (``"R"``) polarization.
@@ -197,28 +237,14 @@ class _Sol:
         Jones basis — for the 0th order at normal incidence they are the two in-plane axes (≈ x, y); an
         isotropic stack gives a diagonal ``J`` (no conversion), an in-plane-anisotropic one an off-diagonal
         ``J`` (polarization conversion). Differentiable in the design. Returns a JAX ``(2, 2)`` array."""
-        fm, nt = self._fm, self._nt
-        if kind == "T":
-            smat, out_layer = self._s.s11, self._layers[-1]
-        elif kind == "R":
-            smat, out_layer = self._s.s21, self._layers[0]
-        else:
-            raise RcwaError(f"jones(kind): kind must be 'T' or 'R', got {kind!r}")
-        flux_in = jnp.abs(jnp.real(jnp.reshape(fm.eigenmode_poynting_flux(self._layers[0]), (-1,))))
-        flux_out = jnp.abs(jnp.real(jnp.reshape(fm.eigenmode_poynting_flux(out_layer), (-1,))))
-        # fmmax orders eigenmodes by eigenvalue, not by Fourier order — the 0th order's two polarizations are
-        # the two most-forward (largest-flux) ambient modes. The ambient is design-independent, so the two
-        # indices are fixed geometry (read eagerly); the amplitudes/normalisation stay JAX (differentiable).
-        order = np.argsort(-np.asarray(flux_in))
-        pa, pb = int(order[0]), int(order[1])
-        if _concrete(flux_in) and float(flux_in[pb]) <= 1e-9 * float(flux_in[pa] + 1e-30):
-            raise RcwaError("only one forward-propagating polarization at the 0th order; the Jones matrix is degenerate.")
 
-        def col(p):  # transmitted/reflected 0th-order amplitudes for a unit-power input in polarization p
-            amp = jnp.reshape(smat @ jnp.zeros((2 * nt, 1), complex).at[p, 0].set(1.0), (-1,))
-            return jnp.stack([amp[pa] * jnp.sqrt(flux_out[pa] / flux_in[p]), amp[pb] * jnp.sqrt(flux_out[pb] / flux_in[p])])
+        def out0(pol):  # the 0th-order (E_x, E_y) of the output field for this input plane wave
+            ex, ey = self._spectrum(kind, fwd=self._input_pol(pol))
+            return ex[0], ey[0]  # (0,0) is expansion index 0
 
-        return jnp.stack([col(pa), col(pb)], axis=1)  # (out q, in p)
+        exx, eyx = out0("x")  # input x-pol -> output (E_x, E_y)
+        exy, eyy = out0("y")  # input y-pol -> output (E_x, E_y)
+        return jnp.array([[exx, exy], [eyx, eyy]])  # J[out q, in p]
 
     def field(self, y_frac=0.5, nx=80, density=40.0):
         """Reconstruct the real-space electric field on a vertical (x–z) slice at ``y = y_frac·Py``.
@@ -242,6 +268,261 @@ class _Sol:
         zc = np.asarray(z).reshape(-1)
         layer_z = list(np.cumsum([float(t) for t in self._thick]))[:-1]
         return slab, [0.0, float(self._period[0]), float(zc.min()), float(zc.max())], layer_z
+
+    def _spectrum(self, kind="T", fwd=None):
+        """The complex diffraction spectrum for imaging: the transverse E-field Fourier coefficients
+        ``(ex, ey)`` per diffraction order (transmitted ``"T"`` or reflected ``"R"``), for the corrected
+        0th-order incidence (or a supplied input amplitude ``fwd``). ``(0,0)`` is expansion index 0."""
+        fm = self._fm
+        if kind == "T":
+            smat, layer = self._s.s11, self._layers[-1]
+        elif kind == "R":
+            smat, layer = self._s.s21, self._layers[0]
+        else:
+            raise RcwaError(f"kind must be 'T' or 'R', got {kind!r}")
+        amp = smat @ (self._fwd if fwd is None else fwd)
+        zero = jnp.zeros_like(amp)
+        fa, ba = (amp, zero) if kind == "T" else (zero, amp)  # T -> forward in substrate; R -> backward in super
+        (ex, ey, _ez), _ = fm.fields_from_wave_amplitudes(fa, ba, layer)
+        return jnp.reshape(ex, (-1,)), jnp.reshape(ey, (-1,))
+
+    def aerial(self, NA, source=0.7, defocus=0.0, grid=128, kind="T", polarization=None):
+        """Partially-coherent **aerial image** (wafer-plane intensity) of this mask, by **Abbe** source
+        integration -- the litho imaging step on top of the rigorous RCWA mask diffraction.
+
+        The mask's diffraction orders (this solution's spectrum) are projected through a lens of numerical
+        aperture ``NA``, summed over the illumination ``source``. Everything (wavelength, period, the complex
+        mask spectrum) is read from the solve; only the optics are yours.
+
+        Parameters
+        ----------
+        NA:
+            Numerical aperture of the projection lens (an order passes the pupil when its direction cosine
+            ``|α| ≤ NA``).
+        source:
+            Illumination. A **float** ``σ`` → conventional (a filled disk of partial-coherence radius ``σ``);
+            a **(σ_in, σ_out) tuple** → annular; a raw **array** of pupil weights (differentiable, for
+            source-mask optimization).
+        defocus:
+            Defocus (same length unit as the geometry); applies the quadratic pupil phase.
+        grid:
+            Real-space resolution of the returned image (one period).
+        kind:
+            ``"T"`` (transmissive DUV mask, default) or ``"R"`` (reflective EUV mask).
+        polarization:
+            ``None`` (default) → **scalar** imaging (uses ``E_x``), correct at low NA. A string turns on the
+            **vector high-NA** model, which rotates each order's transverse ``(E_x, E_y)`` to the 3-D wafer
+            field through the Richards-Wolf/Flagello vector pupil (so the TM component loses contrast at large
+            angles): ``"x"`` / ``"y"`` → linearly polarized illumination; ``"unpolarized"`` → the two averaged.
+
+        Returns
+        -------
+        A ``(grid, grid)`` JAX intensity array over one period -- differentiable in the mask design and the
+        source, so ``jax.grad`` of a printed-vs-target loss drives OPC / ILT / SMO.
+
+        Notes
+        -----
+        Uses the shift-invariant (Kirchhoff-like) Abbe sum on this single solve's rigorous spectrum; full
+        angular rigor (re-solving the mask per source point) is a heavier option. The vector pupil follows
+        Flagello, Milster & Rosenbluth, *J. Opt. Soc. Am. A* **13**, 53 (1996), with the aplanatic
+        ``1/√(cosθ)`` apodization; at NA→0 it reduces to the scalar image.
+        """
+        wl = self._wl  # may be a tracer (a wavelength parameter) -- keep jax-native
+        Px, Py = float(self._period[0]), float(self._period[1])
+        bc = np.asarray(self._ex.basis_coefficients)  # (nt, 2) static (m, n)
+        M = int(np.abs(bc).max())
+        grid = max(int(grid), 2 * M + 2)
+        ms = jnp.asarray(np.arange(-M, M + 1))
+        AX, AY = jnp.meshgrid(ms * wl / Px, ms * wl / Py, indexing="ij")  # α (direction cosine) per order
+        S, W = _source_grid(source, float(NA))
+        c = grid // 2
+
+        def _grid(vals):  # scatter an order-indexed spectrum onto the (2M+1)² frequency grid
+            return jnp.zeros((2 * M + 1, 2 * M + 1), complex).at[bc[:, 0] + M, bc[:, 1] + M].set(vals)
+
+        def _place(Apad):  # embed a pupil-weighted spectrum and inverse-FFT to a real-space field
+            pad = jnp.zeros((grid, grid), complex).at[c - M : c + M + 1, c - M : c + M + 1].set(Apad)
+            return jnp.fft.ifft2(jnp.fft.ifftshift(pad)) * (grid * grid)
+
+        if polarization is None:  # scalar imaging (E_x only)
+            A = _grid(self._spectrum(kind)[0])
+
+            def one(s):  # image from a single source point s (a shift of the order frequencies)
+                r2 = (AX + s[0]) ** 2 + (AY + s[1]) ** 2
+                pupil = jnp.where(r2 <= NA**2, jnp.exp(-1j * jnp.pi * wl * defocus * r2), 0.0)
+                return jnp.abs(_place(A * pupil)) ** 2
+
+            imgs = jax.vmap(one)(S)  # (Ns, grid, grid)
+            return jnp.sum(W[:, None, None] * imgs, axis=0) / jnp.sum(W)
+
+        # Vector (high-NA) imaging: rotate each order's transverse (E_x, E_y) to the 3-D wafer field via the
+        # Richards-Wolf/Flagello vector pupil (below). Average the incoherent images of the requested input
+        # polarizations. At NA→0 the pupil is the identity and this reduces to |E_x|²+|E_y|² == the scalar image.
+        pols = ("x", "y") if polarization == "unpolarized" else (polarization,)
+        specs = [(_grid(ex), _grid(ey)) for ex, ey in (self._spectrum(kind, fwd=self._input_pol(p)) for p in pols)]
+
+        def one(s):
+            ax, ay = AX + s[0], AY + s[1]
+            r2 = ax**2 + ay**2
+            passes = r2 <= NA**2
+            # sinθ / cosθ via a double-`where` safe sqrt: √ is only ever evaluated at a strictly-positive
+            # argument, so its reverse-mode `1/(2√·)` never hits the 0th-order (r2=0) or grazing (r2=1)
+            # singularity. rho/cth are constant in the design, but an unguarded √0 grad still poisons the sum.
+            s2 = jnp.clip(r2, 0.0, 1.0)
+            rho = jnp.where(s2 > 0.0, jnp.sqrt(jnp.where(s2 > 0.0, s2, 1.0)), 0.0)  # sinθ
+            c2 = jnp.clip(1.0 - r2, 0.0, 1.0)
+            cth = jnp.where(c2 > 0.0, jnp.sqrt(jnp.where(c2 > 0.0, c2, 1.0)), 0.0)  # cosθ
+            safe = rho > 1e-9
+            cf = jnp.where(safe, ax / jnp.where(safe, rho, 1.0), 1.0)  # cosφ (azimuth)
+            sf = jnp.where(safe, ay / jnp.where(safe, rho, 1.0), 0.0)  # sinφ
+            apod = jnp.where(  # defocus phase × aplanatic 1/√(cosθ), gated by the pupil
+                passes, jnp.exp(-1j * jnp.pi * wl * defocus * r2) / jnp.sqrt(jnp.where(passes, cth, 1.0)), 0.0
+            )
+            m00, m01, m11 = cf**2 * cth + sf**2, cf * sf * (cth - 1.0), sf**2 * cth + cf**2
+            m20, m21 = -rho * cf, -rho * sf
+            tot = jnp.zeros((grid, grid))
+            for Ax, Ay in specs:
+                ux, uy = Ax * apod, Ay * apod
+                ewx, ewy, ewz = _place(m00 * ux + m01 * uy), _place(m01 * ux + m11 * uy), _place(m20 * ux + m21 * uy)
+                tot = tot + jnp.abs(ewx) ** 2 + jnp.abs(ewy) ** 2 + jnp.abs(ewz) ** 2
+            return tot / len(specs)
+
+        imgs = jax.vmap(one)(S)
+        return jnp.sum(W[:, None, None] * imgs, axis=0) / jnp.sum(W)
+
+    def expose(self, NA, source=0.7, defocus=0.0, grid=128, kind="T", polarization=None):
+        """The **optical exposure** of this mask at the wafer plane -- the imaging result before any resist.
+
+        Returns an :class:`_Exposure` (optics only: :meth:`_Exposure.intensity` = the aerial image,
+        :meth:`_Exposure.spectrum` = the diffraction-order angular spectrum). Turn it into a developed
+        pattern with ``exposure.develop(resist)`` for a resist model (:class:`jno.litho.Threshold`, or a
+        rigorous PEB model). The imaging arguments ``NA … polarization`` are exactly :meth:`aerial`'s."""
+        return _Exposure(self, (NA, source, defocus, grid, kind, polarization))
+
+    def printed(self, NA, source=0.7, defocus=0.0, grid=128, kind="T", polarization=None, resist=None):
+        """Developed **resist image** (the printed pattern) -- a one-call shortcut for
+        ``expose(...).develop(resist)``. ``resist`` defaults to :class:`jno.litho.Threshold` (the fast
+        constant-threshold + PEB-diffusion model). Differentiable in the mask + source, so ``jax.grad`` of a
+        printed-vs-target loss drives **OPC / ILT / SMO** back through development, imaging *and* the RCWA
+        mask solve. Pass a different resist model (e.g. a rigorous reaction-diffusion PEB) to swap physics
+        without changing the call."""
+        return self.expose(NA, source, defocus, grid, kind, polarization).develop(resist or Threshold())
+
+    def _bulk(self, cfg, film):
+        """Standing-wave **bulk image** ``|E(x, y, z)|²`` inside the resist film. Each diffraction order (a
+        plane wave at direction cosine ``(α, β)``) is refracted into the film (``k_z = k0·√(n_r² − α² − β²)``,
+        complex ⇒ absorption) and interferes with its substrate reflection ``r_s``, producing the vertical
+        standing wave. Reuses the aerial Abbe sum with a per-order depth factor; returns ``(grid, grid, nz)``.
+        Scalar (``E_x``); single-substrate-reflection model (the dominant standing wave)."""
+        NA, source, defocus, grid, kind, _polarization = cfg
+        wl = self._wl
+        Px, Py = float(self._period[0]), float(self._period[1])
+        bc = np.asarray(self._ex.basis_coefficients)
+        M = int(np.abs(bc).max())
+        grid = max(int(grid), 2 * M + 2)
+        A = jnp.zeros((2 * M + 1, 2 * M + 1), complex).at[bc[:, 0] + M, bc[:, 1] + M].set(self._spectrum(kind)[0])
+        ms = jnp.asarray(np.arange(-M, M + 1))
+        AX, AY = jnp.meshgrid(ms * wl / Px, ms * wl / Py, indexing="ij")
+        S, W = _source_grid(source, float(NA))
+        c = grid // 2
+        k0 = 2.0 * jnp.pi / wl
+        n_r, n_s, n_top = complex(film.n_resist), complex(film.n_substrate), complex(getattr(film, "n_top", 1.0))
+        d, nz = float(film.thickness), int(getattr(film, "nz", 16))
+        zs = jnp.linspace(0.0, d, nz)
+        r_s, t_top = (n_r - n_s) / (n_r + n_s), 2.0 * n_top / (n_top + n_r)  # substrate reflection + top transmission
+
+        def plane(s, z):  # one source point, one depth -> |E(x, y, z)|²
+            a2 = (AX + s[0]) ** 2 + (AY + s[1]) ** 2
+            kz = k0 * jnp.sqrt(n_r**2 - a2 + 0j)  # z-wavevector in the resist (complex ⇒ depth absorption)
+            fz = t_top * (jnp.exp(1j * kz * z) + r_s * jnp.exp(1j * kz * (2.0 * d - z)))  # down + substrate-reflected up
+            pupil = jnp.where(a2 <= NA**2, jnp.exp(-1j * jnp.pi * wl * defocus * a2) * fz, 0.0)
+            pad = jnp.zeros((grid, grid), complex).at[c - M : c + M + 1, c - M : c + M + 1].set(A * pupil)
+            return jnp.abs(jnp.fft.ifft2(jnp.fft.ifftshift(pad)) * (grid * grid)) ** 2
+
+        imgs = jax.vmap(lambda s: jax.vmap(lambda z: plane(s, z))(zs))(S)  # (Ns, nz, grid, grid)
+        vol = jnp.sum(W[:, None, None, None] * imgs, axis=0) / jnp.sum(W)  # (nz, grid, grid)
+        return jnp.moveaxis(vol, 0, -1)  # (grid, grid, nz): x, y, depth
+
+
+class _Exposure:
+    """The **optical exposure** at the wafer plane (from :meth:`_Sol.expose`) -- optics only, no resist. A
+    resist model (any callable ``exposure -> developed field``) is applied with :meth:`develop`; the fast
+    :class:`jno.litho.Threshold` reads :meth:`intensity`, a depth-resolved resist reads :meth:`bulk` (the
+    standing-wave field inside the film). Keeping the exposure resist-agnostic is what lets new resist models
+    plug in without touching the imaging code."""
+
+    def __init__(self, sol, cfg):
+        self._sol, self._cfg = sol, cfg
+        self.period = (float(sol._period[0]), float(sol._period[1]))
+
+    def intensity(self):
+        """The **aerial image** ``|E|²`` at the wafer -- a ``(grid, grid)`` JAX array (see :meth:`_Sol.aerial`;
+        the exposure's imaging config is applied). What a constant-threshold resist develops."""
+        return self._sol.aerial(*self._cfg)
+
+    def bulk(self, film):
+        """The **standing-wave bulk image** ``|E(x, y, z)|²`` inside the resist ``film`` -- the aerial spectrum
+        propagated into the film so each order interferes with its substrate reflection (the vertical standing
+        wave) and decays by absorption (a complex resist index). ``film`` supplies ``n_resist`` (complex for
+        absorption), ``thickness``, ``n_substrate``, optional ``n_top`` (default 1) and ``nz`` (depth samples;
+        default 16) -- e.g. :class:`jno.litho.Film`. Returns a ``(grid, grid, nz)`` JAX array. At ``z = 0`` with
+        no substrate reflection it equals :meth:`intensity`. The depth-resolved input a rigorous 3-D resist
+        develops; scalar (``E_x``), single-substrate-reflection model (full multilayer Airy is a refinement)."""
+        return self._sol._bulk(self._cfg, film)
+
+    def develop(self, resist):
+        """Apply a **resist model** -- any callable ``exposure -> developed field`` (the fast
+        :class:`jno.litho.Threshold`, or a rigorous PEB model). Equivalent to ``resist(self)``."""
+        return resist(self)
+
+
+def _source_grid(source, NA, ns=15):
+    """Illumination source as (points, weights) on a pupil grid, for the Abbe sum. ``source`` is a float
+    (conventional disk of coherence radius σ), a (σ_in, σ_out) tuple (annular), or a raw weight array."""
+    if not np.isscalar(source) and not isinstance(source, tuple):  # a raw pupil-weight array
+        w = jnp.asarray(source).reshape(-1)
+        ns = int(round(float(w.size) ** 0.5))
+    sp = np.linspace(-NA, NA, ns)
+    SX, SY = np.meshgrid(sp, sp, indexing="ij")
+    S = jnp.asarray(np.stack([SX.ravel(), SY.ravel()], 1))  # (ns², 2)
+    rn = np.hypot(np.asarray(SX).ravel(), np.asarray(SY).ravel()) / NA  # coherence radius σ per point
+    if np.isscalar(source):
+        W = jnp.asarray((rn <= float(source)).astype(float))  # conventional disk
+    elif isinstance(source, tuple):
+        W = jnp.asarray(((rn >= source[0]) & (rn <= source[1])).astype(float))  # annular
+    else:
+        W = jnp.asarray(source).reshape(-1)  # arbitrary (differentiable for SMO)
+    return S, W
+
+
+class _EmitterSol:
+    """Readouts for an internal-source (dipole / Gaussian) emission solve: the power radiated **up** (into
+    the superstrate) and **down** (into the substrate), and the **extraction** fraction into either side.
+
+    ``power`` is in the source's own (un-normalised) units, so it scales with the source amplitude² -- useful
+    as a relative objective and differentiable in the amplitude / orientation / design ε. ``extraction`` is
+    the scale-free fraction ``up/(up+down)`` (or ``down/…``) -- the LED/emitter directionality figure of
+    merit. (Purcell / LDOS -- total emitted power ÷ a homogeneous-medium reference -- is future work.)"""
+
+    def __init__(self, up, down):
+        self._up, self._down = up, down
+
+    def power(self, kind="total"):
+        if kind == "up":
+            return self._up
+        if kind == "down":
+            return self._down
+        if kind == "total":
+            return self._up + self._down
+        raise RcwaError(f"power(kind): kind must be 'up' | 'down' | 'total', got {kind!r}")
+
+    def extraction(self, kind="up"):
+        total = self._up + self._down
+        if kind == "up":
+            return self._up / total
+        if kind == "down":
+            return self._down / total
+        raise RcwaError(f"extraction(kind): kind must be 'up' | 'down', got {kind!r}")
 
 
 class Rcwa:
@@ -299,29 +580,40 @@ class Rcwa:
         self._ex = fm.generate_expansion(self._lv, approximate_num_terms=orders)
         self._nt = self._ex.num_terms
 
-    def solve(self, inc=None, wavelength=None, k_in=None, layers=None):
-        """Solve the stack and return a :class:`_Sol`. Raises if the wavelength is unknown or energy is
-        not conserved.
+    def _eigensolve_stack(self, layers_spec, wl, kin):
+        """Eigensolve every layer (isotropic / anisotropic-ε / general ε&μ, by tuple length) and return the
+        ``LayerSolveResult`` list plus the thickness list. Shared by the plane-wave and internal-source paths."""
+        fm, lv, ex = self.fm, self._lv, self._ex
+        kin = jnp.asarray(kin)
+        wl = jnp.asarray(wl).astype(kin.dtype)  # wl at the incidence real precision
+        cdt = jnp.result_type(kin.dtype, jnp.complex64)  # one complex dtype for the eigensolve (robust to a
 
-        ``layers`` optionally overrides the construction layer stack with ``[(thickness, eps), ...]`` at
-        solve time -- pass JAX permittivity grids here to differentiate the solve in the design (the
-        construction-time shape guards run once, eagerly, so the solve itself stays trace-clean)."""
-        fm = self.fm
-        wl = wavelength if wavelength is not None else self.wavelength
-        if wl is None:
-            raise RcwaError(
-                "wavelength is unknown: pass wavelength= to solve() or at construction; it sets every "
-                "layer's eigenmodes and is never defaulted."
-            )
-        layers_spec = self.layers_spec if layers is None else layers
-        kin = jnp.asarray(self.k_in if k_in is None else k_in, float)  # jax -> incidence angle is differentiable
-        lv, ex, nt = self._lv, self._ex, self._nt  # precomputed eagerly in __init__ (jit-safe)
-
-        def _grid(g):
-            g = jnp.asarray(g) + 0j  # jax-native so a permittivity grid flows -> differentiable in ε
+        def _grid(g):  # float32 design parameter, e.g. when trained through jno.core, vs float64 wavevectors)
+            g = jnp.asarray(g).astype(cdt)  # jax-native so a permittivity grid flows -> differentiable in ε
             return jnp.full((1, 1), g) if g.ndim == 0 else g
 
         def solve_layer(e):
+            # general anisotropic layer: e = (ε_xx..ε_zz, μ_xx..μ_zz) -> ε AND μ tensors. Used for a uniaxial
+            # PML (an in-plane coordinate stretch is a diagonal ε̂ and μ̂), and for magnetic / magneto-optic media.
+            if isinstance(e, tuple) and len(e) == 10:
+                exx, exy, eyx, eyy, ezz, uxx, uxy, uyx, uyy, uzz = (_grid(c) for c in e)
+                return fm.eigensolve_general_anisotropic_media(
+                    jnp.asarray(wl),
+                    kin,
+                    lv,
+                    exx,
+                    exy,
+                    eyx,
+                    eyy,
+                    ezz,
+                    uxx,
+                    uxy,
+                    uyx,
+                    uyy,
+                    uzz,
+                    ex,
+                    formulation=self.formulation,
+                )
             # anisotropic layer: e = (ε_xx, ε_xy, ε_yx, ε_yy, ε_zz) grids -> fmmax's anisotropic eigensolve
             if isinstance(e, tuple) and len(e) == 5:
                 exx, exy, eyx, eyy, ezz = (_grid(c) for c in e)
@@ -332,19 +624,49 @@ class Rcwa:
 
         layers = [solve_layer(e) for _, e in layers_spec]
         thick = [jnp.asarray(1.0 if t is None or t == np.inf else t) for t, _ in layers_spec]
-        s = fm.stack_s_matrix(layers, thick)
-        # Incidence: excite the genuinely forward-propagating mode in the superstrate and normalise by
-        # ITS flux. fmmax sorts eigenmodes by eigenvalue, so index 0 need not be the 0th forward order,
-        # and a one-hot forward amplitude can carry zero forward flux -- pick the max-positive-flux mode.
-        # (The superstrate is design-independent, so this is effectively constant, but stays jax-native so
-        # the whole solve traces under grad/jit.)
-        flux_sup = jnp.real(jnp.reshape(fm.eigenmode_poynting_flux(layers[0]), (-1,)))
-        idx = jnp.argmax(flux_sup)
-        Pin = flux_sup[idx]
+        return layers, thick
+
+    def solve(self, inc=None, wavelength=None, k_in=None, layers=None, source=None):
+        """Solve the stack and return a :class:`_Sol`. Raises if the wavelength is unknown or energy is
+        not conserved.
+
+        ``layers`` optionally overrides the construction layer stack with ``[(thickness, eps), ...]`` at
+        solve time -- pass JAX permittivity grids here to differentiate the solve in the design (the
+        construction-time shape guards run once, eagerly, so the solve itself stays trace-clean).
+
+        ``source`` (a dict built by the front door) drives an **internal-source** emission solve instead of
+        plane-wave incidence -- see :meth:`_solve_source`; it returns an :class:`_EmitterSol`."""
+        fm = self.fm
+        wl = wavelength if wavelength is not None else self.wavelength
+        if wl is None:
+            raise RcwaError(
+                "wavelength is unknown: pass wavelength= to solve() or at construction; it sets every "
+                "layer's eigenmodes and is never defaulted."
+            )
+        layers_spec = self.layers_spec if layers is None else layers
+        kin = jnp.asarray(self.k_in if k_in is None else k_in, float)  # jax -> incidence angle is differentiable
+        nt = self._nt  # precomputed eagerly in __init__ (jit-safe)
+        if source is not None:
+            return self._solve_source(source, layers_spec, wl, kin)
+        with _annot("rcwa:eigensolve"):
+            layers, thick = self._eigensolve_stack(layers_spec, wl, kin)
+        with _annot("rcwa:s_matrix"):
+            s = fm.stack_s_matrix(layers, thick)
+        # Incidence: the 0th diffraction order (at k_in) -- an x-polarised plane wave whose REAL-SPACE field
+        # is uniform. `argmax(eigenmode flux)` is wrong here: the (0,0) order does NOT carry the max eigenmode
+        # flux (the oblique first-ring orders can tie higher), so argmax would excite an oblique mode and tilt
+        # the incidence -- invisible in symmetric problems but wrong for anything direction-sensitive.
+        # `amplitudes_for_fields` divides out the Bloch phase, so a uniform E_x, H_y = E_x field decomposes to
+        # the forward 0th-order amplitude at k_in (jax-native, so the solve still traces under grad/jit).
+        gs = fm.min_array_shape_for_expansion(self._ex)
+        _u = jnp.ones((*gs, 1), complex)
+        _z = jnp.zeros((*gs, 1), complex)
+        fwd_amp, _bwd = fm.amplitudes_for_fields(_u, _z, _z, _u, layers[0])  # x-pol, H=+y -> forward-going
+        fwd = jnp.reshape(fwd_amp, (2 * nt, 1))
+        Pin = jnp.sum(jnp.real(fm.directional_poynting_flux(fwd, jnp.zeros_like(fwd), layers[0])[0]))
         if _concrete(Pin) and float(Pin) <= 0:
             raise RcwaError("no forward-propagating incident mode in the superstrate; check wavelength/period.")
-        fwd = jnp.zeros((2 * nt, 1), complex).at[idx, 0].set(1.0)
-        sol = _Sol(fm, s, layers, ex, nt, Pin, wl, thick=thick, period=self.period)
+        sol = _Sol(fm, s, layers, self._ex, nt, Pin, wl, thick=thick, period=self.period)
         sol._fwd = fwd
         T, R = sol.efficiency("T"), sol.efficiency("R")
         if _concrete(T):  # never-silent runtime guards run on the eager forward pass; they step aside under trace
@@ -361,6 +683,47 @@ class Rcwa:
                 )
         return sol
 
+    def _solve_source(self, source, layers_spec, wl, kin):
+        """Internal-source (dipole / Gaussian) emission solve. ``source`` is a dict from the front door::
+
+            {x0, y0, layer, t_upper, t_lower, kind ('delta'|'gaussian'), fwhm, orient (ox,oy,oz), amp}
+
+        The stack is split at the source plane (layer ``layer`` divided into ``t_upper`` above / ``t_lower``
+        below the source), fmmax builds the dipole current ``(jx,jy,jz) = amp·orient·source_coeffs`` and
+        ``amplitudes_for_source`` propagates it to the ambients. Returns an :class:`_EmitterSol` with the
+        power radiated up / down (differentiable in ``amp``, ``orient`` and the design ε)."""
+        fm, lv, ex = self.fm, self._lv, self._ex
+        with _annot("rcwa:eigensolve"):
+            layers, thick = self._eigensolve_stack(layers_spec, wl, kin)
+        si = source["layer"]
+        tu, tl = jnp.asarray(source["t_upper"]), jnp.asarray(source["t_lower"])  # z-split thicknesses (differentiable)
+        before = layers[: si + 1]
+        after = layers[si:]
+        before_t = [*thick[:si], tu]
+        after_t = [tl, *thick[si + 1 :]]
+        s_before = fm.stack_s_matrix(before, before_t)
+        s_after = fm.stack_s_matrix(after, after_t)
+        loc = jnp.asarray(source["loc"])  # (1, 2) lateral location -- JAX, so an emitter-placement param flows
+        if source["kind"] == "gaussian":
+            base = fm.gaussian_source(jnp.asarray(source["fwhm"]), loc, kin, lv, ex)
+        else:
+            base = fm.dirac_delta_source(loc, kin, lv, ex)
+        ox, oy, oz = source["orient"]
+        amp = jnp.asarray(source["amp"]) + 0j
+        jx, jy, jz = amp * ox * base, amp * oy * base, amp * oz * base
+        bwd0, _, _, _, _, fN = fm.amplitudes_for_source(jx, jy, jz, s_before, s_after)
+        # power emitted up = backward-going flux in the superstrate; down = forward-going flux in the substrate
+        _, ub = fm.directional_poynting_flux(jnp.zeros_like(bwd0), bwd0, layers[0])
+        df, _ = fm.directional_poynting_flux(fN, jnp.zeros_like(fN), layers[-1])
+        up = jnp.abs(jnp.sum(jnp.real(ub)))
+        down = jnp.abs(jnp.sum(jnp.real(df)))
+        if _concrete(up) and not (np.isfinite(float(up)) and np.isfinite(float(down))):
+            raise RcwaError(
+                "non-finite emission (NaN/inf): the internal-source solve hit a Γ-point / Rayleigh degeneracy "
+                f"(k_in={tuple(float(k) for k in kin)}). Nudge k_in off exact normal, e.g. k_in=(1e-3, 1e-3)."
+            )
+        return _EmitterSol(up, down)
+
 
 # =====================================================================================
 # Front door: infer an RCWA problem from a jNO constraint list / FEM problem + eps.
@@ -376,6 +739,7 @@ class RcwaSpec:
     source_face: str = ""
     ambient_faces: tuple = ()
     periodic_axes: dict = field(default_factory=dict)
+    source: dict = None  # an internal-source (dipole/Gaussian) emission spec, else None (plane-wave incidence)
 
     def __repr__(self):
         return (
@@ -612,6 +976,145 @@ def _extract_permittivity_coeff(volume_term):
     return functools.reduce(operator.add, mass)
 
 
+def _extract_pml_stretch(volume_term):
+    """Recover an in-plane uniaxial PML coordinate-stretch from a scalar Helmholtz volume term.
+
+    A PML writes the stiffness with anisotropic diagonal coefficients::
+
+        c_xx·∂ₓu ∂ₓv + c_yy·∂ᵧu ∂ᵧv + c_zz·∂_zu ∂_zv
+
+    where ``(c_xx, c_yy, c_zz) = Λ = diag(SᵧS_z/Sₓ, SₓS_z/Sᵧ, SₓSᵧ/S_z)`` is the coordinate-stretch
+    tensor (``S_i = 1 + iσ_i/k``, ramping in the absorbing frame, ``1`` in the physical core). This is
+    exactly the Maxwell uniaxial PML: ``ε̂ = ε·Λ``, ``μ̂ = Λ``. We honour whatever stretch the user traced.
+
+    Returns ``{axis: Λ_axis_node}`` (axis ``0/1/2`` ↦ ``x/y/z``) when a stretch is present, or ``{}`` when
+    every stiffness summand is a bare ``∂u·∂v`` (no PML). Raises on an off-diagonal stiffness
+    (``∂ᵢu ∂ⱼv``, i≠j) — only a diagonal (uniaxial) stretch is supported."""
+    import functools
+    import operator
+
+    from jno.trace import Jacobian
+
+    expr = getattr(volume_term, "expr", volume_term)
+    per_axis = {}  # axis -> list of coefficient nodes (None = a bare, coefficient-less ∂u·∂v)
+    saw_stiffness = False
+    for _sign, summand in _add_split(expr):
+        fac = _mul_factors(summand)
+        jt = [f for f in fac if isinstance(f, Jacobian) and _contains_trial(f.target)]
+        je = [f for f in fac if isinstance(f, Jacobian) and _contains_test(f.target)]
+        if not (jt and je):
+            continue  # mass / source / other channel -- not a stiffness summand
+        if len(jt) != 1 or len(je) != 1:
+            raise RcwaError("RCWA PML: expected one trial-gradient and one test-gradient per stiffness term.")
+        saw_stiffness = True
+        axt, axe = jt[0].variables[0].dim[0], je[0].variables[0].dim[0]
+        if axt != axe:
+            raise RcwaError(
+                "RCWA sees an off-diagonal stiffness term (∂ᵢu ∂ⱼv, i≠j) -> a non-diagonal coordinate "
+                "stretch. Only a diagonal (uniaxial) in-plane PML is supported."
+            )
+        coeff_factors = [f for f in fac if f is not jt[0] and f is not je[0]]
+        per_axis.setdefault(axt, []).append(functools.reduce(operator.mul, coeff_factors) if coeff_factors else None)
+    if not saw_stiffness or all(c is None for cs in per_axis.values() for c in cs):
+        return {}  # no stiffness, or every stiffness term is a bare ∂u·∂v -> not a PML
+    return {  # a bare contribution on a stretched axis counts as Λ += 1
+        ax: functools.reduce(operator.add, [(c if c is not None else 1.0) for c in cs]) for ax, cs in per_axis.items()
+    }
+
+
+def _pml_layer_components(mass_node, stretch, period, grid, zmid, params, k0sq, sub=1):
+    """The 10 relative-permittivity/permeability grids ``(ε_xx,ε_xy,ε_yx,ε_yy,ε_zz, μ_xx,μ_xy,μ_yx,μ_yy,μ_zz)``
+    of an in-plane uniaxial PML layer at height ``zmid``.
+
+    ``Λ = diag(c_xx, c_yy, c_zz)`` is read off the stiffness coefficients (``stretch``); the Maxwell PML is
+    ``ε̂ = ε·Λ``, ``μ̂ = Λ`` with ``ε = (K0²·ε·SₓSᵧS_z)/k0² / (c_xx·c_yy·c_zz)`` since
+    ``SₓSᵧS_z = c_xx·c_yy·c_zz``. Off-diagonal components are zero (uniaxial). ``sub`` = subpixel smoothing
+    (each ε̂/μ̂ component is built at ``grid·sub`` and averaged per pixel)."""
+    g = grid * sub
+    pts = _cell_grid_at_z(period, g, zmid)
+
+    def samp(node):
+        v = jnp.full((g * g,), node) if np.isscalar(node) else _eval_coeff_points(node, pts, params)
+        return jnp.reshape(v, (g, g)) + 0j
+
+    lam = [samp(stretch[ax]) for ax in (0, 1, 2)]
+    m = jnp.reshape(_eval_coeff_points(mass_node, pts, params), (g, g)) + 0j
+    eps_rel = (m / k0sq) / (lam[0] * lam[1] * lam[2])
+    z = jnp.zeros((g, g), complex)
+    comps = (eps_rel * lam[0], z, z, eps_rel * lam[1], eps_rel * lam[2], lam[0], z, z, lam[1], lam[2])
+    return tuple(_pixel_average(c, grid, sub) for c in comps)
+
+
+def _extract_volume_source(volume_term):
+    """The **internal-source** forcing in the volume weak form: a summand that carries the TEST function but
+    **no trial** — ``- f·v`` (scalar monopole) or ``- inner(J, v)`` (vector dipole, ``J`` a current density).
+
+    Returns ``(source_node, is_vector)`` or ``None`` when the volume term is a pure operator (no forcing).
+    The sign is dropped (emitted power ∝ |source|², sign-invariant); the node keeps any ``jno.np.parameter``
+    it depends on, so a trainable source amplitude flows through the differentiable solve."""
+    import functools
+    import operator
+
+    from jno.trace import FunctionCall, TestFunction, TrialFunction
+
+    def _test_inner_other(f):  # inner(J, v) / inner(v, J) with a bare test v and J not a trial -> J
+        if not (isinstance(f, FunctionCall) and getattr(f, "_name", None) == "inner" and len(f.args) == 2):
+            return None
+        a0, a1 = f.args
+        if isinstance(a0, TestFunction) and not isinstance(a1, TrialFunction):
+            return a1
+        if isinstance(a1, TestFunction) and not isinstance(a0, TrialFunction):
+            return a0
+        return None
+
+    expr = getattr(volume_term, "expr", volume_term)
+    scal, vect = [], []
+    for _sign, summand in _add_split(expr):
+        if _contains_trial(summand) or not _contains_test(summand):
+            continue  # operator term (has trial) or non-source
+        fac = _mul_factors(summand)
+        jinner = next((f for f in fac if _test_inner_other(f) is not None), None)
+        if jinner is not None:  # vector source inner(J, v): source = (scalar factors)·J
+            J = _test_inner_other(jinner)
+            rest = [f for f in fac if f is not jinner]
+            vect.append(functools.reduce(operator.mul, [*rest, J]) if rest else J)
+        else:  # scalar source f·v: drop the bare test factor
+            rest = [f for f in fac if not isinstance(f, TestFunction)]
+            if rest:
+                scal.append(functools.reduce(operator.mul, rest))
+    if vect and scal:
+        raise RcwaError("RCWA found both a scalar and a vector internal source in the volume term; author one.")
+    if vect:
+        return functools.reduce(operator.add, vect), True
+    if scal:
+        return functools.reduce(operator.add, scal), False
+    return None
+
+
+def _localize_source(src_node, is_vector, period, z_range, grid, nz, params):
+    """Locate an internal source by its ``|·|²`` distribution on the cell volume: the centroid ``(x₀,y₀,z₀)``
+    and lateral width → **point** (``dirac_delta_source``) vs **Gaussian** (``gaussian_source`` with a fwhm).
+    Returns ``dict(x0, y0, z0, kind, fwhm)`` (all static geometry; the amplitude flows separately)."""
+    xs = np.linspace(0, period[0], grid, endpoint=False)
+    ys = np.linspace(0, period[1], grid, endpoint=False)
+    zs = np.linspace(z_range[0], z_range[1], nz)
+    GX, GY, GZ = np.meshgrid(xs, ys, zs, indexing="ij")
+    pts = np.stack([GX.ravel(), GY.ravel(), GZ.ravel()], 1)
+    v = np.asarray(_eval_coeff_points(src_node, pts, params or {}))
+    mag2 = np.sum(np.abs(v) ** 2, axis=-1) if (is_vector and v.ndim > 1) else np.abs(v).reshape(-1) ** 2
+    if float(mag2.max()) <= 0:
+        raise RcwaError("the internal source is identically zero at construction values; check its amplitude.")
+    w = mag2 / mag2.sum()
+    x0, y0, z0 = (float((w * pts[:, k]).sum()) for k in range(3))
+    sx = float(np.sqrt(((pts[:, 0] - x0) ** 2 * w).sum()))
+    sy = float(np.sqrt(((pts[:, 1] - y0) ** 2 * w).sum()))
+    width = 0.5 * (sx + sy)  # lateral std; a point source is narrower than a cell
+    dx = 0.5 * (period[0] + period[1]) / grid
+    if width < 1.5 * dx:
+        return dict(x0=x0, y0=y0, z0=z0, kind="delta", fwhm=0.0)
+    return dict(x0=x0, y0=y0, z0=z0, kind="gaussian", fwhm=2.35482 * width)  # FWHM = 2.355·σ
+
+
 def _has_nodal_field(node):
     """True if the coefficient depends on a per-node field parameter (needs mesh interpolation)."""
     return any(getattr(mc.model, "_fem_field", None) == "node" for mc in _model_calls(node))
@@ -714,22 +1217,37 @@ def _kin_from_source(src_coeff, period, z0, params):
     return jnp.stack([kx, ky])
 
 
-def _sample_grid_direct(coeff_node, grid, nz, period, z_range, params=None):
+def _pixel_average(vals, grid, sub):
+    """**Subpixel smoothing**: area-average a ``(grid·sub, grid·sub[, …])`` supersampled field down to
+    ``(grid, grid[, …])`` by averaging each pixel's ``sub×sub`` block. Anti-aliases material boundaries so
+    the Fourier expansion converges faster (less Gibbs ringing) and the gradient w.r.t. a boundary-moving
+    design parameter is smooth, not staircased. A plain mean -- differentiable, works on NumPy or JAX."""
+    if sub == 1:
+        return vals
+    tail = tuple(vals.shape[2:])
+    return vals.reshape(grid, sub, grid, sub, *tail).mean(axis=(1, 3))
+
+
+def _sample_grid_direct(coeff_node, grid, nz, period, z_range, params=None, sub=1):
     """Evaluate an analytic coefficient expression directly on the RCWA grid (exact, no mesh noise).
 
     Used when the permittivity is an analytic function of the coordinates (no per-node field); this
     avoids the staircase/interp noise that makes z-slices look non-invariant on an unstructured mesh.
     ``params`` substitutes trainable-parameter values (so the eager structure/k0 inference uses valid
-    values, e.g. a K0 parameter)."""
-    xs = np.linspace(0, period[0], grid, endpoint=False)
-    ys = np.linspace(0, period[1], grid, endpoint=False)
+    values, e.g. a K0 parameter). ``sub`` supersamples each pixel ``sub×sub`` and averages (subpixel
+    smoothing)."""
+    g = grid * sub
+    xs = np.linspace(0, period[0], g, endpoint=False)
+    ys = np.linspace(0, period[1], g, endpoint=False)
     zs = np.linspace(z_range[0], z_range[1], nz)
     GX, GY, GZ = np.meshgrid(xs, ys, zs, indexing="ij")
     pts = np.stack([GX.ravel(), GY.ravel(), GZ.ravel()], 1)
     vals = np.asarray(_eval_coeff_points(coeff_node, pts, params or {}))
     if vals.ndim >= 3 and vals.shape[-2:] == (3, 3):  # anisotropic ε̂ -> layer-detect on the xx component
         vals = vals[..., 0, 0]
-    vals = vals.reshape(grid, grid, nz)
+    vals = vals.reshape(g, g, nz)
+    if sub > 1:  # anti-alias: average each pixel's sub×sub supersamples (z untouched)
+        vals = vals.reshape(grid, sub, grid, sub, nz).mean(axis=(1, 3))
     return np.moveaxis(vals, 2, 0).astype(complex), zs  # -> (nz, grid, grid)
 
 
@@ -741,32 +1259,36 @@ def _coeff_is_tensor(coeff_node, period, z_range, params):
     return v.ndim >= 3 and v.shape[-2:] == (3, 3)
 
 
-def _tensor_components(coeff_node, period, grid, zmid, params, k0sq):
+def _tensor_components(coeff_node, period, grid, zmid, params, k0sq, sub=1):
     """The 5 relative-permittivity component grids (ε_xx, ε_xy, ε_yx, ε_yy, ε_zz) fmmax needs, sampled on the
-    unit-cell grid at height ``zmid`` from the K0²·ε̂ tensor coefficient (divided by k0²)."""
-    T = jnp.reshape(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, grid, zmid), params), (grid, grid, 3, 3))
-    T = T / k0sq
+    unit-cell grid at height ``zmid`` from the K0²·ε̂ tensor coefficient (divided by k0²). ``sub`` = subpixel
+    smoothing factor."""
+    g = grid * sub
+    T = jnp.reshape(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, g, zmid), params), (g, g, 3, 3))
+    T = _pixel_average(T, grid, sub) / k0sq
     return (T[..., 0, 0], T[..., 0, 1], T[..., 1, 0], T[..., 1, 1], T[..., 2, 2])
 
 
-def _sample_grid(domain, eps_nodes, grid, nz, period, z_range):
-    """Interpolate nodal eps onto an (nz, grid, grid) unit-cell array over the z-extent."""
+def _sample_grid(domain, eps_nodes, grid, nz, period, z_range, sub=1):
+    """Interpolate nodal eps onto an (nz, grid, grid) unit-cell array over the z-extent (``sub`` = subpixel
+    supersampling, averaged per pixel)."""
     from scipy.interpolate import griddata
 
+    g = grid * sub
     pts = np.asarray(domain.points)
-    xs = np.linspace(0, period[0], grid, endpoint=False)
-    ys = np.linspace(0, period[1], grid, endpoint=False)
+    xs = np.linspace(0, period[0], g, endpoint=False)
+    ys = np.linspace(0, period[1], g, endpoint=False)
     zs = np.linspace(z_range[0], z_range[1], nz)
     GX, GY = np.meshgrid(xs, ys, indexing="ij")
     E = np.empty((nz, grid, grid), complex)
     for k, zz in enumerate(zs):
         sel = np.abs(pts[:, 2] - zz) < (z_range[1] - z_range[0]) / (nz - 1) * 0.75 + 1e-9
         if sel.sum() < 3:
-            j = np.argsort(np.abs(pts[:, 2] - zz))[: max(3, grid)]
+            j = np.argsort(np.abs(pts[:, 2] - zz))[: max(3, g)]
             sel = np.zeros(len(pts), bool)
             sel[j] = True
         vals = griddata(pts[sel][:, :2], eps_nodes[sel], (GX, GY), method="nearest")
-        E[k] = vals
+        E[k] = vals.reshape(grid, sub, grid, sub).mean(axis=(1, 3)) if sub > 1 else vals
     return E, zs
 
 
@@ -912,11 +1434,46 @@ class _ParametricSol:
     def order(self, m, n):
         return self._node("order", m, n)
 
+    def power(self, kind="total"):
+        return self._node("power", kind)
+
+    def extraction(self, kind="up"):
+        return self._node("extraction", kind)
+
+    def aerial(self, NA, source=0.7, defocus=0.0, grid=128, kind="T", polarization=None):
+        """The aerial image as a trace node over the mask's ``jno.np.parameter``\\ s -- so ``jax.grad`` of a
+        printed-vs-target loss flows back through the imaging AND the RCWA mask solve to the mask design (ILT)."""
+        return self._node("aerial", NA, source, defocus, grid, kind, polarization)
+
+    def printed(self, NA, source=0.7, defocus=0.0, grid=128, kind="T", polarization=None, resist=None):
+        """The developed resist image as a trace node over the mask's ``jno.np.parameter``\\ s -- ``jax.grad``
+        of a printed-vs-target loss flows back through development, imaging AND the RCWA solve to the mask (ILT).
+        ``resist`` defaults to :class:`jno.litho.Threshold`; pass another resist model to swap physics."""
+        return self._node("printed", NA, source, defocus, grid, kind, polarization, resist or Threshold())
+
+    def expose(self, *a, **k):
+        raise RcwaError(
+            "expose() returns an optics object, not a scalar readout, so it is not a parametric trace node. "
+            "For a differentiable printed-resist loss use rc.solve().printed(resist=...); to inspect an "
+            "exposure at concrete values use rc.solve(params={...}).expose(...)."
+        )
+
     def field(self, *a, **k):
         raise RcwaError(
             "field() on a parameterised solve is not a scalar readout; reconstruct it at concrete values "
             "with rc.solve(params={...}).field(...)."
         )
+
+
+def _profile_solve(run, eng):
+    """The profiling path of ``rc.solve(profile=True)`` -- an eager, per-stage-annotated RCWA solve inside a
+    JAX Perfetto trace (shared with ``jno.fem``/``jno.fdm``). The eager solve self-blocks (its energy guard
+    reads ``efficiency`` concretely), so the shared timer sees the real O((2·n_t)³) eigensolve work."""
+    from jno.utils.profiling import profile_solve
+
+    nt = eng._nt
+    label = f"rcwa profile · {len(eng.layers_spec)} layers · n_t={nt} · {2 * nt}×{2 * nt} eigenproblem/layer"
+    return profile_solve(run, label=label)
 
 
 class _RcwaProblem:
@@ -933,28 +1490,32 @@ class _RcwaProblem:
     def __repr__(self):
         return f"_RcwaProblem(orders={self.orders}, params={sorted(self._rpe)}, {self.spec!r})"
 
+    def _build_engine(self, orders):
+        return Rcwa(
+            self.spec.layers,
+            period=self.spec.period,
+            orders=orders,
+            wavelength=self.spec.wavelength,
+            k_in=self.spec.k_in,
+            formulation=self.formulation,
+            assume_periodic=True,
+        )
+
     def _engine(self):
         if getattr(self, "_eng", None) is None:  # build ONCE (warmed eagerly in _node) so the expansion is trace-free
-            self._eng = Rcwa(
-                self.spec.layers,
-                period=self.spec.period,
-                orders=self.orders,
-                wavelength=self.spec.wavelength,
-                k_in=self.spec.k_in,
-                formulation=self.formulation,
-                assume_periodic=True,
-            )
+            self._eng = self._build_engine(self.orders)
         return self._eng
 
     def _solve_at(self, params):
-        """Concrete solve at explicit parameter values (JAX) -- re-derives eps, wavelength AND k_in."""
+        """Concrete solve at explicit parameter values (JAX) -- re-derives eps, wavelength, k_in AND (for an
+        internal-source problem) the dipole current."""
         eng = self._engine()
         if not params or self._resample is None:
-            return eng.solve()
-        layers, wl, kin = self._resample(params)
-        return eng.solve(layers=layers, wavelength=wl, k_in=kin)
+            return eng.solve(source=self.spec.source)
+        layers, wl, kin, source = self._resample(params)
+        return eng.solve(layers=layers, wavelength=wl, k_in=kin, source=source)
 
-    def solve(self, params=None, wavelength=None, k_in=None):
+    def solve(self, params=None, wavelength=None, k_in=None, orders=None, profile=False):
         """Solve.
 
         The jNO way (**no arguments**): if the constraint list carries ``jno.np.parameter`` coefficients
@@ -964,36 +1525,205 @@ class _RcwaProblem:
         or ``jno.rcwa``. A parameter-free problem solves eagerly and returns concrete readouts.
 
         Escape hatches for a *forward sweep* (not the traced/optimised path): ``params={name: value}`` for
-        a concrete solve at explicit values, or ``wavelength`` / ``k_in`` to override those directly."""
-        if params is None and wavelength is None and k_in is None:
+        a concrete solve at explicit values, or ``wavelength`` / ``k_in`` to override those directly.
+
+        ``orders=N`` re-solves at a different Fourier truncation (a fresh engine, the construction ``orders``
+        is untouched) -- for a **convergence sweep** (compare ``.efficiency`` at N vs 1.5·N) or profiling at
+        scale. ``profile=True`` runs the solve eagerly (at the current parameter values) inside a JAX
+        Perfetto trace with per-stage annotations, like ``jno.core.solve(profile=True)`` -- it prints the
+        problem size and wall time and writes the trace to ``./rcwa_traces`` (RCWA time is dominated by the
+        O((2·n_t)³) per-layer eigensolves, which the trace makes explicit)."""
+        forward = params is not None or wavelength is not None or k_in is not None or orders is not None or profile
+        if not forward:
             if self._rpe and self._resample is not None:
                 return _ParametricSol(self, self._rpe)  # parametric -> trace node (crux-differentiable)
-            return self._engine().solve()  # parameter-free -> eager concrete
-        eng = self._engine()
-        if params is None:
-            return eng.solve(wavelength=wavelength, k_in=k_in)
-        if self._resample is None:
-            raise RcwaError(
-                "differentiable solve(params=...) needs the analytic re-sampling path, which is only built "
-                "for an analytic permittivity (no per-node field). This problem uses a nodal-field "
-                "permittivity; differentiable nodal re-sampling is not implemented yet."
+            return self._engine().solve(source=self.spec.source)  # parameter-free -> eager concrete
+        eng = self._engine() if orders is None else self._build_engine(orders)
+
+        def run():  # a concrete (eager) solve at explicit / current values
+            if params is None:
+                return eng.solve(wavelength=wavelength, k_in=k_in, source=self.spec.source)
+            if self._resample is None:
+                raise RcwaError(
+                    "differentiable solve(params=...) needs the analytic re-sampling path, which is only built "
+                    "for an analytic permittivity (no per-node field). This problem uses a nodal-field "
+                    "permittivity; differentiable nodal re-sampling is not implemented yet."
+                )
+            layers, wl, kin, source = self._resample(params)
+            return eng.solve(
+                layers=layers,
+                wavelength=wavelength if wavelength is not None else wl,
+                k_in=k_in if k_in is not None else kin,
+                source=source,
             )
-        layers, wl, kin = self._resample(params)
-        return eng.solve(
-            layers=layers,
-            wavelength=wavelength if wavelength is not None else wl,
-            k_in=k_in if k_in is not None else kin,
+
+        return _profile_solve(run, eng) if profile else run()
+
+
+def _build_emitter_problem(
+    femobj,
+    domain,
+    period,
+    axes,
+    ambients,
+    coeff_node,
+    cparams,
+    coeff_layers,
+    zmids,
+    zspans,
+    z_range,
+    grid,
+    nz,
+    wavelength,
+    orders,
+    formulation,
+    vsrc,
+    is_aniso,
+    is_pml,
+    sub=1,
+):
+    """Build an internal-source (dipole / Gaussian) emission problem: localize the traced ``- f·v`` /
+    ``- inner(J, v)`` forcing, split its layer, and route it to fmmax's ``amplitudes_for_source``.
+
+    The Floquet-periodic supercell + absorbing z-ambients behaves as an emitter in a layered environment.
+    Scope: scalar Helmholtz layers (no tensor ε̂ / PML yet). The amplitude, orientation, lateral location,
+    z-position (within its layer) and Gaussian width, plus the design ε, are all differentiable — only the
+    *discrete* choices (which layer, point-vs-Gaussian) are frozen at construction. ``k_in`` is nudged off
+    the singular Γ-point."""
+    bottom, top = ambients
+    src_node, is_vector = vsrc
+    if is_aniso or is_pml:
+        raise RcwaError("internal-source RCWA supports the scalar Helmholtz form only (no tensor ε̂ / PML yet).")
+    try:  # a boundary plane-wave incidence AND an internal source is an ambiguous double excitation
+        _source_kin(femobj, domain, cparams)
+        raise RcwaError("RCWA found both an internal source and a boundary plane-wave incidence; author one excitation.")
+    except RcwaError as e:
+        if "internal source and a boundary" in str(e):
+            raise
+
+    # order top-first: superstrate (the "up" ambient) = the max-z face; substrate ("down") = min-z
+    o = list(range(len(coeff_layers)))
+    if z_range[0] < z_range[1]:  # detect_layers is z-ascending -> reverse so layers[0] is the top ambient
+        o = o[::-1]
+    cl = [coeff_layers[i] for i in o]
+    zm = [zmids[i] for i in o]
+    zsp = [zspans[i] for i in o]
+
+    super_coeff = float(np.real(cl[0][1]).mean())  # top ambient (vacuum) ⇒ coeff = k0²
+    if wavelength is not None:
+        k0 = 2 * np.pi / float(wavelength)
+    elif super_coeff <= 0:
+        raise RcwaError("cannot infer wavelength: the superstrate permittivity is non-positive; pass wavelength=.")
+    else:
+        k0 = float(np.sqrt(super_coeff))
+    layers = [(t, np.asarray(e) / (k0 * k0)) for t, e in cl]  # scalar relative permittivity
+
+    loc = _localize_source(src_node, is_vector, period, z_range, grid, nz, cparams)
+    si = lo = hi = None
+    for i in range(1, len(zsp) - 1):  # the source sits in a finite (non-ambient) layer
+        zlo, zhi = zsp[i]
+        if zlo - 1e-9 <= loc["z0"] <= zhi + 1e-9:
+            si, lo, hi = i, zlo, zhi
+            break
+    if si is None:
+        raise RcwaError(
+            f"the internal source at z={loc['z0']:.3f} is not inside a finite (non-ambient) layer; place it "
+            "within a slab whose permittivity differs from the ambients (a layer contrast defines the slab)."
         )
 
+    # static volume grid for the DIFFERENTIABLE re-derivation of the source's centroid / width from params
+    _xs = np.linspace(0, period[0], grid, endpoint=False)
+    _ys = np.linspace(0, period[1], grid, endpoint=False)
+    _zs = np.linspace(z_range[0], z_range[1], nz)
+    _GX, _GY, _GZ = np.meshgrid(_xs, _ys, _zs, indexing="ij")
+    _pts = np.stack([_GX.ravel(), _GY.ravel(), _GZ.ravel()], 1)
 
-def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, params=None, formulation="JONES_DIRECT_FOURIER"):
+    def geom_at(params):  # differentiable centroid (x0,y0,z0) + lateral σ from the |source|² distribution
+        v = _eval_coeff_points(src_node, _pts, params)
+        mag2 = jnp.sum(jnp.abs(v) ** 2, -1) if (is_vector and jnp.ndim(v) > 1) else jnp.abs(jnp.reshape(v, (-1,))) ** 2
+        w = mag2 / jnp.sum(mag2)
+        x0, y0, z0 = (jnp.sum(w * jnp.asarray(_pts[:, k])) for k in range(3))
+        sig = 0.5 * (
+            jnp.sqrt(jnp.sum((jnp.asarray(_pts[:, 0]) - x0) ** 2 * w))
+            + jnp.sqrt(jnp.sum((jnp.asarray(_pts[:, 1]) - y0) ** 2 * w))
+        )
+        return x0, y0, z0, sig
+
+    def make_source(params):  # amplitude/orientation, location (x0,y0), z-split and fwhm all differentiable
+        x0, y0, z0, sig = geom_at(params)
+        val = jnp.reshape(_eval_coeff_points(src_node, jnp.stack([x0, y0, z0]).reshape(1, 3), params), (-1,))
+        orient = (val[0], val[1], val[2]) if is_vector else (val[0], jnp.asarray(0.0 + 0j), jnp.asarray(0.0 + 0j))
+        return dict(
+            loc=jnp.stack([x0, y0]).reshape(1, 2),
+            layer=si,
+            t_upper=hi - z0,  # toward the top ambient (si, lo, hi fixed eagerly; z0 differentiable within the layer)
+            t_lower=z0 - lo,
+            kind=loc["kind"],
+            fwhm=2.35482 * sig,  # FWHM = 2.355·σ (used only when kind == "gaussian")
+            orient=orient,
+            amp=1.0,
+        )
+
+    kin = (1e-3, 1e-3)  # nudge off the singular Γ-point (exactly-normal k_in is degenerate for an internal source)
+
+    def resample(params):
+        g = grid * sub  # supersampled lattice for subpixel smoothing
+        k0p = jnp.sqrt(jnp.mean(jnp.real(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, g, zm[0]), params))))
+        out = []
+        for (thick, _), zmid in zip(layers, zm):
+            cfine = jnp.reshape(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, g, zmid), params), (g, g))
+            out.append((thick, _pixel_average(jnp.real(cfine), grid, sub) / (k0p * k0p)))
+        return out, 2 * jnp.pi / k0p, kin, make_source(params)
+
+    from jno.utils.solver.parametric_helpers import _collect_runtime_parameter_exprs
+
+    rpe = {}
+    _collect_runtime_parameter_exprs(coeff_node, rpe)  # eps / wavelength parameters
+    _collect_runtime_parameter_exprs(src_node, rpe)  # a trainable source amplitude / orientation
+    spec = RcwaSpec(
+        period=period,
+        layers=layers,
+        wavelength=2 * np.pi / k0,
+        k_in=kin,
+        source_face=top,
+        ambient_faces=(bottom, top),
+        periodic_axes=axes,
+        source=make_source(cparams),
+    )
+    return _RcwaProblem(spec, orders=orders, formulation=formulation, resample=resample, rpe=rpe)
+
+
+def rcwa(
+    problem,
+    *,
+    orders,
+    wavelength=None,
+    grid=64,
+    nz=64,
+    slices=None,
+    params=None,
+    formulation="JONES_DIRECT_FOURIER",
+    smoothing=1,
+):
     """Infer and build an RCWA problem from a jNO constraint list (or built ``FEM``).
 
     Everything is read out of the traced problem: **periodicity + period** (Floquet ties — absent ⇒
     raise), the **super/substrate ambients**, the **permittivity** (the ``K0**2*eps`` coefficient
-    recovered from the scalar Helmholtz volume term, sampled along z), the **wavelength** (``k0`` from
-    the vacuum superstrate, unless ``wavelength`` is given), and the **incident wave** (illuminated face
-    + transverse angle ``k_in``, from the assembled forcing).
+    recovered from the scalar Helmholtz volume term, sampled along z; a tensor ``ε̂`` from
+    ``inner(ε̂ @ u, v)``), the **wavelength** (``k0`` from the vacuum superstrate, unless ``wavelength``
+    is given), and the **incident wave** (illuminated face + transverse angle ``k_in``, from the
+    assembled forcing). An **in-plane PML** (a complex coordinate stretch in the stiffness coefficients)
+    is detected and honoured as a diagonal Maxwell ``ε̂``/``μ̂`` — the supercell then behaves as an
+    isolated scatterer, and a design parameter on the scatterer ε **is differentiable** (inverse design of
+    an isolated structure). Scope: uniaxial (diagonal) in-plane stretch only, scalar Helmholtz.
+
+    An **internal source** (a ``- f·v`` / ``- inner(J, v)`` volume forcing) switches the solve to an
+    emission problem: the source is localized (point vs Gaussian; dipole orientation from ``J``), the stack
+    is split at the source plane, and ``sol.power("up"|"down"|"total")`` / ``sol.extraction("up"|"down")``
+    give the radiated power and directionality. The amplitude, orientation, lateral location, z-position and
+    Gaussian width, plus the design ε, are all differentiable (only the discrete layer choice is frozen);
+    ``k_in`` is nudged off the singular Γ-point, and the source must sit in a finite (contrast-defined) layer.
+    Scalar Helmholtz only for now; a boundary incidence + internal source together raise.
 
     Parameters
     ----------
@@ -1008,12 +1738,21 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
         Transverse resolution and number of z-samples used to detect the layer stack.
     slices:
         Staircase a continuously-varying permittivity into this many layers instead of raising.
+    smoothing:
+        Subpixel-smoothing factor (default ``1`` = off). ``smoothing=k`` supersamples each RCWA pixel
+        ``k×k`` and area-averages the permittivity, anti-aliasing material boundaries. Recommended (``2``–``4``)
+        for **inverse design**: it cuts Fourier (Gibbs) ringing so fewer ``orders`` converge, and makes the
+        gradient w.r.t. a boundary-moving design parameter smooth rather than staircased. Costs ``k²``× more
+        coefficient evaluations (cheap) — the fmmax eigensolve size is unchanged.
 
     Returns
     -------
     _RcwaProblem
         Holds the inferred :class:`RcwaSpec` (``.spec``) and a :meth:`~_RcwaProblem.solve`.
     """
+    sub = int(smoothing)
+    if sub < 1:
+        raise RcwaError(f"smoothing must be a positive integer (1 = off), got {smoothing!r}.")
     femobj = _as_fem(problem)
     domain = femobj.domain
     axes, period = _periodic_period(femobj, domain)
@@ -1029,15 +1768,46 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
     cparams = _param_values(femobj, coeff_node)
     cparams.update({k: jnp.asarray(v) for k, v in (params or {}).items()})
     is_aniso = _coeff_is_tensor(coeff_node, period, z_range, cparams)  # 3×3 ε̂ vs scalar ε
+    stretch = _extract_pml_stretch(_volume_constraint(femobj))  # {axis: Λ node} for an in-plane PML, else {}
+    is_pml = bool(stretch)
+    if is_pml and is_aniso:
+        raise RcwaError("RCWA sees both an in-plane PML stretch and a tensor ε̂ mass term; combine them by hand.")
     if _has_nodal_field(coeff_node):  # per-node design field -> interpolate off the mesh
         coeff_nodes = _eval_expr_nodes(coeff_node, domain)
         if np.iscomplexobj(coeff_nodes) and np.max(np.abs(coeff_nodes.imag)) < 1e-9:
             coeff_nodes = coeff_nodes.real.astype(complex)
-        C, zs = _sample_grid(domain, coeff_nodes, grid, nz, period, z_range)
+        C, zs = _sample_grid(domain, coeff_nodes, grid, nz, period, z_range, sub=sub)
     else:  # analytic permittivity -> sample the grid exactly
-        C, zs = _sample_grid_direct(coeff_node, grid, nz, period, z_range, cparams)
+        C, zs = _sample_grid_direct(coeff_node, grid, nz, period, z_range, cparams, sub=sub)
     coeff_layers = detect_layers(C, zs, slices=slices)
     zmids = list(detect_layers.last_zmid)  # representative z of each layer (both paths) -> re-sampling
+    zspans = list(detect_layers.last_zspan)  # (z_lo, z_hi) per layer -> place an internal source in its layer
+
+    # ---- internal source (dipole / Gaussian emitter): a `- f·v` / `- inner(J, v)` volume forcing ----
+    vsrc = _extract_volume_source(_volume_constraint(femobj))
+    if vsrc is not None:
+        return _build_emitter_problem(
+            femobj,
+            domain,
+            period,
+            axes,
+            (bottom, top),
+            coeff_node,
+            cparams,
+            coeff_layers,
+            zmids,
+            zspans,
+            z_range,
+            grid,
+            nz,
+            wavelength,
+            orders,
+            formulation,
+            vsrc,
+            is_aniso,
+            is_pml,
+            sub,
+        )
 
     face_z, k_in = _source_kin(femobj, domain, cparams)
     source_at_bottom = abs(face_z - _region_centroid(domain, bottom)[2]) < abs(face_z - _region_centroid(domain, top)[2])
@@ -1047,8 +1817,14 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
     if not source_at_bottom:
         coeff_layers = list(reversed(coeff_layers))
         zmids = list(reversed(zmids))
-    # k0 from the superstrate (vacuum ⇒ coeff = k0^2), unless wavelength is given
-    super_coeff = float(np.real(coeff_layers[0][1]).mean())
+    # k0 from the superstrate (vacuum ⇒ coeff = k0^2), unless wavelength is given. With a PML the superstrate
+    # is a vacuum framed by the absorber, so its transverse MEAN is stretched; read k0 at the physical-core
+    # centre instead (there Λ=1 and ε=1, so the mass coefficient is exactly k0²).
+    if is_pml:
+        center = np.array([[period[0] * 0.5, period[1] * 0.5, zmids[0]]])
+        super_coeff = float(np.real(_eval_coeff_points(coeff_node, center, cparams)).reshape(-1)[0])
+    else:
+        super_coeff = float(np.real(coeff_layers[0][1]).mean())
     if wavelength is not None:
         k0 = 2 * np.pi / float(wavelength)
     elif super_coeff <= 0:
@@ -1058,9 +1834,19 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
     else:
         k0 = float(np.sqrt(super_coeff))
     k0sq = k0 * k0
-    if is_aniso:  # relative-permittivity TENSOR per layer: (ε_xx, ε_xy, ε_yx, ε_yy, ε_zz)
+    if is_pml:  # in-plane uniaxial PML: general-anisotropic layer (ε̂ AND μ̂), 10 grids per layer
         layers = [
-            (t, tuple(np.asarray(c) for c in _tensor_components(coeff_node, period, grid, zm, cparams, k0sq)))
+            (
+                t,
+                tuple(
+                    np.asarray(c) for c in _pml_layer_components(coeff_node, stretch, period, grid, zm, cparams, k0sq, sub)
+                ),
+            )
+            for (t, _), zm in zip(coeff_layers, zmids)
+        ]
+    elif is_aniso:  # relative-permittivity TENSOR per layer: (ε_xx, ε_xy, ε_yx, ε_yy, ε_zz)
+        layers = [
+            (t, tuple(np.asarray(c) for c in _tensor_components(coeff_node, period, grid, zm, cparams, k0sq, sub)))
             for (t, _), zm in zip(coeff_layers, zmids)
         ]
     else:
@@ -1080,9 +1866,9 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
         mc.model._parameter_name for mc in _model_calls(coeff_node) if getattr(mc.model, "_fem_field", None) == "node"
     }
     bary = None
-    if nodal_names:
+    if nodal_names:  # bary at grid·sub -> the nodal density is interpolated on the supersampled lattice, then averaged
         nc = np.asarray(domain.points)
-        bary = [_bary_weights(nc, _cell_grid_at_z(period, grid, zm)) for zm in zmids]  # per layer: (ids, weights)
+        bary = [_bary_weights(nc, _cell_grid_at_z(period, grid * sub, zm)) for zm in zmids]  # per layer: (ids, weights)
 
     # the illuminated boundary term's forcing -> lets an incidence-ANGLE parameter in the source flow
     # (its transverse phase gradient IS k_in); None when the source has no angle to read.
@@ -1094,6 +1880,8 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
         k_in = tuple(float(x) for x in _kin_from_source(src_coeff, period, src_z, cparams))  # corrupted for N1E)
 
     def resample(params):
+        g = grid * sub  # supersampled lattice for subpixel smoothing
+
         def at(li):  # parameter values for layer li: nodal fields barycentrically interpolated, scalars as-is
             def gather(v):
                 ids, w = bary[li]
@@ -1101,26 +1889,29 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
 
             return {k: (gather(v) if k in nodal_names else jnp.asarray(v)) for k, v in params.items()}
 
-        if is_aniso:  # k0 from the superstrate's xx (isotropic vacuum ⇒ xx = k0²); tensor components per layer
-            sup_xx = jnp.reshape(
-                _eval_coeff_points(coeff_node, _cell_grid_at_z(period, grid, zmids[0]), at(0)), (grid, grid, 3, 3)
-            )
+        if is_pml:  # in-plane PML: k0 at the physical-core centre (Λ=1, ε=1 ⇒ mass = k0²); 10 ε̂/μ̂ grids per layer
+            center_pt = np.array([[period[0] * 0.5, period[1] * 0.5, zmids[0]]])
+            k0 = jnp.sqrt(jnp.real(jnp.reshape(_eval_coeff_points(coeff_node, center_pt, at(0)), (-1,))[0]))
+            out = [
+                (thick, _pml_layer_components(coeff_node, stretch, period, grid, zmid, at(li), k0 * k0, sub))
+                for li, (thick, zmid) in enumerate(zip(thicks, zmids))
+            ]
+        elif is_aniso:  # k0 from the superstrate's xx (isotropic vacuum ⇒ xx = k0²); tensor components per layer
+            sup_xx = jnp.reshape(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, g, zmids[0]), at(0)), (g, g, 3, 3))
             k0 = jnp.sqrt(jnp.mean(jnp.real(sup_xx[..., 0, 0])))
             out = [
-                (thick, _tensor_components(coeff_node, period, grid, zmid, at(li), k0 * k0))
+                (thick, _tensor_components(coeff_node, period, grid, zmid, at(li), k0 * k0, sub))
                 for li, (thick, zmid) in enumerate(zip(thicks, zmids))
             ]
         else:
-            sup = jnp.mean(jnp.real(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, grid, zmids[0]), at(0))))
+            sup = jnp.mean(jnp.real(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, g, zmids[0]), at(0))))
             k0 = jnp.sqrt(sup)
             out = []
             for li, (thick, zmid) in enumerate(zip(thicks, zmids)):
-                cvals = jnp.reshape(
-                    _eval_coeff_points(coeff_node, _cell_grid_at_z(period, grid, zmid), at(li)), (grid, grid)
-                )
-                out.append((thick, jnp.real(cvals) / (k0 * k0)))
+                cfine = jnp.reshape(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, g, zmid), at(li)), (g, g))
+                out.append((thick, _pixel_average(jnp.real(cfine), grid, sub) / (k0 * k0)))
         kin = _kin_from_source(src_coeff, period, src_z, params) if src_coeff is not None else jnp.asarray(k_in)
-        return out, 2 * jnp.pi / k0, kin
+        return out, 2 * jnp.pi / k0, kin, None  # source=None: plane-wave incidence, not an internal source
 
     # the trainable jno.np.parameter(s) the permittivity depends on -> solve() returns trace nodes over
     # them (crux threads the values), so the parameterised constraint list is differentiable with no solve
@@ -1129,7 +1920,7 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
     from jno.utils.solver.parametric_helpers import _collect_runtime_parameter_exprs
 
     rpe = {}
-    _collect_runtime_parameter_exprs(coeff_node, rpe)  # eps / wavelength parameters
+    _collect_runtime_parameter_exprs(coeff_node, rpe)  # eps / wavelength parameters (PML: the scatterer ε too)
     if src_coeff is not None:
         _collect_runtime_parameter_exprs(src_coeff, rpe)  # an incidence-angle parameter in the source
 
