@@ -456,26 +456,48 @@ class _AMS:
             L[0, 0] = 1.0
             return L.tocsr()
 
-        def to_op(M):  # scipy -> jno LinearOperator over a BCOO
-            coo = pin0(M).tocoo()
+        def to_op(M):  # a pre-pinned scipy matrix -> jno LinearOperator over a BCOO
+            coo = M.tocoo()
             idx = jnp.asarray(np.stack([coo.row, coo.col], axis=1))
             return LinearOperator(jsp.BCOO((jnp.asarray(coo.data), idx), shape=coo.shape))
-
-        # G's constant null-space (G·1 = 0) is exact; each Π_α's constant mode is redundant with it
-        # (Π_α·1 = G·coordₐ is a gradient), so pinning node 0 in every auxiliary operator is correct.
-        g_op = to_op(A_G)
-        p_ops = [to_op((P.T @ A_sp @ P).tocsr()) for P in Pi_sp]
 
         G, Pis = self._G, self._Pis
         GT, PisT = G.T, [P.T for P in Pis]
         dinv = 1.0 / ctx.diag()  # Jacobi smoother (complex diagonal on a complex operator)
 
-        def apply(r):
-            x = dinv * r
-            x = x + G @ aux(g_op, (GT @ r).at[0].set(0.0))  # gradient-space correction
-            for P, PT, p_op in zip(Pis, PisT, p_ops):
-                x = x + P @ aux(p_op, (PT @ r).at[0].set(0.0))  # solenoidal correction (per component)
-            return x
+        # G's constant null-space (G·1 = 0) is exact; each Π_α's constant mode is redundant with it
+        # (Π_α·1 = G·coordₐ is a gradient), so pinning node 0 in every auxiliary operator is correct.
+        if not np.iscomplexobj(A_sp.data):
+            g_op = to_op(pin0(A_G))
+            p_ops = [to_op(pin0((P.T @ A_sp @ P).tocsr())) for P in Pi_sp]
+
+            def apply(r):
+                x = dinv * r
+                x = x + G @ aux(g_op, (GT @ r).at[0].set(0.0))  # gradient-space correction
+                for P, PT, p_op in zip(Pis, PisT, p_ops):
+                    x = x + P @ aux(p_op, (PT @ r).at[0].set(0.0))  # solenoidal correction (per component)
+                return x
+        else:
+            # Complex eddy operator (νK + jωσM): AmgX-style multigrid aux solvers are real-only, so each
+            # complex auxiliary is reformulated as a REAL problem the aux solves *exactly*:
+            #   • gradient   GᵀA_cG = jω·R  (real part vanishes, GᵀKG = 0) → A_G⁻¹ = -j·(Im A_G)⁻¹  [real AMG on Im A_G]
+            #   • solenoidal ΠᵀA_cΠ = S + jT → the real-equivalent 2n block [[S,-T],[T,S]]
+            rg_op = to_op(pin0(sp.csr_matrix(A_G.imag)))
+            b_ops, nvs = [], []
+            for P in Pi_sp:
+                Ap = pin0((P.T @ A_sp @ P).tocsr())
+                b_ops.append(to_op(sp.bmat([[Ap.real, -Ap.imag], [Ap.imag, Ap.real]]).tocsr()))
+                nvs.append(Ap.shape[0])
+
+            def apply(r):
+                x = dinv * r
+                rg = (GT @ r).at[0].set(0.0)
+                x = x + G @ (-1j * (aux(rg_op, jnp.real(rg)) + 1j * aux(rg_op, jnp.imag(rg))))  # -j (Im A_G)⁻¹ rg
+                for P, PT, b_op, nv in zip(Pis, PisT, b_ops, nvs):
+                    rp = (PT @ r).at[0].set(0.0)
+                    s = aux(b_op, jnp.concatenate([jnp.real(rp), jnp.imag(rp)]))  # real 2n-block solve
+                    x = x + P @ (s[:nv] + 1j * s[nv:])
+                return x
 
         return PrecondApplier(apply)
 
@@ -510,8 +532,12 @@ def ams(*, aux=None) -> _AMS:
 
     The same spec handles the **real** curl-curl+mass and the **complex** eddy operator ``νK + jωσM``
     — dtype follows the assembled matrix; pair it with :func:`jno.solve.gmres` (complex-correct) for
-    the eddy case. (An AmgX ``aux`` is real-only, so a complex auxiliary needs a real reformulation —
-    factor ``jω`` out of the gradient block; a real proxy for the Π block.)
+    the eddy case. For a complex operator each auxiliary is reformulated so a **real-only** ``aux``
+    (AmgX/multigrid) still applies, *exactly*: the gradient block ``GᵀA_cG = jω·R`` is pure imaginary
+    (``GᵀKG = 0``) so ``A_G⁻¹ = -j·(Im A_G)⁻¹``; the Π block ``S + jT`` becomes the real 2n block
+    ``[[S,-T],[T,S]]`` (non-symmetric → the ``aux`` must be non-symmetric-capable, e.g. AMG with
+    ``is_symmetric=False``). Complex GMRES is not flexible, so solve the complex ``aux`` **tightly**
+    (near-exact) — a strong multigrid or ``lu``, not a single V-cycle.
 
     Requirements & scope:
 

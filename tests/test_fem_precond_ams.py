@@ -68,7 +68,9 @@ def _complex_eddy(mesh_size, freq, eps):
 def test_ams_complex_eddy_matches_sparse_lu():
     """M4b: the complex eddy operator solved by complex GMRES + AMS (through the new complex-direct
     wiring — sparse ``A_r + i·A_i``, never the dense 2n block) matches the sparse-direct solve. This is
-    the σ=0-in-air ε-gauge regime, complex-symmetric ⇒ GMRES (not CG)."""
+    the σ=0-in-air ε-gauge regime, complex-symmetric ⇒ GMRES (not CG). Also the CI guard for the M5b
+    complex→real auxiliary reformulation: the default ``lu`` aux here runs through it (factor-jω
+    gradient + real 2n-block Π), so a passing solve confirms the reformulation is exact."""
     fem = _complex_eddy(0.3, freq=1e6, eps=1e-3)
     x_lu = _solve(fem)  # default: complex sparse-LU on the real-equivalent block
     x_ams = _solve(fem, linear=jno.solve.gmres(tol=1e-8, restart=120, maxiter=600), precond=jno.precond.ams())
