@@ -408,7 +408,14 @@ def assemble_fem_nonnodal(
 
     cdofs = [_field_cdofs(i) for i in range(len(fields))]
 
-    def _cell_fields(c, u_blocks):
+    def _cell_local_sols(c, u_blocks):
+        """This cell's LOCAL DOF values per field: ``u_blocks[i][cdofs[i][c] - offs[i]]``. Decoupling the
+        per-cell slice from the global vector is what lets the matrix be assembled per element (``jacfwd``
+        w.r.t. these local dofs) instead of via one global ``jacfwd`` that materialises an O(n_dof × n_cell)
+        tangent."""
+        return [u_blocks[i][cdofs[i][c] - offs[i]] for i in range(len(fields))]
+
+    def _cell_fields(c, cell_sols):
         verts = pts[cells_j[c]]
         J = jnp.stack([verts[k] - verts[0] for k in range(1, dim + 1)], axis=1)  # (dim, dim): 2x2 tri / 3x3 tet
         detJ = jnp.linalg.det(J)
@@ -425,7 +432,7 @@ def assemble_fem_nonnodal(
                         "shape_vals": phi,
                         "shape_grads": grad,
                         "shape_hess": hess,
-                        "cell_sol": u_blocks[i][cdofs[i][c] - offs[i]][:, None],
+                        "cell_sol": cell_sols[i][:, None],
                         "space": "Lagrange",
                     }
                 )
@@ -437,7 +444,7 @@ def assemble_fem_nonnodal(
                         "shape_vals": phi,
                         "shape_grads": grad,
                         "shape_hess": hess,
-                        "cell_sol": u_blocks[i][cdofs[i][c] - offs[i]][:, None],  # this cell's 21 local DOFs
+                        "cell_sol": cell_sols[i][:, None],  # this cell's 21 local DOFs
                         "space": "Lagrange",
                     }
                 )
@@ -449,7 +456,7 @@ def assemble_fem_nonnodal(
                         "shape_vals": phi,
                         "shape_grads": grad,
                         "shape_hess": hess,
-                        "cell_sol": u_blocks[i][cdofs[i][c] - offs[i]][:, None],  # this cell's 6 local DOFs
+                        "cell_sol": cell_sols[i][:, None],  # this cell's 6 local DOFs
                         "space": "Lagrange",
                     }
                 )
@@ -457,13 +464,13 @@ def assemble_fem_nonnodal(
                 rval, rdop, rgr, pf, pgf = edge_ref[s]
                 phi, _d = pf(rval, rdop, J, detJ, esigns[c])  # (n_quad, 3, 2)
                 grad = pgf(rgr, J, detJ, esigns[c])  # (n_quad, 3, 2, 2)
-                per.append({"shape_vals": phi, "shape_grads": grad, "cell_sol": u_blocks[i][ce[c]], "space": s})
+                per.append({"shape_vals": phi, "shape_grads": grad, "cell_sol": cell_sols[i], "space": s})
             else:  # P0: a single constant DOF per cell
                 per.append(
                     {
                         "shape_vals": jnp.ones((n_quad, 1)),
                         "shape_grads": jnp.zeros((n_quad, 1, dim, dim)),
-                        "cell_sol": u_blocks[i][c][None],
+                        "cell_sol": cell_sols[i],
                         "space": "P0",
                     }
                 )
@@ -502,7 +509,7 @@ def assemble_fem_nonnodal(
             for coeff, tfi in typed:
 
                 def _cell(c, e=coeff, _sc=rt_scalar, _fv=field_vals):
-                    per, xq, meas = _cell_fields(c, u_blocks)
+                    per, xq, meas = _cell_fields(c, _cell_local_sols(c, u_blocks))
                     vol_vars = tuple(
                         (_fv[name][cells_j[c]] if name in _field_param_names else _sc[name])  # field: 3 vertex values
                         for name in runtime_parameter_tags
@@ -687,7 +694,7 @@ def assemble_fem_nonnodal(
                 u0_blocks = [jnp.zeros(offs[i + 1] - offs[i]) for i in range(len(fields))]
 
                 def _ic_cell(cidx):
-                    per, xq, meas = _cell_fields(cidx, u0_blocks)
+                    per, xq, meas = _cell_fields(cidx, _cell_local_sols(cidx, u0_blocks))
                     u0 = jnp.asarray(_eval_value_node_at(u0_node, xq)).reshape(n_quad)
                     return jnp.einsum("q,qn,q->n", qw * meas, per[0]["shape_vals"], u0)
 
@@ -907,11 +914,80 @@ def assemble_fem_nonnodal(
             offs,
         )
 
-    # --- steady linear (non-parametric): A u = b (byte-identical to before the refactor) ---
+    # --- steady linear (non-parametric): A u = b ---
+    b = -full_residual(zeros)  # spatial + natural-BC load (constant part of the residual)
+
+    # RT/N1E/P0 (edge & cell DOFs): assemble the matrix SPARSELY, one element at a time. Each cell's block
+    # is ``jacfwd`` of its element residual w.r.t. that cell's LOCAL dofs — an ``(n_test, n_local_all)`` block
+    # — scattered as COO triplets into a BCOO. A single global ``jacfwd(full_residual)`` (the dense path
+    # below) instead materialises an ``O(n_edges × n_cells)`` tangent tensor that overflows the 2³¹ XLA
+    # element limit past ~10⁴ edges; per-element AD keeps every intermediate element-sized. Mirrors the
+    # native (Lagrange) assembler `fem_native._make_jacobian`. The vertex C0/C1 families
+    # (Hermite/Argyris/Morley) keep the dense path — small 2-D problems whose Hessian-shape element
+    # assembly is not ported — so their behaviour is byte-identical to before this refactor.
+    if not has_vertex:
+        import jax.experimental.sparse as _jsparse
+
+        cell_all_dofs = jnp.concatenate([cdofs[i] for i in range(len(fields))], axis=1)  # (n_cells, n_local_all)
+        _sizes = [int(cdofs[i].shape[1]) for i in range(len(fields))]
+        _splits = list(np.cumsum([0] + _sizes))  # per-field slice bounds within a cell's local vector
+
+        typed = []  # (lowered coeff, test-field index) — same typing as `_make_residual`
+        for bare in volume_terms:
+            for sign, sub in _split_additive_terms(domain, bare):
+                coeff = _lower_statefield_to_trial(_apply_sign(domain, sign, sub), {})
+                tfi = _test_field_index(coeff, field_index)
+                if tfi is None:
+                    raise ValueError("jno.fem (non-nodal): each weak term must contain exactly one test field.")
+                typed.append((coeff, tfi))
+
+        def _elem_res(c, la, coeff, tfi):
+            """This cell's element residual (n_test of field ``tfi``,) from its local dof vector ``la``."""
+            cell_sols = [la[_splits[i] : _splits[i + 1]] for i in range(len(fields))]
+            per, xq, meas = _cell_fields(c, cell_sols)
+            local = {
+                "physical_quad_points": xq,
+                "fields": per,
+                "field_index": field_index,
+                "tag": "fem_gauss",
+                "surface": False,
+                "domain_context": ctx,
+                "temporal_tags": (),
+                "runtime_parameter_tags": (),
+                "volume_vars": (),
+            }
+            return _integrate_term(domain, coeff, local, qw * meas)
+
+        rows_l, cols_l, data_l = [], [], []
+        local_zero = jnp.zeros((n_cells, cell_all_dofs.shape[1]), zeros.dtype)  # assemble at u=0 (linear)
+        for coeff, tfi in typed:
+
+            def _ke(c, la, _e=coeff, _t=tfi):
+                return jax.jacfwd(lambda v: _elem_res(c, v, _e, _t))(la)
+
+            Ke = jax.vmap(_ke)(jnp.arange(n_cells), local_zero)  # (n_cells, n_test_tfi, n_local_all)
+            r = jnp.broadcast_to(cdofs[tfi][:, :, None], Ke.shape)
+            cc = jnp.broadcast_to(cell_all_dofs[:, None, :], Ke.shape)
+            rows_l.append(r.reshape(-1))
+            cols_l.append(cc.reshape(-1))
+            data_l.append(Ke.reshape(-1))
+
+        rows, cols, data = jnp.concatenate(rows_l), jnp.concatenate(cols_l), jnp.concatenate(data_l)
+        if surf_mass is not None:  # fold in the tangential-trace surface mass (BCOO add = triplet concat; dups sum)
+            sm = _jsparse.BCOO.fromdense(jnp.asarray(surf_mass))
+            rows = jnp.concatenate([rows, sm.indices[:, 0]])
+            cols = jnp.concatenate([cols, sm.indices[:, 1]])
+            data = jnp.concatenate([data, sm.data])
+        idx = jnp.stack([rows.astype(jnp.int32), cols.astype(jnp.int32)], axis=1)
+        A = _jsparse.BCOO((data, idx), shape=(total, total))
+        if pins:  # symmetric elimination; `_apply_dirichlet_symmetric` keeps a BCOO sparse
+            A, b = _apply_dirichlet_symmetric(A, b, pins)
+        return (A, b), "linear", offs
+
+    # vertex C0/C1 families (Hermite/Argyris/Morley): dense global jacfwd (small 2-D problems)
     A = jax.jacfwd(full_residual)(zeros)
     if surf_mass is not None:  # add the tangential-trace surface mass (impedance / absorbing BC) to the stiffness
         A = A + surf_mass
-    b = -full_residual(zeros)
     if pins:
         A, b = _apply_dirichlet_symmetric(jnp.asarray(A), jnp.asarray(b), pins)
     return (A, b), "linear", offs
