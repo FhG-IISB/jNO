@@ -46,3 +46,41 @@ def discrete_gradient(topology: Mapping) -> jsparse.BCOO:
     data = np.tile(np.asarray([-1.0, 1.0]), n_edges)  # -φ(lo) + φ(hi)
     indices = jnp.asarray(np.stack([rows, cols], axis=1))
     return jsparse.BCOO((jnp.asarray(data), indices), shape=(n_edges, n_verts))
+
+
+def nodal_vector_interpolation(topology: Mapping) -> tuple[jsparse.BCOO, jsparse.BCOO, jsparse.BCOO]:
+    """Nodal→edge vector interpolation ``(Π_x, Π_y, Π_z)`` for a Nédélec first-kind (N1E) space.
+
+    AMS corrects a *second* near-null-space — the solenoidal (divergence-free) modes the discrete
+    gradient misses — on an auxiliary **vector nodal** problem. The link is ``Π``, which maps a
+    piecewise-linear nodal vector field to N1E edge DOFs: the DOF on edge ``e`` is the circulation
+    ``∫_e v·dl ≈ v(mid)·t_e`` with ``t_e = x_hi − x_lo`` (midpoint rule), and ``v(mid) = ½(v_lo + v_hi)``
+    for a linear field, so ``Π_α[e, lo] = Π_α[e, hi] = ½ t_e[α]``. Following Kolev & Vassilevski
+    (*J. Comput. Math.* 27(5):604–623, 2009, §3) the three scalar components are kept separate — each
+    gets its own scalar auxiliary solve ``(Π_αᵀ A Π_α)⁻¹`` — which is cheaper than one coupled 3n-vector
+    solve and works as well in practice.
+
+    A key consistency property, exact by construction, is that ``Π`` reproduces constant vector fields
+    and ties back to the discrete gradient: ``Π_α · 1 = G · coords[:, α] = t_e[α]``.
+
+    Args:
+        topology: the ``domain._fem_nonnodal_topology`` dict; needs ``n_edges``, ``n_verts``, the
+            canonical ``edge_vertices`` pairs and ``vertex_points``.
+
+    Returns:
+        A 3-tuple of ``(n_edges, n_verts)`` BCOO blocks — one per Cartesian component.
+    """
+    n_edges = int(topology["n_edges"])
+    n_verts = int(topology["n_verts"])
+    ev = np.asarray(topology["edge_vertices"], dtype=np.int64)  # (n_edges, 2) canonical (lo, hi)
+    vpts = np.asarray(topology["vertex_points"], dtype=float)
+    lo, hi = ev[:, 0], ev[:, 1]
+    t = vpts[hi] - vpts[lo]  # (n_edges, 3) edge vectors x_hi − x_lo
+    rows = np.repeat(np.arange(n_edges, dtype=np.int64), 2)
+    cols = np.stack([lo, hi], axis=1).reshape(-1)  # [lo_0, hi_0, lo_1, hi_1, ...]
+    indices = jnp.asarray(np.stack([rows, cols], axis=1))
+    blocks = tuple(
+        jsparse.BCOO((jnp.asarray(np.repeat(0.5 * t[:, a], 2)), indices), shape=(n_edges, n_verts))
+        for a in range(3)  # both endpoints of an edge share ½ t_α
+    )
+    return blocks
