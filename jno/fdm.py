@@ -660,22 +660,32 @@ class _TraceFDM:
             u0 = u0.at[jnp.asarray(idx if len(idx) else allnodes)].set(vals)
         return u0
 
-    def solve(self, nonlinear=None, x0=None):
+    def solve(self, nonlinear=None, x0=None, profile=False):
         """Solve the strong-form system. **Steady** problems fold the Dirichlet rows into the residual
         (``u - g`` on the region) and hand it to the same ``jno.solve`` Newton–Krylov + ``custom_root``
         machinery ``jno.fem`` uses (linear/nonlinear uniform, differentiable for inverse problems).
         **Transient** problems (an ``u(initial) - u0`` condition is present) march by method-of-lines —
         ``t_span`` and the step count come from ``domain.time`` and the initial state from the IC — and
-        return the trajectory (``(n_save, N)``); ``x0`` is rejected (the IC owns the initial state)."""
-        if self._transient:
-            if x0 is not None:
-                raise ValueError("jno.fdm([...]): x0= is rejected for a transient problem — the IC owns the state.")
-            return self._march(nonlinear=nonlinear)
+        return the trajectory (``(n_save, N)``); ``x0`` is rejected (the IC owns the initial state).
 
-        trainable = self._trainable_params()
-        if trainable:
-            return self._parametric_node(trainable, nonlinear=nonlinear, x0=x0)
-        return self._steady_solve(nonlinear=nonlinear, x0=x0)
+        ``profile=True`` runs the (eager, non-parametric) solve inside a JAX Perfetto trace, prints the node
+        count + wall time, and writes the trace to ``./jno_traces`` — like ``jno.core.solve(profile=True)``."""
+
+        def _run():
+            if self._transient:
+                if x0 is not None:
+                    raise ValueError("jno.fdm([...]): x0= is rejected for a transient problem — the IC owns the state.")
+                return self._march(nonlinear=nonlinear)
+            trainable = self._trainable_params()
+            if trainable:
+                return self._parametric_node(trainable, nonlinear=nonlinear, x0=x0)
+            return self._steady_solve(nonlinear=nonlinear, x0=x0)
+
+        if not profile:
+            return _run()
+        from .utils.profiling import profile_solve
+
+        return profile_solve(_run, label=f"fdm profile · {self._N} nodes · {'transient' if self._transient else 'steady'}")
 
     def _steady_solve(self, *, nonlinear=None, x0=None, extra_params=None, extra_pins=None):
         """The eager steady solve: fold the flux and Dirichlet rows into the residual and hand it to the

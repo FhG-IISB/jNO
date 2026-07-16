@@ -1680,6 +1680,8 @@ class domain(MeshIOMixin):
         self._apply_mesh(mesh)
         for name, pred in list(getattr(self, "_tag_predicates", {}).items()):  # re-materialize predicate tags
             self.tag(name, pred)
+        if getattr(self, "_is_time_dependent", False) and self.time is not None:
+            self._add_time_dimension(*self.time)  # re-broadcast the fresh (N, D) tags across time (idempotent)
         self._periodic_meshed = getattr(self, "_periodic_meshed", frozenset()) | want
         self.log.info(f"Re-meshed periodic (conforming) for face pairs {sorted(tuple(sorted(p)) for p in pairs)}")
         return True
@@ -2579,7 +2581,6 @@ class domain(MeshIOMixin):
         occlude=True,
         inward=False,
         r_min=None,
-        near_field=True,
     ):
         """Build an :class:`~jno.domain.enclosure.Enclosure` from radiating boundary ``tags``.
 
@@ -2604,20 +2605,10 @@ class domain(MeshIOMixin):
                 use when the radiating ``tags`` are the outer walls of a **meshed cavity** (an oven /
                 furnace filled with a transparent fluid) and radiation crosses the meshed interior, so
                 the facing walls see one another. Default ``False`` (normals out of the mesh, vacuum gap).
-            near_field: Axisymmetric only, default ``True``. Recompute the element pairs that the uniform
-                ``n_phi`` azimuthal rule cannot resolve — near-touching surfaces (two parts meeting in a
-                narrow wedge) and every element's own ring self-view — with a graded azimuthal quadrature
-                sized to each pair's peak. The ring kernel's azimuthal integrand peaks at ``phi = 0`` with
-                width ``d/r`` (``d`` = surface separation, ``r`` = radius); when ``2*pi/n_phi`` exceeds
-                that, the rule samples the peak's crest and multiplies it by a far wider step, overshooting
-                by ``~dphi/(d/r)``. That is what otherwise drives row sums well above the physical bound of
-                1 and forces the ``r_min`` fudge. Costs a one-off build-time pass over the near pairs.
             r_min: Axisymmetric only. Near-field FLOOR for the ring kernel (``R^2 -> R^2 + r_min^2``) — a
                 fudge that caps the kernel for near-coincident rings rather than integrating them properly.
-                Defaults to ``0`` when ``near_field`` is on (the refinement handles the near field, so any
-                floor is then a pure bias) and to half the median element length otherwise. Note that the
-                legacy default is itself a ~12% systematic error on the analytic concentric-cylinder view
-                factors; pass a value to override either way.
+                Defaults to half the median element length. Note that this default is itself a ~12%
+                systematic error on the analytic concentric-cylinder view factors; pass a value to override.
         """
         from .enclosure import build_enclosure
 
@@ -2634,7 +2625,6 @@ class domain(MeshIOMixin):
             occlude=occlude,
             inward=inward,
             r_min=r_min,
-            near_field=near_field,
         )
 
     def compute_enclosure_view_factor(self, tags, opaque_tags=None):
