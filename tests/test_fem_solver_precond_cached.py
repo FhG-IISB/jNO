@@ -123,6 +123,29 @@ def test_cached_is_idempotent():
     assert c.cached() is c  # .cached() on an already-cached spec is a no-op
 
 
+def test_amg_no_longer_self_caches_but_cached_does(monkeypatch):
+    """Unification: `jno.precond.amg()` rebuilds the hierarchy each solve (no silent cross-solve
+    cache); `.cached()` is the explicit build-once mechanism. Verified without pyamg by counting the
+    (monkeypatched) hierarchy build."""
+    import jno.utils.solver.amg as amgmod
+
+    builds = []
+    monkeypatch.setattr(amgmod, "build_hierarchy", lambda A, **kw: builds.append(1) or "LEVELS")
+    monkeypatch.setattr(amgmod, "vcycle_apply", lambda levels, r: r)  # identity apply
+    ctx = PrecondContext(_op()[0], None)
+
+    bare = jno.precond.amg()
+    materialize_precond(bare, ctx)
+    materialize_precond(bare, ctx)
+    assert len(builds) == 2  # rebuilt each solve — no implicit self-cache
+
+    builds.clear()
+    wrapped = jno.precond.amg().cached()
+    materialize_precond(wrapped, ctx)
+    materialize_precond(wrapped, ctx)
+    assert len(builds) == 1  # .cached() builds once, reuses
+
+
 def test_cached_forwards_prepare_hook():
     class _WithPrepare:
         def __init__(self):

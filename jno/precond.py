@@ -359,13 +359,18 @@ class _AMG(_Spec):
         return self
 
     def materialize(self, ctx: PrecondContext):
-        from .utils.solver.amg import vcycle_apply
+        from .utils.solver.amg import build_hierarchy, vcycle_apply
 
-        if self._levels is None:
+        levels = self._levels  # persisted ONLY by an explicit eager .build(); None → rebuilt THIS solve
+        if levels is None:
             A = ctx.A.bcoo if ctx.A.bcoo is not None else ctx.A.dense()
-            self.build(A)  # raises with .build() guidance when A is traced
-        levels, cycles = self._levels, self.cycles
-        A_op = ctx.A
+            # Rebuild each solve (NOT persisted): the hierarchy depends on the operator *values*, so
+            # silently reusing a stale one across solves would quietly cost iterations. Wrap in
+            # ``.cached()`` (or call ``.build()`` eagerly) to reuse it explicitly. Raises on a tracer.
+            levels = build_hierarchy(
+                A, max_levels=self.max_levels, coarse_size=self.coarse_size, smoother_degree=self.smoother_degree
+            )
+        cycles, A_op = self.cycles, ctx.A
 
         def apply(r):
             x = vcycle_apply(levels, r)
@@ -385,19 +390,20 @@ def amg(*, cycles: int = 1, max_levels: int = 10, coarse_size: int = 100, smooth
     a pure-JAX V-cycle with Chebyshev polynomial smoothing (Adams et al., JCP 188, 2003) — see
     :mod:`jno.utils.solver.amg`.
 
-    The setup runs **once on the host** (eagerly) and freezes fixed-pattern level operators; the
-    per-application V-cycle is then ``jit``/``vmap``-native and a fixed *linear* map, so it may
-    precondition ``cg``/``minres`` as well as ``bicgstab``/``fgmres``. The mesh-independent
-    convergence of multigrid makes this *the* preconditioner for large elliptic blocks — heat,
-    diffusion, elasticity, the (Picard-lagged) velocity block of a saddle system inside
-    :func:`triangular`.
+    The host-side setup builds fixed-pattern level operators; the per-application V-cycle is then
+    ``jit``/``vmap``-native and a fixed *linear* map, so it may precondition ``cg``/``minres`` as
+    well as ``bicgstab``/``fgmres``. The mesh-independent convergence of multigrid makes this *the*
+    preconditioner for large elliptic blocks — heat, diffusion, elasticity, the (Picard-lagged)
+    velocity block of a saddle system inside :func:`triangular`.
 
-    Inside traced contexts (jit, vmap, a parametric inverse solve) call ``spec.build(fem.A)``
-    once, eagerly, first; the frozen hierarchy is a legitimate preconditioner while operator
-    values change (speed degrades gracefully, correctness never). pyamg is imported lazily —
-    without it, a clear ``ImportError`` explains the install. On a matvec-only sub-block the
-    matrix is recovered via the (dense) block view — fine for moderate blocks; pass a pre-built
-    spec for very large ones.
+    **Caching is explicit.** The hierarchy is (re)built at each solve — it depends on the operator
+    *values*, so silently reusing a stale one would quietly cost iterations. To amortise the setup
+    over a sweep / Newton loop / inverse solve, say so: ``jno.precond.amg().cached()``. Inside a
+    **traced** context (jit, vmap, a parametric inverse) pyamg cannot run under the trace, so build
+    once eagerly first — ``spec.build(fem.A)`` — and the frozen hierarchy is reused (a legitimate
+    preconditioner while values drift: speed degrades gracefully, correctness never). pyamg is
+    imported lazily — without it a clear ``ImportError`` explains the install. On a matvec-only
+    sub-block the matrix is recovered via the (dense) block view.
     """
     return _AMG(cycles, max_levels, coarse_size, smoother_degree)
 
