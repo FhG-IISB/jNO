@@ -1192,6 +1192,166 @@ def run_adaptive_transient(
     return AdaptiveTrajectory(np.asarray(times), states, meshes)
 
 
+@dataclass
+class MovingBoundary:
+    """Free-surface / moving-boundary spec for ``FEM.solve(move=...)`` on a **transient** problem.
+
+    The domain boundary moves by a **prescribed velocity**; the mesh deforms to follow it (harmonic
+    interior extension -- :func:`harmonic_extension` + :func:`move_mesh`), the physics marches on the
+    moving mesh, and the state is carried across each move. Returns an :class:`AdaptiveTrajectory` (each
+    frame on its own moved mesh -- use ``.resample(ref)`` to project onto a fixed grid).
+
+    Attributes
+    ----------
+    velocity
+        ``velocity(t, x) -> (n_boundary, dim)`` -- the boundary velocity at time ``t``, evaluated at the
+        **current boundary-vertex positions** ``x`` (a ``(n_boundary, dim)`` array; the mapping is
+        position-based, so the callback needs no vertex indices). **Return zero rows for the held (fixed)
+        part of the boundary** and the interface velocity for the moving surface -- the returned field
+        *is* the specification of which boundary moves.
+    every
+        Move + re-assemble every ``every`` steps (default 1 = every step, most accurate). Larger is
+        cheaper (fewer re-assemblies) but lags the domain shape within a chunk.
+
+    Method / scope (house rule: fail loud on the rest).
+    - **Operator-split ALE.** The physics marches on the current mesh; between steps the mesh is moved
+      and the field **re-interpolated** onto the moved vertices (:func:`transfer_solution`), which
+      transports the field under the mesh motion. This is first-order in ``every`` and is correct for a
+      field whose material is (quasi-)stationary while the *boundary* moves (a melt/free surface with a
+      quasi-static bulk); it does **not** add an ALE convective ``(c-w)·∇u`` term, so it is *not* the
+      right discretization when a represented material velocity ``c`` differs from the mesh velocity
+      ``w`` (coupled flow -- that would double-count advection). State-dependent velocity (Stefan /
+      kinematic condition) is a later extension; ``velocity`` is prescribed for now.
+    - **Connectivity-preserving move only.** A move that would invert an element raises
+      (:func:`move_mesh` ``check``); the remesh-on-tangle fallback (``remesh_with_mmg`` + transfer, for
+      large deformation) is the next extension. Reduce ``dt`` / the motion, or await it.
+    - **Boundary conditions on the moving surface must be *natural* (unconstrained) or a whole-boundary
+      / held-boundary tag** -- those re-derive correctly on the moved mesh. A Dirichlet/Robin BC pinned
+      to the moving surface by a spatial sub-predicate would not follow the motion; an index-carried
+      moving tag is the next extension.
+    - **scalar-P1 field(s), real, non-periodic**, default θ-stepper (mirrors the transient adaptive
+      driver): vector / higher-order / complex / periodic / a custom ``solve_fn`` each raise.
+    """
+
+    velocity: Any
+    every: int = 1
+
+
+def run_moving_boundary(
+    fem: Any, spec: MovingBoundary, *, solve_fn: Any = None, save_ts: Any = None, **kwargs: Any
+) -> "AdaptiveTrajectory":
+    """Drive ``FEM.solve(move=spec)``: march a transient problem while the **boundary moves** by the
+    prescribed ``spec.velocity``. Every ``spec.every`` steps the mesh is deformed to follow the boundary
+    (:func:`harmonic_extension` + :func:`move_mesh`), the problem re-assembled on the moved mesh, and the
+    state carried across (:func:`transfer_solution`, connectivity-preserving). Returns an
+    :class:`AdaptiveTrajectory`. See :class:`MovingBoundary` for the method and its scope."""
+    import jax
+    import jax.numpy as jnp
+
+    import jno
+
+    from .backend_blocks import _block_time_grid
+
+    if fem._constraints is None:
+        raise ValueError("FEM.solve(move=...) requires a FEM built by jno.fem(...) (its constraint list is retained).")
+    if solve_fn is not None:
+        raise NotImplementedError(
+            "fem.solve(move=..., solve_fn=...) is not supported: the moving-boundary driver owns the time march. "
+            "Drop solve_fn (use the default θ-stepper), or drop move=."
+        )
+    if getattr(fem, "_periodic", None) is not None:
+        raise NotImplementedError("fem.solve(move=...) with periodic ties is not supported yet.")
+    if not callable(getattr(spec, "velocity", None)):
+        raise TypeError("MovingBoundary.velocity must be callable: velocity(t, x) -> (n_boundary, dim).")
+
+    d = fem.domain
+    dim = int(d.dimension)
+    if dim not in (2, 3):
+        raise NotImplementedError(f"moving-boundary supports 2D/3D simplicial meshes; got dimension {dim}.")
+
+    cons, kw = fem._constraints, fem._fem_kwargs
+    block = fem._op
+    n_verts = int(np.asarray(d.mesh.points).shape[0])
+    state = jnp.asarray(block.state0).reshape(-1)
+    if jnp.iscomplexobj(state):
+        raise NotImplementedError("moving-boundary is real-only (the state transfer / mesh motion are); complex is future.")
+    off = [int(x) for x in (fem.offsets or [0, int(state.shape[0])])]
+    n_fields = len(off) - 1
+    for _f in range(n_fields):
+        if off[_f + 1] - off[_f] != n_verts:
+            raise NotImplementedError(
+                f"moving-boundary supports scalar-P1 field(s) only for now: field {_f} has {off[_f + 1] - off[_f]} "
+                f"DOFs vs {n_verts} mesh vertices (vector / higher-order). Express it as scalar-P1 fields, or await it."
+            )
+
+    key = "triangle" if dim == 2 else "tetra"
+    ts = np.asarray(_block_time_grid(block))  # fixed t0..t1 grid; moving the mesh never changes the grid
+    dt = float(block.dt)
+    theta = float(block.metadata.get("theta", 1.0)) if block.metadata else 1.0
+    n_steps = len(ts) - 1
+    every = max(1, int(spec.every))
+    vel = spec.velocity
+
+    def _snapshot():
+        return (np.asarray(d.mesh.points)[:, :dim].astype(np.float64), np.asarray(d.mesh.cells_dict[key]).astype(np.int64))
+
+    cur_mesh = _snapshot()
+    times, states, meshes = [float(ts[0])], [state], [cur_mesh]
+    history: list[dict] = []
+    cur = fem
+
+    i = 0
+    while i < n_steps:
+        chunk = int(min(every, n_steps - i))
+        t0c, t1c = float(ts[i]), float(ts[i + chunk])
+        old_pts, old_cells = cur_mesh
+
+        # 1) MOVE the boundary from shape(t0c) toward shape(t1c) by the prescribed velocity, hold the rest.
+        bfacets = _boundary_edges_from_triangles(old_cells) if dim == 2 else _boundary_faces_from_tets(old_cells)
+        bverts = np.unique(bfacets.reshape(-1))
+        vb = np.asarray(vel(t0c, old_pts[bverts]), dtype=np.float64)
+        if vb.shape != (bverts.shape[0], dim):
+            raise ValueError(
+                f"MovingBoundary.velocity must return (n_boundary, dim) = ({bverts.shape[0]}, {dim}); got {vb.shape}."
+            )
+        bdisp = np.zeros((old_pts.shape[0], dim), dtype=np.float64)
+        bdisp[bverts] = vb * (t1c - t0c)
+        move_mesh(d, harmonic_extension(d, bdisp), copy=False)  # fail loud on tangle (house rule 1)
+
+        # 2) re-tag (held boundaries re-derive on the moved facets) + re-assemble on the moved mesh
+        for _name, _pred in list(getattr(d, "_tag_predicates", {}).items()):
+            d.tag(_name, _pred)
+        cur = jno.fem(cons, **kw)
+        block = cur._op
+        new_mesh = _snapshot()
+        new_pts, _new_cells = new_mesh
+
+        # 3) carry the state onto the moved vertices (re-interpolate -> transports the field under the motion)
+        idx, w, _inside = _locate_barycentric(old_pts, old_cells, new_pts, tol=1e-9, k=32)
+        wj, ij = jnp.asarray(w, dtype=state.real.dtype), jnp.asarray(idx)
+        state = jnp.concatenate([jnp.einsum("qk,qk->q", wj, state[off[_f] : off[_f + 1]][ij]) for _f in range(n_fields)])
+
+        # 4) march the chunk on the moved mesh (the ordinary differentiable θ-stepper)
+        blk = block
+
+        def _body(u, t, _blk=blk):
+            un = _blk.step(u, t, dt, theta=theta)
+            return un, un
+
+        state, traj = jax.lax.scan(_body, state, jnp.asarray(ts[i : i + chunk], dtype=state.dtype))
+        cur_mesh = new_mesh
+        for j in range(chunk):
+            i += 1
+            times.append(float(ts[i]))
+            states.append(traj[j])
+            meshes.append(cur_mesh)
+        history.append({"t": float(ts[i]), "n_dofs": int(new_pts.shape[0])})
+
+    fem.__dict__.update(cur.__dict__)  # rebind to the final moved mesh
+    fem.adapt_history = history
+    return AdaptiveTrajectory(np.asarray(times), states, meshes)
+
+
 def run_adaptive_inverse(
     domain: Any,
     build_inverse: Any,

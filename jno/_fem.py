@@ -1134,6 +1134,7 @@ class FEM:
         solve_fn=None,
         *,
         adapt=None,
+        move=None,
         x0=None,
         nonlinear=None,
         linear=None,
@@ -1152,6 +1153,13 @@ class FEM:
         refinement step is non-differentiable (discrete remeshing); gradients are exact on
         the frozen final mesh, so a differentiable inverse problem is run *after* adapting.
         See :class:`jno.utils.solver.fem_adapt.AdaptSpec`.
+
+        Pass ``move=MovingBoundary(velocity=...)`` on a **transient** problem to run the
+        **moving-boundary** loop: the domain boundary moves each step by the prescribed velocity, the
+        mesh deforms to follow it (harmonic interior extension), and the state is carried across each
+        move — for free-surface / deforming-domain physics. Returns an ``AdaptiveTrajectory`` (each frame
+        on its own moved mesh). See :class:`jno.utils.solver.fem_adapt.MovingBoundary` for the method and
+        its scope (operator-split ALE; scalar-P1, real, prescribed velocity for now).
 
         Delegates to :meth:`FemLinearSystem.solve` (steady linear),
         :meth:`FemResidualOperator.solve` (steady nonlinear), or
@@ -1224,7 +1232,15 @@ class FEM:
 
         def _run():
             result = self._solve_dispatch(
-                solve_fn, adapt=adapt, x0=x0, nonlinear=nonlinear, linear=linear, precond=precond, time=time, **kwargs
+                solve_fn,
+                adapt=adapt,
+                move=move,
+                x0=x0,
+                nonlinear=nonlinear,
+                linear=linear,
+                precond=precond,
+                time=time,
+                **kwargs,
             )
             if isinstance(result, Placeholder):
                 # Tag the solve node with its domain so jno.core can infer the domain straight from the graph
@@ -1239,7 +1255,17 @@ class FEM:
         return profile_solve(_run, label=f"fem profile · {self.dofs} DOFs · {self._mode}", warm=(adapt is None))
 
     def _solve_dispatch(
-        self, solve_fn=None, *, adapt=None, x0=None, nonlinear=None, linear=None, precond=None, time=None, **kwargs
+        self,
+        solve_fn=None,
+        *,
+        adapt=None,
+        move=None,
+        x0=None,
+        nonlinear=None,
+        linear=None,
+        precond=None,
+        time=None,
+        **kwargs,
     ):
         """Mode dispatch for :meth:`solve` — returns the solution array or a differentiable trace node."""
         has_slots = (
@@ -1249,6 +1275,21 @@ class FEM:
             or (precond is not None)
             or (time is not None)
         )
+        if move is not None:
+            if adapt is not None or has_slots:
+                raise NotImplementedError(
+                    "fem.solve(move=...) does not compose with adapt= or the solver slots "
+                    "(x0/nonlinear/linear/precond/time) yet — the moving-boundary driver owns the march and "
+                    "re-assembles each move. Use move= on its own (default θ-stepper)."
+                )
+            if self._mode != "transient":
+                raise NotImplementedError(
+                    f"fem.solve(move=...) needs a transient problem (a u.t term); this FEM is '{self._mode}'. "
+                    "A moving boundary evolves in time — add the time derivative and a domain time grid."
+                )
+            from .utils.solver.fem_adapt import run_moving_boundary
+
+            return run_moving_boundary(self, move, solve_fn=solve_fn, **kwargs)
         if adapt is not None:
             if has_slots:
                 raise NotImplementedError(
