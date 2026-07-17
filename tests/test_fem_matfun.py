@@ -114,31 +114,33 @@ def _advection_fem():
     return LinearOperator(A), dense
 
 
-_CPU = jax.devices("cpu")[0]  # jax.scipy.linalg.schur (the non-symmetric path) is CPU-only
-
-
 def test_applyfun_nonsymmetric_forward_is_exact():
-    """``symmetric=False`` (Arnoldi) computes ``exp(A)·v`` for a non-symmetric advection–diffusion ``A``,
-    forward-exact — matching the dense matrix exponential. CPU-only (Schur)."""
+    """``symmetric=False`` (Arnoldi + eig) computes ``f(A)·v`` for a non-symmetric advection–diffusion ``A``,
+    forward-exact — the matrix exponential and a resolvent both match their dense references (GPU-capable)."""
     _op, dense = _advection_fem()
     w = jnp.asarray(np.random.default_rng(0).standard_normal(dense.shape[0]))
-    with jax.default_device(_CPU):
-        fv = jno.solve.applyfun(dense, w, fun=lambda z: jnp.exp(-0.05 * z), order=40, symmetric=False)
-        true = jax.scipy.linalg.expm(-0.05 * dense) @ w
+    fv = jno.solve.applyfun(dense, w, fun=lambda z: jnp.exp(-0.05 * z), order=40, symmetric=False)
+    true = jax.scipy.linalg.expm(-0.05 * dense) @ w
     assert float(jnp.linalg.norm(fv - true) / jnp.linalg.norm(true)) < 1e-8
 
+    fr = jno.solve.applyfun(dense, w, fun=lambda z: 1.0 / (3.0 + z), order=40, symmetric=False)
+    truer = jnp.linalg.solve(3.0 * jnp.eye(dense.shape[0]) + dense, w)
+    assert float(jnp.linalg.norm(fr - truer) / jnp.linalg.norm(truer)) < 1e-8
 
-def test_applyfun_nonsymmetric_gradient_is_blocked_loudly():
-    """The non-symmetric path is forward-only: differentiating it raises (JAX has no Schur derivative),
-    per the house rule against a silently-non-differentiable path dressed up as differentiable."""
+
+def test_applyfun_nonsymmetric_is_differentiable():
+    """The non-symmetric path is **differentiable** for a general holomorphic ``fun`` — the Daleckii–Krein
+    JVP supplies the matrix-function derivative analytically (no differentiating through ``eig``), so
+    ``jax.grad`` flows and matches central finite differences to machine precision."""
     _op, dense = _advection_fem()
     w = jnp.asarray(np.random.default_rng(0).standard_normal(dense.shape[0]))
 
     def loss(s):
-        return jnp.sum(jno.solve.applyfun(s * dense, w, fun=lambda z: jnp.exp(-0.05 * z), symmetric=False) ** 2)
+        return jnp.sum(jno.solve.applyfun(s * dense, w, fun=lambda z: jnp.exp(-0.05 * z), order=40, symmetric=False) ** 2)
 
-    with jax.default_device(_CPU), pytest.raises(NotImplementedError):
-        jax.grad(loss)(1.0)
+    g = float(jax.grad(loss)(1.0))
+    fd = float((loss(1.0 + 1e-6) - loss(1.0 - 1e-6)) / 2e-6)
+    assert abs(g - fd) / abs(fd) < 1e-5
 
 
 def test_diagonal_matches_dense():

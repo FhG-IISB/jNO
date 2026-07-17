@@ -74,35 +74,76 @@ def trace(A, *, fun=None, samples: int = 32, order: int = 25, key=None):
     return estimate(mv, _key(key))
 
 
+def _dense_funm_eig(fun):
+    """A **GPU-capable, differentiable** dense matrix function ``f(H) = V diag(f(λ)) V⁻¹`` for the Arnoldi
+    path, replacing ``matfree``'s Schur one (which is CPU-only *and* non-differentiable). The forward uses
+    ``jnp.linalg.eig`` (GPU-capable where ``jax.scipy.linalg.schur`` is not); the derivative is supplied
+    **analytically** by the Daleckii–Krein / divided-difference formula rather than by differentiating
+    through ``eig`` — so it sidesteps JAX's missing non-symmetric-eigenvector derivative. A ``custom_jvp``
+    (built only from matmuls, hence transposable ⇒ reverse-mode works too):
+
+        ``L_f(H)[E] = V ( Γ ∘ (V⁻¹ E V) ) V⁻¹``,   ``Γ_ij = (f(λ_i)−f(λ_j))/(λ_i−λ_j)``  (``= f′(λ_i)`` if ``i=j``)
+
+    Requires ``fun`` **holomorphic** (for ``f′`` on the diagonal) and ``H`` **diagonalizable** (generic;
+    a defective operator makes ``eig`` ill-conditioned)."""
+    fp = jax.grad(fun, holomorphic=True)  # complex derivative for the divided-difference diagonal
+
+    @jax.custom_jvp
+    def dense_funm(H):
+        real_in = not jnp.iscomplexobj(H)
+        lam, V = jnp.linalg.eig(H)
+        out = (V * fun(lam)) @ jnp.linalg.inv(V)
+        return out.real.astype(H.dtype) if real_in else out
+
+    @dense_funm.defjvp
+    def _jvp(primals, tangents):
+        (H,), (dH,) = primals, tangents
+        real_in = not jnp.iscomplexobj(H)
+        lam, V = jnp.linalg.eig(H)
+        Vinv = jnp.linalg.inv(V)
+        fl = fun(lam)
+        out = (V * fl) @ Vinv
+        den = lam[:, None] - lam[None, :]
+        deg = jnp.abs(den) < 1e-12  # coincident eigenvalues ⇒ divided difference → f′
+        gamma = jnp.where(
+            deg, jax.vmap(fp)(lam)[:, None] * jnp.ones_like(den), (fl[:, None] - fl[None, :]) / jnp.where(deg, 1.0, den)
+        )
+        dout = V @ (gamma * (Vinv @ dH.astype(V.dtype) @ V)) @ Vinv
+        if real_in:
+            out, dout = out.real.astype(H.dtype), dout.real.astype(H.dtype)
+        return out, dout
+
+    return dense_funm
+
+
 def applyfun(A, v, *, fun, order: int = 30, symmetric: bool = True):
     """``f(A)·v``, matrix-free via a Krylov (Lanczos/Arnoldi) approximation — e.g.
     ``fun=lambda z: jnp.exp(-dt*z)`` is one exact exponential-integrator step ``exp(-dt·A)·v``.
-    Deterministic (no probes); ``order`` sets the Krylov subspace size.
+    Deterministic (no probes); ``order`` sets the Krylov subspace size. Both paths are **differentiable**
+    and **GPU-capable**.
 
-    ``symmetric=True`` (default) uses **Lanczos** (short recurrence, cheap), assumes ``A = Aᵀ`` (the common
-    FEM case), is **differentiable**, and runs on **GPU**. ``symmetric=False`` uses **Arnoldi** for a
-    **non-symmetric** operator (advection–diffusion / non-self-adjoint transport): it evaluates ``fun`` on
-    the small Hessenberg matrix by a Schur decomposition, so it is **forward-exact for any analytic ``fun``**
-    but comes with two limits from ``jax.scipy.linalg.schur`` — it is **CPU-only** (raises on GPU) and
-    **not differentiable** (JAX has no ``schur`` derivative). For a **differentiable, GPU** non-symmetric
-    time step, use the exponential integrator ``fem.solve(time=jno.solve.exponential())``, which routes the
-    non-symmetric matrix exponential through a differentiable Padé approximation instead."""
+    ``symmetric=True`` (default) uses **Lanczos** (short recurrence, cheap) and assumes ``A = Aᵀ`` (the common
+    FEM case). ``symmetric=False`` uses **Arnoldi** for a **non-symmetric** operator (advection–diffusion /
+    non-self-adjoint transport), with ``f(H)`` on the small Hessenberg matrix computed by an
+    eigendecomposition and differentiated analytically (Daleckii–Krein), so it is forward-exact *and*
+    reverse-mode differentiable for any **holomorphic** ``fun`` on a **diagonalizable** ``A``."""
     _require_matfree()
     from matfree import decomp, funm
 
     mv, _n, _dtype = _operator(A)
     if symmetric:
         f = funm.funm_lanczos_sym(funm.dense_funm_sym_eigh(fun), decomp.tridiag_sym(order))
-    else:  # non-symmetric: Arnoldi Hessenberg + Schur f(H). Forward-exact; Schur blocks the JAX gradient.
-        f = funm.funm_arnoldi(funm.dense_funm_schur(fun), decomp.hessenberg(order, reortho="full"))
+    else:  # non-symmetric: Arnoldi Hessenberg + eig f(H) — GPU-capable, differentiable (Daleckii–Krein JVP)
+        f = funm.funm_arnoldi(_dense_funm_eig(fun), decomp.hessenberg(order, reortho="full"))
     return f(mv, jnp.asarray(v))
 
 
 def expmv(A, v, *, order: int = 30):
     """``exp(A)·v`` for a possibly **non-symmetric** ``A``, via Arnoldi + a differentiable **Padé**
-    approximation of the small Hessenberg exponential. Unlike ``applyfun(..., symmetric=False)`` (Schur:
-    CPU-only, forward-only, any ``fun``) this is limited to the **exponential** but is **reverse-mode
-    differentiable and GPU-capable** — the engine of the non-symmetric exponential time integrator. Scale
+    approximation of the small Hessenberg exponential (GPU, reverse-mode differentiable). It is limited to
+    the **exponential** (where ``applyfun(..., symmetric=False)`` takes any holomorphic ``fun``), but Padé
+    needs **no diagonalizability** — robust on defective/near-defective Hessenbergs where the eig-based
+    ``applyfun`` path is ill-conditioned. The engine of the non-symmetric exponential time integrator; scale
     ``A`` into its matvec to get ``exp(dt·A)·v``."""
     _require_matfree()
     from matfree import decomp, funm
