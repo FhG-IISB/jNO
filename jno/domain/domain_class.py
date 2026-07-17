@@ -3204,9 +3204,18 @@ class domain(MeshIOMixin):
                 self.context[tag] = _apply_time_value_to_sampled(tag, stacked)
 
                 if normals_available and all_normals:
-                    nrm_stacked = np.stack(all_normals, axis=0)
-                    if not is_time_dep:
-                        nrm_stacked = nrm_stacked[:, np.newaxis, :, :]
+                    nrm_stacked = np.stack(all_normals, axis=0)  # (B, N, D)
+                    if is_time_dep:
+                        # Normals are geometric (time-independent), but the coords are tiled to (B, T, N, D);
+                        # tile the normals across T too so the eval's time-scan slices them per step. Without
+                        # this they stay (B, N, D) and the scan collapses them to a single point (a silently
+                        # wrong, constant boundary flux).
+                        t_steps = int(np.asarray(stacked).shape[1])
+                        nrm_stacked = np.broadcast_to(
+                            nrm_stacked[:, np.newaxis], (nrm_stacked.shape[0], t_steps, *nrm_stacked.shape[1:])
+                        ).copy()
+                    else:
+                        nrm_stacked = nrm_stacked[:, np.newaxis, :, :]  # (B, 1, N, D) — T=1 for steady
                     self.context[f"n_{tag}"] = nrm_stacked
 
             else:
@@ -3234,9 +3243,14 @@ class domain(MeshIOMixin):
                 self.context[tag] = _apply_time_value_to_sampled(tag, self.context[tag])
 
                 if normals_available and available_normals is not None:
-                    sampled_nrm = available_normals[idx]
-                    if not is_time_dep:
-                        sampled_nrm = sampled_nrm[np.newaxis, :, :]
+                    sampled_nrm = available_normals[idx]  # (n_samples, D)
+                    if is_time_dep:
+                        # tile the (time-independent) normals across T so the eval's time-scan slices them
+                        # per step (matching the coords); otherwise the scan collapses them to one point.
+                        t_steps = int(sampled_pts.shape[0])  # sampled_pts is (T, n_samples, D) here
+                        sampled_nrm = np.broadcast_to(sampled_nrm[np.newaxis], (t_steps, *sampled_nrm.shape))
+                    else:
+                        sampled_nrm = sampled_nrm[np.newaxis, :, :]  # (1, n_samples, D) — T=1 for steady
                     self.context[f"n_{tag}"] = np.broadcast_to(
                         sampled_nrm[np.newaxis, ...],
                         (batch_count, *sampled_nrm.shape),

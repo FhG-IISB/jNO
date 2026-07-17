@@ -114,17 +114,28 @@ def test_frozen_gradient_readout_3d_affine_exact():
     assert np.max(np.abs(vn - vn_ana)) < 1e-6
 
 
-def test_frozen_readout_on_transient_domain_fails_loud():
-    """On a transient domain the normal tags are not time-replicated, so a spatial readout would silently
-    collapse to a wrong constant — the eval must refuse rather than return garbage (house rule 1)."""
-    d = jno.Shape.rect(0, 0, 1, 1, size=0.15).domain(time=(0.0, 0.3, 6))
+def test_frozen_readout_on_transient_domain_is_correct_and_differentiable():
+    """The normals fix: on a TRANSIENT domain the normal tags are time-tiled (like the coords), so the
+    boundary-flux readout evaluates correctly — the normals no longer collapse to one point — and it is
+    differentiable in the field values (a Stefan velocity feeding back into the solve trains cleanly)."""
+    d = jno.Shape.rect(0, 0, 1, 1, size=0.1).domain(time=(0.0, 0.3, 11))
     u, _ = d.fem_symbols()
     pts = np.asarray(d.mesh.points)[:, :2]
-    sol = 3.0 * pts[:, 0] - 2.0 * pts[:, 1]
+    sol = 3.0 * pts[:, 0] - 2.0 * pts[:, 1]  # ∇T = (3, -2)
     x, y, t, nx, ny = d.variable("boundary", normals=True, split=True)
     Tf = u.bind(x=x, y=y).freeze(sol)
-    with pytest.raises(NotImplementedError, match="transient|time"):
-        (Tf.x * nx + Tf.y * ny).eval()
+
+    nxe, nye = np.asarray(nx.eval()).reshape(-1), np.asarray(ny.eval()).reshape(-1)
+    assert nxe.shape[0] > 1 and nxe.min() < -0.9 and nxe.max() > 0.9  # many varying unit-normal comps, not 1
+    flux = np.asarray((Tf.x * nx + Tf.y * ny).eval()).reshape(-1)
+    assert np.max(np.abs(flux - (3.0 * nxe - 2.0 * nye))) < 1e-7  # Tf.x=3, Tf.y=-2 ⇒ flux = 3·nx - 2·ny exactly
+
+    def loss(v):
+        Tv = u.bind(x=x, y=y).freeze(v)
+        return jnp.sum((Tv.x * nx + Tv.y * ny).eval() ** 2)
+
+    g = np.asarray(jax.grad(loss)(jnp.asarray(sol)))
+    assert np.all(np.isfinite(g)) and np.linalg.norm(g) > 0  # readout is differentiable in the field
 
 
 def test_frozen_readout_without_domain_fails_loud():
