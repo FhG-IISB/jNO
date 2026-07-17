@@ -103,6 +103,44 @@ def test_logdet_trains_a_parameter():
     assert abs(float(theta) - 2.0) < 0.05  # recovered the scale by training through logdet
 
 
+def _advection_fem():
+    """A **non-symmetric** advection–diffusion FEM operator ``b·∇u + (∇u,∇v)`` and its dense form."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.16)
+    u, v = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    A = jno.fem([5.0 * ui.x * vi + ui.x * vi.x + ui.y * vi.y]).operator[0]  # convection ⇒ A ≠ Aᵀ
+    dense = jnp.asarray(A.todense() if hasattr(A, "todense") else A)
+    return LinearOperator(A), dense
+
+
+_CPU = jax.devices("cpu")[0]  # jax.scipy.linalg.schur (the non-symmetric path) is CPU-only
+
+
+def test_applyfun_nonsymmetric_forward_is_exact():
+    """``symmetric=False`` (Arnoldi) computes ``exp(A)·v`` for a non-symmetric advection–diffusion ``A``,
+    forward-exact — matching the dense matrix exponential. CPU-only (Schur)."""
+    _op, dense = _advection_fem()
+    w = jnp.asarray(np.random.default_rng(0).standard_normal(dense.shape[0]))
+    with jax.default_device(_CPU):
+        fv = jno.solve.applyfun(dense, w, fun=lambda z: jnp.exp(-0.05 * z), order=40, symmetric=False)
+        true = jax.scipy.linalg.expm(-0.05 * dense) @ w
+    assert float(jnp.linalg.norm(fv - true) / jnp.linalg.norm(true)) < 1e-8
+
+
+def test_applyfun_nonsymmetric_gradient_is_blocked_loudly():
+    """The non-symmetric path is forward-only: differentiating it raises (JAX has no Schur derivative),
+    per the house rule against a silently-non-differentiable path dressed up as differentiable."""
+    _op, dense = _advection_fem()
+    w = jnp.asarray(np.random.default_rng(0).standard_normal(dense.shape[0]))
+
+    def loss(s):
+        return jnp.sum(jno.solve.applyfun(s * dense, w, fun=lambda z: jnp.exp(-0.05 * z), symmetric=False) ** 2)
+
+    with jax.default_device(_CPU), pytest.raises(NotImplementedError):
+        jax.grad(loss)(1.0)
+
+
 def test_diagonal_matches_dense():
     """``diagonal`` estimates the per-DOF diagonal field — of ``A`` and (the key use) of ``A⁻¹``, the
     pointwise variance map. Stochastic, so the whole-field error is loose."""

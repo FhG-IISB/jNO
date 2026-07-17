@@ -425,13 +425,16 @@ def trace(A, *, fun=None, samples: int = 32, order: int = 25, key=None):
     return _trace(A, fun=fun, samples=samples, order=order, key=key)
 
 
-def applyfun(A, v, *, fun, order: int = 30):
-    """Matrix-free ``f(A)·v`` for a symmetric ``A`` (Lanczos) — e.g. one exact exponential-integrator
-    step ``exp(-dt·A)·v`` with ``fun=lambda z: jnp.exp(-dt*z)``. Differentiable; optional ``matfree``.
+def applyfun(A, v, *, fun, order: int = 30, symmetric: bool = True):
+    """Matrix-free ``f(A)·v`` — e.g. one exact exponential-integrator step ``exp(-dt·A)·v`` with
+    ``fun=lambda z: jnp.exp(-dt*z)``. ``symmetric=True`` (default, Lanczos) is differentiable;
+    ``symmetric=False`` (Arnoldi) handles a **non-symmetric** ``A`` **forward-exact** but is **CPU-only and
+    not differentiable** (relies on ``jax.scipy.linalg.schur``) — for a differentiable, GPU non-symmetric
+    time step use ``fem.solve(time=jno.solve.exponential())``. Optional ``matfree``.
     See :func:`jno.utils.solver.matfun.applyfun`."""
     from .utils.solver.matfun import applyfun as _applyfun
 
-    return _applyfun(A, v, fun=fun, order=order)
+    return _applyfun(A, v, fun=fun, order=order, symmetric=symmetric)
 
 
 def diagonal(A, *, fun=None, samples: int = 32, order: int = 25, key=None):

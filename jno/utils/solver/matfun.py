@@ -74,15 +74,27 @@ def trace(A, *, fun=None, samples: int = 32, order: int = 25, key=None):
     return estimate(mv, _key(key))
 
 
-def applyfun(A, v, *, fun, order: int = 30):
-    """``f(A)·v`` for a symmetric ``A``, matrix-free via Lanczos (Krylov) approximation — e.g.
+def applyfun(A, v, *, fun, order: int = 30, symmetric: bool = True):
+    """``f(A)·v``, matrix-free via a Krylov (Lanczos/Arnoldi) approximation — e.g.
     ``fun=lambda z: jnp.exp(-dt*z)`` is one exact exponential-integrator step ``exp(-dt·A)·v``.
-    Deterministic (no probes); ``order`` sets the Krylov subspace size."""
+    Deterministic (no probes); ``order`` sets the Krylov subspace size.
+
+    ``symmetric=True`` (default) uses **Lanczos** (short recurrence, cheap), assumes ``A = Aᵀ`` (the common
+    FEM case), is **differentiable**, and runs on **GPU**. ``symmetric=False`` uses **Arnoldi** for a
+    **non-symmetric** operator (advection–diffusion / non-self-adjoint transport): it evaluates ``fun`` on
+    the small Hessenberg matrix by a Schur decomposition, so it is **forward-exact for any analytic ``fun``**
+    but comes with two limits from ``jax.scipy.linalg.schur`` — it is **CPU-only** (raises on GPU) and
+    **not differentiable** (JAX has no ``schur`` derivative). For a **differentiable, GPU** non-symmetric
+    time step, use the exponential integrator ``fem.solve(time=jno.solve.exponential())``, which routes the
+    non-symmetric matrix exponential through a differentiable Padé approximation instead."""
     _require_matfree()
     from matfree import decomp, funm
 
     mv, _n, _dtype = _operator(A)
-    f = funm.funm_lanczos_sym(funm.dense_funm_sym_eigh(fun), decomp.tridiag_sym(order))
+    if symmetric:
+        f = funm.funm_lanczos_sym(funm.dense_funm_sym_eigh(fun), decomp.tridiag_sym(order))
+    else:  # non-symmetric: Arnoldi Hessenberg + Schur f(H). Forward-exact; Schur blocks the JAX gradient.
+        f = funm.funm_arnoldi(funm.dense_funm_schur(fun), decomp.hessenberg(order, reortho="full"))
     return f(mv, jnp.asarray(v))
 
 
