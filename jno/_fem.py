@@ -1116,7 +1116,9 @@ class FEM:
             raise KeyError(f"FEM.block_index: trial field {getattr(field, 'name', fk)!r} is not part of this system.")
         return keys.index(fk)
 
-    def solve(self, solve_fn=None, *, adapt=None, x0=None, nonlinear=None, linear=None, precond=None, **kwargs) -> Any:
+    def solve(
+        self, solve_fn=None, *, adapt=None, x0=None, nonlinear=None, linear=None, precond=None, time=None, **kwargs
+    ) -> Any:
         """Differentiable forward solve as a trace node — the inverse-problem entry.
 
         Pass ``adapt=AdaptSpec(...)`` to run the **adaptive** loop
@@ -1192,7 +1194,7 @@ class FEM:
         invalidates warm starts and cached preconditioner setups — pass ``solve_fn=`` there).
         """
         result = self._solve_dispatch(
-            solve_fn, adapt=adapt, x0=x0, nonlinear=nonlinear, linear=linear, precond=precond, **kwargs
+            solve_fn, adapt=adapt, x0=x0, nonlinear=nonlinear, linear=linear, precond=precond, time=time, **kwargs
         )
         if isinstance(result, Placeholder):
             # Tag the solve node with its domain so jno.core can infer the domain straight from the graph
@@ -1200,9 +1202,17 @@ class FEM:
             result._domain = self.domain
         return result
 
-    def _solve_dispatch(self, solve_fn=None, *, adapt=None, x0=None, nonlinear=None, linear=None, precond=None, **kwargs):
+    def _solve_dispatch(
+        self, solve_fn=None, *, adapt=None, x0=None, nonlinear=None, linear=None, precond=None, time=None, **kwargs
+    ):
         """Mode dispatch for :meth:`solve` — returns the solution array or a differentiable trace node."""
-        has_slots = (x0 is not None) or (nonlinear is not None) or (linear is not None) or (precond is not None)
+        has_slots = (
+            (x0 is not None)
+            or (nonlinear is not None)
+            or (linear is not None)
+            or (precond is not None)
+            or (time is not None)
+        )
         if adapt is not None:
             if has_slots:
                 raise NotImplementedError(
@@ -1215,7 +1225,7 @@ class FEM:
             return run_adaptive_solve(self, adapt, solve_fn=solve_fn, **kwargs)
         if has_slots:
             solve_fn, kwargs = self._compose_slots(
-                solve_fn, x0=x0, nonlinear=nonlinear, linear=linear, precond=precond, kwargs=kwargs
+                solve_fn, x0=x0, nonlinear=nonlinear, linear=linear, precond=precond, time=time, kwargs=kwargs
             )
             from_slots = True
         else:
@@ -1301,14 +1311,18 @@ class FEM:
             return self._op.solve(solve_fn, **kwargs).fn()
         return self._op.solve(solve_fn, **kwargs)
 
-    def _compose_slots(self, solve_fn, *, x0, nonlinear, linear, precond, kwargs):
+    def _compose_slots(self, solve_fn, *, x0, nonlinear, linear, precond, time=None, kwargs):
         """Compose the solver slots into the mode-appropriate ``solve_fn`` (see :meth:`solve`)."""
         from .utils.solver.solver_api import compose_linear_solve_fn, compose_nonlinear_solve_fn
 
         if solve_fn is not None:
             raise ValueError(
                 "fem.solve: pass either solve_fn= (the total override) or the solver slots "
-                "(x0/nonlinear/linear/precond), not both."
+                "(x0/nonlinear/linear/precond/time), not both."
+            )
+        if time is not None and self._mode != "transient":
+            raise ValueError(
+                f"fem.solve(time=...) picks a time-integration scheme, but this problem is {self._mode}, not transient."
             )
         if self._mode == "complex_transient":
             raise NotImplementedError(
@@ -1331,6 +1345,8 @@ class FEM:
             lin_s, nonlin_s = compose_transient_step_solvers(nonlinear, linear, precond, self, self._op)
 
             def _stepper(block, args, save_ts):
+                if time is not None:  # jno.solve.theta(...) / jno.solve.exponential(...)
+                    return time.integrate(block, args, save_ts, linear_solve=lin_s, nonlinear_solve=nonlin_s)
                 return _default_transient_integrate(block, args, save_ts, linear_solve=lin_s, nonlinear_solve=nonlin_s)
 
             return _stepper, kwargs

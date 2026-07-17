@@ -327,7 +327,7 @@ def _block_time_grid(block):
     return jnp.linspace(t0, t1, n_steps + 1)
 
 
-def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, nonlinear_solve=None):
+def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, nonlinear_solve=None, theta=None):
     """Default transient integrator: backward Euler at the block's *own* assembled step ``dt``,
     advanced with ``jax.lax.scan`` (reverse-mode differentiable) and sampled at ``save_ts`` by
     linear interpolation, so the integration step is always the assembled ``dt`` and never an
@@ -359,7 +359,8 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
     # that step (theta-method for a linear block, backward-Euler Newton for a nonlinear one); read
     # theta from the block so a linear step uses the assembled scheme. Operators are only applied as
     # matvecs inside block.step, so a BCOO operator stays sparse.
-    theta = float(block.metadata.get("theta", 1.0)) if getattr(block, "metadata", None) else 1.0
+    if theta is None:  # jno.solve.theta(...) overrides the assembly's default (1 backward-Euler / ½ trapezoidal)
+        theta = float(block.metadata.get("theta", 1.0)) if getattr(block, "metadata", None) else 1.0
 
     def step(w, t_next):
         wn = block.step(

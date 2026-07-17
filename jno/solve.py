@@ -52,6 +52,8 @@ __all__ = [
     "logdet",
     "trace",
     "applyfun",
+    "theta",
+    "exponential",
 ]
 
 
@@ -429,3 +431,23 @@ def applyfun(A, v, *, fun, order: int = 30):
     from .utils.solver.matfun import applyfun as _applyfun
 
     return _applyfun(A, v, fun=fun, order=order)
+
+
+def theta(theta: float = 1.0):
+    """θ-method **time scheme** for ``fem.solve(time=...)``: ``θ=1`` backward Euler (default),
+    ``θ=1/2`` Crank–Nicolson / trapezoidal (2nd-order accurate), ``θ=0`` forward Euler. Overrides the
+    scheme the assembly picks; composes with ``linear=``/``precond=`` (the per-step solve)."""
+    from .utils.solver.timeschemes import _ThetaScheme
+
+    return _ThetaScheme(theta)
+
+
+def exponential(*, order: int = 40, mass: str = "lumped"):
+    """Matrix-**exponential** time scheme for ``fem.solve(time=...)`` — advances a *linear autonomous*
+    parabolic block ``M u̇ + A u = c`` by ``u(t+dt) = exp(-dt·M⁻¹A) u(t) (+ φ₁ forcing)``, computed
+    matrix-free by Lanczos (:func:`applyfun`, needs ``matfree``). **Exact in time and unconditionally
+    stable**, so it takes large stiff steps a θ-step cannot. ``order`` is the Krylov size; ``mass``
+    is ``'lumped'`` (V1). Time-varying coefficients / nonlinear terms → use :func:`theta` instead."""
+    from .utils.solver.timeschemes import _ExponentialScheme
+
+    return _ExponentialScheme(order, mass)
