@@ -281,6 +281,12 @@ def _domain_from_arrays(template: Any, points: np.ndarray, elems: np.ndarray, bf
     if hasattr(target, "_reset_custom_tag_state"):
         target._reset_custom_tag_state()
     target._apply_mesh(new_mesh)
+    # `_apply_mesh` rebuilds the spatial (N, D) mesh pool but does not re-broadcast it over time; on a
+    # transient domain re-tile it (idempotent), so `domain.variable(...)` on the remeshed / moved domain
+    # samples spatiotemporally again — otherwise a state-dependent velocity reading the field via the DSL
+    # on the moved mesh hits a 2-D pool where it expects (T, N, D). Mirrors `_remesh_periodic`.
+    if getattr(target, "_is_time_dependent", False) and getattr(target, "time", None) is not None:
+        target._add_time_dimension(*target.time)
     return target
 
 

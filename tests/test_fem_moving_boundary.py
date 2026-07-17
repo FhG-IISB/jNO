@@ -202,3 +202,31 @@ def test_state_dependent_velocity_drives_motion():
     traj = fem.solve(move=jno.MovingBoundary(velocity=vel, every=1))
     top_final = np.asarray(traj.meshes[-1][0])[:, 1].max()
     assert abs(top_final - (1.0 + RATE * T_END)) < 0.05, f"top reached {top_final:.3f}, expected {1.0 + RATE * T_END:.3f}"
+
+
+def test_state_dependent_velocity_reads_flux_via_dsl_readout():
+    """End-to-end: a state-dependent velocity reads the boundary flux ∇T·n via the DSL readout
+    (`u.bind(...).freeze(state)` + `(Tf.x*nx+Tf.y*ny).eval()`) on the MOVED transient domain. Proves the
+    readout composes inside the driver — the moved domain is re-tiled over time, so `variable(...)` there
+    samples spatiotemporally and the normals don't collapse. (Hot boundary u=1 ⇒ ∇T·n develops > 0.)"""
+    d = jno.Shape.rect(0, 0, 1, 1, size=0.1).domain(time=(0.0, 0.3, 16))
+    u, phi = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi0, yi0, _ = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    fem = jno.fem([ui.t * vi + 0.1 * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 1.0, u(xi0, yi0) - 0.0])
+
+    seen = []
+
+    def vel(t, x, state, dom):
+        us = dom.fem_symbols()[0]
+        a, b, _, nx, ny = dom.variable("boundary", normals=True, split=True)
+        Tf = us.bind(x=a, y=b).freeze(np.asarray(state))
+        flux = np.asarray((Tf.x * nx + Tf.y * ny).eval()).reshape(-1)  # ∇T·n via the DSL readout
+        seen.append((float(flux.min()), float(flux.max())))
+        return np.zeros_like(x)  # checking the readout composes, not the motion
+
+    fem.solve(move=jno.MovingBoundary(velocity=vel, every=1))
+    assert len(seen) >= 10
+    assert any(abs(hi - lo) > 1e-3 for lo, hi in seen), "the DSL flux readout collapsed inside the driver"
