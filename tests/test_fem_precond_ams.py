@@ -39,7 +39,7 @@ def _x64():
 
 def _curlcurl_source(mesh_size, beta):
     """A driven real curl-curl (+ β·mass) N1E problem: inner(curl u, curl v) + β⟨u,v⟩ − ⟨Js, v⟩."""
-    d = jno.domain(constructor=jno.domain.cube(mesh_size=mesh_size))
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=mesh_size).domain()
     u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
     c = d.variable("interior", split=True)
     x, y, z = c[0], c[1], c[2]
@@ -53,7 +53,7 @@ def _curlcurl_source(mesh_size, beta):
 def _complex_eddy(mesh_size, freq, eps):
     """A complex eddy operator νK + jω(σ+ε)M with σ nonzero only on a sub-region (copper analog) and a
     small ε mass floor everywhere (the σ=0-in-air ε-gauge), plus a source in the conductor."""
-    d = jno.domain(constructor=jno.domain.cube(mesh_size=mesh_size))
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=mesh_size).domain()
     u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
     c = d.variable("interior", split=True)
     x, y, z = c[0], c[1], c[2]

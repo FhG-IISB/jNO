@@ -34,7 +34,7 @@ def _assemble(mesh_size, beta):
     """Assembled dense curl-curl (+ β·mass) N1E operator and the stashed edge topology. Meshes are kept
     coarse enough that the assembly fits the (small, 8 GB) dev GPU — this is a numpy/scipy structure
     test, so a refinement *contrast* is all it needs, not a fine mesh."""
-    d = jno.domain(constructor=jno.domain.cube(mesh_size=mesh_size))
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=mesh_size).domain()
     u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
     c = d.variable("interior", split=True)
     x, y, z = c[0], c[1], c[2]

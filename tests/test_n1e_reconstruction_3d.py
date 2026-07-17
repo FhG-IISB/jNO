@@ -36,7 +36,7 @@ def _project_and_reconstruct(mesh_size):
     from jno.utils.solver.fem_nonnodal import n1e_field_at_tet_centroids
     from jno.utils.solver.fem_topology import BASIX_TET_EDGES, build_edge_topology
 
-    d = jno.domain(constructor=jno.domain.cube(mesh_size=mesh_size))
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=mesh_size).domain()
     u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
     c = d.variable("interior", split=True)
     x, y, z = c[0], c[1], c[2]
@@ -77,7 +77,7 @@ def test_reconstruction_is_complex_linear():
     from jno.utils.solver.fem_nonnodal import n1e_field_at_tet_centroids
     from jno.utils.solver.fem_topology import BASIX_TET_EDGES, build_edge_topology
 
-    d = jno.domain(constructor=jno.domain.cube(mesh_size=0.5))
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
     u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
     c = d.variable("interior", split=True)
     x, y, z = c[0], c[1], c[2]
