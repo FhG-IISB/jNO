@@ -45,8 +45,17 @@ __all__ = [
     "fgmres",
     "minres",
     "chebyshev",
+    "amg",
     "newton",
     "picard",
+    "eigs",
+    "logdet",
+    "trace",
+    "applyfun",
+    "diagonal",
+    "lstsq",
+    "theta",
+    "exponential",
 ]
 
 
@@ -206,6 +215,69 @@ def chebyshev(
     return LinearSolver(_fn, name="chebyshev")
 
 
+def _require_jaxamg():
+    try:
+        import jaxamg
+    except ImportError as e:  # optional GPU dependency — see the message for the system requirements
+        raise ImportError(
+            "jno.solve.amg() needs the optional dependency `jaxamg` (NVIDIA AmgX wrapped as a JAX "
+            "primitive). It requires a prebuilt AmgX 2.5+, CUDA Toolkit 12+, JAX-with-CUDA, and an MPI "
+            "stack (mpi4py / mpi4jax). Install those into your environment, then retry."
+        ) from e
+    return jaxamg
+
+
+def amg(
+    *, tol: float = 1e-6, maxiter: int = 500, krylov: Optional[str] = "PBICGSTAB", config: Optional[dict] = None
+) -> LinearSolver:
+    """GPU algebraic-multigrid solve via **jaxamg** (NVIDIA AmgX wrapped as a JAX primitive).
+
+    A self-contained solver: it runs an AMG-preconditioned Krylov iteration (or pure AMG) entirely on
+    the GPU/device — the on-device counterpart to the host-side pyamg used by ``jno.precond.amg``.
+    Ideal for large H¹-elliptic systems (Poisson, diffusion, elasticity) and, via
+    ``jno.precond.inner(jno.solve.amg(...))``, as the smoother inside an outer flexible-Krylov solve
+    (e.g. the auxiliary nodal solves of a future H(curl) AMS preconditioner). Plain AMG will **not**
+    converge on a raw curl-curl (H(curl)) system — that needs AMS on top.
+
+    ``config`` (a full AmgX-format dict) overrides the convenience args entirely; otherwise a config is
+    built from ``tol``/``maxiter``/``krylov`` (``krylov=None`` → pure AMG, else an AMG-preconditioned
+    ``krylov`` Krylov, e.g. ``"PBICGSTAB"``/``"GMRES"``/``"PCG"``). Needs an **assembled** operator
+    (hands the sparse matrix to jaxamg); errors on a matrix-free operator. Direct-style: takes no outer
+    ``precond=`` (it owns its AMG preconditioner) and ignores ``x0``.
+
+    Optional dependency — jaxamg is imported lazily; see :func:`_require_jaxamg` for the requirements.
+
+    Reference: Liu, Fan & Wang, *JAX-AMG: A GPU-Accelerated Differentiable Sparse Linear Solver Library
+    for JAX*, arXiv:2606.09001 (2026); wraps NVIDIA AmgX (Naumov et al., 2015).
+    """
+
+    def _fn(op: LinearOperator, b, *, M, x0):
+        A = op.bcoo
+        if A is None:
+            raise ValueError(
+                "jno.solve.amg() needs an assembled (sparse) operator — it cannot solve a matrix-free "
+                "operator. Use a Krylov solver (cg/bicgstab/fgmres) for matrix-free systems."
+            )
+        jaxamg = _require_jaxamg()
+        if config is not None:
+            cfg = dict(config)
+        elif krylov:
+            cfg = {
+                "solver": krylov,
+                "preconditioner": {"solver": "AMG"},
+                "tolerance": float(tol),
+                "max_iters": int(maxiter),
+            }
+        else:
+            cfg = {"solver": "AMG", "tolerance": float(tol), "max_iters": int(maxiter)}
+        x, _info = jaxamg.solve(A, b, config=cfg)
+        return jnp.asarray(x).reshape(-1)
+
+    # AmgX owns the solve; treat as direct (no outer preconditioner). vmap left "no" (AmgX/MPI primitive
+    # is not a pure-JAX batching op) — loop for batched solves.
+    return LinearSolver(_fn, name="amg", direct=True, traits={"vmap": "no"})
+
+
 def _root_driver(
     name, *, damping, rtol, atol, max_steps, inner_tol, inner_maxit, line_search, ls_max, ls_c
 ) -> NonlinearSolver:
@@ -306,3 +378,109 @@ def picard(
         ls_max=ls_max,
         ls_c=ls_c,
     )
+
+
+def eigs(*, k: int = 6, which: str = "smallest"):
+    """Generalized **symmetric eigensolver** ``K x = λ M x`` (K symmetric, M SPD). Returns a callable
+    ``(K, M=None) -> (λ, X)``: the ``k`` eigenvalues at the requested end (``which='smallest'`` /
+    ``'largest'``) and their **M-orthonormal** eigenvectors (``Xᵀ M X = I``). ``M=None`` is the standard
+    problem ``K x = λ x``.
+
+    Use it for modal analysis (vibration), buckling, EM cavity/waveguide resonances and photonic band
+    structure — everything that is ``Kx=λMx`` rather than ``Ax=b``. Build ``K``/``M`` as source-less
+    ``jno.fem`` bilinear forms (or via :meth:`FEM.eigs`).
+
+    **Differentiable.** V1a reduces the pencil densely (Cholesky ``M=LLᵀ`` → ``jnp.linalg.eigh`` on
+    ``L⁻¹KL⁻ᵀ``), so ``∂λ/∂θ`` flows for free — for **simple** eigenvalues (degenerate/crossing
+    eigenvalues make the eigen-JVP singular; use the trace of a degenerate cluster there). Preconditioned
+    LOBPCG (reusing ``jno.precond.*``) and shift-invert to a target ``σ`` are the planned scale paths.
+    """
+    if which not in ("smallest", "largest", "SM", "LM", "SA", "LA"):
+        raise ValueError(f"jno.solve.eigs: which={which!r} — use 'smallest' or 'largest'.")
+
+    def _fn(K, M=None):
+        from .utils.solver.eigen import dense_geneigh
+
+        return dense_geneigh(K, M, k, which)
+
+    return _fn
+
+
+def logdet(A, *, samples: int = 32, order: int = 25, key=None):
+    """Differentiable, matrix-free ``log det A`` (symmetric positive-definite) — stochastic Lanczos
+    quadrature via the optional ``matfree`` package. Scales where a direct factorisation cannot; the
+    key use is **Bayesian log-evidence / marginal likelihood** of a FEM precision operator. Returns an
+    unbiased estimate (variance ↓ with ``samples``, bias ↓ with ``order``). See
+    :func:`jno.utils.solver.matfun.logdet`."""
+    from .utils.solver.matfun import logdet as _logdet
+
+    return _logdet(A, samples=samples, order=order, key=key)
+
+
+def trace(A, *, fun=None, samples: int = 32, order: int = 25, key=None):
+    """Differentiable, matrix-free ``tr A`` (Hutchinson) or ``tr f(A)`` (``fun=``, Lanczos quadrature) —
+    e.g. ``fun=lambda z: 1/z`` for ``tr(A⁻¹)`` (uncertainty / effective degrees of freedom). Optional
+    ``matfree``. See :func:`jno.utils.solver.matfun.trace`."""
+    from .utils.solver.matfun import trace as _trace
+
+    return _trace(A, fun=fun, samples=samples, order=order, key=key)
+
+
+def applyfun(A, v, *, fun, order: int = 30, symmetric: bool = True):
+    """Matrix-free ``f(A)·v`` — e.g. one exact exponential-integrator step ``exp(-dt·A)·v`` with
+    ``fun=lambda z: jnp.exp(-dt*z)``. ``symmetric=True`` (default, Lanczos) assumes ``A = Aᵀ``;
+    ``symmetric=False`` (Arnoldi + an eigendecomposition of the Hessenberg with an analytic Daleckii–Krein
+    derivative) handles a **non-symmetric** ``A`` (advection–diffusion). Both are **differentiable and
+    GPU-capable** — the non-symmetric path for any **holomorphic** ``fun`` on a **diagonalizable** ``A``.
+    Optional ``matfree``. See :func:`jno.utils.solver.matfun.applyfun`."""
+    from .utils.solver.matfun import applyfun as _applyfun
+
+    return _applyfun(A, v, fun=fun, order=order, symmetric=symmetric)
+
+
+def diagonal(A, *, fun=None, samples: int = 32, order: int = 25, key=None):
+    """Differentiable, matrix-free estimate of the **diagonal** of ``A`` (Hutchinson) or ``f(A)`` (``fun=``,
+    ``A`` symmetric) — the per-DOF **field** counterpart of :func:`trace`. The key use is
+    ``fun=lambda z: 1/z`` → ``diag(A⁻¹)``, the **pointwise posterior variance / uncertainty map** of a FEM
+    precision, plottable on the mesh. Stochastic (variance ↓ ``samples``, bias ↓ ``order``); optional
+    ``matfree``. See :func:`jno.utils.solver.matfun.diagonal`."""
+    from .utils.solver.matfun import diagonal as _diagonal
+
+    return _diagonal(A, fun=fun, samples=samples, order=order, key=key)
+
+
+def lstsq(A, b, *, damp: float = 0.0, atol: float = 1e-6, btol: float = 1e-6, maxiter: int = 100_000, x0=None):
+    """Differentiable, matrix-free **least-squares** ``min_x ‖A x − b‖²`` for a **rectangular** ``A`` (LSMR) —
+    the gap left by the square ``Ax=b`` solvers. ``damp`` adds Tikhonov ``+ damp²‖x‖²`` (ill-posed /
+    rank-deficient inverse problems); ``x0`` an initial guess. Real operators; optional ``matfree``.
+    See :func:`jno.utils.solver.matfun.lstsq`."""
+    from .utils.solver.matfun import lstsq as _lstsq
+
+    return _lstsq(A, b, damp=damp, atol=atol, btol=btol, maxiter=maxiter, x0=x0)
+
+
+def theta(theta: float = 1.0):
+    """θ-method **time scheme** for ``fem.solve(time=...)``: ``θ=1`` backward Euler (default),
+    ``θ=1/2`` Crank–Nicolson / trapezoidal (2nd-order accurate), ``θ=0`` forward Euler. Overrides the
+    scheme the assembly picks; composes with ``linear=``/``precond=`` (the per-step solve)."""
+    from .utils.solver.timeschemes import _ThetaScheme
+
+    return _ThetaScheme(theta)
+
+
+def exponential(*, order: int = 40, mass: str = "lumped", symmetric: bool = True):
+    """Matrix-**exponential** time scheme for ``fem.solve(time=...)`` — advances a *linear autonomous*
+    parabolic block ``M u̇ + A u = c`` by ``u(t+dt) = exp(-dt·M⁻¹A) u(t) (+ φ₁ forcing)``, matrix-free.
+    **Exact in time and unconditionally stable**, so it takes large stiff steps a θ-step cannot. ``order``
+    is the Krylov size. ``mass='lumped'`` (default) is the row-sum diagonal — cheapest, discrete maximum
+    principle; ``mass='consistent'`` uses the full ``M`` (no lumping error) via a matrix-free
+    M-inner-product Lanczos.
+
+    ``symmetric=True`` (default, ``A = Aᵀ``) uses Lanczos. ``symmetric=False`` handles a **non-symmetric**
+    operator (**advection–diffusion / transport**): it advances by Arnoldi + a differentiable **Padé**
+    exponential, with forcing carried exactly through an augmented generator — still matrix-free, GPU, and
+    reverse-mode differentiable. All paths are differentiable; time-varying coefficients / nonlinear → use
+    :func:`theta`."""
+    from .utils.solver.timeschemes import _ExponentialScheme
+
+    return _ExponentialScheme(order, mass, symmetric)

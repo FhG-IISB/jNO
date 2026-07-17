@@ -688,7 +688,28 @@ def _complex_block_bcoo(A_r: Any, A_i: Any, n: int) -> Any:
     return jsp.BCOO((data, indices), shape=(2 * n, 2 * n))
 
 
-def _solve_complex_block(ops: Any, solve_fn: Optional[Callable] = None, periodic: Optional[dict] = None) -> Any:
+def _complex_operator(A_r: Any, A_i: Any) -> Any:
+    """Fuse the real/imag legs into one complex operator ``A_r + i·A_i`` — as a **complex BCOO** when
+    the legs are sparse (so an iterative complex solve never densifies), else a dense complex array.
+    This is the operator a slot-composed complex solver (``linear=gmres, precond=ams``) runs on."""
+    if hasattr(A_r, "indices") and hasattr(A_i, "indices"):
+        from jax.experimental import sparse as jsp
+
+        indices = jnp.concatenate([A_r.indices, A_i.indices], axis=0)
+        data = jnp.concatenate([A_r.data + 0j, 1j * A_i.data])  # +0j promotes to the complex dtype
+        return jsp.BCOO((data, indices), shape=A_r.shape).sum_duplicates()
+    Ar = A_r.todense() if hasattr(A_r, "todense") else A_r
+    Ai = A_i.todense() if hasattr(A_i, "todense") else A_i
+    return jnp.asarray(Ar) + 1j * jnp.asarray(Ai)
+
+
+def _solve_complex_block(
+    ops: Any,
+    solve_fn: Optional[Callable] = None,
+    periodic: Optional[dict] = None,
+    complex_solve: Optional[Callable] = None,
+    from_slots: bool = False,
+) -> Any:
     """Solve a complex linear FEM system via the real-equivalent block (everything was
     assembled as two *real* systems)::
 
@@ -741,11 +762,29 @@ def _solve_complex_block(ops: Any, solve_fn: Optional[Callable] = None, periodic
             return _bloch_solve(args)
         (A_r, b_r), (A_i, b_i) = _ab(ops[0], args), _ab(ops[1], args)
         n = b_r.shape[0]
+
+        if complex_solve is not None:
+            # Slot-composed iterative path (linear=/precond=): solve the COMPLEX system directly on the
+            # sparse operator A_r + i·A_i (never the dense 2n block), e.g. gmres + jno.precond.ams.
+            A_c = _complex_operator(A_r, A_i)
+            u = complex_solve(A_c, b_r + 1j * b_i)
+            return (
+                u
+                if periodic is None
+                else prolong_periodic(periodic, jnp.real(u)) + 1j * prolong_periodic(periodic, jnp.imag(u))
+            )
+
         rhs = jnp.concatenate([b_r, b_i])
         is_sparse = hasattr(A_r, "indices") and hasattr(A_i, "indices")
 
-        if solve_fn is not None:
-            # user solver receives the densified block (dense/direct back-compat path)
+        if solve_fn is not None and from_slots and is_sparse:
+            # Slot-composed solver on a non-complex-native precond (gmres + jacobi/form/amg): hand it the
+            # SPARSE 2n BCOO block [[A_r,-A_i],[A_i,A_r]] rather than densifying — keeps it O(nnz) AND lets
+            # the composed solver's extreme-magnitude normalization fire (a dense block has no .bcoo, so a
+            # mass-dominated eddy system would otherwise stall the Krylov Arnoldi at real scale).
+            sol = jnp.asarray(solve_fn(_complex_block_bcoo(A_r, A_i, n), rhs))
+        elif solve_fn is not None:
+            # raw user solver (or a dense-leg fallback) receives the densified block (dense/direct back-compat)
             Ar_d = jnp.asarray(A_r.todense() if hasattr(A_r, "todense") else A_r)
             Ai_d = jnp.asarray(A_i.todense() if hasattr(A_i, "todense") else A_i)
             sol = jnp.asarray(solve_fn(jnp.block([[Ar_d, -Ai_d], [Ai_d, Ar_d]]), rhs))
@@ -1091,7 +1130,17 @@ class FEM:
         return keys.index(fk)
 
     def solve(
-        self, solve_fn=None, *, adapt=None, x0=None, nonlinear=None, linear=None, precond=None, profile=False, **kwargs
+        self,
+        solve_fn=None,
+        *,
+        adapt=None,
+        x0=None,
+        nonlinear=None,
+        linear=None,
+        precond=None,
+        time=None,
+        profile=False,
+        **kwargs,
     ) -> Any:
         """Differentiable forward solve as a trace node — the inverse-problem entry.
 
@@ -1175,7 +1224,7 @@ class FEM:
 
         def _run():
             result = self._solve_dispatch(
-                solve_fn, adapt=adapt, x0=x0, nonlinear=nonlinear, linear=linear, precond=precond, **kwargs
+                solve_fn, adapt=adapt, x0=x0, nonlinear=nonlinear, linear=linear, precond=precond, time=time, **kwargs
             )
             if isinstance(result, Placeholder):
                 # Tag the solve node with its domain so jno.core can infer the domain straight from the graph
@@ -1189,9 +1238,17 @@ class FEM:
 
         return profile_solve(_run, label=f"fem profile · {self.dofs} DOFs · {self._mode}", warm=(adapt is None))
 
-    def _solve_dispatch(self, solve_fn=None, *, adapt=None, x0=None, nonlinear=None, linear=None, precond=None, **kwargs):
+    def _solve_dispatch(
+        self, solve_fn=None, *, adapt=None, x0=None, nonlinear=None, linear=None, precond=None, time=None, **kwargs
+    ):
         """Mode dispatch for :meth:`solve` — returns the solution array or a differentiable trace node."""
-        has_slots = (x0 is not None) or (nonlinear is not None) or (linear is not None) or (precond is not None)
+        has_slots = (
+            (x0 is not None)
+            or (nonlinear is not None)
+            or (linear is not None)
+            or (precond is not None)
+            or (time is not None)
+        )
         if adapt is not None:
             if has_slots:
                 raise NotImplementedError(
@@ -1204,13 +1261,17 @@ class FEM:
             return run_adaptive_solve(self, adapt, solve_fn=solve_fn, **kwargs)
         if has_slots:
             solve_fn, kwargs = self._compose_slots(
-                solve_fn, x0=x0, nonlinear=nonlinear, linear=linear, precond=precond, kwargs=kwargs
+                solve_fn, x0=x0, nonlinear=nonlinear, linear=linear, precond=precond, time=time, kwargs=kwargs
             )
             from_slots = True
         else:
             from_slots = False
         if self._mode == "complex":
-            return _solve_complex_block(self._op, solve_fn, periodic=self._periodic)
+            # A complex-native preconditioner (AMS) solves the sparse COMPLEX operator directly (never
+            # densified); real-equivalent preconditioners (form/jacobi/…) stay on the 2n-block path.
+            if from_slots and getattr(precond, "complex_native", False):
+                return _solve_complex_block(self._op, periodic=self._periodic, complex_solve=solve_fn)
+            return _solve_complex_block(self._op, solve_fn, periodic=self._periodic, from_slots=from_slots)
         if self._mode == "complex_transient":
             return _solve_complex_transient(self._op, save_ts=kwargs.get("save_ts"), periodic=self._periodic)
         if self._mode == "linear" and not isinstance(self._op, FemLinearSystem):
@@ -1286,14 +1347,18 @@ class FEM:
             return self._op.solve(solve_fn, **kwargs).fn()
         return self._op.solve(solve_fn, **kwargs)
 
-    def _compose_slots(self, solve_fn, *, x0, nonlinear, linear, precond, kwargs):
+    def _compose_slots(self, solve_fn, *, x0, nonlinear, linear, precond, time=None, kwargs):
         """Compose the solver slots into the mode-appropriate ``solve_fn`` (see :meth:`solve`)."""
         from .utils.solver.solver_api import compose_linear_solve_fn, compose_nonlinear_solve_fn
 
         if solve_fn is not None:
             raise ValueError(
                 "fem.solve: pass either solve_fn= (the total override) or the solver slots "
-                "(x0/nonlinear/linear/precond), not both."
+                "(x0/nonlinear/linear/precond/time), not both."
+            )
+        if time is not None and self._mode != "transient":
+            raise ValueError(
+                f"fem.solve(time=...) picks a time-integration scheme, but this problem is {self._mode}, not transient."
             )
         if self._mode == "complex_transient":
             raise NotImplementedError(
@@ -1316,6 +1381,8 @@ class FEM:
             lin_s, nonlin_s = compose_transient_step_solvers(nonlinear, linear, precond, self, self._op)
 
             def _stepper(block, args, save_ts):
+                if time is not None:  # jno.solve.theta(...) / jno.solve.exponential(...)
+                    return time.integrate(block, args, save_ts, linear_solve=lin_s, nonlinear_solve=nonlin_s)
                 return _default_transient_integrate(block, args, save_ts, linear_solve=lin_s, nonlinear_solve=nonlin_s)
 
             return _stepper, kwargs
@@ -1398,6 +1465,25 @@ class FEM:
         if self._mode != "linear":
             raise AttributeError(f"FEM is {self._mode}; .b is only for a steady linear problem (see .operator / .M).")
         return _as_flat(self._b)
+
+    def eigs(self, *, mass, k: int = 6, which: str = "smallest"):
+        """Generalized eigenproblem ``K x = λ M x`` on this fem: ``K`` is this **source-less** fem's
+        operator (its stiffness bilinear form) and ``M`` is the ``mass`` bilinear form assembled on the
+        same space. Returns ``(λ, X)`` — the ``k`` eigenvalues at ``which`` (``'smallest'``/``'largest'``)
+        and their **M-orthonormal** eigenvectors. Eigenvalues are differentiable (see :func:`jno.solve.eigs`).
+
+        Modal analysis, buckling, EM cavity/waveguide resonances, photonic band structure::
+
+            u, v = d.fem_symbols(); ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+            K = jno.fem([ui.x * vi.x + ui.y * vi.y])      # stiffness (no source term)
+            lam, X = K.eigs(mass=[ui * vi], k=6)          # K x = λ M x  → λ = ω² (Neumann box)
+        """
+        if self._mode != "linear":
+            raise AttributeError(f"FEM.eigs needs a steady-linear (source-less) bilinear form; this fem is {self._mode}.")
+        from . import solve as _solve
+
+        M = fem(list(mass)).operator[0]  # mass matrix on the same FE space
+        return _solve.eigs(k=k, which=which)(self.operator[0], M)
 
     # -- domain-decomposition coupling (`jno.core([...])`): the region this subdomain owns + a pinned solve --
     def _dd_region(self):
