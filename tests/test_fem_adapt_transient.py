@@ -92,7 +92,54 @@ def test_solve_fn_with_transient_adapt_raises():
 
 
 def test_higher_order_transient_adapt_raises():
-    # P2 has more DOFs than vertices → trips the scalar single-field P1 scope guard.
+    # P2 has more DOFs than vertices → trips the scalar-P1 scope guard.
     fem, _ = _heat_fem(mesh_size=0.2, t_end=0.1, nt=7, order=2)
-    with pytest.raises(NotImplementedError, match="scalar single-field P1"):
+    with pytest.raises(NotImplementedError, match="scalar-P1 field"):
         fem.solve(adapt=jno.AdaptSpec(anisotropic=True, every=3))
+
+
+def test_metric_field_out_of_range_raises():
+    fem, _ = _heat_fem(mesh_size=0.2, t_end=0.1, nt=7)
+    with pytest.raises(ValueError, match="out of range"):
+        fem.solve(adapt=jno.AdaptSpec(every=3, metric_field=5))
+
+
+# ── coupled multifield (scalar-P1) ────────────────────────────────────────────
+def test_transient_adaptive_two_coupled_scalar_fields():
+    """Two heat fields with DIFFERENT κ (block/multifield). If the per-field transfer mixed them, the
+    decay rates would be wrong — so matching each field's analytic decay proves the multifield state is
+    split, transferred, and re-assembled correctly. Also exercises the (n_save, n_fields, n_ref) resample."""
+    ku, kw = 0.12, 0.04
+    d = jno.Shape.rect(0, 0, 1, 1, size=0.1).domain(time=(0.0, 0.3, 21))
+    u, v = d.fem_symbols(names=("u", "v"))
+    w, q = d.fem_symbols(names=("w", "q"))
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi0, yi0, _ = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+    wi, qi = w.bind(x=xi, y=yi, t=ti), q.bind(x=xi, y=yi, t=ti)
+    ic = jno.fn(lambda x, y: jnp.sin(PI * x) * jnp.sin(PI * y), [xi0, yi0])
+    fem = jno.fem(
+        [
+            ui.t * vi + ku * (ui.x * vi.x + ui.y * vi.y),
+            wi.t * qi + kw * (wi.x * qi.x + wi.y * qi.y),
+            u(xb, yb) - 0.0,
+            w(xb, yb) - 0.0,
+            u(xi0, yi0) - ic,
+            w(xi0, yi0) - ic,
+        ]
+    )
+    traj = fem.solve(adapt=jno.AdaptSpec(anisotropic=True, every=5, max_dofs=6000, metric_field=0))
+    assert isinstance(traj, AdaptiveTrajectory)
+
+    ref = jno.Shape.rect(0, 0, 1, 1, size=0.08).domain()
+    ys = np.asarray(traj.resample(ref))  # (n_save, n_fields=2, n_ref)
+    assert ys.ndim == 3 and ys.shape[1] == 2
+    xr = np.asarray(ref.mesh.points)[:, :2]
+    base = np.sin(PI * xr[:, 0]) * np.sin(PI * xr[:, 1])
+    wu = ww = 0.0
+    for kk, t in enumerate(np.asarray(traj.times)):
+        eu, ew = np.exp(-2 * ku * PI**2 * t) * base, np.exp(-2 * kw * PI**2 * t) * base
+        wu = max(wu, np.linalg.norm(ys[kk, 0] - eu) / max(np.linalg.norm(eu), 1e-12))
+        ww = max(ww, np.linalg.norm(ys[kk, 1] - ew) / max(np.linalg.norm(ew), 1e-12))
+    assert wu < 0.08 and ww < 0.08, f"multifield decay mismatch (fields not kept separate?): u={wu:.3f}, w={ww:.3f}"
