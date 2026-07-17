@@ -3401,9 +3401,15 @@ class FrozenField(Placeholder):
     unknown-detection that routes nonlinear solves: a term like
     ``softplus(net(xi, yi, ui.freeze(u0).x, ui.freeze(u0).y)) * (grad u . grad v)``
     stays LINEAR in the true unknown ``u`` while conditioning the coefficient on the
-    known field ``u0`` (a predictor-corrector). No gradient flows into ``values``."""
+    known field ``u0`` (a predictor-corrector). No gradient flows into ``values``.
 
-    def __init__(self, source, values):
+    Beyond assembly, a frozen field carries its mesh ``_domain`` and the ``_coord_tag`` it was bound to,
+    so it (and its ``.x`` / ``.y`` gradient) can be **read out standalone via ``.eval()``** — the
+    boundary-functional readout the evaluator handles in ``_eval_frozen_field`` (value → nodal values
+    mapped to the sample points) and ``_eval_jacobian`` (gradient → FD-over-mesh). This turns a
+    functional of a solved field, e.g. the normal-flux ``∇T·n``, into an evaluable traced expression."""
+
+    def __init__(self, source, values, domain=None, coord_tag=None):
         self.name = f"frozen[{getattr(source, 'name', 'u')}]"
         self.value_shape = tuple(getattr(source, "value_shape", ()))
         self.order = int(getattr(source, "order", 1))
@@ -3412,6 +3418,11 @@ class FrozenField(Placeholder):
         self.field_key = source.field_key  # share the source field's shape data
         self.values = jnp.asarray(values).reshape(-1)  # global nodal vector (scalar field)
         self.frozen_id = _next_op_id()  # kernel gather-table key
+        # Standalone ``.eval()`` support (distinct from the kernel gather-table used during assembly):
+        # the mesh domain + the coordinate region this field was bound to, so the evaluator can map the
+        # nodal ``values`` — and their FD-over-mesh gradient (``.x`` / ``.y``) — onto the sample points.
+        self._domain = domain
+        self._coord_tag = coord_tag
 
     @property
     def num_components(self) -> int:

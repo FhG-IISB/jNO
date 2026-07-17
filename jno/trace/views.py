@@ -270,11 +270,32 @@ class ScalarView(_DelegatesToPlaceholder):
         field's value / gradient at the quadrature points — usable as a neural-coefficient
         input (``net(xi, yi, ui.freeze(u0).x, ui.freeze(u0).y)``) while the weak form stays
         LINEAR in the live unknown. Coordinate bindings from ``.bind(x=, y=)`` are preserved,
-        so ``.x`` / ``.y`` keep working. See :class:`jno.trace.FrozenField`."""
+        so ``.x`` / ``.y`` keep working.
+
+        The frozen field (and its gradient) is also **readable standalone via ``.eval()``** — a
+        functional of a solved field written as pure traced math. With the region's normals
+        (``d.variable(tag, normals=True, split=True)`` → ``…, n_x, n_y``) this gives the boundary
+        normal-flux, e.g. a Stefan interface speed::
+
+            x, y, t, nx, ny = d.variable("boundary", normals=True, split=True)
+            Tf = u.bind(x=x, y=y).freeze(sol)
+            v_n = (-(k / L) * (Tf.x * nx + Tf.y * ny)).eval()   # ∇T·n on the boundary, as an array
+
+        The gradient of a frozen (nodal) field is evaluated by the **FD-over-mesh** scheme (there is no
+        analytic coordinate-function to auto-differentiate). See :class:`jno.trace.FrozenField`."""
         from . import FrozenField
 
-        frozen = FrozenField(self._expr, values)
         cv = getattr(self, "_coord_vars", None)
+        # Carry the mesh domain + the (spatial) region tag so a standalone `.eval()` of the frozen field
+        # — or of its `.x`/`.y` gradient — can map the nodal values onto that region's sample points.
+        domain = coord_tag = None
+        for _var in (cv or {}).values():
+            if getattr(_var, "axis", "spatial") == "temporal":
+                continue  # x/y share the spatial region tag; skip the time coordinate
+            if getattr(_var, "_domain", None) is not None:
+                domain, coord_tag = _var._domain, getattr(_var, "tag", None)
+                break
+        frozen = FrozenField(self._expr, values, domain=domain, coord_tag=coord_tag)
         if cv:
             return _coords_dispatch(ScalarView(frozen), (), dict(cv))
         return ScalarView(frozen)
