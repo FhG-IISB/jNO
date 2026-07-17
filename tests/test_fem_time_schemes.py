@@ -173,6 +173,36 @@ def test_exponential_nonsymmetric_is_differentiable():
     assert abs(g - fd) / abs(fd) < 1e-4
 
 
+def test_transient_with_source_converges_to_manufactured_solution():
+    """A transient heat problem **with a source term** must converge to the exact manufactured solution.
+
+    Regression: the per-step linear solve must be preconditioned. The composed default was a *bare*
+    ``bicgstab()`` (no preconditioner) that silently under-converged each step — invisible on homogeneous
+    decay (the warm-start already sits near the answer) but ~30% wrong on any forced/growing solution.
+    Constant source ``f=SS`` ⇒ ``u=SS·(1−e^{−2π²T})/(2π²)``; time-varying ``f=SS(1+2π²t)`` ⇒ ``u=SS·t``."""
+    T = 0.3
+
+    def build(time_varying):
+        d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.06, time=(0.0, T, 60))
+        u, v = d.fem_symbols()
+        xi, yi, ti = d.variable("interior", split=True)
+        xb, yb, _ = d.variable("boundary", split=True)
+        ci = d.variable("initial", split=True)
+        ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+        ss = jno.np.sin(PI * xi) * jno.np.sin(PI * yi)
+        f = ss * (1.0 + 2.0 * PI**2 * ti) if time_varying else ss
+        return jno.fem([ui.t * vi + ui.x * vi.x + ui.y * vi.y - f * vi, u(xb, yb) - 0.0, u(ci[0], ci[1]) - 0.0])
+
+    for time_varying in (False, True):
+        fem = build(time_varying)
+        pts = np.asarray(fem.points)
+        ss = np.sin(PI * pts[:, 0]) * np.sin(PI * pts[:, 1])
+        exact = ss * T if time_varying else ss * (1.0 - np.exp(-2.0 * PI**2 * T)) / (2.0 * PI**2)
+        for scheme in (None, jno.solve.theta(0.5), jno.solve.theta(1.0)):
+            got = _final(fem) if scheme is None else _final(fem, time=scheme)
+            assert np.linalg.norm(got - exact) / np.linalg.norm(exact) < 5e-3, (time_varying, scheme)
+
+
 def test_time_scheme_rejects_a_steady_problem():
     """``time=`` selects a TIME integrator, so it is an error on a non-transient problem."""
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2)

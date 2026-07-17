@@ -467,10 +467,17 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block):
     if nonlinear is not None:
         raise ValueError("fem.solve: nonlinear= given, but this transient block is linear (no linearization).")
 
+    if linear is None and precond is None:
+        # No linear/precond slots: defer to SemidiscreteTimeBlock.step's built-in per-step solve, a
+        # Jacobi-preconditioned BiCGStab at tol=1e-10. The historic default here was a *bare* bicgstab()
+        # with NO preconditioner, which silently under-converged each step — invisible on homogeneous
+        # decay (the warm-start is already near the answer) but corrupting any forced/growing solution.
+        return None, None
+
     if linear is None:
         from ... import solve as _solve_ns
 
-        solver = _solve_ns.bicgstab()  # the historic per-step default
+        solver = _solve_ns.bicgstab()
     else:
         solver = linear
     if precond is not None:
@@ -491,6 +498,10 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block):
         else:
             op = LinearOperator.from_matvec(matvec, diag_fn=diag_fn, shape=(rhs.shape[0], rhs.shape[0]))
             M = materialize_precond(precond, PrecondContext(op, fem)) if precond is not None else None
+        if M is None:  # never run the per-step solve unpreconditioned: default to Jacobi (the step diagonal)
+            diag = op.diag() if hasattr(op, "diag") else diag_fn()
+            inv = 1.0 / jnp.where(jnp.abs(diag) > 1e-30, diag, 1.0)
+            M = lambda x: inv * x  # noqa: E731
         return solver(op, rhs, M=M, x0=x0)
 
     return step_solve, None
