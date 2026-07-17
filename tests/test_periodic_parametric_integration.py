@@ -277,11 +277,14 @@ class TestAffineNonAffineConsistency:
 
 
 class TestPeriodicMeshGuard:
-    def test_multidirection_without_tag_predicates_rejected(self):
-        """Multi-direction periodicity needs each face defined via ``domain.tag(name, predicate)`` so
-        the shared corners (a slave in two directions) are recovered. Auto-generated face tags (no
-        predicate) cannot resolve the corners, so jno.fem rejects them loudly rather than silently
-        under-identifying the corners and mis-solving."""
+    def test_multidirection_without_tag_predicates_now_accepted(self):
+        """Auto-generated face tags (no ``domain.tag`` predicate) now carry their shared corners: a
+        boundary face is chained as an *open* edge chain that keeps both endpoints, so each corner
+        belongs to every face it touches (a slave in two directions). jno.fem therefore ACCEPTS
+        multidirectional periodicity on auto tags -- here in the transient + parametric setting --
+        instead of rejecting it. The full numeric solve on auto faces is verified in
+        test_fem_periodic_unstructured.py; this locks in the accept path and the shared-corner mesh
+        invariant that unlocks it. The guard still rejects genuinely corner-partitioned tags."""
         dom = jno.Shape.rect(0, 0, 1, 1, size=0.3).domain(  # auto-generated left/right/... tags (no predicate)
             time=(0.0, T_END, N_TIME),
             compute_mesh_connectivity=False,
@@ -293,14 +296,24 @@ class TestPeriodicMeshGuard:
         xr, yr, _ = dom.variable("right", split=True)
         xb, yb, _ = dom.variable("bottom", split=True)
         xt, yt, _ = dom.variable("top", split=True)
+
+        # The invariant the accept path relies on: the (0,0) corner belongs to BOTH perpendicular
+        # faces' auto tags (left AND bottom), so it resolves as a slave in two directions.
+        pts0 = np.asarray(dom.mesh.points)
+        c00 = int(np.argmin(np.sum(pts0[:, :2] ** 2, axis=1)))
+        assert c00 in set(np.asarray(dom.tag_indices["left"]).ravel().tolist())
+        assert c00 in set(np.asarray(dom.tag_indices["bottom"]).ravel().tolist())
+
         ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
         ic = jnn.sin(TWO_PI * ci[0]) * jnn.sin(TWO_PI * ci[1])
-        with pytest.raises(NotImplementedError):
-            jno.fem(
-                [
-                    ui.t * vi + 0.1 * (ui.x * vi.x + ui.y * vi.y),
-                    u(xl, yl) - u(xr, yr),
-                    u(xb, yb) - u(xt, yt),
-                    u(ci[0], ci[1]) - ic,
-                ]
-            )
+        # Accept path: building the transient multidirectional-periodic problem on auto tags now
+        # succeeds (no NotImplementedError).
+        fem = jno.fem(
+            [
+                ui.t * vi + 0.1 * (ui.x * vi.x + ui.y * vi.y),
+                u(xl, yl) - u(xr, yr),
+                u(xb, yb) - u(xt, yt),
+                u(ci[0], ci[1]) - ic,
+            ]
+        )
+        assert fem is not None
