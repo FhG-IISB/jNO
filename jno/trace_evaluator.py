@@ -1839,7 +1839,25 @@ class TraceEvaluator:
             if is_boundary:
                 reg_indices = np.asarray(domain._boundary_registry[tag]["point_indices"])
                 region_pts_np = np.asarray(mc["points"])[reg_indices]
-                weights_np = np.asarray(mc["nodal_ds"])[reg_indices]
+                # A boundary face that carries its own edge subset (a Shape/CSG source-edge tag such
+                # as ``boundary_chamber_0``) shares its two end corners with the perpendicular faces.
+                # The global ``nodal_ds`` lumps a corner's measure over *all* boundary edges meeting at
+                # that node, so counting the corner in this face over-attributes its perpendicular-edge
+                # share (one mesh segment) to this face's length. Recompute the nodal measure from just
+                # this tag's own edges -- mirroring the interior-subregion branch below -- so a shared
+                # corner contributes only its own-face half. (Corners must stay in ``tag_indices`` for
+                # multidirectional periodicity; only the integration weight needs the per-face split.)
+                tag_edges = getattr(domain, "_tag_edges", {}).get(tag)
+                if tag_edges is not None and len(tag_edges) > 0:
+                    points_arr = np.asarray(mc["points"])
+                    ds_local = np.zeros(points_arr.shape[0], dtype=np.float64)
+                    te = np.asarray(tag_edges)
+                    seg = np.linalg.norm(points_arr[te[:, 1]] - points_arr[te[:, 0]], axis=1)
+                    np.add.at(ds_local, te[:, 0], 0.5 * seg)
+                    np.add.at(ds_local, te[:, 1], 0.5 * seg)
+                    weights_np = ds_local[reg_indices]
+                else:
+                    weights_np = np.asarray(mc["nodal_ds"])[reg_indices]
                 normals_np = None
                 stored = getattr(domain, "normals_by_tag", {}).get(tag)
                 if stored is not None:
