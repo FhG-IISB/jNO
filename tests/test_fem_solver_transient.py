@@ -66,15 +66,20 @@ def test_linear_transient_slots_match_default():
         assert np.abs(sol - ref).max() < 1e-8, f"{name} trajectory deviates from the default"
 
 
-def test_linear_transient_amg_built_once_on_step_operator():
+def test_linear_transient_amg_built_once_on_step_operator(monkeypatch):
     pytest.importorskip("pyamg", reason="pyamg required for the AMG setup (optional dep)")
+    import jno.utils.solver.amg as amgmod
+
     fem = _heat(mesh_size=0.1)
     ref = np.asarray(fem.solve().fn())
-    spec = jno.precond.amg()
-    sol = np.asarray(fem.solve(linear=jno.solve.cg(tol=1e-10), precond=spec).fn())
+    builds = []
+    orig = amgmod.build_hierarchy
+    monkeypatch.setattr(amgmod, "build_hierarchy", lambda A, **kw: (builds.append(1), orig(A, **kw))[1])
+    sol = np.asarray(fem.solve(linear=jno.solve.cg(tol=1e-10), precond=jno.precond.amg()).fn())
     assert np.abs(sol - ref).max() < 1e-8
-    # the hierarchy was set up eagerly (constant step operator M + theta*dt*A), before the scan
-    assert spec._levels is not None
+    # the hierarchy is set up ONCE for the whole run (constant step operator M + θ·dt·A), before the scan —
+    # not per step (amg() no longer self-caches; the transient compose materialises it once up front)
+    assert len(builds) == 1
 
 
 def test_nonlinear_transient_slots_match_default():
