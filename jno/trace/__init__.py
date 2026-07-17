@@ -3448,6 +3448,105 @@ class FrozenField(Placeholder):
         return f"FrozenField(source_key={self.field_key}, ndof={self.values.shape[0]})"
 
 
+# ---------------------------------------------------------------------------
+# Trace substitution — rebuild an expression with some nodes swapped out
+# ---------------------------------------------------------------------------
+def _iter_placeholder_children(node):
+    """Yield ``(kind, attr, value)`` for each Placeholder-bearing child of a trace node — the scalar
+    child attributes (``target``/``left``/``right``/``expr``/``operation``) and the list attributes
+    (``args``/``variables``/``options``). The single traversal shape used by all trace walks here."""
+    for attr in ("target", "left", "right", "expr", "operation"):
+        child = getattr(node, attr, None)
+        if isinstance(child, Placeholder):
+            yield "scalar", attr, child
+    for attr in ("args", "variables", "options"):
+        seq = getattr(node, attr, None)
+        if isinstance(seq, (list, tuple)):
+            yield "list", attr, seq
+
+
+def substitute(expr, mapping):
+    """Return ``expr`` with each node in ``mapping`` replaced by its value, rebuilding all ancestors.
+
+    ``mapping`` maps existing trace nodes (matched **by identity**) to their replacements. Nodes on the
+    path to a replacement are shallow-cloned with a fresh ``op_id`` (so eval caches never confuse a clone
+    with its original); a node with no replaced descendant is returned unchanged (shared, not copied).
+    General over the trace node structure. Example — swap the live state into a *static* velocity
+    expression each step of a moving-boundary solve::
+
+        v_now = substitute(v, {frozen_u: refreeze(frozen_u, state)})
+    """
+    import copy as _copy
+
+    id_map = {id(k): v for k, v in mapping.items()}
+    memo: dict = {}
+
+    def visit(node):
+        if not isinstance(node, Placeholder):
+            return node
+        if id(node) in id_map:
+            return id_map[id(node)]
+        if id(node) in memo:
+            return memo[id(node)]
+        changed = False
+        new_scalar: dict = {}
+        new_list: dict = {}
+        for kind, attr, val in _iter_placeholder_children(node):
+            if kind == "scalar":
+                nc = visit(val)
+                new_scalar[attr] = nc
+                changed = changed or nc is not val
+            else:
+                nl = [visit(c) if isinstance(c, Placeholder) else c for c in val]
+                new_list[attr] = type(val)(nl)
+                changed = changed or any(a is not b for a, b in zip(nl, val))
+        if not changed:
+            memo[id(node)] = node
+            return node
+        clone = _copy.copy(node)
+        for attr, nc in new_scalar.items():
+            setattr(clone, attr, nc)
+        for attr, nl in new_list.items():
+            setattr(clone, attr, nl)
+        if hasattr(clone, "op_id"):
+            clone.op_id = _next_op_id()
+        memo[id(node)] = clone
+        return clone
+
+    return visit(expr)
+
+
+def frozen_fields_in(expr):
+    """The distinct :class:`FrozenField` nodes appearing in ``expr`` (by identity), in first-seen order."""
+    out, seen = [], set()
+
+    def visit(node):
+        if not isinstance(node, Placeholder) or id(node) in seen:
+            return
+        seen.add(id(node))
+        if isinstance(node, FrozenField):
+            out.append(node)
+        for kind, _attr, val in _iter_placeholder_children(node):
+            for c in val if kind == "list" else (val,):
+                visit(c)
+
+    visit(expr)
+    return out
+
+
+def refreeze(frozen, values):
+    """A copy of :class:`FrozenField` ``frozen`` pinned to new ``values``, with a **fresh gather-table
+    key** so the eval bakes the new values. (Mutating ``.values`` in place does not take effect — the
+    key is cached.) Used to swap the live state into a static readout each step."""
+    import copy as _copy
+
+    clone = _copy.copy(frozen)
+    clone.values = jnp.asarray(values).reshape(-1)
+    clone.frozen_id = _next_op_id()  # new gather-table key ⇒ the compiler bakes THESE values
+    clone.op_id = _next_op_id()
+    return clone
+
+
 class TestFunction(Placeholder):
     """
     Generic variational test function.

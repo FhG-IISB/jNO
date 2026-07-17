@@ -149,3 +149,31 @@ def test_frozen_readout_without_domain_fails_loud():
     bare = FrozenField(u.scalar._expr, jnp.zeros(n))  # no domain / coord_tag
     with pytest.raises((ValueError, KeyError), match="domain|region|bind"):
         np.asarray(bare.eval())
+
+
+def test_substitute_refreeze_swaps_state_in_a_static_readout():
+    """`substitute` + `refreeze` swap the live state into a STATIC readout expression (mutating the
+    frozen values in place does not — the gather-table key is cached), and the swap is differentiable in
+    the new state. This is the mechanism that lets a moving-boundary velocity be passed *as a trace*."""
+    from jno.trace import frozen_fields_in, refreeze, substitute
+
+    d = jno.Shape.rect(0, 0, 1, 1, size=0.15).domain()
+    u, _ = d.fem_symbols()
+    pts = np.asarray(d.mesh.points)[:, :2]
+    xb, yb, _, nx, ny = d.variable("boundary", normals=True, split=True)
+    v = (lambda Tf: Tf.x * nx + Tf.y * ny)(u.bind(x=xb, y=yb).freeze(3.0 * pts[:, 0] - 2.0 * pts[:, 1]))  # ∇=(3,-2)
+    vexpr = v.expr if hasattr(v, "expr") else v
+
+    frozen = frozen_fields_in(vexpr)
+    assert len(frozen) == 1  # the single frozen field is located (both Tf.x and Tf.y target the same node)
+    v2 = substitute(vexpr, {frozen[0]: refreeze(frozen[0], 1.0 * pts[:, 0])})  # swap to a field with ∇=(1,0)
+
+    nxe, nye = np.asarray(nx.eval()).reshape(-1), np.asarray(ny.eval()).reshape(-1)
+    assert np.max(np.abs(np.asarray(vexpr.eval()).reshape(-1) - (3 * nxe - 2 * nye))) < 1e-6  # original intact
+    assert np.max(np.abs(np.asarray(v2.eval()).reshape(-1) - (1 * nxe))) < 1e-6  # substituted ⇒ the NEW state
+
+    def loss(s):
+        return jnp.sum(substitute(vexpr, {frozen[0]: refreeze(frozen[0], s)}).eval() ** 2)
+
+    g = np.asarray(jax.grad(loss)(jnp.asarray(3.0 * pts[:, 0] - 2.0 * pts[:, 1])))
+    assert np.all(np.isfinite(g)) and np.linalg.norm(g) > 0  # differentiable in the swapped-in state
