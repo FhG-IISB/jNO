@@ -1225,9 +1225,22 @@ class MovingBoundary:
           of the current mesh (or read ``∇field`` via nodal recovery); the standalone readout is
           validated on a steady domain, and a transient-domain spatial ``.eval()`` is a follow-up.
 
-        In both forms, **return zero rows for the held (fixed) part of the boundary** and the interface
-        velocity for the moving surface -- the returned field *is* the specification of which boundary
-        moves.
+        In both callback forms, **return zero rows for the held (fixed) part of the boundary** and the
+        interface velocity for the moving surface -- the returned field *is* the specification of which
+        boundary moves.
+
+        - **trace expression** (velocity *as math*) -- a jNO trace node giving the **scalar normal
+          speed** at the boundary, referencing a frozen field for the current state::
+
+              xb, yb, _, nx, ny = d.variable("boundary", normals=True, split=True)
+              Tf = u.bind(x=xb, y=yb).freeze(state0)          # state0 = any placeholder (e.g. zeros/IC)
+              velocity = -(k / L) * (Tf.x * nx + Tf.y * ny)   # v_n = -k/L · ∇T·n, a Stefan front
+
+          The driver swaps the **live state** into ``Tf`` each step (via :func:`jno.trace.substitute` /
+          :func:`jno.trace.refreeze`), evaluates the expression, and moves each boundary vertex **along
+          its outward normal** at that speed. This is the fully-declarative form -- the interface law
+          *is* the input, and it is differentiable in the field. (Interpreted as a *normal* speed; a
+          callback returns the full velocity vector instead.)
     every
         Move + re-assemble every ``every`` steps (default 1 = every step, most accurate). Larger is
         cheaper (fewer re-assemblies) but lags the domain shape within a chunk.
@@ -1272,6 +1285,39 @@ def _velocity_wants_state(vel: Any) -> bool:
         return False
 
 
+def _is_trace_velocity(vel: Any) -> bool:
+    """True if ``vel`` is a **trace expression** (a Placeholder / typed view) rather than a Python
+    callback — i.e. the user passed the velocity *as math* (`v = -(k/L)*(Tf.x*nx + Tf.y*ny)`)."""
+    from ...trace import Placeholder
+
+    return isinstance(vel, Placeholder) or isinstance(getattr(vel, "expr", None), Placeholder)
+
+
+def _trace_velocity_vb(vexpr: Any, frozen_nodes: list, state: Any, dom: Any, bverts: np.ndarray, old_pts, dim: int):
+    """Turn a **trace-expression** velocity (a *scalar normal speed*) into a per-boundary-vertex velocity
+    VECTOR, moved along the outward normal. Swaps the live ``state`` into the static expression
+    (:func:`jno.trace.substitute` / :func:`jno.trace.refreeze`), evaluates it on the current domain (in
+    boundary-tag order), aligns to the driver's boundary vertices, and multiplies by the boundary normal.
+    The interface thus moves along its normal at the speed the expression gives (the Stefan/kinematic case)."""
+    from scipy.spatial import cKDTree
+
+    from ...trace import refreeze, substitute
+
+    v_now = substitute(vexpr, {f: refreeze(f, np.asarray(state)) for f in frozen_nodes})
+    v_n = np.asarray(v_now.eval()).reshape(-1)  # scalar normal speed at the "boundary" tag points
+
+    parts = dom.variable("boundary", normals=True, split=True)  # (x, y, [z], t, nx, ny, [nz])
+    coords = np.column_stack([np.asarray(parts[i].eval()).reshape(-1) for i in range(dim)])
+    normals = np.column_stack([np.asarray(parts[len(parts) - dim + i].eval()).reshape(-1) for i in range(dim)])
+    if v_n.shape[0] != coords.shape[0]:
+        raise ValueError(
+            f"MovingBoundary trace velocity evaluated to {v_n.shape[0]} values but the boundary tag has "
+            f"{coords.shape[0]} points — a trace velocity must be a SCALAR per boundary point (the normal speed)."
+        )
+    _, perm = cKDTree(coords).query(np.asarray(old_pts)[bverts])  # align tag order → driver's boundary vertices
+    return v_n[perm][:, None] * normals[perm]  # v_n · n̂ : each vertex moves along its outward normal
+
+
 def run_moving_boundary(
     fem: Any, spec: MovingBoundary, *, solve_fn: Any = None, save_ts: Any = None, **kwargs: Any
 ) -> "AdaptiveTrajectory":
@@ -1296,8 +1342,12 @@ def run_moving_boundary(
         )
     if getattr(fem, "_periodic", None) is not None:
         raise NotImplementedError("fem.solve(move=...) with periodic ties is not supported yet.")
-    if not callable(getattr(spec, "velocity", None)):
-        raise TypeError("MovingBoundary.velocity must be callable: velocity(t, x) -> (n_boundary, dim).")
+    _vel = getattr(spec, "velocity", None)
+    if not (callable(_vel) or _is_trace_velocity(_vel)):
+        raise TypeError(
+            "MovingBoundary.velocity must be a callable (velocity(t, x[, state, domain]) -> (n_boundary, dim)) "
+            "or a trace expression (a scalar normal speed, e.g. -(k/L)*(Tf.x*nx + Tf.y*ny))."
+        )
 
     d = fem.domain
     dim = int(d.dimension)
@@ -1326,7 +1376,20 @@ def run_moving_boundary(
     n_steps = len(ts) - 1
     every = max(1, int(spec.every))
     vel = spec.velocity
-    wants_state = _velocity_wants_state(vel)
+    vel_is_trace = _is_trace_velocity(vel)
+    wants_state = (not vel_is_trace) and _velocity_wants_state(vel)
+    frozen_nodes = vexpr = None
+    if vel_is_trace:
+        from ...trace import Placeholder, frozen_fields_in
+
+        vexpr = vel if isinstance(vel, Placeholder) else vel.expr  # unwrap a typed view to its Placeholder
+        frozen_nodes = frozen_fields_in(vexpr)
+        if not frozen_nodes:
+            raise ValueError(
+                "MovingBoundary.velocity given as a trace expression must reference a frozen field — build it "
+                "as `Tf = u.bind(x=xb, y=yb).freeze(state0)` and write the speed in terms of `Tf` (e.g. "
+                "`-(k/L)*(Tf.x*nx + Tf.y*ny)`); the driver swaps the live state into `Tf` each step."
+            )
 
     def _snapshot():
         return (np.asarray(d.mesh.points)[:, :dim].astype(np.float64), np.asarray(d.mesh.cells_dict[key]).astype(np.int64))
@@ -1345,9 +1408,13 @@ def run_moving_boundary(
         # 1) MOVE the boundary from shape(t0c) toward shape(t1c) by the prescribed velocity, hold the rest.
         bfacets = _boundary_edges_from_triangles(old_cells) if dim == 2 else _boundary_faces_from_tets(old_cells)
         bverts = np.unique(bfacets.reshape(-1))
-        # Prescribed velocity(t, x) or state-dependent velocity(t, x, state, domain) — the latter reads the
-        # CURRENT field on the CURRENT mesh (before this move), e.g. a Stefan v_n = -k/L·∇T·n.
-        if wants_state:
+        # Velocity in one of three forms: a trace expression (a scalar normal speed the driver moves along
+        # the normal), a state-dependent callback velocity(t, x, state, domain), or a prescribed
+        # velocity(t, x). The state-reading forms see the CURRENT field on the CURRENT mesh (before this
+        # move), e.g. a Stefan v_n = -k/L·∇T·n.
+        if vel_is_trace:
+            vb = np.asarray(_trace_velocity_vb(vexpr, frozen_nodes, state, d, bverts, old_pts, dim), dtype=np.float64)
+        elif wants_state:
             vb = np.asarray(vel(t0c, old_pts[bverts], np.asarray(state), d), dtype=np.float64)
         else:
             vb = np.asarray(vel(t0c, old_pts[bverts]), dtype=np.float64)

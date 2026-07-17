@@ -230,3 +230,44 @@ def test_state_dependent_velocity_reads_flux_via_dsl_readout():
     fem.solve(move=jno.MovingBoundary(velocity=vel, every=1))
     assert len(seen) >= 10
     assert any(abs(hi - lo) > 1e-3 for lo, hi in seen), "the DSL flux readout collapsed inside the driver"
+
+
+# ── velocity passed AS A TRACE EXPRESSION (declarative Stefan form) ────────────
+def test_velocity_as_trace_expression_drives_motion():
+    """The velocity passed as a jNO trace expression (not a callback): a scalar normal speed
+    -(k)·(Tf.x·nx + Tf.y·ny). The driver substitutes the live state into Tf each step (substitute/
+    refreeze), evaluates it, and moves the boundary along its normal — the fully-declarative Stefan form."""
+    d = jno.Shape.rect(0, 0, 1, 1, size=0.1).domain(time=(0.0, 0.3, 16))
+    u, phi = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xi0, yi0, _ = d.variable("initial", split=True)
+    xb, yb, _, nx, ny = d.variable("boundary", normals=True, split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    fem = jno.fem([ui.t * vi + 0.1 * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 1.0, u(xi0, yi0) - 0.0])
+
+    nvv = len(np.asarray(d.mesh.points))
+    Tf = u.bind(x=xb, y=yb).freeze(np.zeros(nvv))  # placeholder state; the driver swaps in the live field
+    v = -0.08 * (Tf.x * nx + Tf.y * ny)  # a TRACE EXPRESSION — scalar normal speed ∝ ∇T·n
+
+    traj = fem.solve(move=jno.MovingBoundary(velocity=v))
+    assert len(traj) == 16
+
+    def bbox(p):
+        return (p[:, 0].max() - p[:, 0].min()) * (p[:, 1].max() - p[:, 1].min())
+
+    p0, pf = np.asarray(traj.meshes[0][0]), np.asarray(traj.meshes[-1][0])
+    assert abs(bbox(pf) - bbox(p0)) > 1e-3, "the trace-expression velocity did not move the boundary"
+
+
+def test_velocity_as_trace_without_frozen_field_raises():
+    """A trace velocity must reference a frozen field (so the driver can inject the live state); a bare
+    expression of only the normals has nowhere to put the state → fail loud."""
+    d = jno.Shape.rect(0, 0, 1, 1, size=0.2).domain(time=(0.0, 0.1, 6))
+    u, phi = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xi0, yi0, _ = d.variable("initial", split=True)
+    _, _, _, nx, _ = d.variable("boundary", normals=True, split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    fem = jno.fem([ui.t * vi + 0.1 * (ui.x * vi.x + ui.y * vi.y), u(xi0, yi0) - 1.0])
+    with pytest.raises(ValueError, match="frozen field"):
+        fem.solve(move=jno.MovingBoundary(velocity=0.1 * nx))
