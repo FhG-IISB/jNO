@@ -85,7 +85,26 @@ def _exponential_integrate(block, args, save_ts, *, order, mass, symmetric):
     if block.affine_bias is not None:
         c = c + jnp.asarray(block.affine_bias, dtype).reshape(-1)
     if block.forcing_vector_fn is not None:
-        c = c + jnp.asarray(block.forcing_vector_fn(float(grid[0]), args or {}), dtype).reshape(-1)
+        f0 = jnp.asarray(block.forcing_vector_fn(float(grid[0]), args or {}), dtype).reshape(-1)
+        c = c + f0
+        # The exponential step is exact-in-time only for an AUTONOMOUS system with TIME-INDEPENDENT
+        # forcing; a time-varying source would be silently frozen at t0 here. Probe f at a few times and
+        # fail loud if it drifts (concrete-args case; under traced/parametric args the probe is skipped).
+        probes = [float(grid[k]) for k in (len(grid) // 2, -1)]
+        try:
+            drift = max(
+                float(jnp.linalg.norm(jnp.asarray(block.forcing_vector_fn(t, args or {}), dtype).reshape(-1) - f0))
+                for t in probes
+            )
+            scale = float(jnp.linalg.norm(f0)) + 1e-30
+        except Exception:  # traced args: cannot concretely compare — documented scope limit
+            drift, scale = 0.0, 1.0
+        if drift > 1e-9 * scale:
+            raise NotImplementedError(
+                "jno.solve.exponential integrates an AUTONOMOUS system with time-INDEPENDENT forcing (it is "
+                "exact-in-time only then); this problem's source f(t) varies in time, which the exponential "
+                "step would silently freeze at t0. Use jno.solve.theta(...) for a time-varying source."
+            )
     has_forcing = bool(block.affine_bias is not None or block.forcing_vector_fn is not None)
 
     def _exp(lam):

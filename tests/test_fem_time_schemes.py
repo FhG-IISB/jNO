@@ -203,6 +203,25 @@ def test_transient_with_source_converges_to_manufactured_solution():
             assert np.linalg.norm(got - exact) / np.linalg.norm(exact) < 5e-3, (time_varying, scheme)
 
 
+@pytest.mark.skipif(not _HAS_MATFREE, reason="jno.solve.exponential needs the optional 'matfree' package")
+def test_exponential_rejects_time_varying_forcing():
+    """The exponential integrator is exact-in-time only for an autonomous system with a TIME-INDEPENDENT
+    source. A time-varying forcing would be silently frozen at t0 (an 83%-wrong solution), so it must fail
+    loud and point to the θ-scheme instead."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.12, time=(0.0, 0.3, 6))
+    u, v = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+    ss = jno.np.sin(PI * xi) * jno.np.sin(PI * yi)
+    fem = jno.fem(
+        [ui.t * vi + ui.x * vi.x + ui.y * vi.y - ss * (1.0 + 2.0 * PI**2 * ti) * vi, u(xb, yb) - 0.0, u(ci[0], ci[1]) - 0.0]
+    )
+    with pytest.raises(NotImplementedError, match="time-INDEPENDENT|autonomous|time-varying"):
+        fem.solve(time=jno.solve.exponential(order=40)).fn()
+
+
 def test_time_scheme_rejects_a_steady_problem():
     """``time=`` selects a TIME integrator, so it is an error on a non-transient problem."""
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2)
