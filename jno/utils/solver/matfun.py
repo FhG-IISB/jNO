@@ -23,8 +23,8 @@ def _require_matfree():
         import matfree  # noqa: F401
     except ImportError as e:  # optional dependency — keep core jNO lean
         raise ImportError(
-            "jno.solve.logdet / trace / applyfun need the optional 'matfree' package (MIT, pure JAX). "
-            "Install it with:  pip install matfree"
+            "jno.solve.logdet / trace / applyfun / diagonal need the optional 'matfree' package "
+            "(MIT, pure JAX). Install it with:  pip install matfree"
         ) from e
 
 
@@ -84,3 +84,29 @@ def applyfun(A, v, *, fun, order: int = 30):
     mv, _n, _dtype = _operator(A)
     f = funm.funm_lanczos_sym(funm.dense_funm_sym_eigh(fun), decomp.tridiag_sym(order))
     return f(mv, jnp.asarray(v))
+
+
+def diagonal(A, *, fun=None, samples: int = 32, order: int = 25, key=None):
+    """Differentiable stochastic estimate of the **diagonal** of ``A`` (Hutchinson), or of ``f(A)`` when
+    ``fun`` is given (``A`` symmetric; ``f(A)·probe`` via Lanczos). Unlike :func:`trace` (a scalar) this
+    returns the **per-DOF field** — the pointwise version of the same probe estimator. The key use is the
+    diagonal of the inverse, ``fun=lambda z: 1/z`` → ``diag(A⁻¹)``: the **pointwise posterior variance /
+    uncertainty map** of a FEM precision ``A``, a spatial field you can plot on the mesh.
+
+    Stochastic: an unbiased estimate whose variance falls with ``samples`` and (for ``fun``) whose bias
+    falls with ``order`` — **not** exact. Cost is ``samples`` matvecs (``fun=None``) or ``samples×order``
+    (``fun`` given, a Lanczos per probe)."""
+    _require_matfree()
+    from matfree import decomp, funm, stochtrace
+
+    mv, n, dtype = _operator(A)
+    if fun is None:
+        matvec = mv
+    else:  # diag f(A): each probe gets f(A)·probe by Lanczos, then Hutchinson takes the diagonal
+        f = funm.funm_lanczos_sym(funm.dense_funm_sym_eigh(fun), decomp.tridiag_sym(order))
+        matvec = lambda v: f(mv, v)  # noqa: E731
+    estimate = stochtrace.estimator_monte_carlo(
+        stochtrace.monte_carlo_diagonal(),
+        sampler=stochtrace.sampler_normal(jnp.zeros(n, dtype), num=samples),
+    )
+    return estimate(matvec, _key(key))

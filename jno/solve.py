@@ -52,6 +52,7 @@ __all__ = [
     "logdet",
     "trace",
     "applyfun",
+    "diagonal",
     "theta",
     "exponential",
 ]
@@ -431,6 +432,17 @@ def applyfun(A, v, *, fun, order: int = 30):
     from .utils.solver.matfun import applyfun as _applyfun
 
     return _applyfun(A, v, fun=fun, order=order)
+
+
+def diagonal(A, *, fun=None, samples: int = 32, order: int = 25, key=None):
+    """Differentiable, matrix-free estimate of the **diagonal** of ``A`` (Hutchinson) or ``f(A)`` (``fun=``,
+    ``A`` symmetric) — the per-DOF **field** counterpart of :func:`trace`. The key use is
+    ``fun=lambda z: 1/z`` → ``diag(A⁻¹)``, the **pointwise posterior variance / uncertainty map** of a FEM
+    precision, plottable on the mesh. Stochastic (variance ↓ ``samples``, bias ↓ ``order``); optional
+    ``matfree``. See :func:`jno.utils.solver.matfun.diagonal`."""
+    from .utils.solver.matfun import diagonal as _diagonal
+
+    return _diagonal(A, fun=fun, samples=samples, order=order, key=key)
 
 
 def theta(theta: float = 1.0):

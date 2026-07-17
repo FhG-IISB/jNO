@@ -103,6 +103,27 @@ def test_logdet_trains_a_parameter():
     assert abs(float(theta) - 2.0) < 0.05  # recovered the scale by training through logdet
 
 
+def test_diagonal_matches_dense():
+    """``diagonal`` estimates the per-DOF diagonal field — of ``A`` and (the key use) of ``A⁻¹``, the
+    pointwise variance map. Stochastic, so the whole-field error is loose."""
+    op, dense = _spd_fem()
+    d0 = jno.solve.diagonal(op, samples=4000, key=jax.random.PRNGKey(0))
+    true0 = jnp.diagonal(dense)
+    assert float(jnp.linalg.norm(d0 - true0) / jnp.linalg.norm(true0)) < 0.1
+    # diag(A⁻¹) (the variance map) is a much higher-variance estimand — loose gate, honestly stochastic
+    di = jno.solve.diagonal(op, fun=lambda z: 1.0 / z, samples=6000, order=30, key=jax.random.PRNGKey(1))
+    truei = jnp.diagonal(jnp.linalg.inv(dense))
+    assert float(jnp.linalg.norm(di - truei) / jnp.linalg.norm(truei)) < 0.2
+
+
+def test_diagonal_gradient_matches_trace():
+    """``∂/∂s Σ diag(sA) = Σ diag(A) = tr A`` — autodiff flows through the diagonal estimator."""
+    _op, dense = _spd_fem()
+    key = jax.random.PRNGKey(0)
+    g = float(jax.grad(lambda s: jnp.sum(jno.solve.diagonal(s * dense, samples=2000, key=key)))(1.0))
+    assert abs(g - float(jnp.trace(dense))) / float(jnp.trace(dense)) < 0.05
+
+
 @pytest.mark.skipif(_HAS_MATFREE, reason="matfree installed; this checks the missing-dependency message")
 def test_missing_matfree_message():
     _op, dense = _spd_fem()
