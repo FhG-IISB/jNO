@@ -271,3 +271,27 @@ def test_velocity_as_trace_without_frozen_field_raises():
     fem = jno.fem([ui.t * vi + 0.1 * (ui.x * vi.x + ui.y * vi.y), u(xi0, yi0) - 1.0])
     with pytest.raises(ValueError, match="frozen field"):
         fem.solve(move=jno.MovingBoundary(velocity=0.1 * nx))
+
+
+def test_trace_velocity_moves_only_part_of_the_boundary():
+    """Because the boundary COORDINATES are trace nodes, a coordinate-masked velocity frees only part of
+    the boundary and holds the rest EXACTLY — no movable-tag API needed. `velocity * (yb > 0.9)` frees the
+    top; the base is pinned to 0. (The mask follows the moving surface: `yb` re-samples each step.)"""
+    d = jno.Shape.rect(0, 0, 1, 1, size=0.1).domain(time=(0.0, 0.3, 16))
+    u, phi = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xi0, yi0, _ = d.variable("initial", split=True)
+    xb, yb, _, nx, ny = d.variable("boundary", normals=True, split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    fem = jno.fem([ui.t * vi + 0.1 * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 1.0, u(xi0, yi0) - 0.0])
+
+    nvv = len(np.asarray(d.mesh.points))
+    Tf = u.bind(x=xb, y=yb).freeze(np.zeros(nvv))
+    v = (-0.10 * (Tf.x * nx + Tf.y * ny)) * (yb > 0.9)  # only the top is a free surface (coordinate mask)
+
+    traj = fem.solve(move=jno.MovingBoundary(velocity=v))
+    p0, pf = np.asarray(traj.meshes[0][0]), np.asarray(traj.meshes[-1][0])  # same connectivity (no remesh)
+    disp = np.linalg.norm(pf - p0, axis=1)
+    y0 = p0[:, 1]
+    assert disp[y0 > 0.9].max() > 0.02, "the freed top did not move"
+    assert disp[y0 < 0.05].max() < 1e-9, "the masked-out base was not held exactly"

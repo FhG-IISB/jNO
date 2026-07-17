@@ -1241,6 +1241,16 @@ class MovingBoundary:
           its outward normal** at that speed. This is the fully-declarative form -- the interface law
           *is* the input, and it is differentiable in the field. (Interpreted as a *normal* speed; a
           callback returns the full velocity vector instead.)
+
+          **Only part of the boundary moves** -- because the boundary coordinates ``xb, yb`` are trace
+          nodes too, a coordinate-masked speed frees just the surface(s) you want and holds the rest
+          exactly (the mask *follows* the moving surface, since the coordinates re-sample each step). No
+          separate movable-tag is needed::
+
+              v = (-(k / L) * (Tf.x * nx + Tf.y * ny)) * (yb > y_base)   # top free, base held
+
+          (several parts: a compound mask; the held nodes get zero speed and are pinned by the harmonic
+          interior extension.)
     every
         Move + re-assemble every ``every`` steps (default 1 = every step, most accurate). Larger is
         cheaper (fewer re-assemblies) but lags the domain shape within a chunk.
