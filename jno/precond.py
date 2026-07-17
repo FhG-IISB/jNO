@@ -503,8 +503,19 @@ class _AMS(_Spec):
             self._transfer(ctx.fem.domain)
 
         A = ctx.A.bcoo if ctx.A.bcoo is not None else ctx.A.dense()
+
+        def _csr(M):
+            # BCOO -> scipy CSR through its COO triplets: O(nnz), never densify. `.todense()` here would
+            # materialize the full edge x edge operator (~80 GB at 70k edges) before re-sparsifying.
+            # Duplicate indices sum, matching BCOO semantics; a traced operator's tracer .data raises under
+            # np.asarray and is caught below as "cannot host-assemble under a trace".
+            if hasattr(M, "indices") and hasattr(M, "data"):
+                idx = np.asarray(M.indices)
+                return sp.csr_matrix((np.asarray(M.data), (idx[:, 0], idx[:, 1])), shape=tuple(M.shape))
+            return sp.csr_matrix(np.asarray(M))
+
         try:
-            A_sp = sp.csr_matrix(np.asarray(A.todense() if hasattr(A, "todense") else A))
+            A_sp = _csr(A)
         except Exception as e:  # a traced operator (parametric/complex-inverse) can't be host-assembled
             raise RuntimeError(
                 "jno.precond.ams assembles the nodal auxiliaries on the host from a concrete matrix, so it "
@@ -513,8 +524,8 @@ class _AMS(_Spec):
                 "at your reference parameters — then reuse that spec; the frozen preconditioner then runs "
                 "and differentiates through (the gradient flows through the operator, not the preconditioner)."
             ) from e
-        G_sp = sp.csr_matrix(np.asarray(self._G.todense()))
-        Pi_sp = [sp.csr_matrix(np.asarray(P.todense())) for P in self._Pis]
+        G_sp = _csr(self._G)
+        Pi_sp = [_csr(P) for P in self._Pis]
 
         A_G = (G_sp.T @ A_sp @ G_sp).tocsr()  # gradient-space auxiliary operator GᵀAG
         g_scale = float(np.abs(A_G.data).max()) if A_G.nnz else 0.0
