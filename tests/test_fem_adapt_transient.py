@@ -74,6 +74,15 @@ def test_transient_adaptive_mesh_actually_changes():
     assert len(set(sizes)) > 1, "the adapted mesh never changed size across the march"
 
 
+def test_transient_adaptive_holds_a_constant_budget():
+    """The transient driver targets a CONSTANT complexity each remesh (redistribute DOFs to follow the
+    feature) — it must NOT ratchet the mesh up toward max_dofs every remesh like the steady loop does."""
+    fem, _ = _heat_fem(mesh_size=0.1, t_end=0.24, nt=16)
+    traj = fem.solve(adapt=jno.AdaptSpec(anisotropic=True, every=3, max_dofs=4000))
+    post = [m[0].shape[0] for m in traj.meshes][4:]  # sizes after the first remesh settles
+    assert max(post) < 1.5 * min(post), f"vertex count ratcheted instead of holding a budget: {min(post)}..{max(post)}"
+
+
 def test_resample_shape_and_final():
     fem, _ = _heat_fem(mesh_size=0.14, t_end=0.15, nt=13)
     traj = fem.solve(adapt=jno.AdaptSpec(anisotropic=True, every=4))

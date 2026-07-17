@@ -964,6 +964,15 @@ def run_adaptive_transient(
     n_steps = len(ts) - 1
     every = max(1, int(spec.every))
 
+    # Transient budget: a CONSTANT target complexity + a FIXED edge-size window (from the initial mesh), so
+    # each remesh REDISTRIBUTES ~the same number of DOFs to follow the moving feature — the mesh tracks it
+    # and coarsens the wake, instead of ratcheting up by refine_factor every remesh like the steady loop
+    # (which grows the mesh toward convergence). Budget = max_dofs if given, else the initial vertex count.
+    h_typ0 = _mean_edge_length(d)
+    hmin = spec.hmin if spec.hmin is not None else h_typ0 / 50.0
+    hmax = spec.hmax if spec.hmax is not None else h_typ0 * 2.0
+    target = float(spec.max_dofs) if spec.max_dofs is not None else float(n_verts)
+
     def _snapshot():
         return (np.asarray(d.mesh.points)[:, :dim].astype(np.float64), np.asarray(d.mesh.cells_dict[key]).astype(np.int64))
 
@@ -990,15 +999,8 @@ def run_adaptive_transient(
         if i >= n_steps:
             break
 
-        # remesh from the metric-driving field, then carry every field's block onto the new mesh
+        # remesh from the metric-driving field (fixed budget above), then carry every field's block over
         u_v = np.asarray(state[off[mf] : off[mf + 1]])  # the metric_field's scalar-P1 vertex values
-        h_typ = _mean_edge_length(d)
-        hmin = spec.hmin if spec.hmin is not None else h_typ / 50.0
-        hmax = spec.hmax if spec.hmax is not None else h_typ * 2.0
-        n_dofs = int(np.asarray(d.mesh.points).shape[0])
-        target = n_dofs * spec.refine_factor
-        if spec.max_dofs is not None:
-            target = min(target, float(spec.max_dofs))
         old_pts, old_cells = cur_mesh
         if spec.anisotropic:
             metric = hessian_metric(d, u_v, target_complexity=target, hmin=hmin, hmax=hmax)
