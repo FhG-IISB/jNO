@@ -17,7 +17,7 @@ def _assert_nonempty(path: Path):
     [
         jno.domain.line(mesh_size=0.2),
         jno.domain.equi_distant_rect(nx=6, ny=6),
-        jno.domain.cube(mesh_size=0.6),
+        jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.6),
     ],
 )
 def test_export_vtk_msh(constructor, tmp_path):
@@ -38,7 +38,7 @@ def test_export_vtk_msh(constructor, tmp_path):
     [
         jno.domain.line(mesh_size=0.2),
         jno.domain.equi_distant_rect(nx=6, ny=6),
-        jno.domain.cube(mesh_size=0.6),
+        jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.6),
     ],
 )
 def test_export_png_if_matplotlib_available(constructor, tmp_path):
@@ -65,7 +65,7 @@ def test_export_dispatch_with_explicit_format(tmp_path):
     "constructor",
     [
         jno.domain.equi_distant_rect(nx=6, ny=6),
-        jno.domain.cube(mesh_size=0.8),
+        jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.8),
     ],
 )
 def test_export_html_if_plotly_available(constructor, tmp_path):

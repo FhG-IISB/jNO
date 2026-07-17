@@ -56,7 +56,7 @@ def _laplacian_K(dim, order, mesh_size):
         ui, vi = u.bind(x=co[0], y=co[1]), phi.bind(x=co[0], y=co[1])
         var = [co[0], co[1]]
     else:
-        d = jno.domain(constructor=jno.domain.cube(mesh_size=mesh_size))
+        d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=mesh_size).domain()
         co = d.variable("interior", split=True)
         u, phi = d.fem_symbols(order=order)
         ui, vi = u.bind(x=co[0], y=co[1], z=co[2]), phi.bind(x=co[0], y=co[1], z=co[2])

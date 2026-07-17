@@ -354,7 +354,7 @@ def test_region_in_transient_form():
 
 def test_region_in_3d():
     """Per-region integration works in 3D (centroid-in-predicate over tetrahedra)."""
-    d = jno.domain(constructor=jno.domain.cube(mesh_size=0.18))
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.18).domain()
     assert d.dimension == 3
     ball = lambda x, y, z: (x - 0.5) ** 2 + (y - 0.5) ** 2 + (z - 0.5) ** 2 < 0.25**2  # noqa: E731
     d.tag("ball", ball)

@@ -107,7 +107,7 @@ import jax.numpy as jnp
 import numpy as np
 
 # --- train ---
-domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.05))
+domain = jno.Shape.rect(0, 0, 1, 1, size=0.05).domain()
 x, y, _ = domain.variable("interior")
 
 net = jno.nn(foundax.mlp(in_features=2, hidden_dims=64, num_layers=4,

@@ -67,7 +67,7 @@ def test_nedelec_tet_element_pushforward():
 
 
 def _n1e_cube(mesh_size=0.5):
-    d = jno.domain(constructor=jno.domain.cube(mesh_size=mesh_size))
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=mesh_size).domain()
     u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
     coords = d.variable("interior", split=True)
     xi, yi, zi = coords[0], coords[1], coords[2]
@@ -106,7 +106,7 @@ def test_nedelec_tet_curl_curl_exact_bilinear():
 def test_3d_nonnodal_only_nedelec_supported():
     """On a 3D tet mesh only N1E is wired; the 2D-only families (here Morley) must raise a clear
     NotImplementedError rather than silently mis-map their 2D edge/vertex machinery onto a tet."""
-    d = jno.domain(constructor=jno.domain.cube(mesh_size=0.6))
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.6).domain()
     u, phi = d.fem_symbols(space="Morley")
     coords = d.variable("interior", split=True)
     xi, yi, zi = coords[0], coords[1], coords[2]
@@ -124,7 +124,7 @@ def test_pec_tangential_pins_are_boundary_face_edges():
     from jno.utils.solver.fem_nonnodal import _n1e_tangential_pins_3d
     from jno.utils.solver.fem_topology import BASIX_TET_EDGES, build_edge_topology
 
-    d = jno.domain(constructor=jno.domain.cube(mesh_size=0.4))
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.4).domain()
     cells = np.asarray(d.mesh.cells_dict["tetra"])
     top = build_edge_topology(cells, BASIX_TET_EDGES)
     pins = _n1e_tangential_pins_3d([("u", "boundary", 0.0)], d, {"u": 0}, ["N1E"], top, [0])
@@ -150,7 +150,7 @@ def _driven_pec_l2_error(mesh_size):
     boundary. Returns ``(n_dof, ‖E_h − E*‖_L²)`` via ``‖E-E*‖² = EᵀME − 2Eᵀb* + ∫|E*|²`` (``∫|E*|²=¾``)."""
     sin, cos, vec = jno.np.sin, jno.np.cos, jno.np.vector
     pi = np.pi
-    d = jno.domain(constructor=jno.domain.cube(mesh_size=mesh_size))
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=mesh_size).domain()
     u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
     c = d.variable("interior", split=True)
     xi, yi, zi = c[0], c[1], c[2]
@@ -187,7 +187,7 @@ def _cavity_eigenvalues(mesh_size):
     from jno.utils.solver.fem_nonnodal import _n1e_tangential_pins_3d
     from jno.utils.solver.fem_topology import BASIX_TET_EDGES, build_edge_topology
 
-    d = jno.domain(constructor=jno.domain.cube(mesh_size=mesh_size))
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=mesh_size).domain()
     u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
     c = d.variable("interior", split=True)
     xi, yi, zi = c[0], c[1], c[2]

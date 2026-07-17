@@ -1,8 +1,11 @@
-"""Tests for jno.domain with built-in Geometries constructors.
+"""Tests for jno.domain construction.
 
-Covers 1-D, 2-D, and 3-D geometry construction both with and without a time
+Covers 1-D, 2-D, and 3-D domain construction both with and without a time
 dimension, always using ``compute_mesh_connectivity=True`` so that the full
-preprocessing pipeline (connectivity, normals, etc.) is exercised.
+preprocessing pipeline (connectivity, normals, etc.) is exercised. 1-D lines and
+structured grids come from the ``jno.domain.line`` / ``equi_distant_rect`` /
+``poseidon`` classmethods; 2-D/3-D geometries come from ``jno.Shape`` (the CSG
+build-plan) realized via ``Shape(...).domain()``.
 
 Mesh sizes are kept deliberately coarse to keep the suite fast.
 """
@@ -15,8 +18,8 @@ import pytest
 import jno
 
 
-def test_geometry_shortcut_returns_domain_instance():
-    dom = jno.domain.rect(mesh_size=0.3, compute_mesh_connectivity=True)
+def test_shape_domain_returns_domain_instance():
+    dom = jno.Shape.rect(0, 0, 1, 1, size=0.3).domain(compute_mesh_connectivity=True)
 
     assert isinstance(dom, jno.domain)
     assert dom.dimension == 2
@@ -56,17 +59,6 @@ def test_line_domain_exposes_named_endpoints():
             {"x_range", "mesh_size", "algorithm", "time", "compute_mesh_connectivity"},
         ),
         (
-            "rect",
-            {
-                "x_range",
-                "y_range",
-                "mesh_size",
-                "algorithm",
-                "time",
-                "compute_mesh_connectivity",
-            },
-        ),
-        (
             "equi_distant_rect",
             {
                 "x_range",
@@ -79,86 +71,6 @@ def test_line_domain_exposes_named_endpoints():
             },
         ),
         ("poseidon", {"nx", "ny", "algorithm", "time", "compute_mesh_connectivity"}),
-        (
-            "cube",
-            {
-                "x_range",
-                "y_range",
-                "z_range",
-                "mesh_size",
-                "algorithm",
-                "time",
-                "compute_mesh_connectivity",
-            },
-        ),
-        (
-            "disk",
-            {
-                "center",
-                "radius",
-                "mesh_size",
-                "num_points",
-                "algorithm",
-                "time",
-                "compute_mesh_connectivity",
-            },
-        ),
-        (
-            "triangle",
-            {"vertices", "mesh_size", "algorithm", "time", "compute_mesh_connectivity"},
-        ),
-        (
-            "polygon",
-            {"vertices", "mesh_size", "algorithm", "time", "compute_mesh_connectivity"},
-        ),
-        (
-            "l_shape",
-            {
-                "size",
-                "mesh_size",
-                "separate_boundary",
-                "algorithm",
-                "time",
-                "compute_mesh_connectivity",
-            },
-        ),
-        (
-            "rectangle_with_hole",
-            {
-                "outer_size",
-                "hole_size",
-                "mesh_size",
-                "separate_boundary",
-                "algorithm",
-                "time",
-                "compute_mesh_connectivity",
-            },
-        ),
-        (
-            "rect_pml",
-            {
-                "x_range",
-                "y_range",
-                "mesh_size",
-                "pml_thickness_top",
-                "pml_thickness_bottom",
-                "algorithm",
-                "time",
-                "compute_mesh_connectivity",
-            },
-        ),
-        (
-            "rectangle_with_holes",
-            {
-                "outer_size",
-                "holes",
-                "mesh_size",
-                "separate_boundary",
-                "algorithm",
-                "time",
-                "compute_mesh_connectivity",
-            },
-        ),
     ],
 )
 def test_geometry_shortcuts_expose_explicit_signatures(shape_name, expected_parameters):
@@ -252,14 +164,11 @@ class TestLine1DTimeDep:
 
 
 class TestRect2DStationary:
-    """``Geometries.rect`` – unstructured pygmsh mesh, no time."""
+    """``Shape.rect`` – unstructured gmsh mesh, no time."""
 
     @pytest.fixture(scope="class")
     def dom(self):
-        return jno.domain(
-            constructor=jno.domain.rect(mesh_size=0.3),
-            compute_mesh_connectivity=True,
-        )
+        return jno.Shape.rect(0, 0, 1, 1, size=0.3).domain(compute_mesh_connectivity=True)
 
     def test_no_exception_on_creation(self, dom):
         assert dom is not None
@@ -285,7 +194,7 @@ class TestRect2DStationary:
         assert pts.shape[1] == 2
 
     def test_side_tags_present(self, dom):
-        for tag in ("one", "two", "three", "four", "top", "right", "bottom", "left"):
+        for tag in ("top", "right", "bottom", "left"):
             assert tag in dom.avaiable_mesh_tags, f"Expected tag '{tag}' in avaiable_mesh_tags"
 
     def test_stationary_time_in_context(self, dom):
@@ -298,12 +207,11 @@ class TestRect2DStationary:
 
 
 class TestRect2DTimeDep:
-    """``Geometries.rect`` with a time dimension ``(0, 2, 4)``."""
+    """``Shape.rect`` with a time dimension ``(0, 2, 4)``."""
 
     @pytest.fixture(scope="class")
     def dom(self):
-        return jno.domain(
-            constructor=jno.domain.rect(mesh_size=0.3),
+        return jno.Shape.rect(0, 0, 1, 1, size=0.3).domain(
             time=(0, 2, 4),
             compute_mesh_connectivity=True,
         )
@@ -367,14 +275,11 @@ class TestEquiDistantRect2DStationary:
 
 
 class TestCube3DStationary:
-    """``Geometries.cube`` – 3-D unstructured pygmsh mesh, no time."""
+    """``Shape.box`` – 3-D unstructured gmsh mesh, no time."""
 
     @pytest.fixture(scope="class")
     def dom(self):
-        return jno.domain(
-            constructor=jno.domain.cube(mesh_size=0.5),
-            compute_mesh_connectivity=True,
-        )
+        return jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain(compute_mesh_connectivity=True)
 
     def test_no_exception_on_creation(self, dom):
         assert dom is not None
@@ -409,12 +314,11 @@ class TestCube3DStationary:
 
 
 class TestCube3DTimeDep:
-    """``Geometries.cube`` with a time dimension ``(0, 1, 3)``."""
+    """``Shape.box`` with a time dimension ``(0, 1, 3)``."""
 
     @pytest.fixture(scope="class")
     def dom(self):
-        return jno.domain(
-            constructor=jno.domain.cube(mesh_size=0.5),
+        return jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain(
             time=(0, 1, 3),
             compute_mesh_connectivity=True,
         )
@@ -439,13 +343,11 @@ class TestCube3DTimeDep:
 
 
 class TestTriangle:
-    """Basic triangle domain from custom vertices."""
+    """Basic triangle domain from custom vertices (a 3-vertex polygon)."""
 
     @pytest.fixture(scope="class")
     def dom(self):
-        return jno.domain.triangle(
-            vertices=((0, 0), (2, 0), (1, 1)),
-            mesh_size=0.3,
+        return jno.Shape.polygon(((0, 0), (2, 0), (1, 1)), size=0.3).domain(
             compute_mesh_connectivity=True,
         )
 
@@ -468,13 +370,12 @@ class TestTriangle:
 
 
 class TestPolygon:
-    """Generic polygon domain with auto-orientation and boundary labels."""
+    """Generic polygon domain with per-edge boundary labels (``e0..e{n-1}``)."""
 
     @pytest.fixture(scope="class")
     def dom(self):
-        # Pentagon (given in CW order to test auto-reorientation)
         verts = [(0, 0), (0, 2), (1, 3), (2, 2), (2, 0)]
-        return jno.domain.polygon(vertices=verts, mesh_size=0.5, compute_mesh_connectivity=True)
+        return jno.Shape.polygon(verts, size=0.5).domain(compute_mesh_connectivity=True)
 
     def test_dimension_is_2(self, dom):
         assert dom.dimension == 2
@@ -485,19 +386,19 @@ class TestPolygon:
 
     def test_five_boundary_labels(self, dom):
         tags = set(dom._mesh_pool.keys())
-        for name in ("one", "two", "three", "four", "five"):
+        for name in ("e0", "e1", "e2", "e3", "e4"):
             assert name in tags, f"Missing boundary label '{name}'"
 
-    def test_rect_has_four_boundary_labels(self):
-        dom = jno.domain.rect(mesh_size=0.4)
+    def test_rect_has_named_side_labels(self):
+        dom = jno.Shape.rect(0, 0, 1, 1, size=0.4).domain()
         tags = set(dom._mesh_pool.keys())
-        for name in ("one", "two", "three", "four"):
+        for name in ("left", "right", "top", "bottom"):
             assert name in tags
 
     def test_triangle_has_three_boundary_labels(self):
-        dom = jno.domain.triangle(mesh_size=0.4)
+        dom = jno.Shape.polygon(((0, 0), (1, 0), (0, 1)), size=0.4).domain()
         tags = set(dom._mesh_pool.keys())
-        for name in ("one", "two", "three"):
+        for name in ("e0", "e1", "e2"):
             assert name in tags
 
 
@@ -510,8 +411,8 @@ class TestDomainStacking:
     """Verify that combining domains via ``+`` correctly stacks batches."""
 
     def test_two_geometries_batch_shape(self):
-        dom = 3 * jno.domain.rect(mesh_size=0.3)
-        dom += 2 * jno.domain.disk(mesh_size=0.3)
+        dom = 3 * jno.Shape.rect(0, 0, 1, 1, size=0.3).domain()
+        dom += 2 * jno.Shape.disk(0, 0, 1, size=0.3).domain()
         x, y, _ = dom.variable("interior", (10, None))
         ctx = dom.context["interior"]
         assert ctx.shape[0] == 5  # 3 rect + 2 disk
@@ -519,24 +420,24 @@ class TestDomainStacking:
         assert ctx.shape[3] == 2
 
     def test_three_geometries_batch_shape(self):
-        dom = 4 * jno.domain.rect(mesh_size=0.3)
-        dom += 3 * jno.domain.disk(mesh_size=0.3)
-        dom += 2 * jno.domain.l_shape(mesh_size=0.3)
+        dom = 4 * jno.Shape.rect(0, 0, 1, 1, size=0.3).domain()
+        dom += 3 * jno.Shape.disk(0, 0, 1, size=0.3).domain()
+        dom += 2 * jno.Shape.polygon([(0, 0), (1, 0), (1, 0.5), (0.5, 0.5), (0.5, 1), (0, 1)], size=0.3).domain()
         x, y, _ = dom.variable("interior", (8, None))
         ctx = dom.context["interior"]
         assert ctx.shape[0] == 9  # 4 + 3 + 2
         assert ctx.shape[2] == 8
 
     def test_boundary_also_stacks(self):
-        dom = 2 * jno.domain.rect(mesh_size=0.3)
-        dom += 3 * jno.domain.triangle(mesh_size=0.3)
+        dom = 2 * jno.Shape.rect(0, 0, 1, 1, size=0.3).domain()
+        dom += 3 * jno.Shape.polygon(((0, 0), (1, 0), (0, 1)), size=0.3).domain()
         x, y, _ = dom.variable("boundary")
         ctx = dom.context["boundary"]
         assert ctx.shape[0] == 5  # 2 + 3
 
     def test_total_samples_updated(self):
-        dom = 5 * jno.domain.rect(mesh_size=0.3)
-        dom += 3 * jno.domain.disk(mesh_size=0.3)
+        dom = 5 * jno.Shape.rect(0, 0, 1, 1, size=0.3).domain()
+        dom += 3 * jno.Shape.disk(0, 0, 1, size=0.3).domain()
         assert dom.total_samples == 8
 
 
@@ -551,7 +452,7 @@ class TestDistanceFunction:
     def test_distances_nonnegative(self):
         import jno
 
-        dom = jno.domain.rect(mesh_size=0.3)
+        dom = jno.Shape.rect(0, 0, 1, 1, size=0.3).domain()
         dom.variable("interior")  # populate context
         d = dom.distance_function("interior")
         # Variable tag should exist in context
@@ -565,7 +466,7 @@ class TestDistanceFunction:
 
         import jno
 
-        dom = jno.domain.rect(mesh_size=0.3)
+        dom = jno.Shape.rect(0, 0, 1, 1, size=0.3).domain()
         dom.variable("boundary")
         dom.variable("interior")
         d_var = dom.distance_function("boundary", boundary_tags=["interior"])
@@ -578,7 +479,7 @@ class TestDistanceFunction:
 
         import jno
 
-        dom = jno.domain.rect(mesh_size=0.2)
+        dom = jno.Shape.rect(0, 0, 1, 1, size=0.2).domain()
         dom.variable("interior")
         d_var = dom.distance_function("interior")
         dist_arr = np.array(dom.context[d_var.tag])
@@ -588,7 +489,7 @@ class TestDistanceFunction:
     def test_custom_name(self):
         import jno
 
-        dom = jno.domain.rect(mesh_size=0.3)
+        dom = jno.Shape.rect(0, 0, 1, 1, size=0.3).domain()
         dom.variable("interior")
         d_var = dom.distance_function("interior", name="my_dist")
         assert d_var.tag == "my_dist"

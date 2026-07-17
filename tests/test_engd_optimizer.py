@@ -44,7 +44,7 @@ def _build_poisson2d(seed: int = 0, hidden_dims: int = 32, num_layers: int = 1):
     """Return (net, losses, gram_terms, eval_error) for Poisson2D on [0,1]²."""
     import foundax
 
-    dom = jno.domain.rect(mesh_size=0.05)
+    dom = jno.Shape.rect(0, 0, 1, 1, size=0.05).domain()
     x, y, _ = dom.variable("interior")
     xb, yb, _ = dom.variable("boundary")
     dom.context["interior"] = _int_pts()[None, None]

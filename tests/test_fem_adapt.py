@@ -95,7 +95,7 @@ def _l_shape_polygon(size: float = 1.0) -> Polygon:
 
 
 def _l_shape_domain(mesh_size: float = 0.15):
-    return jno.domain(jno.domain.l_shape(size=1.0, mesh_size=mesh_size))
+    return jno.Shape.polygon([(0, 0), (1.0, 0), (1.0, 0.5), (0.5, 0.5), (0.5, 1.0), (0, 1.0)], size=mesh_size).domain()
 
 
 def _corner_focused_size(points: np.ndarray, corner=(0.5, 0.5), fine=0.03, coarse=0.3) -> np.ndarray:
@@ -447,7 +447,7 @@ def test_anisotropic_adapt_beats_isotropic_on_oblique_layer():
 
 
 def _cube(mesh_size=0.35):
-    return jno.domain(constructor=jno.domain.cube(mesh_size=mesh_size))
+    return jno.Shape.box(0, 0, 0, 1, 1, 1, size=mesh_size).domain()
 
 
 def test_remesh_and_solve_3d_recovers_linear_solution():

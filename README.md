@@ -85,7 +85,7 @@ import foundax
 dir = jno.setup("./runs/test")
 
 # Domain
-dom = 500 * jno.domain.rect(mesh_size=0.05, x_range=(0, 2), y_range=(0, 1))
+dom = 500 * jno.Shape.rect(0, 0, 2, 1, size=0.05).domain()
 x, y, _ = dom.variable("interior")
 xb, yb, _ = dom.variable("boundary")
 
@@ -110,7 +110,7 @@ crux.solve(epochs=20_000, batchsize=32, callbacks=[cb]).plot(f"{dir}/training.pn
 jno.save(crux, f"{dir}/model.pkl")
 
 # Inference via test domain on a finer mesh
-tst_dom = 16 * jno.domain.rect(mesh_size=0.01, x_range=(0, 2), y_range=(0, 1))
+tst_dom = 16 * jno.Shape.rect(0, 0, 2, 1, size=0.01).domain()
 tst_dom.variable("k", jax.random.uniform(jax.random.PRNGKey(0), shape=(16, 1, 1), minval=0.1, maxval=1.9))
 
 pred, x, y, k = crux.eval([u, x, y, k], domain=tst_dom)

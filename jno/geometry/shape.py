@@ -18,7 +18,7 @@ from __future__ import annotations
 import itertools
 import math
 from dataclasses import dataclass, field
-from typing import Callable, FrozenSet, Tuple, Union
+from typing import Callable, FrozenSet, Optional, Tuple, Union
 
 import numpy as np
 
@@ -36,6 +36,11 @@ def _node_contains(node, pts, tol):
         return _node_contains(node[1]._node, pts, tol) | _node_contains(node[2]._node, pts, tol)
     if kind == "inter":
         return _node_contains(node[1]._node, pts, tol) & _node_contains(node[2]._node, pts, tol)
+    if kind == "regions":
+        mask = np.zeros(len(pts), dtype=bool)
+        for _name, sub in node[1]:
+            mask |= _node_contains(sub._node, pts, tol)
+        return mask
     raise NotImplementedError(
         f"Shape.contains supports the analytic CSG subset — primitive leaves combined by "
         f"'-'/'|'/'&' (cut/fuse/inter); a {kind!r} solid (extrude/revolve/sweep/fillet/translate/"
@@ -75,6 +80,7 @@ class Shape:
     _node: tuple
     dim: int
     _size: Size = field(default=None, compare=False)
+    _region_name: Optional[str] = field(default=None, compare=False)
 
     # ----- primitive constructors ------------------------------------------------
     @classmethod
@@ -106,6 +112,61 @@ class Shape:
     def sphere(cls, cx: float, cy: float, cz: float, r: float, size: Size = None) -> "Shape":
         """Sphere centred ``(cx,cy,cz)`` radius ``r``."""
         return cls(("leaf", Sphere(cx, cy, cz, r), next(_LEAF_KEYS)), 3, size)
+
+    @classmethod
+    def regions(cls, **named: "Shape") -> "Shape":
+        """A multi-material domain: named sub-regions meshed **conforming** to their interfaces.
+
+        Each keyword names a sub-region shape (all same ``dim``); the pieces are fragmented
+        (``occ.fragment``) so element edges align exactly with every material interface, then each
+        volume cell is assigned to the **first** region (keyword order = priority) whose shape
+        contains its centroid — exact, because the mesh conforms. The realized domain exposes each
+        region as its own variable set (``d.variable("core")``) alongside ``interior``/``boundary``,
+        and the outer boundary keeps its auto-names; internal interface facets are not boundary.
+
+        Regions may overlap: ``Shape.regions(inclusion=disk, matrix=plate)`` labels the disk
+        ``inclusion`` (higher priority) and the remainder ``matrix``. Equivalent to combining named
+        shapes with ``+`` — ``disk.name("inclusion") + plate.name("matrix")``. Must be the top-level
+        shape (call ``.domain()`` on it); it is not composable with boolean operators/transforms.
+        """
+        return cls._from_region_items(tuple(named.items()))
+
+    @classmethod
+    def _from_region_items(cls, items) -> "Shape":
+        if len(items) < 2:
+            raise ValueError("a multi-material domain needs at least two named regions")
+        names = [n for n, _ in items]
+        if len(set(names)) != len(names):
+            raise ValueError(f"duplicate region name in {names}")
+        dims = {sub.dim for _n, sub in items}
+        if len(dims) != 1:
+            raise ValueError(f"all regions must share one dimension, got {sorted(dims)}")
+        return cls(("regions", tuple(items)), items[0][1].dim, None)
+
+    def name(self, name: str) -> "Shape":
+        """Label this shape as a named material region, for combining with ``+`` (see :meth:`regions`).
+
+        ``core.name("core") + clad.name("clad")`` builds a multi-material domain whose regions are
+        ``core`` and ``clad``. Apply ``name`` last (a later transform drops the label)."""
+        return Shape(self._node, self.dim, self._size, str(name))
+
+    def _region_items(self):
+        """This shape as ``((name, shape), ...)`` region items — its own group, or a single named leaf."""
+        if self._node[0] == "regions":
+            return self._node[1]
+        if self._region_name is None:
+            raise ValueError("combine regions with '+' only after naming each with .name('...')")
+        return ((self._region_name, self),)
+
+    def __add__(self, other: "Shape") -> "Shape":
+        """Combine named regions into a conforming multi-material domain (sugar for :meth:`regions`).
+
+        ``a.name("x") + b.name("y")`` keeps ``a`` and ``b`` as distinct materials with a conforming
+        interface — unlike ``a | b`` (fuse), which merges them into one. Left-to-right order is region
+        priority; composes n-ary (``a + b + c``)."""
+        if not isinstance(other, Shape):
+            return NotImplemented
+        return Shape._from_region_items(self._region_items() + other._region_items())
 
     # ----- boolean operators -----------------------------------------------------
     def __sub__(self, other: "Shape") -> "Shape":
@@ -206,7 +267,7 @@ class Shape:
 
     def sized(self, size: Size) -> "Shape":
         """Return a copy of this shape with its target mesh size set (scalar or ``f(x,y,z)``)."""
-        return Shape(self._node, self.dim, size)
+        return Shape(self._node, self.dim, size, self._region_name)
 
     # ----- introspection (pure; used by emit + selection) ------------------------
     def leaves(self) -> Tuple[Tuple[object, Size, int], ...]:
@@ -220,6 +281,11 @@ class Shape:
             return node[1].leaves() + node[2].leaves()
         if kind in ("extrude", "revolve", "translate", "rotate", "fillet", "sweep"):
             return node[1].leaves()
+        if kind == "regions":
+            out: Tuple[Tuple[object, Size, int], ...] = ()
+            for _name, sub in node[1]:
+                out += sub.leaves()
+            return out
         raise ValueError(f"unknown node kind {kind!r}")
 
     def keys(self) -> FrozenSet[int]:

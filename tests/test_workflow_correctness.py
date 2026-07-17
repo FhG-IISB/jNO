@@ -370,7 +370,7 @@ class TestDivergenceCorrectness:
 
     @pytest.fixture(scope="class")
     def dom2d(self):
-        return jno.domain(constructor=jno.domain.rect(mesh_size=0.1))
+        return jno.Shape.rect(0, 0, 1, 1, size=0.1).domain()
 
     def test_divergence_of_identity_field_is_two(self, dom2d):
         x, y, _ = dom2d.variable("interior")
@@ -408,7 +408,7 @@ class TestCurlCorrectness:
 
     @pytest.fixture(scope="class")
     def dom2d(self):
-        return jno.domain(constructor=jno.domain.rect(mesh_size=0.1))
+        return jno.Shape.rect(0, 0, 1, 1, size=0.1).domain()
 
     def test_curl_2d_of_rotation_field_is_constant_two(self, dom2d):
         """curl_2d(-y, x) = ∂x/∂x - ∂(-y)/∂y = 1 - (-1) = 2."""

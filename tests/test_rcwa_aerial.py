@@ -52,9 +52,7 @@ def _sbox(dx=0.07, ny=5):
     tets = np.asarray(tets)
     F = np.concatenate([tets[:, [0, 1, 2]], tets[:, [0, 1, 3]], tets[:, [0, 2, 3]], tets[:, [1, 2, 3]]])
     uq, cnt = np.unique(np.sort(F, 1), axis=0, return_counts=True)
-    d = _domain_from_arrays(
-        jno.domain.cube(x_range=(0, P), y_range=(0, P), z_range=(0, LZ), mesh_size=0.2), Pt, tets, uq[cnt == 1], copy=True
-    )
+    d = _domain_from_arrays(jno.Shape.box(0, 0, 0, P, P, LZ, size=0.2).domain(), Pt, tets, uq[cnt == 1], copy=True)
     e = 1e-6
     for nm, f in [
         ("bottom", lambda x, y, z: z < e),

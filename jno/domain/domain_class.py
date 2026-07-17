@@ -134,70 +134,6 @@ class domain(MeshIOMixin):
         )
 
     @classmethod
-    def rect(
-        cls,
-        x_range=(0, 1),
-        y_range=(0, 1),
-        mesh_size=0.1,
-        *,
-        algorithm: int = 6,
-        time: Optional[Tuple[float, float, int]] = None,
-        compute_mesh_connectivity: bool = True,
-    ) -> "domain":
-        """Instantiate a rectangular domain.
-
-        Args:
-            x_range: Inclusive spatial extent along x.
-            y_range: Inclusive spatial extent along y.
-            mesh_size: Target mesh size passed to pygmsh.
-            algorithm: Gmsh meshing algorithm.
-            time: Optional tuple of ``(start, end, n_steps)`` for time-dependent problems.
-            compute_mesh_connectivity: Whether to precompute mesh connectivity metadata.
-        """
-        return cls._from_geometry(
-            Geometries.rect(x_range=x_range, y_range=y_range, mesh_size=mesh_size),
-            algorithm=algorithm,
-            time=time,
-            compute_mesh_connectivity=compute_mesh_connectivity,
-        )
-
-    @classmethod
-    def polygon(
-        cls,
-        vertices,
-        mesh_size=0.1,
-        *,
-        algorithm: int = 6,
-        time: Optional[Tuple[float, float, int]] = None,
-        compute_mesh_connectivity: bool = True,
-    ) -> "domain":
-        """Instantiate a 2D polygon domain from an arbitrary list of vertices."""
-        return cls._from_geometry(
-            Geometries.polygon(vertices=vertices, mesh_size=mesh_size),
-            algorithm=algorithm,
-            time=time,
-            compute_mesh_connectivity=compute_mesh_connectivity,
-        )
-
-    @classmethod
-    def triangle(
-        cls,
-        vertices=((0, 0), (1, 0), (0, 1)),
-        mesh_size=0.1,
-        *,
-        algorithm: int = 6,
-        time: Optional[Tuple[float, float, int]] = None,
-        compute_mesh_connectivity: bool = True,
-    ) -> "domain":
-        """Instantiate a triangular domain from 3 vertices."""
-        return cls._from_geometry(
-            Geometries.triangle(vertices=vertices, mesh_size=mesh_size),
-            algorithm=algorithm,
-            time=time,
-            compute_mesh_connectivity=compute_mesh_connectivity,
-        )
-
-    @classmethod
     def equi_distant_rect(
         cls,
         x_range=(0, 1),
@@ -240,142 +176,6 @@ class domain(MeshIOMixin):
         return dom
 
     @classmethod
-    def cube(
-        cls,
-        x_range=(0, 1),
-        y_range=(0, 1),
-        z_range=(0, 1),
-        mesh_size=0.1,
-        *,
-        algorithm: int = 6,
-        time: Optional[Tuple[float, float, int]] = None,
-        compute_mesh_connectivity: bool = True,
-    ) -> "domain":
-        """Instantiate a cubic 3D domain."""
-        return cls._from_geometry(
-            Geometries.cube(x_range=x_range, y_range=y_range, z_range=z_range, mesh_size=mesh_size),
-            algorithm=algorithm,
-            time=time,
-            compute_mesh_connectivity=compute_mesh_connectivity,
-        )
-
-    @classmethod
-    def disk(
-        cls,
-        center=(0, 0),
-        radius=1.0,
-        mesh_size=0.1,
-        num_points=32,
-        *,
-        algorithm: int = 6,
-        time: Optional[Tuple[float, float, int]] = None,
-        compute_mesh_connectivity: bool = True,
-    ) -> "domain":
-        """Instantiate a polygonal disk domain."""
-        return cls._from_geometry(
-            Geometries.disk(center=center, radius=radius, mesh_size=mesh_size, num_points=num_points),
-            algorithm=algorithm,
-            time=time,
-            compute_mesh_connectivity=compute_mesh_connectivity,
-        )
-
-    @classmethod
-    def l_shape(
-        cls,
-        size=1.0,
-        mesh_size=0.1,
-        separate_boundary=False,
-        *,
-        algorithm: int = 6,
-        time: Optional[Tuple[float, float, int]] = None,
-        compute_mesh_connectivity: bool = True,
-    ) -> "domain":
-        """Instantiate an L-shaped domain."""
-        return cls._from_geometry(
-            Geometries.l_shape(size=size, mesh_size=mesh_size, separate_boundary=separate_boundary),
-            algorithm=algorithm,
-            time=time,
-            compute_mesh_connectivity=compute_mesh_connectivity,
-        )
-
-    @classmethod
-    def rectangle_with_hole(
-        cls,
-        outer_size=1.0,
-        hole_size=0.4,
-        mesh_size=0.1,
-        separate_boundary=False,
-        *,
-        algorithm: int = 6,
-        time: Optional[Tuple[float, float, int]] = None,
-        compute_mesh_connectivity: bool = True,
-    ) -> "domain":
-        """Instantiate a rectangle with a single rectangular hole."""
-        return cls._from_geometry(
-            Geometries.rectangle_with_hole(
-                outer_size=outer_size,
-                hole_size=hole_size,
-                mesh_size=mesh_size,
-                separate_boundary=separate_boundary,
-            ),
-            algorithm=algorithm,
-            time=time,
-            compute_mesh_connectivity=compute_mesh_connectivity,
-        )
-
-    @classmethod
-    def rect_pml(
-        cls,
-        x_range=(0, 1),
-        y_range=(0, 1),
-        mesh_size=0.1,
-        pml_thickness_top=0.2,
-        pml_thickness_bottom=0.2,
-        *,
-        algorithm: int = 6,
-        time: Optional[Tuple[float, float, int]] = None,
-        compute_mesh_connectivity: bool = True,
-    ) -> "domain":
-        """Instantiate a rectangle with top and bottom PML regions."""
-        return cls._from_geometry(
-            Geometries.rect_pml(
-                x_range=x_range,
-                y_range=y_range,
-                mesh_size=mesh_size,
-                pml_thickness_top=pml_thickness_top,
-                pml_thickness_bottom=pml_thickness_bottom,
-            ),
-            algorithm=algorithm,
-            time=time,
-            compute_mesh_connectivity=compute_mesh_connectivity,
-        )
-
-    @classmethod
-    def rectangle_with_holes(
-        cls,
-        outer_size=(2.0, 1.0),
-        holes=None,
-        mesh_size=0.1,
-        separate_boundary=True,
-        *,
-        algorithm: int = 6,
-        time: Optional[Tuple[float, float, int]] = None,
-        compute_mesh_connectivity: bool = True,
-    ) -> "domain":
-        """Instantiate a rectangle with multiple rectangular holes."""
-        return cls._from_geometry(
-            Geometries.rectangle_with_holes(
-                outer_size=outer_size,
-                holes=holes,
-                mesh_size=mesh_size,
-                separate_boundary=separate_boundary,
-            ),
-            algorithm=algorithm,
-            time=time,
-            compute_mesh_connectivity=compute_mesh_connectivity,
-        )
-
-    @classmethod
     def poly(
         cls,
         vertices,
@@ -386,9 +186,9 @@ class domain(MeshIOMixin):
     ) -> "domain":
         """Instantiate a Shapely-backed polygon CSG domain.
 
-        This factory intentionally leaves :meth:`polygon` unchanged: the
-        historical ``domain.polygon(...)`` constructor remains mesh-backed,
-        while ``domain.poly(...)`` returns the separate lazy CSG domain class.
+        ``domain.poly(...)`` returns the lazy CSG domain class (no mesh until
+        sampled). For a meshed polygon, build one with ``jno.Shape.polygon(...)``
+        and realize it via ``.domain()``.
         """
         from .polygon_domain import PolygonDomain
 
@@ -566,6 +366,11 @@ class domain(MeshIOMixin):
         elif callable(constructor):
             self._generate_mesh(constructor, algorithm)
             self.log.info(f"Loaded mesh from {constructor}")  # type: ignore[attr-defined]
+            # A Shape.regions() plan carries named sub-region shapes; remember them so jno.fem
+            # per-region integration can restrict a term to a region's cells (centroid membership
+            # via the region shape's ``contains`` — see ``_cell_region_mask``).
+            if getattr(constructor, "_node", (None,))[0] == "regions":
+                self._shape_regions = {name: sub for name, sub in constructor._node[1]}
         else:
             raise ValueError("Must provide either geometry_func, mesh file, or NPZ tag file")
 
@@ -621,6 +426,7 @@ class domain(MeshIOMixin):
         self._param_tags: set = set()  # tags that are parametric (TensorTag)
         self.normals_by_tag: Dict[str, np.ndarray] = {}
         self._boundary_registry: Dict[str, Dict[str, Any]] = {}
+        self._interface_registry: Dict[str, Dict[str, Any]] = {}
         self._tag_edges: Dict[str, np.ndarray] = {}
         self._tag_triangles: Dict[str, np.ndarray] = {}
         self._boundary_regions: Dict[str, BoundaryRegion] = {}
@@ -1025,6 +831,14 @@ class domain(MeshIOMixin):
             Neumann conditions.
         """
         return sorted(self._boundary_registry.keys())
+
+    def interface_tags(self):
+        """Return the internal material-interface tags (``"a|b"``) from a :meth:`Shape.regions` domain.
+
+        These are facet regions between two materials — impose a coupling/flux condition on one, or
+        sample it — but they are *not* part of :meth:`boundary_tags` (the outer boundary).
+        """
+        return sorted(getattr(self, "_interface_registry", {}).keys())
 
     def dirichlet(self, tags, values=None):
         """
@@ -1940,6 +1754,7 @@ class domain(MeshIOMixin):
         self.points = points
         self._mesh_pool = {}
         self._boundary_registry = {}
+        self._interface_registry: Dict[str, Dict[str, Any]] = {}
         self.tag_indices = {}
         self._tag_edges = {}
         self._tag_triangles = {}
@@ -1982,6 +1797,14 @@ class domain(MeshIOMixin):
                 tag_points = set()
                 tag_edges = []
                 tag_tris = []
+                # A tag backed by volume cells (block 0 = the spatial-fill element for this
+                # dimension) is a region/interior, never a boundary — so it must not pick up PCA
+                # "boundary" normals (that would mislabel an interior sub-region as a boundary tag).
+                # Boundary tags live in the facet block (block 1); point clouds (block 0 = vertex)
+                # are not volume-filling, so they still get PCA normals.
+                _vol_elem = {1: "line", 2: "triangle", 3: "tetra"}.get(self.dimension)
+                block0_is_volume = bool(mesh.cells) and mesh.cells[0].type == _vol_elem
+                has_volume_cells = False
 
                 if isinstance(cell_data, dict):
                     for cell_type, indices in cell_data.items():
@@ -1999,6 +1822,8 @@ class domain(MeshIOMixin):
                                             point_idx = int(cell_block.data[local_idx].flatten()[0])
                                             tag_points.add(point_idx)
                         else:
+                            if block0_is_volume and cell_type == _vol_elem and len(indices) > 0:
+                                has_volume_cells = True
                             for b_idx, cell_block in enumerate(mesh.cells):
                                 if cell_block.type == cell_type:
                                     offset = block_offsets.get((b_idx, cell_type), 0)
@@ -2024,6 +1849,8 @@ class domain(MeshIOMixin):
                     for block_idx, indices in enumerate(cell_data):
                         if indices is None or len(indices) == 0:
                             continue
+                        if block_idx == 0 and block0_is_volume:
+                            has_volume_cells = True
                         if block_idx < len(mesh.cells):
                             cell_block = mesh.cells[block_idx]
                             block_len = len(cell_block.data)
@@ -2074,7 +1901,7 @@ class domain(MeshIOMixin):
                     normal_positions = np.array([index_to_normal_pos[i] for i in indices_list if i in index_to_normal_pos])
                     if len(normal_positions) == len(indices_list) and len(indices_list) > 0:
                         self.normals_by_tag[name] = boundary_normals[normal_positions]
-                    elif len(normal_positions) == 0:
+                    elif len(normal_positions) == 0 and not has_volume_cells:
                         tag_pt_coords = points[indices_list, : self.dimension]
                         if len(tag_pt_coords) > 1:
                             tag_normals, _ = self._compute_normals_pca(
@@ -2125,7 +1952,12 @@ class domain(MeshIOMixin):
                             tol=tol,
                         )
 
-                        self._boundary_registry[name] = {
+                        # An internal material interface (auto-named "a|b" by Shape.regions) is a facet
+                        # region you can impose a coupling/flux condition on, but it is NOT the outer
+                        # boundary -- keep it out of boundary_tags() so `dirichlet(boundary_tags())`
+                        # never pins it. It stays queryable via d.variable("a|b") / interface_tags().
+                        registry = self._interface_registry if "|" in name else self._boundary_registry
+                        registry[name] = {
                             "tag": name,
                             "entity_kind": entity_kind,
                             "point_indices": indices_list,
@@ -2611,13 +2443,19 @@ class domain(MeshIOMixin):
 
     @staticmethod
     def _chain_edges_to_loop(edges):
-        """Chain a set of (a, b) edge pairs into an ordered loop.
+        """Chain a set of ``(a, b)`` edge pairs into one ordered path of point indices.
+
+        Handles both a **closed loop** (every node degree 2 -> N edges give N nodes) and an **open
+        chain** (a box face: two endpoints of degree 1 -> N edges give N+1 nodes). The open case must
+        keep *both* endpoints: a shared corner is an endpoint of a face's chain, and dropping it (the
+        old closed-loop-only walk did) removes the corner from that face's tag -- which silently breaks
+        multidirectional periodicity, where a corner must belong to every face it lies on.
 
         Args:
-            edges: List of 2-tuples (global point indices) forming a closed loop.
+            edges: List of 2-tuples (global point indices) forming a single connected path/loop.
 
         Returns:
-            np.ndarray of global point indices in loop order.
+            np.ndarray of global point indices in traversal order.
         """
         from collections import defaultdict
 
@@ -2626,18 +2464,19 @@ class domain(MeshIOMixin):
             adj[a].append(b)
             adj[b].append(a)
 
-        # Walk the graph
-        start = edges[0][0]
+        # Start at an endpoint (degree 1) for an open chain; anywhere for a closed loop.
+        endpoints = [n for n, nbrs in adj.items() if len(nbrs) == 1]
+        start = endpoints[0] if endpoints else edges[0][0]
         visited = {start}
         order = [start]
         current = start
-        for _ in range(len(edges) - 1):
-            for nb in adj[current]:
-                if nb not in visited:
-                    visited.add(nb)
-                    order.append(nb)
-                    current = nb
-                    break
+        while True:
+            nxt = next((nb for nb in adj[current] if nb not in visited), None)
+            if nxt is None:
+                break
+            visited.add(nxt)
+            order.append(nxt)
+            current = nxt
         return np.array(order, dtype=int)
 
     @staticmethod

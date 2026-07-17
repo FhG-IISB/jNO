@@ -21,7 +21,7 @@ import foundax  # noqa: E402
 
 
 def _coord_field():
-    d = jno.domain(constructor=jno.domain.rect(mesh_size=0.5))
+    d = jno.Shape.rect(0, 0, 1, 1, size=0.5).domain()
     x, y, _ = d.variable("interior")
     k_net = jnn.nn.wrap(foundax.mlp(in_features=2, output_dim=1, hidden_dims=8, num_layers=2, key=jax.random.PRNGKey(0)))
     k_net.optimizer(optax.adam(1e-3))
