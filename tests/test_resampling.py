@@ -94,16 +94,16 @@ def _build_solver_nd(
     time: tuple[float, float, int] | None = None,
 ):
     if spatial_dim == 2:
-        constructor = jno.domain.rect(mesh_size=0.2)
+        shape = jno.Shape.rect(0, 0, 1, 1, size=0.2)
     elif spatial_dim == 3:
-        constructor = jno.domain.cube(mesh_size=0.6)
+        shape = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.6)
     else:
         raise ValueError("spatial_dim must be 2 or 3")
 
     if time is None:
-        domain = 1 * jno.domain(constructor=constructor)
+        domain = 1 * shape.domain()
     else:
-        domain = 1 * jno.domain(constructor=constructor, time=time)
+        domain = 1 * shape.domain(time=time)
 
     vars_all = domain.variable(
         "interior",
@@ -517,7 +517,7 @@ def test_boundary_normals_updated_after_resample():
     strategy = RAD(resample_every=1, resample_fraction=0.5, start_epoch=0, k=3)
 
     # mesh_size=0.1 → ~40 boundary nodes in pool, working set = 20 → 2× ratio.
-    domain = 1 * jno.domain(constructor=jno.domain.rect(mesh_size=0.1))
+    domain = 1 * jno.Shape.rect(0, 0, 1, 1, size=0.1).domain()
     b_vars = domain.variable("boundary", sample=(20, None), normals=True, split=True, resampling_strategy=strategy)
     xb, yb = b_vars[0], b_vars[1]
 
@@ -562,13 +562,7 @@ _BURGERS_NU = 0.01 / np.pi  # classical PINN benchmark value
 
 def _make_burgers_domain(strategy=None, mesh_size=0.15, n_sample=60):
     """Rectangle [-1,1] × [0,1]; x is spatial, y acts as time."""
-    domain = 1 * jno.domain(
-        constructor=jno.domain.rect(
-            mesh_size=mesh_size,
-            x_range=(-1.0, 1.0),
-            y_range=(0.0, 1.0),
-        )
-    )
+    domain = 1 * jno.Shape.rect(-1.0, 0.0, 1.0, 1.0, size=mesh_size).domain()
     if strategy is not None:
         domain.variable("interior", sample=(n_sample, None), resampling_strategy=strategy)
     else:
@@ -642,13 +636,7 @@ def test_burgers_rad_resampling_concentrates_near_steep_gradient():
     """
     strategy = RAD(resample_every=20, resample_fraction=0.25, start_epoch=0, k=5)
 
-    domain = 1 * jno.domain(
-        constructor=jno.domain.rect(
-            mesh_size=0.08,
-            x_range=(-1.0, 1.0),
-            y_range=(0.0, 1.0),
-        )
-    )
+    domain = 1 * jno.Shape.rect(-1.0, 0.0, 1.0, 1.0, size=0.08).domain()
     vars_all = domain.variable("interior", sample=(60, None), resampling_strategy=strategy)
     x, t = vars_all[0], vars_all[1]
 

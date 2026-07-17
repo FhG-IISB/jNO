@@ -61,9 +61,7 @@ def _structured_box(Lx, dx=0.1, dz=0.2):
     tets = np.asarray(tets)
     F = np.concatenate([tets[:, [0, 1, 2]], tets[:, [0, 1, 3]], tets[:, [0, 2, 3]], tets[:, [1, 2, 3]]])
     uq, cnt = np.unique(np.sort(F, 1), axis=0, return_counts=True)
-    d = _domain_from_arrays(
-        jno.domain.cube(x_range=(0, Lx), y_range=(0, Lx), z_range=(0, LZ), mesh_size=0.2), P, tets, uq[cnt == 1], copy=True
-    )
+    d = _domain_from_arrays(jno.Shape.box(0, 0, 0, Lx, Lx, LZ, size=0.2).domain(), P, tets, uq[cnt == 1], copy=True)
     e = 1e-6
     for nm, f in [
         ("bottom", lambda x, y, z: z < e),

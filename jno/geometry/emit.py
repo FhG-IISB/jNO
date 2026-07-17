@@ -37,6 +37,14 @@ def _emit_node(node, occ, split_full=False):
     kind = node[0]
     if kind == "leaf":
         return [node[1].build(occ)]
+    if kind == "regions":
+        pieces: List[tuple] = []
+        for _name, sub in node[1]:
+            pieces.extend(_emit_node(sub._node, occ, split_full))
+        # Fragment every piece against the others: shared interfaces become conforming
+        # (element edges align), and each material region survives as its own volume entity.
+        out, _ = occ.fragment(pieces[:1], pieces[1:])
+        return out
     if kind in ("cut", "fuse", "inter"):
         a = _emit_node(node[1]._node, occ, split_full)
         b = _emit_node(node[2]._node, occ, split_full)
@@ -118,6 +126,9 @@ def _plan_sizes(shape):
             walk(node[2])
         elif kind in ("extrude", "revolve", "translate", "rotate", "fillet", "sweep"):
             walk(node[1])
+        elif kind == "regions":
+            for _name, sub in node[1]:
+                walk(sub)
 
     walk(shape)
     return out
@@ -179,8 +190,49 @@ def _apply_size_fields(dim: int, leaves, labels: Dict[int, Tuple[int, str]], sha
     return float(min(scalars)) if scalars else None
 
 
-def _to_meshio(dim: int, labels: Dict[int, Tuple[int, str]]):
-    """Assemble the generated gmsh mesh into a ``meshio.Mesh`` with named ``cell_sets``."""
+def _facet_components(facet_idx, facet_nodes):
+    """Group facets into connected components (share a node -> same component), returning a list of
+    global-index arrays. A material interface spans many gmsh faces but is usually ONE connected
+    patch; only genuinely disjoint patches (e.g. two separate inclusions) split into several."""
+    from collections import defaultdict
+
+    import numpy as np
+
+    n = len(facet_idx)
+    parent = list(range(n))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    node_first: Dict[int, int] = {}
+    for fi in range(n):
+        for node in facet_nodes[fi]:
+            node = int(node)
+            if node in node_first:
+                ri, rj = find(fi), find(node_first[node])
+                if ri != rj:
+                    parent[ri] = rj
+            else:
+                node_first[node] = fi
+    groups = defaultdict(list)
+    for fi in range(n):
+        groups[find(fi)].append(fi)
+    return [np.asarray(facet_idx)[g] for g in groups.values()]
+
+
+def _to_meshio(dim: int, labels: Dict[int, Tuple[int, str]], region_items=None):
+    """Assemble the generated gmsh mesh into a ``meshio.Mesh`` with named ``cell_sets``.
+
+    ``region_items`` (``((name, sub_shape), ...)``, when the plan is a :meth:`Shape.regions`
+    multi-material domain) adds one volume ``cell_set`` per region — each cell assigned to the first
+    region whose shape contains its centroid — plus one facet ``cell_set`` per material **interface**,
+    auto-named by the region pair it separates (``"a|b"`` = every facet between those two materials,
+    however many gmsh faces that spans). Only *topologically disjoint* interfaces of the same pair
+    (e.g. two separate inclusions) additionally split into connected components ``"a|b.0"`` / ``"a|b.1"``.
+    """
     import gmsh
     import meshio
     import numpy as np
@@ -199,24 +251,55 @@ def _to_meshio(dim: int, labels: Dict[int, Tuple[int, str]]):
     _vtags, vnodes = gmsh.model.mesh.getElementsByType(vtype)
     vcells = np.asarray([index[int(t)] for t in vnodes], dtype=np.int64).reshape(-1, npv)
 
+    # Which region each volume ENTITY belongs to (all its cells share one region -> classify one cell).
+    vol_region: Dict[int, str] = {}
+    if region_items is not None:
+        for _d, vtag in gmsh.model.getEntities(dim):
+            vt, _vt2, vn = gmsh.model.mesh.getElements(dim, vtag)
+            for et, en in zip(vt, vn):
+                if et != vtype:
+                    continue
+                nodes = [index[int(t)] for t in np.asarray(en[:npv], dtype=np.int64)]
+                c = coords[nodes].mean(axis=0)[None, :]
+                for name, sub in region_items:
+                    if bool(np.asarray(sub.contains(c))[0]):
+                        vol_region[int(vtag)] = name
+                        break
+                break
+
     bdim = dim - 1
     facet_rows: List[List[int]] = []
     by_name: Dict[str, List[np.ndarray]] = {}
+    external_ranges: List[np.ndarray] = []
+    iface_entities: Dict[str, List[np.ndarray]] = {}  # "a|b" -> per-entity facet index ranges
     for _edim, etag in gmsh.model.getEntities(bdim):
+        adj = gmsh.model.getAdjacencies(bdim, etag)[0] if region_items is not None else ()
+        interface_pair = None
+        if len(adj) >= 2:
+            regs = sorted({vol_region[int(v)] for v in adj if int(v) in vol_region})
+            if len(regs) < 2:
+                continue  # both sides are the same region -> not a material interface
+            interface_pair = "|".join(regs)
         label = labels.get(etag)
         # A 1-D polyline's intermediate junctions are interior points (unnamed) -- they must not
         # land in the boundary block. Higher-dim unnamed facets stay boundary (just unnamed).
         if dim == 1 and label is None:
             continue
         etypes, _etags, enodes = gmsh.model.mesh.getElements(bdim, etag)
+        start = len(facet_rows)
         for et, en in zip(etypes, enodes):
             if et != btype:
                 continue
             rows = np.asarray(en, dtype=np.int64).reshape(-1, npb)
-            start = len(facet_rows)
             facet_rows.extend([index[int(t)] for t in row] for row in rows)
+        rng = np.arange(start, len(facet_rows), dtype=np.int64)
+        if rng.size == 0:
+            continue
+        if interface_pair is not None:
+            iface_entities.setdefault(interface_pair, []).append(rng)
+        else:
+            external_ranges.append(rng)
             if label is not None:
-                rng = np.arange(start, len(facet_rows), dtype=np.int64)
                 by_name.setdefault(label[1], []).append(rng)
 
     facets = np.asarray(facet_rows, dtype=np.int64).reshape(-1, npb) if facet_rows else np.zeros((0, npb), dtype=np.int64)
@@ -225,7 +308,26 @@ def _to_meshio(dim: int, labels: Dict[int, Tuple[int, str]]):
     cell_sets: Dict[str, list] = {"interior": [np.arange(len(vcells), dtype=np.int64), empty.copy()]}
     for name, chunks in by_name.items():
         cell_sets[name] = [empty.copy(), np.concatenate(chunks) if chunks else empty.copy()]
-    cell_sets["boundary"] = [empty.copy(), np.arange(len(facets), dtype=np.int64)]
+    # "boundary" is the OUTER boundary only (internal interfaces are separate, named tags).
+    ext = np.concatenate(external_ranges) if external_ranges else empty.copy()
+    cell_sets["boundary"] = [empty.copy(), ext]
+
+    for pair, ent_list in iface_entities.items():
+        all_idx = np.concatenate(ent_list)  # every facet between this pair (across all its faces)
+        cell_sets[pair] = [empty.copy(), all_idx]
+        comps = _facet_components(all_idx, facets[all_idx])  # group by TOPOLOGY, not gmsh face
+        if len(comps) > 1:  # genuinely disjoint interfaces of the SAME pair -> keep each separable
+            for k, comp in enumerate(comps):
+                cell_sets[f"{pair}.{k}"] = [empty.copy(), comp]
+
+    if region_items and len(vcells):
+        centroids = coords[vcells].mean(axis=1)  # (M, 3) cell centroids
+        assigned = np.full(len(vcells), -1, dtype=np.int64)
+        for ri, (name, sub) in enumerate(region_items):
+            take = np.asarray(sub.contains(centroids), dtype=bool) & (assigned < 0)  # first match wins
+            assigned[take] = ri
+        for ri, (name, _sub) in enumerate(region_items):
+            cell_sets[name] = [np.where(assigned == ri)[0].astype(np.int64), empty.copy()]
 
     return meshio.Mesh(points=coords, cells=cells, cell_sets=cell_sets)
 
@@ -277,7 +379,8 @@ def _build_once(shape, split_full, periodic=None):
         if periodic:  # make named opposite faces conform (edge-element periodic ties need it)
             _apply_periodic(dim, labels, periodic)
         gmsh.model.mesh.generate(dim)
-        mesh = _to_meshio(dim, labels)
+        region_items = shape._node[1] if shape._node[0] == "regions" else None
+        mesh = _to_meshio(dim, labels, region_items)
         return mesh, dim, ds
     finally:
         gmsh.model.remove()

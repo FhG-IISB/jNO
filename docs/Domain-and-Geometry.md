@@ -115,6 +115,40 @@ solid.sized(lambda x, y, z: 0.03 + 0.10 * y)    # graded: denser where the funct
 So "denser in a region" = give a small `size=` to the shape covering it, or a callable that is small
 there.
 
+### Multi-material regions
+
+Name each material with `.name(...)` and combine with `+` to build a **multi-material** domain: the
+sub-shapes are fragmented so element edges align exactly with every material interface (a *conforming*
+mesh), and each cell is assigned to the first region — left-to-right order is priority — whose shape
+contains its centroid. Each region becomes its own variable set; the outer boundary keeps its
+auto-names and internal interface facets are not boundary.
+
+```python
+plate = Shape.rect(0, 0, 2, 1)
+core  = Shape.disk(1, 0.5, 0.3)
+d = (core.name("inclusion") + plate.name("matrix")).sized(0.05).domain()
+
+d.variable("inclusion")     # the disk's cells/points (a distinct material)
+d.variable("matrix")        # everything else
+d.boundary_tags()           # {left, right, top, bottom, boundary} — the plate's outer edges only
+```
+
+`+` keeps the pieces as distinct materials with a conforming interface — unlike `|` (fuse), which
+merges them into one. It composes n-ary (`a + b + c`), and `Shape.regions(inclusion=core,
+matrix=plate)` is the equivalent keyword form. Regions may overlap: here the disk overlaps the plate,
+and `inclusion` wins inside the disk because it is listed first. Use each region tag to restrict a
+`jno.fem` term or coefficient to that material (per-region volume integration), or to sample it in a
+PINN. A multi-material shape is a top-level construct — call `.domain()` on it directly; it does not
+compose with boolean operators or transforms.
+
+**Interfaces** between materials are auto-named by the region pair, sorted — `d.variable("inclusion|matrix")`
+gives *every* facet where those two materials meet (however many flat faces that spans — an E-core's
+`air|core` boundary is one tag, not one per face). Impose a coupling/flux condition there, or sample it.
+Interfaces are listed by `d.interface_tags()` and kept **out** of `d.boundary_tags()` (an interface is not
+the outer boundary). When an interface is *topologically disjoint* — two separate inclusions, or the two
+stacked layers of a winding — the connected pieces are additionally exposed as `"a|b.0"`, `"a|b.1"`, …
+alongside the union `"a|b"`.
+
 ---
 
 ## Worked examples
@@ -166,9 +200,11 @@ d = jno.domain("part.msh")     # .msh / .vtk / .med … built anywhere (gmsh, CA
 d = jno.domain.from_array({"interior": interior_coords, "boundary": boundary_coords})
 ```
 
-**Shorthand constructors** for simple axis-aligned domains — including **1-D**, which `Shape`
-doesn't cover: `jno.domain.line(...)`, `jno.domain.rect(...)`, `jno.domain.cube(...)`. (Shapely
-geometries and vertex lists are also still accepted.)
+**1-D domains** — either the `jno.domain.line(...)` shorthand or, `Shape`-native, an open path:
+`jno.Path(0, 0).line_to(1, 0).curve(size=0.01).domain()` (ends named `left`/`right`). `jno.domain`
+also keeps the structured grids `equi_distant_rect` / `poseidon` and the point-cloud `from_array`.
+For 2-D/3-D geometry build the shape with `Shape` — `Shape.rect(...).domain()`,
+`Shape.box(...).domain()`, and so on. (Shapely geometries and vertex lists are also still accepted.)
 
 ---
 

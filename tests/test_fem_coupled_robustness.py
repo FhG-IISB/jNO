@@ -91,7 +91,7 @@ def test_coupled_linear_recovers_across_domains(name):
 def test_coupled_3d_cube_recovers():
     # The same block machinery on a 3-D tetrahedral cube: -lap u + p = y, -lap p + u = x.
     pytest.importorskip("pygmsh", reason="pygmsh required for cube meshing")
-    d = jno.domain(constructor=jno.domain.cube(mesh_size=0.4))
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.4).domain()
     u, v = d.fem_symbols(names=("u", "v"))
     p, q = d.fem_symbols(names=("p", "q"))
     co = d.variable("interior", split=True)

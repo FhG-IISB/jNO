@@ -115,7 +115,7 @@ def test_p3_3d_recovers_cubic_exactly():
     pytest.importorskip("pygmsh", reason="pygmsh required for cube meshing")
     # 3D P3 (TET20 via promotion): harmonic cubic u = x^3 - 3x y^2 (independent of z, still harmonic),
     # recovered exactly -- exercises the tet edge + face node placement.
-    d = jno.domain(constructor=jno.domain.cube(mesh_size=0.6))
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.6).domain()
     nverts = int(np.asarray(d.mesh.points).shape[0])
     u, phi = d.fem_symbols(order=3)
     co = d.variable("interior", split=True)
@@ -134,7 +134,7 @@ def test_p2_3d_recovers_quadratic_exactly():
     pytest.importorskip("pygmsh", reason="pygmsh required for cube meshing")
     # 3D P2 (TET10 via promotion of the linear cube). u = xy + yz + xz (degree 2,
     # harmonic) recovered exactly; exercises all three edge directions.
-    d = jno.domain(constructor=jno.domain.cube(mesh_size=0.5))
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
     nverts = int(np.asarray(d.mesh.points).shape[0])
     u, phi = d.fem_symbols(order=2)
     co = d.variable("interior", split=True)

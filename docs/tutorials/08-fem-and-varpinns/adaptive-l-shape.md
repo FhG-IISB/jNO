@@ -23,7 +23,7 @@ directly:
 ```python
 from jno.utils.solver.fem_adapt import dorfler_mark, size_field_from_marks, zz_error_indicators
 
-d = jno.domain(jno.domain.l_shape(size=1.0, mesh_size=0.3))
+d = jno.Shape.polygon([(0, 0), (1.0, 0), (1.0, 0.5), (0.5, 0.5), (0.5, 1.0), (0, 1.0)], size=0.3).domain()
 for _ in range(n_rounds):
     fem = jno.fem(build_constraints(d))          # constraints reference the domain -> reassemble
     u   = np.asarray(fem.solve()).reshape(-1)     # scalar P1: one value per vertex
@@ -54,7 +54,7 @@ error estimate at ~455 DOFs than a uniform mesh at ~828 DOFs.
 - **The re-entrant corner is pinned** during remeshing (mmg `set_corners`), so the singularity stays
   put and the benchmark is honest.
 - **Works in 2D and 3D** — the same loop drives isotropic refinement on triangle *and*
-  tetrahedron meshes (`domain.refine` / `FEM.solve(adapt=...)` on a `jno.domain.cube(...)`
+  tetrahedron meshes (`domain.refine` / `FEM.solve(adapt=...)` on a `jno.Shape.box(...).domain()`
   remeshes via mmg3d, preserving the polyhedral geometry). Scalar P1 for now (one DOF/vertex);
   anisotropic metrics are 2D-only so far.
 - **Knowing when to stop:** `AdaptSpec` takes `tol` (stop once the error estimate falls

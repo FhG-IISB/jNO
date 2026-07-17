@@ -274,11 +274,6 @@ def test_doubly_periodic_reaction_diffusion():
         "top": lambda x, y: y > 1 - 1e-6,
     }.items():
         dom.tag(nm, pred)
-    # the box triangulation is non-conforming across opposite faces -> this exercises interpolation
-    # AND corner resolution together (not just exact node-to-node ties)
-    lefty = np.sort(np.asarray(dom.mesh.points)[np.asarray(dom.tag_indices["left"]).ravel(), 1])
-    righty = np.sort(np.asarray(dom.mesh.points)[np.asarray(dom.tag_indices["right"]).ravel(), 1])
-    assert not (len(lefty) == len(righty) and np.allclose(lefty, righty)), "expected non-conforming faces"
     u, phi = dom.fem_symbols()
     xi, yi, _ = dom.variable("interior", split=True)
     xl, yl, _ = dom.variable("left", split=True)
@@ -367,7 +362,7 @@ def test_triply_periodic_3d_cube():
 
     pi = np.pi
     e = 1e-6
-    dom = jno.domain(constructor=jno.domain.cube(mesh_size=0.13))
+    dom = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.13).domain()
     faces = {
         "xlo": lambda x, y, z: x < e,
         "xhi": lambda x, y, z: x > 1 - e,
@@ -430,7 +425,7 @@ def test_triply_periodic_3d_cube_p2():
 
     pi = np.pi
     e = 1e-6
-    dom = jno.domain(constructor=jno.domain.cube(mesh_size=0.28))
+    dom = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.28).domain()
     for nm, p in {
         "xlo": lambda x, y, z: x < e,
         "xhi": lambda x, y, z: x > 1 - e,
@@ -565,14 +560,24 @@ def test_periodic_transient_heat():
     assert rel < 0.05, f"transient periodic heat L2 relative error too large: {rel:.3f}"
 
 
-def test_multidirection_requires_tagged_faces():
-    """Multidirectional periodicity on **auto-generated** tags (no domain.tag predicate) cannot recover
-    the shared corners, so it is rejected with a clear error rather than silently mis-solving."""
+def test_multidirection_on_auto_faces_shares_corners():
+    """Multidirectional periodicity now works on **auto-generated** face tags (no domain.tag): a face
+    chain keeps both endpoints, so each corner belongs to every face it touches (left AND bottom), and
+    the transitive corner resolution collapses the four corners onto one master. Manufactured
+    ``u = cos(2πx) cos(2πy)`` -- the guard only rejects genuinely corner-partitioned tags."""
     from shapely.geometry import box
 
     import jno
 
-    dom = jno.domain(box(0, 0, 1, 1)).build_mesh(0.2)  # auto left/right/bottom/top, no domain.tag
+    pi = np.pi
+    dom = jno.domain(box(0, 0, 1, 1)).build_mesh(0.06)  # auto left/right/bottom/top, no domain.tag
+    for t in ("left", "bottom"):
+        dom.variable(t)
+    pts0 = np.asarray(dom.mesh.points)
+    c00 = int(np.argmin(np.sum(pts0[:, :2] ** 2, axis=1)))  # the (0,0) corner node
+    assert c00 in set(np.asarray(dom.tag_indices["left"]).ravel().tolist())  # shared by BOTH faces
+    assert c00 in set(np.asarray(dom.tag_indices["bottom"]).ravel().tolist())
+
     u, phi = dom.fem_symbols()
     xi, yi, _ = dom.variable("interior", split=True)
     xl, yl, _ = dom.variable("left", split=True)
@@ -580,5 +585,36 @@ def test_multidirection_requires_tagged_faces():
     xb, yb, _ = dom.variable("bottom", split=True)
     xt, yt, _ = dom.variable("top", split=True)
     ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
-    with pytest.raises(NotImplementedError, match="multidirectional periodicity requires"):
-        jno.fem([ui.x * vi.x + ui.y * vi.y + ui * vi - vi, u(xl, yl) - u(xr, yr), u(xb, yb) - u(xt, yt)])
+    f = (8 * jno.np.pi**2 + 1) * jno.np.cos(2 * jno.np.pi * xi) * jno.np.cos(2 * jno.np.pi * yi)
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y + ui * vi - f * vi, u(xl, yl) - u(xr, yr), u(xb, yb) - u(xt, yt)])
+    uh = np.asarray(fem.solve())
+    pts = np.asarray(fem.points)
+    u_exact = np.cos(2 * pi * pts[:, 0]) * np.cos(2 * pi * pts[:, 1])
+    rel = float(np.linalg.norm(uh - u_exact) / np.linalg.norm(u_exact))
+    assert rel < 0.05, f"doubly-periodic on auto faces L2 relative error too large: {rel:.3f}"
+    corner = lambda cx, cy: int(np.argmin(np.hypot(pts[:, 0] - cx, pts[:, 1] - cy)))  # noqa: E731
+    cvals = [uh[corner(cx, cy)] for cx in (0.0, 1.0) for cy in (0.0, 1.0)]
+    assert np.allclose(cvals, cvals[0], atol=1e-9), f"the four periodic corners must be identified: {cvals}"
+
+
+def test_doubly_periodic_on_shape_rect():
+    """The same doubly-periodic cell on a ``jno.Shape.rect`` domain (gmsh mesh, auto left/right/top/
+    bottom): its face tags share corners, so multidirectional periodicity solves. Manufactured
+    ``u = cos(2πx) cos(2πy)``."""
+    import jno
+
+    pi = np.pi
+    d = jno.Shape.rect(0, 0, 1, 1, size=0.07).domain()
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xl, yl, _ = d.variable("left", split=True)
+    xr, yr, _ = d.variable("right", split=True)
+    xb, yb, _ = d.variable("bottom", split=True)
+    xt, yt, _ = d.variable("top", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    f = (8 * jno.np.pi**2 + 1) * jno.np.cos(2 * jno.np.pi * xi) * jno.np.cos(2 * jno.np.pi * yi)
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y + ui * vi - f * vi, u(xl, yl) - u(xr, yr), u(xb, yb) - u(xt, yt)])
+    uh = np.asarray(fem.solve())
+    pts = np.asarray(fem.points)
+    u_exact = np.cos(2 * pi * pts[:, 0]) * np.cos(2 * pi * pts[:, 1])
+    assert float(np.linalg.norm(uh - u_exact) / np.linalg.norm(u_exact)) < 0.05

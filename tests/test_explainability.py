@@ -693,7 +693,7 @@ def test_engd_line_search_reduces_loss():
     )
     bdy_pts = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=np.float64)
 
-    dom = jno.domain.rect(mesh_size=0.3)
+    dom = jno.Shape.rect(0, 0, 1, 1, size=0.3).domain()
     x, y, _ = dom.variable("interior")
     dom.context["interior"] = int_pts[np.newaxis, np.newaxis]
     xb, yb, _ = dom.variable("boundary")

@@ -160,7 +160,7 @@ Attach the strategy when creating variables from a tagged point set using
 ```python
 from jno import sampler
 
-domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.05))
+domain = jno.Shape.rect(0, 0, 1, 1, size=0.05).domain()
 x, y = domain.variable(
     "interior",
     sample=(None, None),

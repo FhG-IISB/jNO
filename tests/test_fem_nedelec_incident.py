@@ -33,7 +33,7 @@ def _x64():
 
 
 def _cube_with_top(mesh_size=0.4):
-    d = jno.domain(constructor=jno.domain.cube(mesh_size=mesh_size))
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=mesh_size).domain()
     d.tag("top", lambda x, y, z: z > 1.0 - 1e-6)  # a single boundary face (z = 1)
     u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
     c = d.variable("interior", split=True)
@@ -88,7 +88,7 @@ def test_combined_absorbing_plus_incident_on_one_face():
     """A single boundary entry may combine the absorbing mass and the incident load —
     ``i k₀·inner(n×u,n×v) + 2 i k₀·inner(g,n×v)`` — and the additive split routes the bilinear part into A
     and the trial-free part into b (equal to authoring them as two separate entries)."""
-    d = jno.domain(constructor=jno.domain.cube(mesh_size=0.5))
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
     d.tag("top", lambda x, y, z: z > 1.0 - 1e-6)
     k0 = 2.0
     u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
@@ -113,7 +113,7 @@ def test_driven_maxwell_end_to_end_solves():
     volume, the i·k₀ impedance absorbing BC on the whole boundary, and a plane-wave incident source on the
     top face — assembles as a complex system and SOLVES to a finite, non-trivial complex field. (The
     impedance term provides radiation damping, so the otherwise-indefinite Helmholtz operator is well posed.)"""
-    d = jno.domain(constructor=jno.domain.cube(mesh_size=0.4))
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.4).domain()
     d.tag("top", lambda x, y, z: z > 1.0 - 1e-6)
     k0 = 3.0
     u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")

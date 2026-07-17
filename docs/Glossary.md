@@ -58,7 +58,7 @@ and worked examples in [Operations → Part B](operations.md#part-b-operations-t
 Two distinct concepts share the word "mesh":
 
 - **Spatial mesh** — the unstructured triangular / tetrahedral / line
-  mesh defining the simulation domain (`jno.domain.rect(mesh_size=...)`,
+  mesh defining the simulation domain (`jno.Shape.rect(...).domain()`,
   loaded from `.msh` / `.npz`, or built from a polygon). Collocation
   and integration points come from this mesh.
 - **Device mesh** — the JAX `(batch, model)` device topology passed via

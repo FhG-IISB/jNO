@@ -52,7 +52,7 @@ crux = jno.core.load("runs/crux.pkl")
 pred = crux.eval(u)
 
 # Evaluate on a different domain
-test_domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.01))
+test_domain = jno.Shape.rect(0, 0, 1, 1, size=0.01).domain()
 pred_fine = crux.eval(u, domain=test_domain)
 ```
 

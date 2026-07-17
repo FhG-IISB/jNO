@@ -112,8 +112,7 @@ class TestMixedSpatialTemporalChain:
 
 
 def _build_cube_3d(mesh_size: float = 0.10):
-    return jno.domain(
-        constructor=jno.domain.cube(mesh_size=mesh_size),
+    return jno.Shape.box(0, 0, 0, 1, 1, 1, size=mesh_size).domain(
         compute_mesh_connectivity=True,
     )
 
@@ -263,7 +262,7 @@ class TestWindowedHessian2DPipeline:
         # Coarse mesh + few time steps so the test stays fast — the goal
         # is to drive the windowed path, not measure stencil accuracy
         # (the latter is already covered by Track B's L²-rel tests).
-        dom = jno.domain(constructor=jno.domain.rect(mesh_size=0.2), time=(0.0, 0.1, 3))
+        dom = jno.Shape.rect(0, 0, 1, 1, size=0.2).domain(time=(0.0, 0.1, 3))
         x, y, t = dom.variable("interior")
 
         # u(x, y, t) = sin(πx) cos(πy) exp(-2π² t)

@@ -357,7 +357,7 @@ def test_3d_tet_poisson_routes_native_and_solves(order):
     """A 3D tet Poisson (Dirichlet on every cube face) is assembled natively and solves the
     manufactured ``sin·sin·sin`` problem; ``fem.points`` indexes the flat solution one-to-one
     (vertices for P1, vertices+edge-midpoints for P2)."""
-    d = jno.domain(constructor=jno.domain.cube(mesh_size=0.3))
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.3).domain()
     u, w = d.fem_symbols(names=("u", "w"), order=order)
     xi, yi, zi = d.variable("interior", split=True)[:3]
     vv = w.bind(x=xi, y=yi, z=zi)
@@ -379,7 +379,7 @@ def test_3d_tet_p2_reproduces_quadratic_exactly():
     tet edge-DOF ordering used by ``_promote_to_quadratic`` (a permutation bug silently scrambles
     the local DOFs) and the robust facet-based boundary-node detection (the geometric containment
     test misses P2 edge-midpoints sitting exactly on a cube face, leaving them unconstrained)."""
-    d = jno.domain(constructor=jno.domain.cube(mesh_size=0.4))
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.4).domain()
     u, w = d.fem_symbols(names=("u", "w"), order=2)
     xi, yi, zi = d.variable("interior", split=True)[:3]
     vv = w.bind(x=xi, y=yi, z=zi)
@@ -402,7 +402,7 @@ def test_3d_tet_neumann_routes_native_and_recovers_flux():
     y/z faces left natural (zero flux, which ``u = x`` satisfies). The native solution recovers ``u = x``
     to the linear-solve tolerance -- pinning the tet-face area element, the parent-basis face
     tabulation and the local-face indexing against ``build_facet_connectivity``."""
-    d = jno.domain(constructor=jno.domain.cube(mesh_size=0.3))
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.3).domain()
     u, w = d.fem_symbols(names=("u", "w"))
     xi, yi, zi = d.variable("interior", split=True)[:3]
     xr, yr, zr = d.variable("right", split=True)[:3]
@@ -427,7 +427,7 @@ def test_3d_tet_multifield_routes_native_and_recovers():
     gate admits 3D now that the assembler is dimension-generic. Manufactured ``u = p = sin·sin·sin``
     with the symmetric coupling ``-Δu + p = (3π²+1)g`` / ``-Δp + u = (3π²+1)g`` (which ``u = p = g``
     solves) is recovered in both blocks."""
-    d = jno.domain(constructor=jno.domain.cube(mesh_size=0.25))
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.25).domain()
     u, wu = d.fem_symbols(names=("u", "wu"))
     p, wp = d.fem_symbols(names=("p", "wp"))
     xi, yi, zi = d.variable("interior", split=True)[:3]
