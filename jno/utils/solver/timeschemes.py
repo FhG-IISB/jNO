@@ -47,15 +47,15 @@ class _ExponentialScheme:
 def _exponential_integrate(block, args, save_ts, *, order, mass):
     """Advance ``M u̇ + A u = c`` exactly per step via ``exp(-dt·M⁻¹A)`` (+ ``φ₁`` forcing).
 
-    Both mass treatments reduce the pencil to a **symmetric** operator ``C`` in a transformed variable
-    ``w``, integrate ``ẇ = -C w + g`` with :func:`applyfun`'s Lanczos, and map ``w`` back to the field
-    ``u`` — ``lumped`` uses ``C = D^{-1/2} A D^{-1/2}`` (``w = D^{1/2} u``, matrix-free), ``consistent``
-    factors ``M = L Lᵀ`` once and uses ``C = L⁻¹ A L⁻ᵀ`` (``w = Lᵀ u``). Reverse-mode differentiable
-    (``lumped``); ``consistent`` needs a concrete operator (host Cholesky)."""
-    import numpy as np
+    * ``lumped`` — symmetric ``L̃ = D^{-1/2} A D^{-1/2}`` (``D`` = row-sum mass); integrate ``w = D^{1/2} u``
+      with the Euclidean Lanczos of :func:`applyfun`. Matrix-free.
+    * ``consistent`` — ``L = M⁻¹A`` applied by a **matrix-free M-inner-product Lanczos** (:func:`m_inner_funm`,
+      an M-solve per matvec via CG). No lumping error, no factorization.
 
+    Both are **matrix-free and reverse-mode differentiable**; the Dirichlet boundary (zero-mass DOFs) is
+    held at 0 by *masking* (a multiply — trace-safe), never a host-side extraction."""
     from .backend_blocks import _block_time_grid
-    from .mass import _dense, cholesky_spd, lumped_diagonal
+    from .mass import lumped_diagonal, m_inner_funm
     from .matfun import applyfun
     from .solver_api import LinearOperator
 
@@ -85,41 +85,6 @@ def _exponential_integrate(block, args, save_ts, *, order, mass):
         c = c + jnp.asarray(block.forcing_vector_fn(float(grid[0]), args or {}), dtype).reshape(-1)
     has_forcing = bool(block.affine_bias is not None or block.forcing_vector_fn is not None)
 
-    d = lumped_diagonal(Mop)  # Dirichlet DOFs carry NO mass (d=0) — algebraic (u=0), not ODEs.
-    if mass == "lumped":
-        interior = d > 1e-12 * jnp.max(d)
-        s = jnp.sqrt(d)
-        s_inv = jnp.where(interior, 1.0 / jnp.where(interior, s, 1.0), 0.0)  # 0 on the boundary
-        C = LinearOperator.from_matvec(lambda w: s_inv * (Aop @ (s_inv * w)), shape=(n, n))
-        w0, g = s * s0, s_inv * c
-        to_field = lambda w: s_inv * w  # u = D^{-1/2} w (boundary → 0)
-        e0 = interior.astype(dtype)
-    else:  # consistent: restrict to the interior (zero-mass Dirichlet DOFs), Cholesky M_ii = L Lᵀ (once)
-        from jax.scipy.linalg import solve_triangular
-
-        try:
-            interior_np = np.asarray(d) > 1e-12 * float(np.asarray(d).max())
-        except Exception as e:
-            raise RuntimeError(
-                "jno.solve.exponential(mass='consistent') factors M on the host from a concrete operator; it "
-                "cannot run under a trace (parametric solve). Use mass='lumped' there."
-            ) from e
-        idx = np.where(interior_np)[0]
-        idxj = jnp.asarray(idx)
-        Md, Ad = _dense(Mop), _dense(Aop)
-        L = cholesky_spd(Md[idxj][:, idxj])
-        A_ii = Ad[idxj][:, idxj]
-        C = LinearOperator.from_matvec(
-            lambda w: solve_triangular(L, A_ii @ solve_triangular(L.T, w, lower=False), lower=True),
-            shape=(len(idx), len(idx)),
-        )
-        w0 = L.T @ s0[idxj]
-        g = solve_triangular(L, c[idxj], lower=True)  # L⁻¹ c_i
-        to_field = lambda w: jnp.zeros(n, dtype).at[idxj].set(solve_triangular(L.T, w, lower=False))  # boundary → 0
-        e0 = jnp.ones(len(idx), dtype)
-
-    e0 = e0 / jnp.linalg.norm(e0)  # fixed nonzero unit vector — fallback for a null/decayed Lanczos start
-
     def _exp(lam):
         return jnp.exp(-dt * lam)
 
@@ -127,20 +92,48 @@ def _exponential_integrate(block, args, save_ts, *, order, mass):
         z = -dt * lam
         return jnp.where(jnp.abs(z) < 1e-7, 1.0 + 0.5 * z, jnp.expm1(z) / z)
 
-    def _apply(vec, fun):
-        # f(C)·vec by Lanczos, applied to the NORMALISED vector and scaled back — Lanczos divides by the
-        # start-vector norm, so a zero/decayed vec would give NaN; this is exact (linearity) and 0 at 0.
-        nrm = jnp.linalg.norm(vec)
-        unit = jnp.where(nrm > 1e-300, vec / jnp.where(nrm > 1e-300, nrm, 1.0), e0)
-        return nrm * applyfun(C, unit, fun=fun, order=order)
+    d = lumped_diagonal(Mop)  # Dirichlet DOFs carry NO mass (d=0) — algebraic (u=0), not ODEs
+    mask = (d > 1e-12 * jnp.max(d)).astype(dtype)  # 1 interior / 0 boundary — a *multiply* (trace-safe)
+
+    if mass == "lumped":
+        # symmetric L̃ = D^{-1/2} A D^{-1/2}; integrate w = D^{1/2} u with the Euclidean Lanczos of applyfun
+        s = jnp.sqrt(d)
+        s_inv = jnp.where(mask > 0, 1.0 / jnp.where(mask > 0, s, 1.0), 0.0)  # 0 on the boundary
+        Ctil = LinearOperator.from_matvec(lambda w: s_inv * (Aop @ (s_inv * w)), shape=(n, n))
+        e0 = mask / jnp.linalg.norm(mask)
+
+        def apply_f(vec, fun):  # f(L̃)·vec, on the *normalised* vector (Lanczos divides by ‖·‖ → NaN at 0)
+            nrm = jnp.linalg.norm(vec)
+            unit = jnp.where(nrm > 1e-300, vec / jnp.where(nrm > 1e-300, nrm, 1.0), e0)
+            return nrm * applyfun(Ctil, unit, fun=fun, order=order)
+
+        w0, g = s * s0, s_inv * c
+        to_field = lambda w: s_inv * w  # u = D^{-1/2} w (boundary → 0)
+    else:  # consistent — matrix-free M-inner-product Lanczos on L = M⁻¹A: scalable AND differentiable
+        from jax.scipy.sparse.linalg import cg as _cg
+
+        from .linear import matrix_diagonal
+
+        Mreg = lambda x: Mop @ x + (1.0 - mask) * x  # M + (1-mask)·I — SPD (boundary block is identity)
+        jac = 1.0 / (matrix_diagonal(Mop) + (1.0 - mask))  # Jacobi preconditioner for the CG M-solve
+
+        def m_solve(rhs):  # M⁻¹·rhs on the interior (boundary → 0, since the masked rhs is 0 there)
+            return _cg(Mreg, rhs, tol=1e-10, maxiter=300, M=lambda z: jac * z)[0]
+
+        L_mv = lambda x: m_solve(mask * (Aop @ x))  # M⁻¹A x (interior)
+        m_inner = lambda a, b: a @ (Mop @ b)  # ⟨a,b⟩_M — M already zeros the boundary
+        e0 = mask / jnp.sqrt(m_inner(mask, mask))  # a fixed M-unit interior vector
+        apply_f = lambda vec, fun: m_inner_funm(L_mv, m_inner, e0, vec, fun, order)
+        w0, g = mask * s0, m_solve(mask * c)  # integrate u directly (homogeneous boundary); forcing M⁻¹c
+        to_field = lambda u: u
 
     def step(w, _t):
-        wn = _apply(w, _exp)
+        wn = apply_f(w, _exp)
         if has_forcing:
-            wn = wn + dt * _apply(g, _phi1)
+            wn = wn + dt * apply_f(g, _phi1)
         return wn, wn
 
     _, ws = jax.lax.scan(step, w0, grid[1:])
-    traj_u = jax.vmap(to_field)(jnp.concatenate([w0[None, :], ws], axis=0))  # each w-row → the full field u
+    traj_u = jax.vmap(to_field)(jnp.concatenate([w0[None, :], ws], axis=0))  # each row → the full field u
     save_ts = jnp.asarray(save_ts, dtype)
     return jax.vmap(lambda col: jnp.interp(save_ts, grid, col), in_axes=1, out_axes=1)(traj_u)

@@ -9,6 +9,7 @@ fixed (coarse) step count. The θ-scheme test checks the override (θ=1 ≡ defa
 import importlib.util
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 from shapely.geometry import box
@@ -75,18 +76,55 @@ def test_exponential_beats_backward_euler():
     assert exp_err < 0.5 * be_err  # exact-in-time wins at coarse steps
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not _HAS_MATFREE, reason="jno.solve.exponential needs the optional 'matfree' package")
 def test_exponential_consistent_mass_is_more_accurate():
-    """``mass='consistent'`` (Cholesky-factored M, no lumping error) is closer to the time-converged
-    reference than ``mass='lumped'`` — and is still exact in time (step-independent)."""
-    ref = _final(_heat(400))
-    lump = np.linalg.norm(_final(_heat(4), time=jno.solve.exponential(mass="lumped")) - ref) / np.linalg.norm(ref)
-    cons = np.linalg.norm(_final(_heat(4), time=jno.solve.exponential(mass="consistent")) - ref) / np.linalg.norm(ref)
+    """``mass='consistent'`` (full M, no lumping error, matrix-free M-inner-product Lanczos) is closer to
+    the time-converged reference than ``mass='lumped'`` — and is still exact in time (step-independent)."""
+    h = 0.16  # coarse: the consistent path runs a CG M-solve per Lanczos step
+    ref = _final(_heat(300, h=h))
+    lump = np.linalg.norm(_final(_heat(4, h=h), time=jno.solve.exponential(mass="lumped")) - ref) / np.linalg.norm(ref)
+    cons = np.linalg.norm(
+        _final(_heat(4, h=h), time=jno.solve.exponential(mass="consistent", order=30)) - ref
+    ) / np.linalg.norm(ref)
     assert cons < lump  # consistent mass removes the lumping error
 
-    c4 = _final(_heat(4), time=jno.solve.exponential(mass="consistent"))
-    c8 = _final(_heat(8), time=jno.solve.exponential(mass="consistent"))
-    assert np.linalg.norm(c4 - c8) / np.linalg.norm(c8) < 1e-6  # still exact in time
+    c4 = _final(_heat(4, h=h), time=jno.solve.exponential(mass="consistent", order=30))
+    c8 = _final(_heat(8, h=h), time=jno.solve.exponential(mass="consistent", order=30))
+    assert np.linalg.norm(c4 - c8) / np.linalg.norm(c8) < 1e-5  # still exact in time
+
+
+def test_m_inner_product_lanczos_matches_dense_and_differentiates():
+    """The matrix-free M-inner-product Lanczos (the consistent-mass engine) computes ``f(M⁻¹A)·v``
+    exactly and is differentiable — pure JAX, no host factorization, so consistent mass is scalable
+    *and* autodiff-friendly (unlike a dense Cholesky with a concrete interior extraction)."""
+    from jno.utils.solver.mass import m_inner_funm
+
+    rng = np.random.default_rng(0)
+    n = 50
+    Bm = rng.standard_normal((n, n))
+    M = jnp.asarray(Bm @ Bm.T + n * np.eye(n))
+    Ba = rng.standard_normal((n, n))
+    A = jnp.asarray(Ba @ Ba.T + np.eye(n))
+    Minv = jnp.linalg.inv(M)
+    L = Minv @ A
+    m_inner = lambda a, b: a @ (M @ b)
+    ones = jnp.ones(n)
+    e0 = ones / jnp.sqrt(m_inner(ones, ones))
+    v = jnp.asarray(rng.standard_normal(n))
+    t = 0.05
+
+    fv = m_inner_funm(lambda x: Minv @ (A @ x), m_inner, e0, v, lambda lam: jnp.exp(-t * lam), order=40)
+    true = jax.scipy.linalg.expm(-t * L) @ v
+    assert float(jnp.linalg.norm(fv - true) / jnp.linalg.norm(true)) < 1e-8  # exact vs dense expm
+
+    def loss(scale):
+        fw = m_inner_funm(lambda x: scale * (Minv @ (A @ x)), m_inner, e0, v, lambda lam: jnp.exp(-t * lam), order=40)
+        return jnp.sum(fw**2)
+
+    g = float(jax.grad(loss)(1.0))
+    fd = float((loss(1.0 + 1e-5) - loss(1.0 - 1e-5)) / 2e-5)
+    assert abs(g - fd) / abs(fd) < 1e-3  # gradient flows through the matrix-free Lanczos
 
 
 def test_time_scheme_rejects_a_steady_problem():
