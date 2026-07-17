@@ -361,6 +361,40 @@ def prepare_precond(spec: Any, fem: Any) -> None:
         prep(fem)
 
 
+_KRYLOV_SCALE_THRESHOLD = 1e8  # normalize the system only when the operator magnitude is genuinely extreme
+
+
+def _normalize_extreme_scale(op, b, precond):
+    """Guard the Krylov path against extreme operator magnitude. A mass-dominated eddy operator
+    (``|A| ~ jωσ ~ 1e12``) makes jax's GMRES Arnoldi break down and return ~0 *regardless of the
+    preconditioner* (plain Jacobi stalls identically). Scale the operator and RHS by a concrete scalar
+    ``α`` so the iteration runs on an ``O(1)`` system; the solution is invariant (``Â x = b̂ ⟺ A x = b``),
+    so nothing downstream changes and no un-scaling is needed.
+
+    Fires ONLY for a **concrete** BCOO operator (a forward solve) whose magnitude exceeds the threshold —
+    a traced/parametric operator (its magnitude is a tracer, so ``float(...)`` raises) and a normally
+    scaled one are returned untouched. A frozen AMS auxiliary (assembled from the *un-scaled* operator) is
+    reset so the coming ``materialize`` re-freezes it from the scaled operator; that reset only happens on
+    this concrete forward path, so a traced/parametric ``.build()`` is never disturbed."""
+    import math
+
+    import jax.experimental.sparse as jsp
+
+    bc = getattr(op, "bcoo", None)
+    if bc is None:
+        return op, b
+    try:
+        alpha = float(jnp.max(jnp.abs(bc.data)))  # concrete forward operator only; a tracer raises here
+    except Exception:  # noqa: BLE001 — traced operator: leave the frozen-aux path untouched
+        return op, b
+    if not math.isfinite(alpha) or alpha <= _KRYLOV_SCALE_THRESHOLD:
+        return op, b
+    op_scaled = LinearOperator(jsp.BCOO((bc.data / alpha, bc.indices), shape=bc.shape))
+    if precond is not None and getattr(precond, "_frozen", None) is not None:
+        precond._frozen = None  # re-freeze the AMS auxiliaries from the scaled operator (forward path only)
+    return op_scaled, jnp.asarray(b) / alpha
+
+
 def compose_linear_solve_fn(linear, precond, x0, fem=None) -> Callable:
     """Compose the linear-mode slots into the classic ``(A, b) -> x`` ``solve_fn`` contract.
 
@@ -379,6 +413,9 @@ def compose_linear_solve_fn(linear, precond, x0, fem=None) -> Callable:
 
     def composed(A, b):
         op = A if isinstance(A, LinearOperator) else LinearOperator(A)
+        # Extreme-magnitude systems (the physical eddy regime) break the Krylov Arnoldi; scale to O(1)
+        # first — solution-invariant, and a no-op for normally scaled / traced operators.
+        op, b = _normalize_extreme_scale(op, b, precond)
         M = materialize_precond(precond, PrecondContext(op, fem)) if precond is not None else None
         return linear(op, jnp.asarray(b).reshape(-1), M=M, x0=x0_flat)
 

@@ -78,6 +78,31 @@ def test_ams_complex_eddy_matches_sparse_lu():
     assert np.linalg.norm(x_ams - x_lu) / np.linalg.norm(x_lu) < 1e-8
 
 
+def test_ams_complex_eddy_extreme_scale_matches_lu():
+    """Regression for the extreme-magnitude Krylov breakdown. The *physical* eddy operator has huge
+    absolute coefficients (ν ~ 1/μ₀ ~ 1e6, jωσ ~ jω·σ_cu ~ 1e12), and jax GMRES's Arnoldi breaks down
+    on it — it returns ~0 (relative residual 1.0) *regardless of preconditioner* — unless the system is
+    normalized to O(1) first. The slot path auto-scales the operator+RHS by a concrete scalar (solution-
+    invariant), so a realistic-scale eddy solve reproduces the sparse-direct result. Every other test
+    here uses O(1) coefficients, so they miss this; without the normalization x_ams would be ~0 and the
+    solve would raise the residual-check error."""
+    mu0 = 4 * np.pi * 1e-7
+    nu, sigma, omega = 1.0 / mu0, 5.8e7, 2 * np.pi * 1e4  # ν~8e5, jωσ~3.6e12  ⇒  |A| ~ 1e12
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.3).domain()
+    u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
+    c = d.variable("interior", split=True)
+    x, y, z = c[0], c[1], c[2]
+    ui, vi = u.bind(x=x, y=y, z=z), v.bind(x=x, y=y, z=z)
+    cu, cv = u.vector.curl(x, y, z), v.vector.curl(x, y, z)
+    sig = jno.np.where(x > 0.5, sigma, 0.0)  # conductor half; ε-gauge mass floor everywhere
+    Js = vec(0.0 * x, 0.0 * x, jno.np.where(x > 0.5, 1.0, 0.0))
+    fem = jno.fem([nu * inner(cu, cv) + 1j * omega * (sig + sigma * 1e-3) * inner(ui, vi) - inner(Js, vi)])
+    x_lu = _solve(fem)
+    x_ams = _solve(fem, linear=jno.solve.gmres(tol=1e-8, restart=200, maxiter=20), precond=jno.precond.ams())
+    assert x_ams.dtype == np.complex128
+    assert np.linalg.norm(x_ams - x_lu) / np.linalg.norm(x_lu) < 1e-7
+
+
 def test_ams_matches_direct_solve_through_fem_solve():
     """fem.solve(linear=cg, precond=ams()) reproduces the sparse-direct solve — the spec is wired
     end-to-end (prepare builds G/Π from the mesh, materialize assembles the nodal aux, CG converges)."""
