@@ -23,7 +23,7 @@ def _require_matfree():
         import matfree  # noqa: F401
     except ImportError as e:  # optional dependency — keep core jNO lean
         raise ImportError(
-            "jno.solve.logdet / trace / applyfun / diagonal need the optional 'matfree' package "
+            "jno.solve.logdet / trace / applyfun / diagonal / lstsq need the optional 'matfree' package "
             "(MIT, pure JAX). Install it with:  pip install matfree"
         ) from e
 
@@ -122,3 +122,25 @@ def diagonal(A, *, fun=None, samples: int = 32, order: int = 25, key=None):
         sampler=stochtrace.sampler_normal(jnp.zeros(n, dtype), num=samples),
     )
     return estimate(matvec, _key(key))
+
+
+def lstsq(A, b, *, damp: float = 0.0, atol: float = 1e-6, btol: float = 1e-6, maxiter: int = 100_000, x0=None):
+    """Differentiable, matrix-free **least-squares** ``min_x ‖A x − b‖²`` for a **rectangular** ``A``
+    (over- or under-determined), via LSMR — the gap left by the square ``Ax=b`` solvers. ``damp`` adds
+    Tikhonov regularisation ``+ damp²‖x‖²`` (well-posed for rank-deficient / ill-posed inverse problems);
+    ``x0`` an initial guess. ``A`` may be a dense/sparse matrix or a jNO ``LinearOperator`` (only its
+    matvec and transpose are used — matrix-free). Returns the solution ``x``.
+
+    Scope: **real** operators (LSMR's complex path is untested here). Convergence is controlled by
+    ``atol``/``btol``/``maxiter`` — a stalled solve returns its best iterate, so check the residual."""
+    _require_matfree()
+    from matfree import lstsq as _lstsq
+
+    m, n = A.shape
+    mv = A.mv if hasattr(A, "mv") else (lambda v: A @ v)
+    dtype = jax.eval_shape(mv, jnp.zeros(n)).dtype
+    # LSMR wants the vector–matrix product v ↦ vᵀA; get it as the transpose of the matvec (matrix-free)
+    vecmat = lambda v: jax.linear_transpose(mv, jnp.zeros(n, dtype))(v)[0]  # noqa: E731
+    solve = _lstsq.lsmr(atol=atol, btol=btol, maxiter=maxiter)
+    out = solve(vecmat, jnp.asarray(b), x0=x0, damp=damp)
+    return out[0] if isinstance(out, tuple) else out

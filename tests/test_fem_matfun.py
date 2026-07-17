@@ -162,6 +162,28 @@ def test_diagonal_gradient_matches_trace():
     assert abs(g - float(jnp.trace(dense))) / float(jnp.trace(dense)) < 0.05
 
 
+def test_lstsq_rectangular_and_damped():
+    """LSMR least-squares for a rectangular ``A``: overdetermined matches ``np.linalg.lstsq``; ``damp``
+    reproduces the Tikhonov normal equations ``(AᵀA + damp²I)x = Aᵀb``; and it differentiates in ``b``."""
+    rng = np.random.default_rng(3)
+    m, n = 120, 60
+    A = jnp.asarray(rng.standard_normal((m, n)))
+    b = jnp.asarray(rng.standard_normal(m))
+
+    # LSMR is iterative (atol=btol=1e-6) so the gate is its convergence floor, not machine precision
+    x = jno.solve.lstsq(A, b, atol=1e-10, btol=1e-10)
+    xr = jnp.asarray(np.linalg.lstsq(np.asarray(A), np.asarray(b), rcond=None)[0])
+    assert float(jnp.linalg.norm(x - xr) / jnp.linalg.norm(xr)) < 1e-5
+
+    damp = 2.0
+    xd = jno.solve.lstsq(A, b, damp=damp, atol=1e-10, btol=1e-10)
+    xo = jnp.linalg.solve(A.T @ A + damp**2 * jnp.eye(n), A.T @ b)
+    assert float(jnp.linalg.norm(xd - xo) / jnp.linalg.norm(xo)) < 1e-5
+
+    gb = jax.grad(lambda bb: jnp.sum(jno.solve.lstsq(A, bb) ** 2))(b)
+    assert bool(jnp.isfinite(gb).all())
+
+
 @pytest.mark.skipif(_HAS_MATFREE, reason="matfree installed; this checks the missing-dependency message")
 def test_missing_matfree_message():
     _op, dense = _spd_fem()

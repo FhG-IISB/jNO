@@ -53,6 +53,7 @@ __all__ = [
     "trace",
     "applyfun",
     "diagonal",
+    "lstsq",
     "theta",
     "exponential",
 ]
@@ -446,6 +447,16 @@ def diagonal(A, *, fun=None, samples: int = 32, order: int = 25, key=None):
     from .utils.solver.matfun import diagonal as _diagonal
 
     return _diagonal(A, fun=fun, samples=samples, order=order, key=key)
+
+
+def lstsq(A, b, *, damp: float = 0.0, atol: float = 1e-6, btol: float = 1e-6, maxiter: int = 100_000, x0=None):
+    """Differentiable, matrix-free **least-squares** ``min_x ‖A x − b‖²`` for a **rectangular** ``A`` (LSMR) —
+    the gap left by the square ``Ax=b`` solvers. ``damp`` adds Tikhonov ``+ damp²‖x‖²`` (ill-posed /
+    rank-deficient inverse problems); ``x0`` an initial guess. Real operators; optional ``matfree``.
+    See :func:`jno.utils.solver.matfun.lstsq`."""
+    from .utils.solver.matfun import lstsq as _lstsq
+
+    return _lstsq(A, b, damp=damp, atol=atol, btol=btol, maxiter=maxiter, x0=x0)
 
 
 def theta(theta: float = 1.0):
