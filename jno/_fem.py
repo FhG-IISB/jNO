@@ -1256,8 +1256,18 @@ class FEM:
                     "adapt= yet — remeshing changes the DOF layout under a warm start and stales "
                     "cached form/amg preconditioner setups. Pass solve_fn= for the adaptive loop."
                 )
-            from .utils.solver.fem_adapt import run_adaptive_solve
+            from .utils.solver.fem_adapt import run_adaptive_solve, run_adaptive_transient
 
+            if self._mode == "transient":
+                # Adapt the mesh AS the problem marches: remesh every `adapt.every` steps and carry the
+                # state across (transfer_solution), tracking a moving feature. Returns an AdaptiveTrajectory.
+                return run_adaptive_transient(self, adapt, solve_fn=solve_fn, **kwargs)
+            if self._mode in ("complex", "complex_transient"):
+                raise NotImplementedError(
+                    "fem.solve(adapt=...) on a complex / complex-transient problem is not supported yet "
+                    "(the Hessian metric and ZZ estimator are real-only). Solve the real-equivalent form, "
+                    "or adapt a real reference mesh first."
+                )
             return run_adaptive_solve(self, adapt, solve_fn=solve_fn, **kwargs)
         if has_slots:
             solve_fn, kwargs = self._compose_slots(

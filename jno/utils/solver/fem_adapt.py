@@ -685,6 +685,11 @@ class AdaptSpec:
         (a round may overshoot it by up to ~1.5x, especially in 3D).
     hmin, hmax
         Edge-size window for the anisotropic metric (defaults derive from the mesh).
+    every
+        **Transient only** (``FEM.solve(adapt=...)`` on a ``u.t`` problem): remesh every ``every``
+        time steps, carrying the state across each remesh (:func:`transfer_solution`). Between remeshes
+        the march is the ordinary differentiable stepper; smaller = the mesh tracks a fast feature more
+        tightly, larger = cheaper. Ignored by the steady loop.
     """
 
     theta: float = 0.5
@@ -696,6 +701,7 @@ class AdaptSpec:
     anisotropic: bool = False
     hmin: float | None = None
     hmax: float | None = None
+    every: int = 5
 
 
 # Consecutive rounds that must satisfy ``eps`` before the loop stops on convergence.
@@ -816,6 +822,180 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
     fem.__dict__.update(cur.__dict__)
     fem.adapt_history = history
     return u
+
+
+@dataclass
+class AdaptiveTrajectory:
+    """Output of a **transient adaptive** solve (``FEM.solve(adapt=...)`` on a ``u.t`` problem).
+
+    The mesh changes with time, so this is *not* a single ``(n_save, n_dofs)`` array — each saved
+    frame lives on its own adapted mesh: ``times[i]`` ↔ ``states[i]`` (the nodal field) on
+    ``meshes[i]`` (a ``(points, cells)`` pair; ``points`` ``(n_i, dim)``, ``cells`` ``(m_i, dim+1)`` —
+    the same mesh object is shared between remeshes). Call :meth:`resample` to project every frame onto
+    one reference mesh and get a uniform array for post-processing / plotting.
+    """
+
+    times: np.ndarray
+    states: list
+    meshes: list
+
+    def __len__(self):
+        return len(self.times)
+
+    def final(self):
+        """``(state, (points, cells))`` at the last time — the solution on the final adapted mesh."""
+        return self.states[-1], self.meshes[-1]
+
+    def resample(self, domain: Any, *, fill: Any = "nearest", tol: float = 1e-9, k: int = 32):
+        """Project every saved state onto ``domain``'s vertices (via the same barycentric transfer as
+        :func:`transfer_solution`), returning a uniform ``(n_save, n_target_vertices, ...)`` array. The
+        per-frame data in ``states`` is loss-free; this adds one interpolation per frame on demand."""
+        import jax.numpy as jnp
+
+        dim = int(domain.dimension)
+        tgt = np.asarray(domain.mesh.points)[:, :dim].astype(np.float64)
+        rows = []
+        for u, (pts, cells) in zip(self.states, self.meshes):
+            idx, w, inside = _locate_barycentric(
+                np.asarray(pts, np.float64), np.asarray(cells, np.int64), tgt, tol=tol, k=k
+            )
+            uu = jnp.asarray(u)
+            row = jnp.einsum("qk,qk...->q...", jnp.asarray(w, dtype=uu.real.dtype), uu[jnp.asarray(idx)])
+            n_out = int((~inside).sum())
+            if n_out and fill == "error":
+                raise ValueError(
+                    f"resample: {n_out} reference vertices fall outside a frame's mesh; use fill='nearest' or a constant."
+                )
+            if isinstance(fill, (int, float)) and n_out:
+                keep = jnp.asarray(inside).reshape((-1,) + (1,) * (row.ndim - 1))
+                row = jnp.where(keep, row, jnp.asarray(fill, dtype=uu.dtype))
+            rows.append(row)
+        return jnp.stack(rows, axis=0)
+
+
+def run_adaptive_transient(
+    fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, save_ts: Any = None, **kwargs: Any
+) -> "AdaptiveTrajectory":
+    """Drive ``FEM.solve(adapt=spec)`` for a **transient** problem: march the semidiscrete block and,
+    every ``spec.every`` steps, remesh from the current field and carry the state onto the new mesh
+    (:func:`transfer_solution`), so the mesh **tracks a moving feature**. Returns an
+    :class:`AdaptiveTrajectory` (each frame on its own adapted mesh).
+
+    The between-remesh march is the ordinary differentiable ``θ``-stepper (:meth:`SemidiscreteTimeBlock.step`
+    over a ``lax.scan``); the remesh is the non-differentiable outer Python loop, exactly like the steady
+    driver. The time grid is the block's fixed ``t0..t1`` at ``dt`` — remeshing changes only the mesh, not
+    the grid, so time never drifts across chunks.
+
+    **Scope (v1) — fail-loud on the rest** (a mis-transferred transient solve is silently wrong):
+    scalar single-field **P1**, **real**, **non-periodic**, and the driver owns the march (no custom
+    ``solve_fn``). Vector / higher-order / multifield, complex, periodic ties, and a bring-your-own
+    integrator each raise a clear error and are later extensions. The forward march is differentiable
+    within each fixed-mesh chunk and through the transfers, but the *remesh decisions* are not (the
+    AFEM-inverse pattern -- freeze the mesh sequence, differentiate the chunks -- applies)."""
+    import jax
+    import jax.numpy as jnp
+
+    import jno
+
+    from .backend_blocks import _block_time_grid
+
+    if fem._constraints is None:
+        raise ValueError("FEM.solve(adapt=...) requires a FEM built by jno.fem(...) (its constraint list is retained).")
+    if solve_fn is not None:
+        raise NotImplementedError(
+            "fem.solve(adapt=..., solve_fn=...) is not supported on a transient problem: the adaptive driver "
+            "owns the time march (it steps between remeshes). Drop solve_fn (use the default θ-stepper), or drop adapt."
+        )
+    if getattr(fem, "_periodic", None) is not None:
+        raise NotImplementedError(
+            "fem.solve(adapt=...) with periodic ties on a transient problem is not supported yet "
+            "(the remesh would need a periodic-aware state transfer)."
+        )
+
+    d = fem.domain
+    dim = int(d.dimension)
+    if dim not in (2, 3):
+        raise NotImplementedError(f"transient adaptive remeshing supports 2D/3D simplicial meshes; got dimension {dim}.")
+
+    cons, kw = fem._constraints, fem._fem_kwargs
+    block = fem._op
+    n_verts = int(np.asarray(d.mesh.points).shape[0])
+    state = jnp.asarray(block.state0).reshape(-1)
+    if state.shape[0] != n_verts:
+        raise NotImplementedError(
+            f"transient adaptive remeshing is scalar single-field P1 for now: the state has {int(state.shape[0])} DOFs "
+            f"but the mesh has {n_verts} vertices (vector / higher-order / multifield). Write it as a scalar P1 field, "
+            "or await the multifield extension."
+        )
+    if jnp.iscomplexobj(state):
+        raise NotImplementedError(
+            "transient adaptive remeshing is real-only (the Hessian metric and the ZZ estimator are); a complex "
+            "transient is not supported yet."
+        )
+
+    key = "triangle" if dim == 2 else "tetra"
+    ts = np.asarray(_block_time_grid(block))  # fixed t0..t1 at dt -- unchanged by remeshing
+    dt = float(block.dt)
+    theta = float(block.metadata.get("theta", 1.0)) if block.metadata else 1.0
+    n_steps = len(ts) - 1
+    every = max(1, int(spec.every))
+
+    def _snapshot():
+        return (np.asarray(d.mesh.points)[:, :dim].astype(np.float64), np.asarray(d.mesh.cells_dict[key]).astype(np.int64))
+
+    cur_mesh = _snapshot()
+    times, states, meshes = [float(ts[0])], [state], [cur_mesh]
+    history: list[dict] = []
+    cur = fem
+
+    i = 0
+    while i < n_steps:
+        chunk = int(min(every, n_steps - i))
+        blk = block  # capture the current-mesh block for the scan closure
+
+        def _body(u, t, _blk=blk):
+            un = _blk.step(u, t, dt, theta=theta)
+            return un, un
+
+        state, traj = jax.lax.scan(_body, state, jnp.asarray(ts[i : i + chunk], dtype=state.dtype))
+        for j in range(chunk):
+            i += 1
+            times.append(float(ts[i]))
+            states.append(traj[j])
+            meshes.append(cur_mesh)
+        if i >= n_steps:
+            break
+
+        # remesh from the current field, then carry the state onto the new mesh + re-assemble
+        u_v = np.asarray(state)  # scalar P1 vertex values
+        h_typ = _mean_edge_length(d)
+        hmin = spec.hmin if spec.hmin is not None else h_typ / 50.0
+        hmax = spec.hmax if spec.hmax is not None else h_typ * 2.0
+        n_dofs = int(np.asarray(d.mesh.points).shape[0])
+        target = n_dofs * spec.refine_factor
+        if spec.max_dofs is not None:
+            target = min(target, float(spec.max_dofs))
+        old_pts, old_cells = cur_mesh
+        if spec.anisotropic:
+            metric = hessian_metric(d, u_v, target_complexity=target, hmin=hmin, hmax=hmax)
+            remesh_with_mmg(d, metric, copy=False, hmin=hmin, hmax=hmax, hgrad=3.0)
+        else:
+            eta, _est = zz_error_indicators(d, u_v)
+            remesh_with_mmg(
+                d, size_field_from_marks(d, dorfler_mark(eta, spec.theta), refine_factor=spec.refine_factor), copy=False
+            )
+        for _name, _pred in list(getattr(d, "_tag_predicates", {}).items()):  # flux tags re-derive on the new facets
+            d.tag(_name, _pred)
+        cur = jno.fem(cons, **kw)  # re-assemble the same transient problem on the refined mesh
+        block = cur._op
+        cur_mesh = _snapshot()
+        idx, w, _inside = _locate_barycentric(old_pts, old_cells, cur_mesh[0], tol=1e-9, k=32)  # carry state
+        state = jnp.einsum("qk,qk...->q...", jnp.asarray(w, dtype=state.real.dtype), state[jnp.asarray(idx)])
+        history.append({"t": float(ts[i]), "n_dofs": int(cur_mesh[0].shape[0])})
+
+    fem.__dict__.update(cur.__dict__)  # rebind to the final adapted mesh (matches the steady driver)
+    fem.adapt_history = history
+    return AdaptiveTrajectory(np.asarray(times), states, meshes)
 
 
 def run_adaptive_inverse(
