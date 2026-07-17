@@ -49,6 +49,9 @@ __all__ = [
     "newton",
     "picard",
     "eigs",
+    "logdet",
+    "trace",
+    "applyfun",
 ]
 
 
@@ -397,3 +400,32 @@ def eigs(*, k: int = 6, which: str = "smallest"):
         return dense_geneigh(K, M, k, which)
 
     return _fn
+
+
+def logdet(A, *, samples: int = 32, order: int = 25, key=None):
+    """Differentiable, matrix-free ``log det A`` (symmetric positive-definite) — stochastic Lanczos
+    quadrature via the optional ``matfree`` package. Scales where a direct factorisation cannot; the
+    key use is **Bayesian log-evidence / marginal likelihood** of a FEM precision operator. Returns an
+    unbiased estimate (variance ↓ with ``samples``, bias ↓ with ``order``). See
+    :func:`jno.utils.solver.matfun.logdet`."""
+    from .utils.solver.matfun import logdet as _logdet
+
+    return _logdet(A, samples=samples, order=order, key=key)
+
+
+def trace(A, *, fun=None, samples: int = 32, order: int = 25, key=None):
+    """Differentiable, matrix-free ``tr A`` (Hutchinson) or ``tr f(A)`` (``fun=``, Lanczos quadrature) —
+    e.g. ``fun=lambda z: 1/z`` for ``tr(A⁻¹)`` (uncertainty / effective degrees of freedom). Optional
+    ``matfree``. See :func:`jno.utils.solver.matfun.trace`."""
+    from .utils.solver.matfun import trace as _trace
+
+    return _trace(A, fun=fun, samples=samples, order=order, key=key)
+
+
+def applyfun(A, v, *, fun, order: int = 30):
+    """Matrix-free ``f(A)·v`` for a symmetric ``A`` (Lanczos) — e.g. one exact exponential-integrator
+    step ``exp(-dt·A)·v`` with ``fun=lambda z: jnp.exp(-dt*z)``. Differentiable; optional ``matfree``.
+    See :func:`jno.utils.solver.matfun.applyfun`."""
+    from .utils.solver.matfun import applyfun as _applyfun
+
+    return _applyfun(A, v, fun=fun, order=order)
