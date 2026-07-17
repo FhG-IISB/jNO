@@ -701,7 +701,11 @@ def _complex_operator(A_r: Any, A_i: Any) -> Any:
 
 
 def _solve_complex_block(
-    ops: Any, solve_fn: Optional[Callable] = None, periodic: Optional[dict] = None, complex_solve: Optional[Callable] = None
+    ops: Any,
+    solve_fn: Optional[Callable] = None,
+    periodic: Optional[dict] = None,
+    complex_solve: Optional[Callable] = None,
+    from_slots: bool = False,
 ) -> Any:
     """Solve a complex linear FEM system via the real-equivalent block (everything was
     assembled as two *real* systems)::
@@ -770,8 +774,14 @@ def _solve_complex_block(
         rhs = jnp.concatenate([b_r, b_i])
         is_sparse = hasattr(A_r, "indices") and hasattr(A_i, "indices")
 
-        if solve_fn is not None:
-            # user solver receives the densified block (dense/direct back-compat path)
+        if solve_fn is not None and from_slots and is_sparse:
+            # Slot-composed solver on a non-complex-native precond (gmres + jacobi/form/amg): hand it the
+            # SPARSE 2n BCOO block [[A_r,-A_i],[A_i,A_r]] rather than densifying — keeps it O(nnz) AND lets
+            # the composed solver's extreme-magnitude normalization fire (a dense block has no .bcoo, so a
+            # mass-dominated eddy system would otherwise stall the Krylov Arnoldi at real scale).
+            sol = jnp.asarray(solve_fn(_complex_block_bcoo(A_r, A_i, n), rhs))
+        elif solve_fn is not None:
+            # raw user solver (or a dense-leg fallback) receives the densified block (dense/direct back-compat)
             Ar_d = jnp.asarray(A_r.todense() if hasattr(A_r, "todense") else A_r)
             Ai_d = jnp.asarray(A_i.todense() if hasattr(A_i, "todense") else A_i)
             sol = jnp.asarray(solve_fn(jnp.block([[Ar_d, -Ai_d], [Ai_d, Ar_d]]), rhs))
@@ -1258,7 +1268,7 @@ class FEM:
             # densified); real-equivalent preconditioners (form/jacobi/…) stay on the 2n-block path.
             if from_slots and getattr(precond, "complex_native", False):
                 return _solve_complex_block(self._op, periodic=self._periodic, complex_solve=solve_fn)
-            return _solve_complex_block(self._op, solve_fn, periodic=self._periodic)
+            return _solve_complex_block(self._op, solve_fn, periodic=self._periodic, from_slots=from_slots)
         if self._mode == "complex_transient":
             return _solve_complex_transient(self._op, save_ts=kwargs.get("save_ts"), periodic=self._periodic)
         if self._mode == "linear" and not isinstance(self._op, FemLinearSystem):

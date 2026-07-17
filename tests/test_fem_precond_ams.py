@@ -103,6 +103,31 @@ def test_ams_complex_eddy_extreme_scale_matches_lu():
     assert np.linalg.norm(x_ams - x_lu) / np.linalg.norm(x_lu) < 1e-7
 
 
+def test_non_native_precond_complex_extreme_scale_does_not_break_down():
+    """A non-complex-native precond (jacobi) on a complex problem solves the real-equivalent 2n block.
+    That block must be handed to the slot solver as a SPARSE BCOO so the composed solver's extreme-scale
+    normalization fires — otherwise the mass-dominated eddy block (|A| ~ 1e12) breaks the Krylov Arnoldi
+    and the solve returns ~0 (relative residual 1.0 → raises). Jacobi is a weak preconditioner for the
+    indefinite eddy block, so it does not reach tight accuracy (that is what AMS is for), but the solve
+    now *converges to a real answer* instead of breaking down. Regression for the sparse-2n-block route."""
+    mu0 = 4 * np.pi * 1e-7
+    nu, sigma, omega = 1.0 / mu0, 5.8e7, 2 * np.pi * 1e4  # |A| ~ 1e12
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.3).domain()
+    u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
+    c = d.variable("interior", split=True)
+    x, y, z = c[0], c[1], c[2]
+    ui, vi = u.bind(x=x, y=y, z=z), v.bind(x=x, y=y, z=z)
+    cu, cv = u.vector.curl(x, y, z), v.vector.curl(x, y, z)
+    sig = jno.np.where(x > 0.5, sigma, 0.0)
+    Js = vec(0.0 * x, 0.0 * x, jno.np.where(x > 0.5, 1.0, 0.0))
+    fem = jno.fem([nu * inner(cu, cv) + 1j * omega * (sig + sigma * 1e-3) * inner(ui, vi) - inner(Js, vi)])
+    x_lu = _solve(fem)
+    # Without the fix this raises (residual 1.0). With it, jacobi iterates to a real (if loose) solution.
+    x_jac = _solve(fem, linear=jno.solve.gmres(tol=1e-8, restart=300, maxiter=40), precond=jno.precond.jacobi())
+    assert np.all(np.isfinite(x_jac))
+    assert np.linalg.norm(x_jac - x_lu) / np.linalg.norm(x_lu) < 0.1  # real solution, not the x≈0 breakdown
+
+
 def test_ams_matches_direct_solve_through_fem_solve():
     """fem.solve(linear=cg, precond=ams()) reproduces the sparse-direct solve — the spec is wired
     end-to-end (prepare builds G/Π from the mesh, materialize assembles the nodal aux, CG converges)."""
