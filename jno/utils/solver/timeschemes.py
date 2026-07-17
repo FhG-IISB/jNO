@@ -4,7 +4,9 @@ Default (``time=None``): the θ-method the assembly picks — backward Euler for
 trapezoidal for second-order. ``jno.solve.theta(θ)`` overrides θ (``1`` backward Euler, ``1/2``
 Crank–Nicolson, ``0`` forward Euler). ``jno.solve.exponential(...)`` advances a **linear autonomous**
 parabolic block with the **matrix exponential** — exact in time and unconditionally stable, so it takes
-large stiff steps that an implicit θ-step cannot; it reuses :func:`jno.solve.applyfun` (matfree Lanczos).
+large stiff steps that an implicit θ-step cannot. For a symmetric operator it reuses the Lanczos
+:func:`jno.solve.applyfun`; for a **non-symmetric** one (``symmetric=False``, advection–diffusion) it uses
+an Arnoldi + differentiable **Padé** exponential (:func:`jno.utils.solver.matfun.expmv`), all matfree.
 """
 
 from __future__ import annotations
@@ -33,18 +35,19 @@ class _ThetaScheme:
 class _ExponentialScheme:
     """Matrix-exponential scheme (see :func:`jno.solve.exponential`) — linear autonomous parabolic only."""
 
-    def __init__(self, order: int, mass: str):
+    def __init__(self, order: int, mass: str, symmetric: bool):
         self.order = int(order)
         self.mass = mass
+        self.symmetric = bool(symmetric)
 
     def integrate(self, block, args, save_ts, *, linear_solve=None, nonlinear_solve=None):
-        return _exponential_integrate(block, args, save_ts, order=self.order, mass=self.mass)
+        return _exponential_integrate(block, args, save_ts, order=self.order, mass=self.mass, symmetric=self.symmetric)
 
     def __repr__(self):
-        return f"jno.solve.exponential(order={self.order}, mass={self.mass!r})"
+        return f"jno.solve.exponential(order={self.order}, mass={self.mass!r}, symmetric={self.symmetric})"
 
 
-def _exponential_integrate(block, args, save_ts, *, order, mass):
+def _exponential_integrate(block, args, save_ts, *, order, mass, symmetric):
     """Advance ``M u̇ + A u = c`` exactly per step via ``exp(-dt·M⁻¹A)`` (+ ``φ₁`` forcing).
 
     * ``lumped`` — symmetric ``L̃ = D^{-1/2} A D^{-1/2}`` (``D`` = row-sum mass); integrate ``w = D^{1/2} u``
@@ -56,7 +59,7 @@ def _exponential_integrate(block, args, save_ts, *, order, mass):
     held at 0 by *masking* (a multiply — trace-safe), never a host-side extraction."""
     from .backend_blocks import _block_time_grid
     from .mass import lumped_diagonal, m_inner_funm
-    from .matfun import applyfun
+    from .matfun import applyfun, expmv
     from .solver_api import LinearOperator
 
     if not block.is_linear():
@@ -95,43 +98,71 @@ def _exponential_integrate(block, args, save_ts, *, order, mass):
     d = lumped_diagonal(Mop)  # Dirichlet DOFs carry NO mass (d=0) — algebraic (u=0), not ODEs
     mask = (d > 1e-12 * jnp.max(d)).astype(dtype)  # 1 interior / 0 boundary — a *multiply* (trace-safe)
 
-    if mass == "lumped":
-        # symmetric L̃ = D^{-1/2} A D^{-1/2}; integrate w = D^{1/2} u with the Euclidean Lanczos of applyfun
-        s = jnp.sqrt(d)
-        s_inv = jnp.where(mask > 0, 1.0 / jnp.where(mask > 0, s, 1.0), 0.0)  # 0 on the boundary
-        Ctil = LinearOperator.from_matvec(lambda w: s_inv * (Aop @ (s_inv * w)), shape=(n, n))
-        e0 = mask / jnp.linalg.norm(mask)
-
-        def apply_f(vec, fun):  # f(L̃)·vec, on the *normalised* vector (Lanczos divides by ‖·‖ → NaN at 0)
-            nrm = jnp.linalg.norm(vec)
-            unit = jnp.where(nrm > 1e-300, vec / jnp.where(nrm > 1e-300, nrm, 1.0), e0)
-            return nrm * applyfun(Ctil, unit, fun=fun, order=order)
-
-        w0, g = s * s0, s_inv * c
-        to_field = lambda w: s_inv * w  # u = D^{-1/2} w (boundary → 0)
-    else:  # consistent — matrix-free M-inner-product Lanczos on L = M⁻¹A: scalable AND differentiable
+    def _consistent_m_solve():
+        """A masked, Jacobi-preconditioned CG solve for ``M⁻¹·(mask·rhs)`` — used by the consistent-mass
+        paths (boundary → 0, since the masked rhs vanishes there). Reverse-mode differentiable."""
         from jax.scipy.sparse.linalg import cg as _cg
 
         from .linear import matrix_diagonal
 
         Mreg = lambda x: Mop @ x + (1.0 - mask) * x  # M + (1-mask)·I — SPD (boundary block is identity)
         jac = 1.0 / (matrix_diagonal(Mop) + (1.0 - mask))  # Jacobi preconditioner for the CG M-solve
+        return lambda rhs: _cg(Mreg, mask * rhs, tol=1e-10, maxiter=300, M=lambda z: jac * z)[0]
 
-        def m_solve(rhs):  # M⁻¹·rhs on the interior (boundary → 0, since the masked rhs is 0 there)
-            return _cg(Mreg, rhs, tol=1e-10, maxiter=300, M=lambda z: jac * z)[0]
+    if not symmetric:
+        # NON-symmetric A (advection–diffusion): L = M⁻¹A is not self-adjoint, so neither the symmetric
+        # similarity nor the M-inner Lanczos applies. Advance with exp(-dt·L) by **Arnoldi + a differentiable
+        # Padé** exponential (:func:`expmv`, GPU + reverse-mode diff). Forcing enters *exactly* through the
+        # augmented generator G = [[-L, g], [0, 0]]: exp(dt·G)·[u; 1] = [exp(-dtL)u + dt·φ₁(-dtL)g ; 1] — one
+        # exponential covers both the homogeneous decay and the φ₁ forcing, and ‖[u;1]‖ ≥ 1 never vanishes.
+        if mass == "lumped":
+            d_inv = jnp.where(mask > 0, 1.0 / jnp.where(mask > 0, d, 1.0), 0.0)  # 0 on the boundary
+            m_inv = lambda r: d_inv * r
+        else:
+            m_solve = _consistent_m_solve()
+            m_inv = m_solve
+        L_mv = lambda x: m_inv(Aop @ x)  # M⁻¹A x (interior; boundary held at 0 by m_inv)
+        g = m_inv(c)
+        w0, to_field = mask * s0, lambda u: u
 
-        L_mv = lambda x: m_solve(mask * (Aop @ x))  # M⁻¹A x (interior)
-        m_inner = lambda a, b: a @ (Mop @ b)  # ⟨a,b⟩_M — M already zeros the boundary
-        e0 = mask / jnp.sqrt(m_inner(mask, mask))  # a fixed M-unit interior vector
-        apply_f = lambda vec, fun: m_inner_funm(L_mv, m_inner, e0, vec, fun, order)
-        w0, g = mask * s0, m_solve(mask * c)  # integrate u directly (homogeneous boundary); forcing M⁻¹c
-        to_field = lambda u: u
+        def step(w, _t):
+            y0 = jnp.concatenate([w, jnp.ones((1,), dtype)])  # augment with the constant "1" row
 
-    def step(w, _t):
-        wn = apply_f(w, _exp)
-        if has_forcing:
-            wn = wn + dt * apply_f(g, _phi1)
-        return wn, wn
+            def gen(y):  # dt·G·[x; a] = dt·[-L x + a·g ; 0]
+                x, a = y[:n], y[n]
+                return dt * jnp.concatenate([-L_mv(x) + a * g, jnp.zeros((1,), dtype)])
+
+            wn = expmv(LinearOperator.from_matvec(gen, shape=(n + 1, n + 1)), y0, order=order)[:n]
+            return wn, wn
+    else:
+        if mass == "lumped":
+            # symmetric L̃ = D^{-1/2} A D^{-1/2}; integrate w = D^{1/2} u with the Euclidean Lanczos of applyfun
+            s = jnp.sqrt(d)
+            s_inv = jnp.where(mask > 0, 1.0 / jnp.where(mask > 0, s, 1.0), 0.0)  # 0 on the boundary
+            Ctil = LinearOperator.from_matvec(lambda w: s_inv * (Aop @ (s_inv * w)), shape=(n, n))
+            e0 = mask / jnp.linalg.norm(mask)
+
+            def apply_f(vec, fun):  # f(L̃)·vec, on the *normalised* vector (Lanczos divides by ‖·‖ → NaN at 0)
+                nrm = jnp.linalg.norm(vec)
+                unit = jnp.where(nrm > 1e-300, vec / jnp.where(nrm > 1e-300, nrm, 1.0), e0)
+                return nrm * applyfun(Ctil, unit, fun=fun, order=order)
+
+            w0, g = s * s0, s_inv * c
+            to_field = lambda w: s_inv * w  # u = D^{-1/2} w (boundary → 0)
+        else:  # consistent — matrix-free M-inner-product Lanczos on L = M⁻¹A: scalable AND differentiable
+            m_solve = _consistent_m_solve()
+            L_mv = lambda x: m_solve(Aop @ x)  # M⁻¹A x (interior)
+            m_inner = lambda a, b: a @ (Mop @ b)  # ⟨a,b⟩_M — M already zeros the boundary
+            e0 = mask / jnp.sqrt(m_inner(mask, mask))  # a fixed M-unit interior vector
+            apply_f = lambda vec, fun: m_inner_funm(L_mv, m_inner, e0, vec, fun, order)
+            w0, g = mask * s0, m_solve(c)  # integrate u directly (homogeneous boundary); forcing M⁻¹c
+            to_field = lambda u: u
+
+        def step(w, _t):
+            wn = apply_f(w, _exp)
+            if has_forcing:
+                wn = wn + dt * apply_f(g, _phi1)
+            return wn, wn
 
     _, ws = jax.lax.scan(step, w0, grid[1:])
     traj_u = jax.vmap(to_field)(jnp.concatenate([w0[None, :], ws], axis=0))  # each row → the full field u

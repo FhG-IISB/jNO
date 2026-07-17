@@ -98,6 +98,20 @@ def applyfun(A, v, *, fun, order: int = 30, symmetric: bool = True):
     return f(mv, jnp.asarray(v))
 
 
+def expmv(A, v, *, order: int = 30):
+    """``exp(A)·v`` for a possibly **non-symmetric** ``A``, via Arnoldi + a differentiable **Padé**
+    approximation of the small Hessenberg exponential. Unlike ``applyfun(..., symmetric=False)`` (Schur:
+    CPU-only, forward-only, any ``fun``) this is limited to the **exponential** but is **reverse-mode
+    differentiable and GPU-capable** — the engine of the non-symmetric exponential time integrator. Scale
+    ``A`` into its matvec to get ``exp(dt·A)·v``."""
+    _require_matfree()
+    from matfree import decomp, funm
+
+    mv, _n, _dtype = _operator(A)
+    f = funm.funm_arnoldi(funm.dense_funm_pade_exp(), decomp.hessenberg(order, reortho="full"))
+    return f(mv, jnp.asarray(v))
+
+
 def diagonal(A, *, fun=None, samples: int = 32, order: int = 25, key=None):
     """Differentiable stochastic estimate of the **diagonal** of ``A`` (Hutchinson), or of ``f(A)`` when
     ``fun`` is given (``A`` symmetric; ``f(A)·probe`` via Lanczos). Unlike :func:`trace` (a scalar) this

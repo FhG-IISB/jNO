@@ -468,14 +468,19 @@ def theta(theta: float = 1.0):
     return _ThetaScheme(theta)
 
 
-def exponential(*, order: int = 40, mass: str = "lumped"):
+def exponential(*, order: int = 40, mass: str = "lumped", symmetric: bool = True):
     """Matrix-**exponential** time scheme for ``fem.solve(time=...)`` — advances a *linear autonomous*
-    parabolic block ``M u̇ + A u = c`` by ``u(t+dt) = exp(-dt·M⁻¹A) u(t) (+ φ₁ forcing)``, computed
-    matrix-free by Lanczos (:func:`applyfun`, needs ``matfree``). **Exact in time and unconditionally
-    stable**, so it takes large stiff steps a θ-step cannot. ``order`` is the Krylov size. ``mass=
-    'lumped'`` (default) is the row-sum diagonal — cheapest, discrete maximum principle; ``mass=
-    'consistent'`` uses the full ``M`` (no lumping error) via a matrix-free M-inner-product Lanczos. Both
-    are matrix-free and differentiable. Time-varying coefficients / nonlinear → use :func:`theta`."""
+    parabolic block ``M u̇ + A u = c`` by ``u(t+dt) = exp(-dt·M⁻¹A) u(t) (+ φ₁ forcing)``, matrix-free.
+    **Exact in time and unconditionally stable**, so it takes large stiff steps a θ-step cannot. ``order``
+    is the Krylov size. ``mass='lumped'`` (default) is the row-sum diagonal — cheapest, discrete maximum
+    principle; ``mass='consistent'`` uses the full ``M`` (no lumping error) via a matrix-free
+    M-inner-product Lanczos.
+
+    ``symmetric=True`` (default, ``A = Aᵀ``) uses Lanczos. ``symmetric=False`` handles a **non-symmetric**
+    operator (**advection–diffusion / transport**): it advances by Arnoldi + a differentiable **Padé**
+    exponential, with forcing carried exactly through an augmented generator — still matrix-free, GPU, and
+    reverse-mode differentiable. All paths are differentiable; time-varying coefficients / nonlinear → use
+    :func:`theta`."""
     from .utils.solver.timeschemes import _ExponentialScheme
 
-    return _ExponentialScheme(order, mass)
+    return _ExponentialScheme(order, mass, symmetric)

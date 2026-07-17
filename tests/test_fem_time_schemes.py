@@ -41,6 +41,18 @@ def _heat(nsteps, T=0.03, h=0.11):
     return jno.fem([ui.t * vi + ui.x * vi.x + ui.y * vi.y, u(xb, yb) - 0.0, u(ci[0], ci[1]) - ic])
 
 
+def _advection_diffusion(nsteps, T=0.02, h=0.14, beta=6.0):
+    """Transient **advection–diffusion** — the convection term ``β·∂ₓu`` makes ``A`` non-symmetric."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=h, time=(0.0, T, nsteps))
+    u, v = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+    ic = jno.np.sin(PI * ci[0]) * jno.np.sin(PI * ci[1])
+    return jno.fem([ui.t * vi + beta * ui.x * vi + ui.x * vi.x + ui.y * vi.y, u(xb, yb) - 0.0, u(ci[0], ci[1]) - ic])
+
+
 def _final(fem, **kw):
     return np.asarray(fem.solve(**kw).fn())[-1]
 
@@ -125,6 +137,40 @@ def test_m_inner_product_lanczos_matches_dense_and_differentiates():
     g = float(jax.grad(loss)(1.0))
     fd = float((loss(1.0 + 1e-5) - loss(1.0 - 1e-5)) / 2e-5)
     assert abs(g - fd) / abs(fd) < 1e-3  # gradient flows through the matrix-free Lanczos
+
+
+@pytest.mark.skipif(not _HAS_MATFREE, reason="jno.solve.exponential needs the optional 'matfree' package")
+def test_exponential_nonsymmetric_advection_diffusion():
+    """``symmetric=False`` advances a **non-symmetric** advection–diffusion operator with an Arnoldi + Padé
+    exponential: exact in time (step-independent) and closer to the time-converged reference than backward
+    Euler. The symmetric path is *invalid* here (it assumes ``A = Aᵀ``), so it must be visibly worse."""
+    ns = jno.solve.exponential(symmetric=False, order=40)
+    e3 = _final(_advection_diffusion(3), time=ns)
+    e9 = _final(_advection_diffusion(9), time=ns)
+    assert np.linalg.norm(e3 - e9) / np.linalg.norm(e9) < 1e-5  # exact in time
+
+    ref = _final(_advection_diffusion(300))  # fine backward-Euler reference
+    exp_err = np.linalg.norm(_final(_advection_diffusion(4), time=ns) - ref) / np.linalg.norm(ref)
+    be_err = np.linalg.norm(_final(_advection_diffusion(4)) - ref) / np.linalg.norm(ref)
+    sym_err = np.linalg.norm(_final(_advection_diffusion(4), time=jno.solve.exponential(order=40)) - ref) / np.linalg.norm(
+        ref
+    )
+    assert exp_err < be_err  # exact-in-time beats backward Euler at coarse steps
+    assert sym_err > 3 * exp_err  # the symmetric path is wrong on a non-symmetric operator
+
+
+@pytest.mark.skipif(not _HAS_MATFREE, reason="jno.solve.exponential needs the optional 'matfree' package")
+def test_exponential_nonsymmetric_is_differentiable():
+    """A gradient flows through the non-symmetric (Arnoldi + Padé) exponential integrator — the whole point:
+    differentiable transport for inverse problems. ``∂/∂β`` of the final-state energy matches central FD."""
+    ns = jno.solve.exponential(symmetric=False, order=40)
+
+    def loss(beta):
+        return jnp.sum(jnp.asarray(_advection_diffusion(3, beta=beta).solve(time=ns).fn())[-1] ** 2)
+
+    g = float(jax.grad(loss)(6.0))
+    fd = (float(loss(6.0 + 1e-4)) - float(loss(6.0 - 1e-4))) / 2e-4
+    assert abs(g - fd) / abs(fd) < 1e-4
 
 
 def test_time_scheme_rejects_a_steady_problem():
