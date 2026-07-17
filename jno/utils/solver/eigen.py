@@ -35,12 +35,12 @@ def dense_geneigh(K, M, k: int, which: str = "smallest"):
     """
     Kd = _as_dense(K)
     Kd = 0.5 * (Kd + Kd.T)  # symmetrise away assembly roundoff
-    Md = _as_dense(M)
-    if Md is None:
+    if _as_dense(M) is None:
         lam, V = jnp.linalg.eigh(Kd)
     else:
-        Md = 0.5 * (Md + Md.T)
-        L = jnp.linalg.cholesky(Md)
+        from .mass import cholesky_spd
+
+        L = cholesky_spd(M)  # M = L Lᵀ (shared with the consistent-mass exponential integrator)
         C = solve_triangular(L, solve_triangular(L, Kd, lower=True).T, lower=True)  # L⁻¹ K L⁻ᵀ
         lam, Y = jnp.linalg.eigh(0.5 * (C + C.T))
         V = solve_triangular(L.T, Y, lower=False)  # x = L⁻ᵀ y  →  M-orthonormal

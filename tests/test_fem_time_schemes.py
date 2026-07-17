@@ -75,6 +75,20 @@ def test_exponential_beats_backward_euler():
     assert exp_err < 0.5 * be_err  # exact-in-time wins at coarse steps
 
 
+@pytest.mark.skipif(not _HAS_MATFREE, reason="jno.solve.exponential needs the optional 'matfree' package")
+def test_exponential_consistent_mass_is_more_accurate():
+    """``mass='consistent'`` (Cholesky-factored M, no lumping error) is closer to the time-converged
+    reference than ``mass='lumped'`` — and is still exact in time (step-independent)."""
+    ref = _final(_heat(400))
+    lump = np.linalg.norm(_final(_heat(4), time=jno.solve.exponential(mass="lumped")) - ref) / np.linalg.norm(ref)
+    cons = np.linalg.norm(_final(_heat(4), time=jno.solve.exponential(mass="consistent")) - ref) / np.linalg.norm(ref)
+    assert cons < lump  # consistent mass removes the lumping error
+
+    c4 = _final(_heat(4), time=jno.solve.exponential(mass="consistent"))
+    c8 = _final(_heat(8), time=jno.solve.exponential(mass="consistent"))
+    assert np.linalg.norm(c4 - c8) / np.linalg.norm(c8) < 1e-6  # still exact in time
+
+
 def test_time_scheme_rejects_a_steady_problem():
     """``time=`` selects a TIME integrator, so it is an error on a non-transient problem."""
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2)

@@ -446,8 +446,10 @@ def exponential(*, order: int = 40, mass: str = "lumped"):
     """Matrix-**exponential** time scheme for ``fem.solve(time=...)`` — advances a *linear autonomous*
     parabolic block ``M u̇ + A u = c`` by ``u(t+dt) = exp(-dt·M⁻¹A) u(t) (+ φ₁ forcing)``, computed
     matrix-free by Lanczos (:func:`applyfun`, needs ``matfree``). **Exact in time and unconditionally
-    stable**, so it takes large stiff steps a θ-step cannot. ``order`` is the Krylov size; ``mass``
-    is ``'lumped'`` (V1). Time-varying coefficients / nonlinear terms → use :func:`theta` instead."""
+    stable**, so it takes large stiff steps a θ-step cannot. ``order`` is the Krylov size. ``mass=
+    'lumped'`` (default) is the row-sum diagonal — matrix-free, differentiable, discrete maximum
+    principle; ``mass='consistent'`` factors the full ``M = L Lᵀ`` **once** for no lumping error (needs a
+    concrete operator; denser setup). Time-varying coefficients / nonlinear → use :func:`theta`."""
     from .utils.solver.timeschemes import _ExponentialScheme
 
     return _ExponentialScheme(order, mass)
