@@ -41,7 +41,8 @@ def _assemble(mesh_size, beta):
     ui, vi = u.bind(x=x, y=y, z=z), v.bind(x=x, y=y, z=z)
     cu, cv = u.vector.curl(x, y, z), v.vector.curl(x, y, z)
     term = inner(cu, cv) if beta == 0 else inner(cu, cv) + beta * inner(ui, vi)
-    A = np.asarray(jno.fem([term]).operator[0])  # small mesh → assembled dense
+    A_raw = jno.fem([term]).operator[0]  # RT/N1E/P0 assemble sparse: .operator[0] is a BCOO (not dense)
+    A = np.asarray(A_raw.todense() if hasattr(A_raw, "todense") else A_raw)
     return A, d._fem_nonnodal_topology
 
 
