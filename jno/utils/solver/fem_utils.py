@@ -995,8 +995,9 @@ def _eval_integrand(domain, node, local):
         if node.region not in mask_names or idx >= len(volume_vars):
             raise NotImplementedError(
                 f"jno.fem per-region integration: the per-cell mask for region '{node.region}' was not "
-                f"threaded into this assembly path. Sub-region terms are currently wired for the steady "
-                f"linear single-field path; nonlinear / transient / multifield / parametric are not yet."
+                f"threaded into this assembly path. Per-region terms ARE supported in steady, nonlinear, "
+                f"transient, multifield, parametric and 3D forms (see tests/test_fem_per_region.py); if you "
+                f"reach this on such a form, the mask wiring for that specific path is missing — please report it."
             )
         return jnp.reshape(jnp.asarray(volume_vars[idx]), (-1,))[0]
 
