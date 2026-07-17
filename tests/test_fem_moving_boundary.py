@@ -155,3 +155,50 @@ def test_velocity_wrong_shape_raises():
 def test_non_callable_velocity_raises():
     with pytest.raises(TypeError, match="callable"):
         _mini_transient().solve(move=jno.MovingBoundary(velocity=np.zeros((3, 2))))
+
+
+# ── state-dependent (physics-driven) velocity ────────────────────────────────
+def _heat_blob(mesh=0.12, t_end=0.2, nt=11, u0=1.0, insulated=True):
+    d = jno.Shape.rect(0, 0, 1, 1, size=mesh).domain(time=(0.0, t_end, nt))
+    u, phi = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xi0, yi0, _ = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    terms = [ui.t * vi + 0.05 * (ui.x * vi.x + ui.y * vi.y), u(xi0, yi0) - u0]  # insulated (natural) ⇒ u stays u0
+    return jno.fem(terms), d
+
+
+def test_state_dependent_velocity_receives_the_current_field():
+    """The 4-arg form velocity(t, x, state, domain) is handed the CURRENT nodal field on the CURRENT mesh
+    (the solution before this move) — the prerequisite for any physics-driven law."""
+    fem, _ = _heat_blob(t_end=0.2, nt=11)
+    seen = []
+
+    def vel(t, x, state, dom):
+        seen.append((np.asarray(state).copy(), int(np.asarray(dom.mesh.points).shape[0])))
+        return np.zeros_like(x)  # no motion → an ordinary transient march
+
+    traj = fem.solve(move=jno.MovingBoundary(velocity=vel, every=1))
+    assert len(seen) == len(traj) - 1  # velocity called once before each step
+    for k, (st, nv) in enumerate(seen):
+        assert st.shape[0] == nv  # state aligned with the (unchanged) mesh
+        assert np.allclose(st, np.asarray(traj.states[k]), atol=1e-8)  # it IS the field at that step
+
+
+def test_state_dependent_velocity_drives_motion():
+    """The payoff: a velocity that reads the current field off `state` and moves the boundary with it.
+    With a constant field u≡1 (insulated), the top rises at RATE·u = RATE, so its height reaches
+    1 + RATE·T exactly — the motion is genuinely driven by the state (double u ⇒ double the rate)."""
+    RATE, T_END = 0.5, 0.4
+    fem, _ = _heat_blob(mesh=0.1, t_end=T_END, nt=21, u0=1.0)
+
+    def vel(t, x, state, dom):
+        u_bdry = float(np.asarray(state).mean())  # ≈ 1 — the current field sets the rate (state-dependent)
+        v = np.zeros_like(x)
+        top = x[:, 1] > x[:, 1].max() - 1e-6
+        v[top, 1] = RATE * u_bdry
+        return v
+
+    traj = fem.solve(move=jno.MovingBoundary(velocity=vel, every=1))
+    top_final = np.asarray(traj.meshes[-1][0])[:, 1].max()
+    assert abs(top_final - (1.0 + RATE * T_END)) < 0.05, f"top reached {top_final:.3f}, expected {1.0 + RATE * T_END:.3f}"

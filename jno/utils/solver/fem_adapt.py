@@ -1204,11 +1204,24 @@ class MovingBoundary:
     Attributes
     ----------
     velocity
-        ``velocity(t, x) -> (n_boundary, dim)`` -- the boundary velocity at time ``t``, evaluated at the
-        **current boundary-vertex positions** ``x`` (a ``(n_boundary, dim)`` array; the mapping is
-        position-based, so the callback needs no vertex indices). **Return zero rows for the held (fixed)
-        part of the boundary** and the interface velocity for the moving surface -- the returned field
-        *is* the specification of which boundary moves.
+        The boundary velocity, in one of two forms (arity-detected):
+
+        - **prescribed** -- ``velocity(t, x) -> (n_boundary, dim)``: the velocity at time ``t`` evaluated
+          at the current boundary-vertex positions ``x`` (``(n_boundary, dim)``; position-based, so no
+          vertex indices needed);
+        - **state-dependent** (physics-driven) -- ``velocity(t, x, state, domain) -> (n_boundary, dim)``:
+          additionally receives the **current nodal field** ``state`` (the solution on the current mesh)
+          and the **current** ``domain``. Use this to read a functional of the solution and drive the
+          boundary with it -- e.g. a **Stefan** front ``v_n = -k/L · ∇T·n``. The boundary-functional
+          readout (``u.bind(x=xb, y=yb).freeze(state)`` then ``(Tf.x*nx + Tf.y*ny).eval()``; see
+          :class:`jno.trace.FrozenField`) expresses such a functional as traced math. Caveat: ``domain``
+          here carries the **transient time grid**, so evaluate a purely-spatial readout on a steady view
+          of the current mesh (or read ``∇field`` via nodal recovery); the standalone readout is
+          validated on a steady domain, and a transient-domain spatial ``.eval()`` is a follow-up.
+
+        In both forms, **return zero rows for the held (fixed) part of the boundary** and the interface
+        velocity for the moving surface -- the returned field *is* the specification of which boundary
+        moves.
     every
         Move + re-assemble every ``every`` steps (default 1 = every step, most accurate). Larger is
         cheaper (fewer re-assemblies) but lags the domain shape within a chunk.
@@ -1220,8 +1233,10 @@ class MovingBoundary:
       field whose material is (quasi-)stationary while the *boundary* moves (a melt/free surface with a
       quasi-static bulk); it does **not** add an ALE convective ``(c-w)·∇u`` term, so it is *not* the
       right discretization when a represented material velocity ``c`` differs from the mesh velocity
-      ``w`` (coupled flow -- that would double-count advection). State-dependent velocity (Stefan /
-      kinematic condition) is a later extension; ``velocity`` is prescribed for now.
+      ``w`` (coupled flow -- that would double-count advection). A **state-dependent** ``velocity`` (a
+      Stefan / kinematic law reading the current field) is supported via the 4-argument form above; the
+      velocity is still applied **explicitly** (evaluated from the state at the start of each move), not
+      solved implicitly with the interface position.
     - **Connectivity-preserving move only.** A move that would invert an element raises
       (:func:`move_mesh` ``check``); the remesh-on-tangle fallback (``remesh_with_mmg`` + transfer, for
       large deformation) is the next extension. Reduce ``dt`` / the motion, or await it.
@@ -1235,6 +1250,20 @@ class MovingBoundary:
 
     velocity: Any
     every: int = 1
+
+
+def _velocity_wants_state(vel: Any) -> bool:
+    """True if ``vel`` takes the state-dependent form ``velocity(t, x, state, domain)`` (>=4 positional
+    parameters) rather than the prescribed ``velocity(t, x)``. Falls back to prescribed if unintrospectable."""
+    import inspect
+
+    try:
+        params = [
+            p for p in inspect.signature(vel).parameters.values() if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+        ]
+        return len(params) >= 4
+    except (ValueError, TypeError):
+        return False
 
 
 def run_moving_boundary(
@@ -1291,6 +1320,7 @@ def run_moving_boundary(
     n_steps = len(ts) - 1
     every = max(1, int(spec.every))
     vel = spec.velocity
+    wants_state = _velocity_wants_state(vel)
 
     def _snapshot():
         return (np.asarray(d.mesh.points)[:, :dim].astype(np.float64), np.asarray(d.mesh.cells_dict[key]).astype(np.int64))
@@ -1309,7 +1339,12 @@ def run_moving_boundary(
         # 1) MOVE the boundary from shape(t0c) toward shape(t1c) by the prescribed velocity, hold the rest.
         bfacets = _boundary_edges_from_triangles(old_cells) if dim == 2 else _boundary_faces_from_tets(old_cells)
         bverts = np.unique(bfacets.reshape(-1))
-        vb = np.asarray(vel(t0c, old_pts[bverts]), dtype=np.float64)
+        # Prescribed velocity(t, x) or state-dependent velocity(t, x, state, domain) — the latter reads the
+        # CURRENT field on the CURRENT mesh (before this move), e.g. a Stefan v_n = -k/L·∇T·n.
+        if wants_state:
+            vb = np.asarray(vel(t0c, old_pts[bverts], np.asarray(state), d), dtype=np.float64)
+        else:
+            vb = np.asarray(vel(t0c, old_pts[bverts]), dtype=np.float64)
         if vb.shape != (bverts.shape[0], dim):
             raise ValueError(
                 f"MovingBoundary.velocity must return (n_boundary, dim) = ({bverts.shape[0]}, {dim}); got {vb.shape}."
