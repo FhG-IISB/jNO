@@ -29,12 +29,35 @@ import jax.numpy as jnp
 from .utils.solver.solver_api import (  # noqa: F401  (PrecondContext re-exported for user specs)
     PrecondApplier,
     PrecondContext,
+    materialize_precond,
 )
 
-__all__ = ["PrecondContext", "jacobi", "chebyshev", "form", "inner", "block_diag", "triangular", "amg"]
+__all__ = [
+    "PrecondContext",
+    "jacobi",
+    "chebyshev",
+    "form",
+    "inner",
+    "block_diag",
+    "triangular",
+    "amg",
+    "jaxamg",
+    "cached",
+    "ams",
+]
 
 
-class _Jacobi:
+class _Spec:
+    """Base for ``jno.precond.*`` specs — gives every preconditioner a fluent ``.cached()``."""
+
+    def cached(self, *, refresh: bool = False):
+        """Wrap this preconditioner so its setup is built **once** and reused across solves — the
+        fluent form of :func:`cached`. E.g. ``jno.precond.amg().cached()``. ``refresh`` controls
+        invalidation (``False`` frozen, ``True`` on shape/sparsity change, or a ``ctx -> key`` callable)."""
+        return _Cached(self, refresh)
+
+
+class _Jacobi(_Spec):
     """Spec for the diagonal (Jacobi) preconditioner; see :func:`jacobi`."""
 
     def materialize(self, ctx: PrecondContext):
@@ -47,7 +70,7 @@ class _Jacobi:
         return "jno.precond.jacobi()"
 
 
-class _Chebyshev:
+class _Chebyshev(_Spec):
     """Spec for the fixed-degree Chebyshev polynomial preconditioner; see :func:`chebyshev`."""
 
     def __init__(self, degree, lmin, lmax, lmin_ratio, safety, bound_iters):
@@ -93,7 +116,7 @@ def jacobi() -> _Jacobi:
     return _Jacobi()
 
 
-class _Form:
+class _Form(_Spec):
     """Spec assembling an auxiliary weak form as the preconditioner operator; see :func:`form`."""
 
     def __init__(self, terms, inner_solver, quad_degree):
@@ -153,7 +176,7 @@ def form(terms, *, inner=None, quad_degree: int = 2) -> _Form:
     return _Form(terms, inner, quad_degree)
 
 
-class _InnerSolve:
+class _InnerSolve(_Spec):
     """Spec using a configured linear solver as the ``M^{-1}`` application; see :func:`inner`."""
 
     def __init__(self, solver):
@@ -218,7 +241,7 @@ def _prepare_pairs(pairs, fem):
             prep(fem)
 
 
-class _BlockDiag:
+class _BlockDiag(_Spec):
     def __init__(self, pairs):
         self.pairs = pairs
 
@@ -246,7 +269,7 @@ class _BlockDiag:
         return f"jno.precond.block_diag(<{len(self.pairs)} blocks>)"
 
 
-class _Triangular:
+class _Triangular(_Spec):
     def __init__(self, pairs):
         self.pairs = pairs
 
@@ -319,7 +342,7 @@ def triangular(*pairs) -> _Triangular:
     return _Triangular(list(pairs))
 
 
-class _AMG:
+class _AMG(_Spec):
     """Spec for the hybrid (pyamg-setup / pure-JAX-apply) AMG preconditioner; see :func:`amg`."""
 
     def __init__(self, cycles, max_levels, coarse_size, smoother_degree):
@@ -348,13 +371,18 @@ class _AMG:
         return self
 
     def materialize(self, ctx: PrecondContext):
-        from .utils.solver.amg import vcycle_apply
+        from .utils.solver.amg import build_hierarchy, vcycle_apply
 
-        if self._levels is None:
+        levels = self._levels  # persisted ONLY by an explicit eager .build(); None → rebuilt THIS solve
+        if levels is None:
             A = ctx.A.bcoo if ctx.A.bcoo is not None else ctx.A.dense()
-            self.build(A)  # raises with .build() guidance when A is traced
-        levels, cycles = self._levels, self.cycles
-        A_op = ctx.A
+            # Rebuild each solve (NOT persisted): the hierarchy depends on the operator *values*, so
+            # silently reusing a stale one across solves would quietly cost iterations. Wrap in
+            # ``.cached()`` (or call ``.build()`` eagerly) to reuse it explicitly. Raises on a tracer.
+            levels = build_hierarchy(
+                A, max_levels=self.max_levels, coarse_size=self.coarse_size, smoother_degree=self.smoother_degree
+            )
+        cycles, A_op = self.cycles, ctx.A
 
         def apply(r):
             x = vcycle_apply(levels, r)
@@ -374,21 +402,372 @@ def amg(*, cycles: int = 1, max_levels: int = 10, coarse_size: int = 100, smooth
     a pure-JAX V-cycle with Chebyshev polynomial smoothing (Adams et al., JCP 188, 2003) — see
     :mod:`jno.utils.solver.amg`.
 
-    The setup runs **once on the host** (eagerly) and freezes fixed-pattern level operators; the
-    per-application V-cycle is then ``jit``/``vmap``-native and a fixed *linear* map, so it may
-    precondition ``cg``/``minres`` as well as ``bicgstab``/``fgmres``. The mesh-independent
-    convergence of multigrid makes this *the* preconditioner for large elliptic blocks — heat,
-    diffusion, elasticity, the (Picard-lagged) velocity block of a saddle system inside
-    :func:`triangular`.
+    The host-side setup builds fixed-pattern level operators; the per-application V-cycle is then
+    ``jit``/``vmap``-native and a fixed *linear* map, so it may precondition ``cg``/``minres`` as
+    well as ``bicgstab``/``fgmres``. The mesh-independent convergence of multigrid makes this *the*
+    preconditioner for large elliptic blocks — heat, diffusion, elasticity, the (Picard-lagged)
+    velocity block of a saddle system inside :func:`triangular`.
 
-    Inside traced contexts (jit, vmap, a parametric inverse solve) call ``spec.build(fem.A)``
-    once, eagerly, first; the frozen hierarchy is a legitimate preconditioner while operator
-    values change (speed degrades gracefully, correctness never). pyamg is imported lazily —
-    without it, a clear ``ImportError`` explains the install. On a matvec-only sub-block the
-    matrix is recovered via the (dense) block view — fine for moderate blocks; pass a pre-built
-    spec for very large ones.
+    **Caching is explicit.** The hierarchy is (re)built at each solve — it depends on the operator
+    *values*, so silently reusing a stale one would quietly cost iterations. To amortise the setup
+    over a sweep / Newton loop / inverse solve, say so: ``jno.precond.amg().cached()``. Inside a
+    **traced** context (jit, vmap, a parametric inverse) pyamg cannot run under the trace, so build
+    once eagerly first — ``spec.build(fem.A)`` — and the frozen hierarchy is reused (a legitimate
+    preconditioner while values drift: speed degrades gracefully, correctness never). pyamg is
+    imported lazily — without it a clear ``ImportError`` explains the install. On a matvec-only
+    sub-block the matrix is recovered via the (dense) block view.
     """
     return _AMG(cycles, max_levels, coarse_size, smoother_degree)
+
+
+def _fem_concrete_operator(fem):
+    """Concrete assembled operator of a linear/complex ``fem`` (real: the BCOO/dense matrix; complex:
+    ``A_r + i·A_i``), evaluated at the current parameters — for eager preconditioner setup (``.build``)."""
+
+    def _leg(o):  # a raw (A, b) or a parametric FemLinearSystem → its concrete matrix A
+        A, _ = o.evaluate(None) if hasattr(o, "evaluate") else o
+        return A
+
+    op = fem.operator
+    if getattr(fem, "_mode", None) == "complex":
+        from ._fem import _complex_operator
+
+        return _complex_operator(_leg(op[0]), _leg(op[1]))
+    if hasattr(op, "evaluate"):  # a bare parametric FemLinearSystem
+        return _leg(op)
+    return _leg(op[0]) if hasattr(op[0], "evaluate") else op[0]  # (A, b) or (FemLinearSystem, …)
+
+
+class _AMS(_Spec):
+    """Spec for the H(curl) auxiliary-space Maxwell (AMS) preconditioner; see :func:`ams`."""
+
+    complex_native = True  # solve the COMPLEX operator directly (not the real-equivalent 2n block)
+
+    def __init__(self, aux):
+        self.aux = aux  # jno.solve LinearSolver for the nodal auxiliary solves (None -> lu())
+        self._G = None  # discrete gradient (node->edge), built once from the mesh topology
+        self._Pis = None  # (Π_x, Π_y, Π_z) nodal->edge vector interpolation
+        self._frozen = None  # host-assembled auxiliary operators, set by .build() for traced solves
+
+    def prepare(self, fem):
+        """Eager setup at compose time (outside any trace): the mesh transfer operators G, Π, **and** —
+        whenever the operator is concrete here (the forward *and* native parametric-inverse solves) — the
+        frozen auxiliaries too, so an AMS-preconditioned solve is differentiable **automatically**, no
+        explicit ``.build`` required. If only a tracer is available at this point (a raw ``jit``/``vmap``
+        of ``fem.solve``, where there is no concrete operator to freeze from), freezing is deferred and
+        :meth:`build` is the escape hatch — :meth:`materialize` says so."""
+        self._transfer(fem.domain)
+        if self._frozen is None:
+            try:
+                self.build(fem)  # auto-freeze when the operator is concrete & complete here
+            except Exception:  # noqa: BLE001 — a tracer / a parameter-incomplete operator: fall through,
+                pass  # and materialize either assembles from the concrete ctx or asks for an explicit .build
+
+    def build(self, fem) -> "_AMS":
+        """Eager host setup from a **concrete** ``fem`` — required to use AMS inside a **traced** solve
+        (``jit`` / ``vmap`` / a **parametric-inverse** design loop), where the host scipy assembly of the
+        nodal auxiliaries cannot run under the trace. It freezes the auxiliary operators once (from the
+        operator at the current parameters); the frozen preconditioner stays valid while ``A(θ)`` drifts
+        (speed degrades gracefully, correctness never), so the solve — **and its gradient**, which flows
+        through the traced operator by implicit differentiation, not through the preconditioner — runs
+        differentiably. Returns ``self`` (chainable): ``fem.solve(precond=jno.precond.ams().build(fem))``."""
+        self._transfer(fem.domain)
+        from .utils.solver.solver_api import LinearOperator, PrecondContext
+
+        self._frozen = self._assemble_aux(PrecondContext(LinearOperator(_fem_concrete_operator(fem)), fem))
+        return self
+
+    def _transfer(self, domain):
+        from .utils.solver.ams import discrete_gradient, nodal_vector_interpolation
+
+        topo = domain._fem_nonnodal_topology
+        self._G = discrete_gradient(topo)
+        self._Pis = nodal_vector_interpolation(topo)
+
+    def _assemble_aux(self, ctx: PrecondContext) -> dict:
+        """Host (scipy) assembly of the nodal auxiliary operators from a **concrete** matrix — the part
+        that cannot run under a trace. Returns frozen jno ``LinearOperator``s; :meth:`materialize` builds
+        the (pure-JAX, differentiable) applier from these plus the smoother diagonal."""
+        import numpy as np
+        import scipy.sparse as sp
+        from jax.experimental import sparse as jsp
+
+        from .utils.solver.solver_api import LinearOperator
+
+        if self._G is None:
+            if ctx.fem is None:
+                raise TypeError(
+                    "jno.precond.ams needs the owning FEM to read the N1E edge topology — "
+                    "use it via fem.solve(precond=jno.precond.ams()), not on a bare operator."
+                )
+            self._transfer(ctx.fem.domain)
+
+        A = ctx.A.bcoo if ctx.A.bcoo is not None else ctx.A.dense()
+
+        def _csr(M):
+            # BCOO -> scipy CSR through its COO triplets: O(nnz), never densify. `.todense()` here would
+            # materialize the full edge x edge operator (~80 GB at 70k edges) before re-sparsifying.
+            # Duplicate indices sum, matching BCOO semantics; a traced operator's tracer .data raises under
+            # np.asarray and is caught below as "cannot host-assemble under a trace".
+            if hasattr(M, "indices") and hasattr(M, "data"):
+                idx = np.asarray(M.indices)
+                return sp.csr_matrix((np.asarray(M.data), (idx[:, 0], idx[:, 1])), shape=tuple(M.shape))
+            return sp.csr_matrix(np.asarray(M))
+
+        try:
+            A_sp = _csr(A)
+        except Exception as e:  # a traced operator (parametric/complex-inverse) can't be host-assembled
+            raise RuntimeError(
+                "jno.precond.ams assembles the nodal auxiliaries on the host from a concrete matrix, so it "
+                "cannot run under a trace (jit/vmap/parametric-inverse). Freeze it once from a CONCRETE "
+                "reference first — spec = jno.precond.ams().build(fem0), with fem0 the (non-parametric) fem "
+                "at your reference parameters — then reuse that spec; the frozen preconditioner then runs "
+                "and differentiates through (the gradient flows through the operator, not the preconditioner)."
+            ) from e
+        G_sp = _csr(self._G)
+        Pi_sp = [_csr(P) for P in self._Pis]
+
+        A_G = (G_sp.T @ A_sp @ G_sp).tocsr()  # gradient-space auxiliary operator GᵀAG
+        g_scale = float(np.abs(A_G.data).max()) if A_G.nnz else 0.0
+        if g_scale < 1e-12 * (float(np.abs(A_sp.data).max()) or 1.0):
+            raise ValueError(
+                "jno.precond.ams: the gradient auxiliary GᵀAG is ~0 — a pure curl-curl operator has no "
+                "coercivity on the gradient space. Add a mass term (σ/ε-gauge: jω·ε·⟨A,v⟩) so it is "
+                "non-singular; see the AMS docs."
+            )
+
+        def pin0(M):  # pin node 0 → remove the constant nodal mode so an exact aux solve is non-singular
+            L = M.tolil()
+            L[0, :] = 0.0
+            L[:, 0] = 0.0
+            L[0, 0] = 1.0
+            return L.tocsr()
+
+        def to_op(M):  # a pre-pinned scipy matrix -> jno LinearOperator over a BCOO
+            coo = M.tocoo()
+            idx = jnp.asarray(np.stack([coo.row, coo.col], axis=1))
+            return LinearOperator(jsp.BCOO((jnp.asarray(coo.data), idx), shape=coo.shape))
+
+        # G's constant null-space (G·1 = 0) is exact; each Π_α's constant mode is redundant with it
+        # (Π_α·1 = G·coordₐ is a gradient), so pinning node 0 in every auxiliary operator is correct.
+        if not np.iscomplexobj(A_sp.data):
+            return {
+                "complex": False,
+                "g_op": to_op(pin0(A_G)),
+                "p_ops": [to_op(pin0((P.T @ A_sp @ P).tocsr())) for P in Pi_sp],
+            }
+        # Complex eddy operator (νK + jωσM): AmgX-style multigrid aux solvers are real-only, so each complex
+        # auxiliary is reformulated as a REAL problem the aux solves *exactly* — gradient GᵀA_cG = jω·R
+        # (Re=0, GᵀKG=0) → -j·(Im A_G)⁻¹; solenoidal ΠᵀA_cΠ = S+jT → the real 2n block [[S,-T],[T,S]].
+        b_ops, nvs = [], []
+        for P in Pi_sp:
+            Ap = pin0((P.T @ A_sp @ P).tocsr())
+            b_ops.append(to_op(sp.bmat([[Ap.real, -Ap.imag], [Ap.imag, Ap.real]]).tocsr()))
+            nvs.append(Ap.shape[0])
+        return {"complex": True, "rg_op": to_op(pin0(sp.csr_matrix(A_G.imag))), "b_ops": b_ops, "nvs": nvs}
+
+    def materialize(self, ctx: PrecondContext):
+        from . import solve as _solve
+
+        aux = self.aux if self.aux is not None else _solve.lu()
+        f = self._frozen if self._frozen is not None else self._assemble_aux(ctx)  # frozen (built) or eager
+
+        G, Pis = self._G, self._Pis
+        GT, PisT = G.T, [P.T for P in Pis]
+        dinv = 1.0 / ctx.diag()  # Jacobi smoother — the traced diagonal carries A(θ) under a trace
+
+        if not f["complex"]:
+            g_op, p_ops = f["g_op"], f["p_ops"]
+
+            def apply(r):
+                x = dinv * r
+                x = x + G @ aux(g_op, (GT @ r).at[0].set(0.0))  # gradient-space correction
+                for P, PT, p_op in zip(Pis, PisT, p_ops):
+                    x = x + P @ aux(p_op, (PT @ r).at[0].set(0.0))  # solenoidal correction (per component)
+                return x
+        else:
+            rg_op, b_ops, nvs = f["rg_op"], f["b_ops"], f["nvs"]
+
+            def apply(r):
+                x = dinv * r
+                rg = (GT @ r).at[0].set(0.0)
+                x = x + G @ (-1j * (aux(rg_op, jnp.real(rg)) + 1j * aux(rg_op, jnp.imag(rg))))  # -j (Im A_G)⁻¹ rg
+                for P, PT, b_op, nv in zip(Pis, PisT, b_ops, nvs):
+                    rp = (PT @ r).at[0].set(0.0)
+                    s = aux(b_op, jnp.concatenate([jnp.real(rp), jnp.imag(rp)]))  # real 2n-block solve
+                    x = x + P @ (s[:nv] + 1j * s[nv:])
+                return x
+
+        return PrecondApplier(apply)
+
+    def __repr__(self):
+        return f"jno.precond.ams(aux={self.aux!r})"
+
+
+def ams(*, aux=None) -> _AMS:
+    """**AMS** — the auxiliary-space Maxwell preconditioner for H(curl) (Nédélec/N1E) curl-curl
+    systems (Hiptmair & Xu, *SIAM J. Numer. Anal.* 45(6):2483, 2007; Kolev & Vassilevski,
+    *J. Comput. Math.* 27(5):604, 2009).
+
+    Plain point/AMG smoothing cannot damp the huge **gradient near-null-space** of a curl-curl
+    operator (``curl∘grad = 0``), so its condition number leaks into the iteration count. AMS adds
+    two corrections on cheaper **nodal** auxiliary problems — one on the discrete-gradient space
+    ``G``, one on the vector-nodal space ``Π`` — restoring near mesh-independent convergence::
+
+        M⁻¹ r = D⁻¹ r  +  G (GᵀAG)⁻¹ Gᵀ r  +  Σ_α Π_α (Π_αᵀAΠ_α)⁻¹ Π_αᵀ r
+
+    ``G`` and ``Π`` come from the N1E edge topology (:mod:`jno.utils.solver.ams`); the auxiliary
+    operators are assembled once on the host from the concrete matrix and solved with ``aux`` —
+    **any** ``jno.solve`` solver (default :func:`jno.solve.lu`). Because the auxiliary problems are
+    ordinary **nodal Poisson-like** systems, an algebraic-multigrid ``aux`` makes the whole
+    preconditioner scalable at ``O(n)``. A GPU realisation is NVIDIA AmgX via ``jaxamg``: build each
+    auxiliary hierarchy **once per operator** (``jaxamg.with_cache(A, is_symmetric=True)``) and reuse
+    it across outer iterations — the AMS applier calls ``aux`` with the same operator each iteration,
+    so caching on the operator gives factor-once setup with a pure-JAX apply.
+
+    **Outer solver.** An *exact* ``aux`` (``lu``) is a fixed linear map, so it pairs with ``cg``; an
+    *inexact/iterative* ``aux`` (multigrid, an inexact ``cg``) is a **variable** preconditioner and
+    needs a **flexible** outer solver — :func:`jno.solve.fgmres` (real) — or ``cg`` stalls.
+
+    **Differentiable / traced solves.** The host aux-assembly cannot run under a trace. A **forward**
+    (concrete) solve freezes the auxiliaries automatically at compose time, so it is already
+    differentiable-ready — nothing to do. For a solve whose **operator itself is traced** — a ``jit`` /
+    ``vmap``, or a **parametric-inverse** design loop where ``A(θ)`` carries a ``jno.np.parameter`` —
+    freeze once from a **concrete reference** and reuse it::
+
+        spec = jno.precond.ams().build(fem0)          # fem0 = the fem at your reference parameters θ₀
+        node = fem_of(theta).solve(precond=spec)      # parametric solve; node is differentiable
+
+    The frozen preconditioner stays valid as ``A(θ)`` drifts (speed degrades, correctness never), and
+    ``∂/∂θ`` flows through the **operator** by implicit differentiation — never through the
+    preconditioner (a preconditioner cannot change the solution, so differentiating its setup would be
+    pure waste). You cannot auto-freeze from the parametric fem itself because ``θ₀`` is only resolved
+    at solve time; the one-line concrete reference is that choice made explicit.
+
+    The same spec handles the **real** curl-curl+mass and the **complex** eddy operator ``νK + jωσM``
+    — dtype follows the assembled matrix; pair it with :func:`jno.solve.gmres` (complex-correct) for
+    the eddy case. For a complex operator each auxiliary is reformulated so a **real-only** ``aux``
+    (AmgX/multigrid) still applies, *exactly*: the gradient block ``GᵀA_cG = jω·R`` is pure imaginary
+    (``GᵀKG = 0``) so ``A_G⁻¹ = -j·(Im A_G)⁻¹``; the Π block ``S + jT`` becomes the real 2n block
+    ``[[S,-T],[T,S]]`` (non-symmetric → the ``aux`` must be non-symmetric-capable, e.g. AMG with
+    ``is_symmetric=False``). Complex GMRES is not flexible, so solve the complex ``aux`` **tightly**
+    (near-exact) — a strong multigrid or ``lu``, not a single V-cycle.
+
+    Requirements & scope:
+
+    * The operator must be **coercive on the gradient space** — a bare curl-curl is singular there;
+      a mass term (conductivity, or the σ=0-in-air **ε-gauge** ``jω·ε·⟨A,v⟩``) is what makes
+      ``GᵀAG`` invertible. The spec raises if that term is missing.
+    * ``G``/``Π`` are built from the **full** edge topology, so this targets weak/penalty (PEC-style)
+      boundary terms; Dirichlet-**eliminated** DOFs would need row-masking — out of scope here.
+    """
+    return _AMS(aux)
+
+
+class _JaxAMG(_Spec):
+    """Spec for the GPU AMG preconditioner via jaxamg (NVIDIA AmgX); see :func:`jaxamg`."""
+
+    def __init__(self, config):
+        self.config = config
+
+    def materialize(self, ctx: PrecondContext):
+        from .solve import _require_jaxamg  # reuse the lazy import + install-requirements error
+
+        A = ctx.A.bcoo
+        if A is None:
+            raise ValueError(
+                "jno.precond.jaxamg needs an assembled (sparse) operator — it cannot build an AMG "
+                "hierarchy from a matrix-free operator."
+            )
+        jax_amg = _require_jaxamg()
+        cfg = dict(self.config) if self.config is not None else {"solver": "AMG"}
+        apply = jax_amg.make_preconditioner(A, config=cfg)  # build-once M⁻¹ apply (single AMG cycle)
+        return PrecondApplier(lambda v: apply(v))
+
+    def __repr__(self):
+        return "jno.precond.jaxamg()"
+
+
+def jaxamg(*, config: "dict | None" = None) -> _JaxAMG:
+    """GPU AMG **preconditioner** via jaxamg (NVIDIA AmgX wrapped as a JAX primitive) — the
+    on-device counterpart of :func:`amg`, and the natural smoother for large elliptic blocks or the
+    auxiliary nodal solves of an H(curl) AMS preconditioner on the GPU.
+
+    Builds the AMG hierarchy with ``jaxamg.make_preconditioner`` and applies a single cycle as
+    ``M⁻¹`` — a proper build-once/apply-many preconditioner (unlike ``jno.precond.inner(jno.solve.amg())``,
+    which re-solves each application). Wrap in ``.cached()`` to reuse the hierarchy across solves::
+
+        fem.solve(linear=jno.solve.fgmres(), precond=jno.precond.jaxamg().cached())
+
+    ``config`` is a full AmgX-format dict (default ``{"solver": "AMG"}``). Needs an **assembled**
+    operator. Optional dependency — jaxamg (AmgX 2.5+, CUDA 12+, mpi4py/mpi4jax) is imported lazily.
+
+    Reference: Liu, Fan & Wang, arXiv:2606.09001 (2026), wrapping NVIDIA AmgX (Naumov et al., 2015).
+    """
+    return _JaxAMG(config)
+
+
+_MISS = object()  # sentinel so the first materialize always builds
+
+
+class _Cached(_Spec):
+    """Spec that memoises another spec's setup across solves; see :func:`cached`."""
+
+    def __init__(self, spec, refresh):
+        self.spec = spec
+        self.refresh = refresh  # False → frozen | True → rebuild on sparsity change | callable ctx→key
+        self._applier = None
+        self._key = _MISS
+
+    def cached(self, *, refresh: bool = False):
+        return self  # already cached — .cached() is idempotent (no double-wrapping)
+
+    def prepare(self, fem):  # forward the eager (out-of-trace) build hook, if the inner spec has one
+        prep = getattr(self.spec, "prepare", None)
+        if callable(prep):
+            prep(fem)
+
+    def _key_of(self, ctx):
+        if self.refresh is False:
+            return "frozen"
+        if callable(self.refresh):
+            return self.refresh(ctx)
+        A = ctx.A  # refresh=True → key on the operator's shape + sparsity size
+        return (A.shape, int(A.bcoo.nse)) if A.bcoo is not None else (A.shape,)
+
+    def materialize(self, ctx: PrecondContext):
+        key = self._key_of(ctx)
+        if self._applier is None or key != self._key:
+            self._applier = materialize_precond(self.spec, ctx)  # build the wrapped preconditioner once
+            self._key = key
+        return self._applier  # same applier object (and its .T) reused on later solves
+
+    def __repr__(self):
+        return f"jno.precond.cached({self.spec!r}, refresh={self.refresh}, built={self._applier is not None})"
+
+
+def cached(spec, *, refresh: bool = False):
+    """Memoise any preconditioner's setup so it is built **once** and reused across solves — the
+    plug-and-play way to amortise an expensive setup (a multigrid hierarchy, an assembled auxiliary
+    operator, a jaxamg/AmgX coloring) over a frequency sweep, a Newton loop, or an inverse-problem
+    optimisation, *regardless of which backend does the work*.
+
+    Wraps any spec (``jacobi``, ``amg``, ``form``, a jaxamg-backed preconditioner, or a user
+    ``ctx -> M⁻¹`` callable). ``refresh=False`` (default) freezes the setup from the first solve and
+    reuses it forever — the standard frozen-preconditioner trade (a preconditioner only changes
+    convergence *speed*, never the solution, so reusing a slightly-stale setup is always correct and
+    usually cheap). ``refresh=True`` rebuilds when the operator's shape/sparsity changes (values may
+    still drift under the frozen setup); pass a callable ``ctx -> hashable`` for a custom invalidation
+    key. The wrapped spec's eager ``prepare(fem)`` hook (if any) is forwarded, so it composes with the
+    ``jit``/``vmap``/parametric-inverse build-eagerly requirement unchanged.
+
+    Reuse the SAME ``cached(...)`` object across the solves you want to share the setup::
+
+        M = jno.precond.cached(jno.precond.amg())          # backend-agnostic — pyamg or jaxamg alike
+        for f in freqs:
+            u = build_fem(f).solve(linear=jno.solve.fgmres(), precond=M)   # hierarchy built once
+    """
+    return _Cached(spec, refresh)
 
 
 def chebyshev(
