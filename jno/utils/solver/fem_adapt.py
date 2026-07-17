@@ -19,8 +19,9 @@ analysis", Int. J. Numer. Methods Eng. 24 (1987), 337-357 (recovery estimator).
 
 Public surface: ``FEM.solve(adapt=AdaptSpec(...))`` drives the loop; ``domain.refine``
 applies a hand-built size field.  The building blocks (``remesh_with_mmg``,
-``zz_error_indicators``, ``dorfler_mark``, ``size_field_from_marks``) are reusable on
-their own.
+``transfer_solution`` (mesh-to-mesh nodal-field interpolation — the keystone for carrying state
+across a remesh in a transient / moving-mesh loop), ``zz_error_indicators``, ``dorfler_mark``,
+``size_field_from_marks``) are reusable on their own.
 """
 
 from __future__ import annotations
@@ -285,6 +286,138 @@ def _domain_from_arrays(template: Any, points: np.ndarray, elems: np.ndarray, bf
 
 def _shallow_copy(domain: Any):
     return copy.copy(domain)
+
+
+# ---------------------------------------------------------------------------
+# Solution transfer -- piecewise-linear (barycentric) mesh-to-mesh interpolation
+# ---------------------------------------------------------------------------
+def _locate_barycentric(src_pts: np.ndarray, src_cells: np.ndarray, qpts: np.ndarray, *, tol: float, k: int):
+    """Locate each query point in a simplicial mesh and return its barycentric interpolation stencil.
+
+    Point location is a KD-tree candidate search over cell centroids (the containing cell is almost
+    always among the nearest centroids; raise ``k`` for strongly anisotropic meshes) followed by an
+    exact barycentric inside-test. Returns ``(idx, weights, inside)``: ``idx`` ``(Q, D+1)`` the chosen
+    simplex's source-vertex indices, ``weights`` ``(Q, D+1)`` its barycentric coordinates, ``inside``
+    ``(Q,)`` bool (``True`` = strictly contained; ``False`` = the point fell outside every candidate
+    and was projected onto the nearest simplex by clamping + renormalising the barycentric weights,
+    which keeps the result a bounded convex combination of that cell's vertices). Pure host/NumPy."""
+    from scipy.spatial import cKDTree
+
+    dim = src_pts.shape[1]
+    cell_verts = src_pts[src_cells]  # (C, D+1, D)
+    kk = int(min(max(k, 1), len(src_cells)))
+    _, cand = cKDTree(cell_verts.mean(axis=1)).query(qpts, k=kk)
+    cand = np.asarray(cand).reshape(len(qpts), kk)  # (Q, kk) candidate cell indices
+
+    V = cell_verts[cand]  # (Q, kk, nv, D)
+    v0 = V[:, :, 0, :]  # (Q, kk, D)
+    T = np.transpose(V[:, :, 1:, :] - v0[:, :, None, :], (0, 1, 3, 2))  # (Q, kk, D, D): columns v_i - v0
+    rhs = qpts[:, None, :] - v0  # (Q, kk, D)
+    detT = np.linalg.det(T)  # (Q, kk); ~0 marks a degenerate candidate
+    safe = np.abs(detT) > 1e-300
+    Tsafe = np.where(safe[..., None, None], T, np.eye(dim))  # avoid a singular batch member raising
+    lam_rest = np.linalg.solve(Tsafe, rhs[..., None])[..., 0]  # (Q, kk, D)
+    lam0 = 1.0 - lam_rest.sum(axis=-1)
+    lam = np.concatenate([lam0[..., None], lam_rest], axis=-1)  # (Q, kk, nv)
+
+    inside_cand = safe & np.all(lam >= -tol, axis=-1)  # (Q, kk)
+    any_inside = inside_cand.any(axis=1)
+    choice = np.where(any_inside, np.argmax(inside_cand, axis=1), np.argmax(lam.min(axis=-1), axis=1))
+    q = np.arange(len(qpts))
+    chosen, chosen_lam, inside = cand[q, choice], lam[q, choice], inside_cand[q, choice]
+
+    proj = np.clip(chosen_lam, 0.0, None)  # nearest-simplex projection for the outside points
+    proj = proj / np.clip(proj.sum(axis=1, keepdims=True), 1e-300, None)
+    weights = np.where(inside[:, None], chosen_lam, proj)
+    return src_cells[chosen].astype(np.int64), weights, inside
+
+
+def transfer_solution(
+    source_domain: Any, values: Any, target_domain: Any, *, fill: Any = "nearest", tol: float = 1e-9, k: int = 32
+):
+    r"""Transfer a nodal field from one simplicial mesh to another by piecewise-linear (barycentric)
+    interpolation -- the mesh-to-mesh **solution transfer** an adaptive / moving-mesh time loop needs
+    to carry state across a remesh (:func:`remesh_with_mmg`).
+
+    For each vertex :math:`x` of ``target_domain`` the containing simplex of ``source_domain`` is
+    located and the field evaluated from its barycentric coordinates
+    :math:`u_\text{new}(x) = \sum_i \lambda_i(x)\,\text{values}[c_i]`. This is **exact for a P1 field**
+    (and for any affine field, to machine precision); for a higher-order source it is the P1 (linear)
+    interpolant sampled at the target vertices -- first-order accurate, *not* the full basis.
+
+    Scope: 2-D triangle / 3-D tet meshes. ``values`` may be scalar ``(n_src,)``, vector ``(n_src, c)``,
+    or any ``(n_src, ...)`` -- stack several fields on the trailing axis to transfer them in one
+    location pass. The point location runs on the **host** (NumPy + a SciPy ``cKDTree`` over cell
+    centroids -- a structural step with no gradient); the interpolation **apply is pure JAX**, so
+    gradients flow through ``values`` (a field parameter carried across a remesh in an inverse loop
+    stays differentiable).
+
+    Parameters
+    ----------
+    source_domain, target_domain
+        Meshed 2-D/3-D ``jno`` domains (``.mesh.points`` + triangle/tetra ``cells_dict``).
+    values
+        Nodal field on ``source_domain``'s **vertices**: leading axis ``n_src == n_source_vertices``.
+    fill
+        How to treat target vertices that fall outside the source mesh (numerically, or genuinely
+        non-overlapping domains): ``"nearest"`` (default) projects onto the nearest source simplex;
+        ``"error"`` raises, naming the count; a float substitutes that constant there. A remesh of the
+        same domain preserves the boundary, so outside points are rare and ``"nearest"`` is safe;
+        ``"error"`` is the strict check for a genuinely mismatched target.
+    tol
+        Barycentric inside-tolerance (a point on a shared face/edge belongs to every incident cell,
+        which all agree on the value).
+    k
+        Candidate cells tested per query point (nearest centroids). Raise for strongly anisotropic
+        meshes where the containing cell's centroid may not be among the ``k`` nearest.
+
+    Returns
+    -------
+    The field on ``target_domain``'s vertices, shape ``(n_target_vertices, ...)`` and the dtype of
+    ``values`` (complex is preserved).
+
+    Notes
+    -----
+    A shape/nodes mismatch (``values`` not aligned with the source vertices) or a dimension mismatch
+    raises rather than silently mis-transferring. Reference: barycentric interpolation over a
+    simplicial complex; KD-tree candidate location is the standard scattered-mesh interpolation route.
+    """
+    import jax.numpy as jnp
+
+    dim = int(source_domain.dimension)
+    if dim not in (2, 3):
+        raise NotImplementedError(f"transfer_solution supports 2D/3D simplicial meshes; got dimension {dim}.")
+    if int(target_domain.dimension) != dim:
+        raise ValueError(f"source ({dim}D) and target ({int(target_domain.dimension)}D) mesh dimensions differ.")
+    if fill not in ("nearest", "error") and not isinstance(fill, (int, float)):
+        raise ValueError(f"fill must be 'nearest', 'error', or a numeric constant; got {fill!r}.")
+
+    key = "triangle" if dim == 2 else "tetra"
+    src_pts = np.asarray(source_domain.mesh.points)[:, :dim].astype(np.float64)
+    src_cells = np.asarray(source_domain.mesh.cells_dict[key]).astype(np.int64)
+    qpts = np.asarray(target_domain.mesh.points)[:, :dim].astype(np.float64)
+
+    vals = jnp.asarray(values)
+    if vals.shape[0] != src_pts.shape[0]:
+        raise ValueError(
+            f"transfer_solution: values has {vals.shape[0]} rows but the source mesh has "
+            f"{src_pts.shape[0]} vertices — it takes a P1 (vertex) nodal field aligned with source_domain."
+        )
+
+    idx, weights, inside = _locate_barycentric(src_pts, src_cells, qpts, tol=tol, k=k)  # host
+    n_out = int((~inside).sum())
+    if n_out and fill == "error":
+        raise ValueError(
+            f"transfer_solution: {n_out}/{len(qpts)} target vertices fall outside the source mesh. "
+            "Pass fill='nearest' to project them onto the nearest source simplex, or fill=<float>."
+        )
+
+    rdtype = vals.real.dtype  # keep float32 float32 / complex complex; barycentric weights are real
+    out = jnp.einsum("qk,qk...->q...", jnp.asarray(weights, dtype=rdtype), vals[jnp.asarray(idx)])
+    if isinstance(fill, (int, float)) and n_out:
+        keep = jnp.asarray(inside).reshape((-1,) + (1,) * (out.ndim - 1))
+        out = jnp.where(keep, out, jnp.asarray(fill, dtype=vals.dtype))
+    return out
 
 
 # ---------------------------------------------------------------------------
