@@ -602,7 +602,40 @@ class Placeholder:
                 "original solve back). Rebuild the `jno.fem([...])` on the new domain and solve that."
             )
         dom = domain if domain is not None else _infer_domain_from_constraints([self])
-        return jno.core([self], domain=dom).eval(self, domain=dom)
+        core_obj = jno.core([self], domain=dom)
+
+        # Fail loud: a frozen-field readout (u.bind(...).freeze(...)) is a SPATIAL functional. It is
+        # validated on a STEADY domain; on a TRANSIENT domain the normal tags are not time-replicated, so
+        # the eval's time-scan silently collapses them (returning a wrong constant). Refuse rather than
+        # hand back garbage (house rule: never fail silently).
+        def _has_frozen_field(node, seen=None):
+            seen = seen if seen is not None else set()
+            if node is None or id(node) in seen:
+                return False
+            seen.add(id(node))
+            if isinstance(node, FrozenField):
+                return True
+            for attr in ("target", "left", "right", "expr", "operation"):
+                child = getattr(node, attr, None)
+                if isinstance(child, Placeholder) and _has_frozen_field(child, seen):
+                    return True
+            for attr in ("args", "variables", "options"):
+                for child in getattr(node, attr, []) or []:
+                    if isinstance(child, Placeholder) and _has_frozen_field(child, seen):
+                        return True
+            return False
+
+        if _has_frozen_field(self):
+            _t = core_obj.domain_data.context.get("__time__")
+            if _t is not None and int(jnp.asarray(_t).reshape(-1, 1).shape[0]) > 1:
+                raise NotImplementedError(
+                    "Placeholder.eval(): a frozen-field readout is a spatial functional, but this domain is "
+                    "TRANSIENT (a time grid). The readout is validated on a steady domain; on a transient "
+                    "domain the normal tags are not time-replicated, so the eval would silently collapse them "
+                    "to a wrong constant. Evaluate it on a steady view of the mesh, or read the gradient via "
+                    "jno.utils.solver.fem_adapt._recover_nodal_gradient(domain, field)."
+                )
+        return core_obj.eval(self, domain=dom)
 
     # ------------------------------------------------------------------
     # Native complex-dtype helpers (work on jnp.complex64/complex128)

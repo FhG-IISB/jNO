@@ -114,6 +114,19 @@ def test_frozen_gradient_readout_3d_affine_exact():
     assert np.max(np.abs(vn - vn_ana)) < 1e-6
 
 
+def test_frozen_readout_on_transient_domain_fails_loud():
+    """On a transient domain the normal tags are not time-replicated, so a spatial readout would silently
+    collapse to a wrong constant — the eval must refuse rather than return garbage (house rule 1)."""
+    d = jno.Shape.rect(0, 0, 1, 1, size=0.15).domain(time=(0.0, 0.3, 6))
+    u, _ = d.fem_symbols()
+    pts = np.asarray(d.mesh.points)[:, :2]
+    sol = 3.0 * pts[:, 0] - 2.0 * pts[:, 1]
+    x, y, t, nx, ny = d.variable("boundary", normals=True, split=True)
+    Tf = u.bind(x=x, y=y).freeze(sol)
+    with pytest.raises(NotImplementedError, match="transient|time"):
+        (Tf.x * nx + Tf.y * ny).eval()
+
+
 def test_frozen_readout_without_domain_fails_loud():
     """A frozen field that carries no mesh domain (never coordinate-bound) cannot be read out — it must
     raise a clear error, not return garbage."""

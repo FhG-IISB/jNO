@@ -860,8 +860,10 @@ class TraceEvaluator:
                 f"context (have {have}); evaluate it on the region it was bound to."
             )
         pts = jnp.asarray(pts)
-        while pts.ndim > 2 and pts.shape[0] == 1:
-            pts = jnp.squeeze(pts, axis=0)
+        # A transient domain time-batches a tag as (B, T, N, D); a frozen field is a spatial snapshot
+        # (time-independent), so collapse every leading axis down to the (N, D) spatial points.
+        while pts.ndim > 2:
+            pts = pts[0]
         if pts.ndim == 1:
             pts = pts[jnp.newaxis, :]
         return self._map_mesh_to_sampled(mesh_points, pts[:, :mesh_dim], values)
@@ -1273,6 +1275,12 @@ class TraceEvaluator:
         points = ctx.context[bound_var.tag]
         while hasattr(points, "ndim") and points.ndim > 2 and points.shape[0] == 1:
             points = jnp.squeeze(points, axis=0)
+        # The gradient of a FrozenField is a spatial functional; on a transient domain its target points
+        # are time-batched (B, T, N, D) — collapse the leading axes to the (N, D) spatial points so the
+        # mesh→points map is not entangled with the time scan (which silently collapses it to a constant).
+        if isinstance(target, FrozenField):
+            while hasattr(points, "ndim") and points.ndim > 2:
+                points = points[0]
         n_vars = len(variables)
         var_dims = [(i, vi.dim[0]) for i, vi in enumerate(variables)]
 
