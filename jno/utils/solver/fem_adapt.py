@@ -649,6 +649,171 @@ def _mean_edge_length(domain: Any) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Moving mesh -- ALE vertex motion + harmonic (Laplacian) mesh smoothing
+#
+# When the *boundary* of the domain moves (a free surface / melt front), the mesh must deform to
+# follow it.  The cheap, connectivity-preserving way is an ALE move: displace the vertices but keep
+# the topology, so a nodal field simply rides along on its (now-moved) vertices -- no re-interpolation
+# (:func:`transfer_solution`) is needed, unlike after a genuine :func:`remesh_with_mmg`.  The interior
+# vertices are moved by *harmonically extending* the prescribed boundary motion (solve ``∇²d = 0`` with
+# ``d`` fixed on ``∂Ω``), which keeps the elements well-shaped far longer than a naive rigid follow.
+# These are the free-boundary companions of ``transfer_solution``; the outer driver (large deformation)
+# combines a move with an occasional ``remesh_with_mmg`` + ``transfer_solution`` when the mesh distorts.
+# ---------------------------------------------------------------------------
+def _mesh_cells(domain: Any) -> tuple[np.ndarray, int]:
+    dim = int(domain.dimension)
+    return np.asarray(domain.mesh.cells_dict["triangle" if dim == 2 else "tetra"]).astype(np.int64), dim
+
+
+def _signed_simplex_measures(points: np.ndarray, cells: np.ndarray, dim: int) -> np.ndarray:
+    """Signed area (2D) / volume (3D) of every simplex; the *sign* flips iff a cell inverts (tangles)."""
+    v = np.asarray(points)[cells]  # (n_cells, dim+1, dim)
+    edge = v[:, 1:, :] - v[:, :1, :]  # (n_cells, dim, dim): rows v_i - v_0
+    return np.linalg.det(edge) / (2.0 if dim == 2 else 6.0)
+
+
+def _mesh_boundary_facets(domain: Any) -> tuple[np.ndarray, np.ndarray, int]:
+    """Return ``(cells, boundary_facets, dim)`` -- the interior simplices, their topological boundary
+    facets (edges in 2D / triangles in 3D), and the dimension."""
+    cells, dim = _mesh_cells(domain)
+    bfacets = _boundary_edges_from_triangles(cells) if dim == 2 else _boundary_faces_from_tets(cells)
+    return cells, bfacets, dim
+
+
+def _p1_stiffness(domain: Any):
+    """Assemble the P1 (linear-simplex) stiffness / discrete Laplacian ``K_ij = ∫_Ω ∇φ_i·∇φ_j``.
+
+    Returns a symmetric sparse ``(n_vert, n_vert)`` SciPy CSR matrix built from the constant per-element
+    barycentric gradients (:func:`_p1_element_gradients`).  This is the operator whose harmonic solve
+    (:func:`harmonic_extension`) propagates a boundary motion smoothly into the interior.
+    """
+    from scipy.sparse import coo_matrix
+
+    grad, measure, cells = _p1_element_gradients(domain)  # (n_cells, nv, dim), (n_cells,), (n_cells, nv)
+    nv = cells.shape[1]
+    ke = np.einsum("c,cad,cbd->cab", measure, grad, grad)  # (n_cells, nv, nv): measure * (∇φ_a·∇φ_b)
+    ii = np.broadcast_to(cells[:, :, None], (cells.shape[0], nv, nv)).reshape(-1)
+    jj = np.broadcast_to(cells[:, None, :], (cells.shape[0], nv, nv)).reshape(-1)
+    n = int(np.asarray(domain.mesh.points).shape[0])
+    return coo_matrix((ke.reshape(-1), (ii, jj)), shape=(n, n)).tocsr()
+
+
+def harmonic_extension(domain: Any, boundary_displacement: np.ndarray) -> np.ndarray:
+    r"""Harmonically extend a **boundary** displacement into the mesh interior (ALE mesh motion).
+
+    Solves the vector Laplace problem :math:`\nabla^2 d = 0` in the interior with :math:`d` fixed to
+    ``boundary_displacement`` on :math:`\partial\Omega` (one scalar solve per coordinate, sharing the
+    factorization).  This is the standard way to move an FE mesh when its boundary moves: interior nodes
+    follow the boundary *as smoothly as possible*, which keeps elements well-shaped far longer than
+    rigidly dragging them.  A boundary field that is already **affine** (:math:`d = A x + b` -- a uniform
+    expansion, translation, or shear) extends to exactly that affine field in the interior (an affine
+    field is harmonic), so those motions are reproduced to machine precision.
+
+    Parameters
+    ----------
+    domain
+        A meshed 2-D/3-D simplicial ``jno`` domain.
+    boundary_displacement
+        ``(n_vert, dim)`` array; **only its boundary-vertex rows are read** (as Dirichlet data).  Interior
+        rows are ignored and overwritten by the harmonic solve -- build a full-length array and set the
+        boundary rows to the desired boundary motion (e.g. an interface velocity times ``dt``).
+
+    Returns
+    -------
+    ``(n_vert, dim)`` full displacement (given boundary rows, harmonically-extended interior); pass it
+    straight to :func:`move_mesh`.  Host/NumPy + a SciPy sparse solve -- a structural mesh step, outside
+    the differentiable trace.
+
+    Reference: harmonic / Laplacian mesh motion, the simplest ALE mesh-update operator; e.g. Johnson &
+    Tezduyar, *Mesh update strategies in parallel FE computations of flows with moving boundaries*,
+    Comput. Methods Appl. Mech. Engrg. 119 (1994) 73-94 (§3).
+    """
+    from scipy.sparse.linalg import splu
+
+    cells, dim = _mesh_cells(domain)
+    pts = np.asarray(domain.mesh.points)[:, :dim]
+    n = pts.shape[0]
+    bd = np.asarray(boundary_displacement, dtype=np.float64)
+    if bd.shape != (n, dim):
+        raise ValueError(
+            f"harmonic_extension: boundary_displacement must be (n_vert, dim) = ({n}, {dim}); got {bd.shape}. "
+            "Build a full-length array and set its boundary-vertex rows to the desired motion."
+        )
+
+    bfacets = _boundary_edges_from_triangles(cells) if dim == 2 else _boundary_faces_from_tets(cells)
+    bverts = np.unique(bfacets.reshape(-1))
+    is_b = np.zeros(n, dtype=bool)
+    is_b[bverts] = True
+    iverts = np.where(~is_b)[0]
+
+    disp = np.zeros((n, dim), dtype=np.float64)
+    disp[bverts] = bd[bverts]
+    if iverts.size:
+        k = _p1_stiffness(domain)
+        kii = k[iverts][:, iverts].tocsc()
+        kib = k[iverts][:, bverts]
+        rhs = -(kib @ bd[bverts])  # (n_i, dim): move the boundary term to the RHS
+        disp[iverts] = splu(kii).solve(np.asarray(rhs))  # one factorization, all `dim` columns at once
+    return disp
+
+
+def move_mesh(domain: Any, displacement: np.ndarray, *, copy: bool = True, check: bool = True) -> Any:
+    r"""Move the mesh vertices by a per-vertex ``displacement`` (an ALE mesh motion), **keeping the
+    connectivity**.  Returns the deformed domain (ready for ``jno.fem``); its boundary changes shape.
+
+    Because the topology is unchanged, a nodal solution field stays attached to its (now-moved) vertices
+    -- **no** :func:`transfer_solution` is needed, unlike after a :func:`remesh_with_mmg`.  Use this for
+    the *smooth* part of a free-boundary march; once the accumulated motion distorts the mesh too much
+    (``check`` trips, or element quality drops), ``remesh_with_mmg`` + ``transfer_solution`` instead.
+
+    Parameters
+    ----------
+    domain
+        A meshed 2-D/3-D simplicial ``jno`` domain.
+    displacement
+        ``(n_vert, dim)`` per-vertex displacement -- typically :func:`harmonic_extension` of a boundary
+        motion, so the interior follows smoothly.
+    copy
+        Return a moved copy (``True``, default) or mutate ``domain`` in place (``False``).
+    check
+        If ``True`` (default), raise if the motion **inverts or collapses** any element (a tangled mesh
+        would silently give a wrong solve -- house rule: fail loud).  Pass ``False`` only if you validate
+        element quality yourself.
+
+    Returns
+    -------
+    The deformed domain.
+
+    Scope / limitations (fail-loud, each a later extension):
+    - **Connectivity-preserving** only -- large boundary motion eventually tangles; the recovery is an
+      outer remesh + transfer, not this call.
+    - **Boundary sub-tags re-derive from the domain's spatial predicates on the moved coordinates.** A
+      predicate pinned to a fixed location (e.g. ``x == 1``) will *not* follow an edge that moved past it;
+      the moving surface should be tagged by a predicate that tracks it, or driven through the outer loop.
+    """
+    cells, bfacets, dim = _mesh_boundary_facets(domain)
+    pts = np.asarray(domain.mesh.points)[:, :dim].astype(np.float64)
+    disp = np.asarray(displacement, dtype=np.float64)
+    n = pts.shape[0]
+    if disp.shape != (n, dim):
+        raise ValueError(f"move_mesh: displacement must be (n_vert, dim) = ({n}, {dim}); got {disp.shape}.")
+    new_pts = pts + disp
+
+    if check:
+        old_m = _signed_simplex_measures(pts, cells, dim)
+        new_m = _signed_simplex_measures(new_pts, cells, dim)
+        floor = 1e-12 * float(np.median(np.abs(old_m)) or 1.0)
+        tangled = int(np.sum((np.sign(new_m) != np.sign(old_m)) | (np.abs(new_m) <= floor)))
+        if tangled:
+            raise ValueError(
+                f"move_mesh: the displacement inverts or collapses {tangled}/{cells.shape[0]} elements "
+                "(the mesh would tangle). Take a smaller step, harmonic_extension the boundary motion into "
+                "the interior, or remesh_with_mmg + transfer_solution instead of a connectivity-preserving move."
+            )
+    return _domain_from_arrays(domain, new_pts, cells, bfacets, copy=copy)
+
+
+# ---------------------------------------------------------------------------
 # Driver -- the outer adaptive loop
 # ---------------------------------------------------------------------------
 @dataclass
