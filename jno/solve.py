@@ -221,8 +221,9 @@ def _require_jaxamg():
     except ImportError as e:  # optional GPU dependency — see the message for the system requirements
         raise ImportError(
             "jno.solve.amg() needs the optional dependency `jaxamg` (NVIDIA AmgX wrapped as a JAX "
-            "primitive). It requires a prebuilt AmgX 2.5+, CUDA Toolkit 12+, JAX-with-CUDA, and an MPI "
-            "stack (mpi4py / mpi4jax). Install those into your environment, then retry."
+            "primitive). Install it with `pip install jax-neural-operators[amg]` (the `amg` extra); it "
+            "also requires a prebuilt AmgX 2.5+, CUDA Toolkit 12+, JAX-with-CUDA, and an MPI stack "
+            "(mpi4py / mpi4jax). Install those into your environment, then retry."
         ) from e
     return jaxamg
 
