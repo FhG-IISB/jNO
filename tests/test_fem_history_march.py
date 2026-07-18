@@ -311,6 +311,61 @@ def test_surface_qp_history_accumulates_over_the_march():
 
 
 # --------------------------------------------------------------------------------------------------
+# Oracle 4c — stick/slip Coulomb FRICTION as a return map on the friction cone (the J2 analogue), on a
+# surface slip state. Under a growing tangential drag the interface STICKS (traction rises elastically)
+# then SLIPS: the traction — and hence the shear it produces — CAPS at μ·p_n instead of running away with
+# the drag. That saturation is the defining friction feature and the accumulated slip is permanent. (The
+# tangential displacement is read as inner(x̂, u.bind(top)); a component-indexed bound view u.bind(top)[0]
+# isn't yet resolved inside a surface readout formula — a known follow-up.)
+# --------------------------------------------------------------------------------------------------
+def test_stick_slip_friction_caps_at_the_cone():
+    sym, grad, trace, inner, sqrt, maximum, identity = _aliases()
+    P0, MUF, k_t, D, N = 4.0, 0.3, 400.0, 0.06, 25  # normal pressure, friction coeff, tangential stiffness, drag, steps
+    Lz, G = 2.0, MU  # MU (module constant) is the elastic shear modulus; MUF is the friction coefficient
+    d = jno.Shape.box(0, 0, 0, 3, 3, Lz, size=0.9).domain(tau=(0.0, 1.0, N))
+    d.tag("bot", lambda x, y, z: z < 1e-6)
+    d.tag("top", lambda x, y, z: z > Lz - 1e-6)
+    co = d.variable("interior", split=True)
+    cb = d.variable("bot", split=True)
+    tp = d.variable("top", split=True)
+    xt, yt, zt, taut = tp[0], tp[1], tp[2], tp[-1]
+    X, I3 = [co[0], co[1], co[2]], identity(3)
+    u, phi = d.fem_symbols(value_shape=(3,))
+    slip, _ = d.fem_symbols(value_shape=())  # scalar tangential slip — a SURFACE state
+    eps = lambda w: sym(grad(w, X))
+    xhat = jno.np.asarray([1.0, 0.0, 0.0])
+    zhat = jno.np.asarray([0.0, 0.0, 1.0])
+    phit = phi.bind(x=xt, y=yt, z=zt)
+    sig = LAM * trace(eps(u)) * I3 + 2 * MU * eps(u)
+    d_tau = D * taut  # obstacle x-drag: monotonic 0 -> D
+    g = inner(xhat, u.bind(x=xt, y=yt, z=zt), 1) - d_tau  # tangential relative displacement
+    t_tr = k_t * (g - slip.i(-1))  # elastic trial tangential traction
+    mag = sqrt(t_tr * t_tr + 1e-30)
+    excess = maximum(mag - MUF * P0, 0.0)  # over the friction cone (radius μ·p_n)
+    t_ret = t_tr - excess * (t_tr / mag)  # returned traction, |t_ret| <= μ·p_n
+    fem = jno.fem(
+        [
+            inner(sig, eps(phi), 2),
+            P0 * inner(zhat, phit, 1),  # constant normal pressure
+            t_ret * inner(xhat, phit, 1),  # stick/slip friction traction (restores toward the obstacle)
+            slip.evolves(slip.i(-1) + excess / k_t * (t_tr / mag)),  # slip advances by the return
+            *[u(cb[0], cb[1], cb[2])[i] - 0.0 for i in range(3)],
+        ]
+    )
+    assert bool(fem._op.surface_history_specs)  # 'slip' is a surface state
+    traj = np.asarray(fem.solve(nonlinear=jno.solve.newton(max_steps=80, rtol=1e-9, atol=1e-11, line_search=True)))
+    pts = np.asarray(getattr(d, "_fem_native_dof_points", d.mesh.points))[:, :3]
+    top = np.where(pts[:, 2] > Lz - 1e-6)[0]
+    ux = traj.reshape(N, -1, 3)[:, top, 0].mean(1)
+    cap = MUF * P0 * Lz / G  # the shear a capped friction traction produces
+    # STICK -> SLIP: u_x rises then saturates near the cap instead of tracking the (much larger) drag.
+    assert ux[-1] > 0.5 * cap, "the contact never reached the slip (saturated) regime"
+    assert np.abs(ux).max() < 2.0 * cap, "friction traction did not cap at the cone (u_x ran away with the drag)"
+    # the last few steps barely move (slipping at the cap) — the tell of saturation, not elastic tracking
+    assert abs(ux[-1] - ux[-4]) < 0.15 * cap, "u_x still tracking the drag — did not saturate"
+
+
+# --------------------------------------------------------------------------------------------------
 # Oracle 5 — fail loud.
 # --------------------------------------------------------------------------------------------------
 def test_history_form_on_non_tau_domain_fails_loud():
