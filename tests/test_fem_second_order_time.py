@@ -301,6 +301,38 @@ def test_second_order_1d_wave_matches_analytic():
     assert rel < 0.01, f"1D wave does not track sin(πx)cos(πt): rel L2 = {rel:.4f}"
 
 
+def test_second_order_periodic_bloch_standing_wave():
+    """Periodic (Bloch / phononic) ties on a u_tt wave: the standing wave ``u=cos(2πx)cos(2πt)`` on a
+    domain periodic in x (``u(left)=u(right)``), natural in y. The augmented [u, v] block is reduced by
+    the field prolongation P duplicated on each block (``P_aug=blkdiag(P,P)``); the reduced trajectory,
+    prolonged back to the mesh, tracks the analytic periodic wave — phononic band structure in the time
+    domain, previously fail-loud."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.06, time=(0.0, 1.1, 70))
+    d.tag("left", lambda x, y: (x < 1e-6) & (y > 1e-6) & (y < 1 - 1e-6))  # open edges (corners excluded)
+    d.tag("right", lambda x, y: (x > 1 - 1e-6) & (y > 1e-6) & (y < 1 - 1e-6))
+    u, phi = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xl, yl, _ = d.variable("left", split=True)
+    xr, yr, _ = d.variable("right", split=True)
+    xi0, yi0, ti0 = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    ui0 = u.bind(x=xi0, y=yi0, t=ti0)
+    weak = ui.tt * vi + (ui.x * vi.x + ui.y * vi.y)
+    u0 = u(xi0, yi0) - jno.fn(lambda x, y: jnp.cos(2 * PI * x), [xi0, yi0])
+    fem = jno.fem([weak, u(xl, yl) - u(xr, yr), u0, ui0.t - 0.0])
+    assert fem.is_transient and fem._periodic is not None  # periodic reduction applied to the augmented block
+    blk = fem.operator
+    ts = np.asarray(_block_time_grid(blk))
+    blk.metadata["theta"] = 0.5
+    Yr = np.asarray(_default_transient_integrate(blk, {}, ts))  # reduced-DOF trajectory
+    Yf = np.asarray(jax.vmap(lambda y: blk.prolong(y))(jnp.asarray(Yr)))  # prolong to the full mesh
+    nf = Yf.shape[1] // 2
+    pts = np.asarray(fem.points)
+    exact = np.cos(2 * PI * pts[:, 0])[None, :] * np.cos(2 * PI * ts)[:, None]
+    rel = np.linalg.norm(Yf[:, :nf] - exact) / np.linalg.norm(exact)
+    assert rel < 0.03, f"periodic wave does not track cos(2πx)cos(2πt): rel L2 = {rel:.4f}"
+
+
 def _elastodynamics_fem(mesh_size=0.12, n_periods=4, n_steps=240, E=1.0, nu=0.25, rho=1.0):
     """Clamped elastic unit square, released from an initial x-displacement bump (at rest):
     ρ u_tt = ∇·σ(u),  σ = λ(∇·u)I + 2μ ε(u)  — vector (elastodynamics) second-order-in-time."""

@@ -2096,6 +2096,19 @@ def _reduce_transient_block_periodic(block: Any, periodic: dict) -> Any:
         restrict_state_periodic,
     )
 
+    # A second-order augmented block carries the state y=[u; v] — two copies of the field, so reduce by
+    # P on each (P_aug = blkdiag(P, P)). Duplicate the field's periodic blocks into a u-block and a
+    # v-block; every reduction below (M, A, operator_fn, forcing, state0) then acts on the 2N system.
+    if (getattr(block, "metadata", None) or {}).get("second_order"):
+        _b, _of, _or = _periodic_blocks(periodic)
+        _of, _or = np.asarray(_of), np.asarray(_or)
+        nf, nr = int(_of[-1]), int(_or[-1])
+        periodic = {
+            "blocks": list(_b) + list(_b),
+            "off_full": np.concatenate([_of[:-1], _of + nf]),
+            "off_red": np.concatenate([_or[:-1], _or + nr]),
+        }
+
     blocks, off_f, off_r = _periodic_blocks(periodic)
     n_full, n_red = int(off_f[-1]), int(off_r[-1])
     meta = dict(getattr(block, "metadata", None) or {})
@@ -2761,8 +2774,6 @@ def fem(
     # only the 2D/3D nodal-Lagrange route is intercepted here (a non-nodal / 1D u_tt has its own path).
     _second_order = any(_max_temporal_order(_bare(c)) >= 2 for c in constraints)
     if _second_order and getattr(domain, "dimension", None) != 1 and not (_trial_spaces(constraints) - {"Lagrange"}):
-        if periodic_ties:
-            raise NotImplementedError("jno.fem: periodic ties on a second-order-in-time problem are not supported yet.")
         if multifield:
             raise NotImplementedError(
                 "jno.fem: second-order-in-time (u_tt) is single-field only for now; write the coupled "
@@ -2788,6 +2799,14 @@ def fem(
             quad_degree=quad_degree,
         )
         _so._term_source = (domain, volume_terms)
+        if periodic_ties:
+            # Bloch / phononic in the time domain: reduce the augmented [u, v] block by the field
+            # prolongation P (duplicated per block inside _reduce_transient_block_periodic).
+            _cells = getattr(domain, "_fem_native_assembly_cells", None)
+            _eo = int(getattr(domain, "_fem_native_assembly_order", 1))
+            _periodic = _build_periodic_reduction(domain, periodic_ties, _so.points, _cells, _eo, vec or 1)
+            _so._op = reduce_op_periodic(_so._op, "transient", _periodic)
+            _so._periodic = _periodic
         return _so
 
     # ---- non-nodal element families (RT / Nedelec / Argyris): native push-forward assembler ----
