@@ -724,6 +724,21 @@ class Placeholder:
         _guard_ad_on_fd(self, scheme)
         return Hessian(self, [variable], scheme, trace=True)
 
+    def i(self, offset: int) -> "HistoryRef":
+        """Step-time **history index**: ``v.i(-1)`` is this variable one load-step back (``0`` = the
+        current step, ``-1`` the previous, ``-2`` two back, …; ``offset`` must be ``<= 0``).
+
+        Reading ``v.i(-n)`` in a form declares that the load-step driver must keep ``n`` past states of
+        ``v``; the keep-depth is *inferred* from the most-negative index the form uses (see
+        :func:`history_variables`), and the buffer rides the driver's ``lax.scan`` carry so the whole
+        history-dependent solve stays reverse-mode differentiable. Use it for path-dependent internal
+        variables (plastic strain ``ep.i(-1)``) or multistep time schemes (``u.i(-2)``).
+
+        The step axis ``i`` is orthogonal to the spatial axis — it is *not* a coordinate and may not be
+        passed to ``.bind()``.
+        """
+        return HistoryRef(self, offset)
+
     def laplacian(
         self,
         *variables: "Variable",
@@ -3134,6 +3149,10 @@ class FemResidualOperator:
         self.runtime_parameter_exprs = runtime_parameter_exprs or {}
         self.residual_basis = residual_basis or {}
         self.metadata = metadata or {}
+        # Step-history buffer layout {history_key: {name, depth, value_shape, shape}} for a load-step
+        # solve (``v.i(k)`` in the form); empty unless the assembler found HistoryRef nodes. The driver
+        # reads it to allocate the zeroed per-QP buffers and thread them on ``args["__history__"]``.
+        self.history_specs: dict = {}
 
     @property
     def is_parametric(self) -> bool:
@@ -3545,6 +3564,75 @@ def refreeze(frozen, values):
     clone.frozen_id = _next_op_id()  # new gather-table key ⇒ the compiler bakes THESE values
     clone.op_id = _next_op_id()
     return clone
+
+
+class HistoryRef(Placeholder):
+    """A traced variable indexed in STEP time — ``v.i(k)`` for ``k <= 0`` (0 = current step, -1 = the
+    previous step, …), produced by :meth:`Placeholder.i`.
+
+    Like a :class:`FrozenField` it is a KNOWN field within a load step — the driver hands in the buffered
+    value — so it stays invisible to the nonlinear unknown-detection: a residual that reads ``ep.i(-1)`` is
+    still linear in the live unknown ``u``, exactly like a frozen field. Unlike a frozen field its value is
+    UPDATED each step, and it lives at the quadrature points (not interpolated from nodes). It carries the
+    base variable's identity + shape so the assembler resolves it to the right per-quadrature-point history
+    buffer slot; a build keeps ``max|offset|`` past states per base variable (inferred, see
+    :func:`history_variables`)."""
+
+    def __init__(self, base, offset):
+        base = base._expr if hasattr(base, "_expr") else base  # unwrap a typed view
+        off = int(offset)
+        if off > 0:
+            raise ValueError(
+                f".i(k) is a PAST-state index: k must be <= 0 (0 = current step, -1 = previous); got {offset}."
+            )
+        self.target = base  # every trace walk reaches the base through _iter_placeholder_children
+        self.offset = off
+        self.name = f"{getattr(base, 'name', 'field')}.i({off})"
+        self.value_shape = tuple(getattr(base, "value_shape", ()))
+        self.order = int(getattr(base, "order", 1))
+        self.space = str(getattr(base, "space", "Lagrange"))
+        self.field_key = getattr(base, "field_key", None)
+        self.op_id = _next_op_id()
+
+    @property
+    def base(self):
+        return self.target
+
+    @property
+    def history_key(self):
+        """Buffer identity — shared across offsets of the same base variable, so ``v.i(-1)`` and
+        ``v.i(-2)`` index one buffer."""
+        return id(self.target)
+
+    def __repr__(self):
+        return f"HistoryRef({self.name})"
+
+
+def history_variables(terms):
+    """Scan trace ``terms`` (a term or list of terms) for :class:`HistoryRef` nodes and return
+    ``{history_key: (base, depth)}`` — ``depth`` is how many PAST states of that base variable the load-step
+    driver must buffer, i.e. the magnitude of the most-negative ``.i(k)`` the form uses. A form that only
+    reads ``.i(0)`` needs no buffer (depth 0, omitted). Same trace walk as :func:`frozen_fields_in`."""
+    if isinstance(terms, Placeholder):
+        terms = [terms]
+    found: dict = {}
+    seen: set = set()
+
+    def visit(node):
+        if not isinstance(node, Placeholder) or id(node) in seen:
+            return
+        seen.add(id(node))
+        if isinstance(node, HistoryRef) and node.offset < 0:
+            key = node.history_key
+            base, prev = found.get(key, (node.base, 0))
+            found[key] = (base, max(prev, -node.offset))
+        for kind, _attr, val in _iter_placeholder_children(node):
+            for c in val if kind == "list" else (val,):
+                visit(c)
+
+    for t in terms:
+        visit(t)
+    return found
 
 
 class TestFunction(Placeholder):

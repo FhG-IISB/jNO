@@ -573,6 +573,25 @@ def assemble_fem_native(
 
     _frozen_nodes = _collect_frozen_fields(list(volume_terms) + list(boundary_terms))
 
+    # Per-quadrature-point STEP HISTORY (``v.i(k)``): scan the terms for HistoryRef nodes and record, per
+    # base variable, how many past states to buffer (the most-negative offset). The buffer itself lives on
+    # the runtime ``args`` (so it UPDATES each load step without re-assembly and rides the driver's scan
+    # carry differentiably); here we only fix the layout so the driver can allocate and thread it. Buffer
+    # shape per variable: ``(n_cells, n_quad, depth, *value_shape)`` -- per Gauss point, exactly `depth`
+    # deep, so it is memory-minimal. Presence of any history forces the args-threading (parametric) path.
+    from ...trace import history_variables as _history_variables
+
+    _history_raw = _history_variables(list(volume_terms) + list(boundary_terms))  # {key: (base, depth)}
+    history_specs = {
+        key: {
+            "name": str(getattr(base, "name", "hist")),
+            "depth": int(depth),
+            "value_shape": tuple(getattr(base, "value_shape", ())),
+            "shape": (n_cells, int(qp_shared.shape[0]), int(depth)) + tuple(getattr(base, "value_shape", ())),
+        }
+        for key, (base, depth) in _history_raw.items()
+    }
+
     # A trainable DIRICHLET VALUE ``u(region) - net(x)`` (an unknown boundary profile). The net is not an
     # integrand coefficient -- it is evaluated at the boundary NODES to form the Dirichlet lift -- so it is
     # collected here from ``dirichlet_raw`` (a bare net node; the front-end already rejected compound values)
@@ -758,6 +777,12 @@ def assemble_fem_native(
             loc["neural_coefficients"] = _nt
         if _frozen_gathered:  # known-field (ui.freeze) per-cell nodal slices for this cell
             loc["frozen_fields"] = {fid: g[c] for fid, g in _frozen_gathered.items()}
+        if history_specs and args is not None:
+            # This cell's per-quad-point history slice (n_quad, depth, *shape), gathered from the buffers on
+            # ``args`` -- a plain per-cell index, so ``jacfwd`` treats it as a frozen constant.
+            hbuf = args.get("__history__") if isinstance(args, dict) else None
+            if hbuf:
+                loc["qp_history"] = {k: hbuf[k][c] for k in history_specs if k in hbuf}
         return _integrate_term(domain, coeff, loc, qw_shared * meas)
 
     def _surf_elem_res(fi, local_all, bcoeff, btfi, region, t=0.0, args=None):
@@ -1344,7 +1369,7 @@ def assemble_fem_native(
     # each call, kept differentiable in args -- the parameter flows as a JAX array through the kernel
     # coefficient into the per-cell assembly (no float() cast). The same re-assembly handles affine,
     # non-affine and (scalar) parameters uniformly. ----
-    if runtime_parameter_tags or neural_param_names or _dir_net_models:
+    if runtime_parameter_tags or neural_param_names or _dir_net_models or history_specs:
         from ...trace import FemLinearSystem
 
         if nonlinear:
@@ -1362,11 +1387,9 @@ def assemble_fem_native(
                 J = jacobian(jnp.asarray(u), 0.0, args)
                 return J if _d is None else bcoo_set_dirichlet_rows(J, _d)
 
-            return (
-                FemResidualOperator(res_p, jac_p, total, runtime_parameter_exprs=dict(_param_and_neural_exprs)),
-                "nonlinear",
-                offs,
-            )
+            _op = FemResidualOperator(res_p, jac_p, total, runtime_parameter_exprs=dict(_param_and_neural_exprs))
+            _op.history_specs = history_specs  # step-history buffer layout for the load-step driver
+            return (_op, "nonlinear", offs)
 
         def _assemble_at(args):
             A = jacobian(zeros, 0.0, args)
