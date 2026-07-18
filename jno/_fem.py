@@ -1331,7 +1331,7 @@ class FEM:
         # grid, threading τ as the load coordinate and the per-QP internal state on ``args["__history__"]``;
         # each step solves equilibrium then advances the states via their ``.evolves`` readout. Triggered
         # with NOTHING passed — exactly as ``u.t`` triggers the transient stepper. ----
-        if getattr(self._op, "history_specs", None):
+        if getattr(self._op, "history_specs", None) or getattr(self._op, "surface_history_specs", None):
             if not getattr(self.domain, "_is_pseudo_time", False):
                 raise ValueError(
                     "jno.fem: this form reads step history (`.i(k)`) but the domain has no pseudo-time load "

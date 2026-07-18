@@ -264,6 +264,53 @@ def test_bdf2_primary_unknown_history_marches_to_static():
 
 
 # --------------------------------------------------------------------------------------------------
+# Oracle 4b — SURFACE-quadrature-point history: a state read/evolved on a boundary term marches on the
+# face quadrature points (the enabler for stick/slip friction — slip is a surface state).
+# --------------------------------------------------------------------------------------------------
+def test_surface_qp_history_accumulates_over_the_march():
+    # A scalar state `acc` lives on the TOP face; it reads its past via `acc.i(-1)` in a boundary term and
+    # advances by `acc.evolves(acc.i(-1) + 1)` — so at step k it equals k, driving a downward surface
+    # traction of magnitude k. With a (nonlinear-but-never-yielding, i.e. elastic) bulk, the top deflects
+    # by ∝ k: the per-step peak grows linearly, proving read + evolve + roll all work on face QPs.
+    sym, grad, trace, inner, sqrt, maximum, identity = _aliases()
+    N = 6
+    d = jno.Shape.box(0, 0, 0, 3, 3, 2, size=0.9).domain(tau=(0.0, 1.0, N))
+    d.tag("bot", lambda x, y, z: z < 1e-6)
+    d.tag("top", lambda x, y, z: z > 2 - 1e-6)
+    co = d.variable("interior", split=True)
+    cb = d.variable("bot", split=True)
+    tp = d.variable("top", split=True)
+    xt, yt, zt = tp[0], tp[1], tp[2]
+    X, I3 = [co[0], co[1], co[2]], identity(3)
+    u, phi = d.fem_symbols(value_shape=(3,))
+    acc, _ = d.fem_symbols(value_shape=())  # a SCALAR surface state on 'top'
+    eps = lambda w: sym(grad(w, X))
+    dev = lambda A: A - trace(A) / 3 * I3
+    nrm = lambda A: sqrt(maximum(inner(A, A, 2), 0) + 1e-30)
+    ee = eps(u)  # nonlinear op via the return map, but SY huge => never yields (elastic response)
+    D = dev(ee)
+    dd = nrm(D)
+    dg = maximum(RT * 2 * MU * dd - 1e6, 0) / (3 * MU)
+    sig = K * trace(ee) * I3 + 2 * MU * D - 2 * MU * RT * dg * (D / dd)
+    phit = phi.bind(x=xt, y=yt, z=zt)
+    zhat = jno.np.asarray([0.0, 0.0, 1.0])
+    fem = jno.fem(
+        [
+            inner(sig, eps(phi), 2),
+            acc.i(-1) * inner(zhat, phit, 1),  # surface traction from the accumulated state
+            acc.evolves(acc.i(-1) + 1.0),  # the state advances on the face QPs
+            *[u(cb[0], cb[1], cb[2])[i] - 0.0 for i in range(3)],
+        ]
+    )
+    assert list(fem._op.surface_history_specs.values())  # 'acc' buffered on faces, not cells
+    assert not fem._op.history_specs  # nothing on cell QPs
+    peak = np.abs(np.asarray(fem.solve())).max(axis=1)
+    assert peak[0] < 1e-9  # step 0: acc.i(-1)=0 -> no load
+    ratios = peak[1:] / np.arange(1, N)
+    assert np.ptp(ratios) < 1e-3, f"surface state did not accumulate linearly: peak/k = {ratios}"
+
+
+# --------------------------------------------------------------------------------------------------
 # Oracle 5 — fail loud.
 # --------------------------------------------------------------------------------------------------
 def test_history_form_on_non_tau_domain_fails_loud():

@@ -35,15 +35,19 @@ def run_history_march(fem, solve_fn=None, **kwargs):
     domain = fem.domain
     specs: Dict[Any, Any] = op.history_specs
     readout = op.state_readout
+    surf_specs: Dict[Any, Any] = getattr(op, "surface_history_specs", {}) or {}
+    surf_readout = getattr(op, "surface_state_readout", None)
 
     n_dofs = int(op.size)
     tau_pts = np.asarray(getattr(domain, "_time_points", [0.0]), dtype=float)
     dtype = jnp.zeros(()).dtype  # x64-aware default float
     tau_grid = jnp.asarray(tau_pts, dtype=dtype)
 
-    # Virgin (zeroed) per-quadrature-point buffers, one per buffered state:
-    # (n_cell, n_quad, depth, *value_shape). Depth = the most-negative `.i(k)` the form uses.
+    # Virgin (zeroed) buffers per buffered state. VOLUME states live on cell quad points
+    # (n_cell, n_quad, depth, *shape); SURFACE states (e.g. a friction slip) on boundary FACE quad points
+    # (n_bfaces, n_quad_surf, depth, *shape). Depth = the most-negative `.i(k)` the form uses.
     buffers0 = {k: jnp.zeros(s["shape"], dtype=dtype) for k, s in specs.items()}
+    sbuffers0 = {k: jnp.zeros(s["shape"], dtype=dtype) for k, s in surf_specs.items()}
     u0 = jnp.zeros(n_dofs, dtype=dtype)
 
     def _newton(res, u_prev):
@@ -65,19 +69,23 @@ def run_history_march(fem, solve_fn=None, **kwargs):
         the per-step ``newton_krylov`` is ``custom_root`` and the readout/roll are pure JAX."""
 
         def step(carry, tau_k):
-            u_prev, buffers = carry
-            args = {"__history__": buffers, **param_args}
+            u_prev, buffers, sbuffers = carry
+            args = {"__history__": buffers, "__surface_history__": sbuffers, **param_args}
             # Equilibrium at this load level, previous state frozen on the buffers. τ enters the load
-            # through the residual's temporal coordinate; jacfwd sees the buffers as constants → the
-            # consistent tangent (return map with the previous state held).
+            # through the residual's temporal coordinate; jacfwd sees the buffers (volume AND surface) as
+            # constants → the consistent tangent (return map with the previous state held).
             u = _newton(lambda u: op.residual(u, args, tau_k), u_prev)
-            # Advance every buffered state: internal states via their `.evolves` formula, a primary-unknown
-            # history via the bare field interpolated to the quad points (both are `readout_formulas`).
+            # Advance every buffered state: volume states via their `.evolves` formula / a primary-unknown
+            # history; surface states (a friction slip) via the surface readout on the region's faces.
             new_states = readout(u, tau_k, args)
             new_buffers = {k: _roll(buffers[k], new_states[k]) for k in buffers}
-            return (u, new_buffers), u
+            new_sbuffers = sbuffers
+            if surf_readout is not None and sbuffers:
+                new_surf = surf_readout(u, tau_k, args)
+                new_sbuffers = {k: _roll(sbuffers[k], new_surf[k]) for k in sbuffers}
+            return (u, new_buffers, new_sbuffers), u
 
-        _final, traj = lax.scan(step, (u0, buffers0), tau_grid)
+        _final, traj = lax.scan(step, (u0, buffers0, sbuffers0), tau_grid)
         return traj  # (n_steps, n_dofs)
 
     # A runtime-parametric form (an inverse problem: a material/load parameter created with

@@ -587,8 +587,27 @@ def assemble_fem_native(
     # formulas are walked here too, so a ``state.i(-1)`` that appears ONLY inside an evolution formula
     # (not in the weak form) still allocates its buffer with the right depth.
     _evolution = dict(evolution or {})  # {history_key: StateUpdate}
-    _evo_formulas = [su.formula for su in _evolution.values()]
-    _history_raw = _history_variables(list(volume_terms) + list(boundary_terms) + _evo_formulas)  # {key: (base, depth)}
+    # WHERE each step-history state lives: a state read at ``.i(k)`` inside a BOUNDARY term buffers on that
+    # region's face quadrature points (a *surface* state — e.g. a friction slip on the contact face);
+    # otherwise it buffers on the cell quadrature points (a *volume* state — e.g. a plastic strain). Each
+    # state's evolution formula is walked together with the reads it belongs to. (Boundary terms were
+    # previously not scanned at all — ``list(boundary_terms)`` yielded the region keys, not the terms.)
+    _bterm_list = [t for terms in boundary_terms.values() for t in terms]
+    _surf_read_regions: Dict[Any, str] = {}  # history key -> the boundary region it is read on
+    for _R, _rterms in boundary_terms.items():
+        for _k in _history_variables(_rterms):
+            _surf_read_regions[_k] = _R
+    _surf_read_keys = set(_surf_read_regions)  # history keys read on ANY boundary
+    _vol_evo = [su.formula for k, su in _evolution.items() if k not in _surf_read_keys]
+    _surf_evo = [su.formula for k, su in _evolution.items() if k in _surf_read_keys]
+    _vol_history_raw = _history_variables(list(volume_terms) + _vol_evo)  # {key: (base, depth)}
+    _surf_history_raw = _history_variables(_bterm_list + _surf_evo)
+    _both = set(_vol_history_raw) & set(_surf_history_raw)
+    if _both:
+        raise ValueError(
+            "jno.fem: a step-history state is read at `.i(k)` on BOTH a volume and a boundary term; a "
+            "state lives on one quadrature set (cells or faces). Split it into separate states."
+        )
     history_specs = {
         key: {
             "name": str(getattr(base, "name", "hist")),
@@ -596,8 +615,11 @@ def assemble_fem_native(
             "value_shape": tuple(getattr(base, "value_shape", ())),
             "shape": (n_cells, int(qp_shared.shape[0]), int(depth)) + tuple(getattr(base, "value_shape", ())),
         }
-        for key, (base, depth) in _history_raw.items()
+        for key, (base, depth) in _vol_history_raw.items()
     }
+    # Surface-state buffer specs are allocated below, once the boundary facet tables (face count +
+    # per-face quadrature width) are built; kept here so the role/readout pass sees every state.
+    _history_raw = {**_vol_history_raw, **_surf_history_raw}
 
     # Per-history-key READOUT + role, for the load-step march. Every buffered state advances one of two
     # ways between steps: (1) a *primary unknown* read at ``.i(-1)`` (its base is one of the solved fields
@@ -692,6 +714,37 @@ def assemble_fem_native(
 
     conn = build_facet_connectivity(cells_p1, cell_key)
     normals_np = compute_face_normals(pts_p1, conn, cells_p1, cell_key) if conn.n_bfaces > 0 else np.zeros((0, dim))
+
+    # Surface step-history buffer layout (now that the facet tables give the per-face quadrature width). A
+    # state read at ``.i(k)`` on a boundary term (e.g. a friction slip on the contact face) lives on the
+    # boundary FACE quadrature points: shape ``(n_bfaces, n_quad_surf, depth, *value_shape)``, indexed by
+    # the global boundary-face id in ``_surf_elem_res`` (faces outside the term's region keep unused,
+    # zeroed slots -- cheap, and avoids per-region local re-indexing). Threaded on ``args`` under a key
+    # distinct from the volume history so the two never collide.
+    _n_quad_surf = int(face_tables_per_field[0][4].shape[0]) if face_tables_per_field[0] is not None else 0
+    surface_history_specs = {
+        key: {
+            "name": str(getattr(base, "name", "hist")),
+            "depth": int(depth),
+            "value_shape": tuple(getattr(base, "value_shape", ())),
+            "shape": (int(conn.n_bfaces), _n_quad_surf, int(depth)) + tuple(getattr(base, "value_shape", ())),
+            "surface": True,
+        }
+        for key, (base, depth) in _surf_history_raw.items()
+    }
+    # Boundary-face ids per region that carries a surface state (the faces its readout advances). Same
+    # all-nodes-in-region face mask the residual's ``surface_work`` uses; computed once here.
+    _surf_region_faces: Dict[str, np.ndarray] = {}
+    if surface_history_specs and conn.n_bfaces > 0:
+        for _R in set(_surf_read_regions.values()):
+            _rnodes = {int(n) for n in _region_node_ids(domain, _R)}
+            _mask = np.array(
+                [
+                    all(int(conn.face_nodes[fi, j]) in _rnodes for j in range(conn.face_nodes.shape[1]))
+                    for fi in range(conn.n_bfaces)
+                ]
+            )
+            _surf_region_faces[_R] = np.where(_mask)[0].astype(np.int32)
 
     # -------------------------------------------------------------------------
     # Cell-level field data builder (called inside vmap'd kernels)
@@ -874,6 +927,8 @@ def assemble_fem_native(
         local_all = u_flat[cell_all_dofs]  # (n_cell, n_local_all)
         out: Dict[Any, Any] = {}
         for key, formula in readout_formulas.items():
+            if key not in history_specs:  # VOLUME states only; surface states advance in surface_state_readout
+                continue
             out[key] = jax.vmap(lambda c, la, _f=formula: _vol_elem_readout(c, la, _f, t, args))(
                 jnp.arange(n_cells), local_all
             )
@@ -927,7 +982,90 @@ def assemble_fem_native(
             loc["neural_coefficients"] = _nt
         if _frozen_gathered:  # known-field (ui.freeze) per-cell nodal slices for the parent cell
             loc["frozen_fields"] = {fid: g[c] for fid, g in _frozen_gathered.items()}
+        if surface_history_specs and args is not None:
+            # This face's per-quad-point surface-history slice (n_quad_surf, depth, *shape), gathered from
+            # the buffers on ``args`` by the global boundary-face id -- a per-face constant, so ``jacfwd``
+            # treats it as frozen (the tangent is ``∂t_fric/∂u`` with the slip history held, exactly like
+            # the volume return map holds the plastic strain).
+            sbuf = args.get("__surface_history__") if isinstance(args, dict) else None
+            if sbuf:
+                loc["qp_history"] = {k: sbuf[k][fi] for k in surface_history_specs if k in sbuf}
         return _integrate_term(domain, bcoeff, loc, face_w * jac_f)
+
+    def _surf_elem_readout(fi, local_all, formula, region, t=0.0, args=None):
+        """Per-quad-point VALUE of a surface evolution formula on boundary face ``fi`` -> (n_q, *shape).
+
+        The surface analogue of :func:`_vol_elem_readout`: the same surface ``loc`` as ``_surf_elem_res``
+        (fields, outward normal, per-face surface history), but the formula carries no test function, so it
+        is *evaluated* (``_eval_integrand``), not integrated -- the advance for a surface state (a slip)."""
+        c = parent_j[fi]
+        k = lface_j[fi]
+        n_vec = normals_j[fi]
+        cell_sols = _split_cell_local(local_all)
+        verts = pts_j[cells_j[c]]
+        J = jnp.stack([verts[i + 1] - verts[0] for i in range(dim)], axis=1)
+        Kmat = jnp.linalg.inv(J)
+        per_f = []
+        for i in range(len(fields)):
+            fp_i, fd_i, _, _, _ = face_tables_per_field[i]
+            per_f.append(
+                {
+                    "shape_vals": fp_i[k],
+                    "shape_grads": jnp.einsum("qnd,dD->qnD", fd_i[k], Kmat),
+                    "cell_sol": cell_sols[i],
+                    "space": "Lagrange",
+                }
+            )
+        _, _, fp_qp, _fp_tangs, _fw = face_tables_per_field[0]
+        xq_f = verts[0] + fp_qp[k] @ J.T
+        loc = {
+            "physical_quad_points": xq_f,
+            "fields": per_f,
+            "field_index": field_index,
+            "tag": f"gauss_{region}",
+            "surface": True,
+            "domain_context": {**ctx, f"n_{region}": n_vec},
+            "temporal_tags": temporal_tags,
+            "runtime_parameter_tags": runtime_parameter_tags,
+            "region_mask_names": (),
+            "volume_vars": _runtime_vals(c, t, args, local_all.dtype),
+            "trial_value_shape": fields[0]["value_shape"],
+            "trial_vec": vecs[0],
+        }
+        if _field_param_names:
+            loc["shape_vals"] = per_f[_field_param_field_idx]["shape_vals"]
+        _nt = neural_local_table(_neural, args)
+        if _nt is not None:
+            loc["neural_coefficients"] = _nt
+        if _frozen_gathered:
+            loc["frozen_fields"] = {fid: g[c] for fid, g in _frozen_gathered.items()}
+        if surface_history_specs and args is not None:
+            sbuf = args.get("__surface_history__") if isinstance(args, dict) else None
+            if sbuf:
+                loc["qp_history"] = {kk: sbuf[kk][fi] for kk in surface_history_specs if kk in sbuf}
+        return _eval_integrand(domain, formula, loc)
+
+    def surface_state_readout(u_flat, t=0.0, args=None):
+        """Advance each SURFACE state one load step: evaluate its evolves formula on its region's faces.
+
+        Returns ``{key: (n_bfaces, n_quad_surf, *value_shape)}`` -- the region's faces filled, every other
+        boundary face zero (unused). The march rolls these into the surface depth buffers."""
+        out: Dict[Any, Any] = {}
+        for key, spec in surface_history_specs.items():
+            formula = readout_formulas.get(key)
+            region = _surf_read_regions[key]
+            faces = _surf_region_faces.get(region)
+            full = jnp.zeros(
+                (int(spec["shape"][0]), int(spec["shape"][1])) + tuple(spec["value_shape"]), dtype=u_flat.dtype
+            )
+            if formula is None or faces is None or len(faces) == 0:
+                out[key] = full
+                continue
+            fids = jnp.asarray(faces, dtype=jnp.int32)
+            lv = u_flat[cell_all_dofs[parent_j[fids]]]  # (n_face_R, n_local_all)
+            vals = jax.vmap(lambda fi, la, _f=formula, _r=region: _surf_elem_readout(fi, la, _f, _r, t, args))(fids, lv)
+            out[key] = full.at[fids].set(vals)
+        return out
 
     def _classify_one(coeff, where: str) -> List[Tuple[Any, int]]:
         """``[(coeff, test_field_idx), ...]`` for one lowered term. Normally one entry; a term that
@@ -1463,7 +1601,7 @@ def assemble_fem_native(
     # each call, kept differentiable in args -- the parameter flows as a JAX array through the kernel
     # coefficient into the per-cell assembly (no float() cast). The same re-assembly handles affine,
     # non-affine and (scalar) parameters uniformly. ----
-    if runtime_parameter_tags or neural_param_names or _dir_net_models or history_specs:
+    if runtime_parameter_tags or neural_param_names or _dir_net_models or history_specs or surface_history_specs:
         from ...trace import FemLinearSystem
 
         if nonlinear:
@@ -1485,9 +1623,11 @@ def assemble_fem_native(
                 return J if _d is None else bcoo_set_dirichlet_rows(J, _d)
 
             _op = FemResidualOperator(res_p, jac_p, total, runtime_parameter_exprs=dict(_param_and_neural_exprs))
-            _op.history_specs = history_specs  # step-history buffer layout for the load-step driver
+            _op.history_specs = history_specs  # VOLUME step-history buffer layout for the load-step driver
+            _op.surface_history_specs = surface_history_specs  # SURFACE (per-face) step-history layout
             _op.history_roles = history_roles  # {key: "primary" | "internal"} — how each state advances
-            _op.state_readout = state_readout  # (u, t, args) -> {key: next per-QP state}; the march driver
+            _op.state_readout = state_readout  # (u, t, args) -> {key: next per-QP VOLUME state}; march driver
+            _op.surface_state_readout = surface_state_readout  # (u, t, args) -> {key: next per-FACE state}
             return (_op, "nonlinear", offs)
 
         def _assemble_at(args):
