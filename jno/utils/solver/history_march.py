@@ -50,6 +50,21 @@ def run_history_march(fem, solve_fn=None, **kwargs):
     sbuffers0 = {k: jnp.zeros(s["shape"], dtype=dtype) for k, s in surf_specs.items()}
     u0 = jnp.zeros(n_dofs, dtype=dtype)
 
+    # Read-only per-load-step fields (``freeze_path``): one nodal frame per load step, scanned alongside
+    # ``tau_grid`` and delivered to the residual/readout on ``args["__loadpath__"]`` (like ``__history__``,
+    # but never rolled/advanced). Empty in the common case; validated to match the load-step count.
+    path_specs: Dict[Any, Any] = getattr(op, "path_specs", {}) or {}
+    path_frames: Dict[Any, Any] = {}
+    for _fid, _spec in path_specs.items():
+        _fr = jnp.asarray(_spec["frames"], dtype=dtype)
+        if int(_fr.shape[0]) != int(tau_grid.shape[0]):
+            raise ValueError(
+                f"jno.fem: load-path field {_spec.get('name', '?')!r} carries {int(_fr.shape[0])} frames "
+                f"but the tau= grid has {int(tau_grid.shape[0])} load steps — `freeze_path(frames)` needs "
+                "one nodal field per load step (frames.shape[0] must equal n in domain(tau=(start, end, n)))."
+            )
+        path_frames[_fid] = _fr
+
     def _newton(res, u_prev):
         if solve_fn is not None:
             return jnp.asarray(solve_fn(res, u_prev)).reshape(-1)
@@ -68,12 +83,13 @@ def run_history_march(fem, solve_fn=None, **kwargs):
         (empty for a non-parametric forward march). Reverse-mode differentiable w.r.t. those values —
         the per-step ``newton_krylov`` is ``custom_root`` and the readout/roll are pure JAX."""
 
-        def step(carry, tau_k):
+        def step(carry, xs):
+            tau_k, path_k = xs  # this step's τ and its per-load-step field slices ({fid: (n_nodes,)})
             u_prev, buffers, sbuffers = carry
-            args = {"__history__": buffers, "__surface_history__": sbuffers, **param_args}
+            args = {"__history__": buffers, "__surface_history__": sbuffers, "__loadpath__": path_k, **param_args}
             # Equilibrium at this load level, previous state frozen on the buffers. τ enters the load
-            # through the residual's temporal coordinate; jacfwd sees the buffers (volume AND surface) as
-            # constants → the consistent tangent (return map with the previous state held).
+            # through the residual's temporal coordinate (and the load-path field slices its frames); jacfwd
+            # sees the buffers (volume AND surface) and the path slice as constants → the consistent tangent.
             u = _newton(lambda u: op.residual(u, args, tau_k), u_prev)
             # Advance every buffered state: volume states via their `.evolves` formula / a primary-unknown
             # history; surface states (a friction slip) via the surface readout on the region's faces.
@@ -85,7 +101,7 @@ def run_history_march(fem, solve_fn=None, **kwargs):
                 new_sbuffers = {k: _roll(sbuffers[k], new_surf[k]) for k in sbuffers}
             return (u, new_buffers, new_sbuffers), u
 
-        _final, traj = lax.scan(step, (u0, buffers0, sbuffers0), tau_grid)
+        _final, traj = lax.scan(step, (u0, buffers0, sbuffers0), (tau_grid, path_frames))
         return traj  # (n_steps, n_dofs)
 
     # A runtime-parametric form (an inverse problem: a material/load parameter created with

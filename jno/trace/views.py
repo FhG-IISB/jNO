@@ -300,6 +300,39 @@ class ScalarView(_DelegatesToPlaceholder):
             return _coords_dispatch(ScalarView(frozen), (), dict(cv))
         return ScalarView(frozen)
 
+    def freeze_path(self, frames) -> "ScalarView":
+        """Like :meth:`freeze`, but the pinned nodal values vary **per load step** of a
+        ``domain(tau=...)`` march: ``frames`` has shape ``(n_load_steps, n_nodes)`` and at step ``k`` the
+        field presents ``frames[k]`` at the quadrature points (its ``.x`` / ``.y`` / ``.z`` gradients too).
+
+        This drives a load path with a **precomputed field history** — one nodal field per step, from a
+        prior solve or prescribed data — so the field history *is* the load (a one-way coupling)::
+
+            u, phi = d.fem_symbols(value_shape=(3,))
+            xi, yi, zi = d.variable("interior", split=True)[:3]
+            g = f.bind(x=xi, y=yi, z=zi).freeze_path(field_frames)  # (n_load_steps, n_nodes)
+            eigenstrain = beta * g * I3                             # a prescribed per-step eigenstrain
+            fem = jno.fem([inner(sigma(u, g), eps(phi), 2), ep.evolves(...), *bcs])
+            fem.solve()   # marches the tau= grid; step k sees field_frames[k]
+
+        ``frames``'s leading dimension must equal the number of ``tau=`` load steps. Scalar Lagrange
+        fields only. See :class:`jno.trace.LoadPathField`."""
+        from . import LoadPathField
+
+        cv = getattr(self, "_coord_vars", None)
+        domain = coord_tag = None
+        for _var in (cv or {}).values():
+            if getattr(_var, "axis", "spatial") == "temporal":
+                continue
+            if getattr(_var, "_domain", None) is not None:
+                domain, coord_tag = _var._domain, getattr(_var, "tag", None)
+                break
+        field = LoadPathField(self._expr, frames, domain=domain, coord_tag=coord_tag)
+        # Return the node itself (a scalar trace expression): a load-path field is consumed by its VALUE in
+        # the weak form (e.g. the thermal strain ``β·θ·I``), and the assembler interpolates it at the quad
+        # points via the FrozenField path. (Gradients ``.x/.y`` of a per-step field are not exposed.)
+        return field
+
     # -- scalar operations --
     def abs(self) -> "ScalarView":
         return ScalarView(FunctionCall(jnp.abs, [self._expr], "abs"))

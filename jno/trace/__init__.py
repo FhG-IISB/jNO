@@ -3476,6 +3476,42 @@ class FrozenField(Placeholder):
         return f"FrozenField(source_key={self.field_key}, ndof={self.values.shape[0]})"
 
 
+class LoadPathField(FrozenField):
+    """A frozen field whose nodal values vary **per load step** of a ``domain(tau=...)`` march — produced
+    by ``u.bind(...).freeze_path(frames)`` with ``frames`` of shape ``(n_load_steps, n_nodes)``.
+
+    At load step ``k`` it presents ``frames[k]`` at the quadrature points, exactly like a
+    :class:`FrozenField` presents a fixed field — it **is** a ``FrozenField`` (so it reuses the same
+    node→quadrature interpolation and stays invisible to unknown-detection), but its per-step nodal slice
+    is delivered by the load-step driver through ``args["__loadpath__"]`` rather than baked at compile
+    time. This is what lets a **precomputed field history** — one nodal field per load step, from a prior
+    solve or prescribed data — drive a load path (a one-way coupling: the field history *is* the load).
+    Requires a ``tau=`` march (fails loud on a plain domain, where no driver would supply the per-step
+    slice). Scalar Lagrange fields only.
+    """
+
+    def __init__(self, source, frames, domain=None, coord_tag=None):
+        frames = jnp.asarray(frames)
+        if frames.ndim != 2:
+            raise ValueError(
+                f"freeze_path expects `frames` of shape (n_load_steps, n_nodes); got {tuple(frames.shape)}. "
+                "Stack one nodal field per load step of the tau= grid."
+            )
+        # values[0] seeds the FrozenField shape data / identity; the driver overrides it per step.
+        super().__init__(source, frames[0], domain=domain, coord_tag=coord_tag)
+        self.path_frames = frames  # (n_load_steps, n_nodes) — the driver scans this leading axis
+        self.n_steps = int(frames.shape[0])
+        self.name = f"loadpath[{getattr(source, 'name', 'u')}]"
+
+    def __repr__(self):
+        return f"LoadPathField(source_key={self.field_key}, steps={self.n_steps}, nnode={self.values.shape[0]})"
+
+
+def load_path_fields_in(expr):
+    """The distinct :class:`LoadPathField` nodes in ``expr`` (by identity, first-seen order)."""
+    return [f for f in frozen_fields_in(expr) if isinstance(f, LoadPathField)]
+
+
 # ---------------------------------------------------------------------------
 # Trace substitution — rebuild an expression with some nodes swapped out
 # ---------------------------------------------------------------------------

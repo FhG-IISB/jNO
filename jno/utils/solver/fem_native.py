@@ -783,6 +783,14 @@ def assemble_fem_native(
         loc_seg.append(loc_seg[-1] + n_local_f[i] * vecs[i])
     cell_all_dofs = jnp.concatenate(cdofs, axis=1) if len(cdofs) > 1 else cdofs[0]  # (n_cell, n_local_all)
 
+    # A LOAD-PATH field (``freeze_path``) is a FrozenField whose nodal values vary per load step: split it
+    # out of the compile-time frozen gather, keep only its per-cell connectivity, and let the load-step
+    # driver deliver each step's nodal slice through ``args["__loadpath__"]`` (like ``__history__``).
+    from ...trace import LoadPathField as _LoadPathField
+
+    _path_nodes = {fid: n for fid, n in _frozen_nodes.items() if isinstance(n, _LoadPathField)}
+    _frozen_nodes = {fid: n for fid, n in _frozen_nodes.items() if not isinstance(n, _LoadPathField)}
+
     # Per-cell gather of each frozen field's nodal slice (n_cell, n_local, 1) -- a compile-time constant
     # (no args threading, no jacfwd tangent), gathered on the frozen field's own FE space via the same
     # connectivity as the live state, so its shape-gradient contraction matches the trial gradient.
@@ -794,6 +802,59 @@ def assemble_fem_native(
         _fconn = cells_f_j[_ffidx]  # (n_cell, n_local)
         _fvals = jnp.asarray(_fnode.values).reshape(-1)
         _frozen_gathered[_fid] = _fvals[_fconn].reshape(_fconn.shape[0], _fconn.shape[1], 1)
+
+    # Load-path fields are scalar P1 fields on the mesh vertices (a temperature history, say) that are not
+    # among the solved unknowns, so they have no assembled basis of their own. They borrow the nodal basis
+    # and vertex connectivity of a P1 Lagrange field already in the problem (both live on the same mesh
+    # vertices): we alias the load-path field's key to that P1 field's index so the kernel resolves its
+    # shape functions, and gather its per-cell nodal slice on the same connectivity. Values arrive per step
+    # from args; a spec (the full frame stack) rides the driver's scan.
+    _path_conn: Dict[Any, Any] = {}
+    path_specs: Dict[Any, Any] = {}
+    if _path_nodes:
+        _p1_idx = next(
+            (i for i, f in enumerate(fields) if int(f["order"]) == 1 and str(f.get("space", "Lagrange")) == "Lagrange"),
+            None,
+        )
+        if _p1_idx is None:
+            raise NotImplementedError(
+                "freeze_path(...): the load-path field is scalar P1 on the mesh vertices and borrows the "
+                "nodal basis of a P1 Lagrange field in the problem, but this form has none. Give the primary "
+                "unknown order=1 (P1)."
+            )
+        for _fid, _fnode in _path_nodes.items():
+            if _fnode.num_components != 1:
+                raise NotImplementedError("freeze_path(frames): only scalar load-path fields are supported.")
+            field_index[_fnode.field_key] = _p1_idx  # resolve the load-path field's basis to the P1 field
+            _path_conn[_fid] = cells_f_j[_p1_idx]  # scalar P1 vertex connectivity (n_cell, n_local)
+            path_specs[_fid] = {"name": _fnode.name, "frames": jnp.asarray(_fnode.path_frames), "n_steps": _fnode.n_steps}
+
+    if path_specs and not (_is_march and history_specs):
+        # A load-path field's per-step slice is delivered by the load-step driver; without a march (a
+        # `tau=` grid + step-history to drive it) it would never be supplied. Fail loud, name the fix.
+        raise ValueError(
+            "jno.fem: a `freeze_path(...)` load-path field requires a load-step march — build the domain "
+            "with `domain(tau=(start, end, n))` and include step-history (a `.i(-1)` state advanced by "
+            "`.evolves`, e.g. the plastic strain εₚ) so `fem.solve()` marches the load path and delivers "
+            "each step's field slice. On a plain/steady domain the per-step values are never threaded."
+        )
+
+    def _add_loadpath_fields(loc, c, args):
+        """Merge this load step's per-cell nodal slice for each load-path field into
+        ``loc['frozen_fields']`` — so the FrozenField kernel path interpolates it to the quad points.
+        The per-step nodal values come from the driver on ``args['__loadpath__']`` (like ``__history__``);
+        without them (e.g. a non-march assembly) the field is simply absent, and a build-time guard has
+        already required a march when a load-path field is present."""
+        if not _path_conn or not isinstance(args, dict):
+            return
+        pbuf = args.get("__loadpath__")
+        if not pbuf:
+            return
+        fz = dict(loc.get("frozen_fields", {}))
+        for _fid, _conn in _path_conn.items():
+            if _fid in pbuf:
+                fz[_fid] = jnp.asarray(pbuf[_fid]).reshape(-1)[_conn[c]].reshape(_conn.shape[1], 1)
+        loc["frozen_fields"] = fz
 
     def _split_cell_local(local_vals):
         """Split a cell's gathered all-field local vector into per-field ``(n_local_i, vec_i)``."""
@@ -877,6 +938,7 @@ def assemble_fem_native(
             hbuf = args.get("__history__") if isinstance(args, dict) else None
             if hbuf:
                 loc["qp_history"] = {k: hbuf[k][c] for k in history_specs if k in hbuf}
+        _add_loadpath_fields(loc, c, args)  # per-step load-path field slices -> loc["frozen_fields"]
         return _integrate_term(domain, coeff, loc, qw_shared * meas)
 
     def _vol_elem_readout(c, local_all, formula, t=0.0, args=None):
@@ -915,6 +977,7 @@ def assemble_fem_native(
             hbuf = args.get("__history__") if isinstance(args, dict) else None
             if hbuf:
                 loc["qp_history"] = {k: hbuf[k][c] for k in history_specs if k in hbuf}
+        _add_loadpath_fields(loc, c, args)  # per-step load-path field slices -> loc["frozen_fields"]
         return _eval_integrand(domain, formula, loc)
 
     def state_readout(u_flat, t=0.0, args=None):
@@ -1632,6 +1695,7 @@ def assemble_fem_native(
             _op.history_roles = history_roles  # {key: "primary" | "internal"} — how each state advances
             _op.state_readout = state_readout  # (u, t, args) -> {key: next per-QP VOLUME state}; march driver
             _op.surface_state_readout = surface_state_readout  # (u, t, args) -> {key: next per-FACE state}
+            _op.path_specs = path_specs  # {fid: {frames (n_steps, n_nodes), ...}} — per-step load-path fields
             return (_op, "nonlinear", offs)
 
         def _assemble_at(args):
