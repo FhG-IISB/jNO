@@ -661,7 +661,57 @@ def test_second_order_nonlinear_klein_gordon_conserves_energy():
     assert e_be[-1] / e_be[0] < 0.85, f"backward Euler should dissipate nonlinear energy ({e_be[-1] / e_be[0]:.4f})"
 
 
-def test_second_order_multifield_rejected():
+def test_second_order_coupled_membranes_beating():
+    """Coupled multifield second-order-in-time (every field carries ``u_tt``): two spring-coupled
+    membranes ``u1_tt=Δu1−k(u1−u2)``, ``u2_tt=Δu2−k(u2−u1)``, clamped, released from ``u1=sin·sin``,
+    ``u2=0``. The augmented state ``[u_all; v_all]`` reduces to the single-field formula with the
+    COUPLED block M₂/K; the two normal modes (symmetric ω_s=π√2, antisymmetric ω_a=√(2π²+2k)) beat:
+    ``u1=½(cos ω_s t+cos ω_a t)φ``, ``u2=½(cos ω_s t−cos ω_a t)φ``. Previously fail-loud (single-field)."""
+    k = 40.0
+    om_s, om_a = PI * np.sqrt(2.0), np.sqrt(2 * PI**2 + 2 * k)
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1, time=(0.0, 1.0, 110))
+    u1, p1 = d.fem_symbols(names=("u1", "p1"))
+    u2, p2 = d.fem_symbols(names=("u2", "p2"))
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi0, yi0, ti0 = d.variable("initial", split=True)
+    a1, b1 = u1.bind(x=xi, y=yi, t=ti), p1.bind(x=xi, y=yi, t=ti)
+    a2, b2 = u2.bind(x=xi, y=yi, t=ti), p2.bind(x=xi, y=yi, t=ti)
+    v1, v2 = u1.bind(x=xi, y=yi, t=ti), u2.bind(x=xi, y=yi, t=ti)
+    a10, a20 = u1.bind(x=xi0, y=yi0, t=ti0), u2.bind(x=xi0, y=yi0, t=ti0)
+    weak = (
+        a1.tt * b1
+        + (a1.x * b1.x + a1.y * b1.y)
+        + k * (v1 - v2) * b1
+        + a2.tt * b2
+        + (a2.x * b2.x + a2.y * b2.y)
+        + k * (v2 - v1) * b2
+    )
+    u10 = jno.fn(lambda x, y: jnp.sin(PI * x) * jnp.sin(PI * y), [xi0, yi0])
+    fem = jno.fem(
+        [weak, u1(xb, yb) - 0.0, u2(xb, yb) - 0.0, u1(xi0, yi0) - u10, u2(xi0, yi0) - 0.0, a10.t - 0.0, a20.t - 0.0]
+    )
+    assert fem.is_transient and fem.is_linear
+    o = fem.offsets  # [0, n1, N, N+n1, 2N] -> field blocks u1, u2, v1, v2
+    assert len(o) == 5, "the coupled augmented state exposes 4 field blocks [u1, u2, v1, v2]"
+    ts = np.asarray(_block_time_grid(fem.operator))
+    fem.operator.metadata["theta"] = 0.5
+    Yfull = np.asarray(_default_transient_integrate(fem.operator, {}, ts))  # full augmented trajectory
+    n1 = o[1]
+    U1, U2 = Yfull[:, o[0] : o[1]], Yfull[:, o[1] : o[2]]
+    pts = np.asarray(fem.points)[:n1]
+    ci = int(np.argmin(np.sum((pts - 0.5) ** 2, axis=1)))
+    phi_c = _mode11(pts[ci, 0], pts[ci, 1])
+    ex1 = 0.5 * (np.cos(om_s * ts) + np.cos(om_a * ts)) * phi_c
+    ex2 = 0.5 * (np.cos(om_s * ts) - np.cos(om_a * ts)) * phi_c
+    assert np.linalg.norm(U1[:, ci] - ex1) / np.linalg.norm(ex1) < 0.03, "u1 does not track the beating analytic"
+    assert np.linalg.norm(U2[:, ci] - ex2) / np.linalg.norm(ex2) < 0.03, "u2 does not track the beating analytic"
+
+
+def test_second_order_mixed_order_multifield_rejected():
+    """A coupled form where one field is second-order (u_tt) and another is first-order (w_t) — the
+    mixed-order case needs a per-field velocity augmentation and is fail-loud (write it as a first-order
+    system). Only *all-second-order* couplings are supported."""
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.3, time=(0.0, 1.0, 10))
     u, p = d.fem_symbols(names=("u", "pu"))
     w, q = d.fem_symbols(names=("w", "qw"))
@@ -672,5 +722,5 @@ def test_second_order_multifield_rejected():
     wi, qi = w.bind(x=xi, y=yi, t=ti), q.bind(x=xi, y=yi, t=ti)
     ui0 = u.bind(x=xi0, y=yi0, t=ti0)
     weak = ui.tt * pi + (ui.x * pi.x + ui.y * pi.y) + wi.t * qi + (wi.x * qi.x + wi.y * qi.y)
-    with pytest.raises(NotImplementedError, match="single-field"):
+    with pytest.raises(NotImplementedError, match="u_t term|first-order"):
         jno.fem([weak, u(xb, yb) - 0.0, w(xb, yb) - 0.0, u(xi0, yi0) - 0.0, ui0.t - 0.0, w(xi0, yi0) - 0.0])
