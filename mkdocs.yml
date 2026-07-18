@@ -133,6 +133,8 @@ nav:
       - "Rayleigh–Bénard (heat + flow)": tutorials/08-fem-and-varpinns/rayleigh-benard-2d.md
       - "Brittle Fracture (4th-order phase-field, coupled)": tutorials/08-fem-and-varpinns/phase-field-fracture-2d.md
       - Vibrating Membrane (2D wave, 2nd-order time): tutorials/08-fem-and-varpinns/wave-membrane-2d.md
+      - "Ringing Cantilever (elastodynamics + modal)": tutorials/08-fem-and-varpinns/elastodynamics-cantilever-2d.md
+      - "Full-Waveform Inversion (recover a wave speed)": tutorials/08-fem-and-varpinns/inverse-wave-speed-2d.md
       - Inverse Diffusivity Field: tutorials/08-fem-and-varpinns/inverse-diffusivity-field.md
       - Adaptive Mesh Refinement (L-shape): tutorials/08-fem-and-varpinns/adaptive-l-shape.md
       - 2D Maxwell (complex vector E): tutorials/08-fem-and-varpinns/maxwell-2d-vector.md
