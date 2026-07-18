@@ -1064,6 +1064,10 @@ def assemble_fem_native(
             fids = jnp.asarray(faces, dtype=jnp.int32)
             lv = u_flat[cell_all_dofs[parent_j[fids]]]  # (n_face_R, n_local_all)
             vals = jax.vmap(lambda fi, la, _f=formula, _r=region: _surf_elem_readout(fi, la, _f, _r, t, args))(fids, lv)
+            # Normalize to the state's declared per-face shape (n_faces, n_quad_surf, *value_shape): a
+            # scalar update written with `inner(dir, u.bind(...), 1)` keeps a spurious trailing size-1 axis
+            # (harmless in the residual, where it contracts with the test) that must be squeezed here.
+            vals = vals.reshape((fids.shape[0], int(spec["shape"][1])) + tuple(spec["value_shape"]))
             out[key] = full.at[fids].set(vals)
         return out
 
