@@ -277,22 +277,28 @@ def test_second_order_time_varying_dirichlet_drives_wave():
 # ==========================================================================
 # fail-loud scope boundaries (a mis-assembled second-order solve is silently wrong)
 # ==========================================================================
-def _second_order_1d():
+def test_second_order_1d_wave_matches_analytic():
+    """Native 1D second-order-in-time: the wave ``u_tt = u_xx`` on [0,1], clamped, released from
+    ``u(x,0)=sin(πx)`` at rest, tracks the analytic standing wave ``sin(πx)cos(πt)``. The native 1D
+    assembler (LINE2/P1) builds the augmented [u, v] block just like the 2D/3D path — 1D was
+    previously fail-loud (first-order only)."""
     pytest.importorskip("pygmsh", reason="pygmsh required for line meshing")
-    d = jno.domain(constructor=jno.domain.line(mesh_size=0.1), time=(0.0, 1.0, 10))
+    d = jno.domain(constructor=jno.domain.line(mesh_size=0.02), time=(0.0, 1.2, 80))
     u, phi = d.fem_symbols()
     xi, ti = d.variable("interior", split=True)[0], d.variable("interior", split=True)[-1]
     xb = d.variable("boundary", split=True)[0]
     xi0, ti0 = d.variable("initial", split=True)[0], d.variable("initial", split=True)[-1]
-    ui = u.bind(x=xi, t=ti)
-    vi = phi.bind(x=xi, t=ti)
+    ui, vi = u.bind(x=xi, t=ti), phi.bind(x=xi, t=ti)
     ui0 = u.bind(x=xi0, t=ti0)
-    return [ui.tt * vi + ui.x * vi.x, u(xb) - 0.0, u(xi0) - 0.0, ui0.t - 0.0]
-
-
-def test_second_order_1d_rejected():
-    with pytest.raises(NotImplementedError, match="2D/3D"):
-        jno.fem(_second_order_1d())
+    fem = jno.fem([ui.tt * vi + ui.x * vi.x, u(xb) - 0.0, u(xi0) - jno.fn(lambda x: jnp.sin(PI * x), [xi0]), ui0.t - 0.0])
+    assert fem.is_transient and fem.is_linear
+    n = fem.offsets[1]
+    assert fem.offsets == [0, n, 2 * n]  # augmented [u; v]
+    ts, U, _ = _trajectory(fem)
+    xx = np.asarray(fem.points)[:, 0]
+    exact = np.sin(PI * xx)[None, :] * np.cos(PI * ts)[:, None]
+    rel = np.linalg.norm(U - exact) / np.linalg.norm(exact)
+    assert rel < 0.01, f"1D wave does not track sin(πx)cos(πt): rel L2 = {rel:.4f}"
 
 
 def _elastodynamics_fem(mesh_size=0.12, n_periods=4, n_steps=240, E=1.0, nu=0.25, rho=1.0):

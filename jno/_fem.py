@@ -2757,14 +2757,12 @@ def fem(
     # Lagrange u_tt -> the native augmented [u, v] block here. A NON-NODAL (Argyris/Hermite) u_tt is NOT
     # intercepted: it falls through to the non-nodal branch below, which builds the same augmented block from
     # its own push-forward assembly / pins / IC-projection (so the C¹ element gets dynamic plates too).
-    if any(_max_temporal_order(_bare(c)) >= 2 for c in constraints) and not (_trial_spaces(constraints) - {"Lagrange"}):
+    # 1D u_tt falls through to the native 1D branch (its assembler builds the augmented [u, v] block);
+    # only the 2D/3D nodal-Lagrange route is intercepted here (a non-nodal / 1D u_tt has its own path).
+    _second_order = any(_max_temporal_order(_bare(c)) >= 2 for c in constraints)
+    if _second_order and getattr(domain, "dimension", None) != 1 and not (_trial_spaces(constraints) - {"Lagrange"}):
         if periodic_ties:
             raise NotImplementedError("jno.fem: periodic ties on a second-order-in-time problem are not supported yet.")
-        if getattr(domain, "dimension", None) == 1:
-            raise NotImplementedError(
-                "jno.fem: second-order-in-time (u_tt) is supported on 2D/3D domains only (the native 1D "
-                "assembler is first-order). Rewrite as a first-order system, or solve on a 2D domain."
-            )
         if multifield:
             raise NotImplementedError(
                 "jno.fem: second-order-in-time (u_tt) is single-field only for now; write the coupled "
@@ -2772,8 +2770,10 @@ def fem(
             )
         if any(isinstance(n, RegionMask) for b in volume_terms for n in _walk(b)):
             raise NotImplementedError(
-                "jno.fem per-region integration on a second-order-in-time problem is not wired yet — "
-                "sub-region terms are currently supported on steady problems only."
+                "jno.fem: per-region (RegionMask) integration on a second-order-in-time problem is not "
+                "wired yet — the region-grouping distributes the mask over the whole form, including the "
+                "u_tt mass term. Use a jno.fn indicator coefficient instead, e.g. (1 + k*ind)*(u.x*v.x + "
+                "u.y*v.y), which gives the same piecewise-material dynamics."
             )
         _so = _assemble_second_order_time(
             domain,
@@ -2882,6 +2882,11 @@ def fem(
                 "(smaller mesh_size) for accuracy. (P2 promotion is supported on 2D/3D domains.)"
             )
         if multifield:  # coupled 1D -> native block assembly
+            if _second_order:
+                raise NotImplementedError(
+                    "jno.fem: second-order-in-time (u_tt) 1D is single-field only for now; write the coupled "
+                    "problem as a first-order system (one velocity field per second-order field)."
+                )
             op, mode = assemble_fem_1d_multifield(
                 domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, quad_degree=quad_degree
             )
@@ -2889,7 +2894,12 @@ def fem(
             op, mode = assemble_fem_1d(
                 domain, volume_terms, boundary_terms, dirichlet_values, ic_residuals, vec=vec, quad_degree=quad_degree
             )
-        return _finalize(FEM(domain=domain, op=op, classification=classification, mode=mode))
+        # a second-order 1D block carries the augmented state y=[u; v] (size 2N) -> field offsets [0, N, 2N]
+        offs_1d = None
+        if _second_order and mode == "transient":
+            _nh = int(np.asarray(op.state0).shape[0]) // 2
+            offs_1d = [0, _nh, 2 * _nh]
+        return _finalize(FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs_1d))
 
     order = _infer_order(constraints)
     quad_degree = max(quad_degree, 2 * order)
