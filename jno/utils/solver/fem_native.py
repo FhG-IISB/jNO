@@ -38,7 +38,7 @@ linear, nonlinear, and transient), with Dirichlet and Neumann/Robin boundary con
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import jax
 import jax.experimental.sparse as jsparse
@@ -65,6 +65,7 @@ from .fem_lagrange import (
 from .fem_utils import (
     _cell_region_mask,
     _collect_region_mask_names,
+    _eval_integrand,
     _gather_temporal_tags,
     _infer_fields,
     _lower_statefield_to_trial,
@@ -371,6 +372,7 @@ def assemble_fem_native(
     *,
     vec: int,
     quad_degree: int,
+    evolution: Optional[Dict[Any, Any]] = None,
 ) -> Tuple[Any, str]:
     """Assemble a Lagrange FEM system into ``(op, mode, offs)`` for :class:`FEM`.
 
@@ -581,7 +583,12 @@ def assemble_fem_native(
     # deep, so it is memory-minimal. Presence of any history forces the args-threading (parametric) path.
     from ...trace import history_variables as _history_variables
 
-    _history_raw = _history_variables(list(volume_terms) + list(boundary_terms))  # {key: (base, depth)}
+    # Evolution updates (``state.evolves(formula)``) advance internal states between load steps. Their
+    # formulas are walked here too, so a ``state.i(-1)`` that appears ONLY inside an evolution formula
+    # (not in the weak form) still allocates its buffer with the right depth.
+    _evolution = dict(evolution or {})  # {history_key: StateUpdate}
+    _evo_formulas = [su.formula for su in _evolution.values()]
+    _history_raw = _history_variables(list(volume_terms) + list(boundary_terms) + _evo_formulas)  # {key: (base, depth)}
     history_specs = {
         key: {
             "name": str(getattr(base, "name", "hist")),
@@ -591,6 +598,40 @@ def assemble_fem_native(
         }
         for key, (base, depth) in _history_raw.items()
     }
+
+    # Per-history-key READOUT + role, for the load-step march. Every buffered state advances one of two
+    # ways between steps: (1) a *primary unknown* read at ``.i(-1)`` (its base is one of the solved fields
+    # — e.g. a BDF2 ``u.i(-1)``) auto-buffers the just-solved ``u``, so its readout is the bare field
+    # interpolated to the quad points; (2) an *internal state* (``ep``) advances by its
+    # ``state.evolves(formula)`` update. A state read at ``.i(-1)`` that is NEITHER solved NOR has an
+    # ``.evolves`` would leave its buffer frozen at zero — a silently wrong (deformation-theory) result —
+    # so that is a hard build error (never a silent freeze). ``readout_formulas`` maps each key to the
+    # trace expression the march evaluates per quad point to produce that state's next value.
+    _solved_field_keys = {f["field_key"] for f in fields}
+    _is_march = bool(getattr(domain, "_is_pseudo_time", False))
+    history_roles: Dict[Any, str] = {}
+    readout_formulas: Dict[Any, Any] = {}
+    for key, (base, _depth) in _history_raw.items():
+        if key in _evolution:
+            history_roles[key] = "internal"
+            readout_formulas[key] = _lower_statefield_to_trial(_evolution[key].formula, {})
+        elif getattr(base, "field_key", None) in _solved_field_keys:
+            history_roles[key] = "primary"  # auto-buffered from the solved unknown (the bare field at QPs)
+            readout_formulas[key] = _lower_statefield_to_trial(base, {})
+        elif _is_march:
+            # A ``tau=`` domain signals a load-step MARCH: a buffered internal state with no ``.evolves``
+            # would stay frozen at zero every step (a silently wrong, deformation-theory result). Fail
+            # loud. (On a plain domain the same read is allowed — a residual you thread history into by
+            # hand, e.g. to verify the zero-history reduction — so this only fires when marching.)
+            raise ValueError(
+                f"jno.fem: internal state {str(getattr(base, 'name', 'state'))!r} is read at `.i(-1)` but "
+                "has no `.evolves(...)` update — on a `domain(tau=...)` march its history buffer would stay "
+                "frozen at zero (a silently wrong, deformation-theory result). Add "
+                "`state.evolves(<formula>)` to the `jno.fem([...])` list describing how it advances; or, if "
+                "it is really the primary unknown, solve for it (give it a test function)."
+            )
+        else:
+            history_roles[key] = "frozen"  # plain-domain history read, threaded by hand; not marchable
 
     # A trainable DIRICHLET VALUE ``u(region) - net(x)`` (an unknown boundary profile). The net is not an
     # integrand coefficient -- it is evaluated at the boundary NODES to form the Dirichlet lift -- so it is
@@ -784,6 +825,59 @@ def assemble_fem_native(
             if hbuf:
                 loc["qp_history"] = {k: hbuf[k][c] for k in history_specs if k in hbuf}
         return _integrate_term(domain, coeff, loc, qw_shared * meas)
+
+    def _vol_elem_readout(c, local_all, formula, t=0.0, args=None):
+        """Per-quadrature-point VALUE of an evolution formula on cell ``c`` -> ``(n_quad, *value_shape)``.
+
+        Same field / parameter / frozen / history ``loc`` as :func:`_vol_elem_res` (so the formula reads
+        the solved unknown through ``ε(u)`` and the previous state through ``ep.i(-1)``), but the formula
+        carries NO test function, so it is *evaluated* at the quad points (``_eval_integrand``) rather than
+        integrated. This is the internal-state update the load-step march applies after each solve.
+        Reverse-mode differentiable in ``local_all`` (the solved DOFs) and the history buffers."""
+        cell_sols = _split_cell_local(local_all)
+        per, xq, meas = _cell_fields(c, cell_sols)
+        h_qp = jnp.broadcast_to(meas ** (1.0 / dim), (qw_shared.shape[0], 1))
+        loc = {
+            "physical_quad_points": xq,
+            "fields": per,
+            "field_index": field_index,
+            "tag": "fem_gauss",
+            "surface": False,
+            "domain_context": {**ctx, "cell_size": h_qp},
+            "temporal_tags": temporal_tags,
+            "runtime_parameter_tags": runtime_parameter_tags,
+            "region_mask_names": (),
+            "volume_vars": _runtime_vals(c, t, args, local_all.dtype),
+            "trial_value_shape": fields[0]["value_shape"],
+            "trial_vec": vecs[0],
+        }
+        if _field_param_names:
+            loc["shape_vals"] = per[_field_param_field_idx]["shape_vals"]
+        _nt = neural_local_table(_neural, args)
+        if _nt is not None:
+            loc["neural_coefficients"] = _nt
+        if _frozen_gathered:
+            loc["frozen_fields"] = {fid: g[c] for fid, g in _frozen_gathered.items()}
+        if history_specs and args is not None:
+            hbuf = args.get("__history__") if isinstance(args, dict) else None
+            if hbuf:
+                loc["qp_history"] = {k: hbuf[k][c] for k in history_specs if k in hbuf}
+        return _eval_integrand(domain, formula, loc)
+
+    def state_readout(u_flat, t=0.0, args=None):
+        """Advance every buffered state one load step: evaluate each key's readout formula at the
+        quadrature points, given the just-solved ``u_flat`` and the current history buffers (on
+        ``args['__history__']``). Returns ``{history_key: (n_cells, n_quad, *value_shape)}`` — the value
+        that becomes each state's ``.i(-1)`` at the NEXT step. The load-step march rolls these into the
+        depth buffers. Whole-domain: the readout runs on every cell (sub-region-restricted plasticity is
+        not wired — a future masked readout)."""
+        local_all = u_flat[cell_all_dofs]  # (n_cell, n_local_all)
+        out: Dict[Any, Any] = {}
+        for key, formula in readout_formulas.items():
+            out[key] = jax.vmap(lambda c, la, _f=formula: _vol_elem_readout(c, la, _f, t, args))(
+                jnp.arange(n_cells), local_all
+            )
+        return out
 
     def _surf_elem_res(fi, local_all, bcoeff, btfi, region, t=0.0, args=None):
         """Element residual of one surface term on boundary face ``fi`` as a function of the parent
@@ -1379,16 +1473,21 @@ def assemble_fem_native(
                     "(the row-replacement Dirichlet uses a static value). Use a linear form."
                 )
 
-            def res_p(u, args=None, _d=s_d_dofs, _g=s_d_vals):
-                R = residual(jnp.asarray(u), 0.0, args)
+            # ``t`` carries the pseudo-time (load) coordinate τ for the history march — the load written
+            # as a function of τ in the weak form varies through it. Defaults to 0.0, so the ordinary
+            # (non-marching) parametric/inverse call sites are unchanged.
+            def res_p(u, args=None, t=0.0, _d=s_d_dofs, _g=s_d_vals):
+                R = residual(jnp.asarray(u), t, args)
                 return R if _d is None else R.at[_d].set(jnp.asarray(u)[_d] - _g)
 
-            def jac_p(u, args=None, _d=s_d_dofs):
-                J = jacobian(jnp.asarray(u), 0.0, args)
+            def jac_p(u, args=None, t=0.0, _d=s_d_dofs):
+                J = jacobian(jnp.asarray(u), t, args)
                 return J if _d is None else bcoo_set_dirichlet_rows(J, _d)
 
             _op = FemResidualOperator(res_p, jac_p, total, runtime_parameter_exprs=dict(_param_and_neural_exprs))
             _op.history_specs = history_specs  # step-history buffer layout for the load-step driver
+            _op.history_roles = history_roles  # {key: "primary" | "internal"} — how each state advances
+            _op.state_readout = state_readout  # (u, t, args) -> {key: next per-QP state}; the march driver
             return (_op, "nonlinear", offs)
 
         def _assemble_at(args):

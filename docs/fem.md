@@ -708,12 +708,39 @@ elastoplastic tangent for free (AD of the formula). The solve is differentiable 
 problem). This is Hencky deformation theory (virgin every solve): exact for monotonic proportional loading.
 
 **Flow theory** (path-dependent; unloading leaves a permanent set) is the *identical* formula reading the
-previous step's per-quadrature-point state with the step-history index `.i(k)`: `eu = eps(u) - ep.i(-1)`
-and `sy -> sy + H*al.i(-1)`, with `ep, al` declared like any field via `fem_symbols`. `.i(k)` is a general
-trace primitive (multistep time schemes read `u.i(-2)` the same way); the build infers the keep-depth from
-the most-negative index and threads a zeroed per-QP buffer on the solver `args` (one compiled residual,
-reused every step; frozen-constant in the tangent). The load-path march over a `domain(tau=...)`
-pseudo-time grid — triggered by `.i(k)` the way `u.t` triggers transient — is the remaining piece.
+previous step's per-quadrature-point state with the step-history index `.i(k)`: `ee = eps(u) - ep.i(-1)`
+and `sy -> sy + H*al.i(-1)`, with `ep, al` declared like any field via `fem_symbols`. How each state
+*advances* is a **named update term** in the same list — `state.evolves(<formula>)`, an update, not an
+equation (and not an operator: `==` is reserved for identity, `<` for comparison). The load is written as
+a function of the pseudo-time coordinate `tau`, the domain carries a `tau=` load grid, and `fem.solve()`
+**marches** the path with **nothing passed** — triggered by `.i(k)` exactly as `u.t` triggers transient:
+
+```python
+d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.1).domain(tau=(0.0, 1.0, 40))   # pseudo-time load path
+x, y, z, tau = d.variable("interior", split=True)            # τ is a coordinate, like t
+dev = lambda A: A - trace(A) / 3 * I3                         # I3 = jno.np.identity(3)
+nrm = lambda A: sqrt(maximum(inner(A, A, 2), 0) + 1e-30)      # safe Frobenius norm
+ee  = eps(u) - ep.i(-1); D = dev(ee); dd = nrm(D)             # elastic predictor about the previous state
+dg  = maximum(rt * 2 * mu * dd - (sy + H * al.i(-1)), 0) / (3 * mu + H)
+n   = D / dd
+sig = K * trace(ee) * I3 + 2 * mu * D - 2 * mu * rt * dg * n  # returned stress
+P   = peak * (1 - jno.np.abs(2 * tau - 1))                    # load ramps 0 → peak → 0 with τ
+traj = jno.fem([
+    inner(sig, eps(phi), 2) - P * inner(zhat, phi, 1),       # equilibrium              (test phi)
+    ep.evolves(ep.i(-1) + rt * dg * n),                      # plastic strain advances  (a named update)
+    al.evolves(al.i(-1) + dg),                               # hardening advances
+    u(*bc) - 0.0,                                            # clamp
+]).solve()                                                   # (n_steps, n_dofs) load-path trajectory
+```
+
+`.i(-k)` **reads** history, `.evolves` **writes** it. The build infers the keep-depth from the
+most-negative index and threads a zeroed per-quadrature-point buffer through the march's `lax.scan` carry
+(one compiled residual, reused every step; frozen-constant in the tangent → the consistent return-map
+tangent). The whole march rides `custom_root`, so it stays differentiable end-to-end: thread `sy` as a
+`jno.np.parameter` and `∂(unloaded state)/∂sy` flows through the entire load path (a material-
+identification inverse). A **primary-unknown** history (`u.i(-1)`/`u.i(-2)`, e.g. a BDF2 time scheme) is
+auto-buffered from the solved `u` — no `.evolves`; an **internal** state read at `.i(-1)` with no
+`.evolves` on a `tau=` domain is a build error (never a silently frozen buffer = deformation theory).
 
 **Scope:** small-strain, isotropic, linear-hardening; 3-D (2-D is plane strain). Kinematic / nonlinear
 hardening and contact are separate (not built).
@@ -762,10 +789,12 @@ route** — the residual-PINN path is unaffected. Full detail is inline in the s
   term (`nu * grad(u)·grad(phi)`), not nested or buried in a nonlinear expression.
 - **Enclosure radiation is a composition, not an auto-detected term** — it is 2D / axisymmetric and
   needs a direct linear solve; you write the radiosity and couple it yourself.
-- **Plasticity flow-theory march is not wired yet** — the deformation-theory formula (monotonic /
-  proportional) runs today; path-dependent flow theory reads history via `.i(k)` (works at the residual
-  level) but the load-path march over a `domain(tau=…)` grid is still to be added. Small-strain,
-  isotropic only.
+- **Plasticity is small-strain, isotropic, linear-hardening, whole-domain.** Deformation theory
+  (monotonic / proportional) and the path-dependent flow-theory **`tau=` load-path march** both run
+  today; the march assembles on the real, steady, single-field native-Lagrange path only (not
+  transient / complex / multifield / non-nodal / periodic — each rejected with a clear error). The
+  internal-state readout runs on every cell (sub-region-restricted plasticity is not wired). Kinematic /
+  nonlinear (Voce) hardening and contact are separate formulas / machinery, not built.
 
 Hitting one of these is a signal to reformulate (move the parameter, reduce the time order) rather than
 a bug — the error message names the offending term.

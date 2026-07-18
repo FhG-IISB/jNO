@@ -43,9 +43,11 @@ from .trace import (
     NormalDerivative,
     Placeholder,
     RegionMask,
+    StateUpdate,
     TestFunction,
     TrialFunction,
     Variable,
+    state_updates,
 )
 
 __all__ = ["fem", "FEM"]
@@ -1317,6 +1319,28 @@ class FEM:
             from_slots = True
         else:
             from_slots = False
+
+        # ---- pseudo-time HISTORY MARCH (path-dependent state, e.g. plasticity): the op carries step-
+        # history buffers (``.i(k)`` in the form) and the domain a ``tau=`` pseudo-time grid. March the
+        # grid, threading τ as the load coordinate and the per-QP internal state on ``args["__history__"]``;
+        # each step solves equilibrium then advances the states via their ``.evolves`` readout. Triggered
+        # with NOTHING passed — exactly as ``u.t`` triggers the transient stepper. ----
+        if getattr(self._op, "history_specs", None):
+            if not getattr(self.domain, "_is_pseudo_time", False):
+                raise ValueError(
+                    "jno.fem: this form reads step history (`.i(k)`) but the domain has no pseudo-time load "
+                    "path, so `fem.solve()` has no steps to march over. Build the domain with "
+                    "`domain(tau=(start, end, n))` (the load written as a function of τ in the form). "
+                    "A plain steady solve cannot carry step history."
+                )
+            if getattr(self._op, "state_readout", None) is None:
+                raise NotImplementedError(
+                    "jno.fem: the history march is only wired on the real, steady, single-field native "
+                    "Lagrange path; this form assembled through another route."
+                )
+            from .utils.solver.history_march import run_history_march
+
+            return run_history_march(self, solve_fn if from_slots else solve_fn)
         if self._mode == "complex":
             # A complex-native preconditioner (AMS) solves the sparse COMPLEX operator directly (never
             # densified); real-equivalent preconditioners (form/jacobi/…) stay on the 2n-block path.
@@ -2460,6 +2484,15 @@ def fem(
         spec = _rotation_bc_spec(c, domain)
         (rotation_bcs.append(spec) if spec is not None else _core_r.append(c))
     constraints = _core_r
+
+    # Internal-state EVOLUTION terms (`state.evolves(formula)`): pulled out BEFORE weak-form/Dirichlet
+    # classification and field/space inference. A StateUpdate carries no test function and is NOT an
+    # equation — but its formula references the trial (and its own past `state.i(-1)`), which would
+    # otherwise mis-route it to the Dirichlet branch and mis-count its state field as a coupled unknown.
+    # The `.i(k)` reads inside each formula are still walked by ``history_variables`` (in the assembler)
+    # so they allocate the right per-quadrature-point buffer depth.
+    _evolution = state_updates(constraints)  # {history_key: StateUpdate}
+    constraints = [c for c in constraints if not isinstance(_bare(c), StateUpdate)]
     if rotation_bcs and not (_trial_spaces(constraints) - {"Lagrange"}):
         raise NotImplementedError(
             "jno.fem: a rotation BC `u.dn(region) - h` is a 4th-order plate essential BC — it requires a field "
@@ -2528,6 +2561,22 @@ def fem(
     multifield = len(_field_keys(constraints)) > 1
     if vec is None and not multifield:
         vec = _infer_vec(constraints)  # single-field only (coupled fields carry per-field vec)
+
+    # Evolution terms ride the real, steady, single-field native-Lagrange path only (the plasticity
+    # load-path march). Reject the structurally-incompatible routes up front — fail loud, never a
+    # silently dropped update. (transient / complex are rejected below, once the IR reveals them.)
+    if _evolution and (
+        multifield
+        or is_vpinn
+        or getattr(domain, "dimension", None) == 1
+        or (_trial_spaces(constraints) - {"Lagrange"})
+        or periodic_ties
+    ):
+        raise NotImplementedError(
+            "jno.fem: `state.evolves(...)` evolution terms are supported on the real, steady, single-field "
+            "native-Lagrange path only (the plasticity load-path march over `domain(tau=...)`). Not yet: "
+            "multifield, VPINN, 1D, non-nodal (Argyris/Morley/edge) elements, or periodic ties."
+        )
 
     # The transient route reduces M/A from the assembly context at *assembly* time, so its P must be
     # built and injected before the time block is assembled (see the single-field transient branch below).
@@ -2886,6 +2935,15 @@ def fem(
     weak_bares = volume_terms + [e for exprs in boundary_terms.values() for e in exprs]
     is_transient = any(_contains_temporal_derivative(b) for b in weak_bares)
 
+    # Evolution + real-transient (`u.t`) or complex is the last structural rejection (needs the IR): the
+    # load path is the *pseudo-time* march (`domain(tau=...)`, no `u.t`), and the return map is real.
+    if _evolution and (is_transient or _is_complex_form(domain, ir)):
+        raise NotImplementedError(
+            "jno.fem: `state.evolves(...)` cannot combine with a real time derivative (`u.t`) or a complex "
+            "form — the load path is the *pseudo-time* march over `domain(tau=...)`, not a `u.t` transient, "
+            "and the constitutive update is real. Drop `u.t`/complex, or drive time through the `tau` grid."
+        )
+
     # ---- native Lagrange (single field): the standard fast path. Covers 2D triangle and 3D tet (incl.
     # Neumann/Robin surfaces), steady (incl. runtime-scalar-parametric) and transient (constant
     # Dirichlet + a time-dependent source). complex / VPINN / field-param / time-varying-Dirichlet /
@@ -2924,7 +2982,14 @@ def fem(
 
             domain._fem_problem = None  # native owns this domain's FE state
             op, mode, offs = assemble_fem_native(
-                domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, vec=vec or 1, quad_degree=quad_degree
+                domain,
+                volume_terms,
+                boundary_terms,
+                dirichlet_raw,
+                ic_residuals,
+                vec=vec or 1,
+                quad_degree=quad_degree,
+                evolution=_evolution,
             )
             return _finalize(FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs))
 

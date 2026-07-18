@@ -739,6 +739,15 @@ class Placeholder:
         """
         return HistoryRef(self, offset)
 
+    def evolves(self, formula) -> "StateUpdate":
+        """Declare a per-step **state update** for this (internal-state) field: at the current step it
+        *becomes* ``formula`` — which typically reads its own past via ``self.i(-1)`` and the solved
+        unknown (e.g. ``ep.evolves(ep.i(-1) + rt*dg*n)``). Put it in the ``jno.fem([...])`` list beside the
+        equations; the load-step march evaluates ``formula`` at the quadrature points after each solve to
+        advance the buffer that ``self.i(-1)`` reads. Reads use ``.i(-k)``, writes use ``.evolves`` — a
+        *named* update, not an operator (``==`` is reserved for identity, ``<`` for comparison)."""
+        return StateUpdate(self, formula)
+
     def laplacian(
         self,
         *variables: "Variable",
@@ -3608,6 +3617,47 @@ class HistoryRef(Placeholder):
         return f"HistoryRef({self.name})"
 
 
+class StateUpdate(Placeholder):
+    """A per-quadrature-point **state update** — ``state.evolves(formula)``, produced by
+    :meth:`Placeholder.evolves`. It declares how an internal-state field advances one load step: at the
+    current step ``state`` *becomes* ``formula`` (which typically reads the previous state via
+    ``state.i(-1)`` and the solved unknown). It is NOT a weak-form residual (no test function) and NOT an
+    equation — the FEM front-end routes it to the *evolution* bucket, and the load-step march evaluates
+    ``formula`` at the quadrature points after each equilibrium solve to overwrite the history buffer that
+    ``state.i(-1)`` reads. Its :attr:`history_key` matches the base variable's :class:`HistoryRef` key, so
+    the write lands in the exact buffer the read consumes. Both children (``target`` = the state field,
+    ``expr`` = the update formula) are walked, so any ``.i(k)`` *inside* the formula still contributes to
+    the inferred keep-depth (see :func:`history_variables`)."""
+
+    def __init__(self, base, formula):
+        base = base._expr if hasattr(base, "_expr") else base  # unwrap a typed view
+        self.target = base  # the state field advanced (reached via _iter_placeholder_children)
+        self.expr = formula  # the RHS update expression (also a walked child)
+        self.name = f"{getattr(base, 'name', 'state')}.evolves(...)"
+        self.value_shape = tuple(getattr(base, "value_shape", ()))
+        self.order = int(getattr(base, "order", 1))
+        self.space = str(getattr(base, "space", "Lagrange"))
+        self.field_key = getattr(base, "field_key", None)
+        self.op_id = _next_op_id()
+
+    @property
+    def base(self):
+        return self.target
+
+    @property
+    def formula(self):
+        return self.expr
+
+    @property
+    def history_key(self):
+        """Buffer identity — the same ``id(base)`` a :class:`HistoryRef` on this field uses, so the update
+        writes the slot the read consumes."""
+        return id(self.target)
+
+    def __repr__(self):
+        return f"StateUpdate({getattr(self.target, 'name', 'state')})"
+
+
 def history_variables(terms):
     """Scan trace ``terms`` (a term or list of terms) for :class:`HistoryRef` nodes and return
     ``{history_key: (base, depth)}`` — ``depth`` is how many PAST states of that base variable the load-step
@@ -3633,6 +3683,22 @@ def history_variables(terms):
     for t in terms:
         visit(t)
     return found
+
+
+def state_updates(terms):
+    """The top-level :class:`StateUpdate` nodes in ``terms`` (a term or list of terms), as
+    ``{history_key: StateUpdate}`` — one update per internal-state field (a later declaration wins). The
+    FEM front-end uses this to pull ``state.evolves(...)`` terms out of the weak-form/Dirichlet
+    classification and into the evolution bucket; the formulas are still walked by
+    :func:`history_variables` so their ``.i(k)`` reads allocate buffers."""
+    if isinstance(terms, Placeholder):
+        terms = [terms]
+    out: dict = {}
+    for t in terms:
+        node = t._expr if hasattr(t, "_expr") else t
+        if isinstance(node, StateUpdate):
+            out[node.history_key] = node
+    return out
 
 
 class TestFunction(Placeholder):
