@@ -462,7 +462,13 @@ def _region_and_support(constraint: Any, domain: Any) -> Tuple[str, str]:
     # classification is exactly what we want -- keep it.
     has_test = _contains(constraint, TestFunction)
     if has_test:
-        boundary_tags = {t for t in tags if t in _bregions and _subregion_id(t) is None}
+        # The whole-domain interior ("interior") is never a boundary -- even if a coarse mesh left every
+        # interior node lying on the boundary and so registered "interior" in `_boundary_regions`. A
+        # VOLUME weak-form term must integrate over cells, not be misread as a (face-less) boundary term
+        # (this mirrors the sub-region `_subregion_id` guard: both are interior regions that happen to
+        # collide with a boundary-region node set). Without this, a coarse-mesh weak form with any surface
+        # term classifies the volume term as boundary -> empty `volume_terms` -> "no trial fields".
+        boundary_tags = {t for t in tags if t in _bregions and _subregion_id(t) is None and t != "interior"}
     else:
         boundary_tags = {t for t in tags if t in _bregions}
     interiorish = tags - boundary_tags
