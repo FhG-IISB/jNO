@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import warnings
 from typing import Any, Callable, List, Optional, Tuple
 
 import jax
@@ -3429,6 +3430,33 @@ def _ic_value_at_nodes(bare: Any, domain: Any, pts: Any, n: int, vec: int = 1) -
     )
 
 
+_SECOND_ORDER_FLOAT32_WARNED = False
+
+
+def _warn_second_order_float32() -> None:
+    """Warn once if a second-order-in-time solve is assembled without ``jax_enable_x64``.
+
+    jNO does not own data precision (see :mod:`jno.utils.dtypes`), so we never force float64. But a
+    wave / elastodynamics mass–stiffness pair has *soft* modes — a slender cantilever's fundamental
+    bending frequency, say, whose modal stiffness is orders of magnitude below ``‖K‖`` — and float32
+    assembly round-off (~1e-7 relative) can shift such a frequency by several percent. The
+    trapezoidal rule still conserves energy on the (slightly wrong) block, so the error is *silent*:
+    the vibration rings at the wrong speed while every conservation check passes. Enabling x64 makes
+    it exact. We warn rather than raise, once per process, to keep the choice with the user.
+    """
+    global _SECOND_ORDER_FLOAT32_WARNED
+    if _SECOND_ORDER_FLOAT32_WARNED or jax.config.jax_enable_x64:
+        return
+    _SECOND_ORDER_FLOAT32_WARNED = True
+    warnings.warn(
+        "jno.fem: assembling a second-order-in-time (u_tt) problem with jax_enable_x64 disabled "
+        "(float32). Soft-mode frequencies (e.g. slender-beam bending) can be several percent wrong "
+        "while energy is still conserved — a silent error. Enable "
+        'jax.config.update("jax_enable_x64", True) for accurate wave / elastodynamics frequencies.',
+        stacklevel=2,
+    )
+
+
 def _assemble_second_order_time(
     domain,
     volume_terms,
@@ -3460,11 +3488,21 @@ def _assemble_second_order_time(
     ``fem.state0`` accessors are unchanged; the state is ``y=[u; v]`` (size ``2N``), split via
     ``fem.offsets`` (``[0, N, 2N]``) — displacement ``y[:N]``, velocity ``y[N:]``.
 
+    **Runtime / trainable parameters** (the differentiable inverse through ``u_tt`` — full-waveform
+    inversion, elastography, source recovery) are supported: when a coefficient is a
+    :func:`jno.np.parameter`, a trainable scalar, or a ``jno.nn.wrap`` field, each block ``M₂/C/K`` is
+    assembled as a callable ``op(args)`` and the augmented ``M_aug``/``A_aug``/forcing are re-formed
+    per step through ``operator_fn``/``mass_fn``/``forcing_vector_fn``; the θ=½ stepper differentiates
+    through its own scan, so the gradient reaches the parameter with no stepper change. ``M₂`` feeds
+    both ``M_aug`` and the ``−M₂`` coupling of ``A_aug``, so a parametric *mass* wires ``mass_fn`` as
+    well as ``operator_fn``. The constant Dirichlet ``g`` rides ``affine_bias`` and the (possibly
+    parametric) load ``F`` rides the forcing.
+
     Scope: linear, single field — **scalar or vector** (vector = elastodynamics, ``value_shape=(2,)``
     / ``(3,)``) — nodal Lagrange, 2D/3D, constant Dirichlet. Two initial conditions: displacement
     ``u(initial) - u0`` and (optional) velocity ``u.t(initial) - v0`` (default zero). Nonlinear,
-    multi-field, runtime-parameter, or time-varying-Dirichlet second-order forms are rejected
-    (fail-loud) rather than silently mis-assembled.
+    multi-field, time-varying-Dirichlet ``g(x,t)``, or *trainable-Dirichlet-value* second-order forms
+    are rejected (fail-loud) rather than silently mis-assembled.
     """
     from .utils.solver.backend_blocks import SemidiscreteTimeBlock
     from .utils.solver.fem_native import assemble_fem_native
@@ -3485,16 +3523,25 @@ def _assemble_second_order_time(
         raise NotImplementedError(
             "jno.fem: a nonlinear second-order-in-time form is not supported; linearize it or write a first-order system."
         )
-    if any(_contains_runtime_parameter(b) for b in weak_bares):
-        raise NotImplementedError(
-            "jno.fem: runtime/trainable parameters in a second-order-in-time form are not supported yet; "
-            "recover parameters on a first-order (reduced) form instead."
-        )
     if any(_is_temporal_value_node(vnode) for *_rest, vnode in dirichlet_raw):
         raise NotImplementedError(
             "jno.fem: time-varying Dirichlet g(x,t) on a second-order-in-time problem is not supported "
             "(the velocity boundary value v=g_t is taken as zero); use a constant Dirichlet value."
         )
+    # Runtime/trainable parameters ARE supported (the differentiable inverse through `u_tt`): the
+    # augmented block is re-formed from the runtime args each step (below). Only a parametric Dirichlet
+    # *value* is rejected — the held boundary value is a constant snapshot, so a trainable g would
+    # silently freeze at its initial value.
+    has_param = any(_contains_runtime_parameter(b) for b in weak_bares)
+    if has_param and any(_contains_runtime_parameter(vnode) for *_rest, vnode in dirichlet_raw):
+        raise NotImplementedError(
+            "jno.fem: a runtime/trainable Dirichlet value on a second-order-in-time problem is not "
+            "supported (the held boundary value is a constant); keep the Dirichlet value fixed and "
+            "recover the parameter through the operator or load instead."
+        )
+
+    # Wave / elastodynamics frequencies of soft modes are not resolvable in float32 (silent error).
+    _warn_second_order_float32()
 
     # ---- quadrature setup (the native assembler owns the FE state; no problem object) ----
     quad_degree = max(quad_degree, 2 * order)  # factory uses 2*degree+1; bump to the field's order
@@ -3520,40 +3567,50 @@ def _assemble_second_order_time(
     if not mass2_raw:
         raise ValueError("jno.fem: second-order route found no `u_tt * phi` mass term.")
 
-    # Raw (no-Dirichlet) physics blocks assembled natively; the mass/damping bilinears (`u*phi`,
-    # which carry no gradient to anchor field inference on their own) are assembled here in the same
-    # preprocessed-term context the dispatch produced, where the field is established. Dirichlet is
-    # applied explicitly to the 2N augmented system below (row replacement, columns kept).
-    def _native_matrix(terms, bterms):
+    # Raw (no-Dirichlet) physics blocks assembled natively; Dirichlet is applied explicitly to the 2N
+    # augmented system below (row replacement, columns kept). Each group is returned as a pair of
+    # callables ``op(args)`` / ``rhs(args)``: a parameter-free group's callable just returns its
+    # constant matrix, while a runtime-parametric group (a wave speed, a density, a ``k(x)``/nn field)
+    # re-assembles at the runtime args each call, kept differentiable in args so the gradient reaches
+    # the parameter through every step of the augmented march. ``A0``/``b0`` are the static
+    # placeholders (parameters at 0 / stored weights) used for the ``.M``/``.A`` accessors and sizing.
+    def _native_group(terms, bterms):
         op, _mode, _offs = assemble_fem_native(domain, terms, bterms, [], [], vec=vec, quad_degree=quad_degree)
-        # second-order augmentation composes via jnp.block -> densify the BCOO assembler output
-        return _as_dense(op[0]), jnp.asarray(op[1]).reshape(-1)
+        if isinstance(op, tuple):  # static (A, b): a parameter-free group
+            A0, b0 = _as_dense(op[0]), jnp.asarray(op[1]).reshape(-1)
+            return {
+                "op": (lambda a=None, _A=A0: _A),
+                "rhs": (lambda a=None, _b=b0: _b),
+                "A0": A0,
+                "b0": b0,
+                "rpe": {},
+                "is_param": False,
+            }
+        # parametric FemLinearSystem: operator_fn(args)/rhs_fn(args) re-assemble at the runtime args.
+        return {
+            "op": (lambda a=None, _o=op: _as_dense(_o.operator_fn(a))),
+            "rhs": (lambda a=None, _o=op: jnp.asarray(_o.rhs_fn(a)).reshape(-1)),
+            "A0": _as_dense(op.A),
+            "b0": jnp.asarray(op.b).reshape(-1),
+            "rpe": dict(getattr(op, "runtime_parameter_exprs", {}) or {}),
+            "is_param": True,
+        }
 
-    M2, _ = _native_matrix(mass2_raw, {})
-    n = int(M2.shape[0])
-    dtype = M2.dtype
-    C = _native_matrix(damp_raw, {})[0] if damp_raw else jnp.zeros((n, n), dtype=dtype)
-    K, F = _native_matrix(stiff_raw, boundary_terms)  # spatial operator (K) + load (F), Neumann in K/F
+    gm = _native_group(mass2_raw, {})  # u_tt -> M2 (mass)
+    n = int(gm["A0"].shape[0])
+    dtype = gm["A0"].dtype
+    Z = jnp.zeros((n, n), dtype=dtype)
+    gc = _native_group(damp_raw, {}) if damp_raw else None  # u_t -> C (damping)
+    gk = _native_group(stiff_raw, boundary_terms)  # spatial operator K + load F (Neumann in K/F)
 
-    # Dirichlet (dof, value) pairs from the native assembler (it stashes them); the augmented block
-    # below reads u[d]=g on the displacement rows and v[d]=0 on the velocity rows.
+    # Dirichlet (dof, value) pairs from the native assembler (it stashes them); constant g only, so the
+    # velocity boundary value is zero. The augmented block reads u[d]=g on displacement rows, v[d]=0 on
+    # velocity rows.
     assemble_fem_native(domain, stiff_raw, boundary_terms, dirichlet_raw, [], vec=vec, quad_degree=quad_degree)
     pairs = list(getattr(domain, "_fem_native_dirichlet_pairs", []) or [])
     rows = jnp.asarray([p[0] for p in pairs], dtype=int) if pairs else jnp.zeros((0,), dtype=int)
     g = jnp.asarray([p[1] for p in pairs], dtype=dtype) if pairs else jnp.zeros((0,), dtype=dtype)
-
-    # ---- compose the 2N augmented system M_aug y' + A_aug y = c_aug, y = [u; v] ----
-    Z = jnp.zeros((n, n), dtype=dtype)
-    M_aug = jnp.block([[M2, Z], [Z, M2]])
-    A_aug = jnp.block([[Z, -M2], [K, C]])
-    c_aug = jnp.concatenate([jnp.zeros((n,), dtype), F])
-
-    # Dirichlet: u-block row d reads u[d]=g; v-block row d reads v[d]=0 (constant g => velocity zero).
-    if int(rows.shape[0]):
-        M_aug = M_aug.at[rows, :].set(0.0).at[rows + n, :].set(0.0)
-        A_aug = A_aug.at[rows, :].set(0.0).at[rows, rows].set(1.0)  # u[d] = g
-        A_aug = A_aug.at[rows + n, :].set(0.0).at[rows + n, rows + n].set(1.0)  # v[d] = 0
-        c_aug = c_aug.at[rows].set(g).at[rows + n].set(0.0)
+    nrows = int(rows.shape[0])
 
     # ---- initial state y0 = [u0; v0] from the displacement and (optional) velocity ICs ----
     # The IC is sampled at the native assembly DOF coordinates (vertices + P2 edge-midpoints), which
@@ -3568,25 +3625,87 @@ def _assemble_second_order_time(
         else:
             u0 = val
     state0 = jnp.concatenate([u0, v0])
-
     domain._fem_problem = None  # native owns this domain's FE state -> FEM.points reads the native DOFs
-
     t0, t1, dt = _infer_time_window(domain)
-    block = SemidiscreteTimeBlock(
-        backend="transient",
-        mode="implicit",
-        time_order=2,
-        spatial_kind="weak_form",
-        M=M_aug,
-        A=A_aug,
-        affine_bias=c_aug,
-        state0=state0,
-        t0=t0,
-        t1=t1,
-        dt=dt,
-        eval_context={},
-        metadata={"theta": 0.5, "second_order": True},
-    )
+
+    # ---- compose the 2N augmented system M_aug y' + A_aug y = c_aug, y = [u; v] ----
+    #   [M2  0 ] [u']   [ 0   -M2] [u]   [0]
+    #   [0   M2] [v'] + [ K    C ] [v] = [F]
+    def _dirichlet_A(A):  # u-block row d -> u[d]=g ; v-block row d -> v[d]=0 (identity rows, cols kept)
+        if not nrows:
+            return A
+        A = A.at[rows, :].set(0.0).at[rows, rows].set(1.0)
+        return A.at[rows + n, :].set(0.0).at[rows + n, rows + n].set(1.0)
+
+    def _dirichlet_M(M):  # zero both blocks' Dirichlet rows (the constraint rows are algebraic)
+        return M.at[rows, :].set(0.0).at[rows + n, :].set(0.0) if nrows else M
+
+    if not has_param:
+        # parameter-free: assemble the augmented block once (the fast, common path)
+        M2, C, K, F = gm["A0"], (gc["A0"] if gc else Z), gk["A0"], gk["b0"]
+        M_aug = _dirichlet_M(jnp.block([[M2, Z], [Z, M2]]))
+        A_aug = _dirichlet_A(jnp.block([[Z, -M2], [K, C]]))
+        c_aug = jnp.concatenate([jnp.zeros((n,), dtype), F])
+        if nrows:
+            c_aug = c_aug.at[rows].set(g).at[rows + n].set(0.0)
+        block = SemidiscreteTimeBlock(
+            backend="transient",
+            mode="implicit",
+            time_order=2,
+            spatial_kind="weak_form",
+            M=M_aug,
+            A=A_aug,
+            affine_bias=c_aug,
+            state0=state0,
+            t0=t0,
+            t1=t1,
+            dt=dt,
+            eval_context={},
+            metadata={"theta": 0.5, "second_order": True},
+        )
+    else:
+        # runtime/trainable parameters: re-form the augmented block from args each step so the gradient
+        # flows through the whole march. The stepper already reads operator_fn/mass_fn/forcing_vector_fn
+        # and differentiates through its scan (no stepper change). M2 appears in both M_aug and the -M2
+        # coupling of A_aug, so a parametric mass wires mass_fn *and* operator_fn; the constant Dirichlet
+        # g rides affine_bias while the (possibly parametric) load F rides the forcing, zeroed on the
+        # Dirichlet rows so it never fights the held boundary value.
+        def _A_of(args):
+            M2, C, K = gm["op"](args), (gc["op"](args) if gc else Z), gk["op"](args)
+            return _dirichlet_A(jnp.block([[Z, -M2], [K, C]]))
+
+        def _M_of(args):
+            M2 = gm["op"](args)
+            return _dirichlet_M(jnp.block([[M2, Z], [Z, M2]]))
+
+        def _f_of(args):
+            f = jnp.concatenate([jnp.zeros((n,), dtype), gk["rhs"](args)])
+            return f.at[rows].set(0.0).at[rows + n].set(0.0) if nrows else f
+
+        M2s, Cs, Ks = gm["A0"], (gc["A0"] if gc else Z), gk["A0"]
+        M_aug0 = _dirichlet_M(jnp.block([[M2s, Z], [Z, M2s]]))
+        A_aug0 = _dirichlet_A(jnp.block([[Z, -M2s], [Ks, Cs]]))
+        c_dir = jnp.zeros((2 * n,), dtype).at[rows].set(g) if nrows else jnp.zeros((2 * n,), dtype)
+        rpe = {**gm["rpe"], **(gc["rpe"] if gc else {}), **gk["rpe"]}
+        block = SemidiscreteTimeBlock(
+            backend="transient",
+            mode="implicit",
+            time_order=2,
+            spatial_kind="weak_form",
+            M=M_aug0,
+            A=A_aug0,
+            affine_bias=c_dir,
+            operator_fn=lambda t, args=None: _A_of(args),
+            mass_fn=((lambda t, args=None: _M_of(args)) if gm["is_param"] else None),
+            forcing_vector_fn=lambda t, args=None: _f_of(args),
+            runtime_parameter_exprs=rpe,
+            state0=state0,
+            t0=t0,
+            t1=t1,
+            dt=dt,
+            eval_context={},
+            metadata={"theta": 0.5, "second_order": True, "runtime_parameter_names": list(rpe), "nonaffine_operator": True},
+        )
     return FEM(domain=domain, op=block, classification=classification, mode="transient", offsets=[0, n, 2 * n])
 
 
