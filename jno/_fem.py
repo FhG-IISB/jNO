@@ -3523,11 +3523,9 @@ def _assemble_second_order_time(
         raise NotImplementedError(
             "jno.fem: a nonlinear second-order-in-time form is not supported; linearize it or write a first-order system."
         )
-    if any(_is_temporal_value_node(vnode) for *_rest, vnode in dirichlet_raw):
-        raise NotImplementedError(
-            "jno.fem: time-varying Dirichlet g(x,t) on a second-order-in-time problem is not supported "
-            "(the velocity boundary value v=g_t is taken as zero); use a constant Dirichlet value."
-        )
+    # Time-varying Dirichlet g(x,t) IS supported (driven boundaries: prescribed oscillation, seismic
+    # input, a transducer feed): the displacement rows carry u[d]=g(x_d,t) and the velocity rows carry
+    # the compatible v[d]=ġ(x_d,t), both written into the forcing per step (below).
     # Runtime/trainable parameters ARE supported (the differentiable inverse through `u_tt`): the
     # augmented block is re-formed from the runtime args each step (below). Only a parametric Dirichlet
     # *value* is rejected — the held boundary value is a constant snapshot, so a trainable g would
@@ -3603,18 +3601,37 @@ def _assemble_second_order_time(
     gc = _native_group(damp_raw, {}) if damp_raw else None  # u_t -> C (damping)
     gk = _native_group(stiff_raw, boundary_terms)  # spatial operator K + load F (Neumann in K/F)
 
-    # Dirichlet (dof, value) pairs from the native assembler (it stashes them); constant g only, so the
-    # velocity boundary value is zero. The augmented block reads u[d]=g on displacement rows, v[d]=0 on
-    # velocity rows.
+    # Dirichlet from the native assembler (it stashes them): constant (dof, value) pairs → the held
+    # value rides the affine bias; time-varying entries (dofs, g(x,t) node, coords) → the displacement
+    # rows carry u[d]=g(x_d,t) and the velocity rows the compatible v[d]=ġ(x_d,t), written per step.
     assemble_fem_native(domain, stiff_raw, boundary_terms, dirichlet_raw, [], vec=vec, quad_degree=quad_degree)
     pairs = list(getattr(domain, "_fem_native_dirichlet_pairs", []) or [])
     rows = jnp.asarray([p[0] for p in pairs], dtype=int) if pairs else jnp.zeros((0,), dtype=int)
     g = jnp.asarray([p[1] for p in pairs], dtype=dtype) if pairs else jnp.zeros((0,), dtype=dtype)
-    nrows = int(rows.shape[0])
+    tv = list(getattr(domain, "_fem_native_dirichlet_tv", []) or [])  # driven boundaries g(x,t)
+    has_tv = bool(tv)
+    rows_tv = jnp.concatenate([jnp.asarray(e[0], dtype=int) for e in tv]) if tv else jnp.zeros((0,), dtype=int)
+    rows_all = jnp.concatenate([rows, rows_tv])  # every Dirichlet displacement DOF (constant + driven)
+    nrows = int(rows_all.shape[0])
+    t0, t1, dt = _infer_time_window(domain)
 
-    # ---- initial state y0 = [u0; v0] from the displacement and (optional) velocity ICs ----
-    # The IC is sampled at the native assembly DOF coordinates (vertices + P2 edge-midpoints), which
-    # the native assembler stashed; ``n = N*vec`` flattens node-major, matching the block layout.
+    def _gval(vnode, coords, t):  # g(x_d, t) at the boundary DOF coordinates
+        return jnp.asarray(_eval_value_node_at_time(vnode, coords, t)).reshape(-1)
+
+    def _gdot(vnode, coords, t):  # ġ(x_d, t) = ∂g/∂t — the velocity compatible with a moving boundary
+        _, gd = jax.jvp(lambda tt: _eval_value_node_at_time(vnode, coords, tt), (t,), (jnp.ones_like(t),))
+        return jnp.asarray(gd).reshape(-1)
+
+    def _tv_forcing(t):  # driven-boundary rows: g(t) on displacement, ġ(t) on velocity
+        f = jnp.zeros((2 * n,), dtype)
+        for dofs, vnode, coords in tv:
+            dd = jnp.asarray(dofs, dtype=int)
+            f = f.at[dd].set(_gval(vnode, coords, t)).at[dd + n].set(_gdot(vnode, coords, t))
+        return f
+
+    # ---- initial state y0 = [u0; v0] from the ICs, made Dirichlet-consistent (u[d]=g, v[d]=0 or ġ(t0)) ----
+    # The IC is sampled at the native assembly DOF coordinates (vertices + P2 edge-midpoints), stashed by
+    # the native assembler; ``n = N*vec`` flattens node-major, matching the block layout.
     pts = jnp.asarray(getattr(domain, "_fem_native_dof_points", domain.mesh.points))[:, : domain.dimension]
     u0 = jnp.zeros((n,), dtype)
     v0 = jnp.zeros((n,), dtype)
@@ -3624,24 +3641,39 @@ def _assemble_second_order_time(
             v0 = val
         else:
             u0 = val
+    if int(rows.shape[0]):  # constant Dirichlet: u(0)=g, v(0)=0
+        u0, v0 = u0.at[rows].set(g), v0.at[rows].set(0.0)
+    for dofs, vnode, coords in tv:  # driven boundary: u(0)=g(x,t0), v(0)=ġ(x,t0)
+        dd = jnp.asarray(dofs, dtype=int)
+        u0, v0 = u0.at[dd].set(_gval(vnode, coords, t0)), v0.at[dd].set(_gdot(vnode, coords, t0))
     state0 = jnp.concatenate([u0, v0])
     domain._fem_problem = None  # native owns this domain's FE state -> FEM.points reads the native DOFs
-    t0, t1, dt = _infer_time_window(domain)
 
     # ---- compose the 2N augmented system M_aug y' + A_aug y = c_aug, y = [u; v] ----
     #   [M2  0 ] [u']   [ 0   -M2] [u]   [0]
     #   [0   M2] [v'] + [ K    C ] [v] = [F]
-    def _dirichlet_A(A):  # u-block row d -> u[d]=g ; v-block row d -> v[d]=0 (identity rows, cols kept)
+    def _dirichlet_A(A):  # every Dirichlet row (u-block d, v-block d+n) -> identity row (cols kept)
         if not nrows:
             return A
-        A = A.at[rows, :].set(0.0).at[rows, rows].set(1.0)
-        return A.at[rows + n, :].set(0.0).at[rows + n, rows + n].set(1.0)
+        A = A.at[rows_all, :].set(0.0).at[rows_all, rows_all].set(1.0)
+        return A.at[rows_all + n, :].set(0.0).at[rows_all + n, rows_all + n].set(1.0)
 
-    def _dirichlet_M(M):  # zero both blocks' Dirichlet rows (the constraint rows are algebraic)
-        return M.at[rows, :].set(0.0).at[rows + n, :].set(0.0) if nrows else M
+    def _dirichlet_M(M):  # zero every Dirichlet row of both blocks (the constraint rows are algebraic)
+        return M.at[rows_all, :].set(0.0).at[rows_all + n, :].set(0.0) if nrows else M
 
-    if not has_param:
-        # parameter-free: assemble the augmented block once (the fast, common path)
+    common = dict(
+        backend="transient",
+        mode="implicit",
+        time_order=2,
+        spatial_kind="weak_form",
+        state0=state0,
+        t0=t0,
+        t1=t1,
+        dt=dt,
+        eval_context={},
+    )
+    if not has_param and not has_tv:
+        # parameter-free, constant Dirichlet: assemble the augmented block once (the fast, common path)
         M2, C, K, F = gm["A0"], (gc["A0"] if gc else Z), gk["A0"], gk["b0"]
         M_aug = _dirichlet_M(jnp.block([[M2, Z], [Z, M2]]))
         A_aug = _dirichlet_A(jnp.block([[Z, -M2], [K, C]]))
@@ -3649,27 +3681,15 @@ def _assemble_second_order_time(
         if nrows:
             c_aug = c_aug.at[rows].set(g).at[rows + n].set(0.0)
         block = SemidiscreteTimeBlock(
-            backend="transient",
-            mode="implicit",
-            time_order=2,
-            spatial_kind="weak_form",
-            M=M_aug,
-            A=A_aug,
-            affine_bias=c_aug,
-            state0=state0,
-            t0=t0,
-            t1=t1,
-            dt=dt,
-            eval_context={},
-            metadata={"theta": 0.5, "second_order": True},
+            M=M_aug, A=A_aug, affine_bias=c_aug, metadata={"theta": 0.5, "second_order": True}, **common
         )
     else:
-        # runtime/trainable parameters: re-form the augmented block from args each step so the gradient
-        # flows through the whole march. The stepper already reads operator_fn/mass_fn/forcing_vector_fn
-        # and differentiates through its scan (no stepper change). M2 appears in both M_aug and the -M2
-        # coupling of A_aug, so a parametric mass wires mass_fn *and* operator_fn; the constant Dirichlet
-        # g rides affine_bias while the (possibly parametric) load F rides the forcing, zeroed on the
-        # Dirichlet rows so it never fights the held boundary value.
+        # runtime parameters and/or driven boundaries: re-form what varies each step, so the gradient
+        # flows through the whole march (the θ=½ stepper reads operator_fn/mass_fn/forcing_vector_fn and
+        # differentiates through its own scan — no stepper change). M2 feeds both M_aug and the -M2
+        # coupling of A_aug, so a parametric mass wires mass_fn *and* operator_fn. The constant Dirichlet
+        # g rides affine_bias; the load F and the driven boundary g(t)/ġ(t) ride the forcing (zeroed on
+        # the Dirichlet rows so the load never fights the held value).
         def _A_of(args):
             M2, C, K = gm["op"](args), (gc["op"](args) if gc else Z), gk["op"](args)
             return _dirichlet_A(jnp.block([[Z, -M2], [K, C]]))
@@ -3678,33 +3698,27 @@ def _assemble_second_order_time(
             M2 = gm["op"](args)
             return _dirichlet_M(jnp.block([[M2, Z], [Z, M2]]))
 
-        def _f_of(args):
+        def _forcing(t, args):
             f = jnp.concatenate([jnp.zeros((n,), dtype), gk["rhs"](args)])
-            return f.at[rows].set(0.0).at[rows + n].set(0.0) if nrows else f
+            if nrows:
+                f = f.at[rows_all].set(0.0).at[rows_all + n].set(0.0)  # load off the Dirichlet rows
+            return f + _tv_forcing(t) if has_tv else f  # driven-boundary g(t)/ġ(t) on the tv rows
 
         M2s, Cs, Ks = gm["A0"], (gc["A0"] if gc else Z), gk["A0"]
         M_aug0 = _dirichlet_M(jnp.block([[M2s, Z], [Z, M2s]]))
         A_aug0 = _dirichlet_A(jnp.block([[Z, -M2s], [Ks, Cs]]))
-        c_dir = jnp.zeros((2 * n,), dtype).at[rows].set(g) if nrows else jnp.zeros((2 * n,), dtype)
+        c_dir = jnp.zeros((2 * n,), dtype).at[rows].set(g) if int(rows.shape[0]) else jnp.zeros((2 * n,), dtype)
         rpe = {**gm["rpe"], **(gc["rpe"] if gc else {}), **gk["rpe"]}
         block = SemidiscreteTimeBlock(
-            backend="transient",
-            mode="implicit",
-            time_order=2,
-            spatial_kind="weak_form",
             M=M_aug0,
             A=A_aug0,
             affine_bias=c_dir,
-            operator_fn=lambda t, args=None: _A_of(args),
-            mass_fn=((lambda t, args=None: _M_of(args)) if gm["is_param"] else None),
-            forcing_vector_fn=lambda t, args=None: _f_of(args),
+            operator_fn=(lambda t, args=None: _A_of(args)) if has_param else None,
+            mass_fn=((lambda t, args=None: _M_of(args)) if (has_param and gm["is_param"]) else None),
+            forcing_vector_fn=lambda t, args=None: _forcing(t, args),
             runtime_parameter_exprs=rpe,
-            state0=state0,
-            t0=t0,
-            t1=t1,
-            dt=dt,
-            eval_context={},
             metadata={"theta": 0.5, "second_order": True, "runtime_parameter_names": list(rpe), "nonaffine_operator": True},
+            **common,
         )
     return FEM(domain=domain, op=block, classification=classification, mode="transient", offsets=[0, n, 2 * n])
 

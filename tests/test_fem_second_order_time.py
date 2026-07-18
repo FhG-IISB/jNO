@@ -246,6 +246,34 @@ def test_constant_nonhomogeneous_dirichlet_is_held():
     assert np.max(np.abs(V)) < 1e-6, "velocity should stay zero for a static constant-Dirichlet field"
 
 
+def test_second_order_time_varying_dirichlet_drives_wave():
+    """Time-varying (driven) Dirichlet ``g(x,t)``: ``u = cos(πx)cos(πt)`` solves ``u_tt = Δu`` (it is
+    y-independent, so ``u_yy=0``) with the whole boundary driven by ``g(x,t)=cos(πx)cos(πt)``. The
+    displacement rows carry ``u[d]=g(t)`` and the velocity rows the compatible ``v[d]=ġ(t)`` (AD of the
+    boundary value through the θ-scheme), so the interior tracks the analytic *driven* wave — the load
+    the old code rejected (it hard-zeroed the velocity boundary value)."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.09, time=(0.0, 1.2, 72))
+    u, phi = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, tb = d.variable("boundary", split=True)
+    xi0, yi0, ti0 = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    ui0 = u.bind(x=xi0, y=yi0, t=ti0)
+    weak = ui.tt * vi + (ui.x * vi.x + ui.y * vi.y)
+    g = u(xb, yb) - jno.np.cos(PI * xb) * jno.np.cos(PI * tb)  # driven boundary g(x,t)=cos(πx)cos(πt)
+    fem = jno.fem([weak, g, u(xi0, yi0) - jno.fn(lambda x, y: jnp.cos(PI * x), [xi0, yi0]), ui0.t - 0.0])
+    assert fem.is_transient and fem.operator.forcing_vector_fn is not None  # driven -> time-dependent forcing
+    ts, U, _ = _trajectory(fem)
+    pts = np.asarray(fem.points)
+    exact = np.cos(PI * pts[:, 0])[None, :] * np.cos(PI * ts)[:, None]
+    rel = np.linalg.norm(U - exact) / np.linalg.norm(exact)
+    assert rel < 0.01, f"driven wave does not track cos(πx)cos(πt): rel L2 = {rel:.4f}"
+    # the driven boundary itself must equal g(x,t) exactly (the g(t) row) at every grid time
+    bnode = int(np.argmin(np.abs(pts[:, 0]) + np.abs(pts[:, 1] - 0.5)))  # a node on the driven left edge
+    g_bnode = np.cos(PI * pts[bnode, 0]) * np.cos(PI * ts)
+    assert np.max(np.abs(U[:, bnode] - g_bnode)) < 1e-6, "the driven boundary must equal g(x,t) exactly"
+
+
 # ==========================================================================
 # fail-loud scope boundaries (a mis-assembled second-order solve is silently wrong)
 # ==========================================================================
