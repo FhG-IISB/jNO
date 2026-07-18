@@ -3529,10 +3529,9 @@ def _assemble_second_order_time(
 
     # ---- fail-loud guards (a mis-assembled second-order solve is a silently wrong result) ----
     weak_bares = list(volume_terms) + [e for exprs in boundary_terms.values() for e in exprs]
-    if any(_is_obviously_nonlinear_in_unknown(domain, b) for b in weak_bares):
-        raise NotImplementedError(
-            "jno.fem: a nonlinear second-order-in-time form is not supported; linearize it or write a first-order system."
-        )
+    # A NONLINEAR spatial operator (sine-Gordon, cubic Klein–Gordon, large-deformation elastodynamics)
+    # is supported via Newton on the augmented residual (below); only the mass/damping stay linear.
+    is_nonlinear = any(_is_obviously_nonlinear_in_unknown(domain, b) for b in weak_bares)
     # Time-varying Dirichlet g(x,t) IS supported (driven boundaries: prescribed oscillation, seismic
     # input, a transducer feed): the displacement rows carry u[d]=g(x_d,t) and the velocity rows carry
     # the compatible v[d]=ġ(x_d,t), both written into the forcing per step (below).
@@ -3609,7 +3608,8 @@ def _assemble_second_order_time(
     dtype = gm["A0"].dtype
     Z = jnp.zeros((n, n), dtype=dtype)
     gc = _native_group(damp_raw, {}) if damp_raw else None  # u_t -> C (damping)
-    gk = _native_group(stiff_raw, boundary_terms)  # spatial operator K + load F (Neumann in K/F)
+    # A nonlinear spatial operator is assembled as a residual/jacobian below, not a linear K matrix.
+    gk = None if is_nonlinear else _native_group(stiff_raw, boundary_terms)  # spatial operator K + load F
 
     # Dirichlet from the native assembler (it stashes them): constant (dof, value) pairs → the held
     # value rides the affine bias; time-varying entries (dofs, g(x,t) node, coords) → the displacement
@@ -3682,7 +3682,46 @@ def _assemble_second_order_time(
         dt=dt,
         eval_context={},
     )
-    if not has_param and not has_tv:
+    if is_nonlinear:
+        # nonlinear spatial operator (sine-Gordon, cubic Klein–Gordon, large-deformation elastodynamics):
+        # Newton on the augmented residual M_aug ẏ + R_aug(y) = 0 with R_aug(y) = [−M2 v ; N(u,args)+C v],
+        # N(u)=S(u)−F the native nonlinear spatial residual. The θ=½ stepper (now θ-aware for nonlinear
+        # blocks too) keeps the undamped wave from bleeding energy; args flow through N/J_N for the inverse.
+        if has_tv:
+            raise NotImplementedError(
+                "jno.fem: time-varying Dirichlet g(x,t) on a *nonlinear* second-order-in-time form is not "
+                "supported; use a constant Dirichlet value."
+            )
+        M2, C = gm["A0"], (gc["A0"] if gc else Z)
+        sop, _sm, _so = assemble_fem_native(domain, stiff_raw, boundary_terms, [], [], vec=vec, quad_degree=quad_degree)
+        M_aug = _dirichlet_M(jnp.block([[M2, Z], [Z, M2]]))
+        rpe = dict(getattr(sop, "runtime_parameter_exprs", {}) or {})
+
+        def _residual_aug(y, t=0.0, args=None):
+            y = jnp.asarray(y).reshape(-1)
+            u_, v_ = y[:n], y[n:]
+            r = jnp.concatenate([-(M2 @ v_), jnp.asarray(sop.residual(u_, args)).reshape(-1) + (C @ v_)])
+            if int(rows.shape[0]):  # u[d]=g on displacement rows, v[d]=0 on velocity rows (constant g)
+                r = r.at[rows].set(u_[rows] - g).at[rows + n].set(v_[rows])
+            return r
+
+        def _jacobian_aug(y, t=0.0, args=None):
+            y = jnp.asarray(y).reshape(-1)
+            jn = _as_dense(sop.jacobian(y[:n], args))  # ∂N/∂u
+            return _dirichlet_A(jnp.block([[Z, -M2], [jn, C]]))
+
+        meta = {"theta": 0.5, "second_order": True}
+        if rpe:
+            meta.update(runtime_parameter_names=list(rpe), nonaffine_operator=True)
+        block = SemidiscreteTimeBlock(
+            mass=lambda t, args=None, _M=M_aug: _M,
+            residual=_residual_aug,
+            jacobian=_jacobian_aug,
+            runtime_parameter_exprs=rpe,
+            metadata=meta,
+            **common,
+        )
+    elif not has_param and not has_tv:
         # parameter-free, constant Dirichlet: assemble the augmented block once (the fast, common path)
         M2, C, K, F = gm["A0"], (gc["A0"] if gc else Z), gk["A0"], gk["b0"]
         M_aug = _dirichlet_M(jnp.block([[M2, Z], [Z, M2]]))

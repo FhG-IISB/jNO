@@ -571,17 +571,62 @@ def test_second_order_recovers_wave_speed_via_crux():
     assert abs(rec - 1.0) < 0.05, f"wave speed not recovered through crux: c²={rec:.4f} (truth 1.0)"
 
 
-def test_second_order_nonlinear_rejected():
-    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.3, time=(0.0, 1.0, 10))
+def _cubic_klein_gordon(amp, mesh_size=0.16, t1=1.6, n_steps=96):
+    """Cubic Klein–Gordon ``u_tt = Δu − u³`` on the unit square, clamped, released from
+    ``amp·sin(πx)sin(πy)`` at rest — a nonlinear second-order-in-time form."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=mesh_size, time=(0.0, float(t1), n_steps))
     u, phi = d.fem_symbols()
     xi, yi, ti = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
     xi0, yi0, ti0 = d.variable("initial", split=True)
     ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
     ui0 = u.bind(x=xi0, y=yi0, t=ti0)
-    weak = ui.tt * vi + (ui.x * vi.x + ui.y * vi.y) + (ui**3) * vi  # cubic reaction -> nonlinear
-    with pytest.raises(NotImplementedError, match="nonlinear"):
-        jno.fem([weak, u(xb, yb) - 0.0, u(xi0, yi0) - 0.0, ui0.t - 0.0])
+    weak = ui.tt * vi + (ui.x * vi.x + ui.y * vi.y) + (ui**3) * vi  # u_tt = Δu − u³
+    u0 = u(xi0, yi0) - jno.fn(lambda x, y: amp * jnp.sin(PI * x) * jnp.sin(PI * y), [xi0, yi0])
+    return jno.fem([weak, u(xb, yb) - 0.0, u0, ui0.t - 0.0])
+
+
+def test_second_order_nonlinear_reduces_to_linear_at_small_amplitude():
+    """A nonlinear second-order form is supported (Newton on the augmented residual). At tiny amplitude
+    the cubic term ``u³`` is negligible, so the solve reproduces the linear standing wave
+    ``sin(πx)sin(πy)cos(ω t)``, ``ω=π√2`` — a direct check that the nonlinear augmented assembly is
+    correct (it must reduce to the linear block as the nonlinearity vanishes)."""
+    fem = _cubic_klein_gordon(1e-3)
+    assert fem.operator.is_nonlinear() and fem.is_transient
+    ts, U, _ = _trajectory(fem)
+    pts = np.asarray(fem.points)
+    ci = int(np.argmin(np.sum((pts - 0.5) ** 2, axis=1)))
+    exact = 1e-3 * _mode11(pts[ci, 0], pts[ci, 1]) * np.cos(OMEGA * ts)
+    rel = np.linalg.norm(U[:, ci] - exact) / np.linalg.norm(exact)
+    assert rel < 0.05, f"small-amplitude cubic KG should track the linear wave: rel L2 = {rel:.4f}"
+
+
+def test_second_order_nonlinear_klein_gordon_conserves_energy():
+    """Nonlinear ``u_tt = Δu − u³`` via Newton on the augmented residual. The θ=½ (Newmark) step
+    conserves the discrete energy ``E = ½vᵀM₂v + ½uᵀKu + ¼∫u⁴`` of the undamped nonlinear system,
+    while backward Euler (θ=1) dissipates it — the nonlinear analogue of the linear energy gate, and
+    the check that the θ-aware nonlinear step (not hard backward Euler) is in place."""
+    fem = _cubic_klein_gordon(0.8, mesh_size=0.17, t1=2.0, n_steps=110)
+    n = fem.offsets[1]
+    M2 = np.asarray(fem.M)[:n, :n]
+    d2 = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.17)
+    u2, p2 = d2.fem_symbols()
+    a2, b2, _ = d2.variable("interior", split=True)
+    ux, vx = u2.bind(x=a2, y=b2), p2.bind(x=a2, y=b2)
+    K = np.asarray(jno.fem([ux.x * vx.x + ux.y * vx.y]).A)
+    ts = np.asarray(_block_time_grid(fem.operator))
+
+    def energy(theta):
+        fem.operator.metadata["theta"] = theta
+        Y = np.asarray(_default_transient_integrate(fem.operator, {}, ts))
+        Ut, Vt = Y[:, :n], Y[:, n:]
+        lin = 0.5 * np.einsum("ti,ij,tj->t", Vt, M2, Vt) + 0.5 * np.einsum("ti,ij,tj->t", Ut, K, Ut)
+        return lin + 0.25 * np.einsum("ti,ij,tj->t", Ut**2, M2, Ut**2)  # + ¼∫u⁴ (nonlinear potential)
+
+    e_half, e_be = energy(0.5), energy(1.0)
+    assert np.all(np.isfinite(e_half)), "the nonlinear Newton march must not blow up"
+    assert abs(e_half[-1] / e_half[0] - 1.0) < 0.03, f"θ=½ should conserve nonlinear energy ({e_half[-1] / e_half[0]:.4f})"
+    assert e_be[-1] / e_be[0] < 0.85, f"backward Euler should dissipate nonlinear energy ({e_be[-1] / e_be[0]:.4f})"
 
 
 def test_second_order_multifield_rejected():
