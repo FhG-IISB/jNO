@@ -957,27 +957,30 @@ def curl_3d(
     return stack([curl_x, curl_y, curl_z], axis=-1)
 
 
-def integrate(expr: Placeholder) -> "Integral":
+def integrate(expr: Placeholder, *, quadrature: "str | int" = "nodal") -> "Integral":
     """Integrate a scalar expression over its mesh domain region.
 
-    Shorthand for ``expr.integrate()``.  The region (boundary vs volume) is
-    auto-detected from the Variable tags inside ``expr`` via
+    Shorthand for ``expr.integrate(quadrature=...)``.  The region (boundary vs
+    volume) is auto-detected from the Variable tags inside ``expr`` via
     ``domain._boundary_registry``.
 
-    The expression is evaluated at **all** mesh nodes of that region and
-    reduced to a scalar via a weighted sum using nodal measures.
-    For flux integrals, compute F·n explicitly first::
+    The expression is evaluated at the region's quadrature points and reduced to
+    a scalar via a weighted sum.  ``quadrature`` selects the volume rule:
+    ``"nodal"`` (default, the P1 vertex rule using nodal measures) or ``"gauss"``
+    / an integer degree (element Gauss quadrature — higher-order, alias-resistant;
+    volume regions only).  For flux integrals, compute F·n explicitly first::
 
         (Fx(x_b, y_b) * nx + Fy(x_b, y_b) * ny).integrate()
         integrate(Fx(x_b, y_b) * nx + Fy(x_b, y_b) * ny)  # equivalent
 
     Args:
         expr: Scalar-valued Placeholder expression.
+        quadrature: ``"nodal"`` (default), ``"gauss"``, or an integer Gauss degree.
 
     Returns:
         Integral node that evaluates to a scalar.
     """
-    return Integral(_u(expr))
+    return Integral(_u(expr), quadrature=quadrature)
 
 
 def test(name: str = "phi") -> TestFunction:

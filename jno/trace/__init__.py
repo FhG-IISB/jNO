@@ -802,13 +802,25 @@ class Placeholder:
     # Integration — method-style API
     # ------------------------------------------------------------------
 
-    def integrate(self, var: "Variable | None" = None) -> "Integral | IntegralTime":
+    def integrate(self, var: "Variable | None" = None, *, quadrature: "str | int" = "nodal") -> "Integral | IntegralTime":
         """Integrate this expression over its mesh domain region or over time.
 
         **Spatial scalar integral** (``var=None``, default):
         The region (boundary vs volume) is auto-detected from the Variable
         tags inside the expression.  The expression is evaluated at all mesh
         nodes and reduced to a scalar via a weighted sum.
+
+        ``quadrature`` selects the rule for a **volume** integral:
+
+        - ``"nodal"`` (default): the P1 nodal-volume (vertex) rule — evaluate at
+          mesh nodes, weight by each node's share of incident-cell volume. Exact
+          for P1, and the cheapest rule, but it only samples at the nodes.
+        - ``"gauss"`` or an integer degree: element Gauss quadrature of that
+          degree (``"gauss"`` → degree 4) — evaluate at the per-element Gauss
+          points, weight by ``w·|det J|``. Higher-order and far harder for an
+          expressive integrand (e.g. a network energy in a Deep-Ritz loss) to
+          *alias*, because it samples inside each element, not only at its
+          vertices. Volume regions only (a boundary integral raises).
 
         **Vectorized spatial integral** (``var=x`` — the outer/collocation variable):
         When the expression contains two distinct Variable objects from the
@@ -839,7 +851,7 @@ class Placeholder:
         """
         if var is not None and getattr(var, "axis", None) == "temporal":
             return IntegralTime(self, time_var=var)
-        return Integral(self, integration_var=var)
+        return Integral(self, integration_var=var, quadrature=quadrature)
 
     def grad(self, *args):
         """Gradient operator with two forms (dispatched by argument type).
@@ -2888,9 +2900,10 @@ class Integral(Placeholder):
     scalar, enabling non-separable Fredholm kernels.
     """
 
-    def __init__(self, target: "Placeholder", integration_var: "Variable | None" = None):
+    def __init__(self, target: "Placeholder", integration_var: "Variable | None" = None, quadrature: "str | int" = "nodal"):
         self.target = target
         self.integration_var = integration_var
+        self.quadrature = quadrature
         _propagate_weak(self, target)
 
     def __repr__(self):
