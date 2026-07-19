@@ -1300,18 +1300,26 @@ class FEM:
 
             return run_moving_boundary(self, move, solve_fn=solve_fn, **kwargs)
         if adapt is not None:
-            if has_slots:
+            # x0= (warm start) and time= do not compose with a remesh — the DOF layout changes across it,
+            # staling a warm start and any cached step operator. The nonlinear=/linear=/precond= slots DO
+            # compose: they configure the per-step (Newton / theta) solve, which is layout-independent —
+            # but only on the transient adaptive driver, which owns the march.
+            _adapt_step_slots = (nonlinear is not None) or (linear is not None) or (precond is not None)
+            if (x0 is not None) or (time is not None) or (_adapt_step_slots and self._mode != "transient"):
                 raise NotImplementedError(
-                    "fem.solve: the solver slots (x0/nonlinear/linear/precond) do not compose with "
-                    "adapt= yet — remeshing changes the DOF layout under a warm start and stales "
-                    "cached form/amg preconditioner setups. Pass solve_fn= for the adaptive loop."
+                    "fem.solve: adapt= composes with the nonlinear=/linear=/precond= slots only on a "
+                    "transient problem; x0= (warm start) and time= do not compose with remeshing (the DOF "
+                    "layout changes across a remesh). Drop them, or pass solve_fn= for a custom loop."
                 )
             from .utils.solver.fem_adapt import run_adaptive_solve, run_adaptive_transient
 
             if self._mode == "transient":
                 # Adapt the mesh AS the problem marches: remesh every `adapt.every` steps and carry the
-                # state across (transfer_solution), tracking a moving feature. Returns an AdaptiveTrajectory.
-                return run_adaptive_transient(self, adapt, solve_fn=solve_fn, **kwargs)
+                # state across (basis-aware transfer), tracking a moving feature. The nonlinear=/linear=/
+                # precond= slots configure the per-step (Newton / theta) solve. Returns an AdaptiveTrajectory.
+                return run_adaptive_transient(
+                    self, adapt, solve_fn=solve_fn, nonlinear=nonlinear, linear=linear, precond=precond, **kwargs
+                )
             if self._mode in ("complex", "complex_transient"):
                 raise NotImplementedError(
                     "fem.solve(adapt=...) on a complex / complex-transient problem is not supported yet "

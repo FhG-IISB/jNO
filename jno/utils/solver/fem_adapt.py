@@ -297,16 +297,20 @@ def _shallow_copy(domain: Any):
 # ---------------------------------------------------------------------------
 # Solution transfer -- piecewise-linear (barycentric) mesh-to-mesh interpolation
 # ---------------------------------------------------------------------------
-def _locate_barycentric(src_pts: np.ndarray, src_cells: np.ndarray, qpts: np.ndarray, *, tol: float, k: int):
-    """Locate each query point in a simplicial mesh and return its barycentric interpolation stencil.
+def _locate_in_cells(src_pts: np.ndarray, src_cells: np.ndarray, qpts: np.ndarray, *, tol: float, k: int):
+    """Locate each query point in a simplicial mesh; return the containing **cell index** and its
+    barycentric weights.
 
     Point location is a KD-tree candidate search over cell centroids (the containing cell is almost
     always among the nearest centroids; raise ``k`` for strongly anisotropic meshes) followed by an
-    exact barycentric inside-test. Returns ``(idx, weights, inside)``: ``idx`` ``(Q, D+1)`` the chosen
-    simplex's source-vertex indices, ``weights`` ``(Q, D+1)`` its barycentric coordinates, ``inside``
-    ``(Q,)`` bool (``True`` = strictly contained; ``False`` = the point fell outside every candidate
-    and was projected onto the nearest simplex by clamping + renormalising the barycentric weights,
-    which keeps the result a bounded convex combination of that cell's vertices). Pure host/NumPy."""
+    exact barycentric inside-test. Returns ``(cell_idx, weights, inside)``: ``cell_idx`` ``(Q,)`` the
+    chosen simplex's index into ``src_cells``; ``weights`` ``(Q, D+1)`` its barycentric coordinates
+    ``[λ0, λ1, …]`` (``weights[:, 1:]`` are the point's **basix reference coordinates** in that cell,
+    since the reference simplex is ``v0=0, v_i=e_i``); ``inside`` ``(Q,)`` bool (``True`` = strictly
+    contained; ``False`` = fell outside every candidate and was projected onto the nearest simplex by
+    clamping + renormalising the weights, a bounded convex combination of that cell's vertices). Pure
+    host/NumPy — this is the shared point-location core behind :func:`_locate_barycentric` (P1
+    interpolation) and :func:`_eval_fe_fields_at_points` (general P{k}/vector transfer)."""
     from scipy.spatial import cKDTree
 
     dim = src_pts.shape[1]
@@ -335,7 +339,15 @@ def _locate_barycentric(src_pts: np.ndarray, src_cells: np.ndarray, qpts: np.nda
     proj = np.clip(chosen_lam, 0.0, None)  # nearest-simplex projection for the outside points
     proj = proj / np.clip(proj.sum(axis=1, keepdims=True), 1e-300, None)
     weights = np.where(inside[:, None], chosen_lam, proj)
-    return src_cells[chosen].astype(np.int64), weights, inside
+    return chosen.astype(np.int64), weights, inside
+
+
+def _locate_barycentric(src_pts: np.ndarray, src_cells: np.ndarray, qpts: np.ndarray, *, tol: float, k: int):
+    """P1 stencil form of :func:`_locate_in_cells`: return ``(idx, weights, inside)`` where ``idx``
+    ``(Q, D+1)`` are the chosen simplex's **source-vertex indices** (the P1 interpolation stencil).
+    Unchanged public behaviour — the state-transfer / resample / moving-boundary callers use this."""
+    cell_idx, weights, inside = _locate_in_cells(src_pts, src_cells, qpts, tol=tol, k=k)
+    return src_cells[cell_idx].astype(np.int64), weights, inside
 
 
 def transfer_solution(
@@ -423,6 +435,66 @@ def transfer_solution(
     if isinstance(fill, (int, float)) and n_out:
         keep = jnp.asarray(inside).reshape((-1,) + (1,) * (out.ndim - 1))
         out = jnp.where(keep, out, jnp.asarray(fill, dtype=vals.dtype))
+    return out
+
+
+def _tabulate_lagrange_at(dim: int, order: int, xi: np.ndarray) -> np.ndarray:
+    """The Lagrange P{order} simplex basis tabulated at reference coordinates ``xi`` ``(Q, dim)`` ->
+    ``(Q, n_dof)``. Uses the SAME :func:`fem_lagrange._lagrange_basix` builder as the assembler, so the
+    returned columns are in the element's DOF order and line up with the recorded P{order} cell
+    connectivity. ``order == 1`` is ordinary linear (barycentric) interpolation. Host/basix."""
+    from basix import CellType
+
+    from .fem_lagrange import _lagrange_basix
+
+    cell = CellType.triangle if dim == 2 else CellType.tetrahedron
+    tab = _lagrange_basix(cell, int(order)).tabulate(0, np.asarray(xi, dtype=np.float64))
+    return np.asarray(tab[0, :, :, 0])  # (Q, n_dof): basis values (0th-derivative block, scalar value)
+
+
+def _eval_fe_fields_at_points(
+    src_pts_p1: np.ndarray,
+    src_cells_p1: np.ndarray,
+    src_state: Any,
+    src_offsets: Any,
+    src_orders: Any,
+    src_cells_f: Any,
+    field_vecs: Any,
+    query_pts: Any,
+    *,
+    dim: int,
+    tol: float = 1e-9,
+    k: int = 32,
+    fill: Any = "nearest",
+) -> list:
+    """Evaluate an OLD finite-element solution at NEW per-field DOF coordinates -- the basis-aware,
+    value-shape-aware generalisation of :func:`transfer_solution`, used to carry state across a remesh
+    for vector / higher-order (P2) / mixed (Taylor-Hood) fields.
+
+    For each field ``i``: locate its NEW sample points ``query_pts[i]`` ``(Q_i, dim)`` in the OLD **P1
+    base** mesh (:func:`_locate_in_cells` -> containing cell + reference coords), tabulate the OLD
+    element's P{``src_orders[i]``} basis there, and contract with that cell's OLD DOFs -- for all
+    ``field_vecs[i]`` components at once (node-major ``node*vec + comp`` layout, matching the assembler).
+    Returns a list of ``(Q_i, vec_i)`` arrays; ``reshape(-1)`` restores each field's flat block. Point
+    location is host; the interpolation apply stays differentiable in ``src_state`` (like
+    :func:`transfer_solution`). Points outside the old mesh use the nearest-simplex projection (``fill``
+    default 'nearest', first-order); a numeric ``fill`` substitutes a constant there instead."""
+    import jax.numpy as jnp
+
+    state = jnp.asarray(src_state).reshape(-1)
+    rdtype = state.real.dtype
+    off = [int(x) for x in src_offsets]
+    out = []
+    for i in range(len(off) - 1):
+        vec_i = int(field_vecs[i])
+        blk = state[off[i] : off[i + 1]].reshape(-1, vec_i)  # (n_nodes_i, vec_i)
+        cell_idx, weights, inside = _locate_in_cells(src_pts_p1, src_cells_p1, np.asarray(query_pts[i]), tol=tol, k=k)
+        phi = _tabulate_lagrange_at(dim, int(src_orders[i]), weights[:, 1:])  # (Q_i, n_dof_i) at ref coords
+        cells_i = np.asarray(src_cells_f[i])[cell_idx]  # (Q_i, n_dof_i): the old DOF ids of the containing cell
+        vals = jnp.einsum("qn,qnc->qc", jnp.asarray(phi, dtype=rdtype), blk[jnp.asarray(cells_i)])  # (Q_i, vec_i)
+        if isinstance(fill, (int, float)) and bool((~inside).any()):
+            vals = jnp.where(jnp.asarray(inside)[:, None], vals, jnp.asarray(fill, dtype=state.dtype))
+        out.append(vals)
     return out
 
 
@@ -862,10 +934,11 @@ class AdaptSpec:
         the march is the ordinary differentiable stepper; smaller = the mesh tracks a fast feature more
         tightly, larger = cheaper. Ignored by the steady loop.
     metric_field
-        **Transient multifield only**: for a coupled scalar-P1 system, the index of the field whose
-        curvature drives the anisotropic metric (which feature the mesh tracks) — first appearance order
-        in the ``jno.fem`` constraints. Default 0. (Refining on *all* fields at once — metric
-        intersection — is a later refinement.)
+        **Transient multifield only**: the index of the coupled field whose curvature drives the
+        anisotropic metric (which feature the mesh tracks) — first-appearance order in the ``jno.fem``
+        constraints. Default 0. A vector and/or higher-order (P2) metric field is reduced to a scalar
+        **per-vertex magnitude** for the (scalar) ZZ / Hessian estimator. (Refining on *all* fields at
+        once — metric intersection — is a later refinement.)
     """
 
     theta: float = 0.5
@@ -1015,6 +1088,7 @@ class AdaptiveTrajectory:
     times: np.ndarray
     states: list
     meshes: list
+    layouts: Any = None  # per-frame field layout (offsets/orders/vecs/cells_f/field_points); None = scalar-P1 legacy
 
     def __len__(self):
         return len(self.times)
@@ -1023,16 +1097,56 @@ class AdaptiveTrajectory:
         """``(state, (points, cells))`` at the last time — the solution on the final adapted mesh."""
         return self.states[-1], self.meshes[-1]
 
-    def resample(self, domain: Any, *, fill: Any = "nearest", tol: float = 1e-9, k: int = 32):
-        """Project every saved state onto ``domain``'s vertices (the same barycentric transfer as
-        :func:`transfer_solution`). Returns ``(n_save, n_target_vertices)`` for a single field, or
-        ``(n_save, n_fields, n_target_vertices)`` for a coupled scalar-P1 system (the field count is
-        read from each frame's DOFs ÷ vertices). The per-frame data in ``states`` is loss-free; this
-        adds one interpolation per frame on demand."""
+    def resample(self, domain: Any, *, field: Any = None, fill: Any = "nearest", tol: float = 1e-9, k: int = 32):
+        """Project every saved state onto ``domain``'s vertices. Returns ``(n_save, n_target_vertices)``
+        for a single scalar field, ``(n_save, n_fields, n_ref)`` for a coupled all-scalar system, or —
+        with ``field=i`` on a vector/mixed (e.g. Taylor-Hood) system — that field's ``(n_save, n_ref)``
+        (scalar) / ``(n_save, n_ref, vec_i)`` (vector). The transfer is basis-aware (P1/P2, per component)
+        via each frame's recorded per-field layout; a legacy scalar-P1 trajectory (no layouts — e.g. a
+        moving-boundary run) uses the plain barycentric transfer of :func:`transfer_solution`. Frames are
+        loss-free; this adds one interpolation per frame on demand."""
         import jax.numpy as jnp
 
         dim = int(domain.dimension)
         tgt = np.asarray(domain.mesh.points)[:, :dim].astype(np.float64)
+
+        if self.layouts is not None:  # basis-aware / value-shape-aware projection from per-frame layouts
+            n_fields = len(self.layouts[0]["offsets"]) - 1
+            if field is None and any(v != 1 for v in self.layouts[0]["vecs"]):
+                raise ValueError(
+                    f"resample: this system has a vector field — pass field=i (0..{n_fields - 1}); a vector "
+                    "field returns (n_save, n_ref, vec_i)."
+                )
+            if field is not None and not 0 <= int(field) < n_fields:
+                raise ValueError(f"resample: field={field} out of range for {n_fields} field(s).")
+            frames = []
+            for u, (pts, cells), lay in zip(self.states, self.meshes, self.layouts):
+                pts, cells = np.asarray(pts, np.float64), np.asarray(cells, np.int64)
+                vals = _eval_fe_fields_at_points(
+                    pts,
+                    cells,
+                    u,
+                    lay["offsets"],
+                    lay["orders"],
+                    lay["cells_f"],
+                    lay["vecs"],
+                    [tgt] * n_fields,
+                    dim=dim,
+                    tol=tol,
+                    k=k,
+                    fill=fill,
+                )
+                if field is not None:
+                    v = vals[int(field)]
+                    frames.append(v[:, 0] if v.shape[1] == 1 else v)
+                else:
+                    blocks = [v[:, 0] for v in vals]  # all scalar (guarded above)
+                    frames.append(blocks[0] if n_fields == 1 else jnp.stack(blocks, axis=0))
+            return jnp.stack(frames, axis=0)
+
+        # --- legacy scalar-P1 path (no per-frame layouts: a moving-boundary trajectory) ---
+        if field not in (None, 0):
+            raise ValueError("resample(field=...) needs a layout-carrying trajectory; this is a legacy scalar-P1 result.")
         frames = []
         for u, (pts, cells) in zip(self.states, self.meshes):
             pts, cells = np.asarray(pts, np.float64), np.asarray(cells, np.int64)
@@ -1058,27 +1172,84 @@ class AdaptiveTrajectory:
         return jnp.stack(frames, axis=0)
 
 
+def _field_layout(fem: Any) -> dict:
+    """Per-field layout of an assembled native-Lagrange FEM, for the transient adaptive transfer:
+    ``offsets`` (flat block boundaries), ``field_points`` (per-field DOF coords), ``orders`` (per-field
+    element order), ``cells_f`` (per-field P{order} connectivity, cell-aligned with the P1 base mesh),
+    ``vecs`` (per-field component count). Reads the per-FEM ``offsets``/``field_points`` snapshots plus
+    the domain's ``_fem_native_*`` records -- which the NEXT assembly clobbers, so call this right after
+    ``jno.fem(...)``. Fail-loud if the problem is not a native nodal-Lagrange assembly (the basis-aware
+    transfer only tabulates nodal Lagrange bases)."""
+    import jax.numpy as jnp
+
+    d = fem.domain
+    off = fem.offsets
+    if off is None:  # single scalar field with no block structure
+        off = [0, int(jnp.asarray(fem._op.state0).reshape(-1).shape[0])]
+    off = [int(x) for x in off]
+    n_fields = len(off) - 1
+    fpts = fem.field_points
+    orders = getattr(d, "_fem_native_field_orders", None)
+    cells_f = getattr(d, "_fem_native_assembly_cells_all", None)
+    if fpts is None or orders is None or cells_f is None or len(fpts) != n_fields or len(orders) != n_fields:
+        raise NotImplementedError(
+            "transient adaptive remeshing requires a native nodal-Lagrange assembly (its per-field DOF "
+            "coordinates / element orders / connectivity drive the basis-aware transfer); this problem "
+            "assembled through another route (e.g. non-nodal RT/Nedelec/P0, or a non-native path)."
+        )
+    fpts = [np.asarray(p) for p in fpts]
+    vecs = [(off[i + 1] - off[i]) // max(1, fpts[i].shape[0]) for i in range(n_fields)]
+    return {
+        "offsets": off,
+        "field_points": fpts,
+        "orders": [int(o) for o in orders],
+        "cells_f": [np.asarray(c) for c in cells_f],
+        "vecs": vecs,
+    }
+
+
+def _scalar_vertex_metric(state: Any, layout: dict, mf: int, n_verts: int) -> np.ndarray:
+    """Reduce the metric-driving field (possibly vector and/or P2) to a scalar field on the mesh
+    VERTICES, to feed the scalar ZZ / Hessian estimator: per-node magnitude across components,
+    restricted to the leading ``n_verts`` DOFs (``_promote_to_degree`` keeps the P1 vertices as ids
+    ``0..n_verts-1``, and a P1 field's nodes ARE the vertices)."""
+    off, vec = layout["offsets"], int(layout["vecs"][mf])
+    blk = np.asarray(state[off[mf] : off[mf + 1]]).reshape(-1, vec)  # (n_nodes, vec)
+    mag = blk[:, 0] if vec == 1 else np.sqrt((blk**2).sum(axis=1))
+    return np.asarray(mag[:n_verts])
+
+
 def run_adaptive_transient(
-    fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, save_ts: Any = None, **kwargs: Any
+    fem: Any,
+    spec: AdaptSpec,
+    *,
+    solve_fn: Any = None,
+    save_ts: Any = None,
+    nonlinear: Any = None,
+    linear: Any = None,
+    precond: Any = None,
+    **kwargs: Any,
 ) -> "AdaptiveTrajectory":
     """Drive ``FEM.solve(adapt=spec)`` for a **transient** problem: march the semidiscrete block and,
     every ``spec.every`` steps, remesh from the current field and carry the state onto the new mesh
     (:func:`transfer_solution`), so the mesh **tracks a moving feature**. Returns an
     :class:`AdaptiveTrajectory` (each frame on its own adapted mesh).
 
-    The between-remesh march is the ordinary differentiable ``θ``-stepper (:meth:`SemidiscreteTimeBlock.step`
-    over a ``lax.scan``); the remesh is the non-differentiable outer Python loop, exactly like the steady
-    driver. The time grid is the block's fixed ``t0..t1`` at ``dt`` — remeshing changes only the mesh, not
-    the grid, so time never drifts across chunks.
+    **Fields**: one or several coupled native-Lagrange fields — scalar or **vector**, **P1 or higher
+    order (P2)**, and **mixed spaces** (e.g. Taylor-Hood P2 velocity + P1 pressure). State is carried
+    across each remesh by a basis-aware, value-shape-aware transfer (:func:`_eval_fe_fields_at_points`);
+    ``spec.metric_field`` picks the field driving the (scalar) metric, reduced to a per-vertex magnitude.
+    The between-remesh march is :meth:`SemidiscreteTimeBlock.step` over a ``lax.scan`` — a **linear**
+    θ-step, or for a **nonlinear** block (e.g. Navier–Stokes) a per-step Newton solve; the
+    ``nonlinear=``/``linear=``/``precond=`` slots configure it. The remesh is the non-differentiable outer
+    Python loop; the time grid is the block's fixed ``t0..t1`` at ``dt`` (remeshing never drifts time).
 
-    **Scope — fail-loud on the rest** (a mis-transferred transient solve is silently wrong): one or
-    several coupled **scalar-P1** fields (``spec.metric_field`` picks which drives the metric), **real**,
-    **non-periodic**, and the driver owns the march (no custom ``solve_fn``). A **vector / higher-order**
-    field (P1-vector velocity, Taylor-Hood P2 — needs component-wise / P2-basis transfer), a complex
-    problem, periodic ties, and a bring-your-own integrator each raise a clear error and are later
-    extensions. The forward march is differentiable within each fixed-mesh chunk and through the
-    transfers, but the *remesh decisions* are not (the AFEM-inverse pattern -- freeze the mesh sequence,
-    differentiate the chunks -- applies)."""
+    **Scope — fail-loud on the rest** (a mis-transferred solve is silently wrong): **real**,
+    **non-periodic**, native nodal-Lagrange fields only (non-nodal RT/Nédélec/P0 raise via
+    :func:`_field_layout`); the driver owns the march (no whole-march ``solve_fn``, and ``x0=``/``time=``
+    do not compose with a remesh — the DOF layout changes). The forward march is differentiable within
+    each fixed-mesh chunk and through the transfers, but the *remesh decisions* are not (the AFEM-inverse
+    pattern — freeze the mesh sequence, differentiate the chunks — applies)."""
     import jax
     import jax.numpy as jnp
 
@@ -1113,17 +1284,14 @@ def run_adaptive_transient(
             "transient adaptive remeshing is real-only (the Hessian metric and the ZZ estimator are); a complex "
             "transient is not supported yet."
         )
-    # Per-field block layout: one or several coupled **scalar P1** fields, each on the mesh vertices.
-    off = [int(x) for x in (fem.offsets or [0, int(state.shape[0])])]
+    # Per-field block layout (offsets / orders / vecs / P{order} connectivity / DOF coords), generalised
+    # beyond scalar-P1: vector, higher-order (P2), and mixed (Taylor-Hood) fields are carried across a
+    # remesh by the basis-aware transfer below. Read right after assembly — the domain's per-field
+    # metadata is clobbered by the next one.
+    layout = _field_layout(fem)
+    off = layout["offsets"]
     n_fields = len(off) - 1
-    for _f in range(n_fields):
-        if off[_f + 1] - off[_f] != n_verts:
-            raise NotImplementedError(
-                f"transient adaptive remeshing supports scalar-P1 field(s) only for now: field {_f} has "
-                f"{off[_f + 1] - off[_f]} DOFs vs {n_verts} mesh vertices (it is vector / higher-order — a P1 vector "
-                "velocity or Taylor-Hood P2). A vector / P2 field needs component-wise / P2-basis transfer, the next "
-                "extension. Express the coupled system as scalar-P1 fields, or await it."
-            )
+    cur_nverts = n_verts  # current mesh's vertex count (updates each remesh; drives the metric slice)
     mf = int(spec.metric_field)
     if not 0 <= mf < n_fields:
         raise ValueError(f"AdaptSpec.metric_field={spec.metric_field} is out of range for {n_fields} field(s).")
@@ -1148,7 +1316,7 @@ def run_adaptive_transient(
         return (np.asarray(d.mesh.points)[:, :dim].astype(np.float64), np.asarray(d.mesh.cells_dict[key]).astype(np.int64))
 
     cur_mesh = _snapshot()
-    times, states, meshes = [float(ts[0])], [state], [cur_mesh]
+    times, states, meshes, layouts = [float(ts[0])], [state], [cur_mesh], [layout]
     history: list[dict] = []
     cur = fem
 
@@ -1156,9 +1324,18 @@ def run_adaptive_transient(
     while i < n_steps:
         chunk = int(min(every, n_steps - i))
         blk = block  # capture the current-mesh block for the scan closure
+        # Per-step solve config (nonlinear=/linear=/precond= slots) composed on the CURRENT-mesh block, so
+        # a Navier-Stokes chunk gets its Newton (picard/damping) driver — re-composed after each remesh.
+        # No slots -> (None, None) -> block.step's defaults (theta linear solve / newton_krylov), unchanged.
+        if nonlinear is not None or linear is not None or precond is not None:
+            from .solver_api import compose_transient_step_solvers
 
-        def _body(u, t, _blk=blk):
-            un = _blk.step(u, t, dt, theta=theta)
+            lin_s, nonlin_s = compose_transient_step_solvers(nonlinear, linear, precond, cur, blk)
+        else:
+            lin_s, nonlin_s = None, None
+
+        def _body(u, t, _blk=blk, _l=lin_s, _n=nonlin_s):
+            un = _blk.step(u, t, dt, theta=theta, linear_solve=_l, nonlinear_solve=_n)
             return un, un
 
         state, traj = jax.lax.scan(_body, state, jnp.asarray(ts[i : i + chunk], dtype=state.dtype))
@@ -1167,11 +1344,12 @@ def run_adaptive_transient(
             times.append(float(ts[i]))
             states.append(traj[j])
             meshes.append(cur_mesh)
+            layouts.append(layout)
         if i >= n_steps:
             break
 
         # remesh from the metric-driving field (fixed budget above), then carry every field's block over
-        u_v = np.asarray(state[off[mf] : off[mf + 1]])  # the metric_field's scalar-P1 vertex values
+        u_v = _scalar_vertex_metric(state, layout, mf, cur_nverts)  # scalar VERTEX field (vector/P2 reduced)
         old_pts, old_cells = cur_mesh
         if spec.anisotropic:
             metric = hessian_metric(d, u_v, target_complexity=target, hmin=hmin, hmax=hmax)
@@ -1187,15 +1365,27 @@ def run_adaptive_transient(
         block = cur._op
         cur_mesh = _snapshot()
         new_n = int(cur_mesh[0].shape[0])
-        idx, w, _inside = _locate_barycentric(old_pts, old_cells, cur_mesh[0], tol=1e-9, k=32)  # carry each field
-        wj, ij = jnp.asarray(w, dtype=state.real.dtype), jnp.asarray(idx)
-        state = jnp.concatenate([jnp.einsum("qk,qk->q", wj, state[off[_f] : off[_f + 1]][ij]) for _f in range(n_fields)])
-        off = [_f * new_n for _f in range(n_fields + 1)]  # all scalar-P1 -> uniform n_verts blocks on the new mesh
-        history.append({"t": float(ts[i]), "n_dofs": new_n, "fields": n_fields})
+        new_layout = _field_layout(cur)  # per-field layout on the refined mesh (read now, before any re-assembly)
+        # Basis-aware, value-shape-aware state transfer: evaluate each OLD field at its NEW per-field DOF
+        # coordinates using the OLD element's shape functions (P1 vertices / P2 midpoints / vector comps).
+        vals = _eval_fe_fields_at_points(
+            old_pts,
+            old_cells,
+            state,
+            layout["offsets"],
+            layout["orders"],
+            layout["cells_f"],
+            layout["vecs"],
+            new_layout["field_points"],
+            dim=dim,
+        )
+        state = jnp.concatenate([v.reshape(-1) for v in vals])
+        off, layout, cur_nverts = new_layout["offsets"], new_layout, new_n
+        history.append({"t": float(ts[i]), "n_dofs": int(off[-1]), "fields": n_fields})
 
     fem.__dict__.update(cur.__dict__)  # rebind to the final adapted mesh (matches the steady driver)
     fem.adapt_history = history
-    return AdaptiveTrajectory(np.asarray(times), states, meshes)
+    return AdaptiveTrajectory(np.asarray(times), states, meshes, layouts=layouts)
 
 
 @dataclass
