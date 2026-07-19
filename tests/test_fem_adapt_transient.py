@@ -16,7 +16,10 @@ import numpy as np
 import pytest
 
 import jno
-from jno.utils.solver.fem_adapt import AdaptiveTrajectory
+
+pytest.importorskip("mmgpy", reason="mmgpy required for adaptive remeshing (fem_adapt imports it)")
+
+from jno.utils.solver.fem_adapt import AdaptiveTrajectory  # noqa: E402
 
 PI = np.pi
 
