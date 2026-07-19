@@ -535,7 +535,13 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block):
         else:
             op = LinearOperator.from_matvec(matvec, diag_fn=diag_fn, shape=(rhs.shape[0], rhs.shape[0]))
             M = materialize_precond(precond, PrecondContext(op, fem)) if precond is not None else None
-        if M is None:  # never run the per-step solve unpreconditioned: default to Jacobi (the step diagonal)
+        if getattr(solver, "direct", False):
+            # A DIRECT solver (lu/dense) factorizes the step operator itself — it takes no preconditioner,
+            # so don't synthesize the Jacobi one below (which it would reject). Needs a materializable
+            # operator: the constant-operator ``static_op`` (a real M+θdt·A matrix) provides it, letting a
+            # direct solve compose with the transient stepper — e.g. a Taylor-Hood saddle under adapt=.
+            return solver(op, rhs, x0=x0)
+        if M is None:  # iterative: never run the per-step solve unpreconditioned -> Jacobi (the step diagonal)
             diag = op.diag() if hasattr(op, "diag") else diag_fn()
             inv = 1.0 / jnp.where(jnp.abs(diag) > 1e-30, diag, 1.0)
             M = lambda x: inv * x  # noqa: E731

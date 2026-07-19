@@ -236,10 +236,16 @@ class SemidiscreteTimeBlock:
         if self.is_nonlinear():
             from .newton_krylov import newton_krylov
 
+            # θ-method: M(y⁺−y)/dt + θ R(y⁺) + (1−θ) R(y) = 0. θ=1 (default) is backward Euler — the
+            # existing first-order behaviour; a second-order (u_tt) block sets θ=½ (trapezoidal /
+            # Newmark average-acceleration) so an undamped nonlinear wave is not spuriously damped.
+            thn = theta if theta is not None else (float(self.metadata.get("theta", 1.0)) if self.metadata else 1.0)
             M_t = _operand(self.mass(t_next, args))
+            r_now = (1.0 - thn) * jnp.asarray(self.residual(u, t, args), dtype).reshape(-1) if thn < 1.0 else None
 
             def G(wn):
-                return (M_t @ (wn - u)) / dt + jnp.asarray(self.residual(wn, t_next, args), dtype).reshape(-1)
+                g = (M_t @ (wn - u)) / dt + thn * jnp.asarray(self.residual(wn, t_next, args), dtype).reshape(-1)
+                return g if r_now is None else g + r_now
 
             if nonlinear_solve is not None:
                 return nonlinear_solve(G, u)

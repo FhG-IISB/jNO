@@ -659,13 +659,21 @@ def assemble_fem_nonnodal(
         #     the trapezoidal (θ=½, energy-conserving) rule — the non-nodal analogue of the native
         #     _assemble_second_order_time, reusing this path's push-forward mass / pins / IC-projection. ===
         if max((_mto(t) for t in temporal), default=1) >= 2:
-            if runtime_parameter_tags or neural_param_names:
-                raise NotImplementedError(
-                    "jno.fem (non-nodal): a runtime parameter or neural coefficient in a second-order-in-time "
-                    "form is not supported."
-                )
             if len(fields) > 1:
                 raise NotImplementedError("jno.fem (non-nodal): second-order-in-time (u_tt) is single-field only.")
+            # Runtime/trainable parameters are supported on the SPATIAL operator (a bending stiffness, a wave
+            # speed, a k(x) field) — the differentiable inverse for C¹ plates/beams (mirrors the native path).
+            # A parameter on the mass/damping (u_tt / u_t) term is rejected: the mass block, and the IC
+            # L²-projection through it, are assembled once, so a runtime density would silently freeze.
+            _temporal_param: dict = {}
+            for _t in temporal:
+                _collect_runtime_parameter_exprs(_t, _temporal_param)
+            if _temporal_param or collect_neural_slots(temporal).any_trainable:
+                raise NotImplementedError(
+                    "jno.fem (non-nodal): a runtime/trainable parameter on the mass or damping (u_tt / u_t) "
+                    "term of a second-order-in-time form is not supported; put it on the spatial operator."
+                )
+            has_param = bool(runtime_parameter_tags or neural_param_names)  # all remaining params are spatial
 
             def _strip_n(t, k):
                 for _ in range(k):
@@ -675,20 +683,28 @@ def assemble_fem_nonnodal(
             M2 = jax.jacfwd(_make_residual([_strip_n(t, 2) for t in temporal if _mto(t) >= 2]))(zeros)  # ∫ü·v ⇒ mass
             damp = [_strip_n(t, 1) for t in temporal if _mto(t) == 1]  # ∫u̇·v ⇒ damping (optional)
             Cmat = jax.jacfwd(_make_residual(damp))(zeros) if damp else jnp.zeros((total, total), zeros.dtype)
-            spatial_res2 = _make_residual(spatial)
-            K = jax.jacfwd(spatial_res2)(zeros)  # spatial operator (stiffness)
-            F = -spatial_res2(zeros) + nat_load  # load (natural BC folded in)
+            spatial_res2 = _make_residual(spatial)  # residual(u, args) -> threads a spatial runtime parameter
             n = total
             Z = jnp.zeros((n, n), zeros.dtype)
+            dd = jnp.asarray([p[0] for p in pins], dtype=jnp.int32) if pins else None
+            dg = jnp.asarray([p[1] for p in pins], dtype=zeros.dtype) if pins else None
+
+            def _dir_A(A):  # essential rows of the augmented system: u[d]=g (constant) and v[d]=0 (identity rows)
+                if dd is None:
+                    return A
+                return A.at[dd, :].set(0.0).at[dd, dd].set(1.0).at[dd + n, :].set(0.0).at[dd + n, dd + n].set(1.0)
+
+            def _A_of(args):  # A_aug(args) = [[0, -M2], [K(args), C]]: M2 u̇ = M2 v ; M2 v̇ + C v + K u = F
+                K = jax.jacfwd(lambda u: spatial_res2(u, args))(zeros)
+                return _dir_A(jnp.block([[Z, -M2], [K, Cmat]]))
+
+            def _f_of(args):  # load F(args) on the v-block rows (Dirichlet g rides affine_bias, not the forcing)
+                f = jnp.concatenate([jnp.zeros((n,), zeros.dtype), -spatial_res2(zeros, args) + nat_load])
+                return f if dd is None else f.at[dd].set(0.0).at[dd + n].set(0.0)
+
             M_aug = jnp.block([[M2, Z], [Z, M2]])
-            A_aug = jnp.block([[Z, -M2], [K, Cmat]])  # M2 u̇ = M2 v ; M2 v̇ + C v + K u = F
-            c_aug = jnp.concatenate([jnp.zeros((n,), zeros.dtype), F])
-            if pins:  # essential BC on the augmented rows: u[d] = g (constant) and v[d] = 0
-                dd = jnp.asarray([p[0] for p in pins], dtype=jnp.int32)
-                dg = jnp.asarray([p[1] for p in pins], dtype=zeros.dtype)
+            if dd is not None:
                 M_aug = M_aug.at[dd, :].set(0.0).at[dd + n, :].set(0.0)
-                A_aug = A_aug.at[dd, :].set(0.0).at[dd, dd].set(1.0).at[dd + n, :].set(0.0).at[dd + n, dd + n].set(1.0)
-                c_aug = c_aug.at[dd].set(dg).at[dd + n].set(0.0)
 
             def _project_onto(u0_node):  # L²-project a value node onto the field DOFs via the mass block M2
                 u0_blocks = [jnp.zeros(offs[i + 1] - offs[i]) for i in range(len(fields))]
@@ -716,25 +732,46 @@ def assemble_fem_nonnodal(
                 u0_dofs = u0_dofs.at[_pd].set(jnp.asarray([p[1] for p in pins], dtype=zeros.dtype))
                 v0_dofs = v0_dofs.at[_pd].set(0.0)
             t0, t1, dt = _infer_time_window(domain)
-            return (
-                SemidiscreteTimeBlock(
-                    backend="transient",
-                    mode="implicit",
-                    time_order=2,
-                    spatial_kind="weak_form",
-                    M=M_aug,
-                    A=A_aug,
-                    affine_bias=c_aug,
-                    state0=jnp.concatenate([u0_dofs, v0_dofs]),
-                    t0=t0,
-                    t1=t1,
-                    dt=dt,
-                    eval_context=getattr(domain, "_fem_eval_context", {}) or {},
-                    metadata={"theta": 0.5, "second_order": True},
-                ),
-                "transient",
-                [0, n, 2 * n],
+            common2 = dict(
+                backend="transient",
+                mode="implicit",
+                time_order=2,
+                spatial_kind="weak_form",
+                M=M_aug,
+                state0=jnp.concatenate([u0_dofs, v0_dofs]),
+                t0=t0,
+                t1=t1,
+                dt=dt,
+                eval_context=getattr(domain, "_fem_eval_context", {}) or {},
             )
+            if not has_param:
+                c_aug = jnp.concatenate([jnp.zeros((n,), zeros.dtype), -spatial_res2(zeros) + nat_load])
+                if dd is not None:
+                    c_aug = c_aug.at[dd].set(dg).at[dd + n].set(0.0)
+                block = SemidiscreteTimeBlock(
+                    A=_A_of(None), affine_bias=c_aug, metadata={"theta": 0.5, "second_order": True}, **common2
+                )
+            else:
+                # re-form A_aug/forcing from the runtime args each step; the θ=½ stepper differentiates through
+                # its own scan (no stepper change), exactly like the native second-order parametric path.
+                _ph = {nm: (jnp.zeros((n_verts,)) if nm in _field_param_names else 0.0) for nm in runtime_parameter_tags}
+                _ph.update({nm: _neural_models[nm].module for nm in neural_param_names})
+                c_dir = jnp.zeros((2 * n,), zeros.dtype) if dd is None else jnp.zeros((2 * n,), zeros.dtype).at[dd].set(dg)
+                block = SemidiscreteTimeBlock(
+                    A=_A_of(_ph),
+                    affine_bias=c_dir,
+                    operator_fn=lambda t, args=None: _A_of(args),
+                    forcing_vector_fn=lambda t, args=None: _f_of(args),
+                    runtime_parameter_exprs=dict(_param_and_neural_exprs),
+                    metadata={
+                        "theta": 0.5,
+                        "second_order": True,
+                        "runtime_parameter_names": list(_param_and_neural_exprs),
+                        "nonaffine_operator": True,
+                    },
+                    **common2,
+                )
+            return block, "transient", [0, n, 2 * n]
 
         M = jax.jacfwd(_make_residual([_strip_temporal_trial_derivative(t) for t in temporal]))(zeros)  # block mass
         spatial_res = _make_residual(spatial)

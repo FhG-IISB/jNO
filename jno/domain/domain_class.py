@@ -270,6 +270,7 @@ class domain(MeshIOMixin):
         constructor: Union[Callable, str, "domain", None] = None,
         algorithm: Optional[int] = None,
         time: Optional[Tuple[float, float, int]] = None,
+        tau: Optional[Tuple[float, float, int]] = None,
         compute_mesh_connectivity: Optional[bool] = None,
         keep_orphan_nodes: bool = False,
         **_ignored_kwargs,
@@ -281,9 +282,20 @@ class domain(MeshIOMixin):
             constructor: Function accepting a pygmsh.geo.Geometry object, an existing domain,
                 or a path to a meshfile
             algorithm: Gmsh meshing algorithm
-            time: Tuple of (start, end) for time-dependent problems
+            time: Tuple of (start, end, n) for physical time-dependent problems (a ``u.t`` derivative).
+            tau: Tuple of (start, end, n) for a **pseudo-time load path** — identical grid machinery to
+                ``time`` but flagged so ``fem.solve`` marches it as a history path (driven by ``.i(k)``)
+                rather than integrating a physical time derivative. Use for quasi-static load-stepping
+                (e.g. an elasto-plastic load→unload cycle). Pass ``time`` **or** ``tau``, not both.
             mesh_connectivity: Wether or not to compute the some hyperparameters about the mesh (needed for finite_difference methods)
         """
+        # `tau=` is a pseudo-time (load-path) alias of `time=`: reuse the whole grid/coordinate/tiling
+        # machinery, only flag it so the solve marches it as a history path instead of integrating u.t.
+        _pseudo_time = tau is not None
+        if _pseudo_time:
+            if time is not None:
+                raise ValueError("domain: pass time= (physical time) OR tau= (pseudo-time load path), not both.")
+            time = tau
         if isinstance(constructor, domain):
             existing_domain = constructor
 
@@ -308,6 +320,7 @@ class domain(MeshIOMixin):
             self._constructor_source = getattr(existing_domain, "_constructor_source", None)
             self.time = time
             self._is_time_dependent = time is not None
+            self._is_pseudo_time = _pseudo_time or bool(getattr(existing_domain, "_is_pseudo_time", False))
 
             if getattr(existing_domain, "_is_time_dependent", False):
                 base_mesh_pool: Dict[str, Any] = {}
@@ -347,6 +360,7 @@ class domain(MeshIOMixin):
             constructor_source=constructor,
             algorithm=algorithm,
             time=time,
+            pseudo_time=_pseudo_time,
             compute_mesh_connectivity=compute_mesh_connectivity,
         )
         # Drop mesh nodes that belong to no cell (gmsh geometry-construction points — arc/circle
@@ -406,6 +420,7 @@ class domain(MeshIOMixin):
         constructor_source: Any = None,
         algorithm: int = 6,
         time: Optional[Tuple[float, float, int]] = None,
+        pseudo_time: bool = False,
         compute_mesh_connectivity: bool = True,
     ) -> None:
         """Initialize common domain bookkeeping without loading a mesh.
@@ -462,6 +477,7 @@ class domain(MeshIOMixin):
         self.total_samples: int = 1
         self.time = time
         self._is_time_dependent = time is not None
+        self._is_pseudo_time = pseudo_time
         self._verbose = True
         self.same_domain = False
 
@@ -3204,9 +3220,18 @@ class domain(MeshIOMixin):
                 self.context[tag] = _apply_time_value_to_sampled(tag, stacked)
 
                 if normals_available and all_normals:
-                    nrm_stacked = np.stack(all_normals, axis=0)
-                    if not is_time_dep:
-                        nrm_stacked = nrm_stacked[:, np.newaxis, :, :]
+                    nrm_stacked = np.stack(all_normals, axis=0)  # (B, N, D)
+                    if is_time_dep:
+                        # Normals are geometric (time-independent), but the coords are tiled to (B, T, N, D);
+                        # tile the normals across T too so the eval's time-scan slices them per step. Without
+                        # this they stay (B, N, D) and the scan collapses them to a single point (a silently
+                        # wrong, constant boundary flux).
+                        t_steps = int(np.asarray(stacked).shape[1])
+                        nrm_stacked = np.broadcast_to(
+                            nrm_stacked[:, np.newaxis], (nrm_stacked.shape[0], t_steps, *nrm_stacked.shape[1:])
+                        ).copy()
+                    else:
+                        nrm_stacked = nrm_stacked[:, np.newaxis, :, :]  # (B, 1, N, D) — T=1 for steady
                     self.context[f"n_{tag}"] = nrm_stacked
 
             else:
@@ -3234,9 +3259,14 @@ class domain(MeshIOMixin):
                 self.context[tag] = _apply_time_value_to_sampled(tag, self.context[tag])
 
                 if normals_available and available_normals is not None:
-                    sampled_nrm = available_normals[idx]
-                    if not is_time_dep:
-                        sampled_nrm = sampled_nrm[np.newaxis, :, :]
+                    sampled_nrm = available_normals[idx]  # (n_samples, D)
+                    if is_time_dep:
+                        # tile the (time-independent) normals across T so the eval's time-scan slices them
+                        # per step (matching the coords); otherwise the scan collapses them to one point.
+                        t_steps = int(sampled_pts.shape[0])  # sampled_pts is (T, n_samples, D) here
+                        sampled_nrm = np.broadcast_to(sampled_nrm[np.newaxis], (t_steps, *sampled_nrm.shape))
+                    else:
+                        sampled_nrm = sampled_nrm[np.newaxis, :, :]  # (1, n_samples, D) — T=1 for steady
                     self.context[f"n_{tag}"] = np.broadcast_to(
                         sampled_nrm[np.newaxis, ...],
                         (batch_count, *sampled_nrm.shape),

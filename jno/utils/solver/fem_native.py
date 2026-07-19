@@ -38,7 +38,7 @@ linear, nonlinear, and transient), with Dirichlet and Neumann/Robin boundary con
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import jax
 import jax.experimental.sparse as jsparse
@@ -65,6 +65,7 @@ from .fem_lagrange import (
 from .fem_utils import (
     _cell_region_mask,
     _collect_region_mask_names,
+    _eval_integrand,
     _gather_temporal_tags,
     _infer_fields,
     _lower_statefield_to_trial,
@@ -371,6 +372,7 @@ def assemble_fem_native(
     *,
     vec: int,
     quad_degree: int,
+    evolution: Optional[Dict[Any, Any]] = None,
 ) -> Tuple[Any, str]:
     """Assemble a Lagrange FEM system into ``(op, mode, offs)`` for :class:`FEM`.
 
@@ -573,6 +575,86 @@ def assemble_fem_native(
 
     _frozen_nodes = _collect_frozen_fields(list(volume_terms) + list(boundary_terms))
 
+    # Per-quadrature-point STEP HISTORY (``v.i(k)``): scan the terms for HistoryRef nodes and record, per
+    # base variable, how many past states to buffer (the most-negative offset). The buffer itself lives on
+    # the runtime ``args`` (so it UPDATES each load step without re-assembly and rides the driver's scan
+    # carry differentiably); here we only fix the layout so the driver can allocate and thread it. Buffer
+    # shape per variable: ``(n_cells, n_quad, depth, *value_shape)`` -- per Gauss point, exactly `depth`
+    # deep, so it is memory-minimal. Presence of any history forces the args-threading (parametric) path.
+    from ...trace import history_variables as _history_variables
+
+    # Evolution updates (``state.evolves(formula)``) advance internal states between load steps. Their
+    # formulas are walked here too, so a ``state.i(-1)`` that appears ONLY inside an evolution formula
+    # (not in the weak form) still allocates its buffer with the right depth.
+    _evolution = dict(evolution or {})  # {history_key: StateUpdate}
+    # WHERE each step-history state lives: a state read at ``.i(k)`` inside a BOUNDARY term buffers on that
+    # region's face quadrature points (a *surface* state — e.g. a friction slip on the contact face);
+    # otherwise it buffers on the cell quadrature points (a *volume* state — e.g. a plastic strain). Each
+    # state's evolution formula is walked together with the reads it belongs to. (Boundary terms were
+    # previously not scanned at all — ``list(boundary_terms)`` yielded the region keys, not the terms.)
+    _bterm_list = [t for terms in boundary_terms.values() for t in terms]
+    _surf_read_regions: Dict[Any, str] = {}  # history key -> the boundary region it is read on
+    for _R, _rterms in boundary_terms.items():
+        for _k in _history_variables(_rterms):
+            _surf_read_regions[_k] = _R
+    _surf_read_keys = set(_surf_read_regions)  # history keys read on ANY boundary
+    _vol_evo = [su.formula for k, su in _evolution.items() if k not in _surf_read_keys]
+    _surf_evo = [su.formula for k, su in _evolution.items() if k in _surf_read_keys]
+    _vol_history_raw = _history_variables(list(volume_terms) + _vol_evo)  # {key: (base, depth)}
+    _surf_history_raw = _history_variables(_bterm_list + _surf_evo)
+    _both = set(_vol_history_raw) & set(_surf_history_raw)
+    if _both:
+        raise ValueError(
+            "jno.fem: a step-history state is read at `.i(k)` on BOTH a volume and a boundary term; a "
+            "state lives on one quadrature set (cells or faces). Split it into separate states."
+        )
+    history_specs = {
+        key: {
+            "name": str(getattr(base, "name", "hist")),
+            "depth": int(depth),
+            "value_shape": tuple(getattr(base, "value_shape", ())),
+            "shape": (n_cells, int(qp_shared.shape[0]), int(depth)) + tuple(getattr(base, "value_shape", ())),
+        }
+        for key, (base, depth) in _vol_history_raw.items()
+    }
+    # Surface-state buffer specs are allocated below, once the boundary facet tables (face count +
+    # per-face quadrature width) are built; kept here so the role/readout pass sees every state.
+    _history_raw = {**_vol_history_raw, **_surf_history_raw}
+
+    # Per-history-key READOUT + role, for the load-step march. Every buffered state advances one of two
+    # ways between steps: (1) a *primary unknown* read at ``.i(-1)`` (its base is one of the solved fields
+    # — e.g. a BDF2 ``u.i(-1)``) auto-buffers the just-solved ``u``, so its readout is the bare field
+    # interpolated to the quad points; (2) an *internal state* (``ep``) advances by its
+    # ``state.evolves(formula)`` update. A state read at ``.i(-1)`` that is NEITHER solved NOR has an
+    # ``.evolves`` would leave its buffer frozen at zero — a silently wrong (deformation-theory) result —
+    # so that is a hard build error (never a silent freeze). ``readout_formulas`` maps each key to the
+    # trace expression the march evaluates per quad point to produce that state's next value.
+    _solved_field_keys = {f["field_key"] for f in fields}
+    _is_march = bool(getattr(domain, "_is_pseudo_time", False))
+    history_roles: Dict[Any, str] = {}
+    readout_formulas: Dict[Any, Any] = {}
+    for key, (base, _depth) in _history_raw.items():
+        if key in _evolution:
+            history_roles[key] = "internal"
+            readout_formulas[key] = _lower_statefield_to_trial(_evolution[key].formula, {})
+        elif getattr(base, "field_key", None) in _solved_field_keys:
+            history_roles[key] = "primary"  # auto-buffered from the solved unknown (the bare field at QPs)
+            readout_formulas[key] = _lower_statefield_to_trial(base, {})
+        elif _is_march:
+            # A ``tau=`` domain signals a load-step MARCH: a buffered internal state with no ``.evolves``
+            # would stay frozen at zero every step (a silently wrong, deformation-theory result). Fail
+            # loud. (On a plain domain the same read is allowed — a residual you thread history into by
+            # hand, e.g. to verify the zero-history reduction — so this only fires when marching.)
+            raise ValueError(
+                f"jno.fem: internal state {str(getattr(base, 'name', 'state'))!r} is read at `.i(-1)` but "
+                "has no `.evolves(...)` update — on a `domain(tau=...)` march its history buffer would stay "
+                "frozen at zero (a silently wrong, deformation-theory result). Add "
+                "`state.evolves(<formula>)` to the `jno.fem([...])` list describing how it advances; or, if "
+                "it is really the primary unknown, solve for it (give it a test function)."
+            )
+        else:
+            history_roles[key] = "frozen"  # plain-domain history read, threaded by hand; not marchable
+
     # A trainable DIRICHLET VALUE ``u(region) - net(x)`` (an unknown boundary profile). The net is not an
     # integrand coefficient -- it is evaluated at the boundary NODES to form the Dirichlet lift -- so it is
     # collected here from ``dirichlet_raw`` (a bare net node; the front-end already rejected compound values)
@@ -633,6 +715,37 @@ def assemble_fem_native(
     conn = build_facet_connectivity(cells_p1, cell_key)
     normals_np = compute_face_normals(pts_p1, conn, cells_p1, cell_key) if conn.n_bfaces > 0 else np.zeros((0, dim))
 
+    # Surface step-history buffer layout (now that the facet tables give the per-face quadrature width). A
+    # state read at ``.i(k)`` on a boundary term (e.g. a friction slip on the contact face) lives on the
+    # boundary FACE quadrature points: shape ``(n_bfaces, n_quad_surf, depth, *value_shape)``, indexed by
+    # the global boundary-face id in ``_surf_elem_res`` (faces outside the term's region keep unused,
+    # zeroed slots -- cheap, and avoids per-region local re-indexing). Threaded on ``args`` under a key
+    # distinct from the volume history so the two never collide.
+    _n_quad_surf = int(face_tables_per_field[0][4].shape[0]) if face_tables_per_field[0] is not None else 0
+    surface_history_specs = {
+        key: {
+            "name": str(getattr(base, "name", "hist")),
+            "depth": int(depth),
+            "value_shape": tuple(getattr(base, "value_shape", ())),
+            "shape": (int(conn.n_bfaces), _n_quad_surf, int(depth)) + tuple(getattr(base, "value_shape", ())),
+            "surface": True,
+        }
+        for key, (base, depth) in _surf_history_raw.items()
+    }
+    # Boundary-face ids per region that carries a surface state (the faces its readout advances). Same
+    # all-nodes-in-region face mask the residual's ``surface_work`` uses; computed once here.
+    _surf_region_faces: Dict[str, np.ndarray] = {}
+    if surface_history_specs and conn.n_bfaces > 0:
+        for _R in set(_surf_read_regions.values()):
+            _rnodes = {int(n) for n in _region_node_ids(domain, _R)}
+            _mask = np.array(
+                [
+                    all(int(conn.face_nodes[fi, j]) in _rnodes for j in range(conn.face_nodes.shape[1]))
+                    for fi in range(conn.n_bfaces)
+                ]
+            )
+            _surf_region_faces[_R] = np.where(_mask)[0].astype(np.int32)
+
     # -------------------------------------------------------------------------
     # Cell-level field data builder (called inside vmap'd kernels)
     # -------------------------------------------------------------------------
@@ -670,6 +783,14 @@ def assemble_fem_native(
         loc_seg.append(loc_seg[-1] + n_local_f[i] * vecs[i])
     cell_all_dofs = jnp.concatenate(cdofs, axis=1) if len(cdofs) > 1 else cdofs[0]  # (n_cell, n_local_all)
 
+    # A LOAD-PATH field (``freeze_path``) is a FrozenField whose nodal values vary per load step: split it
+    # out of the compile-time frozen gather, keep only its per-cell connectivity, and let the load-step
+    # driver deliver each step's nodal slice through ``args["__loadpath__"]`` (like ``__history__``).
+    from ...trace import LoadPathField as _LoadPathField
+
+    _path_nodes = {fid: n for fid, n in _frozen_nodes.items() if isinstance(n, _LoadPathField)}
+    _frozen_nodes = {fid: n for fid, n in _frozen_nodes.items() if not isinstance(n, _LoadPathField)}
+
     # Per-cell gather of each frozen field's nodal slice (n_cell, n_local, 1) -- a compile-time constant
     # (no args threading, no jacfwd tangent), gathered on the frozen field's own FE space via the same
     # connectivity as the live state, so its shape-gradient contraction matches the trial gradient.
@@ -681,6 +802,59 @@ def assemble_fem_native(
         _fconn = cells_f_j[_ffidx]  # (n_cell, n_local)
         _fvals = jnp.asarray(_fnode.values).reshape(-1)
         _frozen_gathered[_fid] = _fvals[_fconn].reshape(_fconn.shape[0], _fconn.shape[1], 1)
+
+    # Load-path fields are scalar P1 fields on the mesh vertices (a temperature history, say) that are not
+    # among the solved unknowns, so they have no assembled basis of their own. They borrow the nodal basis
+    # and vertex connectivity of a P1 Lagrange field already in the problem (both live on the same mesh
+    # vertices): we alias the load-path field's key to that P1 field's index so the kernel resolves its
+    # shape functions, and gather its per-cell nodal slice on the same connectivity. Values arrive per step
+    # from args; a spec (the full frame stack) rides the driver's scan.
+    _path_conn: Dict[Any, Any] = {}
+    path_specs: Dict[Any, Any] = {}
+    if _path_nodes:
+        _p1_idx = next(
+            (i for i, f in enumerate(fields) if int(f["order"]) == 1 and str(f.get("space", "Lagrange")) == "Lagrange"),
+            None,
+        )
+        if _p1_idx is None:
+            raise NotImplementedError(
+                "freeze_path(...): the load-path field is scalar P1 on the mesh vertices and borrows the "
+                "nodal basis of a P1 Lagrange field in the problem, but this form has none. Give the primary "
+                "unknown order=1 (P1)."
+            )
+        for _fid, _fnode in _path_nodes.items():
+            if _fnode.num_components != 1:
+                raise NotImplementedError("freeze_path(frames): only scalar load-path fields are supported.")
+            field_index[_fnode.field_key] = _p1_idx  # resolve the load-path field's basis to the P1 field
+            _path_conn[_fid] = cells_f_j[_p1_idx]  # scalar P1 vertex connectivity (n_cell, n_local)
+            path_specs[_fid] = {"name": _fnode.name, "frames": jnp.asarray(_fnode.path_frames), "n_steps": _fnode.n_steps}
+
+    if path_specs and not (_is_march and history_specs):
+        # A load-path field's per-step slice is delivered by the load-step driver; without a march (a
+        # `tau=` grid + step-history to drive it) it would never be supplied. Fail loud, name the fix.
+        raise ValueError(
+            "jno.fem: a `freeze_path(...)` load-path field requires a load-step march — build the domain "
+            "with `domain(tau=(start, end, n))` and include step-history (a `.i(-1)` state advanced by "
+            "`.evolves`, e.g. the plastic strain εₚ) so `fem.solve()` marches the load path and delivers "
+            "each step's field slice. On a plain/steady domain the per-step values are never threaded."
+        )
+
+    def _add_loadpath_fields(loc, c, args):
+        """Merge this load step's per-cell nodal slice for each load-path field into
+        ``loc['frozen_fields']`` — so the FrozenField kernel path interpolates it to the quad points.
+        The per-step nodal values come from the driver on ``args['__loadpath__']`` (like ``__history__``);
+        without them (e.g. a non-march assembly) the field is simply absent, and a build-time guard has
+        already required a march when a load-path field is present."""
+        if not _path_conn or not isinstance(args, dict):
+            return
+        pbuf = args.get("__loadpath__")
+        if not pbuf:
+            return
+        fz = dict(loc.get("frozen_fields", {}))
+        for _fid, _conn in _path_conn.items():
+            if _fid in pbuf:
+                fz[_fid] = jnp.asarray(pbuf[_fid]).reshape(-1)[_conn[c]].reshape(_conn.shape[1], 1)
+        loc["frozen_fields"] = fz
 
     def _split_cell_local(local_vals):
         """Split a cell's gathered all-field local vector into per-field ``(n_local_i, vec_i)``."""
@@ -758,7 +932,70 @@ def assemble_fem_native(
             loc["neural_coefficients"] = _nt
         if _frozen_gathered:  # known-field (ui.freeze) per-cell nodal slices for this cell
             loc["frozen_fields"] = {fid: g[c] for fid, g in _frozen_gathered.items()}
+        if history_specs and args is not None:
+            # This cell's per-quad-point history slice (n_quad, depth, *shape), gathered from the buffers on
+            # ``args`` -- a plain per-cell index, so ``jacfwd`` treats it as a frozen constant.
+            hbuf = args.get("__history__") if isinstance(args, dict) else None
+            if hbuf:
+                loc["qp_history"] = {k: hbuf[k][c] for k in history_specs if k in hbuf}
+        _add_loadpath_fields(loc, c, args)  # per-step load-path field slices -> loc["frozen_fields"]
         return _integrate_term(domain, coeff, loc, qw_shared * meas)
+
+    def _vol_elem_readout(c, local_all, formula, t=0.0, args=None):
+        """Per-quadrature-point VALUE of an evolution formula on cell ``c`` -> ``(n_quad, *value_shape)``.
+
+        Same field / parameter / frozen / history ``loc`` as :func:`_vol_elem_res` (so the formula reads
+        the solved unknown through ``ε(u)`` and the previous state through ``ep.i(-1)``), but the formula
+        carries NO test function, so it is *evaluated* at the quad points (``_eval_integrand``) rather than
+        integrated. This is the internal-state update the load-step march applies after each solve.
+        Reverse-mode differentiable in ``local_all`` (the solved DOFs) and the history buffers."""
+        cell_sols = _split_cell_local(local_all)
+        per, xq, meas = _cell_fields(c, cell_sols)
+        h_qp = jnp.broadcast_to(meas ** (1.0 / dim), (qw_shared.shape[0], 1))
+        loc = {
+            "physical_quad_points": xq,
+            "fields": per,
+            "field_index": field_index,
+            "tag": "fem_gauss",
+            "surface": False,
+            "domain_context": {**ctx, "cell_size": h_qp},
+            "temporal_tags": temporal_tags,
+            "runtime_parameter_tags": runtime_parameter_tags,
+            "region_mask_names": (),
+            "volume_vars": _runtime_vals(c, t, args, local_all.dtype),
+            "trial_value_shape": fields[0]["value_shape"],
+            "trial_vec": vecs[0],
+        }
+        if _field_param_names:
+            loc["shape_vals"] = per[_field_param_field_idx]["shape_vals"]
+        _nt = neural_local_table(_neural, args)
+        if _nt is not None:
+            loc["neural_coefficients"] = _nt
+        if _frozen_gathered:
+            loc["frozen_fields"] = {fid: g[c] for fid, g in _frozen_gathered.items()}
+        if history_specs and args is not None:
+            hbuf = args.get("__history__") if isinstance(args, dict) else None
+            if hbuf:
+                loc["qp_history"] = {k: hbuf[k][c] for k in history_specs if k in hbuf}
+        _add_loadpath_fields(loc, c, args)  # per-step load-path field slices -> loc["frozen_fields"]
+        return _eval_integrand(domain, formula, loc)
+
+    def state_readout(u_flat, t=0.0, args=None):
+        """Advance every buffered state one load step: evaluate each key's readout formula at the
+        quadrature points, given the just-solved ``u_flat`` and the current history buffers (on
+        ``args['__history__']``). Returns ``{history_key: (n_cells, n_quad, *value_shape)}`` — the value
+        that becomes each state's ``.i(-1)`` at the NEXT step. The load-step march rolls these into the
+        depth buffers. Whole-domain: the readout runs on every cell (sub-region-restricted plasticity is
+        not wired — a future masked readout)."""
+        local_all = u_flat[cell_all_dofs]  # (n_cell, n_local_all)
+        out: Dict[Any, Any] = {}
+        for key, formula in readout_formulas.items():
+            if key not in history_specs:  # VOLUME states only; surface states advance in surface_state_readout
+                continue
+            out[key] = jax.vmap(lambda c, la, _f=formula: _vol_elem_readout(c, la, _f, t, args))(
+                jnp.arange(n_cells), local_all
+            )
+        return out
 
     def _surf_elem_res(fi, local_all, bcoeff, btfi, region, t=0.0, args=None):
         """Element residual of one surface term on boundary face ``fi`` as a function of the parent
@@ -808,7 +1045,94 @@ def assemble_fem_native(
             loc["neural_coefficients"] = _nt
         if _frozen_gathered:  # known-field (ui.freeze) per-cell nodal slices for the parent cell
             loc["frozen_fields"] = {fid: g[c] for fid, g in _frozen_gathered.items()}
+        if surface_history_specs and args is not None:
+            # This face's per-quad-point surface-history slice (n_quad_surf, depth, *shape), gathered from
+            # the buffers on ``args`` by the global boundary-face id -- a per-face constant, so ``jacfwd``
+            # treats it as frozen (the tangent is ``∂t_fric/∂u`` with the slip history held, exactly like
+            # the volume return map holds the plastic strain).
+            sbuf = args.get("__surface_history__") if isinstance(args, dict) else None
+            if sbuf:
+                loc["qp_history"] = {k: sbuf[k][fi] for k in surface_history_specs if k in sbuf}
         return _integrate_term(domain, bcoeff, loc, face_w * jac_f)
+
+    def _surf_elem_readout(fi, local_all, formula, region, t=0.0, args=None):
+        """Per-quad-point VALUE of a surface evolution formula on boundary face ``fi`` -> (n_q, *shape).
+
+        The surface analogue of :func:`_vol_elem_readout`: the same surface ``loc`` as ``_surf_elem_res``
+        (fields, outward normal, per-face surface history), but the formula carries no test function, so it
+        is *evaluated* (``_eval_integrand``), not integrated -- the advance for a surface state (a slip)."""
+        c = parent_j[fi]
+        k = lface_j[fi]
+        n_vec = normals_j[fi]
+        cell_sols = _split_cell_local(local_all)
+        verts = pts_j[cells_j[c]]
+        J = jnp.stack([verts[i + 1] - verts[0] for i in range(dim)], axis=1)
+        Kmat = jnp.linalg.inv(J)
+        per_f = []
+        for i in range(len(fields)):
+            fp_i, fd_i, _, _, _ = face_tables_per_field[i]
+            per_f.append(
+                {
+                    "shape_vals": fp_i[k],
+                    "shape_grads": jnp.einsum("qnd,dD->qnD", fd_i[k], Kmat),
+                    "cell_sol": cell_sols[i],
+                    "space": "Lagrange",
+                }
+            )
+        _, _, fp_qp, _fp_tangs, _fw = face_tables_per_field[0]
+        xq_f = verts[0] + fp_qp[k] @ J.T
+        loc = {
+            "physical_quad_points": xq_f,
+            "fields": per_f,
+            "field_index": field_index,
+            "tag": f"gauss_{region}",
+            "surface": True,
+            "domain_context": {**ctx, f"n_{region}": n_vec},
+            "temporal_tags": temporal_tags,
+            "runtime_parameter_tags": runtime_parameter_tags,
+            "region_mask_names": (),
+            "volume_vars": _runtime_vals(c, t, args, local_all.dtype),
+            "trial_value_shape": fields[0]["value_shape"],
+            "trial_vec": vecs[0],
+        }
+        if _field_param_names:
+            loc["shape_vals"] = per_f[_field_param_field_idx]["shape_vals"]
+        _nt = neural_local_table(_neural, args)
+        if _nt is not None:
+            loc["neural_coefficients"] = _nt
+        if _frozen_gathered:
+            loc["frozen_fields"] = {fid: g[c] for fid, g in _frozen_gathered.items()}
+        if surface_history_specs and args is not None:
+            sbuf = args.get("__surface_history__") if isinstance(args, dict) else None
+            if sbuf:
+                loc["qp_history"] = {kk: sbuf[kk][fi] for kk in surface_history_specs if kk in sbuf}
+        return _eval_integrand(domain, formula, loc)
+
+    def surface_state_readout(u_flat, t=0.0, args=None):
+        """Advance each SURFACE state one load step: evaluate its evolves formula on its region's faces.
+
+        Returns ``{key: (n_bfaces, n_quad_surf, *value_shape)}`` -- the region's faces filled, every other
+        boundary face zero (unused). The march rolls these into the surface depth buffers."""
+        out: Dict[Any, Any] = {}
+        for key, spec in surface_history_specs.items():
+            formula = readout_formulas.get(key)
+            region = _surf_read_regions[key]
+            faces = _surf_region_faces.get(region)
+            full = jnp.zeros(
+                (int(spec["shape"][0]), int(spec["shape"][1])) + tuple(spec["value_shape"]), dtype=u_flat.dtype
+            )
+            if formula is None or faces is None or len(faces) == 0:
+                out[key] = full
+                continue
+            fids = jnp.asarray(faces, dtype=jnp.int32)
+            lv = u_flat[cell_all_dofs[parent_j[fids]]]  # (n_face_R, n_local_all)
+            vals = jax.vmap(lambda fi, la, _f=formula, _r=region: _surf_elem_readout(fi, la, _f, _r, t, args))(fids, lv)
+            # Normalize to the state's declared per-face shape (n_faces, n_quad_surf, *value_shape): a
+            # scalar update written with `inner(dir, u.bind(...), 1)` keeps a spurious trailing size-1 axis
+            # (harmless in the residual, where it contracts with the test) that must be squeezed here.
+            vals = vals.reshape((fids.shape[0], int(spec["shape"][1])) + tuple(spec["value_shape"]))
+            out[key] = full.at[fids].set(vals)
+        return out
 
     def _classify_one(coeff, where: str) -> List[Tuple[Any, int]]:
         """``[(coeff, test_field_idx), ...]`` for one lowered term. Normally one entry; a term that
@@ -1014,13 +1338,25 @@ def assemble_fem_native(
         return [int(n) for n in bnodes]
 
     def _build_dirichlet_pairs() -> List[Tuple[int, float]]:
-        from ..._fem import _eval_value_node_at
+        from ..._fem import _eval_value_node_at, _is_temporal_value_node
         from ...trace import ModelCall
 
         pairs: List[Tuple[int, float]] = []
+        tv_stash: List[Tuple[Any, Any, Any]] = []  # (dofs, value_node, coords) for time-varying g(x,t)
         for field_key, region, comp, value, value_node in dirichlet_raw:
             fidx = field_index.get(field_key)
             if fidx is None:
+                continue
+            # Time-varying Dirichlet g(x,t): no constant pair — stash (dofs, value_node, coords) so a
+            # transient caller (e.g. the second-order augmented block) writes g(x_d, t) each step.
+            if value_node is not None and _is_temporal_value_node(value_node):
+                vt = vecs[fidx]
+                pts_all = np.asarray(pts_f_all[fidx])
+                nids = list(_boundary_node_ids(fidx, region))
+                coords = jnp.asarray(pts_all[np.asarray(nids, dtype=int)]) if nids else jnp.zeros((0, dim))
+                for c in range(vt) if comp is None else [int(comp)]:
+                    dofs = jnp.asarray([offs[fidx] + nid * vt + c for nid in nids], dtype=jnp.int32)
+                    tv_stash.append((dofs, value_node, coords))
                 continue
             _vn = _bare_node(value_node) if value_node is not None else None
             # A nodal DATA-field value (a `jno.np.parameter` carrying a field with NO optimizer — e.g. a
@@ -1054,7 +1390,10 @@ def assemble_fem_native(
                     pairs.append((offs[fidx] + nid * vt + c, g))
         # Expose the (dof, value) pairs for callers that compose their own system from native blocks
         # (e.g. the second-order-in-time augmented [u, v] block applies them to the 2N system itself).
+        # The time-varying entries ride a companion stash: the caller writes g(x_d, t) (and, for a
+        # second-order block, the velocity ġ) per step.
         domain._fem_native_dirichlet_pairs = pairs
+        domain._fem_native_dirichlet_tv = tv_stash
         return pairs
 
     def _dirichlet_pairs_at(args):
@@ -1344,7 +1683,7 @@ def assemble_fem_native(
     # each call, kept differentiable in args -- the parameter flows as a JAX array through the kernel
     # coefficient into the per-cell assembly (no float() cast). The same re-assembly handles affine,
     # non-affine and (scalar) parameters uniformly. ----
-    if runtime_parameter_tags or neural_param_names or _dir_net_models:
+    if runtime_parameter_tags or neural_param_names or _dir_net_models or history_specs or surface_history_specs:
         from ...trace import FemLinearSystem
 
         if nonlinear:
@@ -1354,19 +1693,25 @@ def assemble_fem_native(
                     "(the row-replacement Dirichlet uses a static value). Use a linear form."
                 )
 
-            def res_p(u, args=None, _d=s_d_dofs, _g=s_d_vals):
-                R = residual(jnp.asarray(u), 0.0, args)
+            # ``t`` carries the pseudo-time (load) coordinate τ for the history march — the load written
+            # as a function of τ in the weak form varies through it. Defaults to 0.0, so the ordinary
+            # (non-marching) parametric/inverse call sites are unchanged.
+            def res_p(u, args=None, t=0.0, _d=s_d_dofs, _g=s_d_vals):
+                R = residual(jnp.asarray(u), t, args)
                 return R if _d is None else R.at[_d].set(jnp.asarray(u)[_d] - _g)
 
-            def jac_p(u, args=None, _d=s_d_dofs):
-                J = jacobian(jnp.asarray(u), 0.0, args)
+            def jac_p(u, args=None, t=0.0, _d=s_d_dofs):
+                J = jacobian(jnp.asarray(u), t, args)
                 return J if _d is None else bcoo_set_dirichlet_rows(J, _d)
 
-            return (
-                FemResidualOperator(res_p, jac_p, total, runtime_parameter_exprs=dict(_param_and_neural_exprs)),
-                "nonlinear",
-                offs,
-            )
+            _op = FemResidualOperator(res_p, jac_p, total, runtime_parameter_exprs=dict(_param_and_neural_exprs))
+            _op.history_specs = history_specs  # VOLUME step-history buffer layout for the load-step driver
+            _op.surface_history_specs = surface_history_specs  # SURFACE (per-face) step-history layout
+            _op.history_roles = history_roles  # {key: "primary" | "internal"} — how each state advances
+            _op.state_readout = state_readout  # (u, t, args) -> {key: next per-QP VOLUME state}; march driver
+            _op.surface_state_readout = surface_state_readout  # (u, t, args) -> {key: next per-FACE state}
+            _op.path_specs = path_specs  # {fid: {frames (n_steps, n_nodes), ...}} — per-step load-path fields
+            return (_op, "nonlinear", offs)
 
         def _assemble_at(args):
             A = jacobian(zeros, 0.0, args)

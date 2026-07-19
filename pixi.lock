@@ -4233,6 +4233,7 @@ packages:
   - paramax>=0.0.5
   - blackjax>=1.2
   - fenics-basix
+  - jaxamg[cuda13]>=0.1.3,<0.2 ; extra == 'amg'
   - pytest>=7.0 ; extra == 'dev'
   - black>=22.0 ; extra == 'dev'
   - flake8>=4.0 ; extra == 'dev'

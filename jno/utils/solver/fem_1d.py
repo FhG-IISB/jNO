@@ -314,6 +314,7 @@ def _assemble_1d_transient(domain, volume_terms, boundary_terms, dirichlet_value
     ``jacobian`` callables."""
     from ..._fem import _bare, _ic_value_at_nodes
     from .backend_blocks import SemidiscreteTimeBlock
+    from .solver_helper import max_temporal_derivative_order as _mto
     from .time_route import _infer_time_window, _strip_temporal_trial_derivative
     from .weak_form import (
         _apply_sign,
@@ -334,6 +335,73 @@ def _assemble_1d_transient(domain, volume_terms, boundary_terms, dirichlet_value
     spatial_terms = [t for t in sub_terms if not _contains_temporal_derivative(t)]
     if not temporal_terms:
         raise ValueError("jno.fem: a transient 1D weak form must contain a temporal-derivative term (u_t * phi).")
+
+    # === second-order-in-time (u_tt): the augmented first-order block y = [u; v], v = u̇, integrated
+    #     by the trapezoidal (θ=½) rule — the 1D analogue of the native _assemble_second_order_time. ===
+    if max((_mto(t) for t in temporal_terms), default=1) >= 2:
+        if any(_is_obviously_nonlinear_in_unknown(domain, t) for t in spatial_terms):
+            raise NotImplementedError("jno.fem: a nonlinear second-order-in-time 1D form is not supported.")
+
+        def _strip_n(t, k):
+            for _ in range(k):
+                t = _strip_temporal_trial_derivative(t)
+            return t
+
+        z = jnp.zeros(ndof)
+        m2_terms = [_strip_n(t, 2) for t in temporal_terms if _mto(t) >= 2]  # u_tt·φ ⇒ mass M2
+        d_terms = [_strip_n(t, 1) for t in temporal_terms if _mto(t) == 1]  # u_t·φ ⇒ damping C (optional)
+        M2 = jax.jacfwd(_make_residual(domain, m2_terms, {}, n_nodes=n_nodes, vec=vec, quad_degree=quad_degree))(z)
+        Cmat = (
+            jax.jacfwd(_make_residual(domain, d_terms, {}, n_nodes=n_nodes, vec=vec, quad_degree=quad_degree))(z)
+            if d_terms
+            else jnp.zeros((ndof, ndof), z.dtype)
+        )
+        spatial_res2 = _make_residual(
+            domain, spatial_terms, boundary_terms, n_nodes=n_nodes, vec=vec, quad_degree=quad_degree
+        )
+        K = jax.jacfwd(spatial_res2)(z)
+        F = -spatial_res2(z)  # spatial load + natural-BC load
+        n = ndof
+        Z = jnp.zeros((n, n), z.dtype)
+        M_aug = jnp.block([[M2, Z], [Z, M2]])
+        A_aug = jnp.block([[Z, -M2], [K, Cmat]])  # M2 u̇ = M2 v ; M2 v̇ + C v + K u = F
+        c_aug = jnp.concatenate([jnp.zeros((n,), z.dtype), F])
+        dpairs = _dirichlet_dofs(domain, dirichlet_values, vec)
+        if dpairs:  # u[d]=g (constant) on displacement rows, v[d]=0 on velocity rows
+            dd = jnp.asarray([p[0] for p in dpairs], dtype=jnp.int32)
+            dg = jnp.asarray([p[1] for p in dpairs], dtype=z.dtype)
+            M_aug = M_aug.at[dd, :].set(0.0).at[dd + n, :].set(0.0)
+            A_aug = A_aug.at[dd, :].set(0.0).at[dd, dd].set(1.0).at[dd + n, :].set(0.0).at[dd + n, dd + n].set(1.0)
+            c_aug = c_aug.at[dd].set(dg).at[dd + n].set(0.0)
+        pts = jnp.asarray(domain.mesh.points)[:, : domain.dimension]
+        u0 = jnp.zeros((n,), z.dtype)
+        v0 = jnp.zeros((n,), z.dtype)
+        for ic in ic_residuals:  # displacement IC u(0)=u0 + optional velocity IC u̇(0)=v0
+            val = jnp.asarray(_ic_value_at_nodes(_bare(ic), domain, pts, ndof, vec), z.dtype)
+            if _mto(_bare(ic)) >= 1:
+                v0 = val
+            else:
+                u0 = val
+        if dpairs:
+            u0, v0 = u0.at[dd].set(dg), v0.at[dd].set(0.0)
+        t0, t1, dt = _infer_time_window(domain)
+        block = SemidiscreteTimeBlock(
+            backend="transient",
+            mode="implicit",
+            time_order=2,
+            spatial_kind="weak_form",
+            M=M_aug,
+            A=A_aug,
+            affine_bias=c_aug,
+            state0=jnp.concatenate([u0, v0]),
+            t0=t0,
+            t1=t1,
+            dt=dt,
+            eval_context=getattr(domain, "_fem_eval_context", {}) or {},
+            metadata={"theta": 0.5, "second_order": True},
+        )
+        return block, "transient"
+
     mass_terms = [_strip_temporal_trial_derivative(t) for t in temporal_terms]
 
     dirichlet_pairs = _dirichlet_dofs(domain, dirichlet_values, vec)

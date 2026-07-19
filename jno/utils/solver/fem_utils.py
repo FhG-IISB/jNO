@@ -24,6 +24,7 @@ from ...trace import (
     FrozenField,
     FunctionCall,
     Hessian,
+    HistoryRef,
     Jacobian,
     Literal,
     ModelCall,
@@ -1081,6 +1082,22 @@ def _eval_integrand(domain, node, local):
         if len(value_shape) == 0:
             return flat_interp
         return _reshape_components_last(flat_interp, value_shape)
+
+    if isinstance(node, HistoryRef):
+        # STEP-history read ``v.i(k)``: the driver threads this cell's per-quadrature-point buffer slice
+        # (shape (n_quad, depth, *value_shape)) as a per-cell constant. We just pick the offset's slot —
+        # no shape-function interpolation (history lives AT the quad points, not at nodes). Because the
+        # slice is indexed by the cell (not the local DOFs), the per-element ``jacfwd`` sees it as a
+        # constant, so the tangent is ``∂σ/∂ε`` with history frozen (correct within a load step).
+        table = local.get("qp_history")
+        if table is None or node.history_key not in table:
+            raise NotImplementedError(
+                f"history read {node.name!r} has no buffer — a form using ``.i(k)`` must be solved through "
+                "the load-step driver (fem.solve(load=...)), which allocates and threads the per-step "
+                "history. A plain fem.solve() does not carry step history."
+            )
+        buf_c = table[node.history_key]  # (n_quad, depth, *value_shape) for this cell
+        return buf_c[:, -node.offset - 1]  # offset -1 -> slot 0, -2 -> slot 1, ...  -> (n_quad, *value_shape)
 
     if isinstance(node, FrozenField):
         # KNOWN field: interpolate its frozen nodal slice at the quad points, exactly like the

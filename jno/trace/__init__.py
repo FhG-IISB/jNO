@@ -724,6 +724,30 @@ class Placeholder:
         _guard_ad_on_fd(self, scheme)
         return Hessian(self, [variable], scheme, trace=True)
 
+    def i(self, offset: int) -> "HistoryRef":
+        """Step-time **history index**: ``v.i(-1)`` is this variable one load-step back (``0`` = the
+        current step, ``-1`` the previous, ``-2`` two back, …; ``offset`` must be ``<= 0``).
+
+        Reading ``v.i(-n)`` in a form declares that the load-step driver must keep ``n`` past states of
+        ``v``; the keep-depth is *inferred* from the most-negative index the form uses (see
+        :func:`history_variables`), and the buffer rides the driver's ``lax.scan`` carry so the whole
+        history-dependent solve stays reverse-mode differentiable. Use it for path-dependent internal
+        variables (plastic strain ``ep.i(-1)``) or multistep time schemes (``u.i(-2)``).
+
+        The step axis ``i`` is orthogonal to the spatial axis — it is *not* a coordinate and may not be
+        passed to ``.bind()``.
+        """
+        return HistoryRef(self, offset)
+
+    def evolves(self, formula) -> "StateUpdate":
+        """Declare a per-step **state update** for this (internal-state) field: at the current step it
+        *becomes* ``formula`` — which typically reads its own past via ``self.i(-1)`` and the solved
+        unknown (e.g. ``ep.evolves(ep.i(-1) + rt*dg*n)``). Put it in the ``jno.fem([...])`` list beside the
+        equations; the load-step march evaluates ``formula`` at the quadrature points after each solve to
+        advance the buffer that ``self.i(-1)`` reads. Reads use ``.i(-k)``, writes use ``.evolves`` — a
+        *named* update, not an operator (``==`` is reserved for identity, ``<`` for comparison)."""
+        return StateUpdate(self, formula)
+
     def laplacian(
         self,
         *variables: "Variable",
@@ -3134,6 +3158,10 @@ class FemResidualOperator:
         self.runtime_parameter_exprs = runtime_parameter_exprs or {}
         self.residual_basis = residual_basis or {}
         self.metadata = metadata or {}
+        # Step-history buffer layout {history_key: {name, depth, value_shape, shape}} for a load-step
+        # solve (``v.i(k)`` in the form); empty unless the assembler found HistoryRef nodes. The driver
+        # reads it to allocate the zeroed per-QP buffers and thread them on ``args["__history__"]``.
+        self.history_specs: dict = {}
 
     @property
     def is_parametric(self) -> bool:
@@ -3401,9 +3429,15 @@ class FrozenField(Placeholder):
     unknown-detection that routes nonlinear solves: a term like
     ``softplus(net(xi, yi, ui.freeze(u0).x, ui.freeze(u0).y)) * (grad u . grad v)``
     stays LINEAR in the true unknown ``u`` while conditioning the coefficient on the
-    known field ``u0`` (a predictor-corrector). No gradient flows into ``values``."""
+    known field ``u0`` (a predictor-corrector). No gradient flows into ``values``.
 
-    def __init__(self, source, values):
+    Beyond assembly, a frozen field carries its mesh ``_domain`` and the ``_coord_tag`` it was bound to,
+    so it (and its ``.x`` / ``.y`` gradient) can be **read out standalone via ``.eval()``** — the
+    boundary-functional readout the evaluator handles in ``_eval_frozen_field`` (value → nodal values
+    mapped to the sample points) and ``_eval_jacobian`` (gradient → FD-over-mesh). This turns a
+    functional of a solved field, e.g. the normal-flux ``∇T·n``, into an evaluable traced expression."""
+
+    def __init__(self, source, values, domain=None, coord_tag=None):
         self.name = f"frozen[{getattr(source, 'name', 'u')}]"
         self.value_shape = tuple(getattr(source, "value_shape", ()))
         self.order = int(getattr(source, "order", 1))
@@ -3412,6 +3446,11 @@ class FrozenField(Placeholder):
         self.field_key = source.field_key  # share the source field's shape data
         self.values = jnp.asarray(values).reshape(-1)  # global nodal vector (scalar field)
         self.frozen_id = _next_op_id()  # kernel gather-table key
+        # Standalone ``.eval()`` support (distinct from the kernel gather-table used during assembly):
+        # the mesh domain + the coordinate region this field was bound to, so the evaluator can map the
+        # nodal ``values`` — and their FD-over-mesh gradient (``.x`` / ``.y``) — onto the sample points.
+        self._domain = domain
+        self._coord_tag = coord_tag
 
     @property
     def num_components(self) -> int:
@@ -3435,6 +3474,267 @@ class FrozenField(Placeholder):
 
     def __repr__(self):
         return f"FrozenField(source_key={self.field_key}, ndof={self.values.shape[0]})"
+
+
+class LoadPathField(FrozenField):
+    """A frozen field whose nodal values vary **per load step** of a ``domain(tau=...)`` march — produced
+    by ``u.bind(...).freeze_path(frames)`` with ``frames`` of shape ``(n_load_steps, n_nodes)``.
+
+    At load step ``k`` it presents ``frames[k]`` at the quadrature points, exactly like a
+    :class:`FrozenField` presents a fixed field — it **is** a ``FrozenField`` (so it reuses the same
+    node→quadrature interpolation and stays invisible to unknown-detection), but its per-step nodal slice
+    is delivered by the load-step driver through ``args["__loadpath__"]`` rather than baked at compile
+    time. This is what lets a **precomputed field history** — one nodal field per load step, from a prior
+    solve or prescribed data — drive a load path (a one-way coupling: the field history *is* the load).
+    Requires a ``tau=`` march (fails loud on a plain domain, where no driver would supply the per-step
+    slice). Scalar Lagrange fields only.
+    """
+
+    def __init__(self, source, frames, domain=None, coord_tag=None):
+        frames = jnp.asarray(frames)
+        if frames.ndim != 2:
+            raise ValueError(
+                f"freeze_path expects `frames` of shape (n_load_steps, n_nodes); got {tuple(frames.shape)}. "
+                "Stack one nodal field per load step of the tau= grid."
+            )
+        # values[0] seeds the FrozenField shape data / identity; the driver overrides it per step.
+        super().__init__(source, frames[0], domain=domain, coord_tag=coord_tag)
+        self.path_frames = frames  # (n_load_steps, n_nodes) — the driver scans this leading axis
+        self.n_steps = int(frames.shape[0])
+        self.name = f"loadpath[{getattr(source, 'name', 'u')}]"
+
+    def __repr__(self):
+        return f"LoadPathField(source_key={self.field_key}, steps={self.n_steps}, nnode={self.values.shape[0]})"
+
+
+def load_path_fields_in(expr):
+    """The distinct :class:`LoadPathField` nodes in ``expr`` (by identity, first-seen order)."""
+    return [f for f in frozen_fields_in(expr) if isinstance(f, LoadPathField)]
+
+
+# ---------------------------------------------------------------------------
+# Trace substitution — rebuild an expression with some nodes swapped out
+# ---------------------------------------------------------------------------
+def _iter_placeholder_children(node):
+    """Yield ``(kind, attr, value)`` for each Placeholder-bearing child of a trace node — the scalar
+    child attributes (``target``/``left``/``right``/``expr``/``operation``) and the list attributes
+    (``args``/``variables``/``options``). The single traversal shape used by all trace walks here."""
+    for attr in ("target", "left", "right", "expr", "operation"):
+        child = getattr(node, attr, None)
+        if isinstance(child, Placeholder):
+            yield "scalar", attr, child
+    for attr in ("args", "variables", "options"):
+        seq = getattr(node, attr, None)
+        if isinstance(seq, (list, tuple)):
+            yield "list", attr, seq
+
+
+def substitute(expr, mapping):
+    """Return ``expr`` with each node in ``mapping`` replaced by its value, rebuilding all ancestors.
+
+    ``mapping`` maps existing trace nodes (matched **by identity**) to their replacements. Nodes on the
+    path to a replacement are shallow-cloned with a fresh ``op_id`` (so eval caches never confuse a clone
+    with its original); a node with no replaced descendant is returned unchanged (shared, not copied).
+    General over the trace node structure. Example — swap the live state into a *static* velocity
+    expression each step of a moving-boundary solve::
+
+        v_now = substitute(v, {frozen_u: refreeze(frozen_u, state)})
+    """
+    import copy as _copy
+
+    id_map = {id(k): v for k, v in mapping.items()}
+    memo: dict = {}
+
+    def visit(node):
+        if not isinstance(node, Placeholder):
+            return node
+        if id(node) in id_map:
+            return id_map[id(node)]
+        if id(node) in memo:
+            return memo[id(node)]
+        changed = False
+        new_scalar: dict = {}
+        new_list: dict = {}
+        for kind, attr, val in _iter_placeholder_children(node):
+            if kind == "scalar":
+                nc = visit(val)
+                new_scalar[attr] = nc
+                changed = changed or nc is not val
+            else:
+                nl = [visit(c) if isinstance(c, Placeholder) else c for c in val]
+                new_list[attr] = type(val)(nl)
+                changed = changed or any(a is not b for a, b in zip(nl, val))
+        if not changed:
+            memo[id(node)] = node
+            return node
+        clone = _copy.copy(node)
+        for attr, nc in new_scalar.items():
+            setattr(clone, attr, nc)
+        for attr, nl in new_list.items():
+            setattr(clone, attr, nl)
+        if hasattr(clone, "op_id"):
+            clone.op_id = _next_op_id()
+        memo[id(node)] = clone
+        return clone
+
+    return visit(expr)
+
+
+def frozen_fields_in(expr):
+    """The distinct :class:`FrozenField` nodes appearing in ``expr`` (by identity), in first-seen order."""
+    out, seen = [], set()
+
+    def visit(node):
+        if not isinstance(node, Placeholder) or id(node) in seen:
+            return
+        seen.add(id(node))
+        if isinstance(node, FrozenField):
+            out.append(node)
+        for kind, _attr, val in _iter_placeholder_children(node):
+            for c in val if kind == "list" else (val,):
+                visit(c)
+
+    visit(expr)
+    return out
+
+
+def refreeze(frozen, values):
+    """A copy of :class:`FrozenField` ``frozen`` pinned to new ``values``, with a **fresh gather-table
+    key** so the eval bakes the new values. (Mutating ``.values`` in place does not take effect — the
+    key is cached.) Used to swap the live state into a static readout each step."""
+    import copy as _copy
+
+    clone = _copy.copy(frozen)
+    clone.values = jnp.asarray(values).reshape(-1)
+    clone.frozen_id = _next_op_id()  # new gather-table key ⇒ the compiler bakes THESE values
+    clone.op_id = _next_op_id()
+    return clone
+
+
+class HistoryRef(Placeholder):
+    """A traced variable indexed in STEP time — ``v.i(k)`` for ``k <= 0`` (0 = current step, -1 = the
+    previous step, …), produced by :meth:`Placeholder.i`.
+
+    Like a :class:`FrozenField` it is a KNOWN field within a load step — the driver hands in the buffered
+    value — so it stays invisible to the nonlinear unknown-detection: a residual that reads ``ep.i(-1)`` is
+    still linear in the live unknown ``u``, exactly like a frozen field. Unlike a frozen field its value is
+    UPDATED each step, and it lives at the quadrature points (not interpolated from nodes). It carries the
+    base variable's identity + shape so the assembler resolves it to the right per-quadrature-point history
+    buffer slot; a build keeps ``max|offset|`` past states per base variable (inferred, see
+    :func:`history_variables`)."""
+
+    def __init__(self, base, offset):
+        base = base._expr if hasattr(base, "_expr") else base  # unwrap a typed view
+        off = int(offset)
+        if off > 0:
+            raise ValueError(
+                f".i(k) is a PAST-state index: k must be <= 0 (0 = current step, -1 = previous); got {offset}."
+            )
+        self.target = base  # every trace walk reaches the base through _iter_placeholder_children
+        self.offset = off
+        self.name = f"{getattr(base, 'name', 'field')}.i({off})"
+        self.value_shape = tuple(getattr(base, "value_shape", ()))
+        self.order = int(getattr(base, "order", 1))
+        self.space = str(getattr(base, "space", "Lagrange"))
+        self.field_key = getattr(base, "field_key", None)
+        self.op_id = _next_op_id()
+
+    @property
+    def base(self):
+        return self.target
+
+    @property
+    def history_key(self):
+        """Buffer identity — shared across offsets of the same base variable, so ``v.i(-1)`` and
+        ``v.i(-2)`` index one buffer."""
+        return id(self.target)
+
+    def __repr__(self):
+        return f"HistoryRef({self.name})"
+
+
+class StateUpdate(Placeholder):
+    """A per-quadrature-point **state update** — ``state.evolves(formula)``, produced by
+    :meth:`Placeholder.evolves`. It declares how an internal-state field advances one load step: at the
+    current step ``state`` *becomes* ``formula`` (which typically reads the previous state via
+    ``state.i(-1)`` and the solved unknown). It is NOT a weak-form residual (no test function) and NOT an
+    equation — the FEM front-end routes it to the *evolution* bucket, and the load-step march evaluates
+    ``formula`` at the quadrature points after each equilibrium solve to overwrite the history buffer that
+    ``state.i(-1)`` reads. Its :attr:`history_key` matches the base variable's :class:`HistoryRef` key, so
+    the write lands in the exact buffer the read consumes. Both children (``target`` = the state field,
+    ``expr`` = the update formula) are walked, so any ``.i(k)`` *inside* the formula still contributes to
+    the inferred keep-depth (see :func:`history_variables`)."""
+
+    def __init__(self, base, formula):
+        base = base._expr if hasattr(base, "_expr") else base  # unwrap a typed view
+        self.target = base  # the state field advanced (reached via _iter_placeholder_children)
+        self.expr = formula  # the RHS update expression (also a walked child)
+        self.name = f"{getattr(base, 'name', 'state')}.evolves(...)"
+        self.value_shape = tuple(getattr(base, "value_shape", ()))
+        self.order = int(getattr(base, "order", 1))
+        self.space = str(getattr(base, "space", "Lagrange"))
+        self.field_key = getattr(base, "field_key", None)
+        self.op_id = _next_op_id()
+
+    @property
+    def base(self):
+        return self.target
+
+    @property
+    def formula(self):
+        return self.expr
+
+    @property
+    def history_key(self):
+        """Buffer identity — the same ``id(base)`` a :class:`HistoryRef` on this field uses, so the update
+        writes the slot the read consumes."""
+        return id(self.target)
+
+    def __repr__(self):
+        return f"StateUpdate({getattr(self.target, 'name', 'state')})"
+
+
+def history_variables(terms):
+    """Scan trace ``terms`` (a term or list of terms) for :class:`HistoryRef` nodes and return
+    ``{history_key: (base, depth)}`` — ``depth`` is how many PAST states of that base variable the load-step
+    driver must buffer, i.e. the magnitude of the most-negative ``.i(k)`` the form uses. A form that only
+    reads ``.i(0)`` needs no buffer (depth 0, omitted). Same trace walk as :func:`frozen_fields_in`."""
+    if isinstance(terms, Placeholder):
+        terms = [terms]
+    found: dict = {}
+    seen: set = set()
+
+    def visit(node):
+        if not isinstance(node, Placeholder) or id(node) in seen:
+            return
+        seen.add(id(node))
+        if isinstance(node, HistoryRef) and node.offset < 0:
+            key = node.history_key
+            base, prev = found.get(key, (node.base, 0))
+            found[key] = (base, max(prev, -node.offset))
+        for kind, _attr, val in _iter_placeholder_children(node):
+            for c in val if kind == "list" else (val,):
+                visit(c)
+
+    for t in terms:
+        visit(t)
+    return found
+
+
+def state_updates(terms):
+    """The top-level :class:`StateUpdate` nodes in ``terms`` (a term or list of terms), as
+    ``{history_key: StateUpdate}`` — one update per internal-state field (a later declaration wins). The
+    FEM front-end uses this to pull ``state.evolves(...)`` terms out of the weak-form/Dirichlet
+    classification and into the evolution bucket; the formulas are still walked by
+    :func:`history_variables` so their ``.i(k)`` reads allocate buffers."""
+    if isinstance(terms, Placeholder):
+        terms = [terms]
+    out: dict = {}
+    for t in terms:
+        node = t._expr if hasattr(t, "_expr") else t
+        if isinstance(node, StateUpdate):
+            out[node.history_key] = node
+    return out
 
 
 class TestFunction(Placeholder):
