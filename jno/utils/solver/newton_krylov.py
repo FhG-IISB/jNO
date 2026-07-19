@@ -17,7 +17,7 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
-__all__ = ["newton_krylov", "bicgstab"]
+__all__ = ["newton_krylov", "newton_direct", "bicgstab"]
 
 _EPS = 1e-300
 
@@ -150,3 +150,74 @@ def newton_krylov(
 
     tangent_solve = lambda g, y: inner(g, y)
     return jax.lax.custom_root(f0, u0, solve, tangent_solve)
+
+
+def newton_direct(
+    residual_fn,
+    jacobian_fn,
+    u0,
+    *,
+    rtol=1e-8,
+    atol=1e-8,
+    max_steps=100,
+    damping=1.0,
+    line_search=False,
+    ls_max=25,
+    ls_c=1e-4,
+):
+    """Root-find ``residual_fn(u) = 0`` with a **sparse-direct** Newton: each step factorizes the
+    ASSEMBLED Jacobian ``jacobian_fn(u)`` (a ``jax.experimental.sparse.BCOO``) with ``sparse_lu_solve``
+    instead of the matrix-free Krylov inner solve of :func:`newton_krylov`. A direct factorization is
+    robust on **indefinite / ill-conditioned** systems -- Taylor-Hood velocity/pressure saddles, stiff
+    phase-change (Carman-Kozeny) drag -- where BiCGStab stalls (no saddle-point preconditioner).
+
+    Differentiable w.r.t. anything ``residual_fn`` closes over: the forward Newton runs to the root
+    un-differentiated, then ``jax.lax.custom_root`` provides the implicit-function-theorem gradient via a
+    **direct, transposable** tangent solve on the Jacobian assembled at the root (so the reverse pass
+    solves ``Jᵀ`` directly too, not with a stalling Krylov). ``jacobian_fn(u)`` must return the assembled
+    Jacobian of ``residual_fn`` at ``u``. ``damping`` / ``line_search`` as in :func:`newton_krylov`."""
+    from .linear import sparse_lu_solve
+
+    f0 = lambda u: jnp.asarray(residual_fn(u)).reshape(-1)  # noqa: E731
+    u0 = jnp.asarray(u0).reshape(-1)
+
+    def _backtrack(u, delta, rn):  # residual-norm Armijo, identical to newton_krylov's
+        def cond(s):
+            _a, acc, it = s
+            return (~acc) & (it < ls_max)
+
+        def step(s):
+            a, _acc, it = s
+            acc = jnp.linalg.norm(f0(u + a * delta)) <= (1.0 - ls_c * a) * rn
+            return jnp.where(acc, a, 0.5 * a), acc, it + 1
+
+        a, _acc, _it = jax.lax.while_loop(cond, step, (jnp.asarray(damping, u.dtype), False, 0))
+        return a
+
+    def _forward(x0):
+        r0n = jnp.linalg.norm(f0(x0))
+
+        def cond(state):
+            _u, r, k = state
+            return (jnp.linalg.norm(r) > atol + rtol * r0n) & (k < max_steps)
+
+        def body(state):
+            u, _r, k = state
+            r = f0(u)
+            delta = sparse_lu_solve(jacobian_fn(u), -r)  # DIRECT solve of the assembled tangent
+            alpha = _backtrack(u, delta, jnp.linalg.norm(r)) if line_search else damping
+            u = u + alpha * delta
+            return u, f0(u), k + 1
+
+        u, _r, _k = jax.lax.while_loop(cond, body, (x0, f0(x0), 0))
+        return u
+
+    root = _forward(u0)  # un-differentiated forward solve; custom_root below supplies the gradient
+
+    def _tangent(g, y):  # solve J_root x = y (and Jᵀ on the reverse pass) DIRECTLY at the converged root
+        J = jacobian_fn(root)
+        fwd = lambda _mv, rhs: sparse_lu_solve(J, rhs)  # noqa: E731
+        tsp = lambda _mv, rhs: sparse_lu_solve(J.T, rhs)  # noqa: E731
+        return jax.lax.custom_linear_solve(g, y, fwd, transpose_solve=tsp)
+
+    return jax.lax.custom_root(f0, root, lambda _f, _x0: root, _tangent)

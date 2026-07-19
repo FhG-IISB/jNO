@@ -163,6 +163,68 @@ def test_nonlinear_slots_match_default():
 
 
 # ---------------------------------------------------------------------------
+# sparse-DIRECT nonlinear Newton -- jno.solve.newton(direct=True)
+# ---------------------------------------------------------------------------
+
+
+def test_nonlinear_direct_newton_matches_default():
+    """``direct=True`` factorizes the ASSEMBLED tangent each Newton step (sparse LU) instead of the
+    matrix-free BiCGStab inner solve. On a well-behaved system it solves the SAME discrete nonlinear
+    problem as the default -- to solver tolerance -- and reproduces the manufactured solution."""
+    fem = _nonlinear()
+    u_ref = np.asarray(fem.solve())  # matrix-free Newton-Krylov default
+    u = np.asarray(fem.solve(nonlinear=jno.solve.newton(direct=True)))
+    assert np.abs(u - u_ref).max() < 1e-7
+    p = np.asarray(fem.points)
+    u_exact = np.sin(PI * p[:, 0]) * np.sin(PI * p[:, 1])  # exact u = sin(pi x) sin(pi y)
+    assert np.abs(u - u_exact).max() < 5e-2  # coarse-mesh (0.25) discretization error, not a solver error
+
+
+def test_nonlinear_direct_newton_line_search():
+    """The direct inner solve composes with the shared globalization options (damped + line search)."""
+    fem = _nonlinear()
+    u_ref = np.asarray(fem.solve())
+    u = np.asarray(fem.solve(nonlinear=jno.solve.newton(direct=True, line_search=True, damping=0.8)))
+    assert np.abs(u - u_ref).max() < 1e-7
+
+
+def test_nonlinear_direct_newton_differentiable():
+    """The direct Newton stays differentiable in a parameter: ``custom_root`` supplies the implicit-
+    function gradient via a DIRECT, transposable tangent solve on the assembled tangent at the root."""
+    import optax
+
+    alpha = jno.np.parameter((1,), key=jax.random.PRNGKey(3), name="alpha_direct")
+    alpha.initialize(jax.nn.initializers.constant(2.0))
+    alpha.dtype(jnp.float64)
+    alpha.optimizer(optax.adam(5e-2))
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.25)
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    ss = jno.np.sin(PI * xi) * jno.np.sin(PI * yi)
+    f = 2.0 * PI**2 * ss + ss**3
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y + alpha * ui**3 * vi - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+
+    u_obs = jnp.asarray(_nonlinear(mesh_size=0.25).solve())  # alpha_true = 1 data
+    node = fem.solve(nonlinear=jno.solve.newton(direct=True))
+    dummy = jno.domain.from_array({"_": np.zeros((1, 1))})
+    crux = jno.core([(node - u_obs).mse], domain=dummy)
+    crux.solve(120)
+    a = float(np.asarray(crux.eval([alpha])).reshape(-1)[0])
+    assert abs(a - 1.0) < 0.05, f"alpha not recovered through the direct Newton adjoint: {a}"
+
+
+def test_direct_newton_without_assembled_jacobian_raises():
+    """As a bare driver (no assembled Jacobian threaded in) ``direct=True`` fails loud: a sparse-direct
+    step needs the assembler's tangent, provided only on the native nonlinear / transient paths."""
+    solver = jno.solve.newton(direct=True)
+    with pytest.raises(ValueError, match="ASSEMBLED Jacobian"):
+        solver(lambda w: w, jnp.zeros(3))
+
+
+# ---------------------------------------------------------------------------
 # parametric (inverse) path stays differentiable through slot solvers
 # ---------------------------------------------------------------------------
 

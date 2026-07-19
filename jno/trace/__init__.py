@@ -3219,7 +3219,13 @@ class FemResidualOperator:
 
         def _solve(*values):
             args = dict(zip(names, values))
-            return solve_fn(lambda u: self.residual(u, args), u0)
+            residual_fn = lambda u: self.residual(u, args)  # noqa: E731
+            # A sparse-direct Newton (``jno.solve.newton(direct=True)``) flags ``wants_jacobian`` and
+            # factorizes the ASSEMBLED tangent each step; hand it ``self.jacobian`` (the per-element
+            # assembled BCOO, with Dirichlet rows already set). Every other driver stays matrix-free.
+            if getattr(solve_fn, "wants_jacobian", False) and self.jacobian is not None:
+                return solve_fn(residual_fn, u0, jacobian=lambda u: self.jacobian(u, args))
+            return solve_fn(residual_fn, u0)
 
         return FunctionCall(_solve, params, name="fem_solve")
 

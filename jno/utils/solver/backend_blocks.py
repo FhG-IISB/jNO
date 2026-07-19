@@ -248,6 +248,19 @@ class SemidiscreteTimeBlock:
                 return g if r_now is None else g + r_now
 
             if nonlinear_solve is not None:
+                # A sparse-direct Newton (``jno.solve.newton(direct=True)``) factorizes the ASSEMBLED
+                # step tangent each iteration rather than a matrix-free Krylov inner solve — it flags
+                # ``wants_jacobian`` so we build the backward-Euler step Jacobian here and thread it in.
+                # The step residual is ``G = M(t+dt)(wn-u)/dt + R(wn, t+dt)`` so its Jacobian is
+                # ``M(t+dt)/dt + jacobian(wn, t+dt)`` (reusing the assembled ``self.jacobian``). Every
+                # other nonlinear driver stays matrix-free (jacobian left None).
+                if getattr(nonlinear_solve, "wants_jacobian", False) and self.jacobian is not None:
+                    from .solver_api import _add_step_operator
+
+                    def jac_step(wn):
+                        return _add_step_operator(self.jacobian(wn, t_next, args), M_t, 1.0 / dt)
+
+                    return nonlinear_solve(G, u, jacobian=jac_step)
                 return nonlinear_solve(G, u)
             return newton_krylov(G, u)
 

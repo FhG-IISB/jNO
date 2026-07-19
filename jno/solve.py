@@ -280,9 +280,33 @@ def amg(
 
 
 def _root_driver(
-    name, *, damping, rtol, atol, max_steps, inner_tol, inner_maxit, line_search, ls_max, ls_c
+    name, *, damping, rtol, atol, max_steps, inner_tol, inner_maxit, line_search, ls_max, ls_c, direct=False
 ) -> NonlinearSolver:
-    def _fn(residual_fn, u0, *, linear_solve):
+    def _fn(residual_fn, u0, *, linear_solve=None, jacobian=None):
+        if direct:
+            # Sparse-direct Newton: factorize the ASSEMBLED tangent each step (robust on saddles / stiff
+            # drag where the matrix-free Krylov inner solve stalls). Needs the assembler-provided Jacobian.
+            if jacobian is None:
+                raise ValueError(
+                    "jno.solve.newton(direct=True) needs the ASSEMBLED Jacobian, which only the native "
+                    "nonlinear FEM assembler / transient stepper provides. Use it via "
+                    "fem.solve(nonlinear=jno.solve.newton(direct=True)) on a native nonlinear problem "
+                    "(a matrix-free residual has no assembled tangent to factorize)."
+                )
+            from .utils.solver.newton_krylov import newton_direct
+
+            return newton_direct(
+                residual_fn,
+                jacobian,
+                u0,
+                rtol=rtol,
+                atol=atol,
+                max_steps=max_steps,
+                damping=damping,
+                line_search=line_search,
+                ls_max=ls_max,
+                ls_c=ls_c,
+            )
         from .utils.solver.newton_krylov import newton_krylov
 
         return newton_krylov(
@@ -300,7 +324,7 @@ def _root_driver(
             ls_c=ls_c,
         )
 
-    return NonlinearSolver(_fn, name=name)
+    return NonlinearSolver(_fn, name=name, direct=direct)
 
 
 def newton(
@@ -314,15 +338,22 @@ def newton(
     line_search: bool = False,
     ls_max: int = 25,
     ls_c: float = 1e-4,
+    direct: bool = False,
 ) -> NonlinearSolver:
-    """Jacobian-free Newton-Krylov -- the (unchanged) nonlinear default, as a configurable slot.
+    """Newton root-find, as a configurable slot. Two inner-solve modes:
 
-    Wraps :func:`jno.utils.solver.newton_krylov.newton_krylov`: ``J @ v`` from a JVP, inner
-    matrix-free solve (default BiCGStab, or the ``linear=`` slot when given), implicit
-    differentiation via ``lax.custom_root`` so gradients reach parameters without unrolling.
-    ``damping < 1`` relaxes each update for strongly nonlinear residuals; ``line_search=True`` adds
-    residual-norm Armijo backtracking (up to ``ls_max`` halvings, sufficient-decrease constant
-    ``ls_c``) so a stiff problem converges without hand-tuning ``damping``."""
+    * **default (matrix-free)** -- ``J @ v`` from a JVP, inner matrix-free solve (default BiCGStab, or the
+      ``linear=`` slot), implicit differentiation via ``lax.custom_root``. The historic behaviour.
+    * **``direct=True`` (sparse-direct)** -- factorize the ASSEMBLED tangent each step with a sparse LU
+      instead of an iterative inner solve. Robust on **indefinite / ill-conditioned** systems -- a
+      Taylor-Hood velocity/pressure saddle, a stiff Carman-Kozeny phase-change drag -- where the
+      matrix-free BiCGStab has no saddle-point preconditioner and stalls. Still differentiable (implicit
+      diff with a *direct*, transposable tangent solve at the root). Composes only where the assembler
+      provides the tangent: ``fem.solve(nonlinear=jno.solve.newton(direct=True))`` on a native nonlinear
+      problem (steady or the transient stepper); the ``linear=``/``precond=`` slots are then unused.
+
+    ``damping < 1`` relaxes each update; ``line_search=True`` adds residual-norm Armijo backtracking (up
+    to ``ls_max`` halvings, constant ``ls_c``) so a stiff problem converges without hand-tuning."""
     return _root_driver(
         "newton",
         damping=damping,
@@ -334,6 +365,7 @@ def newton(
         line_search=line_search,
         ls_max=ls_max,
         ls_c=ls_c,
+        direct=direct,
     )
 
 
