@@ -1361,6 +1361,10 @@ def run_adaptive_transient(
             )
         for _name, _pred in list(getattr(d, "_tag_predicates", {}).items()):  # flux tags re-derive on the new facets
             d.tag(_name, _pred)
+        # Drop the cached p.pin() gauge nodes so `_lower_gauge_pin` re-creates the single-vertex pin region
+        # on the NEW mesh (its point-region does not survive a remesh) — needed for a Taylor-Hood pressure
+        # gauge under adapt=. Harmless when there is no pin.
+        d.__dict__.pop("_gauge_pin_coords", None)
         cur = jno.fem(cons, **kw)  # re-assemble the same transient problem on the refined mesh
         block = cur._op
         cur_mesh = _snapshot()

@@ -391,3 +391,40 @@ def test_transient_adaptive_vector_p2_plus_scalar_p1():
             np.linalg.norm(ysc[k] - es) / max(np.linalg.norm(es), 1e-12),
         )
     assert worst < 0.1, f"vector-P2 + scalar-P1 mixed decay mismatch: worst rel L2 = {worst:.3f}"
+
+
+@pytest.mark.slow  # a coupled Taylor-Hood saddle + per-remesh Newton solves ~ a few minutes
+def test_transient_adaptive_pressure_pin_survives_remesh():
+    """A Taylor-Hood pressure gauge ``p.pin()`` must re-derive on every remesh: its single-vertex point
+    region is cached per domain and does NOT survive a remesh, so without re-deriving it collapses to a
+    whole-domain trial-no-test term on re-assembly. A small body-forced Navier–Stokes saddle (P2 vel +
+    P1 pressure, advection -> nonlinear -> the fast per-step Newton path), no-slip, ``p.pin()``, adapt on
+    velocity: it must re-assemble across remeshes and develop a finite flow (the gauge holding)."""
+    nu = 0.1
+    d = jno.Shape.rect(0, 0, 1, 1, size=0.22).domain(time=(0.0, 0.06, 7))
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)  # P2 velocity
+    p, q = d.fem_symbols(names=("p", "q"), order=1)  # P1 pressure
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi0, yi0, _ = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+    pb, qb = p.bind(x=xi, y=yi, t=ti), q.bind(x=xi, y=yi, t=ti)
+    ux, uy, vx, vy = ui[0], ui[1], vi[0], vi[1]
+    uxx, uxy, uyx, uyy = ui.x[0], ui.y[0], ui.x[1], ui.y[1]
+    vxx, vxy, vyx, vyy = vi.x[0], vi.y[0], vi.x[1], vi.y[1]
+    force = jno.fn(lambda x, y, t: jnp.sin(PI * y), [xi, yi, ti])  # a steady body force -> a flow
+    mom = (
+        (ui.t[0] * vx + ui.t[1] * vy)
+        + ((ux * uxx + uy * uxy) * vx + (ux * uyx + uy * uyy) * vy)  # (u.grad)u -> nonlinear -> Newton path
+        + nu * (uxx * vxx + uxy * vxy + uyx * vyx + uyy * vyy)
+        - pb * (vxx + vyy)
+        - force * vx
+    )
+    cont = qb * (uxx + uyy)
+    fem = jno.fem([mom, cont, u(xb, yb) - 0.0, p.pin(), u(xi0, yi0) - 0.0])
+    assert len(fem.offsets) == 3 and not fem.is_linear  # P2 vel + P1 pressure saddle, nonlinear
+    traj = fem.solve(adapt=jno.AdaptSpec(anisotropic=True, every=2, max_dofs=4000, metric_field=0))
+    assert isinstance(traj, AdaptiveTrajectory) and fem.adapt_history  # remeshed >= once -> pin re-derived each time
+    ref = jno.Shape.rect(0, 0, 1, 1, size=0.1).domain()
+    yv = np.asarray(traj.resample(ref, field=0))
+    assert np.all(np.isfinite(yv)) and float(np.abs(yv[-1]).max()) > 1e-3  # a finite flow developed; the gauge held
