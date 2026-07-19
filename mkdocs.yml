@@ -127,6 +127,7 @@ nav:
     - FEM:
       - Poisson 2D: tutorials/08-fem-and-varpinns/poisson-2d-fem.md
       - Variational PINN (Poisson): tutorials/08-fem-and-varpinns/vpinn-poisson-2d.md
+      - Deep Ritz (Energy Method): tutorials/08-fem-and-varpinns/deep-ritz-poisson-2d.md
       - Helmholtz + PML (complex): tutorials/08-fem-and-varpinns/helmholtz-pml-2d.md
       - Linear Elasticity (Cantilever): tutorials/08-fem-and-varpinns/linear-elasticity-cantilever.md
       - Navier-Stokes Lid-Driven Cavity: tutorials/08-fem-and-varpinns/navier-stokes-cavity-2d.md
