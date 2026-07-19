@@ -682,6 +682,85 @@ trajectory`. Build your own (e.g. diffrax) from the block's `block.M` / `block.A
 
 ---
 
+## Elasto-plasticity — a trace formula, not a module
+
+Plasticity is not a module in jNO; it is a **formula** in the term list (the FEM contract). The J2 (von
+Mises) radial return contracts against the test strain to a *scalar* per Gauss point — the same trick the
+elastic form uses (`lam*trace*trace + 2*mu*inner`, never an identity), via `dev(A):B = A:B - tr(A)tr(B)/3`
+and `||dev(A)||^2 = A:A - tr(A)^2/3`. So the whole return map is six lines of `jno.np`, behind your aliases:
+
+```python
+sym, grad, trace, inner, sqrt, maximum = jno.np.sym, jno.np.grad, jno.np.trace, jno.np.inner, jno.np.sqrt, jno.np.maximum
+lam, mu = lame(E, nu); K = lam + 2*mu/3; rt = 1.5**0.5
+eps = lambda w: sym(grad(w, [x, y, z]))
+eu, ev = eps(u), eps(phi)
+tru, trv = trace(eu), trace(ev)
+ddev = sqrt(maximum(inner(eu, eu, 2) - tru*tru/3, 0) + 1e-30)   # ||dev eps(u)||, safe von-Mises norm at 0
+dg   = maximum(rt*2*mu*ddev - sy, 0) / (3*mu + H)               # plastic multiplier
+dev_ev = inner(eu, ev, 2) - tru*trv/3                          # dev eps(u) : eps(phi)
+mech = K*tru*trv + 2*mu*dev_ev - 2*mu*rt*dg*dev_ev/ddev        # = the integrand of  sigma(eps(u)) : eps(phi)
+sol  = jno.fem([mech, u(*bc) - 0.0]).solve(nonlinear=jno.solve.newton())
+```
+
+`jno.fem` sees the nonlinear form and routes to Newton; the element Jacobian is the consistent
+elastoplastic tangent for free (AD of the formula). The solve is differentiable — thread `sy` (or `H`,
+`E`) as a `jno.np.parameter` to recover it from an observed deformation (material-identification inverse
+problem). This is Hencky deformation theory (virgin every solve): exact for monotonic proportional loading.
+
+**Flow theory** (path-dependent; unloading leaves a permanent set) is the *identical* formula reading the
+previous step's per-quadrature-point state with the step-history index `.i(k)`: `ee = eps(u) - ep.i(-1)`
+and `sy -> sy + H*al.i(-1)`, with `ep, al` declared like any field via `fem_symbols`. How each state
+*advances* is a **named update term** in the same list — `state.evolves(<formula>)`, an update, not an
+equation (and not an operator: `==` is reserved for identity, `<` for comparison). The load is written as
+a function of the pseudo-time coordinate `tau`, the domain carries a `tau=` load grid, and `fem.solve()`
+**marches** the path with **nothing passed** — triggered by `.i(k)` exactly as `u.t` triggers transient:
+
+```python
+d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.1).domain(tau=(0.0, 1.0, 40))   # pseudo-time load path
+x, y, z, tau = d.variable("interior", split=True)            # τ is a coordinate, like t
+dev = lambda A: A - trace(A) / 3 * I3                         # I3 = jno.np.identity(3)
+nrm = lambda A: sqrt(maximum(inner(A, A, 2), 0) + 1e-30)      # safe Frobenius norm
+ee  = eps(u) - ep.i(-1); D = dev(ee); dd = nrm(D)             # elastic predictor about the previous state
+dg  = maximum(rt * 2 * mu * dd - (sy + H * al.i(-1)), 0) / (3 * mu + H)
+n   = D / dd
+sig = K * trace(ee) * I3 + 2 * mu * D - 2 * mu * rt * dg * n  # returned stress
+P   = peak * (1 - jno.np.abs(2 * tau - 1))                    # load ramps 0 → peak → 0 with τ
+traj = jno.fem([
+    inner(sig, eps(phi), 2) - P * inner(zhat, phi, 1),       # equilibrium              (test phi)
+    ep.evolves(ep.i(-1) + rt * dg * n),                      # plastic strain advances  (a named update)
+    al.evolves(al.i(-1) + dg),                               # hardening advances
+    u(*bc) - 0.0,                                            # clamp
+]).solve()                                                   # (n_steps, n_dofs) load-path trajectory
+```
+
+`.i(-k)` **reads** history, `.evolves` **writes** it. The build infers the keep-depth from the
+most-negative index and threads a zeroed per-quadrature-point buffer through the march's `lax.scan` carry
+(one compiled residual, reused every step; frozen-constant in the tangent → the consistent return-map
+tangent). The whole march rides `custom_root`, so it stays differentiable end-to-end: thread `sy` as a
+`jno.np.parameter` and `∂(unloaded state)/∂sy` flows through the entire load path (a material-
+identification inverse). A **primary-unknown** history (`u.i(-1)`/`u.i(-2)`, e.g. a BDF2 time scheme) is
+auto-buffered from the solved `u` — no `.evolves`; an **internal** state read at `.i(-1)` with no
+`.evolves` on a `tau=` domain is a build error (never a silently frozen buffer = deformation theory).
+
+**Scope:** small-strain, isotropic, linear-hardening; 3-D (2-D is plane strain). Kinematic / nonlinear
+hardening and contact are separate (not built).
+
+**Finite strain is also just a formula.** Tensor constants broadcast correctly (`jno.np.identity(n)` carries
+a leading batch axis), so `F = I + ∇u`, `E = ½(FᵀF − I)`, `S = λ tr(E) I + 2μ E` and the internal virtual
+work `∫ (F S):∇δu` are written directly — St. Venant-Kirchhoff in five lines, no module:
+
+```python
+grad, trace, inner, einsum, I = jno.np.grad, jno.np.trace, jno.np.inner, jno.np.einsum, jno.np.identity(3)
+H = lambda w: grad(w, [x, y, z])
+F = I + H(u);  E = 0.5*(einsum("...ki,...kj->...ij", F, F) - I);  S = lam*trace(E)*I + 2*mu*E
+mech = inner(einsum("...ij,...jk->...ik", F, S), H(phi), 2)      # ∫ (F S):∇δu
+```
+
+`jno.fem` routes the nonlinear form to Newton (exact 20%-stretch patch test; reduces to linear elasticity
+as strain → 0). Combine with the plastic return map for finite-strain plasticity — both are formulas.
+
+---
+
 ## Worked examples
 
 The [FEM tutorials](tutorials/08-fem-and-varpinns/poisson-2d-fem.md) cover every pattern above:
@@ -710,6 +789,12 @@ route** — the residual-PINN path is unaffected. Full detail is inline in the s
   term (`nu * grad(u)·grad(phi)`), not nested or buried in a nonlinear expression.
 - **Enclosure radiation is a composition, not an auto-detected term** — it is 2D / axisymmetric and
   needs a direct linear solve; you write the radiosity and couple it yourself.
+- **Plasticity is small-strain, isotropic, linear-hardening, whole-domain.** Deformation theory
+  (monotonic / proportional) and the path-dependent flow-theory **`tau=` load-path march** both run
+  today; the march assembles on the real, steady, single-field native-Lagrange path only (not
+  transient / complex / multifield / non-nodal / periodic — each rejected with a clear error). The
+  internal-state readout runs on every cell (sub-region-restricted plasticity is not wired). Kinematic /
+  nonlinear (Voce) hardening and contact are separate formulas / machinery, not built.
 
 Hitting one of these is a signal to reformulate (move the parameter, reduce the time order) rather than
 a bug — the error message names the offending term.

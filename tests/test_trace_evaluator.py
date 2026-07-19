@@ -52,7 +52,7 @@ class TestEvalCtx:
 # ======================================================================
 class TestDispatchTable:
     def test_handlers_count(self):
-        assert len(TraceEvaluator._HANDLERS) == 24  # +ModelWeights (neural FEM coefficients)
+        assert len(TraceEvaluator._HANDLERS) == 25  # +StateField (step-history state evolution)
 
     def test_handlers_are_strings(self):
         for node_type, method_name in TraceEvaluator._HANDLERS:

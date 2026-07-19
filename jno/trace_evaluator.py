@@ -12,6 +12,7 @@ from .trace import (
     BinaryOp,
     Choice,
     Constant,
+    FrozenField,
     FunctionCall,
     GroupedAssembly,
     Hessian,
@@ -295,6 +296,7 @@ class TraceEvaluator:
         (Constant, "_eval_constant"),
         (Literal, "_eval_literal"),
         (TensorTag, "_eval_tensor_tag"),
+        (FrozenField, "_eval_frozen_field"),
         (Variable, "_eval_variable"),
         (FunctionCall, "_eval_function_call"),
         (BinaryOp, "_eval_binary_op"),
@@ -834,6 +836,38 @@ class TraceEvaluator:
             raise ValueError(f"Choice index {idx} out of range for '{expr.name}'")
         return self._dispatch(expr.options[idx], ctx)
 
+    def _eval_frozen_field(self, expr, ctx):
+        """Evaluate a :class:`~jno.trace.FrozenField` (a field pinned to known nodal ``values``) at the
+        active sample points: map its per-vertex values onto the points in context for the region it was
+        bound to. Its gradient (``.x`` / ``.y``) is produced by :meth:`_eval_jacobian`'s FD-over-mesh path
+        (a nodal mesh field has no analytic coordinate-function to auto-differentiate)."""
+        values = jnp.asarray(expr.values).reshape(-1)
+        domain = getattr(expr, "_domain", None)
+        if domain is None or getattr(domain, "mesh_connectivity", None) is None:
+            raise ValueError(
+                "FrozenField.eval() needs the frozen field to carry its mesh domain — build it via "
+                "`u.bind(x=..., y=...).freeze(values)` (the coordinate bind supplies the domain)."
+            )
+        mesh_dim = int(domain.mesh_connectivity["dimension"])
+        mesh_points = jnp.asarray(domain.mesh_connectivity["points"])[:, :mesh_dim]
+
+        tag = getattr(expr, "_coord_tag", None)
+        pts = ctx.context.get(tag) if tag is not None else None
+        if pts is None:
+            have = sorted(k for k in ctx.context if not str(k).startswith("__"))
+            raise KeyError(
+                f"FrozenField.eval(): the sample points for its bound region '{tag}' are not in the eval "
+                f"context (have {have}); evaluate it on the region it was bound to."
+            )
+        pts = jnp.asarray(pts)
+        # A transient domain time-batches a tag as (B, T, N, D); a frozen field is a spatial snapshot
+        # (time-independent), so collapse every leading axis down to the (N, D) spatial points.
+        while pts.ndim > 2:
+            pts = pts[0]
+        if pts.ndim == 1:
+            pts = pts[jnp.newaxis, :]
+        return self._map_mesh_to_sampled(mesh_points, pts[:, :mesh_dim], values)
+
     def _eval_normal_derivative(self, target, normal_var, scheme, ctx):
         """``∇(target)·n`` at the eval points, where ``normal_var`` is a boundary/interface normal
         (tag ``n_<region>``). The full spatial FD gradient of ``target`` is computed over the mesh and
@@ -909,6 +943,10 @@ class TraceEvaluator:
         target = expr.target
         variables = expr.variables
         scheme = expr.scheme
+        # A FrozenField is known nodal values on a mesh — there is no analytic coordinate-function to
+        # auto-differentiate, so its spatial gradient is the FD-over-mesh gradient of those values.
+        if isinstance(target, FrozenField) and not str(scheme).startswith("finite_difference"):
+            scheme = "finite_difference"
         if isinstance(target, TestFunction):
             if ctx.active_region is None:
                 raise ValueError(
@@ -1237,6 +1275,12 @@ class TraceEvaluator:
         points = ctx.context[bound_var.tag]
         while hasattr(points, "ndim") and points.ndim > 2 and points.shape[0] == 1:
             points = jnp.squeeze(points, axis=0)
+        # The gradient of a FrozenField is a spatial functional; on a transient domain its target points
+        # are time-batched (B, T, N, D) — collapse the leading axes to the (N, D) spatial points so the
+        # mesh→points map is not entangled with the time scan (which silently collapses it to a constant).
+        if isinstance(target, FrozenField):
+            while hasattr(points, "ndim") and points.ndim > 2:
+                points = points[0]
         n_vars = len(variables)
         var_dims = [(i, vi.dim[0]) for i, vi in enumerate(variables)]
 

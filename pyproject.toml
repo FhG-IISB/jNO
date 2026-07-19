@@ -55,6 +55,13 @@ Issues = "https://github.com/FhG-IISB/jno/issues"
 # the JAX wheel for a specific CUDA version, install JAX from its own
 # index (see docs/Installation.md).
 
+# GPU algebraic multigrid (`jno.solve.amg` / `jno.precond.ams` / inner-AMG smoothers) via jaxamg
+# (NVIDIA AmgX wrapped as a JAX primitive). It is imported **lazily**, so the core installs WITHOUT it —
+# opt in with `pip install jax-neural-operators[amg]`. Kept out of the core dependencies because it
+# builds a CUDA extension against a prebuilt AmgX (2.5+, CUDA 12+, MPI), which otherwise breaks a fresh
+# install (and every downstream app that depends on jNO) on machines without that toolchain.
+amg = ["jaxamg[cuda13]>=0.1.3,<0.2"]
+
 dev = ["pytest>=7.0",
         "black>=22.0",
         "flake8>=4.0",

@@ -471,18 +471,20 @@ def antisym(x) -> FunctionCall:
 
 def identity(n: int) -> FunctionCall:
     """
-    Symbolic identity matrix helper.
-
-    This returns a traced constant-like FunctionCall so it composes naturally
-    inside symbolic expressions.
+    Symbolic identity matrix helper — an ``(n, n)`` identity carried with a **leading singleton axis**,
+    ``(1, n, n)``, so it broadcasts as a *constant tensor* over the batch axis a kernel prepends (the
+    quadrature axis in an FE weak form; the points axis in a collocation residual). A bare ``(n, n)``
+    would be mis-read by the elementwise-broadcast alignment as if its first axis were the quadrature
+    axis; the leading singleton makes ``I`` compose correctly inside any tensor formula.
 
     Example
     -------
-    I = jnn.identity(2)
-    sigma = lam * jnn.trace(eps) * I + 2.0 * mu * eps
+    I = jnn.identity(3)
+    sigma = lam * jnn.trace(eps) * I + 2.0 * mu * eps          # tensor stress in a weak form
+    F     = I + jnn.grad(u, [x, y, z])                          # deformation gradient (finite strain)
     """
     return FunctionCall(
-        lambda: jnp.eye(n),
+        lambda: jnp.eye(n)[None],  # (1, n, n): constant over the leading (quadrature / points) axis
         [],
         name="identity",
     )
