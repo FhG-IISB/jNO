@@ -1338,13 +1338,25 @@ def assemble_fem_native(
         return [int(n) for n in bnodes]
 
     def _build_dirichlet_pairs() -> List[Tuple[int, float]]:
-        from ..._fem import _eval_value_node_at
+        from ..._fem import _eval_value_node_at, _is_temporal_value_node
         from ...trace import ModelCall
 
         pairs: List[Tuple[int, float]] = []
+        tv_stash: List[Tuple[Any, Any, Any]] = []  # (dofs, value_node, coords) for time-varying g(x,t)
         for field_key, region, comp, value, value_node in dirichlet_raw:
             fidx = field_index.get(field_key)
             if fidx is None:
+                continue
+            # Time-varying Dirichlet g(x,t): no constant pair — stash (dofs, value_node, coords) so a
+            # transient caller (e.g. the second-order augmented block) writes g(x_d, t) each step.
+            if value_node is not None and _is_temporal_value_node(value_node):
+                vt = vecs[fidx]
+                pts_all = np.asarray(pts_f_all[fidx])
+                nids = list(_boundary_node_ids(fidx, region))
+                coords = jnp.asarray(pts_all[np.asarray(nids, dtype=int)]) if nids else jnp.zeros((0, dim))
+                for c in range(vt) if comp is None else [int(comp)]:
+                    dofs = jnp.asarray([offs[fidx] + nid * vt + c for nid in nids], dtype=jnp.int32)
+                    tv_stash.append((dofs, value_node, coords))
                 continue
             _vn = _bare_node(value_node) if value_node is not None else None
             # A nodal DATA-field value (a `jno.np.parameter` carrying a field with NO optimizer — e.g. a
@@ -1378,7 +1390,10 @@ def assemble_fem_native(
                     pairs.append((offs[fidx] + nid * vt + c, g))
         # Expose the (dof, value) pairs for callers that compose their own system from native blocks
         # (e.g. the second-order-in-time augmented [u, v] block applies them to the 2N system itself).
+        # The time-varying entries ride a companion stash: the caller writes g(x_d, t) (and, for a
+        # second-order block, the velocity ġ) per step.
         domain._fem_native_dirichlet_pairs = pairs
+        domain._fem_native_dirichlet_tv = tv_stash
         return pairs
 
     def _dirichlet_pairs_at(args):

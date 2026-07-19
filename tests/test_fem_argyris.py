@@ -352,18 +352,19 @@ def test_argyris_clamped_bc_frees_boundary_curvature():
 
 
 def test_argyris_dynamic_plate_conserves_energy():
-    """Argyris + **second-order-in-time** (a vibrating Kirchhoff plate): ``w_tt + Δ²w = 0``, clamped, released
-    from rest. The augmented [w, v] block integrates by the trapezoidal (Newmark average-acceleration) rule,
-    which conserves energy for the undamped system — so the discrete energy ``E = ½(vᵀM₂v + wᵀKw)`` stays
-    constant. This is the BC-robust check (a manufactured solution would expose the clamped-BC over-pinning);
-    it validates the non-nodal ``u_tt`` (dynamic plate) path, previously nodal-Lagrange only."""
+    """Argyris + **second-order-in-time** (a vibrating Kirchhoff plate): ``w_tt + Δ²w = 0``, simply
+    supported (``w=0`` on the boundary), released from rest. The augmented [w, v] block integrates by the
+    trapezoidal (Newmark average-acceleration) rule, which conserves energy for the undamped system — so
+    the discrete energy ``E = ½(vᵀM₂v + wᵀKw)`` stays constant. This is the energy invariant; the
+    companion :func:`test_argyris_dynamic_plate_frequency` checks the *frequency*. It validates the
+    non-nodal ``u_tt`` (dynamic plate) path, previously nodal-Lagrange only."""
     d = jno.domain(box(0, 0, 1, 1), mesh_size=0.24, time=(0.0, 0.03, 13))
     xi, yi, ti = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
     ci = d.variable("initial", split=True)
     u, phi = d.fem_symbols(space="Argyris")
     ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
-    w0 = (jno.np.sin(PI * ci[0]) * jno.np.sin(PI * ci[1])) ** 2  # a clamped initial deflection, at rest
+    w0 = (jno.np.sin(PI * ci[0]) * jno.np.sin(PI * ci[1])) ** 2  # a smooth boundary-vanishing deflection, at rest
     fem = jno.fem([ui.tt * vi + laplacian(ui, [xi, yi]) * laplacian(vi, [xi, yi]), u(xb, yb) - 0.0, u(ci[0], ci[1]) - w0])
     assert fem.is_transient, "a w_tt + Δ²w form must build a (second-order) transient problem"
 
@@ -402,3 +403,120 @@ def test_argyris_dynamic_plate_conserves_energy():
     drift = float(np.max(np.abs(E - E[0])) / E[0])
     assert drift < 1e-3, f"undamped plate energy must be conserved (trapezoidal): drift {drift:.3e}, E={E}"
     assert float(np.max(np.abs(v))) > 1e-6, "the plate must actually vibrate (nonzero velocity)"
+
+
+def test_argyris_dynamic_plate_frequency():
+    """The Argyris dynamic plate rings at the correct *frequency*, not merely conserving energy — the
+    gap the vector-elastodynamics finding exposed (the trapezoidal rule conserves a quadratic invariant
+    of *any* linear block, even a frequency-wrong one). With only ``w=0`` pinned the plate is
+    **simply-supported**, whose fundamental is the exact sinusoidal mode ``w=sin(πx)sin(πy)cos(ω₁t)``
+    with ``ω₁=2π²``. We check both that the assembled M₂/K eigenpair gives that frequency (to plate
+    theory) and that the trapezoidal augmented march reproduces it."""
+    import scipy.linalg as sla
+
+    T1 = 1.0 / PI  # = 2π/ω₁ with ω₁ = 2π², the simply-supported fundamental
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.2, time=(0.0, float(1.2 * T1), 48))
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    u, phi = d.fem_symbols(space="Argyris")
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    w0 = jno.np.sin(PI * ci[0]) * jno.np.sin(PI * ci[1])  # the exact simply-supported fundamental mode
+    fem = jno.fem([ui.tt * vi + laplacian(ui, [xi, yi]) * laplacian(vi, [xi, yi]), u(xb, yb) - 0.0, u(ci[0], ci[1]) - w0])
+    M, A = _dense(fem.M), _dense(fem.operator.A)
+    n = fem.offsets[1]
+    M_ww, K_ww = M[:n, :n], A[n:, :n]  # mass and biharmonic-stiffness blocks of the augmented [w, v]
+    pinned = np.where(np.all(np.abs(M[:n, :]) < 1e-13, axis=1))[0]  # Dirichlet rows carry a zeroed mass row
+    free = np.setdiff1d(np.arange(n), pinned)
+
+    # (1) the assembled operators give the exact simply-supported fundamental ω₁ = 2π²
+    Kff, Mff = K_ww[np.ix_(free, free)], M_ww[np.ix_(free, free)]
+    evals, evecs = sla.eigh(0.5 * (Kff + Kff.T), 0.5 * (Mff + Mff.T))
+    pos = np.where(evals > 1e-6)[0]
+    omega1 = float(np.sqrt(evals[pos[0]]))
+    assert abs(omega1 - 2 * PI**2) / (2 * PI**2) < 0.02, (
+        f"SS plate fundamental should be 2π²≈{2 * PI**2:.2f}, got {omega1:.3f}"
+    )
+
+    # (2) released from that eigenmode, the trapezoidal augmented march rings as cos(ω₁ t) — the modal
+    # amplitude a(t) = (wᵀ M φ₁)/(φ₁ᵀ M φ₁) tracks the analytic cosine (a wrong frequency would drift).
+    phi1 = np.zeros(n)
+    phi1[free] = evecs[:, pos[0]]
+    dt = float(fem.dt)
+    lhs, rhs = M + 0.5 * dt * A, M - 0.5 * dt * A  # (M+½dtA) y⁺ = (M−½dtA) y, trapezoidal, c=0
+    y = np.concatenate([phi1, np.zeros(n)])
+    Mphi, denom = M_ww @ phi1, float(phi1 @ M_ww @ phi1)
+    ts, amp = [0.0], [1.0]
+    for k in range(round((fem.t1 - fem.t0) / dt)):
+        y = np.linalg.solve(lhs, rhs @ y)
+        ts.append((k + 1) * dt)
+        amp.append(float(y[:n] @ Mphi) / denom)
+    ts, amp = np.asarray(ts), np.asarray(amp)
+    rel = np.linalg.norm(amp - np.cos(omega1 * ts)) / np.linalg.norm(np.cos(omega1 * ts))
+    assert rel < 0.03, f"plate modal amplitude does not ring as cos(ω₁ t): rel L2 = {rel:.4f}"
+
+
+def test_argyris_dynamic_plate_recovers_stiffness():
+    """The non-nodal (Argyris C¹) second-order path supports the **differentiable inverse**: recover a
+    bending stiffness ``c`` in ``w_tt + c·Δ²w = 0`` from the plate trajectory. The augmented [w, v]
+    block re-forms its biharmonic operator from the runtime parameter each step (a dense direct solve —
+    the h⁻⁴-conditioned biharmonic defeats matrix-free Krylov), and the gradient flows through the
+    trapezoidal march back to ``c`` (the C¹ analogue of the native u_tt inverse)."""
+    import jax.numpy as jnp
+    import optax
+
+    from jno.utils.solver.backend_blocks import _block_time_grid
+
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.28, time=(0.0, 0.3, 20))
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    u, phi = d.fem_symbols(space="Argyris")
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    w0 = jno.np.sin(PI * ci[0]) * jno.np.sin(PI * ci[1])
+    c = jno.np.parameter((1,), name="c")
+    fem = jno.fem(
+        [ui.tt * vi + c * (laplacian(ui, [xi, yi]) * laplacian(vi, [xi, yi])), u(xb, yb) - 0.0, u(ci[0], ci[1]) - w0]
+    )
+    blk = fem.operator
+    assert blk.operator_fn is not None and list(blk.runtime_parameter_exprs) == ["c"]  # re-formable parametric block
+
+    def direct(block, args, save_ts):
+        """Trapezoidal θ with a DENSE DIRECT solve, re-forming A from the runtime args each step."""
+        M = jnp.asarray(_dense(block.M))
+        A = block.operator_fn(0.0, args)
+        A = jnp.asarray(A.todense() if hasattr(A, "todense") else A)
+        th, dt = float(block.metadata.get("theta", 1.0)), float(block.dt)
+        lhs, rhs = M + th * dt * A, M - (1.0 - th) * dt * A
+        s0 = jnp.asarray(block.state0).reshape(-1)
+        _, ys = jax.lax.scan(
+            lambda y, _t: (jnp.linalg.solve(lhs, rhs @ y), jnp.linalg.solve(lhs, rhs @ y)), s0, jnp.asarray(save_ts)[1:]
+        )
+        return jnp.concatenate([s0[None], ys], axis=0)
+
+    ts = np.asarray(_block_time_grid(blk))
+    u_obs = np.asarray(direct(blk, {"c": 1.0}, ts))  # the "data": the plate trajectory at the true stiffness
+    c.dtype(jnp.float64)
+    c.initialize(jax.nn.initializers.constant(1.6))  # start away from the truth
+    c.optimizer(optax.adam(6e-2))
+    crux = jno.core([(fem.solve(direct) - u_obs).mse], domain=_DUMMY)
+    crux.solve(150)
+    rec = float(np.asarray(crux.eval([c])).reshape(-1)[0])
+    assert abs(rec - 1.0) < 0.03, f"bending stiffness not recovered through the C¹ u_tt inverse: c={rec:.4f} (truth 1.0)"
+
+
+def test_argyris_dynamic_plate_mass_parameter_rejected():
+    """A runtime parameter on the **mass** (``u_tt``) term of a non-nodal second-order form is
+    fail-loud: the mass block and its IC L²-projection are assembled once, so a runtime density would
+    silently freeze. (A parameter on the spatial biharmonic IS supported — see the recovery test.)"""
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.4, time=(0.0, 0.1, 6))
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    u, phi = d.fem_symbols(space="Argyris")
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    rho = jno.np.parameter((1,), name="rho")
+    with pytest.raises(NotImplementedError, match="mass or damping"):
+        jno.fem(
+            [rho * ui.tt * vi + laplacian(ui, [xi, yi]) * laplacian(vi, [xi, yi]), u(xb, yb) - 0.0, u(ci[0], ci[1]) - 0.0]
+        )

@@ -203,6 +203,63 @@ def test_transient_heat_decays_to_analytic():
     assert 0.0 < np.linalg.norm(w) < np.linalg.norm(np.asarray(fem.state0))
 
 
+def test_second_order_vector_elastodynamics_3d_pwave():
+    """3D vector **second-order-in-time** (u_tt): a pressure wave u=(sin(πx),0,0)cos(ω_p t) on the unit
+    cube, ω_p=π√((λ+2μ)/ρ). Clamp the x-faces and roller the transverse component to zero on the other
+    faces (a consistent set that makes it an exact mode). First 3D ``u_tt`` coverage — it verifies the
+    augmented [u,v] reduction, the vector mass/stiffness, and the vector Dirichlet path in 3D, and that
+    the wave runs at the P-wave *speed* (a wrong λ/μ/ρ factor would shift ω far off; the ~3% residual
+    here is coarse-TET4 P1 over-stiffness, not a factor error)."""
+    from jno.utils.solver.backend_blocks import _block_time_grid, _default_transient_integrate
+
+    inner, symgrad, trace = jno.np.inner, jno.np.symgrad, jno.np.trace
+    rho, lam, mu = 1.0, 1.0, 1.0
+    omega = np.pi * np.sqrt((lam + 2 * mu) / rho)  # P-wave speed c_p = √((λ+2μ)/ρ)
+    d = _cube(0.26, time=(0.0, float(1.3 * 2 * np.pi / omega), 44))
+    xi, yi, zi, ti = d.variable("interior", split=True)
+    xL, yL, zL, _ = d.variable("left", split=True)
+    xR, yR, zR, _ = d.variable("right", split=True)
+    xF, yF, zF, _ = d.variable("front", split=True)
+    xBk, yBk, zBk, _ = d.variable("back", split=True)
+    xbo, ybo, zbo, _ = d.variable("bottom", split=True)
+    xto, yto, zto, _ = d.variable("top", split=True)
+    xi0, yi0, zi0, ti0 = d.variable("initial", split=True)
+    u, phi = d.fem_symbols(value_shape=(3,))
+    ui, vi = u.bind(x=xi, y=yi, z=zi, t=ti), phi.bind(x=xi, y=yi, z=zi, t=ti)
+    ui0 = u.bind(x=xi0, y=yi0, z=zi0, t=ti0)
+    eu, ep = symgrad(u, [xi, yi, zi]), symgrad(phi, [xi, yi, zi])
+    weak = rho * inner(ui.tt, vi, n_contract=1) + lam * trace(eu) * trace(ep) + 2.0 * mu * inner(eu, ep, n_contract=2)
+    u0 = jno.fn(lambda x, y, z: jnp.stack([jnp.sin(np.pi * x), 0.0 * x, 0.0 * x], axis=-1), [xi0, yi0, zi0])
+    fem = jno.fem(
+        [
+            weak,
+            u(xL, yL, zL) - (0.0, 0.0, 0.0),
+            u(xR, yR, zR) - (0.0, 0.0, 0.0),  # clamp the x-faces
+            u(xF, yF, zF)[1] - 0.0,
+            u(xBk, yBk, zBk)[1] - 0.0,  # roller u_y=0 on the y-faces
+            u(xbo, ybo, zbo)[2] - 0.0,
+            u(xto, yto, zto)[2] - 0.0,  # roller u_z=0 on the z-faces
+            u(xi0, yi0, zi0) - u0,
+            ui0.t - (0.0, 0.0, 0.0),
+        ]
+    )
+    assert fem.is_transient and fem.is_linear
+    n = fem.offsets[1]
+    assert fem.offsets == [0, n, 2 * n]  # augmented [u; v]
+    ts = np.asarray(_block_time_grid(fem.operator))
+    fem.operator.metadata["theta"] = 0.5
+    U = np.asarray(_default_transient_integrate(fem.operator, {}, ts))[:, :n]
+    # the P-wave rings at ω_p: the whole-field modal amplitude a(t)=⟨U,U₀⟩/⟨U₀,U₀⟩ tracks cos(ω_p t)
+    U0 = U[0]
+    a = (U @ U0) / (U0 @ U0)
+    cr = np.where(np.diff(np.sign(a)) != 0)[0]
+    assert len(cr) >= 2, "the 3D wave must oscillate (>=2 sign changes)"
+    w_meas = 2 * np.pi / (2 * np.mean(np.diff(ts[cr])))
+    assert abs(w_meas - omega) / omega < 0.08, f"3D P-wave speed off: measured ω={w_meas:.3f} vs {omega:.3f}"
+    # polarization preserved: the transverse components stay small next to the peak longitudinal ~1
+    assert max(np.max(np.abs(U[:, 1::3])), np.max(np.abs(U[:, 2::3]))) < 0.12, "P-wave should stay longitudinal"
+
+
 def test_transient_nonlinear_assembles_residual_block():
     # 3D Allen-Cahn-style reaction: u_t*phi + grad.grad + (u^3 - u)*phi.
     d = _cube(0.4, time=(0.0, 0.1, 6))
