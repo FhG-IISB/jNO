@@ -4,9 +4,9 @@ A **resist** turns the optical exposure at the wafer (``sol.expose(...)``) into 
 any callable ``exposure -> developed field`` -- so it is applied with ``exposure.develop(resist)`` and new
 models plug in without touching the imaging code. This module ships the fast, differentiable design-loop
 model :class:`Threshold` and the rigorous 3-species reaction-diffusion PEB model :class:`CAResist`, which
-plug into the same ``develop`` seam. ``CAResist`` currently drives its latent acid from the aerial image;
-the exposure's :meth:`_Exposure.bulk` gives the depth-resolved standing-wave field (a :class:`Film` stack),
-so consuming it in a 3-D PEB solve is the next step.
+plug into the same ``develop`` seam. ``CAResist`` develops the 2-D aerial image by default, or -- given a
+:class:`Film` -- the depth-resolved standing-wave bulk image (:meth:`_Exposure.bulk`) as a full 3-D
+``(x, y, z)`` reaction-diffusion bake (the species diffuse through the film thickness too).
 """
 
 from dataclasses import dataclass
@@ -100,9 +100,13 @@ class CAResist:
         Acid/base diffusion lengths ``(ρ_A, ρ_B)`` (same length unit as the mask period); ``D = ρ²/(2 t_peb)``.
     dill_c, dose:
         Dill exposure-rate constant and exposure dose -- the latent acid is
-        ``A(t=0) = 1 − exp(−dill_c · dose · I)`` from the aerial intensity ``I``.
+        ``A(t=0) = 1 − exp(−dill_c · dose · I)`` from the aerial intensity ``I``. **Calibrate ``dill_c·dose``
+        to the exposure scale** so the acid *straddles* ``quencher`` across the pattern (roughly
+        ``dill_c·dose·median(I) ≈ −ln(1 − quencher)``): a seed that saturates (``A0 ≈ 1`` everywhere) or
+        starves (``A0 ≈ 0``) bakes to a **flat** developed field with no printed contrast.
     quencher:
-        Uniform initial base-quencher loading ``B(t=0)``.
+        Uniform initial base-quencher loading ``B(t=0)``. The developed pattern forms at the contour where
+        the latent acid crosses this level (excess acid deprotects and clears; below it the resist stays).
     tone:
         ``"positive"`` (default) returns the developed/soluble fraction ``1 − M``; ``"negative"`` returns ``M``.
     film:
@@ -226,7 +230,8 @@ def _peb_develop(img, period, r):
     ix = np.round(coords[:, 0] / hx).astype(int) % n
     iy = np.round(coords[:, 1] / hy).astype(int) % n
     grid = jnp.zeros((n, n)).at[ix, iy].set(m_final)  # regrid M onto one period (differentiable in M)
-    return 1.0 - grid if r.tone == "positive" else grid
+    developed = (1.0 - grid) if r.tone == "positive" else grid
+    return jnp.clip(developed, 0.0, 1.0)  # a developed fraction is physical in [0, 1]
 
 
 def _sample_bulk(vol, x, y, z, period, thickness):
@@ -253,16 +258,22 @@ def _sample_bulk(vol, x, y, z, period, thickness):
 
 
 def _regrid3d(vals, coords, n, nz, period, thickness):
-    """Regrid unstructured node values onto a regular ``(n, n, nz)`` grid by nearest-cell scatter-mean
-    (differentiable in ``vals``); empty cells take the global mean."""
-    ix = np.clip((coords[:, 0] / period[0] * n).astype(int), 0, n - 1)
-    iy = np.clip((coords[:, 1] / period[1] * n).astype(int), 0, n - 1)
-    iz = np.clip((coords[:, 2] / thickness * nz).astype(int), 0, nz - 1)
-    flat = (ix * n + iy) * nz + iz
-    tot = jnp.zeros(n * n * nz).at[flat].add(vals)
-    cnt = jnp.zeros(n * n * nz).at[flat].add(1.0)
-    grid = jnp.where(cnt > 0, tot / jnp.where(cnt > 0, cnt, 1.0), jnp.mean(vals))
-    return grid.reshape(n, n, nz)
+    """Resample unstructured node values onto a regular ``(n, n, nz)`` grid by **nearest node** -- a gather,
+    so it is differentiable in ``vals`` and never leaves a cell empty. (The earlier scatter-mean put each
+    node into one cell and filled every *other* cell with the global mean, so a grid finer than the film
+    mesh came out as sparse dots on a flat background.) The nearest-node index per cell is a fixed host
+    computation (a KD-tree -- structural, like point location); the gather ``vals[idx]`` carries the
+    gradient. The developed volume is therefore mesh-limited in detail but dense (dot-free) at any ``n``."""
+    from scipy.spatial import cKDTree
+
+    Px, Py = period
+    gx = (np.arange(n) + 0.5) / n * Px
+    gy = (np.arange(n) + 0.5) / n * Py
+    gz = (np.arange(nz) + 0.5) / nz * thickness
+    GX, GY, GZ = np.meshgrid(gx, gy, gz, indexing="ij")
+    query = np.stack([GX.ravel(), GY.ravel(), GZ.ravel()], axis=1)
+    idx = cKDTree(np.asarray(coords)).query(query)[1]  # nearest mesh node per grid cell (host, structural)
+    return jnp.asarray(vals)[jnp.asarray(idx)].reshape(n, n, nz)
 
 
 def _peb_develop_3d(vol, period, film, r):
@@ -328,4 +339,7 @@ def _peb_develop_3d(vol, period, film, r):
     m_final = traj[-1][fem.offsets[0] : fem.offsets[1]]
     coords = np.asarray(fem.field_points[0])[:, :3]
     grid = _regrid3d(m_final, coords, n, int(film.nz), period, d)
-    return 1.0 - grid if r.tone == "positive" else grid
+    developed = (1.0 - grid) if r.tone == "positive" else grid
+    # a developed fraction is physical in [0, 1]; the P1 reaction-diffusion can slightly overshoot at sharp
+    # acid gradients (non-lumped mass), so clip to the documented range.
+    return jnp.clip(developed, 0.0, 1.0)

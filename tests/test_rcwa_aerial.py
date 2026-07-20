@@ -346,21 +346,38 @@ def test_caresist_validation():
         jno.litho.CAResist(k=(0.5, 0.005, 0.005))  # needs (k1..k5)
 
 
-@needs_fmmax
+class _FakeAerial:  # a stub exposure carrying a prescribed aerial image, for the 2-D PEB (no RCWA solve)
+    def __init__(self, img, period):
+        self._img, self.period = img, period
+
+    def intensity(self):
+        return self._img
+
+
 def test_caresist_develops_exposed_band():
-    """The rigorous 3-species reaction-diffusion PEB resist plugs into the same develop() seam and prints:
-    exp.develop(CAResist) runs the coupled transient jno.fem PEB seeded by the Dill latent acid from this
-    exposure, returns a developed pattern in [0, 1], and the exposed (grating-line) band clears more than the
-    unexposed edges (positive tone: exposure -> acid -> deprotection -> soluble)."""
-    exp = jno.rcwa(_cons(_line), orders=40, grid=40).solve().expose(NA=0.6, source=0.4)
-    resist = jno.litho.CAResist(n=20, t_peb=20.0, steps=8, dill_c=4.0, diffusion_length=(0.12, 0.08))
-    dev = np.asarray(exp.develop(resist))
-    assert dev.shape == (20, 20) and np.all(np.isfinite(dev))
-    assert dev.min() >= -1e-3 and dev.max() <= 1.0 + 1e-3  # developed fraction in [0, 1]
-    prof, nn = dev.mean(1), dev.shape[0]  # x-profile (grating uniform in y)
-    mid = prof[nn // 4 : 3 * nn // 4].mean()  # the exposed line band (centre in x)
+    """The rigorous 2-D reaction-diffusion PEB develops a pattern that TRACKS the exposure: seeded (Dill acid)
+    from a bright band, the exposed band deprotects and clears while the dark edges stay -- checked by a strong
+    positive correlation between the developed field and the exposure (clears where bright), not just a coarse
+    profile. The dose is calibrated so the latent acid straddles the quencher (a saturated or starved seed
+    develops flat -- the honest operating point). This is the litho-level regression test for the periodic-tie
+    prolongation fix: the pre-fix reduced-vs-full DOF slice scrambled the developed pattern to ~zero
+    correlation (a coarse mid>edge check still passed on the scramble, which is why the bug hid here)."""
+    G = 40
+    xs = (np.arange(G) + 0.5) / G
+    band = np.where((xs > 0.35) & (xs < 0.65), 1.0, 0.05)  # bright exposed band in x, uniform in y
+    img = jnp.asarray(band[:, None] * np.ones((1, G)))
+    resist = jno.litho.CAResist(n=24, t_peb=30.0, steps=16, dill_c=1.0, dose=2.0, diffusion_length=(0.03, 0.03))
+    dev = np.asarray(resist(_FakeAerial(img, (1.2, 1.2))))
+    assert dev.shape == (24, 24) and np.all(np.isfinite(dev))
+    assert dev.min() >= 0.0 and dev.max() <= 1.0  # developed fraction clipped to the physical [0, 1]
+    idx = np.linspace(0, G - 1, 24).astype(int)  # sample the exposure onto the developed grid
+    expo = np.asarray(img)[np.ix_(idx, idx)]
+    corr = float(np.corrcoef(dev.ravel(), expo.ravel())[0, 1])
+    assert corr > 0.6, f"developed pattern must track the exposure (clears where bright), corr={corr:.2f}"
+    prof, nn = dev.mean(1), dev.shape[0]  # x-profile (band uniform in y)
+    mid = prof[nn // 4 : 3 * nn // 4].mean()  # the exposed band (centre in x)
     edge = np.concatenate([prof[: nn // 4], prof[3 * nn // 4 :]]).mean()
-    assert mid > edge + 0.02  # exposed band clears more than the unexposed edges
+    assert mid > edge + 0.2  # exposed band clears clearly more (strong, not the 0.02 the DOF scramble faked)
 
 
 @needs_fmmax
@@ -422,8 +439,10 @@ class _FakeExposure:  # a stub exposure carrying a prescribed bulk image, for te
 
 def test_caresist_3d_develops_exposed_stripe():
     """The 3-D CAResist (a jno.Shape box, periodic in x,y, species diffusing in x,y AND z) develops a printed
-    pattern: seeded from a bulk image with a bright exposed stripe in x, the exposed region clears more. A stub
-    exposure gives unambiguous contrast — fast, deterministic, no RCWA solve needed."""
+    pattern that TRACKS the exposure: seeded from a bulk image with a bright exposed stripe in x, the exposed
+    region deprotects and clears while the dark edges stay -- a strong positive correlation with the stripe
+    (the periodic-tie prolongation must be right for the developed volume to follow the seed; the pre-fix
+    reduced-vs-full DOF slice scrambled it). A stub exposure gives unambiguous contrast -- fast, no RCWA."""
     G, nz = 24, 6
     xs = (np.arange(G) + 0.5) / G
     band = np.where((xs > 0.3) & (xs < 0.7), 1.0, 0.05)  # bright exposed stripe in x, uniform in y and z
@@ -432,11 +451,15 @@ def test_caresist_3d_develops_exposed_stripe():
     resist = jno.litho.CAResist(n=16, t_peb=20.0, steps=6, dill_c=4.0, diffusion_length=(0.12, 0.08), film=film)
     dev = np.asarray(resist(_FakeExposure(bulk, (1.2, 1.2))))
     assert dev.shape == (16, 16, nz) and np.all(np.isfinite(dev))
-    assert dev.min() >= -0.05 and dev.max() <= 1.05  # small P1 overshoot at the sharp synthetic band edge
+    assert dev.min() >= 0.0 and dev.max() <= 1.0  # developed fraction clipped to the physical [0, 1]
+    n = dev.shape[0]  # the developed volume tracks the stripe (clears where bright), through the whole depth
+    bn = np.where(((np.arange(n) + 0.5) / n > 0.3) & ((np.arange(n) + 0.5) / n < 0.7), 1.0, 0.05)
+    stripe = bn[:, None, None] * np.ones((1, n, dev.shape[2]))
+    assert float(np.corrcoef(dev.ravel(), stripe.ravel())[0, 1]) > 0.6
     prof, nn = dev.mean((1, 2)), dev.shape[0]  # x-profile
     mid = prof[nn // 4 : 3 * nn // 4].mean()  # exposed stripe (centre in x)
     edge = np.concatenate([prof[: nn // 4], prof[3 * nn // 4 :]]).mean()
-    assert mid > edge + 0.02  # exposed stripe clears more than the unexposed edges
+    assert mid > edge + 0.3  # exposed stripe clears clearly more (strong, not the 0.02 the DOF scramble faked)
 
 
 @needs_fmmax
