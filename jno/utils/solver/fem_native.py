@@ -853,7 +853,13 @@ def assemble_fem_native(
         fz = dict(loc.get("frozen_fields", {}))
         for _fid, _conn in _path_conn.items():
             if _fid in pbuf:
-                fz[_fid] = jnp.asarray(pbuf[_fid]).reshape(-1)[_conn[c]].reshape(_conn.shape[1], 1)
+                _arr = jnp.asarray(pbuf[_fid])
+                # scalar field: (n_nodes,) -> per-cell (n_local, 1); vector field (prev-state mass):
+                # (n_nodes, vec) -> per-cell (n_local, vec). The kernel interpolation handles either.
+                if _arr.ndim <= 1:
+                    fz[_fid] = _arr.reshape(-1)[_conn[c]].reshape(_conn.shape[1], 1)
+                else:
+                    fz[_fid] = _arr[_conn[c]]
         loc["frozen_fields"] = fz
 
     def _split_cell_local(local_vals):
@@ -1474,7 +1480,11 @@ def assemble_fem_native(
             )
         from ..._fem import _bare, _essential_spec, _eval_value_node_at, _field_key_of
         from .backend_blocks import SemidiscreteTimeBlock
-        from .time_route import _infer_time_window, _strip_temporal_trial_derivative
+        from .time_route import (
+            _infer_time_window,
+            _replace_temporal_with_backward_euler,
+            _strip_temporal_trial_derivative,
+        )
 
         sub_signed = [
             _apply_sign(domain, sign, sub) for bare in volume_terms for sign, sub in _split_additive_terms(domain, bare)
@@ -1551,6 +1561,50 @@ def assemble_fem_native(
         d_dofs = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32) if dirichlet_pairs else None
         d_vals = jnp.asarray([p[1] for p in dirichlet_pairs], dtype=zeros.dtype) if dirichlet_pairs else None
 
+        # ---- STATE-DEPENDENT (nonlinear) MASS: ``c(u)·u_t`` with a coefficient depending on the unknown.
+        # The fixed ``M = _mass_jac(zeros)`` freezes ``c`` at ``u=0`` (silently wrong; see jno-fem-hard-limits).
+        # Reformulate each temporal term to backward-Euler *residual* form ``c(u)·(u − u_prev)·v`` — with
+        # ``u_prev`` the previous step's nodal values delivered per step on the load-path channel — so the
+        # ordinary residual/Jacobian assembly captures the exact mass action ``M(u)(u−u_prev)`` AND its exact
+        # ``∂/∂u`` (both the ``M`` block and the ``∫c′(u)(u−u_prev)·v`` coefficient coupling). The ``1/dt``
+        # factor is applied by the stepper. Backward Euler (θ=1) only; scalar fields only (load-path is scalar).
+        _nonlinear_mass = (not _parametric_mass) and any(
+            _is_obviously_nonlinear_in_unknown(domain, mt) for mt in mass_terms
+        )
+        prev_state_slices: List[Tuple[int, int, int, int]] = []  # (frozen_id, dof_start, dof_stop, n_components)
+        mass_res_bc = mass_jac_bc = None
+        if _nonlinear_mass:
+            from ...trace import PrevStateField as _PrevStateField
+
+            _prev_by_field: Dict[Any, Any] = {}
+
+            def _prev_for(trial, _cache=_prev_by_field):
+                fkey = trial.field_key
+                pf = _cache.get(fkey)
+                if pf is None:
+                    fidx = field_index[fkey]
+                    pf = _PrevStateField(trial)
+                    _cache[fkey] = pf
+                    # The prev-state field carries the source field's OWN key/basis, so it resolves the field's
+                    # own shape data (P1 or P2, scalar or vector) — no P1 aliasing (unlike a load-path field).
+                    _path_conn[pf.frozen_id] = cells_f_j[fidx]  # the field's own vertex connectivity
+                    # (frozen_id, dof-slice into the flat state, n_components) — the step delivers this slice
+                    # reshaped to (n_nodes, vec) on the load-path channel each backward-Euler step.
+                    prev_state_slices.append((int(pf.frozen_id), int(offs[fidx]), int(offs[fidx + 1]), int(vecs[fidx])))
+                return pf
+
+            temporal_be = [_replace_temporal_with_backward_euler(t, _prev_for) for t in temporal]
+            _mass_res_raw = _make_residual(temporal_be)  # ∫ c(u)·(u − u_prev)·v  (volume only; mass has no boundary)
+            _mass_jac_raw = _make_jacobian(temporal_be)
+
+            def mass_res_bc(u, t, args=None, _d=d_dofs, _f=_mass_res_raw):
+                R = jnp.asarray(_f(jnp.asarray(u), t, args)).reshape(-1)
+                return R if _d is None else R.at[_d].set(0.0)  # a constrained DOF carries no mass equation
+
+            def mass_jac_bc(u, t, args=None, _d=d_dofs, _f=_mass_jac_raw):
+                J = _f(jnp.asarray(u), t, args)
+                return J if _d is None else bcoo_zero_rows(J, _d)
+
         # Parametric mass ``mass_fn(t, args)`` (unknown density net(x)*u_t): re-assemble M from args each
         # step with the Dirichlet rows/cols zeroed (a constrained DOF carries no time derivative). ``None``
         # keeps the static ``M_bc`` for a non-parametric mass.
@@ -1558,7 +1612,9 @@ def assemble_fem_native(
             Mt = _mass_jac(zeros, t, args)
             return Mt if _d is None else bcoo_zero_rows_cols(Mt, _d)
 
-        nonlinear = any(_is_obviously_nonlinear_in_unknown(domain, t) for t in spatial)
+        # A mass-only nonlinearity (state-dependent mass) also requires the nonlinear step path, even when
+        # every spatial term is linear — the mass action lives in the residual there (``mass_residual``).
+        nonlinear = _nonlinear_mass or any(_is_obviously_nonlinear_in_unknown(domain, t) for t in spatial)
         if nonlinear:
             # Row-replacement Dirichlet (constant g), threaded through the runtime time t AND the
             # runtime args so a time-dependent / parametric spatial coefficient is re-evaluated each step.
@@ -1573,10 +1629,16 @@ def assemble_fem_native(
             M_bc = M if d_dofs is None else bcoo_zero_rows_cols(M, d_dofs)
             return (
                 SemidiscreteTimeBlock(
-                    mass=_mass_cb if _parametric_mass else (lambda t, args=None, _M=M_bc: _M),
+                    # A state-dependent mass carries no fixed matrix; the mass action is in mass_residual.
+                    mass=None
+                    if _nonlinear_mass
+                    else (_mass_cb if _parametric_mass else (lambda t, args=None, _M=M_bc: _M)),
+                    mass_residual=mass_res_bc,
+                    mass_residual_jac=mass_jac_bc,
                     residual=res_bc,
                     jacobian=jac_bc,
                     runtime_parameter_exprs=dict(_param_and_neural_exprs),
+                    metadata={"prev_state_slices": prev_state_slices} if _nonlinear_mass else {},
                     **common,
                 ),
                 "transient",

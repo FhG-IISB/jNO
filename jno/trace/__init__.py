@@ -3526,6 +3526,34 @@ class LoadPathField(FrozenField):
         return f"LoadPathField(source_key={self.field_key}, steps={self.n_steps}, nnode={self.values.shape[0]})"
 
 
+class PrevStateField(FrozenField):
+    """The PREVIOUS transient-step nodal values of a field, delivered each backward-Euler step through
+    the load-path channel (``args["__loadpath__"]``) by the transient stepper — which already carries the
+    prior solution.
+
+    Assembler-synthesized (never user-constructed) when a transient mass term's coefficient depends on the
+    unknown, i.e. a **state-dependent mass** ``c(u)·u_t·v``. Such a term is reformulated to
+    ``c(u)·(u − u_prev)·v`` with ``u_prev`` this field; the ordinary ``_make_residual`` / ``_make_jacobian``
+    then assemble the exact backward-Euler mass action ``M(u)(u−u_prev)`` and its exact ``∂/∂u`` (both the
+    ``M`` block and the ``∫c′(u)(u−u_prev)·v`` coefficient-coupling block) — the ``1/dt`` factor is applied
+    by the stepper. Because it is a :class:`FrozenField` it stays invisible to unknown-detection, so the
+    reformulated term's nonlinearity in the true unknown ``u`` is detected correctly. Scalar or vector
+    Lagrange fields (it carries the source field's own key/basis, so a vector velocity ``ρ(φ)·u_vec_t``
+    resolves the field's own P1/P2 vector basis — the load-path gather delivers its ``(n_nodes, vec)`` slice).
+    """
+
+    def __init__(self, source):
+        import jax.numpy as _jnp
+
+        # values are a placeholder: the real per-step nodal slice is delivered on args["__loadpath__"]
+        # (this field is registered in the assembler's load-path connectivity, not the compile-time gather).
+        super().__init__(source, _jnp.zeros(1))
+        self.name = f"prev[{getattr(source, 'name', 'u')}]"
+
+    def __repr__(self):
+        return f"PrevStateField(source_key={self.field_key})"
+
+
 def load_path_fields_in(expr):
     """The distinct :class:`LoadPathField` nodes in ``expr`` (by identity, first-seen order)."""
     return [f for f in frozen_fields_in(expr) if isinstance(f, LoadPathField)]
