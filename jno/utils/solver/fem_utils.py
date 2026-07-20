@@ -13,6 +13,7 @@ Responsibilities:
 """
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import jax
 import jax.experimental.sparse as jsparse
 import jax.numpy as jnp
 import numpy as np
@@ -1192,6 +1193,39 @@ def _eval_integrand(domain, node, local):
                 if isinstance(field, TestFunction):
                     return g  # per-DOF directional derivative of the component
                 return jnp.einsum("qn...,n->q...", g, cell_sol)  # contract the trial DOFs
+
+        if isinstance(node.target, ModelCall):
+            # Gradient of a KNOWN (frozen) network coefficient: evaluate the network's spatial
+            # gradient CONTINUOUSLY at the quad points (autodiff of the module w.r.t. its coordinate
+            # inputs) — unlike a FrozenField, which is only a P1 nodal projection and carries no
+            # sub-grid content. With no live trial in the term it is constant in the unknown, so it
+            # lands in the RHS (b = -residual(0)), giving a(u_h, v) = L(v) - a(u_NN, v): the
+            # finite-element correction to a network prior (FE-basis enrichment, Barucq et al. 2025).
+            from .parametric_helpers import _neural_coefficient_name
+
+            neural_modules = local.get("neural_coefficients")
+            module = None if neural_modules is None else neural_modules.get(_neural_coefficient_name(node.target))
+            if module is None:
+                raise NotImplementedError(
+                    "jno.fem: the gradient of a network coefficient needs the neural-coefficient assembly "
+                    "path — a known/frozen net (net.freeze()) used alongside a real trial in the weak form."
+                )
+            args = node.target.args
+            if not all(isinstance(a, Variable) for a in args):
+                raise NotImplementedError(
+                    "jno.fem: ∂net/∂x is supported for a network of coordinate variables only, e.g. jnn.grad(net(x, y), x)."
+                )
+            arg_dims = [a.dim[0] for a in args]
+            pts = local["physical_quad_points"]  # (n_quad, gdim)
+
+            def _net_scalar(pt):  # scalar network value at one physical point, differentiable in pt
+                out = module(*[pt[d].reshape(1, 1) for d in arg_dims])
+                out = out.output if hasattr(out, "output") else out
+                return jnp.reshape(jnp.asarray(out), (-1,))[0]
+
+            full_grad = jax.vmap(jax.grad(_net_scalar))(pts)  # (n_quad, gdim): ∂net/∂x_l at each quad point
+            comps = [full_grad[:, dim0 : dim0 + 1] for dim0 in dims]  # each (n_quad, 1)
+            return comps[0] if len(comps) == 1 else jnp.concatenate(comps, axis=-1)
 
         raise NotImplementedError("The FEM assembler supports gradients of TrialFunction/TestFunction only.")
 

@@ -337,6 +337,160 @@ def test_enclosure_handle_square_cavity_inward():
         bad.check()
 
 
+def _axisym_vf(e0, e1, nrm, dom, tags, *, n_phi=96, n_quad=3, refine, r_min_fac):
+    """Axisymmetric element view factor, with/without the near-field refinement, at a chosen r_min."""
+    from jno.domain.enclosure import _refine_near_pairs, _solid_polygon_visibility_3d
+
+    mids = 0.5 * (e0 + e1)
+    length = np.linalg.norm(e1 - e0, axis=1)
+    phi = np.linspace(0.0, 2 * np.pi, n_phi, endpoint=False)
+    vm = _solid_polygon_visibility_3d(dom, tags, mids, length, phi)
+    F = np.asarray(
+        MeshUtils.get_view_factor_axisymmetric_element(
+            jnp.asarray(e0),
+            jnp.asarray(e1),
+            jnp.asarray(nrm),
+            jnp.asarray(vm),
+            n_quad=n_quad,
+            n_phi=n_phi,
+            r_min=r_min_fac * float(np.median(length)),
+        )
+    )
+    if refine:
+        F = _refine_near_pairs(F, e0, e1, nrm, dom, tags, n_phi)
+    return F
+
+
+def test_axisymmetric_occlusion_catches_a_wall_far_thinner_than_the_mesh():
+    """A closed cavity with a 0.5 mm baffle across it, meshed with 5 mm elements: the occluder is TEN
+    TIMES thinner than an element, and 400x thinner than the chords crossing the cavity.
+
+    This is the case a fixed-stride chord test cannot do at any affordable density -- sample every
+    ``L/n`` and you step clean over any wall thinner than that, and the ray passes THROUGH a solid. That
+    is occlusion which silently does not happen, so it INFLATES the view factors: on the cg furnace a
+    16-sample test wrongly called 12% of all visible pairs visible. It is equally fatal to scale the
+    blocking tolerance to the element size (as the legacy straight-line test does): a wall thinner than
+    the tolerance can then never register as a block no matter how finely it is sampled.
+
+    Occlusion is instead sphere-traced against a signed-distance field, which advances by the distance to
+    the nearest solid and therefore CANNOT skip a feature, whatever its size (Hart 1996).
+
+    The cavity is closed, so this is checkable without a reference: rows must sum to 1. If the baffle
+    leaks, the elements it should shadow see straight past it and their rows blow past 1.
+    """
+    from types import SimpleNamespace
+
+    from shapely.geometry import box
+
+    R, H, zb, Rb, thick = 0.10, 0.20, 0.10, 0.06, 0.0005  # baffle 0.5 mm thick; elements ~5 mm
+    NR, NZ, NB = 20, 40, 12
+    segs, nrms = [], []
+
+    def add(p0, p1, n, k):
+        t = (np.arange(k + 1) / k)[:, None]
+        P = np.asarray(p0)[None, :] * (1 - t) + np.asarray(p1)[None, :] * t
+        segs.append((P[:-1], P[1:]))
+        nrms.append(np.tile(n, (k, 1)))
+
+    add((1e-6, 0), (R, 0), (0, 1), NR)  # bottom disc, faces up
+    add((R, 0), (R, H), (-1, 0), NZ)  # wall, faces in
+    add((1e-6, H), (R, H), (0, -1), NR)  # top disc, faces down
+    add((1e-6, zb + thick), (Rb, zb + thick), (0, 1), NB)  # baffle top face
+    add((1e-6, zb), (Rb, zb), (0, -1), NB)  # baffle bottom face
+    e0 = np.vstack([a for a, _ in segs])
+    e1 = np.vstack([b for _, b in segs])
+    nrm = np.vstack(nrms)
+    m = e0.shape[0]
+    dom = SimpleNamespace(_source_regions={"baffle": box(0.0, zb, Rb, zb + thick)})
+    tags = np.array(["baffle"] * m)
+
+    assert thick < 0.15 * float(np.median(np.linalg.norm(e1 - e0, axis=1))), "premise: baffle << element"
+
+    F = _axisym_vf(e0, e1, nrm, dom, tags, refine=True, r_min_fac=0.0)
+    rs = F.sum(axis=1)
+    assert rs.max() < 1.02, f"rays are leaking through the thin baffle: max row sum {rs.max():.4f}"
+    assert rs.min() > 0.98, f"closed cavity: row sums must not fall below 1, got min {rs.min():.4f}"
+
+
+def test_axisymmetric_near_field_closed_cavity_rows_sum_to_one():
+    """A CLOSED cylindrical cavity: every row of F must sum to exactly 1 (no radiation can escape).
+
+    This is the corner test. Where the wall meets each end disk, two surfaces are separated by a distance
+    ``d`` far smaller than their radius ``r``, and the ring kernel's azimuthal integrand becomes a peak at
+    ``phi = 0`` of width ``phi_c ~ d/r``. A uniform ``n_phi`` rule with ``2*pi/n_phi >> phi_c`` samples the
+    peak's crest and multiplies it by a step far wider than the peak, overshooting by ``~dphi/phi_c`` —
+    driving row sums to ~1.8 here, and to ~6.7 on a real furnace mesh with sub-mm wedges. The ``r_min``
+    floor only masks it (by inflating ``d`` until ``d/r ~ dphi``), at the cost of biasing every OTHER pair
+    low — which is why both must be fixed together, not separately.
+
+    Locks: the graded azimuthal rule restores closure with r_min = 0 and NO enforce_closure, and still
+    reproduces the analytic coaxial-disk factor (Modest, Ch. 4 / App. D).
+    """
+    from types import SimpleNamespace
+
+    R, H, NR, NZ = 0.10, 0.10, 24, 24
+    rr, zz = np.linspace(1e-6, R, NR + 1), np.linspace(0.0, H, NZ + 1)
+    e0 = np.vstack([np.c_[rr[:-1], np.zeros(NR)], np.c_[np.full(NZ, R), zz[:-1]], np.c_[rr[:-1], np.full(NR, H)]])
+    e1 = np.vstack([np.c_[rr[1:], np.zeros(NR)], np.c_[np.full(NZ, R), zz[1:]], np.c_[rr[1:], np.full(NR, H)]])
+    nrm = np.vstack([np.tile([0.0, 1.0], (NR, 1)), np.tile([-1.0, 0.0], (NZ, 1)), np.tile([0.0, -1.0], (NR, 1))])
+    m = e0.shape[0]
+    dom = SimpleNamespace(_source_regions={})  # closed cavity: nothing occludes
+    tags = np.array(["cav"] * m)
+
+    # WITHOUT the refinement (and no r_min to hide it), the corners overshoot badly.
+    F_raw = _axisym_vf(e0, e1, nrm, dom, tags, refine=False, r_min_fac=0.0)
+    assert F_raw.sum(axis=1).max() > 1.5, (
+        "expected the un-refined corner overshoot (guard against a silent regression of this test's premise)"
+    )
+
+    # WITH it: closure, from the raw kernel, with no r_min and no enforce_closure.
+    F = _axisym_vf(e0, e1, nrm, dom, tags, refine=True, r_min_fac=0.0)
+    rs = F.sum(axis=1)
+    assert rs.max() < 1.02, f"closed cavity: row sums must not exceed 1, got max {rs.max():.4f}"
+    assert rs.min() > 0.98, f"closed cavity: row sums must not fall below 1, got min {rs.min():.4f}"
+
+    # ...and the analytic coaxial parallel-disk factor still comes out right.
+    mids = 0.5 * (e0 + e1)
+    A = 2 * np.pi * mids[:, 0] * np.linalg.norm(e1 - e0, axis=1)
+    bot, top = np.arange(NR), np.arange(NR + NZ, m)
+    f_bt = float((A[bot, None] * F[np.ix_(bot, top)]).sum() / A[bot].sum())
+    Rr = R / H
+    S = 1 + (1 + Rr**2) / Rr**2
+    ana = 0.5 * (S - np.sqrt(S**2 - 4))
+    assert abs(f_bt - ana) < 5e-3, f"bottom->top disk factor {f_bt:.4f} vs analytic {ana:.4f}"
+
+
+def test_axisymmetric_occlusion_is_per_azimuth_concentric_cylinders():
+    """The outer cylinder's concave self-view ``F22 = 1 - r1/r2`` is carried ENTIRELY by occlusion.
+
+    Two outer-wall elements both sit at ``r = r2``, so the straight line between them in the (r,z) meridian
+    never enters the inner solid — an occlusion test that checks only that line concludes "always visible"
+    and F22 comes out ~2x too big, with row sums ABOVE 1 (unphysical). The true 3-D chord between them bows
+    inward to ``r2 cos(phi/2)`` and does cut the inner cylinder once ``phi > 2 arccos(r1/r2)``.
+    """
+    from types import SimpleNamespace
+
+    from shapely.geometry import box
+
+    r1, r2, H, NZ = 0.20, 0.35, 6.0, 60  # tall -> the infinite-cylinder limit
+    z = np.linspace(0.0, H, NZ + 1)
+    e0 = np.vstack([np.c_[np.full(NZ, r1), z[:-1]], np.c_[np.full(NZ, r2), z[:-1]]])
+    e1 = np.vstack([np.c_[np.full(NZ, r1), z[1:]], np.c_[np.full(NZ, r2), z[1:]]])
+    nrm = np.vstack([np.tile([1.0, 0.0], (NZ, 1)), np.tile([-1.0, 0.0], (NZ, 1))])
+    dom = SimpleNamespace(_source_regions={"inner": box(0.0, 0.0, r1, H)})
+    tags = np.array(["inner"] * (2 * NZ))
+
+    F = _axisym_vf(e0, e1, nrm, dom, tags, refine=True, r_min_fac=0.0)
+    mid_i, mid_o = NZ // 2, NZ + NZ // 2
+    inner, outer = slice(0, NZ), slice(NZ, 2 * NZ)
+    f12, f21, f22 = F[mid_i, outer].sum(), F[mid_o, inner].sum(), F[mid_o, outer].sum()
+
+    assert abs(f12 - 1.0) < 2e-2, f"F12 should be 1, got {f12:.3f}"
+    assert abs(f21 - r1 / r2) < 2e-2, f"F21 should be r1/r2={r1 / r2:.3f}, got {f21:.3f}"
+    assert abs(f22 - (1 - r1 / r2)) < 2e-2, f"concave self-view F22 should be {1 - r1 / r2:.3f}, got {f22:.3f}"
+    assert abs(f21 + f22 - 1.0) < 2e-2, f"row must close to 1 with no enforce_closure, got {f21 + f22:.3f}"
+
+
 def test_enclosure_axisymmetric_r_min_keeps_view_factors_physical():
     """The axisymmetric ring kernel has a ``1/R^2`` near-field singularity: near-coincident / on-axis
     ring pairs blow up to F > 1 unless a near-field floor ``r_min`` is applied. ``d.enclosure`` defaults

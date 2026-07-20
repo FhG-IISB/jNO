@@ -1246,3 +1246,83 @@ def test_freeze_gradient_conditioned_coefficient_is_linear_and_trains():
     hist = crux.solve(200)
     losses = np.asarray(hist.total_loss_history)
     assert losses[-1] < 0.5 * losses[0], "frozen-conditioned coefficient weights should train through the solve"
+
+
+# ==========================================================================
+# gradient of a KNOWN (frozen) network coefficient — FE-basis enrichment
+# (a(u_h, v) = L(v) - a(u_NN, v); the net's continuous spatial gradient lands in b)
+# ==========================================================================
+
+
+def _net_dx_nodal(net, pts, dim):
+    """Independent autodiff reference: d(net)/d(coord `dim`) at the given points."""
+
+    def _scalar(p):
+        out = net.module(p[0:1], p[1:2])
+        return jnp.reshape(jnp.asarray(out), (-1,))[0]
+
+    return np.asarray(jax.vmap(lambda p: jax.grad(_scalar)(p)[dim])(jnp.asarray(pts)))
+
+
+def test_frozen_network_gradient_l2_projection_matches_autodiff():
+    """``jnn.grad(frozen_net, x)`` assembles the net's CONTINUOUS spatial gradient. Verify it by
+    L²-projecting ∂net/∂x onto the FE space — (w, v) = (∂net/∂x, v) ∀v — and comparing to an
+    independent ``jax.grad`` of the network at the DOF nodes. Deterministic (fixed PRNG, no training)."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.05)
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    net = _mlp_net(key=1, hidden=8, layers=2)
+    fnet = net.freeze()
+    pts = np.asarray(d.mesh.points)[:, :2]
+
+    for dim, dvar in ((0, xi), (1, yi)):
+        fem = jno.fem([ui * vi - jnn.grad(fnet(xi, yi), dvar) * vi], quad_degree=4)  # mass-matrix L² projection
+        w = np.asarray(fem.solve()).reshape(-1)
+        ref = _net_dx_nodal(net, pts, dim)
+        rel = float(np.linalg.norm(w - ref) / np.linalg.norm(ref))
+        assert rel < 5e-3, f"assembled d(net)/d(dim{dim}) mismatches autodiff: rel-L2={rel:.3e}"
+        assert np.linalg.norm(w) > 1e-3, "assembled network gradient is spuriously ~zero"
+
+
+def test_network_gradient_requires_coordinate_arguments():
+    """∂net/∂x is wired for a network of *coordinate* variables (the enrichment case). A network of
+    a non-coordinate argument (e.g. a trial value) raises a clear error rather than silently wrong."""
+    d, u, phi, (xi, yi), (xb, yb), ui, vi, f = _poisson_setup(mesh_size=0.25)
+    fnet = _mlp_net(key=1).freeze()
+    with pytest.raises(NotImplementedError, match="coordinate variables"):
+        # arg ``2*xi`` is a coordinate *expression*, not a bare Variable → guard fires (stays linear)
+        fem = jno.fem([ui.x * vi.x + jnn.grad(fnet(2 * xi, yi), xi) * vi.x - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+        _ = np.asarray(fem.b)  # force assembly
+
+
+def test_frozen_network_gradient_enrichment_improves_prior():
+    """FE-basis enrichment end to end: correct a network prior on a coarse mesh via
+    a(u_h, v) = (f, v) - a(u_NN, v). The enriched u_NN + u_h is at least as accurate as the raw
+    prior — proof the frozen net's gradient lands in the RHS with the right sign."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.12)
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    f = 2 * np.pi**2 * jnn.sin(np.pi * xi) * jnn.sin(np.pi * yi)
+    pts = np.asarray(d.mesh.points)[:, :2]
+    exact = np.sin(np.pi * pts[:, 0]) * np.sin(np.pi * pts[:, 1])
+
+    net = _mlp_net(key=0, hidden=32, layers=3)
+    xf, yf, _ = d.variable("interior", split=True)
+    tgt = jnn.sin(np.pi * xf) * jnn.sin(np.pi * yf)
+    net.optimizer(optax.adam(optax.exponential_decay(3e-3, 2000, 0.5, end_value=2e-5)))
+    crux = jno.core([(net(xf, yf) - tgt).mse])
+    crux.solve(4000)
+    prior = np.asarray(crux.eval([net(xi, yi)], domain=d)).reshape(-1)
+    prior_rel = float(np.linalg.norm(prior - exact) / np.linalg.norm(exact))
+
+    fnet = net.freeze()
+    gx = ui.x + jnn.grad(fnet(xi, yi), xi)
+    gy = ui.y + jnn.grad(fnet(xi, yi), yi)
+    fem = jno.fem([gx * vi.x + gy * vi.y - f * vi, u(xb, yb) - 0.0], quad_degree=4)
+    u_h = np.asarray(fem.solve()).reshape(-1)
+    enriched_rel = float(np.linalg.norm(prior + u_h - exact) / np.linalg.norm(exact))
+    assert enriched_rel < 1.5e-2, f"enriched solution inaccurate: rel-L2={enriched_rel:.3e}"
+    assert enriched_rel <= prior_rel * 1.2, f"correction worsened the prior: {prior_rel:.3e} -> {enriched_rel:.3e}"

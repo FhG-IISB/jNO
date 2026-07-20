@@ -17,12 +17,74 @@ For operations that don't have a dedicated method (``.mse``, ``.mean``,
 
 from __future__ import annotations
 
+from functools import partial
 from typing import TYPE_CHECKING, Optional
 
+import jax
 import jax.numpy as jnp
 
 from ..jnp_ops import concat
 from . import FunctionCall, Placeholder
+
+# ---------------------------------------------------------------------------
+# Stable spectral matrix functions (logm / expm / Aⁿ) on symmetric matrices.
+# ---------------------------------------------------------------------------
+# f(A) = V diag(f(λ)) Vᵀ. Its differential is the Daleckiĭ–Kreĭn / Löwner form
+# with divided differences L_ij = (f(λ_i)−f(λ_j))/(λ_i−λ_j), which stay finite at
+# λ_i = λ_j (the limit is f'(λ_i)) — exactly where ``jnp.linalg.eigh``'s own
+# gradient blows up (a bare 1/(λ_i−λ_j)). A ``custom_jvp`` in this form makes
+# matrix log/exp/pow differentiable through *repeated* eigenvalues — equal
+# principal stretches in finite-strain plasticity, or any isotropic state —
+# batched over a leading quadrature axis.
+#
+# Reference: N. J. Higham, *Functions of Matrices: Theory and Computation*,
+# SIAM (2008), Theorem 3.11 (Daleckiĭ–Kreĭn); the Fréchet derivative of a
+# symmetric matrix function is the Hadamard product of the Löwner matrix with
+# the eigenbasis-rotated perturbation.
+_SPECTRAL_DEGENERATE_TOL = 1e-7
+
+
+def _spectral_scalar(w, kind: str, n: float):
+    if kind == "log":
+        return jnp.log(w)
+    if kind == "exp":
+        return jnp.exp(w)
+    return w**n  # pow
+
+
+def _spectral_dscalar(w, kind: str, n: float):
+    if kind == "log":
+        return 1.0 / w
+    if kind == "exp":
+        return jnp.exp(w)
+    return n * w ** (n - 1.0)  # pow
+
+
+@partial(jax.custom_jvp, nondiff_argnums=(1, 2))
+def _spectral_matrix_function(a, kind: str, n: float):
+    """``f(A) = V diag(f(λ)) Vᵀ`` for a symmetric ``A`` (batched on a leading axis)."""
+    w, vecs = jnp.linalg.eigh(a)
+    return (vecs * _spectral_scalar(w, kind, n)[..., None, :]) @ jnp.swapaxes(vecs, -2, -1)
+
+
+@_spectral_matrix_function.defjvp
+def _spectral_matrix_function_jvp(kind, n, primals, tangents):
+    (a,), (da,) = primals, tangents
+    w, vecs = jnp.linalg.eigh(a)
+    fw, dfw = _spectral_scalar(w, kind, n), _spectral_dscalar(w, kind, n)
+    vt = jnp.swapaxes(vecs, -2, -1)
+    out = (vecs * fw[..., None, :]) @ vt
+    # Löwner matrix: off-diagonal divided difference; diagonal (and near-degenerate) -> f'(λ)
+    dw = w[..., :, None] - w[..., None, :]
+    close = jnp.abs(dw) < _SPECTRAL_DEGENERATE_TOL
+    loewner = jnp.where(
+        close,
+        0.5 * (dfw[..., :, None] + dfw[..., None, :]),
+        (fw[..., :, None] - fw[..., None, :]) / jnp.where(close, 1.0, dw),
+    )
+    das = 0.5 * (da + jnp.swapaxes(da, -2, -1))  # symmetric part (A is symmetric)
+    dout = vecs @ (loewner * (vt @ das @ vecs)) @ vt
+    return out, dout
 
 
 def _is_periodic_tie_combination(expr_a, expr_b) -> bool:
@@ -1159,31 +1221,21 @@ class MatrixView(_DelegatesToPlaceholder):
         return MatrixView(FunctionCall(lambda x: x.swapaxes(-2, -1), [self._expr], "transpose"))
 
     def log(self) -> "MatrixView":
-        """Matrix logarithm via eigendecomposition (symmetric / SPD matrices only)."""
-
-        def _logm(x):
-            vals, vecs = jnp.linalg.eigh(x)
-            return (vecs * jnp.log(vals)[..., jnp.newaxis, :]) @ vecs.swapaxes(-2, -1)
-
-        return MatrixView(FunctionCall(_logm, [self._expr], "mat_log"))
+        """Matrix logarithm ``logm(A)`` via eigendecomposition (symmetric / SPD), with a gradient that
+        stays finite at repeated eigenvalues (Daleckiĭ–Kreĭn form) → MatrixView."""
+        return MatrixView(FunctionCall(lambda x: _spectral_matrix_function(x, "log", 0.0), [self._expr], "mat_log"))
 
     def exp(self) -> "MatrixView":
-        """Matrix exponential via eigendecomposition (symmetric matrices only)."""
-
-        def _expm(x):
-            vals, vecs = jnp.linalg.eigh(x)
-            return (vecs * jnp.exp(vals)[..., jnp.newaxis, :]) @ vecs.swapaxes(-2, -1)
-
-        return MatrixView(FunctionCall(_expm, [self._expr], "mat_exp"))
+        """Matrix exponential ``expm(A)`` via eigendecomposition (symmetric), stable at repeated
+        eigenvalues → MatrixView."""
+        return MatrixView(FunctionCall(lambda x: _spectral_matrix_function(x, "exp", 0.0), [self._expr], "mat_exp"))
 
     def pow(self, n: float) -> "MatrixView":
-        """Matrix power ``Aⁿ`` via eigendecomposition (symmetric matrices only)."""
-
-        def _powm(x, _n=n):
-            vals, vecs = jnp.linalg.eigh(x)
-            return (vecs * (vals**_n)[..., jnp.newaxis, :]) @ vecs.swapaxes(-2, -1)
-
-        return MatrixView(FunctionCall(_powm, [self._expr], f"mat_pow_{n}"))
+        """Matrix power ``Aⁿ`` via eigendecomposition (symmetric), stable at repeated eigenvalues (so
+        ``pow(0.5)`` is a differentiable ``sqrtm``) → MatrixView."""
+        return MatrixView(
+            FunctionCall(lambda x, _n=float(n): _spectral_matrix_function(x, "pow", _n), [self._expr], f"mat_pow_{n}")
+        )
 
     # ------------------------------------------------------------------
     # Packed-format constructors and converters

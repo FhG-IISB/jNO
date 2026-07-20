@@ -50,6 +50,52 @@ def _eval(expr, domain):
 # ---------------------------------------------------------------------------
 
 
+class TestGaussQuadratureIntegrals:
+    """``expr.integrate(quadrature=...)`` — element Gauss quadrature vs the default nodal rule.
+
+    Discriminator: ``∫_Ω x²y² dA = 1/9`` over the unit square. Gauss (degree ≥ 4) is *exact* for
+    this quartic; the P1 nodal (vertex) rule is only O(h²). A constant integrand recovers the area
+    with either rule, but the higher polynomial separates them.
+    """
+
+    @pytest.fixture(scope="class")
+    def dom(self):
+        return jno.Shape.rect(0, 0, 1, 1, size=0.1).domain()
+
+    def test_gauss_constant_recovers_area(self, dom):
+        x, y, _ = dom.variable("interior", split=True)
+        area = float(_eval((x * 0.0 + 1.0).integrate(quadrature="gauss"), dom))
+        assert abs(area - 1.0) < 1e-9, f"Gauss ∫1 dA = {area:.6e}, expected 1.0"
+
+    def test_gauss_exact_for_polynomial(self, dom):
+        x, y, _ = dom.variable("interior", split=True)
+        expr = (x**2) * (y**2)  # ∫_[0,1]² x²y² dA = 1/9
+        gauss = float(_eval(expr.integrate(quadrature=4), dom))
+        assert abs(gauss - 1.0 / 9.0) < 1e-9, f"Gauss ∫x²y² dA = {gauss:.6e}, expected {1 / 9:.6e}"
+
+    def test_gauss_beats_nodal_on_polynomial(self, dom):
+        x, y, _ = dom.variable("interior", split=True)
+        expr = (x**2) * (y**2)
+        nodal = float(_eval(expr.integrate(), dom))
+        gauss = float(_eval(expr.integrate(quadrature="gauss"), dom))
+        exact = 1.0 / 9.0
+        assert abs(gauss - exact) < abs(nodal - exact) / 100.0, (
+            f"Gauss ({gauss:.6e}) should be far more accurate than nodal ({nodal:.6e}) vs {exact:.6e}"
+        )
+
+    def test_gauss_string_matches_default_degree(self, dom):
+        x, y, _ = dom.variable("interior", split=True)
+        expr = (x**2) * (y**2)
+        assert float(_eval(expr.integrate(quadrature="gauss"), dom)) == pytest.approx(
+            float(_eval(expr.integrate(quadrature=4), dom))
+        )
+
+    def test_gauss_on_boundary_raises(self, dom):
+        x_b, y_b, _ = dom.variable("boundary", split=True)
+        with pytest.raises(NotImplementedError, match="volume-only"):
+            _eval((x_b * 0.0 + 1.0).integrate(quadrature="gauss"), dom)
+
+
 class TestJitCompatibleIntegrals:
     """Boundary and volume integrals evaluated under jax.jit.
 

@@ -89,6 +89,46 @@ def test_nonlinear_transient_slots_match_default():
     assert np.abs(sol - ref).max() < 1e-8
 
 
+def test_nonlinear_transient_direct_newton_matches_default():
+    """A sparse-DIRECT Newton drives each implicit step of the nonlinear transient march: the step
+    tangent ``M/dt + J(u)`` is assembled and factorized (sparse LU) rather than solved matrix-free.
+    It must survive the ``lax.scan`` time-march and match the matrix-free default trajectory --
+    proving ``jno.solve.newton(direct=True)`` composes through the transient stepper."""
+    fem = _heat(nonlinear=True)
+    ref = np.asarray(fem.solve().fn())
+    sol = np.asarray(fem.solve(nonlinear=jno.solve.newton(direct=True)).fn())
+    assert np.abs(sol - ref).max() < 1e-8
+
+
+def test_nonlinear_transient_direct_newton_inverse():
+    """Reverse-mode adjoint through the nonlinear transient inverse with the DIRECT Newton: each
+    per-step ``custom_root`` uses a direct, transposable tangent solve (``sparse_lu_solve`` on ``J``
+    and ``Jᵀ``), and those chain through the time-march ``lax.scan`` to recover the parameter."""
+    import optax
+
+    alpha = jno.np.parameter((1,), key=jax.random.PRNGKey(2), name="alpha_dt")
+    alpha.initialize(jax.nn.initializers.constant(2.0))
+    alpha.dtype(jnp.float64)
+    alpha.optimizer(optax.adam(5e-2))
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.25, time=(0.0, 0.2, 11))
+    u, v = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+    ic = jno.np.sin(PI * ci[0]) * jno.np.sin(PI * ci[1])
+    fem = jno.fem([ui.t * vi + ui.x * vi.x + ui.y * vi.y + alpha * ui**3 * vi, u(xb, yb) - 0.0, u(ci[0], ci[1]) - ic])
+    u_obs = jnp.asarray(_heat(nonlinear=True, mesh_size=0.25, time=(0.0, 0.2, 11)).solve().fn())  # alpha_true = 1
+
+    node = fem.solve(nonlinear=jno.solve.newton(direct=True))
+    dummy = jno.domain.from_array({"_": np.zeros((1, 1))})
+    crux = jno.core([(node - u_obs).mse], domain=dummy)
+    crux.solve(120)
+    a = float(np.asarray(crux.eval([alpha])).reshape(-1)[0])
+    assert abs(a - 1.0) < 0.05, f"alpha not recovered through the transient DIRECT Newton adjoint: {a}"
+
+
 def test_nonlinear_transient_inverse_through_slots():
     """Reverse-mode adjoint through a NONLINEAR transient inverse with a *slot* inner solver.
 

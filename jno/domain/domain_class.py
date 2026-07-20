@@ -2597,6 +2597,7 @@ class domain(MeshIOMixin):
         occlude=True,
         inward=False,
         r_min=None,
+        near_field=True,
     ):
         """Build an :class:`~jno.domain.enclosure.Enclosure` from radiating boundary ``tags``.
 
@@ -2641,6 +2642,7 @@ class domain(MeshIOMixin):
             occlude=occlude,
             inward=inward,
             r_min=r_min,
+            near_field=near_field,
         )
 
     def compute_enclosure_view_factor(self, tags, opaque_tags=None):
