@@ -116,32 +116,23 @@ E_REF = float(
     )
 )
 
-# --- (1) h-adaptivity: the built-in adaptive driver, the whole loop in ONE call ---------------------------
+# (1) h-adaptivity — ADD elements: one call runs the whole solve→estimate→mark→remesh loop and returns the
+#     solution on the final adapted mesh (`d_h`/`fem_h` now refer to it).
 d_h, fem_h = build(0.12)
 n0 = len(d_h.mesh.points)
-E0 = float(
-    dirichlet_energy(
-        jnp.asarray(np.asarray(d_h.mesh.points)[:, :2]), _solve(fem_h), jnp.asarray(d_h.mesh.cells_dict["triangle"])
-    )
-)
-# ---- the h-adaptivity API: `fem.solve(adapt=...)` runs solve -> ZZ-estimate -> Dörfler-mark -> remesh
-#      internally and returns the solution on the final adapted mesh (`d_h`/`fem_h` now refer to it). ----
+pts0, tris0 = np.asarray(d_h.mesh.points)[:, :2], np.asarray(d_h.mesh.cells_dict["triangle"])
+E0 = float(dirichlet_energy(jnp.asarray(pts0), _solve(fem_h), jnp.asarray(tris0)))
 sol_h = np.asarray(fem_h.solve(adapt=AdaptSpec(theta=0.6, max_iters=4, refine_factor=1.7))).reshape(-1)
 pts_h, tris_h = np.asarray(d_h.mesh.points)[:, :2], np.asarray(d_h.mesh.cells_dict["triangle"])
 E_h = float(dirichlet_energy(jnp.asarray(pts_h), jnp.asarray(sol_h), jnp.asarray(tris_h)))
 n_h = len(sol_h)
 
-# --- (2) r-adaptivity: the built-in relocation driver, ONE call -------------------------------------------
-# `build(movable=True)` tags the interior vertices with `.trainable()` (see build()), so the r-adaptivity API
-# is the SAME slot as h-adaptivity: `fem.solve(adapt=AdaptSpec(relocate=True))`. Internally it descends the
-# FE energy *through the differentiable solve* (∂E/∂X, exact) with a **backtracking mesh-validity line search**
-# — so the fixed node set concentrates at the corner and the mesh never tangles (validity lives in the step
-# control, which a stock optimiser / barrier can't guarantee on a stiff problem). It returns the solution on
-# the relocated mesh; `d_r`/`fem_r` now refer to it. Raises if no coordinate was `.trainable()`-tagged.
+# (2) r-adaptivity — RELOCATE a fixed node set: the SAME `adapt=` slot with `relocate=True`. The interior
+#     vertices were tagged `.trainable()` in build(); the driver moves them (no new DOFs) and returns the solve.
 d_r, fem_r = build(0.12, movable=True)
-sol_r = np.asarray(fem_r.solve(adapt=AdaptSpec(relocate=True, max_iters=60, lr=3e-3, quality_floor=0.1))).reshape(-1)
-pts_r = np.asarray(d_r.mesh.points)[:, :2]
-tris_r = np.asarray(d_r.mesh.cells_dict["triangle"])
+pts_r0 = np.asarray(d_r.mesh.points)[:, :2].copy()  # coarse start, for the animation
+sol_r = np.asarray(fem_r.solve(adapt=AdaptSpec(relocate=True, max_iters=60, lr=3e-3))).reshape(-1)
+pts_r, tris_r = np.asarray(d_r.mesh.points)[:, :2], np.asarray(d_r.mesh.cells_dict["triangle"])
 E_r = float(dirichlet_energy(jnp.asarray(pts_r), jnp.asarray(sol_r), jnp.asarray(tris_r)))
 
 print(f"energy-norm error  (E - E_ref),  E_ref = {E_REF:.4f}")
@@ -207,3 +198,40 @@ for s in ("top", "right"):
 fig.tight_layout(w_pad=2.2)
 fig.savefig(Path(__file__).parents[2] / "assets" / "adaptive_l_shape.png")
 print("saved figure -> assets/adaptive_l_shape.png")
+
+# --- animation: the two mechanisms refining, side by side (a GIF) -----------------------------------------
+# Both drivers record the mesh at each step in `fem.adapt_history`; h-adaptivity jumps at each discrete
+# remesh, r-adaptivity flows continuously — the animation shows that difference faithfully.
+import matplotlib.animation as animation  # noqa: E402
+
+h_seq = [(h["points"], h["cells"]) for h in fem_h.adapt_history] + [(pts_h, tris_h)]  # connectivity grows
+r_seq = [pts_r0] + [h["points"] for h in fem_r.adapt_history]  # fixed connectivity (tris_r), points move
+N_FRAMES = 40
+figA, (axL, axR) = plt.subplots(1, 2, figsize=(8.6, 4.5))
+
+
+def _frame(i):
+    frac = i / (N_FRAMES - 1)  # advance both sequences by the same fraction of their own progress
+    hp, hc = h_seq[round(frac * (len(h_seq) - 1))]
+    rp = r_seq[round(frac * (len(r_seq) - 1))]
+    for a in (axL, axR):
+        a.clear()
+        a.plot([0.5], [0.5], "x", color=TEAL, ms=8, mew=2.0)  # the reentrant corner
+        a.set_aspect("equal")
+        a.set_axis_off()
+        a.set_xlim(-0.03, 1.03)
+        a.set_ylim(-0.03, 1.03)
+    axL.triplot(Triangulation(hp[:, 0], hp[:, 1], hc), color=INK, lw=0.4, alpha=0.75)
+    axL.set_title(f"h-adaptivity — add elements  ·  {len(hp)} dofs")
+    axR.triplot(Triangulation(rp[:, 0], rp[:, 1], tris_r), color=TEAL, lw=0.5, alpha=0.85)
+    axR.set_title(f"r-adaptivity — relocate  ·  {len(rp)} dofs (fixed)")
+    return []
+
+
+figA.tight_layout(w_pad=1.5)
+gif_path = Path(__file__).parents[2] / "assets" / "adaptive_l_shape.gif"
+animation.FuncAnimation(figA, _frame, frames=N_FRAMES, interval=100).save(
+    gif_path, writer=animation.PillowWriter(fps=10), dpi=100
+)
+plt.close(figA)
+print("saved animation -> assets/adaptive_l_shape.gif")
