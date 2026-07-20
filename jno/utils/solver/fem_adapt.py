@@ -1153,8 +1153,6 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
 
     import jno
 
-    from ..._fem import _infer_vec
-
     dom = fem.domain
     coord_specs = list(getattr(dom, "_trainable_coords", None) or [])
     if not coord_specs:
@@ -1164,13 +1162,13 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
             "(per component) BEFORE `jno.fem(...)` -- otherwise there is nothing to relocate."
         )
     mode = getattr(fem, "_mode", "linear")
-    if mode in ("complex", "complex_transient"):
-        raise NotImplementedError(
-            f"AdaptSpec(relocate=True) does not support complex problems yet (got mode={mode!r}); the "
-            "Dirichlet-energy objective is real-only. Relocate the real-equivalent form."
-        )
     if mode not in ("linear", "nonlinear", "transient"):
-        raise NotImplementedError(f"AdaptSpec(relocate=True): unsupported problem mode {mode!r}.")
+        # A complex *linear* form is mode "linear" (a real 2N block system) and relocates fine — the energy
+        # sums its real + imaginary blocks. Only a complex *transient* march is not wired yet.
+        raise NotImplementedError(
+            f"AdaptSpec(relocate=True): unsupported problem mode {mode!r} (complex-transient relocation is "
+            "a planned extension)."
+        )
 
     dim = int(dom.dimension)
     cells, _ = _mesh_cells(dom)
@@ -1178,7 +1176,6 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
     pts0 = np.asarray(dom.mesh.points)[:, :dim].copy()
     pts0_j = jnp.asarray(pts0)
     n_verts = pts0.shape[0]
-    vec0 = _infer_vec(fem._constraints) if getattr(fem, "_constraints", None) else 1
     names = [sp["name"] for sp in coord_specs]
 
     def _scatter(vals):
@@ -1186,6 +1183,20 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
         for sp in coord_specs:
             p = p.at[jnp.asarray(sp["ids"]), sp["axis"]].set(vals[sp["name"]])
         return p
+
+    def _block_energy(u, pts):
+        """Total Dirichlet energy summed over EVERY solution block (per-field offsets) — so a scalar, a
+        vector (per component), a **complex** field (its real + imaginary blocks) and a coupled multifield
+        all contribute. A higher-order block (P2) falls back to its vertex DOFs."""
+        bounds = list(fem.offsets) if fem.offsets is not None else [0, int(u.shape[0])]
+        e = 0.0
+        for i in range(len(bounds) - 1):
+            blk = u[bounds[i] : bounds[i + 1]]
+            nb = int(blk.shape[0])
+            veci = nb // n_verts if (n_verts and nb % n_verts == 0) else 1
+            bf = blk.reshape(n_verts, veci) if veci > 1 else blk[:n_verts]
+            e = e + _dirichlet_energy_jax(pts, bf, cells_j, dim)
+        return e
 
     _march = _transient_march_fn(fem.operator) if mode == "transient" else None
 
@@ -1205,10 +1216,7 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
         return _march(vals)  # transient: time-averaged nodal state over the marched trajectory
 
     def _energy(vals):
-        u = _solve_at(vals)
-        uf = u[: n_verts * vec0]
-        uf = uf.reshape(n_verts, vec0) if vec0 > 1 else uf
-        return _dirichlet_energy_jax(_scatter(vals), uf, cells_j, dim)
+        return _block_energy(_solve_at(vals), _scatter(vals))
 
     val_grad = jax.jit(jax.value_and_grad(lambda arrs: _energy(dict(zip(names, arrs)))))
 

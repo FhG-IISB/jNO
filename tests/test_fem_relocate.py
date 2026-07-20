@@ -2,8 +2,9 @@
 
 Relocates the mesh vertices tagged with :meth:`Variable.trainable` down the FE-energy gradient (through the
 differentiable solve) with a backtracking mesh-validity line search — the built-in companion of h-refinement
-(``run_adaptive_relocate``). Checks: it reduces the objective at **fixed DOF** without tangling (scalar +
-vector), demands at least one ``.trainable()`` coordinate, and fails loud on the not-yet-supported modes.
+(``run_adaptive_relocate``). Checks that it reduces the objective at **fixed DOF** without tangling across
+**scalar, vector, nonlinear, transient, periodic, and complex** problems, and demands at least one
+``.trainable()`` coordinate.
 """
 
 import jax
@@ -151,3 +152,29 @@ def test_relocate_periodic():
     cells = np.asarray(fem.domain.mesh.cells_dict["triangle"])
     assert fem.adapt_history[-1]["energy"] <= fem.adapt_history[0]["energy"]
     assert _min_detj(np.asarray(fem.domain.mesh.points)[:, :2], cells) > 0.0
+
+
+def test_relocate_complex():
+    """A *complex* problem relocates: complex is two real blocks (real + imag), and the energy sums both."""
+    from shapely.geometry import box
+
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.16)
+    u, w = d.fem_symbols(complex=True)
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    _mov(d)
+    ub, wb = u.bind(x=xi, y=yi), w.bind(x=xi, y=yi)
+    c = 1.0 + 0.5j
+    f = jno.complex(
+        10.0 * J.exp(-40.0 * ((xi - 0.6) ** 2 + (yi - 0.35) ** 2)),
+        8.0 * J.exp(-40.0 * ((xi - 0.35) ** 2 + (yi - 0.6) ** 2)),
+    )
+    weak = (ub.x * wb.x + ub.y * wb.y) - c * (ub * wb) - f * wb
+    fem = jno.fem([weak.real, u.real(xb, yb) - 0.0, u.imag(xb, yb) - 0.0])
+    assert fem._mode == "linear" and len(fem.offsets) == 3  # a real 2N block system (real + imag)
+    sol = np.asarray(fem.solve(adapt=AdaptSpec(relocate=True, max_iters=20, lr=2e-3))).reshape(-1)
+    cells = np.asarray(fem.domain.mesh.cells_dict["triangle"])
+    n0 = len(fem.domain.mesh.points)
+    assert fem.adapt_history[-1]["energy"] <= fem.adapt_history[0]["energy"]
+    assert _min_detj(np.asarray(fem.domain.mesh.points)[:, :2], cells) > 0.0
+    assert sol.shape[0] == 2 * n0, "complex solution = real + imaginary blocks"

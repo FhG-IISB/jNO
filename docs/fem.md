@@ -351,8 +351,9 @@ u = fem.solve(adapt=jno.AdaptSpec(relocate=True, max_iters=60))
 (the validity constraint lives in the step control; a stock optimiser or an energy barrier alone cannot
 guarantee it on a stiff problem — see `run_adaptive_relocate`). It mutates the domain to the relocated mesh,
 returns the solution there, and **raises** if no coordinate was tagged. Works across **linear, nonlinear
-(Newton), transient (relocates for the whole trajectory via a time-averaged objective), and periodic**
-problems, scalar or vector; only **complex** fails loud (the energy objective is real-only).
+(Newton), transient (relocates for the whole trajectory via a time-averaged objective), periodic, and
+complex** problems, scalar or vector — the energy sums over every solution block, so a complex field's real
+and imaginary parts both contribute. Only complex-*transient* is not wired yet.
 
 ---
 
