@@ -2835,12 +2835,14 @@ def fem(
         # non-nodal push-forward assembler. The basis is real, so ``Re(c·T) = Re(c)·T``: wrapping each
         # term in ``.real``/``.imag`` gives two ordinary real systems A_r/A_i, and FEM.solve() forms
         # ``[[A_r,-A_i],[A_i,A_r]]`` (``mode="complex"`` → _solve_complex_block), recombining to a complex
-        # ``u`` — needed for time-harmonic Maxwell (complex ε, the ``i k₀`` impedance BC). Without this the
-        # plain real assembler would SILENTLY cast the imaginary part away, so the unwired compositions
-        # (transient/parametric/nonlinear) raise rather than mislead. ----
+        # ``u`` — needed for time-harmonic Maxwell (complex ε, the ``i k₀`` impedance BC). A runtime
+        # parameter is allowed (the complex *inverse*): each ``.real``/``.imag`` leg carries the parameter,
+        # so ``assemble_fem_nonnodal`` returns parametric ``FemLinearSystem`` legs and ``_solve_complex_block``
+        # builds a differentiable trace node — exactly like the nodal complex inverse. Without this split the
+        # plain real assembler would SILENTLY cast the imaginary part away, so the compositions that are still
+        # unwired (transient / nonlinear / neural-coefficient) raise rather than mislead. ----
         _nn_bares = volume_terms + [e for exprs in boundary_terms.values() for e in exprs]
         if _bares_have_complex_coeff(_nn_bares):
-            from .utils.solver.parametric_helpers import _contains_runtime_parameter as _crp_nn
             from .utils.solver.weak_form import _contains_temporal_derivative as _ctd_nn
             from .utils.solver.weak_form import _is_obviously_nonlinear_in_unknown as _nlin_nn
 
@@ -2850,10 +2852,10 @@ def fem(
                     "the steady linear complex form is. (The real assembler would silently drop the imaginary "
                     "part, so this raises instead.)"
                 )
-            if has_neural_coeff or any(_crp_nn(b) for b in _nn_bares):
+            if has_neural_coeff:
                 raise NotImplementedError(
-                    "jno.fem: a complex non-nodal *parametric/inverse* form (runtime parameter or neural "
-                    "coefficient) is not wired — the steady linear forward complex form is. (Raises rather than "
+                    "jno.fem: a *neural-coefficient* complex non-nodal (RT/Nédélec/Argyris) form is not wired "
+                    "yet — the runtime-parameter complex non-nodal inverse IS (below). (Raises rather than "
                     "silently dropping the imaginary part.)"
                 )
             if any(_nlin_nn(domain, b) for b in _nn_bares):

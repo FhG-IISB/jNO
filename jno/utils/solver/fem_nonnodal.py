@@ -583,7 +583,9 @@ def assemble_fem_nonnodal(
         nat_load = nat_load + _assemble_n1e_surface_load(
             total, incident_terms, domain, spaces, top, np.asarray(pts), offs, quad_degree, dim
         )
-    # the tangential-trace surface mass added to A (steady linear only; unwired compositions raise below)
+    # the tangential-trace surface mass added to A (steady linear, incl. parametric/inverse; the surface mass
+    # and incident load are assembled once — a boundary-term parameter is already rejected above, so both stay
+    # constant and fold into A(args)/b(args). Transient/nonlinear compositions still raise below.)
     surf_mass = (
         _assemble_n1e_surface_mass(total, surface_terms, domain, spaces, top, np.asarray(pts), offs, quad_degree, dim)
         if surface_terms
@@ -592,11 +594,11 @@ def assemble_fem_nonnodal(
     if surf_mass is not None or incident_terms:
         _nonlinear = any(_is_obviously_nonlinear_in_unknown(domain, t) for t in volume_terms)
         _transient = bool(ic_residuals) or any(_contains_temporal_derivative(t) for t in volume_terms)
-        if _transient or _nonlinear or runtime_parameter_tags or neural_param_names:
+        if _transient or _nonlinear:
             raise NotImplementedError(
                 "jno.fem (non-nodal): the N1E tangential-trace surface terms (impedance / absorbing / incident BC) "
-                "are wired for the steady linear forward problem only — not with a transient, nonlinear, or "
-                "parametric/inverse form. (Raises rather than silently dropping the surface contribution.)"
+                "are wired for the steady linear (incl. parametric/inverse) problem only — not with a transient or "
+                "nonlinear form. (Raises rather than silently dropping the surface contribution.)"
             )
     pins = (
         _flux_bc_pins(flux_bcs, domain, field_index, spaces, top, np.asarray(pts), offs, n_cells, quad_degree, dim=dim)
@@ -928,6 +930,8 @@ def assemble_fem_nonnodal(
 
         def _assemble_at(args):
             A = jax.jacfwd(lambda u: full_residual(u, args))(zeros)
+            if surf_mass is not None:  # constant tangential-trace surface mass (impedance/absorbing BC) → into A(args)
+                A = A + surf_mass
             b = -full_residual(zeros, args)
             if pins:
                 A, b = _apply_dirichlet_symmetric(jnp.asarray(A), jnp.asarray(b), pins)
