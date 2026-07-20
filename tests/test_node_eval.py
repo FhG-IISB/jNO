@@ -92,3 +92,16 @@ def test_eval_domain_override_rejected_on_solve_node():
     other = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.2).domain(time=(0.0, 0.2, 3))
     with pytest.raises(ValueError, match="owns the mesh"):
         fem.solve().eval(domain=other)
+
+
+def test_parameter_preserves_declared_1d_shape():
+    """A 1-D ``jno.np.parameter((N,))`` evaluates to ``(N,)``, not a spurious ``(N, 1)``.
+
+    The ``(N, 1)`` channel axis is a *pointwise-network* output convention; it must not leak onto a bare
+    parameter (it broke building a geometry functional from coordinate parameters for crux-driven
+    r-adaptivity -- ``S @ cx`` then carried a phantom trailing dim)."""
+    dom = jno.domain.from_array({"_": np.zeros((1, 1))})
+    for shape in [(5,), (54,), (3, 2), (1,)]:
+        p = jno.np.parameter(shape, name=f"p_{'x'.join(map(str, shape))}")
+        got = np.asarray(jno.core([p], domain=dom).eval(p)).shape
+        assert got == shape, f"parameter({shape}) evaluated to {got}, expected {shape}"
