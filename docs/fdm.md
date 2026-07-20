@@ -183,7 +183,7 @@ array eagerly, as in every section above.
 ## 3-D tetrahedral meshes
 
 Everything above dispatches on `domain.dimension`: give `jno.fdm` a **3-D tetrahedral** domain and the
-same constraint list solves in 3-D. Build the mesh with [`jno.Shape`](shape.md) — a box, sphere,
+same constraint list solves in 3-D. Build the mesh with [`jno.Shape`](Domain-and-Geometry.md) — a box, sphere,
 cylinder, or any boolean combination — and add the third coordinate:
 
 ```python
@@ -222,7 +222,7 @@ Dirichlet and flux (Neumann / Robin / coordinate-coefficient, affine in `∂u/�
 in 2-D and 3-D; transient problems by the method of lines (`M = I`, unit-coefficient `u.t`); linear
 and nonlinear residuals; differentiable inverse problems. A geometric sub-region for a subdomain /
 domain-decomposition solve (`jno.dd.couple([(problem, region)])`) resolves to a mesh-node subset via
-the analytic, shapely-free [`Shape.contains`](shape.md) — in 2-D **and** 3-D.
+the analytic, shapely-free [`Shape.contains`](Domain-and-Geometry.md) — in 2-D **and** 3-D.
 
 **Planned:** transient flux boundary conditions (a flux node keeps `M = 1`, unlike a pinned Dirichlet
 node); periodic boundaries; a general `u.t` mass coefficient; a structured-grid stencil backend; 1-D
