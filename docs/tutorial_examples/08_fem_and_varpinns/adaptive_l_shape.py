@@ -109,15 +109,22 @@ def _min_detj(pts, cells):
 
 
 def relocate(fem, d, e_ref, n_steps=60, lr=3e-3):
-    """Descend the FE-energy gradient to relocate the trainable interior vertices.
+    """Descend the FE-energy gradient to relocate the trainable interior vertices (differentiable r-adaptivity).
 
-    The built-in part is one line — ``jax.value_and_grad(energy)`` — which is exact only because
-    ``.trainable()`` made ``fem.solve()`` differentiable in the mesh (``fem.operator.evaluate`` is
-    differentiable in the coordinate parameters). The rest is a plain compact optimiser: a per-node
-    RMS-normalised step (the near-corner gradients are huge, so unnormalised descent would stall the rest)
-    with a backtracking safeguard so the mesh never tangles. A relocation companion to
-    ``fem.solve(adapt=...)`` — it concentrates a *fixed* node set instead of adding new ones. (Because the
-    gradient is exact, a learned monitor network can be trained through it via ``jno.core`` — the ML path.)"""
+    The built-in, general part is one line — ``jax.value_and_grad(energy)`` — exact only because
+    ``.trainable()`` made ``fem.solve()`` differentiable in the mesh. The rest is a compact optimiser with
+    the one ingredient a plain optimiser (``jno.core`` / adam) lacks here: **mesh-validity control**. Each
+    step takes a per-node RMS-normalised descent direction, then a *backtracking line search* halves the
+    step until no element is inverted — so the mesh never tangles.
+
+    NOTE — why backtracking and not just ``jno.core([energy + λ·barrier]).solve()``: on a *stiff* problem
+    like this reentrant corner the near-corner gradients are enormous, so a fixed-step optimiser (adam/sgd)
+    overshoots ``detJ = 0`` before a ``detJ`` log-barrier can react — the mesh inverts and the loss goes
+    ``nan``. A barrier needs a line search to be safe, and crux's optimisers do none; backtracking *checks*
+    validity every step, so it is robust. (A barrier alone is fine for milder relocation / co-design, where
+    the validity constraint is not binding — and ``.trainable()`` + the exact gradient is what lets a learned
+    monitor be trained through this via ``jno.core``, the ML path.) Fails loud if the mesh cannot stay valid.
+    """
     cells = np.asarray(d.mesh.cells_dict["triangle"])
     cj = jnp.asarray(cells)
     pts0 = np.asarray(d.mesh.points)[:, :2].copy()
@@ -156,7 +163,16 @@ def relocate(fem, d, e_ref, n_steps=60, lr=3e-3):
             break  # no admissible step -> at the mesh-quality limit
         xy = cand
         hist.append(float(e) - e_ref)
-    return moved(xy), np.array(hist)
+    # fail-loud tangle guard: never hand back an inverted mesh (a silent tangle would give nan solves later)
+    result = moved(xy)
+    if _min_detj(result, cells) <= 0.0:
+        raise RuntimeError(
+            "relocate: the mesh tangled — an element inverted (min detJ <= 0). Lower `lr`, raise the quality "
+            "floor, or take fewer steps; the coordinate gradient is exact but the optimiser must stay valid."
+        )
+    if len(hist) == 1:
+        raise RuntimeError("relocate: could not take a single valid step from the start mesh (lr too large?).")
+    return result, np.array(hist)
 
 
 # --- reference energy (fine mesh) and a common coarse starting mesh ---------------------------------------
