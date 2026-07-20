@@ -337,6 +337,22 @@ the boundary-facet normals** all become differentiable in the node positions. Sc
 *relocation*, not remeshing (h-remeshing stays the non-differentiable outer AFEM loop); it is differentiable
 on valid meshes, with element inversion (tangling) the boundary of that regime.
 
+**r-adaptivity in one call.** Tagging coordinates `.trainable()` and driving the relocation yourself is the
+low-level path; the packaged form reuses the **same `adapt=` slot** as h-refinement:
+
+```python
+xm, ym, _ = domain.variable("core", where=interior, split=True)
+xm.trainable(); ym.trainable()                              # BEFORE jno.fem(...)
+u = fem.solve(adapt=jno.AdaptSpec(relocate=True, max_iters=60))
+```
+
+`AdaptSpec(relocate=True)` descends the FE energy through the differentiable solve with a **backtracking
+`det J` line search** — so the fixed node set concentrates at solution features and the mesh never tangles
+(the validity constraint lives in the step control; a stock optimiser or an energy barrier alone cannot
+guarantee it on a stiff problem — see `run_adaptive_relocate`). It mutates the domain to the relocated mesh,
+returns the solution there, and **raises** if no coordinate was tagged. Scope today: steady scalar/vector;
+nonlinear / transient / complex relocation fail loud (planned extensions).
+
 ---
 
 ## Per-region (sub-domain) integration

@@ -952,6 +952,19 @@ class AdaptSpec:
     hmax: float | None = None
     every: int = 5
     metric_field: int = 0
+    # --- r-adaptivity (mesh relocation) --------------------------------------------------------------
+    relocate: bool = False
+    """Switch ``FEM.solve(adapt=...)`` from h-refinement (add elements) to **r-adaptivity**: relocate the
+    mesh vertices tagged with :meth:`Variable.trainable` down the FE-energy gradient — *through the
+    differentiable solve* — at fixed connectivity and no new DOFs. Requires at least one coordinate tagged
+    ``domain.variable(region)[i].trainable()`` before ``jno.fem`` (else it raises). See
+    :func:`run_adaptive_relocate`. ``max_iters`` sets the number of relocation steps; ``lr`` the step size."""
+    quality_floor: float = 0.1
+    """Relocation only: a step is backtracked (halved) until no element's ``|det J|`` falls below this
+    fraction of the initial worst element — the mesh-validity line search that keeps the relocation from
+    tangling (a stock optimiser / a barrier alone cannot guarantee this on stiff problems)."""
+    lr: float = 3e-3
+    """Relocation only: base step size for the RMS-normalised energy-gradient descent."""
 
 
 # Consecutive rounds that must satisfy ``eps`` before the loop stops on convergence.
@@ -1072,6 +1085,137 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
     fem.__dict__.update(cur.__dict__)
     fem.adapt_history = history
     return u
+
+
+def _dirichlet_energy_jax(pts, u_nodal, cells, dim):
+    """``Σ_cells |∇u|² · vol`` for a P1 field — differentiable in the vertices ``pts`` and the nodal values
+    ``u_nodal`` (shape ``(n_verts,)`` or ``(n_verts, n_comp)``). Field-agnostic (scalar / vector / a
+    primary field), 2-D triangle and 3-D tet: the relocation objective (concentrate nodes where the
+    solution's gradient is large). ``pts`` are the *moved* vertices, so this is the shape derivative's
+    integrand -- differentiating it w.r.t. the coordinate parameters is the r-adaptivity gradient."""
+    import jax.numpy as jnp
+
+    v = pts[cells]  # (n_cell, dim+1, dim)
+    u_nodal = u_nodal[:, None] if u_nodal.ndim == 1 else u_nodal
+    s = u_nodal[cells]  # (n_cell, dim+1, n_comp)
+    e = jnp.stack([v[:, i + 1] - v[:, 0] for i in range(dim)], axis=1)  # (n_cell, dim, dim): rows = edge vectors
+    du = jnp.stack([s[:, i + 1] - s[:, 0] for i in range(dim)], axis=1)  # (n_cell, dim, n_comp): du along each edge
+    grad = jnp.linalg.solve(e, du)  # (n_cell, dim, n_comp): ∇u, since du = E·∇u with E the edge matrix
+    vol = jnp.abs(jnp.linalg.det(e)) / (2.0 if dim == 2 else 6.0)
+    return jnp.sum(jnp.sum(grad**2, axis=(1, 2)) * vol)
+
+
+def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwargs: Any) -> np.ndarray:
+    """Drive ``FEM.solve(adapt=AdaptSpec(relocate=True, ...))`` -- **r-adaptivity** (mesh relocation).
+
+    Relocate the mesh vertices tagged with :meth:`Variable.trainable` down the FE Dirichlet-energy gradient
+    -- evaluated *through the differentiable solve* (``∂(solve)/∂X``) -- at **fixed connectivity** and no new
+    DOFs, with a **backtracking line search on ``det J``** so the mesh never tangles (a stock optimiser or a
+    barrier alone cannot guarantee validity on stiff problems -- the constraint must live in the step control).
+    Concentrates a *fixed* node set at solution features; the relocation companion of the h-refinement
+    :func:`run_adaptive_solve`.
+
+    ``spec.max_iters`` relocation steps, ``spec.lr`` step size, ``spec.quality_floor`` the validity bound.
+    Requires ≥1 coordinate tagged ``domain.variable(region)[i].trainable()`` before ``jno.fem`` (else raises).
+    Mutates ``fem`` / its domain to the relocated mesh (like the refinement loop) and returns the solution there;
+    ``fem.adapt_history`` traces the per-step energy.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    import jno
+
+    from ..._fem import _infer_vec
+
+    dom = fem.domain
+    coord_specs = list(getattr(dom, "_trainable_coords", None) or [])
+    if not coord_specs:
+        raise ValueError(
+            "FEM.solve(adapt=AdaptSpec(relocate=True)) found no trainable mesh coordinates to move. Tag the "
+            "vertices to relocate with `x, y[, z] = domain.variable(region, split=True); x.trainable()` "
+            "(per component) BEFORE `jno.fem(...)` -- otherwise there is nothing to relocate."
+        )
+    mode = getattr(fem, "_mode", "linear")
+    if mode != "linear":
+        raise NotImplementedError(
+            f"AdaptSpec(relocate=True) currently supports steady *linear* problems (got mode={mode!r}); "
+            "nonlinear / transient / complex relocation are planned extensions (fail-loud until then)."
+        )
+
+    dim = int(dom.dimension)
+    cells, _ = _mesh_cells(dom)
+    cells_j = jnp.asarray(cells)
+    pts0 = np.asarray(dom.mesh.points)[:, :dim].copy()
+    pts0_j = jnp.asarray(pts0)
+    n_verts = pts0.shape[0]
+    vec0 = _infer_vec(fem._constraints) if getattr(fem, "_constraints", None) else 1
+    names = [sp["name"] for sp in coord_specs]
+
+    def _scatter(vals):
+        p = pts0_j
+        for sp in coord_specs:
+            p = p.at[jnp.asarray(sp["ids"]), sp["axis"]].set(vals[sp["name"]])
+        return p
+
+    def _energy(vals):
+        a_mat, b_vec = fem.operator.evaluate(vals)
+        u = jnp.linalg.solve(jnp.asarray(a_mat.todense()), jnp.asarray(b_vec).reshape(-1))
+        uf = u[: n_verts * vec0]
+        uf = uf.reshape(n_verts, vec0) if vec0 > 1 else uf
+        return _dirichlet_energy_jax(_scatter(vals), uf, cells_j, dim)
+
+    val_grad = jax.jit(jax.value_and_grad(lambda arrs: _energy(dict(zip(names, arrs)))))
+
+    def _min_detj(p):
+        vv = p[cells]
+        ee = np.stack([vv[:, i + 1] - vv[:, 0] for i in range(dim)], axis=1)
+        return float(np.min(np.linalg.det(ee.transpose(0, 2, 1))))
+
+    def _moved(arrs):
+        p = pts0.copy()
+        for i, sp in enumerate(coord_specs):
+            p[sp["ids"], sp["axis"]] = np.asarray(arrs[i])
+        return p
+
+    floor = spec.quality_floor * _min_detj(pts0)
+    arrs = [jnp.asarray(pts0[sp["ids"], sp["axis"]]) for sp in coord_specs]
+    msq = [jnp.zeros_like(a) for a in arrs]  # RMSProp running average (near-feature gradients dwarf the rest)
+    history: list[dict] = []
+    for it in range(spec.max_iters):
+        e, g = val_grad(arrs)
+        msq = [0.9 * m + 0.1 * gi**2 for m, gi in zip(msq, g)]
+        stepdir = [gi / jnp.sqrt(m + 1e-8) for gi, m in zip(g, msq)]
+        a = spec.lr
+        for _ in range(25):  # backtracking line search: shrink the step until no element inverts
+            cand = [ai - a * si for ai, si in zip(arrs, stepdir)]
+            if _min_detj(_moved(cand)) > floor:
+                break
+            a *= 0.5
+        else:
+            break  # at the mesh-quality limit -- no admissible step
+        arrs = cand
+        history.append({"step": it, "energy": float(e)})
+
+    final = _moved(arrs)
+    if _min_detj(final) <= 0.0:  # fail loud rather than hand back / re-solve on a tangled mesh
+        raise RuntimeError(
+            "FEM.solve(adapt=relocate): the mesh tangled (min det J <= 0). Lower AdaptSpec.lr or raise "
+            "AdaptSpec.quality_floor."
+        )
+
+    # apply the relocation to the domain (connectivity-preserving), drop the trainable tags, re-solve plainly
+    disp = np.zeros((n_verts, dim))
+    for i, sp in enumerate(coord_specs):
+        disp[sp["ids"], sp["axis"]] = np.asarray(arrs[i]) - pts0[sp["ids"], sp["axis"]]
+    move_mesh(dom, disp, copy=False, check=True)
+    dom._trainable_coords = []  # relocation consumed the tags; the moved vertices are now the geometry
+    for _name, _pred in list(getattr(dom, "_tag_predicates", {}).items()):
+        dom.tag(_name, _pred)
+    cur = jno.fem(fem._constraints, **fem._fem_kwargs)
+    u_final = np.asarray(cur.solve(solve_fn, **kwargs)).reshape(-1)
+    fem.__dict__.update(cur.__dict__)
+    fem.adapt_history = history
+    return u_final
 
 
 @dataclass

@@ -108,73 +108,6 @@ def _min_detj(pts, cells):
     return float(np.min(a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0]))
 
 
-def relocate(fem, d, e_ref, n_steps=60, lr=3e-3):
-    """Descend the FE-energy gradient to relocate the trainable interior vertices (differentiable r-adaptivity).
-
-    The built-in, general part is one line — ``jax.value_and_grad(energy)`` — exact only because
-    ``.trainable()`` made ``fem.solve()`` differentiable in the mesh. The rest is a compact optimiser with
-    the one ingredient a plain optimiser (``jno.core`` / adam) lacks here: **mesh-validity control**. Each
-    step takes a per-node RMS-normalised descent direction, then a *backtracking line search* halves the
-    step until no element is inverted — so the mesh never tangles.
-
-    NOTE — why backtracking and not just ``jno.core([energy + λ·barrier]).solve()``: on a *stiff* problem
-    like this reentrant corner the near-corner gradients are enormous, so a fixed-step optimiser (adam/sgd)
-    overshoots ``detJ = 0`` before a ``detJ`` log-barrier can react — the mesh inverts and the loss goes
-    ``nan``. A barrier needs a line search to be safe, and crux's optimisers do none; backtracking *checks*
-    validity every step, so it is robust. (A barrier alone is fine for milder relocation / co-design, where
-    the validity constraint is not binding — and ``.trainable()`` + the exact gradient is what lets a learned
-    monitor be trained through this via ``jno.core``, the ML path.) Fails loud if the mesh cannot stay valid.
-    """
-    cells = np.asarray(d.mesh.cells_dict["triangle"])
-    cj = jnp.asarray(cells)
-    pts0 = np.asarray(d.mesh.points)[:, :2].copy()
-    pts0_j = jnp.asarray(pts0)
-    (sx, sy) = (d._trainable_coords[0], d._trainable_coords[1])
-    ids, nx, ny = sx["ids"], sx["name"], sy["name"]
-
-    def energy(xy):
-        A, b = fem.operator.evaluate({nx: xy[0], ny: xy[1]})
-        u = jnp.linalg.solve(jnp.asarray(A.todense()), jnp.asarray(b).reshape(-1))
-        pts = pts0_j.at[ids, 0].set(xy[0]).at[ids, 1].set(xy[1])
-        return dirichlet_energy(pts, u, cj)
-
-    val_grad = jax.jit(jax.value_and_grad(energy))
-    floor = 0.1 * _min_detj(pts0, cells)  # never let any cell fall below 10% of the initial worst quality
-
-    def moved(xy):
-        p = pts0.copy()
-        p[ids, 0], p[ids, 1] = np.asarray(xy[0]), np.asarray(xy[1])
-        return p
-
-    xy = (pts0_j[ids, 0], pts0_j[ids, 1])
-    msq = (jnp.zeros_like(xy[0]), jnp.zeros_like(xy[1]))  # RMSProp running average of squared gradient
-    hist = [float(energy(xy)) - e_ref]
-    for _ in range(n_steps):
-        e, g = val_grad(xy)
-        msq = (0.9 * msq[0] + 0.1 * g[0] ** 2, 0.9 * msq[1] + 0.1 * g[1] ** 2)
-        step = (g[0] / jnp.sqrt(msq[0] + 1e-8), g[1] / jnp.sqrt(msq[1] + 1e-8))
-        a = lr
-        for _ in range(20):  # backtracking on mesh validity
-            cand = (xy[0] - a * step[0], xy[1] - a * step[1])
-            if _min_detj(moved(cand), cells) > floor:
-                break
-            a *= 0.5
-        else:
-            break  # no admissible step -> at the mesh-quality limit
-        xy = cand
-        hist.append(float(e) - e_ref)
-    # fail-loud tangle guard: never hand back an inverted mesh (a silent tangle would give nan solves later)
-    result = moved(xy)
-    if _min_detj(result, cells) <= 0.0:
-        raise RuntimeError(
-            "relocate: the mesh tangled — an element inverted (min detJ <= 0). Lower `lr`, raise the quality "
-            "floor, or take fewer steps; the coordinate gradient is exact but the optimiser must stay valid."
-        )
-    if len(hist) == 1:
-        raise RuntimeError("relocate: could not take a single valid step from the start mesh (lr too large?).")
-    return result, np.array(hist)
-
-
 # --- reference energy (fine mesh) and a common coarse starting mesh ---------------------------------------
 d_ref, fem_ref = build(0.03)
 E_REF = float(
@@ -198,14 +131,18 @@ pts_h, tris_h = np.asarray(d_h.mesh.points)[:, :2], np.asarray(d_h.mesh.cells_di
 E_h = float(dirichlet_energy(jnp.asarray(pts_h), jnp.asarray(sol_h), jnp.asarray(tris_h)))
 n_h = len(sol_h)
 
-# --- (2) r-adaptivity: `.trainable()` coordinates + the differentiable solve ------------------------------
-# `build(movable=True)` calls `xm.trainable()` / `ym.trainable()` on the interior coordinates (see build()),
-# so `fem_r.solve()` is now differentiable w.r.t. the mesh. The exact shape gradient ∂E/∂X is therefore just
-# `jax.grad` — no adjoint code — and `relocate` simply descends it (no new DOFs, fixed connectivity).
+# --- (2) r-adaptivity: the built-in relocation driver, ONE call -------------------------------------------
+# `build(movable=True)` tags the interior vertices with `.trainable()` (see build()), so the r-adaptivity API
+# is the SAME slot as h-adaptivity: `fem.solve(adapt=AdaptSpec(relocate=True))`. Internally it descends the
+# FE energy *through the differentiable solve* (∂E/∂X, exact) with a **backtracking mesh-validity line search**
+# — so the fixed node set concentrates at the corner and the mesh never tangles (validity lives in the step
+# control, which a stock optimiser / barrier can't guarantee on a stiff problem). It returns the solution on
+# the relocated mesh; `d_r`/`fem_r` now refer to it. Raises if no coordinate was `.trainable()`-tagged.
 d_r, fem_r = build(0.12, movable=True)
-pts_r, hist_r = relocate(fem_r, d_r, E_REF)
+sol_r = np.asarray(fem_r.solve(adapt=AdaptSpec(relocate=True, max_iters=60, lr=3e-3, quality_floor=0.1))).reshape(-1)
+pts_r = np.asarray(d_r.mesh.points)[:, :2]
 tris_r = np.asarray(d_r.mesh.cells_dict["triangle"])
-E_r = float(hist_r[-1] + E_REF)
+E_r = float(dirichlet_energy(jnp.asarray(pts_r), jnp.asarray(sol_r), jnp.asarray(tris_r)))
 
 print(f"energy-norm error  (E - E_ref),  E_ref = {E_REF:.4f}")
 print(f"  coarse start   : {E0 - E_REF:.3e}   ({n0} dofs)")

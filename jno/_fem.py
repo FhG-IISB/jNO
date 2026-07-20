@@ -1300,6 +1300,11 @@ class FEM:
 
             return run_moving_boundary(self, move, solve_fn=solve_fn, **kwargs)
         if adapt is not None:
+            if getattr(adapt, "relocate", False):
+                # r-adaptivity: relocate the .trainable() vertices (fixed connectivity), not h-refinement.
+                from .utils.solver.fem_adapt import run_adaptive_relocate
+
+                return run_adaptive_relocate(self, adapt, solve_fn=solve_fn, **kwargs)
             # x0= (warm start) and time= do not compose with a remesh — the DOF layout changes across it,
             # staling a warm start and any cached step operator. The nonlinear=/linear=/precond= slots DO
             # compose: they configure the per-step (Newton / theta) solve, which is layout-independent —
