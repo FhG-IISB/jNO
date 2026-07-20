@@ -154,15 +154,15 @@ def test_crux_trains_the_coordinate_parameter():
     assert np.linalg.norm(X_trained - X_seed) > 1e-4, "crux did not move the coordinate parameter"
 
 
-def test_coordinate_plus_surface_term_raises():
-    """Fail-loud scope: trainable coordinates + surface (Neumann) terms need differentiable normals (Feature 3)."""
+def test_coordinate_with_surface_term_builds():
+    """Feature 3: trainable coordinates + a Neumann surface term now assemble (the earlier guard is gone;
+    the facet normals are JAX — see test_fem_trainable_normals.py for the full FD-vs-autodiff proof)."""
     d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain()
-    xi, _, _ = d.variable("mv", where=lambda x, y: (x > 0.25) & (x < 0.75) & (y > 0.25) & (y < 0.75), split=True)
-    xi.trainable(name="cx")
     u, phi = d.fem_symbols()
     xin, yin, _ = d.variable("interior", split=True)
-    xb, yb, _ = d.variable("boundary", split=True)
+    xb, yb, _tb, nxb, nyb = d.variable("boundary", split=True, normals=True)
+    d.variable("boundary", split=True)[0].trainable(name="cb")  # trainable boundary coordinate
     ui, vi = u.bind(x=xin, y=yin), phi.bind(x=xin, y=yin)
-    vb = phi.bind(x=xb, y=yb)  # a Neumann flux term (boundary integral) -> surface_work
-    with pytest.raises(NotImplementedError, match="facet normals"):
-        jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, 1.0 * vb], quad_degree=2)
+    vb = phi.bind(x=xb, y=yb)
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y + ui * vi - 1.0 * vi, -(nxb + nyb) * vb], quad_degree=3)
+    assert type(fem.operator).__name__ == "FemLinearSystem", "coordinate + surface term did not build a solve operator"

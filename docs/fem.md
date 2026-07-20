@@ -308,6 +308,37 @@ component** with scalar functions (a single function returning a tuple hits a ke
 
 ---
 
+## Differentiable mesh geometry — trainable coordinates (`.trainable()`)
+
+Any placeholder promotes to a `jno.np.parameter` seeded at its current values with **`.trainable()`** —
+an existing coefficient / data tag becomes an inverse unknown in one call:
+
+```python
+k = domain.variable("kappa", sample=k0).trainable()   # trainable coefficient, seeded at k0
+```
+
+Called on a **spatial coordinate** (`domain.variable(region)`), `.trainable()` makes that region's **mesh
+vertices** a design variable — the map from node positions to the solution is differentiable, so a solve
+can be optimized *with respect to the mesh itself* (mesh relocation / r-adaptivity / shape optimization),
+all in one JAX graph:
+
+```python
+xi, yi, _ = domain.variable("core", split=True)   # a where= / predicate sub-region
+Xx = xi.trainable()                                # ONLY the x-positions of the core vertices move
+#   differentiating a solve now yields the shape derivative ∂(solve)/∂X
+```
+
+The spelling is **literal, per component** (`x.trainable()` moves only x; call it per axis for full
+motion — which also gives constrained relocation for free, e.g. promote only the tangential component on a
+slip plane). Under the hood the coordinate parameter scatters into the assembly's P1 geometry *before* the
+element Jacobian is formed, so `J`, `JxW`, the physical gradients, the quadrature-point coordinates **and
+the boundary-facet normals** all become differentiable in the node positions. Scope: nodal-Lagrange volume
++ Neumann/Robin terms, 2D triangle / 3D tet, steady. The mesh **connectivity is fixed** — this is
+*relocation*, not remeshing (h-remeshing stays the non-differentiable outer AFEM loop); it is differentiable
+on valid meshes, with element inversion (tangling) the boundary of that regime.
+
+---
+
 ## Per-region (sub-domain) integration
 
 A weak term integrates over the **region of the coordinates it is written on** — exactly the rule that
