@@ -604,6 +604,51 @@ class Placeholder:
         dom = domain if domain is not None else _infer_domain_from_constraints([self])
         return jno.core([self], domain=dom).eval(self, domain=dom)
 
+    def trainable(self, *, name: str | None = None):
+        """Promote this placeholder to a trainable :func:`jno.np.parameter`, seeded at its current values.
+
+        Generic over placeholders: reads this node's current concrete values (via :meth:`eval`), mints a
+        parameter of the **same shape and dtype**, and initializes it to those values -- so an existing
+        coefficient / data tag becomes a design variable in one call and trains through ``jno.core`` exactly
+        like a hand-written parameter::
+
+            k  = domain.variable("kappa", sample=k0)   # a coefficient tag (data today)
+            kp = k.trainable()                          # -> trainable parameter, seeded at k0
+            u  = jno.fem([kp * (u.x * v.x + u.y * v.y) - f * v, u(b) - g]).solve()
+
+        A **spatial coordinate** placeholder (the ``x, y[, z]`` returned by ``domain.variable(region)``) is a
+        mesh *geometry* design variable: promoting it must route the coordinates into the assembly Jacobian,
+        which is handled by the FEM coordinate-routing path (``domain.variable(region)`` coordinates feeding
+        ``jno.fem``). This generic method raises for it -- and for the temporal variable, which is not a
+        design variable -- so a partial (coefficient-only) gradient can never be produced silently.
+
+        Args:
+            name: Optional readable label for the parameter (see :func:`jno.np.parameter`).
+
+        Returns:
+            The parameter (a ``ModelCall``); read its trained value with ``crux.eval(p)``.
+        """
+        import jno
+
+        axis = getattr(self, "axis", None)
+        if axis in ("spatial", "temporal"):
+            raise NotImplementedError(
+                "Placeholder.trainable(): a spatial coordinate is a mesh-geometry design variable, routed "
+                "through jno.fem (the domain.variable(region) coordinates feed the assembly Jacobian); the "
+                "temporal variable is not trainable. This generic promotion is for coefficient / data tags."
+            )
+
+        values = jnp.asarray(self.eval())
+        param = jno.np.parameter(tuple(values.shape), name=name)
+        if values.dtype == jnp.float64:
+            param = param.dtype(jnp.float64)
+
+        def _seed(key, shape, dtype=None):  # a constant JAX initializer -> the captured current values
+            arr = jnp.asarray(values)
+            return arr.astype(dtype) if dtype is not None else arr
+
+        return param.initialize(_seed)
+
     # ------------------------------------------------------------------
     # Native complex-dtype helpers (work on jnp.complex64/complex128)
     # ------------------------------------------------------------------
