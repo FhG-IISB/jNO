@@ -1672,7 +1672,7 @@ def _build_emitter_problem(
         out = []
         for (thick, _), zmid in zip(layers, zm):
             cfine = jnp.reshape(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, g, zmid), params), (g, g))
-            out.append((thick, _pixel_average(jnp.real(cfine), grid, sub) / (k0p * k0p)))
+            out.append((thick, _pixel_average(cfine, grid, sub) / (k0p * k0p)))  # keep complex ε (absorption)
         return out, 2 * jnp.pi / k0p, kin, make_source(params)
 
     from jno.utils.solver.parametric_helpers import _collect_runtime_parameter_exprs
@@ -1909,7 +1909,9 @@ def rcwa(
             out = []
             for li, (thick, zmid) in enumerate(zip(thicks, zmids)):
                 cfine = jnp.reshape(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, g, zmid), at(li)), (g, g))
-                out.append((thick, _pixel_average(jnp.real(cfine), grid, sub) / (k0 * k0)))
+                # keep the FULL complex coefficient: ε = coeff / k0² is complex for a lossy layer; taking the
+                # real part here would silently drop the absorption (Im ε) — k0 stays real (vacuum superstrate).
+                out.append((thick, _pixel_average(cfine, grid, sub) / (k0 * k0)))
         kin = _kin_from_source(src_coeff, period, src_z, params) if src_coeff is not None else jnp.asarray(k_in)
         return out, 2 * jnp.pi / k0, kin, None  # source=None: plane-wave incidence, not an internal source
 
