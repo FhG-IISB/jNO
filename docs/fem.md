@@ -556,6 +556,18 @@ marker, `picard(damping=…)` is exactly damped Newton (`jno.solve.newton(dampin
 problems: implicit differentiation then also uses the lagged Jacobian — drop `lag` when exact parameter
 gradients matter more than per-step solvability.
 
+**Sparse-direct Newton — `jno.solve.newton(direct=True)`.** The default Newton solves each linear step
+**matrix-free** (BiCGStab on the JVP), which stalls on an **indefinite / ill-conditioned** tangent with no
+good preconditioner — a Taylor–Hood velocity/pressure saddle, a stiff Carman–Kozeny phase-change drag in a
+melt pool. `direct=True` instead **assembles and factorizes** the tangent each step with a sparse LU (the
+transient stepper factorizes the backward-Euler step tangent `M/dt + ∂R/∂u`; the steady path `∂R/∂u`).
+It composes wherever the assembler provides that tangent — `fem.solve(nonlinear=jno.solve.newton(direct=True))`
+on a native nonlinear problem, **steady or the transient march** — and stays differentiable: implicit
+differentiation uses a *direct, transposable* tangent solve on the tangent assembled at the root (the adjoint
+solves `Jᵀ` directly too, not with a stalling Krylov). The `linear=`/`precond=` slots are then unused;
+`damping` / `line_search` apply unchanged. It needs the assembled tangent, so it does **not** apply to the
+matrix-free-only paths (a coupled-residual wrapper, complex) — those fail loud.
+
 **User extension** is duck-typed — a linear solver is any `fn(A, b, *, M=None, x0=None) -> x` with `A` a
 `jno.solve.LinearOperator` (`.mv`, `.T`, `.diag()`, `.bcoo`, `.dense()`); a preconditioner is any
 `ctx -> (v -> M⁻¹v)`:

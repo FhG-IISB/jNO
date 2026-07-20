@@ -1033,6 +1033,21 @@ class MeshUtils:
         return F
 
     @staticmethod
+    def meridional_quad_points(E0, E1, n_quad: int = 3):
+        """Gauss-Legendre quadrature points along each meridional element -> ``(m*n_quad, 2)``.
+
+        The exact points :meth:`get_view_factor_axisymmetric_element` integrates on (grouped
+        contiguously per element, so ``reshape(m, n_quad, ...)`` recovers the element blocks). Exposed so
+        an occlusion test can be evaluated at the SAME points the kernel uses, rather than once per
+        element at its midpoint -- element-level visibility makes a partially-shadowed element
+        all-or-nothing, which converges only at O(h)."""
+        E0, E1 = np.asarray(E0), np.asarray(E1)
+        gx, _ = np.polynomial.legendre.leggauss(int(n_quad))
+        s = (gx + 1.0) * 0.5  # -> [0, 1]
+        m = E0.shape[0]
+        return (E0[:, None, :] + s[None, :, None] * (E1 - E0)[:, None, :]).reshape(m * int(n_quad), 2)
+
+    @staticmethod
     def get_view_factor_axisymmetric_element(E0, E1, Nrm, VM, n_quad: int = 3, n_phi: int = 16, r_min: float = 0.0):
         r"""Element-based axisymmetric view-factor matrix ``F[i, j]`` for a body of revolution.
 
@@ -1051,14 +1066,31 @@ class MeshUtils:
                      {\sum_{q\in e_i} r_q w_q}
 
         i.e. the source-ring view factor (area-weighted by ``r_p w_p``) averaged over the receiver
-        element's rings (weighted by ``r_q w_q``). ``VM`` is element-to-element visibility (occlusion).
-        ``n_quad=1`` recovers the single-point-per-ring kernel.
+        element's rings (weighted by ``r_q w_q``). ``n_quad=1`` recovers the single-point-per-ring kernel.
+
+        ``VM`` is the visibility (occlusion) mask and accepts three shapes:
+
+        * ``(m, m)`` — a single azimuth-blind flag per element pair (the historical behaviour): applied
+          as one constant mask *after* the azimuthal sum. This is only exact at ``phi = 0``, i.e. it
+          silently assumes that whatever occludes (or doesn't) the same-meridian chord occludes (or
+          doesn't) the chord at *every* azimuthal offset — not true in general for a solid of revolution,
+          since the true 3-D chord's distance from the axis is strictly smaller than the flat
+          ``(r, z)``-plane projection for any nonzero azimuth (it "cuts the corner" toward the axis).
+        * ``(m, m, n_phi)`` — per-azimuth visibility per element PAIR, applied **inside** the azimuthal
+          sum before it is reduced: occlusion is checked at the same azimuth the exchange is integrated
+          over. Correct, but decided once per element (at its midpoint), so a partially-shadowed element
+          is all-or-nothing and the shadow boundary is only resolved to O(element size).
+        * ``(m*n_quad, m*n_quad, n_phi)`` — per-azimuth visibility at the **quadrature points** (see
+          :meth:`meridional_quad_points`). Same as above but resolves the shadow boundary within an
+          element, so a partially-shadowed element is partially shadowed. Preferred.
 
         Reference: M. F. Modest, *Radiative Heat Transfer*, 3rd ed., Ch. 4 (bodies of revolution).
         """
         E0 = jnp.asarray(E0)
         E1 = jnp.asarray(E1)
         Nrm = jnp.asarray(Nrm)
+        VM = jnp.asarray(VM)
+        phi_resolved = VM.ndim == 3
         m = E0.shape[0]
         nq = int(n_quad)
 
@@ -1087,7 +1119,13 @@ class MeshUtils:
         R = jnp.sqrt(R2 + 1e-30)
         cos_i = jnp.maximum(0.0, (nr_i * dx + nz_i * dz) / R)
         cos_j = jnp.maximum(0.0, -(nr_j * jnp.cos(phi_m) * dx + nr_j * jnp.sin(phi_m) * dy + nz_j * dz) / R)
-        ring = dphi * jnp.sum(cos_i * cos_j / (jnp.pi * R2 + 1e-30), axis=-1)  # (M, M) ring-to-ring kernel
+        kernel = cos_i * cos_j / (jnp.pi * R2 + 1e-30)  # (M, M, n_phi) point-to-point diffuse kernel
+        if phi_resolved:
+            # Occlusion checked AT the azimuth being integrated, not just phi=0. Quadrature-resolved
+            # visibility is used as-is; element-level visibility is broadcast up to the quad points.
+            vm_full = VM if VM.shape[0] == m * nq else jnp.repeat(jnp.repeat(VM, nq, axis=0), nq, axis=1)
+            kernel = kernel * vm_full
+        ring = dphi * jnp.sum(kernel, axis=-1)  # (M, M) ring-to-ring kernel
 
         # Differential view factor ring_q -> ring_p (source weighted by its ring area r_p * w_p):
         fqq = ring * (r[None, :] * w_merid[None, :])  # (M, M)
@@ -1096,7 +1134,15 @@ class MeshUtils:
         num = (a_q[:, None] * fqq).reshape(m, nq, m, nq).sum(axis=(1, 3))  # (m, m)
         a_elem = a_q.reshape(m, nq).sum(axis=1)  # (m,)
         F = num / a_elem[:, None]
-        F = F * jnp.asarray(VM) * (1.0 - jnp.eye(m))
+        if phi_resolved:
+            # Occlusion already applied per-azimuth above. The diagonal is KEPT: unlike a flat 2-D
+            # segment (which cannot see itself), a RING sees itself around the azimuth, and on a concave
+            # surface that is real exchange -- zeroing it discards energy and is precisely what makes the
+            # raw row sums fall short of 1 (confirmed against a 3-D Monte-Carlo ray trace). Its phi = 0
+            # term is harmless: the chord degenerates and the cosines vanish.
+            pass
+        else:
+            F = F * VM * (1.0 - jnp.eye(m))
         return F
 
     @staticmethod

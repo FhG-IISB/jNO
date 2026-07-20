@@ -226,15 +226,23 @@ class LinearSolver:
 
 
 class NonlinearSolver:
-    """A configured nonlinear driver: ``driver(residual_fn, u0, *, linear_solve=None) -> u``."""
+    """A configured nonlinear driver: ``driver(residual_fn, u0, *, linear_solve=None, jacobian=None) -> u``.
 
-    def __init__(self, fn: Callable, *, name: str, traits: Optional[dict] = None):
+    ``direct=True`` marks an **assembled-Jacobian, sparse-direct** Newton: it factorizes the assembled
+    tangent (``jacobian=`` — a callable ``u -> BCOO``) each step instead of the matrix-free Krylov inner
+    solve, so it is robust on indefinite/ill-conditioned systems (Taylor-Hood saddles, stiff drag). It
+    composes only where the assembler provides that Jacobian (native nonlinear FEM / the transient
+    stepper), which threads it in via ``jacobian=``.
+    """
+
+    def __init__(self, fn: Callable, *, name: str, traits: Optional[dict] = None, direct: bool = False):
         self._fn = fn
         self.name = name
+        self.direct = direct
         self.traits = {"vmap": "native", "jit": True, **(traits or {})}
 
-    def __call__(self, residual_fn, u0, *, linear_solve=None):
-        return self._fn(residual_fn, u0, linear_solve=linear_solve)
+    def __call__(self, residual_fn, u0, *, linear_solve=None, jacobian=None):
+        return self._fn(residual_fn, u0, linear_solve=linear_solve, jacobian=jacobian)
 
     def __repr__(self):
         return f"jno.solve.{self.name}()"
@@ -461,7 +469,13 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
             M = materialize_precond(precond, PrecondContext(op, fem)) if precond is not None else None
             return solver(op, rhs, M=M)
 
-    return lambda residual_fn, u0: nonlinear(residual_fn, u0, linear_solve=inner)
+    def _composed(residual_fn, u0, *, jacobian=None):
+        return nonlinear(residual_fn, u0, linear_solve=inner, jacobian=jacobian)
+
+    # A direct (assembled-Jacobian) Newton needs the step Jacobian threaded in; flag it so the caller
+    # (SemidiscreteTimeBlock.step) builds ``M/dt + jacobian`` and passes it via ``jacobian=``.
+    _composed.wants_jacobian = bool(getattr(nonlinear, "direct", False))
+    return _composed
 
 
 def _add_step_operator(M, A, scale):

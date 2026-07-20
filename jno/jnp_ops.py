@@ -522,6 +522,102 @@ def symgrad(
 
 
 # ============================================================================
+# Linear algebra on second-order tensors
+# ============================================================================
+# All act on the **last two axes** and broadcast over any leading (e.g.
+# quadrature) axes — exactly like ``trace``/``sym`` above. ``inv``/``det``/
+# ``eigvalsh`` are thin ``jax.numpy.linalg`` wrappers; the symmetric matrix
+# functions ``logm``/``expm``/``sqrtm`` route through a Daleckiĭ–Kreĭn
+# ``custom_jvp`` (see ``jno.trace.views``) so their gradient stays finite at
+# *repeated* eigenvalues — equal principal stretches, the common case in
+# finite-strain plasticity. Together these are the tensor primitives a
+# finite-strain constitutive update needs: ``inv`` for the multiplicative split
+# ``F = Fₑ·Fₚ``, ``det`` for the volumetric part ``J = det F``, ``logm``/``expm``
+# for a log-strain (Hencky) return map.
+
+
+def inv(x) -> FunctionCall:
+    """Inverse of a second-order tensor over the last two axes → tensor.
+
+    Broadcasts over any leading (quadrature/batch) axes.
+
+    Example
+    -------
+    Fe = jnn.matmul(F, jnn.inv(Fp))       # elastic part of F = Fe · Fp
+    """
+    return _attach_coords(FunctionCall(jnp.linalg.inv, [_u(x)], name="inv"), [x])
+
+
+def det(x) -> FunctionCall:
+    """Determinant over the last two axes → scalar (per leading index).
+
+    Example
+    -------
+    J = jnn.det(F)                        # volumetric part of the deformation
+    """
+    return _attach_coords(FunctionCall(jnp.linalg.det, [_u(x)], name="det"), [x])
+
+
+def eigvalsh(x) -> FunctionCall:
+    """Ascending eigenvalues of a **symmetric** tensor over the last two axes →
+    vector of principal values (per leading index).
+
+    Uses the symmetric solver ``jnp.linalg.eigh``. Useful for principal
+    stretches / principal stresses and isotropic yield functions. (Eigenvalues
+    only — eigenvectors are not returned, as they are ill-defined at repeated
+    eigenvalues; for a spectral matrix function use :func:`logm`/:func:`expm`/
+    :func:`sqrtm`, which stay differentiable there.)
+    """
+    return _attach_coords(FunctionCall(lambda a: jnp.linalg.eigh(a)[0], [_u(x)], name="eigvalsh"), [x])
+
+
+def logm(x) -> FunctionCall:
+    """Symmetric matrix logarithm ``logm(A) = V diag(log λ) Vᵀ`` over the last two
+    axes → tensor (SPD input).
+
+    The gradient stays finite at **repeated eigenvalues** (Daleckiĭ–Kreĭn form),
+    so a log-strain return map is differentiable through equal principal
+    stretches. Distinct from the element-wise scalar :func:`log`.
+
+    Example
+    -------
+    E = 0.5 * jnn.logm(jnn.matmul(F.T, F))   # Hencky (logarithmic) strain
+    """
+    from .trace.views import _spectral_matrix_function
+
+    return _attach_coords(FunctionCall(lambda a: _spectral_matrix_function(a, "log", 0.0), [_u(x)], name="logm"), [x])
+
+
+def expm(x) -> FunctionCall:
+    """Symmetric matrix exponential ``expm(A) = V diag(exp λ) Vᵀ`` over the last
+    two axes → tensor.
+
+    Gradient stable at repeated eigenvalues; the inverse of :func:`logm` on SPD
+    inputs. Distinct from the element-wise scalar :func:`exp`.
+
+    Example
+    -------
+    Fp = jnn.matmul(jnn.expm(dgamma * N), Fp_prev)   # exponential map of plastic flow
+    """
+    from .trace.views import _spectral_matrix_function
+
+    return _attach_coords(FunctionCall(lambda a: _spectral_matrix_function(a, "exp", 0.0), [_u(x)], name="expm"), [x])
+
+
+def sqrtm(x) -> FunctionCall:
+    """Symmetric matrix square root ``A^(1/2) = V diag(√λ) Vᵀ`` over the last two
+    axes → tensor (SPD input).
+
+    Gradient stable at repeated eigenvalues. E.g. the right stretch
+    ``U = sqrtm(FᵀF)`` of a polar decomposition. Distinct from the element-wise
+    scalar :func:`sqrt`.
+    """
+    from .trace.views import _spectral_matrix_function
+
+    return _attach_coords(FunctionCall(lambda a: _spectral_matrix_function(a, "pow", 0.5), [_u(x)], name="sqrtm"), [x])
+
+
+# ============================================================================
 # Reduction operations
 # ============================================================================
 
@@ -861,27 +957,30 @@ def curl_3d(
     return stack([curl_x, curl_y, curl_z], axis=-1)
 
 
-def integrate(expr: Placeholder) -> "Integral":
+def integrate(expr: Placeholder, *, quadrature: "str | int" = "nodal") -> "Integral":
     """Integrate a scalar expression over its mesh domain region.
 
-    Shorthand for ``expr.integrate()``.  The region (boundary vs volume) is
-    auto-detected from the Variable tags inside ``expr`` via
+    Shorthand for ``expr.integrate(quadrature=...)``.  The region (boundary vs
+    volume) is auto-detected from the Variable tags inside ``expr`` via
     ``domain._boundary_registry``.
 
-    The expression is evaluated at **all** mesh nodes of that region and
-    reduced to a scalar via a weighted sum using nodal measures.
-    For flux integrals, compute F·n explicitly first::
+    The expression is evaluated at the region's quadrature points and reduced to
+    a scalar via a weighted sum.  ``quadrature`` selects the volume rule:
+    ``"nodal"`` (default, the P1 vertex rule using nodal measures) or ``"gauss"``
+    / an integer degree (element Gauss quadrature — higher-order, alias-resistant;
+    volume regions only).  For flux integrals, compute F·n explicitly first::
 
         (Fx(x_b, y_b) * nx + Fy(x_b, y_b) * ny).integrate()
         integrate(Fx(x_b, y_b) * nx + Fy(x_b, y_b) * ny)  # equivalent
 
     Args:
         expr: Scalar-valued Placeholder expression.
+        quadrature: ``"nodal"`` (default), ``"gauss"``, or an integer Gauss degree.
 
     Returns:
         Integral node that evaluates to a scalar.
     """
-    return Integral(_u(expr))
+    return Integral(_u(expr), quadrature=quadrature)
 
 
 def test(name: str = "phi") -> TestFunction:

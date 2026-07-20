@@ -1,5 +1,6 @@
 """Unit tests for jno.jnp_ops — JAX NumPy wrappers for the tracing DSL."""
 
+import jax
 import jax.numpy as jnp
 import pytest
 
@@ -164,6 +165,62 @@ class TestCreationWrappers:
     def test_arange(self):
         result = np.arange(0, 5, 1)
         assert result.shape == (5,)
+
+
+class TestLinalgTensorWrappers:
+    """Second-order-tensor linear algebra: inv / det / eigvalsh / logm / expm / sqrtm.
+
+    These act on the last two axes and broadcast over leading (quadrature) axes.
+    The deep numerical + FD-gradient verification of the shared spectral helper
+    lives in tests/test_views.py; here we cover the ``jno.np`` free-function
+    surface, the broadcast contract, and that the degeneracy-stable gradient is
+    inherited (the enabler for a finite-strain-plasticity return map).
+    """
+
+    def test_return_types(self):
+        x = make_var("x")
+        for op in (np.inv, np.det, np.eigvalsh, np.logm, np.expm, np.sqrtm):
+            assert isinstance(op(x), FunctionCall)
+
+    def test_inv_det_numerical(self):
+        A = jnp.array([[4.0, 1.0], [2.0, 3.0]])
+        assert jnp.allclose(np.inv(make_var("x")).fn(A), jnp.linalg.inv(A))
+        assert jnp.allclose(np.det(make_var("x")).fn(A), jnp.linalg.det(A))
+
+    def test_eigvalsh_numerical(self):
+        A = jnp.array([[2.0, 1.0], [1.0, 2.0]])  # eigenvalues 1, 3
+        assert jnp.allclose(np.eigvalsh(make_var("x")).fn(A), jnp.linalg.eigvalsh(A))
+
+    def test_logm_expm_roundtrip(self):
+        A = jnp.array([[3.0, 1.0], [1.0, 2.0]])  # SPD
+        logA = np.logm(make_var("x")).fn(A)
+        assert jnp.allclose(np.expm(make_var("x")).fn(logA), A, atol=1e-5)
+
+    def test_sqrtm_squares_back(self):
+        A = jnp.array([[3.0, 1.0], [1.0, 2.0]])  # SPD
+        S = np.sqrtm(make_var("x")).fn(A)
+        assert jnp.allclose(S @ S, A, atol=1e-5)
+
+    def test_broadcasts_over_leading_axis(self):
+        # (Q, n, n): broadcast over the leading quadrature axis, one entry degenerate
+        batch = jnp.stack([2.0 * jnp.eye(3), jnp.diag(jnp.array([1.0, 2.0, 3.0]))])  # (2, 3, 3)
+        assert np.inv(make_var("x")).fn(batch).shape == (2, 3, 3)
+        assert np.det(make_var("x")).fn(batch).shape == (2,)
+        assert np.eigvalsh(make_var("x")).fn(batch).shape == (2, 3)
+        assert np.logm(make_var("x")).fn(batch).shape == (2, 3, 3)
+
+    def test_matrix_function_gradient_stable_at_degeneracy(self):
+        # logm gradient must stay finite at repeated eigenvalues (equal principal
+        # stretches) — the enabler for a differentiable finite-strain return map.
+        prev = jax.config.jax_enable_x64
+        jax.config.update("jax_enable_x64", True)
+        try:
+            logm = np.logm(make_var("x")).fn
+            g = jax.grad(lambda A: logm(A)[0, 0])(2.0 * jnp.eye(3))  # eigenvalues [2, 2, 2]
+            assert bool(jnp.all(jnp.isfinite(g))), "jno.np.logm gradient is NaN at repeated eigenvalues"
+            assert jnp.allclose(g[0, 0], 0.5, atol=1e-6)  # d/dλ log λ = 1/λ = 1/2
+        finally:
+            jax.config.update("jax_enable_x64", prev)
 
 
 class TestDtypes:

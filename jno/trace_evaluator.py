@@ -1741,7 +1741,7 @@ class TraceEvaluator:
                 "Mesh-based integration requires an unstructured mesh domain."
             )
 
-        cached = self._get_integral_cache(domain, tag, mc)
+        cached = self._get_integral_cache(domain, tag, mc, getattr(expr, "quadrature", "nodal"))
         is_boundary = cached["is_boundary"]
         all_region_pts = jnp.array(cached["region_pts"])
         weights = jnp.array(cached["weights"])
@@ -1866,12 +1866,13 @@ class TraceEvaluator:
         return (u_next - u_prev) / dt_eff
 
     @staticmethod
-    def _get_integral_cache(domain, tag: str, mc: dict) -> dict:
-        """Populate and return the per-tag integration region cache on *domain*."""
+    def _get_integral_cache(domain, tag: str, mc: dict, quadrature: "str | int" = "nodal") -> dict:
+        """Populate and return the per-(tag, quadrature) integration region cache on *domain*."""
         if not hasattr(domain, "_integral_region_cache"):
             domain._integral_region_cache = {}
 
-        if tag not in domain._integral_region_cache:
+        cache_key = (tag, quadrature)
+        if cache_key not in domain._integral_region_cache:
             global_bi = np.asarray(mc["boundary_indices"])
             is_boundary = False
             if tag in domain._boundary_registry:
@@ -1879,6 +1880,14 @@ class TraceEvaluator:
                 if len(reg_pts_idx) > 0:
                     n_on_bnd = int(np.sum(np.isin(reg_pts_idx, global_bi)))
                     is_boundary = n_on_bnd / len(reg_pts_idx) > 0.5
+
+            use_gauss = quadrature != "nodal"
+            if use_gauss and is_boundary:
+                raise NotImplementedError(
+                    f"Gauss-quadrature integration (quadrature={quadrature!r}) is volume-only; "
+                    f"region '{tag}' is a boundary. Use the default nodal rule for boundary integrals."
+                )
+            gauss_degree = 4 if quadrature == "gauss" else quadrature
 
             if is_boundary:
                 reg_indices = np.asarray(domain._boundary_registry[tag]["point_indices"])
@@ -1912,7 +1921,15 @@ class TraceEvaluator:
                 has_subregion = (
                     tag_tris is not None and full_tris is not None and len(tag_tris) > 0 and len(tag_tris) < len(full_tris)
                 )
-                if has_subregion:
+                if use_gauss:
+                    # Element Gauss quadrature: physical quad points + JxW weights over this
+                    # region's cells (all cells, or a sub-region's triangle subset).
+                    sub_cells = np.asarray(tag_tris) if has_subregion else None
+                    region_pts_np, weights_np = IntegrationOperators.gauss_points_and_weights(
+                        mc, degree=gauss_degree, cells=sub_cells
+                    )
+                    normals_np = None
+                elif has_subregion:
                     # Non-boundary tag with its own triangle subset (e.g.
                     # ``interior_<name>`` on a CSG mesh): compute weights
                     # from just those triangles so disjoint sub-regions
@@ -1939,14 +1956,14 @@ class TraceEvaluator:
                     weights_np = IntegrationOperators.nodal_volumes(mc)
                 normals_np = None
 
-            domain._integral_region_cache[tag] = {
+            domain._integral_region_cache[cache_key] = {
                 "is_boundary": is_boundary,
                 "region_pts": region_pts_np,
                 "weights": weights_np,
                 "normals": normals_np,
             }
 
-        return domain._integral_region_cache[tag]
+        return domain._integral_region_cache[cache_key]
 
     def _eval_integral_vectorized(self, expr, ctx):
         """Vectorized integral — result is (N_outer, 1), a function of the outer variable.

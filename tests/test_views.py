@@ -374,6 +374,45 @@ class TestMatrixView:
         roundtrip = _eval(A.log().exp().expr, ctx)
         np.testing.assert_allclose(roundtrip, _eval(A.expr, ctx), atol=1e-5)
 
+    def test_logexp_roundtrip_isotropic(self):
+        # Isotropic (repeated-eigenvalue) matrix [[2,0],[0,2]] still round-trips: the stable-gradient
+        # rewrite leaves the forward unchanged.
+        A, ctx = _make_2x2([[2.0, 0.0, 0.0, 2.0]])
+        roundtrip = _eval(A.log().exp().expr, ctx)
+        np.testing.assert_allclose(roundtrip, _eval(A.expr, ctx), atol=1e-5)
+
+    def test_spectral_matrix_function_gradient_stable_at_degeneracy(self):
+        """logm/expm/Aⁿ must differentiate through REPEATED eigenvalues — equal principal stretches in
+        finite-strain plasticity, any isotropic state — where a naive ``eigh`` gradient is NaN. The
+        Daleckiĭ–Kreĭn custom-JVP keeps it finite and FD-correct (this is what unblocks a differentiable
+        finite-strain-plasticity return map)."""
+        from jno.trace.views import _spectral_matrix_function as smf
+
+        prev = jax.config.jax_enable_x64
+        jax.config.update("jax_enable_x64", True)
+        try:
+            logm = lambda a: smf(a, "log", 0.0)  # noqa: E731
+            # fully degenerate: eigenvalues [2, 2, 2]
+            iso = jnp.eye(3) * 2.0
+            g_iso = jax.grad(lambda a: logm(a).sum())(iso)
+            assert bool(jnp.all(jnp.isfinite(g_iso))), "logm gradient is NaN at repeated eigenvalues"
+            np.testing.assert_allclose(np.diag(np.asarray(g_iso)), [0.5, 0.5, 0.5], atol=1e-9)  # d/dλ logλ = 1/2
+            # batched over a leading (quadrature) axis, including a degenerate entry
+            batch = jnp.stack([iso, jnp.diag(jnp.array([1.0, 2.0, 3.0]))])
+            assert bool(jnp.all(jnp.isfinite(jax.grad(lambda a: logm(a).sum())(batch))))
+            # full Löwner form vs central FD on a generic symmetric matrix (distinct eigenvalues)
+            sym = jnp.array([[3.0, 0.4, 0.1], [0.4, 2.0, 0.2], [0.1, 0.2, 4.0]])
+            loss = lambda a: jnp.sum(logm(0.5 * (a + a.T)) ** 2)  # noqa: E731
+            g_ad = np.asarray(jax.grad(loss)(sym))
+            g_fd = np.zeros((3, 3))
+            for i in range(3):
+                for j in range(3):
+                    e = jnp.zeros((3, 3)).at[i, j].set(1e-6)
+                    g_fd[i, j] = float((loss(sym + e) - loss(sym - e)) / 2e-6)
+            np.testing.assert_allclose(g_ad, g_fd, atol=1e-6)
+        finally:
+            jax.config.update("jax_enable_x64", prev)
+
     def test_from_upper_tri_roundtrip(self):
         # [..., 3] upper tri → [..., 2, 2] symmetric → back to [..., 3]
         d = _domain_with(("v", 3))

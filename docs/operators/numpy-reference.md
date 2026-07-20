@@ -142,6 +142,33 @@ jnn.cross(x, y)
 result = x @ A
 ```
 
+### Second-order tensors
+
+All act on the **last two axes** and broadcast over any leading (e.g.
+quadrature) axes.
+
+```python
+jnn.inv(A)          # inverse
+jnn.det(A)          # determinant  → scalar per leading index
+jnn.eigvalsh(A)     # ascending eigenvalues of a symmetric tensor → principal values
+```
+
+**Symmetric matrix functions** — `f(A) = V diag(f(λ)) Vᵀ` via `eigh`. Their
+gradient stays finite at **repeated eigenvalues** (equal principal stretches —
+the common case in finite-strain plasticity) using the Daleckiĭ–Kreĭn / Löwner
+divided-difference form (Higham, *Functions of Matrices*, SIAM 2008, Thm 3.11).
+Distinct from the element-wise scalar `log` / `exp` / `sqrt` above.
+
+```python
+jnn.logm(A)         # matrix logarithm    E = 0.5 * jnn.logm(jnn.matmul(F.T, F))   # Hencky strain
+jnn.expm(A)         # matrix exponential  (inverse of logm on SPD)
+jnn.sqrtm(A)        # matrix square root  U = jnn.sqrtm(jnn.matmul(F.T, F))         # right stretch
+```
+
+These are the tensor primitives a finite-strain constitutive update needs:
+`inv` for the multiplicative split `F = Fₑ·Fₚ`, `det` for the volumetric part
+`J = det F`, and `logm`/`expm` for a log-strain (Hencky) return map.
+
 ---
 
 ## Symbolic Arithmetic
