@@ -58,12 +58,13 @@ def test_trainable_preserves_dtype_float64():
     assert abs(float(got.reshape(-1)[0]) - 3.0) < 1e-9
 
 
-def test_trainable_coordinate_raises():
-    """A spatial coordinate is a geometry design variable (Feature 2), not a plain promotion."""
+def test_spatial_coordinate_routes_to_geometry():
+    """A spatial coordinate is NOT a plain coefficient promotion — it routes to the geometry path and
+    registers a mesh design variable (Feature 2). The temporal variable is still not trainable."""
     d = _rect()
-    xi, yi, _ = d.variable("interior", split=True)
-    with pytest.raises(NotImplementedError, match="geometry design variable"):
-        xi.trainable()
+    xi, _, _ = d.variable("mv", where=lambda x, y: (x > 0.25) & (x < 0.75) & (y > 0.25) & (y < 0.75), split=True)
+    xi.trainable(name="cx")
+    assert getattr(d, "_trainable_coords", None), "spatial coordinate did not register as a geometry design variable"
 
 
 def test_trainable_promoted_coefficient_is_recoverable():
