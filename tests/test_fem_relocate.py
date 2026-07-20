@@ -178,3 +178,19 @@ def test_relocate_complex():
     assert fem.adapt_history[-1]["energy"] <= fem.adapt_history[0]["energy"]
     assert _min_detj(np.asarray(fem.domain.mesh.points)[:, :2], cells) > 0.0
     assert sol.shape[0] == 2 * n0, "complex solution = real + imaginary blocks"
+
+
+def test_relocate_complex_transient_fails_loud():
+    """Complex-*transient* cannot carry a trainable coordinate yet — its assembly builds static real Re/Im
+    blocks and does not thread runtime parameters — so it fails loud at build (not silently mis-assembled)."""
+    from shapely.geometry import box
+
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.3, time=(0.0, 0.05, 6))
+    u, phi = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    _mov(d)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    with pytest.raises(NotImplementedError, match="complex-transient"):
+        jno.fem([ui.t * vi + (0.5 + 1j) * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - 1.0])

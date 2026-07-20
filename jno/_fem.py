@@ -3117,6 +3117,16 @@ def fem(
         from .utils.solver.time_route import _infer_time_window, _strip_temporal_trial_derivative
         from .utils.solver.weak_form import _apply_sign, _split_additive_terms
 
+        if getattr(domain, "_trainable_coords", None):
+            # The complex-transient path densifies static real Re/Im blocks (M, A_r, A_i) and does not thread
+            # runtime parameters, so it cannot carry a trainable mesh coordinate (fail loud rather than let the
+            # parametric assembler output be unpacked as a plain matrix below).
+            raise NotImplementedError(
+                "jno.fem: a complex-transient problem cannot carry a trainable mesh coordinate "
+                "(Variable.trainable()) yet — its assembly builds static real Re/Im blocks. Relocate a complex "
+                "*steady* problem (supported via the real 2N linear path) or a real transient problem instead."
+            )
+
         mass_stripped, spatial_raw = [], []
         for bare in volume_terms:
             for sign, sub in _split_additive_terms(domain, bare):

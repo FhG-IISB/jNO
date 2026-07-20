@@ -1163,12 +1163,10 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
         )
     mode = getattr(fem, "_mode", "linear")
     if mode not in ("linear", "nonlinear", "transient"):
-        # A complex *linear* form is mode "linear" (a real 2N block system) and relocates fine — the energy
-        # sums its real + imaginary blocks. Only a complex *transient* march is not wired yet.
-        raise NotImplementedError(
-            f"AdaptSpec(relocate=True): unsupported problem mode {mode!r} (complex-transient relocation is "
-            "a planned extension)."
-        )
+        # A complex *linear* form is mode "linear" (a real 2N block system) and relocates fine. A complex
+        # *transient* problem is caught earlier at jno.fem build time (its assembly builds static real blocks
+        # and does not thread runtime parameters, so it cannot carry a trainable coordinate yet).
+        raise NotImplementedError(f"AdaptSpec(relocate=True): unsupported problem mode {mode!r}.")
 
     dim = int(dom.dimension)
     cells, _ = _mesh_cells(dom)
@@ -1184,11 +1182,10 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
             p = p.at[jnp.asarray(sp["ids"]), sp["axis"]].set(vals[sp["name"]])
         return p
 
-    def _block_energy(u, pts):
-        """Total Dirichlet energy summed over EVERY solution block (per-field offsets) — so a scalar, a
-        vector (per component), a **complex** field (its real + imaginary blocks) and a coupled multifield
-        all contribute. A higher-order block (P2) falls back to its vertex DOFs."""
-        bounds = list(fem.offsets) if fem.offsets is not None else [0, int(u.shape[0])]
+    def _block_energy(u, pts, bounds):
+        """Total Dirichlet energy summed over EVERY solution block (``bounds``) — so a scalar, a vector (per
+        component), a **complex** field (its real + imaginary blocks) and a coupled multifield all contribute.
+        A higher-order block (P2) falls back to its vertex DOFs."""
         e = 0.0
         for i in range(len(bounds) - 1):
             blk = u[bounds[i] : bounds[i + 1]]
@@ -1216,7 +1213,9 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
         return _march(vals)  # transient: time-averaged nodal state over the marched trajectory
 
     def _energy(vals):
-        return _block_energy(_solve_at(vals), _scatter(vals))
+        u = _solve_at(vals)
+        bounds = list(fem.offsets) if fem.offsets is not None else [0, int(u.shape[0])]
+        return _block_energy(u, _scatter(vals), bounds)
 
     val_grad = jax.jit(jax.value_and_grad(lambda arrs: _energy(dict(zip(names, arrs)))))
 
