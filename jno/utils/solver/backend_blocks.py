@@ -391,7 +391,17 @@ class SemidiscreteTimeBlock:
         params = [self.runtime_parameter_exprs[n] for n in names]
 
         def _solve(*values):
-            return solve_fn(self, dict(zip(names, values)), save_ts)
+            ys = solve_fn(self, dict(zip(names, values)), save_ts)
+            if self.prolongation is not None:
+                # Periodic tie: the block integrates in the reduced master-DOF space. Prolong each saved
+                # step ``u = P·u_red`` back to the full nodal layout, so the returned trajectory lives on the
+                # mesh nodes (matching ``fem.points`` / ``fem.offsets``) -- exactly as the steady operators
+                # (``FemLinearSystem.solve``) and the complex-transient path already do. Without this a
+                # periodic transient hands back reduced DOFs a caller then mis-slices with full offsets.
+                import jax
+
+                ys = jax.vmap(self.prolong)(ys)
+            return ys
 
         return FunctionCall(_solve, params, name="fem_transient_solve")
 
