@@ -1105,6 +1105,34 @@ def _dirichlet_energy_jax(pts, u_nodal, cells, dim):
     return jnp.sum(jnp.sum(grad**2, axis=(1, 2)) * vol)
 
 
+def _transient_march_fn(block):
+    """Build a differentiable ``args -> time-averaged nodal state`` for a :class:`SemidiscreteTimeBlock`.
+
+    The time grid / dt / theta are constants (independent of the runtime parameters), so they are captured
+    once here; the returned closure is a plain ``lax.scan`` over the block's one-step primitive, reverse-mode
+    differentiable in ``args`` (the coordinate gradient flows). The relocation driver averages the trajectory
+    in time -- it optimises the mesh for the whole run, not one snapshot."""
+    import jax
+    import jax.numpy as jnp
+
+    from .backend_blocks import _block_time_grid
+
+    state0 = jnp.asarray(block.state0).reshape(-1)
+    ts = jnp.asarray(np.asarray(_block_time_grid(block)))  # constant grid, materialised outside the trace
+    dt = float(block.dt)
+    theta = float(block.metadata.get("theta", 1.0)) if block.metadata else 1.0
+
+    def march(args):
+        def _scan_step(u, t):
+            un = block.step(u, t, dt, args=args, theta=theta)
+            return un, un
+
+        _, traj = jax.lax.scan(_scan_step, state0, ts[:-1])
+        return jnp.mean(jnp.concatenate([state0[None, :], traj], axis=0), axis=0)
+
+    return march
+
+
 def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwargs: Any) -> np.ndarray:
     """Drive ``FEM.solve(adapt=AdaptSpec(relocate=True, ...))`` -- **r-adaptivity** (mesh relocation).
 
@@ -1136,11 +1164,13 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
             "(per component) BEFORE `jno.fem(...)` -- otherwise there is nothing to relocate."
         )
     mode = getattr(fem, "_mode", "linear")
-    if mode != "linear":
+    if mode in ("complex", "complex_transient"):
         raise NotImplementedError(
-            f"AdaptSpec(relocate=True) currently supports steady *linear* problems (got mode={mode!r}); "
-            "nonlinear / transient / complex relocation are planned extensions (fail-loud until then)."
+            f"AdaptSpec(relocate=True) does not support complex problems yet (got mode={mode!r}); the "
+            "Dirichlet-energy objective is real-only. Relocate the real-equivalent form."
         )
+    if mode not in ("linear", "nonlinear", "transient"):
+        raise NotImplementedError(f"AdaptSpec(relocate=True): unsupported problem mode {mode!r}.")
 
     dim = int(dom.dimension)
     cells, _ = _mesh_cells(dom)
@@ -1157,9 +1187,25 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
             p = p.at[jnp.asarray(sp["ids"]), sp["axis"]].set(vals[sp["name"]])
         return p
 
+    _march = _transient_march_fn(fem.operator) if mode == "transient" else None
+
+    def _solve_at(vals):
+        """The solution at the coordinate values ``vals`` -- differentiable in them (the keystone).
+        Linear: ``A(X)⁻¹ b(X)``. Nonlinear: Newton (``custom_root`` keeps ``∂u/∂X`` exact). Transient:
+        the *time-averaged* nodal state over the marched trajectory (relocate the mesh for the whole run)."""
+        if mode == "linear":
+            a_mat, b_vec = fem.operator.evaluate(vals)
+            return jnp.linalg.solve(jnp.asarray(a_mat.todense()), jnp.asarray(b_vec).reshape(-1))
+        if mode == "nonlinear":
+            from .newton_krylov import newton_krylov
+
+            op = fem.operator
+            u0 = jnp.zeros((int(op.size),), dtype=jnp.result_type(float))
+            return newton_krylov(lambda uu: op.residual(uu, vals), u0)
+        return _march(vals)  # transient: time-averaged nodal state over the marched trajectory
+
     def _energy(vals):
-        a_mat, b_vec = fem.operator.evaluate(vals)
-        u = jnp.linalg.solve(jnp.asarray(a_mat.todense()), jnp.asarray(b_vec).reshape(-1))
+        u = _solve_at(vals)
         uf = u[: n_verts * vec0]
         uf = uf.reshape(n_verts, vec0) if vec0 > 1 else uf
         return _dirichlet_energy_jax(_scatter(vals), uf, cells_j, dim)

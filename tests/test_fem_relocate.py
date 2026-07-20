@@ -91,16 +91,63 @@ def test_relocate_vector_field():
     assert sol.shape[0] == 2 * n0, "vector solution has 2 DOFs per node, unchanged by relocation"
 
 
-def test_relocate_fails_loud_on_nonlinear():
-    """Scope guard: nonlinear / transient / complex relocation is a planned extension and must fail loud."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain()
-    u, phi = d.fem_symbols()
-    xi, yi, _ = d.variable("interior", split=True)
-    xb, yb, _ = d.variable("boundary", split=True)
+def _mov(d):
     xm, ym, _ = d.variable("mov", where=lambda x, y: (x > 0.2) & (x < 0.8) & (y > 0.2) & (y < 0.8), split=True)
     xm.trainable(name="ix")
     ym.trainable(name="iy")
+
+
+def test_relocate_nonlinear():
+    """A steady *nonlinear* problem relocates (the objective's solve is a differentiable Newton solve)."""
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.18).domain()
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    _mov(d)
     ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
-    fem = jno.fem([ui.x * vi.x + ui.y * vi.y + ui * ui * vi - vi, u(xb, yb) - 0.0])  # u² -> nonlinear
-    with pytest.raises(NotImplementedError, match="steady"):
-        fem.solve(adapt=AdaptSpec(relocate=True))
+    f = 10.0 * J.exp(-40.0 * ((xi - 0.6) ** 2 + (yi - 0.35) ** 2))
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y + ui * ui * ui * vi - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+    assert fem._mode == "nonlinear"
+    fem.solve(adapt=AdaptSpec(relocate=True, max_iters=20, lr=2e-3))
+    cells = np.asarray(fem.domain.mesh.cells_dict["triangle"])
+    assert fem.adapt_history[-1]["energy"] <= fem.adapt_history[0]["energy"]
+    assert _min_detj(np.asarray(fem.domain.mesh.points)[:, :2], cells) > 0.0
+
+
+def test_relocate_transient():
+    """A *transient* problem relocates for the whole trajectory (time-averaged energy; the coord gradient
+    flows through the marched block)."""
+    from shapely.geometry import box
+
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.18, time=(0.0, 0.3, 11))
+    u, v = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    _mov(d)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+    fem = jno.fem([ui.t * vi + ui.x * vi.x + ui.y * vi.y, u(xb, yb) - 0.0, u(ci[0], ci[1]) - 1.0])
+    assert fem.is_transient
+    fem.solve(adapt=AdaptSpec(relocate=True, max_iters=15, lr=2e-3))
+    cells = np.asarray(fem.domain.mesh.cells_dict["triangle"])
+    h = fem.adapt_history
+    assert h[-1]["energy"] < h[0]["energy"], "transient relocation should reduce the time-averaged energy"
+    assert _min_detj(np.asarray(fem.domain.mesh.points)[:, :2], cells) > 0.0
+
+
+def test_relocate_periodic():
+    """A *periodic* problem relocates: interior relocation never touches the boundary ties."""
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.18).domain()
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xl, yl, _ = d.variable("left", where=lambda x, y: x < 1e-6, split=True)
+    xr, yr, _ = d.variable("right", where=lambda x, y: x > 1 - 1e-6, split=True)
+    bt = d.variable("bt", where=lambda x, y: (y < 1e-6) | (y > 1 - 1e-6), split=True)
+    _mov(d)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    f = J.exp(-40.0 * ((xi - 0.5) ** 2 + (yi - 0.35) ** 2))
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y - f * vi, u(xl, yl) - u(xr, yr), u(bt[0], bt[1]) - 0.0])
+    fem.solve(adapt=AdaptSpec(relocate=True, max_iters=20, lr=2e-3))
+    cells = np.asarray(fem.domain.mesh.cells_dict["triangle"])
+    assert fem.adapt_history[-1]["energy"] <= fem.adapt_history[0]["energy"]
+    assert _min_detj(np.asarray(fem.domain.mesh.points)[:, :2], cells) > 0.0

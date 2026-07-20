@@ -350,8 +350,9 @@ u = fem.solve(adapt=jno.AdaptSpec(relocate=True, max_iters=60))
 `det J` line search** — so the fixed node set concentrates at solution features and the mesh never tangles
 (the validity constraint lives in the step control; a stock optimiser or an energy barrier alone cannot
 guarantee it on a stiff problem — see `run_adaptive_relocate`). It mutates the domain to the relocated mesh,
-returns the solution there, and **raises** if no coordinate was tagged. Scope today: steady scalar/vector;
-nonlinear / transient / complex relocation fail loud (planned extensions).
+returns the solution there, and **raises** if no coordinate was tagged. Works across **linear, nonlinear
+(Newton), transient (relocates for the whole trajectory via a time-averaged objective), and periodic**
+problems, scalar or vector; only **complex** fails loud (the energy objective is real-only).
 
 ---
 
