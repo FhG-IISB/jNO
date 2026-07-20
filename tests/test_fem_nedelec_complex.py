@@ -76,10 +76,16 @@ def test_imaginary_leg_is_the_mass_matrix():
     np.testing.assert_allclose(_dense(op_i[0]), M, atol=1e-10)
 
 
-def test_complex_parametric_nonnodal_raises_not_silent():
-    """A complex N1E *parametric/inverse* form is not wired — it must RAISE (the earlier behaviour silently
-    cast the imaginary part to zero, a silently-wrong solve)."""
+def test_complex_parametric_nonnodal_assembles_keeps_imag():
+    """A complex N1E *parametric/inverse* form is now wired: it builds without raising (it was rejected
+    before, and earlier still silently cast Im ε to zero). The Re/Im legs are parametric operators; the
+    imaginary leg carries ``a·mass``, so it must be non-empty — Im ε is kept. (Full correctness of the kept
+    imaginary part + the gradient is pinned in ``test_rcwa_vector.py``; the sparse operator in
+    ``test_fem_nonnodal_sparse_assembly.py``.)"""
     d, (xi, yi, zi), (ui, vi), (cu, cv) = _n1e_cube(0.6)
     a = jno.np.parameter((), name="a").initialize(jax.nn.initializers.constant(2.0))  # a runtime parameter in ε
-    with pytest.raises(NotImplementedError, match="complex non-nodal.*parametric"):
-        jno.fem([inner(cu, cv) + 1j * a * inner(ui, vi)]).A
+    op_r, op_i = jno.fem([inner(cu, cv) + 1j * a * inner(ui, vi)]).operator  # complex → two parametric legs
+    assert op_r.operator_fn({"a": 2.0}) is not None
+    A_i = op_i.operator_fn({"a": 2.0})
+    A_i = jnp.asarray(A_i.todense() if hasattr(A_i, "todense") else A_i)
+    assert float(jnp.abs(A_i).sum()) > 0.0, "the imaginary leg is empty — Im ε was dropped"
