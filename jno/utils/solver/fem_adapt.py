@@ -1036,7 +1036,16 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
         eta, est = zz_error_indicators(d, u)
         n_dofs = int(np.asarray(d.mesh.points).shape[0])
         marked = None if spec.anisotropic else dorfler_mark(eta, spec.theta)
-        history.append({"n_dofs": n_dofs, "estimate": est, "n_marked": None if marked is None else int(marked.size)})
+        _rec_cells, _ = _mesh_cells(d)  # points/cells: for a refinement animation (connectivity changes each round)
+        history.append(
+            {
+                "n_dofs": n_dofs,
+                "estimate": est,
+                "n_marked": None if marked is None else int(marked.size),
+                "points": np.asarray(d.mesh.points)[:, : int(d.dimension)].copy(),
+                "cells": np.asarray(_rec_cells).copy(),
+            }
+        )
 
         # eps: the estimate stopped improving (plateau) for _EPS_PATIENCE rounds
         if spec.eps is not None and prev_est is not None:
@@ -1247,7 +1256,7 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
         else:
             break  # at the mesh-quality limit -- no admissible step
         arrs = cand
-        history.append({"step": it, "energy": float(e)})
+        history.append({"step": it, "energy": float(e), "points": _moved(arrs)})  # points: for a relocation animation
 
     final = _moved(arrs)
     if _min_detj(final) <= 0.0:  # fail loud rather than hand back / re-solve on a tangled mesh

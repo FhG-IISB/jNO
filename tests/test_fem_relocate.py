@@ -58,6 +58,9 @@ def test_relocate_reduces_energy_and_stays_valid():
 
     assert len(hist) >= 5, "relocation should take several steps"
     assert hist[-1]["energy"] < hist[0]["energy"], "relocation must reduce the FE energy"
+    # each step records the moved vertices (so a relocation run can be animated); the last is the final mesh
+    assert hist[0]["points"].shape == (n0, 2)
+    assert np.allclose(hist[-1]["points"], pts_r), "the last recorded mesh should be the final relocated mesh"
     assert len(pts_r) == n0 and sol.shape[0] == n0, "r-adaptivity adds no DOFs (fixed connectivity)"
     assert _min_detj(pts_r, cells) > 0.0, "the relocated mesh must stay valid (no inverted elements)"
     assert np.linalg.norm(pts_r - pts0) > 1e-3, "the interior vertices should actually move toward the feature"
