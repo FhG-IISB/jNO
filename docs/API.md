@@ -174,6 +174,31 @@ or per script via `jno.setup(__file__, diff_type="forward")`. Per-call
 
 ---
 
+## Solvers and preconditioners
+
+`jno.solve` and `jno.precond` are the slots that `fem.solve(linear=…, nonlinear=…,
+precond=…, time=…)` composes (see the [FEM guide](fem.md)). The families:
+
+| Kind | `jno.solve` |
+| --- | --- |
+| **Linear — direct** | `lu` (sparse LU), `dense` |
+| **Linear — iterative (Krylov)** | `cg`, `bicgstab`, `gmres`, `fgmres`, `minres`; `lstsq` (LSQR, least-squares); `chebyshev` (polynomial) |
+| **Linear — multigrid** | `amg` (GPU AMG / NVIDIA AmgX via jaxamg) |
+| **Nonlinear** | `newton`, `picard` |
+| **Eigenproblem** | `eigs` (generalized `Kx = λMx`) |
+| **Matrix functions** (stochastic Lanczos, matrix-free) | `logdet`, `trace`, `applyfun` (`f(A)·v`), `diagonal` |
+| **Time integration** | `theta` (θ-method), `exponential` (exponential integrator) |
+
+**Preconditioners** (`jno.precond`, for the iterative solvers): `jacobi`, `chebyshev`,
+`amg`, `ams` (H(curl) auxiliary-space Maxwell), `form` (weak-form auxiliary operator),
+`inner` (any solver as `M⁻¹`), `block_diag` / `triangular` (block / Schur), and `cached`.
+
+::: jno.solve
+
+::: jno.precond
+
+---
+
 ## Tracing primitives
 
 Most users never instantiate these directly — they are what the
