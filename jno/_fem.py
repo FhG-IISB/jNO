@@ -1325,12 +1325,15 @@ class FEM:
                 return run_adaptive_transient(
                     self, adapt, solve_fn=solve_fn, nonlinear=nonlinear, linear=linear, precond=precond, **kwargs
                 )
-            if self._mode in ("complex", "complex_transient"):
+            if self._mode == "complex_transient":
                 raise NotImplementedError(
-                    "fem.solve(adapt=...) on a complex / complex-transient problem is not supported yet "
-                    "(the Hessian metric and ZZ estimator are real-only). Solve the real-equivalent form, "
-                    "or adapt a real reference mesh first."
+                    "fem.solve(adapt=...) on a complex-transient problem is not supported yet (its assembly "
+                    "builds static real Re/Im blocks that do not thread a remesh). Solve the real-equivalent "
+                    "form, or adapt a real reference mesh first."
                 )
+            # A steady COMPLEX problem adapts via the ISOTROPIC ZZ estimator, which uses the modulus of the
+            # (complex) recovered-gradient gap; only the anisotropic Hessian metric is real-only (guarded in
+            # run_adaptive_solve). complex-transient stays out (its Re/Im block assembly can't remesh).
             return run_adaptive_solve(self, adapt, solve_fn=solve_fn, **kwargs)
         if has_slots:
             solve_fn, kwargs = self._compose_slots(
