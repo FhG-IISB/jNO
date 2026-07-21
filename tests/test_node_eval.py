@@ -105,3 +105,19 @@ def test_parameter_preserves_declared_1d_shape():
         p = jno.np.parameter(shape, name=f"p_{'x'.join(map(str, shape))}")
         got = np.asarray(jno.core([p], domain=dom).eval(p)).shape
         assert got == shape, f"parameter({shape}) evaluated to {got}, expected {shape}"
+
+
+def test_field_parameter_keeps_channel_axis():
+    """A NODAL FIELD parameter ``jno.np.parameter(<symbol>)`` evaluates to ``(N, 1)`` -- the SAME channel
+    axis a pointwise network carries -- so ``network * field_parameter`` composes elementwise instead of
+    broadcasting into a spurious ``(N, N)`` outer product. Collapsing it to ``(N,)`` (as a *bare* parameter
+    must, see :func:`test_parameter_preserves_declared_1d_shape`) broke an eps coefficient
+    ``network * f(field_param)`` in :mod:`jno.rcwa` -- an ``N**2`` boolean-index crash downstream. The two
+    tests pin the two halves of the convention: bare parameters keep ``(N,)``, field parameters keep the
+    channel axis."""
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain()
+    _, phi = d.fem_symbols()
+    n = len(d.mesh.points)
+    rho = jno.np.parameter(phi, name="rho")  # one trainable value per mesh node
+    got = np.asarray(jno.core([rho], domain=d).eval(rho)).shape
+    assert got == (n, 1), f"field parameter evaluated to {got}, expected {(n, 1)} (channel axis kept)"

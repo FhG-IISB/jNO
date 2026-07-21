@@ -653,10 +653,15 @@ class TraceEvaluator:
             result = result.output
 
         # A pointwise network maps coordinates -> per-point values; give it the (N, 1) channel axis the
-        # downstream ops expect. A bare jno.np.parameter has no coordinate input, so it must keep its
-        # declared shape -- `parameter((N,))` evaluates to (N,), not a spurious (N, 1) (which broke, e.g.,
-        # building a geometry functional from coordinate parameters for crux-driven r-adaptivity).
-        if result.ndim == 1 and result.shape[0] > 1 and not getattr(flax_mod, "_is_parameter", False):
+        # downstream ops expect. A NODAL FIELD parameter (``jno.np.parameter(<symbol>)``) is that same
+        # per-point field kind, so it must ALSO carry the channel axis -- otherwise a (N,) parameter
+        # broadcasts against an (N, 1) coefficient field/network into a spurious (N, N) outer product (this
+        # broke an eps coefficient built as ``network * f(field_parameter)`` in jno.rcwa). Only a BARE
+        # parameter (``jno.np.parameter((N,))``, e.g. a trainable mesh-coordinate leaf) has no field/
+        # coordinate nature, so it keeps its declared shape -- ``parameter((N,))`` evaluates to (N,), not a
+        # spurious (N, 1) (needed for building a geometry functional from coordinate parameters).
+        _bare_parameter = getattr(flax_mod, "_is_parameter", False) and getattr(flax_mod, "_fem_field", None) is None
+        if result.ndim == 1 and result.shape[0] > 1 and not _bare_parameter:
             result = result[:, jnp.newaxis]
 
         return result
