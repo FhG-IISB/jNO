@@ -1163,9 +1163,9 @@ def test_dirichlet_net_recovers_bc_profile():
 
 def test_dirichlet_net_scope_guards():
     """A bare net(x) essential value is supported as a Dirichlet profile (steady / nonlinear /
-    linear-transient) and as a linear-transient initial condition; the remaining cases fail loud: a
-    compound value (Dirichlet or IC), and a net Dirichlet on a *nonlinear transient* form (the nonlinear
-    stepper still holds a static value)."""
+    linear-transient / nonlinear-transient) and as a linear-transient initial condition; the remaining
+    cases fail loud: a compound value (Dirichlet or IC), and a net *initial condition* on a nonlinear
+    transient form (state0_fn threads only the linear stepper)."""
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.3)
     u, phi = d.fem_symbols()
     xi, yi, _ = d.variable("interior", split=True)
@@ -1189,15 +1189,17 @@ def test_dirichlet_net_scope_guards():
             ]
         )
 
-    # net Dirichlet on a NONLINEAR transient form: rejected (static value in the nonlinear stepper)
+    # net INITIAL CONDITION on a NONLINEAR transient form: rejected (state0_fn threads only the linear
+    # stepper). The net *Dirichlet* on a nonlinear transient IS supported — see
+    # test_dirichlet_net_nonlinear_transient_matches_const_and_differentiates.
     d3, u3, phi3, (x3, y3), (xb3, yb3), ci3, u3i, v3i, u03 = _transient_setup(mesh_size=0.4, time=(0.0, 0.02, 3))
     net3 = _mlp_net(key=44)
     with pytest.raises(NotImplementedError, match="nonlinear transient"):
         jno.fem(
             [
                 u3i.t * v3i + (1.0 + u3i**2) * (u3i.x * v3i.x + u3i.y * v3i.y),
-                u3(xb3, yb3) - net3(xb3, yb3),
-                u3(ci3[0], ci3[1]) - u03,
+                u3(xb3, yb3) - 0.0,
+                u3(ci3[0], ci3[1]) - net3(ci3[0], ci3[1]),
             ]
         )
 
@@ -1285,6 +1287,36 @@ def test_dirichlet_net_transient_matches_const_and_differentiates():
     nodes = np.asarray(d.built_mesh.points)[:, :2]
     onb = np.isclose(nodes[:, 0], 0) | np.isclose(nodes[:, 0], 1) | np.isclose(nodes[:, 1], 0) | np.isclose(nodes[:, 1], 1)
     assert float(np.max(np.abs(np.asarray(traj)[-1, onb] - c))) < 1e-7
+
+    # differentiable in the Dirichlet weights
+    g = jax.grad(lambda module: jnp.sum(_default_transient_integrate(fem.operator, {name: module}, ts)))(net.module)
+    assert jnp.isfinite(g.c) and abs(float(g.c)) > 1e-6
+
+
+def test_dirichlet_net_nonlinear_transient_matches_const_and_differentiates():
+    """Net-valued Dirichlet ``u(∂Ω) - net(xb, yb)`` on a NONLINEAR TRANSIENT form
+    ``u_t v + (1 + u²)∇u·∇v``: the nonlinear stepper's row-replacement now re-forms the held value from
+    the net weights each Newton residual, so a constant-output net reproduces the constant-Dirichlet
+    trajectory to solver tolerance, and the trajectory is differentiable in the Dirichlet weights."""
+    from jno.utils.solver.backend_blocks import _default_transient_integrate
+
+    d, u, phi, (xi, yi), (xb, yb), ci, ui, vi, u0 = _transient_setup(mesh_size=0.3, time=(0.0, 0.03, 4))
+    c = 0.4
+    net = _const_net(c)
+    fem = jno.fem([ui.t * vi + (1.0 + ui**2) * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - net(xb, yb), u(ci[0], ci[1]) - u0])
+    assert fem.is_transient and not fem.is_linear  # a nonlinear transient (Newton per step)
+    (name,) = fem.operator.runtime_parameter_exprs
+    assert isinstance(fem.operator.runtime_parameter_exprs[name], ModelWeights)
+    ts = _grid_ts(fem.operator)
+    traj = _default_transient_integrate(fem.operator, {name: net.module}, ts)
+
+    # oracle: the identical nonlinear transient with a constant Dirichlet value c
+    d2, u2, phi2, (x2, y2), (xb2, yb2), ci2, u2i, v2i, u02 = _transient_setup(mesh_size=0.3, time=(0.0, 0.03, 4))
+    fem_c = jno.fem(
+        [u2i.t * v2i + (1.0 + u2i**2) * (u2i.x * v2i.x + u2i.y * v2i.y), u2(xb2, yb2) - c, u2(ci2[0], ci2[1]) - u02]
+    )
+    traj_c = _default_transient_integrate(fem_c.operator, {}, ts)
+    assert float(jnp.max(jnp.abs(traj - traj_c))) < 1e-7
 
     # differentiable in the Dirichlet weights
     g = jax.grad(lambda module: jnp.sum(_default_transient_integrate(fem.operator, {name: module}, ts)))(net.module)

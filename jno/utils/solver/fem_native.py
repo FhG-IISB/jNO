@@ -1707,30 +1707,53 @@ def assemble_fem_native(
         # every spatial term is linear — the mass action lives in the residual there (``mass_residual``).
         nonlinear = _nonlinear_mass or any(_is_obviously_nonlinear_in_unknown(domain, t) for t in spatial)
         if nonlinear:
-            if _dir_net_models:
-                raise NotImplementedError(
-                    "jno.fem: a net-valued Dirichlet u(region) - net(x) on a *nonlinear transient* form is not "
-                    "wired yet (the nonlinear stepper's row-replacement uses a static value). Use a linear "
-                    "transient form (a net Dirichlet threads there) or a nonlinear steady form."
-                )
             if _ic_net_models:
                 raise NotImplementedError(
                     "jno.fem: a net-valued initial condition u(initial) - net(x) on a *nonlinear transient* "
                     "form is not wired yet (state0_fn threads only the linear stepper). Use a linear "
                     "transient form (a net IC threads there)."
                 )
+            if _dir_net_models and _nonlinear_mass:
+                raise NotImplementedError(
+                    "jno.fem: a net-valued Dirichlet with a state-dependent (nonlinear) mass c(u)·u_t on a "
+                    "transient form is not supported (the mass residual holds a static Dirichlet dof set). "
+                    "Use a linear/parametric mass."
+                )
 
-            # Row-replacement Dirichlet (constant g), threaded through the runtime time t AND the
-            # runtime args so a time-dependent / parametric spatial coefficient is re-evaluated each step.
-            def res_bc(u, t, args=None, _d=d_dofs, _g=d_vals):
-                R = spatial_res(jnp.asarray(u), t, args)
-                return R if _d is None else R.at[_d].set(jnp.asarray(u)[_d] - _g)
+            if _dir_net_models:
+                # net-valued Dirichlet u(∂Ω) - net(x): the held value is re-formed from the net weights each
+                # Newton residual (mirrors the nonlinear STEADY path ``res_p``); the dof set is static, only
+                # the held values ride the weights, and ``∂/∂weights`` flows through the step's custom_root.
+                _tnpd = jnp.asarray(
+                    [p[0] for p in _dirichlet_pairs_at({n: m.module for n, m in _dir_net_models.items()})],
+                    dtype=jnp.int32,
+                )
 
-            def jac_bc(u, t, args=None, _d=d_dofs):
-                J = spatial_jac(jnp.asarray(u), t, args)
-                return J if _d is None else bcoo_set_dirichlet_rows(J, _d)
+                def _tnp_hold(args):
+                    return jnp.stack([jnp.asarray(p[1]).reshape(()) for p in _dirichlet_pairs_at(args)])
 
-            M_bc = M if d_dofs is None else bcoo_zero_rows_cols(M, d_dofs)
+                def res_bc(u, t, args=None, _d=_tnpd):
+                    R = spatial_res(jnp.asarray(u), t, args)
+                    return R.at[_d].set(jnp.asarray(u)[_d] - _tnp_hold(args))
+
+                def jac_bc(u, t, args=None, _d=_tnpd):
+                    return bcoo_set_dirichlet_rows(spatial_jac(jnp.asarray(u), t, args), _d)
+
+                _mdofs = _tnpd
+            else:
+                # Row-replacement Dirichlet (constant g), threaded through the runtime time t AND the
+                # runtime args so a time-dependent / parametric spatial coefficient is re-evaluated each step.
+                def res_bc(u, t, args=None, _d=d_dofs, _g=d_vals):
+                    R = spatial_res(jnp.asarray(u), t, args)
+                    return R if _d is None else R.at[_d].set(jnp.asarray(u)[_d] - _g)
+
+                def jac_bc(u, t, args=None, _d=d_dofs):
+                    J = spatial_jac(jnp.asarray(u), t, args)
+                    return J if _d is None else bcoo_set_dirichlet_rows(J, _d)
+
+                _mdofs = d_dofs
+
+            M_bc = M if _mdofs is None else bcoo_zero_rows_cols(M, _mdofs)
             return (
                 SemidiscreteTimeBlock(
                     # A state-dependent mass carries no fixed matrix; the mass action is in mass_residual.
