@@ -907,7 +907,11 @@ def _solve_complex_transient(blocks: Any, save_ts: Any = None, periodic: Optiona
         t0, t1, dt = float(br.t0), float(br.t1), float(br.dt)
         grid = jnp.linspace(t0, t1, max(1, round((t1 - t0) / dt)) + 1)
         fr, fi = br.forcing_vector_fn, bi.forcing_vector_fn
-        sysmat = M_blk + dt * A_blk  # time-independent block operator: factor once, reuse across steps
+        # Time-independent block operator: LU-factor it ONCE here, not on every step. `jnp.linalg.solve`
+        # inside the scan re-factors each iteration (O(n³) per step); `lu_factor` once + `lu_solve` per
+        # step is O(n³) once + O(n²) per step. Both are differentiable, so ∂traj/∂args (the parametric
+        # inverse) flows through the factorization for a runtime parameter in the operator.
+        lu = jax.scipy.linalg.lu_factor(M_blk + dt * A_blk)
 
         def step(w, t_next):  # backward Euler: (M_blk + dt A_blk) w_next = M_blk w + dt (c_blk + f)
             rhs = M_blk @ w + dt * c_blk
@@ -915,7 +919,7 @@ def _solve_complex_transient(blocks: Any, save_ts: Any = None, periodic: Optiona
                 f_r = jnp.asarray(fr(t_next, args)).reshape(-1) if fr is not None else jnp.zeros((n,), c_blk.dtype)
                 f_i = jnp.asarray(fi(t_next, args)).reshape(-1) if fi is not None else jnp.zeros((n,), c_blk.dtype)
                 rhs = rhs + dt * jnp.concatenate([f_r, f_i])
-            w_next = jnp.linalg.solve(sysmat, rhs)
+            w_next = jax.scipy.linalg.lu_solve(lu, rhs)
             return w_next, w_next
 
         _, ws = jax.lax.scan(step, w0, grid[1:])
