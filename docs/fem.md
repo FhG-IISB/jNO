@@ -308,6 +308,55 @@ component** with scalar functions (a single function returning a tuple hits a ke
 
 ---
 
+## Differentiable mesh geometry — trainable coordinates (`.trainable()`)
+
+Any placeholder promotes to a `jno.np.parameter` seeded at its current values with **`.trainable()`** —
+an existing coefficient / data tag becomes an inverse unknown in one call:
+
+```python
+k = domain.variable("kappa", sample=k0).trainable()   # trainable coefficient, seeded at k0
+```
+
+Called on a **spatial coordinate** (`domain.variable(region)`), `.trainable()` makes that region's **mesh
+vertices** a design variable — the map from node positions to the solution is differentiable, so a solve
+can be optimized *with respect to the mesh itself* (mesh relocation / r-adaptivity / shape optimization),
+all in one JAX graph:
+
+```python
+xi, yi, _ = domain.variable("core", split=True)   # a where= / predicate sub-region
+Xx = xi.trainable()                                # ONLY the x-positions of the core vertices move
+#   differentiating a solve now yields the shape derivative ∂(solve)/∂X
+```
+
+The spelling is **literal, per component** (`x.trainable()` moves only x; call it per axis for full
+motion — which also gives constrained relocation for free, e.g. promote only the tangential component on a
+slip plane). Under the hood the coordinate parameter scatters into the assembly's P1 geometry *before* the
+element Jacobian is formed, so `J`, `JxW`, the physical gradients, the quadrature-point coordinates **and
+the boundary-facet normals** all become differentiable in the node positions. Scope: nodal-Lagrange volume
++ Neumann/Robin terms, 2D triangle / 3D tet, steady. The mesh **connectivity is fixed** — this is
+*relocation*, not remeshing (h-remeshing stays the non-differentiable outer AFEM loop); it is differentiable
+on valid meshes, with element inversion (tangling) the boundary of that regime.
+
+**r-adaptivity in one call.** Tagging coordinates `.trainable()` and driving the relocation yourself is the
+low-level path; the packaged form reuses the **same `adapt=` slot** as h-refinement:
+
+```python
+xm, ym, _ = domain.variable("core", where=interior, split=True)
+xm.trainable(); ym.trainable()                              # BEFORE jno.fem(...)
+u = fem.solve(adapt=jno.AdaptSpec(relocate=True, max_iters=60))
+```
+
+`AdaptSpec(relocate=True)` descends the FE energy through the differentiable solve with a **backtracking
+`det J` line search** — so the fixed node set concentrates at solution features and the mesh never tangles
+(the validity constraint lives in the step control; a stock optimiser or an energy barrier alone cannot
+guarantee it on a stiff problem — see `run_adaptive_relocate`). It mutates the domain to the relocated mesh,
+returns the solution there, and **raises** if no coordinate was tagged. Works across **linear, nonlinear
+(Newton), transient (relocates for the whole trajectory via a time-averaged objective), periodic, and
+complex** problems, scalar or vector — the energy sums over every solution block, so a complex field's real
+and imaginary parts both contribute. Only complex-*transient* is not wired yet.
+
+---
+
 ## Per-region (sub-domain) integration
 
 A weak term integrates over the **region of the coordinates it is written on** — exactly the rule that

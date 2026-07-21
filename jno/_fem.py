@@ -1300,6 +1300,11 @@ class FEM:
 
             return run_moving_boundary(self, move, solve_fn=solve_fn, **kwargs)
         if adapt is not None:
+            if getattr(adapt, "relocate", False):
+                # r-adaptivity: relocate the .trainable() vertices (fixed connectivity), not h-refinement.
+                from .utils.solver.fem_adapt import run_adaptive_relocate
+
+                return run_adaptive_relocate(self, adapt, solve_fn=solve_fn, **kwargs)
             # x0= (warm start) and time= do not compose with a remesh — the DOF layout changes across it,
             # staling a warm start and any cached step operator. The nonlinear=/linear=/precond= slots DO
             # compose: they configure the per-step (Newton / theta) solve, which is layout-independent —
@@ -3117,6 +3122,16 @@ def fem(
         from .utils.solver.fem_native import assemble_fem_native
         from .utils.solver.time_route import _infer_time_window, _strip_temporal_trial_derivative
         from .utils.solver.weak_form import _apply_sign, _split_additive_terms
+
+        if getattr(domain, "_trainable_coords", None):
+            # The complex-transient path densifies static real Re/Im blocks (M, A_r, A_i) and does not thread
+            # runtime parameters, so it cannot carry a trainable mesh coordinate (fail loud rather than let the
+            # parametric assembler output be unpacked as a plain matrix below).
+            raise NotImplementedError(
+                "jno.fem: a complex-transient problem cannot carry a trainable mesh coordinate "
+                "(Variable.trainable()) yet — its assembly builds static real Re/Im blocks. Relocate a complex "
+                "*steady* problem (supported via the real 2N linear path) or a real transient problem instead."
+            )
 
         mass_stripped, spatial_raw = [], []
         for bare in volume_terms:

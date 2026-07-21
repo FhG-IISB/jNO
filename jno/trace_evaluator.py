@@ -652,7 +652,11 @@ class TraceEvaluator:
         if hasattr(result, "output"):
             result = result.output
 
-        if result.ndim == 1 and result.shape[0] > 1:
+        # A pointwise network maps coordinates -> per-point values; give it the (N, 1) channel axis the
+        # downstream ops expect. A bare jno.np.parameter has no coordinate input, so it must keep its
+        # declared shape -- `parameter((N,))` evaluates to (N,), not a spurious (N, 1) (which broke, e.g.,
+        # building a geometry functional from coordinate parameters for crux-driven r-adaptivity).
+        if result.ndim == 1 and result.shape[0] > 1 and not getattr(flax_mod, "_is_parameter", False):
             result = result[:, jnp.newaxis]
 
         return result

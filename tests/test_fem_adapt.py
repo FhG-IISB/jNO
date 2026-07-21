@@ -211,6 +211,8 @@ def test_fem_solve_adapt_drives_loop_and_rebinds():
     assert 1 <= len(hist) <= 3
     dofs = [h["n_dofs"] for h in hist]
     assert dofs == sorted(dofs)
+    # each record also carries that round's mesh (points/cells) so an adapt run can be animated
+    assert hist[0]["points"].shape == (dofs[0], 2) and hist[0]["cells"].shape[1] == 3
 
 
 def _poisson_on(d, alpha):
