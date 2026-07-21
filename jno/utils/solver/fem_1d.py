@@ -70,11 +70,24 @@ def _region_node_ids(domain: Any, region: str) -> List[int]:
     pts = jnp.asarray(domain.mesh.points)
     n = int(pts.shape[0])
     num_args = loc.__code__.co_argcount if hasattr(loc, "__code__") else 1
-    if num_args == 1:
-        hits = jax.vmap(loc)(pts)
+
+    # Map over the points in CHUNKS, not all at once. A geometric region predicate
+    # (`BoundaryRegion.contains`) tests ONE point against every boundary facet, so vmapping it over the
+    # whole mesh materialises an (n_points x n_facets) intermediate -- on a realistic 3-D mesh that is
+    # 11820 x 8502 f64 = 804 MB, which exhausts the device before the problem is even assembled.
+    # Chunking bounds the peak at O(chunk x n_facets) and the result is identical (a pointwise predicate
+    # does not couple points). This runs eagerly (the caller wants concrete ids), so the Python loop is free.
+    chunk = 512
+
+    def _eval(lo, hi):
+        blk = pts[lo:hi]
+        return jax.vmap(loc)(blk) if num_args == 1 else jax.vmap(loc)(blk, jnp.arange(lo, hi))
+
+    if n <= chunk:
+        hits = np.asarray(_eval(0, n)).reshape(-1)
     else:
-        hits = jax.vmap(loc)(pts, jnp.arange(n))
-    return list(np.where(np.asarray(hits).reshape(-1))[0])
+        hits = np.concatenate([np.asarray(_eval(s, min(s + chunk, n))).reshape(-1) for s in range(0, n, chunk)])
+    return list(np.where(hits)[0])
 
 
 def _dirichlet_dofs(domain: Any, dirichlet_values: Dict[str, Any], vec: int) -> List[Tuple[int, float]]:
