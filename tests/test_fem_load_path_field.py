@@ -132,3 +132,37 @@ def test_frame_count_mismatch_fails_loud():
     )
     with pytest.raises(ValueError, match="frames|load step"):
         np.asarray(fem.solve())
+
+
+def test_vector_load_path_field_matches_analytic_in_tau():
+    """A VECTOR load-path field (``frames`` of shape ``(nstep, n_nodes, 3)``) delivers its per-step
+    vec-slice through the same march. Driving the eigenstrain scalar ``theta = gx + gy + gz`` from a linear
+    vector field reproduces the SAME march written with that field analytically-in-tau, to machine
+    precision (P1 node->quad interpolation is exact for a linear field) -- proving all THREE components are
+    delivered and interpolated correctly across the load-step scan."""
+    nstep = 11
+    tau_pts = np.linspace(0.0, 1.0, nstep)
+    vec3, inner = jno.np.vector, jno.np.inner
+    ones = vec3(1.0, 1.0, 1.0)  # theta = g . (1,1,1) = gx+gy+gz, contracted without component indexing
+
+    def theta_analytic(X, tau):  # theta from a linear vector field g(X, tau)
+        return inner(vec3(tau * X[2], 0.5 * tau * X[0], (1.0 / 3.0) * tau * X[1]), ones)
+
+    traj_analytic, d = _march(theta_analytic, nstep)
+
+    # the same vector field as a load-path field: frames[k] = tau_k * (z, x/2, y/3) sampled at the nodes
+    nodes = np.asarray(d.mesh.points)[:, :3]
+    base = np.stack([nodes[:, 2], 0.5 * nodes[:, 0], (1.0 / 3.0) * nodes[:, 1]], axis=1)  # (n_nodes, 3)
+    frames = np.stack([t * base for t in tau_pts])  # (nstep, n_nodes, 3)
+
+    def theta_path(X, tau):
+        G = d.fem_symbols(value_shape=(3,), names=("Gpath", "w"))[0]
+        g = G.bind(x=X[0], y=X[1], z=X[2]).freeze_path(frames)  # (nstep, n_nodes, 3) vector load-path field
+        return inner(g, ones)
+
+    traj_path, _ = _march(theta_path, nstep)
+
+    assert traj_path.shape == traj_analytic.shape
+    err = np.abs(traj_path - traj_analytic).max()
+    assert err < 1e-9, f"vector load-path field vs analytic-in-tau march differ by {err:.2e} (should be ~0)"
+    assert np.abs(traj_analytic).max() > 1e-4  # non-trivial deformation (a real oracle)

@@ -3614,14 +3614,19 @@ class LoadPathField(FrozenField):
 
     def __init__(self, source, frames, domain=None, coord_tag=None):
         frames = jnp.asarray(frames)
-        if frames.ndim != 2:
+        _nc = 1
+        for s in tuple(getattr(source, "value_shape", ())):
+            _nc *= int(s)
+        # scalar field: (n_load_steps, n_nodes); VECTOR field: (n_load_steps, n_nodes, vec).
+        if not (frames.ndim == 2 or (frames.ndim == 3 and _nc > 1 and int(frames.shape[-1]) == _nc)):
             raise ValueError(
-                f"freeze_path expects `frames` of shape (n_load_steps, n_nodes); got {tuple(frames.shape)}. "
+                f"freeze_path expects `frames` of shape (n_load_steps, n_nodes) for a scalar field or "
+                f"(n_load_steps, n_nodes, vec) for a vector field; got {tuple(frames.shape)}. "
                 "Stack one nodal field per load step of the tau= grid."
             )
         # values[0] seeds the FrozenField shape data / identity; the driver overrides it per step.
         super().__init__(source, frames[0], domain=domain, coord_tag=coord_tag)
-        self.path_frames = frames  # (n_load_steps, n_nodes) — the driver scans this leading axis
+        self.path_frames = frames  # (n_load_steps, n_nodes[, vec]) — the driver scans this leading axis
         self.n_steps = int(frames.shape[0])
         self.name = f"loadpath[{getattr(source, 'name', 'u')}]"
 
