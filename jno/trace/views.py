@@ -503,6 +503,18 @@ class VectorView(_DelegatesToPlaceholder):
         view = VectorView(FrozenField(self._expr, values, domain=domain, coord_tag=coord_tag))
         return _coords_dispatch(view, (), dict(cv)) if cv else view
 
+    def freeze_path(self, frames) -> "VectorView":
+        """Like :meth:`freeze`, but the pinned VECTOR nodal values vary **per load step** of a
+        ``domain(tau=...)`` march: ``frames`` has shape ``(n_load_steps, n_nodes, vec)`` and at step ``k``
+        the field presents ``frames[k]`` at the quadrature points -- the vector analogue of
+        :meth:`ScalarView.freeze_path` (e.g. a prescribed per-step field driving an eigenstrain / a
+        one-way coupling). See :class:`jno.trace.LoadPathField`."""
+        from . import LoadPathField
+
+        cv, domain, coord_tag = self._frozen_domain_tag()
+        view = VectorView(LoadPathField(self._expr, frames, domain=domain, coord_tag=coord_tag))
+        return _coords_dispatch(view, (), dict(cv)) if cv else view
+
     @property
     def complex(self) -> "ComplexVectorView":
         """Reinterpret this vector field as a **complex vector** ``[..., d, 2]`` (last axis =

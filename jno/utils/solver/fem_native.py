@@ -886,8 +886,8 @@ def assemble_fem_native(
                 "unknown order=1 (P1)."
             )
         for _fid, _fnode in _path_nodes.items():
-            if _fnode.num_components != 1:
-                raise NotImplementedError("freeze_path(frames): only scalar load-path fields are supported.")
+            # scalar and VECTOR load-path fields both borrow the P1 nodal basis (per-component interpolation
+            # uses the same shape functions); the driver delivers the per-step slice (n_nodes[, vec]).
             field_index[_fnode.field_key] = _p1_idx  # resolve the load-path field's basis to the P1 field
             _path_conn[_fid] = cells_f_j[_p1_idx]  # scalar P1 vertex connectivity (n_cell, n_local)
             path_specs[_fid] = {"name": _fnode.name, "frames": jnp.asarray(_fnode.path_frames), "n_steps": _fnode.n_steps}
