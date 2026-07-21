@@ -432,3 +432,75 @@ def test_second_order_in_time_region_fails_loud():
                 ui0.t - 0.0,
             ]
         )
+
+
+# ==========================================================================
+# per-region integration on the NON-NODAL (N1E) path
+#
+# The non-nodal assembler never threaded the per-cell region mask, so any per-region term on an
+# N1E/RT form hit `fem_utils`' loud NotImplementedError. That blocked the natural way to write a
+# multi-material vector-Maxwell cell (a-Si pillar / substrate / air, each with its own eps) on one
+# conforming mesh.
+# ==========================================================================
+def _n1e_nested_box(mesh_size=0.16):
+    """Three STRICTLY INTERIOR nested regions on a tet mesh. Interior matters: a region that touches the
+    outer boundary also registers as a boundary region, and the shared classifier then reads a volume term
+    on it as a (face-less) surface term -- a pre-existing property of `jno.fem`, unrelated to N1E."""
+    c0 = (0.5, 0.5, 0.5)
+    r2 = lambda x, y, z: (x - c0[0]) ** 2 + (y - c0[1]) ** 2 + (z - c0[2]) ** 2  # noqa: E731
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=mesh_size).domain()
+    d.tag("core", lambda x, y, z: r2(x, y, z) < 0.22**2)
+    d.tag("shell", lambda x, y, z: (r2(x, y, z) >= 0.22**2) & (r2(x, y, z) < 0.36**2))
+    d.tag("both", lambda x, y, z: r2(x, y, z) < 0.36**2)
+    u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
+    xi, yi, zi, _ = d.variable("interior", split=True)
+    b = lambda s, nm: s.bind(**dict(zip("xyz", d.variable(nm, split=True)[:3])))  # noqa: E731
+    return (
+        (u.bind(x=xi, y=yi, z=zi), v.bind(x=xi, y=yi, z=zi)),
+        {nm: (b(u, nm), b(v, nm)) for nm in ("core", "shell", "both")},
+        (u.vector.curl(xi, yi, zi), v.vector.curl(xi, yi, zi)),
+    )
+
+
+def _dense_A(fem):
+    A = fem.A
+    return np.asarray(jnp.asarray(A.todense() if hasattr(A, "todense") else A))
+
+
+def test_per_region_n1e_assembles_and_restricts():
+    """It assembles at all -- this used to raise `NotImplementedError` from `fem_utils` because the
+    non-nodal assembler never threaded the per-cell mask -- and the restriction genuinely bites."""
+    inner3 = jno.np.inner
+    (ui, vi), reg, (cu, cv) = _n1e_nested_box()
+    uc, vc = reg["core"]
+    whole = _dense_A(jno.fem([inner3(cu, cv), 1.0 * inner3(ui, vi)]))
+    cored = _dense_A(jno.fem([inner3(cu, cv), 1.0 * inner3(ui, vi), 10.0 * inner3(uc, vc)]))
+    assert np.all(np.isfinite(cored))
+    assert np.max(np.abs(cored - whole)) > 1e-3, "per-region coefficient had no effect (mask not applied)"
+
+
+def test_per_region_n1e_nested_regions_are_exactly_additive():
+    """Exactness: `core` and `shell` partition `both` cell-for-cell, so the restricted MASS operators must
+    add to the `both` one entry for entry -- not merely approximately. That pins the mask to exactly the
+    right cells, not just to *some* cells. Assemble the shared curl-curl reference first and subtract it,
+    so what is compared is purely the region-restricted part."""
+    inner3 = jno.np.inner
+    c0 = (0.5, 0.5, 0.5)
+    r2 = lambda x, y, z: (x - c0[0]) ** 2 + (y - c0[1]) ** 2 + (z - c0[2]) ** 2  # noqa: E731
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.16).domain()
+    d.tag("core", lambda x, y, z: r2(x, y, z) < 0.22**2)
+    d.tag("shell", lambda x, y, z: (r2(x, y, z) >= 0.22**2) & (r2(x, y, z) < 0.36**2))
+    d.tag("both", lambda x, y, z: r2(x, y, z) < 0.36**2)
+    u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
+    xi, yi, zi, _ = d.variable("interior", split=True)
+    cu, cv = u.vector.curl(xi, yi, zi), v.vector.curl(xi, yi, zi)
+
+    K = _dense_A(jno.fem([inner3(cu, cv)]))  # the shared whole-domain reference
+    M = {}
+    for nm in ("core", "shell", "both"):
+        c = d.variable(nm, split=True)
+        ur, vr = u.bind(x=c[0], y=c[1], z=c[2]), v.bind(x=c[0], y=c[1], z=c[2])
+        M[nm] = _dense_A(jno.fem([inner3(cu, cv), 1.0 * inner3(ur, vr)])) - K
+
+    assert np.max(np.abs(M["both"])) > 0.0, "the union region contributed nothing -- mask is empty"
+    np.testing.assert_allclose(M["core"] + M["shell"], M["both"], atol=1e-10)

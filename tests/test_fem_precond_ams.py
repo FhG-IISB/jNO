@@ -236,3 +236,51 @@ def test_ams_needs_the_owning_fem():
     op = LinearOperator(jsparse.BCOO.fromdense(jnp.eye(n)))
     with pytest.raises(TypeError, match="owning FEM"):
         jno.precond.ams().materialize(PrecondContext(op, None))
+
+
+# ------------------------------------------------------------------------------------
+# Driven time-harmonic Maxwell with SURFACE-ONLY absorption (impedance / first-order ABC).
+#
+# The gradient auxiliary used to keep only ``Im A_G``, on the eddy-case reasoning that GᵀKG = 0 makes
+# A_G purely imaginary. For a driven wave problem that fails twice: Re A_G = -k₀²·GᵀεMG ≠ 0, and with
+# no volume loss ``Im A_G`` is a *boundary* mass — identically zero on every interior node, hence
+# singular. The aux solve returned garbage and the outer Krylov stalled at residual ~1 with NO error
+# (the ``GᵀAG ≈ 0`` guard does not catch it). Inverting the full complex A_G fixes it.
+# ------------------------------------------------------------------------------------
+def _driven_maxwell(mesh_size, k0, volume_loss=0.0):
+    """curl-curl − k₀²·mass, Silver–Müller impedance ABC on the whole boundary, plane-wave source."""
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=mesh_size).domain()
+    xi, yi, zi, _ = d.variable("interior", split=True)
+    u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
+    ui, vi = u.bind(x=xi, y=yi, z=zi), v.bind(x=xi, y=yi, z=zi)
+    cu, cv = u.vector.curl(xi, yi, zi), v.vector.curl(xi, yi, zi)
+    nb = d.variable("boundary", normals=True)
+    tu, tv = u.vector.cross(nb), v.vector.cross(nb)
+    cb = d.variable("boundary", split=True)
+    g = vec(1.0 + 0.0 * cb[0], 0.0 * cb[1], 0.0 * cb[2])
+    vol = inner(cu, cv) - k0**2 * inner(ui, vi)
+    if volume_loss:
+        vol = vol + 1j * volume_loss * inner(ui, vi)
+    return jno.fem([vol, 1j * k0 * inner(tu, tv), 2j * k0 * inner(g, tv)])
+
+
+@pytest.mark.parametrize("k0", [1.0, 3.0])
+def test_ams_driven_maxwell_surface_only_absorption(k0):
+    """The regression: with absorption ONLY on the boundary, AMS must actually solve the system. Before
+    the full-complex auxiliary this stalled silently — GMRES returned relative residual ~1 at every k₀."""
+    fem = _driven_maxwell(0.3, k0)
+    x_lu = _solve(fem)
+    spec = jno.precond.ams().build(fem)
+    x_ams = _solve(fem, linear=jno.solve.gmres(tol=1e-10, restart=60, maxiter=400), precond=spec)
+    rel = np.linalg.norm(x_ams - x_lu) / np.linalg.norm(x_lu)
+    assert rel < 1e-8, f"AMS did not solve the surface-absorbing wave problem (rel err {rel:.2e})"
+
+
+def test_ams_driven_maxwell_volume_loss_still_works():
+    """The other side of the fix: a volume imaginary mass (a physical ε'' — what a lossy dielectric
+    actually has) was the only case that worked before, and must keep working."""
+    fem = _driven_maxwell(0.3, 1.0, volume_loss=1e-3)
+    x_lu = _solve(fem)
+    spec = jno.precond.ams().build(fem)
+    x_ams = _solve(fem, linear=jno.solve.gmres(tol=1e-10, restart=60, maxiter=400), precond=spec)
+    assert np.linalg.norm(x_ams - x_lu) / np.linalg.norm(x_lu) < 1e-8

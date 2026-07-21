@@ -79,6 +79,11 @@ def _concrete(x):
     return not isinstance(x, jax.core.Tracer)
 
 
+# Relative spread below which a permittivity grid counts as uniform (see ``_eigensolve_stack._grid``).
+# Tight on purpose: the collapse is exact only for a genuinely constant layer, never a "nearly flat" one.
+_UNIFORM_RTOL = 1e-12
+
+
 _FMMAX_HINT = (
     "jno.rcwa needs the optional fmmax backend: pip install jax-neural-operators[rcwa] "
     "(or `pixi run -e rcwa ...`, or `pip install fmmax`)."
@@ -592,11 +597,40 @@ class Rcwa:
             g = jnp.asarray(g).astype(cdt)  # jax-native so a permittivity grid flows -> differentiable in ε
             return jnp.full((1, 1), g) if g.ndim == 0 else g
 
+        def _uniform_value(g):
+            """The single value of a CONCRETE, constant grid; ``None`` if it is patterned or traced.
+
+            Traced grids never collapse: under trace a "uniform" grid may be a design parameter that merely
+            starts flat (a topology-optimisation ρ initialised to a constant), and collapsing that would
+            freeze the design's structure out of the solve."""
+            if not _concrete(g) or g.size <= 1:
+                return None
+            a = np.asarray(g)
+            scale = max(float(np.abs(a).max()), 1.0)
+            if np.ptp(a.real) <= _UNIFORM_RTOL * scale and np.ptp(a.imag) <= _UNIFORM_RTOL * scale:
+                return a.reshape(-1)[0]
+            return None
+
+        def _collapse(gs):
+            """Collapse a layer's component grids to ``(1, 1)`` so fmmax takes its ANALYTIC uniform
+            eigensolve (in uniform media the eigenmodes are exactly the plane waves) instead of a dense
+            O((2·n_terms)³) eigendecomposition. ``detect_layers`` hands back a full ``(Ng, Ng)`` grid for
+            EVERY slab, so constant cladding / substrate / mirror films would otherwise each pay for one --
+            ruinous for a stack that is mostly uniform (a Bragg or Mo/Si multilayer). Exact, not an
+            approximation.
+
+            ALL-OR-NOTHING across the layer's components: fmmax requires every component of an anisotropic
+            layer to share one shape, so a partly-uniform tensor layer must stay fully patterned."""
+            vals = [_uniform_value(g) for g in gs]
+            if any(v is None for v in vals):
+                return gs
+            return [jnp.full((1, 1), v) for v in vals]
+
         def solve_layer(e):
             # general anisotropic layer: e = (ε_xx..ε_zz, μ_xx..μ_zz) -> ε AND μ tensors. Used for a uniaxial
             # PML (an in-plane coordinate stretch is a diagonal ε̂ and μ̂), and for magnetic / magneto-optic media.
             if isinstance(e, tuple) and len(e) == 10:
-                exx, exy, eyx, eyy, ezz, uxx, uxy, uyx, uyy, uzz = (_grid(c) for c in e)
+                exx, exy, eyx, eyy, ezz, uxx, uxy, uyx, uyy, uzz = _collapse([_grid(c) for c in e])
                 return fm.eigensolve_general_anisotropic_media(
                     jnp.asarray(wl),
                     kin,
@@ -616,11 +650,12 @@ class Rcwa:
                 )
             # anisotropic layer: e = (ε_xx, ε_xy, ε_yx, ε_yy, ε_zz) grids -> fmmax's anisotropic eigensolve
             if isinstance(e, tuple) and len(e) == 5:
-                exx, exy, eyx, eyy, ezz = (_grid(c) for c in e)
+                exx, exy, eyx, eyy, ezz = _collapse([_grid(c) for c in e])
                 return fm.eigensolve_anisotropic_media(
                     jnp.asarray(wl), kin, lv, exx, exy, eyx, eyy, ezz, ex, formulation=self.formulation
                 )
-            return fm.eigensolve_isotropic_media(jnp.asarray(wl), kin, lv, _grid(e), ex, formulation=self.formulation)
+            (eps_g,) = _collapse([_grid(e)])
+            return fm.eigensolve_isotropic_media(jnp.asarray(wl), kin, lv, eps_g, ex, formulation=self.formulation)
 
         layers = [solve_layer(e) for _, e in layers_spec]
         thick = [jnp.asarray(1.0 if t is None or t == np.inf else t) for t, _ in layers_spec]
