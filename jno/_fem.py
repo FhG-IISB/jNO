@@ -869,43 +869,61 @@ def _solve_complex_transient(blocks: Any, save_ts: Any = None, periodic: Optiona
     def _dn(a):
         return jnp.asarray(a.todense()) if hasattr(a, "todense") else jnp.asarray(a)
 
-    def _MAc(b):
+    br, bi = blocks
+
+    def _MAc(b, args):  # (M, A(args), c) for one real leg — the operator/load re-formed at ``args`` when parametric
         M = _dn(b.M)
-        A = _dn(b.operator_fn(0.0, {}) if b.operator_fn is not None else b.A)
-        c = jnp.zeros((M.shape[0],), M.dtype) if b.affine_bias is None else jnp.asarray(b.affine_bias).reshape(-1)
+        A = _dn(b.operator_fn(0.0, args) if b.operator_fn is not None else b.A)
+        c = jnp.zeros((M.shape[0],), A.dtype) if b.affine_bias is None else jnp.asarray(b.affine_bias).reshape(-1)
         return M, A, c
 
-    br, bi = blocks
-    Mr, Ar, cr = _MAc(br)
-    Mi, Ai, ci = _MAc(bi)
-    n = Mr.shape[0]
-    M_blk = jnp.block([[Mr, -Mi], [Mi, Mr]])
-    A_blk = jnp.block([[Ar, -Ai], [Ai, Ar]])
-    c_blk = jnp.concatenate([cr, ci])
-    w0 = jnp.concatenate([jnp.asarray(br.state0).reshape(-1), jnp.asarray(bi.state0).reshape(-1)])
-    t0, t1, dt = float(br.t0), float(br.t1), float(br.dt)
-    grid = jnp.linspace(t0, t1, max(1, round((t1 - t0) / dt)) + 1)
-    fr, fi = br.forcing_vector_fn, bi.forcing_vector_fn
+    def _march(args):
+        Mr, Ar, cr = _MAc(br, args)
+        Mi, Ai, ci = _MAc(bi, args)
+        n = Mr.shape[0]
+        M_blk = jnp.block([[Mr, -Mi], [Mi, Mr]])
+        A_blk = jnp.block([[Ar, -Ai], [Ai, Ar]])
+        c_blk = jnp.concatenate([cr, ci])
+        w0 = jnp.concatenate([jnp.asarray(br.state0).reshape(-1), jnp.asarray(bi.state0).reshape(-1)])
+        t0, t1, dt = float(br.t0), float(br.t1), float(br.dt)
+        grid = jnp.linspace(t0, t1, max(1, round((t1 - t0) / dt)) + 1)
+        fr, fi = br.forcing_vector_fn, bi.forcing_vector_fn
+        sysmat = M_blk + dt * A_blk  # time-independent block operator: factor once, reuse across steps
 
-    def step(w, t_next):  # backward Euler: (M_blk + dt A_blk) w_next = M_blk w + dt (c_blk + f)
-        rhs = M_blk @ w + dt * c_blk
-        if fr is not None or fi is not None:
-            f_r = jnp.asarray(fr(t_next, {})).reshape(-1) if fr is not None else jnp.zeros((n,), c_blk.dtype)
-            f_i = jnp.asarray(fi(t_next, {})).reshape(-1) if fi is not None else jnp.zeros((n,), c_blk.dtype)
-            rhs = rhs + dt * jnp.concatenate([f_r, f_i])
-        w_next = jnp.linalg.solve(M_blk + dt * A_blk, rhs)
-        return w_next, w_next
+        def step(w, t_next):  # backward Euler: (M_blk + dt A_blk) w_next = M_blk w + dt (c_blk + f)
+            rhs = M_blk @ w + dt * c_blk
+            if fr is not None or fi is not None:
+                f_r = jnp.asarray(fr(t_next, args)).reshape(-1) if fr is not None else jnp.zeros((n,), c_blk.dtype)
+                f_i = jnp.asarray(fi(t_next, args)).reshape(-1) if fi is not None else jnp.zeros((n,), c_blk.dtype)
+                rhs = rhs + dt * jnp.concatenate([f_r, f_i])
+            w_next = jnp.linalg.solve(sysmat, rhs)
+            return w_next, w_next
 
-    _, ws = jax.lax.scan(step, w0, grid[1:])
-    traj = jnp.concatenate([w0[None, :], ws], axis=0)  # (n_grid, 2N)
-    save_ts = grid if save_ts is None else jnp.asarray(save_ts)
-    traj = jax.vmap(lambda col: jnp.interp(save_ts, grid, col), in_axes=1, out_axes=1)(traj)
-    result = traj[:, :n] + 1j * traj[:, n:]  # (n_save, n_red) complex (full N when untied)
-    if periodic is None:
-        return result
-    from .utils.solver.fem_utils import prolong_periodic
+        _, ws = jax.lax.scan(step, w0, grid[1:])
+        traj = jnp.concatenate([w0[None, :], ws], axis=0)  # (n_grid, 2N)
+        _save = grid if save_ts is None else jnp.asarray(save_ts)
+        traj = jax.vmap(lambda col: jnp.interp(_save, grid, col), in_axes=1, out_axes=1)(traj)
+        result = traj[:, :n] + 1j * traj[:, n:]  # (n_save, n_red) complex (full N when untied)
+        if periodic is None:
+            return result
+        from .utils.solver.fem_utils import prolong_periodic
 
-    return prolong_periodic(periodic, result.real) + 1j * prolong_periodic(periodic, result.imag)
+        return prolong_periodic(periodic, result.real) + 1j * prolong_periodic(periodic, result.imag)
+
+    # Forward (non-parametric): march eagerly. Inverse: a leg carries runtime parameters (its operator/load
+    # re-form at ``args``) -> return a differentiable FunctionCall over their union so ∂traj/∂θ flows through
+    # crux, exactly like the complex *linear* :func:`_solve_complex` (the same real-equivalent block, re-marched).
+    rpe: dict = {}
+    for b in blocks:
+        rpe.update(getattr(b, "runtime_parameter_exprs", None) or {})
+    if not rpe:
+        return _march(None)
+    from .trace import FunctionCall
+
+    names = list(rpe)
+    return FunctionCall(
+        lambda *vals: _march(dict(zip(names, vals))), [rpe[n] for n in names], name="fem_complex_transient_solve"
+    )
 
 
 def _is_temporal_value_node(node: Any) -> bool:
@@ -3101,9 +3119,10 @@ def fem(
         # ride it), and a solution-dependent net makes the legs nonlinear (no complex Newton block).
         if is_transient:
             raise NotImplementedError(
-                "jno.fem: a neural coefficient in a complex *transient* form is not supported — the "
-                "complex-transient path has no parametric/inverse route at all (it integrates fixed "
-                "real-equivalent blocks with no runtime args), so this needs that infrastructure built first."
+                "jno.fem: a neural coefficient in a complex *transient* form is not supported yet — a runtime "
+                "PARAMETER now threads through the complex-transient path (parametric Re/Im legs + a "
+                "differentiable trace node), but a trainable NETWORK's weights are not yet routed into those "
+                "legs. Use a scalar/field jno.np.parameter coefficient, or a real transient form."
             )
         from .utils.solver.weak_form import _is_obviously_nonlinear_in_unknown as _nlin_cx
 
@@ -3145,22 +3164,22 @@ def fem(
         and _is_complex_form(domain, ir)
         and not multifield
         and _native_lagrange_ok(domain, constraints, weak_bares, periodic_ties)
-        and not any(_crp(b) for b in weak_bares)
         and not any(_is_temporal_value_node(vnode) for *_rest, vnode in dirichlet_raw)
     ):
+        from .trace import FemLinearSystem as _FLS
         from .utils.solver.backend_blocks import SemidiscreteTimeBlock as _FTB
         from .utils.solver.fem_native import assemble_fem_native
         from .utils.solver.time_route import _infer_time_window, _strip_temporal_trial_derivative
         from .utils.solver.weak_form import _apply_sign, _split_additive_terms
 
         if getattr(domain, "_trainable_coords", None):
-            # The complex-transient path densifies static real Re/Im blocks (M, A_r, A_i) and does not thread
-            # runtime parameters, so it cannot carry a trainable mesh coordinate (fail loud rather than let the
-            # parametric assembler output be unpacked as a plain matrix below).
+            # A runtime PARAMETER now threads through this path (parametric Re/Im legs below), but a trainable
+            # mesh COORDINATE additionally needs the relocation driver, which is real-only. Fail loud.
             raise NotImplementedError(
                 "jno.fem: a complex-transient problem cannot carry a trainable mesh coordinate "
-                "(Variable.trainable()) yet — its assembly builds static real Re/Im blocks. Relocate a complex "
-                "*steady* problem (supported via the real 2N linear path) or a real transient problem instead."
+                "(Variable.trainable()) yet — the relocation driver is real-only. Relocate a complex *steady* "
+                "problem (the real 2N linear path) or a real transient problem instead. (A non-coordinate "
+                "runtime parameter in a complex-transient form IS now supported.)"
             )
 
         mass_stripped, spatial_raw = [], []
@@ -3178,11 +3197,15 @@ def fem(
         (M_raw, _bm), _mm, offs = assemble_fem_native(
             domain, mass_stripped, {}, [], [], vec=vec or 1, quad_degree=quad_degree
         )
-        # Spatial Re/Im parts, with the Dirichlet conditions applied to each block.
-        (A_r, c_r), _mr, _o1 = assemble_fem_native(
+        # Spatial Re/Im parts, with the Dirichlet conditions applied to each block. A runtime parameter makes
+        # ``assemble_fem_native`` return a parametric ``FemLinearSystem`` leg (the complex-transient INVERSE)
+        # instead of a raw ``(A, b)``; the block then carries operator_fn/forcing that re-form ``A(θ)``/``b(θ)``
+        # at args, and _solve_complex_transient wraps a differentiable trace node (mirrors the complex linear
+        # inverse). A non-parametric leg keeps the static ``A``/``affine_bias`` block (byte-identical).
+        _leg_r, _mr, _o1 = assemble_fem_native(
             domain, [s.real for s in spatial_raw], real_bd, dirichlet_raw, [], vec=vec or 1, quad_degree=quad_degree
         )
-        (A_i, c_i), _mi, _o2 = assemble_fem_native(
+        _leg_i, _mi, _o2 = assemble_fem_native(
             domain, [s.imag for s in spatial_raw], imag_bd, dirichlet_raw, [], vec=vec or 1, quad_degree=quad_degree
         )
         M = _as_dense(M_raw)  # complex path composes via jnp.block -> densify the BCOO assembler output
@@ -3207,14 +3230,22 @@ def fem(
             dt=dt,
             eval_context={},
         )
-        block_r = _FTB(M=M_bc, A=_as_dense(A_r), affine_bias=jnp.asarray(c_r).reshape(-1), state0=jnp.real(s0), **_common)
-        block_i = _FTB(
-            M=jnp.zeros((n, n), M.dtype),
-            A=_as_dense(A_i),
-            affine_bias=jnp.asarray(c_i).reshape(-1),
-            state0=jnp.imag(s0),
-            **_common,
-        )
+
+        def _leg_block(leg, M_blk, state0):
+            if isinstance(leg, _FLS):  # parametric leg: operator/load re-form at args (the inverse)
+                return _FTB(
+                    M=M_blk,
+                    operator_fn=lambda t, args, _L=leg: _as_dense(_L.evaluate(args)[0]),
+                    forcing_vector_fn=lambda t, args, _L=leg: jnp.asarray(_L.evaluate(args)[1]).reshape(-1),
+                    runtime_parameter_exprs=dict(getattr(leg, "runtime_parameter_exprs", {}) or {}),
+                    state0=state0,
+                    **_common,
+                )
+            A, c = leg  # raw (A, b): the static block, byte-identical to before
+            return _FTB(M=M_blk, A=_as_dense(A), affine_bias=jnp.asarray(c).reshape(-1), state0=state0, **_common)
+
+        block_r = _leg_block(_leg_r, M_bc, jnp.real(s0))
+        block_i = _leg_block(_leg_i, jnp.zeros((n, n), M.dtype), jnp.imag(s0))
         return _finalize(FEM(domain=domain, op=(block_r, block_i), classification=classification, mode="complex_transient"))
 
     # ---- native periodic transient (scalar single-field, linear, incl. runtime-parametric): assemble

@@ -805,3 +805,41 @@ def test_name_method_sets_parameter_identity():
     labelled = (p * 2.0).name("loss")  # a BinaryOp, not a parameter node
     assert getattr(labelled, "_user_name", None) == "loss"
     assert not hasattr(labelled, "_parameter_name")
+
+
+def test_complex_transient_parametric_inverse_recovers():
+    """A COMPLEX-TRANSIENT problem now carries a runtime parameter: ``assemble_fem_native`` returns
+    parametric Re/Im legs, the time blocks re-form ``A(θ)``/``b(θ)`` per args, and
+    ``_solve_complex_transient`` wraps a differentiable trace node (mirroring the complex *linear* inverse).
+    Oracle: the parametric operator at ``k`` equals the constant-coefficient assembly (Re and Im legs), and
+    a scalar complex-diffusion coefficient is recovered from a synthetic trajectory through ``crux.solve``."""
+
+    def _fem(k):
+        d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.25, time=(0.0, 0.3, 6))
+        u, v = d.fem_symbols()
+        xi, yi, ti = d.variable("interior", split=True)
+        xb, yb, _ = d.variable("boundary", split=True)
+        ci = d.variable("initial", split=True)
+        ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+        ss = jno.np.sin(PI * ci[0]) * jno.np.sin(PI * ci[1])  # real IC; the complex diffusion drives the Im part
+        return jno.fem([ui.t * vi + k * (1.0 + 0.5j) * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - ss])
+
+    # the parametric operator at k equals the constant-coefficient assembly (both Re and Im legs)
+    dense = lambda a: np.asarray(a.todense() if hasattr(a, "todense") else a)  # noqa: E731
+    brp, bip = _fem(jno.np.parameter((1,), name="k").initialize(jax.nn.initializers.constant(0.7)))._op
+    brc, bic = _fem(0.7)._op
+    assert brp.operator_fn is not None and list(brp.runtime_parameter_exprs) == ["k"]
+    assert np.max(np.abs(dense(brp.operator_fn(0.0, {"k": 0.7})) - dense(brc.A))) < 1e-10, "Re leg mismatch"
+    assert np.max(np.abs(dense(bip.operator_fn(0.0, {"k": 0.7})) - dense(bic.A))) < 1e-10, "Im leg mismatch"
+
+    # end-to-end inverse: recover k from a synthetic trajectory (real loss over the complex residual)
+    u_obs = jnp.asarray(_fem(0.9).solve())  # k_true = 0.9
+    k = jno.np.parameter((1,), name="k")
+    k.initialize(jax.nn.initializers.constant(0.4))  # far start
+    k.dtype(jnp.float64)
+    k.optimizer(optax.adam(0.06))
+    diff = _fem(k).solve() - u_obs
+    crux = jno.core([(diff.real**2 + diff.imag**2).mean], domain=_DUMMY)
+    crux.solve(90)
+    kfit = float(np.asarray(crux.eval([k])).reshape(-1)[0])
+    assert abs(kfit - 0.9) < 0.05, f"recovered k={kfit:.4f}, expected ~0.9"
