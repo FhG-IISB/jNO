@@ -528,6 +528,7 @@ def assemble_fem_native(
     region_mask_arrays = [
         jnp.asarray(_cell_region_mask(domain, r), dtype=qw_shared.dtype).reshape(-1) for r in region_mask_names
     ]
+    _region_mask_index = {r: i for i, r in enumerate(region_mask_names)}  # O(1) lookup vs list().index() per cell
 
     # Temporal variable tags (e.g. "__time__") used inside the weak form's coefficients -- a
     # time-dependent source s(x,t) or operator. The residual/Jacobian builders thread the runtime time
@@ -1004,7 +1005,7 @@ def assemble_fem_native(
         # Element size h = |detJ|^(1/dim) at the quad points -> the `dom.cell_size` symbol (SUPG/GLS).
         # Constant w.r.t. the cell DOFs (geometry only), so the per-cell Jacobian sees it as a constant.
         h_qp = jnp.broadcast_to(meas ** (1.0 / dim), (qw_shared.shape[0], 1))
-        cell_masks = tuple(region_mask_arrays[list(region_mask_names).index(r)][c] for r in rnames)
+        cell_masks = tuple(region_mask_arrays[_region_mask_index[r]][c] for r in rnames)
         loc = {
             "physical_quad_points": xq,
             "fields": per,
