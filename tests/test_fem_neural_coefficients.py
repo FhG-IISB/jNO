@@ -1200,6 +1200,42 @@ def test_scope_guards_fail_loud():
         )
 
 
+def test_dirichlet_net_nonlinear_enforced_and_differentiates():
+    """Net-valued Dirichlet ``u(∂Ω) - net(xb, yb)`` on a NONLINEAR form ``(1 + u²)∇u·∇v = f v``: the
+    row-replacement now holds the net's LIVE value (re-evaluated from the weights each residual), so a
+    constant-output net reproduces the constant-Dirichlet nonlinear solve to solver tolerance, its
+    boundary trace equals the held value (the BC is enforced, not baked/dropped), and the solution is
+    differentiable in the Dirichlet weights — the property the guard blocked."""
+    from jno.utils.solver.newton_krylov import newton_krylov
+
+    d, u, phi, (xi, yi), (xb, yb), ui, vi, f = _ku_setup()
+    c = 0.4
+    net = _const_net(c)
+    fem = jno.fem([(1.0 + ui**2) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - net(xb, yb)], quad_degree=3)
+    assert fem._mode == "nonlinear"
+    (name,) = fem.operator.runtime_parameter_exprs
+    assert isinstance(fem.operator.runtime_parameter_exprs[name], ModelWeights)
+
+    def _solve(module):
+        return newton_krylov(lambda v: fem.operator.residual(v, {name: module}), jnp.zeros(fem.operator.size))
+
+    u_net = _solve(net.module)
+
+    # oracle: the identical nonlinear problem with a constant Dirichlet value c
+    fem_c = jno.fem([(1.0 + ui**2) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - c], quad_degree=3)
+    u_c = newton_krylov(lambda v: fem_c.operator(v), jnp.zeros(fem_c.operator.size))
+    assert float(jnp.max(jnp.abs(u_net - u_c))) < 1e-9
+
+    # the solved boundary trace equals the net's held value (enforced from the weights)
+    nodes = np.asarray(d.built_mesh.points)[:, :2]
+    onb = np.isclose(nodes[:, 0], 0) | np.isclose(nodes[:, 0], 1) | np.isclose(nodes[:, 1], 0) | np.isclose(nodes[:, 1], 1)
+    assert float(np.max(np.abs(np.asarray(u_net)[onb] - c))) < 1e-9
+
+    # differentiable in the Dirichlet weights (∂/∂c actually moves the interior solution)
+    g = jax.grad(lambda module: jnp.sum(_solve(module)))(net.module)
+    assert jnp.isfinite(g.c) and abs(float(g.c)) > 1e-6
+
+
 # ==========================================================================
 # frozen fields: ui.freeze(values) as a KNOWN predictor input to a coefficient
 # ==========================================================================
