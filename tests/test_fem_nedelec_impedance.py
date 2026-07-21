@@ -135,3 +135,41 @@ def test_parametric_impedance_surface_mass_matches_and_differentiates():
     g = float(jax.grad(_loss)(2.0))
     fd = (float(_loss(2.0 + 1e-4)) - float(_loss(2.0 - 1e-4))) / 2e-4
     assert abs(g - fd) / abs(fd) < 1e-5, f"autodiff {g} vs FD {fd}"
+
+
+def test_transient_n1e_surface_impedance_reaches_steady_state():
+    """An N1E impedance surface term now composes with a TRANSIENT problem: the tangential-trace surface
+    mass is added to the spatial operator ``A`` of ``M u̇ + A u = c``. Marched to steady state, the transient
+    solution converges to the STEADY solve of the same ``A u = c`` (u̇ → 0) — a real oracle that the surface
+    mass is in the transient operator, not silently dropped."""
+    T, NS, AL, CI = 1.4, 28, 8.0, 3.0  # end time, steps, reaction coeff, impedance coeff (fast decay → converges)
+
+    def _build(transient):
+        bx = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.6)
+        d = bx.domain(time=(0.0, T, NS)) if transient else bx.domain()
+        u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
+        co = d.variable("interior", split=True)
+        xi, yi, zi = co[0], co[1], co[2]
+        nvec = d.variable("boundary", normals=True)
+        tu, tv = u.vector.cross(nvec), v.vector.cross(nvec)
+        ccu, ccv = u.vector.curl(xi, yi, zi), v.vector.curl(xi, yi, zi)
+        if transient:
+            ti = co[3]
+            ui, vi = u.bind(x=xi, y=yi, z=zi, t=ti), v.bind(x=xi, y=yi, z=zi, t=ti)
+        else:
+            ui, vi = u.bind(x=xi, y=yi, z=zi), v.bind(x=xi, y=yi, z=zi)
+        src = 1.0 * vi[0] + 0.5 * vi[1] + 0.2 * vi[2]  # a constant source
+        vol = inner(ccu, ccv) + AL * inner(ui, vi) - src  # volume: curl-curl + reaction − load (interior region)
+        surf = CI * inner(tu, tv)  # the N1E tangential-trace impedance surface term (its own boundary region)
+        if not transient:
+            return np.asarray(jno.fem([vol, surf]).solve()).reshape(-1)
+        ci = d.variable("initial", split=True)
+        u0 = u.bind(x=ci[0], y=ci[1], z=ci[2])
+        traj = jno.fem([inner(ui.t, vi) + vol, surf, u0[0] - 0.0, u0[1] - 0.0, u0[2] - 0.0]).solve()
+        return np.asarray(traj.fn() if hasattr(traj, "fn") else traj)[-1]  # final-time state
+
+    steady = _build(False)
+    final = _build(True)
+    rel = np.linalg.norm(final - steady) / (np.linalg.norm(steady) + 1e-30)
+    assert np.linalg.norm(steady) > 1e-4, "steady solve is trivial — the source/impedance did not drive it"
+    assert rel < 5e-3, f"transient with an N1E surface impedance did not reach the steady solve (rel {rel:.2e})"
