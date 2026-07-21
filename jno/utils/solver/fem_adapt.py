@@ -1230,7 +1230,12 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
         the *time-averaged* nodal state over the marched trajectory (relocate the mesh for the whole run)."""
         if mode == "linear":
             a_mat, b_vec = fem.operator.evaluate(vals)
-            return jnp.linalg.solve(jnp.asarray(a_mat.todense()), jnp.asarray(b_vec).reshape(-1))
+            b = jnp.asarray(b_vec).reshape(-1)
+            if hasattr(a_mat, "indices"):  # BCOO: differentiable sparse-direct — no O(n²) densify / O(n³) solve
+                from .linear import sparse_lu_solve
+
+                return sparse_lu_solve(a_mat, b)  # reverse-mode diff in A(X)'s values and b, so ∂u/∂X still flows
+            return jnp.linalg.solve(jnp.asarray(a_mat), b)  # already dense (vertex C¹ / 1D): small, keep dense
         if mode == "nonlinear":
             from .newton_krylov import newton_krylov
 
