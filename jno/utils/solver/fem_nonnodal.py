@@ -216,9 +216,10 @@ def assemble_fem_nonnodal(
         )
     )
     region_mask_arrays = [jnp.asarray(_cell_region_mask(domain, r)).reshape(-1) for r in region_mask_names]
+    _region_mask_index = {r: i for i, r in enumerate(region_mask_names)}  # O(1) lookup vs list().index() per cell
 
     def _cell_masks(c, rnames):  # this cell's 0/1 indicator per region the term references
-        return tuple(region_mask_arrays[list(region_mask_names).index(r)][c] for r in rnames)
+        return tuple(region_mask_arrays[_region_mask_index[r]][c] for r in rnames)
 
     _field_param_names = frozenset(n for n, e in _rt_param_exprs.items() if _is_fem_field_parameter(e))
 
@@ -527,6 +528,7 @@ def assemble_fem_nonnodal(
             }
             field_vals = {name: jnp.asarray(_a.get(name, _zero_field), dtype=u_flat.dtype) for name in _field_param_names}
             R = jnp.zeros(total, dtype=u_flat.dtype)
+            _nt = neural_local_table(_neural, args)  # once per call, not per (term × cell) inside `_cell`
             for coeff, tfi, rnames in typed:
 
                 def _cell(c, e=coeff, _sc=rt_scalar, _fv=field_vals, _rn=rnames):
@@ -549,7 +551,6 @@ def assemble_fem_nonnodal(
                     }
                     if _field_param_names:  # P1 basis to interpolate a field parameter (top-level, param-only key)
                         local["shape_vals"] = p1_shape_vals
-                    _nt = neural_local_table(_neural, args)
                     if _nt is not None:  # trainable nets ride args (crux weights); frozen/placeholder -> stored
                         local["neural_coefficients"] = _nt
                     return _integrate_term(domain, e, local, qw * meas)  # (ndof of the test field,)
@@ -984,27 +985,42 @@ def assemble_fem_nonnodal(
                     raise ValueError("jno.fem (non-nodal): each weak term must contain exactly one test field.")
                 _sparse_typed.append((_coeff, _tfi, tuple(sorted(_collect_region_mask_names(_coeff)))))
 
+    # Host-static assembly scaffold: the per-cell dof layout and the BCOO row/col PATTERN depend only on the
+    # mesh connectivity, never on ``args`` — so build them ONCE here rather than on every
+    # ``_assemble_sparse_A(args)`` (i.e. every optimizer step of an inverse solve). Only the element data
+    # ``Ke`` and the surface-mass values are args-dependent; the volume pattern rides ``_vol_idx``.
+    _cell_all_dofs = jnp.concatenate([cdofs[i] for i in range(len(fields))], axis=1)  # (n_cells, n_local_all)
+    _field_splits = list(np.cumsum([0] + [int(cdofs[i].shape[1]) for i in range(len(fields))]))
+    _asm_zero_field = jnp.zeros((n_verts,), dtype=zeros.dtype)  # placeholder for an absent field parameter
+    _asm_local_zero = jnp.zeros((n_cells, _cell_all_dofs.shape[1]), zeros.dtype)  # assemble at u=0 (linear)
+    _vol_rows_l, _vol_cols_l = [], []
+    for _cf_p, _tfi_p, _rn_p in _sparse_typed:
+        _kshape = (n_cells, int(cdofs[_tfi_p].shape[1]), _cell_all_dofs.shape[1])  # (n_cells, n_test, n_local_all)
+        _vol_rows_l.append(jnp.broadcast_to(cdofs[_tfi_p][:, :, None], _kshape).reshape(-1))
+        _vol_cols_l.append(jnp.broadcast_to(_cell_all_dofs[:, None, :], _kshape).reshape(-1))
+    _vol_idx = (
+        jnp.stack([jnp.concatenate(_vol_rows_l).astype(jnp.int32), jnp.concatenate(_vol_cols_l).astype(jnp.int32)], axis=1)
+        if _vol_rows_l
+        else jnp.zeros((0, 2), jnp.int32)
+    )
+
     def _assemble_sparse_A(args=None):
-        """The steady linear operator ``A(args)`` as a BCOO, assembled per element."""
+        """The steady linear operator ``A(args)`` as a BCOO, assembled per element. Only the element data and
+        the surface-mass values depend on ``args``; the row/col pattern is the host-static scaffold above."""
         import jax.experimental.sparse as _jsparse
 
-        cell_all_dofs = jnp.concatenate([cdofs[i] for i in range(len(fields))], axis=1)  # (n_cells, n_local_all)
-        _sizes = [int(cdofs[i].shape[1]) for i in range(len(fields))]
-        _splits = list(np.cumsum([0] + _sizes))  # per-field slice bounds within a cell's local vector
-
         _a = args or {}
-        _zero_field = jnp.zeros((n_verts,), dtype=zeros.dtype)
         rt_scalar = {
             name: jnp.reshape(jnp.asarray(_a.get(name, 0.0), dtype=zeros.dtype), (-1,))[:1]
             for name in runtime_parameter_tags
             if name not in _field_param_names
         }
-        field_vals = {name: jnp.asarray(_a.get(name, _zero_field), dtype=zeros.dtype) for name in _field_param_names}
+        field_vals = {name: jnp.asarray(_a.get(name, _asm_zero_field), dtype=zeros.dtype) for name in _field_param_names}
         _nt = neural_local_table(_neural, args)
 
         def _elem_res(c, la, coeff, tfi, rnames):
             """This cell's element residual (n_test of field ``tfi``,) from its local dof vector ``la``."""
-            cell_sols = [la[_splits[i] : _splits[i + 1]] for i in range(len(fields))]
+            cell_sols = [la[_field_splits[i] : _field_splits[i + 1]] for i in range(len(fields))]
             per, xq, meas = _cell_fields(c, cell_sols)
             vol_vars = tuple(
                 (field_vals[name][cells_j[c]] if name in _field_param_names else rt_scalar[name])  # field: vertex values
@@ -1028,29 +1044,24 @@ def assemble_fem_nonnodal(
                 local["neural_coefficients"] = _nt
             return _integrate_term(domain, coeff, local, qw * meas)
 
-        rows_l, cols_l, data_l = [], [], []
-        local_zero = jnp.zeros((n_cells, cell_all_dofs.shape[1]), zeros.dtype)  # assemble at u=0 (linear)
+        data_l = []  # only the element data is args-dependent; the (row, col) pattern is `_vol_idx`
         for coeff, tfi, rnames in _sparse_typed:
 
             def _ke(c, la, _e=coeff, _t=tfi, _rn=rnames):
                 return jax.jacfwd(lambda v: _elem_res(c, v, _e, _t, _rn))(la)
 
-            Ke = jax.vmap(_ke)(jnp.arange(n_cells), local_zero)  # (n_cells, n_test_tfi, n_local_all)
-            r = jnp.broadcast_to(cdofs[tfi][:, :, None], Ke.shape)
-            cc = jnp.broadcast_to(cell_all_dofs[:, None, :], Ke.shape)
-            rows_l.append(r.reshape(-1))
-            cols_l.append(cc.reshape(-1))
+            Ke = jax.vmap(_ke)(jnp.arange(n_cells), _asm_local_zero)  # (n_cells, n_test_tfi, n_local_all)
             data_l.append(Ke.reshape(-1))
 
-        rows, cols, data = jnp.concatenate(rows_l), jnp.concatenate(cols_l), jnp.concatenate(data_l)
-        # Tangential-trace surface mass (impedance BC), re-evaluated per args. Taken SPARSE: densifying
-        # it here would cost O(n_dof²) just to re-sparsify, which is the memory wall for a 3-D vector run.
+        data = jnp.concatenate(data_l) if data_l else jnp.zeros((0,), zeros.dtype)
+        # Tangential-trace surface mass (impedance BC), re-evaluated per args. Taken SPARSE: densifying it
+        # would cost O(n_dof²) just to re-sparsify, the memory wall for a 3-D vector run. Its pattern rides
+        # its own BCOO indices (which the surface assembler still rebuilds — a further hoist opportunity).
         sm = _surf_mass_of(args, sparse=True)
-        if sm is not None:  # BCOO add = triplet concat; duplicate indices sum on materialisation
-            rows = jnp.concatenate([rows, sm.indices[:, 0]])
-            cols = jnp.concatenate([cols, sm.indices[:, 1]])
-            data = jnp.concatenate([data, sm.data])
-        idx = jnp.stack([rows.astype(jnp.int32), cols.astype(jnp.int32)], axis=1)
+        if sm is None:
+            return _jsparse.BCOO((data, _vol_idx), shape=(total, total))
+        idx = jnp.concatenate([_vol_idx, sm.indices], axis=0)  # BCOO sums duplicate (i, j) on materialisation
+        data = jnp.concatenate([data, sm.data])
         return _jsparse.BCOO((data, idx), shape=(total, total))
 
     # --- steady nonlinear: a genuinely nonlinear weak term -> a Newton residual operator ---
