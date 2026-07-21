@@ -100,8 +100,9 @@ no term.
 >
 > **Not yet:** the rest of the zoo in 3-D (RT / C¹ / plate are 2-D only); the *inhomogeneous* `n×E = g` on
 > N1E; higher order; other families (BDM, second-kind Nédélec, Bell); quad / non-triangular meshes; a
-> runtime parameter in a **host-assembled** RT-pressure / plate boundary term (the N1E tangential-trace
-> impedance / incident **surface** BC now *is* differentiable in a boundary-term parameter); the
+> runtime parameter **or trainable neural coefficient** in a **host-assembled** RT-pressure / plate
+> boundary term (the N1E tangential-trace impedance / incident **surface** BC now *is* differentiable in a
+> boundary-term parameter *and* a learned `net(x)` coefficient); the
 > constraint-consistent algebraic initial state at `t0` in the saddle-DAE transient (only the reported `t0`
 > algebraic value is affected).
 

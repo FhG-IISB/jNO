@@ -210,8 +210,12 @@ def assemble_fem_nonnodal(
     # natural-BC (Neumann/Robin) term is rejected, since that load is assembled non-differentiably here.
     from .parametric_helpers import collect_neural_slots, neural_local_table, neural_operator_exprs
 
+    # Collect boundary networks into the slots too (their weights ride ``args`` as ModelWeights): the N1E
+    # tangential-trace surface/incident coefficient is re-evaluated per args differentiably (like a scalar
+    # parameter). A trainable net in a host-assembled RT-pressure / plate term is rejected below (after
+    # classification), so it is never baked non-differentiably.
     _neural = collect_neural_slots(
-        volume_terms, boundary_terms, runtime_parameter_tags=runtime_parameter_tags, reject_trainable_boundary=True
+        volume_terms, boundary_terms, runtime_parameter_tags=runtime_parameter_tags, reject_trainable_boundary=False
     )
     neural_param_names, _neural_models = _neural.param_names, _neural.models
     _param_and_neural_exprs = neural_operator_exprs(_rt_param_exprs, _neural)
@@ -569,15 +573,19 @@ def assemble_fem_nonnodal(
     # A runtime parameter in a host-assembled RT pressure / plate BC cannot be threaded differentiably
     # (the load is baked once); only the N1E surface/incident coefficient re-assembles per args. Reject the
     # former loudly (rather than silently freeze it) now that classification separates the two.
+    from .parametric_helpers import _collect_neural_coefficient_exprs
+
     _pressure_param: dict = {}
     for _terms in pressure_terms.values():
         for _t in _terms:
             _collect_runtime_parameter_exprs(_t, _pressure_param)
+            _collect_neural_coefficient_exprs(_t, _pressure_param)  # a trainable net is baked here too
     if _pressure_param:
         raise NotImplementedError(
-            "jno.fem (non-nodal): a runtime parameter in a host-assembled natural-BC (RT pressure / plate "
-            f"moment) term is not supported (its load is baked non-differentiably); got {sorted(_pressure_param)}. "
-            "Put the parameter in a volume term, or use an N1E tangential-trace surface/incident BC (parametric)."
+            "jno.fem (non-nodal): a runtime parameter or trainable neural coefficient in a host-assembled "
+            "natural-BC (RT pressure / plate moment) term is not supported (its load is baked "
+            f"non-differentiably); got {sorted(_pressure_param)}. Put it in a volume term, or use an N1E "
+            "tangential-trace surface/incident BC (which IS parametric / neural-differentiable)."
         )
     # RT natural pressure BC (host-assembled once, constant). The N1E surface mass (→ A) and incident load
     # (→ b) are wrapped in ``_of(params)`` closures so the parametric path re-assembles them differentiably
