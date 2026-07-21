@@ -1665,6 +1665,12 @@ class FEM:
         # the nonlinear-transient route carries the mass as a callable (the ``.M`` attribute is
         # unset); evaluate it once at t0 -- the mass is constant in the standard ``u_t * v`` form.
         M = self._op.M
+        if M is None and getattr(self._op, "mass_residual", None) is not None:
+            raise AttributeError(
+                "FEM has a STATE-DEPENDENT (nonlinear) mass ``c(u)·u_t``: there is no single mass matrix "
+                "(the mass M(u) varies with the solution). Its per-step action is assembled inside the "
+                "solve; use ``fem.solve()`` to march it, not ``fem.M``."
+            )
         if M is None:
             M = self._op.mass(self.t0, {})
         return _as_dense(M)
