@@ -850,6 +850,14 @@ class TraceEvaluator:
         active sample points: map its per-vertex values onto the points in context for the region it was
         bound to. Its gradient (``.x`` / ``.y``) is produced by :meth:`_eval_jacobian`'s FD-over-mesh path
         (a nodal mesh field has no analytic coordinate-function to auto-differentiate)."""
+        if getattr(expr, "num_components", 1) != 1:
+            # A VECTOR frozen field stores (n_nodes, vec); a standalone readout maps ONE scalar per vertex.
+            # It works as a coefficient inside a jno.fem form (the assembler gathers the vec-vectors); a
+            # standalone .eval() of the whole vector is not wired (fail loud, not a silent reshape).
+            raise NotImplementedError(
+                "FrozenField.eval(): standalone readout of a VECTOR frozen field is not supported yet — a "
+                "vector frozen field works as a coefficient in a jno.fem form. Read a single component."
+            )
         values = jnp.asarray(expr.values).reshape(-1)
         domain = getattr(expr, "_domain", None)
         if domain is None or getattr(domain, "mesh_connectivity", None) is None:

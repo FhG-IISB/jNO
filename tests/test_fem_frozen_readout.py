@@ -177,3 +177,43 @@ def test_substitute_refreeze_swaps_state_in_a_static_readout():
 
     g = np.asarray(jax.grad(loss)(jnp.asarray(3.0 * pts[:, 0] - 2.0 * pts[:, 1])))
     assert np.all(np.isfinite(g)) and np.linalg.norm(g) > 0  # differentiable in the swapped-in state
+
+
+def test_vector_frozen_field_as_coefficient_matches_analytic():
+    """A VECTOR frozen field ``u.bind(...).freeze(vals)`` with ``vals`` of shape ``(n_nodes, vec)`` works as
+    a coefficient in a jno.fem form: the assembler gathers each cell's per-node vec-vectors and interpolates
+    them. A LINEAR field is P1-exact, so a frozen vector *source* must equal the same source written
+    analytically (to machine precision) -- e.g. a precomputed velocity / prior displacement field."""
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34).domain()
+    u, phi = d.fem_symbols(value_shape=(2,), names=("u", "phi"))
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    vi = phi.bind(x=xi, y=yi)
+    nodes = np.asarray(d.built_mesh.points)[:, :2]
+    gvals = np.stack([0.3 + 0.5 * nodes[:, 0], 0.2 + 0.4 * nodes[:, 1]], axis=1)  # (n_nodes, 2) LINEAR -> P1-exact
+    uf = u.bind(x=xi, y=yi).freeze(gvals)  # vector frozen field (shares u's basis)
+    weak = jno.np.inner(jno.np.grad(u, [xi, yi]), jno.np.grad(phi, [xi, yi]), n_contract=2) - (
+        uf[0] * vi[0] + uf[1] * vi[1]
+    )
+    fem = jno.fem([weak, u(xb, yb) - 0.0])
+
+    u2, p2 = d.fem_symbols(value_shape=(2,), names=("u2", "p2"))
+    v2 = p2.bind(x=xi, y=yi)
+    weak_ref = jno.np.inner(jno.np.grad(u2, [xi, yi]), jno.np.grad(p2, [xi, yi]), n_contract=2) - (
+        (0.3 + 0.5 * xi) * v2[0] + (0.2 + 0.4 * yi) * v2[1]
+    )
+    fem_ref = jno.fem([weak_ref, u2(xb, yb) - 0.0])
+    bf, br = np.asarray(fem.b).reshape(-1), np.asarray(fem_ref.b).reshape(-1)
+    assert np.max(np.abs(bf - br)) < 1e-9, "vector frozen source must match the analytic source (P1-exact)"
+
+
+def test_vector_frozen_field_standalone_eval_fails_loud():
+    """A standalone ``.eval()`` readout of a VECTOR frozen field is not wired (its values are (n_nodes, vec));
+    it must fail loud rather than silently reshape-flatten. (Assembly as a coefficient is supported above.)"""
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34).domain()
+    u, _ = d.fem_symbols(value_shape=(2,), names=("u", "phi"))
+    xb, yb, _ = d.variable("boundary", split=True)
+    nvv = int(np.asarray(d.built_mesh.points).shape[0])
+    uf = u.bind(x=xb, y=yb).freeze(np.ones((nvv, 2)))
+    with pytest.raises(NotImplementedError, match="VECTOR frozen field"):
+        uf.eval()

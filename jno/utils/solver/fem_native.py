@@ -858,11 +858,13 @@ def assemble_fem_native(
     _frozen_gathered: Dict[Any, Any] = {}
     for _fid, _fnode in _frozen_nodes.items():
         _ffidx = field_index[_fnode.field_key]
-        if vecs[_ffidx] != 1:
-            raise NotImplementedError("ui.freeze(values): only scalar frozen fields are supported.")
         _fconn = cells_f_j[_ffidx]  # (n_cell, n_local)
-        _fvals = jnp.asarray(_fnode.values).reshape(-1)
-        _frozen_gathered[_fid] = _fvals[_fconn].reshape(_fconn.shape[0], _fconn.shape[1], 1)
+        _fvals = jnp.asarray(_fnode.values)
+        # scalar frozen field (n_nodes,) -> per-cell (n_local, 1); VECTOR (n_nodes, vec) -> (n_local, vec).
+        # The kernel interpolation ``shape_vals . cell_nodal`` handles either (the trailing axis is carried).
+        _frozen_gathered[_fid] = (
+            _fvals[_fconn].reshape(_fconn.shape[0], _fconn.shape[1], 1) if _fvals.ndim == 1 else _fvals[_fconn]
+        )
 
     # Load-path fields are scalar P1 fields on the mesh vertices (a temperature history, say) that are not
     # among the solved unknowns, so they have no assembled basis of their own. They borrow the nodal basis
