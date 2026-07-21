@@ -604,6 +604,53 @@ class Placeholder:
         dom = domain if domain is not None else _infer_domain_from_constraints([self])
         return jno.core([self], domain=dom).eval(self, domain=dom)
 
+    def trainable(self, *, name: str | None = None):
+        """Promote this placeholder to a trainable :func:`jno.np.parameter`, seeded at its current values.
+
+        Generic over placeholders: reads this node's current concrete values (via :meth:`eval`), mints a
+        parameter of the **same shape and dtype**, and initializes it to those values -- so an existing
+        coefficient / data tag becomes a design variable in one call and trains through ``jno.core`` exactly
+        like a hand-written parameter::
+
+            k  = domain.variable("kappa", sample=k0)   # a coefficient tag (data today)
+            kp = k.trainable()                          # -> trainable parameter, seeded at k0
+            u  = jno.fem([kp * (u.x * v.x + u.y * v.y) - f * v, u(b) - g]).solve()
+
+        A **spatial coordinate** placeholder (the ``x, y[, z]`` returned by ``domain.variable(region)``) is a
+        mesh *geometry* design variable: it promotes to a **per-component vertex-coordinate** parameter over
+        that region's mesh vertices (``x.trainable()`` moves only the x column — the API is literal), seeded at
+        their current positions and registered on the domain so ``jno.fem`` routes it into the assembly
+        Jacobian. Differentiating a solve w.r.t. it yields the shape derivative ``∂(solve)/∂X``. The
+        **temporal** variable is not a design variable and raises.
+
+        Args:
+            name: Optional readable label for the parameter (see :func:`jno.np.parameter`).
+
+        Returns:
+            The parameter (a ``ModelCall``); read its trained value with ``crux.eval(p)``.
+        """
+        axis = getattr(self, "axis", None)
+        if axis == "temporal":
+            raise NotImplementedError("Placeholder.trainable(): the temporal variable is not a design variable.")
+        if axis == "spatial":
+            return self._trainable_coordinate(name=name)
+        return self._seeded_parameter(jnp.asarray(self.eval()), name)
+
+    def _seeded_parameter(self, values, name):
+        """Mint a :func:`jno.np.parameter` of ``values``' shape and dtype, initialized to ``values``."""
+        import jno
+
+        values = jnp.asarray(values)
+        param = jno.np.parameter(tuple(values.shape), name=name)
+        if values.dtype == jnp.float64:
+            param = param.dtype(jnp.float64)
+
+        def _seed(key, shape, dtype=None):  # a constant JAX initializer -> the captured current values
+            arr = jnp.asarray(values)
+            return arr.astype(dtype) if dtype is not None else arr
+
+        return param.initialize(_seed)
+
     # ------------------------------------------------------------------
     # Native complex-dtype helpers (work on jnp.complex64/complex128)
     # ------------------------------------------------------------------
@@ -1339,6 +1386,59 @@ class Variable(Placeholder):
             region = self.fem_meta.get("region_id")
             return f"Var({self.tag}[{self.dim}], support={support}, region={region})"
         return f"Var({self.tag}[{self.dim}])"
+
+    def _trainable_coordinate(self, *, name: str | None = None):
+        """Promote this spatial coordinate component to a mesh-geometry design variable (per-component
+        vertex leaf). Mints a :func:`jno.np.parameter` over this region's mesh vertices, seeded at their
+        current positions in this component's axis, and registers it on the domain so ``jno.fem`` scatters
+        it into the assembly geometry (``fem_native._apply_coord_params``). See
+        ``plans/differentiable-r-adaptivity.md`` (Feature 2)."""
+        import numpy as _np
+
+        from ..utils.solver.parametric_helpers import _collect_runtime_parameter_exprs
+
+        dom = self._domain
+        axis_idx = int(self.dim[0])  # x=0, y=1, z=2 (the component slice [i, i+1])
+        pts = _np.asarray(dom.mesh.points)
+        ids = _np.asarray(self._region_vertex_ids(dom, self.tag, pts), dtype=int)
+        if ids.size == 0:
+            raise ValueError(f"Variable.trainable(): region {self.tag!r} has no mesh vertices to make trainable.")
+
+        param = self._seeded_parameter(jnp.asarray(pts[ids, axis_idx]), name)
+        # Canonical runtime-parameter name -- the same key the assembler uses to read the value from ``args``.
+        _named: dict = {}
+        _collect_runtime_parameter_exprs(param, _named)
+        pname = next(iter(_named))
+
+        registry = getattr(dom, "_trainable_coords", None)
+        if registry is None:
+            registry = []
+            dom._trainable_coords = registry
+        registry.append({"ids": ids, "axis": axis_idx, "expr": param, "name": pname})
+        return param
+
+    @staticmethod
+    def _region_vertex_ids(dom, tag, pts):
+        """Mesh-vertex ids of region ``tag`` for coordinate trainability -- interior OR boundary.
+
+        A ``where=`` predicate is applied to **all** nodes (not intersected with the domain boundary
+        as the Dirichlet location fn is), so an interior region selects its interior vertices. Falls back
+        to the assembler's region resolver for polygon / named-boundary tags."""
+        import numpy as _np
+
+        preds = getattr(dom, "_tag_predicates", {}) or {}
+        if preds.get(tag, None) is not None:
+            where = preds[tag]
+            cols = [jnp.asarray(pts[:, i]) for i in range(pts.shape[1])]
+            try:
+                hits = where(*cols)  # a (x, y[, z]) predicate over the node coordinates
+            except TypeError:
+                hits = where(*cols[:2])  # a 2-arg (x, y) predicate on a 3-column mesh
+            return list(_np.where(_np.asarray(hits).reshape(-1))[0])
+
+        from ..utils.solver.fem_native import _region_node_ids_from_pts
+
+        return list(_region_node_ids_from_pts(dom, tag, pts))
 
 
 class TensorTag(Placeholder):

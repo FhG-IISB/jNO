@@ -952,6 +952,19 @@ class AdaptSpec:
     hmax: float | None = None
     every: int = 5
     metric_field: int = 0
+    # --- r-adaptivity (mesh relocation) --------------------------------------------------------------
+    relocate: bool = False
+    """Switch ``FEM.solve(adapt=...)`` from h-refinement (add elements) to **r-adaptivity**: relocate the
+    mesh vertices tagged with :meth:`Variable.trainable` down the FE-energy gradient — *through the
+    differentiable solve* — at fixed connectivity and no new DOFs. Requires at least one coordinate tagged
+    ``domain.variable(region)[i].trainable()`` before ``jno.fem`` (else it raises). See
+    :func:`run_adaptive_relocate`. ``max_iters`` sets the number of relocation steps; ``lr`` the step size."""
+    quality_floor: float = 0.1
+    """Relocation only: a step is backtracked (halved) until no element's ``|det J|`` falls below this
+    fraction of the initial worst element — the mesh-validity line search that keeps the relocation from
+    tangling (a stock optimiser / a barrier alone cannot guarantee this on stiff problems)."""
+    lr: float = 3e-3
+    """Relocation only: base step size for the RMS-normalised energy-gradient descent."""
 
 
 # Consecutive rounds that must satisfy ``eps`` before the loop stops on convergence.
@@ -1023,7 +1036,16 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
         eta, est = zz_error_indicators(d, u)
         n_dofs = int(np.asarray(d.mesh.points).shape[0])
         marked = None if spec.anisotropic else dorfler_mark(eta, spec.theta)
-        history.append({"n_dofs": n_dofs, "estimate": est, "n_marked": None if marked is None else int(marked.size)})
+        _rec_cells, _ = _mesh_cells(d)  # points/cells: for a refinement animation (connectivity changes each round)
+        history.append(
+            {
+                "n_dofs": n_dofs,
+                "estimate": est,
+                "n_marked": None if marked is None else int(marked.size),
+                "points": np.asarray(d.mesh.points)[:, : int(d.dimension)].copy(),
+                "cells": np.asarray(_rec_cells).copy(),
+            }
+        )
 
         # eps: the estimate stopped improving (plateau) for _EPS_PATIENCE rounds
         if spec.eps is not None and prev_est is not None:
@@ -1072,6 +1094,190 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
     fem.__dict__.update(cur.__dict__)
     fem.adapt_history = history
     return u
+
+
+def _dirichlet_energy_jax(pts, u_nodal, cells, dim):
+    """``Σ_cells |∇u|² · vol`` for a P1 field — differentiable in the vertices ``pts`` and the nodal values
+    ``u_nodal`` (shape ``(n_verts,)`` or ``(n_verts, n_comp)``). Field-agnostic (scalar / vector / a
+    primary field), 2-D triangle and 3-D tet: the relocation objective (concentrate nodes where the
+    solution's gradient is large). ``pts`` are the *moved* vertices, so this is the shape derivative's
+    integrand -- differentiating it w.r.t. the coordinate parameters is the r-adaptivity gradient."""
+    import jax.numpy as jnp
+
+    v = pts[cells]  # (n_cell, dim+1, dim)
+    u_nodal = u_nodal[:, None] if u_nodal.ndim == 1 else u_nodal
+    s = u_nodal[cells]  # (n_cell, dim+1, n_comp)
+    e = jnp.stack([v[:, i + 1] - v[:, 0] for i in range(dim)], axis=1)  # (n_cell, dim, dim): rows = edge vectors
+    du = jnp.stack([s[:, i + 1] - s[:, 0] for i in range(dim)], axis=1)  # (n_cell, dim, n_comp): du along each edge
+    grad = jnp.linalg.solve(e, du)  # (n_cell, dim, n_comp): ∇u, since du = E·∇u with E the edge matrix
+    vol = jnp.abs(jnp.linalg.det(e)) / (2.0 if dim == 2 else 6.0)
+    return jnp.sum(jnp.sum(grad**2, axis=(1, 2)) * vol)
+
+
+def _transient_march_fn(block):
+    """Build a differentiable ``args -> time-averaged nodal state`` for a :class:`SemidiscreteTimeBlock`.
+
+    The time grid / dt / theta are constants (independent of the runtime parameters), so they are captured
+    once here; the returned closure is a plain ``lax.scan`` over the block's one-step primitive, reverse-mode
+    differentiable in ``args`` (the coordinate gradient flows). The relocation driver averages the trajectory
+    in time -- it optimises the mesh for the whole run, not one snapshot."""
+    import jax
+    import jax.numpy as jnp
+
+    from .backend_blocks import _block_time_grid
+
+    state0 = jnp.asarray(block.state0).reshape(-1)
+    ts = jnp.asarray(np.asarray(_block_time_grid(block)))  # constant grid, materialised outside the trace
+    dt = float(block.dt)
+    theta = float(block.metadata.get("theta", 1.0)) if block.metadata else 1.0
+
+    def march(args):
+        def _scan_step(u, t):
+            un = block.step(u, t, dt, args=args, theta=theta)
+            return un, un
+
+        _, traj = jax.lax.scan(_scan_step, state0, ts[:-1])
+        return jnp.mean(jnp.concatenate([state0[None, :], traj], axis=0), axis=0)
+
+    return march
+
+
+def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwargs: Any) -> np.ndarray:
+    """Drive ``FEM.solve(adapt=AdaptSpec(relocate=True, ...))`` -- **r-adaptivity** (mesh relocation).
+
+    Relocate the mesh vertices tagged with :meth:`Variable.trainable` down the FE Dirichlet-energy gradient
+    -- evaluated *through the differentiable solve* (``∂(solve)/∂X``) -- at **fixed connectivity** and no new
+    DOFs, with a **backtracking line search on ``det J``** so the mesh never tangles (a stock optimiser or a
+    barrier alone cannot guarantee validity on stiff problems -- the constraint must live in the step control).
+    Concentrates a *fixed* node set at solution features; the relocation companion of the h-refinement
+    :func:`run_adaptive_solve`.
+
+    ``spec.max_iters`` relocation steps, ``spec.lr`` step size, ``spec.quality_floor`` the validity bound.
+    Requires ≥1 coordinate tagged ``domain.variable(region)[i].trainable()`` before ``jno.fem`` (else raises).
+    Mutates ``fem`` / its domain to the relocated mesh (like the refinement loop) and returns the solution there;
+    ``fem.adapt_history`` traces the per-step energy.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    import jno
+
+    dom = fem.domain
+    coord_specs = list(getattr(dom, "_trainable_coords", None) or [])
+    if not coord_specs:
+        raise ValueError(
+            "FEM.solve(adapt=AdaptSpec(relocate=True)) found no trainable mesh coordinates to move. Tag the "
+            "vertices to relocate with `x, y[, z] = domain.variable(region, split=True); x.trainable()` "
+            "(per component) BEFORE `jno.fem(...)` -- otherwise there is nothing to relocate."
+        )
+    mode = getattr(fem, "_mode", "linear")
+    if mode not in ("linear", "nonlinear", "transient"):
+        # A complex *linear* form is mode "linear" (a real 2N block system) and relocates fine. A complex
+        # *transient* problem is caught earlier at jno.fem build time (its assembly builds static real blocks
+        # and does not thread runtime parameters, so it cannot carry a trainable coordinate yet).
+        raise NotImplementedError(f"AdaptSpec(relocate=True): unsupported problem mode {mode!r}.")
+
+    dim = int(dom.dimension)
+    cells, _ = _mesh_cells(dom)
+    cells_j = jnp.asarray(cells)
+    pts0 = np.asarray(dom.mesh.points)[:, :dim].copy()
+    pts0_j = jnp.asarray(pts0)
+    n_verts = pts0.shape[0]
+    names = [sp["name"] for sp in coord_specs]
+
+    def _scatter(vals):
+        p = pts0_j
+        for sp in coord_specs:
+            p = p.at[jnp.asarray(sp["ids"]), sp["axis"]].set(vals[sp["name"]])
+        return p
+
+    def _block_energy(u, pts, bounds):
+        """Total Dirichlet energy summed over EVERY solution block (``bounds``) — so a scalar, a vector (per
+        component), a **complex** field (its real + imaginary blocks) and a coupled multifield all contribute.
+        A higher-order block (P2) falls back to its vertex DOFs."""
+        e = 0.0
+        for i in range(len(bounds) - 1):
+            blk = u[bounds[i] : bounds[i + 1]]
+            nb = int(blk.shape[0])
+            veci = nb // n_verts if (n_verts and nb % n_verts == 0) else 1
+            bf = blk.reshape(n_verts, veci) if veci > 1 else blk[:n_verts]
+            e = e + _dirichlet_energy_jax(pts, bf, cells_j, dim)
+        return e
+
+    _march = _transient_march_fn(fem.operator) if mode == "transient" else None
+
+    def _solve_at(vals):
+        """The solution at the coordinate values ``vals`` -- differentiable in them (the keystone).
+        Linear: ``A(X)⁻¹ b(X)``. Nonlinear: Newton (``custom_root`` keeps ``∂u/∂X`` exact). Transient:
+        the *time-averaged* nodal state over the marched trajectory (relocate the mesh for the whole run)."""
+        if mode == "linear":
+            a_mat, b_vec = fem.operator.evaluate(vals)
+            return jnp.linalg.solve(jnp.asarray(a_mat.todense()), jnp.asarray(b_vec).reshape(-1))
+        if mode == "nonlinear":
+            from .newton_krylov import newton_krylov
+
+            op = fem.operator
+            u0 = jnp.zeros((int(op.size),), dtype=jnp.result_type(float))
+            return newton_krylov(lambda uu: op.residual(uu, vals), u0)
+        return _march(vals)  # transient: time-averaged nodal state over the marched trajectory
+
+    def _energy(vals):
+        u = _solve_at(vals)
+        bounds = list(fem.offsets) if fem.offsets is not None else [0, int(u.shape[0])]
+        return _block_energy(u, _scatter(vals), bounds)
+
+    val_grad = jax.jit(jax.value_and_grad(lambda arrs: _energy(dict(zip(names, arrs)))))
+
+    def _min_detj(p):
+        vv = p[cells]
+        ee = np.stack([vv[:, i + 1] - vv[:, 0] for i in range(dim)], axis=1)
+        return float(np.min(np.linalg.det(ee.transpose(0, 2, 1))))
+
+    def _moved(arrs):
+        p = pts0.copy()
+        for i, sp in enumerate(coord_specs):
+            p[sp["ids"], sp["axis"]] = np.asarray(arrs[i])
+        return p
+
+    floor = spec.quality_floor * _min_detj(pts0)
+    arrs = [jnp.asarray(pts0[sp["ids"], sp["axis"]]) for sp in coord_specs]
+    msq = [jnp.zeros_like(a) for a in arrs]  # RMSProp running average (near-feature gradients dwarf the rest)
+    history: list[dict] = []
+    for it in range(spec.max_iters):
+        e, g = val_grad(arrs)
+        msq = [0.9 * m + 0.1 * gi**2 for m, gi in zip(msq, g)]
+        stepdir = [gi / jnp.sqrt(m + 1e-8) for gi, m in zip(g, msq)]
+        a = spec.lr
+        for _ in range(25):  # backtracking line search: shrink the step until no element inverts
+            cand = [ai - a * si for ai, si in zip(arrs, stepdir)]
+            if _min_detj(_moved(cand)) > floor:
+                break
+            a *= 0.5
+        else:
+            break  # at the mesh-quality limit -- no admissible step
+        arrs = cand
+        history.append({"step": it, "energy": float(e), "points": _moved(arrs)})  # points: for a relocation animation
+
+    final = _moved(arrs)
+    if _min_detj(final) <= 0.0:  # fail loud rather than hand back / re-solve on a tangled mesh
+        raise RuntimeError(
+            "FEM.solve(adapt=relocate): the mesh tangled (min det J <= 0). Lower AdaptSpec.lr or raise "
+            "AdaptSpec.quality_floor."
+        )
+
+    # apply the relocation to the domain (connectivity-preserving), drop the trainable tags, re-solve plainly
+    disp = np.zeros((n_verts, dim))
+    for i, sp in enumerate(coord_specs):
+        disp[sp["ids"], sp["axis"]] = np.asarray(arrs[i]) - pts0[sp["ids"], sp["axis"]]
+    move_mesh(dom, disp, copy=False, check=True)
+    dom._trainable_coords = []  # relocation consumed the tags; the moved vertices are now the geometry
+    for _name, _pred in list(getattr(dom, "_tag_predicates", {}).items()):
+        dom.tag(_name, _pred)
+    cur = jno.fem(fem._constraints, **fem._fem_kwargs)
+    u_final = np.asarray(cur.solve(solve_fn, **kwargs)).reshape(-1)
+    fem.__dict__.update(cur.__dict__)
+    fem.adapt_history = history
+    return u_final
 
 
 @dataclass

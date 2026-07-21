@@ -222,6 +222,27 @@ def _facet_area_element(J, tangs):
     return jnp.linalg.norm(T[0]) if T.shape[0] == 1 else jnp.linalg.norm(jnp.cross(T[0], T[1]))
 
 
+def _face_normals_jax(points, facet_verts, sign):
+    """Differentiable outward unit boundary-facet normals ``(n_bfaces, dim)`` from (traced) vertex
+    positions -- the JAX companion of the host-numpy :func:`fem_facets.compute_face_normals`, so a facet's
+    normal re-evaluates (and stays differentiable) when its vertices move (trainable coordinates / ALE).
+
+    ``facet_verts`` is ``(n_bfaces, dim)`` P1 vertex ids per facet (``conn.face_nodes``); ``sign`` is a
+    precomputed ``±1`` per facet fixing the outward orientation. The raw normal is the 90°-rotated edge
+    tangent (2D) or the edge cross product (3D); the orientation sign is **frozen** because it is locally
+    constant -- it only flips at element inversion (tangling), the same validity envelope as ``detJ``. See
+    plans/differentiable-r-adaptivity.md (Feature 3)."""
+    v = points[facet_verts]  # (n_bfaces, n_face_nodes, dim)
+    dim = v.shape[-1]
+    if dim == 2:  # edge -> rotate the tangent 90°
+        t = v[:, 1] - v[:, 0]
+        n_raw = jnp.stack([t[:, 1], -t[:, 0]], axis=1)
+    else:  # triangular face -> cross product of two edges
+        n_raw = jnp.cross(v[:, 1] - v[:, 0], v[:, 2] - v[:, 0])
+    n = sign[:, None] * n_raw
+    return n / jnp.linalg.norm(n, axis=1, keepdims=True)
+
+
 # ---------------------------------------------------------------------------
 # Native fem_context for the VPINN / grouped-weak-form path
 # ---------------------------------------------------------------------------
@@ -552,6 +573,18 @@ def assemble_fem_native(
     neural_param_names, _neural_models = _neural.param_names, _neural.models
     _param_and_neural_exprs = neural_operator_exprs(_rt_param_exprs, _neural)
 
+    # Trainable mesh-coordinate parameters (geometry design variables) registered by
+    # ``Variable.trainable()`` on a spatial coordinate: their value is scattered into the P1 geometry
+    # points before the cell Jacobian is formed (``_apply_coord_params`` below), so ``∂(solve)/∂X``
+    # flows through the ordinary assembly. They ride ``runtime_parameter_exprs`` (so crux discovers them
+    # and their value arrives in ``args``) but stay OUT of ``runtime_parameter_tags`` -- they are not term
+    # coefficients (``_runtime_vals`` must not pack them). See plans/differentiable-r-adaptivity.md (Feature 2).
+    _coord_specs: List[Tuple[Any, int, str]] = []
+    for _cspec in getattr(domain, "_trainable_coords", None) or []:
+        _cname = str(_cspec["name"])
+        _param_and_neural_exprs = {**_param_and_neural_exprs, _cname: _cspec["expr"]}
+        _coord_specs.append((jnp.asarray(_cspec["ids"], dtype=jnp.int32), int(_cspec["axis"]), _cname))
+
     # Frozen fields (ui.freeze(values)): KNOWN nodal vectors whose value/gradient are delivered at the
     # quad points (e.g. as neural-coefficient inputs). Collected once; their per-cell nodal slice is a
     # compile-time constant gathered below and threaded via loc["frozen_fields"].
@@ -714,6 +747,21 @@ def assemble_fem_native(
 
     conn = build_facet_connectivity(cells_p1, cell_key)
     normals_np = compute_face_normals(pts_p1, conn, cells_p1, cell_key) if conn.n_bfaces > 0 else np.zeros((0, dim))
+    # Frozen outward-orientation sign per boundary facet, so the normals can be recomputed differentiably
+    # from moved vertices (``_face_normals_jax``) when coordinates are trainable (Feature 3). The sign is
+    # locally constant (flips only at element inversion), so freezing it keeps the normal smooth on valid
+    # meshes; the raw (unsigned) normal is built the same way as ``compute_face_normals``.
+    if conn.n_bfaces > 0:
+        _fv = np.asarray(pts_p1)[conn.face_nodes]  # (n_bfaces, n_face_nodes, dim)
+        if dim == 2:
+            _nraw = np.stack([(_fv[:, 1] - _fv[:, 0])[:, 1], -(_fv[:, 1] - _fv[:, 0])[:, 0]], axis=1)
+        else:
+            _nraw = np.cross(_fv[:, 1] - _fv[:, 0], _fv[:, 2] - _fv[:, 0])
+        _facet_sign_j = jnp.asarray(np.where(np.sum(_nraw * np.asarray(normals_np), axis=1) >= 0, 1.0, -1.0))
+        _facet_verts_j = jnp.asarray(conn.face_nodes, dtype=jnp.int32)
+    else:
+        _facet_sign_j = jnp.zeros((0,))
+        _facet_verts_j = jnp.zeros((0, dim), dtype=jnp.int32)
 
     # Surface step-history buffer layout (now that the facet tables give the per-face quadrature width). A
     # state read at ``.i(k)`` on a boundary term (e.g. a friction slip on the contact face) lives on the
@@ -750,15 +798,28 @@ def assemble_fem_native(
     # Cell-level field data builder (called inside vmap'd kernels)
     # -------------------------------------------------------------------------
 
-    def _cell_fields(c, cell_sols):
+    def _apply_coord_params(pts, args):
+        """Scatter trainable mesh-coordinate parameters (``Variable.trainable()`` on a spatial coordinate)
+        into the P1 geometry points, so the cell Jacobian and quad-point coordinates become differentiable
+        in them. A no-op (returns ``pts`` unchanged) when there are no coordinate parameters. Called once
+        per residual/Jacobian evaluation; the resulting dynamic points thread down into ``_cell_fields``."""
+        if not _coord_specs or args is None:
+            return pts
+        for _ids, _axis, _name in _coord_specs:
+            if _name in args:
+                pts = pts.at[_ids, _axis].set(jnp.asarray(args[_name], dtype=pts.dtype).reshape(-1))
+        return pts
+
+    def _cell_fields(c, cell_sols, pts=pts_j):
         """Per-field ``(phi, dphi_phys, cell_sol)`` and shared ``(xq, meas)`` for cell c.
 
         ``cell_sols`` is a list of this cell's local DOF values per field, shape
         ``(n_local_i, vec_i)``. The residual path gathers them from the global state; the
         per-cell Jacobian path passes a *differentiated* local slice so ``jax.jacfwd`` sees
         an element-sized (not global) input — keeping the AD intermediate O(n_local), not
-        O(n_dofs)."""
-        verts = pts_j[cells_j[c]]  # (dim+1, dim)
+        O(n_dofs). ``pts`` is the (possibly coordinate-parameter-scattered) P1 geometry points;
+        it defaults to the static mesh and is overridden per-eval when coordinates are trainable."""
+        verts = pts[cells_j[c]]  # (dim+1, dim)
         J = jnp.stack([verts[i + 1] - verts[0] for i in range(dim)], axis=1)  # (dim, dim) columns = edges
         detJ = jnp.linalg.det(J)
         xq = verts[0][None, :] + qp_shared @ J.T  # (n_quad, dim) physical qp
@@ -901,15 +962,22 @@ def assemble_fem_native(
     parent_j = jnp.asarray(conn.parent_cell, dtype=jnp.int32)
     lface_j = jnp.asarray(conn.local_face, dtype=jnp.int32)
 
-    def _vol_elem_res(c, local_all, coeff, tfi, rnames, t=0.0, args=None):
+    def _surface_normals(pts):
+        """Outward unit facet normals for the current geometry ``pts``: the frozen static normals when no
+        coordinates are trainable (fast path), else recomputed differentiably from the moved vertices."""
+        if conn.n_bfaces == 0 or not _coord_specs:
+            return normals_j
+        return _face_normals_jax(pts, _facet_verts_j, _facet_sign_j)
+
+    def _vol_elem_res(c, local_all, coeff, tfi, rnames, t=0.0, args=None, pts=None):
         """Element residual of one volume term on cell ``c`` as a function of that cell's gathered
         all-field local DOFs ``local_all`` -> ``(n_test_dofs_tfi,)``. Driving the AD off this
         element-sized input (not the global state) is what keeps the per-cell Jacobian's intermediate
         O(n_local) instead of O(n_dofs). ``t`` / ``args`` carry the runtime time and parameters, packed
         per cell into volume_vars BEFORE the region masks (layout [temporal..., runtime_param...,
-        region_mask...])."""
+        region_mask...]). ``pts`` is the coordinate-parameter-scattered geometry (``None`` -> static mesh)."""
         cell_sols = _split_cell_local(local_all)
-        per, xq, meas = _cell_fields(c, cell_sols)
+        per, xq, meas = _cell_fields(c, cell_sols, pts_j if pts is None else pts)
         # Element size h = |detJ|^(1/dim) at the quad points -> the `dom.cell_size` symbol (SUPG/GLS).
         # Constant w.r.t. the cell DOFs (geometry only), so the per-cell Jacobian sees it as a constant.
         h_qp = jnp.broadcast_to(meas ** (1.0 / dim), (qw_shared.shape[0], 1))
@@ -1003,14 +1071,15 @@ def assemble_fem_native(
             )
         return out
 
-    def _surf_elem_res(fi, local_all, bcoeff, btfi, region, t=0.0, args=None):
+    def _surf_elem_res(fi, local_all, bcoeff, btfi, region, t=0.0, args=None, pts=None, normals=None):
         """Element residual of one surface term on boundary face ``fi`` as a function of the parent
-        cell's gathered all-field local DOFs ``local_all`` -> ``(n_test_dofs_btfi,)``."""
+        cell's gathered all-field local DOFs ``local_all`` -> ``(n_test_dofs_btfi,)``. ``pts`` / ``normals``
+        are the coordinate-parameter-scattered geometry and its facet normals (``None`` -> static mesh)."""
         c = parent_j[fi]
         k = lface_j[fi]
-        n_vec = normals_j[fi]  # (dim,) outward unit normal
+        n_vec = (normals_j if normals is None else normals)[fi]  # (dim,) outward unit normal
         cell_sols = _split_cell_local(local_all)
-        verts = pts_j[cells_j[c]]
+        verts = (pts_j if pts is None else pts)[cells_j[c]]
         J = jnp.stack([verts[i + 1] - verts[0] for i in range(dim)], axis=1)  # (dim, dim)
         K = jnp.linalg.inv(J)
 
@@ -1210,20 +1279,24 @@ def assemble_fem_native(
         def residual(u_flat, t=0.0, args=None):
             R = jnp.zeros(total, dtype=u_flat.dtype)
             local_all = u_flat[cell_all_dofs]  # (n_cell, n_local_all)
+            pts_dyn = _apply_coord_params(pts_j, args)  # trainable coords -> differentiable geometry
 
             for coeff, tfi, rnames in typed_with_masks:
-                elem = jax.vmap(lambda c, la, _e=coeff, _t=tfi, _r=rnames: _vol_elem_res(c, la, _e, _t, _r, t, args))(
-                    jnp.arange(n_cells), local_all
-                )
+                elem = jax.vmap(
+                    lambda c, la, _e=coeff, _t=tfi, _r=rnames: _vol_elem_res(c, la, _e, _t, _r, t, args, pts_dyn)
+                )(jnp.arange(n_cells), local_all)
                 R = R.at[cdofs[tfi].reshape(-1)].add(elem.reshape(-1))
 
+            normals_dyn = _surface_normals(pts_dyn)  # differentiable facet normals under coordinate motion
             for region, face_ids, btyped in surface_work:
                 fids = jnp.asarray(face_ids, dtype=jnp.int32)
                 pcells = parent_j[fids]
                 lv = u_flat[cell_all_dofs[pcells]]  # (n_face, n_local_all)
                 for bcoeff, btfi in btyped:
                     contribs = jax.vmap(
-                        lambda fi, la, _e=bcoeff, _t=btfi, _r=region: _surf_elem_res(fi, la, _e, _t, _r, t, args)
+                        lambda fi, la, _e=bcoeff, _t=btfi, _r=region: _surf_elem_res(
+                            fi, la, _e, _t, _r, t, args, pts_dyn, normals_dyn
+                        )
                     )(fids, lv)
                     R = R.at[cdofs[btfi][pcells].reshape(-1)].add(contribs.reshape(-1))
             return R
@@ -1248,11 +1321,12 @@ def assemble_fem_native(
             # per-cell blocks are simply concatenated (no pre-summation).
             rows_l, cols_l, data_l = [], [], []
             local_all = u_flat[cell_all_dofs]  # (n_cell, n_local_all)
+            pts_dyn = _apply_coord_params(pts_j, args)  # trainable coords -> differentiable geometry
 
             for coeff, tfi, rnames in typed_with_masks:
 
-                def _ke(c, la, _e=coeff, _t=tfi, _r=rnames):
-                    return jax.jacfwd(lambda v: _vol_elem_res(c, v, _e, _t, _r, t, args))(la)
+                def _ke(c, la, _e=coeff, _t=tfi, _r=rnames, _p=pts_dyn):
+                    return jax.jacfwd(lambda v: _vol_elem_res(c, v, _e, _t, _r, t, args, _p))(la)
 
                 Ke = jax.vmap(_ke)(jnp.arange(n_cells), local_all)  # (n_cell, n_test_tfi, n_local_all)
                 r = jnp.broadcast_to(cdofs[tfi][:, :, None], Ke.shape)
@@ -1261,6 +1335,7 @@ def assemble_fem_native(
                 cols_l.append(c.reshape(-1))
                 data_l.append(Ke.reshape(-1))
 
+            normals_dyn = _surface_normals(pts_dyn)  # differentiable facet normals under coordinate motion
             for region, face_ids, btyped in surface_work:
                 fids = jnp.asarray(face_ids, dtype=jnp.int32)
                 pcells = parent_j[fids]
@@ -1268,8 +1343,8 @@ def assemble_fem_native(
                 fcols = cell_all_dofs[pcells]  # (n_face, n_local_all)
                 for bcoeff, btfi in btyped:
 
-                    def _kef(fi, la, _e=bcoeff, _t=btfi, _r=region):
-                        return jax.jacfwd(lambda v: _surf_elem_res(fi, v, _e, _t, _r, t, args))(la)
+                    def _kef(fi, la, _e=bcoeff, _t=btfi, _r=region, _p=pts_dyn, _n=normals_dyn):
+                        return jax.jacfwd(lambda v: _surf_elem_res(fi, v, _e, _t, _r, t, args, _p, _n))(la)
 
                     Kef = jax.vmap(_kef)(fids, lv)  # (n_face, n_test_btfi, n_local_all)
                     fr = jnp.broadcast_to(cdofs[btfi][pcells][:, :, None], Kef.shape)
@@ -1745,7 +1820,14 @@ def assemble_fem_native(
     # each call, kept differentiable in args -- the parameter flows as a JAX array through the kernel
     # coefficient into the per-cell assembly (no float() cast). The same re-assembly handles affine,
     # non-affine and (scalar) parameters uniformly. ----
-    if runtime_parameter_tags or neural_param_names or _dir_net_models or history_specs or surface_history_specs:
+    if (
+        runtime_parameter_tags
+        or neural_param_names
+        or _dir_net_models
+        or history_specs
+        or surface_history_specs
+        or _coord_specs
+    ):
         from ...trace import FemLinearSystem
 
         if nonlinear:
