@@ -609,13 +609,15 @@ def assemble_fem_nonnodal(
     nat_load = nat_load_rt + _incident_const  # the constant boundary load (used by the non-parametric path)
     surf_mass = _surf_mass_of(None)
     if surf_mass is not None or incident_terms:
-        _nonlinear = any(_is_obviously_nonlinear_in_unknown(domain, t) for t in volume_terms)
-        _transient = bool(ic_residuals) or any(_contains_temporal_derivative(t) for t in volume_terms)
-        if _transient or _nonlinear:
+        # The surface mass is a fixed LINEAR block added to the spatial operator A (and the incident load to
+        # b), so it composes with the steady AND transient linear problem (M u̇ + A u = c: the impedance is a
+        # boundary contribution to A, the incident source rides the forcing). A NONLINEAR form is not wired —
+        # the surface block is not re-linearised per Newton step. Raise rather than silently drop it.
+        if any(_is_obviously_nonlinear_in_unknown(domain, t) for t in volume_terms):
             raise NotImplementedError(
                 "jno.fem (non-nodal): the N1E tangential-trace surface terms (impedance / absorbing / incident BC) "
-                "are wired for the steady linear (incl. parametric/inverse) problem only — not with a transient or "
-                "nonlinear form. (Raises rather than silently dropping the surface contribution.)"
+                "compose with the steady and transient LINEAR problem, but not a NONLINEAR form yet (the surface "
+                "mass is a fixed linear block, not re-linearised per step). (Raises rather than silently dropping it.)"
             )
     pins = (
         _flux_bc_pins(flux_bcs, domain, field_index, spaces, top, np.asarray(pts), offs, n_cells, quad_degree, dim=dim)
@@ -715,6 +717,8 @@ def assemble_fem_nonnodal(
 
             def _A_of(args):  # A_aug(args) = [[0, -M2], [K(args), C]]: M2 u̇ = M2 v ; M2 v̇ + C v + K u = F
                 K = jax.jacfwd(lambda u: spatial_res2(u, args))(zeros)
+                if surf_mass is not None:  # N1E tangential-trace surface mass (impedance) → the stiffness K
+                    K = K + surf_mass
                 return _dir_A(jnp.block([[Z, -M2], [K, Cmat]]))
 
             def _f_of(args):  # load F(args) on the v-block rows (Dirichlet g rides affine_bias, not the forcing)
@@ -882,8 +886,10 @@ def assemble_fem_nonnodal(
                 else jnp.ones((total,), dtype=zeros.dtype).at[pin_dofs].set(0.0)
             )
 
-            def operator_fn(t, args=None, _d=pin_dofs):
+            def operator_fn(t, args=None, _d=pin_dofs, _sm=surf_mass):
                 A = jax.jacfwd(lambda u: spatial_res(u, args))(zeros)
+                if _sm is not None:  # N1E tangential-trace surface mass (impedance) → the spatial operator A
+                    A = A + _sm
                 return A if _d is None else A.at[_d, :].set(0.0).at[_d, _d].set(1.0)  # Dirichlet rows -> identity
 
             def forcing_vector_fn(t, args=None, _mask=free_mask):
@@ -905,6 +911,8 @@ def assemble_fem_nonnodal(
 
         # linear transient: M u̇ + A u = c
         A = jax.jacfwd(spatial_res)(zeros)
+        if surf_mass is not None:  # N1E tangential-trace surface mass (impedance) → the spatial operator A
+            A = A + surf_mass
         c = -spatial_res(zeros) + nat_load  # spatial load + natural-BC constant load
         M, A, c = _apply_dirichlet_transient(M, A, c, pins)  # essential edge-trace pins -> M/A/c rows
         return SemidiscreteTimeBlock(M=M, A=A, affine_bias=c, **common), "transient", offs
