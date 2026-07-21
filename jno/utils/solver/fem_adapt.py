@@ -515,7 +515,8 @@ def zz_error_indicators(domain: Any, u_vertex: np.ndarray) -> tuple[np.ndarray, 
         A meshed domain whose P1 gradient geometry is read via
         :func:`jno._fem._fe_element_gradient_data`.
     u_vertex
-        ``(n_vertices,)`` nodal solution values at the mesh vertices.
+        ``(n_vertices,)`` nodal values of a SCALAR field, or ``(n_vertices, vec)`` for a VECTOR field
+        (one column per component). Values may be complex (Helmholtz).
 
     Returns
     -------
@@ -523,17 +524,25 @@ def zz_error_indicators(domain: Any, u_vertex: np.ndarray) -> tuple[np.ndarray, 
         ``eta`` is ``(n_cells,)`` non-negative indicators; ``global_estimate`` is
         ``sqrt(sum eta**2)``, an estimate of the global energy-norm error.
 
+    For a vector field the ZZ energy-norm error generalises to the **sum over components** of the
+    per-component recovered-gradient gaps (the Frobenius norm of the recovered gradient-*tensor* gap), so
+    one scalar indicator per cell still drives refinement.
+
     Reference: Zienkiewicz & Zhu (1987), IJNME 24, 337-357.
     """
-    g_star, g_cell, area, cells = _recover_nodal_gradient(domain, u_vertex)
+    u = np.asarray(u_vertex)
+    comps = [u[:, c] for c in range(u.shape[1])] if (u.ndim == 2 and u.shape[1] > 1) else [u.reshape(-1)]
 
-    # elementwise gap, integrated over the cell (centroid rule: P1 g_cell is exact
-    # there and the centroid value of the P1-recovered field is the vertex mean).
-    # For a COMPLEX field ``u_vertex`` the gradient gap is complex and the energy-norm error uses
-    # its modulus: ``|g* - grad u_h|^2``. Since ``|x|^2 == x^2`` for reals, this stays exact in the
-    # real case -- so one indicator drives refinement for real and complex (Helmholtz) fields alike.
-    g_star_centroid = g_star[cells].mean(axis=1)  # (n_cells, dim)
-    eta2 = area * np.sum(np.abs(g_star_centroid - g_cell) ** 2, axis=1)  # (n_cells,), real
+    # elementwise gap, integrated over the cell (centroid rule: P1 g_cell is exact there and the centroid
+    # value of the P1-recovered field is the vertex mean), summed over the field's components. For a COMPLEX
+    # component the gap is complex and the energy-norm uses its modulus ``|g* - grad u_h|^2`` (exact for
+    # reals since ``|x|^2 == x^2``) -- so one indicator drives real, complex and vector fields alike.
+    eta2 = None
+    for uc in comps:
+        g_star, g_cell, area, cells = _recover_nodal_gradient(domain, uc)
+        g_star_centroid = g_star[cells].mean(axis=1)  # (n_cells, dim)
+        e = area * np.sum(np.abs(g_star_centroid - g_cell) ** 2, axis=1)  # (n_cells,), real
+        eta2 = e if eta2 is None else eta2 + e
     eta = np.sqrt(np.maximum(eta2, 0.0))
     return eta, float(np.sqrt(eta2.sum()))
 
@@ -982,22 +991,26 @@ def _rel_change(cur: Any, prev: Any) -> float:
     return diff / denom if denom > 0.0 else diff
 
 
-def _solve_vertex_values(fem: Any, solve_fn: Any = None, **kwargs: Any) -> np.ndarray:
-    """Solve ``fem`` and return the nodal solution at the mesh vertices as a plain
-    ``(n_vertices,)`` array -- complex-valued if the form is complex.
+def _solve_vertex_values(fem: Any, solve_fn: Any = None, *, allow_vector: bool = False, **kwargs: Any) -> np.ndarray:
+    """Solve ``fem`` and return the nodal solution at the mesh vertices -- complex-valued if the form is
+    complex.
 
-    Scalar P1 returns all DOFs; a higher-order scalar field (e.g. P2/TET10) returns its **vertex**
-    DOFs (the first ``n_vertices`` entries, which are nodal), which drive the ZZ estimator. Vector /
-    multifield problems are rejected -- refine on a scalar readout instead."""
+    Scalar P1 returns all DOFs as ``(n_vertices,)``; a higher-order scalar field (e.g. P2/TET10) returns
+    its **vertex** DOFs (the first ``n_vertices`` entries, which are nodal). With ``allow_vector=True`` a
+    P1 **vector** field returns its node-major nodal values reshaped to ``(n_vertices, vec)`` (which the ZZ
+    estimator sums over components); without it -- and for a higher-order vector field, whose vertex DOFs
+    are not a simple prefix -- a vector problem is rejected (refine on a scalar readout instead)."""
     from jno._fem import _infer_vec  # local import: fem_adapt is loaded lazily by the domain
 
     sol = np.asarray(fem.solve(solve_fn, **kwargs)).reshape(-1)
     n_vert = int(np.asarray(fem.domain.mesh.points).shape[0])
     vec = _infer_vec(fem._constraints) if getattr(fem, "_constraints", None) else 1
     if vec != 1:
+        if allow_vector and sol.shape[0] == n_vert * vec:
+            return sol.reshape(n_vert, vec)  # node-major P1 vector: (n_vert, vec), one column per component
         raise NotImplementedError(
-            f"The ZZ estimator supports a scalar field; got a vector field (vec={vec}). "
-            "Refine per component or on a scalar readout instead."
+            f"The ZZ estimator supports a scalar field or a P1 vector field; got a vector field (vec={vec})"
+            f"{' with a non-P1 DOF layout' if allow_vector else ''}. Refine per component or on a scalar readout."
         )
     if sol.shape[0] == n_vert:
         return sol
@@ -1032,7 +1045,12 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
     prev_est = None
     n_converged = 0
     for it in range(spec.max_iters):
-        u = _solve_vertex_values(cur, solve_fn, **kwargs)
+        u = _solve_vertex_values(cur, solve_fn, allow_vector=True, **kwargs)
+        if u.ndim == 2 and spec.anisotropic:  # vector field: the ZZ estimator sums components, but the
+            raise NotImplementedError(  # anisotropic Hessian metric is scalar-only (a single Hessian field)
+                "anisotropic (Hessian-metric) adaptation is scalar-only; use isotropic ZZ "
+                "(AdaptSpec(anisotropic=False)) to refine a vector field."
+            )
         eta, est = zz_error_indicators(d, u)
         n_dofs = int(np.asarray(d.mesh.points).shape[0])
         marked = None if spec.anisotropic else dorfler_mark(eta, spec.theta)

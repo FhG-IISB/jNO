@@ -196,16 +196,19 @@ def test_absorbing_source_survives_repeated_remesh():
         assert a > 0.5, f"the absorbing source must survive remesh (|u| mean {a:.3f}); stale-tag regression"
 
 
-def test_adaptive_rejects_vector_field():
-    """A vector field has no scalar ZZ indicator -> a clear error, not a wrong slice."""
+def test_adaptive_supports_vector_field():
+    """A vector field now drives h-adaptivity: the ZZ estimator sums the per-component recovered-gradient
+    errors (one scalar indicator per cell), so the adaptive solve runs and returns the vector solution
+    rather than rejecting it. (Per-component recovery + estimate-drop are checked in tests/test_fem_adapt.py.)"""
     d = jno.domain(box(0, 0, 1, 1), mesh_size=0.2)
     w, z = d.fem_symbols(value_shape=(2,), names=("w", "z"))
     xi, yi, _ = d.variable("interior", split=True)
-    wi, zi = w.bind(x=xi, y=yi), z.bind(x=xi, y=yi)
     xb, yb, _ = d.variable("boundary", split=True)
-    fem = jno.fem([wi[0] * zi[0] + wi[1] * zi[1] - (zi[0] + zi[1]), w(xb, yb)[0] - 0.0, w(xb, yb)[1] - 0.0])
-    with pytest.raises(NotImplementedError, match="scalar field"):
-        fem.solve(adapt=AdaptSpec(max_iters=2), solve_fn=sparse_lu_solve)
+    zi = z.bind(x=xi, y=yi)
+    weak = jno.np.inner(jno.np.grad(w, [xi, yi]), jno.np.grad(z, [xi, yi]), n_contract=2) - (zi[0] + zi[1])
+    fem = jno.fem([weak, w(xb, yb)[0] - 0.0, w(xb, yb)[1] - 0.0])
+    sol = np.asarray(fem.solve(adapt=AdaptSpec(max_iters=2), solve_fn=sparse_lu_solve)).reshape(-1)
+    assert sol.shape[0] == 2 * len(fem.domain.mesh.points), "vector adaptive solve returns 2 DOFs per node"
 
 
 def test_adaptive_anisotropic_rejects_complex():

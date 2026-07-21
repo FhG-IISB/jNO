@@ -570,3 +570,49 @@ def test_adaptive_beats_uniform_on_l_shape():
     assert finer, "uniform sequence should include a mesh at least as fine as the adaptive result"
     uniform_true_at_matched = min(e for _, e in finer)
     assert a_final_true < uniform_true_at_matched
+
+
+def test_adapt_vector_field_isotropic_refines_and_estimate_drops():
+    """h-adaptivity on a VECTOR field: the ZZ estimator sums the per-component recovered-gradient errors,
+    so one indicator refines the mesh where the vector solution varies sharply. The largest indicator sits
+    at the feature, and the adaptive loop adds DOFs and cuts the global estimate (isotropic ZZ)."""
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.12).domain()
+    u, phi = d.fem_symbols(value_shape=(2,))
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    vi = phi.bind(x=xi, y=yi)
+    peak = 30.0 * J.exp(-90.0 * ((xi - 0.62) ** 2 + (yi - 0.37) ** 2))  # sharp, off-center (component 0)
+    smooth = 2.0 * (xi * (1 - xi) + yi * (1 - yi))  # smooth (component 1)
+    weak = jno.np.inner(jno.np.grad(u, [xi, yi]), jno.np.grad(phi, [xi, yi]), n_contract=2) - (
+        peak * vi.component(0) + smooth * vi.component(1)
+    )
+    fem = jno.fem([weak, u(xb, yb) - 0.0])
+    n0 = len(d.mesh.points)
+
+    u0 = _solve_vertex_values(fem, allow_vector=True)  # node-major vector nodal values
+    assert u0.shape == (n0, 2), "a P1 vector field returns (n_vert, vec)"
+    eta0, _est0 = zz_error_indicators(d, u0)
+    cent = np.asarray(d.mesh.points)[:, :2][np.asarray(d.mesh.cells_dict["triangle"])].mean(axis=1)
+    assert np.linalg.norm(cent[int(np.argmax(eta0))] - (0.62, 0.37)) < 0.3, "the largest ZZ indicator sits at the feature"
+
+    fem.solve(adapt=AdaptSpec(theta=0.6, max_iters=3, refine_factor=1.7))
+    hist = fem.adapt_history
+    assert hist[-1]["n_dofs"] > n0, "vector h-adapt must add DOFs at the feature"
+    assert hist[-1]["estimate"] < hist[0]["estimate"], "vector h-adapt should reduce the ZZ estimate"
+
+
+def test_adapt_vector_field_anisotropic_rejected():
+    """The anisotropic Hessian metric is a single scalar-field Hessian, so a vector field must fall back to
+    the (now vector-aware) isotropic ZZ path -- ``anisotropic=True`` on a vector field fails loud."""
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.2).domain()
+    u, phi = d.fem_symbols(value_shape=(2,))
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    vi = phi.bind(x=xi, y=yi)
+    f = 2.0 * (xi * (1 - xi) + yi * (1 - yi))
+    weak = jno.np.inner(jno.np.grad(u, [xi, yi]), jno.np.grad(phi, [xi, yi]), n_contract=2) - (
+        f * vi.component(0) + f * vi.component(1)
+    )
+    fem = jno.fem([weak, u(xb, yb) - 0.0])
+    with pytest.raises(NotImplementedError, match="scalar-only"):
+        fem.solve(adapt=AdaptSpec(theta=0.6, max_iters=2, anisotropic=True))
