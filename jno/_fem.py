@@ -634,18 +634,28 @@ def _eval_value_node_at(value_node: Any, points: Any, params: Any = None) -> Any
 
     tags = {v.tag for v in _walk(value_node) if isinstance(v, Variable)}
     pts = jnp.atleast_2d(jnp.asarray(points))
-    # Register every ModelCall (parameter / network) so the evaluator resolves it, substituting a runtime
-    # parameter's value from ``params`` when supplied (else its stored value → a plain forward pass).
+    # Register every ModelCall (parameter / network) so the evaluator resolves it. With ``params`` (the
+    # runtime ``args``), substitute a trainable parameter's value OR a trainable network's live module from
+    # it, so the coefficient stays differentiable in the design variable; else use the stored module
+    # (a plain forward pass / a frozen net).
     table: dict = {}
     _mcs = [nd for nd in _walk(value_node) if type(nd).__name__ == "ModelCall"]
     if _mcs:
         import equinox as eqx
 
+        from .utils.solver.parametric_helpers import _neural_coefficient_name
+
         for nd in _mcs:
-            mod, name = nd.model.module, getattr(nd.model, "_parameter_name", None)
-            if params and name is not None and name in params and getattr(nd.model, "_is_parameter", False):
-                mod = eqx.tree_at(lambda m: m.value, mod, jnp.asarray(params[name]))
-            table[nd.model.layer_id] = mod
+            m = nd.model
+            mod = m.module
+            if params:
+                if getattr(m, "_is_parameter", False):
+                    pn = getattr(m, "_parameter_name", None)
+                    if pn is not None and pn in params:  # trainable parameter: substitute its .value
+                        mod = eqx.tree_at(lambda mm: mm.value, mod, jnp.asarray(params[pn]))
+                elif (nn := _neural_coefficient_name(nd)) in params:  # trainable network: its live module
+                    mod = params[nn]
+            table[m.layer_id] = mod
     return jnp.reshape(TraceEvaluator(table).evaluate(value_node, context={t: pts for t in tags}), (-1,))
 
 

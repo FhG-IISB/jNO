@@ -1087,10 +1087,11 @@ def test_transient_nonnodal_mass_net_guard():
         jno.fem([(1.0 + net2(xi, yi)) * ui.t * vi + (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - u0])
 
 
-def test_nonnodal_trainable_net_in_boundary_term_guard():
-    """On a non-nodal element a *trainable* net in a Neumann/Robin (boundary) term fails loud — the
-    natural-BC load is assembled non-differentiably there. (Native folds boundary nets into the
-    kernel table; the non-nodal path deliberately does not — this pins that divergence.)"""
+def test_nonnodal_trainable_net_in_host_assembled_boundary_term_guard():
+    """On a non-nodal element a *trainable* net in a HOST-ASSEMBLED natural-BC (RT pressure / plate moment)
+    boundary term fails loud — that load is baked non-differentiably. (The N1E tangential-trace impedance /
+    incident SURFACE BC now IS neural-differentiable — see test_fem_nedelec_impedance; only these
+    host-assembled families are not, so the guard is now narrow and names the case.)"""
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.3)
     xi, yi, _ = d.variable("interior", split=True)
     xr, yr, _ = d.variable("right", split=True)
@@ -1099,7 +1100,7 @@ def test_nonnodal_trainable_net_in_boundary_term_guard():
     ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
     wr = phi.bind(x=xr, y=yr)
     net = _mlp_net(key=22)
-    with pytest.raises(NotImplementedError, match="boundary"):
+    with pytest.raises(NotImplementedError, match="host-assembled|natural-BC|neural coefficient"):
         jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, net(xr, yr) * wr, u(xl, yl) - 0.0])
 
 
