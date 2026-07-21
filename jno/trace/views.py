@@ -479,6 +479,30 @@ class VectorView(_DelegatesToPlaceholder):
         """Wrap ``new_expr`` in the same view subclass as ``self``."""
         return VectorView(new_expr)
 
+    def _frozen_domain_tag(self):
+        """The mesh domain + spatial region tag from this view's ``.bind(...)`` coords, so a frozen field
+        can map its nodal values onto the region (shared by :meth:`freeze` / :meth:`freeze_path`)."""
+        cv = getattr(self, "_coord_vars", None)
+        for _var in (cv or {}).values():
+            if getattr(_var, "axis", "spatial") == "temporal":
+                continue  # x/y/z share the spatial region tag; skip the time coordinate
+            if getattr(_var, "_domain", None) is not None:
+                return cv, _var._domain, getattr(_var, "tag", None)
+        return cv, None, None
+
+    def freeze(self, values) -> "VectorView":
+        """Pin this VECTOR field's DOFs to the known nodal array ``values`` of shape ``(n_nodes, vec)`` --
+        the vector analogue of :meth:`ScalarView.freeze`. The returned view (and its component/gradient
+        views) give that KNOWN vector field at the quadrature points, so it conditions a coefficient while
+        the weak form stays LINEAR in the live unknown -- e.g. a precomputed vector field (a velocity, a
+        prior displacement) driving a coefficient. Coordinate bindings from ``.bind(x=, y=, z=)`` are
+        preserved. See :class:`jno.trace.FrozenField`."""
+        from . import FrozenField
+
+        cv, domain, coord_tag = self._frozen_domain_tag()
+        view = VectorView(FrozenField(self._expr, values, domain=domain, coord_tag=coord_tag))
+        return _coords_dispatch(view, (), dict(cv)) if cv else view
+
     @property
     def complex(self) -> "ComplexVectorView":
         """Reinterpret this vector field as a **complex vector** ``[..., d, 2]`` (last axis =

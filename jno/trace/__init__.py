@@ -3563,7 +3563,10 @@ class FrozenField(Placeholder):
         self.space = str(getattr(source, "space", "Lagrange"))
         self.op_id = _next_op_id()
         self.field_key = source.field_key  # share the source field's shape data
-        self.values = jnp.asarray(values).reshape(-1)  # global nodal vector (scalar field)
+        _v = jnp.asarray(values)
+        # scalar field: a flat global nodal vector (n_nodes,); VECTOR field: (n_nodes, vec) so the assembler
+        # gathers each cell's per-node vec-vectors (the kernel interpolates either). value_shape is set above.
+        self.values = _v.reshape(-1) if self.num_components == 1 else _v.reshape(-1, self.num_components)
         self.frozen_id = _next_op_id()  # kernel gather-table key
         # Standalone ``.eval()`` support (distinct from the kernel gather-table used during assembly):
         # the mesh domain + the coordinate region this field was bound to, so the evaluator can map the
