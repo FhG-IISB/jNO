@@ -622,19 +622,29 @@ def assemble_fem_nonnodal(
         else jnp.zeros(total)
     )
 
+    # Host-static face geometry / region membership for the N1E surface terms, built ONCE. It does not
+    # depend on the runtime parameters, and rebuilding it per evaluation was both the dominant cost of a
+    # parametric assembly and what made the path un-`jit`-able (a host `np.where` cannot see a tracer).
+    _inc_static = (
+        _n1e_surface_static("load", incident_terms, domain, spaces, top, np.asarray(pts), offs, quad_degree, dim)
+        if incident_terms
+        else None
+    )
+    _surf_static = (
+        _n1e_surface_static("mass", surface_terms, domain, spaces, top, np.asarray(pts), offs, quad_degree, dim)
+        if surface_terms
+        else None
+    )
+
     def _incident_of(params):  # N1E incident forcing ∫ g·(n×v) → b
         if not incident_terms:
             return jnp.zeros(total)
-        return _assemble_n1e_surface_load(
-            total, incident_terms, domain, spaces, top, np.asarray(pts), offs, quad_degree, dim, params=params
-        )
+        return _assemble_n1e_surface_load(total, _inc_static, params=params)
 
-    def _surf_mass_of(params):  # N1E tangential-trace impedance mass ∫ c(n×u)·(n×v) → A
+    def _surf_mass_of(params, sparse=False):  # N1E tangential-trace impedance mass ∫ c(n×u)·(n×v) → A
         if not surface_terms:
             return None
-        return _assemble_n1e_surface_mass(
-            total, surface_terms, domain, spaces, top, np.asarray(pts), offs, quad_degree, dim, params=params
-        )
+        return _assemble_n1e_surface_mass(total, _surf_static, params=params, sparse=sparse)
 
     _incident_const = _incident_of(None)
     nat_load = nat_load_rt + _incident_const  # the constant boundary load (used by the non-parametric path)
@@ -1033,12 +1043,13 @@ def assemble_fem_nonnodal(
             data_l.append(Ke.reshape(-1))
 
         rows, cols, data = jnp.concatenate(rows_l), jnp.concatenate(cols_l), jnp.concatenate(data_l)
-        sm = _surf_mass_of(args)  # tangential-trace surface mass (impedance); re-assembled per args
+        # Tangential-trace surface mass (impedance BC), re-evaluated per args. Taken SPARSE: densifying
+        # it here would cost O(n_dof²) just to re-sparsify, which is the memory wall for a 3-D vector run.
+        sm = _surf_mass_of(args, sparse=True)
         if sm is not None:  # BCOO add = triplet concat; duplicate indices sum on materialisation
-            smb = _jsparse.BCOO.fromdense(jnp.asarray(sm))
-            rows = jnp.concatenate([rows, smb.indices[:, 0]])
-            cols = jnp.concatenate([cols, smb.indices[:, 1]])
-            data = jnp.concatenate([data, smb.data])
+            rows = jnp.concatenate([rows, sm.indices[:, 0]])
+            cols = jnp.concatenate([cols, sm.indices[:, 1]])
+            data = jnp.concatenate([data, sm.data])
         idx = jnp.stack([rows.astype(jnp.int32), cols.astype(jnp.int32)], axis=1)
         return _jsparse.BCOO((data, idx), shape=(total, total))
 
@@ -1273,79 +1284,126 @@ def _n1e_region_faces(fc, region_nodes):
             yield bf
 
 
-def _assemble_n1e_surface_mass(total, surface_terms, domain, spaces, top, pts_np, offs, quad_degree, dim, params=None):
-    """Assemble the tangential-trace surface mass ``∑ ∫_Γ c (n×φ_a)·(n×φ_b) dS`` (N1E impedance /
-    absorbing BC) into a dense ``(total, total)`` matrix to ADD to the stiffness ``A``.
+def _bcast_surface_vals(vals, n, nq, comp=None):
+    """Broadcast an evaluated surface coefficient to ``(n, nq)`` (or ``(n, nq, comp)``).
 
-    The tangential projection ``(n×φ_a)·(n×φ_b) = φ_a·φ_b − (φ_a·n)(φ_b·n)`` is integrated over the
-    region's boundary faces with the physical face measure. 3-D N1E only. The face geometry / dof map is
-    host-static (the mesh is fixed); only the coefficient value ``c`` and the scatter are JAX, so with a
-    runtime parameter in ``c`` (``params``) the surface mass stays **differentiable** in it (inverse
-    design of a surface impedance)."""
-    from ..._fem import _eval_value_node_at
+    ``_eval_value_node_at`` returns as few values as the node needs: a CONSTANT coefficient collapses to
+    a single entry however many points it was handed, a per-point one returns all of them. Batching the
+    faces means the caller must accept either, so dispatch on size rather than assuming the full shape."""
+    v = jnp.asarray(vals).reshape(-1)
+    tail = () if comp is None else (comp,)
+    full = n * nq * (1 if comp is None else comp)
+    if v.size == full:
+        return v.reshape((n, nq) + tail)
+    if comp is not None and v.size == comp:  # one constant vector for every point
+        return jnp.broadcast_to(v.reshape((1, 1, comp)), (n, nq, comp))
+    if v.size == nq * (1 if comp is None else comp):  # per-quad-point, face-independent
+        return jnp.broadcast_to(v.reshape((1, nq) + tail), (n, nq) + tail)
+    return jnp.broadcast_to(v.reshape((1,) * (2 + len(tail))), (n, nq) + tail)  # scalar
+
+
+def _n1e_surface_static(kind, terms, domain, spaces, top, pts_np, offs, quad_degree, dim):
+    """HOST-STATIC per-(face, term) structure for an N1E surface term — built ONCE.
+
+    The mesh, the region membership and the face geometry do not depend on the runtime parameters, yet
+    this was rebuilt on EVERY operator evaluation: a Python loop over every boundary face, plus a host
+    ``np.where`` region lookup, per assembly. That both dominated the parametric assembly cost and made
+    the whole path un-``jit``-able (a host ``np.where`` cannot see a tracer). Hoisting it leaves the
+    per-args path pure JAX.
+
+    ``kind`` is ``"mass"`` (tangential ``φ·φ − (φ·n)(φ·n)``, the impedance BC) or ``"load"`` (``φ×n``,
+    the incident source). Entries are grouped by coefficient node so each group evaluates and scatters
+    in ONE batched op instead of one per face.
+
+    Returns ``(groups, fqw)`` with ``groups = [(coeff_node, gdofs(n,6), tens(n,nq,...), xq(n,nq,3),
+    measure(n,)), ...]``."""
     from .fem_1d import _region_node_ids
 
     fidx, cells, fc, fqp, fqw, face_rv, signs, cell_edges = _n1e_surface_precompute(domain, top, quad_degree, spaces, dim)
     fqw = np.asarray(fqw)
-    # STATIC per-(face, term) structure (host): the dof block, the tangential φ·φ tensor, quad points, measure.
-    entries = []
-    for region, coeff_nodes in surface_terms.items():
+    groups = {}  # id(coeff node) -> [node, gdofs[], tens[], xq[], measure[]]  (insertion-ordered)
+    for region, nodes in terms.items():
         region_nodes = {int(n) for n in _region_node_ids(domain, region)}
         for bf in _n1e_region_faces(fc, region_nodes):
             c, phi, nhat, measure, xq = _n1e_face_geometry(bf, cells, fc, pts_np, top, face_rv, fqp, signs)
-            pn = phi @ nhat  # (nqf, 6) normal component
-            tang = np.einsum("qai,qbi->qab", phi, phi) - np.einsum("qa,qb->qab", pn, pn)  # tangential φ·φ
+            if kind == "mass":
+                pn = phi @ nhat  # (nqf, 6) normal component
+                tens = np.einsum("qai,qbi->qab", phi, phi) - np.einsum("qa,qb->qab", pn, pn)
+            else:
+                tens = np.cross(phi, nhat)  # (nqf, 6, 3) = φ_a × n (the authored `v.vector.cross(nvec)`)
             gdofs = np.asarray(offs[fidx] + cell_edges[c], dtype=np.int64)
-            for coeff in coeff_nodes:  # each surface term in this region adds coeff·(surface mass)
-                entries.append((gdofs, np.asarray(tang), np.asarray(xq), np.asarray(measure), coeff))
-    if not entries:
-        return jnp.zeros((total, total))
-    # VALUE + SCATTER (JAX, differentiable in ``params``): evaluate c at the quad points and add the block.
-    blocks = []
-    for gdofs, tang, xq, measure, coeff in entries:
-        cval = jnp.ones(len(fqw)) if coeff is None else _eval_value_node_at(coeff, jnp.asarray(xq), params=params)
-        blocks.append((jnp.asarray(gdofs), jnp.einsum("q,qab->ab", jnp.asarray(fqw * measure) * cval, jnp.asarray(tang))))
-    dt = jnp.result_type(*[b.dtype for _, b in blocks])
-    S = jnp.zeros((total, total), dt)
-    for gd, block in blocks:
-        S = S.at[gd[:, None], gd[None, :]].add(block.astype(dt))
-    return S
+            for node in nodes:
+                g = groups.setdefault(id(node), [node, [], [], [], []])
+                g[1].append(gdofs)
+                g[2].append(np.asarray(tens))
+                g[3].append(np.asarray(xq))
+                g[4].append(float(measure))
+    out = [
+        (node, np.stack(gd), np.stack(tn), np.stack(xq), np.asarray(ms, dtype=float))
+        for node, gd, tn, xq, ms in groups.values()
+    ]
+    return out, fqw
 
 
-def _assemble_n1e_surface_load(total, load_terms, domain, spaces, top, pts_np, offs, quad_degree, dim, params=None):
-    """Assemble the tangential incident/forcing surface term ``∑ ∫_Γ g·(φ_a×n) dS`` (the ``inner(g, n×v)``
-    RHS of the Silver–Müller ABC) into a dense ``(total,)`` load vector to ADD to ``b``. 3-D N1E only.
+def _assemble_n1e_surface_mass(total, static, params=None, sparse=False):
+    """Tangential-trace surface mass ``∑ ∫_Γ c (n×φ_a)·(n×φ_b) dS`` (the N1E impedance / absorbing BC),
+    to ADD to the stiffness ``A``.
 
-    ``g`` is a prescribed (possibly complex, possibly spatial) tangential source; the test factor ``φ_a×n``
-    matches the authored ``v.vector.cross(nvec)`` and uses the same OUTWARD normal as the impedance mass.
-    Host-static face geometry; the source value ``g`` and the scatter are JAX, so a runtime parameter in
-    ``g`` (``params``) keeps the incident load **differentiable** (inverse design of an incident source)."""
+    Pure JAX over the host-static structure from :func:`_n1e_surface_static`, so it is differentiable in
+    a runtime parameter inside ``c`` (inverse design of a surface impedance) AND ``jit``-able. With
+    ``sparse=True`` it returns COO triplets as a BCOO instead of a dense ``(total, total)`` matrix —
+    a dense one is ``O(n_dof²)``, which for a 3-D vector problem is the memory wall, not a detail."""
     from ..._fem import _eval_value_node_at
-    from .fem_1d import _region_node_ids
 
-    fidx, cells, fc, fqp, fqw, face_rv, signs, cell_edges = _n1e_surface_precompute(domain, top, quad_degree, spaces, dim)
-    fqw = np.asarray(fqw)
-    entries = []  # STATIC per-(face, term) structure: dof block, φ×n, quad points, measure
-    for region, g_nodes in load_terms.items():
-        region_nodes = {int(n) for n in _region_node_ids(domain, region)}
-        for bf in _n1e_region_faces(fc, region_nodes):
-            c, phi, nhat, measure, xq = _n1e_face_geometry(bf, cells, fc, pts_np, top, face_rv, fqp, signs)
-            phi_x_n = np.cross(phi, nhat)  # (nqf, 6, 3) = φ_a × n  (the authored `v.vector.cross(nvec)`)
-            gdofs = np.asarray(offs[fidx] + cell_edges[c], dtype=np.int64)
-            for g in g_nodes:
-                entries.append((gdofs, np.asarray(phi_x_n), np.asarray(xq), np.asarray(measure), g))
-    if not entries:
+    groups, fqw = static
+    if not groups:
+        return None if sparse else jnp.zeros((total, total))
+    nq = len(fqw)
+    rows_l, cols_l, data_l = [], [], []
+    for node, gd, tn, xq, ms in groups:
+        n = gd.shape[0]
+        pts_flat = jnp.asarray(xq).reshape(-1, xq.shape[-1])
+        cval = (
+            jnp.ones((n, nq))
+            if node is None
+            else _bcast_surface_vals(_eval_value_node_at(node, pts_flat, params=params), n, nq)
+        )
+        wq = jnp.asarray(fqw)[None, :] * jnp.asarray(ms)[:, None] * cval  # (n, nq) quad weight x measure x c
+        blk = jnp.einsum("nq,nqab->nab", wq, jnp.asarray(tn))  # (n, 6, 6) element surface-mass blocks
+        g = jnp.asarray(gd)
+        rows_l.append(jnp.broadcast_to(g[:, :, None], blk.shape).reshape(-1))
+        cols_l.append(jnp.broadcast_to(g[:, None, :], blk.shape).reshape(-1))
+        data_l.append(blk.reshape(-1))
+    rows, cols, data = jnp.concatenate(rows_l), jnp.concatenate(cols_l), jnp.concatenate(data_l)
+    if sparse:
+        from jax.experimental import sparse as _jsp
+
+        idx = jnp.stack([rows.astype(jnp.int32), cols.astype(jnp.int32)], axis=1)
+        return _jsp.BCOO((data, idx), shape=(total, total))  # duplicate (i,j) sum on materialisation
+    return jnp.zeros((total, total), data.dtype).at[rows, cols].add(data)
+
+
+def _assemble_n1e_surface_load(total, static, params=None):
+    """Tangential incident/forcing surface term ``∑ ∫_Γ g·(φ_a×n) dS`` (the ``inner(g, n×v)`` RHS of the
+    Silver-Müller ABC) as a ``(total,)`` load to ADD to ``b``. Pure JAX over the host-static structure,
+    so a runtime parameter in ``g`` stays differentiable (inverse design of an incident source)."""
+    from ..._fem import _eval_value_node_at
+
+    groups, fqw = static
+    if not groups:
         return jnp.zeros(total)
-    contribs = []  # VALUE + SCATTER (JAX, differentiable in ``params``)
-    for gdofs, phi_x_n, xq, measure, g in entries:
-        gval = _eval_value_node_at(g, jnp.asarray(xq), params=params).reshape(len(fqw), 3)  # (nqf, 3)
-        integrand = jnp.einsum("qi,qai->qa", gval, jnp.asarray(phi_x_n))  # g·(φ_a×n)
-        contribs.append((jnp.asarray(gdofs), jnp.einsum("q,qa->a", jnp.asarray(fqw * measure), integrand)))
-    dt = jnp.result_type(*[c.dtype for _, c in contribs])
-    b = jnp.zeros(total, dt)
-    for gd, contrib in contribs:
-        b = b.at[gd].add(contrib.astype(dt))
-    return b
+    nq = len(fqw)
+    idx_l, val_l = [], []
+    for node, gd, tn, xq, ms in groups:
+        n = gd.shape[0]
+        pts_flat = jnp.asarray(xq).reshape(-1, xq.shape[-1])
+        gval = _bcast_surface_vals(_eval_value_node_at(node, pts_flat, params=params), n, nq, comp=3)
+        integrand = jnp.einsum("nqi,nqai->nqa", gval, jnp.asarray(tn))  # g·(φ_a×n)
+        wq = jnp.asarray(fqw)[None, :] * jnp.asarray(ms)[:, None]  # (n, nq)
+        idx_l.append(jnp.asarray(gd).reshape(-1))
+        val_l.append(jnp.einsum("nq,nqa->na", wq, integrand).reshape(-1))
+    ids, vals = jnp.concatenate(idx_l), jnp.concatenate(val_l)
+    return jnp.zeros(total, vals.dtype).at[ids].add(vals)
 
 
 def _apply_natural_boundary_terms(b, boundary_terms, domain, field_index, spaces, top, pts_np, offs, n_cells, quad_degree):
