@@ -124,6 +124,14 @@ class SemidiscreteTimeBlock:
     mass: Optional[Callable] = None
     residual: Optional[Callable] = None
     nonlinear_runtime: Dict[str, Any] = field(default_factory=dict)
+    # STATE-DEPENDENT (nonlinear) MASS. When a transient mass term's coefficient depends on the unknown
+    # (``c(u)·u_t·v``) the mass cannot be a fixed matrix. It is carried instead as the backward-Euler mass
+    # *residual* ``mass_residual(u, t, args) = ∫ c(u)·(u − u_prev)·v`` (its ``1/dt`` applied by the step)
+    # and its exact Jacobian ``mass_residual_jac(u, t, args)``; the previous step's nodal values ``u_prev``
+    # are delivered by :meth:`step` on ``args["__loadpath__"]`` per the ``prev_state_slices`` metadata.
+    # Backward Euler only (θ=1) — a state-dependent mass makes a θ≠1 half-step ill-defined.
+    mass_residual: Optional[Callable] = None
+    mass_residual_jac: Optional[Callable] = None
 
     state0: Any = None
     initial_conditions: Any = None
@@ -194,8 +202,13 @@ class SemidiscreteTimeBlock:
         callables are populated. The represented system is:
 
             mass(t) u_dot + residual(u, t) = 0
+
+        A **state-dependent mass** block (``mass_residual`` set) is also nonlinear even if the fixed
+        ``mass`` matrix path is unused — the mass action lives in the residual there.
         """
-        return self.mass is not None and self.residual is not None
+        return (self.mass is not None and self.residual is not None) or (
+            self.mass_residual is not None and self.residual is not None
+        )
 
     def step(self, u, t, dt, args=None, theta=None, *, linear_solve=None, nonlinear_solve=None):
         """Advance the semidiscrete state by one implicit step: ``u(t) -> u(t + dt)``.
@@ -240,6 +253,48 @@ class SemidiscreteTimeBlock:
             # existing first-order behaviour; a second-order (u_tt) block sets θ=½ (trapezoidal /
             # Newmark average-acceleration) so an undamped nonlinear wave is not spuriously damped.
             thn = theta if theta is not None else (float(self.metadata.get("theta", 1.0)) if self.metadata else 1.0)
+
+            # STATE-DEPENDENT MASS: the backward-Euler mass action lives in ``mass_residual(y⁺)`` (its
+            # coefficient c(y⁺) cannot be a fixed matrix), so the step residual is
+            #     G(y⁺) = mass_residual(y⁺; u_prev=y)/dt + R(y⁺)
+            # Newton on G is exact (both matrix-free — jax linearizes through c(y⁺) and (y⁺−y) — and
+            # sparse-direct, which adds mass_residual_jac(y⁺)/dt to R's Jacobian). Backward Euler only.
+            if self.mass_residual is not None:
+                if abs(thn - 1.0) > 1e-12:
+                    raise ValueError(
+                        "jno.fem: a state-dependent (nonlinear) transient mass `c(u)·u_t` supports only "
+                        f"backward Euler (theta=1), not theta={thn:g}. A θ≠1 half-step needs the mass at the "
+                        "half-state, which is ill-defined for a coefficient that depends on the unknown. "
+                        "Drop `jno.solve.theta(...)` (use the default) for a nonlinear mass."
+                    )
+                # Deliver the previous state y as each prev-field's nodal slice on the load-path channel.
+                # A vector field's DOFs are node-major interleaved (node·vec + comp), so reshape its slice to
+                # (n_nodes, vec); a scalar field stays 1-D. The assembler's load-path gather handles either.
+                _lp = dict((args or {}).get("__loadpath__", {}) or {})
+                _uprev = jnp.asarray(u, dtype).reshape(-1)
+                for _fid, _s0, _s1, _vec in self.metadata.get("prev_state_slices", []):
+                    _slice = _uprev[_s0:_s1]
+                    _lp[_fid] = _slice if _vec == 1 else _slice.reshape(-1, _vec)
+                _ap = {**(args or {}), "__loadpath__": _lp}
+
+                def G(wn):
+                    m = jnp.asarray(self.mass_residual(wn, t_next, _ap), dtype).reshape(-1) / dt
+                    return m + jnp.asarray(self.residual(wn, t_next, args), dtype).reshape(-1)
+
+                if nonlinear_solve is not None:
+                    if getattr(nonlinear_solve, "wants_jacobian", False) and self.mass_residual_jac is not None:
+                        from .solver_api import _add_step_operator
+
+                        def jac_step(wn):
+                            # J = J_spatial(wn) + (1/dt)·J_mass(wn); both assembled BCOO (exact ∂M/∂u).
+                            return _add_step_operator(
+                                self.jacobian(wn, t_next, args), self.mass_residual_jac(wn, t_next, _ap), 1.0 / dt
+                            )
+
+                        return nonlinear_solve(G, u, jacobian=jac_step)
+                    return nonlinear_solve(G, u)
+                return newton_krylov(G, u)
+
             M_t = _operand(self.mass(t_next, args))
             r_now = (1.0 - thn) * jnp.asarray(self.residual(u, t, args), dtype).reshape(-1) if thn < 1.0 else None
 
