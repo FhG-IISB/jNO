@@ -502,17 +502,22 @@ def theta(theta: float = 1.0):
 
 
 def exponential(*, order: int = 40, mass: str = "lumped", symmetric: bool = True):
-    """Matrix-**exponential** time scheme for ``fem.solve(time=...)`` — advances a *linear autonomous*
-    parabolic block ``M u̇ + A u = c`` by ``u(t+dt) = exp(-dt·M⁻¹A) u(t) (+ φ₁ forcing)``, matrix-free.
-    **Exact in time and unconditionally stable**, so it takes large stiff steps a θ-step cannot. ``order``
-    is the Krylov size. ``mass='lumped'`` (default) is the row-sum diagonal — cheapest, discrete maximum
-    principle; ``mass='consistent'`` uses the full ``M`` (no lumping error) via a matrix-free
-    M-inner-product Lanczos.
+    """Matrix-**exponential** time scheme for ``fem.solve(time=...)`` — advances a linear block
+    ``M u̇ + A u = f(t)`` with **time-independent** ``M``, ``A`` by ``u(t+dt) = exp(-dt·M⁻¹A) u(t) +
+    forcing``, matrix-free. The homogeneous decay is **exact in time and unconditionally stable**, so it
+    takes large stiff steps a θ-step cannot. A **constant** source rides a ``φ₁`` weight (exact); a
+    **time-varying** source ``f(t)`` is integrated by **ETD2** (the exponential trapezoidal rule) — sampled
+    at both step ends with a ``φ₂`` ramp weight, so it is **exact for a source affine in time** and
+    second-order for a general one (Hochbruck & Ostermann, *Exponential integrators*, Acta Numerica 19
+    (2010) 209–286, §2.3). ``order`` is the Krylov size. ``mass='lumped'`` (default) is the row-sum diagonal
+    — cheapest, discrete maximum principle; ``mass='consistent'`` uses the full ``M`` (no lumping error) via
+    a matrix-free M-inner-product Lanczos.
 
     ``symmetric=True`` (default, ``A = Aᵀ``) uses Lanczos. ``symmetric=False`` handles a **non-symmetric**
     operator (**advection–diffusion / transport**): it advances by Arnoldi + a differentiable **Padé**
-    exponential, with forcing carried exactly through an augmented generator — still matrix-free, GPU, and
-    reverse-mode differentiable. All paths are differentiable; time-varying coefficients / nonlinear → use
+    exponential, with forcing carried exactly through an augmented generator (a ramp row for ETD2) — still
+    matrix-free, GPU, and reverse-mode differentiable. All paths are differentiable; time-varying
+    **coefficients** ``M(t)``/``A(t)`` (a moving/parametric operator) or a nonlinear form → use
     :func:`theta`."""
     from .utils.solver.timeschemes import _ExponentialScheme
 

@@ -2,9 +2,10 @@
 
 Default (``time=None``): the θ-method the assembly picks — backward Euler for a first-order system,
 trapezoidal for second-order. ``jno.solve.theta(θ)`` overrides θ (``1`` backward Euler, ``1/2``
-Crank–Nicolson, ``0`` forward Euler). ``jno.solve.exponential(...)`` advances a **linear autonomous**
-parabolic block with the **matrix exponential** — exact in time and unconditionally stable, so it takes
-large stiff steps that an implicit θ-step cannot. For a symmetric operator it reuses the Lanczos
+Crank–Nicolson, ``0`` forward Euler). ``jno.solve.exponential(...)`` advances a linear parabolic block
+with **time-independent** ``M``, ``A`` by the **matrix exponential** — its homogeneous decay exact in time
+and unconditionally stable, so it takes large stiff steps that an implicit θ-step cannot (a time-varying
+source is integrated by ETD2). For a symmetric operator it reuses the Lanczos
 :func:`jno.solve.applyfun`; for a **non-symmetric** one (``symmetric=False``, advection–diffusion) it uses
 an Arnoldi + differentiable **Padé** exponential (:func:`jno.utils.solver.matfun.expmv`), all matfree.
 """
@@ -33,7 +34,8 @@ class _ThetaScheme:
 
 
 class _ExponentialScheme:
-    """Matrix-exponential scheme (see :func:`jno.solve.exponential`) — linear autonomous parabolic only."""
+    """Matrix-exponential scheme (see :func:`jno.solve.exponential`) — linear, time-independent ``M``/``A``
+    (a time-varying source is handled by ETD2)."""
 
     def __init__(self, order: int, mass: str, symmetric: bool):
         self.order = int(order)
@@ -48,7 +50,8 @@ class _ExponentialScheme:
 
 
 def _exponential_integrate(block, args, save_ts, *, order, mass, symmetric):
-    """Advance ``M u̇ + A u = c`` exactly per step via ``exp(-dt·M⁻¹A)`` (+ ``φ₁`` forcing).
+    """Advance ``M u̇ + A u = f(t)`` per step via ``exp(-dt·M⁻¹A)``: exact for the homogeneous decay, with a
+    ``φ₁`` weight for a constant source and a ``φ₂`` ramp weight (ETD2) for a time-varying one.
 
     * ``lumped`` — symmetric ``L̃ = D^{-1/2} A D^{-1/2}`` (``D`` = row-sum mass); integrate ``w = D^{1/2} u``
       with the Euclidean Lanczos of :func:`applyfun`. Matrix-free.
@@ -81,31 +84,23 @@ def _exponential_integrate(block, args, save_ts, *, order, mass, symmetric):
     dt = float(block.dt)
     grid = jnp.asarray(_block_time_grid(block), dtype)
 
-    c = jnp.zeros(n, dtype)  # constant forcing c = affine_bias + forcing(t0)
+    # Forcing = a CONSTANT part (affine_bias) + an optional time-varying source f(t). A time-INDEPENDENT
+    # problem uses the fast φ₁ path with a single precomputed vector; a time-VARYING source is integrated by
+    # ETD2 (the exponential trapezoidal rule): the source is sampled at both ends of each step and its ramp
+    # enters through a φ₂ weight -- EXACT for a source affine in time, second-order for a general one
+    # (Hochbruck & Ostermann, "Exponential integrators", Acta Numerica 19 (2010) 209-286, §2.3). The
+    # homogeneous decay stays exact-in-time either way.
+    c_aff = jnp.zeros(n, dtype)  # the constant (affine_bias) forcing
     if block.affine_bias is not None:
-        c = c + jnp.asarray(block.affine_bias, dtype).reshape(-1)
-    if block.forcing_vector_fn is not None:
-        f0 = jnp.asarray(block.forcing_vector_fn(float(grid[0]), args or {}), dtype).reshape(-1)
-        c = c + f0
-        # The exponential step is exact-in-time only for an AUTONOMOUS system with TIME-INDEPENDENT
-        # forcing; a time-varying source would be silently frozen at t0 here. Probe f at a few times and
-        # fail loud if it drifts (concrete-args case; under traced/parametric args the probe is skipped).
-        probes = [float(grid[k]) for k in (len(grid) // 2, -1)]
-        try:
-            drift = max(
-                float(jnp.linalg.norm(jnp.asarray(block.forcing_vector_fn(t, args or {}), dtype).reshape(-1) - f0))
-                for t in probes
-            )
-            scale = float(jnp.linalg.norm(f0)) + 1e-30
-        except Exception:  # traced args: cannot concretely compare — documented scope limit
-            drift, scale = 0.0, 1.0
-        if drift > 1e-9 * scale:
-            raise NotImplementedError(
-                "jno.solve.exponential integrates an AUTONOMOUS system with time-INDEPENDENT forcing (it is "
-                "exact-in-time only then); this problem's source f(t) varies in time, which the exponential "
-                "step would silently freeze at t0. Use jno.solve.theta(...) for a time-varying source."
-            )
-    has_forcing = bool(block.affine_bias is not None or block.forcing_vector_fn is not None)
+        c_aff = c_aff + jnp.asarray(block.affine_bias, dtype).reshape(-1)
+    _time_varying = block.forcing_vector_fn is not None
+    has_forcing = bool(block.affine_bias is not None or _time_varying)
+
+    def _f_of(t):  # total forcing vector at time t: constant affine_bias + the time-varying source
+        f = c_aff
+        if _time_varying:
+            f = f + jnp.asarray(block.forcing_vector_fn(t, args or {}), dtype).reshape(-1)
+        return f
 
     def _exp(lam):
         return jnp.exp(-dt * lam)
@@ -113,6 +108,10 @@ def _exponential_integrate(block, args, save_ts, *, order, mass, symmetric):
     def _phi1(lam):  # φ₁(z) = (eᶻ − 1)/z at z = −dt·λ (Taylor near 0 for stability)
         z = -dt * lam
         return jnp.where(jnp.abs(z) < 1e-7, 1.0 + 0.5 * z, jnp.expm1(z) / z)
+
+    def _phi2(lam):  # φ₂(z) = (eᶻ − 1 − z)/z² at z = −dt·λ (Taylor near 0) — the ETD2 ramp weight
+        z = -dt * lam
+        return jnp.where(jnp.abs(z) < 1e-5, 0.5 + z / 6.0, (jnp.expm1(z) - z) / (z * z))
 
     d = lumped_diagonal(Mop)  # Dirichlet DOFs carry NO mass (d=0) — algebraic (u=0), not ODEs
     mask = (d > 1e-12 * jnp.max(d)).astype(dtype)  # 1 interior / 0 boundary — a *multiply* (trace-safe)
@@ -131,9 +130,10 @@ def _exponential_integrate(block, args, save_ts, *, order, mass, symmetric):
     if not symmetric:
         # NON-symmetric A (advection–diffusion): L = M⁻¹A is not self-adjoint, so neither the symmetric
         # similarity nor the M-inner Lanczos applies. Advance with exp(-dt·L) by **Arnoldi + a differentiable
-        # Padé** exponential (:func:`expmv`, GPU + reverse-mode diff). Forcing enters *exactly* through the
-        # augmented generator G = [[-L, g], [0, 0]]: exp(dt·G)·[u; 1] = [exp(-dtL)u + dt·φ₁(-dtL)g ; 1] — one
-        # exponential covers both the homogeneous decay and the φ₁ forcing, and ‖[u;1]‖ ≥ 1 never vanishes.
+        # Padé** exponential (:func:`expmv`, GPU + reverse-mode diff). Forcing enters *exactly* through an
+        # augmented generator: a CONSTANT source rides one row (G = [[-L, g], [0, 0]] → φ₁), and a
+        # TIME-VARYING one adds a ramp row (G = [[-L, g₀, g₁], [0,0,0], [0,1,0]] → φ₁ + φ₂, ETD2), so one
+        # exponential covers the homogeneous decay and the forcing, and ‖[x; 1; …]‖ ≥ 1 never vanishes.
         if mass == "lumped":
             d_inv = jnp.where(mask > 0, 1.0 / jnp.where(mask > 0, d, 1.0), 0.0)  # 0 on the boundary
             m_inv = lambda r: d_inv * r
@@ -141,17 +141,29 @@ def _exponential_integrate(block, args, save_ts, *, order, mass, symmetric):
             m_solve = _consistent_m_solve()
             m_inv = m_solve
         L_mv = lambda x: m_inv(Aop @ x)  # M⁻¹A x (interior; boundary held at 0 by m_inv)
-        g = m_inv(c)
         w0, to_field = mask * s0, lambda u: u
+        if not _time_varying:
+            g = m_inv(c_aff)  # constant forcing (fast φ₁ path)
 
-        def step(w, _t):
-            y0 = jnp.concatenate([w, jnp.ones((1,), dtype)])  # augment with the constant "1" row
+        def step(w, t_target):
+            if _time_varying:
+                f0, f1 = _f_of(t_target - dt), _f_of(t_target)  # source at both step ends
+                g0, g1 = m_inv(f0), m_inv(f1 - f0)  # constant part (φ₁) + ramp increment (φ₂)
+                y0 = jnp.concatenate([w, jnp.ones((1,), dtype), jnp.zeros((1,), dtype)])  # [x; a=1; b=0]
 
-            def gen(y):  # dt·G·[x; a] = dt·[-L x + a·g ; 0]
-                x, a = y[:n], y[n]
-                return dt * jnp.concatenate([-L_mv(x) + a * g, jnp.zeros((1,), dtype)])
+                def gen(y):  # dt·G·[x; a; b]:  ẋ = -L x + a·g₀ + b·g₁ ;  ȧ = 0 ;  ḃ = a
+                    x, a, b = y[:n], y[n], y[n + 1]
+                    return jnp.concatenate([dt * (-L_mv(x) + a * g0 + b * g1), jnp.zeros((1,), dtype), y[n : n + 1]])
 
-            wn = expmv(LinearOperator.from_matvec(gen, shape=(n + 1, n + 1)), y0, order=order)[:n]
+                wn = expmv(LinearOperator.from_matvec(gen, shape=(n + 2, n + 2)), y0, order=order)[:n]
+            else:
+                y0 = jnp.concatenate([w, jnp.ones((1,), dtype)])  # augment with the constant "1" row
+
+                def gen(y):  # dt·G·[x; a] = dt·[-L x + a·g ; 0]
+                    x, a = y[:n], y[n]
+                    return dt * jnp.concatenate([-L_mv(x) + a * g, jnp.zeros((1,), dtype)])
+
+                wn = expmv(LinearOperator.from_matvec(gen, shape=(n + 1, n + 1)), y0, order=order)[:n]
             return wn, wn
     else:
         if mass == "lumped":
@@ -166,7 +178,7 @@ def _exponential_integrate(block, args, save_ts, *, order, mass, symmetric):
                 unit = jnp.where(nrm > 1e-300, vec / jnp.where(nrm > 1e-300, nrm, 1.0), e0)
                 return nrm * applyfun(Ctil, unit, fun=fun, order=order)
 
-            w0, g = s * s0, s_inv * c
+            w0, solve_c = s * s0, lambda x: s_inv * x  # forcing in the scaled system: D^{-1/2}·rhs
             to_field = lambda w: s_inv * w  # u = D^{-1/2} w (boundary → 0)
         else:  # consistent — matrix-free M-inner-product Lanczos on L = M⁻¹A: scalable AND differentiable
             m_solve = _consistent_m_solve()
@@ -174,13 +186,19 @@ def _exponential_integrate(block, args, save_ts, *, order, mass, symmetric):
             m_inner = lambda a, b: a @ (Mop @ b)  # ⟨a,b⟩_M — M already zeros the boundary
             e0 = mask / jnp.sqrt(m_inner(mask, mask))  # a fixed M-unit interior vector
             apply_f = lambda vec, fun: m_inner_funm(L_mv, m_inner, e0, vec, fun, order)
-            w0, g = mask * s0, m_solve(c)  # integrate u directly (homogeneous boundary); forcing M⁻¹c
+            w0, solve_c = mask * s0, m_solve  # integrate u directly (homogeneous boundary); forcing M⁻¹·rhs
             to_field = lambda u: u
+        if not _time_varying:
+            g = solve_c(c_aff)  # constant forcing (fast φ₁ path)
 
-        def step(w, _t):
+        def step(w, t_target):
             wn = apply_f(w, _exp)
             if has_forcing:
-                wn = wn + dt * apply_f(g, _phi1)
+                if _time_varying:  # ETD2: constant part rides φ₁, the step's source ramp rides φ₂
+                    f0, f1 = _f_of(t_target - dt), _f_of(t_target)
+                    wn = wn + dt * apply_f(solve_c(f0), _phi1) + dt * apply_f(solve_c(f1 - f0), _phi2)
+                else:
+                    wn = wn + dt * apply_f(g, _phi1)
             return wn, wn
 
     _, ws = jax.lax.scan(step, w0, grid[1:])
