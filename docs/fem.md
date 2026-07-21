@@ -700,16 +700,19 @@ steady forms and **coupled (multi-field)** forms, and with the scalar C¹ famili
 (`"Argyris"`/`"Morley"`/`"Hermite"`) and a *scalar coordinate* `net(x)` on the vector edge families
 (`"RT"`/`"N1E"`); the non-nodal path assembles a *dense* operator, so wants an explicit dense `solve_fn`.
 
-**Unknown boundary conditions.** A network as a *Dirichlet value* — `u(region) - net(xb, yb)` — is a
-trainable BC *profile* (it enters the Dirichlet lift, not the operator). Supported for a **bare**
-`net(x)` on a boundary region — steady, **nonlinear**, or **linear-transient** native Lagrange (single
-or coupled multi-field); a compound value, an IC value, or a *nonlinear-transient* form fails loud.
+**Unknown boundary / initial conditions.** A network as an *essential value* is a trainable *profile*
+(it enters the lift, not the operator): a *Dirichlet* value `u(∂Ω) - net(xb, yb)` (an unknown boundary
+profile) or an *initial condition* `u(initial) - net(xi, yi)` (an unknown starting state, recovered from
+a trajectory). Both supported for a **bare** `net(x)`, native Lagrange single-field — the Dirichlet on
+steady / nonlinear / linear-transient forms, the IC on a linear-transient form; a compound value or a
+*nonlinear-transient* net fails loud.
 
 *Current scope:* steady/transient/steady-complex on the native 2D/3D Lagrange assembler (single or
-coupled multi-field), steady scalar C¹ non-nodal, and a bare `net(x)` steady/nonlinear/linear-transient
-Dirichlet value. Not yet (each fails loud): a compound/IC/nonlinear-transient net Dirichlet value,
-`net(u)` on the mass term, k(u) in complex forms, the complex transient, a net Dirichlet combined with a
-time-varying `g(x,t)` Dirichlet, `net(u)` on the vector edge families, and 1D domains.
+coupled multi-field), steady scalar C¹ non-nodal, a bare `net(x)` steady/nonlinear/linear-transient
+Dirichlet value, and a bare `net(x)` linear-transient initial condition. Not yet (each fails loud): a
+compound net essential value, a net Dirichlet or IC on a *nonlinear* transient, `net(u)` on the mass
+term, k(u) in complex forms, the complex transient, a net Dirichlet combined with a time-varying
+`g(x,t)` Dirichlet, `net(u)` on the vector edge families, and 1D domains.
 
 ### Transient inverse
 

@@ -1162,9 +1162,10 @@ def test_dirichlet_net_recovers_bc_profile():
 
 
 def test_dirichlet_net_scope_guards():
-    """A bare net(x) Dirichlet value is supported on steady, nonlinear and linear-transient forms; the
-    remaining cases fail loud: a compound value, a net initial condition, and a net Dirichlet on a
-    *nonlinear transient* form (the nonlinear stepper still holds a static value)."""
+    """A bare net(x) essential value is supported as a Dirichlet profile (steady / nonlinear /
+    linear-transient) and as a linear-transient initial condition; the remaining cases fail loud: a
+    compound value (Dirichlet or IC), and a net Dirichlet on a *nonlinear transient* form (the nonlinear
+    stepper still holds a static value)."""
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.3)
     u, phi = d.fem_symbols()
     xi, yi, _ = d.variable("interior", split=True)
@@ -1176,11 +1177,17 @@ def test_dirichlet_net_scope_guards():
     with pytest.raises(NotImplementedError, match="bare|compound"):
         jno.fem([ui.x * vi.x + ui.y * vi.y - 0.0 * vi, u(xb, yb) - (1.0 + net(xb, yb))], quad_degree=3)
 
-    # net as an initial-condition value: rejected
+    # compound INITIAL-condition value 1 + net(x): rejected (only a bare net(x) IC is supported)
     d2, u2, phi2, (x2, y2), (xb2, yb2), ci, u2i, v2i, _psi0 = _transient_setup(mesh_size=0.3, time=(0.0, 0.05, 6))
     net2 = _mlp_net(key=43)
-    with pytest.raises(NotImplementedError, match="bare|initial|boundary"):
-        jno.fem([u2i.t * v2i + (u2i.x * v2i.x + u2i.y * v2i.y), u2(xb2, yb2) - 0.0, u2(ci[0], ci[1]) - net2(ci[0], ci[1])])
+    with pytest.raises(NotImplementedError, match="bare|compound"):
+        jno.fem(
+            [
+                u2i.t * v2i + (u2i.x * v2i.x + u2i.y * v2i.y),
+                u2(xb2, yb2) - 0.0,
+                u2(ci[0], ci[1]) - (1.0 + net2(ci[0], ci[1])),
+            ]
+        )
 
     # net Dirichlet on a NONLINEAR transient form: rejected (static value in the nonlinear stepper)
     d3, u3, phi3, (x3, y3), (xb3, yb3), ci3, u3i, v3i, u03 = _transient_setup(mesh_size=0.4, time=(0.0, 0.02, 3))
@@ -1197,8 +1204,9 @@ def test_dirichlet_net_scope_guards():
 
 def test_scope_guards_fail_loud():
     """Scope limits raise explicit NotImplementedError, never mis-assemble: a solution-dependent
-    net(u) on the mass (u_t) term (a nonlinear mass). (A *bare* net(x) Dirichlet value IS supported
-    — see test_dirichlet_net_recovers_bc_profile; only compound/IC/transient net values are guarded.)"""
+    net(u) on the mass (u_t) term (a nonlinear mass). (A *bare* net(x) essential value IS supported as a
+    Dirichlet profile or an initial condition — see test_dirichlet_net_recovers_bc_profile and
+    test_ic_net_recovers_initial_field; only compound values and net(u)-on-mass are guarded.)"""
     # net(u) on the mass term = a nonlinear mass C(u)*u_t (the matrix form can't express it). A
     # coordinate net(x) mass coefficient IS supported (see test_mass_net_kx_recovers_via_crux).
     d2, u2, phi2, (x2, y2), (xb2, yb2), ci, u2i, v2i, psi0 = _transient_setup(mesh_size=0.3, time=(0.0, 0.02, 5))
@@ -1281,6 +1289,82 @@ def test_dirichlet_net_transient_matches_const_and_differentiates():
     # differentiable in the Dirichlet weights
     g = jax.grad(lambda module: jnp.sum(_default_transient_integrate(fem.operator, {name: module}, ts)))(net.module)
     assert jnp.isfinite(g.c) and abs(float(g.c)) > 1e-6
+
+
+def test_ic_net_matches_const_and_differentiates():
+    """Net-valued initial condition ``u(initial) - net(xi, yi)`` on a TRANSIENT heat form: the initial
+    state is now re-formed from the net weights (``state0_fn``), so a constant-output net reproduces the
+    constant-IC trajectory to solver tolerance, the t=0 slice equals the net value everywhere, and the
+    trajectory is differentiable in the IC weights — the property the guard blocked."""
+    from jno.utils.solver.backend_blocks import _default_transient_integrate
+
+    d, u, phi, (xi, yi), (xb, yb), ci, ui, vi, _ = _transient_setup()
+    c = 0.5
+    net = _const_net(c)
+    fem = jno.fem([ui.t * vi + (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - net(ci[0], ci[1])])
+    assert fem.is_transient
+    (name,) = fem.operator.runtime_parameter_exprs
+    assert isinstance(fem.operator.runtime_parameter_exprs[name], ModelWeights)
+    assert getattr(fem.operator, "state0_fn", None) is not None  # the parametric initial state
+    ts = _grid_ts(fem.operator)
+    traj = _default_transient_integrate(fem.operator, {name: net.module}, ts)
+
+    # oracle: the identical transient with a constant IC value c (non-parametric)
+    d2, u2, phi2, (x2, y2), (xb2, yb2), ci2, u2i, v2i, _2 = _transient_setup()
+    fem_c = jno.fem([u2i.t * v2i + (u2i.x * v2i.x + u2i.y * v2i.y), u2(xb2, yb2) - 0.0, u2(ci2[0], ci2[1]) - c])
+    traj_c = _default_transient_integrate(fem_c.operator, {}, ts)
+    assert float(jnp.max(jnp.abs(traj - traj_c))) < 1e-8
+
+    # the t=0 slice equals the net's IC value everywhere (the initial field is net(x))
+    assert float(jnp.max(jnp.abs(traj[0] - c))) < 1e-10
+
+    # differentiable in the IC weights
+    g = jax.grad(lambda module: jnp.sum(_default_transient_integrate(fem.operator, {name: module}, ts)))(net.module)
+    assert jnp.isfinite(g.c) and abs(float(g.c)) > 1e-6
+
+
+@pytest.mark.slow
+def test_ic_net_recovers_initial_field():
+    """The headline: recover an unknown INITIAL field ``u(x, 0) = net(x)`` from the heat trajectory. A
+    reference solve imprints ``u0 = sin(πx)sin(πy)`` on the trajectory; training the net IC against that
+    trajectory through the differentiable transient solve recovers the initial field (verified as the
+    trained net's own output on the mesh nodes, not a restatement of the target)."""
+    from jno.utils.solver.backend_blocks import _default_transient_integrate
+
+    dr, ur, pr, (xir, yir), (xbr, ybr), cir, uri, vri, u0r = _transient_setup(mesh_size=0.22, time=(0.0, 0.02, 5))
+    fem_ref = jno.fem([uri.t * vri + (uri.x * vri.x + uri.y * vri.y), ur(xbr, ybr) - 0.0, ur(cir[0], cir[1]) - u0r])
+    ts = _grid_ts(fem_ref.operator)
+    u_obs = _default_transient_integrate(fem_ref.operator, {}, ts)
+
+    d, u, phi, (xi, yi), (xb, yb), ci, ui, vi, _ = _transient_setup(mesh_size=0.22, time=(0.0, 0.02, 5))
+    net = _mlp_net(key=51, hidden=16)
+    net.optimizer(optax.adam(1e-2))
+    fem = jno.fem([ui.t * vi + (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - net(ci[0], ci[1])])
+    crux = jno.core([(fem.solve() - u_obs).mse], domain=_DUMMY)
+    crux.solve(400)
+
+    trained = crux.eval([ModelWeights(net)])
+    nodes = np.asarray(d.built_mesh.points)[:, :2]
+    ic_net = np.asarray(trained(jnp.asarray(nodes[:, 0:1]), jnp.asarray(nodes[:, 1:2]))).reshape(-1)
+    ic_true = np.sin(np.pi * nodes[:, 0]) * np.sin(np.pi * nodes[:, 1])
+    rel = float(np.linalg.norm(ic_net - ic_true) / np.linalg.norm(ic_true))
+    assert rel < 0.15, f"initial-field recovery rel-err {rel:.3e}"
+
+
+def test_ic_net_second_order_guard():
+    """A net-valued IC threads its weights only on the real first-order transient path (state0_fn). On a
+    *second-order-in-time* (u_tt) form the IC is baked at assembly, so a net IC there fails loud rather
+    than silently freezing the weights."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.4, time=(0.0, 0.4, 5))
+    u, phi = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi0, yi0, ti0 = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    ui0 = u.bind(x=xi0, y=yi0, t=ti0)
+    net = _const_net(0.3)
+    with pytest.raises(NotImplementedError, match="first-order|second-order"):
+        jno.fem([ui.tt * vi + (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(xi0, yi0) - net(xi0, yi0), ui0.t - 0.0])
 
 
 # ==========================================================================

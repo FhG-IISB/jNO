@@ -694,6 +694,7 @@ def assemble_fem_native(
     # and joins ``_param_and_neural_exprs`` as its own ``ModelWeights`` slot. The lift is (re-)built from the
     # runtime args in ``_dirichlet_pairs_at`` so ``∂b/∂weights`` flows through the solve.
     from ..._fem import _bare as _bare_node
+    from ..._fem import _essential_spec as _essential_spec_node
     from ...trace import ModelWeights
     from .parametric_helpers import _is_neural_coefficient, _neural_coefficient_name
 
@@ -702,10 +703,20 @@ def assemble_fem_native(
         _vn = _bare_node(_vnode) if _vnode is not None else None
         if _vn is not None and _is_neural_coefficient(_vn):
             _dir_net_models[_neural_coefficient_name(_vn)] = _vn.model
-    if _dir_net_models:
+    # A net-valued INITIAL condition ``u(initial) - net(x)`` (a trainable starting state, recovered from a
+    # trajectory): its weights join the runtime slots the same way, and the initial state is (re-)formed
+    # from the runtime args in ``_state0_at`` so ``∂traj/∂weights`` flows through the IC.
+    _ic_net_models: Dict[str, Any] = {}
+    for _ic in ic_residuals:
+        _icv = _essential_spec_node(_bare_node(_ic))[1]
+        _vn = _bare_node(_icv) if _icv is not None else None
+        if _vn is not None and _is_neural_coefficient(_vn):
+            _ic_net_models[_neural_coefficient_name(_vn)] = _vn.model
+    if _dir_net_models or _ic_net_models:
         _param_and_neural_exprs = {
             **_param_and_neural_exprs,
             **{n: ModelWeights(m) for n, m in _dir_net_models.items()},
+            **{n: ModelWeights(m) for n, m in _ic_net_models.items()},
         }
     # A nodal FIELD parameter k(x) interpolates on one field's FE space. Single field -> field 0. For a
     # coupled (multi-field) problem, associate it with the field whose test function appears in the
@@ -1600,34 +1611,42 @@ def assemble_fem_native(
             eval_context=getattr(domain, "_fem_eval_context", {}) or {},
         )
 
-        # --- initial state: nodal interpolation (exact for Lagrange) ---
-        state0 = zeros
-        for ic in ic_residuals:
-            comp, u0_node = _essential_spec(_bare(ic))
-            fidx = field_index.get(_field_key_of(ic))
-            if fidx is None:
-                raise ValueError("jno.fem (native): IC does not match any known trial field.")
-            pts_ic = pts_f_all[fidx]  # (n_nodes_f[fidx], 2)
-            nn, vv = n_nodes_f[fidx], vecs[fidx]
-            raw = jnp.reshape(jnp.asarray(_eval_value_node_at(u0_node, jnp.asarray(pts_ic))), (-1,))
-            if comp is not None:
-                # Per-component IC (e.g. ``u(initial)[0] - g0``): set just component ``comp`` at every
-                # node of the field. ``raw`` is the per-node value (or a single constant to broadcast).
-                vals = jnp.broadcast_to(raw, (nn,)) if raw.size == 1 else raw.reshape(nn)
-                idx = offs[fidx] + jnp.arange(nn) * vv + int(comp)
-                state0 = state0.at[idx].set(vals)
-            else:
-                # Whole-field IC. A constant evaluates to a single value (no coordinate Variables to
-                # sample) -> broadcast to every node; a per-component constant broadcasts across nodes;
-                # otherwise it is the per-node field already.
-                if raw.size == 1:
-                    u0_vals = jnp.full((nn, vv), raw[0])
-                elif raw.size == vv:
-                    u0_vals = jnp.broadcast_to(raw[None, :], (nn, vv))
+        # --- initial state: nodal interpolation (exact for Lagrange). ``params`` re-forms a net-valued IC
+        # ``u(initial) - net(x)`` from the runtime weights; ``None`` (no IC net) is byte-identical to the
+        # old eager build. When an IC net is present the closure also rides the block as ``state0_fn`` so
+        # ``∂traj/∂weights`` flows through the initial state. ---
+        def _state0_at(params=None):
+            s0 = zeros
+            for ic in ic_residuals:
+                comp, u0_node = _essential_spec(_bare(ic))
+                fidx = field_index.get(_field_key_of(ic))
+                if fidx is None:
+                    raise ValueError("jno.fem (native): IC does not match any known trial field.")
+                pts_ic = pts_f_all[fidx]  # (n_nodes_f[fidx], 2)
+                nn, vv = n_nodes_f[fidx], vecs[fidx]
+                raw = jnp.reshape(jnp.asarray(_eval_value_node_at(u0_node, jnp.asarray(pts_ic), params=params)), (-1,))
+                if comp is not None:
+                    # Per-component IC (e.g. ``u(initial)[0] - g0``): set just component ``comp`` at every
+                    # node of the field. ``raw`` is the per-node value (or a single constant to broadcast).
+                    vals = jnp.broadcast_to(raw, (nn,)) if raw.size == 1 else raw.reshape(nn)
+                    idx = offs[fidx] + jnp.arange(nn) * vv + int(comp)
+                    s0 = s0.at[idx].set(vals)
                 else:
-                    u0_vals = raw.reshape(nn, vv)
-                state0 = state0.at[offs[fidx] : offs[fidx + 1]].set(u0_vals.reshape(-1))
-        common["state0"] = state0
+                    # Whole-field IC. A constant evaluates to a single value (no coordinate Variables to
+                    # sample) -> broadcast to every node; a per-component constant broadcasts across nodes;
+                    # otherwise it is the per-node field already.
+                    if raw.size == 1:
+                        u0_vals = jnp.full((nn, vv), raw[0])
+                    elif raw.size == vv:
+                        u0_vals = jnp.broadcast_to(raw[None, :], (nn, vv))
+                    else:
+                        u0_vals = raw.reshape(nn, vv)
+                    s0 = s0.at[offs[fidx] : offs[fidx + 1]].set(u0_vals.reshape(-1))
+            return s0
+
+        common["state0"] = _state0_at({n: m.module for n, m in _ic_net_models.items()} if _ic_net_models else None)
+        if _ic_net_models:
+            common["state0_fn"] = _state0_at
 
         dirichlet_pairs = _build_dirichlet_pairs()
         d_dofs = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32) if dirichlet_pairs else None
@@ -1694,6 +1713,12 @@ def assemble_fem_native(
                     "wired yet (the nonlinear stepper's row-replacement uses a static value). Use a linear "
                     "transient form (a net Dirichlet threads there) or a nonlinear steady form."
                 )
+            if _ic_net_models:
+                raise NotImplementedError(
+                    "jno.fem: a net-valued initial condition u(initial) - net(x) on a *nonlinear transient* "
+                    "form is not wired yet (state0_fn threads only the linear stepper). Use a linear "
+                    "transient form (a net IC threads there)."
+                )
 
             # Row-replacement Dirichlet (constant g), threaded through the runtime time t AND the
             # runtime args so a time-dependent / parametric spatial coefficient is re-evaluated each step.
@@ -1729,7 +1754,7 @@ def assemble_fem_native(
         # CONSTANT g -- the held value sits in the affine bias. A net-valued Dirichlet u(∂Ω)-net(x) has an
         # args-dependent held value (differentiable in the weights): its whole held vector rides the
         # forcing each step instead (mirrors the g(x,t) path), so the constant bias drops to zero. ----
-        if runtime_parameter_tags or neural_param_names or _dir_net_models:
+        if runtime_parameter_tags or neural_param_names or _dir_net_models or _ic_net_models:
             if _dir_net_models:
                 if getattr(domain, "_fem_native_dirichlet_tv", None):
                     raise NotImplementedError(
@@ -1781,7 +1806,8 @@ def assemble_fem_native(
                     metadata={
                         "runtime_parameter_names": list(runtime_parameter_tags)
                         + list(neural_param_names)
-                        + list(_dir_net_models),
+                        + list(_dir_net_models)
+                        + list(_ic_net_models),
                         "nonaffine_operator": True,
                     },
                     **common,
