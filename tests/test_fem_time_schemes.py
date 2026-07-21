@@ -173,6 +173,33 @@ def test_exponential_nonsymmetric_is_differentiable():
     assert abs(g - fd) / abs(fd) < 1e-4
 
 
+@pytest.mark.skipif(not _HAS_MATFREE, reason="jno.solve.exponential needs the optional 'matfree' package")
+def test_exponential_nonsymmetric_time_varying_forcing_is_step_independent():
+    """The non-symmetric (Arnoldi + Padé) path also integrates a TIME-VARYING source by ETD2 — a ramp row
+    in the augmented generator. For an AFFINE-in-time source it stays exact-in-time, so a coarse march
+    equals a fine one on the non-symmetric advection–diffusion operator (backward Euler would not)."""
+
+    def build(nsteps):
+        d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.14, time=(0.0, 0.02, nsteps))
+        u, v = d.fem_symbols()
+        xi, yi, ti = d.variable("interior", split=True)
+        xb, yb, _ = d.variable("boundary", split=True)
+        ci = d.variable("initial", split=True)
+        ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+        ic = jno.np.sin(PI * ci[0]) * jno.np.sin(PI * ci[1])
+        f = jno.np.sin(PI * xi) * jno.np.sin(PI * yi) * (2.0 + 30.0 * ti)  # source affine in t
+        return jno.fem(
+            [ui.t * vi + 6.0 * ui.x * vi + ui.x * vi.x + ui.y * vi.y - f * vi, u(xb, yb) - 0.0, u(ci[0], ci[1]) - ic]
+        )
+
+    ns = jno.solve.exponential(symmetric=False, order=40)
+    coarse, fine = _final(build(3), time=ns), _final(build(12), time=ns)
+    assert np.linalg.norm(coarse - fine) / np.linalg.norm(fine) < 1e-6, (
+        "non-symmetric ETD2 step-independent for affine f(t)"
+    )
+    assert np.abs(fine).max() > 1e-3  # a non-trivial forced solution (a real oracle)
+
+
 def test_transient_with_source_converges_to_manufactured_solution():
     """A transient heat problem **with a source term** must converge to the exact manufactured solution.
 
@@ -204,22 +231,34 @@ def test_transient_with_source_converges_to_manufactured_solution():
 
 
 @pytest.mark.skipif(not _HAS_MATFREE, reason="jno.solve.exponential needs the optional 'matfree' package")
-def test_exponential_rejects_time_varying_forcing():
-    """The exponential integrator is exact-in-time only for an autonomous system with a TIME-INDEPENDENT
-    source. A time-varying forcing would be silently frozen at t0 (an 83%-wrong solution), so it must fail
-    loud and point to the θ-scheme instead."""
-    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.12, time=(0.0, 0.3, 6))
-    u, v = d.fem_symbols()
-    xi, yi, ti = d.variable("interior", split=True)
-    xb, yb, _ = d.variable("boundary", split=True)
-    ci = d.variable("initial", split=True)
-    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
-    ss = jno.np.sin(PI * xi) * jno.np.sin(PI * yi)
-    fem = jno.fem(
-        [ui.t * vi + ui.x * vi.x + ui.y * vi.y - ss * (1.0 + 2.0 * PI**2 * ti) * vi, u(xb, yb) - 0.0, u(ci[0], ci[1]) - 0.0]
+def test_exponential_handles_time_varying_forcing_via_etd2():
+    """The exponential integrator now integrates a TIME-VARYING source by ETD2 (the exponential trapezoidal
+    rule): the source is sampled at both ends of each step and its ramp rides a φ₂ weight. For a source
+    AFFINE in time it stays exact-in-time, so it (a) recovers the manufactured solution u = ss·t to the
+    spatial-discretisation tolerance and (b) is step-count independent — a coarse 4-step march equals a
+    fine 40-step one (where backward Euler needs many steps). ``f = ss·(1 + 2π²t)`` ⇒ ``u = ss·t``."""
+
+    def build(nstep):
+        d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.06, time=(0.0, 0.3, nstep))
+        u, v = d.fem_symbols()
+        xi, yi, ti = d.variable("interior", split=True)
+        xb, yb, _ = d.variable("boundary", split=True)
+        ci = d.variable("initial", split=True)
+        ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+        ss = jno.np.sin(PI * xi) * jno.np.sin(PI * yi)
+        f = ss * (1.0 + 2.0 * PI**2 * ti)  # affine in t → exact continuous solution u = ss·t
+        return jno.fem([ui.t * vi + ui.x * vi.x + ui.y * vi.y - f * vi, u(xb, yb) - 0.0, u(ci[0], ci[1]) - 0.0])
+
+    fem = build(40)
+    pts = np.asarray(fem.points)
+    exact = np.sin(PI * pts[:, 0]) * np.sin(PI * pts[:, 1]) * 0.3  # u(T=0.3) = ss·T
+    exp = jno.solve.exponential(mass="consistent", order=40)
+    fine = _final(fem, time=exp)
+    assert np.linalg.norm(fine - exact) / np.linalg.norm(exact) < 5e-3, "ETD2 must recover the manufactured u = ss·t"
+    coarse = _final(build(4), time=exp)  # exact-in-time for affine forcing ⇒ step-count independent
+    assert np.linalg.norm(coarse - fine) / np.linalg.norm(fine) < 1e-6, (
+        "ETD2 is step-count independent for an affine source"
     )
-    with pytest.raises(NotImplementedError, match="time-INDEPENDENT|autonomous|time-varying"):
-        fem.solve(time=jno.solve.exponential(order=40)).fn()
 
 
 def test_time_scheme_rejects_a_steady_problem():
