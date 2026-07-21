@@ -785,12 +785,31 @@ def _solve_complex_block(
     def _bloch_solve(args):
         # Bloch/quasi-periodic: P is complex, so the reduced operator A_c = P^H (A_r + i A_i) P mixes
         # Re/Im and cannot be split into independent legs. Reduce Hermitian, form the complex reduced
-        # operator, solve it directly (reduced cell is small), and prolong with the complex P.
+        # operator, solve, and prolong with the complex P.
         (A_r, b_r), (A_i, b_i) = _ab(ops[0], args, conj=True), _ab(ops[1], args, conj=True)
-        to_d = lambda M: jnp.asarray(M.todense() if hasattr(M, "todense") else M)
-        A_c = to_d(A_r) + 1j * to_d(A_i)
         b_c = jnp.asarray(b_r) + 1j * jnp.asarray(b_i)
-        u_red = jnp.linalg.solve(A_c, b_c)
+        n = b_c.shape[0]
+        if hasattr(A_r, "indices") and hasattr(A_i, "indices"):
+            # Stay SPARSE. `reduce_matrix_periodic` already keeps the reduction sparse, so densifying here
+            # just to call `jnp.linalg.solve` reintroduced the O(n²) peak it exists to avoid — tolerable for
+            # a small reduced cell, ruinous for a 3-D metasurface unit cell. Both reduced legs are
+            # themselves COMPLEX (P^H is complex even for a real leg), so fuse them into A_c = A_r + i·A_i
+            # over the concatenated index set, split into Re/Im parts sharing that index set, and
+            # sparse-direct-solve the real-equivalent 2n block. Repeated (i, j) entries from the
+            # concatenation are merged by `sparse_lu_solve`'s `sum_duplicates`.
+            from jax.experimental import sparse as jsp
+
+            from .utils.solver.linear import sparse_lu_solve
+
+            idx = jnp.concatenate([A_r.indices, A_i.indices], axis=0)
+            dat = jnp.concatenate([jnp.asarray(A_r.data), 1j * jnp.asarray(A_i.data)])
+            re = jsp.BCOO((jnp.real(dat), idx), shape=(n, n))
+            im = jsp.BCOO((jnp.imag(dat), idx), shape=(n, n))
+            sol = sparse_lu_solve(_complex_block_bcoo(re, im, n), jnp.concatenate([jnp.real(b_c), jnp.imag(b_c)]))
+            u_red = sol[:n] + 1j * sol[n:]
+        else:  # dense fallback (1-D, or already-dense legs)
+            to_d = lambda M: jnp.asarray(M.todense() if hasattr(M, "todense") else M)  # noqa: E731
+            u_red = jnp.linalg.solve(to_d(A_r) + 1j * to_d(A_i), b_c)
         return prolong_periodic(periodic, u_red)
 
     def _block_solve(args):

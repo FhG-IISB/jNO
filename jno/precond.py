@@ -556,15 +556,28 @@ class _AMS(_Spec):
                 "g_op": to_op(pin0(A_G)),
                 "p_ops": [to_op(pin0((P.T @ A_sp @ P).tocsr())) for P in Pi_sp],
             }
-        # Complex eddy operator (νK + jωσM): AmgX-style multigrid aux solvers are real-only, so each complex
-        # auxiliary is reformulated as a REAL problem the aux solves *exactly* — gradient GᵀA_cG = jω·R
-        # (Re=0, GᵀKG=0) → -j·(Im A_G)⁻¹; solenoidal ΠᵀA_cΠ = S+jT → the real 2n block [[S,-T],[T,S]].
+
+        # Complex operator (eddy νK + jωσM, or time-harmonic Maxwell K − k₀²εM + absorption): AmgX-style
+        # multigrid aux solvers are real-only, so EVERY complex auxiliary is reformulated as the
+        # real-equivalent 2n block [[Re,-Im],[Im,Re]], which the aux solves *exactly*.
+        #
+        # The gradient block used to keep only `Im A_G`, on the eddy-case reasoning that GᵀKG = 0 makes
+        # A_G = jω·R purely imaginary, so A_G⁻¹ = -j·(Im A_G)⁻¹. That assumption fails twice for a driven
+        # wave problem: (i) Re A_G = -k₀²·GᵀεMG ≠ 0, and (ii) with SURFACE-ONLY absorption (an impedance /
+        # first-order absorbing BC and no volume loss) Im A_G is a *boundary* mass — identically zero on
+        # every interior node, hence singular — so the aux solve returned garbage and the outer Krylov
+        # stalled at residual ~1 with no error. Inverting the FULL complex A_G fixes both; on the eddy case
+        # it is algebraically identical to the old form (solving [[0,-R],[R,0]] gives exactly -j·R⁻¹).
+        def _real_block(M):  # complex M -> its real-equivalent 2n block
+            return to_op(sp.bmat([[M.real, -M.imag], [M.imag, M.real]]).tocsr())
+
         b_ops, nvs = [], []
         for P in Pi_sp:
             Ap = pin0((P.T @ A_sp @ P).tocsr())
-            b_ops.append(to_op(sp.bmat([[Ap.real, -Ap.imag], [Ap.imag, Ap.real]]).tocsr()))
+            b_ops.append(_real_block(Ap))
             nvs.append(Ap.shape[0])
-        return {"complex": True, "rg_op": to_op(pin0(sp.csr_matrix(A_G.imag))), "b_ops": b_ops, "nvs": nvs}
+        A_Gp = pin0(A_G)
+        return {"complex": True, "rg_op": _real_block(A_Gp), "rg_nv": A_Gp.shape[0], "b_ops": b_ops, "nvs": nvs}
 
     def materialize(self, ctx: PrecondContext):
         from . import solve as _solve
@@ -586,12 +599,13 @@ class _AMS(_Spec):
                     x = x + P @ aux(p_op, (PT @ r).at[0].set(0.0))  # solenoidal correction (per component)
                 return x
         else:
-            rg_op, b_ops, nvs = f["rg_op"], f["b_ops"], f["nvs"]
+            rg_op, rg_nv, b_ops, nvs = f["rg_op"], f["rg_nv"], f["b_ops"], f["nvs"]
 
             def apply(r):
                 x = dinv * r
                 rg = (GT @ r).at[0].set(0.0)
-                x = x + G @ (-1j * (aux(rg_op, jnp.real(rg)) + 1j * aux(rg_op, jnp.imag(rg))))  # -j (Im A_G)⁻¹ rg
+                sg = aux(rg_op, jnp.concatenate([jnp.real(rg), jnp.imag(rg)]))  # full complex A_G, real 2n block
+                x = x + G @ (sg[:rg_nv] + 1j * sg[rg_nv:])  # gradient-space correction
                 for P, PT, b_op, nv in zip(Pis, PisT, b_ops, nvs):
                     rp = (PT @ r).at[0].set(0.0)
                     s = aux(b_op, jnp.concatenate([jnp.real(rp), jnp.imag(rp)]))  # real 2n-block solve

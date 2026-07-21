@@ -212,6 +212,87 @@ def test_engine_requires_assume_periodic():
         Rcwa([(INF, 1.0), (0.3, 11.0), (INF, 1.0)], period=(1.0, 1.0), orders=5, wavelength=WL)
 
 
+# ------------------------------------------------------------------------------------
+# Uniform layers take fmmax's ANALYTIC eigensolve (plane waves are exactly their modes).
+# detect_layers returns a full (Ng, Ng) grid per slab, so without the collapse a stack that
+# is mostly uniform -- a Bragg / Mo-Si multilayer -- pays one dense O((2·n_terms)³)
+# eigendecomposition per film.
+# ------------------------------------------------------------------------------------
+def _count_patterned_eigensolves(fn):
+    """Run ``fn`` with fmmax's PATTERNED isotropic eigensolve counted; return (result, n_calls)."""
+    import fmmax.fmm as fmm
+
+    calls, real = [], fmm._eigensolve_patterned_isotropic_media
+
+    def counting(*a, **k):
+        calls.append(1)
+        return real(*a, **k)
+
+    fmm._eigensolve_patterned_isotropic_media = counting
+    try:
+        return fn(), len(calls)
+    finally:
+        fmm._eigensolve_patterned_isotropic_media = real
+
+
+@needs_fmmax
+def test_uniform_grid_layers_take_the_analytic_eigensolve():
+    """Only the genuinely patterned layer may pay a dense eigendecomposition."""
+    from jno.rcwa import Rcwa
+
+    P, ng = 0.6, 24
+    xs = (np.arange(ng) + 0.5) / ng * P
+    X, Y = np.meshgrid(xs, xs, indexing="ij")
+    patterned = 1.0 + (((X - P / 2) ** 2 + (Y - P / 2) ** 2) < 0.18**2) * 10.0
+    flat = np.full((ng, ng), 2.1)  # a uniform film, written as a grid (what detect_layers hands back)
+
+    rc = Rcwa(
+        [(INF, 1.0), (0.20, flat), (0.35, patterned), (0.20, flat), (INF, flat)],
+        period=(P, P),
+        orders=20,
+        wavelength=WL,
+        assume_periodic=True,
+    )
+    T, n = _count_patterned_eigensolves(lambda: float(rc.solve().efficiency("T")))
+    assert n == 1, f"{n} patterned eigensolves for a stack with exactly ONE patterned layer"
+    assert np.isfinite(T)
+
+
+@needs_fmmax
+def test_uniform_layer_as_grid_matches_scalar_and_analytic_slab():
+    """Collapsing a constant grid is exact: same answer as the scalar form, and as the TMM slab."""
+    from jno.rcwa import Rcwa
+
+    nn, h, P, ng = 2.0, 0.4, 0.85, 16
+    args = dict(period=(P, P), orders=5, wavelength=WL, assume_periodic=True)
+    scalar = Rcwa([(INF, 1.0), (h, nn**2), (INF, 1.0)], **args).solve()
+    grid = Rcwa([(INF, np.ones((ng, ng))), (h, np.full((ng, ng), nn**2)), (INF, np.ones((ng, ng)))], **args).solve()
+    assert float(grid.efficiency("T")) == pytest.approx(float(scalar.efficiency("T")), rel=1e-10)
+    assert float(grid.efficiency("T")) == pytest.approx(tmm_slab(nn, h, WL), abs=2e-3)
+
+
+@needs_fmmax
+def test_traced_uniform_layer_is_not_collapsed():
+    """A design grid that merely STARTS flat (a topology-optimisation ρ) must keep the patterned path --
+    collapsing a tracer would freeze the design's structure out of the solve."""
+    import jax
+    import jax.numpy as jnp
+
+    from jno.rcwa import Rcwa
+
+    P, ng, h = 0.85, 16, 0.4
+    rc = Rcwa(
+        [(INF, 1.0), (h, jnp.ones((ng, ng))), (INF, 1.0)], period=(P, P), orders=5, wavelength=WL, assume_periodic=True
+    )
+
+    def T(v):  # uniform at EVERY v, but traced -- the collapse must step aside
+        return rc.solve(layers=[(INF, 1.0), (h, jnp.full((ng, ng), v)), (INF, 1.0)]).efficiency("T")
+
+    (g, n) = _count_patterned_eigensolves(lambda: float(jax.grad(T)(4.0)))
+    assert n >= 1, "a traced (design) grid must NOT take the analytic uniform path"
+    assert g == g and abs(g) > 1e-6, "gradient must be finite and non-zero"
+
+
 @needs_fmmax
 def test_efficiency_is_differentiable_in_the_design():
     """jax.grad of transmission w.r.t. the permittivity flows through the modal solve (matches FD)."""
