@@ -618,18 +618,35 @@ def _essential_spec(bare: Any) -> Tuple[Optional[int], Any]:
     )
 
 
-def _eval_value_node_at(value_node: Any, points: Any) -> Any:
+def _eval_value_node_at(value_node: Any, points: Any, params: Any = None) -> Any:
     """Evaluate a coordinate value expression at ``points`` (1-D result).
 
     Reuses the existing :class:`~jno.trace_evaluator.TraceEvaluator` (the engine
     behind ``.eval``) — the coordinates are concrete (the mesh is built), so this
     is a single forward pass. No bespoke expression walker is introduced.
+
+    ``params`` (a ``{name: value}`` map of runtime parameters) substitutes the referenced trainable
+    parameters into the evaluation, so the result stays **differentiable** in them — the coefficient of a
+    parametric natural / surface boundary term (an inverse-design impedance / incident source). When it is
+    ``None`` (the default) the parameters keep their stored values (a plain forward pass).
     """
     from .trace_evaluator import TraceEvaluator
 
     tags = {v.tag for v in _walk(value_node) if isinstance(v, Variable)}
     pts = jnp.atleast_2d(jnp.asarray(points))
-    return jnp.reshape(TraceEvaluator({}).evaluate(value_node, context={t: pts for t in tags}), (-1,))
+    # Register every ModelCall (parameter / network) so the evaluator resolves it, substituting a runtime
+    # parameter's value from ``params`` when supplied (else its stored value → a plain forward pass).
+    table: dict = {}
+    _mcs = [nd for nd in _walk(value_node) if type(nd).__name__ == "ModelCall"]
+    if _mcs:
+        import equinox as eqx
+
+        for nd in _mcs:
+            mod, name = nd.model.module, getattr(nd.model, "_parameter_name", None)
+            if params and name is not None and name in params and getattr(nd.model, "_is_parameter", False):
+                mod = eqx.tree_at(lambda m: m.value, mod, jnp.asarray(params[name]))
+            table[nd.model.layer_id] = mod
+    return jnp.reshape(TraceEvaluator(table).evaluate(value_node, context={t: pts for t in tags}), (-1,))
 
 
 def _coord_value_fn(value_node: Any) -> Callable:

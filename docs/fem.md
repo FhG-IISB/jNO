@@ -100,8 +100,10 @@ no term.
 >
 > **Not yet:** the rest of the zoo in 3-D (RT / C¹ / plate are 2-D only); the *inhomogeneous* `n×E = g` on
 > N1E; higher order; other families (BDM, second-kind Nédélec, Bell); quad / non-triangular meshes; a
-> parameter in a **boundary** term through the non-nodal path; the constraint-consistent algebraic initial
-> state at `t0` in the saddle-DAE transient (only the reported `t0` algebraic value is affected).
+> runtime parameter in a **host-assembled** RT-pressure / plate boundary term (the N1E tangential-trace
+> impedance / incident **surface** BC now *is* differentiable in a boundary-term parameter); the
+> constraint-consistent algebraic initial state at `t0` in the saddle-DAE transient (only the reported `t0`
+> algebraic value is affected).
 
 Beyond nodal Lagrange (P1/P2), `jno.fem` assembles **edge-DOF** families on 2-D triangles — for
 problems whose natural space is *not* H¹. Pick one with the `space=` knob on `fem_symbols`:
