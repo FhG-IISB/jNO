@@ -1550,11 +1550,6 @@ def assemble_fem_native(
 
     # === transient (Mu̇ + Au = c or M u̇ + R(u) = 0) ===
     if ic_residuals or any(_contains_temporal_derivative(t) for t in all_terms):
-        if _dir_net_models:
-            raise NotImplementedError(
-                "jno.fem: a net-valued Dirichlet u(region) - net(x) in a *transient* form is not supported yet "
-                "(the Dirichlet lift is assembled once). Use a steady form."
-            )
         from ..._fem import _bare, _essential_spec, _eval_value_node_at, _field_key_of
         from .backend_blocks import SemidiscreteTimeBlock
         from .time_route import (
@@ -1693,6 +1688,13 @@ def assemble_fem_native(
         # every spatial term is linear — the mass action lives in the residual there (``mass_residual``).
         nonlinear = _nonlinear_mass or any(_is_obviously_nonlinear_in_unknown(domain, t) for t in spatial)
         if nonlinear:
+            if _dir_net_models:
+                raise NotImplementedError(
+                    "jno.fem: a net-valued Dirichlet u(region) - net(x) on a *nonlinear transient* form is not "
+                    "wired yet (the nonlinear stepper's row-replacement uses a static value). Use a linear "
+                    "transient form (a net Dirichlet threads there) or a nonlinear steady form."
+                )
+
             # Row-replacement Dirichlet (constant g), threaded through the runtime time t AND the
             # runtime args so a time-dependent / parametric spatial coefficient is re-evaluated each step.
             def res_bc(u, t, args=None, _d=d_dofs, _g=d_vals):
@@ -1723,21 +1725,48 @@ def assemble_fem_native(
             )
 
         # ---- linear parametric transient: the operator A(t, args) is re-evaluated each step.
-        # Row-replacement Dirichlet (rows -> identity, columns kept) needs no args-dependent lift --
-        # the coupling to the held Dirichlet value sits on the LHS, the constant g in the affine bias. ----
-        if runtime_parameter_tags or neural_param_names:
-            M_bc = M if d_dofs is None else bcoo_zero_rows_cols(M, d_dofs)
-            c_bias = zeros if d_dofs is None else zeros.at[d_dofs].set(d_vals)
-            free_mask = jnp.ones((total,), dtype=zeros.dtype)
-            if d_dofs is not None:
-                free_mask = free_mask.at[d_dofs].set(0.0)
+        # Row-replacement Dirichlet (rows -> identity, columns kept) needs no args-dependent lift for a
+        # CONSTANT g -- the held value sits in the affine bias. A net-valued Dirichlet u(∂Ω)-net(x) has an
+        # args-dependent held value (differentiable in the weights): its whole held vector rides the
+        # forcing each step instead (mirrors the g(x,t) path), so the constant bias drops to zero. ----
+        if runtime_parameter_tags or neural_param_names or _dir_net_models:
+            if _dir_net_models:
+                if getattr(domain, "_fem_native_dirichlet_tv", None):
+                    raise NotImplementedError(
+                        "jno.fem: a net-valued Dirichlet combined with a time-varying g(x, t) Dirichlet on a "
+                        "transient form is not supported yet (the net value rides the forcing; the g(x, t) lift "
+                        "needs the temporal evaluator on those same rows). Use one or the other."
+                    )
+                # const + net Dirichlet dofs (static boundary-node layout); held values re-formed from args.
+                _dd = jnp.asarray(
+                    [p[0] for p in _dirichlet_pairs_at({n: m.module for n, m in _dir_net_models.items()})],
+                    dtype=jnp.int32,
+                )
 
-            def operator_fn(t, args=None, _d=d_dofs):
+                def _dhold(args):  # held value on every Dirichlet dof (net entries live in the weights)
+                    return jnp.stack([jnp.asarray(p[1]).reshape(()) for p in _dirichlet_pairs_at(args)])
+            else:
+                _dd = d_dofs
+            M_bc = M if _dd is None else bcoo_zero_rows_cols(M, _dd)
+            free_mask = jnp.ones((total,), dtype=zeros.dtype)
+            if _dd is not None:
+                free_mask = free_mask.at[_dd].set(0.0)
+
+            def operator_fn(t, args=None, _d=_dd):
                 A = spatial_jac(zeros, t, args)
                 return A if _d is None else bcoo_set_dirichlet_rows(A, _d)
 
-            def forcing_vector_fn(t, args=None, _mask=free_mask):
-                return _mask * (-spatial_res(zeros, t, args))
+            if _dir_net_models:
+                c_bias = zeros  # every held value (const + net) rides the forcing
+
+                def forcing_vector_fn(t, args=None, _mask=free_mask, _d=_dd):
+                    f = _mask * (-spatial_res(zeros, t, args))
+                    return f.at[_d].set(_dhold(args))
+            else:
+                c_bias = zeros if d_dofs is None else zeros.at[d_dofs].set(d_vals)
+
+                def forcing_vector_fn(t, args=None, _mask=free_mask):
+                    return _mask * (-spatial_res(zeros, t, args))
 
             return (
                 SemidiscreteTimeBlock(
@@ -1750,7 +1779,9 @@ def assemble_fem_native(
                     # The operator is re-assembled at each (t, args) -- a general (non-affine) operator,
                     # so it covers a parameter inside a nonlinear coefficient (e.g. exp(logk)) too.
                     metadata={
-                        "runtime_parameter_names": list(runtime_parameter_tags) + list(neural_param_names),
+                        "runtime_parameter_names": list(runtime_parameter_tags)
+                        + list(neural_param_names)
+                        + list(_dir_net_models),
                         "nonaffine_operator": True,
                     },
                     **common,

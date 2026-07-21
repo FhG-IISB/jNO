@@ -702,14 +702,14 @@ steady forms and **coupled (multi-field)** forms, and with the scalar C¹ famili
 
 **Unknown boundary conditions.** A network as a *Dirichlet value* — `u(region) - net(xb, yb)` — is a
 trainable BC *profile* (it enters the Dirichlet lift, not the operator). Supported for a **bare**
-`net(x)` on a boundary region — steady or **nonlinear** native Lagrange (single or coupled multi-field);
-a compound value, an IC value, or a transient form fails loud.
+`net(x)` on a boundary region — steady, **nonlinear**, or **linear-transient** native Lagrange (single
+or coupled multi-field); a compound value, an IC value, or a *nonlinear-transient* form fails loud.
 
 *Current scope:* steady/transient/steady-complex on the native 2D/3D Lagrange assembler (single or
-coupled multi-field), steady scalar C¹ non-nodal, and a bare `net(x)` steady/nonlinear Dirichlet value.
-Not yet (each fails loud): a compound/IC/transient net Dirichlet value, `net(u)` on the mass term, k(u) in
-complex forms, the complex transient, time-varying Dirichlet `g(x,t)` with a trainable net, `net(u)` on
-the vector edge families, and 1D domains.
+coupled multi-field), steady scalar C¹ non-nodal, and a bare `net(x)` steady/nonlinear/linear-transient
+Dirichlet value. Not yet (each fails loud): a compound/IC/nonlinear-transient net Dirichlet value,
+`net(u)` on the mass term, k(u) in complex forms, the complex transient, a net Dirichlet combined with a
+time-varying `g(x,t)` Dirichlet, `net(u)` on the vector edge families, and 1D domains.
 
 ### Transient inverse
 
