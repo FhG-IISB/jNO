@@ -284,3 +284,14 @@ def test_ams_driven_maxwell_volume_loss_still_works():
     spec = jno.precond.ams().build(fem)
     x_ams = _solve(fem, linear=jno.solve.gmres(tol=1e-10, restart=60, maxiter=400), precond=spec)
     assert np.linalg.norm(x_ams - x_lu) / np.linalg.norm(x_lu) < 1e-8
+
+
+def test_ams_accepts_a_custom_aux_solver():
+    """A user-supplied ``aux=`` solver takes the non-default (per-apply) branch of the build-once
+    ``materialize`` — the same path ``aux=jno.solve.amg()`` (jaxamg on the GPU) uses. An explicit ``lu()``
+    exercises it and must reproduce the default (frozen-SuperLU) answer."""
+    fem = _driven_maxwell(0.3, 1.0)
+    x_lu = _solve(fem)
+    spec = jno.precond.ams(aux=jno.solve.lu()).build(fem)
+    x_ams = _solve(fem, linear=jno.solve.gmres(tol=1e-10, restart=60, maxiter=400), precond=spec)
+    assert np.linalg.norm(x_ams - x_lu) / np.linalg.norm(x_lu) < 1e-8

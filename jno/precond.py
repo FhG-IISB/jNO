@@ -444,7 +444,7 @@ class _AMS(_Spec):
     complex_native = True  # solve the COMPLEX operator directly (not the real-equivalent 2n block)
 
     def __init__(self, aux):
-        self.aux = aux  # jno.solve LinearSolver for the nodal auxiliary solves (None -> lu())
+        self.aux = aux  # nodal aux solver; None -> host SuperLU factored ONCE per block, reused per apply
         self._G = None  # discrete gradient (node->edge), built once from the mesh topology
         self._Pis = None  # (Π_x, Π_y, Π_z) nodal->edge vector interpolation
         self._frozen = None  # host-assembled auxiliary operators, set by .build() for traced solves
@@ -543,18 +543,25 @@ class _AMS(_Spec):
             L[0, 0] = 1.0
             return L.tocsr()
 
-        def to_op(M):  # a pre-pinned scipy matrix -> jno LinearOperator over a BCOO
+        def to_op(M):  # a pre-pinned scipy matrix -> (LinearOperator over a BCOO, the scipy CSR itself)
+            # The CSR is kept so ``materialize`` can factor it ONCE on the host (SuperLU) and reuse the
+            # factor across every apply, instead of re-factoring per Krylov iteration.
+            csr = M.tocsr()
             coo = M.tocoo()
             idx = jnp.asarray(np.stack([coo.row, coo.col], axis=1))
-            return LinearOperator(jsp.BCOO((jnp.asarray(coo.data), idx), shape=coo.shape))
+            return LinearOperator(jsp.BCOO((jnp.asarray(coo.data), idx), shape=coo.shape)), csr
 
         # G's constant null-space (G·1 = 0) is exact; each Π_α's constant mode is redundant with it
         # (Π_α·1 = G·coordₐ is a gradient), so pinning node 0 in every auxiliary operator is correct.
         if not np.iscomplexobj(A_sp.data):
+            g_op, g_csr = to_op(pin0(A_G))
+            p_pairs = [to_op(pin0((P.T @ A_sp @ P).tocsr())) for P in Pi_sp]
             return {
                 "complex": False,
-                "g_op": to_op(pin0(A_G)),
-                "p_ops": [to_op(pin0((P.T @ A_sp @ P).tocsr())) for P in Pi_sp],
+                "g_op": g_op,
+                "g_csr": g_csr,
+                "p_ops": [o for o, _ in p_pairs],
+                "p_csrs": [c for _, c in p_pairs],
             }
 
         # Complex operator (eddy νK + jωσM, or time-harmonic Maxwell K − k₀²εM + absorption): AmgX-style
@@ -568,47 +575,98 @@ class _AMS(_Spec):
         # every interior node, hence singular — so the aux solve returned garbage and the outer Krylov
         # stalled at residual ~1 with no error. Inverting the FULL complex A_G fixes both; on the eddy case
         # it is algebraically identical to the old form (solving [[0,-R],[R,0]] gives exactly -j·R⁻¹).
-        def _real_block(M):  # complex M -> its real-equivalent 2n block
+        def _real_block(M):  # complex M -> (LinearOperator, scipy CSR) of its real-equivalent 2n block
             return to_op(sp.bmat([[M.real, -M.imag], [M.imag, M.real]]).tocsr())
 
-        b_ops, nvs = [], []
+        b_ops, b_csrs, nvs = [], [], []
         for P in Pi_sp:
             Ap = pin0((P.T @ A_sp @ P).tocsr())
-            b_ops.append(_real_block(Ap))
+            op, csr = _real_block(Ap)
+            b_ops.append(op)
+            b_csrs.append(csr)
             nvs.append(Ap.shape[0])
         A_Gp = pin0(A_G)
-        return {"complex": True, "rg_op": _real_block(A_Gp), "rg_nv": A_Gp.shape[0], "b_ops": b_ops, "nvs": nvs}
+        rg_op, rg_csr = _real_block(A_Gp)
+        return {
+            "complex": True,
+            "rg_op": rg_op,
+            "rg_csr": rg_csr,
+            "rg_nv": int(A_Gp.shape[0]),
+            "b_ops": b_ops,
+            "b_csrs": b_csrs,
+            "nvs": nvs,
+        }
+
+    def _aux_solve_builder(self):
+        """Return ``make(op, csr) -> (rhs -> op⁻¹ rhs)``, called ONCE per aux block so its setup (a
+        factorization / AMG hierarchy) is amortized across every preconditioner apply — a preconditioner's
+        whole point. The previous default called a stateless ``lu()`` *per apply*, re-factoring each aux
+        block on **every** Krylov iteration (a fresh cuSolver sparse-LU factorization each iteration — the
+        AMS setup wall)."""
+        aux = self.aux
+        if aux is None:
+            # Default: freeze a host SuperLU factorization of each (concrete, host-assembled) aux block ONCE
+            # and apply it per iteration via a host callback — no refactor, and off the GPU so it avoids
+            # cuSolver entirely. The preconditioner need not be differentiable: the outer solve's
+            # ``custom_linear_solve`` takes the gradient through the operator A, never through M⁻¹, so it
+            # only ever *calls* this (forward), which a ``pure_callback`` supports.
+            import jax
+            import numpy as np
+            import scipy.sparse.linalg as _spla
+
+            def make(op, csr):
+                lu = _spla.splu(csr.tocsc())  # factor ONCE (SuperLU)
+                n = int(csr.shape[0])
+
+                def solve(rhs):
+                    rhs = jnp.asarray(rhs)
+                    return jax.pure_callback(
+                        lambda b: np.asarray(lu.solve(np.asarray(b)), dtype=np.asarray(b).dtype),
+                        jax.ShapeDtypeStruct((n,), rhs.dtype),
+                        rhs,
+                    )
+
+                return solve
+
+            return make
+
+        # A user-supplied ``aux`` (e.g. ``jno.solve.amg()`` → jaxamg on the GPU, or a custom solver): call
+        # it per apply. A one-shot solver re-runs its own setup each iteration; to amortize a jaxamg
+        # hierarchy across the Krylov loop it needs a setup-once handle (a jaxamg AmgX setup/solve split) —
+        # wire that here once exposed. ``csr`` is unused on this path.
+        return lambda op, csr: lambda rhs: aux(op, rhs)
 
     def materialize(self, ctx: PrecondContext):
-        from . import solve as _solve
-
-        aux = self.aux if self.aux is not None else _solve.lu()
         f = self._frozen if self._frozen is not None else self._assemble_aux(ctx)  # frozen (built) or eager
 
         G, Pis = self._G, self._Pis
         GT, PisT = G.T, [P.T for P in Pis]
         dinv = 1.0 / ctx.diag()  # Jacobi smoother — the traced diagonal carries A(θ) under a trace
+        make = self._aux_solve_builder()  # build each aux solver's setup ONCE, reuse across every apply
 
         if not f["complex"]:
-            g_op, p_ops = f["g_op"], f["p_ops"]
+            solve_g = make(f["g_op"], f["g_csr"])
+            solve_ps = [make(op, csr) for op, csr in zip(f["p_ops"], f["p_csrs"])]
 
             def apply(r):
                 x = dinv * r
-                x = x + G @ aux(g_op, (GT @ r).at[0].set(0.0))  # gradient-space correction
-                for P, PT, p_op in zip(Pis, PisT, p_ops):
-                    x = x + P @ aux(p_op, (PT @ r).at[0].set(0.0))  # solenoidal correction (per component)
+                x = x + G @ solve_g((GT @ r).at[0].set(0.0))  # gradient-space correction
+                for P, PT, solve_p in zip(Pis, PisT, solve_ps):
+                    x = x + P @ solve_p((PT @ r).at[0].set(0.0))  # solenoidal correction (per component)
                 return x
         else:
-            rg_op, rg_nv, b_ops, nvs = f["rg_op"], f["rg_nv"], f["b_ops"], f["nvs"]
+            rg_nv, nvs = f["rg_nv"], f["nvs"]
+            solve_rg = make(f["rg_op"], f["rg_csr"])
+            solve_bs = [make(op, csr) for op, csr in zip(f["b_ops"], f["b_csrs"])]
 
             def apply(r):
                 x = dinv * r
                 rg = (GT @ r).at[0].set(0.0)
-                sg = aux(rg_op, jnp.concatenate([jnp.real(rg), jnp.imag(rg)]))  # full complex A_G, real 2n block
+                sg = solve_rg(jnp.concatenate([jnp.real(rg), jnp.imag(rg)]))  # full complex A_G, real 2n block
                 x = x + G @ (sg[:rg_nv] + 1j * sg[rg_nv:])  # gradient-space correction
-                for P, PT, b_op, nv in zip(Pis, PisT, b_ops, nvs):
+                for P, PT, solve_b, nv in zip(Pis, PisT, solve_bs, nvs):
                     rp = (PT @ r).at[0].set(0.0)
-                    s = aux(b_op, jnp.concatenate([jnp.real(rp), jnp.imag(rp)]))  # real 2n-block solve
+                    s = solve_b(jnp.concatenate([jnp.real(rp), jnp.imag(rp)]))  # real 2n-block solve
                     x = x + P @ (s[:nv] + 1j * s[nv:])
                 return x
 
@@ -631,13 +689,16 @@ def ams(*, aux=None) -> _AMS:
         M⁻¹ r = D⁻¹ r  +  G (GᵀAG)⁻¹ Gᵀ r  +  Σ_α Π_α (Π_αᵀAΠ_α)⁻¹ Π_αᵀ r
 
     ``G`` and ``Π`` come from the N1E edge topology (:mod:`jno.utils.solver.ams`); the auxiliary
-    operators are assembled once on the host from the concrete matrix and solved with ``aux`` —
-    **any** ``jno.solve`` solver (default :func:`jno.solve.lu`). Because the auxiliary problems are
-    ordinary **nodal Poisson-like** systems, an algebraic-multigrid ``aux`` makes the whole
-    preconditioner scalable at ``O(n)``. A GPU realisation is NVIDIA AmgX via ``jaxamg``: build each
-    auxiliary hierarchy **once per operator** (``jaxamg.with_cache(A, is_symmetric=True)``) and reuse
-    it across outer iterations — the AMS applier calls ``aux`` with the same operator each iteration,
-    so caching on the operator gives factor-once setup with a pure-JAX apply.
+    operators are assembled once on the host from the concrete matrix and solved with ``aux``.
+    **Default** (``aux=None``): each auxiliary block is **factored once** (host SuperLU) and that factor
+    is reused across every Krylov iteration via a host callback — the setup is amortized (the whole point
+    of a preconditioner) and runs off the GPU. The previous default re-factored on *every* iteration (a
+    fresh cuSolver sparse-LU per iteration — impractically slow at scale). Pass any ``jno.solve`` solver
+    as ``aux`` to override. Because the auxiliary problems are ordinary **nodal Poisson-like** systems, an
+    algebraic-multigrid ``aux`` makes the whole preconditioner scalable at ``O(n)``: on the GPU pass
+    ``aux=jno.solve.amg()`` (NVIDIA AmgX via ``jaxamg``), which caches each auxiliary hierarchy per
+    operator (``jaxamg.with_cache(A, is_symmetric=…)``) — the AMS applier calls ``aux`` with the same
+    operator every iteration, so caching gives setup-once with a pure-JAX apply.
 
     **Outer solver.** An *exact* ``aux`` (``lu``) is a fixed linear map, so it pairs with ``cg``; an
     *inexact/iterative* ``aux`` (multigrid, an inexact ``cg``) is a **variable** preconditioner and
