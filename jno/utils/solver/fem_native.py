@@ -1833,22 +1833,37 @@ def assemble_fem_native(
         from ...trace import FemLinearSystem
 
         if nonlinear:
-            if _dir_net_models:
-                raise NotImplementedError(
-                    "jno.fem: a net-valued Dirichlet u(region) - net(x) on a *nonlinear* form is not wired yet "
-                    "(the row-replacement Dirichlet uses a static value). Use a linear form."
-                )
-
             # ``t`` carries the pseudo-time (load) coordinate τ for the history march — the load written
             # as a function of τ in the weak form varies through it. Defaults to 0.0, so the ordinary
             # (non-marching) parametric/inverse call sites are unchanged.
-            def res_p(u, args=None, t=0.0, _d=s_d_dofs, _g=s_d_vals):
-                R = residual(jnp.asarray(u), t, args)
-                return R if _d is None else R.at[_d].set(jnp.asarray(u)[_d] - _g)
+            if _dir_net_models:
+                # net-valued Dirichlet u(∂Ω) - net(x): the held value is a differentiable function of the
+                # net weights (delivered on args), so the row-replacement value is re-evaluated from args
+                # each residual call (mirrors the linear parametric path's ``_dirichlet_pairs_at``). The
+                # dof set is static (boundary-node layout); only the held values ride the weights.
+                _npd = jnp.asarray(
+                    [p[0] for p in _dirichlet_pairs_at({n: m.module for n, m in _dir_net_models.items()})],
+                    dtype=jnp.int32,
+                )
 
-            def jac_p(u, args=None, t=0.0, _d=s_d_dofs):
-                J = jacobian(jnp.asarray(u), t, args)
-                return J if _d is None else bcoo_set_dirichlet_rows(J, _d)
+                def _np_hold(args):  # held value on every Dirichlet dof (const + net), net entries live
+                    return jnp.stack([jnp.asarray(p[1]).reshape(()) for p in _dirichlet_pairs_at(args)])
+
+                def res_p(u, args=None, t=0.0, _d=_npd):
+                    R = residual(jnp.asarray(u), t, args)
+                    return R.at[_d].set(jnp.asarray(u)[_d] - _np_hold(args))
+
+                def jac_p(u, args=None, t=0.0, _d=_npd):
+                    return bcoo_set_dirichlet_rows(jacobian(jnp.asarray(u), t, args), _d)
+            else:
+
+                def res_p(u, args=None, t=0.0, _d=s_d_dofs, _g=s_d_vals):
+                    R = residual(jnp.asarray(u), t, args)
+                    return R if _d is None else R.at[_d].set(jnp.asarray(u)[_d] - _g)
+
+                def jac_p(u, args=None, t=0.0, _d=s_d_dofs):
+                    J = jacobian(jnp.asarray(u), t, args)
+                    return J if _d is None else bcoo_set_dirichlet_rows(J, _d)
 
             _op = FemResidualOperator(res_p, jac_p, total, runtime_parameter_exprs=dict(_param_and_neural_exprs))
             _op.history_specs = history_specs  # VOLUME step-history buffer layout for the load-step driver
