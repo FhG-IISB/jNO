@@ -228,3 +228,40 @@ def test_nedelec_tet_cavity_resonator_eigenvalues():
     # convergence from below toward 2π² under refinement
     assert w_f[0] > w_c[0], "the lowest mode must rise toward 2π² as the mesh refines (Nédélec converges from below)"
     assert abs(np.mean(w_f[:3]) / k2 - 1.0) < 0.08, f"finer triplet {np.round(w_f[:3], 2)} not tighter to 2π²"
+
+
+def test_nedelec_tet_field_parameter_kx_matches_analytic_and_differentiates():
+    """A spatially-varying P1 **field parameter** ``k(x)`` in a 3D N1E form -- the H(curl) analogue of the
+    2D non-nodal field inverse, and the enabler for a spatially-varying permittivity ``ε(x)`` in Maxwell /
+    RCWA. A LINEAR ``k(x)`` is reproduced EXACTLY by the P1 basis, so the parametric operator evaluated at
+    the field's nodal values must equal the operator assembled with the same coefficient written
+    analytically; and the assembly stays differentiable in the full nodal field (the inverse-design payoff)."""
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
+    xi, yi, zi, _ = d.variable("interior", split=True)
+    kf, _ = d.fem_symbols()  # a P1 coefficient field, independent of the N1E trial
+    k = jno.np.parameter(kf, name="k")
+    assert getattr(k.model, "_fem_field", None) == "node"
+    u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
+    ui, vi = u.bind(x=xi, y=yi, z=zi), v.bind(x=xi, y=yi, z=zi)
+    cu, cv = u.vector.curl(xi, yi, zi), v.vector.curl(xi, yi, zi)
+    fem = jno.fem([inner(cu, cv) - k * inner(ui, vi)])  # curl-curl with a k(x) mass (an ε(x)-like coefficient)
+    assert fem.is_linear and list(fem.operator.runtime_parameter_exprs) == ["k"]
+
+    nodes = np.asarray(d.built_mesh.points)[:, :3]
+    k_lin = jnp.asarray(0.6 + 0.8 * nodes[:, 0] + 0.5 * nodes[:, 1] + 0.3 * nodes[:, 2])  # LINEAR -> P1-exact
+
+    u2, v2 = d.fem_symbols(value_shape=(3,), names=("u2", "v2"), space="N1E")
+    ux, vx = u2.bind(x=xi, y=yi, z=zi), v2.bind(x=xi, y=yi, z=zi)
+    cux, cvx = u2.vector.curl(xi, yi, zi), v2.vector.curl(xi, yi, zi)
+    fem_ref = jno.fem([inner(cux, cvx) - (0.6 + 0.8 * xi + 0.5 * yi + 0.3 * zi) * inner(ux, vx)])
+    A_field, _b = fem.operator.evaluate({"k": k_lin})
+    assert np.max(np.abs(_dense(A_field) - _dense(fem_ref.A))) < 1e-9, "3D N1E P1 field-param interpolation mismatch"
+
+    # differentiable in the FULL nodal field (the inverse-design payoff): a finite, non-zero gradient
+    def _loss(kv):
+        A, _ = fem.operator.evaluate({"k": kv})
+        Ad = A.todense() if hasattr(A, "todense") else A
+        return jnp.sum(Ad**2)
+
+    g = np.asarray(jax.grad(_loss)(k_lin))
+    assert g.shape == k_lin.shape and np.all(np.isfinite(g)) and np.linalg.norm(g) > 0.0

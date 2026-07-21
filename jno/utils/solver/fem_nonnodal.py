@@ -232,11 +232,6 @@ def assemble_fem_nonnodal(
             f"(H(curl), for Maxwell / curl-curl); got spaces {spaces}. RT / P0 / Hermite / Argyris / Morley "
             "are 2D-triangle only."
         )
-    if dim == 3 and _field_param_names:
-        raise NotImplementedError(
-            "jno.fem (non-nodal): a field parameter k(x) in a 3D N1E problem is not wired yet "
-            "(the P1 interpolation of the parameter is 2D-triangle only)."
-        )
     pts = jnp.asarray(np.asarray(domain.mesh.points))[:, :dim]
     cells = np.asarray(domain.mesh.cells_dict["tetra" if dim == 3 else "triangle"], dtype=np.int64)
     n_cells = int(cells.shape[0])
@@ -301,8 +296,14 @@ def assemble_fem_nonnodal(
     n_quad = int(qw.shape[0])
     ctx = getattr(domain, "context", {}) or {}
     # P1 (linear) shape functions at the quad points -- used ONLY to interpolate a P1 field parameter k(x)
-    # (its 3 mesh-vertex values per cell), independent of the trial element's own basis.
-    p1_shape_vals = jnp.stack([1.0 - qp[:, 0] - qp[:, 1], qp[:, 0], qp[:, 1]], axis=1) if _field_param_names else None
+    # from its mesh-vertex values per cell (3 barycentric on a triangle, 4 on a tetrahedron), independent of
+    # the trial element's own basis. The kernel contraction ``shape_vals . cell_nodal`` is vertex-count
+    # agnostic, so only this reference-basis table is dimension-specific.
+    if _field_param_names:
+        _bary0 = 1.0 - qp[:, 0] - qp[:, 1] - (qp[:, 2] if dim == 3 else 0.0)
+        p1_shape_vals = jnp.stack([_bary0, qp[:, 0], qp[:, 1]] + ([qp[:, 2]] if dim == 3 else []), axis=1)
+    else:
+        p1_shape_vals = None
 
     # Edge topology: edge families (RT/N1E) need it for their edge DOFs; Argyris/Morley need it for the global
     # id + orientation of their edge-normal DOFs (Hermite, pure-vertex, does not).
