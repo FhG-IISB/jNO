@@ -134,6 +134,11 @@ class SemidiscreteTimeBlock:
     mass_residual_jac: Optional[Callable] = None
 
     state0: Any = None
+    # Optional runtime callback ``state0_fn(args) -> s0`` for a PARAMETRIC initial state (a net-valued
+    # initial condition ``u(initial) - net(x)``, recovered from a trajectory). ``state0`` stays as the
+    # static placeholder (the net at its stored weights); when ``state0_fn`` is set the integrator re-forms
+    # the initial state from ``args`` so ``∂traj/∂weights`` flows through the IC as well as the operator.
+    state0_fn: Optional[Callable] = None
     initial_conditions: Any = None
 
     t0: float = 0.0
@@ -424,7 +429,8 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
     import jax
     import jax.numpy as jnp
 
-    s0 = jnp.asarray(block.state0).reshape(-1)
+    _s0f = getattr(block, "state0_fn", None)  # parametric initial state (net-valued IC): re-form from args
+    s0 = jnp.asarray(_s0f(args) if _s0f is not None else block.state0).reshape(-1)
     dtype = s0.dtype
     grid_ts = jnp.asarray(_block_time_grid(block), dtype)
     dt = float(block.dt)

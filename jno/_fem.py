@@ -2600,11 +2600,12 @@ def fem(
     has_neural_coeff = _has_network and not is_vpinn
 
     if has_neural_coeff:
-        # A network in a trial-only (essential) constraint is a trainable *Dirichlet value*
-        # ``u(region) - net(x)`` (an unknown boundary profile), NOT an integrand coefficient. It is
-        # supported as a *bare* net on a boundary region, native Lagrange single-field (the parametric
-        # path evaluates ``net(boundary_coords)`` from the runtime args each solve). Everything else --
-        # a compound value ``1+net(x)``, an initial-condition value, non-nodal or multifield -- is rejected.
+        # A network in a trial-only (essential) constraint is a trainable *essential value*, NOT an
+        # integrand coefficient: a *Dirichlet value* ``u(∂Ω) - net(x)`` (an unknown boundary profile) or an
+        # *initial condition* ``u(initial) - net(x)`` (an unknown starting state, recovered from a
+        # trajectory). Both are supported as a *bare* net, native Lagrange single-field — the parametric
+        # path evaluates ``net(coords)`` from the runtime args each solve (a Dirichlet lift / the state0).
+        # Everything else -- a compound value ``1+net(x)``, non-nodal or multifield -- is rejected.
         _net_trial_only = [
             c
             for c in constraints
@@ -2613,17 +2614,17 @@ def fem(
         for c in _net_trial_only:
             support, _rg = _region_and_support(c, domain)
             _comp, _val, _vnode = _dirichlet_spec(_bare(c))
-            if support != "boundary" or not _is_bare_neural_value_node(_vnode):
+            if support not in ("boundary", "initial") or not _is_bare_neural_value_node(_vnode):
                 raise NotImplementedError(
-                    "jno.fem: a network in an essential (trial-only) constraint must be a *bare* Dirichlet "
-                    "value net(x) on a boundary region — a compound expression (e.g. 1 + net(x)) or an "
-                    "initial-condition value is not supported."
+                    "jno.fem: a network in an essential (trial-only) constraint must be a *bare* net(x) value "
+                    "on a boundary region (a Dirichlet profile) or the 'initial' region (an initial "
+                    "condition) — a compound expression (e.g. 1 + net(x)) is not supported."
                 )
         if _net_trial_only:
             if _trial_spaces(constraints) - {"Lagrange"}:
-                raise NotImplementedError("jno.fem: a net-valued Dirichlet is supported on Lagrange elements only.")
+                raise NotImplementedError("jno.fem: a net-valued essential value is supported on Lagrange elements only.")
             if len(_field_keys(constraints)) > 1:
-                raise NotImplementedError("jno.fem: a net-valued Dirichlet is single-field only.")
+                raise NotImplementedError("jno.fem: a net-valued essential value is single-field only.")
         if getattr(domain, "dimension", None) == 1:
             raise NotImplementedError(
                 "jno.fem: neural coefficients are not supported on 1D domains — the native 1D assembler has no "
@@ -3532,6 +3533,18 @@ def _ic_value_at_nodes(bare: Any, domain: Any, pts: Any, n: int, vec: int = 1) -
             trial_side, value_node = right, left
     if value_node is None:
         return jnp.zeros((n,))
+    from .utils.solver.parametric_helpers import _is_neural_coefficient
+
+    if _is_neural_coefficient(_bare(value_node)):
+        # A net-valued IC threads its weights only on the real, first-order-in-time transient path
+        # (``state0_fn`` re-forms the initial state from ``args``). This routine bakes the IC at assembly
+        # (complex-transient / second-order-in-time), so the weights would silently NOT train — reject it.
+        raise NotImplementedError(
+            "jno.fem: a net-valued initial condition u(initial) - net(x) is wired on a real, "
+            "first-order-in-time transient form (its weights thread the initial state); this path "
+            "(complex-transient or second-order-in-time) bakes the IC at assembly and cannot thread the "
+            "weights. Use a real first-order transient form, or a constant/field initial condition here."
+        )
     comp = _component_index_of(trial_side)  # one component (u(...)[i] - g) vs all (u(...) - g)
     n_nodes = int(jnp.asarray(pts).shape[0])
     const = _constant_of(value_node)
