@@ -735,13 +735,23 @@ def assemble_fem_native(
                     tfi = _test_field_index(coeff, field_index)
                     if tfi is not None:
                         _pf_idxs.add(int(tfi))
-        if len(_pf_idxs) != 1:
-            raise NotImplementedError(
-                "jno.fem (native): a FEM field parameter k(x) on a coupled (multi-field) problem must "
-                "appear in the terms of exactly one field (its nodal values interpolate on that field's "
-                f"FE space); resolved to fields {sorted(_pf_idxs)}."
-            )
-        _field_param_field_idx = _pf_idxs.pop()
+        if len(_pf_idxs) == 1:
+            _field_param_field_idx = _pf_idxs.pop()
+        else:
+            # A field parameter shared across several fields' terms (a material property common to coupled
+            # equations, e.g. a conductivity in both a thermal and a coupling term) is allowed WHEN those
+            # fields share ONE FE space: same element order on the one mesh -> identical nodes, connectivity
+            # and shape_vals, so k(x) interpolates the same regardless of which field's space we pick. Only
+            # DIFFERING orders are ambiguous (no shared node set) and stay rejected.
+            _orders = {int(fields[i]["order"]) for i in _pf_idxs}
+            if not _pf_idxs or len(_orders) != 1:
+                raise NotImplementedError(
+                    "jno.fem (native): a FEM field parameter k(x) on a coupled (multi-field) problem must "
+                    "appear in the terms of fields sharing ONE FE space (same element order) — its nodal "
+                    "values interpolate on that shared space. Resolved to fields "
+                    f"{sorted(_pf_idxs)} with orders {sorted(_orders)} (differing orders share no node set)."
+                )
+            _field_param_field_idx = min(_pf_idxs)
 
     # -------------------------------------------------------------------------
     # Surface integration setup
