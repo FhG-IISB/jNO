@@ -101,3 +101,37 @@ def test_imaginary_impedance_lands_in_the_imag_leg():
     Mm = _dense(jno.fem([inner(ui, vi)]).A)
     np.testing.assert_allclose(_dense(op_r[0]), K - k0**2 * Mm, atol=1e-8)  # Re leg: curl-curl − k0² mass
     np.testing.assert_allclose(_dense(op_i[0]), k0 * S, atol=1e-8)  # Im leg: k0 · surface mass
+
+
+def test_parametric_impedance_surface_mass_matches_and_differentiates():
+    """A runtime parameter in the N1E tangential-trace (impedance) surface coefficient re-assembles the
+    surface mass per args, DIFFERENTIABLY (inverse design of a surface impedance). The parametric operator
+    at ``k=k0`` equals the constant-coefficient assembly, and a scalar readout's gradient w.r.t. ``k``
+    matches central finite differences."""
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
+    u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
+    c = d.variable("interior", split=True)
+    xi, yi, zi = c[0], c[1], c[2]
+    ui, vi = u.bind(x=xi, y=yi, z=zi), v.bind(x=xi, y=yi, z=zi)
+    ccu, ccv = u.vector.curl(xi, yi, zi), v.vector.curl(xi, yi, zi)
+    nvec = d.variable("boundary", normals=True)
+    tu, tv = u.vector.cross(nvec), v.vector.cross(nvec)  # n×u, n×v
+    k = jno.np.parameter((), name="k").initialize(jax.nn.initializers.constant(2.0))
+    fem = jno.fem([inner(ccu, ccv) + inner(ui, vi), k * inner(tu, tv)])  # volume + a parametric surface term
+    assert fem.is_linear and list(fem.operator.runtime_parameter_exprs) == ["k"]
+
+    # (1) the parametric operator at k=k0 equals assembling with the constant coefficient k0
+    for k0 in (0.7, 2.5):
+        A_param = _dense(fem.operator.evaluate({"k": k0})[0])
+        A_const = _dense(jno.fem([inner(ccu, ccv) + inner(ui, vi), k0 * inner(tu, tv)]).A)
+        assert np.max(np.abs(A_param - A_const)) < 1e-9, f"parametric surface mass mismatch at k={k0}"
+
+    # (2) differentiable in k: the surface mass is linear in k, so the gradient matches central FD
+    def _loss(kv):
+        A, _b = fem.operator.evaluate({"k": kv})
+        Ad = A.todense() if hasattr(A, "todense") else A
+        return jnp.sum(Ad**2)
+
+    g = float(jax.grad(_loss)(2.0))
+    fd = (float(_loss(2.0 + 1e-4)) - float(_loss(2.0 - 1e-4))) / 2e-4
+    assert abs(g - fd) / abs(fd) < 1e-5, f"autodiff {g} vs FD {fd}"

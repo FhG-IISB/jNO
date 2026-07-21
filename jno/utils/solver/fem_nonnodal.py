@@ -191,20 +191,14 @@ def assemble_fem_nonnodal(
     _rt_param_exprs: dict = {}
     for bare in volume_terms:
         _collect_runtime_parameter_exprs(bare, _rt_param_exprs)
+    # A runtime parameter may also live in a BOUNDARY term. The N1E tangential-trace surface/incident BCs
+    # re-assemble their coefficient per args differentiably (`_assemble_n1e_surface_mass/_load(params=)`);
+    # the host-assembled RT natural-pressure / plate BCs cannot, and are rejected below after classification.
+    for _terms in (boundary_terms or {}).values():
+        for bare in _terms:
+            _collect_runtime_parameter_exprs(bare, _rt_param_exprs)
     runtime_parameter_tags: Tuple[str, ...] = tuple(sorted(_rt_param_exprs))
     _field_param_names = frozenset(n for n, e in _rt_param_exprs.items() if _is_fem_field_parameter(e))
-    # A parameter in a boundary (Neumann/Robin) term would silently bake to a constant: the natural-BC load
-    # is assembled once, non-differentiably (`_apply_natural_boundary_terms`). Reject it rather than mislead.
-    _bdry_param_exprs: dict = {}
-    for _terms in boundary_terms.values():
-        for bare in _terms:
-            _collect_runtime_parameter_exprs(bare, _bdry_param_exprs)
-    if _bdry_param_exprs:
-        raise NotImplementedError(
-            "jno.fem (non-nodal): a runtime parameter in a boundary (Neumann/Robin) term is not supported for "
-            "inverse problems -- the natural-BC load is assembled non-differentiably. Put the parameter in a "
-            "volume term."
-        )
 
     # Neural coefficients (``jno.nn.wrap(net)`` in the weak form) on a non-nodal element: like the native
     # path, the network is re-evaluated at the quad points and its weights ride the runtime ``args`` as a
@@ -572,26 +566,48 @@ def assemble_fem_nonnodal(
                     incident_terms.setdefault(region, []).append(_signed(load[0], sign))
                 else:
                     pressure_terms.setdefault(region, []).append(_apply_sign(domain, sign, sub_w))
-    nat_load = (
+    # A runtime parameter in a host-assembled RT pressure / plate BC cannot be threaded differentiably
+    # (the load is baked once); only the N1E surface/incident coefficient re-assembles per args. Reject the
+    # former loudly (rather than silently freeze it) now that classification separates the two.
+    _pressure_param: dict = {}
+    for _terms in pressure_terms.values():
+        for _t in _terms:
+            _collect_runtime_parameter_exprs(_t, _pressure_param)
+    if _pressure_param:
+        raise NotImplementedError(
+            "jno.fem (non-nodal): a runtime parameter in a host-assembled natural-BC (RT pressure / plate "
+            f"moment) term is not supported (its load is baked non-differentiably); got {sorted(_pressure_param)}. "
+            "Put the parameter in a volume term, or use an N1E tangential-trace surface/incident BC (parametric)."
+        )
+    # RT natural pressure BC (host-assembled once, constant). The N1E surface mass (→ A) and incident load
+    # (→ b) are wrapped in ``_of(params)`` closures so the parametric path re-assembles them differentiably
+    # in a boundary-term parameter (an inverse-design impedance / incident source); ``params=None`` is the
+    # plain forward pass for the non-parametric build.
+    nat_load_rt = (
         _apply_natural_boundary_terms(
             jnp.zeros(total), pressure_terms, domain, field_index, spaces, top, np.asarray(pts), offs, n_cells, quad_degree
         )
         if pressure_terms
         else jnp.zeros(total)
     )
-    # the N1E incident forcing added to the RHS load b (∫ g·(n×v))
-    if incident_terms:
-        nat_load = nat_load + _assemble_n1e_surface_load(
-            total, incident_terms, domain, spaces, top, np.asarray(pts), offs, quad_degree, dim
+
+    def _incident_of(params):  # N1E incident forcing ∫ g·(n×v) → b
+        if not incident_terms:
+            return jnp.zeros(total)
+        return _assemble_n1e_surface_load(
+            total, incident_terms, domain, spaces, top, np.asarray(pts), offs, quad_degree, dim, params=params
         )
-    # the tangential-trace surface mass added to A (steady linear, incl. parametric/inverse; the surface mass
-    # and incident load are assembled once — a boundary-term parameter is already rejected above, so both stay
-    # constant and fold into A(args)/b(args). Transient/nonlinear compositions still raise below.)
-    surf_mass = (
-        _assemble_n1e_surface_mass(total, surface_terms, domain, spaces, top, np.asarray(pts), offs, quad_degree, dim)
-        if surface_terms
-        else None
-    )
+
+    def _surf_mass_of(params):  # N1E tangential-trace impedance mass ∫ c(n×u)·(n×v) → A
+        if not surface_terms:
+            return None
+        return _assemble_n1e_surface_mass(
+            total, surface_terms, domain, spaces, top, np.asarray(pts), offs, quad_degree, dim, params=params
+        )
+
+    _incident_const = _incident_of(None)
+    nat_load = nat_load_rt + _incident_const  # the constant boundary load (used by the non-parametric path)
+    surf_mass = _surf_mass_of(None)
     if surf_mass is not None or incident_terms:
         _nonlinear = any(_is_obviously_nonlinear_in_unknown(domain, t) for t in volume_terms)
         _transient = bool(ic_residuals) or any(_contains_temporal_derivative(t) for t in volume_terms)
@@ -931,9 +947,12 @@ def assemble_fem_nonnodal(
 
         def _assemble_at(args):
             A = jax.jacfwd(lambda u: full_residual(u, args))(zeros)
-            if surf_mass is not None:  # constant tangential-trace surface mass (impedance/absorbing BC) → into A(args)
-                A = A + surf_mass
-            b = -full_residual(zeros, args)
+            sm = _surf_mass_of(args)  # tangential-trace surface mass (impedance) → A, re-assembled per args
+            if sm is not None:
+                A = A + sm
+            # ``full_residual`` folds in the CONSTANT nat_load; add the parametric change of the N1E incident
+            # load so a runtime parameter in the incident source is differentiable in b too.
+            b = -full_residual(zeros, args) + (_incident_of(args) - _incident_const)
             if pins:
                 A, b = _apply_dirichlet_symmetric(jnp.asarray(A), jnp.asarray(b), pins)
             return A, b
@@ -1181,56 +1200,79 @@ def _n1e_region_faces(fc, region_nodes):
             yield bf
 
 
-def _assemble_n1e_surface_mass(total, surface_terms, domain, spaces, top, pts_np, offs, quad_degree, dim):
+def _assemble_n1e_surface_mass(total, surface_terms, domain, spaces, top, pts_np, offs, quad_degree, dim, params=None):
     """Assemble the tangential-trace surface mass ``∑ ∫_Γ c (n×φ_a)·(n×φ_b) dS`` (N1E impedance /
     absorbing BC) into a dense ``(total, total)`` matrix to ADD to the stiffness ``A``.
 
     The tangential projection ``(n×φ_a)·(n×φ_b) = φ_a·φ_b − (φ_a·n)(φ_b·n)`` is integrated over the
-    region's boundary faces with the physical face measure. 3-D N1E only."""
+    region's boundary faces with the physical face measure. 3-D N1E only. The face geometry / dof map is
+    host-static (the mesh is fixed); only the coefficient value ``c`` and the scatter are JAX, so with a
+    runtime parameter in ``c`` (``params``) the surface mass stays **differentiable** in it (inverse
+    design of a surface impedance)."""
     from ..._fem import _eval_value_node_at
     from .fem_1d import _region_node_ids
 
     fidx, cells, fc, fqp, fqw, face_rv, signs, cell_edges = _n1e_surface_precompute(domain, top, quad_degree, spaces, dim)
-    S = np.zeros((total, total))
+    fqw = np.asarray(fqw)
+    # STATIC per-(face, term) structure (host): the dof block, the tangential φ·φ tensor, quad points, measure.
+    entries = []
     for region, coeff_nodes in surface_terms.items():
         region_nodes = {int(n) for n in _region_node_ids(domain, region)}
         for bf in _n1e_region_faces(fc, region_nodes):
             c, phi, nhat, measure, xq = _n1e_face_geometry(bf, cells, fc, pts_np, top, face_rv, fqp, signs)
             pn = phi @ nhat  # (nqf, 6) normal component
             tang = np.einsum("qai,qbi->qab", phi, phi) - np.einsum("qa,qb->qab", pn, pn)  # tangential φ·φ
-            gdofs = offs[fidx] + cell_edges[c]
+            gdofs = np.asarray(offs[fidx] + cell_edges[c], dtype=np.int64)
             for coeff in coeff_nodes:  # each surface term in this region adds coeff·(surface mass)
-                cval = (
-                    np.ones(len(fqw))
-                    if coeff is None
-                    else np.asarray(_eval_value_node_at(coeff, jnp.asarray(xq))).reshape(-1)
-                )
-                S[np.ix_(gdofs, gdofs)] += np.einsum("q,qab->ab", fqw * measure * cval, tang)
-    return jnp.asarray(S)
+                entries.append((gdofs, np.asarray(tang), np.asarray(xq), np.asarray(measure), coeff))
+    if not entries:
+        return jnp.zeros((total, total))
+    # VALUE + SCATTER (JAX, differentiable in ``params``): evaluate c at the quad points and add the block.
+    blocks = []
+    for gdofs, tang, xq, measure, coeff in entries:
+        cval = jnp.ones(len(fqw)) if coeff is None else _eval_value_node_at(coeff, jnp.asarray(xq), params=params)
+        blocks.append((jnp.asarray(gdofs), jnp.einsum("q,qab->ab", jnp.asarray(fqw * measure) * cval, jnp.asarray(tang))))
+    dt = jnp.result_type(*[b.dtype for _, b in blocks])
+    S = jnp.zeros((total, total), dt)
+    for gd, block in blocks:
+        S = S.at[gd[:, None], gd[None, :]].add(block.astype(dt))
+    return S
 
 
-def _assemble_n1e_surface_load(total, load_terms, domain, spaces, top, pts_np, offs, quad_degree, dim):
+def _assemble_n1e_surface_load(total, load_terms, domain, spaces, top, pts_np, offs, quad_degree, dim, params=None):
     """Assemble the tangential incident/forcing surface term ``∑ ∫_Γ g·(φ_a×n) dS`` (the ``inner(g, n×v)``
     RHS of the Silver–Müller ABC) into a dense ``(total,)`` load vector to ADD to ``b``. 3-D N1E only.
 
     ``g`` is a prescribed (possibly complex, possibly spatial) tangential source; the test factor ``φ_a×n``
-    matches the authored ``v.vector.cross(nvec)`` and uses the same OUTWARD normal as the impedance mass."""
+    matches the authored ``v.vector.cross(nvec)`` and uses the same OUTWARD normal as the impedance mass.
+    Host-static face geometry; the source value ``g`` and the scatter are JAX, so a runtime parameter in
+    ``g`` (``params``) keeps the incident load **differentiable** (inverse design of an incident source)."""
     from ..._fem import _eval_value_node_at
     from .fem_1d import _region_node_ids
 
     fidx, cells, fc, fqp, fqw, face_rv, signs, cell_edges = _n1e_surface_precompute(domain, top, quad_degree, spaces, dim)
-    b = np.zeros(total)
+    fqw = np.asarray(fqw)
+    entries = []  # STATIC per-(face, term) structure: dof block, φ×n, quad points, measure
     for region, g_nodes in load_terms.items():
         region_nodes = {int(n) for n in _region_node_ids(domain, region)}
         for bf in _n1e_region_faces(fc, region_nodes):
             c, phi, nhat, measure, xq = _n1e_face_geometry(bf, cells, fc, pts_np, top, face_rv, fqp, signs)
             phi_x_n = np.cross(phi, nhat)  # (nqf, 6, 3) = φ_a × n  (the authored `v.vector.cross(nvec)`)
-            gdofs = offs[fidx] + cell_edges[c]
+            gdofs = np.asarray(offs[fidx] + cell_edges[c], dtype=np.int64)
             for g in g_nodes:
-                gval = np.asarray(_eval_value_node_at(g, jnp.asarray(xq))).reshape(len(fqw), 3)  # (nqf, 3)
-                integrand = np.einsum("qi,qai->qa", gval, phi_x_n)  # g·(φ_a×n)
-                b[gdofs] += np.einsum("q,qa->a", fqw * measure, integrand)
-    return jnp.asarray(b)
+                entries.append((gdofs, np.asarray(phi_x_n), np.asarray(xq), np.asarray(measure), g))
+    if not entries:
+        return jnp.zeros(total)
+    contribs = []  # VALUE + SCATTER (JAX, differentiable in ``params``)
+    for gdofs, phi_x_n, xq, measure, g in entries:
+        gval = _eval_value_node_at(g, jnp.asarray(xq), params=params).reshape(len(fqw), 3)  # (nqf, 3)
+        integrand = jnp.einsum("qi,qai->qa", gval, jnp.asarray(phi_x_n))  # g·(φ_a×n)
+        contribs.append((jnp.asarray(gdofs), jnp.einsum("q,qa->a", jnp.asarray(fqw * measure), integrand)))
+    dt = jnp.result_type(*[c.dtype for _, c in contribs])
+    b = jnp.zeros(total, dt)
+    for gd, contrib in contribs:
+        b = b.at[gd].add(contrib.astype(dt))
+    return b
 
 
 def _apply_natural_boundary_terms(b, boundary_terms, domain, field_index, spaces, top, pts_np, offs, n_cells, quad_degree):
