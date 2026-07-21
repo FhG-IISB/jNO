@@ -719,14 +719,24 @@ def ams(*, aux=None) -> _AMS:
     pure waste). You cannot auto-freeze from the parametric fem itself because ``θ₀`` is only resolved
     at solve time; the one-line concrete reference is that choice made explicit.
 
-    The same spec handles the **real** curl-curl+mass and the **complex** eddy operator ``νK + jωσM``
-    — dtype follows the assembled matrix; pair it with :func:`jno.solve.gmres` (complex-correct) for
-    the eddy case. For a complex operator each auxiliary is reformulated so a **real-only** ``aux``
-    (AmgX/multigrid) still applies, *exactly*: the gradient block ``GᵀA_cG = jω·R`` is pure imaginary
-    (``GᵀKG = 0``) so ``A_G⁻¹ = -j·(Im A_G)⁻¹``; the Π block ``S + jT`` becomes the real 2n block
-    ``[[S,-T],[T,S]]`` (non-symmetric → the ``aux`` must be non-symmetric-capable, e.g. AMG with
-    ``is_symmetric=False``). Complex GMRES is not flexible, so solve the complex ``aux`` **tightly**
-    (near-exact) — a strong multigrid or ``lu``, not a single V-cycle.
+    The same spec handles the **real** curl-curl+mass, the **complex** eddy operator ``νK + jωσM``, and
+    a **driven time-harmonic** ``K − k₀²εM`` with absorption — dtype follows the assembled matrix; pair
+    it with :func:`jno.solve.gmres` (complex-correct) for the complex cases. For a complex operator
+    **every** auxiliary is reformulated as its real-equivalent ``2n`` block ``[[Re,-Im],[Im,Re]]``, which
+    a **real-only** ``aux`` (AmgX/multigrid) solves *exactly*: the gradient block ``GᵀA_cG`` and each
+    solenoidal block ``ΠᵀA_cΠ`` alike (non-symmetric → the ``aux`` must be non-symmetric-capable, e.g.
+    AMG with ``is_symmetric=False``).
+
+    The gradient block once kept only ``Im A_G``, on the eddy-case reasoning that ``GᵀKG = 0`` makes
+    ``A_G = jω·R`` pure imaginary, so ``A_G⁻¹ = -j·(Im A_G)⁻¹``. That fails for a **driven wave**
+    problem twice over: ``Re A_G = -k₀²·GᵀεMG ≠ 0``, and with **surface-only** absorption (an impedance
+    / first-order absorbing BC and no volume loss) ``Im A_G`` is a *boundary* mass — identically zero on
+    every interior node, hence singular, so the aux solve returned garbage and the outer Krylov stalled
+    at residual ~1 with **no error**. Inverting the full complex ``A_G`` fixes both, and on the eddy case
+    is algebraically identical to the old form (solving ``[[0,-R],[R,0]]`` gives exactly ``-j·R⁻¹``).
+
+    Complex GMRES is **not flexible**, so solve a complex ``aux`` **tightly** (near-exact) — a strong
+    multigrid or ``lu``, not a single V-cycle, which is a *variable* preconditioner and will stall.
 
     Requirements & scope:
 
