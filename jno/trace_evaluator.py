@@ -1360,6 +1360,7 @@ class TraceEvaluator:
                         domain.mesh_connectivity["triangles"],
                         vi_dim,
                         method=grad_method,
+                        grid=domain.mesh_connectivity.get("grid"),  # structured-grid fast path
                     )
                 return DifferentialOperators.compute_fd_gradient_3d_simple(
                     u_1d,
@@ -1530,6 +1531,7 @@ class TraceEvaluator:
                         domain.mesh_connectivity["triangles"],
                         dims,
                         method=lap_method,
+                        grid=domain.mesh_connectivity.get("grid"),  # structured-grid fast path
                     )
                 return DifferentialOperators.compute_fd_laplacian_3d_simple(
                     u_1d,
@@ -1550,6 +1552,7 @@ class TraceEvaluator:
                         mesh_points,
                         domain.mesh_connectivity["triangles"],
                         var_dims,
+                        grid=domain.mesh_connectivity.get("grid"),  # structured-grid fast path
                     )
                 return DifferentialOperators.compute_fd_hessian_3d_simple(
                     u_1d,

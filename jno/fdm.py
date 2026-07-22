@@ -31,9 +31,19 @@ residual) and boundary **faces in 3-D** (each oriented outward exactly via its o
 flat face gives an exact axis normal, no corner heuristic). Plus **transient** problems by
 method-of-lines (``M = I``;
 a unit-coefficient ``u.t`` term, e.g. ``ui.t - νΔu``) — all with linear + nonlinear residuals. Transient
-flux BCs, periodic, a general ``u.t`` mass coefficient, and a structured-grid stencil backend are planned
-extensions (see ``plans/fdm-solver.md``). A pure-Neumann problem (no Dirichlet node) is singular
-(solution up to a constant) and is solved as-is.
+flux BCs, periodic, and a general ``u.t`` mass coefficient are planned extensions (see
+``plans/fdm-solver.md``). A pure-Neumann problem (no Dirichlet node) is singular (solution up to a
+constant) and is solved as-is.
+
+**Structured grid (2-D).** ``jno.domain(jno.Shape.rect(x0, y0, x1, y1, size=h), structured=True)`` builds
+a regular right-triangulation and records a grid descriptor on ``mesh_connectivity["grid"]``; the interior
+operators (``jno.fdm.laplacian`` / ``gradient`` and the constraint-list ``u.d2(x)`` authoring) then take
+the assembly-free direct finite-difference stencils (the 5-point Laplacian) instead of the cotangent
+operator — identical to the cotangent result on a uniform right-triangulation, but without per-element
+assembly. The canonical ``jno.fdm([-ui.d2(x) - ui.d2(y) - f, u(bnd) - g]).solve()`` works unchanged and
+stays differentiable; because the reduced-Dirichlet 5-point operator is nonsymmetric, a structured solve
+defaults its inner Krylov to **GMRES** (robust for nonsymmetric systems, still matrix-free) instead of
+BiCGStab — no authoring change. Structured 3-D (box) and cut-cell geometry are planned.
 """
 
 from __future__ import annotations
@@ -45,6 +55,21 @@ from . import solve as _solve
 from .differential_operators import DifferentialOperators as _D
 
 __all__ = ["fdm", "laplacian", "gradient"]
+
+
+def _structured_linear_solve(domain):
+    """Inner linear solve for the matrix-free Newton–Krylov on a **structured grid**: GMRES rather than
+    the driver's default BiCGStab. The reduced-Dirichlet 5-point operator is nonsymmetric, and BiCGStab
+    can break down on it (a strong-form ``u.d2(x)+u.d2(y)`` returns NaN), whereas GMRES is robust for
+    nonsymmetric systems while staying matrix-free and differentiable (the driver firewalls it in
+    ``custom_linear_solve``, so the reverse pass runs GMRES on ``Aᵀ``). Returns ``None`` for an
+    unstructured mesh, so the driver keeps its (BiCGStab) default there."""
+    if getattr(domain, "mesh_connectivity", None) is None or domain.mesh_connectivity.get("grid") is None:
+        return None
+    from .utils.solver.solver_api import LinearOperator
+
+    gmres = _solve.gmres()
+    return lambda mv, rhs: gmres(LinearOperator.from_matvec(mv), rhs)
 
 
 def _mesh(domain):
@@ -70,9 +95,10 @@ def laplacian(u, domain, method: str = "cotangent"):
     3-D."""
     pts, cells = _mesh(domain)
     dim = int(getattr(domain, "dimension", 2))
+    grid = domain.mesh_connectivity.get("grid")  # structured-grid fast path (2-D), else None
     if dim == 3:
         return _D.compute_fd_laplacian_3d_simple(u, pts, cells, dims=(0, 1, 2), method=method)
-    return _D.compute_fd_laplacian_2d_simple(u, pts, cells, dims=(0, 1), method=method)
+    return _D.compute_fd_laplacian_2d_simple(u, pts, cells, dims=(0, 1), method=method, grid=grid)
 
 
 def gradient(u, domain, method: str = "area_weighted"):
@@ -81,11 +107,12 @@ def gradient(u, domain, method: str = "area_weighted"):
     names apply on a 2-D triangular or 3-D tetrahedral mesh."""
     pts, cells = _mesh(domain)
     dim = int(getattr(domain, "dimension", 2))
+    grid = domain.mesh_connectivity.get("grid")  # structured-grid fast path (2-D), else None
     if dim == 3:
         comps = [_D.compute_fd_gradient_3d_simple(u, pts, cells, d, method=method) for d in range(3)]
         return jnp.stack(comps, axis=1)
-    gx = _D.compute_fd_gradient_2d_simple(u, pts, cells, 0, method=method)
-    gy = _D.compute_fd_gradient_2d_simple(u, pts, cells, 1, method=method)
+    gx = _D.compute_fd_gradient_2d_simple(u, pts, cells, 0, method=method, grid=grid)
+    gy = _D.compute_fd_gradient_2d_simple(u, pts, cells, 1, method=method, grid=grid)
     return jnp.stack([gx, gy], axis=1)
 
 
@@ -143,7 +170,7 @@ class FDMSystem:
 
         driver = nonlinear or _solve.newton()
         u0 = jnp.zeros(self._N) if x0 is None else jnp.asarray(x0)
-        return driver(residual_with_bc, u0)
+        return driver(residual_with_bc, u0, linear_solve=_structured_linear_solve(self.domain))
 
     def solve_transient(self, u0, t_span, nsteps, *, save_ts=None):
         """Explicit method-of-lines march (when you don't drive time through ``domain.time``). See
@@ -717,7 +744,7 @@ class _TraceFDM:
 
         driver = nonlinear or _solve.newton()
         u0 = jnp.zeros(self._N) if x0 is None else jnp.asarray(x0)
-        return driver(residual_with_bc, u0)
+        return driver(residual_with_bc, u0, linear_solve=_structured_linear_solve(self.domain))
 
     def pinned_solver(self, node_ids, *, nonlinear=None):
         """A **reusable** ``f(values) -> field`` that solves the subdomain with ``node_ids`` pinned to

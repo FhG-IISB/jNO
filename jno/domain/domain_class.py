@@ -244,6 +244,12 @@ class domain(MeshIOMixin):
         """Dispatch to PolygonDomain when constructor is a shapely geometry, vertex list, or dict."""
         if cls is domain and constructor is not None:
             if not isinstance(constructor, (str, domain)) and not callable(constructor):
+                if kwargs.get("structured"):
+                    raise ValueError(
+                        "jno.domain(..., structured=True) requires a jno.Shape.rect(...) geometry — a "
+                        "shapely/polygon/vertex constructor is not supported. Build the rectangle with "
+                        "jno.Shape.rect(x0, y0, x1, y1, size=h) (structured grids are v1-limited to that)."
+                    )
                 from .polygon_domain import PolygonDomain
 
                 _POLY_KWARGS = frozenset(
@@ -273,6 +279,7 @@ class domain(MeshIOMixin):
         tau: Optional[Tuple[float, float, int]] = None,
         compute_mesh_connectivity: Optional[bool] = None,
         keep_orphan_nodes: bool = False,
+        structured: bool = False,
         **_ignored_kwargs,
     ):
         """
@@ -288,6 +295,13 @@ class domain(MeshIOMixin):
                 rather than integrating a physical time derivative. Use for quasi-static load-stepping
                 (e.g. an elasto-plastic load→unload cycle). Pass ``time`` **or** ``tau``, not both.
             mesh_connectivity: Wether or not to compute the some hyperparameters about the mesh (needed for finite_difference methods)
+            structured: When ``True`` and the geometry is a single axis-aligned ``jno.Shape.rect(...)``,
+                build a **regular grid** (right-triangulation) sized from the shape's ``size=`` instead of
+                an unstructured gmsh mesh, and record a grid descriptor on ``mesh_connectivity["grid"]``.
+                ``jno.fdm`` then takes the assembly-free direct finite-difference stencils (the 5-point
+                Laplacian) on that grid rather than the cotangent operator — same answer, much cheaper.
+                v1 is 2-D axis-aligned rectangles only; a 3-D ``Shape.box(...)`` or a composite/CSG shape
+                raises (structured 3-D and cut-cell geometry are planned).
         """
         # `tau=` is a pseudo-time (load-path) alias of `time=`: reuse the whole grid/coordinate/tiling
         # machinery, only flag it so the solve marches it as a history path instead of integrating u.t.
@@ -368,6 +382,12 @@ class domain(MeshIOMixin):
         # assembled operator). Off by default via keep_orphan_nodes=True. Applied in _apply_mesh.
         self._keep_orphan_nodes = keep_orphan_nodes
 
+        # Structured-grid request: replace the (Shape) constructor with a regular right-triangulation
+        # over the rectangle, and remember the grid descriptor to stamp on mesh_connectivity below.
+        self._structured_grid = None
+        if structured:
+            constructor, self._structured_grid = self._structured_grid_setup(constructor)
+
         # Generate or load mesh / npz point cloud tags
         if isinstance(constructor, str):
             suffix = Path(constructor).suffix.lower()
@@ -389,6 +409,12 @@ class domain(MeshIOMixin):
             raise ValueError("Must provide either geometry_func, mesh file, or NPZ tag file")
 
         self._apply_mesh(self.mesh)
+
+        # Stamp the structured-grid descriptor so jno.fdm takes the direct-stencil fast path. Kept on
+        # both mesh_connectivity (where the FD kernels read it) and as _grid_shape (existing convention).
+        if self._structured_grid is not None and getattr(self, "mesh_connectivity", None):
+            self.mesh_connectivity["grid"] = dict(self._structured_grid)
+            self._grid_shape = self._structured_grid["shape"]
 
         # Add time dimension if needed
         if self._is_time_dependent:
@@ -1540,6 +1566,54 @@ class domain(MeshIOMixin):
         return assemble_weak_form(self, expr, **kwargs)
 
     # Generators
+    def _structured_grid_setup(self, shape):
+        """Validate a ``structured=True`` request and prepare the regular-grid constructor.
+
+        Returns ``(constructor, grid_meta)`` where ``constructor(geo) -> (meshio.Mesh, 2, ds)`` builds a
+        right-triangulated regular grid over the rectangle (reusing :meth:`Geometries.equi_distant_rect`,
+        so boundary tags ``left/right/bottom/top`` come for free), and ``grid_meta`` is the
+        ``{"shape": (Nx, Ny), "spacing": (hx, hy), "origin": (x0, y0)}`` descriptor stamped onto
+        ``mesh_connectivity["grid"]`` — the key ``jno.fdm``'s FD kernels read to take the assembly-free
+        5-point-stencil path (node order ``idx(i, j) = i·Ny + j``). Fails loud: v1 supports only a single
+        axis-aligned 2-D ``jno.Shape.rect(...)`` with a uniform (scalar) size."""
+        from ..geometry.primitives import Rect
+        from ..geometry.shape import Shape
+
+        if not isinstance(shape, Shape):
+            raise ValueError(
+                "jno.domain(..., structured=True) requires a jno.Shape.rect(...) geometry — got "
+                f"{type(shape).__name__}. Structured grids are v1-limited to an axis-aligned rectangle."
+            )
+        node = getattr(shape, "_node", None)
+        prim = node[1] if (isinstance(node, tuple) and node and node[0] == "leaf") else None
+        if not isinstance(prim, Rect):
+            raise NotImplementedError(
+                "jno.domain(..., structured=True) currently supports only a single axis-aligned "
+                "jno.Shape.rect(x0, y0, x1, y1) (2-D). A 3-D jno.Shape.box(...) or a composite/CSG shape "
+                "is not yet supported (structured 3-D and cut-cell geometry are planned) — use an "
+                "unstructured mesh (structured=False) for those."
+            )
+        size = getattr(shape, "_size", None)
+        if callable(size):
+            raise NotImplementedError(
+                "jno.domain(..., structured=True) needs a uniform scalar size — a spatially varying "
+                "size=<callable> (graded mesh) is not supported on a structured grid."
+            )
+        h = float(size) if isinstance(size, (int, float)) and size > 0 else 0.1
+        if not (isinstance(size, (int, float)) and size > 0):
+            self.log.info(f"structured=True: no scalar size on the Shape; defaulting to grid spacing h={h}.")
+        x_lo, x_hi = sorted((float(prim.x0), float(prim.x1)))
+        y_lo, y_hi = sorted((float(prim.y0), float(prim.y1)))
+        nx = max(2, int(round((x_hi - x_lo) / h)))  # >= 2 cells so the 3-point edge stencil is defined
+        ny = max(2, int(round((y_hi - y_lo) / h)))
+        constructor = Geometries.equi_distant_rect(x_range=(x_lo, x_hi), y_range=(y_lo, y_hi), nx=nx, ny=ny)
+        grid_meta = {
+            "shape": (nx + 1, ny + 1),
+            "spacing": ((x_hi - x_lo) / nx, (y_hi - y_lo) / ny),
+            "origin": (x_lo, y_lo),
+        }
+        return constructor, grid_meta
+
     def _generate_mesh(self, geometry_func: Callable, algorithm: int):
         """Generate mesh using PyGmsh."""
         import pygmsh
