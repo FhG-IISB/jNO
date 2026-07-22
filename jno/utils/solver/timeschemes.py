@@ -8,6 +8,10 @@ and unconditionally stable, so it takes large stiff steps that an implicit θ-st
 source is integrated by ETD2). For a symmetric operator it reuses the Lanczos
 :func:`jno.solve.applyfun`; for a **non-symmetric** one (``symmetric=False``, advection–diffusion) it uses
 an Arnoldi + differentiable **Padé** exponential (:func:`jno.utils.solver.matfun.expmv`), all matfree.
+``jno.solve.adaptive(...)`` chooses the step size per step from a **step-doubling** local-error estimate
+on the block's own implicit step, so it works for every transient case (real/complex, scalar/vector,
+plain/periodic) and stays reverse-mode differentiable (a fixed-budget ``lax.scan`` with the controller
+``stop_gradient``-ed — the state differentiates at the realized step schedule).
 """
 
 from __future__ import annotations
@@ -47,6 +51,115 @@ class _ExponentialScheme:
 
     def __repr__(self):
         return f"jno.solve.exponential(order={self.order}, mass={self.mass!r}, symmetric={self.symmetric})"
+
+
+class _AdaptiveScheme:
+    """Adaptive step-size scheme (see :func:`jno.solve.adaptive`) — step-doubling (Richardson) error
+    control on the block's OWN implicit step, so it inherits the block's DAE handling and works for a
+    linear or nonlinear block, scalar or vector, plain or periodic-reduced (the step runs in the reduced
+    space; the caller prolongs). The complex-transient path feeds the same marcher its 2n-block step."""
+
+    def __init__(self, rtol: float, atol: float, max_steps: int):
+        self.rtol, self.atol, self.max_steps = float(rtol), float(atol), int(max_steps)
+
+    def integrate(self, block, args, save_ts, *, linear_solve=None, nonlinear_solve=None):
+        s0f = getattr(block, "state0_fn", None)
+        u0 = jnp.asarray(s0f(args) if s0f is not None else block.state0).reshape(-1)
+        theta = float(block.metadata.get("theta", 1.0)) if getattr(block, "metadata", None) else 1.0
+
+        def step_fn(u, t, dt):
+            return block.step(u, t, dt, args=args, theta=theta, linear_solve=linear_solve, nonlinear_solve=nonlinear_solve)
+
+        dt0 = float(block.dt) if block.dt else (float(block.t1) - float(block.t0)) / 100.0
+        return adaptive_march(
+            step_fn,
+            u0,
+            float(block.t0),
+            float(block.t1),
+            save_ts,
+            rtol=self.rtol,
+            atol=self.atol,
+            max_steps=self.max_steps,
+            dt0=dt0,
+        )
+
+    def __repr__(self):
+        return f"jno.solve.adaptive(rtol={self.rtol}, atol={self.atol}, max_steps={self.max_steps})"
+
+
+def _safe_interp(x, xp, fp):
+    """Piecewise-linear interpolation that stays gradient-safe when ``xp`` has repeated (flat) values.
+    A rejected or settled adaptive step records a **duplicate** time, and ``jnp.interp`` divides by the
+    zero gap in its VJP → ``NaN``; here a flat gap contributes zero slope, so ``∂/∂fp`` stays finite."""
+    n = xp.shape[0]
+    i = jnp.clip(jnp.searchsorted(xp, x, side="right") - 1, 0, n - 2)
+    x0, x1, f0, f1 = xp[i], xp[i + 1], fp[i], fp[i + 1]
+    gap = x1 - x0
+    w = jnp.where(gap > 0, (x - x0) / jnp.where(gap > 0, gap, 1.0), 0.0)  # zero slope on a flat gap (no 0/0)
+    return f0 + w * (f1 - f0)
+
+
+def adaptive_march(step_fn, u0, t0, t1, save_ts, *, rtol, atol, max_steps, dt0, safety=0.9, min_factor=0.2, max_factor=5.0):
+    """Adaptive step-size march via **step doubling** (Richardson error control), reverse-mode
+    differentiable. ``step_fn(u, t, dt) -> u(t+dt)`` is one implicit step (the block's DAE-correct
+    θ-step, or the complex 2n-block step). Each attempt compares a single full step with two half-steps;
+    the normalized RMS difference drives accept/reject and the next dt (exponent ½ for a first-order
+    method). The march is a **fixed-length** ``lax.scan`` of ``max_steps`` — a static trip count, so the
+    whole thing stays reverse-differentiable — where a rejected step or an over-budget tail simply consumes
+    an iteration without advancing ``t``. The trajectory is sampled at ``save_ts`` by interpolation; if the
+    budget is exhausted before ``t1`` the result is **NaN-poisoned** (raise ``max_steps``) rather than
+    silently under-resolving the tail — jNO never fails silently."""
+    u0 = jnp.asarray(u0).reshape(-1)
+    rt = jnp.real(u0).dtype  # time / dt live in the state's real dtype (a complex system marches its real 2n block)
+    t0, t1 = jnp.asarray(t0, rt), jnp.asarray(t1, rt)
+    span = jnp.abs(t1 - t0)
+    # A non-degenerate floor: a *tiny* dt makes ``M + dt·A`` near-singular on the zeroed Dirichlet rows
+    # (its adjoint then blows up to NaN), so never step below this — the fixed-length scan already bounds
+    # the count, so the floor needs only to keep every step well-conditioned, not to bound work.
+    dt_min = 1e-4 * span
+    dt_max = span
+
+    def _err(a, b):  # normalized RMS of the two estimates' difference (mixed absolute / relative tolerance)
+        scale = atol + rtol * jnp.maximum(jnp.abs(a), jnp.abs(b))
+        return jnp.sqrt(jnp.mean(jnp.abs((a - b) / scale) ** 2))
+
+    def _take(operand):
+        u, _t, _dt = operand
+        # ``u_full`` is used ONLY to size the next step, so freeze its gradient entirely — otherwise its
+        # matrix-free solve adjoint would run with a zero cotangent and hit a 0/0 (‖r‖/‖b‖ with b=0) → NaN.
+        u_full = jax.lax.stop_gradient(step_fn(u, _t, _dt))
+        u_half = step_fn(step_fn(u, _t, 0.5 * _dt), _t + 0.5 * _dt, 0.5 * _dt)  # the accepted (more accurate) state
+        return u_half, jax.lax.stop_gradient(_err(u_full, u_half))
+
+    def body(carry, _):
+        t, u, dt = carry  # t, dt are the step SCHEDULE (control); the gradient flows through the state u only
+        remaining = t1 - t
+        done = remaining <= dt_min
+        dt_ctrl = jnp.clip(dt, dt_min, dt_max)
+        dt_step = jnp.clip(jnp.minimum(dt_ctrl, remaining), dt_min, dt_max)  # land on t1; never a degenerate dt
+        # Differentiate the numerical state at the REALIZED (t, dt) schedule; the controller (the error
+        # estimate and the next dt) is a discrete control decision whose derivative is both fragile (√err
+        # blows up exactly when a step is well-resolved) and not what an inverse problem wants, so
+        # ``stop_gradient`` it — the standard way to differentiate an adaptive solver (Diffrax does the
+        # same): the gradient goes through u and the operator params at the step sequence the forward pass
+        # chose. On a **settled** step ``lax.cond`` runs the *skip* branch (no solve), so no zero-cotangent
+        # solve adjoint runs there. **No rejection**: a too-large step is only inaccurate, never unstable
+        # (backward Euler is L-stable), and the error feedback simply shrinks the *next* dt — which keeps
+        # every step's ``u_half`` a genuinely-used (non-discarded) state, so no NaN from a masked branch.
+        _t, _dt = jax.lax.stop_gradient(t), jax.lax.stop_gradient(dt_step)
+        u_new, err = jax.lax.cond(done, lambda o: (o[0], jnp.asarray(0.0, rt)), _take, (u, _t, _dt))
+        t_new = jnp.where(done, t, t + _dt)
+        fac = jnp.clip(safety * jnp.maximum(err, 1e-12) ** (-0.5), min_factor, max_factor)
+        dt_next = jnp.clip(dt_ctrl * fac, dt_min, dt_max)
+        return (t_new, u_new, dt_next), (t_new, u_new)
+
+    (t_end, _u, _dt), (ts, us) = jax.lax.scan(body, (t0, u0, jnp.asarray(dt0, rt)), None, length=int(max_steps))
+    ts = jax.lax.stop_gradient(jnp.concatenate([t0[None], ts]))  # sample times are a fixed schedule (control)
+    us = jnp.concatenate([u0[None, :], us], axis=0)
+    save = jnp.asarray(save_ts, rt)
+    out = jax.vmap(lambda col: _safe_interp(save, ts, col), in_axes=1, out_axes=1)(us)
+    reached = t_end >= t1 - 2.0 * dt_min  # the last real step lands within dt_min of t1 (see ``done``)
+    return jnp.where(reached, out, jnp.asarray(jnp.nan, out.dtype))  # fail loud if max_steps was too small
 
 
 def _exponential_integrate(block, args, save_ts, *, order, mass, symmetric):

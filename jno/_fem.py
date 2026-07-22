@@ -871,7 +871,7 @@ def _solve_complex_block(
     )
 
 
-def _solve_complex_transient(blocks: Any, save_ts: Any = None, periodic: Optional[dict] = None) -> Any:
+def _solve_complex_transient(blocks: Any, save_ts: Any = None, periodic: Optional[dict] = None, time: Any = None) -> Any:
     """Integrate a complex *transient* system via the real-equivalent block (everything was
     assembled as real systems): ``(M_r + i M_i) u_dot + (A_r + i A_i) u = (c_r + i c_i)`` becomes
     the real ``2N`` system
@@ -906,26 +906,43 @@ def _solve_complex_transient(blocks: Any, save_ts: Any = None, periodic: Optiona
         w0 = jnp.concatenate([jnp.asarray(br.state0).reshape(-1), jnp.asarray(bi.state0).reshape(-1)])
         t0, t1, dt = float(br.t0), float(br.t1), float(br.dt)
         grid = jnp.linspace(t0, t1, max(1, round((t1 - t0) / dt)) + 1)
-        fr, fi = br.forcing_vector_fn, bi.forcing_vector_fn
-        # Time-independent block operator: LU-factor it ONCE here, not on every step. `jnp.linalg.solve`
-        # inside the scan re-factors each iteration (O(n³) per step); `lu_factor` once + `lu_solve` per
-        # step is O(n³) once + O(n²) per step. Both are differentiable, so ∂traj/∂args (the parametric
-        # inverse) flows through the factorization for a runtime parameter in the operator.
-        lu = jax.scipy.linalg.lu_factor(M_blk + dt * A_blk)
-
-        def step(w, t_next):  # backward Euler: (M_blk + dt A_blk) w_next = M_blk w + dt (c_blk + f)
-            rhs = M_blk @ w + dt * c_blk
-            if fr is not None or fi is not None:
-                f_r = jnp.asarray(fr(t_next, args)).reshape(-1) if fr is not None else jnp.zeros((n,), c_blk.dtype)
-                f_i = jnp.asarray(fi(t_next, args)).reshape(-1) if fi is not None else jnp.zeros((n,), c_blk.dtype)
-                rhs = rhs + dt * jnp.concatenate([f_r, f_i])
-            w_next = jax.scipy.linalg.lu_solve(lu, rhs)
-            return w_next, w_next
-
-        _, ws = jax.lax.scan(step, w0, grid[1:])
-        traj = jnp.concatenate([w0[None, :], ws], axis=0)  # (n_grid, 2N)
         _save = grid if save_ts is None else jnp.asarray(save_ts)
-        traj = jax.vmap(lambda col: jnp.interp(_save, grid, col), in_axes=1, out_axes=1)(traj)
+        fr, fi = br.forcing_vector_fn, bi.forcing_vector_fn
+
+        def _rhs(w, t_end, dt_):  # backward-Euler RHS: M_blk w + dt (c_blk + f(t_end))
+            r = M_blk @ w + dt_ * c_blk
+            if fr is not None or fi is not None:
+                f_r = jnp.asarray(fr(t_end, args)).reshape(-1) if fr is not None else jnp.zeros((n,), c_blk.dtype)
+                f_i = jnp.asarray(fi(t_end, args)).reshape(-1) if fi is not None else jnp.zeros((n,), c_blk.dtype)
+                r = r + dt_ * jnp.concatenate([f_r, f_i])
+            return r
+
+        if time is not None:
+            # Adaptive (or another bring-your-own) scheme on the real 2n block: dt varies, so the operator
+            # is re-factored per attempt (no factor-once), and step-doubling drives the step size. Runs the
+            # SAME marcher as the real path — vector and periodic ride through (the blocks are already flat
+            # and periodic-reduced). Differentiable in a runtime parameter through lu_factor/lu_solve.
+            from .utils.solver.timeschemes import adaptive_march
+
+            def cstep(w, t, dt_):
+                return jax.scipy.linalg.lu_solve(jax.scipy.linalg.lu_factor(M_blk + dt_ * A_blk), _rhs(w, t + dt_, dt_))
+
+            traj = adaptive_march(
+                cstep, w0, t0, t1, _save, rtol=time.rtol, atol=time.atol, max_steps=time.max_steps, dt0=dt
+            )
+        else:
+            # Time-independent block operator: LU-factor it ONCE, not on every step (`jnp.linalg.solve`
+            # inside the scan re-factors each iteration — O(n³)/step; `lu_factor` once + `lu_solve`/step is
+            # O(n³) once + O(n²)/step). Differentiable, so ∂traj/∂args (the parametric inverse) flows.
+            lu = jax.scipy.linalg.lu_factor(M_blk + dt * A_blk)
+
+            def step(w, t_next):  # backward Euler: (M_blk + dt A_blk) w_next = M_blk w + dt (c_blk + f)
+                w_next = jax.scipy.linalg.lu_solve(lu, _rhs(w, t_next, dt))
+                return w_next, w_next
+
+            _, ws = jax.lax.scan(step, w0, grid[1:])
+            traj = jnp.concatenate([w0[None, :], ws], axis=0)  # (n_grid, 2N)
+            traj = jax.vmap(lambda col: jnp.interp(_save, grid, col), in_axes=1, out_axes=1)(traj)
         result = traj[:, :n] + 1j * traj[:, n:]  # (n_save, n_red) complex (full N when untied)
         if periodic is None:
             return result
@@ -1403,6 +1420,20 @@ class FEM:
             # (complex) recovered-gradient gap; only the anisotropic Hessian metric is real-only (guarded in
             # run_adaptive_solve). complex-transient stays out (its Re/Im block assembly can't remesh).
             return run_adaptive_solve(self, adapt, solve_fn=solve_fn, **kwargs)
+        if self._mode == "complex_transient" and time is not None:
+            # The complex-transient path runs its own marcher over the real 2n block, so thread the time=
+            # scheme straight into it (bypassing the per-step slot composition, which is real-block only).
+            if not hasattr(time, "rtol"):  # jno.solve.adaptive is the scheme wired into the 2n-block marcher
+                raise NotImplementedError(
+                    "fem.solve(time=...) on a complex-transient problem is wired for jno.solve.adaptive(...) "
+                    "only (a fixed θ-step is already the default there; jno.solve.exponential is not wired)."
+                )
+            if any(s is not None for s in (x0, nonlinear, linear, precond)):
+                raise NotImplementedError(
+                    "fem.solve on a complex-transient threads only the time= scheme so far; the "
+                    "x0/nonlinear/linear/precond slots are not wired into that path yet."
+                )
+            return _solve_complex_transient(self._op, save_ts=kwargs.get("save_ts"), periodic=self._periodic, time=time)
         if has_slots:
             solve_fn, kwargs = self._compose_slots(
                 solve_fn, x0=x0, nonlinear=nonlinear, linear=linear, precond=precond, time=time, kwargs=kwargs
