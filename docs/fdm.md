@@ -195,8 +195,10 @@ traj = jno.fdm([
 ]).solve()
 ```
 
-The `u.t` term must appear with unit coefficient (the standard `u.t - 𝒩(u)` form). Nonlinear
-transient residuals are handled the same way (the march reuses the Newton driver).
+The `u.t` term carries a **unit or a general `c(x)·u.t` mass coefficient** (variable material, e.g.
+`ρcₚ(x)·u.t`): it is extracted by a two-probe `c = F(u.t=1) − F(u.t=0)` and carried as `M = diag(c)`, so
+no structural parsing is needed; a nonlinear `c(u)·u.t` fails loud. Nonlinear transient residuals are
+handled the same way (the march reuses the Newton driver).
 
 ### Time schemes
 
@@ -280,9 +282,9 @@ conditions work per face exactly as in 2-D — bind to the face and take the nor
 Dirichlet, one PDE equation per unknown; `.solve()` returns `(nf, N)`) — on a **2-D triangular or 3-D
 tetrahedral** mesh; any mix of Dirichlet and flux (Neumann / Robin / coordinate-coefficient, affine in
 `∂u/∂n`) boundary conditions, in 2-D and 3-D, **steady or transient** (a transient flux node is an
-algebraic zero-mass-row constraint); transient problems by the method of lines (`M = I`,
-unit-coefficient `u.t`) with a selectable [time scheme](#time-schemes); linear and nonlinear residuals;
-differentiable inverse problems.
+algebraic zero-mass-row constraint); transient problems by the method of lines (a `u.t` term with a unit or a general `c(x)·u.t` mass
+coefficient, `M = diag(c)`) with a selectable [time scheme](#time-schemes); linear and nonlinear
+residuals; differentiable inverse problems.
 
 Author a coupled system as one PDE equation per unknown, in declaration order (equation *k* drives
 unknown *k*), plus each field's BCs:
@@ -304,8 +306,8 @@ the analytic, shapely-free [`Shape.contains`](Domain-and-Geometry.md) — in 2-D
 An axis-aligned 2-D rectangle or 3-D box can use a fast [structured grid](#structured-grid-fast-stencils)
 (`structured=True`) with direct finite-difference stencils in place of the unstructured mesh.
 
-**Planned:** periodic boundaries; a general `u.t` mass coefficient; composite / cut-cell structured
-geometry (axis-aligned rectangles and boxes are supported, above); 1-D meshes. Authoring a `jno.Shape` sub-region
+**Planned:** periodic boundaries; composite / cut-cell structured geometry (axis-aligned rectangles and
+boxes are supported, above); 1-D meshes; transient / flux BCs on coupled multi-field systems. Authoring a `jno.Shape` sub-region
 through `domain.region(name, shape)` + `d.variable`, and 3-D coupled solves, additionally need
 region-tag support on the base 3-D domain (a separate 3-D domain-decomposition feature). A pure-Neumann
 problem (no Dirichlet node anywhere) is singular — the solution is defined only up to an additive

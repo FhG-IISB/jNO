@@ -450,6 +450,57 @@ def test_coupled_guards():
         )
 
 
+@pytest.mark.slow
+def test_general_mass_coefficient():
+    """A general `c(x)·u.t` mass coefficient (variable material) — extracted via the two-probe
+    `c = F(u.t=1) − F(u.t=0)` and carried as `M = diag(c)`. Extraction is exact (constant + coordinate);
+    a constant `a·u.t` rescales the effective diffusivity: `a·u̇ = νΔu ⇒ u̇ = (ν/a)Δu`."""
+    import jno.jnp_ops as jnn
+
+    nu, T = 0.1, 0.3
+    # exact extraction of a coordinate-dependent coefficient
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1, time=(0.0, T, 40))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    p = _nodes(d)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, t=t)
+    u0 = jnn.sin(np.pi * xi) * jnn.sin(np.pi * yi)
+    s = jno.fdm([(1.0 + 0.5 * jnn.sin(np.pi * x)) * ui.t - nu * (ui.d2(x) + ui.d2(y)), u(xb, yb) - 0.0, u(xi, yi) - u0])
+    assert np.max(np.abs(np.asarray(s._mass_coefficient()) - (1.0 + 0.5 * np.sin(np.pi * p[:, 0])))) < 1e-9
+
+    # constant a=2, ν=0.1 ⇒ effective diffusivity ν/a = 0.05
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.06, time=(0.0, T, 60))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    p = _nodes(d)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, t=t)
+    u0 = jnn.sin(np.pi * xi) * jnn.sin(np.pi * yi)
+    traj = np.asarray(jno.fdm([2.0 * ui.t - nu * (ui.d2(x) + ui.d2(y)), u(xb, yb) - 0.0, u(xi, yi) - u0]).solve())
+    exact = np.exp(-2 * (nu / 2.0) * np.pi**2 * T) * (np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]))
+    interior = (p[:, 0] > 1e-9) & (p[:, 0] < 1 - 1e-9) & (p[:, 1] > 1e-9) & (p[:, 1] < 1 - 1e-9)
+    assert float(np.linalg.norm(traj[-1][interior] - exact[interior]) / np.linalg.norm(exact[interior])) < 2e-2
+
+
+def test_nonlinear_mass_rejected():
+    """A nonlinear mass `c(u)·u.t` (here `u·u.t`) is not supported — the two-probe detects u-dependence
+    and fails loud."""
+    import jno.jnp_ops as jnn
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.15, time=(0.0, 0.5, 50))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, t=t)
+    u0 = jnn.sin(np.pi * xi) * jnn.sin(np.pi * yi)
+    with pytest.raises(ValueError, match="nonlinear mass"):
+        jno.fdm([ui * ui.t - (ui.d2(x) + ui.d2(y)), u(xb, yb) - 0.0, u(xi, yi) - u0]).solve()
+
+
 def test_constraint_list_inverse_via_crux():
     """A trainable jno.np.parameter in the constraint list makes jno.fdm([...]).solve() a deferred trace
     node (like fem.solve()) that composes into jno.core — recover a source amplitude from an observed
