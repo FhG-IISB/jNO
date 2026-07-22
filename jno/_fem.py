@@ -724,6 +724,39 @@ def _complex_block_bcoo(A_r: Any, A_i: Any, n: int) -> Any:
     return jsp.BCOO((data, indices), shape=(2 * n, 2 * n))
 
 
+def _to_bcoo(A: Any) -> Any:
+    """Coerce ``A`` to a BCOO (identity if already sparse) — the native assembler returns BCOO, so this is
+    a defensive no-op that also lets a dense operator flow into the sparse block composers below."""
+    from jax.experimental import sparse as jsp
+
+    return A if hasattr(A, "indices") else jsp.BCOO.fromdense(jnp.asarray(A))
+
+
+def _bcoo_empty(m: int, n: int, dtype: Any) -> Any:
+    """An all-zero ``(m, n)`` BCOO (no stored entries)."""
+    from jax.experimental import sparse as jsp
+
+    return jsp.BCOO((jnp.zeros((0,), dtype), jnp.zeros((0, 2), jnp.int32)), shape=(m, n))
+
+
+def _bcoo_block(subblocks: Any, shape: Any, dtype: Any) -> Any:
+    """Assemble a block matrix of ``shape`` from ``(sub, row_off, col_off, scale)`` entries — each ``sub`` a
+    BCOO placed (and scaled) at its ``(row_off, col_off)`` offset. Composes in ``O(Σ nnz)`` without ever
+    forming a dense intermediate (BCOO sums any coincident coordinates on matvec / todense); a ``None`` sub
+    is the zero block. This is the sparse analogue of ``jnp.block`` for the augmented / saddle systems."""
+    from jax.experimental import sparse as jsp
+
+    idx, dat = [], []
+    for sub, roff, coff, scale in subblocks:
+        if sub is None:
+            continue
+        idx.append(sub.indices + jnp.asarray([roff, coff], dtype=sub.indices.dtype))
+        dat.append(scale * sub.data if scale != 1.0 else sub.data)
+    if not idx:
+        return jsp.BCOO((jnp.zeros((0,), dtype), jnp.zeros((0, 2), jnp.int32)), shape=shape)
+    return jsp.BCOO((jnp.concatenate(dat), jnp.concatenate(idx)), shape=shape)
+
+
 def _complex_operator(A_r: Any, A_i: Any) -> Any:
     """Fuse the real/imag legs into one complex operator ``A_r + i·A_i`` — as a **complex BCOO** when
     the legs are sparse (so an iterative complex solve never densifies), else a dense complex array.
@@ -3744,6 +3777,7 @@ def _assemble_second_order_time(
     """
     from .utils.solver.backend_blocks import SemidiscreteTimeBlock
     from .utils.solver.fem_native import assemble_fem_native
+    from .utils.solver.fem_utils import bcoo_set_dirichlet_rows, bcoo_zero_rows
     from .utils.solver.parametric_helpers import _contains_runtime_parameter
     from .utils.solver.solver_helper import max_temporal_derivative_order as _mto
     from .utils.solver.time_route import _infer_time_window, _strip_temporal_trial_derivative
@@ -3812,7 +3846,7 @@ def _assemble_second_order_time(
     def _native_group(terms, bterms):
         op, _mode, _offs = assemble_fem_native(domain, terms, bterms, [], [], vec=vec, quad_degree=quad_degree)
         if isinstance(op, tuple):  # static (A, b): a parameter-free group
-            A0, b0 = _as_dense(op[0]), jnp.asarray(op[1]).reshape(-1)
+            A0, b0 = _to_bcoo(op[0]), jnp.asarray(op[1]).reshape(-1)  # BCOO — the 2N block is composed sparsely
             return {
                 "op": (lambda a=None, _A=A0: _A),
                 "rhs": (lambda a=None, _b=b0: _b),
@@ -3823,9 +3857,9 @@ def _assemble_second_order_time(
             }
         # parametric FemLinearSystem: operator_fn(args)/rhs_fn(args) re-assemble at the runtime args.
         return {
-            "op": (lambda a=None, _o=op: _as_dense(_o.operator_fn(a))),
+            "op": (lambda a=None, _o=op: _to_bcoo(_o.operator_fn(a))),
             "rhs": (lambda a=None, _o=op: jnp.asarray(_o.rhs_fn(a)).reshape(-1)),
-            "A0": _as_dense(op.A),
+            "A0": _to_bcoo(op.A),
             "b0": jnp.asarray(op.b).reshape(-1),
             "rpe": dict(getattr(op, "runtime_parameter_exprs", {}) or {}),
             "is_param": True,
@@ -3834,7 +3868,7 @@ def _assemble_second_order_time(
     gm = _native_group(mass2_raw, {})  # u_tt -> M2 (mass)
     n = int(gm["A0"].shape[0])
     dtype = gm["A0"].dtype
-    Z = jnp.zeros((n, n), dtype=dtype)
+    Z = _bcoo_empty(n, n, dtype)  # the zero block / zero damping — sparse, so the 2N block never densifies
     gc = _native_group(damp_raw, {}) if damp_raw else None  # u_t -> C (damping)
     # A nonlinear spatial operator is assembled as a residual/jacobian below, not a linear K matrix.
     gk = None if is_nonlinear else _native_group(stiff_raw, boundary_terms)  # spatial operator K + load F
@@ -3890,14 +3924,22 @@ def _assemble_second_order_time(
     # ---- compose the 2N augmented system M_aug y' + A_aug y = c_aug, y = [u; v] ----
     #   [M2  0 ] [u']   [ 0   -M2] [u]   [0]
     #   [0   M2] [v'] + [ K    C ] [v] = [F]
+    _aug_d = jnp.concatenate([rows_all, rows_all + n]) if nrows else rows_all  # Dirichlet rows in BOTH blocks
+
     def _dirichlet_A(A):  # every Dirichlet row (u-block d, v-block d+n) -> identity row (cols kept)
         if not nrows:
             return A
+        if hasattr(A, "indices"):  # BCOO: row-replacement (zero rows + unit diagonal), never densify
+            return bcoo_set_dirichlet_rows(A, _aug_d)
         A = A.at[rows_all, :].set(0.0).at[rows_all, rows_all].set(1.0)
         return A.at[rows_all + n, :].set(0.0).at[rows_all + n, rows_all + n].set(1.0)
 
     def _dirichlet_M(M):  # zero every Dirichlet row of both blocks (the constraint rows are algebraic)
-        return M.at[rows_all, :].set(0.0).at[rows_all + n, :].set(0.0) if nrows else M
+        if not nrows:
+            return M
+        return (
+            bcoo_zero_rows(M, _aug_d) if hasattr(M, "indices") else M.at[rows_all, :].set(0.0).at[rows_all + n, :].set(0.0)
+        )
 
     common = dict(
         backend="transient",
@@ -3922,7 +3964,7 @@ def _assemble_second_order_time(
             )
         M2, C = gm["A0"], (gc["A0"] if gc else Z)
         sop, _sm, _so = assemble_fem_native(domain, stiff_raw, boundary_terms, [], [], vec=vec, quad_degree=quad_degree)
-        M_aug = _dirichlet_M(jnp.block([[M2, Z], [Z, M2]]))
+        M_aug = _dirichlet_M(_bcoo_block([(M2, 0, 0, 1.0), (M2, n, n, 1.0)], (2 * n, 2 * n), dtype))
         rpe = dict(getattr(sop, "runtime_parameter_exprs", {}) or {})
 
         def _residual_aug(y, t=0.0, args=None):
@@ -3935,8 +3977,8 @@ def _assemble_second_order_time(
 
         def _jacobian_aug(y, t=0.0, args=None):
             y = jnp.asarray(y).reshape(-1)
-            jn = _as_dense(sop.jacobian(y[:n], args))  # ∂N/∂u
-            return _dirichlet_A(jnp.block([[Z, -M2], [jn, C]]))
+            jn = _to_bcoo(sop.jacobian(y[:n], args))  # ∂N/∂u (BCOO — composed into the augmented block sparsely)
+            return _dirichlet_A(_bcoo_block([(M2, 0, n, -1.0), (jn, n, 0, 1.0), (C, n, n, 1.0)], (2 * n, 2 * n), dtype))
 
         meta = {"theta": 0.5, "second_order": True}
         if rpe:
@@ -3952,8 +3994,8 @@ def _assemble_second_order_time(
     elif not has_param and not has_tv:
         # parameter-free, constant Dirichlet: assemble the augmented block once (the fast, common path)
         M2, C, K, F = gm["A0"], (gc["A0"] if gc else Z), gk["A0"], gk["b0"]
-        M_aug = _dirichlet_M(jnp.block([[M2, Z], [Z, M2]]))
-        A_aug = _dirichlet_A(jnp.block([[Z, -M2], [K, C]]))
+        M_aug = _dirichlet_M(_bcoo_block([(M2, 0, 0, 1.0), (M2, n, n, 1.0)], (2 * n, 2 * n), dtype))
+        A_aug = _dirichlet_A(_bcoo_block([(M2, 0, n, -1.0), (K, n, 0, 1.0), (C, n, n, 1.0)], (2 * n, 2 * n), dtype))
         c_aug = jnp.concatenate([jnp.zeros((n,), dtype), F])
         if nrows:
             c_aug = c_aug.at[rows].set(g).at[rows + n].set(0.0)
@@ -3969,11 +4011,11 @@ def _assemble_second_order_time(
         # the Dirichlet rows so the load never fights the held value).
         def _A_of(args):
             M2, C, K = gm["op"](args), (gc["op"](args) if gc else Z), gk["op"](args)
-            return _dirichlet_A(jnp.block([[Z, -M2], [K, C]]))
+            return _dirichlet_A(_bcoo_block([(M2, 0, n, -1.0), (K, n, 0, 1.0), (C, n, n, 1.0)], (2 * n, 2 * n), dtype))
 
         def _M_of(args):
             M2 = gm["op"](args)
-            return _dirichlet_M(jnp.block([[M2, Z], [Z, M2]]))
+            return _dirichlet_M(_bcoo_block([(M2, 0, 0, 1.0), (M2, n, n, 1.0)], (2 * n, 2 * n), dtype))
 
         def _forcing(t, args):
             f = jnp.concatenate([jnp.zeros((n,), dtype), gk["rhs"](args)])
@@ -3982,8 +4024,8 @@ def _assemble_second_order_time(
             return f + _tv_forcing(t) if has_tv else f  # driven-boundary g(t)/ġ(t) on the tv rows
 
         M2s, Cs, Ks = gm["A0"], (gc["A0"] if gc else Z), gk["A0"]
-        M_aug0 = _dirichlet_M(jnp.block([[M2s, Z], [Z, M2s]]))
-        A_aug0 = _dirichlet_A(jnp.block([[Z, -M2s], [Ks, Cs]]))
+        M_aug0 = _dirichlet_M(_bcoo_block([(M2s, 0, 0, 1.0), (M2s, n, n, 1.0)], (2 * n, 2 * n), dtype))
+        A_aug0 = _dirichlet_A(_bcoo_block([(M2s, 0, n, -1.0), (Ks, n, 0, 1.0), (Cs, n, n, 1.0)], (2 * n, 2 * n), dtype))
         c_dir = jnp.zeros((2 * n,), dtype).at[rows].set(g) if int(rows.shape[0]) else jnp.zeros((2 * n,), dtype)
         rpe = {**gm["rpe"], **(gc["rpe"] if gc else {}), **gk["rpe"]}
         block = SemidiscreteTimeBlock(
@@ -4018,6 +4060,7 @@ def _assemble_multifield_second_order(
     """
     from .utils.solver.backend_blocks import SemidiscreteTimeBlock
     from .utils.solver.fem_native import assemble_fem_native
+    from .utils.solver.fem_utils import bcoo_set_dirichlet_rows, bcoo_zero_rows
     from .utils.solver.parametric_helpers import _contains_runtime_parameter
     from .utils.solver.solver_helper import max_temporal_derivative_order as _mto
     from .utils.solver.time_route import _infer_time_window, _strip_temporal_trial_derivative
@@ -4062,7 +4105,7 @@ def _assemble_multifield_second_order(
 
     def _mat(terms, bterms):
         op, _mode, offs = assemble_fem_native(domain, terms, bterms, [], [], vec=1, quad_degree=quad_degree)
-        A = _as_dense(op[0] if isinstance(op, tuple) else op.A)
+        A = _to_bcoo(op[0] if isinstance(op, tuple) else op.A)  # BCOO — the 2N block is composed sparsely
         b = jnp.asarray(op[1] if isinstance(op, tuple) else op.b).reshape(-1)
         return A, b, list(offs)
 
@@ -4075,7 +4118,6 @@ def _assemble_multifield_second_order(
         )
     n = int(M2.shape[0])
     dtype = M2.dtype
-    Z = jnp.zeros((n, n), dtype=dtype)
 
     # Dirichlet (dof, value) pairs from the native assembler stash (constant g only)
     assemble_fem_native(domain, spatial_raw, boundary_terms, dirichlet_raw, [], vec=1, quad_degree=quad_degree)
@@ -4103,13 +4145,15 @@ def _assemble_multifield_second_order(
         else:
             u0 = u0.at[lo:hi].set(val)  # displacement IC u(0)=u0 for this field
 
-    # ---- compose the 2N augmented block (single-field formula, coupled M2/K) ----
-    M_aug = jnp.block([[M2, Z], [Z, M2]])
-    A_aug = jnp.block([[Z, -M2], [K, Z]])
+    # ---- compose the 2N augmented block (single-field formula, coupled M2/K) — SPARSELY (BCOO), so a large
+    #      coupled wave / membrane system never materialises the dense (2N × 2N) block ----
+    M_aug = _bcoo_block([(M2, 0, 0, 1.0), (M2, n, n, 1.0)], (2 * n, 2 * n), dtype)  # [[M2, 0], [0, M2]]
+    A_aug = _bcoo_block([(M2, 0, n, -1.0), (K, n, 0, 1.0)], (2 * n, 2 * n), dtype)  # [[0, -M2], [K, 0]]
     c_aug = jnp.concatenate([jnp.zeros((n,), dtype), F])
     if nrows:  # u[d]=g on displacement rows, v[d]=0 on velocity rows (identity rows, cols kept)
-        M_aug = M_aug.at[rows, :].set(0.0).at[rows + n, :].set(0.0)
-        A_aug = A_aug.at[rows, :].set(0.0).at[rows, rows].set(1.0).at[rows + n, :].set(0.0).at[rows + n, rows + n].set(1.0)
+        _md = jnp.concatenate([rows, rows + n])
+        M_aug = bcoo_zero_rows(M_aug, _md)
+        A_aug = bcoo_set_dirichlet_rows(A_aug, _md)
         c_aug = c_aug.at[rows].set(g).at[rows + n].set(0.0)
         u0, v0 = u0.at[rows].set(g), v0.at[rows].set(0.0)
     domain._fem_problem = None

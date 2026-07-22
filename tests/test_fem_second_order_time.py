@@ -179,6 +179,26 @@ def test_wave_matches_analytic_standing_wave_one_period():
     assert rel < 0.05, f"antinode does not track analytic cos(ω t): rel L2 = {rel:.4f}"
 
 
+def test_second_order_augmented_block_is_sparse():
+    """The reduced first-order augmented block ``M_aug``/``A_aug`` (``2N × 2N``, ``y = [u; v]``) is composed
+    from BCOO sub-blocks and marched matrix-free, so the dense ``(2N × 2N)`` block never materialises — a
+    large wave / elastodynamics solve scales instead of hitting the ``O((2N)^2)`` memory wall. Assert the
+    block is sparse (a dense assembler would give plain ndarrays), then march it and confirm the standing-wave
+    amplitude is still conserved (the sparse trapezoidal march is accurate)."""
+    fem = _wave_fem(mesh_size=0.08, n_periods=1, n_steps=80)
+    block = fem.operator
+    N = int(np.asarray(block.state0).shape[0])  # augmented 2n size
+    # THE FIX: the augmented operators are BCOO (a dense `jnp.block` assembly would give ndarrays, no indices)
+    assert hasattr(block.M, "indices") and hasattr(block.A, "indices"), "augmented M/A must be sparse (BCOO)"
+    assert int(block.M.nse) < 0.1 * N * N and int(block.A.nse) < 0.1 * N * N  # genuinely sparse, not dense
+    ts, U, _ = _trajectory(fem)  # the sparse matrix-free march
+    pts = np.asarray(fem.points)
+    ci = int(np.argmin(np.sum((pts - 0.5) ** 2, axis=1)))
+    exact = np.asarray(_mode11(pts[ci, 0], pts[ci, 1])) * np.cos(OMEGA * ts)
+    rel = np.linalg.norm(U[:, ci] - exact) / np.linalg.norm(exact)
+    assert rel < 0.05, f"sparse second-order march does not track cos(ω t): rel L2 = {rel:.4f}"
+
+
 def test_wave_p2_elements_higher_accuracy():
     """The reduction works on P2 (order=2) elements too — the IC is read at the assembly nodes
     (edge midpoints included), and the higher order gives a smaller phase error than P1."""
