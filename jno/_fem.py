@@ -885,29 +885,52 @@ def _solve_complex_transient(blocks: Any, save_ts: Any = None, periodic: Optiona
     prolonged back ``u = P u_red`` -- real and imaginary parts separately (a real ``P`` would cast a
     complex vector to its real dtype and drop the imaginary part)."""
 
+    from .utils.solver.linear import matrix_diagonal as _matrix_diagonal
+
     def _dn(a):
         return jnp.asarray(a.todense()) if hasattr(a, "todense") else jnp.asarray(a)
 
     br, bi = blocks
 
     def _MAc(b, args):  # (M, A(args), c) for one real leg — the operator/load re-formed at ``args`` when parametric
-        M = _dn(b.M)
-        A = _dn(b.operator_fn(0.0, args) if b.operator_fn is not None else b.A)
-        c = jnp.zeros((M.shape[0],), A.dtype) if b.affine_bias is None else jnp.asarray(b.affine_bias).reshape(-1)
+        M = b.M  # kept SPARSE (BCOO) — the marcher composes the real 2N block without ever densifying it
+        A = b.operator_fn(0.0, args) if b.operator_fn is not None else b.A
+        c = jnp.zeros((M.shape[0],), M.dtype) if b.affine_bias is None else jnp.asarray(b.affine_bias).reshape(-1)
         return M, A, c
 
     def _march(args):
         Mr, Ar, cr = _MAc(br, args)
         Mi, Ai, ci = _MAc(bi, args)
         n = Mr.shape[0]
-        M_blk = jnp.block([[Mr, -Mi], [Mi, Mr]])
-        A_blk = jnp.block([[Ar, -Ai], [Ai, Ar]])
+        # Real-equivalent 2N block [[·,-·],[·,·]] — composed SPARSELY (BCOO) from the legs when they are sparse
+        # (the norm; native Lagrange assembles BCOO), so a large complex-transient (Schrödinger / complex
+        # diffusion) never materialises the dense (2N × 2N) block or a dense LU. Dense legs fall back to jnp.block.
+        sparse = hasattr(Mr, "indices")
+        if sparse:
+            M_blk = _complex_block_bcoo(Mr, Mi, n)
+            A_blk = _complex_block_bcoo(Ar, Ai, n)
+        else:
+            M_blk = jnp.block([[_dn(Mr), -_dn(Mi)], [_dn(Mi), _dn(Mr)]])
+            A_blk = jnp.block([[_dn(Ar), -_dn(Ai)], [_dn(Ai), _dn(Ar)]])
         c_blk = jnp.concatenate([cr, ci])
         w0 = jnp.concatenate([jnp.asarray(br.state0).reshape(-1), jnp.asarray(bi.state0).reshape(-1)])
         t0, t1, dt = float(br.t0), float(br.t1), float(br.dt)
         grid = jnp.linspace(t0, t1, max(1, round((t1 - t0) / dt)) + 1)
         _save = grid if save_ts is None else jnp.asarray(save_ts)
         fr, fi = br.forcing_vector_fn, bi.forcing_vector_fn
+
+        def _blk_solve(a):  # a solver for the autonomous step operator ``S = M_blk + a·A_blk`` (built once per a)
+            S = M_blk + a * A_blk
+            if not sparse:  # dense legs: LU-factor S once, reuse across all steps
+                lu = jax.scipy.linalg.lu_factor(S)
+                return lambda rhs, w: jax.scipy.linalg.lu_solve(lu, rhs)
+            # sparse: matrix-free GMRES + Jacobi, warm-started with the previous state — no dense factorisation,
+            # so memory stays O(nnz). GMRES (not BiCGStab) is robust on the non-symmetric real-equivalent block.
+            d = _matrix_diagonal(S)
+            inv = 1.0 / jnp.where(jnp.abs(d) > 1e-30, d, 1.0)
+            return lambda rhs, w: jax.scipy.sparse.linalg.gmres(
+                lambda v: S @ v, rhs, x0=w, M=lambda v: inv * v, tol=1e-9, atol=0.0, restart=min(2 * n, 40)
+            )[0]
 
         def _rhs(w, t_end, dt_):  # backward-Euler RHS: M_blk w + dt (c_blk + f(t_end))
             r = M_blk @ w + dt_ * c_blk
@@ -918,14 +941,14 @@ def _solve_complex_transient(blocks: Any, save_ts: Any = None, periodic: Optiona
             return r
 
         if time is not None and hasattr(time, "rtol"):
-            # Adaptive scheme on the real 2n block: dt varies, so the operator is re-factored per attempt
+            # Adaptive scheme on the real 2n block: dt varies, so the step operator is rebuilt per attempt
             # (no factor-once), and step-doubling drives the step size. Runs the SAME marcher as the real
             # path — vector and periodic ride through (the blocks are already flat and periodic-reduced).
-            # Differentiable in a runtime parameter through lu_factor/lu_solve.
+            # Differentiable in a runtime parameter through the (sparse GMRES / dense LU) step solve.
             from .utils.solver.timeschemes import adaptive_march
 
-            def cstep(w, t, dt_):
-                return jax.scipy.linalg.lu_solve(jax.scipy.linalg.lu_factor(M_blk + dt_ * A_blk), _rhs(w, t + dt_, dt_))
+            def cstep(w, t, dt_):  # dt_ varies per attempt -> rebuild the step solver (backward Euler, θ=1)
+                return _blk_solve(dt_)(_rhs(w, t + dt_, dt_), w)
 
             traj = adaptive_march(
                 cstep, w0, t0, t1, _save, rtol=time.rtol, atol=time.atol, max_steps=time.max_steps, dt0=dt
@@ -934,9 +957,10 @@ def _solve_complex_transient(blocks: Any, save_ts: Any = None, periodic: Optiona
             # θ-method: (M + θ dt A) w_next = (M − (1−θ) dt A) w + dt(c + θ f_next + (1−θ) f_now). Default
             # θ=1 (backward Euler); jno.solve.theta(θ) overrides — e.g. θ=1/2 Crank–Nicolson, the second-
             # order, norm-preserving choice for a Schrödinger / wave complex-transient. The LHS operator is
-            # autonomous, so LU-factor it ONCE (not per step); differentiable, so ∂traj/∂args flows.
+            # autonomous, so its solver is built ONCE (dense LU factor / sparse Jacobi), reused every step;
+            # differentiable, so ∂traj/∂args flows.
             theta_val = float(time.theta) if (time is not None and hasattr(time, "theta")) else 1.0
-            lu = jax.scipy.linalg.lu_factor(M_blk + theta_val * dt * A_blk)
+            _solve = _blk_solve(theta_val * dt)
             M_expl = M_blk - (1.0 - theta_val) * dt * A_blk  # explicit (previous-step) part
 
             def _f2n(t_eval):  # combined 2n forcing at t_eval (zero when there is no boundary source)
@@ -948,7 +972,7 @@ def _solve_complex_transient(blocks: Any, save_ts: Any = None, periodic: Optiona
 
             def step(w, t):  # t = step START (advance to t+dt); θ=1 uses only f(t+dt), matching the old path
                 rhs = M_expl @ w + dt * (c_blk + theta_val * _f2n(t + dt) + (1.0 - theta_val) * _f2n(t))
-                w_next = jax.scipy.linalg.lu_solve(lu, rhs)
+                w_next = _solve(rhs, w)
                 return w_next, w_next
 
             _, ws = jax.lax.scan(step, w0, grid[:-1])  # iterate the step START times
@@ -3274,11 +3298,16 @@ def fem(
         _leg_i, _mi, _o2 = assemble_fem_native(
             domain, [s.imag for s in spatial_raw], imag_bd, dirichlet_raw, [], vec=vec or 1, quad_degree=quad_degree
         )
-        M = _as_dense(M_raw)  # complex path composes via jnp.block -> densify the BCOO assembler output
+        from jax.experimental import sparse as _jsp
+
+        from .utils.solver.fem_utils import bcoo_zero_rows as _bcoo_zero_rows
+
+        M = M_raw  # keep the mass a BCOO; the marcher composes the real-equivalent block sparsely (no densify)
         n = int(M.shape[0])
         d_pairs = list(getattr(domain, "_fem_native_dirichlet_pairs", []) or [])
         d_dofs = jnp.asarray([p[0] for p in d_pairs], dtype=jnp.int32) if d_pairs else jnp.zeros((0,), jnp.int32)
-        M_bc = M.at[d_dofs, :].set(0.0)  # a constrained dof carries no time derivative
+        # a constrained dof carries no time derivative -> zero its mass row (BCOO-sparse, mirrors the steady path)
+        M_bc = _bcoo_zero_rows(M, d_dofs) if hasattr(M, "indices") else M.at[d_dofs, :].set(0.0)
         pts = jnp.asarray(domain._fem_native_dof_points)
         s0 = (
             jnp.asarray(_ic_value_at_nodes(_bare(ic_residuals[0]), domain, pts, n, vec or 1))
@@ -3301,17 +3330,19 @@ def fem(
             if isinstance(leg, _FLS):  # parametric leg: operator/load re-form at args (the inverse)
                 return _FTB(
                     M=M_blk,
-                    operator_fn=lambda t, args, _L=leg: _as_dense(_L.evaluate(args)[0]),
+                    operator_fn=lambda t, args, _L=leg: _L.evaluate(args)[0],  # BCOO operator (not densified)
                     forcing_vector_fn=lambda t, args, _L=leg: jnp.asarray(_L.evaluate(args)[1]).reshape(-1),
                     runtime_parameter_exprs=dict(getattr(leg, "runtime_parameter_exprs", {}) or {}),
                     state0=state0,
                     **_common,
                 )
-            A, c = leg  # raw (A, b): the static block, byte-identical to before
-            return _FTB(M=M_blk, A=_as_dense(A), affine_bias=jnp.asarray(c).reshape(-1), state0=state0, **_common)
+            A, c = leg  # raw (A, b): the static BCOO block (the marcher composes the 2N block sparsely)
+            return _FTB(M=M_blk, A=A, affine_bias=jnp.asarray(c).reshape(-1), state0=state0, **_common)
 
+        # the imaginary mass M_i is 0 (a real density): an empty BCOO, so the block mass stays sparse
+        _zero_Mi = _jsp.BCOO((jnp.zeros((0,), M.dtype), jnp.zeros((0, 2), jnp.int32)), shape=(n, n))
         block_r = _leg_block(_leg_r, M_bc, jnp.real(s0))
-        block_i = _leg_block(_leg_i, jnp.zeros((n, n), M.dtype), jnp.imag(s0))
+        block_i = _leg_block(_leg_i, _zero_Mi, jnp.imag(s0))
         return _finalize(FEM(domain=domain, op=(block_r, block_i), classification=classification, mode="complex_transient"))
 
     # ---- native periodic transient (scalar single-field, linear, incl. runtime-parametric): assemble

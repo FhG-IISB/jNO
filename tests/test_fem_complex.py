@@ -139,3 +139,31 @@ def test_complex_transient_recovers_mode_and_conserves_schrodinger_norm():
     assert rel_s < 3e-2, f"Schrodinger recovery rel-L2 {rel_s:.3e}"
     ratio = float(np.linalg.norm(traj_s[-1]) / np.linalg.norm(traj_s[0]))
     assert 0.97 < ratio < 1.01, f"Schrodinger norm not conserved: |psi(t1)|/|psi(0)| {ratio:.4f}"
+
+
+def test_complex_transient_block_is_sparse_not_dense():
+    """The complex-transient real-equivalent block ``[[·,-·],[·,·]]`` is now composed from BCOO legs and
+    marched matrix-free (GMRES + Jacobi), so the dense ``(2N × 2N)`` block and its dense LU never
+    materialise — a large complex diffusion / Schrödinger solve scales instead of hitting the ``O((2N)^2)``
+    memory wall. Assert the legs are sparse (a dense assembler would give plain ndarrays), the imaginary
+    mass is the empty BCOO ``M_i = 0``, and the sparse march still recovers the analytic mode."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.06, time=(0.0, 0.03, 21))
+    u, phi = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    psi0 = jno.np.sin(PI * ci[0]) * jno.np.sin(PI * ci[1])
+    fem = jno.fem([ui.t * vi + (0.5 + 1j) * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - psi0])
+    assert fem.is_complex and fem.is_transient
+    block_r, block_i = fem.operator  # the (Re-coeff, Im-coeff) real legs
+    # THE FIX: the block legs are BCOO (a dense global jacfwd / _as_dense would give ndarrays, no `.indices`)
+    assert hasattr(block_r.M, "indices") and hasattr(block_r.A, "indices"), "complex-transient legs must be sparse"
+    assert hasattr(block_i.M, "indices") and int(block_i.M.nse) == 0  # imaginary mass M_i = 0 (empty BCOO)
+    # the sparse GMRES march still recovers exp(-c·2π²t)·sin·sin (accuracy is not sacrificed for sparsity)
+    traj, pts = np.asarray(fem.solve()), np.asarray(fem.points)
+    mode = np.sin(PI * pts[:, 0]) * np.sin(PI * pts[:, 1])
+    analytic = np.exp(-(0.5 + 1j) * 2 * PI**2 * float(fem.t1)) * mode
+    rel = float(np.linalg.norm(traj[-1] - analytic) / np.linalg.norm(analytic))
+    assert rel < 3e-2, f"sparse complex-transient march rel-L2 {rel:.3e}"
+    assert np.iscomplexobj(traj) and float(np.abs(traj[-1].imag).max()) > 1e-2  # genuinely complex
