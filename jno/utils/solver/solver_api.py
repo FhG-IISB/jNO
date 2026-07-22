@@ -265,12 +265,25 @@ class PrecondContext:
     forms" primitive (weighted mass matrices, low-order proxies, shifted operators).
     """
 
-    def __init__(self, A: LinearOperator, fem: Any = None):
+    def __init__(self, A: LinearOperator, fem: Any = None, grid: Any = None):
         self.A = A
         self.fem = fem
+        self._grid = grid
 
     def diag(self):
         return self.A.diag()
+
+    @property
+    def grid(self):
+        """Structured-grid descriptor ``{shape, spacing, origin}`` when the operator lives on a regular
+        grid (``jno.domain(..., structured=True)``), else ``None`` — needed by geometric multigrid
+        (:func:`jno.precond.gmg`). An explicit override if given, else derived from the owning FEM's
+        domain (``ctx.fem.domain.mesh_connectivity["grid"]``)."""
+        if self._grid is not None:
+            return self._grid
+        dom = getattr(self.fem, "domain", None)
+        mc = getattr(dom, "mesh_connectivity", None)
+        return mc.get("grid") if isinstance(mc, dict) else None
 
     @property
     def blocks(self):

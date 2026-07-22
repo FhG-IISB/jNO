@@ -44,7 +44,9 @@ constraint-list ``u.d2(x)`` authoring) then take the assembly-free direct finite
 The canonical ``jno.fdm([-ui.d2(x) - ui.d2(y) - f, u(bnd) - g]).solve()`` works unchanged and stays
 differentiable; because the reduced-Dirichlet stencil operator is nonsymmetric, a structured solve
 defaults its inner Krylov to **GMRES** (robust for nonsymmetric systems, still matrix-free) instead of
-BiCGStab — no authoring change. Composite/CSG and cut-cell geometry are planned.
+BiCGStab, **preconditioned by a geometric-multigrid V-cycle** (:func:`jno.precond.gmg`) — O(N),
+grid-independent convergence — with a plain-GMRES fallback when the grid is too small to coarsen. All
+automatic, no authoring change. Composite/CSG and cut-cell geometry are planned.
 """
 
 from __future__ import annotations
@@ -60,17 +62,26 @@ __all__ = ["fdm", "laplacian", "gradient"]
 
 def _structured_linear_solve(domain):
     """Inner linear solve for the matrix-free Newton–Krylov on a **structured grid**: GMRES rather than
-    the driver's default BiCGStab. The reduced-Dirichlet 5-point operator is nonsymmetric, and BiCGStab
+    the driver's default BiCGStab. The reduced-Dirichlet 5-/7-point operator is nonsymmetric, and BiCGStab
     can break down on it (a strong-form ``u.d2(x)+u.d2(y)`` returns NaN), whereas GMRES is robust for
     nonsymmetric systems while staying matrix-free and differentiable (the driver firewalls it in
-    ``custom_linear_solve``, so the reverse pass runs GMRES on ``Aᵀ``). Returns ``None`` for an
+    ``custom_linear_solve``, so the reverse pass runs GMRES on ``Aᵀ``).
+
+    The GMRES is **preconditioned by a geometric-multigrid V-cycle** (:func:`build_vcycle`) built from the
+    grid — O(N), grid-independent convergence (~0.1 residual reduction per cycle) on Poisson-type
+    operators — falling back to plain GMRES when the grid is too small to coarsen (a single level). The
+    V-cycle is a fixed linear operator, so standard GMRES (not FGMRES) suffices. Returns ``None`` for an
     unstructured mesh, so the driver keeps its (BiCGStab) default there."""
     if getattr(domain, "mesh_connectivity", None) is None or domain.mesh_connectivity.get("grid") is None:
         return None
+    from .utils.solver.geometric_mg import build_vcycle
     from .utils.solver.solver_api import LinearOperator
 
+    grid = domain.mesh_connectivity["grid"]
     gmres = _solve.gmres()
-    return lambda mv, rhs: gmres(LinearOperator.from_matvec(mv), rhs)
+    vcycle, n_levels = build_vcycle(grid["shape"], grid["spacing"])
+    precond = vcycle if n_levels >= 2 else None  # skip GMG when the grid can't be coarsened
+    return lambda mv, rhs: gmres(LinearOperator.from_matvec(mv), rhs, M=precond)
 
 
 def _mesh(domain):
