@@ -198,6 +198,21 @@ traj = jno.fdm([
 The `u.t` term must appear with unit coefficient (the standard `u.t - 𝒩(u)` form). Nonlinear
 transient residuals are handled the same way (the march reuses the Newton driver).
 
+### Time schemes
+
+The march is **backward Euler** by default. Pass a `jno.solve` time scheme to `.solve(time=…)` — exactly
+as `fem.solve(time=…)`, the *same* slot object — to change it:
+
+```python
+traj = jno.fdm([...]).solve(time=jno.solve.theta(0.5))   # Crank–Nicolson (2nd-order in time)
+traj = jno.fdm([...]).solve(time=jno.solve.adaptive())   # step-doubling adaptive step size
+```
+
+`jno.solve.theta(θ)` (θ = 1 backward Euler, 0.5 Crank–Nicolson, 0 forward Euler) and
+`jno.solve.adaptive(…)` compose onto the method-of-lines march. The **exponential** integrator is *not*
+available for `jno.fdm`: it needs a linear operator `A` (for `e^{AΔt}`), which the strong-form
+matrix-free residual does not assemble, so it fails loud pointing you to a θ-scheme.
+
 ---
 
 ## Differentiable inverse problems

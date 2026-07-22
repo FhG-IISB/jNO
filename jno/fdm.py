@@ -30,7 +30,10 @@ from the mesh boundary **segments in 2-D** (a corner node — undefined normal �
 residual) and boundary **faces in 3-D** (each oriented outward exactly via its owning tet's apex, so a
 flat face gives an exact axis normal, no corner heuristic). Plus **transient** problems by
 method-of-lines (``M = I``;
-a unit-coefficient ``u.t`` term, e.g. ``ui.t - νΔu``) — all with linear + nonlinear residuals. Transient
+a unit-coefficient ``u.t`` term, e.g. ``ui.t - νΔu``) — all with linear + nonlinear residuals, and with
+the time scheme selectable via ``.solve(time=…)`` exactly as ``fem.solve(time=…)`` (``jno.solve.theta``
+for backward Euler / Crank–Nicolson, ``jno.solve.adaptive``; backward Euler by default — the exponential
+integrator needs a linear block the matrix-free residual doesn't assemble, so it fails loud). Transient
 flux BCs, periodic, and a general ``u.t`` mass coefficient are planned extensions (see
 ``plans/fdm-solver.md``). A pure-Neumann problem (no Dirichlet node) is singular (solution up to a
 constant) and is solved as-is.
@@ -82,6 +85,19 @@ def _structured_linear_solve(domain):
     vcycle, n_levels = build_vcycle(grid["shape"], grid["spacing"])
     precond = vcycle if n_levels >= 2 else None  # skip GMG when the grid can't be coarsened
     return lambda mv, rhs: gmres(LinearOperator.from_matvec(mv), rhs, M=precond)
+
+
+def _integrate_transient(block, ts, time):
+    """March the semidiscrete ``block`` over the save-times ``ts`` with the chosen **time scheme** — a
+    ``jno.solve.theta`` / ``adaptive`` / ``exponential`` slot, via its ``.integrate`` — or the default
+    backward-Euler ``lax.scan`` when ``time is None``. This is the FDM analogue of ``fem.solve(time=…)``:
+    the scheme is the *same* slot object ``jno.fem`` uses, so θ / Crank–Nicolson, adaptive step size, and
+    the exponential integrator all compose onto the strong-form method-of-lines march."""
+    from .utils.solver.backend_blocks import _default_transient_integrate
+
+    if time is None:
+        return _default_transient_integrate(block, {}, ts)
+    return time.integrate(block, {}, ts, linear_solve=None, nonlinear_solve=None)
 
 
 def _mesh(domain):
@@ -184,13 +200,14 @@ class FDMSystem:
         u0 = jnp.zeros(self._N) if x0 is None else jnp.asarray(x0)
         return driver(residual_with_bc, u0, linear_solve=_structured_linear_solve(self.domain))
 
-    def solve_transient(self, u0, t_span, nsteps, *, save_ts=None):
-        """Explicit method-of-lines march (when you don't drive time through ``domain.time``). See
-        :meth:`solve`; ``dt = (t1 - t0) / nsteps``."""
+    def solve_transient(self, u0, t_span, nsteps, *, save_ts=None, time=None):
+        """Method-of-lines march (when you don't drive time through ``domain.time``). See :meth:`solve`;
+        ``dt = (t1 - t0) / nsteps``. ``time=`` picks the scheme (``jno.solve.theta`` / ``adaptive`` /
+        ``exponential``); the default (``None``) is backward Euler."""
         t0, t1 = float(t_span[0]), float(t_span[1])
-        return self._march(jnp.asarray(u0), t0, t1, (t1 - t0) / int(nsteps), save_ts)
+        return self._march(jnp.asarray(u0), t0, t1, (t1 - t0) / int(nsteps), save_ts, time=time)
 
-    def _march(self, u0, t0, t1, dt, save_ts):
+    def _march(self, u0, t0, t1, dt, save_ts, *, time=None):
         """Method-of-lines transient of ``u̇ = 𝒩(u) = -residual(u)`` (the SAME residual serves steady
         and transient). Reuses jNO's solver-agnostic :class:`SemidiscreteTimeBlock` + backward-Euler
         ``lax.scan`` integrator — no new time-stepping code, and ``custom_root`` differentiable.
@@ -198,11 +215,7 @@ class FDMSystem:
         stay pinned at ``g``. Autonomous residuals only in v1 (no explicit ``t`` / time-varying source)."""
         import jax.experimental.sparse as jsparse
 
-        from .utils.solver.backend_blocks import (
-            SemidiscreteTimeBlock,
-            _block_time_grid,
-            _default_transient_integrate,
-        )
+        from .utils.solver.backend_blocks import SemidiscreteTimeBlock, _block_time_grid
 
         bmask, bvals = self._dirichlet_mask_values()
         diag = jnp.stack([jnp.arange(self._N), jnp.arange(self._N)], axis=1)
@@ -215,7 +228,7 @@ class FDMSystem:
             mass=lambda t, args: M, residual=residual, state0=jnp.asarray(u0), t0=float(t0), t1=float(t1), dt=float(dt)
         )
         ts = _block_time_grid(block) if save_ts is None else jnp.asarray(save_ts)
-        return _default_transient_integrate(block, {}, ts)
+        return _integrate_transient(block, ts, time)
 
 
 # ============================================================================
@@ -699,7 +712,7 @@ class _TraceFDM:
             u0 = u0.at[jnp.asarray(idx if len(idx) else allnodes)].set(vals)
         return u0
 
-    def solve(self, nonlinear=None, x0=None, profile=False):
+    def solve(self, nonlinear=None, x0=None, profile=False, time=None):
         """Solve the strong-form system. **Steady** problems fold the Dirichlet rows into the residual
         (``u - g`` on the region) and hand it to the same ``jno.solve`` Newton–Krylov + ``custom_root``
         machinery ``jno.fem`` uses (linear/nonlinear uniform, differentiable for inverse problems).
@@ -707,14 +720,16 @@ class _TraceFDM:
         ``t_span`` and the step count come from ``domain.time`` and the initial state from the IC — and
         return the trajectory (``(n_save, N)``); ``x0`` is rejected (the IC owns the initial state).
 
-        ``profile=True`` runs the (eager, non-parametric) solve inside a JAX Perfetto trace, prints the node
-        count + wall time, and writes the trace to ``./jno_traces`` — like ``jno.core.solve(profile=True)``."""
+        ``time=`` selects the time scheme exactly as ``fem.solve(time=…)`` does — ``jno.solve.theta(θ)``
+        (Crank–Nicolson at θ=0.5), ``jno.solve.adaptive(…)`` (step-doubling adaptive step size), or
+        ``jno.solve.exponential(…)`` — defaulting to backward Euler. ``profile=True`` runs the (eager,
+        non-parametric) solve inside a JAX Perfetto trace and writes it to ``./jno_traces``."""
 
         def _run():
             if self._transient:
                 if x0 is not None:
                     raise ValueError("jno.fdm([...]): x0= is rejected for a transient problem — the IC owns the state.")
-                return self._march(nonlinear=nonlinear)
+                return self._march(nonlinear=nonlinear, time=time)
             trainable = self._trainable_params()
             if trainable:
                 return self._parametric_node(trainable, nonlinear=nonlinear, x0=x0)
@@ -822,18 +837,14 @@ class _TraceFDM:
         node._domain = self.domain  # so jno.core infers the domain from the graph (no explicit domain= needed)
         return node
 
-    def _march(self, *, nonlinear=None, save_ts=None):
+    def _march(self, *, nonlinear=None, save_ts=None, time=None):
         """Method-of-lines march of ``u̇ = -R_spatial(u)`` reusing jNO's solver-agnostic
-        :class:`SemidiscreteTimeBlock` + backward-Euler ``lax.scan`` integrator (no new time-stepping
-        code, ``custom_root`` differentiable). ``M = I`` on interior nodes; Dirichlet nodes carry a zero
-        mass row so they stay pinned at ``g``. ``t_span``/``dt`` are inferred from ``domain.time``."""
+        :class:`SemidiscreteTimeBlock` integrator (``custom_root`` differentiable). ``M = I`` on interior
+        nodes; Dirichlet nodes carry a zero mass row so they stay pinned at ``g``. ``t_span``/``dt`` are
+        inferred from ``domain.time``. ``time=`` picks the scheme (backward Euler by default)."""
         import jax.experimental.sparse as jsparse
 
-        from .utils.solver.backend_blocks import (
-            SemidiscreteTimeBlock,
-            _block_time_grid,
-            _default_transient_integrate,
-        )
+        from .utils.solver.backend_blocks import SemidiscreteTimeBlock, _block_time_grid
         from .utils.solver.time_route import _infer_time_window
 
         t0, t1, dt = _infer_time_window(self.domain)
@@ -864,7 +875,7 @@ class _TraceFDM:
             dt=float(dt),
         )
         ts = _block_time_grid(block) if save_ts is None else jnp.asarray(save_ts)
-        return _default_transient_integrate(block, {}, ts)
+        return _integrate_transient(block, ts, time)
 
 
 def fdm(constraints_or_domain, residual=None, dirichlet=None):
