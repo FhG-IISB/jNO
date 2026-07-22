@@ -104,8 +104,13 @@ field rather than silently dropping the imaginary part, matching the unstructure
     The strong-form `−u.d2(x) − u.d2(y)` with row-replaced Dirichlet gives a **nonsymmetric**
     reduced operator, on which the default matrix-free BiCGStab can break down. A structured solve
     therefore defaults its inner Krylov to **GMRES** (robust for nonsymmetric systems, still matrix-free
-    and differentiable via `custom_linear_solve`) — automatically, with no change to how you write the
-    problem. Override with `.solve(nonlinear=…)` as usual.
+    and differentiable via `custom_linear_solve`), **preconditioned by a geometric-multigrid V-cycle**
+    (`jno.precond.gmg()`) — O(N), grid-independent convergence (~0.1 residual reduction per cycle). All
+    automatic, with no change to how you write the problem; it falls back to plain GMRES when the grid is
+    too small to coarsen (an odd cell count on any axis — pick a size giving an even, ideally power-of-two,
+    cell count for the full multigrid speedup). `jno.precond.gmg()` is also a reusable slot for
+    `fem.solve(linear=jno.solve.gmres(), precond=jno.precond.gmg())` on a structured domain. Override the
+    inner solver with `.solve(nonlinear=…)` as usual.
 
     Supported: **2-D axis-aligned rectangles** (`Shape.rect`) and **3-D boxes** (`Shape.box`). A
     composite/CSG shape or a spatially varying `size=` raises; composite / cut-cell geometry is planned.

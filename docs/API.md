@@ -190,7 +190,8 @@ precond=…, time=…)` composes (see the [FEM guide](fem.md)). The families:
 | **Time integration** | `theta` (θ-method), `exponential` (exponential integrator), `adaptive` (step-doubling adaptive step size) |
 
 **Preconditioners** (`jno.precond`, for the iterative solvers): `jacobi`, `chebyshev`,
-`amg`, `ams` (H(curl) auxiliary-space Maxwell), `form` (weak-form auxiliary operator),
+`amg` (algebraic multigrid), `gmg` (geometric multigrid — a structured-grid V-cycle),
+`ams` (H(curl) auxiliary-space Maxwell), `form` (weak-form auxiliary operator),
 `inner` (any solver as `M⁻¹`), `block_diag` / `triangular` (block / Schur), and `cached`.
 
 ::: jno.solve

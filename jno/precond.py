@@ -44,6 +44,7 @@ __all__ = [
     "jaxamg",
     "cached",
     "ams",
+    "gmg",
 ]
 
 
@@ -68,6 +69,41 @@ class _Jacobi(_Spec):
 
     def __repr__(self):
         return "jno.precond.jacobi()"
+
+
+class _GMG(_Spec):
+    """Spec for the geometric-multigrid V-cycle preconditioner; see :func:`gmg`."""
+
+    def __init__(self, n_pre, n_post, omega, min_size):
+        self.n_pre, self.n_post, self.omega, self.min_size = n_pre, n_post, omega, min_size
+
+    def materialize(self, ctx: PrecondContext):
+        grid = ctx.grid
+        if grid is None:
+            raise ValueError(
+                "jno.precond.gmg() needs a structured grid — build the domain with "
+                "jno.domain(..., structured=True) (an axis-aligned Shape.rect / .box). This operator has "
+                "no grid descriptor, so there is no coarsening hierarchy to build."
+            )
+        from .utils.solver.geometric_mg import build_vcycle
+
+        vcycle, n_levels = build_vcycle(
+            grid["shape"],
+            grid["spacing"],
+            n_pre=self.n_pre,
+            n_post=self.n_post,
+            omega=self.omega,
+            min_size=self.min_size,
+        )
+        if n_levels < 2:
+            raise ValueError(
+                "jno.precond.gmg(): the grid is too small to coarsen (a single level) — nothing to "
+                "precondition. Use a finer grid, or jno.precond.jacobi() / amg()."
+            )
+        return PrecondApplier(vcycle)  # a V-cycle for -Δ is ~symmetric (SPD) → reuse M for the transpose
+
+    def __repr__(self):
+        return "jno.precond.gmg()"
 
 
 class _Chebyshev(_Spec):
@@ -114,6 +150,29 @@ def jacobi() -> _Jacobi:
     historic steady-linear default exactly.
     """
     return _Jacobi()
+
+
+def gmg(*, n_pre: int = 2, n_post: int = 2, omega: float | None = None, min_size: int = 5) -> _GMG:
+    """Geometric-multigrid V-cycle preconditioner for a **structured grid** (``jno.domain(...,
+    structured=True)``).
+
+    Builds a coarsen-by-2 grid hierarchy and applies one V-cycle as ``M⁻¹``: damped-Jacobi smoothing
+    (``n_pre``/``n_post`` sweeps, ``omega`` damping — default the model-problem optimum ``2d/(2d+1)``),
+    full-weighting restriction, multilinear prolongation, **rediscretised** coarse Laplacians, and a
+    dense solve at the coarsest level (stops coarsening below ``min_size`` nodes/axis or at an odd cell
+    count). Convergence is **grid-independent** — ~0.1 residual reduction per V-cycle, O(N) work — on
+    Poisson / Helmholtz-type operators. Matrix-free and differentiable; the V-cycle is a *fixed* linear
+    operator, so standard GMRES (not FGMRES) suffices.
+
+    Use it as ``fem.solve(linear=jno.solve.gmres(), precond=jno.precond.gmg())`` on a structured domain;
+    a structured ``jno.fdm`` solve already uses it automatically. Raises if the operator has no
+    structured grid, or the grid is too small to coarsen. v1 is constant-coefficient (the rediscretised
+    coarse operator); a Galerkin ``RAP`` coarse operator for variable coefficients is future work.
+
+    Reference: A. Brandt, *Multi-Level Adaptive Solutions to Boundary-Value Problems*, Mathematics of
+    Computation 31(138), 1977.
+    """
+    return _GMG(n_pre, n_post, omega, min_size)
 
 
 class _Form(_Spec):
