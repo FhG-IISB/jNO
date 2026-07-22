@@ -192,14 +192,22 @@ class DifferentialOperators:
     # ══════════════════════════════════════════════════════════════════
 
     @staticmethod
-    def _grid_second_diff(field: jnp.ndarray, h: float, axis: int) -> jnp.ndarray:
+    def _grid_second_diff(field: jnp.ndarray, h: float, axis: int, periodic: bool = False) -> jnp.ndarray:
         """Second derivative ``∂²/∂x_axis²`` of a field sampled on a **regular grid** — the 3-point
         central stencil ``(u₊ − 2u + u₋)/h²`` in the interior, and a 3-point one-sided stencil at the two
         ends so the result is defined everywhere. The outermost ring is 1st-order (the interior is
         2nd-order); in a ``jno.fdm`` solve those boundary rows are overwritten by the Dirichlet/flux
-        conditions, so the edge order does not affect the solution. Fully differentiable / ``jit``-safe."""
+        conditions, so the edge order does not affect the solution. Fully differentiable / ``jit``-safe.
+
+        When ``periodic`` the axis wraps: the stencil is the exact central 3-point over the ``N`` unique
+        nodes (the redundant last node ``x=L ≡ x=0`` is dropped and re-appended equal to node 0), so a
+        ``jno.fdm`` periodic tie ``u(left) - u(right)`` gets the true periodic Laplacian, not a one-sided edge."""
         u = jnp.moveaxis(jnp.asarray(field), axis, 0)
         inv = 1.0 / (h * h)
+        if periodic:
+            uu = u[:-1]  # the N unique nodes (drop the redundant x=L ≡ x=0)
+            d2u = (jnp.roll(uu, -1, 0) + jnp.roll(uu, 1, 0) - 2.0 * uu) * inv  # wrap-central
+            return jnp.moveaxis(jnp.concatenate([d2u, d2u[:1]], axis=0), 0, axis)  # node N ≡ node 0
         d2 = jnp.zeros_like(u)
         d2 = d2.at[1:-1].set((u[2:] - 2.0 * u[1:-1] + u[:-2]) * inv)  # central interior
         d2 = d2.at[0].set((u[0] - 2.0 * u[1] + u[2]) * inv)  # forward one-sided
@@ -244,6 +252,11 @@ class DifferentialOperators:
             # stays complex (jnp.result_type(complex, float64) = complex) instead of being silently
             # cast to real. ``jnp.gradient``/roll stencils are themselves dtype-preserving.
             U = jnp.asarray(u_values).astype(jnp.result_type(u_values, points)).reshape(grid["shape"])
+            _per = grid.get("periodic") or (False,) * len(grid["shape"])
+            if _per[dim]:  # wrap-central over the unique nodes (periodic axis)
+                uu = jnp.moveaxis(U, dim, 0)[:-1]
+                g = (jnp.roll(uu, -1, 0) - jnp.roll(uu, 1, 0)) / (2.0 * grid["spacing"][dim])
+                return jnp.moveaxis(jnp.concatenate([g, g[:1]], axis=0), 0, dim).reshape(-1)
             return jnp.gradient(U, grid["spacing"][dim], axis=dim).reshape(-1)
         if method == "least_squares":
             return DifferentialOperators.compute_gradient_2d_lsq(u_values, points, triangles, dim)
@@ -386,9 +399,10 @@ class DifferentialOperators:
         """
         if grid is not None:
             U = jnp.asarray(u_values).astype(jnp.result_type(u_values, points)).reshape(grid["shape"])  # coord precision
+            per = grid.get("periodic") or (False,) * len(grid["shape"])
             out = jnp.zeros_like(U)
             for d in dims:
-                out = out + DifferentialOperators._grid_second_diff(U, grid["spacing"][d], d)
+                out = out + DifferentialOperators._grid_second_diff(U, grid["spacing"][d], d, periodic=per[d])
             return out.reshape(-1)
         if method == "cotangent":
             return DifferentialOperators.compute_laplacian_2d_cotangent(u_values, points, triangles)
@@ -522,6 +536,7 @@ class DifferentialOperators:
         if grid is not None:
             U = jnp.asarray(u_values).astype(jnp.result_type(u_values, points)).reshape(grid["shape"])  # coord precision
             sp = grid["spacing"]
+            per = grid.get("periodic") or (False,) * len(grid["shape"])
             # Compute ONLY the second-derivative components the caller asks for (``u.d2(x)`` needs just
             # ``∂²/∂x²``). Materializing an unused ``∂²/∂x∂y`` leaves a dead branch that corrupts the
             # reverse-mode JVP of the solve, so build each component on demand and memoize it.
@@ -531,7 +546,9 @@ class DifferentialOperators:
                 key = (a, b) if a <= b else (b, a)
                 if key not in comps:
                     if key[0] == key[1]:
-                        comps[key] = DifferentialOperators._grid_second_diff(U, sp[key[0]], key[0]).reshape(-1)
+                        comps[key] = DifferentialOperators._grid_second_diff(
+                            U, sp[key[0]], key[0], periodic=per[key[0]]
+                        ).reshape(-1)
                     else:  # mixed partial: nested central difference
                         comps[key] = jnp.gradient(
                             jnp.gradient(U, sp[key[0]], axis=key[0]), sp[key[1]], axis=key[1]
@@ -595,6 +612,11 @@ class DifferentialOperators:
         """
         if grid is not None:
             U = jnp.asarray(u_values).astype(jnp.result_type(u_values, points)).reshape(grid["shape"])
+            _per = grid.get("periodic") or (False,) * len(grid["shape"])
+            if _per[dim]:  # wrap-central over the unique nodes (periodic axis)
+                uu = jnp.moveaxis(U, dim, 0)[:-1]
+                g = (jnp.roll(uu, -1, 0) - jnp.roll(uu, 1, 0)) / (2.0 * grid["spacing"][dim])
+                return jnp.moveaxis(jnp.concatenate([g, g[:1]], axis=0), 0, dim).reshape(-1)
             return jnp.gradient(U, grid["spacing"][dim], axis=dim).reshape(-1)
         if method == "least_squares":
             return DifferentialOperators.compute_gradient_3d_lsq(u_values, points, tetrahedra, dim)
@@ -854,9 +876,10 @@ class DifferentialOperators:
         """
         if grid is not None:  # structured-grid 7-point stencil (Σ_d central 2nd difference), assembly-free
             U = jnp.asarray(u_values).astype(jnp.result_type(u_values, points)).reshape(grid["shape"])
+            per = grid.get("periodic") or (False,) * len(grid["shape"])
             out = jnp.zeros_like(U)
             for d in dims:
-                out = out + DifferentialOperators._grid_second_diff(U, grid["spacing"][d], d)
+                out = out + DifferentialOperators._grid_second_diff(U, grid["spacing"][d], d, periodic=per[d])
             return out.reshape(-1)
         if method == "cotangent":
             return DifferentialOperators.compute_laplacian_3d_cotangent(u_values, points, tetrahedra)
@@ -897,13 +920,16 @@ class DifferentialOperators:
         if grid is not None:  # structured grid: only the requested second-derivative components (see 2-D)
             U = jnp.asarray(u_values).astype(jnp.result_type(u_values, points)).reshape(grid["shape"])
             sp = grid["spacing"]
+            per = grid.get("periodic") or (False,) * len(grid["shape"])
             comps: dict = {}
 
             def _component(a, b):
                 key = (a, b) if a <= b else (b, a)
                 if key not in comps:
                     if key[0] == key[1]:
-                        comps[key] = DifferentialOperators._grid_second_diff(U, sp[key[0]], key[0]).reshape(-1)
+                        comps[key] = DifferentialOperators._grid_second_diff(
+                            U, sp[key[0]], key[0], periodic=per[key[0]]
+                        ).reshape(-1)
                     else:
                         comps[key] = jnp.gradient(
                             jnp.gradient(U, sp[key[0]], axis=key[0]), sp[key[1]], axis=key[1]

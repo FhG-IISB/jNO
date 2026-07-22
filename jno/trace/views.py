@@ -88,18 +88,32 @@ def _spectral_matrix_function_jvp(kind, n, primals, tangents):
 
 
 def _is_periodic_tie_combination(expr_a, expr_b) -> bool:
-    """True iff ``expr_a - expr_b`` is an FEM **periodic tie** ``u(A) - u(B)``: both sides reference a
-    ``TrialFunction`` and neither carries a ``TestFunction`` (a weak term would). This isolates the
-    tie from ordinary weak forms so the coord-binding merge only relaxes for a true tie; non-trial
-    views (e.g. two model fields) still raise. Imports are local to avoid a trace<->solver cycle."""
+    """True iff ``expr_a - expr_b`` is a **periodic tie** ``u(A) - u(B)``: both sides reference the
+    unknown — a ``TrialFunction`` (``jno.fem``) or the strong-form nodal-field unknown from
+    ``domain.unknown()`` (``jno.fdm``) — and neither carries a ``TestFunction`` (a weak term would).
+    This isolates the tie from ordinary weak forms so the coord-binding merge only relaxes for a true
+    tie; unrelated two-field combinations still raise. Imports are local to avoid a trace↔solver cycle."""
     if expr_a is None or expr_b is None:
         return False
-    from ..utils.solver.solver_helper import contains_node_type
-    from . import TestFunction, TrialFunction
+    from ..utils.solver.solver_helper import contains_node_type, iter_children
+    from . import ModelCall, TestFunction, TrialFunction
 
     if contains_node_type(expr_a, TestFunction) or contains_node_type(expr_b, TestFunction):
         return False
-    return contains_node_type(expr_a, TrialFunction) and contains_node_type(expr_b, TrialFunction)
+
+    def _has_unknown(expr):
+        if contains_node_type(expr, TrialFunction):
+            return True
+        seen = [expr]  # a jno.fdm nodal-field unknown is a ModelCall with model._fem_field == "node"
+        while seen:
+            node = seen.pop()
+            node = getattr(node, "_expr", node)
+            if isinstance(node, ModelCall) and getattr(getattr(node, "model", None), "_fem_field", None) == "node":
+                return True
+            seen.extend(iter_children(node) or ())
+        return False
+
+    return _has_unknown(expr_a) and _has_unknown(expr_b)
 
 
 def _tag_of_coord_vars(cv) -> Optional[str]:
@@ -1868,22 +1882,33 @@ class FieldViewWithPartials(ScalarView):
         cv = object.__getattribute__(self, "_coord_vars")
         sc = object.__getattribute__(self, "_spatial_coords")
         other_cv = getattr(other, "_coord_vars", None) if other is not None else None
+        tie_tags = None
         if other_cv:
-            merged = dict(cv)
-            for name, var in other_cv.items():
-                if name in merged and merged[name] is not var:
-                    raise ValueError(
-                        f"coord binding conflict for {name!r}: cannot combine "
-                        f"two FieldView bindings that map {name!r} to different "
-                        f"Variables (left={merged[name]!r}, right={var!r}). "
-                        f"Re-bind the result explicitly with .bind(...) to resolve."
-                    )
-                merged[name] = var
-            cv = merged
+            conflict = any(name in cv and cv[name] is not var for name, var in other_cv.items())
+            if conflict and _is_periodic_tie_combination(
+                object.__getattribute__(self, "_expr"), getattr(other, "_expr", None)
+            ):
+                # jno.fdm periodic tie `u(A) - u(B)`: the BinaryOp discards the per-side views, so stash
+                # the two region tags here (the only place they survive) for the classifier to read.
+                tie_tags = (_tag_of_coord_vars(cv), _tag_of_coord_vars(other_cv))
+            else:
+                merged = dict(cv)
+                for name, var in other_cv.items():
+                    if name in merged and merged[name] is not var:
+                        raise ValueError(
+                            f"coord binding conflict for {name!r}: cannot combine "
+                            f"two FieldView bindings that map {name!r} to different "
+                            f"Variables (left={merged[name]!r}, right={var!r}). "
+                            f"Re-bind the result explicitly with .bind(...) to resolve."
+                        )
+                    merged[name] = var
+                cv = merged
         new = FieldViewWithPartials.__new__(FieldViewWithPartials)
         ScalarView.__init__(new, new_expr)
         object.__setattr__(new, "_coord_vars", cv)
         object.__setattr__(new, "_spatial_coords", sc)
+        if tie_tags is not None:
+            object.__setattr__(new, "_periodic_tie", tie_tags)
         return new
 
     # ------------------------------------------------------------------

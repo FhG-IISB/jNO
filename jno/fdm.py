@@ -38,8 +38,10 @@ the time scheme selectable via ``.solve(time=…)`` exactly as ``fem.solve(time=
 for backward Euler / Crank–Nicolson, ``jno.solve.adaptive``; backward Euler by default — the exponential
 integrator needs a linear block the matrix-free residual doesn't assemble, so it fails loud). **Flux BCs
 compose with transient too** — a flux node becomes an algebraic zero-mass-row constraint imposing the
-same ``a·(∇u·n) + b`` at each instant (its value slaved to the interior via the flux). Periodic boundaries
-are a planned extension (see ``plans/fdm-solver.md``). A pure-Neumann
+same ``a·(∇u·n) + b`` at each instant (its value slaved to the interior via the flux). **Periodic**
+boundaries are a tie constraint ``u(left) - u(right)`` (opposite faces, exactly as ``jno.fem``): on a
+**structured grid** it wraps that axis (the ``jnp.roll`` stencil gives the true periodic Laplacian, not a
+one-sided edge), structured-only since a strong-form stencil must wrap. A pure-Neumann
 problem (no Dirichlet node) is singular (solution up to a constant) and is solved as-is.
 
 **Structured grid.** ``jno.domain(jno.Shape.rect(x0, y0, x1, y1, size=h), structured=True)`` (2-D) or
@@ -86,6 +88,8 @@ def _structured_linear_solve(domain):
 
     grid = domain.mesh_connectivity["grid"]
     gmres = _solve.gmres()
+    if any(grid.get("periodic") or ()):  # the GMG V-cycle assumes Dirichlet boundaries; skip it (plain GMRES)
+        return lambda mv, rhs: gmres(LinearOperator.from_matvec(mv), rhs)
     vcycle, n_levels = build_vcycle(grid["shape"], grid["spacing"])
     precond = vcycle if n_levels >= 2 else None  # skip GMG when the grid can't be coarsened
     return lambda mv, rhs: gmres(LinearOperator.from_matvec(mv), rhs, M=precond)
@@ -300,6 +304,14 @@ def _find_unknowns(constraints):
     return order
 
 
+def _periodic_axis(tag_a, tag_b):
+    """The grid axis a periodic tie ``u(A) - u(B)`` wraps, from its two opposite-face tags:
+    ``left``/``right`` → 0 (x), ``bottom``/``top`` → 1 (y), ``front``/``back`` → 2 (z). ``None`` if the
+    two tags are not an opposite-face pair."""
+    faces = {frozenset(("left", "right")): 0, frozenset(("bottom", "top")): 1, frozenset(("front", "back")): 2}
+    return faces.get(frozenset((tag_a, tag_b)))
+
+
 def _contains_unknown(node, model):
     from .trace import ModelCall
 
@@ -457,15 +469,26 @@ class _TraceFDM:
         self._Ntot = self._nf * self._N  # blocked DOF vector [field_0 (N), …, field_{nf-1} (N)]
         self._pts = jnp.asarray(np.asarray(self.domain.mesh_connectivity["points"])[:, : self.domain.dimension])
         self._pde, self._dirichlet, self._neumann, self._ic = [], [], [], []
+        self._periodic_axes = []  # grid axes tied by a `u(A) - u(B)` periodic constraint (structured only)
         for c in constraints:
             # Classify by structure (not by which region tag), so a value-only pin works on ANY region —
             # a boundary edge OR a geometric sub-region (`domain.region(name, geom)`, used by coupled /
             # domain-decomposition solves to pin a subdomain's complement to a neighbour's field):
-            #   * a normal derivative `ui.d(n, ...)`           → a Neumann/Robin flux row (check first);
+            #   * a periodic tie `u(A) - u(B)` (opposite faces)  → wrap the grid axis (check first);
+            #   * a normal derivative `ui.d(n, ...)`           → a Neumann/Robin flux row;
             #   * a derivative of the unknown (Laplacian, u.t) → the PDE residual;
             #   * the `initial` region, value-only            → the initial condition;
             #   * otherwise (value-only, affine in u)          → a Dirichlet pin on its region.
-            if _normal_jacobian(c) is not None:
+            tie = getattr(c, "_periodic_tie", None)
+            if tie is not None:
+                ax = _periodic_axis(*tie)
+                if ax is None:
+                    raise ValueError(
+                        f"jno.fdm([...]): a periodic tie `u(A) - u(B)` must connect two OPPOSITE faces "
+                        f"(left/right, bottom/top, or front/back); got {tie}."
+                    )
+                self._periodic_axes.append(ax)
+            elif _normal_jacobian(c) is not None:
                 self._neumann.append(c)
             elif any(_has_unknown_derivative(c, u) for u in self.unknowns):
                 self._pde.append(c)
@@ -505,6 +528,20 @@ class _TraceFDM:
                     "jno.fdm([...]): a coupled (multi-field) system is v1-limited to a STEADY problem with "
                     "Dirichlet BCs — transient / flux BCs on coupled fields are not yet supported."
                 )
+        self._grid = None
+        if self._periodic_axes:  # mark the grid axes the wrap stencil must handle (structured only)
+            grid = self.domain.mesh_connectivity.get("grid")
+            if grid is None:
+                raise NotImplementedError(
+                    "jno.fdm([...]): a periodic tie `u(A) - u(B)` requires a STRUCTURED grid — build the "
+                    "domain with `jno.domain(..., structured=True)`. Periodic on an unstructured mesh is "
+                    "not supported (the FD stencil must wrap the grid, which a boundary tie alone cannot)."
+                )
+            per = list(grid.get("periodic") or (False,) * len(grid["shape"]))
+            for ax in self._periodic_axes:
+                per[ax] = True
+            grid["periodic"] = tuple(per)  # the FD kernels read this to wrap those axes
+            self._grid = grid
         # The sub-domain this problem owns, if its PDE coordinates carry a named region
         # (`domain.region(name, poly)`). Used by `jno.core([...])` to couple subdomains automatically.
         self.region, self.region_geometry = self._pde_region()
@@ -680,6 +717,21 @@ class _TraceFDM:
             rows.append((self._field_index(c), jnp.asarray(idx), self._condition_value(c, idx)))
         return rows
 
+    def _periodic_rows(self):
+        """``(slave_idx, master_idx)`` per periodic axis: the slave (last-index) face DOFs tied to the
+        master (first-index) face DOFs, matched by the other-axis indices — the tie ``u[slave] = u[master]``
+        pinning the redundant face (node ``L ≡ 0``) that the wrap stencil already identifies."""
+        if not self._periodic_axes:
+            return []
+        shape = self._grid["shape"]
+        idx = np.arange(self._N).reshape(shape)
+        rows = []
+        for ax in self._periodic_axes:
+            master = np.take(idx, 0, axis=ax).ravel()
+            slave = np.take(idx, shape[ax] - 1, axis=ax).ravel()
+            rows.append((jnp.asarray(slave), jnp.asarray(master)))
+        return rows
+
     def _node_normals(self, region):
         """Unit outward normals for the flux nodes of ``region``, aligned to those nodes.
 
@@ -852,18 +904,21 @@ class _TraceFDM:
         residual_fn = self._pde_residual_fn(extra_params=extra_params)
         rows = self._dirichlet_rows()
         flux_rows = self._flux_rows(extra_params) if single else []  # flux is single-field (guarded at build)
+        periodic_rows = self._periodic_rows()  # (slave, master) face DOF pairs per periodic axis
 
         def residual_with_bc(u):
             r = residual_fn(u)
             # Flux rows first (`a·(∇u·n) + b`, with a = F(1)-F(0), b = F(0) — Neumann/Robin/etc.), then
-            # Dirichlet: a node carrying both (a 2-D corner, or a 3-D edge where a flux face meets a
-            # Dirichlet face) resolves to the essential Dirichlet value — the Dirichlet row is set last.
+            # the periodic ties, then Dirichlet: a node carrying several (a 2-D corner, or a 3-D edge)
+            # resolves to the essential Dirichlet value — the Dirichlet row is set last.
             for idx, nrm, method, v0, v1 in flux_rows:
                 grad = gradient(u, self.domain, method=method)  # (N, 2), differentiable
                 flux = jnp.sum(grad[idx] * nrm, axis=1)  # ∇u·n at the edge nodes
                 b = v0(u)
                 a = v1(u) - b
                 r = r.at[idx].set(a[idx] * flux + b[idx])
+            for slave, master in periodic_rows:  # periodic: the redundant slave face ≡ the master face
+                r = r.at[slave].set(u[slave] - u[master])
             if extra_pins is not None:  # interface pin (a coupled subdomain's complement) — before the
                 pidx, pvals = extra_pins  # authored Dirichlet, so the physical outer BC still wins on ∂Ω
                 r = r.at[pidx].set(u[pidx] - pvals)
