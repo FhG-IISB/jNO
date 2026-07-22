@@ -73,21 +73,23 @@ Laplace–Beltrami operator on tetrahedra; see [3-D tetrahedral meshes](#3-d-tet
 
 ## Structured grid (fast stencils)
 
-For an axis-aligned rectangle, build a **regular grid** instead of an unstructured mesh by passing
-`structured=True`:
+For an axis-aligned **rectangle** or **box**, build a **regular grid** instead of an unstructured mesh by
+passing `structured=True`:
 
 ```python
-d = jno.domain(jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.02), structured=True)
+d = jno.domain(jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.02), structured=True)           # 2-D
+d = jno.domain(jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=0.05), structured=True)   # 3-D
 ```
 
-This meshes the rectangle as a uniform right-triangulation (the spacing is taken from the shape's
-`size=`) and records a grid descriptor on `d.mesh_connectivity["grid"]`. The interior operators
-(`jno.fdm.laplacian` / `gradient`, and the constraint-list `ui.d2(x)` authoring) then detect the grid
-and apply the **direct finite-difference stencils** — the 5-point Laplacian `Σ (u₊ − 2u + u₋)/hₖ²` and
-central-difference gradients — by array reshaping, with **no per-element assembly**. On a uniform
-right-triangulation the 5-point stencil coincides *exactly* with the cotangent P1 finite-element
-Laplacian (a classical result — see Strang & Fix, *An Analysis of the Finite Element Method*, 1973), so
-the structured path is the *same answer* as the unstructured `cotangent` operator, only cheaper.
+This meshes the rectangle as a uniform right-triangulation — or, in 3-D, the box as a Kuhn
+6-tets-per-voxel grid — (spacing from the shape's `size=`) and records a grid descriptor on
+`d.mesh_connectivity["grid"]`. The interior operators (`jno.fdm.laplacian` / `gradient`, and the
+constraint-list `ui.d2(x)` authoring) then detect the grid and apply the **direct finite-difference
+stencils** — the 5-point (2-D) / 7-point (3-D) Laplacian `Σ (u₊ − 2u + u₋)/hₖ²` and central-difference
+gradients — by array reshaping, with **no per-element assembly**. On a uniform 2-D right-triangulation the
+5-point stencil coincides *exactly* with the cotangent P1 finite-element Laplacian (a classical result —
+see Strang & Fix, *An Analysis of the Finite Element Method*, 1973), so the structured path is the *same
+answer* as the unstructured `cotangent` operator, only cheaper.
 
 The full `jno.fdm([-ui.d2(x) - ui.d2(y) - f, u(bnd) - g]).solve()` works unchanged and stays
 differentiable — no authoring change from the unstructured case. **Transient** composes too:
@@ -105,8 +107,8 @@ field rather than silently dropping the imaginary part, matching the unstructure
     and differentiable via `custom_linear_solve`) — automatically, with no change to how you write the
     problem. Override with `.solve(nonlinear=…)` as usual.
 
-    v1 covers **2-D axis-aligned rectangles** only; a 3-D `Shape.box(...)`, a composite/CSG shape, or a
-    spatially varying `size=` raises. Structured 3-D and cut-cell geometry are planned.
+    Supported: **2-D axis-aligned rectangles** (`Shape.rect`) and **3-D boxes** (`Shape.box`). A
+    composite/CSG shape or a spatially varying `size=` raises; composite / cut-cell geometry is planned.
 
 ---
 
@@ -261,12 +263,12 @@ and nonlinear residuals; differentiable inverse problems. A geometric sub-region
 domain-decomposition solve (`jno.dd.couple([(problem, region)])`) resolves to a mesh-node subset via
 the analytic, shapely-free [`Shape.contains`](Domain-and-Geometry.md) — in 2-D **and** 3-D.
 
-A 2-D axis-aligned rectangle can use a fast [structured grid](#structured-grid-fast-stencils)
+An axis-aligned 2-D rectangle or 3-D box can use a fast [structured grid](#structured-grid-fast-stencils)
 (`structured=True`) with direct finite-difference stencils in place of the unstructured mesh.
 
 **Planned:** transient flux boundary conditions (a flux node keeps `M = 1`, unlike a pinned Dirichlet
-node); periodic boundaries; a general `u.t` mass coefficient; structured 3-D (box) grids and cut-cell
-geometry (2-D structured grids are supported, above); 1-D meshes. Authoring a `jno.Shape` sub-region
+node); periodic boundaries; a general `u.t` mass coefficient; composite / cut-cell structured geometry
+(axis-aligned rectangles and boxes are supported, above); 1-D meshes. Authoring a `jno.Shape` sub-region
 through `domain.region(name, shape)` + `d.variable`, and 3-D coupled solves, additionally need
 region-tag support on the base 3-D domain (a separate 3-D domain-decomposition feature). A pure-Neumann
 problem (no Dirichlet node anywhere) is singular — the solution is defined only up to an additive

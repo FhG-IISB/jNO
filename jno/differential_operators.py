@@ -577,6 +577,7 @@ class DifferentialOperators:
         tetrahedra: jnp.ndarray,
         dim: int,
         method: str = "area_weighted",
+        grid: dict | None = None,
     ) -> jnp.ndarray:
         """Gradient on a 3-D tetrahedral mesh.
 
@@ -589,8 +590,12 @@ class DifferentialOperators:
                          ``"inverse_distance"``, ``"least_squares"``.
 
         Returns:
-            ``∂u/∂x_dim`` at each point, shape ``(N,)``.
+            ``∂u/∂x_dim`` at each point, shape ``(N,)``. When ``grid`` is a structured-grid descriptor
+            the reshaped central difference is used (see the 2-D gradient); ``tetrahedra`` is ignored.
         """
+        if grid is not None:
+            U = jnp.asarray(u_values).astype(jnp.result_type(u_values, points)).reshape(grid["shape"])
+            return jnp.gradient(U, grid["spacing"][dim], axis=dim).reshape(-1)
         if method == "least_squares":
             return DifferentialOperators.compute_gradient_3d_lsq(u_values, points, tetrahedra, dim)
 
@@ -832,6 +837,7 @@ class DifferentialOperators:
         tetrahedra: jnp.ndarray,
         dims: tuple,
         method: str = "gradient_of_gradient",
+        grid: dict | None = None,
     ) -> jnp.ndarray:
         """Laplacian on a 3-D tetrahedral mesh.
 
@@ -846,6 +852,12 @@ class DifferentialOperators:
         Returns:
             Laplacian, shape ``(N,)``.
         """
+        if grid is not None:  # structured-grid 7-point stencil (Σ_d central 2nd difference), assembly-free
+            U = jnp.asarray(u_values).astype(jnp.result_type(u_values, points)).reshape(grid["shape"])
+            out = jnp.zeros_like(U)
+            for d in dims:
+                out = out + DifferentialOperators._grid_second_diff(U, grid["spacing"][d], d)
+            return out.reshape(-1)
         if method == "cotangent":
             return DifferentialOperators.compute_laplacian_3d_cotangent(u_values, points, tetrahedra)
         if method == "lsq_of_gradient":
@@ -866,6 +878,7 @@ class DifferentialOperators:
         points: jnp.ndarray,
         tetrahedra: jnp.ndarray,
         var_dims: list,
+        grid: dict | None = None,
     ) -> jnp.ndarray:
         """Hessian on a 3-D tetrahedral mesh (volume-weighted FD).
 
@@ -880,6 +893,27 @@ class DifferentialOperators:
         """
         N = points.shape[0]
         n_vars = int(jnp.sqrt(len(var_dims)))
+
+        if grid is not None:  # structured grid: only the requested second-derivative components (see 2-D)
+            U = jnp.asarray(u_values).astype(jnp.result_type(u_values, points)).reshape(grid["shape"])
+            sp = grid["spacing"]
+            comps: dict = {}
+
+            def _component(a, b):
+                key = (a, b) if a <= b else (b, a)
+                if key not in comps:
+                    if key[0] == key[1]:
+                        comps[key] = DifferentialOperators._grid_second_diff(U, sp[key[0]], key[0]).reshape(-1)
+                    else:
+                        comps[key] = jnp.gradient(
+                            jnp.gradient(U, sp[key[0]], axis=key[0]), sp[key[1]], axis=key[1]
+                        ).reshape(-1)
+                return comps[key]
+
+            result = jnp.zeros((N, n_vars, n_vars))
+            for i, vi_dim, j, vj_dim in var_dims:
+                result = result.at[:, i, j].set(_component(vi_dim, vj_dim))
+            return result
 
         grad_x = DifferentialOperators.compute_fd_gradient_3d_simple(u_values, points, tetrahedra, 0)
         grad_y = DifferentialOperators.compute_fd_gradient_3d_simple(u_values, points, tetrahedra, 1)

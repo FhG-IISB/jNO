@@ -35,15 +35,16 @@ flux BCs, periodic, and a general ``u.t`` mass coefficient are planned extension
 ``plans/fdm-solver.md``). A pure-Neumann problem (no Dirichlet node) is singular (solution up to a
 constant) and is solved as-is.
 
-**Structured grid (2-D).** ``jno.domain(jno.Shape.rect(x0, y0, x1, y1, size=h), structured=True)`` builds
-a regular right-triangulation and records a grid descriptor on ``mesh_connectivity["grid"]``; the interior
-operators (``jno.fdm.laplacian`` / ``gradient`` and the constraint-list ``u.d2(x)`` authoring) then take
-the assembly-free direct finite-difference stencils (the 5-point Laplacian) instead of the cotangent
-operator — identical to the cotangent result on a uniform right-triangulation, but without per-element
-assembly. The canonical ``jno.fdm([-ui.d2(x) - ui.d2(y) - f, u(bnd) - g]).solve()`` works unchanged and
-stays differentiable; because the reduced-Dirichlet 5-point operator is nonsymmetric, a structured solve
+**Structured grid.** ``jno.domain(jno.Shape.rect(x0, y0, x1, y1, size=h), structured=True)`` (2-D) or
+``jno.domain(jno.Shape.box(x0, y0, z0, x1, y1, z1, size=h), structured=True)`` (3-D) builds a regular
+grid — a right-triangulation in 2-D, a Kuhn 6-tets-per-voxel mesh in 3-D — and records a grid descriptor
+on ``mesh_connectivity["grid"]``; the interior operators (``jno.fdm.laplacian`` / ``gradient`` and the
+constraint-list ``u.d2(x)`` authoring) then take the assembly-free direct finite-difference stencils (the
+5-point Laplacian in 2-D, 7-point in 3-D) instead of the cotangent operator, without per-element assembly.
+The canonical ``jno.fdm([-ui.d2(x) - ui.d2(y) - f, u(bnd) - g]).solve()`` works unchanged and stays
+differentiable; because the reduced-Dirichlet stencil operator is nonsymmetric, a structured solve
 defaults its inner Krylov to **GMRES** (robust for nonsymmetric systems, still matrix-free) instead of
-BiCGStab — no authoring change. Structured 3-D (box) and cut-cell geometry are planned.
+BiCGStab — no authoring change. Composite/CSG and cut-cell geometry are planned.
 """
 
 from __future__ import annotations
@@ -97,7 +98,7 @@ def laplacian(u, domain, method: str = "cotangent"):
     dim = int(getattr(domain, "dimension", 2))
     grid = domain.mesh_connectivity.get("grid")  # structured-grid fast path (2-D), else None
     if dim == 3:
-        return _D.compute_fd_laplacian_3d_simple(u, pts, cells, dims=(0, 1, 2), method=method)
+        return _D.compute_fd_laplacian_3d_simple(u, pts, cells, dims=(0, 1, 2), method=method, grid=grid)
     return _D.compute_fd_laplacian_2d_simple(u, pts, cells, dims=(0, 1), method=method, grid=grid)
 
 
@@ -109,7 +110,7 @@ def gradient(u, domain, method: str = "area_weighted"):
     dim = int(getattr(domain, "dimension", 2))
     grid = domain.mesh_connectivity.get("grid")  # structured-grid fast path (2-D), else None
     if dim == 3:
-        comps = [_D.compute_fd_gradient_3d_simple(u, pts, cells, d, method=method) for d in range(3)]
+        comps = [_D.compute_fd_gradient_3d_simple(u, pts, cells, d, method=method, grid=grid) for d in range(3)]
         return jnp.stack(comps, axis=1)
     gx = _D.compute_fd_gradient_2d_simple(u, pts, cells, 0, method=method, grid=grid)
     gy = _D.compute_fd_gradient_2d_simple(u, pts, cells, 1, method=method, grid=grid)
