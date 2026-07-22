@@ -7,18 +7,18 @@ Requires Python 3.11–3.13.
 ## PyPI
 
 ```bash
-pip install jax-neural-operators
+pip install jax-numerical-operators
 ```
 
-The finite-element assembler additionally needs `fenics-basix` (imports as `basix`) —
-`pip install jax-neural-operators fenics-basix`, or use the pixi `fem` environment below
-(which pulls it in).
+That is the whole library — the finite-element assembler's `fenics-basix` backend (imports as
+`basix`) is a **core dependency**, so a standard `pip install` already includes it; there is no
+separate step (or extra) for FEM.
 
 The optional [RCWA solver](rcwa.md) (`jno.rcwa`, periodic-layered electromagnetics) needs `fmmax`.
 It is imported lazily, so install it only when needed via the `rcwa` extra —
-`pip install jax-neural-operators[rcwa]`, or use the pixi `rcwa` environment.
+`pip install jax-numerical-operators[rcwa]`, or use the pixi `rcwa` environment.
 
-GPU support is included by default — `jax-neural-operators` depends on
+GPU support is included by default — `jax-numerical-operators` depends on
 `jax[cuda]>=0.10.1,<0.11`, so a standard `pip install` already pulls a
 CUDA-capable JAX wheel. The pin is tight on purpose: jNO tracks a single
 JAX minor version per release to avoid silently breaking on JAX API
@@ -30,7 +30,7 @@ package index *before* installing jNO:
 ```bash
 # CUDA 12 example
 pip install --upgrade "jax[cuda12]>=0.10.1,<0.11"
-pip install jax-neural-operators
+pip install jax-numerical-operators
 ```
 
 To pin a different JAX version locally for an experiment, see the

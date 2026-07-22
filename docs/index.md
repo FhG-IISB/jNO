@@ -1,10 +1,15 @@
 # Documentation
 
-**jNO** (jax Neural Operators) is a JAX-native library for training
-neural operators, physics-informed networks, and PDE foundation models.
-Everything — the PDE residual, the supervised loss, the FEM weak form,
-the sensitivity diagnostic — is written in one symbolic *tracing*
-language and compiled into one optimisation pipeline.
+**jNO** (jax Numerical Operators) is a JAX-native library for
+**differentiable numerical methods**. Classical solvers — finite
+elements, finite differences, and spectral (RCWA) — and scientific
+machine learning — PINNs, neural operators, Bayesian inference — are two
+pillars on one substrate: everything (a weak form, a strong-form stencil,
+a PDE residual, a supervised loss, a sensitivity diagnostic) is written
+in one symbolic *tracing* language and compiled into a single GPU-ready,
+end-to-end differentiable graph. Because every solve is differentiable,
+a forward solve, an inverse problem, and a trained network compose
+instead of living in separate frameworks.
 
 ---
 

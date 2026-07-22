@@ -182,7 +182,7 @@ For deployment scenarios, jNO supports exporting compiled models via [IREE](http
 
 Install IREE support:
 ```bash
-pip install jax-neural-operators[iree]
+pip install jax-numerical-operators[iree]
 ```
 
 ```python

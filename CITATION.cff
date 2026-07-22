@@ -1,6 +1,6 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it."
-title: "jNO: A JAX Library for Neural Operator and Foundation Model Training"
+title: "jNO: A JAX Library for Differentiable Numerical Methods and Scientific Machine Learning"
 version: "0.2.3"
 date-released: 2026-03-26
 license: EPL-2.0
@@ -8,19 +8,21 @@ repository-code: "https://github.com/FhG-IISB/jno"
 url: "https://github.com/FhG-IISB/jno"
 
 abstract: >
-  jNO (jax Neural Operators) is a JAX-native library for neural operators and foundation models with unified support for both data-driven and physics-informed training.
-  Its core design is a tracing system in which domains, model calls, residuals, supervised losses, and diagnostics are written in one symbolic language and compiled into one optimization pipeline.
-  This allows users to move between operator regression, mesh-aware residual evaluation, and PDE-constrained training without restructuring the surrounding code.
+  jNO (jax Numerical Operators) is a JAX-native library for differentiable numerical methods. Classical solvers — finite elements, finite differences, and spectral (RCWA) — and scientific machine learning — physics-informed neural networks, neural operators, and Bayesian inference — sit on one substrate.
+  Its core design is a tracing system in which domains, weak forms, strong-form stencils, residuals, supervised losses, and diagnostics are written in one symbolic language and compiled into a single GPU-ready, end-to-end reverse-mode-differentiable graph.
+  Because every solve is differentiable, a forward solve, an inverse / PDE-constrained problem, and a trained network compose without restructuring the surrounding code, and gradients flow through the entire pipeline — including the discrete solver.
   jNO also supports multi-model compositions, fine-grained control at parameter level (model, optimizer, and learning rate), hyperparameter tuning, and JAX-native workflows for translated PDE foundation-model families.
 
 keywords:
   - JAX
-  - neural operators
+  - numerical methods
+  - finite element method
+  - differentiable simulation
+  - PDEs
   - physics-informed machine learning
   - PINNs
-  - PDEs
-  - foundation models
   - scientific machine learning
+  - neural operators
 
 authors:
   - family-names: Armbruster
