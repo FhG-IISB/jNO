@@ -141,9 +141,9 @@ def test_adaptive_real_periodic():
     assert np.max(np.abs(ad[0] - be[0])) < 1e-12  # IC preserved
 
 
-def _complex_heat(mesh_size=0.25, param=False, periodic=False):
+def _complex_heat(mesh_size=0.25, param=False, periodic=False, nsteps=6):
     """Complex diffusion u_t + coeff·(1+0.5j)·Δu -> complex_transient."""
-    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=mesh_size, time=(0.0, 0.05, 6))
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=mesh_size, time=(0.0, 0.05, nsteps))
     u, phi = d.fem_symbols()
     xi, yi, ti = d.variable("interior", split=True)
     ci = d.variable("initial", split=True)
@@ -228,11 +228,40 @@ def test_adaptive_threads_through_fem_solve():
     assert cx.dtype == np.complex128 and not np.any(np.isnan(cx))
 
 
-def test_adaptive_complex_transient_slot_guards():
-    """Scope limits fail loud on the complex-transient time path: only ``jno.solve.adaptive`` is wired
-    (θ/exponential raise), and the other solver slots are not threaded there yet."""
+def test_theta_on_complex_transient():
+    """jno.solve.theta threads into the complex-transient marcher: θ=1 reproduces the default backward
+    Euler exactly, and θ=1/2 (Crank–Nicolson) is 2nd-order — much closer to a fine-dt reference on the same
+    mesh than backward Euler at the same coarse step — and reverse-mode differentiable."""
+    save = jnp.linspace(0.0, 0.05, 6)
+    _, fem = _complex_heat(mesh_size=0.3, nsteps=6)
+    default = np.asarray(_solve_complex_transient(fem.operator, save_ts=save, periodic=None))
+    th1 = np.asarray(_solve_complex_transient(fem.operator, save_ts=save, periodic=None, time=jno.solve.theta(1.0)))
+    assert np.max(np.abs(th1 - default)) < 1e-12  # θ=1 is exactly the default backward Euler
+
+    _, fine = _complex_heat(mesh_size=0.3, nsteps=401)  # fine-dt reference on the same mesh
+    ref = np.asarray(_solve_complex_transient(fine.operator, save_ts=save, periodic=None))
+    cn = np.asarray(_solve_complex_transient(fem.operator, save_ts=save, periodic=None, time=jno.solve.theta(0.5)))
+    err_be = np.linalg.norm(default[-1] - ref[-1]) / np.linalg.norm(ref[-1])
+    err_cn = np.linalg.norm(cn[-1] - ref[-1]) / np.linalg.norm(ref[-1])
+    assert not np.any(np.isnan(cn))
+    assert err_cn < 0.2 * err_be, f"Crank–Nicolson (2nd-order) should beat backward Euler: CN={err_cn:.2e} BE={err_be:.2e}"
+
+    _, femp = _complex_heat(mesh_size=0.3, param=True)
+    fc = _solve_complex_transient(femp.operator, save_ts=save, periodic=None, time=jno.solve.theta(0.5))
+
+    def loss(kv):
+        return jnp.sum(jnp.abs(fc.fn(jnp.asarray([kv]))) ** 2)
+
+    g = float(jax.grad(loss)(0.8))
+    fd = float((loss(0.8 + 1e-5) - loss(0.8 - 1e-5)) / 2e-5)
+    assert np.isfinite(g) and abs(g - fd) <= 1e-2 * max(abs(fd), 1.0), f"CN AD {g} vs FD {fd}"
+
+
+def test_complex_transient_time_scheme_guards():
+    """Scope limits fail loud on the complex-transient time path: adaptive and θ are wired, but
+    ``jno.solve.exponential`` is not, and the per-step solver slots are not threaded there yet."""
     _, fem = _complex_heat(mesh_size=0.3)
-    with pytest.raises(NotImplementedError, match="adaptive"):
-        fem.solve(time=jno.solve.theta(0.5))
+    with pytest.raises(NotImplementedError, match="exponential|adaptive"):
+        fem.solve(time=jno.solve.exponential())
     with pytest.raises(NotImplementedError, match="time=|slots"):
         fem.solve(time=adaptive(), linear=jno.solve.lu())

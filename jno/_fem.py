@@ -917,11 +917,11 @@ def _solve_complex_transient(blocks: Any, save_ts: Any = None, periodic: Optiona
                 r = r + dt_ * jnp.concatenate([f_r, f_i])
             return r
 
-        if time is not None:
-            # Adaptive (or another bring-your-own) scheme on the real 2n block: dt varies, so the operator
-            # is re-factored per attempt (no factor-once), and step-doubling drives the step size. Runs the
-            # SAME marcher as the real path — vector and periodic ride through (the blocks are already flat
-            # and periodic-reduced). Differentiable in a runtime parameter through lu_factor/lu_solve.
+        if time is not None and hasattr(time, "rtol"):
+            # Adaptive scheme on the real 2n block: dt varies, so the operator is re-factored per attempt
+            # (no factor-once), and step-doubling drives the step size. Runs the SAME marcher as the real
+            # path — vector and periodic ride through (the blocks are already flat and periodic-reduced).
+            # Differentiable in a runtime parameter through lu_factor/lu_solve.
             from .utils.solver.timeschemes import adaptive_march
 
             def cstep(w, t, dt_):
@@ -931,16 +931,27 @@ def _solve_complex_transient(blocks: Any, save_ts: Any = None, periodic: Optiona
                 cstep, w0, t0, t1, _save, rtol=time.rtol, atol=time.atol, max_steps=time.max_steps, dt0=dt
             )
         else:
-            # Time-independent block operator: LU-factor it ONCE, not on every step (`jnp.linalg.solve`
-            # inside the scan re-factors each iteration — O(n³)/step; `lu_factor` once + `lu_solve`/step is
-            # O(n³) once + O(n²)/step). Differentiable, so ∂traj/∂args (the parametric inverse) flows.
-            lu = jax.scipy.linalg.lu_factor(M_blk + dt * A_blk)
+            # θ-method: (M + θ dt A) w_next = (M − (1−θ) dt A) w + dt(c + θ f_next + (1−θ) f_now). Default
+            # θ=1 (backward Euler); jno.solve.theta(θ) overrides — e.g. θ=1/2 Crank–Nicolson, the second-
+            # order, norm-preserving choice for a Schrödinger / wave complex-transient. The LHS operator is
+            # autonomous, so LU-factor it ONCE (not per step); differentiable, so ∂traj/∂args flows.
+            theta_val = float(time.theta) if (time is not None and hasattr(time, "theta")) else 1.0
+            lu = jax.scipy.linalg.lu_factor(M_blk + theta_val * dt * A_blk)
+            M_expl = M_blk - (1.0 - theta_val) * dt * A_blk  # explicit (previous-step) part
 
-            def step(w, t_next):  # backward Euler: (M_blk + dt A_blk) w_next = M_blk w + dt (c_blk + f)
-                w_next = jax.scipy.linalg.lu_solve(lu, _rhs(w, t_next, dt))
+            def _f2n(t_eval):  # combined 2n forcing at t_eval (zero when there is no boundary source)
+                if fr is None and fi is None:
+                    return jnp.zeros((2 * n,), c_blk.dtype)
+                f_r = jnp.asarray(fr(t_eval, args)).reshape(-1) if fr is not None else jnp.zeros((n,), c_blk.dtype)
+                f_i = jnp.asarray(fi(t_eval, args)).reshape(-1) if fi is not None else jnp.zeros((n,), c_blk.dtype)
+                return jnp.concatenate([f_r, f_i])
+
+            def step(w, t):  # t = step START (advance to t+dt); θ=1 uses only f(t+dt), matching the old path
+                rhs = M_expl @ w + dt * (c_blk + theta_val * _f2n(t + dt) + (1.0 - theta_val) * _f2n(t))
+                w_next = jax.scipy.linalg.lu_solve(lu, rhs)
                 return w_next, w_next
 
-            _, ws = jax.lax.scan(step, w0, grid[1:])
+            _, ws = jax.lax.scan(step, w0, grid[:-1])  # iterate the step START times
             traj = jnp.concatenate([w0[None, :], ws], axis=0)  # (n_grid, 2N)
             traj = jax.vmap(lambda col: jnp.interp(_save, grid, col), in_axes=1, out_axes=1)(traj)
         result = traj[:, :n] + 1j * traj[:, n:]  # (n_save, n_red) complex (full N when untied)
@@ -1423,10 +1434,10 @@ class FEM:
         if self._mode == "complex_transient" and time is not None:
             # The complex-transient path runs its own marcher over the real 2n block, so thread the time=
             # scheme straight into it (bypassing the per-step slot composition, which is real-block only).
-            if not hasattr(time, "rtol"):  # jno.solve.adaptive is the scheme wired into the 2n-block marcher
+            if not (hasattr(time, "rtol") or hasattr(time, "theta")):  # adaptive or θ-method on the 2n block
                 raise NotImplementedError(
                     "fem.solve(time=...) on a complex-transient problem is wired for jno.solve.adaptive(...) "
-                    "only (a fixed θ-step is already the default there; jno.solve.exponential is not wired)."
+                    "and jno.solve.theta(...) (θ=1/2 Crank–Nicolson, etc.); jno.solve.exponential is not."
                 )
             if any(s is not None for s in (x0, nonlinear, linear, precond)):
                 raise NotImplementedError(
