@@ -9,6 +9,7 @@ plug into the same ``develop`` seam. ``CAResist`` develops the 2-D aerial image 
 ``(x, y, z)`` reaction-diffusion bake (the species diffuse through the film thickness too).
 """
 
+import warnings
 from dataclasses import dataclass
 
 import jax
@@ -93,6 +94,13 @@ class CAResist:
     ----------
     n, t_peb, steps:
         Film-mesh resolution per side, bake time, and number of (backward-Euler) time steps.
+    source_chunk:
+        Accumulate the bulk image's Abbe sum this many source points at a time (``None`` = all at once).
+        Bounds peak memory when a ``film`` is given; see :meth:`jno.rcwa._Exposure.bulk`.
+    mesh_size:
+        PEB mesh element size (same length unit as the period). ``None`` = ``min(Px, Py, thickness)/4``,
+        which resolves the film thickness but *not* in-plane features of a wider clip -- set it to a
+        fraction of your smallest feature when the returned volume looks blocky.
     k:
         Rate constants ``(k1, k2, k3, k4, k5)``. ``k4`` is the bilinear acid-base neutralization (the stiff,
         genuinely-nonlinear coupling).
@@ -129,6 +137,8 @@ class CAResist:
         quencher=0.4,
         tone="positive",
         film=None,
+        source_chunk=None,
+        mesh_size=None,
     ):
         if tone not in ("positive", "negative"):
             raise ValueError(f"tone must be 'positive' or 'negative', got {tone!r}")
@@ -139,6 +149,18 @@ class CAResist:
         self.rho_a, self.rho_b = (float(v) for v in diffusion_length)
         self.dill_c, self.dose, self.quencher, self.tone = float(dill_c), float(dose), float(quencher), tone
         self.film = film
+        # Bounds the peak memory of the bulk image this resist reads: the Abbe sum over source points is
+        # accumulated `source_chunk` points at a time rather than materialising the whole
+        # (n_source, nz, grid, grid) stack. The 3-D PEB is exactly the caller that needs it -- it reads a
+        # depth-resolved image over the full film -- so leaving it unthreaded made the bulk chunking apply
+        # only to direct `bulk()` calls and not to the resist model that mainly uses them.
+        self.source_chunk = source_chunk
+        # PEB mesh element size. The default `min(Px, Py, thickness)/4` gives only ~4 elements through
+        # the thinnest dimension, which for a mask clip much wider than the film is far too coarse to
+        # resolve in-plane features -- the returned volume is then dominated by the scatter-mean regrid
+        # (empty output cells fall back to the global mean, which reads as blocky noise). Set this to
+        # resolve the smallest feature you care about.
+        self.mesh_size = None if mesh_size is None else float(mesh_size)
 
     def __call__(self, exposure):
         """Develop an exposure through the reaction-diffusion PEB. With no ``film`` this reads the 2-D aerial
@@ -146,7 +168,7 @@ class CAResist:
         image (``exposure.bulk(film)``) and solves the 3-D PEB → ``(n, n, film.nz)``. Both in ``[0, 1]``."""
         if self.film is None:
             return _peb_develop(exposure.intensity(), exposure.period, self)
-        return _peb_develop_3d(exposure.bulk(self.film), exposure.period, self.film, self)
+        return _peb_develop_3d(exposure.bulk(self.film, source_chunk=self.source_chunk), exposure.period, self.film, self)
 
 
 def _sample_periodic(img, x, y, period):
@@ -258,22 +280,28 @@ def _sample_bulk(vol, x, y, z, period, thickness):
 
 
 def _regrid3d(vals, coords, n, nz, period, thickness):
-    """Resample unstructured node values onto a regular ``(n, n, nz)`` grid by **nearest node** -- a gather,
-    so it is differentiable in ``vals`` and never leaves a cell empty. (The earlier scatter-mean put each
-    node into one cell and filled every *other* cell with the global mean, so a grid finer than the film
-    mesh came out as sparse dots on a flat background.) The nearest-node index per cell is a fixed host
-    computation (a KD-tree -- structural, like point location); the gather ``vals[idx]`` carries the
-    gradient. The developed volume is therefore mesh-limited in detail but dense (dot-free) at any ``n``."""
-    from scipy.spatial import cKDTree
+    """Interpolate unstructured node values onto a regular ``(n, n, nz)`` grid by **barycentric**
+    interpolation (differentiable in ``vals``): each output point takes a weighted combination of its
+    containing tetrahedron's four nodes.
+
+    This replaces a nearest-cell scatter-mean, which was only valid when ``n*n*nz << n_nodes``: output
+    cells containing no node fell back to the GLOBAL MEAN, so at the default ``n=48, nz=24`` (55k cells)
+    against a ~1.8k-node PEB mesh, ~97% of the returned volume was a single constant. That read as blocky
+    noise and got WORSE as ``n`` was raised, since more cells meant more of them empty. Barycentric
+    interpolation is independent of the node count, so ``n`` now sets the output resolution and nothing
+    else. Points outside the hull fall back to the nearest node (see ``jno.rcwa._bary_weights``).
+    """
+    from jno.rcwa import _bary_weights  # lazy: jno.rcwa imports jno.litho at module scope
 
     Px, Py = period
-    gx = (np.arange(n) + 0.5) / n * Px
-    gy = (np.arange(n) + 0.5) / n * Py
-    gz = (np.arange(nz) + 0.5) / nz * thickness
-    GX, GY, GZ = np.meshgrid(gx, gy, gz, indexing="ij")
-    query = np.stack([GX.ravel(), GY.ravel(), GZ.ravel()], axis=1)
-    idx = cKDTree(np.asarray(coords)).query(query)[1]  # nearest mesh node per grid cell (host, structural)
-    return jnp.asarray(vals)[jnp.asarray(idx)].reshape(n, n, nz)
+    xs = (np.arange(n) + 0.5) / n * Px
+    ys = (np.arange(n) + 0.5) / n * Py
+    zs = (np.arange(nz) + 0.5) / nz * float(thickness)
+    X, Y, Z = np.meshgrid(xs, ys, zs, indexing="ij")
+    pts = np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=1)
+    ids, w = _bary_weights(np.asarray(coords, dtype=float), pts)
+    g = jnp.sum(jnp.asarray(w) * jnp.asarray(vals)[jnp.asarray(ids)], axis=1)
+    return g.reshape(n, n, nz)
 
 
 def _peb_develop_3d(vol, period, film, r):
@@ -286,8 +314,32 @@ def _peb_develop_3d(vol, period, film, r):
     Px, Py = period
     d, n = float(film.thickness), r.n
     k1, k2, k3, k4, k5 = r.k
+    if not jax.config.jax_enable_x64:  # measured: every seed tried returns an all-NaN volume in float32
+        warnings.warn(
+            "jno.litho.CAResist: the 3-D PEB is being solved in float32. The bilinear acid-quencher "
+            "term (k4) makes the backward-Euler system stiff enough that float32 diverges to NaN across "
+            "the whole volume -- silently, since the NaNs are only visible in the returned array. Enable "
+            "jax.config.update('jax_enable_x64', True) before calling.",
+            stacklevel=2,
+        )
     d_a, d_b = r.rho_a**2 / (2.0 * r.t_peb), r.rho_b**2 / (2.0 * r.t_peb)
-    size = min(Px, Py, d) / 4.0  # isotropic tets; ≥ ~4 elements through the thinnest dimension
+    # Mesh size. The seed image `vol` is (G, G, nz) over the period, so its pixel pitch Px/G is the
+    # finest structure the PEB can possibly be given -- a mesh coarser than that discards exposure data
+    # before solving. Sizing by the film thickness alone (the old `min(Px, Py, d)/4`) knows about the
+    # THINNEST dimension and nothing about the pattern, which for a clip much wider than the film is the
+    # wrong constraint: at Px = 1.4 um, G = 96 and d = 0.3 um it gave 75 nm elements for a 14.6 nm input.
+    # Default to the tighter of the two, capped at 2 input pixels so the mesh does not explode.
+    gx = int(jnp.shape(vol)[0])  # shape only -- `vol` is a tracer under jit/grad (ILT), never realise it
+    px_in = Px / max(gx, 1)
+    size = float(r.mesh_size) if getattr(r, "mesh_size", None) else min(min(Px, Py, d) / 4.0, 2.0 * px_in)
+    if size > 4.0 * px_in:  # never silently throw away most of the seed image
+        warnings.warn(
+            f"jno.litho.CAResist: PEB mesh {size:.4g} is {size / px_in:.1f}x coarser than the exposure "
+            f"image it is seeded from ({px_in:.4g} per pixel), so most of that image is averaged away "
+            f"before the bake. Pass a smaller mesh_size, or a coarser exposure grid, if that is not "
+            f"intended.",
+            stacklevel=2,
+        )
 
     dom = jno.Shape.box(0.0, 0.0, 0.0, Px, Py, d, size=size).domain(
         time=(0.0, r.t_peb, r.steps), compute_mesh_connectivity=False
