@@ -279,6 +279,39 @@ def test_structured_constraint_list_transient():
     assert float(np.linalg.norm(final[interior] - expected[interior]) / np.linalg.norm(expected[interior])) < 3e-2
 
 
+@pytest.mark.slow
+def test_transient_time_schemes():
+    """The FDM transient march composes with the jno.solve time schemes exactly like fem.solve(time=…):
+    θ=1 reproduces the backward-Euler default, Crank–Nicolson (θ=0.5) is more accurate in time, and the
+    adaptive stepper works. The exponential integrator needs a *linear* block (an assembled A) the
+    matrix-free method-of-lines residual does not provide, so it fails loud. (Domain-agnostic — the
+    scheme acts on the SemidiscreteTimeBlock; a structured grid is used here only for speed.)"""
+    import jno.jnp_ops as jnn
+
+    nu, T = 0.05, 0.3
+
+    def run(time):
+        d = jno.domain(jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1), structured=True, time=(0.0, T, 50))
+        p = _nodes(d)
+        x, y, t = d.variable("interior", split=True)
+        xb, yb, _ = d.variable("boundary", split=True)
+        xi, yi, _ = d.variable("initial", split=True)
+        u = d.unknown()
+        ui = u.bind(x=x, y=y, t=t)
+        u0 = jnn.sin(np.pi * xi) * jnn.sin(np.pi * yi)
+        traj = np.asarray(jno.fdm([ui.t - nu * (ui.d2(x) + ui.d2(y)), u(xb, yb) - 0.0, u(xi, yi) - u0]).solve(time=time))
+        expected = np.exp(-2 * nu * np.pi**2 * T) * (np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]))
+        interior = (p[:, 0] > 1e-9) & (p[:, 0] < 1 - 1e-9) & (p[:, 1] > 1e-9) & (p[:, 1] < 1 - 1e-9)
+        return float(np.linalg.norm(traj[-1][interior] - expected[interior]) / np.linalg.norm(expected[interior]))
+
+    be = run(None)
+    assert abs(run(jno.solve.theta(1.0)) - be) < 1e-6  # θ=1 == the backward-Euler default
+    assert run(jno.solve.theta(0.5)) < be  # Crank–Nicolson is more accurate in time
+    assert run(jno.solve.adaptive()) < 1e-2  # adaptive step size works
+    with pytest.raises(NotImplementedError, match="LINEAR"):
+        run(jno.solve.exponential())
+
+
 def test_grid_stencil_preserves_complex():
     """The grid stencil must preserve a complex field (like the triangle path) — not silently drop the
     imaginary part. FDM has no first-class complex solve, but the operator itself must stay honest:
