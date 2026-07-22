@@ -17,7 +17,9 @@ u(xi, yi) - u0])`` authored with ``u = domain.unknown()`` exactly as ``jno.fem([
 initial condition is *found from the constraints* (never a config flag) and ``t_span``/step-count are
 inferred from ``domain.time`` — and a low-level **function form** (:class:`FDMSystem`).
 
-Scope: scalar fields on a **2-D triangular or 3-D tetrahedral mesh**. The interior operators
+Scope: scalar fields — or a **coupled system** of several ``domain.unknown()`` fields (steady + Dirichlet;
+one PDE equation per unknown, equation *k* driving unknown *k*, ``.solve()`` returning ``(nf, N)``) — on a
+**2-D triangular or 3-D tetrahedral mesh**. The interior operators
 (``jno.fdm.laplacian`` / ``jno.fdm.gradient``, and the constraint-list ``u.d2(x)+u.d2(y)+u.d2(z)``
 authoring) dispatch on ``domain.dimension``; the default ``cotangent`` Laplacian is the cotangent-weight
 operator in 2-D and its exact analogue, the **P1 tetrahedral finite-element** Laplace-Beltrami operator,
@@ -270,6 +272,33 @@ def _find_unknown(constraints):
     return next(iter(models.values()))
 
 
+def _find_unknowns(constraints):
+    """All ``domain.unknown()`` fields (nodal-field-parameter ModelCalls' Models) in the constraints, in
+    first-appearance order — a **coupled** system has several. At least one is required. The k-th PDE
+    equation (constraint order) drives the k-th unknown's DOF block; a ``u_k(region) - g`` BC is folded
+    into that block by whichever unknown it contains."""
+    from .trace import ModelCall
+
+    seen, order = set(), []
+
+    def walk(n):
+        n = _unwrap(n)
+        if isinstance(n, ModelCall) and getattr(n.model, "_fem_field", None) == "node" and n.model.layer_id not in seen:
+            seen.add(n.model.layer_id)
+            order.append(n.model)
+        for c in _iter(n):
+            walk(c)
+
+    for c in constraints:
+        walk(c)
+    if not order:
+        raise ValueError(
+            "jno.fdm([...]): expected at least one domain.unknown() field. Author the strong form with "
+            "`u = domain.unknown()` (declare several for a coupled system)."
+        )
+    return order
+
+
 def _contains_unknown(node, model):
     from .trace import ModelCall
 
@@ -414,9 +443,12 @@ class _TraceFDM:
 
     def __init__(self, constraints):
         self._constraints = list(constraints)  # kept verbatim so a coupled solve can re-author with an interface pin
-        self.unknown = _find_unknown(constraints)
+        self.unknowns = _find_unknowns(constraints)  # coupled system ⇒ several, in declaration order
+        self.unknown = self.unknowns[0]  # the single-field paths (transient/flux/parametric) use this
+        self._nf = len(self.unknowns)
         self.domain = self.unknown._fem_field_domain
-        self._N = int(np.asarray(self.domain.mesh_connectivity["points"]).shape[0])
+        self._N = int(np.asarray(self.domain.mesh_connectivity["points"]).shape[0])  # nodes per field
+        self._Ntot = self._nf * self._N  # blocked DOF vector [field_0 (N), …, field_{nf-1} (N)]
         self._pts = jnp.asarray(np.asarray(self.domain.mesh_connectivity["points"])[:, : self.domain.dimension])
         self._pde, self._dirichlet, self._neumann, self._ic = [], [], [], []
         for c in constraints:
@@ -429,7 +461,7 @@ class _TraceFDM:
             #   * otherwise (value-only, affine in u)          → a Dirichlet pin on its region.
             if _normal_jacobian(c) is not None:
                 self._neumann.append(c)
-            elif _has_unknown_derivative(c, self.unknown):
+            elif any(_has_unknown_derivative(c, u) for u in self.unknowns):
                 self._pde.append(c)
             elif _region_tag(c) == "initial":
                 self._ic.append(c)
@@ -455,6 +487,18 @@ class _TraceFDM:
                 "jno.fdm([...]): the PDE residual has a time derivative `u.t` but no initial condition — "
                 "add `u(xi, yi) - u0` (with `xi, yi = domain.variable('initial', split=True)`)."
             )
+        if self._nf > 1:  # coupled (multi-field): v1 is STEADY + Dirichlet only
+            if len(self._pde) != self._nf:
+                raise ValueError(
+                    f"jno.fdm([...]): a coupled system needs exactly one PDE equation per unknown — got "
+                    f"{self._nf} unknowns but {len(self._pde)} PDE equation(s). Author one equation per "
+                    "field, in the order the unknowns are declared (equation k drives unknown k)."
+                )
+            if self._transient or self._neumann:
+                raise NotImplementedError(
+                    "jno.fdm([...]): a coupled (multi-field) system is v1-limited to a STEADY problem with "
+                    "Dirichlet BCs — transient / flux BCs on coupled fields are not yet supported."
+                )
         # The sub-domain this problem owns, if its PDE coordinates carry a named region
         # (`domain.region(name, poly)`). Used by `jno.core([...])` to couple subdomains automatically.
         self.region, self.region_geometry = self._pde_region()
@@ -493,12 +537,15 @@ class _TraceFDM:
 
         from .trace_evaluator import TraceEvaluator
 
-        expr = self._pde[0]
-        for c in self._pde[1:]:
-            expr = expr + c
-        expr = _unwrap(expr)
+        if self._nf == 1:  # single field: sum all PDE terms into the one equation (historic behaviour)
+            expr = self._pde[0]
+            for c in self._pde[1:]:
+                expr = expr + c
+            exprs = [_unwrap(expr)]
+        else:  # coupled: one equation per field, order-paired (equation k → block k → unknown k)
+            exprs = [_unwrap(self._pde[k]) for k in range(self._nf)]
         if spatial:
-            expr = _zero_temporal(expr)
+            exprs = [_zero_temporal(e) for e in exprs]
         spatial_tags = {  # collocate every spatial term at the mesh nodes (temporal tags carry no field)
             v.tag
             for c in self._pde
@@ -506,13 +553,17 @@ class _TraceFDM:
             if getattr(v, "axis", None) != "temporal"
         }
         context = {t: self._pts for t in spatial_tags}
-        lid, base = self.unknown.layer_id, self.unknown.module
+        N, unknowns = self._N, self.unknowns
 
         def residual_fn(dofs):
-            mod = eqx.tree_at(lambda m: m.value, base, jnp.asarray(dofs).astype(base.value.dtype))
-            params = {lid: mod, **(extra_params or {})}
+            dofs = jnp.asarray(dofs)
+            params = dict(extra_params or {})
+            for k, unk in enumerate(unknowns):  # inject each field's DOF slice into its module
+                slice_k = dofs[k * N : (k + 1) * N] if len(unknowns) > 1 else dofs
+                params[unk.layer_id] = eqx.tree_at(lambda m: m.value, unk.module, slice_k.astype(unk.module.value.dtype))
             ev = TraceEvaluator(params=params)
-            return jnp.asarray(ev.evaluate(expr, context=context, var_bindings={})).reshape(-1)
+            blocks = [jnp.asarray(ev.evaluate(e, context=context, var_bindings={})).reshape(-1) for e in exprs]
+            return blocks[0] if len(blocks) == 1 else jnp.concatenate(blocks)
 
         return residual_fn
 
@@ -532,7 +583,7 @@ class _TraceFDM:
             if (
                 isinstance(n, ModelCall)
                 and getattr(n.model, "_is_parameter", False)
-                and n.model is not self.unknown
+                and all(n.model is not u for u in self.unknowns)
                 and getattr(n.model, "_opt_fn", None) is not None  # trainable ⇔ has an optimizer
             ):
                 found[n.model.layer_id] = n
@@ -563,15 +614,25 @@ class _TraceFDM:
         region's nodes ``idx`` — reused for both boundary conditions and the initial state."""
         inner = _unwrap(constraint)
         g_node = 0.0
-        if getattr(inner, "op", None) == "-":  # u(region) - g  →  g is the side without the unknown
-            g_node = inner.right if _contains_unknown(inner.left, self.unknown) else inner.left
+        if getattr(inner, "op", None) == "-":  # u(region) - g  →  g is the side without any unknown
+            left_has_u = any(_contains_unknown(inner.left, u) for u in self.unknowns)
+            g_node = inner.right if left_has_u else inner.left
         return self._eval_g(g_node, idx)
 
+    def _field_index(self, constraint):
+        """Which unknown's DOF block a value-only constraint (Dirichlet) pins — 0 for a single field."""
+        for k, u in enumerate(self.unknowns):
+            if _contains_unknown(constraint, u):
+                return k
+        return 0
+
     def _dirichlet_rows(self):
+        """Per-field Dirichlet rows ``(field_index, node_indices, values)``: ``field_index`` selects the
+        DOF block (0 for a single field), ``node_indices`` the region's nodes, ``values`` the pinned g."""
         rows = []
         for c in self._dirichlet:
             idx = self._region_nodes(_region_tag(c))
-            rows.append((jnp.asarray(idx), self._condition_value(c, idx)))
+            rows.append((self._field_index(c), jnp.asarray(idx), self._condition_value(c, idx)))
         return rows
 
     def _node_normals(self, region):
@@ -742,9 +803,10 @@ class _TraceFDM:
         ``jno.np.parameter`` (from :meth:`_parametric_node`). ``extra_pins`` is an ``(idx, values)`` pair
         of nodes pinned to given values on top of the authored BCs — the interface pin a coupled /
         domain-decomposition Schwarz step applies (:meth:`solve_pinned`)."""
+        N, single = self._N, self._nf == 1
         residual_fn = self._pde_residual_fn(extra_params=extra_params)
         rows = self._dirichlet_rows()
-        flux_rows = self._flux_rows(extra_params)
+        flux_rows = self._flux_rows(extra_params) if single else []  # flux is single-field (guarded at build)
 
         def residual_with_bc(u):
             r = residual_fn(u)
@@ -760,13 +822,15 @@ class _TraceFDM:
             if extra_pins is not None:  # interface pin (a coupled subdomain's complement) — before the
                 pidx, pvals = extra_pins  # authored Dirichlet, so the physical outer BC still wins on ∂Ω
                 r = r.at[pidx].set(u[pidx] - pvals)
-            for idx, gvals in rows:
-                r = r.at[idx].set(u[idx] - gvals)
+            for k, idx, gvals in rows:  # Dirichlet: pin field k's DOF block at its region nodes
+                base = k * N
+                r = r.at[base + idx].set(u[base + idx] - gvals)
             return r
 
         driver = nonlinear or _solve.newton()
-        u0 = jnp.zeros(self._N) if x0 is None else jnp.asarray(x0)
-        return driver(residual_with_bc, u0, linear_solve=_structured_linear_solve(self.domain))
+        u0 = jnp.zeros(self._Ntot) if x0 is None else jnp.asarray(x0).reshape(-1)
+        sol = driver(residual_with_bc, u0, linear_solve=_structured_linear_solve(self.domain) if single else None)
+        return sol if single else sol.reshape(self._nf, N)  # coupled: (nf, N), one row per field
 
     def pinned_solver(self, node_ids, *, nonlinear=None):
         """A **reusable** ``f(values) -> field`` that solves the subdomain with ``node_ids`` pinned to
@@ -794,7 +858,7 @@ class _TraceFDM:
                     a = v1(u) - b
                     r = r.at[idx].set(a[idx] * flux + b[idx])
                 r = r.at[pin_idx].set(u[pin_idx] - pv)  # interface pin — before the authored Dirichlet
-                for idx, gvals in rows:
+                for _k, idx, gvals in rows:  # single-field (domain-decomposition) path ⇒ block 0
                     r = r.at[idx].set(u[idx] - gvals)
                 return r
 
@@ -853,7 +917,7 @@ class _TraceFDM:
         flux_rows = self._flux_rows()
         bmask = np.zeros(self._N, dtype=bool)
         bvals = np.zeros(self._N)
-        for idx, gv in rows:
+        for _k, idx, gv in rows:  # single-field transient ⇒ block 0
             bmask[np.asarray(idx)] = True
             bvals[np.asarray(idx)] = np.asarray(gv)
         algebraic = bmask.copy()  # Dirichlet + flux nodes are algebraic (zero mass row)

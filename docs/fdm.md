@@ -276,11 +276,28 @@ conditions work per face exactly as in 2-D — bind to the face and take the nor
 
 ## Scope and limitations
 
-**Supported:** scalar fields on a **2-D triangular or 3-D tetrahedral** mesh; any mix of
-Dirichlet and flux (Neumann / Robin / coordinate-coefficient, affine in `∂u/∂n`) boundary conditions,
-in 2-D and 3-D, **steady or transient** (a transient flux node is an algebraic zero-mass-row constraint);
-transient problems by the method of lines (`M = I`, unit-coefficient `u.t`) with a selectable
-[time scheme](#time-schemes); linear and nonlinear residuals; differentiable inverse problems. A geometric sub-region for a subdomain /
+**Supported:** scalar fields — or a **coupled system** of several `domain.unknown()` fields (steady +
+Dirichlet, one PDE equation per unknown; `.solve()` returns `(nf, N)`) — on a **2-D triangular or 3-D
+tetrahedral** mesh; any mix of Dirichlet and flux (Neumann / Robin / coordinate-coefficient, affine in
+`∂u/∂n`) boundary conditions, in 2-D and 3-D, **steady or transient** (a transient flux node is an
+algebraic zero-mass-row constraint); transient problems by the method of lines (`M = I`,
+unit-coefficient `u.t`) with a selectable [time scheme](#time-schemes); linear and nonlinear residuals;
+differentiable inverse problems.
+
+Author a coupled system as one PDE equation per unknown, in declaration order (equation *k* drives
+unknown *k*), plus each field's BCs:
+
+```python
+u = d.unknown(); v = d.unknown()
+ui = u.bind(x=x, y=y); vi = v.bind(x=x, y=y)
+uh, vh = jno.fdm([
+    -ui.d2(x) - ui.d2(y) + vi - f_u,   # equation for u
+    -vi.d2(x) - vi.d2(y) + ui - f_v,   # equation for v
+    u(xb, yb) - 0.0, v(xb, yb) - 0.0,  # Dirichlet per field
+]).solve()                              # returns (2, N): uh = row 0, vh = row 1
+```
+
+Coupled fields are v1-limited to steady + Dirichlet (transient / flux on coupled fields are planned). A geometric sub-region for a subdomain /
 domain-decomposition solve (`jno.dd.couple([(problem, region)])`) resolves to a mesh-node subset via
 the analytic, shapely-free [`Shape.contains`](Domain-and-Geometry.md) — in 2-D **and** 3-D.
 

@@ -385,6 +385,71 @@ def test_transient_neumann_bc():
     assert float(np.linalg.norm(final[left_right] - expected[left_right]) / np.linalg.norm(expected[left_right])) < 2e-2
 
 
+def test_coupled_two_field():
+    """A coupled 2-field system — −Δu + v = f_u, −Δv + u = f_v, u = v = 0 on ∂Ω — authored as one PDE
+    equation per unknown (equation k drives unknown k). `.solve()` returns `(nf, N)` with each field
+    recovered. MMS: u = sin(πx)sin(πy), v = sin(2πx)sin(πy)."""
+    import jno.jnp_ops as jnn
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.04)
+    p = _nodes(d)
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    v = d.unknown()
+    ui = u.bind(x=x, y=y)
+    vi = v.bind(x=x, y=y)
+    u_ex = jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+    v_ex = jnn.sin(2 * np.pi * x) * jnn.sin(np.pi * y)
+    f_u = 2 * np.pi**2 * u_ex + v_ex  # −Δu_ex = 2π²·u_ex
+    f_v = 5 * np.pi**2 * v_ex + u_ex  # −Δv_ex = 5π²·v_ex
+    sol = np.asarray(
+        jno.fdm(
+            [
+                -ui.d2(x) - ui.d2(y) + vi - f_u,  # equation for u (block 0)
+                -vi.d2(x) - vi.d2(y) + ui - f_v,  # equation for v (block 1)
+                u(xb, yb) - 0.0,  # Dirichlet u
+                v(xb, yb) - 0.0,  # Dirichlet v
+            ]
+        ).solve()
+    )
+    assert sol.shape == (2, p.shape[0])  # (nf, N), one row per field
+    uex = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+    vex = np.sin(2 * np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+    assert float(np.linalg.norm(sol[0] - uex) / np.linalg.norm(uex)) < 2e-2
+    assert float(np.linalg.norm(sol[1] - vex) / np.linalg.norm(vex)) < 5e-2  # v is higher-frequency
+
+
+def test_coupled_guards():
+    """A coupled system is v1-limited to STEADY + Dirichlet with exactly one PDE equation per unknown."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2)
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    v = d.unknown()
+    ui = u.bind(x=x, y=y)
+    vi = v.bind(x=x, y=y)
+    with pytest.raises(ValueError, match="one PDE equation per unknown"):  # 2 unknowns, 1 equation
+        jno.fdm([-ui.d2(x) - ui.d2(y) + vi, u(xb, yb) - 0.0, v(xb, yb) - 0.0]).solve()
+
+    dt = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2, time=(0.0, 0.5, 50))
+    xt, yt, tt = dt.variable("interior", split=True)
+    xit, yit, _ = dt.variable("initial", split=True)
+    ut = dt.unknown()
+    vt = dt.unknown()
+    uit = ut.bind(x=xt, y=yt, t=tt)
+    vit = vt.bind(x=xt, y=yt, t=tt)
+    with pytest.raises(NotImplementedError, match="coupled"):  # coupled + transient not yet supported
+        jno.fdm(
+            [
+                uit.t - (uit.d2(xt) + uit.d2(yt)) + vit,
+                vit.t - (vit.d2(xt) + vit.d2(yt)) + uit,
+                ut(xit, yit) - 0.0,
+                vt(xit, yit) - 0.0,
+            ]
+        )
+
+
 def test_constraint_list_inverse_via_crux():
     """A trainable jno.np.parameter in the constraint list makes jno.fdm([...]).solve() a deferred trace
     node (like fem.solve()) that composes into jno.core — recover a source amplitude from an observed
