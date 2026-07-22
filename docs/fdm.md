@@ -276,19 +276,19 @@ conditions work per face exactly as in 2-D — bind to the face and take the nor
 
 ## Scope and limitations
 
-**Supported:** scalar fields on a **2-D triangular or 3-D tetrahedral** mesh; any mix of steady
+**Supported:** scalar fields on a **2-D triangular or 3-D tetrahedral** mesh; any mix of
 Dirichlet and flux (Neumann / Robin / coordinate-coefficient, affine in `∂u/∂n`) boundary conditions,
-in 2-D and 3-D; transient problems by the method of lines (`M = I`, unit-coefficient `u.t`); linear
-and nonlinear residuals; differentiable inverse problems. A geometric sub-region for a subdomain /
+in 2-D and 3-D, **steady or transient** (a transient flux node is an algebraic zero-mass-row constraint);
+transient problems by the method of lines (`M = I`, unit-coefficient `u.t`) with a selectable
+[time scheme](#time-schemes); linear and nonlinear residuals; differentiable inverse problems. A geometric sub-region for a subdomain /
 domain-decomposition solve (`jno.dd.couple([(problem, region)])`) resolves to a mesh-node subset via
 the analytic, shapely-free [`Shape.contains`](Domain-and-Geometry.md) — in 2-D **and** 3-D.
 
 An axis-aligned 2-D rectangle or 3-D box can use a fast [structured grid](#structured-grid-fast-stencils)
 (`structured=True`) with direct finite-difference stencils in place of the unstructured mesh.
 
-**Planned:** transient flux boundary conditions (a flux node keeps `M = 1`, unlike a pinned Dirichlet
-node); periodic boundaries; a general `u.t` mass coefficient; composite / cut-cell structured geometry
-(axis-aligned rectangles and boxes are supported, above); 1-D meshes. Authoring a `jno.Shape` sub-region
+**Planned:** periodic boundaries; a general `u.t` mass coefficient; composite / cut-cell structured
+geometry (axis-aligned rectangles and boxes are supported, above); 1-D meshes. Authoring a `jno.Shape` sub-region
 through `domain.region(name, shape)` + `d.variable`, and 3-D coupled solves, additionally need
 region-tag support on the base 3-D domain (a separate 3-D domain-decomposition feature). A pure-Neumann
 problem (no Dirichlet node anywhere) is singular — the solution is defined only up to an additive

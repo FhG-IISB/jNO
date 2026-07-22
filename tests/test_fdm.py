@@ -325,9 +325,8 @@ def test_mixed_dirichlet_neumann_robin():
     assert float(np.linalg.norm(np.asarray(sol).reshape(-1) - exact) / np.linalg.norm(exact)) < 1e-3
 
 
-def test_flux_rejects_nonaffine_and_transient():
-    """Guards: a flux BC nonlinear in ∂u/∂n (here `(∂u/∂n)² − 1`) raises rather than silently returning a
-    secant, and a flux BC on a transient problem raises."""
+def test_flux_rejects_nonaffine():
+    """A flux BC nonlinear in ∂u/∂n (here `(∂u/∂n)² − 1`) raises rather than silently returning a secant."""
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.15)
     x, y, _ = d.variable("interior", split=True)
     xl, yl, _ = d.variable("left", split=True)
@@ -339,20 +338,51 @@ def test_flux_rejects_nonaffine_and_transient():
     with pytest.raises(ValueError, match="affine"):
         jno.fdm([-ui.d2(x) - ui.d2(y), u(xl, yl) - 0.0, ur.d(nr) * ur.d(nr) - 1.0]).solve()
 
-    dt = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.15, time=(0.0, 0.5, 50))
-    xt, yt, tt = dt.variable("interior", split=True)
-    xit, yit, _ = dt.variable("initial", split=True)
-    nrt = dt.variable("right", normals=True)
-    ut = dt.unknown()
-    uit = ut.bind(x=xt, y=yt, t=tt)
-    with pytest.raises(ValueError, match="Neumann.*transient|transient.*not supported"):
+
+@pytest.mark.slow
+def test_transient_neumann_bc():
+    """Transient Neumann (insulated) BC via the algebraic-flux march: u = cos(πx)·sin(πy)·e^{−2νπ²t} has
+    homogeneous Neumann ∂u/∂n = 0 on left/right (∂u/∂x = 0 there) and Dirichlet u = 0 on top/bottom. The
+    Neumann boundary nodes EVOLVE (a zero mass row + the flux constraint, an index-1 DAE) and track the
+    analytic solution — the flux + transient combination that jno.fdm used to reject."""
+    import jno.jnp_ops as jnn
+
+    nu, T = 0.05, 0.2
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.05, time=(0.0, T, 100))
+    p = _nodes(d)
+    x, y, t = d.variable("interior", split=True)
+    xl, yl, _ = d.variable("left", split=True)
+    xr, yr, _ = d.variable("right", split=True)
+    xb, yb, _ = d.variable("bottom", split=True)
+    xt, yt, _ = d.variable("top", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    nl = d.variable("left", normals=True)
+    nr = d.variable("right", normals=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, t=t)
+    ul = u.bind(x=xl, y=yl)
+    ur = u.bind(x=xr, y=yr)
+    u0 = jnn.cos(np.pi * xi) * jnn.sin(np.pi * yi)
+    traj = np.asarray(
         jno.fdm(
             [
-                uit.t - 0.05 * (uit.d2(xt) + uit.d2(yt)),
-                ut(xit, yit) - 0.0,
-                uit.d(nrt) - 1.0,
+                ui.t - nu * (ui.d2(x) + ui.d2(y)),
+                ul.d(nl) - 0.0,
+                ur.d(nr) - 0.0,  # Neumann (insulated) left + right
+                u(xb, yb) - 0.0,
+                u(xt, yt) - 0.0,  # Dirichlet bottom + top
+                u(xi, yi) - u0,  # initial condition
             ]
-        )
+        ).solve()
+    )
+    final = traj[-1]
+    expected = np.cos(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]) * np.exp(-2 * nu * np.pi**2 * T)
+    assert np.all(np.isfinite(final))
+    interior = (p[:, 1] > 1e-9) & (p[:, 1] < 1 - 1e-9)  # all non-Dirichlet nodes (incl. left/right Neumann)
+    left_right = ((p[:, 0] < 1e-9) | (p[:, 0] > 1 - 1e-9)) & (p[:, 1] > 1e-9) & (p[:, 1] < 1 - 1e-9)
+    assert float(np.linalg.norm(final[interior] - expected[interior]) / np.linalg.norm(expected[interior])) < 2e-2
+    # the Neumann boundary nodes evolve (not pinned) and match the analytic decay
+    assert float(np.linalg.norm(final[left_right] - expected[left_right]) / np.linalg.norm(expected[left_right])) < 2e-2
 
 
 def test_constraint_list_inverse_via_crux():

@@ -22,7 +22,7 @@ Scope: scalar fields on a **2-D triangular or 3-D tetrahedral mesh**. The interi
 authoring) dispatch on ``domain.dimension``; the default ``cotangent`` Laplacian is the cotangent-weight
 operator in 2-D and its exact analogue, the **P1 tetrahedral finite-element** Laplace-Beltrami operator,
 in 3-D (symmetric, second-order for the solve; ``gradient_of_gradient`` is the first-order local
-alternative). **Any mix** of steady boundary conditions — Dirichlet ``u(region) - g``, and **any flux BC
+alternative). **Any mix** of boundary conditions — Dirichlet ``u(region) - g``, and **any flux BC
 affine in the normal derivative** ``∂u/∂n`` written with that region's boundary tags: Neumann
 ``ur.d(n) - h``, Robin ``ur.d(n) + α(u - u∞)``, a coordinate-coefficient ``κ(x)·ur.d(n)``, either sign
 (``ur = u.bind(x=xr, y=yr[, z=zr])``, ``n = domain.variable(region, normals=True)``). Flux normals come
@@ -33,10 +33,11 @@ method-of-lines (``M = I``;
 a unit-coefficient ``u.t`` term, e.g. ``ui.t - νΔu``) — all with linear + nonlinear residuals, and with
 the time scheme selectable via ``.solve(time=…)`` exactly as ``fem.solve(time=…)`` (``jno.solve.theta``
 for backward Euler / Crank–Nicolson, ``jno.solve.adaptive``; backward Euler by default — the exponential
-integrator needs a linear block the matrix-free residual doesn't assemble, so it fails loud). Transient
-flux BCs, periodic, and a general ``u.t`` mass coefficient are planned extensions (see
-``plans/fdm-solver.md``). A pure-Neumann problem (no Dirichlet node) is singular (solution up to a
-constant) and is solved as-is.
+integrator needs a linear block the matrix-free residual doesn't assemble, so it fails loud). **Flux BCs
+compose with transient too** — a flux node becomes an algebraic zero-mass-row constraint imposing the
+same ``a·(∇u·n) + b`` at each instant (its value slaved to the interior via the flux). Periodic and a
+general ``u.t`` mass coefficient are planned extensions (see ``plans/fdm-solver.md``). A pure-Neumann
+problem (no Dirichlet node) is singular (solution up to a constant) and is solved as-is.
 
 **Structured grid.** ``jno.domain(jno.Shape.rect(x0, y0, x1, y1, size=h), structured=True)`` (2-D) or
 ``jno.domain(jno.Shape.box(x0, y0, z0, x1, y1, z1, size=h), structured=True)`` (3-D) builds a regular
@@ -454,12 +455,6 @@ class _TraceFDM:
                 "jno.fdm([...]): the PDE residual has a time derivative `u.t` but no initial condition — "
                 "add `u(xi, yi) - u0` (with `xi, yi = domain.variable('initial', split=True)`)."
             )
-        if self._neumann and self._transient:
-            raise ValueError(
-                "jno.fdm([...]): Neumann/Robin flux conditions on a transient problem are not supported in v1 "
-                "(a flux node keeps its mass row, unlike a pinned Dirichlet node). Use a steady problem, or "
-                "impose the flux as a Dirichlet condition."
-            )
         # The sub-domain this problem owns, if its PDE coordinates carry a named region
         # (`domain.region(name, poly)`). Used by `jno.core([...])` to couple subdomains automatically.
         self.region, self.region_geometry = self._pde_region()
@@ -840,8 +835,11 @@ class _TraceFDM:
     def _march(self, *, nonlinear=None, save_ts=None, time=None):
         """Method-of-lines march of ``u̇ = -R_spatial(u)`` reusing jNO's solver-agnostic
         :class:`SemidiscreteTimeBlock` integrator (``custom_root`` differentiable). ``M = I`` on interior
-        nodes; Dirichlet nodes carry a zero mass row so they stay pinned at ``g``. ``t_span``/``dt`` are
-        inferred from ``domain.time``. ``time=`` picks the scheme (backward Euler by default)."""
+        nodes; **Dirichlet and Neumann/Robin flux nodes carry a zero mass row** — Dirichlet pins to ``g``,
+        a flux node imposes the SAME ``a·(∇u·n) + b`` the steady solve folds in, as an index-1 DAE
+        constraint the boundary value satisfies at each instant (its value is slaved to the interior via
+        the flux). ``t_span``/``dt`` come from ``domain.time``; ``time=`` picks the scheme (backward Euler
+        by default)."""
         import jax.experimental.sparse as jsparse
 
         from .utils.solver.backend_blocks import SemidiscreteTimeBlock, _block_time_grid
@@ -852,19 +850,30 @@ class _TraceFDM:
             raise ValueError("jno.fdm([...]): domain.time must specify n_steps >= 2 for a transient march.")
 
         rows = self._dirichlet_rows()
+        flux_rows = self._flux_rows()
         bmask = np.zeros(self._N, dtype=bool)
         bvals = np.zeros(self._N)
         for idx, gv in rows:
             bmask[np.asarray(idx)] = True
             bvals[np.asarray(idx)] = np.asarray(gv)
-        bmask, bvals = jnp.asarray(bmask), jnp.asarray(bvals)
+        algebraic = bmask.copy()  # Dirichlet + flux nodes are algebraic (zero mass row)
+        for row in flux_rows:
+            algebraic[np.asarray(row[0])] = True
+        bmask, bvals, algebraic = jnp.asarray(bmask), jnp.asarray(bvals), jnp.asarray(algebraic)
 
         spatial_res = self._pde_residual_fn(spatial=True)
         diag = jnp.stack([jnp.arange(self._N), jnp.arange(self._N)], axis=1)
-        M = jsparse.BCOO((jnp.where(bmask, 0.0, 1.0), diag), shape=(self._N, self._N))  # 0 mass on Dirichlet rows
+        M = jsparse.BCOO((jnp.where(algebraic, 0.0, 1.0), diag), shape=(self._N, self._N))  # 0 mass: Dirichlet+flux
 
-        def residual(wn, t, args):  # M u̇ + R_spatial = 0  →  interior u̇ = -R_spatial;  boundary wn = g
-            return jnp.where(bmask, wn - bvals, spatial_res(wn))
+        def residual(wn, t, args):  # M u̇ + R = 0 → interior u̇ = -R_spatial; flux/Dirichlet rows algebraic
+            r = spatial_res(wn)
+            for idx, nrm, method, v0, v1 in flux_rows:  # a·(∇u·n) + b — the same folding as _steady_solve
+                grad = gradient(wn, self.domain, method=method)
+                flux = jnp.sum(grad[idx] * nrm, axis=1)
+                b = v0(wn)
+                a = v1(wn) - b
+                r = r.at[idx].set(a[idx] * flux + b[idx])
+            return jnp.where(bmask, wn - bvals, r)  # Dirichlet wins over flux on an overlapping node
 
         block = SemidiscreteTimeBlock(
             mass=lambda t, args: M,
