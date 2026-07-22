@@ -65,10 +65,15 @@ class TraceEvaluator:
     ``_eval_<NodeType>(self, expr, ctx)`` and add an entry in ``_HANDLERS``.
     """
 
+    # Sentinel: the sampled points ARE the mesh vertices, so the mesh→sampled map is the identity and the
+    # values pass through unremapped (the common collocation-on-mesh case, decided once on the host).
+    _NN_IDENTITY = object()
+
     def __init__(self, params: Dict):
         self.params = params
         self.log = get_logger()
         self._logged_schemes: Dict[str, str] = {}
+        self._nn_index_cache: Dict = {}  # (mesh, sampled) point-set geometry -> nearest-vertex gather index
 
     # ------------------------------------------------------------------
     # Evaluation context — lightweight carrier replacing 5 positional args
@@ -379,24 +384,49 @@ class TraceEvaluator:
         return local
 
     def _map_mesh_to_sampled(self, mesh_points, sampled_points, values):
-        """Map values computed at mesh vertices back to sampled points via
-        nearest-neighbour lookup.  If the point sets have the same size
-        and are identical (common when n_samples == n_mesh), return
-        values directly to avoid a costly O(N×M) distance matrix."""
-        if mesh_points.shape == sampled_points.shape:
-            # Fast path: when shapes match, check if points are identical
-            # (this is the common case when all mesh points are sampled).
-            same = jnp.all(jnp.abs(mesh_points - sampled_points) < 1e-8)
-            return jax.lax.cond(
-                same,
-                lambda _: values,
-                lambda _: self._nearest_neighbour_lookup(mesh_points, sampled_points, values),
-                operand=None,
-            )
-        return self._nearest_neighbour_lookup(mesh_points, sampled_points, values)
+        """Map values computed at mesh vertices back to sampled points via nearest-neighbour lookup.
+
+        The nearest-vertex assignment is a STRUCTURAL map — it depends only on the two point sets, never on
+        ``values`` — so it is resolved ONCE on the host (a scipy cKDTree, ``O((N+M) log N)``) and reused as a
+        constant gather index. Every derivative readout at non-mesh collocation points (`u.x`, `∇u·n`, the
+        Jacobian / Laplacian / Hessian) is then a `values[index]` gather, instead of rebuilding an
+        ``O(N_sampled × N_mesh)`` distance matrix in the compiled graph on every call. When the sampled points
+        ARE the mesh vertices (the common case) the map is the identity and ``values`` pass through unremapped.
+        Dynamic (traced) coordinates — e.g. differentiating an objective w.r.t. the sample points — fall back
+        to the original in-graph ``jnp.argmin`` (structural precompute needs concrete coordinates)."""
+        idx = self._nn_index(mesh_points, sampled_points)
+        if idx is None:  # traced coordinates: the host cannot resolve the index -> in-graph argmin
+            return self._nearest_neighbour_lookup(mesh_points, sampled_points, values)
+        if idx is self._NN_IDENTITY:  # sampled points == mesh vertices -> no remap
+            return values
+        return values[idx]
+
+    def _nn_index(self, mesh_points, sampled_points):
+        """The nearest mesh-vertex index for each sampled point, resolved on the host and cached by the two
+        point sets' geometry. Returns ``None`` if either set is a JAX tracer (dynamic coordinates), the
+        ``_NN_IDENTITY`` sentinel if the sampled points are the mesh vertices, else the gather index as a
+        JAX array (a jaxpr constant, so it never re-runs a distance reduction at solve time)."""
+        if isinstance(mesh_points, jax.core.Tracer) or isinstance(sampled_points, jax.core.Tracer):
+            return None
+        mp, sp = np.asarray(mesh_points), np.asarray(sampled_points)
+        key = (mp.shape, sp.shape, hash(mp.tobytes()), hash(sp.tobytes()))
+        cached = self._nn_index_cache.get(key)
+        if cached is None:
+            if mp.shape == sp.shape and np.allclose(mp, sp, rtol=0.0, atol=1e-8):
+                cached = self._NN_IDENTITY  # collocation on the mesh vertices — the direct-return fast path
+            else:
+                from scipy.spatial import cKDTree
+
+                cached = jnp.asarray(cKDTree(mp).query(sp)[1])  # (N_sampled,) nearest mesh-vertex indices
+            if len(self._nn_index_cache) > 128:  # bound memory if the geometry changes every call (eager resampling)
+                self._nn_index_cache.clear()
+            self._nn_index_cache[key] = cached
+        return cached
 
     @staticmethod
     def _nearest_neighbour_lookup(mesh_points, sampled_points, values):
+        """In-graph nearest-neighbour fallback for traced coordinates: an ``O(N_sampled × N_mesh)`` distance
+        reduction. The host path (:meth:`_nn_index`) avoids this whenever the coordinates are concrete."""
         dists = jnp.sum(
             (mesh_points[jnp.newaxis, :, :] - sampled_points[:, jnp.newaxis, :]) ** 2,
             axis=-1,

@@ -217,3 +217,43 @@ def test_vector_frozen_field_standalone_eval_fails_loud():
     uf = u.bind(x=xb, y=yb).freeze(np.ones((nvv, 2)))
     with pytest.raises(NotImplementedError, match="VECTOR frozen field"):
         uf.eval()
+
+
+def test_nn_readout_is_host_precomputed_and_matches_argmin():
+    """The mesh→sampled nearest-neighbour map is field-INDEPENDENT, so `_map_mesh_to_sampled` resolves the
+    gather index ONCE on the host (a scipy cKDTree) rather than rebuilding an O(N_sampled × N_mesh) distance
+    matrix in the compiled graph on every derivative readout. Assert: (a) genuine off-mesh nearest-neighbour
+    matches a reference argmin; (b) for concrete points the index is a jaxpr constant and the readout carries
+    no in-graph argmin; (c) coincident points short-circuit to the identity (values pass through); (d) the
+    gather is differentiable in the field values; (e) traced coordinates fall back to the in-graph lookup."""
+    from jno.trace_evaluator import TraceEvaluator
+
+    ev = TraceEvaluator({})
+    mesh = jax.random.uniform(jax.random.PRNGKey(0), (40, 2))
+    sampled = jax.random.uniform(jax.random.PRNGKey(1), (13, 2))  # generic points, NOT on the mesh vertices
+    values = jax.random.normal(jax.random.PRNGKey(2), (40,))
+    ref = np.argmin(((np.asarray(mesh)[None] - np.asarray(sampled)[:, None]) ** 2).sum(-1), axis=1)
+
+    # (a) genuine nearest-neighbour == reference argmin
+    out = np.asarray(ev._map_mesh_to_sampled(mesh, sampled, values))
+    np.testing.assert_array_equal(out, np.asarray(values)[ref])
+
+    # (b) concrete points -> a concrete (host-resolved) index, and NO argmin/distance reduction in the jaxpr
+    idx = ev._nn_index(mesh, sampled)
+    assert idx is not None and idx is not ev._NN_IDENTITY and not isinstance(idx, jax.core.Tracer)
+    prims = {
+        e.primitive.name for e in jax.make_jaxpr(lambda v: ev._map_mesh_to_sampled(mesh, sampled, v))(values).jaxpr.eqns
+    }
+    assert "argmin" not in prims, f"the O(N×M) argmin should be host-resolved, not in the graph; got {prims}"
+
+    # (c) coincident points -> identity short-circuit
+    assert ev._nn_index(mesh, mesh) is ev._NN_IDENTITY
+    np.testing.assert_array_equal(np.asarray(ev._map_mesh_to_sampled(mesh, mesh, values)), np.asarray(values))
+
+    # (d) differentiable in the field values (a gather -> scatter-add on the backward pass)
+    g = jax.grad(lambda v: ev._map_mesh_to_sampled(mesh, sampled, v).sum())(values)
+    assert np.all(np.isfinite(np.asarray(g))) and abs(float(g.sum()) - len(sampled)) < 1e-9
+
+    # (e) traced coordinates (differentiating w.r.t. the sample points) -> in-graph fallback, still correct
+    out_traced = np.asarray(jax.jit(lambda s: ev._map_mesh_to_sampled(mesh, s, values))(sampled))
+    np.testing.assert_array_equal(out_traced, np.asarray(values)[ref])
