@@ -501,6 +501,48 @@ def test_nonlinear_mass_rejected():
         jno.fdm([ui * ui.t - (ui.d2(x) + ui.d2(y)), u(xb, yb) - 0.0, u(xi, yi) - u0]).solve()
 
 
+@pytest.mark.slow
+def test_periodic_poisson():
+    """A periodic tie `u(left) - u(right)` wraps the structured x-axis (the Nx-node periodic 5-point
+    stencil), authored exactly as in jno.fem. MMS: -Δu = 5π²·sin(2πx)sin(πy), periodic in x with
+    Dirichlet u=0 in y ⇒ u = sin(2πx)sin(πy). The tie holds to machine precision."""
+    import jno.jnp_ops as jnn
+
+    d = jno.domain(jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.08), structured=True)
+    p = _nodes(d)
+    x, y, _ = d.variable("interior", split=True)
+    xl, yl, _ = d.variable("left", split=True)
+    xr, yr, _ = d.variable("right", split=True)
+    xb, yb, _ = d.variable("bottom", split=True)
+    xt, yt, _ = d.variable("top", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    f = 5 * np.pi**2 * jnn.sin(2 * np.pi * x) * jnn.sin(np.pi * y)
+    sol = np.asarray(
+        jno.fdm([-ui.d2(x) - ui.d2(y) - f, u(xl, yl) - u(xr, yr), u(xb, yb) - 0.0, u(xt, yt) - 0.0]).solve()
+    ).reshape(-1)
+    exact = np.sin(2 * np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+    assert float(np.linalg.norm(sol - exact) / np.linalg.norm(exact)) < 3e-2
+    sx, sy = d.mesh_connectivity["grid"]["shape"]  # the tie holds exactly: left face == right face
+    grid_sol = sol.reshape(sx, sy)
+    assert float(np.max(np.abs(grid_sol[0, :] - grid_sol[-1, :]))) < 1e-9
+
+
+def test_periodic_requires_structured():
+    """A periodic tie on an unstructured mesh raises — the FD stencil must wrap the grid, which only a
+    structured grid can do."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2)  # unstructured
+    x, y, _ = d.variable("interior", split=True)
+    xl, yl, _ = d.variable("left", split=True)
+    xr, yr, _ = d.variable("right", split=True)
+    xb, yb, _ = d.variable("bottom", split=True)
+    xt, yt, _ = d.variable("top", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    with pytest.raises(NotImplementedError, match="STRUCTURED"):
+        jno.fdm([-ui.d2(x) - ui.d2(y), u(xl, yl) - u(xr, yr), u(xb, yb) - 0.0, u(xt, yt) - 0.0])
+
+
 def test_constraint_list_inverse_via_crux():
     """A trainable jno.np.parameter in the constraint list makes jno.fdm([...]).solve() a deferred trace
     node (like fem.solve()) that composes into jno.core — recover a source amplitude from an observed

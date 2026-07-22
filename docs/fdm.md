@@ -171,6 +171,25 @@ jno.fdm([
     row is applied last). A condition that is *not* affine in `∂u/∂n` raises rather than returning a
     wrong answer.
 
+### Periodic
+
+Tie two opposite faces with a `u(A) - u(B)` constraint — exactly as `jno.fem`:
+
+```python
+jno.fdm([
+    -ui.d2(x) - ui.d2(y) - f,
+    u(xl, yl) - u(xr, yr),          # periodic in x  (left/right; bottom/top → y, front/back → z)
+    u(xb, yb) - 0.0, u(xt, yt) - 0.0,  # Dirichlet in y
+]).solve()
+```
+
+This is **structured-only**: the tie wraps that grid axis so the `jnp.roll` stencil gives the true
+periodic 5-/7-point Laplacian (a strong-form stencil must *wrap* — a mere boundary tie on an unstructured
+mesh would keep a one-sided edge and solve the wrong problem, so it raises). The redundant `x=L ≡ x=0`
+face is pinned to its master by the tie. Note: a periodic structured solve is currently un-preconditioned
+(the geometric-multigrid V-cycle assumes Dirichlet boundaries), so it is slow on fine grids — periodic GMG
+is a planned extension.
+
 ---
 
 ## Transient problems
@@ -306,8 +325,13 @@ the analytic, shapely-free [`Shape.contains`](Domain-and-Geometry.md) — in 2-D
 An axis-aligned 2-D rectangle or 3-D box can use a fast [structured grid](#structured-grid-fast-stencils)
 (`structured=True`) with direct finite-difference stencils in place of the unstructured mesh.
 
-**Planned:** periodic boundaries; composite / cut-cell structured geometry (axis-aligned rectangles and
-boxes are supported, above); 1-D meshes; transient / flux BCs on coupled multi-field systems. Authoring a `jno.Shape` sub-region
+A periodic tie `u(left) - u(right)` (opposite faces) wraps that axis on a
+[structured grid](#structured-grid-fast-stencils).
+
+**Planned:** periodic on unstructured meshes and periodic geometric multigrid (a periodic structured solve
+is currently un-preconditioned, so it is slow on fine grids); composite / cut-cell structured geometry
+(axis-aligned rectangles and boxes are supported, above); 1-D meshes; transient / flux BCs on coupled
+multi-field systems. Authoring a `jno.Shape` sub-region
 through `domain.region(name, shape)` + `d.variable`, and 3-D coupled solves, additionally need
 region-tag support on the base 3-D domain (a separate 3-D domain-decomposition feature). A pure-Neumann
 problem (no Dirichlet node anywhere) is singular — the solution is defined only up to an additive
