@@ -192,12 +192,28 @@ class DifferentialOperators:
     # ══════════════════════════════════════════════════════════════════
 
     @staticmethod
+    def _grid_second_diff(field: jnp.ndarray, h: float, axis: int) -> jnp.ndarray:
+        """Second derivative ``∂²/∂x_axis²`` of a field sampled on a **regular grid** — the 3-point
+        central stencil ``(u₊ − 2u + u₋)/h²`` in the interior, and a 3-point one-sided stencil at the two
+        ends so the result is defined everywhere. The outermost ring is 1st-order (the interior is
+        2nd-order); in a ``jno.fdm`` solve those boundary rows are overwritten by the Dirichlet/flux
+        conditions, so the edge order does not affect the solution. Fully differentiable / ``jit``-safe."""
+        u = jnp.moveaxis(jnp.asarray(field), axis, 0)
+        inv = 1.0 / (h * h)
+        d2 = jnp.zeros_like(u)
+        d2 = d2.at[1:-1].set((u[2:] - 2.0 * u[1:-1] + u[:-2]) * inv)  # central interior
+        d2 = d2.at[0].set((u[0] - 2.0 * u[1] + u[2]) * inv)  # forward one-sided
+        d2 = d2.at[-1].set((u[-1] - 2.0 * u[-2] + u[-3]) * inv)  # backward one-sided
+        return jnp.moveaxis(d2, 0, axis)
+
+    @staticmethod
     def compute_fd_gradient_2d_simple(
         u_values: jnp.ndarray,
         points: jnp.ndarray,
         triangles: jnp.ndarray,
         dim: int,
         method: str = "area_weighted",
+        grid: dict | None = None,
     ) -> jnp.ndarray:
         """Gradient on a 2-D triangular mesh.
 
@@ -208,10 +224,27 @@ class DifferentialOperators:
             dim:       Spatial dimension to differentiate (0 = x, 1 = y).
             method:    ``"area_weighted"`` (default), ``"uniform"``,
                        ``"inverse_distance"``, ``"least_squares"``.
+            grid:      Optional structured-grid descriptor
+                       ``{"shape": (Nx, Ny), "spacing": (hx, hy), ...}`` (from
+                       ``jno.domain(..., structured=True)``, node order
+                       ``idx(i, j) = i·Ny + j``). When given, the triangulation
+                       is bypassed and the derivative is the direct central
+                       finite difference on the regular grid (2nd-order
+                       interior, 1st-order one-sided edges, via ``jnp.gradient``)
+                       — the fast path ``jno.fdm`` takes on a structured grid;
+                       ``triangles``/``method`` are then ignored.
 
         Returns:
             ``∂u/∂x_dim`` at each point, shape ``(N,)``.
         """
+        if grid is not None:
+            # Promote against the mesh-coordinate dtype — exactly what the triangle path gets by
+            # multiplying the field against the float64 point coords: a float32 field lifts to float64
+            # under x64 (else it would clash with float64 coordinate BC values), and a *complex* field
+            # stays complex (jnp.result_type(complex, float64) = complex) instead of being silently
+            # cast to real. ``jnp.gradient``/roll stencils are themselves dtype-preserving.
+            U = jnp.asarray(u_values).astype(jnp.result_type(u_values, points)).reshape(grid["shape"])
+            return jnp.gradient(U, grid["spacing"][dim], axis=dim).reshape(-1)
         if method == "least_squares":
             return DifferentialOperators.compute_gradient_2d_lsq(u_values, points, triangles, dim)
 
@@ -327,6 +360,7 @@ class DifferentialOperators:
         triangles: jnp.ndarray,
         dims: tuple,
         method: str = "gradient_of_gradient",
+        grid: dict | None = None,
     ) -> jnp.ndarray:
         """Laplacian on a 2-D triangular mesh.
 
@@ -337,10 +371,25 @@ class DifferentialOperators:
             dims:      Spatial dimensions to sum over, e.g. ``(0, 1)``.
             method:    ``"gradient_of_gradient"`` (default), ``"cotangent"``,
                        or ``"lsq_of_gradient"``.
+            grid:      Optional structured-grid descriptor
+                       ``{"shape": (Nx, Ny), "spacing": (hx, hy), ...}`` (from
+                       ``jno.domain(..., structured=True)``). When given, ``Δu``
+                       is the direct 5-point finite-difference stencil
+                       ``Σ_d (u₊ − 2u + u₋)/h_d²`` on the regular grid — the fast
+                       path ``jno.fdm`` takes on a structured mesh; the
+                       triangulation and ``method`` are then ignored. (On a
+                       uniform right-triangulation this is exactly what the
+                       ``"cotangent"`` operator computes, but assembly-free.)
 
         Returns:
             Laplacian, shape ``(N,)``.
         """
+        if grid is not None:
+            U = jnp.asarray(u_values).astype(jnp.result_type(u_values, points)).reshape(grid["shape"])  # coord precision
+            out = jnp.zeros_like(U)
+            for d in dims:
+                out = out + DifferentialOperators._grid_second_diff(U, grid["spacing"][d], d)
+            return out.reshape(-1)
         if method == "cotangent":
             return DifferentialOperators.compute_laplacian_2d_cotangent(u_values, points, triangles)
         if method == "lsq_of_gradient":
@@ -448,6 +497,7 @@ class DifferentialOperators:
         points: jnp.ndarray,
         triangles: jnp.ndarray,
         var_dims: list,
+        grid: dict | None = None,
     ) -> jnp.ndarray:
         """Hessian on a 2-D triangular mesh (area-weighted FD).
 
@@ -456,12 +506,42 @@ class DifferentialOperators:
             points:    Coordinates, shape ``(N, 2)``.
             triangles: Triangle connectivity, shape ``(M, 3)``.
             var_dims:  List of ``(i, vi_dim, j, vj_dim)`` tuples.
+            grid:      Optional structured-grid descriptor (from
+                       ``jno.domain(..., structured=True)``). When given, the
+                       second derivatives are the direct grid stencils
+                       (``∂²/∂x²``, ``∂²/∂y²`` central; the mixed ``∂²/∂x∂y`` a
+                       nested central difference) instead of the triangulation
+                       — the fast path for e.g. ``u.d2(x)`` on a structured mesh.
 
         Returns:
             Hessian, shape ``(N, n_vars, n_vars)``.
         """
         N = points.shape[0]
         n_vars = int(jnp.sqrt(len(var_dims)))
+
+        if grid is not None:
+            U = jnp.asarray(u_values).astype(jnp.result_type(u_values, points)).reshape(grid["shape"])  # coord precision
+            sp = grid["spacing"]
+            # Compute ONLY the second-derivative components the caller asks for (``u.d2(x)`` needs just
+            # ``∂²/∂x²``). Materializing an unused ``∂²/∂x∂y`` leaves a dead branch that corrupts the
+            # reverse-mode JVP of the solve, so build each component on demand and memoize it.
+            comps: dict = {}
+
+            def _component(a, b):
+                key = (a, b) if a <= b else (b, a)
+                if key not in comps:
+                    if key[0] == key[1]:
+                        comps[key] = DifferentialOperators._grid_second_diff(U, sp[key[0]], key[0]).reshape(-1)
+                    else:  # mixed partial: nested central difference
+                        comps[key] = jnp.gradient(
+                            jnp.gradient(U, sp[key[0]], axis=key[0]), sp[key[1]], axis=key[1]
+                        ).reshape(-1)
+                return comps[key]
+
+            result = jnp.zeros((N, n_vars, n_vars))
+            for i, vi_dim, j, vj_dim in var_dims:
+                result = result.at[:, i, j].set(_component(vi_dim, vj_dim))
+            return result
 
         grad_x = DifferentialOperators.compute_fd_gradient_2d_simple(u_values, points, triangles, 0)
         grad_y = DifferentialOperators.compute_fd_gradient_2d_simple(u_values, points, triangles, 1)
