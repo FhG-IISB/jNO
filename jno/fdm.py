@@ -31,14 +31,15 @@ affine in the normal derivative** ``∂u/∂n`` written with that region's bound
 from the mesh boundary **segments in 2-D** (a corner node — undefined normal — falls back to the PDE
 residual) and boundary **faces in 3-D** (each oriented outward exactly via its owning tet's apex, so a
 flat face gives an exact axis normal, no corner heuristic). Plus **transient** problems by
-method-of-lines (``M = I``;
-a unit-coefficient ``u.t`` term, e.g. ``ui.t - νΔu``) — all with linear + nonlinear residuals, and with
+method-of-lines with a ``u.t`` term carrying a **unit or a general ``c(x)·u.t`` mass coefficient** (e.g.
+``ρcₚ(x)·ui.t - νΔu``; the coefficient is extracted by a two-probe ``c = F(u.t=1) − F(u.t=0)`` and carried
+as ``M = diag(c)``, a nonlinear ``c(u)`` fails loud) — all with linear + nonlinear residuals, and with
 the time scheme selectable via ``.solve(time=…)`` exactly as ``fem.solve(time=…)`` (``jno.solve.theta``
 for backward Euler / Crank–Nicolson, ``jno.solve.adaptive``; backward Euler by default — the exponential
 integrator needs a linear block the matrix-free residual doesn't assemble, so it fails loud). **Flux BCs
 compose with transient too** — a flux node becomes an algebraic zero-mass-row constraint imposing the
-same ``a·(∇u·n) + b`` at each instant (its value slaved to the interior via the flux). Periodic and a
-general ``u.t`` mass coefficient are planned extensions (see ``plans/fdm-solver.md``). A pure-Neumann
+same ``a·(∇u·n) + b`` at each instant (its value slaved to the interior via the flux). Periodic boundaries
+are a planned extension (see ``plans/fdm-solver.md``). A pure-Neumann
 problem (no Dirichlet node) is singular (solution up to a constant) and is solved as-is.
 
 **Structured grid.** ``jno.domain(jno.Shape.rect(x0, y0, x1, y1, size=h), structured=True)`` (2-D) or
@@ -355,26 +356,31 @@ def _mesh_nodes_in(pts, geom):
     return np.nonzero(mask)[0].astype(int)
 
 
-def _zero_temporal(node):
-    """Strong-form method-of-lines split: drop the ``u.t`` (:class:`TemporalDerivative`) terms, leaving
-    the **spatial** residual ``R_spatial``. The semidiscrete form ``M u̇ + R_spatial = 0`` (collocation
-    ⇒ ``M = I``) then reads ``u̇ = -R_spatial`` — e.g. ``u.t - νΔu`` ⟶ ``-νΔu`` ⟹ ``u̇ = νΔu``. This
-    mirrors fem's :func:`_strip_temporal_trial_derivative` (which folds ``d/dt(u)·φ`` into the mass
-    operator); here ``M = I`` carries ``u̇`` so the term is dropped outright. v1 assumes a **unit
-    coefficient** on ``u.t`` (the standard ``u.t - 𝒩(u)`` form); a general mass coefficient is future work."""
+def _set_temporal(node, val):
+    """Replace every ``u.t`` (:class:`TemporalDerivative`) in ``node`` with the constant ``val``, leaving
+    the rest of the expression intact. Two probes recover, for a residual ``F(u.t, u) = c·u.t + R_spatial``
+    affine in the time derivative, the **spatial** residual ``R_spatial = F(u.t=0)`` and the **mass
+    coefficient** ``c = F(u.t=1) − F(u.t=0)`` — so a general ``c(x)·u.t`` term (variable material, e.g.
+    ``ρcₚ(x)·u.t``) is handled without parsing its structure, exactly as ``_set_normal`` handles a flux."""
     from .trace import BinaryOp, FunctionCall, Hessian, Jacobian, Literal, Placeholder, TemporalDerivative
 
     if isinstance(node, TemporalDerivative):
-        return Literal(0.0)
+        return Literal(float(val))
     if isinstance(node, BinaryOp):
-        return BinaryOp(node.op, _zero_temporal(node.left), _zero_temporal(node.right))
+        return BinaryOp(node.op, _set_temporal(node.left, val), _set_temporal(node.right, val))
     if isinstance(node, FunctionCall):
-        return node.copy_with_args([_zero_temporal(a) if isinstance(a, Placeholder) else a for a in node.args])
+        return node.copy_with_args([_set_temporal(a, val) if isinstance(a, Placeholder) else a for a in node.args])
     if isinstance(node, Jacobian):
-        return Jacobian(_zero_temporal(node.target), node.variables, node.scheme)
+        return Jacobian(_set_temporal(node.target, val), node.variables, node.scheme)
     if isinstance(node, Hessian):
-        return Hessian(_zero_temporal(node.target), node.variables, node.scheme, node.trace)
+        return Hessian(_set_temporal(node.target, val), node.variables, node.scheme, node.trace)
     return node
+
+
+def _zero_temporal(node):
+    """Drop the ``u.t`` terms (``_set_temporal(node, 0)``) → the spatial residual ``R_spatial`` for the
+    method-of-lines split ``M u̇ + R_spatial = 0``."""
+    return _set_temporal(node, 0.0)
 
 
 def _normal_jacobian(node):
@@ -566,6 +572,45 @@ class _TraceFDM:
             return blocks[0] if len(blocks) == 1 else jnp.concatenate(blocks)
 
         return residual_fn
+
+    def _mass_coefficient(self):
+        """Per-node coefficient ``c`` on ``u.t`` (the diagonal mass ``M = diag(c)``), via the two-probe
+        ``c = F(u.t=1) − F(u.t=0)`` (:func:`_set_temporal`) — the spatial residual cancels between the
+        probes, leaving ``c``. A plain ``ui.t - 𝒩(u)`` gives ``c = 1``; a ``ρcₚ(x)·ui.t`` term gives the
+        node values of ``ρcₚ(x)``. ``c`` must be constant in ``u`` (a nonlinear mass ``c(u)·u.t`` raises).
+        Single-field only (the transient march is)."""
+        import equinox as eqx
+
+        from .trace_evaluator import TraceEvaluator
+
+        expr = self._pde[0]
+        for c in self._pde[1:]:
+            expr = expr + c
+        expr = _unwrap(expr)
+        spatial_tags = {
+            v.tag
+            for c in self._pde
+            for v in (getattr(c, "_coord_vars", None) or {}).values()
+            if getattr(v, "axis", None) != "temporal"
+        }
+        context = {t: self._pts for t in spatial_tags}
+        lid, base = self.unknown.layer_id, self.unknown.module
+
+        def probe(u_val):
+            def at(temporal):
+                mod = eqx.tree_at(lambda m: m.value, base, jnp.full(self._N, u_val, base.value.dtype))
+                ev = TraceEvaluator(params={lid: mod})
+                return jnp.asarray(ev.evaluate(_set_temporal(expr, temporal), context=context, var_bindings={})).reshape(-1)
+
+            return at(1.0) - at(0.0)
+
+        c0 = probe(0.0)
+        if not bool(jnp.allclose(c0, probe(1.0), atol=1e-6, rtol=1e-6)):  # u-dependence ⇒ nonlinear mass
+            raise ValueError(
+                "jno.fdm([...]): the `u.t` mass coefficient depends on u (a nonlinear mass `c(u)·u.t`) — v1 "
+                "supports a constant or coordinate-dependent `c(x)·u.t` only."
+            )
+        return c0
 
     def _trainable_params(self):
         """**Trainable** ``jno.np.parameter`` fields in the constraints — a parameter with an attached
@@ -926,8 +971,9 @@ class _TraceFDM:
         bmask, bvals, algebraic = jnp.asarray(bmask), jnp.asarray(bvals), jnp.asarray(algebraic)
 
         spatial_res = self._pde_residual_fn(spatial=True)
+        c_nodes = self._mass_coefficient()  # u.t coefficient: 1 for a plain u.t, c(x) for ρcₚ(x)·u.t
         diag = jnp.stack([jnp.arange(self._N), jnp.arange(self._N)], axis=1)
-        M = jsparse.BCOO((jnp.where(algebraic, 0.0, 1.0), diag), shape=(self._N, self._N))  # 0 mass: Dirichlet+flux
+        M = jsparse.BCOO((jnp.where(algebraic, 0.0, c_nodes), diag), shape=(self._N, self._N))  # 0: Dirichlet+flux
 
         def residual(wn, t, args):  # M u̇ + R = 0 → interior u̇ = -R_spatial; flux/Dirichlet rows algebraic
             r = spatial_res(wn)
