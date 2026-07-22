@@ -87,7 +87,12 @@ no term.
 > **⚠️ Experimental.** Validated on 2-D triangular meshes at lowest order (RT₀ / N1E₀); the API may
 > still change. Steady-linear, steady-nonlinear (Newton), and transient `M u̇ + A u = c` (including the
 > mixed/saddle DAE, e.g. transient Darcy) all work, as does the differentiable `fem.solve()` inverse
-> (a **scalar** or spatially-varying **P1 field** `k(x)` in a *volume* term, steady and transient).
+> (a **scalar** or spatially-varying **P1 field** `k(x)` in a *volume* term, steady and transient). Every
+> edge/cell (RT/N1E/P0) operator — the steady `A`, and the transient **mass `M` and spatial `A`** (also when
+> re-assembled per step for a parametric march) — is assembled **sparsely, one element at a time** (a `BCOO`,
+> mirroring the native Lagrange assembler), never a dense global `jacfwd`; the mixed-DAE initial state is
+> projected by a matrix-free CG on the (SPD) field mass block. So a 3-D N1E **eddy-current / time-domain
+> Maxwell** transient scales instead of hitting the `O(n_dof²)` dense-assembly wall past ~10⁴ edges.
 >
 > **3-D Nédélec (H(curl)) is supported** on a **tetrahedral** mesh: the first-kind `"N1E"` element
 > assembles the H(curl) **mass and curl-curl** forms (`inner(u, v) + inner(u.vector.curl(x,y,z),

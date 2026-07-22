@@ -137,7 +137,13 @@ def assemble_fem_nonnodal(
         raviart_thomas_triangle,
     )
     from .fem_topology import build_edge_topology
-    from .fem_utils import _infer_fields, _lower_statefield_to_trial, _test_field_index
+    from .fem_utils import (
+        _infer_fields,
+        _lower_statefield_to_trial,
+        _test_field_index,
+        bcoo_set_dirichlet_rows,
+        bcoo_zero_rows_cols,
+    )
     from .weak_form import (
         _apply_sign,
         _contains_temporal_derivative,
@@ -696,6 +702,110 @@ def assemble_fem_nonnodal(
         pins = list(dict(pins).items())
     zeros = jnp.zeros(total)
 
+    # --- SPARSE per-element assembly of a linear operator from a bare-term list -------------------------
+    # Edge/cell DOF families (N1E, RT, P0) assemble one element at a time: each cell's block is ``jacfwd`` of
+    # its ELEMENT residual w.r.t. that cell's LOCAL dofs — an ``(n_test, n_local_all)`` block — scattered as
+    # COO triplets into a BCOO. A single global ``jacfwd`` instead materialises an ``O(n_dof × n_cells)``
+    # tangent tensor that overflows the 2³¹ XLA element limit past ~10⁴ edges. Mirrors the native (Lagrange)
+    # assembler ``fem_native._make_jacobian``, and is the ONE assembler behind the steady operator A(args),
+    # the transient block mass M, and the transient spatial operator A — so a 3-D vector transient (eddy
+    # currents, time-domain Maxwell) marches sparse instead of hitting the dense-assembly wall.
+    def _make_sparse_assembler(term_source):
+        """Return ``assemble(args=None, *, surface=True) -> BCOO`` for the bare weak terms ``term_source``.
+
+        Only the element data and the tangential-trace surface-mass values depend on ``args``; the BCOO
+        row/col PATTERN depends only on the mesh connectivity, so it is built ONCE here (host-static) rather
+        than on every ``assemble(args)`` — i.e. every optimizer step of an inverse solve AND every implicit
+        time step of a parametric march. ``surface=False`` omits the surface mass (used for the pure temporal
+        MASS block, which carries no boundary impedance)."""
+        import jax.experimental.sparse as _jsparse
+
+        _typed = []  # (lowered coeff, test-field index, region-mask names) — identical typing to `_make_residual`
+        if not has_vertex:
+            for _bare_term in term_source:
+                for _sign, _sub in _split_additive_terms(domain, _bare_term):
+                    _coeff = _lower_statefield_to_trial(_apply_sign(domain, _sign, _sub), {})
+                    _tfi = _test_field_index(_coeff, field_index)
+                    if _tfi is None:
+                        raise ValueError("jno.fem (non-nodal): each weak term must contain exactly one test field.")
+                    _typed.append((_coeff, _tfi, tuple(sorted(_collect_region_mask_names(_coeff)))))
+
+        _cell_all_dofs = jnp.concatenate([cdofs[i] for i in range(len(fields))], axis=1)  # (n_cells, n_local_all)
+        _field_splits = list(np.cumsum([0] + [int(cdofs[i].shape[1]) for i in range(len(fields))]))
+        _asm_zero_field = jnp.zeros((n_verts,), dtype=zeros.dtype)  # placeholder for an absent field parameter
+        _asm_local_zero = jnp.zeros((n_cells, _cell_all_dofs.shape[1]), zeros.dtype)  # assemble at u=0 (linear)
+        _vol_rows_l, _vol_cols_l = [], []
+        for _cf_p, _tfi_p, _rn_p in _typed:
+            _kshape = (n_cells, int(cdofs[_tfi_p].shape[1]), _cell_all_dofs.shape[1])  # (n_cells, n_test, n_local_all)
+            _vol_rows_l.append(jnp.broadcast_to(cdofs[_tfi_p][:, :, None], _kshape).reshape(-1))
+            _vol_cols_l.append(jnp.broadcast_to(_cell_all_dofs[:, None, :], _kshape).reshape(-1))
+        _vol_idx = (
+            jnp.stack(
+                [jnp.concatenate(_vol_rows_l).astype(jnp.int32), jnp.concatenate(_vol_cols_l).astype(jnp.int32)], axis=1
+            )
+            if _vol_rows_l
+            else jnp.zeros((0, 2), jnp.int32)
+        )
+
+        def assemble(args=None, *, surface=True):
+            _a = args or {}
+            rt_scalar = {
+                name: jnp.reshape(jnp.asarray(_a.get(name, 0.0), dtype=zeros.dtype), (-1,))[:1]
+                for name in runtime_parameter_tags
+                if name not in _field_param_names
+            }
+            field_vals = {
+                name: jnp.asarray(_a.get(name, _asm_zero_field), dtype=zeros.dtype) for name in _field_param_names
+            }
+            _nt = neural_local_table(_neural, args)
+
+            def _elem_res(c, la, coeff, tfi, rnames):
+                """This cell's element residual (n_test of field ``tfi``,) from its local dof vector ``la``."""
+                cell_sols = [la[_field_splits[i] : _field_splits[i + 1]] for i in range(len(fields))]
+                per, xq, meas = _cell_fields(c, cell_sols)
+                vol_vars = tuple(
+                    (field_vals[name][cells_j[c]] if name in _field_param_names else rt_scalar[name])
+                    for name in runtime_parameter_tags
+                )
+                local = {
+                    "physical_quad_points": xq,
+                    "fields": per,
+                    "field_index": field_index,
+                    "tag": "fem_gauss",
+                    "surface": False,
+                    "domain_context": ctx,
+                    "temporal_tags": (),
+                    "runtime_parameter_tags": runtime_parameter_tags,
+                    "region_mask_names": rnames,
+                    "volume_vars": vol_vars + _cell_masks(c, rnames),
+                }
+                if _field_param_names:  # P1 basis to interpolate a field parameter (top-level, param-only key)
+                    local["shape_vals"] = p1_shape_vals
+                if _nt is not None:  # trainable nets ride args (crux weights); frozen/placeholder -> stored
+                    local["neural_coefficients"] = _nt
+                return _integrate_term(domain, coeff, local, qw * meas)
+
+            data_l = []  # only the element data is args-dependent; the (row, col) pattern is `_vol_idx`
+            for coeff, tfi, rnames in _typed:
+
+                def _ke(c, la, _e=coeff, _t=tfi, _rn=rnames):
+                    return jax.jacfwd(lambda v: _elem_res(c, v, _e, _t, _rn))(la)
+
+                Ke = jax.vmap(_ke)(jnp.arange(n_cells), _asm_local_zero)  # (n_cells, n_test_tfi, n_local_all)
+                data_l.append(Ke.reshape(-1))
+
+            data = jnp.concatenate(data_l) if data_l else jnp.zeros((0,), zeros.dtype)
+            # Tangential-trace surface mass (impedance BC), re-evaluated per args. Taken SPARSE: densifying it
+            # would cost O(n_dof²) just to re-sparsify, the memory wall for a 3-D vector run.
+            sm = _surf_mass_of(args, sparse=True) if surface else None
+            if sm is None:
+                return _jsparse.BCOO((data, _vol_idx), shape=(total, total))
+            idx = jnp.concatenate([_vol_idx, sm.indices], axis=0)  # BCOO sums duplicate (i, j) on materialisation
+            data = jnp.concatenate([data, sm.data])
+            return _jsparse.BCOO((data, idx), shape=(total, total))
+
+        return assemble
+
     # === transient: M u̇ + A u = c (mirrors fem_1d._assemble_1d_transient) -- split the temporal term
     #     (∫ ∂ₜu·v -> mass M) from the spatial operator, project the IC onto the edge DOFs, time-block it. ===
     if ic_residuals or any(_contains_temporal_derivative(t) for t in volume_terms):
@@ -838,7 +948,18 @@ def assemble_fem_nonnodal(
                 )
             return block, "transient", [0, n, 2 * n]
 
-        M = jax.jacfwd(_make_residual([_strip_temporal_trial_derivative(t) for t in temporal]))(zeros)  # block mass
+        # Block mass M and spatial operator A: assemble the edge/cell DOF families (N1E/RT/P0) SPARSELY (per
+        # element, BCOO) so a 3-D vector transient never forms the dense global jacfwd — the eddy-current /
+        # time-domain-Maxwell OOM (the ``O(n_dof × n_cells)`` tangent overflows the 2³¹ XLA limit past ~10⁴
+        # edges). ``spatial_res`` (a cheap O(n) residual eval) still supplies the RHS load and the nonlinear
+        # residual; only the operator MATRICES go sparse. Vertex C0/C1 families keep the dense path (small 2-D).
+        _strip_mass = [_strip_temporal_trial_derivative(t) for t in temporal]
+        if not has_vertex:
+            _assemble_spatial = _make_sparse_assembler(spatial)
+            M = _make_sparse_assembler(_strip_mass)(None, surface=False)  # BCOO mass — no impedance on the u̇ term
+        else:
+            _assemble_spatial = None  # C0/C1 vertex families: dense global jacfwd below
+            M = jax.jacfwd(_make_residual(_strip_mass))(zeros)  # block mass (dense, small 2-D)
         spatial_res = _make_residual(spatial)
         t0, t1, dt = _infer_time_window(domain)
         common = dict(
@@ -879,6 +1000,16 @@ def assemble_fem_nonnodal(
             local = (cdofs[fidx] - offs[fidx]).reshape(-1)  # field-local DOFs (ce for RT/N1E, cell index for P0)
             load = jnp.zeros(offs[fidx + 1] - offs[fidx]).at[local].add(jax.vmap(_ic_cell)(jnp.arange(n_cells)).reshape(-1))
             sl = slice(offs[fidx], offs[fidx + 1])
+            if hasattr(M, "indices"):  # BCOO mass: solve the (SPD) field mass block matrix-free — never slice/
+                #   densify the block (that is the very O(n²) wall the sparse assembly avoids). The mass block is
+                #   block-diagonal in the field, so ``(M @ embed(x))[sl] == M_block @ x``; CG is exact-to-tol.
+                nblk = offs[fidx + 1] - offs[fidx]
+
+                def _mv(x, _sl=sl):
+                    return (M @ jnp.zeros((total,), zeros.dtype).at[_sl].set(x))[_sl]
+
+                block_sol, _ = jax.scipy.sparse.linalg.cg(_mv, load, tol=1e-12, atol=0.0, maxiter=nblk + 50)
+                return fidx, block_sol
             return fidx, jnp.linalg.solve(M[sl, sl], load)  # the differential field's mass block is non-singular
 
         state0 = zeros
@@ -890,8 +1021,15 @@ def assemble_fem_nonnodal(
         pin_dofs = jnp.asarray([p[0] for p in pins], dtype=jnp.int32) if pins else None
         if any(_is_obviously_nonlinear_in_unknown(domain, t) for t in spatial):
             # nonlinear transient: M(t) u̇ + R(u) = 0 (matrix-free Newton-Krylov per step). Natural load
-            # folds into R; essential pins are residual rows + zeroed M rows/cols (the 1D pattern).
-            M_nl = M if pin_dofs is None else M.at[pin_dofs, :].set(0.0).at[:, pin_dofs].set(0.0)
+            # folds into R; essential pins are residual rows + zeroed M rows/cols (the 1D pattern). The mass is
+            # BCOO for edge/cell families (kept sparse through the step matvec); dense for C¹ vertex families.
+            M_nl = (
+                M
+                if pin_dofs is None
+                else bcoo_zero_rows_cols(M, pin_dofs)
+                if hasattr(M, "indices")
+                else M.at[pin_dofs, :].set(0.0).at[:, pin_dofs].set(0.0)
+            )
             if runtime_parameter_tags or neural_param_names:  # transient inverse: thread args through res + jac
 
                 def res_pt(u, t, args=None):
@@ -919,8 +1057,14 @@ def assemble_fem_nonnodal(
             return block, "transient", offs
 
         if runtime_parameter_tags or neural_param_names:  # linear transient inverse: A(args) re-assembled each
-            #   step; dense Dirichlet row-replacement inside operator_fn (dense analogue of bcoo_set_dirichlet_rows).
-            M_bc = M if pin_dofs is None else M.at[pin_dofs, :].set(0.0).at[:, pin_dofs].set(0.0)
+            #   step (SPARSELY for edge/cell families), Dirichlet rows -> identity via `bcoo_set_dirichlet_rows`.
+            M_bc = (
+                M
+                if pin_dofs is None
+                else bcoo_zero_rows_cols(M, pin_dofs)
+                if hasattr(M, "indices")
+                else M.at[pin_dofs, :].set(0.0).at[:, pin_dofs].set(0.0)
+            )
             c_bias = zeros if pin_dofs is None else zeros.at[pin_dofs].set(jnp.asarray([p[1] for p in pins]))
             free_mask = (
                 jnp.ones((total,), dtype=zeros.dtype)
@@ -928,8 +1072,11 @@ def assemble_fem_nonnodal(
                 else jnp.ones((total,), dtype=zeros.dtype).at[pin_dofs].set(0.0)
             )
 
-            def operator_fn(t, args=None, _d=pin_dofs, _sm=surf_mass):
-                A = jax.jacfwd(lambda u: spatial_res(u, args))(zeros)
+            def operator_fn(t, args=None, _d=pin_dofs, _sm=surf_mass, _asm=_assemble_spatial):
+                if _asm is not None:  # edge/cell families: per-element sparse A(args), folds in the surface mass
+                    A = _asm(args)
+                    return A if _d is None else bcoo_set_dirichlet_rows(A, _d)  # Dirichlet rows -> identity
+                A = jax.jacfwd(lambda u: spatial_res(u, args))(zeros)  # C¹ vertex families: dense (small 2-D)
                 if _sm is not None:  # N1E tangential-trace surface mass (impedance) → the spatial operator A
                     A = A + _sm
                 return A if _d is None else A.at[_d, :].set(0.0).at[_d, _d].set(1.0)  # Dirichlet rows -> identity
@@ -951,10 +1098,16 @@ def assemble_fem_nonnodal(
                 offs,
             )
 
-        # linear transient: M u̇ + A u = c
-        A = jax.jacfwd(spatial_res)(zeros)
-        if surf_mass is not None:  # N1E tangential-trace surface mass (impedance) → the spatial operator A
-            A = A + surf_mass
+        # linear transient: M u̇ + A u = c. Edge/cell families assemble A SPARSELY (BCOO, folds in the surface
+        # mass); vertex families keep the dense jacfwd. `_apply_dirichlet_transient` is BCOO-aware (a sparse M/A
+        # stays sparse) and the SemidiscreteTimeBlock applies M/A only as matvecs — so a large 3-D vector
+        # transient marches without ever densifying the operator (the eddy-current / time-domain-Maxwell fix).
+        if _assemble_spatial is not None:
+            A = _assemble_spatial(None)  # BCOO; the tangential-trace surface mass is folded in by the assembler
+        else:
+            A = jax.jacfwd(spatial_res)(zeros)  # C¹ vertex families: dense (small 2-D)
+            if surf_mass is not None:  # N1E tangential-trace surface mass (impedance) → the spatial operator A
+                A = A + surf_mass
         c = -spatial_res(zeros) + nat_load  # spatial load + natural-BC constant load
         M, A, c = _apply_dirichlet_transient(M, A, c, pins)  # essential edge-trace pins -> M/A/c rows
         return SemidiscreteTimeBlock(M=M, A=A, affine_bias=c, **common), "transient", offs
@@ -964,105 +1117,13 @@ def assemble_fem_nonnodal(
     def full_residual(u_flat, args=None):  # the natural BC is a constant load on the RHS: R(u) = assembled(u) - load
         return residual(u_flat, args) - nat_load
 
-    # --- SPARSE per-element assembly of the steady linear operator A(args) -------------------------------
-    # Edge/cell DOF families (N1E, RT, P0) assemble one element at a time: each cell's block is ``jacfwd`` of
-    # its ELEMENT residual w.r.t. that cell's LOCAL dofs — an ``(n_test, n_local_all)`` block — scattered as
-    # COO triplets into a BCOO. A single global ``jacfwd(full_residual)`` instead materialises an
-    # ``O(n_dof × n_cells)`` tangent tensor that overflows the 2³¹ XLA element limit past ~10⁴ edges.
-    #
-    # ``args`` threads the runtime parameters exactly as ``_make_residual.residual`` does, so the PARAMETRIC
-    # (inverse) path assembles sparsely too — that path used to take the dense global ``jacfwd``, which put a
-    # ~10⁴-edge ceiling on 3-D vector inverse design and re-ran on every optimizer step. ``args=None`` with no
-    # runtime parameters reduces to the non-parametric assembly exactly (empty tags → empty volume_vars).
-    # Mirrors the native (Lagrange) assembler ``fem_native._make_jacobian``.
-    _sparse_typed = []  # (lowered coeff, test-field index) — same typing as `_make_residual`
-    if not has_vertex:
-        for _bare_term in volume_terms:
-            for _sign, _sub in _split_additive_terms(domain, _bare_term):
-                _coeff = _lower_statefield_to_trial(_apply_sign(domain, _sign, _sub), {})
-                _tfi = _test_field_index(_coeff, field_index)
-                if _tfi is None:
-                    raise ValueError("jno.fem (non-nodal): each weak term must contain exactly one test field.")
-                _sparse_typed.append((_coeff, _tfi, tuple(sorted(_collect_region_mask_names(_coeff)))))
-
-    # Host-static assembly scaffold: the per-cell dof layout and the BCOO row/col PATTERN depend only on the
-    # mesh connectivity, never on ``args`` — so build them ONCE here rather than on every
-    # ``_assemble_sparse_A(args)`` (i.e. every optimizer step of an inverse solve). Only the element data
-    # ``Ke`` and the surface-mass values are args-dependent; the volume pattern rides ``_vol_idx``.
-    _cell_all_dofs = jnp.concatenate([cdofs[i] for i in range(len(fields))], axis=1)  # (n_cells, n_local_all)
-    _field_splits = list(np.cumsum([0] + [int(cdofs[i].shape[1]) for i in range(len(fields))]))
-    _asm_zero_field = jnp.zeros((n_verts,), dtype=zeros.dtype)  # placeholder for an absent field parameter
-    _asm_local_zero = jnp.zeros((n_cells, _cell_all_dofs.shape[1]), zeros.dtype)  # assemble at u=0 (linear)
-    _vol_rows_l, _vol_cols_l = [], []
-    for _cf_p, _tfi_p, _rn_p in _sparse_typed:
-        _kshape = (n_cells, int(cdofs[_tfi_p].shape[1]), _cell_all_dofs.shape[1])  # (n_cells, n_test, n_local_all)
-        _vol_rows_l.append(jnp.broadcast_to(cdofs[_tfi_p][:, :, None], _kshape).reshape(-1))
-        _vol_cols_l.append(jnp.broadcast_to(_cell_all_dofs[:, None, :], _kshape).reshape(-1))
-    _vol_idx = (
-        jnp.stack([jnp.concatenate(_vol_rows_l).astype(jnp.int32), jnp.concatenate(_vol_cols_l).astype(jnp.int32)], axis=1)
-        if _vol_rows_l
-        else jnp.zeros((0, 2), jnp.int32)
-    )
-
-    def _assemble_sparse_A(args=None):
-        """The steady linear operator ``A(args)`` as a BCOO, assembled per element. Only the element data and
-        the surface-mass values depend on ``args``; the row/col pattern is the host-static scaffold above."""
-        import jax.experimental.sparse as _jsparse
-
-        _a = args or {}
-        rt_scalar = {
-            name: jnp.reshape(jnp.asarray(_a.get(name, 0.0), dtype=zeros.dtype), (-1,))[:1]
-            for name in runtime_parameter_tags
-            if name not in _field_param_names
-        }
-        field_vals = {name: jnp.asarray(_a.get(name, _asm_zero_field), dtype=zeros.dtype) for name in _field_param_names}
-        _nt = neural_local_table(_neural, args)
-
-        def _elem_res(c, la, coeff, tfi, rnames):
-            """This cell's element residual (n_test of field ``tfi``,) from its local dof vector ``la``."""
-            cell_sols = [la[_field_splits[i] : _field_splits[i + 1]] for i in range(len(fields))]
-            per, xq, meas = _cell_fields(c, cell_sols)
-            vol_vars = tuple(
-                (field_vals[name][cells_j[c]] if name in _field_param_names else rt_scalar[name])  # field: vertex values
-                for name in runtime_parameter_tags
-            )
-            local = {
-                "physical_quad_points": xq,
-                "fields": per,
-                "field_index": field_index,
-                "tag": "fem_gauss",
-                "surface": False,
-                "domain_context": ctx,
-                "temporal_tags": (),
-                "runtime_parameter_tags": runtime_parameter_tags,
-                "region_mask_names": rnames,
-                "volume_vars": vol_vars + _cell_masks(c, rnames),
-            }
-            if _field_param_names:  # P1 basis to interpolate a field parameter (top-level, param-only key)
-                local["shape_vals"] = p1_shape_vals
-            if _nt is not None:  # trainable nets ride args (crux weights); frozen/placeholder -> stored
-                local["neural_coefficients"] = _nt
-            return _integrate_term(domain, coeff, local, qw * meas)
-
-        data_l = []  # only the element data is args-dependent; the (row, col) pattern is `_vol_idx`
-        for coeff, tfi, rnames in _sparse_typed:
-
-            def _ke(c, la, _e=coeff, _t=tfi, _rn=rnames):
-                return jax.jacfwd(lambda v: _elem_res(c, v, _e, _t, _rn))(la)
-
-            Ke = jax.vmap(_ke)(jnp.arange(n_cells), _asm_local_zero)  # (n_cells, n_test_tfi, n_local_all)
-            data_l.append(Ke.reshape(-1))
-
-        data = jnp.concatenate(data_l) if data_l else jnp.zeros((0,), zeros.dtype)
-        # Tangential-trace surface mass (impedance BC), re-evaluated per args. Taken SPARSE: densifying it
-        # would cost O(n_dof²) just to re-sparsify, the memory wall for a 3-D vector run. Its pattern rides
-        # its own BCOO indices (which the surface assembler still rebuilds — a further hoist opportunity).
-        sm = _surf_mass_of(args, sparse=True)
-        if sm is None:
-            return _jsparse.BCOO((data, _vol_idx), shape=(total, total))
-        idx = jnp.concatenate([_vol_idx, sm.indices], axis=0)  # BCOO sums duplicate (i, j) on materialisation
-        data = jnp.concatenate([data, sm.data])
-        return _jsparse.BCOO((data, idx), shape=(total, total))
+    # Steady operator A(args): assemble the RT/N1E/P0 edge & cell DOF families SPARSELY, one element at a time
+    # (never a dense global ``jacfwd``) — the SAME ``_make_sparse_assembler`` that backs the transient mass and
+    # spatial split above. ``args`` threads the runtime parameters so the PARAMETRIC (inverse) path assembles
+    # sparsely too (it used to take the dense global jacfwd — a ~10⁴-edge ceiling on 3-D vector inverse design,
+    # re-run every optimizer step); ``args=None`` reduces to the non-parametric assembly exactly. Vertex C0/C1
+    # families keep the dense path below (their Hessian-shape element assembly is not ported; small 2-D problems).
+    _assemble_sparse_A = _make_sparse_assembler(volume_terms)
 
     # --- steady nonlinear: a genuinely nonlinear weak term -> a Newton residual operator ---
     if any(_is_obviously_nonlinear_in_unknown(domain, t) for t in volume_terms):
