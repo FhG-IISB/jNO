@@ -433,7 +433,7 @@ class _FakeExposure:  # a stub exposure carrying a prescribed bulk image, for te
     def __init__(self, bulk, period):
         self._bulk, self.period = bulk, period
 
-    def bulk(self, film):
+    def bulk(self, film, source_chunk=None):  # mirror _Exposure.bulk -- CAResist forwards source_chunk
         return self._bulk
 
 
