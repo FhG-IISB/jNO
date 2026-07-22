@@ -4219,7 +4219,7 @@ packages:
   size: 24190
   timestamp: 1779159948016
 - pypi: .
-  name: jax-neural-operators
+  name: jax-numerical-operators
   requires_dist:
   - jax[cuda]>=0.10.1,<0.11
   - equinox>=0.11.0

@@ -12,7 +12,7 @@ Modal Method, imported **lazily** — the core `jno` install does not pull it in
 the `rcwa` extra:
 
 ```bash
-pip install jax-neural-operators[rcwa]      # or:  pixi run -e rcwa ...
+pip install jax-numerical-operators[rcwa]      # or:  pixi run -e rcwa ...
 ```
 
 ## The front door — infer the problem from a jNO constraint list

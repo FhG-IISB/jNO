@@ -99,7 +99,7 @@ try:
     from importlib.metadata import PackageNotFoundError
     from importlib.metadata import version as _version
 
-    __version__ = _version("jax-neural-operators")
+    __version__ = _version("jax-numerical-operators")
 except (ImportError, PackageNotFoundError):
     __version__ = "unknown"
 

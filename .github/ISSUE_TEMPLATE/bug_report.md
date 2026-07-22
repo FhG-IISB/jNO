@@ -38,7 +38,7 @@ the full traceback (inside a ```python or ```text fence) if one exists.
 - Python version (`python --version`):
 - Operating system (e.g. Ubuntu 24.04, macOS 14.5):
 - GPU / CUDA version (or "CPU only"):
-- Install method (`pip install jax-neural-operators[fem]`, `pixi install`, Docker image tag, source checkout):
+- Install method (`pip install jax-numerical-operators[fem]`, `pixi install`, Docker image tag, source checkout):
 
 ## Additional context
 

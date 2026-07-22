@@ -194,7 +194,7 @@ def _log_setup_info(log, script_path: Path, dire: Path, stem: str, wandb_arg) ->
     try:
         from importlib.metadata import version as _pkg_version
 
-        jno_ver = _pkg_version("jax-neural-operators")
+        jno_ver = _pkg_version("jax-numerical-operators")
     except Exception:
         jno_ver = "unknown"
 
