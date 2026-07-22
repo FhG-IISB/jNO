@@ -577,3 +577,53 @@ def test_rt_p0_transient_mixed_poisson_dae():
     assert np.all(np.isfinite(traj))
     p_traj = traj[:, off[1] : off[2]]
     assert 0.0 < np.linalg.norm(p_traj[-1]) < np.linalg.norm(p_traj[0])  # pressure decays (heat eqn, mixed form)
+
+
+def test_n1e_transient_operator_is_sparse_and_marches():
+    # The transient block MASS M and spatial operator A of an edge/cell family (N1E) are assembled per element
+    # into a BCOO — NOT a dense global jacfwd, which materialises an O(n_dof × n_cells) tangent and overflows
+    # the 2³¹ XLA limit past ~10⁴ edges (the eddy-current / time-domain-Maxwell OOM). This asserts the fix
+    # (M and A are sparse) and marches through the REAL sparse integrator (BiCGStab matvecs on the BCOO) from
+    # the projected IC, recovering the analytic decay ∂ₜu + u = 0, u0 = (-y, x) ⇒ u(t) = exp(-t) u0.
+    from jno.utils.solver.backend_blocks import _default_transient_integrate
+
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.5, time=(0.0, 0.1, 11))
+    co = d.variable("interior", split=True)
+    ci = d.variable("initial", split=True)
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="N1E")
+    ui, vi = u.bind(x=co[0], y=co[1], t=co[2]), v.bind(x=co[0], y=co[1], t=co[2])
+    ic = u(ci[0], ci[1]) - jno.np.vector(-ci[1], ci[0])
+    fem = jno.fem([inner(ui.t, vi) + inner(ui, vi), ic])
+    assert fem.is_transient and fem.is_linear
+    # THE FIX: the operator is BCOO (a dense global jacfwd would give a plain ndarray with no `.indices`).
+    assert hasattr(fem.operator.M, "indices"), "transient mass M must be a sparse BCOO, not a dense global jacfwd"
+    assert hasattr(fem.operator.A, "indices"), "transient operator A must be a sparse BCOO, not a dense global jacfwd"
+    ts = jnp.linspace(fem.t0, fem.t1, 11)
+    traj = np.asarray(_default_transient_integrate(fem.operator, {}, ts))  # sparse marcher end-to-end
+    assert np.all(np.isfinite(traj)) and np.linalg.norm(traj[0]) > 0.5  # the projected IC is non-trivial
+    decay = float(np.exp(-(fem.t1 - fem.t0)))
+    rel = np.linalg.norm(traj[-1] - decay * traj[0]) / np.linalg.norm(decay * traj[0])
+    assert rel < 1e-2, f"sparse march did not match exp(-t) decay (rel {rel:.2e})"
+    assert 0.0 < np.linalg.norm(traj[-1]) < np.linalg.norm(traj[0])  # the field decays
+
+
+def test_n1e_parametric_transient_operator_fn_is_sparse_and_differentiable():
+    # A runtime parameter on the spatial operator of an N1E transient (∂ₜu + a·u = 0) re-assembles A(a) each
+    # step. That per-step assembly is now SPARSE (BCOO) and differentiable in a — previously a dense global
+    # jacfwd re-run every step (the ~10⁴-edge ceiling on a 3-D vector transient inverse). A(a) = a·M exactly
+    # (the reaction term IS the mass block, no essential BC ⇒ no Dirichlet row replacement), and dA/da = M ≠ 0.
+    a = jno.np.parameter((), name="a").initialize(jax.nn.initializers.constant(2.0))  # runtime parameter in the operator
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.5, time=(0.0, 0.1, 6))
+    co = d.variable("interior", split=True)
+    ci = d.variable("initial", split=True)
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="N1E")
+    ui, vi = u.bind(x=co[0], y=co[1], t=co[2]), v.bind(x=co[0], y=co[1], t=co[2])
+    ic = u(ci[0], ci[1]) - jno.np.vector(-ci[1], ci[0])
+    fem = jno.fem([inner(ui.t, vi) + a * inner(ui, vi), ic])
+    assert fem.is_transient and fem.operator.operator_fn is not None  # the nonaffine (re-assembled) parametric path
+    A2 = fem.operator.operator_fn(fem.t0, {"a": 2.0})
+    assert hasattr(A2, "indices"), "the parametric operator_fn must assemble a sparse BCOO, not a dense jacfwd"
+    M = _dense(fem.operator.M)  # the (sparse) block mass, densified only for the oracle
+    np.testing.assert_allclose(_dense(A2), 2.0 * M, atol=1e-10)  # A(a) = a·M
+    g = jax.grad(lambda av: fem.operator.operator_fn(fem.t0, {"a": av}).todense().sum())(2.0)  # differentiable in a
+    assert np.isfinite(g) and abs(g - M.sum()) < 1e-8  # dA/da = M (through the sparse per-element assembly)
