@@ -1569,29 +1569,29 @@ class domain(MeshIOMixin):
     def _structured_grid_setup(self, shape):
         """Validate a ``structured=True`` request and prepare the regular-grid constructor.
 
-        Returns ``(constructor, grid_meta)`` where ``constructor(geo) -> (meshio.Mesh, 2, ds)`` builds a
-        right-triangulated regular grid over the rectangle (reusing :meth:`Geometries.equi_distant_rect`,
-        so boundary tags ``left/right/bottom/top`` come for free), and ``grid_meta`` is the
-        ``{"shape": (Nx, Ny), "spacing": (hx, hy), "origin": (x0, y0)}`` descriptor stamped onto
-        ``mesh_connectivity["grid"]`` — the key ``jno.fdm``'s FD kernels read to take the assembly-free
-        5-point-stencil path (node order ``idx(i, j) = i·Ny + j``). Fails loud: v1 supports only a single
-        axis-aligned 2-D ``jno.Shape.rect(...)`` with a uniform (scalar) size."""
-        from ..geometry.primitives import Rect
+        Returns ``(constructor, grid_meta)`` where ``constructor(geo) -> (meshio.Mesh, dim, ds)`` builds a
+        regular grid over the rectangle (2-D right-triangulation, :meth:`Geometries.equi_distant_rect`) or
+        box (3-D Kuhn tets, :meth:`Geometries.equi_distant_box`) — boundary tags come for free — and
+        ``grid_meta`` is the ``{"shape": (Nx, Ny[, Nz]), "spacing": (hx, hy[, hz]), "origin": (...)}``
+        descriptor stamped onto ``mesh_connectivity["grid"]``, the key ``jno.fdm``'s FD kernels read to
+        take the assembly-free 5-/7-point-stencil path (node order ``idx = ((i·Ny + j)·Nz + k)``). Fails
+        loud: v1 supports only a single axis-aligned ``jno.Shape.rect(...)`` / ``.box(...)`` with a uniform
+        (scalar) size."""
+        from ..geometry.primitives import Box, Rect
         from ..geometry.shape import Shape
 
         if not isinstance(shape, Shape):
             raise ValueError(
-                "jno.domain(..., structured=True) requires a jno.Shape.rect(...) geometry — got "
-                f"{type(shape).__name__}. Structured grids are v1-limited to an axis-aligned rectangle."
+                "jno.domain(..., structured=True) requires a jno.Shape.rect(...) / .box(...) geometry — got "
+                f"{type(shape).__name__}. Structured grids are v1-limited to an axis-aligned rectangle/box."
             )
         node = getattr(shape, "_node", None)
         prim = node[1] if (isinstance(node, tuple) and node and node[0] == "leaf") else None
-        if not isinstance(prim, Rect):
+        if not isinstance(prim, (Rect, Box)):
             raise NotImplementedError(
                 "jno.domain(..., structured=True) currently supports only a single axis-aligned "
-                "jno.Shape.rect(x0, y0, x1, y1) (2-D). A 3-D jno.Shape.box(...) or a composite/CSG shape "
-                "is not yet supported (structured 3-D and cut-cell geometry are planned) — use an "
-                "unstructured mesh (structured=False) for those."
+                "jno.Shape.rect(...) (2-D) or jno.Shape.box(...) (3-D). A composite/CSG shape is not yet "
+                "supported (cut-cell geometry is planned) — use an unstructured mesh (structured=False)."
             )
         size = getattr(shape, "_size", None)
         if callable(size):
@@ -1602,16 +1602,32 @@ class domain(MeshIOMixin):
         h = float(size) if isinstance(size, (int, float)) and size > 0 else 0.1
         if not (isinstance(size, (int, float)) and size > 0):
             self.log.info(f"structured=True: no scalar size on the Shape; defaulting to grid spacing h={h}.")
-        x_lo, x_hi = sorted((float(prim.x0), float(prim.x1)))
-        y_lo, y_hi = sorted((float(prim.y0), float(prim.y1)))
-        nx = max(2, int(round((x_hi - x_lo) / h)))  # >= 2 cells so the 3-point edge stencil is defined
-        ny = max(2, int(round((y_hi - y_lo) / h)))
-        constructor = Geometries.equi_distant_rect(x_range=(x_lo, x_hi), y_range=(y_lo, y_hi), nx=nx, ny=ny)
-        grid_meta = {
-            "shape": (nx + 1, ny + 1),
-            "spacing": ((x_hi - x_lo) / nx, (y_hi - y_lo) / ny),
-            "origin": (x_lo, y_lo),
-        }
+
+        def _axis(lo, hi):  # (lo, hi, n_cells); >= 2 cells so the 3-point edge stencil is defined
+            a, b = sorted((float(lo), float(hi)))
+            return a, b, max(2, int(round((b - a) / h)))
+
+        if isinstance(prim, Rect):
+            x_lo, x_hi, nx = _axis(prim.x0, prim.x1)
+            y_lo, y_hi, ny = _axis(prim.y0, prim.y1)
+            constructor = Geometries.equi_distant_rect(x_range=(x_lo, x_hi), y_range=(y_lo, y_hi), nx=nx, ny=ny)
+            grid_meta = {
+                "shape": (nx + 1, ny + 1),
+                "spacing": ((x_hi - x_lo) / nx, (y_hi - y_lo) / ny),
+                "origin": (x_lo, y_lo),
+            }
+        else:  # Box (3-D)
+            x_lo, x_hi, nx = _axis(prim.x0, prim.x1)
+            y_lo, y_hi, ny = _axis(prim.y0, prim.y1)
+            z_lo, z_hi, nz = _axis(prim.z0, prim.z1)
+            constructor = Geometries.equi_distant_box(
+                x_range=(x_lo, x_hi), y_range=(y_lo, y_hi), z_range=(z_lo, z_hi), nx=nx, ny=ny, nz=nz
+            )
+            grid_meta = {
+                "shape": (nx + 1, ny + 1, nz + 1),
+                "spacing": ((x_hi - x_lo) / nx, (y_hi - y_lo) / ny, (z_hi - z_lo) / nz),
+                "origin": (x_lo, y_lo, z_lo),
+            }
         return constructor, grid_meta
 
     def _generate_mesh(self, geometry_func: Callable, algorithm: int):

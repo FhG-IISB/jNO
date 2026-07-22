@@ -189,6 +189,80 @@ class Geometries:
         return constructor
 
     @staticmethod
+    def equi_distant_box(x_range=(0, 1), y_range=(0, 1), z_range=(0, 1), nx=8, ny=8, nz=8):
+        """Structured 3-D **tetrahedral** mesh of a box (Kuhn 6-tets-per-voxel) with boundary-face
+        ``cell_sets`` (``left/right/bottom/top/front/back`` + ``boundary``, ``interior`` for the volume).
+
+        Node order is ``idx(i, j, k) = (i·(ny+1) + j)·(nz+1) + k`` (C-order), so a nodal field reshapes
+        cleanly to ``(nx+1, ny+1, nz+1)`` for the structured FD stencils. The six Kuhn tets all share the
+        voxel's main diagonal, so the subdivision is conforming across voxels. Returns a
+        ``constructor(geo) -> (meshio.Mesh, 3, ds)`` (the ``jno.domain`` geometry-func contract)."""
+
+        def constructor(geo):
+            x0, x1 = x_range
+            y0, y1 = y_range
+            z0, z1 = z_range
+            X = np.linspace(x0, x1, nx + 1)
+            Y = np.linspace(y0, y1, ny + 1)
+            Z = np.linspace(z0, z1, nz + 1)
+            xx, yy, zz = np.meshgrid(X, Y, Z, indexing="ij")
+            points = np.column_stack([xx.ravel(), yy.ravel(), zz.ravel()])  # C-order: idx below
+            ny1, nz1 = ny + 1, nz + 1
+
+            def idx(i, j, k):
+                return (i * ny1 + j) * nz1 + k
+
+            # Kuhn / Freudenthal split: 6 tets per voxel, all sharing the main diagonal 000→111.
+            # Local corner c encodes (Δi, Δj, Δk) as bits (c>>2, c>>1, c) ∈ {0,1}³.
+            kuhn = [(0, 4, 6, 7), (0, 4, 5, 7), (0, 2, 6, 7), (0, 2, 3, 7), (0, 1, 5, 7), (0, 1, 3, 7)]
+            tets = []
+            for i in range(nx):
+                for j in range(ny):
+                    for k in range(nz):
+                        corner = [idx(i + ((c >> 2) & 1), j + ((c >> 1) & 1), k + (c & 1)) for c in range(8)]
+                        for a, b, cc, dd in kuhn:
+                            tets.append([corner[a], corner[b], corner[cc], corner[dd]])
+            tets = np.array(tets, dtype=np.int64)
+
+            # Boundary faces: each box face is a quad grid; split every quad into two triangles.
+            def quad_tris(node, na, nb):
+                tris = []
+                for a in range(na):
+                    for b in range(nb):
+                        p00, p10, p11, p01 = node(a, b), node(a + 1, b), node(a + 1, b + 1), node(a, b + 1)
+                        tris += [[p00, p10, p11], [p00, p11, p01]]
+                return tris
+
+            faces = {
+                "left": quad_tris(lambda j, k: idx(0, j, k), ny, nz),
+                "right": quad_tris(lambda j, k: idx(nx, j, k), ny, nz),
+                "bottom": quad_tris(lambda i, k: idx(i, 0, k), nx, nz),
+                "top": quad_tris(lambda i, k: idx(i, ny, k), nx, nz),
+                "front": quad_tris(lambda i, j: idx(i, j, 0), nx, ny),
+                "back": quad_tris(lambda i, j: idx(i, j, nz), nx, ny),
+            }
+            all_tris = []
+            face_ranges = {}
+            for name, tris in faces.items():
+                start = len(all_tris)
+                all_tris.extend(tris)
+                face_ranges[name] = np.arange(start, len(all_tris), dtype=np.int64)
+            all_tris = np.array(all_tris, dtype=np.int64)
+
+            cells = [("tetra", tets), ("triangle", all_tris)]
+            empty = np.array([], dtype=np.int64)
+            cell_sets = {"interior": [np.arange(len(tets), dtype=np.int64), empty]}
+            cell_sets["boundary"] = [empty, np.arange(len(all_tris), dtype=np.int64)]
+            for name, rng in face_ranges.items():
+                cell_sets[name] = [empty, rng]
+
+            mesh = meshio.Mesh(points=points, cells=cells, cell_sets=cell_sets)
+            ds = min((x1 - x0) / nx, (y1 - y0) / ny, (z1 - z0) / nz)
+            return mesh, 3, ds
+
+        return constructor
+
+    @staticmethod
     def poseidon(nx: int = 128, ny: int = 128):
         """
         Create a structured 2-D grid for foundation models (Poseidon, Walrus, …).

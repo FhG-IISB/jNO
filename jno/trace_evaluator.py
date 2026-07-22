@@ -929,14 +929,20 @@ class TraceEvaluator:
             ]
         elif mesh_dim == 2:
             cells = domain.mesh_connectivity["triangles"]
+            _grid = domain.mesh_connectivity.get("grid")  # structured-grid fast path (else None)
             grads = [
-                DifferentialOperators.compute_fd_gradient_2d_simple(u_full, mesh_points, cells, i, method=grad_method)
+                DifferentialOperators.compute_fd_gradient_2d_simple(
+                    u_full, mesh_points, cells, i, method=grad_method, grid=_grid
+                )
                 for i in range(2)
             ]
         else:
             cells = domain.mesh_connectivity["tetrahedra"]
+            _grid = domain.mesh_connectivity.get("grid")  # structured-grid fast path (else None)
             grads = [
-                DifferentialOperators.compute_fd_gradient_3d_simple(u_full, mesh_points, cells, i, method=grad_method)
+                DifferentialOperators.compute_fd_gradient_3d_simple(
+                    u_full, mesh_points, cells, i, method=grad_method, grid=_grid
+                )
                 for i in range(3)
             ]
         grad_full = jnp.stack([jnp.asarray(g).reshape(-1) for g in grads], axis=-1)  # (N_mesh, D)
@@ -1368,6 +1374,7 @@ class TraceEvaluator:
                     domain.mesh_connectivity["tetrahedra"],
                     vi_dim,
                     method=grad_method,
+                    grid=domain.mesh_connectivity.get("grid"),  # structured-grid fast path
                 )
 
             jac_components = []
@@ -1539,6 +1546,7 @@ class TraceEvaluator:
                     domain.mesh_connectivity["tetrahedra"],
                     dims,
                     method=lap_method,
+                    grid=domain.mesh_connectivity.get("grid"),  # structured-grid fast path
                 )
 
             def _hess_one_channel(u_1d):
@@ -1559,6 +1567,7 @@ class TraceEvaluator:
                     mesh_points,
                     domain.mesh_connectivity["tetrahedra"],
                     var_dims,
+                    grid=domain.mesh_connectivity.get("grid"),  # structured-grid fast path
                 )
 
             if compute_trace:

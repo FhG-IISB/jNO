@@ -30,6 +30,10 @@ def _structured(x0=0.0, y0=0.0, x1=1.0, y1=1.0, size=0.1, **kw):
     return jno.domain(jno.Shape.rect(x0, y0, x1, y1, size=size), structured=True, **kw)
 
 
+def _structured_box(x0=0.0, y0=0.0, z0=0.0, x1=1.0, y1=1.0, z1=1.0, size=0.2, **kw):
+    return jno.domain(jno.Shape.box(x0, y0, z0, x1, y1, z1, size=size), structured=True, **kw)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # grid metadata + structure
 # ─────────────────────────────────────────────────────────────────────────────
@@ -295,7 +299,79 @@ def test_grid_stencil_preserves_complex():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# fail-loud scope limits (v1: 2-D axis-aligned Shape.rect only)
+# structured 3-D (box) — Kuhn tet grid + 7-point stencil
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_structured_3d_grid_descriptor():
+    d = _structured_box(size=0.2)
+    grid = d.mesh_connectivity.get("grid")
+    assert d.dimension == 3
+    assert grid["shape"] == (6, 6, 6)
+    assert np.allclose(grid["spacing"], (0.2, 0.2, 0.2))
+    assert np.asarray(d.mesh_connectivity["points"]).shape[0] == 6**3
+    assert np.asarray(d.mesh_connectivity["tetrahedra"]).shape[0] == 6 * 5**3  # Kuhn: 6 tets/voxel
+
+
+def test_structured_3d_point_ordering():
+    """The 7-point stencil relies on node order idx(i,j,k) = (i·Ny + j)·Nz + k (reshape → 3-D meshgrid)."""
+    d = _structured_box(size=0.25)  # 4 cells → 5 nodes/axis
+    Nx, Ny, Nz = d.mesh_connectivity["grid"]["shape"]
+    P = np.asarray(d.mesh_connectivity["points"])[:, :3].reshape(Nx, Ny, Nz, 3)
+    assert np.all(np.diff(P[:, 0, 0, 0]) > 0)  # x along axis 0
+    assert np.all(np.diff(P[0, :, 0, 1]) > 0)  # y along axis 1
+    assert np.all(np.diff(P[0, 0, :, 2]) > 0)  # z along axis 2
+    assert np.allclose(P[:, :, :, 0], P[:, :1, :1, 0])  # x constant across (j, k)
+
+
+def test_structured_3d_laplacian_second_order():
+    """Δ(sin πx·sin πy·sin πz) = −3π²·u; the 7-point stencil is 2nd-order (≈4× error drop per h-halving)."""
+
+    def err(size):
+        d = _structured_box(size=size)
+        p = np.asarray(d.mesh_connectivity["points"])[:, :3]
+        u = jnp.asarray(np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]) * np.sin(np.pi * p[:, 2]))
+        lap = np.asarray(jno.fdm.laplacian(u, d))
+        analytic = -3.0 * np.pi**2 * np.asarray(u)
+        interior = np.all((p > 1e-9) & (p < 1 - 1e-9), axis=1)
+        return np.max(np.abs(lap[interior] - analytic[interior]))
+
+    e_coarse, e_fine = err(0.25), err(0.125)
+    assert e_fine < e_coarse
+    assert e_fine / e_coarse < 0.4
+
+
+def test_structured_3d_poisson_function_form():
+    """-Δu = f on a structured 3-D grid, u = sin πx·sin πy·sin πz (function-form FDMSystem)."""
+    d = _structured_box(size=0.14)
+    p = np.asarray(d.mesh_connectivity["points"])[:, :3]
+    exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]) * np.sin(np.pi * p[:, 2])
+    f = jnp.asarray(3 * np.pi**2 * exact)
+    sys = jno.fdm(d, residual=lambda w: -jno.fdm.laplacian(w, d) - f, dirichlet={"boundary": 0.0})
+    u = np.asarray(sys.solve()).reshape(-1)
+    assert float(np.linalg.norm(u - exact) / np.linalg.norm(exact)) < 2e-2
+
+
+def test_structured_3d_constraint_list_solve():
+    """The canonical term-list form on a structured 3-D grid: -ui.d2(x)-ui.d2(y)-ui.d2(z) via the grid
+    Hessian, GMRES inner solve (nonsymmetric reduced-Dirichlet operator)."""
+    import jno.jnp_ops as jnn
+
+    d = _structured_box(size=0.2)
+    x, y, z, _ = d.variable("interior", split=True)
+    xb, yb, zb, _ = d.variable("boundary", split=True)
+    p = np.asarray(d.mesh_connectivity["points"])[:, :3]
+    exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]) * np.sin(np.pi * p[:, 2])
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, z=z)
+    f = 3 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y) * jnn.sin(np.pi * z)
+    sol = jno.fdm([-ui.d2(x) - ui.d2(y) - ui.d2(z) - f, u(xb, yb, zb) - 0.0]).solve()
+    assert float(np.all(np.isfinite(np.asarray(sol))))
+    assert float(np.linalg.norm(np.asarray(sol).reshape(-1) - exact) / np.linalg.norm(exact)) < 5e-2
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# fail-loud scope limits (v1: axis-aligned Shape.rect / .box only)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -304,9 +380,11 @@ def test_structured_rejects_disk():
         jno.domain(jno.Shape.disk(0.0, 0.0, 1.0, size=0.1), structured=True)
 
 
-def test_structured_rejects_3d_box():
+def test_structured_rejects_3d_composite():
+    """A plain box is now supported (3-D); a composite/CSG 3-D shape still raises — cut-cell is planned."""
+    shape = jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=0.2) - jno.Shape.sphere(0.5, 0.5, 0.5, 0.2)
     with pytest.raises((ValueError, NotImplementedError)):
-        jno.domain(jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=0.2), structured=True)
+        jno.domain(shape, structured=True)
 
 
 def test_structured_rejects_composite():
