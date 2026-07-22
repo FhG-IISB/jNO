@@ -56,6 +56,7 @@ __all__ = [
     "lstsq",
     "theta",
     "exponential",
+    "adaptive",
 ]
 
 
@@ -522,3 +523,22 @@ def exponential(*, order: int = 40, mass: str = "lumped", symmetric: bool = True
     from .utils.solver.timeschemes import _ExponentialScheme
 
     return _ExponentialScheme(order, mass, symmetric)
+
+
+def adaptive(*, rtol: float = 1e-4, atol: float = 1e-6, max_steps: int = 1000):
+    """**Adaptive step-size** time scheme for ``fem.solve(time=...)``: the step size is chosen per step
+    from a **step-doubling** (Richardson) local-error estimate — one full step compared with two
+    half-steps — so a stiff / sharp / multi-rate transient takes small steps only where it needs them and
+    large steps elsewhere, instead of the fixed ``dt`` from ``domain(time=(t0,t1,n))``.
+
+    Built on the block's own implicit θ-step, so it inherits the DAE (Dirichlet) handling and works for a
+    **linear or nonlinear**, **scalar or vector**, **plain, periodic, or complex** transient. It is a
+    **fixed-length** ``lax.scan`` of ``max_steps`` attempts (a static trip count — a rejected step or the
+    settled tail just consumes an attempt), which keeps it **reverse-mode differentiable** (the gradient
+    flows through the realized step sequence). ``rtol``/``atol`` set the mixed relative/absolute tolerance;
+    ``max_steps`` is the step **budget** — if it is exhausted before ``t1`` the trajectory is returned as
+    ``NaN`` (raise it), never silently under-resolved. Composes with ``linear=``/``precond=`` (the per-step
+    solve). Backward-Euler order (first-order in time); pair with a fine tolerance for accuracy."""
+    from .utils.solver.timeschemes import _AdaptiveScheme
+
+    return _AdaptiveScheme(rtol, atol, max_steps)

@@ -187,7 +187,7 @@ precond=…, time=…)` composes (see the [FEM guide](fem.md)). The families:
 | **Nonlinear** | `newton`, `picard` |
 | **Eigenproblem** | `eigs` (generalized `Kx = λMx`) |
 | **Matrix functions** (stochastic Lanczos, matrix-free) | `logdet`, `trace`, `applyfun` (`f(A)·v`), `diagonal` |
-| **Time integration** | `theta` (θ-method), `exponential` (exponential integrator) |
+| **Time integration** | `theta` (θ-method), `exponential` (exponential integrator), `adaptive` (step-doubling adaptive step size) |
 
 **Preconditioners** (`jno.precond`, for the iterative solvers): `jacobi`, `chebyshev`,
 `amg`, `ams` (H(curl) auxiliary-space Maxwell), `form` (weak-form auxiliary operator),
