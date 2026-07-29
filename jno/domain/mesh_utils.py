@@ -7,6 +7,11 @@ from scipy.spatial import KDTree
 
 
 class MeshUtils:
+    #: Memory budget, in float64 elements, for one row-block of the axisymmetric ring kernel's
+    #: (M, M, n_phi) intermediate. Lower it if the view-factor build OOMs on a small GPU; it changes
+    #: only how the work is split, never the result.
+    _kernel_block_doubles = 2**24
+
     @staticmethod
     def _preprocess_mesh_connectivity(mesh, dimension, boundary_indices):
         """Preprocess mesh to build FEM connectivity matrices for finite differences."""
@@ -1109,23 +1114,39 @@ class MeshUtils:
         phi = jnp.linspace(0.0, 2.0 * jnp.pi, n_phi, endpoint=False)
         dphi = 2.0 * jnp.pi / n_phi
 
-        r_i, z_i, nr_i, nz_i = (a[:, None, None] for a in (r, z, nr, nz))
         r_j, z_j, nr_j, nz_j = (a[None, :, None] for a in (r, z, nr, nz))
         phi_m = phi[None, None, :]
-        dx = r_j * jnp.cos(phi_m) - r_i
-        dy = r_j * jnp.sin(phi_m)
-        dz = z_j - z_i
-        R2 = dx**2 + dy**2 + dz**2 + r_min**2
-        R = jnp.sqrt(R2 + 1e-30)
-        cos_i = jnp.maximum(0.0, (nr_i * dx + nz_i * dz) / R)
-        cos_j = jnp.maximum(0.0, -(nr_j * jnp.cos(phi_m) * dx + nr_j * jnp.sin(phi_m) * dy + nz_j * dz) / R)
-        kernel = cos_i * cos_j / (jnp.pi * R2 + 1e-30)  # (M, M, n_phi) point-to-point diffuse kernel
+        cos_phi, sin_phi = jnp.cos(phi_m), jnp.sin(phi_m)
         if phi_resolved:
             # Occlusion checked AT the azimuth being integrated, not just phi=0. Quadrature-resolved
             # visibility is used as-is; element-level visibility is broadcast up to the quad points.
             vm_full = VM if VM.shape[0] == m * nq else jnp.repeat(jnp.repeat(VM, nq, axis=0), nq, axis=1)
-            kernel = kernel * vm_full
-        ring = dphi * jnp.sum(kernel, axis=-1)  # (M, M) ring-to-ring kernel
+
+        # The point-to-point kernel is (M, M, n_phi) -- 816 MB at M = 1785, n_phi = 32, which OOMs an
+        # 8 GB GPU before the azimuthal sum ever reduces it away. It is only ever needed one receiver
+        # row-block at a time (the reduction is over the azimuth and the source), so build it in
+        # blocks: same arithmetic per element, memory bounded by `chunk` instead of M. Not bit-identical
+        # to the unblocked build -- the azimuthal reduction runs over a differently-shaped array and XLA
+        # reassociates it, measured at 3 ULP (see the row-chunking test), which is rounding, not drift.
+        M = r.shape[0]
+        budget = int(getattr(MeshUtils, "_kernel_block_doubles", 2**24))  # ~16M doubles = 128 MB
+        chunk = max(1, min(M, budget // max(M * n_phi, 1)))
+        blocks = []
+        for a0 in range(0, M, chunk):
+            b0 = min(a0 + chunk, M)
+            r_i, z_i, nr_i, nz_i = (a[a0:b0, None, None] for a in (r, z, nr, nz))
+            dx = r_j * cos_phi - r_i
+            dy = r_j * sin_phi
+            dz = z_j - z_i
+            R2 = dx**2 + dy**2 + dz**2 + r_min**2
+            R = jnp.sqrt(R2 + 1e-30)
+            cos_i = jnp.maximum(0.0, (nr_i * dx + nz_i * dz) / R)
+            cos_j = jnp.maximum(0.0, -(nr_j * cos_phi * dx + nr_j * sin_phi * dy + nz_j * dz) / R)
+            kern = cos_i * cos_j / (jnp.pi * R2 + 1e-30)
+            if phi_resolved:
+                kern = kern * vm_full[a0:b0]
+            blocks.append(dphi * jnp.sum(kern, axis=-1))
+        ring = blocks[0] if len(blocks) == 1 else jnp.concatenate(blocks, axis=0)  # (M, M)
 
         # Differential view factor ring_q -> ring_p (source weighted by its ring area r_p * w_p):
         fqq = ring * (r[None, :] * w_merid[None, :])  # (M, M)
