@@ -19,8 +19,10 @@ radiosity method for diffuse-grey enclosures).
 
 from __future__ import annotations
 
+from functools import partial
 from typing import List, Optional, Sequence
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -150,6 +152,9 @@ class _SolidSDF:
     surfaces", The Visual Computer 12 (1996) 527-545.
     """
 
+    __hash__ = object.__hash__  # static jit arg: one SDF instance == one compiled march
+    __eq__ = object.__eq__
+
     def __init__(self, union, bounds, cell: float, pad: float):
         from scipy.ndimage import distance_transform_edt
         from shapely.vectorized import contains as _vcontains
@@ -176,6 +181,23 @@ class _SolidSDF:
         d_in = distance_transform_edt(occ) * cell
         self.sdf = (d_out - d_in).astype(np.float64)
         self.nr, self.nz = nr, nz
+        self.jax = jnp.asarray(self.sdf)  # eager: see the note on the annotation above
+
+    #: The field as a device array. Built EAGERLY in ``__init__`` -- materialising it lazily inside
+    #: the jitted march would cache a tracer and leak it into every later call.
+    jax: "jnp.ndarray"
+
+    def signed_jax(self, r, z):
+        """:meth:`signed`, in JAX. Same clamping and same out-of-grid convention (a query can only
+        fall outside the chord-reachable grid by round-off, and such points are far from any solid)."""
+        fr = (r - self.r0) / self.cell
+        fz = (z - self.z0) / self.cell
+        ir = fr.astype(jnp.int32)
+        iz = fz.astype(jnp.int32)
+        ok = (ir >= 0) & (ir < self.nr) & (iz >= 0) & (iz < self.nz)
+        ir = jnp.clip(ir, 0, self.nr - 1)
+        iz = jnp.clip(iz, 0, self.nz - 1)
+        return jnp.where(ok, self.jax[ir, iz], jnp.inf)
 
     def signed(self, r, z):
         """Signed distance at ``(r, z)``. The grid spans the whole chord-reachable region, so a query can
@@ -188,6 +210,40 @@ class _SolidSDF:
         np.clip(ir, 0, self.nr - 1, out=ir)
         np.clip(iz, 0, self.nz - 1, out=iz)
         return np.where(ok, self.sdf[ir, iz], np.inf)
+
+
+@partial(jax.jit, static_argnums=(0, 8))
+def _march_jax(sdf, ri, zi, dx, dy, dz, Lsafe, depth, max_iter):
+    """Sphere-trace every chord in lockstep. Returns ``(t, blocked, active)``; ``active`` marks the
+    rays that never resolved -- the grazing minority the caller finishes with a dense scan.
+
+    ``sdf`` is static (hashed by identity): it carries the grid metadata the indexing needs, and the
+    field itself rides in as a device array via :attr:`_SolidSDF.jax`."""
+
+    def probe(tt):
+        x = ri + tt * dx
+        y = tt * dy
+        z = zi + tt * dz
+        return sdf.signed_jax(jnp.sqrt(x * x + y * y), z) + depth
+
+    min_step = 0.5 * sdf.cell / Lsafe  # never stall: always advance at least half a cell
+
+    def cond(state):
+        _, _, active, k = state
+        return jnp.logical_and(k < max_iter, jnp.any(active))
+
+    def body(state):
+        t, blocked, active, k = state
+        g = probe(t)
+        hit = active & (g <= 0.0)
+        blocked = blocked | hit
+        active = active & (~hit)
+        t = jnp.where(active, t + jnp.maximum(g / Lsafe, min_step), t)
+        active = active & (t < 1.0)
+        return t, blocked, active, k + 1
+
+    t0 = jnp.zeros(ri.shape, dtype=jnp.float64)
+    return jax.lax.while_loop(cond, body, (t0, jnp.zeros(ri.shape, bool), Lsafe > 1e-12, 0))[:3]
 
 
 def _chord_blocked(sdf, ri, zi, rj, zj, cphi, sphi, depth, max_iter=160):
@@ -236,19 +292,25 @@ def _chord_blocked(sdf, ri, zi, rj, zj, cphi, sphi, depth, max_iter=160):
         z = ZI + tt * DZ
         return sdf.signed(np.sqrt(x * x + y * y), z) + depth
 
-    t = np.zeros(ri.shape, dtype=np.float64)
-    blocked = np.zeros(ri.shape, dtype=bool)
-    active = L > 1e-12
-    min_step = 0.5 * sdf.cell / Lsafe  # never stall: always advance at least half a cell
-    for _ in range(max_iter):
-        if not active.any():
-            break
-        g = probe(t)
-        hit = active & (g <= 0.0)
-        blocked |= hit
-        active &= ~hit
-        t = np.where(active, t + np.maximum(g / Lsafe, min_step), t)
-        active &= t < 1.0
+    # --- the march, in JAX: every (pair, azimuth) steps together, jitted, and it runs on whatever
+    # device is active. Semantics are the numpy loop's, including the early exit once nothing is
+    # active (a lax.while_loop, not a fixed fori_loop, so a cheap geometry still costs few steps).
+    t, blocked, active = _march_jax(
+        sdf,
+        jnp.asarray(ri),
+        jnp.asarray(zi),
+        jnp.asarray(dx),
+        jnp.asarray(dy),
+        jnp.asarray(dz),
+        jnp.asarray(Lsafe),
+        float(depth),
+        int(max_iter),
+    )
+    # np.array (not asarray): a device array converts to a READ-ONLY view, and the grazing fallback
+    # below writes into `blocked` in place.
+    t = np.array(t)
+    blocked = np.array(blocked)
+    active = np.array(active)
 
     # Rays still alive here never resolved -- they are grazing. Scan whatever is left of THEIR chords
     # densely rather than declaring them visible. Operate on the compressed subset only: these are a tiny
@@ -297,7 +359,7 @@ def _chord_test_setup(geoms, union, r, z):
     return sdf, 2.0 * cell
 
 
-def _solid_polygon_visibility_3d(domain, elem_tag, P, length, phi, n_seg: int = 0):
+def _solid_polygon_visibility_3d(domain, elem_tag, P, length, phi, n_seg: int = 0, occluders=None):
     r"""Point-to-point visibility **per azimuth** for the true 3-D ray between axisymmetric rings.
 
     ``P`` is an ``(M, 2)`` array of ``(r, z)`` points -- pass the kernel's own quadrature points
@@ -334,6 +396,22 @@ def _solid_polygon_visibility_3d(domain, elem_tag, P, length, phi, n_seg: int = 
 
     ``n_seg`` is accepted and ignored; it is a vestige of the fixed-stride implementation.
 
+    ``occluders`` is the OPAQUE-SOLID model the chords are traced against:
+
+    * a sequence of shapely meridian polygons -- exactly those solids block, nothing else;
+    * ``()`` / an empty sequence -- an explicit "nothing occludes";
+    * ``None`` -- fall back to deriving them from ``domain._source_regions`` keyed by the SET of
+      ``elem_tag`` values.
+
+    The fallback is the dangerous case, and it is why this argument exists. It makes a solid an
+    occluder only if some radiating element happens to be *tagged* with it, so a solid that owns no
+    radiating element -- or one whose elements were tagged under a different name -- is silently
+    transparent. Measured on the cg furnace, tagging every insulation element ``WallS`` left ``WallU``,
+    ``WallO`` and three quartz ports out of the occluder set, and **46% of the pairs this function
+    called visible had chords passing through solid material** (worst case: 99% of the chord buried in
+    insulation). There is no error and the resulting ``F`` looks perfectly plausible. Callers that know
+    their opaque geometry should pass it rather than let it be inferred from tags.
+
     Returns an ``(M, M, len(phi))`` bool array (True = visible/unblocked at that azimuth); the self-pair
     is excluded at every azimuth.
     """
@@ -343,8 +421,11 @@ def _solid_polygon_visibility_3d(domain, elem_tag, P, length, phi, n_seg: int = 
     M = P.shape[0]
     phi = np.asarray(phi, dtype=np.float64)
     n_phi = phi.shape[0]
-    regions = getattr(domain, "_source_regions", {}) or {}
-    geoms = [regions[s] for s in sorted(set(map(str, elem_tag))) if s in regions]
+    if occluders is None:
+        regions = getattr(domain, "_source_regions", {}) or {}
+        geoms = [regions[s] for s in sorted(set(map(str, elem_tag))) if s in regions]
+    else:
+        geoms = list(occluders)
     vis = np.ones((M, M, n_phi), dtype=bool)
     if geoms:
         union = unary_union(geoms)
@@ -369,6 +450,39 @@ def _solid_polygon_visibility_3d(domain, elem_tag, P, length, phi, n_seg: int = 
     return vis
 
 
+def _consistent_node_weights(areas: np.ndarray, endpoints, axisymmetric: bool) -> np.ndarray:
+    r"""Per-element P1 load weights ``(m, 2)``: the two endpoint shares of ``\int_elem N_i \,d\Gamma``.
+
+    **2D** — the measure is the edge length and ``N_i`` is symmetric about the midpoint, so each endpoint
+    takes half: ``(L/2, L/2)``.
+
+    **Axisymmetric** — the measure carries the ring Jacobian, ``d\Gamma = 2\pi r \,ds``, and ``r`` varies
+    linearly along the element (``r(s) = r_0 + s\,\Delta``, ``\Delta = r_1 - r_0``). The halves are then
+    *not* equal: the endpoint at the larger radius sweeps more area. With ``L`` the meridional length,
+
+    .. math::
+        \int_0^1 (1-s)\,r(s)\,2\pi L\,ds = \tfrac{\pi L}{3}(2r_0 + r_1), \qquad
+        \int_0^1 s\,r(s)\,2\pi L\,ds     = \tfrac{\pi L}{3}(r_0 + 2r_1)
+
+    which still sums to the ring area ``2\pi \bar{r} L`` but splits it ``(2r_0+r_1) : (r_0+2r_1)``. Using
+    the 2D half-and-half split instead is exact only for an element at constant radius (a cylindrical
+    wall, ``\Delta = 0``); for a radial element spanning ``0 \to R`` -- an end disc, which every closed
+    axisymmetric cavity has -- it puts ``R/4`` on each node where the truth is ``R/6`` and ``R/3``, i.e.
+    50% too much on the inner node. These weights integrate a linear test function EXACTLY (verified
+    against ``\int 2\pi r \cdot r\,dr``), which the equal split does not.
+    """
+    areas = np.asarray(areas, dtype=np.float64)
+    if not axisymmetric or endpoints is None:
+        half = 0.5 * areas
+        return np.stack([half, half], axis=1)
+    e0, e1 = (np.asarray(e, dtype=np.float64) for e in endpoints)
+    r0, r1 = e0[:, 0], e1[:, 0]
+    length = np.linalg.norm(e1 - e0, axis=1)
+    w0 = np.pi * length * (2.0 * r0 + r1) / 3.0
+    w1 = np.pi * length * (r0 + 2.0 * r1) / 3.0
+    return np.stack([w0, w1], axis=1)
+
+
 class Enclosure:
     """Geometric handle for an enclosure-radiation surface set (see module docstring).
 
@@ -388,7 +502,7 @@ class Enclosure:
         Unique global node indices used by the enclosure (FEM DOFs for a scalar P1 field).
     """
 
-    def __init__(self, domain, tags, F, elements, element_tags, areas, normals, midpoints, axisymmetric):
+    def __init__(self, domain, tags, F, elements, element_tags, areas, normals, midpoints, axisymmetric, endpoints=None):
         self.domain = domain
         self.tags = list(tags)
         self._F = jnp.asarray(F)
@@ -398,6 +512,7 @@ class Enclosure:
         self.normals = jnp.asarray(normals)
         self.midpoints = np.asarray(midpoints)
         self.axisymmetric = bool(axisymmetric)
+        self._node_weights = jnp.asarray(_consistent_node_weights(np.asarray(areas), endpoints, self.axisymmetric))
 
     @property
     def size(self) -> int:
@@ -435,15 +550,23 @@ class Enclosure:
     def load(self, q, *, size: Optional[int] = None) -> jnp.ndarray:
         """Consistent global surface load ``(n_dofs,)`` from a per-element flux ``q`` ``(m,)``.
 
-        Scatters ``∫_Γ q v ds`` onto the FEM nodes: for piecewise-constant ``q`` and P1 test functions
-        ``∫_elem q N_i ds = q · (measure/2)`` per endpoint, so each element contributes ``q·area/2`` to
-        each of its two nodes. ``size`` defaults to the mesh node count (scalar P1 DOF layout)."""
+        Scatters ``∫_Γ q v dΓ`` onto the FEM nodes for piecewise-constant ``q`` and P1 test functions.
+        In 2D the two endpoints split the edge evenly; in **axisymmetric** mode the ring Jacobian
+        ``2πr`` weights them by radius instead (see :func:`_consistent_node_weights`), which is what
+        makes the load exact for a linear test function on a radial element. ``size`` defaults to the
+        mesh node count (scalar P1 DOF layout).
+
+        .. important::
+           With ``axisymmetric=True`` this load is **per full revolution** (W, not W/m): the measure is
+           ``2πr ds``. jNO does not weight the FEM forms for you, so the weak form this load is added to
+           must carry the same ``2πr`` factor or the two sides differ by exactly that. See the
+           *Axisymmetric* section of ``docs/fem.md``."""
         q = jnp.asarray(q).reshape(-1)
         n = int(size) if size is not None else int(np.asarray(self.domain.mesh.points).shape[0])
-        half = q * self.areas * 0.5
-        load = jnp.zeros(n, dtype=half.dtype)
-        load = load.at[jnp.asarray(self.elements[:, 0])].add(half)
-        load = load.at[jnp.asarray(self.elements[:, 1])].add(half)
+        w = self._node_weights.astype(q.dtype)
+        load = jnp.zeros(n, dtype=q.dtype)
+        load = load.at[jnp.asarray(self.elements[:, 0])].add(q * w[:, 0])
+        load = load.at[jnp.asarray(self.elements[:, 1])].add(q * w[:, 1])
         return load
 
     def quality(self):
@@ -520,6 +643,37 @@ def _graded_phi_rule(phi_c: np.ndarray, n_int: int, n_gl: int):
     return phi, w
 
 
+@jax.jit
+def _refine_block_jax(rq, zq, rp, zp, nq, np_, aq, ap, cphi, sphi, w_eff):
+    """Exchange ``G_ij = A_i F_ij / (2 pi)`` for a block of near pairs, in one jitted expression.
+
+    This is the arithmetic that dominates an enclosure build (measured: 42 s of a 65 s build on the cg
+    furnace). It is pure batched array work -- a (pair, quad_i, quad_j, azimuth) kernel contracted down
+    to one number per pair -- so it belongs in JAX, where it jits and runs on whatever device is
+    active, rather than in numpy on the host.
+
+    ``w_eff`` is the azimuthal weight already multiplied by the occlusion mask, so a blocked azimuth
+    simply contributes nothing. Exchange is formed in its SYMMETRIC form, which is what makes
+    reciprocity exact by construction when the caller splits it back into ``F``.
+    """
+    RQ, ZQ = rq[:, :, None, None], zq[:, :, None, None]
+    RP, ZP = rp[:, None, :, None], zp[:, None, :, None]
+    C, S = cphi[:, None, None, :], sphi[:, None, None, :]
+    dx = RP * C - RQ
+    dy = RP * S
+    dz = ZP - ZQ
+    R2 = dx * dx + dy * dy + dz * dz
+    R = jnp.sqrt(R2 + 1e-300)
+    cos_q = jnp.maximum(0.0, (nq[:, 0][:, None, None, None] * dx + nq[:, 1][:, None, None, None] * dz) / R)
+    cos_p = jnp.maximum(
+        0.0, -(np_[:, 0][:, None, None, None] * (dx * C + dy * S) + np_[:, 1][:, None, None, None] * dz) / R
+    )
+    K = cos_q * cos_p / (jnp.pi * R2 + 1e-300)  # (n, Q, Q, NP)
+    # azimuthal integral over [0, 2pi) = 2 x integral over [0, pi]  (the integrand is even in phi)
+    Iqp = 2.0 * jnp.einsum("nqpf,nf->nqp", K, w_eff)
+    return jnp.einsum("nq,nqp,np->n", aq, Iqp, ap)
+
+
 def _refine_near_pairs(
     F,
     e0,
@@ -538,6 +692,7 @@ def _refine_near_pairs(
     n_seg=256,
     chunk=96,
     log=None,
+    occluders=None,
 ):
     """Recompute NEAR element pairs (and the diagonal) with adaptive quadrature; return the corrected F.
 
@@ -556,6 +711,22 @@ def _refine_near_pairs(
     Exchange is computed in its symmetric form ``G_ij = A_i F_ij`` and split back, so reciprocity is exact
     by construction. Occlusion is evaluated per pair per refined azimuth on the element midpoints, by the
     same 3-D chord test as :func:`_solid_polygon_visibility_3d`.
+
+    ``occluders`` is the OPAQUE-SOLID model to test the refined chords against. It must be supplied
+    whenever anything occludes:
+
+    * ``(geoms, union)`` -- shapely meridian polygons; refined chords are sphere-traced against them
+      (the interface-mode model).
+    * ``()`` / an empty sequence -- an explicit "nothing occludes" (a closed convex cavity).
+    * ``None`` -- fall back to deriving the polygons from ``domain._source_regions`` keyed by
+      ``elem_tag``.
+
+    The fallback is the dangerous case and the reason this argument exists: in **boundary** mode the tags
+    are surface names, not region names, so the lookup comes back empty and every refined near pair is
+    silently recomputed as fully visible. On concentric cylinders that turns the outer wall's occlusion-
+    limited self-view ``F22 = 1 - r1/r2`` into ``0.64`` at ``r1/r2 = 0.8`` (true value ``0.2``) and pushes
+    row sums to ``1.44`` -- worse than the corner overshoot the refinement exists to fix. Callers that
+    know their occluder model must therefore pass it rather than let it be guessed.
     """
     from shapely.ops import unary_union
 
@@ -578,9 +749,12 @@ def _refine_near_pairs(
             f"({100 * len(iu) / (m * (m + 1) / 2):.1f}%)"
         )
 
-    regions = getattr(domain, "_source_regions", {}) or {}
-    geoms = [regions[s] for s in sorted(set(map(str, elem_tag))) if s in regions]
-    union = unary_union(geoms) if geoms else None
+    if occluders is None:  # legacy: guess the solids from the element tags (see the docstring's warning)
+        regions = getattr(domain, "_source_regions", {}) or {}
+        geoms = [regions[s] for s in sorted(set(map(str, elem_tag))) if s in regions]
+        union = unary_union(geoms) if geoms else None
+    else:
+        geoms, union = occluders if occluders else ([], None)
     # Occlusion by sphere tracing against a signed-distance field (see _chord_test_setup / _chord_blocked):
     # scaled to the thinnest SOLID, not to the mesh, and unable to step over a feature of any size.
     sdf = depth = None
@@ -631,26 +805,21 @@ def _refine_near_pairs(
                 )
             ).astype(np.float64)
 
-        # ring kernel at every (quad_i, quad_j, phi)
-        RQ = rq[:, :, None, None]
-        ZQ = zq[:, :, None, None]
-        RP = rp[:, None, :, None]
-        ZP = zp[:, None, :, None]
-        C = cphi[:, None, None, :]
-        S = sphi[:, None, None, :]
-        dx = RP * C - RQ
-        dy = RP * S
-        dz = ZP - ZQ
-        R2 = dx * dx + dy * dy + dz * dz
-        R = np.sqrt(R2 + 1e-300)
-        cos_q = np.maximum(0.0, (nq[:, 0][:, None, None, None] * dx + nq[:, 1][:, None, None, None] * dz) / R)
-        cos_p = np.maximum(
-            0.0, -(np_[:, 0][:, None, None, None] * (dx * C + dy * S) + np_[:, 1][:, None, None, None] * dz) / R
+        # ring kernel at every (quad_i, quad_j, phi) -> the symmetric exchange G, in JAX
+        G = _refine_block_jax(
+            jnp.asarray(rq),
+            jnp.asarray(zq),
+            jnp.asarray(rp),
+            jnp.asarray(zp),
+            jnp.asarray(nq),
+            jnp.asarray(np_),
+            jnp.asarray(aq),
+            jnp.asarray(ap),
+            jnp.asarray(cphi),
+            jnp.asarray(sphi),
+            jnp.asarray(wphi * vis),
         )
-        K = cos_q * cos_p / (np.pi * R2 + 1e-300)  # (n, Q, Q, NP)
-        # azimuthal integral over [0, 2pi) = 2 * integral over [0, pi]  (the integrand is even in phi)
-        Iqp = 2.0 * np.einsum("nqpf,nf->nqp", K, wphi * vis)
-        G = np.einsum("nq,nqp,np->n", aq, Iqp, ap)  # symmetric exchange, = A_i F_ij / (2*pi)
+        G = np.asarray(G)
 
         Aq, Ap = aq.sum(axis=1), ap.sum(axis=1)  # = A_i/(2*pi), A_j/(2*pi)
         F[ii, jj] = G / Aq
@@ -869,6 +1038,17 @@ def build_enclosure(
     occ0 = np.concatenate(occ0_list, axis=0)
     occ1 = np.concatenate(occ1_list, axis=0)
     own_edge = np.arange(elem_nodes.shape[0])  # each element's own edge is the first m occluders
+    # In interface mode the opaque solids are the geometry regions the radiating elements bound, plus
+    # every OTHER region that is not a transparent medium: a solid that owns no radiating element still
+    # blocks rays. Resolving this once, here, is what keeps the visibility test and the near-field
+    # refinement on the same occluder model (and off the tag-derived fallback -- see
+    # _solid_polygon_visibility_3d's docstring for what that silently costs).
+    solid_geoms = None
+    if medium_tags is not None:
+        _regions = getattr(domain, "_source_regions", {}) or {}
+        _transparent = {str(t) for t in medium_tags}
+        solid_geoms = [g for name, g in _regions.items() if str(name) not in _transparent]
+
     if not occlude:
         vm = 1.0 - np.eye(elem_nodes.shape[0])  # diagnostic: no occlusion (all mutually visible)
     elif medium_tags is not None:
@@ -886,21 +1066,49 @@ def build_enclosure(
             # already resolved to n_phi. The kernel still ACCEPTS quadrature-resolved visibility if a
             # caller wants it (see get_view_factor_axisymmetric_element).
             phi_occ = np.linspace(0.0, 2.0 * np.pi, n_phi, endpoint=False)
-            vm = _solid_polygon_visibility_3d(domain, elem_tag_arr, mids, length, phi_occ)
+            vm = _solid_polygon_visibility_3d(domain, elem_tag_arr, mids, length, phi_occ, occluders=solid_geoms)
         else:
             vm = _solid_polygon_visibility(domain, elem_tag_arr, mids, normals, length)
     else:
         vm = _element_visibility(mids, own_edge, occ0, occ1)
 
     if axisymmetric:
-        # The near-field refinement is applied ONLY in interface mode. It re-derives occlusion from the
-        # solid polygons (domain._source_regions, keyed by the element tags), which is exactly the
-        # interface-mode occluder model. In BOUNDARY mode the tags are surface names ("inner_gap"), not
-        # region names, so that lookup would come back empty and the refinement would silently drop
-        # occlusion altogether -- worse than the artifact it fixes. Boundary mode therefore keeps the
-        # legacy behaviour (uniform azimuthal rule + the r_min floor), and with it the known limitation
-        # that its occlusion (_element_visibility) is a meridian-only test reused across all azimuths.
-        refine = bool(near_field) and medium_tags is not None
+        # --- what does the refinement have to test its refined chords against? ---
+        # The refinement's occluder model is passed EXPLICITLY (it used to re-derive the solids from
+        # domain._source_regions keyed by the element tags, which silently comes back empty in boundary
+        # mode -- see _refine_near_pairs' docstring for what that does to F22).
+        #
+        #   interface mode -> the same solid polygons the visibility test used.
+        #   boundary mode  -> the tags are SURFACE names, so there are no polygons to trace against, and
+        #                     the refinement would recompute its pairs as fully visible. That is correct
+        #                     only when nothing occludes, and there is no sound cheap test for it: the
+        #                     available visibility (`_element_visibility`) is a MERIDIAN test, and the
+        #                     meridian is blind exactly where axisymmetry bites -- two points on a common
+        #                     cylinder are "visible" in the (r, z) plane while the true 3-D chord between
+        #                     them at azimuth phi cuts straight through whatever the cylinder encloses.
+        #                     So the refinement runs here only on the caller's explicit assertion,
+        #                     `occlude=False`, which is precisely the statement "nothing blocks any ray".
+        occluders = None
+        if medium_tags is not None:
+            from shapely.ops import unary_union as _uu
+
+            _g = list(solid_geoms or [])  # the SAME solids the visibility test used, not a tag lookup
+            occluders = (_g, _uu(_g) if _g else None)
+            refine = bool(near_field)
+        else:
+            occluders = ()  # explicit "nothing occludes" -- never the silent empty-lookup fallback
+            refine = bool(near_field) and not occlude
+            if bool(near_field) and occlude:
+                # Refining here could fabricate lines of sight through a solid. Say so: the r_min
+                # fallback is a known ~12% bias, but it is not an invented line of sight.
+                domain.log.warning(
+                    "domain.enclosure(axisymmetric=True) in boundary mode keeps the uniform azimuthal "
+                    "rule + the r_min floor, so closure error stays around 1e-1 (see docs/fem.md). The "
+                    "near-field refinement needs an occluder model and the tags here name surfaces, not "
+                    "regions. Use medium_tags=[...] (interface mode) for the refined near field WITH "
+                    "occlusion, or occlude=False if this enclosure genuinely has nothing blocking it "
+                    "(a convex cavity)."
+                )
 
         # r_min is a near-field 1/R^2 FLOOR -- a fudge that caps the kernel for near-coincident rings.
         # Where the refinement runs, the near pairs are integrated properly instead, so no floor is needed
@@ -918,7 +1126,9 @@ def build_enclosure(
         )
         areas = 2.0 * np.pi * mids[:, 0] * length  # ring areas
         if refine:
-            F = jnp.asarray(_refine_near_pairs(np.asarray(F), e0, e1, normals, domain, elem_tag_arr, n_phi))
+            F = jnp.asarray(
+                _refine_near_pairs(np.asarray(F), e0, e1, normals, domain, elem_tag_arr, n_phi, occluders=occluders)
+            )
     else:
         F = MeshUtils.get_view_factor_2d_element(
             jnp.asarray(e0), jnp.asarray(e1), jnp.asarray(normals), jnp.asarray(vm), n_quad=n_quad
@@ -928,4 +1138,4 @@ def build_enclosure(
     if enforce_closure:
         F = _enforce_closure(F, areas, n_iter=closure_iters)
 
-    return Enclosure(domain, tags, F, elem_nodes, elem_tag_arr, areas, normals, mids, axisymmetric)
+    return Enclosure(domain, tags, F, elem_nodes, elem_tag_arr, areas, normals, mids, axisymmetric, endpoints=(e0, e1))
