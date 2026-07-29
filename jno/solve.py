@@ -414,7 +414,7 @@ def picard(
     )
 
 
-def eigs(*, k: int = 6, which: str = "smallest"):
+def eigs(*, k: int = 6, which: str = "smallest", precond=None, tol=None, maxiter=None):
     """Generalized **symmetric eigensolver** ``K x = λ M x`` (K symmetric, M SPD). Returns a callable
     ``(K, M=None) -> (λ, X)``: the ``k`` eigenvalues at the requested end (``which='smallest'`` /
     ``'largest'``) and their **M-orthonormal** eigenvectors (``Xᵀ M X = I``). ``M=None`` is the standard
@@ -424,18 +424,52 @@ def eigs(*, k: int = 6, which: str = "smallest"):
     structure — everything that is ``Kx=λMx`` rather than ``Ax=b``. Build ``K``/``M`` as source-less
     ``jno.fem`` bilinear forms (or via :meth:`FEM.eigs`).
 
-    **Differentiable.** V1a reduces the pencil densely (Cholesky ``M=LLᵀ`` → ``jnp.linalg.eigh`` on
-    ``L⁻¹KL⁻ᵀ``), so ``∂λ/∂θ`` flows for free — for **simple** eigenvalues (degenerate/crossing
-    eigenvalues make the eigen-JVP singular; use the trace of a degenerate cluster there). Preconditioned
-    LOBPCG (reusing ``jno.precond.*``) and shift-invert to a target ``σ`` are the planned scale paths.
+    **Two paths, selected by the arguments.** With no iterative argument the pencil is reduced
+    **densely** (Cholesky ``M=LLᵀ`` → ``jnp.linalg.eigh`` on ``L⁻¹KL⁻ᵀ``) — exact, and the right answer
+    when you want the whole low spectrum of a small problem, but ``O(N²)`` memory because it
+    materializes the operator. Passing ``precond=`` switches to **preconditioned LOBPCG**
+    (:func:`jno.utils.solver.eigen.lobpcg_geneigh`, Knyazev 2001), which only ever applies ``K``/``M`` as
+    matvecs and so runs at a scale the dense reduction cannot::
+
+        lam, X = K.eigs(mass=mass, k=6)                              # dense
+        lam, X = K.eigs(mass=mass, k=6, precond=jno.precond.amg())   # LOBPCG, matrix-free
+
+    The Rayleigh-Ritz runs in the **M-inner product**, so the consistent (non-lumped) mass matrix of an
+    ordinary FEM form is handled directly. ``tol``/``maxiter`` tune that iteration (defaults ``1e-6`` /
+    ``200``) and are rejected without ``precond=``, so a tolerance can never be silently ignored on the
+    dense path. If the sweep budget is exhausted before ``tol``, the result is **NaN-poisoned** rather
+    than silently under-converged — jNO never fails silently.
+
+    **Differentiable** on both paths: ``∂λ/∂θ`` for **simple** eigenvalues (degenerate/crossing
+    eigenvalues make the derivative ill-defined — use the trace of the cluster). The dense path
+    differentiates through ``eigh``; LOBPCG freezes the converged eigenvector and differentiates the
+    Rayleigh quotient, which is the same derivative exactly (``∂R/∂x = 0`` at an eigenvector) — but its
+    **eigenvectors** carry no gradient, where the dense path's do.
     """
     if which not in ("smallest", "largest", "SM", "LM", "SA", "LA"):
         raise ValueError(f"jno.solve.eigs: which={which!r} — use 'smallest' or 'largest'.")
+    if precond is None and (tol is not None or maxiter is not None):
+        raise ValueError(
+            "jno.solve.eigs: tol=/maxiter= configure the iterative (LOBPCG) path, but no precond= was "
+            "given, so the dense reduction would run and silently ignore them. Pass precond= (e.g. "
+            "jno.precond.jacobi() for unpreconditioned-strength LOBPCG), or drop tol=/maxiter=."
+        )
+    _tol = 1e-6 if tol is None else float(tol)
+    _maxiter = 200 if maxiter is None else int(maxiter)
 
     def _fn(K, M=None):
-        from .utils.solver.eigen import dense_geneigh
+        from .utils.solver.eigen import dense_geneigh, lobpcg_geneigh
 
-        return dense_geneigh(K, M, k, which)
+        if precond is None:
+            return dense_geneigh(K, M, k, which)
+
+        from .utils.solver.solver_api import LinearOperator, PrecondContext, materialize_precond
+
+        op = K if isinstance(K, LinearOperator) else LinearOperator(K)
+        apply = materialize_precond(precond, PrecondContext(op))
+        lam, X, res = lobpcg_geneigh(K, M, k, which, precond=apply, tol=_tol, maxiter=_maxiter)
+        bad = res > _tol  # budget exhausted -> poison, never a quietly under-converged spectrum
+        return jnp.where(bad, jnp.nan, lam), jnp.where(bad, jnp.nan, X)
 
     return _fn
 

@@ -185,9 +185,35 @@ precond=…, time=…)` composes (see the [FEM guide](fem.md)). The families:
 | **Linear — iterative (Krylov)** | `cg`, `bicgstab`, `gmres`, `fgmres`, `minres`; `lstsq` (LSQR, least-squares); `chebyshev` (polynomial) |
 | **Linear — multigrid** | `amg` (GPU AMG / NVIDIA AmgX via jaxamg) |
 | **Nonlinear** | `newton`, `picard` |
-| **Eigenproblem** | `eigs` (generalized `Kx = λMx`) |
+| **Eigenproblem** | `eigs` (generalized `Kx = λMx`) — dense reduction, or preconditioned LOBPCG with `precond=` |
 | **Matrix functions** (stochastic Lanczos, matrix-free) | `logdet`, `trace`, `applyfun` (`f(A)·v`), `diagonal` |
 | **Time integration** | `theta` (θ-method), `exponential` (exponential integrator), `adaptive` (step-doubling adaptive step size) |
+
+### Eigenproblems at scale
+
+`jno.solve.eigs` / `FEM.eigs` have two paths, chosen by the arguments. With none of the iterative
+arguments the pencil is reduced **densely** — exact, and right when you want the whole low spectrum of
+a small problem, but it materializes the operator (`O(N²)` memory). Passing `precond=` selects
+**preconditioned LOBPCG** (Knyazev, *SIAM J. Sci. Comput.* **23**(2), 517–541, 2001), which only applies
+`K`/`M` as matvecs and so runs where the dense reduction cannot:
+
+```python
+lam, X = K.eigs(mass=mass, k=6)                              # dense
+lam, X = K.eigs(mass=mass, k=6, precond=jno.precond.amg())   # LOBPCG, never densified
+```
+
+The Rayleigh–Ritz runs in the **M-inner product**, so an ordinary FEM form's consistent (non-lumped)
+mass matrix is handled directly, and `XᵀMX = I` holds on both paths. Eigenvalues are differentiable on
+both — for **simple** eigenvalues; a degenerate cluster makes `∂λ/∂θ` ill-defined either way (use the
+trace of the cluster). LOBPCG freezes the converged eigenvector and differentiates the Rayleigh
+quotient, which gives that derivative exactly without differentiating through the sweeps, but its
+**eigenvectors** carry no gradient where the dense path's do.
+
+`tol`/`maxiter` tune the iteration and are **rejected** without `precond=`, so a tolerance can never be
+silently ignored by the dense path. Do not set `tol` near machine precision: on an ill-conditioned
+pencil the residual floors well above it (≈`4.4e-8` on a singular all-Neumann Laplacian with
+`cond(K) ≈ 2e16`), and a tolerance below that floor burns the budget and **NaN-poisons** the result —
+which is the deliberate contract for an exhausted budget, never a quietly under-converged spectrum.
 
 **Preconditioners** (`jno.precond`, for the iterative solvers): `jacobi`, `chebyshev`,
 `amg` (algebraic multigrid), `gmg` (geometric multigrid — a structured-grid V-cycle),
