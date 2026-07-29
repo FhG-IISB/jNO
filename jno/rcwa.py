@@ -27,7 +27,7 @@ Two entry points, both on `jno.rcwa`:
 Built on `fmmax` (a differentiable JAX Fourier Modal Method), imported lazily so the core install stays
 lean. Enable with the ``rcwa`` extra::
 
-    pip install jax-neural-operators[rcwa]      # or: pixi run -e rcwa ...
+    pip install jax-numerical-operators[rcwa]      # or: pixi run -e rcwa ...
 
 It **never fails silently**: every inference (periodicity, layer invariance, order/grid Nyquist,
 wavelength, energy balance, a recognisable source) is validated and raises :class:`RcwaError` with a
@@ -85,7 +85,7 @@ _UNIFORM_RTOL = 1e-12
 
 
 _FMMAX_HINT = (
-    "jno.rcwa needs the optional fmmax backend: pip install jax-neural-operators[rcwa] "
+    "jno.rcwa needs the optional fmmax backend: pip install jax-numerical-operators[rcwa] "
     "(or `pixi run -e rcwa ...`, or `pip install fmmax`)."
 )
 
@@ -251,13 +251,10 @@ class _Sol:
         exy, eyy = out0("y")  # input y-pol -> output (E_x, E_y)
         return jnp.array([[exx, exy], [eyx, eyy]])  # J[out q, in p]
 
-    def field(self, y_frac=0.5, nx=80, density=40.0):
-        """Reconstruct the real-space electric field on a vertical (x–z) slice at ``y = y_frac·Py``.
-
-        Returns ``(intensity, extent, layer_z)``: ``intensity`` = ``|E|²`` of shape ``(nz, nx)`` (z
-        vertical, x horizontal) for ``imshow``; ``extent`` = ``[0, Px, z_min, z_max]``; ``layer_z`` = the
-        z-interfaces between layers (to annotate the patterned slab). Needs the finite ambient
-        thickness recorded at solve time (semi-infinite ambients are shown as unit-thick slabs)."""
+    def _field_volume(self, nx=80, density=40.0):
+        """``(|E|², x, y, z)`` on the full 3-D reconstruction grid — the shared core of :meth:`field`
+        and :meth:`field3d`. ``|E|²`` has shape ``(nx, ny, nz)``; the coordinate arrays come straight
+        from ``fmmax.stack_fields_3d``."""
         fm = self._fm
         if self._thick is None:
             raise RcwaError("field() needs the layer thicknesses; call .solve() (which records them).")
@@ -266,13 +263,39 @@ class _Sol:
         amps = fm.stack_amplitudes_interior(smi, self._fwd, np.zeros_like(self._fwd))
         efield, _h, (x, y, z) = fm.stack_fields_3d(amps, self._layers, self._thick, znum, grid_shape=(nx, nx))
         E = np.asarray(efield)  # (3, nx, ny, nz, 1)
-        inten = np.sum(np.abs(E) ** 2, axis=0)[..., 0]  # (nx, ny, nz)
-        yv = np.asarray(y)
-        j = int(np.argmin(np.abs(yv[0, :] - y_frac * self._period[1])))
+        return np.sum(np.abs(E) ** 2, axis=0)[..., 0], np.asarray(x), np.asarray(y), np.asarray(z)
+
+    def field(self, y_frac=0.5, nx=80, density=40.0):
+        """Reconstruct the real-space electric field on a vertical (x–z) slice at ``y = y_frac·Py``.
+
+        Returns ``(intensity, extent, layer_z)``: ``intensity`` = ``|E|²`` of shape ``(nz, nx)`` (z
+        vertical, x horizontal) for ``imshow``; ``extent`` = ``[0, Px, z_min, z_max]``; ``layer_z`` = the
+        z-interfaces between layers (to annotate the patterned slab). Needs the finite ambient
+        thickness recorded at solve time (semi-infinite ambients are shown as unit-thick slabs).
+
+        See :meth:`field3d` for the whole volume rather than one slice."""
+        inten, _x, y, z = self._field_volume(nx=nx, density=density)
+        j = int(np.argmin(np.abs(y[0, :] - y_frac * self._period[1])))
         slab = inten[:, j, :].T  # (nz, nx): z vertical, x horizontal
-        zc = np.asarray(z).reshape(-1)
+        zc = z.reshape(-1)
         layer_z = list(np.cumsum([float(t) for t in self._thick]))[:-1]
         return slab, [0.0, float(self._period[0]), float(zc.min()), float(zc.max())], layer_z
+
+    def field3d(self, nx=80, density=40.0):
+        """``|E|²`` on the full 3-D grid, for volume rendering / isosurfaces — the whole reconstruction
+        rather than the single ``y``-slice :meth:`field` returns.
+
+        Returns ``(intensity, (x, y, z), layer_z)`` with ``intensity`` of shape ``(nx, ny, nz)`` and
+        ``x``/``y``/``z`` the 1-D coordinates of each axis. The semi-infinite ambients are rendered as
+        unit-thick slabs (see :meth:`field`), so ``z`` starts at 0 at the top of the superstrate, not at
+        any coordinate of the authored geometry — ``layer_z`` gives the interfaces in the same frame.
+
+        NumPy, like :meth:`field`: this is the visualisation path. A differentiable ``|E|²`` for a
+        coupled (e.g. thermal) objective needs the JAX-valued volume, which this deliberately does not
+        return — see the roadmap in ``docs/rcwa.md``."""
+        inten, x, y, z = self._field_volume(nx=nx, density=density)
+        layer_z = list(np.cumsum([float(t) for t in self._thick]))[:-1]
+        return inten, (x[:, 0], y[0, :], z.reshape(-1)), layer_z
 
     def _spectrum(self, kind="T", fwd=None):
         """The complex diffraction spectrum for imaging: the transverse E-field Fourier coefficients
@@ -413,12 +436,16 @@ class _Sol:
         without changing the call."""
         return self.expose(NA, source, defocus, grid, kind, polarization).develop(resist or Threshold())
 
-    def _bulk(self, cfg, film):
+    def _bulk(self, cfg, film, source_chunk=None):
         """Standing-wave **bulk image** ``|E(x, y, z)|²`` inside the resist film. Each diffraction order (a
         plane wave at direction cosine ``(α, β)``) is refracted into the film (``k_z = k0·√(n_r² − α² − β²)``,
         complex ⇒ absorption) and interferes with its substrate reflection ``r_s``, producing the vertical
         standing wave. Reuses the aerial Abbe sum with a per-order depth factor; returns ``(grid, grid, nz)``.
-        Scalar (``E_x``); single-substrate-reflection model (the dominant standing wave)."""
+        Scalar (``E_x``); single-substrate-reflection model (the dominant standing wave).
+
+        ``source_chunk`` bounds the peak memory: the Abbe sum over source points is accumulated
+        ``source_chunk`` points at a time instead of materialising the whole stack (see below).
+        ``None`` = all at once, the historical behaviour."""
         NA, source, defocus, grid, kind, _polarization = cfg
         wl = self._wl
         Px, Py = float(self._period[0]), float(self._period[1])
@@ -444,8 +471,32 @@ class _Sol:
             pad = jnp.zeros((grid, grid), complex).at[c - M : c + M + 1, c - M : c + M + 1].set(A * pupil)
             return jnp.abs(jnp.fft.ifft2(jnp.fft.ifftshift(pad)) * (grid * grid)) ** 2
 
-        imgs = jax.vmap(lambda s: jax.vmap(lambda z: plane(s, z))(zs))(S)  # (Ns, nz, grid, grid)
-        vol = jnp.sum(W[:, None, None, None] * imgs, axis=0) / jnp.sum(W)  # (nz, grid, grid)
+        # The Abbe sum is a WEIGHTED REDUCTION over source points, so it accumulates -- but vmapping it
+        # in one shot materialises the whole ``(n_source, nz, grid, grid)`` stack first. At 192² × 40
+        # depths with a σ=0.6 source that intermediate is ~5 GB and OOMs a small card, even though the
+        # result is only ``(nz, grid, grid)``. Scan over CHUNKS of source points instead: peak memory
+        # becomes ``O(chunk · nz · grid²)`` and ``chunk`` trades parallelism against it. ``lax.scan``
+        # keeps this jit-able and differentiable (no Python unrolling).
+        #
+        # Padding with ZERO-weight source points keeps the scan shapes static; a zero weight adds
+        # nothing, so the result is the same sum -- only the floating-point association order changes.
+        ns = int(S.shape[0])
+        chunk = max(1, min(int(source_chunk or ns), ns))
+        pad = (-ns) % chunk
+        Sp = jnp.concatenate([S, jnp.zeros((pad,) + S.shape[1:], S.dtype)]) if pad else S
+        Wp = jnp.concatenate([W, jnp.zeros((pad,), W.dtype)]) if pad else W
+        Sp = Sp.reshape(-1, chunk, *S.shape[1:])
+        Wp = Wp.reshape(-1, chunk)
+        proto = jax.eval_shape(plane, S[0], zs[0])  # shape/dtype of one plane, computed for free
+
+        def _accum(acc, sw):
+            s_c, w_c = sw
+            imgs = jax.vmap(lambda s: jax.vmap(lambda z: plane(s, z))(zs))(s_c)  # (chunk, nz, g, g)
+            return acc + jnp.sum(w_c[:, None, None, None] * imgs, axis=0), None
+
+        acc0 = jnp.zeros((int(nz),) + proto.shape, proto.dtype)
+        vol, _ = jax.lax.scan(_accum, acc0, (Sp, Wp))
+        vol = vol / jnp.sum(W)  # (nz, grid, grid)
         return jnp.moveaxis(vol, 0, -1)  # (grid, grid, nz): x, y, depth
 
 
@@ -465,7 +516,7 @@ class _Exposure:
         the exposure's imaging config is applied). What a constant-threshold resist develops."""
         return self._sol.aerial(*self._cfg)
 
-    def bulk(self, film):
+    def bulk(self, film, source_chunk=None):
         """The **standing-wave bulk image** ``|E(x, y, z)|²`` inside the resist ``film`` -- the aerial spectrum
         propagated into the film so each order interferes with its substrate reflection (the vertical standing
         wave) and decays by absorption (a complex resist index). ``film`` supplies ``n_resist`` (complex for
@@ -473,7 +524,7 @@ class _Exposure:
         default 16) -- e.g. :class:`jno.litho.Film`. Returns a ``(grid, grid, nz)`` JAX array. At ``z = 0`` with
         no substrate reflection it equals :meth:`intensity`. The depth-resolved input a rigorous 3-D resist
         develops; scalar (``E_x``), single-substrate-reflection model (full multilayer Airy is a refinement)."""
-        return self._sol._bulk(self._cfg, film)
+        return self._sol._bulk(self._cfg, film, source_chunk=source_chunk)
 
     def develop(self, resist):
         """Apply a **resist model** -- any callable ``exposure -> developed field`` (the fast
