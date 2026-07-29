@@ -983,8 +983,19 @@ def _solve_complex_transient(blocks: Any, save_ts: Any = None, periodic: Optiona
             def cstep(w, t, dt_):  # dt_ varies per attempt -> rebuild the step solver (backward Euler, θ=1)
                 return _blk_solve(dt_)(_rhs(w, t + dt_, dt_), w)
 
+            # dt0 comes from the SCHEME, not from ``dt`` (the output grid's step): with no rejection an
+            # over-large first attempt is committed permanently, so the marcher's default grows into the
+            # step size from below. See ``adaptive_march``.
             traj = adaptive_march(
-                cstep, w0, t0, t1, _save, rtol=time.rtol, atol=time.atol, max_steps=time.max_steps, dt0=dt
+                cstep,
+                w0,
+                t0,
+                t1,
+                _save,
+                rtol=time.rtol,
+                atol=time.atol,
+                max_steps=time.max_steps,
+                dt0=getattr(time, "dt0", None),
             )
         else:
             # θ-method: (M + θ dt A) w_next = (M − (1−θ) dt A) w + dt(c + θ f_next + (1−θ) f_now). Default

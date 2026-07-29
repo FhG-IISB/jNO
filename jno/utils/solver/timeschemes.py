@@ -59,8 +59,9 @@ class _AdaptiveScheme:
     linear or nonlinear block, scalar or vector, plain or periodic-reduced (the step runs in the reduced
     space; the caller prolongs). The complex-transient path feeds the same marcher its 2n-block step."""
 
-    def __init__(self, rtol: float, atol: float, max_steps: int):
+    def __init__(self, rtol: float, atol: float, max_steps: int, dt0: float | None = None):
         self.rtol, self.atol, self.max_steps = float(rtol), float(atol), int(max_steps)
+        self.dt0 = None if dt0 is None else float(dt0)
 
     def integrate(self, block, args, save_ts, *, linear_solve=None, nonlinear_solve=None):
         s0f = getattr(block, "state0_fn", None)
@@ -70,7 +71,9 @@ class _AdaptiveScheme:
         def step_fn(u, t, dt):
             return block.step(u, t, dt, args=args, theta=theta, linear_solve=linear_solve, nonlinear_solve=nonlinear_solve)
 
-        dt0 = float(block.dt) if block.dt else (float(block.t1) - float(block.t0)) / 100.0
+        # NOTE: deliberately NOT ``block.dt``. The output grid's dt has no relation to the correct step
+        # size, and with no rejection an over-large first step is committed for good — ``dt0=None`` lets
+        # the marcher start at its floor and grow into the right scale. See ``adaptive_march``.
         return adaptive_march(
             step_fn,
             u0,
@@ -80,11 +83,11 @@ class _AdaptiveScheme:
             rtol=self.rtol,
             atol=self.atol,
             max_steps=self.max_steps,
-            dt0=dt0,
+            dt0=self.dt0,
         )
 
     def __repr__(self):
-        return f"jno.solve.adaptive(rtol={self.rtol}, atol={self.atol}, max_steps={self.max_steps})"
+        return f"jno.solve.adaptive(rtol={self.rtol}, atol={self.atol}, max_steps={self.max_steps}, dt0={self.dt0})"
 
 
 def _safe_interp(x, xp, fp):
@@ -99,16 +102,27 @@ def _safe_interp(x, xp, fp):
     return f0 + w * (f1 - f0)
 
 
-def adaptive_march(step_fn, u0, t0, t1, save_ts, *, rtol, atol, max_steps, dt0, safety=0.9, min_factor=0.2, max_factor=5.0):
+def adaptive_march(
+    step_fn, u0, t0, t1, save_ts, *, rtol, atol, max_steps, dt0=None, safety=0.9, min_factor=0.2, max_factor=5.0
+):
     """Adaptive step-size march via **step doubling** (Richardson error control), reverse-mode
     differentiable. ``step_fn(u, t, dt) -> u(t+dt)`` is one implicit step (the block's DAE-correct
     θ-step, or the complex 2n-block step). Each attempt compares a single full step with two half-steps;
-    the normalized RMS difference drives accept/reject and the next dt (exponent ½ for a first-order
-    method). The march is a **fixed-length** ``lax.scan`` of ``max_steps`` — a static trip count, so the
-    whole thing stays reverse-differentiable — where a rejected step or an over-budget tail simply consumes
-    an iteration without advancing ``t``. The trajectory is sampled at ``save_ts`` by interpolation; if the
-    budget is exhausted before ``t1`` the result is **NaN-poisoned** (raise ``max_steps``) rather than
-    silently under-resolving the tail — jNO never fails silently."""
+    the normalized RMS difference sizes the next dt (exponent ½ for a first-order method). The march is a
+    **fixed-length** ``lax.scan`` of ``max_steps`` — a static trip count, so the whole thing stays
+    reverse-differentiable — where the settled / over-budget tail simply consumes an iteration without
+    advancing ``t``. The trajectory is sampled at ``save_ts`` by interpolation; if the budget is exhausted
+    before ``t1`` the result is **NaN-poisoned** (raise ``max_steps``) rather than silently under-resolving
+    the tail — jNO never fails silently.
+
+    **Every attempt is accepted** — see the ``body`` comment for why rejection is not available here. The
+    consequence is that ``dt0`` must not overshoot: an over-large step is committed, and only the *next* one
+    shrinks (and by at most ``1/min_factor`` per attempt). ``dt0=None`` (the default) therefore starts at
+    the floor ``1e-4·span`` and lets the controller **grow** into the right scale at up to ``max_factor``
+    per attempt — an under-sized step costs work, never accuracy, so approaching from below cannot commit
+    an out-of-tolerance step. Passing the caller's output-grid ``dt`` instead measured **4.2x** worse on a
+    2-D heat benchmark, its first two attempts landing 741x and 34x over tolerance and staying in the
+    answer."""
     u0 = jnp.asarray(u0).reshape(-1)
     rt = jnp.real(u0).dtype  # time / dt live in the state's real dtype (a complex system marches its real 2n block)
     t0, t1 = jnp.asarray(t0, rt), jnp.asarray(t1, rt)
@@ -118,6 +132,8 @@ def adaptive_march(step_fn, u0, t0, t1, save_ts, *, rtol, atol, max_steps, dt0, 
     # the count, so the floor needs only to keep every step well-conditioned, not to bound work.
     dt_min = 1e-4 * span
     dt_max = span
+    # Approach the step size from BELOW by default (see the docstring): growth is safe, overshoot is not.
+    dt_start = dt_min if dt0 is None else jnp.clip(jnp.asarray(dt0, rt), dt_min, dt_max)
 
     def _err(a, b):  # normalized RMS of the two estimates' difference (mixed absolute / relative tolerance)
         scale = atol + rtol * jnp.maximum(jnp.abs(a), jnp.abs(b))
@@ -143,9 +159,16 @@ def adaptive_march(step_fn, u0, t0, t1, save_ts, *, rtol, atol, max_steps, dt0, 
         # ``stop_gradient`` it — the standard way to differentiate an adaptive solver (Diffrax does the
         # same): the gradient goes through u and the operator params at the step sequence the forward pass
         # chose. On a **settled** step ``lax.cond`` runs the *skip* branch (no solve), so no zero-cotangent
-        # solve adjoint runs there. **No rejection**: a too-large step is only inaccurate, never unstable
-        # (backward Euler is L-stable), and the error feedback simply shrinks the *next* dt — which keeps
-        # every step's ``u_half`` a genuinely-used (non-discarded) state, so no NaN from a masked branch.
+        # solve adjoint runs there.
+        #
+        # **No rejection**, and the reason is AD, not stability: rejecting would mean discarding this
+        # attempt's ``u_half`` (``where(accept, u_half, u)``), whose cotangent is then exactly zero, so the
+        # matrix-free solve adjoint runs on ``b = 0`` and its relative-residual test divides 0/0. Measured:
+        # adding rejection turns a finite gradient (AD -21.92 vs FD -21.99) into ``NaN``. Accepting every
+        # attempt keeps ``u_half`` a genuinely-used state. NOTE the older rationale here — "a too-large step
+        # is only inaccurate, never unstable (backward Euler is L-stable)" — argued the wrong thing:
+        # L-stability says the step will not blow up, not that an out-of-tolerance step is acceptable to
+        # keep. Since it IS kept, the burden falls on ``dt0`` never overshooting (see the docstring).
         _t, _dt = jax.lax.stop_gradient(t), jax.lax.stop_gradient(dt_step)
         u_new, err = jax.lax.cond(done, lambda o: (o[0], jnp.asarray(0.0, rt)), _take, (u, _t, _dt))
         t_new = jnp.where(done, t, t + _dt)
@@ -153,7 +176,7 @@ def adaptive_march(step_fn, u0, t0, t1, save_ts, *, rtol, atol, max_steps, dt0, 
         dt_next = jnp.clip(dt_ctrl * fac, dt_min, dt_max)
         return (t_new, u_new, dt_next), (t_new, u_new)
 
-    (t_end, _u, _dt), (ts, us) = jax.lax.scan(body, (t0, u0, jnp.asarray(dt0, rt)), None, length=int(max_steps))
+    (t_end, _u, _dt), (ts, us) = jax.lax.scan(body, (t0, u0, dt_start), None, length=int(max_steps))
     ts = jax.lax.stop_gradient(jnp.concatenate([t0[None], ts]))  # sample times are a fixed schedule (control)
     us = jnp.concatenate([u0[None, :], us], axis=0)
     save = jnp.asarray(save_ts, rt)
