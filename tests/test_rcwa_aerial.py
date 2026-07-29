@@ -411,7 +411,11 @@ def test_bulk_standing_wave_period():
     """A reflective substrate makes each order interfere with its reflection → a vertical STANDING WAVE of
     period λ/(2·n_resist). Open frame (single order), n_resist=1.7, wl=1 (K0=2π) → period ≈ 0.294."""
     nr, d, nz = 1.7, 2.0, 64
-    exp = jno.rcwa(_cons(_open), orders=20, grid=24).solve().expose(NA=0.4, source=0.3)
+    # The measurement is one pixel column FFT'd along z, and the mask is an open frame (laterally
+    # uniform), so lateral resolution buys nothing here -- while the default 128x128 image makes the
+    # Abbe sum's (n_source, nz, grid, grid) stack a multi-GB allocation. Keep nz (it sets the FFT
+    # resolution the period is read from) and drop the image to 16x16.
+    exp = jno.rcwa(_cons(_open), orders=20, grid=24).solve().expose(NA=0.4, source=0.3, grid=16)
     vol = np.asarray(exp.bulk(jno.litho.Film(n_resist=nr, thickness=d, n_substrate=4.0, nz=nz)))
     Iz = vol[vol.shape[0] // 2, vol.shape[1] // 2, :]  # I(z) at a pixel
     Iz = Iz - Iz.mean()
@@ -482,8 +486,18 @@ def test_caresist_3d_is_differentiable_ilt():
     PEB on a jno.Shape box → developed volume. The rigorous depth-resolved resist stays fully differentiable."""
     cons, ep = _ilt_cons()
     film = jno.litho.Film(n_resist=1.6, thickness=0.6, n_substrate=4.0, nz=4)
-    resist = jno.litho.CAResist(n=8, t_peb=10.0, steps=3, dill_c=4.0, diffusion_length=(0.12, 0.08), film=film)
-    node = jno.rcwa(cons, orders=30, grid=24, params={"ep": 2.0}).solve().printed(NA=0.6, source=0.5, resist=resist)
+    # Sized to fit an 8 GB GPU. The periodic transient prolongs its whole trajectory back to the full
+    # nodal space (SemidiscreteTimeBlock.solve) and reverse-mode holds every prolonged step, so the PEB
+    # mesh sets the peak. Shrink the SEED first -- printed(grid=) defaults to a 128x128 image, 16x finer
+    # than this gradient check needs -- then take a mesh to match: at grid=32 the pixel pitch is 0.0875,
+    # so 0.3 stays inside the 4-pixel coarseness guard while being ~8x fewer tets than the 0.15 default.
+    # Coarsening the mesh alone would instead trip that guard, i.e. test the regime the library warns about.
+    resist = jno.litho.CAResist(
+        n=8, t_peb=10.0, steps=3, dill_c=4.0, diffusion_length=(0.12, 0.08), film=film, mesh_size=0.3
+    )
+    node = (
+        jno.rcwa(cons, orders=30, grid=24, params={"ep": 2.0}).solve().printed(NA=0.6, source=0.5, grid=32, resist=resist)
+    )
     assert isinstance(node, FunctionCall)
     g, fd = _grad_vs_fd(node, ep)
     assert g == pytest.approx(fd, rel=5e-3)
