@@ -60,9 +60,28 @@ def _analytic(d, save, coeff=1.0):
     return u0, interior, np.exp(-2 * PI**2 * coeff * np.asarray(save))
 
 
-def test_adaptive_real_scalar_matches_analytic_and_beats_coarse_fixed():
+def _semidiscrete(mesh_size, t_end, coeff=1.0, n_coarse=1001):
+    """The ``dt -> 0`` solution on the SAME mesh: two fine fixed-dt solves, Richardson-extrapolated
+    (backward Euler is first order, so ``2·u(dt/2) - u(dt)`` cancels the O(dt) term).
+
+    Time-stepping accuracy must be measured against THIS, not against the analytic solution. On this
+    problem the P1 spatial error and the backward-Euler time error have **opposite signs** — the discrete
+    eigenvalue over-decays, backward Euler under-decays — so error-vs-analytic is non-monotonic in dt and
+    partially cancels. A scheme with *more* time error can look closer to the analytic answer, which is an
+    artefact, not accuracy."""
+    ts = jnp.asarray([0.0, t_end])
+    _, coarse = _heat(mesh_size=mesh_size, nsteps=n_coarse, coeff=coeff)
+    _, fine = _heat(mesh_size=mesh_size, nsteps=2 * n_coarse - 1, coeff=coeff)
+    return (
+        2 * np.asarray(_default_transient_integrate(fine.operator, {}, ts))[-1]
+        - np.asarray(_default_transient_integrate(coarse.operator, {}, ts))[-1]
+    )
+
+
+def test_adaptive_real_scalar_is_time_converged_and_beats_coarse_fixed():
     """The headline: on a coarse 6-point save grid the adaptive marcher takes finer *internal* steps, so
-    it tracks the analytic heat decay far better than fixed backward-Euler on the same 6 points."""
+    its **time-discretization error** is far below fixed backward-Euler's on the same 6 points — and low
+    enough that what remains is the mesh's own spatial error, i.e. it is time-converged."""
     d, fem = _heat(mesh_size=0.15, nsteps=6)
     save = jnp.linspace(0.0, 0.05, 6)
     ad = np.asarray(
@@ -71,14 +90,73 @@ def test_adaptive_real_scalar_matches_analytic_and_beats_coarse_fixed():
     be = np.asarray(_default_transient_integrate(fem.operator, {}, save))
     assert not np.any(np.isnan(ad))
     assert np.max(np.abs(ad[0] - be[0])) < 1e-12  # initial condition preserved exactly
+
     u0, interior, decay = _analytic(d, save)
+    ref = _semidiscrete(0.15, 0.05)
+    t_err = lambda traj: np.linalg.norm(traj[-1][interior] - ref[interior]) / np.linalg.norm(ref[interior])
+    assert t_err(ad) < 5e-3, f"adaptive time error: {t_err(ad):.2e}"
+    assert t_err(ad) < 0.1 * t_err(be), f"adaptive {t_err(ad):.2e} vs fixed BE {t_err(be):.2e}"
 
-    def rel(traj, k):
-        e = (u0 * decay[k])[interior]
-        return np.linalg.norm(traj[k][interior] - e) / np.linalg.norm(e)
+    # Time-converged: the residual against the analytic solution is now the MESH error, not the scheme's.
+    exact = (u0 * decay[-1])[interior]
+    floor = np.linalg.norm(ref[interior] - exact) / np.linalg.norm(exact)
+    off_analytic = np.linalg.norm(ad[-1][interior] - exact) / np.linalg.norm(exact)
+    assert off_analytic < 1.2 * floor, f"off analytic {off_analytic:.2e} vs mesh floor {floor:.2e}"
 
-    assert rel(ad, -1) < 2e-2, f"adaptive off analytic: {rel(ad, -1):.2e}"
-    assert rel(ad, -1) < rel(be, -1), "adaptive must beat coarse fixed backward-Euler on the same save grid"
+
+def test_adaptive_starts_from_below_not_from_the_output_grid():
+    """Regression: ``dt0`` must NOT default to the output grid's ``dt``.
+
+    There is no step rejection (a discarded state would zero the per-step solve adjoint's cotangent and
+    return a NaN gradient), so an over-large first step is committed permanently — only the *next* one
+    shrinks, and by at most 5x per attempt. Seeding from the caller's output grid therefore bakes the
+    first few attempts' error into the answer for good: on this problem attempt 1 lands ~740x over
+    tolerance and attempt 2 ~34x. Growing from the floor instead cannot commit an out-of-tolerance step,
+    because an under-sized step costs work, not accuracy.
+
+    Measured against a Richardson-extrapolated semi-discrete reference (same mesh, dt -> 0, so this is
+    PURE time error with no spatial contamination): 1.23e-2 seeded from the grid vs 2.94e-3 from below."""
+    d, fem = _heat(mesh_size=0.15, nsteps=11, coeff=1.0)
+    save = jnp.linspace(0.0, 0.05, 11)
+    block = fem.operator
+    kw = dict(rtol=1e-5, atol=1e-8, max_steps=800)
+
+    ref = _semidiscrete(0.15, 0.05)
+    time_err = lambda traj: np.linalg.norm(np.asarray(traj)[-1] - ref) / np.linalg.norm(ref)
+
+    from_below = _AdaptiveScheme(**kw).integrate(block, {}, save, linear_solve=None, nonlinear_solve=None)
+    from_grid = _AdaptiveScheme(**kw, dt0=float(block.dt)).integrate(
+        block, {}, save, linear_solve=None, nonlinear_solve=None
+    )
+    e_below, e_grid = time_err(from_below), time_err(from_grid)
+    assert not np.any(np.isnan(np.asarray(from_below)))
+    assert e_below < 0.5 * e_grid, f"growing from below must beat grid-seeded: {e_below:.2e} vs {e_grid:.2e}"
+    assert e_below < 5e-3, f"time error from below regressed: {e_below:.2e}"
+
+
+def test_adaptive_rejection_would_break_the_gradient():
+    """Documents WHY every attempt is accepted, so nobody "fixes" it back.
+
+    The no-rejection design is load-bearing for AD, not for stability: rejecting means discarding an
+    attempt's state, whose cotangent is then exactly zero, so the matrix-free per-step solve adjoint runs
+    on ``b = 0`` and its relative-residual test divides 0/0. This test pins the *property that makes
+    rejection unavailable* — that the accepted state is the one the gradient flows through — by checking
+    the gradient stays finite and matches a finite difference at a tolerance loose enough to make the
+    controller work hard (many attempts, wide dt range)."""
+    d, fem = _heat(mesh_size=0.2, nsteps=6, param=True)
+    (name,) = fem.operator.runtime_parameter_exprs
+    save = jnp.linspace(0.0, 0.05, 6)
+    sch = _AdaptiveScheme(1e-6, 1e-9, 1200)
+
+    def loss(kv):
+        return jnp.sum(
+            sch.integrate(fem.operator, {name: jnp.asarray([kv])}, save, linear_solve=None, nonlinear_solve=None) ** 2
+        )
+
+    g = float(jax.grad(loss)(0.8))
+    fd = float((loss(0.8 + 1e-5) - loss(0.8 - 1e-5)) / 2e-5)
+    assert np.isfinite(g), "gradient must stay finite — a discarded state would make it NaN"
+    assert abs(g - fd) <= 1e-2 * max(abs(fd), 1.0), f"AD {g} vs FD {fd}"
 
 
 def test_adaptive_real_scalar_is_differentiable():
