@@ -419,6 +419,51 @@ no listed region. It desugars to `sum_r RegionMask(r)·value_r`, inheriting the 
 
 ---
 
+## Axisymmetric (bodies of revolution)
+
+**jNO applies no ring measure for you — you write it in the weak form.** A meridional `(r, z)` mesh is
+an ordinary 2-D mesh; what makes a form axisymmetric is the measure you put in it.
+
+For a **scalar** field that is exactly the Cartesian integrand times `2πr`:
+
+```
+∫ (∂ᵣu ∂ᵣv + ∂zu ∂zv) 2πr dr dz     is the weak form of     (1/r)(r u_ᵣ)_ᵣ + u_zz
+```
+
+so nothing is missing — write the factor and you have it:
+
+```python
+d = jno.domain(box(a, 0, b, h), mesh_size=0.05)      # just a 2-D mesh
+d.tag("inner", lambda x, y: jnp.abs(x - a) < 1e-9)
+d.tag("outer", lambda x, y: jnp.abs(x - b) < 1e-9)
+
+u, v = d.fem_symbols()
+r, z, _ = d.variable("interior", split=True)
+ui, vi = u.bind(x=r, y=z), v.bind(x=r, y=z)
+ra, za, _ = d.variable("inner", split=True)
+rb, zb, _ = d.variable("outer", split=True)
+
+dV = 2 * jnp.pi * r                                   # the ring measure, written once
+fem = jno.fem([k * (ui.x * vi.x + ui.y * vi.y) * dV,
+               -g * v.bind(x=rb, y=zb) * (2 * jnp.pi * rb),   # boundary terms carry it too
+               u(ra, za) - T_a])
+T = fem.solve()      # logarithmic in r, and Q = 2πk ΔT/ln(b/a) comes out right
+```
+
+Every term needs it — volume terms, source terms and Neumann/Robin terms alike. Miss one and the
+answer is wrong by exactly that factor with no error raised, so bind `dV` once at the top and reuse it.
+
+> **Vector fields need more than the measure.** Axisymmetric elasticity carries a hoop strain
+> `ε_θθ = u_r/r`, and divergence picks up `u_r/r`. Neither can be produced by weighting the Cartesian
+> form by anything — they are extra terms you must write out. This is precisely why jNO does not offer
+> to apply the weighting automatically: it would be exact for scalars and quietly wrong for vectors.
+
+> **Enclosure radiation.** `domain.enclosure(tags, axisymmetric=True)` gives ring areas `2πr̄·L` and a
+> `gap.load(q)` that is **per full revolution** (W, not W/m). The weak form you add it to must carry
+> the same `2πr`, or the two sides differ by exactly that factor. jNO cannot check this for you.
+
+---
+
 ## Enclosure radiation (nonlocal boundary flux)
 
 Grey-body radiation between surfaces is **nonlinear** (`T⁴`) and **nonlocal** (every surface element
@@ -430,7 +475,7 @@ provides the *geometric* building block — the view matrix — and you write th
 FEM mesh nodes and returns a handle:
 
 ```python
-gap = d.enclosure(["inner_gap", "outer_gap"], axisymmetric=False)   # name the surfaces once
+gap = d.enclosure(["inner_gap", "outer_gap"])   # name the surfaces once
 gap.check()                          # F-quality gate: closure (Σ_j F_ij→1) + reciprocity (A_i F_ij=A_j F_ji)
 F   = gap.view_factor                # (m, m) element view factor — fully geometry-determined
 eps = gap.emissivity({"inner_gap": 0.8, "outer_gap": 0.6})         # per-element ε from a {tag: ε} map
@@ -439,11 +484,29 @@ rho = 1.0 - eps
 
 `F` is computed purely from geometry (occlusion + orientation) by **double-area Gauss quadrature** of
 the diffuse kernel — so a *concave* surface keeps its self-view. Tags only group elements (for
-per-surface emissivity); they never block exchange. Use `axisymmetric=True` for a body of revolution
-(a near-field floor `r_min` keeps on-axis pairs physical). By default the boundary normals point *out
-of* the mesh (radiation across an un-meshed gap); for an **oven/furnace cavity** where the meshed fluid
-is inside, pass `inward=True` so the facing walls see one another (see the *Oven* tutorial); for a
-meshed *medium* between solids use `medium_tags`.
+per-surface emissivity); they never block exchange. The enclosure **inherits** `axisymmetric` from the
+domain (see below), so its ring areas and the FEM measure cannot disagree; passing a contradicting value
+raises. By default the boundary normals point *out of* the mesh (radiation across an un-meshed gap); for
+an **oven/furnace cavity** where the meshed fluid is inside, pass `inward=True` so the facing walls see
+one another (see the *Oven* tutorial); for a meshed *medium* between solids use `medium_tags`.
+
+> **What blocks a ray (interface mode).** Every meshed region that is *not* listed in `medium_tags`
+> is opaque — including a solid that carries no radiating surface of its own. This used to be inferred
+> from the element tags, which made such a solid silently transparent; on a real furnace that let 46 %
+> of the pairs the visibility test called *visible* have chords passing through solid material, with no
+> error raised and a perfectly plausible `F`. The occluder set is now resolved once from the region
+> list and shared by the visibility test and the near-field refinement.
+
+> **Axisymmetric near field.** The ring kernel's azimuthal integrand peaks at `φ = 0` with width `d/r`,
+> so a uniform `n_phi` rule overshoots every near-touching pair (two surfaces meeting in a wedge, and
+> every element's own ring self-view) by roughly `dφ/(d/r)`. A graded azimuthal rule fixes it and
+> restores closure to ~1e-3, but it needs an occluder model to test its refined chords against, so it
+> runs when one is available: **`medium_tags=...`** (interface mode — the solid polygons), or
+> **`occlude=False`** (you asserting nothing blocks any ray, e.g. a convex cavity). Plain boundary mode
+> with occlusion on keeps the uniform rule plus the `r_min` floor and a closure error around 1e-1, and
+> logs a warning saying so. Its occlusion is also a *meridian-only* test reused at every azimuth, which
+> is wrong for a general solid of revolution — interface mode checks the true 3-D chord per azimuth.
+> Always call `gap.check()`.
 
 Write the **full grey-body radiosity** (reflections included) and couple it to the conduction FEM by
 adding the net flux as a consistent surface load to the residual:
