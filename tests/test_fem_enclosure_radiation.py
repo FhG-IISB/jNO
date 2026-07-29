@@ -1001,3 +1001,447 @@ def test_radiation_coupling_in_a_transient_solve_reaches_the_steady_coupled_stat
     assert T_final.max() > T_cold + 100.0, "transient never heated up"
     rel = np.abs(T_final - T_steady).max() / (np.abs(T_steady).max() + 1e-9)
     assert rel < 2e-2, f"transient end state did not reach the steady coupled solution: rel {rel:.3f}"
+
+
+def _axisym_disc_enclosure(R, n, z=0.0):
+    """A bare radial (disc) surface as enclosure elements: r from 0 to R at height z."""
+    from jno.domain.enclosure import Enclosure
+
+    r = np.linspace(0.0, R, n + 1)
+    e0 = np.c_[r[:-1], np.full(n, z)]
+    e1 = np.c_[r[1:], np.full(n, z)]
+    elements = np.c_[np.arange(n), np.arange(1, n + 1)]
+    areas = 2 * np.pi * (0.5 * (e0[:, 0] + e1[:, 0])) * np.linalg.norm(e1 - e0, axis=1)
+    normals = np.tile([0.0, 1.0], (n, 1))
+    return Enclosure(
+        domain=None,
+        tags=["disc"],
+        F=np.zeros((n, n)),
+        elements=elements,
+        element_tags=np.array(["disc"] * n, dtype=object),
+        areas=areas,
+        normals=normals,
+        midpoints=0.5 * (e0 + e1),
+        axisymmetric=True,
+        endpoints=(e0, e1),
+    ), r
+
+
+def test_enclosure_load_axisymmetric_ring_measure_is_exact_for_a_linear_field():
+    """``Enclosure.load`` must scatter ``∫_Γ q v (2πr) ds``, not the 2-D ``q·area/2`` half-and-half split.
+
+    Oracle: for constant ``q`` on a disc of radius ``R``, the consistent load tested against the linear
+    nodal field ``v(r) = r`` must reproduce ``∫_0^R q·r·2πr dr = 2πqR³/3`` EXACTLY (the ring weights
+    integrate a linear test function exactly, element by element). The equal split cannot — it puts too
+    much weight on the inner node of every radial element.
+    """
+    R, n, q0 = 0.7, 5, 3.0
+    gap, r = _axisym_disc_enclosure(R, n)
+    q = jnp.full(n, q0)
+
+    load = np.asarray(gap.load(q, size=n + 1))
+    exact = 2 * np.pi * q0 * R**3 / 3.0
+    assert abs(float(load @ r) - exact) < 1e-12 * exact, f"ring load {load @ r:.9f} vs exact {exact:.9f}"
+
+    # total load is still the ring area x flux (the split redistributes, it does not create or destroy)
+    assert abs(load.sum() - q0 * np.pi * R**2) < 1e-12 * q0 * np.pi * R**2
+
+    # ...and the 2-D half-and-half split, which is what the code did before, is measurably wrong here
+    half = np.zeros(n + 1)
+    A = np.asarray(gap.areas)
+    np.add.at(half, np.arange(n), q0 * A * 0.5)
+    np.add.at(half, np.arange(1, n + 1), q0 * A * 0.5)
+    assert abs(float(half @ r) - exact) > 1e-3 * exact, "premise broken: the equal split should NOT be exact"
+
+
+def test_enclosure_load_axisymmetric_weights_reduce_to_halves_on_a_cylindrical_wall():
+    """A wall at constant radius has Δr = 0, so the ring weights must collapse back to the even split —
+    the radius-weighting is a correction for RADIAL extent only, not a global rescale."""
+    from jno.domain.enclosure import _consistent_node_weights
+
+    r_wall, H, n = 0.4, 1.0, 6
+    z = np.linspace(0.0, H, n + 1)
+    e0 = np.c_[np.full(n, r_wall), z[:-1]]
+    e1 = np.c_[np.full(n, r_wall), z[1:]]
+    areas = 2 * np.pi * r_wall * np.linalg.norm(e1 - e0, axis=1)
+
+    w = _consistent_node_weights(areas, (e0, e1), axisymmetric=True)
+    assert np.allclose(w[:, 0], w[:, 1]), "constant-radius elements must split evenly"
+    assert np.allclose(w.sum(axis=1), areas), "weights must sum to the ring area"
+
+
+def test_enclosure_load_2d_is_unchanged_by_the_ring_measure_work():
+    """Regression: the 2-D path must keep the plain half-and-half split (edge length, no 2πr)."""
+    from jno.domain.enclosure import _consistent_node_weights
+
+    areas = np.array([0.3, 1.7, 0.05])
+    w = _consistent_node_weights(areas, None, axisymmetric=False)
+    assert np.allclose(w, np.stack([areas * 0.5, areas * 0.5], axis=1))
+
+
+def test_axisymmetric_boundary_mode_closure_when_nothing_occludes():
+    """A CLOSED convex cavity built the plain way (``d.enclosure(tags)``, no ``medium_tags``) must close.
+
+    The near-field refinement used to be gated to interface mode outright, because it re-derived its
+    occluders from ``domain._source_regions`` keyed by the element tags — a lookup that comes back empty
+    in boundary mode, silently recomputing every refined pair as fully visible. The occluder model is now
+    passed in explicitly, so boundary mode can run the refinement exactly where "fully visible" is the
+    truth: an unobstructed enclosure. Without it, row sums here sit ~0.87 (the r_min floor destroying
+    energy) or ~2.3 (no floor, the corner overshoot creating it).
+    """
+    import jno
+
+    pytest.importorskip("shapely", reason="shapely required for PolygonDomain")
+    from shapely.geometry import box
+
+    R, H = 0.10, 0.10
+    d = jno.domain(box(0.0, 0.0, R, H), mesh_size=0.012)
+    d.tag("bottom", lambda x, y: jnp.abs(y) < 1e-9)
+    d.tag("side", lambda x, y: jnp.abs(x - R) < 1e-9)
+    d.tag("top", lambda x, y: jnp.abs(y - H) < 1e-9)
+
+    # occlude=False is the caller asserting "nothing blocks any ray" — true for this convex cavity, and
+    # what lets the refinement run in boundary mode (there are no solid polygons to trace against here,
+    # and the meridian visibility test is blind to axisymmetric self-occlusion, so it cannot be inferred).
+    gap = d.enclosure(["bottom", "side", "top"], axisymmetric=True, inward=True, occlude=False)
+    rows = np.asarray(gap.view_factor).sum(axis=1)
+    assert rows.max() < 1.02, f"closed cavity: row sums must not exceed 1, got max {rows.max():.4f}"
+    assert rows.min() > 0.98, f"closed cavity: row sums must not fall below 1, got min {rows.min():.4f}"
+
+    # the analytic coaxial-disk factor still comes out of the same F (Modest Ch. 4 / App. D)
+    F, A, tags = np.asarray(gap.view_factor), np.asarray(gap.areas), np.asarray(gap.element_tags)
+    bot, top = tags == "bottom", tags == "top"
+    f_bt = float((A[bot, None] * F[np.ix_(bot, top)]).sum() / A[bot].sum())
+    Rr = R / H
+    S = 1 + (1 + Rr**2) / Rr**2
+    assert abs(f_bt - 0.5 * (S - np.sqrt(S**2 - 4))) < 1e-2, f"bottom->top disk factor {f_bt:.4f}"
+
+
+def test_refine_near_pairs_requires_its_occluder_model():
+    """Passing the occluders explicitly is what stops the refinement from fabricating lines of sight.
+
+    Concentric cylinders: the outer wall's self-view is occlusion-limited to ``1 - r1/r2``. Refining with
+    the real solid keeps it; refining with the old empty-lookup fallback (a domain with no
+    ``_source_regions``) inflates it and pushes the row sum well past 1.
+    """
+    from types import SimpleNamespace
+
+    from shapely.geometry import box
+
+    from jno.domain.enclosure import _refine_near_pairs, _solid_polygon_visibility_3d
+
+    r1, r2, H, NZ, n_phi = 0.8, 1.0, 12.0, 48, 64
+    z = np.linspace(0.0, H, NZ + 1)
+    e0 = np.vstack([np.c_[np.full(NZ, r1), z[:-1]], np.c_[np.full(NZ, r2), z[:-1]]])
+    e1 = np.vstack([np.c_[np.full(NZ, r1), z[1:]], np.c_[np.full(NZ, r2), z[1:]]])
+    nrm = np.vstack([np.tile([1.0, 0.0], (NZ, 1)), np.tile([-1.0, 0.0], (NZ, 1))])
+    mids, length = 0.5 * (e0 + e1), np.linalg.norm(e1 - e0, axis=1)
+    m = e0.shape[0]
+
+    solid = box(0.0, 0.0, r1, H)
+    dom = SimpleNamespace(_source_regions={"inner": solid})
+    tags = np.array(["inner"] * m, dtype=object)
+    phi = np.linspace(0.0, 2 * np.pi, n_phi, endpoint=False)
+    vm = _solid_polygon_visibility_3d(dom, tags, mids, length, phi)
+    F0 = np.asarray(
+        MeshUtils.get_view_factor_axisymmetric_element(
+            jnp.asarray(e0), jnp.asarray(e1), jnp.asarray(nrm), jnp.asarray(vm), n_quad=3, n_phi=n_phi, r_min=0.0
+        )
+    )
+    mid_o, outer = NZ + NZ // 2, slice(NZ, 2 * NZ)
+
+    good = _refine_near_pairs(F0, e0, e1, nrm, dom, tags, n_phi, occluders=([solid], solid))
+    assert abs(good[mid_o, outer].sum() - (1 - r1 / r2)) < 3e-2, (
+        f"with its occluders, F22 should be {1 - r1 / r2:.3f}, got {good[mid_o, outer].sum():.3f}"
+    )
+
+    # the old behaviour: no occluders found -> refined pairs invented as fully visible
+    blind = _refine_near_pairs(F0, e0, e1, nrm, SimpleNamespace(_source_regions={}), tags, n_phi)
+    assert blind[mid_o, outer].sum() > (1 - r1 / r2) + 0.2, "premise broken: the blind fallback should inflate F22"
+    assert blind[mid_o].sum() > 1.05, "premise broken: the blind fallback should break the physical row bound"
+
+
+def _chords_cross_solid(vis, mids, phi, solids, n_sample=200, frac=0.02):
+    """Independent audit of a visibility array: of the pairs it calls VISIBLE, how many have a 3-D
+    chord that actually passes through solid material?
+
+    Shares no code with the occlusion test — it samples the chord, maps it to the meridian via
+    ``rho(t) = |(1-t)P_i + t P_j|_xy``, and asks shapely whether those points are inside a solid.
+    """
+    import shapely
+    from shapely.ops import unary_union
+
+    uni = unary_union(list(solids)).buffer(-2e-4)  # erode: endpoints legitimately sit ON a surface
+    rng = np.random.default_rng(0)
+    m = mids.shape[0]
+    t = np.linspace(0.0, 1.0, 240)[:, None]
+    leaked = checked = 0
+    for _ in range(n_sample):
+        i, j, k = (int(rng.integers(m)), int(rng.integers(m)), int(rng.integers(len(phi))))
+        if not vis[i, j, k]:
+            continue
+        checked += 1
+        Pi = np.array([mids[i, 0], 0.0, mids[i, 1]])
+        Pj = np.array([mids[j, 0] * np.cos(phi[k]), mids[j, 0] * np.sin(phi[k]), mids[j, 1]])
+        Q = Pi[None, :] * (1 - t) + Pj[None, :] * t
+        if shapely.contains_xy(uni, np.hypot(Q[:, 0], Q[:, 1]), Q[:, 2]).mean() > frac:
+            leaked += 1
+    return leaked, checked
+
+
+def test_visibility_occluders_must_be_passed_not_inferred_from_tags():
+    """``_solid_polygon_visibility_3d`` infers its occluders from the SET of element tags unless they
+    are passed. A solid that owns no radiating element — or whose elements were tagged under another
+    name — is then silently transparent, and the resulting F is plausible but wrong.
+
+    Here a baffle splits a cavity in two. Tag the elements only by the outer shell (as a caller
+    lumping several parts under one name would), and the baffle stops blocking anything: chords sail
+    straight through it. Passing ``occluders=`` restores it.
+    """
+    from types import SimpleNamespace
+
+    from shapely.geometry import box
+
+    from jno.domain.enclosure import _solid_polygon_visibility_3d
+
+    R, H, RB, ZB, TB = 0.10, 0.20, 0.045, 0.10, 0.006
+    baffle = box(RB, ZB - TB / 2, R, ZB + TB / 2)
+    shell = box(R, 0.0, R + 0.01, H)  # a wall that owns the tag the elements carry
+    dom = SimpleNamespace(_source_regions={"baffle": baffle, "shell": shell})
+
+    # elements on the cavity wall, above and below the baffle
+    z = np.concatenate([np.linspace(0.01, ZB - TB, 8), np.linspace(ZB + TB, H - 0.01, 8)])
+    mids = np.c_[np.full(z.size, R - 1e-6), z]
+    length = np.full(z.size, 0.01)
+    phi = np.linspace(0.0, 2 * np.pi, 16, endpoint=False)
+    tags = np.array(["shell"] * z.size, dtype=object)  # baffle owns no element -> never an occluder
+
+    inferred = _solid_polygon_visibility_3d(dom, tags, mids, length, phi)
+    passed = _solid_polygon_visibility_3d(dom, tags, mids, length, phi, occluders=[baffle, shell])
+
+    lo_hi = np.ix_(np.arange(8), np.arange(8, 16), [0])  # below-baffle -> above-baffle, same meridian
+    assert inferred[lo_hi].all(), (
+        "premise broken: with the baffle missing from the tag-derived occluder set, every "
+        "across-the-baffle pair should come back visible"
+    )
+    assert not passed[lo_hi].any(), (
+        "with occluders passed explicitly the baffle must block every across-the-baffle chord at phi=0"
+    )
+
+    # and the audit agrees: the inferred set leaks, the explicit one does not
+    leak_i, n_i = _chords_cross_solid(inferred, mids, phi, [baffle, shell])
+    leak_p, n_p = _chords_cross_solid(passed, mids, phi, [baffle, shell])
+    assert leak_i > 0, f"expected leaks from the inferred occluder set (checked {n_i})"
+    assert leak_p == 0, f"explicit occluders must not leak, got {leak_p} of {n_p}"
+
+
+def test_build_enclosure_occludes_with_every_solid_not_just_tagged_ones():
+    """End-to-end: ``d.enclosure(..., medium_tags=[...])`` must treat EVERY non-medium region as
+    opaque, including one that carries no radiating surface of its own."""
+    import jno
+
+    pytest.importorskip("shapely", reason="shapely required for PolygonDomain")
+    from shapely.geometry import box
+
+    from jno.domain.enclosure import _solid_polygon_visibility_3d  # noqa: F401  (documents the path)
+
+    R, H = 0.05, 0.12
+    inner = box(0.0, 0.0, R, H)  # the transparent medium
+    baffle = box(0.02, 0.055, R, 0.065)  # an opaque shelf with no radiating tag of its own
+    outer = box(R, 0.0, R + 0.01, H)
+    d = jno.domain({"gas": inner.difference(baffle), "baffle": baffle, "wall": outer}, mesh_size=0.01)
+    gap = d.enclosure(["wall"], medium_tags=["gas"], axisymmetric=True, n_phi=16)
+
+    # the baffle is not a 'wall' element owner, so a tag-derived occluder set would omit it entirely
+    mids = np.asarray(gap.midpoints)
+    below = mids[:, 1] < 0.05
+    above = mids[:, 1] > 0.07
+    assert below.any() and above.any(), "need elements on both sides of the baffle"
+    F = np.asarray(gap.view_factor)
+    across = F[np.ix_(np.flatnonzero(below), np.flatnonzero(above))]
+    assert across.max() < 0.5 * F.max(), (
+        f"the baffle must attenuate across-shelf exchange; got max {across.max():.4f} vs overall {F.max():.4f}"
+    )
+
+
+def _monte_carlo_row(e0, e1, nrm, cavity, src, n_rays=60_000, step=1e-4, seed=5):
+    """Brute-force the view-factor row of one element by tracing diffuse rays in true 3-D.
+
+    Shares no code with the view-factor machinery: it samples the source ring uniformly in AREA
+    (density proportional to r), fires cosine-weighted directions, marches each ray until it leaves
+    the cavity polygon, and counts where it lands. Those hit fractions ARE F_ij by definition
+    (Modest, *Radiative Heat Transfer*, 3rd ed., Ch. 4).
+    """
+    import shapely
+
+    rng = np.random.default_rng(seed)
+    (ra, za), (rb, zb) = e0[src], e1[src]
+    dr = rb - ra
+    u = rng.random(n_rays)
+    s = u if abs(dr) < 1e-14 else (-ra + np.sqrt(ra**2 + 2 * dr * u * (ra + 0.5 * dr))) / dr
+    P = np.c_[ra + s * dr, np.zeros(n_rays), za + s * (zb - za)]
+
+    nv = np.array([nrm[src, 0], 0.0, nrm[src, 1]])
+    nv /= np.linalg.norm(nv)
+    t1 = np.cross(nv, [0.0, 1.0, 0.0])
+    t1 /= np.linalg.norm(t1)
+    t2 = np.cross(nv, t1)
+    u1, u2 = rng.random(n_rays), rng.random(n_rays)
+    ct, st, ps = np.sqrt(u1), np.sqrt(1 - u1), 2 * np.pi * u2
+    D = (st * np.cos(ps))[:, None] * t1 + (st * np.sin(ps))[:, None] * t2 + ct[:, None] * nv
+    P = P + 1e-9 * D
+
+    span = float(np.hypot(np.ptp(e0[:, 0]) * 2, np.ptp(e0[:, 1]))) * 2.5
+    t_hit = np.full(n_rays, np.nan)
+    alive = np.ones(n_rays, bool)
+    t = np.zeros(n_rays)
+    for _ in range(int(span / step)):
+        if not alive.any():
+            break
+        tt = t + step
+        Q = P + tt[:, None] * D
+        left = alive & ~shapely.contains_xy(cavity, np.hypot(Q[:, 0], Q[:, 1]), Q[:, 2])
+        t_hit[left] = tt[left]
+        alive &= ~left
+        t = np.where(alive, tt, t)
+    lo = np.where(np.isnan(t_hit), 0.0, t_hit - step)
+    hi = np.where(np.isnan(t_hit), 0.0, t_hit)
+    ok = ~np.isnan(t_hit)
+    for _ in range(28):
+        md = 0.5 * (lo + hi)
+        Q = P + md[:, None] * D
+        ins = shapely.contains_xy(cavity, np.hypot(Q[:, 0], Q[:, 1]), Q[:, 2])
+        lo, hi = np.where(ins, md, lo), np.where(ins, hi, md)
+    Q = P + (0.5 * (lo + hi))[:, None] * D
+    X = np.c_[np.hypot(Q[:, 0], Q[:, 1]), Q[:, 2]]
+
+    seg = e1 - e0
+    L2 = np.maximum((seg**2).sum(1), 1e-30)
+    tt = np.clip(((X[:, None, :] - e0[None]) * seg[None]).sum(-1) / L2[None], 0, 1)
+    d = np.linalg.norm(X[:, None, :] - (e0[None] + tt[:, :, None] * seg[None]), axis=-1)
+    land = np.where(ok, np.argmin(d, axis=1), -1)
+    good = land >= 0
+    return np.bincount(land[good], minlength=e0.shape[0]) / good.sum(), int(good.sum())
+
+
+@pytest.mark.slow
+def test_axisymmetric_view_factors_match_a_monte_carlo_ray_trace():
+    """Independent oracle for a case with NO closed form: a cavity with an annular baffle.
+
+    Monte-Carlo ray tracing shares none of the view-factor code — not the azimuthal quadrature, not
+    the sphere-traced occlusion, not the near-field refinement. Agreement to the MC noise floor is
+    therefore a real check on the assembled ``F``, not a restatement of it. Locks both the occluded
+    zeros (the baffle's shadow) and the concave self-view.
+    """
+    from types import SimpleNamespace
+
+    from shapely.geometry import Polygon, box
+
+    from jno.domain.enclosure import _refine_near_pairs, _solid_polygon_visibility_3d
+
+    R, HH, RB, ZB, TB = 1.0, 2.0, 0.45, 1.0, 0.06
+    baffle = box(RB, ZB - TB / 2, R, ZB + TB / 2)
+    cavity = Polygon(
+        [(0, 0), (R, 0), (R, ZB - TB / 2), (RB, ZB - TB / 2), (RB, ZB + TB / 2), (R, ZB + TB / 2), (R, HH), (0, HH)]
+    )
+
+    def wall(p0, p1, n, normal):
+        t = np.linspace(0.0, 1.0, n + 1)[:, None]
+        P = np.asarray(p0)[None, :] + t * (np.asarray(p1) - np.asarray(p0))[None, :]
+        return P[:-1], P[1:], np.tile(np.asarray(normal, float), (n, 1))
+
+    parts = [
+        wall((1e-6, 0), (R, 0), 10, (0, 1)),
+        wall((R, 0), (R, ZB - TB / 2), 10, (-1, 0)),
+        wall((R, ZB - TB / 2), (RB, ZB - TB / 2), 6, (0, -1)),
+        wall((RB, ZB - TB / 2), (RB, ZB + TB / 2), 2, (-1, 0)),
+        wall((RB, ZB + TB / 2), (R, ZB + TB / 2), 6, (0, 1)),
+        wall((R, ZB + TB / 2), (R, HH), 10, (-1, 0)),
+        wall((R, HH), (1e-6, HH), 10, (0, -1)),
+    ]
+    e0 = np.vstack([p[0] for p in parts])
+    e1 = np.vstack([p[1] for p in parts])
+    nrm = np.vstack([p[2] for p in parts])
+    mids, length, m = 0.5 * (e0 + e1), np.linalg.norm(e1 - e0, axis=1), e0.shape[0]
+
+    n_phi = 64
+    phi = np.linspace(0.0, 2 * np.pi, n_phi, endpoint=False)
+    dom = SimpleNamespace(_source_regions={"baffle": baffle})
+    tags = np.array(["baffle"] * m, dtype=object)
+    vis = _solid_polygon_visibility_3d(dom, tags, mids, length, phi, occluders=[baffle])
+    F = np.asarray(
+        MeshUtils.get_view_factor_axisymmetric_element(
+            jnp.asarray(e0),
+            jnp.asarray(e1),
+            jnp.asarray(nrm),
+            jnp.asarray(vis.astype(float)),
+            n_quad=3,
+            n_phi=n_phi,
+            r_min=0.0,
+        )
+    )
+    F = _refine_near_pairs(F, e0, e1, nrm, dom, tags, n_phi, occluders=([baffle], baffle))
+
+    rows = F.sum(axis=1)
+    assert rows.min() > 0.97 and rows.max() < 1.03, f"closure: row sums {rows.min():.4f}..{rows.max():.4f}"
+
+    for src in (4, len(e0) - 5):  # a floor element and a ceiling element
+        mc, used = _monte_carlo_row(e0, e1, nrm, cavity, src)
+        big = F[src] > 0.01
+        err = np.abs(mc - F[src])
+        noise = np.sqrt(0.05 / used)  # 1-sigma on a bin holding ~5% of the rays
+        assert err[big].max() < 12 * noise, (
+            f"element {src}: max |F_MC - F_jNO| = {err[big].max():.5f} over F>0.01 "
+            f"(MC 1-sigma ~ {noise:.5f}); MC row sum {mc.sum():.4f} vs {F[src].sum():.4f}"
+        )
+        # the baffle's shadow must be shadow in BOTH: nothing the trace reaches may have F == 0
+        assert mc[F[src] < 1e-12].sum() < 5e-3, (
+            f"element {src}: rays landed on elements the view factor calls unreachable "
+            f"({mc[F[src] < 1e-12].sum():.4f} of the energy)"
+        )
+
+
+def test_axisymmetric_kernel_row_chunking_matches_the_unblocked_build():
+    """The ring kernel builds its ``(M, M, n_phi)`` intermediate in receiver row-blocks so a fine mesh
+    does not need it all at once (816 MB at M=1785, n_phi=32 — an OOM on an 8 GB GPU). The blocking
+    must be pure bookkeeping: every element sees the same arithmetic either way.
+
+    Not *bit*-identical, though: the azimuthal ``sum(..., axis=-1)`` runs over a differently-shaped
+    array once it is blocked, and XLA reassociates the reduction accordingly. Measured at 3 ULP
+    (max relative 4.1e-16), which is rounding, not a change of result — so the tolerance here is a
+    few ULP rather than exact equality. Checked by forcing several block sizes through the public
+    entry point and comparing to a run whose block covers the whole array.
+    """
+    from unittest import mock
+
+    r1, r2, H, NZ, n_phi = 0.25, 0.5, 1.0, 14, 24
+    z = np.linspace(0.0, H, NZ + 1)
+    e0 = np.vstack([np.c_[np.full(NZ, r1), z[:-1]], np.c_[np.full(NZ, r2), z[:-1]]])
+    e1 = np.vstack([np.c_[np.full(NZ, r1), z[1:]], np.c_[np.full(NZ, r2), z[1:]]])
+    nrm = np.vstack([np.tile([1.0, 0.0], (NZ, 1)), np.tile([-1.0, 0.0], (NZ, 1))])
+    m = e0.shape[0]
+
+    def run(vm):
+        return np.asarray(
+            MeshUtils.get_view_factor_axisymmetric_element(
+                jnp.asarray(e0),
+                jnp.asarray(e1),
+                jnp.asarray(nrm),
+                jnp.asarray(vm),
+                n_quad=3,
+                n_phi=n_phi,
+                r_min=0.0,
+            )
+        )
+
+    for vm in (np.ones((m, m)), np.ones((m, m, n_phi))):  # both the 2-D and per-azimuth paths
+        ref = run(vm)
+        for cap in (2**24, 4096, 512):  # forces 1, several, many blocks
+            with mock.patch.object(MeshUtils, "_kernel_block_doubles", cap, create=True):
+                got = run(vm)
+            # A few ULP of the reference magnitude — reduction reassociation, nothing more.
+            assert np.allclose(got, ref, rtol=8e-16, atol=0.0), (
+                f"chunking changed the result beyond rounding (cap={cap}, vm.ndim={vm.ndim}, "
+                f"max rel {np.abs(got - ref).max() / max(np.abs(ref).max(), 1e-300):.2e})"
+            )
+        assert np.all(np.isfinite(ref))
