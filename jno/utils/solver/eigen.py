@@ -26,7 +26,11 @@ from jax.scipy.linalg import solve_triangular
 def _as_dense(A):
     if A is None:
         return None
-    return jnp.asarray(A.todense() if hasattr(A, "todense") else A)
+    if hasattr(A, "todense"):  # BCOO
+        return jnp.asarray(A.todense())
+    if hasattr(A, "dense") and callable(getattr(A, "dense")):  # LinearOperator (incl. matvec-only)
+        return jnp.asarray(A.dense())
+    return jnp.asarray(A)
 
 
 def dense_geneigh(K, M, k: int, which: str = "smallest"):
@@ -44,12 +48,15 @@ def dense_geneigh(K, M, k: int, which: str = "smallest"):
     """
     Kd = _as_dense(K)
     Kd = 0.5 * (Kd + Kd.T)  # symmetrise away assembly roundoff
-    if _as_dense(M) is None:
+    Md = _as_dense(M)
+    if Md is None:
         lam, V = jnp.linalg.eigh(Kd)
     else:
         from .mass import cholesky_spd
 
-        L = cholesky_spd(M)  # M = L Lᵀ (shared with the consistent-mass exponential integrator)
+        # Pass the DENSIFIED mass: `M` may be a matvec-only LinearOperator (the constraint-reduced
+        # pencil PᵀMP), which cholesky_spd cannot consume.
+        L = cholesky_spd(Md)  # M = L Lᵀ (shared with the consistent-mass exponential integrator)
         C = solve_triangular(L, solve_triangular(L, Kd, lower=True).T, lower=True)  # L⁻¹ K L⁻ᵀ
         lam, Y = jnp.linalg.eigh(0.5 * (C + C.T))
         V = solve_triangular(L.T, Y, lower=False)  # x = L⁻ᵀ y  →  M-orthonormal
