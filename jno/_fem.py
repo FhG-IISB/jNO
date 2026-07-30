@@ -222,6 +222,54 @@ def _reject_source_terms(fem_obj: Any, where: str) -> None:
                 )
 
 
+def _eigs_constraint_maps(fem_obj: Any, n_full: int):
+    """``(restrict, prolong, n_red)`` for the **space-reducing** constraints of an eigenproblem.
+
+    ``fem.solve()`` applies Dirichlet by *row replacement* and periodic ties by a *per-call*
+    reduction (:meth:`FemLinearSystem.solve`'s ``periodic=``). Neither survives into
+    ``fem.operator[0]``, which is why reading that matrix directly gets an eigenproblem wrong:
+
+    * **Dirichlet** row-replacement leaves identity rows against a full mass row, which injects
+      spurious pairs — measured on a 198-DOF Dirichlet square (48 constrained), the lowest spurious
+      eigenvalue was 267.4 while the true spectrum starts at 19.9. Small ``k`` misses them by luck;
+      a larger ``k`` or ``which="largest"`` does not.
+    * **Periodic** ties are dropped entirely — a periodic-in-x unit square returned the *non-periodic*
+      Neumann spectrum ``0, π², π², 2π²`` where the truth is ``0, π², 4π², 4π²``.
+
+    Both are the same operation: a prolongation ``P`` (n_full × n_red). Returned as matvec maps rather
+    than matrices so the reduced pencil ``PᵀKP`` is never assembled and the LOBPCG path stays
+    matrix-free. ``(None, None, n_full)`` when the form is unconstrained.
+    """
+    per = getattr(fem_obj, "_periodic", None)
+    pairs = getattr(getattr(fem_obj, "domain", None), "_fem_native_dirichlet_pairs", None) or []
+    if pairs and any(abs(float(val)) > 1e-12 for _d, val in pairs):
+        raise ValueError(
+            "jno.fem eigs: an INHOMOGENEOUS Dirichlet value has no meaning in K x = λ M x — the "
+            "constrained DOFs are eliminated, not driven. Use a homogeneous pin (u(region) - 0.0)."
+        )
+    dofs = sorted({int(d) for d, _v in pairs})
+    if per is not None and dofs:
+        raise NotImplementedError(
+            "jno.fem eigs: combining periodic ties with a Dirichlet pin is not supported yet — the "
+            "Dirichlet DOFs are numbered in the FULL space and would have to be re-indexed into the "
+            "periodic master space to compose the two reductions. Use one or the other for now."
+        )
+
+    if per is not None:
+        from .utils.solver.fem_utils import prolong_periodic, reduce_vector_periodic
+
+        restrict = lambda w: jnp.asarray(reduce_vector_periodic(per, w))  # noqa: E731  Pᵀ w
+        prolong = lambda v: jnp.asarray(prolong_periodic(per, v))  # noqa: E731         P v
+        n_red = int(jnp.shape(restrict(jnp.zeros(n_full)))[0])
+        return restrict, prolong, n_red, "periodic"
+    if dofs:
+        free = jnp.asarray(sorted(set(range(n_full)) - set(dofs)), dtype=jnp.int32)
+        restrict = lambda w: w[free]  # noqa: E731                                      gather (= Pᵀ)
+        prolong = lambda v: jnp.zeros(n_full, v.dtype).at[free].set(v)  # noqa: E731    scatter (= P)
+        return restrict, prolong, int(free.shape[0]), "dirichlet"
+    return None, None, n_full, None
+
+
 def _contains_network_call(constraint: Any) -> bool:
     """True if a constraint embeds a *network* ModelCall (``jno.nn.wrap(net)(...)``).
 
@@ -1794,9 +1842,37 @@ class FEM:
             raise AttributeError(f"FEM.eigs needs a steady-linear (source-less) bilinear form; this fem is {self._mode}.")
         _reject_source_terms(self, "FEM.eigs")
         from . import solve as _solve
+        from .utils.solver.solver_api import LinearOperator
 
+        K = self.operator[0]
+        n_full = int(jnp.shape(K)[0] if getattr(K, "shape", None) is not None else LinearOperator(K).shape[0])
+        # Read the constraint sets BEFORE assembling the mass form. `_fem_native_dirichlet_pairs` is
+        # stashed on the shared DOMAIN, so assembling the (Dirichlet-free) mass form overwrites it with
+        # an empty list — the elimination would then silently not happen and the row-replaced spurious
+        # modes would come back.
+        restrict, prolong, n_red, _kind = _eigs_constraint_maps(self, n_full)
         M = fem(list(mass)).operator[0]  # mass matrix on the same FE space
-        return _solve.eigs(k=k, which=which, precond=precond, tol=tol, maxiter=maxiter)(self.operator[0], M)
+
+        solver = _solve.eigs(k=k, which=which, precond=precond, tol=tol, maxiter=maxiter)
+        if restrict is None:
+            return solver(K, M)
+
+        # Reduced pencil (PᵀKP) x̂ = λ (PᵀMP) x̂ as MATVECS — never assembled, so this composes with the
+        # matrix-free LOBPCG path and never densifies a big operator just to drop some rows.
+        Kop, Mop = LinearOperator(K), LinearOperator(M)
+
+        def red(op):
+            mv = lambda v: restrict(op.mv(prolong(v)))  # noqa: E731
+            # `dense_fn` only fires on the small-problem dense path, which materializes anyway; the
+            # LOBPCG path never calls it and so never builds the reduced matrix.
+            return LinearOperator.from_matvec(
+                mv,
+                shape=(n_red, n_red),
+                dense_fn=lambda: jax.vmap(mv, in_axes=1, out_axes=1)(jnp.eye(n_red)),
+            )
+
+        lam, Xr = solver(red(Kop), red(Mop))
+        return lam, jax.vmap(prolong, in_axes=1, out_axes=1)(Xr)  # modes back on the full mesh
 
     # -- domain-decomposition coupling (`jno.core([...])`): the region this subdomain owns + a pinned solve --
     def _dd_region(self):

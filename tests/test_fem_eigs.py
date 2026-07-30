@@ -198,3 +198,90 @@ def test_eigs_rejects_a_source_term():
     lam_neu, _ = jno.fem([stiff]).eigs(mass=mass, k=3)
     lam_rob, _ = jno.fem([stiff, 2.0 * ub * vb]).eigs(mass=mass, k=3)
     assert np.asarray(lam_rob)[0] > np.asarray(lam_neu)[0] + 1e-6  # alpha>0 lifts the zero mode
+
+
+# ---------------------------------------------------------------------------------------------
+# Space-reducing constraints. fem.solve() applies Dirichlet by ROW REPLACEMENT and periodic ties
+# by a per-call reduction; neither survives into fem.operator[0], so an eigensolve reading that
+# matrix directly is wrong. Oracles are analytic, not self-comparisons.
+# ---------------------------------------------------------------------------------------------
+
+
+def _dirichlet_box(mesh_size):
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=mesh_size)
+    d.tag("wall", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
+    u, v = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("wall", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    return d, jno.fem([ui.x * vi.x + ui.y * vi.y, u(xb, yb) - 0.0]), [ui * vi]
+
+
+def test_eigs_dirichlet_dofs_are_eliminated_not_row_replaced():
+    """Dirichlet box: λ = π²(n²+m²), n,m ≥ 1. Row replacement leaves identity rows against a full mass
+    row, injecting spurious pairs (measured: lowest spurious at 267 while the true spectrum starts at
+    19.9). Eliminating the constrained DOFs removes them, and the modes vanish on the wall exactly."""
+    d, K, mass = _dirichlet_box(0.05)
+    lam, X = K.eigs(mass=mass, k=6)
+    analytic = np.pi**2 * np.array([2.0, 5, 5, 8, 10, 10])
+    assert np.allclose(np.asarray(lam), analytic, rtol=0.06), np.asarray(lam)
+
+    pts = np.asarray(K.points)
+    onwall = (
+        (np.abs(pts[:, 0]) < 1e-9)
+        | (np.abs(pts[:, 0] - 1) < 1e-9)
+        | (np.abs(pts[:, 1]) < 1e-9)
+        | (np.abs(pts[:, 1] - 1) < 1e-9)
+    )
+    assert np.max(np.abs(np.asarray(X)[onwall])) == 0.0  # eliminated => exactly zero, not "small"
+
+
+def test_eigs_periodic_tie_reduces_the_pencil():
+    """Periodic-in-x / Neumann-in-y: λ = (2πn)² + (πm)² → 0, π², 4π², 4π². Before the reduction this
+    returned the NON-periodic Neumann spectrum (0, π², π², 2π²) — a silently wrong band structure."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.07)
+    d.tag("L", lambda x, y: x < 1e-9)
+    d.tag("R", lambda x, y: x > 1 - 1e-9)
+    d._remesh_periodic([("L", "R")])  # conforming faces for the nodal tie
+    u, v = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xl, yl, _ = d.variable("L", split=True)
+    xr, yr, _ = d.variable("R", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    K = jno.fem([ui.x * vi.x + ui.y * vi.y, u(xl, yl) - u(xr, yr)])
+
+    lam, X = K.eigs(mass=[ui * vi], k=4)
+    lam = np.asarray(lam)
+    assert np.allclose(lam, np.pi**2 * np.array([0.0, 1, 4, 4]), rtol=0.06, atol=0.05), lam
+    assert lam[2] > 3.0 * lam[1]  # the 4π² pair, NOT the Neumann π² duplicate
+
+    pts, X = np.asarray(K.points), np.asarray(X)
+    li = np.where(pts[:, 0] < 1e-9)[0]
+    ri = np.where(pts[:, 0] > 1 - 1e-9)[0]
+    lo, ro = li[np.argsort(pts[li, 1])], ri[np.argsort(pts[ri, 1])]
+    assert np.max(np.abs(X[lo] - X[ro])) == 0.0  # the tie holds on the returned modes
+
+
+def test_eigs_constraints_compose_with_lobpcg():
+    """The reduction is applied as matvecs, so it must work on the iterative path too — and the
+    reduced pencil must never be densified for it."""
+    d, K, mass = _dirichlet_box(0.06)
+    ref, _ = K.eigs(mass=mass, k=4)
+    lam, X = K.eigs(mass=mass, k=4, precond=jno.precond.jacobi(), tol=1e-6, maxiter=400)
+    assert np.all(np.isfinite(np.asarray(lam)))
+    # tol=1e-6 on the residual buys ~1e-4 on the eigenvalues here; the point of this test is that the
+    # reduction is applied on the iterative path at all, not eigenvalue precision.
+    assert np.allclose(np.asarray(lam), np.asarray(ref), rtol=1e-3)
+
+
+def test_eigs_rejects_inhomogeneous_dirichlet_and_mixed_constraints():
+    """An inhomogeneous pin has no meaning for modes (the DOFs are eliminated, not driven), and
+    periodic+Dirichlet is not composed yet — both fail loud rather than quietly doing the wrong thing."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2)
+    d.tag("wall", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9))
+    u, v = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("wall", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    with pytest.raises(ValueError, match="INHOMOGENEOUS"):
+        jno.fem([ui.x * vi.x + ui.y * vi.y, u(xb, yb) - 1.0]).eigs(mass=[ui * vi], k=2)
