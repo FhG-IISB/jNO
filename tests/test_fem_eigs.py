@@ -174,3 +174,27 @@ def test_eigs_rejects_tol_without_precond():
         K.eigs(mass=mass, k=2, tol=1e-10)
     with pytest.raises(ValueError, match="no precond="):
         jno.solve.eigs(k=2, maxiter=10)
+
+
+def test_eigs_rejects_a_source_term():
+    """A load has no place in ``Kx = λMx``: the pencil reads only the matrix, so a source would be
+    silently dropped and return the *undriven* spectrum. Measured before the guard: adding ``-3·v`` on
+    the boundary gave eigenvalues bit-identical to the source-free problem."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2)
+    d.tag("wall", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
+    u, v = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("wall", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    ub, vb = u.bind(x=xb, y=yb), v.bind(x=xb, y=yb)
+    stiff = ui.x * vi.x + ui.y * vi.y
+    mass = [ui * vi]
+
+    for terms in ([stiff, -3.0 * vb], [stiff, -3.0 * vi], [stiff - 3.0 * vi]):  # surface, volume, inside a sum
+        with pytest.raises(ValueError, match="source term"):
+            jno.fem(list(terms)).eigs(mass=mass, k=2)
+
+    # Bilinear surface terms are NOT sources: Robin/impedance belongs in K and must still work.
+    lam_neu, _ = jno.fem([stiff]).eigs(mass=mass, k=3)
+    lam_rob, _ = jno.fem([stiff, 2.0 * ub * vb]).eigs(mass=mass, k=3)
+    assert np.asarray(lam_rob)[0] > np.asarray(lam_neu)[0] + 1e-6  # alpha>0 lifts the zero mode
