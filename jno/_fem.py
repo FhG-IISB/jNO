@@ -192,6 +192,36 @@ def _contains(constraint: Any, cls) -> bool:
     return contains_node_type(_bare(constraint), cls)
 
 
+def _reject_source_terms(fem_obj: Any, where: str) -> None:
+    """Fail loud if the weak form carries a **load** — a term with a test function but no trial.
+
+    ``K x = λ M x`` is homogeneous: there is nowhere for a source to go. The assembled operator is
+    ``(A, b)`` and an eigensolve reads only ``A``, so a load would otherwise be **silently dropped**
+    and the caller would get the *undriven* spectrum back with no warning — measured: adding
+    ``-3.0 * v`` on a boundary returned eigenvalues bit-identical to the source-free problem.
+
+    Detection mirrors the assembler's own classification (:func:`_bare` + :func:`_contains`, the pair
+    used at the top of :func:`fem`): split each volume/surface constraint additively and look for a
+    piece with no ``TrialFunction``. Bilinear surface terms (Robin / impedance ``α u v``) contain the
+    trial and are correctly left alone — they belong in ``K`` and genuinely shift the spectrum.
+    """
+    from .trace import TrialFunction
+    from .utils.solver.weak_form import _split_additive_terms
+
+    dom = getattr(fem_obj, "domain", None)
+    for c, cl in zip(getattr(fem_obj, "_constraints", None) or [], fem_obj.classification or []):
+        if not (isinstance(cl, str) and (cl.startswith("volume") or cl.startswith("surface"))):
+            continue
+        for _sign, sub in _split_additive_terms(dom, _bare(c)):
+            if not _contains(sub, TrialFunction):
+                raise ValueError(
+                    f"{where}: the weak form carries a source term on '{cl}' (a term with the test "
+                    f"function but no trial function). An eigenproblem K x = λ M x is homogeneous — the "
+                    f"load vector is not part of the pencil, so it would be silently ignored and you "
+                    f"would get the spectrum of the *undriven* problem. Drop the source term."
+                )
+
+
 def _contains_network_call(constraint: Any) -> bool:
     """True if a constraint embeds a *network* ModelCall (``jno.nn.wrap(net)(...)``).
 
@@ -1762,6 +1792,7 @@ class FEM:
         """
         if self._mode != "linear":
             raise AttributeError(f"FEM.eigs needs a steady-linear (source-less) bilinear form; this fem is {self._mode}.")
+        _reject_source_terms(self, "FEM.eigs")
         from . import solve as _solve
 
         M = fem(list(mass)).operator[0]  # mass matrix on the same FE space
