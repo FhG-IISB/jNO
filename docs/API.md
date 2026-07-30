@@ -197,10 +197,21 @@ a small problem, but it materializes the operator (`O(N²)` memory). Passing `pr
 **preconditioned LOBPCG** (Knyazev, *SIAM J. Sci. Comput.* **23**(2), 517–541, 2001), which only applies
 `K`/`M` as matvecs and so runs where the dense reduction cannot:
 
+`K` is the **source-less** `jno.fem` whose bilinear form is the stiffness; `mass=` takes the mass form
+as a plain term list, which `eigs` assembles onto the same space for you:
+
 ```python
-lam, X = K.eigs(mass=mass, k=6)                              # dense
-lam, X = K.eigs(mass=mass, k=6, precond=jno.precond.amg())   # LOBPCG, never densified
+u, v = d.fem_symbols()
+xi, yi, _ = d.variable("interior", split=True)
+ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+
+K = jno.fem([ui.x * vi.x + ui.y * vi.y])                       # stiffness — no source term
+lam, X = K.eigs(mass=[ui * vi], k=6)                           # dense;  λ = ω² on a Neumann box
+lam, X = K.eigs(mass=[ui * vi], k=6, precond=jno.precond.amg())  # LOBPCG, never densified
 ```
+
+`jno.solve.eigs(...)` is the lower-level form of the same thing and takes two **assembled operators**
+rather than a fem and a term list — `jno.solve.eigs(k=6)(K.operator[0], M)`.
 
 The Rayleigh–Ritz runs in the **M-inner product**, so an ordinary FEM form's consistent (non-lumped)
 mass matrix is handled directly, and `XᵀMX = I` holds on both paths. Eigenvalues are differentiable on
