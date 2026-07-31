@@ -331,11 +331,46 @@ def test_theta_on_complex_transient():
     assert np.isfinite(g) and abs(g - fd) <= 1e-2 * max(abs(fd), 1.0), f"CN AD {g} vs FD {fd}"
 
 
-def test_complex_transient_time_scheme_guards():
-    """Scope limits fail loud on the complex-transient time path: adaptive and θ are wired, but
-    ``jno.solve.exponential`` is not, and the per-step solver slots are not threaded there yet."""
+def test_complex_transient_composes_solver_slots():
+    """The complex transient is assembled as ONE real 2n block, so it is an ordinary transient block and
+    the per-step solver slots apply to it like any other — ``linear=``, ``precond=``, and ``time=``
+    together. Each of these raised ``NotImplementedError`` while the Re/Im legs were fused only at solve
+    time by a second, bespoke marcher that none of the slots had been threaded into.
+
+    The slots change *how* the step is solved, not *what* it solves, so every choice must land on the
+    same trajectory as the default to solver tolerance."""
     _, fem = _complex_heat(mesh_size=0.3)
-    with pytest.raises(NotImplementedError, match="exponential|adaptive"):
-        fem.solve(time=jno.solve.exponential())
-    with pytest.raises(NotImplementedError, match="time=|slots"):
-        fem.solve(time=adaptive(), linear=jno.solve.lu())
+    base = np.asarray(fem.solve())
+    assert base.dtype == np.complex128
+
+    for label, kwargs in [
+        ("linear=lu", dict(linear=jno.solve.lu())),
+        ("linear=gmres", dict(linear=jno.solve.gmres())),
+        ("linear=gmres+precond=jacobi", dict(linear=jno.solve.gmres(), precond=jno.precond.jacobi())),
+        ("time=theta(1)+linear=lu", dict(time=jno.solve.theta(1.0), linear=jno.solve.lu())),
+    ]:
+        _, femk = _complex_heat(mesh_size=0.3)
+        out = np.asarray(femk.solve(**kwargs))
+        assert out.dtype == np.complex128 and not np.any(np.isnan(out)), f"{label} produced no complex result"
+        rel = float(np.linalg.norm(out[-1] - base[-1]) / np.linalg.norm(base[-1]))
+        assert rel < 1e-8, f"{label} disagrees with the default complex-transient solve: rel {rel:.3e}"
+
+
+def test_complex_transient_exponential_scheme_routes():
+    """``jno.solve.exponential`` on a complex transient was refused outright ("wired for adaptive and θ
+    only") because the bespoke complex marcher implemented just those two. The fused block routes into the
+    ordinary scheme dispatch, so the exponential integrator now reaches it like any real transient."""
+    pytest.importorskip("matfree", reason="jno.solve.exponential needs the optional matfree package")
+    _, fem = _complex_heat(mesh_size=0.3)
+    out = np.asarray(fem.solve(time=jno.solve.exponential()))
+    assert out.dtype == np.complex128 and not np.any(np.isnan(out))
+
+
+def test_complex_transient_adapt_still_fails_loud():
+    """Scope limit, stated explicitly: fusing the block makes a complex transient *route* into the adaptive
+    transient driver, but that driver's cross-remesh state transfer interpolates a real nodal field and the
+    fused state is the stacked ``[Re; Im]`` pair. Until the transfer carries the two halves separately this
+    must fail loud rather than interpolate half a complex field."""
+    _, fem = _complex_heat(mesh_size=0.3)
+    with pytest.raises(NotImplementedError, match="complex"):
+        fem.solve(adapt=jno.AdaptSpec(every=2))

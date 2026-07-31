@@ -285,14 +285,11 @@ def test_jacobi_on_matrix_free_nonlinear_raises():
         fem.solve(nonlinear=jno.solve.newton(), precond=jno.precond.jacobi())
 
 
-def test_complex_transient_slots_raise():
-    # plain-transient slots are supported (see test_fem_solver_transient.py); the complex-
-    # transient path still routes around them
-    from jno._fem import FEM
-
-    fem = FEM(None, None, [], mode="complex_transient")
-    with pytest.raises(NotImplementedError, match="complex-transient"):
-        fem.solve(linear=jno.solve.cg())
+# NOTE: the former ``test_complex_transient_slots_raise`` is gone. A complex transient is now assembled
+# as ONE real 2n block, so it *is* an ordinary transient block and the solver slots apply to it like any
+# other. The inverted assertion — the slots compose, and every choice lands on the same trajectory — lives
+# in ``test_fem_adaptive_timestep.py::test_complex_transient_composes_solver_slots``, on a real FEM rather
+# than the synthetic ``FEM(None, None, [], mode=...)`` this test had to fabricate.
 
 
 def test_x0_u0_conflict_raises():
