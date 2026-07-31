@@ -115,6 +115,70 @@ def test_chebyshev_solver_true_and_estimated_bounds():
     assert np.abs(np.asarray(x_auto) - x_ref).max() < 1e-8
 
 
+def test_lanczos_bounds_bracket_the_spectrum_where_the_ratio_guess_does_not():
+    """Both ends of the spectrum, measured rather than guessed (Lanczos 1950 §II).
+
+    The historical estimate took ``lmax`` from power iteration and *fabricated*
+    ``lmin = lmax / 30``. A Chebyshev polynomial is a contraction only **inside** the interval it
+    is fitted to, so whenever the true ``lmin/lmax`` ratio is smaller than the assumed 1/30 the
+    fabricated lower end sits above the bottom of the spectrum and the lowest modes are amplified
+    instead of damped. This matrix is built with a true ratio (~1/80) well below the guess, which
+    is exactly the regime the guess gets wrong.
+
+    Pins that Lanczos recovers both ends closely, that the guess does not, and that the guess errs
+    in the dangerous direction (too *high* a lower bound, i.e. modes left outside the interval)."""
+    from jno.utils.solver.krylov import lanczos_spectrum_bounds, power_iteration_bound
+
+    pytest.importorskip("matfree", reason="Lanczos bounds need the optional matfree package")
+    n = 160
+    key = jax.random.PRNGKey(11)
+    B = jax.random.normal(key, (n, n))
+    Ad = B @ B.T / n + 0.05 * jnp.eye(n)  # SPD with a wide spectrum
+    true = np.linalg.eigvalsh(np.asarray(Ad))
+    lo_t, hi_t = float(true[0]), float(true[-1])
+    assert lo_t / hi_t < 1.0 / 30.0, "fixture must sit in the regime the lmax/30 guess gets wrong"
+
+    got = lanczos_spectrum_bounds(lambda v: Ad @ v, n, iters=40)
+    assert got is not None, "matfree is installed, so Lanczos must produce bounds"
+    lo_l, hi_l = float(got[0]), float(got[1])
+    assert abs(hi_l - hi_t) / hi_t < 1e-3, f"Lanczos lmax {hi_l:.5f} vs true {hi_t:.5f}"
+    assert abs(lo_l - lo_t) / lo_t < 0.25, f"Lanczos lmin {lo_l:.5f} vs true {lo_t:.5f}"
+    # Ritz values are interior to the true spectrum -- never outside it
+    assert lo_l >= lo_t - 1e-9 and hi_l <= hi_t + 1e-9, "Ritz values must bracket from the inside"
+
+    # the guess it replaces: lmax is fine, lmin lands ABOVE the true smallest eigenvalue
+    hi_p = float(power_iteration_bound(lambda v: Ad @ v, n, iters=40))
+    lo_guess = hi_p / 30.0
+    assert lo_guess > lo_t, "the fixture is only interesting if the guess overshoots the true lmin"
+    assert abs(lo_l - lo_t) < abs(lo_guess - lo_t), (
+        f"Lanczos lmin {lo_l:.5f} must beat the guess {lo_guess:.5f} against true {lo_t:.5f}"
+    )
+
+
+def test_spectrum_bounds_honours_explicit_and_falls_back():
+    """The bound chooser: caller-supplied ends always win, and a missing/degenerate Lanczos still
+    yields a usable interval (the power-iteration fallback) rather than failing the solve."""
+    from jno.utils.solver.krylov import lanczos_spectrum_bounds, spectrum_bounds
+
+    Ad = _spd(seed=12)
+    n = Ad.shape[0]
+    mv = lambda v: Ad @ v  # noqa: E731
+
+    lo, hi = spectrum_bounds(mv, n, lmin=0.25, lmax=4.0)
+    assert (lo, hi) == (0.25, 4.0), "explicit bounds must pass through untouched"
+
+    lo, hi = spectrum_bounds(mv, n, iters=30)  # estimated (Lanczos, or fallback)
+    true = np.linalg.eigvalsh(Ad)
+    assert 0.0 < lo < hi, f"estimated interval must be non-degenerate, got [{lo}, {hi}]"
+    assert hi >= float(true[-1]) * 0.98, "lmax must not badly under-estimate the top of the spectrum"
+
+    # a 1-DOF operator is the degenerate extreme: Lanczos cannot run, the fallback must still work
+    one = jnp.asarray([[3.0]])
+    assert lanczos_spectrum_bounds(lambda v: one @ v, 1, iters=8) is None
+    lo1, hi1 = spectrum_bounds(lambda v: one @ v, 1, iters=8)
+    assert 0.0 < lo1 < hi1 and hi1 >= 3.0 * 0.98
+
+
 def test_chebyshev_polynomial_preconditioner_accelerates_cg():
     from jno.utils.solver.solver_api import PrecondContext, materialize_precond
 

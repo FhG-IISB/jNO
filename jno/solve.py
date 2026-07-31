@@ -199,17 +199,27 @@ def chebyshev(
     Alg. 12.1; see :func:`jno.utils.solver.krylov.chebyshev_iteration`). Inner-product free —
     matvecs and AXPYs only, no reductions — so it shines under ``vmap`` and on GPU where CG's
     dot products serialise. Needs spectrum bounds of ``M^{-1} A``: pass ``lmin``/``lmax`` when
-    known; otherwise ``lmax`` is estimated by ``bound_iters`` power-iteration steps (inflated by
-    ``safety``) and ``lmin = lmin_ratio * lmax`` — a smoother-style default that converges but
-    slower than true bounds; prefer real bounds for a *solver* use."""
+    known; otherwise **both** ends are measured by ``bound_iters`` steps of Lanczos (Lanczos 1950,
+    §II — the extreme Ritz values of the tridiagonal), for the same one-matvec-per-step cost as
+    the power iteration it replaces. Without the optional :mod:`matfree` package this falls back
+    to power iteration for ``lmax`` and the ``lmin = lmin_ratio * lmax`` guess, which converges
+    more slowly and, when the true ratio is smaller than assumed, leaves the lowest modes outside
+    the fitted interval where the polynomial amplifies them."""
 
     def _fn(op: LinearOperator, b, *, M, x0):
-        from .utils.solver.krylov import chebyshev_iteration, power_iteration_bound
+        from .utils.solver.krylov import chebyshev_iteration, spectrum_bounds
 
-        hi = lmax
-        if hi is None:
-            hi = safety * power_iteration_bound(op.mv, b.shape[0], dtype=b.dtype, iters=bound_iters, M=M)
-        lo = lmin if lmin is not None else lmin_ratio * hi
+        lo, hi = spectrum_bounds(
+            op.mv,
+            b.shape[0],
+            dtype=b.dtype,
+            iters=bound_iters,
+            M=M,
+            lmin=lmin,
+            lmax=lmax,
+            safety=safety,
+            lmin_ratio=lmin_ratio,
+        )
         raw = lambda mv, rhs, M, x0: chebyshev_iteration(mv, rhs, lmin=lo, lmax=hi, M=M, x0=x0, tol=tol, maxiter=maxiter)
         return _firewalled(raw, op, b, M=M, x0=x0, symmetric=True, name="chebyshev")
 
