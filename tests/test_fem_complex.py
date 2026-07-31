@@ -189,11 +189,11 @@ def test_complex_transient_save_ts_interpolates_every_frame():
 
 
 def test_complex_transient_block_is_sparse_not_dense():
-    """The complex-transient real-equivalent block ``[[·,-·],[·,·]]`` is now composed from BCOO legs and
-    marched matrix-free (GMRES + Jacobi), so the dense ``(2N × 2N)`` block and its dense LU never
-    materialise — a large complex diffusion / Schrödinger solve scales instead of hitting the ``O((2N)^2)``
-    memory wall. Assert the legs are sparse (a dense assembler would give plain ndarrays), the imaginary
-    mass is the empty BCOO ``M_i = 0``, and the sparse march still recovers the analytic mode."""
+    """The complex-transient real-equivalent block ``[[·,-·],[·,·]]`` is composed as **one** BCOO at
+    assembly and marched matrix-free (GMRES + Jacobi), so the dense ``(2N × 2N)`` block and its dense LU
+    never materialise — a large complex diffusion / Schrödinger solve scales instead of hitting the
+    ``O((2N)^2)`` memory wall. Assert the fused block is sparse and square at ``2n`` (a dense assembler
+    would give plain ndarrays, with no ``.indices``), and that the sparse march recovers the analytic mode."""
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.06, time=(0.0, 0.03, 21))
     u, phi = d.fem_symbols()
     xi, yi, ti = d.variable("interior", split=True)
@@ -203,10 +203,14 @@ def test_complex_transient_block_is_sparse_not_dense():
     psi0 = jno.np.sin(PI * ci[0]) * jno.np.sin(PI * ci[1])
     fem = jno.fem([ui.t * vi + (0.5 + 1j) * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - psi0])
     assert fem.is_complex and fem.is_transient
-    block_r, block_i = fem.operator  # the (Re-coeff, Im-coeff) real legs
-    # THE FIX: the block legs are BCOO (a dense global jacfwd / _as_dense would give ndarrays, no `.indices`)
-    assert hasattr(block_r.M, "indices") and hasattr(block_r.A, "indices"), "complex-transient legs must be sparse"
-    assert hasattr(block_i.M, "indices") and int(block_i.M.nse) == 0  # imaginary mass M_i = 0 (empty BCOO)
+    block = fem.operator  # ONE real 2n SemidiscreteTimeBlock over the stacked [Re; Im] state
+    # the fused block is BCOO (a dense global jacfwd / _as_dense would give ndarrays, no `.indices`)
+    assert hasattr(block.M, "indices") and hasattr(block.A, "indices"), "the fused complex block must be sparse"
+    n_pts = int(np.asarray(fem.points).shape[0])
+    assert block.A.shape == (2 * n_pts, 2 * n_pts), f"expected the 2n real-equivalent block, got {block.A.shape}"
+    assert block.M.shape == block.A.shape
+    # the block is a real-equivalent embedding, so it must carry no complex dtype itself
+    assert not np.iscomplexobj(np.asarray(block.A.data)), "the real-equivalent block must be real"
     # the sparse GMRES march still recovers exp(-c·2π²t)·sin·sin (accuracy is not sacrificed for sparsity)
     traj, pts = np.asarray(fem.solve()), np.asarray(fem.points)
     mode = np.sin(PI * pts[:, 0]) * np.sin(PI * pts[:, 1])

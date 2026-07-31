@@ -982,147 +982,6 @@ def _solve_complex_block(
     )
 
 
-def _solve_complex_transient(blocks: Any, save_ts: Any = None, periodic: Optional[dict] = None, time: Any = None) -> Any:
-    """Integrate a complex *transient* system via the real-equivalent block (everything was
-    assembled as real systems): ``(M_r + i M_i) u_dot + (A_r + i A_i) u = (c_r + i c_i)`` becomes
-    the real ``2N`` system
-    ``M_blk u_dot + A_blk u = c_blk`` with ``M_blk=[[M_r,-M_i],[M_i,M_r]]`` (likewise A, c) and
-    ``u=[u_r;u_i]``. Backward Euler over the block, then recombine to ``u_r + i u_i``. ``blocks =
-    (block_r, block_i)`` are the Re-coeff and Im-coeff real ``SemidiscreteTimeBlock``s. This covers
-    Schrodinger (``i u_t = H u`` -> M_r = 0) since the *block* mass stays non-singular.
-
-    With a periodic tie the two blocks arrive already reduced (``P^T M P`` etc., restricted ``state0``)
-    by the same ``P``, so the integration runs in the reduced master-DOF space; each saved slice is then
-    prolonged back ``u = P u_red`` -- real and imaginary parts separately (a real ``P`` would cast a
-    complex vector to its real dtype and drop the imaginary part)."""
-
-    from .utils.solver.linear import matrix_diagonal as _matrix_diagonal
-
-    def _dn(a):
-        return jnp.asarray(a.todense()) if hasattr(a, "todense") else jnp.asarray(a)
-
-    br, bi = blocks
-
-    def _MAc(b, args):  # (M, A(args), c) for one real leg — the operator/load re-formed at ``args`` when parametric
-        M = b.M  # kept SPARSE (BCOO) — the marcher composes the real 2N block without ever densifying it
-        A = b.operator_fn(0.0, args) if b.operator_fn is not None else b.A
-        c = jnp.zeros((M.shape[0],), M.dtype) if b.affine_bias is None else jnp.asarray(b.affine_bias).reshape(-1)
-        return M, A, c
-
-    def _march(args):
-        Mr, Ar, cr = _MAc(br, args)
-        Mi, Ai, ci = _MAc(bi, args)
-        n = Mr.shape[0]
-        # Real-equivalent 2N block [[·,-·],[·,·]] — composed SPARSELY (BCOO) from the legs when they are sparse
-        # (the norm; native Lagrange assembles BCOO), so a large complex-transient (Schrödinger / complex
-        # diffusion) never materialises the dense (2N × 2N) block or a dense LU. Dense legs fall back to jnp.block.
-        sparse = hasattr(Mr, "indices")
-        if sparse:
-            M_blk = _complex_block_bcoo(Mr, Mi, n)
-            A_blk = _complex_block_bcoo(Ar, Ai, n)
-        else:
-            M_blk = jnp.block([[_dn(Mr), -_dn(Mi)], [_dn(Mi), _dn(Mr)]])
-            A_blk = jnp.block([[_dn(Ar), -_dn(Ai)], [_dn(Ai), _dn(Ar)]])
-        c_blk = jnp.concatenate([cr, ci])
-        w0 = jnp.concatenate([jnp.asarray(br.state0).reshape(-1), jnp.asarray(bi.state0).reshape(-1)])
-        t0, t1, dt = float(br.t0), float(br.t1), float(br.dt)
-        grid = jnp.linspace(t0, t1, max(1, round((t1 - t0) / dt)) + 1)
-        _save = grid if save_ts is None else jnp.asarray(save_ts)
-        fr, fi = br.forcing_vector_fn, bi.forcing_vector_fn
-
-        def _blk_solve(a):  # a solver for the autonomous step operator ``S = M_blk + a·A_blk`` (built once per a)
-            S = M_blk + a * A_blk
-            if not sparse:  # dense legs: LU-factor S once, reuse across all steps
-                lu = jax.scipy.linalg.lu_factor(S)
-                return lambda rhs, w: jax.scipy.linalg.lu_solve(lu, rhs)
-            # sparse: matrix-free GMRES + Jacobi, warm-started with the previous state — no dense factorisation,
-            # so memory stays O(nnz). GMRES (not BiCGStab) is robust on the non-symmetric real-equivalent block.
-            d = _matrix_diagonal(S)
-            inv = 1.0 / jnp.where(jnp.abs(d) > 1e-30, d, 1.0)
-            return lambda rhs, w: jax.scipy.sparse.linalg.gmres(
-                lambda v: S @ v, rhs, x0=w, M=lambda v: inv * v, tol=1e-9, atol=0.0, restart=min(2 * n, 40)
-            )[0]
-
-        def _rhs(w, t_end, dt_):  # backward-Euler RHS: M_blk w + dt (c_blk + f(t_end))
-            r = M_blk @ w + dt_ * c_blk
-            if fr is not None or fi is not None:
-                f_r = jnp.asarray(fr(t_end, args)).reshape(-1) if fr is not None else jnp.zeros((n,), c_blk.dtype)
-                f_i = jnp.asarray(fi(t_end, args)).reshape(-1) if fi is not None else jnp.zeros((n,), c_blk.dtype)
-                r = r + dt_ * jnp.concatenate([f_r, f_i])
-            return r
-
-        if time is not None and hasattr(time, "rtol"):
-            # Adaptive scheme on the real 2n block: dt varies, so the step operator is rebuilt per attempt
-            # (no factor-once), and step-doubling drives the step size. Runs the SAME marcher as the real
-            # path — vector and periodic ride through (the blocks are already flat and periodic-reduced).
-            # Differentiable in a runtime parameter through the (sparse GMRES / dense LU) step solve.
-            from .utils.solver.timeschemes import adaptive_march
-
-            def cstep(w, t, dt_):  # dt_ varies per attempt -> rebuild the step solver (backward Euler, θ=1)
-                return _blk_solve(dt_)(_rhs(w, t + dt_, dt_), w)
-
-            # dt0 comes from the SCHEME, not from ``dt`` (the output grid's step): with no rejection an
-            # over-large first attempt is committed permanently, so the marcher's default grows into the
-            # step size from below. See ``adaptive_march``.
-            traj = adaptive_march(
-                cstep,
-                w0,
-                t0,
-                t1,
-                _save,
-                rtol=time.rtol,
-                atol=time.atol,
-                max_steps=time.max_steps,
-                dt0=getattr(time, "dt0", None),
-            )
-        else:
-            # θ-method: (M + θ dt A) w_next = (M − (1−θ) dt A) w + dt(c + θ f_next + (1−θ) f_now). Default
-            # θ=1 (backward Euler); jno.solve.theta(θ) overrides — e.g. θ=1/2 Crank–Nicolson, the second-
-            # order, norm-preserving choice for a Schrödinger / wave complex-transient. The LHS operator is
-            # autonomous, so its solver is built ONCE (dense LU factor / sparse Jacobi), reused every step;
-            # differentiable, so ∂traj/∂args flows.
-            theta_val = float(time.theta) if (time is not None and hasattr(time, "theta")) else 1.0
-            _solve = _blk_solve(theta_val * dt)
-            M_expl = M_blk - (1.0 - theta_val) * dt * A_blk  # explicit (previous-step) part
-
-            def _f2n(t_eval):  # combined 2n forcing at t_eval (zero when there is no boundary source)
-                if fr is None and fi is None:
-                    return jnp.zeros((2 * n,), c_blk.dtype)
-                f_r = jnp.asarray(fr(t_eval, args)).reshape(-1) if fr is not None else jnp.zeros((n,), c_blk.dtype)
-                f_i = jnp.asarray(fi(t_eval, args)).reshape(-1) if fi is not None else jnp.zeros((n,), c_blk.dtype)
-                return jnp.concatenate([f_r, f_i])
-
-            def step(w, t):  # t = step START (advance to t+dt); θ=1 uses only f(t+dt), matching the old path
-                rhs = M_expl @ w + dt * (c_blk + theta_val * _f2n(t + dt) + (1.0 - theta_val) * _f2n(t))
-                w_next = _solve(rhs, w)
-                return w_next, w_next
-
-            _, ws = jax.lax.scan(step, w0, grid[:-1])  # iterate the step START times
-            traj = jnp.concatenate([w0[None, :], ws], axis=0)  # (n_grid, 2N)
-            traj = jax.vmap(lambda col: jnp.interp(_save, grid, col), in_axes=1, out_axes=1)(traj)
-        result = traj[:, :n] + 1j * traj[:, n:]  # (n_save, n_red) complex (full N when untied)
-        if periodic is None:
-            return result
-        from .utils.solver.fem_utils import prolong_periodic
-
-        return prolong_periodic(periodic, result.real) + 1j * prolong_periodic(periodic, result.imag)
-
-    # Forward (non-parametric): march eagerly. Inverse: a leg carries runtime parameters (its operator/load
-    # re-form at ``args``) -> return a differentiable FunctionCall over their union so ∂traj/∂θ flows through
-    # crux, exactly like the complex *linear* :func:`_solve_complex` (the same real-equivalent block, re-marched).
-    rpe: dict = {}
-    for b in blocks:
-        rpe.update(getattr(b, "runtime_parameter_exprs", None) or {})
-    if not rpe:
-        return _march(None)
-    from .trace import FunctionCall
-
-    names = list(rpe)
-    return FunctionCall(
-        lambda *vals: _march(dict(zip(names, vals))), [rpe[n] for n in names], name="fem_complex_transient_solve"
-    )
-
-
 def _is_temporal_value_node(node: Any) -> bool:
     """True if an essential value carries a temporal Variable (time-varying ``g(x,t)``)."""
     return any(isinstance(v, Variable) and getattr(v, "axis", None) == "temporal" for v in _walk(node))
@@ -1301,7 +1160,7 @@ class FEM:
 
     @property
     def is_transient(self) -> bool:
-        return self._mode in ("transient", "complex_transient")
+        return self._mode == "transient"
 
     @property
     def is_linear(self) -> bool:
@@ -1311,10 +1170,14 @@ class FEM:
 
     @property
     def is_complex(self) -> bool:
-        """A complex-valued problem (steady or transient), solved via the real-equivalent block."""
-        if self._mode == "complex_transient":
+        """A complex-valued problem (steady or transient), solved via the real-equivalent block.
+
+        Steady complex still carries its own mode (the ``(re, im)`` leg pair); a complex *transient*
+        is fused into one real 2n :class:`SemidiscreteTimeBlock` at assembly and is therefore an
+        ordinary ``"transient"`` — it announces itself through the block's ``metadata["complex"]``."""
+        if self._mode == "complex":
             return True
-        return self._mode == "complex"
+        return bool((getattr(self._op, "metadata", None) or {}).get("complex"))
 
     @property
     def operator(self) -> Any:
@@ -1561,36 +1424,26 @@ class FEM:
             from .utils.solver.fem_adapt import run_adaptive_solve, run_adaptive_transient
 
             if self._mode == "transient":
+                if self.is_complex:
+                    # A complex transient is now an ordinary transient block, so it *routes* here — but the
+                    # adaptive driver's cross-remesh state transfer interpolates a real nodal field, and this
+                    # block's state is the stacked ``[u_r; u_i]`` pair on one mesh. Transferring it needs the
+                    # two halves carried separately. Fail loud rather than interpolate half a complex field.
+                    raise NotImplementedError(
+                        "jno.fem: fem.solve(adapt=...) on a complex *transient* problem is not supported yet — "
+                        "the adaptive state transfer is not complex-aware (the block state is the stacked "
+                        "[Re; Im] pair). A complex *steady* problem adapts, and a real transient adapts."
+                    )
                 # Adapt the mesh AS the problem marches: remesh every `adapt.every` steps and carry the
                 # state across (basis-aware transfer), tracking a moving feature. The nonlinear=/linear=/
                 # precond= slots configure the per-step (Newton / theta) solve. Returns an AdaptiveTrajectory.
                 return run_adaptive_transient(
                     self, adapt, solve_fn=solve_fn, nonlinear=nonlinear, linear=linear, precond=precond, **kwargs
                 )
-            if self._mode == "complex_transient":
-                raise NotImplementedError(
-                    "fem.solve(adapt=...) on a complex-transient problem is not supported yet (its assembly "
-                    "builds static real Re/Im blocks that do not thread a remesh). Solve the real-equivalent "
-                    "form, or adapt a real reference mesh first."
-                )
             # A steady COMPLEX problem adapts via the ISOTROPIC ZZ estimator, which uses the modulus of the
             # (complex) recovered-gradient gap; only the anisotropic Hessian metric is real-only (guarded in
-            # run_adaptive_solve). complex-transient stays out (its Re/Im block assembly can't remesh).
+            # run_adaptive_solve).
             return run_adaptive_solve(self, adapt, solve_fn=solve_fn, **kwargs)
-        if self._mode == "complex_transient" and time is not None:
-            # The complex-transient path runs its own marcher over the real 2n block, so thread the time=
-            # scheme straight into it (bypassing the per-step slot composition, which is real-block only).
-            if not (hasattr(time, "rtol") or hasattr(time, "theta")):  # adaptive or θ-method on the 2n block
-                raise NotImplementedError(
-                    "fem.solve(time=...) on a complex-transient problem is wired for jno.solve.adaptive(...) "
-                    "and jno.solve.theta(...) (θ=1/2 Crank–Nicolson, etc.); jno.solve.exponential is not."
-                )
-            if any(s is not None for s in (x0, nonlinear, linear, precond)):
-                raise NotImplementedError(
-                    "fem.solve on a complex-transient threads only the time= scheme so far; the "
-                    "x0/nonlinear/linear/precond slots are not wired into that path yet."
-                )
-            return _solve_complex_transient(self._op, save_ts=kwargs.get("save_ts"), periodic=self._periodic, time=time)
         if has_slots:
             solve_fn, kwargs = self._compose_slots(
                 solve_fn, x0=x0, nonlinear=nonlinear, linear=linear, precond=precond, time=time, kwargs=kwargs
@@ -1626,8 +1479,6 @@ class FEM:
             if from_slots and getattr(precond, "complex_native", False):
                 return _solve_complex_block(self._op, periodic=self._periodic, complex_solve=solve_fn)
             return _solve_complex_block(self._op, solve_fn, periodic=self._periodic, from_slots=from_slots)
-        if self._mode == "complex_transient":
-            return _solve_complex_transient(self._op, save_ts=kwargs.get("save_ts"), periodic=self._periodic)
         if self._mode == "linear" and not isinstance(self._op, FemLinearSystem):
             # Non-parametric steady linear. Default: matrix-free Jacobi-preconditioned BiCGStab on the
             # BCOO operator (never densifies -> memory O(nnz); GPU-safe; solves general systems). Pass
@@ -1699,6 +1550,12 @@ class FEM:
             # branch above). `fem.solve()` builds a FunctionCall trace node so a trainable parameter can
             # flow to crux; with no parameter it is just a forward solve, so evaluate it to an array.
             return self._op.solve(solve_fn, **kwargs).fn()
+        if self._mode == "transient" and self.is_complex and not self._op.runtime_parameter_exprs:
+            # Non-parametric COMPLEX transient: return the concrete complex trajectory eagerly, exactly as
+            # the steady linear / nonlinear branches above do — and as the complex transient did before its
+            # Re/Im legs were fused into one block. (A *real* transient stays lazy; that asymmetry predates
+            # the fusion and is a separate call to make, not something a refactor should change silently.)
+            return self._op.solve(solve_fn, **kwargs).fn()
         return self._op.solve(solve_fn, **kwargs)
 
     def _compose_slots(self, solve_fn, *, x0, nonlinear, linear, precond, time=None, kwargs):
@@ -1713,11 +1570,6 @@ class FEM:
         if time is not None and self._mode != "transient":
             raise ValueError(
                 f"fem.solve(time=...) picks a time-integration scheme, but this problem is {self._mode}, not transient."
-            )
-        if self._mode == "complex_transient":
-            raise NotImplementedError(
-                "fem.solve solver slots are not threaded into the complex-transient path yet -- pass a "
-                "full integrator via solve_fn= (see plans/fem-solver-api.md)."
             )
         if self._mode == "transient":
             # thread the slots into the default theta-stepper as per-step solvers: the linear
@@ -1983,9 +1835,9 @@ class FEM:
         return _as_flat(self._op.state0)
 
     def _time_block(self):
-        """The (real) SemidiscreteTimeBlock carrying the integration window — for complex_transient it is
-        the Re-coeff block of the (block_r, block_i) pair."""
-        return self._op[0] if self._mode == "complex_transient" else self._op
+        """The (real) SemidiscreteTimeBlock carrying the integration window (a complex transient is
+        fused into one such block over the stacked ``[Re; Im]`` state, so this needs no special case)."""
+        return self._op
 
     @property
     def t0(self):
@@ -2409,10 +2261,14 @@ def _reduce_transient_block_periodic(block: Any, periodic: dict) -> Any:
         restrict_state_periodic,
     )
 
-    # A second-order augmented block carries the state y=[u; v] — two copies of the field, so reduce by
-    # P on each (P_aug = blkdiag(P, P)). Duplicate the field's periodic blocks into a u-block and a
-    # v-block; every reduction below (M, A, operator_fn, forcing, state0) then acts on the 2N system.
-    if (getattr(block, "metadata", None) or {}).get("second_order"):
+    # A block whose state is TWO stacked copies of the field reduces by P on each half
+    # (P_aug = blkdiag(P, P)). Two assemblies produce that shape and the reduction is identical for both:
+    #   * second-order in time — y = [u; v]  (displacement, velocity)
+    #   * complex             — y = [u_r; u_i]  (real part, imaginary part)
+    # Duplicate the field's periodic blocks into a lower and an upper block; every reduction below
+    # (M, A, operator_fn, forcing, state0) then acts on the 2N system.
+    _meta_in = getattr(block, "metadata", None) or {}
+    if _meta_in.get("second_order") or _meta_in.get("complex"):
         _b, _of, _or = _periodic_blocks(periodic)
         _of, _or = np.asarray(_of), np.asarray(_or)
         nf, nr = int(_of[-1]), int(_or[-1])
@@ -2489,17 +2345,17 @@ def reduce_op_periodic(op: Any, mode: str, periodic: dict) -> Any:
     * ``"transient"`` -- eager reduction of the ``SemidiscreteTimeBlock`` (``P^T M P``, ``P^T A P``,
       runtime ``operator_fn``/``forcing_vector_fn``, restricted ``state0``) via
       :func:`_reduce_transient_block_periodic`.
-    * ``"complex"`` / ``"complex_transient"`` -- ``op`` is a ``(re, im)`` tuple of real systems that
-      share **one** FE space, hence **one** ``P``; each leg is reduced with the *same* ``periodic`` so
-      the real-equivalent block ``[[A_r, -A_i], [A_i, A_r]]`` (and its transient analogue) is preserved
-      exactly. (``complex`` legs are raw ``(A, b)``; ``complex_transient`` legs are time blocks.)
+    * ``"complex"`` (steady) -- ``op`` is a ``(re, im)`` tuple of real systems that share **one** FE
+      space, hence **one** ``P``; each leg is reduced with the *same* ``periodic`` so the
+      real-equivalent block ``[[A_r, -A_i], [A_i, A_r]]`` is preserved exactly. (A complex *transient*
+      needs no case here: it is fused into a single 2n ``"transient"`` block at assembly, and
+      :func:`_reduce_transient_block_periodic` duplicates ``P`` into ``blkdiag(P, P)`` for it.)
     * ``"linear"`` (a raw ``(A, b)``) and ``"nonlinear"`` (a residual operator) -- returned unchanged;
       these reduce lazily at solve time in :meth:`FEM.solve` (``P^T A P`` on the BCOO operator, or the
       ``P^T r(P·)`` residual wrap), which keeps the operator sparse and the residual matrix-free.
     """
-    if mode in ("complex", "complex_transient"):
-        leg_mode = "transient" if mode == "complex_transient" else "linear"
-        return tuple(reduce_op_periodic(leg, leg_mode, periodic) for leg in op)
+    if mode == "complex":
+        return tuple(reduce_op_periodic(leg, "linear", periodic) for leg in op)
     if mode == "transient":
         return _reduce_transient_block_periodic(op, periodic)
     return op
@@ -2975,7 +2831,8 @@ def fem(
         else:
             periodic = _build_periodic_reduction(domain, periodic_ties, fem_obj.points, cells, ele_order, vec or 1)
         # One op-level reduction combinator handles every representation: a transient block is reduced
-        # now (P^T M P, ...) and a complex (re, im) tuple is reduced leg-wise with the same P; steady
+        # now (P^T M P, ...) — including a fused complex transient, whose stacked [Re; Im] state reduces by
+        # blkdiag(P, P) — and a steady complex (re, im) tuple is reduced leg-wise with the same P; steady
         # linear (A, b) and nonlinear residual ops are returned unchanged and reduce lazily in FEM.solve.
         fem_obj._op = reduce_op_periodic(fem_obj._op, fem_obj._mode, periodic)
         fem_obj._periodic = periodic
@@ -3362,8 +3219,8 @@ def fem(
         # A real coordinate-input net in a steady complex form is fine — each Re/Im leg assembles as
         # a parametric FemLinearSystem and _solve_complex_block builds the differentiable trace node,
         # exactly like the scalar complex inverse. The two compositions that would mis-assemble stay
-        # rejected: the complex-transient branch unpacks eager (A, b) legs (a parametric leg cannot
-        # ride it), and a solution-dependent net makes the legs nonlinear (no complex Newton block).
+        # rejected: a trainable network's WEIGHTS are not routed into the complex-transient legs (a scalar
+        # runtime parameter is), and a solution-dependent net makes the legs nonlinear (no complex Newton).
         if is_transient:
             raise NotImplementedError(
                 "jno.fem: a neural coefficient in a complex *transient* form is not supported yet — a runtime "
@@ -3447,7 +3304,7 @@ def fem(
         # Spatial Re/Im parts, with the Dirichlet conditions applied to each block. A runtime parameter makes
         # ``assemble_fem_native`` return a parametric ``FemLinearSystem`` leg (the complex-transient INVERSE)
         # instead of a raw ``(A, b)``; the block then carries operator_fn/forcing that re-form ``A(θ)``/``b(θ)``
-        # at args, and _solve_complex_transient wraps a differentiable trace node (mirrors the complex linear
+        # at args, and the fused block wraps a differentiable trace node (mirrors the complex linear
         # inverse). A non-parametric leg keeps the static ``A``/``affine_bias`` block (byte-identical).
         _leg_r, _mr, _o1 = assemble_fem_native(
             domain, [s.real for s in spatial_raw], real_bd, dirichlet_raw, [], vec=vec or 1, quad_degree=quad_degree
@@ -3483,24 +3340,59 @@ def fem(
             eval_context={},
         )
 
-        def _leg_block(leg, M_blk, state0):
+        # ---- FUSE the Re/Im legs into ONE real 2n block, at ASSEMBLY time. This is the same move
+        # ``_assemble_second_order_time`` makes for ``u_tt``: the real-equivalent block
+        # ``[[A_r, -A_i], [A_i, A_r]]`` over the state ``y = [u_r; u_i]`` is an ordinary
+        # :class:`SemidiscreteTimeBlock`, so the solver slots, the ``jno.solve`` time schemes and the
+        # transient drivers all apply to a complex transient unchanged — there is no second marcher to
+        # re-thread each of them into. Recombination ``u = y[:n] + i·y[n:]`` happens once, on the
+        # finished trajectory, keyed off ``metadata["complex"]`` (after any periodic prolongation —
+        # ``P`` is real and linear, so prolong-then-split equals split-then-prolong). ----
+        def _leg_parts(leg):
+            """``(A(args), c(args))`` for one real leg — the static matrices, or re-formed at runtime args."""
             if isinstance(leg, _FLS):  # parametric leg: operator/load re-form at args (the inverse)
-                return _FTB(
-                    M=M_blk,
-                    operator_fn=lambda t, args, _L=leg: _L.evaluate(args)[0],  # BCOO operator (not densified)
-                    forcing_vector_fn=lambda t, args, _L=leg: jnp.asarray(_L.evaluate(args)[1]).reshape(-1),
-                    runtime_parameter_exprs=dict(getattr(leg, "runtime_parameter_exprs", {}) or {}),
-                    state0=state0,
-                    **_common,
+                return (
+                    lambda args, _L=leg: _to_bcoo(_L.evaluate(args)[0]),  # BCOO operator (not densified)
+                    lambda args, _L=leg: jnp.asarray(_L.evaluate(args)[1]).reshape(-1),
                 )
-            A, c = leg  # raw (A, b): the static BCOO block (the marcher composes the 2N block sparsely)
-            return _FTB(M=M_blk, A=A, affine_bias=jnp.asarray(c).reshape(-1), state0=state0, **_common)
+            _A, _c = _to_bcoo(leg[0]), jnp.asarray(leg[1]).reshape(-1)  # raw (A, b): static
+            return (lambda args, _A=_A: _A), (lambda args, _c=_c: _c)
+
+        A_r_fn, c_r_fn = _leg_parts(_leg_r)
+        A_i_fn, c_i_fn = _leg_parts(_leg_i)
+        rpe: dict = {}
+        for _leg in (_leg_r, _leg_i):
+            if isinstance(_leg, _FLS):
+                rpe.update(getattr(_leg, "runtime_parameter_exprs", None) or {})
 
         # the imaginary mass M_i is 0 (a real density): an empty BCOO, so the block mass stays sparse
         _zero_Mi = _jsp.BCOO((jnp.zeros((0,), M.dtype), jnp.zeros((0, 2), jnp.int32)), shape=(n, n))
-        block_r = _leg_block(_leg_r, M_bc, jnp.real(s0))
-        block_i = _leg_block(_leg_i, _zero_Mi, jnp.imag(s0))
-        return _finalize(FEM(domain=domain, op=(block_r, block_i), classification=classification, mode="complex_transient"))
+        # ``krylov="gmres"``: the real-equivalent block is genuinely NON-SYMMETRIC, and BiCGStab (the
+        # stepper's default, right for the symmetric real blocks) can break down on it. The bespoke
+        # marcher this fusion replaces chose GMRES for exactly that reason; carry the choice over rather
+        # than silently regressing robustness on the indefinite / mass-dominated systems it was picked for.
+        meta = {"complex": True, "krylov": "gmres"}
+        y0 = jnp.concatenate([jnp.real(s0), jnp.imag(s0)])
+        if rpe:  # parametric: the 2n operator/load are re-formed from the runtime args each step
+            block = _FTB(
+                M=_complex_block_bcoo(M_bc, _zero_Mi, n),
+                operator_fn=lambda t, args: _complex_block_bcoo(A_r_fn(args), A_i_fn(args), n),
+                forcing_vector_fn=lambda t, args: jnp.concatenate([c_r_fn(args), c_i_fn(args)]),
+                runtime_parameter_exprs=rpe,
+                state0=y0,
+                metadata=meta,
+                **_common,
+            )
+        else:  # non-parametric: one static 2n block, composed sparsely (never densified)
+            block = _FTB(
+                M=_complex_block_bcoo(M_bc, _zero_Mi, n),
+                A=_complex_block_bcoo(A_r_fn(None), A_i_fn(None), n),
+                affine_bias=jnp.concatenate([c_r_fn(None), c_i_fn(None)]),
+                state0=y0,
+                metadata=meta,
+                **_common,
+            )
+        return _finalize(FEM(domain=domain, op=block, classification=classification, mode="transient"))
 
     # ---- native periodic transient (scalar single-field, linear, incl. runtime-parametric): assemble
     # the full native transient block, build the prolongation P from the native assembly mesh, then

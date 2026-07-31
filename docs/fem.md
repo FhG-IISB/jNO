@@ -709,8 +709,13 @@ all work; only specs that need the assembled matrix (`jacobi`, an unbuilt `amg`)
 formed **once** and the preconditioner materialized **once before the time loop** — and `nonlinear` drives
 each implicit step of a nonlinear block. Second-order-in-time (`u_tt`) flows through the same augmented
 block. Each step warm-starts from the previous state (so `x0=` is rejected); `lu()` inside the time loop
-re-factorizes per step. Not yet supported (clear errors): slots on **complex** / complex-transient
-problems, and slots combined with `adapt=`.
+re-factorizes per step.
+
+A **complex transient** is assembled as one real `2n` block over the stacked `[Re; Im]` state, so it is an
+ordinary transient block: the slots configure its per-step solve exactly as above, and every `jno.solve`
+time scheme (`theta`, `adaptive`, `exponential`) applies. Not yet supported (clear errors): slots on a
+**steady complex** problem, and `adapt=` on a complex transient (the cross-remesh state transfer is not
+complex-aware yet).
 
 ### Field parameters `k(x)` + regularization
 

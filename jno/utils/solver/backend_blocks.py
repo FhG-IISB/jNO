@@ -349,6 +349,15 @@ class SemidiscreteTimeBlock:
         # diagonal (Jacobi) preconditioner 1/diag(M + theta dt A); zero diagonals left unscaled
         d = matrix_diagonal(M) + th * dt * matrix_diagonal(A)
         inv = 1.0 / jnp.where(jnp.abs(d) > 1e-30, d, 1.0)
+        # ``metadata["krylov"]`` lets an assembly pick the Krylov method its operator needs. BiCGStab is
+        # the default and is right for the symmetric real blocks; the complex real-equivalent block
+        # ``[[A_r,-A_i],[A_i,A_r]]`` is genuinely non-symmetric and asks for GMRES, which does not break
+        # down there. Restart is capped at 40 (as the dedicated complex marcher used) to bound memory.
+        if (self.metadata or {}).get("krylov") == "gmres":
+            wn, _ = jax.scipy.sparse.linalg.gmres(
+                step_op, rhs, x0=u, tol=1e-10, atol=0.0, restart=min(n, 40), M=lambda x: inv * x
+            )
+            return wn
         wn, _ = jax.scipy.sparse.linalg.bicgstab(
             step_op, rhs, x0=u, tol=1e-10, atol=0.0, maxiter=20_000, M=lambda x: inv * x
         )
@@ -401,6 +410,13 @@ class SemidiscreteTimeBlock:
                 import jax
 
                 ys = jax.vmap(self.prolong)(ys)
+            if (self.metadata or {}).get("complex"):
+                # A complex transient integrates as the real-equivalent 2n block over y=[u_r; u_i].
+                # Recombine ONCE, here, after any periodic prolongation -- P is real and linear, so
+                # prolong-then-split is identical to split-then-prolong, and doing it last means the
+                # marcher, the time schemes and the solver slots all stay real-only and complex-unaware.
+                h = ys.shape[-1] // 2
+                ys = ys[..., :h] + 1j * ys[..., h:]
             return ys
 
         return FunctionCall(_solve, params, name="fem_transient_solve")
