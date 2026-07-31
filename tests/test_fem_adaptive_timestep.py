@@ -19,7 +19,6 @@ import jax.numpy as jnp  # noqa: E402
 from shapely.geometry import box  # noqa: E402
 
 import jno  # noqa: E402
-from jno._fem import _solve_complex_transient  # noqa: E402
 from jno.solve import adaptive  # noqa: E402
 from jno.utils.solver.backend_blocks import _default_transient_integrate  # noqa: E402
 from jno.utils.solver.timeschemes import _AdaptiveScheme  # noqa: E402
@@ -243,16 +242,16 @@ def test_adaptive_complex_scalar_forward_and_grad():
     """Complex-transient: the same marcher runs on the real 2n block. Forward is complex, no NaN, IC
     preserved, and the parametric inverse gradient matches a finite difference."""
     d, fem = _complex_heat()
-    assert fem._mode == "complex_transient"
+    assert fem.is_complex and fem.is_transient
     save = jnp.linspace(0.0, 0.05, 6)
     sch = adaptive(rtol=1e-4, atol=1e-6, max_steps=1000)
-    ad = np.asarray(_solve_complex_transient(fem.operator, save_ts=save, periodic=None, time=sch))
-    be = np.asarray(_solve_complex_transient(fem.operator, save_ts=save, periodic=None))
+    ad = np.asarray(fem.solve(save_ts=save, time=sch))
+    be = np.asarray(fem.solve(save_ts=save))
     assert ad.dtype == np.complex128 and not np.any(np.isnan(ad))
     assert np.max(np.abs(ad[0] - be[0])) < 1e-12  # IC preserved
 
     _, femp = _complex_heat(param=True)
-    fc = _solve_complex_transient(femp.operator, save_ts=save, periodic=None, time=sch)  # parametric -> FunctionCall
+    fc = femp.solve(save_ts=save, time=sch)  # parametric -> FunctionCall
 
     def loss(kv):
         return jnp.sum(jnp.abs(fc.fn(jnp.asarray([kv]))) ** 2)
@@ -267,14 +266,11 @@ def test_adaptive_complex_periodic():
     """The full compose — complex + periodic (the metasurface-in-time case): one adaptive marcher over the
     reduced 2n block, recombined to complex and prolonged. No NaN, complex, IC preserved."""
     d, fem = _complex_heat(periodic=True)
-    assert fem._mode == "complex_transient"
+    assert fem.is_complex and fem.is_transient
+    assert fem._periodic is not None, "the u(left)-u(right) tie must reduce the complex transient block"
     save = jnp.linspace(0.0, 0.05, 6)
-    ad = np.asarray(
-        _solve_complex_transient(
-            fem.operator, save_ts=save, periodic=fem._periodic, time=adaptive(rtol=1e-4, max_steps=1000)
-        )
-    )
-    be = np.asarray(_solve_complex_transient(fem.operator, save_ts=save, periodic=fem._periodic))
+    ad = np.asarray(fem.solve(save_ts=save, time=adaptive(rtol=1e-4, max_steps=1000)))
+    be = np.asarray(fem.solve(save_ts=save))
     assert ad.dtype == np.complex128 and not np.any(np.isnan(ad))
     assert ad.shape == be.shape
     assert np.max(np.abs(ad[0] - be[0])) < 1e-12  # IC preserved
@@ -312,20 +308,20 @@ def test_theta_on_complex_transient():
     mesh than backward Euler at the same coarse step — and reverse-mode differentiable."""
     save = jnp.linspace(0.0, 0.05, 6)
     _, fem = _complex_heat(mesh_size=0.3, nsteps=6)
-    default = np.asarray(_solve_complex_transient(fem.operator, save_ts=save, periodic=None))
-    th1 = np.asarray(_solve_complex_transient(fem.operator, save_ts=save, periodic=None, time=jno.solve.theta(1.0)))
+    default = np.asarray(fem.solve(save_ts=save))
+    th1 = np.asarray(fem.solve(save_ts=save, time=jno.solve.theta(1.0)))
     assert np.max(np.abs(th1 - default)) < 1e-12  # θ=1 is exactly the default backward Euler
 
     _, fine = _complex_heat(mesh_size=0.3, nsteps=401)  # fine-dt reference on the same mesh
-    ref = np.asarray(_solve_complex_transient(fine.operator, save_ts=save, periodic=None))
-    cn = np.asarray(_solve_complex_transient(fem.operator, save_ts=save, periodic=None, time=jno.solve.theta(0.5)))
+    ref = np.asarray(fine.solve(save_ts=save))
+    cn = np.asarray(fem.solve(save_ts=save, time=jno.solve.theta(0.5)))
     err_be = np.linalg.norm(default[-1] - ref[-1]) / np.linalg.norm(ref[-1])
     err_cn = np.linalg.norm(cn[-1] - ref[-1]) / np.linalg.norm(ref[-1])
     assert not np.any(np.isnan(cn))
     assert err_cn < 0.2 * err_be, f"Crank–Nicolson (2nd-order) should beat backward Euler: CN={err_cn:.2e} BE={err_be:.2e}"
 
     _, femp = _complex_heat(mesh_size=0.3, param=True)
-    fc = _solve_complex_transient(femp.operator, save_ts=save, periodic=None, time=jno.solve.theta(0.5))
+    fc = femp.solve(save_ts=save, time=jno.solve.theta(0.5))
 
     def loss(kv):
         return jnp.sum(jnp.abs(fc.fn(jnp.asarray([kv]))) ** 2)
