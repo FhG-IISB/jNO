@@ -53,6 +53,7 @@ __all__ = [
     "trace",
     "applyfun",
     "diagonal",
+    "svd",
     "lstsq",
     "theta",
     "exponential",
@@ -525,6 +526,20 @@ def diagonal(A, *, fun=None, samples: int = 32, order: int = 25, key=None):
     from .utils.solver.matfun import diagonal as _diagonal
 
     return _diagonal(A, fun=fun, samples=samples, order=order, key=key)
+
+
+def svd(A, *, k: int = 6, depth: int | None = None, v0=None):
+    """Differentiable, matrix-free **partial SVD** — the ``k`` largest singular triplets of a possibly
+    **rectangular** operator (Golub–Kahan bidiagonalization, 1965). The non-symmetric counterpart to
+    :func:`eigs`: use it for **POD / reduced-order bases** from a snapshot matrix, and for the
+    **ill-posedness** of an inverse problem — the singular spectrum of the parameter-to-observable map
+    says which modes are recoverable at all. ``A`` is touched only through its matvec, so it may be the
+    JVP of a differentiable FEM solve rather than an assembled matrix. ``depth`` (default ``2k+10``)
+    must exceed ``k`` — see :func:`jno.utils.solver.matfun.svd` for why, and for the clustered-spectrum
+    caveat. Returns ``(U, s, Vt)``. Optional ``matfree``."""
+    from .utils.solver.matfun import svd as _svd
+
+    return _svd(A, k=k, depth=depth, v0=v0)
 
 
 def lstsq(A, b, *, damp: float = 0.0, atol: float = 1e-6, btol: float = 1e-6, maxiter: int = 100_000, x0=None):

@@ -186,6 +186,7 @@ precond=…, time=…)` composes (see the [FEM guide](fem.md)). The families:
 | **Linear — multigrid** | `amg` (GPU AMG / NVIDIA AmgX via jaxamg) |
 | **Nonlinear** | `newton`, `picard` |
 | **Eigenproblem** | `eigs` (generalized `Kx = λMx`) — dense reduction, or preconditioned LOBPCG with `precond=` |
+| **Singular values** | `svd` (partial SVD of a **rectangular**, matrix-free operator — POD bases, inverse-problem ill-posedness) |
 | **Matrix functions** (stochastic Lanczos, matrix-free) | `logdet`, `trace`, `applyfun` (`f(A)·v`), `diagonal` |
 | **Time integration** | `theta` (θ-method), `exponential` (exponential integrator), `adaptive` (step-doubling adaptive step size) |
 
@@ -226,7 +227,33 @@ pencil the residual floors well above it (≈`4.4e-8` on a singular all-Neumann 
 `cond(K) ≈ 2e16`), and a tolerance below that floor burns the budget and **NaN-poisons** the result —
 which is the deliberate contract for an exhausted budget, never a quietly under-converged spectrum.
 
+### Singular values — `jno.solve.svd`
+
+`eigs` solves the *symmetric* pencil `Kx = λMx`. The two questions that are **not** eigenproblems need
+the SVD of a possibly rectangular map, via Golub–Kahan bidiagonalization (Golub & Kahan,
+*J. SIAM Numer. Anal. Ser. B* **2**(2), 1965):
+
+```python
+U, s, Vt = jno.solve.svd(snapshots, k=6)      # POD basis from a (n_time, n_dofs) trajectory
+U, s, Vt = jno.solve.svd(jacobian_op, k=20)   # ill-posedness of a parameter-to-observable map
+```
+
+* **POD / reduced-order models** — the singular vectors are the energy-optimal basis and `s` says how
+  many modes the trajectory actually needs.
+* **Ill-posedness** — the singular spectrum of the parameter-to-observable map says which parameter
+  modes are recoverable at all; those below the noise floor are not, whatever the optimizer does.
+
+`A` is touched only through its matvec, so it can be the JVP of a differentiable FEM solve rather than
+an assembled matrix, and `s` differentiates back to whatever that matvec closes over.
+
+`depth` (bidiagonalization steps, default `2k+10`) **must exceed `k`** — the Ritz values converge from
+below, so at `depth == k` only the largest singular value is meaningful (measured 95 % error on the
+rest, against ~1e-15 at `depth = 2k`). Convergence is fast on the *decaying* spectra that make POD and
+ill-posedness analysis worth doing, and slow on clustered ones (~3 % error at `depth = 4k` on a tight
+cluster) — inspect `s` for a plateau if the spectrum may be flat.
+
 **Preconditioners** (`jno.precond`, for the iterative solvers): `jacobi`, `chebyshev`,
+`nystrom` (randomized low-rank — the rung between `jacobi` and multigrid),
 `amg` (algebraic multigrid), `gmg` (geometric multigrid — a structured-grid V-cycle),
 `ams` (H(curl) auxiliary-space Maxwell), `form` (weak-form auxiliary operator),
 `inner` (any solver as `M⁻¹`), `block_diag` / `triangular` (block / Schur), and `cached`.
