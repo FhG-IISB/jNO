@@ -45,6 +45,7 @@ __all__ = [
     "cached",
     "ams",
     "gmg",
+    "nystrom",
 ]
 
 
@@ -104,6 +105,40 @@ class _GMG(_Spec):
 
     def __repr__(self):
         return "jno.precond.gmg()"
+
+
+class _Nystrom(_Spec):
+    """Spec for the randomized-Nyström low-rank preconditioner; see :func:`nystrom`."""
+
+    def __init__(self, rank, mu, seed):
+        self.rank, self.mu, self.seed = rank, mu, seed
+
+    def materialize(self, ctx: PrecondContext):
+        import jax
+
+        from .utils.solver.krylov import nystrom_apply, nystrom_sketch
+
+        if ctx.A.shape is None:
+            raise TypeError(
+                "jno.precond.nystrom needs to know the operator size — this is a matvec-only "
+                "operator with no shape. Wrap it with a shape, or use jno.precond.jacobi()."
+            )
+        n = int(ctx.A.shape[0])
+        if self.rank >= n:
+            raise ValueError(
+                f"jno.precond.nystrom(rank={self.rank}) on an n={n} operator: the rank must be smaller "
+                "than the system (a rank-n sketch costs n matvecs, i.e. more than a direct solve). "
+                "Use a rank well below n — the point is to capture only the top of the spectrum."
+            )
+        U, lam = nystrom_sketch(ctx.A.mv, n, rank=self.rank, key=jax.random.PRNGKey(self.seed))
+        # mu defaults to the smallest captured eigenvalue: the spectrum below the sketch is left
+        # untouched (identity), so scaling by lam_min matches the two parts continuously.
+        mu = self.mu if self.mu is not None else jnp.maximum(lam[-1], 1e-12)
+        apply = nystrom_apply(U, lam, mu)
+        return PrecondApplier(apply)  # U diag U^T + (I - U U^T) is symmetric => M^T == M
+
+    def __repr__(self):
+        return f"jno.precond.nystrom(rank={self.rank})"
 
 
 class _Chebyshev(_Spec):
@@ -918,6 +953,32 @@ def cached(spec, *, refresh: bool = False):
             u = build_fem(f).solve(linear=jno.solve.fgmres(), precond=M)   # hierarchy built once
     """
     return _Cached(spec, refresh)
+
+
+def nystrom(*, rank: int = 20, mu: float | None = None, seed: int = 0) -> _Nystrom:
+    r"""Randomized **Nyström** low-rank preconditioner for SPD operators — the rung between
+    ``jacobi`` and a multilevel method.
+
+    Frangella, Tropp & Udell, "Randomized Nyström Preconditioning", *SIAM J. Matrix Anal. Appl.*
+    44(2), 2023 — Algorithm 2.1 (the stabilized sketch) and §3 / Definition 3.1 (the
+    preconditioner ``P^{-1} = (lam_min+mu) U (diag(lam)+mu)^{-1} U^T + (I - U U^T)``).
+
+    Sketches ``A`` against a random ``n x rank`` matrix — **exactly ``rank`` matvecs, no assembled
+    matrix and no triangular solves** — and deflates the captured top of the spectrum. That is the
+    part `jacobi` cannot reach: a diagonal preconditioner rescales, it cannot separate a few large
+    outlying eigenvalues, which is precisely what stalls Krylov on FEM operators with a stiff
+    coefficient contrast or a near-null-space. Unlike ILU it needs no factorization and no
+    sequential sweep, so it is ``jit``/``vmap``-native and runs on GPU.
+
+    ``rank`` is the number of eigenvalues captured (cost is linear in it); ``mu`` is the
+    regularization, defaulting to the smallest captured eigenvalue so the low-rank and identity
+    parts meet continuously. ``seed`` fixes the sketch, so a solve is reproducible.
+
+    **SPD only.** The sketch takes a Cholesky of ``Omega^T A Omega``, so a non-symmetric or
+    indefinite operator will produce NaNs rather than a wrong answer quietly — use ``jacobi`` or
+    ``chebyshev`` for those.
+    """
+    return _Nystrom(rank, mu, seed)
 
 
 def chebyshev(

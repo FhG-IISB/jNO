@@ -115,6 +115,97 @@ def test_chebyshev_solver_true_and_estimated_bounds():
     assert np.abs(np.asarray(x_auto) - x_ref).max() < 1e-8
 
 
+def _spd_with_outliers(n=300, n_out=15, seed=21):
+    """SPD with a spread bulk plus a few large outlying eigenvalues.
+
+    The regime that motivates a low-rank preconditioner: Jacobi can rescale a spectrum but cannot
+    *separate* a handful of large outliers, which is what stalls CG. A FEM operator gets this shape
+    from a stiff coefficient contrast or a near-null-space."""
+    rng = np.random.default_rng(seed)
+    Q, _ = np.linalg.qr(rng.standard_normal((n, n)))
+    lam = np.concatenate([np.linspace(2000.0, 300.0, n_out), np.linspace(1.0, 8.0, n - n_out)])
+    A = (Q * lam) @ Q.T
+    return 0.5 * (A + A.T)
+
+
+def _cg_iters(Ad, b, M, xref, cap=500):
+    """Smallest CG iteration count reaching 1e-10 relative error (``None`` if never)."""
+    for k in range(1, cap + 1):
+        x, _ = jax.scipy.sparse.linalg.cg(lambda v: Ad @ v, b, M=M, tol=0.0, atol=0.0, maxiter=k)
+        if np.linalg.norm(np.asarray(x) - xref) / np.linalg.norm(xref) < 1e-10:
+            return k
+    return None
+
+
+def test_nystrom_preconditioner_beats_jacobi_on_outlying_eigenvalues():
+    """Randomized Nyström (Frangella, Tropp & Udell 2023, Alg. 2.1 + §3) deflates the top of the
+    spectrum — the part a diagonal preconditioner cannot reach.
+
+    On a spectrum with large outliers Jacobi is not merely weak, it is *worse than nothing*
+    (measured: 124 iterations vs 98 unpreconditioned), because rescaling cannot separate outliers.
+    A rank-20 sketch captures the 15 outliers and roughly halves the unpreconditioned count, for a
+    setup cost of 20 matvecs."""
+    from jno.utils.solver.solver_api import PrecondContext, materialize_precond
+
+    Ad = jnp.asarray(_spd_with_outliers())
+    b = _b(Ad.shape[0], seed=22)
+    xref = np.linalg.solve(np.asarray(Ad), np.asarray(b))
+    op = _op(Ad)
+
+    plain = _cg_iters(Ad, b, None, xref)
+    jac = _cg_iters(Ad, b, materialize_precond(jno.precond.jacobi(), PrecondContext(op)), xref)
+    nys = _cg_iters(Ad, b, materialize_precond(jno.precond.nystrom(rank=20), PrecondContext(op)), xref)
+    assert None not in (plain, jac, nys), f"all three must converge, got {plain}, {jac}, {nys}"
+    assert nys < 0.6 * plain, f"nystrom({nys}) should roughly halve unpreconditioned CG ({plain})"
+    assert nys < jac, f"nystrom({nys}) must beat jacobi({jac}) where the spectrum has outliers"
+
+    # more rank captures more of the spectrum -> never worse
+    nys40 = _cg_iters(Ad, b, materialize_precond(jno.precond.nystrom(rank=40), PrecondContext(op)), xref)
+    assert nys40 <= nys, f"rank 40 ({nys40}) should not be worse than rank 20 ({nys})"
+
+
+def test_nystrom_applier_is_linear_symmetric_and_reproducible():
+    """Contract required to precondition CG: the application must be a *linear* symmetric operator
+    (a fixed sketch, no per-call randomness), and a fixed ``seed`` must reproduce it exactly."""
+    from jno.utils.solver.solver_api import PrecondContext, materialize_precond
+
+    Ad = jnp.asarray(_spd_with_outliers(n=120, seed=23))
+    op = _op(Ad)
+    M = materialize_precond(jno.precond.nystrom(rank=12, seed=3), PrecondContext(op))
+    v, w = _b(120, seed=24), _b(120, seed=25)
+
+    lin = np.asarray(M(2.0 * v + w) - 2.0 * M(v) - M(w))
+    assert np.abs(lin).max() < 1e-9, "the preconditioner application must be linear"
+    # symmetry: <Mv, w> == <v, Mw>
+    assert abs(float(M(v) @ w - v @ M(w))) < 1e-9, "the Nystrom preconditioner must be symmetric"
+    # the same seed reproduces the sketch exactly; a different one still gives a valid operator
+    M_same = materialize_precond(jno.precond.nystrom(rank=12, seed=3), PrecondContext(op))
+    assert np.abs(np.asarray(M(v) - M_same(v))).max() < 1e-12, "seed must make the sketch reproducible"
+    M_other = materialize_precond(jno.precond.nystrom(rank=12, seed=99), PrecondContext(op))
+    assert np.all(np.isfinite(np.asarray(M_other(v))))
+
+
+def test_nystrom_rejects_ranks_and_operators_it_cannot_serve():
+    """Extremes, each failing loud rather than silently wasting work or returning garbage."""
+    from jno.utils.solver.solver_api import LinearOperator, PrecondContext, materialize_precond
+
+    Ad = jnp.asarray(_spd(n=30, seed=26))
+    ctx = PrecondContext(_op(Ad))
+    # rank >= n costs more matvecs than a direct solve -- refuse rather than "work" pointlessly
+    with pytest.raises(ValueError, match="rank"):
+        materialize_precond(jno.precond.nystrom(rank=30), ctx)
+    with pytest.raises(ValueError, match="rank"):
+        materialize_precond(jno.precond.nystrom(rank=64), ctx)
+    # a matvec-only operator has no shape to size the sketch from
+    mv_only = LinearOperator.from_matvec(lambda v: Ad @ v)
+    if getattr(mv_only, "shape", None) is None:
+        with pytest.raises(TypeError, match="shape|matvec-only"):
+            materialize_precond(jno.precond.nystrom(rank=4), PrecondContext(mv_only))
+    # the smallest useful sketch still produces a working, finite operator
+    M1 = materialize_precond(jno.precond.nystrom(rank=1), ctx)
+    assert np.all(np.isfinite(np.asarray(M1(_b(30, seed=27)))))
+
+
 def test_lanczos_bounds_bracket_the_spectrum_where_the_ratio_guess_does_not():
     """Both ends of the spectrum, measured rather than guessed (Lanczos 1950 §II).
 
@@ -252,6 +343,8 @@ def test_fem_solve_with_new_krylov_slots():
         (jno.solve.minres(), jno.precond.jacobi()),  # Poisson stiffness is SPD: MINRES applies
         (jno.solve.cg(), jno.precond.chebyshev(degree=6)),
         (jno.solve.chebyshev(maxiter=2000), None),
+        # the low-rank slot rides fem.solve like any other preconditioner (SPD Poisson operator)
+        (jno.solve.cg(), jno.precond.nystrom(rank=12)),
     ]:
         uu = np.asarray(fem.solve(linear=solver, precond=precond))
         assert np.abs(uu - u_ref).max() < 1e-6, f"{solver.name} deviates on Poisson"
