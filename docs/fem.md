@@ -635,6 +635,15 @@ preconditioner never changes the converged solution, only the speed, so specs ne
   the interval it is fitted to: the older `lmin = lmax/30` guess, whenever the true ratio is smaller,
   left the lowest modes outside that interval where the polynomial amplifies them. Without the optional
   `matfree` package the guess remains the fallback.
+* `jno.precond.nystrom(rank=…)` — **randomized Nyström** low-rank preconditioner (Frangella, Tropp &
+  Udell, *SIAM J. Matrix Anal. Appl.* 44(2), 2023, Alg. 2.1 and §3), the rung between `jacobi` and a
+  multilevel method. Sketches `A` against a random `n × rank` matrix — exactly `rank` matvecs, no
+  factorization, no triangular sweep — and deflates the captured top of the spectrum. That is what
+  `jacobi` cannot do: a diagonal rescales, it cannot *separate* a few large outlying eigenvalues, and on
+  such a spectrum Jacobi can be worse than no preconditioner at all (measured on a rank-15-outlier SPD
+  system: 124 CG iterations for `jacobi`, 98 unpreconditioned, **46** for `nystrom(rank=20)`). **SPD
+  only** — the sketch takes a Cholesky, so an indefinite operator gives NaN rather than a quiet wrong
+  answer.
 * `jno.precond.inner(solver)` — any `jno.solve` solver as the `M⁻¹` application (an inexact block/system
   solve). Iterative inner ⇒ flexible outer (`fgmres`).
 * `jno.precond.form([...terms], inner=…)` — **preconditioners as weak forms**: assemble an auxiliary

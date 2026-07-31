@@ -285,6 +285,64 @@ def lanczos_spectrum_bounds(matvec, n, *, dtype=None, iters=30, M=None):
     return jnp.abs(lo), jnp.abs(hi)
 
 
+def nystrom_sketch(matvec, n, *, rank, key, dtype=None):
+    r"""Randomized Nyström approximation ``A ≈ U diag(lam) U^T`` of an SPD operator, from matvecs.
+
+    Frangella, Tropp & Udell, "Randomized Nyström Preconditioning", *SIAM J. Matrix Anal. Appl.*
+    44(2), 2023, Algorithm 2.1 (the sketch) — the stabilized construction, which avoids the
+    catastrophic cancellation of the naive ``Y (Ω^T Y)^{-1} Y^T`` form.
+
+    Costs exactly ``rank`` matvecs: the sketch ``Y = A Ω`` is a single batched matvec against an
+    ``n x rank`` Gaussian test matrix. Everything after that is dense work on ``n x rank`` and
+    ``rank x rank`` factors, so nothing the size of ``A`` is ever formed.
+
+    Returns ``(U, lam)`` with ``U`` orthonormal ``(n, rank)`` and ``lam`` the ``rank`` non-negative
+    approximate eigenvalues, largest first.
+    """
+    dtype = dtype or jnp.result_type(float)
+    k = int(min(max(int(rank), 1), n))
+    omega = jax.random.normal(key, (n, k), dtype)
+    omega, _ = jnp.linalg.qr(omega)  # orthonormal test matrix: better conditioned sketch
+    Y = jax.vmap(matvec, in_axes=1, out_axes=1)(omega)  # rank matvecs -> (n, k)
+
+    # Stabilization shift nu (Alg. 2.1): lifts Omega^T Y_nu to be safely positive definite so the
+    # Cholesky below cannot fail on a numerically semi-definite sketch.
+    nu = jnp.sqrt(jnp.asarray(n, dtype)) * _EPS_OF(dtype) * jnp.linalg.norm(Y)
+    Y_nu = Y + nu * omega
+    C = jnp.linalg.cholesky(omega.T @ Y_nu)
+    # B = Y_nu C^{-T} via a triangular solve, so A ~ B B^T without inverting anything
+    B = jax.scipy.linalg.solve_triangular(C, Y_nu.T, lower=True).T
+    U, s, _ = jnp.linalg.svd(B, full_matrices=False)
+    lam = jnp.maximum(s**2 - nu, 0.0)  # undo the shift; clamp at 0 (the approximation is PSD)
+    return U, lam
+
+
+def _EPS_OF(dtype):
+    return jnp.finfo(jnp.dtype(dtype)).eps
+
+
+def nystrom_apply(U, lam, mu):
+    r"""The Nyström **preconditioner** application ``P^{-1} v`` for ``A ≈ U diag(lam) U^T``.
+
+    Frangella, Tropp & Udell 2023, §3 (Definition 3.1)::
+
+        P^{-1} = (lam_min + mu) · U (diag(lam) + mu I)^{-1} U^T  +  (I - U U^T)
+
+    The low-rank part deflates the captured (largest) eigenvalues towards 1 while the orthogonal
+    complement is left alone, so ``P^{-1} A`` has its top of the spectrum flattened — which is
+    exactly the part Jacobi cannot touch. ``mu`` is the regularization / smallest retained
+    eigenvalue; larger ``mu`` is a weaker but safer preconditioner.
+    """
+    lam_min = lam[-1]
+    scale = (lam_min + mu) / (lam + mu)
+
+    def apply(v):
+        c = U.T @ v
+        return U @ (scale * c) + (v - U @ c)
+
+    return apply
+
+
 def spectrum_bounds(matvec, n, *, dtype=None, iters=30, M=None, lmin=None, lmax=None, safety=1.05, lmin_ratio=1.0 / 30.0):
     """The ``(lmin, lmax)`` a Chebyshev recurrence should be fitted to — the single place both
     ``jno.solve.chebyshev`` and ``jno.precond.chebyshev`` decide it.
