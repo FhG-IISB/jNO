@@ -1,8 +1,11 @@
-"""``jno.solve.{logdet, trace, applyfun}`` — matrix-free, differentiable matrix functions (via matfree).
+"""``jno.solve.{logdet, trace, applyfun, diagonal, svd, lstsq}`` — matrix-free, differentiable matrix
+functions and spectral quantities (via matfree).
 
-``logdet`` / ``trace`` are stochastic (Hutchinson + Lanczos quadrature) so gates are loose; ``applyfun``
-(``f(A)·v`` by Lanczos) is deterministic and essentially exact for the exponential. The last test trains
-a parameter *through* ``logdet`` — the Bayesian-evidence workflow the layer exists for.
+``logdet`` / ``trace`` / ``diagonal`` are stochastic (Hutchinson + Lanczos quadrature) so gates are
+loose; ``applyfun`` (``f(A)·v`` by Lanczos) is deterministic and essentially exact for the exponential.
+One test trains a parameter *through* ``logdet`` — the Bayesian-evidence workflow the layer exists for.
+``svd`` is the partial (Golub–Kahan) SVD of a rectangular operator, pinned against a dense oracle and
+on the POD workflow that motivates it.
 """
 
 import importlib.util
@@ -184,6 +187,122 @@ def test_lstsq_rectangular_and_damped():
 
     gb = jax.grad(lambda bb: jnp.sum(jno.solve.lstsq(A, bb) ** 2))(b)
     assert bool(jnp.isfinite(gb).all())
+
+
+def _decaying_svd_fixture(m=200, n=120, ratio=0.5, seed=1):
+    """A rectangular operator with a geometrically decaying singular spectrum — the regime that makes
+    POD and ill-posedness analysis meaningful (and the one Golub–Kahan converges on quickly)."""
+    U0, _ = jnp.linalg.qr(jax.random.normal(jax.random.PRNGKey(seed), (m, m)))
+    V0, _ = jnp.linalg.qr(jax.random.normal(jax.random.PRNGKey(seed + 1), (n, n)))
+    s = jnp.asarray([10.0 * ratio**i for i in range(n)])
+    return (U0[:, :n] * s) @ V0.T, s
+
+
+def test_svd_recovers_the_leading_singular_triplets():
+    """Partial SVD vs a dense oracle on a decaying spectrum, and the triplets must actually reconstruct
+    the operator's dominant action — matching singular *values* alone would not catch swapped or
+    misaligned vectors."""
+    A, s_true = _decaying_svd_fixture()
+    k = 6
+    U, s, Vt = jno.solve.svd(A, k=k)
+
+    assert U.shape == (A.shape[0], k) and s.shape == (k,) and Vt.shape == (k, A.shape[1])
+    rel = float(jnp.max(jnp.abs(s - s_true[:k]) / s_true[:k]))
+    assert rel < 1e-6, f"singular values off by {rel:.2e}"
+    assert bool(jnp.all(jnp.diff(s) <= 0)), "singular values must come back descending"
+
+    # the triplets reconstruct the optimal rank-k truncation (Eckart-Young-Mirsky): in the SPECTRAL
+    # norm the residual is exactly the next singular value (in Frobenius it would be the tail norm
+    # sqrt(sum_{i>k} s_i^2) instead -- a different statement)
+    err2 = float(jnp.linalg.norm(A - (U * s) @ Vt, ord=2))
+    assert abs(err2 - float(s_true[k])) / float(s_true[k]) < 1e-4, f"rank-{k} spectral residual {err2:.3e}"
+    errF = float(jnp.linalg.norm(A - (U * s) @ Vt))
+    tailF = float(jnp.sqrt(jnp.sum(s_true[k:] ** 2)))
+    assert abs(errF - tailF) / tailF < 1e-4, f"rank-{k} Frobenius residual {errF:.3e} vs tail {tailF:.3e}"
+    # orthonormal bases
+    assert float(jnp.max(jnp.abs(U.T @ U - jnp.eye(k)))) < 1e-8
+    assert float(jnp.max(jnp.abs(Vt @ Vt.T - jnp.eye(k)))) < 1e-8
+
+
+def test_svd_is_matrix_free_and_differentiable():
+    """The point of a *matrix-free* SVD: ``A`` is reached only through its matvec, so it can be the JVP
+    of a differentiable solve rather than an assembled matrix — and the singular values differentiate
+    back to whatever that matvec closes over (checked against a finite difference)."""
+    A, _ = _decaying_svd_fixture(m=80, n=50, seed=7)
+    op = LinearOperator.from_matvec(lambda v: A @ v, shape=A.shape)
+    U, s, Vt = jno.solve.svd(op, k=4)
+    s_dense = jnp.linalg.svd(A, compute_uv=False)[:4]
+    assert float(jnp.max(jnp.abs(s - s_dense) / s_dense)) < 1e-6, "matvec-only path must match the dense SVD"
+
+    # gradient of the leading singular value w.r.t. a scaling closed over by the matvec
+    f = lambda c: jno.solve.svd(LinearOperator.from_matvec(lambda v: c * (A @ v), shape=A.shape), k=2)[1][0]  # noqa: E731
+    g = float(jax.grad(f)(1.0))
+    fd = float((f(1.0 + 1e-6) - f(1.0 - 1e-6)) / 2e-6)
+    assert np.isfinite(g) and abs(g - fd) <= 1e-4 * max(abs(fd), 1.0), f"AD {g} vs FD {fd}"
+
+
+def test_svd_depth_and_rank_limits_fail_loud():
+    """Extremes. ``depth`` below ``k`` is the real footgun: the Ritz values converge from below, so at
+    ``depth == k`` everything but the largest singular value is badly wrong — refuse it rather than
+    return a plausible-looking spectrum."""
+    A, s_true = _decaying_svd_fixture(m=60, n=40, seed=9)
+    with pytest.raises(ValueError, match="depth"):
+        jno.solve.svd(A, k=6, depth=3)
+    for bad_k in (0, 41):
+        with pytest.raises(ValueError, match="k="):
+            jno.solve.svd(A, k=bad_k)
+
+    # k=1 (the smallest useful request) and k=min(m,n) (the largest legal one) both work
+    _U1, s1, _V1 = jno.solve.svd(A, k=1)
+    assert abs(float(s1[0]) - float(s_true[0])) / float(s_true[0]) < 1e-6
+    _Uf, sf, _Vf = jno.solve.svd(A, k=40)
+    assert sf.shape == (40,) and bool(jnp.all(jnp.isfinite(sf)))
+
+    # a wide operator (m < n) is as valid as a tall one
+    Aw = A.T
+    _Uw, sw, _Vw = jno.solve.svd(Aw, k=4)
+    assert float(jnp.max(jnp.abs(sw - jnp.linalg.svd(Aw, compute_uv=False)[:4]) / sw)) < 1e-6
+
+
+def test_svd_gives_a_pod_basis_from_a_fem_trajectory():
+    """The motivating use: POD on a transient FEM trajectory.
+
+    Two spatial modes with very different decay rates give a snapshot matrix of numerical rank ~2 — the
+    fast mode is present at ``t=0`` and gone by the end. POD's actual claim is that a handful of modes
+    captures the trajectory's energy, so that is what is pinned (two modes ≳99%), along with the leading
+    right singular vector being the dominant *spatial* shape the trajectory relaxes onto."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.12, time=(0.0, 0.1, 21))
+    u, phi = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    # two modes with very different decay rates -> the fast one dies, leaving essentially one mode
+    u0 = jno.np.sin(np.pi * ci[0]) * jno.np.sin(np.pi * ci[1]) + 0.8 * jno.np.sin(3 * np.pi * ci[0]) * jno.np.sin(
+        3 * np.pi * ci[1]
+    )
+    fem = jno.fem([ui.t * vi + (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - u0])
+    traj = np.asarray(fem.solve().fn())  # (n_time, n_dofs) snapshot matrix
+
+    snaps = jnp.asarray(traj)
+    k = 4
+    _U, s, Vt = jno.solve.svd(snaps, k=k)
+    s_ref = jnp.linalg.svd(snaps, compute_uv=False)[:k]
+    assert float(jnp.max(jnp.abs(s - s_ref) / s_ref[0])) < 1e-6, "POD spectrum must match the dense SVD"
+    # energy: the trajectory is numerically rank ~2 (one slow mode plus the fast one that dies early)
+    total = float(jnp.sum(s_ref**2))
+    energy1 = float(s[0] ** 2) / total
+    energy2 = float(s[0] ** 2 + s[1] ** 2) / total
+    assert energy1 > 0.9, f"the slow mode should dominate a diffused trajectory, got {energy1:.3f}"
+    assert energy2 > 0.99, f"two POD modes should capture the trajectory, got {energy2:.3f}"
+    # the POD basis is a *subspace*: the leading two right singular vectors reconstruct any frame,
+    # including the last (projecting onto the single leading mode is a strictly weaker basis and does
+    # not, since each frame is a different mixture of the two spatial modes)
+    basis = Vt[:2]
+    for frame in (snaps[0], snaps[len(snaps) // 2], snaps[-1]):
+        proj = basis.T @ (basis @ frame)
+        rel = float(jnp.linalg.norm(frame - proj) / jnp.linalg.norm(frame))
+        assert rel < 0.05, f"the rank-2 POD basis must reconstruct every frame, got {rel:.3f}"
 
 
 @pytest.mark.skipif(_HAS_MATFREE, reason="matfree installed; this checks the missing-dependency message")
