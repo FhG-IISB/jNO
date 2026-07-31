@@ -629,7 +629,12 @@ preconditioner never changes the converged solution, only the speed, so specs ne
 * `jno.precond.jacobi()` — diagonal.
 * `jno.precond.chebyshev(degree=…)` — fixed-degree Chebyshev **polynomial** preconditioner: matvecs and
   AXPYs only, the GPU-era substitute for Gauss-Seidel/ILU smoothing, and a fixed *linear* map so it
-  legally preconditions `cg`/`minres`.
+  legally preconditions `cg`/`minres`. Spectrum bounds come from `lmin`/`lmax` when you pass them, else
+  **both** ends are measured by Lanczos (Lanczos 1950, §II — the extreme Ritz values), at the same cost
+  as the power iteration it replaces. This matters because the polynomial is a contraction only *inside*
+  the interval it is fitted to: the older `lmin = lmax/30` guess, whenever the true ratio is smaller,
+  left the lowest modes outside that interval where the polynomial amplifies them. Without the optional
+  `matfree` package the guess remains the fallback.
 * `jno.precond.inner(solver)` — any `jno.solve` solver as the `M⁻¹` application (an inexact block/system
   solve). Iterative inner ⇒ flexible outer (`fgmres`).
 * `jno.precond.form([...terms], inner=…)` — **preconditioners as weak forms**: assemble an auxiliary

@@ -115,18 +115,24 @@ class _Chebyshev(_Spec):
         self.lmin_ratio, self.safety, self.bound_iters = lmin_ratio, safety, bound_iters
 
     def materialize(self, ctx: PrecondContext):
-        from .utils.solver.krylov import chebyshev_apply, power_iteration_bound
+        from .utils.solver.krylov import chebyshev_apply, spectrum_bounds
 
         if ctx.A.shape is None and self.lmax is None:
             raise TypeError(
                 "jno.precond.chebyshev on a matvec-only operator needs explicit spectrum bounds "
                 "(lmin=, lmax=) — there is no assembled matrix to estimate them from."
             )
-        hi = self.lmax
-        if hi is None:
-            n = ctx.A.shape[0]
-            hi = self.safety * power_iteration_bound(ctx.A.mv, n, iters=self.bound_iters)
-        lo = self.lmin if self.lmin is not None else self.lmin_ratio * hi
+        # Lanczos measures BOTH ends; power iteration + lmin_ratio is the fallback. See
+        # `spectrum_bounds` for why a fabricated lmin can make the polynomial amplify.
+        lo, hi = spectrum_bounds(
+            ctx.A.mv,
+            None if ctx.A.shape is None else ctx.A.shape[0],
+            iters=self.bound_iters,
+            lmin=self.lmin,
+            lmax=self.lmax,
+            safety=self.safety,
+            lmin_ratio=self.lmin_ratio,
+        )
         # A^T shares the spectrum of A, so the same [lo, hi] bounds the transpose recurrence.
         return PrecondApplier(
             lambda v: chebyshev_apply(ctx.A.mv, v, lmin=lo, lmax=hi, degree=self.degree),
@@ -929,8 +935,15 @@ def chebyshev(
     application a fixed *linear* map so it may precondition CG and MINRES).
 
     The GPU-era substitute for Gauss-Seidel/ILU smoothing: only matvecs and AXPYs — no
-    reductions, no triangular solves — ``jit``- and ``vmap``-native. Spectrum bounds of ``A``
-    are taken from ``lmin``/``lmax`` when given, else estimated by power iteration (``safety``
-    inflation, ``lmin = lmin_ratio * lmax``).
+    reductions, no triangular solves — ``jit``- and ``vmap``-native.
+
+    Spectrum bounds of ``A`` are taken from ``lmin``/``lmax`` when given, else **both** ends are
+    measured by ``bound_iters`` steps of Lanczos (Lanczos 1950, §II — the extreme Ritz values of
+    the tridiagonal), at the same one-matvec-per-step cost as the power iteration it replaces.
+    This matters because the polynomial is a contraction only *inside* the interval it is fitted
+    to: the historical ``lmin = lmin_ratio * lmax`` guess, when it lands above the true smallest
+    eigenvalue, leaves the lowest modes outside that interval where the polynomial amplifies them
+    instead of damping. Without the optional :mod:`matfree` package the guess is still the
+    fallback (``lmin_ratio`` then applies).
     """
     return _Chebyshev(degree, lmin, lmax, lmin_ratio, safety, bound_iters)

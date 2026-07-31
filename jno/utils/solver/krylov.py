@@ -21,7 +21,14 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
-__all__ = ["fgmres", "minres", "chebyshev_iteration", "power_iteration_bound"]
+__all__ = [
+    "fgmres",
+    "minres",
+    "chebyshev_iteration",
+    "power_iteration_bound",
+    "lanczos_spectrum_bounds",
+    "spectrum_bounds",
+]
 
 _TINY = 1e-300
 
@@ -232,6 +239,80 @@ def power_iteration_bound(matvec, n, *, dtype=None, iters=30, M=None):
 
     _, lam = jax.lax.fori_loop(0, iters, step, (v0, jnp.asarray(1.0, dtype)))
     return jnp.abs(lam)
+
+
+def lanczos_spectrum_bounds(matvec, n, *, dtype=None, iters=30, M=None):
+    """**Both** ends of the spectrum of ``M^{-1} A`` (SPD) from one Krylov space, via Lanczos.
+
+    C. Lanczos, "An iteration method for the solution of the eigenvalue problem of linear
+    differential and integral operators", *J. Res. Natl. Bur. Stand.* 45(4), 1950, §II — the
+    symmetric tridiagonalization whose extreme **Ritz values** (the eigenvalues of the ``k x k``
+    tridiagonal ``T_k``) bound the extreme eigenvalues of ``A`` from the inside, converging to
+    them from within as ``k`` grows.
+
+    This exists because power iteration gives only ``lmax``. A Chebyshev polynomial is optimal on
+    the interval it is fitted to, so a fabricated ``lmin`` (the historical ``lmax / 30`` guess)
+    fits the wrong interval and degrades the preconditioner — badly when the true ratio is far
+    from the guess. Lanczos returns both ends for the same one-matvec-per-step cost.
+
+    Returns ``(lmin, lmax)``, or ``None`` when :mod:`matfree` is not installed (an OPTIONAL
+    dependency) or the decomposition is degenerate — the caller then falls back to power
+    iteration. Both ends are Ritz values, hence *interior* to the true spectrum, so the caller
+    should still inflate ``lmax`` by a safety factor and deflate ``lmin``.
+    """
+    try:
+        from matfree import decomp
+    except ImportError:  # optional dependency: the caller falls back to power_iteration_bound
+        return None
+
+    M = M or _ident
+    dtype = dtype or jnp.result_type(float)
+    k = int(min(max(int(iters), 2), max(2, n - 1)))  # Lanczos needs 2 <= num_matvecs <= n-1
+    v0 = jnp.ones((n,), dtype) / jnp.sqrt(jnp.asarray(n, dtype))
+    try:
+        # tridiag_sym(k) builds the decomposition; `J_small` is the materialized k x k
+        # tridiagonal, so its eigenvalues are the Ritz values directly. k is the Lanczos depth
+        # (~30), so this dense eigenproblem is trivial — nothing the size of the FEM operator.
+        out = decomp.tridiag_sym(k)(lambda v: M(matvec(v)), v0)
+        vals = jnp.linalg.eigvalsh(jnp.asarray(out.J_small))
+        lo, hi = jnp.min(vals), jnp.max(vals)
+    except Exception:  # a degenerate / broken-down decomposition must not fail the whole solve
+        return None
+    # A breakdown can collapse or invert the interval; reject rather than hand the Chebyshev
+    # recurrence something it divides by (delta = (hi - lo)/2 must be > 0).
+    if not (jnp.isfinite(lo) and jnp.isfinite(hi)) or hi <= 0.0 or hi - lo <= 0.0:
+        return None
+    return jnp.abs(lo), jnp.abs(hi)
+
+
+def spectrum_bounds(matvec, n, *, dtype=None, iters=30, M=None, lmin=None, lmax=None, safety=1.05, lmin_ratio=1.0 / 30.0):
+    """The ``(lmin, lmax)`` a Chebyshev recurrence should be fitted to — the single place both
+    ``jno.solve.chebyshev`` and ``jno.precond.chebyshev`` decide it.
+
+    Caller-supplied bounds always win. Otherwise prefer :func:`lanczos_spectrum_bounds`, which
+    measures **both** ends, and fall back to :func:`power_iteration_bound` (``lmax`` only, with
+    ``lmin = lmin_ratio * lmax``) when :mod:`matfree` is absent or the decomposition breaks down.
+
+    Why this matters: the Chebyshev polynomial is *optimal on the interval it is given*, and is
+    only a contraction inside it. A fabricated ``lmin`` that lands above the true smallest
+    eigenvalue leaves the modes below it outside the fitted interval, where the polynomial
+    **amplifies** them instead of damping. The fallback's ``lmax/30`` is a smoother-style guess
+    that is safe when the true ratio is smaller than it assumes and harmful when it is not.
+
+    The Ritz values are interior to the true spectrum, so ``lmax`` is still inflated by ``safety``
+    and ``lmin`` deflated by the same factor to cover the ends Lanczos has not yet reached.
+    """
+    if lmin is not None and lmax is not None:
+        return float(lmin), float(lmax)
+    est = None if lmax is not None else lanczos_spectrum_bounds(matvec, n, dtype=dtype, iters=iters, M=M)
+    if est is not None:
+        lo_e, hi_e = est
+        hi = safety * hi_e
+        lo = lmin if lmin is not None else lo_e / safety
+        return lo, hi
+    hi = lmax if lmax is not None else safety * power_iteration_bound(matvec, n, dtype=dtype, iters=iters, M=M)
+    lo = lmin if lmin is not None else lmin_ratio * hi
+    return lo, hi
 
 
 def chebyshev_iteration(matvec, b, *, lmin, lmax, M=None, x0=None, tol=1e-8, maxiter=200):
