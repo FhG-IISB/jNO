@@ -141,6 +141,53 @@ def test_complex_transient_recovers_mode_and_conserves_schrodinger_norm():
     assert 0.97 < ratio < 1.01, f"Schrodinger norm not conserved: |psi(t1)|/|psi(0)| {ratio:.4f}"
 
 
+def test_complex_transient_save_ts_interpolates_every_frame():
+    """CHARACTERIZATION — the ``save_ts`` contract on a complex transient, pinned frame by frame.
+
+    The existing complex-transient tests check only ``traj[-1]``, so a change that got the endpoint
+    right while corrupting the interior of the march (or the ``save_ts`` interpolation onto times that
+    are *not* natural grid points) would pass unnoticed. Here the requested times are deliberately the
+    grid **midpoints**, which forces the interpolation path, and *every* returned frame is compared
+    against the analytic mode
+
+        psi(t) = exp(-c 2 pi^2 t) sin(pi x) sin(pi y),   c = 0.5 + 1j.
+
+    Pins the shape contract (one frame per requested time), the time placement, and the per-frame
+    accuracy — all behaviour, no internal representation, so it holds across the assembly refactor."""
+    nsteps, t_end = 41, 0.04
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.07, time=(0.0, t_end, nsteps))
+    u, phi = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    c = 0.5 + 1j
+    psi0 = jno.np.sin(PI * ci[0]) * jno.np.sin(PI * ci[1])
+    fem = jno.fem([ui.t * vi + c * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - psi0])
+
+    grid = np.linspace(0.0, t_end, nsteps)
+    save = 0.5 * (grid[:-1] + grid[1:])  # midpoints: never a natural step, so interpolation must fire
+    traj = np.asarray(fem.solve(save_ts=save))
+    pts = np.asarray(fem.points)
+
+    assert traj.shape[0] == save.shape[0], f"expected one frame per save_ts, got {traj.shape[0]} for {save.shape[0]}"
+    assert np.iscomplexobj(traj) and not bool(np.isnan(traj).any())
+
+    mode = np.sin(PI * pts[:, 0]) * np.sin(PI * pts[:, 1])
+    errs = [
+        float(
+            np.linalg.norm(traj[i] - np.exp(-c * 2 * PI**2 * t) * mode) / np.linalg.norm(np.exp(-c * 2 * PI**2 * t) * mode)
+        )
+        for i, t in enumerate(save)
+    ]
+    # measured max is 8.6e-3 (backward-Euler error, largest at the final frame); 1.5e-2 leaves ~1.7x
+    # headroom — tight enough that a mis-sized step or a broken interpolation trips it
+    assert max(errs) < 1.5e-2, f"per-frame complex-transient error too large: max {max(errs):.3e} over {len(errs)} frames"
+    # the decay must be monotone in |psi| — catches a march that lands the endpoint but wanders between
+    norms = np.linalg.norm(traj, axis=1)
+    assert np.all(np.diff(norms) < 0), "|psi| must decay monotonically for a damped complex diffusion"
+
+
 def test_complex_transient_block_is_sparse_not_dense():
     """The complex-transient real-equivalent block ``[[·,-·],[·,·]]`` is now composed from BCOO legs and
     marched matrix-free (GMRES + Jacobi), so the dense ``(2N × 2N)`` block and its dense LU never
