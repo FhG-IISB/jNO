@@ -2294,10 +2294,22 @@ def _build_periodic_reduction_nonnodal(domain: Any, ties: List[Any], offsets: An
     vpts = np.asarray(topo["vertex_points"])
     ev = np.asarray(topo["edge_vertices"])
 
-    pairs = [(master, slave) for (master, slave, _comp, _fk) in ties]
+    # A tie spec is ``(master, slave, comp, field_key, phase)``. Unpack it TOLERANTLY, as the nodal and
+    # N1E builders do: this one hard-unpacked exactly four and so broke outright the moment the Bloch
+    # ``phase`` was appended — every periodic Morley problem raised "too many values to unpack".
+    phases = [(t[4] if len(t) > 4 and t[4] is not None else 1.0) for t in ties]
+    if any(abs(complex(p) - 1.0) > 1e-12 for p in phases):
+        raise NotImplementedError(
+            "jno.fem: a Bloch/quasi-periodic tie `u(A) - c*u(B)` is not supported on the Morley C¹ element "
+            "— the C¹ prolongation carries real edge-normal orientation signs, and a complex phase would "
+            "need a complex prolongation (P^H A P mixes Re and Im). Use a plain periodic tie `u(A) - u(B)`, "
+            "or a nodal Lagrange / N1E space, both of which do carry the phase."
+        )
+
+    pairs = [(master, slave) for (master, slave, *_rest) in ties]
     vtags: dict = {}
     etags: dict = {}
-    for tag in {t for (m, s, _c, _fk) in ties for t in (m, s)}:
+    for tag in {t for (m, s, *_rest) in ties for t in (m, s)}:
         f = _face_nodes(domain, vpts, None, tag)
         if f is None or np.asarray(f).size == 0:
             raise ValueError(f"jno.fem periodic (non-nodal C¹): boundary tag {tag!r} has no mesh vertices.")
