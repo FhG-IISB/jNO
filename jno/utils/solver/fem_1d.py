@@ -14,8 +14,16 @@ Assembly strategy (how an element matrix is formed):
   load by construction — no ad-hoc load patching);
 - Dirichlet rows are replaced by ``u[d] - g`` so the tangent row is the identity
   and the load entry is ``g``;
-- for a linear problem ``A = jacfwd(R)(0)`` and ``b = -R(0)``; nonlinear keeps
-  ``R``/``jac`` as callables; transient separates the mass term.
+- the operator is scattered from **per-element** Jacobians into a **BCOO**: a LINE2
+  element couples only its own ``2*vec`` dofs, so differentiating the element
+  residual w.r.t. that element's dofs gives the element matrix directly
+  (``sparse_jacobian``). ``b = -R(0)``; nonlinear keeps ``R``/``jac`` as callables;
+  transient separates the mass term.
+
+Assembly is ``O(nnz)``, not ``O(N²)``. It previously recovered the global operator as
+``jacfwd(R)(0)`` over the whole residual, whose ``(n_elem, n_dof, ...)`` intermediate
+exhausted GPU memory at ~10k nodes — so 1D, the *cheapest* dimension, had the library's
+lowest DOF ceiling while 2D/3D scattered sparsely. 50k nodes now assemble in ~2 s.
 
 Scope: scalar unknown (``vec == 1``) on ``LINE2`` elements. Boundary terms must
 be value/Robin terms (``g*phi`` / ``(a*u - g)*phi``) — they carry no spatial
@@ -154,7 +162,13 @@ def _make_residual(
             for nid in nids:
                 boundary_apps.append((term, int(nid)))
 
-    def _volume_local(cell, u, expr):
+    def _volume_local(cell, u_local, expr):
+        """Element residual ``(2*vec,)`` from the element's OWN dofs ``u_local`` ``(2, vec)``.
+
+        Taking the local dofs rather than indexing a global vector is what makes the element
+        Jacobian available: differentiating this w.r.t. ``u_local`` gives the ``(2*vec, 2*vec)``
+        element matrix directly, so the global operator can be scattered sparsely instead of
+        recovered by an ``O(N²)`` ``jacfwd`` of the global residual (see :func:`_sparse_jacobian`)."""
         xc = nodes[cell]  # (2,)
         h = xc[1] - xc[0]
         phys = (N @ xc)[:, None]  # (n_quad, 1)
@@ -163,7 +177,7 @@ def _make_residual(
             "physical_quad_points": phys,
             "shape_vals": N,
             "shape_grads": shape_grads,
-            "cell_sol": u[cell],  # (2, vec)
+            "cell_sol": u_local,  # (2, vec)
             "tag": "fem_gauss",
             "surface": False,
             "domain_context": ctx,
@@ -181,30 +195,74 @@ def _make_residual(
 
         # --- volume terms: vmap over elements, then scatter ---
         for expr in volume_terms:
-            elem_res = jax.vmap(lambda c, e=expr: _volume_local(c, u, e))(cells)  # (n_elem, 2*vec)
+            elem_res = jax.vmap(lambda c, e=expr: _volume_local(c, u[c], e))(cells)  # (n_elem, 2*vec)
             R = R.at[cell_dofs.reshape(-1)].add(elem_res.reshape(-1))
 
         # --- boundary terms: degenerate one-node "element" (shape val 1, weight 1) ---
         for expr, nid in boundary_apps:
-            local = {
-                "physical_quad_points": jnp.asarray([[nodes[nid]]]),
-                "shape_vals": jnp.ones((1, 1), dtype=u_flat.dtype),
-                "shape_grads": jnp.zeros((1, 1, 1), dtype=u_flat.dtype),
-                "cell_sol": u[nid : nid + 1],  # (1, vec)
-                "tag": "fem_gauss",
-                "surface": True,
-                "domain_context": ctx,
-                "trial_value_shape": (),
-                "trial_vec": vec,
-                "temporal_tags": (),
-                "runtime_parameter_tags": (),
-                "volume_vars": (),
-            }
-            contrib = _integrate_term(domain, expr, local, jnp.ones((1,), dtype=u_flat.dtype))  # (vec,)
+            contrib = _boundary_local(nid, u[nid : nid + 1], expr, u_flat.dtype)  # (vec,)
             R = R.at[nid * vec + comp_offsets].add(contrib.reshape(vec))
 
         return R
 
+    def _boundary_local(nid, u_local, expr, dtype):
+        """Boundary contribution ``(vec,)`` at node ``nid`` from its own dof ``u_local`` ``(1, vec)``."""
+        local = {
+            "physical_quad_points": jnp.asarray([[nodes[nid]]]),
+            "shape_vals": jnp.ones((1, 1), dtype=dtype),
+            "shape_grads": jnp.zeros((1, 1, 1), dtype=dtype),
+            "cell_sol": u_local,  # (1, vec)
+            "tag": "fem_gauss",
+            "surface": True,
+            "domain_context": ctx,
+            "trial_value_shape": (),
+            "trial_vec": vec,
+            "temporal_tags": (),
+            "runtime_parameter_tags": (),
+            "volume_vars": (),
+        }
+        return _integrate_term(domain, expr, local, jnp.ones((1,), dtype=dtype))  # (vec,)
+
+    def sparse_jacobian(u_flat):
+        """``dR/du`` as a **BCOO**, scattered from per-element blocks — never an ``O(N²)`` dense array.
+
+        Each LINE2 element couples only its own ``2*vec`` dofs, so its Jacobian is a ``(2*vec, 2*vec)``
+        block obtained by differentiating :func:`_volume_local` w.r.t. that element's dofs (vmapped over
+        elements); a boundary term couples one node to itself, a ``(vec, vec)`` block. Emitting those
+        blocks as triplets is the same element-scatter the 2D/3D native assembler does, and it is what
+        lets a 1D problem scale past the few-thousand-node ceiling that a global ``jacfwd`` imposed
+        (its ``(n_elem, n_dof, ...)`` intermediate exhausted GPU memory at ~10k nodes).
+        """
+        from jax.experimental import sparse as jsp
+
+        u = u_flat.reshape(n_nodes, vec)
+        idx, dat = [], []
+
+        for expr in volume_terms:
+            # (n_elem, 2*vec, 2, vec) -> (n_elem, 2*vec, 2*vec): the element matrices
+            Ke = jax.vmap(lambda c, e=expr: jax.jacfwd(lambda ul: _volume_local(c, ul, e))(u[c]))(cells)
+            Ke = Ke.reshape(cells.shape[0], 2 * vec, 2 * vec)
+            rows = jnp.broadcast_to(cell_dofs[:, :, None], Ke.shape)
+            cols = jnp.broadcast_to(cell_dofs[:, None, :], Ke.shape)
+            idx.append(jnp.stack([rows.reshape(-1), cols.reshape(-1)], axis=1))
+            dat.append(Ke.reshape(-1))
+
+        for expr, nid in boundary_apps:
+            Kb = jax.jacfwd(lambda ul: _boundary_local(nid, ul, expr, u_flat.dtype))(u[nid : nid + 1])
+            Kb = Kb.reshape(vec, vec)
+            dofs = nid * vec + comp_offsets
+            rows = jnp.broadcast_to(dofs[:, None], (vec, vec))
+            cols = jnp.broadcast_to(dofs[None, :], (vec, vec))
+            idx.append(jnp.stack([rows.reshape(-1), cols.reshape(-1)], axis=1))
+            dat.append(Kb.reshape(-1))
+
+        nd = n_nodes * vec
+        if not idx:
+            return jsp.BCOO((jnp.zeros((0,), u_flat.dtype), jnp.zeros((0, 2), jnp.int32)), shape=(nd, nd))
+        # duplicate (i, j) entries from shared nodes are summed by BCOO on matvec / todense
+        return jsp.BCOO((jnp.concatenate(dat), jnp.concatenate(idx).astype(jnp.int32)), shape=(nd, nd))
+
+    residual.sparse_jacobian = sparse_jacobian
     return residual
 
 
@@ -296,9 +354,12 @@ def assemble_fem_1d(
         )
         return op, "nonlinear"
 
-    # linear: R(u) = A u - b  ->  A = dR/du, b = -R(0), then symmetric Dirichlet
+    # linear: R(u) = A u - b  ->  A = dR/du, b = -R(0), then symmetric Dirichlet.
+    # A is scattered from per-element blocks (BCOO), not recovered by a global jacfwd — see
+    # `sparse_jacobian`. Memory is O(nnz) instead of O(N²), which is what lets a 1D problem run
+    # at the node counts 1D actually wants.
     zeros = jnp.zeros(ndof)
-    A = jax.jacfwd(residual_free)(zeros)
+    A = residual_free.sparse_jacobian(zeros)
     b = -residual_free(zeros)
     A, b = _apply_dirichlet_symmetric(A, b, dirichlet_pairs)
     return (A, b), "linear"
@@ -363,16 +424,20 @@ def _assemble_1d_transient(domain, volume_terms, boundary_terms, dirichlet_value
         z = jnp.zeros(ndof)
         m2_terms = [_strip_n(t, 2) for t in temporal_terms if _mto(t) >= 2]  # u_tt·φ ⇒ mass M2
         d_terms = [_strip_n(t, 1) for t in temporal_terms if _mto(t) == 1]  # u_t·φ ⇒ damping C (optional)
-        M2 = jax.jacfwd(_make_residual(domain, m2_terms, {}, n_nodes=n_nodes, vec=vec, quad_degree=quad_degree))(z)
+        M2 = _make_residual(domain, m2_terms, {}, n_nodes=n_nodes, vec=vec, quad_degree=quad_degree).sparse_jacobian(z)
+        from jax.experimental import sparse as _jsp
+
         Cmat = (
-            jax.jacfwd(_make_residual(domain, d_terms, {}, n_nodes=n_nodes, vec=vec, quad_degree=quad_degree))(z)
+            _make_residual(domain, d_terms, {}, n_nodes=n_nodes, vec=vec, quad_degree=quad_degree).sparse_jacobian(z)
             if d_terms
-            else jnp.zeros((ndof, ndof), z.dtype)
+            # an absent damping term is the EMPTY BCOO, not a dense zero block — a dense (ndof, ndof)
+            # of zeros would reintroduce the O(N²) allocation this whole path exists to avoid
+            else _jsp.BCOO((jnp.zeros((0,), z.dtype), jnp.zeros((0, 2), jnp.int32)), shape=(ndof, ndof))
         )
         spatial_res2 = _make_residual(
             domain, spatial_terms, boundary_terms, n_nodes=n_nodes, vec=vec, quad_degree=quad_degree
         )
-        K = jax.jacfwd(spatial_res2)(z)
+        K = spatial_res2.sparse_jacobian(z)
         F = -spatial_res2(z)  # spatial load + natural-BC load
         n = ndof
         Z = jnp.zeros((n, n), z.dtype)
@@ -431,7 +496,7 @@ def _assemble_1d_transient(domain, volume_terms, boundary_terms, dirichlet_value
     all_terms = spatial_terms + [t for ts in boundary_terms.values() for t in ts]
     nonlinear = any(_is_obviously_nonlinear_in_unknown(domain, t) for t in all_terms)
 
-    M = jax.jacfwd(mass_res)(jnp.zeros(ndof))
+    M = mass_res.sparse_jacobian(jnp.zeros(ndof))
 
     common = dict(
         backend="transient",
@@ -449,7 +514,14 @@ def _assemble_1d_transient(domain, volume_terms, boundary_terms, dirichlet_value
         # M(t) u̇ + R(u) = 0 with R the (Dirichlet-enforced) spatial residual.
         residual = _apply_dirichlet_rows(spatial_res, dirichlet_pairs)
         dofs = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32) if dirichlet_pairs else None
-        M_nl = M if dofs is None else M.at[dofs, :].set(0.0).at[:, dofs].set(0.0)
+        # the mass is a BCOO now, which has no `.at[]` — zero the constrained rows/cols sparsely
+        # (mirrors the linear branch); a dense fallback keeps the old indexing path.
+        if dofs is None:
+            M_nl = M
+        elif hasattr(M, "indices"):
+            M_nl = bcoo_zero_rows_cols(M, dofs)
+        else:
+            M_nl = M.at[dofs, :].set(0.0).at[:, dofs].set(0.0)
         block = SemidiscreteTimeBlock(
             mass=lambda t, args=None, _M=M_nl: _M,
             residual=lambda u, t, args=None: residual(jnp.asarray(u)),
@@ -459,7 +531,7 @@ def _assemble_1d_transient(domain, volume_terms, boundary_terms, dirichlet_value
         return block, "transient"
 
     # linear: M u̇ + A u = c
-    A = jax.jacfwd(spatial_res)(jnp.zeros(ndof))
+    A = spatial_res.sparse_jacobian(jnp.zeros(ndof))
     c = -spatial_res(jnp.zeros(ndof))
     M, A, c = _apply_dirichlet_transient(M, A, c, dirichlet_pairs)
     block = SemidiscreteTimeBlock(M=M, A=A, affine_bias=c, **common)
@@ -534,6 +606,53 @@ def _make_multifield_residual_1d(domain, term_list, boundary_term_list, fields, 
         cd = (cells[:, :, None] * vecs[i] + comp[None, None, :]).reshape(cells.shape[0], -1) + offs[i]
         cell_dofs.append(cd)  # (n_elem, 2*vec_i)
 
+    def _elem_local(cell, locs, e):
+        """Element residual ``(2*vec_test,)`` from every field's OWN element dofs ``locs[i]`` ``(2, vec_i)``.
+
+        Taking the local dofs explicitly is what exposes the element Jacobian: a coupled term's element
+        block couples the *test* field's element dofs to **each** field's, so differentiating this w.r.t.
+        ``locs`` yields one ``(2*vec_test, 2*vec_i)`` block per field — all still element-local, hence
+        scatterable (see ``sparse_jacobian``)."""
+        xc = nodes[cell]
+        h = xc[1] - xc[0]
+        sg = (dN_dxi / h)[:, :, None]
+        per_field = [{"shape_vals": N, "shape_grads": sg, "cell_sol": locs[i]} for i in range(nfields)]
+        local = {
+            "physical_quad_points": (N @ xc)[:, None],
+            "fields": per_field,
+            "field_index": field_index,
+            "tag": "fem_gauss",
+            "surface": False,
+            "domain_context": ctx,
+            "temporal_tags": (),
+            "runtime_parameter_tags": (),
+            "volume_vars": (),
+        }
+        return _integrate_term(domain, e, local, gw * h)  # (2*vec_test,)
+
+    def _bnd_local(nid, locs, e, dtype):
+        """Boundary contribution ``(vec_test,)`` at node ``nid`` from each field's own dof ``locs[i]``."""
+        per_field = [
+            {
+                "shape_vals": jnp.ones((1, 1), dtype=dtype),
+                "shape_grads": jnp.zeros((1, 1, 1), dtype=dtype),
+                "cell_sol": locs[i],
+            }
+            for i in range(nfields)
+        ]
+        local = {
+            "physical_quad_points": jnp.asarray([[nodes[nid]]]),
+            "fields": per_field,
+            "field_index": field_index,
+            "tag": "fem_gauss",
+            "surface": True,
+            "domain_context": ctx,
+            "temporal_tags": (),
+            "runtime_parameter_tags": (),
+            "volume_vars": (),
+        }
+        return _integrate_term(domain, e, local, jnp.ones((1,), dtype=dtype))  # (vec_test,)
+
     def residual(u_flat):
         u_list = [u_flat[offs[i] : offs[i + 1]].reshape(n_nodes, vecs[i]) for i in range(nfields)]
         R = jnp.zeros(total, dtype=u_flat.dtype)
@@ -541,56 +660,65 @@ def _make_multifield_residual_1d(domain, term_list, boundary_term_list, fields, 
         # --- volume terms: per element, evaluate the coeff against all fields, scatter
         #     into the test field's block ---
         for coeff, test_idx in term_list:
-
-            def _elem(cell, e=coeff):
-                xc = nodes[cell]
-                h = xc[1] - xc[0]
-                sg = (dN_dxi / h)[:, :, None]
-                per_field = [{"shape_vals": N, "shape_grads": sg, "cell_sol": u_list[i][cell]} for i in range(nfields)]
-                local = {
-                    "physical_quad_points": (N @ xc)[:, None],
-                    "fields": per_field,
-                    "field_index": field_index,
-                    "tag": "fem_gauss",
-                    "surface": False,
-                    "domain_context": ctx,
-                    "temporal_tags": (),
-                    "runtime_parameter_tags": (),
-                    "volume_vars": (),
-                }
-                return _integrate_term(domain, e, local, gw * h)  # (2*vec_test,)
-
-            elem_res = jax.vmap(_elem)(cells)  # (n_elem, 2*vec_test)
+            elem_res = jax.vmap(lambda c, e=coeff: _elem_local(c, [u_list[i][c] for i in range(nfields)], e))(cells)
             R = R.at[cell_dofs[test_idx].reshape(-1)].add(elem_res.reshape(-1))
 
         # --- boundary terms: degenerate one-node element (shape val 1, weight 1) ---
         for coeff, test_idx, nids in boundary_term_list:
             vt = vecs[test_idx]
             for nid in nids:
-                per_field = [
-                    {
-                        "shape_vals": jnp.ones((1, 1), dtype=u_flat.dtype),
-                        "shape_grads": jnp.zeros((1, 1, 1), dtype=u_flat.dtype),
-                        "cell_sol": u_list[i][nid : nid + 1],
-                    }
-                    for i in range(nfields)
-                ]
-                local = {
-                    "physical_quad_points": jnp.asarray([[nodes[nid]]]),
-                    "fields": per_field,
-                    "field_index": field_index,
-                    "tag": "fem_gauss",
-                    "surface": True,
-                    "domain_context": ctx,
-                    "temporal_tags": (),
-                    "runtime_parameter_tags": (),
-                    "volume_vars": (),
-                }
-                contrib = _integrate_term(domain, coeff, local, jnp.ones((1,), dtype=u_flat.dtype))  # (vec_test,)
+                locs = [u_list[i][nid : nid + 1] for i in range(nfields)]
+                contrib = _bnd_local(nid, locs, coeff, u_flat.dtype)  # (vec_test,)
                 R = R.at[offs[test_idx] + nid * vt + jnp.arange(vt)].add(contrib.reshape(vt))
 
         return R
 
+    def sparse_jacobian(u_flat):
+        """``dR/du`` as a **BCOO** for the coupled block system, scattered from element blocks.
+
+        A coupled term contributes, per element, one ``(2*vec_test, 2*vec_i)`` block per field ``i`` it
+        references — the off-diagonal blocks are exactly the field couplings. Every one is element-local,
+        so the whole block operator is assembled in ``O(nnz)`` instead of by an ``O(total²)`` global
+        ``jacfwd`` over the concatenated block vector."""
+        from jax.experimental import sparse as jsp
+
+        u_list = [u_flat[offs[i] : offs[i + 1]].reshape(n_nodes, vecs[i]) for i in range(nfields)]
+        idx, dat = [], []
+
+        for coeff, test_idx in term_list:
+
+            def _jac(cell, e=coeff):
+                locs = [u_list[i][cell] for i in range(nfields)]
+                return jax.jacfwd(lambda L: _elem_local(cell, L, e))(locs)  # list of (2*vt, 2, vec_i)
+
+            Js = jax.vmap(_jac)(cells)
+            n_el, vt = cells.shape[0], vecs[test_idx]
+            for i in range(nfields):
+                Ji = jnp.asarray(Js[i]).reshape(n_el, 2 * vt, 2 * vecs[i])
+                rows = jnp.broadcast_to(cell_dofs[test_idx][:, :, None], Ji.shape)
+                cols = jnp.broadcast_to(cell_dofs[i][:, None, :], Ji.shape)
+                idx.append(jnp.stack([rows.reshape(-1), cols.reshape(-1)], axis=1))
+                dat.append(Ji.reshape(-1))
+
+        for coeff, test_idx, nids in boundary_term_list:
+            vt = vecs[test_idx]
+            for nid in nids:
+                locs = [u_list[i][nid : nid + 1] for i in range(nfields)]
+                Jb = jax.jacfwd(lambda L: _bnd_local(nid, L, coeff, u_flat.dtype))(locs)
+                for i in range(nfields):
+                    Bi = jnp.asarray(Jb[i]).reshape(vt, vecs[i])
+                    r = offs[test_idx] + nid * vt + jnp.arange(vt)
+                    c = offs[i] + nid * vecs[i] + jnp.arange(vecs[i])
+                    rows = jnp.broadcast_to(r[:, None], Bi.shape)
+                    cols = jnp.broadcast_to(c[None, :], Bi.shape)
+                    idx.append(jnp.stack([rows.reshape(-1), cols.reshape(-1)], axis=1))
+                    dat.append(Bi.reshape(-1))
+
+        if not idx:
+            return jsp.BCOO((jnp.zeros((0,), u_flat.dtype), jnp.zeros((0, 2), jnp.int32)), shape=(total, total))
+        return jsp.BCOO((jnp.concatenate(dat), jnp.concatenate(idx).astype(jnp.int32)), shape=(total, total))
+
+    residual.sparse_jacobian = sparse_jacobian
     return residual
 
 
@@ -680,7 +808,7 @@ def assemble_fem_1d_multifield(domain, volume_terms, boundary_terms, dirichlet_r
         return op, "nonlinear"
 
     zeros = jnp.zeros(total)
-    A = jax.jacfwd(residual_free)(zeros)
+    A = residual_free.sparse_jacobian(zeros)
     b = -residual_free(zeros)
     A, b = _apply_dirichlet_symmetric(A, b, dirichlet_pairs)
     return (A, b), "linear"
@@ -766,7 +894,7 @@ def _assemble_1d_multifield_transient(
     spatial_res = _make_multifield_residual_1d(
         domain, spatial_tl, boundary_tl, fields, field_index, n_nodes=n_nodes, quad_degree=quad_degree
     )
-    M = jax.jacfwd(mass_res)(jnp.zeros(total))
+    M = mass_res.sparse_jacobian(jnp.zeros(total))
     state0 = _multifield_initial_state_1d(domain, fields, field_index, ic_residuals, n_nodes)
     t0, t1, dt = _infer_time_window(domain)
     common = dict(
@@ -785,7 +913,14 @@ def _assemble_1d_multifield_transient(
     if any(_is_obviously_nonlinear_in_unknown(domain, t) for t in all_terms):
         residual = _apply_dirichlet_rows(spatial_res, dirichlet_pairs)
         dofs = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32) if dirichlet_pairs else None
-        M_nl = M if dofs is None else M.at[dofs, :].set(0.0).at[:, dofs].set(0.0)
+        # the mass is a BCOO now, which has no `.at[]` — zero the constrained rows/cols sparsely
+        # (mirrors the linear branch); a dense fallback keeps the old indexing path.
+        if dofs is None:
+            M_nl = M
+        elif hasattr(M, "indices"):
+            M_nl = bcoo_zero_rows_cols(M, dofs)
+        else:
+            M_nl = M.at[dofs, :].set(0.0).at[:, dofs].set(0.0)
         block = SemidiscreteTimeBlock(
             mass=lambda t, args=None, _M=M_nl: _M,
             residual=lambda u, t, args=None: residual(jnp.asarray(u)),
@@ -794,7 +929,7 @@ def _assemble_1d_multifield_transient(
         )
         return block, "transient"
 
-    A = jax.jacfwd(spatial_res)(jnp.zeros(total))
+    A = spatial_res.sparse_jacobian(jnp.zeros(total))
     c = -spatial_res(jnp.zeros(total))
     M, A, c = _apply_dirichlet_transient(M, A, c, dirichlet_pairs)
     block = SemidiscreteTimeBlock(M=M, A=A, affine_bias=c, **common)

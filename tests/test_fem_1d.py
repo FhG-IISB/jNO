@@ -55,6 +55,34 @@ def _x(d):
 # ==========================================================================
 # structure
 # ==========================================================================
+def test_assembly_is_sparse_and_scales_past_the_dense_ceiling():
+    """1D assembles into a **BCOO**, scattered from per-element blocks.
+
+    It used to recover the global operator as ``jacfwd(R)(0)`` over the whole residual, which made 1D —
+    the *cheapest* dimension — carry the library's lowest DOF ceiling: the ``(n_elem, n_dof, ...)``
+    intermediate exhausted GPU memory at ~10k nodes while 2D/3D scattered sparsely all along.
+
+    Pins the structure (BCOO, and ``nnz`` growing **linearly**, which a dense or dense-derived operator
+    could not do), and solves at a node count that used to be unreachable."""
+    d = _line(0.001)  # ~1000 nodes: comfortably past nothing, but pins the nnz law
+    u, phi = d.fem_symbols()
+    xi = d.variable("interior", split=True)[0]
+    xb = d.variable("boundary", split=True)[0]
+    ui, vi = u.bind(x=xi), phi.bind(x=xi)
+    fem = jno.fem([ui.x * vi.x - 1.0 * vi, u(xb) - 0.0])
+    A, _b = fem.operator
+    n = A.shape[0]
+    assert hasattr(A, "indices"), "1D must assemble sparsely (BCOO), not into a dense array"
+    # a LINE2 element contributes a 2x2 block, plus one entry per Dirichlet row: nnz ~ 4*(n-1) + 2,
+    # i.e. LINEAR in n. A dense N^2 operator at n=1001 would be 8 MB of mostly zeros.
+    assert int(A.nse) < 8 * n, f"nnz={int(A.nse)} is not linear in n={n} — the scatter is not element-local"
+
+    x = np.asarray(d.mesh.points)[:, 0]
+    sol = np.asarray(fem.solve())
+    exact = x * (1.0 - x) / 2.0  # -u'' = 1, u(0)=u(1)=0
+    assert np.max(np.abs(sol - exact)) < 1e-11, "the sparse assembly must stay nodally exact"
+
+
 def test_line_domain_is_1d():
     d = _line(0.2)
     assert d.dimension == 1

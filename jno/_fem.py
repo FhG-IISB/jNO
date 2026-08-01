@@ -1521,6 +1521,19 @@ class FEM:
                 else:
                     u_red = jnp.linalg.solve(jnp.asarray(A_red), b_red)  # dense reduced (1D / dense fallback)
                 return _fin(prolong_periodic(_per, u_red))
+            if (
+                solve_fn is None
+                and not from_slots
+                and getattr(self.domain, "dimension", None) == 1
+                and hasattr(A, "todense")
+            ):
+                # A 1D (LINE2) operator is TRIDIAGONAL: a sparse-direct solve is O(N) — as cheap as
+                # iterating — and exact to round-off, where Jacobi-BiCGStab converges only to its
+                # tolerance and its error GROWS with N (measured 8.9e-16 vs 2.7e-11 at n=101, and
+                # 4.6e-14 vs 2.6e-10 at n=1001). Iterating a tridiagonal system is strictly worse.
+                from .utils.solver.linear import sparse_lu_solve
+
+                return _fin(sparse_lu_solve(A, b))
             if solve_fn is None and self._complex_n is not None and hasattr(A, "todense"):
                 # SPARSE-DIRECT is the complex default, and deliberately so: the real-equivalent block
                 # is **indefinite** for Helmholtz / PML, where the Jacobi-preconditioned BiCGStab that
