@@ -33,8 +33,11 @@ centred midpoint has a constant Jacobian, so the linear map is exact, not an app
 Runtime parameters (``jno.np.parameter``, scalar or nodal field) thread through the element kernels
 via ``local["volume_vars"]``, the same channel the 2D/3D and non-nodal assemblers use, so a **steady
 linear** 1D form is parametric and differentiable in the parameter — a 1D inverse problem runs through
-``crux.solve`` like any other. Not wired: a parameter in a nonlinear or transient 1D form, and neural
-(``jno.nn.wrap``) coefficients, whose weights ride a separate slot mechanism.
+``crux.solve`` like any other. A **neural** (``jno.nn.wrap``) coefficient rides the same steady-linear
+path by a different route: a weight pytree is cell-independent, so a network never enters
+``volume_vars`` — the kernel re-evaluates it at the quad points from ``local["neural_coefficients"]``
+while its weights arrive in ``args`` as a ``ModelWeights`` slot, which is what makes ∂solve/∂weights
+flow. Not wired: a parameter or network in a nonlinear or transient 1D form.
 
 Scope: scalar unknown (``vec == 1``), order 1 or 2, single field (the coupled block assembler is
 P1 only). Boundary terms must
@@ -177,6 +180,7 @@ def _make_residual(
     order: int = 1,
     runtime_parameter_tags: Tuple[str, ...] = (),
     field_param_names: Any = frozenset(),
+    neural_slots: Any = None,
 ) -> Any:
     """Build the *free* global residual ``R(u_flat) -> (n_dof*vec,)``.
 
@@ -240,7 +244,18 @@ def _make_residual(
             out.append(flat[node_ids] if is_field else flat[:1])
         return tuple(out)
 
-    def _volume_local(cell, u_local, expr, pvals=()):
+    def _neural_table(args):
+        """``local['neural_coefficients']`` for this call: the ``{name: module}`` table the evaluator
+        re-evaluates each network from at the quad points. Unlike a scalar/field parameter a network
+        never enters ``volume_vars`` (a weight pytree is cell-independent) — trainable weights arrive
+        through ``args``, a frozen net falls back to its stored module."""
+        if neural_slots is None:
+            return None
+        from .parametric_helpers import neural_local_table
+
+        return neural_local_table(neural_slots, args)
+
+    def _volume_local(cell, u_local, expr, pvals=(), ntable=None):
         """Element residual ``(2*vec,)`` from the element's OWN dofs ``u_local`` ``(2, vec)``.
 
         Taking the local dofs rather than indexing a global vector is what makes the element
@@ -264,16 +279,18 @@ def _make_residual(
             "temporal_tags": (),
             "runtime_parameter_tags": runtime_parameter_tags,
             "volume_vars": pvals,
+            "neural_coefficients": ntable,
         }
         return _integrate_term(domain, expr, local, gw * h)  # (nen*vec,)
 
     def residual(u_flat, args=None):
         u = u_flat.reshape(n_nodes, vec)
+        _nt = _neural_table(args)
         R = jnp.zeros(n_nodes * vec, dtype=u_flat.dtype)
 
         # --- volume terms: vmap over elements, then scatter ---
         for expr in volume_terms:
-            elem_res = jax.vmap(lambda c, e=expr: _volume_local(c, u[c], e, _pack_params(c, args, u_flat.dtype)))(
+            elem_res = jax.vmap(lambda c, e=expr: _volume_local(c, u[c], e, _pack_params(c, args, u_flat.dtype), _nt))(
                 elem_nodes
             )  # (n_elem, nen*vec)
             R = R.at[cell_dofs.reshape(-1)].add(elem_res.reshape(-1))
@@ -281,12 +298,12 @@ def _make_residual(
         # --- boundary terms: degenerate one-node "element" (shape val 1, weight 1) ---
         for expr, nid in boundary_apps:
             _bp = _pack_params(jnp.asarray([nid]), args, u_flat.dtype)
-            contrib = _boundary_local(nid, u[nid : nid + 1], expr, u_flat.dtype, _bp)  # (vec,)
+            contrib = _boundary_local(nid, u[nid : nid + 1], expr, u_flat.dtype, _bp, _nt)  # (vec,)
             R = R.at[nid * vec + comp_offsets].add(contrib.reshape(vec))
 
         return R
 
-    def _boundary_local(nid, u_local, expr, dtype, pvals=()):
+    def _boundary_local(nid, u_local, expr, dtype, pvals=(), ntable=None):
         """Boundary contribution ``(vec,)`` at node ``nid`` from its own dof ``u_local`` ``(1, vec)``."""
         local = {
             "physical_quad_points": jnp.asarray([[verts[nid]]]),
@@ -301,6 +318,7 @@ def _make_residual(
             "temporal_tags": (),
             "runtime_parameter_tags": runtime_parameter_tags,
             "volume_vars": pvals,
+            "neural_coefficients": ntable,
         }
         return _integrate_term(domain, expr, local, jnp.ones((1,), dtype=dtype))  # (vec,)
 
@@ -317,12 +335,15 @@ def _make_residual(
         from jax.experimental import sparse as jsp
 
         u = u_flat.reshape(n_nodes, vec)
+        _nt = _neural_table(args)
         idx, dat = [], []
 
         for expr in volume_terms:
             # (n_elem, 2*vec, 2, vec) -> (n_elem, 2*vec, 2*vec): the element matrices
             Ke = jax.vmap(
-                lambda c, e=expr: jax.jacfwd(lambda ul: _volume_local(c, ul, e, _pack_params(c, args, u_flat.dtype)))(u[c])
+                lambda c, e=expr: jax.jacfwd(lambda ul: _volume_local(c, ul, e, _pack_params(c, args, u_flat.dtype), _nt))(
+                    u[c]
+                )
             )(elem_nodes)
             nen = elem_nodes.shape[1]
             Ke = Ke.reshape(n_elem, nen * vec, nen * vec)
@@ -333,7 +354,7 @@ def _make_residual(
 
         for expr, nid in boundary_apps:
             _bp = _pack_params(jnp.asarray([nid]), args, u_flat.dtype)
-            Kb = jax.jacfwd(lambda ul: _boundary_local(nid, ul, expr, u_flat.dtype, _bp))(u[nid : nid + 1])
+            Kb = jax.jacfwd(lambda ul: _boundary_local(nid, ul, expr, u_flat.dtype, _bp, _nt))(u[nid : nid + 1])
             Kb = Kb.reshape(vec, vec)
             dofs = nid * vec + comp_offsets
             rows = jnp.broadcast_to(dofs[:, None], (vec, vec))
@@ -426,6 +447,17 @@ def assemble_fem_1d(
         _collect_runtime_parameter_exprs(_bare_t, _rt_param_exprs)
     runtime_parameter_tags: Tuple[str, ...] = tuple(sorted(_rt_param_exprs))
     field_param_names = frozenset(n for n, e in _rt_param_exprs.items() if _is_fem_field_parameter(e))
+
+    # Neural coefficients (``jno.nn.wrap(net)`` inside the weak form). They deliberately stay OUT of
+    # ``runtime_parameter_tags``: a weight pytree is cell-independent, so unlike a scalar/field
+    # parameter a network never enters the per-cell ``volume_vars`` — the kernel re-evaluates it at the
+    # quad points from the ``{name: module}`` table instead. Its weights still ride ``args`` as a
+    # ``ModelWeights`` slot, which is what makes ∂solve/∂weights flow. Same three touch-points as the
+    # native and non-nodal assemblers (collect / merge into the operator exprs / per-call table).
+    from .parametric_helpers import collect_neural_slots, neural_operator_exprs
+
+    _neural = collect_neural_slots(volume_terms, boundary_terms, runtime_parameter_tags=runtime_parameter_tags)
+    _param_and_neural_exprs = neural_operator_exprs(_rt_param_exprs, _neural)
     # NOTE: a nodal field parameter is interpolated with the element's own shape functions, so its nodal
     # layout must match the trial's — a P1 parameter field cannot ride a LINE3 element. No guard is needed
     # here: `jno.np.parameter(<symbol>)` already refuses a non-P1 symbol at construction, which is the
@@ -465,15 +497,16 @@ def assemble_fem_1d(
         order=order,
         runtime_parameter_tags=runtime_parameter_tags,
         field_param_names=field_param_names,
+        neural_slots=_neural,
     )
 
     nonlinear = any(_is_obviously_nonlinear_in_unknown(domain, t) for t in all_terms)
     if nonlinear:
-        if runtime_parameter_tags:
+        if _param_and_neural_exprs:
             raise NotImplementedError(
-                "jno.fem: a runtime parameter in a *nonlinear* 1D form is not supported yet — the 1D "
-                "parametric path is wired for the steady linear system. Linearize the form, or recover "
-                "the parameter through a linear one."
+                "jno.fem: a runtime parameter or neural coefficient in a *nonlinear* 1D form is not "
+                "supported yet — the 1D parametric path is wired for the steady linear system. "
+                "Linearize the form, or recover the parameter through a linear one."
             )
         residual = _apply_dirichlet_rows(residual_free, dirichlet_pairs)
         op = FemResidualOperator(
@@ -495,7 +528,7 @@ def assemble_fem_1d(
         return _apply_dirichlet_symmetric(A, b, dirichlet_pairs)
 
     A0, b0 = _system(None)
-    if not runtime_parameter_tags:
+    if not _param_and_neural_exprs:
         return (A0, b0), "linear"
     # Parametric: re-form A(θ), b(θ) from the runtime args per call, so ∂u/∂θ flows through the solve.
     # Dirichlet elimination couples A and b (known columns move to the load), so each accessor assembles
@@ -506,7 +539,7 @@ def assemble_fem_1d(
             b0,
             operator_fn=lambda args: _system(args)[0],
             rhs_fn=lambda args: _system(args)[1],
-            runtime_parameter_exprs=_rt_param_exprs,
+            runtime_parameter_exprs=_param_and_neural_exprs,
         ),
         "linear",
     )
