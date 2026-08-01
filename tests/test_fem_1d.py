@@ -284,26 +284,65 @@ def test_nodal_field_parameter_in_1d():
     assert np.max(np.abs(got - x * (1.0 - x) / 4.0)) < 1e-12, "constant field k=2 must give u = x(1-x)/4"
 
 
-def test_1d_parameter_scope_limits_fail_loud():
-    """Scope, each with its own reason rather than one blanket refusal."""
-    # A field parameter is interpolated with the element's own shape functions, so its nodal layout must
-    # match the trial's and a P1 field cannot ride a LINE3 element. The refusal comes from
-    # `jno.np.parameter` itself, at construction -- earlier than assembly, and the better place for it.
-    d = _line(0.1)
-    _u, phi = d.fem_symbols(order=2)
-    with pytest.raises(NotImplementedError, match="P1|order=1"):
-        jno.np.parameter(phi, name="kf2")
+def test_1d_nonlinear_inverse_recovers_a_parameter():
+    """A parameter in a NONLINEAR 1D form. The residual already re-evaluates its coefficients from
+    ``args`` — which is what made the linear path parametric — and ``FemResidualOperator`` takes
+    ``R(u, args)``, so Newton runs on ``R(., theta)`` and the implicit derivative gives d(u)/d(theta)
+    with no extra machinery. Here ``-k u'' + u^3 = f``, recovered from a 0.6 start."""
+    import optax
 
-    # a parameter in a NONLINEAR 1D form: the parametric path is wired for the steady linear system
+    from jno.trace import FemResidualOperator
+
+    k_true = 1.6
+
+    def build(kappa):
+        d = _line(0.08)
+        u, phi = d.fem_symbols()
+        xi = d.variable("interior", split=True)[0]
+        xb = d.variable("boundary", split=True)[0]
+        ui, vi = u.bind(x=xi), phi.bind(x=xi)
+        return jno.fem([kappa * (ui.x * vi.x) + (u * u * u) * vi - 8.0 * vi, u(xb) - 0.0])
+
+    u_obs = np.asarray(build(k_true).solve()).reshape(-1)
+    k = jno.np.parameter((1,), name="kn")
+    k.initialize(jax.nn.initializers.constant(0.6))
+    k.optimizer(optax.adam(0.1))
+    femp = build(k)
+    assert isinstance(femp.operator, FemResidualOperator)
+    assert list(femp.operator.runtime_parameter_exprs) == ["kn"]
+
+    crux = jno.core([(femp.solve() - u_obs).mae], domain=_dummy_domain())
+    crux.solve(200)
+    rec = float(np.asarray(crux.eval([k])).reshape(-1)[0])
+    assert abs(rec - k_true) < 0.08, f"kappa not recovered through the nonlinear 1D inverse: {rec:.4f}"
+
+
+def test_1d_parameter_scope_limits_fail_loud():
+    """The two remaining limits, each with its own reason.
+
+    A COUPLED 1D system threads no runtime parameters. That previously did not merely fail, it failed
+    with the same internal KeyError about InternalVars that the single-field path used to give — the
+    value never reached the kernel. It now says so.
+
+    And a field parameter must share the trial's nodal layout, so a P1 field cannot ride a LINE3
+    element; that refusal comes from ``jno.np.parameter`` itself, at construction, which is earlier and
+    better than assembly."""
+    d = _line(0.1)
+    u, phi = d.fem_symbols(names=("u", "phi"))
+    p, q = d.fem_symbols(names=("p", "q"))
+    xi = d.variable("interior", split=True)[0]
+    xb = d.variable("boundary", split=True)[0]
+    ui, vi = u.bind(x=xi), phi.bind(x=xi)
+    pi_, qi = p.bind(x=xi), q.bind(x=xi)
+    kc = jno.np.parameter((1,), name="kc")
+    kc.initialize(jax.nn.initializers.constant(1.0))
+    with pytest.raises(NotImplementedError, match="COUPLED|coupled"):
+        jno.fem([kc * (ui.x * vi.x) - 1.0 * vi, pi_.x * qi.x - u * qi, u(xb) - 0.0, p(xb) - 0.0])
+
     d2 = _line(0.1)
-    u2, p2 = d2.fem_symbols()
-    x2 = d2.variable("interior", split=True)[0]
-    xb2 = d2.variable("boundary", split=True)[0]
-    u2i, v2i = u2.bind(x=x2), p2.bind(x=x2)
-    k2 = jno.np.parameter((1,), name="k3")
-    k2.initialize(jax.nn.initializers.constant(1.0))
-    with pytest.raises(NotImplementedError, match="nonlinear"):
-        jno.fem([k2 * (u2i.x * v2i.x) + (u2 * u2) * v2i - 1.0 * v2i, u2(xb2) - 0.0])
+    _u2, phi2 = d2.fem_symbols(order=2)
+    with pytest.raises(NotImplementedError, match="P1|order=1"):
+        jno.np.parameter(phi2, name="kf2")
 
 
 def _const_net_1d(c):

@@ -39,8 +39,11 @@ path by a different route: a weight pytree is cell-independent, so a network nev
 while its weights arrive in ``args`` as a ``ModelWeights`` slot, which is what makes ∂solve/∂weights
 flow. Both work on the **transient** path too (the operator and load re-form per step, so a 1D
 time-series inverse trains), with one rule enforced: the transient MASS must be parameter-free, since
-it is assembled once and a parameter there would be silently frozen. Not wired: a parameter or network
-in a *nonlinear* 1D form, or on a coupled system.
+it is assembled once and a parameter there would be silently frozen. A **nonlinear** form is parametric
+too: the residual re-evaluates its coefficients from ``args`` and ``FemResidualOperator`` takes
+``R(u, args)``, so Newton runs on ``R(·, θ)`` and implicit differentiation supplies ∂u/∂θ. Not wired:
+anything parametric on a **coupled** system (that block builder threads no parameters — it fails loud
+rather than dropping the value, which is what it used to do).
 
 Scope: scalar unknown (``vec == 1``), order 1 or 2, single field (the coupled block assembler is
 P1 only). Boundary terms must
@@ -425,7 +428,15 @@ def _apply_dirichlet_rows(residual_free, dirichlet_pairs: List[Tuple[int, float]
     """Wrap a free residual so Dirichlet rows read ``u[d] - g`` (row-replacement).
 
     Used for the nonlinear residual: the tangent row becomes the identity and the
-    Newton step drives ``u[d] -> g``."""
+    Newton step drives ``u[d] -> g``.
+
+    ``residual_free`` takes the state ALONE. That single-argument contract is deliberate: this helper
+    is shared with the non-nodal and native assemblers, whose free residuals have *different* trailing
+    signatures (``R(u, args)`` in one, ``R(u, t=0.0, args=None)`` in the other) — so a wrapper that
+    forwarded a second positional would bind it to ``t`` in the native case and silently evaluate the
+    form at the wrong time rather than fail. A caller that needs runtime args closes over them and
+    wraps per call, ``_apply_dirichlet_rows(lambda uu: free(uu, args), pins)(u)``, which is what the
+    parametric paths here and in ``fem_nonnodal`` do."""
     if not dirichlet_pairs:
         return residual_free
     dofs = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32)
@@ -522,17 +533,19 @@ def assemble_fem_1d(
 
     nonlinear = any(_is_obviously_nonlinear_in_unknown(domain, t) for t in all_terms)
     if nonlinear:
-        if _param_and_neural_exprs:
-            raise NotImplementedError(
-                "jno.fem: a runtime parameter or neural coefficient in a *nonlinear* 1D form is not "
-                "supported yet — the 1D parametric path is wired for the steady linear system. "
-                "Linearize the form, or recover the parameter through a linear one."
-            )
-        residual = _apply_dirichlet_rows(residual_free, dirichlet_pairs)
+        # The residual already re-evaluates its coefficients from ``args`` (that is what made the linear
+        # path parametric), and ``FemResidualOperator`` takes ``R(u, args)`` — so a parameter or network
+        # in a NONLINEAR form threads with no extra machinery: Newton runs on R(·, θ) and the implicit
+        # derivative gives ∂u/∂θ. NOTE the jacobian_fn stays a dense global jacfwd; the matrix-free
+        # Newton-Krylov default never calls it, so it is a latent cost rather than an active one.
+        def res_p(u, args=None):
+            return _apply_dirichlet_rows(lambda uu: residual_free(uu, args), dirichlet_pairs)(jnp.asarray(u))
+
         op = FemResidualOperator(
-            residual_fn=lambda u, args=None: residual(jnp.asarray(u)),
-            jacobian_fn=lambda u, args=None: jax.jacfwd(residual)(jnp.asarray(u)),
+            residual_fn=res_p,
+            jacobian_fn=lambda u, args=None: jax.jacfwd(lambda uu: res_p(uu, args))(jnp.asarray(u)),
             size=ndof,
+            runtime_parameter_exprs=_param_and_neural_exprs,
         )
         return op, "nonlinear"
 
@@ -746,14 +759,12 @@ def _assemble_1d_transient(
     )
 
     if nonlinear:
-        if _param_exprs:
-            raise NotImplementedError(
-                "jno.fem: a runtime parameter or neural coefficient in a *nonlinear* 1D transient form is "
-                "not supported yet — the 1D parametric path is wired for linear systems (steady and "
-                "transient). Linearize the form, or recover the parameter through a linear one."
-            )
-        # M(t) u̇ + R(u) = 0 with R the (Dirichlet-enforced) spatial residual.
-        residual = _apply_dirichlet_rows(spatial_res, dirichlet_pairs)
+        # M(t) u̇ + R(u, args) = 0 with R the (Dirichlet-enforced) spatial residual, re-evaluated at the
+        # runtime args each step — so a parameter threads a nonlinear transient too (the mass stays
+        # parameter-free, guarded above).
+        def res_pt(u, t, args=None):
+            return _apply_dirichlet_rows(lambda uu: spatial_res(uu, args), dirichlet_pairs)(jnp.asarray(u))
+
         dofs = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32) if dirichlet_pairs else None
         # the mass is a BCOO now, which has no `.at[]` — zero the constrained rows/cols sparsely
         # (mirrors the linear branch); a dense fallback keeps the old indexing path.
@@ -765,8 +776,9 @@ def _assemble_1d_transient(
             M_nl = M.at[dofs, :].set(0.0).at[:, dofs].set(0.0)
         block = SemidiscreteTimeBlock(
             mass=lambda t, args=None, _M=M_nl: _M,
-            residual=lambda u, t, args=None: residual(jnp.asarray(u)),
-            jacobian=lambda u, t, args=None: jax.jacfwd(residual)(jnp.asarray(u)),
+            residual=res_pt,
+            jacobian=lambda u, t, args=None: jax.jacfwd(lambda uu: res_pt(uu, t, args))(jnp.asarray(u)),
+            runtime_parameter_exprs=_param_exprs,
             **common,
         )
         return block, "transient"
@@ -1007,6 +1019,19 @@ def assemble_fem_1d_multifield(domain, volume_terms, boundary_terms, dirichlet_r
     from ...trace import FemResidualOperator
     from .fem_utils import _infer_fields, _lower_statefield_to_trial
     from .weak_form import _contains_temporal_derivative, _is_obviously_nonlinear_in_unknown
+
+    # The coupled block builder threads no runtime parameters — its element kernels publish no
+    # ``runtime_parameter_tags``/``volume_vars``. Without this guard the parameter's value simply never
+    # reaches the kernel and the solve dies with an internal KeyError about InternalVars, which is what
+    # the single-field path did before it grew a parameter path. Fail loud and say so instead.
+    _c_tags, _, _c_neural, _c_exprs = _param_context(volume_terms, boundary_terms)
+    if _c_exprs:
+        raise NotImplementedError(
+            "jno.fem: a runtime parameter or neural coefficient on a COUPLED 1D system "
+            f"({sorted(_c_exprs)}) is not supported — the coupled 1D block assembler threads no runtime "
+            "parameters. A single-field 1D form is fully parametric (steady, transient, linear and "
+            "nonlinear); use one field, or a 2D/3D domain for the coupled case."
+        )
 
     n_nodes = int(np.asarray(domain.mesh.points).shape[0])
 
