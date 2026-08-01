@@ -78,7 +78,7 @@ def test_complex_incident_lands_in_the_imag_leg():
 
     fem = jno.fem([inner(ui, vi) + 0j * inner(ui, vi), 2j * k0 * inner(g, tv_top)])
     assert fem.is_complex
-    (_Ar, b_r), (_Ai, b_i) = fem._op
+    (_Ar, b_r), (_Ai, b_i) = fem._complex_legs  # unfused legs (``_op`` is the fused 2n block)
     b_ref = _arr(jno.fem([inner(ui, vi), inner(g, tv_top)]).b)  # real reference load
     np.testing.assert_allclose(_arr(b_r), 0.0, atol=1e-10)  # Re leg: no source
     np.testing.assert_allclose(_arr(b_i), 2.0 * k0 * b_ref, atol=1e-8)  # Im leg: 2 k0 · load
@@ -102,8 +102,8 @@ def test_combined_absorbing_plus_incident_on_one_face():
 
     combined = jno.fem([inner(ui, vi), 1j * k0 * inner(tu, tv) + 2j * k0 * inner(g, tv)])
     separate = jno.fem([inner(ui, vi), 1j * k0 * inner(tu, tv), 2j * k0 * inner(g, tv)])
-    (Ar_c, br_c), (Ai_c, bi_c) = combined._op
-    (Ar_s, br_s), (Ai_s, bi_s) = separate._op
+    (Ar_c, br_c), (Ai_c, bi_c) = combined._complex_legs  # unfused legs (``_op`` is the fused 2n block)
+    (Ar_s, br_s), (Ai_s, bi_s) = separate._complex_legs
     np.testing.assert_allclose(_dense(Ai_c), _dense(Ai_s), atol=1e-9)  # same surface mass into A_i
     np.testing.assert_allclose(_arr(bi_c), _arr(bi_s), atol=1e-9)  # same incident load into b_i
 

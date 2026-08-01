@@ -1401,11 +1401,15 @@ def _source_dof_coords(domain, n_dof):
 def _source_kin(femobj, domain, params=None):
     """Read the illuminated face and transverse wavevector k_in from the assembled forcing b.
     ``params`` overrides trainable-parameter values used when assembling (e.g. a K0/source parameter)."""
-    op = femobj.operator
+    # A complex form is FUSED into one real 2n system at assembly, so ``fem.operator`` is that block and
+    # no longer the Re/Im pair. The unfused legs are retained on ``_complex_legs`` for exactly the
+    # consumers that still want them (here, and the complex-native AMS preconditioner) — read those
+    # first, and fall back to ``.operator`` for the un-fused Bloch remnant, whose operator IS the pair.
+    op = getattr(femobj, "_complex_legs", None) or femobj.operator
     if not (isinstance(op, tuple) and len(op) == 2):
         raise RcwaError(
-            "jno.rcwa expects a complex (time-harmonic) Helmholtz problem: fem.operator did not return a "
-            "(real, imag) operator pair. Author the field with complex=True."
+            "jno.rcwa expects a complex (time-harmonic) Helmholtz problem: neither fem._complex_legs nor "
+            "fem.operator gave a (real, imag) operator pair. Author the field with complex=True."
         )
     opr, opi = op
     if hasattr(opr, "evaluate"):  # lazy (parametric) operator

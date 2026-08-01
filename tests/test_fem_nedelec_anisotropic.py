@@ -82,5 +82,7 @@ def test_gyrotropic_tensor_is_complex_and_not_misclassified_nonlinear():
 
     fem = jno.fem([inner(cu, cv) - inner(eps @ ui, vi)])
     assert fem.is_complex  # complex tensor → complex system (steady linear, not nonlinear)
-    op_r, op_i = fem._op
+    # A complex form is FUSED into one real 2n system at assembly, so ``_op`` is that block's (A, b);
+    # the unfused Re/Im legs are retained on ``_complex_legs``, which is what this property is about.
+    op_r, op_i = fem._complex_legs
     assert np.max(np.abs(_dense(op_i[0]))) > 1e-6  # the imaginary (gyrotropic) part survives assembly
