@@ -377,6 +377,65 @@ def test_1d_neural_coefficient_trains():
     assert after < 5e-2, f"the coefficient network did not fit the data: {after:.3e}"
 
 
+def _transient_diffusion(kappa, ms=0.08):
+    """``u_t = kappa u_xx`` on the unit line, ``u0 = sin(pi x)``, zero Dirichlet — analytic decay
+    ``exp(-kappa pi^2 t) sin(pi x)``. ``kappa`` may be a float or a ``jno.np.parameter``."""
+    d = _line(ms, time=(0.0, 0.05, 21))
+    u, phi = d.fem_symbols()
+    sp = d.variable("interior", split=True)
+    xi, ti = sp[0], sp[-1]
+    xb = d.variable("boundary", split=True)[0]
+    ci = d.variable("initial", split=True)[0]
+    ui, vi = u.bind(x=xi, t=ti), phi.bind(x=xi, t=ti)
+    return jno.fem([ui.t * vi + kappa * (ui.x * vi.x), u(xb) - 0.0, u(ci) - jno.np.sin(np.pi * ci)])
+
+
+def test_1d_transient_inverse_recovers_a_diffusivity():
+    """The canonical PDE inverse problem — recover a diffusivity from a time series — now runs in 1D.
+
+    The transient operator and load re-form from the runtime args at every step, so ``∂traj/∂θ`` flows
+    through the marcher. Starts nearly 3x wrong (2.0 against a true 0.7)."""
+    import optax
+
+    k_true = 0.7
+    fem = _transient_diffusion(k_true)
+    traj_obs = np.asarray(fem.solve().fn())
+    pts = np.asarray(fem.points).reshape(-1)
+    exact = np.exp(-k_true * np.pi**2 * float(fem.t1)) * np.sin(np.pi * pts)
+    assert np.linalg.norm(traj_obs[-1] - exact) / np.linalg.norm(exact) < 5e-3, "forward transient is off"
+
+    k = jno.np.parameter((1,), name="kt")
+    k.initialize(jax.nn.initializers.constant(2.0))
+    k.optimizer(optax.adam(0.08))
+    femp = _transient_diffusion(k)
+    assert list(femp.operator.runtime_parameter_exprs) == ["kt"], "the transient block must carry the parameter"
+
+    node = femp.solve()
+    crux = jno.core([(node - traj_obs).mae], domain=_dummy_domain())
+    crux.solve(200)
+    rec = float(np.asarray(crux.eval([k])).reshape(-1)[0])
+    assert abs(rec - k_true) < 0.03, f"diffusivity not recovered from the 1D time series: {rec:.4f} vs {k_true}"
+
+
+def test_1d_transient_parameter_on_the_mass_fails_loud():
+    """A parameter on the MASS term (``u_t * phi``) must fail loud, not be silently frozen.
+
+    The mass is assembled once, outside the per-args re-forming, so a parameter there would be read at
+    its zero placeholder and baked in — a wrong answer with no error, which is the one outcome this
+    stack never returns. The 2D/3D path documents the same rule; here it is enforced."""
+    d = _line(0.1, time=(0.0, 0.05, 6))
+    u, phi = d.fem_symbols()
+    sp = d.variable("interior", split=True)
+    xi, ti = sp[0], sp[-1]
+    xb = d.variable("boundary", split=True)[0]
+    ci = d.variable("initial", split=True)[0]
+    ui, vi = u.bind(x=xi, t=ti), phi.bind(x=xi, t=ti)
+    rho = jno.np.parameter((1,), name="rho")
+    rho.initialize(jax.nn.initializers.constant(1.0))
+    with pytest.raises(NotImplementedError, match="MASS|mass"):
+        jno.fem([rho * (ui.t * vi) + ui.x * vi.x, u(xb) - 0.0, u(ci) - jno.np.sin(np.pi * ci)])
+
+
 def test_order3_and_coupled_p2_fail_loud():
     """Scope, stated explicitly: 1D Lagrange is implemented for order 1 and 2, and the *coupled* 1D
     block assembler is still P1 — both refuse rather than silently solving at the wrong order."""
