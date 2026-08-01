@@ -3220,14 +3220,16 @@ def fem(
     if getattr(domain, "dimension", None) == 1:
         from .utils.solver.fem_1d import assemble_fem_1d, assemble_fem_1d_multifield
 
-        # The native 1D assembler is LINE2 (P1) only; a P2 request would otherwise be silently
-        # ignored (the order is dropped on this path). Fail loud instead -- a wrong-order solve
-        # is a silently wrong result, which this stack never returns. (P2 is 2D/3D only.)
-        if _infer_order(constraints) > 1:
+        _order_1d = _infer_order(constraints)
+        if _order_1d > 2:
             raise NotImplementedError(
-                "jno.fem: higher-order (P2) elements are not available on a 1D line domain -- the "
-                "native 1D assembler is P1 (LINE2) only. Use order=1, or refine the mesh "
-                "(smaller mesh_size) for accuracy. (P2 promotion is supported on 2D/3D domains.)"
+                f"jno.fem: 1D Lagrange elements are implemented for order 1 (LINE2) and 2 (LINE3); "
+                f"got order={_order_1d}. Use order<=2, or refine the mesh for accuracy."
+            )
+        if _order_1d > 1 and multifield:
+            raise NotImplementedError(
+                "jno.fem: higher-order (P2 / LINE3) elements on a 1D domain are single-field only for "
+                "now -- the coupled 1D block assembler is P1. Use order=1 for the coupled system."
             )
         if multifield:  # coupled 1D -> native block assembly
             if _second_order:
@@ -3240,7 +3242,16 @@ def fem(
             )
         else:
             op, mode = assemble_fem_1d(
-                domain, volume_terms, boundary_terms, dirichlet_values, ic_residuals, vec=vec, quad_degree=quad_degree
+                domain,
+                volume_terms,
+                boundary_terms,
+                dirichlet_values,
+                ic_residuals,
+                vec=vec,
+                # a P2 mass term is degree 4, so the rule must be raised with the order (mirrors the
+                # 2D/3D path); too few Gauss points would under-integrate the mass silently
+                quad_degree=max(quad_degree, 2 * _order_1d),
+                order=_order_1d,
             )
         # a second-order 1D block carries the augmented state y=[u; v] (size 2N) -> field offsets [0, N, 2N]
         offs_1d = None

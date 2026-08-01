@@ -41,6 +41,10 @@ u_h = fem.solve()          # matrix-free default; slots pick anything else (see 
   Use `value_shape=(2,)` for a vector unknown (elasticity, flow velocity), `order=k` for degree-`k`
   Lagrange (`order=2` quadratic P2, `order=3` cubic P3, … — any `k ≥ 1`), `space="RT"`/`"N1E"`/`"P0"`
   for the non-nodal families (see below), and call `fem_symbols` once per field for coupled systems.
+  On a **1D line domain** orders 1 (LINE2) and 2 (LINE3) are available — P2 adds a dof per element
+  midpoint, so read `fem.points` for the coordinates the solution lives on. Measured on
+  `-u'' + u = f`: P1 converges at O(h²) nodally and P2 at O(h⁴), which at an equal 41 dofs is
+  4.7e-5 against 2.4e-7. Higher orders, and P2 on a *coupled* 1D system, are not wired (clear errors).
 * **Quadrature coordinates** — `d.variable("interior", split=True)` returns the volume
   coordinates; `d.variable("<edge>", split=True)` returns a boundary edge's coordinates. A
   `Shape.rect` auto-tags `"left"`, `"right"`, `"bottom"`, `"top"` (and `"front"`/`"back"` for a box);

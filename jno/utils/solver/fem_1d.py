@@ -1,8 +1,8 @@
-"""Native 1D (segment / ``LINE2``) FEM assembly for ``jno.fem``.
+"""Native 1D (segment) FEM assembly for ``jno.fem`` — ``LINE2`` (P1) and ``LINE3`` (P2).
 
 Small native assembler for a 1D ``jno.domain.line(...)`` problem that reuses
 jNO's weak-form integrand evaluator (:func:`_eval_integrand`) — it adds the
-1D geometry (``LINE2`` shape functions + Gauss quadrature), an element loop with
+1D geometry (Lagrange shape functions + Gauss quadrature), an element loop with
 a global scatter, and native boundary handling. Same matrices-only contract as
 the 2D/3D path: it returns the assembled system, never a solve.
 
@@ -25,7 +25,13 @@ Assembly is ``O(nnz)``, not ``O(N²)``. It previously recovered the global opera
 exhausted GPU memory at ~10k nodes — so 1D, the *cheapest* dimension, had the library's
 lowest DOF ceiling while 2D/3D scattered sparsely. 50k nodes now assemble in ~2 s.
 
-Scope: scalar unknown (``vec == 1``) on ``LINE2`` elements. Boundary terms must
+P2 (``order=2``) adds one dof per element **midpoint**, laid out after all vertices so a vertex dof
+keeps its mesh-node index — which is why the boundary/Dirichlet lookup needs no P2 awareness (a 1D
+boundary is an endpoint, hence always a vertex). Geometry stays LINE2: a straight element with a
+centred midpoint has a constant Jacobian, so the linear map is exact, not an approximation.
+
+Scope: scalar unknown (``vec == 1``), order 1 or 2, single field (the coupled block assembler is
+P1 only). Boundary terms must
 be value/Robin terms (``g*phi`` / ``(a*u - g)*phi``) — they carry no spatial
 derivative, since a 0D facet has no element to differentiate over.
 """
@@ -56,14 +62,24 @@ def _line_quadrature(quad_degree: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
     return jnp.asarray(gp), jnp.asarray(gw)
 
 
-def _line_shape(gp: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """LINE2 shape values ``N`` and reference gradients ``dN/dxi`` at ``gp``.
+def _line_shape(gp: jnp.ndarray, order: int = 1) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Lagrange shape values ``N`` and reference gradients ``dN/dxi`` at ``gp`` on [0, 1].
 
-    ``N0 = 1 - xi``, ``N1 = xi`` on [0, 1]. Returns ``N`` (n_quad, 2) and
-    ``dN_dxi`` (n_quad, 2)."""
+    ``order=1`` (LINE2): nodes at ``0, 1`` — ``N = [1-xi, xi]``.
+    ``order=2`` (LINE3): nodes at ``0, 1, 1/2`` — the endpoints FIRST, then the midpoint, so a
+    global DOF layout of "all vertices, then all element midpoints" keeps every vertex dof at its
+    mesh-node index (which is what lets the boundary/Dirichlet node lookup stay unchanged)::
+
+        N_0 = (1-xi)(1-2xi),  N_1 = xi(2xi-1),  N_2 = 4 xi (1-xi)
+
+    Returns ``N`` and ``dN_dxi``, each ``(n_quad, order+1)``."""
     one = jnp.ones_like(gp)
-    N = jnp.stack([1.0 - gp, gp], axis=-1)
-    dN_dxi = jnp.stack([-one, one], axis=-1)
+    if int(order) == 1:
+        return jnp.stack([1.0 - gp, gp], axis=-1), jnp.stack([-one, one], axis=-1)
+    if int(order) != 2:
+        raise NotImplementedError(f"jno.fem: 1D Lagrange elements are implemented for order 1 and 2; got {order}.")
+    N = jnp.stack([(1.0 - gp) * (1.0 - 2.0 * gp), gp * (2.0 * gp - 1.0), 4.0 * gp * (1.0 - gp)], axis=-1)
+    dN_dxi = jnp.stack([4.0 * gp - 3.0, 4.0 * gp - 1.0, 4.0 - 8.0 * gp], axis=-1)
     return N, dN_dxi
 
 
@@ -130,6 +146,20 @@ def _integrate_term(domain: Any, expr: Any, local: dict, weights: jnp.ndarray) -
     return ravel_pytree(jnp.sum(val * weights.reshape(wshape), axis=0))[0]
 
 
+def dof_layout_1d(domain: Any, order: int):
+    """``(n_dof_nodes, dof_coords)`` for a 1D Lagrange space of ``order``.
+
+    P1 dofs are the mesh vertices. P2 adds one dof per element **midpoint**, laid out after all
+    vertices, so a vertex dof keeps its mesh-node index. ``dof_coords`` is what ``fem.points`` must
+    report — the solution vector lives on these, not on the linear mesh the domain keeps."""
+    verts = np.asarray(domain.mesh.points)[:, 0]
+    if int(order) == 1:
+        return int(verts.shape[0]), verts.reshape(-1, 1)
+    cells = np.asarray(domain.mesh.cells_dict["line"])
+    mids = 0.5 * (verts[cells[:, 0]] + verts[cells[:, 1]])
+    return int(verts.shape[0] + cells.shape[0]), np.concatenate([verts, mids]).reshape(-1, 1)
+
+
 def _make_residual(
     domain: Any,
     volume_terms: List[Any],
@@ -138,21 +168,42 @@ def _make_residual(
     n_nodes: int,
     vec: int,
     quad_degree: int,
+    order: int = 1,
 ) -> Any:
-    """Build the *free* global residual ``R(u_flat) -> (n_nodes*vec,)``.
+    """Build the *free* global residual ``R(u_flat) -> (n_dof*vec,)``.
 
     Covers the volume + boundary (Neumann/Robin) weak terms; Dirichlet is applied
     by the caller (symmetric elimination for the linear ``(A, b)``, row-replacement
-    for the nonlinear residual)."""
-    nodes = jnp.asarray(domain.mesh.points)[:, 0]
-    cells = jnp.asarray(domain.mesh.cells_dict["line"], dtype=jnp.int32)  # (n_elem, 2)
+    for the nonlinear residual).
+
+    ``order`` selects LINE2 (P1) or LINE3 (P2). ``n_nodes`` is the caller's *vertex* count; the
+    residual is sized by the element's dof count, which for P2 adds one midpoint dof per element
+    (see :func:`n_dofs_1d`)."""
+    verts = jnp.asarray(domain.mesh.points)[:, 0]
+    cells = jnp.asarray(domain.mesh.cells_dict["line"], dtype=jnp.int32)  # (n_elem, 2) — the GEOMETRY
+    n_vert, n_elem = int(verts.shape[0]), int(cells.shape[0])
+    order = int(order)
     gp, gw = _line_quadrature(quad_degree)
-    N, dN_dxi = _line_shape(gp)
+    N, dN_dxi = _line_shape(gp, order)
+    N_geom, _ = _line_shape(gp, 1)  # geometry stays LINE2: a straight element with a centred
+    # midpoint has a constant Jacobian h, so the linear map is EXACT — subparametric, not an
+    # approximation, and it keeps `h` a scalar per element.
     ctx = getattr(domain, "context", {}) or {}
     comp_offsets = jnp.arange(vec)
 
+    # P2 adds one dof per element midpoint. Layout: ALL vertices, then all midpoints — so a vertex
+    # dof keeps its mesh-node index and the boundary/Dirichlet node lookup needs no P2 awareness
+    # (a 1D boundary is an endpoint, hence always a vertex).
+    if order == 2:
+        elem_nodes = jnp.concatenate([cells, (n_vert + jnp.arange(n_elem, dtype=jnp.int32))[:, None]], axis=1)
+        n_nodes_dof = n_vert + n_elem
+    else:
+        elem_nodes = cells
+        n_nodes_dof = n_vert
+    n_nodes = n_nodes_dof  # the residual is sized by DOF nodes, not mesh vertices
+
     # element-local -> global DOF map, node-major: dof = node*vec + comp
-    cell_dofs = (cells[:, :, None] * vec + comp_offsets[None, None, :]).reshape(cells.shape[0], -1)  # (n_elem, 2*vec)
+    cell_dofs = (elem_nodes[:, :, None] * vec + comp_offsets[None, None, :]).reshape(n_elem, -1)  # (n_elem, nen*vec)
 
     # precompute boundary (region, term, node_id) triples
     boundary_apps: List[Tuple[Any, int]] = []
@@ -169,10 +220,10 @@ def _make_residual(
         Jacobian available: differentiating this w.r.t. ``u_local`` gives the ``(2*vec, 2*vec)``
         element matrix directly, so the global operator can be scattered sparsely instead of
         recovered by an ``O(N²)`` ``jacfwd`` of the global residual (see :func:`_sparse_jacobian`)."""
-        xc = nodes[cell]  # (2,)
+        xc = verts[cell[:2]]  # (2,) — the element's endpoints carry the geometry
         h = xc[1] - xc[0]
-        phys = (N @ xc)[:, None]  # (n_quad, 1)
-        shape_grads = (dN_dxi / h)[:, :, None]  # (n_quad, 2, 1)
+        phys = (N_geom @ xc)[:, None]  # (n_quad, 1)
+        shape_grads = (dN_dxi / h)[:, :, None]  # (n_quad, nen, 1)
         local = {
             "physical_quad_points": phys,
             "shape_vals": N,
@@ -195,7 +246,7 @@ def _make_residual(
 
         # --- volume terms: vmap over elements, then scatter ---
         for expr in volume_terms:
-            elem_res = jax.vmap(lambda c, e=expr: _volume_local(c, u[c], e))(cells)  # (n_elem, 2*vec)
+            elem_res = jax.vmap(lambda c, e=expr: _volume_local(c, u[c], e))(elem_nodes)  # (n_elem, nen*vec)
             R = R.at[cell_dofs.reshape(-1)].add(elem_res.reshape(-1))
 
         # --- boundary terms: degenerate one-node "element" (shape val 1, weight 1) ---
@@ -208,7 +259,7 @@ def _make_residual(
     def _boundary_local(nid, u_local, expr, dtype):
         """Boundary contribution ``(vec,)`` at node ``nid`` from its own dof ``u_local`` ``(1, vec)``."""
         local = {
-            "physical_quad_points": jnp.asarray([[nodes[nid]]]),
+            "physical_quad_points": jnp.asarray([[verts[nid]]]),
             "shape_vals": jnp.ones((1, 1), dtype=dtype),
             "shape_grads": jnp.zeros((1, 1, 1), dtype=dtype),
             "cell_sol": u_local,  # (1, vec)
@@ -240,8 +291,9 @@ def _make_residual(
 
         for expr in volume_terms:
             # (n_elem, 2*vec, 2, vec) -> (n_elem, 2*vec, 2*vec): the element matrices
-            Ke = jax.vmap(lambda c, e=expr: jax.jacfwd(lambda ul: _volume_local(c, ul, e))(u[c]))(cells)
-            Ke = Ke.reshape(cells.shape[0], 2 * vec, 2 * vec)
+            Ke = jax.vmap(lambda c, e=expr: jax.jacfwd(lambda ul: _volume_local(c, ul, e))(u[c]))(elem_nodes)
+            nen = elem_nodes.shape[1]
+            Ke = Ke.reshape(n_elem, nen * vec, nen * vec)
             rows = jnp.broadcast_to(cell_dofs[:, :, None], Ke.shape)
             cols = jnp.broadcast_to(cell_dofs[:, None, :], Ke.shape)
             idx.append(jnp.stack([rows.reshape(-1), cols.reshape(-1)], axis=1))
@@ -317,6 +369,7 @@ def assemble_fem_1d(
     *,
     vec: int,
     quad_degree: int,
+    order: int = 1,
 ) -> Tuple[Any, str]:
     """Assemble a 1D (``LINE2``) weak form into ``(op, mode)`` for :class:`FEM`.
 
@@ -329,20 +382,33 @@ def assemble_fem_1d(
     if int(vec) != 1:
         raise NotImplementedError(f"jno.fem: 1D (LINE2) assembly supports a scalar unknown (vec=1) only; got vec={vec}.")
 
-    n_nodes = int(np.asarray(domain.mesh.points).shape[0])
+    # P2 adds a midpoint dof per element, so the dof count is NOT the vertex count. Publishing the
+    # dof coordinates is what makes `fem.points` line up with the solution vector (the same
+    # contract the 2D/3D P2 path already has).
+    n_nodes, dof_coords = dof_layout_1d(domain, order)
     ndof = n_nodes * vec
+    domain._fem_native_dof_points = dof_coords
     all_terms = list(volume_terms) + [t for ts in boundary_terms.values() for t in ts]
 
     if any(_contains_temporal_derivative(t) for t in all_terms):
         return _assemble_1d_transient(
-            domain, volume_terms, boundary_terms, dirichlet_values, ic_residuals, vec=vec, quad_degree=quad_degree
+            domain,
+            volume_terms,
+            boundary_terms,
+            dirichlet_values,
+            ic_residuals,
+            vec=vec,
+            quad_degree=quad_degree,
+            order=order,
         )
 
     if ic_residuals:
         raise ValueError("jno.fem: an initial condition was given but the 1D weak form has no time derivative.")
 
     dirichlet_pairs = _dirichlet_dofs(domain, dirichlet_values, vec)
-    residual_free = _make_residual(domain, volume_terms, boundary_terms, n_nodes=n_nodes, vec=vec, quad_degree=quad_degree)
+    residual_free = _make_residual(
+        domain, volume_terms, boundary_terms, n_nodes=n_nodes, vec=vec, quad_degree=quad_degree, order=order
+    )
 
     nonlinear = any(_is_obviously_nonlinear_in_unknown(domain, t) for t in all_terms)
     if nonlinear:
@@ -378,7 +444,9 @@ def _apply_dirichlet_transient(M, A, c, dirichlet_pairs: List[Tuple[int, float]]
     return M, A, c
 
 
-def _assemble_1d_transient(domain, volume_terms, boundary_terms, dirichlet_values, ic_residuals, *, vec, quad_degree):
+def _assemble_1d_transient(
+    domain, volume_terms, boundary_terms, dirichlet_values, ic_residuals, *, vec, quad_degree, order=1
+):
     """Assemble a first-order transient 1D weak form into a ``SemidiscreteTimeBlock``.
 
     Splits the volume terms into a temporal part (``u_t``) and a spatial part: the
@@ -397,8 +465,12 @@ def _assemble_1d_transient(domain, volume_terms, boundary_terms, dirichlet_value
         _split_additive_terms,
     )
 
-    n_nodes = int(np.asarray(domain.mesh.points).shape[0])
+    # P2 adds a midpoint dof per element, so the dof count is NOT the vertex count. Publishing the
+    # dof coordinates is what makes `fem.points` line up with the solution vector (the same
+    # contract the 2D/3D P2 path already has).
+    n_nodes, dof_coords = dof_layout_1d(domain, order)
     ndof = n_nodes * vec
+    domain._fem_native_dof_points = dof_coords
 
     # Split each weak constraint into additive sub-terms first, so the temporal
     # term (u_t * phi) can be separated from the spatial terms in the same sum.
@@ -424,18 +496,22 @@ def _assemble_1d_transient(domain, volume_terms, boundary_terms, dirichlet_value
         z = jnp.zeros(ndof)
         m2_terms = [_strip_n(t, 2) for t in temporal_terms if _mto(t) >= 2]  # u_tt·φ ⇒ mass M2
         d_terms = [_strip_n(t, 1) for t in temporal_terms if _mto(t) == 1]  # u_t·φ ⇒ damping C (optional)
-        M2 = _make_residual(domain, m2_terms, {}, n_nodes=n_nodes, vec=vec, quad_degree=quad_degree).sparse_jacobian(z)
+        M2 = _make_residual(
+            domain, m2_terms, {}, n_nodes=n_nodes, vec=vec, quad_degree=quad_degree, order=order
+        ).sparse_jacobian(z)
         from jax.experimental import sparse as _jsp
 
         Cmat = (
-            _make_residual(domain, d_terms, {}, n_nodes=n_nodes, vec=vec, quad_degree=quad_degree).sparse_jacobian(z)
+            _make_residual(
+                domain, d_terms, {}, n_nodes=n_nodes, vec=vec, quad_degree=quad_degree, order=order
+            ).sparse_jacobian(z)
             if d_terms
             # an absent damping term is the EMPTY BCOO, not a dense zero block — a dense (ndof, ndof)
             # of zeros would reintroduce the O(N²) allocation this whole path exists to avoid
             else _jsp.BCOO((jnp.zeros((0,), z.dtype), jnp.zeros((0, 2), jnp.int32)), shape=(ndof, ndof))
         )
         spatial_res2 = _make_residual(
-            domain, spatial_terms, boundary_terms, n_nodes=n_nodes, vec=vec, quad_degree=quad_degree
+            domain, spatial_terms, boundary_terms, n_nodes=n_nodes, vec=vec, quad_degree=quad_degree, order=order
         )
         K = spatial_res2.sparse_jacobian(z)
         F = -spatial_res2(z)  # spatial load + natural-BC load
@@ -451,7 +527,8 @@ def _assemble_1d_transient(domain, volume_terms, boundary_terms, dirichlet_value
             M_aug = M_aug.at[dd, :].set(0.0).at[dd + n, :].set(0.0)
             A_aug = A_aug.at[dd, :].set(0.0).at[dd, dd].set(1.0).at[dd + n, :].set(0.0).at[dd + n, dd + n].set(1.0)
             c_aug = c_aug.at[dd].set(dg).at[dd + n].set(0.0)
-        pts = jnp.asarray(domain.mesh.points)[:, : domain.dimension]
+        # the initial state lives on the DOF nodes, which for P2 include the element midpoints
+        pts = jnp.asarray(dof_coords)
         u0 = jnp.zeros((n,), z.dtype)
         v0 = jnp.zeros((n,), z.dtype)
         for ic in ic_residuals:  # displacement IC u(0)=u0 + optional velocity IC u̇(0)=v0
@@ -484,14 +561,17 @@ def _assemble_1d_transient(domain, volume_terms, boundary_terms, dirichlet_value
 
     dirichlet_pairs = _dirichlet_dofs(domain, dirichlet_values, vec)
     if ic_residuals:
-        pts = jnp.asarray(domain.mesh.points)[:, : domain.dimension]
+        # the initial state lives on the DOF nodes, which for P2 include the element midpoints
+        pts = jnp.asarray(dof_coords)
         state0 = _ic_value_at_nodes(_bare(ic_residuals[0]), domain, pts, ndof, vec)
     else:
         state0 = jnp.zeros(ndof)
     t0, t1, dt = _infer_time_window(domain)
 
-    mass_res = _make_residual(domain, mass_terms, {}, n_nodes=n_nodes, vec=vec, quad_degree=quad_degree)
-    spatial_res = _make_residual(domain, spatial_terms, boundary_terms, n_nodes=n_nodes, vec=vec, quad_degree=quad_degree)
+    mass_res = _make_residual(domain, mass_terms, {}, n_nodes=n_nodes, vec=vec, quad_degree=quad_degree, order=order)
+    spatial_res = _make_residual(
+        domain, spatial_terms, boundary_terms, n_nodes=n_nodes, vec=vec, quad_degree=quad_degree, order=order
+    )
 
     all_terms = spatial_terms + [t for ts in boundary_terms.values() for t in ts]
     nonlinear = any(_is_obviously_nonlinear_in_unknown(domain, t) for t in all_terms)
