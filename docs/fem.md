@@ -45,6 +45,9 @@ u_h = fem.solve()          # matrix-free default; slots pick anything else (see 
   midpoint, so read `fem.points` for the coordinates the solution lives on. Measured on
   `-u'' + u = f`: P1 converges at O(h²) nodally and P2 at O(h⁴), which at an equal 41 dofs is
   4.7e-5 against 2.4e-7. Higher orders, and P2 on a *coupled* 1D system, are not wired (clear errors).
+  A `jno.np.parameter` coefficient (scalar or nodal field) also works on a **steady linear** 1D form, so
+  a 1D differentiable inverse problem runs through `crux.solve`; a parameter in a nonlinear or transient
+  1D form, and neural (`jno.nn.wrap`) coefficients, are not wired there yet.
 * **Quadrature coordinates** — `d.variable("interior", split=True)` returns the volume
   coordinates; `d.variable("<edge>", split=True)` returns a boundary edge's coordinates. A
   `Shape.rect` auto-tags `"left"`, `"right"`, `"bottom"`, `"top"` (and `"front"`/`"back"` for a box);

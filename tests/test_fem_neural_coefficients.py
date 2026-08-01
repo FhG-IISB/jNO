@@ -716,14 +716,23 @@ def _complex_helmholtz(kappa_expr_fn, mesh_size=0.15):
 
 
 def test_complex_net_yields_parametric_legs_and_node():
-    """A real net coefficient in a complex form: the legs assemble as parametric FemLinearSystems
-    carrying the ModelWeights slot, and solve() is a differentiable trace node."""
+    """A real net coefficient in a complex form: the Re/Im legs assemble as parametric
+    FemLinearSystems carrying the ModelWeights slot, and solve() is a differentiable trace node.
+
+    The legs are fused into ONE parametric system over the real-equivalent 2n block at assembly, so
+    that is what ``fem.operator`` is; the unfused legs stay reachable on ``_complex_legs``, which is
+    what a complex-native preconditioner (AMS) needs."""
     from jno.trace import FemLinearSystem
 
     net = _mlp_net(key=11)
     _, fem = _complex_helmholtz(lambda x, y, u: 1.0 + net(x, y))
     assert fem.is_complex
-    op_r, _op_i = fem._op
+    fused = fem._op
+    assert isinstance(fused, FemLinearSystem) and fused.is_parametric
+    (fname,) = fused.runtime_parameter_exprs
+    assert isinstance(fused.runtime_parameter_exprs[fname], ModelWeights)
+
+    op_r, _op_i = fem._complex_legs
     assert isinstance(op_r, FemLinearSystem) and op_r.is_parametric
     (name,) = op_r.runtime_parameter_exprs
     assert isinstance(op_r.runtime_parameter_exprs[name], ModelWeights)
