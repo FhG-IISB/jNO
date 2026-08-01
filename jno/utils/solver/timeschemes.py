@@ -8,10 +8,18 @@ and unconditionally stable, so it takes large stiff steps that an implicit θ-st
 source is integrated by ETD2). For a symmetric operator it reuses the Lanczos
 :func:`jno.solve.applyfun`; for a **non-symmetric** one (``symmetric=False``, advection–diffusion) it uses
 an Arnoldi + differentiable **Padé** exponential (:func:`jno.utils.solver.matfun.expmv`), all matfree.
-``jno.solve.adaptive(...)`` chooses the step size per step from a **step-doubling** local-error estimate
-on the block's own implicit step, so it works for every transient case (real/complex, scalar/vector,
-plain/periodic) and stays reverse-mode differentiable (a fixed-budget ``lax.scan`` with the controller
-``stop_gradient``-ed — the state differentiates at the realized step schedule).
+Step **size** is a separate axis from which step to take, so it composes rather than being its own scheme:
+``.adaptive(...)`` on any scheme chooses the step size from a **step-doubling** local-error estimate of
+*that* scheme's step, working for every transient case (real/complex, scalar/vector, plain/periodic) and
+staying reverse-mode differentiable (a fixed-budget ``lax.scan`` with the controller ``stop_gradient``-ed —
+the state differentiates at the realized step schedule)::
+
+    fem.solve(time=jno.solve.theta(0.5))                       # 2nd-order, fixed grid
+    fem.solve(time=jno.solve.theta(0.5).adaptive(rtol=1e-5))   # 2nd-order, error-controlled
+    fem.solve(time=jno.solve.adaptive(rtol=1e-5))              # the block's own θ-step, error-controlled
+
+The controller's step-size exponent ``1/(p+1)`` follows the base scheme's ``step_order``, so attaching it
+to a second-order step is far cheaper per digit than the first-order default — see :func:`jno.solve.adaptive`.
 """
 
 from __future__ import annotations
@@ -20,11 +28,51 @@ import jax
 import jax.numpy as jnp
 
 
-class _ThetaScheme:
+class _TimeScheme:
+    """Base for the ``fem.solve(time=…)`` schemes.
+
+    A time scheme has two separable jobs: **which step** to take (a θ-step, a matrix exponential, later
+    an SDIRK / Rosenbrock stage) and **how big** the steps are (the domain's fixed grid, or chosen from an
+    error estimate). ``integrate`` marches on the fixed grid; ``.adaptive(...)`` wraps *this same base
+    step* in the step-doubling controller, so the two axes compose instead of each scheme carrying its own
+    copy of the other::
+
+        fem.solve(time=jno.solve.theta(0.5))                       # 2nd-order, fixed grid
+        fem.solve(time=jno.solve.theta(0.5).adaptive(rtol=1e-5))   # 2nd-order, error-controlled
+
+    A subclass supplies ``step_order`` — the classical order ``p`` of its base step, which the controller
+    needs for its ``1/(p+1)`` exponent — and ``stepper``, a single ``(u, t, dt) -> u(t+dt)``."""
+
+    step_order = 1
+
+    def stepper(self, block, args, *, linear_solve=None, nonlinear_solve=None):
+        """One implicit step of THIS scheme, as ``(u, t, dt) -> u(t+dt)``. Schemes that cannot expose a
+        single arbitrary-``dt`` step (and so cannot be adaptively sized) leave this raising."""
+        raise NotImplementedError(f"{type(self).__name__} does not expose a single step, so it cannot be adaptively sized.")
+
+    def adaptive(self, *, rtol: float = 1e-4, atol: float = 1e-6, max_steps: int = 1000, dt0: float | None = None):
+        """Size THIS scheme's step from a step-doubling local-error estimate. See
+        :func:`jno.solve.adaptive` for the tolerances, the step budget, and the ``dt0`` rule."""
+        return _AdaptiveScheme(self, rtol, atol, max_steps, dt0)
+
+
+class _ThetaScheme(_TimeScheme):
     """θ-method scheme (see :func:`jno.solve.theta`) — reuses the default stepper with an explicit θ."""
 
     def __init__(self, theta: float):
         self.theta = float(theta)
+
+    @property
+    def step_order(self):
+        return _theta_order(self.theta)
+
+    def stepper(self, block, args, *, linear_solve=None, nonlinear_solve=None):
+        def step_fn(u, t, dt):
+            return block.step(
+                u, t, dt, args=args, theta=self.theta, linear_solve=linear_solve, nonlinear_solve=nonlinear_solve
+            )
+
+        return step_fn
 
     def integrate(self, block, args, save_ts, *, linear_solve, nonlinear_solve):
         from .backend_blocks import _default_transient_integrate
@@ -37,14 +85,24 @@ class _ThetaScheme:
         return f"jno.solve.theta({self.theta})"
 
 
-class _ExponentialScheme:
+class _ExponentialScheme(_TimeScheme):
     """Matrix-exponential scheme (see :func:`jno.solve.exponential`) — linear, time-independent ``M``/``A``
-    (a time-varying source is handled by ETD2)."""
+    (a time-varying source is handled by ETD2).
+
+    NOTE ``order`` here is the **Krylov subspace size**, not the method's order in ``dt`` — do not feed it
+    to the adaptive controller."""
 
     def __init__(self, order: int, mass: str, symmetric: bool):
         self.order = int(order)
         self.mass = mass
         self.symmetric = bool(symmetric)
+
+    def adaptive(self, **kwargs):
+        raise NotImplementedError(
+            "jno.solve.exponential(...).adaptive(...) is not available: this scheme is already exact in time "
+            "for the homogeneous decay, so a step-doubling estimate would measure only the ETD2 source term "
+            "and would size steps by that alone. Use jno.solve.theta(...).adaptive(...)."
+        )
 
     def integrate(self, block, args, save_ts, *, linear_solve=None, nonlinear_solve=None):
         return _exponential_integrate(block, args, save_ts, order=self.order, mass=self.mass, symmetric=self.symmetric)
@@ -53,23 +111,36 @@ class _ExponentialScheme:
         return f"jno.solve.exponential(order={self.order}, mass={self.mass!r}, symmetric={self.symmetric})"
 
 
-class _AdaptiveScheme:
-    """Adaptive step-size scheme (see :func:`jno.solve.adaptive`) — step-doubling (Richardson) error
-    control on the block's OWN implicit step, so it inherits the block's DAE handling and works for a
-    linear or nonlinear block, scalar or vector, plain or periodic-reduced (the step runs in the reduced
-    space; the caller prolongs). The complex-transient path feeds the same marcher its 2n-block step."""
+class _AdaptiveScheme(_TimeScheme):
+    """Step-size **policy** wrapping a base scheme — step-doubling (Richardson) error control on that
+    scheme's implicit step, so it inherits the block's DAE handling and works for a linear or nonlinear
+    block, scalar or vector, plain or periodic-reduced (the step runs in the reduced space; the caller
+    prolongs). The complex-transient path feeds the same marcher its 2n-block step.
 
-    def __init__(self, rtol: float, atol: float, max_steps: int, dt0: float | None = None):
+    Built by :meth:`_TimeScheme.adaptive` (``jno.solve.theta(0.5).adaptive(...)``). ``base=None`` — what
+    the bare :func:`jno.solve.adaptive` produces — means "whatever θ-step the assembly picked for this
+    block", which is backward Euler for a parabolic block and trapezoidal for a second-order one."""
+
+    def __init__(self, base, rtol: float, atol: float, max_steps: int, dt0: float | None = None):
+        self.base = base
         self.rtol, self.atol, self.max_steps = float(rtol), float(atol), int(max_steps)
         self.dt0 = None if dt0 is None else float(dt0)
+
+    def base_for(self, block):
+        """The base scheme this will actually step with — ``self.base``, or the block's own θ-step."""
+        if self.base is not None:
+            return self.base
+        theta = float(block.metadata.get("theta", 1.0)) if getattr(block, "metadata", None) else 1.0
+        return _ThetaScheme(theta)
+
+    def adaptive(self, **kwargs):
+        raise NotImplementedError("this scheme is already adaptively sized; .adaptive() does not nest.")
 
     def integrate(self, block, args, save_ts, *, linear_solve=None, nonlinear_solve=None):
         s0f = getattr(block, "state0_fn", None)
         u0 = jnp.asarray(s0f(args) if s0f is not None else block.state0).reshape(-1)
-        theta = float(block.metadata.get("theta", 1.0)) if getattr(block, "metadata", None) else 1.0
-
-        def step_fn(u, t, dt):
-            return block.step(u, t, dt, args=args, theta=theta, linear_solve=linear_solve, nonlinear_solve=nonlinear_solve)
+        base = self.base_for(block)
+        step_fn = base.stepper(block, args, linear_solve=linear_solve, nonlinear_solve=nonlinear_solve)
 
         # NOTE: deliberately NOT ``block.dt``. The output grid's dt has no relation to the correct step
         # size, and with no rejection an over-large first step is committed for good — ``dt0=None`` lets
@@ -84,10 +155,19 @@ class _AdaptiveScheme:
             atol=self.atol,
             max_steps=self.max_steps,
             dt0=self.dt0,
+            order=base.step_order,
         )
 
     def __repr__(self):
-        return f"jno.solve.adaptive(rtol={self.rtol}, atol={self.atol}, max_steps={self.max_steps}, dt0={self.dt0})"
+        base = "" if self.base is None else f"{self.base!r}."
+        return f"{base}adaptive(rtol={self.rtol}, atol={self.atol}, max_steps={self.max_steps}, dt0={self.dt0})"
+
+
+def _theta_order(theta: float) -> int:
+    """Classical order of the θ-step: the θ-method is O(dt²) **only** at θ=1/2 (Crank–Nicolson /
+    trapezoidal) and O(dt) everywhere else. The step-size controller needs this to pick its exponent
+    ``1/(p+1)``; getting it wrong does not break the march, it just sizes every step badly."""
+    return 2 if abs(float(theta) - 0.5) < 1e-12 else 1
 
 
 def _safe_interp(x, xp, fp):
@@ -103,12 +183,26 @@ def _safe_interp(x, xp, fp):
 
 
 def adaptive_march(
-    step_fn, u0, t0, t1, save_ts, *, rtol, atol, max_steps, dt0=None, safety=0.9, min_factor=0.2, max_factor=5.0
+    step_fn,
+    u0,
+    t0,
+    t1,
+    save_ts,
+    *,
+    rtol,
+    atol,
+    max_steps,
+    dt0=None,
+    order=1,
+    safety=0.9,
+    min_factor=0.2,
+    max_factor=5.0,
 ):
     """Adaptive step-size march via **step doubling** (Richardson error control), reverse-mode
     differentiable. ``step_fn(u, t, dt) -> u(t+dt)`` is one implicit step (the block's DAE-correct
     θ-step, or the complex 2n-block step). Each attempt compares a single full step with two half-steps;
-    the normalized RMS difference sizes the next dt (exponent ½ for a first-order method). The march is a
+    the normalized RMS difference sizes the next dt (exponent ``1/(order+1)`` — ½ for a first-order base
+    such as backward Euler, ⅓ for a second-order one such as trapezoidal / Crank–Nicolson). The march is a
     **fixed-length** ``lax.scan`` of ``max_steps`` — a static trip count, so the whole thing stays
     reverse-differentiable — where the settled / over-budget tail simply consumes an iteration without
     advancing ``t``. The trajectory is sampled at ``save_ts`` by interpolation; if the budget is exhausted
@@ -172,7 +266,10 @@ def adaptive_march(
         _t, _dt = jax.lax.stop_gradient(t), jax.lax.stop_gradient(dt_step)
         u_new, err = jax.lax.cond(done, lambda o: (o[0], jnp.asarray(0.0, rt)), _take, (u, _t, _dt))
         t_new = jnp.where(done, t, t + _dt)
-        fac = jnp.clip(safety * jnp.maximum(err, 1e-12) ** (-0.5), min_factor, max_factor)
+        # Exponent 1/(p+1) for a base method of order p — NOT a hardwired ½. A second-order base (θ=1/2,
+        # including the trapezoidal step the assembly picks for second-order systems) needs ⅓, or every
+        # step is mis-sized.
+        fac = jnp.clip(safety * jnp.maximum(err, 1e-12) ** (-1.0 / (int(order) + 1)), min_factor, max_factor)
         dt_next = jnp.clip(dt_ctrl * fac, dt_min, dt_max)
         return (t_new, u_new, dt_next), (t_new, u_new)
 
