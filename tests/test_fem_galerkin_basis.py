@@ -203,6 +203,73 @@ def test_basis_shape_and_orthonormality_guards():
         fem.solve(basis=U * 2.0)
     with pytest.raises(ValueError, match="ORTHONORMAL"):
         fem.solve(basis=jnp.asarray(np.random.default_rng(2).standard_normal((n, 3))))
+    with pytest.raises(ValueError, match="1 <= k"):
+        fem.solve(basis=jnp.zeros((n, 0)))
+
+
+def test_non_float_bases_are_refused():
+    """dtype guards, each for a reason the orthonormality check cannot catch.
+
+    An INTEGER basis sails through orthonormality (an identity slice is exactly orthonormal) and then
+    silently truncates the reduced solve to integers. A COMPLEX one is worse: the reduction here is
+    ``UᵀAU``, not the Hermitian ``UᴴAU``, so it is the wrong projection *and* it hands back a complex
+    field for a real problem — which is what it did before this guard."""
+    fem = _poisson(0.435)
+    n = fem.dofs
+    with pytest.raises(ValueError, match="real floating-point"):
+        fem.solve(basis=jnp.asarray(np.eye(n, 3, dtype=np.int32)))
+    with pytest.raises(ValueError, match="real floating-point|Hermitian"):
+        fem.solve(basis=jnp.asarray(np.asarray(_pod(4)).astype(np.complex128)))
+
+
+def test_non_finite_basis_is_refused():
+    """NaN/Inf in the basis must be caught at the door, not surface later as a NaN field."""
+    fem = _poisson(0.435)
+    for bad in (np.nan, np.inf):
+        U = np.asarray(_pod(4)).copy()
+        U[0, 0] = bad
+        with pytest.raises(ValueError, match="NaN or Inf"):
+            fem.solve(basis=jnp.asarray(U))
+
+
+def test_accepts_numpy_and_list_bases():
+    """A basis is a plain array, so the ordinary array-likes must work. A numpy basis used to CRASH:
+    the reduction sniffed BCOO with ``hasattr(x, "data")``, and a numpy array has ``.data`` too — a
+    memoryview, with no ``.dtype``."""
+    U = np.asarray(_pod(8))
+    ref = np.asarray(_poisson(0.435).solve()).reshape(-1)
+    assert _rel(_poisson(0.435).solve(basis=U), ref) < 1e-3  # numpy
+    assert _rel(_poisson(0.435).solve(basis=U.tolist()), ref) < 1e-3  # nested list
+
+
+def test_basis_residual_is_cleared_by_a_later_full_solve():
+    """Staleness guard. ``basis_residual`` left over from an earlier reduced solve would read as
+    'this answer was certified' on an answer that was never reduced at all."""
+    fem = _poisson(0.435)
+    fem.solve(basis=_pod(8))
+    assert fem.basis_residual is not None
+    fem.solve()  # a FULL solve on the same object
+    assert fem.basis_residual is None, "a full solve must not leave a stale certificate behind"
+
+
+def test_remeshing_slots_are_refused():
+    """``adapt=``/``move=`` rebuild or move the mesh, so the DOF count and layout the basis was built
+    against change underneath it — the basis would be silently meaningless, not merely inaccurate."""
+    fem = _poisson(0.435)
+    U = _pod(4)
+    with pytest.raises(NotImplementedError, match="adapt="):
+        fem.solve(basis=U, adapt={"max_iters": 1})
+    with pytest.raises(NotImplementedError, match="move="):
+        fem.solve(basis=U, move=object())
+
+
+def test_reduction_is_restored_even_when_the_solve_raises():
+    """The reduction is installed on the object for the duration of one call. If an exception escapes
+    mid-solve it must still come off, or every later solve on that object is silently reduced."""
+    fem = _poisson(0.435)
+    with pytest.raises(RuntimeError):
+        fem.solve(basis=_pod(8), solve_fn=lambda A, b: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert fem._periodic is None, "the reduction must be removed even on the exception path"
 
 
 def test_trainable_parameter_basis_is_refused_with_a_reason():

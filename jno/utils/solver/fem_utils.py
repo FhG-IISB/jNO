@@ -2545,9 +2545,9 @@ def reduce_matrix(P, mat, is_selection=None, conj=False):
         # Read the dtype OFF the object. ``np.asarray(x).dtype`` would materialise it, which throws
         # TracerArrayConversionError when ``P`` is traced -- and ``P`` IS traced whenever the basis is
         # differentiated through (``jax.grad`` w.r.t. a Galerkin/POD basis, the learned-basis case).
-        # Every array type in play here -- numpy, jnp, BCOO's ``.data``, and a tracer -- carries ``.dtype``.
-        if hasattr(x, "data"):  # BCOO
-            return x.data.dtype
+        # numpy, jnp, BCOO and tracers all carry ``.dtype`` directly, so no sniffing is needed. NB a
+        # ``hasattr(x, "data")`` test does NOT identify a BCOO: a numpy array has ``.data`` too (a
+        # memoryview, which has no ``.dtype``), so that route crashed on a plain numpy ``P``.
         return x.dtype if hasattr(x, "dtype") else np.asarray(x).dtype
 
     pdtype = np.result_type(_dt(P), _dt(mat))

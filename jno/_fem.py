@@ -1504,7 +1504,10 @@ class FEM:
         Profile a *concrete* forward solve; a parametric solve returns a deferred trace node with no numeric
         work to time.
         """
-        reduction = None if basis is None else self._basis_reduction(basis)
+        # Cleared on EVERY solve, not only a reduced one: a leftover value from an earlier
+        # ``basis=`` call would read as "this answer was certified" on an answer that never was.
+        self.basis_residual = None
+        reduction = None if basis is None else self._basis_reduction(basis, adapt=adapt, move=move)
 
         def _run():
             prev_periodic = self._periodic
@@ -1543,8 +1546,21 @@ class FEM:
     #: merely resolving it coarsely — which is the legitimate use of a reduced basis.
     BASIS_RESIDUAL_LIMIT = 0.1
 
-    def _basis_reduction(self, basis):
+    def _basis_reduction(self, basis, *, adapt=None, move=None):
         """Validate ``basis=`` against this problem and wrap it as a reduction dict."""
+        if adapt is not None or move is not None:
+            which = "adapt=" if adapt is not None else "move="
+            raise NotImplementedError(
+                f"jno.fem: fem.solve(basis=..., {which}...) is not supported — {which} rebuilds or moves "
+                "the mesh, so the DOF count and layout the basis was built against change underneath it. "
+                "The basis would then be silently meaningless. Adapt first, then build a basis on the "
+                "final mesh."
+            )
+        if self.dofs is None:
+            raise NotImplementedError(
+                f"jno.fem: fem.solve(basis=...) needs a known DOF count to validate the basis against, "
+                f"and this {self._mode} problem does not report one."
+            )
         if self._periodic is not None:
             raise NotImplementedError(
                 "jno.fem: fem.solve(basis=...) together with a periodic tie is not supported yet — both "
@@ -1574,10 +1590,11 @@ class FEM:
         full-size matvec — negligible against the full solve it replaces — and is a real certificate: it
         cannot prove the answer is good, but it does catch a basis that does not span the solution.
 
-        Only the concrete, non-parametric linear path is measurable; a parametric solve is a deferred
-        trace node with no values yet. The measured value is kept on ``self.basis_residual``.
+        Only the concrete, non-parametric linear path is measurable; a parametric or nonlinear solve is
+        a deferred trace node with no values yet, so ``basis_residual`` stays ``None`` there and the
+        span check does NOT run — a real hole in the guarantee, stated here rather than papered over.
+        The measured value is kept on ``self.basis_residual`` (cleared at the top of every solve).
         """
-        self.basis_residual = None
         if self._mode != "linear" or isinstance(self._op, FemLinearSystem):
             return
         uc = _concrete(u)
@@ -2579,10 +2596,13 @@ def _concrete(x):
     """``np.asarray(x)`` if ``x`` carries values, else ``None`` (it is a JAX tracer).
 
     Used to run the *checkable* basis validation only when there is something to check — under
-    ``jax.grad``/``jit`` w.r.t. the basis there are no values, and forcing them would raise."""
+    ``jax.grad``/``jit`` w.r.t. the basis there are no values, and forcing them would raise. The
+    two tracer errors are caught by NAME rather than with a bare ``except``: anything else going
+    wrong here (a ragged array, a bad dtype) is a real problem and must not be swallowed into a
+    silent "skip the validation"."""
     try:
         return np.asarray(x)
-    except Exception:
+    except (jax.errors.TracerArrayConversionError, jax.errors.ConcretizationTypeError):
         return None
 
 
@@ -2607,7 +2627,7 @@ def _galerkin_reduction(basis: Any, n_dofs: int, *, ortho_tol: float = 1e-8) -> 
             "jno.nn.wrap is a trace node, and threading it as a runtime parameter is not wired yet. "
             "A basis differentiated through jax.grad/jit DOES work -- pass the array itself."
         )
-    U = basis if hasattr(basis, "ndim") else jnp.asarray(basis)
+    U = jnp.asarray(basis)  # normalise numpy / list / jnp up front; a tracer passes through unchanged
     if U.ndim != 2:
         raise ValueError(f"jno.fem: fem.solve(basis=U) needs a 2-D (n_dofs, k) basis; got shape {tuple(U.shape)}.")
     n, k = int(U.shape[0]), int(U.shape[1])
@@ -2620,9 +2640,25 @@ def _galerkin_reduction(basis: Any, n_dofs: int, *, ortho_tol: float = 1e-8) -> 
         )
     if not 1 <= k <= n:
         raise ValueError(f"jno.fem: the basis must have 1 <= k <= n_dofs columns; got k={k} against {n} DOFs.")
+    if not jnp.issubdtype(U.dtype, jnp.floating):
+        # An INTEGER basis passes the orthonormality check (an identity slice is exactly orthonormal)
+        # and then silently truncates the reduced solve to integers. A COMPLEX basis is worse: the
+        # reduction here is ``UᵀAU``, not the Hermitian ``UᴴAU``, so it is the wrong projection AND it
+        # returns a complex field for a real problem. Neither may pass quietly.
+        raise ValueError(
+            f"jno.fem: fem.solve(basis=U) needs a real floating-point basis; got dtype {U.dtype}. "
+            "A complex basis would need the Hermitian reduction UᴴAU (not wired), and an integer one "
+            "silently truncates the reduced solve."
+        )
 
     Uc = _concrete(U)
-    if Uc is not None:  # orthonormality is checkable only when the basis carries values
+    if Uc is not None:  # these are checkable only when the basis carries values (not under trace)
+        if not np.all(np.isfinite(Uc)):
+            raise ValueError(
+                "jno.fem: fem.solve(basis=U) got a basis containing NaN or Inf. A non-finite column "
+                "poisons the whole reduced system, so it is refused here rather than surfacing later as "
+                "a NaN solution."
+            )
         gram = Uc.T @ Uc
         off = float(np.max(np.abs(gram - np.eye(k))))
         if not np.isfinite(off) or off > ortho_tol:
