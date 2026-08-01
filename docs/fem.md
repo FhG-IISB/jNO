@@ -725,11 +725,22 @@ each implicit step of a nonlinear block. Second-order-in-time (`u_tt`) flows thr
 block. Each step warm-starts from the previous state (so `x0=` is rejected); `lu()` inside the time loop
 re-factorizes per step.
 
-A **complex transient** is assembled as one real `2n` block over the stacked `[Re; Im]` state, so it is an
-ordinary transient block: the slots configure its per-step solve exactly as above, and every `jno.solve`
-time scheme (`theta`, `adaptive`, `exponential`) applies. Not yet supported (clear errors): slots on a
-**steady complex** problem, and `adapt=` on a complex transient (the cross-remesh state transfer is not
-complex-aware yet).
+**Complex problems** are assembled as one real `2n` system over the stacked `[Re; Im]` state — the
+real-equivalent block `[[A_r, -A_i], [A_i, A_r]]` — at assembly rather than at solve time. A complex
+transient is therefore an ordinary transient block (the slots configure its per-step solve as above, and
+`theta` / `adaptive` / `exponential` all apply), and a complex steady problem is an ordinary linear
+system: the `linear` / `precond` slots and `x0=` work on it, with a **complex** `x0` mapped into the
+block layout for you. Its default solver stays **sparse-direct**, not the matrix-free BiCGStab real
+elliptic systems get — the real-equivalent block is indefinite for Helmholtz/PML, where Jacobi-BiCGStab
+does not converge.
+
+Two exceptions keep a dedicated path. A **complex-native** preconditioner (`ams`) solves `A_r + i·A_i`
+directly rather than the block, so the Re/Im legs are retained for it. And a **Bloch** (quasi-periodic)
+tie has a *complex* prolongation `P`, which does not split into two real legs — that case still solves
+through its own complex block routine, and `x0=` on it is rejected.
+
+Not yet supported (clear errors): `adapt=` on a complex transient (the cross-remesh state transfer is
+not complex-aware yet).
 
 ### Field parameters `k(x)` + regularization
 

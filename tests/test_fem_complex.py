@@ -141,6 +141,54 @@ def test_complex_transient_recovers_mode_and_conserves_schrodinger_norm():
     assert 0.97 < ratio < 1.01, f"Schrodinger norm not conserved: |psi(t1)|/|psi(0)| {ratio:.4f}"
 
 
+def _manufactured_complex_fem(mesh_size=0.1):
+    """The all-Neumann manufactured complex Helmholtz of the first test, as a reusable fixture."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=mesh_size)
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    c, d_coef, amp = 1.0 / (1.0 + 1j * 0.5), -(1.0 + 0.2j), 1.0 + 0.5j
+    g = jno.np.cos(PI * xi) * jno.np.cos(PI * yi)
+    f = (2 * PI**2 * c + d_coef) * amp * g
+    return jno.fem([c * (ui.x * vi.x + ui.y * vi.y) + d_coef * (u * vi) - f * vi])
+
+
+def test_steady_complex_is_one_fused_real_block():
+    """A steady complex form is assembled as ONE real ``2n`` system ``[[A_r,-A_i],[A_i,A_r]]`` over
+    ``x=[x_r; x_i]``, not as a pair of legs welded together at solve time — so it is an ordinary
+    ``"linear"`` FEM and every real-linear facility applies to it unchanged. The unfused legs stay
+    reachable for a complex-native preconditioner (AMS), which wants ``A_r + i·A_i`` instead."""
+    fem = _manufactured_complex_fem()
+    n = int(np.asarray(fem.points).shape[0])
+    assert fem.is_complex and fem._mode == "linear", "a fused complex problem is an ordinary linear one"
+    assert fem._complex_n == n
+    A, b = fem._op
+    assert A.shape == (2 * n, 2 * n) and b.shape == (2 * n,), f"expected the 2n block, got {A.shape}"
+    assert hasattr(A, "indices"), "the fused block must stay sparse (BCOO)"
+    assert not np.iscomplexobj(np.asarray(A.data)), "the real-equivalent block must be real"
+    assert fem._complex_legs is not None and len(fem._complex_legs) == 2
+    # and it still returns an n-vector complex solution, not the 2n internal layout
+    u = np.asarray(fem.solve())
+    assert u.shape == (n,) and np.iscomplexobj(u)
+
+
+def test_steady_complex_accepts_a_warm_start():
+    """``x0=`` on a complex problem was refused outright ("the solve runs on the real-equivalent block,
+    an internal layout"). With the block built at assembly the guess is just a vector in that layout, so
+    a **complex** x0 is accepted and mapped to ``[Re; Im]`` — and warm-starting from the answer must
+    reproduce the answer."""
+    fem = _manufactured_complex_fem()
+    u_ref = np.asarray(fem.solve())
+
+    warm = np.asarray(_manufactured_complex_fem().solve(linear=jno.solve.gmres(tol=1e-12), x0=u_ref))
+    assert np.iscomplexobj(warm) and warm.shape == u_ref.shape
+    assert float(np.linalg.norm(warm - u_ref) / np.linalg.norm(u_ref)) < 1e-8, "warm start changed the solution"
+
+    # a cold zero guess reaches the same solution (x0 must be a guess, never a constraint)
+    cold = np.asarray(_manufactured_complex_fem().solve(linear=jno.solve.gmres(tol=1e-12), x0=np.zeros_like(u_ref)))
+    assert float(np.linalg.norm(cold - u_ref) / np.linalg.norm(u_ref)) < 1e-6
+
+
 def test_complex_transient_save_ts_interpolates_every_frame():
     """CHARACTERIZATION — the ``save_ts`` contract on a complex transient, pinned frame by frame.
 

@@ -63,12 +63,22 @@ def _complex_fem(kappa, mesh_size=0.08):
 
 
 def test_complex_parametric_yields_parametric_legs_and_node():
-    """A real parameter in a complex form -> at least the real-coefficient leg is a parametric
-    FemLinearSystem (the assembler registers κ on whichever Re/Im legs reference it) and solve() is a
-    trace node, not an array -- so the parameter can flow to crux."""
+    """A real parameter in a complex form: the Re/Im legs are fused into ONE parametric
+    ``FemLinearSystem`` over the real-equivalent 2n block, which carries κ and re-forms ``A(κ), b(κ)``
+    per call — so ``solve()`` is a trace node, not an array, and the parameter can flow to crux.
+
+    The unfused legs stay reachable on ``_complex_legs``, because a complex-native preconditioner (AMS)
+    solves ``A_r + i·A_i`` rather than the block; the assembler registers κ on whichever legs reference
+    it (here the real one — κ scales the diffusion)."""
     fem = _complex_fem(_kappa(start=1.0))
     assert fem.is_complex
-    op_r, _op_i = fem._op
+    fused = fem._op
+    assert isinstance(fused, FemLinearSystem) and fused.is_parametric, "the fused 2n system must carry κ"
+    assert list(fused.runtime_parameter_exprs) == ["kappa"]
+    n = int(np.asarray(fem.points).shape[0])
+    assert fused.A.shape == (2 * n, 2 * n), f"expected the real-equivalent 2n block, got {fused.A.shape}"
+
+    op_r, _op_i = fem._complex_legs  # retained for the complex-native (AMS) path
     assert isinstance(op_r, FemLinearSystem) and op_r.is_parametric, "the real leg must carry κ"
     assert list(op_r.runtime_parameter_exprs) == ["kappa"]
     assert not isinstance(fem.solve(), jax.Array), "a parametric complex solve must be a trace node"
