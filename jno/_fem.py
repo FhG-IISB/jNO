@@ -1285,6 +1285,9 @@ class FEM:
         self.mesh = getattr(domain, "mesh", None)
         self.problem = getattr(domain, "_fem_problem", None)
         self._periodic = None  # periodic-tie reduction (prolongation P), attached by fem()
+        #: relative residual of the full system after the most recent ``solve(basis=...)`` — ``None``
+        #: for a full solve, or when the reduced one was traced/parametric (nothing concrete to measure).
+        self.basis_residual = None
         self._offsets = offsets  # per-field block offsets for the native non-nodal path (else problem.offset)
         self._term_source = None  # (domain, volume_terms); attached by fem() for the provisional term_kinds accessor
         self._constraints = None  # original constraint list; attached by fem() for the adaptive driver
@@ -1391,6 +1394,7 @@ class FEM:
         linear=None,
         precond=None,
         time=None,
+        basis=None,
         profile=False,
         **kwargs,
     ) -> Any:
@@ -1475,24 +1479,53 @@ class FEM:
         complex/complex-transient problems, and slots combined with ``adapt=`` (remeshing
         invalidates warm starts and cached preconditioner setups — pass ``solve_fn=`` there).
 
+        ``basis=U`` solves in the span of an ``(n_dofs, k)`` **Galerkin basis** instead of the full space:
+        the reduced system ``UᵀA U x = Uᵀb`` is ``k×k``, and the answer is lifted back to ``u = U x`` so
+        nothing downstream changes. This is the reduced-order-model (POD) entry — build ``U`` from a few
+        full solves with :func:`jno.solve.svd`, then every later solve in the family costs ``k`` unknowns::
+
+            snapshots = jnp.stack([build(p).solve() for p in sweep])   # (n_snapshots, n_dofs)
+            _, s, Vt  = jno.solve.svd(snapshots, k=10)
+            u = build(p_new).solve(basis=Vt.T)                         # 10 unknowns, full field back
+
+        Unlike every other way of solving here, this returns an **approximation**, so the relative residual
+        of the FULL system at the lifted solution is measured (one matvec) and a basis that does not span
+        the solution fails loud rather than returning a plausible wrong field — the measured value stays on
+        ``fem.basis_residual``, and ``fem.BASIS_RESIDUAL_LIMIT`` relaxes the bar for deliberately coarse
+        work. ``U`` must be orthonormal. It composes with ``linear=``/``precond=`` (which see the reduced
+        operator) and is differentiable in the basis itself under ``jax.grad`` — the learned-subspace path.
+        Steady only (linear and nonlinear); transient, complex and periodic-tied problems refuse with a
+        reason. A reduced NONLINEAR solve returns a deferred trace node, as a periodic one does. Nonlinear
+        reduction is a memory win, not a speed one: the full-order residual is still evaluated per Newton
+        step (no hyper-reduction).
+
         ``profile=True`` runs the (eager, non-parametric) solve inside a JAX Perfetto trace, prints the DOF
         count + wall time, and writes the trace to ``./jno_traces`` — like ``jno.core.solve(profile=True)``.
         Profile a *concrete* forward solve; a parametric solve returns a deferred trace node with no numeric
         work to time.
         """
+        reduction = None if basis is None else self._basis_reduction(basis)
 
         def _run():
-            result = self._solve_dispatch(
-                solve_fn,
-                adapt=adapt,
-                move=move,
-                x0=x0,
-                nonlinear=nonlinear,
-                linear=linear,
-                precond=precond,
-                time=time,
-                **kwargs,
-            )
+            prev_periodic = self._periodic
+            if reduction is not None:
+                self._periodic = reduction
+            try:
+                result = self._solve_dispatch(
+                    solve_fn,
+                    adapt=adapt,
+                    move=move,
+                    x0=x0,
+                    nonlinear=nonlinear,
+                    linear=linear,
+                    precond=precond,
+                    time=time,
+                    **kwargs,
+                )
+            finally:
+                self._periodic = prev_periodic  # the basis is per-CALL; never sticks to the object
+            if reduction is not None:
+                self._check_basis_residual(result, reduction)
             if isinstance(result, Placeholder):
                 # Tag the solve node with its domain so jno.core can infer the domain straight from the graph
                 # (a data-misfit inverse `jno.core([(fem.solve() - u_obs).mse])` needs no explicit `domain=`).
@@ -1504,6 +1537,68 @@ class FEM:
         from .utils.profiling import profile_solve
 
         return profile_solve(_run, label=f"fem profile · {self.dofs} DOFs · {self._mode}", warm=(adapt is None))
+
+    #: relative residual of the FULL system above which a ``basis=`` solve is refused. Not a tuning
+    #: knob: at this size the basis does not span the solution at all (a modelling error), rather than
+    #: merely resolving it coarsely — which is the legitimate use of a reduced basis.
+    BASIS_RESIDUAL_LIMIT = 0.1
+
+    def _basis_reduction(self, basis):
+        """Validate ``basis=`` against this problem and wrap it as a reduction dict."""
+        if self._periodic is not None:
+            raise NotImplementedError(
+                "jno.fem: fem.solve(basis=...) together with a periodic tie is not supported yet — both "
+                "reduce the system by a prolongation, and composing the two needs a decided convention "
+                "for which space the basis is expressed in (full, or already periodic-reduced). Build the "
+                "basis from snapshots of the untied problem, or drop the tie."
+            )
+        if self._mode in ("complex", "complex_transient"):
+            raise NotImplementedError(
+                f"jno.fem: fem.solve(basis=...) is not wired for a {self._mode} problem — a complex form "
+                "solves through the real-equivalent 2n block, so the basis would have to be expressed in "
+                "that internal layout. Real steady problems (linear and nonlinear) are supported."
+            )
+        if self._mode == "transient":
+            raise NotImplementedError(
+                "jno.fem: fem.solve(basis=...) is not wired for a transient problem yet — the time block "
+                "is reduced eagerly at assembly (PᵀMP, PᵀAP, restricted state0), so a basis arriving at "
+                "solve time has to re-reduce it. Steady (linear and nonlinear) is supported."
+            )
+        return _galerkin_reduction(basis, self.dofs)
+
+    def _check_basis_residual(self, u, reduction):
+        """Measure how well the reduced answer satisfies the FULL system, and refuse a hopeless basis.
+
+        A reduced solve is the ONE path here that returns an approximation rather than the answer, which
+        cuts against the rest of the stack. ``‖A u − b‖/‖b‖`` at the lifted ``u`` costs a single
+        full-size matvec — negligible against the full solve it replaces — and is a real certificate: it
+        cannot prove the answer is good, but it does catch a basis that does not span the solution.
+
+        Only the concrete, non-parametric linear path is measurable; a parametric solve is a deferred
+        trace node with no values yet. The measured value is kept on ``self.basis_residual``.
+        """
+        self.basis_residual = None
+        if self._mode != "linear" or isinstance(self._op, FemLinearSystem):
+            return
+        uc = _concrete(u)
+        if uc is None:
+            return  # traced (jax.grad/jit through the basis) — nothing to check yet
+        A, b = self._op
+        b = jnp.asarray(b).reshape(-1)
+        r = _concrete(jnp.asarray(A @ jnp.asarray(uc, b.dtype)).reshape(-1) - b)
+        nb = float(np.linalg.norm(np.asarray(b)))
+        rel = float(np.linalg.norm(r)) / (nb if nb > 0 else 1.0)
+        self.basis_residual = rel
+        if not np.isfinite(rel) or rel > self.BASIS_RESIDUAL_LIMIT:
+            k = int(np.asarray(reduction["P"]).shape[1])
+            raise ValueError(
+                f"jno.fem: the reduced solve does not satisfy the full system (relative residual "
+                f"{rel:.3e} > {self.BASIS_RESIDUAL_LIMIT:g}) — this {k}-column basis does not span the "
+                "solution, so the returned field would be plausible and wrong. Add modes, or include this "
+                "parameter's regime in the snapshots the basis was built from. The measured value is on "
+                "`fem.basis_residual`; deliberately coarse work (a rank sweep, a rough design pass) can "
+                "raise the bar with `fem.BASIS_RESIDUAL_LIMIT = ...`."
+            )
 
     def _solve_dispatch(
         self,
@@ -2478,6 +2573,66 @@ def _reduce_transient_block_periodic(block: Any, periodic: dict) -> Any:
         prolongation=prol,
         metadata=meta,
     )
+
+
+def _concrete(x):
+    """``np.asarray(x)`` if ``x`` carries values, else ``None`` (it is a JAX tracer).
+
+    Used to run the *checkable* basis validation only when there is something to check — under
+    ``jax.grad``/``jit`` w.r.t. the basis there are no values, and forcing them would raise."""
+    try:
+        return np.asarray(x)
+    except Exception:
+        return None
+
+
+def _galerkin_reduction(basis: Any, n_dofs: int, *, ortho_tol: float = 1e-8) -> dict:
+    """Wrap a user-supplied Galerkin basis ``U`` as a reduction dict, in the SAME shape the periodic
+    tie machinery already consumes -- ``{"P", "kept_nodes", "vec", "is_selection"}``.
+
+    That is the whole trick behind ``fem.solve(basis=U)``: a periodic prolongation and a reduced-order
+    basis are the same object (a tall ``n_full x k`` map defining ``P^T A P`` / ``P^T b`` / ``u = P x``),
+    so the reduction, the per-mode combinator and the multifield block handling are reused verbatim.
+
+    Two things differ from a periodic ``P`` and are recorded here:
+
+    * ``kept_nodes=None`` -- the columns are not a subset of the full DOFs, so a state is restricted by
+      PROJECTION (``P^T u``) rather than by gathering. See :func:`restrict_state`.
+    * ``is_selection=False`` -- passed explicitly rather than sniffed, both because a dense basis never
+      is one and because sniffing inspects values, which fails when the basis is traced.
+    """
+    if isinstance(basis, (Placeholder, ModelCall)):
+        raise NotImplementedError(
+            "jno.fem: fem.solve(basis=...) takes a concrete array. A basis built from jno.np.parameter / "
+            "jno.nn.wrap is a trace node, and threading it as a runtime parameter is not wired yet. "
+            "A basis differentiated through jax.grad/jit DOES work -- pass the array itself."
+        )
+    U = basis if hasattr(basis, "ndim") else jnp.asarray(basis)
+    if U.ndim != 2:
+        raise ValueError(f"jno.fem: fem.solve(basis=U) needs a 2-D (n_dofs, k) basis; got shape {tuple(U.shape)}.")
+    n, k = int(U.shape[0]), int(U.shape[1])
+    if n != int(n_dofs):
+        raise ValueError(
+            f"jno.fem: the basis has {n} rows but this problem has {n_dofs} DOFs. Its COLUMNS are the modes "
+            f"(shape (n_dofs, k)) -- a snapshot matrix is usually (n_snapshots, n_dofs), so it needs "
+            "transposing. Note jno.solve.svd(snapshots, k) returns the spatial modes as `Vt.T` for a "
+            "(n_snapshots, n_dofs) input, and as `U` for the transpose."
+        )
+    if not 1 <= k <= n:
+        raise ValueError(f"jno.fem: the basis must have 1 <= k <= n_dofs columns; got k={k} against {n} DOFs.")
+
+    Uc = _concrete(U)
+    if Uc is not None:  # orthonormality is checkable only when the basis carries values
+        gram = Uc.T @ Uc
+        off = float(np.max(np.abs(gram - np.eye(k))))
+        if not np.isfinite(off) or off > ortho_tol:
+            raise ValueError(
+                f"jno.fem: fem.solve(basis=U) needs an ORTHONORMAL basis (max|UᵀU - I| = {off:.2e}). A "
+                "non-orthonormal basis is still a valid Galerkin projection, but restricting an initial "
+                "state would then need (UᵀU)⁻¹ and would be silently wrong here. Orthonormalise it "
+                "(np.linalg.qr(U)[0], or take it straight from jno.solve.svd, whose factors already are)."
+            )
+    return {"P": U, "kept_nodes": None, "vec": 1, "is_selection": False}
 
 
 def reduce_op_periodic(op: Any, mode: str, periodic: dict) -> Any:

@@ -2540,7 +2540,16 @@ def reduce_matrix(P, mat, is_selection=None, conj=False):
     ``None`` (a direct/eager call) it is computed once here."""
     if is_selection is None:
         is_selection = _is_selection(P)
-    _dt = lambda x: x.data.dtype if hasattr(x, "data") else np.asarray(x).dtype  # noqa: E731
+
+    def _dt(x):
+        # Read the dtype OFF the object. ``np.asarray(x).dtype`` would materialise it, which throws
+        # TracerArrayConversionError when ``P`` is traced -- and ``P`` IS traced whenever the basis is
+        # differentiated through (``jax.grad`` w.r.t. a Galerkin/POD basis, the learned-basis case).
+        # Every array type in play here -- numpy, jnp, BCOO's ``.data``, and a tracer -- carries ``.dtype``.
+        if hasattr(x, "data"):  # BCOO
+            return x.data.dtype
+        return x.dtype if hasattr(x, "dtype") else np.asarray(x).dtype
+
     pdtype = np.result_type(_dt(P), _dt(mat))
     if hasattr(mat, "indices") and is_selection:
         master, pval = _selection_maps(P, pdtype)
@@ -2574,8 +2583,16 @@ def restrict_state(P, state_full, kept_nodes, vec: int = 1):
     For a consistent periodic initial condition (matching values on opposite
     faces) gathering the kept-node entries is exact and avoids the doubling
     that ``P^T`` would introduce on master nodes.
+
+    ``kept_nodes=None`` means ``P`` is a **Galerkin basis** (``fem.solve(basis=...)``) rather than a
+    master/slave selection: its columns are not a subset of the full DOFs, so there is nothing to
+    gather and the restriction is the projection ``P^T state``. For an orthonormal ``P`` that is the
+    best approximation of the state within the span, which is exactly what the reduced solve wants.
     """
     state_full = jnp.asarray(state_full).reshape(-1)
+    if kept_nodes is None:
+        Pd = P if hasattr(P, "todense") else jnp.asarray(P)
+        return Pd.T @ jnp.asarray(state_full, Pd.dtype)
     kept = np.asarray(kept_nodes, dtype=int)
     if vec == 1:
         return state_full[jnp.asarray(kept)]
