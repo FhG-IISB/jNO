@@ -32,14 +32,19 @@ def _heat(coef, size=0.4, steps=3):
 
 
 def test_eval_matches_explicit_core():
-    """The sugar returns exactly what `jno.core([node]).eval(node)` returns."""
+    """The sugar returns what `jno.core([node]).eval(node)` returns.
+
+    Tight tolerance, not bitwise. The sugar and the explicit form build the core slightly
+    differently, and XLA may reassociate the two graphs differently — on GPU it does, by ~1e-16
+    absolute on entries that are themselves ~1e-15 (i.e. numerically zero). Asserting `rtol=0,
+    atol=0` made this a test of XLA's arithmetic ordering rather than of the sugar."""
     d, fem = _heat(1.0)
     sol = fem.solve()
     np.testing.assert_allclose(
         np.asarray(sol.eval()),
         np.asarray(jno.core([sol], domain=d).eval(sol)),
-        rtol=0,
-        atol=0,
+        rtol=1e-12,
+        atol=1e-12,
     )
 
 
