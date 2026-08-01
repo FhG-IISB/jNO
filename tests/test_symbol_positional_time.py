@@ -47,8 +47,15 @@ def _periodic_transient(splat: bool):
 
 
 def test_positional_time_is_dropped_not_bound_to_z():
-    """`u(*c)` (x, y, t) must equal `u(x, y)` — the time coordinate carries no spatial axis."""
-    np.testing.assert_array_equal(_periodic_transient(splat=True), _periodic_transient(splat=False))
+    """`u(*c)` (x, y, t) must equal `u(x, y)` — the time coordinate carries no spatial axis.
+
+    Compared to a tight tolerance rather than bitwise. The two spellings build slightly different
+    graphs, and XLA is free to reassociate them differently — on GPU it does, giving ~1 ULP (rel
+    6e-16) on the output of this NONLINEAR, time-stepped solve, where Newton iterations amplify a
+    last-bit difference in the assembly. That is not the failure this test guards: binding ``t`` to
+    the ``z`` axis changes which coordinate the trace reads, which is a gross difference (and broke
+    the periodic-tie parser outright — see the test below), never a last-bit one."""
+    np.testing.assert_allclose(_periodic_transient(splat=True), _periodic_transient(splat=False), rtol=1e-12, atol=1e-12)
 
 
 def test_positional_time_does_not_break_periodic_ties():
@@ -75,4 +82,7 @@ def test_third_positional_coord_still_binds_z_in_3d():
 
     assert splatted.size > 0 and np.isfinite(splatted).all()
     assert splatted.max() > 0.0  # non-trivial solution => the z trace really bound
-    np.testing.assert_array_equal(explicit, splatted)
+    # tight, not bitwise -- see the note on the 2-D case above: the two spellings build slightly
+    # different graphs and XLA reassociates them differently on GPU (~1 ULP). Dropping z instead of t
+    # would change which face is constrained, which is a gross difference, not a last-bit one.
+    np.testing.assert_allclose(explicit, splatted, rtol=1e-12, atol=1e-12)
