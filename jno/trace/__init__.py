@@ -3655,7 +3655,12 @@ class PrevStateField(FrozenField):
 
         # values are a placeholder: the real per-step nodal slice is delivered on args["__loadpath__"]
         # (this field is registered in the assembler's load-path connectivity, not the compile-time gather).
-        super().__init__(source, _jnp.zeros(1))
+        # It must still be RESHAPABLE by the parent, which lays a vector field out as (-1, n_components):
+        # a flat ``zeros(1)`` cannot become (-1, 2), so a vector nonlinear mass died at construction.
+        _nc = 1
+        for _s in tuple(getattr(source, "value_shape", ()) or ()):
+            _nc *= int(_s)
+        super().__init__(source, _jnp.zeros(max(1, _nc)))
         self.name = f"prev[{getattr(source, 'name', 'u')}]"
 
     def __repr__(self):
