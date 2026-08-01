@@ -307,3 +307,36 @@ def test_morley_periodic_rejects_argyris_and_nonconforming():
                 u(xt, yt) - u(xb, yb),  # periodic-y on Argyris -> must raise, not silently mis-tie
             ]
         )
+
+
+def test_morley_periodic_rejects_a_bloch_phase():
+    """A Bloch / quasi-periodic tie ``u(A) - c*u(B)`` must refuse on Morley rather than drop the phase.
+
+    The C¹ prolongation carries REAL edge-normal orientation signs; a complex phase needs a complex
+    prolongation (``P^H A P`` mixes Re and Im). The nodal Lagrange and N1E builders both read the phase off
+    the tie spec, so this element is the odd one out and has to say so.
+
+    This also pins the tie-spec ARITY. The spec is ``(master, slave, comp, field_key, phase)`` and this
+    builder used to unpack exactly four, so appending the Bloch phase broke *every* periodic Morley
+    problem with ``ValueError: too many values to unpack (expected 4)`` — a plain-periodic tie included.
+    The two convergence tests above are the regression for that; this one covers the phase itself."""
+    sin = jno.np.sin
+    d = jno.domain.equi_distant_rect(x_range=(0.0, 1.0), y_range=(0.0, 1.0), nx=6, ny=6)
+    xi, yi, _ = d.variable("interior", split=True)
+    xl, yl, _ = d.variable("left", split=True)
+    xr, yr, _ = d.variable("right", split=True)
+    xt, yt, _ = d.variable("top", split=True)
+    xb, yb, _ = d.variable("bottom", split=True)
+    u, phi = d.fem_symbols(space="Morley")
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    f = 25 * PI**4 * sin(PI * xi) * sin(2 * PI * yi)
+    Hu, Hv = jno.np.hessian(ui, [xi, yi]), jno.np.hessian(vi, [xi, yi])
+    with pytest.raises(NotImplementedError, match="Bloch|quasi-periodic"):
+        jno.fem(
+            [
+                jno.np.inner(Hu, Hv, n_contract=2) - f * vi,
+                u(xl, yl) - sin(PI * xl) * sin(2 * PI * yl),
+                u(xr, yr) - sin(PI * xr) * sin(2 * PI * yr),
+                u(xt, yt) - 0.5 * u(xb, yb),  # quasi-periodic phase c=0.5 -> refuse, never silently drop
+            ]
+        )
