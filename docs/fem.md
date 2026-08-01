@@ -47,8 +47,10 @@ u_h = fem.solve()          # matrix-free default; slots pick anything else (see 
   4.7e-5 against 2.4e-7. Higher orders, and P2 on a *coupled* 1D system, are not wired (clear errors).
   A `jno.np.parameter` coefficient (scalar or nodal field) also works on a **steady linear** 1D form, so
   a 1D differentiable inverse problem runs through `crux.solve` — as does a **neural** (`jno.nn.wrap`)
-  coefficient, so a learned `k(x)` can be trained from 1D data. Not wired in 1D: a parameter or network
-  in a *nonlinear* or *transient* form, and either on a *coupled* system.
+  coefficient, so a learned `k(x)` can be trained from 1D data. Transient too — recovering a diffusivity
+  from a 1D time series works — except that the transient **mass** must be parameter-free (it is
+  assembled once, so a parameter there would be silently frozen; it fails loud). Not wired in 1D: a
+  parameter or network in a *nonlinear* form, or on a *coupled* system.
 * **Quadrature coordinates** — `d.variable("interior", split=True)` returns the volume
   coordinates; `d.variable("<edge>", split=True)` returns a boundary edge's coordinates. A
   `Shape.rect` auto-tags `"left"`, `"right"`, `"bottom"`, `"top"` (and `"front"`/`"back"` for a box);

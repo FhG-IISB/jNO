@@ -37,7 +37,10 @@ linear** 1D form is parametric and differentiable in the parameter — a 1D inve
 path by a different route: a weight pytree is cell-independent, so a network never enters
 ``volume_vars`` — the kernel re-evaluates it at the quad points from ``local["neural_coefficients"]``
 while its weights arrive in ``args`` as a ``ModelWeights`` slot, which is what makes ∂solve/∂weights
-flow. Not wired: a parameter or network in a nonlinear or transient 1D form.
+flow. Both work on the **transient** path too (the operator and load re-form per step, so a 1D
+time-series inverse trains), with one rule enforced: the transient MASS must be parameter-free, since
+it is assembled once and a parameter there would be silently frozen. Not wired: a parameter or network
+in a *nonlinear* 1D form, or on a coupled system.
 
 Scope: scalar unknown (``vec == 1``), order 1 or 2, single field (the coupled block assembler is
 P1 only). Boundary terms must
@@ -153,6 +156,30 @@ def _integrate_term(domain: Any, expr: Any, local: dict, weights: jnp.ndarray) -
     val = _eval_integrand(domain, expr, local)
     wshape = (weights.shape[0],) + (1,) * (val.ndim - 1)
     return ravel_pytree(jnp.sum(val * weights.reshape(wshape), axis=0))[0]
+
+
+def _param_context(volume_terms, boundary_terms):
+    """``(tags, field_names, neural_slots, operator_exprs)`` for a 1D form.
+
+    One collector for the steady and transient paths, using the same helpers as the 2D/3D and
+    non-nodal assemblers so a parameter behaves identically across dimensions. ``operator_exprs`` is
+    what the resulting ``FemLinearSystem`` / ``SemidiscreteTimeBlock`` carries: the scalar/field
+    parameters plus any network's ``ModelWeights`` slot. Networks stay OUT of ``tags`` — a weight
+    pytree is cell-independent, so it never enters the per-cell ``volume_vars``."""
+    from .parametric_helpers import (
+        _collect_runtime_parameter_exprs,
+        _is_fem_field_parameter,
+        collect_neural_slots,
+        neural_operator_exprs,
+    )
+
+    exprs: Dict[str, Any] = {}
+    for bare in list(volume_terms) + [t for ts in (boundary_terms or {}).values() for t in ts]:
+        _collect_runtime_parameter_exprs(bare, exprs)
+    tags: Tuple[str, ...] = tuple(sorted(exprs))
+    fields = frozenset(n for n, e in exprs.items() if _is_fem_field_parameter(e))
+    slots = collect_neural_slots(volume_terms, boundary_terms, runtime_parameter_tags=tags)
+    return tags, fields, slots, neural_operator_exprs(exprs, slots)
 
 
 def dof_layout_1d(domain: Any, order: int):
@@ -431,7 +458,6 @@ def assemble_fem_1d(
     :class:`FemResidualOperator`), or ``"transient"`` (``op`` a ``SemidiscreteTimeBlock``).
     """
     from ...trace import FemLinearSystem, FemResidualOperator
-    from .parametric_helpers import _collect_runtime_parameter_exprs, _is_fem_field_parameter
     from .weak_form import _contains_temporal_derivative, _is_obviously_nonlinear_in_unknown
 
     if int(vec) != 1:
@@ -442,11 +468,9 @@ def assemble_fem_1d(
     # and stay differentiable in them, so `crux.solve` can recover the parameter from data. Collected
     # with the same helpers the 2D/3D and non-nodal assemblers use, so scalar and nodal-field
     # parameters behave identically across dimensions. ----
-    _rt_param_exprs: Dict[str, Any] = {}
-    for _bare_t in list(volume_terms) + [t for ts in boundary_terms.values() for t in ts]:
-        _collect_runtime_parameter_exprs(_bare_t, _rt_param_exprs)
-    runtime_parameter_tags: Tuple[str, ...] = tuple(sorted(_rt_param_exprs))
-    field_param_names = frozenset(n for n, e in _rt_param_exprs.items() if _is_fem_field_parameter(e))
+    runtime_parameter_tags, field_param_names, _neural, _param_and_neural_exprs = _param_context(
+        volume_terms, boundary_terms
+    )
 
     # Neural coefficients (``jno.nn.wrap(net)`` inside the weak form). They deliberately stay OUT of
     # ``runtime_parameter_tags``: a weight pytree is cell-independent, so unlike a scalar/field
@@ -454,10 +478,6 @@ def assemble_fem_1d(
     # quad points from the ``{name: module}`` table instead. Its weights still ride ``args`` as a
     # ``ModelWeights`` slot, which is what makes ∂solve/∂weights flow. Same three touch-points as the
     # native and non-nodal assemblers (collect / merge into the operator exprs / per-call table).
-    from .parametric_helpers import collect_neural_slots, neural_operator_exprs
-
-    _neural = collect_neural_slots(volume_terms, boundary_terms, runtime_parameter_tags=runtime_parameter_tags)
-    _param_and_neural_exprs = neural_operator_exprs(_rt_param_exprs, _neural)
     # NOTE: a nodal field parameter is interpolated with the element's own shape functions, so its nodal
     # layout must match the trial's — a P1 parameter field cannot ride a LINE3 element. No guard is needed
     # here: `jno.np.parameter(<symbol>)` already refuses a non-P1 symbol at construction, which is the
@@ -585,6 +605,7 @@ def _assemble_1d_transient(
     n_nodes, dof_coords = dof_layout_1d(domain, order)
     ndof = n_nodes * vec
     domain._fem_native_dof_points = dof_coords
+    _tags, _fields, _neural, _param_exprs = _param_context(volume_terms, boundary_terms)
 
     # Split each weak constraint into additive sub-terms first, so the temporal
     # term (u_t * phi) can be separated from the spatial terms in the same sum.
@@ -682,9 +703,29 @@ def _assemble_1d_transient(
         state0 = jnp.zeros(ndof)
     t0, t1, dt = _infer_time_window(domain)
 
+    # The MASS must be parameter-free. It is assembled once, outside the per-args re-forming, so a
+    # parameter sitting on `u_t * phi` would be read at its zero placeholder and silently baked in --
+    # a wrong answer with no error. Same rule the 2D/3D path documents; here it is enforced.
+    _mass_tags, _, _mass_slots, _ = _param_context(mass_terms, {})
+    if _mass_tags or _mass_slots.all_names:
+        raise NotImplementedError(
+            "jno.fem: a runtime parameter or neural coefficient on the 1D transient MASS term "
+            f"({sorted(set(_mass_tags) | set(_mass_slots.all_names))}) is not supported — the mass is "
+            "assembled once, so a parameter there would be silently frozen. Put the parameter on the "
+            "spatial operator or the load instead."
+        )
     mass_res = _make_residual(domain, mass_terms, {}, n_nodes=n_nodes, vec=vec, quad_degree=quad_degree, order=order)
     spatial_res = _make_residual(
-        domain, spatial_terms, boundary_terms, n_nodes=n_nodes, vec=vec, quad_degree=quad_degree, order=order
+        domain,
+        spatial_terms,
+        boundary_terms,
+        n_nodes=n_nodes,
+        vec=vec,
+        quad_degree=quad_degree,
+        order=order,
+        runtime_parameter_tags=_tags,
+        field_param_names=_fields,
+        neural_slots=_neural,
     )
 
     all_terms = spatial_terms + [t for ts in boundary_terms.values() for t in ts]
@@ -705,6 +746,12 @@ def _assemble_1d_transient(
     )
 
     if nonlinear:
+        if _param_exprs:
+            raise NotImplementedError(
+                "jno.fem: a runtime parameter or neural coefficient in a *nonlinear* 1D transient form is "
+                "not supported yet — the 1D parametric path is wired for linear systems (steady and "
+                "transient). Linearize the form, or recover the parameter through a linear one."
+            )
         # M(t) u̇ + R(u) = 0 with R the (Dirichlet-enforced) spatial residual.
         residual = _apply_dirichlet_rows(spatial_res, dirichlet_pairs)
         dofs = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32) if dirichlet_pairs else None
@@ -725,10 +772,25 @@ def _assemble_1d_transient(
         return block, "transient"
 
     # linear: M u̇ + A u = c
-    A = spatial_res.sparse_jacobian(jnp.zeros(ndof))
-    c = -spatial_res(jnp.zeros(ndof))
-    M, A, c = _apply_dirichlet_transient(M, A, c, dirichlet_pairs)
-    block = SemidiscreteTimeBlock(M=M, A=A, affine_bias=c, **common)
+    def _lin_sys(args=None):
+        A = spatial_res.sparse_jacobian(jnp.zeros(ndof), args)
+        c = -spatial_res(jnp.zeros(ndof), args)
+        return _apply_dirichlet_transient(M, A, c, dirichlet_pairs)
+
+    M0, A0, c0 = _lin_sys(None)
+    if not _param_exprs:
+        return SemidiscreteTimeBlock(M=M0, A=A0, affine_bias=c0, **common), "transient"
+    # Parametric transient: the operator and load re-form from the runtime args at every step, so
+    # ∂traj/∂θ flows through the marcher -- a 1D time-series inverse (recover a diffusivity from
+    # u(x, t)) trains through `crux.solve` like the steady one. The mass is parameter-free (guarded
+    # above), so it stays the statically assembled M.
+    block = SemidiscreteTimeBlock(
+        M=M0,
+        operator_fn=lambda t, args=None: _lin_sys(args)[1],
+        forcing_vector_fn=lambda t, args=None: _lin_sys(args)[2],
+        runtime_parameter_exprs=_param_exprs,
+        **common,
+    )
     return block, "transient"
 
 
