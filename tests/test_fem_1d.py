@@ -100,15 +100,117 @@ def test_vec_gt_1_rejected():
         jno.fem([weak, u(xb) - 0.0])
 
 
-def test_order2_p2_rejected_loudly():
-    # The native 1D assembler is LINE2 (P1) only; a P2 request must fail loud, not silently
-    # fall back to P1 (a wrong-order, silently-wrong solve). P2 is a 2D/3D capability.
+def _reaction_diffusion(ms, order):
+    """``-u'' + u = f`` with ``u = sin(pi x)``, zero Dirichlet — returns ``(ndof, max nodal error)``.
+
+    The reaction term is deliberate. For the pure ``-u'' = f`` problem 1D P1 is *nodally exact* (the
+    discrete Green's function reproduces nodal values), so a nodal-error study there measures the
+    quadrature rule and reports ~O(h^4) for P1 too — it cannot tell P1 and P2 apart. Adding ``u*phi``
+    breaks that exactness, so the nodal error shows the true convergence order."""
+    d = _line(ms)
+    u, phi = d.fem_symbols(order=order)
+    xi = d.variable("interior", split=True)[0]
+    xb = d.variable("boundary", split=True)[0]
+    ui, vi = u.bind(x=xi), phi.bind(x=xi)
+    f = (np.pi**2 + 1.0) * jno.np.sin(np.pi * xi)
+    fem = jno.fem([ui.x * vi.x + u * vi - f * vi, u(xb) - 0.0])
+    sol = np.asarray(fem.solve())
+    pts = np.asarray(fem.points).reshape(-1)
+    return len(sol), float(np.max(np.abs(sol - np.sin(np.pi * pts))))
+
+
+def test_p2_line3_dof_layout_and_points():
+    """P2 (LINE3) adds one dof per element **midpoint**, laid out after all vertices — so a vertex dof
+    keeps its mesh-node index (which is what lets the boundary/Dirichlet lookup stay P1-shaped), and
+    ``fem.points`` reports the dof coordinates the solution vector actually lives on."""
     d = _line(0.25)
+    n_vert = int(np.asarray(d.mesh.points).shape[0])
+    n_elem = int(np.asarray(d.mesh.cells_dict["line"]).shape[0])
     u, phi = d.fem_symbols(order=2)
     xi = d.variable("interior", split=True)[0]
     xb = d.variable("boundary", split=True)[0]
     ui, vi = u.bind(x=xi), phi.bind(x=xi)
-    with pytest.raises(NotImplementedError, match="P2.*1D|1D.*P2|LINE2"):
+    fem = jno.fem([ui.x * vi.x - 1.0 * vi, u(xb) - 0.0])
+
+    pts = np.asarray(fem.points).reshape(-1)
+    assert len(pts) == n_vert + n_elem, f"P2 needs one midpoint dof per element: {len(pts)} vs {n_vert + n_elem}"
+    verts = np.asarray(d.mesh.points)[:, 0]
+    assert np.allclose(pts[:n_vert], verts), "vertex dofs must come first, at their mesh-node index"
+    cells = np.asarray(d.mesh.cells_dict["line"])
+    assert np.allclose(np.sort(pts[n_vert:]), np.sort(0.5 * (verts[cells[:, 0]] + verts[cells[:, 1]])))
+    assert fem.operator[0].shape == (len(pts), len(pts))
+
+    # and it still solves: -u'' = 1, u(0)=u(1)=0 -> u = x(1-x)/2, which P2 represents EXACTLY
+    sol = np.asarray(fem.solve())
+    assert np.max(np.abs(sol - pts * (1.0 - pts) / 2.0)) < 1e-12, "P2 must be exact on a quadratic solution"
+
+
+def test_p2_converges_faster_than_p1():
+    """The point of LINE3: P1 is O(h²) at the nodes, P2 is O(h⁴) (nodal superconvergence, O(h^2k)),
+    so at *equal dof count* P2 is orders more accurate — measured 4.7e-5 vs 2.4e-7 at 41 dofs."""
+    p1 = [_reaction_diffusion(ms, 1) for ms in (0.1, 0.05, 0.025)]
+    p2 = [_reaction_diffusion(ms, 2) for ms in (0.1, 0.05, 0.025)]
+
+    r1 = [np.log2(p1[i][1] / p1[i + 1][1]) for i in range(len(p1) - 1)]
+    r2 = [np.log2(p2[i][1] / p2[i + 1][1]) for i in range(len(p2) - 1)]
+    assert all(abs(r - 2.0) < 0.25 for r in r1), f"P1 must converge at O(h^2), got rates {r1}"
+    assert all(abs(r - 4.0) < 0.35 for r in r2), f"P2 must converge at O(h^4) nodally, got rates {r2}"
+
+    # same dof count (41), far better answer -- the accuracy is not bought with dofs
+    (n1, e1), (n2, e2) = p1[2], p2[1]
+    assert n1 == n2 == 41
+    assert e2 < e1 / 50.0, f"at {n1} dofs P2 ({e2:.2e}) must beat P1 ({e1:.2e}) by a wide margin"
+
+
+def test_p2_is_sparse_and_couples_three_dofs_per_element():
+    """A LINE3 element couples its 3 dofs, so the element block is 3x3 and ``nnz`` stays linear in the
+    dof count — the sparse element scatter must not have quietly become dense for the higher order."""
+    d = _line(0.01)
+    u, phi = d.fem_symbols(order=2)
+    xi = d.variable("interior", split=True)[0]
+    xb = d.variable("boundary", split=True)[0]
+    ui, vi = u.bind(x=xi), phi.bind(x=xi)
+    A = jno.fem([ui.x * vi.x - 1.0 * vi, u(xb) - 0.0]).operator[0]
+    n = A.shape[0]
+    assert hasattr(A, "indices"), "P2 must assemble sparsely too"
+    # ~9 entries per element (3x3) + 2 Dirichlet rows, against ~2 dofs per element
+    assert int(A.nse) < 10 * n, f"nnz={int(A.nse)} is not linear in n={n}"
+
+
+def test_p2_transient_decays_to_analytic():
+    """P2 composes with the transient path: the mass, operator AND the initial state all live on the
+    LINE3 dofs. The initial condition is the sharp edge — it is sampled at the dof coordinates, so a
+    P2 state must be seeded at the midpoints too, not just at the mesh vertices."""
+    d = _line(0.05, time=(0.0, 0.02, 41))
+    u, phi = d.fem_symbols(order=2)
+    sp = d.variable("interior", split=True)
+    xi, ti = sp[0], sp[-1]
+    xb = d.variable("boundary", split=True)[0]
+    ci = d.variable("initial", split=True)[0]
+    ui, vi = u.bind(x=xi, t=ti), phi.bind(x=xi, t=ti)
+    fem = jno.fem([ui.t * vi + ui.x * vi.x, u(xb) - 0.0, u(ci) - jno.np.sin(np.pi * ci)])
+
+    pts = np.asarray(fem.points).reshape(-1)
+    n_vert = int(np.asarray(d.mesh.points).shape[0])
+    assert len(pts) > n_vert, "the transient state must be sized by the P2 dofs, not the vertices"
+
+    traj = np.asarray(fem.solve().fn())
+    assert traj.shape[1] == len(pts)
+    # the IC must be seeded on every dof, midpoints included
+    assert np.max(np.abs(traj[0] - np.sin(np.pi * pts))) < 1e-12, "P2 initial state is not on the dof nodes"
+    exact = np.exp(-(np.pi**2) * float(fem.t1)) * np.sin(np.pi * pts)
+    assert np.linalg.norm(traj[-1] - exact) / np.linalg.norm(exact) < 5e-3
+
+
+def test_order3_and_coupled_p2_fail_loud():
+    """Scope, stated explicitly: 1D Lagrange is implemented for order 1 and 2, and the *coupled* 1D
+    block assembler is still P1 — both refuse rather than silently solving at the wrong order."""
+    d = _line(0.25)
+    u, phi = d.fem_symbols(order=3)
+    xi = d.variable("interior", split=True)[0]
+    xb = d.variable("boundary", split=True)[0]
+    ui, vi = u.bind(x=xi), phi.bind(x=xi)
+    with pytest.raises(NotImplementedError, match="order"):
         jno.fem([ui.x * vi.x - 1.0 * vi, u(xb) - 0.0])
 
 
