@@ -337,23 +337,16 @@ class PrecondContext:
 
         if aux.is_complex:
             # A COMPLEX auxiliary operator (e.g. the shifted-Laplacian twin of a complex Helmholtz)
-            # must precondition the outer complex solve's 2n real-equivalent system, so assemble it as
-            # the same block ``[[Mr,-Mi],[Mi,Mr]]`` (2n x 2n) from the form's two real/imag legs.
+            # must precondition the outer complex solve's 2n real-equivalent system, i.e. the block
+            # ``[[Mr,-Mi],[Mi,Mr]]``. This used to rebuild that block by hand from the form's Re/Im legs.
+            # It no longer has to: a complex form is FUSED into exactly that 2n block at assembly, so
+            # ``aux.A`` already IS it (verified bit-identical to the hand-built version). The remaining
+            # complex-specific concern is periodic ties, and only that.
             if getattr(aux, "_periodic", None) is not None:
                 raise NotImplementedError(
                     "PrecondContext.assemble: a complex auxiliary form with periodic ties is not supported "
                     "(the outer P-reduction is not mirrored onto the preconditioner block)."
                 )
-            from ..._fem import _complex_block_bcoo
-
-            legs = aux.operator  # ((A_r, b_r), (A_i, b_i)); a preconditioner form is parameter-independent
-            if not (isinstance(legs, tuple) and len(legs) == 2 and all(isinstance(leg, tuple) for leg in legs)):
-                raise NotImplementedError(
-                    "PrecondContext.assemble: expected two eager (A, b) complex legs "
-                    "(a parametric complex preconditioner form is not supported)."
-                )
-            A_r, A_i = _bcoo(legs[0][0]), _bcoo(legs[1][0])
-            return LinearOperator(_complex_block_bcoo(A_r, A_i, A_r.shape[0]))
 
         return LinearOperator(_bcoo(aux.A))
 

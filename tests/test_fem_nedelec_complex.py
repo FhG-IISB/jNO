@@ -71,7 +71,8 @@ def test_imaginary_leg_is_the_mass_matrix():
     M = _dense(jno.fem([inner(ui, vi)]).A)
 
     fem = jno.fem([inner(cu, cv) + 1j * inner(ui, vi)])
-    op_r, op_i = fem._op  # (A_r, b_r), (A_i, b_i)
+    # ``_op`` is the fused real 2n block now; the unfused legs live on ``_complex_legs``.
+    op_r, op_i = fem._complex_legs  # (A_r, b_r), (A_i, b_i)
     np.testing.assert_allclose(_dense(op_r[0]), K, atol=1e-10)
     np.testing.assert_allclose(_dense(op_i[0]), M, atol=1e-10)
 
@@ -84,7 +85,8 @@ def test_complex_parametric_nonnodal_assembles_keeps_imag():
     ``test_fem_nonnodal_sparse_assembly.py``.)"""
     d, (xi, yi, zi), (ui, vi), (cu, cv) = _n1e_cube(0.6)
     a = jno.np.parameter((), name="a").initialize(jax.nn.initializers.constant(2.0))  # a runtime parameter in ε
-    op_r, op_i = jno.fem([inner(cu, cv) + 1j * a * inner(ui, vi)]).operator  # complex → two parametric legs
+    _fem = jno.fem([inner(cu, cv) + 1j * a * inner(ui, vi)])
+    op_r, op_i = _fem._complex_legs  # the unfused parametric legs (``.operator`` is the fused 2n system)
     assert op_r.operator_fn({"a": 2.0}) is not None
     A_i = op_i.operator_fn({"a": 2.0})
     A_i = jnp.asarray(A_i.todense() if hasattr(A_i, "todense") else A_i)

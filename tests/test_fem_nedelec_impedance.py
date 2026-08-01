@@ -113,7 +113,7 @@ def test_imaginary_impedance_lands_in_the_imag_leg():
 
     fem = jno.fem([inner(ccu, ccv) - k0**2 * inner(ui, vi), 1j * k0 * inner(tu, tv)])
     assert fem.is_complex
-    op_r, op_i = fem._op
+    op_r, op_i = fem._complex_legs  # unfused legs (``_op`` is the fused 2n block)
 
     S = _surface_mass(inner(ui, vi), inner(tu, tv))
     K = _dense(jno.fem([inner(ccu, ccv)]).A)

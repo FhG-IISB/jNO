@@ -155,7 +155,9 @@ def test_parametric_solve_gradient_matches_finite_differences():
     n_verts = np.asarray(d.built_mesh.points).shape[0]
     e0 = jnp.full((n_verts,), 1.5)
 
-    opr, opi = fem.operator  # a complex form is stored as two REAL legs -- both must assemble sparsely
+    # A complex form is FUSED into one real 2n system at assembly (``.operator``); the unfused REAL
+    # legs are retained on ``_complex_legs``, and it is those that must each assemble sparsely.
+    opr, opi = fem._complex_legs
     assert hasattr(opr.evaluate({"eps": e0})[0], "indices"), "the real leg densified"
     assert hasattr(opi.evaluate({"eps": e0})[0], "indices"), "the imaginary leg densified"
 
