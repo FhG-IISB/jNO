@@ -306,6 +306,77 @@ def test_1d_parameter_scope_limits_fail_loud():
         jno.fem([k2 * (u2i.x * v2i.x) + (u2 * u2) * v2i - 1.0 * v2i, u2(xb2) - 0.0])
 
 
+def _const_net_1d(c):
+    """A 'network' emitting a constant per quad point — the degenerate case that must reproduce a
+    scalar-coefficient assembly *exactly*, which is what pins the kernel's evaluation of the net."""
+    eqx = pytest.importorskip("equinox", reason="neural coefficients need equinox")
+
+    class _Const(eqx.Module):
+        c: jnp.ndarray
+
+        def __call__(self, *args):
+            n = jnp.asarray(args[0]).shape[0]
+            return jnp.broadcast_to(self.c.reshape(1, 1), (n, 1))
+
+    net = jno.nn.wrap(_Const(c=jnp.asarray(float(c), dtype=jnp.float64)))
+    net.dtype(jnp.float64)
+    return net
+
+
+def _neural_poisson(kfun, rhs_scale=1.0, ms=0.05):
+    """``-k(x) u'' = rhs_scale * pi^2 sin(pi x)``, zero Dirichlet, with ``k`` from a callable."""
+    d = _line(ms)
+    u, phi = d.fem_symbols()
+    xi = d.variable("interior", split=True)[0]
+    xb = d.variable("boundary", split=True)[0]
+    ui, vi = u.bind(x=xi), phi.bind(x=xi)
+    f = rhs_scale * (np.pi**2) * jno.np.sin(np.pi * xi)
+    return jno.fem([kfun(xi) * (ui.x * vi.x) - f * vi, u(xb) - 0.0])
+
+
+def test_neural_coefficient_in_1d_matches_the_scalar_assembly():
+    """A ``jno.nn.wrap`` coefficient assembles on a 1D domain. Unlike a scalar/field parameter a network
+    never enters the per-cell ``volume_vars`` — a weight pytree is cell-independent — so the kernel
+    re-evaluates it at the quad points from a ``{name: module}`` table instead, and its weights ride
+    ``args`` as a ``ModelWeights`` slot. A *constant* net must therefore land on the scalar-coefficient
+    solve exactly; anything else means the net is being evaluated on the wrong points."""
+    from jno.trace import FemLinearSystem, ModelWeights
+
+    net = _const_net_1d(0.8)
+    fem = _neural_poisson(lambda xi: net(xi))
+    assert isinstance(fem.operator, FemLinearSystem) and fem.operator.is_parametric
+    (name,) = fem.operator.runtime_parameter_exprs
+    assert isinstance(fem.operator.runtime_parameter_exprs[name], ModelWeights)
+
+    node = fem.solve()
+    assert not isinstance(node, jax.Array), "a neural 1D solve must be a trace node"
+    crux = jno.core([(node * 0.0).mae], domain=_dummy_domain())
+    got = np.asarray(crux.eval([node])).reshape(-1)
+    ref = np.asarray(_neural_poisson(lambda xi: 0.8).solve()).reshape(-1)
+    assert np.max(np.abs(got - ref)) < 1e-12, "a constant net must reproduce the scalar-coefficient solve"
+
+
+def test_1d_neural_coefficient_trains():
+    """The point of the layer: ``d(solve)/d(weights)`` flows, so a coefficient network is *learnable*
+    from 1D data — the differentiable-FEM-plus-ML story working in the dimension you would prototype
+    it in. Starts a 4x-wrong coefficient and drives the data misfit down through ``crux.solve``."""
+    optax = pytest.importorskip("optax")
+
+    k_true = 2.0
+    u_obs = np.asarray(_neural_poisson(lambda xi: k_true, rhs_scale=k_true).solve()).reshape(-1)
+
+    net = _const_net_1d(0.5)  # 4x off
+    net.optimizer(optax.adam(0.1))
+    node = _neural_poisson(lambda xi: net(xi), rhs_scale=k_true).solve()
+    crux = jno.core([(node - u_obs).mae], domain=_dummy_domain())
+
+    before = float(np.max(np.abs(np.asarray(crux.eval([node])).reshape(-1) - u_obs)))
+    crux.solve(200)
+    after = float(np.max(np.abs(np.asarray(crux.eval([node])).reshape(-1) - u_obs)))
+    assert after < before / 10.0, f"training must reduce the 1D misfit: {before:.3e} -> {after:.3e}"
+    assert after < 5e-2, f"the coefficient network did not fit the data: {after:.3e}"
+
+
 def test_order3_and_coupled_p2_fail_loud():
     """Scope, stated explicitly: 1D Lagrange is implemented for order 1 and 2, and the *coupled* 1D
     block assembler is still P1 — both refuse rather than silently solving at the wrong order."""
