@@ -49,8 +49,9 @@ u_h = fem.solve()          # matrix-free default; slots pick anything else (see 
   a 1D differentiable inverse problem runs through `crux.solve` — as does a **neural** (`jno.nn.wrap`)
   coefficient, so a learned `k(x)` can be trained from 1D data. Transient too — recovering a diffusivity
   from a 1D time series works — except that the transient **mass** must be parameter-free (it is
-  assembled once, so a parameter there would be silently frozen; it fails loud). Not wired in 1D: a
-  parameter or network in a *nonlinear* form, or on a *coupled* system.
+  assembled once, so a parameter there would be silently frozen; it fails loud). *Nonlinear* forms are
+  parametric too — Newton runs on `R(·, θ)` and implicit differentiation gives `∂u/∂θ`. Not wired in 1D:
+  anything parametric on a *coupled* system.
 * **Quadrature coordinates** — `d.variable("interior", split=True)` returns the volume
   coordinates; `d.variable("<edge>", split=True)` returns a boundary edge's coordinates. A
   `Shape.rect` auto-tags `"left"`, `"right"`, `"bottom"`, `"top"` (and `"front"`/`"back"` for a box);
