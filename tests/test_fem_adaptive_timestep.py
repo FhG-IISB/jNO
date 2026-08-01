@@ -22,7 +22,6 @@ import jno  # noqa: E402
 from jno._fem import _solve_complex_transient  # noqa: E402
 from jno.solve import adaptive  # noqa: E402
 from jno.utils.solver.backend_blocks import _default_transient_integrate  # noqa: E402
-from jno.utils.solver.timeschemes import _AdaptiveScheme  # noqa: E402
 
 PI = np.pi
 
@@ -85,7 +84,9 @@ def test_adaptive_real_scalar_is_time_converged_and_beats_coarse_fixed():
     d, fem = _heat(mesh_size=0.15, nsteps=6)
     save = jnp.linspace(0.0, 0.05, 6)
     ad = np.asarray(
-        _AdaptiveScheme(1e-5, 1e-8, 2000).integrate(fem.operator, {}, save, linear_solve=None, nonlinear_solve=None)
+        adaptive(rtol=1e-5, atol=1e-8, max_steps=2000).integrate(
+            fem.operator, {}, save, linear_solve=None, nonlinear_solve=None
+        )
     )
     be = np.asarray(_default_transient_integrate(fem.operator, {}, save))
     assert not np.any(np.isnan(ad))
@@ -124,14 +125,69 @@ def test_adaptive_starts_from_below_not_from_the_output_grid():
     ref = _semidiscrete(0.15, 0.05)
     time_err = lambda traj: np.linalg.norm(np.asarray(traj)[-1] - ref) / np.linalg.norm(ref)
 
-    from_below = _AdaptiveScheme(**kw).integrate(block, {}, save, linear_solve=None, nonlinear_solve=None)
-    from_grid = _AdaptiveScheme(**kw, dt0=float(block.dt)).integrate(
-        block, {}, save, linear_solve=None, nonlinear_solve=None
-    )
+    from_below = adaptive(**kw).integrate(block, {}, save, linear_solve=None, nonlinear_solve=None)
+    from_grid = adaptive(**kw, dt0=float(block.dt)).integrate(block, {}, save, linear_solve=None, nonlinear_solve=None)
     e_below, e_grid = time_err(from_below), time_err(from_grid)
     assert not np.any(np.isnan(np.asarray(from_below)))
     assert e_below < 0.5 * e_grid, f"growing from below must beat grid-seeded: {e_below:.2e} vs {e_grid:.2e}"
     assert e_below < 5e-3, f"time error from below regressed: {e_below:.2e}"
+
+
+def test_adaptive_second_order_base_is_far_cheaper_per_digit():
+    """The base method's ORDER dominates everything the controller does.
+
+    Step doubling spends 3 implicit solves per step. On a first-order base (θ=1, backward Euler) those
+    solves buy error that only falls linearly in dt, so the scheme cannot beat a first-order fixed march
+    by much — which is exactly what the work-precision numbers showed. Driving the SAME controller on a
+    second-order base (θ=1/2) is dramatically cheaper per digit; the exponent follows via ``_theta_order``.
+
+    Measured on this benchmark (x64, CPU): θ=1 -> 5.1e-3 in 54 steps / 162 solves; θ=1/2 -> 2.2e-4 in
+    16 steps / 48 solves — ~23x the accuracy on ~3x less work. (Step count read off by bisecting
+    ``max_steps``: the march NaNs when the budget is exhausted, and ``dt_min``/``dt_max`` depend only on
+    the time span, so the step sequence is independent of the budget.) Asserted loosely so it pins the
+    effect, not the exact arithmetic — the step count shifts by one or two with dtype and platform."""
+    _, fem = _heat(mesh_size=0.15, nsteps=11)
+    save = jnp.linspace(0.0, 0.05, 11)
+    ref = _semidiscrete(0.15, 0.05)
+    err = lambda traj: np.linalg.norm(np.asarray(traj)[-1] - ref) / np.linalg.norm(ref)
+
+    kw = dict(rtol=1e-4, atol=1e-6, max_steps=4000)
+    run = lambda sch: sch.integrate(fem.operator, {}, save, linear_solve=None, nonlinear_solve=None)
+    first = run(adaptive(**kw))  # bare: the block's own θ=1 step
+    second = run(jno.solve.theta(0.5).adaptive(**kw))  # same controller on a 2nd-order step
+    e1, e2 = err(first), err(second)
+    assert not np.any(np.isnan(np.asarray(second)))
+    assert e2 < 0.2 * e1, f"second-order base should be much more accurate: {e2:.2e} vs {e1:.2e}"
+
+
+def test_theta_order_drives_the_controller_exponent():
+    """θ=1/2 is the ONLY second-order θ; everything else is first order. The controller reads this off the
+    BASE scheme to pick its step-size exponent 1/(p+1), so a wrong answer here mis-sizes every step (it was
+    previously hardwired to ½, which also mis-sized the trapezoidal second-order-system blocks)."""
+    from jno.utils.solver.timeschemes import _theta_order
+
+    assert _theta_order(0.5) == 2
+    assert _theta_order(1.0) == 1 and _theta_order(0.0) == 1 and _theta_order(0.7) == 1
+    assert jno.solve.theta(0.5).step_order == 2 and jno.solve.theta(1.0).step_order == 1
+
+
+def test_adaptive_composes_onto_a_base_scheme():
+    """Adaptivity is a step-size POLICY attached to a base step, not a scheme of its own: ``which step``
+    and ``how big`` are separate axes. The bare ``jno.solve.adaptive()`` keeps meaning "the block's own
+    θ-step", so it stays a drop-in."""
+    assert adaptive().base is None  # bare form defers to the block
+    wrapped = jno.solve.theta(0.5).adaptive(rtol=1e-5)
+    assert wrapped.base.theta == 0.5 and wrapped.rtol == 1e-5
+    assert wrapped.base.step_order == 2  # the controller exponent follows the base, not a hardwired 1/2
+
+    # base=None resolves to the block's own θ at integrate time
+    _, fem = _heat(mesh_size=0.3, nsteps=5)
+    assert adaptive().base_for(fem.operator).theta == 1.0
+
+    with pytest.raises(NotImplementedError, match="does not nest"):
+        jno.solve.theta(0.5).adaptive().adaptive()
+    with pytest.raises(NotImplementedError, match="exact in time|exponential"):
+        jno.solve.exponential().adaptive()
 
 
 def test_adaptive_rejection_would_break_the_gradient():
@@ -146,7 +202,7 @@ def test_adaptive_rejection_would_break_the_gradient():
     d, fem = _heat(mesh_size=0.2, nsteps=6, param=True)
     (name,) = fem.operator.runtime_parameter_exprs
     save = jnp.linspace(0.0, 0.05, 6)
-    sch = _AdaptiveScheme(1e-6, 1e-9, 1200)
+    sch = adaptive(rtol=1e-6, atol=1e-9, max_steps=1200)
 
     def loss(kv):
         return jnp.sum(
@@ -164,7 +220,7 @@ def test_adaptive_real_scalar_is_differentiable():
     d, fem = _heat(mesh_size=0.2, nsteps=6, param=True)
     (name,) = fem.operator.runtime_parameter_exprs
     save = jnp.linspace(0.0, 0.05, 6)
-    sch = _AdaptiveScheme(1e-4, 1e-6, 1000)
+    sch = adaptive(rtol=1e-4, atol=1e-6, max_steps=1000)
 
     def loss(kv):
         return jnp.sum(
@@ -191,7 +247,9 @@ def test_adaptive_real_vector():
     )
     save = jnp.linspace(0.0, 0.05, 6)
     traj = np.asarray(
-        _AdaptiveScheme(1e-4, 1e-6, 1000).integrate(fem.operator, {}, save, linear_solve=None, nonlinear_solve=None)
+        adaptive(rtol=1e-4, atol=1e-6, max_steps=1000).integrate(
+            fem.operator, {}, save, linear_solve=None, nonlinear_solve=None
+        )
     )
     assert not np.any(np.isnan(traj))
     assert np.linalg.norm(traj[-1]) < np.linalg.norm(traj[0])  # diffusion decays both components
@@ -211,7 +269,9 @@ def test_adaptive_real_periodic():
     fem = jno.fem([ui.t * vi + (ui.x * vi.x + ui.y * vi.y), u(xl, yl) - u(xr, yr), u(ci[0], ci[1]) - u0])
     save = jnp.linspace(0.0, 0.05, 6)
     ad = np.asarray(
-        _AdaptiveScheme(1e-4, 1e-6, 1000).integrate(fem.operator, {}, save, linear_solve=None, nonlinear_solve=None)
+        adaptive(rtol=1e-4, atol=1e-6, max_steps=1000).integrate(
+            fem.operator, {}, save, linear_solve=None, nonlinear_solve=None
+        )
     )
     be = np.asarray(_default_transient_integrate(fem.operator, {}, save))
     assert not np.any(np.isnan(ad))
@@ -286,7 +346,9 @@ def test_adaptive_fail_loud_on_exhausted_budget():
     d, fem = _heat(mesh_size=0.2, nsteps=6)
     save = jnp.linspace(0.0, 0.05, 6)
     out = np.asarray(
-        _AdaptiveScheme(1e-9, 1e-12, 20).integrate(fem.operator, {}, save, linear_solve=None, nonlinear_solve=None)
+        adaptive(rtol=1e-9, atol=1e-12, max_steps=20).integrate(
+            fem.operator, {}, save, linear_solve=None, nonlinear_solve=None
+        )
     )
     assert np.all(np.isnan(out)), "an exhausted step budget must fail loud (NaN), not silently truncate"
 

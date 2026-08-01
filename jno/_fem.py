@@ -1058,6 +1058,16 @@ def _solve_complex_transient(blocks: Any, save_ts: Any = None, periodic: Optiona
             # Differentiable in a runtime parameter through the (sparse GMRES / dense LU) step solve.
             from .utils.solver.timeschemes import adaptive_march
 
+            # ``cstep`` below is backward Euler (θ=1) only, so a second-order base would be silently
+            # ignored — refuse it instead. (The FIXED complex path does honour θ; see the else branch.)
+            _base = getattr(time, "base", None)
+            if _base is not None and float(getattr(_base, "theta", 1.0)) != 1.0:
+                raise NotImplementedError(
+                    "jno.solve.theta(θ).adaptive(...) with θ != 1 is not wired for a complex transient — the "
+                    "adaptive 2n-block step is backward Euler only. Use jno.solve.adaptive(...) (θ=1), or "
+                    "jno.solve.theta(θ) on the fixed grid."
+                )
+
             def cstep(w, t, dt_):  # dt_ varies per attempt -> rebuild the step solver (backward Euler, θ=1)
                 return _blk_solve(dt_)(_rhs(w, t + dt_, dt_), w)
 
@@ -1074,6 +1084,7 @@ def _solve_complex_transient(blocks: Any, save_ts: Any = None, periodic: Optiona
                 atol=time.atol,
                 max_steps=time.max_steps,
                 dt0=getattr(time, "dt0", None),
+                order=1,
             )
         else:
             # θ-method: (M + θ dt A) w_next = (M − (1−θ) dt A) w + dt(c + θ f_next + (1−θ) f_now). Default
