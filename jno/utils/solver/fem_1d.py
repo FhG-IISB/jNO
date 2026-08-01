@@ -60,7 +60,13 @@ import jax.numpy as jnp
 import numpy as np
 from jax.flatten_util import ravel_pytree
 
-from .fem_utils import _eval_integrand, bcoo_set_unit_diag, bcoo_zero_rows_cols
+from .fem_utils import (
+    _eval_integrand,
+    bcoo_set_dirichlet_rows,
+    bcoo_set_unit_diag,
+    bcoo_zero_rows,
+    bcoo_zero_rows_cols,
+)
 
 _COMPONENT_NAMES = {"x": 0, "y": 1, "z": 2}
 
@@ -663,17 +669,25 @@ def _assemble_1d_transient(
         )
         K = spatial_res2.sparse_jacobian(z)
         F = -spatial_res2(z)  # spatial load + natural-BC load
+        # Compose the augmented 2n system SPARSELY. M2/C/K are BCOO (per-element scatter), so ``jnp.block``
+        # and ``.at[]`` are both unavailable here — the former cannot mix sparse with dense at all, and
+        # BCOO has no ``.at[]``. Reuse the same three helpers the native u_tt path uses, so the 1D and
+        # native augmented systems are assembled and constrained by identical code.
+        #   [M2  0 ] [u']   [ 0   -M2] [u]   [0]
+        #   [0   M2] [v'] + [ K    C ] [v] = [F]
+        from ..._fem import _bcoo_block
+
         n = ndof
-        Z = jnp.zeros((n, n), z.dtype)
-        M_aug = jnp.block([[M2, Z], [Z, M2]])
-        A_aug = jnp.block([[Z, -M2], [K, Cmat]])  # M2 u̇ = M2 v ; M2 v̇ + C v + K u = F
+        M_aug = _bcoo_block([(M2, 0, 0, 1.0), (M2, n, n, 1.0)], (2 * n, 2 * n), z.dtype)
+        A_aug = _bcoo_block([(M2, 0, n, -1.0), (K, n, 0, 1.0), (Cmat, n, n, 1.0)], (2 * n, 2 * n), z.dtype)
         c_aug = jnp.concatenate([jnp.zeros((n,), z.dtype), F])
         dpairs = _dirichlet_dofs(domain, dirichlet_values, vec)
         if dpairs:  # u[d]=g (constant) on displacement rows, v[d]=0 on velocity rows
             dd = jnp.asarray([p[0] for p in dpairs], dtype=jnp.int32)
             dg = jnp.asarray([p[1] for p in dpairs], dtype=z.dtype)
-            M_aug = M_aug.at[dd, :].set(0.0).at[dd + n, :].set(0.0)
-            A_aug = A_aug.at[dd, :].set(0.0).at[dd, dd].set(1.0).at[dd + n, :].set(0.0).at[dd + n, dd + n].set(1.0)
+            aug_d = jnp.concatenate([dd, dd + n])  # the constrained rows in BOTH blocks
+            M_aug = bcoo_zero_rows(M_aug, aug_d)  # mass rows are algebraic -> zeroed
+            A_aug = bcoo_set_dirichlet_rows(A_aug, aug_d)  # -> identity rows (columns kept)
             c_aug = c_aug.at[dd].set(dg).at[dd + n].set(0.0)
         # the initial state lives on the DOF nodes, which for P2 include the element midpoints
         pts = jnp.asarray(dof_coords)
