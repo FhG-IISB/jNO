@@ -2877,8 +2877,11 @@ def fem(
                 raise NotImplementedError("jno.fem: a net-valued essential value is single-field only.")
         if getattr(domain, "dimension", None) == 1:
             raise NotImplementedError(
-                "jno.fem: neural coefficients are not supported on 1D domains — the native 1D assembler has no "
-                "runtime-parameter path at all (scalar and field parameters are unsupported there too)."
+                "jno.fem: a neural coefficient net(x)/net(u) is not supported on a 1D domain yet. The 1D "
+                "assembler now threads runtime parameters (a scalar or nodal-field jno.np.parameter works, "
+                "so a 1D differentiable inverse does too), but a network's weights are delivered through a "
+                "separate slot mechanism that is not wired there. Use a jno.np.parameter coefficient in 1D, "
+                "or a 2D/3D domain for a neural one."
             )
         # Non-nodal: the scalar C¹ families (Argyris/Morley/Hermite) thread the network at the quad points
         # like their P1 field parameter. The vector edge families (RT/Nédélec) accept a *scalar coordinate*

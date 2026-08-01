@@ -30,6 +30,12 @@ keeps its mesh-node index — which is why the boundary/Dirichlet lookup needs n
 boundary is an endpoint, hence always a vertex). Geometry stays LINE2: a straight element with a
 centred midpoint has a constant Jacobian, so the linear map is exact, not an approximation.
 
+Runtime parameters (``jno.np.parameter``, scalar or nodal field) thread through the element kernels
+via ``local["volume_vars"]``, the same channel the 2D/3D and non-nodal assemblers use, so a **steady
+linear** 1D form is parametric and differentiable in the parameter — a 1D inverse problem runs through
+``crux.solve`` like any other. Not wired: a parameter in a nonlinear or transient 1D form, and neural
+(``jno.nn.wrap``) coefficients, whose weights ride a separate slot mechanism.
+
 Scope: scalar unknown (``vec == 1``), order 1 or 2, single field (the coupled block assembler is
 P1 only). Boundary terms must
 be value/Robin terms (``g*phi`` / ``(a*u - g)*phi``) — they carry no spatial
@@ -169,6 +175,8 @@ def _make_residual(
     vec: int,
     quad_degree: int,
     order: int = 1,
+    runtime_parameter_tags: Tuple[str, ...] = (),
+    field_param_names: Any = frozenset(),
 ) -> Any:
     """Build the *free* global residual ``R(u_flat) -> (n_dof*vec,)``.
 
@@ -213,7 +221,26 @@ def _make_residual(
             for nid in nids:
                 boundary_apps.append((term, int(nid)))
 
-    def _volume_local(cell, u_local, expr):
+    def _pack_params(node_ids, args, dtype, width_default=1):
+        """This element's runtime-parameter values, in ``runtime_parameter_tags`` order.
+
+        The evaluator reads them out of ``volume_vars`` at ``[temporal..., runtime_param...]``: a length-1
+        entry is a **scalar** coefficient (broadcast to the quad points), a length-``n_local`` entry is a
+        nodal **field** coefficient which it interpolates with this element's own ``shape_vals``. A tag the
+        current assembly does not supply gets a zero placeholder of the right width — it is only ever read
+        back when the term actually contains that node, in which case ``args`` carries it."""
+        a = args or {}
+        out = []
+        for name in runtime_parameter_tags:
+            is_field = name in field_param_names
+            if name not in a:
+                out.append(jnp.zeros((node_ids.shape[0] if is_field else width_default,), dtype))
+                continue
+            flat = jnp.reshape(jnp.asarray(a[name], dtype=dtype), (-1,))
+            out.append(flat[node_ids] if is_field else flat[:1])
+        return tuple(out)
+
+    def _volume_local(cell, u_local, expr, pvals=()):
         """Element residual ``(2*vec,)`` from the element's OWN dofs ``u_local`` ``(2, vec)``.
 
         Taking the local dofs rather than indexing a global vector is what makes the element
@@ -235,28 +262,31 @@ def _make_residual(
             "trial_value_shape": (),
             "trial_vec": vec,
             "temporal_tags": (),
-            "runtime_parameter_tags": (),
-            "volume_vars": (),
+            "runtime_parameter_tags": runtime_parameter_tags,
+            "volume_vars": pvals,
         }
-        return _integrate_term(domain, expr, local, gw * h)  # (2*vec,)
+        return _integrate_term(domain, expr, local, gw * h)  # (nen*vec,)
 
-    def residual(u_flat):
+    def residual(u_flat, args=None):
         u = u_flat.reshape(n_nodes, vec)
         R = jnp.zeros(n_nodes * vec, dtype=u_flat.dtype)
 
         # --- volume terms: vmap over elements, then scatter ---
         for expr in volume_terms:
-            elem_res = jax.vmap(lambda c, e=expr: _volume_local(c, u[c], e))(elem_nodes)  # (n_elem, nen*vec)
+            elem_res = jax.vmap(lambda c, e=expr: _volume_local(c, u[c], e, _pack_params(c, args, u_flat.dtype)))(
+                elem_nodes
+            )  # (n_elem, nen*vec)
             R = R.at[cell_dofs.reshape(-1)].add(elem_res.reshape(-1))
 
         # --- boundary terms: degenerate one-node "element" (shape val 1, weight 1) ---
         for expr, nid in boundary_apps:
-            contrib = _boundary_local(nid, u[nid : nid + 1], expr, u_flat.dtype)  # (vec,)
+            _bp = _pack_params(jnp.asarray([nid]), args, u_flat.dtype)
+            contrib = _boundary_local(nid, u[nid : nid + 1], expr, u_flat.dtype, _bp)  # (vec,)
             R = R.at[nid * vec + comp_offsets].add(contrib.reshape(vec))
 
         return R
 
-    def _boundary_local(nid, u_local, expr, dtype):
+    def _boundary_local(nid, u_local, expr, dtype, pvals=()):
         """Boundary contribution ``(vec,)`` at node ``nid`` from its own dof ``u_local`` ``(1, vec)``."""
         local = {
             "physical_quad_points": jnp.asarray([[verts[nid]]]),
@@ -269,12 +299,12 @@ def _make_residual(
             "trial_value_shape": (),
             "trial_vec": vec,
             "temporal_tags": (),
-            "runtime_parameter_tags": (),
-            "volume_vars": (),
+            "runtime_parameter_tags": runtime_parameter_tags,
+            "volume_vars": pvals,
         }
         return _integrate_term(domain, expr, local, jnp.ones((1,), dtype=dtype))  # (vec,)
 
-    def sparse_jacobian(u_flat):
+    def sparse_jacobian(u_flat, args=None):
         """``dR/du`` as a **BCOO**, scattered from per-element blocks — never an ``O(N²)`` dense array.
 
         Each LINE2 element couples only its own ``2*vec`` dofs, so its Jacobian is a ``(2*vec, 2*vec)``
@@ -291,7 +321,9 @@ def _make_residual(
 
         for expr in volume_terms:
             # (n_elem, 2*vec, 2, vec) -> (n_elem, 2*vec, 2*vec): the element matrices
-            Ke = jax.vmap(lambda c, e=expr: jax.jacfwd(lambda ul: _volume_local(c, ul, e))(u[c]))(elem_nodes)
+            Ke = jax.vmap(
+                lambda c, e=expr: jax.jacfwd(lambda ul: _volume_local(c, ul, e, _pack_params(c, args, u_flat.dtype)))(u[c])
+            )(elem_nodes)
             nen = elem_nodes.shape[1]
             Ke = Ke.reshape(n_elem, nen * vec, nen * vec)
             rows = jnp.broadcast_to(cell_dofs[:, :, None], Ke.shape)
@@ -300,7 +332,8 @@ def _make_residual(
             dat.append(Ke.reshape(-1))
 
         for expr, nid in boundary_apps:
-            Kb = jax.jacfwd(lambda ul: _boundary_local(nid, ul, expr, u_flat.dtype))(u[nid : nid + 1])
+            _bp = _pack_params(jnp.asarray([nid]), args, u_flat.dtype)
+            Kb = jax.jacfwd(lambda ul: _boundary_local(nid, ul, expr, u_flat.dtype, _bp))(u[nid : nid + 1])
             Kb = Kb.reshape(vec, vec)
             dofs = nid * vec + comp_offsets
             rows = jnp.broadcast_to(dofs[:, None], (vec, vec))
@@ -376,11 +409,27 @@ def assemble_fem_1d(
     ``mode`` is ``"linear"`` (``op = (A, b)``), ``"nonlinear"`` (``op`` a
     :class:`FemResidualOperator`), or ``"transient"`` (``op`` a ``SemidiscreteTimeBlock``).
     """
-    from ...trace import FemResidualOperator
+    from ...trace import FemLinearSystem, FemResidualOperator
+    from .parametric_helpers import _collect_runtime_parameter_exprs, _is_fem_field_parameter
     from .weak_form import _contains_temporal_derivative, _is_obviously_nonlinear_in_unknown
 
     if int(vec) != 1:
         raise NotImplementedError(f"jno.fem: 1D (LINE2) assembly supports a scalar unknown (vec=1) only; got vec={vec}.")
+
+    # ---- runtime parameters: the differentiable-inverse path. A `jno.np.parameter` in the form makes
+    # the system PARAMETRIC -- the operator and load are re-formed from the runtime args on every call
+    # and stay differentiable in them, so `crux.solve` can recover the parameter from data. Collected
+    # with the same helpers the 2D/3D and non-nodal assemblers use, so scalar and nodal-field
+    # parameters behave identically across dimensions. ----
+    _rt_param_exprs: Dict[str, Any] = {}
+    for _bare_t in list(volume_terms) + [t for ts in boundary_terms.values() for t in ts]:
+        _collect_runtime_parameter_exprs(_bare_t, _rt_param_exprs)
+    runtime_parameter_tags: Tuple[str, ...] = tuple(sorted(_rt_param_exprs))
+    field_param_names = frozenset(n for n, e in _rt_param_exprs.items() if _is_fem_field_parameter(e))
+    # NOTE: a nodal field parameter is interpolated with the element's own shape functions, so its nodal
+    # layout must match the trial's — a P1 parameter field cannot ride a LINE3 element. No guard is needed
+    # here: `jno.np.parameter(<symbol>)` already refuses a non-P1 symbol at construction, which is the
+    # earlier and better place to catch it.
 
     # P2 adds a midpoint dof per element, so the dof count is NOT the vertex count. Publishing the
     # dof coordinates is what makes `fem.points` line up with the solution vector (the same
@@ -407,11 +456,25 @@ def assemble_fem_1d(
 
     dirichlet_pairs = _dirichlet_dofs(domain, dirichlet_values, vec)
     residual_free = _make_residual(
-        domain, volume_terms, boundary_terms, n_nodes=n_nodes, vec=vec, quad_degree=quad_degree, order=order
+        domain,
+        volume_terms,
+        boundary_terms,
+        n_nodes=n_nodes,
+        vec=vec,
+        quad_degree=quad_degree,
+        order=order,
+        runtime_parameter_tags=runtime_parameter_tags,
+        field_param_names=field_param_names,
     )
 
     nonlinear = any(_is_obviously_nonlinear_in_unknown(domain, t) for t in all_terms)
     if nonlinear:
+        if runtime_parameter_tags:
+            raise NotImplementedError(
+                "jno.fem: a runtime parameter in a *nonlinear* 1D form is not supported yet — the 1D "
+                "parametric path is wired for the steady linear system. Linearize the form, or recover "
+                "the parameter through a linear one."
+            )
         residual = _apply_dirichlet_rows(residual_free, dirichlet_pairs)
         op = FemResidualOperator(
             residual_fn=lambda u, args=None: residual(jnp.asarray(u)),
@@ -425,10 +488,28 @@ def assemble_fem_1d(
     # `sparse_jacobian`. Memory is O(nnz) instead of O(N²), which is what lets a 1D problem run
     # at the node counts 1D actually wants.
     zeros = jnp.zeros(ndof)
-    A = residual_free.sparse_jacobian(zeros)
-    b = -residual_free(zeros)
-    A, b = _apply_dirichlet_symmetric(A, b, dirichlet_pairs)
-    return (A, b), "linear"
+
+    def _system(args=None):
+        A = residual_free.sparse_jacobian(zeros, args)
+        b = -residual_free(zeros, args)
+        return _apply_dirichlet_symmetric(A, b, dirichlet_pairs)
+
+    A0, b0 = _system(None)
+    if not runtime_parameter_tags:
+        return (A0, b0), "linear"
+    # Parametric: re-form A(θ), b(θ) from the runtime args per call, so ∂u/∂θ flows through the solve.
+    # Dirichlet elimination couples A and b (known columns move to the load), so each accessor assembles
+    # the pair and takes its half — correct by construction, at the cost of assembling twice per call.
+    return (
+        FemLinearSystem(
+            A0,
+            b0,
+            operator_fn=lambda args: _system(args)[0],
+            rhs_fn=lambda args: _system(args)[1],
+            runtime_parameter_exprs=_rt_param_exprs,
+        ),
+        "linear",
+    )
 
 
 def _apply_dirichlet_transient(M, A, c, dirichlet_pairs: List[Tuple[int, float]]):
@@ -753,7 +834,7 @@ def _make_multifield_residual_1d(domain, term_list, boundary_term_list, fields, 
 
         return R
 
-    def sparse_jacobian(u_flat):
+    def sparse_jacobian(u_flat, args=None):
         """``dR/du`` as a **BCOO** for the coupled block system, scattered from element blocks.
 
         A coupled term contributes, per element, one ``(2*vec_test, 2*vec_i)`` block per field ``i`` it

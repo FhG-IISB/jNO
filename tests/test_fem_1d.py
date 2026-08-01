@@ -202,6 +202,110 @@ def test_p2_transient_decays_to_analytic():
     assert np.linalg.norm(traj[-1] - exact) / np.linalg.norm(exact) < 5e-3
 
 
+_DUMMY_DOM = None
+
+
+def _dummy_domain():
+    global _DUMMY_DOM
+    if _DUMMY_DOM is None:
+        _DUMMY_DOM = jno.domain.from_array({"_": np.zeros((1, 1))})
+    return _DUMMY_DOM
+
+
+def _parametric_poisson(kappa, rhs_scale=1.0, ms=0.05, order=1):
+    """``-kappa u'' = rhs_scale * pi^2 sin(pi x)``, zero Dirichlet. ``kappa`` may be a float or a
+    ``jno.np.parameter`` (scalar or nodal field)."""
+    d = _line(ms)
+    u, phi = d.fem_symbols(order=order)
+    xi = d.variable("interior", split=True)[0]
+    xb = d.variable("boundary", split=True)[0]
+    ui, vi = u.bind(x=xi), phi.bind(x=xi)
+    f = rhs_scale * (np.pi**2) * jno.np.sin(np.pi * xi)
+    return jno.fem([kappa * (ui.x * vi.x) - f * vi, u(xb) - 0.0])
+
+
+def test_scalar_runtime_parameter_makes_the_system_parametric():
+    """A ``jno.np.parameter`` in a 1D form makes the system parametric — the differentiable-inverse
+    entry. This previously did not merely fail, it failed *cryptically*: the 1D assembler threaded no
+    runtime parameters at all, so the value never reached the kernel and it died with an internal
+    ``KeyError`` about ``InternalVars`` rather than any documented error."""
+    from jno.trace import FemLinearSystem
+
+    k = jno.np.parameter((1,), name="k")
+    k.initialize(jax.nn.initializers.constant(2.5))
+    fem = _parametric_poisson(k)
+    assert isinstance(fem.operator, FemLinearSystem) and fem.operator.is_parametric
+    assert list(fem.operator.runtime_parameter_exprs) == ["k"]
+
+    node = fem.solve()
+    assert not isinstance(node, jax.Array), "a parametric 1D solve must be a trace node, not an array"
+    # evaluated at k, it must equal the non-parametric assembly at the same value
+    crux = jno.core([(node * 0.0).mae], domain=_dummy_domain())
+    got = np.asarray(crux.eval([node])).reshape(-1)
+    ref = np.asarray(_parametric_poisson(2.5).solve()).reshape(-1)
+    assert np.max(np.abs(got - ref)) < 1e-10, "parametric 1D solve disagrees with the constant-coefficient one"
+
+
+def test_1d_inverse_recovers_a_scalar_parameter():
+    """End to end: recover a diffusivity from full-field 1D data through ``crux.solve``. This is what
+    the missing parameter path cost — a *differentiable* library in which the cheapest, most natural
+    dimension for prototyping an inverse problem could not run one."""
+    import optax
+
+    k_true = 2.5
+    u_obs = np.asarray(_parametric_poisson(k_true, rhs_scale=k_true).solve()).reshape(-1)
+
+    k = jno.np.parameter((1,), name="k")
+    k.initialize(jax.nn.initializers.constant(1.0))
+    k.optimizer(optax.adam(0.15))
+    node = _parametric_poisson(k, rhs_scale=k_true).solve()
+    crux = jno.core([(node - u_obs).mae], domain=_dummy_domain())
+    crux.solve(220)
+    rec = float(np.asarray(crux.eval([k])).reshape(-1)[0])
+    assert abs(rec - k_true) < 0.05, f"kappa not recovered through the 1D inverse: {rec:.4f} vs {k_true}"
+
+
+def test_nodal_field_parameter_in_1d():
+    """A nodal FIELD parameter ``k(x)`` rides the same path: it is gathered per element and interpolated
+    with that element's shape functions. A *constant* field must therefore reproduce the equivalent
+    scalar-coefficient solve exactly — which is the check that the gather and interpolation line up."""
+    d = _line(0.05)
+    u, phi = d.fem_symbols()
+    xi = d.variable("interior", split=True)[0]
+    xb = d.variable("boundary", split=True)[0]
+    ui, vi = u.bind(x=xi), phi.bind(x=xi)
+    kf = jno.np.parameter(phi, name="kf")
+    kf.initialize(jax.nn.initializers.constant(2.0))
+    fem = jno.fem([kf * (ui.x * vi.x) - 1.0 * vi, u(xb) - 0.0])
+
+    crux = jno.core([(fem.solve() * 0.0).mae], domain=_dummy_domain())
+    got = np.asarray(crux.eval([fem.solve()])).reshape(-1)
+    x = np.asarray(fem.points).reshape(-1)
+    assert np.max(np.abs(got - x * (1.0 - x) / 4.0)) < 1e-12, "constant field k=2 must give u = x(1-x)/4"
+
+
+def test_1d_parameter_scope_limits_fail_loud():
+    """Scope, each with its own reason rather than one blanket refusal."""
+    # A field parameter is interpolated with the element's own shape functions, so its nodal layout must
+    # match the trial's and a P1 field cannot ride a LINE3 element. The refusal comes from
+    # `jno.np.parameter` itself, at construction -- earlier than assembly, and the better place for it.
+    d = _line(0.1)
+    _u, phi = d.fem_symbols(order=2)
+    with pytest.raises(NotImplementedError, match="P1|order=1"):
+        jno.np.parameter(phi, name="kf2")
+
+    # a parameter in a NONLINEAR 1D form: the parametric path is wired for the steady linear system
+    d2 = _line(0.1)
+    u2, p2 = d2.fem_symbols()
+    x2 = d2.variable("interior", split=True)[0]
+    xb2 = d2.variable("boundary", split=True)[0]
+    u2i, v2i = u2.bind(x=x2), p2.bind(x=x2)
+    k2 = jno.np.parameter((1,), name="k3")
+    k2.initialize(jax.nn.initializers.constant(1.0))
+    with pytest.raises(NotImplementedError, match="nonlinear"):
+        jno.fem([k2 * (u2i.x * v2i.x) + (u2 * u2) * v2i - 1.0 * v2i, u2(xb2) - 0.0])
+
+
 def test_order3_and_coupled_p2_fail_loud():
     """Scope, stated explicitly: 1D Lagrange is implemented for order 1 and 2, and the *coupled* 1D
     block assembler is still P1 — both refuse rather than silently solving at the wrong order."""
