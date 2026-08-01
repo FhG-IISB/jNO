@@ -529,10 +529,14 @@ def _fem_concrete_operator(fem):
         return A
 
     op = fem.operator
-    if getattr(fem, "_mode", None) == "complex":
+    # A complex fem is fused into a real 2n system at assembly, but a complex-native preconditioner
+    # (AMS) wants ``A_r + i·A_i`` — built from the Re/Im legs the fusion retains. The bare
+    # ``_mode == "complex"`` case is the un-fused Bloch remnant, whose operator IS the leg pair.
+    legs = getattr(fem, "_complex_legs", None) or (op if getattr(fem, "_mode", None) == "complex" else None)
+    if legs is not None:
         from ._fem import _complex_operator
 
-        return _complex_operator(_leg(op[0]), _leg(op[1]))
+        return _complex_operator(_leg(legs[0]), _leg(legs[1]))
     if hasattr(op, "evaluate"):  # a bare parametric FemLinearSystem
         return _leg(op)
     return _leg(op[0]) if hasattr(op[0], "evaluate") else op[0]  # (A, b) or (FemLinearSystem, …)
