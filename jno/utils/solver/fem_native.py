@@ -75,6 +75,7 @@ from .fem_utils import (
     bcoo_zero_rows,
     bcoo_zero_rows_cols,
     sum_duplicate_triplets,
+    unique_triplet_count,
 )
 from .parametric_helpers import _collect_runtime_parameter_exprs
 from .weak_form import (
@@ -1339,6 +1340,38 @@ def assemble_fem_native(
         identical to that global ``jacfwd``, just assembled within a per-element memory budget."""
         typed_with_masks, surface_work = _preprocess_terms(terms, bterms)
 
+        # --- hoist the (row, col) pattern out of the trace -------------------------------------
+        # The triplet INDICES come exclusively from host-static mesh connectivity (`cdofs`,
+        # `cell_all_dofs`, `parent_j`, `face_ids`) and the term list; only the element blocks `Ke`
+        # depend on `u_flat`/`t`/`args`. So the pattern -- and therefore the compressed nonzero count
+        # -- is the same at every state, time and parameter value this is ever traced at.
+        #
+        # Building it once here is what lets the TRACED assemblies compress: `sum_duplicates` needs a
+        # static `nse` under jit, and inferring one requires concrete indices it does not have inside
+        # the trace. This mirrors `fem_nonnodal._make_sparse_assembler`, which already hoists its
+        # `_vol_idx` the same way. Order must match the append order in `jacobian` exactly.
+        _idx_rows, _idx_cols = [], []
+        for _coeff_s, _tfi_s, _rn_s in typed_with_masks:
+            _sh = (n_cells, int(cdofs[_tfi_s].shape[1]), int(cell_all_dofs.shape[1]))
+            _idx_rows.append(jnp.broadcast_to(cdofs[_tfi_s][:, :, None], _sh).reshape(-1))
+            _idx_cols.append(jnp.broadcast_to(cell_all_dofs[:, None, :], _sh).reshape(-1))
+        for _region_s, _face_ids_s, _btyped_s in surface_work:
+            _pc = parent_j[jnp.asarray(_face_ids_s, dtype=jnp.int32)]
+            _fcols = cell_all_dofs[_pc]
+            for _bcoeff_s, _btfi_s in _btyped_s:
+                _sh = (int(_pc.shape[0]), int(cdofs[_btfi_s].shape[1]), int(cell_all_dofs.shape[1]))
+                _idx_rows.append(jnp.broadcast_to(cdofs[_btfi_s][_pc][:, :, None], _sh).reshape(-1))
+                _idx_cols.append(jnp.broadcast_to(_fcols[:, None, :], _sh).reshape(-1))
+        _idx_static = (
+            jnp.stack([jnp.concatenate(_idx_rows).astype(jnp.int32), jnp.concatenate(_idx_cols).astype(jnp.int32)], axis=1)
+            if _idx_rows
+            else None
+        )
+        try:
+            _nse_static = unique_triplet_count(_idx_static) if _idx_static is not None else None
+        except Exception:  # noqa: BLE001 -- a traced pattern would break the static-count invariant
+            _idx_static, _nse_static = None, None  # fall back to the uncompressed (still correct) path
+
         def jacobian(u_flat, t=0.0, args=None):
             # Assemble into COO triplets and build a BCOO -- never materialises the dense (total, total)
             # matrix (O(nnz), GPU-able at large N). Each per-element block is element-sized; duplicate
@@ -1380,9 +1413,21 @@ def assemble_fem_native(
 
             if not data_l:  # no terms -> empty operator
                 return jsparse.BCOO((jnp.zeros((0,), u_flat.dtype), jnp.zeros((0, 2), jnp.int32)), shape=(total, total))
-            idx = jnp.stack([jnp.concatenate(rows_l).astype(jnp.int32), jnp.concatenate(cols_l).astype(jnp.int32)], axis=1)
-            return jsparse.BCOO((jnp.concatenate(data_l), idx), shape=(total, total))
+            if _idx_static is not None:
+                idx = _idx_static
+            else:  # pattern could not be hoisted -> rebuild it in-trace, uncompressed but correct
+                idx = jnp.stack(
+                    [jnp.concatenate(rows_l).astype(jnp.int32), jnp.concatenate(cols_l).astype(jnp.int32)], axis=1
+                )
+            A = jsparse.BCOO((jnp.concatenate(data_l), idx), shape=(total, total))
+            # ~21x fewer stored triplets, and this runs inside the trace -- so it reaches the
+            # nonlinear Jacobian and the per-step/parametric re-assemblies, not just eager assembly.
+            return sum_duplicate_triplets(A, nse=_nse_static) if _nse_static is not None else A
 
+        # Published so a wrapper that APPENDS triplets (the Dirichlet row-replacement below) can
+        # derive its own static count from the same pattern instead of re-deriving one that might
+        # disagree with it.
+        jacobian._jno_static_idx = _idx_static  # type: ignore[attr-defined]
         return jacobian
 
     def _dirichlet_jac_rows(jac_fn, pairs):
@@ -1393,8 +1438,25 @@ def assemble_fem_native(
             return jac_fn
         dofs = jnp.asarray([p[0] for p in pairs], dtype=jnp.int32)
 
+        # `bcoo_set_dirichlet_rows` zeroes the constrained rows and then APPENDS one (d, d, 1) triplet
+        # per constrained DOF, so its output carries up to `len(dofs)` duplicates however well the
+        # inner Jacobian was compressed. That count is static too: the union of the inner pattern with
+        # the Dirichlet diagonal. Derived from the inner assembler's own published pattern so the two
+        # cannot disagree; without it, fall back to leaving the appended duplicates in place.
+        _inner_idx = getattr(jac_fn, "_jno_static_idx", None)
+        _nse_dir = None
+        if _inner_idx is not None:
+            try:
+                _d_np = np.asarray(dofs, dtype=np.int64).reshape(-1)
+                _nse_dir = unique_triplet_count(
+                    np.concatenate([np.asarray(_inner_idx), np.stack([_d_np, _d_np], axis=1)], axis=0)
+                )
+            except Exception:  # noqa: BLE001 -- no static count available; correctness is unaffected
+                _nse_dir = None
+
         def jac(u_flat):
-            return bcoo_set_dirichlet_rows(jac_fn(jnp.asarray(u_flat)), dofs)
+            A = bcoo_set_dirichlet_rows(jac_fn(jnp.asarray(u_flat)), dofs)
+            return sum_duplicate_triplets(A, nse=_nse_dir) if _nse_dir is not None else A
 
         return jac
 

@@ -157,14 +157,181 @@ def test_1d_steady_operator_is_compressed():
 
 
 # ---------------------------------------------------------------------------------------------
+# nonlinear Jacobian — assembled INSIDE the trace, via the hoisted static pattern
+# ---------------------------------------------------------------------------------------------
+
+
+def _nonlinear(kind):
+    """``(1 + u²)∇u·∇v`` — nonlinear in the unknown, so the Jacobian is re-assembled per Newton step."""
+    if kind == "3d":
+        d = jno.domain(jno.Shape.box(0, 0, 0, 1, 1, 1), mesh_size=0.3)
+        u, v = d.fem_symbols()
+        i, b = d.variable("interior", split=True), d.variable("boundary", split=True)
+        a, c = u.bind(x=i[0], y=i[1], z=i[2]), v.bind(x=i[0], y=i[1], z=i[2])
+        return jno.fem([(1.0 + a**2) * (a.x * c.x + a.y * c.y + a.z * c.z) - 1.0 * c, u(b[0], b[1], b[2]) - 0.0])
+    d = jno.domain(jno.Shape.rect(0, 0, 1, 1), mesh_size=0.18)
+    u, v = d.fem_symbols()
+    i = d.variable("interior", split=True)
+    r, ln = d.variable("right", split=True), d.variable("left", split=True)
+    a, c = u.bind(x=i[0], y=i[1]), v.bind(x=i[0], y=i[1])
+    if kind == "surface":  # a Robin term -> exercises the surface half of the hoisted pattern
+        ar, cr = u.bind(x=r[0], y=r[1]), v.bind(x=r[0], y=r[1])
+        return jno.fem([(1.0 + a**2) * (a.x * c.x + a.y * c.y) - 1.0 * c, 3.0 * ar * cr, u(ln[0], ln[1]) - 0.0])
+    b = d.variable("boundary", split=True)
+    return jno.fem([(1.0 + a**2) * (a.x * c.x + a.y * c.y) - 1.0 * c, u(b[0], b[1]) - 0.0])
+
+
+@pytest.mark.parametrize("kind", ["2d", "3d", "surface"])
+def test_traced_jacobian_is_compressed_and_still_the_right_matrix(kind):
+    """The keystone: compression inside the trace, checked against an INDEPENDENT Jacobian.
+
+    ``sum_duplicates`` needs a static ``nse`` under ``jit`` and infers it from concrete indices it
+    does not have mid-trace, so the traced assemblies could not compress at all — which excluded the
+    most redundant operator in the library (measured 9.6x on a 3-D nonlinear Jacobian: 36752 stored
+    triplets -> 3841, 0.561 -> 0.059 MiB, matvec 6.6x faster). The pattern is hoisted host-side
+    because the triplet INDICES come only from mesh connectivity and the term list.
+
+    Checked against ``jacfwd`` of the residual, and that choice of oracle is the whole point. A
+    rebuild from the operator's own triplets would be self-consistent: if the hoisted pattern were
+    wrong the data would land in the wrong entries and the rebuild would agree with the wrong answer.
+    An independent Jacobian is the only reference that can catch it — and a wrong static count is a
+    silently WRONG operator (``sum_duplicates`` drops entries when ``nse`` is too small), not merely a
+    slower one, so this needs the strong oracle rather than a solve that happens to converge."""
+    fem = _nonlinear(kind)
+    n = int(fem.dofs)
+    J, R = fem._op.jacobian, fem._op.residual  # sparse handle; the public .jacobian densifies
+
+    for seed, scale in ((None, 0.0), (7, 0.3)):
+        u0 = jax.numpy.asarray(np.zeros(n) if seed is None else np.random.default_rng(seed).standard_normal(n) * scale)
+        A_eager = J(u0)
+        A_traced = jax.jit(J)(u0)
+
+        idx = np.asarray(A_traced.indices)
+        assert idx.min() >= 0 and idx.max() < n, "an out-of-bounds padding index leaked into the operator"
+        _assert_compressed(A_traced, f"traced nonlinear Jacobian ({kind})")
+
+        ref = np.asarray(jax.jacfwd(lambda w: jax.numpy.asarray(R(w)).reshape(-1))(u0))
+        got = np.asarray(A_traced.todense())
+        scale_ref = max(1.0, float(np.max(np.abs(ref))))
+        assert np.max(np.abs(got - ref)) / scale_ref < 1e-11, "the compressed Jacobian is not the Jacobian"
+        assert np.max(np.abs(np.asarray(A_eager.todense()) - got)) / scale_ref < 1e-11, "jit changed the operator"
+
+
+def test_the_static_pattern_does_not_depend_on_the_state():
+    """What makes a *static* count legitimate: the pattern is fixed by mesh and terms, so the same
+    ``nse`` must serve every state the assembler is traced at. If it varied with ``u``, caching one
+    count would drop entries at some other state — a wrong answer that no single-state test sees."""
+    fem = _nonlinear("3d")
+    n = int(fem.dofs)
+    J = jax.jit(fem._op.jacobian)
+    rng = np.random.default_rng(0)
+    counts = {int(J(jax.numpy.asarray(rng.standard_normal(n) * s)).nse) for s in (0.0, 0.1, 1.0, 10.0)}
+    assert len(counts) == 1, f"nse varies with the state: {sorted(counts)}"
+
+
+def test_newton_still_converges_on_the_compressed_jacobian():
+    """The Jacobian is not an output — it drives Newton. Compression must not disturb that."""
+    fem = _nonlinear("2d")
+    u = np.asarray(fem.solve()).reshape(-1)
+    assert np.all(np.isfinite(u))
+    assert u.max() > 0.0, "the source must lift the interior"
+    assert u.min() > -1e-8, f"unexpected undershoot {u.min():.3e}"
+
+
+# ---------------------------------------------------------------------------------------------
 # the compression primitive itself
 # ---------------------------------------------------------------------------------------------
 
 
+def test_static_nse_must_be_exact_or_entries_are_dropped():
+    """The failure mode that makes ``unique_triplet_count`` a correctness requirement rather than an
+    optimisation, pinned so nobody later "optimises" it into an estimate.
+
+    A too-small ``nse`` does not raise and does not merely cost accuracy — it silently discards
+    triplets, producing a different matrix. Also pins ``remove_zeros=False``: with removal on,
+    ``sum_duplicates`` pads out to ``nse`` using OUT-OF-BOUNDS indices, which the AMG/AMS CSR
+    conversions would turn into a row that does not exist."""
+    import jax.experimental.sparse as jsp
+    import jax.numpy as jnp
+
+    from jno.utils.solver.fem_utils import sum_duplicate_triplets, unique_triplet_count
+
+    rng = np.random.default_rng(0)
+    n, nnz = 40, 500
+    idx = np.stack([rng.integers(0, n, nnz), rng.integers(0, n, nnz)], axis=1).astype(np.int32)
+    data = rng.standard_normal(nnz)
+    raw = jsp.BCOO((jnp.asarray(data), jnp.asarray(idx)), shape=(n, n))
+
+    k = unique_triplet_count(idx)
+    assert k == len({tuple(t) for t in idx}), "the count must be the exact number of distinct pairs"
+
+    packed = sum_duplicate_triplets(raw, nse=k)
+    assert int(packed.nse) == k
+    assert np.asarray(packed.indices).max() < n, "no out-of-bounds padding may be emitted"
+    dense = np.zeros((n, n))
+    np.add.at(dense, (idx[:, 0], idx[:, 1]), data)
+    assert np.max(np.abs(np.asarray(packed.todense()) - dense)) < 1e-12
+
+    # the hazard itself: one short and the operator is quietly wrong, with no error raised
+    short = sum_duplicate_triplets(raw, nse=k - 1)
+    assert np.max(np.abs(np.asarray(short.todense()) - dense)) > 1e-9, (
+        "a too-small nse must visibly change the matrix — if it did not, the exactness requirement "
+        "would be untestable and could rot"
+    )
+
+
+def test_dropping_an_explicit_zero_is_invisible_to_the_preconditioners():
+    """Compression removes numerically-zero triplets, which changes the *pattern*. The docstring
+    claims that is safe for the diagonal-reading preconditioners; this is that claim under test
+    rather than under assertion.
+
+    ``matrix_diagonal`` scatter-*adds* only on-diagonal triplets, so a dropped zero contributes
+    nothing and a stored zero contributes nothing — identical by construction. ``jacobi`` then guards
+    ``|d| > 1e-30``, so a diagonal that is zero either way is left unscaled instead of producing
+    ``inf``. Checked on a saddle-shaped operator whose zero diagonal block is exactly the case where
+    the distinction could have mattered."""
+    import jax.experimental.sparse as jsp
+    import jax.numpy as jnp
+
+    from jno.utils.solver.linear import jacobi, matrix_diagonal
+
+    n = 12
+    rows = list(range(n)) + [0, 5]
+    cols = list(range(n)) + [3, 9]
+    vals = [1.0 + i for i in range(n - 4)] + [0.0] * 4 + [2.0, -1.5]  # four EXPLICIT zero diagonals
+    with_zeros = jsp.BCOO((jnp.asarray(vals), jnp.asarray(np.stack([rows, cols], 1), dtype=jnp.int32)), shape=(n, n))
+    keep = [i for i, v in enumerate(vals) if v != 0.0]  # the same operator with the zeros dropped
+    without = jsp.BCOO(
+        (
+            jnp.asarray([vals[i] for i in keep]),
+            jnp.asarray(np.stack([[rows[i] for i in keep], [cols[i] for i in keep]], 1), dtype=jnp.int32),
+        ),
+        shape=(n, n),
+    )
+    assert without.nse < with_zeros.nse
+
+    assert np.allclose(np.asarray(matrix_diagonal(with_zeros)), np.asarray(matrix_diagonal(without)))
+    x = jnp.asarray(np.random.default_rng(0).standard_normal(n))
+    got_a, got_b = np.asarray(jacobi(with_zeros)(x)), np.asarray(jacobi(without)(x))
+    assert np.allclose(got_a, got_b), "jacobi must not see the difference"
+    assert np.all(np.isfinite(got_a)), "a zero diagonal must be left unscaled, not divided by"
+
+
+def test_unique_count_refuses_a_traced_index_array():
+    """It must not guess. Every caller derives its pattern from host-static mesh connectivity, so a
+    tracer here means that invariant broke — and a guessed count is a wrong matrix."""
+    import jax.numpy as jnp
+
+    from jno.utils.solver.fem_utils import unique_triplet_count
+
+    with pytest.raises(Exception):
+        jax.jit(lambda i: unique_triplet_count(i))(jnp.zeros((4, 2), jnp.int32))
+
+
 def test_traced_operators_are_returned_untouched_not_broken():
-    """``sum_duplicates`` infers ``nse``, which needs concrete indices, so a traced assembly cannot be
-    compressed yet. The contract is that it degrades to *uncompressed*, never to an error — the
-    parametric and per-step paths depend on that until the pattern is hoisted host-side."""
+    """Without a static ``nse``, ``sum_duplicates`` cannot run under trace. The contract is that it
+    degrades to *uncompressed*, never to an error — the paths whose pattern could not be hoisted (the
+    parametric placeholders, the per-step transient re-assembly) still depend on that."""
     import jax.experimental.sparse as jsp
     import jax.numpy as jnp
 

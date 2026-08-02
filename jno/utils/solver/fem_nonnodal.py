@@ -144,6 +144,7 @@ def assemble_fem_nonnodal(
         bcoo_set_dirichlet_rows,
         bcoo_zero_rows_cols,
         sum_duplicate_triplets,
+        unique_triplet_count,
     )
     from .weak_form import (
         _apply_sign,
@@ -748,6 +749,11 @@ def assemble_fem_nonnodal(
             else jnp.zeros((0, 2), jnp.int32)
         )
 
+        try:
+            _vol_nse = unique_triplet_count(_vol_idx) if _vol_rows_l else None
+        except Exception:  # noqa: BLE001 -- a traced pattern breaks the static-count invariant
+            _vol_nse = None  # fall back to the uncompressed (still correct) operator
+
         def assemble(args=None, *, surface=True):
             _a = args or {}
             rt_scalar = {
@@ -800,9 +806,18 @@ def assemble_fem_nonnodal(
             # would cost O(n_dof²) just to re-sparsify, the memory wall for a 3-D vector run.
             sm = _surf_mass_of(args, sparse=True) if surface else None
             if sm is None:
-                return _jsparse.BCOO((data, _vol_idx), shape=(total, total))
+                A = _jsparse.BCOO((data, _vol_idx), shape=(total, total))
+                # `_vol_idx` is hoisted out of the trace already, so its unique count is host-static
+                # and the compression runs INSIDE the trace -- which is what reaches the parametric
+                # and per-step N1E/RT re-assemblies, the 3-D vector runs where memory is the wall.
+                return sum_duplicate_triplets(A, nse=_vol_nse) if _vol_nse is not None else A
             idx = jnp.concatenate([_vol_idx, sm.indices], axis=0)  # BCOO sums duplicate (i, j) on materialisation
             data = jnp.concatenate([data, sm.data])
+            # Deliberately NOT compressed. The static count would have to cover `sm.indices`, which is
+            # produced inside the trace by `_surf_mass_of(args)`; assuming it is args-independent and
+            # caching a count on that assumption is exactly the failure mode a static `nse` has -- too
+            # small drops entries, silently, and returns a wrong operator rather than a slow one.
+            # Left uncompressed (correct, just redundant) until that pattern is hoisted as well.
             return _jsparse.BCOO((data, idx), shape=(total, total))
 
         return assemble

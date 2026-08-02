@@ -2440,7 +2440,7 @@ def bcoo_set_unit_diag(A, dofs):
     return jsparse.BCOO((jnp.concatenate([A.data, eye_dat]), jnp.concatenate([A.indices, eye_idx])), shape=A.shape)
 
 
-def sum_duplicate_triplets(A):
+def sum_duplicate_triplets(A, nse: int | None = None):
     """Collapse duplicate ``(row, col)`` triplets in an assembled BCOO. Exact, and a large win.
 
     The assemblers append one triplet block **per additive weak-form term** and never pre-sum, and on
@@ -2483,10 +2483,36 @@ def sum_duplicate_triplets(A):
     """
     if not hasattr(A, "indices"):
         return A
+    if nse is not None:
+        # Static-count path: works under trace. ``remove_zeros=False`` is deliberate and load-bearing.
+        # With removal on, the surviving count is data-dependent, so ``sum_duplicates`` pads the
+        # result out to ``nse`` using OUT-OF-BOUND indices ``(shape[0], shape[1])``. BCOO's own matvec
+        # ignores those, but jNO hands operators to consumers that read the triplets directly -- the
+        # AMG/AMS CSR conversion would build a row ``n`` that does not exist. Off, the output is
+        # exactly the unique-pair set with every index in bounds: purely structural, data-independent,
+        # no padding, and identical for every parameter value the assembler is traced at.
+        return A.sum_duplicates(nse=int(nse), remove_zeros=False)
     try:
         return A.sum_duplicates()  # nse inferred -> requires concrete indices
     except Exception:  # noqa: BLE001 — traced operator: leave it alone rather than fail the assembly
         return A
+
+
+def unique_triplet_count(indices) -> int:
+    """Host-side count of distinct ``(row, col)`` pairs -- the exact ``nse`` for the static path above.
+
+    Exactness is a correctness requirement, not an optimisation: ``sum_duplicates`` *drops* entries
+    when the requested ``nse`` is too small, which is a silently wrong operator rather than a slower
+    one. Computed with ``np.unique`` over the concrete index array the assembler is about to close
+    over, so the count and the pattern come from the same source and cannot drift apart.
+
+    Raises on a traced index array rather than guessing. Every caller builds its pattern from
+    host-static mesh connectivity, so a tracer here means that invariant broke, and the caller must
+    fall back to the uncompressed path rather than ship a wrong count."""
+    arr = np.asarray(indices)  # raises on a tracer -- deliberately not caught
+    if arr.size == 0:
+        return 0
+    return int(np.unique(arr.reshape(arr.shape[0], -1), axis=0).shape[0])
 
 
 def bcoo_set_dirichlet_rows(A, dofs):
