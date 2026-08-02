@@ -30,7 +30,34 @@ __all__ = [
     "spectrum_bounds",
 ]
 
-_TINY = 1e-300
+
+def _EPS_OF(dtype):
+    return jnp.finfo(jnp.dtype(dtype)).eps
+
+
+def _tiny_of(dtype):
+    """Smallest positive normal of ``dtype`` — the divide-by-zero floor for the breakdown guards.
+
+    One hard-coded constant cannot serve both precisions. The historical ``1e-300`` **underflows to
+    exactly 0.0 in float32** (whose smallest normal is ~1.18e-38), so every ``maximum(x, tiny)`` guard
+    below degenerated into ``maximum(x, 0.0)`` and divided by exact zero on breakdown, yielding
+    ``inf``/``NaN`` instead of a clamped value. Reciprocals stay finite either way: ``1/tiny`` is
+    ~8.5e37 (float32) and ~4.5e307 (float64), both representable.
+    """
+    return jnp.finfo(jnp.dtype(dtype)).tiny
+
+
+def _effective_tol(tol, dtype, *, floor_factor=4.0):
+    """The relative tolerance ``dtype`` can actually reach.
+
+    A tolerance below unit round-off is unsatisfiable: the residual norm cannot fall below
+    ``~eps*||b||``, so the ``while_loop`` runs to ``maxiter`` on a system it has already solved. The
+    shipped default ``tol=1e-8`` is exactly such a request in float32 (eps 1.2e-7).
+
+    Floored at a small multiple of eps. **float64 is untouched** for any tolerance anyone passes in
+    practice (the floor there is ~8.9e-16), so this changes no existing result.
+    """
+    return float(max(float(tol), floor_factor * float(_EPS_OF(dtype))))
 
 
 def _ident(v):
@@ -62,14 +89,16 @@ def fgmres(matvec, b, *, M=None, x0=None, tol=1e-8, restart=30, maxiter=1000):
     n = b.shape[0]
     m = int(min(restart, n))
     x0 = jnp.zeros_like(b) if x0 is None else jnp.asarray(x0).reshape(-1)
+    tiny = _tiny_of(b.dtype)  # float32-safe breakdown floor (see _tiny_of)
+    tol = _effective_tol(tol, b.dtype)  # a sub-eps request cannot converge; floor it
     bnorm = jnp.linalg.norm(b)
-    tol_abs = tol * jnp.maximum(bnorm, _TINY)
+    tol_abs = tol * jnp.maximum(bnorm, tiny)
     max_cycles = -(-int(maxiter) // m)  # ceil
 
     def cycle(x):
         r0 = b - matvec(x)
         beta = jnp.linalg.norm(r0)
-        V = jnp.zeros((m + 1, n), b.dtype).at[0].set(r0 / jnp.maximum(beta, _TINY))
+        V = jnp.zeros((m + 1, n), b.dtype).at[0].set(r0 / jnp.maximum(beta, tiny))
         Z = jnp.zeros((m, n), b.dtype)
         H = jnp.zeros((m + 1, m), b.dtype)
         g = jnp.zeros((m + 1,), b.dtype).at[0].set(beta)
@@ -101,13 +130,13 @@ def fgmres(matvec, b, *, M=None, x0=None, tol=1e-8, restart=30, maxiter=1000):
 
             # new rotation annihilating the subdiagonal entry
             denom = jnp.sqrt(hcol[j] ** 2 + hcol[j + 1] ** 2)
-            c_new = hcol[j] / jnp.maximum(denom, _TINY)
-            s_new = hcol[j + 1] / jnp.maximum(denom, _TINY)
+            c_new = hcol[j] / jnp.maximum(denom, tiny)
+            s_new = hcol[j + 1] / jnp.maximum(denom, tiny)
             hcol = hcol.at[j].set(denom).at[j + 1].set(0.0)
             gj = g[j]
 
             new = (
-                V.at[j + 1].set(w / jnp.maximum(hj1, _TINY)),
+                V.at[j + 1].set(w / jnp.maximum(hj1, tiny)),
                 Z.at[j].set(z),
                 H.at[:, j].set(hcol),
                 g.at[j].set(c_new * gj).at[j + 1].set(-s_new * gj),
@@ -156,10 +185,13 @@ def minres(matvec, b, *, M=None, x0=None, tol=1e-8, maxiter=2000):
     b = jnp.asarray(b)
     x0 = jnp.zeros_like(b) if x0 is None else jnp.asarray(x0).reshape(-1)
 
+    tiny = _tiny_of(b.dtype)  # float32-safe breakdown floor (see _tiny_of)
+    tol = _effective_tol(tol, b.dtype)  # a sub-eps request cannot converge; floor it
+
     r1 = b - matvec(x0)
     y = M(r1)
     beta1 = jnp.sqrt(jnp.maximum(r1 @ y, 0.0))
-    tol_abs = tol * jnp.maximum(beta1, _TINY)
+    tol_abs = tol * jnp.maximum(beta1, tiny)
 
     # state: x, r1, r2, y, oldb, beta, dbar, epsln, phibar, cs, sn, w, w2, itn
     zeros = jnp.zeros_like(b)
@@ -186,11 +218,11 @@ def minres(matvec, b, *, M=None, x0=None, tol=1e-8, maxiter=2000):
 
     def body(s):
         x, r1, r2, y, oldb, beta, dbar, epsln, phibar, cs, sn, w, w2, itn = s
-        v = y / jnp.maximum(beta, _TINY)
+        v = y / jnp.maximum(beta, tiny)
         y = matvec(v)
-        y = y - jnp.where(itn >= 1, beta / jnp.maximum(oldb, _TINY), 0.0) * r1
+        y = y - jnp.where(itn >= 1, beta / jnp.maximum(oldb, tiny), 0.0) * r1
         alfa = v @ y
-        y = y - (alfa / jnp.maximum(beta, _TINY)) * r2
+        y = y - (alfa / jnp.maximum(beta, tiny)) * r2
         r1, r2 = r2, y
         y = M(r2)
         oldb, beta = beta, jnp.sqrt(jnp.maximum(r2 @ y, 0.0))
@@ -202,7 +234,7 @@ def minres(matvec, b, *, M=None, x0=None, tol=1e-8, maxiter=2000):
         epsln = sn * beta
         dbar = -cs * beta
         # next rotation
-        gamma = jnp.maximum(jnp.sqrt(gbar**2 + beta**2), _TINY)
+        gamma = jnp.maximum(jnp.sqrt(gbar**2 + beta**2), tiny)
         cs, sn = gbar / gamma, beta / gamma
         phi = cs * phibar
         phibar = sn * phibar
@@ -235,7 +267,7 @@ def power_iteration_bound(matvec, n, *, dtype=None, iters=30, M=None):
         v, _lam = carry
         w = M(matvec(v))
         lam = v @ w
-        return w / jnp.maximum(jnp.linalg.norm(w), _TINY), lam
+        return w / jnp.maximum(jnp.linalg.norm(w), _tiny_of(dtype)), lam
 
     _, lam = jax.lax.fori_loop(0, iters, step, (v0, jnp.asarray(1.0, dtype)))
     return jnp.abs(lam)
@@ -317,10 +349,6 @@ def nystrom_sketch(matvec, n, *, rank, key, dtype=None):
     return U, lam
 
 
-def _EPS_OF(dtype):
-    return jnp.finfo(jnp.dtype(dtype)).eps
-
-
 def nystrom_apply(U, lam, mu):
     r"""The Nyström **preconditioner** application ``P^{-1} v`` for ``A ≈ U diag(lam) U^T``.
 
@@ -390,8 +418,10 @@ def chebyshev_iteration(matvec, b, *, lmin, lmax, M=None, x0=None, tol=1e-8, max
     theta = 0.5 * (lmax + lmin)
     delta = 0.5 * (lmax - lmin)
     sigma1 = theta / delta
+    tiny = _tiny_of(b.dtype)  # float32-safe breakdown floor (see _tiny_of)
+    tol = _effective_tol(tol, b.dtype)  # a sub-eps request cannot converge; floor it
     bnorm = jnp.linalg.norm(b)
-    tol_abs = tol * jnp.maximum(bnorm, _TINY)
+    tol_abs = tol * jnp.maximum(bnorm, tiny)
 
     r = b - matvec(x)
     d = M(r) / theta
