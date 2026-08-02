@@ -73,20 +73,38 @@ def test_padding_is_exact_and_only_when_needed():
     assert n2 == 0 and d2.shape[0] == 10, "an already-divisible count must not be padded"
 
 
-def test_device_request_is_explicit_not_silently_expanded():
-    """``jno.core`` expands a default ``mesh=(1,1)`` to *all* visible devices. A FEM operator must
-    not: silently distributing an operator nobody asked to distribute is a behaviour change, and the
-    whole value of the default is that it changes nothing. An over-request fails loud instead."""
+def test_device_resolution_is_automatic_with_an_explicit_opt_out():
+    """Sharding is ON by default: the default resolves to every visible device.
+
+    The justification is that the realistic alternative is not a tuned single-device run, it is idle
+    silicon — a FEM solve uses one device and leaves the rest of a multi-GPU box unused — and the
+    change is answer-preserving (same operator, same solvers; only the reduction order moves).
+
+    The safety property that makes default-on acceptable is the one asserted hardest here: on a
+    single-device host, automatic resolves to ``[]``, i.e. the untouched single-device path. So the
+    default carries no risk on the machine that cannot verify it.
+
+    ``[]`` means "stay single-device", which is why 1, False and a one-device list all return it."""
     import jax
 
     from jno.utils.solver.sharding import resolve_devices
 
-    assert resolve_devices(None) == [], "the default must request no devices at all"
-    assert len(resolve_devices(1)) == 1
+    n_visible = len(jax.devices())
+    auto = resolve_devices(None)
+    assert resolve_devices(True) == auto, "True must mean the same as the default"
+    if n_visible == 1:
+        assert auto == [], "on a single-device host the default must not change anything"
+    else:
+        assert len(auto) == n_visible, "automatic must use every visible device"
+
+    # explicit opt-out, and the degenerate requests that mean the same thing
+    assert resolve_devices(False) == []
+    assert resolve_devices(1) == []
+    assert resolve_devices(jax.devices()[:1]) == []
 
     with pytest.raises(ValueError, match="positive device count"):
         resolve_devices(0)
     with pytest.raises(ValueError, match="only .* device"):
-        resolve_devices(len(jax.devices()) + 8)
+        resolve_devices(n_visible + 8)
     with pytest.raises(ValueError, match="empty device list"):
         resolve_devices([])
