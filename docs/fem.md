@@ -792,6 +792,30 @@ communication).
 **What shards:** the default steady-linear solve, and the slot-composed solve
 (`linear=` any Krylov solver, with `precond=None` or `jno.precond.jacobi()`).
 
+**Parametric / differentiate-through solves shard too, but only on an explicit `shard=`:**
+
+```python
+u = fem.solve(linear=jno.solve.bicgstab(), precond=jno.precond.jacobi(), shard=4)
+```
+
+`device_put` cannot place a tracer, so this route uses `lax.with_sharding_constraint` from inside the
+trace. Gradients flow through it unchanged. It is opt-in rather than automatic for a safety reason,
+not out of caution: inside a trace jNO is a guest in someone else's computation, and a sharding
+constraint has to agree with the device commitments of every other value in that `jit`. Under `crux`
+it does not — the optimiser's parameters arrive committed to a single device while the constraint
+spans all of them, and JAX rejects the mix. That conflict cannot be detected in advance
+(`get_abstract_mesh()` is empty there) and cannot be caught locally, because it surfaces when the
+*outer* `jit` compiles, long after the solve was traced. There is no fallback to write, so automatic
+placement leaves traced operators alone; an explicit `shard=` is a request you can diagnose.
+
+> Two traps on this route were invisible in the answers and only showed up in the compiled HLO, which
+> is why the tests assert on collectives rather than on values. Padding the triplet axis to a multiple
+> of the device count makes XLA `all-gather` the **whole operator** onto every device to feed the
+> concatenate; constraining an *uneven* axis makes it gather the index array instead (the same 8 bytes
+> per triplet as the data). Both produced correct answers and correct gradients with the memory saving
+> entirely gone. jNO therefore shards the divisible prefix and leaves the sub-device-count tail
+> replicated — at most 3 triplets on a 4-device run.
+
 **What does not** — each falls back silently to the single-device path rather than raising:
 
 | | why |
@@ -802,7 +826,7 @@ communication).
 | `precond=amg()` / `ams()` | the hierarchy is built host-side through scipy/pyamg; distributing the V-cycle is a distributed-AMG project, not a placement change |
 | `precond=chebyshev()` / `form()` | not wired yet, and **not** a hard limit — Chebyshev is matvec-only by construction (spectral bounds by power iteration), so it composes with the sharded matvec directly; `form`'s auxiliary operator is just another assembled BCOO |
 | other `precond=` | the applier closes over the assembled operator, so a full copy would be replicated anyway. Jacobi is the exception: it needs only the diagonal, computed from the *sharded* triplets |
-| parametric / differentiate-through solves | not wired yet — **not** a hard limit. `device_put` cannot place a tracer, but `lax.with_sharding_constraint` is expressed *inside* the trace and does: verified to emit `all-reduce`, no `all-gather`, with gradients flowing through |
+| parametric / differentiate-through solves | **opt-in only** — needs an explicit `shard=`, see below |
 | transient | not wired yet. A sharding constraint inside the `lax.scan` body already produces the right collectives with the operator still closed over; threading it in as a jit argument additionally makes the per-device footprint provable (measured: exactly `nnz/N` per device) |
 
 No speedup figure is quoted here because none has been measured — the development machine has one

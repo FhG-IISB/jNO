@@ -47,6 +47,7 @@ __all__ = [
     "pad_triplets",
     "shard_triplets",
     "sharded_solve",
+    "constrain_operator",
     "jacobi_from_diagonal",
     "describe",
 ]
@@ -151,6 +152,77 @@ def sharded_solve(A, b, solve_fn, devices, *, precond_fn=None, x0=None):
 
     in_shardings = (shard_spec, shard_spec, repl, None if x0_s is None else repl)
     return jax.jit(_run, in_shardings=in_shardings, out_shardings=repl)(data_s, idx_s, b_s, x0_s)
+
+
+def constrain_operator(A, devices):
+    """Partition a **traced** operator's triplets, returning ``(matvec, diag_fn)``.
+
+    The concrete route (:func:`sharded_solve`) places ``data``/``indices`` with ``device_put`` and
+    ``jit(in_shardings=...)``, and ``device_put`` cannot place a tracer. That excluded every
+    parametric and differentiate-through solve -- which is where jNO spends its largest problems.
+
+    ``lax.with_sharding_constraint`` is the way in: it is expressed *inside* the trace, so it applies
+    to a tracer, and it partitions the same nonzero axis for the same one ``all-reduce``. Verified on
+    simulated devices to emit ``all-reduce``, **no** ``all-gather``, and to carry a gradient through.
+
+    Returns the pieces rather than running a solve, because here the caller is already inside the
+    trace: there is no ``jit`` boundary of ours to hang ``in_shardings`` on, and wrapping one would
+    close over the operator (constant-folded, replicated -- the failure this whole module exists to
+    avoid). ``diag_fn`` is the same scatter-add restricted to ``row == col``, so a Jacobi
+    preconditioner distributes with the matvec instead of forcing an assembled matrix.
+
+    One honest caveat: with the operator arriving as a traced value rather than a placed argument,
+    the per-device footprint is a compiler decision expressed by the constraint, not something the
+    caller can measure with ``memory_analysis`` the way the concrete route can.
+    """
+    from jax.lax import with_sharding_constraint
+
+    mesh = operator_mesh(devices)
+    n = int(A.shape[0])
+    # NOT padded, deliberately. `pad_triplets` exists because `device_put` raises IndivisibleError on
+    # a triplet count that does not divide the device count -- but `with_sharding_constraint` handles
+    # an uneven axis itself. Padding here is actively harmful: the `jnp.concatenate` is performed on
+    # replicated data, and XLA then inserts an `all-gather` of the WHOLE operator to feed it, undoing
+    # the partition entirely. Measured on a 4-device run: 898 triplets (padded to 900) emitted an
+    # `all-gather` of f64[900] -- the full operator on every device -- while 896 (already divisible,
+    # so unpadded) emitted none. Answers and gradients were correct either way, which is exactly why
+    # this has to be checked on the collectives rather than on values.
+    # Shard the DIVISIBLE PREFIX and leave the sub-device-count tail replicated.
+    #
+    # An uneven triplet axis is the trap here, and it is invisible in the answers. Both obvious
+    # approaches make XLA `all-gather` the whole operator back onto every device -- padding to a
+    # multiple of the device count (the `jnp.concatenate` runs on replicated data and is fed by an
+    # `all-gather` of f64[900] for an 898-triplet operator), and constraining the uneven axis directly
+    # (XLA's own uneven-sharding path gathers s32[900,1], the indices, which cost the same 8 bytes per
+    # triplet as the data). Measured both; each time the results and gradients were correct and the
+    # memory saving was entirely gone.
+    #
+    # A divisible axis compiles clean, so the operator is split: the first `(nnz // nd) * nd` triplets
+    # shard, and the remaining FEWER THAN `nd` triplets stay replicated. That tail is at most 3
+    # triplets on a 4-device run -- a rounding error against an operator of thousands -- and its
+    # scatter-add is exact, so the two partial results simply add.
+    nd = len(np.asarray(devices).reshape(-1))
+    nnz = int(A.data.shape[0])
+    m = (nnz // nd) * nd
+    spec = NamedSharding(mesh, P(SHARD_AXIS))
+    data = with_sharding_constraint(A.data[:m], spec)
+    rows = with_sharding_constraint(A.indices[:m, 0], spec)
+    cols = with_sharding_constraint(A.indices[:m, 1], spec)
+    t_data, t_rows, t_cols = A.data[m:], A.indices[m:, 0], A.indices[m:, 1]
+
+    def matvec(v):
+        out = jax.ops.segment_sum(data * v[cols], rows, num_segments=n)
+        if m < nnz:
+            out = out + jax.ops.segment_sum(t_data * v[t_cols], t_rows, num_segments=n)
+        return out
+
+    def diag_fn():
+        d = jax.ops.segment_sum(jnp.where(rows == cols, data, 0.0), rows, num_segments=n)
+        if m < nnz:
+            d = d + jax.ops.segment_sum(jnp.where(t_rows == t_cols, t_data, 0.0), t_rows, num_segments=n)
+        return d
+
+    return matvec, diag_fn
 
 
 def jacobi_from_diagonal(diag):

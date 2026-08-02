@@ -140,6 +140,55 @@ def main(n_dev: int) -> None:
     if n_dev > 1:
         assert len(x_direct.sharding.device_set) == 1, "a direct solve must NOT claim to be sharded"
 
+    # --- 5. TRACED (parametric / differentiate-through) operators -------------------------------
+    # `device_put` cannot place a tracer, so this route uses `with_sharding_constraint` from inside
+    # the trace. Two traps here were invisible in the answers and only showed up in the HLO, so this
+    # asserts on collectives: padding the triplet axis to a multiple of the device count made XLA
+    # `all-gather` the whole operator to feed the concatenate, and constraining an UNEVEN axis made it
+    # gather the index array. Hence the divisible-prefix + replicated-tail split.
+    import jax.experimental.sparse as _jsp
+
+    from jno.utils.solver.solver_api import compose_linear_solve_fn as _compose
+
+    for nnz_off in (0, 1, 2, 3):  # exercise every remainder against the device count
+        rr, cc, dd = _spd_triplets(n)
+        keep = len(dd) - nnz_off
+        idx_t = jnp.asarray(np.stack([rr[:keep], cc[:keep]], 1))
+        dat_t = jnp.asarray(dd[:keep])
+        dense_t = np.zeros((n, n))
+        np.add.at(dense_t, (rr[:keep], cc[:keep]), dd[:keep])
+        b_t = jnp.asarray(rng.standard_normal(n))
+        ref_t = np.linalg.solve(dense_t, np.asarray(b_t))
+
+        solver = _compose(jno.solve.bicgstab(tol=1e-12, maxiter=5000), jno.precond.jacobi(), None, None, shard=devices)
+        f = lambda th, _i=idx_t, _d=dat_t, _b=b_t, _s=solver: _s(_jsp.BCOO((th * _d, _i), shape=(n, n)), _b)  # noqa: E731
+        got = np.asarray(jax.jit(f)(jnp.asarray(1.0, dat_t.dtype)))
+        assert np.linalg.norm(got - ref_t) / np.linalg.norm(ref_t) < 1e-8, f"traced solve, remainder {nnz_off}"
+
+        hlo_t = jax.jit(f).lower(jnp.asarray(1.0, dat_t.dtype)).compile().as_text()
+        if n_dev > 1:
+            assert "all-reduce" in hlo_t, f"traced operator not partitioned (remainder {nnz_off})"
+        assert "all-gather" not in hlo_t, (
+            f"remainder {nnz_off}: the operator is being reconstituted on every device -- correct "
+            f"answers, zero memory saving, which is the failure this whole module guards against"
+        )
+        # and the gradient must still reach the parameter through the sharded solve
+        g = jax.grad(lambda th, _f=f: jnp.sum(_f(th)))(jnp.asarray(1.0, dat_t.dtype))
+        assert np.isfinite(float(g)), f"gradient lost through the sharded traced solve (remainder {nnz_off})"
+
+    # --- 6. AUTOMATIC must leave traced operators alone -----------------------------------------
+    # Inside a trace we are a guest: a sharding constraint must agree with the device commitments of
+    # every other value in that jit, and under `crux` it does not (parameters arrive committed to one
+    # device). That conflict is undetectable in advance and surfaces when the OUTER jit compiles, so
+    # there is no fallback to write -- automatic placement must therefore not touch traced operators.
+    auto = _compose(jno.solve.bicgstab(tol=1e-12, maxiter=5000), jno.precond.jacobi(), None, None, shard=None)
+    rr, cc, dd = _spd_triplets(n)
+    idx_a, dat_a = jnp.asarray(np.stack([rr, cc], 1)), jnp.asarray(dd)
+    b_a = jnp.asarray(rng.standard_normal(n))
+    fa = lambda th: auto(_jsp.BCOO((th * dat_a, idx_a), shape=(n, n)), b_a)  # noqa: E731
+    hlo_a = jax.jit(fa).lower(jnp.asarray(1.0, dat_a.dtype)).compile().as_text()
+    assert "all-reduce" not in hlo_a, "automatic must not shard a TRACED operator -- it can break crux"
+
     print(f"OK n_devices={n_dev} per_device_nnz={per_device} pad={n_pad}")
 
 
