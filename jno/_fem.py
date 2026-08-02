@@ -1145,7 +1145,15 @@ class FEM:
         self.problem = getattr(domain, "_fem_problem", None)
         self._periodic = None  # periodic-tie reduction (prolongation P), attached by fem()
         self._complex_n = None  # half-size n when _op is a fused complex real-equivalent 2n system
-        self._complex_legs = None  # the (re, im) legs a complex-native precond (AMS) still needs
+        # The unfused (re, im) legs. KNOWN CONSUMERS — check all of them before changing this or the
+        # fused layout, since a stale reader does not crash (see the `operator` docstring: the fused
+        # value is also a 2-tuple, so it keeps unpacking and silently means something else):
+        #   * jno.precond            — `_complex_operator(A_r, A_i)` for the complex-native AMS route
+        #   * jno.rcwa `_source_kin` — reads the incident load off the imaginary leg
+        #   * FEM.solve              — the complex-native precond branch
+        #   * tests/test_fem_nedelec_{complex,anisotropic,impedance,incident}.py,
+        #     tests/test_fem_nonnodal_sparse_assembly.py — assert on the legs directly
+        self._complex_legs = None
         self._periodic_2n = None  # blkdiag(P, P): the periodic reduction of that 2n system
         self._offsets = offsets  # per-field block offsets for the native non-nodal path (else problem.offset)
         self._term_source = None  # (domain, volume_terms); attached by fem() for the provisional term_kinds accessor
@@ -1187,7 +1195,16 @@ class FEM:
     @property
     def operator(self) -> Any:
         """The raw assembled block — ``(A, b)`` / ``FemLinearSystem`` /
-        ``FemResidualOperator`` (steady) or ``SemidiscreteTimeBlock`` (transient)."""
+        ``FemResidualOperator`` (steady) or ``SemidiscreteTimeBlock`` (transient).
+
+        **A COMPLEX problem returns the fused real ``2n`` block**, i.e. an ordinary ``(A, b)`` over
+        ``x = [x_r; x_i]`` — NOT the ``(re, im)`` leg pair it used to. Read the unfused legs off
+        :attr:`_complex_legs` instead.
+
+        Beware when migrating code: the fused value is *also* a 2-tuple, so ``op_r, op_i =
+        fem.operator`` keeps unpacking cleanly and silently binds ``op_i`` to the LOAD VECTOR. It
+        does not raise; it just means something else. That is what broke ``jno.rcwa`` and made a
+        test report a missing imaginary part that was there all along."""
         return self._op
 
     @property
