@@ -2509,10 +2509,48 @@ def unique_triplet_count(indices) -> int:
     Raises on a traced index array rather than guessing. Every caller builds its pattern from
     host-static mesh connectivity, so a tracer here means that invariant broke, and the caller must
     fall back to the uncompressed path rather than ship a wrong count."""
+    plan = compress_plan(indices)
+    return 0 if plan is None else int(plan[2])
+
+
+def compress_plan(indices):
+    """Host-side compression plan ``(unique_indices, inverse, nse)``, or ``None`` for an empty pattern.
+
+    The pattern is fixed by mesh and terms, so the *same* duplicate-collapse happens on every call.
+    Deciding it once host-side turns the in-trace work from a sort into a scatter-add:
+    ``segment_sum(data, inverse)`` is ``O(nnz)`` where ``sum_duplicates`` is ``O(nnz log nnz)``, and it
+    compiles to no sort at all. That matters because the traced assemblers re-run per Newton step, per
+    timestep and per parameter value -- measured on an 18k-DOF 3-D nonlinear problem, paying the sort
+    on every call cost more in assembly than the compression saved in matvecs.
+
+    Keys are flattened to a single ``int64`` (``row * (max_col + 1) + col``) rather than sorted
+    lexicographically as an ``(nnz, 2)`` array: ``np.unique(..., axis=0)`` builds a structured view and
+    is ~2x slower on a 3M-triplet pattern.
+
+    Raises on a traced index array rather than guessing. Every caller builds its pattern from
+    host-static mesh connectivity, so a tracer here means that invariant broke, and the caller must
+    fall back to the uncompressed path rather than ship a wrong count."""
     arr = np.asarray(indices)  # raises on a tracer -- deliberately not caught
-    if arr.size == 0:
-        return 0
-    return int(np.unique(arr.reshape(arr.shape[0], -1), axis=0).shape[0])
+    if arr.size == 0 or arr.shape[0] == 0:
+        return None
+    rows = arr[:, 0].astype(np.int64)
+    cols = arr[:, 1].astype(np.int64)
+    stride = int(cols.max()) + 1
+    uniq, inverse = np.unique(rows * stride + cols, return_inverse=True)
+    idx = np.stack([uniq // stride, uniq % stride], axis=1).astype(np.int32)
+    # int32 inverse: it is one entry per RAW triplet, so on a large 3-D operator it is the biggest
+    # array the plan holds -- halving it against numpy's int64 default is worth the cast.
+    return jnp.asarray(idx), jnp.asarray(inverse.reshape(-1).astype(np.int32)), int(uniq.shape[0])
+
+
+def apply_compress_plan(data, plan, shape):
+    """Build the compressed BCOO from raw triplet ``data`` and a :func:`compress_plan`.
+
+    Works under trace (no data-dependent shapes) and is exact: every raw triplet is added into its
+    unique slot exactly once, which is the same accumulation ``sum_duplicates`` performs and the same
+    one BCOO performs lazily on each matvec."""
+    idx, inverse, nse = plan
+    return jsparse.BCOO((jax.ops.segment_sum(data, inverse, num_segments=nse), idx), shape=shape)
 
 
 def bcoo_set_dirichlet_rows(A, dofs):

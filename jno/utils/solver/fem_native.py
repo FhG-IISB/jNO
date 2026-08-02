@@ -71,11 +71,12 @@ from .fem_utils import (
     _lower_statefield_to_trial,
     _promote_to_degree,
     _test_field_index,
+    apply_compress_plan,
     bcoo_set_dirichlet_rows,
     bcoo_zero_rows,
     bcoo_zero_rows_cols,
+    compress_plan,
     sum_duplicate_triplets,
-    unique_triplet_count,
 )
 from .parametric_helpers import _collect_runtime_parameter_exprs
 from .weak_form import (
@@ -1368,9 +1369,9 @@ def assemble_fem_native(
             else None
         )
         try:
-            _nse_static = unique_triplet_count(_idx_static) if _idx_static is not None else None
+            _plan = compress_plan(_idx_static) if _idx_static is not None else None
         except Exception:  # noqa: BLE001 -- a traced pattern would break the static-count invariant
-            _idx_static, _nse_static = None, None  # fall back to the uncompressed (still correct) path
+            _idx_static, _plan = None, None  # fall back to the uncompressed (still correct) path
 
         def jacobian(u_flat, t=0.0, args=None):
             # Assemble into COO triplets and build a BCOO -- never materialises the dense (total, total)
@@ -1413,21 +1414,28 @@ def assemble_fem_native(
 
             if not data_l:  # no terms -> empty operator
                 return jsparse.BCOO((jnp.zeros((0,), u_flat.dtype), jnp.zeros((0, 2), jnp.int32)), shape=(total, total))
+            data = jnp.concatenate(data_l)
+            if _plan is not None:
+                # ~12x fewer stored triplets, INSIDE the trace -- so it reaches the nonlinear Jacobian
+                # and the per-step/parametric re-assemblies, not just eager assembly. Applying a
+                # host-decided plan makes this an O(nnz) scatter-add rather than an O(nnz log nnz)
+                # sort, which matters because this runs once per Newton step / timestep / parameter.
+                return apply_compress_plan(data, _plan, (total, total))
             if _idx_static is not None:
                 idx = _idx_static
             else:  # pattern could not be hoisted -> rebuild it in-trace, uncompressed but correct
                 idx = jnp.stack(
                     [jnp.concatenate(rows_l).astype(jnp.int32), jnp.concatenate(cols_l).astype(jnp.int32)], axis=1
                 )
-            A = jsparse.BCOO((jnp.concatenate(data_l), idx), shape=(total, total))
-            # ~21x fewer stored triplets, and this runs inside the trace -- so it reaches the
-            # nonlinear Jacobian and the per-step/parametric re-assemblies, not just eager assembly.
-            return sum_duplicate_triplets(A, nse=_nse_static) if _nse_static is not None else A
+            return jsparse.BCOO((data, idx), shape=(total, total))
 
         # Published so a wrapper that APPENDS triplets (the Dirichlet row-replacement below) can
-        # derive its own static count from the same pattern instead of re-deriving one that might
-        # disagree with it.
-        jacobian._jno_static_idx = _idx_static  # type: ignore[attr-defined]
+        # derive its own plan from the same pattern instead of re-deriving one that might disagree.
+        # It must describe what `jacobian` ACTUALLY RETURNS -- the COMPRESSED pattern when a plan is
+        # in force, not the raw one it was derived from. Publishing the raw pattern here silently
+        # mismatched the wrapper's `inverse` against the compressed data length: the recurring shape
+        # of bug in this repo is a representation changing while one of its readers does not move.
+        jacobian._jno_static_idx = _plan[0] if _plan is not None else _idx_static  # type: ignore[attr-defined]
         return jacobian
 
     def _dirichlet_jac_rows(jac_fn, pairs):
@@ -1444,19 +1452,20 @@ def assemble_fem_native(
         # the Dirichlet diagonal. Derived from the inner assembler's own published pattern so the two
         # cannot disagree; without it, fall back to leaving the appended duplicates in place.
         _inner_idx = getattr(jac_fn, "_jno_static_idx", None)
-        _nse_dir = None
+        _dir_plan = None
         if _inner_idx is not None:
             try:
                 _d_np = np.asarray(dofs, dtype=np.int64).reshape(-1)
-                _nse_dir = unique_triplet_count(
+                _dir_plan = compress_plan(
                     np.concatenate([np.asarray(_inner_idx), np.stack([_d_np, _d_np], axis=1)], axis=0)
                 )
-            except Exception:  # noqa: BLE001 -- no static count available; correctness is unaffected
-                _nse_dir = None
+            except Exception:  # noqa: BLE001 -- no static plan available; correctness is unaffected
+                _dir_plan = None
 
         def jac(u_flat):
             A = bcoo_set_dirichlet_rows(jac_fn(jnp.asarray(u_flat)), dofs)
-            return sum_duplicate_triplets(A, nse=_nse_dir) if _nse_dir is not None else A
+            # Same host-decided plan, so this is an O(nnz) scatter-add per Newton step, not a sort.
+            return apply_compress_plan(A.data, _dir_plan, A.shape) if _dir_plan is not None else A
 
         return jac
 
