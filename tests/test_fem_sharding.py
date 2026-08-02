@@ -52,6 +52,41 @@ def test_sharded_operator_matches_single_device(n_dev):
     assert f"OK n_devices={n_dev}" in r.stdout, r.stdout[-2000:]
 
 
+def test_shard_argument_is_actually_wired_to_the_solve():
+    """``fem.solve(shard=...)`` must reach the solve.
+
+    This is a regression for a shipped bug: the solve read ``getattr(A, "_jno_shard", None)``, an
+    attribute **nothing ever set**, and ``FEM.solve`` had no ``shard=`` parameter at all. Sharding was
+    therefore permanently automatic with no way out, while the docstring advertised ``shard=False``.
+    A documented opt-out that silently does nothing is worse than no opt-out."""
+    pytest.importorskip("shapely", reason="shapely required for the box domain")
+    import inspect
+
+    import jax
+
+    import jno
+
+    assert "shard" in inspect.signature(jno.fem.__globals__["FEM"].solve).parameters, "FEM.solve must accept shard="
+
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.35).domain()
+    u, phi = d.fem_symbols()
+    c = d.variable("interior", split=True)
+    cb = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=c[0], y=c[1], z=c[2]), phi.bind(x=c[0], y=c[1], z=c[2])
+    build = lambda: jno.fem(  # noqa: E731
+        [ui.x * vi.x + ui.y * vi.y + ui.z * vi.z - 1.0 * vi, u(cb[0], cb[1], cb[2]) - 0.0]
+    )
+
+    ref = np.asarray(build().solve()).reshape(-1)
+    for kw in ({}, {"shard": False}, {"shard": 1}):
+        got = np.asarray(build().solve(**kw)).reshape(-1)
+        assert np.max(np.abs(got - ref)) < 1e-12, f"shard={kw} changed the answer"
+
+    # an over-request must fail loud rather than quietly using fewer devices
+    with pytest.raises(ValueError, match="only .* device"):
+        build().solve(shard=len(jax.devices()) + 8)
+
+
 def test_padding_is_exact_and_only_when_needed():
     """The triplet count must divide the device count or ``device_put`` raises ``IndivisibleError``.
     Padding appends zero-valued triplets at ``(0, 0)``, which scatter-add to nothing — safe by

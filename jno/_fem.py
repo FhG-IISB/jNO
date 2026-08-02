@@ -80,7 +80,7 @@ def _residual_check(A, b, u, who):
     return u
 
 
-def _solve_linear_matrix_free(A, b, *, tol=1e-8, maxiter=20_000):
+def _solve_linear_matrix_free(A, b, *, tol=1e-8, maxiter=20_000, shard=None):
     """Default steady-linear solve: matrix-free **Jacobi-preconditioned** BiCGStab on the BCOO operator.
 
     Never forms the dense ``N x N`` matrix — each iteration is a couple of sparse matvecs ``A @ v`` (cost
@@ -102,7 +102,7 @@ def _solve_linear_matrix_free(A, b, *, tol=1e-8, maxiter=20_000):
     from .utils.solver.linear import jacobi
     from .utils.solver.sharding import jacobi_from_diagonal, resolve_devices, sharded_solve
 
-    devices = resolve_devices(getattr(A, "_jno_shard", None))
+    devices = resolve_devices(shard)
     if devices and hasattr(A, "indices"):
 
         def _bicgstab(mv, rhs, M, x0):
@@ -1297,6 +1297,7 @@ class FEM:
         precond=None,
         time=None,
         basis=None,
+        shard=None,
         profile=False,
         **kwargs,
     ) -> Any:
@@ -1403,6 +1404,16 @@ class FEM:
         reduction is a memory win, not a speed one: the full-order residual is still evaluated per Newton
         step (no hyper-reduction).
 
+        ``shard=`` controls multi-device execution of the default steady-linear solve. The default
+        (``None``) is **automatic**: the operator's nonzero axis is partitioned across every visible
+        device and one ``all-reduce`` combines the partial scatter-adds. That is a placement decision,
+        not a different algorithm — the answer moves only by reduction order (~1e-14) — and it is on by
+        default because the alternative on a multi-device box is idle silicon. On a single-device host
+        it resolves to the untouched single-device path. ``shard=False`` (or ``1``) opts out,
+        ``shard=N`` pins a device count, and a device list pins exactly; over-requesting fails loud.
+        Only the default steady-linear path shards today: sparse-direct branches (periodic, 1-D,
+        fused-complex) cannot, and slot-composed / transient / nonlinear paths are not yet wired.
+
         ``profile=True`` runs the (eager, non-parametric) solve inside a JAX Perfetto trace, prints the DOF
         count + wall time, and writes the trace to ``./jno_traces`` — like ``jno.core.solve(profile=True)``.
         Profile a *concrete* forward solve; a parametric solve returns a deferred trace node with no numeric
@@ -1434,6 +1445,7 @@ class FEM:
                     linear=linear,
                     precond=precond,
                     time=time,
+                    shard=shard,
                     **kwargs,
                 )
             finally:
@@ -1577,6 +1589,7 @@ class FEM:
         linear=None,
         precond=None,
         time=None,
+        shard=None,
         **kwargs,
     ):
         """Mode dispatch for :meth:`solve` — returns the solution array or a differentiable trace node."""
@@ -1736,7 +1749,7 @@ class FEM:
 
                 return _fin(sparse_lu_solve(A, b))
             if solve_fn is None and hasattr(A, "todense"):
-                return _fin(_solve_linear_matrix_free(A, b))
+                return _fin(_solve_linear_matrix_free(A, b, shard=shard))
             if from_slots:
                 return _fin(solve_fn(A, b))  # slot-composed solvers take the BCOO operator directly
             A = jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)
