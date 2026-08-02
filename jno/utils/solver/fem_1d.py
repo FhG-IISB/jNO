@@ -639,8 +639,22 @@ def _assemble_1d_transient(
     # === second-order-in-time (u_tt): the augmented first-order block y = [u; v], v = u̇, integrated
     #     by the trapezoidal (θ=½) rule — the 1D analogue of the native _assemble_second_order_time. ===
     if max((_mto(t) for t in temporal_terms), default=1) >= 2:
-        if any(_is_obviously_nonlinear_in_unknown(domain, t) for t in spatial_terms):
-            raise NotImplementedError("jno.fem: a nonlinear second-order-in-time 1D form is not supported.")
+        # A nonlinear SPATIAL operator (sine-Gordon, cubic Klein-Gordon, a nonlinear string) is carried by
+        # the residual/jacobian form of the same augmented block, exactly as the native path does — see
+        # the ``nonlinear_spatial`` branch below. The temporal side must stay linear either way: M2 and C
+        # are matrices, so a state-dependent inertia or damping has no representation here.
+        nonlinear_spatial = any(_is_obviously_nonlinear_in_unknown(domain, t) for t in spatial_terms)
+        # The TEMPORAL side must stay linear whatever the spatial side does: M2 and C are extracted as
+        # matrices via ``sparse_jacobian(0)``, so a state-dependent inertia or damping would be silently
+        # linearised about u=0 and integrated as a constant — a wrong answer with no error. Checked
+        # unconditionally, NOT only when the spatial part is nonlinear, or the linear-spatial case keeps
+        # that silent path open.
+        if any(_is_obviously_nonlinear_in_unknown(domain, t) for t in temporal_terms):
+            raise NotImplementedError(
+                "jno.fem: a state-dependent MASS or DAMPING on a second-order-in-time 1D form is not "
+                "supported — the augmented block carries M2 and C as matrices, so a c(u) there would be "
+                "frozen at its u=0 value. A nonlinear SPATIAL operator (u_tt + N(u) = f) IS supported."
+            )
 
         def _strip_n(t, k):
             for _ in range(k):
@@ -667,8 +681,6 @@ def _assemble_1d_transient(
         spatial_res2 = _make_residual(
             domain, spatial_terms, boundary_terms, n_nodes=n_nodes, vec=vec, quad_degree=quad_degree, order=order
         )
-        K = spatial_res2.sparse_jacobian(z)
-        F = -spatial_res2(z)  # spatial load + natural-BC load
         # Compose the augmented 2n system SPARSELY. M2/C/K are BCOO (per-element scatter), so ``jnp.block``
         # and ``.at[]`` are both unavailable here — the former cannot mix sparse with dense at all, and
         # BCOO has no ``.at[]``. Reuse the same three helpers the native u_tt path uses, so the 1D and
@@ -679,16 +691,13 @@ def _assemble_1d_transient(
 
         n = ndof
         M_aug = _bcoo_block([(M2, 0, 0, 1.0), (M2, n, n, 1.0)], (2 * n, 2 * n), z.dtype)
-        A_aug = _bcoo_block([(M2, 0, n, -1.0), (K, n, 0, 1.0), (Cmat, n, n, 1.0)], (2 * n, 2 * n), z.dtype)
-        c_aug = jnp.concatenate([jnp.zeros((n,), z.dtype), F])
         dpairs = _dirichlet_dofs(domain, dirichlet_values, vec)
+        dd = dg = aug_d = None
         if dpairs:  # u[d]=g (constant) on displacement rows, v[d]=0 on velocity rows
             dd = jnp.asarray([p[0] for p in dpairs], dtype=jnp.int32)
             dg = jnp.asarray([p[1] for p in dpairs], dtype=z.dtype)
             aug_d = jnp.concatenate([dd, dd + n])  # the constrained rows in BOTH blocks
             M_aug = bcoo_zero_rows(M_aug, aug_d)  # mass rows are algebraic -> zeroed
-            A_aug = bcoo_set_dirichlet_rows(A_aug, aug_d)  # -> identity rows (columns kept)
-            c_aug = c_aug.at[dd].set(dg).at[dd + n].set(0.0)
         # the initial state lives on the DOF nodes, which for P2 include the element midpoints
         pts = jnp.asarray(dof_coords)
         u0 = jnp.zeros((n,), z.dtype)
@@ -702,14 +711,11 @@ def _assemble_1d_transient(
         if dpairs:
             u0, v0 = u0.at[dd].set(dg), v0.at[dd].set(0.0)
         t0, t1, dt = _infer_time_window(domain)
-        block = SemidiscreteTimeBlock(
+        common2 = dict(
             backend="transient",
             mode="implicit",
             time_order=2,
             spatial_kind="weak_form",
-            M=M_aug,
-            A=A_aug,
-            affine_bias=c_aug,
             state0=jnp.concatenate([u0, v0]),
             t0=t0,
             t1=t1,
@@ -717,6 +723,42 @@ def _assemble_1d_transient(
             eval_context=getattr(domain, "_fem_eval_context", {}) or {},
             metadata={"theta": 0.5, "second_order": True},
         )
+        if nonlinear_spatial:
+            # Newton on the augmented residual ``M_aug ẏ + R_aug(y) = 0`` with
+            # ``R_aug(y) = [−M2 v ; N(u) + C v]``, ``N(u) = S(u) − F`` the 1D nonlinear spatial residual.
+            # Identical in shape to the native u_tt nonlinear path, so the two cannot drift. The θ=½
+            # stepper still applies, which is what keeps an undamped nonlinear wave from bleeding energy.
+            def _residual_aug(y, t=0.0, args=None):
+                y = jnp.asarray(y).reshape(-1)
+                u_, v_ = y[:n], y[n:]
+                r = jnp.concatenate([-(M2 @ v_), jnp.asarray(spatial_res2(u_, args)).reshape(-1) + (Cmat @ v_)])
+                if dpairs:  # u[d] = g on the displacement rows, v[d] = 0 on the velocity rows
+                    r = r.at[dd].set(u_[dd] - dg).at[dd + n].set(v_[dd])
+                return r
+
+            def _jacobian_aug(y, t=0.0, args=None):
+                # ∂N/∂u at the CURRENT state, scattered per element (never a global dense jacfwd), then
+                # composed into the augmented block by the same helper the linear branch uses.
+                jn = spatial_res2.sparse_jacobian(jnp.asarray(y).reshape(-1)[:n], args)
+                A = _bcoo_block([(M2, 0, n, -1.0), (jn, n, 0, 1.0), (Cmat, n, n, 1.0)], (2 * n, 2 * n), z.dtype)
+                return bcoo_set_dirichlet_rows(A, aug_d) if dpairs else A
+
+            block = SemidiscreteTimeBlock(
+                mass=lambda t, args=None, _M=M_aug: _M,
+                residual=_residual_aug,
+                jacobian=_jacobian_aug,
+                **common2,
+            )
+            return block, "transient"
+
+        K = spatial_res2.sparse_jacobian(z)
+        F = -spatial_res2(z)  # spatial load + natural-BC load
+        A_aug = _bcoo_block([(M2, 0, n, -1.0), (K, n, 0, 1.0), (Cmat, n, n, 1.0)], (2 * n, 2 * n), z.dtype)
+        c_aug = jnp.concatenate([jnp.zeros((n,), z.dtype), F])
+        if dpairs:
+            A_aug = bcoo_set_dirichlet_rows(A_aug, aug_d)  # -> identity rows (columns kept)
+            c_aug = c_aug.at[dd].set(dg).at[dd + n].set(0.0)
+        block = SemidiscreteTimeBlock(M=M_aug, A=A_aug, affine_bias=c_aug, **common2)
         return block, "transient"
 
     mass_terms = [_strip_temporal_trial_derivative(t) for t in temporal_terms]
