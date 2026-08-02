@@ -753,6 +753,41 @@ through its own complex block routine, and `x0=` on it is rejected.
 Not yet supported (clear errors): `adapt=` on a complex transient (the cross-remesh state transfer is
 not complex-aware yet).
 
+### Reduced-order solves — `fem.solve(basis=U)`
+
+A periodic prolongation and a **reduced-order basis** are the same object: a tall `(n_dofs, k)` map `U`
+defining `UᵀAU`, `Uᵀb`, and the lift `u = U x`. So `basis=` reuses the reduction the periodic ties
+already drive, and the answer comes back in the **full** space — nothing downstream changes.
+
+Solve the family a few times, keep the recurring shapes, then every later solve costs `k` unknowns:
+
+```python
+snapshots = jnp.stack([build(p).solve() for p in sweep])    # (n_snapshots, n_dofs)
+U, s, Vt  = jno.solve.svd(snapshots.T, k=10)                # columns of U are the spatial modes
+u = build(p_new).solve(basis=U)                             # 10 unknowns; full field returned
+```
+
+Mind the orientation: for a `(n_snapshots, n_dofs)` snapshot matrix the spatial modes are `Vt.T`, and
+for its transpose they are `U`. Passing the wrong one is refused by shape, with the fix in the message.
+
+This is the **only** path here that returns an approximation, so it is measured rather than trusted: the
+relative residual of the full system at the lifted solution is computed each call (one matvec), kept on
+`fem.basis_residual`, and a basis that does not span the solution **raises** instead of returning a
+plausible wrong field. Deliberately coarse work (a rank sweep) can raise `fem.BASIS_RESIDUAL_LIMIT`.
+
+The basis is per-call, must be orthonormal (a non-orthonormal one would need `(UᵀU)⁻¹` when restricting
+a state, and would be silently wrong), and composes with `linear=` / `precond=`, which see the reduced
+operator. `∂u/∂U` flows under `jax.grad`, so the subspace itself can be **learned** — note an orthonormal
+basis lives on the Stiefel manifold, so put the orthonormalisation inside the differentiated function
+(`net -> QR -> basis`) rather than projecting the step afterwards.
+
+Scope, each refused with its own reason: **transient** (the time block is reduced eagerly at assembly),
+**complex** (solves through an internal real-equivalent 2n layout), a **periodic tie** (composing two
+prolongations has no decided convention yet), and a `jno.np.parameter` basis (a trace node, not an
+array — `jax.grad` over a concrete basis is the supported differentiable path). A reduced **nonlinear**
+solve works and returns a deferred trace node, but is a memory win, not a speed one: the full-order
+residual is still evaluated per Newton step (no hyper-reduction).
+
 ### Field parameters `k(x)` + regularization
 
 `jno.np.parameter(phi)` is a **nodal field** on the trial space — a trainable value per node. Field
@@ -960,6 +995,8 @@ route** — the residual-PINN path is unaffected. Full detail is inline in the s
 - **Second-order in time is scoped** to linear, single-field (scalar or vector), nodal Lagrange, 2D/3D,
   constant Dirichlet — rewrite a nonlinear / multi-field / parametric / time-varying-Dirichlet `u_tt`
   form as a first-order system.
+- **Reduced-order (`basis=`) solves are steady-only** — transient, complex and periodic-tied
+  problems refuse; nonlinear reduces but without hyper-reduction is a memory win, not a speed one.
 - **No runtime Dirichlet parameters** — a trainable parameter may sit in the operator (stiffness) but
   not in an essential/Dirichlet boundary *value*.
 - **Affine parameter lowering expects a single, direct factor** — one trainable scalar per additive
