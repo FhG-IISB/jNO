@@ -172,6 +172,36 @@ def test_steady_complex_is_one_fused_real_block():
     assert u.shape == (n,) and np.iscomplexobj(u)
 
 
+def test_fused_block_and_the_retained_legs_stay_in_sync():
+    """The two representations of a complex problem must keep describing the SAME operator.
+
+    ``.operator`` is the fused real ``2n`` block; ``_complex_legs`` keeps the unfused ``(re, im)``
+    pair for the consumers that still need it (``jno.rcwa``'s source reader, the complex-native AMS
+    preconditioner). Nothing structural forces the two to agree.
+
+    This is pinned because a stale reader of the legs does NOT crash: the fused value is *also* a
+    2-tuple, so ``op_r, op_i = fem.operator`` keeps unpacking cleanly and silently binds ``op_i`` to
+    the LOAD VECTOR. That is exactly how it failed once — ``jno.rcwa`` lost its front door, and a
+    Nedelec test reported a vanished imaginary part that was present the whole time. A future change
+    to either layout should break this one clearly-named test, with the consumer list sitting next to
+    ``_complex_legs`` in ``_fem.py``, rather than surfacing far away as a wrong number."""
+    from jno._fem import _complex_block_bcoo
+
+    fem = _manufactured_complex_fem()
+    n = int(fem._complex_n)
+    (A_r, b_r), (A_i, b_i) = fem._complex_legs
+    A_fused, b_fused = fem.operator
+    dense = lambda A: np.asarray(A.todense() if hasattr(A, "todense") else A)  # noqa: E731
+
+    ref = dense(_complex_block_bcoo(A_r, A_i, n))
+    got = dense(A_fused)
+    scale = max(1.0, float(np.max(np.abs(ref))))
+    assert np.max(np.abs(got - ref)) < 1e-12 * scale, "the fused block is no longer [[A_r,-A_i],[A_i,A_r]]"
+
+    rhs = np.concatenate([np.asarray(b_r).reshape(-1), np.asarray(b_i).reshape(-1)])
+    assert np.max(np.abs(np.asarray(b_fused).reshape(-1) - rhs)) < 1e-12 * max(1.0, float(np.max(np.abs(rhs))))
+
+
 def test_steady_complex_accepts_a_warm_start():
     """``x0=`` on a complex problem was refused outright ("the solve runs on the real-equivalent block,
     an internal layout"). With the block built at assembly the guess is just a vector in that layout, so
