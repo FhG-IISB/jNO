@@ -321,6 +321,73 @@ def test_second_order_1d_wave_matches_analytic():
     assert rel < 0.01, f"1D wave does not track sin(πx)cos(πt): rel L2 = {rel:.4f}"
 
 
+def test_second_order_1d_damped_wave_decays_and_places_C_correctly():
+    """1D ``u_tt`` WITH a damping term ``c·u_t`` — the sub-block the undamped test above cannot reach.
+
+    The augmented system is ``[[M2,0],[0,M2]] y' + [[0,-M2],[K,C]] y = [0;F]``, so ``C`` sits at the
+    (n, n) offset alone. It is assembled sparsely (BCOO), and an offset error there does not raise —
+    it silently damps the wrong block (C landing on the displacement rows would damp ``u`` rather than
+    ``u̇``, or on the off-diagonal would corrupt ``u̇ = v``). Both give a plausible decaying wave.
+
+    Pinned two ways so a misplaced C cannot pass: the damped amplitude must decay monotonically, AND
+    it must match the analytic damped standing wave. For ``u_tt + c·u_t = u_xx`` with ``u(x,0)=sin(πx)``
+    at rest, the mode-1 amplitude is ``e^{-ct/2}[cos(ωt) + (c/2ω)·sin(ωt)]`` with ``ω=sqrt(π²-c²/4)``
+    (underdamped for c < 2π)."""
+    pytest.importorskip("pygmsh", reason="pygmsh required for line meshing")
+    c_damp = 1.5
+    d = jno.domain(constructor=jno.domain.line(mesh_size=0.02), time=(0.0, 1.2, 80))
+    u, phi = d.fem_symbols()
+    xi, ti = d.variable("interior", split=True)[0], d.variable("interior", split=True)[-1]
+    xb = d.variable("boundary", split=True)[0]
+    xi0, ti0 = d.variable("initial", split=True)[0], d.variable("initial", split=True)[-1]
+    ui, vi = u.bind(x=xi, t=ti), phi.bind(x=xi, t=ti)
+    ui0 = u.bind(x=xi0, t=ti0)
+    fem = jno.fem(
+        [
+            ui.tt * vi + c_damp * (ui.t * vi) + ui.x * vi.x,
+            u(xb) - 0.0,
+            u(xi0) - jno.fn(lambda x: jnp.sin(PI * x), [xi0]),
+            ui0.t - 0.0,
+        ]
+    )
+    assert fem.is_transient and fem.is_linear
+    ts, U, _ = _trajectory(fem)
+    xx = np.asarray(fem.points)[:, 0]
+
+    amp = np.max(np.abs(U), axis=1)
+    assert amp[-1] < 0.5 * amp[0], f"a damped 1D wave must decay (end/start = {amp[-1] / amp[0]:.3f})"
+
+    w = np.sqrt(PI**2 - (c_damp / 2.0) ** 2)  # underdamped: c < 2*pi
+    env = np.exp(-c_damp * ts / 2.0) * (np.cos(w * ts) + (c_damp / (2 * w)) * np.sin(w * ts))
+    exact = np.sin(PI * xx)[None, :] * env[:, None]
+    rel = np.linalg.norm(U - exact) / np.linalg.norm(exact)
+    assert rel < 0.02, f"1D damped wave does not track the analytic envelope: rel L2 = {rel:.4f}"
+
+
+def test_second_order_1d_wave_without_dirichlet_assembles():
+    """The ``dpairs``-empty branch of the 1D augmented assembly: with no essential condition the
+    Dirichlet row-replacement is skipped entirely, so the sparse blocks go to the marcher untouched.
+    A free-free bar released from rest simply has to integrate — this pins that the branch is wired,
+    not that the physics is interesting."""
+    pytest.importorskip("pygmsh", reason="pygmsh required for line meshing")
+    d = jno.domain(constructor=jno.domain.line(mesh_size=0.05), time=(0.0, 0.4, 30))
+    u, phi = d.fem_symbols()
+    xi, ti = d.variable("interior", split=True)[0], d.variable("interior", split=True)[-1]
+    xi0, ti0 = d.variable("initial", split=True)[0], d.variable("initial", split=True)[-1]
+    ui, vi = u.bind(x=xi, t=ti), phi.bind(x=xi, t=ti)
+    ui0 = u.bind(x=xi0, t=ti0)
+    fem = jno.fem(
+        [
+            ui.tt * vi + ui.x * vi.x + 1.0 * vi,  # a load, so the free bar actually moves
+            u(xi0) - jno.fn(lambda x: jnp.cos(PI * x), [xi0]),
+            ui0.t - 0.0,
+        ]
+    )
+    _ts, U, _ = _trajectory(fem)
+    assert np.all(np.isfinite(U)), "the no-Dirichlet 1D augmented assembly produced non-finite state"
+    assert np.max(np.abs(U)) > 0.0
+
+
 def test_second_order_periodic_bloch_standing_wave():
     """Periodic (Bloch / phononic) ties on a u_tt wave: the standing wave ``u=cos(2πx)cos(2πt)`` on a
     domain periodic in x (``u(left)=u(right)``), natural in y. The augmented [u, v] block is reduced by
