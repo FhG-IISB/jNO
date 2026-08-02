@@ -797,10 +797,13 @@ communication).
 | | why |
 |---|---|
 | sparse-direct branches (periodic, 1-D, fused-complex) | route to `spsolve` — single-device, no batching rule |
-| `linear=jno.solve.lu()` / `dense()` | factorise the matrix themselves; nothing to distribute |
-| any `precond=` but `jacobi` | the applier closes over the assembled operator (Chebyshev needs its matvecs, `form` holds an auxiliary BCOO, `amg`/`ams` build host-side through scipy/pyamg), so a full copy would be replicated anyway. Jacobi is the exception: it needs only the diagonal, which is computed from the *sharded* triplets |
-| parametric / differentiate-through solves | `device_put` cannot place a tracer |
-| transient | the scan body closes over the block, so `M`/`A` are constant-folded and replicated inside `lax.scan`; fixing it needs `block.step` to take the operator as data |
+| `linear=jno.solve.lu()` | `spsolve` is single-device with no batching rule — a genuine wall, not a wiring gap. Distributing it means a distributed sparse-direct solver (SuperLU_DIST class), which is not a placement change |
+| `linear=jno.solve.dense()` | not wired. Dense LU with partial pivoting shards poorly, but the `N²` matrix itself would split — the win here would be capacity, not speed |
+| `precond=amg()` / `ams()` | the hierarchy is built host-side through scipy/pyamg; distributing the V-cycle is a distributed-AMG project, not a placement change |
+| `precond=chebyshev()` / `form()` | not wired yet, and **not** a hard limit — Chebyshev is matvec-only by construction (spectral bounds by power iteration), so it composes with the sharded matvec directly; `form`'s auxiliary operator is just another assembled BCOO |
+| other `precond=` | the applier closes over the assembled operator, so a full copy would be replicated anyway. Jacobi is the exception: it needs only the diagonal, computed from the *sharded* triplets |
+| parametric / differentiate-through solves | not wired yet — **not** a hard limit. `device_put` cannot place a tracer, but `lax.with_sharding_constraint` is expressed *inside* the trace and does: verified to emit `all-reduce`, no `all-gather`, with gradients flowing through |
+| transient | not wired yet. A sharding constraint inside the `lax.scan` body already produces the right collectives with the operator still closed over; threading it in as a jit argument additionally makes the per-device footprint provable (measured: exactly `nnz/N` per device) |
 
 No speedup figure is quoted here because none has been measured — the development machine has one
 GPU. What *is* verified, on simulated devices, is correctness, the even split, that XLA emits
