@@ -1863,8 +1863,10 @@ def assemble_fem_native(
             _cv = jnp.asarray([p[1] for p in _const_pairs], dtype=zeros.dtype) if _const_pairs else zeros[:0]
             _tvd = jnp.concatenate([e[0] for e in _tv_entries])
             _all_d = jnp.concatenate([_cd, _tvd])
-            A_tv = bcoo_set_dirichlet_rows(spatial_jac(zeros, 0.0), _all_d)
-            M_tv = bcoo_zero_rows(M, _all_d)
+            # Compress AFTER the Dirichlet edit: bcoo_set_unit_diag appends its own (d, d, 1)
+            # triplets, which must merge with whatever the assembly already put on that diagonal.
+            A_tv = sum_duplicate_triplets(bcoo_set_dirichlet_rows(spatial_jac(zeros, 0.0), _all_d))
+            M_tv = sum_duplicate_triplets(bcoo_zero_rows(M, _all_d))
             c_tv = zeros.at[_cd].set(_cv)
             free_tv = jnp.ones((total,), dtype=zeros.dtype).at[_all_d].set(0.0)
 
@@ -1887,6 +1889,9 @@ def assemble_fem_native(
         A = spatial_jac(zeros, 0.0)
         c0 = -spatial_res(zeros, 0.0)
         M, A, c = _apply_dirichlet_transient(M, A, c0, dirichlet_pairs)
+        # Both operators are applied on EVERY timestep, so the ~19x triplet redundancy is paid once
+        # per step for the whole march. Compressing here is the single highest-leverage site.
+        M, A = sum_duplicate_triplets(M), sum_duplicate_triplets(A)
         if temporal_tags:
             free_mask = jnp.ones((total,), dtype=zeros.dtype)
             if d_dofs is not None:

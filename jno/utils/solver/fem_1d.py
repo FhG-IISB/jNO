@@ -569,7 +569,7 @@ def assemble_fem_1d(
 
     A0, b0 = _system(None)
     if not _param_and_neural_exprs:
-        return (A0, b0), "linear"
+        return (sum_duplicate_triplets(A0), b0), "linear"
     # Parametric: re-form A(θ), b(θ) from the runtime args per call, so ∂u/∂θ flows through the solve.
     # Dirichlet elimination couples A and b (known columns move to the load), so each accessor assembles
     # the pair and takes its half — correct by construction, at the cost of assembling twice per call.
@@ -832,7 +832,7 @@ def _assemble_1d_transient(
         else:
             M_nl = M.at[dofs, :].set(0.0).at[:, dofs].set(0.0)
         block = SemidiscreteTimeBlock(
-            mass=lambda t, args=None, _M=M_nl: _M,
+            mass=lambda t, args=None, _M=sum_duplicate_triplets(M_nl): _M,
             residual=res_pt,
             jacobian=lambda u, t, args=None: jax.jacfwd(lambda uu: res_pt(uu, t, args))(jnp.asarray(u)),
             runtime_parameter_exprs=_param_exprs,
@@ -847,8 +847,9 @@ def _assemble_1d_transient(
         return _apply_dirichlet_transient(M, A, c, dirichlet_pairs)
 
     M0, A0, c0 = _lin_sys(None)
+    M0 = sum_duplicate_triplets(M0)  # parameter-free (guarded above), so this holds on both branches
     if not _param_exprs:
-        return SemidiscreteTimeBlock(M=M0, A=A0, affine_bias=c0, **common), "transient"
+        return SemidiscreteTimeBlock(M=M0, A=sum_duplicate_triplets(A0), affine_bias=c0, **common), "transient"
     # Parametric transient: the operator and load re-form from the runtime args at every step, so
     # ∂traj/∂θ flows through the marcher -- a 1D time-series inverse (recover a diffusivity from
     # u(x, t)) trains through `crux.solve` like the steady one. The mass is parameter-free (guarded
@@ -1261,7 +1262,7 @@ def _assemble_1d_multifield_transient(
         else:
             M_nl = M.at[dofs, :].set(0.0).at[:, dofs].set(0.0)
         block = SemidiscreteTimeBlock(
-            mass=lambda t, args=None, _M=M_nl: _M,
+            mass=lambda t, args=None, _M=sum_duplicate_triplets(M_nl): _M,
             residual=lambda u, t, args=None: residual(jnp.asarray(u)),
             jacobian=lambda u, t, args=None: jax.jacfwd(residual)(jnp.asarray(u)),
             **common,
@@ -1271,5 +1272,6 @@ def _assemble_1d_multifield_transient(
     A = spatial_res.sparse_jacobian(jnp.zeros(total))
     c = -spatial_res(jnp.zeros(total))
     M, A, c = _apply_dirichlet_transient(M, A, c, dirichlet_pairs)
+    M, A = sum_duplicate_triplets(M), sum_duplicate_triplets(A)
     block = SemidiscreteTimeBlock(M=M, A=A, affine_bias=c, **common)
     return block, "transient"
