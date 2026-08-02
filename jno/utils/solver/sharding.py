@@ -56,30 +56,40 @@ __all__ = [
 SHARD_AXIS = "shard"
 
 
-def resolve_devices(shard: Any) -> list:
-    """Devices named by a ``shard=`` argument: an int (take the first N), a device list, or None.
+def resolve_devices(shard: Any = None) -> list:
+    """Devices to partition the operator over.
 
-    Unlike ``jno.core._setup_parallelism``, an integer is **not** silently expanded to "all
-    available devices" — for a FEM operator that would start distributing without being asked, and
-    the whole point of the default is that it changes nothing.
+    ``None`` (the default) means **automatic**: every visible device. That is on by default because
+    the realistic alternative is not a tuned single-device run — it is idle silicon. A FEM solve
+    today uses one device and leaves the rest of a multi-GPU box unused, and sharding is answer-
+    preserving (same operator, same solvers; only the reduction order moves, ~1e-14).
+
+    On a single-device machine automatic resolves to that one device, so the default path is
+    byte-identical to before and carries no risk.
+
+    ``1`` or ``False`` opts out explicitly; an int takes the first N; a device list pins exactly.
+    Returns ``[]`` when there is nothing to distribute across, which callers read as "stay on the
+    single-device path".
     """
-    if shard is None:
+    avail = jax.devices()
+    if shard is None or shard is True:  # automatic
+        return list(avail) if len(avail) > 1 else []
+    if shard is False:
         return []
     if isinstance(shard, int):
         if shard < 1:
-            raise ValueError(f"jno.fem: shard= must be a positive device count; got {shard}.")
-        avail = jax.devices()
+            raise ValueError(f"jno.fem: shard= must be a positive device count (or False); got {shard}.")
         if shard > len(avail):
             raise ValueError(
                 f"jno.fem: shard={shard} was requested but only {len(avail)} device(s) are visible "
                 f"({[d.device_kind for d in avail]}). Simulate more with "
                 f"XLA_FLAGS=--xla_force_host_platform_device_count=N, or lower shard=."
             )
-        return list(avail[:shard])
+        return list(avail[:shard]) if shard > 1 else []
     devices = list(shard)
     if not devices:
         raise ValueError("jno.fem: shard= got an empty device list.")
-    return devices
+    return devices if len(devices) > 1 else []
 
 
 def operator_mesh(devices) -> Mesh:

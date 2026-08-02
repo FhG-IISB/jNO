@@ -91,8 +91,25 @@ def _solve_linear_matrix_free(A, b, *, tol=1e-8, maxiter=20_000):
     returning garbage — for the indefinite saddle-point systems where Jacobi does not help, pass a
     direct solver via ``solve_fn`` (e.g. ``jno.utils.solver.linear.sparse_lu_solve`` on CPU, or
     ``jnp.linalg.solve``).
+
+    Runs across **every visible device** automatically when there is more than one: the BCOO's nonzero
+    axis partitions, each device scatter-adds its slice, and one ``all-reduce`` combines them. The
+    operator shards and the vectors stay replicated, so the iteration itself is unchanged — this is a
+    placement decision, not a different algorithm, and the answer moves only by reduction order
+    (~1e-14). It is on by default because the alternative on a multi-device box is not a tuned
+    single-device run, it is idle silicon. On one device it resolves to exactly the code below.
     """
     from .utils.solver.linear import jacobi
+    from .utils.solver.sharding import jacobi_from_diagonal, resolve_devices, sharded_solve
+
+    devices = resolve_devices(getattr(A, "_jno_shard", None))
+    if devices and hasattr(A, "indices"):
+
+        def _bicgstab(mv, rhs, M, x0):
+            return jax.scipy.sparse.linalg.bicgstab(mv, rhs, x0=x0, tol=tol, atol=0.0, maxiter=maxiter, M=M)[0]
+
+        u = sharded_solve(A, b, _bicgstab, devices, precond_fn=jacobi_from_diagonal)
+        return _residual_check(A, b, u, "Jacobi-preconditioned BiCGStab (sharded)")
 
     matvec = lambda v: A @ v
     u, _info = jax.scipy.sparse.linalg.bicgstab(matvec, b, tol=tol, atol=0.0, maxiter=maxiter, M=jacobi(A))
