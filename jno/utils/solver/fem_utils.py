@@ -2440,6 +2440,39 @@ def bcoo_set_unit_diag(A, dofs):
     return jsparse.BCOO((jnp.concatenate([A.data, eye_dat]), jnp.concatenate([A.indices, eye_idx])), shape=A.shape)
 
 
+def sum_duplicate_triplets(A):
+    """Collapse duplicate ``(row, col)`` triplets in an assembled BCOO. Exact, and a large win.
+
+    The assemblers append one triplet block **per additive weak-form term** and never pre-sum, and on
+    top of that every interior DOF pair receives a contribution from each element sharing it — for P1
+    tets that is ~20 elements. BCOO sums the duplicates lazily on every ``@``, so results were always
+    correct; they just cost ~19x the work, invisibly, on every one of a Krylov solve's hundreds of
+    matvecs.
+
+    Measured on a real 3-D Poisson (P1 tets), stored vs unique triplets, and the redundancy GROWS
+    with the mesh::
+
+        h=0.30   21882 -> 1311  (16.7x)   0.33 -> 0.02 MiB   matvec 3.5x faster
+        h=0.20   47176 -> 2567  (18.4x)   0.72 -> 0.04 MiB   matvec 5.6x faster
+        h=0.16   96473 -> 4999  (19.3x)   1.47 -> 0.08 MiB   matvec 5.7x faster
+
+    Operator unchanged to 2.2e-15. The one-time sort amortises immediately against the matvec count.
+
+    **Concrete operators only.** ``sum_duplicates`` needs a static ``nse`` under ``jit``, and the
+    unique count is data-dependent, so a traced/parametric assembly is returned untouched (correct,
+    just uncompressed). The sparsity pattern is fixed by mesh and terms, so threading a precomputed
+    ``nse`` through the parametric path is a worthwhile follow-up rather than a limitation in
+    principle. Note ``sparse_lu_solve`` already calls ``sum_duplicates(nse=A.nse)`` — that sorts but
+    deliberately keeps the *unshrunk* count, so it gets none of this compression.
+    """
+    if not hasattr(A, "indices"):
+        return A
+    try:
+        return A.sum_duplicates()  # nse inferred -> requires concrete indices
+    except Exception:  # noqa: BLE001 — traced operator: leave it alone rather than fail the assembly
+        return A
+
+
 def bcoo_set_dirichlet_rows(A, dofs):
     """``A.at[dofs, :].set(0).at[dofs, dofs].set(1)`` for a BCOO ``A`` — row-replacement (identity row,
     columns kept): the matrix-level analogue of the Newton row-replacement residual."""

@@ -74,6 +74,7 @@ from .fem_utils import (
     bcoo_set_dirichlet_rows,
     bcoo_zero_rows,
     bcoo_zero_rows_cols,
+    sum_duplicate_triplets,
 )
 from .parametric_helpers import _collect_runtime_parameter_exprs
 from .weak_form import (
@@ -2011,4 +2012,8 @@ def assemble_fem_native(
     b = -residual(zeros)
     if dirichlet_pairs:
         A, b = _apply_dirichlet_symmetric(A, jnp.asarray(b).reshape(-1), dirichlet_pairs)
+    # Collapse duplicate triplets ONCE, after Dirichlet (which appends its own). The assembly emits
+    # one block per term and never pre-sums, and each interior DOF pair gets a contribution per
+    # incident element -- ~19x redundancy on a 3-D P1 mesh, paid again on every matvec.
+    A = sum_duplicate_triplets(A)
     return (A, b), "linear", offs
