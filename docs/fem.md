@@ -992,9 +992,12 @@ route** — the residual-PINN path is unaffected. Full detail is inline in the s
 
 - **Transient mass terms must be parameter-free** — put affine trainable parameters on the stiffness /
   residual, not on `u_t * phi`.
-- **Second-order in time is scoped** to linear, single-field (scalar or vector), nodal Lagrange, 2D/3D,
-  constant Dirichlet — rewrite a nonlinear / multi-field / parametric / time-varying-Dirichlet `u_tt`
-  form as a first-order system.
+- **Second-order in time (`u_tt`) is scoped** to nodal Lagrange, 1D/2D/3D, scalar or vector. A
+  **nonlinear spatial** operator (sine-Gordon, cubic Klein–Gordon, large-deformation elastodynamics)
+  *is* supported — Newton on the augmented `[u; v]` block — but the **temporal** side must stay linear:
+  a state-dependent mass or damping `c(u)·u_tt` is refused, since `M2`/`C` are extracted by
+  differentiating at `u=0` and would otherwise be frozen there. Coupled multi-field is 2D/3D and
+  **all**-second-order only (1D is single-field); time-varying Dirichlet is refused on nonlinear forms.
 - **Reduced-order (`basis=`) solves are steady-only** — transient, complex and periodic-tied
   problems refuse; nonlinear reduces but without hyper-reduction is a memory win, not a speed one.
 - **No runtime Dirichlet parameters** — a trainable parameter may sit in the operator (stiffness) but

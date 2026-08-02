@@ -364,6 +364,107 @@ def test_second_order_1d_damped_wave_decays_and_places_C_correctly():
     assert rel < 0.02, f"1D damped wave does not track the analytic envelope: rel L2 = {rel:.4f}"
 
 
+def _sine_gordon_1d(amp, t_end=4.0, nsteps=240, mesh_size=0.04):
+    """``u_tt - u_xx + sin(u) = 0``, clamped, released from ``amp*sin(pi x)`` at rest."""
+    d = jno.domain(constructor=jno.domain.line(mesh_size=mesh_size), time=(0.0, t_end, nsteps))
+    u, phi = d.fem_symbols()
+    xi, ti = d.variable("interior", split=True)[0], d.variable("interior", split=True)[-1]
+    xb = d.variable("boundary", split=True)[0]
+    xi0, ti0 = d.variable("initial", split=True)[0], d.variable("initial", split=True)[-1]
+    ui, vi = u.bind(x=xi, t=ti), phi.bind(x=xi, t=ti)
+    ui0 = u.bind(x=xi0, t=ti0)
+    fem = jno.fem(
+        [
+            ui.tt * vi + ui.x * vi.x + jno.np.sin(u) * vi,
+            u(xb) - 0.0,
+            u(xi0) - jno.fn(lambda x, a=amp: a * jnp.sin(PI * x), [xi0]),
+            ui0.t - 0.0,
+        ]
+    )
+    ts, U, _ = _trajectory(fem)
+    return ts, U, np.asarray(fem.points)[:, 0]
+
+
+def _antinode_period(ts, U, xx):
+    """Period from the descending zero-crossings of the mid-span displacement."""
+    s = U[:, int(np.argmin(np.abs(xx - 0.5)))]
+    sign = np.sign(s)
+    cross = np.where((sign[:-1] > 0) & (sign[1:] <= 0))[0]
+    assert len(cross) >= 2, "need at least two crossings to measure a period"
+    tc = [ts[i] + (ts[i + 1] - ts[i]) * s[i] / (s[i] - s[i + 1]) for i in cross]
+    return float(np.mean(np.diff(tc)))
+
+
+def test_second_order_1d_nonlinear_reduces_to_the_linear_path():
+    """A nonlinear 1D ``u_tt`` form takes the Newton/residual route rather than the assembled ``A``
+    payload. With the nonlinearity scaled to nothing, the two routes must agree — which pins the
+    augmented residual ``[-M2 v ; N(u) + C v]`` and its Jacobian against the linear block that was
+    already validated against the analytic wave."""
+    pytest.importorskip("pygmsh", reason="pygmsh required for line meshing")
+
+    def wave(eps):
+        d = jno.domain(constructor=jno.domain.line(mesh_size=0.02), time=(0.0, 1.0, 60))
+        u, phi = d.fem_symbols()
+        xi, ti = d.variable("interior", split=True)[0], d.variable("interior", split=True)[-1]
+        xb = d.variable("boundary", split=True)[0]
+        xi0, ti0 = d.variable("initial", split=True)[0], d.variable("initial", split=True)[-1]
+        ui, vi = u.bind(x=xi, t=ti), phi.bind(x=xi, t=ti)
+        ui0 = u.bind(x=xi0, t=ti0)
+        weak = ui.tt * vi + ui.x * vi.x
+        if eps:
+            weak = weak + eps * ((u * u * u) * vi)
+        fem = jno.fem([weak, u(xb) - 0.0, u(xi0) - jno.fn(lambda x: jnp.sin(PI * x), [xi0]), ui0.t - 0.0])
+        _ts, U, _ = _trajectory(fem)
+        return U
+
+    lin, nl = wave(0.0), wave(1e-9)
+    assert np.max(np.abs(nl - lin)) < 1e-8, "the nonlinear route must reduce to the linear one as eps -> 0"
+
+
+def test_second_order_1d_sine_gordon_period_lengthens_with_amplitude():
+    """The nonlinearity has to be REAL, not merely assembled: sine-Gordon's period depends on amplitude.
+
+    ``sin(u) < u`` is a softening restoring force, so a larger swing takes LONGER. At small amplitude the
+    period must collapse onto the linearised ``2*pi/sqrt(pi^2+1)`` (mode 1 of ``u_tt - u_xx + u = 0``);
+    at amplitude 2 it must be measurably longer. No linear solve can produce that — a linearised or
+    frozen-at-u=0 operator gives one period for every amplitude, which is exactly the failure this
+    catches. Measured: 1.0000x, 1.0040x and 1.0150x of the linear period at amp 0.05, 1.0 and 2.0."""
+    pytest.importorskip("pygmsh", reason="pygmsh required for line meshing")
+    t_lin = 2 * PI / np.sqrt(PI**2 + 1.0)
+
+    t_small = _antinode_period(*_sine_gordon_1d(0.05))
+    t_big = _antinode_period(*_sine_gordon_1d(2.0))
+
+    assert abs(t_small / t_lin - 1.0) < 5e-3, (
+        f"small-amplitude period must match the linearised one: {t_small:.5f} vs {t_lin:.5f}"
+    )
+    assert t_big > t_small * 1.008, f"a softening nonlinearity must lengthen the period: {t_big:.5f} vs {t_small:.5f}"
+
+
+def test_second_order_1d_state_dependent_mass_fails_loud():
+    """``M2`` and ``C`` are extracted as matrices by differentiating at ``u=0``, so a state-dependent
+    inertia or damping would be frozen at its ``u=0`` value and integrated as a constant — a wrong
+    answer with no error. Refused unconditionally, including when the spatial part is linear (which is
+    precisely the case that would otherwise slip through)."""
+    pytest.importorskip("pygmsh", reason="pygmsh required for line meshing")
+    d = jno.domain(constructor=jno.domain.line(mesh_size=0.1), time=(0.0, 0.5, 10))
+    u, phi = d.fem_symbols()
+    xi, ti = d.variable("interior", split=True)[0], d.variable("interior", split=True)[-1]
+    xb = d.variable("boundary", split=True)[0]
+    xi0, ti0 = d.variable("initial", split=True)[0], d.variable("initial", split=True)[-1]
+    ui, vi = u.bind(x=xi, t=ti), phi.bind(x=xi, t=ti)
+    ui0 = u.bind(x=xi0, t=ti0)
+    with pytest.raises(NotImplementedError, match="state-dependent MASS or DAMPING"):
+        jno.fem(
+            [
+                (1.0 + u) * (ui.tt * vi) + ui.x * vi.x,  # c(u) on the inertia -> refuse
+                u(xb) - 0.0,
+                u(xi0) - 0.0,
+                ui0.t - 0.0,
+            ]
+        )
+
+
 def test_second_order_1d_coupled_fails_loud():
     """The 1D ``u_tt`` path is single-field. A COUPLED second-order 1D system refuses by name rather
     than assembling something plausible.
