@@ -78,9 +78,15 @@ def test_shard_argument_is_actually_wired_to_the_solve():
     )
 
     ref = np.asarray(build().solve()).reshape(-1)
+    # Tolerance from the WORKING PRECISION, not a hard-coded float64 number. This suite has no x64
+    # fixture, so it runs float32 on GPU, where two BiCGStab runs of the same system already differ by
+    # ~4e-9 in reduction order alone — a fixed 1e-12 would fail on a difference that has nothing to do
+    # with sharding. What is being tested is that `shard=` does not change the ANSWER, and "same
+    # answer" can only mean "to the precision the solve was run in".
+    tol = 100.0 * np.finfo(ref.dtype).eps * max(1.0, float(np.max(np.abs(ref))))
     for kw in ({}, {"shard": False}, {"shard": 1}):
         got = np.asarray(build().solve(**kw)).reshape(-1)
-        assert np.max(np.abs(got - ref)) < 1e-12, f"shard={kw} changed the answer"
+        assert np.max(np.abs(got - ref)) < tol, f"shard={kw} changed the answer by more than {tol:.1e}"
 
     # an over-request must fail loud rather than quietly using fewer devices
     with pytest.raises(ValueError, match="only .* device"):
