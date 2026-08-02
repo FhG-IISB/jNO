@@ -409,13 +409,55 @@ def _normalize_extreme_scale(op, b, precond):
     return op_scaled, jnp.asarray(b) / alpha
 
 
-def compose_linear_solve_fn(linear, precond, x0, fem=None) -> Callable:
+def _shardable(op: LinearOperator, linear, precond) -> bool:
+    """Can this slot-composed solve be partitioned across devices?
+
+    The set is narrow, and narrow on purpose -- each exclusion is a case where sharding would either
+    fail outright or quietly gather the whole operator back onto one device, which is the worst
+    outcome (the memory saving disappears and only the collectives remain).
+
+    * **No assembled matrix** -- a matvec-only or dense operator has no triplet axis to partition.
+    * **A direct solver** -- ``lu``/``dense`` factorise the matrix themselves; ``spsolve`` is
+      single-device with no batching rule, so there is nothing to distribute.
+    * **A preconditioner other than Jacobi** -- the applier is materialised from the assembled
+      operator and closes over it (Chebyshev needs matvecs with ``A``, ``form`` holds an auxiliary
+      BCOO, ``amg``/``ams`` build host-side through scipy/pyamg). A closed-over array is baked in as
+      a compile-time constant and replicated to every device, so sharding the main operator while the
+      preconditioner drags a full copy along saves nothing. Jacobi is the exception because it needs
+      only the diagonal, and the diagonal is the same scatter-add the matvec already performs -- so it
+      is computed *from the sharded triplets* and never touches an assembled matrix.
+    * **A traced operator** -- ``device_put`` cannot place a tracer. The parametric and
+      differentiate-through paths therefore stay single-device for now.
+
+    Anything outside the set falls back silently to the ordinary path. It must not raise: the user
+    asked for a solver configuration, not for sharding, and automatic placement is not a request they
+    can be held to.
+    """
+    from ...precond import _Jacobi
+
+    A = op.bcoo
+    if A is None or isinstance(A.data, jax.core.Tracer) or isinstance(A.indices, jax.core.Tracer):
+        return False
+    if getattr(linear, "direct", False):
+        return False
+    return precond is None or isinstance(precond, _Jacobi)
+
+
+def compose_linear_solve_fn(linear, precond, x0, fem=None, shard=None) -> Callable:
     """Compose the linear-mode slots into the classic ``(A, b) -> x`` ``solve_fn`` contract.
 
     The composed callable is handed to the *existing* dispatch (plain / periodic-reduced /
     parametric ``FemLinearSystem`` / complex real-block), so every path keeps its current
     reduction and implicit-differentiation behaviour. It accepts the assembler's BCOO operator
     directly -- no densification.
+
+    This is the single ``LinearOperator`` construction point for **every** slot-composed linear
+    solve, so partitioning it here covers all the Krylov solvers at once rather than one at a time.
+    It cannot be a decorator around ``linear``, though: ``composed`` closes over the operator, while
+    sharding requires ``data``/``indices`` to arrive as ``jit`` *arguments* (a closed-over array is
+    replicated to every device, giving right answers with zero collectives and zero memory saving).
+    So the call structure is inverted -- the triplets are threaded in as arguments and the matvec is
+    rebuilt as a ``segment_sum`` inside. See :func:`_shardable` for what is and is not covered.
     """
     if linear is None:
         from ... import solve as _solve_ns
@@ -425,13 +467,34 @@ def compose_linear_solve_fn(linear, precond, x0, fem=None) -> Callable:
         prepare_precond(precond, fem)  # eager auxiliary assembly (safe for traced/parametric solves)
     x0_flat = None if x0 is None else jnp.asarray(x0).reshape(-1)
 
+    from .sharding import resolve_devices
+
+    devices = resolve_devices(shard)
+
     def composed(A, b):
         op = A if isinstance(A, LinearOperator) else LinearOperator(A)
         # Extreme-magnitude systems (the physical eddy regime) break the Krylov Arnoldi; scale to O(1)
         # first — solution-invariant, and a no-op for normally scaled / traced operators.
         op, b = _normalize_extreme_scale(op, b, precond)
+        rhs = jnp.asarray(b).reshape(-1)
+        if devices and _shardable(op, linear, precond):
+            from .sharding import jacobi_from_diagonal, sharded_solve
+
+            n = int(op.shape[0])
+
+            def _run(matvec, r, M, guess):
+                return linear(LinearOperator.from_matvec(matvec, shape=(n, n)), r, M=M, x0=guess)
+
+            return sharded_solve(
+                op.bcoo,
+                rhs,
+                _run,
+                devices,
+                precond_fn=None if precond is None else jacobi_from_diagonal,
+                x0=x0_flat,
+            )
         M = materialize_precond(precond, PrecondContext(op, fem)) if precond is not None else None
-        return linear(op, jnp.asarray(b).reshape(-1), M=M, x0=x0_flat)
+        return linear(op, rhs, M=M, x0=x0_flat)
 
     return composed
 
