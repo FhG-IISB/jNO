@@ -364,6 +364,75 @@ def test_second_order_1d_damped_wave_decays_and_places_C_correctly():
     assert rel < 0.02, f"1D damped wave does not track the analytic envelope: rel L2 = {rel:.4f}"
 
 
+def test_second_order_1d_coupled_fails_loud():
+    """The 1D ``u_tt`` path is single-field. A COUPLED second-order 1D system refuses by name rather
+    than assembling something plausible.
+
+    Worth pinning even though it is only a guard: the 1D augmented assembly composes ``[[M2,0],[0,M2]]``
+    and ``[[0,-M2],[K,C]]`` at fixed ``n`` offsets, so a second field would silently overlay the
+    velocity block rather than get its own — a wrong answer, not a crash, if the guard ever lapses.
+    2D/3D coupled second-order IS supported (see the mixed-order test above); this is a 1D-only limit."""
+    pytest.importorskip("pygmsh", reason="pygmsh required for line meshing")
+    d = jno.domain(constructor=jno.domain.line(mesh_size=0.1), time=(0.0, 0.5, 10))
+    u, phi = d.fem_symbols(names=("u", "phi"))
+    p, q = d.fem_symbols(names=("p", "q"))
+    xi, ti = d.variable("interior", split=True)[0], d.variable("interior", split=True)[-1]
+    xb = d.variable("boundary", split=True)[0]
+    xi0, ti0 = d.variable("initial", split=True)[0], d.variable("initial", split=True)[-1]
+    ui, vi = u.bind(x=xi, t=ti), phi.bind(x=xi, t=ti)
+    pi_, qi = p.bind(x=xi, t=ti), q.bind(x=xi, t=ti)
+    ui0, pi0 = u.bind(x=xi0, t=ti0), p.bind(x=xi0, t=ti0)
+    with pytest.raises(NotImplementedError, match="single-field|first-order system"):
+        jno.fem(
+            [
+                ui.tt * vi + ui.x * vi.x,
+                pi_.tt * qi + pi_.x * qi.x,
+                u(xb) - 0.0,
+                p(xb) - 0.0,
+                u(xi0) - 0.0,
+                ui0.t - 0.0,
+                p(xi0) - 0.0,
+                pi0.t - 0.0,
+            ]
+        )
+
+
+def test_second_order_1d_p2_wave_converges_at_second_order_in_time():
+    """1D **P2** (LINE3) combined with ``u_tt`` — two features that landed separately and meet only here.
+
+    P2 puts extra DOFs at the element midpoints, so the augmented ``[u; v]`` state must be seeded at the
+    DOF coordinates rather than the mesh vertices; getting that wrong shifts the initial shape rather
+    than raising. The dof count is pinned (21 vertices + 20 midpoints) alongside the physics.
+
+    Asserted as a CONVERGENCE RATE in dt, not a single error, and deliberately so: a one-point check is
+    untrustworthy here because the P1 spatial error and the time error carry opposite signs and partly
+    cancel, so a coarser run can look *better* than a finer one (P1 at nt=80 beats P1 at nt=320 on this
+    very problem). A clean O(dt^2) rate cannot be produced by a mis-seeded initial state."""
+    pytest.importorskip("pygmsh", reason="pygmsh required for line meshing")
+    errs = []
+    for nsteps in (50, 100, 200):
+        d = jno.domain(constructor=jno.domain.line(mesh_size=0.05), time=(0.0, 1.2, nsteps))
+        u, phi = d.fem_symbols(order=2)
+        xi, ti = d.variable("interior", split=True)[0], d.variable("interior", split=True)[-1]
+        xb = d.variable("boundary", split=True)[0]
+        xi0, ti0 = d.variable("initial", split=True)[0], d.variable("initial", split=True)[-1]
+        ui, vi = u.bind(x=xi, t=ti), phi.bind(x=xi, t=ti)
+        ui0 = u.bind(x=xi0, t=ti0)
+        fem = jno.fem(
+            [ui.tt * vi + ui.x * vi.x, u(xb) - 0.0, u(xi0) - jno.fn(lambda x: jnp.sin(PI * x), [xi0]), ui0.t - 0.0]
+        )
+        n = fem.offsets[1]
+        assert n == 41, f"P2 on 20 line elements is 21 vertices + 20 midpoints, got {n} DOFs"
+        ts, U, _ = _trajectory(fem)
+        xx = np.asarray(fem.points)[:, 0]
+        exact = np.sin(PI * xx)[None, :] * np.cos(PI * ts)[:, None]
+        errs.append(float(np.linalg.norm(U - exact) / np.linalg.norm(exact)))
+
+    rates = [np.log2(errs[i] / errs[i + 1]) for i in range(len(errs) - 1)]
+    assert np.mean(rates) > 1.8, f"trapezoidal on P2 must be ~O(dt^2) in time: errors {errs}, rates {rates}"
+    assert errs[-1] < 1e-4, f"1D P2 wave did not track sin(pi x)cos(pi t): {errs[-1]:.2e}"
+
+
 def test_second_order_1d_wave_without_dirichlet_assembles():
     """The ``dpairs``-empty branch of the 1D augmented assembly: with no essential condition the
     Dirichlet row-replacement is skipped entirely, so the sparse blocks go to the marcher untouched.
