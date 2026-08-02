@@ -1657,7 +1657,14 @@ class FEM:
             return run_adaptive_solve(self, adapt, solve_fn=solve_fn, **kwargs)
         if has_slots:
             solve_fn, kwargs = self._compose_slots(
-                solve_fn, x0=x0, nonlinear=nonlinear, linear=linear, precond=precond, time=time, kwargs=kwargs
+                solve_fn,
+                x0=x0,
+                nonlinear=nonlinear,
+                linear=linear,
+                precond=precond,
+                time=time,
+                shard=shard,
+                kwargs=kwargs,
             )
             from_slots = True
         else:
@@ -1807,7 +1814,7 @@ class FEM:
             return self._op.solve(solve_fn, **kwargs).fn()
         return self._op.solve(solve_fn, **kwargs)
 
-    def _compose_slots(self, solve_fn, *, x0, nonlinear, linear, precond, time=None, kwargs):
+    def _compose_slots(self, solve_fn, *, x0, nonlinear, linear, precond, time=None, shard=None, kwargs):
         """Compose the solver slots into the mode-appropriate ``solve_fn`` (see :meth:`solve`)."""
         from .utils.solver.solver_api import compose_linear_solve_fn, compose_nonlinear_solve_fn
 
@@ -1867,7 +1874,7 @@ class FEM:
             from .utils.solver.fem_utils import restrict_state_periodic
 
             x0 = restrict_state_periodic(_per_x0, jnp.asarray(x0).reshape(-1))
-        return compose_linear_solve_fn(linear, precond, x0, self), kwargs
+        return compose_linear_solve_fn(linear, precond, x0, self, shard=shard), kwargs
 
     @property
     def points(self):

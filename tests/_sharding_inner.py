@@ -101,6 +101,45 @@ def main(n_dev: int) -> None:
     got = np.asarray(f(d_s, i_s, jax.device_put(b, repl)))
     assert np.max(np.abs(got - dense @ np.asarray(b))) < 1e-10, "padded triplets perturbed the matvec"
 
+    # --- 4. the SLOT-COMPOSED path shards too, and the refuse-set falls back silently ------------
+    # `compose_linear_solve_fn` is the single LinearOperator construction point for every
+    # slot-composed linear solve, so one change there covers all the Krylov solvers. It could not be
+    # a decorator: `composed` closes over the operator, while sharding needs data/indices as jit
+    # ARGUMENTS -- so the call structure is inverted and the matvec rebuilt as a segment_sum inside.
+    import jno
+    from jno.utils.solver.solver_api import LinearOperator, _shardable, compose_linear_solve_fn
+
+    op = LinearOperator(A)
+    for label, linear, precond in (
+        ("no precond", jno.solve.bicgstab(tol=1e-10, maxiter=3000), None),
+        ("jacobi", jno.solve.bicgstab(tol=1e-10, maxiter=3000), jno.precond.jacobi()),
+        ("cg", jno.solve.cg(tol=1e-10, maxiter=3000), jno.precond.jacobi()),
+        ("gmres", jno.solve.gmres(tol=1e-10, maxiter=3000), None),
+    ):
+        assert _shardable(op, linear, precond), f"{label} should be shardable"
+        x = compose_linear_solve_fn(linear, precond, None, None, shard=devices)(A, b)
+        assert rel(x) < 1e-8, f"slot-composed {label} on {n_dev} device(s): rel {rel(x):.3e}"
+        # Values alone CANNOT show the operator was distributed -- a closed-over (hence replicated)
+        # operator gives identical answers with zero collectives. The output's device set can: the
+        # sharded path returns on the multi-device mesh, the fallback on a single device.
+        assert len(x.sharding.device_set) == n_dev, (
+            f"slot-composed {label} produced a {len(x.sharding.device_set)}-device result on "
+            f"{n_dev} devices -- it silently took the unsharded path"
+        )
+
+    # the refuse-set: each must fall back to the ordinary path, never raise
+    assert not _shardable(op, jno.solve.lu(), None), "a direct solver has nothing to distribute"
+    assert not _shardable(op, jno.solve.bicgstab(), jno.precond.chebyshev()), (
+        "a preconditioner that closes over the operator would replicate it -- refuse"
+    )
+    assert not _shardable(LinearOperator.from_matvec(lambda v: v, shape=(n, n)), jno.solve.cg(), None), (
+        "a matvec-only operator has no triplet axis"
+    )
+    x_direct = compose_linear_solve_fn(jno.solve.lu(), None, None, None, shard=devices)(A, b)
+    assert rel(x_direct) < 1e-8, "the refuse-set must fall back silently, not fail"
+    if n_dev > 1:
+        assert len(x_direct.sharding.device_set) == 1, "a direct solve must NOT claim to be sharded"
+
     print(f"OK n_devices={n_dev} per_device_nnz={per_device} pad={n_pad}")
 
 
