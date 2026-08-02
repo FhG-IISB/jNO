@@ -123,6 +123,58 @@ def test_element_storage_is_smaller_than_the_assembled_matrix():
     assert assembled / op.nbytes > 1.5, f"expected a clear margin, got {assembled / op.nbytes:.2f}x"
 
 
+def test_assembled_operator_carries_no_duplicate_triplets():
+    """The assembled operator must store each ``(row, col)`` once.
+
+    Two independent sources of redundancy used to survive into it: the assemblers append one triplet
+    block **per additive weak-form term**, and every interior DOF pair receives a contribution from
+    each element sharing it (~20 tets for P1). BCOO summed them lazily on every ``@``, so results
+    were always right — they just cost ~19x the work on each of a Krylov solve's hundreds of matvecs.
+
+    Measured on this 3-D Poisson before the fix: 96473 stored triplets for 4999 unique pairs, 1.47
+    MiB, and a matvec 5.7x slower than necessary."""
+    pytest.importorskip("shapely", reason="shapely required for the box domain")
+    import jno
+
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.25).domain()
+    u, phi = d.fem_symbols()
+    c = d.variable("interior", split=True)
+    cb = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=c[0], y=c[1], z=c[2]), phi.bind(x=c[0], y=c[1], z=c[2])
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y + ui.z * vi.z - 1.0 * vi, u(cb[0], cb[1], cb[2]) - 0.0])
+    A, _b = fem.operator
+
+    idx = np.asarray(A.indices)
+    n_stored, n_unique = idx.shape[0], len({tuple(t) for t in idx})
+    assert n_stored == n_unique, f"{n_stored} triplets stored for {n_unique} unique pairs"
+
+
+def test_summing_duplicates_leaves_the_operator_unchanged():
+    """Compression must be exact — it is a storage change, not an approximation. Checked as a matvec
+    against the *uncompressed* triplets rebuilt by hand, so this cannot pass by comparing a value to
+    itself."""
+    from jax.experimental import sparse as jsp
+
+    from jno.utils.solver.fem_utils import sum_duplicate_triplets
+
+    rng = np.random.default_rng(0)
+    n, nnz = 60, 900
+    rows = rng.integers(0, n, nnz).astype(np.int32)  # heavy duplication by construction
+    cols = rng.integers(0, n, nnz).astype(np.int32)
+    data = rng.standard_normal(nnz)
+    raw = jsp.BCOO((jnp.asarray(data), jnp.asarray(np.stack([rows, cols], 1))), shape=(n, n))
+
+    dense = np.zeros((n, n))
+    for r, c, dv in zip(rows, cols, data):
+        dense[r, c] += dv
+
+    packed = sum_duplicate_triplets(raw)
+    assert packed.nse < raw.nse, "a duplicate-heavy operator must actually shrink"
+    v = jnp.asarray(rng.standard_normal(n))
+    assert np.max(np.abs(np.asarray(packed @ v) - dense @ np.asarray(v))) < 1e-12
+    assert np.max(np.abs(np.asarray(packed @ v) - np.asarray(raw @ v))) < 1e-12
+
+
 def test_dtype_is_reported_from_the_blocks():
     """``LinearOperator`` consumers read the operator dtype (spectral bound probes, Jacobi); an
     element operator has to answer the same question."""

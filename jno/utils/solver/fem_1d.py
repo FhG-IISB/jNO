@@ -66,6 +66,7 @@ from .fem_utils import (
     bcoo_set_unit_diag,
     bcoo_zero_rows,
     bcoo_zero_rows_cols,
+    sum_duplicate_triplets,
 )
 
 _COMPONENT_NAMES = {"x": 0, "y": 1, "z": 2}
@@ -1148,6 +1149,7 @@ def assemble_fem_1d_multifield(domain, volume_terms, boundary_terms, dirichlet_r
     A = residual_free.sparse_jacobian(zeros)
     b = -residual_free(zeros)
     A, b = _apply_dirichlet_symmetric(A, b, dirichlet_pairs)
+    A = sum_duplicate_triplets(A)  # ~19x redundant triplets otherwise; see the helper
     return (A, b), "linear"
 
 
