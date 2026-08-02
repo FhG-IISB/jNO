@@ -282,6 +282,130 @@ def test_trainable_parameter_basis_is_refused_with_a_reason():
         fem.solve(basis=P)
 
 
+def _heat(kappa, ms=0.12, nsteps=11, t_end=0.05):
+    """``u_t = kappa*lap(u) - u^3`` (nonlinear) or the linear heat equation when ``cubic=False``."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=ms, time=(0.0, t_end, nsteps))
+    u, phi = d.fem_symbols()
+    si = d.variable("interior", split=True)
+    xi, yi, ti = si[0], si[1], si[-1]
+    sb = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    u0 = 2.0 * jno.np.sin(np.pi * ci[0]) * jno.np.sin(np.pi * ci[1])
+    return jno.fem([ui.t * vi + kappa * (ui.x * vi.x + ui.y * vi.y), u(sb[0], sb[1]) - 0.0, u(ci[0], ci[1]) - u0])
+
+
+def _heat_nl(kappa, ms=0.12, nsteps=11, t_end=0.05):
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=ms, time=(0.0, t_end, nsteps))
+    u, phi = d.fem_symbols()
+    si = d.variable("interior", split=True)
+    xi, yi, ti = si[0], si[1], si[-1]
+    sb = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    u0 = 2.0 * jno.np.sin(np.pi * ci[0]) * jno.np.sin(np.pi * ci[1])
+    return jno.fem(
+        [
+            ui.t * vi + kappa * (ui.x * vi.x + ui.y * vi.y) + (u * u * u) * vi,
+            u(sb[0], sb[1]) - 0.0,
+            u(ci[0], ci[1]) - u0,
+        ]
+    )
+
+
+def _traj_pod(builder, kappas, k):
+    """POD basis from trajectories across a parameter sweep — snapshots in TIME as well as parameter."""
+    snaps = np.concatenate([np.asarray(builder(kk).solve().fn()) for kk in kappas], axis=0)
+    return jnp.asarray(np.linalg.svd(snaps.T, full_matrices=False)[0][:, :k])
+
+
+def test_transient_reduced_march_tracks_the_full_trajectory():
+    """A reduced TRANSIENT march — the case reduced-order models exist for, since the cost being
+    avoided is a whole time integration rather than one solve.
+
+    The block is reduced ONCE at solve time (``PᵀMP``, ``PᵀAP``, restricted ``state0``) and the marcher
+    steps in the reduced space, so the saved trajectory must still come back at FULL width."""
+    ks = np.linspace(0.8, 1.2, 5)
+    U = _traj_pod(_heat, ks, 8)
+    fem = _heat(1.05)  # a kappa the basis never saw
+    full = np.asarray(fem.solve().fn())
+    red = np.asarray(_heat(1.05).solve(basis=U).fn())
+
+    assert red.shape == full.shape, "the reduced march must return the FULL-width trajectory"
+    assert np.linalg.norm(red - full) / np.linalg.norm(full) < 1e-3
+
+
+def test_transient_reduced_accuracy_improves_with_rank():
+    """More modes, less error — over the whole trajectory, not just the final frame."""
+    ks = np.linspace(0.8, 1.2, 5)
+    U = _traj_pod(_heat, ks, 8)
+    full = np.asarray(_heat(1.05).solve().fn())
+    errs = []
+    for k in (1, 2, 4, 8):
+        fem = _heat(1.05)
+        fem.BASIS_RESIDUAL_LIMIT = 1e9  # sweeping ranks on purpose
+        red = np.asarray(fem.solve(basis=U[:, :k]).fn())
+        errs.append(float(np.linalg.norm(red - full) / np.linalg.norm(full)))
+    assert all(errs[i] > errs[i + 1] for i in range(len(errs) - 1)), f"error must fall with rank: {errs}"
+
+
+def test_transient_nonlinear_reduced_march():
+    """A NONLINEAR transient reduces too: the mass / residual / jacobian are wrapped to act on the
+    reduced state, so Newton runs in the k-dimensional space each step."""
+    ks = (0.8, 1.0, 1.2)
+    U = _traj_pod(_heat_nl, ks, 5)
+    full = np.asarray(_heat_nl(1.05).solve().fn())
+    fem = _heat_nl(1.05)
+    red = np.asarray(fem.solve(basis=U).fn())
+    assert red.shape == full.shape
+    assert np.linalg.norm(red - full) / np.linalg.norm(full) < 1e-3
+
+
+def test_transient_basis_that_cannot_represent_the_initial_state_fails_loud():
+    """The transient certificate. A reduced march cannot be checked by a steady residual, so what is
+    measured is the projection error of the INITIAL state: if the span cannot represent where the
+    trajectory starts, the march is wrong from step 0.
+
+    Deliberately NOT asserted to bound the trajectory error — it does not. Measured on the nonlinear
+    problem above, the certificate (3.7e-4) comes in BELOW the actual error (4.5e-4) at k=2. It is a
+    floor that catches a basis from the wrong family, not an error bound, and the docstring says so."""
+    fem = _heat(1.0)
+    junk = jnp.asarray(np.linalg.qr(np.random.default_rng(3).standard_normal((fem.dofs, 3)))[0])
+    with pytest.raises(ValueError, match="INITIAL state"):
+        fem.solve(basis=junk).fn()
+    assert fem.basis_residual is not None and fem.basis_residual > 0.5
+
+
+def test_transient_basis_is_per_call_and_leaves_the_block_alone():
+    """The transient path swaps the OPERATOR (a reduced block), not just the reduction dict. That block
+    must not stick: a later full solve on the same object has to march the full system again."""
+    U = _traj_pod(_heat, np.linspace(0.8, 1.2, 5), 8)
+    fem = _heat(1.05)
+    n_before = fem.dofs
+    fem.solve(basis=U).fn()
+    assert fem.dofs == n_before, "the reduced block must not persist on the FEM object"
+    full_again = np.asarray(fem.solve().fn())
+    assert full_again.shape[1] == n_before
+
+
+def test_second_order_in_time_basis_is_refused():
+    """A ``u_tt`` block marches the augmented state ``[u; v]``, so ``dofs`` is 2n while a basis built
+    from field snapshots is (n, k). Applying it needs blkdiag(U, U) and the row convention is a
+    decision, not a detail — reducing the velocity block by a displacement basis would not complain."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.25, time=(0.0, 0.5, 8))
+    u, phi = d.fem_symbols()
+    si = d.variable("interior", split=True)
+    xi, yi, ti = si[0], si[1], si[-1]
+    sb = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    ui0 = u.bind(x=ci[0], y=ci[1], t=ci[-1])
+    fem = jno.fem([ui.tt * vi + (ui.x * vi.x + ui.y * vi.y), u(sb[0], sb[1]) - 0.0, u(ci[0], ci[1]) - 1.0, ui0.t - 0.0])
+    U = jnp.asarray(np.linalg.qr(np.random.default_rng(0).standard_normal((fem.dofs, 3)))[0])
+    with pytest.raises(NotImplementedError, match="SECOND-ORDER-in-time"):
+        fem.solve(basis=U)
+
+
 def test_complex_problem_is_refused_by_is_complex_not_by_mode():
     """A COMPLEX problem must refuse — and the check has to ask ``is_complex``, not the mode.
 
@@ -306,22 +430,11 @@ def test_complex_problem_is_refused_by_is_complex_not_by_mode():
 
 
 def test_unsupported_modes_fail_loud():
-    """Scope, each with its own reason rather than one blanket refusal: transient (the time block is
-    reduced eagerly at assembly), complex (solves through an internal real-equivalent 2n layout), and
-    a periodic tie (two prolongations whose composition has no decided convention yet)."""
-    # transient
-    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2, time=(0.0, 0.05, 6))
-    u, phi = d.fem_symbols()
-    si = d.variable("interior", split=True)
-    xi, yi, ti = si[0], si[1], si[-1]
-    xb, yb, _ = d.variable("boundary", split=True)
-    ci = d.variable("initial", split=True)
-    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
-    u0 = jno.np.sin(np.pi * ci[0]) * jno.np.sin(np.pi * ci[1])
-    fem_t = jno.fem([ui.t * vi + (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - u0])
-    with pytest.raises(NotImplementedError, match="transient"):
-        fem_t.solve(basis=jnp.asarray(np.linalg.qr(np.random.default_rng(0).standard_normal((fem_t.dofs, 3)))[0]))
+    """The remaining scope limit: a periodic tie, because both it and the basis reduce the system by a
+    prolongation and composing the two has no decided convention.
 
+    (First-order transient used to be listed here and is now supported — see the reduced-march tests
+    above. Complex and second-order-in-time have their own tests, each with its own reason.)"""
     # periodic tie
     dp = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2)
     up, php = dp.fem_symbols()

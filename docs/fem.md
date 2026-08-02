@@ -781,12 +781,29 @@ operator. `∂u/∂U` flows under `jax.grad`, so the subspace itself can be **le
 basis lives on the Stiefel manifold, so put the orthonormalisation inside the differentiated function
 (`net -> QR -> basis`) rather than projecting the step afterwards.
 
-Scope, each refused with its own reason: **transient** (the time block is reduced eagerly at assembly),
-**complex** (solves through an internal real-equivalent 2n layout), a **periodic tie** (composing two
-prolongations has no decided convention yet), and a `jno.np.parameter` basis (a trace node, not an
-array — `jax.grad` over a concrete basis is the supported differentiable path). A reduced **nonlinear**
-solve works and returns a deferred trace node, but is a memory win, not a speed one: the full-order
-residual is still evaluated per Newton step (no hyper-reduction).
+**Transient too** — and that is what a ROM is really for, since the cost avoided is a whole time
+integration rather than one solve. The block is reduced once at solve time (`PᵀMP`, `PᵀAP`, restricted
+`state0`) and the marcher steps in the reduced space, returning the trajectory at full width:
+
+```python
+snaps = np.concatenate([np.asarray(build(p).solve().fn()) for p in sweep])   # (n_sweep*n_t, n_dofs)
+U = np.linalg.svd(snaps.T, full_matrices=False)[0][:, :8]
+traj = build(p_new).solve(basis=U).fn()                                     # 8 unknowns per step
+```
+
+A transient solve is certified differently: the steady residual has no analogue, so what is measured is
+the **projection error of the initial state**, `‖u0 − U Uᵀ u0‖/‖u0‖`. If the span cannot represent where
+the trajectory starts, the march is wrong from step 0. It is a floor, not a bound — it says nothing
+about whether the span keeps up *later* (measured on a nonlinear case it came in below the true
+trajectory error), and the docstring is explicit about that.
+
+Scope, each refused with its own reason: **second-order-in-time** (`u_tt` marches the augmented `[u; v]`
+state, so a field basis needs `blkdiag(U, U)` and the row convention is unsettled), **complex** (solves
+through an internal real-equivalent 2n layout), a **periodic tie** (composing two prolongations has no
+decided convention yet), and a `jno.np.parameter` basis (a trace node, not an array — `jax.grad` over a
+concrete basis is the supported differentiable path). A reduced **nonlinear** solve works, but is a
+memory win, not a speed one: the full-order residual is still evaluated per Newton step (no
+hyper-reduction).
 
 ### Field parameters `k(x)` + regularization
 
@@ -998,8 +1015,9 @@ route** — the residual-PINN path is unaffected. Full detail is inline in the s
   a state-dependent mass or damping `c(u)·u_tt` is refused, since `M2`/`C` are extracted by
   differentiating at `u=0` and would otherwise be frozen there. Coupled multi-field is 2D/3D and
   **all**-second-order only (1D is single-field); time-varying Dirichlet is refused on nonlinear forms.
-- **Reduced-order (`basis=`) solves are steady-only** — transient, complex and periodic-tied
-  problems refuse; nonlinear reduces but without hyper-reduction is a memory win, not a speed one.
+- **Reduced-order (`basis=`) solves** cover steady and **first-order transient** (linear and
+  nonlinear). Second-order-in-time (`u_tt`), complex, and periodic-tied problems refuse, each with its
+  own reason. Nonlinear reduces, but without hyper-reduction that is a memory win, not a speed one.
 - **No runtime Dirichlet parameters** — a trainable parameter may sit in the operator (stiffness) but
   not in an essential/Dirichlet boundary *value*.
 - **Affine parameter lowering expects a single, direct factor** — one trainable scalar per additive
