@@ -1363,6 +1363,7 @@ def assemble_fem_native(
                 _sh = (int(_pc.shape[0]), int(cdofs[_btfi_s].shape[1]), int(cell_all_dofs.shape[1]))
                 _idx_rows.append(jnp.broadcast_to(cdofs[_btfi_s][_pc][:, :, None], _sh).reshape(-1))
                 _idx_cols.append(jnp.broadcast_to(_fcols[:, None, :], _sh).reshape(-1))
+        _blk_sizes = [int(r.shape[0]) for r in _idx_rows]  # per-term flat lengths, in append order
         _idx_static = (
             jnp.stack([jnp.concatenate(_idx_rows).astype(jnp.int32), jnp.concatenate(_idx_cols).astype(jnp.int32)], axis=1)
             if _idx_rows
@@ -1378,9 +1379,31 @@ def assemble_fem_native(
             # matrix (O(nnz), GPU-able at large N). Each per-element block is element-sized; duplicate
             # (i, j) triplets from neighbouring cells are summed by BCOO on matvec / todense, so the
             # per-cell blocks are simply concatenated (no pre-summation).
+            # With a plan in force each element block is scattered STRAIGHT into its compressed slots
+            # and then dropped, so the concatenated raw-triplet array is never built. That array and
+            # the transposed copy XLA made of it were the two largest buffers in the compiled jacobian
+            # after the element blocks themselves (61.6 MiB each on a 31k-DOF 3-D problem, against a
+            # 6.8 MiB operator), and every per-term `Ke` had to stay alive waiting for the concatenate.
+            # The row/column arrays are skipped for the same reason: the plan already has the pattern.
+            _acc = [None]
+            _off = [0]
+            _nblk = [0]
             rows_l, cols_l, data_l = [], [], []
             local_all = u_flat[cell_all_dofs]  # (n_cell, n_local_all)
             pts_dyn = _apply_coord_params(pts_j, args)  # trainable coords -> differentiable geometry
+
+            def _emit(flat, rows_fn, cols_fn):
+                if _plan is None:
+                    data_l.append(flat)
+                    rows_l.append(rows_fn())
+                    cols_l.append(cols_fn())
+                    return
+                _inv, _nse = _plan[1], _plan[2]
+                k = _blk_sizes[_nblk[0]]
+                part = jax.ops.segment_sum(flat, _inv[_off[0] : _off[0] + k], num_segments=_nse)
+                _acc[0] = part if _acc[0] is None else _acc[0] + part
+                _off[0] += k
+                _nblk[0] += 1
 
             for coeff, tfi, rnames in typed_with_masks:
 
@@ -1388,11 +1411,11 @@ def assemble_fem_native(
                     return jax.jacfwd(lambda v: _vol_elem_res(c, v, _e, _t, _r, t, args, _p))(la)
 
                 Ke = jax.vmap(_ke)(jnp.arange(n_cells), local_all)  # (n_cell, n_test_tfi, n_local_all)
-                r = jnp.broadcast_to(cdofs[tfi][:, :, None], Ke.shape)
-                c = jnp.broadcast_to(cell_all_dofs[:, None, :], Ke.shape)
-                rows_l.append(r.reshape(-1))
-                cols_l.append(c.reshape(-1))
-                data_l.append(Ke.reshape(-1))
+                _emit(
+                    Ke.reshape(-1),
+                    lambda _K=Ke, _t=tfi: jnp.broadcast_to(cdofs[_t][:, :, None], _K.shape).reshape(-1),
+                    lambda _K=Ke: jnp.broadcast_to(cell_all_dofs[:, None, :], _K.shape).reshape(-1),
+                )
 
             normals_dyn = _surface_normals(pts_dyn)  # differentiable facet normals under coordinate motion
             for region, face_ids, btyped in surface_work:
@@ -1406,21 +1429,25 @@ def assemble_fem_native(
                         return jax.jacfwd(lambda v: _surf_elem_res(fi, v, _e, _t, _r, t, args, _p, _n))(la)
 
                     Kef = jax.vmap(_kef)(fids, lv)  # (n_face, n_test_btfi, n_local_all)
-                    fr = jnp.broadcast_to(cdofs[btfi][pcells][:, :, None], Kef.shape)
-                    fc = jnp.broadcast_to(fcols[:, None, :], Kef.shape)
-                    rows_l.append(fr.reshape(-1))
-                    cols_l.append(fc.reshape(-1))
-                    data_l.append(Kef.reshape(-1))
+                    _emit(
+                        Kef.reshape(-1),
+                        lambda _K=Kef, _t=btfi, _p=pcells: jnp.broadcast_to(cdofs[_t][_p][:, :, None], _K.shape).reshape(
+                            -1
+                        ),
+                        lambda _K=Kef, _f=fcols: jnp.broadcast_to(_f[:, None, :], _K.shape).reshape(-1),
+                    )
 
+            if _plan is not None:
+                if _acc[0] is None:  # no terms -> empty operator
+                    return jsparse.BCOO((jnp.zeros((0,), u_flat.dtype), jnp.zeros((0, 2), jnp.int32)), shape=(total, total))
+                # ~12x fewer stored triplets, INSIDE the trace -- so it reaches the nonlinear Jacobian
+                # and the per-step/parametric re-assemblies, not just eager assembly. The host-decided
+                # plan makes this an O(nnz) scatter-add rather than an O(nnz log nnz) sort, which
+                # matters because it runs once per Newton step / timestep / parameter value.
+                return jsparse.BCOO((_acc[0], _plan[0]), shape=(total, total))
             if not data_l:  # no terms -> empty operator
                 return jsparse.BCOO((jnp.zeros((0,), u_flat.dtype), jnp.zeros((0, 2), jnp.int32)), shape=(total, total))
             data = jnp.concatenate(data_l)
-            if _plan is not None:
-                # ~12x fewer stored triplets, INSIDE the trace -- so it reaches the nonlinear Jacobian
-                # and the per-step/parametric re-assemblies, not just eager assembly. Applying a
-                # host-decided plan makes this an O(nnz) scatter-add rather than an O(nnz log nnz)
-                # sort, which matters because this runs once per Newton step / timestep / parameter.
-                return apply_compress_plan(data, _plan, (total, total))
             if _idx_static is not None:
                 idx = _idx_static
             else:  # pattern could not be hoisted -> rebuild it in-trace, uncompressed but correct
