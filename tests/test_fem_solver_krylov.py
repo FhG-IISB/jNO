@@ -19,6 +19,7 @@ import numpy as np
 import pytest
 
 import jno
+from jno.utils.solver import krylov
 
 
 @pytest.fixture(autouse=True)
@@ -61,6 +62,81 @@ def _b(n, seed=3):
 # ---------------------------------------------------------------------------
 # correctness vs oracles
 # ---------------------------------------------------------------------------
+
+
+def _f32_tridiag(n=200):
+    """SPD tridiagonal in float32, plus its float64 reference solution. Explicit f32 arrays rather
+    than toggling ``jax_enable_x64`` — precision is per-array, and the global flag is process-wide."""
+    d, off = np.full(n, 2.0), np.full(n - 1, -1.0)
+    A64 = np.diag(d) + np.diag(off, 1) + np.diag(off, -1)
+    b64 = np.random.default_rng(0).standard_normal(n)
+    A32, b32 = jnp.asarray(A64.astype(np.float32)), jnp.asarray(b64.astype(np.float32))
+    return (lambda v: A32 @ v), b32, np.linalg.solve(A64, b64)
+
+
+def test_breakdown_guard_is_representable_in_float32():
+    """The guard floor must exist in the dtype it guards.
+
+    The historical constant was ``1e-300``, which **underflows to exactly 0.0 in float32** (smallest
+    normal ~1.18e-38). Every ``maximum(x, tiny)`` breakdown guard in the three solvers then became
+    ``maximum(x, 0.0)`` and divided by exact zero, giving inf/NaN instead of a clamped value — and
+    jNO's session default is float32 (``tests/conftest.py``), so that path was reachable by default."""
+    from jno.utils.solver.krylov import _tiny_of
+
+    assert np.float32(1e-300) == 0.0, "the premise: the old constant is not representable in f32"
+    for dt in (np.float32, np.float64):
+        tiny = float(_tiny_of(dt))
+        assert tiny > 0.0 and np.asarray(tiny, dt) > 0, f"{dt.__name__} floor underflowed"
+        assert np.isfinite(1.0 / np.asarray(tiny, dt)), f"1/tiny overflowed in {dt.__name__}"
+
+
+def test_float32_breakdown_returns_finite_not_nan():
+    """A zero right-hand side drives ``beta`` to exactly 0 — the case the guard exists for. Both
+    solvers must return the (finite) zero solution rather than NaN."""
+    mv, b32, _ = _f32_tridiag()
+    zero = jnp.zeros_like(b32)
+    for name, fn in (("minres", krylov.minres), ("fgmres", krylov.fgmres)):
+        x = np.asarray(fn(mv, zero, tol=1e-8, maxiter=50))
+        assert np.all(np.isfinite(x)), f"{name} returned non-finite values on a zero RHS"
+        assert np.max(np.abs(x)) == 0.0, f"{name} did not return the zero solution"
+
+
+def test_tolerance_floor_is_reachable_and_leaves_float64_alone():
+    """A tolerance below unit round-off cannot be met: the residual norm never falls below
+    ~eps*||b||, so the loop runs to ``maxiter`` on a system it already solved. The shipped default
+    ``tol=1e-8`` is exactly that request in float32 (eps 1.2e-7).
+
+    float64 must be untouched — this is what makes the fix free of regression surface."""
+    from jno.utils.solver.krylov import _effective_tol
+
+    assert _effective_tol(1e-8, np.float64) == 1e-8, "float64 tolerances must not move"
+    assert _effective_tol(1e-2, np.float32) == 1e-2, "a reachable f32 tolerance must not move"
+    floored = _effective_tol(1e-8, np.float32)
+    assert floored > float(np.finfo(np.float32).eps), "the f32 floor must exceed unit round-off"
+    assert floored < 1e-5, f"the floor should stay tight, got {floored:.2e}"
+
+
+def test_float32_tracks_float64_at_matched_restart():
+    """The end-to-end property: at the SAME restart, float32 must track float64 rather than diverge.
+
+    Guards against reading restarted-GMRES stagnation as a precision bug. On this deliberately
+    ill-conditioned tridiagonal (kappa ~ 1.6e4) a restart of 30 stagnates around 1.1e-2 in BOTH
+    precisions — the restart is the limit, not the dtype. Without a restart the two separate as
+    expected (~1e-13 vs ~1e-5), which is the honest float32 floor."""
+    mv32, b32, x_ref = _f32_tridiag()
+    n = b32.shape[0]
+    A64 = np.diag(np.full(n, 2.0)) + np.diag(np.full(n - 1, -1.0), 1) + np.diag(np.full(n - 1, -1.0), -1)
+    b64 = jnp.asarray(np.asarray(b32, np.float64))
+    mv64 = lambda v: jnp.asarray(A64) @ v  # noqa: E731
+    rel = lambda x: float(np.linalg.norm(np.asarray(x, np.float64) - x_ref) / np.linalg.norm(x_ref))  # noqa: E731
+
+    r32 = rel(krylov.fgmres(mv32, b32, tol=1e-8, restart=30, maxiter=1200))
+    r64 = rel(krylov.fgmres(mv64, b64, tol=1e-8, restart=30, maxiter=1200))
+    assert r32 == pytest.approx(r64, rel=0.1), f"f32 must track f64 at matched restart: {r32:.2e} vs {r64:.2e}"
+    assert np.isfinite(r32)
+
+    # and unrestarted, float32 reaches its own floor rather than stalling or blowing up
+    assert rel(krylov.fgmres(mv32, b32, tol=1e-8, restart=n, maxiter=1200)) < 1e-4
 
 
 def test_minres_symmetric_indefinite_vs_scipy():
