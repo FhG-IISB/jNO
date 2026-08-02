@@ -225,6 +225,18 @@ spurious-free, converging to `2π²` from below).
 Always-available: `fem.dofs`, `fem.points` (the coordinates the DOFs live on — use these for P2,
 where they differ from the mesh vertices), `fem.operator`, and `fem.classification`.
 
+> **Operator storage.** The assembled BCOO stores each `(row, col)` pair **once**. The assemblers
+> emit one triplet block per additive weak-form term and every interior DOF pair receives a
+> contribution from each element sharing it (~20 tets for P1), so the raw triplets are ~10–20×
+> redundant; they are summed once at assembly instead of lazily on every matvec. Measured on a 3-D
+> transient heat block: mass 18240 → 753 stored triplets, operator 54992 → 1025, step operator
+> `M + dt·A` 73232 → 1025 (1.12 → 0.02 MiB); on a 3-D nonlinear Jacobian, 36752 → 3841 with a 6.6×
+> faster matvec. Two consequences if you read the triplets yourself: `nse` is the true nonzero count,
+> and **numerically-zero entries are dropped** — symmetric Dirichlet elimination leaves whole rows of
+> them behind, and on a Dirichlet-heavy operator that removal is the larger of the two effects. Code
+> that needs the *structural* pattern (an entry that is zero at this parameter value but nonzero at
+> another) must not read it off the assembled operator.
+
 > **Term introspection (provisional).** `fem.term_kinds` returns a `list[TermKind]` — each
 > additively-split PDE (volume) term classified by `support`, `time_order`, `trial_channel` /
 > `test_channel`, and `linear`, with `is_local` flagging a spatially pointwise term (reaction/mass) vs. a
@@ -752,6 +764,48 @@ through its own complex block routine, and `x0=` on it is rejected.
 
 Not yet supported (clear errors): `adapt=` on a complex transient (the cross-remesh state transfer is
 not complex-aware yet).
+
+### Multiple devices — `fem.solve(shard=...)`
+
+Sharding is **automatic**: on a machine with more than one visible device, the assembled operator's
+nonzero axis is partitioned across all of them, each device scatter-adds its slice, and one
+`all-reduce` combines the partials. The operator shards; the vectors stay replicated.
+
+```python
+u = fem.solve()                 # automatic: every visible device
+u = fem.solve(shard=False)      # opt out — single device (1 means the same)
+u = fem.solve(shard=2)          # pin a device count; over-requesting fails loud
+u = fem.solve(shard=jax.devices()[:4])   # pin exactly these
+```
+
+It is on by default because the change is **answer-preserving** — same operator, same solvers, only
+the reduction order moves (~1e-14) — and because the realistic alternative on a multi-GPU box is not
+a tuned single-device run, it is idle silicon. On a single-device host it resolves to the untouched
+single-device path, so the default carries no risk there.
+
+The reason no solver needed changing is that the operator is ~100× the vector, so replicating the
+vectors costs nothing and removes the entire distributed-FEM apparatus: no mesh partitioning, no halo
+exchange, no ghost DOFs, no DOF renumbering. Every Krylov step is either a matvec (sharded,
+`all-reduce` inside) or a vector operation on replicated data (identical on every device, no
+communication).
+
+**What shards:** the default steady-linear solve, and the slot-composed solve
+(`linear=` any Krylov solver, with `precond=None` or `jno.precond.jacobi()`).
+
+**What does not** — each falls back silently to the single-device path rather than raising:
+
+| | why |
+|---|---|
+| sparse-direct branches (periodic, 1-D, fused-complex) | route to `spsolve` — single-device, no batching rule |
+| `linear=jno.solve.lu()` / `dense()` | factorise the matrix themselves; nothing to distribute |
+| any `precond=` but `jacobi` | the applier closes over the assembled operator (Chebyshev needs its matvecs, `form` holds an auxiliary BCOO, `amg`/`ams` build host-side through scipy/pyamg), so a full copy would be replicated anyway. Jacobi is the exception: it needs only the diagonal, which is computed from the *sharded* triplets |
+| parametric / differentiate-through solves | `device_put` cannot place a tracer |
+| transient | the scan body closes over the block, so `M`/`A` are constant-folded and replicated inside `lax.scan`; fixing it needs `block.step` to take the operator as data |
+
+No speedup figure is quoted here because none has been measured — the development machine has one
+GPU. What *is* verified, on simulated devices, is correctness, the even split, that XLA emits
+`all-reduce` and **zero** `all-gather` (no device ever reconstitutes the matrix), and that the
+fallbacks decline rather than silently gathering.
 
 ### Reduced-order solves — `fem.solve(basis=U)`
 
