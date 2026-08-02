@@ -1379,8 +1379,10 @@ class FEM:
         ``fem.basis_residual``, and ``fem.BASIS_RESIDUAL_LIMIT`` relaxes the bar for deliberately coarse
         work. ``U`` must be orthonormal. It composes with ``linear=``/``precond=`` (which see the reduced
         operator) and is differentiable in the basis itself under ``jax.grad`` — the learned-subspace path.
-        Steady only (linear and nonlinear); transient, complex and periodic-tied problems refuse with a
-        reason. A reduced NONLINEAR solve returns a deferred trace node, as a periodic one does. Nonlinear
+        Steady and **first-order transient** (linear and nonlinear); a transient block is reduced once at
+        solve time and the marcher steps in the reduced space, returning the trajectory at full width —
+        certified there by the projection error of the initial state rather than a residual. Refused,
+        each with its own reason: second-order-in-time, complex, and periodic-tied problems. A reduced NONLINEAR solve returns a deferred trace node, as a periodic one does. Nonlinear
         reduction is a memory win, not a speed one: the full-order residual is still evaluated per Newton
         step (no hyper-reduction).
 
@@ -1395,9 +1397,16 @@ class FEM:
         reduction = None if basis is None else self._basis_reduction(basis, adapt=adapt, move=move)
 
         def _run():
-            prev_periodic = self._periodic
+            prev_periodic, prev_op = self._periodic, self._op
             if reduction is not None:
-                self._periodic = reduction
+                if self.is_transient:
+                    # A transient block is reduced ONCE, here, into a new block that carries ``P`` on its
+                    # ``prolongation`` field — the marcher then steps in the reduced space and lifts the
+                    # trajectory itself. Installing the reduction as ``_periodic`` instead would reduce a
+                    # second time inside the step, so the block is swapped rather than the dict.
+                    self._op = _reduce_transient_block_periodic(self._op, reduction)
+                else:
+                    self._periodic = reduction
             try:
                 result = self._solve_dispatch(
                     solve_fn,
@@ -1411,7 +1420,8 @@ class FEM:
                     **kwargs,
                 )
             finally:
-                self._periodic = prev_periodic  # the basis is per-CALL; never sticks to the object
+                # the basis is per-CALL; neither the reduction nor the reduced block sticks to the object
+                self._periodic, self._op = prev_periodic, prev_op
             if reduction is not None:
                 self._check_basis_residual(result, reduction)
             if isinstance(result, Placeholder):
@@ -1464,11 +1474,17 @@ class FEM:
                 "expressed in that internal layout rather than in the n complex DOFs you author against. "
                 "Real steady problems (linear and nonlinear) are supported."
             )
-        if self._mode == "transient":
+        if self._mode == "transient" and ((getattr(self._op, "metadata", None) or {}).get("second_order")):
+            # A u_tt block marches the AUGMENTED state y = [u; v], so `dofs` is 2n while the basis you
+            # would build from snapshots of the field is (n, k). Reducing it needs blkdiag(U, U) — which
+            # `_duplicate_periodic` can build — but the convention (does the user hand n or 2n rows?) is
+            # a decision, not a detail, and getting it wrong reduces the velocity block by a displacement
+            # basis without complaining. Refused until that is chosen deliberately.
             raise NotImplementedError(
-                "jno.fem: fem.solve(basis=...) is not wired for a transient problem yet — the time block "
-                "is reduced eagerly at assembly (PᵀMP, PᵀAP, restricted state0), so a basis arriving at "
-                "solve time has to re-reduce it. Steady (linear and nonlinear) is supported."
+                "jno.fem: fem.solve(basis=...) on a SECOND-ORDER-in-time (u_tt) problem is not supported "
+                "yet — that block marches the augmented state [u; v], so a field basis has to be applied "
+                "to both halves and the row convention (n vs 2n) is not settled. First-order transients "
+                "(u_t) and steady problems are supported."
             )
         return _galerkin_reduction(basis, self.dofs)
 
@@ -1484,7 +1500,33 @@ class FEM:
         a deferred trace node with no values yet, so ``basis_residual`` stays ``None`` there and the
         span check does NOT run — a real hole in the guarantee, stated here rather than papered over.
         The measured value is kept on ``self.basis_residual`` (cleared at the top of every solve).
+
+        A TRANSIENT reduced solve gets a different, weaker certificate: the relative projection error of
+        the INITIAL STATE, ``‖u0 − U Uᵀ u0‖/‖u0‖``. It costs one projection, and it is honest about what
+        it proves — if the span cannot represent where the trajectory starts, the march is hopeless from
+        step 0, which is the failure a basis built from the wrong family actually produces. It says
+        nothing about whether the span follows the trajectory *later*, so it is a floor, not a bound.
         """
+        if self.is_transient:
+            u0 = _concrete(getattr(self._op, "state0", None))
+            U = _concrete(reduction["P"])
+            if u0 is None or U is None:
+                return
+            u0 = np.asarray(u0).reshape(-1)
+            nrm = float(np.linalg.norm(u0))
+            if nrm == 0.0:
+                return  # a zero initial state is representable in any span; nothing to certify
+            rel = float(np.linalg.norm(u0 - U @ (U.T @ u0))) / nrm
+            self.basis_residual = rel
+            if not np.isfinite(rel) or rel > self.BASIS_RESIDUAL_LIMIT:
+                raise ValueError(
+                    f"jno.fem: the basis cannot represent the INITIAL state (relative projection error "
+                    f"{rel:.3e} > {self.BASIS_RESIDUAL_LIMIT:g}), so the reduced march is wrong from step "
+                    "0. Build the basis from snapshots of this problem's own trajectory. The measured "
+                    "value is on `fem.basis_residual`; raise `fem.BASIS_RESIDUAL_LIMIT` for deliberately "
+                    "coarse work."
+                )
+            return
         if self._mode != "linear" or isinstance(self._op, FemLinearSystem):
             return
         uc = _concrete(u)
