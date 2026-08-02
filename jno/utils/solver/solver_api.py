@@ -490,13 +490,21 @@ def _add_step_operator(M, A, scale):
     Both BCOO: concatenate triplets (duplicates are legal COO — every consumer sums them:
     matvec, ``matrix_diagonal``, ``sparse_lu_solve``, the AMG CSR conversion). Anything else:
     dense addition.
+
+    Concatenation is itself a duplicate source: ``M`` and ``A`` overlap almost entirely, so the step
+    operator carries ~2x the triplets of either even when both arrive compressed — and it is applied
+    on every step of the march. ``sum_duplicate_triplets`` collapses that for the eager
+    constant-operator path; for the per-step callers in ``backend_blocks`` the operands are traced, so
+    it returns them untouched (correct, just uncompressed) until the pattern is hoisted host-side.
     """
     if hasattr(M, "todense") and hasattr(A, "todense"):
         import jax.experimental.sparse as jsp
 
+        from .fem_utils import sum_duplicate_triplets
+
         data = jnp.concatenate([M.data, scale * A.data])
         indices = jnp.concatenate([M.indices, A.indices], axis=0)
-        return jsp.BCOO((data, indices), shape=M.shape)
+        return sum_duplicate_triplets(jsp.BCOO((data, indices), shape=M.shape))
     dense = lambda x: x.todense() if hasattr(x, "todense") else jnp.asarray(x)
     return dense(M) + scale * dense(A)
 

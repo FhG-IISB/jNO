@@ -2458,6 +2458,22 @@ def sum_duplicate_triplets(A):
 
     Operator unchanged to 2.2e-15. The one-time sort amortises immediately against the matvec count.
 
+    **This changes the sparsity PATTERN, not only the storage.** ``BCOO.sum_duplicates`` defaults to
+    ``remove_zeros=True``, and on a Dirichlet-constrained operator that is the larger of the two
+    effects: symmetric elimination and mass row/column zeroing leave whole rows of numerically-zero
+    triplets behind. On a 3-D transient heat block (341 dofs, h=0.16) the mass goes 18240 stored ->
+    3841 unique-with-zeros -> **753** actually nonzero, and the operator 54992 -> 3841 -> 1025. So the
+    output is the true nonzero pattern, not a re-indexed copy of the input one.
+
+    That is safe for every current consumer, and was checked rather than assumed: ``matrix_diagonal``
+    scatter-adds only on-diagonal triplets, so a *dropped* zero and a *stored* zero give the same
+    diagonal; ``jacobi`` guards with ``where(|d| > 1e-30, d, 1.0)`` and documents leaving those rows
+    unscaled; the AMG/AMS CSR conversions only see a sparser graph. Solutions were compared before and
+    after across steady 3-D, forced 2-D transient with inhomogeneous Dirichlet, 1-D steady and 1-D
+    transient: max relative change 1.4e-15. A consumer that needs the *structural* pattern (an entry
+    that is zero now but nonzero at another parameter value) must not read it off a compressed
+    operator.
+
     **Concrete operators only.** ``sum_duplicates`` needs a static ``nse`` under ``jit``, and the
     unique count is data-dependent, so a traced/parametric assembly is returned untouched (correct,
     just uncompressed). The sparsity pattern is fixed by mesh and terms, so threading a precomputed
