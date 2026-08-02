@@ -426,8 +426,9 @@ def _shardable(op: LinearOperator, linear, precond) -> bool:
       preconditioner drags a full copy along saves nothing. Jacobi is the exception because it needs
       only the diagonal, and the diagonal is the same scatter-add the matvec already performs -- so it
       is computed *from the sharded triplets* and never touches an assembled matrix.
-    * **A traced operator** -- ``device_put`` cannot place a tracer. The parametric and
-      differentiate-through paths therefore stay single-device for now.
+    A **traced** operator is covered, by a different mechanism: ``device_put`` cannot place a tracer,
+    so the parametric and differentiate-through paths take the ``with_sharding_constraint`` route in
+    :func:`~.sharding.constrain_operator` instead of the ``device_put`` + ``in_shardings`` one.
 
     Anything outside the set falls back silently to the ordinary path. It must not raise: the user
     asked for a solver configuration, not for sharding, and automatic placement is not a request they
@@ -436,11 +437,16 @@ def _shardable(op: LinearOperator, linear, precond) -> bool:
     from ...precond import _Jacobi
 
     A = op.bcoo
-    if A is None or isinstance(A.data, jax.core.Tracer) or isinstance(A.indices, jax.core.Tracer):
+    if A is None:
         return False
     if getattr(linear, "direct", False):
         return False
     return precond is None or isinstance(precond, _Jacobi)
+
+
+def _is_traced(A) -> bool:
+    """Is this operator's data a tracer? Decides which of the two sharding mechanisms applies."""
+    return isinstance(A.data, jax.core.Tracer) or isinstance(A.indices, jax.core.Tracer)
 
 
 def compose_linear_solve_fn(linear, precond, x0, fem=None, shard=None) -> Callable:
@@ -470,6 +476,10 @@ def compose_linear_solve_fn(linear, precond, x0, fem=None, shard=None) -> Callab
     from .sharding import resolve_devices
 
     devices = resolve_devices(shard)
+    # `None`/`True` mean "automatic"; anything else is an explicit request. Only an explicit one may
+    # shard a TRACED operator -- see the comment at the traced branch below for why that distinction
+    # is a safety property and not caution.
+    shard_explicit = shard is not None and shard is not True
 
     def composed(A, b):
         op = A if isinstance(A, LinearOperator) else LinearOperator(A)
@@ -477,7 +487,31 @@ def compose_linear_solve_fn(linear, precond, x0, fem=None, shard=None) -> Callab
         # first — solution-invariant, and a no-op for normally scaled / traced operators.
         op, b = _normalize_extreme_scale(op, b, precond)
         rhs = jnp.asarray(b).reshape(-1)
-        if devices and _shardable(op, linear, precond):
+        _traced = _shardable(op, linear, precond) and _is_traced(op.bcoo)
+        if devices and _traced and shard_explicit:
+            # Parametric / differentiate-through: we are already INSIDE a trace, so there is no jit
+            # boundary of ours to hang `in_shardings` on -- and adding one would close over the
+            # operator, which constant-folds and replicates it. `with_sharding_constraint` partitions
+            # the same axis from inside the trace instead, and gradients flow through.
+            #
+            # OPT-IN ONLY, and that is a safety property rather than caution. Inside a trace we are a
+            # guest in someone else's computation, and a sharding constraint must agree with the
+            # device commitments of every other value in that jit. Under `crux` it does not: the
+            # optimiser's parameters arrive committed to one device while our constraint spans all of
+            # them, and JAX rejects the mix. That conflict cannot be detected in advance
+            # (`get_abstract_mesh()` is empty there) and cannot be caught locally -- it surfaces when
+            # the OUTER jit compiles, long after this function returned -- so there is no fallback to
+            # write. Automatic placement must never be able to fail a user's compile, so `shard=None`
+            # leaves traced operators alone; an explicit `shard=N` is a request we can honour and the
+            # user can diagnose.
+            from .sharding import constrain_operator
+
+            n = int(op.shape[0])
+            matvec, diag_fn = constrain_operator(op.bcoo, devices)
+            mf = LinearOperator.from_matvec(matvec, diag_fn=diag_fn, shape=(n, n))
+            M = materialize_precond(precond, PrecondContext(mf, fem)) if precond is not None else None
+            return linear(mf, rhs, M=M, x0=x0_flat)
+        if devices and not _traced and _shardable(op, linear, precond):
             from .sharding import jacobi_from_diagonal, sharded_solve
 
             n = int(op.shape[0])
