@@ -239,6 +239,88 @@ def test_newton_still_converges_on_the_compressed_jacobian():
 
 
 # ---------------------------------------------------------------------------------------------
+# element-loop chunking — jno.fem(chunk=)
+# ---------------------------------------------------------------------------------------------
+
+
+def _poisson_3d_terms(size=0.28):
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=size).domain()
+    u, v = d.fem_symbols()
+    i = d.variable("interior", split=True)
+    b = d.variable("boundary", split=True)
+    a, c = u.bind(x=i[0], y=i[1], z=i[2]), v.bind(x=i[0], y=i[1], z=i[2])
+    return [a.x * c.x + a.y * c.y + a.z * c.z - 1.0 * c, u(b[0], b[1], b[2]) - 0.0]
+
+
+@pytest.mark.parametrize("chunk", [None, False, 64, 1_000_000])
+def test_chunking_never_changes_the_answer(chunk):
+    """The element loop is chunked to cap the batched intermediate — the thing that actually sets the
+    3-D memory ceiling (a nonlinear solve peaked at 2324 MiB unchunked, 509 MiB chunked). It is a
+    scheduling change and nothing else, so every chunk size must give the same answer, including the
+    degenerate ones: ``False`` (one vmap over every cell, the old behaviour), a chunk far smaller than
+    the mesh, and one far larger."""
+    terms = _poisson_3d_terms()
+    ref = np.asarray(jno.fem(terms).solve()).reshape(-1)
+    got = np.asarray(jno.fem(terms, chunk=chunk).solve()).reshape(-1)
+    assert np.max(np.abs(got - ref)) < 1e-12, f"chunk={chunk} changed the answer"
+    assert np.all(np.isfinite(got))
+
+
+@pytest.mark.parametrize("bad", [-1, 0.5, "big", 2.5])
+def test_a_nonsense_chunk_is_refused(bad):
+    """A silently-ignored size would be worse than no option: the user would believe they had capped
+    the memory. Zero and ``False`` are the documented "off" spellings and are NOT errors."""
+    with pytest.raises(ValueError, match="chunk"):
+        jno.fem(_poisson_3d_terms(), chunk=bad)
+
+
+def test_chunk_on_an_assembler_without_an_element_loop_is_refused():
+    """``chunk=`` reaches the native assembler only. The 1-D and non-nodal paths have their own
+    element loops and neither is chunked yet, so an explicit request there must fail rather than do
+    nothing — the whole point of the option is memory the caller is counting on."""
+    d = jno.domain(constructor=jno.domain.line(mesh_size=0.05))
+    u, phi = d.fem_symbols()
+    x = d.variable("interior", split=True)[0]
+    xb = d.variable("boundary", split=True)[0]
+    a, b = u.bind(x=x), phi.bind(x=x)
+    terms = [a.x * b.x - 1.0 * b, u(xb) - 0.0]
+
+    assert np.all(np.isfinite(np.asarray(jno.fem(terms).solve()))), "the default must stay a no-op there"
+    with pytest.raises(ValueError, match="no chunked element loop"):
+        jno.fem(terms, chunk=4096)
+
+
+def test_the_chunk_policy_is_restored_after_assembly():
+    """The policy is a module-level slot scoped by ``jno.fem``. If it leaked, one problem's explicit
+    chunk would silently become the next problem's default."""
+    from jno.utils.solver import fem_native
+
+    before = fem_native._CHUNK_OVERRIDE[0]
+    jno.fem(_poisson_3d_terms(), chunk=64)
+    assert fem_native._CHUNK_OVERRIDE[0] == before, "chunk= leaked out of the assembly"
+    try:  # and it must be restored even when the assembly raises
+        jno.fem(_poisson_3d_terms(), chunk=-5)
+    except ValueError:
+        pass
+    assert fem_native._CHUNK_OVERRIDE[0] == before, "chunk= leaked after a failed assembly"
+
+
+def test_the_automatic_chunk_is_derived_from_the_device_not_hardcoded():
+    """The size is computed from ``memory_stats()["bytes_limit"]`` (~0.15% of device memory) rather
+    than tuned to one machine, with a cell floor for the case that cannot be derived — JAX exposes
+    device memory but no SM count, so saturation has no portable source."""
+    from jno.utils.solver.fem_native import assemble_fem_native
+
+    src = assemble_fem_native.__doc__ or ""
+    import inspect
+
+    body = inspect.getsource(assemble_fem_native)
+    assert "bytes_limit" in body, "the cap must come from the device"
+    assert "_CHUNK_MIN_CELLS" in body, "the saturation floor must still exist"
+    assert src is not None
+
+
+# ---------------------------------------------------------------------------------------------
 # the compression primitive itself
 # ---------------------------------------------------------------------------------------------
 

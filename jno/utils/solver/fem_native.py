@@ -387,6 +387,33 @@ def build_native_fem_context(domain, *, element_type, quad_degree, vec=1, neuman
 # ---------------------------------------------------------------------------
 
 
+#: Element-chunk policy for the assembly currently being built. Set by ``jno.fem(chunk=...)`` for the
+#: duration of one assembly and captured (not read lazily) by :func:`assemble_fem_native`, because the
+#: residual/jacobian closures are CALLED long afterwards -- at solve time, outside any context.
+#: ``None`` = automatic (device-derived), ``False``/``0`` = no chunking, positive int = cells per chunk.
+#: A list rather than a plain global so the context manager can restore the previous value on nesting.
+_CHUNK_OVERRIDE = [None]
+#: Set when an assembly consumed the override, so ``jno.fem`` can refuse an explicit ``chunk=`` that
+#: reached an assembler with no element loop instead of silently ignoring it.
+_CHUNK_CONSUMED = [False]
+
+
+def normalize_chunk(chunk):
+    """Validate a user ``chunk=`` value. ``None`` -> automatic, ``False``/``0`` -> off, int -> cells."""
+    if chunk is None:
+        return None
+    if chunk is False or (isinstance(chunk, int) and not isinstance(chunk, bool) and chunk == 0):
+        return 0
+    if chunk is True:
+        return None  # "yes, chunk" == automatic
+    if isinstance(chunk, (int, np.integer)) and int(chunk) > 0:
+        return int(chunk)
+    raise ValueError(
+        f"jno.fem: chunk={chunk!r} is not a valid element-chunk size. Pass a positive int (cells per "
+        "chunk), False to disable chunking, or None (the default) to size it from the device."
+    )
+
+
 def assemble_fem_native(
     domain,
     volume_terms: List[Any],
@@ -1305,6 +1332,11 @@ def assemble_fem_native(
     # `lax.map(..., batch_size=C)` vmaps C cells at a time and scans over the chunks, so the batched
     # intermediate is capped at C cells regardless of mesh size. Remainders are handled (verified at
     # several non-dividing C) and gradients match the unchunked form exactly.
+    # An explicit `jno.fem(chunk=...)` is captured HERE, once, rather than read when the closures run:
+    # they are called at solve time, long outside the context that set it.
+    _chunk_setting = _CHUNK_OVERRIDE[0]
+    _CHUNK_CONSUMED[0] = True
+
     # Sized in CELLS, capped by a fraction of the DEVICE's memory. GPU saturation depends on how many
     # independent work items a chunk has, not on how many bytes it occupies, so a pure byte budget
     # starves the device as soon as the per-cell block grows (P2/P3, vector fields).
@@ -1353,6 +1385,10 @@ def assemble_fem_native(
         jacobian's dominant intermediate. The residual's is smaller, so it gets chunked somewhat more
         finely than it strictly needs -- a deliberate simplification: one policy, one explanation, and
         the cost of an extra chunk is a scan step, not a re-computation."""
+        if _chunk_setting == 0:
+            return None  # explicitly disabled: one vmap over every cell
+        if _chunk_setting is not None:
+            return None if n_items <= _chunk_setting else int(_chunk_setting)  # explicit cells/chunk
         per = max(1, int(n_test) * int(n_local) * int(n_local) * 8)
         chunk = max(1, _chunk_budget_bytes() // per)
         chunk = max(chunk, _CHUNK_MIN_CELLS)  # never starve the device to honour the byte cap

@@ -3008,6 +3008,48 @@ def fem(
     quad_degree: int = 2,
     element_type: Optional[str] = None,
     vec: Optional[int] = None,
+    chunk: Any = None,
+    _dd_overlap: bool = False,
+) -> FEM:
+    """Assemble a flat list of traced residuals into an :class:`FEM` — see :func:`_fem_impl`.
+
+    This thin wrapper exists only to scope ``chunk=`` over the assembly. The element-chunk policy has
+    to be in force while the assembler builds its closures (it is captured there, not read when they
+    later run), and threading a parameter through ten ``assemble_fem_native`` call sites to say the
+    same thing would be churn for no gain.
+    """
+    from .utils.solver import fem_native as _fn
+
+    prev, prev_consumed = _fn._CHUNK_OVERRIDE[0], _fn._CHUNK_CONSUMED[0]
+    _fn._CHUNK_OVERRIDE[0] = _fn.normalize_chunk(chunk)
+    _fn._CHUNK_CONSUMED[0] = False
+    try:
+        out = _fem_impl(
+            constraints,
+            quad_degree=quad_degree,
+            element_type=element_type,
+            vec=vec,
+            _dd_overlap=_dd_overlap,
+        )
+        if chunk is not None and not _fn._CHUNK_CONSUMED[0]:
+            # Refuse rather than ignore: the 1-D and non-nodal assemblers have their own element
+            # loops and none of them chunk, so an explicit request there would quietly do nothing.
+            raise ValueError(
+                "jno.fem: chunk= was given, but this problem routes to an assembler with no chunked "
+                "element loop (the 1-D and non-nodal/N1E-RT paths are not covered yet). Drop chunk= "
+                "to use the default, which is a no-op on those paths."
+            )
+        return out
+    finally:
+        _fn._CHUNK_OVERRIDE[0], _fn._CHUNK_CONSUMED[0] = prev, prev_consumed
+
+
+def _fem_impl(
+    constraints: Any,
+    *,
+    quad_degree: int = 2,
+    element_type: Optional[str] = None,
+    vec: Optional[int] = None,
     _dd_overlap: bool = False,
 ) -> FEM:
     """Assemble a flat list of traced residuals into an :class:`FEM`.
@@ -3022,6 +3064,24 @@ def fem(
     vec:
         Vector size of the unknown. ``None`` (default) infers it from the trial's
         ``value_shape`` (scalar → 1, ``(2,)`` → 2, …); pass an int to override.
+    chunk:
+        Cells per chunk in the element assembly loop. ``None`` (the default) sizes it from the
+        device — see below; ``False`` runs one ``vmap`` over every cell (the old behaviour); a
+        positive int pins the cell count.
+
+        A single ``vmap`` over every cell materialises the whole batched intermediate at once, and on
+        a 3-D mesh that intermediate — not the assembled operator — is what sets the memory ceiling.
+        Chunking capped the peak of a 3-D nonlinear solve at 509 MiB where it had been 2324 MiB, for
+        roughly 15% more assembly time.
+
+        The default needs no tuning: a chunk may use ~0.15% of device memory, so the same problem
+        that must be split on an 8 GB card runs unsplit — and therefore at full speed — on an 80 GB
+        one. Pin it when you know better than the heuristic: a very large per-cell block, an unusual
+        device, or to reproduce the unchunked behaviour exactly.
+
+        This lives on ``jno.fem`` rather than on ``fem.solve`` because it is an assembly-time
+        decision: the steady-linear operator is built here, before any solve. Setting it on a problem
+        whose assembler has no element loop (1-D, non-nodal) is an error rather than a silent no-op.
     """
     from .utils.solver.fem_route import neumann
     from .utils.solver.weak_form import (

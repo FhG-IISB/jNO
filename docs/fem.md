@@ -237,6 +237,25 @@ where they differ from the mesh vertices), `fem.operator`, and `fem.classificati
 > that needs the *structural* pattern (an entry that is zero at this parameter value but nonzero at
 > another) must not read it off the assembled operator.
 
+> **Element-loop chunking — `jno.fem(chunk=)`.** A single `vmap` over every cell materialises the
+> whole batched intermediate at once, and on a 3-D mesh that intermediate — not the assembled
+> operator — is what sets the memory ceiling. The element loop is therefore chunked: measured on a 3-D
+> nonlinear solve, peak memory fell from 2324 MiB to 509 MiB at 52k DOFs (and 1378 → 381 at 31k), for
+> roughly 15% more assembly time. Reverse mode keeps the win — `scan` stores per-iteration residuals,
+> but the chunked total is still below the unchunked one (183.5 vs 194.4 MiB).
+>
+> The default needs no tuning: a chunk may use **~0.15% of device memory**, taken from
+> `memory_stats()["bytes_limit"]`, so the same problem that must be split on an 8 GB card runs
+> unsplit — and therefore at full speed — on an 80 GB one. A cell floor (8192) keeps large per-cell
+> blocks (P2 tets at 8 KB/cell, vector P1 at 13.8 KB/cell) from collapsing below GPU saturation, where
+> the measured penalty is a ~2× slowdown; that floor is the one number JAX gives no way to derive, as
+> it exposes device memory but not the SM count.
+>
+> `chunk=False` restores the single `vmap`, and a positive int pins cells per chunk. It lives on
+> `jno.fem` rather than `fem.solve` because the steady-linear operator is assembled *here*, before any
+> solve. On the 1-D and non-nodal assemblers — whose element loops are **not** chunked — an explicit
+> `chunk=` raises instead of being ignored.
+
 > **Term introspection (provisional).** `fem.term_kinds` returns a `list[TermKind]` — each
 > additively-split PDE (volume) term classified by `support`, `time_order`, `trial_channel` /
 > `test_channel`, and `linear`, with `is_local` flagging a spatially pointwise term (reaction/mass) vs. a
