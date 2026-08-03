@@ -87,13 +87,21 @@ class MeshUtils:
         else:
             raise ValueError(f"Finite difference not supported for dimension {dimension}")
 
-        # Build neighbor lists efficiently
-        neighbors = {}
-        for i in range(n_points):
-            # Find all edges starting from vertex i
-            mask = edges[:, 0] == i
-            neighbor_ids = np.unique(edges[mask, 1]).tolist()
-            neighbors[i] = neighbor_ids
+        # Build neighbor lists by SORTING the edge list once, then slicing each vertex's block out of
+        # it. The obvious loop -- `mask = edges[:, 0] == i` per vertex -- rescans every edge for every
+        # point, which is O(n_points x n_edges): a 3-D tet mesh has 12 directed edges per cell, so at
+        # 30932 points / 168277 cells that is ~6e10 comparisons and it measured 103.6 s, against 1.3 s
+        # for gmsh to produce the mesh in the first place. Sorting is O(E log E) and the per-vertex
+        # work then touches only that vertex's own edges.
+        order = np.argsort(edges[:, 0], kind="stable")
+        src_sorted = edges[order, 0]
+        dst_sorted = edges[order, 1]
+        # one boundary scan for all vertices, rather than a search per vertex
+        bounds = np.searchsorted(src_sorted, np.arange(n_points + 1))
+        neighbors = {
+            i: np.unique(dst_sorted[bounds[i] : bounds[i + 1]]).tolist() if bounds[i + 1] > bounds[i] else []
+            for i in range(n_points)
+        }
 
         # Store connectivity info
         mesh_connectivity = {
