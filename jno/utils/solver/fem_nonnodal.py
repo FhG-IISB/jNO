@@ -754,7 +754,7 @@ def assemble_fem_nonnodal(
         _cell_all_dofs = jnp.concatenate([cdofs[i] for i in range(len(fields))], axis=1)  # (n_cells, n_local_all)
         _field_splits = list(np.cumsum([0] + [int(cdofs[i].shape[1]) for i in range(len(fields))]))
         _asm_zero_field = jnp.zeros((n_verts,), dtype=zeros.dtype)  # placeholder for an absent field parameter
-        _asm_local_zero = jnp.zeros((n_cells, _cell_all_dofs.shape[1]), zeros.dtype)  # assemble at u=0 (linear)
+        _asm_local_zero = jnp.zeros((n_cells, _cell_all_dofs.shape[1]), zeros.dtype)  # u=0: the LINEAR default
         _vol_rows_l, _vol_cols_l = [], []
         for _cf_p, _tfi_p, _rn_p in _typed:
             _kshape = (n_cells, int(cdofs[_tfi_p].shape[1]), _cell_all_dofs.shape[1])  # (n_cells, n_test, n_local_all)
@@ -773,7 +773,14 @@ def assemble_fem_nonnodal(
         except Exception:  # noqa: BLE001 -- a traced pattern breaks the static-count invariant
             _vol_nse = None  # fall back to the uncompressed (still correct) operator
 
-        def assemble(args=None, *, surface=True):
+        def assemble(args=None, *, surface=True, u_flat=None):
+            # ``u_flat=None`` linearises at u=0, which is exact for a LINEAR form (the tangent does not
+            # depend on the state) and is the historic behaviour. Passing the current iterate gives the
+            # NONLINEAR tangent J(u_k) instead -- per-element `jacfwd` at that state, exactly what
+            # `fem_native._make_jacobian` does. The sparsity PATTERN is unchanged either way: it comes
+            # from mesh connectivity, so the hoisted `_vol_idx` and its compression plan carry over
+            # untouched and only the element DATA becomes state-dependent.
+            _local_u = _asm_local_zero if u_flat is None else jnp.asarray(u_flat)[_cell_all_dofs]
             _a = args or {}
             rt_scalar = {
                 name: jnp.reshape(jnp.asarray(_a.get(name, 0.0), dtype=zeros.dtype), (-1,))[:1]
@@ -819,7 +826,7 @@ def assemble_fem_nonnodal(
 
                 Ke = _elem_map(  # (n_cells, n_test_tfi, n_local_all)
                     _ke,
-                    (jnp.arange(n_cells), _asm_local_zero),
+                    (jnp.arange(n_cells), _local_u),
                     _cell_chunk_of(n_cells, int(cdofs[tfi].shape[1]), int(_cell_all_dofs.shape[1]), _chunk_setting),
                 )
                 data_l.append(Ke.reshape(-1))
@@ -1071,7 +1078,7 @@ def assemble_fem_nonnodal(
                     return _apply_dirichlet_rows(lambda uu: spatial_res(uu, args) - nat_load, pins)(jnp.asarray(u))
 
                 def jac_pt(u, t, args=None):
-                    return jax.jacfwd(lambda uu: res_pt(uu, t, args))(jnp.asarray(u))
+                    return _sparse_tangent(_assemble_spatial, u, args)
 
                 block = SemidiscreteTimeBlock(
                     mass=lambda t, args=None, _M=M_nl: _M,
@@ -1082,7 +1089,10 @@ def assemble_fem_nonnodal(
                 )
                 return block, "transient", offs
             res_bc = _apply_dirichlet_rows(lambda u: spatial_res(u) - nat_load, pins)
-            jac = jax.jacfwd(res_bc)
+
+            def jac(u, _asm=_assemble_spatial):
+                return _sparse_tangent(_asm, u)
+
             block = SemidiscreteTimeBlock(
                 mass=lambda t, args=None, _M=M_nl: _M,
                 residual=lambda u, t, args=None: res_bc(u),
@@ -1161,6 +1171,20 @@ def assemble_fem_nonnodal(
     # sparsely too (it used to take the dense global jacfwd — a ~10⁴-edge ceiling on 3-D vector inverse design,
     # re-run every optimizer step); ``args=None`` reduces to the non-parametric assembly exactly. Vertex C0/C1
     # families keep the dense path below (their Hessian-shape element assembly is not ported; small 2-D problems).
+    # --- the NONLINEAR tangent, assembled per element ------------------------------------------
+    # `_apply_dirichlet_rows` replaces the pinned rows of the residual with `u[d] - g`, so the tangent
+    # of that is the free tangent with those rows set to the identity -- `bcoo_set_dirichlet_rows`,
+    # the same row-replacement `fem_native._dirichlet_jac_rows` performs.
+    #
+    # `surface=False` matches the dense `jacfwd(res_bc)` it replaces EXACTLY: `_make_residual` is
+    # volume-only and the nonlinear path never added `surf_mass` to its tangent. Whether it should is
+    # a separate question about the residual too, not something a storage change may decide quietly.
+    _pin_dofs_j = jnp.asarray([p[0] for p in pins], dtype=jnp.int32) if pins else None
+
+    def _sparse_tangent(asm, u, args=None):
+        J = asm(args, surface=False, u_flat=jnp.asarray(u).reshape(-1))
+        return J if _pin_dofs_j is None else bcoo_set_dirichlet_rows(J, _pin_dofs_j)
+
     _assemble_sparse_A = _make_sparse_assembler(volume_terms)
 
     # --- steady nonlinear: a genuinely nonlinear weak term -> a Newton residual operator ---
@@ -1171,7 +1195,7 @@ def assemble_fem_nonnodal(
                 return _apply_dirichlet_rows(lambda uu: full_residual(uu, args), pins)(jnp.asarray(u))
 
             def jac_p(u, args=None):
-                return jax.jacfwd(lambda uu: res_p(uu, args))(jnp.asarray(u))
+                return _sparse_tangent(_assemble_sparse_A, u, args)
 
             return (
                 FemResidualOperator(res_p, jac_p, total, runtime_parameter_exprs=dict(_param_and_neural_exprs)),
@@ -1179,7 +1203,10 @@ def assemble_fem_nonnodal(
                 offs,
             )
         res_bc = _apply_dirichlet_rows(full_residual, pins)  # essential pins as residual rows R[d]=u[d]-g
-        jac = jax.jacfwd(res_bc)
+
+        def jac(u):
+            return _sparse_tangent(_assemble_sparse_A, u)
+
         # FemResidualOperator.solve calls residual(u, args)/jacobian(u, args); non-parametric here, so
         # accept-and-ignore args (args=None keeps `fem.residual(u)` single-arg too).
         return (

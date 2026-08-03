@@ -152,8 +152,8 @@ problems whose natural space is *not* H¹. Pick one with the `space=` knob on `f
 >
 > The solve stays **sparse-direct** for these families. Going sparse would otherwise have handed 4th-order
 > biharmonic operators to the Jacobi-preconditioned BiCGStab that serves real elliptic systems, where it
-> does not converge — a solver change disguised as a storage change. Their **nonlinear** and
-> **second-order-in-time** paths are still dense, as they are for every non-nodal family.
+> does not converge — a solver change disguised as a storage change. Their **second-order-in-time** path
+> is still dense, as it is for every non-nodal family.
 
 > **Argyris** is the **C¹-conforming** quintic triangle (21 DOF) — the element for **4th-order PDEs**.
 > Across a shared edge both `u` and `∂u/∂n` are continuous, so `∫Δu·Δv` is now a *convergent* biharmonic
@@ -271,10 +271,11 @@ where they differ from the mesh vertices), `fem.operator`, and `fem.classificati
 >
 > Coverage, since it is not uniform. The **native** assembler chunks its residual and jacobian, volume
 > and surface loops. The **non-nodal** assembler chunks both, for every family — including the C⁰/C¹
-> vertex families, whose *linear* operator now assembles per element (see below). Two paths still take
-> a global dense `jacfwd` and are unchunked, for **every** non-nodal family rather than any particular
-> one: the **nonlinear tangent** (the sparse assembler linearises at `u = 0`, so it is linear-only) and
-> the **second-order-in-time** block, which builds a dense `2n × 2n` system by construction. The
+> vertex families (see below). The **nonlinear tangent** is per-element too: the assembler takes the
+> current iterate, so `J(u_k)` assembles element-by-element like the linear operator. One path still
+> takes a global dense `jacfwd` and is unchunked, for **every** non-nodal family rather than any
+> particular one: the **second-order-in-time** block, which builds a dense `2n × 2n` system by
+> construction. The
 > **1-D** assembler is not chunked at all, and an explicit `chunk=` there raises rather than being
 > silently ignored.
 
