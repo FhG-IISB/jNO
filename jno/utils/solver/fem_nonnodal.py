@@ -143,6 +143,7 @@ def assemble_fem_nonnodal(
         _test_field_index,
         bcoo_set_dirichlet_rows,
         bcoo_zero_rows_cols,
+        compress_eager,
         sum_duplicate_triplets,
         unique_triplet_count,
     )
@@ -1128,7 +1129,7 @@ def assemble_fem_nonnodal(
         M, A, c = _apply_dirichlet_transient(M, A, c, pins)  # essential edge-trace pins -> M/A/c rows
         # Applied on every timestep, so the per-term/per-element triplet redundancy is paid the whole
         # march. A no-op on the dense vertex-family branch (no `.indices`), which is what we want.
-        M, A = sum_duplicate_triplets(M), sum_duplicate_triplets(A)
+        M, A = compress_eager(M), compress_eager(A)
         return SemidiscreteTimeBlock(M=M, A=A, affine_bias=c, **common), "transient", offs
 
     residual = _make_residual(volume_terms)
@@ -1218,7 +1219,7 @@ def assemble_fem_nonnodal(
         A = _assemble_sparse_A(None)  # no runtime parameters on this branch -> identical to the args-threaded form
         if pins:  # symmetric elimination; `_apply_dirichlet_symmetric` keeps a BCOO sparse
             A, b = _apply_dirichlet_symmetric(A, b, pins)
-        return (sum_duplicate_triplets(A), b), "linear", offs
+        return (compress_eager(A), b), "linear", offs
 
     # vertex C0/C1 families (Hermite/Argyris/Morley): dense global jacfwd (small 2-D problems)
     A = jax.jacfwd(full_residual)(zeros)
