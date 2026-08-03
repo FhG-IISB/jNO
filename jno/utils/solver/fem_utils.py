@@ -11,6 +11,7 @@ Responsibilities:
 - evaluate symbolic expressions at quadrature points inside volume/surface kernels,
 - normalize Dirichlet data and prepare residual/Jacobian runtime objects.
 """
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import jax
@@ -2529,11 +2530,99 @@ def cell_chunk(n_items: int, n_test: int, n_local: int, setting=None):
     return int(chunk)
 
 
+_ELEM_MAP_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
+#: LRU bound. One assembled problem registers ~6 entries and a nonlinear solve ~4 more, so this holds
+#: roughly twenty problems -- comfortably more than the repeated-solve case it exists for. It is not
+#: unbounded because an entry pins the values baked into its compilation (see
+#: :func:`_bake_fingerprint`), which for a discarded problem means keeping that mesh's arrays alive;
+#: at 128 that is bounded by ~20 dead problems rather than by the whole session.
+_ELEM_MAP_CACHE_MAX = 128
+
+
+def _bake_fingerprint(fn, chunk):
+    """Identity of everything a ``jit`` of ``fn`` would BAKE IN: its code object, and the *leaves* of
+    its closure cells and default arguments.
+
+    Two element functions with the same fingerprint produce the same jaxpr, so they can share one
+    compilation. The leaves are compared **by identity**, which is sound because JAX arrays are
+    immutable -- the same array object cannot have become different values. Flattening as a pytree
+    rather than fingerprinting the containers is what makes a mutated-in-place ``args`` dict miss:
+    its leaves are new objects, so it gets a new key instead of a stale compilation.
+
+    Returns ``(key, pins)``, or ``None`` when the function must not be cached -- an empty cell, or a
+    **tracer** among the captures. Tracers are excluded for two reasons: under an enclosing trace the
+    inner ``jit`` is inlined and compiles nothing anyway, so caching buys zero; and pinning a tracer
+    in a module-level dict would keep it alive past the trace that owns it.
+    """
+    try:
+        captured = tuple(c.cell_contents for c in (fn.__closure__ or ()))
+    except ValueError:  # a cell that is not filled yet (recursive closure)
+        return None
+    baked = (captured, fn.__defaults__ or ())
+    leaves, treedef = jax.tree_util.tree_flatten(baked)
+    if any(isinstance(leaf, jax.core.Tracer) for leaf in leaves):
+        return None
+    return (fn.__code__, treedef, tuple(id(leaf) for leaf in leaves), chunk), leaves
+
+
 def elem_map(fn, xs, chunk):
-    """``vmap(fn)`` over the leading axis, in chunks of ``chunk`` when one is set."""
+    """``vmap(fn)`` over the leading axis, in chunks of ``chunk`` when one is set -- COMPILED.
+
+    ``jax.vmap`` batches, it does not compile. Without an enclosing ``jit`` every batched primitive
+    inside ``fn`` executes eagerly and is compiled as its own single-primitive program: assembling
+    one 2-D Poisson problem issued **187 such programs, 3.5 s**, of which 187 were under 60 MLIR
+    lines. They are keyed on shapes, so a remesh pays the whole bill again -- which is what made an
+    AFEM step cost ~4 s. (The chunked branch escaped this only by accident: ``lax.map`` lowers to
+    ``scan``, a single primitive.)
+
+    The reason this could not simply be ``jax.jit(jax.vmap(fn))`` is that callers build ``fn`` as a
+    fresh lambda per evaluation. ``jax.jit`` keys its cache on the function object, so a fresh lambda
+    is a fresh entry: measured, that turned a repeat nonlinear solve from 522 ms into 1233 ms with 9
+    recompilations -- trading a 2.5x faster first solve for a 2.4x slower every-solve-after. Hence
+    :func:`_bake_fingerprint`: the cache is keyed on what the compilation actually depends on -- the
+    code object and the identities of the values baked into it -- so the freshly-built lambda that
+    wraps identical captures reuses the identical compiled program.
+
+    The cache is bounded and holds its baked leaves, which both caps memory and keeps the ``id``\\ s
+    in the key from being recycled onto different objects while an entry is live.
+
+    Measured cold, one variant per process (running both in one process lets whichever goes second
+    inherit the other's warm XLA cache, which is how an earlier comparison flattered itself):
+
+        cold build     4282 -> 2758 ms     remesh (the AFEM step)   4134 -> 2764 ms
+        first solve    2745 -> 1739 ms     repeat solve              502 ->  355 ms
+
+    **What this costs.** Rebuilding an identical problem from scratch allocates fresh mesh arrays, so
+    the key legitimately misses and that path pays a trace plus a compile where the old eager route
+    hit JAX's per-op cache (which keys on shapes): 283 -> 710 ms. Shape-keying instead would be faster
+    and WRONG -- it would hand a compilation baked with one mesh's coordinates to a different mesh of
+    the same size. The honest fix for that case is to stop baking the geometry in at all and pass it
+    as an argument, a restructure of how ``fem_native`` builds these closures. Until then the trade is
+    net favourable: a build-then-remesh-twice-then-rebuild sequence goes 13.0 s -> 9.1 s.
+
+    The regression the naive ``jax.jit(jax.vmap(fn))`` caused -- repeat solve 522 -> 1233 ms -- does
+    not appear; repeats are faster than before the change, not slower.
+    """
     if chunk is None:
-        return jax.vmap(fn)(*xs)
-    return jax.lax.map(lambda z: fn(*z), xs, batch_size=int(chunk))
+        run, arrays = jax.vmap(fn), xs
+    else:
+        c = int(chunk)
+        run, arrays = (lambda *a: jax.lax.map(lambda z: fn(*z), a, batch_size=c)), xs
+
+    fp = _bake_fingerprint(fn, chunk)
+    if fp is None:  # traced or unpinnable: jit anyway (inlined under a trace), just do not cache
+        return jax.jit(run)(*arrays)
+
+    key, pins = fp
+    hit = _ELEM_MAP_CACHE.get(key)
+    if hit is None:
+        hit = (jax.jit(run), pins)
+        _ELEM_MAP_CACHE[key] = hit
+        if len(_ELEM_MAP_CACHE) > _ELEM_MAP_CACHE_MAX:
+            _ELEM_MAP_CACHE.popitem(last=False)
+    else:
+        _ELEM_MAP_CACHE.move_to_end(key)
+    return hit[0](*arrays)
 
 
 def sum_duplicate_triplets(A, nse: int | None = None):

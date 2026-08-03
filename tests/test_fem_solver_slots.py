@@ -435,3 +435,93 @@ def test_compiled_path_still_raises_on_an_unconverged_solve():
     # and the guard does not fire on a solve that DID converge
     u = fem.solve(linear=jno.solve.cg(tol=1e-12, maxiter=5000), precond=jno.precond.jacobi())
     assert np.abs(np.asarray(u) - np.asarray(fem.solve())).max() < 1e-7
+
+
+# ---------------------------------------------------------------------------
+# the element-map compilation cache
+# ---------------------------------------------------------------------------
+
+
+def test_elem_map_cache_keys_on_what_gets_baked_in():
+    """`jax.vmap` batches but does not compile, so the element loop used to run as ~187 separately
+    compiled single-primitive programs. Wrapping it in `jax.jit` is only safe if the cache can HIT:
+    callers build the mapped function as a fresh lambda per evaluation, and `jax.jit` keys on the
+    function object, so the naive version recompiled every call -- measured, a repeat nonlinear solve
+    went 522 -> 1233 ms with 9 recompilations.
+
+    So the key is the code object plus the identity of the pytree LEAVES of the closure and defaults
+    -- everything a compilation bakes in. This test pins the three properties that make that sound.
+    """
+    from jno.utils.solver.fem_utils import _bake_fingerprint
+
+    a, b = jnp.ones(3), jnp.ones(3)
+
+    def make(arr):  # same source lambda, same captures -> must share a key
+        return lambda z, _a=arr: z + _a
+
+    k1, _ = _bake_fingerprint(make(a), None)
+    k2, _ = _bake_fingerprint(make(a), None)
+    assert k1 == k2, "an equivalent freshly-built lambda missed the cache -- the regression this fixes"
+
+    # a DIFFERENT captured array is a different compilation
+    k3, _ = _bake_fingerprint(make(b), None)
+    assert k1 != k3, "two different captured arrays shared a key -- would serve a stale compilation"
+
+    # the chunk policy changes the program, so it belongs in the key
+    k4, _ = _bake_fingerprint(make(a), 256)
+    assert k1 != k4
+
+    # leaves, not containers: a dict mutated in place has new leaves and must not reuse the old entry
+    d = {"c": a}
+    k5, _ = _bake_fingerprint(lambda z, _d=d: z + _d["c"], None)
+    d["c"] = b
+    k6, _ = _bake_fingerprint(lambda z, _d=d: z + _d["c"], None)
+    assert k5 != k6, "a mutated capture reused its old compilation"
+
+
+def test_elem_map_cache_refuses_tracers():
+    """A tracer capture must never be cached: under an enclosing trace the inner jit is inlined and
+    compiles nothing (so caching buys zero), and pinning a tracer in a module-level dict would keep
+    it alive past the trace that owns it."""
+    from jno.utils.solver.fem_utils import _bake_fingerprint
+
+    assert _bake_fingerprint(lambda z, _a=jnp.ones(3): z + _a, None) is not None
+
+    seen = {}
+
+    def probe(t):
+        seen["fp"] = _bake_fingerprint(lambda z, _a=t: z + _a, None)
+        return t * 2.0
+
+    jax.jit(probe)(jnp.float64(1.0))
+    assert seen["fp"] is None, "a tracer capture was cached -- it would outlive its trace"
+
+
+def test_repeated_solves_do_not_recompile():
+    """The property the whole design exists for: solving the same problem twice must not recompile.
+
+    This is the test that would have caught the naive `jax.jit(jax.vmap(fn))`, which passed every
+    correctness check and still made every repeat solve 2.4x slower.
+    """
+    import jax._src.compiler as _compiler
+
+    fem = _nonlinear()
+    fem.solve(nonlinear=jno.solve.newton())  # warm
+
+    n = {"c": 0}
+    orig = _compiler.compile_or_get_cached
+
+    def counting(*a, **kw):
+        n["c"] += 1
+        return orig(*a, **kw)
+
+    _compiler.compile_or_get_cached = counting
+    try:
+        u1 = np.asarray(fem.solve(nonlinear=jno.solve.newton()))
+        first_repeat = n["c"]
+        u2 = np.asarray(fem.solve(nonlinear=jno.solve.newton()))
+    finally:
+        _compiler.compile_or_get_cached = orig
+
+    assert np.abs(u1 - u2).max() < 1e-12, "repeated solves disagree"
+    assert n["c"] - first_repeat <= 1, f"a repeat solve recompiled {n['c'] - first_repeat} programs"
