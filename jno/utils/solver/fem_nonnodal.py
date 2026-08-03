@@ -176,6 +176,13 @@ def assemble_fem_nonnodal(
         raise NotImplementedError("jno.fem (non-nodal): a Morley field cannot be mixed with other element families.")
     # vertex-DOF families (take a nodal/derivative Dirichlet): the M(cell) DOF-transform path
     has_vertex = has_hermite or has_argyris or has_morley
+    # The vertex families used to hand back a DENSE operator, so `fem.solve()` landed on a direct
+    # `jnp.linalg.solve`. Now that they assemble sparsely the default would silently become the
+    # Jacobi-preconditioned BiCGStab that serves real elliptic systems -- and these are 4th-order
+    # biharmonic operators (`test_fem_morley.py` asserts the WELL-conditioned form is only cond < 1e12),
+    # where it does not converge. Carry the direct choice over rather than inherit the sparse default;
+    # `_solve_dispatch` already does the same for 1-D tridiagonal and complex/indefinite systems.
+    domain._fem_prefer_direct = bool(has_vertex)
     if has_edge and (has_hermite or has_argyris):
         raise NotImplementedError(
             "jno.fem (non-nodal): mixing edge (RT/N1E) and vertex (Hermite/Argyris) fields is not supported."
@@ -736,14 +743,13 @@ def assemble_fem_nonnodal(
         import jax.experimental.sparse as _jsparse
 
         _typed = []  # (lowered coeff, test-field index, region-mask names) — identical typing to `_make_residual`
-        if not has_vertex:
-            for _bare_term in term_source:
-                for _sign, _sub in _split_additive_terms(domain, _bare_term):
-                    _coeff = _lower_statefield_to_trial(_apply_sign(domain, _sign, _sub), {})
-                    _tfi = _test_field_index(_coeff, field_index)
-                    if _tfi is None:
-                        raise ValueError("jno.fem (non-nodal): each weak term must contain exactly one test field.")
-                    _typed.append((_coeff, _tfi, tuple(sorted(_collect_region_mask_names(_coeff)))))
+        for _bare_term in term_source:
+            for _sign, _sub in _split_additive_terms(domain, _bare_term):
+                _coeff = _lower_statefield_to_trial(_apply_sign(domain, _sign, _sub), {})
+                _tfi = _test_field_index(_coeff, field_index)
+                if _tfi is None:
+                    raise ValueError("jno.fem (non-nodal): each weak term must contain exactly one test field.")
+                _typed.append((_coeff, _tfi, tuple(sorted(_collect_region_mask_names(_coeff)))))
 
         _cell_all_dofs = jnp.concatenate([cdofs[i] for i in range(len(fields))], axis=1)  # (n_cells, n_local_all)
         _field_splits = list(np.cumsum([0] + [int(cdofs[i].shape[1]) for i in range(len(fields))]))
@@ -987,12 +993,8 @@ def assemble_fem_nonnodal(
         # edges). ``spatial_res`` (a cheap O(n) residual eval) still supplies the RHS load and the nonlinear
         # residual; only the operator MATRICES go sparse. Vertex C0/C1 families keep the dense path (small 2-D).
         _strip_mass = [_strip_temporal_trial_derivative(t) for t in temporal]
-        if not has_vertex:
-            _assemble_spatial = _make_sparse_assembler(spatial)
-            M = _make_sparse_assembler(_strip_mass)(None, surface=False)  # BCOO mass — no impedance on the u̇ term
-        else:
-            _assemble_spatial = None  # C0/C1 vertex families: dense global jacfwd below
-            M = jax.jacfwd(_make_residual(_strip_mass))(zeros)  # block mass (dense, small 2-D)
+        _assemble_spatial = _make_sparse_assembler(spatial)
+        M = _make_sparse_assembler(_strip_mass)(None, surface=False)  # BCOO mass — no impedance on the u̇ term
         spatial_res = _make_residual(spatial)
         t0, t1, dt = _infer_time_window(domain)
         common = dict(
@@ -1193,18 +1195,13 @@ def assemble_fem_nonnodal(
         from ...trace import FemLinearSystem
 
         def _assemble_at(args):
-            if has_vertex:  # C0/C1 vertex families (Hermite/Argyris/Morley): dense, small 2-D problems
-                A = jax.jacfwd(lambda u: full_residual(u, args))(zeros)
-                sm = _surf_mass_of(args)  # tangential-trace surface mass (impedance) → A, re-assembled per args
-                if sm is not None:
-                    A = A + sm
-            else:  # edge/cell DOF families (N1E/RT/P0): per-element sparse assembly, folds in the surface mass
-                A = _assemble_sparse_A(args)
+            # per-element sparse assembly for every family; folds in the tangential-trace surface mass
+            A = _assemble_sparse_A(args)
             # ``full_residual`` folds in the CONSTANT nat_load; add the parametric change of the N1E incident
             # load so a runtime parameter in the incident source is differentiable in b too.
             b = -full_residual(zeros, args) + (_incident_of(args) - _incident_const)
             if pins:  # `_apply_dirichlet_symmetric` keeps a BCOO sparse; only the dense path needs the cast
-                A, b = _apply_dirichlet_symmetric(jnp.asarray(A) if has_vertex else A, jnp.asarray(b), pins)
+                A, b = _apply_dirichlet_symmetric(A, jnp.asarray(b), pins)
             return A, b
 
         # static placeholder for `.A` / `.b` (right width per parameter kind: a field param is (n_verts,),
@@ -1228,22 +1225,16 @@ def assemble_fem_nonnodal(
     # --- steady linear (non-parametric): A u = b ---
     b = -full_residual(zeros)  # spatial + natural-BC load (constant part of the residual)
 
-    # RT/N1E/P0 (edge & cell DOFs): assemble SPARSELY, one element at a time -- see `_assemble_sparse_A`.
-    # The vertex C0/C1 families (Hermite/Argyris/Morley) keep the dense path below: small 2-D problems whose
-    # Hessian-shape element assembly is not ported, so their behaviour is unchanged.
-    if not has_vertex:
-        A = _assemble_sparse_A(None)  # no runtime parameters on this branch -> identical to the args-threaded form
-        if pins:  # symmetric elimination; `_apply_dirichlet_symmetric` keeps a BCOO sparse
-            A, b = _apply_dirichlet_symmetric(A, b, pins)
-        return (compress_eager(A), b), "linear", offs
-
-    # vertex C0/C1 families (Hermite/Argyris/Morley): dense global jacfwd (small 2-D problems)
-    A = jax.jacfwd(full_residual)(zeros)
-    if surf_mass is not None:  # add the tangential-trace surface mass (impedance / absorbing BC) to the stiffness
-        A = A + surf_mass
-    if pins:
-        A, b = _apply_dirichlet_symmetric(jnp.asarray(A), jnp.asarray(b), pins)
-    return (A, b), "linear", offs
+    # EVERY family assembles SPARSELY, one element at a time -- see `_assemble_sparse_A`. The vertex
+    # C0/C1 families (Hermite/Argyris/Morley) used a global dense `jacfwd` here, which was never a
+    # property of C0/C1 elements: `_elem_res` calls the same `_cell_fields` that carries their
+    # per-cell M(cell) DOF-transform and shape_hess, and the RESIDUAL already assembled them per
+    # element through it. The dense form's cost is the `O(n_dofs x n_cells)` tangent, not the matrix --
+    # measured on Argyris at 635 dofs: a 3.1 MiB operator with a 2279 MiB peak, 741x the stored size.
+    A = _assemble_sparse_A(None)  # no runtime parameters on this branch -> identical to the args-threaded form
+    if pins:  # symmetric elimination; `_apply_dirichlet_symmetric` keeps a BCOO sparse
+        A, b = _apply_dirichlet_symmetric(A, b, pins)
+    return (compress_eager(A), b), "linear", offs
 
 
 def _n1e_surface_mass_spec(bare):

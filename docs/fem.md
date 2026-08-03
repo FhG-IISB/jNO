@@ -141,6 +141,20 @@ problems whose natural space is *not* H¹. Pick one with the `space=` knob on `f
 > value-Dirichlet `u(region) - g` pins boundary-vertex value DOFs (derivatives free); composes with the
 > steady / transient / nonlinear paths (`tests/test_fem_hermite.py`).
 
+> **These families assemble sparsely.** Their *linear* operator is built element-by-element like every
+> other family. It used to be a **global dense `jacfwd`**, which was never a property of C⁰/C¹ elements
+> — the real cost was that form's `O(n_dofs × n_cells)` tangent, not the matrix. Measured on Argyris
+> before the change: a **3.1 MiB operator with a 2279 MiB peak** (741× the stored size) at 635 DOFs,
+> OOMing at the next refinement. Sparse reaches **22,511 DOFs** on the same 8 GB card — a 35× larger
+> problem — with peak memory growing as `n^1.0` instead of `n^1.7`. Morley and Hermite gain ~9× DOFs and
+> 15–29× less peak at matched size. The answers are unchanged: identical to the dense assembly at every
+> size tested.
+>
+> The solve stays **sparse-direct** for these families. Going sparse would otherwise have handed 4th-order
+> biharmonic operators to the Jacobi-preconditioned BiCGStab that serves real elliptic systems, where it
+> does not converge — a solver change disguised as a storage change. Their **nonlinear** and
+> **second-order-in-time** paths are still dense, as they are for every non-nodal family.
+
 > **Argyris** is the **C¹-conforming** quintic triangle (21 DOF) — the element for **4th-order PDEs**.
 > Across a shared edge both `u` and `∂u/∂n` are continuous, so `∫Δu·Δv` is now a *convergent* biharmonic
 > discretisation (the conformity caveat above is lifted). The reference dual basis is mapped to each
@@ -154,8 +168,8 @@ problems whose natural space is *not* H¹. Pick one with the `space=` knob on `f
 
 > **Morley** is the **cheapest** biharmonic element (6 DOF, quadratic). It is **non-conforming** — yet
 > passes the patch test and converges (energy `O(h)`, L² `O(h²)`). It reuses Argyris's `M(cell)` transform
-> and globally-oriented edge-normal DOF but with ~3.5× fewer DOF, so it **clears the Argyris construction
-> memory ceiling** and scales to much finer meshes. **Modelling subtlety:** because it is non-conforming,
+> and globally-oriented edge-normal DOF but with ~3.5× fewer DOF, so it is **much cheaper per node**
+> and scales to finer meshes. **Modelling subtlety:** because it is non-conforming,
 > the biharmonic form must be the **full-Hessian inner product** `inner(hessian(u), hessian(v))` (`∫D²u:D²v`),
 > *not* `∫Δu·Δv` — the Laplacian form is singular for Morley (`xy` has `Δu = 0` but `D²u ≠ 0`, a spurious
 > kernel). Its two plate traces `u(region) - g` and `u.dn(region) - h` work on **any** boundary orientation.
@@ -256,12 +270,13 @@ where they differ from the mesh vertices), `fem.operator`, and `fem.classificati
 > solve.
 >
 > Coverage, since it is not uniform. The **native** assembler chunks its residual and jacobian, volume
-> and surface loops. The **non-nodal** assembler chunks its residual element loop for every family, and
-> its jacobian for the edge/cell families (N1E/RT/P0) — the 3-D vector route where this matters most.
-> The vertex C⁰/C¹ families (Hermite, Argyris, Morley) take a *global dense* `jacfwd` for the jacobian:
-> there is no element loop there to chunk, and their memory cost is `O(n²)` density, a different
-> problem needing per-element assembly rather than a different schedule. The **1-D** assembler is not
-> chunked at all, and an explicit `chunk=` there raises rather than being silently ignored.
+> and surface loops. The **non-nodal** assembler chunks both, for every family — including the C⁰/C¹
+> vertex families, whose *linear* operator now assembles per element (see below). Two paths still take
+> a global dense `jacfwd` and are unchunked, for **every** non-nodal family rather than any particular
+> one: the **nonlinear tangent** (the sparse assembler linearises at `u = 0`, so it is linear-only) and
+> the **second-order-in-time** block, which builds a dense `2n × 2n` system by construction. The
+> **1-D** assembler is not chunked at all, and an explicit `chunk=` there raises rather than being
+> silently ignored.
 
 > **Term introspection (provisional).** `fem.term_kinds` returns a `list[TermKind]` — each
 > additively-split PDE (volume) term classified by `support`, `time_order`, `trial_channel` /

@@ -1755,6 +1755,17 @@ class FEM:
                 from .utils.solver.linear import sparse_lu_solve
 
                 return _fin(sparse_lu_solve(A, b))
+            if solve_fn is None and getattr(self.domain, "_fem_prefer_direct", False) and hasattr(A, "todense"):
+                # SPARSE-DIRECT for the C0/C1 vertex families (Hermite/Argyris/Morley). They used to
+                # hand back a DENSE operator, so this landed on `jnp.linalg.solve` -- a direct solve.
+                # Now that they assemble sparsely the default would silently become the Jacobi-
+                # preconditioned BiCGStab that serves real elliptic systems, and these are 4th-order
+                # biharmonic operators (the Morley suite asserts the WELL-conditioned form is only
+                # cond < 1e12), where it does not converge. Carrying the choice over keeps the storage
+                # change from being a solver change. Same reasoning as the two branches above.
+                from .utils.solver.linear import sparse_lu_solve
+
+                return _fin(sparse_lu_solve(A, b))
             if solve_fn is None and hasattr(A, "todense"):
                 return _fin(_solve_linear_matrix_free(A, b, shard=shard))
             if from_slots:
