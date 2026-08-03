@@ -242,74 +242,33 @@ class MeshUtils:
         -------
         ds : ndarray of shape (n_boundary_points,)
         """
-        from collections import Counter
-
         dimension = mesh_connectivity["dimension"]
         points = mesh_connectivity["points"]
         n_points = mesh_connectivity["n_points"]
 
-        ds = np.zeros(n_points)
+        def scatter(nodes, measure):
+            """Split each element's measure equally over its own nodes and accumulate."""
+            per_node = np.repeat(measure / nodes.shape[1], nodes.shape[1])
+            return np.bincount(nodes.ravel(), weights=per_node, minlength=n_points)
 
         if dimension == 1:
             # Boundary = endpoints, ds = half of adjacent line element
-            elements = mesh_connectivity["lines"]
-            for elem in elements:
-                p0, p1 = points[elem[0]], points[elem[1]]
-                length = np.linalg.norm(p1 - p0)
-                ds[elem[0]] += 0.5 * length
-                ds[elem[1]] += 0.5 * length
+            segments = np.asarray(mesh_connectivity["lines"])
+            lengths = np.linalg.norm(points[segments[:, 1]] - points[segments[:, 0]], axis=-1)
+            ds = scatter(segments, lengths)
 
         elif dimension == 2:
             # Boundary = edges that appear once in the triangulation
-            triangles = mesh_connectivity["triangles"]
-
-            edge_count = Counter()
-            edge_lengths = {}
-
-            for tri in triangles:
-                for i in range(3):
-                    n0, n1 = int(tri[i]), int(tri[(i + 1) % 3])
-                    edge = (min(n0, n1), max(n0, n1))
-                    edge_count[edge] += 1
-                    if edge not in edge_lengths:
-                        edge_lengths[edge] = np.linalg.norm(points[n1] - points[n0])
-
-            # Boundary edges appear exactly once
-            for edge, count in edge_count.items():
-                if count == 1:
-                    length = edge_lengths[edge]
-                    ds[edge[0]] += 0.5 * length
-                    ds[edge[1]] += 0.5 * length
+            edges = MeshUtils._get_boundary_elements(np.asarray(mesh_connectivity["triangles"]), "triangle")
+            lengths = np.linalg.norm(points[edges[:, 1]] - points[edges[:, 0]], axis=-1)
+            ds = scatter(edges, lengths)
 
         elif dimension == 3:
             # Boundary = faces that appear once in the tetrahedralization
-            tetra = mesh_connectivity["tetrahedra"]
-
-            face_count = Counter()
-            face_areas = {}
-
-            # 4 faces per tetrahedron
-            face_local = [[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]]
-
-            for tet in tetra:
-                for fl in face_local:
-                    nodes = tuple(sorted([int(tet[fl[0]]), int(tet[fl[1]]), int(tet[fl[2]])]))
-                    face_count[nodes] += 1
-                    if nodes not in face_areas:
-                        p0, p1, p2 = (
-                            points[nodes[0]],
-                            points[nodes[1]],
-                            points[nodes[2]],
-                        )
-                        area = 0.5 * np.linalg.norm(np.cross(p1 - p0, p2 - p0))
-                        face_areas[nodes] = area
-
-            # Boundary faces appear exactly once
-            for face, count in face_count.items():
-                if count == 1:
-                    area = face_areas[face]
-                    for node in face:
-                        ds[node] += area / 3.0  # Divide among 3 vertices
+            faces = MeshUtils._get_boundary_elements(np.asarray(mesh_connectivity["tetrahedra"]), "tetra")
+            p0, p1, p2 = points[faces[:, 0]], points[faces[:, 1]], points[faces[:, 2]]
+            areas = 0.5 * np.linalg.norm(np.cross(p1 - p0, p2 - p0), axis=-1)
+            ds = scatter(faces, areas)
 
         else:
             raise ValueError(f"Unsupported dimension: {dimension}")
@@ -336,33 +295,28 @@ class MeshUtils:
         dimension = mesh_connectivity["dimension"]
         points = mesh_connectivity["points"]
         n_points = mesh_connectivity["n_points"]
-        vols = np.zeros(n_points)
 
         if dimension == 1:
-            for seg in mesh_connectivity["lines"]:
-                L = np.linalg.norm(points[seg[1]] - points[seg[0]])
-                vols[seg[0]] += 0.5 * L
-                vols[seg[1]] += 0.5 * L
+            cells = np.asarray(mesh_connectivity["lines"])
+            measure = np.linalg.norm(points[cells[:, 1]] - points[cells[:, 0]], axis=-1)
 
         elif dimension == 2:
-            for tri in mesh_connectivity["triangles"]:
-                a, b, c = points[tri[0]], points[tri[1]], points[tri[2]]
-                ba, ca = b - a, c - a
-                area = 0.5 * abs(float(ba[0] * ca[1] - ba[1] * ca[0]))
-                for n in tri:
-                    vols[n] += area / 3.0
+            cells = np.asarray(mesh_connectivity["triangles"])
+            a, b, c = points[cells[:, 0]], points[cells[:, 1]], points[cells[:, 2]]
+            ba, ca = b - a, c - a
+            measure = 0.5 * np.abs(ba[:, 0] * ca[:, 1] - ba[:, 1] * ca[:, 0])
 
         elif dimension == 3:
-            for tet in mesh_connectivity["tetrahedra"]:
-                a, b, c, d = (points[tet[i]] for i in range(4))
-                vol = abs(float(np.dot(b - a, np.cross(c - a, d - a)))) / 6.0
-                for n in tet:
-                    vols[n] += vol / 4.0
+            cells = np.asarray(mesh_connectivity["tetrahedra"])
+            a, b, c, d = (points[cells[:, i]] for i in range(4))
+            measure = np.abs(np.einsum("ij,ij->i", b - a, np.cross(c - a, d - a))) / 6.0
 
         else:
             raise ValueError(f"Unsupported dimension: {dimension}")
 
-        return vols
+        # each of an element's nodes takes an equal share of its measure
+        n_local = cells.shape[1]
+        return np.bincount(cells.ravel(), weights=np.repeat(measure / n_local, n_local), minlength=n_points)
 
     @staticmethod
     def get_boundary_normals(mesh, k=8):
@@ -480,6 +434,50 @@ class MeshUtils:
         return unique_elements[counts == 1]
 
     @staticmethod
+    def _points_in_polygon_2d(pts, edges, all_points, block=1 << 22):
+        """Ray-casting point-in-polygon test, every point against every edge at once.
+
+        Crossing-number rule (Shimrat, "Algorithm 112: Position of point relative to polygon",
+        Comm. ACM 5(8), 1962): a point is inside when a ray cast along +x crosses the boundary an
+        odd number of times.
+
+        Parameters
+        ----------
+        pts : (m, 2) array of query points.
+        edges : (n_edges, 2) array of indices into `all_points`, or None.
+        all_points : (n, >=2) array holding the edge endpoints.
+        block : int, cap on the (points x edges) temporary, processed in chunks of this many pairs.
+
+        Returns
+        -------
+        (m,) bool array, True where the point is inside. All-True when `edges` is None, matching
+        the caller's "no boundary information, assume inside" fallback.
+        """
+        pts = np.atleast_2d(pts)
+        if edges is None or len(edges) == 0:
+            return np.ones(len(pts), dtype=bool)
+
+        edges = np.asarray(edges)
+        x0, y0 = all_points[edges[:, 0], 0], all_points[edges[:, 0], 1]
+        x1, y1 = all_points[edges[:, 1], 0], all_points[edges[:, 1], 1]
+        dy = y1 - y0
+        # a horizontal edge can never be crossed; keep it out of the divisor rather than
+        # dividing by zero and masking the nan afterwards
+        safe_dy = np.where(dy == 0.0, 1.0, dy)
+        crossable = dy != 0.0
+
+        rows = max(1, block // max(len(edges), 1))
+        inside = np.empty(len(pts), dtype=bool)
+        for lo in range(0, len(pts), rows):
+            x = pts[lo : lo + rows, 0:1]
+            y = pts[lo : lo + rows, 1:2]
+            straddles = (y0 > y) != (y1 > y)
+            x_int = x0 + (x1 - x0) * (y - y0) / safe_dy
+            crossings = np.count_nonzero(straddles & crossable & (x < x_int), axis=1)
+            inside[lo : lo + rows] = crossings % 2 == 1
+        return inside
+
+    @staticmethod
     def _compute_normals_pca(points, boundary_indices, dim, k=8, mesh=None):
         """
         Compute outward-pointing normals for boundary points using PCA.
@@ -491,85 +489,47 @@ class MeshUtils:
 
         tree = KDTree(coords)
         _, neighbors = tree.query(coords, k=min(k, len(coords)))
+        neighbors = neighbors.reshape(len(coords), -1)  # k=1 drops the neighbour axis
 
-        v_normals = np.zeros((len(boundary_indices), dim))
         mesh_centroid = np.mean(points[:, :dim], axis=0)
 
         # Get boundary edges for point-in-polygon test
         boundary_edges = None
         if dim == 2 and mesh is not None and "triangle" in mesh.cells_dict:
-            from collections import Counter
+            boundary_edges = MeshUtils._get_boundary_elements(mesh.cells_dict["triangle"], "triangle")
 
-            triangles = mesh.cells_dict["triangle"]
-            edge_count = Counter()
-            for tri in triangles:
-                for j in range(3):
-                    n0, n1 = int(tri[j]), int(tri[(j + 1) % 3])
-                    edge = (min(n0, n1), max(n0, n1))
-                    edge_count[edge] += 1
-            boundary_edges = [edge for edge, count in edge_count.items() if count == 1]
+        # --- normals: one batched SVD over every neighbourhood patch ---------------------------
+        # KDTree returns a fixed k, so the patches stack into a single (n_boundary, k, dim) array
+        # and the decomposition batches. The last right-singular vector is the direction of least
+        # variance, i.e. the surface normal.
+        patches = coords[neighbors]
+        _, _, vh = np.linalg.svd(patches - patches.mean(axis=1, keepdims=True))
+        v_normals = vh[:, -1, :]
+        v_normals = v_normals / (np.linalg.norm(v_normals, axis=1, keepdims=True) + 1e-12)
 
-        def point_in_domain_2d(pt, edges, all_points):
-            """Ray casting point-in-polygon for 2D."""
-            if edges is None:
-                return True  # Fallback
+        # --- orientation: a normal points OUT, i.e. away from the material ---------------------
+        # Step a short way along each normal and against it, and keep the direction that lands
+        # outside the domain.
+        step_size = 1e-4 * np.max(np.abs(coords.max(axis=0) - coords.min(axis=0)))
+        if dim == 2:
+            inside_positive = MeshUtils._points_in_polygon_2d(
+                coords + step_size * v_normals, boundary_edges, points[:, :dim]
+            )
+            inside_negative = MeshUtils._points_in_polygon_2d(
+                coords - step_size * v_normals, boundary_edges, points[:, :dim]
+            )
+            flip = inside_positive & ~inside_negative
+            # both sides inside, or both outside -- the test is inconclusive here
+            undecided = inside_positive == inside_negative
+        else:
+            flip = np.zeros(len(coords), dtype=bool)
+            undecided = np.ones(len(coords), dtype=bool)
 
-            x, y = pt[0], pt[1]
-            crossings = 0
+        # 3D, no boundary edges, and inconclusive 2D points fall back to the centroid heuristic
+        outward = np.einsum("ij,ij->i", v_normals, coords - mesh_centroid) < 0
+        flip = np.where(undecided, outward, flip)
 
-            for e0, e1 in edges:
-                x0, y0 = all_points[e0, 0], all_points[e0, 1]
-                x1, y1 = all_points[e1, 0], all_points[e1, 1]
-
-                if ((y0 > y) != (y1 > y)) and (y1 != y0):
-                    x_int = x0 + (x1 - x0) * (y - y0) / (y1 - y0)
-                    if x < x_int:
-                        crossings += 1
-
-            return crossings % 2 == 1
-
-        for i in range(len(boundary_indices)):
-            patch = coords[neighbors[i]]
-            centered_patch = patch - np.mean(patch, axis=0)
-
-            # SVD finds directions of variance
-            _, _, vh = np.linalg.svd(centered_patch)
-
-            # The last row of vh is the direction of LEAST variance (the normal)
-            normal = vh[-1, :]
-            normal = normal / (np.linalg.norm(normal) + 1e-12)
-
-            # Test which direction is "inside" the domain
-            step_size = 1e-4 * np.max(np.abs(coords.max(axis=0) - coords.min(axis=0)))
-
-            test_point_positive = coords[i] + step_size * normal
-            test_point_negative = coords[i] - step_size * normal
-
-            if dim == 2:
-                inside_positive = point_in_domain_2d(test_point_positive, boundary_edges, points[:, :dim])
-                inside_negative = point_in_domain_2d(test_point_negative, boundary_edges, points[:, :dim])
-
-                # Normal should point OUT of domain (toward the side that is NOT inside)
-                if inside_positive and not inside_negative:
-                    # Positive direction is inside, so normal should point negative
-                    normal = -normal
-                elif inside_negative and not inside_positive:
-                    # Negative direction is inside, normal already points out
-                    pass
-                else:
-                    # Fallback to centroid-based heuristic
-                    point_vec = coords[i] - mesh_centroid
-                    if np.dot(normal, point_vec) < 0:
-                        normal = -normal
-            else:
-                # 3D or fallback: use centroid heuristic
-                point_vec = coords[i] - mesh_centroid
-                if np.dot(normal, point_vec) < 0:
-                    normal = -normal
-
-            v_normals[i] = normal
-
-        return v_normals, boundary_indices
+        return np.where(flip[:, None], -v_normals, v_normals), boundary_indices
 
     @staticmethod
     @jax.jit
