@@ -75,8 +75,8 @@ from .fem_utils import (
     bcoo_set_dirichlet_rows,
     bcoo_zero_rows,
     bcoo_zero_rows_cols,
+    compress_eager,
     compress_plan,
-    sum_duplicate_triplets,
 )
 from .parametric_helpers import _collect_runtime_parameter_exprs
 from .weak_form import (
@@ -1963,8 +1963,8 @@ def assemble_fem_native(
             _all_d = jnp.concatenate([_cd, _tvd])
             # Compress AFTER the Dirichlet edit: bcoo_set_unit_diag appends its own (d, d, 1)
             # triplets, which must merge with whatever the assembly already put on that diagonal.
-            A_tv = sum_duplicate_triplets(bcoo_set_dirichlet_rows(spatial_jac(zeros, 0.0), _all_d))
-            M_tv = sum_duplicate_triplets(bcoo_zero_rows(M, _all_d))
+            A_tv = compress_eager(bcoo_set_dirichlet_rows(spatial_jac(zeros, 0.0), _all_d))
+            M_tv = compress_eager(bcoo_zero_rows(M, _all_d))
             c_tv = zeros.at[_cd].set(_cv)
             free_tv = jnp.ones((total,), dtype=zeros.dtype).at[_all_d].set(0.0)
 
@@ -1989,7 +1989,7 @@ def assemble_fem_native(
         M, A, c = _apply_dirichlet_transient(M, A, c0, dirichlet_pairs)
         # Both operators are applied on EVERY timestep, so the ~19x triplet redundancy is paid once
         # per step for the whole march. Compressing here is the single highest-leverage site.
-        M, A = sum_duplicate_triplets(M), sum_duplicate_triplets(A)
+        M, A = compress_eager(M), compress_eager(A)
         if temporal_tags:
             free_mask = jnp.ones((total,), dtype=zeros.dtype)
             if d_dofs is not None:
@@ -2118,5 +2118,5 @@ def assemble_fem_native(
     # Collapse duplicate triplets ONCE, after Dirichlet (which appends its own). The assembly emits
     # one block per term and never pre-sums, and each interior DOF pair gets a contribution per
     # incident element -- ~19x redundancy on a 3-D P1 mesh, paid again on every matvec.
-    A = sum_duplicate_triplets(A)
+    A = compress_eager(A)
     return (A, b), "linear", offs

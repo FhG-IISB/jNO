@@ -2543,6 +2543,37 @@ def compress_plan(indices):
     return jnp.asarray(idx), jnp.asarray(inverse.reshape(-1).astype(np.int32)), int(uniq.shape[0])
 
 
+def compress_eager(A):
+    """Collapse duplicates in a CONCRETE operator without an on-device sort.
+
+    ``sum_duplicates`` sorts the triplet axis on the device, and on a large operator that workspace
+    costs more than the compression saves. Measured on a 3-D transient heat block (18k DOFs, 6.27M raw
+    triplets): the operator fell 95.6 -> 5.9 MiB but PEAK memory rose 500 -> 666 MiB. The stored
+    operator got 16x smaller and the machine could fit a smaller problem -- the opposite of the point.
+
+    The pattern is host data, so the collapse can be decided in numpy and applied on device as an
+    ``O(nnz)`` ``segment_sum``: no device sort, no workspace spike. Explicit zeros are still dropped,
+    but the check runs on the ALREADY-COMPRESSED values, which are ~16x smaller than the raw triplets,
+    so it is a cheap transfer rather than a full round trip.
+
+    Falls back to the sorting path for anything non-concrete -- correctness never depends on this."""
+    if not hasattr(A, "indices"):
+        return A
+    try:
+        plan = compress_plan(A.indices)
+    except Exception:  # noqa: BLE001 -- traced operator: no host plan available
+        return sum_duplicate_triplets(A)
+    if plan is None:
+        return A
+    idx, inverse, nse = plan
+    data = jax.ops.segment_sum(A.data, inverse, num_segments=nse)
+    keep = np.asarray(jnp.abs(data) > 0.0)  # concrete and already compressed -> cheap
+    if not bool(keep.all()):
+        sel = jnp.asarray(np.flatnonzero(keep))
+        data, idx = data[sel], idx[sel]
+    return jsparse.BCOO((data, idx), shape=A.shape)
+
+
 def apply_compress_plan(data, plan, shape):
     """Build the compressed BCOO from raw triplet ``data`` and a :func:`compress_plan`.
 
