@@ -12,6 +12,7 @@ Responsibilities:
 - normalize Dirichlet data and prepare residual/Jacobian runtime objects.
 """
 from collections import OrderedDict
+from functools import partial
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import jax
@@ -2669,18 +2670,35 @@ def sum_duplicate_triplets(A, nse: int | None = None):
     if not hasattr(A, "indices"):
         return A
     if nse is not None:
-        # Static-count path: works under trace. ``remove_zeros=False`` is deliberate and load-bearing.
-        # With removal on, the surviving count is data-dependent, so ``sum_duplicates`` pads the
-        # result out to ``nse`` using OUT-OF-BOUND indices ``(shape[0], shape[1])``. BCOO's own matvec
-        # ignores those, but jNO hands operators to consumers that read the triplets directly -- the
-        # AMG/AMS CSR conversion would build a row ``n`` that does not exist. Off, the output is
-        # exactly the unique-pair set with every index in bounds: purely structural, data-independent,
-        # no padding, and identical for every parameter value the assembler is traced at.
-        return A.sum_duplicates(nse=int(nse), remove_zeros=False)
+        return _sum_duplicates_static(A, nse=int(nse))
     try:
         return A.sum_duplicates()  # nse inferred -> requires concrete indices
     except Exception:  # noqa: BLE001 — traced operator: leave it alone rather than fail the assembly
         return A
+
+
+@partial(jax.jit, static_argnames=("nse",))
+def _sum_duplicates_static(A, *, nse: int):
+    """``sum_duplicates`` at a STATIC count, as one compiled program.
+
+    ``BCOO.sum_duplicates`` is a sort plus segment work, and run uncompiled each of those primitives
+    becomes its own XLA module. The non-nodal assembler calls this from inside its re-assembly, which
+    is not itself jitted, so a Morley build spent **~1150 ms across 41 programs** here -- more than the
+    element kernels it was compressing. The 2-D Lagrange path never showed it because that route uses
+    :func:`compress_eager` instead.
+
+    ``nse`` is static and the operator arrives as an argument, so ``jax.jit`` keys this on shapes
+    natively -- no cache-key machinery, and under the parametric/per-step traces that call it, the jit
+    simply inlines.
+
+    ``remove_zeros=False`` is deliberate and load-bearing. With removal on, the surviving count is
+    data-dependent, so ``sum_duplicates`` pads the result out to ``nse`` using OUT-OF-BOUND indices
+    ``(shape[0], shape[1])``. BCOO's own matvec ignores those, but jNO hands operators to consumers
+    that read the triplets directly -- the AMG/AMS CSR conversion would build a row ``n`` that does not
+    exist. Off, the output is exactly the unique-pair set with every index in bounds: purely
+    structural, data-independent, and identical for every parameter value the assembler is traced at.
+    """
+    return A.sum_duplicates(nse=nse, remove_zeros=False)
 
 
 def unique_triplet_count(indices) -> int:
