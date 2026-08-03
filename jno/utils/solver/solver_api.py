@@ -656,6 +656,12 @@ def compose_linear_solve_fn(linear, precond, x0, fem=None, shard=None) -> Callab
         if devices and _shardable(op, linear, precond):
             return composed(A, b)
         op, rhs = _normalize_extreme_scale(op, b, precond)
+        # Re-decide AFTER the scaling guard, because that guard MUTATES the preconditioner: on an
+        # extreme-magnitude operator it drops a frozen AMS auxiliary so the coming materialize
+        # re-freezes from the scaled matrix. That un-freezes the very state `_compilable` keyed on at
+        # compose time, and materialising an unfrozen AMS inside the trace means scipy on a tracer.
+        if not _compilable(linear, precond):
+            return composed(A, b)
         rhs = jnp.asarray(rhs).reshape(-1)
         mat = op.bcoo if op.bcoo is not None else A
         x = _composed_compiled(mat, rhs, x0_flat, linear=linear, precond=precond)
