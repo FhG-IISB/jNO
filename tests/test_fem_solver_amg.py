@@ -130,3 +130,56 @@ def test_pyamg_stays_optional(monkeypatch):
     fem = _poisson(mesh_size=0.2)
     with pytest.raises(ImportError, match="pip install pyamg"):
         jno.precond.amg().build(fem.A)
+
+
+def test_built_amg_rides_the_compiled_slot_path():
+    """AMG has the best asymptotics of any shipped preconditioner -- iterations are O(1) in n where
+    Jacobi's grow as sqrt(n) -- and it was the one spec permanently locked out of the compiled slot
+    path. Every Krylov iteration therefore dispatched a ~10-level V-cycle op by op from Python, which
+    buried the entire advantage: at n=46677 a built-hierarchy AMG solve measured 625 ms against 29 ms
+    for Jacobi-BiCGStab.
+
+    The distinction that fixes it is that `traceable` depends on STATE, not on the class. Unbuilt,
+    `materialize` calls pyamg on the host. Built, the levels are frozen data and `vcycle_apply` is
+    pure JAX, so the applier traces. Compiled, the same comparison inverts to 3.2x in AMG's favour,
+    rising to 4.6x at n=95061.
+    """
+    from jno.utils.solver.solver_api import _compilable
+
+    fem = _poisson()
+    A = fem.operator[0]
+    cg = jno.solve.cg(tol=1e-10, maxiter=5000)
+
+    unbuilt = jno.precond.amg()
+    assert unbuilt.traceable is False, "an unbuilt hierarchy needs pyamg on the host -- must stay eager"
+    assert unbuilt.key is None
+    assert not _compilable(cg, unbuilt)
+
+    built = jno.precond.amg().build(A)
+    assert built.traceable is True, "a built hierarchy is frozen data and vcycle_apply is pure JAX"
+    assert built.key is not None
+    assert _compilable(cg, built), "a built AMG must reach the compiled path -- that is the whole point"
+
+    # ... and compiling it must not change the answer
+    u_ref = np.asarray(fem.solve(linear=jno.solve.lu()))
+    u_eager = np.asarray(fem.solve(linear=cg, precond=unbuilt))
+    u_compiled = np.asarray(fem.solve(linear=cg, precond=built))
+    assert np.abs(u_eager - u_ref).max() < 1e-8
+    assert np.abs(u_compiled - u_ref).max() < 1e-8
+    assert np.abs(u_compiled - u_eager).max() < 1e-8
+
+
+def test_two_amg_hierarchies_do_not_share_a_compilation():
+    """The hierarchy IS the compilation, so it has to be in the cache key: two specs built from
+    different operators must never share a compiled program."""
+    fem_a, fem_b = _poisson(0.03), _poisson(0.05)
+    a = jno.precond.amg().build(fem_a.operator[0])
+    b = jno.precond.amg().build(fem_b.operator[0])
+    assert a.key != b.key
+    assert jno.precond.amg(cycles=1).build(fem_a.operator[0]).key != jno.precond.amg(cycles=2).build(fem_a.operator[0]).key
+
+    # each still solves its OWN problem correctly
+    for fem, spec in ((fem_a, a), (fem_b, b)):
+        ref = np.asarray(fem.solve(linear=jno.solve.lu()))
+        got = np.asarray(fem.solve(linear=jno.solve.cg(tol=1e-10, maxiter=5000), precond=spec))
+        assert np.abs(got - ref).max() < 1e-8

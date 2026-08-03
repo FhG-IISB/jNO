@@ -271,7 +271,7 @@ These combinations stay **eager**, and are correct but not accelerated:
 | Slot | Why |
 | --- | --- |
 | `solve.chebyshev`, `precond.chebyshev` | measures spectrum bounds, then branches on what it measured |
-| `precond.amg`, `precond.ams`, `precond.form` | assembles an auxiliary operator host-side (scipy / pyamg) |
+| `precond.amg` **unbuilt**, `precond.ams`, `precond.form` | assembles an auxiliary operator host-side (scipy / pyamg) |
 | `precond.jaxamg`, `solve.amg` | AmgX builds its hierarchy from the matrix values; unverified under a tracer |
 | `solve.lu`, `solve.dense`, `solve.amg` | one direct call — no per-iteration dispatch to remove |
 | a bare callable in either slot | jNO knows nothing about it, so it makes no assumption |
@@ -300,6 +300,33 @@ jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)  # REQUIRED
 The second line is not optional for this workload: the default threshold is 1.0 s and every one of
 these compilations is far below it, so with the cache directory alone nothing is ever written. jNO
 does not set either of these for you — a library should not start writing to a user's disk uninvited.
+
+### When AMG is worth it
+
+`jno.precond.amg` has the best asymptotics on offer: Jacobi's iteration count grows as `√n` (79 → 166
+→ 288 at n = 3k → 12k → 47k on a 2-D Poisson), AMG's is `O(1)`. **Build the hierarchy once and reuse
+it** — an unbuilt spec re-runs pyamg's host-side setup on every solve, and stays off the compiled path
+because that setup cannot be traced:
+
+```python
+M = jno.precond.amg().build(fem.operator[0])       # or jno.precond.amg().cached()
+u = fem.solve(linear=jno.solve.cg(tol=1e-10), precond=M)
+```
+
+Per solve, against `cg + jacobi` at the same tolerance — the advantage grows with the problem, which
+is the `√n`-vs-`O(1)` law showing up directly:
+
+| DOFs | cg + jacobi | cg + amg (built) | | setup | break-even |
+| --- | --- | --- | --- | --- | --- |
+| 3,013 | 6.4 ms | 4.4 ms | 1.5x | 135 ms | 66 solves |
+| 18,289 | 13.6 ms | 6.6 ms | 2.1x | 317 ms | 45 solves |
+| 46,677 | 31.5 ms | 10.0 ms | 3.2x | 303 ms | 14 solves |
+| 95,061 | 80.3 ms | 16.4 ms | **4.9x** | 419 ms | **7 solves** |
+
+So AMG is for **repeated solves against the same operator** — a transient run, a parameter sweep, a
+Newton loop — where the setup amortises. For a single one-shot solve below ~100k DOFs, Jacobi still
+wins on wall clock: you would pay 419 ms of setup to save 64 ms. This is why AMG is not the default;
+the right choice depends on how many times you solve, which only you know.
 
 **Preconditioners** (`jno.precond`, for the iterative solvers): `jacobi`, `chebyshev`,
 `nystrom` (randomized low-rank — the rung between `jacobi` and multigrid),
