@@ -29,6 +29,7 @@ from __future__ import annotations
 import functools
 import inspect
 import warnings
+from functools import partial
 from typing import Any, Callable, List, Optional, Tuple
 
 import jax
@@ -88,6 +89,15 @@ def _residual_check(A, b, u, who):
     return u
 
 
+@partial(jax.jit, static_argnums=(2, 3))
+def _bicgstab_jacobi(A, b, tol, maxiter):
+    """The default steady-linear iteration, compiled. Split out of :func:`_solve_linear_matrix_free`
+    so the Krylov loop is one XLA program while the convergence check stays eager -- see there."""
+    from .utils.solver.linear import jacobi
+
+    return jax.scipy.sparse.linalg.bicgstab(lambda v: A @ v, b, tol=tol, atol=0.0, maxiter=maxiter, M=jacobi(A))[0]
+
+
 def _solve_linear_matrix_free(A, b, *, tol=1e-8, maxiter=20_000, shard=None):
     """Default steady-linear solve: matrix-free **Jacobi-preconditioned** BiCGStab on the BCOO operator.
 
@@ -107,7 +117,6 @@ def _solve_linear_matrix_free(A, b, *, tol=1e-8, maxiter=20_000, shard=None):
     (~1e-14). It is on by default because the alternative on a multi-device box is not a tuned
     single-device run, it is idle silicon. On one device it resolves to exactly the code below.
     """
-    from .utils.solver.linear import jacobi
     from .utils.solver.sharding import jacobi_from_diagonal, resolve_devices, sharded_solve
 
     devices = resolve_devices(shard)
@@ -119,8 +128,16 @@ def _solve_linear_matrix_free(A, b, *, tol=1e-8, maxiter=20_000, shard=None):
         u = sharded_solve(A, b, _bicgstab, devices, precond_fn=jacobi_from_diagonal)
         return _residual_check(A, b, u, "Jacobi-preconditioned BiCGStab (sharded)")
 
-    matvec = lambda v: A @ v
-    u, _info = jax.scipy.sparse.linalg.bicgstab(matvec, b, tol=tol, atol=0.0, maxiter=maxiter, M=jacobi(A))
+    # COMPILED iteration, EAGER guard. `jax.scipy.sparse.linalg.bicgstab` was called from eager
+    # Python, so every one of its hundreds of iterations paid dispatch: measured 102.9 ms against
+    # 6.4 ms for the identical computation under `jit` at n=13861 -- a 16x tax on every default solve,
+    # and the reason the solve time barely moved between n=4641 and n=51843 (it was dispatch-bound,
+    # not compute-bound).
+    #
+    # The guard stays OUTSIDE the jit deliberately. `_residual_check` needs a concrete residual, so
+    # wrapping the whole function would make it step aside and silently give up "raise rather than
+    # return garbage" in exchange for the speed. Split this way there is nothing to trade.
+    u = _bicgstab_jacobi(A, b, float(tol), int(maxiter))
     return _residual_check(A, b, u, "Jacobi-preconditioned BiCGStab")
 
 
