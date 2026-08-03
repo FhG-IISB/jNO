@@ -67,7 +67,17 @@ def main(argv: list[str]) -> None:
             rec = run_case(case, idx)
             if rec:
                 records.append(rec)
-    OUT.write_text(json.dumps(records, indent=2))
+    # MERGE with whatever is already on disk, keyed on (case, size). Overwriting would mean that
+    # re-running one case to check a fix silently discards every other case's numbers -- and the file
+    # still looks complete.
+    merged = {}
+    if OUT.exists():
+        for r in json.loads(OUT.read_text()):
+            merged[(r["case"], r["size_index"])] = r
+    for r in records:
+        merged[(r["case"], r["size_index"])] = r
+    OUT.write_text(json.dumps(sorted(merged.values(), key=lambda r: (r["case"], r["size_index"])), indent=2))
+
     ok = sum(1 for r in records if "failed" not in r)
     print(f"\n{ok}/{len(records)} cases succeeded in {time.perf_counter() - t0:.0f}s -> {OUT}")
 

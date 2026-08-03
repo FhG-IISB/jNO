@@ -77,11 +77,13 @@ def reaction2d(ms):
     return fem, {"nonlinear": jno.solve.newton()}
 
 
-def heat2d(ms):
-    """2-D TRANSIENT heat, 41 steps — the whole trajectory compiles into one scan."""
+def heat2d(ms, steps=201):
+    """2-D TRANSIENT heat — the whole trajectory compiles into one scan, so the cost is steps x
+    per-step solve while the compilation is paid once. Stepping is what makes this case solve-heavy;
+    refining the mesh alone would not."""
     from shapely.geometry import box
 
-    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=ms, time=(0.0, 0.2, 41))
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=ms, time=(0.0, 0.2, steps))
     u, v = d.fem_symbols()
     xi, yi, ti = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
@@ -148,15 +150,26 @@ def eddy3d(ms):
     return fem, {"linear": jno.solve.lu()}
 
 
-#: case -> (builder, mesh sizes, human label). Sizes chosen to span roughly a decade of DOFs.
+#: case -> (builder, mesh sizes, human label).
+#:
+#: Sized so the SOLVE carries the wall clock rather than the build. That is the regime worth
+#: measuring -- a problem small enough for a per-problem XLA compilation to dominate says more about
+#: the compiler than about the solver. Roughly a decade of DOFs per case, chosen to land each largest
+#: size in tens of seconds.
+#:
+#: Two cases are heavy for a reason other than mesh size. The transient runs 201 steps, because its
+#: cost is steps x per-step solve and the trajectory compiles into a single scan either way. The
+#: complex H(curl) case is solved directly and gets expensive fast: LU fill-in in 3-D was measured at
+#: 81x, and cuSolver fails outright somewhere above ~20k complex DOFs -- if the largest size here
+#: reports a failure, that ceiling is the finding, not a broken benchmark.
 CASES = {
-    "poisson2d": (poisson2d, (0.05, 0.02, 0.012), "2-D Poisson (P1)"),
-    "elastic2d": (elastic2d, (0.06, 0.03, 0.018), "2-D vector"),
-    "reaction2d": (reaction2d, (0.06, 0.03, 0.018), "2-D nonlinear (Newton)"),
-    "heat2d": (heat2d, (0.06, 0.03, 0.018), "2-D transient (41 steps)"),
-    "stokes2d": (stokes2d, (0.4, 0.25, 0.18), "2-D Stokes (Taylor-Hood)"),
-    "poisson3d": (poisson3d, (0.15, 0.11, 0.085), "3-D Poisson (tets)"),
-    "eddy3d": (eddy3d, (0.3, 0.22, 0.17), "3-D complex H(curl)"),
+    "poisson2d": (poisson2d, (0.008, 0.004, 0.0022), "2-D Poisson (P1)"),
+    "elastic2d": (elastic2d, (0.012, 0.006, 0.0035), "2-D vector"),
+    "reaction2d": (reaction2d, (0.012, 0.006, 0.0035), "2-D nonlinear (Newton)"),
+    "heat2d": (heat2d, (0.02, 0.012, 0.008), "2-D transient (201 steps)"),
+    "stokes2d": (stokes2d, (0.09, 0.06, 0.05), "2-D Stokes (Taylor-Hood)"),
+    "poisson3d": (poisson3d, (0.05, 0.038, 0.03), "3-D Poisson (tets)"),
+    "eddy3d": (eddy3d, (0.16, 0.12, 0.095), "3-D complex H(curl)"),
 }
 
 
