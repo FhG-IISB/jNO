@@ -105,3 +105,51 @@ def test_fem_steady_linear_default_is_sparse_direct():
     A = jnp.asarray(A0.todense() if hasattr(A0, "todense") else A0)
     b = jnp.asarray(fem.operator[1]).reshape(-1)
     assert np.allclose(x, np.asarray(jnp.linalg.solve(A, b)), atol=1e-9)
+
+
+def test_sparse_lu_is_one_compiled_program():
+    """The triplets-to-CSR conversion in front of ``spsolve`` -- a lexsort, two gathers and a
+    ``searchsorted`` -- used to run uncompiled, so each primitive became its own XLA module: ~43 of
+    them. On a Morley (C1) problem, whose 4th-order system needs the sparse-direct path, that was
+    1520 ms of a 1751 ms first solve, 87% of it spent compiling fragments of an index conversion. It
+    was never Morley-specific: every ``jno.solve.lu()``, the 1-D default and every non-nodal solve
+    goes through here.
+
+    Pins the property rather than the timing: one program on first call, none on the second, and the
+    conversion is shape-keyed so a same-shaped problem reuses it.
+    """
+    import jax._src.compiler as _compiler
+
+    from jno.utils.solver.linear import sparse_lu_solve
+
+    rng = np.random.default_rng(0)
+    n = 60
+    Ad = rng.standard_normal((n, n)) + n * np.eye(n)
+    A = jsp.BCOO.fromdense(jnp.asarray(Ad))
+    b = jnp.asarray(rng.standard_normal(n))
+
+    count = {"n": 0}
+    orig = _compiler.compile_or_get_cached
+
+    def counting(*a, **kw):
+        count["n"] += 1
+        return orig(*a, **kw)
+
+    _compiler.compile_or_get_cached = counting
+    try:
+        x1 = np.asarray(sparse_lu_solve(A, b))
+        first = count["n"]
+        x2 = np.asarray(sparse_lu_solve(A, b))
+        second = count["n"] - first
+        # a DIFFERENT operator of the same shape must reuse the compilation
+        A2 = jsp.BCOO.fromdense(jnp.asarray(rng.standard_normal((n, n)) + n * np.eye(n)))
+        np.asarray(sparse_lu_solve(A2, b))
+        third = count["n"] - first - second
+    finally:
+        _compiler.compile_or_get_cached = orig
+
+    assert first <= 2, f"the conversion compiled {first} programs -- it is meant to be one"
+    assert second == 0, "a repeated solve recompiled"
+    assert third == 0, "a same-shaped operator recompiled -- the conversion is not shape-keyed"
+    assert np.allclose(x1, np.linalg.solve(Ad, np.asarray(b)), atol=1e-8)
+    assert np.allclose(x1, x2)

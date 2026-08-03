@@ -13,6 +13,7 @@ Users always remain free to extract ``fem.operator`` and pass their own ``solve_
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 from jax.experimental.sparse.linalg import spsolve
 
@@ -42,20 +43,21 @@ def jacobi(A):
     return lambda x: inv * x
 
 
-def sparse_lu_solve(A, b):
-    """Differentiable sparse-direct solve ``A x = b`` via JAX's ``spsolve`` (cuSolver GPU / native CPU).
+@jax.jit
+def _sparse_lu_solve(A, b):
+    """The triplets-to-CSR conversion and the ``spsolve`` itself, as ONE compiled program.
 
-    ``A`` is a BCOO (or dense) operator. ``jit``-compatible and reverse-mode differentiable in both
-    ``A``'s stored values and ``b`` -- no external dependency, no hand-written factorisation. Returns a
-    solution containing ``NaN`` (rather than raising) for a singular ``A``; wrap it in a residual check
-    if you need a hard failure. Drop-in for the ``(A, b) -> u`` solver contract of ``fem.solve``.
+    Left uncompiled, this ran as ~43 separately compiled single-primitive programs -- the lexsort, the
+    gathers, the ``searchsorted``, each its own XLA module. On a Morley (C1) problem, whose 4th-order
+    system needs the sparse-direct path, that was **1520 ms of the 1751 ms first solve**: 87% of the
+    solve spent compiling fragments of a conversion. It is not a Morley problem -- every
+    ``jno.solve.lu()``, the 1-D default and every non-nodal solve goes through here.
+
+    Module level and array-only, so ``jax.jit`` keys on shapes and hits across calls and across
+    problems of the same size; under an enclosing trace it simply inlines.
     """
-    import jax.experimental.sparse as jsp
-
     b = jnp.asarray(b).reshape(-1)
     n = b.shape[0]
-    if not (hasattr(A, "indices") and hasattr(A, "sum_duplicates")):
-        A = jsp.BCOO.fromdense(jnp.asarray(A))
     A = A.sum_duplicates(nse=A.nse)  # static nse -> jit-safe; merges any repeated (i, j) entries
     idx = A.indices
     order = jnp.lexsort((idx[:, 1], idx[:, 0]))  # CSR ordering: by row, then column
@@ -64,3 +66,21 @@ def sparse_lu_solve(A, b):
     data = A.data[order]
     indptr = jnp.searchsorted(rows, jnp.arange(n + 1, dtype=rows.dtype)).astype(jnp.int32)
     return spsolve(data, cols, indptr, b)
+
+
+def sparse_lu_solve(A, b):
+    """Differentiable sparse-direct solve ``A x = b`` via JAX's ``spsolve`` (cuSolver GPU / native CPU).
+
+    ``A`` is a BCOO (or dense) operator. ``jit``-compatible and reverse-mode differentiable in both
+    ``A``'s stored values and ``b`` -- no external dependency, no hand-written factorisation. Returns a
+    solution containing ``NaN`` (rather than raising) for a singular ``A``; wrap it in a residual check
+    if you need a hard failure. Drop-in for the ``(A, b) -> u`` solver contract of ``fem.solve``.
+
+    The densification of a non-sparse ``A`` stays out here: it needs a concrete ``nse``, so it cannot
+    live inside the compiled body (see :func:`_sparse_lu_solve`).
+    """
+    import jax.experimental.sparse as jsp
+
+    if not (hasattr(A, "indices") and hasattr(A, "sum_duplicates")):
+        A = jsp.BCOO.fromdense(jnp.asarray(A))
+    return _sparse_lu_solve(A, b)
