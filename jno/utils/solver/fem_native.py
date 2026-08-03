@@ -1305,19 +1305,41 @@ def assemble_fem_native(
     # `lax.map(..., batch_size=C)` vmaps C cells at a time and scans over the chunks, so the batched
     # intermediate is capped at C cells regardless of mesh size. Remainders are handled (verified at
     # several non-dividing C) and gradients match the unchunked form exactly.
-    _CHUNK_BUDGET_BYTES = 16 << 20
+    # Sized in CELLS, capped in bytes. GPU saturation depends on how many independent work items a
+    # chunk has, not on how many bytes it occupies, so a pure byte budget starves the device as soon as
+    # the per-cell block grows (P2/P3, vector fields). Swept on an RTX 3070 at 97824 cells, measuring
+    # the full solve rather than the assembly alone:
+    #
+    #   cells/chunk   2048    4096    8192   16384   32768   unchunked
+    #   solve peak   287.6   256.0   273.6   279.5   378.6     801.8 MiB
+    #   jacobian      6.08    4.51    3.81    3.69    3.50      3.24 ms
+    #
+    # The cliff is between "chunked at all" and "not": one chunk costs 802 MiB, any split more than
+    # halves it. Below ~8k cells the device runs dry and the assembly nearly doubles in time, while
+    # above ~16k the extra memory buys almost no speed. Note the peak is NOT monotonic in chunk size --
+    # 2048 cells is worse than 4096 -- so "smaller is safer" would have been the wrong instinct.
+    #
+    # 16384 cells is the chosen operating point: near the memory floor, within 15% of the unchunked
+    # assembly time. The byte cap only binds for large per-cell blocks, and the cell floor then keeps
+    # the chunk from collapsing below saturation -- there, exceeding the byte budget is the better
+    # trade, because the alternative is a ~2x slowdown.
+    _CHUNK_TARGET_CELLS = 16384
+    _CHUNK_MAX_BYTES = 8 << 20
+    _CHUNK_MIN_CELLS = 8192  # saturation floor: below this the GPU runs dry
 
     def _cell_chunk(n_items: int, n_test: int, n_local: int):
         """Cells per chunk, or ``None`` to keep the plain single `vmap`.
 
-        Sized by the per-cell element block *including its AD tangent* (`n_test * n_local**2`), which is
-        the jacobian's dominant intermediate. The residual's is smaller, so it gets chunked somewhat
-        more finely than it strictly needs -- a deliberate simplification: one policy, one explanation,
-        and the cost of an extra chunk is a scan step, not a re-computation."""
+        The per-cell cost is the element block *including its AD tangent* (`n_test * n_local**2`), the
+        jacobian's dominant intermediate. The residual's is smaller, so it gets chunked somewhat more
+        finely than it strictly needs -- a deliberate simplification: one policy, one explanation, and
+        the cost of an extra chunk is a scan step, not a re-computation."""
         per = max(1, int(n_test) * int(n_local) * int(n_local) * 8)
-        if n_items * per <= _CHUNK_BUDGET_BYTES:
-            return None  # small enough that chunking would only cost scan overhead
-        return max(1, min(int(n_items), _CHUNK_BUDGET_BYTES // per))
+        chunk = min(_CHUNK_TARGET_CELLS, max(1, _CHUNK_MAX_BYTES // per))
+        chunk = max(chunk, _CHUNK_MIN_CELLS)  # never starve the device to honour the byte cap
+        if n_items <= chunk:
+            return None  # one chunk anyway -- skip the scan overhead entirely
+        return int(chunk)
 
     def _elem_map(fn, xs, chunk):
         """``vmap(fn)`` over the leading axis, in chunks of ``chunk`` when one is set."""
