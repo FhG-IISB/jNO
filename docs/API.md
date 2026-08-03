@@ -277,6 +277,30 @@ These combinations stay **eager**, and are correct but not accelerated:
 | a bare callable in either slot | jNO knows nothing about it, so it makes no assumption |
 | a multi-device (`shard=`) solve | already compiles itself, with the operator partitioned |
 
+### First-run compilation cost
+
+Compiling is not free the first time. Building a 13.8k-DOF 2-D Poisson problem issues ~209 XLA
+compilations totalling ~3.7 s — assembly evaluates reference-element expressions whose every distinct
+operation and shape is its own small program. The cost is paid **once per distinct mesh shape**, and
+it is cached within a process: rebuilding the same problem costs ~320 ms, and rebuilding with freshly
+constructed term objects costs the same (the cache is keyed on shapes, not on object identity). A
+*different* mesh pays it again, so a remeshing loop (`fem.adapt`, a refinement study) pays it per
+iteration.
+
+Across **separate processes** — running a script twice, a test suite, CI — nothing is reused by
+default. JAX can persist compilations to disk, which takes the same build from 4757 ms to 1143 ms
+(measured, 214 entries, 932 KB):
+
+```python
+import jax
+jax.config.update("jax_compilation_cache_dir", "~/.cache/jax")
+jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)  # REQUIRED here
+```
+
+The second line is not optional for this workload: the default threshold is 1.0 s and every one of
+these compilations is far below it, so with the cache directory alone nothing is ever written. jNO
+does not set either of these for you — a library should not start writing to a user's disk uninvited.
+
 **Preconditioners** (`jno.precond`, for the iterative solvers): `jacobi`, `chebyshev`,
 `nystrom` (randomized low-rank — the rung between `jacobi` and multigrid),
 `amg` (algebraic multigrid), `gmg` (geometric multigrid — a structured-grid V-cycle),
