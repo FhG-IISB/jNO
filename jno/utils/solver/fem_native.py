@@ -1295,6 +1295,36 @@ def assemble_fem_native(
                 surface_work.append((region, np.asarray(face_ids, dtype=np.int32), btyped))
         return typed_with_masks, surface_work
 
+    # --- element-loop chunking -----------------------------------------------------------------
+    # A single `vmap` over every cell materialises the whole batched intermediate at once, and on a 3-D
+    # mesh that intermediate -- not the assembled operator -- is what sets the memory ceiling. Measured
+    # on a 31k-DOF 3-D nonlinear problem: the jacfwd tangent tensor `f64[n_cells, 4, 4, 4]` was 82.2 MiB
+    # against a 6.8 MiB operator, and the residual's own temp (182 MiB) is the unit every other cost is
+    # a multiple of -- each Krylov matvec, and the linearization the matrix-free inner solve holds live.
+    #
+    # `lax.map(..., batch_size=C)` vmaps C cells at a time and scans over the chunks, so the batched
+    # intermediate is capped at C cells regardless of mesh size. Remainders are handled (verified at
+    # several non-dividing C) and gradients match the unchunked form exactly.
+    _CHUNK_BUDGET_BYTES = 16 << 20
+
+    def _cell_chunk(n_items: int, n_test: int, n_local: int):
+        """Cells per chunk, or ``None`` to keep the plain single `vmap`.
+
+        Sized by the per-cell element block *including its AD tangent* (`n_test * n_local**2`), which is
+        the jacobian's dominant intermediate. The residual's is smaller, so it gets chunked somewhat
+        more finely than it strictly needs -- a deliberate simplification: one policy, one explanation,
+        and the cost of an extra chunk is a scan step, not a re-computation."""
+        per = max(1, int(n_test) * int(n_local) * int(n_local) * 8)
+        if n_items * per <= _CHUNK_BUDGET_BYTES:
+            return None  # small enough that chunking would only cost scan overhead
+        return max(1, min(int(n_items), _CHUNK_BUDGET_BYTES // per))
+
+    def _elem_map(fn, xs, chunk):
+        """``vmap(fn)`` over the leading axis, in chunks of ``chunk`` when one is set."""
+        if chunk is None:
+            return jax.vmap(fn)(*xs)
+        return jax.lax.map(lambda z: fn(*z), xs, batch_size=int(chunk))
+
     def _make_residual(terms, bterms=None):
         """Build the free global residual ``R(u_flat) -> (total,)`` (volume + optional surface).
 
@@ -1309,9 +1339,11 @@ def assemble_fem_native(
             pts_dyn = _apply_coord_params(pts_j, args)  # trainable coords -> differentiable geometry
 
             for coeff, tfi, rnames in typed_with_masks:
-                elem = jax.vmap(
-                    lambda c, la, _e=coeff, _t=tfi, _r=rnames: _vol_elem_res(c, la, _e, _t, _r, t, args, pts_dyn)
-                )(jnp.arange(n_cells), local_all)
+                elem = _elem_map(
+                    lambda c, la, _e=coeff, _t=tfi, _r=rnames: _vol_elem_res(c, la, _e, _t, _r, t, args, pts_dyn),
+                    (jnp.arange(n_cells), local_all),
+                    _cell_chunk(n_cells, cdofs[tfi].shape[1], cell_all_dofs.shape[1]),
+                )
                 R = R.at[cdofs[tfi].reshape(-1)].add(elem.reshape(-1))
 
             normals_dyn = _surface_normals(pts_dyn)  # differentiable facet normals under coordinate motion
@@ -1320,11 +1352,13 @@ def assemble_fem_native(
                 pcells = parent_j[fids]
                 lv = u_flat[cell_all_dofs[pcells]]  # (n_face, n_local_all)
                 for bcoeff, btfi in btyped:
-                    contribs = jax.vmap(
+                    contribs = _elem_map(
                         lambda fi, la, _e=bcoeff, _t=btfi, _r=region: _surf_elem_res(
                             fi, la, _e, _t, _r, t, args, pts_dyn, normals_dyn
-                        )
-                    )(fids, lv)
+                        ),
+                        (fids, lv),
+                        _cell_chunk(int(fids.shape[0]), cdofs[btfi].shape[1], cell_all_dofs.shape[1]),
+                    )
                     R = R.at[cdofs[btfi][pcells].reshape(-1)].add(contribs.reshape(-1))
             return R
 
@@ -1410,7 +1444,11 @@ def assemble_fem_native(
                 def _ke(c, la, _e=coeff, _t=tfi, _r=rnames, _p=pts_dyn):
                     return jax.jacfwd(lambda v: _vol_elem_res(c, v, _e, _t, _r, t, args, _p))(la)
 
-                Ke = jax.vmap(_ke)(jnp.arange(n_cells), local_all)  # (n_cell, n_test_tfi, n_local_all)
+                Ke = _elem_map(  # (n_cell, n_test_tfi, n_local_all)
+                    _ke,
+                    (jnp.arange(n_cells), local_all),
+                    _cell_chunk(n_cells, cdofs[tfi].shape[1], cell_all_dofs.shape[1]),
+                )
                 _emit(
                     Ke.reshape(-1),
                     lambda _K=Ke, _t=tfi: jnp.broadcast_to(cdofs[_t][:, :, None], _K.shape).reshape(-1),
@@ -1428,7 +1466,11 @@ def assemble_fem_native(
                     def _kef(fi, la, _e=bcoeff, _t=btfi, _r=region, _p=pts_dyn, _n=normals_dyn):
                         return jax.jacfwd(lambda v: _surf_elem_res(fi, v, _e, _t, _r, t, args, _p, _n))(la)
 
-                    Kef = jax.vmap(_kef)(fids, lv)  # (n_face, n_test_btfi, n_local_all)
+                    Kef = _elem_map(  # (n_face, n_test_btfi, n_local_all)
+                        _kef,
+                        (fids, lv),
+                        _cell_chunk(int(fids.shape[0]), cdofs[btfi].shape[1], cell_all_dofs.shape[1]),
+                    )
                     _emit(
                         Kef.reshape(-1),
                         lambda _K=Kef, _t=btfi, _p=pcells: jnp.broadcast_to(cdofs[_t][_p][:, :, None], _K.shape).reshape(
