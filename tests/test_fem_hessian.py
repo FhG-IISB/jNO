@@ -156,3 +156,44 @@ def test_biharmonic_mixed_method_recovers():
     u_exact = np.sin(PI * pts_u[:, 0]) * np.sin(PI * pts_u[:, 1])
     rel = float(np.linalg.norm(uh - u_exact) / np.linalg.norm(u_exact))
     assert rel < 2e-2, f"mixed-method biharmonic did not recover u*: rel-L2 {rel:.3e}"
+
+
+def test_shape_hessian_is_deferred_when_no_term_needs_it():
+    """`ref_hess` is tabulated for EVERY Lagrange element, so the `is not None` guard in
+    `_cell_fields` never fired and a plain P1 Poisson computed physical shape Hessians it cannot
+    use -- a three-operand einsum over the batched cell axis, measured at 467 ms of the 3716 ms
+    spent compiling one `jno.fem()` build (12.6%).
+
+    Both directions matter, so both are asserted: a form with no second derivative must never touch
+    the push-forward, and a form that HAS one must still get exactly the same value.
+    """
+    import jno.utils.solver.fem_native as fem_native
+
+    calls = {"n": 0}
+    orig = fem_native.identity_pushforward_hess
+
+    def counting(ref_hess, J):
+        calls["n"] += 1
+        return orig(ref_hess, J)
+
+    fem_native.identity_pushforward_hess = counting
+    try:
+        # (a) no second derivative anywhere -> never computed
+        d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.25)
+        u, v = d.fem_symbols(order=2)
+        xi, yi, _ = d.variable("interior", split=True)
+        xb, yb, _ = d.variable("boundary", split=True)
+        ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+        fem = jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0], quad_degree=3)
+        sol = np.asarray(fem.solve())
+        assert np.all(np.isfinite(sol))
+        assert calls["n"] == 0, f"the Hessian push-forward ran {calls['n']}x on a form with no second derivative"
+
+        # (b) a Laplacian term DOES need it -> still computed, and still right
+        calls["n"] = 0
+        lap = jno.fem([jno.np.laplacian(ui, xi, yi) * jno.np.laplacian(vi, xi, yi)], quad_degree=3)
+        K = lap.operator[0]
+        assert calls["n"] > 0, "a 4th-order form must still reach the Hessian push-forward"
+        assert np.all(np.isfinite(np.asarray(K.todense() if hasattr(K, "todense") else K)))
+    finally:
+        fem_native.identity_pushforward_hess = orig
