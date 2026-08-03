@@ -160,3 +160,59 @@ def test_cached_forwards_prepare_hook():
     inner = _WithPrepare()
     prepare_precond(jno.precond.cached(inner), fem=object())  # prepare_precond no-ops on fem=None
     assert inner.prepared  # the eager build hook is forwarded to the wrapped spec
+
+
+def test_frozen_cache_reaches_the_compiled_path_once_built():
+    """`.cached()` is the recipe for many-iteration work -- a transient run or a Newton loop, where
+    one preconditioner serves every step. It inherited `traceable = False`, so it stayed on the eager
+    path on exactly the workloads with the most preconditioner applications to dispatch.
+
+    A frozen cache that has already built does no setup at all -- `materialize` hands back the stored
+    applier -- so it can be materialised inside a trace. The first solve still runs eager (it has to,
+    to build); every solve after it can compile. `refresh=` variants are excluded because they key on
+    the operator and may rebuild through the inner spec, which for amg/ams/form is host-side work.
+    """
+    from jno.utils.solver.solver_api import PrecondContext, _compilable, materialize_precond
+
+    op, _ = _op()
+    lin = jno.solve.cg(tol=1e-10)
+
+    spec = jno.precond.jacobi().cached()
+    assert spec.traceable is False, "an unbuilt cache has nothing stored yet"
+    assert spec.key is None
+    assert not _compilable(lin, spec)
+
+    materialize_precond(spec, PrecondContext(op, None))  # the first (eager) solve builds it
+    assert spec.traceable is True, "a frozen, built cache materialises to a stored applier"
+    assert spec.key is not None
+    assert _compilable(lin, spec), "a built frozen cache must be able to compile -- that is the point"
+
+    # refresh= keys on the operator and may rebuild host-side, so it must never claim traceability
+    for refresh in (True, lambda ctx: 1):
+        r = jno.precond.jacobi().cached(refresh=refresh)
+        materialize_precond(r, PrecondContext(op, None))
+        assert r.traceable is False, f"cached(refresh={refresh!r}) must stay eager"
+        assert not _compilable(lin, r)
+
+
+def test_compiled_cached_precond_gives_the_same_answer():
+    """Compiling the solve around a frozen cache must not change what it returns."""
+    import numpy as np
+    from shapely.geometry import box
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.15)
+    u, v = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    f = 2.0 * (xi * (1.0 - xi) + yi * (1.0 - yi))
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+
+    ref = np.asarray(fem.solve(linear=jno.solve.lu()))
+    spec = jno.precond.jacobi().cached()
+    lin = jno.solve.cg(tol=1e-12, maxiter=5000)
+    first = np.asarray(fem.solve(linear=lin, precond=spec))  # eager: builds the cache
+    second = np.asarray(fem.solve(linear=lin, precond=spec))  # compiled: reuses it
+    assert np.abs(first - ref).max() < 1e-8
+    assert np.abs(second - ref).max() < 1e-8
+    assert np.abs(second - first).max() < 1e-10

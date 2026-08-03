@@ -960,6 +960,29 @@ class _Cached(_Spec):
         self._applier = None
         self._key = _MISS
 
+    @property
+    def traceable(self):
+        """A **frozen** cache that has already built does no setup at all -- :meth:`materialize` hands
+        back the stored applier -- so it can be materialised inside a trace, and the solve around it
+        can be compiled.
+
+        This is the case that matters for many-iteration work. ``.cached()`` is the recipe for a
+        transient run or a Newton loop, where the same preconditioner serves every step; leaving it on
+        the eager path meant dispatching the applier op by op on exactly the workloads with the most
+        applications to dispatch. The first solve still runs eager (it has to, to build); every solve
+        after it compiles.
+
+        ``refresh=`` is excluded: those variants key on the operator and may rebuild through the inner
+        spec, which for ``amg``/``ams``/``form`` is host-side work that no trace can run.
+        """
+        return self.refresh is False and self._applier is not None
+
+    @property
+    def key(self):
+        """The stored applier IS the compilation, so its identity is the key. ``self`` holds it, so the
+        ``id`` cannot be recycled while this spec is alive."""
+        return (type(self), id(self._applier)) if self.traceable else None
+
     def cached(self, *, refresh: bool = False):
         return self  # already cached — .cached() is idempotent (no double-wrapping)
 
