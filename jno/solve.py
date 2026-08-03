@@ -80,6 +80,9 @@ def lu() -> LinearSolver:
         # nse, which does not exist under jit/vmap tracing
         return jnp.linalg.solve(op.dense(), b)
 
+    # No `key`, so the composer leaves this on the eager path. What compiling the composed solve buys
+    # is the removal of per-ITERATION Python dispatch; a direct solver issues one `spsolve` and has
+    # none to remove, so it would pay a compile for nothing.
     return LinearSolver(_fn, name="lu", direct=True, traits={"vmap": "no"})
 
 
@@ -94,7 +97,7 @@ def dense() -> LinearSolver:
     def _fn(op: LinearOperator, b, *, M, x0):
         return jnp.linalg.solve(op.dense(), b)
 
-    return LinearSolver(_fn, name="dense", direct=True)
+    return LinearSolver(_fn, name="dense", direct=True)  # one LAPACK call: no iteration to compile away
 
 
 def _krylov(name: str, tol: float, atol: float, maxiter: Optional[int], **fixed):
@@ -103,7 +106,9 @@ def _krylov(name: str, tol: float, atol: float, maxiter: Optional[int], **fixed)
         x, _info = method(op.mv, b, x0=x0, tol=tol, atol=atol, maxiter=maxiter, M=M, **fixed)
         return _maybe_residual_check(op, b, x, name)
 
-    return LinearSolver(_fn, name=name)
+    # `key` must name every argument that changes the iteration -- see LinearSolver. `fixed` is
+    # per-method extra configuration (GMRES's restart), so it goes in sorted rather than by position.
+    return LinearSolver(_fn, name=name, key=(tol, atol, maxiter, tuple(sorted(fixed.items()))))
 
 
 def cg(*, tol: float = 1e-8, atol: float = 0.0, maxiter: Optional[int] = 20_000) -> LinearSolver:
@@ -167,7 +172,7 @@ def fgmres(*, tol: float = 1e-8, restart: int = 30, maxiter: int = 1000) -> Line
         raw = lambda mv, rhs, M, x0: _raw(mv, rhs, M=M, x0=x0, tol=tol, restart=restart, maxiter=maxiter)
         return _firewalled(raw, op, b, M=M, x0=x0, symmetric=False, name="fgmres")
 
-    return LinearSolver(_fn, name="fgmres")
+    return LinearSolver(_fn, name="fgmres", key=(tol, restart, maxiter))
 
 
 def minres(*, tol: float = 1e-8, maxiter: int = 2000) -> LinearSolver:
@@ -183,7 +188,7 @@ def minres(*, tol: float = 1e-8, maxiter: int = 2000) -> LinearSolver:
         raw = lambda mv, rhs, M, x0: _raw(mv, rhs, M=M, x0=x0, tol=tol, maxiter=maxiter)
         return _firewalled(raw, op, b, M=M, x0=x0, symmetric=True, name="minres")
 
-    return LinearSolver(_fn, name="minres")
+    return LinearSolver(_fn, name="minres", key=(tol, maxiter))
 
 
 def chebyshev(
@@ -224,7 +229,10 @@ def chebyshev(
         raw = lambda mv, rhs, M, x0: chebyshev_iteration(mv, rhs, lmin=lo, lmax=hi, M=M, x0=x0, tol=tol, maxiter=maxiter)
         return _firewalled(raw, op, b, M=M, x0=x0, symmetric=True, name="chebyshev")
 
-    return LinearSolver(_fn, name="chebyshev")
+    # `jit: False` -- `spectrum_bounds` measures the spectrum and then branches on what it measured
+    # (a collapsed or inverted Lanczos interval is rejected), which a tracer cannot answer. Passing
+    # explicit lmin=/lmax= does not change that: the same code path still validates them.
+    return LinearSolver(_fn, name="chebyshev", traits={"jit": False})
 
 
 def _require_jaxamg():
@@ -287,7 +295,10 @@ def amg(
         return jnp.asarray(x).reshape(-1)
 
     # AmgX owns the solve; treat as direct (no outer preconditioner). vmap left "no" (AmgX/MPI primitive
-    # is not a pure-JAX batching op) — loop for batched solves.
+    # is not a pure-JAX batching op) — loop for batched solves. No `key`, so the composer keeps this
+    # eager: AmgX builds its hierarchy from the matrix VALUES, and whether that setup survives a tracer
+    # is unverified here (jaxamg needs a GPU + AmgX, absent from this environment). Nothing is lost —
+    # the solve is one AmgX call, with no per-iteration Python dispatch to compile away.
     return LinearSolver(_fn, name="amg", direct=True, traits={"vmap": "no"})
 
 
