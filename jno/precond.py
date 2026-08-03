@@ -52,6 +52,14 @@ __all__ = [
 class _Spec:
     """Base for ``jno.precond.*`` specs — gives every preconditioner a fluent ``.cached()``.
 
+    ``complex_ok`` declares that a spec can be applied to a **complex** operator directly. It is read
+    where a consumer would otherwise have to reformulate: AMS splits each complex auxiliary into the
+    real-equivalent 2n block ``[[Re,-Im],[Im,Re]]`` because AmgX-style multigrid is real-only, and that
+    block is skew-dominated by construction (measured ‖A-Aᵀ‖/‖A‖ = 2.0), which destroys algebraic
+    multigrid — smoothed aggregation diverged to 1e+20 on it. The underlying complex operator is
+    complex-SYMMETRIC (8e-17), where the same solver converges in 5-7 iterations. So a complex-capable
+    aux must be able to say so and skip the reformulation.
+
     Two class-level declarations decide whether a spec can ride the *compiled* slot path (see
     :func:`jno.utils.solver.solver_api.compose_linear_solve_fn`); both default to the conservative
     answer, so a new preconditioner is correct-but-eager until it says otherwise.
@@ -69,6 +77,7 @@ class _Spec:
 
     traceable = False
     key = None
+    complex_ok = False  # conservative: a consumer reformulates unless the spec says it takes complex
 
     def cached(self, *, refresh: bool = False):
         """Wrap this preconditioner so its setup is built **once** and reused across solves — the
@@ -90,6 +99,7 @@ class _Jacobi(_Spec):
 
     traceable = True  # the diagonal comes off the traced operator; nothing is assembled host-side
     key = ("jacobi",)  # no parameters, so every jacobi() is the same preconditioner
+    complex_ok = True  # a diagonal scaling is dtype-agnostic
 
     def materialize(self, ctx: PrecondContext):
         d = ctx.diag()
@@ -486,6 +496,10 @@ class _AMG(_Spec):
     slower, despite needing an order of magnitude fewer iterations.
     """
 
+    #: pyamg builds and solves complex hierarchies natively -- unlike AmgX, which is real-only. That
+    #: difference is what lets an AMS complex auxiliary skip the 2n reformulation; see :class:`_Spec`.
+    complex_ok = True
+
     def __init__(self, cycles, max_levels, coarse_size, smoother_degree):
         self.cycles = cycles
         self.max_levels = max_levels
@@ -628,7 +642,9 @@ class _AMS(_Spec):
         """
         if self._frozen is None or self._G is None:
             return False
-        return self.aux is None or bool(getattr(self.aux, "traits", {}).get("jit", False))
+        if self.aux is None or isinstance(self.aux, _AMG):
+            return True  # both are applied through OUR pure_callback wrapper, which jit supports
+        return bool(getattr(self.aux, "traits", {}).get("jit", False))
 
     @property
     def key(self):
@@ -765,20 +781,31 @@ class _AMS(_Spec):
         # every interior node, hence singular — so the aux solve returned garbage and the outer Krylov
         # stalled at residual ~1 with no error. Inverting the FULL complex A_G fixes both; on the eddy case
         # it is algebraically identical to the old form (solving [[0,-R],[R,0]] gives exactly -j·R⁻¹).
+        # ... UNLESS the aux takes complex directly, in which case the reformulation is not merely
+        # unnecessary but actively harmful. The 2n block is skew-dominated by construction -- with the
+        # mass term jω(σ+ε) dominating, ‖A-Aᵀ‖/‖A‖ measures 2.0 -- and algebraic multigrid falls over
+        # on it: smoothed aggregation diverged to 1e+20, `air_solver` made no progress at all, and
+        # Ruge-Stuben returned NaN, on the very blocks whose COMPLEX form is exactly complex-symmetric
+        # (8e-17) and converges in 5-7 iterations. A complex-capable aux therefore gets the complex
+        # blocks untouched; a real-only one (AmgX) still gets the 2n form.
+        aux_takes_complex = bool(getattr(self.aux, "complex_ok", False))
+
         def _real_block(M):  # complex M -> (LinearOperator, scipy CSR) of its real-equivalent 2n block
             return to_op(sp.bmat([[M.real, -M.imag], [M.imag, M.real]]).tocsr())
 
+        block = to_op if aux_takes_complex else _real_block
         b_ops, b_csrs, nvs = [], [], []
         for P in Pi_sp:
             Ap = pin0((P.T @ A_sp @ P).tocsr())
-            op, csr = _real_block(Ap)
+            op, csr = block(Ap)
             b_ops.append(op)
             b_csrs.append(csr)
             nvs.append(Ap.shape[0])
         A_Gp = pin0(A_G)
-        rg_op, rg_csr = _real_block(A_Gp)
+        rg_op, rg_csr = block(A_Gp)
         return {
             "complex": True,
+            "aux_complex": aux_takes_complex,
             "rg_op": rg_op,
             "rg_csr": rg_csr,
             "rg_nv": int(A_Gp.shape[0]),
@@ -820,8 +847,44 @@ class _AMS(_Spec):
 
             return make
 
-        # A user-supplied ``aux`` (e.g. ``jno.solve.amg()`` → jaxamg on the GPU, or a custom solver): call
-        # it per apply. A one-shot solver re-runs its own setup each iteration; to amortize a jaxamg
+        if isinstance(aux, _AMG):
+            # ``aux=jno.precond.amg()`` -- an AMG hierarchy AS the auxiliary solver. Built once per
+            # block here (``make`` is called once per block) and applied per iteration, which is the
+            # whole point: a one-shot solver would re-run setup on every Krylov iteration.
+            #
+            # This is the auxiliary that makes complex AMS cheap. A plain Krylov aux stalls -- cg at
+            # 7.6e-4 and bicgstab at 5.8e-4 relative residual, IDENTICALLY at aux tolerances 1e-3 and
+            # 1e-6, so the tolerance was never the limiter -- while AMG on the (complex, unreformulated)
+            # blocks converges in 5-7 iterations. pyamg's own solve is used rather than the JAX V-cycle
+            # in ``utils.solver.amg`` because that one smooths with Chebyshev, which needs real spectral
+            # bounds and has no meaning on a complex-symmetric spectrum. Applied through
+            # ``pure_callback`` for the same reason the default SuperLU aux is: forward-only, and the
+            # preconditioner is never differentiated.
+            import jax
+            import numpy as np
+
+            def make(op, csr):
+                import pyamg
+
+                ml = pyamg.smoothed_aggregation_solver(csr.tocsr(), max_levels=aux.max_levels)
+                n = int(csr.shape[0])
+
+                def solve(rhs):
+                    rhs = jnp.asarray(rhs)
+
+                    def _host(b):
+                        b = np.asarray(b)
+                        x = ml.solve(b, tol=1e-10, maxiter=50, accel="bicgstab")
+                        return np.asarray(x, dtype=b.dtype)
+
+                    return jax.pure_callback(_host, jax.ShapeDtypeStruct((n,), rhs.dtype), rhs)
+
+                return solve
+
+            return make
+
+        # Any other ``aux`` (e.g. ``jno.solve.amg()`` → jaxamg on the GPU, or a custom callable): call it
+        # per apply. A one-shot solver re-runs its own setup each iteration; to amortize a jaxamg
         # hierarchy across the Krylov loop it needs a setup-once handle (a jaxamg AmgX setup/solve split) —
         # wire that here once exposed. ``csr`` is unused on this path.
         return lambda op, csr: lambda rhs: aux(op, rhs)
@@ -849,16 +912,28 @@ class _AMS(_Spec):
             solve_rg = make(f["rg_op"], f["rg_csr"])
             solve_bs = [make(op, csr) for op, csr in zip(f["b_ops"], f["b_csrs"])]
 
-            def apply(r):
-                x = dinv * r
-                rg = (GT @ r).at[0].set(0.0)
-                sg = solve_rg(jnp.concatenate([jnp.real(rg), jnp.imag(rg)]))  # full complex A_G, real 2n block
-                x = x + G @ (sg[:rg_nv] + 1j * sg[rg_nv:])  # gradient-space correction
-                for P, PT, solve_b, nv in zip(Pis, PisT, solve_bs, nvs):
-                    rp = (PT @ r).at[0].set(0.0)
-                    s = solve_b(jnp.concatenate([jnp.real(rp), jnp.imag(rp)]))  # real 2n-block solve
-                    x = x + P @ (s[:nv] + 1j * s[nv:])
-                return x
+            if f.get("aux_complex"):
+                # The aux takes complex, so the auxiliaries were never split -- no packing, and the
+                # solve sees the complex-symmetric operator multigrid can actually coarsen.
+                def apply(r):
+                    x = dinv * r
+                    x = x + G @ solve_rg((GT @ r).at[0].set(0.0))
+                    for P, PT, solve_b in zip(Pis, PisT, solve_bs):
+                        x = x + P @ solve_b((PT @ r).at[0].set(0.0))
+                    return x
+
+            else:
+
+                def apply(r):
+                    x = dinv * r
+                    rg = (GT @ r).at[0].set(0.0)
+                    sg = solve_rg(jnp.concatenate([jnp.real(rg), jnp.imag(rg)]))  # complex A_G as a real 2n block
+                    x = x + G @ (sg[:rg_nv] + 1j * sg[rg_nv:])  # gradient-space correction
+                    for P, PT, solve_b, nv in zip(Pis, PisT, solve_bs, nvs):
+                        rp = (PT @ r).at[0].set(0.0)
+                        s = solve_b(jnp.concatenate([jnp.real(rp), jnp.imag(rp)]))  # real 2n-block solve
+                        x = x + P @ (s[:nv] + 1j * s[nv:])
+                    return x
 
         return PrecondApplier(apply)
 
