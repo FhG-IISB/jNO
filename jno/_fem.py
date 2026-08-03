@@ -968,14 +968,13 @@ def _solve_complex_block(
         rhs = jnp.concatenate([b_r, b_i])
         is_sparse = hasattr(A_r, "indices") and hasattr(A_i, "indices")
 
-        if solve_fn is not None and from_slots and is_sparse:
-            # Slot-composed solver on a non-complex-native precond (gmres + jacobi/form/amg): hand it the
-            # SPARSE 2n BCOO block [[A_r,-A_i],[A_i,A_r]] rather than densifying — keeps it O(nnz) AND lets
-            # the composed solver's extreme-magnitude normalization fire (a dense block has no .bcoo, so a
-            # mass-dominated eddy system would otherwise stall the Krylov Arnoldi at real scale).
+        if solve_fn is not None and is_sparse:
+            # ANY solver -- yours or a slot-composed one -- gets the SPARSE 2n BCOO block
+            # [[A_r,-A_i],[A_i,A_r]] rather than a densified copy. Keeps it O(nnz), and it lets the
+            # composed solver's extreme-magnitude normalization fire (a dense block has no `.bcoo`, so
+            # a mass-dominated eddy system would otherwise stall the Krylov Arnoldi at real scale).
             sol = jnp.asarray(solve_fn(_complex_block_bcoo(A_r, A_i, n), rhs))
-        elif solve_fn is not None:
-            # raw user solver (or a dense-leg fallback) receives the densified block (dense/direct back-compat)
+        elif solve_fn is not None:  # dense legs (vertex C1 families): nothing to keep sparse
             Ar_d = jnp.asarray(A_r.todense() if hasattr(A_r, "todense") else A_r)
             Ai_d = jnp.asarray(A_i.todense() if hasattr(A_i, "todense") else A_i)
             sol = jnp.asarray(solve_fn(jnp.block([[Ar_d, -Ai_d], [Ai_d, Ar_d]]), rhs))
@@ -1345,8 +1344,13 @@ class FEM:
           GPU-safe, handles general (non-symmetric) systems, ``jit`` + grad; it raises on
           non-convergence. For the indefinite saddle-point systems where Jacobi does not help, pass a
           **direct** ``solve_fn`` — ``jno.utils.solver.linear.sparse_lu_solve`` (JAX ``spsolve``, no
-          dependency, robust on CPU) or ``jnp.linalg.solve`` (dense); it receives the densified
-          ``(A, b)``;
+          dependency, robust on CPU), or bring your own. It receives the operator **exactly as
+          assembled** — the BCOO, never a densified copy — so a sparse solver of your choosing
+          (scipy SuperLU, PETSc, anything taking triplets) can be dropped straight in. jNO does not
+          pick the representation for you: densifying is ``O(n^2)`` on an ``O(nnz)`` operator (20.5
+          GiB against 9.4 MiB at ``n=51843``), which would defeat the point at the sizes where you
+          would reach for your own solver. A **dense** solver must densify itself:
+          ``lambda A, b: jnp.linalg.solve(A.todense(), b)``;
         * steady nonlinear: ``(residual_fn, u0) -> u`` (default a matrix-free Jacobian-free
           Newton-Krylov, implicit-diff, no optimistix; pass ``u0=`` for the guess);
         * transient: ``(block, args, save_ts) -> ys`` returning a ``(len(save_ts),
@@ -1778,8 +1782,15 @@ class FEM:
                 return _fin(_solve_linear_matrix_free(A, b, shard=shard))
             if from_slots:
                 return _fin(solve_fn(A, b))  # slot-composed solvers take the BCOO operator directly
+            if solve_fn is not None:
+                # YOUR solver gets the operator exactly as assembled -- the BCOO, not a densified copy.
+                # jNO does not decide the representation on your behalf: densifying is O(n^2) on an
+                # O(nnz) operator (20.5 GiB against 9.4 MiB at n=51843, a 2179x blow-up that OOMs
+                # before your solver runs), so it made bringing a sparse solver pointless at the sizes
+                # where you would want one. Densify inside your own solver if that is what you need.
+                return _fin(solve_fn(A, b))
             A = jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)
-            return _fin((solve_fn or (lambda A_, b_: jnp.linalg.solve(A_, b_)))(A, b))
+            return _fin(jnp.linalg.solve(A, b))
         if self._mode == "linear" and isinstance(self._op, FemLinearSystem):
             # Runtime-parametric steady linear: solve A(θ)x=b(θ) as a trace node (∂u/∂θ flows through
             # solve_fn). A periodic tie reduces per-call inside FemLinearSystem.solve, after A(θ) is
