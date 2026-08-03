@@ -50,7 +50,25 @@ __all__ = [
 
 
 class _Spec:
-    """Base for ``jno.precond.*`` specs — gives every preconditioner a fluent ``.cached()``."""
+    """Base for ``jno.precond.*`` specs — gives every preconditioner a fluent ``.cached()``.
+
+    Two class-level declarations decide whether a spec can ride the *compiled* slot path (see
+    :func:`jno.utils.solver.solver_api.compose_linear_solve_fn`); both default to the conservative
+    answer, so a new preconditioner is correct-but-eager until it says otherwise.
+
+    ``traceable`` — can :meth:`materialize` run **inside** a trace? That means building the applier
+    from the traced operator alone: no scipy/pyamg assembly, no Python branching on values, and no
+    use of ``ctx.fem`` (the compiled path has no concrete FEM to offer). Jacobi qualifies because it
+    reads the diagonal and nothing else; ``amg``/``ams``/``form`` assemble host-side, and Chebyshev
+    branches on measured spectrum bounds.
+
+    ``key`` — the spec's value identity, for the same reason :class:`LinearSolver` has one: the
+    compiled path passes the spec to ``jax.jit`` as a static argument, and identity hashing would
+    recompile on every call. ``None`` means identity, which keeps the spec off the compiled path.
+    """
+
+    traceable = False
+    key = None
 
     def cached(self, *, refresh: bool = False):
         """Wrap this preconditioner so its setup is built **once** and reused across solves — the
@@ -58,9 +76,20 @@ class _Spec:
         invalidation (``False`` frozen, ``True`` on shape/sparsity change, or a ``ctx -> key`` callable)."""
         return _Cached(self, refresh)
 
+    def __eq__(self, other):
+        if self.key is None or not isinstance(other, _Spec) or other.key is None:
+            return self is other
+        return self.key == other.key
+
+    def __hash__(self):
+        return id(self) if self.key is None else hash(self.key)
+
 
 class _Jacobi(_Spec):
     """Spec for the diagonal (Jacobi) preconditioner; see :func:`jacobi`."""
+
+    traceable = True  # the diagonal comes off the traced operator; nothing is assembled host-side
+    key = ("jacobi",)  # no parameters, so every jacobi() is the same preconditioner
 
     def materialize(self, ctx: PrecondContext):
         d = ctx.diag()

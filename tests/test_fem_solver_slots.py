@@ -297,3 +297,141 @@ def test_x0_u0_conflict_raises():
     z = jnp.zeros(4)
     with pytest.raises(ValueError, match="same initial guess"):
         fem.solve(x0=z, u0=z)
+
+
+# ---------------------------------------------------------------------------
+# the COMPILED slot path: one compilation reused across solves
+# ---------------------------------------------------------------------------
+# The slot path used to call its Krylov solver from eager Python, paying dispatch per iteration
+# (bicgstab+jacobi 104.7 ms vs 6.3 compiled, n=13861). Compiling it is only a win if `jax.jit`'s
+# cache actually SPANS calls, and `FEM.solve` re-composes on every call -- so both the function and
+# its static arguments have to be stable. These tests pin the three ways that goes wrong: a fresh
+# spec object per call (recompile), a slot that cannot trace at all (crash), and a slot that quietly
+# skips work the eager path does.
+
+
+def _compiled():
+    from jno.utils.solver.solver_api import _composed_compiled
+
+    return _composed_compiled
+
+
+def test_inline_specs_share_one_compilation():
+    """`fem.solve(linear=jno.solve.cg())` -- the spec written inline, as the docs write it.
+
+    Specs are handed to `jax.jit` as static arguments, and jax keys its cache on `hash`. With
+    identity hashing every call is a fresh object, hence a fresh cache entry and a recompile:
+    measured 0.4 ms hoisted against 83.5 ms inline on this 513-DOF system, i.e. compiling made the
+    common usage 200x SLOWER than leaving it eager. Value keys are what make the cache work.
+    """
+    fem = _poisson(mesh_size=0.05)
+    u_ref = np.asarray(fem.solve())
+    before = _compiled()._cache_size()
+    for _ in range(3):
+        u = fem.solve(linear=jno.solve.bicgstab(tol=1e-10), precond=jno.precond.jacobi())
+        assert np.abs(np.asarray(u) - u_ref).max() < 1e-7
+    assert _compiled()._cache_size() == before + 1, "an inline spec recompiled instead of hitting the cache"
+
+    # `linear` defaulted: the composer builds its own bicgstab() internally, on every call. That one
+    # is invisible to the user, so identity hashing would recompile a solve nobody wrote a spec for.
+    before = _compiled()._cache_size()
+    for _ in range(3):
+        fem.solve(precond=jno.precond.jacobi())
+    assert _compiled()._cache_size() == before + 1, "the composer's own default solver recompiled per call"
+
+
+def test_differently_configured_specs_do_not_share_a_cache_entry():
+    """The risk value keys introduce: a key that misses a parameter would serve a solve configured
+    the other way -- a wrong answer, not a slow one. Every argument that changes the iteration must
+    be in the key, including the per-method extras (`gmres(restart=)`) that live in `**fixed`."""
+    assert jno.solve.cg(tol=1e-8) == jno.solve.cg(tol=1e-8)
+    assert hash(jno.solve.cg(tol=1e-8)) == hash(jno.solve.cg(tol=1e-8))
+    for a, b in [
+        (jno.solve.cg(tol=1e-8), jno.solve.cg(tol=1e-3)),
+        (jno.solve.cg(maxiter=10), jno.solve.cg(maxiter=20)),
+        (jno.solve.cg(atol=0.0), jno.solve.cg(atol=1e-12)),
+        (jno.solve.gmres(restart=10), jno.solve.gmres(restart=30)),
+        (jno.solve.fgmres(restart=10), jno.solve.fgmres(restart=30)),
+        (jno.solve.minres(tol=1e-8), jno.solve.minres(tol=1e-6)),
+        (jno.solve.cg(), jno.solve.bicgstab()),  # same arguments, different method
+    ]:
+        assert a != b, f"{a!r} and {b!r} would share a compiled solve"
+
+    # End to end, in the order that would hide a collision: converge first, so a cache keyed on the
+    # method name alone would then hand the 2-iteration budget the converged compilation and pass.
+    fem = _poisson()
+    u = fem.solve(linear=jno.solve.cg(tol=1e-12, maxiter=5000), precond=jno.precond.jacobi())
+    assert np.abs(np.asarray(u) - np.asarray(fem.solve())).max() < 1e-7
+    with pytest.raises(Exception, match="did not solve"):
+        fem.solve(linear=jno.solve.cg(tol=1e-12, maxiter=2), precond=jno.precond.jacobi())
+
+
+def test_host_side_slots_stay_eager_and_correct():
+    """Not every slot can be materialized inside a trace, and the ones that cannot must fall back
+    silently rather than fail. `chebyshev` measures spectrum bounds and then branches on what it
+    measured (`if hi <= 0`); `amg`/`ams`/`form` assemble an auxiliary operator host-side through
+    scipy/pyamg. A bare callable -- the documented extension contract -- declares nothing at all."""
+    from jno.utils.solver.solver_api import _compilable
+
+    fem = _poisson()
+    u_ref = np.asarray(fem.solve())
+
+    def my_linear(A, b, *, M=None, x0=None):
+        return jnp.linalg.solve(A.dense(), b)
+
+    def my_precond(ctx):
+        return lambda v: (1.0 / ctx.diag()) * v
+
+    cg = jno.solve.cg(tol=1e-12, maxiter=5000)
+    eager = [
+        (jno.solve.chebyshev(maxiter=2000), None),  # host-side branching in the SOLVER
+        (cg, jno.precond.chebyshev(degree=6)),  # ... and in the PRECONDITIONER
+        (cg, jno.precond.amg()),  # pyamg hierarchy, built host-side
+        (cg, jno.precond.nystrom(rank=12)),
+        (my_linear, None),  # bare callables: no traits, no key
+        (cg, my_precond),
+        (cg, jno.precond.jacobi().cached()),  # .cached() owns its own reuse; do not compile over it
+    ]
+    for linear, precond in eager:
+        assert not _compilable(linear, precond), f"{linear} + {precond} must not be compiled"
+        u = fem.solve(linear=linear, precond=precond)
+        assert np.abs(np.asarray(u) - u_ref).max() < 1e-6, f"{linear} + {precond} deviates on Poisson"
+
+    assert _compilable(cg, None) and _compilable(cg, jno.precond.jacobi()), "the traceable pair must compile"
+
+
+def test_extreme_magnitude_is_scaled_before_the_jit_boundary():
+    """`_normalize_extreme_scale` fires only on a CONCRETE operator -- it reads `float(max|A|)`
+    raising on a tracer as "traced, leave alone". Run it inside the compiled function and every
+    operator is a tracer, so the eddy regime (|A| ~ jw*sigma ~ 1e12) sails past the guard into the
+    Arnoldi breakdown it exists to prevent: a returned ~0 with relative residual 1, silently. So the
+    scaling has to happen OUTSIDE the jit, and this is the test that it still does.
+    """
+    from jno.utils.solver.solver_api import compose_linear_solve_fn
+
+    n = 60
+    rng = np.random.default_rng(0)
+    Q = rng.standard_normal((n, n))
+    Ad = (Q @ Q.T + n * np.eye(n)) * 1e12  # mass-dominated eddy scaling
+    A = jsp.BCOO.fromdense(jnp.asarray(Ad))
+    b = jnp.asarray(rng.standard_normal(n)) * 1e12
+    ref = np.linalg.solve(Ad, np.asarray(b))
+
+    solve = compose_linear_solve_fn(jno.solve.bicgstab(tol=1e-12, maxiter=5000), jno.precond.jacobi(), None, None)
+    x = np.asarray(solve(A, b))
+    assert np.linalg.norm(x - ref) / np.linalg.norm(ref) < 1e-6, "extreme-magnitude solve broke down under jit"
+
+
+def test_compiled_path_still_raises_on_an_unconverged_solve():
+    """Every Krylov solver ends in `_maybe_residual_check`, which needs a CONCRETE residual and
+    steps aside on a tracer. So compiling the solve does not disable that guard loudly -- it
+    disables it silently, and an exhausted iteration budget starts returning its unconverged vector
+    as if it had succeeded. Caught by an AMS test whose *negative control* (Jacobi cannot converge
+    in 60 iterations) stopped failing, which is the kind of thing that reads as a passing suite.
+    """
+    fem = _poisson(mesh_size=0.05)
+    with pytest.raises(Exception, match="did not solve"):
+        fem.solve(linear=jno.solve.cg(tol=1e-12, maxiter=2), precond=jno.precond.jacobi())
+    # and the guard does not fire on a solve that DID converge
+    u = fem.solve(linear=jno.solve.cg(tol=1e-12, maxiter=5000), precond=jno.precond.jacobi())
+    assert np.abs(np.asarray(u) - np.asarray(fem.solve())).max() < 1e-7

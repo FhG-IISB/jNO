@@ -252,6 +252,31 @@ rest, against ~1e-15 at `depth = 2k`). Convergence is fast on the *decaying* spe
 ill-posedness analysis worth doing, and slow on clustered ones (~3 % error at `depth = 4k` on a tight
 cluster) — inspect `s` for a plateau if the spectrum may be flat.
 
+### What runs compiled
+
+A slot-composed solve runs as **one compiled program** where it can, rather than calling the Krylov
+iteration from eager Python and paying dispatch on every step. How much that is worth depends on the
+device: the eager cost is host-bound and so barely varies between machines, while the compiled cost
+is device-bound — the faster the GPU, the larger the ratio. On an RTX 3070 at 13759 DOFs,
+`bicgstab + jacobi` 114.1 ms → 18.1 (6.3x), `cg + jacobi` 97.5 → 14.5, `minres + jacobi` 115.2 →
+20.2, `gmres + jacobi` 398.4 → 183.2, `fgmres + jacobi` 536.3 → 300.8 (1.8x — jNO's own restart loop
+does more real arithmetic, so less of its time was dispatch). On CPU, 1.8–4.2x; on a faster GPU,
+`bicgstab + jacobi` reached 16.6x. Same answers throughout. Nothing to switch on; write the
+slots as usual, and
+write them inline if you like (`fem.solve(linear=jno.solve.cg(), precond=jno.precond.jacobi())`) —
+equivalently configured specs share one compilation, so a solve in a loop compiles once.
+
+These combinations stay **eager**, and are correct but not accelerated:
+
+| Slot | Why |
+| --- | --- |
+| `solve.chebyshev`, `precond.chebyshev` | measures spectrum bounds, then branches on what it measured |
+| `precond.amg`, `precond.ams`, `precond.form` | assembles an auxiliary operator host-side (scipy / pyamg) |
+| `precond.jaxamg`, `solve.amg` | AmgX builds its hierarchy from the matrix values; unverified under a tracer |
+| `solve.lu`, `solve.dense`, `solve.amg` | one direct call — no per-iteration dispatch to remove |
+| a bare callable in either slot | jNO knows nothing about it, so it makes no assumption |
+| a multi-device (`shard=`) solve | already compiles itself, with the operator partitioned |
+
 **Preconditioners** (`jno.precond`, for the iterative solvers): `jacobi`, `chebyshev`,
 `nystrom` (randomized low-rank — the rung between `jacobi` and multigrid),
 `amg` (algebraic multigrid), `gmg` (geometric multigrid — a structured-grid V-cycle),

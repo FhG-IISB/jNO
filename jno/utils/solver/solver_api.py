@@ -24,6 +24,7 @@ Contracts
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Any, Callable, Optional
 
 import jax
@@ -204,15 +205,31 @@ class LinearSolver:
     """A configured linear solver: ``solver(A, b, *, M=None, x0=None) -> x``.
 
     ``fn`` receives ``(op: LinearOperator, b, M, x0)``. ``traits`` documents transform support
-    (``vmap: "native" | "sequential" | "no"``) so composition layers (and, later, the auto
-    policy) can pick honestly instead of silently host-looping.
+    (``vmap: "native" | "sequential" | "no"``, ``jit: True | False``) so composition layers (and,
+    later, the auto policy) can pick honestly instead of silently host-looping. ``jit=False`` marks
+    a solver whose iteration cannot run *inside* a trace -- Chebyshev measures its spectrum bounds
+    and branches on the measured values, which a tracer has no answer for.
+
+    ``key`` is the solver's **value identity**: the constructor arguments that change what it does.
+    It exists because the compiled slot path (:func:`compose_linear_solve_fn`) hands the spec to
+    ``jax.jit`` as a static argument, and ``jax`` keys its compilation cache on ``hash``. Hashing by
+    identity would mean ``fem.solve(linear=jno.solve.cg())`` -- the spec written inline, as the docs
+    themselves write it -- recompiling on every call: measured 0.4 ms against 83.5 ms on a 513-DOF
+    Poisson solve, i.e. far worse than never compiling. With a key, two equivalently configured
+    specs are one cache entry.
+
+    A spec with **no** key falls back to identity, and the composer then declines to compile at all.
+    That default is deliberate: a key that omits a parameter would serve a cached solve configured
+    the *other* way, which is a wrong answer, while no key merely forgoes a speed-up. So a new
+    solver is slow until its key is written, never silently wrong.
     """
 
-    def __init__(self, fn: Callable, *, name: str, traits: Optional[dict] = None, direct: bool = False):
+    def __init__(self, fn: Callable, *, name: str, traits: Optional[dict] = None, direct: bool = False, key: Any = None):
         self._fn = fn
         self.name = name
         self.traits = {"vmap": "native", "jit": True, **(traits or {})}
         self.direct = direct  # a direct solver ignores x0 and takes no preconditioner
+        self.key = None if key is None else (type(self), name, key)
 
     def __call__(self, A, b, *, M=None, x0=None):
         op = A if isinstance(A, LinearOperator) else LinearOperator(A)
@@ -220,6 +237,14 @@ class LinearSolver:
         if self.direct and M is not None:
             raise ValueError(f"jno.solve.{self.name} is a direct solver -- it takes no preconditioner (precond=).")
         return self._fn(op, b, M=M, x0=x0)
+
+    def __eq__(self, other):
+        if self.key is None or not isinstance(other, LinearSolver) or other.key is None:
+            return self is other
+        return self.key == other.key
+
+    def __hash__(self):
+        return id(self) if self.key is None else hash(self.key)
 
     def __repr__(self):
         return f"jno.solve.{self.name}({', '.join(f'{k}={v}' for k, v in self.traits.items())})"
@@ -449,6 +474,74 @@ def _is_traced(A) -> bool:
     return isinstance(A.data, jax.core.Tracer) or isinstance(A.indices, jax.core.Tracer)
 
 
+def _compilable(linear, precond) -> bool:
+    """Can this slot pair run as ONE compiled function, cached across ``fem.solve()`` calls?
+
+    Both halves must clear two independent bars, and both default to "no" so that an unrecognised or
+    newly added slot is merely eager rather than quietly broken.
+
+    * It must **trace**. ``jacobi`` materialises from the traced operator's diagonal;
+      ``amg``/``ams``/``form`` assemble an auxiliary operator host-side through scipy/pyamg, and
+      ``chebyshev`` (either as a solver or as a preconditioner) branches on measured spectrum bounds
+      -- a tracer has no answer for ``if hi <= 0``. Solvers declare this as the ``jit`` trait,
+      preconditioners as :attr:`_Spec.traceable`.
+    * It must have a stable **value key**. ``jax.jit`` caches on the hash of its static arguments, so
+      a spec that hashes by identity would compile once per call -- the very cost this is buying off.
+      See :class:`LinearSolver` for the measurement.
+
+    A wrong "yes" would surface as a trace error at solve time, or worse as a cache hit on a
+    differently configured solver; a wrong "no" costs only the speed-up. Hence the asymmetry.
+    """
+    # Read both slots through `getattr`: the documented extension contract lets a **bare callable**
+    # stand in for either spec, and a bare callable has neither declaration -- so it lands on the
+    # eager path, which is the right answer for code jNO knows nothing about.
+    if not getattr(linear, "traits", {}).get("jit", True) or getattr(linear, "key", None) is None:
+        return False
+    return precond is None or (getattr(precond, "traceable", False) and getattr(precond, "key", None) is not None)
+
+
+@partial(jax.jit, static_argnames=("linear", "precond"))
+def _composed_compiled(A, b, x0, *, linear, precond):
+    """The slot-composed linear solve, COMPILED -- and cached by ``jax.jit`` across ``fem.solve()``
+    calls rather than by hand.
+
+    The slot path called its Krylov solver from eager Python, so every iteration paid dispatch. What
+    removing that is worth depends on the DEVICE, and in a way worth stating because it is not
+    obvious: eager cost is host-bound (the Python dispatch per iteration), so it barely moves between
+    machines, while compiled cost is device-bound. The ratio therefore tracks how fast the GPU is.
+
+    Measured on an RTX 3070 at n=13759 -- ``bicgstab+jacobi`` 114.1 -> 18.1 ms (6.3x), ``cg+jacobi``
+    97.5 -> 14.5 (6.7x), ``minres+jacobi`` 115.2 -> 20.2 (5.7x), ``gmres+jacobi`` 398.4 -> 183.2
+    (2.2x), ``fgmres+jacobi`` 536.3 -> 300.8 (1.8x). On CPU, 1.8-4.2x. On a faster GPU the same
+    ``bicgstab+jacobi`` was 104.7 -> 6.3 ms (16.6x) at n=13861: nearly the same EAGER cost, a 3x
+    quicker compiled one. ``fgmres`` gains least everywhere -- it is jNO's own restart loop, so more
+    of its time was always arithmetic rather than dispatch. Answers are unchanged (max |diff| 1.4e-12
+    down to 3e-16).
+
+    This has to live at MODULE level. Wrapping the closure inside ``compose_linear_solve_fn`` looks
+    equivalent and is not: ``FEM.solve`` re-composes on every call, so the wrapper would be a new
+    function object each time, miss ``jax.jit``'s cache, and recompile -- measured 115 ms against
+    5.9 ms for the same callable reused, i.e. slower than not compiling at all. One module-level
+    function with the slots as STATIC arguments means jax's own cache spans calls, with no hand-rolled
+    memo to keep coherent. That only works because the specs hash by VALUE (:class:`LinearSolver`);
+    with identity hashing, module level or not, an inline ``linear=jno.solve.cg()`` recompiles.
+
+    Staleness is handled by the same mechanism rather than by bookkeeping: the specs are static, so a
+    different solver is a different cache entry, while ``A``/``b`` are traced, so a changed operator
+    re-runs the compiled graph -- the Jacobi diagonal is recomputed from the new values, not reused.
+    Only host-side preconditioner setup would break that, which is exactly what :func:`_compilable`
+    excludes; ``prepare_precond`` stays eager in the composer.
+
+    There is deliberately no ``fem`` argument. Nothing that gets here needs one -- a traceable
+    preconditioner builds from the operator by definition -- and holding a FEM object as a static
+    argument would key the cache on a problem that is rebuilt each sweep step, recompiling every
+    time and pinning every FEM ever solved in ``jax``'s compilation cache.
+    """
+    op = LinearOperator(A)  # the triplets arrive as jit ARGUMENTS; the wrapper is rebuilt inside
+    M = materialize_precond(precond, PrecondContext(op, None)) if precond is not None else None
+    return linear(op, jnp.asarray(b).reshape(-1), M=M, x0=x0)
+
+
 def compose_linear_solve_fn(linear, precond, x0, fem=None, shard=None) -> Callable:
     """Compose the linear-mode slots into the classic ``(A, b) -> x`` ``solve_fn`` contract.
 
@@ -530,7 +623,45 @@ def compose_linear_solve_fn(linear, precond, x0, fem=None, shard=None) -> Callab
         M = materialize_precond(precond, PrecondContext(op, fem)) if precond is not None else None
         return linear(op, rhs, M=M, x0=x0_flat)
 
-    return composed
+    if not _compilable(linear, precond):
+        return composed
+
+    def composed_jit(A, b):
+        """The compiled path, with the cases it must hand back to ``composed`` untouched.
+
+        A **matrix-free or dense-wrapped** operator arrives as a ``LinearOperator``, which is not a
+        pytree and so cannot be a ``jit`` argument at all (its matvec is a Python closure).
+
+        A **sharded** solve compiles itself, with ``in_shardings`` on the triplets; compiling it again
+        from here would close over the operator and replicate it, which is how sharding silently
+        becomes a full copy per device.
+
+        **Extreme magnitude** is why the scaling guard runs out here rather than inside. It fires only
+        on a *concrete* operator -- ``float(max|A|)`` on a tracer raises, and it reads that as "traced,
+        leave alone". Inside the compiled function every operator is a tracer, so an eddy-regime
+        ``|A| ~ 1e12`` would sail past the guard into the Arnoldi breakdown it exists to prevent. The
+        scaling is host-side work on one scalar, so hoisting it costs nothing.
+
+        The **convergence guard** is hoisted for the same reason, and it is the subtler of the two.
+        Every Krylov solver ends in :func:`_maybe_residual_check`, which needs a concrete residual and
+        steps aside on a tracer -- so compiling the solver does not disable the check loudly, it
+        disables it silently, trading "raise rather than return garbage" for the speed. A solve that
+        exhausts its iteration budget then returns an unconverged vector as if it had succeeded.
+        Re-running it out here on the result costs one matvec against hundreds of iterations, and the
+        split is the same one the default steady-linear path makes.
+        """
+        if isinstance(A, LinearOperator):
+            return composed(A, b)
+        op = LinearOperator(A)
+        if devices and _shardable(op, linear, precond):
+            return composed(A, b)
+        op, rhs = _normalize_extreme_scale(op, b, precond)
+        rhs = jnp.asarray(rhs).reshape(-1)
+        mat = op.bcoo if op.bcoo is not None else A
+        x = _composed_compiled(mat, rhs, x0_flat, linear=linear, precond=precond)
+        return _maybe_residual_check(op, rhs, x, getattr(linear, "name", "solve"))
+
+    return composed_jit
 
 
 def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable:
