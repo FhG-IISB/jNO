@@ -157,19 +157,26 @@ def eddy3d(ms):
 #: the compiler than about the solver. Roughly a decade of DOFs per case, chosen to land each largest
 #: size in tens of seconds.
 #:
+#: Six sizes per case, spaced GEOMETRICALLY in mesh size. Element count goes as h^-2 in 2-D and h^-3
+#: in 3-D, so a geometric ladder in h is an even one in DOFs -- which is what the log-log scaling
+#: panel is read against. An arithmetic ladder would bunch every point at the coarse end.
+#:
 #: Two cases are heavy for a reason other than mesh size. The transient runs 201 steps, because its
 #: cost is steps x per-step solve and the trajectory compiles into a single scan either way. The
 #: complex H(curl) case is solved directly and gets expensive fast: LU fill-in in 3-D was measured at
 #: 81x, and cuSolver fails outright somewhere above ~20k complex DOFs -- if the largest size here
 #: reports a failure, that ceiling is the finding, not a broken benchmark.
+#:
+#: Stokes stops at 0.05 deliberately. At 0.04 the saddle-point system comes back "Singular matrix in
+#: linear solve" from cuSolver's sparse LU -- a real and still-open limit, not a sizing accident.
 CASES = {
-    "poisson2d": (poisson2d, (0.008, 0.004, 0.0022), "2-D Poisson (P1)"),
-    "elastic2d": (elastic2d, (0.012, 0.006, 0.0035), "2-D vector"),
-    "reaction2d": (reaction2d, (0.012, 0.006, 0.0035), "2-D nonlinear (Newton)"),
-    "heat2d": (heat2d, (0.02, 0.012, 0.008), "2-D transient (201 steps)"),
-    "stokes2d": (stokes2d, (0.09, 0.06, 0.05), "2-D Stokes (Taylor-Hood)"),
-    "poisson3d": (poisson3d, (0.05, 0.038, 0.03), "3-D Poisson (tets)"),
-    "eddy3d": (eddy3d, (0.16, 0.12, 0.095), "3-D complex H(curl)"),
+    "poisson2d": (poisson2d, (0.008, 0.0062, 0.0048, 0.0037, 0.0028, 0.0022), "2-D Poisson (P1)"),
+    "elastic2d": (elastic2d, (0.012, 0.0094, 0.0073, 0.0057, 0.0045, 0.0035), "2-D vector"),
+    "reaction2d": (reaction2d, (0.012, 0.0094, 0.0073, 0.0057, 0.0045, 0.0035), "2-D nonlinear (Newton)"),
+    "heat2d": (heat2d, (0.02, 0.0167, 0.0139, 0.0115, 0.0096, 0.008), "2-D transient (201 steps)"),
+    "stokes2d": (stokes2d, (0.09, 0.080, 0.071, 0.063, 0.056, 0.05), "2-D Stokes (Taylor-Hood)"),
+    "poisson3d": (poisson3d, (0.05, 0.045, 0.041, 0.037, 0.033, 0.03), "3-D Poisson (tets)"),
+    "eddy3d": (eddy3d, (0.16, 0.144, 0.130, 0.117, 0.105, 0.095), "3-D complex H(curl)"),
 }
 
 
