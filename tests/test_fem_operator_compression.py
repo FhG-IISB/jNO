@@ -290,6 +290,31 @@ def test_chunk_on_an_assembler_without_an_element_loop_is_refused():
         jno.fem(terms, chunk=4096)
 
 
+def test_chunk_reaches_the_non_nodal_edge_family_assembler():
+    """The N1E/RT path is the 3-D vector route (Maxwell, eddy currents) where the batched element
+    intermediate is largest, so it must share the native assembler's chunking rather than sit outside
+    it. Its residual element loop chunks for every non-nodal family; its jacobian chunks for the
+    edge/cell families, which is what this exercises."""
+    pytest.importorskip("pygmsh", reason="pygmsh required for 3-D cube meshing")
+    inner, vecf = jno.np.inner, jno.np.vector
+
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.34).domain()
+    u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
+    c = d.variable("interior", split=True)
+    x, y, z = c[0], c[1], c[2]
+    ui, vi = u.bind(x=x, y=y, z=z), v.bind(x=x, y=y, z=z)
+    cu, cv = u.vector.curl(x, y, z), v.vector.curl(x, y, z)
+    src = vecf(0.0 * x, 0.0 * x, jno.np.where(x > 0.5, 1.0, 0.0))
+    terms = [inner(cu, cv) + inner(ui, vi) - inner(src, vi)]
+
+    ref = np.asarray(jno.fem(terms).solve()).reshape(-1)
+    scale = max(1.0, float(np.max(np.abs(ref))))
+    for chunk in (False, 32):
+        got = np.asarray(jno.fem(terms, chunk=chunk).solve()).reshape(-1)
+        # the inner solve is iterative, so agreement is to its tolerance, not to machine precision
+        assert np.max(np.abs(got - ref)) / scale < 1e-6, f"chunk={chunk} changed the N1E answer"
+
+
 def test_the_chunk_policy_is_restored_after_assembly():
     """The policy is a module-level slot scoped by ``jno.fem``. If it leaked, one problem's explicit
     chunk would silently become the next problem's default."""
@@ -306,18 +331,48 @@ def test_the_chunk_policy_is_restored_after_assembly():
 
 
 def test_the_automatic_chunk_is_derived_from_the_device_not_hardcoded():
-    """The size is computed from ``memory_stats()["bytes_limit"]`` (~0.15% of device memory) rather
-    than tuned to one machine, with a cell floor for the case that cannot be derived — JAX exposes
-    device memory but no SM count, so saturation has no portable source."""
-    from jno.utils.solver.fem_native import assemble_fem_native
+    """The cap is computed from ``memory_stats()["bytes_limit"]`` (~0.15% of device memory) rather than
+    tuned to one machine, so the same problem that must be split on a small card runs unsplit — and
+    therefore at full speed — on a large one.
 
-    src = assemble_fem_native.__doc__ or ""
+    Tested through behaviour, not by grepping the source: what matters is that the derived chunk tracks
+    device memory and that the saturation floor overrides the byte cap for large per-cell blocks. That
+    floor is the one number JAX gives no way to derive (it exposes device memory but no SM count), so
+    it is a constant, and this pins that it still binds where it must."""
+    from jno.utils.solver.fem_utils import _CHUNK_MIN_CELLS, cell_chunk, chunk_budget_bytes
+
+    budget = chunk_budget_bytes()
+    assert budget > 0
+
+    # small per-cell block (P1 tet, 4 dofs): the byte cap decides, and it scales with the budget
+    p1 = cell_chunk(10**9, n_test=4, n_local=4, setting=None)
+    assert p1 == max(budget // (4 * 4 * 4 * 8), _CHUNK_MIN_CELLS)
+
+    # large per-cell block (P2 tet, 10 dofs => 8 KB/cell): the byte cap alone would starve the device,
+    # so the floor takes over and the cap is deliberately overrun
+    p2 = cell_chunk(10**9, n_test=10, n_local=10, setting=None)
+    assert p2 == _CHUNK_MIN_CELLS, "the saturation floor must override the byte cap for big blocks"
+    assert p2 * 10 * 10 * 10 * 8 > budget, "overrunning the cap there is the intended trade"
+
+    # an explicit setting wins outright, and 0/False means one vmap over everything
+    assert cell_chunk(10**9, 4, 4, setting=1234) == 1234
+    assert cell_chunk(10**9, 4, 4, setting=0) is None
+    # a mesh that already fits in one chunk is never split
+    assert cell_chunk(16, 4, 4, setting=None) is None
+
+
+def test_both_assemblers_share_one_chunk_policy():
+    """The native and non-nodal assemblers must not drift into two policies — the non-nodal path is the
+    N1E/RT 3-D vector route, where the memory pressure is highest and a divergent default would be
+    least visible."""
     import inspect
 
-    body = inspect.getsource(assemble_fem_native)
-    assert "bytes_limit" in body, "the cap must come from the device"
-    assert "_CHUNK_MIN_CELLS" in body, "the saturation floor must still exist"
-    assert src is not None
+    from jno.utils.solver import fem_native, fem_nonnodal
+
+    for mod in (fem_native, fem_nonnodal):
+        src = inspect.getsource(mod)
+        assert "elem_map" in src and "cell_chunk" in src, f"{mod.__name__} does not use the shared policy"
+        assert "_CHUNK_MEMORY_FRACTION" not in src, f"{mod.__name__} redefines the policy instead of importing it"
 
 
 # ---------------------------------------------------------------------------------------------

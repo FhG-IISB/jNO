@@ -2440,6 +2440,102 @@ def bcoo_set_unit_diag(A, dofs):
     return jsparse.BCOO((jnp.concatenate([A.data, eye_dat]), jnp.concatenate([A.indices, eye_idx])), shape=A.shape)
 
 
+#: Element-chunk policy for the assembly currently being built. Set by ``jno.fem(chunk=...)`` for the
+#: duration of one assembly and captured (not read lazily) by :func:`assemble_fem_native`, because the
+#: residual/jacobian closures are CALLED long afterwards -- at solve time, outside any context.
+#: ``None`` = automatic (device-derived), ``False``/``0`` = no chunking, positive int = cells per chunk.
+#: A list rather than a plain global so the context manager can restore the previous value on nesting.
+_CHUNK_OVERRIDE = [None]
+#: Set when an assembly consumed the override, so ``jno.fem`` can refuse an explicit ``chunk=`` that
+#: reached an assembler with no element loop instead of silently ignoring it.
+_CHUNK_CONSUMED = [False]
+
+
+def normalize_chunk(chunk):
+    """Validate a user ``chunk=`` value. ``None`` -> automatic, ``False``/``0`` -> off, int -> cells."""
+    if chunk is None:
+        return None
+    if chunk is False or (isinstance(chunk, int) and not isinstance(chunk, bool) and chunk == 0):
+        return 0
+    if chunk is True:
+        return None  # "yes, chunk" == automatic
+    if isinstance(chunk, (int, np.integer)) and int(chunk) > 0:
+        return int(chunk)
+    raise ValueError(
+        f"jno.fem: chunk={chunk!r} is not a valid element-chunk size. Pass a positive int (cells per "
+        "chunk), False to disable chunking, or None (the default) to size it from the device."
+    )
+
+
+# Sized in CELLS, capped by a fraction of the DEVICE's memory. GPU saturation depends on how many
+# independent work items a chunk has, not on how many bytes it occupies, so a pure byte budget
+# starves the device as soon as the per-cell block grows (P2/P3, vector fields).
+#
+# Swept on an RTX 3070 at 97824 cells, measuring the full solve rather than the assembly alone:
+#
+#   cells/chunk   2048    4096    8192   16384   32768   unchunked
+#   solve peak   287.6   256.0   273.6   279.5   378.6     801.8 MiB
+#   jacobian      6.08    4.51    3.81    3.69    3.50      3.24 ms
+#
+# Three things that sweep settles and reasoning would not: the cliff is between "chunked at all"
+# and "not" (one chunk costs 802 MiB, any split more than halves it), so the exact size matters far
+# less than whether it splits; the peak is NOT monotonic in chunk size (2048 is worse than 4096),
+# so "smaller is safer" is the wrong instinct; and below ~8k cells the device runs dry and assembly
+# nearly doubles, while above ~16k the extra memory buys almost no speed.
+#
+# The cap is expressed RELATIVE TO THE DEVICE so it is not tuned to one machine: a chunk may use
+# ~0.15% of device memory, which reproduces the measured optimum here (0.15% of 5.7 GiB = 8.8 MiB
+# = 17.9k P1 cells) and scales on its own to a larger card, which has both more memory to spend and
+# more cores to feed.
+#
+# The saturation FLOOR is the one number that cannot be derived: JAX exposes device memory
+# (`bytes_limit`) but not the SM/core count, so there is nothing portable to compute it from. It is
+# therefore set conservatively LOW, where it binds only for large per-cell blocks -- and when it
+# binds it deliberately overruns the memory cap, because the measured alternative is a ~2x
+# slowdown. A bigger card would want a higher floor, but on a bigger card the memory-derived cap is
+# already well above it, so the floor stops mattering exactly where it would have been wrong.
+_CHUNK_MEMORY_FRACTION = 0.0015
+_CHUNK_MIN_CELLS = 8192  # saturation floor; see above -- not derivable, so kept low on purpose
+_CHUNK_FALLBACK_BYTES = 8 << 20  # CPU / unknown device: no saturation pressure, just bound memory
+
+
+def chunk_budget_bytes():
+    """Bytes one element chunk may occupy, taken from the device rather than tuned to one."""
+    try:
+        limit = jax.local_devices()[0].memory_stats().get("bytes_limit")
+    except Exception:  # noqa: BLE001 -- CPU backends expose no memory stats
+        limit = None
+    if not limit:
+        return _CHUNK_FALLBACK_BYTES
+    return max(_CHUNK_FALLBACK_BYTES // 2, int(limit * _CHUNK_MEMORY_FRACTION))
+
+
+def cell_chunk(n_items: int, n_test: int, n_local: int, setting=None):
+    """Cells per chunk, or ``None`` to keep the plain single `vmap`.
+
+    The per-cell cost is the element block *including its AD tangent* (`n_test * n_local**2`), the
+    jacobian's dominant intermediate. The residual's is smaller, so it gets chunked somewhat more
+    finely than it strictly needs -- a deliberate simplification: one policy, one explanation, and
+    the cost of an extra chunk is a scan step, not a re-computation."""
+    if setting == 0:
+        return None  # explicitly disabled: one vmap over every cell
+    if setting is not None:
+        return None if n_items <= setting else int(setting)  # explicit cells/chunk
+    per = max(1, int(n_test) * int(n_local) * int(n_local) * 8)
+    chunk = max(1, chunk_budget_bytes() // per)
+    chunk = max(chunk, _CHUNK_MIN_CELLS)  # never starve the device to honour the byte cap
+    if n_items <= chunk:
+        return None  # one chunk anyway -- skip the scan overhead entirely
+    return int(chunk)
+
+
+def elem_map(fn, xs, chunk):
+    """``vmap(fn)`` over the leading axis, in chunks of ``chunk`` when one is set."""
+    if chunk is None:
+        return jax.vmap(fn)(*xs)
+    return jax.lax.map(lambda z: fn(*z), xs, batch_size=int(chunk))
+
+
 def sum_duplicate_triplets(A, nse: int | None = None):
     """Collapse duplicate ``(row, col)`` triplets in an assembled BCOO. Exact, and a large win.
 
