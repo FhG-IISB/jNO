@@ -605,6 +605,40 @@ class _AMS(_Spec):
         self._Pis = None  # (Π_x, Π_y, Π_z) nodal->edge vector interpolation
         self._frozen = None  # host-assembled auxiliary operators, set by .build() for traced solves
 
+    @property
+    def traceable(self):
+        """Can :meth:`materialize` run inside a trace? Only once the host work is already done.
+
+        Unbuilt, it calls :meth:`_assemble_aux`, which is scipy on the host. **Built** -- by
+        :meth:`build`, or automatically by :meth:`prepare` whenever the operator is concrete at compose
+        time -- every ingredient of the applier is traceable: ``dinv`` comes from the traced
+        ``ctx.diag()``, ``G``/``Pis`` are frozen BCOO constants, and the default auxiliary applies its
+        SuperLU factor through ``jax.pure_callback``, which ``jit`` supports (the preconditioner is
+        never differentiated -- the outer ``custom_linear_solve`` takes gradients through ``A``, not
+        through ``M⁻¹``).
+
+        This matters more here than anywhere else the flag appears. AMS applies a multi-level auxiliary
+        solve on **every Krylov iteration**, so leaving it on the eager path dispatches that whole
+        structure from Python per iteration. The same class-level default made a built AMG hierarchy
+        measure 21x slower than Jacobi before it was fixed.
+
+        A user-supplied ``aux`` gates the answer: it is called per apply, so AMS is only traceable if
+        that solver is. ``jno.solve`` specs declare this as the ``jit`` trait; anything that does not
+        declare it keeps AMS eager, which costs speed and never correctness.
+        """
+        if self._frozen is None or self._G is None:
+            return False
+        return self.aux is None or bool(getattr(self.aux, "traits", {}).get("jit", False))
+
+    @property
+    def key(self):
+        """Value identity for the compiled slot path. The frozen auxiliaries and the transfer operators
+        ARE the compilation, so their identity is the key; ``self`` holds both, so neither ``id`` can be
+        recycled onto another object while this spec is alive."""
+        if not self.traceable:
+            return None
+        return (type(self), id(self._frozen), id(self._G), id(self.aux))
+
     def prepare(self, fem):
         """Eager setup at compose time (outside any trace): the mesh transfer operators G, Π, **and** —
         whenever the operator is concrete here (the forward *and* native parametric-inverse solves) — the
