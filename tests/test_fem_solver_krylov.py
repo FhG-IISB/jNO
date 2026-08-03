@@ -424,3 +424,62 @@ def test_fem_solve_with_new_krylov_slots():
     ]:
         uu = np.asarray(fem.solve(linear=solver, precond=precond))
         assert np.abs(uu - u_ref).max() < 1e-6, f"{solver.name} deviates on Poisson"
+
+
+# ---------------------------------------------------------------------------
+# COMPLEX systems — this module had no complex coverage at all, which is how a
+# non-Hermitian Arnoldi survived in fgmres
+# ---------------------------------------------------------------------------
+
+
+def _nonsym_complex(n=60, seed=7):
+    rng = np.random.default_rng(seed)
+    return (rng.standard_normal((n, n)) + 1j * rng.standard_normal((n, n))) + n * np.eye(n)
+
+
+def _b_complex(n, seed=8):
+    rng = np.random.default_rng(seed)
+    return jnp.asarray(rng.standard_normal(n) + 1j * rng.standard_normal(n))
+
+
+def test_fgmres_complex_matches_dense():
+    """Arnoldi orthogonalises in the HERMITIAN inner product. fgmres used ``V @ w`` -- the bilinear
+    form -- and built its Givens rotations from ``h**2``; both are right on reals and wrong on
+    complex, so the basis was not orthogonal and the rotations were not unitary.
+
+    It did not fail loudly: the same system that now solves to ~1e-13 came back with a relative error
+    of **1.0e+4**. Nothing in this module was complex, so nothing caught it -- which is the actual
+    lesson, and why this test exists rather than a narrower one on the rotation formula.
+    """
+    Ad = _nonsym_complex()
+    b = _b_complex(Ad.shape[0])
+    ref = np.linalg.solve(Ad, np.asarray(b))
+    x = jno.solve.fgmres(tol=1e-12, restart=30, maxiter=600)(_op(Ad), b)
+    assert np.abs(np.asarray(x) - ref).max() / np.abs(ref).max() < 1e-8
+
+
+def test_fgmres_complex_flexible_iterative_preconditioner():
+    """The defining FGMRES property, on complex: ``M`` is itself an inexact solve, so it varies per
+    call. This is the exact configuration an AMS auxiliary solve needs -- an inexact (multigrid) aux
+    makes the preconditioner variable, which a non-flexible outer Krylov may not have. Without
+    complex FGMRES, a complex H(curl) problem must solve its auxiliaries tightly with a direct
+    factorisation, which is the scaling wall AMS exists to get past.
+    """
+    Ad = _nonsym_complex(seed=11)
+    b = _b_complex(Ad.shape[0])
+    op = _op(Ad)
+    ref = np.linalg.solve(Ad, np.asarray(b))
+    inner_solve = lambda v: jax.scipy.sparse.linalg.gmres(op.mv, v, tol=1e-2, maxiter=4)[0]  # noqa: E731
+    x = jno.solve.fgmres(tol=1e-10, restart=30, maxiter=900)(op, b, M=inner_solve)
+    assert np.abs(np.asarray(x) - ref).max() / np.abs(ref).max() < 1e-7
+
+
+def test_fgmres_real_path_is_unchanged_by_the_complex_fix():
+    """The complex-correct rotation uses ``c = |h_j| / denom``, which is non-negative where the old
+    real formula could be negative -- a different (still unitary) sign convention. A Givens sign flip
+    cancels between Q and R, so the least-squares solution is identical; this pins that rather than
+    trusting it."""
+    Ad = _nonsym(n=48, seed=3)
+    b = _b(Ad.shape[0])
+    x = jno.solve.fgmres(tol=1e-12, restart=16, maxiter=400)(_op(Ad), b)
+    assert np.abs(np.asarray(x) - np.linalg.solve(Ad, np.asarray(b))).max() < 1e-9

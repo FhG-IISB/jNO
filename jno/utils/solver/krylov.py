@@ -111,9 +111,12 @@ def fgmres(matvec, b, *, M=None, x0=None, tol=1e-8, restart=30, maxiter=1000):
             w = matvec(z)
             # CGS2 against v_0..v_j (mask selects the built part of the basis)
             mask = (jnp.arange(m + 1) <= j).astype(b.dtype)
-            h = (V @ w) * mask
+            # HERMITIAN inner products: Arnoldi orthogonalises in <x, y> = xᴴy, so the basis must be
+            # conjugated. `V @ w` is the bilinear form -- correct on reals, wrong on complex, where it
+            # silently produces a non-orthogonal basis. `jnp.conj` on a real array is a no-op.
+            h = (jnp.conj(V) @ w) * mask
             w = w - h @ V
-            h2 = (V @ w) * mask
+            h2 = (jnp.conj(V) @ w) * mask
             w = w - h2 @ V
             h = h + h2
             hj1 = jnp.linalg.norm(w)
@@ -122,17 +125,25 @@ def fgmres(matvec, b, *, M=None, x0=None, tol=1e-8, restart=30, maxiter=1000):
             # apply the stored Givens rotations of columns 0..j-1 to the new column
             def rot(i, hc):
                 hi, hi1 = hc[i], hc[i + 1]
-                new_i = cs[i] * hi + sn[i] * hi1
+                new_i = jnp.conj(cs[i]) * hi + jnp.conj(sn[i]) * hi1
                 new_i1 = -sn[i] * hi + cs[i] * hi1
                 return jnp.where(i < j, hc.at[i].set(new_i).at[i + 1].set(new_i1), hc)
 
             hcol = jax.lax.fori_loop(0, m, rot, hcol)
 
             # new rotation annihilating the subdiagonal entry
-            denom = jnp.sqrt(hcol[j] ** 2 + hcol[j + 1] ** 2)
-            c_new = hcol[j] / jnp.maximum(denom, tiny)
-            s_new = hcol[j + 1] / jnp.maximum(denom, tiny)
-            hcol = hcol.at[j].set(denom).at[j + 1].set(0.0)
+            # Givens on MAGNITUDES, not squares: `h**2` is negative-capable and complex-wrong, so the
+            # rotation has to be built from |h|. `c` comes out real and non-negative and `s` carries the
+            # phase of h[j], which is what makes the rotation unitary rather than merely orthogonal.
+            # On real input this is the same rotation up to the sign convention (c >= 0 always), and a
+            # sign flip of a Givens pair leaves the least-squares solution -- hence `y` -- unchanged.
+            aj = jnp.abs(hcol[j])
+            denom = jnp.sqrt(aj**2 + jnp.abs(hcol[j + 1]) ** 2)
+            safe = jnp.maximum(denom, tiny)
+            c_new = (aj / safe).astype(b.dtype)
+            phase = jnp.where(aj > tiny, hcol[j] / jnp.maximum(aj, tiny), jnp.ones((), b.dtype))
+            s_new = hcol[j + 1] * jnp.conj(phase) / safe
+            hcol = hcol.at[j].set(denom * phase).at[j + 1].set(0.0)
             gj = g[j]
 
             new = (
