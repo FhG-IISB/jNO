@@ -457,6 +457,76 @@ def test_vertex_sparsity_scales_linearly_not_quadratically():
 
 
 # ---------------------------------------------------------------------------------------------
+# the non-nodal NONLINEAR tangent assembles per element
+# ---------------------------------------------------------------------------------------------
+
+
+def _nonlinear_nonnodal(kind):
+    """A genuinely nonlinear weak form, so the tangent depends on the state."""
+    inner, vecf = jno.np.inner, jno.np.vector
+    if kind == "n1e":  # nu(|B|) curl-curl -- the B-H-curve shape
+        d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.34).domain()
+        u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
+        c = d.variable("interior", split=True)
+        x, y, z = c[0], c[1], c[2]
+        ui, vi = u.bind(x=x, y=y, z=z), v.bind(x=x, y=y, z=z)
+        cu, cv = u.vector.curl(x, y, z), v.vector.curl(x, y, z)
+        src = vecf(0.0 * x, 0.0 * x, jno.np.where(x > 0.5, 1.0, 0.0))
+        return jno.fem([(1.0 + inner(cu, cu)) * inner(cu, cv) + inner(ui, vi) - inner(src, vi)])
+    d = jno.Shape.rect(0, 0, 1, 1, size=0.22).domain()  # nonlinear biharmonic on Morley
+    u, v = d.fem_symbols(space="Morley")
+    c = d.variable("interior", split=True)
+    b = d.variable("boundary", split=True)
+    a, q = u.bind(x=c[0], y=c[1]), v.bind(x=c[0], y=c[1])
+    H = lambda f: jno.np.hessian(f, [c[0], c[1]])  # noqa: E731
+    return jno.fem([(1.0 + a**2) * jno.np.inner(H(a), H(q), n_contract=2) - 1.0 * q, u(b[0], b[1]) - 0.0])
+
+
+@pytest.mark.parametrize("kind", ["n1e", "morley"])
+def test_nonlinear_nonnodal_tangent_is_sparse_and_correct(kind):
+    """The non-nodal Newton tangent was a global dense ``jacfwd`` for **every** family — edge and
+    vertex alike — because the sparse assembler linearised at ``u = 0``, which is exact for a linear
+    form and wrong for a nonlinear one. Threading the current iterate in gives ``J(u_k)`` per element;
+    the sparsity pattern is unchanged (it is mesh connectivity), so only the element data moves.
+
+    Checked at THREE states, which is the point: agreeing at ``u = 0`` alone would only re-prove the
+    linear case. The oracle is ``jacfwd`` of the operator's own residual — independent of the triplet
+    machinery, so a wrong scatter cannot agree with itself."""
+    pytest.importorskip("shapely", reason="shapely required for the box/rect domains")
+    fem = _nonlinear_nonnodal(kind)
+    n = int(fem.dofs)
+    J, R = fem._op.jacobian, fem._op.residual
+    rng = np.random.default_rng(0)
+
+    for tag, u in (
+        ("zero", np.zeros(n)),
+        ("random", rng.standard_normal(n) * 0.3),
+        ("large", rng.standard_normal(n) * 2.0),
+    ):
+        uj = jax.numpy.asarray(u)
+        Js = J(uj)
+        assert hasattr(Js, "indices"), f"{kind}/{tag}: the tangent must be a BCOO, not a dense array"
+        assert int(Js.nse) < n * n / 4, f"{kind}/{tag}: nse={int(Js.nse)} is not meaningfully sparse"
+        ref = np.asarray(jax.jacfwd(lambda w: jax.numpy.asarray(R(w)).reshape(-1))(uj))
+        got = np.asarray(Js.todense())
+        scale = max(1.0, float(np.max(np.abs(ref))))
+        assert np.max(np.abs(got - ref)) / scale < 1e-11, f"{kind}/{tag}: the sparse tangent is not the tangent"
+
+
+def test_the_nonlinear_tangent_actually_depends_on_the_state():
+    """Guards the mistake this change exists to fix. If the assembler still linearised at ``u = 0``
+    the tangent would be the same matrix at every iterate — which is exactly the wrong answer for a
+    nonlinear form, and every *linear* test would still pass."""
+    pytest.importorskip("shapely", reason="shapely required for the rect domain")
+    fem = _nonlinear_nonnodal("morley")
+    n = int(fem.dofs)
+    J = fem._op.jacobian
+    a = np.asarray(J(jax.numpy.zeros(n)).todense())
+    b = np.asarray(J(jax.numpy.asarray(np.random.default_rng(1).standard_normal(n) * 0.5)).todense())
+    assert np.max(np.abs(a - b)) > 1e-8, "the tangent is state-independent — it is still linearised at u=0"
+
+
+# ---------------------------------------------------------------------------------------------
 # the compression primitive itself
 # ---------------------------------------------------------------------------------------------
 
