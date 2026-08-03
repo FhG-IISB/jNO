@@ -69,7 +69,15 @@ _COMPONENT_NAMES = {0: "x", 1: "y", 2: "z"}
 
 
 def _residual_check(A, b, u, who):
-    """Raise (eagerly) if ``A u = b`` is not solved -- a hard fail beats silently returning garbage."""
+    """Raise (eagerly) if ``A u = b`` is not solved -- a hard fail beats silently returning garbage.
+
+    Under ``jit``/``vmap``/``grad`` this is a **no-op**: the check needs a concrete residual, so it
+    would both force a device->host sync and fail to concretise. Without that guard
+    ``jax.jit(fem.solve)`` raised ``ConcretizationTypeError`` from the ``float()`` below rather than
+    simply skipping the check. Mirrors ``solver_api._maybe_residual_check``, which already does this;
+    the two had drifted apart. There the solver's own iteration cap is the guard."""
+    if any(isinstance(v, jax.core.Tracer) for v in (u, b)):
+        return u
     matvec = (lambda v: A @ v) if hasattr(A, "__matmul__") else (lambda v: jnp.asarray(A) @ v)
     rel = float(jnp.linalg.norm(b - matvec(u)) / (jnp.linalg.norm(b) + 1e-30))
     if not np.isfinite(rel) or rel > 1e-4:
