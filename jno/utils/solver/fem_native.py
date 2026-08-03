@@ -391,6 +391,45 @@ def build_native_fem_context(domain, *, element_type, quad_degree, vec=1, neuman
 # ---------------------------------------------------------------------------
 
 
+class _CellFieldData(dict):
+    """One field's per-cell data, with ``shape_hess`` built only if a term actually reads it.
+
+    ``ref_hess`` is tabulated for **every** Lagrange element (``lagrange_tri``/``lagrange_tet`` fill
+    it unconditionally), so the old ``if ref_hess is not None`` guard never fired: a plain P1 Poisson
+    computed physical shape Hessians it has no way to use. That is not free -- the push-forward is a
+    three-operand ``einsum`` over the batched cell axis, and it measured **467 ms of the 3716 ms**
+    spent compiling one ``jno.fem()`` build, 12.6% of the total, on a problem with no second
+    derivative anywhere.
+
+    Only a 4th-order weak form (Argyris/Morley plates, biharmonic) reads it, through
+    ``fem_utils._field_hess``, which already uses ``.get`` and raises a clear error on ``None``. So
+    the value is produced on first read instead of always: identical for the forms that need it,
+    absent for the ones that do not.
+
+    ``get`` is overridden as well as ``__missing__`` because ``_field_hess`` reaches the key through
+    ``.get`` -- and ``dict.get`` does not consult ``__missing__``, so overriding only the latter would
+    have deferred the work and then silently reported "this element has no second derivatives".
+    """
+
+    __slots__ = ("_hess_fn",)
+
+    def __init__(self, base, hess_fn):
+        super().__init__(base)
+        self._hess_fn = hess_fn
+
+    def __missing__(self, key):
+        if key != "shape_hess" or self._hess_fn is None:
+            raise KeyError(key)
+        self["shape_hess"] = value = self._hess_fn()
+        return value
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
 def assemble_fem_native(
     domain,
     volume_terms: List[Any],
@@ -857,9 +896,11 @@ def assemble_fem_native(
         per = []
         for i in range(len(fields)):
             phi, dphi = identity_pushforward(ref_vals_all[i], ref_grads_all[i], J, detJ)
-            fd = {"shape_vals": phi, "shape_grads": dphi, "cell_sol": cell_sols[i], "space": "Lagrange"}
-            if ref_hess_all[i] is not None:  # physical shape Hessian for 4th-order weak forms
-                fd["shape_hess"] = identity_pushforward_hess(ref_hess_all[i], J)
+            fd = _CellFieldData(
+                {"shape_vals": phi, "shape_grads": dphi, "cell_sol": cell_sols[i], "space": "Lagrange"},
+                # Deferred: only a 4th-order weak form ever reads this. See _CellFieldData.
+                None if ref_hess_all[i] is None else (lambda _rh=ref_hess_all[i], _J=J: identity_pushforward_hess(_rh, _J)),
+            )
             per.append(fd)
 
         return per, xq, meas
