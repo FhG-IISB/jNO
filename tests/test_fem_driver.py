@@ -38,6 +38,37 @@ def _x64():
         jax.config.update("jax_enable_x64", prev)
 
 
+def test_solve_fn_receives_the_operator_as_assembled_not_densified():
+    """``solve_fn`` is *your* solver, so it gets the operator exactly as assembled — the BCOO.
+
+    It used to be densified first, which made bringing your own SPARSE solver pointless at the sizes
+    where you would want one: densifying is ``O(n²)`` on an ``O(nnz)`` operator — 418 MiB against 1.3
+    MiB at n=7407, and 20.5 GiB against 9.4 MiB at n=51843, which OOMs before the solver runs.
+
+    Pinned by capturing what the callable is handed, because this is the kind of contract that is
+    easy to reverse by accident and impossible to notice from a correct answer."""
+
+    seen = {}
+
+    def capture(A, b):
+        seen["sparse"] = hasattr(A, "indices")
+        seen["nbytes"] = int(A.data.nbytes + A.indices.nbytes) if seen["sparse"] else int(A.nbytes)
+        seen["n"] = int(A.shape[0])
+        return jnp.linalg.solve(_dense(A), jnp.asarray(b).reshape(-1))
+
+    _d, fem = _poisson_fem()
+    u = np.asarray(fem.solve(solve_fn=capture)).reshape(-1)
+
+    assert seen["sparse"], "solve_fn was handed a densified operator, not the assembled BCOO"
+    n = seen["n"]
+    assert seen["nbytes"] < n * n * 8, f"the operator carries {seen['nbytes']} B, no better than dense"
+    assert np.all(np.isfinite(u))
+    # and it still solves the system the assembler built
+    A, b = fem.operator
+    rel = float(jnp.linalg.norm(jnp.asarray(A @ jnp.asarray(u)) - jnp.asarray(b).reshape(-1)))
+    assert rel / max(1e-30, float(jnp.linalg.norm(jnp.asarray(b)))) < 1e-10
+
+
 def _dense(A):
     return np.asarray(A.todense() if hasattr(A, "todense") else A)
 
@@ -74,7 +105,10 @@ def test_linear_solve_default_and_custom_solver_match():
     _, fem = _poisson_fem()
     direct = np.linalg.solve(_dense(fem.A), np.asarray(fem.b).reshape(-1))
     u_default = np.asarray(fem.solve())
-    u_custom = np.asarray(fem.solve(solve_fn=lambda A, b: jnp.linalg.solve(A, b)))
+    # `solve_fn` receives the operator AS ASSEMBLED (a BCOO), never a densified copy -- densifying an
+    # O(nnz) operator would be O(n^2) and would defeat bringing your own sparse solver. A dense solver
+    # therefore densifies itself, which is the one line below.
+    u_custom = np.asarray(fem.solve(solve_fn=lambda A, b: jnp.linalg.solve(_dense(A), b)))
     assert np.allclose(u_default, direct, atol=1e-6)  # iterative: converged to BiCGStab tol
     assert np.allclose(u_custom, direct, atol=1e-10)  # dense direct: exact
 
