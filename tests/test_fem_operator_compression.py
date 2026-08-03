@@ -376,6 +376,87 @@ def test_both_assemblers_share_one_chunk_policy():
 
 
 # ---------------------------------------------------------------------------------------------
+# the C0/C1 vertex families assemble sparsely (Hermite, Argyris, Morley)
+# ---------------------------------------------------------------------------------------------
+
+
+def _vertex_fem(space, h):
+    """The form each family exists for: 4th-order full-Hessian for the C¹/biharmonic ones, a
+    2nd-order form for Hermite (C⁰)."""
+    d = jno.Shape.rect(0, 0, 1, 1, size=h).domain()
+    u, v = d.fem_symbols(space=space)
+    c = d.variable("interior", split=True)
+    b = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=c[0], y=c[1]), v.bind(x=c[0], y=c[1])
+    if space == "Hermite":
+        terms = [ui.x * vi.x + ui.y * vi.y + ui * vi - 1.0 * vi, u(b[0], b[1]) - 0.0]
+    else:
+        H = lambda f: jno.np.hessian(f, [c[0], c[1]])  # noqa: E731
+        terms = [jno.np.inner(H(ui), H(vi), n_contract=2) - 1.0 * vi, u(b[0], b[1]) - 0.0]
+    return jno.fem(terms)
+
+
+@pytest.mark.parametrize("space", ["Hermite", "Argyris", "Morley"])
+def test_vertex_families_assemble_sparsely(space):
+    """These families built their operator with a **global dense ``jacfwd``**, which was never a
+    property of C⁰/C¹ elements — ``_elem_res`` calls the same ``_cell_fields`` that carries their
+    per-cell ``M(cell)`` DOF-transform and ``shape_hess``, and the residual already assembled them
+    element-by-element through it.
+
+    The dense form's real cost was the ``O(n_dofs × n_cells)`` tangent, not the matrix. Measured on
+    Argyris at 635 DOFs before the change: a 3.1 MiB operator with a **2279 MiB** peak — 741× the
+    stored size, and it OOMed at the next mesh refinement. Sparse reached 22511 DOFs, a 35× larger
+    problem, with peak memory growing as n^1.00 instead of n^1.7."""
+    pytest.importorskip("shapely", reason="shapely required for the rect domain")
+    A, _b = _vertex_fem(space, 0.2).operator
+    assert hasattr(A, "indices"), f"{space} must assemble to a BCOO, not a dense array"
+    n = int(A.shape[0])
+    assert int(A.nse) < n * n / 4, f"{space}: nse={int(A.nse)} is not meaningfully sparse for n={n}"
+    _assert_compressed(A, f"{space} operator")
+    _matvec_matches_uncompressed(A, seed=5)
+
+
+@pytest.mark.parametrize("space", ["Hermite", "Argyris", "Morley"])
+def test_vertex_family_solve_stays_direct(space):
+    """Storage changed; the SOLVER must not. A dense operator landed on ``jnp.linalg.solve``, so
+    going sparse would silently hand these to the Jacobi-preconditioned BiCGStab that serves real
+    elliptic systems — and they are 4th-order biharmonic operators where it does not converge
+    (``test_fem_morley.py`` asserts even the *well-conditioned* form is only ``cond < 1e12``).
+
+    Pinned two ways: the routing flag the dispatch reads, and that the answer is actually good."""
+    pytest.importorskip("shapely", reason="shapely required for the rect domain")
+    fem = _vertex_fem(space, 0.2)
+    assert getattr(fem.domain, "_fem_prefer_direct", False), f"{space} must be routed to a direct solve"
+
+    u = np.asarray(fem.solve()).reshape(-1)
+    assert np.all(np.isfinite(u))
+    A, b = fem.operator
+    res = np.linalg.norm(np.asarray(A @ jax.numpy.asarray(u)) - np.asarray(b).reshape(-1))
+    rel = res / max(1e-30, float(np.linalg.norm(np.asarray(b))))
+    # a direct solve is exact to round-off; an under-converged iterative one would sit near its tol
+    assert rel < 1e-10, f"{space}: relative residual {rel:.2e} — this looks iterative, not direct"
+
+
+def test_vertex_sparsity_scales_linearly_not_quadratically():
+    """The property that moves the ceiling. Dense storage is ``O(n²)``; the element assembly's is
+    ``O(n)`` with a family-dependent constant. Checked on two mesh sizes so this measures the SLOPE
+    rather than a single lucky point."""
+    pytest.importorskip("shapely", reason="shapely required for the rect domain")
+    A_c, _ = _vertex_fem("Argyris", 0.25).operator
+    A_f, _ = _vertex_fem("Argyris", 0.15).operator
+    n_c, n_f = int(A_c.shape[0]), int(A_f.shape[0])
+    assert n_f > 1.5 * n_c, "the finer mesh must actually be finer"
+
+    per_row_c, per_row_f = int(A_c.nse) / n_c, int(A_f.nse) / n_f
+    # nnz per row is set by the element stencil, so it must stay ~flat as the mesh refines
+    assert 0.7 < per_row_f / per_row_c < 1.4, (
+        f"nnz/row moved {per_row_c:.1f} -> {per_row_f:.1f}: storage is not growing linearly in n"
+    )
+    # and the win over dense grows with n rather than being a constant factor
+    assert (n_f * n_f) / int(A_f.nse) > (n_c * n_c) / int(A_c.nse)
+
+
+# ---------------------------------------------------------------------------------------------
 # the compression primitive itself
 # ---------------------------------------------------------------------------------------------
 
