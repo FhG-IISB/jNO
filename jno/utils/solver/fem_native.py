@@ -1305,27 +1305,46 @@ def assemble_fem_native(
     # `lax.map(..., batch_size=C)` vmaps C cells at a time and scans over the chunks, so the batched
     # intermediate is capped at C cells regardless of mesh size. Remainders are handled (verified at
     # several non-dividing C) and gradients match the unchunked form exactly.
-    # Sized in CELLS, capped in bytes. GPU saturation depends on how many independent work items a
-    # chunk has, not on how many bytes it occupies, so a pure byte budget starves the device as soon as
-    # the per-cell block grows (P2/P3, vector fields). Swept on an RTX 3070 at 97824 cells, measuring
-    # the full solve rather than the assembly alone:
+    # Sized in CELLS, capped by a fraction of the DEVICE's memory. GPU saturation depends on how many
+    # independent work items a chunk has, not on how many bytes it occupies, so a pure byte budget
+    # starves the device as soon as the per-cell block grows (P2/P3, vector fields).
+    #
+    # Swept on an RTX 3070 at 97824 cells, measuring the full solve rather than the assembly alone:
     #
     #   cells/chunk   2048    4096    8192   16384   32768   unchunked
     #   solve peak   287.6   256.0   273.6   279.5   378.6     801.8 MiB
     #   jacobian      6.08    4.51    3.81    3.69    3.50      3.24 ms
     #
-    # The cliff is between "chunked at all" and "not": one chunk costs 802 MiB, any split more than
-    # halves it. Below ~8k cells the device runs dry and the assembly nearly doubles in time, while
-    # above ~16k the extra memory buys almost no speed. Note the peak is NOT monotonic in chunk size --
-    # 2048 cells is worse than 4096 -- so "smaller is safer" would have been the wrong instinct.
+    # Three things that sweep settles and reasoning would not: the cliff is between "chunked at all"
+    # and "not" (one chunk costs 802 MiB, any split more than halves it), so the exact size matters far
+    # less than whether it splits; the peak is NOT monotonic in chunk size (2048 is worse than 4096),
+    # so "smaller is safer" is the wrong instinct; and below ~8k cells the device runs dry and assembly
+    # nearly doubles, while above ~16k the extra memory buys almost no speed.
     #
-    # 16384 cells is the chosen operating point: near the memory floor, within 15% of the unchunked
-    # assembly time. The byte cap only binds for large per-cell blocks, and the cell floor then keeps
-    # the chunk from collapsing below saturation -- there, exceeding the byte budget is the better
-    # trade, because the alternative is a ~2x slowdown.
-    _CHUNK_TARGET_CELLS = 16384
-    _CHUNK_MAX_BYTES = 8 << 20
-    _CHUNK_MIN_CELLS = 8192  # saturation floor: below this the GPU runs dry
+    # The cap is expressed RELATIVE TO THE DEVICE so it is not tuned to one machine: a chunk may use
+    # ~0.15% of device memory, which reproduces the measured optimum here (0.15% of 5.7 GiB = 8.8 MiB
+    # = 17.9k P1 cells) and scales on its own to a larger card, which has both more memory to spend and
+    # more cores to feed.
+    #
+    # The saturation FLOOR is the one number that cannot be derived: JAX exposes device memory
+    # (`bytes_limit`) but not the SM/core count, so there is nothing portable to compute it from. It is
+    # therefore set conservatively LOW, where it binds only for large per-cell blocks -- and when it
+    # binds it deliberately overruns the memory cap, because the measured alternative is a ~2x
+    # slowdown. A bigger card would want a higher floor, but on a bigger card the memory-derived cap is
+    # already well above it, so the floor stops mattering exactly where it would have been wrong.
+    _CHUNK_MEMORY_FRACTION = 0.0015
+    _CHUNK_MIN_CELLS = 8192  # saturation floor; see above -- not derivable, so kept low on purpose
+    _CHUNK_FALLBACK_BYTES = 8 << 20  # CPU / unknown device: no saturation pressure, just bound memory
+
+    def _chunk_budget_bytes():
+        """Bytes one element chunk may occupy, taken from the device rather than tuned to one."""
+        try:
+            limit = jax.local_devices()[0].memory_stats().get("bytes_limit")
+        except Exception:  # noqa: BLE001 -- CPU backends expose no memory stats
+            limit = None
+        if not limit:
+            return _CHUNK_FALLBACK_BYTES
+        return max(_CHUNK_FALLBACK_BYTES // 2, int(limit * _CHUNK_MEMORY_FRACTION))
 
     def _cell_chunk(n_items: int, n_test: int, n_local: int):
         """Cells per chunk, or ``None`` to keep the plain single `vmap`.
@@ -1335,7 +1354,7 @@ def assemble_fem_native(
         finely than it strictly needs -- a deliberate simplification: one policy, one explanation, and
         the cost of an extra chunk is a scan step, not a re-computation."""
         per = max(1, int(n_test) * int(n_local) * int(n_local) * 8)
-        chunk = min(_CHUNK_TARGET_CELLS, max(1, _CHUNK_MAX_BYTES // per))
+        chunk = max(1, _chunk_budget_bytes() // per)
         chunk = max(chunk, _CHUNK_MIN_CELLS)  # never starve the device to honour the byte cap
         if n_items <= chunk:
             return None  # one chunk anyway -- skip the scan overhead entirely
