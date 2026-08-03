@@ -3018,7 +3018,7 @@ def fem(
     later run), and threading a parameter through ten ``assemble_fem_native`` call sites to say the
     same thing would be churn for no gain.
     """
-    from .utils.solver import fem_native as _fn
+    from .utils.solver import fem_utils as _fn  # the chunk policy's home; both assemblers read it
 
     prev, prev_consumed = _fn._CHUNK_OVERRIDE[0], _fn._CHUNK_CONSUMED[0]
     _fn._CHUNK_OVERRIDE[0] = _fn.normalize_chunk(chunk)
@@ -3036,8 +3036,8 @@ def fem(
             # loops and none of them chunk, so an explicit request there would quietly do nothing.
             raise ValueError(
                 "jno.fem: chunk= was given, but this problem routes to an assembler with no chunked "
-                "element loop (the 1-D and non-nodal/N1E-RT paths are not covered yet). Drop chunk= "
-                "to use the default, which is a no-op on those paths."
+                "element loop -- the 1-D assembler is the remaining one. Drop chunk= to use the "
+                "default, which is a harmless no-op there."
             )
         return out
     finally:

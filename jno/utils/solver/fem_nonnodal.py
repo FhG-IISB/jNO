@@ -212,7 +212,15 @@ def assemble_fem_nonnodal(
     # runtime-parameter slots (layout [temporal..., runtime_param..., region_mask...]) and raises loudly
     # if the assembly path did not thread it -- which this (non-nodal) path previously never did, so
     # per-material eps on an N1E/RT form was unreachable. Mirrors `fem_native`.
-    from .fem_utils import _cell_region_mask, _collect_region_mask_names
+    from .fem_utils import _CHUNK_CONSUMED, _CHUNK_OVERRIDE, _cell_region_mask, _collect_region_mask_names
+    from .fem_utils import cell_chunk as _cell_chunk_of
+    from .fem_utils import elem_map as _elem_map
+
+    # Same element-chunk policy as the native assembler (see `fem_utils`): a single `vmap` over every
+    # cell materialises the whole batched intermediate at once, and on a 3-D vector mesh that is what
+    # sets the ceiling. Captured here, once, because the closures below run at solve time.
+    _chunk_setting = _CHUNK_OVERRIDE[0]
+    _CHUNK_CONSUMED[0] = True
 
     region_mask_names: Tuple[str, ...] = tuple(
         sorted(
@@ -564,7 +572,11 @@ def assemble_fem_nonnodal(
                         local["neural_coefficients"] = _nt
                     return _integrate_term(domain, e, local, qw * meas)  # (ndof of the test field,)
 
-                elem = jax.vmap(_cell)(jnp.arange(n_cells))  # (n_cells, ndof_tfi)
+                elem = _elem_map(  # (n_cells, ndof_tfi)
+                    _cell,
+                    (jnp.arange(n_cells),),
+                    _cell_chunk_of(n_cells, int(cdofs[tfi].shape[1]), int(cdofs[tfi].shape[1]), _chunk_setting),
+                )
                 R = R.at[cdofs[tfi].reshape(-1)].add(elem.reshape(-1))
             return R
 
@@ -799,7 +811,11 @@ def assemble_fem_nonnodal(
                 def _ke(c, la, _e=coeff, _t=tfi, _rn=rnames):
                     return jax.jacfwd(lambda v: _elem_res(c, v, _e, _t, _rn))(la)
 
-                Ke = jax.vmap(_ke)(jnp.arange(n_cells), _asm_local_zero)  # (n_cells, n_test_tfi, n_local_all)
+                Ke = _elem_map(  # (n_cells, n_test_tfi, n_local_all)
+                    _ke,
+                    (jnp.arange(n_cells), _asm_local_zero),
+                    _cell_chunk_of(n_cells, int(cdofs[tfi].shape[1]), int(_cell_all_dofs.shape[1]), _chunk_setting),
+                )
                 data_l.append(Ke.reshape(-1))
 
             data = jnp.concatenate(data_l) if data_l else jnp.zeros((0,), zeros.dtype)

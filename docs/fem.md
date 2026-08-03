@@ -253,8 +253,15 @@ where they differ from the mesh vertices), `fem.operator`, and `fem.classificati
 >
 > `chunk=False` restores the single `vmap`, and a positive int pins cells per chunk. It lives on
 > `jno.fem` rather than `fem.solve` because the steady-linear operator is assembled *here*, before any
-> solve. On the 1-D and non-nodal assemblers — whose element loops are **not** chunked — an explicit
-> `chunk=` raises instead of being ignored.
+> solve.
+>
+> Coverage, since it is not uniform. The **native** assembler chunks its residual and jacobian, volume
+> and surface loops. The **non-nodal** assembler chunks its residual element loop for every family, and
+> its jacobian for the edge/cell families (N1E/RT/P0) — the 3-D vector route where this matters most.
+> The vertex C⁰/C¹ families (Hermite, Argyris, Morley) take a *global dense* `jacfwd` for the jacobian:
+> there is no element loop there to chunk, and their memory cost is `O(n²)` density, a different
+> problem needing per-element assembly rather than a different schedule. The **1-D** assembler is not
+> chunked at all, and an explicit `chunk=` there raises rather than being silently ignored.
 
 > **Term introspection (provisional).** `fem.term_kinds` returns a `list[TermKind]` — each
 > additively-split PDE (volume) term classified by `support`, `time_order`, `trial_channel` /
