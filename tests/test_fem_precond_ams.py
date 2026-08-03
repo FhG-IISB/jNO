@@ -374,3 +374,52 @@ def test_complex_ams_drives_a_flexible_outer():
     x = _solve(fem, linear=jno.solve.fgmres(tol=1e-9, restart=120, maxiter=1200), precond=spec)
     assert np.all(np.isfinite(x))
     assert np.linalg.norm(x - x_lu) / np.linalg.norm(x_lu) < 1e-6
+
+
+def test_complex_ams_takes_an_amg_auxiliary():
+    """The auxiliary that makes complex AMS cheap -- and the reason it did not work before.
+
+    AMS splits every complex auxiliary into the real-equivalent 2n block ``[[Re,-Im],[Im,Re]]``,
+    because AmgX-style multigrid is real-only. That block is skew-dominated by construction (measured
+    ‖A-Aᵀ‖/‖A‖ = 2.0 with the mass term dominating), and algebraic multigrid cannot coarsen it:
+    smoothed aggregation diverged to 1e+20, ``air_solver`` made no progress, Ruge-Stuben returned NaN.
+    A plain Krylov aux fared no better -- cg stalls at 7.6e-4 and bicgstab at 5.8e-4, identically at
+    aux tolerances 1e-3 and 1e-6, so the tolerance was never the limiter.
+
+    The underlying COMPLEX auxiliary is exactly complex-symmetric (8e-17), where the same solver
+    converges in 5-7 iterations. pyamg builds complex hierarchies natively, so an aux that declares
+    ``complex_ok`` skips the reformulation and gets the block multigrid can actually solve.
+    """
+    fem = _complex_eddy(0.3, freq=1e6, eps=1e-3)
+    x_lu = _solve(fem, linear=jno.solve.lu())
+    spec = jno.precond.ams(aux=jno.precond.amg())
+    x = _solve(fem, linear=jno.solve.fgmres(tol=1e-9, restart=120, maxiter=1200), precond=spec)
+    assert np.all(np.isfinite(x))
+    assert np.linalg.norm(x - x_lu) / np.linalg.norm(x_lu) < 1e-6
+
+
+def test_amg_aux_keeps_the_complex_blocks_unreformulated():
+    """The mechanism, pinned directly: a ``complex_ok`` aux must leave the auxiliaries COMPLEX, and a
+    real-only one must still get the 2n reformulation. Getting this backwards is silent -- the solve
+    still runs, it just stalls."""
+    fem = _complex_eddy(0.3, freq=1e6, eps=1e-3)
+
+    amg_aux = jno.precond.ams(aux=jno.precond.amg()).build(fem)._frozen
+    assert amg_aux["complex"] and amg_aux["aux_complex"]
+    assert np.iscomplexobj(amg_aux["rg_csr"].data), "a complex-capable aux must get complex blocks"
+    assert amg_aux["rg_csr"].shape[0] == amg_aux["rg_nv"], "not the doubled 2n block"
+
+    default_aux = jno.precond.ams().build(fem)._frozen  # exact SuperLU: real-only path
+    assert not default_aux["aux_complex"]
+    assert default_aux["rg_csr"].shape[0] == 2 * default_aux["rg_nv"], "expected the real 2n block"
+
+
+def test_amg_aux_still_lets_ams_compile():
+    """An AMG aux is applied through jNO's own ``pure_callback`` wrapper, which ``jit`` supports, so it
+    must not knock AMS back onto the eager path."""
+    from jno.utils.solver.solver_api import _compilable
+
+    fem = _curlcurl_source(0.4, beta=1e-4)
+    spec = jno.precond.ams(aux=jno.precond.amg()).build(fem)
+    assert spec.traceable is True
+    assert _compilable(jno.solve.cg(tol=1e-9, maxiter=400), spec)
