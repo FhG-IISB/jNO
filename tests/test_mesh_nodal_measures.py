@@ -145,3 +145,35 @@ def test_points_in_polygon_ignores_horizontal_edges():
 
 def test_points_in_polygon_accepts_a_single_point():
     assert MeshUtils._points_in_polygon_2d(np.array([0.1, 0.1]), PIP_EDGES, PIP_POINTS).tolist() == [True]
+
+
+# --------------------------------------------------------------------------------------------
+# boundary-edge extraction -- the measures and the normals are both built on it
+# --------------------------------------------------------------------------------------------
+def _closes_into_loops(edges):
+    """A boundary is a union of closed loops, so every node on it has exactly two edges."""
+    _, counts = np.unique(np.asarray(edges).ravel(), return_counts=True)
+    return set(counts.tolist()) == {2}
+
+
+@pytest.mark.parametrize("geom", [box(0.0, 0.0, 1.0, 1.0), SQUARE_HOLE])
+def test_extracted_boundary_edges_close_into_loops(geom):
+    mesh = jno.domain(geom, mesh_size=0.06).mesh
+    edges = np.asarray(MeshUtils.extract_boundary_edges(mesh.cells_dict["triangle"], len(mesh.points)))
+    assert len(edges) > 0
+    assert _closes_into_loops(edges)
+
+
+def test_extracted_boundary_edges_are_exactly_the_once_used_ones():
+    tris = np.array([[0, 1, 2], [1, 3, 2]])  # two triangles sharing edge (1, 2)
+    edges = np.asarray(MeshUtils.extract_boundary_edges(tris, 4))
+    assert {tuple(e) for e in edges.tolist()} == {(0, 1), (0, 2), (1, 3), (2, 3)}  # the shared edge is interior
+
+
+def test_volume_boundary_returns_plain_int_tuples():
+    """``_chain_edges_to_loops`` consumes these as dictionary keys."""
+    from jno.domain.domain_class import domain
+
+    edges = domain._extract_volume_boundary(np.array([[0, 1, 2], [1, 3, 2]]))
+    assert set(edges) == {(0, 1), (0, 2), (1, 3), (2, 3)}
+    assert all(isinstance(v, int) for e in edges for v in e)
