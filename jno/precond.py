@@ -472,7 +472,19 @@ def triangular(*pairs) -> _Triangular:
 
 
 class _AMG(_Spec):
-    """Spec for the hybrid (pyamg-setup / pure-JAX-apply) AMG preconditioner; see :func:`amg`."""
+    """Spec for the hybrid (pyamg-setup / pure-JAX-apply) AMG preconditioner; see :func:`amg`.
+
+    ``traceable`` is a *property* here rather than the class-level flag, because whether this spec can
+    be materialised inside a trace depends on whether its hierarchy exists yet. Unbuilt, ``materialize``
+    calls pyamg on the host and must stay eager. **Built** -- via :meth:`build` or ``.cached()`` -- the
+    levels are frozen data and :func:`~jno.utils.solver.amg.vcycle_apply` is pure JAX, so the applier
+    traces like any other.
+
+    That distinction is worth a lot. With the whole solve left eager, every Krylov iteration dispatched
+    a ~10-level V-cycle op by op from Python, which buried AMG's entire algorithmic advantage: at
+    n=46677 a built-hierarchy AMG solve measured 625 ms against 29 ms for Jacobi-BiCGStab -- 21x
+    slower, despite needing an order of magnitude fewer iterations.
+    """
 
     def __init__(self, cycles, max_levels, coarse_size, smoother_degree):
         self.cycles = cycles
@@ -480,6 +492,17 @@ class _AMG(_Spec):
         self.coarse_size = coarse_size
         self.smoother_degree = smoother_degree
         self._levels = None
+
+    @property
+    def traceable(self):  # only once the host-side pyamg setup has happened -- see the class docstring
+        return self._levels is not None
+
+    @property
+    def key(self):
+        """Value identity for the compiled slot path. The hierarchy is the compilation: two specs
+        share a program only if they apply the *same* levels the same number of times. ``self``
+        holds ``_levels``, so its ``id`` cannot be recycled while this spec is alive."""
+        return None if self._levels is None else (type(self), id(self._levels), self.cycles)
 
     def build(self, A) -> "_AMG":
         """Eager one-time setup from a **concrete** operator (BCOO / dense / ``fem.A`` /
