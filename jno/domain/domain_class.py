@@ -2598,14 +2598,10 @@ class domain(MeshIOMixin):
         Returns:
             List of (a, b) edge tuples forming the boundary.
         """
-        from collections import Counter
+        from jno.domain.mesh_utils import MeshUtils
 
-        edge_count = Counter()
-        for tri in triangles:
-            for i in range(3):
-                e = tuple(sorted((int(tri[i]), int(tri[(i + 1) % 3]))))
-                edge_count[e] += 1
-        return [e for e, c in edge_count.items() if c == 1]
+        edges = MeshUtils._get_boundary_elements(np.asarray(triangles), "triangle")
+        return [tuple(e) for e in edges.tolist()]
 
     @staticmethod
     def _chain_edges_to_loops(edges):

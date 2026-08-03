@@ -866,33 +866,16 @@ class MeshUtils:
         triangles : jnp.ndarray
             (n_tri, 3) triangle connectivity.
         n_points : int
-            Total number of points.
+            Unused; kept because callers pass it positionally.
 
         Returns
         -------
         jnp.ndarray
-            (n_boundary_edges, 2) boundary edge indices.
+            (n_boundary_edges, 2) boundary edge indices, each sorted low-to-high. The edges come
+            back in lexicographic order rather than first-encountered order -- they describe an
+            unordered edge set, and the callers either re-index or chain them into loops.
         """
-        import numpy as np
-
-        triangles_np = np.asarray(triangles)
-
-        # Collect all edges (sorted to make undirected)
-        edges = []
-        for tri in triangles_np:
-            for k in range(3):
-                e = tuple(sorted([tri[k], tri[(k + 1) % 3]]))
-                edges.append(e)
-
-        # Count occurrences
-        from collections import Counter
-
-        edge_count = Counter(edges)
-
-        # Boundary edges appear exactly once
-        boundary_edges = [list(e) for e, c in edge_count.items() if c == 1]  # type: ignore[misc]
-
-        return jnp.array(boundary_edges)  # type: ignore[return-value]
+        return jnp.array(MeshUtils._get_boundary_elements(np.asarray(triangles), "triangle"))
 
     @staticmethod
     @jax.jit
