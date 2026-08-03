@@ -461,3 +461,66 @@ def test_three_disjoint_pieces_keep_distinct_interior_tags():
     for name in ("p1", "p2", "p3"):
         area_i = _eval_area(dom, f"interior_{name}")
         assert area_i == pytest.approx(1.0, rel=1e-3), f"{name} area: {area_i}"
+
+
+# ---------------------------------------------------------------------------
+# deferred mesh-connectivity entries
+# ---------------------------------------------------------------------------
+
+
+def test_visibility_matrix_is_deferred_until_read():
+    """`VM` raytraces every boundary pair against every boundary edge -- measured ~n_b^3, and 36% of
+    the whole domain build at 432 boundary points -- but only the radiation view-factor path reads
+    it. Building it for every 2-D domain was pure cost for everyone else.
+
+    Deferring must be INVISIBLE: the mapping has to behave exactly as it did when the value was
+    precomputed, which is why `MeshConnectivity` overrides `get`/`__contains__`/`keys` and not just
+    `__getitem__`.
+    """
+    from shapely.geometry import box as _box
+
+    from jno.domain.mesh_utils import MeshConnectivity
+
+    d = jno.domain(_box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1)
+    mc = d.mesh_connectivity
+    assert isinstance(mc, MeshConnectivity)
+
+    # not computed yet ...
+    assert "VM" not in dict.keys(mc), "VM was built eagerly -- the deferral is not in effect"
+    # ... but indistinguishable from an eager dict to every reader
+    assert "VM" in mc
+    assert "VM" in mc.keys()
+    vm = mc["VM"]
+    assert vm is not None and np.asarray(vm).ndim == 2
+    n_b = np.asarray(mc["boundary_points"]).shape[0]
+    assert np.asarray(vm).shape == (n_b, n_b)
+
+    # computed once, then cached like any other entry
+    assert "VM" in dict.keys(mc)
+    assert mc["VM"] is vm
+    assert mc.get("VM") is vm
+
+    # a genuinely absent key still raises / returns the default, rather than being swallowed
+    with pytest.raises(KeyError):
+        mc["no_such_entry"]
+    assert mc.get("no_such_entry", "fallback") == "fallback"
+
+
+def test_deferred_visibility_matches_the_eager_value():
+    """Deferring must not change the matrix -- same raytrace, same inputs, same answer."""
+    from shapely.geometry import box as _box
+
+    from jno.domain.mesh_utils import MeshUtils
+
+    d = jno.domain(_box(0.0, 0.0, 1.0, 1.0), mesh_size=0.15)
+    mc = d.mesh_connectivity
+    deferred = np.asarray(mc["VM"])
+
+    bp = np.asarray(mc["boundary_points"])
+    bpe = np.asarray(mc["boundary_edges"])
+    interior = np.setdiff1d(np.arange(np.asarray(mc["points"]).shape[0]), np.asarray(mc["boundary_indices"]))
+    eager = np.asarray(
+        MeshUtils.get_visibility_matrix_raytrace(bp, bpe, np.asarray(mc["points"])[interior][0], n_ray_samples=20)
+    )
+    assert deferred.shape == eager.shape
+    assert np.array_equal(deferred, eager), "the deferred visibility matrix differs from the eager one"

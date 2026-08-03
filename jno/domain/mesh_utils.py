@@ -6,6 +6,60 @@ import numpy as np
 from scipy.spatial import KDTree
 
 
+class MeshConnectivity(dict):
+    """The mesh-connectivity mapping, with entries that may be computed on **first read**.
+
+    An ordinary ``dict`` in every respect a caller can observe -- ``mc["VM"]``, ``mc.get("VM")`` and
+    ``"VM" in mc`` all behave exactly as when the value was precomputed -- except that a registered
+    entry costs nothing until something actually asks for it.
+
+    This exists for ``VM``, the boundary-to-boundary visibility matrix. Preprocessing built it for
+    every 2-D domain, while exactly one consumer reads it: the radiation view-factor path
+    (``domain_class._compute_view_factors``, guarded by ``view_factor=``). It is not cheap and it is
+    not linear -- it raytraces each of the ``n_b^2`` boundary pairs against every boundary edge, so
+    the cost grows roughly as ``n_b^3``. Measured on a 2-D unit square, as a share of the whole
+    domain build::
+
+        boundary pts     80    160    320    432
+        VM               10     30    185    519  ms
+        share of build    4%    12%    27%    36%
+
+    Doubling the boundary again would put it past 70%. The 3-D branch has the same problem in
+    memory rather than time: its all-visible placeholder is a dense ``(n_b, n_b)`` array, which is
+    hundreds of MB on a real 3-D mesh and, being a placeholder, is usually never read at all.
+
+    Deferring rather than deleting is deliberate: a domain that *does* radiate still gets the same
+    matrix, computed identically, at the moment it is needed.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._deferred = {}
+
+    def defer(self, key, thunk):
+        """Register ``key`` to be produced by ``thunk()`` the first time it is read."""
+        self._deferred[key] = thunk
+
+    def __missing__(self, key):  # only called by __getitem__, and only when the key is absent
+        thunk = self._deferred.pop(key, None)
+        if thunk is None:
+            raise KeyError(key)
+        self[key] = value = thunk()
+        return value
+
+    def __contains__(self, key):
+        return super().__contains__(key) or key in self._deferred
+
+    def get(self, key, default=None):  # dict.get does NOT consult __missing__
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def keys(self):
+        return (super().keys() | self._deferred.keys()) if self._deferred else super().keys()
+
+
 class MeshUtils:
     #: Memory budget, in float64 elements, for one row-block of the axisymmetric ring kernel's
     #: (M, M, n_phi) intermediate. Lower it if the view-factor build OOMs on a small GPU; it changes
@@ -104,13 +158,15 @@ class MeshUtils:
         }
 
         # Store connectivity info
-        mesh_connectivity = {
-            "points": points,
-            element_type: elements,
-            "neighbors": neighbors,
-            "n_points": n_points,
-            "dimension": dimension,
-        }
+        mesh_connectivity = MeshConnectivity(
+            {
+                "points": points,
+                element_type: elements,
+                "neighbors": neighbors,
+                "n_points": n_points,
+                "dimension": dimension,
+            }
+        )
 
         if dimension == 2:
             mesh_connectivity["p1_area"] = np.array(area)
@@ -145,16 +201,21 @@ class MeshUtils:
             )
 
             mesh_connectivity["boundary_edges"] = bpe_local
-            mesh_connectivity["VM"] = MeshUtils.get_visibility_matrix_raytrace(bp, bpe_local, _bp[0], n_ray_samples=20)
+            # Deferred: ~n_b^3 raytracing, read only by the view-factor path. See MeshConnectivity.
+            mesh_connectivity.defer(
+                "VM", lambda: MeshUtils.get_visibility_matrix_raytrace(bp, bpe_local, _bp[0], n_ray_samples=20)
+            )
         elif dimension <= 2:
             # 1-D domains: boundary is just 2 points; ordered visibility still works.
-            mesh_connectivity["VM"] = MeshUtils.get_visibility_matrix_ordered(bp, _bp[0])
+            mesh_connectivity.defer("VM", lambda: MeshUtils.get_visibility_matrix_ordered(bp, _bp[0]))
         else:
             # 3-D (and higher): the 2-D ordered visibility algorithm does not
             # generalise to higher-dimensional boundaries.  Store a trivial
             # all-visible placeholder so the rest of the pipeline keeps working.
+            # Deferred because the placeholder is dense (n_b, n_b) -- hundreds of MB on a real 3-D
+            # mesh, allocated for every domain, and read by nothing unless radiation is in play.
             n_bp = len(bp)
-            mesh_connectivity["VM"] = np.ones((n_bp, n_bp), dtype=np.float32) - np.eye(n_bp, dtype=np.float32)
+            mesh_connectivity.defer("VM", lambda: np.ones((n_bp, n_bp), dtype=np.float32) - np.eye(n_bp, dtype=np.float32))
 
         msg = f"Preprocessed mesh connectivity: {n_points} points, {len(elements)} {element_type}"
 
