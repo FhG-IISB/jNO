@@ -35,7 +35,14 @@ jax.config.update("jax_enable_x64", True)
 
 def build_mesh(size):
     """One tet mesh of the unit cube, generated once, shared by all three libraries."""
+    import os
+
     import jno
+
+    # Set JNO_BENCH_CACHE=1 to measure jNO's build with the persistent compilation cache on. Run
+    # twice: the first run populates it, the second is the steady state a repeated workflow sees.
+    if os.getenv("JNO_BENCH_CACHE"):
+        jno.enable_compile_cache()
 
     d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=size).domain()
     m = d.built_mesh

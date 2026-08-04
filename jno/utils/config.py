@@ -250,6 +250,16 @@ def enable_compile_cache(directory: str | None = None) -> str:
     Off by default because a library should not write to a user's disk uninvited; this is the
     opt-in, also reachable as ``jno.setup(__file__, compile_cache=True)``.
 
+    **The first run is SLOWER, sometimes much slower** -- writing the entries is not free. A 75k-node
+    3-D Poisson build measured 7.45 s with no cache, 18.30 s on the run that populates one, and
+    5.84 s on every run after. It pays back from the second run onward, so it is worth enabling for
+    a repeated workflow (a sweep, an optimisation loop, a test suite, re-running a script) and not
+    worth it for a single cold run.
+
+    The win also scales with how much of a build is compilation, which varies a lot by problem: 74%
+    for mixed-order Stokes but 41% for a P1 Poisson on a large mesh, where mesh-proportional work
+    the cache cannot touch dominates instead.
+
     Both settings are required. ``jax_compilation_cache_dir`` ALONE DOES NOTHING here: JAX's default
     ``jax_persistent_cache_min_compile_time_secs`` of 1.0 s skips every one of these compilations,
     which are individually sub-second.
