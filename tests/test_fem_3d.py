@@ -142,7 +142,11 @@ def test_nonlinear_reaction_newton_recovers_manufactured():
     spo = pytest.importorskip("scipy.optimize")
     # -lap u + u^3 = f, u_exact = x(1-x)y(1-y)z(1-z), u=0 on boundary,
     # f = -lap(u_exact) + u_exact^3 = 2(gy*gz + gx*gz + gx*gy) + u^3.
-    d = _cube(0.34)
+    # 0.25 (15 interior nodes, rel err 0.065), not 0.34: at 0.34 the cube resolves to just TWO
+    # interior nodes and the error is 0.1124 -- the 1e-1 assertion below then turns on where those
+    # two nodes happen to land rather than on convergence, and moved either side of the tolerance
+    # when the mesher changed. This size measures the discretisation, which is what it claims to.
+    d = _cube(0.25)
     xi, yi, zi = _xyz(d)
     u, phi = d.fem_symbols()
     cb = d.variable("boundary", split=True)

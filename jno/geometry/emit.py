@@ -380,15 +380,20 @@ MESH_THREADS = 8
 MESH_ALGORITHM_2D = 6
 
 
-def _build_once(shape, split_full, periodic=None, algorithm=None, algorithm3d=None, threads=None):
+def _build_once(shape, split_full, periodic=None, algorithm=None, threads=None):
     import gmsh
 
     started = not gmsh.isInitialized()
     if started:
         gmsh.initialize()
         gmsh.option.setNumber("General.Terminal", 0)
-    gmsh.option.setNumber("Mesh.Algorithm", MESH_ALGORITHM_2D if algorithm is None else int(algorithm))
-    gmsh.option.setNumber("Mesh.Algorithm3D", MESH_ALGORITHM_3D if algorithm3d is None else int(algorithm3d))
+    # Both kernels get jNO's default, then `algorithm` overrides the one for the shape's OWN
+    # dimension. A 3-D shape still meshes its surfaces with the 2-D kernel first, so that one stays
+    # on the quality default rather than being overridden by a 3-D algorithm number.
+    gmsh.option.setNumber("Mesh.Algorithm", MESH_ALGORITHM_2D)
+    gmsh.option.setNumber("Mesh.Algorithm3D", MESH_ALGORITHM_3D)
+    if algorithm is not None:
+        gmsh.option.setNumber("Mesh.Algorithm3D" if shape.dim == 3 else "Mesh.Algorithm", int(algorithm))
     n_threads = MESH_THREADS if threads is None else int(threads)
     gmsh.option.setNumber("General.NumThreads", n_threads)
     gmsh.option.setNumber("Mesh.MaxNumThreads3D", n_threads)
@@ -413,12 +418,13 @@ def _build_once(shape, split_full, periodic=None, algorithm=None, algorithm3d=No
             gmsh.finalize()
 
 
-def build(shape, periodic=None, *, algorithm=None, algorithm3d=None, threads=None):
+def build(shape, periodic=None, *, algorithm=None, threads=None):
     """Mesh ``shape`` -> ``(meshio.Mesh, dim, ds)``.
 
-    ``algorithm`` / ``algorithm3d`` / ``threads`` override gmsh's mesher choice; ``None`` uses
-    :data:`MESH_ALGORITHM_2D` / :data:`MESH_ALGORITHM_3D` / :data:`MESH_THREADS`, whose docstrings
-    record the measurements behind each default.
+    ``algorithm`` selects gmsh's meshing kernel for the shape's own dimension -- there is no
+    separate 2-D/3-D argument because ``shape.dim`` already says which applies. ``threads`` sets the
+    thread count. ``None`` uses :data:`MESH_ALGORITHM_2D` / :data:`MESH_ALGORITHM_3D` /
+    :data:`MESH_THREADS`, whose docstrings record the measurements behind each default.
 
     ``periodic`` is an optional list of ``(master_name, slave_name)`` boundary-face pairs meshed conforming
     (via :func:`_apply_periodic`) so opposite faces line up — needed for Nédélec edge periodic ties.
@@ -427,7 +433,7 @@ def build(shape, periodic=None, *, algorithm=None, algorithm3d=None, threads=Non
     while an axis-touching profile (a cone) meshes fine that way -- so we try the single sweep first and
     only fall back to the two-halves construction if meshing fails.
     """
-    opts = dict(algorithm=algorithm, algorithm3d=algorithm3d, threads=threads)
+    opts = dict(algorithm=algorithm, threads=threads)
     try:
         return _build_once(shape, split_full=False, periodic=periodic, **opts)
     except Exception as exc:  # noqa: BLE001 - narrow retry on the periodic-surface mesher failure
