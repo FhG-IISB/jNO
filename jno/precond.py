@@ -472,7 +472,9 @@ def triangular(*pairs) -> _Triangular:
     the *actual* off-diagonal coupling matvecs of the assembled operator.
 
     Each ``(field, spec)`` pair supplies the approximate **diagonal-block inverse** ``Â_i^{-1}``:
-    e.g. ``jno.precond.inner(jno.solve.cg(tol=1e-2))`` (inexact block solve),
+    e.g. ``jno.precond.inner(jno.solve.cg(tol=1e-4))`` (inexact block solve — but not too inexact:
+    ``tol=1e-2`` measured 11x SLOWER end-to-end than ``1e-4`` on Taylor–Hood Stokes, because the
+    outer Krylov pays more extra iterations than the cheaper block solve saves),
     ``jno.precond.chebyshev(...)`` (polynomial), or ``jno.precond.form([...])`` (auxiliary
     operator — for Stokes the classic pressure choice is the viscosity-weighted **mass matrix**
     ``form([(1/mu) * pi * qi])`` as the Schur-complement approximation; Elman, Silvester & Wathen,

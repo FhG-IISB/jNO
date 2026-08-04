@@ -248,3 +248,94 @@ def test_block_pair_validation():
         fem.solve(linear=jno.solve.fgmres(), precond=jno.precond.triangular((u, jac), (u, jac)))
     with pytest.raises(ValueError, match="every field needs exactly one"):
         fem.solve(linear=jno.solve.fgmres(), precond=jno.precond.triangular((u, jac)))
+
+
+# --------------------------------------------------------------------------------------------
+# a block preconditioner's DIAGONAL blocks must be assembled, not matvec-only
+# --------------------------------------------------------------------------------------------
+def _two_field_stokes(ms=0.25):
+    """A small Taylor-Hood Stokes system and its (u, p) trial symbols."""
+    from shapely.geometry import box
+
+    d = jno.domain(box(0.0, 0.0, 2.0, 1.0), mesh_size=ms)
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)
+    p, q = d.fem_symbols(names=("p", "q"), order=1)
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    gu, gv = jno.np.grad(u, [xi, yi]), jno.np.grad(v, [xi, yi])
+    pp, qq = p.bind(x=xi, y=yi), q.bind(x=xi, y=yi)
+    fem = jno.fem(
+        [
+            jno.np.inner(gu, gv, n_contract=2) - pp * jno.np.trace(gv),
+            -qq * jno.np.trace(gu),
+            u(xb, yb)[0] - yb * (1.0 - yb),
+            u(xb, yb)[1] - 0.0,
+            p.pin(),
+        ]
+    )
+    return fem, u, p, pp, qq
+
+
+def test_diagonal_block_is_assembled_not_matvec_only():
+    """The block a preconditioner SOLVES must carry a sparse matrix.
+
+    Handing it back matvec-only silently restricted the inner solver to matrix-free methods, so
+    `inner(jno.solve.amg())` / `inner(jno.solve.lu())` were refused -- which rules out the standard
+    saddle-point recipe (multigrid on the velocity block).
+    """
+    from jno.utils.solver.solver_api import PrecondContext
+
+    fem, u, p, _pp, _qq = _two_field_stokes()
+    ctx = PrecondContext(_op(fem), fem=fem)
+    for i in (0, 1):  # block 0 velocity, block 1 pressure
+        blk = ctx.sub(i)
+        assert blk.bcoo is not None, f"diagonal block {i} has no assembled matrix"
+        assert blk.shape[0] == blk.shape[1]
+
+
+def _op(fem):
+    from jno.utils.solver.solver_api import LinearOperator
+
+    A, _b = fem.operator
+    return LinearOperator(A)
+
+
+def test_diagonal_block_matches_the_dense_sub_matrix():
+    """The assembled block must equal the corresponding sub-matrix of the parent, exactly."""
+    from jno.utils.solver.solver_api import PrecondContext
+
+    fem, _u, _p, _pp, _qq = _two_field_stokes()
+    A, _b = fem.operator
+    ctx = PrecondContext(_op(fem), fem=fem)
+    full = np.asarray(A.todense())
+    for i in (0, 1):
+        s = ctx.block_slice(i)
+        got = np.asarray(ctx.sub(i).bcoo.todense())
+        assert np.allclose(got, full[s, s], atol=1e-12), f"block {i} is not the parent's sub-matrix"
+
+
+def test_offdiagonal_block_still_applies_correctly():
+    """Off-diagonal blocks are only ever APPLIED, so they may stay matvec-only -- but must be right."""
+    from jno.utils.solver.solver_api import PrecondContext
+
+    fem, _u, _p, _pp, _qq = _two_field_stokes()
+    A, _b = fem.operator
+    ctx = PrecondContext(_op(fem), fem=fem)
+    full = np.asarray(A.todense())
+    si, sj = ctx.block_slice(0), ctx.block_slice(1)
+    v = np.asarray(jax.random.normal(jax.random.PRNGKey(0), (sj.stop - sj.start,)), dtype=full.dtype)
+    got = np.asarray(ctx.sub(0, 1).mv(jnp.asarray(v)))
+    assert np.allclose(got, full[si, sj] @ v, atol=1e-10)
+
+
+def test_block_diagonal_solve_with_a_sparse_inner_solver():
+    """End to end: a block spec whose velocity block needs an ASSEMBLED operator now runs."""
+    fem, u, p, pp, qq = _two_field_stokes()
+    A, b = fem.operator
+    precond = jno.precond.triangular(
+        (u, jno.precond.inner(jno.solve.lu())),  # needs the assembled block; used to be refused
+        (p, jno.precond.form([pp * qq])),
+    )
+    x = np.asarray(fem.solve(linear=jno.solve.fgmres(), precond=precond)).reshape(-1)
+    rel = np.linalg.norm(np.asarray(A @ x) - np.asarray(b).reshape(-1)) / np.linalg.norm(np.asarray(b))
+    assert rel < 1e-6, f"block-preconditioned Stokes did not converge: {rel:.2e}"

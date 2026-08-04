@@ -29,6 +29,7 @@ from typing import Any, Callable, Optional
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from .linear import matrix_diagonal
 
@@ -182,6 +183,43 @@ class LinearOperator:
         return self._A if hasattr(self._A, "todense") else None
 
 
+def _slice_bcoo(src, si: slice, sj: slice):
+    """The ``[si, sj]`` sub-block of a BCOO, as a BCOO — or ``None`` if it cannot be taken.
+
+    Masks rather than filters, deliberately. Selecting the in-block entries would give an array
+    whose length depends on their VALUES, which has no static shape and so cannot run under ``jit``.
+    Instead every entry is kept: those outside the block are zeroed and parked at ``(0, 0)``, where
+    they sum to nothing. ``nse`` therefore stays static and the block is exact -- at the cost of
+    carrying the parent's nse, which is why only the diagonal blocks are built this way.
+    """
+    try:
+        import jax.experimental.sparse as jsp
+
+        idx = src.indices
+        if idx.ndim != 2 or idx.shape[-1] != 2:  # batched / non-2D BCOO: leave it to the matvec path
+            return None
+        rows, cols = idx[:, 0], idx[:, 1]
+        keep = (rows >= si.start) & (rows < si.stop) & (cols >= sj.start) & (cols < sj.stop)
+        shape = (si.stop - si.start, sj.stop - sj.start)
+
+        # When the entries are CONCRETE, drop the out-of-block ones outright. The masked form below
+        # is numerically identical, but it leaves the parent's zeros in the pattern -- and an
+        # algebraic solver reads the PATTERN, not just the values: AMG builds its coarsening from a
+        # strength-of-connection graph, so spurious zero entries give it a graph that is not the
+        # block's. Measured, the difference is not subtle.
+        if not any(isinstance(v, jax.core.Tracer) for v in (src.data, idx)):
+            sel = np.asarray(keep)
+            local = np.stack([np.asarray(rows)[sel] - si.start, np.asarray(cols)[sel] - sj.start], axis=-1)
+            return jsp.BCOO((jnp.asarray(np.asarray(src.data)[sel]), jnp.asarray(local)), shape=shape)
+
+        # Traced: the selection has no static length, so keep every entry and zero the outsiders.
+        data = jnp.where(keep, src.data, jnp.zeros_like(src.data))
+        local = jnp.stack([jnp.where(keep, rows - si.start, 0), jnp.where(keep, cols - sj.start, 0)], axis=-1)
+        return jsp.BCOO((data, local), shape=shape)
+    except Exception:
+        return None  # any exotic layout falls back to the matvec-only block
+
+
 def _maybe_residual_check(op: LinearOperator, b, x, who: str, *, rtol: float = 1e-4):
     """Eager-only convergence guard: raise on a garbage solution when values are concrete.
 
@@ -329,6 +367,17 @@ class PrecondContext:
         sj = si if j is None else self.block_slice(j)
         A = self.A
         n = A.shape[0]
+
+        # A DIAGONAL block is the one a block preconditioner SOLVES (the off-diagonals are only ever
+        # applied). Handing it back as matvec-only silently restricted the inner solver to
+        # matrix-free methods: `inner(jno.solve.amg())` and `inner(jno.solve.lu())` were refused with
+        # "needs an assembled (sparse) operator", which rules out the standard saddle-point recipe --
+        # multigrid on the velocity block of a Stokes system. Give it the assembled sub-block instead
+        # when the parent operator has one; everything else (mv, diag, dense) then follows for free.
+        if sj == si and A.bcoo is not None:
+            block = _slice_bcoo(A.bcoo, si, sj)
+            if block is not None:
+                return LinearOperator(block)
 
         def _embed(v, s):
             return jnp.zeros((n,), v.dtype).at[s].set(v)
