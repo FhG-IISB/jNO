@@ -83,13 +83,6 @@ class MeshUtils:
             elements = mesh.cells_dict["line"]
             element_type = "lines"
 
-            # Precompute 1D element lengths and shape function gradients
-            length, grad_phi = MeshUtils.precompute_p1_line_geometry(points, elements)
-
-            # Create all directed edges from line elements
-            # Each line element [a, b] creates edges a->b and b->a
-            edges = np.concatenate([elements[:, [0, 1]], elements[:, [1, 0]]], axis=0)
-
         elif dimension == 2:
             if "triangle" not in mesh.cells_dict:
                 raise ValueError("2D finite difference support requires triangular meshes")
@@ -99,70 +92,21 @@ class MeshUtils:
 
             area, grad_phi = MeshUtils.precompute_p1_triangle_geometry(points, elements)
 
-            # Create all directed edges from triangles
-            edges = np.concatenate(
-                [
-                    elements[:, [0, 1]],  # a -> b
-                    elements[:, [0, 2]],  # a -> c
-                    elements[:, [1, 0]],  # b -> a
-                    elements[:, [1, 2]],  # b -> c
-                    elements[:, [2, 0]],  # c -> a
-                    elements[:, [2, 1]],  # c -> b
-                ],
-                axis=0,
-            )
-
         elif dimension == 3:
             if "tetra" not in mesh.cells_dict:
                 raise ValueError("3D finite difference support requires tetrahedral meshes")
 
             elements = mesh.cells_dict["tetra"]
             element_type = "tetrahedra"
-            # Create all directed edges from tetrahedra (6 edges per tetrahedron)
-            edges = np.concatenate(
-                [
-                    elements[:, [0, 1]],  # a -> b
-                    elements[:, [0, 2]],  # a -> c
-                    elements[:, [0, 3]],  # a -> d
-                    elements[:, [1, 2]],  # b -> c
-                    elements[:, [1, 3]],  # b -> d
-                    elements[:, [2, 3]],  # c -> d
-                    # Reverse directions
-                    elements[:, [1, 0]],
-                    elements[:, [2, 0]],
-                    elements[:, [3, 0]],
-                    elements[:, [2, 1]],
-                    elements[:, [3, 1]],
-                    elements[:, [3, 2]],
-                ],
-                axis=0,
-            )
 
         else:
             raise ValueError(f"Finite difference not supported for dimension {dimension}")
-
-        # Build neighbor lists by SORTING the edge list once, then slicing each vertex's block out of
-        # it. The obvious loop -- `mask = edges[:, 0] == i` per vertex -- rescans every edge for every
-        # point, which is O(n_points x n_edges): a 3-D tet mesh has 12 directed edges per cell, so at
-        # 30932 points / 168277 cells that is ~6e10 comparisons and it measured 103.6 s, against 1.3 s
-        # for gmsh to produce the mesh in the first place. Sorting is O(E log E) and the per-vertex
-        # work then touches only that vertex's own edges.
-        order = np.argsort(edges[:, 0], kind="stable")
-        src_sorted = edges[order, 0]
-        dst_sorted = edges[order, 1]
-        # one boundary scan for all vertices, rather than a search per vertex
-        bounds = np.searchsorted(src_sorted, np.arange(n_points + 1))
-        neighbors = {
-            i: np.unique(dst_sorted[bounds[i] : bounds[i + 1]]).tolist() if bounds[i + 1] > bounds[i] else []
-            for i in range(n_points)
-        }
 
         # Store connectivity info
         mesh_connectivity = MeshConnectivity(
             {
                 "points": points,
                 element_type: elements,
-                "neighbors": neighbors,
                 "n_points": n_points,
                 "dimension": dimension,
             }
