@@ -49,6 +49,7 @@ import sys
 import time
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 
 jax.config.update("jax_enable_x64", True)
@@ -100,6 +101,56 @@ def poisson2d(ms):
     ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
     k = _rough(C_MILD, xi, yi)
     return jno.fem([k * (ui.x * vi.x + ui.y * vi.y) - 1.0 * vi, u(xb, yb) - 0.0], quad_degree=3), {}
+
+
+def poisson2d_adj(ms):
+    """The GRADIENT of a scalar loss through the same 2-D Poisson solve — an inverse-problem step.
+
+    Uses the raw-AD entry: the form carries a ``jno.np.parameter``, the operator is assembled once
+    and the parameter supplied per call via ``fem.operator.evaluate({name: value})``. Gradients flow
+    by implicit differentiation through ``lax.custom_linear_solve``; there is no adjoint flag.
+
+    NOT the other differentiable entry point. ``fem.solve()`` on a parametric form returns a lazy
+    trace node rather than an array, so plain ``jax.grad`` over it does not apply -- that route is
+    ``crux.solve(n)``. And a gradient that rebuilds ``jno.fem(...)`` INSIDE the differentiated
+    function cannot be jitted at all: ``_build_dirichlet_pairs`` concretizes a traced coefficient.
+
+    The solver here is an explicit BiCGStab on the assembled operator, not the slot-composed default
+    the forward cases use, so the gap to the solid ``poisson2d`` curve is not purely adjoint cost.
+    The honest overhead is against this case's OWN forward, recorded as ``forward_ms``.
+    """
+    d = _sq(ms)
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    k = _rough(C_MILD, xi, yi)
+    alpha = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="alpha")
+    fem = jno.fem([alpha * k * (ui.x * vi.x + ui.y * vi.y) - 1.0 * vi, u(xb, yb) - 0.0], quad_degree=3)
+    system = fem.operator
+
+    def _solve(theta):
+        A, b = system.evaluate({"alpha": theta})
+        rhs = jnp.asarray(b).reshape(-1)
+        # Jacobi-preconditioned, to match what the forward cases run. An UNPRECONDITIONED BiCGStab
+        # does not converge on this contrast past ~500k DOFs -- it silently burns maxiter instead,
+        # which made the gradient time look SMALLER than its own forward. That is impossible for
+        # reverse mode (which computes the primal AND an adjoint solve), and was the tell.
+        rows, cols = A.indices[:, 0], A.indices[:, 1]
+        diag = jnp.zeros(rhs.size, rhs.dtype).at[rows].add(jnp.where(rows == cols, A.data, 0.0))
+        inv = jnp.where(diag == 0, 1.0, 1.0 / jnp.where(diag == 0, 1.0, diag))
+        x, _ = jax.scipy.sparse.linalg.bicgstab(lambda z: A @ z, rhs, M=lambda z: z * inv, tol=1e-8, maxiter=4000)
+        return x, A, rhs
+
+    def loss(theta):
+        return jnp.sum(_solve(theta)[0] ** 2)
+
+    def residual(theta):
+        """Relative residual of the forward solve — the gate that catches a non-converged timing."""
+        x, A, rhs = _solve(theta)
+        return jnp.linalg.norm(A @ x - rhs) / jnp.linalg.norm(rhs)
+
+    return fem, {"grad": loss, "check": residual}
 
 
 def elastic2d(ms):
@@ -227,6 +278,11 @@ def eddy3d(ms):
 #: in the module docstring, which are at their hardware/solver ceiling instead.
 CASES = {
     "poisson2d": (poisson2d, (0.004, 0.0029, 0.0021, 0.0015, 0.0011, 0.0008), "2-D Poisson (1e3 contrast)"),
+    "poisson2d_adj": (
+        poisson2d_adj,
+        (0.004, 0.0029, 0.0021, 0.0015, 0.0011),
+        "2-D Poisson adjoint ($\\partial/\\partial\\alpha$)",
+    ),
     "elastic2d": (elastic2d, (0.006, 0.0045, 0.0034, 0.0026, 0.002, 0.0015), "2-D vector (convergence-walled)"),
     "reaction2d": (reaction2d, (0.008, 0.0062, 0.0048, 0.0037, 0.0028, 0.0022), "2-D nonlinear (Newton)"),
     "heat2d": (heat2d, (0.02, 0.0167, 0.0139, 0.0115, 0.0096, 0.008), f"2-D transient ({HEAT_STEPS} steps)"),
@@ -252,6 +308,38 @@ def _value(out):
     return np.asarray(out.fn() if hasattr(out, "fn") else out)
 
 
+def _timed_gradient(loss) -> dict:
+    """Time one gradient evaluation, and the forward it is the derivative of.
+
+    ``solve_ms`` is the FIRST call, compile included, exactly as every forward case reports it --
+    consistency inside one figure matters more than the cleaner warm number. The warm pair is
+    recorded alongside, and it is the one to quote for adjoint overhead.
+    """
+    theta = jnp.asarray(1.0)
+    fwd, grad = jax.jit(loss), jax.jit(jax.grad(loss))
+
+    t0 = time.perf_counter()
+    float(fwd(theta))
+    forward_ms = (time.perf_counter() - t0) * 1e3
+    t0 = time.perf_counter()
+    float(grad(theta))
+    solve_ms = (time.perf_counter() - t0) * 1e3
+
+    t0 = time.perf_counter()
+    float(fwd(theta))
+    forward_warm_ms = (time.perf_counter() - t0) * 1e3
+    t0 = time.perf_counter()
+    float(grad(theta))
+    grad_warm_ms = (time.perf_counter() - t0) * 1e3
+    return {
+        "solve_ms": round(solve_ms, 1),
+        "forward_ms": round(forward_ms, 1),
+        "forward_warm_ms": round(forward_warm_ms, 1),
+        "grad_warm_ms": round(grad_warm_ms, 1),
+        "adjoint_ratio": round(grad_warm_ms / max(forward_warm_ms, 1e-9), 3),
+    }
+
+
 def main(case: str, idx: int) -> dict:
     builder, sizes, label = CASES[case]
     ms = sizes[idx]
@@ -260,15 +348,30 @@ def main(case: str, idx: int) -> dict:
     fem, kw = builder(ms)
     build_ms = (time.perf_counter() - t0) * 1e3
 
-    t0 = time.perf_counter()
-    sol = _value(fem.solve(**kw))
-    solve_ms = (time.perf_counter() - t0) * 1e3
+    extra = {}
+    loss, check = kw.pop("grad", None), kw.pop("check", None)
+    if loss is not None:
+        extra = _timed_gradient(loss)
+        if check is not None:
+            # a timing on a non-converged solve is not a measurement of anything
+            rel = float(jax.jit(check)(jnp.asarray(1.0)))
+            extra["rel_residual"] = float(f"{rel:.3g}")
+            if not rel < 1e-6:
+                raise RuntimeError(f"forward solve did not converge (relative residual {rel:.3g})")
+        solve_ms = extra.pop("solve_ms")
+        dofs = int(np.asarray(fem.operator.evaluate({"alpha": 1.0})[1]).size)
+    else:
+        t0 = time.perf_counter()
+        sol = _value(fem.solve(**kw))
+        solve_ms = (time.perf_counter() - t0) * 1e3
+        dofs = int(np.size(sol)) // TRAJECTORY_STEPS.get(case, 1)
 
     return {
+        **extra,
         "case": case,
         "label": label,
         "mesh_size": ms,
-        "dofs": int(np.size(sol)) // TRAJECTORY_STEPS.get(case, 1),
+        "dofs": dofs,
         "build_ms": round(build_ms, 1),
         "solve_ms": round(solve_ms, 1),
         "peak_mb": round(_peak_mb(), 1),
