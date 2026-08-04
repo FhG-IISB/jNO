@@ -91,7 +91,20 @@ def _boundary_faces(cells: np.ndarray, local_faces, n_face_nodes: int):
     idx = np.asarray(local_faces, dtype=np.int64)[:, :n_face_nodes]
     n_local = idx.shape[0]
     flat = cells[:, idx].reshape(-1, n_face_nodes).astype(np.int64, copy=False)
-    _, inverse, counts = np.unique(np.sort(flat, axis=1), axis=0, return_inverse=True, return_counts=True)
+    canonical = np.sort(flat, axis=1)
+
+    # Pack each face's sorted vertex ids into ONE int64 and unique on that. ``np.unique(axis=0)``
+    # sorts a void view of the rows, and its argsort measured 2.32 s -- a quarter of the domain
+    # build on a 424k-tet mesh -- where a 1-D sort of the same count is a fraction of it. Falls
+    # back to the row-wise unique when the mesh is too large for the key to fit.
+    n_pts = int(canonical.max()) + 1 if canonical.size else 1
+    if n_pts**n_face_nodes < 2**62:
+        keys = np.zeros(len(canonical), dtype=np.int64)
+        for j in range(n_face_nodes):
+            keys = keys * n_pts + canonical[:, j]
+        _, inverse, counts = np.unique(keys, return_inverse=True, return_counts=True)
+    else:
+        _, inverse, counts = np.unique(canonical, axis=0, return_inverse=True, return_counts=True)
     sel = np.flatnonzero(counts[np.asarray(inverse).ravel()] == 1)
 
     value = (flat, sel, n_local)

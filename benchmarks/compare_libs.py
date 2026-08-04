@@ -33,8 +33,8 @@ import numpy as np
 jax.config.update("jax_enable_x64", True)
 
 
-def build_mesh(size):
-    """One tet mesh of the unit cube, generated once, shared by all three libraries."""
+def build_mesh(size, dim=3):
+    """One mesh of the unit cube/square, generated once, shared by all three libraries."""
     import os
 
     import jno
@@ -44,6 +44,12 @@ def build_mesh(size):
     if os.getenv("JNO_BENCH_CACHE"):
         jno.enable_compile_cache()
 
+    if dim == 2:
+        from shapely.geometry import box
+
+        d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=size)
+        m = d.built_mesh
+        return d, np.asarray(m.points, float)[:, :2], np.asarray(m.cells_dict["triangle"], int)
     d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=size).domain()
     m = d.built_mesh
     return d, np.asarray(m.points, float), np.asarray(m.cells_dict["tetra"], int)
@@ -54,10 +60,26 @@ def on_boundary(pts, tol=1e-8):
 
 
 # ---------------------------------------------------------------------------- jNO
-def run_jno(d):
+def run_jno(d, dim=3):
     import jno
 
     t0 = time.perf_counter()
+    if dim == 2:
+        u, v = d.fem_symbols()
+        xi, yi, _ = d.variable("interior", split=True)
+        xb, yb, _ = d.variable("boundary", split=True)
+        ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+        fem = jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0], quad_degree=3)
+        build = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        sol = np.asarray(fem.solve()).reshape(-1)
+        return {
+            "lib": "jNO",
+            "solver": "Jacobi-BiCGStab (GPU)",
+            "build_s": build,
+            "solve_s": time.perf_counter() - t0,
+            "u": sol,
+        }
     c = d.variable("interior", split=True)
     xi, yi, zi = c[0], c[1], c[2]
     cb = d.variable("boundary", split=True)
@@ -75,7 +97,7 @@ def run_jno(d):
 
 
 # ------------------------------------------------------------------------- JAX-FEM
-def run_jax_fem(points, cells):
+def run_jax_fem(points, cells, dim=3):
     import jax.numpy as jnp
     from jax_fem.generate_mesh import Mesh
     from jax_fem.problem import Problem
@@ -93,13 +115,14 @@ def run_jax_fem(points, cells):
     def boundary(p):
         return jnp.any((p < 1e-8) | (p > 1.0 - 1e-8))
 
+    ele = "TET4" if dim == 3 else "TRI3"
     t0 = time.perf_counter()
-    mesh = Mesh(points, cells, ele_type="TET4")
+    mesh = Mesh(points, cells, ele_type=ele)
     prob = Poisson(
         mesh=mesh,
         vec=1,
-        dim=3,
-        ele_type="TET4",
+        dim=dim,
+        ele_type=ele,
         dirichlet_bc_info=[[boundary], [0], [lambda p: 0.0]],
     )
     build = time.perf_counter() - t0
@@ -116,14 +139,14 @@ def run_jax_fem(points, cells):
 
 
 # ----------------------------------------------------------------------- scikit-fem
-def run_skfem(points, cells):
+def run_skfem(points, cells, dim=3):
     import skfem
     from skfem.helpers import dot, grad
     from skfem.models.poisson import unit_load
 
     t0 = time.perf_counter()
-    mesh = skfem.MeshTet(points.T, cells.T)
-    basis = skfem.Basis(mesh, skfem.ElementTetP1())
+    mesh = skfem.MeshTet(points.T, cells.T) if dim == 3 else skfem.MeshTri(points.T, cells.T)
+    basis = skfem.Basis(mesh, skfem.ElementTetP1() if dim == 3 else skfem.ElementTriP1())
 
     @skfem.BilinearForm
     def laplace(u, v, _):
@@ -138,14 +161,19 @@ def run_skfem(points, cells):
     return {"lib": "scikit-fem", "solver": "scipy sparse direct (CPU)", "build_s": build, "solve_s": solve, "u": sol}
 
 
-def main(sizes):
+def main(sizes, dim=3):
     rows = []
     for size in sizes:
-        d, points, cells = build_mesh(size)
+        d, points, cells = build_mesh(size, dim)
         n, ncell = len(points), len(cells)
-        print(f"\nmesh size {size}:  {n:,} nodes, {ncell:,} tets  (generated once, shared)")
+        kind = "tets" if dim == 3 else "triangles"
+        print(f"\n[{dim}-D] mesh size {size}:  {n:,} nodes, {ncell:,} {kind}  (generated once, shared)")
         got = {}
-        for fn, args in ((run_jno, (d,)), (run_jax_fem, (points, cells)), (run_skfem, (points, cells))):
+        for fn, args in (
+            (run_jno, (d, dim)),
+            (run_jax_fem, (points, cells, dim)),
+            (run_skfem, (points, cells, dim)),
+        ):
             try:
                 r = fn(*args)
             except Exception as e:
@@ -168,11 +196,14 @@ def main(sizes):
                 rel = np.linalg.norm(u - ref) / max(np.linalg.norm(ref), 1e-300)
                 verdict = "agrees" if rel < 1e-6 else "DISAGREES"
                 print(f"    {lib} vs scikit-fem: relative difference {rel:.2e}  ({verdict})")
-    out = "benchmarks/compare_libs.json"
+    out = f"benchmarks/compare_libs_{dim}d.json"
     with open(out, "w") as f:
         json.dump(rows, f, indent=2)
     print(f"\nwrote {out}")
 
 
 if __name__ == "__main__":
-    main([float(a) for a in sys.argv[1:]] or [0.08])
+    args = sys.argv[1:]
+    dim = 2 if args and args[0] == "2d" else 3
+    sizes = [float(a) for a in (args[1:] if args and args[0] in ("2d", "3d") else args)]
+    main(sizes or [0.08], dim)
