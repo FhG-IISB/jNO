@@ -186,6 +186,7 @@ pre-commit = ">=4.0"
 pymdown-extensions = ">=10.0"
 wandb = ">=0.26.1,<0.27"
 pyamg = ">=5.3.0,<6"
+petsc4py = ">=3.25.4,<4"
 
 [tool.pixi.feature.dev.dependencies]
 matplotlib = ">=3.11.0,<4"
