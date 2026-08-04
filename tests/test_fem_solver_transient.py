@@ -221,3 +221,31 @@ def test_transient_guards():
         fem.solve(x0=jnp.zeros(4))
     with pytest.raises(ValueError, match="linear"):
         fem.solve(nonlinear=jno.solve.newton())
+
+
+def test_nonlinear_transient_direct_linear_slot_matches_default():
+    """The failure that motivated this: ``fem.solve(linear=jno.solve.lu(...))`` over a nonlinear
+    transient block raised ``LinearOperator.dense(): a matvec-only operator cannot densify`` from
+    inside the per-step Krylov loop. A direct linear slot now selects the driver that assembles the
+    step tangent, and the trajectory matches the matrix-free default."""
+    fem = _heat(nonlinear=True)
+    ref = np.asarray(fem.solve().fn())
+    for spec in (jno.solve.lu(), jno.solve.lu(host=True)):
+        sol = np.asarray(fem.solve(linear=spec).fn())
+        assert np.abs(sol - ref).max() < 1e-8, f"{spec.name} diverged from the default trajectory"
+
+
+def test_nonlinear_transient_direct_linear_slot_is_the_solver_that_runs():
+    """Per-step: the requested factorization must be the one that actually runs on every step of the
+    march, not just be accepted at compose time."""
+    from jno.utils.solver import linear as linear_mod
+
+    calls = []
+    original = linear_mod.host_lu_solve
+    linear_mod.host_lu_solve = lambda A, b: calls.append(1) or original(A, b)
+    try:
+        sol = np.asarray(_heat(nonlinear=True).solve(linear=jno.solve.lu(host=True)).fn())
+    finally:
+        linear_mod.host_lu_solve = original
+    assert calls, "lu(host=True) was requested but the host factorization never ran"
+    assert np.abs(sol - np.asarray(_heat(nonlinear=True).solve().fn())).max() < 1e-8
