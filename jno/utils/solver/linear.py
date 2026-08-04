@@ -84,3 +84,68 @@ def sparse_lu_solve(A, b):
     if not (hasattr(A, "indices") and hasattr(A, "sum_duplicates")):
         A = jsp.BCOO.fromdense(jnp.asarray(A))
     return _sparse_lu_solve(A, b)
+
+
+def host_lu_solve(A, b):
+    """Sparse-direct solve factored on the HOST (SuperLU), driven from the device.
+
+    Same contract as :func:`sparse_lu_solve` -- ``(A, b) -> x``, jit-compatible, reverse-mode
+    differentiable -- but the factorisation runs in host memory instead of on the GPU. That is the
+    whole point: cuSolver's sparse LU is the ceiling on jNO's two hardest cases (an H(curl) eddy
+    problem stops near 20k complex DOFs, and a Taylor-Hood Stokes system returns "Singular matrix"
+    at a mesh the CPU factors without complaint), while host SuperLU was measured reaching 57,746
+    DOFs on the same problem -- 3.1x.
+
+    **Why moving THIS across PCIe is affordable when moving a Krylov iteration is not.** A direct
+    solve factorises once: the operator crosses once (nnz x 12 bytes -- ~12 MB, ~0.5 ms, against a
+    multi-second factorisation) and thereafter only ``b`` and ``x`` move. Streaming a Krylov vector
+    every iteration would instead pay the full PCIe-vs-device bandwidth penalty (~25 GB/s against
+    448 GB/s on this card, ~18x) on every one of them. Offload what is touched once per solve;
+    never what is touched per iteration.
+
+    Differentiability is preserved by wrapping the host solve in ``lax.custom_linear_solve``, which
+    needs a transpose solve -- supplied by the same factorisation via SuperLU's ``trans="T"``. So
+    ``jax.grad`` flows to the operator entries and the right-hand side exactly as for the GPU path.
+
+    Limitations, all inherited from ``pure_callback``: no ``vmap`` batching rule, and the callback
+    is forward-only, so this cannot appear inside a transformation that needs to differentiate
+    *through* the callback itself (the ``custom_linear_solve`` firewall means it does not have to).
+    The matrix is re-factored on every call -- correct for a one-shot solve, wasteful if you are
+    solving repeatedly with a fixed operator, where a frozen preconditioner is the better tool.
+    """
+    import jax
+    import jax.experimental.sparse as jsp
+
+    if not (hasattr(A, "indices") and hasattr(A, "sum_duplicates")):
+        A = jsp.BCOO.fromdense(jnp.asarray(A))
+    # deliberately NOT A.sum_duplicates(): it needs a concrete ``nse`` and so cannot run inside a
+    # jitted body. scipy sums duplicate (i, j) entries when building the matrix anyway.
+    n = int(A.shape[0])
+    shape = tuple(int(s) for s in A.shape)
+
+    def _host_solve(data, indices, rhs, transpose):
+        import numpy as _np
+        import scipy.sparse as _sp
+        import scipy.sparse.linalg as _spla
+
+        rhs = _np.asarray(rhs)
+        idx = _np.asarray(indices)
+        mat = _sp.csc_matrix((_np.asarray(data), (idx[:, 0], idx[:, 1])), shape=shape)
+        return _np.asarray(_spla.splu(mat).solve(rhs, trans="T" if transpose else "N"), dtype=rhs.dtype)
+
+    def _call(rhs, transpose):
+        return jax.pure_callback(
+            lambda d, i, r: _host_solve(d, i, r, transpose),
+            jax.ShapeDtypeStruct((n,), rhs.dtype),
+            A.data,
+            A.indices,
+            rhs,
+        )
+
+    return jax.lax.custom_linear_solve(
+        lambda x: A @ x,
+        jnp.asarray(b).reshape(-1),
+        lambda _matvec, rhs: _call(rhs, False),
+        transpose_solve=lambda _matvec, rhs: _call(rhs, True),
+        symmetric=False,
+    )

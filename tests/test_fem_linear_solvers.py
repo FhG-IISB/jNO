@@ -153,3 +153,78 @@ def test_sparse_lu_is_one_compiled_program():
     assert third == 0, "a same-shaped operator recompiled -- the conversion is not shape-keyed"
     assert np.allclose(x1, np.linalg.solve(Ad, np.asarray(b)), atol=1e-8)
     assert np.allclose(x1, x2)
+
+
+# --------------------------------------------------------------------------------------------
+# host-factored direct solve: same answer, same gradients, past cuSolver's ceiling
+# --------------------------------------------------------------------------------------------
+def _sparse_nonsym(n=48, seed=5):
+    """A sparse, non-symmetric, diagonally-dominant system and its dense twin."""
+    rng = np.random.default_rng(seed)
+    dense = rng.normal(size=(n, n))
+    dense[np.abs(dense) < 1.4] = 0.0
+    dense += np.eye(n) * 6.0
+    return jsp.BCOO.fromdense(jnp.asarray(dense)), jnp.asarray(dense), jnp.asarray(rng.normal(size=n))
+
+
+def test_host_lu_matches_the_dense_reference():
+    from jno.utils.solver.linear import host_lu_solve
+
+    A, dense, b = _sparse_nonsym()
+    got, want = host_lu_solve(A, b), jnp.linalg.solve(dense, b)
+    assert float(jnp.linalg.norm(got - want) / jnp.linalg.norm(want)) < 1e-10
+
+
+def test_host_lu_matches_the_device_path():
+    """The point of the option is WHERE it factors, not WHAT it computes."""
+    from jno.utils.solver.linear import host_lu_solve, sparse_lu_solve
+
+    A, _dense, b = _sparse_nonsym()
+    got, want = host_lu_solve(A, b), sparse_lu_solve(A, b)
+    assert float(jnp.linalg.norm(got - want) / jnp.linalg.norm(want)) < 1e-10
+
+
+def test_host_lu_runs_under_jit():
+    """It is a pure_callback underneath, so this is the property that could silently break."""
+    from jno.utils.solver.linear import host_lu_solve
+
+    A, dense, b = _sparse_nonsym()
+    got = jax.jit(host_lu_solve)(A, b)
+    assert float(jnp.linalg.norm(got - jnp.linalg.solve(dense, b)) / jnp.linalg.norm(b)) < 1e-10
+
+
+@pytest.mark.parametrize("argnum", [0, 1])
+def test_host_lu_gradients_match_the_device_path(argnum):
+    """A pure_callback is forward-only; gradients survive only because the solve is wrapped in
+    lax.custom_linear_solve, whose transpose solve reuses the same factorisation (SuperLU trans=T).
+    Checks the matrix-entry gradient as well as the right-hand-side one."""
+    from jno.utils.solver.linear import host_lu_solve, sparse_lu_solve
+
+    A, _dense, b = _sparse_nonsym()
+    loss = lambda data, rhs, f: jnp.sum(f(jsp.BCOO((data, A.indices), shape=A.shape), rhs) ** 2)  # noqa: E731
+    g_host = jax.grad(loss, argnum)(A.data, b, host_lu_solve)
+    g_dev = jax.grad(loss, argnum)(A.data, b, sparse_lu_solve)
+    assert float(jnp.linalg.norm(g_host - g_dev) / jnp.linalg.norm(g_dev)) < 1e-8
+
+
+def test_host_lu_solves_an_indefinite_saddle_point():
+    """The case the option exists for: cuSolver reports 'Singular matrix' on these at modest size."""
+    from jno.utils.solver.linear import host_lu_solve
+
+    rng = np.random.default_rng(0)
+    nu, npr = 24, 8
+    K = rng.normal(size=(nu, nu))
+    K = K @ K.T + np.eye(nu) * nu
+    B = rng.normal(size=(nu, npr))
+    dense = np.block([[K, B], [B.T, np.zeros((npr, npr))]])  # zero pressure block
+    A = jsp.BCOO.fromdense(jnp.asarray(dense))
+    b = jnp.asarray(rng.normal(size=nu + npr))
+    got = host_lu_solve(A, b)
+    assert float(jnp.linalg.norm(jnp.asarray(dense) @ got - b) / jnp.linalg.norm(b)) < 1e-10
+
+
+def test_lu_host_spec_is_distinguishable_from_the_device_spec():
+    """Two specs that factor in different memories must not be reported as the same solver."""
+    import jno
+
+    assert jno.solve.lu().name != jno.solve.lu(host=True).name

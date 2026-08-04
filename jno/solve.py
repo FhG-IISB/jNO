@@ -61,7 +61,7 @@ __all__ = [
 ]
 
 
-def lu() -> LinearSolver:
+def lu(*, host: bool = False) -> LinearSolver:
     """Differentiable sparse-direct solve (JAX ``spsolve``: cuSolver on GPU, native LU on CPU).
 
     Wraps the existing :func:`jno.utils.solver.linear.sparse_lu_solve` -- robust on the
@@ -69,13 +69,29 @@ def lu() -> LinearSolver:
     differentiable in the matrix entries and the right-hand side. Direct: ignores ``x0`` and
     rejects a preconditioner. ``jit`` yes; **no vmap batching rule upstream** (trait
     ``vmap="no"``) -- use a Krylov solver inside vmapped/batched solves.
+
+    Args:
+        host: Factor on the HOST with SuperLU instead of on the accelerator, keeping the rest of the
+            solve where it is. cuSolver's sparse LU is the ceiling on jNO's hardest problems -- a
+            complex H(curl) eddy system stops near 20k DOFs and a Taylor-Hood Stokes system reports
+            "Singular matrix" at a mesh the CPU factors fine -- and host SuperLU was measured
+            reaching 3.1x the DOFs on the same problem. Affordable because a direct solve factorises
+            ONCE, so the operator crosses PCIe once rather than per iteration; see
+            :func:`jno.utils.solver.linear.host_lu_solve` for that argument and its limits.
+
+            Measured on this box it is not only a reach extender but FASTER where cuSolver also
+            works -- Stokes at 21,839 DOFs 0.27 s against 1.67 s (6.2x), H(curl) at 17,072 complex
+            DOFs 13.3 s against 36.4 s (2.7x) -- and it runs meshes cuSolver refuses: Stokes at
+            26,908 DOFs, H(curl) at 26,154. Not made the default only because it has no vmap rule
+            and re-factors per call; measure before switching a working GPU solve over.
     """
 
     def _fn(op: LinearOperator, b, *, M, x0):
-        from .utils.solver.linear import sparse_lu_solve
+        from .utils.solver.linear import host_lu_solve, sparse_lu_solve
 
+        solve = host_lu_solve if host else sparse_lu_solve
         if op.bcoo is not None:
-            return sparse_lu_solve(op.bcoo, b)
+            return solve(op.bcoo, b)
         # a dense operator gets the dense direct solve — BCOO.fromdense would need a concrete
         # nse, which does not exist under jit/vmap tracing
         return jnp.linalg.solve(op.dense(), b)
@@ -83,7 +99,9 @@ def lu() -> LinearSolver:
     # No `key`, so the composer leaves this on the eager path. What compiling the composed solve buys
     # is the removal of per-ITERATION Python dispatch; a direct solver issues one `spsolve` and has
     # none to remove, so it would pay a compile for nothing.
-    return LinearSolver(_fn, name="lu", direct=True, traits={"vmap": "no"})
+    # the name carries the placement, so two specs that factor in different memories are not
+    # reported (or cached) as though they were the same solver
+    return LinearSolver(_fn, name="lu-host" if host else "lu", direct=True, traits={"vmap": "no"})
 
 
 def dense() -> LinearSolver:
