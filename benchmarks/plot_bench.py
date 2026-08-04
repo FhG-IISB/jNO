@@ -20,7 +20,8 @@ is built per solve and a one-shot solve pays for it.
 
 BOTTOM LEFT plots PEAK DEVICE MEMORY against the same axis, and is the panel most likely to be
 misread, so: NOTHING here is near the card. The largest point is 3.1 GB against 8 GB nominal, and
-3-D Poisson's ladder ends at 586 MB. Its "memory-walled" label is about where the curve WOULD land
+3-D Poisson's ladder ends at 0.49 GB. Plotted in GB so it reads against the card's capacity
+directly rather than through a factor of 1000. Its "memory-walled" label is about where the curve WOULD land
 at the ~1.3M tets a 10 s solve needs, extrapolated -- what stops it at 98k in practice is a 31 s
 build. The measured wall is the transient's: ~1.5 GB at only 18k spatial DOFs, an order of magnitude
 above anything else at that size, because the whole trajectory is stored -- and 6000 steps does OOM.
@@ -260,13 +261,13 @@ def main() -> None:
     # runs at all. It is why three ladders stop where they do.
     for case in order:
         rs, (c, ls) = cases[case], styles[case]
-        curve(ax_m, [r["dofs"] for r in rs], [r["peak_mb"] for r in rs], c, ls=ls)
-    ax_m.axhline(8192, color=GRAY, lw=1.0, ls=":")
+        curve(ax_m, [r["dofs"] for r in rs], [r["peak_mb"] / 1e3 for r in rs], c, ls=ls)
+    ax_m.axhline(8.0, color=GRAY, lw=1.0, ls=":")  # the card, in the same units as the curves
     # x in AXES fraction, y in data units -- reading get_xlim() here would predate the log scaling
     # below and silently place the label off the axis
     ax_m.text(
         0.02,
-        8192,
+        8.0,
         "8 GB card (nominal)",
         transform=ax_m.get_yaxis_transform(),
         va="bottom",
@@ -277,8 +278,8 @@ def main() -> None:
     ax_m.set_xscale("log")
     ax_m.set_yscale("log")
     ax_m.set_xlabel("Degrees of freedom")
-    ax_m.set_ylabel("Peak device memory  [MB]")
-    slope_triangle(ax_m, 4.5e5, 130.0, 1.0, label="$n$")
+    ax_m.set_ylabel("Peak device memory  [GB]")
+    slope_triangle(ax_m, 4.5e5, 0.13, 1.0, label="$n$")
     plain_log_ticks(ax_m)
 
     # --- bottom right: how much of the wall clock is actually solving -------------------------
@@ -306,12 +307,12 @@ def main() -> None:
     fig.savefig(out)
     print(f"wrote {out}")
 
-    print(f"\n{'case':<26}{'dofs':>9}{'build s':>10}{'solve s':>10}{'peak MB':>10}")
+    print(f"\n{'case':<26}{'dofs':>9}{'build s':>10}{'solve s':>10}{'peak GB':>10}")
     for case in order:
         for r in cases[case]:
             print(
                 f"{r['label']:<26}{r['dofs']:>9,}{r['build_ms'] / 1e3:>10.2f}"
-                f"{r['solve_ms'] / 1e3:>10.2f}{r['peak_mb']:>10.0f}"
+                f"{r['solve_ms'] / 1e3:>10.2f}{r['peak_mb'] / 1e3:>10.2f}"
             )
 
 
