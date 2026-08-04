@@ -108,6 +108,10 @@ C_MILD, C_HARD = 3.5, 6.0
 #: transient steps. The trajectory is what the solve returns, so this also sets its memory.
 HEAT_STEPS = 1500
 
+#: Rayleigh-Benard steps. Far fewer than the heat case: every one is a Newton solve on the full
+#: three-field coupled block, not a single linear solve.
+BOUSSINESQ_STEPS = 26
+
 
 # --------------------------------------------------------------------------------------------
 # problems: each returns (fem, solve_kwargs)
@@ -279,6 +283,77 @@ def stokes2d(ms):
     return fem, {"linear": jno.solve.lu(host=True)}
 
 
+def boussinesq2d(ms, steps=BOUSSINESQ_STEPS):
+    """2-D Rayleigh-Benard convection — the hardest system here: THREE fields, two-way NONLINEAR
+    coupling, a saddle point, and transient, all at once.
+
+    Incompressible Navier-Stokes with a buoyancy body force, two-way coupled to advection-diffusion
+    for heat (Boussinesq)::
+
+        du/dt + (u.grad)u = -grad p + Pr lap u + Pr*Ra*T e_y
+        div u = 0
+        dT/dt + u.grad T  = lap T
+
+    Velocity P2 (vector), pressure P1, temperature P1 — mixed order AND mixed rank in one system.
+    What makes it the stiffest case in this suite is that no single difficulty dominates: the
+    incompressibility constraint makes it indefinite (as Stokes is), the buoyancy term ``Pr*Ra*T``
+    couples heat into momentum, and ``u.grad T`` is a product of two DIFFERENT unknowns, so the
+    system is genuinely nonlinear rather than merely parametric. Every step is a Newton solve on the
+    full coupled block, and it marches in time on top of that.
+
+    Physics and formulation taken from the ``rayleigh_benard_2d`` tutorial (Ra = 1e4, well above the
+    critical ~1708, so the rolls actually form) rather than rewritten, so the case is one a reader
+    can look up in validated form.
+
+    It is the most SOLVE-bound case in the suite by a wide margin -- 96% of the wall clock at its
+    largest size, against 4-8% for the steady linear cases -- and it gets there at only 6,574 DOFs,
+    two to three orders of magnitude fewer than the Poisson ladders need. That is the honest cost of
+    coupling: 26 Newton solves on a three-field indefinite block cost 61 s where a scalar Poisson
+    solve of 1.8M DOFs costs 13 s. Solve time measures n^0.76, so the expense is per-step Newton
+    work rather than anything that scales badly.
+    """
+    Pr, Ra, Lx, Ly = 1.0, 1.0e4, 2.0, 1.0
+    dt = 0.009
+    d = jno.Shape.rect(0, 0, Lx, Ly, size=ms).domain(time=(0.0, steps * dt, steps + 1))
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)
+    p, q = d.fem_symbols(names=("p", "q"), order=1)
+    T, sT = d.fem_symbols(names=("T", "sT"), order=1)
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ub, vb = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+    pb, qb = p.bind(x=xi, y=yi, t=ti), q.bind(x=xi, y=yi, t=ti)
+    Tb, sb = T.bind(x=xi, y=yi, t=ti), sT.bind(x=xi, y=yi, t=ti)
+
+    ux, uy, vx, vy = ub[0], ub[1], vb[0], vb[1]
+    uxx, uxy, uyx, uyy = ub.x[0], ub.y[0], ub.x[1], ub.y[1]
+    vxx, vxy, vyx, vyy = vb.x[0], vb.y[0], vb.x[1], vb.y[1]
+    momentum = (
+        (ub.t[0] * vx + ub.t[1] * vy)
+        + ((ux * uxx + uy * uxy) * vx + (ux * uyx + uy * uyy) * vy)  # (u.grad)u -- nonlinear
+        + Pr * (uxx * vxx + uxy * vxy + uyx * vyx + uyy * vyy)
+        - pb * (vxx + vyy)
+        - Pr * Ra * Tb * vy  # buoyancy: temperature -> momentum
+    )
+    continuity = qb * (uxx + uyy)
+    energy = Tb.t * sb + (ux * Tb.x + uy * Tb.y) * sb + (Tb.x * sb.x + Tb.y * sb.y)
+    Tcond = 1.0 - ci[1] / Ly
+    T0 = Tcond + 0.05 * jno.np.sin(2 * PI * ci[0] / Lx) * jno.np.sin(PI * ci[1] / Ly)
+    fem = jno.fem(
+        [
+            momentum,
+            continuity,
+            energy,
+            u(xb, yb) - 0.0,
+            T(xb, yb) - (1.0 - yb / Ly),
+            p.pin(),
+            u(ci[0], ci[1]) - 0.0,
+            T(ci[0], ci[1]) - T0,
+        ]
+    )
+    return fem, {}
+
+
 def poisson3d(ms):
     """3-D scalar Poisson on tets — ~2x the per-DOF cost of 2-D, from bigger element programs."""
     d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=ms).domain()
@@ -369,6 +444,11 @@ CASES = {
     "elastic2d": (elastic2d, (0.006, 0.0045, 0.0034, 0.0026, 0.002, 0.0015), "2-D vector (convergence-walled)"),
     "reaction2d": (reaction2d, (0.008, 0.0062, 0.0048, 0.0037, 0.0028, 0.0022), "2-D nonlinear (Newton)"),
     "heat2d": (heat2d, (0.02, 0.0167, 0.0139, 0.0115, 0.0096, 0.008), f"2-D transient ({HEAT_STEPS} steps)"),
+    "boussinesq2d": (
+        boussinesq2d,
+        (0.16, 0.13, 0.11, 0.09, 0.075, 0.062),
+        "2-D Rayleigh-Benard (3 fields, nonlinear)",
+    ),
     "stokes2d": (stokes2d, (0.09, 0.063, 0.044, 0.031, 0.021, 0.015), "2-D Stokes (Taylor-Hood)"),
     "poisson3d": (poisson3d, (0.05, 0.042, 0.035, 0.029, 0.024, 0.02), "3-D Poisson (build-bound)"),
     "eddy3d": (eddy3d, (0.16, 0.136, 0.115, 0.097, 0.083, 0.07), "3-D complex H(curl)"),
@@ -381,7 +461,7 @@ CASES = {
 
 #: Cases whose solution is a TRAJECTORY. ``np.size`` would report steps x nodes and put the case
 #: ~3 decades right of everything else on a DOF axis; the system actually solved is one step's.
-TRAJECTORY_STEPS = {"heat2d": HEAT_STEPS}
+TRAJECTORY_STEPS = {"heat2d": HEAT_STEPS, "boussinesq2d": BOUSSINESQ_STEPS + 1}
 
 
 #: a solve whose residual is above this was not a solve, and its timing measures nothing. Recorded
