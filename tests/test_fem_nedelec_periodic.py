@@ -94,3 +94,45 @@ def test_periodic_n1e_bloch_phase_is_complex():
     phase = np.exp(1j * 0.7)  # Bloch phase e^{iφ}
     fem = jno.fem([inner(cu, cv) + inner(ui, vi), face("left") - phase * face("right"), face("front") - face("back")])
     assert fem._periodic is not None and fem._periodic.get("is_bloch")  # quasi-periodic reduction
+
+
+# --------------------------------------------------------------------------------------------
+# which global edges sit on a periodic face: a vertex mask, not a per-edge Python scan
+# --------------------------------------------------------------------------------------------
+def _edges_on_tag_reference(edge_vertices, tag_vertex_ids):
+    """The per-edge comprehension ``_edges_on_tag`` replaced, kept as the oracle."""
+    vset = set(int(v) for v in np.asarray(tag_vertex_ids).reshape(-1))
+    ev = np.asarray(edge_vertices).reshape(-1, 2)
+    return np.asarray([e for e in range(len(ev)) if int(ev[e, 0]) in vset and int(ev[e, 1]) in vset], dtype=int)
+
+
+@pytest.mark.parametrize(
+    "ev,ids",
+    [
+        (np.array([[0, 1], [1, 2], [2, 3], [0, 3]]), np.array([0, 1, 2])),
+        (np.array([[0, 1]]), np.array([5])),  # nothing on the tag
+        (np.zeros((0, 2), dtype=int), np.array([1, 2])),  # no edges at all
+        (np.array([[0, 1], [1, 2]]), np.zeros(0, dtype=int)),  # empty tag
+        (np.array([[3, 7], [7, 9]]), np.array([9, 7, 3, 3])),  # unsorted ids, with a duplicate
+    ],
+)
+def test_edges_on_tag_matches_the_per_edge_scan(ev, ids):
+    from jno._fem import _edges_on_tag
+
+    got, ref = _edges_on_tag(ev, ids), _edges_on_tag_reference(ev, ids)
+    assert got.shape == ref.shape and np.array_equal(got, ref)
+
+
+def test_edges_on_tag_matches_on_a_real_mesh():
+    """Both faces of a real periodic pair, against the scan."""
+    from jno._fem import _edges_on_tag
+    from jno.utils.solver.fem_topology import BASIX_TET_EDGES, build_edge_topology
+
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.3).domain()
+    cells = np.asarray(d.built_mesh.cells_dict["tetra"])
+    ev = build_edge_topology(cells, BASIX_TET_EDGES).edge_vertices
+    pts = np.asarray(d.built_mesh.points)
+    for lo_hi in (0.0, 1.0):
+        ids = np.flatnonzero(np.abs(pts[:, 0] - lo_hi) < 1e-9)
+        assert ids.size > 0
+        assert np.array_equal(_edges_on_tag(ev, ids), _edges_on_tag_reference(ev, ids))
