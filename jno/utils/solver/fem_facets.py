@@ -74,6 +74,31 @@ _FACET_CACHE: dict = {}
 _FACET_CACHE_MAX = 8
 
 
+def pack_face_keys(canonical: np.ndarray):
+    """One ``int64`` per already-sorted face row, or ``None`` if the id range would overflow it.
+
+    ``np.unique(..., axis=0)`` sorts a VOID VIEW of the rows, and its argsort is the single most
+    expensive thing anyone does with a face table here: 2.32 s (a quarter of a 424k-tet domain
+    build) against a fraction of that for a 1-D sort of the same count, and 5.8x on a 3.1M-face 2-D
+    mesh. Packing ``row -> ((r0 * n) + r1) * n + r2`` is exact for ids in ``[0, n)``, and sorting the
+    packed key is *exactly* lexicographic on the rows -- so a caller's row ORDER, first-occurrence
+    indices and inverse are all unchanged, not merely equivalent.
+
+    Every consumer of "which faces occur once" goes through this rather than writing its own
+    ``unique``: the version in :mod:`jno._fem` was left behind when this one was packed, and paid
+    1.57 s of a 26.7 s build for it.
+    """
+    if canonical.size == 0:
+        return np.zeros(len(canonical), dtype=np.int64)
+    n_pts = int(canonical.max()) + 1
+    if n_pts ** canonical.shape[1] >= 2**62:
+        return None  # caller falls back to the row-wise unique
+    keys = np.zeros(len(canonical), dtype=np.int64)
+    for j in range(canonical.shape[1]):
+        keys = keys * n_pts + canonical[:, j]
+    return keys
+
+
 def _boundary_faces(cells: np.ndarray, local_faces, n_face_nodes: int):
     """``(flat, sel, n_local)``: every (cell, local face) row, and which rows are on the boundary.
 
@@ -93,15 +118,8 @@ def _boundary_faces(cells: np.ndarray, local_faces, n_face_nodes: int):
     flat = cells[:, idx].reshape(-1, n_face_nodes).astype(np.int64, copy=False)
     canonical = np.sort(flat, axis=1)
 
-    # Pack each face's sorted vertex ids into ONE int64 and unique on that. ``np.unique(axis=0)``
-    # sorts a void view of the rows, and its argsort measured 2.32 s -- a quarter of the domain
-    # build on a 424k-tet mesh -- where a 1-D sort of the same count is a fraction of it. Falls
-    # back to the row-wise unique when the mesh is too large for the key to fit.
-    n_pts = int(canonical.max()) + 1 if canonical.size else 1
-    if n_pts**n_face_nodes < 2**62:
-        keys = np.zeros(len(canonical), dtype=np.int64)
-        for j in range(n_face_nodes):
-            keys = keys * n_pts + canonical[:, j]
+    keys = pack_face_keys(canonical)
+    if keys is not None:
         _, inverse, counts = np.unique(keys, return_inverse=True, return_counts=True)
     else:
         _, inverse, counts = np.unique(canonical, axis=0, return_inverse=True, return_counts=True)

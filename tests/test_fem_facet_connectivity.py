@@ -130,6 +130,65 @@ def test_the_cache_does_not_confuse_different_meshes():
 
 
 # --------------------------------------------------------------------------------------------
+# packed face keys: the shared unique must be row-for-row what np.unique(axis=0) gives
+# --------------------------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "cells,dim,order",
+    [
+        (None, 2, 1),  # real 2-D mesh, P1
+        (None, 2, 2),  # real 2-D mesh, P2 (the facet-DOF gather)
+        (None, 3, 1),  # real 3-D mesh
+        (np.array([[0, 1, 2]]), 2, 1),  # single cell
+        (np.array([[0, 1, 2, 3], [1, 2, 3, 4]]), 3, 1),  # shared interior face
+    ],
+)
+def test_boundary_facets_match_the_row_wise_unique(cells, dim, order):
+    """``pack_face_keys`` must reproduce ``np.unique(axis=0)`` EXACTLY -- same rows, same order --
+    not merely the same set: callers index ``allf`` by the first-occurrence index it returns."""
+    from jno._fem import _boundary_facets
+    from jno.utils.solver.fem_facets import pack_face_keys
+
+    if cells is None:
+        if dim == 2:
+            mesh = jno.domain(box(0, 0, 1, 1), mesh_size=0.15).built_mesh
+            pts, cells = np.asarray(mesh.points), np.asarray(mesh.cells_dict["triangle"])
+        else:
+            mesh = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.3).domain().built_mesh
+            pts, cells = np.asarray(mesh.points), np.asarray(mesh.cells_dict["tetra"])
+        if order >= 2:  # P2 connectivity: vertices first, then one midpoint per edge
+            e = np.sort(np.concatenate([cells[:, [0, 1]], cells[:, [1, 2]], cells[:, [2, 0]]]), axis=1)
+            uniq, inv = np.unique(e[:, 0] * (cells.max() + 1) + e[:, 1], return_inverse=True)
+            mids = len(pts) + inv.reshape(3, -1).T
+            pts = np.vstack([pts, np.zeros((len(uniq), pts.shape[1]))])
+            cells = np.hstack([cells, mids])
+    else:
+        pts = np.zeros((int(cells.max()) + 1, dim))
+
+    verts = np.asarray(cells)[:, : dim + 1]
+    combos = [(0, 1), (1, 2), (2, 0)] if dim == 2 else [(0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3)]
+    allf = np.concatenate([verts[:, list(c)] for c in combos], axis=0)
+    canonical = np.sort(allf, axis=1)
+
+    keys = pack_face_keys(canonical)
+    _u, i_packed, c_packed = np.unique(keys, return_index=True, return_counts=True)
+    _u, i_rows, c_rows = np.unique(canonical, axis=0, return_index=True, return_counts=True)
+    assert np.array_equal(i_packed[c_packed == 1], i_rows[c_rows == 1]), "packed key reordered the facets"
+
+    got = _boundary_facets(pts, cells, dim, order)
+    assert got is not None and got.shape[0] == int((c_rows == 1).sum())
+    assert np.array_equal(got[:, :dim], allf[i_rows[c_rows == 1]])  # a facet has `dim` vertices
+
+
+def test_pack_face_keys_declines_when_the_key_would_overflow():
+    """Ids too large to pack must return None so the caller falls back, not silently collide."""
+    from jno.utils.solver.fem_facets import pack_face_keys
+
+    assert pack_face_keys(np.array([[0, 1, 2]], dtype=np.int64)) is not None
+    assert pack_face_keys(np.array([[0, 0, 10**7]], dtype=np.int64)) is None  # (1e7)^3 = 1e21 > 2^62
+    assert pack_face_keys(np.zeros((0, 3), dtype=np.int64)).shape == (0,)
+
+
+# --------------------------------------------------------------------------------------------
 # outward face normals: the array expression must reproduce the per-face loop it replaced
 # --------------------------------------------------------------------------------------------
 def _face_normals_reference(points, conn, cells, cell_type):

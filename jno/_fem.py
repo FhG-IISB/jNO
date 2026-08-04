@@ -2267,9 +2267,9 @@ def _boundary_facets(points: Any, cells: Any, dim: int, order: int) -> Optional[
     ``order >= 2`` each facet row also carries the P{order} nodes lying on that facet (edge-interior in
     2D; edge + face-interior in 3D), found from the reference element -- the local DOFs whose reference
     interpolation point lies on the corresponding reference facet. Vertices come first in each row (the
-    leading ``dim+1`` columns stay the facet vertices); the remaining columns are the higher-order facet
-    nodes in arbitrary order (consumers use the node set or match by coordinate). Returns
-    ``(n_facets, n_facet_dof)``, or ``None`` for an empty mesh."""
+    leading ``dim`` columns stay the facet vertices -- a facet of a ``dim``-simplex has ``dim`` of them);
+    the remaining columns are the higher-order facet nodes in arbitrary order (consumers use the node set
+    or match by coordinate). Returns ``(n_facets, n_facet_dof)``, or ``None`` for an empty mesh."""
     points = np.asarray(points, dtype=float)
     cells = np.asarray(cells, dtype=int)
     if cells.ndim != 2 or cells.shape[0] == 0:
@@ -2278,7 +2278,16 @@ def _boundary_facets(points: Any, cells: Any, dim: int, order: int) -> Optional[
     verts = cells[:, : dim + 1]
     combos = [(0, 1), (1, 2), (2, 0)] if dim == 2 else [(0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3)]
     allf = np.concatenate([verts[:, list(c)] for c in combos], axis=0)  # combo-major: row = combo*n_cells + cell
-    _uniq, idx, counts = np.unique(np.sort(allf, axis=1), axis=0, return_index=True, return_counts=True)
+    # Same packed-int64 key the assembler's facet table uses, for the same reason -- and from the
+    # same helper, so the two cannot drift again. See :func:`fem_facets.pack_face_keys`.
+    from .utils.solver.fem_facets import pack_face_keys
+
+    canonical = np.sort(allf, axis=1)
+    keys = pack_face_keys(canonical)
+    if keys is not None:
+        _uniq, idx, counts = np.unique(keys, return_index=True, return_counts=True)
+    else:
+        _uniq, idx, counts = np.unique(canonical, axis=0, return_index=True, return_counts=True)
     bidx = idx[counts == 1]  # allf row index of each boundary facet (a facet used by exactly one cell)
     if order < 2:
         return allf[bidx]
@@ -2291,8 +2300,13 @@ def _boundary_facets(points: Any, cells: Any, dim: int, order: int) -> Optional[
         else np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
     )
     facet_dofs = [list(c) + _ref_interior_facet_dofs(ref_pts, ref_verts[list(c)], dim) for c in combos]
-    rows = [cells[int(r) % n_cells, facet_dofs[int(r) // n_cells]] for r in bidx]
-    return np.asarray(rows, dtype=int)
+    # One gather over all boundary facets rather than a Python row per facet. Every facet of a
+    # simplex carries the same DOF count, so the table is rectangular; the loop stays as the
+    # fallback in case a reference element ever breaks that.
+    if len({len(f) for f in facet_dofs}) == 1:
+        table = np.asarray(facet_dofs, dtype=np.int64)
+        return cells[(bidx % n_cells)[:, None], table[bidx // n_cells]]
+    return np.asarray([cells[int(r) % n_cells, facet_dofs[int(r) // n_cells]] for r in bidx], dtype=int)
 
 
 def _face_nodes(domain: Any, points: Any, bnodes: Optional[np.ndarray], tag: str) -> Optional[np.ndarray]:
