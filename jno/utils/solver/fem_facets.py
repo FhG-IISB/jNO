@@ -183,8 +183,13 @@ def compute_face_normals(
     of two edge vectors, oriented away from the opposite vertex.
 
     Returns ``(n_bfaces, dim)``.
+
+    One array expression over all faces, not a Python loop over them. The loop form called
+    ``np.cross`` / ``np.mean`` / ``np.linalg.norm`` on 3-element vectors once per face, where numpy's
+    per-call dispatch dwarfs the arithmetic: 16,730 boundary faces on a 3-D unit cube cost 0.63 s of
+    a 5.6 s build, and the cost is per-face, so it grows with every refinement.
     """
-    points = np.asarray(points)
+    points = np.asarray(points, dtype=float)
     cells = np.asarray(cells)
     if cell_type == "triangle":
         local_faces = _LOCAL_FACES_TRI
@@ -195,28 +200,26 @@ def compute_face_normals(
     else:
         raise NotImplementedError(f"compute_face_normals: cell_type {cell_type!r} not supported.")
 
-    normals = np.empty((conn.n_bfaces, dim))
-    for i in range(conn.n_bfaces):
-        c = int(conn.parent_cell[i])
-        k = int(conn.local_face[i])
-        entry = local_faces[k]
-        face_ids = [int(cells[c, j]) for j in entry[:n_face_nodes]]
-        opp_id = int(cells[c, entry[n_face_nodes]])
-        verts = points[face_ids, :dim]  # (n_face_nodes, dim)
-        opp = points[opp_id, :dim]
+    if conn.n_bfaces == 0:
+        return np.zeros((0, dim), dtype=float)
 
-        if dim == 2:  # 2-D: edge → rotate tangent 90° clockwise
-            t = verts[1] - verts[0]
-            n = np.array([t[1], -t[0]])
-        else:  # 3-D: face → cross product of two edges
-            n = np.cross(verts[1] - verts[0], verts[2] - verts[0])
+    # (n_bfaces, n_face_nodes + 1): the parent cell's local node ids for this face, apex last
+    entry = np.asarray(local_faces, dtype=np.int64)[np.asarray(conn.local_face)]
+    parent = cells[np.asarray(conn.parent_cell)]  # (n_bfaces, n_verts_per_cell)
+    face_ids = np.take_along_axis(parent, entry[:, :n_face_nodes], axis=1)
+    verts = points[face_ids, :dim]  # (n_bfaces, n_face_nodes, dim)
+    opp = points[np.take_along_axis(parent, entry[:, n_face_nodes : n_face_nodes + 1], axis=1)[:, 0], :dim]
 
-        mid = np.mean(verts, axis=0)
-        if np.dot(n, mid - opp) < 0:
-            n = -n
-        normals[i] = n / np.linalg.norm(n)
+    if dim == 2:  # 2-D: edge → rotate tangent 90° clockwise
+        t = verts[:, 1] - verts[:, 0]
+        n = np.stack([t[:, 1], -t[:, 0]], axis=1)
+    else:  # 3-D: face → cross product of two edges
+        n = np.cross(verts[:, 1] - verts[:, 0], verts[:, 2] - verts[:, 0])
 
-    return normals
+    mid = verts.mean(axis=1)
+    flip = np.einsum("ij,ij->i", n, mid - opp) < 0
+    n = np.where(flip[:, None], -n, n)
+    return n / np.linalg.norm(n, axis=1, keepdims=True)
 
 
 def facet_quad_data(
