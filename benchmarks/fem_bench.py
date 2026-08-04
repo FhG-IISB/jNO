@@ -13,7 +13,7 @@ Each case reports the split that matters for jNO, where assembly compiles a prog
 
 and two things that decide whether those numbers mean anything:
 
-* ``rel_residual`` / ``converged`` -- the correctness gate. A timing taken on a solve that never
+* ``rel_residual`` / ``converged`` / ``residual_tol`` -- the correctness gate. A timing taken on a solve that never
   converged measures nothing, and without this the suite had no way to notice. It is not
   hypothetical: the first case to get a gate immediately caught an unpreconditioned solve burning
   ``maxiter``, which had been timing as a gradient FASTER than its own forward. ``None`` means the
@@ -515,15 +515,20 @@ def _transient_step_residual(fem, traj):
     the constraint, so their residual is meaningless here. Reported relative to ||R(u_n)|| and
     maximised over steps, so one bad step cannot hide behind many good ones.
 
-    Validated to discriminate: a converged Rayleigh-Benard solve gives 2.8e-07, and the same
-    trajectory perturbed by 5% gives 6.3e-01.
+    A LINEAR transient carries ``M``/``A`` rather than ``mass``/``residual`` callables, so its step
+    equation is ``M (u_n - u_(n-1))/dt + A u_n - c - f(t_n) = 0`` and the reference norm is
+    ``||A u_n||``; same check, different accessors.
+
+    Validated to discriminate on both branches, against the same trajectory perturbed by 5%:
+    Rayleigh-Benard 2.8e-07 vs 6.3e-01, heat 1.3e-10 vs 1.0e+00.
     """
     blk = fem.operator
     theta = float((getattr(blk, "metadata", None) or {}).get("theta", 1.0))
     if theta != 1.0:
         return None, f"theta={theta}: this gate implements backward Euler only"
-    if getattr(blk, "mass", None) is None or getattr(blk, "residual", None) is None:
-        return None, "linear transient: block carries M/A rather than mass+residual callables"
+    nonlinear = getattr(blk, "mass", None) is not None and getattr(blk, "residual", None) is not None
+    if not nonlinear and (getattr(blk, "M", None) is None or getattr(blk, "A", None) is None):
+        return None, "transient block carries neither mass+residual nor M+A"
 
     dt = float(blk.dt)
     pairs = getattr(getattr(fem, "domain", None), "_fem_native_dirichlet_pairs", None) or []
@@ -534,12 +539,24 @@ def _transient_step_residual(fem, traj):
     worst = 0.0
     for n in range(1, traj.shape[0]):
         t_n = blk.t0 + n * dt
-        u_n, u_prev = jnp.asarray(traj[n]), jnp.asarray(traj[n - 1])
-        residual = jnp.asarray(blk.residual(u_n, t_n, {})).reshape(-1)
-        g = np.asarray(jnp.asarray(blk.mass(t_n, {}) @ ((u_n - u_prev) / dt)).reshape(-1) + residual)
-        scale = max(float(np.linalg.norm(np.asarray(residual)[free])), 1e-30)
+        u_n = jnp.asarray(traj[n])
+        rate = jnp.asarray(traj[n] - traj[n - 1]) / dt
+        if nonlinear:
+            # M(t) u_dot + R(u, t) = 0
+            reference = jnp.asarray(blk.residual(u_n, t_n, {})).reshape(-1)
+            g = jnp.asarray(blk.mass(t_n, {}) @ rate).reshape(-1) + reference
+        else:
+            # M u_dot + A u = c + f(t)
+            rhs = jnp.asarray(blk.affine_bias if blk.affine_bias is not None else 0.0)
+            if getattr(blk, "forcing_vector_fn", None) is not None:
+                rhs = rhs + jnp.asarray(blk.forcing_vector_fn(t_n, {})).reshape(-1)
+            reference = jnp.asarray(blk.A @ u_n).reshape(-1)
+            g = jnp.asarray(blk.M @ rate).reshape(-1) + reference - jnp.reshape(rhs, (-1,))
+        g, reference = np.asarray(g), np.asarray(reference)
+        scale = max(float(np.linalg.norm(reference[free])), 1e-30)
         worst = max(worst, float(np.linalg.norm(g[free]) / scale))
-    return worst, f"max_n ||M(u_n-u_(n-1))/dt + R(u_n)|| / ||R(u_n)|| over {int(free.sum())} free rows"
+    kind = "R(u_n)" if nonlinear else "A u_n"
+    return worst, f"max_n ||step residual|| / ||{kind}|| over {int(free.sum())} free rows"
 
 
 def _provenance() -> dict:
