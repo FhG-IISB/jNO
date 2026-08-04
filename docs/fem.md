@@ -788,6 +788,13 @@ Jacobi-BiCGStab takes 20.1 s, `linear=jno.solve.lu()` 7.6 s and `linear=jno.solv
 to the same 2.8e-07 per-step Newton residual. Writing an *explicit* matrix-free `nonlinear=` alongside a direct
 `linear=` is contradictory and raises rather than picking one silently.
 
+> Limits, since they are not obvious. This routing only fires when the *linear* slot is direct — a
+> `precond=` that needs an assembled matrix (`jacobi`, an unbuilt `amg`) still raises where it is
+> materialized, as before. `picard()` has no assembled-tangent form: its linearization is the lagged
+> *matrix-free* JVP, so `nonlinear=picard(), linear=lu()` raises — moving to `newton(direct=True)`
+> there changes the algorithm, not just the solver. And the direct Newton still needs the assembler to
+> supply a tangent, so the matrix-free-only routes (a coupled-residual wrapper) fail loud either way.
+
 **User extension** is duck-typed — a linear solver is any `fn(A, b, *, M=None, x0=None) -> x` with `A` a
 `jno.solve.LinearOperator` (`.mv`, `.T`, `.diag()`, `.bcoo`, `.dense()`); a preconditioner is any
 `ctx -> (v -> M⁻¹v)`:
