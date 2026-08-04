@@ -48,8 +48,11 @@ THREE CASES CANNOT REACH A 10 s SOLVE ON AN 8 GB CARD, and are included at their
 * ``stokes2d``  -- walled by the SOLVER. At mesh_size 0.04 the saddle-point system comes back
   "Singular matrix in linear solve" from cuSolver's sparse LU, and an iterative outer does not
   converge on it either (fgmres stalls at 2.8e-3). 0.045 works and is the largest size here: ~1.8 s.
-* ``poisson3d`` -- walled by MEMORY. Even at 8.9e6 contrast the solve is 0.20 s at 98k DOFs; a 10 s
-  solve needs ~1.3M tets, which is ~10 GB of peak device memory and an ~8 minute build.
+* ``poisson3d`` -- never becomes SOLVE-BOUND. Its solve is flat at 0.28-0.35 s from 6.8k to 87k
+  DOFs, i.e. essentially independent of size, while its build grows to 8.4 s: 96% of the wall clock
+  is build. It is NOT memory-walled -- an earlier claim to that effect was an artefact of a bug in
+  this suite's own convergence gate, which densified the operator and OOM'd every size above 20k.
+  With that fixed the case reaches 87k DOFs in 494 MB.
 * ``elastic2d`` -- walled by CONVERGENCE, and instructively so. At 1.6e5 contrast it does reach 5-12 s,
   but only sometimes: the same mesh that converged in an isolated run failed inside the matrix. That
   is BiCGStab sitting on the edge of breakdown, where GPU reduction order is enough to tip it. A
@@ -302,7 +305,7 @@ CASES = {
     "reaction2d": (reaction2d, (0.008, 0.0062, 0.0048, 0.0037, 0.0028, 0.0022), "2-D nonlinear (Newton)"),
     "heat2d": (heat2d, (0.02, 0.0167, 0.0139, 0.0115, 0.0096, 0.008), f"2-D transient ({HEAT_STEPS} steps)"),
     "stokes2d": (stokes2d, (0.09, 0.078, 0.068, 0.059, 0.052, 0.045), "2-D Stokes (solver-walled)"),
-    "poisson3d": (poisson3d, (0.05, 0.042, 0.035, 0.029, 0.024, 0.02), "3-D Poisson (memory-walled)"),
+    "poisson3d": (poisson3d, (0.05, 0.042, 0.035, 0.029, 0.024, 0.02), "3-D Poisson (build-bound)"),
     "eddy3d": (eddy3d, (0.16, 0.141, 0.124, 0.109, 0.096, 0.085), "3-D complex H(curl)"),
 }
 
