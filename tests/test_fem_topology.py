@@ -72,3 +72,66 @@ def test_edge_count_matches_euler_for_structured_grids():
         v = (n + 1) ** 2
         f = 2 * n * n
         assert top.n_edges == v + f - 1
+
+
+# --------------------------------------------------------------------------------------------
+# the numbering itself: edge ids ARE the global DOF numbering of an edge element
+# --------------------------------------------------------------------------------------------
+import pytest  # noqa: E402
+
+from jno.utils.solver.fem_topology import BASIX_TET_EDGES  # noqa: E402
+
+
+def _first_encounter_reference(cells, local_edges):
+    """The nested Python loop ``build_edge_topology`` was, kept as the oracle."""
+    cells = np.asarray(cells)
+    n_cells, n_local = cells.shape[0], len(local_edges)
+    cell_edges = np.empty((n_cells, n_local), dtype=np.int64)
+    signs = np.empty((n_cells, n_local), dtype=np.int8)
+    edge_map, edge_vertices = {}, []
+    for c in range(n_cells):
+        for k, (i, j) in enumerate(local_edges):
+            a, b = int(cells[c, i]), int(cells[c, j])
+            key = (a, b) if a < b else (b, a)
+            eid = edge_map.get(key)
+            if eid is None:
+                eid = len(edge_vertices)
+                edge_map[key] = eid
+                edge_vertices.append(key)
+            cell_edges[c, k] = eid
+            signs[c, k] = 1 if a < b else -1
+    return cell_edges, signs, np.asarray(edge_vertices, dtype=np.int64).reshape(-1, 2)
+
+
+@pytest.mark.parametrize(
+    "cells,edges",
+    [
+        (np.array([[0, 1, 2], [1, 3, 2]]), BASIX_TRIANGLE_EDGES),
+        (_structured_grid(6), BASIX_TRIANGLE_EDGES),
+        (np.array([[0, 1, 2, 3], [1, 2, 3, 4]]), BASIX_TET_EDGES),
+        # vertex ids deliberately NOT ascending within a cell, so encounter order != sorted order
+        (np.array([[9, 4, 7], [4, 1, 7], [7, 1, 0]]), BASIX_TRIANGLE_EDGES),
+        (np.zeros((0, 3), dtype=int), BASIX_TRIANGLE_EDGES),
+    ],
+)
+def test_edge_numbering_is_first_encounter_order(cells, edges):
+    """Edge ids are the DOF numbering, so a permutation would silently reorder every N1E/RT/Morley
+    solution vector. The vectorised build must reproduce the loop's order EXACTLY, not merely the
+    same set of edges."""
+    top = build_edge_topology(cells, edges)
+    ref_ids, ref_signs, ref_verts = _first_encounter_reference(cells, edges)
+    np.testing.assert_array_equal(top.cell_edges, ref_ids)
+    np.testing.assert_array_equal(top.cell_edge_signs, ref_signs)
+    np.testing.assert_array_equal(top.edge_vertices, ref_verts)
+    assert top.n_edges == len(ref_verts)
+
+
+def test_edge_numbering_matches_the_loop_on_a_real_tet_mesh():
+    import jno
+
+    cells = np.asarray(jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.3).domain().built_mesh.cells_dict["tetra"])
+    top = build_edge_topology(cells, BASIX_TET_EDGES)
+    ref_ids, ref_signs, ref_verts = _first_encounter_reference(cells, BASIX_TET_EDGES)
+    np.testing.assert_array_equal(top.cell_edges, ref_ids)
+    np.testing.assert_array_equal(top.cell_edge_signs, ref_signs)
+    np.testing.assert_array_equal(top.edge_vertices, ref_verts)
