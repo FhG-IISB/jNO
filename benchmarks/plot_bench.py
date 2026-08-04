@@ -53,19 +53,28 @@ OKABE_ITO = ["#0072B2", "#E69F00", "#009E73", "#CC79A7", "#D55E00", "#56B4E9", "
 TEAL, GRAY, INK = "#0D9488", "#94A3B8", "#1A202C"
 
 
-#: an adjoint case is drawn as a DASHED twin of the forward case it derives from, in the same
-#: colour, so the gradient cost can be read directly against the solve it differentiates.
-ADJOINT_SUFFIX = "_adj"
+#: A VARIANT of a case -- the same problem differentiated (``_adj``) or solved by a different
+#: solver (``_amg``) -- is drawn in its parent's colour with its own dash pattern, so the cost of
+#: the variation can be read directly against the thing it varies.
+VARIANT_STYLES = {"_adj": "--", "_amg": ":"}
 
 
 def pair_styles(order):
-    """Map case -> (colour, linestyle), pairing ``<case>_adj`` with ``<case>``."""
-    base = [c for c in order if not c.endswith(ADJOINT_SUFFIX)]
+    """Map case -> (colour, linestyle), pairing ``<case><suffix>`` with ``<case>``."""
+
+    def split(case):
+        for suffix, dash in VARIANT_STYLES.items():
+            if case.endswith(suffix):
+                return case[: -len(suffix)], dash
+        return case, "-"
+
+    base = [c for c in order if split(c)[1] == "-"]
     palette = {c: OKABE_ITO[i % len(OKABE_ITO)] for i, c in enumerate(base)}
     styles = {}
     for c in order:
-        if c.endswith(ADJOINT_SUFFIX) and c[: -len(ADJOINT_SUFFIX)] in palette:
-            styles[c] = (palette[c[: -len(ADJOINT_SUFFIX)]], "--")
+        parent, dash = split(c)
+        if dash != "-" and parent in palette:
+            styles[c] = (palette[parent], dash)
         else:
             styles[c] = (palette.get(c, OKABE_ITO[len(palette) % len(OKABE_ITO)]), "-")
     return styles

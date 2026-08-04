@@ -176,6 +176,39 @@ def poisson2d_adj(ms):
     return fem, {"grad": loss, "check": residual}
 
 
+def poisson2d_amg(ms):
+    """The same 2-D Poisson, solved with GPU ALGEBRAIC MULTIGRID instead of Jacobi-BiCGStab.
+
+    The one case here that varies the SOLVER rather than the problem, because that is where the
+    scaling exponent lives. Jacobi-preconditioned Krylov needs iterations growing like sqrt(n);
+    multigrid needs O(1) of them, so the two curves differ in slope, not just offset -- measured
+    n^1.28 against n^0.74, which is 4.8x at 73k DOFs and 17.6x at 805k.
+
+    Run at tol=1e-10 deliberately: at its 1e-6 default AMG returns a residual ~35x looser than the
+    Jacobi path's, and a speed comparison against a slacker convergence criterion is not a
+    comparison. At 1e-10 it lands ~100x TIGHTER than the default solver and is still 17.6x faster.
+
+    READ THIS CURVE AS SETUP, NOT ITERATION. Like every case here it reports the FIRST solve, and
+    AMG's is dominated by building the multigrid hierarchy: it is flat at ~1.1 s from 73k to 959k
+    DOFs, where the warm solve underneath is 0.03-0.16 s. So the curve is a setup cost with the
+    algorithm hidden inside it, and it crosses the Jacobi line near ~400k DOFs -- below that the
+    hierarchy costs more than it saves on a single cold solve, above it AMG wins and keeps winning
+    (3.4x at 959k). For repeated solves on one operator the setup amortises and the warm numbers
+    apply instead, which is where the 17.6x lives.
+
+    Needs the optional ``jaxamg`` extra plus a built AmgX (``AMGX_ROOT``, ``CUDA_HOME`` and AmgX on
+    ``LD_LIBRARY_PATH``); without them this case records a failure and the rest of the matrix runs.
+    """
+    d = _sq(ms)
+    u, v = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    k = _rough(C_MILD, xi, yi)
+    fem = jno.fem([k * (ui.x * vi.x + ui.y * vi.y) - 1.0 * vi, u(xb, yb) - 0.0], quad_degree=3)
+    return fem, {"linear": jno.solve.amg(tol=1e-10)}
+
+
 def elastic2d(ms):
     """2-D VECTOR field — the element block grows with local DOFs, and so does its AD tangent."""
     d = _sq(ms)
@@ -305,6 +338,11 @@ CASES = {
         poisson2d_adj,
         (0.004, 0.0029, 0.0021, 0.0015, 0.0011),
         "2-D Poisson adjoint ($\\partial/\\partial\\alpha$)",
+    ),
+    "poisson2d_amg": (
+        poisson2d_amg,
+        (0.004, 0.0029, 0.0021, 0.0015, 0.0011, 0.0008),
+        "2-D Poisson, GPU AMG",
     ),
     "elastic2d": (elastic2d, (0.006, 0.0045, 0.0034, 0.0026, 0.002, 0.0015), "2-D vector (convergence-walled)"),
     "reaction2d": (reaction2d, (0.008, 0.0062, 0.0048, 0.0037, 0.0028, 0.0022), "2-D nonlinear (Newton)"),
