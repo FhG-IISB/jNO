@@ -2309,6 +2309,23 @@ def _boundary_facets(points: Any, cells: Any, dim: int, order: int) -> Optional[
     return np.asarray([cells[int(r) % n_cells, facet_dofs[int(r) // n_cells]] for r in bidx], dtype=int)
 
 
+def _edges_on_tag(edge_vertices: np.ndarray, tag_vertex_ids: np.ndarray) -> np.ndarray:
+    """Global edge ids whose BOTH canonical vertices lie on a boundary tag, ascending.
+
+    A membership mask over the vertices, not a Python scan over the edges: the scan ran once per
+    global edge per periodic tag, with two ``int()`` casts and two set lookups each, and a 3-D N1E
+    mesh has millions of edges. Same edges, same order (``flatnonzero`` is ascending, as the
+    comprehension was).
+    """
+    ev = np.asarray(edge_vertices, dtype=np.int64).reshape(-1, 2)
+    ids = np.asarray(tag_vertex_ids, dtype=np.int64).reshape(-1)
+    if ev.size == 0 or ids.size == 0:
+        return np.zeros(0, dtype=int)
+    on_tag = np.zeros(max(int(ev.max()), int(ids.max())) + 1, dtype=bool)
+    on_tag[ids] = True
+    return np.flatnonzero(on_tag[ev[:, 0]] & on_tag[ev[:, 1]]).astype(int)
+
+
 def _face_nodes(domain: Any, points: Any, bnodes: Optional[np.ndarray], tag: str) -> Optional[np.ndarray]:
     """Global node ids on a periodic face, taken from the tag's **predicate** (the user's intent),
     evaluated over the **assembly** boundary nodes ``bnodes`` (so P2 midpoints and 3D face nodes are
@@ -2425,9 +2442,8 @@ def _build_periodic_reduction_n1e(domain: Any, ties: List[Any], offsets: Any) ->
         f = _face_nodes(domain, vpts, None, tag)
         if f is None or np.asarray(f).size == 0:
             raise ValueError(f"jno.fem periodic (N1E): boundary tag {tag!r} has no mesh vertices.")
-        vset = set(int(v) for v in np.asarray(f, dtype=int).reshape(-1))
         # a global edge is on the boundary tag iff BOTH its canonical vertices are on that tag
-        etags[tag] = np.asarray([e for e in range(n_edges) if int(ev[e, 0]) in vset and int(ev[e, 1]) in vset], dtype=int)
+        etags[tag] = _edges_on_tag(ev, np.asarray(f, dtype=int).reshape(-1))
 
     red = build_periodic_prolongation_n1e(n_edges, emid, edir, etags, pairs, phases)
     n_fields = len(offsets) - 1
@@ -2491,9 +2507,8 @@ def _build_periodic_reduction_nonnodal(domain: Any, ties: List[Any], offsets: An
             raise ValueError(f"jno.fem periodic (non-nodal C¹): boundary tag {tag!r} has no mesh vertices.")
         vids = np.asarray(f, dtype=int).reshape(-1)
         vtags[tag] = vids
-        vset = set(int(v) for v in vids)
         # a global edge is on the boundary tag iff BOTH its canonical vertices are on that tag
-        etags[tag] = np.asarray([e for e in range(n_edges) if int(ev[e, 0]) in vset and int(ev[e, 1]) in vset], dtype=int)
+        etags[tag] = _edges_on_tag(ev, vids)
 
     red = build_periodic_prolongation_nonnodal(
         n_verts,
