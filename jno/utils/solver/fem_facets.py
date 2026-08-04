@@ -85,32 +85,27 @@ def build_facet_connectivity(cells: np.ndarray, cell_type: str = "triangle") -> 
             f"build_facet_connectivity: cell_type {cell_type!r} not supported (triangle / tetrahedron only)."
         )
 
-    # Map canonical (sorted) face-vertex key -> (cell, local_face_k, face_verts) or None (interior)
-    face_map: dict = {}
-    for c in range(cells.shape[0]):
-        for k, entry in enumerate(local_faces):
-            face_verts = tuple(int(cells[c, i]) for i in entry[:n_face_nodes])
-            key = tuple(sorted(face_verts))
-            if key in face_map:
-                face_map[key] = None  # shared by two cells -> interior
-            else:
-                face_map[key] = (c, k, face_verts)
+    # Every (cell, local face) in one array, then keep the faces whose canonical (sorted) key occurs
+    # exactly once. The dict-of-tuples version of this walked cells x local_faces in Python with an
+    # ``int()`` per vertex -- 5.1M of them on a 424k-tet mesh, and over 3 s of a 14 s assembly.
+    idx = np.asarray(local_faces, dtype=np.int64)[:, :n_face_nodes]  # (n_local_faces, n_face_nodes)
+    n_local = idx.shape[0]
+    flat = cells[:, idx].reshape(-1, n_face_nodes).astype(np.int64, copy=False)
 
-    parent_cells, local_faces_out, face_nodes_out = [], [], []
-    for val in face_map.values():
-        if val is None:
-            continue
-        c, k, face_verts = val
-        parent_cells.append(c)
-        local_faces_out.append(k)
-        face_nodes_out.append(list(face_verts))
+    _, inverse, counts = np.unique(np.sort(flat, axis=1), axis=0, return_inverse=True, return_counts=True)
+    # flat is cell-major, so a boundary face's row index recovers both its cell and its local face.
+    # Selecting in row order also reproduces the old dict-insertion order, since a boundary face
+    # occurs exactly once and was therefore inserted at this position.
+    sel = np.flatnonzero(counts[np.asarray(inverse).ravel()] == 1)
 
-    n_bfaces = len(parent_cells)
+    n_bfaces = int(sel.size)
     empty_face = np.empty((0, n_face_nodes), dtype=np.int64)
     return FacetConnectivity(
-        parent_cell=np.asarray(parent_cells, dtype=np.int64),
-        local_face=np.asarray(local_faces_out, dtype=np.int64),
-        face_nodes=np.asarray(face_nodes_out, dtype=np.int64) if n_bfaces > 0 else empty_face,
+        parent_cell=(sel // n_local).astype(np.int64),
+        local_face=(sel % n_local).astype(np.int64),
+        # the ORIGINAL vertex order of the face, not the sorted key -- orientation is load-bearing
+        # for the outward normals computed from it
+        face_nodes=flat[sel] if n_bfaces > 0 else empty_face,
         n_bfaces=n_bfaces,
     )
 

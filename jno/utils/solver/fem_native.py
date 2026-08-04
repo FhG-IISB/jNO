@@ -1656,20 +1656,33 @@ def assemble_fem_native(
                 continue  # a net-valued Dirichlet is (re-)built per args in _dirichlet_pairs_at
             vt = vecs[fidx]
             pts_all = pts_f_all[fidx]
-            for nid in _boundary_node_ids(fidx, region):
-                p = np.asarray(pts_all[nid])
-                if _field_vals is not None:
-                    g = float(_field_vals[nid])
-                elif value_node is not None:
-                    raw = _eval_value_node_at(value_node, jnp.asarray(p)[None])
-                    g = float(jnp.asarray(raw).reshape(-1)[0])
-                elif callable(value):
-                    g = float(value(p))
+            nids = list(_boundary_node_ids(fidx, region))
+            # Evaluate g on ALL of the region's boundary nodes at once. Doing it per node meant one
+            # traced evaluation and one device->host sync per node -- 14.6k of each on a 75k-node
+            # mesh, and the largest single cost in assembly. ``_eval_value_node_at`` already takes a
+            # batch of points (the initial-condition path below passes the whole array).
+            pts = np.asarray(pts_all)[nids] if nids else np.zeros((0, np.asarray(pts_all).shape[-1]))
+            if _field_vals is not None:
+                gs = np.asarray(_field_vals)[nids].astype(float)
+            elif value_node is not None:
+                raw = np.asarray(jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(pts))))
+                # Does the result scale with the number of points? A CONSTANT profile returns the
+                # same thing for any batch -- including a constant VECTOR like (gx, gy), whose size
+                # can coincide with the node count -- so shape alone cannot tell. One extra
+                # single-point evaluation settles it and costs nothing.
+                one = np.asarray(jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(pts[:1]))))
+                if raw.shape == one.shape or len(nids) == 0:
+                    gs = np.full(len(nids), float(one.reshape(-1)[0]))  # constant over the region
                 else:
-                    g = float(value)
-                comps_range = range(vt) if comp is None else [int(comp)]
+                    gs = raw.reshape(len(nids), -1)[:, 0].astype(float)  # first component per node
+            elif callable(value):
+                gs = np.array([float(value(p)) for p in pts], dtype=float)
+            else:
+                gs = np.full(len(nids), float(value))
+            comps_range = range(vt) if comp is None else [int(comp)]
+            for nid, g in zip(nids, gs):
                 for c in comps_range:
-                    pairs.append((offs[fidx] + nid * vt + c, g))
+                    pairs.append((offs[fidx] + nid * vt + c, float(g)))
         # Expose the (dof, value) pairs for callers that compose their own system from native blocks
         # (e.g. the second-order-in-time augmented [u, v] block applies them to the 2N system itself).
         # The time-varying entries ride a companion stash: the caller writes g(x_d, t) (and, for a
