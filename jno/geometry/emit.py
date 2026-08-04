@@ -371,7 +371,17 @@ def _apply_periodic(dim, labels, periodic):
 MESH_ALGORITHM_3D = 10
 
 #: Threads for the 3-D mesher. Only HXT parallelises; serial algorithms ignore it.
-MESH_THREADS = 8
+#:
+#: **1, not 8, because parallel HXT is NOT REPRODUCIBLE.** Measured: three builds of the same box at
+#: 8 threads gave the same node COUNT but different node positions each time, while at 1 thread the
+#: meshes were bit-identical across runs. A mesh that changes run to run means results that cannot
+#: be reproduced, tests that pin anything about the mesh going flaky, and benchmark variance that
+#: silently includes mesh variation.
+#:
+#: The speed that matters survives this: HXT at 1 thread is still 6.6x gmsh's serial Delaunay
+#: (0.59 s vs 3.91 s at size 0.022); threading adds a further 2.2x (to 0.27 s) on a step that is now
+#: only ~10% of the domain build. Pass ``threads=8`` explicitly to trade reproducibility for it.
+MESH_THREADS = 1
 
 #: gmsh's 2-D mesher, left at 6 (Frontal-Delaunay) DELIBERATELY. Algorithm 5 (Delaunay) is ~1.4x
 #: faster per node but measurably worse: mean minSICN 0.952 against 0.999, worst element 0.665
