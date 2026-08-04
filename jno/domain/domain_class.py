@@ -1671,10 +1671,15 @@ class domain(MeshIOMixin):
         fem_cells = [mesh.cells[i] for i in keep_blocks]
         if not fem_cells:
             return mesh
-        used = np.unique(np.concatenate([np.asarray(cb.data).reshape(-1) for cb in fem_cells]))
-        if used.size == len(pts) and len(keep_blocks) == len(mesh.cells):
+        # "which nodes are referenced" is a membership question, so it is a scatter into a flag
+        # array (O(n)), not a sort (O(n log n)): np.unique over 3.1M connectivity entries cost
+        # 0.29 s of a 26.7 s build to answer it. flatnonzero already returns them in order.
+        seen = np.zeros(len(pts), dtype=bool)
+        for cb in fem_cells:
+            seen[np.asarray(cb.data).reshape(-1)] = True
+        keep = np.flatnonzero(seen).astype(np.int64)
+        if keep.size == len(pts) and len(keep_blocks) == len(mesh.cells):
             return mesh  # every node supports an element and there are no 0-D blocks -> nothing to do
-        keep = np.sort(used.astype(np.int64))
         remap = np.full(len(pts), -1, dtype=np.int64)
         remap[keep] = np.arange(len(keep), dtype=np.int64)
         cells = [meshio.CellBlock(cb.type, remap[np.asarray(cb.data)]) for cb in fem_cells]
@@ -1853,9 +1858,21 @@ class domain(MeshIOMixin):
 
             self._simplex_pools[tag] = SimplexPool.from_segments(seg_coords, normals=normals)
 
+    @staticmethod
+    def _cells_of(block_data, indices, offset):
+        """Rows of ``block_data`` picked out by global cell ``indices`` less ``offset``, in order.
+
+        The Python loop this replaces ran once per CELL, and the interior tag names every cell in the
+        mesh: a 1.03M-triangle 2-D mesh paid 1.03M ``set.update`` calls and built 1.03M tuples only to
+        hand them straight back to ``np.array`` -- 1.05 s of a 26.7 s build. Out-of-range indices are
+        dropped rather than raising, exactly as the loop's bounds test did.
+        """
+        data = np.asarray(block_data)
+        local = np.asarray(indices, dtype=np.int64).reshape(-1) - int(offset)
+        return data[local[(local >= 0) & (local < len(data))]]
+
     def _extract_points_from_mesh(self, mesh):
         """Extract points and normals from mesh and organize by tag."""
-        index_to_normal_pos = {}
         points = mesh.points[:, : self.dimension]
         self.points = points
         self._mesh_pool = {}
@@ -1869,15 +1886,20 @@ class domain(MeshIOMixin):
         if self.dimension > 1:
             boundary_normals, boundary_indices = self.get_boundary_normals(mesh)
             boundary_normals = boundary_normals[:, : self.dimension]
-            index_to_normal_pos = {int(idx): int(pos) for pos, idx in enumerate(boundary_indices)}
         else:
             left_boundary = np.where(points[:, 0] == np.min(points[:, 0]))[0]
             right_boundary = np.where(points[:, 0] == np.max(points[:, 0]))[0]
 
             boundary_indices = np.stack([left_boundary, right_boundary]).flatten()
-            index_to_normal_pos = {int(idx): int(pos) for pos, idx in enumerate(boundary_indices)}
 
             boundary_normals = np.array([[-1], [1]])
+
+        # node id -> row in ``boundary_normals``, as a lookup ARRAY rather than a dict: it is read
+        # once per point of every tag, and the interior tag holds every node in the mesh. A later
+        # duplicate wins, exactly as it did when this was a dict comprehension.
+        normal_pos_of = np.full(len(points), -1, dtype=np.int64)
+        if len(boundary_indices):
+            normal_pos_of[np.asarray(boundary_indices, dtype=np.int64)] = np.arange(len(boundary_indices))
 
         if hasattr(mesh, "cell_sets") and mesh.cell_sets:
             # Compute cumulative offsets: cell_sets may use global cell indices
@@ -1900,9 +1922,10 @@ class domain(MeshIOMixin):
 
                 self.avaiable_mesh_tags.append(name)
 
-                tag_points = set()
-                tag_edges = []
-                tag_tris = []
+                # lists of ARRAYS (one per contributing block), concatenated below
+                tag_point_blocks: List[np.ndarray] = []
+                tag_edge_blocks: List[np.ndarray] = []
+                tag_tri_blocks: List[np.ndarray] = []
                 # A tag backed by volume cells (block 0 = the spatial-fill element for this
                 # dimension) is a region/interior, never a boundary — so it must not pick up PCA
                 # "boundary" normals (that would mislabel an interior sub-region as a boundary tag).
@@ -1921,27 +1944,21 @@ class domain(MeshIOMixin):
                         if cell_type == "vertex":
                             for b_idx, cell_block in enumerate(mesh.cells):
                                 if cell_block.type == "vertex":
-                                    for idx in indices:
-                                        local_idx = int(idx) - block_offsets.get((b_idx, "vertex"), 0)
-                                        if 0 <= local_idx < len(cell_block.data):
-                                            # vertex data contains the point index
-                                            point_idx = int(cell_block.data[local_idx].flatten()[0])
-                                            tag_points.add(point_idx)
+                                    sel = self._cells_of(cell_block.data, indices, block_offsets.get((b_idx, "vertex"), 0))
+                                    if len(sel):  # vertex data contains the point index
+                                        tag_point_blocks.append(sel.reshape(len(sel), -1)[:, 0])
                         else:
                             if block0_is_volume and cell_type == _vol_elem and len(indices) > 0:
                                 has_volume_cells = True
                             for b_idx, cell_block in enumerate(mesh.cells):
                                 if cell_block.type == cell_type:
-                                    offset = block_offsets.get((b_idx, cell_type), 0)
-                                    for idx in indices:
-                                        local_idx = int(idx) - offset
-                                        if 0 <= local_idx < len(cell_block.data):
-                                            cell = cell_block.data[local_idx]
-                                            tag_points.update(cell.flatten())
-                                            if cell_block.type == "line":
-                                                tag_edges.append(tuple(cell))
-                                            elif cell_block.type == "triangle":
-                                                tag_tris.append(tuple(cell))
+                                    sel = self._cells_of(cell_block.data, indices, block_offsets.get((b_idx, cell_type), 0))
+                                    if len(sel):
+                                        tag_point_blocks.append(sel.ravel())
+                                        if cell_block.type == "line":
+                                            tag_edge_blocks.append(sel)
+                                        elif cell_block.type == "triangle":
+                                            tag_tri_blocks.append(sel)
                 else:
                     # Handle list-style cell_data. meshio cell-set indices
                     # can be either block-local (manually written `.inp`
@@ -1966,34 +1983,34 @@ class domain(MeshIOMixin):
                             else:
                                 sub = 0
 
-                            if cell_block.type == "vertex":
-                                for idx in idx_array:
-                                    local_idx = int(idx) - sub
-                                    if 0 <= local_idx < block_len:
-                                        point_idx = int(cell_block.data[local_idx].flatten()[0])
-                                        tag_points.add(point_idx)
-                            else:
-                                for idx in idx_array:
-                                    local_idx = int(idx) - sub
-                                    if 0 <= local_idx < block_len:
-                                        cell = cell_block.data[local_idx]
-                                        tag_points.update(cell.flatten())
-                                        if cell_block.type == "line":
-                                            tag_edges.append(tuple(cell))
-                                        elif cell_block.type == "triangle":
-                                            tag_tris.append(tuple(cell))
+                            sel = self._cells_of(cell_block.data, idx_array, sub)
+                            if len(sel):
+                                if cell_block.type == "vertex":
+                                    tag_point_blocks.append(sel.reshape(len(sel), -1)[:, 0])
+                                else:
+                                    tag_point_blocks.append(sel.ravel())
+                                    if cell_block.type == "line":
+                                        tag_edge_blocks.append(sel)
+                                    elif cell_block.type == "triangle":
+                                        tag_tri_blocks.append(sel)
 
-                if tag_tris:
-                    self._tag_triangles[name] = np.array(tag_tris, dtype=int)
-                if tag_edges:
-                    self._tag_edges[name] = np.array(tag_edges, dtype=int)
+                tag_edges = np.concatenate(tag_edge_blocks, axis=0) if tag_edge_blocks else np.zeros((0, 2), int)
+                tag_tris = np.concatenate(tag_tri_blocks, axis=0) if tag_tri_blocks else np.zeros((0, 3), int)
+                # np.unique both de-duplicates and sorts, which is what `sorted(set(...))` did
+                tag_points = np.unique(np.concatenate(tag_point_blocks)) if tag_point_blocks else np.zeros(0, int)
 
-                if tag_points:
-                    if tag_edges:
+                if len(tag_tris):
+                    self._tag_triangles[name] = np.asarray(tag_tris, dtype=int)
+                if len(tag_edges):
+                    self._tag_edges[name] = np.asarray(tag_edges, dtype=int)
+
+                if len(tag_points):
+                    if len(tag_edges):
                         self._boundary_loop_tags.add(name)
-                        indices_list = self._chain_edges_to_loop(tag_edges)
+                        # the chain walk is a Python graph traversal: hand it plain ints, as before
+                        indices_list = self._chain_edges_to_loop(tag_edges.tolist())
                     else:
-                        indices_list = np.array(sorted(tag_points), dtype=int)
+                        indices_list = np.asarray(tag_points, dtype=int)
 
                     indices_list = np.asarray(indices_list, dtype=int)
                     self.tag_indices[name] = indices_list
@@ -2004,7 +2021,8 @@ class domain(MeshIOMixin):
                     # points (e.g. the gmsh "interior" surface tag includes the
                     # boundary nodes too), and storing a partial normal array
                     # creates a shape mismatch against _mesh_pool[name].
-                    normal_positions = np.array([index_to_normal_pos[i] for i in indices_list if i in index_to_normal_pos])
+                    found = normal_pos_of[indices_list]
+                    normal_positions = found[found >= 0]
                     if len(normal_positions) == len(indices_list) and len(indices_list) > 0:
                         self.normals_by_tag[name] = boundary_normals[normal_positions]
                     elif len(normal_positions) == 0 and not has_volume_cells:

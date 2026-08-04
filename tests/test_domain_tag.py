@@ -251,3 +251,81 @@ def test_tag_still_returns_self_for_chaining():
     the coordinate-returning convenience lives only on ``variable(where=)``."""
     d = jno.domain(box(0, 0, 1, 1), mesh_size=0.3)
     assert d.tag("a", lambda x, y: x < 1e-6) is d
+
+
+# --------------------------------------------------------------------------------------------
+# mesh-tag extraction: the vectorised gather must reproduce the per-cell loop it replaced
+# --------------------------------------------------------------------------------------------
+def _cells_of_reference(block_data, indices, offset):
+    """The per-index Python loop ``_cells_of`` replaced, kept as the oracle."""
+    out = []
+    for idx in np.asarray(indices).reshape(-1):
+        local = int(idx) - int(offset)
+        if 0 <= local < len(block_data):
+            out.append(np.asarray(block_data)[local])
+    return np.asarray(out) if out else np.zeros((0, np.asarray(block_data).shape[1]), dtype=int)
+
+
+@pytest.mark.parametrize(
+    "indices,offset",
+    [
+        ([0, 1, 2], 0),  # plain, in order
+        ([2, 0, 1], 0),  # ORDER matters: edges are chained in the order they arrive
+        ([10, 11], 10),  # global gmsh ids, offset into a later block
+        ([-3, 0, 99], 0),  # below and above range -> dropped, not an IndexError
+        ([], 0),  # empty selection
+        ([5, 5, 5], 0),  # repeats are kept, as the loop kept them
+    ],
+)
+def test_cells_of_matches_the_per_index_loop(indices, offset):
+    from jno.domain.domain_class import domain as Domain
+
+    data = np.arange(24).reshape(8, 3)
+    got = Domain._cells_of(data, indices, offset)
+    ref = _cells_of_reference(data, indices, offset)
+    assert got.shape == ref.shape and np.array_equal(got, ref)
+
+
+def test_mesh_tags_are_sorted_unique_node_sets():
+    """A non-loop tag's indices come from ``np.unique`` where they came from ``sorted(set(...))``."""
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.15)
+    assert d.tag_indices, "no mesh tags were extracted"
+    for name, idx in d.tag_indices.items():
+        if name in d._boundary_loop_tags:
+            continue  # a chained loop is in traversal order by construction, not sorted
+        assert np.array_equal(idx, np.unique(idx)), f"tag {name!r} is not a sorted unique node set"
+
+
+def test_boundary_tag_edges_stay_in_mesh_order_and_close_the_loop():
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.15)
+    edges = d._tag_edges.get("boundary")
+    assert edges is not None and edges.ndim == 2 and edges.shape[1] == 2
+    # every boundary node appears exactly twice across the edge list -> a closed loop
+    _u, counts = np.unique(np.asarray(edges).ravel(), return_counts=True)
+    assert set(counts.tolist()) == {2}
+
+
+def test_orphan_construction_nodes_are_dropped_and_connectivity_remapped():
+    """The referenced-node scan is a scatter now; an unreferenced node must still be removed and
+    every cell renumbered onto the surviving nodes."""
+    import meshio
+
+    from jno.domain.domain_class import domain as Domain
+
+    pts = np.array([[0.0, 0, 0], [1, 0, 0], [0, 1, 0], [5, 5, 0]])  # node 3 supports no element
+    mesh = meshio.Mesh(pts, [meshio.CellBlock("triangle", np.array([[0, 1, 2]]))])
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.5)
+    out = Domain._drop_orphan_nodes(d, mesh)
+    assert len(out.points) == 3
+    assert np.array_equal(out.cells[0].data, np.array([[0, 1, 2]]))
+
+
+def test_a_mesh_with_no_orphans_is_returned_untouched():
+    import meshio
+
+    from jno.domain.domain_class import domain as Domain
+
+    pts = np.array([[0.0, 0, 0], [1, 0, 0], [0, 1, 0]])
+    mesh = meshio.Mesh(pts, [meshio.CellBlock("triangle", np.array([[0, 1, 2]]))])
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.5)
+    assert Domain._drop_orphan_nodes(d, mesh) is mesh
