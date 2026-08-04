@@ -36,6 +36,8 @@ import json
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import numpy as np
+from scipy.interpolate import PchipInterpolator
 
 HERE = Path(__file__).resolve().parent
 
@@ -43,6 +45,28 @@ HERE = Path(__file__).resolve().parent
 #: Spelled out rather than pulled from seaborn so this stays runnable in the plain test env.
 OKABE_ITO = ["#0072B2", "#E69F00", "#009E73", "#CC79A7", "#D55E00", "#56B4E9", "#F0E442", "#000000"]
 TEAL, GRAY, INK = "#0D9488", "#94A3B8", "#1A202C"
+
+
+def curve(ax, x, y, color, label=None, n=250):
+    """Draw the trend through measured points as a smooth curve, in log-log space.
+
+    PCHIP rather than a cubic spline, deliberately: it is shape-preserving, so it cannot invent a
+    local maximum or minimum that the measurements do not contain. These ladders are not perfectly
+    monotone -- the transient dips at 6k DOFs and 3-D Poisson wiggles along its flat stretch, both
+    run-to-run scatter on a latency-bound solve -- and a natural cubic would overshoot into
+    structure that was never measured.
+
+    The curve BETWEEN points is still interpolation. With markers off there is nothing showing
+    where the six measurements per case actually sit; pass ``ms``-marked points back in if that
+    distinction matters for a given audience.
+    """
+    x, y = np.asarray(x, float), np.asarray(y, float)
+    if len(x) < 3:
+        ax.plot(x, y, lw=1.6, color=color, label=label)
+        return
+    lx, ly = np.log10(x), np.log10(y)
+    fine = np.linspace(lx[0], lx[-1], n)
+    ax.plot(10**fine, 10 ** PchipInterpolator(lx, ly)(fine), lw=1.6, color=color, label=label)
 
 
 def slope_triangle(ax, x0, y0, slope, decades=0.3, label=None):
@@ -111,15 +135,7 @@ def main() -> None:
     # actually tracks problem size; the fixed cost it hides behind is the right panel's subject.
     for c, case in zip(colors, order):
         rs = cases[case]
-        ax_s.plot(
-            [r["dofs"] for r in rs],
-            [r["solve_ms"] / 1e3 for r in rs],
-            marker="o",
-            ms=4,
-            lw=1.2,
-            color=c,
-            label=rs[0]["label"],
-        )
+        curve(ax_s, [r["dofs"] for r in rs], [r["solve_ms"] / 1e3 for r in rs], c, label=rs[0]["label"])
     ax_s.set_xscale("log")
     ax_s.set_yscale("log")
     ax_s.set_xlabel("Degrees of freedom")
@@ -134,7 +150,7 @@ def main() -> None:
     # runs at all. It is why three ladders stop where they do.
     for c, case in zip(colors, order):
         rs = cases[case]
-        ax_m.plot([r["dofs"] for r in rs], [r["peak_mb"] for r in rs], marker="o", ms=4, lw=1.2, color=c)
+        curve(ax_m, [r["dofs"] for r in rs], [r["peak_mb"] for r in rs], c)
     ax_m.axhline(8192, color=GRAY, lw=1.0, ls=":")
     # x in AXES fraction, y in data units -- reading get_xlim() here would predate the log scaling
     # below and silently place the label off the axis
@@ -159,14 +175,7 @@ def main() -> None:
     # the wall clock is build (meshing, assembly, XLA compilation); below it, the solve.
     for c, case in zip(colors, order):
         rs = cases[case]
-        ax_b.plot(
-            [r["dofs"] for r in rs],
-            [r["build_ms"] / max(r["solve_ms"], 1e-9) for r in rs],
-            marker="o",
-            ms=4,
-            lw=1.2,
-            color=c,
-        )
+        curve(ax_b, [r["dofs"] for r in rs], [r["build_ms"] / max(r["solve_ms"], 1e-9) for r in rs], c)
     ax_b.axhline(1.0, color=INK, lw=1.0, ls="--")
     ax_b.text(0.02, 1.0, " build = solve", transform=ax_b.get_yaxis_transform(), va="bottom", fontsize=7, color=INK)
     ax_b.set_xscale("log")
