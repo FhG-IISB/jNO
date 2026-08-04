@@ -43,11 +43,16 @@ The contrast is capped by breakdown, not by taste. At 1.6e5 contrast the 2-D Poi
 converging at 805k DOFs (relative residual 1.4e+00 -- BiCGStab breaking down, so raising ``maxiter``
 does not help), which is why that one case runs at 1.1e3 instead.
 
-THREE CASES CANNOT REACH A 10 s SOLVE ON AN 8 GB CARD, and are included at their ceiling:
+``stokes2d`` and ``eddy3d`` USE ``jno.solve.lu(host=True)`` -- SuperLU factoring in host memory,
+driven from the device. Their previous ceilings were cuSolver's, not the problems': cuSolver
+returned "Singular matrix" on Stokes at mesh_size 0.04 and failed outright on H(curl) at 0.06, both
+of which the host factors to a ~2e-15 relative residual. On this box the host path is also faster
+wherever both run (0.15-0.81x of cuSolver over 12 measured points), though that is hardware-specific
+-- see :func:`jno.solve.lu`. With it, Stokes reaches 146k DOFs and H(curl) 17k complex DOFs, and
+both clear the 10 s target that neither could before.
 
-* ``stokes2d``  -- walled by the SOLVER. At mesh_size 0.04 the saddle-point system comes back
-  "Singular matrix in linear solve" from cuSolver's sparse LU, and an iterative outer does not
-  converge on it either (fgmres stalls at 2.8e-3). 0.045 works and is the largest size here: ~1.8 s.
+TWO CASES STILL DO NOT REACH A 10 s SOLVE, and are included at their ceiling:
+
 * ``poisson3d`` -- never becomes SOLVE-BOUND. Its solve is flat at 0.28-0.35 s from 6.8k to 87k
   DOFs, i.e. essentially independent of size, while its build grows to 8.4 s: 96% of the wall clock
   is build. It is NOT memory-walled -- an earlier claim to that effect was an artefact of a bug in
@@ -238,7 +243,7 @@ def stokes2d(ms):
             p.pin(),
         ]
     )
-    return fem, {"linear": jno.solve.lu()}
+    return fem, {"linear": jno.solve.lu(host=True)}
 
 
 def poisson3d(ms):
@@ -272,7 +277,7 @@ def eddy3d(ms):
     fem = jno.fem(
         [inner(cu, cv) + 1j * 2 * PI * 1e3 * (sig + 1e-3) * inner(ui, vi) - inner(vec(0.0 * x, 0.0 * x, sig), vi)]
     )
-    return fem, {"linear": jno.solve.lu()}
+    return fem, {"linear": jno.solve.lu(host=True)}
 
 
 #: case -> (builder, mesh sizes, human label).
@@ -304,9 +309,9 @@ CASES = {
     "elastic2d": (elastic2d, (0.006, 0.0045, 0.0034, 0.0026, 0.002, 0.0015), "2-D vector (convergence-walled)"),
     "reaction2d": (reaction2d, (0.008, 0.0062, 0.0048, 0.0037, 0.0028, 0.0022), "2-D nonlinear (Newton)"),
     "heat2d": (heat2d, (0.02, 0.0167, 0.0139, 0.0115, 0.0096, 0.008), f"2-D transient ({HEAT_STEPS} steps)"),
-    "stokes2d": (stokes2d, (0.09, 0.078, 0.068, 0.059, 0.052, 0.045), "2-D Stokes (solver-walled)"),
+    "stokes2d": (stokes2d, (0.09, 0.063, 0.044, 0.031, 0.021, 0.015), "2-D Stokes (Taylor-Hood)"),
     "poisson3d": (poisson3d, (0.05, 0.042, 0.035, 0.029, 0.024, 0.02), "3-D Poisson (build-bound)"),
-    "eddy3d": (eddy3d, (0.16, 0.141, 0.124, 0.109, 0.096, 0.085), "3-D complex H(curl)"),
+    "eddy3d": (eddy3d, (0.16, 0.136, 0.115, 0.097, 0.083, 0.07), "3-D complex H(curl)"),
 }
 
 #: Cases whose solution is a TRAJECTORY. ``np.size`` would report steps x nodes and put the case
