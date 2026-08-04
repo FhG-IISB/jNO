@@ -237,12 +237,45 @@ def _log_setup_info(log, script_path: Path, dire: Path, stem: str, wandb_arg) ->
         )
 
 
+def enable_compile_cache(directory: str | None = None) -> str:
+    """Turn on JAX's cross-process persistent compilation cache and return its directory.
+
+    jNO assembles a fresh XLA program per problem *structure*, and that cost barely moves with mesh
+    size: a mixed-order Stokes build measured 161 compilations taking 7.25 s of a 9.79 s assembly,
+    and a 15x larger Poisson problem still compiled only 121 programs. Because the cost is fixed
+    per structure rather than per DOF, a cache that survives process exit removes almost all of it
+    -- the same Stokes assembly measured **9.43 s cold, 2.20 s warm (4.3x)** on a second process,
+    for 187 entries and 7.2 MB.
+
+    Off by default because a library should not write to a user's disk uninvited; this is the
+    opt-in, also reachable as ``jno.setup(__file__, compile_cache=True)``.
+
+    Both settings are required. ``jax_compilation_cache_dir`` ALONE DOES NOTHING here: JAX's default
+    ``jax_persistent_cache_min_compile_time_secs`` of 1.0 s skips every one of these compilations,
+    which are individually sub-second.
+
+    Parameters
+    ----------
+    directory : cache location. ``None`` uses ``$JNO_COMPILE_CACHE_DIR`` if set, else
+        ``~/.cache/jno/xla``.
+    """
+    import jax
+
+    path = directory or os.getenv("JNO_COMPILE_CACHE_DIR") or os.path.join("~", ".cache", "jno", "xla")
+    path = os.path.abspath(os.path.expanduser(path))
+    os.makedirs(path, exist_ok=True)
+    jax.config.update("jax_compilation_cache_dir", path)
+    jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+    return path
+
+
 def setup(
     script_file: str,
     name: str | None = None,
     wandb: bool | dict = False,
     diff_type: str | None = None,
     hessian_type: str | None = None,
+    compile_cache: bool | str | None = None,
 ) -> str:
     """Initialise logging and return the run directory for *script_file*.
 
@@ -293,6 +326,16 @@ def setup(
             ``"fwd-over-fwd"``, ``"rev-over-rev"``, ``"rev-over-fwd"``.
             ``None`` reads ``[jno] hessian_type`` from the TOML config, or
             keeps the historical default (``"fwd-over-rev"``).
+        compile_cache: Persist XLA compilations across processes — see
+            :func:`enable_compile_cache`, which this delegates to. Measured 4.3x on a
+            mixed-order Stokes assembly (9.43 s cold, 2.20 s warm), because jNO's compilation
+            cost is fixed per problem *structure* rather than per DOF.
+
+            * ``None`` (default) — read ``[jno] compile_cache`` from the TOML config; off if absent.
+            * ``False`` — off. ``True`` — on, at ``~/.cache/jno/xla``.
+            * ``str`` — on, at that directory.
+
+            Off by default deliberately: a library should not write to a user's disk uninvited.
 
     Returns:
         The path of the run directory (created if absent).
@@ -333,6 +376,12 @@ def setup(
     # Apply AD mode defaults — explicit kwargs win over TOML, which wins
     # over the historical defaults already in ad_mode.py.
     apply_ad_mode_defaults(diff_type, hessian_type)
+
+    # --- Optional persistent XLA compilation cache (explicit kwarg wins over TOML) ---
+    cache_opt = get_config().get("jno", {}).get("compile_cache", False) if compile_cache is None else compile_cache
+    if cache_opt:
+        cache_dir = enable_compile_cache(cache_opt if isinstance(cache_opt, str) else None)
+        _logger_mod._default_logger.info(f"XLA compilation cache enabled at {cache_dir}")
 
     # --- Optional Weights & Biases ---
     _init_wandb(wandb, stem, str(dire))

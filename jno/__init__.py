@@ -62,6 +62,7 @@ from .utils import Logger
 from .utils import init_default_logger as logger
 from .utils.adaptive import LearningRateSchedule, WeightSchedule, callbacks, sampler
 from .utils.config import (
+    enable_compile_cache,
     get_config,
     get_config_path,
     get_rsa_private_key,
@@ -148,6 +149,7 @@ __all__ = [
     "iree",
     "save",
     "load",
+    "enable_compile_cache",
     "setup",
     "wandb_finish",
     "load_config",

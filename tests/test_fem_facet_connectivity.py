@@ -80,6 +80,56 @@ def test_unsupported_cell_type_is_refused():
 
 
 # --------------------------------------------------------------------------------------------
+# the shared computation: domain build and assembly must agree, and pay for it once
+# --------------------------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "cells,cell_type",
+    [
+        (np.array([[0, 1, 2]]), "triangle"),
+        (np.zeros((0, 3), dtype=int), "triangle"),
+        (np.array([[0, 1, 2, 3], [1, 2, 3, 4]]), "tetra"),
+    ],
+)
+def test_shared_boundary_set_matches_the_independent_implementation(cells, cell_type):
+    from jno.domain.mesh_utils import MeshUtils
+
+    shared = MeshUtils._get_boundary_elements(cells, cell_type)
+    reference = MeshUtils._get_boundary_elements_reference(cells, cell_type)
+    assert np.array_equal(shared, reference), "shared path diverged from the sort+unique oracle"
+
+
+def test_shared_boundary_set_matches_on_a_real_mesh():
+    from jno.domain.mesh_utils import MeshUtils
+
+    cells = np.asarray(jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.3).domain().built_mesh.cells_dict["tetra"])
+    assert np.array_equal(
+        MeshUtils._get_boundary_elements(cells, "tetra"),
+        MeshUtils._get_boundary_elements_reference(cells, "tetra"),
+    )
+
+
+def test_the_face_computation_is_shared_between_equal_but_distinct_arrays():
+    """The domain build and the assembler reach this with different array OBJECTS holding the same
+    connectivity, so an identity-keyed cache scored 0% and both paid. Content keying is the fix."""
+    from jno.utils.solver import fem_facets
+
+    cells = np.asarray(jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.3).domain().built_mesh.cells_dict["tetra"])
+    fem_facets._FACET_CACHE.clear()
+    fem_facets.boundary_face_set(cells, "tetra")
+    fem_facets.build_facet_connectivity(cells.copy(), "tetrahedron")  # a DIFFERENT object
+    assert len(fem_facets._FACET_CACHE) == 1, "equal connectivity was computed twice"
+
+
+def test_the_cache_does_not_confuse_different_meshes():
+    from jno.utils.solver import fem_facets
+
+    fem_facets._FACET_CACHE.clear()
+    one = fem_facets.boundary_face_set(np.array([[0, 1, 2, 3]]), "tetra")
+    two = fem_facets.boundary_face_set(np.array([[0, 1, 2, 3], [1, 2, 3, 4]]), "tetra")
+    assert len(one) == 4 and len(two) == 6, "a different mesh got a stale cached answer"
+
+
+# --------------------------------------------------------------------------------------------
 # Dirichlet values: the batched evaluation must reproduce the per-node one
 # --------------------------------------------------------------------------------------------
 def _solved(fem):

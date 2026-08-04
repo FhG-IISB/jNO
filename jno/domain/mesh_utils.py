@@ -411,7 +411,18 @@ class MeshUtils:
 
     @staticmethod
     def _get_boundary_elements(cells, cell_type):
-        """Finds elements (lines/triangles) that appear only once."""
+        """Finds elements (lines/triangles) that appear only once.
+
+        Delegates to the assembler's cached face computation so that a domain build and the
+        assembly that follows it share one sort+unique over the mesh rather than paying ~1 s each.
+        """
+        from ..utils.solver.fem_facets import boundary_face_set
+
+        return boundary_face_set(np.asarray(cells), cell_type)
+
+    @staticmethod
+    def _get_boundary_elements_reference(cells, cell_type):
+        """Independent implementation, kept as the oracle the shared/cached path is tested against."""
         if cell_type == "tetra":
             faces = np.sort(
                 np.vstack(
