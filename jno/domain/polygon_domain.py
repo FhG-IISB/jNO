@@ -1793,7 +1793,8 @@ class PolygonDomain(domain):
         self,
         mesh_size: float = 0.1,
         *,
-        algorithm: int = 6,
+        algorithm: Optional[int] = None,
+        threads: Optional[int] = None,
         region_mesh_sizes: Optional[Mapping[str, float]] = None,
         sizes: Optional[Mapping[str, float]] = None,
         interpolate: bool = True,
@@ -1810,7 +1811,12 @@ class PolygonDomain(domain):
         Args:
             mesh_size: Default target element size for points that don't fall on
                 any per-region boundary override.
-            algorithm: pygmsh algorithm (passed through to ``generate_mesh``).
+            algorithm: gmsh 2-D meshing kernel (``Mesh.Algorithm``). ``None`` uses
+                :data:`jno.geometry.emit.MESH_ALGORITHM_2D` (6, Frontal-Delaunay), kept for element
+                QUALITY: algorithm 5 (Delaunay) meshes ~1.4x faster per node but measured mean
+                minSICN 0.952 against 0.999, with the worst element 0.665 against 0.874.
+            threads: gmsh thread count (``General.NumThreads``). ``None`` uses
+                :data:`jno.geometry.emit.MESH_THREADS`.
             region_mesh_sizes: Per-source-region mesh size overrides keyed by
                 the names used to construct the source regions (e.g. the
                 ``name`` argument of ``jno.domain`` or keys of
@@ -1986,7 +1992,14 @@ class PolygonDomain(domain):
                     gmsh.model.mesh.field.setNumbers(min_tag, "FieldsList", box_field_tags)
                     gmsh.model.mesh.field.setAsBackgroundMesh(min_tag)
 
-            mesh = geo.generate_mesh(dim=2, algorithm=algorithm, verbose=False)
+            import gmsh  # local: the block above only imports it on the region-sizing branch
+
+            from ..geometry.emit import MESH_ALGORITHM_2D, MESH_THREADS
+
+            algo = effective_algorithm = MESH_ALGORITHM_2D if algorithm is None else int(algorithm)
+            self._effective_mesh_algorithm = effective_algorithm
+            gmsh.option.setNumber("General.NumThreads", MESH_THREADS if threads is None else int(threads))
+            mesh = geo.generate_mesh(dim=2, algorithm=algo, verbose=False)
 
         # When CSG merges several source regions into a single mesh surface,
         # gmsh's representative-point dispatch cannot split per-region tags.
@@ -2019,7 +2032,7 @@ class PolygonDomain(domain):
             n_pts = int(np.asarray(mesh.points).shape[0])
             self.log.info(
                 f"PolygonDomain.build_mesh: meshed {len(region_parts)} CSG piece(s) into {n_pts} nodes "
-                f"(mesh_size={mesh_size}, algorithm={algorithm})"
+                f"(mesh_size={mesh_size}, algorithm={getattr(self, '_effective_mesh_algorithm', algorithm)})"
             )
         return self
 

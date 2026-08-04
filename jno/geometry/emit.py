@@ -360,13 +360,38 @@ def _apply_periodic(dim, labels, periodic):
         gmsh.model.mesh.setPeriodic(bdim, s_tags, m_tags, affine)
 
 
-def _build_once(shape, split_full, periodic=None):
+#: gmsh's 3-D mesher. 10 is HXT, a parallel Delaunay kernel; gmsh's own default is 1 (serial
+#: Delaunay), which is what jNO used to get by not setting this at all. Measured on a unit cube at
+#: mesh size 0.022: **3.91 s serial Delaunay vs 0.27 s HXT on 8 threads, 14.5x**, and the quality
+#: does not pay for it -- HXT's WORST element was better (minSICN 0.343 vs 0.288) with mean quality
+#: within 2% and no bad elements either way.
+#:
+#: HXT produces a different (slightly coarser) mesh for the same target size -- 28,068 nodes against
+#: 32,773 on that cube -- so anything asserting an exact node count will see a change.
+MESH_ALGORITHM_3D = 10
+
+#: Threads for the 3-D mesher. Only HXT parallelises; serial algorithms ignore it.
+MESH_THREADS = 8
+
+#: gmsh's 2-D mesher, left at 6 (Frontal-Delaunay) DELIBERATELY. Algorithm 5 (Delaunay) is ~1.4x
+#: faster per node but measurably worse: mean minSICN 0.952 against 0.999, worst element 0.665
+#: against 0.874. Algorithm 6 produces near-perfect triangles, and 2-D meshing is not the
+#: bottleneck the 3-D kernel was. Pass ``algorithm=5`` if speed matters more than conditioning.
+MESH_ALGORITHM_2D = 6
+
+
+def _build_once(shape, split_full, periodic=None, algorithm=None, algorithm3d=None, threads=None):
     import gmsh
 
     started = not gmsh.isInitialized()
     if started:
         gmsh.initialize()
         gmsh.option.setNumber("General.Terminal", 0)
+    gmsh.option.setNumber("Mesh.Algorithm", MESH_ALGORITHM_2D if algorithm is None else int(algorithm))
+    gmsh.option.setNumber("Mesh.Algorithm3D", MESH_ALGORITHM_3D if algorithm3d is None else int(algorithm3d))
+    n_threads = MESH_THREADS if threads is None else int(threads)
+    gmsh.option.setNumber("General.NumThreads", n_threads)
+    gmsh.option.setNumber("Mesh.MaxNumThreads3D", n_threads)
     gmsh.model.add(f"jno_shape_{next(_MODEL_SEQ)}")
     try:
         occ = gmsh.model.occ
@@ -388,8 +413,12 @@ def _build_once(shape, split_full, periodic=None):
             gmsh.finalize()
 
 
-def build(shape, periodic=None):
+def build(shape, periodic=None, *, algorithm=None, algorithm3d=None, threads=None):
     """Mesh ``shape`` -> ``(meshio.Mesh, dim, ds)``.
+
+    ``algorithm`` / ``algorithm3d`` / ``threads`` override gmsh's mesher choice; ``None`` uses
+    :data:`MESH_ALGORITHM_2D` / :data:`MESH_ALGORITHM_3D` / :data:`MESH_THREADS`, whose docstrings
+    record the measurements behind each default.
 
     ``periodic`` is an optional list of ``(master_name, slave_name)`` boundary-face pairs meshed conforming
     (via :func:`_apply_periodic`) so opposite faces line up — needed for Nédélec edge periodic ties.
@@ -398,9 +427,10 @@ def build(shape, periodic=None):
     while an axis-touching profile (a cone) meshes fine that way -- so we try the single sweep first and
     only fall back to the two-halves construction if meshing fails.
     """
+    opts = dict(algorithm=algorithm, algorithm3d=algorithm3d, threads=threads)
     try:
-        return _build_once(shape, split_full=False, periodic=periodic)
+        return _build_once(shape, split_full=False, periodic=periodic, **opts)
     except Exception as exc:  # noqa: BLE001 - narrow retry on the periodic-surface mesher failure
         if "periodic" in str(exc).lower() and _has_full_revolve(shape._node):
-            return _build_once(shape, split_full=True, periodic=periodic)
+            return _build_once(shape, split_full=True, periodic=periodic, **opts)
         raise
