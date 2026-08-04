@@ -61,6 +61,69 @@ class FacetConnectivity(NamedTuple):
     n_bfaces: int
 
 
+#: Cache of the sort+unique over a mesh's faces, so the domain build and assembly do it ONCE
+#: between them. They ask different questions of the same computation -- the domain wants the set
+#: of boundary faces, assembly wants each one's parent cell and local index -- and were each
+#: paying ~1 s for it on a 424k-tet mesh.
+#:
+#: Keyed on the CONTENT of the ``cells`` array, not its identity: the domain build and the
+#: assembler reach this with equal-but-distinct arrays, so an id-based key measured a 0% hit rate.
+#: Hashing 13.5 MB of connectivity costs ~10 ms against the ~1 s it saves, and cannot collide the
+#: way a shape/dtype key would.
+_FACET_CACHE: dict = {}
+_FACET_CACHE_MAX = 8
+
+
+def _boundary_faces(cells: np.ndarray, local_faces, n_face_nodes: int):
+    """``(flat, sel, n_local)``: every (cell, local face) row, and which rows are on the boundary.
+
+    ``flat`` is CELL-MAJOR, so a row index ``r`` decodes as cell ``r // n_local``, local face
+    ``r % n_local``. ``sel`` indexes the rows whose canonical (sorted) key occurs exactly once.
+    """
+    import hashlib
+
+    contiguous = np.ascontiguousarray(cells)
+    key = (hashlib.blake2b(contiguous.view(np.uint8), digest_size=16).digest(), cells.shape, n_face_nodes)
+    hit = _FACET_CACHE.get(key)
+    if hit is not None:
+        return hit[1]
+
+    idx = np.asarray(local_faces, dtype=np.int64)[:, :n_face_nodes]
+    n_local = idx.shape[0]
+    flat = cells[:, idx].reshape(-1, n_face_nodes).astype(np.int64, copy=False)
+    _, inverse, counts = np.unique(np.sort(flat, axis=1), axis=0, return_inverse=True, return_counts=True)
+    sel = np.flatnonzero(counts[np.asarray(inverse).ravel()] == 1)
+
+    value = (flat, sel, n_local)
+    if len(_FACET_CACHE) >= _FACET_CACHE_MAX:
+        _FACET_CACHE.pop(next(iter(_FACET_CACHE)))
+    _FACET_CACHE[key] = (None, value)
+    return value
+
+
+def boundary_face_set(cells: np.ndarray, cell_type: str = "triangle") -> np.ndarray:
+    """The mesh's boundary faces as canonical rows, sorted within a row and lexicographically.
+
+    Same answer as an independent ``np.unique(..., return_counts=True)`` over the faces, but it
+    reuses :func:`_boundary_faces`, so a caller that also builds facet connectivity pays once.
+    """
+    local_faces, n_face_nodes = _face_table(cell_type)
+    flat, sel, _ = _boundary_faces(np.asarray(cells), local_faces, n_face_nodes)
+    faces = np.sort(flat[sel], axis=1)
+    return faces[np.lexsort(faces.T[::-1])] if faces.size else faces
+
+
+def _face_table(cell_type: str):
+    """``(local_faces, n_face_nodes)`` for a simplex cell type, under either naming."""
+    if cell_type in ("triangle", "tri"):
+        return _LOCAL_FACES_TRI, 2
+    if cell_type in ("tetrahedron", "tetra", "tet"):
+        return _LOCAL_FACES_TET, 3
+    raise NotImplementedError(
+        f"build_facet_connectivity: cell_type {cell_type!r} not supported (triangle / tetrahedron only)."
+    )
+
+
 def build_facet_connectivity(cells: np.ndarray, cell_type: str = "triangle") -> FacetConnectivity:
     """Build boundary facet connectivity for a P1 simplex mesh.
 
@@ -74,29 +137,13 @@ def build_facet_connectivity(cells: np.ndarray, cell_type: str = "triangle") -> 
     cell_type : ``"triangle"`` (2-D, 3-node) or ``"tetrahedron"`` (3-D, 4-node).
     """
     cells = np.asarray(cells)
-    if cell_type == "triangle":
-        local_faces = _LOCAL_FACES_TRI
-        n_face_nodes = 2
-    elif cell_type == "tetrahedron":
-        local_faces = _LOCAL_FACES_TET
-        n_face_nodes = 3
-    else:
-        raise NotImplementedError(
-            f"build_facet_connectivity: cell_type {cell_type!r} not supported (triangle / tetrahedron only)."
-        )
+    local_faces, n_face_nodes = _face_table(cell_type)
 
-    # Every (cell, local face) in one array, then keep the faces whose canonical (sorted) key occurs
-    # exactly once. The dict-of-tuples version of this walked cells x local_faces in Python with an
-    # ``int()`` per vertex -- 5.1M of them on a 424k-tet mesh, and over 3 s of a 14 s assembly.
-    idx = np.asarray(local_faces, dtype=np.int64)[:, :n_face_nodes]  # (n_local_faces, n_face_nodes)
-    n_local = idx.shape[0]
-    flat = cells[:, idx].reshape(-1, n_face_nodes).astype(np.int64, copy=False)
-
-    _, inverse, counts = np.unique(np.sort(flat, axis=1), axis=0, return_inverse=True, return_counts=True)
-    # flat is cell-major, so a boundary face's row index recovers both its cell and its local face.
-    # Selecting in row order also reproduces the old dict-insertion order, since a boundary face
-    # occurs exactly once and was therefore inserted at this position.
-    sel = np.flatnonzero(counts[np.asarray(inverse).ravel()] == 1)
+    # The dict-of-tuples version of this walked cells x local_faces in Python with an ``int()`` per
+    # vertex -- 5.1M of them on a 424k-tet mesh, and over 3 s of a 14 s assembly. Shared with the
+    # domain build via the cache, so the sort+unique happens once per mesh rather than once here
+    # and again in ``boundary_face_set``.
+    flat, sel, n_local = _boundary_faces(cells, local_faces, n_face_nodes)
 
     n_bfaces = int(sel.size)
     empty_face = np.empty((0, n_face_nodes), dtype=np.int64)
