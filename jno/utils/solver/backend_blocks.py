@@ -454,6 +454,7 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
     """
     import jax
     import jax.numpy as jnp
+    import numpy as np
 
     _s0f = getattr(block, "state0_fn", None)  # parametric initial state (net-valued IC): re-form from args
     s0 = jnp.asarray(_s0f(args) if _s0f is not None else block.state0).reshape(-1)
@@ -478,5 +479,24 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
 
     traj = jnp.concatenate([s0[None, :], ys], axis=0)  # (n_grid, n_dofs) at grid_ts
     save_ts = jnp.asarray(save_ts, dtype)
-    # sample at save_ts (identity when save_ts == the grid); decouples output from the step
-    return jax.vmap(lambda col: jnp.interp(save_ts, grid_ts, col), in_axes=1, out_axes=1)(traj)
+
+    # The DEFAULT save_ts is the block's own grid (``solve`` fills it from ``_block_time_grid``), so
+    # the sampling below is an identity -- but it used to be paid for anyway, and expensively: a
+    # per-DOF-column vmap of ``jnp.interp`` over the whole trajectory. At 6000 steps x 18k DOFs the
+    # trajectory is 878 MB, and the resampled copy plus the vmap's workspace on top of it is what
+    # made that case fail to allocate 5.72 GiB on an 8 GB card. Return it directly instead.
+    try:
+        same_grid = save_ts.shape == grid_ts.shape and bool(np.allclose(np.asarray(save_ts), np.asarray(grid_ts)))
+    except Exception:  # traced save_ts: cannot compare values, take the general path
+        same_grid = False
+    if same_grid:
+        return traj
+
+    # Otherwise interpolate ONCE for all DOFs rather than once per column: locate each save time in
+    # the grid, then blend the two bracketing states. Matches ``jnp.interp``'s clamping outside the
+    # grid (weight clipped to [0, 1] holds the endpoint state).
+    hi = jnp.clip(jnp.searchsorted(grid_ts, save_ts, side="right"), 1, grid_ts.size - 1)
+    lo = hi - 1
+    span = grid_ts[hi] - grid_ts[lo]
+    w = jnp.clip(jnp.where(span > 0, (save_ts - grid_ts[lo]) / jnp.where(span > 0, span, 1.0), 0.0), 0.0, 1.0)
+    return traj[lo] * (1.0 - w[:, None]) + traj[hi] * w[:, None]
