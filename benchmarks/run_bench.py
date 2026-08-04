@@ -33,7 +33,9 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-OUT = HERE / "results.json"
+#: Output file. Overridable so a CPU sweep does not overwrite a GPU one: the merge key is
+#: (case, size_index), which carries no notion of platform, so both would collide in one file.
+OUT = Path(os.environ.get("JNO_BENCH_OUT", HERE / "results.json"))
 TIMEOUT_S = 900
 
 
