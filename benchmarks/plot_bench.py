@@ -18,11 +18,13 @@ The value is the peak over the WHOLE case, build and solve together (``peak_byte
 running high-water mark and cannot be attributed to the solve alone); that is the right number for
 "will this run", not for a solver's working set.
 
-RIGHT is build time over solve time on the same size axis -- the ratio rather than the two curves,
-to keep it one line per case. Sizing the solves up to ~10 s did NOT make build a small fraction:
-the steady linear cases sit at 13-22x and 3-D Poisson climbs from 20x to 90x, i.e. it gets worse
-with size, not better. Only the cases whose cost is not a single linear solve cross below parity --
-the transient throughout, H(curl) above ~5k DOFs, and Newton around 1e5.
+RIGHT is the share of wall time that is actually SOLVING, the rest being mesh + assembly + XLA
+compilation. Bounded 0-100%, so the cases stay comparable by eye. Sizing the solves up to ~10 s did
+not rescue the steady linear cases -- they sit near 5-7% and 3-D Poisson falls to ~1%, i.e. worse
+with size, not better. Above half are the cases whose cost is not a single linear solve: the
+transient, H(curl) at its larger sizes, and Newton. The adjoint case sits well above its forward
+twin because a gradient does ~2x the work against the same one-time build -- for an inverse problem,
+where the build is paid once and iterated on, build overhead largely stops mattering.
 
 The black triangles are REFERENCE slopes, not fits. Measured least-squares exponents, for reading
 against them: solve time 1.53 for the direct H(curl) solve (LU fill-in), 1.07 for 2-D Poisson,
@@ -65,7 +67,7 @@ def pair_styles(order):
     return styles
 
 
-def curve(ax, x, y, color, label=None, n=250, ls="-"):
+def curve(ax, x, y, color, label=None, n=250, ls="-", logy=True):
     """Draw the trend through measured points as a smooth curve, in log-log space.
 
     PCHIP rather than a cubic spline, deliberately: it is shape-preserving, so it cannot invent a
@@ -82,9 +84,12 @@ def curve(ax, x, y, color, label=None, n=250, ls="-"):
     if len(x) < 3:
         ax.plot(x, y, lw=1.6, color=color, label=label, ls=ls)
         return
-    lx, ly = np.log10(x), np.log10(y)
+    lx = np.log10(x)
     fine = np.linspace(lx[0], lx[-1], n)
-    ax.plot(10**fine, 10 ** PchipInterpolator(lx, ly)(fine), lw=1.6, color=color, label=label, ls=ls)
+    # interpolate in the space the AXIS uses, or the curve bends the wrong way between points
+    ly = np.log10(y) if logy else y
+    fy = PchipInterpolator(lx, ly)(fine)
+    ax.plot(10**fine, 10**fy if logy else fy, lw=1.6, color=color, label=label, ls=ls)
 
 
 def slope_triangle(ax, x0, y0, slope, decades=0.3, label=None):
@@ -188,18 +193,21 @@ def main() -> None:
     ax_m.set_ylabel("Peak device memory  [MB]")
     slope_triangle(ax_m, 4.5e5, 130.0, 1.0, label="$n$")
 
-    # --- right: build vs solve, against the same size axis -----------------------------------
-    # The ratio rather than the two times, so this stays one line per case. Above the parity line
-    # the wall clock is build (meshing, assembly, XLA compilation); below it, the solve.
+    # --- right: how much of the wall clock is actually solving --------------------------------
+    # A share rather than a ratio: it is bounded, so the cases stay comparable by eye, and 50% reads
+    # directly as "half the time is the build". The rest is meshing, assembly and XLA compilation.
     for case in order:
         rs, (c, ls) = cases[case], styles[case]
-        curve(ax_b, [r["dofs"] for r in rs], [r["build_ms"] / max(r["solve_ms"], 1e-9) for r in rs], c, ls=ls)
-    ax_b.axhline(1.0, color=INK, lw=1.0, ls="--")
-    ax_b.text(0.02, 1.0, " build = solve", transform=ax_b.get_yaxis_transform(), va="bottom", fontsize=7, color=INK)
+        share = [100.0 * r["solve_ms"] / max(r["build_ms"] + r["solve_ms"], 1e-9) for r in rs]
+        curve(ax_b, [r["dofs"] for r in rs], share, c, ls=ls, logy=False)
+    ax_b.axhline(50.0, color=INK, lw=1.0, ls="--")
+    ax_b.text(
+        0.02, 50.0, " half the time is build", transform=ax_b.get_yaxis_transform(), va="bottom", fontsize=7, color=INK
+    )
     ax_b.set_xscale("log")
-    ax_b.set_yscale("log")
+    ax_b.set_ylim(0, 100)
     ax_b.set_xlabel("Degrees of freedom")
-    ax_b.set_ylabel("Build time / solve time")
+    ax_b.set_ylabel("Solve share of wall time  [%]")
 
     # --- one legend for all three panels ------------------------------------------------------
     handles, labels = ax_s.get_legend_handles_labels()
