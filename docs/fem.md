@@ -265,9 +265,19 @@ where they differ from the mesh vertices), `fem.operator`, and `fem.classificati
 > the measured penalty is a ~2× slowdown; that floor is the one number JAX gives no way to derive, as
 > it exposes device memory but not the SM count.
 >
-> `chunk=False` restores the single `vmap`, and a positive int pins cells per chunk. It lives on
-> `jno.fem` rather than `fem.solve` because the steady-linear operator is assembled *here*, before any
-> solve.
+> `chunk=False` restores the single `vmap`, and a positive int pins cells per chunk — as an upper
+> bound: whatever size is chosen (default or explicit) is then shrunk to the smallest one giving the
+> *same number of chunks*, so they come out even where they can. That is a compile-time fix, not a
+> memory one. `lax.map` emits the element kernel **twice** when the chunk does not divide the cell
+> count — once as the scan body, once unrolled for the tail — and on Taylor–Hood Stokes (21,138 cells,
+> chunk 8,192, so two full chunks and a 4,754 tail) the duplicate was 4.9× the element-program compile
+> time and **2.0× the whole build, 10.3 s → 5.3 s**, for a bit-identical answer. Evening the chunks
+> costs nothing in either direction: the chunk *count* is unchanged (no extra scan step) and each
+> chunk is no larger than requested (peak memory only falls). It cannot always divide — 100 items in
+> 3 chunks is 34+34+32 — and then it is simply a no-op.
+>
+> `chunk=` lives on `jno.fem` rather than `fem.solve` because the steady-linear operator is assembled
+> *here*, before any solve.
 >
 > Coverage, since it is not uniform. The **native** assembler chunks its residual and jacobian, volume
 > and surface loops. The **non-nodal** assembler chunks both, for every family — including the C⁰/C¹
