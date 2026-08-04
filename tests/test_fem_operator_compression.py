@@ -266,6 +266,38 @@ def test_chunking_never_changes_the_answer(chunk):
     assert np.all(np.isfinite(got))
 
 
+@pytest.mark.parametrize(
+    "n_items,requested",
+    [
+        (21138, 8192),  # the Taylor-Hood Stokes case: 2 full chunks + a 4754 tail -> 3 even ones
+        (100, 34),  # cannot divide evenly (34+34+32); must be left alone rather than made worse
+        (8193, 8192),  # a tail of ONE: the worst duplicate-per-useful-work ratio there is
+        (1_000_000, 8192),  # already divides exactly -> unchanged
+        (10**9, 1234),  # huge item count: the rebalance is a no-op at this ratio
+        (5, 8192),  # requested chunk exceeds the items
+    ],
+)
+def test_the_element_chunk_is_rebalanced_without_costing_memory_or_steps(n_items, requested):
+    """``lax.map`` compiles the element kernel a SECOND time for a non-dividing tail. Rebalancing
+    removes that where it can, and where it cannot it must not make anything worse: never a larger
+    chunk (memory), never more chunks (scan steps)."""
+    from jno.utils.solver.fem_utils import _balanced_chunk
+
+    got = _balanced_chunk(n_items, requested)
+    assert 1 <= got <= requested, "rebalancing must never raise the per-chunk memory"
+    assert -(-n_items // got) == -(-n_items // requested), "rebalancing must not add a scan step"
+    tail = n_items % got
+    assert tail == 0 or tail > n_items % requested or n_items % requested == 0 or got == requested
+
+
+def test_the_stokes_chunk_divides_its_cell_count():
+    """The case that motivated it, end to end through the real policy."""
+    from jno.utils.solver.fem_utils import cell_chunk
+
+    c = cell_chunk(21138, n_test=12, n_local=15, setting=None)  # Taylor-Hood P2 velocity + P1 pressure
+    assert c is not None and 21138 % c == 0, f"chunk {c} leaves a tail, so the kernel compiles twice"
+
+
 @pytest.mark.parametrize("bad", [-1, 0.5, "big", 2.5])
 def test_a_nonsense_chunk_is_refused(bad):
     """A silently-ignored size would be worse than no option: the user would believe they had capped
