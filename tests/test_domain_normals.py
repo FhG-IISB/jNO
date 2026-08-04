@@ -85,3 +85,74 @@ def test_pca_normals_point_out_of_the_material_on_both_boundaries(annulus_normal
     radial = np.einsum("ij,ij->i", normals, xy - 0.5)
     assert np.all(radial[~on_hole] > 0.0)  # outer boundary: away from the centre
     assert np.all(radial[on_hole] < 0.0)  # hole boundary: toward the centre
+
+
+# --------------------------------------------------------------------------------------------
+# the face-normal accumulation is vectorised: it must still reproduce the per-face loop
+# --------------------------------------------------------------------------------------------
+def _boundary_face_normals_reference(points, faces, apex_points=None):
+    """The per-face Python loop ``_compute_normals_from_boundary_faces`` used to be."""
+    pts = np.asarray(points[:, :3], dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+    if faces.size == 0:
+        return np.zeros((0, 3)), np.array([], dtype=np.int64)
+    apex = None if apex_points is None else np.asarray(apex_points[:, :3], dtype=np.float64)
+    centroid, vnorm, eps = np.mean(pts, axis=0), np.zeros_like(pts), 1e-20
+    for k, f in enumerate(faces):
+        p0, p1, p2 = pts[int(f[0])], pts[int(f[1])], pts[int(f[2])]
+        n = np.cross(p1 - p0, p2 - p0)
+        if np.linalg.norm(n) < eps:
+            continue
+        ref = centroid if apex is None else apex[k]
+        if np.dot(n, (p0 + p1 + p2) / 3.0 - ref) < 0.0:
+            n = -n
+        for i in (0, 1, 2):
+            vnorm[int(f[i])] += n
+    bidx = np.unique(faces.ravel())
+    out = vnorm[bidx]
+    lens = np.linalg.norm(out, axis=1, keepdims=True)
+    bad = lens[:, 0] < eps
+    if np.any(bad):
+        radial = pts[bidx[bad]] - centroid
+        rlen = np.linalg.norm(radial, axis=1, keepdims=True)
+        rlen[rlen < eps] = 1.0
+        out[bad] = radial / rlen
+        lens[bad] = 1.0
+    return out / lens, bidx
+
+
+@pytest.mark.parametrize("with_apex", [False, True])
+def test_boundary_face_normals_match_the_per_face_loop(with_apex):
+    """A real tet mesh, with and without the apex orientation (the concave-safe path)."""
+    from jno.utils.solver.fem_facets import _LOCAL_FACES_TET, _boundary_faces
+
+    mesh = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.25).domain().built_mesh
+    pts, cells = np.asarray(mesh.points), np.asarray(mesh.cells_dict["tetra"], dtype=np.int64)
+    flat, sel, n_local = _boundary_faces(cells, _LOCAL_FACES_TET, 3)
+    faces = flat[sel]
+    apex = None
+    if with_apex:
+        apex_local = np.asarray([e[3] for e in _LOCAL_FACES_TET], dtype=np.int64)
+        apex = pts[cells[sel // n_local, apex_local[sel % n_local]]]
+
+    got_n, got_i = MeshUtils._compute_normals_from_boundary_faces(pts, faces, apex_points=apex)
+    ref_n, ref_i = _boundary_face_normals_reference(pts, faces, apex_points=apex)
+    assert np.array_equal(got_i, ref_i)
+    np.testing.assert_allclose(got_n, ref_n, atol=1e-12)
+    np.testing.assert_allclose(np.linalg.norm(got_n, axis=1), 1.0, atol=1e-12)
+
+
+def test_boundary_face_normals_skip_a_degenerate_face():
+    """A zero-area face contributes nothing -- the vectorised form masks where the loop `continue`d."""
+    pts = np.array([[0.0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0], [0.5, 0.5, 1.0]], dtype=float)
+    faces = np.array([[0, 1, 2], [0, 2, 3], [0, 1, 1]], dtype=np.int64)  # last is degenerate
+    got, gi = MeshUtils._compute_normals_from_boundary_faces(pts, faces)
+    ref, ri = _boundary_face_normals_reference(pts, faces)
+    assert np.array_equal(gi, ri)
+    np.testing.assert_allclose(got, ref, atol=1e-12)
+    np.testing.assert_allclose(np.linalg.norm(got, axis=1), 1.0, atol=1e-12)
+
+
+def test_boundary_face_normals_of_an_empty_mesh_are_empty():
+    n, idx = MeshUtils._compute_normals_from_boundary_faces(np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int64))
+    assert n.shape == (0, 3) and idx.shape == (0,)

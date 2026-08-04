@@ -309,6 +309,12 @@ class MeshUtils:
         mesh centroid, which is valid only for convex / star-shaped domains and is kept as a
         fallback for callers that have no volume connectivity. Normals are accumulated per
         vertex (area-weighted via unnormalized face normals).
+
+        Vectorized over faces: the per-face Python loop this replaces called ``np.cross`` and
+        ``np.linalg.norm`` on 3-vectors once per boundary face, which cost 0.52 s of a 5.6 s 3-D
+        build. The per-vertex accumulation becomes three ``bincount`` scatters, so it sums in vertex
+        order rather than face order -- a last-ulp difference on a quantity that is normalized
+        immediately afterwards.
         """
         pts = np.asarray(points[:, :3], dtype=np.float64)
         faces = np.asarray(boundary_faces, dtype=np.int64)
@@ -317,28 +323,21 @@ class MeshUtils:
 
         apex = None if apex_points is None else np.asarray(apex_points[:, :3], dtype=np.float64)
         centroid = np.mean(pts, axis=0)
-        vnorm = np.zeros_like(pts)
         eps = 1e-20
 
-        for k, f in enumerate(faces):
-            i0, i1, i2 = int(f[0]), int(f[1]), int(f[2])
-            p0, p1, p2 = pts[i0], pts[i1], pts[i2]
+        p0, p1, p2 = pts[faces[:, 0]], pts[faces[:, 1]], pts[faces[:, 2]]
+        # Unnormalized normal magnitude is 2*face_area.
+        n = np.cross(p1 - p0, p2 - p0)
+        fc = (p0 + p1 + p2) / 3.0
+        # Outward = away from the owning element's apex (exact); else away from centroid.
+        ref = centroid[None, :] if apex is None else apex
+        n = np.where((np.einsum("ij,ij->i", n, fc - ref) < 0.0)[:, None], -n, n)
+        # a degenerate face contributes nothing, exactly as the loop's `continue` did
+        n = np.where((np.linalg.norm(n, axis=1) >= eps)[:, None], n, 0.0)
 
-            # Unnormalized normal magnitude is 2*face_area.
-            n = np.cross(p1 - p0, p2 - p0)
-            nlen = np.linalg.norm(n)
-            if nlen < eps:
-                continue
-
-            fc = (p0 + p1 + p2) / 3.0
-            # Outward = away from the owning element's apex (exact); else away from centroid.
-            ref = centroid if apex is None else apex[k]
-            if np.dot(n, fc - ref) < 0.0:
-                n = -n
-
-            vnorm[i0] += n
-            vnorm[i1] += n
-            vnorm[i2] += n
+        # faces.ravel() is face-major (f0's 3 nodes, then f1's...), which is what repeat(n, 3) pairs with
+        flat, contrib = faces.ravel(), np.repeat(n, 3, axis=0)
+        vnorm = np.stack([np.bincount(flat, weights=contrib[:, c], minlength=len(pts)) for c in range(3)], axis=1)
 
         boundary_indices = np.unique(faces.ravel())
         out = vnorm[boundary_indices]

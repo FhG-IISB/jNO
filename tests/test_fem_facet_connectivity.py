@@ -130,6 +130,81 @@ def test_the_cache_does_not_confuse_different_meshes():
 
 
 # --------------------------------------------------------------------------------------------
+# outward face normals: the array expression must reproduce the per-face loop it replaced
+# --------------------------------------------------------------------------------------------
+def _face_normals_reference(points, conn, cells, cell_type):
+    """The per-face Python loop ``compute_face_normals`` used to be, kept as the oracle."""
+    from jno.utils.solver.fem_facets import _LOCAL_FACES_TET, _LOCAL_FACES_TRI
+
+    points, cells = np.asarray(points), np.asarray(cells)
+    local_faces, n_face_nodes, dim = (_LOCAL_FACES_TRI, 2, 2) if cell_type == "triangle" else (_LOCAL_FACES_TET, 3, 3)
+    normals = np.empty((conn.n_bfaces, dim))
+    for i in range(conn.n_bfaces):
+        entry = local_faces[int(conn.local_face[i])]
+        c = int(conn.parent_cell[i])
+        verts = points[[int(cells[c, j]) for j in entry[:n_face_nodes]], :dim]
+        opp = points[int(cells[c, entry[n_face_nodes]]), :dim]
+        if dim == 2:
+            t = verts[1] - verts[0]
+            n = np.array([t[1], -t[0]])
+        else:
+            n = np.cross(verts[1] - verts[0], verts[2] - verts[0])
+        if np.dot(n, np.mean(verts, axis=0) - opp) < 0:
+            n = -n
+        normals[i] = n / np.linalg.norm(n)
+    return normals
+
+
+@pytest.mark.parametrize(
+    "shape,cell_key,cell_type",
+    [
+        (jno.Shape.rect(0, 0, 1, 1, size=0.12), "triangle", "triangle"),
+        (jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.3), "tetra", "tetrahedron"),
+    ],
+)
+def test_face_normals_match_the_per_face_loop(shape, cell_key, cell_type):
+    from jno.utils.solver.fem_facets import compute_face_normals
+
+    mesh = shape.domain().built_mesh
+    pts, cells = np.asarray(mesh.points), np.asarray(mesh.cells_dict[cell_key])
+    conn = build_facet_connectivity(cells, cell_type)
+    assert conn.n_bfaces > 0
+    np.testing.assert_allclose(
+        compute_face_normals(pts, conn, cells, cell_type),
+        _face_normals_reference(pts, conn, cells, cell_type),
+        atol=1e-14,
+    )
+
+
+def test_face_normals_on_a_concave_domain_still_point_out():
+    """An L-shape: orientation comes from the owning cell's apex, so the reentrant corner is
+    handled by construction -- a centroid-based rule would flip normals there."""
+    from shapely.geometry import Polygon
+
+    from jno.utils.solver.fem_facets import compute_face_normals
+
+    poly = Polygon([(0, 0), (2, 0), (2, 1), (1, 1), (1, 2), (0, 2)])
+    mesh = jno.domain(poly, mesh_size=0.15).built_mesh
+    pts, cells = np.asarray(mesh.points), np.asarray(mesh.cells_dict["triangle"])
+    conn = build_facet_connectivity(cells, "triangle")
+    n = compute_face_normals(pts, conn, cells, "triangle")
+    np.testing.assert_allclose(n, _face_normals_reference(pts, conn, cells, "triangle"), atol=1e-14)
+    # every normal points away from its own cell's interior, concave corner included
+    apex = np.array([pts[cells[int(conn.parent_cell[i])]].mean(axis=0)[:2] for i in range(conn.n_bfaces)])
+    mid = pts[conn.face_nodes][:, :, :2].mean(axis=1)
+    assert np.all(np.einsum("ij,ij->i", n, mid - apex) > 0)
+
+
+@pytest.mark.parametrize("cell_type,dim", [("triangle", 2), ("tetrahedron", 3)])
+def test_face_normals_of_an_empty_boundary_are_empty(cell_type, dim):
+    from jno.utils.solver.fem_facets import compute_face_normals
+
+    conn = build_facet_connectivity(np.zeros((0, dim + 1), dtype=int), cell_type)
+    out = compute_face_normals(np.zeros((0, dim)), conn, np.zeros((0, dim + 1), dtype=int), cell_type)
+    assert out.shape == (0, dim) and out.dtype == np.float64
+
+
+# --------------------------------------------------------------------------------------------
 # Dirichlet values: the batched evaluation must reproduce the per-node one
 # --------------------------------------------------------------------------------------------
 def _solved(fem):
