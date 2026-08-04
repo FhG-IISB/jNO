@@ -47,7 +47,25 @@ OKABE_ITO = ["#0072B2", "#E69F00", "#009E73", "#CC79A7", "#D55E00", "#56B4E9", "
 TEAL, GRAY, INK = "#0D9488", "#94A3B8", "#1A202C"
 
 
-def curve(ax, x, y, color, label=None, n=250):
+#: an adjoint case is drawn as a DASHED twin of the forward case it derives from, in the same
+#: colour, so the gradient cost can be read directly against the solve it differentiates.
+ADJOINT_SUFFIX = "_adj"
+
+
+def pair_styles(order):
+    """Map case -> (colour, linestyle), pairing ``<case>_adj`` with ``<case>``."""
+    base = [c for c in order if not c.endswith(ADJOINT_SUFFIX)]
+    palette = {c: OKABE_ITO[i % len(OKABE_ITO)] for i, c in enumerate(base)}
+    styles = {}
+    for c in order:
+        if c.endswith(ADJOINT_SUFFIX) and c[: -len(ADJOINT_SUFFIX)] in palette:
+            styles[c] = (palette[c[: -len(ADJOINT_SUFFIX)]], "--")
+        else:
+            styles[c] = (palette.get(c, OKABE_ITO[len(palette) % len(OKABE_ITO)]), "-")
+    return styles
+
+
+def curve(ax, x, y, color, label=None, n=250, ls="-"):
     """Draw the trend through measured points as a smooth curve, in log-log space.
 
     PCHIP rather than a cubic spline, deliberately: it is shape-preserving, so it cannot invent a
@@ -62,11 +80,11 @@ def curve(ax, x, y, color, label=None, n=250):
     """
     x, y = np.asarray(x, float), np.asarray(y, float)
     if len(x) < 3:
-        ax.plot(x, y, lw=1.6, color=color, label=label)
+        ax.plot(x, y, lw=1.6, color=color, label=label, ls=ls)
         return
     lx, ly = np.log10(x), np.log10(y)
     fine = np.linspace(lx[0], lx[-1], n)
-    ax.plot(10**fine, 10 ** PchipInterpolator(lx, ly)(fine), lw=1.6, color=color, label=label)
+    ax.plot(10**fine, 10 ** PchipInterpolator(lx, ly)(fine), lw=1.6, color=color, label=label, ls=ls)
 
 
 def slope_triangle(ax, x0, y0, slope, decades=0.3, label=None):
@@ -125,7 +143,7 @@ def main() -> None:
     for rs in cases.values():
         rs.sort(key=lambda r: r["dofs"])
 
-    colors = [OKABE_ITO[i % len(OKABE_ITO)] for i in range(len(order))]
+    styles = pair_styles(order)
     fig, (ax_s, ax_m, ax_b) = plt.subplots(1, 3, figsize=(16.5, 4.4))
 
     # --- left: SOLVE time vs size ----------------------------------------------------------
@@ -133,9 +151,9 @@ def main() -> None:
     # a per-problem XLA compilation that does not care how big the mesh is, so a total-vs-dofs plot
     # collapses every case into one narrow band and shows nothing. The solve is the part that
     # actually tracks problem size; the fixed cost it hides behind is the right panel's subject.
-    for c, case in zip(colors, order):
-        rs = cases[case]
-        curve(ax_s, [r["dofs"] for r in rs], [r["solve_ms"] / 1e3 for r in rs], c, label=rs[0]["label"])
+    for case in order:
+        rs, (c, ls) = cases[case], styles[case]
+        curve(ax_s, [r["dofs"] for r in rs], [r["solve_ms"] / 1e3 for r in rs], c, label=rs[0]["label"], ls=ls)
     ax_s.set_xscale("log")
     ax_s.set_yscale("log")
     ax_s.set_xlabel("Degrees of freedom")
@@ -148,9 +166,9 @@ def main() -> None:
     # --- middle: peak device memory vs size ------------------------------------------------
     # Peak over the whole case (build AND solve), because that is what decides whether a problem
     # runs at all. It is why three ladders stop where they do.
-    for c, case in zip(colors, order):
-        rs = cases[case]
-        curve(ax_m, [r["dofs"] for r in rs], [r["peak_mb"] for r in rs], c)
+    for case in order:
+        rs, (c, ls) = cases[case], styles[case]
+        curve(ax_m, [r["dofs"] for r in rs], [r["peak_mb"] for r in rs], c, ls=ls)
     ax_m.axhline(8192, color=GRAY, lw=1.0, ls=":")
     # x in AXES fraction, y in data units -- reading get_xlim() here would predate the log scaling
     # below and silently place the label off the axis
@@ -173,9 +191,9 @@ def main() -> None:
     # --- right: build vs solve, against the same size axis -----------------------------------
     # The ratio rather than the two times, so this stays one line per case. Above the parity line
     # the wall clock is build (meshing, assembly, XLA compilation); below it, the solve.
-    for c, case in zip(colors, order):
-        rs = cases[case]
-        curve(ax_b, [r["dofs"] for r in rs], [r["build_ms"] / max(r["solve_ms"], 1e-9) for r in rs], c)
+    for case in order:
+        rs, (c, ls) = cases[case], styles[case]
+        curve(ax_b, [r["dofs"] for r in rs], [r["build_ms"] / max(r["solve_ms"], 1e-9) for r in rs], c, ls=ls)
     ax_b.axhline(1.0, color=INK, lw=1.0, ls="--")
     ax_b.text(0.02, 1.0, " build = solve", transform=ax_b.get_yaxis_transform(), va="bottom", fontsize=7, color=INK)
     ax_b.set_xscale("log")
