@@ -468,6 +468,14 @@ TRAJECTORY_STEPS = {"heat2d": HEAT_STEPS, "boussinesq2d": BOUSSINESQ_STEPS + 1}
 #: rather than raised, so the matrix completes and the bad point is visible instead of missing.
 RESIDUAL_TOL = 1e-6
 
+#: Separate, looser threshold for the TRANSIENT step gate, because it measures a different thing.
+#: A direct or Krylov solve of one system lands at 1e-14; a per-step Newton lands at its own
+#: convergence tolerance, measured 3e-07 to 6e-07 across the Rayleigh-Benard ladder. Judging that
+#: against 1e-6 would flag a perfectly converged solve the moment it drifted to 2e-6 -- a gate that
+#: cries wolf is worse than none. The two regimes are far apart (converged ~1e-7, a trajectory
+#: perturbed 5% gives 6e-01), so this sits between them with three orders of margin either side.
+TRANSIENT_RESIDUAL_TOL = 1e-4
+
 
 def _relative_residual(fem, sol, case):
     """Convergence gate: how far the reported answer actually is from solving the system.
@@ -477,7 +485,7 @@ def _relative_residual(fem, sol, case):
     caught a solve that was silently burning ``maxiter`` and being timed as though it had converged.
     """
     if case in TRAJECTORY_STEPS:
-        return None, "transient: a per-step system, no single residual"
+        return _transient_step_residual(fem, np.asarray(sol))
     u = jnp.asarray(sol).reshape(-1)
     if not fem.is_linear:
         # relative to the residual at zero, so the number is comparable across sizes
@@ -492,6 +500,46 @@ def _relative_residual(fem, sol, case):
     if jnp.iscomplexobj(u) and b.size == 2 * u.size:
         u = jnp.concatenate([u.real, u.imag])  # complex assembles as the real 2n block
     return float(jnp.linalg.norm(A @ u - b) / jnp.linalg.norm(b)), "||Au-b|| / ||b||"
+
+
+def _transient_step_residual(fem, traj):
+    """Worst per-step residual over a transient trajectory — the gate for a time-marched solve.
+
+    A transient has no single system to residual, which left the nonlinear coupled case (the one
+    where an under-converged Newton is MOST likely and least visible) with no correctness check at
+    all. This checks the equation each step is supposed to have solved: for backward Euler,
+
+        G(u_n) = M(t_n) (u_n - u_(n-1)) / dt + R(u_n, t_n) = 0
+
+    evaluated on the rows NOT pinned by a Dirichlet condition -- the pinned rows are row-replaced by
+    the constraint, so their residual is meaningless here. Reported relative to ||R(u_n)|| and
+    maximised over steps, so one bad step cannot hide behind many good ones.
+
+    Validated to discriminate: a converged Rayleigh-Benard solve gives 2.8e-07, and the same
+    trajectory perturbed by 5% gives 6.3e-01.
+    """
+    blk = fem.operator
+    theta = float((getattr(blk, "metadata", None) or {}).get("theta", 1.0))
+    if theta != 1.0:
+        return None, f"theta={theta}: this gate implements backward Euler only"
+    if getattr(blk, "mass", None) is None or getattr(blk, "residual", None) is None:
+        return None, "linear transient: block carries M/A rather than mass+residual callables"
+
+    dt = float(blk.dt)
+    pairs = getattr(getattr(fem, "domain", None), "_fem_native_dirichlet_pairs", None) or []
+    free = np.ones(traj.shape[1], dtype=bool)
+    if pairs:
+        free[np.asarray([int(dof) for dof, _v in pairs])] = False
+
+    worst = 0.0
+    for n in range(1, traj.shape[0]):
+        t_n = blk.t0 + n * dt
+        u_n, u_prev = jnp.asarray(traj[n]), jnp.asarray(traj[n - 1])
+        residual = jnp.asarray(blk.residual(u_n, t_n, {})).reshape(-1)
+        g = np.asarray(jnp.asarray(blk.mass(t_n, {}) @ ((u_n - u_prev) / dt)).reshape(-1) + residual)
+        scale = max(float(np.linalg.norm(np.asarray(residual)[free])), 1e-30)
+        worst = max(worst, float(np.linalg.norm(g[free]) / scale))
+    return worst, f"max_n ||M(u_n-u_(n-1))/dt + R(u_n)|| / ||R(u_n)|| over {int(free.sum())} free rows"
 
 
 def _provenance() -> dict:
@@ -595,9 +643,11 @@ def main(case: str, idx: int) -> dict:
         extra = {"rel_residual": None if rel is None else float(f"{rel:.3g}"), "residual_of": how}
 
     rel = extra.get("rel_residual")
+    tol = TRANSIENT_RESIDUAL_TOL if case in TRAJECTORY_STEPS else RESIDUAL_TOL
     return {
         **extra,
-        "converged": None if rel is None else bool(rel < RESIDUAL_TOL),
+        "residual_tol": tol,
+        "converged": None if rel is None else bool(rel < tol),
         **_provenance(),
         "case": case,
         "label": label,
