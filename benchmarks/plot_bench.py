@@ -67,7 +67,7 @@ TEAL, GRAY, INK = "#0D9488", "#94A3B8", "#1A202C"
 #: A VARIANT of a case -- the same problem differentiated (``_adj``) or solved by a different
 #: solver (``_amg``) -- is drawn in its parent's colour with its own dash pattern, so the cost of
 #: the variation can be read directly against the thing it varies.
-VARIANT_STYLES = {"_adj": "--", "_amg": ":"}
+VARIANT_STYLES = {"_adj": "--", "_amg": ":", "_ams": (0, (5, 1, 1, 1))}
 
 
 def pair_styles(order):
