@@ -79,11 +79,19 @@ def lu(*, host: bool = False) -> LinearSolver:
             ONCE, so the operator crosses PCIe once rather than per iteration; see
             :func:`jno.utils.solver.linear.host_lu_solve` for that argument and its limits.
 
-            Measured on this box it is not only a reach extender but FASTER where cuSolver also
-            works -- Stokes at 21,839 DOFs 0.27 s against 1.67 s (6.2x), H(curl) at 17,072 complex
-            DOFs 13.3 s against 36.4 s (2.7x) -- and it runs meshes cuSolver refuses: Stokes at
-            26,908 DOFs, H(curl) at 26,154. Not made the default only because it has no vmap rule
-            and re-factors per call; measure before switching a working GPU solve over.
+            ON THIS MACHINE it is not merely a reach extender but faster in every one of 12
+            measured points -- 0.15x to 0.81x of the cuSolver time across 2-D/3-D Poisson, Stokes,
+            H(curl) and a 51-step transient -- and it runs meshes cuSolver refuses (Stokes 26,908,
+            H(curl) 26,154, 3-D Poisson 87,284, all of which fail on GPU).
+
+            DO NOT read that as general. This card's FP64 runs at 1/64 of its FP32 rate, ~0.3
+            TFLOPS, against ~1.1 TFLOPS for 20 AVX2 cores, and a sparse direct factorisation is
+            FLOP-heavy (dense supernodes) rather than bandwidth-bound like SpMV. The CPU is simply
+            the faster FP64 machine here. On a datacenter GPU with full-rate FP64 the ranking would
+            plausibly invert -- that is spec-sheet reasoning, not something measured here, so
+            benchmark it on your own hardware before choosing.
+
+            Not the default regardless: no vmap rule, and it re-factors on every call.
     """
 
     def _fn(op: LinearOperator, b, *, M, x0):
