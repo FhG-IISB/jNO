@@ -2,9 +2,9 @@
 
     pixi run python benchmarks/plot_bench.py        # reads results.json, writes fem_benchmark.png
 
-Three panels, because the suite answers three different questions.
+Four panels, because the suite answers four different questions.
 
-LEFT plots SOLVE time against problem size, log-log -- deliberately not total time. Build is
+TOP LEFT plots SOLVE time against problem size, log-log -- deliberately not total time. Build is
 dominated by a per-problem XLA compilation, so plotting the total collapses several cases into one
 band; the solve is the part that tracks problem size. The line is the MEDIAN of repeated runs and
 the shading is min-to-max across them, each repeat a fresh process, so the shading covers cold
@@ -12,7 +12,13 @@ variation -- driver init, XLA compilation and this card's clock state -- not jus
 A point crossed with an X did not converge: its timing measures nothing and the curve through it
 should not be read.
 
-MIDDLE plots PEAK DEVICE MEMORY against the same axis, and is the panel most likely to be
+TOP RIGHT plots TOTAL wall time (build + solve) -- what a user actually waits for. Read against the
+solve panel it shows how little of that wait is solving: the steady linear cases spend 90%+ of it in
+build, so their total curves sit far above their solve curves and are nearly parallel to each other.
+It is also the panel where the AMG variant stops looking like a win, because a multigrid hierarchy
+is built per solve and a one-shot solve pays for it.
+
+BOTTOM LEFT plots PEAK DEVICE MEMORY against the same axis, and is the panel most likely to be
 misread, so: NOTHING here is near the card. The largest point is 3.1 GB against 8 GB nominal, and
 3-D Poisson's ladder ends at 586 MB. Its "memory-walled" label is about where the curve WOULD land
 at the ~1.3M tets a 10 s solve needs, extrapolated -- what stops it at 98k in practice is a 31 s
@@ -22,13 +28,16 @@ The value is the peak over the WHOLE case, build and solve together (``peak_byte
 running high-water mark and cannot be attributed to the solve alone); that is the right number for
 "will this run", not for a solver's working set.
 
-RIGHT is the share of wall time that is actually SOLVING, the rest being mesh + assembly + XLA
+BOTTOM RIGHT is the share of wall time that is actually SOLVING, the rest being mesh + assembly + XLA
 compilation. Bounded 0-100%, so the cases stay comparable by eye. Sizing the solves up to ~10 s did
 not rescue the steady linear cases -- they sit near 5-7% and 3-D Poisson falls to ~1%, i.e. worse
 with size, not better. Above half are the cases whose cost is not a single linear solve: the
 transient, H(curl) at its larger sizes, and Newton. The adjoint case sits well above its forward
 twin because a gradient does ~2x the work against the same one-time build -- for an inverse problem,
 where the build is paid once and iterated on, build overhead largely stops mattering.
+
+Time and memory axes are labelled in plain numbers rather than powers of ten: seconds and megabytes
+are quantities a reader compares by eye, and an exponent makes them do arithmetic first.
 
 The black triangles are REFERENCE slopes, not fits. Measured least-squares exponents, for reading
 against them: solve time 1.53 for the direct H(curl) solve (LU fill-in), 1.07 for 2-D Poisson,
@@ -43,6 +52,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.ticker import FuncFormatter, NullFormatter
 from scipy.interpolate import PchipInterpolator
 
 HERE = Path(__file__).resolve().parent
@@ -78,6 +88,17 @@ def pair_styles(order):
         else:
             styles[c] = (palette.get(c, OKABE_ITO[len(palette) % len(OKABE_ITO)]), "-")
     return styles
+
+
+def plain_log_ticks(ax, axis="y"):
+    """Label a log axis 0.1 / 1 / 10 rather than 10^-1 / 10^0 / 10^1.
+
+    Seconds and megabytes are quantities a reader compares by eye; an exponent makes them do
+    arithmetic first. Minor ticks stay unlabelled so a decade does not fill with clutter.
+    """
+    target = ax.yaxis if axis == "y" else ax.xaxis
+    target.set_major_formatter(FuncFormatter(lambda v, _pos: f"{v:g}"))
+    target.set_minor_formatter(NullFormatter())
 
 
 def curve(ax, x, y, color, label=None, n=250, ls="-", logy=True):
@@ -190,7 +211,7 @@ def main() -> None:
         rs.sort(key=lambda r: r["dofs"])
 
     styles = pair_styles(order)
-    fig, (ax_s, ax_m, ax_b) = plt.subplots(1, 3, figsize=(16.5, 4.4))
+    fig, ((ax_s, ax_t), (ax_m, ax_b)) = plt.subplots(2, 2, figsize=(11.6, 8.6))
 
     # --- left: SOLVE time vs size ----------------------------------------------------------
     # Solve, not total. Total wall time is nearly flat in this range because build is dominated by
@@ -217,7 +238,24 @@ def main() -> None:
     slope_triangle(ax_s, 5.5e5, 0.30, 1.0, label="$n$")
     slope_triangle(ax_s, 5.5e5, 0.80, 1.5, label="$n^{3/2}$")
 
-    # --- middle: peak device memory vs size ------------------------------------------------
+    plain_log_ticks(ax_s)
+
+    # --- top right: TOTAL wall time -----------------------------------------------------------
+    # What a user actually waits for: build + solve. The solve panel answers "how does the solver
+    # scale", this one answers "how long until I have an answer", and for most cases here they are
+    # very different questions -- the steady linear cases spend 90%+ of it in build.
+    for case in order:
+        rs, (c, ls) = cases[case], styles[case]
+        total = [(r["build_ms"] + r["solve_ms"]) / 1e3 for r in rs]
+        curve(ax_t, [r["dofs"] for r in rs], total, c, ls=ls)
+        mark_unconverged(ax_t, [dict(r, tot=(r["build_ms"] + r["solve_ms"]) / 1e3) for r in rs], "tot")
+    ax_t.set_xscale("log")
+    ax_t.set_yscale("log")
+    ax_t.set_xlabel("Degrees of freedom")
+    ax_t.set_ylabel("Total wall time  (build + solve)  [s]")
+    plain_log_ticks(ax_t)
+
+    # --- bottom left: peak device memory vs size ----------------------------------------------
     # Peak over the whole case (build AND solve), because that is what decides whether a problem
     # runs at all. It is why three ladders stop where they do.
     for case in order:
@@ -241,8 +279,9 @@ def main() -> None:
     ax_m.set_xlabel("Degrees of freedom")
     ax_m.set_ylabel("Peak device memory  [MB]")
     slope_triangle(ax_m, 4.5e5, 130.0, 1.0, label="$n$")
+    plain_log_ticks(ax_m)
 
-    # --- right: how much of the wall clock is actually solving --------------------------------
+    # --- bottom right: how much of the wall clock is actually solving -------------------------
     # A share rather than a ratio: it is bounded, so the cases stay comparable by eye, and 50% reads
     # directly as "half the time is the build". The rest is meshing, assembly and XLA compilation.
     for case in order:
@@ -260,10 +299,10 @@ def main() -> None:
 
     # --- one legend for all three panels ------------------------------------------------------
     handles, labels = ax_s.get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", ncol=4, fontsize=8, bbox_to_anchor=(0.5, 1.02))
+    fig.legend(handles, labels, loc="upper center", ncol=3, fontsize=8, bbox_to_anchor=(0.5, 1.015))
 
     out = HERE / "fem_benchmark.png"
-    fig.tight_layout(rect=(0, 0, 1, 0.90))
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
     fig.savefig(out)
     print(f"wrote {out}")
 
