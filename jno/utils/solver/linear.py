@@ -13,11 +13,35 @@ Users always remain free to extract ``fem.operator`` and pass their own ``solve_
 
 from __future__ import annotations
 
+from collections import OrderedDict
+from typing import Any
+
 import jax
 import jax.numpy as jnp
 from jax.experimental.sparse.linalg import spsolve
 
 __all__ = ["sparse_lu_solve", "jacobi", "matrix_diagonal"]
+
+#: Host SuperLU factorizations, keyed on the CONTENT of the operator that produced them.
+#:
+#: The transient march compiles into ONE ``lax.scan``, so :func:`host_lu_solve` runs its Python body
+#: once, at trace time, and the ``pure_callback`` is what executes per step. A cache outside the
+#: callback would therefore never see a repeat. Inside it, the constant-operator path -- where
+#: ``solver_api`` forms ``M + theta*dt*A`` once and then hands the SAME matrix to every step -- goes
+#: from N factorizations to one.
+#:
+#: Keyed on content rather than identity for the same reason the facet cache is: under a trace there
+#: is no stable object to key on, only the values arriving at the callback. Hashing costs a pass over
+#: ``data + indices`` (~16 MB at 1M nonzeros, ~1-2% of a factorization of that size), which a
+#: workload that never repeats -- a Newton loop, whose tangent changes every step -- pays for nothing.
+#: That is the deliberate trade: a small tax on the case that cannot benefit, against removing all
+#: but one factorization from the case that can.
+#:
+#: Bounded at 2 because the win is a repeated operator, not a diverse population of them, and a
+#: sparse factorization is the biggest object either side of the solve (fill-in): holding a stale one
+#: costs host memory for nothing. Two covers an alternating pair (a coupled two-field march).
+_FACTOR_CACHE: "OrderedDict[tuple, Any]" = OrderedDict()
+_FACTOR_CACHE_MAX = 2
 
 
 def matrix_diagonal(A):
@@ -107,11 +131,17 @@ def host_lu_solve(A, b):
     needs a transpose solve -- supplied by the same factorisation via SuperLU's ``trans="T"``. So
     ``jax.grad`` flows to the operator entries and the right-hand side exactly as for the GPU path.
 
+    **The factorization is reused when the operator repeats** (see :data:`_FACTOR_CACHE`). A
+    constant-operator transient forms ``M + theta*dt*A`` once and solves against it at every step, so
+    this turns N factorizations into one -- measured on a 200-step heat march, and the reuse extends
+    to the TRANSPOSE solve, so the adjoint pass costs no factorization at all. What it does NOT help
+    is a Newton loop: the tangent's VALUES change every iteration, so every call legitimately misses,
+    and reusing only the symbolic analysis (the part that does not change) is not something SuperLU
+    exposes through scipy -- that is the gap a phase-separated solver like cuDSS would close.
+
     Limitations, all inherited from ``pure_callback``: no ``vmap`` batching rule, and the callback
     is forward-only, so this cannot appear inside a transformation that needs to differentiate
     *through* the callback itself (the ``custom_linear_solve`` firewall means it does not have to).
-    The matrix is re-factored on every call -- correct for a one-shot solve, wasteful if you are
-    solving repeatedly with a fixed operator, where a frozen preconditioner is the better tool.
     """
     import jax
     import jax.experimental.sparse as jsp
@@ -124,14 +154,35 @@ def host_lu_solve(A, b):
     shape = tuple(int(s) for s in A.shape)
 
     def _host_solve(data, indices, rhs, transpose):
+        import hashlib
+
         import numpy as _np
         import scipy.sparse as _sp
         import scipy.sparse.linalg as _spla
 
         rhs = _np.asarray(rhs)
-        idx = _np.asarray(indices)
-        mat = _sp.csc_matrix((_np.asarray(data), (idx[:, 0], idx[:, 1])), shape=shape)
-        return _np.asarray(_spla.splu(mat).solve(rhs, trans="T" if transpose else "N"), dtype=rhs.dtype)
+        dat = _np.ascontiguousarray(data)
+        idx = _np.ascontiguousarray(_np.asarray(indices))
+
+        # One hasher over both arrays: together they ARE the matrix, so this identifies the
+        # factorization exactly -- a changed coefficient misses and re-factors, which is the whole
+        # correctness requirement. `transpose` is deliberately NOT in the key: one factorization
+        # serves both directions via SuperLU's trans="T", so the adjoint reuses the forward's.
+        h = hashlib.blake2b(digest_size=16)
+        h.update(dat.view(_np.uint8))
+        h.update(idx.view(_np.uint8))
+        key = (h.digest(), shape, dat.dtype.str)
+
+        lu = _FACTOR_CACHE.get(key)
+        if lu is None:
+            mat = _sp.csc_matrix((dat, (idx[:, 0], idx[:, 1])), shape=shape)
+            lu = _spla.splu(mat)
+            _FACTOR_CACHE[key] = lu
+            if len(_FACTOR_CACHE) > _FACTOR_CACHE_MAX:
+                _FACTOR_CACHE.popitem(last=False)
+        else:
+            _FACTOR_CACHE.move_to_end(key)
+        return _np.asarray(lu.solve(rhs, trans="T" if transpose else "N"), dtype=rhs.dtype)
 
     def _call(rhs, transpose):
         return jax.pure_callback(

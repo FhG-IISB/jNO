@@ -249,3 +249,52 @@ def test_nonlinear_transient_direct_linear_slot_is_the_solver_that_runs():
         linear_mod.host_lu_solve = original
     assert calls, "lu(host=True) was requested but the host factorization never ran"
     assert np.abs(sol - np.asarray(_heat(nonlinear=True).solve().fn())).max() < 1e-8
+
+
+def test_a_constant_operator_march_factorizes_once_not_once_per_step(monkeypatch):
+    """The reason the factorization cache exists. ``solver_api`` forms ``M + theta*dt*A`` once for a
+    constant-operator block and hands the SAME matrix to every step, so a direct solver that
+    re-factored per call did N identical factorizations for one matrix."""
+    import scipy.sparse.linalg as spla
+
+    from jno.utils.solver.linear import _FACTOR_CACHE
+
+    _FACTOR_CACHE.clear()
+    calls = []
+    original = spla.splu
+    monkeypatch.setattr(spla, "splu", lambda *a, **kw: calls.append(1) or original(*a, **kw))
+    try:
+        steps = 41
+        fem = _heat(time=(0.0, 0.2, steps))
+        sol = np.asarray(fem.solve(linear=jno.solve.lu(host=True)).fn())
+        ref = np.asarray(_heat(time=(0.0, 0.2, steps)).solve().fn())
+    finally:
+        _FACTOR_CACHE.clear()
+
+    assert np.abs(sol - ref).max() < 1e-8, "reuse changed the trajectory"
+    assert len(calls) == 1, f"{steps - 1} steps on one operator took {len(calls)} factorizations"
+
+
+def test_a_time_dependent_operator_still_refactors_each_step(monkeypatch):
+    """The other side of the guard: when the step matrix genuinely CHANGES, every step must get its
+    own factorization rather than a stale one. Checked on the answer, not just the count."""
+    import scipy.sparse.linalg as spla
+
+    from jno.utils.solver.linear import _FACTOR_CACHE, host_lu_solve
+
+    _FACTOR_CACHE.clear()
+    calls = []
+    original = spla.splu
+    monkeypatch.setattr(spla, "splu", lambda *a, **kw: calls.append(1) or original(*a, **kw))
+    try:
+        import jax.experimental.sparse as jsp
+
+        base = np.diag([4.0, 5.0, 6.0]) + np.diag([1.0, 1.0], 1)
+        rhs = jnp.asarray([1.0, 2.0, 3.0])
+        for k in range(1, 5):  # a "march" whose operator changes every step
+            M = jnp.asarray(base * float(k))
+            got = host_lu_solve(jsp.BCOO.fromdense(M), rhs)
+            np.testing.assert_allclose(np.asarray(got), np.asarray(jnp.linalg.solve(M, rhs)), rtol=1e-10)
+    finally:
+        _FACTOR_CACHE.clear()
+    assert len(calls) == 4, f"a changing operator was factored {len(calls)}x for 4 distinct matrices"

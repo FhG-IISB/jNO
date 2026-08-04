@@ -815,8 +815,22 @@ all work; only specs that need the assembled matrix (`jacobi`, an unbuilt `amg`)
 `linear`/`precond` see the step operator `M + θ·dt·A` — when it is time-independent the step matrix is
 formed **once** and the preconditioner materialized **once before the time loop** — and `nonlinear` drives
 each implicit step of a nonlinear block. Second-order-in-time (`u_tt`) flows through the same augmented
-block. Each step warm-starts from the previous state (so `x0=` is rejected); `lu()` inside the time loop
-re-factorizes per step.
+block. Each step warm-starts from the previous state (so `x0=` is rejected).
+
+> **`lu(host=True)` factorizes a constant step operator once, not once per step.** The step matrix is
+> already formed once above; the host factorization is now cached on the operator's *content*, so a
+> march that solves against the same matrix every step pays one factorization for the whole trajectory
+> — and the transpose solve reuses it too, so the adjoint pass adds none. Measured on a 51-step heat
+> march, whole-solve wall clock: 1.55× at 8,355 DOFs and **2.9× at 23,934** (50 factorizations → 1),
+> trajectories bit-identical. The gain grows with mesh size because factorization cost grows faster
+> than the per-step solve — at 513 DOFs it is only 1.05×, where the factorization is sub-millisecond.
+>
+> What it does **not** help: a *nonlinear* march, or any Newton loop. There the tangent's values
+> change every iteration, so every call legitimately misses and pays a content hash (~1–2% of a
+> factorization) for nothing. Reusing only the *symbolic* analysis — which genuinely is constant when
+> the sparsity pattern is fixed — is not something SuperLU exposes through scipy. It is also
+> host-path-only: `lu()` on GPU goes through cuSolver's `spsolve`, a single fused call with no
+> factorization object to keep.
 
 **Complex problems** are assembled as one real `2n` system over the stacked `[Re; Im]` state — the
 real-equivalent block `[[A_r, -A_i], [A_i, A_r]]` — at assembly rather than at solve time. A complex

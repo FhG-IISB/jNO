@@ -228,3 +228,87 @@ def test_lu_host_spec_is_distinguishable_from_the_device_spec():
     import jno
 
     assert jno.solve.lu().name != jno.solve.lu(host=True).name
+
+
+# --------------------------------------------------------------------------------------------
+# factorization reuse: the SAME operator must factor ONCE, a CHANGED one must never go stale
+# --------------------------------------------------------------------------------------------
+@pytest.fixture
+def count_factorizations(monkeypatch):
+    """Count ``splu`` calls and start from a cold cache."""
+    import scipy.sparse.linalg as spla
+
+    from jno.utils.solver.linear import _FACTOR_CACHE
+
+    _FACTOR_CACHE.clear()
+    calls = []
+    original = spla.splu
+    monkeypatch.setattr(spla, "splu", lambda *a, **kw: calls.append(1) or original(*a, **kw))
+    yield calls
+    _FACTOR_CACHE.clear()
+
+
+def test_repeating_the_same_operator_factors_once(count_factorizations):
+    from jno.utils.solver.linear import host_lu_solve
+
+    A, dense, b = _sparse_nonsym()
+    for _ in range(5):
+        got = host_lu_solve(A, b)
+    assert len(count_factorizations) == 1, f"re-factored {len(count_factorizations)}x for one operator"
+    assert float(jnp.linalg.norm(got - jnp.linalg.solve(dense, b)) / jnp.linalg.norm(b)) < 1e-10
+
+
+def test_a_changed_operator_is_never_served_a_stale_factorization(count_factorizations):
+    """The correctness requirement. A cache that misses is slow; a cache that hits wrongly is a
+    silently wrong answer, so this checks the VALUE, not just the factorization count."""
+    from jno.utils.solver.linear import host_lu_solve
+
+    A, dense, b = _sparse_nonsym()
+    first = host_lu_solve(A, b)
+
+    scaled = jsp.BCOO((A.data * 2.7, A.indices), shape=A.shape)  # same pattern, different values
+    second = host_lu_solve(scaled, b)
+    assert len(count_factorizations) == 2, "a changed coefficient reused the old factorization"
+    np.testing.assert_allclose(np.asarray(second), np.asarray(jnp.linalg.solve(dense * 2.7, b)), rtol=1e-9)
+    assert not np.allclose(np.asarray(first), np.asarray(second)), "the two answers should differ"
+
+
+def test_a_different_pattern_is_not_confused_with_the_same_values(count_factorizations):
+    """Both arrays are hashed: identical data on a DIFFERENT sparsity pattern is a different matrix."""
+    from jno.utils.solver.linear import host_lu_solve
+
+    d = jnp.asarray([4.0, 1.0, 1.0, 4.0])
+    idx_a = jnp.asarray([[0, 0], [0, 1], [1, 0], [1, 1]])
+    idx_b = jnp.asarray([[0, 0], [1, 0], [0, 1], [1, 1]])  # same values, transposed placement
+    rhs = jnp.asarray([1.0, 2.0])
+    xa = host_lu_solve(jsp.BCOO((d, idx_a), shape=(2, 2)), rhs)
+    xb = host_lu_solve(jsp.BCOO((d, idx_b), shape=(2, 2)), rhs)
+    assert len(count_factorizations) == 2
+    np.testing.assert_allclose(
+        np.asarray(xa), np.asarray(jnp.linalg.solve(jnp.asarray([[4.0, 1.0], [1.0, 4.0]]), rhs)), rtol=1e-10
+    )
+    np.testing.assert_allclose(
+        np.asarray(xb), np.asarray(jnp.linalg.solve(jnp.asarray([[4.0, 1.0], [1.0, 4.0]]).T, rhs)), rtol=1e-10
+    )
+
+
+def test_the_transpose_solve_reuses_the_forward_factorization(count_factorizations):
+    """``transpose`` is not in the cache key, so the adjoint pass costs no factorization at all."""
+    from jno.utils.solver.linear import host_lu_solve
+
+    A, _dense, b = _sparse_nonsym()
+    loss = lambda data: jnp.sum(host_lu_solve(jsp.BCOO((data, A.indices), shape=A.shape), b) ** 2)  # noqa: E731
+    g = jax.grad(loss)(A.data)
+    assert np.all(np.isfinite(np.asarray(g)))
+    assert len(count_factorizations) == 1, f"forward + adjoint took {len(count_factorizations)} factorizations"
+
+
+def test_the_factorization_cache_is_bounded(count_factorizations):
+    """A sparse factorization is the biggest object around the solve (fill-in) -- an unbounded cache
+    would hold every stale one in host memory."""
+    from jno.utils.solver.linear import _FACTOR_CACHE, _FACTOR_CACHE_MAX, host_lu_solve
+
+    A, _dense, b = _sparse_nonsym()
+    for s in range(_FACTOR_CACHE_MAX + 3):
+        host_lu_solve(jsp.BCOO((A.data * (1.0 + s), A.indices), shape=A.shape), b)
+    assert len(_FACTOR_CACHE) <= _FACTOR_CACHE_MAX
