@@ -764,9 +764,19 @@ transient stepper factorizes the backward-Euler step tangent `M/dt + ∂R/∂u`;
 It composes wherever the assembler provides that tangent — `fem.solve(nonlinear=jno.solve.newton(direct=True))`
 on a native nonlinear problem, **steady or the transient march** — and stays differentiable: implicit
 differentiation uses a *direct, transposable* tangent solve on the tangent assembled at the root (the adjoint
-solves `Jᵀ` directly too, not with a stalling Krylov). The `linear=`/`precond=` slots are then unused;
-`damping` / `line_search` apply unchanged. It needs the assembled tangent, so it does **not** apply to the
-matrix-free-only paths (a coupled-residual wrapper, complex) — those fail loud.
+solves `Jᵀ` directly too, not with a stalling Krylov). `damping` / `line_search` apply unchanged. It needs the
+assembled tangent, so it does **not** apply to the matrix-free-only paths (a coupled-residual wrapper,
+complex) — those fail loud.
+
+**A direct `linear=` slot selects it for you, and is obeyed.** `lu`, `dense` and `amg` all need an assembled
+matrix, so pairing one with the *matrix-free* Newton cannot work — there is nothing to factorize. Passing
+`fem.solve(linear=jno.solve.lu(host=True))` on a nonlinear or transient problem therefore routes to the direct
+Newton, and that slot is the solver that actually runs on the assembled tangent (and on `Jᵀ` in the adjoint);
+`precond=` materializes against the same assembled operator. Which factorization you pick is not cosmetic
+here: on a 26-step Rayleigh–Bénard march (three fields, saddle, nonlinear) the default matrix-free
+Jacobi-BiCGStab takes 20.1 s, `linear=jno.solve.lu()` 7.6 s and `linear=jno.solve.lu(host=True)` **3.1 s**, all
+to the same 2.8e-07 per-step Newton residual. Writing an *explicit* matrix-free `nonlinear=` alongside a direct
+`linear=` is contradictory and raises rather than picking one silently.
 
 **User extension** is duck-typed — a linear solver is any `fn(A, b, *, M=None, x0=None) -> x` with `A` a
 `jno.solve.LinearOperator` (`.mv`, `.T`, `.diag()`, `.bcoo`, `.dense()`); a preconditioner is any

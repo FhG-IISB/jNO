@@ -735,26 +735,48 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
     What cannot: specs that need the assembled matrix -- ``jacobi`` (no diagonal on a matvec),
     an unbuilt ``amg``, ``lu``/``dense`` inner solvers on sub-blocks -- these raise their own
     targeted errors when materialized.
-    """
-    if nonlinear is None:
-        from ... import solve as _solve_ns
 
-        nonlinear = _solve_ns.newton()
+    **A DIRECT ``linear=`` slot picks the direct Newton.** ``lu``/``dense``/``amg`` need an assembled
+    matrix, and a matrix-free tangent has none to give them, so pairing one with the matrix-free
+    Newton cannot work -- it used to surface as ``LinearOperator.dense(): a matvec-only operator
+    cannot densify`` from six frames inside the Krylov loop, on the perfectly reasonable
+    ``fem.solve(linear=jno.solve.lu(host=True))`` over a nonlinear or transient problem. jNO already
+    has the path that honours it (``newton(direct=True)``, which assembles the tangent), so the
+    default nonlinear driver follows the linear slot instead of crashing inside it. An EXPLICIT
+    matrix-free ``nonlinear=`` with a direct ``linear=`` is a genuine contradiction and says so.
+    """
+    from ... import solve as _solve_ns
+
+    # ``LinearSolver.direct`` is exactly the "needs an assembled operator" flag: lu, dense, amg.
+    needs_assembled = bool(getattr(linear, "direct", False))
+    if nonlinear is None:
+        nonlinear = _solve_ns.newton(direct=needs_assembled)
+    elif needs_assembled and not bool(getattr(nonlinear, "direct", False)):
+        raise ValueError(
+            f"fem.solve: linear={getattr(linear, 'name', linear)!r} is a DIRECT solver and needs the "
+            f"assembled tangent, but nonlinear={getattr(nonlinear, 'name', nonlinear)!r} linearizes "
+            "matrix-free (a JVP), so there is no matrix to factorize. Use "
+            "nonlinear=jno.solve.newton(direct=True) to assemble the tangent, or an iterative "
+            "linear= (cg/bicgstab/gmres/fgmres)."
+        )
 
     inner = None
     if linear is not None or precond is not None:
-        if linear is None:
-            from ... import solve as _solve_ns
-
-            solver = _solve_ns.bicgstab()  # the historic matrix-free inner default
-        else:
-            solver = linear
+        solver = linear if linear is not None else _solve_ns.bicgstab()  # historic matrix-free default
         if precond is not None:
             prepare_precond(precond, fem)  # aux assembly now, NOT inside the traced Newton loop
 
-        def inner(matvec, rhs):
+        def inner(operator, rhs):
+            # The direct Newton hands us the ASSEMBLED tangent, the matrix-free one a JVP callable.
+            # ``LinearOperator`` is the uniform handle over both, so the same composed inner serves
+            # either -- an assembled operator keeps its ``.bcoo``/``.diag()``, which is the whole
+            # point of routing a direct solver here.
             n = rhs.shape[0]
-            op = LinearOperator.from_matvec(matvec, shape=(n, n))
+            op = (
+                LinearOperator.from_matvec(operator, shape=(n, n))
+                if callable(operator) and not hasattr(operator, "shape")
+                else LinearOperator(operator)
+            )
             M = materialize_precond(precond, PrecondContext(op, fem)) if precond is not None else None
             return solver(op, rhs, M=M)
 

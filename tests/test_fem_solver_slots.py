@@ -225,6 +225,76 @@ def test_direct_newton_without_assembled_jacobian_raises():
 
 
 # ---------------------------------------------------------------------------
+# a DIRECT linear= slot on a nonlinear problem: it must reach the assembled tangent
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("spec", [jno.solve.lu(), jno.solve.lu(host=True), jno.solve.dense()])
+def test_direct_linear_slot_solves_a_nonlinear_problem(spec):
+    """``fem.solve(linear=lu())`` used to die with ``a matvec-only operator cannot densify`` -- the
+    matrix-free Newton has no matrix for a direct solver to factorize. The linear slot now selects
+    the driver that assembles one, and the answer matches the matrix-free default."""
+    fem = _nonlinear()
+    u_ref = np.asarray(fem.solve())
+    u = np.asarray(fem.solve(linear=spec))
+    assert np.abs(u - u_ref).max() < 1e-7
+
+
+def test_direct_linear_slot_is_actually_the_solver_that_runs():
+    """The slot must be OBEYED, not merely accepted: ``newton_direct`` hardcoded ``sparse_lu_solve``,
+    so asking for the host factorization silently got cuSolver -- on the one path where that choice
+    decides whether the problem fits at all."""
+    from jno.utils.solver import linear as linear_mod
+
+    calls = []
+    original = linear_mod.host_lu_solve
+    linear_mod.host_lu_solve = lambda A, b: calls.append(1) or original(A, b)
+    try:
+        u = np.asarray(_nonlinear().solve(linear=jno.solve.lu(host=True)))
+    finally:
+        linear_mod.host_lu_solve = original
+    assert calls, "lu(host=True) was requested but the host factorization never ran"
+    assert np.abs(u - np.asarray(_nonlinear().solve())).max() < 1e-7
+
+
+def test_direct_linear_slot_with_an_explicit_matrix_free_newton_is_refused():
+    """An explicit matrix-free ``nonlinear=`` with a direct ``linear=`` is contradictory, and says so
+    instead of failing six frames deep inside the Krylov loop."""
+    with pytest.raises(ValueError, match="DIRECT solver and needs the assembled tangent"):
+        _nonlinear().solve(nonlinear=jno.solve.newton(), linear=jno.solve.lu())
+
+
+def test_iterative_linear_slot_still_takes_the_matrix_free_path():
+    """Only a DIRECT linear slot changes the driver: an iterative one leaves the matrix-free Newton
+    (and its ``wants_jacobian`` flag) exactly as before."""
+    from jno.utils.solver.solver_api import compose_nonlinear_solve_fn
+
+    assert compose_nonlinear_solve_fn(None, jno.solve.bicgstab(), None, None).wants_jacobian is False
+    assert compose_nonlinear_solve_fn(None, None, None, None).wants_jacobian is False
+    assert compose_nonlinear_solve_fn(None, jno.solve.lu(), None, None).wants_jacobian is True
+    u = np.asarray(_nonlinear().solve(linear=jno.solve.bicgstab(tol=1e-12)))
+    assert np.abs(u - np.asarray(_nonlinear().solve())).max() < 1e-7
+
+
+def test_direct_linear_slot_stays_differentiable():
+    """The slot rides the same ``custom_root`` implicit-diff tangent solve, so a gradient still
+    reaches a parameter the residual closes over -- and the transpose solve uses the slot too."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.25)
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    ss = jno.np.sin(PI * xi) * jno.np.sin(PI * yi)
+    f = 2.0 * PI**2 * ss + ss**3
+
+    def loss(a):
+        fem = jno.fem([ui.x * vi.x + ui.y * vi.y + a * ui**3 * vi - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+        return jnp.sum(jnp.asarray(fem.solve(linear=jno.solve.lu())) ** 2)
+
+    g = float(jax.grad(loss)(1.0))
+    fd = float((loss(1.0 + 1e-4) - loss(1.0 - 1e-4)) / 2e-4)
+    assert np.isfinite(g) and abs(g - fd) < 1e-3 * max(1.0, abs(fd)), f"grad {g} vs finite-difference {fd}"
+
+
+# ---------------------------------------------------------------------------
 # parametric (inverse) path stays differentiable through slot solvers
 # ---------------------------------------------------------------------------
 

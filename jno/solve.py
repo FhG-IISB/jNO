@@ -337,10 +337,12 @@ def _root_driver(
             # drag where the matrix-free Krylov inner solve stalls). Needs the assembler-provided Jacobian.
             if jacobian is None:
                 raise ValueError(
-                    "jno.solve.newton(direct=True) needs the ASSEMBLED Jacobian, which only the native "
-                    "nonlinear FEM assembler / transient stepper provides. Use it via "
-                    "fem.solve(nonlinear=jno.solve.newton(direct=True)) on a native nonlinear problem "
-                    "(a matrix-free residual has no assembled tangent to factorize)."
+                    "The sparse-direct Newton needs the ASSEMBLED Jacobian, which only the native "
+                    "nonlinear FEM assembler / transient stepper provides -- a matrix-free residual has "
+                    "no assembled tangent to factorize. Reached either via "
+                    "fem.solve(nonlinear=jno.solve.newton(direct=True)) or by a direct linear slot "
+                    "(fem.solve(linear=jno.solve.lu()/dense()/amg()), which selects this driver); on a "
+                    "matrix-free-only problem use an iterative linear= (cg/bicgstab/gmres/fgmres)."
                 )
             from .utils.solver.newton_krylov import newton_direct
 
@@ -355,6 +357,9 @@ def _root_driver(
                 line_search=line_search,
                 ls_max=ls_max,
                 ls_c=ls_c,
+                # the composed ``linear=``/``precond=`` slots, over the ASSEMBLED tangent; None keeps
+                # the historic sparse-LU default
+                linear_solve=linear_solve,
             )
         from .utils.solver.newton_krylov import newton_krylov
 

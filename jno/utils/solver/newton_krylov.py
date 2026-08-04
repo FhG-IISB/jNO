@@ -164,19 +164,32 @@ def newton_direct(
     line_search=False,
     ls_max=25,
     ls_c=1e-4,
+    linear_solve=None,
 ):
-    """Root-find ``residual_fn(u) = 0`` with a **sparse-direct** Newton: each step factorizes the
-    ASSEMBLED Jacobian ``jacobian_fn(u)`` (a ``jax.experimental.sparse.BCOO``) with ``sparse_lu_solve``
-    instead of the matrix-free Krylov inner solve of :func:`newton_krylov`. A direct factorization is
+    """Root-find ``residual_fn(u) = 0`` with a **sparse-direct** Newton: each step solves against the
+    ASSEMBLED Jacobian ``jacobian_fn(u)`` (a ``jax.experimental.sparse.BCOO``) instead of the
+    matrix-free Krylov inner solve of :func:`newton_krylov`. A direct factorization is
     robust on **indefinite / ill-conditioned** systems -- Taylor-Hood velocity/pressure saddles, stiff
     phase-change (Carman-Kozeny) drag -- where BiCGStab stalls (no saddle-point preconditioner).
+
+    ``linear_solve`` is an ``(A, b) -> x`` callable over the ASSEMBLED tangent -- the composed
+    ``linear=``/``precond=`` slots. Default: ``sparse_lu_solve``. Without it the driver hardcoded
+    cuSolver, so ``fem.solve(nonlinear=newton(direct=True), linear=lu(host=True))`` silently ignored
+    the placement it was asked for -- and this is the one path where that choice decides whether the
+    problem runs at all, cuSolver being the ceiling on exactly the saddle systems the direct Newton
+    exists for.
 
     Differentiable w.r.t. anything ``residual_fn`` closes over: the forward Newton runs to the root
     un-differentiated, then ``jax.lax.custom_root`` provides the implicit-function-theorem gradient via a
     **direct, transposable** tangent solve on the Jacobian assembled at the root (so the reverse pass
-    solves ``Jᵀ`` directly too, not with a stalling Krylov). ``jacobian_fn(u)`` must return the assembled
-    Jacobian of ``residual_fn`` at ``u``. ``damping`` / ``line_search`` as in :func:`newton_krylov`."""
-    from .linear import sparse_lu_solve
+    solves ``Jᵀ`` directly too, not with a stalling Krylov). That transpose is the one requirement on a
+    supplied ``linear_solve``: it is called on ``Jᵀ`` as well as ``J``. ``jacobian_fn(u)`` must return the
+    assembled Jacobian of ``residual_fn`` at ``u``. ``damping`` / ``line_search`` as in
+    :func:`newton_krylov`."""
+    if linear_solve is None:
+        from .linear import sparse_lu_solve
+
+        linear_solve = sparse_lu_solve
 
     f0 = lambda u: jnp.asarray(residual_fn(u)).reshape(-1)  # noqa: E731
     u0 = jnp.asarray(u0).reshape(-1)
@@ -204,7 +217,7 @@ def newton_direct(
         def body(state):
             u, _r, k = state
             r = f0(u)
-            delta = sparse_lu_solve(jacobian_fn(u), -r)  # DIRECT solve of the assembled tangent
+            delta = linear_solve(jacobian_fn(u), -r)  # DIRECT solve of the assembled tangent
             alpha = _backtrack(u, delta, jnp.linalg.norm(r)) if line_search else damping
             u = u + alpha * delta
             return u, f0(u), k + 1
@@ -216,8 +229,8 @@ def newton_direct(
 
     def _tangent(g, y):  # solve J_root x = y (and Jᵀ on the reverse pass) DIRECTLY at the converged root
         J = jacobian_fn(root)
-        fwd = lambda _mv, rhs: sparse_lu_solve(J, rhs)  # noqa: E731
-        tsp = lambda _mv, rhs: sparse_lu_solve(J.T, rhs)  # noqa: E731
+        fwd = lambda _mv, rhs: linear_solve(J, rhs)  # noqa: E731
+        tsp = lambda _mv, rhs: linear_solve(J.T, rhs)  # noqa: E731
         return jax.lax.custom_linear_solve(g, y, fwd, transpose_solve=tsp)
 
     return jax.lax.custom_root(f0, root, lambda _f, _x0: root, _tangent)
