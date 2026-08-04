@@ -314,11 +314,17 @@ class Shape:
         return Selector(keys=sub.keys())
 
     # ----- realization -----------------------------------------------------------
-    def build(self):
-        """Mesh this shape -> ``(meshio.Mesh, dim, ds)``. Imports gmsh lazily."""
+    def build(self, *, algorithm=None, algorithm3d=None, threads=None):
+        """Mesh this shape -> ``(meshio.Mesh, dim, ds)``. Imports gmsh lazily.
+
+        ``algorithm`` (2-D) / ``algorithm3d`` (3-D) select gmsh's meshing kernel and ``threads``
+        its thread count; ``None`` keeps jNO's defaults -- see :mod:`jno.geometry.emit`, which
+        records why each was chosen. The 3-D default is HXT on 8 threads, measured 14.5x faster
+        than gmsh's serial Delaunay at equal-or-better element quality.
+        """
         from .emit import build as _build
 
-        return _build(self)
+        return _build(self, algorithm=algorithm, algorithm3d=algorithm3d, threads=threads)
 
     def __call__(self, geo=None):
         # Callable-constructor compatibility (jno.domain runs constructor()).
