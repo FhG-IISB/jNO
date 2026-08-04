@@ -342,14 +342,17 @@ class MeshUtils:
         node triples and ``apex`` the per-face opposite-vertex node index -- enough to orient
         each face outward exactly (away from the apex), for any geometry incl. concave ones.
         """
+        from ..utils.solver.fem_facets import _LOCAL_FACES_TET, _boundary_faces
+
+        # Reuses the shared (cached) face computation rather than repeating the sort+unique a third
+        # time -- this was 0.93 s of a 2.95 s domain build, and the assembler had already done the
+        # identical work. ``_LOCAL_FACES_TET[k]`` stores the apex as its 4th entry, so the opposite
+        # vertex follows from the local face index without any extra search.
         cells = np.asarray(tetra_cells, dtype=np.int64)
-        specs = ([0, 1, 2], 3), ([0, 1, 3], 2), ([0, 2, 3], 1), ([1, 2, 3], 0)
-        faces = np.vstack([cells[:, list(tri)] for tri, _ in specs])
-        apex = np.concatenate([cells[:, a] for _, a in specs])
-        keys = np.sort(faces, axis=1)
-        _uniq, inv, counts = np.unique(keys, axis=0, return_inverse=True, return_counts=True)
-        boundary = counts[inv.ravel()] == 1
-        return faces[boundary], apex[boundary]
+        flat, sel, n_local = _boundary_faces(cells, _LOCAL_FACES_TET, 3)
+        parent_cell, local_face = sel // n_local, sel % n_local
+        apex_local = np.asarray([entry[3] for entry in _LOCAL_FACES_TET], dtype=np.int64)
+        return flat[sel], cells[parent_cell, apex_local[local_face]]
 
     @staticmethod
     def _compute_normals_from_boundary_faces(points, boundary_faces, apex_points=None):
