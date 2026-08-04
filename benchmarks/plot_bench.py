@@ -6,7 +6,11 @@ Three panels, because the suite answers three different questions.
 
 LEFT plots SOLVE time against problem size, log-log -- deliberately not total time. Build is
 dominated by a per-problem XLA compilation, so plotting the total collapses several cases into one
-band; the solve is the part that tracks problem size.
+band; the solve is the part that tracks problem size. The line is the MEDIAN of repeated runs and
+the shading is min-to-max across them, each repeat a fresh process, so the shading covers cold
+variation -- driver init, XLA compilation and this card's clock state -- not just kernel jitter.
+A point crossed with an X did not converge: its timing measures nothing and the curve through it
+should not be read.
 
 MIDDLE plots PEAK DEVICE MEMORY against the same axis, and is the panel most likely to be
 misread, so: NOTHING here is near the card. The largest point is 3.1 GB against 8 GB nominal, and
@@ -92,6 +96,34 @@ def curve(ax, x, y, color, label=None, n=250, ls="-", logy=True):
     ax.plot(10**fine, 10**fy if logy else fy, lw=1.6, color=color, label=label, ls=ls)
 
 
+def band(ax, x, lo, hi, color, n=250):
+    """Shade min-to-max across repeats. Absent bounds mean a single run -- draw nothing."""
+    x, lo, hi = np.asarray(x, float), np.asarray(lo, float), np.asarray(hi, float)
+    if len(x) < 3 or not np.all(np.isfinite(lo)) or not np.all(np.isfinite(hi)):
+        return
+    lx = np.log10(x)
+    fine = np.linspace(lx[0], lx[-1], n)
+    f_lo = 10 ** PchipInterpolator(lx, np.log10(lo))(fine)
+    f_hi = 10 ** PchipInterpolator(lx, np.log10(hi))(fine)
+    ax.fill_between(10**fine, f_lo, f_hi, color=color, alpha=0.18, lw=0, zorder=2)
+
+
+def mark_unconverged(ax, rs, key):
+    """Cross out any point whose solve did not converge -- its timing measures nothing."""
+    bad = [r for r in rs if r.get("converged") is False]
+    if bad:
+        ax.plot(
+            [r["dofs"] for r in bad],
+            [r[key] for r in bad],
+            ls="none",
+            marker="x",
+            ms=7,
+            mew=1.6,
+            color=INK,
+            zorder=6,
+        )
+
+
 def slope_triangle(ax, x0, y0, slope, decades=0.3, label=None):
     """Draw a REFERENCE slope on log-log axes: a right triangle of the given exponent.
 
@@ -158,7 +190,15 @@ def main() -> None:
     # actually tracks problem size; the fixed cost it hides behind is the right panel's subject.
     for case in order:
         rs, (c, ls) = cases[case], styles[case]
+        band(
+            ax_s,
+            [r["dofs"] for r in rs],
+            [r.get("solve_ms_min", np.nan) / 1e3 for r in rs],
+            [r.get("solve_ms_max", np.nan) / 1e3 for r in rs],
+            c,
+        )
         curve(ax_s, [r["dofs"] for r in rs], [r["solve_ms"] / 1e3 for r in rs], c, label=rs[0]["label"], ls=ls)
+        mark_unconverged(ax_s, [dict(r, solve_s=r["solve_ms"] / 1e3) for r in rs], "solve_s")
     ax_s.set_xscale("log")
     ax_s.set_yscale("log")
     ax_s.set_xlabel("Degrees of freedom")

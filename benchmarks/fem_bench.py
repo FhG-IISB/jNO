@@ -11,6 +11,21 @@ Each case reports the split that matters for jNO, where assembly compiles a prog
 * ``solve_ms``  -- the solve alone, on an already-built problem
 * ``peak_mb``   -- peak device memory over the whole case
 
+and two things that decide whether those numbers mean anything:
+
+* ``rel_residual`` / ``converged`` -- the correctness gate. A timing taken on a solve that never
+  converged measures nothing, and without this the suite had no way to notice. It is not
+  hypothetical: the first case to get a gate immediately caught an unpreconditioned solve burning
+  ``maxiter``, which had been timing as a gradient FASTER than its own forward. ``None`` means the
+  residual is not defined for that case (a transient has a per-step system, not one system).
+* provenance -- ``gpu``, ``sm_clock``, ``jax``, ``git``, ``dirty``, ``when``. Stamped per RECORD,
+  not per file, because ``run_bench`` merges across runs: one ``results.json`` routinely holds
+  points measured at different commits, and a file-level header would misdescribe most rows.
+
+Iteration counts are NOT recorded and would be the most useful thing to add next -- they would have
+made the non-convergence above obvious on sight. jNO's Krylov solvers do not return them, so it
+needs a library API change rather than a benchmark change.
+
 The set spans the axes that change jNO's behaviour rather than just the physics: scalar vs vector,
 linear vs Newton, steady vs transient, single-field vs saddle-point, 2-D vs 3-D, real vs complex, and
 nodal Lagrange vs H(curl) edge elements.
@@ -296,6 +311,65 @@ CASES = {
 TRAJECTORY_STEPS = {"heat2d": HEAT_STEPS}
 
 
+#: a solve whose residual is above this was not a solve, and its timing measures nothing. Recorded
+#: rather than raised, so the matrix completes and the bad point is visible instead of missing.
+RESIDUAL_TOL = 1e-6
+
+
+def _relative_residual(fem, sol, case):
+    """Convergence gate: how far the reported answer actually is from solving the system.
+
+    Returns ``(value, how)``; a ``None`` value carries the reason it is not defined. This exists
+    because the suite had no correctness check at all, and the first case that got one immediately
+    caught a solve that was silently burning ``maxiter`` and being timed as though it had converged.
+    """
+    if case in TRAJECTORY_STEPS:
+        return None, "transient: a per-step system, no single residual"
+    u = jnp.asarray(sol).reshape(-1)
+    if not fem.is_linear:
+        # relative to the residual at zero, so the number is comparable across sizes
+        r0 = float(jnp.linalg.norm(jnp.asarray(fem.residual(jnp.zeros_like(u))).reshape(-1)))
+        r = float(jnp.linalg.norm(jnp.asarray(fem.residual(u)).reshape(-1)))
+        return r / max(r0, 1e-300), "||R(u)|| / ||R(0)||"
+    # ``fem.operator``, NOT ``fem.A``: the latter is a densifying convenience property, and calling
+    # it here allocated n^2 -- 71.9 GiB at 98k DOFs. That OOM'd 18 of 47 points and inflated peak_mb
+    # on every survivor, i.e. the correctness gate silently wrecked the measurement it guards.
+    A, b = fem.operator
+    b = jnp.asarray(b).reshape(-1)
+    if jnp.iscomplexobj(u) and b.size == 2 * u.size:
+        u = jnp.concatenate([u.real, u.imag])  # complex assembles as the real 2n block
+    return float(jnp.linalg.norm(A @ u - b) / jnp.linalg.norm(b)), "||Au-b|| / ||b||"
+
+
+def _provenance() -> dict:
+    """Machine and code identity, stamped on EVERY record.
+
+    Per-record rather than once per file on purpose: ``run_bench`` merges results across runs, so
+    one ``results.json`` routinely holds points measured at different commits on different days.
+    A single file-level header would be a lie about most of the rows.
+    """
+    import subprocess
+
+    def sh(cmd):
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=15, shell=True)
+            return out.stdout.strip() or None
+        except Exception:
+            return None
+
+    return {
+        "gpu": sh("nvidia-smi --query-gpu=name,driver_version --format=csv,noheader"),
+        # sampled at process start: this card idles at 285 MHz against a 2100 MHz max, so a cold
+        # start and a thermally-loaded one are not the same machine
+        "sm_clock": sh("nvidia-smi --query-gpu=clocks.sm,temperature.gpu --format=csv,noheader"),
+        "jax": jax.__version__,
+        "git": sh("git rev-parse --short HEAD"),
+        "dirty": bool(sh("git status --porcelain")),
+        "x64": bool(jax.config.jax_enable_x64),
+        "when": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+
+
 def _peak_mb():
     try:
         return (jax.devices()[0].memory_stats() or {}).get("peak_bytes_in_use", 0) / 1e6
@@ -356,8 +430,7 @@ def main(case: str, idx: int) -> dict:
             # a timing on a non-converged solve is not a measurement of anything
             rel = float(jax.jit(check)(jnp.asarray(1.0)))
             extra["rel_residual"] = float(f"{rel:.3g}")
-            if not rel < 1e-6:
-                raise RuntimeError(f"forward solve did not converge (relative residual {rel:.3g})")
+            extra["residual_of"] = "||Au-b|| / ||b||"
         solve_ms = extra.pop("solve_ms")
         dofs = int(np.asarray(fem.operator.evaluate({"alpha": 1.0})[1]).size)
     else:
@@ -365,9 +438,14 @@ def main(case: str, idx: int) -> dict:
         sol = _value(fem.solve(**kw))
         solve_ms = (time.perf_counter() - t0) * 1e3
         dofs = int(np.size(sol)) // TRAJECTORY_STEPS.get(case, 1)
+        rel, how = _relative_residual(fem, sol, case)
+        extra = {"rel_residual": None if rel is None else float(f"{rel:.3g}"), "residual_of": how}
 
+    rel = extra.get("rel_residual")
     return {
         **extra,
+        "converged": None if rel is None else bool(rel < RESIDUAL_TOL),
+        **_provenance(),
         "case": case,
         "label": label,
         "mesh_size": ms,
