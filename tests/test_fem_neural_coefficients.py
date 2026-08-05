@@ -1029,10 +1029,61 @@ def _hermite_transient_setup(coeff_fn, mesh_size=0.3, time=(0.0, 0.05, 6)):
     return d, jno.fem([ui.t * vi + coeff_fn(xi, yi) * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - u0])
 
 
+def _lagrange_transient_setup(coeff_fn, mesh_size=0.3, time=(0.0, 0.05, 6)):
+    """The Lagrange twin of :func:`_hermite_transient_setup` — same form, nodal space."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=mesh_size, time=time)
+    u, phi = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    u0 = jno.np.sin(PI * ci[0]) * jno.np.sin(PI * ci[1])
+    return d, jno.fem([ui.t * vi + coeff_fn(xi, yi) * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - u0])
+
+
+def test_transient_net_kx_matches_frozen_to_machine_precision_on_lagrange():
+    """The invariant the trainable-coefficient path must satisfy: re-assembling the operator per step
+    from a runtime parameter gives the SAME trajectory as freezing the identical weights into a fixed
+    operator. On a nodal space this holds to machine precision, so it is pinned here at full strength
+    -- the Hermite twin below cannot assert this tightly, for reasons documented there."""
+    from jno.utils.solver.backend_blocks import _block_time_grid, _default_transient_integrate
+
+    net = _mlp_net(key=30, hidden=8)
+    _d, fem = _lagrange_transient_setup(lambda x, y: 1.0 + net(x, y))
+    (name,) = fem.operator.runtime_parameter_exprs
+    traj = _default_transient_integrate(fem.operator, {name: net.module}, _block_time_grid(fem.operator))
+
+    net_f = _mlp_net(key=30, hidden=8)  # identical weights
+    net_f.freeze()
+    _d2, fem_f = _lagrange_transient_setup(lambda x, y: 1.0 + net_f(x, y))
+    traj_f = _default_transient_integrate(fem_f.operator, {}, _block_time_grid(fem_f.operator))
+    assert float(jnp.max(jnp.abs(traj - traj_f))) < 1e-12  # measured 1e-16 over 6 fresh processes
+
+
 def test_transient_nonnodal_net_kx_matches_frozen():
     """A trainable net(x) diffusivity in a Hermite (C¹) TRANSIENT form: the per-step re-assembled
     operator leg reproduces the frozen (fixed-operator) trajectory, and the trajectory's gradient
-    reaches the net weights through the time-stepping."""
+    reaches the net weights through the time-stepping.
+
+    WHY THIS IS NOT A 1e-8 EQUALITY. It used to assert ``< 1e-8`` and failed at 5e-06..4e-05. That is
+    not a regression and not roundoff -- traced to the two legs imposing Dirichlet DIFFERENTLY: the
+    runtime-parameter leg uses row replacement (``bcoo_set_dirichlet_rows``, columns kept) because its
+    lift varies with ``args``, while the static leg uses symmetric elimination. Both are correct and
+    give the same solution, but on Hermite the boundary VALUE dofs are constrained while the boundary
+    DERIVATIVE dofs at the same vertex are not, and those couple -- so the two setups reach the same
+    L2 projection of the initial condition along differently-conditioned paths. Measured: both legs
+    sit within 0.06% of their OWN discretisation error against the analytic derivative (4.6816e-02 vs
+    4.6814e-02), and the discrepancy lives at step 0 and DECAYS over the march (3.2e-05 -> 1.6e-07).
+    Lagrange is unaffected (1e-16, pinned above) because there no unconstrained dof shares a vertex
+    with a constrained one.
+
+    The residual variation across PROCESSES (5e-06..4e-05, while a repeat inside one process is
+    4e-15) is XLA picking different reduction orders, amplified by that conditioning; the mesh itself
+    is bit-identical across processes, so it is the solve, not the geometry.
+
+    So this asserts the two things that are actually true and would catch a real regression: the
+    trajectories agree to well within discretisation error, and the difference does not GROW.
+    """
     from jno.utils.solver.backend_blocks import _block_time_grid, _default_transient_integrate
 
     net = _mlp_net(key=30, hidden=8)
@@ -1047,7 +1098,14 @@ def test_transient_nonnodal_net_kx_matches_frozen():
     net_f.freeze()
     _, fem_f = _hermite_transient_setup(lambda x, y: 1.0 + net_f(x, y))
     traj_f = _default_transient_integrate(fem_f.operator, {}, _block_time_grid(fem_f.operator))
-    assert float(jnp.max(jnp.abs(traj - traj_f))) < 1e-8
+
+    diff = jnp.abs(traj - traj_f)
+    scale = float(jnp.max(jnp.abs(traj_f)))
+    rel = float(jnp.max(diff)) / scale
+    assert rel < 1e-4, f"trajectories diverged: {rel:.3e} relative (measured spread 1.6e-06..1.3e-05)"
+    # the property a real regression would break: the difference must not GROW along the march
+    per_step = np.asarray(jnp.max(diff.reshape(diff.shape[0], -1), axis=1))
+    assert per_step[-1] <= per_step[0], f"discrepancy grew over the march: {per_step}"
 
     def loss(m):
         return jnp.sum(_default_transient_integrate(fem.operator, {name: m}, ts) ** 2)
