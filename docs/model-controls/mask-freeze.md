@@ -1,5 +1,5 @@
 # Mask & Freeze
 
-!!! info "Moved"
-    `.mask`, `.freeze` / `.unfreeze`, and `.constrain` are now documented under
+!!! info "See Operations"
+    `.mask`, `.freeze` / `.unfreeze`, and `.constrain` are documented under
     **[Operations → Parameter selection & freezing](../operations.md#parameter-selection-freezing)**.
