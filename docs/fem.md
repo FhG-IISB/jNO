@@ -806,6 +806,15 @@ def my_precond(ctx):                      # ctx.A, ctx.diag(), ctx.fem
 u = fem.solve(linear=jno.solve.cg(), precond=my_precond)
 ```
 
+Calling a solver **directly** (outside `fem.solve`) takes the preconditioner as `M=`, which is the
+*application* `v -> M⁻¹v`. A `jno.precond.*` spec is accepted there too and materialized against `A` on
+the way in — `jno.solve.cg()(A, b, M=jno.precond.jacobi())` — so the obvious spelling works instead of
+failing inside `jax.scipy.sparse.linalg` with "linear operator must be either a function or ndarray". A
+**bare callable** stays the applier and is never treated as a `ctx -> applier` factory: as a `precond=`
+slot it would be the factory, nothing about a callable tells the two apart, and guessing wrong would
+apply a preconditioner you did not ask for. Specs that need eager preparation (`form`, which assembles
+an auxiliary operator) still require `fem.solve(precond=...)` — a direct call has no owning FEM.
+
 If your callable is pure JAX it inherits `jit`/`vmap`/AD automatically. On the matrix-free **nonlinear**
 path the `precond` spec is materialized *per Newton/Picard linearization* against the JVP operator — so
 `form`, `inner(...)`, `chebyshev`, a pre-built `amg`, and their `block_diag`/`triangular` compositions
