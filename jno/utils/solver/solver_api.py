@@ -242,6 +242,15 @@ def _maybe_residual_check(op: LinearOperator, b, x, who: str, *, rtol: float = 1
 class LinearSolver:
     """A configured linear solver: ``solver(A, b, *, M=None, x0=None) -> x``.
 
+    ``M`` is the preconditioner **application** ``v -> M^-1 v``. A ``jno.precond.*`` **spec** is
+    accepted too and materialized against ``A`` on the way in, so ``jno.solve.cg()(A, b,
+    M=jno.precond.jacobi())`` works without spelling out ``materialize_precond``. A **bare callable**
+    is always taken as the applier, never as a ``ctx -> applier`` factory -- as a ``precond=`` slot it
+    would be the latter, and nothing about a callable distinguishes the two, so the ambiguous case
+    keeps the meaning the Krylov routines already give it. Specs needing eager preparation
+    (``jno.precond.form``, which assembles an auxiliary operator) still need ``fem.solve(precond=...)``:
+    a direct call has no owning FEM to prepare against.
+
     ``fn`` receives ``(op: LinearOperator, b, M, x0)``. ``traits`` documents transform support
     (``vmap: "native" | "sequential" | "no"``, ``jit: True | False``) so composition layers (and,
     later, the auto policy) can pick honestly instead of silently host-looping. ``jit=False`` marks
@@ -274,6 +283,16 @@ class LinearSolver:
         b = jnp.asarray(b).reshape(-1)
         if self.direct and M is not None:
             raise ValueError(f"jno.solve.{self.name} is a direct solver -- it takes no preconditioner (precond=).")
+        # ``M`` is the APPLIER ``v -> M^-1 v``, which is what the Krylov routines want. A caller who
+        # hands over a ``jno.precond.*`` SPEC instead means the obvious thing, so materialize it here
+        # rather than let it reach `jax.scipy.sparse.linalg` and fail there with "linear operator must
+        # be either a function or ndarray" -- an error that names neither the spec nor the fix.
+        # Only ``.materialize``-bearing specs convert: a BARE CALLABLE stays an applier, because as a
+        # `precond=` slot it would duck-type as a ``ctx -> applier`` factory and the two are
+        # indistinguishable by callability alone. Silently guessing wrong there would apply a
+        # preconditioner that is not the one asked for.
+        if M is not None and hasattr(M, "materialize"):
+            M = materialize_precond(M, PrecondContext(op, None))
         return self._fn(op, b, M=M, x0=x0)
 
     def __eq__(self, other):

@@ -339,3 +339,72 @@ def test_block_diagonal_solve_with_a_sparse_inner_solver():
     x = np.asarray(fem.solve(linear=jno.solve.fgmres(), precond=precond)).reshape(-1)
     rel = np.linalg.norm(np.asarray(A @ x) - np.asarray(b).reshape(-1)) / np.linalg.norm(np.asarray(b))
     assert rel < 1e-6, f"block-preconditioned Stokes did not converge: {rel:.2e}"
+
+
+# --------------------------------------------------------------------------------------------
+# calling a solver directly with M=: a SPEC materializes, a bare callable stays an applier
+# --------------------------------------------------------------------------------------------
+def _spd(n=40, seed=3):
+    """A small SPD system with a strongly varying diagonal, so preconditioning is observable."""
+    rng = np.random.default_rng(seed)
+    d = np.geomspace(1.0, 1e4, n)
+    Q = np.linalg.qr(rng.normal(size=(n, n)))[0]
+    dense = Q @ np.diag(d) @ Q.T
+    dense = 0.5 * (dense + dense.T)
+    import jax.experimental.sparse as jsp
+
+    return jsp.BCOO.fromdense(jnp.asarray(dense)), jnp.asarray(dense), jnp.asarray(rng.normal(size=n))
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        jno.precond.jacobi(),
+        jno.precond.inner(jno.solve.cg(tol=1e-10, maxiter=200)),
+        jno.precond.cached(jno.precond.jacobi()),
+    ],
+)
+def test_a_precond_spec_passed_as_M_is_materialized(spec):
+    """``solver(A, b, M=<spec>)`` is the obvious spelling. It used to reach
+    ``jax.scipy.sparse.linalg`` unconverted and die with 'linear operator must be either a function
+    or ndarray', naming neither the spec nor the fix."""
+    A, dense, b = _spd()
+    x = jno.solve.cg(tol=1e-12, maxiter=2000)(A, b, M=spec)
+    assert float(jnp.linalg.norm(x - jnp.linalg.solve(dense, b)) / jnp.linalg.norm(b)) < 1e-8
+
+
+def test_the_spec_gives_the_same_answer_as_materializing_it_by_hand():
+    """The convenience must be exactly the explicit spelling, not a different preconditioner."""
+    from jno.utils.solver.solver_api import LinearOperator, PrecondContext, materialize_precond
+
+    A, _dense, b = _spd()
+    spec = jno.precond.jacobi()
+    by_hand = materialize_precond(spec, PrecondContext(LinearOperator(A), None))
+    solve = jno.solve.cg(tol=1e-12, maxiter=2000)
+    np.testing.assert_allclose(np.asarray(solve(A, b, M=spec)), np.asarray(solve(A, b, M=by_hand)), rtol=1e-10)
+
+
+def test_a_bare_callable_M_is_an_applier_not_a_factory():
+    """The ambiguity that forces the rule. As a ``precond=`` SLOT a bare callable duck-types as a
+    ``ctx -> applier`` FACTORY; passed here it is the applier itself, and the two cannot be told
+    apart by callability. Guessing wrong would silently apply the wrong preconditioner, so only
+    ``.materialize``-bearing specs convert."""
+    A, dense, b = _spd()
+    diag = jnp.asarray(np.diag(np.asarray(dense)))
+    calls = []
+
+    def applier(v):  # v -> M^-1 v, the exact Jacobi inverse
+        calls.append(v)
+        return v / diag
+
+    x = jno.solve.cg(tol=1e-12, maxiter=2000)(A, b, M=applier)
+    assert calls, "the bare callable was never applied as M^-1 (treated as a factory?)"
+    assert float(jnp.linalg.norm(x - jnp.linalg.solve(dense, b)) / jnp.linalg.norm(b)) < 1e-8
+
+
+def test_a_direct_solver_still_refuses_a_spec():
+    """The direct/preconditioner guard runs BEFORE materialization, so the message stays the
+    targeted one rather than becoming an error from inside a spec."""
+    A, _dense, b = _spd()
+    with pytest.raises(ValueError, match="direct solver"):
+        jno.solve.lu()(A, b, M=jno.precond.jacobi())
