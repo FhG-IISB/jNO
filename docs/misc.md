@@ -9,7 +9,7 @@ Utilities that sit outside the core PINN / solver workflow.
 - **[Glossary](Glossary.md)** — terminology reference.
 
 !!! info "Looking for trackers, custom functions, trainable parameters, or the parameter Jacobian?"
-    Those are operations on traced expressions and now live under **[Operations](operations.md)** —
+    Those are operations on traced expressions and live under **[Operations](operations.md)** —
     see [Trackers](operations.md#trackers-labels-debugging),
     [Custom functions](operations.md#custom-functions),
     [Trainable scalar parameters](operations.md#trainable-scalar-parameters), and the

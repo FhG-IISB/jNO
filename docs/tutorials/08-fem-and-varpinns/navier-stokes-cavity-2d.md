@@ -49,9 +49,9 @@ textbook cavity structure.
 
 ## What to notice
 
-- **Navier–Stokes works now.** The convective term used to be silently misclassified as linear; it
-  is detected as nonlinear, so the convection is actually solved (Taylor–Hood P2/P1, autodiff
-  Jacobian). Steady and transient both work.
+- **The convection is actually solved.** The convective term is detected as nonlinear, so `fem.solve`
+  drives a Newton iteration on it (Taylor–Hood P2/P1, autodiff Jacobian) rather than dropping it into
+  a linear solve. Steady and transient both work.
 - **No hand-rolled stepping** — `fem.solve()` does the backward-Euler + Newton implicit stepping
   internally; you just read the returned trajectory.
 - **Verified by physics:** the flow reaches steady state (the last frames stop changing) and shows a

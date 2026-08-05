@@ -117,7 +117,7 @@ no term.
 > **Not yet:** the rest of the zoo in 3-D (RT / C¹ / plate are 2-D only); the *inhomogeneous* `n×E = g` on
 > N1E; higher order; other families (BDM, second-kind Nédélec, Bell); quad / non-triangular meshes; a
 > runtime parameter **or trainable neural coefficient** in a **host-assembled** RT-pressure / plate
-> boundary term (the N1E tangential-trace impedance / incident **surface** BC now *is* differentiable in a
+> boundary term (the N1E tangential-trace impedance / incident **surface** BC *is* differentiable in a
 > boundary-term parameter *and* a learned `net(x)` coefficient); the
 > constraint-consistent algebraic initial state at `t0` in the saddle-DAE transient (only the reported `t0`
 > algebraic value is affected).
@@ -142,13 +142,8 @@ problems whose natural space is *not* H¹. Pick one with the `space=` knob on `f
 > steady / transient / nonlinear paths (`tests/test_fem_hermite.py`).
 
 > **These families assemble sparsely.** Their *linear* operator is built element-by-element like every
-> other family. It used to be a **global dense `jacfwd`**, which was never a property of C⁰/C¹ elements
-> — the real cost was that form's `O(n_dofs × n_cells)` tangent, not the matrix. Measured on Argyris
-> before the change: a **3.1 MiB operator with a 2279 MiB peak** (741× the stored size) at 635 DOFs,
-> OOMing at the next refinement. Sparse reaches **22,511 DOFs** on the same 8 GB card — a 35× larger
-> problem — with peak memory growing as `n^1.0` instead of `n^1.7`. Morley and Hermite gain ~9× DOFs and
-> 15–29× less peak at matched size. The answers are unchanged: identical to the dense assembly at every
-> size tested.
+> other family, so peak memory grows as `n^1.0` and is set by the operator rather than by an
+> intermediate. Argyris reaches **22,511 DOFs** on an 8 GB card; Morley and Hermite go further still.
 >
 > The solve stays **sparse-direct** for these families. Going sparse would otherwise have handed 4th-order
 > biharmonic operators to the Jacobi-preconditioned BiCGStab that serves real elliptic systems, where it
@@ -156,8 +151,8 @@ problems whose natural space is *not* H¹. Pick one with the `space=` knob on `f
 > is still dense, as it is for every non-nodal family.
 
 > **Argyris** is the **C¹-conforming** quintic triangle (21 DOF) — the element for **4th-order PDEs**.
-> Across a shared edge both `u` and `∂u/∂n` are continuous, so `∫Δu·Δv` is now a *convergent* biharmonic
-> discretisation (the conformity caveat above is lifted). The reference dual basis is mapped to each
+> Across a shared edge both `u` and `∂u/∂n` are continuous, so `∫Δu·Δv` is a *convergent* biharmonic
+> discretisation (the conformity caveat above does not apply). The reference dual basis is mapped to each
 > physical cell by the affine-equivalence DOF-transform `M(cell)` (Kirby, *SMAI J. Comput. Math.* 4, 2018;
 > element: Argyris–Fried–Scharpf 1968); its **globally-oriented edge-normal DOF** is what makes it C¹ on an
 > *unstructured* mesh. Essential BCs are the two plate traces — `u(region) - g` (deflection) and
@@ -266,15 +261,14 @@ where they differ from the mesh vertices), `fem.operator`, and `fem.classificati
 > it exposes device memory but not the SM count.
 >
 > `chunk=False` restores the single `vmap`, and a positive int pins cells per chunk — as an upper
-> bound: whatever size is chosen (default or explicit) is then shrunk to the smallest one giving the
-> *same number of chunks*, so they come out even where they can. That is a compile-time fix, not a
-> memory one. `lax.map` emits the element kernel **twice** when the chunk does not divide the cell
-> count — once as the scan body, once unrolled for the tail — and on Taylor–Hood Stokes (21,138 cells,
-> chunk 8,192, so two full chunks and a 4,754 tail) the duplicate was 4.9× the element-program compile
-> time and **2.0× the whole build, 10.3 s → 5.3 s**, for a bit-identical answer. Evening the chunks
-> costs nothing in either direction: the chunk *count* is unchanged (no extra scan step) and each
-> chunk is no larger than requested (peak memory only falls). It cannot always divide — 100 items in
-> 3 chunks is 34+34+32 — and then it is simply a no-op.
+> bound: whatever size is chosen (default or explicit) is shrunk to the smallest one giving the *same
+> number of chunks*, so the chunks come out even where they can. That is a compile-time concern, not a
+> memory one: `lax.map` emits the element kernel **twice** when the chunk does not divide the cell
+> count — once as the scan body, once unrolled for the tail — and on a problem the size of Taylor–Hood
+> Stokes that duplicate doubles the build. Evening the chunks costs nothing in either direction: the
+> chunk *count* is unchanged (no extra scan step) and each chunk is no larger than requested (peak
+> memory only falls). It cannot always divide — 100 items in 3 chunks is 34+34+32 — and then it is
+> simply a no-op.
 >
 > `chunk=` lives on `jno.fem` rather than `fem.solve` because the steady-linear operator is assembled
 > *here*, before any solve.
@@ -566,11 +560,10 @@ an **oven/furnace cavity** where the meshed fluid is inside, pass `inward=True` 
 one another (see the *Oven* tutorial); for a meshed *medium* between solids use `medium_tags`.
 
 > **What blocks a ray (interface mode).** Every meshed region that is *not* listed in `medium_tags`
-> is opaque — including a solid that carries no radiating surface of its own. This used to be inferred
-> from the element tags, which made such a solid silently transparent; on a real furnace that let 46 %
-> of the pairs the visibility test called *visible* have chords passing through solid material, with no
-> error raised and a perfectly plausible `F`. The occluder set is now resolved once from the region
-> list and shared by the visibility test and the near-field refinement.
+> is opaque — including a solid that carries no radiating surface of its own. The occluder set is
+> resolved once from the region list, not inferred from element tags, and is shared by the visibility
+> test and the near-field refinement: a solid with no radiating surface still blocks, and a chord
+> through it is never counted as visible.
 
 > **Axisymmetric near field.** The ring kernel's azimuthal integrand peaks at `φ = 0` with width `d/r`,
 > so a uniform `n_phi` rule overshoots every near-touching pair (two surfaces meeting in a wedge, and
@@ -691,7 +684,7 @@ Pick by structure:
 | structure | solver | notes |
 |---|---|---|
 | SPD (Poisson, elasticity, mass) | `cg` | cheapest per iteration |
-| non-symmetric (advection, SUPG) | `bicgstab` / `gmres` | `bicgstab` == the historic default (with `jacobi()`) |
+| non-symmetric (advection, SUPG) | `bicgstab` / `gmres` | `bicgstab` with `jacobi()` is the default |
 | **iterative preconditioner** (inner Krylov, block/Schur) | `fgmres` | flexible right preconditioning — Saad, *SISSC* 14(2), 1993 |
 | symmetric **indefinite** (Stokes/Biot saddle, biharmonic) | `minres` | monotone residual, `O(1)` memory — Paige & Saunders, *SINUM* 12(4), 1975 |
 | SPD, batched/GPU-heavy | `chebyshev` | inner-product free (no reductions) — Golub & Varga 1961 |
@@ -707,10 +700,10 @@ preconditioner never changes the converged solution, only the speed, so specs ne
   AXPYs only, the GPU-era substitute for Gauss-Seidel/ILU smoothing, and a fixed *linear* map so it
   legally preconditions `cg`/`minres`. Spectrum bounds come from `lmin`/`lmax` when you pass them, else
   **both** ends are measured by Lanczos (Lanczos 1950, §II — the extreme Ritz values), at the same cost
-  as the power iteration it replaces. This matters because the polynomial is a contraction only *inside*
-  the interval it is fitted to: the older `lmin = lmax/30` guess, whenever the true ratio is smaller,
-  left the lowest modes outside that interval where the polynomial amplifies them. Without the optional
-  `matfree` package the guess remains the fallback.
+  as a power iteration on the top end alone. This matters because the polynomial is a contraction only
+  *inside* the interval it is fitted to: the `lmin = lmax/30` guess, whenever the true ratio is smaller,
+  leaves the lowest modes outside that interval where the polynomial amplifies them. Without the
+  optional `matfree` package that guess is the fallback.
 * `jno.precond.nystrom(rank=…)` — **randomized Nyström** low-rank preconditioner (Frangella, Tropp &
   Udell, *SIAM J. Matrix Anal. Appl.* 44(2), 2023, Alg. 2.1 and §3), the rung between `jacobi` and a
   multilevel method. Sketches `A` against a random `n × rank` matrix — exactly `rank` matvecs, no
@@ -778,21 +771,21 @@ solves `Jᵀ` directly too, not with a stalling Krylov). `damping` / `line_searc
 assembled tangent, so it does **not** apply to the matrix-free-only paths (a coupled-residual wrapper,
 complex) — those fail loud.
 
-**A direct `linear=` slot selects it for you, and is obeyed.** `lu`, `dense` and `amg` all need an assembled
-matrix, so pairing one with the *matrix-free* Newton cannot work — there is nothing to factorize. Passing
-`fem.solve(linear=jno.solve.lu(host=True))` on a nonlinear or transient problem therefore routes to the direct
-Newton, and that slot is the solver that actually runs on the assembled tangent (and on `Jᵀ` in the adjoint);
-`precond=` materializes against the same assembled operator. Which factorization you pick is not cosmetic
-here: on a 26-step Rayleigh–Bénard march (three fields, saddle, nonlinear) the default matrix-free
-Jacobi-BiCGStab takes 20.1 s, `linear=jno.solve.lu()` 7.6 s and `linear=jno.solve.lu(host=True)` **3.1 s**, all
-to the same 2.8e-07 per-step Newton residual. Writing an *explicit* matrix-free `nonlinear=` alongside a direct
-`linear=` is contradictory and raises rather than picking one silently.
+**A direct `linear=` slot selects it.** `lu`, `dense` and `amg` all need an assembled matrix, so pairing one
+with the *matrix-free* Newton has nothing to factorize. `fem.solve(linear=jno.solve.lu(host=True))` on a
+nonlinear or transient problem therefore routes to the direct Newton, and that slot is the solver that runs on
+the assembled tangent (and on `Jᵀ` in the adjoint); `precond=` materializes against the same assembled
+operator. Which factorization you pick is not cosmetic here: on a 26-step Rayleigh–Bénard march (three fields,
+saddle, nonlinear) the default matrix-free Jacobi-BiCGStab takes 20.1 s, `linear=jno.solve.lu()` 7.6 s and
+`linear=jno.solve.lu(host=True)` **3.1 s**, all to the same 2.8e-07 per-step Newton residual. An *explicit*
+matrix-free `nonlinear=` alongside a direct `linear=` is contradictory and raises rather than picking one
+silently.
 
 > Limits, since they are not obvious. This routing only fires when the *linear* slot is direct — a
-> `precond=` that needs an assembled matrix (`jacobi`, an unbuilt `amg`) still raises where it is
-> materialized, as before. `picard()` has no assembled-tangent form: its linearization is the lagged
+> `precond=` that needs an assembled matrix (`jacobi`, an unbuilt `amg`) raises where it is
+> materialized. `picard()` has no assembled-tangent form: its linearization is the lagged
 > *matrix-free* JVP, so `nonlinear=picard(), linear=lu()` raises — moving to `newton(direct=True)`
-> there changes the algorithm, not just the solver. And the direct Newton still needs the assembler to
+> there changes the algorithm, not just the solver. And the direct Newton needs the assembler to
 > supply a tangent, so the matrix-free-only routes (a coupled-residual wrapper) fail loud either way.
 
 **User extension** is duck-typed — a linear solver is any `fn(A, b, *, M=None, x0=None) -> x` with `A` a
@@ -808,12 +801,11 @@ u = fem.solve(linear=jno.solve.cg(), precond=my_precond)
 
 Calling a solver **directly** (outside `fem.solve`) takes the preconditioner as `M=`, which is the
 *application* `v -> M⁻¹v`. A `jno.precond.*` spec is accepted there too and materialized against `A` on
-the way in — `jno.solve.cg()(A, b, M=jno.precond.jacobi())` — so the obvious spelling works instead of
-failing inside `jax.scipy.sparse.linalg` with "linear operator must be either a function or ndarray". A
-**bare callable** stays the applier and is never treated as a `ctx -> applier` factory: as a `precond=`
-slot it would be the factory, nothing about a callable tells the two apart, and guessing wrong would
-apply a preconditioner you did not ask for. Specs that need eager preparation (`form`, which assembles
-an auxiliary operator) still require `fem.solve(precond=...)` — a direct call has no owning FEM.
+the way in — `jno.solve.cg()(A, b, M=jno.precond.jacobi())`. A **bare callable** is always the applier,
+never a `ctx -> applier` factory: as a `precond=` slot it would be the factory, nothing about a callable
+tells the two apart, and guessing wrong would apply a preconditioner you did not ask for. Specs that
+need eager preparation (`form`, which assembles an auxiliary operator) require `fem.solve(precond=...)`
+— a direct call has no owning FEM.
 
 If your callable is pure JAX it inherits `jit`/`vmap`/AD automatically. On the matrix-free **nonlinear**
 path the `precond` spec is materialized *per Newton/Picard linearization* against the JVP operator — so
@@ -827,12 +819,12 @@ each implicit step of a nonlinear block. Second-order-in-time (`u_tt`) flows thr
 block. Each step warm-starts from the previous state (so `x0=` is rejected).
 
 > **`lu(host=True)` factorizes a constant step operator once, not once per step.** The step matrix is
-> already formed once above; the host factorization is now cached on the operator's *content*, so a
-> march that solves against the same matrix every step pays one factorization for the whole trajectory
-> — and the transpose solve reuses it too, so the adjoint pass adds none. Measured on a 51-step heat
-> march, whole-solve wall clock: 1.55× at 8,355 DOFs and **2.9× at 23,934** (50 factorizations → 1),
-> trajectories bit-identical. The gain grows with mesh size because factorization cost grows faster
-> than the per-step solve — at 513 DOFs it is only 1.05×, where the factorization is sub-millisecond.
+> formed once (above), and the host factorization is cached on the operator's *content*, so a march
+> that solves against the same matrix every step pays one factorization for the whole trajectory — and
+> the transpose solve reuses it, so the adjoint pass adds none. On a 51-step heat march that is worth
+> 1.55× of whole-solve wall clock at 8,355 DOFs and **2.9× at 23,934**. The gain grows with mesh size,
+> because factorization cost grows faster than the per-step solve; at 513 DOFs it is 1.05×, where the
+> factorization is sub-millisecond.
 >
 > What it does **not** help: a *nonlinear* march, or any Newton loop. There the tangent's values
 > change every iteration, so every call legitimately misses and pays a content hash (~1–2% of a

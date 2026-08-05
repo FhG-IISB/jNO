@@ -1,5 +1,5 @@
 # Diagnostics
 
-!!! info "Moved"
-    `.summary`, `.dont_show`, and `.reset` are now documented under
+!!! info "See Operations"
+    `.summary`, `.dont_show`, and `.reset` are documented under
     **[Operations → Diagnostics, sweeps & deployment](../operations.md#diagnostics-sweeps-deployment)**.
