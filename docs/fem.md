@@ -65,9 +65,28 @@ u_h = fem.solve()          # matrix-free default; slots pick anything else (see 
   1D system is parametric too (steady, linear and nonlinear) — the block element kernels publish the
   same `volume_vars` / neural-table keys the single-field ones do, so the shared evaluator reads them
   regardless of field layout. Not wired in 1D: a parameter on a coupled *transient* block, which is
-  assembled once and would freeze the parameter at its placeholder (it fails loud). A **non-nodal** family (`"RT"`, `"N1curl"`, `"Argyris"`,
-  `"Morley"`, `"Hermite"`) is defined on triangles/tets and has no 1D counterpart — asking for one on a
-  line raises a clear error.
+  assembled once and would freeze the parameter at its placeholder (it fails loud). The vector and
+  triangle-only non-nodal families (`"RT"`, `"N1curl"`, `"Argyris"`, `"Morley"`) have no 1D counterpart
+  and raise a clear error on a line.
+* **The beam element (`space="Hermite"` in 1D)** — the C¹ cubic Hermite, i.e. the classical
+  Euler-Bernoulli beam element and the 1D counterpart of Argyris/Morley on triangles. Two dofs per
+  vertex, `(w, dw/dx)`, laid out `2*node` / `2*node + 1`; sharing the slope dof across elements is what
+  makes the space C¹, so the fourth-order operator has a well-defined weak form:
+
+  ```python
+  u, v = d.fem_symbols(space="Hermite")
+  ui, vi = u.bind(x=xi), v.bind(x=xi)
+  lap = jno.np.laplacian
+  fem = jno.fem([EI * lap(ui, [xi]) * lap(vi, [xi]) - q * vi,   # EI w'''' = q
+                 u(xl) - 0.0, u.dn(xl) - 0.0])                  # clamped at the left end
+  ```
+
+  The classical supports are just *which* of a node's two dofs are pinned — `u(region)` alone is
+  **simply supported**, adding `u.dn(region)` makes it **clamped**, `u.dn` alone is **guided**, and
+  neither is **free**. The slope condition rides the same `u.dn` essential-rotation channel the 2D C¹
+  plate families use, so a beam and a plate are clamped by the same notation. The element is *nodally
+  exact* for a uniform load: a cantilever gives `qL⁴/8` at the tip and `qL³/6` for the tip slope to
+  machine precision, simply supported gives `5qL⁴/384` at mid-span and clamped-clamped `qL⁴/384`.
 * **Complex forms in 1D** — a `1j` anywhere in a 1D weak form routes through the same real-equivalent
   Re/Im split the 2D/3D and non-nodal paths use, so 1D Helmholtz-type problems (complex coefficient,
   complex source, or both) solve and return a complex `u`. A runtime parameter inside the complex
@@ -135,7 +154,8 @@ no term.
 > and the curl is taken from the physical gradient. The essential **PEC wall** `n×E = 0` is supported,
 > written `u.vector.cross(d.variable(region, normals=True))` (facet-based; it pins every boundary-face edge
 > DOF of the region). On a tet mesh **only N1E is wired** — RT / P0 / Hermite / Argyris / Morley remain
-> 2-D-triangle only and raise.
+> 2-D-triangle only and raise. On a **line** mesh `"Hermite"` selects the 1D cubic beam element
+> (see above); the other families raise.
 >
 > **Not yet:** the rest of the zoo in 3-D (RT / C¹ / plate are 2-D only); the *inhomogeneous* `n×E = g` on
 > N1E; higher order; other families (BDM, second-kind Nédélec, Bell); quad / non-triangular meshes; a

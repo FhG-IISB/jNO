@@ -3575,17 +3575,23 @@ def _fem_impl(
     # ---- non-nodal element families (RT / Nedelec / Argyris): native push-forward assembler ----
     # These families need a basis push-forward, so -- like the 1D path -- assemble natively and reuse
     # the shared integrand evaluator (which carries space-guarded branches for the physical basis).
-    if _nonnodal_families := (_trial_spaces(constraints) - {"Lagrange"}):
+    _nonnodal_families = _trial_spaces(constraints) - {"Lagrange"}
+    # A 1D Hermite field is NOT routed here: its element is the classical cubic beam, which the 1D
+    # assembler builds directly (no push-forward — a straight interval has a constant Jacobian).
+    _hermite_1d = getattr(domain, "dimension", None) == 1 and _nonnodal_families == {"Hermite"}
+    if _nonnodal_families and not _hermite_1d:
         # The push-forward assembler is built on triangles/tets, so a non-nodal family on a LINE mesh
         # died with a bare ``KeyError: 'triangle'`` from the topology lookup — a cryptic failure for a
-        # perfectly reasonable request. Name the dimension mismatch instead. (RT/N1curl are vector
-        # H(div)/H(curl) spaces and Argyris/Morley are triangle elements: none has a 1D counterpart.)
-        if getattr(domain, "dimension", None) == 1:
+        # perfectly reasonable request. Name the dimension mismatch instead. Hermite is the exception:
+        # its 1D counterpart is the classical cubic beam element, assembled by the 1D path below.
+        # (RT/N1curl are vector H(div)/H(curl) spaces and Argyris/Morley are triangle elements.)
+        if getattr(domain, "dimension", None) == 1 and _nonnodal_families != {"Hermite"}:
+            _no1d = sorted(_nonnodal_families - {"Hermite"})
             raise NotImplementedError(
-                f"jno.fem: the non-nodal element famil{'y' if len(_nonnodal_families) == 1 else 'ies'} "
-                f"{sorted(_nonnodal_families)} {'is' if len(_nonnodal_families) == 1 else 'are'} defined on "
-                "triangles/tets and has no 1D counterpart — a 1D line domain supports Lagrange "
-                "(order 1 and 2). Use a 2D/3D domain, or space='Lagrange' in 1D."
+                f"jno.fem: the non-nodal element famil{'y' if len(_no1d) == 1 else 'ies'} {_no1d} "
+                f"{'is' if len(_no1d) == 1 else 'are'} defined on triangles/tets and "
+                "has no 1D counterpart — a 1D line domain supports Lagrange (any order) and Hermite "
+                "(the C1 cubic beam element). Use a 2D/3D domain, or space='Lagrange'/'Hermite' in 1D."
             )
         from .utils.solver.fem_nonnodal import assemble_fem_nonnodal
 
@@ -3750,9 +3756,13 @@ def _fem_impl(
                 ic_residuals,
                 vec=vec,
                 # a P2 mass term is degree 4, so the rule must be raised with the order (mirrors the
-                # 2D/3D path); too few Gauss points would under-integrate the mass silently
-                quad_degree=max(quad_degree, 2 * _order_1d),
+                # 2D/3D path); too few Gauss points would under-integrate the mass silently. The
+                # Hermite beam's stiffness ∫w''v'' is degree 2 in xi but its mass ∫wv is degree 6, so
+                # it needs the same rule a P3 Lagrange field would.
+                quad_degree=max(quad_degree, 6 if _hermite_1d else 2 * _order_1d),
                 order=_order_1d,
+                space="Hermite" if _hermite_1d else "Lagrange",
+                rotation_bcs=rotation_bcs,
             )
         # a second-order SINGLE-FIELD 1D block carries the augmented state y=[u; v] (size 2N) -> field
         # offsets [0, N, 2N]. The coupled route already returned its own augmented layout.

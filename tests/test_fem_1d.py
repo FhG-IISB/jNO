@@ -1536,11 +1536,14 @@ def test_coupled_1d_periodic_recovers_manufactured():
     assert abs(sol[mid] - sol[hi - 1]) < 1e-10
 
 
-@pytest.mark.parametrize("space", ["Hermite", "Argyris", "Morley", "RT", "N1curl"])
+@pytest.mark.parametrize("space", ["Argyris", "Morley", "RT", "N1curl"])
 def test_nonnodal_space_on_a_line_fails_loud(space):
     """The non-nodal push-forward assembler is built on triangles/tets, so asking for one of its
     families on a LINE mesh died with a bare ``KeyError: 'triangle'`` from the topology lookup — a
-    cryptic failure for a reasonable request. It must name the dimension mismatch instead."""
+    cryptic failure for a reasonable request. It must name the dimension mismatch instead.
+
+    Hermite is deliberately absent from this list: its 1D counterpart is the cubic beam element,
+    which the 1D assembler builds (see the beam section below)."""
     d = _line(0.2)
     u, phi = d.fem_symbols(space=space)
     xi = d.variable("interior", split=True)[0]
@@ -1548,6 +1551,124 @@ def test_nonnodal_space_on_a_line_fails_loud(space):
     ui, vi = u.bind(x=xi), phi.bind(x=xi)
     with pytest.raises(NotImplementedError, match="no 1D counterpart"):
         jno.fem([ui.x * vi.x - vi, u(xb) - 0.0])
+
+
+# ==========================================================================
+# Hermite C1 cubic — the Euler-Bernoulli beam element
+# ==========================================================================
+def _beam(ms=0.1, q=1.0, EI=1.0, left="clamped", right="free"):
+    """``EI w'''' = q`` on [0,1] as ``int EI w'' v'' - int q v``, on the C1 cubic Hermite space.
+
+    ``left``/``right`` are the classical supports, which on this space are just *which of the node's
+    two dofs* are pinned: ``clamped`` = deflection + slope, ``pinned`` = deflection only,
+    ``guided`` = slope only, ``free`` = neither."""
+    lap = jno.np.laplacian
+    d = _line(ms)
+    u, phi = d.fem_symbols(space="Hermite")
+    xi = d.variable("interior", split=True)[0]
+    ui, vi = u.bind(x=xi), phi.bind(x=xi)
+    cons = [EI * lap(ui, [xi]) * lap(vi, [xi]) - q * vi]
+    for end, kind in (("left", left), ("right", right)):
+        xe = d.variable(end, split=True)[0]
+        if kind in ("clamped", "pinned"):
+            cons.append(u(xe) - 0.0)
+        if kind in ("clamped", "guided"):
+            cons.append(u.dn(xe) - 0.0)
+    return d, jno.fem(cons)
+
+
+def _beam_fields(d, fem):
+    """``(x, w, theta)`` sorted by x — the deflection and slope dofs interleaved as ``2n`` / ``2n+1``."""
+    sol = np.asarray(fem.solve()).reshape(-1)
+    x = np.asarray(d.mesh.points)[:, 0]
+    o = np.argsort(x)
+    return x[o], sol[0::2][o], sol[1::2][o]
+
+
+def test_hermite_beam_dof_layout():
+    """The C1 cubic carries **two** dofs per vertex, ``(w, dw/dx)``, laid out node-major as
+    ``2*node`` / ``2*node + 1``. Sharing the slope dof between neighbouring elements is what makes the
+    space C1 — which is what gives the fourth-order operator a well-defined ``int w'' v''`` weak form.
+    ``fem.points`` repeats each vertex so it lines up entry-for-entry with the solution vector."""
+    d, fem = _beam(0.1)
+    n_vert = int(np.asarray(d.mesh.points).shape[0])
+    assert fem.dofs == 2 * n_vert
+    pts = np.asarray(fem.points).reshape(-1)
+    assert pts.shape[0] == 2 * n_vert
+    assert np.allclose(pts[0::2], pts[1::2]), "both dofs of a node live at that node"
+    assert np.allclose(np.sort(pts[0::2]), np.sort(np.asarray(d.mesh.points)[:, 0]))
+
+
+def test_hermite_beam_cantilever_matches_analytic():
+    """The headline case: a cantilever under uniform load. Clamped at x=0 (deflection AND slope pinned),
+    free at x=1 (neither). The cubic Hermite beam is *nodally exact* for a uniform load, so both the tip
+    deflection ``qL^4/8`` and the tip slope ``qL^3/6`` come out to machine precision — and the whole
+    nodal deflection matches the analytic quartic ``q x^2 (6 - 4x + x^2) / 24``.
+
+    The tip slope is the assertion a C0 space could not pass: it is a *solved dof*, not a
+    post-processed difference."""
+    d, fem = _beam(0.1, q=1.0, EI=1.0, left="clamped", right="free")
+    x, w, th = _beam_fields(d, fem)
+    assert abs(w[-1] - 1.0 / 8.0) < 1e-10, f"tip deflection {w[-1]:.8f} vs qL^4/8"
+    assert abs(th[-1] - 1.0 / 6.0) < 1e-10, f"tip slope {th[-1]:.8f} vs qL^3/6"
+    assert abs(w[0]) < 1e-12 and abs(th[0]) < 1e-12, "the clamped root must pin BOTH dofs"
+    exact = (x**2) * (6.0 - 4.0 * x + x**2) / 24.0
+    assert np.max(np.abs(w - exact)) < 1e-10
+
+
+@pytest.mark.parametrize(
+    "left,right,mid_exact",
+    [("pinned", "pinned", 5.0 / 384.0), ("clamped", "clamped", 1.0 / 384.0)],
+)
+def test_hermite_beam_supports_change_the_answer(left, right, mid_exact):
+    """The two other classical supports, which differ *only* in whether the slope dof is pinned:
+    simply supported gives ``5qL^4/384`` at mid-span, clamped-clamped gives ``qL^4/384`` — a factor of
+    five. Pinning the wrong dof (or silently pinning both) would land on the other value."""
+    d, fem = _beam(0.1, left=left, right=right)
+    x, w, _th = _beam_fields(d, fem)
+    mid = int(np.argmin(np.abs(x - 0.5)))
+    assert abs(w[mid] - mid_exact) < 1e-10, f"{left}/{right} mid-span {w[mid]:.8f} vs {mid_exact:.8f}"
+
+
+def test_hermite_beam_free_end_is_genuinely_free():
+    """A free end carries no essential condition at all, so both its dofs are solved. Contrast with the
+    clamped end of the same beam: this is what pins that the slope condition is *optional* rather than
+    silently applied everywhere."""
+    d, fem = _beam(0.1, left="clamped", right="free")
+    _x, w, th = _beam_fields(d, fem)
+    assert abs(w[-1]) > 0.1 and abs(th[-1]) > 0.1, "the free end moved and rotated"
+
+
+def test_hermite_beam_guided_end_pins_the_slope_only():
+    """A guided (sliding) end pins the slope but not the deflection — the ``u.dn`` condition alone.
+    Extreme on the BC axis: it must leave ``w`` free while forcing ``dw/dx = 0`` there."""
+    d, fem = _beam(0.1, left="clamped", right="guided")
+    _x, w, th = _beam_fields(d, fem)
+    assert abs(th[-1]) < 1e-12, "the guided end must have zero slope"
+    assert abs(w[-1]) > 1e-3, "the guided end must still deflect"
+
+
+def test_hermite_beam_element_couples_four_dofs_and_stays_sparse():
+    """Structure: a Hermite element couples its 4 dofs (both dofs of each endpoint), so the operator is
+    banded and its nnz stays linear in the dof count — the element scatter must not have densified for
+    the extra dof per node."""
+    d, fem = _beam(0.005)
+    A = fem.operator[0]
+    n = A.shape[0]
+    assert hasattr(A, "indices"), "the beam must assemble sparsely too"
+    assert int(A.nse) < 20 * n, f"nnz={int(A.nse)} is not linear in n={n}"
+    dense = _dense(A)
+    # dof 2i couples only to 2i-3 .. 2i+3 (its own node's pair and the neighbours')
+    rows, cols = np.nonzero(np.abs(dense) > 1e-12)
+    assert np.max(np.abs(rows - cols)) <= 3, "the beam operator is not banded at bandwidth 3"
+
+
+def test_hermite_beam_is_symmetric():
+    """``int EI w'' v''`` is a symmetric bilinear form, and the Dirichlet elimination keeps it so —
+    the same invariant the Lagrange path holds."""
+    d, fem = _beam(0.1)
+    A = _dense(fem.A)
+    assert np.allclose(A, A.T, atol=1e-10)
 
 
 # ==========================================================================

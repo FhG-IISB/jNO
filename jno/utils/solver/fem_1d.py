@@ -54,7 +54,7 @@ derivative, since a 0D facet has no element to differentiate over.
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, NamedTuple, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -172,6 +172,42 @@ def _region_node_ids(domain: Any, region: str) -> List[int]:
     return list(np.where(hits)[0])
 
 
+def hermite_dirichlet_dofs(domain: Any, dirichlet_values: Dict[str, Any], rotation_bcs: Any) -> List[Tuple[int, float]]:
+    """``(global_dof, value)`` pairs for a 1D Hermite (beam) space.
+
+    Each vertex carries two dofs, ``2*nid`` (the deflection ``w``) and ``2*nid + 1`` (the slope
+    ``dw/dx``), so the two classical beam supports are two *different* conditions on the same node:
+
+    * ``u(region) - g``      pins the deflection only  -> **simply supported** (a pinned end)
+    * plus ``u.dn(region) - s`` pins the slope too     -> **clamped** (an encastré end)
+    * neither                                          -> **free**
+    * slope only                                       -> **guided** (sliding)
+
+    The slope condition arrives through the same ``u.dn`` essential-rotation channel the 2D C¹ plate
+    families use, so a beam and a plate are clamped by the same notation. In 1D the outward normal at
+    an endpoint is ``-1`` at the left and ``+1`` at the right, so a prescribed ``du/dn`` is signed;
+    ``s = 0`` (the overwhelmingly common case) is unaffected."""
+    from ..._fem import _eval_value_node_at
+
+    pts = np.asarray(domain.mesh.points)
+    xs = pts[:, 0]
+    pairs: List[Tuple[int, float]] = []
+    for region, value in dirichlet_values.items():
+        for nid in _region_node_ids(domain, region):
+            g = float(value(pts[nid])) if callable(value) else float(value)
+            pairs.append((2 * int(nid), g))
+    x_lo, x_hi = float(np.min(xs)), float(np.max(xs))
+    for _field_key, region, value_node in rotation_bcs or []:
+        for nid in _region_node_ids(domain, region):
+            raw = _eval_value_node_at(value_node, np.asarray(pts[nid]).reshape(1, -1))
+            s = float(np.asarray(raw).reshape(-1)[0])
+            # du/dn -> du/dx: the outward normal is -1 at the left end, +1 at the right
+            x = float(xs[nid])
+            n_out = -1.0 if abs(x - x_lo) <= abs(x - x_hi) else 1.0
+            pairs.append((2 * int(nid) + 1, n_out * s))
+    return pairs
+
+
 def complex_dirichlet_regions(domain: Any, dirichlet_values: Dict[str, Any]) -> List[str]:
     """Regions whose essential value has a non-zero imaginary part.
 
@@ -251,8 +287,12 @@ def _param_context(volume_terms, boundary_terms):
     return tags, fields, slots, neural_operator_exprs(exprs, slots)
 
 
-def dof_layout_1d(domain: Any, order: int):
-    """``(n_dof_nodes, dof_coords)`` for a 1D Lagrange space of ``order``.
+def dof_layout_1d(domain: Any, order: int, space: str = "Lagrange"):
+    """``(n_dof_nodes, dof_coords)`` for a 1D space.
+
+    ``space="Hermite"`` carries two dofs per vertex, ``(w, dw/dx)``, so its dof coordinates are the
+    vertex coordinates *repeated* — both dofs of a node live at that node, and ``fem.points`` must
+    line up entry-for-entry with the solution vector.
 
     P1 dofs are the mesh vertices. A degree-``k`` space adds ``k-1`` **interior** dofs per element,
     laid out after all vertices and element-major, so a vertex dof keeps its mesh-node index — which
@@ -260,6 +300,8 @@ def dof_layout_1d(domain: Any, order: int):
     hence always a vertex). ``dof_coords`` is what ``fem.points`` must report: the solution vector
     lives on these, not on the linear mesh the domain keeps."""
     verts = np.asarray(domain.mesh.points)[:, 0]
+    if space == "Hermite":
+        return 2 * int(verts.shape[0]), np.repeat(verts, 2).reshape(-1, 1)
     k = int(order)
     if k == 1:
         return int(verts.shape[0]), verts.reshape(-1, 1)
@@ -319,6 +361,90 @@ def _neural_local_table(neural_slots, args):
     return neural_local_table(neural_slots, args)
 
 
+class _LineElement(NamedTuple):
+    """What the 1D residual builder needs to know about an element family.
+
+    ``elem_nodes`` maps each element to its global dof-node ids; ``n_dof_nodes`` sizes the space;
+    ``shape_at(h)`` returns ``(N, dN_dx, d2N_dx2)`` for an element of length ``h``, each
+    ``(n_quad, nen)``, with ``d2N_dx2`` ``None`` for a family that tabulates no second derivative.
+
+    Lagrange and Hermite differ only in these three things, so they share one scatter and one element
+    Jacobian rather than each carrying its own copy — the drift this codebase keeps rediscovering.
+    ``shape_at`` takes ``h`` because a Hermite slope DOF is *physical* (``dw/dx``), so its basis
+    function carries the element length; for Lagrange only the gradient scales.
+    """
+
+    elem_nodes: Any
+    n_dof_nodes: int
+    shape_at: Any
+
+
+def _lagrange_element_1d(cells, n_vert: int, n_elem: int, gp, order: int) -> _LineElement:
+    """The degree-``order`` Lagrange line element (P1, P2, P3, ...)."""
+    N, dN_dxi = _line_shape(gp, order)
+    return _LineElement(
+        elem_nodes=_elem_dof_nodes_1d(cells, n_vert, order),
+        n_dof_nodes=n_vert + n_elem * (order - 1),
+        shape_at=lambda h: (N, dN_dxi / h, None),
+    )
+
+
+def _hermite_element_1d(cells, n_vert: int, gp) -> _LineElement:
+    r"""The C¹ cubic **Hermite** line element — the classical Euler-Bernoulli beam element.
+
+    Two DOFs per vertex, ``(w, dw/dx)``, laid out node-major as ``dof = 2*node + {0: value,
+    1: slope}``. Sharing the slope DOF between neighbouring elements is what makes the space C¹, so a
+    fourth-order operator (``EI w'''' = q``) has a well-defined ``\int w'' v''`` weak form on it —
+    the 1D counterpart of Argyris/Morley on triangles.
+
+    Shape functions on ``xi in [0,1]`` with ``x = x0 + h*xi`` (Hermite 1877; standard beam element,
+    e.g. Hughes, *The Finite Element Method*, §1.16)::
+
+        N1 = 1 - 3xi^2 + 2xi^3        N2 = h (xi - 2xi^2 + xi^3)
+        N3 = 3xi^2 - 2xi^3            N4 = h (xi^3 - xi^2)
+
+    ``N2``/``N4`` carry ``h`` because their DOF is the physical slope, not ``dw/dxi``.
+    """
+    xi = gp
+    one = jnp.ones_like(xi)
+
+    def shape_at(h):
+        N = jnp.stack(
+            [
+                1.0 - 3.0 * xi**2 + 2.0 * xi**3,
+                h * (xi - 2.0 * xi**2 + xi**3),
+                3.0 * xi**2 - 2.0 * xi**3,
+                h * (xi**3 - xi**2),
+            ],
+            axis=-1,
+        )
+        dN = jnp.stack(  # d/dx = (1/h) d/dxi
+            [
+                (-6.0 * xi + 6.0 * xi**2) / h,
+                one - 4.0 * xi + 3.0 * xi**2,
+                (6.0 * xi - 6.0 * xi**2) / h,
+                3.0 * xi**2 - 2.0 * xi,
+            ],
+            axis=-1,
+        )
+        d2N = jnp.stack(  # d2/dx2 = (1/h^2) d2/dxi2
+            [
+                (-6.0 + 12.0 * xi) / h**2,
+                (-4.0 + 6.0 * xi) / h,
+                (6.0 - 12.0 * xi) / h**2,
+                (6.0 * xi - 2.0) / h,
+            ],
+            axis=-1,
+        )
+        return N, dN, d2N
+
+    # element -> its 4 global dofs: [w0, theta0, w1, theta1]
+    elem_nodes = jnp.stack([2 * cells[:, 0], 2 * cells[:, 0] + 1, 2 * cells[:, 1], 2 * cells[:, 1] + 1], axis=1).astype(
+        jnp.int32
+    )
+    return _LineElement(elem_nodes=elem_nodes, n_dof_nodes=2 * n_vert, shape_at=shape_at)
+
+
 def _make_residual(
     domain: Any,
     volume_terms: List[Any],
@@ -328,6 +454,7 @@ def _make_residual(
     vec: int,
     quad_degree: int,
     order: int = 1,
+    space: str = "Lagrange",
     runtime_parameter_tags: Tuple[str, ...] = (),
     field_param_names: Any = frozenset(),
     neural_slots: Any = None,
@@ -338,26 +465,31 @@ def _make_residual(
     by the caller (symmetric elimination for the linear ``(A, b)``, row-replacement
     for the nonlinear residual).
 
-    ``order`` selects LINE2 (P1) or LINE3 (P2). ``n_nodes`` is the caller's *vertex* count; the
-    residual is sized by the element's dof count, which for P2 adds one midpoint dof per element
-    (see :func:`n_dofs_1d`)."""
+    ``order`` selects the Lagrange degree; ``space="Hermite"`` selects the C¹ cubic beam element
+    instead. ``n_nodes`` is the caller's *vertex* count; the residual is sized by the element's own
+    dof count (see :class:`_LineElement`)."""
     verts = jnp.asarray(domain.mesh.points)[:, 0]
     cells = jnp.asarray(domain.mesh.cells_dict["line"], dtype=jnp.int32)  # (n_elem, 2) — the GEOMETRY
     n_vert, n_elem = int(verts.shape[0]), int(cells.shape[0])
     order = int(order)
     gp, gw = _line_quadrature(quad_degree)
-    N, dN_dxi = _line_shape(gp, order)
     N_geom, _ = _line_shape(gp, 1)  # geometry stays LINE2: a straight element with a centred
     # midpoint has a constant Jacobian h, so the linear map is EXACT — subparametric, not an
     # approximation, and it keeps `h` a scalar per element.
     ctx = getattr(domain, "context", {}) or {}
     comp_offsets = jnp.arange(vec)
 
-    # A degree-k space adds k-1 interior dofs per element. Layout: ALL vertices, then the interior
-    # dofs element-major — so a vertex dof keeps its mesh-node index and the boundary/Dirichlet node
-    # lookup needs no order awareness (a 1D boundary is an endpoint, hence always a vertex).
-    elem_nodes = _elem_dof_nodes_1d(cells, n_vert, order)
-    n_nodes = n_vert + n_elem * (order - 1)  # the residual is sized by DOF nodes, not mesh vertices
+    # A degree-k Lagrange space adds k-1 interior dofs per element (layout: ALL vertices, then the
+    # interior dofs element-major, so a vertex dof keeps its mesh-node index and the
+    # boundary/Dirichlet node lookup needs no order awareness — a 1D boundary is an endpoint, hence
+    # always a vertex). Hermite instead carries two dofs per vertex.
+    element = (
+        _hermite_element_1d(cells, n_vert, gp)
+        if space == "Hermite"
+        else _lagrange_element_1d(cells, n_vert, n_elem, gp, order)
+    )
+    elem_nodes = element.elem_nodes
+    n_nodes = element.n_dof_nodes  # the residual is sized by DOF nodes, not mesh vertices
 
     # element-local -> global DOF map, node-major: dof = node*vec + comp
     cell_dofs = (elem_nodes[:, :, None] * vec + comp_offsets[None, None, :]).reshape(n_elem, -1)  # (n_elem, nen*vec)
@@ -376,22 +508,22 @@ def _make_residual(
     def _neural_table(args):
         return _neural_local_table(neural_slots, args)
 
-    def _volume_local(cell, u_local, expr, pvals=(), ntable=None):
+    def _volume_local(geom_cell, u_local, expr, pvals=(), ntable=None):
         """Element residual ``(2*vec,)`` from the element's OWN dofs ``u_local`` ``(2, vec)``.
 
         Taking the local dofs rather than indexing a global vector is what makes the element
         Jacobian available: differentiating this w.r.t. ``u_local`` gives the ``(2*vec, 2*vec)``
         element matrix directly, so the global operator can be scattered sparsely instead of
         recovered by an ``O(N²)`` ``jacfwd`` of the global residual (see :func:`_sparse_jacobian`)."""
-        xc = verts[cell[:2]]  # (2,) — the element's endpoints carry the geometry
+        xc = verts[geom_cell]  # (2,) — the element's endpoints carry the geometry
         h = xc[1] - xc[0]
         phys = (N_geom @ xc)[:, None]  # (n_quad, 1)
-        shape_grads = (dN_dxi / h)[:, :, None]  # (n_quad, nen, 1)
+        N, dN_dx, d2N_dx2 = element.shape_at(h)
         local = {
             "physical_quad_points": phys,
             "shape_vals": N,
-            "shape_grads": shape_grads,
-            "cell_sol": u_local,  # (2, vec)
+            "shape_grads": dN_dx[:, :, None],  # (n_quad, nen, 1)
+            "cell_sol": u_local,  # (nen, vec)
             "tag": "fem_gauss",
             "surface": False,
             "domain_context": ctx,
@@ -402,6 +534,10 @@ def _make_residual(
             "volume_vars": pvals,
             "neural_coefficients": ntable,
         }
+        if d2N_dx2 is not None:
+            # (n_quad, nen, dim, dim) with dim=1 — what the evaluator's Hessian branch reads, so a
+            # fourth-order form (a beam) has second derivatives of BOTH the trial and the test.
+            local["shape_hess"] = d2N_dx2[:, :, None, None]
         return _integrate_term(domain, expr, local, gw * h)  # (nen*vec,)
 
     def residual(u_flat, args=None):
@@ -409,11 +545,14 @@ def _make_residual(
         _nt = _neural_table(args)
         R = jnp.zeros(n_nodes * vec, dtype=u_flat.dtype)
 
-        # --- volume terms: vmap over elements, then scatter ---
+        # --- volume terms: vmap over the element INDEX (not the dof-node row) — a Hermite element's
+        #     dof ids are not vertex ids, so the geometry must be gathered from `cells` separately ---
         for expr in volume_terms:
-            elem_res = jax.vmap(lambda c, e=expr: _volume_local(c, u[c], e, _pack_params(c, args, u_flat.dtype), _nt))(
-                elem_nodes
-            )  # (n_elem, nen*vec)
+            elem_res = jax.vmap(
+                lambda el, e=expr: _volume_local(
+                    cells[el], u[elem_nodes[el]], e, _pack_params(cells[el], args, u_flat.dtype), _nt
+                )
+            )(jnp.arange(n_elem, dtype=jnp.int32))  # (n_elem, nen*vec)
             R = R.at[cell_dofs.reshape(-1)].add(elem_res.reshape(-1))
 
         # --- boundary terms: degenerate one-node "element" (shape val 1, weight 1) ---
@@ -460,12 +599,12 @@ def _make_residual(
         idx, dat = [], []
 
         for expr in volume_terms:
-            # (n_elem, 2*vec, 2, vec) -> (n_elem, 2*vec, 2*vec): the element matrices
+            # (n_elem, nen*vec, nen, vec) -> (n_elem, nen*vec, nen*vec): the element matrices
             Ke = jax.vmap(
-                lambda c, e=expr: jax.jacfwd(lambda ul: _volume_local(c, ul, e, _pack_params(c, args, u_flat.dtype), _nt))(
-                    u[c]
-                )
-            )(elem_nodes)
+                lambda el, e=expr: jax.jacfwd(
+                    lambda ul: _volume_local(cells[el], ul, e, _pack_params(cells[el], args, u_flat.dtype), _nt)
+                )(u[elem_nodes[el]])
+            )(jnp.arange(n_elem, dtype=jnp.int32))
             nen = elem_nodes.shape[1]
             Ke = Ke.reshape(n_elem, nen * vec, nen * vec)
             rows = jnp.broadcast_to(cell_dofs[:, :, None], Ke.shape)
@@ -553,8 +692,14 @@ def assemble_fem_1d(
     vec: int,
     quad_degree: int,
     order: int = 1,
+    space: str = "Lagrange",
+    rotation_bcs: Any = None,
 ) -> Tuple[Any, str]:
     """Assemble a 1D (``LINE2``) weak form into ``(op, mode)`` for :class:`FEM`.
+
+    ``space="Hermite"`` selects the C1 cubic beam element (two dofs per vertex, ``(w, dw/dx)``)
+    instead of Lagrange; ``rotation_bcs`` then carries the essential ``u.dn(region) - s`` slope
+    conditions that clamp an end.
 
     ``mode`` is ``"linear"`` (``op = (A, b)``), ``"nonlinear"`` (``op`` a
     :class:`FemResidualOperator`), or ``"transient"`` (``op`` a ``SemidiscreteTimeBlock``).
@@ -587,7 +732,7 @@ def assemble_fem_1d(
     # P2 adds a midpoint dof per element, so the dof count is NOT the vertex count. Publishing the
     # dof coordinates is what makes `fem.points` line up with the solution vector (the same
     # contract the 2D/3D P2 path already has).
-    n_nodes, dof_coords = dof_layout_1d(domain, order)
+    n_nodes, dof_coords = dof_layout_1d(domain, order, space=space)
     ndof = n_nodes * vec
     domain._fem_native_dof_points = dof_coords
     all_terms = list(volume_terms) + [t for ts in boundary_terms.values() for t in ts]
@@ -607,7 +752,11 @@ def assemble_fem_1d(
     if ic_residuals:
         raise ValueError("jno.fem: an initial condition was given but the 1D weak form has no time derivative.")
 
-    dirichlet_pairs = _dirichlet_dofs(domain, dirichlet_values, vec)
+    dirichlet_pairs = (
+        hermite_dirichlet_dofs(domain, dirichlet_values, rotation_bcs)
+        if space == "Hermite"
+        else _dirichlet_dofs(domain, dirichlet_values, vec)
+    )
     residual_free = _make_residual(
         domain,
         volume_terms,
@@ -616,6 +765,7 @@ def assemble_fem_1d(
         vec=vec,
         quad_degree=quad_degree,
         order=order,
+        space=space,
         runtime_parameter_tags=runtime_parameter_tags,
         field_param_names=field_param_names,
         neural_slots=_neural,
