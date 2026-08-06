@@ -79,8 +79,8 @@ u_h = fem.solve()          # matrix-free default; slots pick anything else (see 
   optional dependency), with mmg's `hgrad` gradation rule imposed by two monotone sweeps. Solution
   transfer is the same code as 2D/3D — an interval is a 1-simplex, so its barycentric weights are the
   two linear hat values. Measured on a boundary layer `-eps u'' + u' = 0`: adaptive refinement from 11
-  dofs reaches 5.7e-4 where uniform refinement at 81 dofs is at 1.2e-2. Not wired in 1D: the
-  moving-boundary driver (a 1-D "moving boundary" is a single endpoint).
+  dofs reaches 5.7e-4 where uniform refinement at 81 dofs is at 1.2e-2. Not wired in 1D: mesh motion
+  via a geometry term (a 1-D "moving boundary" is a single endpoint).
 * **The beam element (`space="Hermite"` in 1D)** — the C¹ cubic Hermite, i.e. the classical
   Euler-Bernoulli beam element and the 1D counterpart of Argyris/Morley on triangles. Two dofs per
   vertex, `(w, dw/dx)`, laid out `2*node` / `2*node + 1`; sharing the slope dof across elements is what

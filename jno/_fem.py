@@ -1316,7 +1316,6 @@ class FEM:
         solve_fn=None,
         *,
         adapt=None,
-        move=None,
         x0=None,
         nonlinear=None,
         linear=None,
@@ -1340,12 +1339,11 @@ class FEM:
         fixed-connectivity (r-adaptive) alternative, whose vertex map is differentiable in the monitor
         and needs no cross-mesh transfer.
 
-        Pass ``move=MovingBoundary(velocity=...)`` on a **transient** problem to run the
-        **moving-boundary** loop: the domain boundary moves each step by the prescribed velocity, the
-        mesh deforms to follow it (harmonic interior extension), and the state is carried across each
-        move — for free-surface / deforming-domain physics. Returns an ``AdaptiveTrajectory`` (each frame
-        on its own moved mesh). See :class:`jno.utils.solver.fem_adapt.MovingBoundary` for the method and
-        its scope (operator-split ALE; scalar-P1, real, prescribed velocity for now).
+        A **moving mesh** is not a solve argument: put a geometry term ``coord.d(t) - velocity`` in the
+        ``jno.fem([...])`` list and the mesh moves as it says. Returns an ``AdaptiveTrajectory`` (each
+        frame on its own moved mesh). See :func:`jno.trace.mesh_velocity` for what makes a term a geometry
+        term and :func:`jno.utils.solver.fem_adapt.run_mesh_motion` for the method and its scope
+        (operator-split ALE; scalar-P1, real).
 
         Delegates to :meth:`FemLinearSystem.solve` (steady linear),
         :meth:`FemResidualOperator.solve` (steady nonlinear), or
@@ -1455,7 +1453,7 @@ class FEM:
         # Cleared on EVERY solve, not only a reduced one: a leftover value from an earlier
         # ``basis=`` call would read as "this answer was certified" on an answer that never was.
         self.basis_residual = None
-        reduction = None if basis is None else self._basis_reduction(basis, adapt=adapt, move=move)
+        reduction = None if basis is None else self._basis_reduction(basis, adapt=adapt)
 
         def _run():
             prev_periodic, prev_op = self._periodic, self._op
@@ -1472,7 +1470,6 @@ class FEM:
                 result = self._solve_dispatch(
                     solve_fn,
                     adapt=adapt,
-                    move=move,
                     x0=x0,
                     nonlinear=nonlinear,
                     linear=linear,
@@ -1503,10 +1500,10 @@ class FEM:
     #: merely resolving it coarsely — which is the legitimate use of a reduced basis.
     BASIS_RESIDUAL_LIMIT = 0.1
 
-    def _basis_reduction(self, basis, *, adapt=None, move=None):
+    def _basis_reduction(self, basis, *, adapt=None):
         """Validate ``basis=`` against this problem and wrap it as a reduction dict."""
-        if adapt is not None or move is not None:
-            which = "adapt=" if adapt is not None else "move="
+        if adapt is not None:
+            which = "adapt="
             raise NotImplementedError(
                 f"jno.fem: fem.solve(basis=..., {which}...) is not supported — {which} rebuilds or moves "
                 "the mesh, so the DOF count and layout the basis was built against change underneath it. "
@@ -1616,7 +1613,6 @@ class FEM:
         solve_fn=None,
         *,
         adapt=None,
-        move=None,
         x0=None,
         nonlinear=None,
         linear=None,
@@ -1636,9 +1632,9 @@ class FEM:
         if getattr(self, "_geometry", None):
             # A geometry term (`coord.d(t) - velocity`) states that the mesh moves. Its driver owns the
             # march, so it cannot share the call with anything else that also owns it.
-            if adapt is not None or move is not None or has_slots:
+            if adapt is not None or has_slots:
                 raise NotImplementedError(
-                    "jno.fem: a geometry term (`coord.d(t) - velocity`) does not compose with adapt=/move= or "
+                    "jno.fem: a geometry term (`coord.d(t) - velocity`) does not compose with adapt= or "
                     "the solver slots (x0/nonlinear/linear/precond/time) yet — the mesh-motion driver owns the "
                     "march and re-assembles each step. Solve with the geometry term alone (default θ-stepper)."
                 )
@@ -1651,21 +1647,6 @@ class FEM:
             from .utils.solver.fem_adapt import run_mesh_motion
 
             return run_mesh_motion(self, solve_fn=solve_fn, **kwargs)
-        if move is not None:
-            if adapt is not None or has_slots:
-                raise NotImplementedError(
-                    "fem.solve(move=...) does not compose with adapt= or the solver slots "
-                    "(x0/nonlinear/linear/precond/time) yet — the moving-boundary driver owns the march and "
-                    "re-assembles each move. Use move= on its own (default θ-stepper)."
-                )
-            if self._mode != "transient":
-                raise NotImplementedError(
-                    f"fem.solve(move=...) needs a transient problem (a u.t term); this FEM is '{self._mode}'. "
-                    "A moving boundary evolves in time — add the time derivative and a domain time grid."
-                )
-            from .utils.solver.fem_adapt import run_moving_boundary
-
-            return run_moving_boundary(self, move, solve_fn=solve_fn, **kwargs)
         if adapt is not None:
             if getattr(adapt, "relocate", False):
                 # r-adaptivity: relocate the .trainable() vertices (fixed connectivity), not h-refinement.

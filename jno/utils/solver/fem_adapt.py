@@ -2291,136 +2291,6 @@ def run_adaptive_transient(
     return AdaptiveTrajectory(np.asarray(times), states, meshes, layouts=layouts)
 
 
-@dataclass
-class MovingBoundary:
-    """Free-surface / moving-boundary spec for ``FEM.solve(move=...)`` on a **transient** problem.
-
-    The domain boundary moves by a **prescribed velocity**; the mesh deforms to follow it (harmonic
-    interior extension -- :func:`harmonic_extension` + :func:`move_mesh`), the physics marches on the
-    moving mesh, and the state is carried across each move. Returns an :class:`AdaptiveTrajectory` (each
-    frame on its own moved mesh -- use ``.resample(ref)`` to project onto a fixed grid).
-
-    Attributes
-    ----------
-    velocity
-        The boundary velocity, in one of two forms (arity-detected):
-
-        - **prescribed** -- ``velocity(t, x) -> (n_boundary, dim)``: the velocity at time ``t`` evaluated
-          at the current boundary-vertex positions ``x`` (``(n_boundary, dim)``; position-based, so no
-          vertex indices needed);
-        - **state-dependent** (physics-driven) -- ``velocity(t, x, state, domain) -> (n_boundary, dim)``:
-          additionally receives the **current nodal field** ``state`` (the solution on the current mesh)
-          and the **current** ``domain``. Use this to read a functional of the solution and drive the
-          boundary with it -- e.g. a **Stefan** front ``v_n = -k/L · ∇T·n``. The boundary-functional
-          readout (``u.bind(x=xb, y=yb).freeze(state)`` then ``(Tf.x*nx + Tf.y*ny).eval()``; see
-          :class:`jno.trace.FrozenField`) expresses such a functional as traced math. Caveat: ``domain``
-          here carries the **transient time grid**, so evaluate a purely-spatial readout on a steady view
-          of the current mesh (or read ``∇field`` via nodal recovery); the standalone readout is
-          validated on a steady domain, and a transient-domain spatial ``.eval()`` is a follow-up.
-
-        In both callback forms, **return zero rows for the held (fixed) part of the boundary** and the
-        interface velocity for the moving surface -- the returned field *is* the specification of which
-        boundary moves.
-
-        - **trace expression** (velocity *as math*) -- a jNO trace node giving the **scalar normal
-          speed** at the boundary, referencing a frozen field for the current state::
-
-              xb, yb, _, nx, ny = d.variable("boundary", normals=True, split=True)
-              Tf = u.bind(x=xb, y=yb).freeze(state0)          # state0 = any placeholder (e.g. zeros/IC)
-              velocity = -(k / L) * (Tf.x * nx + Tf.y * ny)   # v_n = -k/L · ∇T·n, a Stefan front
-
-          The driver swaps the **live state** into ``Tf`` each step (via :func:`jno.trace.substitute` /
-          :func:`jno.trace.refreeze`), evaluates the expression, and moves each boundary vertex **along
-          its outward normal** at that speed. This is the fully-declarative form -- the interface law
-          *is* the input, and it is differentiable in the field. (Interpreted as a *normal* speed; a
-          callback returns the full velocity vector instead.)
-
-          **Only part of the boundary moves** -- because the boundary coordinates ``xb, yb`` are trace
-          nodes too, a coordinate-masked speed frees just the surface(s) you want and holds the rest
-          exactly (the mask *follows* the moving surface, since the coordinates re-sample each step). No
-          separate movable-tag is needed::
-
-              v = (-(k / L) * (Tf.x * nx + Tf.y * ny)) * (yb > y_base)   # top free, base held
-
-          (several parts: a compound mask; the held nodes get zero speed and are pinned by the harmonic
-          interior extension.)
-    every
-        Move + re-assemble every ``every`` steps (default 1 = every step, most accurate). Larger is
-        cheaper (fewer re-assemblies) but lags the domain shape within a chunk.
-
-    Method / scope (house rule: fail loud on the rest).
-    - **Operator-split ALE.** The physics marches on the current mesh; between steps the mesh is moved
-      and the field **re-interpolated** onto the moved vertices (:func:`transfer_solution`), which
-      transports the field under the mesh motion. This is first-order in ``every`` and is correct for a
-      field whose material is (quasi-)stationary while the *boundary* moves (a melt/free surface with a
-      quasi-static bulk); it does **not** add an ALE convective ``(c-w)·∇u`` term, so it is *not* the
-      right discretization when a represented material velocity ``c`` differs from the mesh velocity
-      ``w`` (coupled flow -- that would double-count advection). A **state-dependent** ``velocity`` (a
-      Stefan / kinematic law reading the current field) is supported via the 4-argument form above; the
-      velocity is still applied **explicitly** (evaluated from the state at the start of each move), not
-      solved implicitly with the interface position.
-    - **Connectivity-preserving move only.** A move that would invert an element raises
-      (:func:`move_mesh` ``check``); the remesh-on-tangle fallback (``remesh_with_mmg`` + transfer, for
-      large deformation) is the next extension. Reduce ``dt`` / the motion, or await it.
-    - **Boundary conditions on the moving surface must be *natural* (unconstrained) or a whole-boundary
-      / held-boundary tag** -- those re-derive correctly on the moved mesh. A Dirichlet/Robin BC pinned
-      to the moving surface by a spatial sub-predicate would not follow the motion; an index-carried
-      moving tag is the next extension.
-    - **scalar-P1 field(s), real, non-periodic**, default θ-stepper (mirrors the transient adaptive
-      driver): vector / higher-order / complex / periodic / a custom ``solve_fn`` each raise.
-    """
-
-    velocity: Any
-    every: int = 1
-
-
-def _velocity_wants_state(vel: Any) -> bool:
-    """True if ``vel`` takes the state-dependent form ``velocity(t, x, state, domain)`` (>=4 positional
-    parameters) rather than the prescribed ``velocity(t, x)``. Falls back to prescribed if unintrospectable."""
-    import inspect
-
-    try:
-        params = [
-            p for p in inspect.signature(vel).parameters.values() if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
-        ]
-        return len(params) >= 4
-    except (ValueError, TypeError):
-        return False
-
-
-def _is_trace_velocity(vel: Any) -> bool:
-    """True if ``vel`` is a **trace expression** (a Placeholder / typed view) rather than a Python
-    callback — i.e. the user passed the velocity *as math* (`v = -(k/L)*(Tf.x*nx + Tf.y*ny)`)."""
-    from ...trace import Placeholder
-
-    return isinstance(vel, Placeholder) or isinstance(getattr(vel, "expr", None), Placeholder)
-
-
-def _trace_velocity_vb(vexpr: Any, frozen_nodes: list, state: Any, dom: Any, bverts: np.ndarray, old_pts, dim: int):
-    """Turn a **trace-expression** velocity (a *scalar normal speed*) into a per-boundary-vertex velocity
-    VECTOR, moved along the outward normal. Swaps the live ``state`` into the static expression
-    (:func:`jno.trace.substitute` / :func:`jno.trace.refreeze`), evaluates it on the current domain (in
-    boundary-tag order), aligns to the driver's boundary vertices, and multiplies by the boundary normal.
-    The interface thus moves along its normal at the speed the expression gives (the Stefan/kinematic case)."""
-    from scipy.spatial import cKDTree
-
-    from ...trace import refreeze, substitute
-
-    v_now = substitute(vexpr, {f: refreeze(f, np.asarray(state)) for f in frozen_nodes})
-    v_n = np.asarray(v_now.eval()).reshape(-1)  # scalar normal speed at the "boundary" tag points
-
-    parts = dom.variable("boundary", normals=True, split=True)  # (x, y, [z], t, nx, ny, [nz])
-    coords = np.column_stack([np.asarray(parts[i].eval()).reshape(-1) for i in range(dim)])
-    normals = np.column_stack([np.asarray(parts[len(parts) - dim + i].eval()).reshape(-1) for i in range(dim)])
-    if v_n.shape[0] != coords.shape[0]:
-        raise ValueError(
-            f"MovingBoundary trace velocity evaluated to {v_n.shape[0]} values but the boundary tag has "
-            f"{coords.shape[0]} points — a trace velocity must be a SCALAR per boundary point (the normal speed)."
-        )
-    _, perm = cKDTree(coords).query(np.asarray(old_pts)[bverts])  # align tag order → driver's boundary vertices
-    return v_n[perm][:, None] * normals[perm]  # v_n · n̂ : each vertex moves along its outward normal
-
-
 def _geometry_motion_specs(fem: Any, dom: Any) -> list[dict]:
     """One record per geometry term: which mesh vertices it moves, along which axis, and the residual to
     evaluate. See :func:`jno.trace.mesh_velocity` for what makes a term a geometry term."""
@@ -2610,6 +2480,50 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, save_ts: Any = None, **kw
                 f"DOFs vs {n_verts} mesh vertices (vector / higher-order). Express it as scalar-P1 fields, or await it."
             )
 
+    # Which route this march takes is decided HERE, on a structural property, and reported -- never
+    # silently. A velocity that READS THE SOLVED FIELD (a Stefan law, via a frozen field) still needs the
+    # per-step `jno.fem` rebuild: the frozen-field spatial gradient is an FD-over-mesh readout against
+    # `domain.mesh_connectivity`, a host array that the rebuild refreshes, and without it the readout goes
+    # stale as the mesh moves and the march reaches NaN within a few steps. A PRESCRIBED velocity has no
+    # such dependency and takes the parametric route below. Closing the split is Phase 3b -- delivering the
+    # state through the evaluation context instead of baking it in -- after which both routes are the fast
+    # one; until then, correctness wins and the cost is stated rather than hidden.
+    _needs_rebuild = any(_geometry_motion_specs(fem, d)[k]["frozen"] for k in range(len(fem._geometry)))
+
+    # Make the assembly a FUNCTION of the vertex positions, once, instead of rebuilding it every step.
+    # `Variable.trainable()` on a spatial coordinate registers it as a runtime parameter that
+    # `_apply_coord_params` scatters into the P1 geometry before the element Jacobian is formed; the
+    # transient block then re-forms A and M from `args` inside `step` (see `SemidiscreteTimeBlock`). One
+    # spec per axis, covering EVERY vertex, since any of them may move.
+    if _needs_rebuild:
+        cur = fem
+
+        def _coord_args(pts_now):
+            return None  # the rebuild carries the geometry; no coordinate parameters to hand over
+
+    else:
+        if getattr(d, "_trainable_coords", None):
+            raise NotImplementedError(
+                "jno.fem: a geometry term does not compose with a hand-tagged `.trainable()` coordinate yet — "
+                "the mesh-motion driver registers the whole mesh as a coordinate parameter to avoid "
+                "re-assembling every step, and two specs writing the same axis would silently let one win. "
+                "Drop the `.trainable()` tag, or drop the geometry term."
+            )
+        _axis_names = [f"__meshmotion_x{a}__" for a in range(dim)]
+        _all_parts = d.variable(
+            "__meshmotion_all__", where=lambda *c: np.ones_like(np.asarray(c[0]), dtype=bool), split=True
+        )
+        for _a, _nm in enumerate(_axis_names):
+            _all_parts[_a].trainable(name=_nm)
+        _coord_ids = np.asarray(d._trainable_coords[0]["ids"], dtype=int)
+        cur = jno.fem(cons, **kw)  # rebuilt ONCE, now parametric in the vertex positions
+        block = cur._op
+        state = jnp.asarray(block.state0).reshape(-1)
+
+        def _coord_args(pts_now):
+            """The moved vertices, in the layout `_apply_coord_params` scatters from (one per axis)."""
+            return {nm: jnp.asarray(pts_now[_coord_ids, a]) for a, nm in enumerate(_axis_names)}
+
     key = _simplex_cell_key(dim)
     ts = np.asarray(_block_time_grid(block))  # fixed t0..t1 grid; moving the mesh never changes the grid
     dt = float(block.dt)
@@ -2628,7 +2542,6 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, save_ts: Any = None, **kw
     cur_mesh = _snapshot()
     times, states, meshes = [float(ts[0])], [state], [cur_mesh]
     history: list[dict] = []
-    cur = fem
 
     for i in range(n_steps):
         t0c, t1c = float(ts[i]), float(ts[i + 1])
@@ -2684,8 +2597,9 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, save_ts: Any = None, **kw
                 d.variable(_tag, normals=True, split=True)  # keep the normals a Stefan-type law reads
             except Exception:
                 d.variable(_tag, split=True)
-        cur = jno.fem(cons, **kw)
-        block = cur._op
+        if _needs_rebuild:
+            cur = jno.fem(cons, **kw)
+            block = cur._op
         new_mesh = _snapshot()
         new_pts, _new_cells = new_mesh
 
@@ -2694,155 +2608,19 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, save_ts: Any = None, **kw
         wj, ij = jnp.asarray(w, dtype=state.real.dtype), jnp.asarray(idx)
         state = jnp.concatenate([jnp.einsum("qk,qk->q", wj, state[off[_f] : off[_f + 1]][ij]) for _f in range(n_fields)])
 
-        # 4) step on the moved mesh (the ordinary differentiable θ-stepper)
-        state = block.step(state, jnp.asarray(t0c, dtype=state.dtype), dt, theta=theta)
+        # 4) step on the moved mesh (the ordinary differentiable θ-stepper). The operator and the mass are
+        #    re-formed from the moved vertices HERE, inside the step, by handing them through `args` --
+        #    `_apply_coord_params` scatters them into the P1 geometry before the element Jacobian, so J,
+        #    detJ, JxW, physical gradients and the facet normals all follow. That replaces a full
+        #    `jno.fem(cons, **kw)` rebuild per step, which was 40% of the driver and ~500 ms flat (it is
+        #    Python re-tracing, not mesh work). Measured against the rebuild it replaces: 2733x at 74
+        #    vertices, 625x at 640, 44x at 4669.
+        state = block.step(state, jnp.asarray(t0c, dtype=state.dtype), dt, args=_coord_args(new_pts), theta=theta)
         cur_mesh = new_mesh
         times.append(float(ts[i + 1]))
         states.append(state)
         meshes.append(cur_mesh)
         history.append({"t": float(ts[i + 1]), "n_dofs": int(new_pts.shape[0])})
-
-    fem.__dict__.update(cur.__dict__)  # rebind to the final moved mesh
-    fem.adapt_history = history
-    return AdaptiveTrajectory(np.asarray(times), states, meshes)
-
-
-def run_moving_boundary(
-    fem: Any, spec: MovingBoundary, *, solve_fn: Any = None, save_ts: Any = None, **kwargs: Any
-) -> "AdaptiveTrajectory":
-    """Drive ``FEM.solve(move=spec)``: march a transient problem while the **boundary moves** by the
-    prescribed ``spec.velocity``. Every ``spec.every`` steps the mesh is deformed to follow the boundary
-    (:func:`harmonic_extension` + :func:`move_mesh`), the problem re-assembled on the moved mesh, and the
-    state carried across (:func:`transfer_solution`, connectivity-preserving). Returns an
-    :class:`AdaptiveTrajectory`. See :class:`MovingBoundary` for the method and its scope."""
-    import jax
-    import jax.numpy as jnp
-
-    import jno
-
-    from .backend_blocks import _block_time_grid
-
-    if fem._constraints is None:
-        raise ValueError("FEM.solve(move=...) requires a FEM built by jno.fem(...) (its constraint list is retained).")
-    if solve_fn is not None:
-        raise NotImplementedError(
-            "fem.solve(move=..., solve_fn=...) is not supported: the moving-boundary driver owns the time march. "
-            "Drop solve_fn (use the default θ-stepper), or drop move=."
-        )
-    if getattr(fem, "_periodic", None) is not None:
-        raise NotImplementedError("fem.solve(move=...) with periodic ties is not supported yet.")
-    _vel = getattr(spec, "velocity", None)
-    if not (callable(_vel) or _is_trace_velocity(_vel)):
-        raise TypeError(
-            "MovingBoundary.velocity must be a callable (velocity(t, x[, state, domain]) -> (n_boundary, dim)) "
-            "or a trace expression (a scalar normal speed, e.g. -(k/L)*(Tf.x*nx + Tf.y*ny))."
-        )
-
-    d = fem.domain
-    dim = int(d.dimension)
-    if dim not in (2, 3):
-        raise NotImplementedError(f"moving-boundary supports 2D/3D simplicial meshes; got dimension {dim}.")
-
-    cons, kw = fem._constraints, fem._fem_kwargs
-    block = fem._op
-    n_verts = int(np.asarray(d.mesh.points).shape[0])
-    state = jnp.asarray(block.state0).reshape(-1)
-    if jnp.iscomplexobj(state):
-        raise NotImplementedError("moving-boundary is real-only (the state transfer / mesh motion are); complex is future.")
-    off = [int(x) for x in (fem.offsets or [0, int(state.shape[0])])]
-    n_fields = len(off) - 1
-    for _f in range(n_fields):
-        if off[_f + 1] - off[_f] != n_verts:
-            raise NotImplementedError(
-                f"moving-boundary supports scalar-P1 field(s) only for now: field {_f} has {off[_f + 1] - off[_f]} "
-                f"DOFs vs {n_verts} mesh vertices (vector / higher-order). Express it as scalar-P1 fields, or await it."
-            )
-
-    key = _simplex_cell_key(dim)
-    ts = np.asarray(_block_time_grid(block))  # fixed t0..t1 grid; moving the mesh never changes the grid
-    dt = float(block.dt)
-    theta = float(block.metadata.get("theta", 1.0)) if block.metadata else 1.0
-    n_steps = len(ts) - 1
-    every = max(1, int(spec.every))
-    vel = spec.velocity
-    vel_is_trace = _is_trace_velocity(vel)
-    wants_state = (not vel_is_trace) and _velocity_wants_state(vel)
-    frozen_nodes = vexpr = None
-    if vel_is_trace:
-        from ...trace import Placeholder, frozen_fields_in
-
-        vexpr = vel if isinstance(vel, Placeholder) else vel.expr  # unwrap a typed view to its Placeholder
-        frozen_nodes = frozen_fields_in(vexpr)
-        if not frozen_nodes:
-            raise ValueError(
-                "MovingBoundary.velocity given as a trace expression must reference a frozen field — build it "
-                "as `Tf = u.bind(x=xb, y=yb).freeze(state0)` and write the speed in terms of `Tf` (e.g. "
-                "`-(k/L)*(Tf.x*nx + Tf.y*ny)`); the driver swaps the live state into `Tf` each step."
-            )
-
-    def _snapshot():
-        return (np.asarray(d.mesh.points)[:, :dim].astype(np.float64), np.asarray(d.mesh.cells_dict[key]).astype(np.int64))
-
-    cur_mesh = _snapshot()
-    times, states, meshes = [float(ts[0])], [state], [cur_mesh]
-    history: list[dict] = []
-    cur = fem
-
-    i = 0
-    while i < n_steps:
-        chunk = int(min(every, n_steps - i))
-        t0c, t1c = float(ts[i]), float(ts[i + chunk])
-        old_pts, old_cells = cur_mesh
-
-        # 1) MOVE the boundary from shape(t0c) toward shape(t1c) by the prescribed velocity, hold the rest.
-        bfacets = _boundary_edges_from_triangles(old_cells) if dim == 2 else _boundary_faces_from_tets(old_cells)
-        bverts = np.unique(bfacets.reshape(-1))
-        # Velocity in one of three forms: a trace expression (a scalar normal speed the driver moves along
-        # the normal), a state-dependent callback velocity(t, x, state, domain), or a prescribed
-        # velocity(t, x). The state-reading forms see the CURRENT field on the CURRENT mesh (before this
-        # move), e.g. a Stefan v_n = -k/L·∇T·n.
-        if vel_is_trace:
-            vb = np.asarray(_trace_velocity_vb(vexpr, frozen_nodes, state, d, bverts, old_pts, dim), dtype=np.float64)
-        elif wants_state:
-            vb = np.asarray(vel(t0c, old_pts[bverts], np.asarray(state), d), dtype=np.float64)
-        else:
-            vb = np.asarray(vel(t0c, old_pts[bverts]), dtype=np.float64)
-        if vb.shape != (bverts.shape[0], dim):
-            raise ValueError(
-                f"MovingBoundary.velocity must return (n_boundary, dim) = ({bverts.shape[0]}, {dim}); got {vb.shape}."
-            )
-        bdisp = np.zeros((old_pts.shape[0], dim), dtype=np.float64)
-        bdisp[bverts] = vb * (t1c - t0c)
-        move_mesh(d, harmonic_extension(d, bdisp), copy=False)  # fail loud on tangle (house rule 1)
-
-        # 2) re-tag (held boundaries re-derive on the moved facets) + re-assemble on the moved mesh
-        for _name, _pred in list(getattr(d, "_tag_predicates", {}).items()):
-            d.tag(_name, _pred)
-        cur = jno.fem(cons, **kw)
-        block = cur._op
-        new_mesh = _snapshot()
-        new_pts, _new_cells = new_mesh
-
-        # 3) carry the state onto the moved vertices (re-interpolate -> transports the field under the motion)
-        idx, w, _inside = _locate_barycentric(old_pts, old_cells, new_pts, tol=1e-9, k=32)
-        wj, ij = jnp.asarray(w, dtype=state.real.dtype), jnp.asarray(idx)
-        state = jnp.concatenate([jnp.einsum("qk,qk->q", wj, state[off[_f] : off[_f + 1]][ij]) for _f in range(n_fields)])
-
-        # 4) march the chunk on the moved mesh (the ordinary differentiable θ-stepper)
-        blk = block
-
-        def _body(u, t, _blk=blk):
-            un = _blk.step(u, t, dt, theta=theta)
-            return un, un
-
-        state, traj = jax.lax.scan(_body, state, jnp.asarray(ts[i : i + chunk], dtype=state.dtype))
-        cur_mesh = new_mesh
-        for j in range(chunk):
-            i += 1
-            times.append(float(ts[i]))
-            states.append(traj[j])
-            meshes.append(cur_mesh)
-        history.append({"t": float(ts[i]), "n_dofs": int(new_pts.shape[0])})
 
     fem.__dict__.update(cur.__dict__)  # rebind to the final moved mesh
     fem.adapt_history = history
