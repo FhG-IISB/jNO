@@ -275,6 +275,9 @@ def _domain_from_arrays(template: Any, points: np.ndarray, elems: np.ndarray, bf
     for attr in list(vars(target)):
         if attr.startswith("_fem_native") or attr in ("_fem_assembly_cache", "_integral_weight_cache"):
             delattr(target, attr)
+    # Give the mesh-generator's named boundary regions a predicate BEFORE the reset, so they are
+    # re-derived on the new mesh exactly like a user `.tag()` (see `_capture_geometric_boundary_tags`).
+    _capture_geometric_boundary_tags(target)
     # Drop the OLD mesh's predicate-tag state (boundary regions / indices / normals / pools /
     # context) so a re-tag re-derives it cleanly on the new mesh; stale surface-tag state otherwise
     # corrupts re-assembled Neumann/Robin/absorbing terms (predicates in `_tag_predicates` are kept).
@@ -288,6 +291,64 @@ def _domain_from_arrays(template: Any, points: np.ndarray, elems: np.ndarray, bf
     if getattr(target, "_is_time_dependent", False) and getattr(target, "time", None) is not None:
         target._add_time_dimension(*target.time)
     return target
+
+
+def _capture_geometric_boundary_tags(domain: Any) -> None:
+    """Give every named boundary region a **mesh-independent predicate**, so it survives a remesh.
+
+    The mesh generator's named edge regions (``left`` / ``right`` / ``top`` / ``bottom`` / any
+    ``Shape`` sub-boundary) are baked into the ORIGINAL mesh as *cell sets*.  A remeshed mesh carries
+    only ``interior`` and ``boundary`` (:func:`_domain_from_arrays` builds exactly those), so those
+    names vanish at the first remesh — and a Dirichlet condition bound to one of them then reaches
+    ``jno.fem`` as a whole-domain residual with a trial but no test function, failing with an error
+    that names neither the mesh nor the region that disappeared.  Only ``.tag()`` regions survived,
+    because a *predicate* is mesh-independent and the drivers re-apply it.
+
+    The domain does keep a mesh-independent description of each named boundary: the shapely curve it
+    registered in ``_polygon_tags``.  Turn that into the same kind of spatial predicate a user
+    ``.tag()`` supplies — "within tol of this curve" — and every existing re-tag path re-derives the
+    region on whatever mesh comes next.  A **distance** test, not ``contains``: these are curves, and
+    a point-in-curve test is false for essentially every floating-point node.  Remeshing preserves the
+    boundary *geometry* (only its discretisation changes), so the new nodes lie on the same curve.
+
+    The description used is the region's own ``BoundaryRegion`` — the segments (2-D) or triangles (3-D)
+    it was registered with — and its ``contains`` test, so no new geometry code is introduced and both
+    dimensions are covered by construction.  Remeshing preserves the boundary *geometry* (only its
+    discretisation changes), so the new nodes lie on those same facets.
+
+    A **distance-to-facet** test, not a point-in-curve one: these regions are curves/surfaces, and an
+    exact containment test is false for essentially every floating-point node.
+
+    Idempotent, and it never overrides a predicate that is already there — a user ``.tag()`` of the
+    same name keeps its own definition.  The aggregate ``boundary`` region is skipped: it is rebuilt
+    from the new mesh's cell sets directly.
+    """
+    regions = getattr(domain, "_boundary_regions", None)
+    if not isinstance(regions, dict):
+        return
+    preds = getattr(domain, "_tag_predicates", None)
+    if preds is None:
+        preds = domain._tag_predicates = {}
+
+    for name, region in list(regions.items()):
+        if name in preds or name == "boundary":
+            continue  # already predicate-backed (a user tag), or the aggregate (rebuilt from the mesh)
+        if region is None or not hasattr(region, "contains"):
+            continue
+        has_facets = any(
+            getattr(region, attr, None) is not None and len(getattr(region, attr)) > 0 for attr in ("edges", "triangles")
+        )
+        if not has_facets:
+            continue
+
+        def _on_region(*coords, _r=region):
+            import jax
+            import jax.numpy as jnp
+
+            pts = np.stack([np.asarray(c, dtype=float).reshape(-1) for c in coords], axis=-1)
+            return np.asarray(jax.vmap(_r.contains)(jnp.asarray(pts)))
+
+        preds[name] = _on_region
 
 
 def _shallow_copy(domain: Any):

@@ -428,3 +428,58 @@ def test_transient_adaptive_pressure_pin_survives_remesh():
     ref = jno.Shape.rect(0, 0, 1, 1, size=0.1).domain()
     yv = np.asarray(traj.resample(ref, field=0))
     assert np.all(np.isfinite(yv)) and float(np.abs(yv[-1]).max()) > 1e-3  # a finite flow developed; the gauge held
+
+
+def test_builtin_edge_regions_survive_a_remesh():
+    """A Dirichlet condition on a **built-in** edge (``left``/``right``) must keep working across a remesh.
+
+    The mesh generator's named edge regions are baked into the ORIGINAL mesh as cell sets; the remeshed
+    mesh carries only ``interior``/``boundary``, so they used to vanish at the first remesh and the
+    condition bound to them reached ``jno.fem`` as a whole-domain residual with a trial but no test
+    function — an error naming neither the mesh nor the region that disappeared.  Only ``.tag()``
+    regions survived, because a predicate is mesh-independent.
+
+    Two edges at *different* Dirichlet values, which is what forces per-edge regions in the first place
+    (an aggregate ``boundary`` region cannot express it).  Pinned against the same problem with both
+    edges written as explicit ``.tag()`` predicates: the two must agree, since they are the same regions.
+    """
+
+    def build(builtin_left):
+        d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.15).domain(time=(0.0, 0.2, 6))
+        d.tag("right_edge", lambda x, y: x > 1.0 - 1e-9)
+        if builtin_left:
+            left = "left"
+        else:
+            d.tag("left_edge", lambda x, y: x < 1e-9)
+            left = "left_edge"
+        u, phi = d.fem_symbols()
+        xi, yi, ti = d.variable("interior", split=True)
+        xl, yl, _ = d.variable(left, split=True)
+        xr, yr, _ = d.variable("right_edge", split=True)
+        ci = d.variable("initial", split=True)
+        ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+        return jno.fem(
+            [
+                ui.t * vi + 0.05 * (ui.x * vi.x + ui.y * vi.y),
+                u(xl, yl) - (-1.0),
+                u(xr, yr) - (+1.0),
+                u(ci[0], ci[1]) - jno.fn(lambda x: 2.0 * x - 1.0, [ci[0]]),
+            ]
+        ), d
+
+    ref = jno.Shape.rect(0, 0, 1, 1, size=0.12).domain()
+    out = {}
+    for builtin in (True, False):
+        fem, _ = build(builtin)
+        traj = fem.solve(adapt=jno.solve.remesh(anisotropic=True, every=2, max_dofs=400))
+        assert fem.adapt_history, "expected at least one remesh"
+        out[builtin] = np.asarray(traj.resample(ref))
+
+    # The Dirichlet data is still imposed after remeshing: the field spans [-1, +1] across x.
+    final = out[True][-1]
+    assert np.all(np.isfinite(final))
+    xr_ = np.asarray(ref.mesh.points)[:, 0]
+    assert final[np.argmin(xr_)] < -0.5 < 0.5 < final[np.argmax(xr_)], "the per-edge Dirichlet values were lost"
+
+    # ... and the built-in edge names the same region as the equivalent predicate tag.
+    assert np.allclose(out[True], out[False], atol=1e-8), "built-in edge and .tag() predicate disagree"
