@@ -90,14 +90,152 @@ def test_line_domain_is_1d():
     assert {"left", "right", "boundary"} <= set(getattr(d, "_boundary_regions", {}))
 
 
-def test_vec_gt_1_rejected():
-    d = _line(0.3)
-    u, phi = d.fem_symbols(value_shape=(2,))
+# ==========================================================================
+# vector unknowns (value_shape=(n,)) — systems on a line
+# ==========================================================================
+def _vector_system(ms=0.02, order=1):
+    """A 2-component system on [0,1], zero Dirichlet on both components:
+
+    -u0'' + u1 = pi^2 sin(pi x) + sin(2 pi x)      ->  u0* = sin(pi x)
+    -u1'' + u0 = 4 pi^2 sin(2 pi x) + sin(pi x)    ->  u1* = sin(2 pi x)
+    """
+    d = _line(ms)
+    u, phi = d.fem_symbols(value_shape=(2,), order=order)
     xi = d.variable("interior", split=True)[0]
     xb = d.variable("boundary", split=True)[0]
-    weak = jno.np.inner(jno.np.grad(u, [xi]), jno.np.grad(phi, [xi]), n_contract=2)
-    with pytest.raises(NotImplementedError):
-        jno.fem([weak, u(xb) - 0.0])
+    ui, vi = u.bind(x=xi), phi.bind(x=xi)
+    s1, s2 = jno.np.sin(np.pi * xi), jno.np.sin(2 * np.pi * xi)
+    f0 = (np.pi**2) * s1 + s2
+    f1 = (4 * np.pi**2) * s2 + s1
+    weak = jno.np.inner(ui.x, vi.x) + ui[1] * vi[0] + ui[0] * vi[1] - f0 * vi[0] - f1 * vi[1]
+    return d, jno.fem([weak, u(xb)[0] - 0.0, u(xb)[1] - 0.0])
+
+
+@pytest.mark.parametrize("order,tol", [(1, 1e-4), (2, 1e-6)])
+def test_vector_unknown_recovers_manufactured(order, tol):
+    """A vector unknown on a line. 1D refused ``vec>1`` outright, which ruled out every 1D *system*
+    written as one field — a two-species model, a Timoshenko pair, a bar with several dofs per node.
+    The element kernels were already written in terms of ``vec``; only the guard stood in the way.
+
+    DOFs stay node-major (``dof = node*vec + comp``), which is what keeps ``fem.points`` a per-node
+    array in 1D exactly as in 2D/3D."""
+    d, fem = _vector_system(0.02, order)
+    pts = np.asarray(fem.points).reshape(-1)
+    assert fem.dofs == 2 * len(pts)
+    sol = np.asarray(fem.solve()).reshape(len(pts), 2)
+    assert np.max(np.abs(sol[:, 0] - np.sin(np.pi * pts))) < tol
+    assert np.max(np.abs(sol[:, 1] - np.sin(2 * np.pi * pts))) < tol
+
+
+def test_vector_unknown_stays_sparse():
+    """The per-element scatter must survive ``vec>1``: an element couples its ``2*vec`` dofs, so nnz
+    stays linear in the dof count rather than becoming a dense ``(2N)^2`` block."""
+    d, fem = _vector_system(0.005)
+    A = fem.operator[0]
+    n = A.shape[0]
+    assert hasattr(A, "indices"), "a vector 1D system must still assemble sparsely"
+    assert int(A.nse) < 20 * n, f"nnz={int(A.nse)} is not linear in n={n}"
+
+
+def test_vector_unknown_per_component_dirichlet():
+    """Per-component essential conditions (``u(region)[i] - g``) address one component's dof stripe:
+    pinning ``u0`` at both ends while ``u1`` keeps a natural condition on the right must give
+    ``u0 = 2x`` exactly and leave ``u1`` free there."""
+    d = _line(0.1)
+    u, phi = d.fem_symbols(value_shape=(2,))
+    xi = d.variable("interior", split=True)[0]
+    xl = d.variable("left", split=True)[0]
+    xr = d.variable("right", split=True)[0]
+    ui, vi = u.bind(x=xi), phi.bind(x=xi)
+    fem = jno.fem([jno.np.inner(ui.x, vi.x) - 1.0 * vi[1], u(xl)[0] - 0.0, u(xl)[1] - 0.0, u(xr)[0] - 2.0])
+    pts = np.asarray(fem.points).reshape(-1)
+    sol = np.asarray(fem.solve()).reshape(len(pts), 2)
+    assert np.max(np.abs(sol[:, 0] - 2.0 * pts)) < 1e-12  # -u0''=0, u0(0)=0, u0(1)=2
+    # -u1''=1, u1(0)=0, natural u1'(1)=0 -> u1 = x - x^2/2, so u1(1)=1/2 (not pinned)
+    assert abs(sol[int(np.argmax(pts)), 1] - 0.5) < 1e-10
+
+
+def test_vector_unknown_three_components_independent_loads():
+    """Extremes: three components with different loads must each recover their own solution — a
+    component-blind scatter would give them all the same field."""
+    d = _line(0.05)
+    u, phi = d.fem_symbols(value_shape=(3,))
+    xi = d.variable("interior", split=True)[0]
+    xb = d.variable("boundary", split=True)[0]
+    ui, vi = u.bind(x=xi), phi.bind(x=xi)
+    fem = jno.fem(
+        [
+            jno.np.inner(ui.x, vi.x) - 1.0 * vi[0] - 2.0 * vi[1] + 3.0 * vi[2],
+            u(xb)[0] - 0.0,
+            u(xb)[1] - 0.0,
+            u(xb)[2] - 0.0,
+        ]
+    )
+    pts = np.asarray(fem.points).reshape(-1)
+    sol = np.asarray(fem.solve()).reshape(len(pts), 3)
+    for c, amp in enumerate((1.0, 2.0, -3.0)):  # -u'' = amp -> u = amp x(1-x)/2
+        assert np.max(np.abs(sol[:, c] - amp * pts * (1 - pts) / 2)) < 1e-10, f"component {c}"
+
+
+def test_vector_unknown_transient_seeds_every_component():
+    """A vector field is given one initial condition **per component**, and each renders as a
+    full-length vector that is zero outside its own stripe. This path used to read only
+    ``ic_residuals[0]``, silently leaving every other component at zero — visible here because the two
+    components decay at different rates and the second one would otherwise start (and stay) at zero."""
+    d = _line(0.02, time=(0.0, 0.02, 21))
+    u, phi = d.fem_symbols(value_shape=(2,))
+    co = d.variable("interior", split=True)
+    xi, ti = co[0], co[-1]
+    xb = d.variable("boundary", split=True)[0]
+    ci = d.variable("initial", split=True)[0]
+    ui, vi = u.bind(x=xi, t=ti), phi.bind(x=xi, t=ti)
+    fem = jno.fem(
+        [
+            jno.np.inner(ui.t, vi) + jno.np.inner(ui.x, vi.x),
+            u(xb)[0] - 0.0,
+            u(xb)[1] - 0.0,
+            u(ci)[0] - jno.np.sin(np.pi * ci),
+            u(ci)[1] - jno.np.sin(2 * np.pi * ci),
+        ]
+    )
+    x = np.asarray(fem.points).reshape(-1)
+    s0 = np.asarray(fem.state0).reshape(len(x), 2)
+    assert np.max(np.abs(s0[:, 0] - np.sin(np.pi * x))) < 1e-12
+    assert np.max(np.abs(s0[:, 1] - np.sin(2 * np.pi * x))) < 1e-12, "the second component's IC was dropped"
+
+    traj = np.asarray(fem.solve().fn())
+    last = traj[-1].reshape(len(x), 2)
+    t1 = float(fem.t1)
+    e0 = np.exp(-(np.pi**2) * t1) * np.sin(np.pi * x)
+    e1 = np.exp(-((2 * np.pi) ** 2) * t1) * np.sin(2 * np.pi * x)
+    assert np.linalg.norm(last[:, 0] - e0) / np.linalg.norm(e0) < 2e-2
+    assert np.linalg.norm(last[:, 1] - e1) / np.linalg.norm(e1) < 5e-2
+    # the two components really decayed at their OWN rates: the amplitude ratio is exp(-3 pi^2 t),
+    # which a shared initial state (or a component-blind march) could not produce
+    ratio = np.max(np.abs(last[:, 1])) / np.max(np.abs(last[:, 0]))
+    assert abs(ratio - np.exp(-3 * np.pi**2 * t1)) < 0.05, f"decay ratio {ratio:.3f}"
+
+
+def test_vector_field_in_a_coupled_1d_system_fails_loud():
+    """Scope: the coupled *block* path is still scalar per field. A vector field inside a coupled 1D
+    system refuses rather than mis-sizing the blocks."""
+    d = _line(0.1)
+    u, v = d.fem_symbols(names=("u", "v"), value_shape=(2,))
+    p, q = d.fem_symbols(names=("p", "q"))
+    xi = d.variable("interior", split=True)[0]
+    xb = d.variable("boundary", split=True)[0]
+    ui, vi = u.bind(x=xi), v.bind(x=xi)
+    pi_, qi = p.bind(x=xi), q.bind(x=xi)
+    with pytest.raises(NotImplementedError, match="scalar fields"):
+        jno.fem(
+            [
+                jno.np.inner(ui.x, vi.x) + pi_ * vi[0],
+                pi_.x * qi.x - qi,
+                u(xb)[0] - 0.0,
+                u(xb)[1] - 0.0,
+                p(xb) - 0.0,
+            ]
+        )
 
 
 def _reaction_diffusion(ms, order):

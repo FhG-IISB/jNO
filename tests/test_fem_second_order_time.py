@@ -71,7 +71,10 @@ def _trajectory(fem, theta=None):
         block.metadata["theta"] = theta
     ts = np.asarray(_block_time_grid(block))
     ys = np.asarray(_default_transient_integrate(block, {}, ts))
-    n = fem.offsets[1]
+    # The augmented state is [displacements | velocities], so the split is the MIDPOINT — the same
+    # thing as offsets[1] for a single field, but not for a coupled system, whose displacement half
+    # already spans several field blocks.
+    n = ys.shape[1] // 2
     return ts, ys[:, :n], ys[:, n:]  # times, displacement, velocity
 
 
@@ -465,16 +468,18 @@ def test_second_order_1d_state_dependent_mass_fails_loud():
         )
 
 
-def test_second_order_1d_coupled_fails_loud():
-    """The 1D ``u_tt`` path is single-field. A COUPLED second-order 1D system refuses by name rather
-    than assembling something plausible.
+def test_second_order_1d_coupled_gives_each_field_its_own_velocity_block():
+    """A COUPLED second-order 1D system (previously refused as "single-field only").
 
-    Worth pinning even though it is only a guard: the 1D augmented assembly composes ``[[M2,0],[0,M2]]``
-    and ``[[0,-M2],[K,C]]`` at fixed ``n`` offsets, so a second field would silently overlay the
-    velocity block rather than get its own — a wrong answer, not a crash, if the guard ever lapses.
-    2D/3D coupled second-order IS supported (see the mixed-order test above); this is a 1D-only limit."""
+    Worth pinning structurally: the augmented assembly composes ``[[M2,0],[0,M2]]`` and
+    ``[[0,-M2],[K,·]]`` over the *whole* block vector, so a second field must get its own displacement
+    AND velocity block rather than overlaying the first — that failure mode is a wrong answer, not a
+    crash. The layout is asserted directly, and the two fields are given different wave speeds so a
+    shared block could not reproduce both.
+
+    The dynamics themselves are covered in ``tests/test_fem_1d.py`` (the two-mode beat)."""
     pytest.importorskip("pygmsh", reason="pygmsh required for line meshing")
-    d = jno.domain(constructor=jno.domain.line(mesh_size=0.1), time=(0.0, 0.5, 10))
+    d = jno.domain(constructor=jno.domain.line(mesh_size=0.05), time=(0.0, 0.5, 60))
     u, phi = d.fem_symbols(names=("u", "phi"))
     p, q = d.fem_symbols(names=("p", "q"))
     xi, ti = d.variable("interior", split=True)[0], d.variable("interior", split=True)[-1]
@@ -483,19 +488,33 @@ def test_second_order_1d_coupled_fails_loud():
     ui, vi = u.bind(x=xi, t=ti), phi.bind(x=xi, t=ti)
     pi_, qi = p.bind(x=xi, t=ti), q.bind(x=xi, t=ti)
     ui0, pi0 = u.bind(x=xi0, t=ti0), p.bind(x=xi0, t=ti0)
-    with pytest.raises(NotImplementedError, match="single-field|first-order system"):
-        jno.fem(
-            [
-                ui.tt * vi + ui.x * vi.x,
-                pi_.tt * qi + pi_.x * qi.x,
-                u(xb) - 0.0,
-                p(xb) - 0.0,
-                u(xi0) - 0.0,
-                ui0.t - 0.0,
-                p(xi0) - 0.0,
-                pi0.t - 0.0,
-            ]
-        )
+    c2 = 4.0  # p travels at twice u's speed -> period halves
+    fem = jno.fem(
+        [
+            ui.tt * vi + ui.x * vi.x,
+            pi_.tt * qi + c2 * (pi_.x * qi.x),
+            u(xb) - 0.0,
+            p(xb) - 0.0,
+            u(xi0) - jno.fn(lambda x: jnp.sin(PI * x), [xi0]),
+            ui0.t - 0.0,
+            p(xi0) - jno.fn(lambda x: jnp.sin(PI * x), [xi0]),
+            pi0.t - 0.0,
+        ]
+    )
+    n_nodes = int(np.asarray(d.mesh.points).shape[0])
+    # [u, p | u̇, ṗ] — four blocks of n_nodes, not two
+    assert fem.offsets == [0, n_nodes, 2 * n_nodes, 3 * n_nodes, 4 * n_nodes]
+    assert int(np.asarray(fem.state0).shape[0]) == 4 * n_nodes
+
+    ts, U, _ = _trajectory(fem)
+    o = fem.offsets
+    xx = np.asarray(fem.points)[:, 0][:n_nodes]
+    w = np.sin(PI * xx)
+    au = (U[:, o[0] : o[1]] @ w) / (w @ w)
+    ap = (U[:, o[1] : o[2]] @ w) / (w @ w)
+    # each field oscillates at its own frequency: omega_u = pi, omega_p = 2 pi
+    assert np.max(np.abs(au - np.cos(PI * ts))) < 0.05, "u block does not track cos(pi t)"
+    assert np.max(np.abs(ap - np.cos(2 * PI * ts))) < 0.05, "p block does not track cos(2 pi t)"
 
 
 def test_second_order_1d_p2_wave_converges_at_second_order_in_time():

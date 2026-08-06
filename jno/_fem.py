@@ -4324,6 +4324,28 @@ def _sum_forcings(f1, f2):
     return summed
 
 
+def _ic_trial_side(bare: Any) -> Any:
+    """The trial-carrying side of an IC residual ``<trial-expr>(initial) - g`` (or ``None``)."""
+    if getattr(bare, "op", None) == "-" and hasattr(bare, "left") and hasattr(bare, "right"):
+        left, right = bare.left, bare.right
+        if _contains(left, TrialFunction) and not _contains(right, TrialFunction):
+            return left
+        if _contains(right, TrialFunction) and not _contains(left, TrialFunction):
+            return right
+    return None
+
+
+def _ic_component(bare: Any) -> Any:
+    """Which component an IC residual addresses: ``i`` for ``u(initial)[i] - g``, ``None`` for all.
+
+    A vector field written with one IC *per component* produces several residuals, each of which
+    :func:`_ic_value_at_nodes` renders as a full-length vector that is zero outside its own stripe.
+    Combining them by plain assignment would let the last one blank the others, so a caller that
+    accumulates several ICs needs to know which stripe each owns."""
+    trial_side = _ic_trial_side(bare)
+    return None if trial_side is None else _component_index_of(trial_side)
+
+
 def _ic_value_at_nodes(bare: Any, domain: Any, pts: Any, n: int, vec: int = 1) -> Any:
     """Nodal value vector (``n`` dofs, node-major interleaved for ``vec>1``) from an IC residual
     ``<trial-expr>(initial) - g``.
@@ -4334,13 +4356,10 @@ def _ic_value_at_nodes(bare: Any, domain: Any, pts: Any, n: int, vec: int = 1) -
     evaluated at the **assembly** nodes ``pts`` (P2 carries edge nodes, so they differ from the
     linear mesh); a vector ``g`` may be a constant per-component tuple (broadcast to every node), a
     full ``(n_nodes·vec,)`` field, or a single scalar (broadcast to all components)."""
-    trial_side = value_node = None
-    if getattr(bare, "op", None) == "-" and hasattr(bare, "left") and hasattr(bare, "right"):
-        left, right = bare.left, bare.right
-        if _contains(left, TrialFunction) and not _contains(right, TrialFunction):
-            trial_side, value_node = left, right
-        elif _contains(right, TrialFunction) and not _contains(left, TrialFunction):
-            trial_side, value_node = right, left
+    trial_side = _ic_trial_side(bare)
+    value_node = None
+    if trial_side is not None:
+        value_node = bare.right if trial_side is bare.left else bare.left
     if value_node is None:
         return jnp.zeros((n,))
     from .utils.solver.parametric_helpers import _is_neural_coefficient

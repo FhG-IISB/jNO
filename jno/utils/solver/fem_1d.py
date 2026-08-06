@@ -513,8 +513,7 @@ def assemble_fem_1d(
     from ...trace import FemLinearSystem, FemResidualOperator
     from .weak_form import _contains_temporal_derivative, _is_obviously_nonlinear_in_unknown
 
-    if int(vec) != 1:
-        raise NotImplementedError(f"jno.fem: 1D (LINE2) assembly supports a scalar unknown (vec=1) only; got vec={vec}.")
+    vec = int(vec)
 
     # ---- runtime parameters: the differentiable-inverse path. A `jno.np.parameter` in the form makes
     # the system PARAMETRIC -- the operator and load are re-formed from the runtime args on every call
@@ -620,6 +619,25 @@ def assemble_fem_1d(
     )
 
 
+def _stack_initial_conditions_1d(domain, ic_residuals, pts, ndof: int, vec: int):
+    """Combine every initial-condition residual into one ``(ndof,)`` initial state.
+
+    A vector field is usually given one IC *per component* (``u(initial)[i] - g_i``), and each renders
+    as a full-length vector that is zero outside its own stripe. Taking only ``ic_residuals[0]`` — as
+    this path used to — silently left every other component at zero; overwriting with each in turn
+    would blank the earlier ones. Each IC writes only the dofs it addresses, so per-component and
+    all-component forms combine, and a later all-component IC still overrides."""
+    from ..._fem import _bare, _ic_component, _ic_value_at_nodes
+
+    state0 = jnp.zeros(ndof)
+    for ic in ic_residuals:
+        bare = _bare(ic)
+        val = jnp.asarray(_ic_value_at_nodes(bare, domain, pts, ndof, vec), state0.dtype)
+        comp = _ic_component(bare)
+        state0 = state0.at[comp::vec].set(val[comp::vec]) if comp is not None else val
+    return state0
+
+
 def _apply_dirichlet_transient(M, A, c, dirichlet_pairs: List[Tuple[int, float]]):
     """Apply Dirichlet to a semidiscrete linear block ``M u̇ + A u = c``.
 
@@ -643,7 +661,7 @@ def _assemble_1d_transient(
     ``_strip_temporal_trial_derivative``); the spatial part + boundary terms become
     the operator. Linear -> ``M``/``A`` payload; nonlinear -> ``mass``/``residual``/
     ``jacobian`` callables."""
-    from ..._fem import _bare, _ic_value_at_nodes
+    from ..._fem import _bare
     from .backend_blocks import SemidiscreteTimeBlock
     from .solver_helper import max_temporal_derivative_order as _mto
     from .time_route import _infer_time_window, _strip_temporal_trial_derivative
@@ -735,15 +753,12 @@ def _assemble_1d_transient(
             aug_d = jnp.concatenate([dd, dd + n])  # the constrained rows in BOTH blocks
             M_aug = bcoo_zero_rows(M_aug, aug_d)  # mass rows are algebraic -> zeroed
         # the initial state lives on the DOF nodes, which for P2 include the element midpoints
+        # displacement IC u(0)=u0 and optional velocity IC u̇(0)=v0, each split by temporal order and
+        # then combined per addressed component (a vector field carries one IC per component)
         pts = jnp.asarray(dof_coords)
-        u0 = jnp.zeros((n,), z.dtype)
-        v0 = jnp.zeros((n,), z.dtype)
-        for ic in ic_residuals:  # displacement IC u(0)=u0 + optional velocity IC u̇(0)=v0
-            val = jnp.asarray(_ic_value_at_nodes(_bare(ic), domain, pts, ndof, vec), z.dtype)
-            if _mto(_bare(ic)) >= 1:
-                v0 = val
-            else:
-                u0 = val
+        u0 = _stack_initial_conditions_1d(domain, [ic for ic in ic_residuals if _mto(_bare(ic)) < 1], pts, ndof, vec)
+        v0 = _stack_initial_conditions_1d(domain, [ic for ic in ic_residuals if _mto(_bare(ic)) >= 1], pts, ndof, vec)
+        u0, v0 = jnp.asarray(u0, z.dtype), jnp.asarray(v0, z.dtype)
         if dpairs:
             u0, v0 = u0.at[dd].set(dg), v0.at[dd].set(0.0)
         t0, t1, dt = _infer_time_window(domain)
@@ -800,12 +815,8 @@ def _assemble_1d_transient(
     mass_terms = [_strip_temporal_trial_derivative(t) for t in temporal_terms]
 
     dirichlet_pairs = _dirichlet_dofs(domain, dirichlet_values, vec)
-    if ic_residuals:
-        # the initial state lives on the DOF nodes, which for P2 include the element midpoints
-        pts = jnp.asarray(dof_coords)
-        state0 = _ic_value_at_nodes(_bare(ic_residuals[0]), domain, pts, ndof, vec)
-    else:
-        state0 = jnp.zeros(ndof)
+    # the initial state lives on the DOF nodes, which for P2 include the element midpoints
+    state0 = _stack_initial_conditions_1d(domain, ic_residuals, jnp.asarray(dof_coords), ndof, vec)
     t0, t1, dt = _infer_time_window(domain)
 
     # The MASS must be parameter-free. It is assembled once, outside the per-args re-forming, so a
