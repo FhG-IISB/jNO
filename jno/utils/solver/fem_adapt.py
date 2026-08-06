@@ -1035,6 +1035,12 @@ class AdaptSpec:
     tangling (a stock optimiser / a barrier alone cannot guarantee this on stiff problems)."""
     lr: float = 3e-3
     """Relocation only: base step size for the RMS-normalised energy-gradient descent."""
+    objective: str = "equidistribution"
+    """Relocation only, **internal / not yet exposed** by :func:`jno.solve.relocate`: which mesh functional
+    to descend. ``"equidistribution"`` (default) is :func:`_equidistribution_jax`, the scale-free
+    equidistribution defect of an arclength monitor; ``"huang"`` is :func:`_huang_ea_jax`, Huang's
+    equidistribution+alignment functional with the same (isotropic) monitor. Present so the two can be
+    measured against each other on the same problem before either is given a public spelling."""
 
 
 # Consecutive rounds that must satisfy ``eps`` before the loop stops on convergence.
@@ -1248,6 +1254,72 @@ def _equidistribution_jax(pts, u_nodal, cells, dim):
     return jnp.mean((w - wbar) ** 2) / wbar**2
 
 
+def _huang_ea_jax(pts, pts0, u_nodal, cells, dim, *, theta=1.0 / 3.0, p=1.5):
+    r"""Huang's **equidistribution–alignment** meshing functional — the variational r-adaptivity objective.
+
+    Huang, *Variational mesh adaptation: isotropy and equidistribution* (2001); stated as Example 2.2 and
+    discretized as eq. (6) of Huang & Kamenski, *A geometric discretization and a simple implementation for
+    variational mesh generation and adaptation*, J. Comput. Phys. **301** (2015) 322–337
+    (arXiv:1410.7872)::
+
+        I[ξ] = θ ∫_Ω √det(M) · tr(J M⁻¹ Jᵀ)^(dp/2) dx
+             + (1−2θ)·d^(dp/2) ∫_Ω √det(M) · (det(J)/√det(M))^p dx
+
+    **Conventions, because both are easy to invert and the wrong one equidistributes backwards.**
+    ``J = ∂ξ/∂x`` is the Jacobian of the *inverse* map (computational-from-physical) — meshing functionals
+    are written in terms of it because the transformation so determined is less likely to be singular
+    (Dvinsky 1991). The integral is over the **physical** domain, so the discrete sum is weighted by the
+    **physical** element volume ``|K|``, and ``J`` is discretized as ``(F'_K)⁻¹`` with ``F_K: K_c → K`` the
+    affine element map — not by differentiating anything on the mesh, which is what preserves the
+    functional's geometric structure.
+
+    Here ``pts`` is the physical (moving) mesh and ``pts0`` the computational (fixed) one, so with ``E``
+    the physical and ``Ê`` the computational edge matrix, ``J_K = Ê E⁻¹`` and ``|K| = |det E|/d!``.
+
+    The two terms are the **alignment** condition (elements shaped and oriented by ``M``) and the
+    **equidistribution** condition (equal share of ``∫√det M``). :func:`_equidistribution_jax`, the
+    objective this one is measured against, is a scale-free proxy for the *second* term alone with an
+    isotropic monitor; the first term has no counterpart there.
+
+    ``M`` is isotropic here — ``M = ρ^(2/d) I`` for the same arclength density ``ρ`` that
+    :func:`_equidistribution_jax` uses, so a comparison between the two isolates the functional rather than
+    confounding it with a change of monitor. A genuine metric-tensor ``M`` (the anisotropic case, where the
+    alignment term earns its keep) needs a differentiable recovered Hessian and is deferred.
+
+    Defaults ``θ = 1/3``, ``p = 3/2`` are MMPDElab's (Huang, arXiv:1904.05535). They sit inside the
+    coercivity + polyconvexity conditions ``0 < θ ≤ 1/2``, ``dp ≥ 2``, ``p ≥ 1``, which is what underwrites
+    the mesh-nonsingularity result; ``1 − 2θ = θ`` there, so the two conditions carry equal weight.
+
+    **The barrier is the point.** ``det J → 0`` drives the second term to ``+∞``: an element cannot flatten
+    without paying infinite energy. That is the coercivity that replaces a ``det J`` step-control heuristic
+    — so ``det J`` is deliberately *not* clamped here. The gradient is only ever taken at a valid mesh.
+    """
+    import jax.numpy as jnp
+
+    v, v0 = pts[cells], pts0[cells]  # (n_cell, dim+1, dim)
+    u_nodal = u_nodal[:, None] if u_nodal.ndim == 1 else u_nodal
+    s = u_nodal[cells]
+    e = jnp.stack([v[:, i + 1] - v[:, 0] for i in range(dim)], axis=1)  # Eᵀ, physical
+    e0 = jnp.stack([v0[:, i + 1] - v0[:, 0] for i in range(dim)], axis=1)  # Êᵀ, computational
+    du = jnp.stack([s[:, i + 1] - s[:, 0] for i in range(dim)], axis=1)
+    grad = jnp.linalg.solve(e, du)  # (n_cell, dim, n_comp)
+
+    g2 = jnp.sum(grad**2, axis=(1, 2))  # |∇u|² per element
+    rho = jnp.sqrt(1.0 + g2 / (jnp.mean(g2) + 1e-30))  # arclength density, as in _equidistribution_jax
+
+    # J = Ê E⁻¹, so Jᵀ = (E⁻¹)ᵀ Êᵀ = solve(Eᵀ, Êᵀ) = solve(e, e0). Frobenius norm and det are
+    # transpose-invariant, so the transpose never has to be formed.
+    a = jnp.linalg.solve(e, e0)  # = Jᵀ
+    fro2 = jnp.sum(a**2, axis=(1, 2))  # tr(J Jᵀ)
+    det_j = jnp.linalg.det(a)
+    vol = jnp.abs(jnp.linalg.det(e)) / (2.0 if dim == 2 else 6.0)  # |K|, PHYSICAL
+
+    m_inv = rho ** (-2.0 / dim)  # M = ρ^(2/d)·I  ⇒  M⁻¹ = ρ^(-2/d)·I
+    align = rho * (m_inv * fro2) ** (dim * p / 2.0)
+    equi = rho * (det_j / rho) ** p
+    return jnp.sum(vol * (theta * align + (1.0 - 2.0 * theta) * dim ** (dim * p / 2.0) * equi))
+
+
 def _transient_march_fn(block):
     """Build a differentiable ``args -> time-averaged nodal state`` for a :class:`SemidiscreteTimeBlock`.
 
@@ -1360,16 +1432,24 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
             return newton_krylov(lambda uu: op.residual(uu, vals), u0)
         return _march(vals)  # transient: time-averaged nodal state over the marched trajectory
 
+    if spec.objective not in ("equidistribution", "huang"):
+        raise ValueError(f"AdaptSpec.objective must be 'equidistribution' or 'huang'; got {spec.objective!r}.")
+
     def _block_defect(u, pts, bounds):
-        """Equidistribution defect summed over every solution block — the mirror of :func:`_block_energy`,
-        so a scalar / vector / complex / coupled multifield all contribute their own monitor."""
+        """Mesh functional summed over every solution block — the mirror of :func:`_block_energy`, so a
+        scalar / vector / complex / coupled multifield all contribute their own monitor. Which functional
+        is :attr:`AdaptSpec.objective`; both take the same arclength monitor, so switching between them
+        changes the functional alone."""
         d_ = 0.0
         for i in range(len(bounds) - 1):
             blk = u[bounds[i] : bounds[i + 1]]
             nb = int(blk.shape[0])
             veci = nb // n_verts if (n_verts and nb % n_verts == 0) else 1
             bf = blk.reshape(n_verts, veci) if veci > 1 else blk[:n_verts]
-            d_ = d_ + _equidistribution_jax(pts, bf, cells_j, dim)
+            if spec.objective == "huang":
+                d_ = d_ + _huang_ea_jax(pts, pts0_j, bf, cells_j, dim)
+            else:
+                d_ = d_ + _equidistribution_jax(pts, bf, cells_j, dim)
         return d_
 
     def _objective(vals):

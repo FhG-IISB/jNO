@@ -256,3 +256,113 @@ def test_relocate_beats_a_uniform_mesh_on_an_underresolved_front():
     assert len(fem1.domain.mesh.points) == n0, "r-adaptivity must not change the node count"
     assert err_moved < err_uniform, f"relocation should beat a uniform mesh here: {err_moved:.3e} vs {err_uniform:.3e}"
     assert err_moved < 0.75 * err_uniform, f"expected a clear win, got ratio {err_moved / err_uniform:.2f}"
+
+
+# ── Huang's equidistribution+alignment functional (AdaptSpec.objective="huang") ──────────────────────
+#
+# Unit tests of the functional itself.  The conventions are the whole risk here: `J` is the Jacobian of
+# the INVERSE map (∂ξ/∂x) and the integral is over the PHYSICAL domain, so a sign/inversion slip yields a
+# functional that still looks plausible and equidistributes backwards.  `test_..._inverse_map_convention`
+# is the test that actually pins that down.
+
+_UNIT_SQUARE = (
+    np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]),
+    np.array([[0, 1, 2], [0, 2, 3]]),
+)
+
+
+def _huang(pts, pts0, u_nodal, cells, **kw):
+    import jax.numpy as jnp
+
+    from jno.utils.solver.fem_adapt import _huang_ea_jax
+
+    return float(_huang_ea_jax(jnp.asarray(pts), jnp.asarray(pts0), jnp.asarray(u_nodal), jnp.asarray(cells), 2, **kw))
+
+
+def test_huang_functional_matches_its_closed_form_at_the_identity_map():
+    """At ``x = ξ`` with a uniform monitor both conditions are exactly met, and the two terms collapse
+    onto the same value: ``I = (1−θ)·d^(dp/2)·ρ^(1−p)·|Ω|``.
+
+    Worth pinning as a number rather than a property: it fixes the *normalisation* of both terms and
+    their relative weight, which is where ``θ`` vs ``1−2θ`` would silently go wrong."""
+    pts, cells = _UNIT_SQUARE
+    u = pts[:, 0].copy()  # linear ⇒ |∇u|² is the same in both cells ⇒ ρ = sqrt(2) everywhere
+    theta, p, dim, area = 1.0 / 3.0, 1.5, 2, 1.0
+    rho = np.sqrt(2.0)
+    expected = (1.0 - theta) * dim ** (dim * p / 2.0) * rho ** (1.0 - p) * area
+    assert _huang(pts, pts, u, cells) == pytest.approx(expected, rel=1e-10)
+
+
+def test_huang_functional_scales_as_the_inverse_map_convention_requires():
+    """Uniformly scale the *physical* mesh by ``s`` at a fixed computational mesh: ``J = ∂ξ/∂x = s⁻¹I``,
+    ``|K| ∝ s^d``, so ``I(s) = I(1)·s^(d(1−p))`` — for ``d=2, p=3/2`` that is ``1/s``.
+
+    This is the convention test.  Had ``J`` been taken as ``∂x/∂ξ`` (the form quoted by several secondary
+    sources) the exponent would be ``d(1+p) = +5`` instead of ``−1`` — a factor of 10⁶ apart at ``s=10``,
+    while every identity-map check above still passes.  The monitor is scale-free by construction
+    (``|∇u|²`` normalised by its own mesh mean), so it does not contaminate the exponent."""
+    pts, cells = _UNIT_SQUARE
+    u = pts[:, 0].copy()
+    base = _huang(pts, pts, u, cells)
+    for s in (0.5, 2.0, 5.0):
+        assert _huang(s * pts, pts, u, cells) == pytest.approx(base * s ** (2 * (1.0 - 1.5)), rel=1e-9)
+
+
+def test_huang_functional_is_a_barrier_against_a_flattening_element():
+    """``det J → ∞`` as a physical element flattens, and the equidistribution term carries ``(det J)^p``
+    against only one factor of ``|K| ∝ det E``, so the functional diverges like ``(det E)^(1−p)``.
+
+    This is the coercivity that is meant to replace the backtracking ``det J`` line search (M2) — so it
+    must hold *before* the line search is removed, not after."""
+    pts0, cells = _UNIT_SQUARE
+    u = pts0[:, 0].copy()
+    vals = []
+    for gap in (1e-1, 1e-2, 1e-3, 1e-4):
+        pts = pts0.copy()
+        # slide vertex 3 perpendicularly onto the 0–2 diagonal, so cell [0,2,3] *approaches* flatness
+        # (landing it exactly on the diagonal gives det E = 0 and a NaN, not a limit)
+        pts[3] = [0.5 - gap / np.sqrt(2.0), 0.5 + gap / np.sqrt(2.0)]
+        vals.append(_huang(pts, pts0, u, cells))
+    assert np.isfinite(vals).all(), f"non-finite before degeneracy: {vals}"
+    assert all(b > a for a, b in zip(vals, vals[1:])), f"not monotone as the element flattens: {vals}"
+    assert vals[-1] > 1e3 * vals[0], f"barrier too weak: {vals[0]:.3e} -> {vals[-1]:.3e}"
+
+
+def test_huang_functional_gradient_is_finite_and_points_somewhere():
+    """The driver descends ``jax.grad`` of this — a NaN or an identically-zero gradient would stall
+    relocation silently rather than loudly."""
+    import jax.numpy as jnp
+
+    from jno.utils.solver.fem_adapt import _huang_ea_jax
+
+    pts0, cells = _UNIT_SQUARE
+    u = np.tanh((pts0[:, 0] - 0.5) / 0.1)  # a front, so the monitor is genuinely non-uniform
+    g = jax.grad(lambda p: _huang_ea_jax(p, jnp.asarray(pts0), jnp.asarray(u), jnp.asarray(cells), 2))(
+        jnp.asarray(pts0 * 1.0)
+    )
+    g = np.asarray(g)
+    assert np.isfinite(g).all(), "non-finite mesh gradient"
+    assert np.abs(g).max() > 1e-8, "gradient vanished — relocation would not move"
+
+
+def test_relocate_with_the_huang_objective_runs_and_keeps_the_mesh_valid():
+    """Driver-level: the alternative objective is wired through ``AdaptSpec.objective`` and descends."""
+    from jno.utils.solver.fem_adapt import AdaptSpec
+
+    d, fem = _peak_scalar()
+    cells = np.asarray(d.mesh.cells_dict["triangle"])
+    n0 = len(d.mesh.points)
+    fem.solve(adapt=AdaptSpec(relocate=True, max_iters=25, lr=3e-3, objective="huang"))
+    h = fem.adapt_history
+    assert len(h) > 0
+    assert h[-1]["objective"] < h[0]["objective"], f"objective did not fall: {h[0]['objective']} -> {h[-1]['objective']}"
+    assert len(fem.domain.mesh.points) == n0, "r-adaptivity must not change the node count"
+    assert _min_detj(np.asarray(fem.domain.mesh.points)[:, :2], cells) > 0.0, "mesh tangled"
+
+
+def test_relocate_rejects_an_unknown_objective():
+    from jno.utils.solver.fem_adapt import AdaptSpec
+
+    _d, fem = _peak_scalar()
+    with pytest.raises(ValueError, match="objective must be"):
+        fem.solve(adapt=AdaptSpec(relocate=True, max_iters=2, objective="dirichlet-energy"))
