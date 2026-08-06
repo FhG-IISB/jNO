@@ -2530,14 +2530,48 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, save_ts: Any = None, **kw
         This is a **general** defect of that branch, not of mesh motion; it is repaired here rather than in
         `SemidiscreteTimeBlock.step` because changing the default Krylov method for every parametric
         transient is a wider blast radius than this change should carry.
+
+        **Tolerance and budget -- this is what the march's wall time was.** Two defects compounded:
+
+        1. ``tol=1e-10`` is below float32 eps (1.2e-7), the default working precision, so the termination
+           test could never fire and every solve ran to its cap.
+        2. ``maxiter=None`` means ``10*n`` OUTER iterations, each of ``restart`` inner ones -- 10140 outer
+           at 1014 dofs. That is a scipy convention for un-restarted GMRES and is wildly wrong here.
+
+        Jacobi-preconditioned GMRES on this row-replaced (non-symmetric) operator stagnates rather than
+        converging quickly, so the cap, not the tolerance, sets the price. Measured at 1014 dofs over 5
+        steps, all giving an IDENTICAL answer (final ymax 1.02525 against the forward-Euler reference
+        1.02525, field finite, max 1.0000):
+
+        ===========================  ==============
+        ``tol=1e-10``, no cap          159 s/step
+        ``tol=1e-6``, no cap          30.8 s/step
+        ``tol``=eps-scaled, cap 20    **0.80 s/step**
+        ===========================  ==============
+
+        i.e. ~200x, for a solve that was already converged after two outer iterations -- the previous
+        state is an excellent initial guess and the step correction is small.
+
+        **Limitation:** the budget is fixed, so a stiffer step (much larger ``dt*kappa``, or a mesh fine
+        enough that Jacobi is too weak) can exhaust it and return an under-solved step *silently* -- a
+        residual check here would be traced away, since this runs inside the jitted step. The march's
+        accuracy is covered instead by the first-order convergence test against the analytic domain.
         """
         import jax
 
         dd = diag_fn()
         inv = 1.0 / jnp.where(jnp.abs(dd) > 1e-30, dd, 1.0)
         n = int(jnp.asarray(rhs).shape[0])
+        eps = float(jnp.finfo(jnp.asarray(rhs).dtype).eps)
         out, _ = jax.scipy.sparse.linalg.gmres(
-            step_op, rhs, x0=u0, tol=1e-10, atol=0.0, restart=min(n, 40), M=lambda x: inv * x
+            step_op,
+            rhs,
+            x0=u0,
+            tol=max(1e-10, 100.0 * eps),  # a tolerance the working precision can actually reach
+            atol=0.0,
+            restart=min(n, 40),
+            maxiter=20,  # bounded: this operator stagnates, so the cap is the price
+            M=lambda x: inv * x,
         )
         return out
 
