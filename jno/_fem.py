@@ -1327,14 +1327,15 @@ class FEM:
     ) -> Any:
         """Differentiable forward solve as a trace node — the inverse-problem entry.
 
-        Pass ``adapt=AdaptSpec(...)`` to run the **adaptive** loop
+        Pass ``adapt=jno.solve.remesh(...)`` to run the **adaptive** loop
         (``solve -> estimate -> mark -> refine``): the domain is remeshed in place to
         equidistribute a Zienkiewicz–Zhu error estimate, and this returns the solution
         on the final adapted mesh. After it returns, this ``FEM`` and its ``domain`` refer
         to that final mesh, and ``fem.adapt_history`` records the per-round trace. The
         refinement step is non-differentiable (discrete remeshing); gradients are exact on
         the frozen final mesh, so a differentiable inverse problem is run *after* adapting.
-        See :class:`jno.utils.solver.fem_adapt.AdaptSpec`.
+        See :func:`jno.solve.remesh` for h-adaptivity and :func:`jno.solve.relocate` for the
+        fixed-connectivity (r-adaptive) alternative, which stays differentiable end to end.
 
         Pass ``move=MovingBoundary(velocity=...)`` on a **transient** problem to run the
         **moving-boundary** loop: the domain boundary moves each step by the prescribed velocity, the

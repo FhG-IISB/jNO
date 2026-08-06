@@ -24,7 +24,6 @@ from shapely.geometry import Polygon, box  # noqa: E402
 
 import jno.jnp_ops as J  # noqa: E402
 from jno.utils.solver.fem_adapt import (  # noqa: E402
-    AdaptSpec,
     _solve_vertex_values,
     dorfler_mark,
     hessian_metric,
@@ -201,7 +200,7 @@ def test_fem_solve_adapt_drives_loop_and_rebinds():
     d = _l_shape_domain(mesh_size=0.2)
     fem = jno.fem(_build_singular_laplace(d))
     n0 = len(d.mesh.points)
-    sol = np.asarray(fem.solve(adapt=AdaptSpec(theta=0.6, max_iters=3, refine_factor=1.6))).reshape(-1)
+    sol = np.asarray(fem.solve(adapt=jno.solve.remesh(theta=0.6, max_iters=3, refine_factor=1.6))).reshape(-1)
 
     # the domain was refined in place and the FEM rebound to the final mesh
     assert len(d.mesh.points) > n0
@@ -235,7 +234,7 @@ def test_differentiable_inverse_on_adapted_mesh():
     # forward: adapt at a fixed coefficient to produce a refined mesh (in place)
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2)
     n0 = len(d.mesh.points)
-    _poisson_on(d, 1.0).solve(adapt=AdaptSpec(theta=0.6, max_iters=3, refine_factor=1.6))
+    _poisson_on(d, 1.0).solve(adapt=jno.solve.remesh(theta=0.6, max_iters=3, refine_factor=1.6))
     assert len(d.mesh.points) > n0
 
     # inverse on the frozen adapted mesh
@@ -319,7 +318,7 @@ def test_adaptive_inverse_beats_uniform_on_l_shape():
 
     d = _l_shape_domain(mesh_size=0.2)
     hist = run_adaptive_inverse(
-        d, build_inverse, AdaptSpec(theta=0.6, max_iters=5, refine_factor=1.6), n_opt=200, readout=readout
+        d, build_inverse, jno.solve.remesh(theta=0.6, max_iters=5, refine_factor=1.6), n_opt=200, readout=readout
     )
     k_adapt = hist[-1]["params"]
     dof_adapt = hist[-1]["n_dofs"]
@@ -349,7 +348,7 @@ def test_adapt_inverse_eps_requires_readout():
     """eps needs a readout to measure parameter convergence -- guard it explicitly."""
     d = _l_shape_domain(mesh_size=0.3)
     with pytest.raises(ValueError, match="readout"):
-        run_adaptive_inverse(d, lambda dd: (None, None), AdaptSpec(max_iters=3, eps=0.01), n_opt=1)
+        run_adaptive_inverse(d, lambda dd: (None, None), jno.solve.remesh(max_iters=3, eps=0.01), n_opt=1)
 
 
 def test_adapt_forward_eps_stops_on_plateau():
@@ -358,7 +357,7 @@ def test_adapt_forward_eps_stops_on_plateau():
     fem = jno.fem(_build_singular_laplace(d))
     # loose eps: consecutive estimate changes are well under 30%, so the plateau guard
     # (patience=2) trips within a few rounds instead of running all 15
-    fem.solve(adapt=AdaptSpec(theta=0.6, max_iters=15, refine_factor=1.5, eps=0.3))
+    fem.solve(adapt=jno.solve.remesh(theta=0.6, max_iters=15, refine_factor=1.5, eps=0.3))
     hist = fem.adapt_history
     assert 3 <= len(hist) < 15, f"eps did not stop the forward loop early (ran {len(hist)} rounds)"
 
@@ -384,7 +383,7 @@ def test_adapt_inverse_eps_stops_on_convergence():
 
     d = _l_shape_domain(mesh_size=0.2)
     hist = run_adaptive_inverse(
-        d, build_inverse, AdaptSpec(theta=0.6, max_iters=12, refine_factor=1.5, eps=0.05), n_opt=150, readout=readout
+        d, build_inverse, jno.solve.remesh(theta=0.6, max_iters=12, refine_factor=1.5, eps=0.05), n_opt=150, readout=readout
     )
     ks = [h["params"] for h in hist]
 
@@ -432,13 +431,13 @@ def test_anisotropic_adapt_beats_isotropic_on_oblique_layer():
     error estimate per DOF than isotropic ZZ + Dörfler."""
     # both run to a comparable DOF budget; anisotropic reaches a far lower estimate
     di = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1)
-    _oblique_layer_fem(di).solve(adapt=AdaptSpec(theta=0.7, max_iters=9, refine_factor=1.7, max_dofs=3000))
+    _oblique_layer_fem(di).solve(adapt=jno.solve.remesh(theta=0.7, max_iters=9, refine_factor=1.7, max_dofs=3000))
     # fem is rebound to the final mesh; rebuild on the adapted domain for a fresh estimate
     _, iso_est = zz_error_indicators(di, _solve_vertex_values(_oblique_layer_fem(di)))
     iso_dofs = len(di.mesh.points)
 
     da = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1)
-    _oblique_layer_fem(da).solve(adapt=AdaptSpec(anisotropic=True, max_iters=8, refine_factor=1.6, max_dofs=3000))
+    _oblique_layer_fem(da).solve(adapt=jno.solve.remesh(anisotropic=True, max_iters=8, refine_factor=1.6, max_dofs=3000))
     _, aniso_est = zz_error_indicators(da, _solve_vertex_values(_oblique_layer_fem(da)))
     aniso_dofs = len(da.mesh.points)
 
@@ -491,7 +490,7 @@ def test_adaptive_loop_3d_refines_at_layer():
     down, grows the mesh, and concentrates DOFs at the planar layer."""
     d = _cube(0.3)
     fem = _layer_3d_fem(d)
-    fem.solve(adapt=AdaptSpec(theta=0.6, max_iters=4, refine_factor=1.6, max_dofs=2500))
+    fem.solve(adapt=jno.solve.remesh(theta=0.6, max_iters=4, refine_factor=1.6, max_dofs=2500))
     hist = fem.adapt_history
 
     dofs = [h["n_dofs"] for h in hist]
@@ -516,12 +515,14 @@ def test_anisotropic_adapt_3d_stretches_and_beats_isotropic():
     """3D anisotropic (Hessian-metric) refinement stretches tetrahedra along a planar layer
     and reaches a far lower error estimate than isotropic at comparable DOFs."""
     di = _cube(0.28)
-    _layer_3d_fem(di, eps=0.05).solve(adapt=AdaptSpec(theta=0.6, max_iters=5, refine_factor=1.6, max_dofs=6000))
+    _layer_3d_fem(di, eps=0.05).solve(adapt=jno.solve.remesh(theta=0.6, max_iters=5, refine_factor=1.6, max_dofs=6000))
     _, iso_est = zz_error_indicators(di, _solve_vertex_values(_layer_3d_fem(di, eps=0.05)))
     iso_dofs = len(di.mesh.points)
 
     da = _cube(0.28)
-    _layer_3d_fem(da, eps=0.05).solve(adapt=AdaptSpec(anisotropic=True, max_iters=5, refine_factor=1.8, max_dofs=6000))
+    _layer_3d_fem(da, eps=0.05).solve(
+        adapt=jno.solve.remesh(anisotropic=True, max_iters=5, refine_factor=1.8, max_dofs=6000)
+    )
     _, aniso_est = zz_error_indicators(da, _solve_vertex_values(_layer_3d_fem(da, eps=0.05)))
     aniso_dofs = len(da.mesh.points)
 
@@ -553,7 +554,7 @@ def test_adaptive_beats_uniform_on_l_shape():
     # one adaptive run from a coarse mesh, driven through the public FEM.solve(adapt=) API
     d0 = _l_shape_domain(mesh_size=0.2)
     fem_a = jno.fem(_build_singular_laplace(d0))
-    sol = np.asarray(fem_a.solve(adapt=AdaptSpec(theta=0.7, max_iters=9, refine_factor=1.6))).reshape(-1)
+    sol = np.asarray(fem_a.solve(adapt=jno.solve.remesh(theta=0.7, max_iters=9, refine_factor=1.6))).reshape(-1)
     a_dofs = [h["n_dofs"] for h in fem_a.adapt_history]
     a_est = [h["estimate"] for h in fem_a.adapt_history]
     a_final_dof = a_dofs[-1]
@@ -595,7 +596,7 @@ def test_adapt_vector_field_isotropic_refines_and_estimate_drops():
     cent = np.asarray(d.mesh.points)[:, :2][np.asarray(d.mesh.cells_dict["triangle"])].mean(axis=1)
     assert np.linalg.norm(cent[int(np.argmax(eta0))] - (0.62, 0.37)) < 0.3, "the largest ZZ indicator sits at the feature"
 
-    fem.solve(adapt=AdaptSpec(theta=0.6, max_iters=3, refine_factor=1.7))
+    fem.solve(adapt=jno.solve.remesh(theta=0.6, max_iters=3, refine_factor=1.7))
     hist = fem.adapt_history
     assert hist[-1]["n_dofs"] > n0, "vector h-adapt must add DOFs at the feature"
     assert hist[-1]["estimate"] < hist[0]["estimate"], "vector h-adapt should reduce the ZZ estimate"
@@ -615,4 +616,4 @@ def test_adapt_vector_field_anisotropic_rejected():
     )
     fem = jno.fem([weak, u(xb, yb) - 0.0])
     with pytest.raises(NotImplementedError, match="scalar-only"):
-        fem.solve(adapt=AdaptSpec(theta=0.6, max_iters=2, anisotropic=True))
+        fem.solve(adapt=jno.solve.remesh(theta=0.6, max_iters=2, anisotropic=True))

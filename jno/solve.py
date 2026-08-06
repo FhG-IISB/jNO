@@ -58,6 +58,8 @@ __all__ = [
     "theta",
     "exponential",
     "adaptive",
+    "remesh",
+    "relocate",
 ]
 
 
@@ -598,6 +600,103 @@ def lstsq(A, b, *, damp: float = 0.0, atol: float = 1e-6, btol: float = 1e-6, ma
     from .utils.solver.matfun import lstsq as _lstsq
 
     return _lstsq(A, b, damp=damp, atol=atol, btol=btol, maxiter=maxiter, x0=x0)
+
+
+def remesh(
+    *,
+    anisotropic: bool = False,
+    max_dofs: int | None = None,
+    every: int = 5,
+    metric_field: int = 0,
+    hmin: float | None = None,
+    hmax: float | None = None,
+    theta: float = 0.5,
+    refine_factor: float = 2.0,
+    max_iters: int = 8,
+    tol: float | None = None,
+    eps: float | None = None,
+):
+    """**h-adaptivity** for ``fem.solve(adapt=...)``: change the mesh to follow the solution.
+
+    On a **steady** problem this is the refine loop — solve, estimate (Zienkiewicz–Zhu), mark
+    (Dörfler ``theta``), refine by ``refine_factor``, repeat up to ``max_iters`` — growing the mesh
+    toward convergence. On a **transient** problem it remeshes every ``every`` steps at a *constant*
+    budget and carries the state across (basis-aware transfer), so the mesh tracks a moving feature and
+    coarsens its wake instead of ratcheting up::
+
+        fem.solve(adapt=jno.solve.remesh(anisotropic=True, max_dofs=6000, every=4))
+
+    ``anisotropic=True`` refines on a Hessian metric (stretched elements aligned to the solution's
+    curvature) instead of isotropic ZZ marking — far fewer DOFs for a layer or a front, and the right
+    choice for an interface. ``hmin``/``hmax`` bound the edge sizes; ``metric_field`` picks which coupled
+    field drives the metric. Metric-based DOF control is approximate, so ``max_dofs`` is honoured only
+    loosely in that mode.
+
+    Steady-only: ``max_iters``, ``tol``, ``eps`` (a relative-change plateau detector, not a certified
+    bound). Transient-only: ``every``, ``metric_field``.
+
+    Args:
+        anisotropic: Hessian-metric refinement instead of isotropic ZZ + Dörfler marking.
+        max_dofs: Vertex budget. Steady: stop once reached. Transient: the constant target.
+        every: Transient only — remesh every ``every`` time steps.
+        metric_field: Transient multifield only — index of the field driving the metric.
+        hmin: Smallest allowed edge length (default: mean edge / 50).
+        hmax: Largest allowed edge length (default: 2 × mean edge).
+        theta: Dörfler bulk-marking fraction (0..1).
+        refine_factor: Local edge-size reduction applied to marked cells each round.
+        max_iters: Steady only — maximum refine-solve rounds.
+        tol: Steady only — stop once the global error estimate falls below this.
+        eps: Steady only — stop once the round's figure of merit stops moving by more than this
+            (two consecutive rounds required).
+
+    Returns:
+        The adaptation spec to pass as ``fem.solve(adapt=...)``.
+
+    See :func:`relocate` for the fixed-connectivity (r-adaptive) alternative, which is differentiable
+    end to end because it never changes the mesh topology.
+    """
+    from .utils.solver.fem_adapt import AdaptSpec
+
+    return AdaptSpec(
+        theta=theta,
+        max_iters=max_iters,
+        refine_factor=refine_factor,
+        tol=tol,
+        max_dofs=max_dofs,
+        eps=eps,
+        anisotropic=anisotropic,
+        hmin=hmin,
+        hmax=hmax,
+        every=every,
+        metric_field=metric_field,
+    )
+
+
+def relocate(*, lr: float = 3e-3, max_iters: int = 8, quality_floor: float = 0.1):
+    """**r-adaptivity** for ``fem.solve(adapt=...)``: move the mesh vertices, keep the connectivity.
+
+    Relocates the vertices tagged ``domain.variable(region)[i].trainable()`` down the FE-energy gradient
+    **through the differentiable solve**, at fixed connectivity and no new DOFs::
+
+        fem.solve(adapt=jno.solve.relocate(lr=3e-3))
+
+    Because the topology never changes, there is no mesh schedule to freeze and no cross-mesh transfer,
+    so this is differentiable end to end — unlike :func:`remesh`, whose refinement decisions are not.
+    Requires at least one coordinate tagged ``.trainable()`` before ``jno.fem`` (else it raises).
+
+    Args:
+        lr: Base step size for the RMS-normalised energy-gradient descent.
+        max_iters: Number of relocation steps.
+        quality_floor: A step is backtracked (halved) until no element's ``|det J|`` falls below this
+            fraction of the initial worst element — the mesh-validity line search that keeps the
+            relocation from tangling.
+
+    Returns:
+        The adaptation spec to pass as ``fem.solve(adapt=...)``.
+    """
+    from .utils.solver.fem_adapt import AdaptSpec
+
+    return AdaptSpec(relocate=True, lr=lr, max_iters=max_iters, quality_floor=quality_floor)
 
 
 def theta(theta: float = 1.0):

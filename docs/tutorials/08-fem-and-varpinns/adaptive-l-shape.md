@@ -24,13 +24,13 @@ continuously: the same nodes slide toward the corner, connectivity and DOF count
 
 ## Both live in the `adapt=` slot
 
-**h-adaptivity is one call.** `FEM.solve(adapt=AdaptSpec(...))` runs the whole classical loop internally
+**h-adaptivity is one call.** `FEM.solve(adapt=jno.solve.remesh(...=))` runs the whole classical loop internally
 — solve → [Zienkiewicz–Zhu](https://doi.org/10.1002/nme.1620240206) estimate → Dörfler mark → local mmg
 remesh — then rebinds the FEM and mutates the domain to the final adapted mesh, recording each round on
 `fem.adapt_history`:
 
 ```python
-sol = fem.solve(adapt=AdaptSpec(theta=0.6, max_iters=4, refine_factor=1.7))   # ADD elements
+sol = fem.solve(adapt=jno.solve.remesh(theta=0.6, max_iters=4, refine_factor=1.7))   # ADD elements
 ```
 
 **r-adaptivity is the same slot with `relocate=True`.** First make the interior vertices trainable:
@@ -44,7 +44,7 @@ xm, ym, _ = d.variable("mov", where=interior, split=True)
 xm.trainable(name="ix")            # literal, per component — x and y are separate coordinates
 ym.trainable(name="iy")
 ...
-sol = fem.solve(adapt=AdaptSpec(relocate=True, max_iters=60, lr=3e-3))         # RELOCATE nodes
+sol = fem.solve(adapt=jno.solve.relocate(max_iters=60, lr=3e-3))         # RELOCATE nodes
 ```
 
 No new DOFs, fixed connectivity, one JAX graph — no remeshing. The boundary is left fixed, so the L-shape

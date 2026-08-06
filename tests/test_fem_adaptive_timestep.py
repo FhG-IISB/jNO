@@ -435,4 +435,4 @@ def test_complex_transient_adapt_still_fails_loud():
     must fail loud rather than interpolate half a complex field."""
     _, fem = _complex_heat(mesh_size=0.3)
     with pytest.raises(NotImplementedError, match="complex"):
-        fem.solve(adapt=jno.AdaptSpec(every=2))
+        fem.solve(adapt=jno.solve.remesh(every=2))

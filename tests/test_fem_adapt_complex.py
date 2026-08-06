@@ -22,7 +22,7 @@ pytest.importorskip("shapely", reason="shapely required for PolygonDomain")
 import jax  # noqa: E402
 from shapely.geometry import box  # noqa: E402
 
-from jno.utils.solver.fem_adapt import AdaptSpec, zz_error_indicators  # noqa: E402
+from jno.utils.solver.fem_adapt import zz_error_indicators  # noqa: E402
 from jno.utils.solver.linear import sparse_lu_solve  # noqa: E402
 
 
@@ -81,7 +81,7 @@ def test_complex_helmholtz_adaptive_solve_converges():
     fem = jno.fem([ui.x * vi.x + ui.y * vi.y - (100.0 + 2j) * (u * vi) - f * vi, u(xb, yb) - 0.0])
     assert fem.is_complex
 
-    sol = np.asarray(fem.solve(adapt=AdaptSpec(theta=0.6, max_iters=4, refine_factor=1.7), solve_fn=sparse_lu_solve))
+    sol = np.asarray(fem.solve(adapt=jno.solve.remesh(theta=0.6, max_iters=4, refine_factor=1.7), solve_fn=sparse_lu_solve))
     assert np.iscomplexobj(sol) and float(np.abs(sol.imag).max()) > 1e-6, "must be a genuine complex solve"
     hist = fem.adapt_history
     assert len(hist) >= 3
@@ -101,7 +101,7 @@ def test_complex_adaptive_supports_scalar_p2():
     ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
     f = (1 + 0.5j) * jno.np.exp(-((xi - 0.5) ** 2 + (yi - 0.5) ** 2) / (2 * 0.04**2))
     fem = jno.fem([ui.x * vi.x + ui.y * vi.y - (80.0 + 2j) * (u * vi) - f * vi, u(xb, yb) - 0.0])
-    sol = np.asarray(fem.solve(adapt=AdaptSpec(theta=0.6, max_iters=3, refine_factor=1.7), solve_fn=sparse_lu_solve))
+    sol = np.asarray(fem.solve(adapt=jno.solve.remesh(theta=0.6, max_iters=3, refine_factor=1.7), solve_fn=sparse_lu_solve))
     assert np.iscomplexobj(sol)
     assert fem.adapt_history[-1]["n_dofs"] > fem.adapt_history[0]["n_dofs"], "P2 complex adaptive must refine"
 
@@ -136,7 +136,7 @@ def test_adaptive_preserves_robin_source_across_remesh():
             -(1j * k * ur) * vr,  # top/left/right absorb (non-reflecting)
         ]
     )
-    sol = np.asarray(fem.solve(adapt=AdaptSpec(theta=0.6, max_iters=3, refine_factor=1.6), solve_fn=sparse_lu_solve))
+    sol = np.asarray(fem.solve(adapt=jno.solve.remesh(theta=0.6, max_iters=3, refine_factor=1.6), solve_fn=sparse_lu_solve))
     hist = fem.adapt_history
     assert hist[-1]["n_dofs"] > hist[0]["n_dofs"], "the mesh must refine"
     assert float(np.abs(sol).mean()) > 0.3, f"the Robin source must survive remesh (|u| mean={np.abs(sol).mean():.3f})"
@@ -207,7 +207,7 @@ def test_adaptive_supports_vector_field():
     zi = z.bind(x=xi, y=yi)
     weak = jno.np.inner(jno.np.grad(w, [xi, yi]), jno.np.grad(z, [xi, yi]), n_contract=2) - (zi[0] + zi[1])
     fem = jno.fem([weak, w(xb, yb)[0] - 0.0, w(xb, yb)[1] - 0.0])
-    sol = np.asarray(fem.solve(adapt=AdaptSpec(max_iters=2), solve_fn=sparse_lu_solve)).reshape(-1)
+    sol = np.asarray(fem.solve(adapt=jno.solve.remesh(max_iters=2), solve_fn=sparse_lu_solve)).reshape(-1)
     assert sol.shape[0] == 2 * len(fem.domain.mesh.points), "vector adaptive solve returns 2 DOFs per node"
 
 
@@ -221,4 +221,4 @@ def test_adaptive_anisotropic_rejects_complex():
     ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
     fem = jno.fem([ui.x * vi.x + ui.y * vi.y - (10.0 + 1j) * (u * vi) - (1 + 0.2j) * vi, u(xb, yb) - 0.0])
     with pytest.raises(NotImplementedError, match="real-only"):
-        fem.solve(adapt=AdaptSpec(anisotropic=True, max_iters=2), solve_fn=sparse_lu_solve)
+        fem.solve(adapt=jno.solve.remesh(anisotropic=True, max_iters=2), solve_fn=sparse_lu_solve)

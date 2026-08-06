@@ -54,7 +54,7 @@ forward solve — no glue code, no finite differences, no leaving JAX.
 | **Linear & nonlinear solvers** — `jno.solve` / `jno.precond` | [stable](https://fhg-iisb.github.io/jNO/) | Sparse-direct LU, Jacobi-BiCGStab, GMRES, CG, MINRES, Chebyshev, geometric multigrid, optional GPU **AMG** — matrix-free and differentiable |
 | **Generalized eigenproblems** — `fem.eigs` | [beta](https://fhg-iisb.github.io/jNO/) | `K x = λ M x`, differentiable, M-orthonormal |
 | **Time integration** | [stable](https://fhg-iisb.github.io/jNO/) | θ-method (backward-Euler / Crank–Nicolson), exponential integrators, adaptive step size |
-| **Adaptive meshing** — `AdaptSpec` / `MovingBoundary` | [beta](https://fhg-iisb.github.io/jNO/) | Hessian-metric remeshing (AFEM), moving boundaries, r-adaptivity |
+| **Adaptive meshing** — `jno.solve.remesh` / `relocate` / `MovingBoundary` | [beta](https://fhg-iisb.github.io/jNO/) | Hessian-metric remeshing (AFEM), moving boundaries, r-adaptivity |
 | **Differentiable inverse / PDE-constrained** | [stable](https://fhg-iisb.github.io/jNO/tutorials/05-coupled-and-inverse/inverse-parameter/) | Recover a scalar, a field `k(x)`, the geometry, or a **neural coefficient** through any solve — the gradient flows through the whole march |
 | **Geometry** — `jno.Shape` / `jno.Path` | [stable](https://fhg-iisb.github.io/jNO/) | CSG via gmsh-OCC; conforming multi-material regions |
 
