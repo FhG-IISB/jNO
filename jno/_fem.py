@@ -1335,7 +1335,8 @@ class FEM:
         refinement step is non-differentiable (discrete remeshing); gradients are exact on
         the frozen final mesh, so a differentiable inverse problem is run *after* adapting.
         See :func:`jno.solve.remesh` for h-adaptivity and :func:`jno.solve.relocate` for the
-        fixed-connectivity (r-adaptive) alternative, which stays differentiable end to end.
+        fixed-connectivity (r-adaptive) alternative, whose vertex map is differentiable in the monitor
+        and needs no cross-mesh transfer.
 
         Pass ``move=MovingBoundary(velocity=...)`` on a **transient** problem to run the
         **moving-boundary** loop: the domain boundary moves each step by the prescribed velocity, the

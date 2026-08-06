@@ -479,14 +479,36 @@ xm.trainable(); ym.trainable()                              # BEFORE jno.fem(...
 u = fem.solve(adapt=jno.solve.relocate(max_iters=60))
 ```
 
-`jno.solve.relocate()` descends the FE energy through the differentiable solve with a **backtracking
-`det J` line search** — so the fixed node set concentrates at solution features and the mesh never tangles
-(the validity constraint lives in the step control; a stock optimiser or an energy barrier alone cannot
-guarantee it on a stiff problem — see `run_adaptive_relocate`). It mutates the domain to the relocated mesh,
-returns the solution there, and **raises** if no coordinate was tagged. Works across **linear, nonlinear
-(Newton), transient (relocates for the whole trajectory via a time-averaged objective), periodic, and
-complex** problems, scalar or vector — the energy sums over every solution block, so a complex field's real
-and imaginary parts both contribute. Only complex-*transient* is not wired yet.
+`jno.solve.relocate()` descends the **equidistribution defect** of an arclength monitor through the
+differentiable solve, with a **backtracking `det J` line search** — so the fixed node set concentrates at
+solution features and the mesh never tangles (the validity constraint lives in the step control; a stock
+optimiser or an energy barrier alone cannot guarantee it on a stiff problem — see `run_adaptive_relocate`).
+It mutates the domain to the relocated mesh, returns the solution there, and **raises** if no coordinate was
+tagged. Works across **linear, nonlinear (Newton), transient (relocates for the whole trajectory via a
+time-averaged objective), periodic, and complex** problems, scalar or vector — the objective sums over every
+solution block, so a complex field's real and imaginary parts both contribute. Only complex-*transient* is
+not wired yet.
+
+Tagging is **literal and per-axis**: `xm.trainable()` frees only the x column. On a boundary that is the
+lever for sliding — free an edge's along-edge axis and its nodes redistribute *within* the wall, leave the
+normal axis untagged and the domain shape is preserved exactly.
+
+`method="monge_ampere"` swaps the descent for a Monge–Ampère mesh solve, `m·det(I + H(φ)) = θ` with
+`x = ξ + ∇φ` (McRae, Cotter & Budd, SIAM J. Sci. Comput. **40**(2) 2018, arXiv:1612.08077 §3.1). The
+displacement is a gradient, so the *whole* map cannot fold and no line search is needed, and it converges in
+3–6 rounds against descent's 30. It is **not** the default, because on the Allen–Cahn front the suite
+measures (`h=0.06`, `eps=0.03`, error on a common fine grid so the metric does not depend on where each mesh
+puts its nodes) it loses on the answer:
+
+| mesh | rel-L2 | vs uniform | min element quality |
+|---|---|---|---|
+| uniform | 1.096e-01 | 1.000 | 0.834 |
+| `relocate()` (descent) | 3.951e-02 | **0.361** | 0.503 |
+| `relocate(method="monge_ampere")` | 8.879e-02 | 0.811 | 0.160 |
+
+The cause is structural rather than a tuning miss: with one global `θ`, concentrating elements at the front
+forces the rest of the domain to stretch, which is why element quality collapses far from the feature. The
+control is under-relaxation — `relax_step=0.02` recovers quality to 0.318 and the ratio to 0.633.
 
 ---
 

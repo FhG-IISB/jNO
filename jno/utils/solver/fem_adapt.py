@@ -1112,29 +1112,34 @@ class AdaptSpec:
     # --- r-adaptivity (mesh relocation) --------------------------------------------------------------
     relocate: bool = False
     """Switch ``FEM.solve(adapt=...)`` from h-refinement (add elements) to **r-adaptivity**: relocate the
-    mesh vertices tagged with :meth:`Variable.trainable` down the FE-energy gradient — *through the
-    differentiable solve* — at fixed connectivity and no new DOFs. Requires at least one coordinate tagged
+    mesh vertices tagged with :meth:`Variable.trainable` so the mesh equidistributes the solution's
+    features, at fixed connectivity and no new DOFs. Requires at least one coordinate tagged
     ``domain.variable(region)[i].trainable()`` before ``jno.fem`` (else it raises). See
-    :func:`run_adaptive_relocate`. ``max_iters`` sets the number of relocation steps; ``lr`` the step size."""
+    :func:`run_adaptive_relocate`; :attr:`relocate_method` picks *how* the vertices move."""
     quality_floor: float = 0.1
-    """Relocation only: a step is backtracked (halved) until no element's ``|det J|`` falls below this
-    fraction of the initial worst element — the mesh-validity line search that keeps the relocation from
-    tangling (a stock optimiser / a barrier alone cannot guarantee this on stiff problems)."""
+    """``relocate_method="descent"`` only: a step is backtracked (halved) until no element's ``|det J|``
+    falls below this fraction of the initial worst element — the mesh-validity line search that keeps the
+    descent from tangling (a stock optimiser / a barrier alone cannot guarantee this on stiff problems).
+    Unused by ``"monge_ampere"``, which needs no line search."""
     lr: float = 3e-3
-    """Relocation only: base step size for the RMS-normalised energy-gradient descent."""
+    """``relocate_method="descent"`` only: base step size for the RMS-normalised gradient descent."""
     ma_relax: int = 60
     """``relocate_method="monge_ampere"`` only: relaxation iterations per outer round (McRae et al. §3.1).
-    Each is one Poisson solve against a pre-factorized constant matrix, so these are cheap."""
+    Each is one Poisson solve against a pre-factorized constant matrix, so these are cheap. The relaxation
+    is explicit in :attr:`ma_dt`, so more is not monotonically better — see :func:`jno.solve.relocate`."""
     ma_dt: float = 0.1
     """``relocate_method="monge_ampere"`` only: the relaxation pseudo-step ``Δt`` of eq. (3.7). Larger
     converges faster and can overshoot; the nonlinearity is carried entirely by this outer relaxation."""
     relocate_method: str = "descent"
-    """Relocation only, **internal / not yet exposed** by :func:`jno.solve.relocate`: *how* the mesh is
-    moved. ``"descent"`` (default) walks the vertices down :attr:`objective` with a mesh-validity line
-    search. ``"monge_ampere"`` instead solves a Monge-Ampère equation for a mesh potential ``φ`` and takes
-    the mesh as ``x = ξ + ∇φ`` (:func:`_monge_ampere_displacement`) — no descent, no line search, and
-    non-tangling by construction because the displacement is a gradient. ``objective`` is then only a
-    *diagnostic* (nothing is descended); ``lr`` and ``quality_floor`` are unused."""
+    """Relocation only: *how* the mesh is moved. ``"monge_ampere"`` — what :func:`jno.solve.relocate`
+    builds — solves a Monge-Ampère equation for a mesh potential ``φ`` and takes the mesh as ``x = ξ + ∇φ``
+    (:func:`_monge_ampere_displacement`): no descent, no line search, and non-folding by construction
+    because the displacement is a gradient (for the *whole* map — see that function on what holding a
+    subset costs). ``objective`` is then only a *diagnostic*; ``lr`` and ``quality_floor`` are unused.
+    ``"descent"`` (the dataclass default, reached only by constructing an ``AdaptSpec`` directly) instead
+    walks the vertices down :attr:`objective` with a mesh-validity line search. It is **kept for
+    measurement**, not for use: on a single front it reached equidistribution spread 0.91 against Monge-
+    Ampère's 0.70, and needed 20-30 rounds against 8."""
     objective: str = "equidistribution"
     """Relocation only, **internal / not yet exposed** by :func:`jno.solve.relocate`: which mesh functional
     to descend. ``"equidistribution"`` (default) is :func:`_equidistribution_jax`, the scale-free
@@ -1513,8 +1518,43 @@ def _monge_ampere_displacement(monitor, ops, cells, dim, *, n_relax=60, dt=0.1):
     - ``φ`` is P1 here, so ``∇φ`` is elementwise-constant and both it and ``σ`` are patch-recovered.
       The paper takes ``φ ∈ P_n, n ≥ 2`` and L²-projects ``∇φ`` into ``[P1]^d`` (eq. (3.5)); patch
       recovery is the cheaper stand-in and is the same order.
-    - Natural (Neumann) boundary treatment only — the caller decides which vertices may move, and the
-      relocation driver holds every untagged vertex exactly, so the boundary never drifts.
+    - Natural (Neumann) boundary treatment only. The caller decides which vertices may move and the
+      driver holds every untagged vertex exactly — but note that **holding vertices is what can tangle
+      the mesh**, not this solve. Non-folding is a property of the *whole* map ``x = ξ + ∇φ``; apply it
+      to a subset and the truncated map carries no such guarantee. Measured on a 21² unit square with a
+      diagonal front: applied to every vertex ``min det J`` stays positive across ``dt ∈ [0.01, 0.2]`` and
+      ``n_relax ∈ [40, 300]``, while freezing the boundary reaches ``-1.2e-03``. Freeing each boundary
+      edge's *tangential* axis only (``x`` on a horizontal edge, ``y`` on a vertical one — which per-axis
+      :meth:`~jno.trace.Placeholder.trainable` tagging expresses directly) recovers almost all of it and
+      equidistributes better, because the held component is then only the one normal to the wall.
+      Whatever the tagging, :func:`run_adaptive_relocate` checks ``det J`` and keeps the last valid mesh.
+    - The relaxation is **explicit in** ``dt`` and has a stability limit, so more iterations is not
+      monotonically better: at ``dt = 0.2`` the equidistribution spread on that same mesh *degrades*
+      from 0.111 at ``n_relax = 40`` to 0.292 at 300. Lower ``dt`` before raising ``n_relax``.
+
+    **The map is global, and that is intrinsic.** ``det(I + H(φ)) = θ/m`` carries a single *global* ``θ``, so
+    concentrating elements where ``m`` is large forces every region where ``m`` is small to stretch — area has
+    to come from somewhere. Elements far from the feature are therefore distorted whether or not that helps:
+    measured on the Allen-Cahn front, largest/smallest element area ratio 8.3 and worst radius-ratio quality
+    0.160, against 2.4 and 0.834 for the uniform mesh it started from (and 3.3 / 0.503 for ``"descent"``,
+    which reaches partial equidistribution in damped steps and so stays gentler).
+
+    The lever is **under-relaxation**, not a boundary condition: lowering ``dt`` stops short of exact
+    equidistribution and keeps the map closer to the identity away from the feature (``dt`` 0.10 → 0.02 moved
+    quality 0.160 → 0.318 and the error ratio 0.811 → 0.633). Imposing ``φ = 0`` on the held vertices does
+    *not* localize it — ``φ = 0`` does not make ``∇φ = 0``, so the recovered displacement at a held vertex
+    beside a free one is if anything *larger* (0.107 against 0.075 measured), and the truncation gets worse
+    rather than better. Genuine confinement needs the problem restricted to the tagged sub-mesh, which is not
+    implemented.
+
+    **Graded computational meshes.** What this solves equidistributes ``m`` against the *ratio*
+    ``|K_phys|/|K_comp|``, not against ``|K_phys|`` — so on a graded ξ (an already h-adapted mesh, i.e. the
+    ``remesh`` → ``relocate`` composition) the grading and the monitor would compound and the adaptation
+    would be applied twice. ``monitor`` is therefore pre-multiplied here by the local computational cell
+    size, after which ``m·|K_phys| = θ`` — true equidistribution — holds on any ξ. The size is the *mean*
+    incident element volume, not ``wsum`` (the incident volume *sum*, which halves at an edge and quarters
+    at a corner purely from patch arity and would push nodes off the boundary of a perfectly uniform mesh).
+    On a uniform ξ the factor is constant and this is a no-op.
     """
     import jax
     import jax.numpy as jnp
@@ -1525,6 +1565,11 @@ def _monge_ampere_displacement(monitor, ops, cells, dim, *, n_relax=60, dt=0.1):
     lu = jax.scipy.linalg.lu_factor(jnp.asarray(k_shift))  # constant mesh ⇒ factorize ONCE
     n_vert = wsum.shape[0]
     total = float(measure.sum())
+
+    counts = np.zeros(n_vert)  # incident element count per vertex (patch arity)
+    np.add.at(counts, cells.ravel(), 1.0)
+    k_comp = wsum / np.maximum(counts, 1.0)  # mean incident element volume = local computational cell size
+    monitor = monitor * jnp.asarray(k_comp / k_comp.mean())  # a global scale cancels in θ; kept O(1) for dt
     fac = 1.0 / ((dim + 1) * (dim + 2))  # P1 consistent mass: ∫φᵢφⱼ = |K|·(1+δᵢⱼ)/((d+1)(d+2))
 
     n_local = cells.shape[1]
@@ -1588,17 +1633,24 @@ def _transient_march_fn(block):
 def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwargs: Any) -> np.ndarray:
     """Drive ``FEM.solve(adapt=AdaptSpec(relocate=True, ...))`` -- **r-adaptivity** (mesh relocation).
 
-    Relocate the mesh vertices tagged with :meth:`Variable.trainable` down the FE Dirichlet-energy gradient
-    -- evaluated *through the differentiable solve* (``∂(solve)/∂X``) -- at **fixed connectivity** and no new
-    DOFs, with a **backtracking line search on ``det J``** so the mesh never tangles (a stock optimiser or a
-    barrier alone cannot guarantee validity on stiff problems -- the constraint must live in the step control).
-    Concentrates a *fixed* node set at solution features; the relocation companion of the h-refinement
-    :func:`run_adaptive_solve`.
+    Relocate the mesh vertices tagged with :meth:`Variable.trainable` at **fixed connectivity** and no new
+    DOFs, so a *fixed* node set concentrates at the solution's features; the relocation companion of the
+    h-refinement :func:`run_adaptive_solve`. ``spec.relocate_method`` picks how:
 
-    ``spec.max_iters`` relocation steps, ``spec.lr`` step size, ``spec.quality_floor`` the validity bound.
+    - ``"monge_ampere"`` (what :func:`jno.solve.relocate` builds) re-solves a Monge-Ampère problem each
+      round from the **original** mesh with a freshly sampled monitor, so rounds never compound. Needs no
+      line search -- the map is a gradient -- but each round is still validity-checked, because holding the
+      untagged vertices truncates that map (:func:`_monge_ampere_displacement`).
+    - ``"descent"`` walks the vertices down ``spec.objective`` -- evaluated *through the differentiable
+      solve* (``∂(solve)/∂X``) -- with a **backtracking line search on ``det J``**, since on a stiff problem
+      neither a stock optimiser nor an energy barrier can guarantee validity from outside the step control.
+
+    Either way the loop keeps the **last valid mesh**: a round that would invert or diverge is dropped and
+    the loop stops there rather than returning a broken mesh.
+
     Requires ≥1 coordinate tagged ``domain.variable(region)[i].trainable()`` before ``jno.fem`` (else raises).
     Mutates ``fem`` / its domain to the relocated mesh (like the refinement loop) and returns the solution there;
-    ``fem.adapt_history`` traces the per-step energy.
+    ``fem.adapt_history`` traces the per-round objective and energy.
     """
     import jax
     import jax.numpy as jnp
@@ -1737,17 +1789,32 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
             disp = _monge_ampere_displacement(m, ops, cells, dim, n_relax=spec.ma_relax, dt=spec.ma_dt)
             return disp, _block_defect(u, pts, bounds), _block_energy(u, pts, bounds)
 
-        for it in range(spec.max_iters):
+        # `max_iters` MOVES need `max_iters + 1` evaluations, so each history entry's ``objective`` is the
+        # objective OF its own ``points`` rather than of the mesh one round earlier.
+        best = -1
+        for it in range(spec.max_iters + 1):
             disp, obj, e = _ma_round(arrs)
+            history.append({"step": it, "objective": float(obj), "energy": float(e), "points": _moved(arrs)})
+            # Keep the BEST mesh, not the last. Monge-Ampère does not descend this objective -- it solves a
+            # different problem -- and holding the untagged vertices truncates its map, so a round genuinely
+            # can make the mesh worse (badly, when few vertices are free: 13 of 57 raised the defect ~10%).
+            # Descent cannot do this, its line search forbids it; the outer loop has to supply the guarantee.
+            if best < 0 or float(obj) < history[best]["objective"]:
+                best = it
+            if it == spec.max_iters:
+                break
             cand = [pts0_j[sp["ids"], sp["axis"]] + disp[jnp.asarray(sp["ids"]), sp["axis"]] for sp in coord_specs]
             # `not (x > 0)` rather than `x <= 0`: the relaxation is explicit in `ma_dt` and diverges past
             # its stability limit, and `nan <= 0` is False -- a diverged solve would sail through the
-            # naive test and move the mesh to NaN. Folding should not happen (the map is a gradient);
-            # divergence can. Either way, keep the last valid mesh.
+            # naive test and move the mesh to NaN. Folding should not happen for the whole map (it is a
+            # gradient); a truncated map and a diverged relaxation both can.
             if not (_min_detj(_moved(cand)) > 0.0):
                 break
             arrs = cand
-            history.append({"step": it, "objective": float(obj), "energy": float(e), "points": _moved(arrs)})
+        # Truncate to the accepted trajectory so the last entry IS the mesh handed back (and an animation
+        # of `history` ends on it) rather than a rejected excursion past it.
+        history[:] = history[: best + 1]
+        arrs = [jnp.asarray(history[best]["points"][sp["ids"], sp["axis"]]) for sp in coord_specs]
         return _finish_relocate(fem, dom, coord_specs, arrs, pts0, n_verts, dim, cells, history, solve_fn, kwargs)
 
     msq = [jnp.zeros_like(a) for a in arrs]  # RMSProp running average (near-feature gradients dwarf the rest)

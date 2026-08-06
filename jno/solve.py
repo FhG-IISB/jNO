@@ -652,8 +652,9 @@ def remesh(
     Returns:
         The adaptation spec to pass as ``fem.solve(adapt=...)``.
 
-    See :func:`relocate` for the fixed-connectivity (r-adaptive) alternative, which is differentiable
-    end to end because it never changes the mesh topology.
+    See :func:`relocate` for the fixed-connectivity (r-adaptive) alternative: it keeps the topology, so
+    there is no mesh schedule to freeze and no cross-mesh transfer, and its vertex map is differentiable
+    in the monitor. The two compose — remesh first, then relocate on the result.
     """
     from .utils.solver.fem_adapt import AdaptSpec
 
@@ -672,31 +673,93 @@ def remesh(
     )
 
 
-def relocate(*, lr: float = 3e-3, max_iters: int = 8, quality_floor: float = 0.1):
+def relocate(
+    *,
+    method: str = "descent",
+    max_iters: int = 8,
+    lr: float = 3e-3,
+    quality_floor: float = 0.1,
+    relax: int = 60,
+    relax_step: float = 0.1,
+):
     """**r-adaptivity** for ``fem.solve(adapt=...)``: move the mesh vertices, keep the connectivity.
 
-    Relocates the vertices tagged ``domain.variable(region)[i].trainable()`` down the FE-energy gradient
-    **through the differentiable solve**, at fixed connectivity and no new DOFs::
+    Moves the vertices tagged ``domain.variable(region)[i].trainable()`` so the mesh **equidistributes**
+    the solution's features, at fixed connectivity and no new DOFs::
 
-        fem.solve(adapt=jno.solve.relocate(lr=3e-3))
+        xm, ym, _ = domain.variable("core", where=interior, split=True)
+        xm.trainable(); ym.trainable()                  # BEFORE jno.fem(...)
+        u = fem.solve(adapt=jno.solve.relocate())
 
-    Because the topology never changes, there is no mesh schedule to freeze and no cross-mesh transfer,
-    so this is differentiable end to end — unlike :func:`remesh`, whose refinement decisions are not.
     Requires at least one coordinate tagged ``.trainable()`` before ``jno.fem`` (else it raises).
+    Tagging is **literal and per-axis**: ``xm.trainable()`` frees only the x column. That is the lever for
+    boundary vertices — free an edge's *along-edge* axis and its nodes slide within the wall; leave the
+    normal axis untagged and the domain shape is preserved exactly.
+
+    **Two methods.** ``"descent"`` (default) walks the vertices down the equidistribution defect of an
+    arclength monitor, evaluated *through the differentiable solve*, with a backtracking ``det J`` line
+    search — on a stiff problem neither a stock optimiser nor an energy barrier can guarantee validity from
+    outside the step control. ``"monge_ampere"`` instead solves ``m·det(I + H(φ)) = θ`` for a mesh potential
+    and takes ``x = ξ + ∇φ`` (McRae, Cotter & Budd, *Optimal-transport-based mesh adaptivity on the plane
+    and sphere using finite elements*, SIAM J. Sci. Comput. **40**(2) (2018) A1121–A1148, arXiv:1612.08077,
+    §3.1); the displacement is a gradient, so the *whole* map cannot fold and no line search is needed.
+
+    Measured on the Allen–Cahn front the suite uses (``h = 0.06``, ``eps = 0.03``, 377 nodes), error on a
+    common fine grid so the comparison does not depend on where each mesh puts its nodes:
+
+    ==================  ===========  ============  ==================
+    method              rel-L2       vs uniform    min element quality
+    ==================  ===========  ============  ==================
+    uniform             1.096e-01    1.000         0.834
+    ``"descent"``       3.951e-02    **0.361**     0.503
+    ``"monge_ampere"``  8.879e-02    0.811         0.160
+    ==================  ===========  ============  ==================
+
+    So descent stays the default: Monge–Ampère converges in far fewer rounds (3–6 against 30) and reaches a
+    comparable equidistribution defect, but it degrades element quality badly here and the answer with it.
+    Lowering ``relax_step`` recovers part of the gap (0.811 → 0.633 at ``relax_step=0.02``).
+
+    Further limits, measured rather than argued:
+
+    - **Monge–Ampère's non-folding is a property of the whole map.** Holding a subset of vertices truncates
+      it, and the truncation is what can tangle: on a 21² square with a diagonal front, freezing the whole
+      boundary reached ``min det J = -1.2e-03`` where the full map stayed positive throughout. Freeing
+      tangential axes recovers nearly all of it. Either method checks ``det J`` each round and keeps the
+      last valid mesh, so a bad tagging costs accuracy, not correctness.
+    - Its relaxation is explicit in ``relax_step``: past the stability limit more iterations make things
+      *worse* (spread 0.111 → 0.292 going from ``relax=40`` to ``300`` at ``relax_step=0.2``).
+    - The monitor is arclength-based, which suits an **under-resolved** feature; on an already
+      well-resolved mesh a curvature monitor wins. Not yet selectable.
+    - Relocation beats :func:`remesh` when features are few and sharp; loses when they are spread through
+      the domain (with four separated fronts the crossover moved below one element per feature width) or
+      when the mesh already over-resolves them. The two **compose** — remesh, then relocate on the result.
 
     Args:
-        lr: Base step size for the RMS-normalised energy-gradient descent.
-        max_iters: Number of relocation steps.
-        quality_floor: A step is backtracked (halved) until no element's ``|det J|`` falls below this
-            fraction of the initial worst element — the mesh-validity line search that keeps the
-            relocation from tangling.
+        method: ``"descent"`` or ``"monge_ampere"``.
+        max_iters: Outer relocation rounds.
+        lr: ``"descent"`` only — base step for the RMS-normalised descent.
+        quality_floor: ``"descent"`` only — a step is halved until no element's ``|det J|`` falls below this
+            fraction of the initial worst element.
+        relax: ``"monge_ampere"`` only — relaxation iterations per round (McRae et al. eq. (3.7)). Each is
+            one Poisson solve against a matrix factorized once for the whole run, so these are cheap.
+        relax_step: ``"monge_ampere"`` only — the relaxation pseudo-step ``Δt``.
 
     Returns:
         The adaptation spec to pass as ``fem.solve(adapt=...)``.
     """
+    if method not in ("descent", "monge_ampere"):
+        raise ValueError(f"jno.solve.relocate(method={method!r}): expected 'descent' or 'monge_ampere'.")
     from .utils.solver.fem_adapt import AdaptSpec
 
-    return AdaptSpec(relocate=True, lr=lr, max_iters=max_iters, quality_floor=quality_floor)
+    return AdaptSpec(
+        relocate=True,
+        relocate_method=method,
+        max_iters=max_iters,
+        lr=lr,
+        quality_floor=quality_floor,
+        ma_relax=relax,
+        ma_dt=relax_step,
+    )
 
 
 def theta(theta: float = 1.0):

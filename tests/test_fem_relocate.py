@@ -426,6 +426,12 @@ def test_monge_ampere_never_folds_the_mesh_without_a_line_search():
     involved — this is the property that lets the line search be deleted, which is what unblocks
     differentiation.
 
+    **The claim is about the WHOLE map**, applied to every vertex — which is what this asserts. Hold a
+    subset (as the driver does for every untagged vertex) and the truncated map carries no such guarantee:
+    on this same problem, freezing the boundary reaches ``min det J = -1.2e-03`` at settings where the full
+    map stays positive throughout. That is why :func:`run_adaptive_relocate` still validity-checks every
+    round, and it is covered by :func:`test_monge_ampere_truncated_by_a_frozen_boundary_can_fold`.
+
     Driven hard: a 13:1 monitor demands a √13 ≈ 3.6× linear compression, and nodes move ~2 cells. Note
     ``dt`` stays inside the relaxation's stability window — divergence is a *separate* failure mode from
     folding, and is covered by :func:`test_monge_ampere_divergence_is_caught_not_silently_accepted`."""
@@ -435,6 +441,23 @@ def test_monge_ampere_never_folds_the_mesh_without_a_line_search():
     moved = pts + disp
     assert np.abs(disp).max() > 1.5 / 14, "not actually driven hard -- nodes barely moved"
     assert _min_detj(moved, cells) > 0.0, f"mesh folded: min det J = {_min_detj(moved, cells):.3e}"
+
+
+def test_monge_ampere_truncated_by_a_frozen_boundary_can_fold():
+    """The other half of the guarantee, stated so it cannot be mistaken for a bug later: applying ``∇φ`` to
+    only *some* vertices is no longer the Monge-Ampère map, and the result can invert. Same monitor and
+    same settings as the whole-map case above, which stays valid — the only difference is the freeze."""
+    pts, cells = _mesh_grid(21)
+    monitor = np.sqrt(1.0 + 9.0 * np.exp(-(((pts[:, 0] + pts[:, 1] - 1.0) / 0.12) ** 2)))
+    disp = _ma_disp(monitor, pts, cells, n_relax=300, dt=0.05)
+    bd = (pts[:, 0] < 1e-12) | (pts[:, 0] > 1 - 1e-12) | (pts[:, 1] < 1e-12) | (pts[:, 1] > 1 - 1e-12)
+    frozen = pts.copy()
+    frozen[~bd] += disp[~bd]
+    assert _min_detj(pts + disp, cells) > 0.0, "the whole map must stay valid — that is the guarantee"
+    assert _min_detj(frozen, cells) < 0.0, (
+        "expected the frozen-boundary truncation to invert here; if the method improved, keep the "
+        "distinction documented rather than deleting it — the driver's validity check depends on it"
+    )
 
 
 def test_monge_ampere_divergence_is_caught_not_silently_accepted():
@@ -493,3 +516,29 @@ def test_relocate_rejects_an_unknown_method():
     _d, fem = _peak_scalar()
     with pytest.raises(ValueError, match="relocate_method must be"):
         fem.solve(adapt=AdaptSpec(relocate=True, max_iters=2, relocate_method="mmpde"))
+
+
+def test_relocate_method_is_selectable_from_the_public_spec():
+    """Both methods are reachable through ``jno.solve.relocate`` — the ``AdaptSpec`` route is internal."""
+    assert jno.solve.relocate().relocate_method == "descent", "descent is the default (it wins on accuracy)"
+    assert jno.solve.relocate(method="monge_ampere").relocate_method == "monge_ampere"
+    spec = jno.solve.relocate(method="monge_ampere", relax=25, relax_step=0.02)
+    assert (spec.ma_relax, spec.ma_dt) == (25, 0.02), "the Monge-Ampere knobs must reach the spec"
+    with pytest.raises(ValueError, match="expected 'descent' or 'monge_ampere'"):
+        jno.solve.relocate(method="mmpde")
+
+
+def test_relocate_monge_ampere_returns_its_best_mesh_not_its_last():
+    """Monge-Ampère does not descend the objective — it solves a different problem, and truncating its map
+    to the tagged vertices can make a round *worse*. Measured: on a periodic problem with 13 of 57 vertices
+    free, running to the last round raised the defect ~10%. The outer loop therefore keeps the best mesh
+    visited, and trims the history so its final entry is the mesh actually handed back."""
+    d, fem = _peak_scalar()
+    fem.solve(adapt=jno.solve.relocate(method="monge_ampere", max_iters=10))
+    hist = fem.adapt_history
+    objs = [h["objective"] for h in hist]
+    pts_final = np.asarray(fem.domain.mesh.points)[:, :2]
+
+    assert objs[-1] == min(objs), f"returned a worse mesh than one it visited: {objs}"
+    assert objs[-1] <= objs[0], "relocation must never hand back a mesh worse than the one it started from"
+    assert np.allclose(hist[-1]["points"], pts_final), "the last history entry must BE the returned mesh"
