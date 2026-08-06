@@ -3673,11 +3673,6 @@ def _fem_impl(
                 f"jno.fem: 1D Lagrange elements are implemented for order 1 (LINE2) and 2 (LINE3); "
                 f"got order={_order_1d}. Use order<=2, or refine the mesh for accuracy."
             )
-        if _order_1d > 1 and multifield:
-            raise NotImplementedError(
-                "jno.fem: higher-order (P2 / LINE3) elements on a 1D domain are single-field only for "
-                "now -- the coupled 1D block assembler is P1. Use order=1 for the coupled system."
-            )
         # ---- complex 1D: the same real-equivalent split the 2D/3D and non-nodal paths use ----
         # Every other `_is_complex_form` dispatch sits BELOW this branch, so before this a `1j` on a
         # line domain reached the real assembler: the stiffness came out complex128 while the load

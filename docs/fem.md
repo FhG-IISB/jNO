@@ -44,7 +44,10 @@ u_h = fem.solve()          # matrix-free default; slots pick anything else (see 
   On a **1D line domain** orders 1 (LINE2) and 2 (LINE3) are available — P2 adds a dof per element
   midpoint, so read `fem.points` for the coordinates the solution lives on. Measured on
   `-u'' + u = f`: P1 converges at O(h²) nodally and P2 at O(h⁴), which at an equal 41 dofs is
-  4.7e-5 against 2.4e-7. Higher orders, and P2 on a *coupled* 1D system, are not wired (clear errors).
+  4.7e-5 against 2.4e-7. A **coupled** 1D system carries a per-field order, so a mixed-order pair
+  (the 1D Taylor-Hood shape) assembles — the blocks are then unequal and the coupling blocks
+  rectangular, so read `fem.field_points` for each field's dof coordinates. Orders above 2 are not
+  wired (clear error).
   A `jno.np.parameter` coefficient (scalar or nodal field) also works on a **steady linear** 1D form, so
   a 1D differentiable inverse problem runs through `crux.solve` — as does a **neural** (`jno.nn.wrap`)
   coefficient, so a learned `k(x)` can be trained from 1D data. Transient too — recovering a diffusivity

@@ -459,9 +459,9 @@ def test_1d_transient_parameter_on_the_mass_fails_loud():
         jno.fem([rho * (ui.t * vi) + ui.x * vi.x, u(xb) - 0.0, u(ci) - jno.np.sin(np.pi * ci)])
 
 
-def test_order3_and_coupled_p2_fail_loud():
-    """Scope, stated explicitly: 1D Lagrange is implemented for order 1 and 2, and the *coupled* 1D
-    block assembler is still P1 — both refuse rather than silently solving at the wrong order."""
+def test_order3_fails_loud():
+    """Scope, stated explicitly: 1D Lagrange is implemented for order 1 and 2 — a higher order refuses
+    rather than silently solving at the wrong one."""
     d = _line(0.25)
     u, phi = d.fem_symbols(order=3)
     xi = d.variable("interior", split=True)[0]
@@ -783,6 +783,114 @@ def test_coupled_nonlinear_transient_recovers():
     assert w[:n].std() < 1e-10 and w[n:].std() < 1e-10  # spatially uniform
     assert abs(w[:n].mean() - u_ex) / u_ex < 1e-2
     assert abs(w[n:].mean() - p_ex) / p_ex < 3e-2
+
+
+# ==========================================================================
+# coupled 1D — per-field element order (P2 and mixed / Taylor-Hood shape)
+# ==========================================================================
+def _coupled_orders(ms, ou, op):
+    """``-u'' + p = f1 ; -p'' + u = f2`` with ``u* = sin(pi x)``, ``p* = sin(2 pi x)``, zero Dirichlet.
+    Each field is requested at its own Lagrange order."""
+    d = _line(ms)
+    u, v = d.fem_symbols(names=("u", "v"), order=ou)
+    p, q = d.fem_symbols(names=("p", "q"), order=op)
+    xi = d.variable("interior", split=True)[0]
+    xb = d.variable("boundary", split=True)[0]
+    ui, vi = u.bind(x=xi), v.bind(x=xi)
+    pi_, qi = p.bind(x=xi), q.bind(x=xi)
+    s1, s2 = jno.np.sin(np.pi * xi), jno.np.sin(2 * np.pi * xi)
+    f1 = (np.pi**2) * s1 + s2
+    f2 = (4 * np.pi**2) * s2 + s1
+    return d, jno.fem([ui.x * vi.x + pi_ * vi - f1 * vi, pi_.x * qi.x + ui * qi - f2 * qi, u(xb) - 0.0, p(xb) - 0.0])
+
+
+@pytest.mark.parametrize("ou,op", [(1, 1), (2, 1), (1, 2), (2, 2)])
+def test_coupled_1d_per_field_order_sizes_each_block(ou, op):
+    """Each coupled field carries its OWN order, so the blocks are unequal — a P2 field adds one dof
+    per element midpoint, a P1 field does not. The coupled 1D assembler used to be P1-only and refused
+    ``order>1`` outright; sizing a P2 block with the vertex count would truncate it instead.
+
+    ``fem.field_points`` reports each field's dof coordinates, because with mixed orders the block
+    vector has no single coordinate list."""
+    ms = 0.05
+    d, fem = _coupled_orders(ms, ou, op)
+    n_vert = int(np.asarray(d.mesh.points).shape[0])
+    n_elem = int(np.asarray(d.mesh.cells_dict["line"]).shape[0])
+    n_u = n_vert + (n_elem if ou == 2 else 0)
+    n_p = n_vert + (n_elem if op == 2 else 0)
+    assert fem.offsets == [0, n_u, n_u + n_p]
+    assert fem.dofs == n_u + n_p
+
+    fp = fem.field_points
+    assert [int(np.asarray(x).shape[0]) for x in fp] == [n_u, n_p]
+
+    # and it solves: each field recovered on its own dofs
+    sol = np.asarray(fem.solve()).reshape(-1)
+    xu, xp = np.asarray(fp[0]).reshape(-1), np.asarray(fp[1]).reshape(-1)
+    assert np.max(np.abs(sol[:n_u] - np.sin(np.pi * xu))) < 1e-3
+    assert np.max(np.abs(sol[n_u:] - np.sin(2 * np.pi * xp))) < 1e-3
+
+
+@pytest.mark.parametrize("order,rate", [(1, 2.0), (2, 4.0)])
+def test_coupled_1d_equal_order_converges_at_its_order(order, rate):
+    """The point of P2 on a coupled system: the nodal error must fall at O(h^2k), not at the P1 rate.
+    Measured on the u block, where both fields share the order so neither limits the other."""
+    errs = []
+    for ms in (0.1, 0.05, 0.025):
+        fem = _coupled_orders(ms, order, order)[1]
+        sol = np.asarray(fem.solve()).reshape(-1)
+        n_u = fem.offsets[1]
+        xu = np.asarray(fem.field_points[0]).reshape(-1)
+        errs.append(float(np.max(np.abs(sol[:n_u] - np.sin(np.pi * xu)))))
+    rates = [np.log2(errs[i] / errs[i + 1]) for i in range(len(errs) - 1)]
+    assert all(abs(r - rate) < 0.3 for r in rates), f"P{order} coupled rates {rates}, expected ~{rate}"
+
+
+def test_coupled_1d_mixed_order_coupling_blocks_are_rectangular():
+    """The structural consequence of mixed order: the off-diagonal coupling blocks are *rectangular*
+    (n_u x n_p), which a shared-node-count layout could not represent. Both couplings must be present
+    and non-zero, or the two equations are not actually coupled."""
+    fem = _coupled_orders(0.1, 2, 1)[1]
+    n_u = fem.offsets[1]
+    A = _dense(fem.A)
+    assert A.shape[0] == fem.dofs and A.shape[0] != 2 * n_u  # unequal blocks
+    assert A[:n_u, n_u:].shape != A[n_u:, :n_u].shape  # rectangular, transposed shapes differ
+    assert np.any(np.abs(A[:n_u, n_u:]) > 1e-12) and np.any(np.abs(A[n_u:, :n_u]) > 1e-12)
+
+
+def test_coupled_1d_mixed_order_transient_seeds_every_dof():
+    """A P2 field's initial state must be seeded at its element midpoints too, not only at the mesh
+    vertices — otherwise the march starts from a state that is right on the vertices and zero between
+    them. The IC is sampled on each field's own dof coordinates."""
+    d = _line(0.05, time=(0.0, 0.02, 11))
+    u, v = d.fem_symbols(names=("u", "v"), order=2)
+    p, q = d.fem_symbols(names=("p", "q"))
+    co = d.variable("interior", split=True)
+    xi, ti = co[0], co[1]
+    xb = d.variable("boundary", split=True)[0]
+    ci = d.variable("initial", split=True)[0]
+    ui, vi = u.bind(x=xi, t=ti), v.bind(x=xi, t=ti)
+    pi_, qi = p.bind(x=xi, t=ti), q.bind(x=xi, t=ti)
+    fem = jno.fem(
+        [
+            ui.t * vi + ui.x * vi.x,
+            pi_.t * qi + pi_.x * qi.x - u.bind(x=xi, t=ti) * qi,
+            u(xb) - 0.0,
+            p(xb) - 0.0,
+            u(ci) - jno.np.sin(np.pi * ci),
+            p(ci) - 0.0,
+        ]
+    )
+    n_u = fem.offsets[1]
+    xu = np.asarray(fem.field_points[0]).reshape(-1)
+    assert len(xu) == n_u > int(np.asarray(d.mesh.points).shape[0]), "the P2 block is not midpoint-sized"
+    s0 = np.asarray(fem.state0)
+    assert s0.shape[0] == fem.dofs
+    assert np.max(np.abs(s0[:n_u] - np.sin(np.pi * xu))) < 1e-12, "IC not seeded on every P2 dof"
+    assert np.allclose(s0[n_u:], 0.0)
+    traj = np.asarray(fem.solve().fn())
+    assert traj.shape[1] == fem.dofs
+    assert np.max(np.abs(traj[-1, :n_u])) < np.max(np.abs(traj[0, :n_u]))  # the heat block decays
 
 
 # ==========================================================================
