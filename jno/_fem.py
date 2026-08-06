@@ -1634,14 +1634,23 @@ class FEM:
             or (time is not None)
         )
         if getattr(self, "_geometry", None):
-            # A geometry term states that the mesh moves. Nothing else in this method would act on it, and a
-            # boundary that silently fails to move is a wrong answer with no symptom -- so refuse rather than
-            # solve on the undeformed mesh.
-            raise NotImplementedError(
-                "jno.fem: a geometry term (`coord.d(t) - velocity`) was given, but the mesh-motion driver "
-                "is not wired up yet, and solving would silently leave the mesh where it started. Use "
-                "`fem.solve(move=jno.MovingBoundary(velocity=...))` until it lands."
-            )
+            # A geometry term (`coord.d(t) - velocity`) states that the mesh moves. Its driver owns the
+            # march, so it cannot share the call with anything else that also owns it.
+            if adapt is not None or move is not None or has_slots:
+                raise NotImplementedError(
+                    "jno.fem: a geometry term (`coord.d(t) - velocity`) does not compose with adapt=/move= or "
+                    "the solver slots (x0/nonlinear/linear/precond/time) yet — the mesh-motion driver owns the "
+                    "march and re-assembles each step. Solve with the geometry term alone (default θ-stepper)."
+                )
+            if self._mode != "transient":
+                raise NotImplementedError(
+                    f"jno.fem: a geometry term needs a transient problem (a u.t term); this FEM is "
+                    f"'{self._mode}'. `coord.d(t) - velocity` moves the mesh *in time* — add the time "
+                    "derivative and a domain time grid, or drop the geometry term."
+                )
+            from .utils.solver.fem_adapt import run_mesh_motion
+
+            return run_mesh_motion(self, solve_fn=solve_fn, **kwargs)
         if move is not None:
             if adapt is not None or has_slots:
                 raise NotImplementedError(

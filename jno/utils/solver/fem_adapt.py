@@ -933,7 +933,9 @@ def _p1_stiffness(domain: Any):
     return coo_matrix((ke.reshape(-1), (ii, jj)), shape=(n, n)).tocsr()
 
 
-def harmonic_extension(domain: Any, boundary_displacement: np.ndarray) -> np.ndarray:
+def harmonic_extension(
+    domain: Any, boundary_displacement: np.ndarray, *, prescribed: np.ndarray | None = None
+) -> np.ndarray:
     r"""Harmonically extend a **boundary** displacement into the mesh interior (ALE mesh motion).
 
     Solves the vector Laplace problem :math:`\nabla^2 d = 0` in the interior with :math:`d` fixed to
@@ -949,9 +951,15 @@ def harmonic_extension(domain: Any, boundary_displacement: np.ndarray) -> np.nda
     domain
         A meshed 2-D/3-D simplicial ``jno`` domain.
     boundary_displacement
-        ``(n_vert, dim)`` array; **only its boundary-vertex rows are read** (as Dirichlet data).  Interior
+        ``(n_vert, dim)`` array; **only its prescribed rows are read** (as Dirichlet data).  The remaining
         rows are ignored and overwritten by the harmonic solve -- build a full-length array and set the
-        boundary rows to the desired boundary motion (e.g. an interface velocity times ``dt``).
+        prescribed rows to the desired motion (e.g. an interface velocity times ``dt``).
+    prescribed
+        Boolean ``(n_vert,)`` mask of the vertices whose displacement is *given*.  Defaults to the
+        geometric boundary, which is the ALE case.  Pass it when the motion is stated on an arbitrary
+        region -- a geometry term ``coord.d(t) - v`` may name an interior region or a ``where=`` predicate
+        just as well as a boundary, and then *those* vertices are the Dirichlet data and everything else
+        (including the outer boundary) relaxes around them.
 
     Returns
     -------
@@ -975,10 +983,17 @@ def harmonic_extension(domain: Any, boundary_displacement: np.ndarray) -> np.nda
             "Build a full-length array and set its boundary-vertex rows to the desired motion."
         )
 
-    bfacets = _boundary_edges_from_triangles(cells) if dim == 2 else _boundary_faces_from_tets(cells)
-    bverts = np.unique(bfacets.reshape(-1))
-    is_b = np.zeros(n, dtype=bool)
-    is_b[bverts] = True
+    if prescribed is None:
+        bfacets = _boundary_edges_from_triangles(cells) if dim == 2 else _boundary_faces_from_tets(cells)
+        is_b = np.zeros(n, dtype=bool)
+        is_b[np.unique(bfacets.reshape(-1))] = True
+    else:
+        is_b = np.asarray(prescribed, dtype=bool).reshape(-1)
+        if is_b.shape != (n,):
+            raise ValueError(f"harmonic_extension: prescribed must be a ({n},) boolean mask; got {is_b.shape}.")
+        if not is_b.any():
+            raise ValueError("harmonic_extension: `prescribed` selects no vertices — there is no data to extend.")
+    bverts = np.where(is_b)[0]
     iverts = np.where(~is_b)[0]
 
     disp = np.zeros((n, dim), dtype=np.float64)
@@ -2320,6 +2335,242 @@ def _trace_velocity_vb(vexpr: Any, frozen_nodes: list, state: Any, dom: Any, bve
         )
     _, perm = cKDTree(coords).query(np.asarray(old_pts)[bverts])  # align tag order → driver's boundary vertices
     return v_n[perm][:, None] * normals[perm]  # v_n · n̂ : each vertex moves along its outward normal
+
+
+def _geometry_motion_specs(fem: Any, dom: Any) -> list[dict]:
+    """One record per geometry term: which mesh vertices it moves, along which axis, and the residual to
+    evaluate. See :func:`jno.trace.mesh_velocity` for what makes a term a geometry term."""
+    from ...trace import Variable, frozen_fields_in, mesh_velocity
+
+    pts = np.asarray(dom.mesh.points)
+    specs = []
+    for term in fem._geometry:
+        coord, _tvar, jac = mesh_velocity(term)
+        ids = np.asarray(Variable._region_vertex_ids(dom, coord.tag, pts), dtype=int)
+        if ids.size == 0:
+            raise ValueError(f"jno.fem: the geometry term on region {coord.tag!r} matches no mesh vertices.")
+        # Store the BARE Placeholder, not a typed view. A velocity like `0.05*(Tf.x*nx + Tf.y*ny)*ny` comes
+        # back wrapped, and both `substitute` and `frozen_fields_in` walk the graph -- handed the wrapper
+        # they find nothing, so the frozen field is never re-pinned and the derivative is never replaced.
+        # The term then evaluates as `d(static coordinate)/dt`, which is identically zero: no motion, no error.
+        bare = term._expr if hasattr(term, "_expr") else term
+        specs.append({"ids": ids, "axis": int(coord.dim[0]), "term": bare, "jac": jac, "coord": coord})
+    for s in specs:
+        s["frozen"] = frozen_fields_in(s["term"])
+    return specs
+
+
+def _geometry_velocity(spec: dict, dom: Any, state: Any) -> np.ndarray:
+    """Evaluate one geometry term's velocity on the current mesh and state.
+
+    The term is a *residual* ``a·d(coord)/dt - v = 0``, not a velocity, so the velocity is recovered by
+    evaluating it twice with the derivative node replaced by a **constant field**: at 0 it reads ``-v``, at 1
+    it reads ``a - v``, hence ``a`` by difference and ``v = -r0/a``. Two evaluations, no symbolic
+    rearrangement, and it handles any term linear in the derivative (``2*yb.d(tb) - 1`` gives ``v = 0.5``).
+    The stand-in is ``0*coord`` rather than a bare float so the expression keeps its shape *and* its domain
+    reference -- a constant velocity would otherwise leave nothing for the evaluator to infer a domain from.
+
+    A frozen field in the term is re-pinned to the live ``state`` first, which is what lets an interface law
+    read the solution (a Stefan front ``-(k/L)·∇T·n``). ``substitute`` matches by identity and leaves nodes
+    off the replacement path shared, so the derivative node survives that first pass and can still be found.
+    """
+    import jno
+
+    from ...trace import refreeze, substitute
+
+    term, zero = spec["term"], 0.0 * spec["coord"]
+    live = {f: refreeze(f, np.asarray(state)) for f in spec["frozen"]}
+
+    def _ev(node):
+        return np.asarray(jno.core([node], domain=dom).eval([node])).reshape(-1)
+
+    def _at(value):
+        """Replace the derivative node with ``value``, THEN re-pin the frozen fields — not the other way
+        round. ``substitute`` rebuilds every ancestor of what it replaces, so re-pinning first would rebuild
+        the derivative node's parents and lose the identity this second substitution matches on; the
+        replacement would silently do nothing and the recovered coefficient would read zero everywhere."""
+        out = substitute(term, {spec["jac"]: value})
+        return _ev(substitute(out, live) if live else out)
+
+    r0, r1 = _at(zero), _at(zero + 1.0)
+    a = r1 - r0
+    if not np.all(np.abs(a) > 1e-30):
+        raise ValueError(
+            f"jno.fem: the geometry term on region {spec['coord'].tag!r} has a vanishing coefficient on "
+            "d(coord)/dt somewhere, so it states no velocity there. Write it as `coord.d(t) - velocity`."
+        )
+    v = -r0 / a
+
+    # The velocity comes out in the region's SAMPLE order, which is not the mesh-vertex order and need not
+    # even have the same length (a tag may sample a point that is not a vertex). Align by position, as the
+    # boundary readout does -- never by index, which would silently permute the motion.
+    dim = int(dom.dimension)
+    parts = dom.variable(spec["coord"].tag, split=True)
+    tag_pts = np.column_stack([np.asarray(_ev(parts[k])).reshape(-1) for k in range(dim)])
+    if v.shape[0] != tag_pts.shape[0]:
+        raise ValueError(
+            f"jno.fem: the geometry term on region {spec['coord'].tag!r} evaluated to {v.shape[0]} values but the "
+            f"region samples {tag_pts.shape[0]} points. A velocity must be one value per sample point; an explicit "
+            "dependence on the time variable is not supported here (a region samples space x time) -- write the "
+            "law in terms of the coordinates and the solved field instead."
+        )
+    from scipy.spatial import cKDTree
+
+    verts = np.asarray(dom.mesh.points)[spec["ids"], :dim]
+    dist, perm = cKDTree(tag_pts).query(verts)
+    # 1e-6, not 1e-8: the sampled context is float32, so an exact match still lands ~1e-7 out. A genuine
+    # mismatch is a point that is not a vertex at all, i.e. ~one element away -- five orders clear of this.
+    tol = 1e-6 * max(float(np.ptp(tag_pts)), 1.0)
+    if float(np.max(dist)) > tol:
+        raise ValueError(
+            f"jno.fem: could not match region {spec['coord'].tag!r}'s sample points to its mesh vertices "
+            f"(worst gap {float(np.max(dist)):.2e} > {tol:.1e}). The velocity cannot be attributed to vertices."
+        )
+    return v[perm]
+
+
+def run_mesh_motion(fem: Any, *, solve_fn: Any = None, save_ts: Any = None, **kwargs: Any) -> "AdaptiveTrajectory":
+    """March a transient problem whose ``jno.fem([...])`` list contains **geometry terms** — the mesh moves
+    as those terms say, the physics marches on the moved mesh, and the state is carried across each move.
+
+    Each step: evaluate every geometry term's velocity on the current mesh and state, scatter it into the
+    vertices and axes those terms name, harmonically extend over everything they do *not* name
+    (:func:`harmonic_extension`), :func:`move_mesh`, re-tag, re-assemble, and carry the state onto the moved
+    vertices (:func:`transfer_solution`). Returns an :class:`AdaptiveTrajectory`, one frame per moved mesh.
+
+    **Method / scope** (house rule: fail loud on the rest).
+
+    - **Operator-split ALE, explicit in the velocity.** The velocity is evaluated from the state at the
+      *start* of each move, not solved implicitly with the interface position, so the scheme is first-order
+      in the step. The term-list spelling reads like a coupled equation and this is not one — moving the
+      mesh implicitly would need the coordinates as unknowns in the monolithic system *and* the ALE
+      convective ``(c-w)·∇u`` term. The state is re-interpolated onto the moved vertices, which transports
+      the field under the mesh motion; that is right for a field whose material is quasi-stationary while
+      the domain deforms, and wrong when a represented material velocity differs from the mesh velocity
+      (it would double-count advection).
+    - **Connectivity-preserving only.** A move that would invert an element raises (:func:`move_mesh`
+      ``check``); remesh-on-tangle for large deformation is the next extension. Reduce the step or the
+      motion.
+    - Boundary conditions on a moving surface must be **natural** or tied to a whole-boundary / held tag —
+      those re-derive on the moved mesh. A Dirichlet BC pinned to the moving surface by a spatial
+      sub-predicate would not follow the motion.
+    - **scalar-P1 field(s), real, non-periodic**, default θ-stepper; vector / higher-order / complex /
+      periodic / a custom ``solve_fn`` each raise.
+    """
+    import jax.numpy as jnp
+
+    import jno
+
+    from .backend_blocks import _block_time_grid
+
+    if fem._constraints is None:
+        raise ValueError("A geometry term requires a FEM built by jno.fem(...) (its constraint list is retained).")
+    if solve_fn is not None:
+        raise NotImplementedError(
+            "fem.solve(solve_fn=...) with a geometry term is not supported: the mesh-motion driver owns the "
+            "time march. Drop solve_fn (use the default θ-stepper), or drop the geometry term."
+        )
+    if getattr(fem, "_periodic", None) is not None:
+        raise NotImplementedError("A geometry term with periodic ties is not supported yet.")
+
+    d = fem.domain
+    dim = int(d.dimension)
+    if dim not in (2, 3):
+        raise NotImplementedError(f"mesh motion supports 2D/3D simplicial meshes; got dimension {dim}.")
+
+    cons, kw = fem._constraints, fem._fem_kwargs
+    block = fem._op
+    n_verts = int(np.asarray(d.mesh.points).shape[0])
+    state = jnp.asarray(block.state0).reshape(-1)
+    if jnp.iscomplexobj(state):
+        raise NotImplementedError("mesh motion is real-only (the state transfer / mesh motion are); complex is future.")
+    off = [int(x) for x in (fem.offsets or [0, int(state.shape[0])])]
+    n_fields = len(off) - 1
+    for _f in range(n_fields):
+        if off[_f + 1] - off[_f] != n_verts:
+            raise NotImplementedError(
+                f"mesh motion supports scalar-P1 field(s) only for now: field {_f} has {off[_f + 1] - off[_f]} "
+                f"DOFs vs {n_verts} mesh vertices (vector / higher-order). Express it as scalar-P1 fields, or await it."
+            )
+
+    key = _simplex_cell_key(dim)
+    ts = np.asarray(_block_time_grid(block))  # fixed t0..t1 grid; moving the mesh never changes the grid
+    dt = float(block.dt)
+    theta = float(block.metadata.get("theta", 1.0)) if block.metadata else 1.0
+    n_steps = len(ts) - 1
+
+    def _snapshot():
+        return (np.asarray(d.mesh.points)[:, :dim].astype(np.float64), np.asarray(d.mesh.cells_dict[key]).astype(np.int64))
+
+    cur_mesh = _snapshot()
+    times, states, meshes = [float(ts[0])], [state], [cur_mesh]
+    history: list[dict] = []
+    cur = fem
+
+    for i in range(n_steps):
+        t0c, t1c = float(ts[i]), float(ts[i + 1])
+        old_pts, old_cells = cur_mesh
+
+        # 1) MOVE: each geometry term drives its own vertices along its own axis; everything the terms do
+        #    not name relaxes harmonically around them (so a moving boundary drags the interior smoothly,
+        #    and a moving interior region lets the mesh around it accommodate).
+        specs = _geometry_motion_specs(cur, d)
+        disp = np.zeros((old_pts.shape[0], dim), dtype=np.float64)
+        named = np.zeros(old_pts.shape[0], dtype=bool)
+        written = np.zeros((old_pts.shape[0], dim), dtype=bool)
+        for sp in specs:
+            v = _geometry_velocity(sp, d, state)
+            # Two terms naming the same vertex AND the same axis state two velocities for one degree of
+            # freedom. Regions are allowed to overlap (a corner belongs to both edges), so this is easy to
+            # write by accident -- and scattering in list order would just let the last one win.
+            clash = written[sp["ids"], sp["axis"]]
+            if clash.any():
+                raise ValueError(
+                    f"jno.fem: two geometry terms both prescribe axis {sp['axis']} of "
+                    f"{int(clash.sum())} vertex/vertices (region {sp['coord'].tag!r} overlaps an earlier "
+                    "term). One coordinate can have only one velocity — narrow the regions so they do not "
+                    "overlap on that axis."
+                )
+            written[sp["ids"], sp["axis"]] = True
+            disp[sp["ids"], sp["axis"]] = v * (t1c - t0c)
+            # A vertex named on ANY axis is Dirichlet data for the extension, with its untagged columns held
+            # at zero -- per-axis tagging is literal, so an untagged column does not drift.
+            named[sp["ids"]] = True
+        move_mesh(d, harmonic_extension(d, disp, prescribed=named), copy=False)  # fail loud on tangle
+
+        # 2) re-tag (held boundaries re-derive on the moved facets), RE-SAMPLE the tags the geometry terms
+        #    read, and re-assemble on the moved mesh. The re-sample is load-bearing: a tag's coordinates are
+        #    cached in `domain.context`, and `move_mesh` moves `domain.mesh.points` without touching it — so
+        #    a velocity like `0.5*yb` would keep reading the ORIGINAL y forever and the boundary would drift
+        #    at a constant rate instead of growing (measured: exp growth flattened to a single Euler step).
+        for _name, _pred in list(getattr(d, "_tag_predicates", {}).items()):
+            d.tag(_name, _pred)
+        for _tag in {sp["coord"].tag for sp in specs}:
+            try:
+                d.variable(_tag, normals=True, split=True)  # keep the normals a Stefan-type law reads
+            except Exception:
+                d.variable(_tag, split=True)
+        cur = jno.fem(cons, **kw)
+        block = cur._op
+        new_mesh = _snapshot()
+        new_pts, _new_cells = new_mesh
+
+        # 3) carry the state onto the moved vertices (re-interpolate -> transports the field under the motion)
+        idx, w, _inside = _locate_barycentric(old_pts, old_cells, new_pts, tol=1e-9, k=32)
+        wj, ij = jnp.asarray(w, dtype=state.real.dtype), jnp.asarray(idx)
+        state = jnp.concatenate([jnp.einsum("qk,qk->q", wj, state[off[_f] : off[_f + 1]][ij]) for _f in range(n_fields)])
+
+        # 4) step on the moved mesh (the ordinary differentiable θ-stepper)
+        state = block.step(state, jnp.asarray(t0c, dtype=state.dtype), dt, theta=theta)
+        cur_mesh = new_mesh
+        times.append(float(ts[i + 1]))
+        states.append(state)
+        meshes.append(cur_mesh)
+        history.append({"t": float(ts[i + 1]), "n_dofs": int(new_pts.shape[0])})
+
+    fem.__dict__.update(cur.__dict__)  # rebind to the final moved mesh
+    fem.adapt_history = history
+    return AdaptiveTrajectory(np.asarray(times), states, meshes)
 
 
 def run_moving_boundary(
