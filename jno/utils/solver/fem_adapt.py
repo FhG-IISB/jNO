@@ -2444,6 +2444,7 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, save_ts: Any = None, **kw
     - **scalar-P1 field(s), real, non-periodic**, default θ-stepper; vector / higher-order / complex /
       periodic / a custom ``solve_fn`` each raise.
     """
+    import jax
     import jax.numpy as jnp
 
     import jno
@@ -2581,6 +2582,16 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, save_ts: Any = None, **kw
     theta = float(block.metadata.get("theta", 1.0)) if block.metadata else 1.0
     n_steps = len(ts) - 1
 
+    # The step is compiled ONCE and reused, so the march re-traces nothing per step. `dt`, `theta` and the
+    # linear solve are closed over as constants; only the state, the time and the moved vertices are
+    # traced. Worth **2.9x** end-to-end (21.1 s -> 7.3 s, 1014 vertices, 20 steps, identical answer).
+    #
+    # That win is only visible once `_step_solve` has a reachable tolerance and a bounded budget: while
+    # every step was burning its whole GMRES budget, the same jit measured 1.0x and looked worthless. A
+    # microbenchmark here once claimed 574x for it, which was wrong in the other direction -- it timed the
+    # jitted step without `block_until_ready`, measuring how long it took to QUEUE the step, not to run it.
+    _jstep = jax.jit(lambda u_, t_, a_: block.step(u_, t_, dt, args=a_, theta=theta, linear_solve=_step_solve))
+
     # Connectivity is PRESERVED by construction here (move_mesh never retriangulates), so every frame can
     # share one cell array instead of copying it. A frame-per-copy costs n_steps x n_cells x (dim+1) x 8 B
     # of identical data -- ~240 MB for 100k cells over 100 steps, for nothing. Points genuinely differ per
@@ -2663,9 +2674,7 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, save_ts: Any = None, **kw
         #    `jno.fem(cons, **kw)` rebuild per step, which was 40% of the driver and ~500 ms flat (it is
         #    Python re-tracing, not mesh work). Measured against the rebuild it replaces: 2733x at 74
         #    vertices, 625x at 640, 44x at 4669.
-        state = block.step(
-            state, jnp.asarray(t0c, dtype=state.dtype), dt, args=_coord_args(new_pts), theta=theta, linear_solve=_step_solve
-        )
+        state = _jstep(state, jnp.asarray(t0c, dtype=state.dtype), _coord_args(new_pts))
         cur_mesh = new_mesh
         times.append(float(ts[i + 1]))
         states.append(state)
