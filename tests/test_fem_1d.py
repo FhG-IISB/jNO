@@ -1536,6 +1536,25 @@ def test_coupled_1d_periodic_recovers_manufactured():
     assert abs(sol[mid] - sol[hi - 1]) < 1e-10
 
 
+def test_coupled_1d_periodic_survives_publishing_the_assembly_records():
+    """Regression guard. Once the coupled 1D path started publishing ``_fem_native_assembly_cells_all``
+    (so a 1D transient could ride the adaptive remesher), the multi-field periodic reduction began
+    taking the *facet* route with that connectivity — and ``_boundary_facets`` enumerated a simplex's
+    facets as vertex PAIRS, which an interval's 2-column connectivity cannot index.
+
+    A facet of a ``dim``-simplex has ``dim`` vertices, so in 1D it is a single endpoint. Pinned here
+    because the two features are unrelated on their face: publishing an assembly record for the
+    adaptivity path is not obviously a periodic-reduction concern."""
+    from jno._fem import _boundary_facets
+
+    pts = np.linspace(0.0, 1.0, 5).reshape(-1, 1)
+    cells = np.column_stack([np.arange(4), np.arange(1, 5)])
+    facets = _boundary_facets(pts, cells, 1, 1)
+    assert facets is not None
+    got = set(np.asarray(facets).reshape(-1).tolist())
+    assert got == {0, 4}, f"an interval's boundary facets are its two endpoints, got {got}"
+
+
 @pytest.mark.parametrize("space", ["Argyris", "Morley", "RT", "N1curl"])
 def test_nonnodal_space_on_a_line_fails_loud(space):
     """The non-nodal push-forward assembler is built on triangles/tets, so asking for one of its

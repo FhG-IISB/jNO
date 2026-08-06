@@ -2277,7 +2277,15 @@ def _boundary_facets(points: Any, cells: Any, dim: int, order: int) -> Optional[
         return None
     n_cells = cells.shape[0]
     verts = cells[:, : dim + 1]
-    combos = [(0, 1), (1, 2), (2, 0)] if dim == 2 else [(0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3)]
+    # A facet of a `dim`-simplex has `dim` vertices: in 1D that is a single endpoint, so the combos
+    # are the two 1-vertex sub-sets of an interval. (Higher-order facet nodes below are then vacuous —
+    # a point carries none — which the `order < 2` early return already handles for P1 and the
+    # reference-point search handles correctly for P{k}.)
+    combos = (
+        [(0,), (1,)]
+        if dim == 1
+        else ([(0, 1), (1, 2), (2, 0)] if dim == 2 else [(0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3)])
+    )
     allf = np.concatenate([verts[:, list(c)] for c in combos], axis=0)  # combo-major: row = combo*n_cells + cell
     # Same packed-int64 key the assembler's facet table uses, for the same reason -- and from the
     # same helper, so the two cannot drift again. See :func:`fem_facets.pack_face_keys`.
