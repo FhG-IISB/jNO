@@ -2480,49 +2480,37 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, save_ts: Any = None, **kw
                 f"DOFs vs {n_verts} mesh vertices (vector / higher-order). Express it as scalar-P1 fields, or await it."
             )
 
-    # Which route this march takes is decided HERE, on a structural property, and reported -- never
-    # silently. A velocity that READS THE SOLVED FIELD (a Stefan law, via a frozen field) still needs the
-    # per-step `jno.fem` rebuild: the frozen-field spatial gradient is an FD-over-mesh readout against
-    # `domain.mesh_connectivity`, a host array that the rebuild refreshes, and without it the readout goes
-    # stale as the mesh moves and the march reaches NaN within a few steps. A PRESCRIBED velocity has no
-    # such dependency and takes the parametric route below. Closing the split is Phase 3b -- delivering the
-    # state through the evaluation context instead of baking it in -- after which both routes are the fast
-    # one; until then, correctness wins and the cost is stated rather than hidden.
-    _needs_rebuild = any(_geometry_motion_specs(fem, d)[k]["frozen"] for k in range(len(fem._geometry)))
-
     # Make the assembly a FUNCTION of the vertex positions, once, instead of rebuilding it every step.
     # `Variable.trainable()` on a spatial coordinate registers it as a runtime parameter that
     # `_apply_coord_params` scatters into the P1 geometry before the element Jacobian is formed; the
     # transient block then re-forms A and M from `args` inside `step` (see `SemidiscreteTimeBlock`). One
     # spec per axis, covering EVERY vertex, since any of them may move.
-    if _needs_rebuild:
-        cur = fem
-
-        def _coord_args(pts_now):
-            return None  # the rebuild carries the geometry; no coordinate parameters to hand over
-
-    else:
-        if getattr(d, "_trainable_coords", None):
-            raise NotImplementedError(
-                "jno.fem: a geometry term does not compose with a hand-tagged `.trainable()` coordinate yet — "
-                "the mesh-motion driver registers the whole mesh as a coordinate parameter to avoid "
-                "re-assembling every step, and two specs writing the same axis would silently let one win. "
-                "Drop the `.trainable()` tag, or drop the geometry term."
-            )
-        _axis_names = [f"__meshmotion_x{a}__" for a in range(dim)]
-        _all_parts = d.variable(
-            "__meshmotion_all__", where=lambda *c: np.ones_like(np.asarray(c[0]), dtype=bool), split=True
+    #
+    # ONE route, for prescribed and state-reading velocities alike. An earlier version split them, on the
+    # belief that a state-reading law needed the rebuild to refresh a host array behind the frozen-field
+    # readout. That was wrong twice over: `move_mesh` does refresh `domain.mesh_connectivity` (measured
+    # 1.0 -> 1.5 across a move), and the actual cause of the NaN was the BiCGStab breakdown that
+    # `_step_solve` now avoids. With that fixed, forcing the state-reading case down this route reproduces
+    # the rebuild route exactly (final ymax 0.9902 either way), so the split bought nothing and is gone.
+    if getattr(d, "_trainable_coords", None):
+        raise NotImplementedError(
+            "jno.fem: a geometry term does not compose with a hand-tagged `.trainable()` coordinate yet — "
+            "the mesh-motion driver registers the whole mesh as a coordinate parameter to avoid "
+            "re-assembling every step, and two specs writing the same axis would silently let one win. "
+            "Drop the `.trainable()` tag, or drop the geometry term."
         )
-        for _a, _nm in enumerate(_axis_names):
-            _all_parts[_a].trainable(name=_nm)
-        _coord_ids = np.asarray(d._trainable_coords[0]["ids"], dtype=int)
-        cur = jno.fem(cons, **kw)  # rebuilt ONCE, now parametric in the vertex positions
-        block = cur._op
-        state = jnp.asarray(block.state0).reshape(-1)
+    _axis_names = [f"__meshmotion_x{a}__" for a in range(dim)]
+    _all_parts = d.variable("__meshmotion_all__", where=lambda *c: np.ones_like(np.asarray(c[0]), dtype=bool), split=True)
+    for _a, _nm in enumerate(_axis_names):
+        _all_parts[_a].trainable(name=_nm)
+    _coord_ids = np.asarray(d._trainable_coords[0]["ids"], dtype=int)
+    cur = jno.fem(cons, **kw)  # rebuilt ONCE, now parametric in the vertex positions
+    block = cur._op
+    state = jnp.asarray(block.state0).reshape(-1)
 
-        def _coord_args(pts_now):
-            """The moved vertices, in the layout `_apply_coord_params` scatters from (one per axis)."""
-            return {nm: jnp.asarray(pts_now[_coord_ids, a]) for a, nm in enumerate(_axis_names)}
+    def _coord_args(pts_now):
+        """The moved vertices, in the layout `_apply_coord_params` scatters from (one per axis)."""
+        return {nm: jnp.asarray(pts_now[_coord_ids, a]) for a, nm in enumerate(_axis_names)}
 
     def _step_solve(step_op, rhs, u0, diag_fn):
         """The θ-step solve for this march, GMRES rather than the block's default BiCGStab.
@@ -2622,9 +2610,6 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, save_ts: Any = None, **kw
                 d.variable(_tag, normals=True, split=True)  # keep the normals a Stefan-type law reads
             except Exception:
                 d.variable(_tag, split=True)
-        if _needs_rebuild:
-            cur = jno.fem(cons, **kw)
-            block = cur._op
         new_mesh = _snapshot()
         new_pts, _new_cells = new_mesh
 
