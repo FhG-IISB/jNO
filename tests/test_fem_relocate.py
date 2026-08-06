@@ -366,3 +366,130 @@ def test_relocate_rejects_an_unknown_objective():
     _d, fem = _peak_scalar()
     with pytest.raises(ValueError, match="objective must be"):
         fem.solve(adapt=AdaptSpec(relocate=True, max_iters=2, objective="dirichlet-energy"))
+
+
+# ── Monge-Ampere relocation (AdaptSpec.relocate_method="monge_ampere") ───────────────────────────────
+#
+# x = xi + grad(phi) for a mesh potential phi solving  m(x)*det(I + H(phi)) = theta.
+# The displacement being a GRADIENT is what makes the map non-folding, so these tests check that
+# structurally -- no line search is involved anywhere below.
+
+
+def _mesh_grid(n=13):
+    """Structured n x n triangulation of the unit square."""
+    s = np.linspace(0.0, 1.0, n)
+    gx, gy = np.meshgrid(s, s, indexing="ij")
+    pts = np.stack([gx.ravel(), gy.ravel()], axis=-1)
+    cells = []
+    for i in range(n - 1):
+        for j in range(n - 1):
+            a, b, c, d = i * n + j, i * n + j + 1, (i + 1) * n + j, (i + 1) * n + j + 1
+            cells += [[a, c, d], [a, d, b]]  # positively oriented -- [a,b,d] would give det = -h²
+    cells = np.asarray(cells)
+    # gmsh hands out positively-oriented cells, so a hand-rolled grid that does not would make every
+    # det-J assertion below read as "totally inverted" and mean nothing.
+    assert _min_detj(pts, cells) > 0.0, "the reference grid itself must be positively oriented"
+    return pts, cells
+
+
+def _ma_disp(monitor, pts, cells, **kw):
+    import jax.numpy as jnp
+
+    from jno.utils.solver.fem_adapt import _monge_ampere_displacement, _p1_operators
+
+    ops = _p1_operators(pts, cells, 2)
+    return np.asarray(_monge_ampere_displacement(jnp.asarray(monitor), ops, cells, 2, **kw))
+
+
+def test_monge_ampere_leaves_an_already_equidistributed_mesh_alone():
+    """A constant monitor means the uniform mesh already equidistributes it, so ``φ`` is constant and the
+    displacement vanishes. The cheapest possible check that the normalisation ``θ`` is right — get ``θ``
+    wrong and a uniform monitor drives a spurious global drift."""
+    pts, cells = _mesh_grid()
+    d = _ma_disp(np.ones(len(pts)), pts, cells)
+    assert np.abs(d).max() < 1e-9, f"uniform monitor moved the mesh by {np.abs(d).max():.2e}"
+
+
+def test_monge_ampere_pulls_nodes_toward_the_feature():
+    """A monitor peaked on the line ``x = 0.5`` must draw nodes toward it — the direction check that a
+    sign slip in eq. (3.7) would invert (and which the physical-vertex descent got wrong)."""
+    pts, cells = _mesh_grid(15)
+    monitor = 1.0 + 12.0 * np.exp(-(((pts[:, 0] - 0.5) / 0.08) ** 2))
+    moved = pts + _ma_disp(monitor, pts, cells, n_relax=120, dt=0.3)
+    before = float(np.mean(np.abs(pts[:, 0] - 0.5)))
+    after = float(np.mean(np.abs(moved[:, 0] - 0.5)))
+    assert after < before, f"nodes moved AWAY from the feature: {before:.4f} -> {after:.4f}"
+
+
+def test_monge_ampere_never_folds_the_mesh_without_a_line_search():
+    """The displacement is ``∇φ``, so the map is a gradient and cannot fold. No ``det J`` step control is
+    involved — this is the property that lets the line search be deleted, which is what unblocks
+    differentiation.
+
+    Driven hard: a 13:1 monitor demands a √13 ≈ 3.6× linear compression, and nodes move ~2 cells. Note
+    ``dt`` stays inside the relaxation's stability window — divergence is a *separate* failure mode from
+    folding, and is covered by :func:`test_monge_ampere_divergence_is_caught_not_silently_accepted`."""
+    pts, cells = _mesh_grid(15)
+    monitor = 1.0 + 12.0 * np.exp(-(((pts[:, 0] - 0.5) / 0.10) ** 2))
+    disp = _ma_disp(monitor, pts, cells, n_relax=400, dt=0.05)
+    moved = pts + disp
+    assert np.abs(disp).max() > 1.5 / 14, "not actually driven hard -- nodes barely moved"
+    assert _min_detj(moved, cells) > 0.0, f"mesh folded: min det J = {_min_detj(moved, cells):.3e}"
+
+
+def test_monge_ampere_divergence_is_caught_not_silently_accepted():
+    """The relaxation is explicit in ``Δt`` and *will* diverge past its stability limit (measured: it
+    survives ``dt=0.3`` on a 13:1 monitor and blows up by ``dt=0.4``). A diverged solve returns a
+    non-finite displacement, and the driver's validity guard must reject that rather than move the mesh
+    to NaN — ``nan <= 0`` is ``False``, so a naive ``<= 0`` test lets it straight through."""
+    pts, cells = _mesh_grid(15)
+    monitor = 1.0 + 60.0 * np.exp(-(((pts[:, 0] - 0.5) / 0.05) ** 2))
+    disp = _ma_disp(monitor, pts, cells, n_relax=200, dt=0.4)
+    assert not np.isfinite(disp).all(), "expected this setting to diverge; restore the guard test if it no longer does"
+    assert not (_min_detj(pts + disp, cells) > 0.0), "a non-finite mesh must not read as valid"
+
+
+def test_monge_ampere_displacement_is_differentiable_in_the_monitor():
+    """The point of this route: the mesh solve sits inside ``jax.grad`` with nothing to trace around.
+
+    There is no concrete branch anywhere in the relaxation — no validity test, no backtracking — so the
+    whole thing is a plain ``lax.scan`` over constant pre-factorized operators."""
+    import jax.numpy as jnp
+
+    from jno.utils.solver.fem_adapt import _monge_ampere_displacement, _p1_operators
+
+    pts, cells = _mesh_grid(11)
+    ops = _p1_operators(pts, cells, 2)
+
+    def spread(scale):
+        m = 1.0 + scale * jnp.exp(-(((jnp.asarray(pts[:, 0]) - 0.5) / 0.1) ** 2))
+        return jnp.sum(_monge_ampere_displacement(m, ops, cells, 2, n_relax=40, dt=0.2) ** 2)
+
+    g = float(jax.grad(spread)(8.0))
+    assert np.isfinite(g), "non-finite gradient through the Monge-Ampere solve"
+    assert abs(g) > 1e-10, "gradient vanished — the monitor does not reach the mesh"
+
+
+def test_relocate_monge_ampere_holds_the_boundary_and_keeps_the_node_count():
+    from jno.utils.solver.fem_adapt import AdaptSpec
+
+    d, fem = _peak_scalar()
+    pts0 = np.asarray(d.mesh.points)[:, :2].copy()
+    cells = np.asarray(d.mesh.cells_dict["triangle"])
+    fem.solve(adapt=AdaptSpec(relocate=True, relocate_method="monge_ampere", max_iters=4))
+    p1 = np.asarray(fem.domain.mesh.points)[:, :2]
+    on_edge = (pts0[:, 0] < 1e-9) | (pts0[:, 0] > 1 - 1e-9) | (pts0[:, 1] < 1e-9) | (pts0[:, 1] > 1 - 1e-9)
+    moved = np.linalg.norm(p1 - pts0, axis=1)
+    assert len(p1) == len(pts0), "r-adaptivity must not change the node count"
+    assert moved[on_edge].max() == 0.0, f"boundary drifted by {moved[on_edge].max():.2e}"
+    assert moved[~on_edge].max() > 1e-4, "no interior motion at all"
+    assert _min_detj(p1, cells) > 0.0, "mesh tangled"
+    assert len(fem.adapt_history) > 0
+
+
+def test_relocate_rejects_an_unknown_method():
+    from jno.utils.solver.fem_adapt import AdaptSpec
+
+    _d, fem = _peak_scalar()
+    with pytest.raises(ValueError, match="relocate_method must be"):
+        fem.solve(adapt=AdaptSpec(relocate=True, max_iters=2, relocate_method="mmpde"))

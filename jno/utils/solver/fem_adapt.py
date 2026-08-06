@@ -1035,6 +1035,19 @@ class AdaptSpec:
     tangling (a stock optimiser / a barrier alone cannot guarantee this on stiff problems)."""
     lr: float = 3e-3
     """Relocation only: base step size for the RMS-normalised energy-gradient descent."""
+    ma_relax: int = 60
+    """``relocate_method="monge_ampere"`` only: relaxation iterations per outer round (McRae et al. §3.1).
+    Each is one Poisson solve against a pre-factorized constant matrix, so these are cheap."""
+    ma_dt: float = 0.1
+    """``relocate_method="monge_ampere"`` only: the relaxation pseudo-step ``Δt`` of eq. (3.7). Larger
+    converges faster and can overshoot; the nonlinearity is carried entirely by this outer relaxation."""
+    relocate_method: str = "descent"
+    """Relocation only, **internal / not yet exposed** by :func:`jno.solve.relocate`: *how* the mesh is
+    moved. ``"descent"`` (default) walks the vertices down :attr:`objective` with a mesh-validity line
+    search. ``"monge_ampere"`` instead solves a Monge-Ampère equation for a mesh potential ``φ`` and takes
+    the mesh as ``x = ξ + ∇φ`` (:func:`_monge_ampere_displacement`) — no descent, no line search, and
+    non-tangling by construction because the displacement is a gradient. ``objective`` is then only a
+    *diagnostic* (nothing is descended); ``lr`` and ``quality_floor`` are unused."""
     objective: str = "equidistribution"
     """Relocation only, **internal / not yet exposed** by :func:`jno.solve.relocate`: which mesh functional
     to descend. ``"equidistribution"`` (default) is :func:`_equidistribution_jax`, the scale-free
@@ -1320,6 +1333,143 @@ def _huang_ea_jax(pts, pts0, u_nodal, cells, dim, *, theta=1.0 / 3.0, p=1.5):
     return jnp.sum(vol * (theta * align + (1.0 - 2.0 * theta) * dim ** (dim * p / 2.0) * equi))
 
 
+def _p1_operators(pts, cells, dim):
+    """Constant P1 operators on a **fixed** mesh: ``(sg, measure, wsum, stiffness+null-space shift)``.
+
+    ``sg`` ``(n_cell, dim+1, dim)`` barycentric gradients, ``measure`` the cell volumes, ``wsum`` the
+    per-vertex incident volume (the denominator of patch recovery), and ``K`` the P1 stiffness matrix
+    with a rank-one shift ``(1/n)·11ᵀ`` that removes its constant null space *without* perturbing the
+    solution: ``K·1 = 0``, so on the mean-zero subspace — which is where a compatible right-hand side
+    puts the answer — the shifted operator acts identically to ``K``.
+
+    Everything here depends only on the mesh geometry, and in :func:`_monge_ampere_displacement` that
+    mesh is the *computational* one, which never moves. So this is assembled and factorized **once** and
+    reused across every relaxation step and every outer round — the reason the Monge-Ampère route costs
+    no re-factorization, unlike a mesh flow whose operator changes as the mesh does.
+    """
+    v = pts[cells]
+    edge = v[:, 1:, :] - v[:, :1, :]
+    einv = np.linalg.inv(edge)
+    measure = np.abs(np.linalg.det(edge)) / (2.0 if dim == 2 else 6.0)
+    sg = np.zeros((cells.shape[0], dim + 1, dim))
+    sg[:, 1:, :] = np.transpose(einv, (0, 2, 1))
+    sg[:, 0, :] = -sg[:, 1:, :].sum(axis=1)
+
+    n = pts.shape[0]
+    wsum = np.zeros(n)
+    for lv in range(cells.shape[1]):
+        np.add.at(wsum, cells[:, lv], measure)
+
+    k = np.zeros((n, n))
+    loc = np.einsum("cid,cjd->cij", sg, sg) * measure[:, None, None]  # (n_cell, d+1, d+1)
+    for a in range(dim + 1):
+        for b in range(dim + 1):
+            np.add.at(k, (cells[:, a], cells[:, b]), loc[:, a, b])
+    return sg, measure, np.maximum(wsum, 1e-300), k + 1.0 / n
+
+
+def _nodal_grad_jax(f, sg_j, meas_j, wsum_j, cells_j, n_local, dim):
+    """Patch-recovered nodal gradient of a P1 field, in JAX — the volume-weighted average of the incident
+    elementwise-constant gradients. The JAX mirror of :func:`_recover_nodal_gradient` (which is numpy and
+    so cannot sit inside a trace), and the ``Π_[P1]^d`` projection of McRae et al. eq. (3.5)."""
+    import jax.numpy as jnp
+
+    g_cell = jnp.einsum("cld,cl->cd", sg_j, f[cells_j])  # (n_cell, dim), constant per element
+    num = jnp.zeros((wsum_j.shape[0], dim), dtype=g_cell.dtype)
+    for lv in range(n_local):
+        num = num.at[cells_j[:, lv]].add(meas_j[:, None] * g_cell)
+    return num / wsum_j[:, None]
+
+
+def _arclength_monitor_jax(u_nodal, sg_j, meas_j, wsum_j, cells_j, n_local, dim):
+    """Per-**vertex** arclength density ``ρ = sqrt(1 + |∇u|²/⟨|∇u|²⟩)`` — the same monitor
+    :func:`_equidistribution_jax` and :func:`_huang_ea_jax` use, but recovered at vertices (a P1 field on
+    the computational mesh) because that is what the Monge-Ampère solve integrates against. Summed over
+    components, so a vector field contributes all of them."""
+    import jax.numpy as jnp
+
+    u_nodal = u_nodal[:, None] if u_nodal.ndim == 1 else u_nodal
+    g2 = sum(
+        jnp.sum(_nodal_grad_jax(u_nodal[:, c], sg_j, meas_j, wsum_j, cells_j, n_local, dim) ** 2, axis=1)
+        for c in range(u_nodal.shape[1])
+    )
+    return jnp.sqrt(1.0 + g2 / (jnp.mean(g2) + 1e-30))
+
+
+def _monge_ampere_displacement(monitor, ops, cells, dim, *, n_relax=60, dt=0.1):
+    r"""Vertex displacement ``Π_[P1]^d ∇φ`` from one **Monge–Ampère** mesh solve — pure JAX.
+
+    Solves ``m(x)·det(I + H(φ)) = θ`` for a scalar mesh potential ``φ`` on the fixed computational mesh,
+    from which the adapted mesh is ``x(ξ) = ξ + ∇φ(ξ)``. Because the displacement is a *gradient*, the
+    map cannot fold — non-tangling is structural here, not a step-control heuristic, which is what makes
+    this route differentiable without a validity line search.
+
+    Reference: McRae, Cotter & Budd, *Optimal-transport-based mesh adaptivity on the plane and sphere
+    using finite elements*, SIAM J. Sci. Comput. **40**(2) (2018) A1121–A1148 (arXiv:1612.08077), §3.1 —
+    the relaxation method, their eqs. (3.5)–(3.8). Each iteration is
+
+    1. ``σᵏ = H(φᵏ)`` — recovered by patch averaging (their eq. (3.8) recovers it by a mass solve;
+       the P1 patch recovery already in this module plays the same role and needs no extra matrix),
+    2. ``θᵏ = ∫ m·det(I + σᵏ) / ∫ 1``  (eq. (3.6)) — the normalisation that makes the next system
+       *solvable*: it is exactly what makes the right-hand side orthogonal to the constant null space,
+    3. ``⟨∇v, ∇φᵏ⁺¹⟩ = ⟨∇v, ∇φᵏ⟩ + Δt⟨v, m·det(I + σᵏ) − θᵏ⟩``  (eq. (3.7)) — one Poisson solve.
+
+    So a step is a Poisson solve against a **pre-factorized constant** matrix plus a mass apply; the
+    nonlinearity is carried entirely by the outer relaxation in ``dt``.
+
+    **Scope — stated, not hidden.**
+
+    - ``m`` is taken as a function of the *computational* coordinate ``ξ``, not of ``x``. That is the
+      paper's "very straightforward" case (§3, above eq. (3.5)); the genuine problem has ``m = m(x)``,
+      an extra nonlinearity, and dropping it means the monitor lags the mesh it produces. The outer
+      loop in :func:`run_adaptive_relocate` recovers it approximately by re-solving and re-sampling.
+    - ``φ`` is P1 here, so ``∇φ`` is elementwise-constant and both it and ``σ`` are patch-recovered.
+      The paper takes ``φ ∈ P_n, n ≥ 2`` and L²-projects ``∇φ`` into ``[P1]^d`` (eq. (3.5)); patch
+      recovery is the cheaper stand-in and is the same order.
+    - Natural (Neumann) boundary treatment only — the caller decides which vertices may move, and the
+      relocation driver holds every untagged vertex exactly, so the boundary never drifts.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    sg, measure, wsum, k_shift = ops
+    sg_j, meas_j, wsum_j = jnp.asarray(sg), jnp.asarray(measure), jnp.asarray(wsum)
+    cells_j = jnp.asarray(cells)
+    lu = jax.scipy.linalg.lu_factor(jnp.asarray(k_shift))  # constant mesh ⇒ factorize ONCE
+    n_vert = wsum.shape[0]
+    total = float(measure.sum())
+    fac = 1.0 / ((dim + 1) * (dim + 2))  # P1 consistent mass: ∫φᵢφⱼ = |K|·(1+δᵢⱼ)/((d+1)(d+2))
+
+    n_local = cells.shape[1]
+
+    def nodal_grad(f):
+        return _nodal_grad_jax(f, sg_j, meas_j, wsum_j, cells_j, n_local, dim)
+
+    def mass_apply(g):
+        """``(M g)ᵢ`` for the P1 consistent mass matrix, assembled on the fly (no matrix stored)."""
+        gc = g[cells_j]  # (n_cell, d+1)
+        s = gc.sum(axis=1, keepdims=True)
+        loc = fac * meas_j[:, None] * (s + gc)
+        out = jnp.zeros((n_vert,), dtype=g.dtype)
+        for lv in range(cells.shape[1]):
+            out = out.at[cells_j[:, lv]].add(loc[:, lv])
+        return out
+
+    eye = jnp.eye(dim)
+
+    def step(phi, _):
+        g = nodal_grad(phi)
+        sigma = jnp.stack([nodal_grad(g[:, j]) for j in range(dim)], axis=1)  # (n_vert, dim, dim)
+        sigma = 0.5 * (sigma + jnp.swapaxes(sigma, 1, 2))  # H(φ) is symmetric; recovery need not be
+        f = monitor * jnp.linalg.det(eye + sigma)  # m·det(I + σ)
+        theta = jnp.sum(meas_j * f[cells_j].mean(axis=1)) / total  # eq. (3.6)
+        rhs = jnp.asarray(k_shift) @ phi + dt * mass_apply(f - theta)  # eq. (3.7)
+        return jax.scipy.linalg.lu_solve(lu, rhs), None
+
+    phi, _ = jax.lax.scan(step, jnp.zeros((n_vert,), dtype=monitor.dtype), None, length=n_relax)
+    return nodal_grad(phi)
+
+
 def _transient_march_fn(block):
     """Build a differentiable ``args -> time-averaged nodal state`` for a :class:`SemidiscreteTimeBlock`.
 
@@ -1365,8 +1515,6 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
     """
     import jax
     import jax.numpy as jnp
-
-    import jno
 
     dom = fem.domain
     coord_specs = list(getattr(dom, "_trainable_coords", None) or [])
@@ -1434,6 +1582,8 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
 
     if spec.objective not in ("equidistribution", "huang"):
         raise ValueError(f"AdaptSpec.objective must be 'equidistribution' or 'huang'; got {spec.objective!r}.")
+    if spec.relocate_method not in ("descent", "monge_ampere"):
+        raise ValueError(f"AdaptSpec.relocate_method must be 'descent' or 'monge_ampere'; got {spec.relocate_method!r}.")
 
     def _block_defect(u, pts, bounds):
         """Mesh functional summed over every solution block — the mirror of :func:`_block_energy`, so a
@@ -1477,8 +1627,43 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
 
     floor = spec.quality_floor * _min_detj(pts0)
     arrs = [jnp.asarray(pts0[sp["ids"], sp["axis"]]) for sp in coord_specs]
-    msq = [jnp.zeros_like(a) for a in arrs]  # RMSProp running average (near-feature gradients dwarf the rest)
     history: list[dict] = []
+
+    if spec.relocate_method == "monge_ampere":
+        # x = ξ + ∇φ is ABSOLUTE, not incremental: every round re-solves from the same computational
+        # mesh with a freshly sampled monitor, so a round never compounds the previous round's error.
+        ops = _p1_operators(pts0, cells, dim)
+        sg_j, meas_j, wsum_j = (jnp.asarray(o) for o in ops[:3])
+        cells_j2, n_local = jnp.asarray(cells), cells.shape[1]
+
+        @jax.jit
+        def _ma_round(arrs_in):
+            vals = dict(zip(names, arrs_in))
+            u = _solve_at(vals)
+            pts = _scatter(vals)
+            bounds = list(fem.offsets) if fem.offsets is not None else [0, int(u.shape[0])]
+            blk = u[bounds[0] : bounds[1]]  # the monitor rides the FIRST field (cf. spec.metric_field)
+            nb = int(blk.shape[0])
+            veci = nb // n_verts if (n_verts and nb % n_verts == 0) else 1
+            bf = blk.reshape(n_verts, veci) if veci > 1 else blk[:n_verts]
+            m = _arclength_monitor_jax(bf, sg_j, meas_j, wsum_j, cells_j2, n_local, dim)
+            disp = _monge_ampere_displacement(m, ops, cells, dim, n_relax=spec.ma_relax, dt=spec.ma_dt)
+            return disp, _block_defect(u, pts, bounds), _block_energy(u, pts, bounds)
+
+        for it in range(spec.max_iters):
+            disp, obj, e = _ma_round(arrs)
+            cand = [pts0_j[sp["ids"], sp["axis"]] + disp[jnp.asarray(sp["ids"]), sp["axis"]] for sp in coord_specs]
+            # `not (x > 0)` rather than `x <= 0`: the relaxation is explicit in `ma_dt` and diverges past
+            # its stability limit, and `nan <= 0` is False -- a diverged solve would sail through the
+            # naive test and move the mesh to NaN. Folding should not happen (the map is a gradient);
+            # divergence can. Either way, keep the last valid mesh.
+            if not (_min_detj(_moved(cand)) > 0.0):
+                break
+            arrs = cand
+            history.append({"step": it, "objective": float(obj), "energy": float(e), "points": _moved(arrs)})
+        return _finish_relocate(fem, dom, coord_specs, arrs, pts0, n_verts, dim, cells, history, solve_fn, kwargs)
+
+    msq = [jnp.zeros_like(a) for a in arrs]  # RMSProp running average (near-feature gradients dwarf the rest)
     for it in range(spec.max_iters):
         (obj, e), g = val_grad(arrs)
         msq = [0.9 * m + 0.1 * gi**2 for m, gi in zip(msq, g)]
@@ -1496,11 +1681,28 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
         # diagnostic. ``points``: the moved vertices, so a relocation run can be animated.
         history.append({"step": it, "objective": float(obj), "energy": float(e), "points": _moved(arrs)})
 
-    final = _moved(arrs)
-    if _min_detj(final) <= 0.0:  # fail loud rather than hand back / re-solve on a tangled mesh
+    return _finish_relocate(fem, dom, coord_specs, arrs, pts0, n_verts, dim, cells, history, solve_fn, kwargs)
+
+
+def _finish_relocate(fem, dom, coord_specs, arrs, pts0, n_verts, dim, cells, history, solve_fn, kwargs):
+    """Land a finished relocation: check validity, move the domain, drop the trainable tags, re-solve.
+
+    Shared by both :attr:`AdaptSpec.relocate_method` branches -- the mesh they hand over is just a set of
+    vertex positions, so everything downstream of "where do the nodes go" is identical."""
+    import jno
+
+    final = pts0.copy()
+    for i, sp in enumerate(coord_specs):
+        final[sp["ids"], sp["axis"]] = np.asarray(arrs[i])
+    vv = final[cells]
+    ee = np.stack([vv[:, i + 1] - vv[:, 0] for i in range(dim)], axis=1)
+    # `not (x > 0)`, not `x <= 0`: NaN must fail this test too (a diverged Monge-Ampere relaxation
+    # returns a non-finite mesh, and `nan <= 0` is False). Fail loud rather than re-solve on it.
+    if not (float(np.min(np.linalg.det(ee.transpose(0, 2, 1)))) > 0.0):
         raise RuntimeError(
-            "FEM.solve(adapt=relocate): the mesh tangled (min det J <= 0). Lower AdaptSpec.lr or raise "
-            "AdaptSpec.quality_floor."
+            "FEM.solve(adapt=relocate): the mesh is invalid (min det J <= 0, or non-finite). For "
+            "relocate_method='descent' lower AdaptSpec.lr or raise AdaptSpec.quality_floor; for "
+            "'monge_ampere' lower AdaptSpec.ma_dt (the relaxation is explicit and has a stability limit)."
         )
 
     # apply the relocation to the domain (connectivity-preserving), drop the trainable tags, re-solve plainly
