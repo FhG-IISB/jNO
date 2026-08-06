@@ -3581,7 +3581,18 @@ def _fem_impl(
     # ---- non-nodal element families (RT / Nedelec / Argyris): native push-forward assembler ----
     # These families need a basis push-forward, so -- like the 1D path -- assemble natively and reuse
     # the shared integrand evaluator (which carries space-guarded branches for the physical basis).
-    if _trial_spaces(constraints) - {"Lagrange"}:
+    if _nonnodal_families := (_trial_spaces(constraints) - {"Lagrange"}):
+        # The push-forward assembler is built on triangles/tets, so a non-nodal family on a LINE mesh
+        # died with a bare ``KeyError: 'triangle'`` from the topology lookup — a cryptic failure for a
+        # perfectly reasonable request. Name the dimension mismatch instead. (RT/N1curl are vector
+        # H(div)/H(curl) spaces and Argyris/Morley are triangle elements: none has a 1D counterpart.)
+        if getattr(domain, "dimension", None) == 1:
+            raise NotImplementedError(
+                f"jno.fem: the non-nodal element famil{'y' if len(_nonnodal_families) == 1 else 'ies'} "
+                f"{sorted(_nonnodal_families)} {'is' if len(_nonnodal_families) == 1 else 'are'} defined on "
+                "triangles/tets and has no 1D counterpart — a 1D line domain supports Lagrange "
+                "(order 1 and 2). Use a 2D/3D domain, or space='Lagrange' in 1D."
+            )
         from .utils.solver.fem_nonnodal import assemble_fem_nonnodal
 
         # ---- complex non-nodal (RT/Nédélec/Argyris): the Re/Im coefficient split, assembled by the

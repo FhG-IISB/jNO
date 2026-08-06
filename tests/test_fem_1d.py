@@ -897,6 +897,20 @@ def test_coupled_1d_periodic_recovers_manufactured():
     assert abs(sol[mid] - sol[hi - 1]) < 1e-10
 
 
+@pytest.mark.parametrize("space", ["Hermite", "Argyris", "Morley", "RT", "N1curl"])
+def test_nonnodal_space_on_a_line_fails_loud(space):
+    """The non-nodal push-forward assembler is built on triangles/tets, so asking for one of its
+    families on a LINE mesh died with a bare ``KeyError: 'triangle'`` from the topology lookup — a
+    cryptic failure for a reasonable request. It must name the dimension mismatch instead."""
+    d = _line(0.2)
+    u, phi = d.fem_symbols(space=space)
+    xi = d.variable("interior", split=True)[0]
+    xb = d.variable("boundary", split=True)[0]
+    ui, vi = u.bind(x=xi), phi.bind(x=xi)
+    with pytest.raises(NotImplementedError, match="no 1D counterpart"):
+        jno.fem([ui.x * vi.x - vi, u(xb) - 0.0])
+
+
 # ==========================================================================
 # complex 1D — the real-equivalent Re/Im split
 # ==========================================================================

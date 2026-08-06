@@ -51,7 +51,9 @@ u_h = fem.solve()          # matrix-free default; slots pick anything else (see 
   from a 1D time series works — except that the transient **mass** must be parameter-free (it is
   assembled once, so a parameter there would be silently frozen; it fails loud). *Nonlinear* forms are
   parametric too — Newton runs on `R(·, θ)` and implicit differentiation gives `∂u/∂θ`. Not wired in 1D:
-  anything parametric on a *coupled* system.
+  anything parametric on a *coupled* system. A **non-nodal** family (`"RT"`, `"N1curl"`, `"Argyris"`,
+  `"Morley"`, `"Hermite"`) is defined on triangles/tets and has no 1D counterpart — asking for one on a
+  line raises a clear error.
 * **Complex forms in 1D** — a `1j` anywhere in a 1D weak form routes through the same real-equivalent
   Re/Im split the 2D/3D and non-nodal paths use, so 1D Helmholtz-type problems (complex coefficient,
   complex source, or both) solve and return a complex `u`. A runtime parameter inside the complex
