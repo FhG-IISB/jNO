@@ -3679,10 +3679,11 @@ def _fem_impl(
                     "jno.fem: second-order-in-time (u_tt) 1D is single-field only for now; write the coupled "
                     "problem as a first-order system (one velocity field per second-order field)."
                 )
-            op, mode = assemble_fem_1d_multifield(
+            op, mode, offs_1d = assemble_fem_1d_multifield(
                 domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, quad_degree=quad_degree
             )
         else:
+            offs_1d = None
             op, mode = assemble_fem_1d(
                 domain,
                 volume_terms,
@@ -3696,7 +3697,6 @@ def _fem_impl(
                 order=_order_1d,
             )
         # a second-order 1D block carries the augmented state y=[u; v] (size 2N) -> field offsets [0, N, 2N]
-        offs_1d = None
         if _second_order and mode == "transient":
             _nh = int(np.asarray(op.state0).shape[0]) // 2
             offs_1d = [0, _nh, 2 * _nh]

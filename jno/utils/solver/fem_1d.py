@@ -1068,12 +1068,13 @@ def _typed_terms_1d(domain, bares, field_index):
 
 
 def assemble_fem_1d_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, *, quad_degree):
-    """Assemble a coupled (multi-field) 1D weak form into ``(op, mode)`` for :class:`FEM`.
+    """Assemble a coupled (multi-field) 1D weak form into ``(op, mode, offsets)`` for :class:`FEM`.
 
     1D block analogue of the 2D/3D ``_assemble_multifield``. The
     field layout ``(fields, field_index)`` is inferred once from the volume trial
     functions and threaded into every block builder so the mass / operator / residual
-    blocks share one ordering."""
+    blocks share one ordering. ``offsets`` reports that ordering to the caller in the same
+    ``[0, n_0, n_0+n_1, ...]`` form the 2D/3D path uses."""
     from ...trace import FemResidualOperator
     from .fem_utils import _infer_fields, _lower_statefield_to_trial
     from .weak_form import _contains_temporal_derivative, _is_obviously_nonlinear_in_unknown
@@ -1109,10 +1110,17 @@ def assemble_fem_1d_multifield(domain, volume_terms, boundary_terms, dirichlet_r
             "got a vector field. Use scalar fields, or a 2D/3D domain for vector unknowns."
         )
 
+    # Per-field block offsets, published to `FEM` exactly as the 2D/3D block path publishes them.
+    # They are not a convenience: `fem.offsets` is what every consumer slices a coupled solution by
+    # (the periodic reduction reduces block-wise through it, and post-processing splits the flat DOF
+    # vector with it). Returning them here is what keeps a coupled 1D system indistinguishable from a
+    # coupled 2D one on the outside.
+    offsets = _block_offsets(fields, n_nodes)
+
     all_terms = list(volume_terms) + [t for ts in boundary_terms.values() for t in ts]
     if any(_contains_temporal_derivative(t) for t in all_terms):
         dirichlet_pairs = _multifield_dirichlet_dofs_1d(domain, dirichlet_raw, fields, field_index, n_nodes)
-        return _assemble_1d_multifield_transient(
+        op, mode = _assemble_1d_multifield_transient(
             domain,
             volume_terms,
             boundary_terms,
@@ -1122,6 +1130,7 @@ def assemble_fem_1d_multifield(domain, volume_terms, boundary_terms, dirichlet_r
             field_index,
             quad_degree=quad_degree,
         )
+        return op, mode, offsets
     if ic_residuals:
         raise ValueError("jno.fem: an initial condition was given but the 1D weak form has no time derivative.")
 
@@ -1132,7 +1141,7 @@ def assemble_fem_1d_multifield(domain, volume_terms, boundary_terms, dirichlet_r
         for (coeff, tfi) in _typed_terms_1d(domain, bares, field_index)
     ]
     dirichlet_pairs = _multifield_dirichlet_dofs_1d(domain, dirichlet_raw, fields, field_index, n_nodes)
-    total = _block_offsets(fields, n_nodes)[-1]
+    total = offsets[-1]
     residual_free = _make_multifield_residual_1d(
         domain, volume_tl, boundary_tl, fields, field_index, n_nodes=n_nodes, quad_degree=quad_degree
     )
@@ -1144,14 +1153,14 @@ def assemble_fem_1d_multifield(domain, volume_terms, boundary_terms, dirichlet_r
             jacobian_fn=lambda u, args=None: jax.jacfwd(residual)(jnp.asarray(u)),
             size=total,
         )
-        return op, "nonlinear"
+        return op, "nonlinear", offsets
 
     zeros = jnp.zeros(total)
     A = residual_free.sparse_jacobian(zeros)
     b = -residual_free(zeros)
     A, b = _apply_dirichlet_symmetric(A, b, dirichlet_pairs)
     A = compress_eager(A)  # ~19x redundant triplets otherwise; see the helper
-    return (A, b), "linear"
+    return (A, b), "linear", offsets
 
 
 def _multifield_initial_state_1d(domain, fields, field_index, ic_residuals, n_nodes):

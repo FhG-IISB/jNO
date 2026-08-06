@@ -799,3 +799,99 @@ def test_coupled_nonlinear_transient_recovers():
     assert w[:n].std() < 1e-10 and w[n:].std() < 1e-10  # spatially uniform
     assert abs(w[:n].mean() - u_ex) / u_ex < 1e-2
     assert abs(w[n:].mean() - p_ex) / p_ex < 3e-2
+
+
+# ==========================================================================
+# coupled 1D — block layout published to the outside
+# ==========================================================================
+def test_coupled_1d_publishes_field_offsets():
+    """``fem.offsets`` is the block layout every consumer slices a coupled solution by — the periodic
+    reduction reduces block-wise through it, and post-processing splits the flat DOF vector with it.
+    The 1D block assembler computed the layout internally but returned only ``(op, mode)``, so
+    ``fem.offsets`` was ``None`` in 1D while 2D/3D reported ``[0, n, 2n]``. A coupled 1D system must be
+    indistinguishable from a coupled 2D one here."""
+    d = _line(0.1)
+    n = int(np.asarray(d.mesh.points).shape[0])
+    u, v = d.fem_symbols(names=("u", "v"))
+    p, q = d.fem_symbols(names=("p", "q"))
+    xi = d.variable("interior", split=True)[0]
+    xb = d.variable("boundary", split=True)[0]
+    ui, vi = u.bind(x=xi), v.bind(x=xi)
+    pi, qi = p.bind(x=xi), q.bind(x=xi)
+    fem = jno.fem([ui.x * vi.x + pi * vi - vi, pi.x * qi.x + ui * qi - qi, u(xb) - 0.0, p(xb) - 0.0])
+    assert fem.offsets == [0, n, 2 * n], f"coupled 1D must publish its block offsets, got {fem.offsets}"
+    assert fem.offsets[-1] == fem.dofs  # the layout accounts for every dof
+
+
+def test_coupled_1d_transient_publishes_field_offsets():
+    """Same contract on the transient block — the offsets come from the shared field layout, so they
+    must survive the transient branch too (a separate return path)."""
+    d = _line(0.1, time=(0.0, 0.02, 11))
+    n = int(np.asarray(d.mesh.points).shape[0])
+    u, v = d.fem_symbols(names=("u", "v"))
+    p, q = d.fem_symbols(names=("p", "q"))
+    co = d.variable("interior", split=True)
+    xi, ti = co[0], co[1]
+    xb = d.variable("boundary", split=True)[0]
+    ci = d.variable("initial", split=True)[0]
+    ui, vi = u.bind(x=xi, t=ti), v.bind(x=xi, t=ti)
+    pi, qi = p.bind(x=xi, t=ti), q.bind(x=xi, t=ti)
+    fem = jno.fem(
+        [
+            ui.t * vi + ui.x * vi.x,
+            pi.t * qi + pi.x * qi.x - u.bind(x=xi, t=ti) * qi,
+            u(xb) - 0.0,
+            p(xb) - 0.0,
+            u(ci) - jno.fn(lambda x: jnp.sin(jnp.pi * x), [ci]),
+            p(ci) - 0.0,
+        ]
+    )
+    assert fem.offsets == [0, n, 2 * n]
+
+
+def test_coupled_1d_periodic_recovers_manufactured():
+    """A periodic tie on a **coupled** 1D system. This is what the missing offsets blocked: the
+    multi-field periodic reduction reduces each block as ``P_i^T A[i,j] P_j`` and reads the block
+    bounds off ``fem.offsets``, so a ``None`` layout crashed with ``TypeError: 'NoneType' object is
+    not iterable`` — a cryptic failure for a case 2D/3D handles.
+
+    Manufactured, both fields 1-periodic on [0,1] with ``k = 2*pi``:
+        -u'' +  u + p = (k^2+1) cos(kx) + sin(kx)      -> u* = cos(kx)
+        -p'' + 2p + u = (k^2+2) sin(kx) + cos(kx)      -> p* = sin(kx)
+    The positive reaction terms make the all-periodic system nonsingular (no constant null space)."""
+    k = 2.0 * np.pi
+    d = _line(0.005)
+    u, v = d.fem_symbols(names=("u", "v"))
+    p, q = d.fem_symbols(names=("p", "q"))
+    xi = d.variable("interior", split=True)[0]
+    xl = d.variable("left", split=True)[0]
+    xr = d.variable("right", split=True)[0]
+    ui, vi = u.bind(x=xi), v.bind(x=xi)
+    pi, qi = p.bind(x=xi), q.bind(x=xi)
+    cos_kx, sin_kx = jno.np.cos(k * xi), jno.np.sin(k * xi)
+    f1 = (k**2 + 1.0) * cos_kx + sin_kx
+    f2 = (k**2 + 2.0) * sin_kx + cos_kx
+    fem = jno.fem(
+        [
+            ui.x * vi.x + ui * vi + pi * vi - f1 * vi,
+            pi.x * qi.x + 2.0 * pi * qi + ui * qi - f2 * qi,
+            u(xl) - u(xr),
+            p(xl) - p(xr),
+        ]
+    )
+    assert fem._periodic is not None, "the coupled ties were not read as a periodic reduction"
+    # one master/slave identification per field -> the reduced space loses exactly 2 dofs
+    assert fem._periodic["n_red"] == fem._periodic["n_full"] - 2
+
+    sol = np.asarray(fem.solve()).reshape(-1)
+    lo, mid, hi = fem.offsets
+    assert len(sol) == hi, "the periodic solve must return the PROLONGED (full) block vector"
+    xs = np.asarray(fem.points).reshape(-1)[lo:mid]
+    u_ex, p_ex = np.cos(k * xs), np.sin(k * xs)
+    ru = np.linalg.norm(sol[lo:mid] - u_ex) / np.linalg.norm(u_ex)
+    rp = np.linalg.norm(sol[mid:hi] - p_ex) / np.linalg.norm(p_ex)
+    assert ru < 5e-3, f"periodic coupled 1D u error {ru:.2e}"
+    assert rp < 5e-3, f"periodic coupled 1D p error {rp:.2e}"
+    # the tie is real: the identified endpoints carry the same value, per field
+    assert abs(sol[lo] - sol[mid - 1]) < 1e-10
+    assert abs(sol[mid] - sol[hi - 1]) < 1e-10
