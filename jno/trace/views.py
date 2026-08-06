@@ -445,6 +445,14 @@ class ScalarView(_DelegatesToPlaceholder):
     def __neg__(self):
         return self._rewrap(-self._expr)
 
+    def __pos__(self):
+        """``+expr`` is the identity, as it is for a Python number: returns ``self`` unchanged.
+
+        Defined so a term list can write a signed source symmetrically -- ``[-r, -r, +r, +r]`` reads as
+        stoichiometry, and without this the ``+r`` legs raise ``TypeError`` while the ``-r`` legs work.
+        Returns ``self`` rather than a ``1 * expr`` node, so it costs nothing in the graph."""
+        return self
+
     def __truediv__(self, other):
         return self._rewrap(self._expr / _unwrap(other), other=other)
 
@@ -720,6 +728,14 @@ class VectorView(_DelegatesToPlaceholder):
     def __neg__(self):
         return self._rewrap(-self._expr)
 
+    def __pos__(self):
+        """``+expr`` is the identity, as it is for a Python number: returns ``self`` unchanged.
+
+        Defined so a term list can write a signed source symmetrically -- ``[-r, -r, +r, +r]`` reads as
+        stoichiometry, and without this the ``+r`` legs raise ``TypeError`` while the ``-r`` legs work.
+        Returns ``self`` rather than a ``1 * expr`` node, so it costs nothing in the graph."""
+        return self
+
     def __mul__(self, other):
         return self._rewrap(self._expr * _unwrap(other), other=other)
 
@@ -864,6 +880,14 @@ class ComplexView(_DelegatesToPlaceholder):
     def __neg__(self):
         return self._rewrap(-self._expr)
 
+    def __pos__(self):
+        """``+expr`` is the identity, as it is for a Python number: returns ``self`` unchanged.
+
+        Defined so a term list can write a signed source symmetrically -- ``[-r, -r, +r, +r]`` reads as
+        stoichiometry, and without this the ``+r`` legs raise ``TypeError`` while the ``-r`` legs work.
+        Returns ``self`` rather than a ``1 * expr`` node, so it costs nothing in the graph."""
+        return self
+
     def __mul__(self, other):
         return self._rewrap(self._expr * _unwrap(other), other=other)
 
@@ -979,6 +1003,14 @@ class ComplexVectorView(_DelegatesToPlaceholder):
 
     def __neg__(self):
         return self._rewrap(-self._expr)
+
+    def __pos__(self):
+        """``+expr`` is the identity, as it is for a Python number: returns ``self`` unchanged.
+
+        Defined so a term list can write a signed source symmetrically -- ``[-r, -r, +r, +r]`` reads as
+        stoichiometry, and without this the ``+r`` legs raise ``TypeError`` while the ``-r`` legs work.
+        Returns ``self`` rather than a ``1 * expr`` node, so it costs nothing in the graph."""
+        return self
 
     def __mul__(self, other):
         return self._rewrap(self._expr * _unwrap(other), other=other)
@@ -1148,6 +1180,14 @@ class ComplexPair:
 
     def __neg__(self) -> "ComplexPair":
         return ComplexPair(-self._re, None if self._im is None else -self._im)
+
+    def __pos__(self) -> "ComplexPair":
+        """``+expr`` is the identity, as it is for a Python number: returns ``self`` unchanged.
+
+        Defined so a term list can write a signed source symmetrically -- ``[-r, -r, +r, +r]`` reads as
+        stoichiometry, and without this the ``+r`` legs raise ``TypeError`` while the ``-r`` legs work.
+        Returns ``self`` rather than a ``1 * expr`` node, so it costs nothing in the graph."""
+        return self
 
     def __mul__(self, other) -> "ComplexPair":
         o = _as_pair(other)
@@ -1403,6 +1443,14 @@ class MatrixView(_DelegatesToPlaceholder):
 
     def __neg__(self):
         return self._rewrap(-self._expr)
+
+    def __pos__(self):
+        """``+expr`` is the identity, as it is for a Python number: returns ``self`` unchanged.
+
+        Defined so a term list can write a signed source symmetrically -- ``[-r, -r, +r, +r]`` reads as
+        stoichiometry, and without this the ``+r`` legs raise ``TypeError`` while the ``-r`` legs work.
+        Returns ``self`` rather than a ``1 * expr`` node, so it costs nothing in the graph."""
+        return self
 
     def __truediv__(self, other):
         return self._rewrap(self._expr / _unwrap(other), other=other)
@@ -1679,6 +1727,14 @@ class VoigtView(_DelegatesToPlaceholder):
 
     def __neg__(self):
         return self._rewrap(-self._expr)
+
+    def __pos__(self):
+        """``+expr`` is the identity, as it is for a Python number: returns ``self`` unchanged.
+
+        Defined so a term list can write a signed source symmetrically -- ``[-r, -r, +r, +r]`` reads as
+        stoichiometry, and without this the ``+r`` legs raise ``TypeError`` while the ``-r`` legs work.
+        Returns ``self`` rather than a ``1 * expr`` node, so it costs nothing in the graph."""
+        return self
 
     def __truediv__(self, other):
         return self._rewrap(self._expr / _unwrap(other), other=other)

@@ -371,6 +371,14 @@ class Placeholder:
     def __neg__(self) -> BinaryOp:
         return BinaryOp("*", Literal(-1.0), self)
 
+    def __pos__(self) -> "Placeholder":
+        """``+expr`` is the identity, as it is for a Python number: returns ``self`` unchanged.
+
+        Defined so a term list can write a signed source symmetrically -- ``[-r, -r, +r, +r]`` reads as
+        stoichiometry, and without this the ``+r`` legs raise ``TypeError`` while the ``-r`` legs work.
+        Returns ``self`` rather than a ``1 * expr`` node, so it costs nothing in the graph."""
+        return self
+
     def __pow__(self, other) -> BinaryOp:
         return BinaryOp("**", self, self._wrap(other))
 
