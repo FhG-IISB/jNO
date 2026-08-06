@@ -49,6 +49,7 @@ from .trace import (
     TestFunction,
     TrialFunction,
     Variable,
+    mesh_velocity,
     state_updates,
 )
 
@@ -1203,6 +1204,7 @@ class FEM:
         self._term_source = None  # (domain, volume_terms); attached by fem() for the provisional term_kinds accessor
         self._constraints = None  # original constraint list; attached by fem() for the adaptive driver
         self._fem_kwargs = {}  # original fem() build options; attached by fem() for the adaptive driver
+        self._geometry = []  # `coord.d(t) - v` mesh-motion terms; attached by fem()
 
         self._A = self._b = None
         if mode == "linear":
@@ -1631,6 +1633,15 @@ class FEM:
             or (precond is not None)
             or (time is not None)
         )
+        if getattr(self, "_geometry", None):
+            # A geometry term states that the mesh moves. Nothing else in this method would act on it, and a
+            # boundary that silently fails to move is a wrong answer with no symptom -- so refuse rather than
+            # solve on the undeformed mesh.
+            raise NotImplementedError(
+                "jno.fem: a geometry term (`coord.d(t) - velocity`) was given, but the mesh-motion driver "
+                "is not wired up yet, and solving would silently leave the mesh where it started. Use "
+                "`fem.solve(move=jno.MovingBoundary(velocity=...))` until it lands."
+            )
         if move is not None:
             if adapt is not None or has_slots:
                 raise NotImplementedError(
@@ -3280,6 +3291,16 @@ def _fem_impl(
     # so they allocate the right per-quadrature-point buffer depth.
     _evolution = state_updates(constraints)  # {history_key: StateUpdate}
     constraints = [c for c in constraints if not isinstance(_bare(c), StateUpdate)]
+
+    # GEOMETRY terms (`yb.d(tb) - v`): how a mesh *coordinate* moves, stated as a residual like any other
+    # equation. Pulled out here for the same reason as the evolution bucket — the term carries no test
+    # function, so the weak-form classifier would not claim it, and the Dirichlet branch would try to read
+    # a coordinate as a field. Nothing about this is boundary-specific: `domain.variable` resolves an
+    # interior region, a boundary or a `where=` predicate identically, and the term is per-axis.
+    _geometry, _rest = [], []
+    for c in constraints:
+        (_geometry if mesh_velocity(c) is not None else _rest).append(c)
+    constraints = _rest
     if rotation_bcs and not (_trial_spaces(constraints) - {"Lagrange"}):
         raise NotImplementedError(
             "jno.fem: a rotation BC `u.dn(region) - h` is a 4th-order plate essential BC — it requires a field "
@@ -3373,6 +3394,7 @@ def _fem_impl(
         fem_obj._term_source = (domain, volume_terms)
         fem_obj._constraints = _orig_constraints
         fem_obj._fem_kwargs = _orig_fem_kwargs
+        fem_obj._geometry = list(_geometry)  # `coord.d(t) - v` terms: the mesh-motion driver reads these
         # Field-key snapshots for FEM.block_index: the assembler's list is offsets-ordered (and
         # must be captured NOW — a later assembly on the same domain overwrites the attribute);
         # the constraint-walk order is the fallback for paths that don't run the native assembler.

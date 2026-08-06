@@ -3889,6 +3889,60 @@ def history_variables(terms):
     return found
 
 
+def mesh_velocity(term):
+    """The ``(coordinate, time_variable, jacobian)`` a **geometry term** differentiates, or ``None``.
+
+    A geometry term states how a *mesh coordinate* moves, written like any other equation in the
+    ``jno.fem([...])`` list — a residual that is implicitly zero::
+
+        xb, yb, tb = domain.variable("boundary", split=True)
+        yb.d(tb) - v_n * ny                 # dy/dt = v_n·n_y  — the boundary follows a front
+        xi.d(ti) - 0.3 * (yi - 0.5)         # the interior drifts; a moving-mesh PDE
+
+    It is recognised structurally, by containing ``d(spatial coordinate)/d(temporal variable)``, so nothing
+    new has to be spelled: :meth:`Variable.d` and the term list already exist. Nothing here is specific to a
+    boundary — ``domain.variable`` resolves an interior region, a boundary, or a ``where=`` predicate the
+    same way (see :meth:`Variable._region_vertex_ids`), and the tagging is **per-axis**, so a term on ``xb``
+    alone moves only the x column and holds y exactly.
+
+    Returns ``None`` for an ordinary term. A term carrying a :class:`TestFunction` is never a geometry term
+    (that is a weak form whose *integrand* happens to mention a coordinate derivative), which keeps this from
+    stealing constraints from the weak-form classifier.
+    """
+    node = term._expr if hasattr(term, "_expr") else term
+    if not isinstance(node, Placeholder):
+        return None
+    seen: set = set()
+    found = []
+
+    def visit(n):
+        if not isinstance(n, Placeholder) or id(n) in seen:
+            return
+        seen.add(id(n))
+        if isinstance(n, TestFunction):
+            found.append(None)  # a weak form -- poison the whole term, it is not a geometry equation
+            return
+        if isinstance(n, Jacobian) and getattr(n.target, "axis", None) == "spatial":
+            for v in n.variables:
+                if getattr(v, "axis", None) == "temporal":
+                    found.append((n.target, v, n))
+        for kind, _attr, val in _iter_placeholder_children(n):
+            for c in val if kind == "list" else (val,):
+                visit(c)
+
+    visit(node)
+    if not found or any(f is None for f in found):
+        return None
+    if len(found) > 1:
+        names = ", ".join(str(getattr(f[0], "tag", f[0])) for f in found)
+        raise ValueError(
+            f"jno.fem: a geometry term may move ONE coordinate, but this one differentiates {len(found)} "
+            f"({names}) with respect to time. Write one term per coordinate -- `xb.d(tb) - vx` and "
+            f"`yb.d(tb) - vy` -- so each axis states its own velocity."
+        )
+    return found[0]
+
+
 def state_updates(terms):
     """The top-level :class:`StateUpdate` nodes in ``terms`` (a term or list of terms), as
     ``{history_key: StateUpdate}`` — one update per internal-state field (a later declaration wins). The
