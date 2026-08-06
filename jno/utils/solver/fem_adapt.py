@@ -2398,7 +2398,7 @@ def _trace_velocity_vb(vexpr: Any, frozen_nodes: list, state: Any, dom: Any, bve
 def _geometry_motion_specs(fem: Any, dom: Any) -> list[dict]:
     """One record per geometry term: which mesh vertices it moves, along which axis, and the residual to
     evaluate. See :func:`jno.trace.mesh_velocity` for what makes a term a geometry term."""
-    from ...trace import Variable, frozen_fields_in, mesh_velocity
+    from ...trace import Variable, frozen_fields_in, mesh_velocity, substitute
 
     pts = np.asarray(dom.mesh.points)
     specs = []
@@ -2412,7 +2412,22 @@ def _geometry_motion_specs(fem: Any, dom: Any) -> list[dict]:
         # they find nothing, so the frozen field is never re-pinned and the derivative is never replaced.
         # The term then evaluates as `d(static coordinate)/dt`, which is identically zero: no motion, no error.
         bare = term._expr if hasattr(term, "_expr") else term
-        specs.append({"ids": ids, "axis": int(coord.dim[0]), "term": bare, "jac": jac, "coord": coord})
+        # The two probe expressions are built ONCE here, not per step. They are what recovers the velocity
+        # from the residual (see :func:`_geometry_velocity`), and their structure does not depend on the
+        # mesh -- only their *values* do. Building them once is what lets `Crux.eval`'s compiled-function
+        # cache, which is keyed on the op object, hit for the whole march instead of compiling every step.
+        zero = 0.0 * coord
+        specs.append(
+            {
+                "ids": ids,
+                "axis": int(coord.dim[0]),
+                "term": bare,
+                "jac": jac,
+                "coord": coord,
+                "expr0": substitute(bare, {jac: zero}),
+                "expr1": substitute(bare, {jac: zero + 1.0}),
+            }
+        )
     for s in specs:
         s["frozen"] = frozen_fields_in(s["term"])
     return specs
@@ -2432,25 +2447,32 @@ def _geometry_velocity(spec: dict, dom: Any, state: Any) -> np.ndarray:
     read the solution (a Stefan front ``-(k/L)·∇T·n``). ``substitute`` matches by identity and leaves nodes
     off the replacement path shared, so the derivative node survives that first pass and can still be found.
     """
-    import jno
-
     from ...trace import refreeze, substitute
 
-    term, zero = spec["term"], 0.0 * spec["coord"]
     live = {f: refreeze(f, np.asarray(state)) for f in spec["frozen"]}
 
     def _ev(node):
-        return np.asarray(jno.core([node], domain=dom).eval([node])).reshape(-1)
+        # One `Crux` per term, built once and reused. `Crux.eval` keys its compiled-function cache on the
+        # op OBJECT, so a *static* expression hits that cache and is compiled once for the whole march;
+        # `domain=` is what makes it re-read the moved mesh (without it the call returns the mesh the crux
+        # was built on). A term reading a frozen field still misses, because `refreeze` mints fresh nodes
+        # each step by design -- that is the 3b half, and it needs the state delivered through the context
+        # rather than baked into the graph.
+        crux = spec.get("_crux")
+        if crux is None:
+            import jno
+
+            crux = spec["_crux"] = jno.core([spec["expr0"], spec["expr1"]], domain=dom)
+        return np.asarray(crux.eval([node], domain=dom)).reshape(-1)
 
     def _at(value):
         """Replace the derivative node with ``value``, THEN re-pin the frozen fields — not the other way
         round. ``substitute`` rebuilds every ancestor of what it replaces, so re-pinning first would rebuild
         the derivative node's parents and lose the identity this second substitution matches on; the
         replacement would silently do nothing and the recovered coefficient would read zero everywhere."""
-        out = substitute(term, {spec["jac"]: value})
-        return _ev(substitute(out, live) if live else out)
+        return _ev(substitute(value, live) if live else value)
 
-    r0, r1 = _at(zero), _at(zero + 1.0)
+    r0, r1 = _at(spec["expr0"]), _at(spec["expr1"])
     a = r1 - r0
     if not np.all(np.abs(a) > 1e-30):
         raise ValueError(
