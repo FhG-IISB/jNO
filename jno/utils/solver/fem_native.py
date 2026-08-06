@@ -1999,7 +1999,7 @@ def assemble_fem_native(
                     # A state-dependent mass carries no fixed matrix; the mass action is in mass_residual.
                     mass=None
                     if _nonlinear_mass
-                    else (_mass_cb if _parametric_mass else (lambda t, args=None, _M=M_bc: _M)),
+                    else (_mass_cb if (_parametric_mass or _coord_specs) else (lambda t, args=None, _M=M_bc: _M)),
                     mass_residual=mass_res_bc,
                     mass_residual_jac=mass_jac_bc,
                     residual=res_bc,
@@ -2017,7 +2017,12 @@ def assemble_fem_native(
         # CONSTANT g -- the held value sits in the affine bias. A net-valued Dirichlet u(∂Ω)-net(x) has an
         # args-dependent held value (differentiable in the weights): its whole held vector rides the
         # forcing each step instead (mirrors the g(x,t) path), so the constant bias drops to zero. ----
-        if runtime_parameter_tags or neural_param_names or _dir_net_models or _ic_net_models:
+        # ``_coord_specs`` belongs here for the same reason it does in the steady gate below: a trainable
+        # mesh coordinate makes the operator (and the mass) a function of ``args``. Without it a transient
+        # falls to the static branch, where A and M are built once with ``args=None`` and
+        # ``_apply_coord_params`` short-circuits -- so ``block.step(..., args={coord: X})`` silently ignores
+        # X and ``du/dX`` is exactly ZERO. That is a wrong gradient with no symptom, not a missing feature.
+        if runtime_parameter_tags or neural_param_names or _dir_net_models or _ic_net_models or _coord_specs:
             if _dir_net_models:
                 if getattr(domain, "_fem_native_dirichlet_tv", None):
                     raise NotImplementedError(
@@ -2059,7 +2064,10 @@ def assemble_fem_native(
             return (
                 SemidiscreteTimeBlock(
                     M=M_bc,
-                    mass_fn=_mass_cb if _parametric_mass else None,  # parametric mass (unknown density net(x)*u_t)
+                    # Parametric mass for an unknown density net(x)*u_t -- and for a trainable mesh
+                    # coordinate, because the mass is ∫φᵢφⱼ dx ∝ |K|: hold it static while the mesh moves
+                    # and the u̇ term keeps the volumes of the mesh you started from.
+                    mass_fn=_mass_cb if (_parametric_mass or _coord_specs) else None,
                     operator_fn=operator_fn,
                     affine_bias=c_bias,
                     forcing_vector_fn=forcing_vector_fn,

@@ -2407,9 +2407,14 @@ def _geometry_velocity(spec: dict, dom: Any, state: Any) -> np.ndarray:
     #
     # The sample coordinates are read straight out of `domain.context` rather than evaluated through the
     # trace: it is the very array the trace would gather from, in the same order (checked at 2 mesh sizes),
-    # and evaluating it instead cost two compiles per term per step -- half of this driver's trace work.
-    # Caching the compiled *core* would be the bigger win and is NOT safe: a core does not see a moved mesh
-    # (measured 0.5 where a fresh core gives 0.75), so reusing one silently reintroduces stale coordinates.
+    # and evaluating it instead cost two evaluations per term per step -- half of this driver's trace work.
+    #
+    # Reusing one compiled `jno.core` across steps IS safe, as long as `domain=` is passed on every call:
+    # `Crux.eval` re-prepares the domain data when given one and reuses the cached data when not, so a bare
+    # `core.eval([expr])` returns the mesh it was built on (measured 0.5 where the moved mesh gives 0.75)
+    # while `core.eval([expr], domain=d)` returns 0.75 correctly. It is not done here because it is not
+    # worth much: measured 1.10x over 12 steps, since the per-call cost is the domain re-preparation rather
+    # than compilation. Cache the core when the re-preparation itself gets cheaper, not before.
     dim = int(dom.dimension)
     ctx = np.asarray(dom.context[spec["coord"].tag])
     tag_pts = ctx.reshape(-1, ctx.shape[-1])[: ctx.shape[-2], :dim] if ctx.ndim > 2 else ctx[:, :dim]
