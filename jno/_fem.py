@@ -442,18 +442,18 @@ def _native_lagrange_ok(domain: Any, constraints: List[Any], weak_bares: List[An
 def _element_for(dimension: int, order: int) -> str:
     """Simplex element-type label for a ``(dimension, order)`` pair (2D/3D simplex, any order >= 1).
 
-    Legacy names ``TRI3``/``TRI6``/``TET4``/``TET10`` for orders 1-2; a generic ``TRI-P{k}`` / ``TET-P{k}``
-    for higher order. The native Lagrange assembler keys off the integer ``order`` (the basis and the
+    Legacy names ``TRI3``/``TRI6``/``TET4``/``TET10`` for orders 1-2; a generic
+    ``INT-P{k}`` / ``TRI-P{k}`` / ``TET-P{k}`` for every other case. The native Lagrange assembler keys off the integer ``order`` (the basis and the
     promoted P{k} node mesh both come from the same basix element), not this string -- the label is only
     consumed by the VPINN context builder."""
     key = (int(dimension), int(order))
     if key in _ELEMENT_FOR:
         return _ELEMENT_FOR[key]
-    if int(dimension) in (2, 3) and int(order) >= 1:
-        return f"{'TRI' if int(dimension) == 2 else 'TET'}-P{int(order)}"
+    if int(dimension) in (1, 2, 3) and int(order) >= 1:
+        return f"{ {1: 'INT', 2: 'TRI'}.get(int(dimension), 'TET') }-P{int(order)}"
     raise ValueError(
         f"jno.fem: no built-in element for dimension {dimension}, order {order} "
-        "(supported: 2D/3D simplex at order >= 1; pass element_type=... to override)."
+        "(supported: 1D/2D/3D simplex at order >= 1; pass element_type=... to override)."
     )
 
 
@@ -3520,8 +3520,8 @@ def _fem_impl(
         else:
             raise ValueError("jno.fem: a residual contains neither the trial nor the test function.")
 
-    if is_vpinn and (getattr(domain, "dimension", None) == 1 or multifield):
-        raise NotImplementedError("jno.fem VPINN (network trial) is currently single-field 2D/3D only.")
+    if is_vpinn and multifield:
+        raise NotImplementedError("jno.fem VPINN (network trial) is currently single-field only.")
 
     # ---- second-order in time (`u_tt`): reduce to a first-order augmented (u, v=u_t) block ----
     # A weak term carrying a SECOND temporal derivative is lowered to the equivalent first-order
@@ -3678,7 +3678,10 @@ def _fem_impl(
     # The native 1D assembler reuses the same integrand evaluator and returns the
     # same (op, mode) the FEM container expects; it needs no problem-object
     # scaffolding (coordinate vars resolve from the per-element quadrature points).
-    if getattr(domain, "dimension", None) == 1:
+    # A VPINN form is the exception: its trial is a NETWORK, not an FE field, so there is no linear
+    # system to assemble — it test-projects onto the FE test space further down, on the native
+    # fem_context (which now builds on an interval too).
+    if getattr(domain, "dimension", None) == 1 and not is_vpinn:
         from .utils.solver.fem_1d import assemble_fem_1d, assemble_fem_1d_multifield
 
         _order_1d = _infer_order(constraints)
@@ -4117,7 +4120,7 @@ def _fem_impl(
     # It builds the native fem_context (init_fem_native) and test-projects the weak form. Every
     # standard single-field FEM problem has already returned natively above; anything else is rejected
     # explicitly below (fail loud -- never silently mis-assemble). ----
-    if is_vpinn and getattr(domain, "dimension", None) == 2 and not periodic_ties:
+    if is_vpinn and getattr(domain, "dimension", None) in (1, 2) and not periodic_ties:
         bcs = [domain.dirichlet(tag, value) for tag, value in dirichlet_values.items()]
         if boundary_terms:
             bcs.append(neumann(list(boundary_terms.keys())))

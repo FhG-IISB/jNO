@@ -68,6 +68,11 @@ u_h = fem.solve()          # matrix-free default; slots pick anything else (see 
   assembled once and would freeze the parameter at its placeholder (it fails loud). The vector and
   triangle-only non-nodal families (`"RT"`, `"N1curl"`, `"Argyris"`, `"Morley"`) have no 1D counterpart
   and raise a clear error on a line.
+* **VPINN in 1D** — a network trial (`u = net(x)` inside the weak form, test-projected onto the FE
+  test space) works on a line, so the cheapest dimension for prototyping a variational PINN is
+  available. The native `fem_context` it projects onto now builds on an interval: `lagrange_interval`
+  is the 1D sibling of `lagrange_triangle`/`lagrange_tet` from the same basix builder, and an
+  interval's facets are its two endpoints (outward normals ∓1). Still single-field only.
 * **Adaptivity in 1D** — `fem.solve(adapt=jno.solve.remesh(...))` works on a line, steady and
   transient. mmg has no 1-D mode and needs none: an interval mesh is a sorted vertex list, so
   honouring a size field is subdivision rather than remeshing (exact where mmg is approximate, and no

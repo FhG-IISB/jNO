@@ -59,6 +59,7 @@ from .fem_lagrange import (
     identity_pushforward,
     identity_pushforward_hess,
     lagrange_interp_points,
+    lagrange_interval,
     lagrange_tet,
     lagrange_triangle,
 )
@@ -113,17 +114,26 @@ def _get_mesh(domain, dim: int, order: int):
     """
     # meshio names the simplex cell block "triangle" (2D) / "tetra" (3D) -- distinct from the basix
     # CellType name "tetrahedron" the facet machinery uses.
-    meshio_key = "triangle" if dim == 2 else "tetra"
+    meshio_key = {1: "line", 2: "triangle"}.get(dim, "tetra")
     pts_p1 = np.asarray(domain.mesh.points)[:, :dim]
     cells_p1 = np.asarray(domain.mesh.cells_dict[meshio_key], dtype=np.int64)
     if order == 1:
         return pts_p1, cells_p1, pts_p1, cells_p1
-    if dim not in (2, 3):
+    if dim not in (1, 2, 3):
         raise NotImplementedError(f"Dimension {dim} not supported by native assembler.")
     # P{order} node mesh: place the element's reference interpolation points (basix DOF order) on each
     # cell and dedup by coordinate. One code path for P2 and P3+ (the P2 midpoints are the k=2 case).
     pts_f, cells_f = _promote_to_degree(pts_p1, cells_p1, lagrange_interp_points(dim, order))
     return pts_p1, cells_p1, pts_f, cells_f
+
+
+def _lagrange_simplex(dim: int, degree: int, quad_degree: Any = None):
+    """The Lagrange ``ElementSpec`` for the ``dim``-simplex: interval / triangle / tetrahedron.
+
+    One dispatcher, because the assembler and the VPINN context builder both need it and a second
+    per-site conditional is how a dimension gets silently left out."""
+    builder = {1: lagrange_interval, 2: lagrange_triangle}.get(int(dim), lagrange_tet)
+    return builder(degree, quad_degree)
 
 
 def _real_dirichlet_values(gs: Any, region: str) -> np.ndarray:
@@ -252,6 +262,8 @@ def _facet_area_element(J, tangs):
     """Physical facet measure element from the reference tangents ``tangs`` (``dim-1, dim``) pushed
     forward by the cell Jacobian ``J`` (``dim, dim``): the edge length ``|J·t|`` in 2D, the face area
     ``|(J·t0) × (J·t1)|`` in 3D. Multiplying it by the reference-facet weights gives ``dS``."""
+    if tangs.shape[0] == 0:  # 1-D: a "facet" is a point, whose measure is 1 (dS = 1, not a length)
+        return jnp.asarray(1.0, dtype=J.dtype)
     T = tangs @ J.T  # (dim-1, dim) physical tangents
     return jnp.linalg.norm(T[0]) if T.shape[0] == 1 else jnp.linalg.norm(jnp.cross(T[0], T[1]))
 
@@ -297,7 +309,7 @@ def build_native_fem_context(domain, *, element_type, quad_degree, vec=1, neuman
     quad_degree = max(quad_degree, 2 * order)
 
     pts_p1, cells_p1, pts_f, cells_f = _get_mesh(domain, dim, order)
-    spec = lagrange_triangle(order, quad_degree)
+    spec = _lagrange_simplex(dim, order, quad_degree)
     ref_vals = jnp.asarray(spec.ref_values)  # (n_q, n_dof, 1)
     ref_grads = jnp.asarray(spec.ref_grads)  # (n_q, n_dof, 1, dim)
     qp = jnp.asarray(spec.quad_points)  # (n_q, dim)
@@ -357,7 +369,7 @@ def build_native_fem_context(domain, *, element_type, quad_degree, vec=1, neuman
     surface_quad_by_tag: dict = {}
     surface_normals_by_tag: dict = {}
     if neumann_tags:
-        cell_key = "triangle" if dim == 2 else "tetrahedron"
+        cell_key = {1: "interval", 2: "triangle"}.get(dim, "tetrahedron")
         conn = build_facet_connectivity(cells_p1, cell_key)
         normals_all = compute_face_normals(pts_p1, conn, cells_p1, cell_key) if conn.n_bfaces > 0 else np.zeros((0, dim))
         fp_phi, fp_dphi_ref, fp_qp, fp_tangs, gw_face = _build_face_tables(order, quad_degree, dim)
@@ -558,8 +570,7 @@ def assemble_fem_native(
     # Element specs and JAX constants
     # -------------------------------------------------------------------------
 
-    _lagrange_simplex = lagrange_tet if dim == 3 else lagrange_triangle
-    specs = [_lagrange_simplex(f["order"], quad_degree) for f in fields]
+    specs = [_lagrange_simplex(dim, f["order"], quad_degree) for f in fields]
     # All specs share the same simplex quadrature rule (basix is deterministic)
     qp_shared = jnp.asarray(specs[0].quad_points)  # (n_quad, dim)
     qw_shared = jnp.asarray(specs[0].quad_weights)  # (n_quad,)

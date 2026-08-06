@@ -1573,6 +1573,71 @@ def test_nonnodal_space_on_a_line_fails_loud(space):
 
 
 # ==========================================================================
+# the interval element spec and 1D facet machinery (the native-context pieces)
+# ==========================================================================
+@pytest.mark.parametrize("degree", [1, 2, 3])
+def test_interval_element_spec_is_a_valid_lagrange_basis(degree):
+    """``lagrange_interval`` is the 1D sibling of ``lagrange_triangle``/``lagrange_tet``, built by the
+    same basix builder — it is what lets the native ``fem_context`` (and hence VPINN) exist on a line.
+
+    The invariants every Lagrange basis must satisfy: partition of unity, gradients summing to zero,
+    second derivatives summing to zero, and a quadrature rule exact to the element's own degree."""
+    from jno.utils.solver.fem_lagrange import lagrange_interval
+
+    spec = lagrange_interval(degree)
+    assert spec.n_dof == degree + 1
+    N = np.asarray(spec.ref_values)[:, :, 0]
+    dN = np.asarray(spec.ref_grads)[:, :, 0, 0]
+    H = np.asarray(spec.ref_hess)[:, :, 0, 0, 0]
+    qp = np.asarray(spec.quad_points).reshape(-1)
+    qw = np.asarray(spec.quad_weights).reshape(-1)
+
+    assert np.max(np.abs(N.sum(axis=1) - 1.0)) < 1e-12, "partition of unity"
+    assert np.max(np.abs(dN.sum(axis=1))) < 1e-12, "gradients must sum to zero"
+    assert np.max(np.abs(H.sum(axis=1))) < 1e-12, "second derivatives must sum to zero"
+    assert abs(qw.sum() - 1.0) < 1e-12, "the reference interval has length 1"
+    assert abs((qw * qp**degree).sum() - 1.0 / (degree + 1)) < 1e-12, f"rule not exact on xi^{degree}"
+
+
+def test_interval_facets_are_the_two_endpoints_with_outward_normals():
+    """A facet of a ``dim``-simplex has ``dim`` vertices, so an interval's facets are its two
+    endpoints. A point has no tangent to rotate, so the unit candidate is ``+1`` and the *shared*
+    away-from-the-apex flip picks the outward sign — which must come out ``-1`` at the left end and
+    ``+1`` at the right."""
+    from jno.utils.solver.fem_facets import build_facet_connectivity, compute_face_normals
+
+    pts = np.linspace(0.0, 1.0, 5).reshape(-1, 1)
+    cells = np.column_stack([np.arange(4), np.arange(1, 5)])
+    conn = build_facet_connectivity(cells, "interval")
+    assert conn.n_bfaces == 2
+    ids = np.asarray(conn.face_nodes).reshape(-1)
+    assert set(ids.tolist()) == {0, 4}, "the boundary of an interval mesh is its two ends"
+
+    n = np.asarray(compute_face_normals(pts, conn, cells, "interval")).reshape(-1)
+    by_id = dict(zip(ids.tolist(), n.tolist()))
+    assert by_id[0] == pytest.approx(-1.0), "the left end's outward normal points -x"
+    assert by_id[4] == pytest.approx(+1.0), "the right end's outward normal points +x"
+
+
+def test_single_item_concat_returns_the_item():
+    """``jnp_ops.concat`` skipped its fast path for a SINGLE operand and fell into a rank-alignment
+    fallback written for two or more. That is unreachable in 2D/3D but not in 1D, where the canonical
+    test-grad coefficient stacks one component per dimension — so a one-item stack — and the fallback
+    re-entered trace-node construction inside the evaluator, hanging a 1D VPINN's loss.
+
+    Checked directly on the op, because the symptom was a hang rather than a wrong number."""
+    import jax.numpy as jnp
+
+    from jno.jnp_ops import concat
+
+    node = concat([jno.np.parameter((1,), name="_c1")])
+    inner = node.fn if hasattr(node, "fn") else node.operation
+    got = np.asarray(inner(jnp.asarray([[1.0], [2.0], [3.0]])))
+    assert got.shape == (3, 1), "a one-item concat must return the item, trailing axis intact"
+    assert np.allclose(got.reshape(-1), [1.0, 2.0, 3.0])
+
+
+# ==========================================================================
 # Hermite C1 cubic — the Euler-Bernoulli beam element
 # ==========================================================================
 def _beam(ms=0.1, q=1.0, EI=1.0, left="clamped", right="free"):

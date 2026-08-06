@@ -345,11 +345,18 @@ def concat(items, axis: int = -1) -> FunctionCall:
                 a = a[..., jnp.newaxis]
             expanded.append(a)
 
+        # A SINGLE operand needs no concatenation at all — and must not fall through to the
+        # rank-alignment fallback below, which is written for two or more. It becomes reachable on a
+        # **1D** domain, where `canonicalize_grad_coeff` stacks one component per dimension: with
+        # dim=1 that is a one-item stack, and the fallback then re-entered trace-node construction
+        # inside the evaluator, so a 1D VPINN never finished assembling its loss.
+        if len(expanded) == 1:
+            return expanded[0]
+
         # Fast path when shapes already match on non-concatenation dims.
-        if len(expanded) > 1:
-            ref = expanded[0].shape[:-1]
-            if all(a.shape[:-1] == ref for a in expanded[1:]):
-                return jnp.concatenate(expanded, axis=-1)
+        ref = expanded[0].shape[:-1]
+        if all(a.shape[:-1] == ref for a in expanded[1:]):
+            return jnp.concatenate(expanded, axis=-1)
 
         # Fallback: align ranks and only broadcast singleton dimensions.
         max_ndim = max(a.ndim for a in expanded)
