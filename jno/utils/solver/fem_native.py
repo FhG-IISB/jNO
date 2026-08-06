@@ -126,6 +126,33 @@ def _get_mesh(domain, dim: int, order: int):
     return pts_p1, cells_p1, pts_f, cells_f
 
 
+def _real_dirichlet_values(gs: Any, region: str) -> np.ndarray:
+    """Essential values as float64, refusing a genuinely complex one instead of dropping its imaginary part.
+
+    A complex weak form assembles as two real legs sharing one Dirichlet row set, and these values feed
+    both. That is well posed for a **real** ``g``: the fused block imposes ``x_r - x_i = g`` and
+    ``x_r + x_i = g``, i.e. ``Re u = g`` with ``Im u = 0``. For a complex ``g`` it is not expressible —
+    pinning ``Im u = g_i`` needs the imaginary leg's Dirichlet rows zeroed rather than set to identity,
+    and the symmetric elimination's *column* lift is cross-leg (the real equation's known-column term is
+    ``A_r[:,j] g_r - A_i[:,j] g_i``, which no per-leg elimination can produce).
+
+    These call sites used to cast with ``float(...)`` / ``.astype(float)``, so ``Im(g)`` vanished behind
+    a numpy ``ComplexWarning`` and the solve returned a plausible, wrong field: measured 8.9e-1 relative
+    error on ``u = (1+2j)x`` over a unit square, with no error raised. Refuse instead.
+    """
+    arr = np.asarray(gs)
+    if np.iscomplexobj(arr) and np.any(np.abs(arr.imag) > 0.0):
+        raise NotImplementedError(
+            f"jno.fem: a COMPLEX essential value on region {region!r} is not supported — a complex form's "
+            "Re/Im legs share one Dirichlet row set, which can impose Re u = g with Im u = 0 but not a "
+            "prescribed Im u. Use a real essential value and carry the complex part in the operator or "
+            "the source."
+        )
+    # Returned UNCHANGED (not cast): each call site keeps its own conversion, so this guard adds a check
+    # and changes nothing else — a real value still takes exactly the path it always did.
+    return gs
+
+
 def _region_node_ids_from_pts(domain, region: str, pts_all: np.ndarray) -> List[int]:
     """Node ids in ``pts_all`` for ``region`` — a **geometric interior sub-region**
     (``domain.region(name, polygon)``) by point-in-polygon, else the region's location function.
@@ -1663,22 +1690,23 @@ def assemble_fem_native(
             # batch of points (the initial-condition path below passes the whole array).
             pts = np.asarray(pts_all)[nids] if nids else np.zeros((0, np.asarray(pts_all).shape[-1]))
             if _field_vals is not None:
-                gs = np.asarray(_field_vals)[nids].astype(float)
+                gs = _real_dirichlet_values(np.asarray(_field_vals)[nids], region).astype(float)
             elif value_node is not None:
                 raw = np.asarray(jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(pts))))
+                _real_dirichlet_values(raw, region)  # refuse a complex g before any cast drops Im(g)
                 # Does the result scale with the number of points? A CONSTANT profile returns the
                 # same thing for any batch -- including a constant VECTOR like (gx, gy), whose size
                 # can coincide with the node count -- so shape alone cannot tell. One extra
                 # single-point evaluation settles it and costs nothing.
                 one = np.asarray(jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(pts[:1]))))
                 if raw.shape == one.shape or len(nids) == 0:
-                    gs = np.full(len(nids), float(one.reshape(-1)[0]))  # constant over the region
+                    gs = np.full(len(nids), float(np.real(one).reshape(-1)[0]))  # constant over the region
                 else:
-                    gs = raw.reshape(len(nids), -1)[:, 0].astype(float)  # first component per node
+                    gs = np.real(raw).reshape(len(nids), -1)[:, 0].astype(float)  # first component per node
             elif callable(value):
-                gs = np.array([float(value(p)) for p in pts], dtype=float)
+                gs = np.array([float(_real_dirichlet_values(value(p), region)) for p in pts], dtype=float)
             else:
-                gs = np.full(len(nids), float(value))
+                gs = np.full(len(nids), float(_real_dirichlet_values(value, region)))
             comps_range = range(vt) if comp is None else [int(comp)]
             for nid, g in zip(nids, gs):
                 for c in comps_range:

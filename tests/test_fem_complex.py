@@ -296,3 +296,63 @@ def test_complex_transient_block_is_sparse_not_dense():
     rel = float(np.linalg.norm(traj[-1] - analytic) / np.linalg.norm(analytic))
     assert rel < 3e-2, f"sparse complex-transient march rel-L2 {rel:.3e}"
     assert np.iscomplexobj(traj) and float(np.abs(traj[-1].imag).max()) > 1e-2  # genuinely complex
+
+
+# ==========================================================================
+# essential values on a complex form
+# ==========================================================================
+def test_real_dirichlet_on_a_complex_form_pins_re_and_zeroes_im():
+    """A **real** essential value is well posed on a complex form: the two Re/Im legs share one
+    Dirichlet row set, so the fused block imposes ``x_r - x_i = g`` and ``x_r + x_i = g``, i.e.
+    ``Re u = g`` with ``Im u = 0`` on the region. The interior stays genuinely complex.
+
+    ``-lap u + i u = 0`` on the unit square with ``u = x`` on the boundary."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1)
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y + 1j * (ui * vi), u(xb, yb) - xb])
+    assert fem.is_complex
+
+    uh = np.asarray(fem.solve()).reshape(-1)
+    pts = np.asarray(fem.points)
+    on_b = (
+        (np.abs(pts[:, 0]) < 1e-9)
+        | (np.abs(pts[:, 0] - 1.0) < 1e-9)
+        | (np.abs(pts[:, 1]) < 1e-9)
+        | (np.abs(pts[:, 1] - 1.0) < 1e-9)
+    )
+    assert np.max(np.abs(uh[on_b].real - pts[on_b, 0])) < 1e-12, "Re u = g not imposed"
+    assert np.max(np.abs(uh[on_b].imag)) < 1e-12, "Im u must be pinned to zero by a real value"
+    assert np.max(np.abs(uh[~on_b].imag)) > 1e-3, "the i*u reaction must make the interior complex"
+
+
+def test_complex_dirichlet_value_fails_loud():
+    """A **complex** essential value is NOT expressible on the shared Dirichlet row set: pinning
+    ``Im u = g_i`` needs the imaginary leg's rows zeroed rather than set to identity, and the symmetric
+    elimination's known-column lift is cross-leg (the real equation needs ``A_r[:,j] g_r - A_i[:,j] g_i``,
+    which no per-leg elimination produces).
+
+    This used to be *silent*: the value was cast with ``.astype(float)``, so ``Im(g)`` vanished behind a
+    numpy ComplexWarning and the solve returned a plausible, wrong field — measured 8.9e-1 relative
+    error on ``u = (1+2j)x``. It must refuse instead."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2)
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    with pytest.raises(NotImplementedError, match="COMPLEX essential value"):
+        jno.fem([ui.x * vi.x + ui.y * vi.y + 0.0j * (ui * vi), u(xb, yb) - (1.0 + 2.0j) * xb])
+
+
+def test_complex_constant_dirichlet_value_fails_loud():
+    """The constant-profile branch resolves ``g`` by a separate single-point evaluation, so it needs the
+    same guard — a constant ``1+2j`` must not slip through where a coordinate profile is refused."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2)
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    with pytest.raises(NotImplementedError, match="COMPLEX essential value"):
+        jno.fem([ui.x * vi.x + ui.y * vi.y + 0.0j * (ui * vi), u(xb, yb) - (1.0 + 2.0j)])

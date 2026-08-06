@@ -890,6 +890,13 @@ directly rather than the block, so the Re/Im legs are retained for it. And a **B
 tie has a *complex* prolongation `P`, which does not split into two real legs — that case still solves
 through its own complex block routine, and `x0=` on it is rejected.
 
+**Essential values on a complex form must be real.** The two legs share one Dirichlet row set, which
+imposes `Re u = g` with `Im u = 0` — right for a real `g`, and the usual case (the complexity lives in
+the operator and the source). A *complex* `g` is not expressible there: pinning `Im u = g_i` would need
+the imaginary leg's rows zeroed rather than set to identity, and the symmetric elimination's
+known-column lift is cross-leg (the real equation needs `A_r[:,j] g_r - A_i[:,j] g_i`, which no per-leg
+elimination produces). It raises a clear error. Carry the complex part in the operator or the source.
+
 Not yet supported (clear errors): `adapt=` on a complex transient (the cross-remesh state transfer is
 not complex-aware yet).
 
