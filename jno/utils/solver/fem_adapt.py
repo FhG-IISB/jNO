@@ -2524,6 +2524,31 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, save_ts: Any = None, **kw
             """The moved vertices, in the layout `_apply_coord_params` scatters from (one per axis)."""
             return {nm: jnp.asarray(pts_now[_coord_ids, a]) for a, nm in enumerate(_axis_names)}
 
+    def _step_solve(step_op, rhs, u0, diag_fn):
+        """The θ-step solve for this march, GMRES rather than the block's default BiCGStab.
+
+        BiCGStab **breaks down** on the parametric branch's step operator and returns NaN. Measured on a
+        29-dof heat problem whose step matrix has condition number 2.5: a direct solve gives a clean
+        answer, CG with the very same Jacobi preconditioner converges to 2.4e-10, BiCGStab *without* the
+        preconditioner converges to 1.4e-10 -- and BiCGStab *with* it returns NaN. The parametric branch
+        imposes Dirichlet by ROW REPLACEMENT, which leaves the operator non-symmetric, and JAX's BiCGStab
+        carries no breakdown handling. GMRES does not break down there (the same reason the complex
+        real-equivalent block already asks for it).
+
+        This is a **general** defect of that branch, not of mesh motion; it is repaired here rather than in
+        `SemidiscreteTimeBlock.step` because changing the default Krylov method for every parametric
+        transient is a wider blast radius than this change should carry.
+        """
+        import jax
+
+        dd = diag_fn()
+        inv = 1.0 / jnp.where(jnp.abs(dd) > 1e-30, dd, 1.0)
+        n = int(jnp.asarray(rhs).shape[0])
+        out, _ = jax.scipy.sparse.linalg.gmres(
+            step_op, rhs, x0=u0, tol=1e-10, atol=0.0, restart=min(n, 40), M=lambda x: inv * x
+        )
+        return out
+
     key = _simplex_cell_key(dim)
     ts = np.asarray(_block_time_grid(block))  # fixed t0..t1 grid; moving the mesh never changes the grid
     dt = float(block.dt)
@@ -2615,7 +2640,9 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, save_ts: Any = None, **kw
         #    `jno.fem(cons, **kw)` rebuild per step, which was 40% of the driver and ~500 ms flat (it is
         #    Python re-tracing, not mesh work). Measured against the rebuild it replaces: 2733x at 74
         #    vertices, 625x at 640, 44x at 4669.
-        state = block.step(state, jnp.asarray(t0c, dtype=state.dtype), dt, args=_coord_args(new_pts), theta=theta)
+        state = block.step(
+            state, jnp.asarray(t0c, dtype=state.dtype), dt, args=_coord_args(new_pts), theta=theta, linear_solve=_step_solve
+        )
         cur_mesh = new_mesh
         times.append(float(ts[i + 1]))
         states.append(state)

@@ -280,3 +280,53 @@ def test_a_position_independent_region_marches_too():
     traj = _heat(d, yb.d(tb) - 0.5).solve()
     p0, p1 = traj.meshes[0][0], traj.meshes[-1][0]
     assert p1[:, 1].max() > p0[:, 1].max() + 0.15, "the boundary did not move"
+
+
+def test_the_SOLUTION_stays_finite_while_the_mesh_moves():
+    """The assertion whose absence shipped a silent NaN.
+
+    Every other motion test checks mesh positions and node counts. For a PRESCRIBED velocity the mesh does
+    not depend on the field, so the mesh can be exactly right while the solution is entirely NaN — which is
+    what happened when the driver stopped re-assembling per step: the parametric branch's step operator
+    made the block's default BiCGStab break down. Seventeen tests passed on a NaN field.
+
+    So: assert the field. Finite at every frame, obeying the maximum principle (this is heat with u=0 on
+    the boundary and u=1 initially, so nothing may exceed those bounds), and actually decaying.
+    """
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain(time=(0.0, 0.4, 9))
+    _xb, yb, tb = d.variable("boundary", split=True)
+    traj = _heat(d, yb.d(tb) - 0.5 * yb).solve()
+    states = [np.asarray(s) for s in traj.states]
+
+    for k, s in enumerate(states):
+        s = s.astype(np.float64)
+        assert np.isfinite(s).all(), f"solution is not finite at frame {k} (the mesh being right proves nothing)"
+        # Bounded, not monotone: a CONSISTENT-mass P1 Galerkin step is not a discrete maximum principle,
+        # and this initial condition is discontinuous (1 in the interior, 0 on the boundary), so a small
+        # overshoot is the scheme's, not a defect. Measured ~2.3%; the bound is there to catch divergence.
+        assert -0.1 < s.min() and s.max() < 1.1, f"frame {k} left a sane envelope: [{s.min():.4f}, {s.max():.4f}]"
+    assert states[-1].max() < states[0].max(), "heat did not diffuse — the field is not being marched"
+
+
+def test_the_solution_matches_a_fixed_mesh_when_the_mesh_does_not_move():
+    """A zero velocity must reproduce the ordinary fixed-mesh march exactly. This pins the whole moving-mesh
+    path — parametric assembly, per-step solve, state transfer — against the plain solver, so a defect in
+    any of them shows up as a number rather than as a plausible-looking trajectory."""
+
+    def _mk(with_motion):
+        d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain(time=(0.0, 0.3, 7))
+        _xb, yb, tb = d.variable("boundary", split=True)
+        geom = (yb.d(tb) - 0.0,) if with_motion else ()
+        return d, _heat(d, *geom)
+
+    d_m, fem_m = _mk(True)
+    moving = np.asarray(fem_m.solve().states[-1])
+
+    d_f, fem_f = _mk(False)
+    sol = fem_f.solve()
+    fixed = np.asarray(jno.core([sol.mean], domain=d_f).eval([sol]))[-1]
+
+    assert np.isfinite(moving).all(), "zero-velocity moving-mesh march is not finite"
+    assert moving == pytest.approx(fixed, rel=1e-6, abs=1e-8), (
+        f"zero motion should reproduce the fixed-mesh march: max|d| = {np.abs(moving - fixed).max():.3e}"
+    )
