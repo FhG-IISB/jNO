@@ -915,22 +915,81 @@ def _mesh_boundary_facets(domain: Any) -> tuple[np.ndarray, np.ndarray, int]:
     return cells, bfacets, dim
 
 
-def _p1_stiffness(domain: Any):
-    """Assemble the P1 (linear-simplex) stiffness / discrete Laplacian ``K_ij = ∫_Ω ∇φ_i·∇φ_j``.
+def _p1_stiffness_jax(pts, cells, dim):
+    """``(matvec, diagonal)`` for the P1 stiffness ``K_ij = ∫_Ω ∇φ_i·∇φ_j`` on ``pts`` — matrix-free, pure
+    JAX, and **differentiable in the vertex positions**.
 
-    Returns a symmetric sparse ``(n_vert, n_vert)`` SciPy CSR matrix built from the constant per-element
-    barycentric gradients (:func:`_p1_element_gradients`).  This is the operator whose harmonic solve
-    (:func:`harmonic_extension`) propagates a boundary motion smoothly into the interior.
+    The element block is the standard ``|K|·(∇φᵢ·∇φⱼ)`` with barycentric gradients from the inverse edge
+    matrix. It replaces a numpy+scipy assembly that existed only to be factorized by
+    :func:`harmonic_extension`; there is deliberately **one** implementation, since two of the same
+    operator drift apart silently.
+
+    :func:`_dirichlet_energy_jax` carries the same quantity (it is ``Σ|∇u|²·vol = uᵀKu``, so ``½·∂E/∂u``
+    *is* this matvec). That equivalence is the **test oracle**, not the implementation: the gradient route
+    would pay a reverse-mode sweep over the element loop on every CG iteration.
+
+    Nothing here depends on the connectivity's values, only on positions, so a caller marching a
+    connectivity-preserving motion hoists ``cells`` once and re-calls this as the mesh moves.
     """
-    from scipy.sparse import coo_matrix
+    import jax.numpy as jnp
 
-    grad, measure, cells = _p1_element_gradients(domain)  # (n_cells, nv, dim), (n_cells,), (n_cells, nv)
-    nv = cells.shape[1]
-    ke = np.einsum("c,cad,cbd->cab", measure, grad, grad)  # (n_cells, nv, nv): measure * (∇φ_a·∇φ_b)
-    ii = np.broadcast_to(cells[:, :, None], (cells.shape[0], nv, nv)).reshape(-1)
-    jj = np.broadcast_to(cells[:, None, :], (cells.shape[0], nv, nv)).reshape(-1)
-    n = int(np.asarray(domain.mesh.points).shape[0])
-    return coo_matrix((ke.reshape(-1), (ii, jj)), shape=(n, n)).tocsr()
+    cells_j = jnp.asarray(cells)
+    v = pts[cells_j]
+    e = jnp.stack([v[:, i + 1] - v[:, 0] for i in range(dim)], axis=1)  # (n_cell, dim, dim)
+    measure = jnp.abs(jnp.linalg.det(e)) / (2.0 if dim == 2 else 6.0)
+    g = jnp.swapaxes(jnp.linalg.inv(e), 1, 2)  # ∇φ of vertices 1..d
+    sg = jnp.concatenate([-g.sum(axis=1, keepdims=True), g], axis=1)  # φ₀ closes the partition of unity
+    loc = jnp.einsum("cid,cjd->cij", sg, sg) * measure[:, None, None]
+
+    n_local, n_vert = cells.shape[1], pts.shape[0]
+
+    def matvec(u):
+        out_c = jnp.einsum("cij,cj->ci", loc, u[cells_j])
+        out = jnp.zeros((n_vert,), dtype=u.dtype)
+        for a in range(n_local):
+            out = out.at[cells_j[:, a]].add(out_c[:, a])
+        return out
+
+    diag = jnp.zeros((n_vert,), dtype=measure.dtype)
+    for a in range(n_local):
+        diag = diag.at[cells_j[:, a]].add(loc[:, a, a])
+    return matvec, diag
+
+
+def _harmonic_extension_jax(pts, cells, dim, given, prescribed, *, tol=1e-13, maxiter=2000):
+    r"""Harmonically extend ``given`` off the ``prescribed`` vertices — pure JAX, differentiable in both.
+
+    Solves ``(K d)ᵢ = 0`` on the free rows with ``d`` held at ``given`` on the prescribed rows, written as
+    a masked SPD system so the shapes stay static under trace. The free/prescribed split is a **multiply,
+    never a gather**, which is what lets this run inside a ``lax.scan``::
+
+        A(v) = mask·K(mask·v) + (1 − mask)·v          rhs = −mask·K((1 − mask)·given)
+
+    ``A`` is the identity on the prescribed block and ``K`` on the free block, hence SPD, so CG applies.
+    Jacobi-preconditioned :func:`jax.scipy.sparse.linalg.cg` — the same masked-CG idiom as
+    ``_consistent_m_solve`` in :mod:`~jno.utils.solver.timeschemes` — which is built on
+    ``lax.custom_linear_solve``, so the gradient is an exact adjoint solve rather than backpropagation
+    through the iterations.
+
+    ``tol`` defaults tight because the bar is **absolute**: an affine field is harmonic and so must come
+    back exactly (1e-9 in 2D, 1e-7 in 3D).
+    """
+    import jax.numpy as jnp
+    from jax.scipy.sparse.linalg import cg
+
+    matvec, diag = _p1_stiffness_jax(pts, cells, dim)
+    mask = 1.0 - jnp.asarray(prescribed, dtype=pts.dtype)  # 1 free / 0 prescribed
+    held = (1.0 - mask)[:, None] * given
+    jac = 1.0 / (mask * diag + (1.0 - mask))  # Jacobi on the free block, identity on the held one
+
+    def op(v):
+        return mask * matvec(mask * v) + (1.0 - mask) * v
+
+    def solve_col(held_col):
+        return cg(op, -mask * matvec(held_col), tol=tol, atol=0.0, maxiter=maxiter, M=lambda z: jac * z)[0]
+
+    free = jnp.stack([solve_col(held[:, c]) for c in range(dim)], axis=1)
+    return mask[:, None] * free + held
 
 
 def harmonic_extension(
@@ -971,7 +1030,7 @@ def harmonic_extension(
     Tezduyar, *Mesh update strategies in parallel FE computations of flows with moving boundaries*,
     Comput. Methods Appl. Mech. Engrg. 119 (1994) 73-94 (§3).
     """
-    from scipy.sparse.linalg import splu
+    import jax.numpy as jnp
 
     cells, dim = _mesh_cells(domain)
     pts = np.asarray(domain.mesh.points)[:, :dim]
@@ -993,18 +1052,17 @@ def harmonic_extension(
             raise ValueError(f"harmonic_extension: prescribed must be a ({n},) boolean mask; got {is_b.shape}.")
         if not is_b.any():
             raise ValueError("harmonic_extension: `prescribed` selects no vertices — there is no data to extend.")
-    bverts = np.where(is_b)[0]
-    iverts = np.where(~is_b)[0]
+    if not (~is_b).any():
+        return np.where(is_b[:, None], bd, 0.0)  # everything prescribed: nothing to extend
 
-    disp = np.zeros((n, dim), dtype=np.float64)
-    disp[bverts] = bd[bverts]
-    if iverts.size:
-        k = _p1_stiffness(domain)
-        kii = k[iverts][:, iverts].tocsc()
-        kib = k[iverts][:, bverts]
-        rhs = -(kib @ bd[bverts])  # (n_i, dim): move the boundary term to the RHS
-        disp[iverts] = splu(kii).solve(np.asarray(rhs))  # one factorization, all `dim` columns at once
-    return disp
+    # A thin host wrapper over the JAX core, rather than a second numpy+scipy implementation of the same
+    # operator: two implementations of one solve is exactly the shape that drifts apart silently. The
+    # existing affine-reproduction and maximum-principle tests are therefore the acceptance bar for the
+    # traced path too.
+    return np.asarray(
+        _harmonic_extension_jax(jnp.asarray(pts), cells, dim, jnp.asarray(bd), jnp.asarray(is_b)),
+        dtype=np.float64,
+    )
 
 
 def move_mesh(domain: Any, displacement: np.ndarray, *, copy: bool = True, check: bool = True) -> Any:
@@ -2531,6 +2589,17 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, save_ts: Any = None, **kw
         # 1) MOVE: each geometry term drives its own vertices along its own axis; everything the terms do
         #    not name relaxes harmonically around them (so a moving boundary drags the interior smoothly,
         #    and a moving interior region lets the mesh around it accommodate).
+        #
+        # KNOWN DEFECT: membership is re-resolved here, on the MOVED points. A `where=` region that
+        # succeeds in moving therefore leaves its own predicate and silently stops being driven -- its
+        # vertices drop into the harmonic extension with no error, so the harder it is driven the less it
+        # moves. The fix is to freeze membership at t0 (the driven set is a material set, which is the
+        # Lagrangian convention every ALE code uses), but freezing alone is not enough: the velocity is
+        # evaluated against the tag's re-sampled points, which after the move are a *different* point set
+        # from the frozen vertices, so the position-alignment below then fails to match. Both have to move
+        # together -- the velocity must become a function of explicit arrays rather than of the tag's
+        # context. Tracked with that work; re-resolving is the behaviour that at least stays consistent
+        # with the alignment until then.
         specs = _geometry_motion_specs(cur, d)
         disp = np.zeros((old_pts.shape[0], dim), dtype=np.float64)
         named = np.zeros(old_pts.shape[0], dtype=bool)

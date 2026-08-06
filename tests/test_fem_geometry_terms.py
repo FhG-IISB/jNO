@@ -266,3 +266,17 @@ def test_a_motion_that_would_tangle_the_mesh_raises():
     _xb, yb, tb = d.variable("boundary", split=True)
     with pytest.raises(ValueError, match="inverts or collapses"):
         _heat(d, yb.d(tb) + 4.0 * yb).solve()
+
+
+def test_a_position_independent_region_marches_too():
+    """The boundary tag does not depend on a coordinate window, so it marches however far it goes.
+
+    A ``where=`` region that moves out of its own predicate does NOT — it silently stops being driven. That
+    is a known defect (see the note in ``run_mesh_motion``); it is not asserted here because pinning the
+    current wrong behaviour into a test would make the fix look like a regression.
+    """
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain(time=(0.0, 0.4, 6))
+    _xb, yb, tb = d.variable("boundary", split=True)
+    traj = _heat(d, yb.d(tb) - 0.5).solve()
+    p0, p1 = traj.meshes[0][0], traj.meshes[-1][0]
+    assert p1[:, 1].max() > p0[:, 1].max() + 0.15, "the boundary did not move"
