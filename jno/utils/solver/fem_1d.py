@@ -1183,7 +1183,9 @@ def _typed_terms_1d(domain, bares, field_index):
     return out
 
 
-def assemble_fem_1d_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, *, quad_degree):
+def assemble_fem_1d_multifield(
+    domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, *, quad_degree, second_order=False
+):
     """Assemble a coupled (multi-field) 1D weak form into ``(op, mode, offsets)`` for :class:`FEM`.
 
     1D block analogue of the 2D/3D ``_assemble_multifield``. The
@@ -1248,6 +1250,21 @@ def assemble_fem_1d_multifield(domain, volume_terms, boundary_terms, dirichlet_r
                 "(linear or nonlinear) is fully parametric; single-field 1D is parametric transient too."
             )
         dirichlet_pairs = _multifield_dirichlet_dofs_1d(domain, dirichlet_raw, fields, field_index, offsets)
+        if second_order:
+            # `u_tt` carries the augmented [u_all; v_all] state, so it reports its OWN offsets
+            # (displacement blocks then velocity blocks) rather than the plain field layout.
+            return _assemble_1d_multifield_second_order(
+                domain,
+                volume_terms,
+                boundary_terms,
+                dirichlet_pairs,
+                ic_residuals,
+                fields,
+                field_index,
+                offsets=offsets,
+                dof_coords=_dof_coords,
+                quad_degree=quad_degree,
+            )
         op, mode = _assemble_1d_multifield_transient(
             domain,
             volume_terms,
@@ -1326,6 +1343,150 @@ def assemble_fem_1d_multifield(domain, volume_terms, boundary_terms, dirichlet_r
         "linear",
         offsets,
     )
+
+
+def _assemble_1d_multifield_second_order(
+    domain,
+    volume_terms,
+    boundary_terms,
+    dirichlet_pairs,
+    ic_residuals,
+    fields,
+    field_index,
+    *,
+    offsets,
+    dof_coords,
+    quad_degree,
+):
+    r"""Coupled 1D second-order-in-time: the augmented ``y = [u_all; v_all]`` block.
+
+    Same formula the single-field 1D path and the 2D/3D coupled path use, with the **coupled block**
+    ``M2``/``K`` in place of the single-field ones::
+
+        [M2  0 ] [u_all']   [ 0   -M2] [u_all]   [ 0 ]
+        [0   M2] [v_all'] + [ K    0 ] [v_all] = [ F ]
+
+    ``M2`` is block-diagonal over the fields; ``K`` carries the per-field spatial operators with the
+    couplings in its off-diagonal blocks. Two coupled 1D waves, a wave driven by a second membrane,
+    a chain of coupled oscillators.
+
+    Scope, matching the 2D/3D coupled route: every field must be second order. A bare ``u_t`` (damping,
+    or a first-order field) would need a per-field velocity augmentation and is refused — write it as
+    a first-order system with an explicit velocity field per second-order field.
+    """
+    from ..._fem import _bare, _bcoo_block, _ic_value_at_nodes
+    from .backend_blocks import SemidiscreteTimeBlock
+    from .fem_utils import _lower_statefield_to_trial, _test_field_index, bcoo_set_dirichlet_rows, bcoo_zero_rows
+    from .solver_helper import max_temporal_derivative_order as _mto
+    from .time_route import _infer_time_window, _strip_temporal_trial_derivative
+    from .weak_form import _apply_sign, _is_obviously_nonlinear_in_unknown, _split_additive_terms
+
+    all_terms = list(volume_terms) + [t for ts in boundary_terms.values() for t in ts]
+    if any(_is_obviously_nonlinear_in_unknown(domain, b) for b in all_terms):
+        raise NotImplementedError("jno.fem: a nonlinear coupled second-order-in-time 1D form is not supported.")
+
+    def _strip(coeff, times):
+        for _ in range(times):
+            coeff = _strip_temporal_trial_derivative(coeff)
+        return coeff
+
+    mass2_tl, spatial_tl = [], []
+    for bare in volume_terms:
+        for sign, sub in _split_additive_terms(domain, bare):
+            coeff = _lower_statefield_to_trial(_apply_sign(domain, sign, sub), {})
+            tfi = _test_field_index(coeff, field_index)
+            if tfi is None:
+                raise ValueError("jno.fem: each coupled 1D weak term must contain exactly one test field.")
+            o = _mto(sub)
+            if o >= 2:
+                mass2_tl.append((_strip(coeff, 2), tfi))
+            elif o == 1:
+                raise NotImplementedError(
+                    "jno.fem: a coupled second-order-in-time 1D form with a u_t term (damping or a "
+                    "first-order field) is not supported — every field must carry u_tt. Write the coupled "
+                    "problem as a first-order system with an explicit velocity field per second-order field."
+                )
+            else:
+                spatial_tl.append((coeff, tfi))
+    if not mass2_tl:
+        raise ValueError("jno.fem: the coupled 1D second-order route found no `u_tt * phi` mass term.")
+    if {fields[tfi]["field_key"] for _, tfi in mass2_tl} != {f["field_key"] for f in fields}:
+        raise NotImplementedError(
+            "jno.fem: coupled second-order-in-time 1D requires EVERY field to carry u_tt — a field with no "
+            "inertia is an algebraic constraint on the augmented block, which the [u; v] form cannot express. "
+            "Write it as a first-order system with an explicit velocity field."
+        )
+
+    boundary_tl = [
+        (coeff, tfi, _region_node_ids(domain, region))
+        for region, bares in boundary_terms.items()
+        for (coeff, tfi) in _typed_terms_1d(domain, bares, field_index)
+    ]
+
+    n = offsets[-1]
+    z = jnp.zeros(n)
+    M2 = _make_multifield_residual_1d(
+        domain, mass2_tl, [], fields, field_index, offs=offsets, quad_degree=quad_degree
+    ).sparse_jacobian(z)
+    spatial_res = _make_multifield_residual_1d(
+        domain, spatial_tl, boundary_tl, fields, field_index, offs=offsets, quad_degree=quad_degree
+    )
+    K = spatial_res.sparse_jacobian(z)
+    F = -spatial_res(z)
+    dtype = z.dtype
+
+    # Compose the 2n augmented block SPARSELY through the same three helpers the single-field 1D and
+    # native u_tt paths use, so the three augmented systems cannot drift apart.
+    M_aug = _bcoo_block([(M2, 0, 0, 1.0), (M2, n, n, 1.0)], (2 * n, 2 * n), dtype)
+    A_aug = _bcoo_block([(M2, 0, n, -1.0), (K, n, 0, 1.0)], (2 * n, 2 * n), dtype)
+    c_aug = jnp.concatenate([jnp.zeros((n,), dtype), F])
+
+    # ---- initial state y0 = [u_all; v_all]: each IC into its field block, displacement vs velocity ----
+    u0 = jnp.zeros((n,), dtype)
+    v0 = jnp.zeros((n,), dtype)
+    for ic in ic_residuals:
+        from ..._fem import _field_key_of
+
+        fi = field_index.get(_field_key_of(ic))
+        if fi is None:
+            continue
+        lo, hi = offsets[fi], offsets[fi + 1]
+        pts = jnp.asarray(dof_coords[fi])[:, : domain.dimension]
+        bare_ic = _bare(ic)
+        val = jnp.asarray(_ic_value_at_nodes(bare_ic, domain, pts, hi - lo, 1), dtype)
+        if _mto(bare_ic) >= 1:
+            v0 = v0.at[lo:hi].set(val)  # velocity IC u̇(0) for this field
+        else:
+            u0 = u0.at[lo:hi].set(val)  # displacement IC u(0) for this field
+
+    if dirichlet_pairs:  # u[d]=g on the displacement rows, v[d]=0 on the velocity rows
+        dd = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32)
+        dg = jnp.asarray([p[1] for p in dirichlet_pairs], dtype=dtype)
+        aug_d = jnp.concatenate([dd, dd + n])
+        M_aug = bcoo_zero_rows(M_aug, aug_d)  # the constrained mass rows are algebraic
+        A_aug = bcoo_set_dirichlet_rows(A_aug, aug_d)  # -> identity rows (columns kept)
+        c_aug = c_aug.at[dd].set(dg).at[dd + n].set(0.0)
+        u0, v0 = u0.at[dd].set(dg), v0.at[dd].set(0.0)
+
+    t0, t1, dt = _infer_time_window(domain)
+    block = SemidiscreteTimeBlock(
+        backend="transient",
+        mode="implicit",
+        time_order=2,
+        spatial_kind="weak_form",
+        M=M_aug,
+        A=A_aug,
+        affine_bias=c_aug,
+        state0=jnp.concatenate([u0, v0]),
+        t0=t0,
+        t1=t1,
+        dt=dt,
+        eval_context=getattr(domain, "_fem_eval_context", {}) or {},
+        metadata={"theta": 0.5, "second_order": True},
+    )
+    # Field slicing on the augmented state [u1..uF, v1..vF]: displacement blocks then velocity blocks
+    # (same convention as the 2D/3D coupled route).
+    return block, "transient", list(offsets[:-1]) + [n + o for o in offsets]
 
 
 def _multifield_initial_state_1d(domain, fields, field_index, ic_residuals, offs, dof_coords):

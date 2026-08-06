@@ -1198,7 +1198,9 @@ route** — the residual-PINN path is unaffected. Full detail is inline in the s
   *is* supported — Newton on the augmented `[u; v]` block — but the **temporal** side must stay linear:
   a state-dependent mass or damping `c(u)·u_tt` is refused, since `M2`/`C` are extracted by
   differentiating at `u=0` and would otherwise be frozen there. Coupled multi-field is 2D/3D and
-  **all**-second-order only (1D is single-field); time-varying Dirichlet is refused on nonlinear forms.
+  **all**-second-order only; time-varying Dirichlet is refused on nonlinear forms. A coupled 1D
+  system carries `u_tt` on the same terms as 2D/3D: the augmented state is `[u_all; v_all]`, so
+  `fem.offsets` lists the displacement blocks then the velocity blocks.
 - **Reduced-order (`basis=`) solves** cover steady and **first-order transient** (linear and
   nonlinear). Second-order-in-time (`u_tt`), complex, and periodic-tied problems refuse, each with its
   own reason. Nonlinear reduces, but without hyper-reduction that is a memory win, not a speed one.

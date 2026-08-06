@@ -786,6 +786,92 @@ def test_coupled_nonlinear_transient_recovers():
 
 
 # ==========================================================================
+# coupled 1D — second order in time (u_tt)
+# ==========================================================================
+def test_coupled_1d_second_order_two_waves_beat():
+    """Two coupled 1D waves, ``u_tt`` on both fields. 1D refused this outright ("single-field only"),
+    though the 2D/3D coupled route builds exactly this augmented block.
+
+        u_tt = u'' - k(u - p),   p_tt = p'' - k(p - u),   clamped, u(x,0)=sin(pi x), p(x,0)=0, at rest
+
+    The normal modes decouple: ``s = u+p`` gives ``omega_s = pi``; ``a = u-p`` gives
+    ``omega_a = sqrt(pi^2 + 2k)``. With this IC ``s0 = a0 = sin(pi x)``, so
+
+        u = 0.5 sin(pi x) [cos(omega_s t) + cos(omega_a t)]
+        p = 0.5 sin(pi x) [cos(omega_s t) - cos(omega_a t)]
+
+    — energy sloshes between the two membranes at the beat frequency. That is the assertion a
+    *decoupled* or frozen operator cannot pass: it would leave p at zero for all time."""
+    k = 5.0
+    d = _line(0.02, time=(0.0, 2.0, 200))
+    u, v = d.fem_symbols(names=("u", "v"))
+    p, q = d.fem_symbols(names=("p", "q"))
+    co = d.variable("interior", split=True)
+    xi, ti = co[0], co[-1]
+    xb = d.variable("boundary", split=True)[0]
+    ic = d.variable("initial", split=True)
+    xi0, ti0 = ic[0], ic[-1]
+    ui, vi = u.bind(x=xi, t=ti), v.bind(x=xi, t=ti)
+    pi_, qi = p.bind(x=xi, t=ti), q.bind(x=xi, t=ti)
+    ui0, pi0 = u.bind(x=xi0, t=ti0), p.bind(x=xi0, t=ti0)
+    fem = jno.fem(
+        [
+            ui.tt * vi + ui.x * vi.x + k * (ui - pi_) * vi,
+            pi_.tt * qi + pi_.x * qi.x + k * (pi_ - ui) * qi,
+            u(xb) - 0.0,
+            p(xb) - 0.0,
+            u(xi0) - jno.fn(lambda x: jnp.sin(np.pi * x), [xi0]),
+            p(xi0) - 0.0,
+            ui0.t - 0.0,
+            pi0.t - 0.0,
+        ]
+    )
+    assert fem.is_transient and fem.is_linear
+    # the augmented state is [u, p, u̇, ṗ]: displacement blocks then velocity blocks
+    o = fem.offsets
+    assert len(o) == 5 and o[2] == o[4] - o[2], f"augmented layout not [u, p | u̇, ṗ]: {o}"
+
+    traj = np.asarray(fem.solve().fn())
+    x = np.asarray(fem.field_points[0]).reshape(-1)
+    ts = np.linspace(0.0, float(fem.t1), traj.shape[0])
+    w = np.sin(np.pi * x)
+    amp = lambda blk: (blk @ w) / (w @ w)  # modal amplitude of the sin(pi x) mode  # noqa: E731
+    au = np.array([amp(traj[i, o[0] : o[1]]) for i in range(traj.shape[0])])
+    ap = np.array([amp(traj[i, o[1] : o[2]]) for i in range(traj.shape[0])])
+    ws, wa = np.pi, np.sqrt(np.pi**2 + 2 * k)
+    au_ex = 0.5 * (np.cos(ws * ts) + np.cos(wa * ts))
+    ap_ex = 0.5 * (np.cos(ws * ts) - np.cos(wa * ts))
+    assert np.linalg.norm(au - au_ex) / np.linalg.norm(au_ex) < 5e-3
+    assert np.linalg.norm(ap - ap_ex) / np.linalg.norm(ap_ex) < 5e-3
+    # p started at rest and at zero: it can only move through the coupling
+    assert np.max(np.abs(ap)) > 0.8
+
+
+def test_coupled_1d_second_order_scope_limits_fail_loud():
+    """The augmented ``[u_all; v_all]`` form carries one velocity block per displacement block, so a
+    bare ``u_t`` (damping, or a first-order field) and a field with no inertia at all are both
+    inexpressible — each refuses, naming the first-order-system rewrite. Same scope as 2D/3D."""
+    d = _line(0.1, time=(0.0, 0.2, 21))
+    u, v = d.fem_symbols(names=("u", "v"))
+    p, q = d.fem_symbols(names=("p", "q"))
+    co = d.variable("interior", split=True)
+    xi, ti = co[0], co[-1]
+    xb = d.variable("boundary", split=True)[0]
+    ic = d.variable("initial", split=True)
+    xi0, ti0 = ic[0], ic[-1]
+    ui, vi = u.bind(x=xi, t=ti), v.bind(x=xi, t=ti)
+    pi_, qi = p.bind(x=xi, t=ti), q.bind(x=xi, t=ti)
+    ui0, pi0 = u.bind(x=xi0, t=ti0), p.bind(x=xi0, t=ti0)
+    common = [u(xb) - 0.0, p(xb) - 0.0, u(xi0) - 1.0, p(xi0) - 0.0, ui0.t - 0.0, pi0.t - 0.0]
+
+    with pytest.raises(NotImplementedError, match="u_t term"):  # damping
+        jno.fem([ui.tt * vi + ui.x * vi.x + 0.5 * ui.t * vi, pi_.tt * qi + pi_.x * qi.x, *common])
+
+    with pytest.raises(NotImplementedError, match="EVERY field to carry u_tt"):  # p has no inertia
+        jno.fem([ui.tt * vi + ui.x * vi.x + pi_ * vi, pi_.x * qi.x + ui * qi, *common])
+
+
+# ==========================================================================
 # coupled 1D — algebraic (DAE) fields in a transient block
 # ==========================================================================
 def test_coupled_1d_transient_algebraic_field():

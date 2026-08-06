@@ -3734,13 +3734,16 @@ def _fem_impl(
             )
 
         if multifield:  # coupled 1D -> native block assembly
-            if _second_order:
-                raise NotImplementedError(
-                    "jno.fem: second-order-in-time (u_tt) 1D is single-field only for now; write the coupled "
-                    "problem as a first-order system (one velocity field per second-order field)."
-                )
+            # `u_tt` on a coupled system builds the augmented [u_all; v_all] block, which reports its
+            # own offsets (displacement blocks then velocity blocks) — hence no override below.
             op, mode, offs_1d = assemble_fem_1d_multifield(
-                domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, quad_degree=quad_degree
+                domain,
+                volume_terms,
+                boundary_terms,
+                dirichlet_raw,
+                ic_residuals,
+                quad_degree=quad_degree,
+                second_order=_second_order,
             )
         else:
             offs_1d = None
@@ -3756,8 +3759,9 @@ def _fem_impl(
                 quad_degree=max(quad_degree, 2 * _order_1d),
                 order=_order_1d,
             )
-        # a second-order 1D block carries the augmented state y=[u; v] (size 2N) -> field offsets [0, N, 2N]
-        if _second_order and mode == "transient":
+        # a second-order SINGLE-FIELD 1D block carries the augmented state y=[u; v] (size 2N) -> field
+        # offsets [0, N, 2N]. The coupled route already returned its own augmented layout.
+        if _second_order and mode == "transient" and not multifield:
             _nh = int(np.asarray(op.state0).shape[0]) // 2
             offs_1d = [0, _nh, 2 * _nh]
         return _finalize(FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs_1d))
