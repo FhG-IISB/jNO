@@ -171,11 +171,17 @@ def remesh_with_mmg(
     domain geometry is preserved exactly; boundary edges are left splittable so the
     boundary can still be refined along its straight segments.
     """
-    import mmgpy  # lazy: optional dependency, only needed for adaptive refinement
-
     dim = int(domain.dimension)
+    if dim == 1:
+        # mmg has no 1-D mode, and needs none: an interval mesh is a sorted list of vertices, so
+        # honouring a size field is subdivision rather than remeshing. Same signature and the same
+        # returned domain, so every caller (the steady AFEM loop, the transient re-mesher) is
+        # dimension-agnostic above this line.
+        return _remesh_line_1d(domain, vertex_size, hmin=hmin, hmax=hmax, hgrad=hgrad, copy=copy)
     if dim not in (2, 3):
-        raise NotImplementedError(f"remesh_with_mmg supports 2D/3D simplicial meshes; got dimension {dim}.")
+        raise NotImplementedError(f"remesh_with_mmg supports 1D line and 2D/3D simplicial meshes; got dimension {dim}.")
+
+    import mmgpy  # lazy: optional dependency, only needed for adaptive refinement
 
     pts = np.asarray(domain.mesh.points)[:, :dim].astype(np.float64)
     field = np.asarray(vertex_size, dtype=np.float64)
@@ -241,6 +247,59 @@ def remesh_with_mmg(
     return _domain_from_arrays(domain, v_out, np.asarray(t_out), np.asarray(f_out), copy=copy)
 
 
+def _remesh_line_1d(domain: Any, vertex_size: Any, *, hmin, hmax, hgrad: float, copy: bool):
+    """Rebuild a 1-D line mesh to honour a per-vertex target size — the 1-D face of
+    :func:`remesh_with_mmg`.
+
+    An interval mesh *is* a sorted vertex list, so there is nothing to remesh: each element is
+    subdivided into as many equal pieces as its requested size demands. That makes the 1-D path exact
+    where mmg is approximate, and it needs no optional dependency.
+
+    ``hgrad`` is the size gradation mmg applies in 2-D/3-D — the cap on the ratio between neighbouring
+    edge lengths. Without it a sharply peaked estimator produces a 100x jump between adjacent elements,
+    which is both wasteful and badly conditioned; it is imposed here by two monotone sweeps over the
+    sorted vertices (forward then backward), the 1-D form of mmg's gradation.
+
+    The endpoints are never moved, so the domain's geometry is preserved exactly.
+    """
+    verts = np.asarray(domain.mesh.points)[:, 0].astype(np.float64)
+    cells = np.asarray(domain.mesh.cells_dict["line"], dtype=np.int64)
+    sizes = np.asarray(vertex_size, dtype=np.float64).reshape(-1)
+    if sizes.shape[0] != verts.shape[0]:
+        raise ValueError(f"metric field has {sizes.shape[0]} entries but the mesh has {verts.shape[0]} vertices.")
+    if not np.all(sizes > 0):
+        raise ValueError("vertex_size must be strictly positive.")
+
+    lengths = np.abs(verts[cells[:, 1]] - verts[cells[:, 0]])
+    hmin = float(sizes.min()) * 0.5 if hmin is None else float(hmin)
+    hmax = float(sizes.max()) * 2.0 if hmax is None else float(hmax)
+    sizes = np.clip(sizes, hmin, hmax)
+
+    order = np.argsort(verts)
+    xs, s = verts[order], sizes[order].copy()
+    # Gradation, as mmg means it: the ratio between ADJACENT edge sizes is capped at `hgrad`. One
+    # forward and one backward sweep is enough — after them every neighbouring pair satisfies the cap,
+    # because each sweep is monotone in the direction it travels.
+    for i in range(1, len(xs)):
+        s[i] = min(s[i], s[i - 1] * hgrad)
+    for i in range(len(xs) - 2, -1, -1):
+        s[i] = min(s[i], s[i + 1] * hgrad)
+
+    out = [xs[0]]
+    for i in range(len(xs) - 1):
+        a, b = xs[i], xs[i + 1]
+        n_sub = max(1, int(np.ceil((b - a) / min(s[i], s[i + 1]))))
+        out.extend(np.linspace(a, b, n_sub + 1)[1:])
+    new_x = np.asarray(out, dtype=np.float64)
+    del lengths
+
+    n = new_x.shape[0] - 1
+    new_cells = np.column_stack([np.arange(n), np.arange(1, n + 1)]).astype(np.int64)
+    # the boundary of an interval is its two endpoint VERTICES (the block `jno.domain.line` builds)
+    bfacets = np.array([[0], [n]], dtype=np.int64)
+    return _domain_from_arrays(domain, new_x.reshape(-1, 1), new_cells, bfacets, copy=copy)
+
+
 def _domain_from_arrays(template: Any, points: np.ndarray, elems: np.ndarray, bfacets: np.ndarray, *, copy: bool):
     """Apply remeshed ``points / elements / boundary-facets`` to a domain.
 
@@ -260,7 +319,7 @@ def _domain_from_arrays(template: Any, points: np.ndarray, elems: np.ndarray, bf
     elems = np.asarray(elems, dtype=np.int64)
     bfacets = np.asarray(bfacets, dtype=np.int64)
 
-    elem_type, facet_type = ("triangle", "line") if dim == 2 else ("tetra", "triangle")
+    elem_type, facet_type = {1: ("line", "vertex"), 2: ("triangle", "line")}.get(dim, ("tetra", "triangle"))
     cells = [(elem_type, elems), (facet_type, bfacets)]
     n_e, n_f = len(elems), len(bfacets)
     empty = np.asarray([], dtype=np.int64)
@@ -268,6 +327,13 @@ def _domain_from_arrays(template: Any, points: np.ndarray, elems: np.ndarray, bf
         "interior": [np.arange(n_e, dtype=np.int64), empty],
         "boundary": [empty, np.arange(n_f, dtype=np.int64)],
     }
+    if dim == 1:
+        # `jno.domain.line` names the two endpoint vertices; re-declare them here so `left` / `right`
+        # survive the remesh as cell sets, exactly as the mesh generator's named edge regions are
+        # re-derived geometrically in 2D/3D by `_capture_geometric_boundary_tags`.
+        lo = int(np.argmin(points[:, 0][np.asarray(bfacets).reshape(-1)]))
+        cell_sets["left"] = [empty.copy(), np.array([lo], dtype=np.int64)]
+        cell_sets["right"] = [empty.copy(), np.array([1 - lo], dtype=np.int64)]
     new_mesh = meshio.Mesh(pts3, cells, cell_sets=cell_sets)
 
     target = _shallow_copy(template) if copy else template
@@ -464,14 +530,16 @@ def transfer_solution(
     import jax.numpy as jnp
 
     dim = int(source_domain.dimension)
-    if dim not in (2, 3):
-        raise NotImplementedError(f"transfer_solution supports 2D/3D simplicial meshes; got dimension {dim}.")
+    if dim not in (1, 2, 3):
+        raise NotImplementedError(f"transfer_solution supports 1D line and 2D/3D simplicial meshes; got {dim}.")
     if int(target_domain.dimension) != dim:
         raise ValueError(f"source ({dim}D) and target ({int(target_domain.dimension)}D) mesh dimensions differ.")
     if fill not in ("nearest", "error") and not isinstance(fill, (int, float)):
         raise ValueError(f"fill must be 'nearest', 'error', or a numeric constant; got {fill!r}.")
 
-    key = "triangle" if dim == 2 else "tetra"
+    # An interval IS a 1-simplex, so the barycentric location core below is dimension-agnostic: in 1D
+    # the "barycentric weights" are just the two linear hat values, which is exactly P1 interpolation.
+    key = {1: "line", 2: "triangle"}.get(dim, "tetra")
     src_pts = np.asarray(source_domain.mesh.points)[:, :dim].astype(np.float64)
     src_cells = np.asarray(source_domain.mesh.cells_dict[key]).astype(np.int64)
     qpts = np.asarray(target_domain.mesh.points)[:, :dim].astype(np.float64)
@@ -508,7 +576,7 @@ def _tabulate_lagrange_at(dim: int, order: int, xi: np.ndarray) -> np.ndarray:
 
     from .fem_lagrange import _lagrange_basix
 
-    cell = CellType.triangle if dim == 2 else CellType.tetrahedron
+    cell = {1: CellType.interval, 2: CellType.triangle}.get(int(dim), CellType.tetrahedron)
     tab = _lagrange_basix(cell, int(order)).tabulate(0, np.asarray(xi, dtype=np.float64))
     return np.asarray(tab[0, :, :, 0])  # (Q, n_dof): basis values (0th-derivative block, scalar value)
 
@@ -619,11 +687,11 @@ def _p1_element_gradients(domain: Any) -> tuple[np.ndarray, np.ndarray, np.ndarr
     """
     dim = int(domain.dimension)
     pts = np.asarray(domain.mesh.points)[:, :dim].astype(np.float64)
-    cells = np.asarray(domain.mesh.cells_dict["triangle" if dim == 2 else "tetra"])
+    cells = np.asarray(domain.mesh.cells_dict[_simplex_cell_key(dim)])
     v = pts[cells]  # (n_cells, dim+1, dim)
     edge = v[:, 1:, :] - v[:, :1, :]  # (n_cells, dim, dim): rows are (v_i - v_0), i=1..dim
     einv = np.linalg.inv(edge)  # column j = grad of barycentric lambda_{j+1}
-    measure = np.abs(np.linalg.det(edge)) / (2.0 if dim == 2 else 6.0)  # simplex volume = |det|/d!
+    measure = np.abs(np.linalg.det(edge)) / _simplex_measure_divisor(dim)  # simplex volume = |det|/d!
 
     grad = np.zeros((cells.shape[0], dim + 1, dim))
     grad[:, 1:, :] = np.transpose(einv, (0, 2, 1))  # grad lambda_i = column (i-1) of E^{-1}
@@ -758,7 +826,7 @@ def size_field_from_marks(domain: Any, marked_cells: np.ndarray, *, refine_facto
     """
     dim = int(domain.dimension)
     pts = np.asarray(domain.mesh.points)[:, :dim]
-    tris = np.asarray(domain.mesh.cells_dict["triangle" if dim == 2 else "tetra"])
+    tris = np.asarray(domain.mesh.cells_dict[_simplex_cell_key(dim)])
     n_vert = pts.shape[0]
 
     # mean incident edge length per vertex
@@ -788,7 +856,7 @@ def _mean_edge_length(domain: Any) -> float:
     """Mean triangle-edge length of the current mesh (a size scale for metric clamps)."""
     dim = int(domain.dimension)
     pts = np.asarray(domain.mesh.points)[:, :dim]
-    tris = np.asarray(domain.mesh.cells_dict["triangle" if dim == 2 else "tetra"])
+    tris = np.asarray(domain.mesh.cells_dict[_simplex_cell_key(dim)])
     n_local = tris.shape[1]
     lengths = [
         np.linalg.norm(pts[tris[:, a]] - pts[tris[:, b]], axis=1) for a in range(n_local) for b in range(a + 1, n_local)
@@ -808,23 +876,42 @@ def _mean_edge_length(domain: Any) -> float:
 # These are the free-boundary companions of ``transfer_solution``; the outer driver (large deformation)
 # combines a move with an occasional ``remesh_with_mmg`` + ``transfer_solution`` when the mesh distorts.
 # ---------------------------------------------------------------------------
+def _simplex_cell_key(dim: int) -> str:
+    """meshio's cell-block name for the ``dim``-simplex: interval / triangle / tetrahedron.
+
+    One place, because every geometric helper below reads the same block and a per-helper conditional
+    is exactly how a dimension gets silently forgotten."""
+    return {1: "line", 2: "triangle"}.get(int(dim), "tetra")
+
+
+def _simplex_measure_divisor(dim: int) -> float:
+    """``d!`` — the simplex volume is ``|det(edge matrix)| / d!`` (length in 1D, area in 2D, volume in 3D)."""
+    return {1: 1.0, 2: 2.0}.get(int(dim), 6.0)
+
+
 def _mesh_cells(domain: Any) -> tuple[np.ndarray, int]:
     dim = int(domain.dimension)
-    return np.asarray(domain.mesh.cells_dict["triangle" if dim == 2 else "tetra"]).astype(np.int64), dim
+    return np.asarray(domain.mesh.cells_dict[_simplex_cell_key(dim)]).astype(np.int64), dim
 
 
 def _signed_simplex_measures(points: np.ndarray, cells: np.ndarray, dim: int) -> np.ndarray:
     """Signed area (2D) / volume (3D) of every simplex; the *sign* flips iff a cell inverts (tangles)."""
     v = np.asarray(points)[cells]  # (n_cells, dim+1, dim)
     edge = v[:, 1:, :] - v[:, :1, :]  # (n_cells, dim, dim): rows v_i - v_0
-    return np.linalg.det(edge) / (2.0 if dim == 2 else 6.0)
+    return np.linalg.det(edge) / _simplex_measure_divisor(dim)
 
 
 def _mesh_boundary_facets(domain: Any) -> tuple[np.ndarray, np.ndarray, int]:
     """Return ``(cells, boundary_facets, dim)`` -- the interior simplices, their topological boundary
     facets (edges in 2D / triangles in 3D), and the dimension."""
     cells, dim = _mesh_cells(domain)
-    bfacets = _boundary_edges_from_triangles(cells) if dim == 2 else _boundary_faces_from_tets(cells)
+    if dim == 1:
+        # the boundary of an interval mesh is its two endpoint vertices: the nodes referenced by
+        # exactly one element (an interior node is shared by two)
+        ids, counts = np.unique(cells.reshape(-1), return_counts=True)
+        bfacets = ids[counts == 1].reshape(-1, 1).astype(np.int64)
+    else:
+        bfacets = _boundary_edges_from_triangles(cells) if dim == 2 else _boundary_faces_from_tets(cells)
     return cells, bfacets, dim
 
 
@@ -1918,8 +2005,8 @@ def run_adaptive_transient(
 
     d = fem.domain
     dim = int(d.dimension)
-    if dim not in (2, 3):
-        raise NotImplementedError(f"transient adaptive remeshing supports 2D/3D simplicial meshes; got dimension {dim}.")
+    if dim not in (1, 2, 3):
+        raise NotImplementedError(f"transient adaptive remeshing supports 1D/2D/3D meshes; got dimension {dim}.")
 
     cons, kw = fem._constraints, fem._fem_kwargs
     block = fem._op
@@ -1942,7 +2029,7 @@ def run_adaptive_transient(
     if not 0 <= mf < n_fields:
         raise ValueError(f"AdaptSpec.metric_field={spec.metric_field} is out of range for {n_fields} field(s).")
 
-    key = "triangle" if dim == 2 else "tetra"
+    key = _simplex_cell_key(dim)
     ts = np.asarray(_block_time_grid(block))  # fixed t0..t1 at dt -- unchanged by remeshing
     dt = float(block.dt)
     theta = float(block.metadata.get("theta", 1.0)) if block.metadata else 1.0
@@ -2219,7 +2306,7 @@ def run_moving_boundary(
                 f"DOFs vs {n_verts} mesh vertices (vector / higher-order). Express it as scalar-P1 fields, or await it."
             )
 
-    key = "triangle" if dim == 2 else "tetra"
+    key = _simplex_cell_key(dim)
     ts = np.asarray(_block_time_grid(block))  # fixed t0..t1 grid; moving the mesh never changes the grid
     dt = float(block.dt)
     theta = float(block.metadata.get("theta", 1.0)) if block.metadata else 1.0

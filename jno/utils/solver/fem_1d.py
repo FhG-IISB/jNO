@@ -313,6 +313,30 @@ def dof_layout_1d(domain: Any, order: int, space: str = "Lagrange"):
     return int(verts.shape[0] + inner.shape[0]), np.concatenate([verts, inner]).reshape(-1, 1)
 
 
+def _elem_dof_nodes_1d_np(domain: Any, order: int) -> np.ndarray:
+    """Host copy of the element -> dof-node map, for the records the cross-remesh transfer reads."""
+    cells = np.asarray(domain.mesh.cells_dict["line"], dtype=np.int64)
+    k = int(order)
+    if k == 1:
+        return cells
+    n_vert = int(np.asarray(domain.mesh.points).shape[0])
+    n_elem = int(cells.shape[0])
+    inner = n_vert + np.arange(n_elem * (k - 1), dtype=np.int64).reshape(n_elem, k - 1)
+    return np.concatenate([cells, inner], axis=1)
+
+
+def _publish_field_records_1d(domain: Any, dof_coords, orders, cells_all) -> None:
+    """Publish the per-field ``_fem_native_*`` records the adaptive transient transfer consumes.
+
+    Same three records the 2D/3D native assembler writes (``_fem_native_dof_points_all`` /
+    ``_field_orders`` / ``_assembly_cells_all``). They are what ``fem_adapt._field_layout`` reads to
+    drive the basis-aware cross-remesh transfer, so publishing them here is the whole of what a 1D
+    transient needed to ride the adaptive remesher."""
+    domain._fem_native_dof_points_all = [np.asarray(p) for p in dof_coords]
+    domain._fem_native_field_orders = [int(o) for o in orders]
+    domain._fem_native_assembly_cells_all = [np.asarray(c) for c in cells_all]
+
+
 def _elem_dof_nodes_1d(cells: jnp.ndarray, n_vert: int, order: int) -> jnp.ndarray:
     """Element -> global dof-node map for a degree-``k`` line: the two vertices, then this element's
     ``k-1`` interior dofs, which live at ``n_vert + e*(k-1) + j`` (the element-major block
@@ -735,6 +759,13 @@ def assemble_fem_1d(
     n_nodes, dof_coords = dof_layout_1d(domain, order, space=space)
     ndof = n_nodes * vec
     domain._fem_native_dof_points = dof_coords
+    if space == "Lagrange":
+        # The per-field records the basis-aware cross-remesh transfer reads (dof coords, element order,
+        # P{k} connectivity aligned with the P1 base mesh). Publishing them is what lets a 1D transient
+        # ride the adaptive remesher, which otherwise refuses for want of a "native nodal-Lagrange
+        # assembly". Deliberately NOT published for Hermite: its dofs are (value, slope) pairs, which
+        # the Lagrange-tabulating transfer cannot interpolate — better absent, so it fails loud.
+        _publish_field_records_1d(domain, [dof_coords], [order], [_elem_dof_nodes_1d_np(domain, order)])
     all_terms = list(volume_terms) + [t for ts in boundary_terms.values() for t in ts]
 
     if any(_contains_temporal_derivative(t) for t in all_terms):
@@ -1441,7 +1472,8 @@ def assemble_fem_1d_multifield(
     # the convention `fem.field_points` reads, with field 0's list as the `fem.points` fallback.
     _dof_coords = _field_dof_coords_1d(domain, fields)
     domain._fem_native_dof_points = _dof_coords[0]
-    domain._fem_native_dof_points_all = _dof_coords
+    _orders = [int(f.get("order", 1)) for f in fields]
+    _publish_field_records_1d(domain, _dof_coords, _orders, [_elem_dof_nodes_1d_np(domain, o) for o in _orders])
 
     all_terms = list(volume_terms) + [t for ts in boundary_terms.values() for t in ts]
     if any(_contains_temporal_derivative(t) for t in all_terms):
