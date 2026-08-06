@@ -79,7 +79,17 @@ def _guard(target, scheme: str = "automatic_differentiation") -> None:
     """Functional-API mirror of ``Placeholder``'s method-level guard: block an
     automatic-differentiation differential operator over a FieldView
     finite-difference partial (which would silently return 0).
+
+    Also catches the coordinates being passed positionally — the functional
+    operators take the variables as a *list*, so ``laplacian(u, x, y)`` lands ``y``
+    in the ``scheme`` slot and would otherwise fail much later inside the compiler
+    with an unrelated ``AttributeError``.
     """
+    if not isinstance(scheme, str):
+        raise TypeError(
+            f"scheme must be a string, got {type(scheme).__name__}. The functional operators take the "
+            f"coordinates as one list — write laplacian(u, [x, y]), or use the method form u.laplacian(x, y)."
+        )
     _guard_ad_on_fd(_u(target), scheme)
 
 

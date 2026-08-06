@@ -191,7 +191,7 @@ def test_shape_hessian_is_deferred_when_no_term_needs_it():
 
         # (b) a Laplacian term DOES need it -> still computed, and still right
         calls["n"] = 0
-        lap = jno.fem([jno.np.laplacian(ui, xi, yi) * jno.np.laplacian(vi, xi, yi)], quad_degree=3)
+        lap = jno.fem([jno.np.laplacian(ui, [xi, yi]) * jno.np.laplacian(vi, [xi, yi])], quad_degree=3)
         K = lap.operator[0]
         assert calls["n"] > 0, "a 4th-order form must still reach the Hessian push-forward"
         assert np.all(np.isfinite(np.asarray(K.todense() if hasattr(K, "todense") else K)))
