@@ -3673,6 +3673,66 @@ def _fem_impl(
                 "jno.fem: higher-order (P2 / LINE3) elements on a 1D domain are single-field only for "
                 "now -- the coupled 1D block assembler is P1. Use order=1 for the coupled system."
             )
+        # ---- complex 1D: the same real-equivalent split the 2D/3D and non-nodal paths use ----
+        # Every other `_is_complex_form` dispatch sits BELOW this branch, so before this a `1j` on a
+        # line domain reached the real assembler: the stiffness came out complex128 while the load
+        # scatter dropped its imaginary part (a numpy ComplexWarning, no jNO error), and the solve then
+        # died inside jax's spsolve on a dtype mismatch. Assemble the Re and Im legs separately and let
+        # `_fuse_complex_steady` build the real 2n block — which also carries the parametric legs, so a
+        # 1D complex *inverse* rides the same path.
+        _cx_bd = any(_bares_have_complex_coeff(exprs) for exprs in boundary_terms.values())
+        if _bares_have_complex_coeff(volume_terms) or _cx_bd:
+            from .utils.solver.fem_1d import complex_dirichlet_regions
+            from .utils.solver.weak_form import _contains_temporal_derivative as _ctd_1d
+            from .utils.solver.weak_form import _is_obviously_nonlinear_in_unknown as _nlin_1d
+
+            _cx_all = list(volume_terms) + [t for ts in boundary_terms.values() for t in ts]
+            # Each guard below refuses a path where the real assembler would silently drop the
+            # imaginary part rather than fail — the same reason the non-nodal complex branch raises.
+            if multifield:
+                raise NotImplementedError(
+                    "jno.fem: a complex COUPLED 1D system is not wired — the 1D block assembler has no "
+                    "Re/Im split. Use a single complex field, or a 2D/3D domain for the coupled case."
+                )
+            if ic_residuals or any(_ctd_1d(b) for b in _cx_all):
+                raise NotImplementedError(
+                    "jno.fem: a complex *transient* 1D form is not wired — only the steady linear complex "
+                    "form is. (The real assembler would silently drop the imaginary part, so this raises.)"
+                )
+            if any(_nlin_1d(domain, b) for b in _cx_all):
+                raise NotImplementedError(
+                    "jno.fem: a complex *nonlinear* 1D form is not wired — complex forms assemble as "
+                    "linear real-equivalent blocks. (Raises rather than dropping the imaginary part.)"
+                )
+            # Both legs share one Dirichlet row set, which imposes `Re u = g, Im u = 0` — right for a
+            # real g, inexpressible for a complex one (see `complex_dirichlet_regions`). 2D/3D takes
+            # the same shared-row route but reaches it by casting g to float, so it *silently* drops
+            # Im(g); refuse instead. A complex essential value is the one thing 1D says no to here.
+            if _cx_dbc := complex_dirichlet_regions(domain, dirichlet_values):
+                raise NotImplementedError(
+                    f"jno.fem: a COMPLEX essential value on region(s) {sorted(set(_cx_dbc))} of a 1D complex "
+                    "form is not supported — the Re/Im legs share one Dirichlet row set, which can impose "
+                    "Re u = g with Im u = 0 but not a prescribed Im u. Use a real essential value and carry "
+                    "the complex part in the operator or the source."
+                )
+            _cx_quad = max(quad_degree, 2 * _order_1d)
+            _cx_legs = [
+                assemble_fem_1d(
+                    domain,
+                    [getattr(b, _part) for b in volume_terms],
+                    {tag: [getattr(e, _part) for e in exprs] for tag, exprs in boundary_terms.items()},
+                    dirichlet_values,
+                    [],
+                    vec=vec,
+                    quad_degree=_cx_quad,
+                    order=_order_1d,
+                )[0]
+                for _part in ("real", "imag")
+            ]
+            return _finalize(
+                FEM(domain=domain, op=tuple(_cx_legs), classification=classification, mode="complex", offsets=None)
+            )
+
         if multifield:  # coupled 1D -> native block assembly
             if _second_order:
                 raise NotImplementedError(

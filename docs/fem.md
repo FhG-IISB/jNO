@@ -52,6 +52,13 @@ u_h = fem.solve()          # matrix-free default; slots pick anything else (see 
   assembled once, so a parameter there would be silently frozen; it fails loud). *Nonlinear* forms are
   parametric too — Newton runs on `R(·, θ)` and implicit differentiation gives `∂u/∂θ`. Not wired in 1D:
   anything parametric on a *coupled* system.
+* **Complex forms in 1D** — a `1j` anywhere in a 1D weak form routes through the same real-equivalent
+  Re/Im split the 2D/3D and non-nodal paths use, so 1D Helmholtz-type problems (complex coefficient,
+  complex source, or both) solve and return a complex `u`. A runtime parameter inside the complex
+  coefficient keeps both legs parametric, so the complex **inverse** works in 1D too. Scope: steady and
+  linear, single field. Complex *transient*, complex *nonlinear*, a complex *coupled* 1D system, and a
+  **complex essential value** each raise — the last because the two legs share one Dirichlet row set,
+  which can impose `Re u = g` with `Im u = 0` but not a prescribed `Im u`.
 * **Quadrature coordinates** — `d.variable("interior", split=True)` returns the volume
   coordinates; `d.variable("<edge>", split=True)` returns a boundary edge's coordinates. A
   `Shape.rect` auto-tags `"left"`, `"right"`, `"bottom"`, `"top"` (and `"front"`/`"back"` for a box);

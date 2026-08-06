@@ -895,3 +895,148 @@ def test_coupled_1d_periodic_recovers_manufactured():
     # the tie is real: the identified endpoints carry the same value, per field
     assert abs(sol[lo] - sol[mid - 1]) < 1e-10
     assert abs(sol[mid] - sol[hi - 1]) < 1e-10
+
+
+# ==========================================================================
+# complex 1D — the real-equivalent Re/Im split
+# ==========================================================================
+def _cx_line(ms=0.01):
+    d = _line(ms)
+    u, phi = d.fem_symbols()
+    xi = d.variable("interior", split=True)[0]
+    return d, u, phi, xi, d.variable("boundary", split=True)[0]
+
+
+def test_complex_1d_helmholtz_recovers_manufactured():
+    """A ``1j`` in a 1D weak form must route through the same real-equivalent split the 2D/3D and
+    non-nodal paths use. Every other complex dispatch sits *below* the 1D branch, so before this a
+    complex 1D form reached the real assembler: the stiffness came out ``complex128`` while the load
+    scatter dropped its imaginary part (a numpy ``ComplexWarning``, no jNO error), and the solve then
+    died inside jax's ``spsolve`` on a dtype mismatch.
+
+    Manufactured, all-Neumann (no Dirichlet bookkeeping), ``u* = (1+0.5i) cos(pi x)``:
+        c(-u'') + d u = f,  c = 1/(1 + 0.5i),  d = -(1 + 0.2i),  f = (pi^2 c + d) u*.
+    Both the operator and the source are complex."""
+    d, u, phi, xi, _ = _cx_line()
+    ui, vi = u.bind(x=xi), phi.bind(x=xi)
+    c = 1.0 / (1.0 + 1j * (0.5 + 0.0 * xi))  # traced -> stresses complex division through the trace
+    d_coef = -(1.0 + 0.2j)
+    amp = 1.0 + 0.5j
+    g = jno.np.cos(np.pi * xi)
+    f = (np.pi**2 * c + d_coef) * amp * g
+
+    fem = jno.fem([c * (ui.x * vi.x) + d_coef * (ui * vi) - f * vi])
+    assert fem.is_complex, "a 1j coefficient did not make the 1D system complex"
+
+    u_num = np.asarray(fem.solve()).reshape(-1)
+    assert np.iscomplexobj(u_num)
+    pts = np.asarray(fem.points).reshape(-1)
+    u_star = amp * np.cos(np.pi * pts)
+    rel = float(np.linalg.norm(u_num - u_star) / np.linalg.norm(u_star))
+    assert rel < 1e-3, f"complex 1D Helmholtz recovery rel-L2 {rel:.3e}"
+    assert float(np.abs(u_num.imag).max()) > 0.1  # genuinely complex, not a real solve in disguise
+
+
+def test_complex_1d_source_imaginary_part_is_not_dropped():
+    """The precise silent path: a **real** operator with a **complex source**. Nothing about the
+    matrix betrays the problem, so dropping ``Im(f)`` produced a plausible real field. ``-u'' = pi^2
+    (1+2i) sin(pi x)``, ``u(0)=u(1)=0`` -> ``u = (1+2i) sin(pi x)``, which 1D P1 reproduces nodally."""
+    d, u, phi, xi, xb = _cx_line(0.02)
+    ui, vi = u.bind(x=xi), phi.bind(x=xi)
+    f = (np.pi**2) * (1.0 + 2.0j) * jno.np.sin(np.pi * xi)
+    fem = jno.fem([ui.x * vi.x - f * vi, u(xb) - 0.0])
+    assert fem.is_complex
+
+    u_num = np.asarray(fem.solve()).reshape(-1)
+    pts = np.asarray(fem.points).reshape(-1)
+    exact = (1.0 + 2.0j) * np.sin(np.pi * pts)
+    rel = float(np.linalg.norm(u_num - exact) / np.linalg.norm(exact))
+    assert rel < 1e-6, f"complex 1D source rel-L2 {rel:.3e}"
+    # the imaginary part is twice the real one -- a dropped Im(f) would leave it at zero
+    assert float(np.abs(u_num.imag).max()) > 1.9
+
+
+def test_complex_1d_real_dirichlet_pins_re_and_leaves_im_free():
+    """A **real** essential value on a complex form is well-posed on the shared Dirichlet row set: the
+    fused block imposes ``x_r - x_i = g`` and ``x_r + x_i = g``, i.e. ``Re u = g`` with ``Im u = 0``.
+    ``-u'' + i u = 0``, ``u(0)=0``, ``u(1)=1``: the endpoints are pinned real, the interior is not."""
+    d, u, phi, xi, _ = _cx_line(0.02)
+    xl = d.variable("left", split=True)[0]
+    xr = d.variable("right", split=True)[0]
+    ui, vi = u.bind(x=xi), phi.bind(x=xi)
+    fem = jno.fem([ui.x * vi.x + 1j * (ui * vi), u(xl) - 0.0, u(xr) - 1.0])
+    assert fem.is_complex
+
+    u_num = np.asarray(fem.solve()).reshape(-1)
+    pts = np.asarray(fem.points).reshape(-1)
+    i0, i1 = int(np.argmin(pts)), int(np.argmax(pts))
+    assert abs(u_num[i0] - 0.0) < 1e-12 and abs(u_num[i1] - 1.0) < 1e-12, "real Dirichlet not imposed"
+    # the i*u reaction drives a genuinely complex interior -- otherwise this is a real solve
+    assert float(np.abs(u_num.imag).max()) > 1e-3
+
+
+def test_complex_1d_parametric_inverse_matches_the_constant_assembly():
+    """The complex **inverse** in 1D: a ``jno.np.parameter`` inside the complex coefficient keeps both
+    legs parametric, and the fused 2n block re-forms from the runtime args as a differentiable trace
+    node. Evaluated at the parameter's value it must equal the constant-coefficient complex solve."""
+    from jno.trace import FemLinearSystem
+
+    def _build(sig):
+        d, u, phi, xi, xb = _cx_line(0.02)
+        ui, vi = u.bind(x=xi), phi.bind(x=xi)
+        c = 1.0 / (1.0 + 1j * sig)
+        return jno.fem([c * ui.x * vi.x - (np.pi**2) * jno.np.sin(np.pi * xi) * vi, u(xb) - 0.0])
+
+    sig = jno.np.parameter((1,), name="sig")
+    sig.initialize(jax.nn.initializers.constant(0.5))
+    fem = _build(sig)
+    assert fem.is_complex and isinstance(fem.operator, FemLinearSystem)
+
+    node = fem.solve()
+    assert not isinstance(node, jax.Array), "a parametric complex 1D solve must be a trace node"
+    crux = jno.core([(node * 0.0).mae], domain=_dummy_domain())
+    got = np.asarray(crux.eval([node])).reshape(-1)
+    ref = np.asarray(_build(0.5).solve()).reshape(-1)
+    assert np.iscomplexobj(got)
+    assert np.max(np.abs(got - ref)) < 1e-12, "parametric complex 1D disagrees with the constant one"
+
+
+def test_complex_1d_scope_limits_fail_loud():
+    """Every path the Re/Im split does NOT cover raises rather than dropping the imaginary part —
+    the same rule the non-nodal complex branch follows."""
+    # transient
+    d = _line(0.1, time=(0.0, 0.02, 11))
+    u, phi = d.fem_symbols()
+    co = d.variable("interior", split=True)
+    xi, ti = co[0], co[1]
+    xb = d.variable("boundary", split=True)[0]
+    ci = d.variable("initial", split=True)[0]
+    ui, vi = u.bind(x=xi, t=ti), phi.bind(x=xi, t=ti)
+    with pytest.raises(NotImplementedError, match="complex \\*transient\\* 1D"):
+        jno.fem([ui.t * vi + 1j * (ui.x * vi.x), u(xb) - 0.0, u(ci) - 1.0])
+
+    # nonlinear
+    d2, u2, phi2, xi2, xb2 = _cx_line(0.1)
+    ui2, vi2 = u2.bind(x=xi2), phi2.bind(x=xi2)
+    with pytest.raises(NotImplementedError, match="complex \\*nonlinear\\* 1D"):
+        jno.fem([ui2.x * vi2.x + 1j * (ui2 * ui2 * vi2) - vi2, u2(xb2) - 0.0])
+
+    # coupled
+    d3 = _line(0.1)
+    a, b = d3.fem_symbols(names=("a", "b"))
+    p, q = d3.fem_symbols(names=("p", "q"))
+    xi3 = d3.variable("interior", split=True)[0]
+    xb3 = d3.variable("boundary", split=True)[0]
+    ai, bi = a.bind(x=xi3), b.bind(x=xi3)
+    pi_, qi = p.bind(x=xi3), q.bind(x=xi3)
+    with pytest.raises(NotImplementedError, match="complex COUPLED 1D"):
+        jno.fem([ai.x * bi.x + 1j * pi_ * bi - bi, pi_.x * qi.x - qi, a(xb3) - 0.0, p(xb3) - 0.0])
+
+    # complex essential value: inexpressible on the shared Dirichlet rows, so refused rather than
+    # silently imposed as Re(g) (which is what the 2D/3D float cast does).
+    d4, u4, phi4, xi4, _ = _cx_line(0.1)
+    xr4 = d4.variable("right", split=True)[0]
+    xl4 = d4.variable("left", split=True)[0]
+    ui4, vi4 = u4.bind(x=xi4), phi4.bind(x=xi4)
+    with pytest.raises(NotImplementedError, match="COMPLEX essential value"):
+        jno.fem([ui4.x * vi4.x + 0.0j * (ui4 * vi4), u4(xl4) - 0.0, u4(xr4) - (1.0 + 2.0j)])

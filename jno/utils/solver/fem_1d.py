@@ -136,6 +136,29 @@ def _region_node_ids(domain: Any, region: str) -> List[int]:
     return list(np.where(hits)[0])
 
 
+def complex_dirichlet_regions(domain: Any, dirichlet_values: Dict[str, Any]) -> List[str]:
+    """Regions whose essential value has a non-zero imaginary part.
+
+    A complex form assembles as two real legs that share one Dirichlet row set. That is correct for a
+    **real** ``g``: the fused block imposes ``x_r - x_i = g`` and ``x_r + x_i = g``, i.e. ``Re u = g``,
+    ``Im u = 0``. It is *not* expressible for a complex ``g`` — pinning ``Im u = g_i`` needs the
+    imaginary leg's Dirichlet rows zeroed rather than set to identity, which the shared elimination
+    cannot do. Callers use this to refuse such a value instead of imposing a silently wrong one.
+    """
+    pts = np.asarray(domain.mesh.points)
+    out: List[str] = []
+    for region, value in dirichlet_values.items():
+        nids = _region_node_ids(domain, region)
+        p = pts[nids[0]] if nids else pts[0]
+        vals = value.values() if isinstance(value, dict) else [value]
+        for v in vals:
+            raw = v(p) if callable(v) else v
+            if abs(complex(np.asarray(raw).reshape(-1)[0]).imag) > 0.0:
+                out.append(region)
+                break
+    return out
+
+
 def _dirichlet_dofs(domain: Any, dirichlet_values: Dict[str, Any], vec: int) -> List[Tuple[int, float]]:
     """Resolve ``{region: value}`` into a list of ``(global_dof, value)`` pairs."""
     pts = np.asarray(domain.mesh.points)
