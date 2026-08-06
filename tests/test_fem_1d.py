@@ -318,27 +318,11 @@ def test_1d_nonlinear_inverse_recovers_a_parameter():
 
 
 def test_1d_parameter_scope_limits_fail_loud():
-    """The two remaining limits, each with its own reason.
-
-    A COUPLED 1D system threads no runtime parameters. That previously did not merely fail, it failed
-    with the same internal KeyError about InternalVars that the single-field path used to give — the
-    value never reached the kernel. It now says so.
-
-    And a field parameter must share the trial's nodal layout, so a P1 field cannot ride a LINE3
-    element; that refusal comes from ``jno.np.parameter`` itself, at construction, which is earlier and
-    better than assembly."""
-    d = _line(0.1)
-    u, phi = d.fem_symbols(names=("u", "phi"))
-    p, q = d.fem_symbols(names=("p", "q"))
-    xi = d.variable("interior", split=True)[0]
-    xb = d.variable("boundary", split=True)[0]
-    ui, vi = u.bind(x=xi), phi.bind(x=xi)
-    pi_, qi = p.bind(x=xi), q.bind(x=xi)
-    kc = jno.np.parameter((1,), name="kc")
-    kc.initialize(jax.nn.initializers.constant(1.0))
-    with pytest.raises(NotImplementedError, match="COUPLED|coupled"):
-        jno.fem([kc * (ui.x * vi.x) - 1.0 * vi, pi_.x * qi.x - u * qi, u(xb) - 0.0, p(xb) - 0.0])
-
+    """A field parameter must share the trial's nodal layout, so a P1 field cannot ride a LINE3
+    element. That refusal comes from ``jno.np.parameter`` itself, at construction, which is earlier
+    and better than assembly. (The coupled-system limit this test also used to cover is gone: a
+    coupled STEADY 1D form is now parametric — see the coupled section. The coupled TRANSIENT block
+    is still refused, covered by ``test_coupled_1d_transient_parameter_fails_loud``.)"""
     d2 = _line(0.1)
     _u2, phi2 = d2.fem_symbols(order=2)
     with pytest.raises(NotImplementedError, match="P1|order=1"):
@@ -799,6 +783,169 @@ def test_coupled_nonlinear_transient_recovers():
     assert w[:n].std() < 1e-10 and w[n:].std() < 1e-10  # spatially uniform
     assert abs(w[:n].mean() - u_ex) / u_ex < 1e-2
     assert abs(w[n:].mean() - p_ex) / p_ex < 3e-2
+
+
+# ==========================================================================
+# coupled 1D — runtime parameters and neural coefficients
+# ==========================================================================
+def _coupled_parametric(kx, ms=0.01):
+    """A coupled 1D system whose solution genuinely MOVES with the coefficient ``k``:
+
+        -k u'' + p = pi^2 sin(pi x) + sin(2 pi x)
+        -  p'' + u = 4 pi^2 sin(2 pi x) + sin(pi x),      u = p = 0 at both ends
+
+    The sources are held fixed, so at ``k = 1`` the exact pair is ``(sin(pi x), sin(2 pi x))`` and any
+    other ``k`` gives a different field. That is deliberate: the obvious manufactured coupled problem
+    (``u = x``, ``p = 2x``) has ``u'' = 0``, so its solution is the same for *every* ``k`` — it cannot
+    tell a live parameter from one frozen at its zero placeholder.
+    """
+    d = _line(ms)
+    u, v = d.fem_symbols(names=("u", "v"))
+    p, q = d.fem_symbols(names=("p", "q"))
+    xi = d.variable("interior", split=True)[0]
+    xb = d.variable("boundary", split=True)[0]
+    ui, vi = u.bind(x=xi), v.bind(x=xi)
+    pi_, qi = p.bind(x=xi), q.bind(x=xi)
+    s1, s2 = jno.np.sin(np.pi * xi), jno.np.sin(2 * np.pi * xi)
+    f1 = (np.pi**2) * s1 + s2
+    f2 = (4 * np.pi**2) * s2 + s1
+    return d, jno.fem(
+        [
+            kx(xi) * (ui.x * vi.x) + pi_ * vi - f1 * vi,
+            pi_.x * qi.x + ui * qi - f2 * qi,
+            u(xb) - 0.0,
+            p(xb) - 0.0,
+        ]
+    )
+
+
+def _const_k(c):
+    return lambda _xi, _c=c: _c
+
+
+def _eval_node(node):
+    return np.asarray(jno.core([(node * 0.0).mae], domain=_dummy_domain()).eval([node])).reshape(-1)
+
+
+def test_coupled_1d_reference_problem_actually_depends_on_k():
+    """Guard on the guard: the coupled fixture must be k-sensitive, or every parametric assertion
+    below would pass just as well against a coefficient baked in at its placeholder."""
+    fem1 = _coupled_parametric(_const_k(1.0))[1]
+    n = fem1.offsets[1]
+    u1 = np.asarray(fem1.solve()).reshape(-1)
+    x = np.asarray(fem1.points).reshape(-1)[:n]
+    # at k = 1 it is the manufactured pair
+    assert np.abs(u1[:n] - np.sin(np.pi * x)).max() < 1e-4
+    assert np.abs(u1[n:] - np.sin(2 * np.pi * x)).max() < 1e-4
+    u2 = np.asarray(_coupled_parametric(_const_k(2.5))[1].solve()).reshape(-1)
+    assert np.abs(u1[:n] - u2[:n]).max() > 0.5, "the fixture is k-insensitive; it proves nothing"
+
+
+@pytest.mark.parametrize("kval", [1.0, 2.5])
+def test_coupled_1d_runtime_parameter_matches_the_constant_assembly(kval):
+    """A ``jno.np.parameter`` coefficient on a COUPLED 1D system. The block element kernels publish the
+    same ``runtime_parameter_tags``/``volume_vars`` keys the single-field ones do, so the shared
+    evaluator reads them regardless of field layout — no block-specific machinery. Previously this
+    raised: the coupled builder threaded no parameters at all.
+
+    Checked at two *different* values, each against the constant-coefficient assembly at the same
+    value: matching at one value alone is also what a frozen coefficient would do."""
+    from jno.trace import FemLinearSystem
+
+    k = jno.np.parameter((1,), name="k")
+    k.initialize(jax.nn.initializers.constant(kval))
+    fem = _coupled_parametric(lambda _xi, _k=k: _k)[1]
+    assert isinstance(fem.operator, FemLinearSystem) and fem.operator.is_parametric
+    assert list(fem.operator.runtime_parameter_exprs) == ["k"]
+
+    node = fem.solve()
+    assert not isinstance(node, jax.Array), "a parametric coupled 1D solve must be a trace node"
+    ref = np.asarray(_coupled_parametric(_const_k(kval))[1].solve()).reshape(-1)
+    assert np.max(np.abs(_eval_node(node) - ref)) < 1e-12
+
+
+@pytest.mark.parametrize("cval", [1.0, 2.5])
+def test_coupled_1d_neural_coefficient_matches_the_constant_assembly(cval):
+    """A ``jno.nn.wrap`` coefficient on a coupled 1D system. A network never enters ``volume_vars`` (a
+    weight pytree is cell-independent) — it rides the ``{name: module}`` table the kernel re-evaluates
+    at the quad points, which the coupled ``local`` now carries too. A *constant* net must reproduce
+    the scalar-coefficient block solve exactly, at more than one value."""
+    net = _const_net_1d(cval)
+    fem = _coupled_parametric(lambda xi, _n=net: _n(xi))[1]
+    assert fem.operator.is_parametric
+    ref = np.asarray(_coupled_parametric(_const_k(cval))[1].solve()).reshape(-1)
+    assert np.max(np.abs(_eval_node(fem.solve()) - ref)) < 1e-12
+
+
+def test_coupled_1d_inverse_recovers_a_scalar_parameter():
+    """End to end: recover ``k`` in a COUPLED 1D system from full-field data through ``crux.solve``.
+    ``∂u/∂k`` has to flow through the *block* solve for this to move at all."""
+    import optax
+
+    k_true, ms = 2.5, 0.02
+    obs = jnp.asarray(np.asarray(_coupled_parametric(_const_k(k_true), ms=ms)[1].solve()).reshape(-1))
+
+    k = jno.np.parameter((1,), name="k")
+    k.initialize(jax.nn.initializers.constant(1.0))
+    k.optimizer(optax.adam(0.15))
+    node = _coupled_parametric(lambda _xi, _k=k: _k, ms=ms)[1].solve()
+    crux = jno.core([(node - obs).mae], domain=_dummy_domain())
+    crux.solve(220)
+    rec = float(np.asarray(crux.eval([k])).reshape(-1)[0])
+    assert abs(rec - k_true) < 0.05, f"k not recovered through the coupled 1D inverse: {rec:.4f} vs {k_true}"
+
+
+def test_coupled_1d_nonlinear_is_parametric_too():
+    """A nonlinear coupled 1D form needs no extra machinery: the block residual already re-evaluates
+    its coefficients from ``args``, and ``FemResidualOperator`` takes ``R(u, args)`` — so Newton runs
+    on ``R(., k)`` and the implicit derivative gives ``du/dk``."""
+    k = jno.np.parameter((1,), name="k")
+    k.initialize(jax.nn.initializers.constant(1.0))
+    d = _line(0.05)
+    u, v = d.fem_symbols(names=("u", "v"))
+    p, q = d.fem_symbols(names=("p", "q"))
+    xi = d.variable("interior", split=True)[0]
+    xb = d.variable("boundary", split=True)[0]
+    ui, vi = u.bind(x=xi), v.bind(x=xi)
+    pi_, qi = p.bind(x=xi), q.bind(x=xi)
+    fem = jno.fem(
+        [
+            k * (ui.x * vi.x) + ui * pi_ * vi - 2.0 * xi * xi * vi,
+            pi_.x * qi.x + ui * ui * qi - xi * xi * qi,
+            u(xb) - xb,
+            p(xb) - 2.0 * xb,
+        ]
+    )
+    assert not fem.is_linear
+    assert list(fem.operator.runtime_parameter_exprs) == ["k"]
+
+
+def test_coupled_1d_transient_parameter_fails_loud():
+    """The coupled TRANSIENT block is assembled once, outside any per-args re-forming, so a parameter
+    there would be read at its zero placeholder and silently baked in — refused, with the steady path
+    named as the supported one. (Same rule the single-field transient applies to its mass.)"""
+    k = jno.np.parameter((1,), name="k")
+    k.initialize(jax.nn.initializers.constant(1.0))
+    d = _line(0.1, time=(0.0, 0.02, 11))
+    u, v = d.fem_symbols(names=("u", "v"))
+    p, q = d.fem_symbols(names=("p", "q"))
+    co = d.variable("interior", split=True)
+    xi, ti = co[0], co[1]
+    xb = d.variable("boundary", split=True)[0]
+    ci = d.variable("initial", split=True)[0]
+    ui, vi = u.bind(x=xi, t=ti), v.bind(x=xi, t=ti)
+    pi_, qi = p.bind(x=xi, t=ti), q.bind(x=xi, t=ti)
+    with pytest.raises(NotImplementedError, match="COUPLED 1D \\*transient\\*"):
+        jno.fem(
+            [
+                ui.t * vi + k * (ui.x * vi.x),
+                pi_.t * qi + pi_.x * qi.x - u.bind(x=xi, t=ti) * qi,
+                u(xb) - 0.0,
+                p(xb) - 0.0,
+                u(ci) - 1.0,
+                p(ci) - 0.0,
+            ]
+        )
 
 
 # ==========================================================================

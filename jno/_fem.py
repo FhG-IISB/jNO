@@ -3316,12 +3316,6 @@ def _fem_impl(
                 raise NotImplementedError("jno.fem: a net-valued essential value is supported on Lagrange elements only.")
             if len(_field_keys(constraints)) > 1:
                 raise NotImplementedError("jno.fem: a net-valued essential value is single-field only.")
-        if getattr(domain, "dimension", None) == 1 and len(_field_keys(constraints)) > 1:
-            # the coupled 1D block assembler threads neither runtime parameters nor networks
-            raise NotImplementedError(
-                "jno.fem: a neural coefficient on a 1D domain is single-field only — the coupled 1D block "
-                "assembler threads no runtime parameters. Use a single field, or a 2D/3D domain."
-            )
         # Non-nodal: the scalar C¹ families (Argyris/Morley/Hermite) thread the network at the quad points
         # like their P1 field parameter. The vector edge families (RT/Nédélec) accept a *scalar coordinate*
         # net(x) coefficient (a spatially-varying permeability/permittivity multiplying a vector term), but

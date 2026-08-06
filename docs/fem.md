@@ -50,8 +50,11 @@ u_h = fem.solve()          # matrix-free default; slots pick anything else (see 
   coefficient, so a learned `k(x)` can be trained from 1D data. Transient too — recovering a diffusivity
   from a 1D time series works — except that the transient **mass** must be parameter-free (it is
   assembled once, so a parameter there would be silently frozen; it fails loud). *Nonlinear* forms are
-  parametric too — Newton runs on `R(·, θ)` and implicit differentiation gives `∂u/∂θ`. Not wired in 1D:
-  anything parametric on a *coupled* system. A **non-nodal** family (`"RT"`, `"N1curl"`, `"Argyris"`,
+  parametric too — Newton runs on `R(·, θ)` and implicit differentiation gives `∂u/∂θ`. A **coupled**
+  1D system is parametric too (steady, linear and nonlinear) — the block element kernels publish the
+  same `volume_vars` / neural-table keys the single-field ones do, so the shared evaluator reads them
+  regardless of field layout. Not wired in 1D: a parameter on a coupled *transient* block, which is
+  assembled once and would freeze the parameter at its placeholder (it fails loud). A **non-nodal** family (`"RT"`, `"N1curl"`, `"Argyris"`,
   `"Morley"`, `"Hermite"`) is defined on triangles/tets and has no 1D counterpart — asking for one on a
   line raises a clear error.
 * **Complex forms in 1D** — a `1j` anywhere in a 1D weak form routes through the same real-equivalent

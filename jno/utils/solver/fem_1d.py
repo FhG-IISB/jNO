@@ -229,6 +229,42 @@ def dof_layout_1d(domain: Any, order: int):
     return int(verts.shape[0] + cells.shape[0]), np.concatenate([verts, mids]).reshape(-1, 1)
 
 
+def _pack_param_values(node_ids, args, dtype, tags, field_names, width_default: int = 1):
+    """This element's runtime-parameter values, in ``tags`` order — ``local["volume_vars"]``.
+
+    The evaluator reads them out of ``volume_vars`` at ``[temporal..., runtime_param...]``: a length-1
+    entry is a **scalar** coefficient (broadcast to the quad points), a length-``n_local`` entry is a
+    nodal **field** coefficient which it interpolates with this element's own ``shape_vals``. A tag the
+    current assembly does not supply gets a zero placeholder of the right width — it is only ever read
+    back when the term actually contains that node, in which case ``args`` carries it.
+
+    Shared by the single-field and coupled 1D residual builders: the packing rule is a property of the
+    *parameter*, not of the field layout, so it must not be duplicated per builder.
+    """
+    a = args or {}
+    out = []
+    for name in tags:
+        is_field = name in field_names
+        if name not in a:
+            out.append(jnp.zeros((node_ids.shape[0] if is_field else width_default,), dtype))
+            continue
+        flat = jnp.reshape(jnp.asarray(a[name], dtype=dtype), (-1,))
+        out.append(flat[node_ids] if is_field else flat[:1])
+    return tuple(out)
+
+
+def _neural_local_table(neural_slots, args):
+    """``local['neural_coefficients']`` for this call: the ``{name: module}`` table the evaluator
+    re-evaluates each network from at the quad points. Unlike a scalar/field parameter a network never
+    enters ``volume_vars`` (a weight pytree is cell-independent) — trainable weights arrive through
+    ``args``, a frozen net falls back to its stored module."""
+    if neural_slots is None:
+        return None
+    from .parametric_helpers import neural_local_table
+
+    return neural_local_table(neural_slots, args)
+
+
 def _make_residual(
     domain: Any,
     volume_terms: List[Any],
@@ -286,34 +322,10 @@ def _make_residual(
                 boundary_apps.append((term, int(nid)))
 
     def _pack_params(node_ids, args, dtype, width_default=1):
-        """This element's runtime-parameter values, in ``runtime_parameter_tags`` order.
-
-        The evaluator reads them out of ``volume_vars`` at ``[temporal..., runtime_param...]``: a length-1
-        entry is a **scalar** coefficient (broadcast to the quad points), a length-``n_local`` entry is a
-        nodal **field** coefficient which it interpolates with this element's own ``shape_vals``. A tag the
-        current assembly does not supply gets a zero placeholder of the right width — it is only ever read
-        back when the term actually contains that node, in which case ``args`` carries it."""
-        a = args or {}
-        out = []
-        for name in runtime_parameter_tags:
-            is_field = name in field_param_names
-            if name not in a:
-                out.append(jnp.zeros((node_ids.shape[0] if is_field else width_default,), dtype))
-                continue
-            flat = jnp.reshape(jnp.asarray(a[name], dtype=dtype), (-1,))
-            out.append(flat[node_ids] if is_field else flat[:1])
-        return tuple(out)
+        return _pack_param_values(node_ids, args, dtype, runtime_parameter_tags, field_param_names, width_default)
 
     def _neural_table(args):
-        """``local['neural_coefficients']`` for this call: the ``{name: module}`` table the evaluator
-        re-evaluates each network from at the quad points. Unlike a scalar/field parameter a network
-        never enters ``volume_vars`` (a weight pytree is cell-independent) — trainable weights arrive
-        through ``args``, a frozen net falls back to its stored module."""
-        if neural_slots is None:
-            return None
-        from .parametric_helpers import neural_local_table
-
-        return neural_local_table(neural_slots, args)
+        return _neural_local_table(neural_slots, args)
 
     def _volume_local(cell, u_local, expr, pvals=(), ntable=None):
         """Element residual ``(2*vec,)`` from the element's OWN dofs ``u_local`` ``(2, vec)``.
@@ -930,14 +942,31 @@ def _multifield_dirichlet_dofs_1d(domain, dirichlet_raw, fields, field_index, n_
     return pairs
 
 
-def _make_multifield_residual_1d(domain, term_list, boundary_term_list, fields, field_index, *, n_nodes, quad_degree):
-    """Free block residual ``R(u_flat) -> (sum_i n_nodes*vec_i,)`` for coupled 1D.
+def _make_multifield_residual_1d(
+    domain,
+    term_list,
+    boundary_term_list,
+    fields,
+    field_index,
+    *,
+    n_nodes,
+    quad_degree,
+    runtime_parameter_tags: Tuple[str, ...] = (),
+    field_param_names: Any = frozenset(),
+    neural_slots: Any = None,
+):
+    """Free block residual ``R(u_flat, args) -> (sum_i n_nodes*vec_i,)`` for coupled 1D.
 
     The native analogue of ``_eval_multifield_volume_integrand``: per element it builds
     one ``local`` with per-field shape data (``local["fields"]``) and evaluates each
     ``(coeff, test_field_index)`` via the shared ``_eval_integrand``, scattering the
     element residual into the **test field's** block DOFs. Boundary (Neumann/Robin)
-    terms ride the degenerate one-node element, same as the single-field path."""
+    terms ride the degenerate one-node element, same as the single-field path.
+
+    Runtime parameters and neural coefficients thread exactly as they do for a single field: the
+    per-element ``volume_vars`` and the ``{name: module}`` neural table go into the *same* ``local``
+    keys, which the shared evaluator reads without caring whether the layout is single- or
+    multi-field. That is why a coupled parametric 1D system needs no separate machinery."""
     nodes = jnp.asarray(domain.mesh.points)[:, 0]
     cells = jnp.asarray(domain.mesh.cells_dict["line"], dtype=jnp.int32)  # (n_elem, 2)
     gp, gw = _line_quadrature(quad_degree)
@@ -955,7 +984,10 @@ def _make_multifield_residual_1d(domain, term_list, boundary_term_list, fields, 
         cd = (cells[:, :, None] * vecs[i] + comp[None, None, :]).reshape(cells.shape[0], -1) + offs[i]
         cell_dofs.append(cd)  # (n_elem, 2*vec_i)
 
-    def _elem_local(cell, locs, e):
+    def _pack_params(node_ids, args, dtype, width_default=1):
+        return _pack_param_values(node_ids, args, dtype, runtime_parameter_tags, field_param_names, width_default)
+
+    def _elem_local(cell, locs, e, pvals=(), ntable=None):
         """Element residual ``(2*vec_test,)`` from every field's OWN element dofs ``locs[i]`` ``(2, vec_i)``.
 
         Taking the local dofs explicitly is what exposes the element Jacobian: a coupled term's element
@@ -974,12 +1006,13 @@ def _make_multifield_residual_1d(domain, term_list, boundary_term_list, fields, 
             "surface": False,
             "domain_context": ctx,
             "temporal_tags": (),
-            "runtime_parameter_tags": (),
-            "volume_vars": (),
+            "runtime_parameter_tags": runtime_parameter_tags,
+            "volume_vars": pvals,
+            "neural_coefficients": ntable,
         }
         return _integrate_term(domain, e, local, gw * h)  # (2*vec_test,)
 
-    def _bnd_local(nid, locs, e, dtype):
+    def _bnd_local(nid, locs, e, dtype, pvals=(), ntable=None):
         """Boundary contribution ``(vec_test,)`` at node ``nid`` from each field's own dof ``locs[i]``."""
         per_field = [
             {
@@ -997,19 +1030,25 @@ def _make_multifield_residual_1d(domain, term_list, boundary_term_list, fields, 
             "surface": True,
             "domain_context": ctx,
             "temporal_tags": (),
-            "runtime_parameter_tags": (),
-            "volume_vars": (),
+            "runtime_parameter_tags": runtime_parameter_tags,
+            "volume_vars": pvals,
+            "neural_coefficients": ntable,
         }
         return _integrate_term(domain, e, local, jnp.ones((1,), dtype=dtype))  # (vec_test,)
 
-    def residual(u_flat):
+    def residual(u_flat, args=None):
         u_list = [u_flat[offs[i] : offs[i + 1]].reshape(n_nodes, vecs[i]) for i in range(nfields)]
+        _nt = _neural_local_table(neural_slots, args)
         R = jnp.zeros(total, dtype=u_flat.dtype)
 
         # --- volume terms: per element, evaluate the coeff against all fields, scatter
         #     into the test field's block ---
         for coeff, test_idx in term_list:
-            elem_res = jax.vmap(lambda c, e=coeff: _elem_local(c, [u_list[i][c] for i in range(nfields)], e))(cells)
+            elem_res = jax.vmap(
+                lambda c, e=coeff: _elem_local(
+                    c, [u_list[i][c] for i in range(nfields)], e, _pack_params(c, args, u_flat.dtype), _nt
+                )
+            )(cells)
             R = R.at[cell_dofs[test_idx].reshape(-1)].add(elem_res.reshape(-1))
 
         # --- boundary terms: degenerate one-node element (shape val 1, weight 1) ---
@@ -1017,7 +1056,8 @@ def _make_multifield_residual_1d(domain, term_list, boundary_term_list, fields, 
             vt = vecs[test_idx]
             for nid in nids:
                 locs = [u_list[i][nid : nid + 1] for i in range(nfields)]
-                contrib = _bnd_local(nid, locs, coeff, u_flat.dtype)  # (vec_test,)
+                _bp = _pack_params(jnp.asarray([nid]), args, u_flat.dtype)
+                contrib = _bnd_local(nid, locs, coeff, u_flat.dtype, _bp, _nt)  # (vec_test,)
                 R = R.at[offs[test_idx] + nid * vt + jnp.arange(vt)].add(contrib.reshape(vt))
 
         return R
@@ -1032,13 +1072,15 @@ def _make_multifield_residual_1d(domain, term_list, boundary_term_list, fields, 
         from jax.experimental import sparse as jsp
 
         u_list = [u_flat[offs[i] : offs[i + 1]].reshape(n_nodes, vecs[i]) for i in range(nfields)]
+        _nt = _neural_local_table(neural_slots, args)
         idx, dat = [], []
 
         for coeff, test_idx in term_list:
 
             def _jac(cell, e=coeff):
                 locs = [u_list[i][cell] for i in range(nfields)]
-                return jax.jacfwd(lambda L: _elem_local(cell, L, e))(locs)  # list of (2*vt, 2, vec_i)
+                pv = _pack_params(cell, args, u_flat.dtype)
+                return jax.jacfwd(lambda L: _elem_local(cell, L, e, pv, _nt))(locs)  # list of (2*vt, 2, vec_i)
 
             Js = jax.vmap(_jac)(cells)
             n_el, vt = cells.shape[0], vecs[test_idx]
@@ -1053,7 +1095,8 @@ def _make_multifield_residual_1d(domain, term_list, boundary_term_list, fields, 
             vt = vecs[test_idx]
             for nid in nids:
                 locs = [u_list[i][nid : nid + 1] for i in range(nfields)]
-                Jb = jax.jacfwd(lambda L: _bnd_local(nid, L, coeff, u_flat.dtype))(locs)
+                _bp = _pack_params(jnp.asarray([nid]), args, u_flat.dtype)
+                Jb = jax.jacfwd(lambda L: _bnd_local(nid, L, coeff, u_flat.dtype, _bp, _nt))(locs)
                 for i in range(nfields):
                     Bi = jnp.asarray(Jb[i]).reshape(vt, vecs[i])
                     r = offs[test_idx] + nid * vt + jnp.arange(vt)
@@ -1098,22 +1141,15 @@ def assemble_fem_1d_multifield(domain, volume_terms, boundary_terms, dirichlet_r
     functions and threaded into every block builder so the mass / operator / residual
     blocks share one ordering. ``offsets`` reports that ordering to the caller in the same
     ``[0, n_0, n_0+n_1, ...]`` form the 2D/3D path uses."""
-    from ...trace import FemResidualOperator
+    from ...trace import FemLinearSystem, FemResidualOperator
     from .fem_utils import _infer_fields, _lower_statefield_to_trial
     from .weak_form import _contains_temporal_derivative, _is_obviously_nonlinear_in_unknown
 
-    # The coupled block builder threads no runtime parameters — its element kernels publish no
-    # ``runtime_parameter_tags``/``volume_vars``. Without this guard the parameter's value simply never
-    # reaches the kernel and the solve dies with an internal KeyError about InternalVars, which is what
-    # the single-field path did before it grew a parameter path. Fail loud and say so instead.
-    _c_tags, _, _c_neural, _c_exprs = _param_context(volume_terms, boundary_terms)
-    if _c_exprs:
-        raise NotImplementedError(
-            "jno.fem: a runtime parameter or neural coefficient on a COUPLED 1D system "
-            f"({sorted(_c_exprs)}) is not supported — the coupled 1D block assembler threads no runtime "
-            "parameters. A single-field 1D form is fully parametric (steady, transient, linear and "
-            "nonlinear); use one field, or a 2D/3D domain for the coupled case."
-        )
+    # Runtime parameters / neural coefficients on a COUPLED system. The block element kernels publish
+    # the same ``runtime_parameter_tags``/``volume_vars``/``neural_coefficients`` keys the single-field
+    # ones do, and the shared evaluator reads them without caring about the field layout — so a coupled
+    # 1D inverse needs no block-specific machinery, only the values threaded to the kernels.
+    _c_tags, _c_fields, _c_neural, _c_exprs = _param_context(volume_terms, boundary_terms)
 
     n_nodes = int(np.asarray(domain.mesh.points).shape[0])
 
@@ -1142,6 +1178,17 @@ def assemble_fem_1d_multifield(domain, volume_terms, boundary_terms, dirichlet_r
 
     all_terms = list(volume_terms) + [t for ts in boundary_terms.values() for t in ts]
     if any(_contains_temporal_derivative(t) for t in all_terms):
+        if _c_exprs:
+            # The coupled transient block assembles M and A ONCE, outside any per-args re-forming, so a
+            # parameter there would be read at its zero placeholder and silently baked in — the same
+            # reason the single-field transient refuses a parameter on the mass. The steady coupled path
+            # above IS parametric.
+            raise NotImplementedError(
+                "jno.fem: a runtime parameter or neural coefficient on a COUPLED 1D *transient* system "
+                f"({sorted(_c_exprs)}) is not supported — the coupled transient block is assembled once, "
+                "so the parameter would be silently frozen at its placeholder. A coupled STEADY 1D form "
+                "(linear or nonlinear) is fully parametric; single-field 1D is parametric transient too."
+            )
         dirichlet_pairs = _multifield_dirichlet_dofs_1d(domain, dirichlet_raw, fields, field_index, n_nodes)
         op, mode = _assemble_1d_multifield_transient(
             domain,
@@ -1166,24 +1213,59 @@ def assemble_fem_1d_multifield(domain, volume_terms, boundary_terms, dirichlet_r
     dirichlet_pairs = _multifield_dirichlet_dofs_1d(domain, dirichlet_raw, fields, field_index, n_nodes)
     total = offsets[-1]
     residual_free = _make_multifield_residual_1d(
-        domain, volume_tl, boundary_tl, fields, field_index, n_nodes=n_nodes, quad_degree=quad_degree
+        domain,
+        volume_tl,
+        boundary_tl,
+        fields,
+        field_index,
+        n_nodes=n_nodes,
+        quad_degree=quad_degree,
+        runtime_parameter_tags=_c_tags,
+        field_param_names=_c_fields,
+        neural_slots=_c_neural,
     )
 
     if any(_is_obviously_nonlinear_in_unknown(domain, t) for t in all_terms):
-        residual = _apply_dirichlet_rows(residual_free, dirichlet_pairs)
+        # `_apply_dirichlet_rows` keeps a single-argument contract on purpose (it is shared with
+        # `fem_nonnodal` and `fem_native`, whose free residuals have different trailing signatures —
+        # threading `args` through it would bind `args` to `t` in the native one and silently evaluate
+        # the form at the wrong time). Parametric callers close over `args` and wrap per call.
+        def res_p(u, args=None):
+            return _apply_dirichlet_rows(lambda uu: residual_free(uu, args), dirichlet_pairs)(jnp.asarray(u))
+
         op = FemResidualOperator(
-            residual_fn=lambda u, args=None: residual(jnp.asarray(u)),
-            jacobian_fn=lambda u, args=None: jax.jacfwd(residual)(jnp.asarray(u)),
+            residual_fn=res_p,
+            jacobian_fn=lambda u, args=None: jax.jacfwd(lambda uu: res_p(uu, args))(jnp.asarray(u)),
             size=total,
+            runtime_parameter_exprs=_c_exprs,
         )
         return op, "nonlinear", offsets
 
     zeros = jnp.zeros(total)
-    A = residual_free.sparse_jacobian(zeros)
-    b = -residual_free(zeros)
-    A, b = _apply_dirichlet_symmetric(A, b, dirichlet_pairs)
-    A = compress_eager(A)  # ~19x redundant triplets otherwise; see the helper
-    return (A, b), "linear", offsets
+
+    def _system(args=None):
+        A = residual_free.sparse_jacobian(zeros, args)
+        b = -residual_free(zeros, args)
+        A, b = _apply_dirichlet_symmetric(A, b, dirichlet_pairs)
+        return compress_eager(A), b  # ~19x redundant triplets otherwise; see the helper
+
+    A0, b0 = _system(None)
+    if not _c_exprs:
+        return (A0, b0), "linear", offsets
+    # Parametric: re-form A(θ), b(θ) from the runtime args per call, so ∂u/∂θ flows through the block
+    # solve. Dirichlet elimination couples A and b (known columns move to the load), so each accessor
+    # assembles the pair and takes its half — same contract as the single-field path.
+    return (
+        FemLinearSystem(
+            A0,
+            b0,
+            operator_fn=lambda args: _system(args)[0],
+            rhs_fn=lambda args: _system(args)[1],
+            runtime_parameter_exprs=_c_exprs,
+        ),
+        "linear",
+        offsets,
+    )
 
 
 def _multifield_initial_state_1d(domain, fields, field_index, ic_residuals, n_nodes):
