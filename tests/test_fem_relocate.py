@@ -1,6 +1,6 @@
-"""r-adaptivity via the adapt slot — ``FEM.solve(adapt=AdaptSpec(relocate=True))``.
+"""r-adaptivity via the adapt slot — ``FEM.solve(adapt=jno.solve.relocate())``.
 
-Relocates the mesh vertices tagged with :meth:`Variable.trainable` down the FE-energy gradient (through the
+Relocates the mesh vertices tagged with :meth:`Variable.trainable` down the **equidistribution** gradient (through the
 differentiable solve) with a backtracking mesh-validity line search — the built-in companion of h-refinement
 (``run_adaptive_relocate``). Checks that it reduces the objective at **fixed DOF** without tangling across
 **scalar, vector, nonlinear, transient, periodic, and complex** problems, and demands at least one
@@ -13,7 +13,6 @@ import pytest
 
 import jno
 import jno.jnp_ops as J
-from jno.utils.solver.fem_adapt import AdaptSpec
 
 
 @pytest.fixture(autouse=True)
@@ -47,17 +46,17 @@ def _peak_scalar(size=0.14, movable=True):
     return d, jno.fem([ui.x * vi.x + ui.y * vi.y - f * vi, u(xb, yb) - 0.0], quad_degree=3)
 
 
-def test_relocate_reduces_energy_and_stays_valid():
+def test_relocate_reduces_the_defect_and_stays_valid():
     d, fem = _peak_scalar()
     pts0 = np.asarray(d.mesh.points)[:, :2].copy()
     n0 = len(pts0)
-    sol = np.asarray(fem.solve(adapt=AdaptSpec(relocate=True, max_iters=40, lr=3e-3, quality_floor=0.1))).reshape(-1)
+    sol = np.asarray(fem.solve(adapt=jno.solve.relocate(max_iters=40, lr=3e-3, quality_floor=0.1))).reshape(-1)
     hist = fem.adapt_history
     cells = np.asarray(fem.domain.mesh.cells_dict["triangle"])
     pts_r = np.asarray(fem.domain.mesh.points)[:, :2]
 
     assert len(hist) >= 5, "relocation should take several steps"
-    assert hist[-1]["energy"] < hist[0]["energy"], "relocation must reduce the FE energy"
+    assert hist[-1]["objective"] < hist[0]["objective"], "relocation must reduce the equidistribution defect"
     # each step records the moved vertices (so a relocation run can be animated); the last is the final mesh
     assert hist[0]["points"].shape == (n0, 2)
     assert np.allclose(hist[-1]["points"], pts_r), "the last recorded mesh should be the final relocated mesh"
@@ -69,11 +68,11 @@ def test_relocate_reduces_energy_and_stays_valid():
 def test_relocate_requires_trainable_coordinates():
     _, fem = _peak_scalar(movable=False)
     with pytest.raises(ValueError, match="no trainable mesh coordinates"):
-        fem.solve(adapt=AdaptSpec(relocate=True))
+        fem.solve(adapt=jno.solve.relocate())
 
 
 def test_relocate_vector_field():
-    """Generality: a vector problem relocates too (the energy objective sums over components)."""
+    """Generality: a vector problem relocates too (the monitor sums over components)."""
     d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.16).domain()
     u, phi = d.fem_symbols(value_shape=(2,))
     xi, yi, _ = d.variable("interior", split=True)
@@ -88,9 +87,11 @@ def test_relocate_vector_field():
     )
     fem = jno.fem([weak, u(xb, yb) - 0.0])
     n0 = len(d.mesh.points)
-    sol = np.asarray(fem.solve(adapt=AdaptSpec(relocate=True, max_iters=25, lr=2e-3))).reshape(-1)
+    sol = np.asarray(fem.solve(adapt=jno.solve.relocate(max_iters=25, lr=2e-3))).reshape(-1)
     cells = np.asarray(fem.domain.mesh.cells_dict["triangle"])
-    assert fem.adapt_history[-1]["energy"] <= fem.adapt_history[0]["energy"], "vector relocation should not raise energy"
+    assert fem.adapt_history[-1]["objective"] <= fem.adapt_history[0]["objective"], (
+        "vector relocation should not raise the defect"
+    )
     assert _min_detj(np.asarray(fem.domain.mesh.points)[:, :2], cells) > 0.0, "vector relocation must stay valid"
     assert sol.shape[0] == 2 * n0, "vector solution has 2 DOFs per node, unchanged by relocation"
 
@@ -112,14 +113,14 @@ def test_relocate_nonlinear():
     f = 10.0 * J.exp(-40.0 * ((xi - 0.6) ** 2 + (yi - 0.35) ** 2))
     fem = jno.fem([ui.x * vi.x + ui.y * vi.y + ui * ui * ui * vi - f * vi, u(xb, yb) - 0.0], quad_degree=3)
     assert fem._mode == "nonlinear"
-    fem.solve(adapt=AdaptSpec(relocate=True, max_iters=20, lr=2e-3))
+    fem.solve(adapt=jno.solve.relocate(max_iters=20, lr=2e-3))
     cells = np.asarray(fem.domain.mesh.cells_dict["triangle"])
-    assert fem.adapt_history[-1]["energy"] <= fem.adapt_history[0]["energy"]
+    assert fem.adapt_history[-1]["objective"] <= fem.adapt_history[0]["objective"]
     assert _min_detj(np.asarray(fem.domain.mesh.points)[:, :2], cells) > 0.0
 
 
 def test_relocate_transient():
-    """A *transient* problem relocates for the whole trajectory (time-averaged energy; the coord gradient
+    """A *transient* problem relocates for the whole trajectory (time-averaged state; the coord gradient
     flows through the marched block)."""
     from shapely.geometry import box
 
@@ -132,10 +133,10 @@ def test_relocate_transient():
     ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
     fem = jno.fem([ui.t * vi + ui.x * vi.x + ui.y * vi.y, u(xb, yb) - 0.0, u(ci[0], ci[1]) - 1.0])
     assert fem.is_transient
-    fem.solve(adapt=AdaptSpec(relocate=True, max_iters=15, lr=2e-3))
+    fem.solve(adapt=jno.solve.relocate(max_iters=15, lr=2e-3))
     cells = np.asarray(fem.domain.mesh.cells_dict["triangle"])
     h = fem.adapt_history
-    assert h[-1]["energy"] < h[0]["energy"], "transient relocation should reduce the time-averaged energy"
+    assert h[-1]["objective"] < h[0]["objective"], "transient relocation should reduce the time-averaged defect"
     assert _min_detj(np.asarray(fem.domain.mesh.points)[:, :2], cells) > 0.0
 
 
@@ -151,14 +152,14 @@ def test_relocate_periodic():
     ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
     f = J.exp(-40.0 * ((xi - 0.5) ** 2 + (yi - 0.35) ** 2))
     fem = jno.fem([ui.x * vi.x + ui.y * vi.y - f * vi, u(xl, yl) - u(xr, yr), u(bt[0], bt[1]) - 0.0])
-    fem.solve(adapt=AdaptSpec(relocate=True, max_iters=20, lr=2e-3))
+    fem.solve(adapt=jno.solve.relocate(max_iters=20, lr=2e-3))
     cells = np.asarray(fem.domain.mesh.cells_dict["triangle"])
-    assert fem.adapt_history[-1]["energy"] <= fem.adapt_history[0]["energy"]
+    assert fem.adapt_history[-1]["objective"] <= fem.adapt_history[0]["objective"]
     assert _min_detj(np.asarray(fem.domain.mesh.points)[:, :2], cells) > 0.0
 
 
 def test_relocate_complex():
-    """A *complex* problem relocates: complex is two real blocks (real + imag), and the energy sums both."""
+    """A *complex* problem relocates: complex is two real blocks (real + imag), and the monitor sums both."""
     from shapely.geometry import box
 
     d = jno.domain(box(0, 0, 1, 1), mesh_size=0.16)
@@ -175,10 +176,10 @@ def test_relocate_complex():
     weak = (ub.x * wb.x + ub.y * wb.y) - c * (ub * wb) - f * wb
     fem = jno.fem([weak.real, u.real(xb, yb) - 0.0, u.imag(xb, yb) - 0.0])
     assert fem._mode == "linear" and len(fem.offsets) == 3  # a real 2N block system (real + imag)
-    sol = np.asarray(fem.solve(adapt=AdaptSpec(relocate=True, max_iters=20, lr=2e-3))).reshape(-1)
+    sol = np.asarray(fem.solve(adapt=jno.solve.relocate(max_iters=20, lr=2e-3))).reshape(-1)
     cells = np.asarray(fem.domain.mesh.cells_dict["triangle"])
     n0 = len(fem.domain.mesh.points)
-    assert fem.adapt_history[-1]["energy"] <= fem.adapt_history[0]["energy"]
+    assert fem.adapt_history[-1]["objective"] <= fem.adapt_history[0]["objective"]
     assert _min_detj(np.asarray(fem.domain.mesh.points)[:, :2], cells) > 0.0
     assert sol.shape[0] == 2 * n0, "complex solution = real + imaginary blocks"
 
@@ -197,3 +198,61 @@ def test_relocate_complex_transient_fails_loud():
     ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
     with pytest.raises(NotImplementedError, match="complex-transient"):
         jno.fem([ui.t * vi + (0.5 + 1j) * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - 1.0])
+
+
+def test_relocate_beats_a_uniform_mesh_on_an_underresolved_front():
+    """The property the old suite never checked: relocation must improve the **answer**, not just an objective.
+
+    Relocation used to descend the FE Dirichlet energy. That is not equidistribution — for a non-convex
+    functional the mesh can lower the energy by *under-resolving* the layer, and it did: on this problem the
+    energy objective cut the energy 4.949 -> 4.422 while making the final-time error 10.7x WORSE than a
+    uniform mesh at the same node count. The objective is now the equidistribution defect of an arclength
+    monitor, which targets resolution directly.
+
+    An Allen-Cahn front of width ~2.2*sqrt(2)*eps on an h=0.06 mesh: eps=0.03 spans ~1.5 cells, so a uniform
+    mesh under-resolves it and there is something for relocation to win. Measured ratios (relocated/uniform
+    final rel-L2) across the sharpness sweep: 4.99 at eps=0.15 (front ~8 cells -- already over-resolved,
+    nothing to redistribute), 0.96 at eps=0.06, 0.51 at eps=0.03.
+    """
+    T, NSTEP, SIZE, EPS = 2.0, 24, 0.06, 0.03
+
+    def build(movable):
+        d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=SIZE).domain(time=(0.0, T, NSTEP))
+        d.tag("right_edge", lambda x, y: x > 1.0 - 1e-9)
+        u, v = d.fem_symbols()
+        xi, yi, ti = d.variable("interior", split=True)
+        xl, yl, _ = d.variable("left", split=True)
+        xr, yr, _ = d.variable("right_edge", split=True)
+        ci = d.variable("initial", split=True)
+        if movable:  # a SEPARATE movable region, so the boundary vertices are never relocated
+            xm, ym, _ = d.variable("mov", where=lambda x, y: (x > 0.02) & (x < 0.98) & (y > 0.02) & (y < 0.98), split=True)
+            xm.trainable(name="ix")
+            ym.trainable(name="iy")
+        ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi)
+        return d, jno.fem(
+            [
+                ui.t * vi + EPS**2 * (ui.x * vi.x + ui.y * vi.y) + (u**3 - u) * vi,
+                u(xl, yl) - (-1.0),
+                u(xr, yr) - (+1.0),
+                u(ci[0], ci[1]) - jno.np.tanh((ci[0] - 0.5) / (np.sqrt(2.0) * 0.30)),
+            ]
+        )
+
+    def final_err(fem, dom):
+        sol = fem.solve(nonlinear=jno.solve.newton(direct=True))
+        traj = np.asarray(jno.core([sol.mean], domain=dom).eval([sol]))
+        p = np.asarray(dom.mesh.points)[:, :2]
+        exact = np.tanh((p[:, 0] - 0.5) / (np.sqrt(2.0) * EPS))
+        return float(np.linalg.norm(traj[-1] - exact) / np.linalg.norm(exact))
+
+    d0, fem0 = build(False)
+    err_uniform = final_err(fem0, d0)
+
+    d1, fem1 = build(True)
+    n0 = len(d1.mesh.points)
+    fem1.solve(adapt=jno.solve.relocate(lr=5e-3, max_iters=30), nonlinear=jno.solve.newton(direct=True))
+    err_moved = final_err(fem1, fem1.domain)
+
+    assert len(fem1.domain.mesh.points) == n0, "r-adaptivity must not change the node count"
+    assert err_moved < err_uniform, f"relocation should beat a uniform mesh here: {err_moved:.3e} vs {err_uniform:.3e}"
+    assert err_moved < 0.75 * err_uniform, f"expected a clear win, got ratio {err_moved / err_uniform:.2f}"

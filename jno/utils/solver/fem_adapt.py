@@ -1193,6 +1193,61 @@ def _dirichlet_energy_jax(pts, u_nodal, cells, dim):
     return jnp.sum(jnp.sum(grad**2, axis=(1, 2)) * vol)
 
 
+def _equidistribution_jax(pts, u_nodal, cells, dim):
+    """Equidistribution defect of a **monitor function** over a P1 mesh — the r-adaptivity objective.
+
+    Classic moving-mesh r-adaptivity equidistributes a monitor ``ρ``: every element should carry the same
+    share of ``∫ρ``, which puts small elements where ``ρ`` is large (Huang & Russell, *Adaptive Moving Mesh
+    Methods*, Springer 2011, §2.1 — the equidistribution principle; Winslow / MMPDE build the same idea into
+    a mesh PDE).  Here ``ρ_T = sqrt(1 + |∇u_T|² / ⟨|∇u|²⟩)`` — the **arclength** monitor, normalised by the
+    mesh average so the functional is dimensionless and one ``lr`` works across problems.  The ``1 +`` floor
+    keeps a flat region from being emptied entirely.
+
+    Returns ``Σ_T (w_T − w̄)² / (n_T · w̄²)`` with ``w_T = ρ_T · |T|``: zero exactly when every element carries
+    an equal share, and scale-free.  Differentiable in ``pts`` (the moved vertices) and in ``u_nodal``.
+
+    **Why not the Dirichlet energy.**  Descending ``Σ|∇u|²·vol`` w.r.t. the vertices looks like the same idea
+    and is not: for a non-convex functional (Allen–Cahn's double well) the mesh can *lower* it by
+    under-resolving the layer.  Measured on the Allen–Cahn interface at 377 nodes, the energy objective cut
+    the energy 4.949 → 4.422 while making the final-time error 10.7× worse (1.68e-2 → 1.78e-1) and visibly
+    coarsening the mesh across the front.  Equidistribution targets resolution directly.
+
+    **Why arclength and not a Hessian monitor.**  P1 interpolation error is governed by curvature, so a
+    Hessian monitor is the textbook choice — but ``∇u`` is constant per P1 element, so the Hessian has to be
+    recovered (ZZ patch averaging), and that recovery is meaningless exactly where adaptivity matters: a
+    front spanning ~1 element gives a noisy Hessian, and equidistributing noise scatters nodes.  Measured
+    against a uniform mesh at equal node count (Allen–Cahn, ``h = 0.06``), relocated/uniform final error:
+
+    ==================  ==========  =================  ================
+    front width         arclength   recovered Hessian  verdict
+    ==================  ==========  =================  ================
+    0.47 (≈8 cells)     4.98        2.61               both worse
+    0.19 (≈3 cells)     **0.86**    1.36               arclength wins
+    0.09 (≈1.5 cells)   **0.55**    1.22               arclength wins
+    ==================  ==========  =================  ================
+
+    Arclength wins wherever relocation is worth doing.  Both lose on an already over-resolved front — there
+    is nothing to redistribute there, and moving nodes only costs; see the scope note on
+    :func:`run_adaptive_relocate`.
+    """
+    import jax.numpy as jnp
+
+    v = pts[cells]  # (n_cell, dim+1, dim)
+    u_nodal = u_nodal[:, None] if u_nodal.ndim == 1 else u_nodal
+    s = u_nodal[cells]
+    e = jnp.stack([v[:, i + 1] - v[:, 0] for i in range(dim)], axis=1)
+    du = jnp.stack([s[:, i + 1] - s[:, 0] for i in range(dim)], axis=1)
+    grad = jnp.linalg.solve(e, du)  # (n_cell, dim, n_comp)
+    vol = jnp.abs(jnp.linalg.det(e)) / (2.0 if dim == 2 else 6.0)
+
+    g2 = jnp.sum(grad**2, axis=(1, 2))  # |∇u|² per element, summed over components/blocks
+    scale = jnp.mean(g2) + 1e-30  # normalise so the monitor (and the step size) is problem-independent
+    rho = jnp.sqrt(1.0 + g2 / scale)  # the "1 +" floor keeps flat regions from being emptied entirely
+    w = rho * vol  # each element's share of ∫ρ
+    wbar = jnp.mean(w) + 1e-30
+    return jnp.mean((w - wbar) ** 2) / wbar**2
+
+
 def _transient_march_fn(block):
     """Build a differentiable ``args -> time-averaged nodal state`` for a :class:`SemidiscreteTimeBlock`.
 
@@ -1305,12 +1360,29 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
             return newton_krylov(lambda uu: op.residual(uu, vals), u0)
         return _march(vals)  # transient: time-averaged nodal state over the marched trajectory
 
-    def _energy(vals):
-        u = _solve_at(vals)
-        bounds = list(fem.offsets) if fem.offsets is not None else [0, int(u.shape[0])]
-        return _block_energy(u, _scatter(vals), bounds)
+    def _block_defect(u, pts, bounds):
+        """Equidistribution defect summed over every solution block — the mirror of :func:`_block_energy`,
+        so a scalar / vector / complex / coupled multifield all contribute their own monitor."""
+        d_ = 0.0
+        for i in range(len(bounds) - 1):
+            blk = u[bounds[i] : bounds[i + 1]]
+            nb = int(blk.shape[0])
+            veci = nb // n_verts if (n_verts and nb % n_verts == 0) else 1
+            bf = blk.reshape(n_verts, veci) if veci > 1 else blk[:n_verts]
+            d_ = d_ + _equidistribution_jax(pts, bf, cells_j, dim)
+        return d_
 
-    val_grad = jax.jit(jax.value_and_grad(lambda arrs: _energy(dict(zip(names, arrs)))))
+    def _objective(vals):
+        """What relocation descends: the monitor's **equidistribution defect**, not the FE energy.
+
+        The energy is still computed and reported in ``adapt_history`` as a diagnostic — it is a useful
+        thing to watch, it just makes a bad objective (see :func:`_equidistribution_jax`)."""
+        u = _solve_at(vals)
+        pts = _scatter(vals)
+        bounds = list(fem.offsets) if fem.offsets is not None else [0, int(u.shape[0])]
+        return _block_defect(u, pts, bounds), _block_energy(u, pts, bounds)
+
+    val_grad = jax.jit(jax.value_and_grad(lambda arrs: _objective(dict(zip(names, arrs))), has_aux=True))
 
     def _min_detj(p):
         vv = p[cells]
@@ -1328,7 +1400,7 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
     msq = [jnp.zeros_like(a) for a in arrs]  # RMSProp running average (near-feature gradients dwarf the rest)
     history: list[dict] = []
     for it in range(spec.max_iters):
-        e, g = val_grad(arrs)
+        (obj, e), g = val_grad(arrs)
         msq = [0.9 * m + 0.1 * gi**2 for m, gi in zip(msq, g)]
         stepdir = [gi / jnp.sqrt(m + 1e-8) for gi, m in zip(g, msq)]
         a = spec.lr
@@ -1340,7 +1412,9 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
         else:
             break  # at the mesh-quality limit -- no admissible step
         arrs = cand
-        history.append({"step": it, "energy": float(e), "points": _moved(arrs)})  # points: for a relocation animation
+        # ``objective`` is what is descended (the equidistribution defect); ``energy`` is kept as a
+        # diagnostic. ``points``: the moved vertices, so a relocation run can be animated.
+        history.append({"step": it, "objective": float(obj), "energy": float(e), "points": _moved(arrs)})
 
     final = _moved(arrs)
     if _min_detj(final) <= 0.0:  # fail loud rather than hand back / re-solve on a tangled mesh
