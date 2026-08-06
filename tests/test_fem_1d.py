@@ -786,6 +786,80 @@ def test_coupled_nonlinear_transient_recovers():
 
 
 # ==========================================================================
+# coupled 1D — algebraic (DAE) fields in a transient block
+# ==========================================================================
+def test_coupled_1d_transient_algebraic_field():
+    """A coupled transient field with **no** time derivative is algebraic: its rows of ``M`` are zero,
+    so the block is a DAE and the implicit step solves ``A p = c`` on those rows. The 1D path used to
+    require a temporal term on *every* field, which ruled out constraint/closure fields (a pressure, a
+    saturation, an equilibrium concentration) that the 2D/3D coupled path has always accepted.
+
+        u_t = u''      clamped, u(x,0) = sin(pi x)   ->  u = e^{-pi^2 t} sin(pi x)
+        p   = c u      algebraic closure, no p_t     ->  p = c u at every step
+    """
+    c = 3.0
+    d = _line(0.02, time=(0.0, 0.05, 51))
+    u, v = d.fem_symbols(names=("u", "v"))
+    p, q = d.fem_symbols(names=("p", "q"))
+    co = d.variable("interior", split=True)
+    xi, ti = co[0], co[1]
+    xb = d.variable("boundary", split=True)[0]
+    ci = d.variable("initial", split=True)[0]
+    ui, vi = u.bind(x=xi, t=ti), v.bind(x=xi, t=ti)
+    pi_, qi = p.bind(x=xi, t=ti), q.bind(x=xi, t=ti)
+    fem = jno.fem(
+        [
+            ui.t * vi + ui.x * vi.x,
+            pi_ * qi - c * u.bind(x=xi, t=ti) * qi,  # algebraic: no p_t
+            u(xb) - 0.0,
+            p(xb) - 0.0,
+            u(ci) - jno.np.sin(np.pi * ci),
+        ]
+    )
+    assert fem.is_transient and fem.is_linear
+    n = fem.offsets[1]
+
+    # the structural signature of a DAE: the algebraic field contributes nothing to the mass
+    M = _dense(fem.M)
+    assert np.allclose(M[n:, :], 0.0), "an algebraic field must have zero mass rows"
+    assert np.any(np.abs(M[:n, :n]) > 1e-12), "the evolving field must still have a mass"
+
+    traj = np.asarray(fem.solve().fn())
+    assert traj.shape[1] == fem.dofs
+    x = np.asarray(fem.field_points[0]).reshape(-1)
+    u_ex = np.exp(-(np.pi**2) * float(fem.t1)) * np.sin(np.pi * x)
+    assert np.linalg.norm(traj[-1, :n] - u_ex) / np.linalg.norm(u_ex) < 1e-2
+    # the constraint holds at the final step, and p is genuinely driven (not left at zero)
+    assert np.max(np.abs(traj[-1, n:] - c * traj[-1, :n])) < 1e-6
+    assert np.max(np.abs(traj[-1, n:])) > 1e-2
+
+
+def test_coupled_1d_all_algebraic_is_not_a_transient_problem():
+    """Dropping the per-field requirement must not make *every* field algebraic acceptable: with no
+    time derivative anywhere there is nothing to march, and the initial condition has no meaning. It
+    still errors (from the IC guard, which is the earlier and more specific one)."""
+    d = _line(0.1, time=(0.0, 0.02, 11))
+    u, v = d.fem_symbols(names=("u", "v"))
+    p, q = d.fem_symbols(names=("p", "q"))
+    co = d.variable("interior", split=True)
+    xi, ti = co[0], co[1]
+    xb = d.variable("boundary", split=True)[0]
+    ci = d.variable("initial", split=True)[0]
+    ui, vi = u.bind(x=xi, t=ti), v.bind(x=xi, t=ti)
+    pi_, qi = p.bind(x=xi, t=ti), q.bind(x=xi, t=ti)
+    with pytest.raises(ValueError, match="no time derivative"):
+        jno.fem(
+            [
+                ui.x * vi.x + pi_ * vi,
+                pi_ * qi - u.bind(x=xi, t=ti) * qi,
+                u(xb) - 0.0,
+                p(xb) - 0.0,
+                u(ci) - 1.0,
+            ]
+        )
+
+
+# ==========================================================================
 # coupled 1D — per-field element order (P2 and mixed / Taylor-Hood shape)
 # ==========================================================================
 def _coupled_orders(ms, ou, op):

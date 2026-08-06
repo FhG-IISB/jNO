@@ -1403,11 +1403,11 @@ def _assemble_1d_multifield_transient(
                 spatial_tl.append((coeff, tfi))
     if not mass_tl:
         raise ValueError("jno.fem: a transient 1D weak form must contain a temporal-derivative term (u_t * phi).")
-    if {fields[tfi]["field_key"] for _, tfi in mass_tl} != {f["field_key"] for f in fields}:
-        raise NotImplementedError(
-            "jno.fem: coupled transient requires every field to carry a time derivative (u_t * test); "
-            "algebraic (DAE) fields are not supported yet."
-        )
+    # A field with NO temporal term is algebraic: its rows of M are simply zero, so the block is a DAE
+    # and the implicit step solves `(M/dt + A) u = M/dt u_old + c`, whose algebraic rows read `A u = c`.
+    # Nothing special is needed — the 2D/3D coupled path never required a time derivative per field
+    # either, and requiring one here ruled out constraint/closure fields (a pressure, a saturation, an
+    # equilibrium concentration) that only 1D refused.
 
     boundary_tl = [
         (coeff, tfi, _region_node_ids(domain, region))

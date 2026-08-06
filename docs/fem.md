@@ -47,7 +47,10 @@ u_h = fem.solve()          # matrix-free default; slots pick anything else (see 
   4.7e-5 against 2.4e-7. A **coupled** 1D system carries a per-field order, so a mixed-order pair
   (the 1D Taylor-Hood shape) assembles — the blocks are then unequal and the coupling blocks
   rectangular, so read `fem.field_points` for each field's dof coordinates. Orders above 2 are not
-  wired (clear error).
+  wired (clear error). In a coupled *transient* system a field may be **algebraic** (no `u_t`): its
+  mass rows are zero, so the block is a DAE and the implicit step solves `A p = c` on those rows —
+  which is how a constraint/closure field (a pressure, a saturation, an equilibrium concentration)
+  is written.
   A `jno.np.parameter` coefficient (scalar or nodal field) also works on a **steady linear** 1D form, so
   a 1D differentiable inverse problem runs through `crux.solve` — as does a **neural** (`jno.nn.wrap`)
   coefficient, so a learned `k(x)` can be trained from 1D data. Transient too — recovering a diffusivity
