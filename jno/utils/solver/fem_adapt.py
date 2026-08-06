@@ -2404,9 +2404,15 @@ def _geometry_velocity(spec: dict, dom: Any, state: Any) -> np.ndarray:
     # The velocity comes out in the region's SAMPLE order, which is not the mesh-vertex order and need not
     # even have the same length (a tag may sample a point that is not a vertex). Align by position, as the
     # boundary readout does -- never by index, which would silently permute the motion.
+    #
+    # The sample coordinates are read straight out of `domain.context` rather than evaluated through the
+    # trace: it is the very array the trace would gather from, in the same order (checked at 2 mesh sizes),
+    # and evaluating it instead cost two compiles per term per step -- half of this driver's trace work.
+    # Caching the compiled *core* would be the bigger win and is NOT safe: a core does not see a moved mesh
+    # (measured 0.5 where a fresh core gives 0.75), so reusing one silently reintroduces stale coordinates.
     dim = int(dom.dimension)
-    parts = dom.variable(spec["coord"].tag, split=True)
-    tag_pts = np.column_stack([np.asarray(_ev(parts[k])).reshape(-1) for k in range(dim)])
+    ctx = np.asarray(dom.context[spec["coord"].tag])
+    tag_pts = ctx.reshape(-1, ctx.shape[-1])[: ctx.shape[-2], :dim] if ctx.ndim > 2 else ctx[:, :dim]
     if v.shape[0] != tag_pts.shape[0]:
         raise ValueError(
             f"jno.fem: the geometry term on region {spec['coord'].tag!r} evaluated to {v.shape[0]} values but the "
@@ -2499,8 +2505,14 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, save_ts: Any = None, **kw
     theta = float(block.metadata.get("theta", 1.0)) if block.metadata else 1.0
     n_steps = len(ts) - 1
 
+    # Connectivity is PRESERVED by construction here (move_mesh never retriangulates), so every frame can
+    # share one cell array instead of copying it. A frame-per-copy costs n_steps x n_cells x (dim+1) x 8 B
+    # of identical data -- ~240 MB for 100k cells over 100 steps, for nothing. Points genuinely differ per
+    # frame and are still copied.
+    shared_cells = np.asarray(d.mesh.cells_dict[key]).astype(np.int64)
+
     def _snapshot():
-        return (np.asarray(d.mesh.points)[:, :dim].astype(np.float64), np.asarray(d.mesh.cells_dict[key]).astype(np.int64))
+        return (np.asarray(d.mesh.points)[:, :dim].astype(np.float64), shared_cells)
 
     cur_mesh = _snapshot()
     times, states, meshes = [float(ts[0])], [state], [cur_mesh]
