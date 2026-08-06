@@ -330,3 +330,28 @@ def test_the_solution_matches_a_fixed_mesh_when_the_mesh_does_not_move():
     assert moving == pytest.approx(fixed, rel=1e-6, abs=1e-8), (
         f"zero motion should reproduce the fixed-mesh march: max|d| = {np.abs(moving - fixed).max():.3e}"
     )
+
+
+def test_the_march_can_be_run_twice():
+    """Solving twice must work, and continue from where the first march left the mesh.
+
+    It raised. The driver registers the whole mesh as a coordinate parameter to keep the assembly
+    parametric, and its own registration from the first call then tripped the guard meant to catch a
+    *user's* hand-tagged coordinate — so a second `solve()` complained about a tag the user never wrote.
+    Only a coordinate the user tagged is a conflict.
+
+    Continuing rather than restarting is the right semantics: like the h-refinement loop, this driver
+    mutates the domain in place, so afterwards ``fem`` and its domain refer to the moved mesh. Each march
+    therefore applies the same increment from wherever it starts.
+    """
+    V, T = 0.3, 0.2
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain(time=(0.0, T, 5))
+    _xb, yb, tb = d.variable("boundary", split=True)
+    fem = _heat(d, yb.d(tb) - V)
+
+    y0 = np.asarray(d.mesh.points)[:, 1].copy()
+    y1 = fem.solve().meshes[-1][0][:, 1]
+    y2 = fem.solve().meshes[-1][0][:, 1]
+
+    assert np.allclose(y1 - y0, V * T, atol=1e-9), "the first march did not move by velocity x horizon"
+    assert np.allclose(y2 - y1, V * T, atol=1e-9), "the second march did not apply the same increment from the moved mesh"

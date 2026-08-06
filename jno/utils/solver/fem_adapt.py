@@ -2492,14 +2492,18 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, save_ts: Any = None, **kw
     # 1.0 -> 1.5 across a move), and the actual cause of the NaN was the BiCGStab breakdown that
     # `_step_solve` now avoids. With that fixed, forcing the state-reading case down this route reproduces
     # the rebuild route exactly (final ymax 0.9902 either way), so the split bought nothing and is gone.
-    if getattr(d, "_trainable_coords", None):
+    _axis_names = [f"__meshmotion_x{a}__" for a in range(dim)]
+    # Only a coordinate the USER tagged is a conflict. The driver's own registration from an earlier
+    # `solve()` on the same domain is not -- it is dropped and re-made below, so a second solve behaves
+    # like the first. Without this distinction the driver is not idempotent: solving twice raised.
+    if [sp for sp in (getattr(d, "_trainable_coords", None) or []) if sp["name"] not in _axis_names]:
         raise NotImplementedError(
             "jno.fem: a geometry term does not compose with a hand-tagged `.trainable()` coordinate yet — "
             "the mesh-motion driver registers the whole mesh as a coordinate parameter to avoid "
             "re-assembling every step, and two specs writing the same axis would silently let one win. "
             "Drop the `.trainable()` tag, or drop the geometry term."
         )
-    _axis_names = [f"__meshmotion_x{a}__" for a in range(dim)]
+    d._trainable_coords = []  # re-registered from the CURRENT mesh just below
     _all_parts = d.variable("__meshmotion_all__", where=lambda *c: np.ones_like(np.asarray(c[0]), dtype=bool), split=True)
     for _a, _nm in enumerate(_axis_names):
         _all_parts[_a].trainable(name=_nm)
