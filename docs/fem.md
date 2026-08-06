@@ -44,16 +44,18 @@ u_h = fem.solve()          # matrix-free default; slots pick anything else (see 
   A **1D line domain** takes a vector unknown too (`value_shape=(n,)`), so a 1D *system* — a
   two-species model, a Timoshenko pair, a bar with several dofs per node — is one field with
   node-major dofs and per-component essential conditions (`u(region)[i] - g`).
-  On a 1D line domain orders 1 (LINE2) and 2 (LINE3) are available — P2 adds a dof per element
-  midpoint, so read `fem.points` for the coordinates the solution lives on. Measured on
-  `-u'' + u = f`: P1 converges at O(h²) nodally and P2 at O(h⁴), which at an equal 41 dofs is
-  4.7e-5 against 2.4e-7. A **coupled** 1D system carries a per-field order, so a mixed-order pair
-  (the 1D Taylor-Hood shape) assembles — the blocks are then unequal and the coupling blocks
-  rectangular, so read `fem.field_points` for each field's dof coordinates. Orders above 2 are not
-  wired (clear error). In a coupled *transient* system a field may be **algebraic** (no `u_t`): its
-  mass rows are zero, so the block is a DAE and the implicit step solves `A p = c` on those rows —
-  which is how a constraint/closure field (a pressure, a saturation, an equilibrium concentration)
-  is written.
+  On a 1D line domain **any order `k ≥ 1`** is available: degree `k` adds `k-1` interior dofs per
+  element, laid out after all vertices, so read `fem.points` for the coordinates the solution lives
+  on. Orders above 2 are tabulated by basix on the reference interval through the same builder the
+  2D/3D path uses, so a P{k} line and a P{k} triangle agree on what degree `k` means. Measured on
+  `-u'' + u = f`: at the **vertices** 1D Lagrange is superconvergent at O(h^2k) — P1 gives O(h²), P2
+  O(h⁴), P3 O(h⁶) — and each P{k} reproduces a degree-`k` solution exactly.
+  A **coupled** 1D system carries a per-field order, so a mixed-order pair (the 1D Taylor-Hood shape)
+  assembles — the blocks are then unequal and the coupling blocks rectangular, so read
+  `fem.field_points` for each field's dof coordinates. In a coupled *transient* system a field may be
+  **algebraic** (no `u_t`): its mass rows are zero, so the block is a DAE and the implicit step solves
+  `A p = c` on those rows — which is how a constraint/closure field (a pressure, a saturation, an
+  equilibrium concentration) is written.
   A `jno.np.parameter` coefficient (scalar or nodal field) also works on a **steady linear** 1D form, so
   a 1D differentiable inverse problem runs through `crux.solve` — as does a **neural** (`jno.nn.wrap`)
   coefficient, so a learned `k(x)` can be trained from 1D data. Transient too — recovering a diffusivity

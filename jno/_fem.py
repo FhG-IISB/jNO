@@ -3668,11 +3668,6 @@ def _fem_impl(
         from .utils.solver.fem_1d import assemble_fem_1d, assemble_fem_1d_multifield
 
         _order_1d = _infer_order(constraints)
-        if _order_1d > 2:
-            raise NotImplementedError(
-                f"jno.fem: 1D Lagrange elements are implemented for order 1 (LINE2) and 2 (LINE3); "
-                f"got order={_order_1d}. Use order<=2, or refine the mesh for accuracy."
-            )
         # ---- complex 1D: the same real-equivalent split the 2D/3D and non-nodal paths use ----
         # Every other `_is_complex_form` dispatch sits BELOW this branch, so before this a `1j` on a
         # line domain reached the real assembler: the stiffness came out complex128 while the load

@@ -53,6 +53,7 @@ derivative, since a 0D facet has no element to differentiate over.
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Any, Dict, List, Tuple
 
 import jax
@@ -94,15 +95,50 @@ def _line_shape(gp: jnp.ndarray, order: int = 1) -> Tuple[jnp.ndarray, jnp.ndarr
 
         N_0 = (1-xi)(1-2xi),  N_1 = xi(2xi-1),  N_2 = 4 xi (1-xi)
 
+    ``order >= 3`` is tabulated by **basix** on the reference interval, through the very builder the
+    2D/3D path uses (``_lagrange_basix``, equispaced variant) — so a P{k} line and a P{k} triangle
+    agree on what "degree k Lagrange" means, and there is no second hand-written basis to drift.
+    basix's interval DOF order is vertices-then-interior, which is exactly the layout above.
+
     Returns ``N`` and ``dN_dxi``, each ``(n_quad, order+1)``."""
     one = jnp.ones_like(gp)
     if int(order) == 1:
         return jnp.stack([1.0 - gp, gp], axis=-1), jnp.stack([-one, one], axis=-1)
-    if int(order) != 2:
-        raise NotImplementedError(f"jno.fem: 1D Lagrange elements are implemented for order 1 and 2; got {order}.")
-    N = jnp.stack([(1.0 - gp) * (1.0 - 2.0 * gp), gp * (2.0 * gp - 1.0), 4.0 * gp * (1.0 - gp)], axis=-1)
-    dN_dxi = jnp.stack([4.0 * gp - 3.0, 4.0 * gp - 1.0, 4.0 - 8.0 * gp], axis=-1)
-    return N, dN_dxi
+    if int(order) == 2:
+        N = jnp.stack([(1.0 - gp) * (1.0 - 2.0 * gp), gp * (2.0 * gp - 1.0), 4.0 * gp * (1.0 - gp)], axis=-1)
+        dN_dxi = jnp.stack([4.0 * gp - 3.0, 4.0 * gp - 1.0, 4.0 - 8.0 * gp], axis=-1)
+        return N, dN_dxi
+    if int(order) < 1:
+        raise NotImplementedError(f"jno.fem: a 1D Lagrange element needs order >= 1; got {order}.")
+    tab = _line_tabulate(tuple(np.asarray(gp).reshape(-1).tolist()), int(order))
+    return jnp.asarray(tab[0]), jnp.asarray(tab[1])
+
+
+@lru_cache(maxsize=32)
+def _line_tabulate(gp: Tuple[float, ...], order: int):
+    """``(N, dN_dxi)`` for a degree-``order`` Lagrange interval at the (hashable) quadrature points.
+
+    Cached because a single assembly re-enters ``_line_shape`` once per field and once per residual
+    builder with the same rule, and basix tabulation is a Python round trip."""
+    from basix import CellType
+
+    from .fem_lagrange import _lagrange_basix
+
+    pts = np.asarray(gp, dtype=float).reshape(-1, 1)
+    tab = np.asarray(_lagrange_basix(CellType.interval, int(order)).tabulate(1, pts))
+    return tab[0, :, :, 0], tab[1, :, :, 0]  # values, d/dxi -> each (n_quad, n_dof)
+
+
+def line_dof_nodes(order: int) -> np.ndarray:
+    """Reference dof coordinates of a degree-``order`` Lagrange interval, in the element's dof order
+    (the two endpoints, then the interior nodes). Used to place the global interior dofs."""
+    if int(order) <= 2:
+        return np.array([0.0, 1.0, 0.5])[: int(order) + 1]
+    from basix import CellType
+
+    from .fem_lagrange import _lagrange_basix
+
+    return np.asarray(_lagrange_basix(CellType.interval, int(order)).points).reshape(-1)
 
 
 # --------------------------------------------------------------------------
@@ -218,15 +254,33 @@ def _param_context(volume_terms, boundary_terms):
 def dof_layout_1d(domain: Any, order: int):
     """``(n_dof_nodes, dof_coords)`` for a 1D Lagrange space of ``order``.
 
-    P1 dofs are the mesh vertices. P2 adds one dof per element **midpoint**, laid out after all
-    vertices, so a vertex dof keeps its mesh-node index. ``dof_coords`` is what ``fem.points`` must
-    report — the solution vector lives on these, not on the linear mesh the domain keeps."""
+    P1 dofs are the mesh vertices. A degree-``k`` space adds ``k-1`` **interior** dofs per element,
+    laid out after all vertices and element-major, so a vertex dof keeps its mesh-node index — which
+    is what lets the boundary/Dirichlet node lookup stay order-agnostic (a 1D boundary is an endpoint,
+    hence always a vertex). ``dof_coords`` is what ``fem.points`` must report: the solution vector
+    lives on these, not on the linear mesh the domain keeps."""
     verts = np.asarray(domain.mesh.points)[:, 0]
-    if int(order) == 1:
+    k = int(order)
+    if k == 1:
         return int(verts.shape[0]), verts.reshape(-1, 1)
     cells = np.asarray(domain.mesh.cells_dict["line"])
-    mids = 0.5 * (verts[cells[:, 0]] + verts[cells[:, 1]])
-    return int(verts.shape[0] + cells.shape[0]), np.concatenate([verts, mids]).reshape(-1, 1)
+    x0, x1 = verts[cells[:, 0]], verts[cells[:, 1]]
+    # interior reference nodes in the element's own dof order, mapped through each element's geometry
+    xi_int = line_dof_nodes(k)[2:]  # (k-1,)
+    inner = (x0[:, None] + (x1 - x0)[:, None] * xi_int[None, :]).reshape(-1)  # element-major
+    return int(verts.shape[0] + inner.shape[0]), np.concatenate([verts, inner]).reshape(-1, 1)
+
+
+def _elem_dof_nodes_1d(cells: jnp.ndarray, n_vert: int, order: int) -> jnp.ndarray:
+    """Element -> global dof-node map for a degree-``k`` line: the two vertices, then this element's
+    ``k-1`` interior dofs, which live at ``n_vert + e*(k-1) + j`` (the element-major block
+    :func:`dof_layout_1d` lays out)."""
+    k = int(order)
+    if k == 1:
+        return cells
+    n_elem = int(cells.shape[0])
+    inner = n_vert + jnp.arange(n_elem * (k - 1), dtype=jnp.int32).reshape(n_elem, k - 1)
+    return jnp.concatenate([cells, inner], axis=1)
 
 
 def _pack_param_values(node_ids, args, dtype, tags, field_names, width_default: int = 1):
@@ -299,16 +353,11 @@ def _make_residual(
     ctx = getattr(domain, "context", {}) or {}
     comp_offsets = jnp.arange(vec)
 
-    # P2 adds one dof per element midpoint. Layout: ALL vertices, then all midpoints — so a vertex
-    # dof keeps its mesh-node index and the boundary/Dirichlet node lookup needs no P2 awareness
-    # (a 1D boundary is an endpoint, hence always a vertex).
-    if order == 2:
-        elem_nodes = jnp.concatenate([cells, (n_vert + jnp.arange(n_elem, dtype=jnp.int32))[:, None]], axis=1)
-        n_nodes_dof = n_vert + n_elem
-    else:
-        elem_nodes = cells
-        n_nodes_dof = n_vert
-    n_nodes = n_nodes_dof  # the residual is sized by DOF nodes, not mesh vertices
+    # A degree-k space adds k-1 interior dofs per element. Layout: ALL vertices, then the interior
+    # dofs element-major — so a vertex dof keeps its mesh-node index and the boundary/Dirichlet node
+    # lookup needs no order awareness (a 1D boundary is an endpoint, hence always a vertex).
+    elem_nodes = _elem_dof_nodes_1d(cells, n_vert, order)
+    n_nodes = n_vert + n_elem * (order - 1)  # the residual is sized by DOF nodes, not mesh vertices
 
     # element-local -> global DOF map, node-major: dof = node*vec + comp
     cell_dofs = (elem_nodes[:, :, None] * vec + comp_offsets[None, None, :]).reshape(n_elem, -1)  # (n_elem, nen*vec)
@@ -922,11 +971,11 @@ def _assemble_1d_transient(
 
 
 def _field_dof_counts_1d(fields: List[Any], n_vert: int, n_elem: int) -> List[int]:
-    """DOF-node count per field: P1 dofs are the mesh vertices, P2 adds one midpoint per element.
+    """DOF-node count per field: P1 dofs are the mesh vertices, degree k adds k-1 interior per element.
 
     Per field, not shared: two coupled fields may carry different orders, and sizing a P2 block with
     the vertex count would silently truncate it."""
-    return [n_vert + (n_elem if int(f.get("order", 1)) == 2 else 0) for f in fields]
+    return [n_vert + n_elem * (int(f.get("order", 1)) - 1) for f in fields]
 
 
 def _block_offsets(fields: List[Any], n_vert: int, n_elem: int) -> List[int]:
@@ -1015,16 +1064,13 @@ def _make_multifield_residual_1d(
     n_dofs = _field_dof_counts_1d(fields, n_vert, n_elem)
     total = offs[-1]
 
-    # per-field shape functions and element node maps. P2 lays its midpoint dofs after ALL of that
-    # field's vertices, so a vertex dof keeps its mesh index inside the block — which is what lets
-    # the boundary/Dirichlet lookup above stay order-agnostic.
+    # per-field shape functions and element node maps. A degree-k field lays its interior dofs after
+    # ALL of that field's vertices, so a vertex dof keeps its mesh index inside the block — which is
+    # what lets the boundary/Dirichlet lookup above stay order-agnostic.
     shapes, elem_nodes = [], []
     for i in range(nfields):
         shapes.append(_line_shape(gp, orders[i]))
-        if orders[i] == 2:
-            elem_nodes.append(jnp.concatenate([cells, (n_vert + jnp.arange(n_elem, dtype=jnp.int32))[:, None]], axis=1))
-        else:
-            elem_nodes.append(cells)
+        elem_nodes.append(_elem_dof_nodes_1d(cells, n_vert, orders[i]))
 
     # element-local -> global block DOF map per field (node-major, then block offset)
     cell_dofs = []

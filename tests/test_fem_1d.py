@@ -597,16 +597,102 @@ def test_1d_transient_parameter_on_the_mass_fails_loud():
         jno.fem([rho * (ui.t * vi) + ui.x * vi.x, u(xb) - 0.0, u(ci) - jno.np.sin(np.pi * ci)])
 
 
-def test_order3_fails_loud():
-    """Scope, stated explicitly: 1D Lagrange is implemented for order 1 and 2 — a higher order refuses
-    rather than silently solving at the wrong one."""
+# ==========================================================================
+# higher-order Lagrange (P3, P4, …) on a line
+# ==========================================================================
+@pytest.mark.parametrize("order", [1, 2, 3, 4])
+def test_higher_order_dof_layout(order):
+    """A degree-``k`` line carries ``k-1`` **interior** dofs per element, laid out after all vertices
+    and element-major. 1D was capped at order 2 while 2D/3D had P3+; the cap is gone, and orders above
+    2 are tabulated by basix on the reference interval through the very builder the 2D/3D path uses,
+    so there is no second hand-written basis to drift.
+
+    Vertices must stay first and at their mesh index — that is what keeps the boundary/Dirichlet node
+    lookup order-agnostic (a 1D boundary is an endpoint, hence always a vertex)."""
     d = _line(0.25)
+    n_vert = int(np.asarray(d.mesh.points).shape[0])
+    n_elem = int(np.asarray(d.mesh.cells_dict["line"]).shape[0])
+    u, phi = d.fem_symbols(order=order)
+    xi = d.variable("interior", split=True)[0]
+    xb = d.variable("boundary", split=True)[0]
+    ui, vi = u.bind(x=xi), phi.bind(x=xi)
+    fem = jno.fem([ui.x * vi.x - 1.0 * vi, u(xb) - 0.0])
+
+    pts = np.asarray(fem.points).reshape(-1)
+    assert len(pts) == n_vert + n_elem * (order - 1)
+    assert np.allclose(pts[:n_vert], np.asarray(d.mesh.points)[:, 0]), "vertex dofs must come first"
+    assert fem.operator[0].shape == (len(pts), len(pts))
+
+
+@pytest.mark.parametrize("order", [2, 3, 4])
+def test_higher_order_reproduces_its_own_degree_exactly(order):
+    """The decisive check on a higher-order basis: P{k} contains every polynomial of degree k, so on a
+    manufactured degree-k solution it must be exact to machine precision — a wrong basis, a scrambled
+    dof order or a misplaced interior node all fail this while still converging plausibly.
+
+    ``-u'' = -k(k-1) x^(k-2)`` with ``u(0)=0``, ``u(1)=1`` has the exact solution ``u = x^k``."""
+    d = _line(0.25)
+    u, phi = d.fem_symbols(order=order)
+    xi = d.variable("interior", split=True)[0]
+    xl = d.variable("left", split=True)[0]
+    xr = d.variable("right", split=True)[0]
+    ui, vi = u.bind(x=xi), phi.bind(x=xi)
+    f = -float(order * (order - 1)) * (xi ** (order - 2)) if order > 2 else -2.0 + 0.0 * xi
+    fem = jno.fem([ui.x * vi.x - f * vi, u(xl) - 0.0, u(xr) - 1.0])
+    pts = np.asarray(fem.points).reshape(-1)
+    sol = np.asarray(fem.solve()).reshape(-1)
+    assert np.max(np.abs(sol - pts**order)) < 1e-12, f"P{order} is not exact on x^{order}"
+
+
+def test_p3_vertex_superconvergence_beats_p2():
+    """P3 must actually converge like a cubic. Measured at the **vertices**, where 1D Lagrange is
+    superconvergent at O(h^2k): P2 gives ~4, P3 gives ~6. (Over *all* dofs the interior nodes pull the
+    rate down to the interpolation order, so the two metrics must not be mixed.)
+
+    The reaction term is essential: for pure ``-u'' = f`` 1D Lagrange is nodally exact at every order,
+    so a nodal-error study there measures the quadrature rule and reports the same rate for P1 and P4
+    alike."""
+
+    def vertex_err(ms, order):
+        d = _line(ms)
+        u, phi = d.fem_symbols(order=order)
+        xi = d.variable("interior", split=True)[0]
+        xb = d.variable("boundary", split=True)[0]
+        ui, vi = u.bind(x=xi), phi.bind(x=xi)
+        f = (np.pi**2 + 1.0) * jno.np.sin(np.pi * xi)
+        fem = jno.fem([ui.x * vi.x + ui * vi - f * vi, u(xb) - 0.0])
+        sol = np.asarray(fem.solve()).reshape(-1)
+        pts = np.asarray(fem.points).reshape(-1)
+        n_vert = int(np.asarray(d.mesh.points).shape[0])
+        return float(np.max(np.abs(sol[:n_vert] - np.sin(np.pi * pts[:n_vert]))))
+
+    sizes = (0.2, 0.1, 0.05)
+    for order, expected in ((2, 4.0), (3, 6.0)):
+        errs = [vertex_err(ms, order) for ms in sizes]
+        rates = [np.log2(errs[i] / errs[i + 1]) for i in range(len(errs) - 1)]
+        assert all(abs(r - expected) < 0.4 for r in rates), f"P{order} vertex rates {rates}, expected ~{expected}"
+
+
+def test_higher_order_stays_sparse():
+    """A P3 element couples its 4 dofs, so nnz stays linear in the dof count — the element scatter must
+    not have quietly become dense for the higher order."""
+    d = _line(0.005)
     u, phi = d.fem_symbols(order=3)
     xi = d.variable("interior", split=True)[0]
     xb = d.variable("boundary", split=True)[0]
     ui, vi = u.bind(x=xi), phi.bind(x=xi)
-    with pytest.raises(NotImplementedError, match="order"):
-        jno.fem([ui.x * vi.x - 1.0 * vi, u(xb) - 0.0])
+    A = jno.fem([ui.x * vi.x - vi, u(xb) - 0.0]).operator[0]
+    n = A.shape[0]
+    assert hasattr(A, "indices")
+    assert int(A.nse) < 12 * n, f"nnz={int(A.nse)} is not linear in n={n}"
+
+
+def test_order_below_1_fails_loud():
+    """Scope: a Lagrange element needs order >= 1."""
+    from jno.utils.solver.fem_1d import _line_shape
+
+    with pytest.raises(NotImplementedError, match="order >= 1"):
+        _line_shape(np.asarray([0.5]), 0)
 
 
 # ==========================================================================
