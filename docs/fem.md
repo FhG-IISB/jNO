@@ -541,9 +541,20 @@ across.
 
 **Scope** — the rest raises rather than guessing:
 
-* **Operator-split ALE, explicit in the velocity**, hence first order in the step. The term list *reads* like
-  a coupled equation and this is not one: an implicit mesh would need the coordinates as unknowns in the
-  monolithic system and the ALE convective term.
+* **Operator-split ALE, explicit in the velocity**, hence first order in the step — *measured*, against a
+  manufactured solution on a translating domain: observed rates 1.14 / 1.12 / 1.12 / 1.10 with the mesh
+  moving, 0.99 / 1.01 / 1.04 / 1.10 with it still. The motion multiplies the error *constant* by ~3× (that
+  is the state transfer) and leaves the *order* intact. Refining `h` converges too — 1.51 → 1.76 toward the
+  expected 2 for P1 — and P2 is ~18× more accurate than P1 on the same moving mesh, so higher order still
+  pays here.
+
+  If you repeat that measurement, compare against a fine-`dt` reference **on the same mesh**, not against
+  the exact solution: the temporal and spatial errors have opposite signs, so the direct comparison shows
+  rates of +1.4 then −0.4 as they cancel and separate again. That reads as a scheme that stops converging,
+  and is only a contaminated measurement.
+
+  The term list *reads* like a coupled equation and this is not one: an implicit mesh would need the
+  coordinates as unknowns in the monolithic system and the ALE convective term.
 * **The state transfer is a conservative L2 projection** onto the moved mesh, and it is still diffusive. On a
   rigid translation carrying a marginally-resolved bump the peak falls ~9 % (the pointwise re-interpolation
   this replaced fell ~33 %, and got *worse* as `dt` shrank). Conservation is algebraic — `Σφ = 1` — so the

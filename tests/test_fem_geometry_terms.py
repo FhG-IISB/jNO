@@ -1347,3 +1347,107 @@ def test_mesh_motion_requires_x64():
             fem.solve()
     finally:
         jax.config.update("jax_enable_x64", prev)
+
+
+# ── the scheme itself: what order is it, actually? ───────────────────────────────────────────────────
+#
+# Everything above tests the MECHANISM -- that the velocity is read correctly, the normals point the
+# right way, the transfer is conservative. None of it measures the SCHEME. `run_mesh_motion` documents
+# "first-order in the step"; these measure it.
+#
+# The manufactured solution is chosen so no part of the driver's stated scope is exercised by accident:
+#
+#     Omega(t) = [0,1] x [ct, 1+ct]      driven by `yb.d(tb) - c`
+#     u*(x,y,t) = sin(pi x) sin(pi (y - ct)) exp(-lambda t),   lambda = 2 pi^2 kappa
+#     f = u*_t - kappa lap(u*) = -pi c exp(-lambda t) sin(pi x) cos(pi (y - ct))
+#
+# u* vanishes on all four MOVING edges at every time, so the Dirichlet data stays homogeneous and never
+# has to follow the boundary -- which the driver says it cannot do. A constant velocity is reproduced
+# EXACTLY by the explicit (forward-Euler) mesh update, so the mesh is exact at every step and what is
+# measured is the solution alone. And the source is a function of the coordinates, so it exercises the
+# forcing-on-the-moved-mesh path that nothing else here touches.
+
+_MMS_KAPPA = 0.05
+_MMS_LAMBDA = 2.0 * np.pi**2 * _MMS_KAPPA
+
+
+def _mms(size, nt, c, t_end=0.2, order=1):
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain(time=(0.0, t_end, nt))
+    u, v = d.fem_symbols(order=order)
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, tb = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi)
+    src = -np.pi * c * jno.np.exp(-_MMS_LAMBDA * ti) * jno.np.sin(np.pi * xi) * jno.np.cos(np.pi * (yi - c * ti))
+    u0 = jno.np.sin(np.pi * ci[0]) * jno.np.sin(np.pi * ci[1])
+    return jno.fem(
+        [
+            ui.t * vi + _MMS_KAPPA * (ui.x * vi.x + ui.y * vi.y) - src * vi,
+            u(xb, yb) - 0.0,
+            u(ci[0], ci[1]) - u0,
+            yb.d(tb) - c,
+        ]
+    )
+
+
+def _l2_on(vals, X, cells):
+    """``||vals||_L2`` over the P1 mesh, by quadrature."""
+    from basix import CellType, make_quadrature
+
+    from jno.utils.solver.fem_adapt import _tabulate_lagrange_at
+
+    qp, qw = make_quadrature(CellType.triangle, 2)
+    phi = _tabulate_lagrange_at(2, 1, np.asarray(qp))
+    v = np.asarray(X)[np.asarray(cells)][:, :, :2]
+    detJ = np.abs(np.linalg.det(np.stack([v[:, i + 1] - v[:, 0] for i in range(2)], axis=2)))
+    eq = np.einsum("qn,cn->cq", phi, np.asarray(vals)[np.asarray(cells)])
+    return float(np.sqrt(np.sum(np.asarray(qw)[None, :] * detJ[:, None] * eq**2)))
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("c, label", [(0.5, "moving"), (0.0, "still")])
+def test_the_march_is_first_order_in_the_step(c, label):
+    """The documented claim, measured: the operator-split ALE scheme is **first order in dt**.
+
+    Measured against a fine-dt reference ON THE SAME MESH rather than against ``u*``, which is what makes
+    this a clean measurement: the spatial error is then identical in both solutions and cancels out of the
+    difference. Comparing against ``u*`` directly instead mixes in an O(h²) floor, and the temporal and
+    spatial errors have OPPOSITE SIGNS — so the naive sweep shows rates of +1.4 then −0.4 as they cancel
+    and separate again, which looks like a broken scheme and is only a broken measurement.
+
+    Observed rates at h = 0.06 (512-step reference): 0.99 / 1.01 / 1.04 / 1.10 still, and
+    1.14 / 1.12 / 1.12 / 1.10 moving. The motion multiplies the error CONSTANT by ~3x — that is the state
+    transfer — but leaves the ORDER intact, which is the property being asserted."""
+    ref = np.asarray(_mms(0.08, 129, c).solve().states[-1])
+    errs, ns = [], (5, 9, 17)
+    for nt in ns:
+        traj = _mms(0.08, nt, c).solve()
+        u = np.asarray(traj.states[-1])
+        errs.append(_l2_on(u - ref, traj.meshes[-1][0], traj.meshes[-1][1]))
+
+    rates = [np.log(errs[i] / errs[i + 1]) / np.log(2.0) for i in range(len(errs) - 1)]
+    assert all(e > 0 for e in errs), f"{label}: degenerate errors {errs}"
+    assert all(0.75 < r < 1.45 for r in rates), f"{label}: expected first order, got rates {rates} from {errs}"
+
+
+@pytest.mark.slow
+def test_a_moving_march_converges_in_space_and_higher_order_pays():
+    """Refining the mesh must converge on a MOVING domain too, and a higher-order field must be worth
+    its DOFs there — the projection happens every step, so it is not obvious that it is.
+
+    Measured at h = 0.05, 128+ steps: P1 reaches 1.84e-03 and P2 1.00e-03 -> 1.00e-04, i.e. **~18x more
+    accurate at the same mesh**. P1's spatial rate on the moving domain measures 1.51 then 1.76,
+    approaching the expected 2."""
+    errs = {}
+    for order, h in ((1, 0.2), (1, 0.1), (2, 0.2), (2, 0.1)):
+        traj = _mms(h, 129, 0.5, order=order).solve()
+        X, cells = np.asarray(traj.meshes[-1][0]), np.asarray(traj.meshes[-1][1])
+        # compare on the P1 vertices, which every order shares (they are the first DOFs of the block)
+        n_v = X.shape[0]
+        u = np.asarray(traj.states[-1])[:n_v]
+        ex = np.sin(np.pi * X[:, 0]) * np.sin(np.pi * (X[:, 1] - 0.5 * 0.2)) * np.exp(-_MMS_LAMBDA * 0.2)
+        errs[(order, h)] = _l2_on(u - ex, X, cells)
+
+    for order in (1, 2):
+        assert errs[(order, 0.1)] < errs[(order, 0.2)], f"P{order} did not converge in h: {errs}"
+    assert errs[(2, 0.1)] < errs[(1, 0.1)], f"P2 is not more accurate than P1 at the same mesh: {errs}"
