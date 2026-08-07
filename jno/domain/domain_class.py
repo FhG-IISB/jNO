@@ -2692,7 +2692,7 @@ class domain(MeshIOMixin):
         tags,
         *,
         axisymmetric=False,
-        n_quad=3,
+        n_quad=6,  # see build_enclosure: the closed-form azimuth has no near-field refinement
         n_phi=16,
         opaque_tags=None,
         medium_tags=None,
