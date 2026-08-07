@@ -2329,6 +2329,144 @@ def _geometry_motion_specs(fem: Any, dom: Any) -> list[dict]:
     return specs
 
 
+def _tag_facet_vertex_ids(dom: Any, tag: str, dim: int) -> np.ndarray:
+    """The tag's boundary facets as MESH-VERTEX INDICES ``(E, dim)``.
+
+    ``BoundaryRegion`` stores facets as vertex *coordinates*; under a connectivity-preserving move the
+    incidence never changes, so resolving it to indices once lets the normals be recomputed from moved
+    positions without touching the domain object."""
+    from scipy.spatial import cKDTree
+
+    region = (getattr(dom, "_boundary_regions", None) or {}).get(tag)
+    ents = None if region is None else (region.edges if dim == 2 else region.triangles)
+    if ents is None or len(ents) == 0:
+        return np.zeros((0, dim), dtype=np.int64)
+    ents = np.asarray(ents)[:, :, :dim]
+    tree = cKDTree(np.asarray(dom.mesh.points)[:, :dim])
+    return np.asarray(tree.query(ents.reshape(-1, dim))[1]).reshape(ents.shape[0], ents.shape[1]).astype(np.int64)
+
+
+def _vertex_normals_jax(pts, facet_ids, dim: int):
+    """Per-vertex outward unit normals from moved vertex positions -- pure JAX, differentiable in ``pts``.
+
+    Reproduces :func:`jno.domain.domain_class._facet_normals` + the per-point averaging at
+    ``domain_class.py:1441-1449`` (facet normal, oriented away from the boundary centroid, accumulated at
+    each of its vertices, then normalised) so a moving surface's normals follow it. The host version keys
+    the accumulation on rounded coordinates; with the incidence resolved to indices this is a scatter-add,
+    which is what makes it traceable."""
+    import jax.numpy as jnp
+
+    f = pts[facet_ids]  # (E, k, dim)
+    if dim == 2:
+        t = f[:, 1] - f[:, 0]
+        n = jnp.stack([t[:, 1], -t[:, 0]], axis=1)
+    else:
+        n = jnp.cross(f[:, 1] - f[:, 0], f[:, 2] - f[:, 0])
+    n = n / (jnp.linalg.norm(n, axis=1, keepdims=True) + 1e-30)
+    ctr = jnp.mean(pts[jnp.unique(facet_ids.reshape(-1), size=facet_ids.size)], axis=0)
+    n = jnp.where((jnp.sum(n * (jnp.mean(f, axis=1) - ctr), axis=1) < 0.0)[:, None], -n, n)
+    acc = jnp.zeros_like(pts)
+    for a in range(facet_ids.shape[1]):
+        acc = acc.at[facet_ids[:, a]].add(n)
+    return acc / (jnp.linalg.norm(acc, axis=1, keepdims=True) + 1e-30)
+
+
+def _geometry_velocity_fn(spec: dict, dom: Any):
+    """Build ``velocity(pts) -> (n_ids,)`` for one geometry term: a **traced, differentiable** function of
+    the vertex positions, evaluated in the spec's own ``ids`` order.
+
+    This is what lets the march be scanned. :func:`Crux.eval` compiles each expression to
+    ``raw_fn(models, ctx, ...)`` where ``ctx`` is a pytree of **arrays** (``jno/core.py:5016-5029``), so
+    handing it a ctx whose tag entries are built from the *carried* positions makes the whole evaluation
+    traceable -- rather than going through ``prepare_domain_data``, which mutates host state and cannot run
+    inside ``lax.scan``. The compiler is reused rather than a second velocity evaluator written: two
+    evaluators for one expression drift apart silently.
+
+    Everything position-independent is resolved ONCE here -- the compiled expressions, the base context,
+    the sample<->vertex permutations, the facet incidence. Only values are rebuilt per call.
+
+    The two-point recovery is unchanged (see :func:`_geometry_velocity`): the term is a residual
+    ``a·d(coord)/dt - v``, so evaluating it with the derivative replaced by 0 and by 1 gives ``-v`` and
+    ``a - v``, hence ``v = -r0/(r1 - r0)``."""
+    import functools
+
+    import equinox as eqx
+    import jax.numpy as jnp
+    from scipy.spatial import cKDTree
+
+    import jno
+
+    from ...core import cse, fuse_laplacian
+    from ...trace_compiler import TraceCompiler
+
+    dim = int(dom.dimension)
+    tag = spec["coord"].tag
+    crux = jno.core([spec["expr0"], spec["expr1"]], domain=dom)
+    base_ctx = dict(crux.prepare_domain_data(dom).context)
+    models = eqx.tree_inference(crux._unwrapped_models)
+
+    def _compile(op):
+        raw = TraceCompiler.compile_traced_expression(cse(fuse_laplacian(op)), crux.all_ops)
+        return eqx.filter_jit(functools.partial(raw, min_consecutive=1))
+
+    fn0, fn1 = _compile(spec["expr0"]), _compile(spec["expr1"])
+
+    # The tag's sample points, and how they relate to mesh vertices. A tag is sampled as (B, T, N, D) on a
+    # transient domain; the samples are a spatial snapshot, so one (N, D) slice describes them all.
+    ctx_tag = np.asarray(base_ctx[tag])
+    n_samp = int(ctx_tag.shape[-2])
+    tag_pts = ctx_tag.reshape(-1, ctx_tag.shape[-1])[:n_samp, :dim]
+    verts = np.asarray(dom.mesh.points)[:, :dim]
+    sample_vid = np.asarray(cKDTree(verts).query(tag_pts)[1], dtype=np.int64)  # sample -> vertex
+    # vertex -> sample, for the spec's driven ids. Position-based, as the boundary readout is; resolved on
+    # the SEED mesh and then held fixed, which is the material-set (Lagrangian) convention a moving driven
+    # set needs -- re-deriving it from moved points is what let a `where=` region drift out of its own tag.
+    gap, perm = cKDTree(tag_pts).query(verts[np.asarray(spec["ids"], dtype=int)])
+    tol = 1e-6 * max(float(np.ptp(tag_pts)), 1.0)
+    if float(np.max(gap)) > tol:
+        raise ValueError(
+            f"jno.fem: could not match region {tag!r}'s sample points to its mesh vertices "
+            f"(worst gap {float(np.max(gap)):.2e} > {tol:.1e}). The velocity cannot be attributed to vertices."
+        )
+    perm = np.asarray(perm, dtype=np.int64)
+
+    nkey = f"n_{tag}"
+    facet_ids = _tag_facet_vertex_ids(dom, tag, dim) if nkey in base_ctx else None
+    # A state-reading interface law (a Stefan front reading the solved field) carries FrozenField nodes.
+    # Their nodal values and the mesh they sit on are delivered through the context -- see
+    # `trace_evaluator._eval_frozen_field`. Baking them into the graph with `refreeze` is what forced a
+    # host sync and pinned the law to the SEED state on the SEED mesh.
+    frozen_ids = [getattr(f, "frozen_id", None) for f in (spec.get("frozen") or [])]
+
+    def _write(entry, values):
+        """Broadcast an (N, D) spatial array into a context entry's (..., N, D) layout.
+
+        Every leading (batch / time) slice gets the same positions: the mesh is one geometry per step, not
+        one per sampled time. Writing only the first slice happens to work for a purely spatial expression
+        and silently would not for anything that reads across the time axis."""
+        e = jnp.asarray(entry)
+        return jnp.broadcast_to(values.reshape((1,) * (e.ndim - 2) + values.shape), e.shape)
+
+    def velocity(pts, state=None):
+        ctx = dict(base_ctx)
+        ctx[tag] = _write(base_ctx[tag], pts[sample_vid])
+        if facet_ids is not None:
+            ctx[nkey] = _write(base_ctx[nkey], _vertex_normals_jax(pts, facet_ids, dim)[sample_vid])
+        if frozen_ids:
+            if state is None:
+                raise ValueError(
+                    f"jno.fem: the geometry term on region {tag!r} reads the solved field, so its velocity "
+                    "needs the current state. This is a driver bug -- report it."
+                )
+            ctx["__mesh_points__"] = pts
+            ctx["__frozen_values__"] = {fid: jnp.asarray(state).reshape(-1) for fid in frozen_ids}
+        r0 = jnp.asarray(fn0(models, ctx, batchsize=None, key=None)).reshape(-1)
+        r1 = jnp.asarray(fn1(models, ctx, batchsize=None, key=None)).reshape(-1)
+        return (-r0 / (r1 - r0))[perm]
+
+    return velocity
+
+
 def _geometry_velocity(spec: dict, dom: Any, state: Any) -> np.ndarray:
     """Evaluate one geometry term's velocity on the current mesh and state.
 

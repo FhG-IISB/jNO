@@ -424,3 +424,87 @@ def test_the_field_gradient_flows_through_a_moving_mesh():
     h = 1e-3
     fd = (float(loss(k0 + h)) - float(loss(k0 - h))) / (2 * h)
     assert g == pytest.approx(fd, rel=2e-2), f"AD {g:.6e} vs FD {fd:.6e}"
+
+
+# ── the velocity as a traced function of the vertex positions ────────────────────────────────────────
+
+
+def _vel_case(term_fn, size=0.3, state_fn=None):
+    """Build a moving-mesh problem and return (spec, domain, state) for a velocity comparison."""
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain(time=(0.0, 0.2, 5))
+    u, v = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, tb, nx, ny = d.variable("boundary", normals=True, split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi)
+    tf = u.bind(x=xb, y=yb).freeze(np.zeros(len(d.mesh.points)))
+    fem = jno.fem(
+        [
+            ui.t * vi + 0.05 * (ui.x * vi.x + ui.y * vi.y),
+            u(xb, yb) - 0.0,
+            u(ci[0], ci[1]) - 1.0,
+            term_fn(yb, tb, tf, nx, ny),
+        ]
+    )
+    from jno.utils.solver.fem_adapt import _geometry_motion_specs
+
+    pts = np.asarray(d.mesh.points)
+    state = np.asarray(fem._op.state0).reshape(-1).astype(np.float64)
+    state = (state + 0.7 * np.sin(3.0 * pts[:, 0]) + 0.4 * pts[:, 1]).astype(np.float32)
+    return _geometry_motion_specs(fem, d)[0], d, state, fem
+
+
+@pytest.mark.parametrize(
+    "label,term_fn",
+    [
+        ("prescribed", lambda yb, tb, tf, nx, ny: yb.d(tb) - 0.5 * yb),
+        ("constant", lambda yb, tb, tf, nx, ny: yb.d(tb) - 0.4),
+        ("scaled derivative", lambda yb, tb, tf, nx, ny: 2.0 * yb.d(tb) - 1.0),
+        ("reads the solved field", lambda yb, tb, tf, nx, ny: yb.d(tb) - 0.2 * tf.x),
+    ],
+)
+def test_the_traced_velocity_reproduces_the_host_evaluation(label, term_fn):
+    """``_geometry_velocity_fn`` must agree with ``_geometry_velocity`` — on the seed mesh AND on a moved one.
+
+    The traced form is what lets the march be scanned: it reads the vertex positions it is *handed*, where
+    the host form re-samples ``domain.context`` (host state that cannot be touched inside ``lax.scan``).
+    The moved case is the one that matters; agreeing only on the seed mesh would prove nothing.
+
+    A state-reading law is checked on a NON-TRIVIAL state on purpose — with the zero state both routes
+    return zero and the comparison passes without exercising anything.
+    """
+    from jno.utils.solver.fem_adapt import _geometry_velocity, _geometry_velocity_fn, harmonic_extension, move_mesh
+
+    sp, d, state, fem = _vel_case(term_fn)
+    fn = _geometry_velocity_fn(sp, d)
+    dim = int(d.dimension)
+    pts0 = jnp.asarray(np.asarray(d.mesh.points)[:, :dim])
+
+    host0 = np.asarray(_geometry_velocity(sp, d, state))
+    assert np.abs(host0).max() > 1e-6, f"{label}: the reference velocity is ~0 — the test would prove nothing"
+    assert np.asarray(fn(pts0, state)) == pytest.approx(host0, abs=2e-6), f"{label}: seed mesh"
+
+    # move, then re-sample the host context (the host route needs that to see the move; the traced one does not)
+    disp = np.zeros((pts0.shape[0], dim))
+    disp[np.asarray(sp["ids"]), 1] = 0.08
+    prescribed = np.isin(np.arange(pts0.shape[0]), np.asarray(sp["ids"]))
+    move_mesh(d, np.asarray(harmonic_extension(d, disp, prescribed=prescribed)), copy=False)
+    d.variable("boundary", normals=True, split=True)
+    from jno.utils.solver.fem_adapt import _geometry_motion_specs
+
+    host1 = np.asarray(_geometry_velocity(_geometry_motion_specs(fem, d)[0], d, state))
+    pts1 = jnp.asarray(np.asarray(d.mesh.points)[:, :dim])
+    assert np.asarray(fn(pts1, state)) == pytest.approx(host1, abs=2e-6), f"{label}: moved mesh"
+    assert not np.allclose(pts0, pts1), "the move did nothing — the moved-mesh half is vacuous"
+
+
+def test_the_traced_velocity_is_differentiable_in_the_vertex_positions():
+    """``∂v/∂X`` must exist and be non-zero — this is the gradient the geometry chain is built on."""
+    from jno.utils.solver.fem_adapt import _geometry_velocity_fn
+
+    sp, d, state, _fem = _vel_case(lambda yb, tb, tf, nx, ny: yb.d(tb) - 0.5 * yb)
+    fn = _geometry_velocity_fn(sp, d)
+    pts = jnp.asarray(np.asarray(d.mesh.points)[:, : int(d.dimension)])
+    g = jax.grad(lambda p: jnp.sum(fn(p, state) ** 2))(pts)
+    assert bool(jnp.isfinite(g).all()), "∂v/∂X is not finite"
+    assert float(jnp.linalg.norm(g)) > 1e-8, "∂v/∂X vanished — the velocity does not see the positions"

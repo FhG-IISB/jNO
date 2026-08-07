@@ -942,15 +942,28 @@ class TraceEvaluator:
                 "FrozenField.eval(): standalone readout of a VECTOR frozen field is not supported yet — a "
                 "vector frozen field works as a coefficient in a jno.fem form. Read a single component."
             )
-        values = jnp.asarray(expr.values).reshape(-1)
+        # A caller marching a MOVING mesh supplies the nodal values and the mesh geometry through the eval
+        # context instead of the graph node and the domain object. Both are otherwise host state captured
+        # when the expression was built, so under a `lax.scan` a frozen field would silently keep reading
+        # the SEED state on the SEED mesh -- a wrong answer with no symptom. Purely additive: absent these
+        # keys, every existing `FrozenField.eval()` caller takes the original path unchanged.
+        _ctx_vals = ctx.context.get("__frozen_values__")
+        _ctx_vals = None if _ctx_vals is None else _ctx_vals.get(getattr(expr, "frozen_id", None))
+        values = jnp.asarray(expr.values if _ctx_vals is None else _ctx_vals).reshape(-1)
+
+        _ctx_pts = ctx.context.get("__mesh_points__")
         domain = getattr(expr, "_domain", None)
-        if domain is None or getattr(domain, "mesh_connectivity", None) is None:
+        if _ctx_pts is None and (domain is None or getattr(domain, "mesh_connectivity", None) is None):
             raise ValueError(
                 "FrozenField.eval() needs the frozen field to carry its mesh domain — build it via "
                 "`u.bind(x=..., y=...).freeze(values)` (the coordinate bind supplies the domain)."
             )
-        mesh_dim = int(domain.mesh_connectivity["dimension"])
-        mesh_points = jnp.asarray(domain.mesh_connectivity["points"])[:, :mesh_dim]
+        if _ctx_pts is not None:
+            mesh_points = jnp.asarray(_ctx_pts)
+            mesh_dim = int(mesh_points.shape[-1])
+        else:
+            mesh_dim = int(domain.mesh_connectivity["dimension"])
+            mesh_points = jnp.asarray(domain.mesh_connectivity["points"])[:, :mesh_dim]
 
         tag = getattr(expr, "_coord_tag", None)
         pts = ctx.context.get(tag) if tag is not None else None
