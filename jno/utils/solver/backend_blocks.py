@@ -354,10 +354,29 @@ class SemidiscreteTimeBlock:
         # ``[[A_r,-A_i],[A_i,A_r]]`` is genuinely non-symmetric and asks for GMRES, which does not break
         # down there. Restart is capped at 40 (as the dedicated complex marcher used) to bound memory.
         if (self.metadata or {}).get("krylov") == "gmres":
+            # The tolerance must be REACHABLE in the working precision. jNO defaults to float32 (x64 is
+            # opt-in), whose eps is 1.2e-7, so the 1e-10 relative target asked for here could never be
+            # met -- the termination test never fired, and GMRES, which has no other way out, paid its
+            # full ``10*n`` restarts every step however easy the system. Measured on a 377-dof parametric
+            # transient: **5485.6 ms/step -> 20.0 ms/step (249x)**, for the same answer (final |u|
+            # 0.141276836 vs 0.141276851).
+            #
+            # Scaled to the dtype rather than capped by ``maxiter``: an easy system then exits as soon as
+            # it converges and a hard one keeps working, where a fixed cap would silently under-solve the
+            # hard one. The 100x factor is not slack -- at 10*eps (1.2e-6) GMRES still never terminated
+            # (5494.0 ms/step measured). In float64 the 1e-10 floor keeps the previous behaviour exactly.
+            ktol = max(1e-10, 100.0 * float(jnp.finfo(rhs.dtype).eps))
             wn, _ = jax.scipy.sparse.linalg.gmres(
-                step_op, rhs, x0=u, tol=1e-10, atol=0.0, restart=min(n, 40), M=lambda x: inv * x
+                step_op, rhs, x0=u, tol=ktol, atol=0.0, restart=min(n, 40), M=lambda x: inv * x
             )
             return wn
+        # BiCGStab asks for the same unreachable 1e-10 and is deliberately LEFT ALONE. It never grinds:
+        # its breakdown test fires once the residual stalls at the float32 noise floor, so the effect is
+        # "solve as tightly as this precision allows" -- 1.0 ms/step here, i.e. the defect is masked at no
+        # measurable cost. Giving it the reachable tolerance measured 0.6 ms/step but moved every real
+        # transient's answer by ~3e-6 relative (0.141276836 -> 0.141277224) and its gradient by ~1e-5,
+        # trading accuracy for 0.4 ms/step. Not worth it. If JAX's breakdown handling ever changes, this
+        # becomes the GMRES bug and wants the same `ktol`.
         wn, _ = jax.scipy.sparse.linalg.bicgstab(
             step_op, rhs, x0=u, tol=1e-10, atol=0.0, maxiter=20_000, M=lambda x: inv * x
         )

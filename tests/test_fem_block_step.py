@@ -135,3 +135,59 @@ def test_block_step_periodic_reduced_space(_x64):
     decay = np.exp(-8.0 * np.pi**2 * 0.1 * block.t1)
     assert 0.0 < float(jnp.linalg.norm(w)) < w0_norm
     assert abs(float(jnp.linalg.norm(w)) / w0_norm - decay) < 0.1
+
+
+def _capture_krylov_kwargs(monkeypatch, block):
+    """Run one `block.step` and return the kwargs it handed its Krylov routine."""
+    import jax.scipy.sparse.linalg as sl
+
+    seen: dict = {}
+    for name in ("gmres", "bicgstab"):
+        real = getattr(sl, name)
+
+        def wrapped(A, b, _real=real, _name=name, **kw):
+            seen.update(kw, _method=_name, _dtype=b.dtype)
+            return _real(A, b, **kw)
+
+        monkeypatch.setattr(sl, name, wrapped)
+    block.step(jnp.asarray(block.state0), float(block.t0), float(block.dt))
+    return seen
+
+
+def test_gmres_step_tolerance_is_reachable_in_the_working_precision(monkeypatch):
+    """The step must not ask its Krylov solver for a residual the working precision cannot represent.
+
+    It asked for `tol=1e-10` unconditionally. jNO defaults to float32 (x64 is opt-in), whose eps is
+    1.2e-7, so the relative-residual test could never fire — and GMRES, which has no breakdown exit,
+    ran its full `10*n` restarts on every step however easy the system. Measured on a 377-dof
+    parametric transient: 5485.6 ms/step against 20.0 ms/step for the same answer.
+
+    Asserted as an invariant rather than a wall-clock bound, which would be flaky: the tolerance has
+    to sit above eps. 10x eps is NOT enough headroom — at 1.2e-6 GMRES still never terminated — so
+    the margin itself is pinned.
+    """
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", False)  # the default precision, and the one that was broken
+    try:
+        block = _heat().operator
+        block.metadata = dict(block.metadata or {}, krylov="gmres")
+        seen = _capture_krylov_kwargs(monkeypatch, block)
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
+    eps = float(jnp.finfo(seen["_dtype"]).eps)
+    assert seen["_method"] == "gmres", "expected the gmres branch"
+    assert seen["_dtype"] == jnp.float32, f"expected the default float32 precision, got {seen['_dtype']}"
+    assert seen["tol"] > eps, f"tol {seen['tol']:.3e} is below float32 eps {eps:.3e} — it can never be reached"
+    assert seen["tol"] >= 50.0 * eps, (
+        f"tol {seen['tol']:.3e} is only {seen['tol'] / eps:.0f}x eps; 10x measured as still non-terminating"
+    )
+
+
+def test_x64_step_tolerance_is_unchanged(monkeypatch, _x64):
+    """Scaling the ask to the dtype must not loosen anything in float64 — the 1e-10 floor still holds."""
+    block = _heat().operator
+    block.metadata = dict(block.metadata or {}, krylov="gmres")
+    seen = _capture_krylov_kwargs(monkeypatch, block)
+    assert seen["_dtype"] == jnp.float64, f"the x64 fixture did not take: {seen['_dtype']}"
+    assert seen["tol"] == 1e-10, f"float64 behaviour changed: tol {seen['tol']:.3e} != 1e-10"
