@@ -2115,6 +2115,16 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
     Requires ≥1 coordinate tagged ``domain.variable(region)[i].trainable()`` before ``jno.fem`` (else raises).
     Mutates ``fem`` / its domain to the relocated mesh (like the refinement loop) and returns the solution there;
     ``fem.adapt_history`` traces the per-round objective and energy.
+
+    **Scope.** 2D and 3D; scalar or vector; **any nodal-Lagrange order** (P1/P2/P3 measured); linear,
+    nonlinear, transient, periodic and complex — everything but complex-*transient*, which ``jno.fem``
+    rejects at build time. It does **not** compose with a geometry term (``coord.d(t) - v``): that driver
+    owns the march.
+
+    **The monitor only ever sees VERTEX values** (:func:`_vertex_values`), whatever the element order. At
+    P2 and above the mid-edge DOFs are invisible to it, so the mesh adapts to the P1 sub-sampling of the
+    field rather than to everything the field resolves. That is a real ceiling on what r-adaptivity buys
+    at higher order, not merely an implementation note — a monitor built on the full basis would see more.
     """
     import jax
     import jax.numpy as jnp
@@ -2148,17 +2158,53 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
             p = p.at[jnp.asarray(sp["ids"]), sp["axis"]].set(vals[sp["name"]])
         return p
 
+    # Per-block value shape, needed to read VERTEX values out of a solution block. DOFs are node-major
+    # (``node*vec + comp``) and a nodal Lagrange element numbers the mesh vertices FIRST, so every
+    # component's vertex values are ``blk[: n_verts*vec].reshape(n_verts, vec)``.
+    #
+    # ``vec`` cannot be guessed from the block LENGTH, which is what this used to do. For a P2 vector
+    # field ``nb % n_verts != 0`` (634 against 88 vertices), so the guess fell through to ``blk[:n_verts]``
+    # -- the first ``n_verts/vec`` NODES times their components, read as though it were one value per
+    # vertex. It did not raise. It relocated against a misread array (measured 1.4e-02 away from the true
+    # component-0 vertex values, the scale of the solution itself), and it was the one configuration in a
+    # sweep where element quality got WORSE: min |det J| 8.7e-03 -> 4.7e-03. The sibling h-adaptive path,
+    # `_solve_vertex_values`, refuses this case outright -- so one of the two silently mangled what the
+    # other declined to touch.
+    #
+    # ``field_points`` and ``offsets`` are per-FEM snapshots (unlike the domain's ``_fem_native_*``
+    # records, which the next assembly clobbers), so reading them here is safe.
+    _fpts = getattr(fem, "field_points", None)
+    _off0 = list(fem.offsets) if getattr(fem, "offsets", None) is not None else None
+    _vecs = None
+    if _fpts is not None and _off0 is not None and len(_fpts) == len(_off0) - 1:
+        _vecs = []
+        for _i in range(len(_fpts)):
+            _nn = int(np.asarray(_fpts[_i]).shape[0])
+            _nb = int(_off0[_i + 1] - _off0[_i])
+            _vecs.append(_nb // _nn if _nn and _nb % _nn == 0 else 1)
+
+    def _vertex_values(blk, i):
+        """Block ``i``'s values at the mesh VERTICES: ``(n_verts,)`` scalar or ``(n_verts, vec)`` vector."""
+        nb = int(blk.shape[0])
+        vec = (
+            _vecs[i] if (_vecs is not None and i < len(_vecs)) else (nb // n_verts if n_verts and nb % n_verts == 0 else 1)
+        )
+        if vec > 1:
+            if nb < n_verts * vec:
+                raise NotImplementedError(
+                    f"AdaptSpec(relocate=True): solution block {i} has {nb} DOFs for {n_verts} vertices at "
+                    f"vec={vec}, so its vertex values are not a prefix and the monitor cannot be built."
+                )
+            return blk[: n_verts * vec].reshape(n_verts, vec)
+        return blk[:n_verts]
+
     def _block_energy(u, pts, bounds):
         """Total Dirichlet energy summed over EVERY solution block (``bounds``) — so a scalar, a vector (per
         component), a **complex** field (its real + imaginary blocks) and a coupled multifield all contribute.
-        A higher-order block (P2) falls back to its vertex DOFs."""
+        A higher-order block reads its vertex DOFs (see :func:`_vertex_values`)."""
         e = 0.0
         for i in range(len(bounds) - 1):
-            blk = u[bounds[i] : bounds[i + 1]]
-            nb = int(blk.shape[0])
-            veci = nb // n_verts if (n_verts and nb % n_verts == 0) else 1
-            bf = blk.reshape(n_verts, veci) if veci > 1 else blk[:n_verts]
-            e = e + _dirichlet_energy_jax(pts, bf, cells_j, dim)
+            e = e + _dirichlet_energy_jax(pts, _vertex_values(u[bounds[i] : bounds[i + 1]], i), cells_j, dim)
         return e
 
     _march = _transient_march_fn(fem.operator) if mode == "transient" else None
@@ -2195,10 +2241,7 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
         changes the functional alone."""
         d_ = 0.0
         for i in range(len(bounds) - 1):
-            blk = u[bounds[i] : bounds[i + 1]]
-            nb = int(blk.shape[0])
-            veci = nb // n_verts if (n_verts and nb % n_verts == 0) else 1
-            bf = blk.reshape(n_verts, veci) if veci > 1 else blk[:n_verts]
+            bf = _vertex_values(u[bounds[i] : bounds[i + 1]], i)
             if spec.objective == "huang":
                 d_ = d_ + _huang_ea_jax(pts, pts0_j, bf, cells_j, dim)
             else:

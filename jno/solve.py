@@ -719,8 +719,15 @@ def relocate(
     comparable equidistribution defect, but it degrades element quality badly here and the answer with it.
     Lowering ``relax_step`` recovers part of the gap (0.811 → 0.633 at ``relax_step=0.02``).
 
+    Works in **2D and 3D**, on a scalar or vector field of **any nodal-Lagrange order**, and across linear,
+    nonlinear, transient, periodic and complex problems (all but complex-*transient*). It does not compose
+    with a moving mesh (``coord.d(t) - v``) — that driver owns the march.
+
     Further limits, measured rather than argued:
 
+    - **The monitor reads vertex values only**, whatever the element order, so at P2 and above it adapts to
+      the P1 sub-sampling of the field rather than to everything the field resolves. Higher order still
+      relocates correctly; it just does not get a sharper monitor for the extra DOFs.
     - **Monge–Ampère's non-folding is a property of the whole map.** Holding a subset of vertices truncates
       it, and the truncation is what can tangle: on a 21² square with a diagonal front, freezing the whole
       boundary reached ``min det J = -1.2e-03`` where the full map stayed positive throughout. Freeing

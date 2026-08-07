@@ -542,3 +542,73 @@ def test_relocate_monge_ampere_returns_its_best_mesh_not_its_last():
     assert objs[-1] == min(objs), f"returned a worse mesh than one it visited: {objs}"
     assert objs[-1] <= objs[0], "relocation must never hand back a mesh worse than the one it started from"
     assert np.allclose(hist[-1]["points"], pts_final), "the last history entry must BE the returned mesh"
+
+
+# ── the monitor must read VERTEX values, whatever the DOF layout ─────────────────────────────────────
+
+
+def _peak_field(order, shape, size=0.14):
+    """The same Poisson peak at a chosen element order and value shape; every component carries the
+    identical field, which is what makes the scalar and vector runs comparable below."""
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain()
+    xm, ym = d.variable("mov", where=lambda x, y: (x > 0.05) & (x < 0.95) & (y > 0.05) & (y < 0.95), split=True)[:2]
+    xm.trainable(name="ix")
+    ym.trainable(name="iy")
+    u, phi = d.fem_symbols(order=order, value_shape=shape)
+    xi, yi = d.variable("interior", split=True)[:2]
+    xb, yb = d.variable("boundary", split=True)[:2]
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    f = J.exp(-60.0 * ((xi - 0.5) ** 2 + (yi - 0.5) ** 2))
+    if shape:
+        weak = J.inner(J.grad(ui, xi), J.grad(vi, xi)) + J.inner(J.grad(ui, yi), J.grad(vi, yi)) - f * (vi[0] + vi[1])
+        bcs = [u(xb, yb)[0] - 0.0, u(xb, yb)[1] - 0.0]
+    else:
+        weak = ui.x * vi.x + ui.y * vi.y - f * vi
+        bcs = [u(xb, yb) - 0.0]
+    return d, jno.fem([weak, *bcs])
+
+
+def test_a_higher_order_vector_field_relocates_on_its_vertex_values():
+    """The monitor reads VERTEX values out of each solution block, and it must find them whatever the DOF
+    layout is.
+
+    It did not. ``vec`` was guessed from the block LENGTH — ``nb // n_verts if nb % n_verts == 0 else 1``
+    — and for a P2 vector field that modulus is non-zero (634 DOFs against 88 vertices), so it fell to
+    ``blk[:n_verts]``: the first ``n_verts/vec`` NODES times their components, read as if it were one
+    value per vertex. Measured 1.4e-02 away from the true component-0 vertex values, the scale of the
+    solution itself. Nothing raised; the mesh relocated against a misread array, and this was the one
+    configuration where element quality got WORSE — min |det J| 8.7e-03 -> 4.7e-03, where every other
+    order/shape improved it.
+
+    Both components here carry the identical field, so the vector run must land on the SAME mesh as the
+    scalar one — the defect is then exactly twice the scalar's, and the descent direction is
+    RMS-normalised. That equality is the sharp assertion: a misread block cannot satisfy it by accident.
+    """
+    d_s, fem_s = _peak_field(2, ())
+    fem_s.solve(adapt=jno.solve.relocate(max_iters=8))
+    scalar_mesh = np.asarray(d_s.mesh.points)[:, :2].copy()
+
+    d_v, fem_v = _peak_field(2, (2,))
+    fem_v.solve(adapt=jno.solve.relocate(max_iters=8))
+    vector_mesh = np.asarray(d_v.mesh.points)[:, :2]
+
+    assert vector_mesh == pytest.approx(scalar_mesh, abs=1e-12), (
+        f"a P2 vector field relocated to a different mesh than the equivalent scalar: "
+        f"max|dX| = {np.abs(vector_mesh - scalar_mesh).max():.3e}"
+    )
+
+
+@pytest.mark.parametrize("order, shape", [(1, ()), (2, ()), (3, ()), (1, (2,)), (2, (2,))])
+def test_relocation_improves_element_quality_at_any_order_and_shape(order, shape):
+    """Relocation must not make the mesh worse. Parametrised over the orders and value shapes the driver
+    accepts, because the P2-vector case silently degraded quality while every other combination improved
+    it — a shape of failure a single-configuration test cannot see."""
+    d, fem = _peak_field(order, shape)
+    cells = np.asarray(d.mesh.cells_dict["triangle"])
+    before = _min_detj(np.asarray(d.mesh.points)[:, :2], cells)
+
+    fem.solve(adapt=jno.solve.relocate(max_iters=8))
+    after = _min_detj(np.asarray(d.mesh.points)[:, :2], cells)
+
+    assert after > 0.0, f"P{order} shape={shape}: relocation tangled the mesh (min detJ {after:.3e})"
+    assert after >= 0.9 * before, f"P{order} shape={shape}: element quality fell, {before:.3e} -> {after:.3e}"
