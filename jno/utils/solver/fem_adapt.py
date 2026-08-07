@@ -1316,15 +1316,20 @@ class AdaptSpec:
     """``relocate_method="monge_ampere"`` only: the relaxation pseudo-step ``Δt`` of eq. (3.7). Larger
     converges faster and can overshoot; the nonlinearity is carried entirely by this outer relaxation."""
     relocate_method: str = "descent"
-    """Relocation only: *how* the mesh is moved. ``"monge_ampere"`` — what :func:`jno.solve.relocate`
-    builds — solves a Monge-Ampère equation for a mesh potential ``φ`` and takes the mesh as ``x = ξ + ∇φ``
-    (:func:`_monge_ampere_displacement`): no descent, no line search, and non-folding by construction
-    because the displacement is a gradient (for the *whole* map — see that function on what holding a
-    subset costs). ``objective`` is then only a *diagnostic*; ``lr`` and ``quality_floor`` are unused.
-    ``"descent"`` (the dataclass default, reached only by constructing an ``AdaptSpec`` directly) instead
-    walks the vertices down :attr:`objective` with a mesh-validity line search. It is **kept for
-    measurement**, not for use: on a single front it reached equidistribution spread 0.91 against Monge-
-    Ampère's 0.70, and needed 20-30 rounds against 8."""
+    """Relocation only: *how* the mesh is moved. ``"descent"`` — the default here and the default
+    :func:`jno.solve.relocate` builds — walks the vertices down :attr:`objective` with a mesh-validity
+    line search. ``"monge_ampere"`` instead solves a Monge-Ampère equation for a mesh potential ``φ`` and
+    takes the mesh as ``x = ξ + ∇φ`` (:func:`_monge_ampere_displacement`): no descent, no line search, and
+    non-folding by construction because the displacement is a gradient (for the *whole* map — see that
+    function on what holding a subset costs). With it, ``objective`` is only a *diagnostic* and ``lr`` /
+    ``quality_floor`` are unused.
+
+    Descent is the default **on the measured answer**, not on convergence rate. Monge-Ampère does converge
+    in far fewer rounds (3-6 against 30) and reaches a comparable equidistribution defect, but on the
+    Allen-Cahn front the suite measures it loses on accuracy and wrecks element quality: rel-L2 8.879e-02
+    against descent's 3.951e-02 (uniform 1.096e-01), min element quality 0.160 against 0.503. See
+    :func:`jno.solve.relocate` for the full table and the ``relax_step`` control that recovers part of it.
+    (This docstring previously claimed the opposite of all of that.)"""
     objective: str = "equidistribution"
     """Relocation only, **internal / not yet exposed** by :func:`jno.solve.relocate`: which mesh functional
     to descend. ``"equidistribution"`` (default) is :func:`_equidistribution_jax`, the scale-free
