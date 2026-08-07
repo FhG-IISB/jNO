@@ -508,3 +508,106 @@ def test_the_traced_velocity_is_differentiable_in_the_vertex_positions():
     g = jax.grad(lambda p: jnp.sum(fn(p, state) ** 2))(pts)
     assert bool(jnp.isfinite(g).all()), "∂v/∂X is not finite"
     assert float(jnp.linalg.norm(g)) > 1e-8, "∂v/∂X vanished — the velocity does not see the positions"
+
+
+# ── the state transfer, without scipy ────────────────────────────────────────────────────────────────
+
+
+def _ring_case(size=0.12, disp_scale=0.02, seed=0):
+    from jno.utils.solver.fem_adapt import _one_ring_cells, _simplex_cell_key
+
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain()
+    dim = int(d.dimension)
+    pts = np.asarray(d.mesh.points)[:, :dim].astype(np.float64)
+    cells = np.asarray(d.mesh.cells_dict[_simplex_cell_key(dim)]).astype(np.int64)
+    rng = np.random.default_rng(seed)
+    new = pts + disp_scale * rng.standard_normal(pts.shape)
+    cand, mask = _one_ring_cells(cells, pts.shape[0])
+    return pts, cells, new, cand, mask
+
+
+def _interior_mask(cells, n):
+    from jno.utils.solver.fem_adapt import _boundary_edges_from_triangles
+
+    on_b = np.zeros(n, dtype=bool)
+    on_b[np.unique(np.asarray(_boundary_edges_from_triangles(cells)).reshape(-1))] = True
+    return ~on_b
+
+
+def test_the_one_ring_transfer_reproduces_the_kdtree_route():
+    """The scipy-free transfer must give the same FIELD, not merely the same cell.
+
+    A query point on a shared face is legitimately inside two simplices, so comparing chosen cell indices
+    would flag a difference that does not exist. What has to agree is the interpolated value."""
+    from jno.utils.solver.fem_adapt import _locate_barycentric, _locate_in_one_ring_jax
+
+    pts, cells, new, cand, mask = _ring_case()
+    field = np.sin(2.4 * pts[:, 0]) + 0.6 * pts[:, 1] ** 2
+
+    idx_h, w_h, inside_h = _locate_barycentric(pts, cells, new, tol=1e-9, k=32)
+    idx_j, w_j, esc = _locate_in_one_ring_jax(jnp.asarray(pts), cells, cand, mask, jnp.asarray(new))
+    val_h = np.einsum("qk,qk->q", w_h, field[idx_h])
+    val_j = np.einsum("qk,qk->q", np.asarray(w_j), field[np.asarray(idx_j)])
+
+    both = inside_h & ~np.asarray(esc)
+    assert both.sum() > 0.5 * len(pts), "too few points located by both routes for the comparison to mean anything"
+    assert val_j[both] == pytest.approx(val_h[both], abs=1e-6)
+
+
+def test_a_moderate_step_never_escapes_an_interior_vertex_s_one_ring():
+    """The one-ring is a *candidate set*, so it has to actually contain the answer.
+
+    An interior vertex cannot leave the mesh, so an interior escape means the step outran the local
+    element size. A BOUNDARY vertex moving outward legitimately leaves the old mesh entirely — the
+    kd-tree route clamps those to the nearest simplex too, so they are expected, not a failure."""
+    from jno.utils.solver.fem_adapt import _locate_barycentric, _locate_in_one_ring_jax
+
+    pts, cells, new, cand, mask = _ring_case(disp_scale=0.02)
+    _, _, esc = _locate_in_one_ring_jax(jnp.asarray(pts), cells, cand, mask, jnp.asarray(new))
+    esc, interior = np.asarray(esc), _interior_mask(cells, len(pts))
+    _, _, inside_h = _locate_barycentric(pts, cells, new, tol=1e-9, k=32)
+
+    assert int((esc & interior).sum()) == 0, "a moderate step escaped an interior vertex's one-ring"
+    assert int((esc & ~interior).sum()) == int((~inside_h).sum()), (
+        "boundary escapes should be exactly the points the kd-tree route also finds outside the old mesh"
+    )
+
+
+def test_an_over_large_step_is_detectable_rather_than_silently_clamped():
+    """The failure the one-ring makes visible. The kd-tree route discards its own `inside` flag, so an
+    over-large step is absorbed by a nearest-simplex clamp without a word; here it is reportable."""
+    from jno.utils.solver.fem_adapt import _locate_in_one_ring_jax
+
+    pts, cells, new, cand, mask = _ring_case(disp_scale=0.06)
+    _, _, esc = _locate_in_one_ring_jax(jnp.asarray(pts), cells, cand, mask, jnp.asarray(new))
+    assert int((np.asarray(esc) & _interior_mask(cells, len(pts))).sum()) > 0
+
+
+def test_a_zero_displacement_transfer_is_the_identity():
+    """Not moving must not diffuse the field — the weights have to land on the vertex itself."""
+    from jno.utils.solver.fem_adapt import _locate_in_one_ring_jax
+
+    pts, cells, _new, cand, mask = _ring_case()
+    field = np.sin(2.4 * pts[:, 0]) + 0.6 * pts[:, 1] ** 2
+    idx, w, esc = _locate_in_one_ring_jax(jnp.asarray(pts), cells, cand, mask, jnp.asarray(pts))
+    got = np.einsum("qk,qk->q", np.asarray(w), field[np.asarray(idx)])
+    assert not np.asarray(esc).any(), "a vertex escaped its own one-ring at zero displacement"
+    # 1e-6, not 1e-9: the barycentric solve runs in the default float32, and an exact vertex hit still
+    # lands ~3.5e-08 out. The quantity being excluded is P1 interpolation DIFFUSION, which on this field
+    # would be O(h^2) ~ 1e-2 -- four orders above this bar, so the test still has all its teeth.
+    assert got == pytest.approx(field, abs=1e-6)
+
+
+def test_the_transfer_is_differentiable_in_the_vertex_positions():
+    """``∂(transferred field)/∂X`` — the transfer sits inside the march, so it must carry a gradient."""
+    from jno.utils.solver.fem_adapt import _locate_in_one_ring_jax
+
+    pts, cells, new, cand, mask = _ring_case()
+    field = jnp.asarray(np.sin(2.4 * pts[:, 0]) + 0.6 * pts[:, 1] ** 2)
+
+    def transferred(p):
+        i, w, _ = _locate_in_one_ring_jax(p, cells, cand, mask, jnp.asarray(new))
+        return jnp.sum(jnp.einsum("qk,qk->q", w, field[i]) ** 2)
+
+    g = jax.grad(transferred)(jnp.asarray(pts))
+    assert bool(jnp.isfinite(g).all()) and float(jnp.linalg.norm(g)) > 1e-8

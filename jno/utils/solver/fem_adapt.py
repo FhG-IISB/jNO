@@ -477,6 +477,73 @@ def _locate_barycentric(src_pts: np.ndarray, src_cells: np.ndarray, qpts: np.nda
     return src_cells[cell_idx].astype(np.int64), weights, inside
 
 
+def _one_ring_cells(cells: np.ndarray, n_vert: int) -> tuple[np.ndarray, np.ndarray]:
+    """``(cand, mask)`` -- for each vertex, the cells incident to it, padded to a fixed width.
+
+    Connectivity only, so a connectivity-preserving march hoists this ONCE and it is a compile-time
+    constant. ``cand`` is ``(n_vert, R)`` cell indices (padding repeats the vertex's first cell, so a
+    padded slot is a *valid* simplex and never produces a singular solve) and ``mask`` ``(n_vert, R)``
+    marks the real entries."""
+    cells = np.asarray(cells, dtype=np.int64)
+    n_local = cells.shape[1]
+    vid = cells.reshape(-1)
+    cid = np.repeat(np.arange(cells.shape[0], dtype=np.int64), n_local)
+    order = np.argsort(vid, kind="stable")
+    vid, cid = vid[order], cid[order]
+    counts = np.bincount(vid, minlength=n_vert)
+    width = int(counts.max()) if len(counts) else 1
+    starts = np.concatenate([[0], np.cumsum(counts)[:-1]])
+    cand = np.zeros((n_vert, width), dtype=np.int64)
+    mask = np.zeros((n_vert, width), dtype=bool)
+    for j in range(width):
+        take = counts > j
+        cand[take, j] = cid[starts[take] + j]
+        mask[take, j] = True
+    # a vertex in no cell would leave an all-invalid row; point it at cell 0 so the solve stays regular
+    cand[~mask.any(axis=1), :] = 0
+    cand = np.where(mask, cand, cand[:, :1])
+    return cand, mask
+
+
+def _locate_in_one_ring_jax(src_pts, cells, cand, mask, qpts, *, tol: float = 1e-9):
+    """P1 stencil + weights for each query point, searching only its own vertex's incident cells.
+
+    The moving-mesh transfer asks a special question: query ``i`` is vertex ``i`` displaced by less than
+    an element, on a mesh with the SAME connectivity. Its containing simplex is therefore in vertex
+    ``i``'s one-ring, so the candidate set is fixed by connectivity instead of found by a KD-tree --
+    static shapes, and differentiable in the positions. Same barycentric algebra as
+    :func:`_locate_in_cells`, batched over a static candidate axis.
+
+    Returns ``(idx, weights, escaped)``: ``idx`` ``(Q, D+1)`` source-vertex indices, ``weights``
+    ``(Q, D+1)`` barycentric coordinates, and ``escaped`` ``(Q,)`` True where the point fell outside
+    every candidate (the caller decides; the host route clamps such points silently)."""
+    import jax.numpy as jnp
+
+    dim = qpts.shape[1]
+    cell_v = jnp.asarray(cells)[jnp.asarray(cand)]  # (Q, R, D+1)
+    V = src_pts[cell_v]  # (Q, R, D+1, D)
+    v0 = V[:, :, 0, :]
+    T = jnp.swapaxes(V[:, :, 1:, :] - v0[:, :, None, :], 2, 3)  # columns v_i - v0
+    rhs = qpts[:, None, :] - v0
+    det = jnp.linalg.det(T)
+    safe = jnp.abs(det) > 1e-300
+    Tsafe = jnp.where(safe[..., None, None], T, jnp.eye(dim, dtype=T.dtype))
+    lam_rest = jnp.linalg.solve(Tsafe, rhs[..., None])[..., 0]
+    lam = jnp.concatenate([(1.0 - lam_rest.sum(axis=-1))[..., None], lam_rest], axis=-1)  # (Q, R, D+1)
+
+    valid = jnp.asarray(mask) & safe
+    inside = valid & jnp.all(lam >= -tol, axis=-1)
+    worst = jnp.where(valid, jnp.min(lam, axis=-1), -jnp.inf)  # best-effort pick when nothing contains it
+    choice = jnp.where(jnp.any(inside, axis=1), jnp.argmax(inside.astype(jnp.int32), axis=1), jnp.argmax(worst, axis=1))
+    q = jnp.arange(qpts.shape[0])
+    chosen_lam, chosen_idx = lam[q, choice], cell_v[q, choice]
+    hit = jnp.any(inside, axis=1)
+
+    proj = jnp.clip(chosen_lam, 0.0, None)  # nearest-simplex projection, as the host route does
+    proj = proj / jnp.clip(proj.sum(axis=1, keepdims=True), 1e-300, None)
+    return chosen_idx, jnp.where(hit[:, None], chosen_lam, proj), ~hit
+
+
 def transfer_solution(
     source_domain: Any, values: Any, target_domain: Any, *, fill: Any = "nearest", tol: float = 1e-9, k: int = 32
 ):
