@@ -27,6 +27,7 @@ across a remesh in a transient / moving-mesh loop), ``zz_error_indicators``, ``d
 from __future__ import annotations
 
 import copy
+import itertools
 from dataclasses import dataclass
 from typing import Any
 
@@ -514,9 +515,13 @@ def _locate_in_one_ring_jax(src_pts, cells, cand, mask, qpts, *, tol: float = 1e
     static shapes, and differentiable in the positions. Same barycentric algebra as
     :func:`_locate_in_cells`, batched over a static candidate axis.
 
-    Returns ``(idx, weights, escaped)``: ``idx`` ``(Q, D+1)`` source-vertex indices, ``weights``
-    ``(Q, D+1)`` barycentric coordinates, and ``escaped`` ``(Q,)`` True where the point fell outside
-    every candidate (the caller decides; the host route clamps such points silently)."""
+    Returns ``(idx, weights, escaped, cell)``: ``idx`` ``(Q, D+1)`` source-vertex indices, ``weights``
+    ``(Q, D+1)`` barycentric coordinates, ``escaped`` ``(Q,)`` True where the point fell outside every
+    candidate (the caller decides; the host route clamps such points silently), and ``cell`` ``(Q,)`` the
+    chosen source cell. A P1 caller wants ``idx``, since a P1 field's DOFs *are* the vertices; a
+    higher-order one wants ``cell``, to index that cell's row of the P{k} connectivity. Both are returned
+    rather than derived by the caller, because re-deriving the cell from its vertex set is a search where
+    here it is already known."""
     import jax.numpy as jnp
 
     dim = qpts.shape[1]
@@ -541,7 +546,7 @@ def _locate_in_one_ring_jax(src_pts, cells, cand, mask, qpts, *, tol: float = 1e
 
     proj = jnp.clip(chosen_lam, 0.0, None)  # nearest-simplex projection, as the host route does
     proj = proj / jnp.clip(proj.sum(axis=1, keepdims=True), 1e-300, None)
-    return chosen_idx, jnp.where(hit[:, None], chosen_lam, proj), ~hit
+    return chosen_idx, jnp.where(hit[:, None], chosen_lam, proj), ~hit, jnp.asarray(cand)[q, choice]
 
 
 def _cell_patch_cells(cells: np.ndarray, n_vert: int) -> tuple[np.ndarray, np.ndarray]:
@@ -575,10 +580,20 @@ def _cell_patch_cells(cells: np.ndarray, n_vert: int) -> tuple[np.ndarray, np.nd
     return cand, mask
 
 
-def _l2_transfer_jax(X_old, X_new, cells, dim, u, off, *, qdeg: int = 3, tol=None, maxiter: int = 200):
-    r"""Carry a scalar-P1 state from the old mesh onto the moved one by **conservative L2 projection** --
-    the Galerkin transfer ``M(X_new) u_new = b``, ``b_i = ∫_{Ω_new} u_old φ_i^new``. Pure JAX, static
-    shapes, differentiable in both meshes and in ``u``.
+def _l2_transfer_jax(
+    X_old, X_new, cells, dim, u, off, *, orders=None, vecs=None, cells_f=None, qdeg=None, tol=None, maxiter: int = 200
+):
+    r"""Carry a finite-element state from the old mesh onto the moved one by **conservative L2
+    projection** -- the Galerkin transfer ``M(X_new) u_new = b``, ``b_i = ∫_{Ω_new} u_old φ_i^new``. Pure
+    JAX, static shapes, differentiable in both meshes and in ``u``.
+
+    Handles **any nodal-Lagrange order and value shape**, per field: pass ``orders`` / ``vecs`` /
+    ``cells_f`` from :func:`_field_layout` (defaults describe scalar P1). Two things make the
+    higher-order case cheap rather than a rewrite. The mesh geometry is **P1 whatever the field order**
+    -- a moved simplex stays straight-sided -- so the quadrature map and the point location are shared by
+    every field and computed once. And the P{k} connectivity is **unchanged by the move**, because the
+    move preserves topology; only the vertex positions differ, so the seed assembly's ``cells_f`` stays
+    valid for the whole march and the new DOF *coordinates* are never needed at all.
 
     Replaces a pointwise re-interpolation (``u_new[i] = u_old(x_new[i])``, still available as
     :func:`_locate_in_one_ring_jax`, which remains this function's point-location core and its test
@@ -636,8 +651,14 @@ def _l2_transfer_jax(X_old, X_new, cells, dim, u, off, *, qdeg: int = 3, tol=Non
     Steps, all of them traceable: the reference rule comes from ``basix.make_quadrature`` (the same
     builder the assembler uses); the physical points are affine in ``X_new``; each is located in the OLD
     mesh over its cell's fixed-width patch (:func:`_cell_patch_cells`); the load vector is a
-    ``segment_sum`` scatter; and the P1 mass is applied matrix-free from the closed form
-    ``|K|/((d+1)(d+2)) · (1 + δ_ij)`` -- no quadrature needed for it -- under Jacobi-CG.
+    ``segment_sum`` scatter; and the mass is applied matrix-free under Jacobi-CG, the vector case being
+    ``M ⊗ I`` so every component rides one solve.
+
+    The test functions are tabulated on the host, at the fixed reference quadrature points. The old field
+    has to be read at the **located** points, which are tracers, so those go through
+    :func:`_lagrange_monomial_coeffs` instead. One basis, two evaluation routes, only because one input is
+    static and the other is not -- and both are built from the single ``_lagrange_basix`` element, so they
+    cannot drift apart.
 
     ``Ω_new ⊄ Ω_old`` where a boundary moves outward: such quadrature points clamp to the nearest simplex
     exactly as the pointwise route does, and conservation then holds against that clamped extension rather
@@ -650,14 +671,25 @@ def _l2_transfer_jax(X_old, X_new, cells, dim, u, off, *, qdeg: int = 3, tol=Non
     from basix import CellType, make_quadrature
 
     cells_j = jnp.asarray(cells)
-    n_vert, n_cells = X_new.shape[0], cells.shape[0]
+    n_cells = cells.shape[0]
+    n_fields = len(off) - 1
+    orders = [1] * n_fields if orders is None else [int(o) for o in orders]
+    vecs = [1] * n_fields if vecs is None else [int(v) for v in vecs]
+    cells_f = [cells] * n_fields if cells_f is None else [np.asarray(c) for c in cells_f]
 
+    # The mass ∫φᵢφⱼ is degree 2k and MUST be integrated exactly -- under-integrate it and ``M`` is not
+    # the mass matrix, so the solve is not a projection at all. One rule serves every field (a
+    # higher-degree rule is merely wasted on a lower-order one). The load vector cannot be exact at any
+    # degree, because its integrand has kinks; 2k is what makes the operator right, not the data.
+    if qdeg is None:
+        qdeg = max(3, 2 * max(orders))
     qp, qw = make_quadrature(CellType.triangle if dim == 2 else CellType.tetrahedron, int(qdeg))
     qp, qw = np.asarray(qp, dtype=np.float64), np.asarray(qw, dtype=np.float64)
-    phi = jnp.asarray(_tabulate_lagrange_at(dim, 1, qp), dtype=X_new.dtype)  # (nq, n_loc)
     qp_j, qw_j = jnp.asarray(qp, dtype=X_new.dtype), jnp.asarray(qw, dtype=X_new.dtype)
 
-    # physical quadrature points on the NEW mesh: affine in the moved vertices
+    # physical quadrature points on the NEW mesh: affine in the moved vertices. The GEOMETRY is P1
+    # whatever the field order -- a moved simplex stays straight-sided -- so this is the same map for
+    # every field, and only the basis tabulated on it changes.
     v_new = X_new[cells_j]  # (n_cells, n_loc, dim)
     J_new = jnp.stack([v_new[:, i + 1] - v_new[:, 0] for i in range(dim)], axis=2)  # columns are edges
     detJ = jnp.abs(jnp.linalg.det(J_new))  # (n_cells,)
@@ -665,8 +697,10 @@ def _l2_transfer_jax(X_old, X_new, cells, dim, u, off, *, qdeg: int = 3, tol=Non
     # runs over J's LAST axis -- the batched form of the assembler's `verts[0] + qp @ J.T`.
     xq = v_new[:, 0][:, None, :] + jnp.einsum("qd,ced->cqe", qp_j, J_new)  # (n_cells, nq, dim)
 
-    cand, cmask = _cell_patch_cells(np.asarray(cells), n_vert)
-    idx, w, esc = _locate_in_one_ring_jax(
+    # Locate every new quadrature point in the OLD mesh. Done ONCE and shared by every field: the point
+    # set is the field-independent geometry, and only what is evaluated there differs.
+    cand, cmask = _cell_patch_cells(np.asarray(cells), X_new.shape[0])
+    _idx, w, esc, src_cell = _locate_in_one_ring_jax(
         X_old,
         cells,
         np.repeat(cand, qp.shape[0], axis=0),
@@ -674,36 +708,50 @@ def _l2_transfer_jax(X_old, X_new, cells, dim, u, off, *, qdeg: int = 3, tol=Non
         xq.reshape(-1, dim),
     )
     w = jnp.asarray(w, dtype=X_new.dtype)
+    # the located point's REFERENCE coordinates in its old cell: barycentric lambda_1..lambda_d, which is
+    # exactly the chart `_tabulate_lagrange_at` / `_lagrange_monomial_coeffs` are written on
+    xi_src = w[:, 1:]
 
-    # Matrix-free P1 mass on the NEW mesh, from the SAME quadrature rule as the load vector above -- not
-    # from the closed form |K|/((d+1)(d+2))*(1+delta), which is equally exact in real arithmetic and was
-    # the first version here. Two computations of one integral disagree at round-off, and that difference
-    # is the whole answer when the meshes coincide: `b - M u_old` should be exactly zero there, and with
-    # two routes it was ~1e-7 in float32, so a still mesh drifted instead of transferring untouched.
-    # Sharing the rule makes the identity exact by construction. The rule integrates the quadratic product
-    # exactly, so nothing is given up for it.
-    m_loc = jnp.einsum("q,c,qi,qj->cij", qw_j, detJ, phi, phi)
-
-    def mass_apply(z):
-        out_c = jnp.einsum("cij,cj->ci", m_loc, z[cells_j])
-        return jax.ops.segment_sum(out_c.reshape(-1), cells_j.reshape(-1), num_segments=n_vert)
-
-    m_diag = jax.ops.segment_sum(jnp.einsum("cii->ci", m_loc).reshape(-1), cells_j.reshape(-1), num_segments=n_vert)
     if tol is None:
         tol = max(1e-13, 100.0 * float(jnp.finfo(X_new.dtype).eps))
-    jac = 1.0 / jnp.where(jnp.abs(m_diag) > 1e-30, m_diag, 1.0)
 
-    n_fields = len(off) - 1
     outs = []
     for f in range(n_fields):
-        blk = u[off[f] : off[f + 1]]
-        uq = jnp.einsum("qk,qk->q", w, blk[idx]).reshape(n_cells, -1)  # u_old at each new quad point
+        k, vec, cf = orders[f], vecs[f], jnp.asarray(cells_f[f])
+        n_nodes = (off[f + 1] - off[f]) // vec
+        phi_q = jnp.asarray(_tabulate_lagrange_at(dim, k, qp), dtype=X_new.dtype)  # (nq, n_dof) -- host
+
+        # The TEST functions sit at fixed reference quadrature points, so basix tabulates them on the
+        # host. The OLD field must be read at the LOCATED points, which are traced, so those go through
+        # the polynomial form. Same basis, two evaluation routes only because one input is static and the
+        # other is not -- both come from the one `_lagrange_basix` builder, so they cannot disagree.
+        exps, coef = _lagrange_monomial_coeffs(dim, k)
+        phi_src = _eval_lagrange_traced(xi_src, exps, coef)  # (n_cells*nq, n_dof)
+
+        blk = u[off[f] : off[f + 1]].reshape(n_nodes, vec)  # node-major: node*vec + comp
+        # u_old at every new quadrature point, all components at once
+        uq = jnp.einsum("pn,pnv->pv", phi_src, blk[cf[src_cell]]).reshape(n_cells, -1, vec)
+
+        # Mass on the NEW mesh from the SAME rule as the load vector -- not a closed form. Two
+        # computations of one integral disagree at round-off, and that difference IS the answer when the
+        # meshes coincide: `b - M u_old` must be exactly zero there. With two routes it was ~1e-7 in
+        # float32 and a still mesh drifted instead of transferring untouched.
+        m_loc = jnp.einsum("q,c,qi,qj->cij", qw_j, detJ, phi_q, phi_q)
+        m_diag = jax.ops.segment_sum(jnp.einsum("cii->ci", m_loc).reshape(-1), cf.reshape(-1), num_segments=n_nodes)
+        jac = 1.0 / jnp.where(jnp.abs(m_diag) > 1e-30, m_diag, 1.0)
+
+        def mass_apply(z, _m=m_loc, _cf=cf, _n=n_nodes):
+            """The scalar mass applied to every component at once -- the vector mass is M (x) I."""
+            out_c = jnp.einsum("cij,cjv->civ", _m, z[_cf])
+            return jax.ops.segment_sum(out_c.reshape(-1, z.shape[-1]), _cf.reshape(-1), num_segments=_n)
+
         # b_i = sum_c sum_q w_q |det J_c| u_old(xq) phi_i(qp_q)
-        b_c = jnp.einsum("q,c,cq,qi->ci", qw_j, detJ, uq, phi)
-        b = jax.ops.segment_sum(b_c.reshape(-1), cells_j.reshape(-1), num_segments=n_vert)
-        outs.append(
-            jax.scipy.sparse.linalg.cg(mass_apply, b, x0=blk, tol=tol, atol=0.0, maxiter=maxiter, M=lambda z: jac * z)[0]
-        )
+        b_c = jnp.einsum("q,c,cqv,qi->civ", qw_j, detJ, uq, phi_q)
+        b = jax.ops.segment_sum(b_c.reshape(-1, vec), cf.reshape(-1), num_segments=n_nodes)
+        sol = jax.scipy.sparse.linalg.cg(
+            mass_apply, b, x0=blk, tol=tol, atol=0.0, maxiter=maxiter, M=lambda z, _j=jac: _j[:, None] * z
+        )[0]
+        outs.append(sol.reshape(-1))
     return jnp.concatenate(outs), esc.reshape(n_cells, -1)
 
 
@@ -809,6 +857,69 @@ def _tabulate_lagrange_at(dim: int, order: int, xi: np.ndarray) -> np.ndarray:
     cell = {1: CellType.interval, 2: CellType.triangle}.get(int(dim), CellType.tetrahedron)
     tab = _lagrange_basix(cell, int(order)).tabulate(0, np.asarray(xi, dtype=np.float64))
     return np.asarray(tab[0, :, :, 0])  # (Q, n_dof): basis values (0th-derivative block, scalar value)
+
+
+def _lagrange_monomial_coeffs(dim: int, order: int) -> tuple[np.ndarray, np.ndarray]:
+    r"""``(exponents, C)`` for evaluating the P{order} simplex basis at **traced** reference coordinates.
+
+    :func:`_tabulate_lagrange_at` goes through basix, which is host-only, so it cannot be called on a
+    reference coordinate that is itself a tracer -- which is exactly what the moving-mesh transfer has,
+    since the point it must evaluate the old field at is located inside the scan. The basis is a
+    polynomial, so its coefficients can be found once on the host and the polynomial evaluated in-trace:
+
+    .. math:: \varphi_j(\xi) = \sum_m \xi^{e_m}\, C_{mj}
+
+    ``C`` is the inverse of the Vandermonde of the monomials at the element's own nodal points, which is
+    where this is well conditioned rather than merely correct: Lagrange nodes satisfy
+    :math:`\varphi_j(\text{node}_s) = \delta_{sj}`, so the tabulated right-hand side is the identity and
+    ``C = A^{-1}`` exactly. The monomial count :math:`\binom{k+d}{d}` equals the Lagrange DOF count, so
+    ``A`` is square.
+
+    Nodes and DOF order come from the same :func:`fem_lagrange._lagrange_basix` builder the assembler
+    uses, so the columns line up with the recorded P{order} connectivity -- the property that lets the
+    result be contracted against a cell's DOFs directly.
+    """
+    from basix import CellType
+
+    from .fem_lagrange import _lagrange_basix
+
+    cell = {1: CellType.interval, 2: CellType.triangle}.get(int(dim), CellType.tetrahedron)
+    nodes = np.asarray(_lagrange_basix(cell, int(order)).points, dtype=np.float64)  # (n_dof, dim)
+
+    exps = np.array(
+        [e for e in itertools.product(range(int(order) + 1), repeat=int(dim)) if sum(e) <= int(order)],
+        dtype=np.int64,
+    )
+    if exps.shape[0] != nodes.shape[0]:  # a Lagrange simplex is unisolvent on exactly this monomial set
+        raise AssertionError(f"P{order} on a {dim}-simplex: {nodes.shape[0]} nodes vs {exps.shape[0]} monomials.")
+    A = np.prod(nodes[:, None, :] ** exps[None, :, :], axis=2)  # (n_dof, n_mon)
+    return exps, np.linalg.inv(A)
+
+
+def _eval_lagrange_traced(xi, exps, coeffs):
+    """P{order} basis values at traced reference coordinates ``xi`` ``(..., dim)`` -> ``(..., n_dof)``.
+
+    The in-trace half of :func:`_lagrange_monomial_coeffs`.
+
+    The monomials are built from **cumulative products**, never from ``xi ** e``. ``xi ** 0`` has the
+    right *value* (1) everywhere, but its derivative is taken by the general power rule as
+    ``0 · xi**(-1)``, which is ``0 · inf = NaN`` at ``xi == 0`` -- and a reference coordinate is exactly
+    zero whenever a quadrature point lands on a cell edge, which some rules do. The value is unaffected,
+    so this shows up only under differentiation: it put NaNs in ``d(march)/dX₀`` while every forward test
+    stayed green. Repeated multiplication has the same value and is differentiable everywhere."""
+    import jax.numpy as jnp
+
+    exps = np.asarray(exps, dtype=np.int64)
+    dim, max_e = exps.shape[1], int(exps.max(initial=0))
+    pows = [jnp.ones_like(xi)]  # pows[k][..., a] == xi[..., a] ** k
+    for _ in range(max_e):
+        pows.append(pows[-1] * xi)
+    stack = jnp.stack(pows, axis=0)  # (max_e + 1, ..., dim)
+
+    mon = jnp.ones(xi.shape[:-1] + (exps.shape[0],), dtype=xi.dtype)
+    for a in range(dim):
+        mon = mon * jnp.moveaxis(stack[..., a], 0, -1)[..., exps[:, a]]
+    return mon @ jnp.asarray(coeffs, dtype=xi.dtype)
 
 
 def _eval_fe_fields_at_points(
@@ -3018,14 +3129,12 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, **kwargs: Any) -> "Adapti
     - Boundary conditions on a moving surface must be **natural** or tied to a whole-boundary / held tag —
       those re-derive on the moved mesh. A Dirichlet BC pinned to the moving surface by a spatial
       sub-predicate would not follow the motion.
-    - **scalar-P1 field(s), real, non-periodic**; vector / higher-order / complex / periodic / a custom
-      ``solve_fn`` each raise. Several *coupled* scalar-P1 fields are fine, and so is a **nonlinear**
-      problem (the block's Newton branch) and **3D** — all three are covered by tests. Note the nonlinear
+    - **Any nodal-Lagrange field(s), real, non-periodic** — scalar or vector, P1 or higher, mixed orders
+      across a coupled system (a Taylor–Hood pair moves as one), in 2D or 3D, linear or **nonlinear** (the
+      block's Newton branch). All of those are covered by tests. Complex, periodic, a non-nodal family
+      (RT / Nédélec / Hermite / Argyris / Morley) and a custom ``solve_fn`` each raise. Note the nonlinear
       branch does not take ``_step_solve``: ``SemidiscreteTimeBlock.step`` threads ``linear_solve`` only
       through the linear path, so a nonlinear march runs ``newton_krylov`` at its own defaults.
-    - The **assembly** is already order-agnostic in the mesh coordinates (a P2 transient carries an exact
-      ``d/dX``), so what pins the scalar-P1 wall is this driver: the DOF-count guard below, the
-      vertex-based transfer, and the ``layouts=None`` trajectory.
     - **Needs ``jax_enable_x64``** and raises without it — see the guard below for the measurement.
     - **Every frame on the block's own time grid.** There is no ``save_ts=``: it used to be accepted here
       and silently ignored (a request for 3 frames returned the grid's 4), and it evaded the
@@ -3074,14 +3183,8 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, **kwargs: Any) -> "Adapti
     state = jnp.asarray(block.state0).reshape(-1)
     if jnp.iscomplexobj(state):
         raise NotImplementedError("mesh motion is real-only (the state transfer / mesh motion are); complex is future.")
-    off = [int(x) for x in (fem.offsets or [0, int(state.shape[0])])]
-    n_fields = len(off) - 1
-    for _f in range(n_fields):
-        if off[_f + 1] - off[_f] != n_verts:
-            raise NotImplementedError(
-                f"mesh motion supports scalar-P1 field(s) only for now: field {_f} has {off[_f + 1] - off[_f]} "
-                f"DOFs vs {n_verts} mesh vertices (vector / higher-order). Express it as scalar-P1 fields, or await it."
-            )
+    # The layout the transfer needs is read from the REBUILT problem below, since that is the one the
+    # march actually steps; this early `off` only sizes the complex check above.
 
     # Make the assembly a FUNCTION of the vertex positions, once, instead of rebuilding it every step.
     # `Variable.trainable()` on a spatial coordinate registers it as a runtime parameter that
@@ -3118,6 +3221,19 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, **kwargs: Any) -> "Adapti
     cur = jno.fem(cons, **kw)  # rebuilt ONCE, now parametric in the vertex positions
     block = cur._op
     state = jnp.asarray(block.state0).reshape(-1)
+
+    # Per-field element order / value shape / P{k} connectivity, for the state transfer. Read HERE,
+    # immediately after the rebuild, because the next assembly on this domain overwrites the
+    # `_fem_native_*` records it comes from. It also raises for a non-nodal family (RT / Nedelec /
+    # Hermite / Argyris / Morley), which is the fail-loud this driver wants: the transfer tabulates a
+    # nodal Lagrange basis, and there is nothing sensible it could do with an edge or a normal-moment DOF.
+    # The layout is CONSTANT over the march -- the move preserves topology, so every field's connectivity
+    # and DOF count are the same at every frame; only the vertex positions differ.
+    try:
+        layout = _field_layout(cur)
+    except NotImplementedError as _e:
+        raise NotImplementedError(f"jno.fem: a geometry term needs a nodal-Lagrange assembly. {_e}") from _e
+    off = [int(x) for x in layout["offsets"]]
 
     # Runtime parameter VALUES (a coefficient, a neural field) travel with the coordinates. Without this
     # they were accepted by `**kwargs` and silently discarded: the block exposes them in
@@ -3311,7 +3427,17 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, **kwargs: Any) -> "Adapti
         #    field under the motion; this IS the ALE convective term, treated semi-Lagrangian. The
         #    pointwise re-interpolation this replaces lost 27.6 % of a marginally-resolved peak over 2
         #    steps and 33.0 % over 16, i.e. it got worse as `dt` shrank. See `_l2_transfer_jax`.
-        u_t, q_esc = _l2_transfer_jax(X_c, X_n, shared_cells, dim, u_c, off)
+        u_t, q_esc = _l2_transfer_jax(
+            X_c,
+            X_n,
+            shared_cells,
+            dim,
+            u_c,
+            off,
+            orders=layout["orders"],
+            vecs=layout["vecs"],
+            cells_f=layout["cells_f"],
+        )
         # An escaping quadrature point of an INTERIOR cell means the projection integrated against a
         # clamped extension rather than the field: the same fault the vertex route reports, at the same
         # place. A cell touching the boundary genuinely leaves the old mesh when that boundary moves
@@ -3373,7 +3499,11 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, **kwargs: Any) -> "Adapti
                 d.variable(_tag, split=True)
     fem.__dict__.update(cur.__dict__)
     fem.adapt_history = history
-    return AdaptiveTrajectory(np.asarray(times), states, meshes)
+    # One layout, repeated: the move preserves topology, so every frame has the same per-field orders,
+    # value shapes and connectivity. Carrying it is what lets `AdaptiveTrajectory.resample` take its
+    # basis-aware branch -- without it a P2 or vector trajectory falls to the legacy scalar-P1 path, which
+    # would mis-slice the state blocks rather than fail.
+    return AdaptiveTrajectory(np.asarray(times), states, meshes, layouts=[layout] * len(times))
 
 
 def run_adaptive_inverse(

@@ -435,7 +435,7 @@ def test_the_transfer_conserves_the_integral_better_than_pointwise_sampling():
     assert not bool(jnp.any(esc)), "an interior jitter should never leave its own cell patch"
 
     cand, cmask = _one_ring_cells(C, n)
-    idx, w, _e = _locate_in_one_ring_jax(P, C, cand, cmask, Xn)
+    idx, w, _e, _c = _locate_in_one_ring_jax(P, C, cand, cmask, Xn)
     pw = jnp.einsum("qk,qk->q", jnp.asarray(w, dtype=u.dtype), u[idx])
 
     d_l2 = abs(integral(l2, Xn) - i0) / i0
@@ -752,7 +752,7 @@ def test_the_one_ring_transfer_reproduces_the_kdtree_route():
     field = np.sin(2.4 * pts[:, 0]) + 0.6 * pts[:, 1] ** 2
 
     idx_h, w_h, inside_h = _locate_barycentric(pts, cells, new, tol=1e-9, k=32)
-    idx_j, w_j, esc = _locate_in_one_ring_jax(jnp.asarray(pts), cells, cand, mask, jnp.asarray(new))
+    idx_j, w_j, esc, _c = _locate_in_one_ring_jax(jnp.asarray(pts), cells, cand, mask, jnp.asarray(new))
     val_h = np.einsum("qk,qk->q", w_h, field[idx_h])
     val_j = np.einsum("qk,qk->q", np.asarray(w_j), field[np.asarray(idx_j)])
 
@@ -770,7 +770,7 @@ def test_a_moderate_step_never_escapes_an_interior_vertex_s_one_ring():
     from jno.utils.solver.fem_adapt import _locate_barycentric, _locate_in_one_ring_jax
 
     pts, cells, new, cand, mask = _ring_case(disp_scale=0.02)
-    _, _, esc = _locate_in_one_ring_jax(jnp.asarray(pts), cells, cand, mask, jnp.asarray(new))
+    _, _, esc, _c = _locate_in_one_ring_jax(jnp.asarray(pts), cells, cand, mask, jnp.asarray(new))
     esc, interior = np.asarray(esc), _interior_mask(cells, len(pts))
     _, _, inside_h = _locate_barycentric(pts, cells, new, tol=1e-9, k=32)
 
@@ -786,7 +786,7 @@ def test_an_over_large_step_is_detectable_rather_than_silently_clamped():
     from jno.utils.solver.fem_adapt import _locate_in_one_ring_jax
 
     pts, cells, new, cand, mask = _ring_case(disp_scale=0.06)
-    _, _, esc = _locate_in_one_ring_jax(jnp.asarray(pts), cells, cand, mask, jnp.asarray(new))
+    _, _, esc, _c = _locate_in_one_ring_jax(jnp.asarray(pts), cells, cand, mask, jnp.asarray(new))
     assert int((np.asarray(esc) & _interior_mask(cells, len(pts))).sum()) > 0
 
 
@@ -796,7 +796,7 @@ def test_a_zero_displacement_transfer_is_the_identity():
 
     pts, cells, _new, cand, mask = _ring_case()
     field = np.sin(2.4 * pts[:, 0]) + 0.6 * pts[:, 1] ** 2
-    idx, w, esc = _locate_in_one_ring_jax(jnp.asarray(pts), cells, cand, mask, jnp.asarray(pts))
+    idx, w, esc, _c = _locate_in_one_ring_jax(jnp.asarray(pts), cells, cand, mask, jnp.asarray(pts))
     got = np.einsum("qk,qk->q", np.asarray(w), field[np.asarray(idx)])
     assert not np.asarray(esc).any(), "a vertex escaped its own one-ring at zero displacement"
     # 1e-6, not 1e-9: the barycentric solve runs in the default float32, and an exact vertex hit still
@@ -813,7 +813,7 @@ def test_the_transfer_is_differentiable_in_the_vertex_positions():
     field = jnp.asarray(np.sin(2.4 * pts[:, 0]) + 0.6 * pts[:, 1] ** 2)
 
     def transferred(p):
-        i, w, _ = _locate_in_one_ring_jax(p, cells, cand, mask, jnp.asarray(new))
+        i, w, _, _c = _locate_in_one_ring_jax(p, cells, cand, mask, jnp.asarray(new))
         return jnp.sum(jnp.einsum("qk,qk->q", w, field[i]) ** 2)
 
     g = jax.grad(transferred)(jnp.asarray(pts))
@@ -1164,34 +1164,173 @@ def test_a_geometry_term_marches_COUPLED_scalar_fields():
     assert np.abs(final[:n_verts] - final[n_verts:]).max() > 1e-6
 
 
-@pytest.mark.parametrize(
-    "kind, order, shape",
-    [("higher-order (P2)", 2, ()), ("vector", 1, (2,))],
-)
-def test_the_scalar_P1_wall_fails_loud(kind, order, shape):
-    """P2 and vector are not supported, and must say so rather than mis-slice the state blocks. Pinned
-    here so the wall is documented where it is enforced; delete these when the transfer becomes
-    basis-aware (the assembly already is — a trainable mesh coordinate carries an exact gradient at P2)."""
-    d = _dom(size=0.4)
+# ── any nodal-Lagrange order and value shape ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("dim, order", [(2, 1), (2, 2), (2, 3), (3, 1), (3, 2), (3, 3)])
+def test_the_in_trace_lagrange_basis_matches_basix_and_differentiates_at_zero(dim, order):
+    """The traced basis must agree with basix in VALUE and stay finite in GRADIENT.
+
+    The gradient half is not redundant. The first version built the monomials as ``xi ** e``, whose value
+    is right everywhere — but whose derivative is taken by the general power rule as ``0 · xi**(-1)``,
+    i.e. ``0 · inf = NaN``, at ``xi == 0``. A reference coordinate is exactly zero whenever a quadrature
+    point lands on a cell edge, so this put NaNs into ``d(march)/dX₀`` while every forward test stayed
+    green. Sample points ON the edges and vertices are included here deliberately."""
+    from jno.utils.solver.fem_adapt import _eval_lagrange_traced, _lagrange_monomial_coeffs, _tabulate_lagrange_at
+
+    exps, coeffs = _lagrange_monomial_coeffs(dim, order)
+    rng = np.random.default_rng(0)
+    xs = rng.random((60, dim))
+    xs = xs[xs.sum(axis=1) <= 1.0]
+    edges = np.zeros((3, dim))  # the origin, and points on two coordinate edges: exact zeros
+    edges[1, 0] = 0.5
+    edges[2, -1] = 0.5
+    xs = np.vstack([xs, edges])
+
+    got = np.asarray(_eval_lagrange_traced(jnp.asarray(xs), exps, coeffs))
+    assert got == pytest.approx(_tabulate_lagrange_at(dim, order, xs), abs=1e-12), "traced basis != basix"
+    assert np.allclose(got.sum(axis=1), 1.0, atol=1e-12), "the basis is not a partition of unity"
+
+    g = jax.jacrev(lambda p: _eval_lagrange_traced(p, exps, coeffs).sum())(jnp.asarray(xs))
+    assert bool(jnp.isfinite(g).all()), "the basis gradient is not finite (xi**0 differentiates to NaN at 0)"
+    # sum(phi) is identically 1, so its derivative is identically 0 -- an independent check on the whole route
+    assert float(jnp.abs(g).max()) < 1e-10, "d(sum phi)/d(xi) should vanish"
+
+
+def _order_march(order=1, shape=(), vel=0.1, size=0.4, nt=4):
+    """A moving-mesh heat problem at a chosen element order and value shape."""
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain(time=(0.0, 0.2, nt))
     u, v = d.fem_symbols(order=order, value_shape=shape)
     xi, yi, ti = d.variable("interior", split=True)
     xb, yb, tb = d.variable("boundary", split=True)
     ci = d.variable("initial", split=True)
     ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi)
     if shape:
+        weak = jno.np.inner(ui.t, vi) + 0.05 * (
+            jno.np.inner(jno.np.grad(ui, xi), jno.np.grad(vi, xi)) + jno.np.inner(jno.np.grad(ui, yi), jno.np.grad(vi, yi))
+        )
         terms = [
-            jno.np.inner(ui.t, vi)
-            + 0.05 * jno.np.inner(jno.np.symgrad(ui, [xi, yi]), jno.np.symgrad(vi, [xi, yi]), n_contract=2),
+            weak,
             u(xb, yb)[0] - 0.0,
             u(xb, yb)[1] - 0.0,
             u(ci[0], ci[1])[0] - 1.0,
-            u(ci[0], ci[1])[1] - 1.0,
+            u(ci[0], ci[1])[1] - 0.5,
         ]
     else:
         terms = [ui.t * vi + 0.05 * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - 1.0]
-    fem = jno.fem([*terms, yb.d(tb) - 0.1])
-    with pytest.raises(NotImplementedError, match="scalar-P1"):
-        fem.solve()
+    return d, jno.fem([*terms, yb.d(tb) - vel])
+
+
+@pytest.mark.parametrize(
+    "order, shape, label", [(1, (), "P1"), (2, (), "P2"), (3, (), "P3"), (1, (2,), "vector P1"), (2, (2,), "vector P2")]
+)
+def test_a_moving_mesh_carries_any_lagrange_order_and_value_shape(order, shape, label):
+    """The P1 wall is gone: the transfer is basis-aware, so a field of any nodal-Lagrange order and value
+    shape marches. It used to raise for everything but scalar P1.
+
+    Two things make the higher-order case cheap rather than a rewrite. The mesh geometry is P1 whatever
+    the field order — a moved simplex stays straight-sided — so the quadrature map and the point location
+    are shared by every field. And the P{k} connectivity is unchanged by a topology-preserving move, so
+    the seed assembly's `cells_f` stays valid and the moved DOF *coordinates* are never needed."""
+    d, fem = _order_march(order=order, shape=shape)
+    traj = fem.solve()
+    final = np.asarray(traj.states[-1])
+    n_comp = shape[0] if shape else 1
+
+    assert np.isfinite(final).all(), f"{label}: the march is not finite"
+    assert final.shape[0] > len(np.asarray(traj.meshes[0][0])) * n_comp or order == 1, (
+        f"{label}: a P{order} field should carry more DOFs than there are vertices"
+    )
+    p0, p1 = np.asarray(traj.meshes[0][0]), np.asarray(traj.meshes[-1][0])
+    assert np.allclose(p1[:, 1] - p0[:, 1], 0.1 * 0.2, atol=1e-9), f"{label}: the mesh did not translate as prescribed"
+    # the maximum principle still holds: u = 0 on the boundary, <= 1 initially
+    assert -0.2 < final.min() and final.max() < 1.2, f"{label}: left a sane envelope [{final.min()}, {final.max()}]"
+
+
+@pytest.mark.parametrize("order", [1, 2, 3])
+def test_a_still_mesh_reproduces_the_fixed_mesh_march_at_any_order(order):
+    """The anchor that pins the whole path — parametric assembly, per-step solve, basis-aware transfer —
+    against the ordinary solver, at each order. A defect in any of them shows up as a number rather than
+    as a plausible-looking trajectory."""
+
+    def mk(with_motion):
+        d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain(time=(0.0, 0.3, 7))
+        u, v = d.fem_symbols(order=order)
+        xi, yi, ti = d.variable("interior", split=True)
+        xb, yb, tb = d.variable("boundary", split=True)
+        ci = d.variable("initial", split=True)
+        ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi)
+        geom = (yb.d(tb) - 0.0,) if with_motion else ()
+        return d, jno.fem([ui.t * vi + 0.05 * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - 1.0, *geom])
+
+    _dm, fem_m = mk(True)
+    moving = np.asarray(fem_m.solve().states[-1])
+    d_f, fem_f = mk(False)
+    sol = fem_f.solve()
+    fixed = np.asarray(jno.core([sol.mean], domain=d_f).eval([sol]))[-1]
+
+    assert moving == pytest.approx(fixed, rel=1e-6, abs=1e-8), (
+        f"P{order}: zero motion should reproduce the fixed-mesh march; max|d| = {np.abs(moving - fixed).max():.3e}"
+    )
+
+
+def test_a_mixed_order_coupled_system_moves_as_one():
+    """Two fields of DIFFERENT order in one system — the shape a Taylor-Hood pair takes. Each field's own
+    order, connectivity and DOF count drive its own projection; they share the mesh, the quadrature map
+    and the point location."""
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain(time=(0.0, 0.2, 4))
+    a, qa = d.fem_symbols(names=("a", "qa"), order=2)
+    b, qb = d.fem_symbols(names=("b", "qb"), order=1)
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, tb = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ai, bi = a.bind(x=xi, y=yi, t=ti), b.bind(x=xi, y=yi, t=ti)
+    va, vb = qa.bind(x=xi, y=yi), qb.bind(x=xi, y=yi)
+    fem = jno.fem(
+        [
+            ai.t * va + 0.05 * (ai.x * va.x + ai.y * va.y) - bi * va,
+            bi.t * vb + 0.05 * (bi.x * vb.x + bi.y * vb.y),
+            a(xb, yb) - 0.0,
+            b(xb, yb) - 0.0,
+            a(ci[0], ci[1]) - 1.0,
+            b(ci[0], ci[1]) - 0.5,
+            yb.d(tb) - 0.1,
+        ]
+    )
+    traj = fem.solve()
+    off = [int(x) for x in fem.offsets]
+    n_verts = len(np.asarray(traj.meshes[0][0]))
+
+    assert off[1] - off[0] > n_verts, "the P2 block should carry more DOFs than there are vertices"
+    assert off[2] - off[1] == n_verts, "the P1 block's DOFs are the vertices"
+    assert np.isfinite(np.asarray(traj.states[-1])).all()
+    # each field resamples onto a reference mesh through its OWN basis
+    for f in (0, 1):
+        r = np.asarray(traj.resample(d, field=f))
+        assert r.shape == (len(traj), n_verts), f"field {f} resampled to {r.shape}"
+        assert np.isfinite(r).all()
+
+
+def test_a_non_nodal_family_fails_loud():
+    """The transfer tabulates a NODAL Lagrange basis. A Nedelec / RT / Argyris DOF is an edge circulation
+    or a normal moment, and there is nothing sensible the projection could do with one, so the wall moved
+    from 'scalar P1 only' to 'nodal Lagrange only' rather than disappearing.
+
+    Asserted at `_field_layout`, which is where the driver asks the question. Driving a non-nodal
+    *transient* to `solve()` would be stopped earlier by the assembler's own gate, testing that instead of
+    this one."""
+    from jno.utils.solver.fem_adapt import _field_layout
+
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain()
+    u, v = d.fem_symbols(space="Morley")
+    xi, yi = d.variable("interior", split=True)[:2]
+    xb, yb = d.variable("boundary", split=True)[:2]
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    Hu, Hv = jno.np.hessian(ui, [xi, yi]), jno.np.hessian(vi, [xi, yi])
+    fem = jno.fem([jno.np.inner(Hu, Hv, n_contract=2) - 1.0 * vi, u(xb, yb) - 0.0])
+
+    with pytest.raises(NotImplementedError, match="nodal-Lagrange"):
+        _field_layout(fem)
 
 
 def test_mesh_motion_requires_x64():

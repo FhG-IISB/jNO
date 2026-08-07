@@ -558,10 +558,17 @@ across.
   extension.
 * A Dirichlet BC on the moving surface must be tied to a whole-boundary or held tag, not to a spatial
   sub-predicate — a predicate does not follow the motion.
-* **Scalar-P1 field(s), real, non-periodic**, 2D or 3D. Several *coupled* scalar fields work, and so does a
-  **nonlinear** problem. Vector, higher-order, complex, periodic, a custom `solve_fn` and `save_ts=` each
-  raise. The assembly itself is already order-agnostic in the mesh coordinates (a P2 transient carries an
-  exact `d/dX`); what pins the P1 wall is the driver's vertex-based transfer.
+* **Any nodal-Lagrange field(s), real, non-periodic**, 2D or 3D — scalar or vector, P1 or higher, and
+  *mixed orders* across a coupled system (a Taylor–Hood pair moves as one). **Nonlinear** problems work
+  too. Complex, periodic, a non-nodal family (RT / Nédélec / Hermite / Argyris / Morley), a custom
+  `solve_fn` and `save_ts=` each raise.
+
+  Higher order costs almost nothing structurally, for two reasons worth knowing: the mesh geometry is
+  **P1 whatever the field order** — a moved simplex stays straight-sided — so the quadrature map and the
+  point location are shared by every field; and a topology-preserving move leaves the P{k} **connectivity
+  unchanged**, so the seed assembly's tables stay valid for the whole march and the moved DOF
+  *coordinates* are never needed at all. The quadrature degree follows the order (`2k`), because the mass
+  `∫φᵢφⱼ` must be integrated exactly or the solve is not a projection.
 
 ---
 
