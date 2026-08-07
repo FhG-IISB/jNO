@@ -2442,7 +2442,14 @@ def _vertex_normals_jax(pts, facet_ids, dim: int):
     else:
         n = jnp.cross(f[:, 1] - f[:, 0], f[:, 2] - f[:, 0])
     n = n / (jnp.linalg.norm(n, axis=1, keepdims=True) + 1e-30)
-    ctr = jnp.mean(pts[jnp.unique(facet_ids.reshape(-1), size=facet_ids.size)], axis=0)
+    # Orient outward against the WHOLE MESH's centroid, not the tag's own. Two reasons, both measured:
+    # a tag covering one flat edge has its centroid ON that edge, so `n . (facet_centre - centroid)` is
+    # 0 to round-off (1.1e-16) and the sign test carries no information; and the previous
+    # `jnp.unique(..., size=facet_ids.size)` PADS (10 slots for 6 unique vertices), which dragged the
+    # centroid off the edge and flipped every normal. A flat top edge came out with ny = -1 throughout.
+    # The mesh centroid is well conditioned for a boundary sub-region and matches the intent of
+    # `_facet_normals` ("away from the material").
+    ctr = jnp.mean(pts, axis=0)
     n = jnp.where((jnp.sum(n * (jnp.mean(f, axis=1) - ctr), axis=1) < 0.0)[:, None], -n, n)
     acc = jnp.zeros_like(pts)
     for a in range(facet_ids.shape[1]):

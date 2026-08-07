@@ -797,3 +797,39 @@ def test_the_march_is_differentiable_in_the_initial_mesh():
 
     fd = (bumped(h) - bumped(-h)) / (2 * h)
     assert float(g[j]) == pytest.approx(fd, rel=5e-2), f"AD {float(g[j]):.6e} vs FD {fd:.6e}"
+
+
+def test_the_traced_normals_agree_with_the_domain_s_own():
+    """The normals recomputed for a moving tag must equal the ones the domain reports for it.
+
+    Two representations of one quantity, so they can drift — and they did: the orientation test compares
+    ``n . (facet_centre - centroid)``, which on a FLAT tag is zero to round-off (measured 1.1e-16) and
+    carries no sign information. Built with a padded ``jnp.unique(..., size=)`` centroid it went further
+    and flipped every normal: a Stefan front's top edge came back with ny = -1 throughout, i.e. inward.
+
+    That went unnoticed because a Stefan law reads ``(grad(T).n) * ny`` — n appears twice, so the flip
+    cancels exactly. Any law LINEAR in the normal would have been silently negated.
+
+    Honest limitation: this checks the invariant (the two routes agree), but it does not reproduce the
+    flip — the minimal configurations tried here orient correctly either way. The flip was observed, and
+    the fix verified, on the Stefan setup in the scratchpad."""
+    from jno.utils.solver.fem_adapt import _tag_facet_vertex_ids, _vertex_normals_jax
+
+    # This exact aspect ratio / resolution is what exposed it (a tall narrow strip, 6 front
+    # vertices): the padded-unique centroid lands far enough off the edge to flip the sign.
+    H = 0.620063
+    d = jno.Shape.rect(0.0, 0.0, 0.35, H, size=0.07).domain(time=(0.0, 0.2, 5))
+    d.tag("top", lambda x, n, names: x[:, 1] > H - 1e-6)
+    d.tag("bottom", lambda x, n, names: x[:, 1] < 1e-6)
+    d.variable("top", normals=True, split=True)
+    d.variable("bottom", normals=True, split=True)
+    pts = jnp.asarray(np.asarray(d.mesh.points)[:, :2])
+
+    for tag, expect in (("top", +1.0), ("bottom", -1.0)):
+        facets = _tag_facet_vertex_ids(d, tag, 2)
+        ids = np.unique(np.asarray(facets).reshape(-1))
+        assert ids.size >= 3, f"{tag}: only {ids.size} facet vertices — the check would be vacuous"
+        got = np.asarray(_vertex_normals_jax(pts, facets, 2))
+        assert np.allclose(got[ids, 1], expect, atol=1e-5), f"{tag}: ny should be {expect}, got {got[ids, 1]}"
+        # and it must agree with the host normals the same tag reports elsewhere
+        assert np.allclose(np.asarray(d.normals_by_tag[tag])[:, 1], expect, atol=1e-5)
