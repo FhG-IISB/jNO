@@ -2470,6 +2470,7 @@ def _geometry_velocity_fn(spec: dict, dom: Any):
     import functools
 
     import equinox as eqx
+    import jax
     import jax.numpy as jnp
     from scipy.spatial import cKDTree
 
@@ -2517,6 +2518,31 @@ def _geometry_velocity_fn(spec: dict, dom: Any):
     # host sync and pinned the law to the SEED state on the SEED mesh.
     frozen_ids = [getattr(f, "frozen_id", None) for f in (spec.get("frozen") or [])]
 
+    # A parameter written INTO the law (`yb.d(tb) - v0*yb`) is what makes the interface law itself a
+    # design variable. It reaches the compiled expression through `models`, which is an ARGUMENT of
+    # `raw_fn`, so substituting a traced value there keeps `d/d(v0)` connected. Without this the
+    # parameter is not merely non-differentiable but INERT: a geometry term is pulled out before the
+    # weak-form assembly, so it never reaches the block's `runtime_parameter_exprs`, and the march ran
+    # with the parameter's seed (measured: no motion at all, and no error).
+    from .parametric_helpers import _collect_runtime_parameter_exprs
+
+    _law_nodes: dict = {}
+    for _e in (spec["expr0"], spec["expr1"]):
+        _collect_runtime_parameter_exprs(_e, _law_nodes)
+    law_param_lids = {nm: int(node.model.layer_id) for nm, node in _law_nodes.items()}
+
+    def _with_value(model, value):
+        """Replace a parameter model's single array leaf with ``value`` (traced or concrete)."""
+        arrs, static = eqx.partition(model, eqx.is_inexact_array)
+        leaves, treedef = jax.tree_util.tree_flatten(arrs)
+        if len(leaves) != 1:
+            raise NotImplementedError(
+                f"jno.fem: a geometry-term parameter must be a plain `jno.np.parameter`; this one carries "
+                f"{len(leaves)} array leaves, so its value cannot be substituted unambiguously."
+            )
+        new = jax.tree_util.tree_unflatten(treedef, [jnp.asarray(value, dtype=leaves[0].dtype).reshape(leaves[0].shape)])
+        return eqx.combine(new, static)
+
     def _write(entry, values):
         """Broadcast an (N, D) spatial array into a context entry's (..., N, D) layout.
 
@@ -2526,7 +2552,11 @@ def _geometry_velocity_fn(spec: dict, dom: Any):
         e = jnp.asarray(entry)
         return jnp.broadcast_to(values.reshape((1,) * (e.ndim - 2) + values.shape), e.shape)
 
-    def velocity(pts, state=None):
+    def velocity(pts, state=None, params=None):
+        mdl = models
+        for _nm, _lid in law_param_lids.items():
+            if params is not None and _nm in params:
+                mdl = {**mdl, _lid: _with_value(mdl[_lid], params[_nm])}
         ctx = dict(base_ctx)
         ctx[tag] = _write(base_ctx[tag], pts[sample_vid])
         if facet_ids is not None:
@@ -2539,10 +2569,11 @@ def _geometry_velocity_fn(spec: dict, dom: Any):
                 )
             ctx["__mesh_points__"] = pts
             ctx["__frozen_values__"] = {fid: jnp.asarray(state).reshape(-1) for fid in frozen_ids}
-        r0 = jnp.asarray(fn0(models, ctx, batchsize=None, key=None)).reshape(-1)
-        r1 = jnp.asarray(fn1(models, ctx, batchsize=None, key=None)).reshape(-1)
+        r0 = jnp.asarray(fn0(mdl, ctx, batchsize=None, key=None)).reshape(-1)
+        r1 = jnp.asarray(fn1(mdl, ctx, batchsize=None, key=None)).reshape(-1)
         return (-r0 / (r1 - r0))[perm]
 
+    velocity.law_params = frozenset(law_param_lids)  # names the driver must accept from `fem.solve(...)`
     return velocity
 
 
@@ -2736,18 +2767,17 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, save_ts: Any = None, **kw
     # mesh-motion axes -- so a moving-mesh solve used each parameter's SEED value and reported no error,
     # and any gradient with respect to one was identically zero. An unknown name raises rather than being
     # swallowed, matching what the ordinary (non-motion) transient path does.
-    _param_names = set(getattr(block, "runtime_parameter_exprs", None) or {}) - set(_axis_names)
-    _unknown = set(kwargs) - _param_names
-    if _unknown:
-        raise TypeError(
-            f"jno.fem: fem.solve() got unexpected keyword argument(s) {sorted(_unknown)!r} for a moving-mesh "
-            f"problem. Runtime parameters on this problem: {sorted(_param_names)!r}."
-        )
-    _user_args = {k: jnp.asarray(v) for k, v in kwargs.items()}
+    # A parameter can live in the WEAK FORM (reaches the assembly through `args`) or in a GEOMETRY TERM
+    # (reaches the velocity through its compiled expression's `models`), and the two take different
+    # routes. Both are validated together and split below, once the velocity functions exist; the names
+    # are disjoint sets, so a parameter used in both places is delivered to both.
+    _step_params = set(getattr(block, "runtime_parameter_exprs", None) or {}) - set(_axis_names)
+    _user_args: dict = {}
+    _law_args: dict = {}
 
     def _coord_args(pts_now):
         """The moved vertices, in the layout `_apply_coord_params` scatters from (one per axis), plus any
-        runtime parameter values the caller supplied."""
+        weak-form parameter values the caller supplied."""
         out = {nm: jnp.asarray(pts_now[_coord_ids, ax]) for ax, nm in enumerate(_axis_names)}
         out.update(_user_args)
         return out
@@ -2848,6 +2878,17 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, save_ts: Any = None, **kw
     specs = _geometry_motion_specs(cur, d)
     vel_fns = [_geometry_velocity_fn(sp, d) for sp in specs]
 
+    _law_params = set().union(*(getattr(vf, "law_params", frozenset()) for vf in vel_fns)) if vel_fns else set()
+    _accepted = _step_params | _law_params
+    _unknown = set(kwargs) - _accepted
+    if _unknown:
+        raise TypeError(
+            f"jno.fem: fem.solve() got unexpected keyword argument(s) {sorted(_unknown)!r} for a moving-mesh "
+            f"problem. Runtime parameters on this problem: {sorted(_accepted)!r}."
+        )
+    _user_args.update({k: jnp.asarray(v) for k, v in kwargs.items() if k in _step_params})
+    _law_args.update({k: jnp.asarray(v) for k, v in kwargs.items() if k in _law_params})
+
     disp_rows, disp_cols, named_np = [], [], np.zeros(n_verts, dtype=bool)
     written = np.zeros((n_verts, dim), dtype=bool)
     for sp in specs:
@@ -2889,7 +2930,7 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, save_ts: Any = None, **kw
         #    and a moving interior region lets the mesh around it accommodate).
         disp = jnp.zeros((n_verts, dim), dtype=X_c.dtype)
         for rows, col, vf in zip(disp_rows, disp_cols, vel_fns):
-            disp = disp.at[rows, col].set(jnp.asarray(vf(X_c, u_c), dtype=X_c.dtype) * dt)
+            disp = disp.at[rows, col].set(jnp.asarray(vf(X_c, u_c, _law_args), dtype=X_c.dtype) * dt)
         X_n = X_c + _harmonic_extension_jax(X_c, shared_cells, dim, disp, named_j)
 
         # A tangled step cannot `raise` from inside a trace, so it is carried out and raised after the

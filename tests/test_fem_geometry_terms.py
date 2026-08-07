@@ -672,3 +672,58 @@ def test_the_interface_position_is_differentiable_in_the_pde_coefficient():
     assert abs(g) > 1e-6, "∂(mesh)/∂κ vanished — the geometry chain is not connected"
     fd = (float(objective(k0 + h)) - float(objective(k0 - h))) / (2 * h)
     assert g == pytest.approx(fd, rel=5e-2), f"AD {g:.6e} vs FD {fd:.6e}"
+
+
+# ── the interface law itself as a design variable ────────────────────────────────────────────────────
+
+
+def _law_param_fem(size=0.3, steps=4):
+    """``yb.d(tb) - v0*yb`` with the law's rate as an ordinary runtime parameter."""
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain(time=(0.0, 0.2, steps + 1))
+    u, v = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, tb = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi)
+    v0 = jno.np.parameter((1,), name="v0")
+    return jno.fem(
+        [
+            ui.t * vi + 0.05 * (ui.x * vi.x + ui.y * vi.y),
+            u(xb, yb) - 0.0,
+            u(ci[0], ci[1]) - 1.0,
+            yb.d(tb) - v0 * yb,
+        ]
+    )
+
+
+@pytest.mark.parametrize("v0", [0.0, 0.5, 1.0])
+def test_a_parameter_in_the_law_actually_sets_the_motion(v0):
+    """A parameter written into a geometry term must drive the march.
+
+    It was INERT, and silently: a geometry term is pulled out before the weak-form assembly, so its
+    parameter never reached the block's ``runtime_parameter_exprs`` and the march ran at the parameter's
+    seed — measured, no motion at all and no error. ``dy/dt = v0*y`` under forward Euler gives exactly
+    ``(1 + v0*dt)^n``, so the check is against the analytic stepper, not a fixture."""
+    ymax = float(jnp.max(jnp.asarray(_law_param_fem().solve(v0=v0).meshes[-1][0])[:, 1]))
+    assert ymax == pytest.approx((1.0 + v0 * 0.05) ** 4, rel=1e-5)
+
+
+def test_the_interface_law_is_differentiable_in_its_own_parameter():
+    """``∂(final mesh)/∂(law parameter)`` — the law is a design variable, which is the point of writing it
+    in the term list rather than as a callback. Rebuilt per evaluation because ``solve()`` leaves the
+    domain on the moved mesh."""
+
+    def objective(p):
+        return jnp.sum(jnp.asarray(_law_param_fem().solve(v0=p).meshes[-1][0])[:, 1] ** 2)
+
+    p0, h = 0.5, 1e-3
+    g = float(jax.grad(objective)(p0))
+    assert abs(g) > 1e-6, "∂(mesh)/∂(law parameter) vanished — the parameter never reached the velocity"
+    fd = (float(objective(p0 + h)) - float(objective(p0 - h))) / (2 * h)
+    assert g == pytest.approx(fd, rel=1e-3), f"AD {g:.6e} vs FD {fd:.6e}"
+
+
+def test_an_unknown_kwarg_still_raises_when_the_law_has_a_parameter():
+    """The accepted set is the union of weak-form and law parameters — not a licence to accept anything."""
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        _law_param_fem().solve(v0=0.5, nope=1.0)
