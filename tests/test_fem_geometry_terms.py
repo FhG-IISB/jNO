@@ -357,6 +357,111 @@ def test_the_solution_matches_a_fixed_mesh_when_the_mesh_does_not_move():
     )
 
 
+# ── the state transfer: conservative L2 projection ───────────────────────────────────────────────────
+
+
+def _bump_march(n_steps, v=0.5, size=0.1):
+    """A Gaussian bump on a mesh translating rigidly in y, with kappa ~ 0 and NO Dirichlet BC. The exact
+    answer is 'the field never changes at a fixed spatial point', so any change is pure transfer error."""
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain(time=(0.0, 0.2, n_steps + 1))
+    u, vv = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    _xb, yb, tb = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), vv.bind(x=xi, y=yi)
+    bump = jno.np.exp(-40.0 * ((ci[0] - 0.5) ** 2 + (ci[1] - 0.5) ** 2))
+    fem = jno.fem([ui.t * vi + 1e-12 * (ui.x * vi.x + ui.y * vi.y), u(ci[0], ci[1]) - bump, yb.d(tb) - v])
+    return fem.solve()
+
+
+def test_the_transfer_does_not_get_worse_as_the_step_shrinks():
+    """The property the pointwise re-interpolation did not have.
+
+    It was applied once per step, so its error ACCUMULATED: the same total displacement cost -27.6 % of
+    the peak over 2 steps and -33.0 % over 16, i.e. refining ``dt`` made the answer worse — the opposite
+    of what a first-order scheme should do. The conservative L2 projection reverses the trend (-11.5 % ->
+    -9.1 %). Asserted as a trend, not a threshold, because the absolute loss is dominated by how well the
+    bump is resolved at this ``h``."""
+    peaks = {n: float(np.asarray(_bump_march(n).states[-1]).max()) for n in (2, 16)}
+    assert peaks[16] >= peaks[2] - 1e-9, (
+        f"refining dt made the transfer worse: peak {peaks[2]:.5f} at 2 steps vs {peaks[16]:.5f} at 16"
+    )
+
+
+def test_a_still_mesh_transfers_the_field_untouched():
+    """Zero velocity must be a bit-for-bit identity, at every frame. With the meshes equal the projection
+    is ``M u_new = M u_old``, so anything but equality means the load vector and the mass disagree."""
+    traj = _bump_march(8, v=0.0)
+    first = np.asarray(traj.states[0])
+    for k, s in enumerate(traj.states):
+        assert np.asarray(s) == pytest.approx(first, rel=1e-9, abs=1e-12), f"frame {k} drifted on a still mesh"
+
+
+def test_the_transfer_conserves_the_integral_better_than_pointwise_sampling():
+    """``int u`` over a domain that cannot change (interior vertices jittered, boundary held).
+
+    The projection conserves whatever its load vector integrated — ``sum_i phi_i = 1`` — so the residual is
+    quadrature error on an integrand with kinks, not a lost invariant. Measured ~2e-4 relative against the
+    pointwise route's 3e-3 to 9e-3, i.e. more than an order of magnitude. Compared against the route it
+    replaced rather than against zero, since exact conservation needs a supermesh."""
+    from jno.utils.solver.fem_adapt import (
+        _l2_transfer_jax,
+        _locate_in_one_ring_jax,
+        _mesh_boundary_facets,
+        _one_ring_cells,
+        _simplex_measure_divisor,
+    )
+
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.08).domain()
+    P = jnp.asarray(np.asarray(d.mesh.points)[:, :2])
+    C = np.asarray(d.mesh.cells_dict["triangle"]).astype(np.int64)
+    n = P.shape[0]
+    xy = np.asarray(P)
+    u = jnp.asarray(np.exp(-40.0 * ((xy[:, 0] - 0.5) ** 2 + (xy[:, 1] - 0.5) ** 2)))
+
+    on_b = np.zeros(n, dtype=bool)
+    on_b[np.unique(np.asarray(_mesh_boundary_facets(d)[1]).reshape(-1))] = True
+    disp = np.zeros((n, 2))
+    disp[~on_b] = np.random.default_rng(0).normal(0.0, 0.012, ((~on_b).sum(), 2))
+    Xn = P + jnp.asarray(disp)
+
+    def integral(vals, pts):
+        v = np.asarray(pts)[C]
+        meas = np.abs(np.linalg.det(v[:, 1:, :] - v[:, :1, :])) / _simplex_measure_divisor(2)
+        return float(np.sum(meas * np.asarray(vals)[C].mean(axis=1)))
+
+    i0 = integral(u, P)
+    l2, esc = _l2_transfer_jax(P, Xn, C, 2, u, [0, n])
+    assert not bool(jnp.any(esc)), "an interior jitter should never leave its own cell patch"
+
+    cand, cmask = _one_ring_cells(C, n)
+    idx, w, _e = _locate_in_one_ring_jax(P, C, cand, cmask, Xn)
+    pw = jnp.einsum("qk,qk->q", jnp.asarray(w, dtype=u.dtype), u[idx])
+
+    d_l2 = abs(integral(l2, Xn) - i0) / i0
+    d_pw = abs(integral(pw, Xn) - i0) / i0
+    assert d_l2 < d_pw / 5.0, f"L2 drift {d_l2:.2e} is not clearly better than pointwise {d_pw:.2e}"
+    assert d_l2 < 5e-3, f"L2 drift {d_l2:.2e} is larger than the quadrature error should allow"
+
+
+def test_the_transfer_between_identical_meshes_is_the_identity():
+    """The sharp self-test for the projection machinery: with ``X_new == X_old`` the system is
+    ``M u_new = M u_old``, so a mismatch between how the load vector and the mass are assembled — a
+    transposed element Jacobian, a mis-ordered quadrature gather — shows up immediately. It did: the first
+    version contracted the Jacobian on the wrong axis and returned an error of 5.4e-01 here."""
+    from jno.utils.solver.fem_adapt import _l2_transfer_jax
+
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.2).domain()
+    P = jnp.asarray(np.asarray(d.mesh.points)[:, :2])
+    C = np.asarray(d.mesh.cells_dict["triangle"]).astype(np.int64)
+    xy = np.asarray(P)
+    u = jnp.asarray(np.sin(3.0 * xy[:, 0]) + xy[:, 1])
+
+    out, esc = _l2_transfer_jax(P, P, C, 2, u, [0, P.shape[0]])
+    assert not bool(jnp.any(esc)), "a zero displacement cannot escape its own cell"
+    assert np.asarray(out) == pytest.approx(np.asarray(u), rel=1e-9, abs=1e-10)
+
+
 def test_the_march_can_be_run_twice():
     """Solving twice must work, and continue from where the first march left the mesh.
 

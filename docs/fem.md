@@ -512,6 +512,59 @@ control is under-relaxation — `relax_step=0.02` recovers quality to 0.318 and 
 
 ---
 
+## A moving mesh is a term
+
+A moving mesh is not a solve argument. Put `coord.d(t) - velocity` in the `jno.fem([...])` list — a residual
+like any other equation — and the mesh moves as it says:
+
+```python
+jax.config.update("jax_enable_x64", True)          # required; see the scope list below
+
+xb, yb, tb = domain.variable("boundary", split=True)
+fem = jno.fem([ui.t * vi + kappa * (ui.x * vi.x + ui.y * vi.y),   # the physics
+               u(xb, yb) - 0.0, u(ci[0], ci[1]) - 1.0,
+               yb.d(tb) - 0.5 * yb])                              # dy/dt = y/2 — the mesh
+traj = fem.solve()                                                # one frame per moved mesh
+```
+
+It is recognised **structurally**, by containing `d(spatial coordinate)/d(temporal variable)`, so there is no
+new spelling: `Variable.d` and the term list already exist. Nothing about it is boundary-specific — an
+interior region, a boundary and a `where=` predicate all resolve the same way — and tagging is **per-axis**,
+so a term on `yb` alone moves the y column and holds x exactly. The velocity is ordinary traced math, so an
+interface law may read the solved field (a Stefan front `-(k/L)·∇T·n`), the coordinates, the outward normals,
+the time, or a `jno.np.parameter` that then becomes a design variable. The march is differentiable in all of
+them, and in where the mesh started.
+
+Each step: evaluate every geometry term's velocity, scatter it into the vertices and axes those terms name,
+extend harmonically over everything they do not, move, re-assemble on the moved vertices, and carry the state
+across.
+
+**Scope** — the rest raises rather than guessing:
+
+* **Operator-split ALE, explicit in the velocity**, hence first order in the step. The term list *reads* like
+  a coupled equation and this is not one: an implicit mesh would need the coordinates as unknowns in the
+  monolithic system and the ALE convective term.
+* **The state transfer is a conservative L2 projection** onto the moved mesh, and it is still diffusive. On a
+  rigid translation carrying a marginally-resolved bump the peak falls ~9 % (the pointwise re-interpolation
+  this replaced fell ~33 %, and got *worse* as `dt` shrank). Conservation is algebraic — `Σφ = 1` — so the
+  residual is quadrature error on an integrand with kinks: ~2e-4 relative against the pointwise route's
+  3e-3 to 9e-3. Removing the diffusion entirely means not transferring at all (Lagrangian DOFs plus an ALE
+  `-w·∇u` term), which is a different semidiscretisation.
+* **Requires `jax_enable_x64`.** The transfer locates quadrature points in the previous mesh, and in float32
+  that carries ~4e-4 — enough for a mesh that never moves to drift 1.5e-3 over a march (2.6e-10 with x64).
+* **Backward Euler only**: `θ` comes from the block, and `time=jno.solve.theta(...)` is a solver slot, which
+  a geometry term does not compose with.
+* **Connectivity-preserving**: a move that would invert an element raises. Remesh-on-tangle is the next
+  extension.
+* A Dirichlet BC on the moving surface must be tied to a whole-boundary or held tag, not to a spatial
+  sub-predicate — a predicate does not follow the motion.
+* **Scalar-P1 field(s), real, non-periodic**, 2D or 3D. Several *coupled* scalar fields work, and so does a
+  **nonlinear** problem. Vector, higher-order, complex, periodic, a custom `solve_fn` and `save_ts=` each
+  raise. The assembly itself is already order-agnostic in the mesh coordinates (a P2 transient carries an
+  exact `d/dX`); what pins the P1 wall is the driver's vertex-based transfer.
+
+---
+
 ## Per-region (sub-domain) integration
 
 A weak term integrates over the **region of the coordinates it is written on** — exactly the rule that
