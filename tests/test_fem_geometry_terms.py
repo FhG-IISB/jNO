@@ -1072,3 +1072,139 @@ def test_the_normals_are_outward_on_a_CONCAVE_boundary():
     )
     rh_h, _rn_h = radial(np.asarray(d.mesh.points)[hid])
     assert np.allclose(np.sum(traced[hid] * rh_h, axis=1), -1.0, atol=1e-5), "traced normals point into the solid"
+
+
+# ── the generality matrix: what already works, and where the walls are ───────────────────────────────
+
+
+def test_a_geometry_term_marches_in_3D():
+    """Nothing in the driver is 2-D, and nothing tested it: every other motion test is a unit square.
+    A box driven on z must translate by exactly ``v*T``, since a uniform boundary velocity is a rigid
+    translation the harmonic extension reproduces exactly."""
+    d = jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=0.45).domain(time=(0.0, 0.2, 4))
+    u, v = d.fem_symbols()
+    xi, yi, zi, ti = d.variable("interior", split=True)
+    xb, yb, zb, tb = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, z=zi, t=ti), v.bind(x=xi, y=yi, z=zi)
+    fem = jno.fem(
+        [
+            ui.t * vi + 0.05 * (ui.x * vi.x + ui.y * vi.y + ui.z * vi.z),
+            u(xb, yb, zb) - 0.0,
+            u(ci[0], ci[1], ci[2]) - 1.0,
+            zb.d(tb) - 0.1,
+        ]
+    )
+    traj = fem.solve()
+    p0, p1 = np.asarray(traj.meshes[0][0]), np.asarray(traj.meshes[-1][0])
+    assert p1.shape == p0.shape and p1.shape[1] == 3
+    assert np.allclose(p1[:, 2] - p0[:, 2], 0.1 * 0.2, atol=1e-9), "z did not translate as prescribed"
+    assert np.allclose(p1[:, :2], p0[:, :2], atol=1e-9), "x/y moved, but only z was given a velocity"
+    assert np.isfinite(np.asarray(traj.states[-1])).all()
+
+
+def test_a_geometry_term_marches_a_NONLINEAR_transient():
+    """A state-dependent coefficient puts the block on its Newton branch, which the motion driver never
+    exercised. It works — and the solution must genuinely respond to the moved mesh, so this compares a
+    moving march against a still one rather than only asserting finiteness."""
+
+    def run(vel):
+        d = _dom(size=0.4)
+        u, v = d.fem_symbols()
+        xi, yi, ti = d.variable("interior", split=True)
+        xb, yb, tb = d.variable("boundary", split=True)
+        ci = d.variable("initial", split=True)
+        ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi)
+        fem = jno.fem(
+            [
+                ui.t * vi + 0.05 * (1.0 + ui**2) * (ui.x * vi.x + ui.y * vi.y),
+                u(xb, yb) - 0.0,
+                u(ci[0], ci[1]) - 1.0,
+                yb.d(tb) - vel,
+            ]
+        )
+        traj = fem.solve()
+        return np.asarray(traj.states[-1]), np.asarray(traj.meshes[-1][0])
+
+    moving, Xm = run(1.0)
+    still, Xs = run(0.0)
+    assert np.isfinite(moving).all(), "a nonlinear moving-mesh march is not finite"
+    assert np.abs(Xm - Xs).max() > 0.1, "the mesh did not move"
+    assert np.abs(moving - still).max() > 1e-6, "the nonlinear solve ignored the moved mesh"
+
+
+def test_a_geometry_term_marches_COUPLED_scalar_fields():
+    """The DOF guard allows N scalar-P1 fields, and the transfer loops over the blocks. Untested until
+    now; a coupled pair is what a Stefan problem with a solute field looks like."""
+    d = _dom(size=0.4)
+    a, qa = d.fem_symbols(names=("a", "qa"))
+    b, qb = d.fem_symbols(names=("b", "qb"))
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, tb = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ai, bi = a.bind(x=xi, y=yi, t=ti), b.bind(x=xi, y=yi, t=ti)
+    vai, vbi = qa.bind(x=xi, y=yi), qb.bind(x=xi, y=yi)
+    fem = jno.fem(
+        [
+            ai.t * vai + 0.05 * (ai.x * vai.x + ai.y * vai.y) - bi * vai,
+            bi.t * vbi + 0.05 * (bi.x * vbi.x + bi.y * vbi.y),
+            a(xb, yb) - 0.0,
+            b(xb, yb) - 0.0,
+            a(ci[0], ci[1]) - 1.0,
+            b(ci[0], ci[1]) - 0.5,
+            yb.d(tb) - 0.1,
+        ]
+    )
+    traj = fem.solve()
+    n_verts = len(np.asarray(traj.meshes[0][0]))
+    final = np.asarray(traj.states[-1])
+    assert final.shape == (2 * n_verts,), f"expected two scalar blocks, got {final.shape}"
+    assert np.isfinite(final).all()
+    # the two fields must stay distinct -- a shared block would make them identical
+    assert np.abs(final[:n_verts] - final[n_verts:]).max() > 1e-6
+
+
+@pytest.mark.parametrize(
+    "kind, order, shape",
+    [("higher-order (P2)", 2, ()), ("vector", 1, (2,))],
+)
+def test_the_scalar_P1_wall_fails_loud(kind, order, shape):
+    """P2 and vector are not supported, and must say so rather than mis-slice the state blocks. Pinned
+    here so the wall is documented where it is enforced; delete these when the transfer becomes
+    basis-aware (the assembly already is — a trainable mesh coordinate carries an exact gradient at P2)."""
+    d = _dom(size=0.4)
+    u, v = d.fem_symbols(order=order, value_shape=shape)
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, tb = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi)
+    if shape:
+        terms = [
+            jno.np.inner(ui.t, vi)
+            + 0.05 * jno.np.inner(jno.np.symgrad(ui, [xi, yi]), jno.np.symgrad(vi, [xi, yi]), n_contract=2),
+            u(xb, yb)[0] - 0.0,
+            u(xb, yb)[1] - 0.0,
+            u(ci[0], ci[1])[0] - 1.0,
+            u(ci[0], ci[1])[1] - 1.0,
+        ]
+    else:
+        terms = [ui.t * vi + 0.05 * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - 1.0]
+    fem = jno.fem([*terms, yb.d(tb) - 0.1])
+    with pytest.raises(NotImplementedError, match="scalar-P1"):
+        fem.solve()
+
+
+def test_mesh_motion_requires_x64():
+    """The transfer locates quadrature points in the previous mesh — interior points, where the
+    barycentric solve is far weaker than at a vertex. Measured in float32: located weights off by 3.9e-04,
+    and a mesh that never moves drifting 1.5e-03 from the fixed-mesh march (2.6e-10 under x64). Refuse
+    rather than return that quietly."""
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", False)
+    try:
+        d = _dom(size=0.4)
+        fem = _heat(d, yb_of(d).d(tb_of(d)) - 0.1)
+        with pytest.raises(NotImplementedError, match="jax_enable_x64"):
+            fem.solve()
+    finally:
+        jax.config.update("jax_enable_x64", prev)
