@@ -968,6 +968,18 @@ def _signed_simplex_measures(points: np.ndarray, cells: np.ndarray, dim: int) ->
     return np.linalg.det(edge) / _simplex_measure_divisor(dim)
 
 
+def _signed_simplex_measures_jax(points, cells, dim: int):
+    """:func:`_signed_simplex_measures` for traced points -- the tangle test inside a scanned march.
+
+    Same quantity by the same formula; only the sign is read, so a cell that inverts flips it. Separate
+    from the host version because that one is a plain NumPy path used by eager callers, and one
+    implementation cannot be both."""
+    import jax.numpy as jnp
+
+    v = points[jnp.asarray(cells)]
+    return jnp.linalg.det(v[:, 1:, :] - v[:, :1, :]) / _simplex_measure_divisor(dim)
+
+
 def _mesh_boundary_facets(domain: Any) -> tuple[np.ndarray, np.ndarray, int]:
     """Return ``(cells, boundary_facets, dim)`` -- the interior simplices, their topological boundary
     facets (edges in 2D / triangles in 3D), and the dimension."""
@@ -2820,91 +2832,130 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, save_ts: Any = None, **kw
     # of identical data -- ~240 MB for 100k cells over 100 steps, for nothing. Points genuinely differ per
     # frame and are still copied.
     shared_cells = np.asarray(d.mesh.cells_dict[key]).astype(np.int64)
+    _pts0 = np.asarray(d.mesh.points)[:, :dim].astype(np.float64)
 
-    def _snapshot():
-        return (np.asarray(d.mesh.points)[:, :dim].astype(np.float64), shared_cells)
+    # ── everything below here is hoisted: it depends on CONNECTIVITY and tag membership, never on where
+    # the vertices currently are, so it is resolved once and rides the scan as a constant.
+    #
+    # Region membership is FROZEN at t0. That is required for static shapes, and it is also the fix for a
+    # defect the per-step re-resolution carried: a `where=` region re-resolved on the MOVED points leaves
+    # its own predicate as soon as it succeeds in moving, so its vertices silently drop into the harmonic
+    # extension and the harder it is driven the less it moves. The driven set is a MATERIAL set -- the
+    # Lagrangian convention every ALE code uses. Freezing alone used not to be enough (the velocity was
+    # evaluated against the tag's re-sampled points, a different point set from the frozen vertices, so
+    # the alignment then failed); that is resolved because the velocity now reads the positions it is
+    # handed rather than the tag's context. The two had to land together, and do.
+    specs = _geometry_motion_specs(cur, d)
+    vel_fns = [_geometry_velocity_fn(sp, d) for sp in specs]
 
-    cur_mesh = _snapshot()
-    times, states, meshes = [float(ts[0])], [state], [cur_mesh]
-    history: list[dict] = []
+    disp_rows, disp_cols, named_np = [], [], np.zeros(n_verts, dtype=bool)
+    written = np.zeros((n_verts, dim), dtype=bool)
+    for sp in specs:
+        # Two terms naming the same vertex AND the same axis state two velocities for one degree of
+        # freedom. Regions may overlap (a corner belongs to both edges), so this is easy to write by
+        # accident -- and scattering in list order would just let the last one win. Index-only, so it is
+        # decided here rather than per step.
+        clash = written[sp["ids"], sp["axis"]]
+        if clash.any():
+            raise ValueError(
+                f"jno.fem: two geometry terms both prescribe axis {sp['axis']} of "
+                f"{int(clash.sum())} vertex/vertices (region {sp['coord'].tag!r} overlaps an earlier "
+                "term). One coordinate can have only one velocity — narrow the regions so they do not "
+                "overlap on that axis."
+            )
+        written[sp["ids"], sp["axis"]] = True
+        disp_rows.append(jnp.asarray(np.asarray(sp["ids"], dtype=np.int64)))
+        disp_cols.append(int(sp["axis"]))
+        # A vertex named on ANY axis is Dirichlet data for the extension, with its untagged columns held
+        # at zero -- per-axis tagging is literal, so an untagged column does not drift.
+        named_np[sp["ids"]] = True
+    named_j = jnp.asarray(named_np)
 
-    for i in range(n_steps):
-        t0c, t1c = float(ts[i]), float(ts[i + 1])
-        old_pts, old_cells = cur_mesh
+    cells_j = jnp.asarray(shared_cells)
+    ring_cand, ring_mask = _one_ring_cells(shared_cells, n_verts)
+    # Only an INTERIOR vertex escaping its one-ring is a fault: a boundary vertex moving outward genuinely
+    # leaves the old mesh, which the kd-tree route clamps too (measured: its escape count is exactly the
+    # kd-tree's outside-the-mesh count). Boundary-ness is connectivity, so it is hoisted.
+    _bfac = _mesh_boundary_facets(d)[1]
+    _on_bnd = np.zeros(n_verts, dtype=bool)
+    _on_bnd[np.unique(np.asarray(_bfac).reshape(-1))] = True
+    interior_j = jnp.asarray(~_on_bnd)
+    sgn0 = jnp.sign(_signed_simplex_measures_jax(jnp.asarray(_pts0), cells_j, dim))
 
+    def _march_step(carry, t0c):
+        u_c, X_c, bad = carry
         # 1) MOVE: each geometry term drives its own vertices along its own axis; everything the terms do
         #    not name relaxes harmonically around them (so a moving boundary drags the interior smoothly,
         #    and a moving interior region lets the mesh around it accommodate).
-        #
-        # KNOWN DEFECT: membership is re-resolved here, on the MOVED points. A `where=` region that
-        # succeeds in moving therefore leaves its own predicate and silently stops being driven -- its
-        # vertices drop into the harmonic extension with no error, so the harder it is driven the less it
-        # moves. The fix is to freeze membership at t0 (the driven set is a material set, which is the
-        # Lagrangian convention every ALE code uses), but freezing alone is not enough: the velocity is
-        # evaluated against the tag's re-sampled points, which after the move are a *different* point set
-        # from the frozen vertices, so the position-alignment below then fails to match. Both have to move
-        # together -- the velocity must become a function of explicit arrays rather than of the tag's
-        # context. Tracked with that work; re-resolving is the behaviour that at least stays consistent
-        # with the alignment until then.
-        specs = _geometry_motion_specs(cur, d)
-        disp = np.zeros((old_pts.shape[0], dim), dtype=np.float64)
-        named = np.zeros(old_pts.shape[0], dtype=bool)
-        written = np.zeros((old_pts.shape[0], dim), dtype=bool)
-        for sp in specs:
-            v = _geometry_velocity(sp, d, state)
-            # Two terms naming the same vertex AND the same axis state two velocities for one degree of
-            # freedom. Regions are allowed to overlap (a corner belongs to both edges), so this is easy to
-            # write by accident -- and scattering in list order would just let the last one win.
-            clash = written[sp["ids"], sp["axis"]]
-            if clash.any():
-                raise ValueError(
-                    f"jno.fem: two geometry terms both prescribe axis {sp['axis']} of "
-                    f"{int(clash.sum())} vertex/vertices (region {sp['coord'].tag!r} overlaps an earlier "
-                    "term). One coordinate can have only one velocity — narrow the regions so they do not "
-                    "overlap on that axis."
-                )
-            written[sp["ids"], sp["axis"]] = True
-            disp[sp["ids"], sp["axis"]] = v * (t1c - t0c)
-            # A vertex named on ANY axis is Dirichlet data for the extension, with its untagged columns held
-            # at zero -- per-axis tagging is literal, so an untagged column does not drift.
-            named[sp["ids"]] = True
-        move_mesh(d, harmonic_extension(d, disp, prescribed=named), copy=False)  # fail loud on tangle
+        disp = jnp.zeros((n_verts, dim), dtype=X_c.dtype)
+        for rows, col, vf in zip(disp_rows, disp_cols, vel_fns):
+            disp = disp.at[rows, col].set(jnp.asarray(vf(X_c, u_c), dtype=X_c.dtype) * dt)
+        X_n = X_c + _harmonic_extension_jax(X_c, shared_cells, dim, disp, named_j)
 
-        # 2) re-tag (held boundaries re-derive on the moved facets), RE-SAMPLE the tags the geometry terms
-        #    read, and re-assemble on the moved mesh. The re-sample is load-bearing: a tag's coordinates are
-        #    cached in `domain.context`, and `move_mesh` moves `domain.mesh.points` without touching it — so
-        #    a velocity like `0.5*yb` would keep reading the ORIGINAL y forever and the boundary would drift
-        #    at a constant rate instead of growing (measured: exp growth flattened to a single Euler step).
-        for _name, _pred in list(getattr(d, "_tag_predicates", {}).items()):
+        # A tangled step cannot `raise` from inside a trace, so it is carried out and raised after the
+        # march -- the failure stays loud, the trace stays valid.
+        tangled = jnp.any(jnp.sign(_signed_simplex_measures_jax(X_n, cells_j, dim)) != sgn0)
+
+        # 2) carry the state onto the moved vertices (re-interpolate -> transports the field under the
+        #    motion; this IS the ALE convective term, treated semi-Lagrangian)
+        idx, w, esc = _locate_in_one_ring_jax(X_c, shared_cells, ring_cand, ring_mask, X_n)
+        w = jnp.asarray(w, dtype=u_c.real.dtype)
+        u_t = jnp.concatenate([jnp.einsum("qk,qk->q", w, u_c[off[_f] : off[_f + 1]][idx]) for _f in range(n_fields)])
+
+        # 3) step on the moved mesh. The operator and the mass are re-formed from the moved vertices HERE,
+        #    inside the step, through `args` -- `_apply_coord_params` scatters them into the P1 geometry
+        #    before the element Jacobian, so J, detJ, JxW, physical gradients and the facet normals follow.
+        u_n = block.step(u_t, t0c.astype(u_c.dtype), dt, args=_coord_args(X_n), theta=theta, linear_solve=_step_solve)
+        bad = (bad[0] | tangled, bad[1] | jnp.any(esc & interior_j))
+        return (u_n, X_n, bad), (u_n, X_n)
+
+    (_u_f, _X_f, (tangled_any, escaped_any)), (u_hist, X_hist) = jax.lax.scan(
+        _march_step, (state, jnp.asarray(_pts0), (jnp.array(False), jnp.array(False))), jnp.asarray(ts[:-1])
+    )
+
+    if bool(tangled_any):
+        raise ValueError(
+            "jno.fem: the mesh motion inverts or collapses an element (the mesh would tangle). Take a "
+            "smaller time step, or drive the motion through a region whose harmonic extension can "
+            "accommodate it."
+        )
+    if bool(escaped_any):
+        raise ValueError(
+            "jno.fem: a step moved an interior vertex further than its own element, so the state transfer "
+            "could not locate it and would have silently clamped it to the nearest simplex. Take a smaller "
+            "time step, or refine the mesh where the motion is fastest."
+        )
+
+    times = [float(t) for t in ts]
+    states = [state] + [u_hist[i] for i in range(n_steps)]
+    meshes = [(jnp.asarray(_pts0), shared_cells)] + [(X_hist[i], shared_cells) for i in range(n_steps)]
+    history = [{"t": float(ts[i + 1]), "n_dofs": int(n_verts)} for i in range(n_steps)]
+
+    # Leave the domain on the final moved mesh, as the eager driver did -- callers inspect `fem.points`
+    # after a solve. Host state, so it can only take a concrete value: inside `jax.grad` the final
+    # positions are a tracer and the domain simply stays where it was, which is right (a differentiated
+    # solve should not mutate the caller's mesh as a side effect).
+    try:
+        _final_pts = np.asarray(_X_f)
+    except Exception:  # noqa: BLE001 -- a tracer: differentiating through the march, nothing to write back
+        _final_pts = None
+    if _final_pts is not None:
+        move_mesh(d, _final_pts - _pts0, copy=False, check=False)
+        # Re-tag and re-sample so the domain is left SELF-CONSISTENT: `move_mesh` moves
+        # `domain.mesh.points` without touching the cached tag pools / contexts, and a second `solve()`
+        # on the same domain resolves its sample<->vertex alignment against both. Stale pools made that
+        # second solve fail the alignment check by exactly the distance the mesh had moved. The eager
+        # driver paid this every step to keep the velocity current; the march no longer needs it (the
+        # velocity reads the positions it is handed), so it is paid ONCE, at the end.
+        _preds = getattr(d, "_tag_predicates", None) or {}
+        for _name, _pred in _preds.items() if hasattr(_preds, "items") else []:
             d.tag(_name, _pred)
         for _tag in {sp["coord"].tag for sp in specs}:
             try:
                 d.variable(_tag, normals=True, split=True)  # keep the normals a Stefan-type law reads
-            except Exception:
+            except Exception:  # noqa: BLE001 -- an interior region has no normals; its coordinates suffice
                 d.variable(_tag, split=True)
-        new_mesh = _snapshot()
-        new_pts, _new_cells = new_mesh
-
-        # 3) carry the state onto the moved vertices (re-interpolate -> transports the field under the motion)
-        idx, w, _inside = _locate_barycentric(old_pts, old_cells, new_pts, tol=1e-9, k=32)
-        wj, ij = jnp.asarray(w, dtype=state.real.dtype), jnp.asarray(idx)
-        state = jnp.concatenate([jnp.einsum("qk,qk->q", wj, state[off[_f] : off[_f + 1]][ij]) for _f in range(n_fields)])
-
-        # 4) step on the moved mesh (the ordinary differentiable θ-stepper). The operator and the mass are
-        #    re-formed from the moved vertices HERE, inside the step, by handing them through `args` --
-        #    `_apply_coord_params` scatters them into the P1 geometry before the element Jacobian, so J,
-        #    detJ, JxW, physical gradients and the facet normals all follow. That replaces a full
-        #    `jno.fem(cons, **kw)` rebuild per step, which was 40% of the driver and ~500 ms flat (it is
-        #    Python re-tracing, not mesh work). Measured against the rebuild it replaces: 2733x at 74
-        #    vertices, 625x at 640, 44x at 4669.
-        state = _jstep(state, jnp.asarray(t0c, dtype=state.dtype), _coord_args(new_pts))
-        cur_mesh = new_mesh
-        times.append(float(ts[i + 1]))
-        states.append(state)
-        meshes.append(cur_mesh)
-        history.append({"t": float(ts[i + 1]), "n_dofs": int(new_pts.shape[0])})
-
-    fem.__dict__.update(cur.__dict__)  # rebind to the final moved mesh
+    fem.__dict__.update(cur.__dict__)
     fem.adapt_history = history
     return AdaptiveTrajectory(np.asarray(times), states, meshes)
 

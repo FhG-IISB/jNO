@@ -611,3 +611,64 @@ def test_the_transfer_is_differentiable_in_the_vertex_positions():
 
     g = jax.grad(transferred)(jnp.asarray(pts))
     assert bool(jnp.isfinite(g).all()) and float(jnp.linalg.norm(g)) > 1e-8
+
+
+# ── the geometry chain: the mesh trajectory itself carries a gradient ────────────────────────────────
+
+
+def _stefan(size=0.25, steps=5):
+    """A state-reading law, so the interface position depends on the PDE coefficient."""
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain(time=(0.0, 0.2, steps + 1))
+    u, v = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, tb, nx, ny = d.variable("boundary", normals=True, split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi)
+    tf = u.bind(x=xb, y=yb).freeze(np.zeros(len(d.mesh.points)))
+    kap = jno.np.parameter((1,), name="kap")
+    return jno.fem(
+        [
+            ui.t * vi + kap * (ui.x * vi.x + ui.y * vi.y),
+            u(xb, yb) - 0.0,
+            u(ci[0], ci[1]) - 1.0,
+            yb.d(tb) - 0.4 * (tf.x * nx + tf.y * ny) * ny,
+        ]
+    )
+
+
+def test_the_mesh_trajectory_is_a_traced_array_not_host_numpy():
+    """The frames must come back on the device, or nothing downstream can differentiate through them.
+
+    This is the whole difference the scan buys: the eager driver returned `np.ndarray` meshes, which made
+    the mesh a CONSTANT to autodiff no matter what was differentiated."""
+    d = _dom()
+    _xb, yb, tb = d.variable("boundary", split=True)
+    traj = _heat(d, yb.d(tb) - 0.5 * yb).solve()
+    assert isinstance(traj.meshes[-1][0], jnp.ndarray), (
+        f"mesh frame is {type(traj.meshes[-1][0]).__name__} — the geometry chain is broken"
+    )
+    assert len(traj.meshes) == len(traj.states) == len(traj.times)
+
+
+def test_the_interface_position_is_differentiable_in_the_pde_coefficient():
+    """``∂(final mesh)/∂κ`` — the gradient that did not exist before the scan.
+
+    The chain is κ → field → Stefan velocity → mesh motion → final vertex positions, so it exercises the
+    whole geometry path. A SMOOTH functional of the mesh is used deliberately: ``max`` has a switching
+    argmax, and central differences across the switch are meaningless (measured: it reports the wrong
+    sign). Small h for the same reason — the transfer's simplex choice is piecewise constant, so a wide
+    stencil can straddle a kink.
+
+    The problem is rebuilt inside the objective on purpose: ``solve()`` leaves the domain on the *moved*
+    mesh (see ``test_the_march_can_be_run_twice``), so reusing one ``fem`` would start each finite-
+    difference evaluation from the previous one's final geometry. Measured, that alone turns FD from
+    5.20 into 1.8e+03."""
+
+    def objective(k):
+        return jnp.sum(jnp.asarray(_stefan().solve(kap=k).meshes[-1][0])[:, 1] ** 2)
+
+    k0, h = 0.05, 5e-4
+    g = float(jax.grad(objective)(k0))
+    assert abs(g) > 1e-6, "∂(mesh)/∂κ vanished — the geometry chain is not connected"
+    fd = (float(objective(k0 + h)) - float(objective(k0 - h))) / (2 * h)
+    assert g == pytest.approx(fd, rel=5e-2), f"AD {g:.6e} vs FD {fd:.6e}"
