@@ -2513,9 +2513,27 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, save_ts: Any = None, **kw
     block = cur._op
     state = jnp.asarray(block.state0).reshape(-1)
 
+    # Runtime parameter VALUES (a coefficient, a neural field) travel with the coordinates. Without this
+    # they were accepted by `**kwargs` and silently discarded: the block exposes them in
+    # `runtime_parameter_exprs` and the assembly reads them from `args`, but `args` only ever held the
+    # mesh-motion axes -- so a moving-mesh solve used each parameter's SEED value and reported no error,
+    # and any gradient with respect to one was identically zero. An unknown name raises rather than being
+    # swallowed, matching what the ordinary (non-motion) transient path does.
+    _param_names = set(getattr(block, "runtime_parameter_exprs", None) or {}) - set(_axis_names)
+    _unknown = set(kwargs) - _param_names
+    if _unknown:
+        raise TypeError(
+            f"jno.fem: fem.solve() got unexpected keyword argument(s) {sorted(_unknown)!r} for a moving-mesh "
+            f"problem. Runtime parameters on this problem: {sorted(_param_names)!r}."
+        )
+    _user_args = {k: jnp.asarray(v) for k, v in kwargs.items()}
+
     def _coord_args(pts_now):
-        """The moved vertices, in the layout `_apply_coord_params` scatters from (one per axis)."""
-        return {nm: jnp.asarray(pts_now[_coord_ids, a]) for a, nm in enumerate(_axis_names)}
+        """The moved vertices, in the layout `_apply_coord_params` scatters from (one per axis), plus any
+        runtime parameter values the caller supplied."""
+        out = {nm: jnp.asarray(pts_now[_coord_ids, ax]) for ax, nm in enumerate(_axis_names)}
+        out.update(_user_args)
+        return out
 
     def _step_solve(step_op, rhs, u0, diag_fn):
         """The θ-step solve for this march, GMRES rather than the block's default BiCGStab.

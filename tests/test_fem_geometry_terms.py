@@ -15,6 +15,8 @@ not, and that nothing about it is boundary-specific — an interior region, a bo
 predicate all resolve the same way, per axis.
 """
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -114,6 +116,14 @@ def test_the_rest_of_the_problem_is_unaffected():
     assert moving._mode == plain._mode == "transient"
     assert moving.dofs == plain.dofs, "a geometry term must not add or consume an FE unknown"
     assert len(moving._geometry) == 1 and len(plain._geometry) == 0
+
+
+def yb_of(d):
+    return d.variable("boundary", split=True)[1]
+
+
+def tb_of(d):
+    return d.variable("boundary", split=True)[2]
 
 
 # ── the motion driver ────────────────────────────────────────────────────────────────────────────────
@@ -355,3 +365,62 @@ def test_the_march_can_be_run_twice():
 
     assert np.allclose(y1 - y0, V * T, atol=1e-9), "the first march did not move by velocity x horizon"
     assert np.allclose(y2 - y1, V * T, atol=1e-9), "the second march did not apply the same increment from the moved mesh"
+
+
+# ── differentiability: r-adaptivity moves nodes at fixed connectivity, so gradients must flow ────────
+
+
+def _heat_kappa(d, *geometry):
+    """The same heat problem, but with the diffusivity as a runtime parameter."""
+    u, v = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _tb = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi)
+    kap = jno.np.parameter((1,), name="kap")
+    return jno.fem([ui.t * vi + kap * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - 1.0, *geometry])
+
+
+def test_a_runtime_parameter_reaches_the_moving_mesh_march():
+    """A parameter's VALUE must reach the assembly, not just its seed.
+
+    ``**kwargs`` was accepted by the driver and dropped on the floor: the block exposes the parameter in
+    ``runtime_parameter_exprs`` and the assembly reads it from ``args``, but ``args`` only ever carried the
+    mesh-motion axes. A moving-mesh solve therefore used the seed value and said nothing — the silent-wrong
+    -answer shape, not a missing feature."""
+    d = _dom()
+    fem = _heat_kappa(d, yb_of(d).d(tb_of(d)) - 0.5)
+    hot = np.asarray(fem.solve(kap=2.0).states[-1])
+    cold = np.asarray(fem.solve(kap=0.01).states[-1])
+    assert np.all(np.isfinite(hot)) and np.all(np.isfinite(cold))
+    assert np.abs(hot - cold).max() > 1e-4, (
+        f"kappa never reached the assembly: kap=2.0 and kap=0.01 agree to {np.abs(hot - cold).max():.2e}"
+    )
+
+
+def test_an_unknown_solve_kwarg_raises_rather_than_being_swallowed():
+    """The ordinary transient path raises on an unknown kwarg; the motion driver used to accept anything."""
+    d = _dom()
+    fem = _heat_kappa(d, yb_of(d).d(tb_of(d)) - 0.5)
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        fem.solve(not_a_parameter=1.0)
+
+
+def test_the_field_gradient_flows_through_a_moving_mesh():
+    """``d(field)/d(kappa)`` through the march, against central differences.
+
+    r-adaptivity moves nodes at FIXED connectivity, so the march is smooth in its parameters and this
+    gradient has to exist. Asserted non-zero as well as correct — a silently vanishing gradient passes any
+    relative-error check on its own."""
+    d = _dom()
+    fem = _heat_kappa(d, yb_of(d).d(tb_of(d)) - 0.5)
+
+    def loss(k):
+        return jnp.sum(jnp.asarray(fem.solve(kap=k).states[-1]) ** 2)
+
+    k0 = 0.05
+    g = float(jax.grad(loss)(k0))
+    assert abs(g) > 1e-8, "d(field)/d(kappa) vanished — the parameter never reached the assembly"
+    h = 1e-3
+    fd = (float(loss(k0 + h)) - float(loss(k0 - h))) / (2 * h)
+    assert g == pytest.approx(fd, rel=2e-2), f"AD {g:.6e} vs FD {fd:.6e}"
