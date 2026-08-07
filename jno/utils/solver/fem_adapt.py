@@ -2742,16 +2742,20 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, save_ts: Any = None, **kw
     # `_step_solve` now avoids. With that fixed, forcing the state-reading case down this route reproduces
     # the rebuild route exactly (final ymax 0.9902 either way), so the split bought nothing and is gone.
     _axis_names = [f"__meshmotion_x{a}__" for a in range(dim)]
-    # Only a coordinate the USER tagged is a conflict. The driver's own registration from an earlier
-    # `solve()` on the same domain is not -- it is dropped and re-made below, so a second solve behaves
-    # like the first. Without this distinction the driver is not idempotent: solving twice raised.
-    if [sp for sp in (getattr(d, "_trainable_coords", None) or []) if sp["name"] not in _axis_names]:
-        raise NotImplementedError(
-            "jno.fem: a geometry term does not compose with a hand-tagged `.trainable()` coordinate yet — "
-            "the mesh-motion driver registers the whole mesh as a coordinate parameter to avoid "
-            "re-assembling every step, and two specs writing the same axis would silently let one win. "
-            "Drop the `.trainable()` tag, or drop the geometry term."
-        )
+    # A coordinate the USER tagged `.trainable()` is where the mesh STARTS; the driver's own registration
+    # is where the mesh IS at each step. Different roles, so they compose -- this used to raise, on the
+    # reading that "two specs writing the same axis would silently let one win". They cannot: the user's
+    # tag seeds the scan's initial carry and is never put in `args`, while the driver's axis params carry
+    # the evolving positions and are supplied every step from that carry. Together they complete the
+    # coordinate table -- free AND determined = the march moves it, from a design-variable start.
+    #
+    # The driver's own registration from an earlier `solve()` on the same domain is neither: it is dropped
+    # and re-made below, so a second solve behaves like the first (without that distinction, solving twice
+    # raised).
+    _init_coords = [sp for sp in (getattr(d, "_trainable_coords", None) or []) if sp["name"] not in _axis_names]
+    _init_specs = [
+        {"ids": np.asarray(sp["ids"], dtype=int), "axis": int(sp["axis"]), "name": str(sp["name"])} for sp in _init_coords
+    ]
     d._trainable_coords = []  # re-registered from the CURRENT mesh just below
     _all_parts = d.variable("__meshmotion_all__", where=lambda *c: np.ones_like(np.asarray(c[0]), dtype=bool), split=True)
     for _a, _nm in enumerate(_axis_names):
@@ -2879,7 +2883,8 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, save_ts: Any = None, **kw
     vel_fns = [_geometry_velocity_fn(sp, d) for sp in specs]
 
     _law_params = set().union(*(getattr(vf, "law_params", frozenset()) for vf in vel_fns)) if vel_fns else set()
-    _accepted = _step_params | _law_params
+    _init_params = {sp["name"] for sp in _init_specs}
+    _accepted = _step_params | _law_params | _init_params
     _unknown = set(kwargs) - _accepted
     if _unknown:
         raise TypeError(
@@ -2888,6 +2893,15 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, save_ts: Any = None, **kw
         )
     _user_args.update({k: jnp.asarray(v) for k, v in kwargs.items() if k in _step_params})
     _law_args.update({k: jnp.asarray(v) for k, v in kwargs.items() if k in _law_params})
+
+    # The starting geometry. A `.trainable()` coordinate the caller supplied a value for is scattered into
+    # the seed positions, so `d(anything)/d(X0)` flows through the whole march; unsupplied, it is simply
+    # the mesh as meshed. This is the ONLY place a user coordinate tag enters -- deliberately not `args`,
+    # where it would race the driver's per-step axis parameters.
+    X0 = jnp.asarray(_pts0)
+    for sp in _init_specs:
+        if sp["name"] in kwargs:
+            X0 = X0.at[jnp.asarray(sp["ids"]), sp["axis"]].set(jnp.asarray(kwargs[sp["name"]]).reshape(-1))
 
     disp_rows, disp_cols, named_np = [], [], np.zeros(n_verts, dtype=bool)
     written = np.zeros((n_verts, dim), dtype=bool)
@@ -2921,7 +2935,7 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, save_ts: Any = None, **kw
     _on_bnd = np.zeros(n_verts, dtype=bool)
     _on_bnd[np.unique(np.asarray(_bfac).reshape(-1))] = True
     interior_j = jnp.asarray(~_on_bnd)
-    sgn0 = jnp.sign(_signed_simplex_measures_jax(jnp.asarray(_pts0), cells_j, dim))
+    sgn0 = jnp.sign(_signed_simplex_measures_jax(X0, cells_j, dim))  # orientation baseline is the START, not the seed mesh
 
     def _march_step(carry, t0c):
         u_c, X_c, bad = carry
@@ -2951,7 +2965,7 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, save_ts: Any = None, **kw
         return (u_n, X_n, bad), (u_n, X_n)
 
     (_u_f, _X_f, (tangled_any, escaped_any)), (u_hist, X_hist) = jax.lax.scan(
-        _march_step, (state, jnp.asarray(_pts0), (jnp.array(False), jnp.array(False))), jnp.asarray(ts[:-1])
+        _march_step, (state, X0, (jnp.array(False), jnp.array(False))), jnp.asarray(ts[:-1])
     )
 
     if bool(tangled_any):
@@ -2969,7 +2983,7 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, save_ts: Any = None, **kw
 
     times = [float(t) for t in ts]
     states = [state] + [u_hist[i] for i in range(n_steps)]
-    meshes = [(jnp.asarray(_pts0), shared_cells)] + [(X_hist[i], shared_cells) for i in range(n_steps)]
+    meshes = [(X0, shared_cells)] + [(X_hist[i], shared_cells) for i in range(n_steps)]
     history = [{"t": float(ts[i + 1]), "n_dofs": int(n_verts)} for i in range(n_steps)]
 
     # Leave the domain on the final moved mesh, as the eager driver did -- callers inspect `fem.points`

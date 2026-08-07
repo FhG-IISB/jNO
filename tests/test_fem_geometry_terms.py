@@ -2,13 +2,15 @@
 
 A coordinate is one of exactly three things, and each is an existing spelling — no new method:
 
-===============  ==========================  ==========================================
-a coordinate is  you write                   who moves it
-===============  ==========================  ==========================================
-fixed            nothing                     nobody
-free             ``coord.trainable()``       an optimiser, or ``jno.solve.relocate()``
-determined       ``coord.d(t) - v`` (a term) the march
-===============  ==========================  ==========================================
+=================  ==========================  ==========================================
+a coordinate is    you write                   who moves it
+=================  ==========================  ==========================================
+fixed              nothing                     nobody
+free               ``coord.trainable()``       an optimiser, or ``jno.solve.relocate()``
+determined         ``coord.d(t) - v`` (a term) the march
+free *and*         both                        the march, from a design-variable start
+determined
+=================  ==========================  ==========================================
 
 These cases pin down the **classification**: which residuals are geometry terms, which are emphatically
 not, and that nothing about it is boundary-specific — an interior region, a boundary and a ``where=``
@@ -727,3 +729,71 @@ def test_an_unknown_kwarg_still_raises_when_the_law_has_a_parameter():
     """The accepted set is the union of weak-form and law parameters — not a licence to accept anything."""
     with pytest.raises(TypeError, match="unexpected keyword argument"):
         _law_param_fem().solve(v0=0.5, nope=1.0)
+
+
+# ── where the mesh STARTS as a design variable ───────────────────────────────────────────────────────
+
+
+def _init_mesh_fem(size=0.3, steps=4):
+    """A moving-mesh problem whose interior region's y-coordinates are a `.trainable()` design variable.
+
+    Completes the coordinate table: the region is FREE (its start is a design variable) and the boundary
+    is DETERMINED (the march moves it). Those two used to be mutually exclusive."""
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain(time=(0.0, 0.2, steps + 1))
+    u, v = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, tb = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi)
+    ym = d.variable("mov", where=lambda x, y: (x > 0.2) & (x < 0.8) & (y > 0.2) & (y < 0.8), split=True)[1]
+    ym.trainable(name="Y0")
+    ids = np.asarray(d._trainable_coords[0]["ids"], dtype=int)
+    fem = jno.fem(
+        [
+            ui.t * vi + 0.05 * (ui.x * vi.x + ui.y * vi.y),
+            u(xb, yb) - 0.0,
+            u(ci[0], ci[1]) - 1.0,
+            yb.d(tb) - 0.5 * yb,
+        ]
+    )
+    return fem, np.asarray(d.mesh.points)[ids, 1], ids
+
+
+def test_a_trainable_coordinate_composes_with_a_geometry_term():
+    """`.trainable()` and `coord.d(t) - v` used to be mutually exclusive — the driver raised outright.
+
+    They are different roles: the tag says where the mesh STARTS, the term says where it GOES. The tag
+    seeds the march's initial geometry and is never put in `args`, so it cannot race the driver's own
+    per-step axis parameters."""
+    fem, y0, ids = _init_mesh_fem()
+    moved = np.asarray(y0) + 0.05
+    traj = fem.solve(Y0=moved)
+    assert np.asarray(traj.meshes[0][0])[ids, 1] == pytest.approx(moved, abs=1e-6), (
+        "the supplied starting coordinates did not become the march's first frame"
+    )
+    assert np.all(np.isfinite(np.asarray(traj.states[-1])))
+
+
+def test_the_march_is_differentiable_in_the_initial_mesh():
+    """``∂(field)/∂X₀`` — the last of the three target gradients.
+
+    It flows through every downstream step: the harmonic extension, the state transfer's simplex
+    selection and each θ-step. Rebuilt per evaluation because ``solve()`` leaves the domain moved."""
+
+    def objective(Y):
+        fem, _y0, _ids = _init_mesh_fem()
+        return jnp.sum(jnp.asarray(fem.solve(Y0=Y).states[-1]) ** 2)
+
+    _fem, y0, _ids = _init_mesh_fem()
+    g = jax.grad(objective)(jnp.asarray(y0))
+    assert bool(jnp.isfinite(g).all()), "∂/∂X₀ is not finite"
+    assert float(jnp.linalg.norm(g)) > 1e-6, "∂/∂X₀ vanished — the initial mesh never reached the march"
+
+    j = int(np.argmax(np.abs(np.asarray(g))))
+    h = 1e-3
+
+    def bumped(dv):
+        return float(objective(jnp.asarray(y0).at[j].add(dv)))
+
+    fd = (bumped(h) - bumped(-h)) / (2 * h)
+    assert float(g[j]) == pytest.approx(fd, rel=5e-2), f"AD {float(g[j]):.6e} vs FD {fd:.6e}"
