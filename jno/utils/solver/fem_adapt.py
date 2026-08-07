@@ -2420,6 +2420,39 @@ def _geometry_motion_specs(fem: Any, dom: Any) -> list[dict]:
     return specs
 
 
+def _tags_read(expr) -> list:
+    """Every region tag the expression reads, in first-seen order.
+
+    The mesh-motion driver rewrites a context entry per tag it hands to the compiled velocity, and it has
+    to rewrite **all** of them: everything left at its seed value is frozen for the whole march. A law
+    reading a second region's coordinates was silently stale -- with two tags over the identical vertex
+    set and ``dy/dt = y``, reading its own tag compounded to 1.46410 while reading the twin returned
+    1.40000, exactly the frozen-seed answer, with no error.
+
+    Walks with :func:`jno.trace._iter_placeholder_children`, the single traversal shape the other trace
+    walks use (:func:`mesh_velocity`, :func:`frozen_fields_in`)."""
+    from ...trace import Placeholder, Variable, _iter_placeholder_children
+
+    node = expr._expr if hasattr(expr, "_expr") else expr
+    seen: set = set()
+    tags: list = []
+
+    def visit(n):
+        if not isinstance(n, Placeholder) or id(n) in seen:
+            return
+        seen.add(id(n))
+        if isinstance(n, Variable):
+            t = getattr(n, "tag", None)
+            if isinstance(t, str) and t not in tags:
+                tags.append(t)
+        for kind, _attr, val in _iter_placeholder_children(n):
+            for c in val if kind == "list" else (val,):
+                visit(c)
+
+    visit(node)
+    return tags
+
+
 def _tag_facet_vertex_ids(dom: Any, tag: str, dim: int) -> np.ndarray:
     """The tag's boundary facets as MESH-VERTEX INDICES ``(E, dim)``.
 
@@ -2437,32 +2470,74 @@ def _tag_facet_vertex_ids(dom: Any, tag: str, dim: int) -> np.ndarray:
     return np.asarray(tree.query(ents.reshape(-1, dim))[1]).reshape(ents.shape[0], ents.shape[1]).astype(np.int64)
 
 
-def _vertex_normals_jax(pts, facet_ids, dim: int):
+def _facet_outward_sign(dom: Any, facet_ids: np.ndarray, dim: int) -> np.ndarray:
+    """``(E,)`` of ±1 fixing the outward orientation of each tag facet, from the mesh **topology**.
+
+    Delegates to :func:`jno.utils.solver.fem_facets.compute_face_normals`, which orients each boundary
+    facet *away from its parent cell's opposite vertex*. That is exact for any topology; the mesh-centroid
+    rule this replaces is only exact for a star-shaped domain, and on an annulus it gave the inner hole a
+    normal pointing into the solid (``n·r̂`` = +1 where outward-from-material is -1). The old test did not
+    see it because it asserted *agreement* with ``domain.normals_by_tag`` -- and both carried the same
+    wrong convention, which is exactly how a shared representation hides a defect.
+
+    The sign is resolved once on the seed mesh and then frozen, exactly as ``assemble_fem_native`` freezes
+    it for :func:`~jno.utils.solver.fem_native._face_normals_jax`: it is locally constant, flipping only
+    at element inversion, which the march's tangle check already rejects."""
+    from .fem_facets import build_facet_connectivity, compute_face_normals
+
+    facet_ids = np.asarray(facet_ids, dtype=np.int64)
+    if facet_ids.size == 0:
+        return np.zeros((0,), dtype=float)
+    cell_type = "triangle" if dim == 2 else "tetrahedron"
+    cells, _ = _mesh_cells(dom)
+    conn = build_facet_connectivity(cells, cell_type)
+    good = compute_face_normals(np.asarray(dom.mesh.points), conn, cells, cell_type)
+
+    # Match each tag facet to its global boundary facet by its (order-independent) vertex set. Sorted
+    # rows viewed as single records give a lexicographic key, so this is one searchsorted rather than a
+    # dict lookup per facet -- 29 ms at 2340 facets and growing, on a library whose cost is its build.
+    def _rowkey(a):
+        a = np.ascontiguousarray(np.sort(np.asarray(a, dtype=np.int64), axis=1))
+        return a.view([("", a.dtype)] * a.shape[1]).ravel()
+
+    gkey, tkey = _rowkey(conn.face_nodes), _rowkey(facet_ids)
+    order = np.argsort(gkey, kind="stable")
+    pos = np.searchsorted(gkey[order], tkey)
+    ok = pos < gkey.size
+    j = order[np.clip(pos, 0, max(gkey.size - 1, 0))]
+    ok &= gkey[j] == tkey
+    if not ok.all():
+        raise ValueError(
+            f"jno.fem: a moving region names {int((~ok).sum())} facet(s) that are not boundary facets of "
+            "the mesh. An interior facet has no outward normal -- tag the region on the boundary."
+        )
+
+    v = np.asarray(dom.mesh.points)[facet_ids, :dim]  # (E, k, dim)
+    if dim == 2:
+        t = v[:, 1] - v[:, 0]
+        raw = np.stack([t[:, 1], -t[:, 0]], axis=1)
+    else:
+        raw = np.cross(v[:, 1] - v[:, 0], v[:, 2] - v[:, 0])
+    return np.where(np.einsum("ij,ij->i", raw, good[j]) >= 0.0, 1.0, -1.0)
+
+
+def _vertex_normals_jax(pts, facet_ids, dim: int, sign):
     """Per-vertex outward unit normals from moved vertex positions -- pure JAX, differentiable in ``pts``.
 
-    Reproduces :func:`jno.domain.domain_class._facet_normals` + the per-point averaging at
-    ``domain_class.py:1441-1449`` (facet normal, oriented away from the boundary centroid, accumulated at
-    each of its vertices, then normalised) so a moving surface's normals follow it. The host version keys
-    the accumulation on rounded coordinates; with the incidence resolved to indices this is a scatter-add,
-    which is what makes it traceable."""
+    The facet normals come from :func:`~jno.utils.solver.fem_native._face_normals_jax` -- the one traced
+    normal builder in the library, already used by the native surface assembly -- with the frozen outward
+    ``sign`` from :func:`_facet_outward_sign`. Only the per-vertex averaging is here: accumulate each
+    facet's normal at its vertices and renormalise, mirroring ``domain_class.py:1450-1458``. With the
+    incidence resolved to indices that averaging is a scatter-add, which is what makes it traceable.
+
+    This used to carry its own facet-normal geometry *and* its own orientation rule, i.e. a second copy of
+    a quantity the library already computes. That is the shape this codebase's normal bugs keep taking, so
+    there is now one producer and this is a consumer of it."""
     import jax.numpy as jnp
 
-    f = pts[facet_ids]  # (E, k, dim)
-    if dim == 2:
-        t = f[:, 1] - f[:, 0]
-        n = jnp.stack([t[:, 1], -t[:, 0]], axis=1)
-    else:
-        n = jnp.cross(f[:, 1] - f[:, 0], f[:, 2] - f[:, 0])
-    n = n / (jnp.linalg.norm(n, axis=1, keepdims=True) + 1e-30)
-    # Orient outward against the WHOLE MESH's centroid, not the tag's own. Two reasons, both measured:
-    # a tag covering one flat edge has its centroid ON that edge, so `n . (facet_centre - centroid)` is
-    # 0 to round-off (1.1e-16) and the sign test carries no information; and the previous
-    # `jnp.unique(..., size=facet_ids.size)` PADS (10 slots for 6 unique vertices), which dragged the
-    # centroid off the edge and flipped every normal. A flat top edge came out with ny = -1 throughout.
-    # The mesh centroid is well conditioned for a boundary sub-region and matches the intent of
-    # `_facet_normals` ("away from the material").
-    ctr = jnp.mean(pts, axis=0)
-    n = jnp.where((jnp.sum(n * (jnp.mean(f, axis=1) - ctr), axis=1) < 0.0)[:, None], -n, n)
+    from .fem_native import _face_normals_jax
+
+    n = _face_normals_jax(pts, facet_ids, jnp.asarray(sign, dtype=pts.dtype))
     acc = jnp.zeros_like(pts)
     for a in range(facet_ids.shape[1]):
         acc = acc.at[facet_ids[:, a]].add(n)
@@ -2470,8 +2545,8 @@ def _vertex_normals_jax(pts, facet_ids, dim: int):
 
 
 def _geometry_velocity_fn(spec: dict, dom: Any):
-    """Build ``velocity(pts) -> (n_ids,)`` for one geometry term: a **traced, differentiable** function of
-    the vertex positions, evaluated in the spec's own ``ids`` order.
+    """Build ``velocity(pts, state, params, t) -> (n_ids,)`` for one geometry term: a **traced,
+    differentiable** function of the vertex positions, evaluated in the spec's own ``ids`` order.
 
     This is what lets the march be scanned. :func:`Crux.eval` compiles each expression to
     ``raw_fn(models, ctx, ...)`` where ``ctx`` is a pytree of **arrays** (``jno/core.py:5016-5029``), so
@@ -2510,16 +2585,55 @@ def _geometry_velocity_fn(spec: dict, dom: Any):
 
     fn0, fn1 = _compile(spec["expr0"]), _compile(spec["expr1"])
 
-    # The tag's sample points, and how they relate to mesh vertices. A tag is sampled as (B, T, N, D) on a
-    # transient domain; the samples are a spatial snapshot, so one (N, D) slice describes them all.
+    # How EVERY tag the law reads relates to mesh vertices -- not just the driven one. A tag is sampled as
+    # (B, T, N, D) on a transient domain; the samples are a spatial snapshot, so one (N, D) slice describes
+    # them all. Resolved on the SEED mesh and then held fixed, which is the material-set (Lagrangian)
+    # convention a moving driven set needs -- re-deriving it from moved points is what let a `where=`
+    # region drift out of its own tag.
+    verts = np.asarray(dom.mesh.points)[:, :dim]
+    vtree = cKDTree(verts)
+    live_tags: dict = {}  # tag -> {"sample_vid", "nkey", "facet_ids"}
+    for _t in _tags_read(spec["term"]):
+        # `n_<tag>` is that tag's NORMALS, not a point set -- `domain.variable(tag, normals=True)` hands
+        # back normal components carrying it as their own tag. It is refreshed together with its owning
+        # tag below; matching it against vertices would (and did) fail with a gap of exactly 1.0, a unit
+        # normal compared against a coordinate.
+        if _t.startswith("n_") and _t[2:] in base_ctx:
+            continue
+        _e = base_ctx.get(_t)
+        if _e is None:
+            continue  # not a context-backed region (a bare symbol / a parameter tag): nothing to refresh
+        _a = np.asarray(_e)
+        if _a.ndim < 2 or _a.shape[-1] < dim:
+            continue
+        _n = int(_a.shape[-2])
+        _pts = _a.reshape(-1, _a.shape[-1])[:_n, :dim]
+        _gap, _vid = vtree.query(_pts)
+        # A tag whose samples are NOT mesh vertices (a `gauss_*` quadrature pool, a mesh-free resampled
+        # region) cannot be moved with the mesh, so its values would go stale exactly as the second-tag
+        # defect did. Refuse, rather than march on frozen coordinates.
+        _tol = 1e-6 * max(float(np.ptp(_pts)), 1.0) if _pts.size else 1.0
+        if _pts.size and float(np.max(_gap)) > _tol:
+            raise NotImplementedError(
+                f"jno.fem: the geometry term on region {tag!r} reads region {_t!r}, whose sample points are "
+                f"not mesh vertices (worst gap {float(np.max(_gap)):.2e} > {_tol:.1e}) -- a quadrature pool "
+                "or a mesh-free region. The driver cannot move those with the mesh, so the law would read "
+                "the seed positions for the whole march. Write the law in terms of a vertex-backed region."
+            )
+        _nk = f"n_{_t}"
+        _fids = _tag_facet_vertex_ids(dom, _t, dim) if _nk in base_ctx else None
+        live_tags[_t] = {
+            "sample_vid": np.asarray(_vid, dtype=np.int64),
+            "nkey": _nk if _nk in base_ctx else None,
+            "facet_ids": _fids,
+            "sign": None if _fids is None else _facet_outward_sign(dom, _fids, dim),
+        }
+
+    # vertex -> sample, for the spec's DRIVEN ids: which entry of the evaluated residual belongs to which
+    # driven vertex. Position-based, as the boundary readout is.
     ctx_tag = np.asarray(base_ctx[tag])
     n_samp = int(ctx_tag.shape[-2])
     tag_pts = ctx_tag.reshape(-1, ctx_tag.shape[-1])[:n_samp, :dim]
-    verts = np.asarray(dom.mesh.points)[:, :dim]
-    sample_vid = np.asarray(cKDTree(verts).query(tag_pts)[1], dtype=np.int64)  # sample -> vertex
-    # vertex -> sample, for the spec's driven ids. Position-based, as the boundary readout is; resolved on
-    # the SEED mesh and then held fixed, which is the material-set (Lagrangian) convention a moving driven
-    # set needs -- re-deriving it from moved points is what let a `where=` region drift out of its own tag.
     gap, perm = cKDTree(tag_pts).query(verts[np.asarray(spec["ids"], dtype=int)])
     tol = 1e-6 * max(float(np.ptp(tag_pts)), 1.0)
     if float(np.max(gap)) > tol:
@@ -2528,9 +2642,6 @@ def _geometry_velocity_fn(spec: dict, dom: Any):
             f"(worst gap {float(np.max(gap)):.2e} > {tol:.1e}). The velocity cannot be attributed to vertices."
         )
     perm = np.asarray(perm, dtype=np.int64)
-
-    nkey = f"n_{tag}"
-    facet_ids = _tag_facet_vertex_ids(dom, tag, dim) if nkey in base_ctx else None
     # A state-reading interface law (a Stefan front reading the solved field) carries FrozenField nodes.
     # Their nodal values and the mesh they sit on are delivered through the context -- see
     # `trace_evaluator._eval_frozen_field`. Baking them into the graph with `refreeze` is what forced a
@@ -2571,15 +2682,31 @@ def _geometry_velocity_fn(spec: dict, dom: Any):
         e = jnp.asarray(entry)
         return jnp.broadcast_to(values.reshape((1,) * (e.ndim - 2) + values.shape), e.shape)
 
-    def velocity(pts, state=None, params=None):
+    def velocity(pts, state=None, params=None, t=None):
         mdl = models
         for _nm, _lid in law_param_lids.items():
             if params is not None and _nm in params:
                 mdl = {**mdl, _lid: _with_value(mdl[_lid], params[_nm])}
         ctx = dict(base_ctx)
-        ctx[tag] = _write(base_ctx[tag], pts[sample_vid])
-        if facet_ids is not None:
-            ctx[nkey] = _write(base_ctx[nkey], _vertex_normals_jax(pts, facet_ids, dim)[sample_vid])
+        for _t, _lt in live_tags.items():
+            ctx[_t] = _write(base_ctx[_t], pts[_lt["sample_vid"]])
+            if _lt["facet_ids"] is not None:
+                ctx[_lt["nkey"]] = _write(
+                    base_ctx[_lt["nkey"]],
+                    _vertex_normals_jax(pts, _lt["facet_ids"], dim, _lt["sign"])[_lt["sample_vid"]],
+                )
+        if t is not None and "__time__" in base_ctx:
+            # The TIME the velocity is evaluated at. A temporal variable does not live in the tag's own
+            # pool -- the tag entry is (B, T, N, D) with D = dim, purely spatial -- it resolves from the
+            # separate `__time__` context key (``trace_evaluator._eval_variable``, axis == "temporal").
+            # Left at the seed grid, `r.reshape(-1)[perm]` reads the FIRST time slice, so a law with an
+            # explicit `t` marched at t = ts[0] forever: `yb.d(tb) - tb` gave no motion at all, and
+            # `- (1 + tb)` gave 1.40000 where forward Euler is 1.46000. No error either way.
+            #
+            # Every slice is filled with the SAME value rather than the step's sub-grid, which is what
+            # makes the existing `[perm]` gather correct by construction: the mesh has one geometry (and
+            # therefore one velocity) per step, not one per sampled time.
+            ctx["__time__"] = jnp.full_like(jnp.asarray(base_ctx["__time__"]), t)
         if frozen_ids:
             if state is None:
                 raise ValueError(
@@ -2590,6 +2717,8 @@ def _geometry_velocity_fn(spec: dict, dom: Any):
             ctx["__frozen_values__"] = {fid: jnp.asarray(state).reshape(-1) for fid in frozen_ids}
         r0 = jnp.asarray(fn0(mdl, ctx, batchsize=None, key=None)).reshape(-1)
         r1 = jnp.asarray(fn1(mdl, ctx, batchsize=None, key=None)).reshape(-1)
+        # `[perm]` gathers the driven vertices out of the driven tag's FIRST (B, T) slice. With `__time__`
+        # held constant above every slice carries the same value, so which one is read does not matter.
         return (-r0 / (r1 - r0))[perm]
 
     velocity.law_params = frozenset(law_param_lids)  # names the driver must accept from `fem.solve(...)`
@@ -2609,6 +2738,17 @@ def _geometry_velocity(spec: dict, dom: Any, state: Any) -> np.ndarray:
     A frozen field in the term is re-pinned to the live ``state`` first, which is what lets an interface law
     read the solution (a Stefan front ``-(k/L)·∇T·n``). ``substitute`` matches by identity and leaves nodes
     off the replacement path shared, so the derivative node survives that first pass and can still be found.
+
+    **Not used by the march** — :func:`_geometry_velocity_fn` is, because this one goes through
+    ``Crux.eval``, which mutates host state and so cannot run inside a ``lax.scan``. This is kept as the
+    independent *oracle* the traced route is checked against (two evaluators for one expression drift
+    apart silently, so the parity test is what keeps them honest).
+
+    **Oracle scope: time-independent laws only.** It evaluates against the domain's own ``__time__`` grid
+    and takes no ``t``, where the traced route is given the step time. Giving it one would mean a third
+    substitution on top of the frozen-field/derivative pair below, whose ordering is already load-bearing
+    (see :func:`_at`). A law with an explicit ``t`` is checked against its closed-form forward-Euler answer
+    instead, which is a stronger oracle than this one anyway.
     """
     from ...trace import refreeze, substitute
 
@@ -2683,7 +2823,7 @@ def _geometry_velocity(spec: dict, dom: Any, state: Any) -> np.ndarray:
     return v[perm]
 
 
-def run_mesh_motion(fem: Any, *, solve_fn: Any = None, save_ts: Any = None, **kwargs: Any) -> "AdaptiveTrajectory":
+def run_mesh_motion(fem: Any, *, solve_fn: Any = None, **kwargs: Any) -> "AdaptiveTrajectory":
     """March a transient problem whose ``jno.fem([...])`` list contains **geometry terms** — the mesh moves
     as those terms say, the physics marches on the moved mesh, and the state is carried across each move.
 
@@ -2963,7 +3103,10 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, save_ts: Any = None, **kw
         #    and a moving interior region lets the mesh around it accommodate).
         disp = jnp.zeros((n_verts, dim), dtype=X_c.dtype)
         for rows, col, vf in zip(disp_rows, disp_cols, vel_fns):
-            disp = disp.at[rows, col].set(jnp.asarray(vf(X_c, u_c, _law_args), dtype=X_c.dtype) * dt)
+            # `t0c`, not `t0c + dt`: the velocity is EXPLICIT, read at the start of the step. That is the
+            # documented scheme and what `test_prescribed_motion_converges_first_order_to_the_analytic_domain`
+            # pins -- it asserts the march reproduces forward Euler exactly.
+            disp = disp.at[rows, col].set(jnp.asarray(vf(X_c, u_c, _law_args, t0c), dtype=X_c.dtype) * dt)
         X_n = X_c + _harmonic_extension_jax(X_c, shared_cells, dim, disp, named_j)
 
         # A tangled step cannot `raise` from inside a trace, so it is carried out and raised after the

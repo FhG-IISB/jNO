@@ -26,6 +26,19 @@ import jno
 from jno.trace import mesh_velocity
 
 
+@pytest.fixture(autouse=True)
+def _x64():
+    """Mesh motion requires x64 and raises without it (see ``run_mesh_motion``): the transfer locates
+    quadrature points in the previous mesh, which in float32 carries ~4e-4 — enough for a mesh that never
+    moves to drift 1.5e-3 from the fixed-mesh march, against 2.6e-10 here."""
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
+
 def _dom(size=0.3, t=(0.0, 0.2, 5)):
     return jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain(time=t)
 
@@ -406,6 +419,93 @@ def test_an_unknown_solve_kwarg_raises_rather_than_being_swallowed():
     fem = _heat_kappa(d, yb_of(d).d(tb_of(d)) - 0.5)
     with pytest.raises(TypeError, match="unexpected keyword argument"):
         fem.solve(not_a_parameter=1.0)
+
+
+@pytest.mark.parametrize(
+    "law, expected, stale",
+    [
+        # v = 1 + t over [0, 0.4] in 4 steps of 0.1: forward Euler sums dt*(1 + t_n) for t_n = 0, .1, .2, .3
+        ("affine", 1.0 + 0.1 * sum(1.0 + 0.1 * k for k in range(4)), 1.4),
+        # v = t: pure time dependence, so a frozen t gives NO MOTION AT ALL
+        ("pure", 1.0 + 0.1 * sum(0.1 * k for k in range(4)), 1.0),
+    ],
+)
+def test_a_velocity_may_depend_explicitly_on_time(law, expected, stale):
+    """``t`` in a velocity law is the step's time, not the seed grid's first entry.
+
+    A temporal variable does not live in the tag's own pool — that is (B, T, N, D) with D = dim, purely
+    spatial — it resolves from the separate ``__time__`` context key. The march rebuilt the tag entry from
+    the carried positions and left ``__time__`` at the seed grid, so every step evaluated at t = ts[0]:
+    ``yb.d(tb) - tb`` produced no motion whatever, and ``- (1 + tb)`` gave 1.40000 against forward Euler's
+    1.46000. No error either way.
+
+    Checked against the closed form rather than against the eager oracle, which takes no ``t``."""
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain(time=(0.0, 0.4, 5))
+    _xb, yb, tb = d.variable("boundary", split=True)
+    v = (1.0 + tb) if law == "affine" else tb
+    ymax = float(_heat(d, yb.d(tb) - v).solve().meshes[-1][0][:, 1].max())
+
+    assert ymax == pytest.approx(expected, rel=1e-6), f"expected forward Euler {expected:.5f}, got {ymax:.5f}"
+    assert abs(ymax - stale) > 1e-3, f"the velocity still reads t = t0: {ymax:.5f} vs the frozen answer {stale:.5f}"
+
+
+def test_a_velocity_may_read_a_SECOND_regions_coordinates():
+    """The driver refreshes every region the law reads, not only the one it drives.
+
+    ``velocity()`` rebuilt the driven tag's context entry and left the rest of the context on the seed
+    mesh for the whole march. Two tags over the IDENTICAL vertex set make that visible with nothing else
+    changing: reading its own coordinate compounded correctly, reading the twin returned exactly the
+    frozen-seed answer (1.40000 against 1.46410) with no error."""
+
+    def run(read_twin):
+        # A FRESH domain per solve: `solve()` leaves the domain on the final moved mesh, so a second solve
+        # here would re-resolve `y > 1 - 1e-6` against vertices that have already moved past it.
+        d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain(time=(0.0, 0.4, 5))
+        d.tag("top", lambda x, n, names: x[:, 1] > 1.0 - 1e-6)
+        d.tag("twin", lambda x, n, names: x[:, 1] > 1.0 - 1e-6)  # the same vertices, a different name
+        _xt, yt, tt = d.variable("top", split=True)
+        _xw, yw, _tw = d.variable("twin", split=True)
+        return float(_heat(d, yt.d(tt) - (yw if read_twin else yt)).solve().meshes[-1][0][:, 1].max())
+
+    own, other = run(False), run(True)
+
+    assert own == pytest.approx(other, rel=1e-9), (
+        f"reading a second region froze the law at the seed mesh: {other:.5f} vs {own:.5f}"
+    )
+    assert own > 1.0 + 0.4 + 1e-3, f"dy/dt = y must compound; {own:.5f} is the single-Euler-step answer"
+
+
+def test_a_law_reading_a_region_the_driver_cannot_move_fails_loud():
+    """The complement of the fix: a region whose samples are NOT mesh vertices cannot be carried with the
+    mesh, so its values would go stale exactly as the second-tag defect did. Refuse instead."""
+    from jno.utils.solver.fem_adapt import _geometry_motion_specs, _geometry_velocity_fn
+
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain(time=(0.0, 0.2, 5))
+    _xb, yb, tb = d.variable("boundary", split=True)
+    fem = _heat(d, yb.d(tb) - 0.5)
+    spec = _geometry_motion_specs(fem, d)[0]
+
+    # a context entry that exists but whose points are nowhere near a vertex
+    d.context["floaty"] = np.full((7, 2), 50.0)
+    spec["term"] = spec["term"]  # unchanged; patch the walker's answer instead
+    import jno.utils.solver.fem_adapt as fa
+
+    real = fa._tags_read
+    fa._tags_read = lambda _e: ["boundary", "floaty"]
+    try:
+        with pytest.raises(NotImplementedError, match="not mesh vertices"):
+            _geometry_velocity_fn(spec, d)
+    finally:
+        fa._tags_read = real
+
+
+def test_save_ts_is_rejected_rather_than_ignored():
+    """It used to be a named parameter of the driver that was never read, so it both did nothing AND
+    slipped past the unknown-keyword check. A request for 3 frames returned the grid's 4."""
+    d = _dom()
+    fem = _heat(d, yb_of(d).d(tb_of(d)) - 0.1)
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        fem.solve(save_ts=np.array([0.0, 0.1, 0.2]))
 
 
 def test_the_field_gradient_flows_through_a_moving_mesh():
@@ -799,24 +899,18 @@ def test_the_march_is_differentiable_in_the_initial_mesh():
     assert float(g[j]) == pytest.approx(fd, rel=5e-2), f"AD {float(g[j]):.6e} vs FD {fd:.6e}"
 
 
-def test_the_traced_normals_agree_with_the_domain_s_own():
-    """The normals recomputed for a moving tag must equal the ones the domain reports for it.
+def test_the_traced_normals_are_outward_and_agree_with_the_domain_s_own():
+    """The normals a moving tag reads must be **outward**, and the domain must report the same ones.
 
-    Two representations of one quantity, so they can drift — and they did: the orientation test compares
-    ``n . (facet_centre - centroid)``, which on a FLAT tag is zero to round-off (measured 1.1e-16) and
-    carries no sign information. Built with a padded ``jnp.unique(..., size=)`` centroid it went further
-    and flipped every normal: a Stefan front's top edge came back with ny = -1 throughout, i.e. inward.
+    Agreement alone is not the property. This test used to assert only that, and it passed while both
+    routes carried the same wrong rule — orient away from the mesh centroid, which is exact for a
+    star-shaped domain and wrong anywhere else. So it is now an absolute check first (against a direction
+    known from the geometry) and an agreement check second."""
+    from jno.utils.solver.fem_adapt import _facet_outward_sign, _tag_facet_vertex_ids, _vertex_normals_jax
 
-    That went unnoticed because a Stefan law reads ``(grad(T).n) * ny`` — n appears twice, so the flip
-    cancels exactly. Any law LINEAR in the normal would have been silently negated.
-
-    Honest limitation: this checks the invariant (the two routes agree), but it does not reproduce the
-    flip — the minimal configurations tried here orient correctly either way. The flip was observed, and
-    the fix verified, on the Stefan setup in the scratchpad."""
-    from jno.utils.solver.fem_adapt import _tag_facet_vertex_ids, _vertex_normals_jax
-
-    # This exact aspect ratio / resolution is what exposed it (a tall narrow strip, 6 front
-    # vertices): the padded-unique centroid lands far enough off the edge to flip the sign.
+    # This exact aspect ratio / resolution exposed an earlier flip (a tall narrow strip, 6 front
+    # vertices): on a FLAT tag `n . (facet_centre - tag_centroid)` is zero to round-off (1.1e-16) and
+    # carries no sign information at all.
     H = 0.620063
     d = jno.Shape.rect(0.0, 0.0, 0.35, H, size=0.07).domain(time=(0.0, 0.2, 5))
     d.tag("top", lambda x, n, names: x[:, 1] > H - 1e-6)
@@ -829,7 +923,47 @@ def test_the_traced_normals_agree_with_the_domain_s_own():
         facets = _tag_facet_vertex_ids(d, tag, 2)
         ids = np.unique(np.asarray(facets).reshape(-1))
         assert ids.size >= 3, f"{tag}: only {ids.size} facet vertices — the check would be vacuous"
-        got = np.asarray(_vertex_normals_jax(pts, facets, 2))
+        got = np.asarray(_vertex_normals_jax(pts, facets, 2, _facet_outward_sign(d, facets, 2)))
         assert np.allclose(got[ids, 1], expect, atol=1e-5), f"{tag}: ny should be {expect}, got {got[ids, 1]}"
-        # and it must agree with the host normals the same tag reports elsewhere
         assert np.allclose(np.asarray(d.normals_by_tag[tag])[:, 1], expect, atol=1e-5)
+
+
+def test_the_normals_are_outward_on_a_CONCAVE_boundary():
+    """The case the agreement-only test could not see: an annulus, whose inner ring is concave.
+
+    Outward-from-the-material on the inner ring points *into the hole*, i.e. **towards** the mesh centroid
+    — the exact opposite of what the centroid rule concludes. Every producer got it wrong and they all
+    agreed, so nothing failed. Measured before the fix, ``n·r̂`` on the inner ring: the traced route and
+    ``_facet_normals`` returned +1 (should be −1), and the k-NN PCA fit behind ``get_boundary_normals``
+    returned values scattered from −0.346 to +0.311 — not a normal at all.
+
+    Asserted on **both** rings so neither half is vacuous."""
+    from jno.domain.mesh_utils import MeshUtils
+    from jno.utils.solver.fem_adapt import _facet_outward_sign, _tag_facet_vertex_ids, _vertex_normals_jax
+
+    C = np.array([0.5, 0.5])
+    d = (jno.Shape.disk(0.5, 0.5, 0.4) - jno.Shape.disk(0.5, 0.5, 0.15)).domain(size=0.06)
+
+    def radial(p):
+        r = np.asarray(p)[:, :2] - C
+        return r / np.linalg.norm(r, axis=1, keepdims=True), np.linalg.norm(r, axis=1)
+
+    # 1) the vertex normals `domain.variable(tag, normals=True)` is built from
+    n_host, ids = MeshUtils.get_boundary_normals(d.mesh)
+    rh, rn = radial(np.asarray(d.mesh.points)[ids])
+    dot = np.sum(np.asarray(n_host)[:, :2] * rh, axis=1)
+    inner = rn < 0.25
+    assert inner.sum() >= 5 and (~inner).sum() >= 5, "both rings must be represented or the check is vacuous"
+    assert np.allclose(dot[inner], -1.0, atol=1e-5), f"inner ring is not outward-from-material: {dot[inner]}"
+    assert np.allclose(dot[~inner], +1.0, atol=1e-5), f"outer ring is not outward: {dot[~inner]}"
+
+    # 2) the traced route the march reads, on the same concave ring
+    d.tag("hole", lambda x, n, names: ((x[:, 0] - 0.5) ** 2 + (x[:, 1] - 0.5) ** 2) < 0.2**2)
+    d.variable("hole", normals=True, split=True)
+    facets = _tag_facet_vertex_ids(d, "hole", 2)
+    hid = np.unique(np.asarray(facets).reshape(-1))
+    traced = np.asarray(
+        _vertex_normals_jax(jnp.asarray(np.asarray(d.mesh.points)[:, :2]), facets, 2, _facet_outward_sign(d, facets, 2))
+    )
+    rh_h, _rn_h = radial(np.asarray(d.mesh.points)[hid])
+    assert np.allclose(np.sum(traced[hid] * rh_h, axis=1), -1.0, atol=1e-5), "traced normals point into the solid"

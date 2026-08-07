@@ -42,26 +42,47 @@ def _is_facet_predicate(where) -> bool:
     return len(params) == 3 and params[1] in ("n", "normal", "normals") and params[2] in ("name", "names")
 
 
-def _facet_normals(ents, dim):
+def _facet_normals(ents, dim, mesh=None):
     """Outward unit normal per boundary facet (``ents`` is ``(E, k, dim)`` facet-vertex coords).
 
-    Geometric normal oriented away from the boundary centroid -- a reasonable orientation for a
-    *selection* predicate (rough on strongly concave boundaries).
+    With ``mesh`` (a meshio mesh carrying volume cells) the orientation comes from the **topology**, via
+    :func:`~jno.utils.solver.fem_facets.compute_face_normals`: a boundary facet belongs to exactly one
+    cell, so "outward" is "away from that cell's opposite vertex". Exact for any shape.
+
+    Without volume cells there is no topology to ask, and it falls back to orienting away from the
+    boundary centroid. That fallback is only exact for a **star-shaped** domain: on an annulus it gives the
+    inner hole a normal pointing into the material, which is the wrong sign for any law linear in ``n``.
+    It was the unconditional rule here until the moving-boundary work measured it.
     """
     ents = np.asarray(ents, dtype=float)
-    ctr = ents.reshape(-1, dim).mean(axis=0)
-    out = np.zeros((len(ents), dim), dtype=float)
-    for i, f in enumerate(ents):
-        if dim == 2:
-            t = f[1] - f[0]
-            n = np.array([t[1], -t[0]])
-        else:
-            n = np.cross(f[1] - f[0], f[2] - f[0])
-        n = n / (np.linalg.norm(n) + 1e-30)
-        if np.dot(n, f.mean(axis=0) - ctr) < 0.0:
-            n = -n
-        out[i] = n
-    return out
+    if dim == 2:
+        t = ents[:, 1] - ents[:, 0]
+        out = np.stack([t[:, 1], -t[:, 0]], axis=1)
+    else:
+        out = np.cross(ents[:, 1] - ents[:, 0], ents[:, 2] - ents[:, 0])
+    out = out / (np.linalg.norm(out, axis=1, keepdims=True) + 1e-30)
+
+    cells = None
+    if mesh is not None:
+        key = "triangle" if dim == 2 else "tetra"
+        cells = getattr(mesh, "cells_dict", {}).get(key)
+    if cells is not None and len(cells):
+        from ..utils.solver.fem_facets import build_facet_connectivity, compute_face_normals
+
+        cell_type = "triangle" if dim == 2 else "tetrahedron"
+        conn = build_facet_connectivity(np.asarray(cells), cell_type)
+        good = compute_face_normals(np.asarray(mesh.points), conn, np.asarray(cells), cell_type)
+        # match each facet to its topological twin by centroid -- ``ents`` carries coordinates, not ids
+        from scipy.spatial import cKDTree
+
+        gmid = np.asarray(mesh.points)[np.asarray(conn.face_nodes), :dim].mean(axis=1)
+        d, j = cKDTree(gmid).query(ents.mean(axis=1)[:, :dim])
+        tol = 1e-8 * max(float(np.ptp(gmid)), 1.0) if gmid.size else 0.0
+        if float(np.max(d, initial=0.0)) <= tol:
+            return np.where((np.einsum("ij,ij->i", out, good[j]) < 0.0)[:, None], -out, out)
+
+    ctr = ents.reshape(-1, dim).mean(axis=0)  # fallback: away from the boundary centroid
+    return np.where((np.einsum("ij,ij->i", out, ents.mean(axis=1) - ctr) < 0.0)[:, None], -out, out)
 
 
 def _facet_current_names(boundary_regions, mid):
@@ -1422,7 +1443,7 @@ class domain(MeshIOMixin):
             raise ValueError(f"tag({name!r}): a facet predicate f(x, n, name) needs a meshed boundary.")
         ents = np.asarray(ents)  # (E, k, dim) facet-vertex coordinates
         mid = ents.mean(axis=1)  # (E, dim) facet centroids
-        nrm = _facet_normals(ents, dim)  # (E, dim) outward facet normals (geometric)
+        nrm = _facet_normals(ents, dim, getattr(self, "mesh", None))  # (E, dim) outward facet normals
         names = _facet_current_names(self._boundary_regions, mid)  # (E,) each facet's current name
         keep = np.asarray(where(mid, nrm, names)).reshape(-1).astype(bool)
         if not keep.any():
