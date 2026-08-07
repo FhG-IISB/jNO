@@ -1035,7 +1035,7 @@ def _p1_stiffness_jax(pts, cells, dim):
     return matvec, diag
 
 
-def _harmonic_extension_jax(pts, cells, dim, given, prescribed, *, tol=1e-13, maxiter=2000):
+def _harmonic_extension_jax(pts, cells, dim, given, prescribed, *, tol=None, maxiter=2000):
     r"""Harmonically extend ``given`` off the ``prescribed`` vertices — pure JAX, differentiable in both.
 
     Solves ``(K d)ᵢ = 0`` on the free rows with ``d`` held at ``given`` on the prescribed rows, written as
@@ -1051,11 +1051,18 @@ def _harmonic_extension_jax(pts, cells, dim, given, prescribed, *, tol=1e-13, ma
     through the iterations.
 
     ``tol`` defaults tight because the bar is **absolute**: an affine field is harmonic and so must come
-    back exactly (1e-9 in 2D, 1e-7 in 3D).
+    back exactly (1e-9 in 2D, 1e-7 in 3D). Tight, but **reachable in the working precision** — it used to
+    be a hardcoded 1e-13, which is below float32 eps (1.2e-7), the default here since x64 is opt-in. The
+    relative termination test could then never fire and CG ground on to the float32 noise floor every
+    call. Measured at 1932 vertices: **8.26 ms -> 3.99 ms**, same answer. Same defect and the same
+    ``max(floor, 100*eps)`` repair as ``SemidiscreteTimeBlock.step``'s GMRES; in float64 the 1e-13 floor
+    keeps the previous behaviour exactly. Pass ``tol=`` to override.
     """
     import jax.numpy as jnp
     from jax.scipy.sparse.linalg import cg
 
+    if tol is None:
+        tol = max(1e-13, 100.0 * float(jnp.finfo(jnp.asarray(pts).dtype).eps))
     matvec, diag = _p1_stiffness_jax(pts, cells, dim)
     mask = 1.0 - jnp.asarray(prescribed, dtype=pts.dtype)  # 1 free / 0 prescribed
     held = (1.0 - mask)[:, None] * given
