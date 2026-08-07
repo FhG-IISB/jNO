@@ -1437,7 +1437,16 @@ class domain(MeshIOMixin):
             triangles=sub if dim == 3 else None,
             tol=full.tol,
         )
-        self._mesh_pool[name] = bpts
+        # Time-dependent domains store pools as (n_time, n_pts, D) and `sample` indexes the SPATIAL axis
+        # as `group_points[:, idx, :]`. Storing the bare (n_pts, D) here made `variable(name)` raise
+        # "too many indices" on any time-dependent domain, so a facet predicate could name a boundary but
+        # never read its coordinates or normals. Same broadcast the pin-node path above uses.
+        _interior_pool = self._mesh_pool.get("interior")
+        if _interior_pool is not None and np.asarray(_interior_pool).ndim == 3:
+            _n_time = int(np.asarray(_interior_pool).shape[0])
+            self._mesh_pool[name] = np.broadcast_to(bpts, (_n_time,) + bpts.shape).copy()
+        else:
+            self._mesh_pool[name] = bpts
         # per-point outward normals for variable(name, normals=True): average the facet normals at each point
         acc = {}
         for f, fn in zip(sub, sub_n):

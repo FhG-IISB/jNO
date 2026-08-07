@@ -329,3 +329,25 @@ def test_a_mesh_with_no_orphans_is_returned_untouched():
     mesh = meshio.Mesh(pts, [meshio.CellBlock("triangle", np.array([[0, 1, 2]]))])
     d = jno.domain(box(0, 0, 1, 1), mesh_size=0.5)
     assert Domain._drop_orphan_nodes(d, mesh) is mesh
+
+
+def test_a_facet_predicate_tag_is_readable_on_a_time_dependent_domain():
+    """``d.tag(name, f(x, n, names))`` must give a usable region on a TRANSIENT domain, not just a static one.
+
+    The facet path stored its sampling pool as ``(n_pts, D)`` while a time-dependent domain stores pools as
+    ``(n_time, n_pts, D)`` — and ``sample`` indexes the spatial axis as ``group_points[:, idx, :]``. So the
+    tag could be created and could carry normals, but reading its coordinates raised "too many indices",
+    which made a facet-selected boundary unusable for anything time-dependent (a moving front, say).
+    """
+    for time in ((0.0, 0.2, 5), None):
+        d = jno.Shape.rect(0.0, 0.0, 0.3, 0.5, size=0.08).domain(**({"time": time} if time else {}))
+        d.tag("top", lambda x, n, names: x[:, 1] > 0.5 - 1e-6)
+
+        parts = d.variable("top", normals=True, split=True)
+        # (x, y, t, nx, ny) — the time variable is present even on a static domain
+        assert len(parts) == 5, f"time={time}: expected (x, y, t, nx, ny), got {len(parts)}"
+
+        nrm = np.asarray(d.normals_by_tag["top"])
+        assert nrm.shape[1] == 2
+        assert np.allclose(nrm[:, 1], 1.0, atol=1e-6), f"time={time}: the top edge's outward normal is +y"
+        assert np.allclose(nrm[:, 0], 0.0, atol=1e-6)
