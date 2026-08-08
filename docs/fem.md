@@ -1219,9 +1219,18 @@ trajectory`. Build your own (e.g. diffrax) from the block's `block.M` / `block.A
 
 ## Vector, coupled, and higher-order problems
 
-* **Vector / elasticity** — `u, phi = d.fem_symbols(value_shape=(2,))`; use `vi.component(i)`,
-  `jno.np.symgrad`, `jno.np.trace`, and `jno.np.inner(..., n_contract=2)` to write the
-  elasticity bilinear form `λ (∇·u)(∇·φ) + 2μ ε(u):ε(φ)`.
+* **Vector / elasticity** — `u, phi = d.fem_symbols(value_shape=(2,))`; write the elasticity bilinear
+  form `λ (∇·u)(∇·φ) + 2μ ε(u):ε(φ)` with `jno.np.symgrad` and `jno.np.inner(..., n_contract=2)` —
+  **or component-wise**: `u[i]` and `u[i].x` / `u[i].d(var)` are first-class on a vector Lagrange field,
+  and the two spellings mix freely in one term (the shape conventions are shared). A boundary traction on
+  one component is `-t * phi_b[i]`.
+* **Finite-strain (hyperelastic) mechanics** — the component spelling is what makes it expressible:
+  build `F = I + ∇u` from `u[i].d(x_j)`, then `det F`, `F⁻ᵀ` and `log` are ordinary term algebra, and a
+  form nonlinear in `∇u` routes to the matrix-free Newton automatically (use
+  `nonlinear=jno.solve.newton(line_search=True)` for large steps). Compressible Neo-Hookean
+  `P = μ(F − F⁻ᵀ) + λ ln(J) F⁻ᵀ` is verified in `tests/test_fem_vector_components.py`: it matches the
+  coupled-scalar spelling to machine precision and linear elasticity in the small-load limit. No
+  load-stepping/continuation driver exists yet — ramp the load yourself, warm-starting with `x0=`.
 * **Coupled / mixed (Stokes)** — call `fem_symbols(...)` once per field and add one momentum and
   one continuity term; an inf-sup-stable Taylor–Hood pair is `order=2` velocity + `order=1`
   pressure. Pure-Dirichlet velocity leaves the pressure defined only up to a constant; gauge-fix

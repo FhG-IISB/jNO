@@ -1175,13 +1175,15 @@ def _eval_integrand(domain, node, local):
                 return _reshape_components_last(flat, value_shape)
             return jnp.reshape(flat, flat.shape[:1] + tuple(value_shape) + (len(dims),))
 
-        # Component-of-field gradient: ``u[i].d(x)`` lowers to ``Jacobian(getitem(field, i), [x])``. A
-        # non-nodal field's value-component cannot be differentiated directly (that is the rejected
-        # "Jacobian-of-getitem"), but ``d(u_i)/dx_l`` IS the (component i, direction l) entry of the
-        # whole-field *physical* gradient -- so select that row. This is what makes the existing
-        # ``.div()`` / ``.curl()`` / ``.x``-partial sugar (all of which build ``u[i].d(v)``) work for RT
-        # and N1E. Nodal FEM keeps the ``trace(grad(u, [x, y]))`` idiom: a nodal field's getitem-gradient
-        # has a different tensor structure and stays out of scope here.
+        # Component-of-field gradient: ``u[i].d(x)`` lowers to ``Jacobian(getitem(field, i), [x])``.
+        # For a NON-NODAL field the value-component cannot be differentiated directly, but
+        # ``d(u_i)/dx_l`` IS the (component i, direction l) entry of the whole-field *physical*
+        # gradient -- so select that row (this is what makes ``.div()`` / ``.curl()`` sugar work for
+        # RT and N1E). For a NODAL Lagrange vector field the same quantity is the scalar-basis
+        # gradient contracted against column ``i`` of the node-major cell solution -- which is what
+        # lets a tensor-nonlinear form (finite-strain elasticity: ``F = I + du_i/dx_j``, ``det F``,
+        # ``F^{-T}``) be written in the natural component spelling instead of forcing every vector
+        # problem through ``inner``/``symgrad`` or a coupled-scalar workaround.
         tgt = node.target
         if isinstance(tgt, FunctionCall) and getattr(tgt, "getitem_key", None) is not None and len(tgt.args) == 1:
             field = tgt.args[0]
@@ -1195,6 +1197,31 @@ def _eval_integrand(domain, node, local):
                 if isinstance(field, TestFunction):
                     return g  # per-DOF directional derivative of the component
                 return jnp.einsum("qn...,n->q...", g, cell_sol)  # contract the trial DOFs
+            if ints and isinstance(field, (TrialFunction, TestFunction)):
+                # Lagrange component gradient. Conventions match the whole-field branches exactly, so
+                # component and whole-field spellings mix freely in one term:
+                #   trial ``u[i].d(x_l)`` -> (n_quad,)                  a number per quad point
+                #   test  ``v[i].d(x_l)`` -> (n_quad, n_local, n_comp)  nonzero only on the DOF-component
+                #                                                       column ``i`` (node-major ravel)
+                # A scalar field (n_comp == 1) takes the whole-field shapes, so ``u[0]`` on a scalar is
+                # the field itself rather than a differently-shaped twin.
+                comp = ints[-1]
+                n_comp = _value_shape_num_components(getattr(field, "value_shape", ()))
+                if not 0 <= comp < n_comp:
+                    raise IndexError(
+                        f"jno.fem: component {comp} is out of range for a field with "
+                        f"value_shape={getattr(field, 'value_shape', ())} ({n_comp} component(s))."
+                    )
+                _, grads, cell_sol = _field_data(local, field)  # grads (n_quad, n_local, gdim); cell_sol (n_local, vec)
+                if isinstance(field, TestFunction):
+                    if n_comp == 1:
+                        comps = [grads[..., d] for d in dims]  # (n_quad, n_local): the scalar convention
+                    else:
+                        onehot = jnp.zeros((n_comp,), dtype=grads.dtype).at[comp].set(1.0)
+                        comps = [grads[..., d][:, :, None] * onehot[None, None, :] for d in dims]
+                else:
+                    comps = [jnp.sum(grads[..., d] * cell_sol[None, :, comp], axis=1) for d in dims]  # (n_quad,)
+                return comps[0] if len(comps) == 1 else jnp.stack(comps, axis=-1)
 
         if isinstance(node.target, ModelCall):
             # Gradient of a KNOWN (frozen) network coefficient: evaluate the network's spatial
