@@ -24,6 +24,7 @@ Contracts
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, Optional
 
@@ -900,3 +901,149 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block):
         return solver(op, rhs, M=M, x0=x0)
 
     return step_solve, None
+
+
+# ---------------------------------------------------------------------------
+# Parameter continuation -- sweeps, load stepping, homotopy
+# ---------------------------------------------------------------------------
+@dataclass
+class ContinuationSpec:
+    """March one or more runtime parameters across a value sequence, warm-starting every solve from
+    the previous one. Built by :func:`jno.solve.continuation`; consumed by ``fem.solve(continuation=)``.
+
+    ``params`` maps runtime-parameter names to equal-length value sequences (marched together, zipped);
+    ``keep`` is ``"last"`` (the final solution -- homotopy) or ``"all"`` (the whole family -- a sweep)."""
+
+    params: dict
+    keep: str = "last"
+
+
+def run_continuation(fem, spec, *, nonlinear=None, linear=None, precond=None, x0=None, kwargs=None):
+    """Drive ``fem.solve(continuation=...)``: solve the steady problem at each parameter value in turn,
+    warm-starting from the previous solution.
+
+    One driver, three names for one mechanism. In EM it is the **frequency / material sweep** (march
+    ``omega`` or a conductivity across a band; each solve seeds the next, which is what carries a Krylov
+    or Newton iteration through resonances). In mechanics it is **load stepping** (ramp a traction so
+    Newton always starts near the solution). In numerics it is **homotopy** (reach a parameter value the
+    cold solve cannot). The measured teeth: cold *default* Newton on the finite-strain cantilever fails
+    at ``load = 0.1`` while the four-step ramp reaches it -- with no line search and no tuning.
+
+    Scope (fail loud on the rest): **steady** linear or nonlinear, real or fused-complex, non-periodic.
+    A transient sweep is a plain Python loop over ``fem.solve()`` -- there is no warm start to transfer
+    between trajectories, so this driver adds nothing there. Composes with the ``nonlinear=`` /
+    ``linear=`` / ``precond=`` slots (each step's solve uses them; a ``precond`` is re-prepared per
+    step); ``x0=`` seeds the *first* step. A **direct** linear solve ignores warm starts by nature --
+    the sweep still buys the family collection and per-step failure localization.
+
+    Every step is checked finite on the host (this driver is eager, like ``adapt=``): a step that
+    diverges or hits a singular operator raises naming the parameter values and the step index, instead
+    of returning NaN from three steps later. Returns concrete arrays -- ``(n_dofs,)`` for
+    ``keep="last"``, ``(n_values, n_dofs)`` for ``keep="all"`` -- complex-valued when the problem is.
+    """
+    kwargs = dict(kwargs or {})
+    mode = getattr(fem, "_mode", None)
+    if mode not in ("linear", "nonlinear"):
+        raise NotImplementedError(
+            f"fem.solve(continuation=...) supports steady problems (linear/nonlinear); this FEM is "
+            f"{mode!r}. Sweep a transient by looping over fem.solve() yourself -- a warm start has no "
+            "meaning across independent trajectories."
+        )
+    if getattr(fem, "_periodic", None) is not None:
+        raise NotImplementedError("fem.solve(continuation=...) with periodic ties is not supported yet.")
+    if spec.keep not in ("last", "all"):
+        raise ValueError(f"continuation keep={spec.keep!r}: expected 'last' or 'all'.")
+    if not spec.params:
+        raise ValueError("jno.solve.continuation(): no parameter sequences given -- nothing to sweep.")
+
+    op = fem._op
+    available = set(getattr(op, "runtime_parameter_exprs", None) or {})
+    swept = set(spec.params)
+    overlap = swept & set(kwargs)
+    if overlap:
+        raise ValueError(
+            f"fem.solve(continuation=...): {sorted(overlap)!r} appear both in the sweep and as fixed "
+            "keyword values. A parameter is either marched or held, not both."
+        )
+    unknown = (swept | set(kwargs)) - available
+    if unknown:
+        raise TypeError(
+            f"fem.solve(continuation=...): unknown runtime parameter(s) {sorted(unknown)!r}. "
+            f"This problem exposes {sorted(available)!r}."
+        )
+
+    seqs = {k: np.asarray(v) for k, v in spec.params.items()}
+    lengths = {k: int(s.shape[0]) if s.ndim else -1 for k, s in seqs.items()}
+    if -1 in lengths.values() or len(set(lengths.values())) != 1:
+        raise ValueError(
+            f"jno.solve.continuation(): all parameter sequences must share one length >= 1; got "
+            f"{ {k: (int(s.shape[0]) if s.ndim else 'scalar') for k, s in seqs.items()} }."
+        )
+    n_steps = next(iter(lengths.values()))
+
+    def _step_value(arr, k):
+        v = jnp.asarray(arr[k])
+        return v.reshape(1) if v.ndim == 0 else v  # a scalar parameter is stored shape-(1,)
+
+    fixed = {k: jnp.asarray(v) for k, v in kwargs.items()}
+
+    # Complex problems solve as the real 2n block; recombine on the way out exactly as FEM.solve does
+    # (u = x[:n] + i x[n:]). Warm starts stay in the REAL block layout.
+    n_c = getattr(fem, "_complex_n", None)
+    _fin = (lambda x: x[:n_c] + 1j * x[n_c : 2 * n_c]) if n_c is not None else (lambda x: x)
+
+    # The same per-family linear defaults as FEM.solve: the fused-complex block is indefinite and the
+    # C1 families are 4th-order, where the matrix-free default does not converge -- both take the
+    # sparse-direct solve unless the caller picked slots.
+    prefer_direct = (
+        n_c is not None
+        or bool(getattr(fem.domain, "_fem_prefer_direct", False))
+        or getattr(fem.domain, "dimension", None) == 1
+    )
+    use_slots = (linear is not None) or (precond is not None)
+
+    if mode == "nonlinear":
+        nl = compose_nonlinear_solve_fn(nonlinear, linear, precond, fem)
+        prev = jnp.zeros((int(op.size),))
+    else:
+        nl = None
+        A0, b0 = op.evaluate({**fixed, **{k: _step_value(s, 0) for k, s in seqs.items()}})
+        prev = jnp.zeros((jnp.asarray(b0).reshape(-1).shape[0],))
+    if x0 is not None:
+        x0 = jnp.asarray(x0).reshape(-1)
+        if jnp.iscomplexobj(x0):  # complex seed enters the real-equivalent layout
+            x0 = jnp.concatenate([jnp.real(x0), jnp.imag(x0)])
+        prev = x0
+
+    outs = []
+    for k in range(n_steps):
+        vals = {**fixed, **{name: _step_value(s, k) for name, s in seqs.items()}}
+        at = ", ".join(f"{name}={np.asarray(s[k])!r}" for name, s in seqs.items())
+        try:
+            if mode == "nonlinear":
+                u = nl(lambda uu, _v=vals: op.residual(uu, _v), prev)
+            else:
+                A, b = op.evaluate(vals)
+                b = jnp.asarray(b).reshape(-1)
+                if use_slots or not prefer_direct:
+                    solve = compose_linear_solve_fn(linear, precond, prev, fem)  # per step: x0 changes
+                    u = solve(A, b)
+                else:
+                    from .linear import sparse_lu_solve
+
+                    u = sparse_lu_solve(A, b)  # direct: warm start is meaningless, robustness is not
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"fem.solve(continuation=...): step {k + 1}/{n_steps} at {at} failed to converge. "
+                f"Refine the value sequence around this point, or pass "
+                f"nonlinear=jno.solve.newton(line_search=True). Original error: {e}"
+            ) from e
+        if not bool(np.isfinite(np.asarray(u)).all()):
+            raise RuntimeError(
+                f"fem.solve(continuation=...): step {k + 1}/{n_steps} at {at} produced a non-finite "
+                "solution (a singular or diverging system). Refine the value sequence around this point."
+            )
+        prev = u
+        if spec.keep == "all":
+            outs.append(_fin(u))
+    return jnp.stack(outs) if spec.keep == "all" else _fin(prev)

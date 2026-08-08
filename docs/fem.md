@@ -1008,6 +1008,35 @@ elimination produces). It raises a clear error. Carry the complex part in the op
 Not yet supported (clear errors): `adapt=` on a complex transient (the cross-remesh state transfer is
 not complex-aware yet).
 
+### Parameter continuation — sweeps, load stepping, homotopy (`continuation=`)
+
+One driver under three familiar names: march one or more **runtime parameters** across a value sequence,
+each solve warm-starting from the previous one.
+
+```python
+# EM: a material sweep — the whole complex family in one call
+U = fem.solve(continuation=jno.solve.continuation(sig=jnp.linspace(0.1, 1.0, 40), keep="all"))
+
+# mechanics: load stepping / homotopy — reach a load the cold solve cannot
+u = fem.solve(continuation=jno.solve.continuation(load=jnp.linspace(0.025, 0.1, 4)))
+```
+
+Keywords name the problem's `jno.np.parameter`s (the same names `fem.solve(**values)` accepts); several
+equal-length sequences march together, other parameters stay fixed as ordinary keywords. `keep="all"`
+stacks the family `(n_values, n_dofs)` — complex-valued when the problem is — and `keep="last"` returns
+the final solution. Composes with `nonlinear=`/`linear=`/`precond=` (each step solves through them) and
+`x0=` (seeds the first step). The measured teeth: on the finite-strain cantilever, cold **default**
+Newton diverges at `load = 0.1` while the four-step ramp reaches it — same solver, no line search. A
+failing or singular step **raises naming the parameter values and the step index** instead of letting a
+NaN surface three steps downstream (the direct solve's singular-matrix NaN is caught too).
+
+Scope: **steady** only (linear or nonlinear, real or complex), non-periodic; a transient sweep is a
+plain Python loop over `fem.solve()`, since no warm start transfers between trajectories. A direct
+`linear=` ignores warm starts by nature — the sweep still buys family collection and failure
+localization. Known wall for the EM case: a *2D/3D nodal* complex form does not yet accept a plain
+`jno.np.parameter` in its coefficients (the ComplexPair × parameter algebra is unwired — 1D and the
+non-nodal N1E path both work), so a 2D Helmholtz frequency sweep needs that wall removed first.
+
 ### Multiple devices — `fem.solve(shard=...)`
 
 Sharding is **automatic**: on a machine with more than one visible device, the assembled operator's
@@ -1229,8 +1258,9 @@ trajectory`. Build your own (e.g. diffrax) from the block's `block.M` / `block.A
   form nonlinear in `∇u` routes to the matrix-free Newton automatically (use
   `nonlinear=jno.solve.newton(line_search=True)` for large steps). Compressible Neo-Hookean
   `P = μ(F − F⁻ᵀ) + λ ln(J) F⁻ᵀ` is verified in `tests/test_fem_vector_components.py`: it matches the
-  coupled-scalar spelling to machine precision and linear elasticity in the small-load limit. No
-  load-stepping/continuation driver exists yet — ramp the load yourself, warm-starting with `x0=`.
+  coupled-scalar spelling to machine precision and linear elasticity in the small-load limit. Ramp a
+  hard load with `fem.solve(continuation=jno.solve.continuation(load=...))` — measured: cold *default*
+  Newton fails at a load the four-step ramp reaches with no line search and no tuning.
 * **Coupled / mixed (Stokes)** — call `fem_symbols(...)` once per field and add one momentum and
   one continuity term; an inf-sup-stable Taylor–Hood pair is `order=2` velocity + `order=1`
   pressure. Pure-Dirichlet velocity leaves the pressure defined only up to a constant; gauge-fix

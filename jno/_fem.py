@@ -1316,6 +1316,7 @@ class FEM:
         solve_fn=None,
         *,
         adapt=None,
+        continuation=None,
         x0=None,
         nonlinear=None,
         linear=None,
@@ -1453,6 +1454,11 @@ class FEM:
         # Cleared on EVERY solve, not only a reduced one: a leftover value from an earlier
         # ``basis=`` call would read as "this answer was certified" on an answer that never was.
         self.basis_residual = None
+        if continuation is not None and basis is not None:
+            raise NotImplementedError(
+                "fem.solve: continuation= does not compose with basis= (a reduced-basis sweep would need "
+                "the basis re-certified per parameter value). Sweep first, then build the basis."
+            )
         reduction = None if basis is None else self._basis_reduction(basis, adapt=adapt)
 
         def _run():
@@ -1470,6 +1476,7 @@ class FEM:
                 result = self._solve_dispatch(
                     solve_fn,
                     adapt=adapt,
+                    continuation=continuation,
                     x0=x0,
                     nonlinear=nonlinear,
                     linear=linear,
@@ -1613,6 +1620,7 @@ class FEM:
         solve_fn=None,
         *,
         adapt=None,
+        continuation=None,
         x0=None,
         nonlinear=None,
         linear=None,
@@ -1632,7 +1640,7 @@ class FEM:
         if getattr(self, "_geometry", None):
             # A geometry term (`coord.d(t) - velocity`) states that the mesh moves. Its driver owns the
             # march, so it cannot share the call with anything else that also owns it.
-            if adapt is not None or has_slots:
+            if adapt is not None or has_slots or continuation is not None:
                 raise NotImplementedError(
                     "jno.fem: a geometry term (`coord.d(t) - velocity`) does not compose with adapt= or "
                     "the solver slots (x0/nonlinear/linear/precond/time) yet — the mesh-motion driver owns the "
@@ -1647,6 +1655,20 @@ class FEM:
             from .utils.solver.fem_adapt import run_mesh_motion
 
             return run_mesh_motion(self, solve_fn=solve_fn, **kwargs)
+        if continuation is not None:
+            # Parameter continuation: sweep / load stepping / homotopy. The driver owns the sequence of
+            # solves (each warm-starts the next), so it cannot share the call with another owner.
+            if adapt is not None or time is not None or solve_fn is not None:
+                raise NotImplementedError(
+                    "fem.solve: continuation= does not compose with adapt=, time= or solve_fn= -- the "
+                    "continuation driver owns the sequence of solves. The nonlinear=/linear=/precond= "
+                    "slots and x0= (the first step's seed) do compose."
+                )
+            from .utils.solver.solver_api import run_continuation
+
+            return run_continuation(
+                self, continuation, nonlinear=nonlinear, linear=linear, precond=precond, x0=x0, kwargs=kwargs
+            )
         if adapt is not None:
             if getattr(adapt, "relocate", False):
                 # r-adaptivity: relocate the .trainable() vertices (fixed connectivity), not h-refinement.
