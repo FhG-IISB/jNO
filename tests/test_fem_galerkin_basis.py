@@ -253,14 +253,16 @@ def test_basis_residual_is_cleared_by_a_later_full_solve():
 
 
 def test_remeshing_slots_are_refused():
-    """``adapt=``/``move=`` rebuild or move the mesh, so the DOF count and layout the basis was built
-    against change underneath it — the basis would be silently meaningless, not merely inaccurate."""
+    """``adapt=`` rebuilds or moves the mesh, so the DOF count and layout the basis was built against
+    change underneath it — the basis would be silently meaningless, not merely inaccurate.
+
+    (This used to also assert the ``move=`` refusal; ``move=`` was deleted when a moving mesh became a
+    geometry TERM — `coord.d(t) - v` — and the geometry-term driver carries its own basis refusal. The
+    stale half sailed an unknown kwarg into the solve and failed on the basis-residual guard instead.)"""
     fem = _poisson(0.435)
     U = _pod(4)
     with pytest.raises(NotImplementedError, match="adapt="):
         fem.solve(basis=U, adapt={"max_iters": 1})
-    with pytest.raises(NotImplementedError, match="move="):
-        fem.solve(basis=U, move=object())
 
 
 def test_reduction_is_restored_even_when_the_solve_raises():

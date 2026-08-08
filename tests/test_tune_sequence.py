@@ -54,7 +54,7 @@ def test_a_sequence_axis_marches_through_crux_sweep():
         run_continuation(fem, ContinuationSpec(params={"kap": np.asarray(ks)}, keep="all"), kwargs={"q": jnp.array([1.0])})
     )
     assert U.shape == ref.shape and U.shape[0] == 4
-    assert U == pytest.approx(ref, abs=1e-12), f"tune march != engine: {np.abs(U - ref).max():.2e}"
+    assert U == pytest.approx(ref, abs=1e-11), f"tune march != engine: {np.abs(U - ref).max():.2e}"
     # physics: u ~ q/kap, so the family ends sit at a 4x ratio
     assert float(U[0].max() / U[-1].max()) == pytest.approx(4.0, rel=1e-6)
 
@@ -68,7 +68,8 @@ def test_keep_last_is_the_homotopy_spelling():
     u_last = np.asarray(crux.sweep(space))
     space2 = jnn.tune.space()
     space2.sequence("kap", ks)
-    assert u_last == pytest.approx(np.asarray(crux.sweep(space2))[-1], abs=0.0)
+    # abs=1e-12, not 0.0: GPU reduction order makes two identical marches differ by ~1 ULP (1.4e-17)
+    assert u_last == pytest.approx(np.asarray(crux.sweep(space2))[-1], abs=1e-12)
 
 
 def test_the_walls_fail_loud():

@@ -1032,13 +1032,17 @@ def run_continuation(fem, spec, *, nonlinear=None, linear=None, precond=None, x0
                     from .linear import sparse_lu_solve
 
                     u = sparse_lu_solve(A, b)  # direct: warm start is meaningless, robustness is not
+            # Materialize INSIDE the try: dispatch is async, so a GPU-side failure (cuSolver raises on
+            # a singular matrix where the CPU path returns NaN) surfaces at the first host read -- which
+            # must be here, where the step context exists, not at the caller's first use.
+            u_host = np.asarray(u)
         except RuntimeError as e:
             raise RuntimeError(
                 f"fem.solve(continuation=...): step {k + 1}/{n_steps} at {at} failed to converge. "
                 f"Refine the value sequence around this point, or pass "
                 f"nonlinear=jno.solve.newton(line_search=True). Original error: {e}"
             ) from e
-        if not bool(np.isfinite(np.asarray(u)).all()):
+        if not bool(np.isfinite(u_host).all()):
             raise RuntimeError(
                 f"fem.solve(continuation=...): step {k + 1}/{n_steps} at {at} produced a non-finite "
                 "solution (a singular or diverging system). Refine the value sequence around this point."

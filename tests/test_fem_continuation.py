@@ -60,7 +60,9 @@ def test_a_linear_sweep_matches_independent_solves():
     # -div(kap grad u) = q: u scales as 1/kap, so the ends must sit at a 4x ratio
     assert float(U[0].max() / U[-1].max()) == pytest.approx(4.0, rel=1e-6)
     last = run_continuation(fem, _spec(kap=ks), kwargs={"q": jnp.array([1.0])})
-    assert np.asarray(last) == pytest.approx(np.asarray(U[-1]), abs=0.0), 'keep="last" != keep="all"[-1]'
+    # abs=1e-12, not 0.0: on GPU two runs of the same march differ by reduction order (measured 1.4e-17,
+    # one ULP) -- bit-exactness is a CPU accident, not a property of the driver
+    assert np.asarray(last) == pytest.approx(np.asarray(U[-1]), abs=1e-12), 'keep="last" != keep="all"[-1]'
 
 
 def test_two_parameters_march_together_and_fixed_kwargs_hold():
