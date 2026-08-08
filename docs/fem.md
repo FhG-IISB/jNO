@@ -41,6 +41,8 @@ u_h = fem.solve()          # matrix-free default; slots pick anything else (see 
   Use `value_shape=(2,)` for a vector unknown (elasticity, flow velocity), `order=k` for degree-`k`
   Lagrange (`order=2` quadratic P2, `order=3` cubic P3, … — any `k ≥ 1`), `space="RT"`/`"N1E"`/`"P0"`
   for the non-nodal families (see below), and call `fem_symbols` once per field for coupled systems.
+  On a **curved boundary**, `order ≥ 2` is capped by the straight-edge geometry — see *Known
+  limitations* for the measured rates before paying for P3 there.
   A **1D line domain** takes a vector unknown too (`value_shape=(n,)`), so a 1D *system* — a
   two-species model, a Timoshenko pair, a bar with several dofs per node — is one field with
   node-major dofs and per-component essential conditions (`u(region)[i] - g`).
@@ -1355,5 +1357,19 @@ route** — the residual-PINN path is unaffected. Full detail is inline in the s
   internal-state readout runs on every cell (sub-region-restricted plasticity is not wired). Kinematic /
   nonlinear (Voce) hardening and contact are separate formulas / machinery, not built.
 
-Hitting one of these is a signal to reformulate (move the parameter, reduce the time order) rather than
-a bug — the error message names the offending term.
+- **Geometry is affine (straight-edge) at every order** — there is no isoparametric mapping, so on a
+  **curved boundary** the domain itself is approximated to O(h²) and that error caps every element
+  order above it. This one is *not* fail-loud: the solve is silently suboptimal. Measured on the unit
+  disk (`-Δu = 4`, `u|∂Ω = 0`, exact `u* = 1 − r²`), L2 rates under refinement:
+
+  | order | expected | measured | error at `h = 0.05` |
+  |---|---|---|---|
+  | P1 | 2 | **2.00** | 1.14e-03 (1 536 dofs) |
+  | P2 | 3 | **2.02** | 7.46e-04 (6 015 dofs) |
+  | P3 | 4 | **2.01** | 7.40e-04 (13 438 dofs) |
+
+  P3 buys *nothing* over P2 on a curved domain — 13 438 dofs for the same answer — and both are barely
+  ahead of P1. The cap comes from imposing the boundary condition at straight-edge nodes that sit on the
+  chord, O(h²) inside the true arc. On a **polygonal** domain the advertised rates hold exactly (the
+  suite measures P2/P3 there). Until an isoparametric mapping exists, prefer `h`-refinement (or the
+  adaptive loop) over `order ≥ 2` near curved boundaries.
