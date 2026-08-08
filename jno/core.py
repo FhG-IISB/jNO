@@ -4827,8 +4827,8 @@ class core:
     def sweep(
         self,
         space: ArchSpace,
-        optimizer: Union[str, type],
-        budget: int,
+        optimizer: Union[str, type, None] = None,
+        budget: int = 0,
         devices: Union[None, int, str, List[int], DeviceConfig] = None,
     ) -> "statistics":
         """Run architecture and hyperparameter search with optional parallelism.

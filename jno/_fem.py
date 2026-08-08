@@ -1487,6 +1487,9 @@ class FEM:
                 # Tag the solve node with its domain so jno.core can infer the domain straight from the graph
                 # (a data-misfit inverse `jno.core([(fem.solve() - u_obs).mse])` needs no explicit `domain=`).
                 result._domain = self.domain
+                # ... and with its FEM, so orchestration (the tune `sequence` axis) can find the operator
+                # behind a constraint without a side channel. Lazy nodes only: a concrete array needs none.
+                result._fem_ref = self
             return result
 
         if not profile:  # profile=True: run the (eager) solve inside a JAX Perfetto trace + print a summary

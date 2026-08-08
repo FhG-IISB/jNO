@@ -1229,10 +1229,10 @@ trajectory`. Build your own (e.g. diffrax) from the block's `block.M` / `block.A
   form nonlinear in `∇u` routes to the matrix-free Newton automatically (use
   `nonlinear=jno.solve.newton(line_search=True)` for large steps). Compressible Neo-Hookean
   `P = μ(F − F⁻ᵀ) + λ ln(J) F⁻ᵀ` is verified in `tests/test_fem_vector_components.py`: it matches the
-  coupled-scalar spelling to machine precision and linear elasticity in the small-load limit. No public
-  load-stepping spelling yet (a warm-started `sequence` axis in the `tune` space is the planned home);
-  meanwhile ramp the load yourself, warm-starting with `x0=` — measured on the cantilever: cold *default*
-  Newton fails at `load = 0.1` while a four-step warm-started ramp reaches it.
+  coupled-scalar spelling to machine precision and linear elasticity in the small-load limit. Ramp a hard
+  load with a warm-started **`sequence` axis**: `space.sequence("load", ramp, keep="last")` then
+  `crux.sweep(space)` — measured on the cantilever: cold *default* Newton fails at `load = 0.1` while
+  the four-step warm-started ramp reaches it.
 * **Coupled / mixed (Stokes)** — call `fem_symbols(...)` once per field and add one momentum and
   one continuity term; an inf-sup-stable Taylor–Hood pair is `order=2` velocity + `order=1`
   pressure. Pure-Dirichlet velocity leaves the pressure defined only up to a constant; gauge-fix

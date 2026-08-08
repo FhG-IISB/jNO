@@ -55,6 +55,20 @@ space.float_range("lr0", low=1e-4, high=1e-2, log_scale=True)
 space.int_range("hidden_dim", low=16, high=256)
 ```
 
+### Ordered Sequence (`sequence`) — continuation, not search
+
+```python
+space.sequence("sig", jnp.linspace(0.1, 1.0, 40))            # the whole family (keep="all")
+space.sequence("load", jnp.linspace(0.02, 0.1, 4), keep="last")   # homotopy: final solution only
+```
+
+A **sequence** axis is *ordered and warm-started*: `crux.sweep(space)` (grid mode) marches it through
+the FEM continuation engine — each solve seeds the next — instead of enumerating independent trials.
+This is the EM frequency/material sweep, mechanics load stepping, and numerical homotopy in the tune
+vocabulary. The constraints must contain exactly one parametric `fem.solve()` node; parameters not
+being marched hold their current values. Sequence axes do not combine with a search optimizer (a
+search would reorder them) and, for now, not with search axes in the same space.
+
 ### Category Labels
 
 Use the `category` keyword to separate architecture choices from training choices:
