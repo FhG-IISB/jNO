@@ -60,7 +60,6 @@ __all__ = [
     "adaptive",
     "remesh",
     "relocate",
-    "continuation",
 ]
 
 
@@ -861,31 +860,3 @@ def adaptive(*, rtol: float = 1e-4, atol: float = 1e-6, max_steps: int = 1000, d
     from .utils.solver.timeschemes import _AdaptiveScheme
 
     return _AdaptiveScheme(None, rtol, atol, max_steps, dt0)
-
-
-def continuation(*, keep: str = "last", **params):
-    """**Parameter continuation** for ``fem.solve(continuation=...)``: march one or more runtime
-    parameters across a value sequence, warm-starting every solve from the previous one.
-
-    One mechanism, three familiar names::
-
-        # EM: a material / frequency sweep -- the whole family, one call
-        U = fem.solve(continuation=jno.solve.continuation(sig=jnp.linspace(0.1, 5.0, 40), keep="all"))
-
-        # mechanics: load stepping -- reach a load the cold solve cannot
-        u = fem.solve(continuation=jno.solve.continuation(load=jnp.linspace(0.02, 0.2, 10)))
-
-        # numerics: homotopy in any runtime parameter, ditto
-
-    Each keyword names a runtime parameter of the problem (a ``jno.np.parameter`` in the form -- the
-    same names ``fem.solve(**values)`` accepts) with a sequence of values; several sequences of equal
-    length march together. Other parameters stay fixed via ordinary ``fem.solve`` keywords.
-    ``keep="last"`` returns the final solution; ``keep="all"`` stacks the family ``(n_values, n_dofs)``
-    (complex-valued when the problem is). Composes with the ``nonlinear=``/``linear=``/``precond=``
-    slots; ``x0=`` seeds the first step. Steady problems only, non-periodic; a failing step raises
-    **naming the parameter values and the step index** rather than returning NaN downstream. See
-    :func:`jno.utils.solver.solver_api.run_continuation` for the method and its measured teeth.
-    """
-    from .utils.solver.solver_api import ContinuationSpec
-
-    return ContinuationSpec(params=dict(params), keep=keep)
