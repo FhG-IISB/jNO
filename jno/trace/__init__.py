@@ -250,6 +250,12 @@ class Placeholder:
         inner = getattr(other, "_expr", None)
         if isinstance(inner, Placeholder):
             return inner
+        if getattr(other, "_is_complex_pair", False):
+            # A ComplexPair is TWO expressions; it cannot be one operand. Signal NotImplemented so the
+            # binary op yields and Python dispatches to the pair's reflected op, which distributes the
+            # real operand over (re, im). This is what lets `jno.np.parameter() * E` work on a
+            # `fem_symbols(complex=True)` field -- the parametric-complex-Maxwell spelling.
+            return NotImplemented
         return Literal(other)
 
     def name(self, label: str) -> "Placeholder":
@@ -339,34 +345,58 @@ class Placeholder:
     def __add__(self, other) -> BinaryOp:
         if isinstance(other, _VIEW_TYPES):
             return NotImplemented
-        return BinaryOp("+", self, self._wrap(other))
+        w = self._wrap(other)
+        if w is NotImplemented:
+            return NotImplemented
+        return BinaryOp("+", self, w)
 
     def __radd__(self, other) -> BinaryOp:
-        return BinaryOp("+", self._wrap(other), self)
+        w = self._wrap(other)
+        if w is NotImplemented:
+            return NotImplemented
+        return BinaryOp("+", w, self)
 
     def __sub__(self, other) -> BinaryOp:
         if isinstance(other, _VIEW_TYPES):
             return NotImplemented
-        return BinaryOp("-", self, self._wrap(other))
+        w = self._wrap(other)
+        if w is NotImplemented:
+            return NotImplemented
+        return BinaryOp("-", self, w)
 
     def __rsub__(self, other) -> BinaryOp:
-        return BinaryOp("-", self._wrap(other), self)
+        w = self._wrap(other)
+        if w is NotImplemented:
+            return NotImplemented
+        return BinaryOp("-", w, self)
 
     def __mul__(self, other) -> BinaryOp:
         if isinstance(other, _VIEW_TYPES):
             return NotImplemented
-        return BinaryOp("*", self, self._wrap(other))
+        w = self._wrap(other)
+        if w is NotImplemented:
+            return NotImplemented
+        return BinaryOp("*", self, w)
 
     def __rmul__(self, other) -> BinaryOp:
-        return BinaryOp("*", self._wrap(other), self)
+        w = self._wrap(other)
+        if w is NotImplemented:
+            return NotImplemented
+        return BinaryOp("*", w, self)
 
     def __truediv__(self, other) -> BinaryOp:
         if isinstance(other, _VIEW_TYPES):
             return NotImplemented
-        return BinaryOp("/", self, self._wrap(other))
+        w = self._wrap(other)
+        if w is NotImplemented:
+            return NotImplemented
+        return BinaryOp("/", self, w)
 
     def __rtruediv__(self, other) -> BinaryOp:
-        return BinaryOp("/", self._wrap(other), self)
+        w = self._wrap(other)
+        if w is NotImplemented:
+            return NotImplemented
+        return BinaryOp("/", w, self)
 
     def __neg__(self) -> BinaryOp:
         return BinaryOp("*", Literal(-1.0), self)
@@ -380,10 +410,16 @@ class Placeholder:
         return self
 
     def __pow__(self, other) -> BinaryOp:
-        return BinaryOp("**", self, self._wrap(other))
+        w = self._wrap(other)
+        if w is NotImplemented:
+            return NotImplemented
+        return BinaryOp("**", self, w)
 
     def __rpow__(self, other) -> BinaryOp:
-        return BinaryOp("**", self._wrap(other), self)
+        w = self._wrap(other)
+        if w is NotImplemented:
+            return NotImplemented
+        return BinaryOp("**", w, self)
 
     def __getitem__(self, key) -> FunctionCall:
         if not isinstance(key, tuple):

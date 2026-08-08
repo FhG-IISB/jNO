@@ -1098,6 +1098,12 @@ class ComplexPair:
 
     __slots__ = ("_re", "_im")
 
+    # Duck-typed marker for Placeholder._wrap: a pair holds TWO expressions, so it cannot be wrapped
+    # as one operand -- the Placeholder-side binary op must yield to ComplexPair's reflected op, which
+    # distributes over (re, im). Without this, `parameter * pair` died in jnp.asarray(ComplexPair)
+    # INSIDE Placeholder.__mul__, so Python never consulted the pair at all.
+    _is_complex_pair = True
+
     def __init__(self, re, im=None):
         self._re = re
         self._im = im
