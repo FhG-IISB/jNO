@@ -1948,17 +1948,34 @@ class FEM:
         # matrix-free LOBPCG path and never densifies a big operator just to drop some rows.
         Kop, Mop = LinearOperator(K), LinearOperator(M)
 
-        def red(op):
+        def _red_diag_fn(A_raw):
+            # diag(PᵀAP) for the diagonal-reading preconditioners (jacobi): a Dirichlet elimination is
+            # a SELECTION, so it is a gather of A's diagonal at the free DOFs; a periodic tie's diag
+            # comes from one sparse triplet-remap of the reduction (the operator itself stays
+            # matvec-only — only its diagonal is ever formed). Without this, `precond=jacobi()` on a
+            # constrained pencil died on `diag()` of a matvec-only operator — a hole the eigs
+            # idempotency fix exposed (the repeat call used to skip the reduction entirely, so the
+            # "reduced" LOBPCG quietly ran the FULL pencil and never asked for this diagonal).
+            from .utils.solver.fem_utils import reduce_matrix_periodic
+            from .utils.solver.linear import matrix_diagonal
+
+            if _kind == "dirichlet":
+                _free = jnp.asarray(sorted(set(range(n_full)) - {int(dof) for dof, _v in _pairs}), dtype=jnp.int32)
+                return lambda: matrix_diagonal(A_raw)[_free]
+            return lambda: matrix_diagonal(reduce_matrix_periodic(self._periodic, A_raw))
+
+        def red(op, A_raw):
             mv = lambda v: restrict(op.mv(prolong(v)))  # noqa: E731
             # `dense_fn` only fires on the small-problem dense path, which materializes anyway; the
             # LOBPCG path never calls it and so never builds the reduced matrix.
             return LinearOperator.from_matvec(
                 mv,
                 shape=(n_red, n_red),
+                diag_fn=_red_diag_fn(A_raw),
                 dense_fn=lambda: jax.vmap(mv, in_axes=1, out_axes=1)(jnp.eye(n_red)),
             )
 
-        lam, Xr = solver(red(Kop), red(Mop))
+        lam, Xr = solver(red(Kop, K), red(Mop, M))
         return lam, jax.vmap(prolong, in_axes=1, out_axes=1)(Xr)  # modes back on the full mesh
 
     # -- domain-decomposition coupling (`jno.core([...])`): the region this subdomain owns + a pinned solve --
