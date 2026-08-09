@@ -270,21 +270,26 @@ class Shape:
         return Shape(self._node, self.dim, size, self._region_name)
 
     # ----- introspection (pure; used by emit + selection) ------------------------
-    def leaves(self) -> Tuple[Tuple[object, Size, int], ...]:
-        """Flat ``(primitive, size, key)`` list of every primitive in the plan."""
+    def leaves(self, _inherit: Size = None) -> Tuple[Tuple[object, Size, int], ...]:
+        """Flat ``(primitive, size, key)`` list of every primitive in the plan.
+        A ``size`` set on a compound shape (``(a - b).sized(h)``, ``core.name("core").sized(h)``)
+        is inherited by every primitive leaf underneath it that has no size of its own — so
+        per-region ``.sized()`` on a CSG region actually reaches the mesher's per-primitive
+        Distance/Threshold fields instead of being silently dropped. A leaf's own size wins."""
+        size = self._size if self._size is not None else _inherit
         node = self._node
         kind = node[0]
         if kind == "leaf":
             prim, key = node[1], node[2]
-            return ((prim, self._size, key),)
+            return ((prim, size, key),)
         if kind in ("cut", "fuse", "inter"):
-            return node[1].leaves() + node[2].leaves()
+            return node[1].leaves(size) + node[2].leaves(size)
         if kind in ("extrude", "revolve", "translate", "rotate", "fillet", "sweep"):
-            return node[1].leaves()
+            return node[1].leaves(size)
         if kind == "regions":
             out: Tuple[Tuple[object, Size, int], ...] = ()
             for _name, sub in node[1]:
-                out += sub.leaves()
+                out += sub.leaves(size)
             return out
         raise ValueError(f"unknown node kind {kind!r}")
 

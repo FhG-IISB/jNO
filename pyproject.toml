@@ -190,3 +190,6 @@ petsc4py = ">=3.25.4,<4"
 
 [tool.pixi.feature.dev.dependencies]
 matplotlib = ">=3.11.0,<4"
+
+[tool.pixi.feature.fem.dependencies]
+plotly = ">=6.9.0,<7"
