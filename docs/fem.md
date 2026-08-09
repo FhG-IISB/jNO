@@ -987,6 +987,13 @@ block. Each step warm-starts from the previous state (so `x0=` is rejected).
 > host-path-only: `lu()` on GPU goes through cuSolver's `spsolve`, a single fused call with no
 > factorization object to keep.
 
+> **Adjoint memory: the march is gradient-checkpointed.** Reverse-mode through the default integrator
+> rematerializes each step in the backward pass instead of storing every step's solver internals for
+> the whole trajectory. Measured at 8,355 DOFs × 399 steps: peak memory **968 → 112 MB (8.6×)** for a
+> gradient cost of **+60%** (2.98 → 4.76 s), gradient identical to 10 digits. The trade is
+> deliberate: a differentiable march OOMs long before it is time-walled on consumer cards. A pure
+> forward solve is unaffected — checkpointing is the identity outside differentiation.
+
 **Complex problems** are assembled as one real `2n` system over the stacked `[Re; Im]` state — the
 real-equivalent block `[[A_r, -A_i], [A_i, A_r]]` — at assembly rather than at solve time. A complex
 transient is therefore an ordinary transient block (the slots configure its per-step solve as above, and

@@ -515,7 +515,17 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
         )
         return wn, wn
 
-    _, ys = jax.lax.scan(step, s0, grid_ts[1:])
+    # ``jax.checkpoint`` on the scan body: reverse-mode otherwise saves every step's *internal*
+    # residuals (the rhs, the θ-combination, the Krylov solve's saved primals — measured ~32 vectors
+    # per step) for the whole march; the trajectory itself is the scan output and is kept either way.
+    # Rematerializing the step in the backward pass trades one forward recompute for that stash.
+    # Measured at 8,355 DOFs × 399 steps (RTX 3070, x64): peak memory **967.7 → 112.0 MB (8.6×)** for
+    # a gradient cost of **2975.5 → 4756.0 ms (+60%)**, gradient identical to 10 digits. The memory
+    # side wins the default: a differentiable march OOMs long before it is time-walled on the cards
+    # this library targets (an un-checkpointed 6000-step × 18k-DOF case failed to allocate 5.72 GiB
+    # on an 8 GB card — see the sampling note below). A pure forward solve pays nothing — checkpoint
+    # is the identity outside differentiation.
+    _, ys = jax.lax.scan(jax.checkpoint(step), s0, grid_ts[1:])
 
     traj = jnp.concatenate([s0[None, :], ys], axis=0)  # (n_grid, n_dofs) at grid_ts
     save_ts = jnp.asarray(save_ts, dtype)
