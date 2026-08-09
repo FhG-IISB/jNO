@@ -475,7 +475,7 @@ def picard(
     )
 
 
-def eigs(*, k: int = 6, which: str = "smallest", sigma=None, linear=None, precond=None, tol=None, maxiter=None):
+def eigs(*, k: int = 6, which: str = "smallest", sigma=None, linear=None, precond=None, tol=None, maxiter=None, X0=None):
     """Generalized **symmetric eigensolver** ``K x = λ M x`` (K symmetric, M SPD). Returns a callable
     ``(K, M=None) -> (λ, X)``: the ``k`` eigenvalues at the requested end (``which='smallest'`` /
     ``'largest'``) and their **M-orthonormal** eigenvectors (``Xᵀ M X = I``). ``M=None`` is the standard
@@ -534,6 +534,19 @@ def eigs(*, k: int = 6, which: str = "smallest", sigma=None, linear=None, precon
             "jno.solve.eigs: linear= picks the inner solver of the shift-invert path and means "
             "nothing without sigma=. Pass sigma=, or drop linear=."
         )
+    if X0 is not None:
+        if sigma is not None:
+            raise NotImplementedError(
+                "jno.solve.eigs: X0= (warm start) is not wired into the shift-invert path yet — the "
+                "spectral transformation converges from random in a handful of sweeps anyway. Drop "
+                "X0=, or drop sigma= and warm-start the LOBPCG path."
+            )
+        if precond is None:
+            raise ValueError(
+                "jno.solve.eigs: X0= seeds the iterative (LOBPCG) block, but no precond= was given, "
+                "so the dense reduction would run and silently ignore it. Pass precond= (e.g. "
+                "jno.precond.jacobi()), or drop X0=."
+            )
     if precond is None and sigma is None and (tol is not None or maxiter is not None):
         raise ValueError(
             "jno.solve.eigs: tol=/maxiter= configure the iterative paths, but neither precond= nor "
@@ -556,7 +569,7 @@ def eigs(*, k: int = 6, which: str = "smallest", sigma=None, linear=None, precon
 
         op = K if isinstance(K, LinearOperator) else LinearOperator(K)
         apply = materialize_precond(precond, PrecondContext(op))
-        lam, X, res = lobpcg_geneigh(K, M, k, which, precond=apply, tol=_tol, maxiter=_maxiter)
+        lam, X, res = lobpcg_geneigh(K, M, k, which, precond=apply, tol=_tol, maxiter=_maxiter, X0=X0)
         bad = res > _tol  # budget exhausted -> poison, never a quietly under-converged spectrum
         return jnp.where(bad, jnp.nan, lam), jnp.where(bad, jnp.nan, X)
 

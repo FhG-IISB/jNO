@@ -224,6 +224,19 @@ lam, X = K.eigs(mass=[ui * vi], k=4, sigma=60.0)               # the 4 modes nea
 `jno.solve.eigs(...)` is the lower-level form of the same thing and takes two **assembled operators**
 rather than a fem and a term list — `jno.solve.eigs(k=6)(K.operator[0], M)`.
 
+**Sweeps warm-start.** `X0=` seeds the LOBPCG block with eigenvector guesses in the full DOF space
+(restricted through any constraint elimination for you) — the classic sweep accelerator: a
+parameter/frequency/k-point sweep passes each point the previous point's eigenvectors, so the
+iteration only tracks the drift instead of re-finding the subspace from random. Fewer columns than
+`k` are padded with the seeded random block. `X0=` is rejected on the dense path (it would be
+silently ignored) and not yet wired into `sigma=` (the transformation converges from random in a
+handful of sweeps anyway):
+
+```python
+lam, X = K.eigs(mass=mass, k=6, precond=jno.precond.jacobi())            # first sweep point
+lam2, X2 = K2.eigs(mass=mass, k=6, precond=jno.precond.jacobi(), X0=X)   # next point: warm
+```
+
 The Rayleigh–Ritz runs in the **M-inner product**, so an ordinary FEM form's consistent (non-lumped)
 mass matrix is handled directly, and `XᵀMX = I` holds on both paths. Eigenvalues are differentiable on
 both — for **simple** eigenvalues; a degenerate cluster makes `∂λ/∂θ` ill-defined either way (use the

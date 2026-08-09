@@ -427,3 +427,37 @@ def test_eigs_sigma_eigenvalue_is_differentiable():
     fd = float((lam_of(1.0 + 1e-6) - lam_of(1.0 - 1e-6)) / 2e-6)
     assert abs(g - fd) / abs(fd) < 1e-4
     assert abs(g - val) / val < 1e-5
+
+
+def test_eigs_warm_start_converges_where_cold_start_poisons():
+    """``X0=`` seeds the LOBPCG block — the sweep accelerator: re-solving from the previous answer
+    must converge inside a budget that NaN-poisons a cold random start. Verified on the constrained
+    (Dirichlet-eliminated) pencil, so the full-space → reduced restriction of the warm columns is
+    exercised too."""
+    d, K, mass = _dirichlet_box(0.06)
+    lam_ref, X_ref = K.eigs(mass=mass, k=4, precond=jno.precond.jacobi(), tol=1e-6, maxiter=400)
+    assert np.all(np.isfinite(np.asarray(lam_ref)))
+
+    lam_cold, _ = K.eigs(mass=mass, k=4, precond=jno.precond.jacobi(), tol=1e-6, maxiter=3)
+    assert np.isnan(np.asarray(lam_cold)).all(), "3 sweeps from random must exhaust and poison"
+
+    lam_warm, X_warm = K.eigs(mass=mass, k=4, precond=jno.precond.jacobi(), tol=1e-6, maxiter=3, X0=X_ref)
+    lam_warm = np.asarray(lam_warm)
+    assert np.all(np.isfinite(lam_warm)), "warm-started from the answer, 3 sweeps must suffice"
+    assert np.allclose(lam_warm, np.asarray(lam_ref), rtol=1e-6)
+
+    # a partial warm start (fewer columns than k) pads with the random block and still helps nothing
+    # break: it must at least run and return the right spectrum with a real budget
+    lam_part, _ = K.eigs(mass=mass, k=4, precond=jno.precond.jacobi(), tol=1e-6, maxiter=400, X0=X_ref[:, :2])
+    assert np.allclose(np.asarray(lam_part), np.asarray(lam_ref), rtol=1e-4)
+
+
+def test_eigs_warm_start_argument_guards():
+    """X0= without the LOBPCG path would be silently ignored — reject; the shift-invert path does not
+    take a warm start yet — say so by name."""
+    d, K, mass = _dirichlet_box(0.2)
+    lam_ref, X_ref = K.eigs(mass=mass, k=2)
+    with pytest.raises(ValueError, match="X0"):
+        K.eigs(mass=mass, k=2, X0=X_ref)
+    with pytest.raises(NotImplementedError, match="X0"):
+        K.eigs(mass=mass, k=2, sigma=50.0, X0=X_ref)

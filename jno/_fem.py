@@ -1902,7 +1902,17 @@ class FEM:
         return _as_flat(self._b)
 
     def eigs(
-        self, *, mass, k: int = 6, which: str = "smallest", sigma=None, linear=None, precond=None, tol=None, maxiter=None
+        self,
+        *,
+        mass,
+        k: int = 6,
+        which: str = "smallest",
+        sigma=None,
+        linear=None,
+        precond=None,
+        tol=None,
+        maxiter=None,
+        X0=None,
     ):
         """Generalized eigenproblem ``K x = λ M x`` on this fem: ``K`` is this **source-less** fem's
         operator (its stiffness bilinear form) and ``M`` is the ``mass`` bilinear form assembled on the
@@ -1951,7 +1961,13 @@ class FEM:
         # 47.2 where the true reduced spectrum has no such eigenvalue).
         self.domain._fem_native_dirichlet_pairs = _pairs
 
-        solver = _solve.eigs(k=k, which=which, sigma=sigma, linear=linear, precond=precond, tol=tol, maxiter=maxiter)
+        # A warm start (the previous sweep point's eigenvectors) arrives in the FULL DOF space the
+        # caller sees; the constrained solve runs in the reduced one, so restrict its columns.
+        if X0 is not None and restrict is not None:
+            _W = jnp.asarray(X0)
+            _W = _W[:, None] if _W.ndim == 1 else _W
+            X0 = jax.vmap(restrict, in_axes=1, out_axes=1)(_W)
+        solver = _solve.eigs(k=k, which=which, sigma=sigma, linear=linear, precond=precond, tol=tol, maxiter=maxiter, X0=X0)
         if restrict is None:
             return solver(K, M)
 

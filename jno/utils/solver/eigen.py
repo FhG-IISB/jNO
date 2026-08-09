@@ -141,6 +141,7 @@ def lobpcg_geneigh(
     tol: float = 1e-6,
     maxiter: int = 200,
     seed: int = 0,
+    X0=None,
 ):
     """The ``k`` eigenpairs of ``K x = λ M x`` by **preconditioned LOBPCG**, without densifying either
     operator.
@@ -171,6 +172,11 @@ def lobpcg_geneigh(
             just burns the whole budget and NaN-poisons a perfectly good spectrum.
         maxiter: sweep budget. Reaching it is **not** an error — check the returned residual.
         seed: PRNG seed for the random initial block (deterministic by default, so runs reproduce).
+        X0: warm-start eigenvector guesses, ``(n, j)`` columns with ``j ≤ k`` + guards (a single
+            vector may be 1-D). The classic sweep accelerator: a parameter/frequency/k-point sweep
+            seeds each solve with the previous point's eigenvectors, cutting the sweeps to the few
+            that track the drift instead of re-finding the subspace from random. Missing columns are
+            padded with the seeded random block; the columns should be linearly independent.
 
     Returns:
         ``(λ, X, res)`` — eigenvalues ``(k,)`` in the requested order, M-orthonormal eigenvectors
@@ -238,9 +244,19 @@ def lobpcg_geneigh(
         _l, _r, res_n = ritz(Xn, k)
         return (i + 1, Xn, Pn, res_n)
 
-    X0 = jax.random.normal(jax.random.PRNGKey(seed), (n, kb), dtype=dtype.dtype)
-    X0 = _m_orth_ordered(X0, _blockmv(Mop, X0), eps_chol)
-    init = (0, X0, jnp.zeros_like(X0), jnp.asarray(jnp.inf, dtype.dtype))
+    V0 = jax.random.normal(jax.random.PRNGKey(seed), (n, kb), dtype=dtype.dtype)
+    if X0 is not None:
+        W0 = jnp.asarray(X0, dtype.dtype)
+        W0 = W0[:, None] if W0.ndim == 1 else W0
+        if W0.shape[0] != n or W0.shape[1] > kb:
+            raise ValueError(
+                f"jno.solve.eigs: X0 must be (n, j) warm-start columns with n={n} and j <= {kb} "
+                f"(k + guard vectors); got {tuple(W0.shape)}."
+            )
+        # warm columns lead, the seeded random block pads the guards — _m_orth_ordered keeps the order
+        V0 = jnp.concatenate([W0, V0[:, W0.shape[1] :]], axis=1)
+    V0 = _m_orth_ordered(V0, _blockmv(Mop, V0), eps_chol)
+    init = (0, V0, jnp.zeros_like(V0), jnp.asarray(jnp.inf, dtype.dtype))
     # stop_gradient: the sweeps are a search for the eigenvector, not part of the value's definition.
     # `while_loop` is reverse-mode-hostile, and it does not need to be differentiable — the gradient is
     # recovered exactly from the Rayleigh quotient below (see the docstring).
