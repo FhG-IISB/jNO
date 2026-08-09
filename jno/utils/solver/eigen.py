@@ -99,6 +99,57 @@ def _blockmv(op, X):
     return jax.vmap(op.mv, in_axes=1, out_axes=1)(X)
 
 
+def _require_symmetric(op, name: str, *, probes: int = 2, seed: int = 12345) -> None:
+    """Fail loud when ``op`` is not symmetric — every path here solves the **symmetric** pencil.
+
+    Both reductions Hermitianize by construction (:func:`dense_geneigh` forms ``½(K+Kᵀ)``; LOBPCG's
+    Rayleigh–Ritz symmetrizes its projected matrix). That is right for *assembly roundoff* and
+    silently **wrong** for a genuinely non-self-adjoint operator, because it answers a different
+    question: measured on a deliberately non-symmetric ``K``, the values returned were exactly the
+    spectrum of ``½(K+Kᵀ)`` and **not one of them was an eigenvalue of** ``K`` — whose true spectrum
+    was complex. Non-self-adjoint operators are the normal case in plasma/flow stability (resistive
+    tearing, drift waves, anything with a mean flow), where the answer is a complex growth rate.
+
+    Tested through the **bilinear form** rather than by forming ``Kᵀ``: ``⟨w, Kv⟩ = ⟨Kw, v⟩`` for all
+    ``v, w`` iff ``K = Kᵀ``. Two matvecs per probe, no transpose is ever materialized, and it works
+    on a **matvec-only** operator — which the constraint-reduced pencil ``PᵀKP`` is. **Concrete-only**:
+    under a trace the probes come back as tracers and the check is skipped, the same contract as
+    :func:`jno.utils.solver.solver_api._maybe_residual_check`.
+    """
+    if op is None:
+        return
+    o = _as_op(op)
+    shape = getattr(o, "shape", None)
+    if shape is None:  # an unsized matvec cannot be probed
+        return
+    import numpy as np
+
+    n = int(shape[0])
+    rng = np.random.default_rng(seed)
+    dt = _as_dense_dtype(op)
+    tol = max(1e-8, 1e3 * float(jnp.finfo(jnp.zeros((), dt).dtype).eps))
+    worst = 0.0
+    for _ in range(probes):
+        v = jnp.asarray(rng.standard_normal(n), dt)
+        w = jnp.asarray(rng.standard_normal(n), dt)
+        Kv, Kw = o.mv(v), o.mv(w)
+        if isinstance(Kv, jax.core.Tracer) or isinstance(Kw, jax.core.Tracer):
+            return  # traced operator: cannot concretise, so do not fabricate a verdict
+        # plain (non-conjugated) products: this tests K = Kᵀ, matching what dense_geneigh imposes
+        num = abs(complex(jnp.sum(w * Kv) - jnp.sum(Kw * v)))
+        den = float(jnp.linalg.norm(w) * jnp.linalg.norm(Kv)) + 1e-300
+        worst = max(worst, num / den)
+    if worst > tol:
+        raise ValueError(
+            f"jno.solve.eigs: {name} is NOT symmetric (relative asymmetry {worst:.2e} > {tol:.0e}). "
+            "This solver reduces the SYMMETRIC pencil, so it would silently return the spectrum of "
+            f"½({name}+{name}ᵀ) — a different problem: a non-self-adjoint operator generally has "
+            "COMPLEX eigenvalues, and none of the symmetrized values need be an eigenvalue of "
+            f"{name} at all. A non-symmetric eigensolver is not available yet. If you are certain "
+            f"you want the symmetrized surrogate, pass it explicitly: 0.5*({name} + {name}.T)."
+        )
+
+
 def _m_orth_basis(V, MV, rtol):
     """A transform ``Z`` making ``V Z`` M-orthonormal, via the eigendecomposition of the M-Gram.
 

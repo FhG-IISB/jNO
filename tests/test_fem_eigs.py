@@ -461,3 +461,106 @@ def test_eigs_warm_start_argument_guards():
         K.eigs(mass=mass, k=2, X0=X_ref)
     with pytest.raises(NotImplementedError, match="X0"):
         K.eigs(mass=mass, k=2, sigma=50.0, X0=X_ref)
+
+
+# --------------------------------------------------------------------------------------------------
+# Symmetry guard: this solver reduces the SYMMETRIC pencil only
+# --------------------------------------------------------------------------------------------------
+
+
+def _nonsymmetric_pencil(n=40, skew=2.0, seed=0):
+    """K = (symmetric part) + skew*(skew-symmetric part) — genuinely non-self-adjoint, with a
+    complex spectrum, exactly the shape of a linearized plasma/flow stability operator."""
+    rng = np.random.default_rng(seed)
+    S = rng.normal(size=(n, n))
+    S = 0.5 * (S + S.T)
+    A = rng.normal(size=(n, n))
+    A = 0.5 * (A - A.T)
+    return S + skew * A
+
+
+def test_eigs_refuses_a_nonsymmetric_operator():
+    """A non-symmetric K used to be SILENTLY symmetrized: the solver returned the spectrum of
+    ½(K+Kᵀ), and (measured) not one returned value was an eigenvalue of K, whose true spectrum was
+    complex. Every plasma/flow stability operator is non-self-adjoint, so this must refuse."""
+    K = _nonsymmetric_pencil()
+    n = K.shape[0]
+    true = np.linalg.eigvals(K)
+    assert np.abs(true.imag).max() > 1.0, "fixture must have a genuinely complex spectrum"
+
+    with pytest.raises(ValueError, match="NOT symmetric"):
+        jno.solve.eigs(k=4)(jnp.asarray(K), jnp.eye(n))
+    # the message must name the measured asymmetry and the escape hatch
+    with pytest.raises(ValueError, match=r"0\.5\*\(K \+ K\.T\)"):
+        jno.solve.eigs(k=4)(jnp.asarray(K), jnp.eye(n))
+    # ... and it must guard the iterative and shift-invert paths too, not just the dense reduction
+    with pytest.raises(ValueError, match="NOT symmetric"):
+        jno.solve.eigs(k=4, precond=jno.precond.jacobi())(jnp.asarray(K), jnp.eye(n))
+    with pytest.raises(ValueError, match="NOT symmetric"):
+        jno.solve.eigs(k=2, sigma=0.5)(jnp.asarray(K), jnp.eye(n))
+
+
+def test_eigs_refuses_a_nonsymmetric_mass():
+    """M is checked too — an asymmetric mass breaks the M-inner product every path relies on."""
+    n = 30
+    K = np.eye(n) * 2.0
+    M = np.eye(n) + 0.3 * np.tril(np.ones((n, n)), -1)  # lower-triangular perturbation: asymmetric
+    with pytest.raises(ValueError, match="M is NOT symmetric"):
+        jno.solve.eigs(k=3)(jnp.asarray(K), jnp.asarray(M))
+
+
+def test_eigs_symmetrized_surrogate_is_still_reachable_explicitly():
+    """The guard refuses to GUESS, not to obey: passing the symmetric part explicitly is accepted
+    and gives that operator's spectrum."""
+    K = _nonsymmetric_pencil()
+    n = K.shape[0]
+    Ks = 0.5 * (K + K.T)
+    lam, _ = jno.solve.eigs(k=4)(jnp.asarray(Ks), jnp.eye(n))
+    assert np.allclose(np.sort(np.asarray(lam)), np.sort(np.linalg.eigvalsh(Ks))[:4], rtol=1e-8)
+
+
+def test_eigs_symmetry_guard_tolerates_assembly_roundoff():
+    """The guard must not fire on a real FEM pencil, whose asymmetry is summation roundoff — that is
+    exactly what the reductions' Hermitianization is legitimately for."""
+    K, mass = _laplacian(0.09)
+    lam, _ = K.eigs(mass=mass, k=4)
+    assert np.all(np.isfinite(np.asarray(lam)))
+    # explicit perturbation just under / over the threshold, to pin where the line sits
+    A = _dense(K.operator[0])
+    n = A.shape[0]
+    rng = np.random.default_rng(3)
+    P = rng.normal(size=(n, n))
+    P = 0.5 * (P - P.T)
+    scale = np.abs(A).max()
+    jno.solve.eigs(k=2)(jnp.asarray(A + 1e-12 * scale * P), jnp.eye(n))  # roundoff-level: accepted
+    with pytest.raises(ValueError, match="NOT symmetric"):
+        jno.solve.eigs(k=2)(jnp.asarray(A + 1e-3 * scale * P), jnp.eye(n))
+
+
+def test_eigs_symmetry_guard_is_silent_under_trace():
+    """Concrete-only, like every other eager guard in the library: under jit/grad the probes come
+    back as tracers and the check must skip rather than crash the transform."""
+    K, mass = _laplacian(0.12)
+    K0 = jnp.asarray(_dense(K.operator[0]))
+    M0 = jnp.asarray(_dense(jno.fem(mass).operator[0]))
+    solver = jno.solve.eigs(k=3)
+
+    def lam_of(s):
+        lam, _ = solver(s * K0, M0)
+        return lam[2]
+
+    g = float(jax.grad(lam_of)(1.0))  # must not raise
+    fd = float((lam_of(1.0 + 1e-6) - lam_of(1.0 - 1e-6)) / 2e-6)
+    assert abs(g - fd) / abs(fd) < 1e-4
+
+
+def test_eigs_dirichlet_application_is_symmetric_so_the_guard_stays_quiet():
+    """A constrained fem's ``operator[0]`` is EXACTLY symmetric (measured 0.0): jNO applies Dirichlet
+    by zeroing rows AND columns with a unit diagonal, not by row replacement alone. So the symmetry
+    guard correctly stays out of the way here — the constrained-pencil hazard is the *spurious
+    identity modes*, an unrelated problem that ``FEM.eigs`` solves by ELIMINATING those DOFs."""
+    d, K, mass = _dirichlet_box(0.15)
+    A = _dense(K.operator[0])
+    assert np.linalg.norm(A - A.T) / np.linalg.norm(A) == 0.0
+    lam, _ = K.eigs(mass=mass, k=3)
+    assert np.all(np.isfinite(np.asarray(lam)))
