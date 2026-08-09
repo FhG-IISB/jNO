@@ -380,7 +380,28 @@ class SemidiscreteTimeBlock:
         wn, _ = jax.scipy.sparse.linalg.bicgstab(
             step_op, rhs, x0=u, tol=1e-10, atol=0.0, maxiter=20_000, M=lambda x: inv * x
         )
-        return wn
+        # BiCGStab's breakdown/stall exit is only benign on the SYMMETRIC blocks the default was
+        # chosen for. Measured on a coupled first-order block with a velocity-identity coupling
+        # (genuinely non-symmetric, cond(M+dtA)=54): with a degenerate warm start it returns NaN
+        # outright (exact mid-iteration convergence makes ``omega = 0/0``, and NaN passes jax's
+        # ``omega != 0`` breakdown test), and with a healthy warm start it EXITS SILENTLY at ~1e-2
+        # relative residual — each step slightly wrong, compounding to 1e62 over 60 steps. The steady
+        # default would have raised (its eager residual check); a traced scan cannot raise, so VERIFY
+        # the step and re-solve with GMRES when the residual is not small — GMRES has no breakdown
+        # division and measured 1e-16 per step on the same block. Cost: one extra matvec + one scalar
+        # reduce per step; the comparison is False for a NaN residual too, so both failure modes take
+        # the rescue. The healthy stall floor (measured 8e-11 in f64, ~1e-5 in f32) sits well under
+        # the dtype-scaled threshold, so a symmetric march never pays the GMRES.
+        eps = float(jnp.finfo(rhs.dtype).eps)
+        r_rel = jnp.linalg.norm(step_op(wn) - rhs) / jnp.maximum(jnp.linalg.norm(rhs), eps)
+        ktol = max(1e-10, 100.0 * eps)
+        return jax.lax.cond(
+            r_rel < max(1e-9, 1e4 * eps),
+            lambda: wn,
+            lambda: jax.scipy.sparse.linalg.gmres(
+                step_op, rhs, x0=u, tol=ktol, atol=0.0, restart=min(n, 40), M=lambda x: inv * x
+            )[0],
+        )
 
     def solve(self, solve_fn=None, *, save_ts=None):
         """Differentiable transient forward solve -> the trajectory ``u(save_ts)`` as a

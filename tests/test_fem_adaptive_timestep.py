@@ -428,14 +428,17 @@ def test_complex_transient_exponential_scheme_routes():
     assert out.dtype == np.complex128 and not np.any(np.isnan(out))
 
 
-def test_complex_transient_adapt_still_fails_loud():
-    """Scope limit, stated explicitly: fusing the block makes a complex transient *route* into the adaptive
-    transient driver, but that driver's cross-remesh state transfer interpolates a real nodal field and the
-    fused state is the stacked ``[Re; Im]`` pair. Until the transfer carries the two halves separately this
-    must fail loud rather than interpolate half a complex field."""
+def test_complex_transient_adapt_composes():
+    """The scope limit this test used to pin is GONE: the adaptive transient driver now carries the
+    fused ``[Re; Im]`` halves separately (a doubled field layout drives the transfer, the modulus
+    drives the metric), so a complex transient composes with ``adapt=`` instead of failing loud.
+    Smoke here — the analytic-recovery and zero-IC extremes live in test_fem_adapt_complex.py."""
     _, fem = _complex_heat(mesh_size=0.3)
-    with pytest.raises(NotImplementedError, match="complex"):
-        fem.solve(adapt=jno.solve.remesh(every=2))
+    traj = fem.solve(adapt=jno.solve.remesh(every=2, max_dofs=80))
+    final, _mesh = traj.final()
+    final = np.asarray(final)
+    assert np.iscomplexobj(final), "adaptive frames of a complex transient must be complex"
+    assert not np.isnan(final).any()
 
 
 def test_exhausted_budget_poison_reaches_the_adjoint():
