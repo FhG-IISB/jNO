@@ -895,120 +895,53 @@ def _complex_operator(A_r: Any, A_i: Any) -> Any:
 
 def _solve_complex_block(
     ops: Any,
-    solve_fn: Optional[Callable] = None,
     periodic: Optional[dict] = None,
     complex_solve: Optional[Callable] = None,
-    from_slots: bool = False,
 ) -> Any:
-    """Solve a complex linear FEM system via the real-equivalent block (everything was
-    assembled as two *real* systems)::
+    """Solve a complex linear FEM system on its COMPLEX operator ``A_c = A_r + i·A_i`` — the
+    **complex-native** path.
 
-        [[A_r, -A_i], [A_i, A_r]] [u_r; u_i] = [b_r; b_i],     u = u_r + i u_i.
+    Every ordinary complex solve runs on the fused real-equivalent ``2n`` block (see
+    :func:`_fuse_complex_steady`); the one consumer that genuinely wants ``A_c`` itself is a
+    complex-native preconditioner (``precond=`` with ``complex_native=True``, i.e. AMS), whose
+    multigrid coarsens the complex-symmetric operator but diverges on the skew-dominated ``2n``
+    block. ``ops = (op_r, op_i)`` are the retained Re/Im legs (each a raw ``(A, b)`` or a parametric
+    :class:`FemLinearSystem`); a parametric leg makes this return a differentiable
+    :class:`FunctionCall` node that re-forms and re-solves per call.
 
-    ``ops = (op_r, op_i)`` are the Re-coeff and Im-coeff real systems (each a raw ``(A, b)``).
-
-    The real-equivalent block is itself **sparse** -- ``[[A_r,-A_i],[A_i,A_r]]`` is four sparse
-    sub-blocks -- so by default it is assembled as one BCOO (concatenating the triplets at the right
-    ``n`` offsets) and solved with the same sparse-direct path the real solves use, never densifying
-    (memory ``O(nnz)``; robust on the indefinite Helmholtz block). Pass ``solve_fn=(A, b) -> u`` to
-    use a dense/direct solver instead -- it receives the densified block.
-
-    Each leg is a raw ``(A, b)`` (forward solve) or a parametric :class:`FemLinearSystem` (the complex
-    *inverse*): when either leg is parametric this returns a differentiable :class:`FunctionCall` trace
-    node instead of an array, so a real ``jno.np.parameter`` recovered through a complex forward solve
-    trains through ``crux`` -- the same real-equivalent block, with ``A(θ), b(θ)`` re-formed and the
-    block re-solved on each call.
-
-    A periodic tie reduces *both* legs by the **same** prolongation ``P`` -- Re and Im live on one FE
-    space, so one ``P`` -- before the block is formed: ``A -> P^T A P``, ``b -> P^T b`` on each leg.
-    Because the same ``P`` hits both, ``blkdiag(P, P)^T [[A_r,-A_i],[A_i,A_r]] blkdiag(P, P)`` preserves
-    the real-equivalent structure exactly; the reduced complex solution is prolonged back ``u = P u_red``."""
+    A periodic tie reduces the legs BEFORE the complex operator is formed, with the Hermitian
+    ``P^H · P`` — identical to ``Pᵀ · P`` for a real ``P``, and the reduction the quasi-periodic
+    space requires for a Bloch (complex) ``P``. The reduced complex solution is prolonged back with
+    the same ``P``: directly when ``P`` is complex, per real/imag half when ``P`` is real (a direct
+    prolong would cast to ``P``'s real dtype and silently drop the imaginary part)."""
     from .trace import FemLinearSystem, FunctionCall
     from .utils.solver.fem_utils import prolong_periodic, reduce_matrix_periodic, reduce_vector_periodic
 
-    bloch = bool(periodic is not None and periodic.get("is_bloch", False))
+    if complex_solve is None:
+        raise ValueError(
+            "jno.fem internal: _solve_complex_block is the complex-native (AMS) path and requires "
+            "complex_solve; every other complex solve runs on the fused real-equivalent block."
+        )
 
-    def _ab(op, args, conj=False):
+    def _ab(op, args):
         A, b = op.evaluate(args) if isinstance(op, FemLinearSystem) else op
         b = jnp.asarray(b).reshape(-1)
         if periodic is not None:
-            A = reduce_matrix_periodic(periodic, A, conj=conj)  # P^T A P (P^H when Bloch); stays sparse
-            b = reduce_vector_periodic(periodic, b, conj=conj)  # P^T b (P^H when Bloch)
+            A = reduce_matrix_periodic(periodic, A, conj=True)  # P^H A P (= P^T A P for a real P)
+            b = reduce_vector_periodic(periodic, b, conj=True)
         return A, b  # keep A sparse (BCOO) -- do NOT densify
 
-    def _bloch_solve(args):
-        # Bloch/quasi-periodic: P is complex, so the reduced operator A_c = P^H (A_r + i A_i) P mixes
-        # Re/Im and cannot be split into independent legs. Reduce Hermitian, form the complex reduced
-        # operator, solve, and prolong with the complex P.
-        (A_r, b_r), (A_i, b_i) = _ab(ops[0], args, conj=True), _ab(ops[1], args, conj=True)
-        b_c = jnp.asarray(b_r) + 1j * jnp.asarray(b_i)
-        n = b_c.shape[0]
-        if hasattr(A_r, "indices") and hasattr(A_i, "indices"):
-            # Stay SPARSE. `reduce_matrix_periodic` already keeps the reduction sparse, so densifying here
-            # just to call `jnp.linalg.solve` reintroduced the O(n²) peak it exists to avoid — tolerable for
-            # a small reduced cell, ruinous for a 3-D metasurface unit cell. Both reduced legs are
-            # themselves COMPLEX (P^H is complex even for a real leg), so fuse them into A_c = A_r + i·A_i
-            # over the concatenated index set, split into Re/Im parts sharing that index set, and
-            # sparse-direct-solve the real-equivalent 2n block. Repeated (i, j) entries from the
-            # concatenation are merged by `sparse_lu_solve`'s `sum_duplicates`.
-            from jax.experimental import sparse as jsp
-
-            from .utils.solver.linear import sparse_lu_solve
-
-            idx = jnp.concatenate([A_r.indices, A_i.indices], axis=0)
-            dat = jnp.concatenate([jnp.asarray(A_r.data), 1j * jnp.asarray(A_i.data)])
-            re = jsp.BCOO((jnp.real(dat), idx), shape=(n, n))
-            im = jsp.BCOO((jnp.imag(dat), idx), shape=(n, n))
-            sol = sparse_lu_solve(_complex_block_bcoo(re, im, n), jnp.concatenate([jnp.real(b_c), jnp.imag(b_c)]))
-            u_red = sol[:n] + 1j * sol[n:]
-        else:  # dense fallback (1-D, or already-dense legs)
-            to_d = lambda M: jnp.asarray(M.todense() if hasattr(M, "todense") else M)  # noqa: E731
-            u_red = jnp.linalg.solve(to_d(A_r) + 1j * to_d(A_i), b_c)
-        return prolong_periodic(periodic, u_red)
-
     def _block_solve(args):
-        if bloch:
-            return _bloch_solve(args)
         (A_r, b_r), (A_i, b_i) = _ab(ops[0], args), _ab(ops[1], args)
-        n = b_r.shape[0]
-
-        if complex_solve is not None:
-            # Slot-composed iterative path (linear=/precond=): solve the COMPLEX system directly on the
-            # sparse operator A_r + i·A_i (never the dense 2n block), e.g. gmres + jno.precond.ams.
-            A_c = _complex_operator(A_r, A_i)
-            u = complex_solve(A_c, b_r + 1j * b_i)
-            return (
-                u
-                if periodic is None
-                else prolong_periodic(periodic, jnp.real(u)) + 1j * prolong_periodic(periodic, jnp.imag(u))
-            )
-
-        rhs = jnp.concatenate([b_r, b_i])
-        is_sparse = hasattr(A_r, "indices") and hasattr(A_i, "indices")
-
-        if solve_fn is not None and is_sparse:
-            # ANY solver -- yours or a slot-composed one -- gets the SPARSE 2n BCOO block
-            # [[A_r,-A_i],[A_i,A_r]] rather than a densified copy. Keeps it O(nnz), and it lets the
-            # composed solver's extreme-magnitude normalization fire (a dense block has no `.bcoo`, so
-            # a mass-dominated eddy system would otherwise stall the Krylov Arnoldi at real scale).
-            sol = jnp.asarray(solve_fn(_complex_block_bcoo(A_r, A_i, n), rhs))
-        elif solve_fn is not None:  # dense legs (vertex C1 families): nothing to keep sparse
-            Ar_d = jnp.asarray(A_r.todense() if hasattr(A_r, "todense") else A_r)
-            Ai_d = jnp.asarray(A_i.todense() if hasattr(A_i, "todense") else A_i)
-            sol = jnp.asarray(solve_fn(jnp.block([[Ar_d, -Ai_d], [Ai_d, Ar_d]]), rhs))
-        elif is_sparse:
-            from .utils.solver.linear import sparse_lu_solve
-
-            sol = sparse_lu_solve(_complex_block_bcoo(A_r, A_i, n), rhs)  # sparse-direct on the 2n block
-        else:
-            Ar_d, Ai_d = jnp.asarray(A_r), jnp.asarray(A_i)  # dense fallback (e.g. 1D / already dense)
-            sol = jnp.linalg.solve(jnp.block([[Ar_d, -Ai_d], [Ai_d, Ar_d]]), rhs)
-
+        # For a Bloch tie the Hermitian-reduced legs are each already complex; A_r + i·A_i is still the
+        # reduced complex operator (P^H A_r P + i·P^H A_i P), so the same fuse serves both cases.
+        A_c = _complex_operator(A_r, A_i)
+        u = complex_solve(A_c, b_r + 1j * b_i)
         if periodic is None:
-            return sol[:n] + 1j * sol[n:]
-        # Prolong the real and imaginary reduced halves *separately* (real P @ real vector); prolonging
-        # the complex vector directly would cast it to P's real dtype and silently drop the imaginary part.
-        return prolong_periodic(periodic, sol[:n]) + 1j * prolong_periodic(periodic, sol[n:])
+            return u
+        if periodic.get("is_bloch"):
+            return prolong_periodic(periodic, u)  # complex P prolongs the complex solution directly
+        return prolong_periodic(periodic, jnp.real(u)) + 1j * prolong_periodic(periodic, jnp.imag(u))
 
     # Forward (non-parametric): solve eagerly. Inverse: one or both legs are a parametric FemLinearSystem
     # -> return a trace node over the union of their runtime parameters so ∂u/∂θ flows through crux.
@@ -1229,11 +1162,11 @@ class FEM:
     def is_complex(self) -> bool:
         """A complex-valued problem (steady or transient), solved via the real-equivalent block.
 
-        Both steady and transient complex problems are fused into one real 2n system at assembly, so
-        they are ordinary ``"linear"`` / ``"transient"`` modes: a steady one announces itself through
-        ``_complex_n`` (the half size), a transient one through its block's ``metadata["complex"]``.
-        The surviving ``"complex"`` mode is the **Bloch** case alone, whose complex prolongation does
-        not split into two real legs."""
+        Both steady and transient complex problems — Bloch included — are fused into one real 2n
+        system at assembly, so they are ordinary ``"linear"`` / ``"transient"`` modes: a steady one
+        announces itself through ``_complex_n`` (the half size), a transient one through its block's
+        ``metadata["complex"]``. ``"complex"`` survives only as the internal pre-fusion tag the
+        assembly hands to :func:`_fuse_complex_steady`; no finalized ``FEM`` carries it."""
         if self._mode == "complex" or self._complex_n is not None:
             return True
         return bool((getattr(self._op, "metadata", None) or {}).get("complex"))
@@ -1731,12 +1664,6 @@ class FEM:
             # directly, never the real-equivalent block — so it wants the Re/Im legs the fusion retained,
             # not the fused 2n system. Real-equivalent preconditioners (form/jacobi/…) stay on the block.
             return _solve_complex_block(self._complex_legs, periodic=self._periodic, complex_solve=solve_fn)
-        if self._mode == "complex":
-            # Bloch only (a complex prolongation does not split into two real legs; everything else was
-            # fused into a real 2n system at assembly by `_fuse_complex_steady`).
-            if from_slots and getattr(precond, "complex_native", False):
-                return _solve_complex_block(self._op, periodic=self._periodic, complex_solve=solve_fn)
-            return _solve_complex_block(self._op, solve_fn, periodic=self._periodic, from_slots=from_slots)
         if self._mode == "linear" and not isinstance(self._op, FemLinearSystem):
             # Non-parametric steady linear. Default: matrix-free Jacobi-preconditioned BiCGStab on the
             # BCOO operator (never densifies -> memory O(nnz); GPU-safe; solves general systems). Pass
@@ -1910,13 +1837,6 @@ class FEM:
             return fn, kwargs
         if nonlinear is not None:
             raise ValueError(f"fem.solve: nonlinear= given, but this problem is {self._mode} (no linearization).")
-        if self._mode == "complex" and x0 is not None:
-            # Bloch only — the complex prolongation keeps this one off the real-equivalent block.
-            raise NotImplementedError(
-                "fem.solve: x0= on a *Bloch* (quasi-periodic) complex problem is not supported yet — "
-                "that path still solves through a complex prolongation rather than the real-equivalent "
-                "block. An ordinary complex problem accepts x0=."
-            )
         if self._complex_n is not None and x0 is not None:
             # A complex guess enters the real-equivalent layout the solve runs in: x0 = [Re; Im].
             _x0 = jnp.asarray(x0).reshape(-1)
@@ -2631,15 +2551,17 @@ def _fuse_complex_steady(fem_obj: "FEM") -> "FEM":
     for one consumer: a **complex-native** preconditioner (AMS) solves ``A_r + i·A_i`` directly rather
     than the real-equivalent block, and needs the legs to build it.
 
-    **Bloch is left alone.** A quasi-periodic tie has a *complex* ``P``, so ``P^H A P`` mixes Re and Im
-    and does not reduce to two independent real legs — that needs ``P`` itself in real-equivalent form.
-    Until then a Bloch problem keeps the ``"complex"`` mode and its dedicated block solve.
+    **Bloch fuses too.** A quasi-periodic tie has a *complex* ``P``, so it cannot reduce the two real
+    legs independently — but on the fused ``[Re; Im]`` state the same tie IS a *real* prolongation,
+    ``B(P) = [[P_r, -P_i], [P_i, P_r]]`` (see :func:`_bloch_realify_periodic`), and the ordinary real
+    congruence ``B(P)ᵀ A_blk B(P)`` equals the Hermitian reduction ``P^H A_c P`` exactly. So a Bloch
+    problem takes the very same fused path — ``x0=``, the solver slots and the default sparse solve all
+    apply — where it previously kept a dedicated complex block solve that silently discarded
+    ``solve_fn=`` and the composed slots.
     """
     if fem_obj._mode != "complex":
         return fem_obj
     per = fem_obj._periodic
-    if per is not None and per.get("is_bloch"):
-        return fem_obj  # complex P — not expressible as two real legs; see the docstring
     from .trace import FemLinearSystem as _FLS
 
     op_r, op_i = fem_obj._op
@@ -2681,8 +2603,14 @@ def _fuse_complex_steady(fem_obj: "FEM") -> "FEM":
     fem_obj._complex_n = n
     fem_obj._complex_legs = (op_r, op_i)
     fem_obj._A, fem_obj._b = (fused.A, fused.b) if isinstance(fused, _FLS) else fused
-    # the solve runs on the 2n block, so its periodic reduction is blkdiag(P, P)
-    fem_obj._periodic_2n = None if per is None else _duplicate_periodic(per)
+    # the solve runs on the 2n block, so its periodic reduction is blkdiag(P, P) — except a Bloch tie,
+    # whose complex P becomes the real-equivalent B(P) over the stacked [Re; Im] halves
+    if per is None:
+        fem_obj._periodic_2n = None
+    elif per.get("is_bloch"):
+        fem_obj._periodic_2n = _bloch_realify_periodic(per)
+    else:
+        fem_obj._periodic_2n = _duplicate_periodic(per)
     return fem_obj
 
 
@@ -2697,7 +2625,17 @@ def _duplicate_periodic(periodic: dict) -> dict:
 
     Duplicating the field's periodic blocks into a lower and an upper block is exactly ``blkdiag(P, P)``,
     which is what preserves the real-equivalent structure: ``blkdiag(P,P)ᵀ [[A_r,-A_i],[A_i,A_r]]
-    blkdiag(P,P)`` is again of that form, with each sub-block reduced by the same ``P``."""
+    blkdiag(P,P)`` is again of that form, with each sub-block reduced by the same ``P``.
+
+    **Real ``P`` only.** A Bloch tie's complex ``P`` mixes the two halves — ``blkdiag(P, P)`` would
+    leak complex data into the real block (measured: a ``while_loop`` carry dtype crash deep in JAX on
+    the transient march). That case is :func:`_bloch_realify_periodic`; taking it here is a bug."""
+    if periodic.get("is_bloch"):
+        raise NotImplementedError(
+            "jno.fem internal: _duplicate_periodic received a Bloch (complex-phase) prolongation — "
+            "blkdiag(P, P) with a complex P is not the real-equivalent reduction. Use "
+            "_bloch_realify_periodic for the fused [Re; Im] state."
+        )
     from .utils.solver.fem_utils import _periodic_blocks
 
     b, of, orr = _periodic_blocks(periodic)
@@ -2707,6 +2645,73 @@ def _duplicate_periodic(periodic: dict) -> dict:
         "blocks": list(b) + list(b),
         "off_full": np.concatenate([of[:-1], of + nf]),
         "off_red": np.concatenate([orr[:-1], orr + nr]),
+    }
+
+
+def _bloch_realify_periodic(periodic: dict) -> dict:
+    """Real-equivalent form ``B(P)`` of a complex (Bloch) prolongation, for the fused ``[Re; Im]`` state.
+
+    A quasi-periodic tie ``u(A) = c·u(B)`` with a complex phase ``c`` builds a complex ``P``
+    (``u_full = P w``), so it cannot reduce the Re/Im legs independently. On the fused ``2n`` state
+    ``x = [x_r; x_i]`` the SAME tie is the **real** prolongation
+
+        ``B(P) = [[P_r, -P_i], [P_i, P_r]]``,      ``x = B(P) y``,  ``y = [w_r; w_i]``,
+
+    and because ``B(M^H) = B(M)ᵀ`` and ``B(MN) = B(M)B(N)``, the ordinary real congruence
+    ``B(P)ᵀ A_blk B(P)`` of the fused block **is** the Hermitian reduction ``P^H A_c P`` of the complex
+    pencil — the one the Bloch space requires (Floquet FEM; the bilinear ``Pᵀ A P`` is *not* a Galerkin
+    projection for a complex ``P`` and was measured 8.1 rel-L2 off on a manufactured Bloch mode).
+
+    Returns an ordinary **real** single-block periodic dict over ``(2n, 2m)`` — downstream reduction,
+    restriction and prolongation then need no complex branch and no ``conj=`` anywhere. Master rows
+    carry weight 1 in each half; a slave row ties to its master's Re and Im columns (arity 2), which the
+    weighted-interpolation sparse remap already handles (``is_selection=False``)."""
+    if "blocks" in periodic:
+        raise NotImplementedError(
+            "jno.fem: a Bloch (complex-phase) tie on a coupled multifield problem is not supported — "
+            "the coupled complex assembly it needs does not exist yet. Use a single field, or a plain "
+            "periodic tie."
+        )
+    P = periodic["P"]
+    n, m = int(P.shape[0]), int(P.shape[1])
+    if hasattr(P, "indices"):  # BCOO (nodal path) — split the concrete triplets, drop exact-zero legs
+        idx = np.asarray(P.indices)
+        dat = np.asarray(P.data)
+        r, c = idx[:, 0], idx[:, 1]
+        rows = [r, r + n]
+        cols = [c, c + m]
+        vals = [dat.real, dat.real]
+        im_nz = dat.imag != 0.0
+        if im_nz.any():
+            ri, ci, wi = r[im_nz], c[im_nz], dat.imag[im_nz]
+            rows += [ri, ri + n]
+            cols += [ci + m, ci]
+            vals += [-wi, wi]
+        import jax.experimental.sparse as jsparse
+
+        B = jsparse.BCOO(
+            (
+                jnp.asarray(np.concatenate(vals), dtype=jnp.float64),
+                jnp.asarray(np.stack([np.concatenate(rows), np.concatenate(cols)], axis=1)),
+            ),
+            shape=(2 * n, 2 * m),
+        )
+    else:  # dense P (the N1E edge path)
+        Pd = np.asarray(P)
+        B = jnp.asarray(np.block([[Pd.real, -Pd.imag], [Pd.imag, Pd.real]]))
+    kept = np.asarray(periodic["kept_nodes"], dtype=np.int64)
+    vec = int(periodic.get("vec", 1))
+    if vec > 1:  # expand node-level kept to DOF-level before stacking the halves
+        kept = (kept[:, None] * vec + np.arange(vec)[None, :]).reshape(-1)
+    return {
+        "P": B,
+        "P_node": B,
+        "kept_nodes": np.concatenate([kept, kept + n]),
+        "n_full": 2 * n,
+        "n_red": 2 * m,
+        "vec": 1,  # kept_nodes is already DOF-level
+        "is_selection": False,  # a slave row ties to two masters (Re, Im) — the weighted remap path
+        "is_bloch": False,  # B(P) is REAL: no conj, no complex branch downstream
     }
 
 
@@ -2738,8 +2743,19 @@ def _reduce_transient_block_periodic(block: Any, periodic: dict) -> Any:
     # assemblies produce that shape, and every reduction below (M, A, operator_fn, forcing, state0)
     # then acts on the 2N system.
     _meta_in = getattr(block, "metadata", None) or {}
+    _bloch = "blocks" not in periodic and bool(periodic.get("is_bloch"))
+    if _bloch and not _meta_in.get("complex"):
+        # A complex phase forces a complex-valued field; this march carries a REAL state (a plain or
+        # second-order transient). Reducing with the complex P used to leak complex128 into the scan
+        # carry and crash with a bare while_loop dtype error at evaluation time — name the cause.
+        raise NotImplementedError(
+            "jno.fem: a Bloch/quasi-periodic tie (`u(A) - c*u(B)` with a complex phase c) on a REAL "
+            "transient march is not supported — the phase forces a complex-valued field, which this "
+            "real time block cannot represent. Make the problem complex (a 1j coefficient, source or "
+            "initial condition), or use a plain periodic tie (`u(A) - u(B)`)."
+        )
     if _meta_in.get("second_order") or _meta_in.get("complex"):
-        periodic = _duplicate_periodic(periodic)
+        periodic = _bloch_realify_periodic(periodic) if _bloch else _duplicate_periodic(periodic)
 
     blocks, off_f, off_r = _periodic_blocks(periodic)
     n_full, n_red = int(off_f[-1]), int(off_r[-1])
@@ -3438,10 +3454,38 @@ def _fem_impl(
             )
         else:
             periodic = _build_periodic_reduction(domain, periodic_ties, fem_obj.points, cells, ele_order, vec or 1)
+        if periodic.get("is_bloch") and fem_obj._mode in ("linear", "nonlinear"):
+            # A REAL form with a Bloch tie: the complex phase makes the field complex anyway, and the
+            # real path would reduce with the bilinear Pᵀ A P — which for a complex P is NOT a Galerkin
+            # projection (measured: rel-L2 8.1 off the Hermitian answer on a manufactured Bloch mode,
+            # with the tie itself satisfied exactly, so nothing looked wrong). Promote the operator to
+            # a complex pair with a ZERO imaginary leg; the fusion below then reduces the real 2n block
+            # by B(P), which equals the Hermitian P^H A P exactly.
+            if fem_obj._mode == "nonlinear":
+                raise NotImplementedError(
+                    "jno.fem: a Bloch/quasi-periodic tie on a NONLINEAR form is not supported — the "
+                    "complex phase makes the field complex, and a complex nonlinear form is not wired "
+                    "(complex forms assemble as linear real-equivalent blocks). Use a plain periodic "
+                    "tie, or linearize the form."
+                )
+            import jax.experimental.sparse as jsparse
+
+            from .trace import FemLinearSystem as _FLS_bloch
+
+            _op_r = fem_obj._op
+            _A0, _b0 = (_op_r.A, _op_r.b) if isinstance(_op_r, _FLS_bloch) else _op_r
+            _Az = (
+                jsparse.BCOO((jnp.zeros_like(_A0.data), _A0.indices), shape=_A0.shape)
+                if hasattr(_A0, "indices")
+                else jnp.zeros_like(jnp.asarray(_A0))
+            )
+            fem_obj._op = (_op_r, (_Az, jnp.zeros_like(jnp.asarray(_b0).reshape(-1))))
+            fem_obj._mode = "complex"
         # One op-level reduction combinator handles every representation: a transient block is reduced
         # now (P^T M P, ...) — including a fused complex transient, whose stacked [Re; Im] state reduces by
-        # blkdiag(P, P) — and a steady complex (re, im) tuple is reduced leg-wise with the same P; steady
-        # linear (A, b) and nonlinear residual ops are returned unchanged and reduce lazily in FEM.solve.
+        # blkdiag(P, P) (B(P) for a Bloch tie) — and a steady complex (re, im) tuple passes through
+        # unchanged (it reduces inside the fused 2n solve); steady linear (A, b) and nonlinear residual
+        # ops are returned unchanged and reduce lazily in FEM.solve.
         fem_obj._op = reduce_op_periodic(fem_obj._op, fem_obj._mode, periodic)
         fem_obj._periodic = periodic
         return _fuse_complex_steady(fem_obj)
@@ -3621,11 +3665,11 @@ def _fem_impl(
 
         # ---- complex non-nodal (RT/Nédélec/Argyris): the Re/Im coefficient split, assembled by the
         # non-nodal push-forward assembler. The basis is real, so ``Re(c·T) = Re(c)·T``: wrapping each
-        # term in ``.real``/``.imag`` gives two ordinary real systems A_r/A_i, and FEM.solve() forms
-        # ``[[A_r,-A_i],[A_i,A_r]]`` (``mode="complex"`` → _solve_complex_block), recombining to a complex
+        # term in ``.real``/``.imag`` gives two ordinary real systems A_r/A_i, fused at finalize into
+        # the real 2n block ``[[A_r,-A_i],[A_i,A_r]]`` and recombined to a complex
         # ``u`` — needed for time-harmonic Maxwell (complex ε, the ``i k₀`` impedance BC). A runtime
         # parameter is allowed (the complex *inverse*): each ``.real``/``.imag`` leg carries the parameter,
-        # so ``assemble_fem_nonnodal`` returns parametric ``FemLinearSystem`` legs and ``_solve_complex_block``
+        # so ``assemble_fem_nonnodal`` returns parametric ``FemLinearSystem`` legs and the fused solve
         # builds a differentiable trace node — exactly like the nodal complex inverse. Without this split the
         # plain real assembler would SILENTLY cast the imaginary part away, so the compositions that are still
         # unwired (transient / nonlinear / neural-coefficient) raise rather than mislead. ----

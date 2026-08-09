@@ -993,10 +993,19 @@ block layout for you. Its default solver stays **sparse-direct**, not the matrix
 elliptic systems get — the real-equivalent block is indefinite for Helmholtz/PML, where Jacobi-BiCGStab
 does not converge.
 
-Two exceptions keep a dedicated path. A **complex-native** preconditioner (`ams`) solves `A_r + i·A_i`
-directly rather than the block, so the Re/Im legs are retained for it. And a **Bloch** (quasi-periodic)
-tie has a *complex* prolongation `P`, which does not split into two real legs — that case still solves
-through its own complex block routine, and `x0=` on it is rejected.
+One exception keeps a dedicated path: a **complex-native** preconditioner (`ams`) solves `A_r + i·A_i`
+directly rather than the block, so the Re/Im legs are retained for it.
+
+A **Bloch** (quasi-periodic) tie fuses like everything else. Its complex prolongation `P` cannot
+reduce the Re/Im legs independently, but on the fused `[Re; Im]` state the same tie is the *real*
+prolongation `B(P) = [[P_r, -P_i], [P_i, P_r]]`, and the ordinary real congruence `B(P)ᵀ A B(P)`
+equals the Hermitian reduction `P^H A_c P` the Bloch space requires. Consequences: `solve_fn=`, the
+`linear`/`precond` slots and `x0=` all apply to a Bloch problem (each used to be silently discarded by
+a dedicated block routine); a Bloch tie composes with a **complex transient** (the quasi-periodic
+plane-wave march, previously a dtype crash); and a **real** weak form with a Bloch tie is promoted to
+the complex path automatically — the phase makes the field complex anyway, and the real path's
+bilinear `Pᵀ A P` is not a Galerkin projection for a complex `P` (measured 8.1 rel-L2 off the
+Hermitian answer on a manufactured mode, with the tie itself satisfied exactly).
 
 **Essential values on a complex form must be real.** The two legs share one Dirichlet row set, which
 imposes `Re u = g` with `Im u = 0` — right for a real `g`, and the usual case (the complexity lives in
@@ -1006,7 +1015,9 @@ known-column lift is cross-leg (the real equation needs `A_r[:,j] g_r - A_i[:,j]
 elimination produces). It raises a clear error. Carry the complex part in the operator or the source.
 
 Not yet supported (clear errors): `adapt=` on a complex transient (the cross-remesh state transfer is
-not complex-aware yet).
+not complex-aware yet); a Bloch tie on a **real** transient march (the phase forces a complex field —
+make the problem complex, or use a plain tie) or on a **nonlinear** form (complex nonlinear forms are
+not wired).
 
 ### Multiple devices — `fem.solve(shard=...)`
 
