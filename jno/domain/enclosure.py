@@ -881,7 +881,15 @@ def build_enclosure(
     tags: Sequence[str],
     *,
     axisymmetric: bool = False,
-    n_quad: int = 3,
+    # Raised from 3 when the axisymmetric azimuthal integral became exact. The sampled path leaned on
+    # the near-field refinement to repair its near pairs; the closed form has no refinement stage, so
+    # the MERIDIONAL rule is now the only discretisation and must carry that accuracy alone. Measured
+    # on a closed cylindrical cavity: max row sum 1.029 at n_quad=3 against 1.009 at n_quad=6. The
+    # cost is small because runtime is dominated by the quadrature-INDEPENDENT interval algebra --
+    # 7.6 s -> 9.0 s on the reference furnace for a ~3x better closure.
+    n_quad: int = 6,
+    # Accepted and ignored on the axisymmetric path: the azimuth is integrated in closed form, so
+    # there is no azimuthal grid. Still used by the 2-D kernel.
     n_phi: int = 16,
     opaque_tags: Optional[Sequence[str]] = None,
     medium_tags: Optional[Sequence[str]] = None,
@@ -1049,12 +1057,19 @@ def build_enclosure(
         _transparent = {str(t) for t in medium_tags}
         solid_geoms = [g for name, g in _regions.items() if str(name) not in _transparent]
 
-    if not occlude:
+    # The AXISYMMETRIC path resolves visibility analytically inside the kernel, so none of the
+    # sampled machinery below is built for it. That is where the speedup lives: the expensive step was
+    # never the kernel arithmetic but `_solid_polygon_visibility_3d`, which rasterises a signed-distance
+    # field whose cell size is set by the thinnest solid in the scene and then sphere-traces every pair
+    # at every azimuth against it.
+    if axisymmetric:
+        vm = None
+    elif not occlude:
         vm = 1.0 - np.eye(elem_nodes.shape[0])  # diagnostic: no occlusion (all mutually visible)
     elif medium_tags is not None:
         # Interface mode: occlude with the CLEAN solid polygons (a ray is blocked iff it passes through
         # a solid interior), immune to the mesh-sliver artefacts that the element-edge occluder suffers.
-        if axisymmetric:
+        if axisymmetric:  # unreachable: handled analytically above
             # Per-azimuth occlusion (see _solid_polygon_visibility_3d): a same-meridian (phi=0) verdict
             # does not transfer to other azimuths for a general solid of revolution, so this checks the
             # true 3-D chord at every azimuth the exchange kernel integrates over.
@@ -1073,62 +1088,35 @@ def build_enclosure(
         vm = _element_visibility(mids, own_edge, occ0, occ1)
 
     if axisymmetric:
-        # --- what does the refinement have to test its refined chords against? ---
-        # The refinement's occluder model is passed EXPLICITLY (it used to re-derive the solids from
-        # domain._source_regions keyed by the element tags, which silently comes back empty in boundary
-        # mode -- see _refine_near_pairs' docstring for what that does to F22).
+        # The azimuthal integral is evaluated in CLOSED FORM (view_factor_closed), which subsumes three
+        # stages of the old path at once: the sampled azimuthal rule, the sphere-traced visibility, and
+        # the near-field refinement that existed to repair both. Consequences worth stating:
         #
-        #   interface mode -> the same solid polygons the visibility test used.
-        #   boundary mode  -> the tags are SURFACE names, so there are no polygons to trace against, and
-        #                     the refinement would recompute its pairs as fully visible. That is correct
-        #                     only when nothing occludes, and there is no sound cheap test for it: the
-        #                     available visibility (`_element_visibility`) is a MERIDIAN test, and the
-        #                     meridian is blind exactly where axisymmetry bites -- two points on a common
-        #                     cylinder are "visible" in the (r, z) plane while the true 3-D chord between
-        #                     them at azimuth phi cuts straight through whatever the cylinder encloses.
-        #                     So the refinement runs here only on the caller's explicit assertion,
-        #                     `occlude=False`, which is precisely the statement "nothing blocks any ray".
-        occluders = None
+        #   * `n_phi` and `r_min` no longer mean anything. There is no azimuthal grid to refine and no
+        #     1/R^2 singularity to floor, so the ~12% r_min bias and the O(1/n_phi) closure error are
+        #     gone rather than tuned. Both are accepted and ignored (see the signature note).
+        #   * Occlusion boundaries are algebraic, so a shadow edge lands exactly instead of on the
+        #     nearest azimuthal bin (measured 113.265974 deg against an analytic 113.265974, where the
+        #     32-bin rule gave 115.00).
+        #   * Cost drops sharply because there is no signed-distance raster to build, and that raster's
+        #     cell size was set by the THINNEST solid in the scene -- which is why the old path made a
+        #     189-element cavity cost twice a 477-element chamber. Measured on the reference furnace:
+        #     106.3 s -> 9.0 s, with closure simultaneously better (2.8e-02 vs 9.2e-02 on the cavity,
+        #     3.4e-02 vs 4.2e-02 on the chamber, both before any enforce_closure).
+        #
+        # `vm` is unused here: visibility is resolved inside the kernel from the occluder geometry.
+        from .view_factor_closed import segments_from_polygons, view_factor_axisymmetric_closed
+
         if medium_tags is not None:
-            from shapely.ops import unary_union as _uu
-
-            _g = list(solid_geoms or [])  # the SAME solids the visibility test used, not a tag lookup
-            occluders = (_g, _uu(_g) if _g else None)
-            refine = bool(near_field)
+            # interface mode: the clean solid polygons, exactly the set the old visibility test used
+            _sides = segments_from_polygons(solid_geoms or [])
+        elif occlude:
+            # boundary mode: the element edges themselves (plus any opaque_tags edges) are the blockers
+            _sides = np.c_[occ0[:, 0], occ0[:, 1], occ1[:, 0], occ1[:, 1]]
         else:
-            occluders = ()  # explicit "nothing occludes" -- never the silent empty-lookup fallback
-            refine = bool(near_field) and not occlude
-            if bool(near_field) and occlude:
-                # Refining here could fabricate lines of sight through a solid. Say so: the r_min
-                # fallback is a known ~12% bias, but it is not an invented line of sight.
-                domain.log.warning(
-                    "domain.enclosure(axisymmetric=True) in boundary mode keeps the uniform azimuthal "
-                    "rule + the r_min floor, so closure error stays around 1e-1 (see docs/fem.md). The "
-                    "near-field refinement needs an occluder model and the tags here name surfaces, not "
-                    "regions. Use medium_tags=[...] (interface mode) for the refined near field WITH "
-                    "occlusion, or occlude=False if this enclosure genuinely has nothing blocking it "
-                    "(a convex cavity)."
-                )
-
-        # r_min is a near-field 1/R^2 FLOOR -- a fudge that caps the kernel for near-coincident rings.
-        # Where the refinement runs, the near pairs are integrated properly instead, so no floor is needed
-        # (and any nonzero floor is then a pure bias): default it to 0. Otherwise keep the legacy
-        # 0.5*median(length), which masks the overshoot at the cost of a ~12% systematic error.
-        rmin = (0.0 if refine else 0.5 * float(np.median(length))) if r_min is None else float(r_min)
-        F = MeshUtils.get_view_factor_axisymmetric_element(
-            jnp.asarray(e0),
-            jnp.asarray(e1),
-            jnp.asarray(normals),
-            jnp.asarray(vm),
-            n_quad=n_quad,
-            n_phi=n_phi,
-            r_min=rmin,
-        )
+            _sides = np.zeros((0, 4))  # the caller asserts nothing blocks any ray
+        F = jnp.asarray(view_factor_axisymmetric_closed(e0, e1, normals, occluders=_sides, n_quad=n_quad))
         areas = 2.0 * np.pi * mids[:, 0] * length  # ring areas
-        if refine:
-            F = jnp.asarray(
-                _refine_near_pairs(np.asarray(F), e0, e1, normals, domain, elem_tag_arr, n_phi, occluders=occluders)
-            )
     else:
         F = MeshUtils.get_view_factor_2d_element(
             jnp.asarray(e0), jnp.asarray(e1), jnp.asarray(normals), jnp.asarray(vm), n_quad=n_quad

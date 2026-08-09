@@ -524,10 +524,13 @@ def test_enclosure_axisymmetric_r_min_keeps_view_factors_physical():
     assert 0.88 < F12 <= 1.0, f"axisymmetric F12 should be ~1 (small end losses), got {F12:.3f}"
     assert abs(F21 - r1 / r2) < 6e-2, f"axisymmetric F21 should be ~r1/r2={r1 / r2:.3f}, got {F21:.3f}"
 
-    # The r_min kwarg must be threaded to the kernel: a large near-field floor softens the 1/R^2 kernel
-    # and measurably shrinks every view factor (vs the default floor) — proving it is wired through.
+    # r_min is now INERT on the axisymmetric path and must be accepted without changing anything. It
+    # was a near-field 1/R^2 floor, a fudge for rings the uniform azimuthal rule could not resolve;
+    # the azimuthal integral is exact now, so there is no singularity to soften and the floor would be
+    # pure bias (it carried a known ~12% one). The physics assertions above are the real content, and
+    # they hold with no floor at all -- which is the point.
     soft = np.asarray(d.enclosure(["inner_gap", "outer_gap"], axisymmetric=True, r_min=0.5).view_factor)
-    assert soft.max() < 0.8 * F.max(), f"explicit r_min must soften F (got soft {soft.max():.3f} vs {F.max():.3f})"
+    assert np.allclose(soft, F), "r_min must be accepted and ignored on the closed-form path"
 
 
 def test_coupled_conduction_radiation_concentric_cylinders():
