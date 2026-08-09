@@ -172,6 +172,14 @@ no term.
 > 2-D-triangle only and raise. On a **line** mesh `"Hermite"` selects the 1D cubic beam element
 > (see above); the other families raise.
 >
+> **Each of these families has ONE intrinsic order** — RT₀ / N1E₀ lowest, P0 constant, Morley quadratic,
+> Hermite cubic, Argyris quintic — set by the element definition, not chosen. `order=` is a nodal-Lagrange
+> knob and **is refused** here rather than ignored: `space="N1E", order=2` used to hand back the same
+> lowest-order space silently (an identical operator), which is the worst failure shape for a wave problem
+> — you pay for accuracy, get first-order convergence, and only find out from a convergence study that
+> stalls. Refine the mesh instead (see *Mesh resolution for wave problems* below), or use a nodal Lagrange
+> field, where `order=` does apply.
+>
 > **Not yet:** the rest of the zoo in 3-D (RT / C¹ / plate are 2-D only); the *inhomogeneous* `n×E = g` on
 > N1E; higher order; other families (BDM, second-kind Nédélec, Bell); quad / non-triangular meshes; a
 > runtime parameter **or trainable neural coefficient** in a **host-assembled** RT-pressure / plate

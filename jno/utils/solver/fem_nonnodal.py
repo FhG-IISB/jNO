@@ -168,6 +168,31 @@ def assemble_fem_nonnodal(
         raise NotImplementedError(
             f"jno.fem (non-nodal): supported element spaces are RT, N1E, P0, Hermite, Argyris and Morley; got {spaces}."
         )
+    # ``order=`` is a nodal-Lagrange knob. Every family here has an order INTRINSIC to the element
+    # definition, and it is never plumbed to the factories (`degree=1` is hard-coded at the call
+    # sites below), so `space="N1E", order=2` used to return the SAME lowest-order space with no
+    # warning — measured: an identical 179-DOF operator. That is the worst shape of failure for a
+    # wave problem, where the user is paying for accuracy: they get first-order convergence and only
+    # find out from a convergence study that stalls at rate 1.
+    _INTRINSIC_ORDER = {
+        "RT": "lowest order (RT0)",
+        "N1E": "lowest order (N1E0)",
+        "P0": "0 (piecewise constant)",
+        "Hermite": "3 (cubic)",
+        "Argyris": "5 (quintic)",
+        "Morley": "2 (quadratic)",
+    }
+    for _f in fields:
+        _o = int(_f.get("order", 1) or 1)
+        if _o > 1:
+            _sp = str(_f["space"])
+            raise NotImplementedError(
+                f"jno.fem: order={_o} is not selectable on the {_sp} element — its order is intrinsic "
+                f"to the family ({_INTRINSIC_ORDER.get(_sp, 'fixed')}) and jNO builds only that one. "
+                "Drop order= (the default) to get it. Higher-order H(curl)/H(div) (N1E/RT with face "
+                "and interior DOFs, and the face-orientation bookkeeping they need) is not built; "
+                "refine the mesh instead, or use a nodal Lagrange field where order= does apply."
+            )
     has_edge = ("RT" in spaces) or ("N1E" in spaces)
     has_hermite = "Hermite" in spaces
     has_argyris = "Argyris" in spaces
