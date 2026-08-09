@@ -1250,6 +1250,22 @@ def test_second_order_coupled_field_without_mass_rejected():
         jno.fem([weak, u1(xb, yb) - 0.0, u2(xb, yb) - 0.0, u1(xi0, yi0) - 0.0])
 
 
+def test_second_order_complex_coefficient_rejected():
+    """A COMPLEX coefficient on a u_tt form used to be silently CAST TO REAL — the march ran, the
+    trajectory came back real, and only a bare numpy ComplexWarning hinted the imaginary part of the
+    operator was gone. It must refuse by name (the 1D and non-nodal complex branches already do)."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.3, time=(0.0, 0.1, 9))
+    u, phi = d.fem_symbols(names=("cxso", "cxsop"))
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi0, yi0, _ = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    ic = jno.fn(lambda x, y: jnp.sin(PI * x) * jnp.sin(PI * y), [xi0, yi0])
+    weak = ui.tt * vi + (1.0 + 0.3j) * (ui.x * vi.x + ui.y * vi.y)
+    with pytest.raises(NotImplementedError, match="COMPLEX coefficient on a second-order"):
+        jno.fem([weak, u(xi0, yi0) - ic, u(xb, yb) - 0.0])
+
+
 def test_second_order_mixed_order_multifield_rejected():
     """A coupled form where one field is second-order (u_tt) and another is first-order (w_t) — the
     mixed-order case needs a per-field velocity augmentation and is fail-loud (write it as a first-order

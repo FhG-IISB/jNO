@@ -1367,9 +1367,10 @@ route** — the residual-PINN path is unaffected. Full detail is inline in the s
   boundary `g(x,t)` compose with coupling; what a coupled form still refuses: a field with **no**
   `u_tt` term (its velocity rows would be singular), **runtime parameters** (the parametric coupled
   steady assembly underneath is not wired), and periodic ties. Time-varying Dirichlet is refused on
-  nonlinear forms. A coupled 1D system carries `u_tt` on narrower terms (linear, undamped): the
-  augmented state is `[u_all; v_all]`, so `fem.offsets` lists the displacement blocks then the
-  velocity blocks.
+  nonlinear forms. A **complex coefficient** on any `u_tt` form is refused by name — it used to be
+  silently cast to real (write the problem first-order in time; the complex transient is supported).
+  A coupled 1D system carries `u_tt` on narrower terms (linear, undamped): the augmented state is
+  `[u_all; v_all]`, so `fem.offsets` lists the displacement blocks then the velocity blocks.
 - **Reduced-order (`basis=`) solves** cover steady and **first-order transient** (linear and
   nonlinear). Second-order-in-time (`u_tt`), complex, and periodic-tied problems refuse, each with its
   own reason. Nonlinear reduces, but without hyper-reduction that is a memory win, not a speed one.

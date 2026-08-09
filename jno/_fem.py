@@ -3597,6 +3597,19 @@ def _fem_impl(
     # only the 2D/3D nodal-Lagrange route is intercepted here (a non-nodal / 1D u_tt has its own path).
     _second_order = any(_max_temporal_order(_bare(c)) >= 2 for c in constraints)
     if _second_order and getattr(domain, "dimension", None) != 1 and not (_trial_spaces(constraints) - {"Lagrange"}):
+        _so_bares = (
+            list(volume_terms) + [e for exprs in boundary_terms.values() for e in exprs] + [_bare(c) for c in ic_residuals]
+        )
+        if _bares_have_complex_coeff(_so_bares):
+            # The augmented real [u; v] assembly casts complex coefficients to float — it silently
+            # DROPPED the imaginary part (measured: is_complex False, a bare numpy ComplexWarning the
+            # only trace). Raise instead; the 1D and non-nodal complex branches already do.
+            raise NotImplementedError(
+                "jno.fem: a COMPLEX coefficient on a second-order-in-time (u_tt) form is not wired — "
+                "the augmented real [u; v] block would silently drop the imaginary part. Keep the "
+                "u_tt coefficients real, or write the problem first-order in time (a complex "
+                "transient IS supported and fuses into the real 2n block)."
+            )
         if multifield and periodic_ties:
             raise NotImplementedError(
                 "jno.fem: periodic ties on a coupled second-order-in-time form are not supported yet."
