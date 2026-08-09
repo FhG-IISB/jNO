@@ -1932,7 +1932,13 @@ class FEM:
         # an empty list — the elimination would then silently not happen and the row-replaced spurious
         # modes would come back.
         restrict, prolong, n_red, _kind = _eigs_constraint_maps(self, n_full)
+        _pairs = list(getattr(self.domain, "_fem_native_dirichlet_pairs", None) or [])
         M = fem(list(mass)).operator[0]  # mass matrix on the same FE space
+        # RESTORE the stash the (Dirichlet-free) mass assembly just cleared: without this, a SECOND
+        # eigs() on the same fem finds no constraints, skips the elimination, and silently returns the
+        # row-replaced spurious spectrum — eigs was not idempotent (measured: the repeat call gave
+        # 47.2 where the true reduced spectrum has no such eigenvalue).
+        self.domain._fem_native_dirichlet_pairs = _pairs
 
         solver = _solve.eigs(k=k, which=which, precond=precond, tol=tol, maxiter=maxiter)
         if restrict is None:

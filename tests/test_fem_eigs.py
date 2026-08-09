@@ -285,3 +285,14 @@ def test_eigs_rejects_inhomogeneous_dirichlet_and_mixed_constraints():
     ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
     with pytest.raises(ValueError, match="INHOMOGENEOUS"):
         jno.fem([ui.x * vi.x + ui.y * vi.y, u(xb, yb) - 1.0]).eigs(mass=[ui * vi], k=2)
+
+
+def test_eigs_is_idempotent():
+    """Calling ``eigs`` twice on the same fem must give the same spectrum. The first call's internal
+    mass assembly cleared the domain's Dirichlet stash, so the SECOND call silently skipped the
+    elimination and returned the row-replaced spurious spectrum (measured: 47.2 appeared where the
+    true reduced spectrum has no eigenvalue at all)."""
+    d, K, mass = _dirichlet_box(0.25)
+    lam1, _ = K.eigs(mass=mass, k=3)
+    lam2, _ = K.eigs(mass=mass, k=3)
+    assert np.allclose(np.asarray(lam1), np.asarray(lam2), rtol=1e-12), (lam1, lam2)
