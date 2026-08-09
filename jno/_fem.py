@@ -3597,19 +3597,10 @@ def _fem_impl(
     # only the 2D/3D nodal-Lagrange route is intercepted here (a non-nodal / 1D u_tt has its own path).
     _second_order = any(_max_temporal_order(_bare(c)) >= 2 for c in constraints)
     if _second_order and getattr(domain, "dimension", None) != 1 and not (_trial_spaces(constraints) - {"Lagrange"}):
-        if multifield:
-            # Coupled second-order-in-time: all fields must be second-order (u_tt) — reduces to the
-            # single-field formula with the coupled block M2/K. Mixed-order/damped/periodic/parametric
-            # coupled 2nd-order fail loud inside the assembler / here.
-            if periodic_ties:
-                raise NotImplementedError(
-                    "jno.fem: periodic ties on a coupled second-order-in-time form are not supported yet."
-                )
-            _so = _assemble_multifield_second_order(
-                domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, classification, quad_degree=quad_degree
+        if multifield and periodic_ties:
+            raise NotImplementedError(
+                "jno.fem: periodic ties on a coupled second-order-in-time form are not supported yet."
             )
-            _so._term_source = (domain, volume_terms)
-            return _so
         if any(isinstance(n, RegionMask) for b in volume_terms for n in _walk(b)):
             raise NotImplementedError(
                 "jno.fem: per-region (RegionMask) integration on a second-order-in-time problem is not "
@@ -3617,6 +3608,9 @@ def _fem_impl(
                 "u_tt mass term. Use a jno.fn indicator coefficient instead, e.g. (1 + k*ind)*(u.x*v.x + "
                 "u.y*v.y), which gives the same piecewise-material dynamics."
             )
+        # Coupled second-order-in-time is the SAME augmented formula with the coupled M2/C/K blocks —
+        # one assembler serves both, so damping, a nonlinear spatial operator and driven boundaries
+        # apply to the coupled case with no second copy of the path.
         _so = _assemble_second_order_time(
             domain,
             volume_terms,
@@ -3625,9 +3619,10 @@ def _fem_impl(
             dirichlet_raw,
             ic_residuals,
             classification,
-            order=_infer_order(constraints),
+            order=1 if multifield else _infer_order(constraints),
             vec=vec or 1,
             quad_degree=quad_degree,
+            multifield=multifield,
         )
         _so._term_source = (domain, volume_terms)
         if periodic_ties:
@@ -4516,6 +4511,7 @@ def _assemble_second_order_time(
     order,
     vec,
     quad_degree,
+    multifield=False,
 ):
     r"""Reduce a linear second-order-in-time weak form to a first-order augmented block.
 
@@ -4545,11 +4541,18 @@ def _assemble_second_order_time(
     well as ``operator_fn``. The constant Dirichlet ``g`` rides ``affine_bias`` and the (possibly
     parametric) load ``F`` rides the forcing.
 
-    Scope: linear, single field — **scalar or vector** (vector = elastodynamics, ``value_shape=(2,)``
-    / ``(3,)``) — nodal Lagrange, 2D/3D, constant Dirichlet. Two initial conditions: displacement
-    ``u(initial) - u0`` and (optional) velocity ``u.t(initial) - v0`` (default zero). Nonlinear,
-    multi-field, time-varying-Dirichlet ``g(x,t)``, or *trainable-Dirichlet-value* second-order forms
-    are rejected (fail-loud) rather than silently mis-assembled.
+    Scope: single field — **scalar or vector** (vector = elastodynamics, ``value_shape=(2,)`` /
+    ``(3,)``) — or, with ``multifield=True``, a **coupled system where every field carries**
+    ``u_tt`` (coupled membranes / waves; the couplings sit in the off-diagonal blocks of the same
+    coupled ``M₂``/``C``/``K``, so the augmented formula is unchanged). Nodal Lagrange, 2D/3D. Two
+    initial conditions per field: displacement ``u(initial) - u0`` and (optional) velocity
+    ``u.t(initial) - v0`` (default zero). Damping ``u_t`` terms, a nonlinear spatial operator
+    (Newton on the augmented residual) and driven boundaries ``g(x,t)`` all apply to the coupled
+    case through the same three branches below. Rejected fail-loud rather than silently
+    mis-assembled: a *trainable Dirichlet value*; a coupled field with **no** ``u_tt`` term (its
+    velocity rows would be silently singular — write a purely first-order field as an explicit
+    first-order system); runtime parameters on a *coupled* form (the parametric coupled steady
+    assembly underneath does not exist yet).
     """
     from .utils.solver.backend_blocks import SemidiscreteTimeBlock
     from .utils.solver.fem_native import assemble_fem_native
@@ -4583,6 +4586,16 @@ def _assemble_second_order_time(
             "jno.fem: a runtime/trainable Dirichlet value on a second-order-in-time problem is not "
             "supported (the held boundary value is a constant); keep the Dirichlet value fixed and "
             "recover the parameter through the operator or load instead."
+        )
+    if multifield and has_param:
+        # The parametric branch re-forms M₂/C/K per step through the STEADY assembly of each group,
+        # and the parametric coupled steady assembly does not exist — letting it run would surface a
+        # confusing "coupled steady form" error from inside a u_tt build.
+        raise NotImplementedError(
+            "jno.fem: runtime/trainable parameters on a COUPLED second-order-in-time form are not "
+            "supported yet — the parametric coupled steady assembly underneath is not wired. A "
+            "single-field parametric u_tt works, and a coupled FIRST-order parametric transient works "
+            "(write each second-order field with an explicit velocity field)."
         )
 
     # Wave / elastodynamics frequencies of soft modes are not resolvable in float32 (silent error).
@@ -4619,8 +4632,10 @@ def _assemble_second_order_time(
     # re-assembles at the runtime args each call, kept differentiable in args so the gradient reaches
     # the parameter through every step of the augmented march. ``A0``/``b0`` are the static
     # placeholders (parameters at 0 / stored weights) used for the ``.M``/``.A`` accessors and sizing.
+    _vec_asm = 1 if multifield else vec  # coupled fields carry their own per-field vec
+
     def _native_group(terms, bterms):
-        op, _mode, _offs = assemble_fem_native(domain, terms, bterms, [], [], vec=vec, quad_degree=quad_degree)
+        op, _mode, _offs = assemble_fem_native(domain, terms, bterms, [], [], vec=_vec_asm, quad_degree=quad_degree)
         if isinstance(op, tuple):  # static (A, b): a parameter-free group
             A0, b0 = _to_bcoo(op[0]), jnp.asarray(op[1]).reshape(-1)  # BCOO — the 2N block is composed sparsely
             return {
@@ -4630,6 +4645,7 @@ def _assemble_second_order_time(
                 "b0": b0,
                 "rpe": {},
                 "is_param": False,
+                "offs": list(_offs),
             }
         # parametric FemLinearSystem: operator_fn(args)/rhs_fn(args) re-assemble at the runtime args.
         return {
@@ -4639,20 +4655,47 @@ def _assemble_second_order_time(
             "b0": jnp.asarray(op.b).reshape(-1),
             "rpe": dict(getattr(op, "runtime_parameter_exprs", {}) or {}),
             "is_param": True,
+            "offs": list(_offs),
         }
 
-    gm = _native_group(mass2_raw, {})  # u_tt -> M2 (mass)
+    if multifield:
+        # Every coupled field must carry a u_tt mass term. The assembler sizes the system by the
+        # domain's registered fields, so a field with NO mass term would get a ZERO M₂ block: its
+        # velocity rows (0·v̇ = 0·v) are silently singular — the layouts would even match. Check by
+        # field key BEFORE assembling.
+        _mass_keys = {_field_key_of(t) for t in mass2_raw}
+        _all_keys = _field_keys(  # trial fields referenced anywhere in the weak form
+            [b for b in volume_terms] + [e for exprs in boundary_terms.values() for e in exprs]
+        )
+        _missing = [k for k in _all_keys if k not in _mass_keys]
+        if _missing:
+            raise NotImplementedError(
+                "jno.fem: a coupled second-order-in-time form needs EVERY field to carry a u_tt mass "
+                f"term; field(s) {sorted(map(str, _missing))} have none. A damping u_t term on a "
+                "second-order field is fine, but a purely first-order (or algebraic) field has no "
+                "velocity block — write the coupled problem as a first-order system with an explicit "
+                "velocity field per second-order field."
+            )
+
+    gm = _native_group(mass2_raw, {})  # u_tt -> M2 (mass; block-diagonal + couplings for multifield)
     n = int(gm["A0"].shape[0])
     dtype = gm["A0"].dtype
     Z = _bcoo_empty(n, n, dtype)  # the zero block / zero damping — sparse, so the 2N block never densifies
     gc = _native_group(damp_raw, {}) if damp_raw else None  # u_t -> C (damping)
     # A nonlinear spatial operator is assembled as a residual/jacobian below, not a linear K matrix.
     gk = None if is_nonlinear else _native_group(stiff_raw, boundary_terms)  # spatial operator K + load F
+    for _g, _nm in ((gc, "damping"), (gk, "stiffness")):
+        if multifield and _g is not None and _g["offs"] != gm["offs"]:
+            raise NotImplementedError(
+                f"jno.fem: coupled second-order-in-time requires one consistent block layout; the "
+                f"{_nm} assembly produced offsets {_g['offs']} against the mass layout {gm['offs']} — "
+                "a mixed-order coupling is not supported. Write it as a first-order system."
+            )
 
     # Dirichlet from the native assembler (it stashes them): constant (dof, value) pairs → the held
     # value rides the affine bias; time-varying entries (dofs, g(x,t) node, coords) → the displacement
     # rows carry u[d]=g(x_d,t) and the velocity rows the compatible v[d]=ġ(x_d,t), written per step.
-    assemble_fem_native(domain, stiff_raw, boundary_terms, dirichlet_raw, [], vec=vec, quad_degree=quad_degree)
+    assemble_fem_native(domain, stiff_raw, boundary_terms, dirichlet_raw, [], vec=_vec_asm, quad_degree=quad_degree)
     pairs = list(getattr(domain, "_fem_native_dirichlet_pairs", []) or [])
     rows = jnp.asarray([p[0] for p in pairs], dtype=int) if pairs else jnp.zeros((0,), dtype=int)
     g = jnp.asarray([p[1] for p in pairs], dtype=dtype) if pairs else jnp.zeros((0,), dtype=dtype)
@@ -4679,16 +4722,35 @@ def _assemble_second_order_time(
 
     # ---- initial state y0 = [u0; v0] from the ICs, made Dirichlet-consistent (u[d]=g, v[d]=0 or ġ(t0)) ----
     # The IC is sampled at the native assembly DOF coordinates (vertices + P2 edge-midpoints), stashed by
-    # the native assembler; ``n = N*vec`` flattens node-major, matching the block layout.
-    pts = jnp.asarray(getattr(domain, "_fem_native_dof_points", domain.mesh.points))[:, : domain.dimension]
+    # the native assembler; ``n = N*vec`` flattens node-major, matching the block layout. A coupled
+    # system places each IC into its field's block (per-field nodes, per-field vec).
     u0 = jnp.zeros((n,), dtype)
     v0 = jnp.zeros((n,), dtype)
-    for ic in ic_residuals:
-        val = jnp.asarray(_ic_value_at_nodes(_bare(ic), domain, pts, n, vec), dtype)
-        if _mto(_bare(ic)) >= 1:
-            v0 = val
-        else:
-            u0 = val
+    if multifield:
+        _keys = list(getattr(domain, "_fem_native_field_keys", []) or [])
+        _fidx = {k: i for i, k in enumerate(_keys)}
+        _moffs = gm["offs"]
+        _pts_all = getattr(domain, "_fem_native_dof_points_all", None)
+        for ic in ic_residuals:
+            fi = _fidx.get(_field_key_of(ic))
+            if fi is None:
+                continue
+            lo, hi = _moffs[fi], _moffs[fi + 1]
+            pts_f = jnp.asarray(_pts_all[fi] if _pts_all is not None else domain.mesh.points)[:, : domain.dimension]
+            vec_i = (hi - lo) // int(pts_f.shape[0])
+            val = jnp.asarray(_ic_value_at_nodes(_bare(ic), domain, pts_f, hi - lo, vec_i), dtype)
+            if _mto(_bare(ic)) >= 1:
+                v0 = v0.at[lo:hi].set(val)
+            else:
+                u0 = u0.at[lo:hi].set(val)
+    else:
+        pts = jnp.asarray(getattr(domain, "_fem_native_dof_points", domain.mesh.points))[:, : domain.dimension]
+        for ic in ic_residuals:
+            val = jnp.asarray(_ic_value_at_nodes(_bare(ic), domain, pts, n, vec), dtype)
+            if _mto(_bare(ic)) >= 1:
+                v0 = val
+            else:
+                u0 = val
     if int(rows.shape[0]):  # constant Dirichlet: u(0)=g, v(0)=0
         u0, v0 = u0.at[rows].set(g), v0.at[rows].set(0.0)
     for dofs, vnode, coords in tv:  # driven boundary: u(0)=g(x,t0), v(0)=ġ(x,t0)
@@ -4739,7 +4801,15 @@ def _assemble_second_order_time(
                 "supported; use a constant Dirichlet value."
             )
         M2, C = gm["A0"], (gc["A0"] if gc else Z)
-        sop, _sm, _so = assemble_fem_native(domain, stiff_raw, boundary_terms, [], [], vec=vec, quad_degree=quad_degree)
+        sop, _sm, _soffs = assemble_fem_native(
+            domain, stiff_raw, boundary_terms, [], [], vec=_vec_asm, quad_degree=quad_degree
+        )
+        if multifield and list(_soffs) != gm["offs"]:
+            raise NotImplementedError(
+                f"jno.fem: coupled second-order-in-time requires one consistent block layout; the "
+                f"nonlinear spatial assembly produced offsets {list(_soffs)} against the mass layout "
+                f"{gm['offs']} — a mixed-order coupling is not supported."
+            )
         M_aug = _dirichlet_M(_bcoo_block([(M2, 0, 0, 1.0), (M2, n, n, 1.0)], (2 * n, 2 * n), dtype))
         rpe = dict(getattr(sop, "runtime_parameter_exprs", {}) or {})
 
@@ -4815,142 +4885,9 @@ def _assemble_second_order_time(
             metadata={"theta": 0.5, "second_order": True, "runtime_parameter_names": list(rpe), "nonaffine_operator": True},
             **common,
         )
-    return FEM(domain=domain, op=block, classification=classification, mode="transient", offsets=[0, n, 2 * n])
-
-
-def _assemble_multifield_second_order(
-    domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, classification, *, quad_degree
-):
-    r"""Coupled multifield second-order-in-time where **every** field carries ``u_tt`` (undamped,
-    value-coupled). With all fields second-order the augmented state ``y=[u_all; v_all]`` reduces to
-    the *single-field* formula with the **coupled block** ``M₂``/``K``::
-
-        [M2  0 ] [u_all']   [ 0   -M2] [u_all]   [ 0 ]
-        [0   M2] [v_all'] + [ K    0 ] [v_all] = [ F ]
-
-    ``M₂`` is the block-diagonal mass over all fields; ``K`` carries the per-field spatial operators and
-    the (value) couplings in its off-diagonal blocks. Two coupled membranes, coupled waves, a system of
-    coupled oscillators — the clean case. **A mixed-order coupling** (a first-order field, i.e. a bare
-    ``u_t`` term) needs a per-field velocity augmentation and is rejected: write it as a first-order
-    system with an explicit velocity field per second-order field.
-    """
-    from .utils.solver.backend_blocks import SemidiscreteTimeBlock
-    from .utils.solver.fem_native import assemble_fem_native
-    from .utils.solver.fem_utils import bcoo_set_dirichlet_rows, bcoo_zero_rows
-    from .utils.solver.parametric_helpers import _contains_runtime_parameter
-    from .utils.solver.solver_helper import max_temporal_derivative_order as _mto
-    from .utils.solver.time_route import _infer_time_window, _strip_temporal_trial_derivative
-    from .utils.solver.weak_form import _apply_sign, _is_obviously_nonlinear_in_unknown, _split_additive_terms
-
-    weak_bares = list(volume_terms) + [e for exprs in boundary_terms.values() for e in exprs]
-    if any(_is_obviously_nonlinear_in_unknown(domain, b) for b in weak_bares):
-        raise NotImplementedError("jno.fem: a nonlinear coupled second-order-in-time form is not supported.")
-    if any(_contains_runtime_parameter(b) for b in weak_bares):
-        raise NotImplementedError(
-            "jno.fem: runtime parameters in a coupled second-order-in-time form are not supported yet."
-        )
-    if any(_is_temporal_value_node(vnode) for *_rest, vnode in dirichlet_raw):
-        raise NotImplementedError(
-            "jno.fem: time-varying Dirichlet on a coupled second-order-in-time form is not supported yet."
-        )
-    _warn_second_order_float32()
-    quad_degree = max(quad_degree, 2)
-
-    def _strip(coeff, times):
-        for _ in range(times):
-            coeff = _strip_temporal_trial_derivative(coeff)
-        return coeff
-
-    mass2_raw, spatial_raw = [], []
-    for bare in volume_terms:
-        for sign, sub in _split_additive_terms(domain, bare):
-            coeff = _apply_sign(domain, sign, sub)
-            o = _mto(sub)
-            if o >= 2:
-                mass2_raw.append(_strip(coeff, 2))
-            elif o == 1:  # a bare u_t → damping / a first-order field: the mixed-order case
-                raise NotImplementedError(
-                    "jno.fem: a coupled second-order-in-time form with a u_t term (damping or a first-order "
-                    "field) is not supported yet — every field must carry u_tt. Write the coupled problem as a "
-                    "first-order system with an explicit velocity field per second-order field."
-                )
-            else:
-                spatial_raw.append(coeff)
-    if not mass2_raw:
-        raise ValueError("jno.fem: coupled second-order route found no `u_tt * phi` mass term.")
-
-    def _mat(terms, bterms):
-        op, _mode, offs = assemble_fem_native(domain, terms, bterms, [], [], vec=1, quad_degree=quad_degree)
-        A = _to_bcoo(op[0] if isinstance(op, tuple) else op.A)  # BCOO — the 2N block is composed sparsely
-        b = jnp.asarray(op[1] if isinstance(op, tuple) else op.b).reshape(-1)
-        return A, b, list(offs)
-
-    M2, _mf, moffs = _mat(mass2_raw, {})  # block-diagonal coupled mass over all fields
-    K, F, koffs = _mat(spatial_raw, boundary_terms)  # coupled spatial operator + load (couplings off-diagonal)
-    if moffs != koffs:
-        raise NotImplementedError(
-            "jno.fem: coupled second-order-in-time requires every field to be second-order with a consistent "
-            "block layout; a mixed-order coupling is not supported yet — write it as a first-order system."
-        )
-    n = int(M2.shape[0])
-    dtype = M2.dtype
-
-    # Dirichlet (dof, value) pairs from the native assembler stash (constant g only)
-    assemble_fem_native(domain, spatial_raw, boundary_terms, dirichlet_raw, [], vec=1, quad_degree=quad_degree)
-    pairs = list(getattr(domain, "_fem_native_dirichlet_pairs", []) or [])
-    rows = jnp.asarray([p[0] for p in pairs], dtype=int) if pairs else jnp.zeros((0,), dtype=int)
-    g = jnp.asarray([p[1] for p in pairs], dtype=dtype) if pairs else jnp.zeros((0,), dtype=dtype)
-    nrows = int(rows.shape[0])
-
-    # ---- initial state y0 = [u_all; v_all] — each IC placed into its field block, displacement vs velocity ----
-    field_keys = list(getattr(domain, "_fem_native_field_keys", []) or [])
-    field_index = {k: i for i, k in enumerate(field_keys)}
-    pts_by_field = getattr(domain, "_fem_native_dof_points_all", None)
-    u0 = jnp.zeros((n,), dtype)
-    v0 = jnp.zeros((n,), dtype)
-    for ic in ic_residuals:
-        bare_ic = _bare(ic)
-        fi = field_index.get(_field_key_of(ic))
-        if fi is None:
-            continue
-        lo, hi = moffs[fi], moffs[fi + 1]
-        pts_f = jnp.asarray(pts_by_field[fi] if pts_by_field is not None else domain.mesh.points)[:, : domain.dimension]
-        val = jnp.asarray(_ic_value_at_nodes(bare_ic, domain, pts_f, hi - lo, 1), dtype)
-        if _mto(bare_ic) >= 1:
-            v0 = v0.at[lo:hi].set(val)  # velocity IC u̇(0)=v0 for this field
-        else:
-            u0 = u0.at[lo:hi].set(val)  # displacement IC u(0)=u0 for this field
-
-    # ---- compose the 2N augmented block (single-field formula, coupled M2/K) — SPARSELY (BCOO), so a large
-    #      coupled wave / membrane system never materialises the dense (2N × 2N) block ----
-    M_aug = _bcoo_block([(M2, 0, 0, 1.0), (M2, n, n, 1.0)], (2 * n, 2 * n), dtype)  # [[M2, 0], [0, M2]]
-    A_aug = _bcoo_block([(M2, 0, n, -1.0), (K, n, 0, 1.0)], (2 * n, 2 * n), dtype)  # [[0, -M2], [K, 0]]
-    c_aug = jnp.concatenate([jnp.zeros((n,), dtype), F])
-    if nrows:  # u[d]=g on displacement rows, v[d]=0 on velocity rows (identity rows, cols kept)
-        _md = jnp.concatenate([rows, rows + n])
-        M_aug = bcoo_zero_rows(M_aug, _md)
-        A_aug = bcoo_set_dirichlet_rows(A_aug, _md)
-        c_aug = c_aug.at[rows].set(g).at[rows + n].set(0.0)
-        u0, v0 = u0.at[rows].set(g), v0.at[rows].set(0.0)
-    domain._fem_problem = None
-    t0, t1, dt = _infer_time_window(domain)
-    block = SemidiscreteTimeBlock(
-        backend="transient",
-        mode="implicit",
-        time_order=2,
-        spatial_kind="weak_form",
-        M=M_aug,
-        A=A_aug,
-        affine_bias=c_aug,
-        state0=jnp.concatenate([u0, v0]),
-        t0=t0,
-        t1=t1,
-        dt=dt,
-        eval_context={},
-        metadata={"theta": 0.5, "second_order": True},
-    )
-    # Field slicing on the augmented state [u1..uF, v1..vF]: displacement blocks then velocity blocks.
-    aug_offsets = list(moffs[:-1]) + [n + o for o in moffs]
+    # Field slicing on the augmented state: displacement blocks then velocity blocks. Single-field
+    # offs = [0, n] gives the familiar [0, n, 2n]; a coupled system gets [u1..uF, v1..vF].
+    aug_offsets = list(gm["offs"][:-1]) + [n + o for o in gm["offs"]]
     return FEM(domain=domain, op=block, classification=classification, mode="transient", offsets=aug_offsets)
 
 

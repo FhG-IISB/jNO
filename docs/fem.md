@@ -411,10 +411,13 @@ damped wave.
 > step `(M + ½·dt·A) w_next = (M − ½·dt·A) w + dt·c`.
 
 A **vector** field works too (`value_shape=(2,)`/`(3,)`) — that is elastodynamics,
-`ρ u_tt = ∇·σ(u)` (see the vibrating-cantilever tutorial). *Scope: linear, single field (scalar or
-vector), nodal Lagrange, 2D/3D, constant Dirichlet; nonlinear / multi-field / runtime-parameter /
-time-varying-Dirichlet second-order forms are rejected (fail-loud) — write those as a first-order
-system.*
+`ρ u_tt = ∇·σ(u)` (see the vibrating-cantilever tutorial). A **coupled system** where every field
+carries `u_tt` (spring-coupled membranes, coupled waves) rides the same augmented formula with the
+coupled blocks — damping `u_t` terms, a nonlinear spatial operator (Newton on the augmented
+residual) and a driven boundary `g(x, t)` all apply to the coupled case exactly as to a single
+field. *Scope: nodal Lagrange, 2D/3D (1D has its own narrower path). Fail-loud: a coupled field
+with no `u_tt` term (write a first-order field as an explicit first-order system), runtime
+parameters on a coupled form, a trainable Dirichlet value, and `g(x, t)` on a nonlinear form.*
 
 ---
 
@@ -1359,10 +1362,14 @@ route** — the residual-PINN path is unaffected. Full detail is inline in the s
   **nonlinear spatial** operator (sine-Gordon, cubic Klein–Gordon, large-deformation elastodynamics)
   *is* supported — Newton on the augmented `[u; v]` block — but the **temporal** side must stay linear:
   a state-dependent mass or damping `c(u)·u_tt` is refused, since `M2`/`C` are extracted by
-  differentiating at `u=0` and would otherwise be frozen there. Coupled multi-field is 2D/3D and
-  **all**-second-order only; time-varying Dirichlet is refused on nonlinear forms. A coupled 1D
-  system carries `u_tt` on the same terms as 2D/3D: the augmented state is `[u_all; v_all]`, so
-  `fem.offsets` lists the displacement blocks then the velocity blocks.
+  differentiating at `u=0` and would otherwise be frozen there. A **coupled** 2D/3D system flows
+  through the *same* assembler as a single field, so damping, the nonlinear path and a driven
+  boundary `g(x,t)` compose with coupling; what a coupled form still refuses: a field with **no**
+  `u_tt` term (its velocity rows would be singular), **runtime parameters** (the parametric coupled
+  steady assembly underneath is not wired), and periodic ties. Time-varying Dirichlet is refused on
+  nonlinear forms. A coupled 1D system carries `u_tt` on narrower terms (linear, undamped): the
+  augmented state is `[u_all; v_all]`, so `fem.offsets` lists the displacement blocks then the
+  velocity blocks.
 - **Reduced-order (`basis=`) solves** cover steady and **first-order transient** (linear and
   nonlinear). Second-order-in-time (`u_tt`), complex, and periodic-tied problems refuse, each with its
   own reason. Nonlinear reduces, but without hyper-reduction that is a memory win, not a speed one.
