@@ -285,6 +285,40 @@ Tutorials: `mixed_poisson_rt_2d.py` (H(div)), `maxwell_nedelec_2d.py` (H(curl): 
 current), and `maxwell_nedelec_3d.py` (the **3-D PEC cube cavity resonator** — recovers `k²=π²(l²+m²+n²)`,
 spurious-free, converging to `2π²` from below).
 
+### Mesh resolution for wave problems
+
+Because N1E is **lowest order only** (`order=` is refused, above), the mesh is your *only* accuracy
+knob on a wave problem — so it is worth knowing what a given resolution buys. Measured on the PEC cube
+cavity, whose lowest mode `k² = 2π²` is analytic, with `h` expressed as **points per wavelength**
+(`λ = 2π/k = √2` on the unit cube, `ppw = λ/h`):
+
+| `h` | ppw | DOFs | mean lowest triplet | rel. error |
+|-----|-----|------|--------------------|------------|
+| 0.50 | 2.8 | 53 | 14.52 | 26% |
+| 0.40 | 3.5 | 121 | 18.67 | 5.4% |
+| 0.30 | 4.7 | 217 | 19.48 | 1.3% |
+| 0.25 | 5.7 | 276 | 19.07 | 3.4% |
+| 0.20 | 7.1 | 532 | 19.27 | 2.4% |
+| 0.16 | 8.8 | 1083 | 19.46 | 1.4% |
+
+The fitted rate is **2.1 in `h`**, consistent with the theoretical `O(h²)` for *eigenvalues* with
+lowest-order edge elements (the *field* itself converges at `O(h)`). Extrapolating the fit: **~9 ppw for
+1%** and **~28 ppw for 0.1%** eigenvalue error.
+
+Read those numbers with two caveats, both real:
+
+- **The sequence is not monotone** (0.25 is worse than 0.30). gmsh meshes at different `h` are
+  unstructured and non-nested, and the mode is 3-fold degenerate, so the triplet mean wobbles by a
+  percent or so between meshes. Treat the table as a trend, not a per-`h` guarantee — and do your own
+  convergence check on your own geometry rather than reading a single number off a single mesh.
+- **A cavity eigenvalue is the friendly case.** A *driven* problem at high frequency additionally
+  suffers the **pollution effect**: holding `ppw` fixed as the domain grows in wavelengths does *not*
+  hold the error fixed — it degrades with `k(kh)^{2p}` (Babuška & Sauter, *Is the pollution effect of
+  the FEM avoidable for the Helmholtz equation considering high wave numbers?*, SIAM J. Numer. Anal.
+  **34**(6), 2392–2423, 1997). So an electrically large problem needs *more* points per wavelength
+  than a small one, and lowest order is where that bites hardest. If you need many wavelengths across
+  the domain, budget accordingly.
+
 ---
 
 ## What `jno.fem` returns
