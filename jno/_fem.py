@@ -1603,19 +1603,12 @@ class FEM:
             from .utils.solver.fem_adapt import run_adaptive_solve, run_adaptive_transient
 
             if self._mode == "transient":
-                if self.is_complex:
-                    # A complex transient is now an ordinary transient block, so it *routes* here — but the
-                    # adaptive driver's cross-remesh state transfer interpolates a real nodal field, and this
-                    # block's state is the stacked ``[u_r; u_i]`` pair on one mesh. Transferring it needs the
-                    # two halves carried separately. Fail loud rather than interpolate half a complex field.
-                    raise NotImplementedError(
-                        "jno.fem: fem.solve(adapt=...) on a complex *transient* problem is not supported yet — "
-                        "the adaptive state transfer is not complex-aware (the block state is the stacked "
-                        "[Re; Im] pair). A complex *steady* problem adapts, and a real transient adapts."
-                    )
                 # Adapt the mesh AS the problem marches: remesh every `adapt.every` steps and carry the
-                # state across (basis-aware transfer), tracking a moving feature. The nonlinear=/linear=/
-                # precond= slots configure the per-step (Newton / theta) solve. Returns an AdaptiveTrajectory.
+                # state across (basis-aware transfer), tracking a moving feature. A fused COMPLEX
+                # transient rides the same driver: the stacked ``[u_r; u_i]`` halves transfer as a
+                # doubled field layout, the modulus drives the metric, and each saved frame recombines
+                # to the complex field. The nonlinear=/linear=/precond= slots configure the per-step
+                # (Newton / theta) solve. Returns an AdaptiveTrajectory.
                 return run_adaptive_transient(
                     self, adapt, solve_fn=solve_fn, nonlinear=nonlinear, linear=linear, precond=precond, **kwargs
                 )

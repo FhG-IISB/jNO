@@ -1022,10 +1022,13 @@ the imaginary leg's rows zeroed rather than set to identity, and the symmetric e
 known-column lift is cross-leg (the real equation needs `A_r[:,j] g_r - A_i[:,j] g_i`, which no per-leg
 elimination produces). It raises a clear error. Carry the complex part in the operator or the source.
 
-Not yet supported (clear errors): `adapt=` on a complex transient (the cross-remesh state transfer is
-not complex-aware yet); a Bloch tie on a **real** transient march (the phase forces a complex field —
-make the problem complex, or use a plain tie) or on a **nonlinear** form (complex nonlinear forms are
-not wired).
+`adapt=` composes with a complex **transient** too: the stacked `[Re; Im]` halves transfer across
+each remesh as a doubled field layout, the **modulus** `|u|` drives the remesh metric (refining on
+`Re` alone would miss a rotating phase), and the saved frames come back complex.
+
+Not yet supported (clear errors): a Bloch tie on a **real** transient march (the phase forces a
+complex field — make the problem complex, or use a plain tie) or on a **nonlinear** form (complex
+nonlinear forms are not wired).
 
 ### Multiple devices — `fem.solve(shard=...)`
 

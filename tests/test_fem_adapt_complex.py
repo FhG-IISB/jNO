@@ -222,3 +222,53 @@ def test_adaptive_anisotropic_rejects_complex():
     fem = jno.fem([ui.x * vi.x + ui.y * vi.y - (10.0 + 1j) * (u * vi) - (1 + 0.2j) * vi, u(xb, yb) - 0.0])
     with pytest.raises(NotImplementedError, match="real-only"):
         fem.solve(adapt=jno.solve.remesh(anisotropic=True, max_iters=2), solve_fn=sparse_lu_solve)
+
+
+def test_adapt_complex_transient_decaying_mode():
+    """``fem.solve(adapt=...)`` on a COMPLEX transient (previously fail-loud): the fused ``[Re; Im]``
+    state transfers across each remesh as a doubled field layout, the MODULUS drives the metric, and
+    the frames come back complex. Pinned against the analytic decaying mode of complex diffusion
+    ``ψ_t = c Δψ`` (c = 0.5+1j, Dirichlet walls): ``ψ(t) = exp(-c·2π²·t)·sin(πx)sin(πy)``."""
+    c = 0.5 + 1j
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.09, time=(0.0, 0.02, 41))
+    u, phi = d.fem_symbols(names=("axc", "axcp"))
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    psi0 = jno.np.sin(np.pi * ci[0]) * jno.np.sin(np.pi * ci[1])
+    fem = jno.fem([ui.t * vi + c * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - psi0])
+    assert fem.is_complex and fem.is_transient
+    traj = fem.solve(adapt=jno.solve.remesh(every=10, max_dofs=260))
+    assert len(fem.adapt_history) >= 1, "the march must actually remesh (the transfer is the point)"
+
+    state, (pts, _cells) = traj.final()
+    state = np.asarray(state)
+    assert np.iscomplexobj(state), "a complex transient's adaptive frames must be complex"
+    pts = np.asarray(pts)
+    assert state.shape[0] == pts.shape[0], "frame length must match its OWN mesh (n complex DOFs)"
+    t1 = float(traj.times[-1])
+    exact = np.exp(-c * 2 * np.pi**2 * t1) * np.sin(np.pi * pts[:, 0]) * np.sin(np.pi * pts[:, 1])
+    rel = np.linalg.norm(state - exact) / np.linalg.norm(exact)
+    assert rel < 6e-2, f"adapted complex transient vs analytic decaying mode: rel {rel:.3e}"
+    assert float(np.abs(state.imag).max()) > 1e-2, "the decayed mode must be genuinely complex"
+
+    # resample the complex trajectory onto the final mesh: complex frames, uniform array out
+    frames = traj.resample(fem.domain)
+    frames = np.asarray(frames)
+    assert np.iscomplexobj(frames) and frames.shape[0] == len(traj)
+
+
+def test_adapt_complex_transient_zero_ic_stays_zero():
+    """Extreme: a zero IC must stay identically zero through every remesh — the doubled-layout
+    transfer and the recombination must not invent a field on either half."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.12, time=(0.0, 0.02, 21))
+    u, phi = d.fem_symbols(names=("zxc", "zxcp"))
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    fem = jno.fem([ui.t * vi + (0.5 + 1j) * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - 0.0])
+    traj = fem.solve(adapt=jno.solve.remesh(every=8, max_dofs=200))
+    for s in traj.states:
+        assert float(np.abs(np.asarray(s)).max()) < 1e-12

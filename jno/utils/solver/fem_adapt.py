@@ -2492,7 +2492,11 @@ def _field_layout(fem: Any) -> dict:
     d = fem.domain
     off = fem.offsets
     if off is None:  # single scalar field with no block structure
-        off = [0, int(jnp.asarray(fem._op.state0).reshape(-1).shape[0])]
+        n_state = int(jnp.asarray(fem._op.state0).reshape(-1).shape[0])
+        _meta = getattr(fem._op, "metadata", None) or {}
+        # A fused complex transient marches the stacked [Re; Im] state (2n) but its FIELD layout is the
+        # n complex DOFs — halve, or the layout would misread [Re; Im] as an interleaved vec-2 field.
+        off = [0, n_state // 2 if _meta.get("complex") else n_state]
     off = [int(x) for x in off]
     n_fields = len(off) - 1
     fpts = fem.field_points
@@ -2512,6 +2516,22 @@ def _field_layout(fem: Any) -> dict:
         "orders": [int(o) for o in orders],
         "cells_f": [np.asarray(c) for c in cells_f],
         "vecs": vecs,
+    }
+
+
+def _double_layout(layout: dict) -> dict:
+    """The transfer/metric layout for a fused complex transient: the block state is the stacked
+    ``[Re; Im]`` pair, so the imaginary half rides as a SECOND COPY of every field — same nodes, same
+    order, same vec, offset by the total. The basis-aware transfer then carries both halves with no
+    complex branch, exactly as :func:`jno._fem._duplicate_periodic` doubles the periodic blocks."""
+    off = layout["offsets"]
+    n_half = off[-1]
+    return {
+        "offsets": off + [n_half + o for o in off[1:]],
+        "field_points": layout["field_points"] + layout["field_points"],
+        "orders": layout["orders"] + layout["orders"],
+        "cells_f": layout["cells_f"] + layout["cells_f"],
+        "vecs": layout["vecs"] + layout["vecs"],
     }
 
 
@@ -2588,20 +2608,32 @@ def run_adaptive_transient(
     state = jnp.asarray(block.state0).reshape(-1)
     if jnp.iscomplexobj(state):
         raise NotImplementedError(
-            "transient adaptive remeshing is real-only (the Hessian metric and the ZZ estimator are); a complex "
-            "transient is not supported yet."
+            "transient adaptive remeshing found a complex-dtype block state — a supported complex "
+            "transient marches the REAL stacked [Re; Im] block; this one assembled through another route."
         )
+    # A fused COMPLEX transient marches the real stacked [Re; Im] state: the transfer/metric see the
+    # DOUBLED layout (the Im half rides as a second copy of every field), the remesh metric is the
+    # MODULUS |u| = sqrt(Re² + Im²), and each saved frame is recombined to the complex field the user
+    # authored against.
+    is_cx = bool(block.metadata and block.metadata.get("complex"))
     # Per-field block layout (offsets / orders / vecs / P{order} connectivity / DOF coords), generalised
     # beyond scalar-P1: vector, higher-order (P2), and mixed (Taylor-Hood) fields are carried across a
     # remesh by the basis-aware transfer below. Read right after assembly — the domain's per-field
     # metadata is clobbered by the next one.
-    layout = _field_layout(fem)
+    layout = _field_layout(fem)  # the (complex) FIELD layout — what saved frames are described by
+    tlayout = _double_layout(layout) if is_cx else layout  # what the stacked block state is laid out as
     off = layout["offsets"]
     n_fields = len(off) - 1
     cur_nverts = n_verts  # current mesh's vertex count (updates each remesh; drives the metric slice)
     mf = int(spec.metric_field)
     if not 0 <= mf < n_fields:
         raise ValueError(f"AdaptSpec.metric_field={spec.metric_field} is out of range for {n_fields} field(s).")
+
+    def _frame(s):  # a saved frame: the complex field for a fused complex transient, the state itself else
+        if not is_cx:
+            return s
+        half = s.shape[0] // 2
+        return s[:half] + 1j * s[half:]
 
     key = _simplex_cell_key(dim)
     ts = np.asarray(_block_time_grid(block))  # fixed t0..t1 at dt -- unchanged by remeshing
@@ -2623,7 +2655,7 @@ def run_adaptive_transient(
         return (np.asarray(d.mesh.points)[:, :dim].astype(np.float64), np.asarray(d.mesh.cells_dict[key]).astype(np.int64))
 
     cur_mesh = _snapshot()
-    times, states, meshes, layouts = [float(ts[0])], [state], [cur_mesh], [layout]
+    times, states, meshes, layouts = [float(ts[0])], [_frame(state)], [cur_mesh], [layout]
     history: list[dict] = []
     cur = fem
 
@@ -2649,14 +2681,19 @@ def run_adaptive_transient(
         for j in range(chunk):
             i += 1
             times.append(float(ts[i]))
-            states.append(traj[j])
+            states.append(_frame(traj[j]))
             meshes.append(cur_mesh)
             layouts.append(layout)
         if i >= n_steps:
             break
 
         # remesh from the metric-driving field (fixed budget above), then carry every field's block over
-        u_v = _scalar_vertex_metric(state, layout, mf, cur_nverts)  # scalar VERTEX field (vector/P2 reduced)
+        if is_cx:  # the modulus drives the metric — refining on Re alone would miss a rotating phase
+            _re = _scalar_vertex_metric(state, tlayout, mf, cur_nverts)
+            _im = _scalar_vertex_metric(state, tlayout, mf + n_fields, cur_nverts)
+            u_v = np.sqrt(_re**2 + _im**2)
+        else:
+            u_v = _scalar_vertex_metric(state, tlayout, mf, cur_nverts)  # scalar VERTEX field (vector/P2 reduced)
         old_pts, old_cells = cur_mesh
         if spec.anisotropic:
             metric = hessian_metric(d, u_v, target_complexity=target, hmin=hmin, hmax=hmax)
@@ -2677,22 +2714,24 @@ def run_adaptive_transient(
         cur_mesh = _snapshot()
         new_n = int(cur_mesh[0].shape[0])
         new_layout = _field_layout(cur)  # per-field layout on the refined mesh (read now, before any re-assembly)
+        new_tlayout = _double_layout(new_layout) if is_cx else new_layout
         # Basis-aware, value-shape-aware state transfer: evaluate each OLD field at its NEW per-field DOF
         # coordinates using the OLD element's shape functions (P1 vertices / P2 midpoints / vector comps).
+        # For a fused complex transient the doubled layout carries the Re and Im halves separately.
         vals = _eval_fe_fields_at_points(
             old_pts,
             old_cells,
             state,
-            layout["offsets"],
-            layout["orders"],
-            layout["cells_f"],
-            layout["vecs"],
-            new_layout["field_points"],
+            tlayout["offsets"],
+            tlayout["orders"],
+            tlayout["cells_f"],
+            tlayout["vecs"],
+            new_tlayout["field_points"],
             dim=dim,
         )
         state = jnp.concatenate([v.reshape(-1) for v in vals])
-        off, layout, cur_nverts = new_layout["offsets"], new_layout, new_n
-        history.append({"t": float(ts[i]), "n_dofs": int(off[-1]), "fields": n_fields})
+        off, layout, tlayout, cur_nverts = new_layout["offsets"], new_layout, new_tlayout, new_n
+        history.append({"t": float(ts[i]), "n_dofs": int(tlayout["offsets"][-1]), "fields": n_fields})
 
     fem.__dict__.update(cur.__dict__)  # rebind to the final adapted mesh (matches the steady driver)
     fem.adapt_history = history
