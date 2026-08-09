@@ -1901,7 +1901,9 @@ class FEM:
             raise AttributeError(f"FEM is {self._mode}; .b is only for a steady linear problem (see .operator / .M).")
         return _as_flat(self._b)
 
-    def eigs(self, *, mass, k: int = 6, which: str = "smallest", precond=None, tol=None, maxiter=None):
+    def eigs(
+        self, *, mass, k: int = 6, which: str = "smallest", sigma=None, linear=None, precond=None, tol=None, maxiter=None
+    ):
         """Generalized eigenproblem ``K x = λ M x`` on this fem: ``K`` is this **source-less** fem's
         operator (its stiffness bilinear form) and ``M`` is the ``mass`` bilinear form assembled on the
         same space. Returns ``(λ, X)`` — the ``k`` eigenvalues at ``which`` (``'smallest'``/``'largest'``)
@@ -1914,10 +1916,15 @@ class FEM:
             lam, X = K.eigs(mass=[ui * vi], k=6)          # K x = λ M x  → λ = ω² (Neumann box)
 
         ``precond=`` switches from the dense reduction to **preconditioned LOBPCG**, which never
-        densifies the operator and so scales past it — ``tol``/``maxiter`` tune that iteration and are
-        rejected without it. See :func:`jno.solve.eigs` for the full contract::
+        densifies the operator and so scales past it; ``sigma=`` targets the ``k`` eigenvalues
+        **nearest the shift** (interior modes — a cavity resonance in a band, a Brillouin-zone point
+        away from the band edge) via the shift-invert transformation, with ``linear=`` picking the
+        inner solver against ``K − σM`` (default: a once-factorized host sparse LU). ``tol``/``maxiter``
+        tune the iterative paths and are rejected on the dense one. See :func:`jno.solve.eigs` for the
+        full contract::
 
             lam, X = K.eigs(mass=[ui * vi], k=6, precond=jno.precond.amg())
+            lam, X = K.eigs(mass=[ui * vi], k=4, sigma=60.0)   # the 4 modes nearest λ = 60
         """
         if self._mode != "linear":
             raise AttributeError(f"FEM.eigs needs a steady-linear (source-less) bilinear form; this fem is {self._mode}.")
@@ -1932,17 +1939,42 @@ class FEM:
         # an empty list — the elimination would then silently not happen and the row-replaced spurious
         # modes would come back.
         restrict, prolong, n_red, _kind = _eigs_constraint_maps(self, n_full)
+        # The Dirichlet DOF set must be captured NOW too (the sigma path assembles its selection P
+        # from it) — after the mass assembly below the domain stash is empty and a P built from it
+        # would silently be the identity.
         _pairs = list(getattr(self.domain, "_fem_native_dirichlet_pairs", None) or [])
+        _dir_dofs = sorted({int(dof) for dof, _v in _pairs})
         M = fem(list(mass)).operator[0]  # mass matrix on the same FE space
         # RESTORE the stash the (Dirichlet-free) mass assembly just cleared: without this, a SECOND
         # eigs() on the same fem finds no constraints, skips the elimination, and silently returns the
-        # row-replaced spurious spectrum — eigs was not idempotent (measured: the repeat call gave
+        # row-replaced spurious spectrum — eigs would not be idempotent (measured: the repeat call gave
         # 47.2 where the true reduced spectrum has no such eigenvalue).
         self.domain._fem_native_dirichlet_pairs = _pairs
 
-        solver = _solve.eigs(k=k, which=which, precond=precond, tol=tol, maxiter=maxiter)
+        solver = _solve.eigs(k=k, which=which, sigma=sigma, linear=linear, precond=precond, tol=tol, maxiter=maxiter)
         if restrict is None:
             return solver(K, M)
+
+        if sigma is not None:
+            # Shift-invert factorizes K − σM, so the constrained pencil must be ASSEMBLED in the
+            # reduced space — sparsely, via the same triplet-remap the periodic solve reduction uses
+            # (a Dirichlet elimination is a selection P, a periodic tie its own P). The matvec-only
+            # reduction below cannot serve here: there is nothing to factorize.
+            import jax.experimental.sparse as jsparse
+
+            from .utils.solver.fem_utils import reduce_matrix, reduce_matrix_periodic
+
+            if _kind == "periodic":
+                K_red, M_red = reduce_matrix_periodic(self._periodic, K), reduce_matrix_periodic(self._periodic, M)
+            else:  # dirichlet: the free-DOF selection P as a BCOO, reduced by the sparse remap
+                free = jnp.asarray(sorted(set(range(n_full)) - set(_dir_dofs)), dtype=jnp.int32)
+                P = jsparse.BCOO(
+                    (jnp.ones(n_red, dtype=K.dtype), jnp.stack([free, jnp.arange(n_red)], axis=1)),
+                    shape=(n_full, n_red),
+                )
+                K_red, M_red = reduce_matrix(P, K, is_selection=True), reduce_matrix(P, M, is_selection=True)
+            lam, Xr = solver(K_red, M_red)
+            return lam, jax.vmap(prolong, in_axes=1, out_axes=1)(Xr)
 
         # Reduced pencil (PᵀKP) x̂ = λ (PᵀMP) x̂ as MATVECS — never assembled, so this composes with the
         # matrix-free LOBPCG path and never densifies a big operator just to drop some rows.

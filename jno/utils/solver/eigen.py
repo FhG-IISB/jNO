@@ -12,8 +12,12 @@ must preserve:
 * :func:`lobpcg_geneigh` — **preconditioned LOBPCG** for scale: matvecs against ``K``/``M`` plus a
   ``jno.precond.*`` apply, so a sparse/matrix-free operator is never densified.
 
-:mod:`jno.solve` exposes both through ``jno.solve.eigs``; an iterative-only argument (``precond=`` /
-``sigma=``) selects LOBPCG, otherwise the dense reduction runs exactly as before.
+* :func:`shift_invert_geneigh` — the ``k`` eigenpairs **nearest a shift** ``σ`` (interior modes:
+  cavity resonances, band structure away from the band edge), by block subspace iteration on the
+  spectrally transformed operator ``C = (K−σM)⁻¹M`` with ``θ = 1/(λ−σ)``.
+
+:mod:`jno.solve` exposes all three through ``jno.solve.eigs``: ``precond=`` selects LOBPCG,
+``sigma=`` selects shift-invert, otherwise the dense reduction runs exactly as before.
 """
 
 from __future__ import annotations
@@ -82,9 +86,16 @@ def _as_op(A):
 
 
 def _blockmv(op, X):
-    """Apply an operator column-wise to an ``(n, m)`` block. ``None`` is the identity (``M = I``)."""
+    """Apply an operator column-wise to an ``(n, m)`` block. ``None`` is the identity (``M = I``).
+
+    An operator tagged ``column_loop=True`` is applied by a static unrolled loop instead of ``vmap``:
+    the shift-inverted operator's matvec runs a host-factorized direct solve through
+    ``jax.pure_callback``, which has **no vmap batching rule** — ``vmap`` would fail where the plain
+    per-column call is fine (the block width is a small static ``kb``)."""
     if op is None:
         return X
+    if getattr(op, "column_loop", False):
+        return jnp.stack([op.mv(X[:, i]) for i in range(X.shape[1])], axis=1)
     return jax.vmap(op.mv, in_axes=1, out_axes=1)(X)
 
 
@@ -240,6 +251,152 @@ def lobpcg_geneigh(
     KX, MX = _blockmv(Kop, X), _blockmv(Mop, X)
     lam = jnp.sum(X.conj() * KX, axis=0).real / jnp.sum(X.conj() * MX, axis=0).real
     return lam, X, res
+
+
+def shift_invert_geneigh(
+    K, M, k: int, sigma: float, *, inner_solve=None, tol: float = 1e-6, maxiter: int = 200, seed: int = 0
+):
+    """The ``k`` eigenpairs of ``K x = λ M x`` **nearest the shift** ``σ`` — interior eigenvalues.
+
+    The extremal-end methods (LOBPCG, Lanczos) cannot target the middle of a spectrum: an interior
+    eigenvalue is extremal in no ordering, and the FEM gaps there are relatively tiny. The **spectral
+    transformation** (Ericsson & Ruhe, *The spectral transformation Lanczos method for the numerical
+    solution of large sparse generalized symmetric eigenvalue problems*, Math. Comp. **35** (1980),
+    §2) fixes both at once: with ``C = (K − σM)⁻¹M``, every eigenpair maps to ``C x = θ x`` with
+
+        ``θ = 1/(λ − σ)``,
+
+    so the eigenvalues **nearest σ become the largest |θ|** — the dominant subspace — and the
+    transformed gaps are enormous exactly where the original gaps are tiny (the transform is its own
+    preconditioner; no ``precond=`` is needed or accepted here). ``C`` is self-adjoint in the
+    M-inner product (``M C = M(K−σM)⁻¹M`` is symmetric), so **block subspace iteration** on ``C``
+    (Bathe & Wilson 1973; guards absorbing the slow boundary direction, as in LOBPCG) converges the
+    ``k`` nearest pairs wherever they lie — both sides of σ or all on one — and, being a BLOCK
+    method, converges a degenerate cluster near σ (the double modes of a symmetric cavity) as a
+    block, where single-vector shift-invert Lanczos finds one copy.
+
+    Every sweep closes with a Rayleigh–Ritz of the **original pencil** on the block, so the
+    convergence gate is the caller's quantity — the λ-space relative residual ``‖Kx − λMx‖`` of the
+    ``k`` wanted pairs, normalized by their spectrum scale — never a θ-space proxy, whose mapping
+    back is amplified by ``‖K−σM‖/|θ|`` (from ``Kx − λMx = −(K−σM)(Cx−θx)/θ``). An exhausted budget
+    NaN-poisons rather than returning a quietly under-converged interior spectrum. A shift that
+    lands ON an eigenvalue makes ``K − σM`` singular; the inner factorization then yields garbage
+    that fails the same gate — perturb σ off the eigenvalue.
+
+    Args:
+        K: **assembled** symmetric operator (BCOO or dense — the shifted operator is factorized, so
+            a matvec-only operator is a ``TypeError``).
+        M: assembled SPD mass operator, or ``None`` for the standard problem (``M = I``).
+        k: number of eigenpairs, nearest σ.
+        sigma: the shift (a plain float — differentiating through the shift location is not defined).
+        inner_solve: ``(A, b) -> x`` for the inner solves against ``K − σM`` (from ``jno.solve.*``).
+            Default: the host sparse-direct LU, whose content-keyed factorization cache means the
+            matrix is **factorized once** and every subsequent inner solve is a pair of triangular
+            substitutions.
+        tol / maxiter / seed: as in :func:`lobpcg_geneigh` (per transformed run).
+
+    Returns:
+        ``(λ, X)`` — the ``k`` eigenvalues nearest σ (sorted by ``|λ − σ|``), M-orthonormal
+        eigenvectors, NaN-poisoned if the final original-pencil residual gate fails. Eigenvalues are
+        differentiable through the Rayleigh quotient at the frozen eigenvectors, like the LOBPCG
+        path; eigenvectors carry no gradient.
+    """
+    for name, op in (("K", K), ("M", M)):
+        if op is not None and not (hasattr(op, "todense") or isinstance(op, jnp.ndarray) or hasattr(op, "__array__")):
+            raise TypeError(
+                f"jno.solve.eigs(sigma=...): {name} must be an ASSEMBLED operator (BCOO or dense) — "
+                "the shifted operator K - sigma*M is factorized for the inner solves, which a "
+                "matvec-only operator cannot provide."
+            )
+    n = int(K.shape[0])
+    if k < 1 or k > n:
+        raise ValueError(f"jno.solve.eigs: k={k} out of range for an operator of size {n}.")
+    sigma = float(sigma)
+
+    # Small pencil: the two k-blocks of the transformed runs would overlap the whole spectrum, and at
+    # this size the dense reduction is exact and cheaper than any iteration — take it and pick the
+    # k nearest σ directly.
+    if n <= max(64, 4 * k + 16):
+        lam_all, V_all = dense_geneigh(K, M, n, "smallest")
+        idx = jnp.argsort(jnp.abs(lam_all - sigma))[:k]
+        return lam_all[idx], V_all[:, idx]
+
+    from .solver_api import LinearOperator, _add_step_operator
+
+    if M is None:
+        import jax.experimental.sparse as jsp
+
+        eye = jsp.BCOO((jnp.ones(n, _as_dense_dtype(K)), jnp.stack([jnp.arange(n)] * 2, axis=1)), shape=(n, n))
+        A_sig = _add_step_operator(K, eye, -sigma)
+        Mmv = lambda v: v  # noqa: E731
+    else:
+        A_sig = _add_step_operator(K, M, -sigma)
+        Mop = LinearOperator(M)
+        Mmv = Mop.mv
+
+    if inner_solve is None:
+        from .linear import host_lu_solve
+
+        inner = lambda b: host_lu_solve(A_sig, b)  # noqa: E731  factorized once (content-keyed cache)
+    else:
+        inner = lambda b: inner_solve(A_sig, b)  # noqa: E731
+
+    # Block shift-invert SUBSPACE ITERATION (Bathe & Wilson, *Solution methods for eigenvalue
+    # problems in structural mechanics*, IJNME 6 (1973) — the classical pairing with the Ericsson-Ruhe
+    # transformation). One application of ``C = (K−σM)⁻¹M`` per sweep multiplies every unwanted
+    # direction by |θ_unwanted/θ_wanted| — tiny, because the transformation makes the near-σ |θ| the
+    # dominant ones by construction — so the m-block converges to the k nearest pairs (wherever they
+    # lie: both sides of σ, or all on one) with the m−k guards absorbing the slow boundary direction,
+    # exactly as in LOBPCG. Each sweep closes with a Rayleigh–Ritz of the ORIGINAL pencil on the
+    # block, so the convergence gate is the quantity the caller cares about — the λ-space residual —
+    # never a θ-space proxy whose mapping back is amplified by ``‖K−σM‖/|θ|``.
+    Kop = LinearOperator(K)
+    Mop_full = LinearOperator(M) if M is not None else None
+    m = min(n, k + max(3, (k + 1) // 2))  # guard vectors, as in LOBPCG
+    dt = _as_dense_dtype(K)
+    eps = jnp.finfo(dt).eps
+
+    def _apply_C(V):  # C V = (K−σM)⁻¹ M V, column-wise: the host-factorized inner solve has no vmap rule
+        return jnp.stack([inner(Mmv(V[:, i])) for i in range(m)], axis=1)
+
+    def sweep(state):
+        i, V, _res, _lam = state
+        W = _apply_C(V)
+        Z, keepc = _m_orth_basis(W, _blockmv(Mop_full, W), eps * 1e2)
+        Sb = W @ Z  # M-orthonormal basis (a collapsed direction -> zero column)
+        A = Sb.T @ _blockmv(Kop, Sb)
+        A = 0.5 * (A + A.T)
+        big = 1e6 * (jnp.max(jnp.abs(A)) + abs(sigma) + 1.0)  # exile dead columns far from the shift
+        A = A + jnp.diag(jnp.where(keepc, 0.0, big).astype(A.dtype))
+        mu, Q = jnp.linalg.eigh(A)
+        order = jnp.argsort(jnp.abs(mu - sigma))  # nearest-σ first, guards after
+        Vn = Sb @ Q[:, order]
+        X = Vn[:, :k]
+        KX = _blockmv(Kop, X)
+        MX = _blockmv(Mop_full, X) if M is not None else X
+        lam = mu[order][:k]
+        scale = jnp.maximum(jnp.max(jnp.abs(lam)), jnp.finfo(lam.dtype).tiny)
+        rel = jnp.max(jnp.linalg.norm(KX - MX * lam[None, :], axis=0) / scale)
+        return (i + 1, Vn, rel, lam)
+
+    key = jax.random.PRNGKey(seed)
+    V0 = jax.random.normal(key, (n, m), dtype=dt)
+    V0 = _m_orth_ordered(V0, _blockmv(Mop_full, V0), eps * 1e2)
+    init = (0, V0, jnp.asarray(jnp.inf, dt), jnp.zeros((k,), dt))
+    # stop_gradient: the sweeps locate the eigenvectors; the differentiable value is the Rayleigh
+    # quotient at the frozen result (below) — identical to the LOBPCG path's contract.
+    _i, V, res, _l = jax.lax.stop_gradient(jax.lax.while_loop(lambda s: (s[0] < maxiter) & (s[2] > tol), sweep, init))
+    X = V[:, :k]
+
+    # Differentiable readout + honesty gate on the ORIGINAL pencil: the Rayleigh quotient at the
+    # frozen eigenvectors carries ∂λ/∂θ; a budget exhausted past ``tol`` — or the NaN residuals a
+    # singular shift produces — NaN-poisons rather than returning a quietly wrong interior spectrum
+    # (``res <= tol`` is False for NaN).
+    KX = _blockmv(Kop, X)
+    MX = _blockmv(Mop_full, X) if M is not None else X
+    lam = jnp.sum(X * KX, axis=0) / jnp.sum(X * MX, axis=0)
+    bad = ~(res <= tol)
+    return jnp.where(bad, jnp.nan, lam), jnp.where(bad, jnp.nan, X)
 
 
 def _as_dense_dtype(A):

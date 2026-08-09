@@ -170,9 +170,9 @@ def test_lobpcg_nan_poisons_on_an_exhausted_budget():
 def test_eigs_rejects_tol_without_precond():
     """tol=/maxiter= without precond= would be silently ignored by the dense path, so it fails loud."""
     K, mass = _laplacian(0.25)
-    with pytest.raises(ValueError, match="no precond="):
+    with pytest.raises(ValueError, match="neither precond= nor sigma="):
         K.eigs(mass=mass, k=2, tol=1e-10)
-    with pytest.raises(ValueError, match="no precond="):
+    with pytest.raises(ValueError, match="neither precond= nor sigma="):
         jno.solve.eigs(k=2, maxiter=10)
 
 
@@ -296,3 +296,134 @@ def test_eigs_is_idempotent():
     lam1, _ = K.eigs(mass=mass, k=3)
     lam2, _ = K.eigs(mass=mass, k=3)
     assert np.allclose(np.asarray(lam1), np.asarray(lam2), rtol=1e-12), (lam1, lam2)
+
+
+# --------------------------------------------------------------------------------------------------
+# Shift-invert (sigma=): interior eigenvalues
+# --------------------------------------------------------------------------------------------------
+
+
+def test_eigs_sigma_recovers_the_interior_cluster_with_degeneracy():
+    """``sigma=60`` on the Dirichlet box must return the modes NEAREST 60 — the degenerate pair at
+    5π² ≈ 49.35 and the single at 8π² ≈ 78.96 — which no extremal-end iteration can target. The tight
+    oracle is the dense full spectrum (same discretized pencil, machine agreement); the analytic
+    values gate the discretization itself."""
+    d, K, mass = _dirichlet_box(0.05)
+    lam, X = K.eigs(mass=mass, k=3, sigma=60.0)
+    lam = np.asarray(lam)
+    assert not np.isnan(lam).any(), "shift-invert poisoned a healthy interior solve"
+
+    # dense oracle: full spectrum of the SAME reduced pencil, k nearest sigma
+    lam_all, _ = K.eigs(mass=mass, k=40)
+    lam_all = np.asarray(lam_all)
+    oracle = lam_all[np.argsort(np.abs(lam_all - 60.0))[:3]]
+    assert np.allclose(np.sort(lam), np.sort(oracle), rtol=1e-8), (lam, oracle)
+    # analytic sanity: {5π², 5π², 8π²} at mesh accuracy — the degenerate pair must BOTH be present
+    assert np.allclose(np.sort(lam), np.pi**2 * np.array([5.0, 5.0, 8.0]), rtol=0.06), lam
+
+    # M-orthonormal modes, exactly zero on the eliminated wall
+    M = _dense(jno.fem(mass).operator[0])
+    G = np.asarray(X).T @ M @ np.asarray(X)
+    assert np.allclose(G, np.eye(3), atol=1e-8)
+    pts = np.asarray(K.points)
+    onwall = (
+        (np.abs(pts[:, 0]) < 1e-9)
+        | (np.abs(pts[:, 0] - 1) < 1e-9)
+        | (np.abs(pts[:, 1]) < 1e-9)
+        | (np.abs(pts[:, 1] - 1) < 1e-9)
+    )
+    assert np.max(np.abs(np.asarray(X)[onwall])) == 0.0
+
+
+def test_eigs_sigma_below_the_spectrum_matches_smallest():
+    """A shift below every eigenvalue makes "nearest σ" = "smallest": shift-invert must agree with
+    the dense smallest-end answer on the same pencil."""
+    d, K, mass = _dirichlet_box(0.06)
+    lam_si, _ = K.eigs(mass=mass, k=3, sigma=0.0)
+    lam_sm, _ = K.eigs(mass=mass, k=3)
+    assert np.allclose(np.sort(np.asarray(lam_si)), np.asarray(lam_sm), rtol=1e-8)
+
+
+def test_eigs_sigma_composes_with_a_periodic_tie():
+    """Interior targeting on the periodic pencil: σ = 35 between π² and the 4π² pair must return the
+    pair — the case that motivates sigma= (band structure at an interior point)."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.07)
+    d.tag("L", lambda x, y: x < 1e-9)
+    d.tag("R", lambda x, y: x > 1 - 1e-9)
+    d._remesh_periodic([("L", "R")])
+    u, v = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xl, yl, _ = d.variable("L", split=True)
+    xr, yr, _ = d.variable("R", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    K = jno.fem([ui.x * vi.x + ui.y * vi.y, u(xl, yl) - u(xr, yr)])
+
+    lam, X = K.eigs(mass=[ui * vi], k=2, sigma=35.0)
+    lam = np.asarray(lam)
+    assert not np.isnan(lam).any()
+    assert np.allclose(np.sort(lam), np.pi**2 * np.array([4.0, 4.0]), rtol=0.06), lam
+    # the tie holds on the returned interior modes
+    pts, Xa = np.asarray(K.points), np.asarray(X)
+    li = np.where(pts[:, 0] < 1e-9)[0]
+    ri = np.where(pts[:, 0] > 1 - 1e-9)[0]
+    lo, ro = li[np.argsort(pts[li, 1])], ri[np.argsort(pts[ri, 1])]
+    assert np.max(np.abs(Xa[lo] - Xa[ro])) < 1e-12
+
+
+def test_eigs_sigma_small_pencil_takes_the_dense_path():
+    """A pencil small enough that the two transformed k-blocks would overlap is answered by the exact
+    dense reduction — same nearest-σ semantics, no iteration."""
+    d, K, mass = _dirichlet_box(0.25)  # a handful of interior DOFs
+    lam, X = K.eigs(mass=mass, k=2, sigma=55.0)
+    lam_all, _ = K.eigs(mass=mass, k=6)
+    lam_all = np.asarray(lam_all)
+    oracle = np.sort(lam_all[np.argsort(np.abs(lam_all - 55.0))[:2]])
+    assert np.allclose(np.sort(np.asarray(lam)), oracle, rtol=1e-10)
+
+
+def test_eigs_sigma_on_an_eigenvalue_fails_loud():
+    """σ exactly ON a discrete eigenvalue makes K − σM singular. The inner factorization degenerates
+    and the original-pencil residual gate must poison (or the factorization itself raise) — never a
+    silently wrong interior spectrum."""
+    d, K, mass = _dirichlet_box(0.1)
+    lam_all, _ = K.eigs(mass=mass, k=1)
+    sig = float(np.asarray(lam_all)[0])  # the exact discrete λ₁
+    try:
+        lam, _X = K.eigs(mass=mass, k=2, sigma=sig)
+    except Exception:
+        return  # a loud factorization failure is an acceptable outcome
+    assert np.isnan(np.asarray(lam)).any(), "a singular shift must poison, not return a spectrum"
+
+
+def test_eigs_sigma_argument_guards():
+    """sigma= replaces which= and needs no precond=; linear= means nothing without sigma=."""
+    d, K, mass = _dirichlet_box(0.2)
+    with pytest.raises(ValueError, match="NEAREST"):
+        K.eigs(mass=mass, k=2, sigma=50.0, which="largest")
+    with pytest.raises(ValueError, match="own\\s+preconditioner|its own"):
+        K.eigs(mass=mass, k=2, sigma=50.0, precond=jno.precond.jacobi())
+    with pytest.raises(ValueError, match="without sigma"):
+        K.eigs(mass=mass, k=2, linear=jno.solve.lu())
+
+
+def test_eigs_sigma_eigenvalue_is_differentiable():
+    """∂λ/∂s through the shift-invert readout: scaling K→sK scales the spectrum, so for the simple
+    interior mode nearest σ, ∂λ/∂s = λ at s=1 — recovered from the Rayleigh quotient at the frozen
+    eigenvector exactly as on the LOBPCG path."""
+    d, K, mass = _dirichlet_box(0.07)
+    K0 = K.operator[0]
+    M0 = jno.fem(mass).operator[0]
+    import jax.experimental.sparse as jsp
+
+    solver = jno.solve.eigs(k=1, sigma=75.0)  # nearest: the simple 8π² ≈ 78.96 mode
+
+    def lam_of(s):
+        Ks = jsp.BCOO((s * K0.data, K0.indices), shape=K0.shape)
+        lam, _ = solver(Ks, M0)
+        return lam[0]
+
+    val = float(lam_of(1.0))
+    g = float(jax.grad(lam_of)(1.0))
+    fd = float((lam_of(1.0 + 1e-6) - lam_of(1.0 - 1e-6)) / 2e-6)
+    assert abs(g - fd) / abs(fd) < 1e-4
+    assert abs(g - val) / val < 1e-5
