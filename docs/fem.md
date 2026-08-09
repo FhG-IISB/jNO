@@ -723,6 +723,21 @@ answer is wrong by exactly that factor with no error raised, so bind `dV` once a
 > form by anything — they are extra terms you must write out. This is precisely why jNO does not offer
 > to apply the weighting automatically: it would be exact for scalars and quietly wrong for vectors.
 
+> **⚠️ This applies to vector EM too, and there is no guard.** An axisymmetric `(r, z)` **vector
+> Maxwell / eddy-current** form — the natural geometry for a coil, a solenoid, a tokamak vessel — is
+> *not* the Cartesian curl-curl weighted by `2πr`. In cylindrical coordinates the curl of a vector
+> field picks up its own `1/r` terms — `(∇×E)_z = (1/r)∂(rE_θ)/∂r` — and for an axisymmetric (`m=0`)
+> problem the meridional (`E_r, E_z`) and azimuthal (`E_θ`) components **decouple into two different
+> operators** that must each be written out. The azimuthal one reduces to a *scalar* equation (in
+> `E_θ`, or in `rA_θ` for the vector-potential/eddy-current form), not a component of the Cartesian
+> form, and it needs care on the axis where `1/r` is singular. Weighting an
+> `"N1E"` form by `2πr` therefore produces a **silently wrong** answer, not an approximate one.
+> Nothing raises: multiplying by `r` is ordinary arithmetic, and the assembler cannot tell it apart
+> from a legitimate radial coefficient — so this limit is stated here, where you choose the geometry,
+> rather than enforced at assembly. Use a **full 3-D** mesh for vector Maxwell (3-D N1E is wired and
+> validated), or derive and write the cylindrical operator yourself as an ordinary scalar/coupled
+> form. jNO ships no axisymmetric H(curl)/H(div) element and no meridional/azimuthal split.
+
 > **Enclosure radiation.** `domain.enclosure(tags, axisymmetric=True)` gives ring areas `2πr̄·L` and a
 > `gap.load(q)` that is **per full revolution** (W, not W/m). The weak form you add it to must carry
 > the same `2πr`, or the two sides differ by exactly that factor. jNO cannot check this for you.
@@ -1409,9 +1424,12 @@ Maxwell / eddy-current** examples, and a **variational PINN** (a neural trial in
 
 ## Known limitations
 
-Each boundary below is an explicit, fail-loud `NotImplementedError` (never a silently wrong result),
-and applies only when you **assemble a weak form** or solve a **transient problem through the time
-route** — the residual-PINN path is unaffected. Full detail is inline in the sections above.
+Almost every boundary below is an explicit, fail-loud `NotImplementedError`. **Two are not, and say so
+in place**: affine (straight-edge) geometry on a curved boundary, and the `2πr` measure on an
+axisymmetric *vector* form — both are cases the assembler cannot distinguish from a legitimate choice,
+so they are stated where you make that choice rather than enforced. These apply when you **assemble a
+weak form** or solve a **transient problem through the time route** — the residual-PINN path is
+unaffected. Full detail is inline in the sections above.
 
 - **Transient mass terms must be parameter-free** — put affine trainable parameters on the stiffness /
   residual, not on `u_t * phi`.
@@ -1460,3 +1478,19 @@ route** — the residual-PINN path is unaffected. Full detail is inline in the s
   chord, O(h²) inside the true arc. On a **polygonal** domain the advertised rates hold exactly (the
   suite measures P2/P3 there). Until an isoparametric mapping exists, prefer `h`-refinement (or the
   adaptive loop) over `order ≥ 2` near curved boundaries.
+- **Element order on a non-nodal family is refused, not applied** — RT/N1E/P0/Hermite/Argyris/Morley
+  each have one intrinsic order. `space="N1E", order=2` used to return the same lowest-order space
+  silently; it now raises. The mesh is the only accuracy knob on an H(curl)/H(div) problem — see
+  *Mesh resolution for wave problems* for what a given points-per-wavelength buys, measured.
+- **`jno.solve.eigs` / `FEM.eigs` solve the SYMMETRIC pencil**, and now *refuse* a non-symmetric
+  operator instead of silently returning the spectrum of `½(K+Kᵀ)` — a different problem, since a
+  non-self-adjoint operator generally has complex eigenvalues and none of the symmetrized values need
+  be an eigenvalue of the original at all. Non-self-adjoint stability problems (resistive MHD growth
+  rates, drift waves, anything with a mean flow) need a non-symmetric eigensolver, which is **not
+  built**. The check is a randomized bilinear probe and is concrete-only, so it skips under trace.
+- **Axisymmetric `(r, z)` VECTOR forms are your responsibility, and this one is *not* fail-loud** —
+  the `2πr` measure is exact for scalars and wrong for vectors (elasticity hoop strain; and for vector
+  Maxwell the cylindrical curl's own `1/r` terms plus the meridional/azimuthal decoupling). jNO ships
+  no axisymmetric H(curl)/H(div) element, and multiplying by `r` is arithmetic the assembler cannot
+  distinguish from a legitimate radial coefficient, so nothing raises. Use a full 3-D mesh for vector
+  Maxwell, or write the cylindrical operator out yourself. See *Axisymmetric (bodies of revolution)*.
