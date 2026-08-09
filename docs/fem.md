@@ -1010,6 +1010,11 @@ the complex path automatically — the phase makes the field complex anyway, and
 bilinear `Pᵀ A P` is not a Galerkin projection for a complex `P` (measured 8.1 rel-L2 off the
 Hermitian answer on a manufactured mode, with the tie itself satisfied exactly).
 
+A **coupled (multi-field) complex steady system** — coupled Helmholtz-type equations — takes the same
+Re/Im split through the coupled assembler: one fused real `2n` block over `[Re_all; Im_all]`, with
+`fem.offsets` still listing the per-field blocks of the recombined complex solution. Scope: steady and
+linear (a complex *nonlinear* coupled form and a complex coupled *transient* refuse, as everywhere).
+
 **Essential values on a complex form must be real.** The two legs share one Dirichlet row set, which
 imposes `Re u = g` with `Im u = 0` — right for a real `g`, and the usual case (the complexity lives in
 the operator and the source). A *complex* `g` is not expressible there: pinning `Im u = g_i` would need

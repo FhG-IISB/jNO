@@ -4384,14 +4384,41 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
         )
         return FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs)
 
-    # A coupled steady form `_native_ok` excluded -- a complex coefficient (vs the real-equivalent
-    # complex=True), or a runtime parameter. The native coupled assembler covers linear and nonlinear
-    # real forms (incl. complex=True); reject the rest explicitly rather than mis-assemble.
+    # ---- complex coupled steady: the same Re/Im coefficient split every other complex path makes,
+    # through the SAME coupled assembler (the basis is real, so ``Re(c·T) = Re(c)·T`` per term). Two
+    # real coupled systems with one shared field layout; ``_finalize`` fuses them into the real 2n
+    # block over ``[Re_all; Im_all]`` and the shared Dirichlet row set imposes ``Re u = g, Im u = 0``
+    # through the ± block structure — coupled Helmholtz systems in their natural spelling. ----
+    _cx_coupled = _is_complex_form(domain, ir)
+    _par_coupled = any(_contains_runtime_parameter(b) for b in weak_bares)
+    if _cx_coupled and not _par_coupled:
+        if any(_is_obviously_nonlinear_in_unknown(domain, b) for b in weak_bares):
+            raise NotImplementedError(
+                "jno.fem: a complex NONLINEAR coupled form is not wired — complex forms assemble as "
+                "linear real-equivalent blocks. (Raises rather than dropping the imaginary part.)"
+            )
+        from .utils.solver.fem_native import assemble_fem_native
+
+        real_bd = {tag: [e.real for e in exprs] for tag, exprs in boundary_terms.items()}
+        imag_bd = {tag: [e.imag for e in exprs] for tag, exprs in boundary_terms.items()}
+        domain._fem_problem = None
+        op_r, _mr, offs = assemble_fem_native(
+            domain, [b.real for b in volume_terms], real_bd, dirichlet_raw, [], vec=1, quad_degree=quad_degree
+        )
+        op_i, _mi, _oi = assemble_fem_native(
+            domain, [b.imag for b in volume_terms], imag_bd, dirichlet_raw, [], vec=1, quad_degree=quad_degree
+        )
+        return FEM(domain=domain, op=(op_r, op_i), classification=classification, mode="complex", offsets=offs)
+
+    # A coupled steady form `_native_ok` excluded -- a runtime parameter (the parametric coupled
+    # steady assembly is not wired). The native coupled assembler covers linear and nonlinear real
+    # forms (incl. complex=True) and, above, the linear complex split; reject the rest explicitly
+    # rather than mis-assemble.
     raise NotImplementedError(
-        "jno.fem: this coupled (multi-field) steady form is not supported natively -- it has a complex "
-        f"coefficient ({_is_complex_form(domain, ir)}) or a runtime parameter "
-        f"({any(_contains_runtime_parameter(b) for b in weak_bares)}). Use complex=True for a complex "
-        "field, or recover the parameter on a single-field reduced form."
+        "jno.fem: this coupled (multi-field) steady form is not supported natively -- it has a runtime "
+        f"parameter ({_par_coupled}); the parametric coupled steady assembly is not wired. Recover the "
+        "parameter on a single-field reduced form, or through a coupled first-order transient (which "
+        "does thread runtime parameters)."
     )
 
 
