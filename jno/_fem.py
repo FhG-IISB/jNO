@@ -2730,13 +2730,21 @@ def _bloch_realify_periodic(periodic: dict) -> dict:
     restriction and prolongation then need no complex branch and no ``conj=`` anywhere. Master rows
     carry weight 1 in each half; a slave row ties to its master's Re and Im columns (arity 2), which the
     weighted-interpolation sparse remap already handles (``is_selection=False``)."""
-    if "blocks" in periodic:
+    from .utils.solver.fem_utils import _periodic_blocks
+
+    # Normalize BOTH dict shapes first. The blocked form is NOT synonymous with "coupled": the N1E
+    # edge reduction emits one block per field and so uses it even for a SINGLE field. Gate on the
+    # block COUNT, not on the key's presence — testing the key rejected an ordinary single-field
+    # N1E Bloch problem.
+    _blocks, _off_f, _off_r = _periodic_blocks(periodic)
+    if len(_blocks) > 1:
         raise NotImplementedError(
             "jno.fem: a Bloch (complex-phase) tie on a coupled multifield problem is not supported — "
             "the coupled complex assembly it needs does not exist yet. Use a single field, or a plain "
             "periodic tie."
         )
-    P = periodic["P"]
+    _b = _blocks[0]
+    P = _b["P"]
     n, m = int(P.shape[0]), int(P.shape[1])
     if hasattr(P, "indices"):  # BCOO (nodal path) — split the concrete triplets, drop exact-zero legs
         idx = np.asarray(P.indices)
@@ -2763,8 +2771,8 @@ def _bloch_realify_periodic(periodic: dict) -> dict:
     else:  # dense P (the N1E edge path)
         Pd = np.asarray(P)
         B = jnp.asarray(np.block([[Pd.real, -Pd.imag], [Pd.imag, Pd.real]]))
-    kept = np.asarray(periodic["kept_nodes"], dtype=np.int64)
-    vec = int(periodic.get("vec", 1))
+    kept = np.asarray(_b["kept"], dtype=np.int64)  # normalized above: both dict shapes expose "kept"
+    vec = int(_b.get("vec", 1) or 1)
     if vec > 1:  # expand node-level kept to DOF-level before stacking the halves
         kept = (kept[:, None] * vec + np.arange(vec)[None, :]).reshape(-1)
     return {

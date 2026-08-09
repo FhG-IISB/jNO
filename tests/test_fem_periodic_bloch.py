@@ -303,3 +303,49 @@ def test_bloch_empty_cell_transmits_at_oblique():
             assert R < 0.02, f"theta={deg}: empty cell R={R:.3f} (expected 0)"
     finally:
         jax.config.update("jax_enable_x64", prev)
+
+
+def test_bloch_realify_accepts_a_single_block_dict():
+    """A periodic reduction has TWO dict shapes: the legacy single-field one (``P``/``kept_nodes``)
+    and the blocked one (``blocks``/``off_full``/``off_red``). The blocked shape is **not** synonymous
+    with "coupled" — the N1E edge reduction emits one block per field and so uses it even for a
+    SINGLE field. Gating the real-equivalent B(P) conversion on the *presence* of ``blocks`` rejected
+    an ordinary single-field N1E Bloch problem (regression: the whole
+    tests/test_fem_nedelec_periodic.py::test_periodic_n1e_bloch_phase_is_complex case). Gate on the
+    block COUNT instead; only a genuinely multi-block (coupled) reduction is refused."""
+    import jax.numpy as jnp
+
+    from jno._fem import _bloch_realify_periodic
+
+    n, m = 4, 3
+    ph = np.exp(1j * 0.7)
+    dense_P = np.zeros((n, m), dtype=np.complex128)
+    for j in range(m):
+        dense_P[j, j] = 1.0
+    dense_P[3, 0] = ph  # one slave tied to master 0 through the Bloch phase
+
+    legacy = {"P": jnp.asarray(dense_P), "kept_nodes": np.arange(m), "vec": 1, "is_bloch": True}
+    blocked = {  # the SAME single-field reduction in the blocked shape (what N1E builds)
+        "blocks": [{"P": jnp.asarray(dense_P), "kept": np.arange(m), "vec": 1, "is_selection": False}],
+        "off_full": [0, n],
+        "off_red": [0, m],
+        "is_bloch": True,
+    }
+    out_legacy = _bloch_realify_periodic(legacy)
+    out_blocked = _bloch_realify_periodic(blocked)
+    for out in (out_legacy, out_blocked):
+        assert out["n_full"] == 2 * n and out["n_red"] == 2 * m
+        assert out["is_bloch"] is False  # B(P) is REAL
+        assert not np.iscomplexobj(np.asarray(out["P"]))
+    assert np.allclose(np.asarray(out_legacy["P"]), np.asarray(out_blocked["P"]))
+    assert np.array_equal(np.asarray(out_legacy["kept_nodes"]), np.asarray(out_blocked["kept_nodes"]))
+
+    # a genuinely MULTI-block (coupled) reduction is still refused, by name
+    coupled = {
+        "blocks": [blocked["blocks"][0], blocked["blocks"][0]],
+        "off_full": [0, n, 2 * n],
+        "off_red": [0, m, 2 * m],
+        "is_bloch": True,
+    }
+    with pytest.raises(NotImplementedError, match="coupled multifield"):
+        _bloch_realify_periodic(coupled)
