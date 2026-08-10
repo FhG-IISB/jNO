@@ -247,8 +247,10 @@ def enable_compile_cache(directory: str | None = None) -> str:
     -- the same Stokes assembly measured **9.43 s cold, 2.20 s warm (4.3x)** on a second process,
     for 187 entries and 7.2 MB.
 
-    Off by default because a library should not write to a user's disk uninvited; this is the
-    opt-in, also reachable as ``jno.setup(__file__, compile_cache=True)``.
+    **Enabled by default when a script calls** :func:`setup`, which is where jNO learns it is being
+    *run* rather than imported. A bare ``import jno`` still writes nothing to disk. This function is
+    the direct handle for turning it on without ``setup``; ``jno.setup(__file__, compile_cache=False)``
+    or ``[jno] compile_cache = false`` turns it off.
 
     **The first run is SLOWER, sometimes much slower** -- writing the entries is not free. A 75k-node
     3-D Poisson build measured 7.45 s with no cache, 18.30 s on the run that populates one, and
@@ -341,11 +343,18 @@ def setup(
             mixed-order Stokes assembly (9.43 s cold, 2.20 s warm), because jNO's compilation
             cost is fixed per problem *structure* rather than per DOF.
 
-            * ``None`` (default) — read ``[jno] compile_cache`` from the TOML config; off if absent.
+            * ``None`` (default) — read ``[jno] compile_cache`` from the TOML config; **on** if absent.
             * ``False`` — off. ``True`` — on, at ``~/.cache/jno/xla``.
             * ``str`` — on, at that directory.
 
-            Off by default deliberately: a library should not write to a user's disk uninvited.
+            **On by default**, because ``jno.setup`` marks a script being *run*, and a script is
+            almost always run more than once — a sweep, an optimisation loop, a test suite, or simply
+            re-running it after an edit. Every run after the first is faster; see
+            :func:`enable_compile_cache` for the measurements and for the one case this costs you (a
+            single cold run, which pays to populate the cache and never collects). Turn it off with
+            ``compile_cache=False`` here, or ``[jno] compile_cache = false`` in ``.jno.toml``.
+
+            Scoped to ``jno.setup`` on purpose: importing ``jno`` as a library still writes nothing.
 
     Returns:
         The path of the run directory (created if absent).
@@ -388,7 +397,7 @@ def setup(
     apply_ad_mode_defaults(diff_type, hessian_type)
 
     # --- Optional persistent XLA compilation cache (explicit kwarg wins over TOML) ---
-    cache_opt = get_config().get("jno", {}).get("compile_cache", False) if compile_cache is None else compile_cache
+    cache_opt = get_config().get("jno", {}).get("compile_cache", True) if compile_cache is None else compile_cache
     if cache_opt:
         cache_dir = enable_compile_cache(cache_opt if isinstance(cache_opt, str) else None)
         _logger_mod._default_logger.info(f"XLA compilation cache enabled at {cache_dir}")

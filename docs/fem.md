@@ -1426,6 +1426,30 @@ Maxwell / eddy-current** examples, and a **variational PINN** (a neural trial in
 
 ---
 
+## Build time: what to expect, and the one knob
+
+`jno.fem([...])` **fully assembles** the operator — it returns concrete matrix values, which is why
+`fem.solve()` is then only the linear solve (measured **7 ms** on 3-D Poisson at 27,833 nodes). Some
+libraries instead defer assembly into their solve; that makes their "build" look faster and their
+solve slower, so compare **build + solve**, and remember jNO assembles *once* while a per-solve
+assembler pays again on every Newton iteration.
+
+Most of a cold build is **XLA compilation**, and the cost is fixed per problem *structure* rather than
+per DOF — a 15x larger mesh still compiles about the same number of programs. So it is cached across
+processes, and **`jno.setup(__file__)` enables that cache by default**:
+
+| 3-D Poisson, 27,833 nodes | first build | repeat build |
+|---|---|---|
+| no cache | 4.75 s | 2.48 s |
+| `jno.setup(__file__)` (cache on) | **2.22 s** | **1.51 s** |
+
+A bare `import jno` still writes nothing to disk — the cache is tied to `setup`, which is where jNO
+learns a script is being *run*. The one case it costs you is a **single cold run**: the run that
+populates the cache is slower and never collects the payback. Turn it off with
+`jno.setup(__file__, compile_cache=False)`, or `[jno] compile_cache = false` in `.jno.toml`.
+
+---
+
 ## Known limitations
 
 Almost every boundary below is an explicit, fail-loud `NotImplementedError`. **Two are not, and say so
