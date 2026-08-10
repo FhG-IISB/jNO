@@ -186,6 +186,16 @@ projection and collocation the pointwise value. Measured on a non-matching 3-D i
 error is 4–40 % lower across a range of mesh ratios. The two also coincide exactly when the master
 nodes are a subset of the slave nodes, since the master basis then lies inside the slave space.
 
+**P2 triangular interfaces (3-D quadratic) stay collocated**, and this is a theorem rather than a gap
+in the implementation. The dual basis is built from the facet mass matrix as `A = diag(∫N)·Mass⁻¹`, and
+the P2 triangle's vertex functions integrate to *exactly zero* (`∫L(2L−1) = 2/12 − 1/6`), so the
+scaling is singular. Rescaling does produce a biorthogonal basis, but not one whose span contains the
+linear functions — and Lemma 3.4 of Lamichhane's thesis proves no locally supported dual space of that
+dimension can, which is precisely what the optimal error estimate requires. The published remedy uses
+*fewer* multipliers than slave DOFs, making the tie a constrained solve rather than an elimination,
+which a prolongation cannot express. P2 **edges** (2-D) are unaffected — there `∫N = 1/6` — and the
+same source confirms the 2-D quadratic dual space does contain the linear hats.
+
 Two practical consequences: tag periodic faces with a **predicate** (`d.tag(name, lambda ...)`) so each
 face includes its corner nodes — a face tagged from geometry may drop them, leaving the two sides with
 different extents, which both disqualifies mortar and leaves the corner DOFs untied. And multidirectional

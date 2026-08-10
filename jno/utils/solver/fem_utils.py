@@ -2229,13 +2229,30 @@ def _tri_dual_available(k: int) -> bool:
 
         int_T L_a (2 L_a - 1) dA = 2/12 - 1/6 = 0
 
-    so ``diag(d)`` is singular and the construction collapses. Quadratic dual multiplier spaces on
-    triangles need a purpose-built basis (Lamichhane & Wohlmuth, *Numer. Math.* 107(1):33-51, 2007),
-    not this one. Until that exists a P2 triangular interface keeps the collocated coupling, and the
-    ``coupling`` key reports it rather than leaving the difference invisible.
+    so ``diag(d)`` is singular and this construction collapses.
 
-    Computed rather than hard-coded to the node count, so adding a proper quadratic dual basis
-    enables it here automatically.
+    **Rescaling does not rescue it, and no better basis exists for this architecture.** Taking
+    ``c_i = 1`` (``psi = Mass^-1 N``) does give an exactly biorthogonal basis with ``D = I``, and it
+    transfers constant/linear/quadratic fields exactly -- but its span does not contain the linear
+    functions, because the coefficients needed for that are ``Mass_e . 1``, which varies per element
+    while the basis coefficients are global. Lamichhane's thesis proves this is unavoidable: under
+    ``supp phi_i == supp mu_i`` (a locally supported dual basis, one multiplier per slave DOF, exactly
+    jNO's structure) **Lemma 3.4** shows there is *no* dual multiplier space containing the piecewise
+    linear hat functions for quadratic simplicial elements in 3-D -- and containing them is what the
+    optimal a priori error estimate needs. The published remedy uses a multiplier space of *lower*
+    dimension than the slave trace space, which makes ``D`` rectangular and the tie a constrained
+    solve rather than an elimination; jNO's prolongation cannot express that.
+
+    Note the boundary matches exactly: the same source records that in **two** dimensions the
+    quadratic dual space *does* contain the linear hats, which is why the P2 edge path above is sound.
+
+    B. Lamichhane, *Higher Order Mortar Finite Elements with Dual Lagrange Multiplier Spaces and
+    Applications*, PhD thesis, Univ. Stuttgart 2006, Remark 2.10 and Lemma 3.4; see also Lamichhane,
+    Stevenson & Wohlmuth, *Numer. Math.* 102:93-121, 2005.
+
+    So a P2 triangular interface keeps the collocated coupling and the ``coupling`` key reports it.
+    The check is computed rather than hard-coded to the node count so it also guards any element type
+    added later whose shape functions have a zero integral.
     """
     bary, w = _tri_quadrature(k // 3 + 2)
     d = np.abs(w @ _tri_shape(bary, k))
