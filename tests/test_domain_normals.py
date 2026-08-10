@@ -156,3 +156,47 @@ def test_boundary_face_normals_skip_a_degenerate_face():
 def test_boundary_face_normals_of_an_empty_mesh_are_empty():
     n, idx = MeshUtils._compute_normals_from_boundary_faces(np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int64))
     assert n.shape == (0, 3) and idx.shape == (0,)
+
+
+def test_coordinate_tag_gets_per_point_normals_like_a_facet_tag():
+    """A boundary named by an ordinary COORDINATE predicate must carry per-point normals, exactly as
+    one named by a facet predicate does.
+
+    It did not: ``normals_by_tag`` was populated only by the mesh cell-set path and by
+    ``_tag_by_facet``, so a coordinate-tagged boundary had a region but no normals — and every reader
+    of that dict saw a *silently missing* entry rather than an error. This is what broke RCWA's
+    superstrate/substrate detection once a tag was re-derived from a predicate (a remesh, or
+    ``_domain_from_arrays``) instead of coming from the mesh's cell sets."""
+    d = jno.domain(jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 2.0, size=0.5).domain())
+    e = 1e-6
+    d.tag("zbot", lambda x, y, z: z < e)
+    d.tag("ztop", lambda x, y, z: z > 2.0 - e)
+    d.tag("xlo", lambda x, y, z: x < e)
+
+    for tag, expect in (("zbot", [0, 0, -1]), ("ztop", [0, 0, 1]), ("xlo", [-1, 0, 0])):
+        assert tag in d.normals_by_tag, f"{tag}: a coordinate-tagged boundary must carry normals"
+        n = np.asarray(d.normals_by_tag[tag])
+        assert n.shape == (np.asarray(d._boundary_regions[tag].points).shape[0], 3), "one normal per region point"
+        assert np.allclose(np.linalg.norm(n, axis=1), 1.0, atol=1e-9), "normals must be unit"
+        assert np.allclose(n.mean(0), expect, atol=1e-9), f"{tag}: outward normal should be {expect}, got {n.mean(0)}"
+
+
+def test_coordinate_tag_normals_survive_a_rebuild_from_arrays():
+    """The exact regression path: ``_domain_from_arrays`` captures the template's named regions as
+    predicates and re-derives them on the new mesh. Those re-derived tags must still carry normals —
+    they previously did not, which is how a face became invisible to anything reading them."""
+    from jno.utils.solver.fem_adapt import _domain_from_arrays
+
+    src = jno.domain(jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 2.0, size=0.5).domain())
+    pts = np.asarray(src.mesh.points)
+    tets = np.asarray(src.mesh.cells_dict["tetra"])
+    faces = np.concatenate([tets[:, [0, 1, 2]], tets[:, [0, 1, 3]], tets[:, [0, 2, 3]], tets[:, [1, 2, 3]]])
+    uq, cnt = np.unique(np.sort(faces, axis=1), axis=0, return_counts=True)
+    bf = uq[cnt == 1]
+
+    d = _domain_from_arrays(src, pts, tets, bf, copy=True)
+    d.tag("ztop", lambda x, y, z: z > 2.0 - 1e-6)
+    assert "ztop" in d.normals_by_tag, "a tag on a rebuilt domain must carry normals"
+    n = np.asarray(d.normals_by_tag["ztop"])
+    assert np.allclose(np.linalg.norm(n, axis=1), 1.0, atol=1e-9)
+    assert np.allclose(n.mean(0), [0, 0, 1], atol=1e-9), f"outward +z expected, got {n.mean(0)}"

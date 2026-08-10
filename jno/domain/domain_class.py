@@ -42,6 +42,29 @@ def _is_facet_predicate(where) -> bool:
     return len(params) == 3 and params[1] in ("n", "normal", "normals") and params[2] in ("name", "names")
 
 
+def _point_normals_from_facets(sub, sub_n, bpts, dim):
+    """Per-point outward normal for a facet subset: average the incident facet normals at each point.
+
+    Shared by both boundary-tag paths so they agree by construction. They did not: the **facet**
+    predicate (:meth:`domain._tag_by_facet`) stored per-point normals while the ordinary **coordinate**
+    predicate (:meth:`domain._register_tag_boundary_region`) did not, so a tag's normals existed only
+    when the mesh happened to carry that name as a cell set. Anything reading ``normals_by_tag``
+    then saw a *silently missing* entry — see :func:`jno.rcwa._z_ambient_faces`, where a zero normal
+    disqualified every face and RCWA could not find its own superstrate/substrate.
+
+    Points are matched by rounded coordinate (9 dp), the same key ``_tag_by_facet`` has always used —
+    ``bpts`` comes from ``np.unique`` on those very vertices, so every point has at least one facet.
+    """
+    acc = {}
+    for f, fn in zip(sub, sub_n):
+        for v in f:
+            key = tuple(np.round(v[:dim], 9))
+            a = acc.get(key)
+            acc[key] = fn if a is None else a + fn
+    pn = np.array([acc[tuple(np.round(p[:dim], 9))] for p in bpts])
+    return pn / (np.linalg.norm(pn, axis=1, keepdims=True) + 1e-30)
+
+
 def _facet_normals(ents, dim, mesh=None):
     """Outward unit normal per boundary facet (``ents`` is ``(E, k, dim)`` facet-vertex coords).
 
@@ -1469,15 +1492,7 @@ class domain(MeshIOMixin):
         else:
             self._mesh_pool[name] = bpts
         # per-point outward normals for variable(name, normals=True): average the facet normals at each point
-        acc = {}
-        for f, fn in zip(sub, sub_n):
-            for v in f:
-                key = tuple(np.round(v[:dim], 9))
-                a = acc.get(key)
-                acc[key] = fn if a is None else a + fn
-        pn = np.array([acc[tuple(np.round(p[:dim], 9))] for p in bpts])
-        pn = pn / (np.linalg.norm(pn, axis=1, keepdims=True) + 1e-30)
-        self.normals_by_tag[name] = pn
+        self.normals_by_tag[name] = _point_normals_from_facets(sub, sub_n, bpts, dim)
         self.tag_indices[name] = np.arange(len(bpts))
         if name not in self.avaiable_mesh_tags:
             self.avaiable_mesh_tags.append(name)
@@ -1555,6 +1570,13 @@ class domain(MeshIOMixin):
             edges=sub if dim == 2 else None,
             triangles=sub if dim == 3 else None,
             tol=full.tol,
+        )
+        # Per-point outward normals, exactly as the facet-predicate path stores them. Without this a
+        # coordinate-tagged boundary had a region but NO entry in ``normals_by_tag``, so every reader
+        # of that dict silently saw nothing for the tag — the mesh cell-set path was the only source,
+        # which is why the miss only surfaced once a tag was re-derived from a predicate instead.
+        self.normals_by_tag[name] = _point_normals_from_facets(
+            sub, _facet_normals(sub, dim, getattr(self, "mesh", None)), bpts, dim
         )
 
     def _materialize_tag_pool(self, name, where):
