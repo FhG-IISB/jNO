@@ -1103,9 +1103,17 @@ def test_transient_nonnodal_net_kx_matches_frozen():
     scale = float(jnp.max(jnp.abs(traj_f)))
     rel = float(jnp.max(diff)) / scale
     assert rel < 1e-4, f"trajectories diverged: {rel:.3e} relative (measured spread 1.6e-06..1.3e-05)"
-    # the property a real regression would break: the difference must not GROW along the march
+    # The property a real regression would break: the difference must not GROW along the march —
+    # i.e. the endpoint is not the peak. Stated against the running maximum, because WHERE the drift
+    # starts is platform-dependent while the decay is not (both measured, x64):
+    #   GPU: [7.97e-06, 4.36e-06, 2.01e-06, 1.00e-06, 5.28e-07, 2.87e-07]  (starts nonzero)
+    #   CPU: [0.00e+00, 4.65e-10, 9.47e-11, 3.86e-11, 1.92e-11, 1.05e-11]  (starts at exactly 0)
+    # The old `per_step[-1] <= per_step[0]` therefore held on GPU but demanded an exactly-zero
+    # endpoint on CPU, where t0 is bit-identical — unsatisfiable for any nonzero drift, and the
+    # reason this test failed CI while passing locally. Anchoring on per_step[1] is equally wrong
+    # (it is ~0 on one platform and the second-largest value on the other).
     per_step = np.asarray(jnp.max(diff.reshape(diff.shape[0], -1), axis=1))
-    assert per_step[-1] <= per_step[0], f"discrepancy grew over the march: {per_step}"
+    assert per_step[-1] <= per_step[:-1].max(), f"discrepancy grew over the march: {per_step}"
 
     def loss(m):
         return jnp.sum(_default_transient_integrate(fem.operator, {name: m}, ts) ** 2)

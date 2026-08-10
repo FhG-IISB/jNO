@@ -433,6 +433,9 @@ def test_complex_transient_adapt_composes():
     fused ``[Re; Im]`` halves separately (a doubled field layout drives the transfer, the modulus
     drives the metric), so a complex transient composes with ``adapt=`` instead of failing loud.
     Smoke here — the analytic-recovery and zero-IC extremes live in test_fem_adapt_complex.py."""
+    # remeshing goes through mmgpy, an OPTIONAL dependency the adapt-dedicated files skip at module
+    # level; this file is not one of them, so guard per-test (as the matfree case above does).
+    pytest.importorskip("mmgpy", reason="mmgpy required for adaptive remeshing")
     _, fem = _complex_heat(mesh_size=0.3)
     traj = fem.solve(adapt=jno.solve.remesh(every=2, max_dofs=80))
     final, _mesh = traj.final()
