@@ -85,6 +85,9 @@ pip install jax-neural-operators
 
 One install — FEM, FDM, the solver stack, PINNs, and the scientific-ML tooling all come in the box, with GPU support on by default (jNO depends on `jax[cuda]`). A couple of heavy, self-contained backends (the RCWA Fourier solver and GPU algebraic multigrid) stay optional; the [Installation guide](https://fhg-iisb.github.io/jNO/Installation/) covers those, plus Pixi, Docker, and pinning a specific CUDA build.
 
+PS: I recommend pulling the latest main branch to always be up to date!
+
+
 ## Example
 
 <details open>
