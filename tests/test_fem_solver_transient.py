@@ -298,3 +298,36 @@ def test_a_time_dependent_operator_still_refactors_each_step(monkeypatch):
     finally:
         _FACTOR_CACHE.clear()
     assert len(calls) == 4, f"a changing operator was factored {len(calls)}x for 4 distinct matrices"
+
+
+def test_transient_adjoint_checkpoint_gradient_matches_finite_differences():
+    """The default march's scan body is ``jax.checkpoint``-ed (8.6x peak-memory cut, measured), which
+    must not move the gradient: reverse-mode through the rematerialized step has to agree with central
+    finite differences — and with itself run twice (determinism of the recompute)."""
+    from jno.utils.solver.backend_blocks import _block_time_grid, _default_transient_integrate
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2, time=(0.0, 0.2, 21))
+    u, p = d.fem_symbols(names=("ck", "ckp"))
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, pi = u.bind(x=xi, y=yi, t=ti), p.bind(x=xi, y=yi, t=ti)
+    alpha = jno.np.parameter((1,), name="ck_alpha")
+    ic = jno.np.sin(PI * ci[0]) * jno.np.sin(PI * ci[1])
+    fem = jno.fem([ui.t * pi + alpha * (ui.x * pi.x + ui.y * pi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - ic])
+    block = fem.operator
+    ts = jnp.asarray(_block_time_grid(block))
+
+    def loss(a):
+        ys = _default_transient_integrate(block, {"ck_alpha": a}, ts)
+        return jnp.sum(ys[-1] ** 2)
+
+    a0 = jnp.asarray([1.3])
+    g1 = float(jax.grad(loss)(a0)[0])
+    g2 = float(jax.grad(loss)(a0)[0])
+    # repeatability to float noise (GPU scatter reductions are not bitwise deterministic, with or
+    # without the checkpoint — only the rematerialization must not add anything beyond that)
+    assert abs(g1 - g2) <= 1e-12 * abs(g1)
+    h = 1e-4
+    fd = float((loss(jnp.asarray([1.3 + h])) - loss(jnp.asarray([1.3 - h]))) / (2 * h))
+    assert abs(g1 - fd) / abs(fd) < 1e-6, f"checkpointed adjoint {g1:.3e} vs FD {fd:.3e}"

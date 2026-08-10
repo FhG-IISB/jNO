@@ -58,6 +58,8 @@ __all__ = [
     "theta",
     "exponential",
     "adaptive",
+    "remesh",
+    "relocate",
 ]
 
 
@@ -473,7 +475,7 @@ def picard(
     )
 
 
-def eigs(*, k: int = 6, which: str = "smallest", precond=None, tol=None, maxiter=None):
+def eigs(*, k: int = 6, which: str = "smallest", sigma=None, linear=None, precond=None, tol=None, maxiter=None, X0=None):
     """Generalized **symmetric eigensolver** ``K x = λ M x`` (K symmetric, M SPD). Returns a callable
     ``(K, M=None) -> (λ, X)``: the ``k`` eigenvalues at the requested end (``which='smallest'`` /
     ``'largest'``) and their **M-orthonormal** eigenvectors (``Xᵀ M X = I``). ``M=None`` is the standard
@@ -483,21 +485,29 @@ def eigs(*, k: int = 6, which: str = "smallest", precond=None, tol=None, maxiter
     structure — everything that is ``Kx=λMx`` rather than ``Ax=b``. Build ``K``/``M`` as source-less
     ``jno.fem`` bilinear forms (or via :meth:`FEM.eigs`).
 
-    **Two paths, selected by the arguments.** With no iterative argument the pencil is reduced
+    **Three paths, selected by the arguments.** With no iterative argument the pencil is reduced
     **densely** (Cholesky ``M=LLᵀ`` → ``jnp.linalg.eigh`` on ``L⁻¹KL⁻ᵀ``) — exact, and the right answer
     when you want the whole low spectrum of a small problem, but ``O(N²)`` memory because it
     materializes the operator. Passing ``precond=`` switches to **preconditioned LOBPCG**
     (:func:`jno.utils.solver.eigen.lobpcg_geneigh`, Knyazev 2001), which only ever applies ``K``/``M`` as
-    matvecs and so runs at a scale the dense reduction cannot::
+    matvecs and so runs at a scale the dense reduction cannot. Passing ``sigma=`` targets the ``k``
+    eigenvalues **nearest the shift** — interior modes (cavity resonances, band structure away from the
+    band edge), which no extremal-end iteration can reach — via the spectral transformation
+    ``θ = 1/(λ−σ)`` (:func:`jno.utils.solver.eigen.shift_invert_geneigh`, Ericsson & Ruhe 1980 §2); the
+    inner solves against ``K − σM`` default to a once-factorized host sparse LU, and ``linear=`` picks a
+    different inner solver (e.g. ``jno.solve.amg()`` when a factorization is too big)::
 
         lam, X = K.eigs(mass=mass, k=6)                              # dense
         lam, X = K.eigs(mass=mass, k=6, precond=jno.precond.amg())   # LOBPCG, matrix-free
+        lam, X = K.eigs(mass=mass, k=4, sigma=60.0)                  # the 4 modes nearest λ = 60
 
-    The Rayleigh-Ritz runs in the **M-inner product**, so the consistent (non-lumped) mass matrix of an
-    ordinary FEM form is handled directly. ``tol``/``maxiter`` tune that iteration (defaults ``1e-6`` /
-    ``200``) and are rejected without ``precond=``, so a tolerance can never be silently ignored on the
-    dense path. If the sweep budget is exhausted before ``tol``, the result is **NaN-poisoned** rather
-    than silently under-converged — jNO never fails silently.
+    ``sigma=`` replaces ``which=`` (the target is "nearest σ") and needs no ``precond=`` — the
+    transformation is its own preconditioner. The Rayleigh-Ritz runs in the **M-inner product**, so the
+    consistent (non-lumped) mass matrix of an ordinary FEM form is handled directly. ``tol``/``maxiter``
+    tune the iterative paths (defaults ``1e-6`` / ``200``) and are rejected on the dense path, so a
+    tolerance can never be silently ignored. If the budget is exhausted before ``tol`` — or a shift
+    lands on an eigenvalue and the inner factorization degenerates — the result is **NaN-poisoned**
+    rather than silently under-converged — jNO never fails silently.
 
     **Differentiable** on both paths: ``∂λ/∂θ`` for **simple** eigenvalues (degenerate/crossing
     eigenvalues make the derivative ill-defined — use the trace of the cluster). The dense path
@@ -507,18 +517,56 @@ def eigs(*, k: int = 6, which: str = "smallest", precond=None, tol=None, maxiter
     """
     if which not in ("smallest", "largest", "SM", "LM", "SA", "LA"):
         raise ValueError(f"jno.solve.eigs: which={which!r} — use 'smallest' or 'largest'.")
-    if precond is None and (tol is not None or maxiter is not None):
+    if sigma is not None:
+        if which not in ("smallest", "SM", "SA"):  # the default — anything else is a contradiction
+            raise ValueError(
+                "jno.solve.eigs: sigma= targets the k eigenvalues NEAREST the shift; which= does not "
+                "apply. Drop which=, or drop sigma=."
+            )
+        if precond is not None:
+            raise ValueError(
+                "jno.solve.eigs: sigma= needs no precond= — the spectral transformation is its own "
+                "preconditioner (the gaps near the shift become the largest in the transformed "
+                "spectrum). Pass linear= to change the INNER solver against K - sigma*M instead."
+            )
+    elif linear is not None:
         raise ValueError(
-            "jno.solve.eigs: tol=/maxiter= configure the iterative (LOBPCG) path, but no precond= was "
-            "given, so the dense reduction would run and silently ignore them. Pass precond= (e.g. "
-            "jno.precond.jacobi() for unpreconditioned-strength LOBPCG), or drop tol=/maxiter=."
+            "jno.solve.eigs: linear= picks the inner solver of the shift-invert path and means "
+            "nothing without sigma=. Pass sigma=, or drop linear=."
+        )
+    if X0 is not None:
+        if sigma is not None:
+            raise NotImplementedError(
+                "jno.solve.eigs: X0= (warm start) is not wired into the shift-invert path yet — the "
+                "spectral transformation converges from random in a handful of sweeps anyway. Drop "
+                "X0=, or drop sigma= and warm-start the LOBPCG path."
+            )
+        if precond is None:
+            raise ValueError(
+                "jno.solve.eigs: X0= seeds the iterative (LOBPCG) block, but no precond= was given, "
+                "so the dense reduction would run and silently ignore it. Pass precond= (e.g. "
+                "jno.precond.jacobi()), or drop X0=."
+            )
+    if precond is None and sigma is None and (tol is not None or maxiter is not None):
+        raise ValueError(
+            "jno.solve.eigs: tol=/maxiter= configure the iterative paths, but neither precond= nor "
+            "sigma= was given, so the dense reduction would run and silently ignore them. Pass "
+            "precond= (e.g. jno.precond.jacobi() for unpreconditioned-strength LOBPCG) or sigma=, "
+            "or drop tol=/maxiter=."
         )
     _tol = 1e-6 if tol is None else float(tol)
     _maxiter = 200 if maxiter is None else int(maxiter)
 
     def _fn(K, M=None):
-        from .utils.solver.eigen import dense_geneigh, lobpcg_geneigh
+        from .utils.solver.eigen import _require_symmetric, dense_geneigh, lobpcg_geneigh, shift_invert_geneigh
 
+        # Every path below reduces the SYMMETRIC pencil (both reductions Hermitianize by
+        # construction), so a non-self-adjoint operator would be silently answered with the spectrum
+        # of its symmetric part. Probe the bilinear form and refuse instead.
+        _require_symmetric(K, "K")
+        _require_symmetric(M, "M")
+        if sigma is not None:
+            return shift_invert_geneigh(K, M, k, sigma, inner_solve=linear, tol=_tol, maxiter=_maxiter)
         if precond is None:
             return dense_geneigh(K, M, k, which)
 
@@ -526,7 +574,7 @@ def eigs(*, k: int = 6, which: str = "smallest", precond=None, tol=None, maxiter
 
         op = K if isinstance(K, LinearOperator) else LinearOperator(K)
         apply = materialize_precond(precond, PrecondContext(op))
-        lam, X, res = lobpcg_geneigh(K, M, k, which, precond=apply, tol=_tol, maxiter=_maxiter)
+        lam, X, res = lobpcg_geneigh(K, M, k, which, precond=apply, tol=_tol, maxiter=_maxiter, X0=X0)
         bad = res > _tol  # budget exhausted -> poison, never a quietly under-converged spectrum
         return jnp.where(bad, jnp.nan, lam), jnp.where(bad, jnp.nan, X)
 
@@ -598,6 +646,173 @@ def lstsq(A, b, *, damp: float = 0.0, atol: float = 1e-6, btol: float = 1e-6, ma
     from .utils.solver.matfun import lstsq as _lstsq
 
     return _lstsq(A, b, damp=damp, atol=atol, btol=btol, maxiter=maxiter, x0=x0)
+
+
+def remesh(
+    *,
+    anisotropic: bool = False,
+    max_dofs: int | None = None,
+    every: int = 5,
+    metric_field: int = 0,
+    hmin: float | None = None,
+    hmax: float | None = None,
+    theta: float = 0.5,
+    refine_factor: float = 2.0,
+    max_iters: int = 8,
+    tol: float | None = None,
+    eps: float | None = None,
+):
+    """**h-adaptivity** for ``fem.solve(adapt=...)``: change the mesh to follow the solution.
+
+    On a **steady** problem this is the refine loop — solve, estimate (Zienkiewicz–Zhu), mark
+    (Dörfler ``theta``), refine by ``refine_factor``, repeat up to ``max_iters`` — growing the mesh
+    toward convergence. On a **transient** problem it remeshes every ``every`` steps at a *constant*
+    budget and carries the state across (basis-aware transfer), so the mesh tracks a moving feature and
+    coarsens its wake instead of ratcheting up::
+
+        fem.solve(adapt=jno.solve.remesh(anisotropic=True, max_dofs=6000, every=4))
+
+    ``anisotropic=True`` refines on a Hessian metric (stretched elements aligned to the solution's
+    curvature) instead of isotropic ZZ marking — far fewer DOFs for a layer or a front, and the right
+    choice for an interface. ``hmin``/``hmax`` bound the edge sizes; ``metric_field`` picks which coupled
+    field drives the metric. Metric-based DOF control is approximate, so ``max_dofs`` is honoured only
+    loosely in that mode.
+
+    Steady-only: ``max_iters``, ``tol``, ``eps`` (a relative-change plateau detector, not a certified
+    bound). Transient-only: ``every``, ``metric_field``.
+
+    Args:
+        anisotropic: Hessian-metric refinement instead of isotropic ZZ + Dörfler marking.
+        max_dofs: Vertex budget. Steady: stop once reached. Transient: the constant target.
+        every: Transient only — remesh every ``every`` time steps.
+        metric_field: Transient multifield only — index of the field driving the metric.
+        hmin: Smallest allowed edge length (default: mean edge / 50).
+        hmax: Largest allowed edge length (default: 2 × mean edge).
+        theta: Dörfler bulk-marking fraction (0..1).
+        refine_factor: Local edge-size reduction applied to marked cells each round.
+        max_iters: Steady only — maximum refine-solve rounds.
+        tol: Steady only — stop once the global error estimate falls below this.
+        eps: Steady only — stop once the round's figure of merit stops moving by more than this
+            (two consecutive rounds required).
+
+    Returns:
+        The adaptation spec to pass as ``fem.solve(adapt=...)``.
+
+    See :func:`relocate` for the fixed-connectivity (r-adaptive) alternative: it keeps the topology, so
+    there is no mesh schedule to freeze and no cross-mesh transfer, and its vertex map is differentiable
+    in the monitor. The two compose — remesh first, then relocate on the result.
+    """
+    from .utils.solver.fem_adapt import AdaptSpec
+
+    return AdaptSpec(
+        theta=theta,
+        max_iters=max_iters,
+        refine_factor=refine_factor,
+        tol=tol,
+        max_dofs=max_dofs,
+        eps=eps,
+        anisotropic=anisotropic,
+        hmin=hmin,
+        hmax=hmax,
+        every=every,
+        metric_field=metric_field,
+    )
+
+
+def relocate(
+    *,
+    method: str = "descent",
+    max_iters: int = 8,
+    lr: float = 3e-3,
+    quality_floor: float = 0.1,
+    relax: int = 60,
+    relax_step: float = 0.1,
+):
+    """**r-adaptivity** for ``fem.solve(adapt=...)``: move the mesh vertices, keep the connectivity.
+
+    Moves the vertices tagged ``domain.variable(region)[i].trainable()`` so the mesh **equidistributes**
+    the solution's features, at fixed connectivity and no new DOFs::
+
+        xm, ym, _ = domain.variable("core", where=interior, split=True)
+        xm.trainable(); ym.trainable()                  # BEFORE jno.fem(...)
+        u = fem.solve(adapt=jno.solve.relocate())
+
+    Requires at least one coordinate tagged ``.trainable()`` before ``jno.fem`` (else it raises).
+    Tagging is **literal and per-axis**: ``xm.trainable()`` frees only the x column. That is the lever for
+    boundary vertices — free an edge's *along-edge* axis and its nodes slide within the wall; leave the
+    normal axis untagged and the domain shape is preserved exactly.
+
+    **Two methods.** ``"descent"`` (default) walks the vertices down the equidistribution defect of an
+    arclength monitor, evaluated *through the differentiable solve*, with a backtracking ``det J`` line
+    search — on a stiff problem neither a stock optimiser nor an energy barrier can guarantee validity from
+    outside the step control. ``"monge_ampere"`` instead solves ``m·det(I + H(φ)) = θ`` for a mesh potential
+    and takes ``x = ξ + ∇φ`` (McRae, Cotter & Budd, *Optimal-transport-based mesh adaptivity on the plane
+    and sphere using finite elements*, SIAM J. Sci. Comput. **40**(2) (2018) A1121–A1148, arXiv:1612.08077,
+    §3.1); the displacement is a gradient, so the *whole* map cannot fold and no line search is needed.
+
+    Measured on the Allen–Cahn front the suite uses (``h = 0.06``, ``eps = 0.03``, 377 nodes), error on a
+    common fine grid so the comparison does not depend on where each mesh puts its nodes:
+
+    ==================  ===========  ============  ==================
+    method              rel-L2       vs uniform    min element quality
+    ==================  ===========  ============  ==================
+    uniform             1.096e-01    1.000         0.834
+    ``"descent"``       3.951e-02    **0.361**     0.503
+    ``"monge_ampere"``  8.879e-02    0.811         0.160
+    ==================  ===========  ============  ==================
+
+    So descent stays the default: Monge–Ampère converges in far fewer rounds (3–6 against 30) and reaches a
+    comparable equidistribution defect, but it degrades element quality badly here and the answer with it.
+    Lowering ``relax_step`` recovers part of the gap (0.811 → 0.633 at ``relax_step=0.02``).
+
+    Works in **2D and 3D**, on a scalar or vector field of **any nodal-Lagrange order**, and across linear,
+    nonlinear, transient, periodic and complex problems (all but complex-*transient*). It does not compose
+    with a moving mesh (``coord.d(t) - v``) — that driver owns the march.
+
+    Further limits, measured rather than argued:
+
+    - **The monitor reads vertex values only**, whatever the element order, so at P2 and above it adapts to
+      the P1 sub-sampling of the field rather than to everything the field resolves. Higher order still
+      relocates correctly; it just does not get a sharper monitor for the extra DOFs.
+    - **Monge–Ampère's non-folding is a property of the whole map.** Holding a subset of vertices truncates
+      it, and the truncation is what can tangle: on a 21² square with a diagonal front, freezing the whole
+      boundary reached ``min det J = -1.2e-03`` where the full map stayed positive throughout. Freeing
+      tangential axes recovers nearly all of it. Either method checks ``det J`` each round and keeps the
+      last valid mesh, so a bad tagging costs accuracy, not correctness.
+    - Its relaxation is explicit in ``relax_step``: past the stability limit more iterations make things
+      *worse* (spread 0.111 → 0.292 going from ``relax=40`` to ``300`` at ``relax_step=0.2``).
+    - The monitor is arclength-based, which suits an **under-resolved** feature; on an already
+      well-resolved mesh a curvature monitor wins. Not yet selectable.
+    - Relocation beats :func:`remesh` when features are few and sharp; loses when they are spread through
+      the domain (with four separated fronts the crossover moved below one element per feature width) or
+      when the mesh already over-resolves them. The two **compose** — remesh, then relocate on the result.
+
+    Args:
+        method: ``"descent"`` or ``"monge_ampere"``.
+        max_iters: Outer relocation rounds.
+        lr: ``"descent"`` only — base step for the RMS-normalised descent.
+        quality_floor: ``"descent"`` only — a step is halved until no element's ``|det J|`` falls below this
+            fraction of the initial worst element.
+        relax: ``"monge_ampere"`` only — relaxation iterations per round (McRae et al. eq. (3.7)). Each is
+            one Poisson solve against a matrix factorized once for the whole run, so these are cheap.
+        relax_step: ``"monge_ampere"`` only — the relaxation pseudo-step ``Δt``.
+
+    Returns:
+        The adaptation spec to pass as ``fem.solve(adapt=...)``.
+    """
+    if method not in ("descent", "monge_ampere"):
+        raise ValueError(f"jno.solve.relocate(method={method!r}): expected 'descent' or 'monge_ampere'.")
+    from .utils.solver.fem_adapt import AdaptSpec
+
+    return AdaptSpec(
+        relocate=True,
+        relocate_method=method,
+        max_iters=max_iters,
+        lr=lr,
+        quality_floor=quality_floor,
+        ma_relax=relax,
+        ma_dt=relax_step,
+    )
 
 
 def theta(theta: float = 1.0):

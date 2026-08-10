@@ -170,9 +170,9 @@ def test_lobpcg_nan_poisons_on_an_exhausted_budget():
 def test_eigs_rejects_tol_without_precond():
     """tol=/maxiter= without precond= would be silently ignored by the dense path, so it fails loud."""
     K, mass = _laplacian(0.25)
-    with pytest.raises(ValueError, match="no precond="):
+    with pytest.raises(ValueError, match="neither precond= nor sigma="):
         K.eigs(mass=mass, k=2, tol=1e-10)
-    with pytest.raises(ValueError, match="no precond="):
+    with pytest.raises(ValueError, match="neither precond= nor sigma="):
         jno.solve.eigs(k=2, maxiter=10)
 
 
@@ -285,3 +285,282 @@ def test_eigs_rejects_inhomogeneous_dirichlet_and_mixed_constraints():
     ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
     with pytest.raises(ValueError, match="INHOMOGENEOUS"):
         jno.fem([ui.x * vi.x + ui.y * vi.y, u(xb, yb) - 1.0]).eigs(mass=[ui * vi], k=2)
+
+
+def test_eigs_is_idempotent():
+    """Calling ``eigs`` twice on the same fem must give the same spectrum. The first call's internal
+    mass assembly cleared the domain's Dirichlet stash, so the SECOND call silently skipped the
+    elimination and returned the row-replaced spurious spectrum (measured: 47.2 appeared where the
+    true reduced spectrum has no eigenvalue at all)."""
+    d, K, mass = _dirichlet_box(0.25)
+    lam1, _ = K.eigs(mass=mass, k=3)
+    lam2, _ = K.eigs(mass=mass, k=3)
+    assert np.allclose(np.asarray(lam1), np.asarray(lam2), rtol=1e-12), (lam1, lam2)
+
+
+# --------------------------------------------------------------------------------------------------
+# Shift-invert (sigma=): interior eigenvalues
+# --------------------------------------------------------------------------------------------------
+
+
+def test_eigs_sigma_recovers_the_interior_cluster_with_degeneracy():
+    """``sigma=60`` on the Dirichlet box must return the modes NEAREST 60 — the degenerate pair at
+    5π² ≈ 49.35 and the single at 8π² ≈ 78.96 — which no extremal-end iteration can target. The tight
+    oracle is the dense full spectrum (same discretized pencil, machine agreement); the analytic
+    values gate the discretization itself."""
+    d, K, mass = _dirichlet_box(0.05)
+    lam, X = K.eigs(mass=mass, k=3, sigma=60.0)
+    lam = np.asarray(lam)
+    assert not np.isnan(lam).any(), "shift-invert poisoned a healthy interior solve"
+
+    # dense oracle: full spectrum of the SAME reduced pencil, k nearest sigma
+    lam_all, _ = K.eigs(mass=mass, k=40)
+    lam_all = np.asarray(lam_all)
+    oracle = lam_all[np.argsort(np.abs(lam_all - 60.0))[:3]]
+    assert np.allclose(np.sort(lam), np.sort(oracle), rtol=1e-8), (lam, oracle)
+    # analytic sanity: {5π², 5π², 8π²} at mesh accuracy — the degenerate pair must BOTH be present
+    assert np.allclose(np.sort(lam), np.pi**2 * np.array([5.0, 5.0, 8.0]), rtol=0.06), lam
+
+    # M-orthonormal modes, exactly zero on the eliminated wall
+    M = _dense(jno.fem(mass).operator[0])
+    G = np.asarray(X).T @ M @ np.asarray(X)
+    assert np.allclose(G, np.eye(3), atol=1e-8)
+    pts = np.asarray(K.points)
+    onwall = (
+        (np.abs(pts[:, 0]) < 1e-9)
+        | (np.abs(pts[:, 0] - 1) < 1e-9)
+        | (np.abs(pts[:, 1]) < 1e-9)
+        | (np.abs(pts[:, 1] - 1) < 1e-9)
+    )
+    assert np.max(np.abs(np.asarray(X)[onwall])) == 0.0
+
+
+def test_eigs_sigma_below_the_spectrum_matches_smallest():
+    """A shift below every eigenvalue makes "nearest σ" = "smallest": shift-invert must agree with
+    the dense smallest-end answer on the same pencil."""
+    d, K, mass = _dirichlet_box(0.06)
+    lam_si, _ = K.eigs(mass=mass, k=3, sigma=0.0)
+    lam_sm, _ = K.eigs(mass=mass, k=3)
+    assert np.allclose(np.sort(np.asarray(lam_si)), np.asarray(lam_sm), rtol=1e-8)
+
+
+def test_eigs_sigma_composes_with_a_periodic_tie():
+    """Interior targeting on the periodic pencil: σ = 35 between π² and the 4π² pair must return the
+    pair — the case that motivates sigma= (band structure at an interior point)."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.07)
+    d.tag("L", lambda x, y: x < 1e-9)
+    d.tag("R", lambda x, y: x > 1 - 1e-9)
+    d._remesh_periodic([("L", "R")])
+    u, v = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xl, yl, _ = d.variable("L", split=True)
+    xr, yr, _ = d.variable("R", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    K = jno.fem([ui.x * vi.x + ui.y * vi.y, u(xl, yl) - u(xr, yr)])
+
+    lam, X = K.eigs(mass=[ui * vi], k=2, sigma=35.0)
+    lam = np.asarray(lam)
+    assert not np.isnan(lam).any()
+    assert np.allclose(np.sort(lam), np.pi**2 * np.array([4.0, 4.0]), rtol=0.06), lam
+    # the tie holds on the returned interior modes
+    pts, Xa = np.asarray(K.points), np.asarray(X)
+    li = np.where(pts[:, 0] < 1e-9)[0]
+    ri = np.where(pts[:, 0] > 1 - 1e-9)[0]
+    lo, ro = li[np.argsort(pts[li, 1])], ri[np.argsort(pts[ri, 1])]
+    assert np.max(np.abs(Xa[lo] - Xa[ro])) < 1e-12
+
+
+def test_eigs_sigma_small_pencil_takes_the_dense_path():
+    """A pencil small enough that the two transformed k-blocks would overlap is answered by the exact
+    dense reduction — same nearest-σ semantics, no iteration."""
+    d, K, mass = _dirichlet_box(0.25)  # a handful of interior DOFs
+    lam, X = K.eigs(mass=mass, k=2, sigma=55.0)
+    lam_all, _ = K.eigs(mass=mass, k=6)
+    lam_all = np.asarray(lam_all)
+    oracle = np.sort(lam_all[np.argsort(np.abs(lam_all - 55.0))[:2]])
+    assert np.allclose(np.sort(np.asarray(lam)), oracle, rtol=1e-10)
+
+
+def test_eigs_sigma_on_an_eigenvalue_fails_loud():
+    """σ exactly ON a discrete eigenvalue makes K − σM singular. The inner factorization degenerates
+    and the original-pencil residual gate must poison (or the factorization itself raise) — never a
+    silently wrong interior spectrum."""
+    d, K, mass = _dirichlet_box(0.1)
+    lam_all, _ = K.eigs(mass=mass, k=1)
+    sig = float(np.asarray(lam_all)[0])  # the exact discrete λ₁
+    try:
+        lam, _X = K.eigs(mass=mass, k=2, sigma=sig)
+    except Exception:
+        return  # a loud factorization failure is an acceptable outcome
+    assert np.isnan(np.asarray(lam)).any(), "a singular shift must poison, not return a spectrum"
+
+
+def test_eigs_sigma_argument_guards():
+    """sigma= replaces which= and needs no precond=; linear= means nothing without sigma=."""
+    d, K, mass = _dirichlet_box(0.2)
+    with pytest.raises(ValueError, match="NEAREST"):
+        K.eigs(mass=mass, k=2, sigma=50.0, which="largest")
+    with pytest.raises(ValueError, match="own\\s+preconditioner|its own"):
+        K.eigs(mass=mass, k=2, sigma=50.0, precond=jno.precond.jacobi())
+    with pytest.raises(ValueError, match="without sigma"):
+        K.eigs(mass=mass, k=2, linear=jno.solve.lu())
+
+
+def test_eigs_sigma_eigenvalue_is_differentiable():
+    """∂λ/∂s through the shift-invert readout: scaling K→sK scales the spectrum, so for the simple
+    interior mode nearest σ, ∂λ/∂s = λ at s=1 — recovered from the Rayleigh quotient at the frozen
+    eigenvector exactly as on the LOBPCG path."""
+    d, K, mass = _dirichlet_box(0.07)
+    K0 = K.operator[0]
+    M0 = jno.fem(mass).operator[0]
+    import jax.experimental.sparse as jsp
+
+    solver = jno.solve.eigs(k=1, sigma=75.0)  # nearest: the simple 8π² ≈ 78.96 mode
+
+    def lam_of(s):
+        Ks = jsp.BCOO((s * K0.data, K0.indices), shape=K0.shape)
+        lam, _ = solver(Ks, M0)
+        return lam[0]
+
+    val = float(lam_of(1.0))
+    g = float(jax.grad(lam_of)(1.0))
+    fd = float((lam_of(1.0 + 1e-6) - lam_of(1.0 - 1e-6)) / 2e-6)
+    assert abs(g - fd) / abs(fd) < 1e-4
+    assert abs(g - val) / val < 1e-5
+
+
+def test_eigs_warm_start_converges_where_cold_start_poisons():
+    """``X0=`` seeds the LOBPCG block — the sweep accelerator: re-solving from the previous answer
+    must converge inside a budget that NaN-poisons a cold random start. Verified on the constrained
+    (Dirichlet-eliminated) pencil, so the full-space → reduced restriction of the warm columns is
+    exercised too."""
+    d, K, mass = _dirichlet_box(0.06)
+    lam_ref, X_ref = K.eigs(mass=mass, k=4, precond=jno.precond.jacobi(), tol=1e-6, maxiter=400)
+    assert np.all(np.isfinite(np.asarray(lam_ref)))
+
+    lam_cold, _ = K.eigs(mass=mass, k=4, precond=jno.precond.jacobi(), tol=1e-6, maxiter=3)
+    assert np.isnan(np.asarray(lam_cold)).all(), "3 sweeps from random must exhaust and poison"
+
+    lam_warm, X_warm = K.eigs(mass=mass, k=4, precond=jno.precond.jacobi(), tol=1e-6, maxiter=3, X0=X_ref)
+    lam_warm = np.asarray(lam_warm)
+    assert np.all(np.isfinite(lam_warm)), "warm-started from the answer, 3 sweeps must suffice"
+    assert np.allclose(lam_warm, np.asarray(lam_ref), rtol=1e-6)
+
+    # a partial warm start (fewer columns than k) pads with the random block and still helps nothing
+    # break: it must at least run and return the right spectrum with a real budget
+    lam_part, _ = K.eigs(mass=mass, k=4, precond=jno.precond.jacobi(), tol=1e-6, maxiter=400, X0=X_ref[:, :2])
+    assert np.allclose(np.asarray(lam_part), np.asarray(lam_ref), rtol=1e-4)
+
+
+def test_eigs_warm_start_argument_guards():
+    """X0= without the LOBPCG path would be silently ignored — reject; the shift-invert path does not
+    take a warm start yet — say so by name."""
+    d, K, mass = _dirichlet_box(0.2)
+    lam_ref, X_ref = K.eigs(mass=mass, k=2)
+    with pytest.raises(ValueError, match="X0"):
+        K.eigs(mass=mass, k=2, X0=X_ref)
+    with pytest.raises(NotImplementedError, match="X0"):
+        K.eigs(mass=mass, k=2, sigma=50.0, X0=X_ref)
+
+
+# --------------------------------------------------------------------------------------------------
+# Symmetry guard: this solver reduces the SYMMETRIC pencil only
+# --------------------------------------------------------------------------------------------------
+
+
+def _nonsymmetric_pencil(n=40, skew=2.0, seed=0):
+    """K = (symmetric part) + skew*(skew-symmetric part) — genuinely non-self-adjoint, with a
+    complex spectrum, exactly the shape of a linearized plasma/flow stability operator."""
+    rng = np.random.default_rng(seed)
+    S = rng.normal(size=(n, n))
+    S = 0.5 * (S + S.T)
+    A = rng.normal(size=(n, n))
+    A = 0.5 * (A - A.T)
+    return S + skew * A
+
+
+def test_eigs_refuses_a_nonsymmetric_operator():
+    """A non-symmetric K used to be SILENTLY symmetrized: the solver returned the spectrum of
+    ½(K+Kᵀ), and (measured) not one returned value was an eigenvalue of K, whose true spectrum was
+    complex. Every plasma/flow stability operator is non-self-adjoint, so this must refuse."""
+    K = _nonsymmetric_pencil()
+    n = K.shape[0]
+    true = np.linalg.eigvals(K)
+    assert np.abs(true.imag).max() > 1.0, "fixture must have a genuinely complex spectrum"
+
+    with pytest.raises(ValueError, match="NOT symmetric"):
+        jno.solve.eigs(k=4)(jnp.asarray(K), jnp.eye(n))
+    # the message must name the measured asymmetry and the escape hatch
+    with pytest.raises(ValueError, match=r"0\.5\*\(K \+ K\.T\)"):
+        jno.solve.eigs(k=4)(jnp.asarray(K), jnp.eye(n))
+    # ... and it must guard the iterative and shift-invert paths too, not just the dense reduction
+    with pytest.raises(ValueError, match="NOT symmetric"):
+        jno.solve.eigs(k=4, precond=jno.precond.jacobi())(jnp.asarray(K), jnp.eye(n))
+    with pytest.raises(ValueError, match="NOT symmetric"):
+        jno.solve.eigs(k=2, sigma=0.5)(jnp.asarray(K), jnp.eye(n))
+
+
+def test_eigs_refuses_a_nonsymmetric_mass():
+    """M is checked too — an asymmetric mass breaks the M-inner product every path relies on."""
+    n = 30
+    K = np.eye(n) * 2.0
+    M = np.eye(n) + 0.3 * np.tril(np.ones((n, n)), -1)  # lower-triangular perturbation: asymmetric
+    with pytest.raises(ValueError, match="M is NOT symmetric"):
+        jno.solve.eigs(k=3)(jnp.asarray(K), jnp.asarray(M))
+
+
+def test_eigs_symmetrized_surrogate_is_still_reachable_explicitly():
+    """The guard refuses to GUESS, not to obey: passing the symmetric part explicitly is accepted
+    and gives that operator's spectrum."""
+    K = _nonsymmetric_pencil()
+    n = K.shape[0]
+    Ks = 0.5 * (K + K.T)
+    lam, _ = jno.solve.eigs(k=4)(jnp.asarray(Ks), jnp.eye(n))
+    assert np.allclose(np.sort(np.asarray(lam)), np.sort(np.linalg.eigvalsh(Ks))[:4], rtol=1e-8)
+
+
+def test_eigs_symmetry_guard_tolerates_assembly_roundoff():
+    """The guard must not fire on a real FEM pencil, whose asymmetry is summation roundoff — that is
+    exactly what the reductions' Hermitianization is legitimately for."""
+    K, mass = _laplacian(0.09)
+    lam, _ = K.eigs(mass=mass, k=4)
+    assert np.all(np.isfinite(np.asarray(lam)))
+    # explicit perturbation just under / over the threshold, to pin where the line sits
+    A = _dense(K.operator[0])
+    n = A.shape[0]
+    rng = np.random.default_rng(3)
+    P = rng.normal(size=(n, n))
+    P = 0.5 * (P - P.T)
+    scale = np.abs(A).max()
+    jno.solve.eigs(k=2)(jnp.asarray(A + 1e-12 * scale * P), jnp.eye(n))  # roundoff-level: accepted
+    with pytest.raises(ValueError, match="NOT symmetric"):
+        jno.solve.eigs(k=2)(jnp.asarray(A + 1e-3 * scale * P), jnp.eye(n))
+
+
+def test_eigs_symmetry_guard_is_silent_under_trace():
+    """Concrete-only, like every other eager guard in the library: under jit/grad the probes come
+    back as tracers and the check must skip rather than crash the transform."""
+    K, mass = _laplacian(0.12)
+    K0 = jnp.asarray(_dense(K.operator[0]))
+    M0 = jnp.asarray(_dense(jno.fem(mass).operator[0]))
+    solver = jno.solve.eigs(k=3)
+
+    def lam_of(s):
+        lam, _ = solver(s * K0, M0)
+        return lam[2]
+
+    g = float(jax.grad(lam_of)(1.0))  # must not raise
+    fd = float((lam_of(1.0 + 1e-6) - lam_of(1.0 - 1e-6)) / 2e-6)
+    assert abs(g - fd) / abs(fd) < 1e-4
+
+
+def test_eigs_dirichlet_application_is_symmetric_so_the_guard_stays_quiet():
+    """A constrained fem's ``operator[0]`` is EXACTLY symmetric (measured 0.0): jNO applies Dirichlet
+    by zeroing rows AND columns with a unit diagonal, not by row replacement alone. So the symmetry
+    guard correctly stays out of the way here — the constrained-pencil hazard is the *spurious
+    identity modes*, an unrelated problem that ``FEM.eigs`` solves by ELIMINATING those DOFs."""
+    d, K, mass = _dirichlet_box(0.15)
+    A = _dense(K.operator[0])
+    assert np.linalg.norm(A - A.T) / np.linalg.norm(A) == 0.0
+    lam, _ = K.eigs(mass=mass, k=3)
+    assert np.all(np.isfinite(np.asarray(lam)))

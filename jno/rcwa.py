@@ -905,7 +905,16 @@ def _z_ambient_faces(domain):
     for tag, br in getattr(domain, "_boundary_regions", {}).items():
         if tag == "boundary" or br is None or len(getattr(br, "points", [])) == 0:
             continue
-        nrm = np.asarray(normals.get(tag, np.zeros((1, 3)))).mean(0)
+        if tag not in normals:
+            # A MISSING normal used to read as a zero vector, and `0 < 0.8*(0+1e-30)` is True — so an
+            # untagged-normal face was silently *disqualified* and the search failed with "could not
+            # identify the ambient faces", naming neither the tag nor the real cause. Say it instead.
+            raise RcwaError(
+                f"boundary region {tag!r} carries no per-point normals (`domain.normals_by_tag` has no "
+                f"entry for it), so RCWA cannot tell whether it is a z-normal ambient face. Tag it with "
+                "a coordinate or facet predicate on a meshed boundary so its normals are derived."
+            )
+        nrm = np.asarray(normals[tag]).mean(0)
         if abs(nrm[2]) < 0.8 * (np.linalg.norm(nrm) + 1e-30):
             continue  # not a z-normal face
         cz = np.asarray(br.points)[:, 2].mean()

@@ -330,3 +330,97 @@ def test_coupled_nonlinear_newton_recovers_manufactured():
     gg = c[:, 0] * (1 - c[:, 0]) * c[:, 1] * (1 - c[:, 1])
     assert np.linalg.norm(sol.x[:n] - gg) / np.linalg.norm(gg) < 1e-2
     assert np.linalg.norm(sol.x[n:] - 2 * gg) / np.linalg.norm(2 * gg) < 1e-2
+
+
+def test_coupled_complex_steady_recovers_manufactured_system():
+    """A COMPLEX coupled steady system (coupled Helmholtz-type) — previously fail-loud ('use
+    complex=True for a single complex field'). The Re/Im coefficient split runs through the same
+    coupled assembler; the fused real 2n block solves both fields at once and recombines. Oracle:
+    a manufactured all-Neumann pair (cos·cos modes have zero normal flux on the unit square)::
+
+        c1(-Δu) + d1 u + k w = f1,   c2(-Δw) + d2 w + k u = f2,
+
+    with complex c/d/k and complex target amplitudes."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.07)
+    u, v = d.fem_symbols(names=("cxu", "cxv"))
+    w, q = d.fem_symbols(names=("cxw", "cxq"))
+    xi, yi, _ = d.variable("interior", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    wi, qi = w.bind(x=xi, y=yi), q.bind(x=xi, y=yi)
+    PI = np.pi
+    c1, d1 = 1.0 / (1.0 + 0.5j), -(1.0 + 0.2j)
+    c2, d2 = 1.0 + 0.3j, -(0.8 - 0.1j)
+    k = 0.5 + 0.1j
+    au, aw = 1.0 + 0.5j, 0.3 - 0.2j  # target amplitudes of the shared cos·cos mode
+    g = jno.np.cos(PI * xi) * jno.np.cos(PI * yi)
+    f1 = (2 * PI**2 * c1 + d1) * au * g + k * aw * g
+    f2 = (2 * PI**2 * c2 + d2) * aw * g + k * au * g
+    fem = jno.fem(
+        [
+            c1 * (ui.x * vi.x + ui.y * vi.y) + d1 * (u * vi) + k * (w * vi) - f1 * vi,
+            c2 * (wi.x * qi.x + wi.y * qi.y) + d2 * (w * qi) + k * (u * qi) - f2 * qi,
+        ]
+    )
+    assert fem.is_complex and fem.is_linear
+    sol = np.asarray(fem.solve())
+    assert np.iscomplexobj(sol)
+    o = fem.offsets
+    assert len(o) == 3, "two coupled fields -> offsets [0, n_u, n_u + n_w]"
+    pts = np.asarray(fem.points)
+    gg = np.cos(PI * pts[:, 0]) * np.cos(PI * pts[:, 1])
+    exact_u, exact_w = au * gg, aw * gg
+    rel_u = np.linalg.norm(sol[o[0] : o[1]] - exact_u) / np.linalg.norm(exact_u)
+    rel_w = np.linalg.norm(sol[o[1] : o[2]] - exact_w) / np.linalg.norm(exact_w)
+    assert rel_u < 2e-2, f"coupled complex field u rel-L2 {rel_u:.3e}"
+    assert rel_w < 2e-2, f"coupled complex field w rel-L2 {rel_w:.3e}"
+    assert float(np.abs(sol[o[0] : o[1]].imag).max()) > 0.1, "u must be genuinely complex"
+
+
+def test_coupled_complex_steady_dirichlet_pins_re_and_zeroes_im():
+    """A real Dirichlet g on one field of a complex coupled system: the shared row set must impose
+    ``Re u = g`` and ``Im u = 0`` on that field's boundary (the ± block structure does this), while
+    the other field stays free (Neumann)."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.15)
+    u, v = d.fem_symbols(names=("dxu", "dxv"))
+    w, q = d.fem_symbols(names=("dxw", "dxq"))
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    wi, qi = w.bind(x=xi, y=yi), q.bind(x=xi, y=yi)
+    fem = jno.fem(
+        [
+            (1.0 + 0.4j) * (ui.x * vi.x + ui.y * vi.y) + (u * vi) + (0.2j) * (w * vi) - (1.0 + 1.0j) * vi,
+            (wi.x * qi.x + wi.y * qi.y) + (w * qi) + (0.2j) * (u * qi) - 1.0 * qi,
+            u(xb, yb) - 1.5,
+        ]
+    )
+    sol = np.asarray(fem.solve())
+    o = fem.offsets
+    pts = np.asarray(fem.points)
+    e = 1e-9
+    onb = (np.abs(pts[:, 0]) < e) | (np.abs(pts[:, 0] - 1) < e) | (np.abs(pts[:, 1]) < e) | (np.abs(pts[:, 1] - 1) < e)
+    u_b = sol[o[0] : o[1]][onb]
+    assert np.abs(u_b.real - 1.5).max() < 1e-10, "Re u must be pinned to g on the boundary"
+    assert np.abs(u_b.imag).max() < 1e-10, "Im u must be zeroed on the boundary"
+    assert float(np.abs(sol[o[1] : o[2]].imag).max()) > 1e-3, "w picks up a genuine imaginary part"
+
+
+def test_coupled_complex_nonlinear_rejected():
+    """Complex × nonlinear × coupled: complex forms assemble as linear real-equivalent blocks, so a
+    nonlinear complex coupled form must refuse by name rather than drop the imaginary part."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.3)
+    u, v = d.fem_symbols(names=("nxu", "nxv"))
+    w, q = d.fem_symbols(names=("nxw", "nxq"))
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    wi, qi = w.bind(x=xi, y=yi), q.bind(x=xi, y=yi)
+    with pytest.raises(NotImplementedError, match="complex NONLINEAR coupled"):
+        jno.fem(
+            [
+                (1.0 + 0.4j) * (ui.x * vi.x + ui.y * vi.y) + (u * u * u) * vi - 1.0 * vi,
+                (wi.x * qi.x + wi.y * qi.y) + (u * qi) - 1.0 * qi,
+                u(xb, yb) - 0.0,
+                w(xb, yb) - 0.0,
+            ]
+        )

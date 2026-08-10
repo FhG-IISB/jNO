@@ -83,6 +83,39 @@ def lagrange_interp_points(dim: int, degree: int) -> np.ndarray:
     return np.asarray(_lagrange_basix(cell, degree).points)
 
 
+def lagrange_interval(degree: int, quad_degree: Optional[int] = None) -> ElementSpec:
+    """Lagrange P{degree} element on a reference interval, tabulated via basix.
+
+    The 1-D sibling of :func:`lagrange_triangle` / :func:`lagrange_tet`, built by the same
+    :func:`_lagrange_basix` builder so a P{k} interval and a P{k} triangle agree on what degree ``k``
+    means. P1 has 2 DOFs (the endpoints); degree ``k`` adds ``k-1`` interior nodes, endpoints first.
+
+    ``local_edges`` is the single "edge" of an interval — the cell itself — which keeps the
+    ``ElementSpec`` contract uniform for consumers that read it.
+    """
+    import basix
+    from basix import CellType
+
+    if degree < 1:
+        raise ValueError(f"lagrange_interval: degree must be >= 1; got {degree}.")
+    qd = quad_degree if quad_degree is not None else 2 * degree + 1
+    elem = _lagrange_basix(CellType.interval, degree)
+    qp, qw = basix.make_quadrature(CellType.interval, qd)
+    tab = elem.tabulate(2, qp)  # (n_blocks, n_quad, n_dof, 1) -- values, 1st and 2nd reference derivatives
+    return ElementSpec(
+        family=f"Lagrange-P{degree}-Interval",
+        n_dof=int(elem.dim),
+        value_size=1,
+        quad_points=np.asarray(qp),
+        quad_weights=np.asarray(qw),
+        ref_values=np.asarray(tab[0]),  # (n_quad, n_dof, 1)
+        ref_div=None,
+        ref_grads=np.asarray(tab[1])[..., None],  # (n_quad, n_dof, 1, 1): the single ∂φ/∂ξ
+        local_edges=((0, 1),),
+        ref_hess=_ref_hessian_from_tab(tab, 1),  # (n_quad, n_dof, 1, 1, 1)
+    )
+
+
 def lagrange_triangle(degree: int, quad_degree: Optional[int] = None) -> ElementSpec:
     """Lagrange P{degree} element on a reference triangle, tabulated via basix.
 

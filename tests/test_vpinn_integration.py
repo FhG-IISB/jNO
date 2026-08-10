@@ -303,3 +303,87 @@ def test_network_trains_under_x64_with_optax_optimizer(opt_name):
         assert l1 < 0.5 * l0, f"{opt_name} under x64 did not train: {l0:.2e} -> {l1:.2e}"
     finally:
         jax.config.update("jax_enable_x64", prev)
+
+
+# ============================================================
+# 1D (line domain)
+# ============================================================
+def _line_domain(mesh_size=0.05):
+    pytest.importorskip("pygmsh", reason="pygmsh required for line meshing")
+    return jno.domain(constructor=jno.domain.line(mesh_size=mesh_size))
+
+
+def test_vpinn_1d_assembles_on_a_line():
+    """A network trial on a **1D** line domain. VPINN was gated to 2D/3D because the native
+    ``fem_context`` it test-projects onto could not be built on an interval mesh — the element spec,
+    the facet connectivity and the facet normals were all triangle/tet only.
+
+    The 1D assembler is deliberately bypassed for a VPINN form: its trial is a network, not an FE
+    field, so there is no linear system to assemble."""
+    dom = _line_domain(0.1)
+    u, phi = dom.fem_symbols()
+    xi = dom.variable("interior", split=True)[0]
+    xb = dom.variable("boundary", split=True)[0]
+    vi = phi.bind(x=xi)
+    net = jnn.nn.wrap(foundax.mlp(1, hidden_dims=8, num_layers=2, activation=jax.nn.tanh, key=jax.random.PRNGKey(0)))
+    u_net = net(xi)
+    weak = jnn.grad(u_net, xi) * jnn.grad(vi, xi) - (1.0 + 0.0 * xi) * vi
+
+    pde = jno.fem([weak, u(xb) - 0.0])
+    assert type(pde).__name__ == "GroupedAssembly"
+    assert hasattr(pde, "mse") and hasattr(pde, "volume_grad_expr")
+
+
+def test_vpinn_1d_loss_evaluates_and_is_finite():
+    """Guard on the pathology this uncovered: with ``dim == 1`` the canonical test-grad coefficient is
+    a **one-item** stack, and ``jnp_ops.concat`` skipped its fast path for a single operand and fell
+    into a rank-alignment fallback written for two or more — which re-entered trace-node construction
+    inside the evaluator, so the loss never finished evaluating (a hang, not an error).
+
+    Evaluating it at all is the assertion; a finite number is the proof it took the direct path."""
+    import numpy as np
+
+    dom = _line_domain(0.1)
+    u, phi = dom.fem_symbols()
+    xi = dom.variable("interior", split=True)[0]
+    xb = dom.variable("boundary", split=True)[0]
+    vi = phi.bind(x=xi)
+    net = jnn.nn.wrap(foundax.mlp(1, hidden_dims=8, num_layers=2, activation=jax.nn.tanh, key=jax.random.PRNGKey(0)))
+    u_net = net(xi) * (xi * (1 - xi))
+    weak = jnn.grad(u_net, xi) * jnn.grad(vi, xi) - (2.0 + 0.0 * xi) * vi
+
+    pde = jno.fem([weak, u(xb) - 0.0])
+    crux = jno.core([pde.mse], domain=dom)
+    loss = float(np.asarray(crux.eval([pde.mse])).mean())
+    assert np.isfinite(loss) and loss > 0.0
+
+
+def test_vpinn_1d_trains_and_solves_poisson():
+    """End to end: ``-u'' = 2`` on [0,1] with ``u(0)=u(1)=0`` has the exact solution ``u = x(1-x)``.
+
+    The hard-BC ansatz ``net(x)·x(1-x)`` vanishes on the boundary by construction, so the network
+    cannot satisfy the loss by cheating there. Verified on the trained net's OWN prediction over a
+    fresh, finer grid — not on the training loss."""
+    import numpy as np
+    import optax
+
+    dom = _line_domain(0.05)
+    u, phi = dom.fem_symbols()
+    xi = dom.variable("interior", split=True)[0]
+    xb = dom.variable("boundary", split=True)[0]
+    vi = phi.bind(x=xi)
+    net = jnn.nn.wrap(foundax.mlp(1, hidden_dims=24, num_layers=3, activation=jax.nn.tanh, key=jax.random.PRNGKey(0)))
+    u_net = net(xi) * (xi * (1 - xi))
+    weak = jnn.grad(u_net, xi) * jnn.grad(vi, xi) - (2.0 + 0.0 * xi) * vi
+    pde = jno.fem([weak, u(xb) - 0.0])
+
+    net.optimizer(optax.adam(1e-2))
+    crux = jno.core([pde.mse], domain=dom)
+    crux.solve(1500)
+
+    test_dom = _line_domain(0.013)
+    xt = test_dom.variable("interior", split=True)[0]
+    pred = np.asarray(crux.eval([net(xt) * (xt * (1 - xt))], domain=test_dom)).reshape(-1)
+    exact = np.asarray(crux.eval([xt * (1 - xt)], domain=test_dom)).reshape(-1)
+    rel = float(np.linalg.norm(pred - exact) / np.linalg.norm(exact))
+    assert rel < 1e-2, f"1D VPINN did not solve Poisson: rel-L2={rel:.3e}"

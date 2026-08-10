@@ -1,5 +1,6 @@
 """CORE solver using new tracing system - NO INNER VMAPS version."""
 
+import functools
 import inspect
 from typing import Dict, List, Tuple
 
@@ -43,6 +44,18 @@ def _default_float_dtype():
     return jnp.asarray(0.0).dtype
 
 
+@functools.lru_cache(maxsize=1024)
+def _accepts_key(fn) -> bool:
+    """Whether ``fn`` declares a ``key=`` parameter.
+
+    Cached on the *unbound* function: ``inspect.signature`` costs ~6 µs and the
+    evaluator asks this once per model / custom-function node per trace — a few
+    thousand times for a multi-field residual, none of which can change answer
+    between calls.
+    """
+    return "key" in inspect.signature(fn).parameters
+
+
 from .differential_operators import DifferentialOperators
 from .integration_operators import IntegrationOperators
 from .utils import get_logger
@@ -74,6 +87,7 @@ class TraceEvaluator:
         self.log = get_logger()
         self._logged_schemes: Dict[str, str] = {}
         self._nn_index_cache: Dict = {}  # (mesh, sampled) point-set geometry -> nearest-vertex gather index
+        self._mesh_eval_cache: Dict = {}  # (target, tag, points, context) -> target sampled on the mesh
 
     # ------------------------------------------------------------------
     # Evaluation context — lightweight carrier replacing 5 positional args
@@ -107,6 +121,9 @@ class TraceEvaluator:
             key=key,
             active_region=None,
         )
+        # Sharing between FD derivative nodes is scoped to one expression: the cache
+        # keys hold identities that only exist inside this call.
+        self._mesh_eval_cache.clear()
         return self._dispatch(expr, ctx)
 
     # ------------------------------------------------------------------
@@ -383,6 +400,41 @@ class TraceEvaluator:
 
         return local
 
+    def _target_on_mesh(self, target, tag, mesh_points, ctx):
+        """Evaluate ``target`` with the spatial tag ``tag`` bound to the whole mesh point set.
+
+        Every finite-difference derivative applies its stencil to the target sampled
+        on the mesh, and one residual routinely carries several of them over the same
+        field — ``laplacian(u, fd) + u.d(x, fd) + u`` re-traced the network once per
+        node.  Siblings share a single evaluation here: the value depends only on the
+        target, the tag, the point set and the surrounding context, and all four are
+        the same object for siblings of one expression.  Only the spatial tag is
+        replaced, so ``__time__`` and the rest of the context stay intact.
+        """
+        key = (
+            id(target),
+            tag,
+            id(mesh_points),
+            id(ctx.context),
+            id(ctx.var_bindings),
+            id(ctx.active_region),
+        )
+        cached = self._mesh_eval_cache.get(key)
+        if cached is not None:
+            return cached[-1]
+
+        new_ctx = self._EvalCtx(
+            {**ctx.context, tag: mesh_points},
+            ctx.var_bindings,
+            ctx.key,
+            active_region=ctx.active_region,
+        )
+        value = self._dispatch(target, new_ctx)
+        # Keep the identified objects alive alongside the value so no id() in the key
+        # can be recycled onto a different object while the entry is live.
+        self._mesh_eval_cache[key] = (target, mesh_points, ctx.context, ctx.var_bindings, ctx.active_region, value)
+        return value
+
     def _map_mesh_to_sampled(self, mesh_points, sampled_points, values):
         """Map values computed at mesh vertices back to sampled points via nearest-neighbour lookup.
 
@@ -509,8 +561,11 @@ class TraceEvaluator:
     def _eval_function_call(self, expr, ctx):
         args = [(self._dispatch(arg, ctx) if isinstance(arg, Placeholder) else arg) for arg in expr.args]
         kwargs = expr.kwargs if expr.kwargs else {}
-        sig = inspect.signature(expr.fn)
-        if "key" in sig.parameters:
+        try:
+            wants_key = _accepts_key(expr.fn)
+        except TypeError:  # unhashable callable (e.g. a functools.partial over a dict)
+            wants_key = "key" in inspect.signature(expr.fn).parameters
+        if wants_key:
             return expr.fn(*args, key=ctx.key, **kwargs)
         else:
             return expr.fn(*args, **kwargs)
@@ -668,11 +723,10 @@ class TraceEvaluator:
                 for a in shaped_args
             ]
 
-        # Call equinox model directly (it IS the pytree, no init/apply split)
-        import inspect
-
-        sig = inspect.signature(model.__call__)
-        if "key" in sig.parameters:
+        # Call equinox model directly (it IS the pytree, no init/apply split).
+        # Keyed on the class's ``__call__`` so the signature lookup caches across
+        # instances (the bound method is a fresh object on every attribute access).
+        if _accepts_key(type(model).__call__):
             result = model(*shaped_args, key=ctx.key)
         else:
             result = model(*shaped_args)
@@ -888,15 +942,28 @@ class TraceEvaluator:
                 "FrozenField.eval(): standalone readout of a VECTOR frozen field is not supported yet — a "
                 "vector frozen field works as a coefficient in a jno.fem form. Read a single component."
             )
-        values = jnp.asarray(expr.values).reshape(-1)
+        # A caller marching a MOVING mesh supplies the nodal values and the mesh geometry through the eval
+        # context instead of the graph node and the domain object. Both are otherwise host state captured
+        # when the expression was built, so under a `lax.scan` a frozen field would silently keep reading
+        # the SEED state on the SEED mesh -- a wrong answer with no symptom. Purely additive: absent these
+        # keys, every existing `FrozenField.eval()` caller takes the original path unchanged.
+        _ctx_vals = ctx.context.get("__frozen_values__")
+        _ctx_vals = None if _ctx_vals is None else _ctx_vals.get(getattr(expr, "frozen_id", None))
+        values = jnp.asarray(expr.values if _ctx_vals is None else _ctx_vals).reshape(-1)
+
+        _ctx_pts = ctx.context.get("__mesh_points__")
         domain = getattr(expr, "_domain", None)
-        if domain is None or getattr(domain, "mesh_connectivity", None) is None:
+        if _ctx_pts is None and (domain is None or getattr(domain, "mesh_connectivity", None) is None):
             raise ValueError(
                 "FrozenField.eval() needs the frozen field to carry its mesh domain — build it via "
                 "`u.bind(x=..., y=...).freeze(values)` (the coordinate bind supplies the domain)."
             )
-        mesh_dim = int(domain.mesh_connectivity["dimension"])
-        mesh_points = jnp.asarray(domain.mesh_connectivity["points"])[:, :mesh_dim]
+        if _ctx_pts is not None:
+            mesh_points = jnp.asarray(_ctx_pts)
+            mesh_dim = int(mesh_points.shape[-1])
+        else:
+            mesh_dim = int(domain.mesh_connectivity["dimension"])
+            mesh_points = jnp.asarray(domain.mesh_connectivity["points"])[:, :mesh_dim]
 
         tag = getattr(expr, "_coord_tag", None)
         pts = ctx.context.get(tag) if tag is not None else None
@@ -1348,12 +1415,7 @@ class TraceEvaluator:
             mesh_points = jnp.array(domain.mesh_connectivity["points"])
             mesh_dim = domain.mesh_connectivity["dimension"]
 
-            def u_at_pts(pts):
-                ctx_dict = {**ctx.context, tag: pts}
-                new_ctx = self._EvalCtx(ctx_dict, ctx.var_bindings, ctx.key, active_region=ctx.active_region)
-                return self._dispatch(target, new_ctx)
-
-            u_full = u_at_pts(mesh_points)
+            u_full = self._target_on_mesh(target, tag, mesh_points, ctx)
             N_mesh = mesh_points.shape[0]
 
             # FD operators expect flat 1-D (N,) values.  Operator-learning
@@ -1453,7 +1515,10 @@ class TraceEvaluator:
                     local_ctx = evaluator_self._build_local_context(idx, tag, points, ctx.context)
                     u_fn = make_u_fn(local_ctx)
 
-                    val0 = u_fn(pt)
+                    # Only the RANK of the output decides how the Jacobian is sliced
+                    # below, so ask for the shape abstractly — calling u_fn here would
+                    # trace the whole target a second time per derivative node.
+                    val0 = jax.eval_shape(u_fn, pt)
                     jac = _jac(u_fn)(pt)
 
                     # scalar output -> shape (1,)
@@ -1472,7 +1537,7 @@ class TraceEvaluator:
                     local_ctx = evaluator_self._build_local_context(idx, tag, points, ctx.context)
                     u_fn = make_u_fn(local_ctx)
 
-                    val0 = u_fn(pt)
+                    val0 = jax.eval_shape(u_fn, pt)  # rank only — see the n_vars == 1 branch
                     jac = _jac(u_fn)(pt)
 
                     # scalar output -> (n_vars,)
@@ -1527,13 +1592,7 @@ class TraceEvaluator:
             mesh_points = jnp.array(domain.mesh_connectivity["points"])
             mesh_dim = domain.mesh_connectivity["dimension"]
 
-            def u_at_pts(pts):
-                # Replace only the spatial tag — __time__ stays intact
-                ctx_dict = {**ctx.context, tag: pts}
-                new_ctx = self._EvalCtx(ctx_dict, ctx.var_bindings, ctx.key, active_region=ctx.active_region)
-                return self._dispatch(target, new_ctx)
-
-            u_full = u_at_pts(mesh_points)
+            u_full = self._target_on_mesh(target, tag, mesh_points, ctx)
             N_mesh = mesh_points.shape[0]
 
             # Auto-flatten image-shaped model outputs and handle multi-channel.
@@ -1642,15 +1701,46 @@ class TraceEvaluator:
                 n_time, n_points, _ = points.shape
 
                 def _windowed_scalar(t_idx, p_idx, p):
-                    updated_points = points.at[t_idx, p_idx, :].set(p)
+                    """``target`` at the single ``(t_idx, p_idx)`` entry, as a function of ``p``.
+
+                    The context is sliced down to that one entry — mirroring
+                    :meth:`_build_local_context` for the 2-D point set, but peeling
+                    the (time, point) pair — so the target is evaluated once per
+                    derivative instead of over the whole window.
+
+                    Restricting the point set this way assumes a *pointwise* target,
+                    which is what the AD derivative paths require throughout (the
+                    2-D branches below evaluate one point at a time for the same
+                    reason).  Evaluating the full window and reading one entry back
+                    out would keep a non-local target honest, but costs a forward
+                    pass over all ``n_time * n_points`` entries for every one of the
+                    ``n_time * n_points`` derivatives — quadratic in the mesh.
+                    """
+                    local = {"__active_spatial_n__": 1}
+                    for k, v in ctx.context.items():
+                        if k == "__active_spatial_n__":
+                            continue
+                        if isinstance(v, dict) or not hasattr(v, "ndim"):
+                            local[k] = v
+                        elif v.ndim >= 3 and v.shape[0] == n_time and v.shape[1] == n_points:
+                            # a (T, N, ...) point set — take the single (t, p) entry
+                            local[k] = jax.lax.dynamic_slice(
+                                v,
+                                (t_idx, p_idx) + (0,) * (v.ndim - 2),
+                                (1, 1) + tuple(v.shape[2:]),
+                            )
+                        elif k != tag and v.ndim >= 1 and v.shape[0] == n_time:
+                            # a per-timestep entry (e.g. __time__ at (T, 1))
+                            local[k] = jax.lax.dynamic_slice(v, (t_idx,) + (0,) * (v.ndim - 1), (1,) + tuple(v.shape[1:]))
+                        else:
+                            local[k] = v
                     new_ctx = evaluator_self._EvalCtx(
-                        {**ctx.context, tag: updated_points},
+                        {**local, tag: p[jnp.newaxis, jnp.newaxis, :]},
                         ctx.var_bindings,
                         ctx.key,
                         active_region=ctx.active_region,
                     )
-                    value = evaluator_self._dispatch(target, new_ctx)
-                    return jnp.squeeze(value[t_idx, p_idx])
+                    return jnp.squeeze(evaluator_self._dispatch(target, new_ctx))
 
                 if compute_trace:
 

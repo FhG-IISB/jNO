@@ -30,6 +30,10 @@ from typing import NamedTuple, Tuple
 
 import numpy as np
 
+# (face_node, opposite_vertex) for each of the 2 facets of an interval. A facet of a `dim`-simplex has
+# `dim` vertices, so in 1D it is a single endpoint, and the "opposite vertex" is the other end.
+_LOCAL_FACES_INT: Tuple[Tuple[int, int], ...] = ((0, 1), (1, 0))
+
 # (face_node_a, face_node_b, opposite_vertex) for each of 3 triangle faces
 _LOCAL_FACES_TRI: Tuple[Tuple[int, int, int], ...] = ((0, 1, 2), (1, 2, 0), (2, 0, 1))
 
@@ -146,12 +150,14 @@ def boundary_face_set(cells: np.ndarray, cell_type: str = "triangle") -> np.ndar
 
 def _face_table(cell_type: str):
     """``(local_faces, n_face_nodes)`` for a simplex cell type, under either naming."""
+    if cell_type in ("interval", "line"):
+        return _LOCAL_FACES_INT, 1
     if cell_type in ("triangle", "tri"):
         return _LOCAL_FACES_TRI, 2
     if cell_type in ("tetrahedron", "tetra", "tet"):
         return _LOCAL_FACES_TET, 3
     raise NotImplementedError(
-        f"build_facet_connectivity: cell_type {cell_type!r} not supported (triangle / tetrahedron only)."
+        f"build_facet_connectivity: cell_type {cell_type!r} not supported (interval / triangle / tetrahedron only)."
     )
 
 
@@ -209,7 +215,10 @@ def compute_face_normals(
     """
     points = np.asarray(points, dtype=float)
     cells = np.asarray(cells)
-    if cell_type == "triangle":
+    if cell_type in ("interval", "line"):
+        local_faces = _LOCAL_FACES_INT
+        n_face_nodes, dim = 1, 1
+    elif cell_type == "triangle":
         local_faces = _LOCAL_FACES_TRI
         n_face_nodes, dim = 2, 2
     elif cell_type == "tetrahedron":
@@ -228,7 +237,10 @@ def compute_face_normals(
     verts = points[face_ids, :dim]  # (n_bfaces, n_face_nodes, dim)
     opp = points[np.take_along_axis(parent, entry[:, n_face_nodes : n_face_nodes + 1], axis=1)[:, 0], :dim]
 
-    if dim == 2:  # 2-D: edge → rotate tangent 90° clockwise
+    if dim == 1:  # 1-D: a facet is a point, so there is no tangent to rotate — the unit candidate is
+        # +1 and the shared away-from-the-apex flip below picks the outward sign
+        n = np.ones((conn.n_bfaces, 1), dtype=float)
+    elif dim == 2:  # 2-D: edge → rotate tangent 90° clockwise
         t = verts[:, 1] - verts[:, 0]
         n = np.stack([t[:, 1], -t[:, 0]], axis=1)
     else:  # 3-D: face → cross product of two edges

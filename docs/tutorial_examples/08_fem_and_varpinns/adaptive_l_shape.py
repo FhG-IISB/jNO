@@ -8,7 +8,7 @@ r"""Two ways to resolve the L-shape reentrant-corner singularity — **h-adaptiv
 ``u`` is harmonic, so all the discretization error is the ``r^(2/3)`` corner singularity, measured here by
 the **energy-norm error** ``E - E_ref`` with ``E = ½∫|∇u_h|²`` and ``E_ref`` from a fine mesh.
 
-* **h-adaptivity** — ``fem.solve(adapt=AdaptSpec(...))`` runs the whole classical loop internally
+* **h-adaptivity** — ``fem.solve(adapt=jno.solve.remesh(...=))`` runs the whole classical loop internally
   (``solve -> Zienkiewicz-Zhu estimate -> Dörfler mark -> local remesh``): it **adds** elements at the
   corner. The remesh is a discrete, non-differentiable outer loop.
 * **r-adaptivity** — make the interior vertex coordinates trainable (``x.trainable()``) and move them down
@@ -36,7 +36,6 @@ import jax.numpy as jnp  # noqa: E402
 
 import jno  # noqa: E402
 import jno.jnp_ops as J  # noqa: E402
-from jno.utils.solver.fem_adapt import AdaptSpec  # noqa: E402
 
 L_SHAPE = [(0, 0), (1.0, 0), (1.0, 0.5), (0.5, 0.5), (0.5, 1.0), (0, 1.0)]  # reentrant corner at (0.5, 0.5)
 MARGIN = 0.025  # keep the movable interior nodes off the boundary (incl. the two notch edges)
@@ -122,7 +121,7 @@ d_h, fem_h = build(0.12)
 n0 = len(d_h.mesh.points)
 pts0, tris0 = np.asarray(d_h.mesh.points)[:, :2], np.asarray(d_h.mesh.cells_dict["triangle"])
 E0 = float(dirichlet_energy(jnp.asarray(pts0), _solve(fem_h), jnp.asarray(tris0)))
-sol_h = np.asarray(fem_h.solve(adapt=AdaptSpec(theta=0.6, max_iters=4, refine_factor=1.7))).reshape(-1)
+sol_h = np.asarray(fem_h.solve(adapt=jno.solve.remesh(theta=0.6, max_iters=4, refine_factor=1.7))).reshape(-1)
 pts_h, tris_h = np.asarray(d_h.mesh.points)[:, :2], np.asarray(d_h.mesh.cells_dict["triangle"])
 E_h = float(dirichlet_energy(jnp.asarray(pts_h), jnp.asarray(sol_h), jnp.asarray(tris_h)))
 n_h = len(sol_h)
@@ -131,7 +130,7 @@ n_h = len(sol_h)
 #     vertices were tagged `.trainable()` in build(); the driver moves them (no new DOFs) and returns the solve.
 d_r, fem_r = build(0.12, movable=True)
 pts_r0 = np.asarray(d_r.mesh.points)[:, :2].copy()  # coarse start, for the animation
-sol_r = np.asarray(fem_r.solve(adapt=AdaptSpec(relocate=True, max_iters=60, lr=3e-3))).reshape(-1)
+sol_r = np.asarray(fem_r.solve(adapt=jno.solve.relocate(max_iters=60, lr=3e-3))).reshape(-1)
 pts_r, tris_r = np.asarray(d_r.mesh.points)[:, :2], np.asarray(d_r.mesh.cells_dict["triangle"])
 E_r = float(dirichlet_energy(jnp.asarray(pts_r), jnp.asarray(sol_r), jnp.asarray(tris_r)))
 

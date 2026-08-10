@@ -74,7 +74,6 @@ from .utils.config import (
     wandb_finish,
 )
 from .utils.load_save import load, save
-from .utils.solver.fem_adapt import AdaptSpec, MovingBoundary
 from .utils.solver.fem_route import dirichlet, neumann
 
 # Mirror the submodule on the package namespace and add a short alias.
@@ -126,8 +125,6 @@ __all__ = [
     "Rcwa",
     "RcwaError",
     "litho",
-    "AdaptSpec",
-    "MovingBoundary",
     "Coupling",
     "Model",
     "Variable",

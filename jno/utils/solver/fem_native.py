@@ -59,6 +59,7 @@ from .fem_lagrange import (
     identity_pushforward,
     identity_pushforward_hess,
     lagrange_interp_points,
+    lagrange_interval,
     lagrange_tet,
     lagrange_triangle,
 )
@@ -113,17 +114,53 @@ def _get_mesh(domain, dim: int, order: int):
     """
     # meshio names the simplex cell block "triangle" (2D) / "tetra" (3D) -- distinct from the basix
     # CellType name "tetrahedron" the facet machinery uses.
-    meshio_key = "triangle" if dim == 2 else "tetra"
+    meshio_key = {1: "line", 2: "triangle"}.get(dim, "tetra")
     pts_p1 = np.asarray(domain.mesh.points)[:, :dim]
     cells_p1 = np.asarray(domain.mesh.cells_dict[meshio_key], dtype=np.int64)
     if order == 1:
         return pts_p1, cells_p1, pts_p1, cells_p1
-    if dim not in (2, 3):
+    if dim not in (1, 2, 3):
         raise NotImplementedError(f"Dimension {dim} not supported by native assembler.")
     # P{order} node mesh: place the element's reference interpolation points (basix DOF order) on each
     # cell and dedup by coordinate. One code path for P2 and P3+ (the P2 midpoints are the k=2 case).
     pts_f, cells_f = _promote_to_degree(pts_p1, cells_p1, lagrange_interp_points(dim, order))
     return pts_p1, cells_p1, pts_f, cells_f
+
+
+def _lagrange_simplex(dim: int, degree: int, quad_degree: Any = None):
+    """The Lagrange ``ElementSpec`` for the ``dim``-simplex: interval / triangle / tetrahedron.
+
+    One dispatcher, because the assembler and the VPINN context builder both need it and a second
+    per-site conditional is how a dimension gets silently left out."""
+    builder = {1: lagrange_interval, 2: lagrange_triangle}.get(int(dim), lagrange_tet)
+    return builder(degree, quad_degree)
+
+
+def _real_dirichlet_values(gs: Any, region: str) -> np.ndarray:
+    """Essential values as float64, refusing a genuinely complex one instead of dropping its imaginary part.
+
+    A complex weak form assembles as two real legs sharing one Dirichlet row set, and these values feed
+    both. That is well posed for a **real** ``g``: the fused block imposes ``x_r - x_i = g`` and
+    ``x_r + x_i = g``, i.e. ``Re u = g`` with ``Im u = 0``. For a complex ``g`` it is not expressible —
+    pinning ``Im u = g_i`` needs the imaginary leg's Dirichlet rows zeroed rather than set to identity,
+    and the symmetric elimination's *column* lift is cross-leg (the real equation's known-column term is
+    ``A_r[:,j] g_r - A_i[:,j] g_i``, which no per-leg elimination can produce).
+
+    These call sites used to cast with ``float(...)`` / ``.astype(float)``, so ``Im(g)`` vanished behind
+    a numpy ``ComplexWarning`` and the solve returned a plausible, wrong field: measured 8.9e-1 relative
+    error on ``u = (1+2j)x`` over a unit square, with no error raised. Refuse instead.
+    """
+    arr = np.asarray(gs)
+    if np.iscomplexobj(arr) and np.any(np.abs(arr.imag) > 0.0):
+        raise NotImplementedError(
+            f"jno.fem: a COMPLEX essential value on region {region!r} is not supported — a complex form's "
+            "Re/Im legs share one Dirichlet row set, which can impose Re u = g with Im u = 0 but not a "
+            "prescribed Im u. Use a real essential value and carry the complex part in the operator or "
+            "the source."
+        )
+    # Returned UNCHANGED (not cast): each call site keeps its own conversion, so this guard adds a check
+    # and changes nothing else — a real value still takes exactly the path it always did.
+    return gs
 
 
 def _region_node_ids_from_pts(domain, region: str, pts_all: np.ndarray) -> List[int]:
@@ -225,6 +262,8 @@ def _facet_area_element(J, tangs):
     """Physical facet measure element from the reference tangents ``tangs`` (``dim-1, dim``) pushed
     forward by the cell Jacobian ``J`` (``dim, dim``): the edge length ``|J·t|`` in 2D, the face area
     ``|(J·t0) × (J·t1)|`` in 3D. Multiplying it by the reference-facet weights gives ``dS``."""
+    if tangs.shape[0] == 0:  # 1-D: a "facet" is a point, whose measure is 1 (dS = 1, not a length)
+        return jnp.asarray(1.0, dtype=J.dtype)
     T = tangs @ J.T  # (dim-1, dim) physical tangents
     return jnp.linalg.norm(T[0]) if T.shape[0] == 1 else jnp.linalg.norm(jnp.cross(T[0], T[1]))
 
@@ -270,7 +309,7 @@ def build_native_fem_context(domain, *, element_type, quad_degree, vec=1, neuman
     quad_degree = max(quad_degree, 2 * order)
 
     pts_p1, cells_p1, pts_f, cells_f = _get_mesh(domain, dim, order)
-    spec = lagrange_triangle(order, quad_degree)
+    spec = _lagrange_simplex(dim, order, quad_degree)
     ref_vals = jnp.asarray(spec.ref_values)  # (n_q, n_dof, 1)
     ref_grads = jnp.asarray(spec.ref_grads)  # (n_q, n_dof, 1, dim)
     qp = jnp.asarray(spec.quad_points)  # (n_q, dim)
@@ -330,7 +369,7 @@ def build_native_fem_context(domain, *, element_type, quad_degree, vec=1, neuman
     surface_quad_by_tag: dict = {}
     surface_normals_by_tag: dict = {}
     if neumann_tags:
-        cell_key = "triangle" if dim == 2 else "tetrahedron"
+        cell_key = {1: "interval", 2: "triangle"}.get(dim, "tetrahedron")
         conn = build_facet_connectivity(cells_p1, cell_key)
         normals_all = compute_face_normals(pts_p1, conn, cells_p1, cell_key) if conn.n_bfaces > 0 else np.zeros((0, dim))
         fp_phi, fp_dphi_ref, fp_qp, fp_tangs, gw_face = _build_face_tables(order, quad_degree, dim)
@@ -531,8 +570,7 @@ def assemble_fem_native(
     # Element specs and JAX constants
     # -------------------------------------------------------------------------
 
-    _lagrange_simplex = lagrange_tet if dim == 3 else lagrange_triangle
-    specs = [_lagrange_simplex(f["order"], quad_degree) for f in fields]
+    specs = [_lagrange_simplex(dim, f["order"], quad_degree) for f in fields]
     # All specs share the same simplex quadrature rule (basix is deterministic)
     qp_shared = jnp.asarray(specs[0].quad_points)  # (n_quad, dim)
     qw_shared = jnp.asarray(specs[0].quad_weights)  # (n_quad,)
@@ -1663,22 +1701,23 @@ def assemble_fem_native(
             # batch of points (the initial-condition path below passes the whole array).
             pts = np.asarray(pts_all)[nids] if nids else np.zeros((0, np.asarray(pts_all).shape[-1]))
             if _field_vals is not None:
-                gs = np.asarray(_field_vals)[nids].astype(float)
+                gs = _real_dirichlet_values(np.asarray(_field_vals)[nids], region).astype(float)
             elif value_node is not None:
                 raw = np.asarray(jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(pts))))
+                _real_dirichlet_values(raw, region)  # refuse a complex g before any cast drops Im(g)
                 # Does the result scale with the number of points? A CONSTANT profile returns the
                 # same thing for any batch -- including a constant VECTOR like (gx, gy), whose size
                 # can coincide with the node count -- so shape alone cannot tell. One extra
                 # single-point evaluation settles it and costs nothing.
                 one = np.asarray(jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(pts[:1]))))
                 if raw.shape == one.shape or len(nids) == 0:
-                    gs = np.full(len(nids), float(one.reshape(-1)[0]))  # constant over the region
+                    gs = np.full(len(nids), float(np.real(one).reshape(-1)[0]))  # constant over the region
                 else:
-                    gs = raw.reshape(len(nids), -1)[:, 0].astype(float)  # first component per node
+                    gs = np.real(raw).reshape(len(nids), -1)[:, 0].astype(float)  # first component per node
             elif callable(value):
-                gs = np.array([float(value(p)) for p in pts], dtype=float)
+                gs = np.array([float(_real_dirichlet_values(value(p), region)) for p in pts], dtype=float)
             else:
-                gs = np.full(len(nids), float(value))
+                gs = np.full(len(nids), float(_real_dirichlet_values(value, region)))
             comps_range = range(vt) if comp is None else [int(comp)]
             for nid, g in zip(nids, gs):
                 for c in comps_range:
@@ -1960,7 +1999,7 @@ def assemble_fem_native(
                     # A state-dependent mass carries no fixed matrix; the mass action is in mass_residual.
                     mass=None
                     if _nonlinear_mass
-                    else (_mass_cb if _parametric_mass else (lambda t, args=None, _M=M_bc: _M)),
+                    else (_mass_cb if (_parametric_mass or _coord_specs) else (lambda t, args=None, _M=M_bc: _M)),
                     mass_residual=mass_res_bc,
                     mass_residual_jac=mass_jac_bc,
                     residual=res_bc,
@@ -1978,7 +2017,12 @@ def assemble_fem_native(
         # CONSTANT g -- the held value sits in the affine bias. A net-valued Dirichlet u(∂Ω)-net(x) has an
         # args-dependent held value (differentiable in the weights): its whole held vector rides the
         # forcing each step instead (mirrors the g(x,t) path), so the constant bias drops to zero. ----
-        if runtime_parameter_tags or neural_param_names or _dir_net_models or _ic_net_models:
+        # ``_coord_specs`` belongs here for the same reason it does in the steady gate below: a trainable
+        # mesh coordinate makes the operator (and the mass) a function of ``args``. Without it a transient
+        # falls to the static branch, where A and M are built once with ``args=None`` and
+        # ``_apply_coord_params`` short-circuits -- so ``block.step(..., args={coord: X})`` silently ignores
+        # X and ``du/dX`` is exactly ZERO. That is a wrong gradient with no symptom, not a missing feature.
+        if runtime_parameter_tags or neural_param_names or _dir_net_models or _ic_net_models or _coord_specs:
             if _dir_net_models:
                 if getattr(domain, "_fem_native_dirichlet_tv", None):
                     raise NotImplementedError(
@@ -2020,7 +2064,10 @@ def assemble_fem_native(
             return (
                 SemidiscreteTimeBlock(
                     M=M_bc,
-                    mass_fn=_mass_cb if _parametric_mass else None,  # parametric mass (unknown density net(x)*u_t)
+                    # Parametric mass for an unknown density net(x)*u_t -- and for a trainable mesh
+                    # coordinate, because the mass is ∫φᵢφⱼ dx ∝ |K|: hold it static while the mesh moves
+                    # and the u̇ term keeps the volumes of the mesh you started from.
+                    mass_fn=_mass_cb if (_parametric_mass or _coord_specs) else None,
                     operator_fn=operator_fn,
                     affine_bias=c_bias,
                     forcing_vector_fn=forcing_vector_fn,

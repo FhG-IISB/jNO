@@ -166,3 +166,86 @@ def test_move_mesh_field_rides_along_no_transfer_needed():
     moved = move_mesh(d, 0.05 * x)
     assert np.asarray(moved.mesh.points).shape[0] == field.shape[0]  # same vertex count ⇒ field still aligned
     assert np.max(np.abs(np.asarray(moved.mesh.points)[:, :2] - 1.05 * x)) < 1e-12
+
+
+def test_p1_stiffness_matvec_matches_the_energy_gradient_oracle():
+    """``_p1_stiffness_jax`` is checked against a route that shares no code with it.
+
+    ``_dirichlet_energy_jax`` computes ``Σ|∇u|²·vol = uᵀKu`` from the element gradients directly, so
+    ``½·∂E/∂u`` is the same matvec by a completely different path (reverse-mode over the energy, rather
+    than an assembled element block). Also asserts the two structural properties a Laplacian must have:
+    symmetry, and a constant null space (rows sum to zero).
+    """
+    import jax
+    import jax.numpy as jnp
+
+    from jno.utils.solver.fem_adapt import _dirichlet_energy_jax, _mesh_cells, _p1_stiffness_jax
+
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain()
+    cells, dim = _mesh_cells(d)
+    pts = jnp.asarray(np.asarray(d.mesh.points)[:, :dim])
+    matvec, diag = _p1_stiffness_jax(pts, cells, dim)
+
+    u = jnp.asarray(np.random.default_rng(0).standard_normal(pts.shape[0]))
+    oracle = 0.5 * jax.grad(lambda uu: _dirichlet_energy_jax(pts, uu, cells, dim))(u)
+    assert float(jnp.abs(matvec(u) - oracle).max()) < 1e-12, "matvec disagrees with the energy-gradient oracle"
+
+    K = jnp.stack([matvec(jnp.eye(pts.shape[0])[i]) for i in range(pts.shape[0])])
+    assert jnp.allclose(K, K.T, atol=1e-12), "the stiffness must be symmetric"
+    assert float(jnp.abs(K.sum(axis=1)).max()) < 1e-12, "a constant field must be in the null space"
+    assert float(jnp.abs(jnp.diag(K) - diag).max()) < 1e-14, "the returned diagonal is not K's diagonal"
+
+
+def test_harmonic_extension_is_differentiable_in_the_prescribed_motion():
+    """The reason it is JAX at all: ``scipy.splu`` was a hard break in the gradient chain, so no gradient
+    could flow through a moving mesh. Checked against central differences, and asserted **non-zero** —
+    a vanishing gradient is the failure mode that a relative-error check alone would pass."""
+    import jax
+    import jax.numpy as jnp
+
+    from jno.utils.solver.fem_adapt import _harmonic_extension_jax, _mesh_cells
+
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain()
+    cells, dim = _mesh_cells(d)
+    pts = jnp.asarray(np.asarray(d.mesh.points)[:, :dim])
+    x = np.asarray(pts)
+    is_b = (x[:, 0] < 1e-9) | (x[:, 0] > 1 - 1e-9) | (x[:, 1] < 1e-9) | (x[:, 1] > 1 - 1e-9)
+    bmask = jnp.asarray(is_b)
+
+    def total(amp):
+        given = jnp.zeros_like(pts).at[:, 1].set(amp * bmask.astype(pts.dtype) * pts[:, 0])
+        return jnp.sum(_harmonic_extension_jax(pts, cells, dim, given, bmask) ** 2)
+
+    g = float(jax.grad(total)(0.3))
+    h = 1e-5
+    fd = (total(0.3 + h) - total(0.3 - h)) / (2 * h)
+    assert abs(g) > 1e-8, "gradient vanished — the extension is not carrying the prescribed motion"
+    assert g == pytest.approx(float(fd), rel=1e-5), f"AD {g:.6e} vs FD {float(fd):.6e}"
+
+
+def test_harmonic_extension_is_differentiable_in_the_vertex_positions():
+    """``d(displacement)/d(mesh)`` — needed for the initial-mesh gradient, and the reason the stiffness is
+    rebuilt from ``pts`` in JAX rather than assembled once on the host."""
+    import jax
+    import jax.numpy as jnp
+
+    from jno.utils.solver.fem_adapt import _harmonic_extension_jax, _mesh_cells
+
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain()
+    cells, dim = _mesh_cells(d)
+    x = np.asarray(d.mesh.points)[:, :dim]
+    is_b = (x[:, 0] < 1e-9) | (x[:, 0] > 1 - 1e-9) | (x[:, 1] < 1e-9) | (x[:, 1] > 1 - 1e-9)
+    bmask = jnp.asarray(is_b)
+    given = jnp.zeros((x.shape[0], dim)).at[:, 1].set(0.2 * bmask.astype(jnp.float64) * jnp.asarray(x[:, 0]))
+
+    def total(p):
+        return jnp.sum(_harmonic_extension_jax(p, cells, dim, given, bmask) ** 2)
+
+    i = int(np.where(~is_b)[0][0])  # an interior vertex
+    g = np.asarray(jax.grad(total)(jnp.asarray(x)))
+    h = 1e-6
+    up = jnp.asarray(x).at[i, 0].add(h)
+    dn = jnp.asarray(x).at[i, 0].add(-h)
+    fd = (total(up) - total(dn)) / (2 * h)
+    assert abs(g[i, 0]) > 1e-10, "no sensitivity to an interior vertex position"
+    assert g[i, 0] == pytest.approx(float(fd), rel=1e-4), f"AD {g[i, 0]:.6e} vs FD {float(fd):.6e}"

@@ -53,7 +53,8 @@ derivative, since a 0D facet has no element to differentiate over.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from functools import lru_cache
+from typing import Any, Dict, List, NamedTuple, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -94,15 +95,50 @@ def _line_shape(gp: jnp.ndarray, order: int = 1) -> Tuple[jnp.ndarray, jnp.ndarr
 
         N_0 = (1-xi)(1-2xi),  N_1 = xi(2xi-1),  N_2 = 4 xi (1-xi)
 
+    ``order >= 3`` is tabulated by **basix** on the reference interval, through the very builder the
+    2D/3D path uses (``_lagrange_basix``, equispaced variant) — so a P{k} line and a P{k} triangle
+    agree on what "degree k Lagrange" means, and there is no second hand-written basis to drift.
+    basix's interval DOF order is vertices-then-interior, which is exactly the layout above.
+
     Returns ``N`` and ``dN_dxi``, each ``(n_quad, order+1)``."""
     one = jnp.ones_like(gp)
     if int(order) == 1:
         return jnp.stack([1.0 - gp, gp], axis=-1), jnp.stack([-one, one], axis=-1)
-    if int(order) != 2:
-        raise NotImplementedError(f"jno.fem: 1D Lagrange elements are implemented for order 1 and 2; got {order}.")
-    N = jnp.stack([(1.0 - gp) * (1.0 - 2.0 * gp), gp * (2.0 * gp - 1.0), 4.0 * gp * (1.0 - gp)], axis=-1)
-    dN_dxi = jnp.stack([4.0 * gp - 3.0, 4.0 * gp - 1.0, 4.0 - 8.0 * gp], axis=-1)
-    return N, dN_dxi
+    if int(order) == 2:
+        N = jnp.stack([(1.0 - gp) * (1.0 - 2.0 * gp), gp * (2.0 * gp - 1.0), 4.0 * gp * (1.0 - gp)], axis=-1)
+        dN_dxi = jnp.stack([4.0 * gp - 3.0, 4.0 * gp - 1.0, 4.0 - 8.0 * gp], axis=-1)
+        return N, dN_dxi
+    if int(order) < 1:
+        raise NotImplementedError(f"jno.fem: a 1D Lagrange element needs order >= 1; got {order}.")
+    tab = _line_tabulate(tuple(np.asarray(gp).reshape(-1).tolist()), int(order))
+    return jnp.asarray(tab[0]), jnp.asarray(tab[1])
+
+
+@lru_cache(maxsize=32)
+def _line_tabulate(gp: Tuple[float, ...], order: int):
+    """``(N, dN_dxi)`` for a degree-``order`` Lagrange interval at the (hashable) quadrature points.
+
+    Cached because a single assembly re-enters ``_line_shape`` once per field and once per residual
+    builder with the same rule, and basix tabulation is a Python round trip."""
+    from basix import CellType
+
+    from .fem_lagrange import _lagrange_basix
+
+    pts = np.asarray(gp, dtype=float).reshape(-1, 1)
+    tab = np.asarray(_lagrange_basix(CellType.interval, int(order)).tabulate(1, pts))
+    return tab[0, :, :, 0], tab[1, :, :, 0]  # values, d/dxi -> each (n_quad, n_dof)
+
+
+def line_dof_nodes(order: int) -> np.ndarray:
+    """Reference dof coordinates of a degree-``order`` Lagrange interval, in the element's dof order
+    (the two endpoints, then the interior nodes). Used to place the global interior dofs."""
+    if int(order) <= 2:
+        return np.array([0.0, 1.0, 0.5])[: int(order) + 1]
+    from basix import CellType
+
+    from .fem_lagrange import _lagrange_basix
+
+    return np.asarray(_lagrange_basix(CellType.interval, int(order)).points).reshape(-1)
 
 
 # --------------------------------------------------------------------------
@@ -134,6 +170,65 @@ def _region_node_ids(domain: Any, region: str) -> List[int]:
     else:
         hits = np.concatenate([np.asarray(_eval(s, min(s + chunk, n))).reshape(-1) for s in range(0, n, chunk)])
     return list(np.where(hits)[0])
+
+
+def hermite_dirichlet_dofs(domain: Any, dirichlet_values: Dict[str, Any], rotation_bcs: Any) -> List[Tuple[int, float]]:
+    """``(global_dof, value)`` pairs for a 1D Hermite (beam) space.
+
+    Each vertex carries two dofs, ``2*nid`` (the deflection ``w``) and ``2*nid + 1`` (the slope
+    ``dw/dx``), so the two classical beam supports are two *different* conditions on the same node:
+
+    * ``u(region) - g``      pins the deflection only  -> **simply supported** (a pinned end)
+    * plus ``u.dn(region) - s`` pins the slope too     -> **clamped** (an encastré end)
+    * neither                                          -> **free**
+    * slope only                                       -> **guided** (sliding)
+
+    The slope condition arrives through the same ``u.dn`` essential-rotation channel the 2D C¹ plate
+    families use, so a beam and a plate are clamped by the same notation. In 1D the outward normal at
+    an endpoint is ``-1`` at the left and ``+1`` at the right, so a prescribed ``du/dn`` is signed;
+    ``s = 0`` (the overwhelmingly common case) is unaffected."""
+    from ..._fem import _eval_value_node_at
+
+    pts = np.asarray(domain.mesh.points)
+    xs = pts[:, 0]
+    pairs: List[Tuple[int, float]] = []
+    for region, value in dirichlet_values.items():
+        for nid in _region_node_ids(domain, region):
+            g = float(value(pts[nid])) if callable(value) else float(value)
+            pairs.append((2 * int(nid), g))
+    x_lo, x_hi = float(np.min(xs)), float(np.max(xs))
+    for _field_key, region, value_node in rotation_bcs or []:
+        for nid in _region_node_ids(domain, region):
+            raw = _eval_value_node_at(value_node, np.asarray(pts[nid]).reshape(1, -1))
+            s = float(np.asarray(raw).reshape(-1)[0])
+            # du/dn -> du/dx: the outward normal is -1 at the left end, +1 at the right
+            x = float(xs[nid])
+            n_out = -1.0 if abs(x - x_lo) <= abs(x - x_hi) else 1.0
+            pairs.append((2 * int(nid) + 1, n_out * s))
+    return pairs
+
+
+def complex_dirichlet_regions(domain: Any, dirichlet_values: Dict[str, Any]) -> List[str]:
+    """Regions whose essential value has a non-zero imaginary part.
+
+    A complex form assembles as two real legs that share one Dirichlet row set. That is correct for a
+    **real** ``g``: the fused block imposes ``x_r - x_i = g`` and ``x_r + x_i = g``, i.e. ``Re u = g``,
+    ``Im u = 0``. It is *not* expressible for a complex ``g`` — pinning ``Im u = g_i`` needs the
+    imaginary leg's Dirichlet rows zeroed rather than set to identity, which the shared elimination
+    cannot do. Callers use this to refuse such a value instead of imposing a silently wrong one.
+    """
+    pts = np.asarray(domain.mesh.points)
+    out: List[str] = []
+    for region, value in dirichlet_values.items():
+        nids = _region_node_ids(domain, region)
+        p = pts[nids[0]] if nids else pts[0]
+        vals = value.values() if isinstance(value, dict) else [value]
+        for v in vals:
+            raw = v(p) if callable(v) else v
+            if abs(complex(np.asarray(raw).reshape(-1)[0]).imag) > 0.0:
+                out.append(region)
+                break
+    return out
 
 
 def _dirichlet_dofs(domain: Any, dirichlet_values: Dict[str, Any], vec: int) -> List[Tuple[int, float]]:
@@ -192,18 +287,186 @@ def _param_context(volume_terms, boundary_terms):
     return tags, fields, slots, neural_operator_exprs(exprs, slots)
 
 
-def dof_layout_1d(domain: Any, order: int):
-    """``(n_dof_nodes, dof_coords)`` for a 1D Lagrange space of ``order``.
+def dof_layout_1d(domain: Any, order: int, space: str = "Lagrange"):
+    """``(n_dof_nodes, dof_coords)`` for a 1D space.
 
-    P1 dofs are the mesh vertices. P2 adds one dof per element **midpoint**, laid out after all
-    vertices, so a vertex dof keeps its mesh-node index. ``dof_coords`` is what ``fem.points`` must
-    report — the solution vector lives on these, not on the linear mesh the domain keeps."""
+    ``space="Hermite"`` carries two dofs per vertex, ``(w, dw/dx)``, so its dof coordinates are the
+    vertex coordinates *repeated* — both dofs of a node live at that node, and ``fem.points`` must
+    line up entry-for-entry with the solution vector.
+
+    P1 dofs are the mesh vertices. A degree-``k`` space adds ``k-1`` **interior** dofs per element,
+    laid out after all vertices and element-major, so a vertex dof keeps its mesh-node index — which
+    is what lets the boundary/Dirichlet node lookup stay order-agnostic (a 1D boundary is an endpoint,
+    hence always a vertex). ``dof_coords`` is what ``fem.points`` must report: the solution vector
+    lives on these, not on the linear mesh the domain keeps."""
     verts = np.asarray(domain.mesh.points)[:, 0]
-    if int(order) == 1:
+    if space == "Hermite":
+        return 2 * int(verts.shape[0]), np.repeat(verts, 2).reshape(-1, 1)
+    k = int(order)
+    if k == 1:
         return int(verts.shape[0]), verts.reshape(-1, 1)
     cells = np.asarray(domain.mesh.cells_dict["line"])
-    mids = 0.5 * (verts[cells[:, 0]] + verts[cells[:, 1]])
-    return int(verts.shape[0] + cells.shape[0]), np.concatenate([verts, mids]).reshape(-1, 1)
+    x0, x1 = verts[cells[:, 0]], verts[cells[:, 1]]
+    # interior reference nodes in the element's own dof order, mapped through each element's geometry
+    xi_int = line_dof_nodes(k)[2:]  # (k-1,)
+    inner = (x0[:, None] + (x1 - x0)[:, None] * xi_int[None, :]).reshape(-1)  # element-major
+    return int(verts.shape[0] + inner.shape[0]), np.concatenate([verts, inner]).reshape(-1, 1)
+
+
+def _elem_dof_nodes_1d_np(domain: Any, order: int) -> np.ndarray:
+    """Host copy of the element -> dof-node map, for the records the cross-remesh transfer reads."""
+    cells = np.asarray(domain.mesh.cells_dict["line"], dtype=np.int64)
+    k = int(order)
+    if k == 1:
+        return cells
+    n_vert = int(np.asarray(domain.mesh.points).shape[0])
+    n_elem = int(cells.shape[0])
+    inner = n_vert + np.arange(n_elem * (k - 1), dtype=np.int64).reshape(n_elem, k - 1)
+    return np.concatenate([cells, inner], axis=1)
+
+
+def _publish_field_records_1d(domain: Any, dof_coords, orders, cells_all) -> None:
+    """Publish the per-field ``_fem_native_*`` records the adaptive transient transfer consumes.
+
+    Same three records the 2D/3D native assembler writes (``_fem_native_dof_points_all`` /
+    ``_field_orders`` / ``_assembly_cells_all``). They are what ``fem_adapt._field_layout`` reads to
+    drive the basis-aware cross-remesh transfer, so publishing them here is the whole of what a 1D
+    transient needed to ride the adaptive remesher."""
+    domain._fem_native_dof_points_all = [np.asarray(p) for p in dof_coords]
+    domain._fem_native_field_orders = [int(o) for o in orders]
+    domain._fem_native_assembly_cells_all = [np.asarray(c) for c in cells_all]
+
+
+def _elem_dof_nodes_1d(cells: jnp.ndarray, n_vert: int, order: int) -> jnp.ndarray:
+    """Element -> global dof-node map for a degree-``k`` line: the two vertices, then this element's
+    ``k-1`` interior dofs, which live at ``n_vert + e*(k-1) + j`` (the element-major block
+    :func:`dof_layout_1d` lays out)."""
+    k = int(order)
+    if k == 1:
+        return cells
+    n_elem = int(cells.shape[0])
+    inner = n_vert + jnp.arange(n_elem * (k - 1), dtype=jnp.int32).reshape(n_elem, k - 1)
+    return jnp.concatenate([cells, inner], axis=1)
+
+
+def _pack_param_values(node_ids, args, dtype, tags, field_names, width_default: int = 1):
+    """This element's runtime-parameter values, in ``tags`` order — ``local["volume_vars"]``.
+
+    The evaluator reads them out of ``volume_vars`` at ``[temporal..., runtime_param...]``: a length-1
+    entry is a **scalar** coefficient (broadcast to the quad points), a length-``n_local`` entry is a
+    nodal **field** coefficient which it interpolates with this element's own ``shape_vals``. A tag the
+    current assembly does not supply gets a zero placeholder of the right width — it is only ever read
+    back when the term actually contains that node, in which case ``args`` carries it.
+
+    Shared by the single-field and coupled 1D residual builders: the packing rule is a property of the
+    *parameter*, not of the field layout, so it must not be duplicated per builder.
+    """
+    a = args or {}
+    out = []
+    for name in tags:
+        is_field = name in field_names
+        if name not in a:
+            out.append(jnp.zeros((node_ids.shape[0] if is_field else width_default,), dtype))
+            continue
+        flat = jnp.reshape(jnp.asarray(a[name], dtype=dtype), (-1,))
+        out.append(flat[node_ids] if is_field else flat[:1])
+    return tuple(out)
+
+
+def _neural_local_table(neural_slots, args):
+    """``local['neural_coefficients']`` for this call: the ``{name: module}`` table the evaluator
+    re-evaluates each network from at the quad points. Unlike a scalar/field parameter a network never
+    enters ``volume_vars`` (a weight pytree is cell-independent) — trainable weights arrive through
+    ``args``, a frozen net falls back to its stored module."""
+    if neural_slots is None:
+        return None
+    from .parametric_helpers import neural_local_table
+
+    return neural_local_table(neural_slots, args)
+
+
+class _LineElement(NamedTuple):
+    """What the 1D residual builder needs to know about an element family.
+
+    ``elem_nodes`` maps each element to its global dof-node ids; ``n_dof_nodes`` sizes the space;
+    ``shape_at(h)`` returns ``(N, dN_dx, d2N_dx2)`` for an element of length ``h``, each
+    ``(n_quad, nen)``, with ``d2N_dx2`` ``None`` for a family that tabulates no second derivative.
+
+    Lagrange and Hermite differ only in these three things, so they share one scatter and one element
+    Jacobian rather than each carrying its own copy — the drift this codebase keeps rediscovering.
+    ``shape_at`` takes ``h`` because a Hermite slope DOF is *physical* (``dw/dx``), so its basis
+    function carries the element length; for Lagrange only the gradient scales.
+    """
+
+    elem_nodes: Any
+    n_dof_nodes: int
+    shape_at: Any
+
+
+def _lagrange_element_1d(cells, n_vert: int, n_elem: int, gp, order: int) -> _LineElement:
+    """The degree-``order`` Lagrange line element (P1, P2, P3, ...)."""
+    N, dN_dxi = _line_shape(gp, order)
+    return _LineElement(
+        elem_nodes=_elem_dof_nodes_1d(cells, n_vert, order),
+        n_dof_nodes=n_vert + n_elem * (order - 1),
+        shape_at=lambda h: (N, dN_dxi / h, None),
+    )
+
+
+def _hermite_element_1d(cells, n_vert: int, gp) -> _LineElement:
+    r"""The C¹ cubic **Hermite** line element — the classical Euler-Bernoulli beam element.
+
+    Two DOFs per vertex, ``(w, dw/dx)``, laid out node-major as ``dof = 2*node + {0: value,
+    1: slope}``. Sharing the slope DOF between neighbouring elements is what makes the space C¹, so a
+    fourth-order operator (``EI w'''' = q``) has a well-defined ``\int w'' v''`` weak form on it —
+    the 1D counterpart of Argyris/Morley on triangles.
+
+    Shape functions on ``xi in [0,1]`` with ``x = x0 + h*xi`` (Hermite 1877; standard beam element,
+    e.g. Hughes, *The Finite Element Method*, §1.16)::
+
+        N1 = 1 - 3xi^2 + 2xi^3        N2 = h (xi - 2xi^2 + xi^3)
+        N3 = 3xi^2 - 2xi^3            N4 = h (xi^3 - xi^2)
+
+    ``N2``/``N4`` carry ``h`` because their DOF is the physical slope, not ``dw/dxi``.
+    """
+    xi = gp
+    one = jnp.ones_like(xi)
+
+    def shape_at(h):
+        N = jnp.stack(
+            [
+                1.0 - 3.0 * xi**2 + 2.0 * xi**3,
+                h * (xi - 2.0 * xi**2 + xi**3),
+                3.0 * xi**2 - 2.0 * xi**3,
+                h * (xi**3 - xi**2),
+            ],
+            axis=-1,
+        )
+        dN = jnp.stack(  # d/dx = (1/h) d/dxi
+            [
+                (-6.0 * xi + 6.0 * xi**2) / h,
+                one - 4.0 * xi + 3.0 * xi**2,
+                (6.0 * xi - 6.0 * xi**2) / h,
+                3.0 * xi**2 - 2.0 * xi,
+            ],
+            axis=-1,
+        )
+        d2N = jnp.stack(  # d2/dx2 = (1/h^2) d2/dxi2
+            [
+                (-6.0 + 12.0 * xi) / h**2,
+                (-4.0 + 6.0 * xi) / h,
+                (6.0 - 12.0 * xi) / h**2,
+                (6.0 * xi - 2.0) / h,
+            ],
+            axis=-1,
+        )
+        return N, dN, d2N
+
+    # element -> its 4 global dofs: [w0, theta0, w1, theta1]
+    elem_nodes = jnp.stack([2 * cells[:, 0], 2 * cells[:, 0] + 1, 2 * cells[:, 1], 2 * cells[:, 1] + 1], axis=1).astype(
+        jnp.int32
+    )
+    return _LineElement(elem_nodes=elem_nodes, n_dof_nodes=2 * n_vert, shape_at=shape_at)
 
 
 def _make_residual(
@@ -215,6 +478,7 @@ def _make_residual(
     vec: int,
     quad_degree: int,
     order: int = 1,
+    space: str = "Lagrange",
     runtime_parameter_tags: Tuple[str, ...] = (),
     field_param_names: Any = frozenset(),
     neural_slots: Any = None,
@@ -225,31 +489,31 @@ def _make_residual(
     by the caller (symmetric elimination for the linear ``(A, b)``, row-replacement
     for the nonlinear residual).
 
-    ``order`` selects LINE2 (P1) or LINE3 (P2). ``n_nodes`` is the caller's *vertex* count; the
-    residual is sized by the element's dof count, which for P2 adds one midpoint dof per element
-    (see :func:`n_dofs_1d`)."""
+    ``order`` selects the Lagrange degree; ``space="Hermite"`` selects the C¹ cubic beam element
+    instead. ``n_nodes`` is the caller's *vertex* count; the residual is sized by the element's own
+    dof count (see :class:`_LineElement`)."""
     verts = jnp.asarray(domain.mesh.points)[:, 0]
     cells = jnp.asarray(domain.mesh.cells_dict["line"], dtype=jnp.int32)  # (n_elem, 2) — the GEOMETRY
     n_vert, n_elem = int(verts.shape[0]), int(cells.shape[0])
     order = int(order)
     gp, gw = _line_quadrature(quad_degree)
-    N, dN_dxi = _line_shape(gp, order)
     N_geom, _ = _line_shape(gp, 1)  # geometry stays LINE2: a straight element with a centred
     # midpoint has a constant Jacobian h, so the linear map is EXACT — subparametric, not an
     # approximation, and it keeps `h` a scalar per element.
     ctx = getattr(domain, "context", {}) or {}
     comp_offsets = jnp.arange(vec)
 
-    # P2 adds one dof per element midpoint. Layout: ALL vertices, then all midpoints — so a vertex
-    # dof keeps its mesh-node index and the boundary/Dirichlet node lookup needs no P2 awareness
-    # (a 1D boundary is an endpoint, hence always a vertex).
-    if order == 2:
-        elem_nodes = jnp.concatenate([cells, (n_vert + jnp.arange(n_elem, dtype=jnp.int32))[:, None]], axis=1)
-        n_nodes_dof = n_vert + n_elem
-    else:
-        elem_nodes = cells
-        n_nodes_dof = n_vert
-    n_nodes = n_nodes_dof  # the residual is sized by DOF nodes, not mesh vertices
+    # A degree-k Lagrange space adds k-1 interior dofs per element (layout: ALL vertices, then the
+    # interior dofs element-major, so a vertex dof keeps its mesh-node index and the
+    # boundary/Dirichlet node lookup needs no order awareness — a 1D boundary is an endpoint, hence
+    # always a vertex). Hermite instead carries two dofs per vertex.
+    element = (
+        _hermite_element_1d(cells, n_vert, gp)
+        if space == "Hermite"
+        else _lagrange_element_1d(cells, n_vert, n_elem, gp, order)
+    )
+    elem_nodes = element.elem_nodes
+    n_nodes = element.n_dof_nodes  # the residual is sized by DOF nodes, not mesh vertices
 
     # element-local -> global DOF map, node-major: dof = node*vec + comp
     cell_dofs = (elem_nodes[:, :, None] * vec + comp_offsets[None, None, :]).reshape(n_elem, -1)  # (n_elem, nen*vec)
@@ -263,51 +527,27 @@ def _make_residual(
                 boundary_apps.append((term, int(nid)))
 
     def _pack_params(node_ids, args, dtype, width_default=1):
-        """This element's runtime-parameter values, in ``runtime_parameter_tags`` order.
-
-        The evaluator reads them out of ``volume_vars`` at ``[temporal..., runtime_param...]``: a length-1
-        entry is a **scalar** coefficient (broadcast to the quad points), a length-``n_local`` entry is a
-        nodal **field** coefficient which it interpolates with this element's own ``shape_vals``. A tag the
-        current assembly does not supply gets a zero placeholder of the right width — it is only ever read
-        back when the term actually contains that node, in which case ``args`` carries it."""
-        a = args or {}
-        out = []
-        for name in runtime_parameter_tags:
-            is_field = name in field_param_names
-            if name not in a:
-                out.append(jnp.zeros((node_ids.shape[0] if is_field else width_default,), dtype))
-                continue
-            flat = jnp.reshape(jnp.asarray(a[name], dtype=dtype), (-1,))
-            out.append(flat[node_ids] if is_field else flat[:1])
-        return tuple(out)
+        return _pack_param_values(node_ids, args, dtype, runtime_parameter_tags, field_param_names, width_default)
 
     def _neural_table(args):
-        """``local['neural_coefficients']`` for this call: the ``{name: module}`` table the evaluator
-        re-evaluates each network from at the quad points. Unlike a scalar/field parameter a network
-        never enters ``volume_vars`` (a weight pytree is cell-independent) — trainable weights arrive
-        through ``args``, a frozen net falls back to its stored module."""
-        if neural_slots is None:
-            return None
-        from .parametric_helpers import neural_local_table
+        return _neural_local_table(neural_slots, args)
 
-        return neural_local_table(neural_slots, args)
-
-    def _volume_local(cell, u_local, expr, pvals=(), ntable=None):
+    def _volume_local(geom_cell, u_local, expr, pvals=(), ntable=None):
         """Element residual ``(2*vec,)`` from the element's OWN dofs ``u_local`` ``(2, vec)``.
 
         Taking the local dofs rather than indexing a global vector is what makes the element
         Jacobian available: differentiating this w.r.t. ``u_local`` gives the ``(2*vec, 2*vec)``
         element matrix directly, so the global operator can be scattered sparsely instead of
         recovered by an ``O(N²)`` ``jacfwd`` of the global residual (see :func:`_sparse_jacobian`)."""
-        xc = verts[cell[:2]]  # (2,) — the element's endpoints carry the geometry
+        xc = verts[geom_cell]  # (2,) — the element's endpoints carry the geometry
         h = xc[1] - xc[0]
         phys = (N_geom @ xc)[:, None]  # (n_quad, 1)
-        shape_grads = (dN_dxi / h)[:, :, None]  # (n_quad, nen, 1)
+        N, dN_dx, d2N_dx2 = element.shape_at(h)
         local = {
             "physical_quad_points": phys,
             "shape_vals": N,
-            "shape_grads": shape_grads,
-            "cell_sol": u_local,  # (2, vec)
+            "shape_grads": dN_dx[:, :, None],  # (n_quad, nen, 1)
+            "cell_sol": u_local,  # (nen, vec)
             "tag": "fem_gauss",
             "surface": False,
             "domain_context": ctx,
@@ -318,6 +558,10 @@ def _make_residual(
             "volume_vars": pvals,
             "neural_coefficients": ntable,
         }
+        if d2N_dx2 is not None:
+            # (n_quad, nen, dim, dim) with dim=1 — what the evaluator's Hessian branch reads, so a
+            # fourth-order form (a beam) has second derivatives of BOTH the trial and the test.
+            local["shape_hess"] = d2N_dx2[:, :, None, None]
         return _integrate_term(domain, expr, local, gw * h)  # (nen*vec,)
 
     def residual(u_flat, args=None):
@@ -325,11 +569,14 @@ def _make_residual(
         _nt = _neural_table(args)
         R = jnp.zeros(n_nodes * vec, dtype=u_flat.dtype)
 
-        # --- volume terms: vmap over elements, then scatter ---
+        # --- volume terms: vmap over the element INDEX (not the dof-node row) — a Hermite element's
+        #     dof ids are not vertex ids, so the geometry must be gathered from `cells` separately ---
         for expr in volume_terms:
-            elem_res = jax.vmap(lambda c, e=expr: _volume_local(c, u[c], e, _pack_params(c, args, u_flat.dtype), _nt))(
-                elem_nodes
-            )  # (n_elem, nen*vec)
+            elem_res = jax.vmap(
+                lambda el, e=expr: _volume_local(
+                    cells[el], u[elem_nodes[el]], e, _pack_params(cells[el], args, u_flat.dtype), _nt
+                )
+            )(jnp.arange(n_elem, dtype=jnp.int32))  # (n_elem, nen*vec)
             R = R.at[cell_dofs.reshape(-1)].add(elem_res.reshape(-1))
 
         # --- boundary terms: degenerate one-node "element" (shape val 1, weight 1) ---
@@ -376,12 +623,12 @@ def _make_residual(
         idx, dat = [], []
 
         for expr in volume_terms:
-            # (n_elem, 2*vec, 2, vec) -> (n_elem, 2*vec, 2*vec): the element matrices
+            # (n_elem, nen*vec, nen, vec) -> (n_elem, nen*vec, nen*vec): the element matrices
             Ke = jax.vmap(
-                lambda c, e=expr: jax.jacfwd(lambda ul: _volume_local(c, ul, e, _pack_params(c, args, u_flat.dtype), _nt))(
-                    u[c]
-                )
-            )(elem_nodes)
+                lambda el, e=expr: jax.jacfwd(
+                    lambda ul: _volume_local(cells[el], ul, e, _pack_params(cells[el], args, u_flat.dtype), _nt)
+                )(u[elem_nodes[el]])
+            )(jnp.arange(n_elem, dtype=jnp.int32))
             nen = elem_nodes.shape[1]
             Ke = Ke.reshape(n_elem, nen * vec, nen * vec)
             rows = jnp.broadcast_to(cell_dofs[:, :, None], Ke.shape)
@@ -469,8 +716,14 @@ def assemble_fem_1d(
     vec: int,
     quad_degree: int,
     order: int = 1,
+    space: str = "Lagrange",
+    rotation_bcs: Any = None,
 ) -> Tuple[Any, str]:
     """Assemble a 1D (``LINE2``) weak form into ``(op, mode)`` for :class:`FEM`.
+
+    ``space="Hermite"`` selects the C1 cubic beam element (two dofs per vertex, ``(w, dw/dx)``)
+    instead of Lagrange; ``rotation_bcs`` then carries the essential ``u.dn(region) - s`` slope
+    conditions that clamp an end.
 
     ``mode`` is ``"linear"`` (``op = (A, b)``), ``"nonlinear"`` (``op`` a
     :class:`FemResidualOperator`), or ``"transient"`` (``op`` a ``SemidiscreteTimeBlock``).
@@ -478,8 +731,7 @@ def assemble_fem_1d(
     from ...trace import FemLinearSystem, FemResidualOperator
     from .weak_form import _contains_temporal_derivative, _is_obviously_nonlinear_in_unknown
 
-    if int(vec) != 1:
-        raise NotImplementedError(f"jno.fem: 1D (LINE2) assembly supports a scalar unknown (vec=1) only; got vec={vec}.")
+    vec = int(vec)
 
     # ---- runtime parameters: the differentiable-inverse path. A `jno.np.parameter` in the form makes
     # the system PARAMETRIC -- the operator and load are re-formed from the runtime args on every call
@@ -504,9 +756,16 @@ def assemble_fem_1d(
     # P2 adds a midpoint dof per element, so the dof count is NOT the vertex count. Publishing the
     # dof coordinates is what makes `fem.points` line up with the solution vector (the same
     # contract the 2D/3D P2 path already has).
-    n_nodes, dof_coords = dof_layout_1d(domain, order)
+    n_nodes, dof_coords = dof_layout_1d(domain, order, space=space)
     ndof = n_nodes * vec
     domain._fem_native_dof_points = dof_coords
+    if space == "Lagrange":
+        # The per-field records the basis-aware cross-remesh transfer reads (dof coords, element order,
+        # P{k} connectivity aligned with the P1 base mesh). Publishing them is what lets a 1D transient
+        # ride the adaptive remesher, which otherwise refuses for want of a "native nodal-Lagrange
+        # assembly". Deliberately NOT published for Hermite: its dofs are (value, slope) pairs, which
+        # the Lagrange-tabulating transfer cannot interpolate — better absent, so it fails loud.
+        _publish_field_records_1d(domain, [dof_coords], [order], [_elem_dof_nodes_1d_np(domain, order)])
     all_terms = list(volume_terms) + [t for ts in boundary_terms.values() for t in ts]
 
     if any(_contains_temporal_derivative(t) for t in all_terms):
@@ -524,7 +783,11 @@ def assemble_fem_1d(
     if ic_residuals:
         raise ValueError("jno.fem: an initial condition was given but the 1D weak form has no time derivative.")
 
-    dirichlet_pairs = _dirichlet_dofs(domain, dirichlet_values, vec)
+    dirichlet_pairs = (
+        hermite_dirichlet_dofs(domain, dirichlet_values, rotation_bcs)
+        if space == "Hermite"
+        else _dirichlet_dofs(domain, dirichlet_values, vec)
+    )
     residual_free = _make_residual(
         domain,
         volume_terms,
@@ -533,6 +796,7 @@ def assemble_fem_1d(
         vec=vec,
         quad_degree=quad_degree,
         order=order,
+        space=space,
         runtime_parameter_tags=runtime_parameter_tags,
         field_param_names=field_param_names,
         neural_slots=_neural,
@@ -585,6 +849,25 @@ def assemble_fem_1d(
     )
 
 
+def _stack_initial_conditions_1d(domain, ic_residuals, pts, ndof: int, vec: int):
+    """Combine every initial-condition residual into one ``(ndof,)`` initial state.
+
+    A vector field is usually given one IC *per component* (``u(initial)[i] - g_i``), and each renders
+    as a full-length vector that is zero outside its own stripe. Taking only ``ic_residuals[0]`` — as
+    this path used to — silently left every other component at zero; overwriting with each in turn
+    would blank the earlier ones. Each IC writes only the dofs it addresses, so per-component and
+    all-component forms combine, and a later all-component IC still overrides."""
+    from ..._fem import _bare, _ic_component, _ic_value_at_nodes
+
+    state0 = jnp.zeros(ndof)
+    for ic in ic_residuals:
+        bare = _bare(ic)
+        val = jnp.asarray(_ic_value_at_nodes(bare, domain, pts, ndof, vec), state0.dtype)
+        comp = _ic_component(bare)
+        state0 = state0.at[comp::vec].set(val[comp::vec]) if comp is not None else val
+    return state0
+
+
 def _apply_dirichlet_transient(M, A, c, dirichlet_pairs: List[Tuple[int, float]]):
     """Apply Dirichlet to a semidiscrete linear block ``M u̇ + A u = c``.
 
@@ -608,7 +891,7 @@ def _assemble_1d_transient(
     ``_strip_temporal_trial_derivative``); the spatial part + boundary terms become
     the operator. Linear -> ``M``/``A`` payload; nonlinear -> ``mass``/``residual``/
     ``jacobian`` callables."""
-    from ..._fem import _bare, _ic_value_at_nodes
+    from ..._fem import _bare
     from .backend_blocks import SemidiscreteTimeBlock
     from .solver_helper import max_temporal_derivative_order as _mto
     from .time_route import _infer_time_window, _strip_temporal_trial_derivative
@@ -700,15 +983,12 @@ def _assemble_1d_transient(
             aug_d = jnp.concatenate([dd, dd + n])  # the constrained rows in BOTH blocks
             M_aug = bcoo_zero_rows(M_aug, aug_d)  # mass rows are algebraic -> zeroed
         # the initial state lives on the DOF nodes, which for P2 include the element midpoints
+        # displacement IC u(0)=u0 and optional velocity IC u̇(0)=v0, each split by temporal order and
+        # then combined per addressed component (a vector field carries one IC per component)
         pts = jnp.asarray(dof_coords)
-        u0 = jnp.zeros((n,), z.dtype)
-        v0 = jnp.zeros((n,), z.dtype)
-        for ic in ic_residuals:  # displacement IC u(0)=u0 + optional velocity IC u̇(0)=v0
-            val = jnp.asarray(_ic_value_at_nodes(_bare(ic), domain, pts, ndof, vec), z.dtype)
-            if _mto(_bare(ic)) >= 1:
-                v0 = val
-            else:
-                u0 = val
+        u0 = _stack_initial_conditions_1d(domain, [ic for ic in ic_residuals if _mto(_bare(ic)) < 1], pts, ndof, vec)
+        v0 = _stack_initial_conditions_1d(domain, [ic for ic in ic_residuals if _mto(_bare(ic)) >= 1], pts, ndof, vec)
+        u0, v0 = jnp.asarray(u0, z.dtype), jnp.asarray(v0, z.dtype)
         if dpairs:
             u0, v0 = u0.at[dd].set(dg), v0.at[dd].set(0.0)
         t0, t1, dt = _infer_time_window(domain)
@@ -765,12 +1045,8 @@ def _assemble_1d_transient(
     mass_terms = [_strip_temporal_trial_derivative(t) for t in temporal_terms]
 
     dirichlet_pairs = _dirichlet_dofs(domain, dirichlet_values, vec)
-    if ic_residuals:
-        # the initial state lives on the DOF nodes, which for P2 include the element midpoints
-        pts = jnp.asarray(dof_coords)
-        state0 = _ic_value_at_nodes(_bare(ic_residuals[0]), domain, pts, ndof, vec)
-    else:
-        state0 = jnp.zeros(ndof)
+    # the initial state lives on the DOF nodes, which for P2 include the element midpoints
+    state0 = _stack_initial_conditions_1d(domain, ic_residuals, jnp.asarray(dof_coords), ndof, vec)
     t0, t1, dt = _infer_time_window(domain)
 
     # The MASS must be parameter-free. It is assembled once, outside the per-args re-forming, so a
@@ -868,30 +1144,50 @@ def _assemble_1d_transient(
 # coupled / mixed multi-field 1D (block native assembly)
 # ==========================================================================
 # The 1D analogue of the 2D/3D block path: hand-build the block residual for
-# LINE2 elements. Each field is a scalar/vector unknown on the
-# shared LINE2 mesh; the global DOF vector is laid out by field block —
-# ``offset[i] = sum_{j<i} n_nodes * vec_j`` — so the user slices the solution
-# exactly as in 2D/3D coupled.
+# LINE2 elements. Each field is a scalar/vector unknown on the shared LINE2
+# *geometry*, but carries its OWN Lagrange order, so the global DOF vector is laid out by field
+# block — ``offset[i] = sum_{j<i} n_dof_j * vec_j`` — and the user slices the solution exactly as
+# in 2D/3D coupled. A mixed-order pair (P2 for one field, P1 for another) is the 1D Taylor-Hood
+# shape, so the layout must not assume one shared node count.
 
 
-def _block_offsets(fields: List[Any], n_nodes: int) -> List[int]:
+def _field_dof_counts_1d(fields: List[Any], n_vert: int, n_elem: int) -> List[int]:
+    """DOF-node count per field: P1 dofs are the mesh vertices, degree k adds k-1 interior per element.
+
+    Per field, not shared: two coupled fields may carry different orders, and sizing a P2 block with
+    the vertex count would silently truncate it."""
+    return [n_vert + n_elem * (int(f.get("order", 1)) - 1) for f in fields]
+
+
+def _block_offsets(fields: List[Any], n_vert: int, n_elem: int) -> List[int]:
     """Per-field block start offsets into the flat DOF vector (cumulative size)."""
     offs = [0]
-    for f in fields:
-        offs.append(offs[-1] + n_nodes * int(f["vec"]))
+    for f, n_dof in zip(fields, _field_dof_counts_1d(fields, n_vert, n_elem)):
+        offs.append(offs[-1] + n_dof * int(f["vec"]))
     return offs
 
 
-def _multifield_dirichlet_dofs_1d(domain, dirichlet_raw, fields, field_index, n_nodes):
+def _field_dof_coords_1d(domain: Any, fields: List[Any]) -> List[np.ndarray]:
+    """Per-field DOF coordinates — what ``fem.field_points`` reports for a coupled 1D system.
+
+    With a mixed-order pair the block vector has no single coordinate list, so each field publishes
+    its own (same convention as the 2D/3D block path's ``_fem_native_dof_points_all``)."""
+    return [dof_layout_1d(domain, int(f.get("order", 1)))[1] for f in fields]
+
+
+def _multifield_dirichlet_dofs_1d(domain, dirichlet_raw, fields, field_index, offs):
     """``dirichlet_raw`` ``(field_key, region, comp, value, value_node)`` -> block ``(dof, g)`` pairs.
 
     Mirrors :func:`_dirichlet_dofs` per field but offsets each DOF into the field's
     block; ``value`` is a constant or a ``value(point)`` callable (so coordinate-
     dependent Dirichlet such as ``u(xb) - xb`` works). ``value_node`` (the raw trace
     node) is consumed only by the 2D/3D time-varying path; the 1D path handles
-    coordinate dependence through ``value`` and ignores it."""
+    coordinate dependence through ``value`` and ignores it.
+
+    ``offs`` is the caller's single block layout rather than a recomputed one: a 1D boundary is an
+    endpoint, hence always a *vertex*, and vertices come first inside every field's block whatever
+    its order — so a P2 field needs no special lookup here, only the right block start."""
     pts = np.asarray(domain.mesh.points)
-    offs = _block_offsets(fields, n_nodes)
     pairs: List[Tuple[int, float]] = []
     for field_key, region, comp, value, _value_node in dirichlet_raw:
         fidx = field_index.get(field_key)
@@ -907,56 +1203,94 @@ def _multifield_dirichlet_dofs_1d(domain, dirichlet_raw, fields, field_index, n_
     return pairs
 
 
-def _make_multifield_residual_1d(domain, term_list, boundary_term_list, fields, field_index, *, n_nodes, quad_degree):
-    """Free block residual ``R(u_flat) -> (sum_i n_nodes*vec_i,)`` for coupled 1D.
+def _make_multifield_residual_1d(
+    domain,
+    term_list,
+    boundary_term_list,
+    fields,
+    field_index,
+    *,
+    offs,
+    quad_degree,
+    runtime_parameter_tags: Tuple[str, ...] = (),
+    field_param_names: Any = frozenset(),
+    neural_slots: Any = None,
+):
+    """Free block residual ``R(u_flat, args) -> (sum_i n_dof_i*vec_i,)`` for coupled 1D.
 
     The native analogue of ``_eval_multifield_volume_integrand``: per element it builds
     one ``local`` with per-field shape data (``local["fields"]``) and evaluates each
     ``(coeff, test_field_index)`` via the shared ``_eval_integrand``, scattering the
     element residual into the **test field's** block DOFs. Boundary (Neumann/Robin)
-    terms ride the degenerate one-node element, same as the single-field path."""
+    terms ride the degenerate one-node element, same as the single-field path.
+
+    Each field carries its own Lagrange order, so the shape values, the element node map and the
+    block size are all per field; only the *geometry* is shared (LINE2, and exactly so — a straight
+    element with a centred midpoint has a constant Jacobian, so the linear map is subparametric, not
+    an approximation).
+
+    Runtime parameters and neural coefficients thread exactly as they do for a single field: the
+    per-element ``volume_vars`` and the ``{name: module}`` neural table go into the *same* ``local``
+    keys, which the shared evaluator reads without caring whether the layout is single- or
+    multi-field. That is why a coupled parametric 1D system needs no separate machinery."""
     nodes = jnp.asarray(domain.mesh.points)[:, 0]
-    cells = jnp.asarray(domain.mesh.cells_dict["line"], dtype=jnp.int32)  # (n_elem, 2)
+    cells = jnp.asarray(domain.mesh.cells_dict["line"], dtype=jnp.int32)  # (n_elem, 2) — the GEOMETRY
+    n_vert, n_elem = int(nodes.shape[0]), int(cells.shape[0])
     gp, gw = _line_quadrature(quad_degree)
-    N, dN_dxi = _line_shape(gp)
+    N_geom, _ = _line_shape(gp, 1)  # geometry stays LINE2 whatever the field orders
     ctx = getattr(domain, "context", {}) or {}
     nfields = len(fields)
     vecs = [int(f["vec"]) for f in fields]
-    offs = _block_offsets(fields, n_nodes)
+    orders = [int(f.get("order", 1)) for f in fields]
+    n_dofs = _field_dof_counts_1d(fields, n_vert, n_elem)
     total = offs[-1]
+
+    # per-field shape functions and element node maps. A degree-k field lays its interior dofs after
+    # ALL of that field's vertices, so a vertex dof keeps its mesh index inside the block — which is
+    # what lets the boundary/Dirichlet lookup above stay order-agnostic.
+    shapes, elem_nodes = [], []
+    for i in range(nfields):
+        shapes.append(_line_shape(gp, orders[i]))
+        elem_nodes.append(_elem_dof_nodes_1d(cells, n_vert, orders[i]))
 
     # element-local -> global block DOF map per field (node-major, then block offset)
     cell_dofs = []
     for i in range(nfields):
         comp = jnp.arange(vecs[i])
-        cd = (cells[:, :, None] * vecs[i] + comp[None, None, :]).reshape(cells.shape[0], -1) + offs[i]
-        cell_dofs.append(cd)  # (n_elem, 2*vec_i)
+        cd = (elem_nodes[i][:, :, None] * vecs[i] + comp[None, None, :]).reshape(n_elem, -1) + offs[i]
+        cell_dofs.append(cd)  # (n_elem, nen_i*vec_i)
 
-    def _elem_local(cell, locs, e):
-        """Element residual ``(2*vec_test,)`` from every field's OWN element dofs ``locs[i]`` ``(2, vec_i)``.
+    def _pack_params(node_ids, args, dtype, width_default=1):
+        return _pack_param_values(node_ids, args, dtype, runtime_parameter_tags, field_param_names, width_default)
+
+    def _elem_local(cell, locs, e, pvals=(), ntable=None):
+        """Element residual ``(nen_test*vec_test,)`` from every field's OWN element dofs ``locs[i]``.
 
         Taking the local dofs explicitly is what exposes the element Jacobian: a coupled term's element
         block couples the *test* field's element dofs to **each** field's, so differentiating this w.r.t.
-        ``locs`` yields one ``(2*vec_test, 2*vec_i)`` block per field — all still element-local, hence
-        scatterable (see ``sparse_jacobian``)."""
-        xc = nodes[cell]
+        ``locs`` yields one ``(nen_test*vec_test, nen_i*vec_i)`` block per field — all still
+        element-local, hence scatterable (see ``sparse_jacobian``)."""
+        xc = nodes[cell[:2]]  # the element's endpoints carry the geometry
         h = xc[1] - xc[0]
-        sg = (dN_dxi / h)[:, :, None]
-        per_field = [{"shape_vals": N, "shape_grads": sg, "cell_sol": locs[i]} for i in range(nfields)]
+        per_field = [
+            {"shape_vals": shapes[i][0], "shape_grads": (shapes[i][1] / h)[:, :, None], "cell_sol": locs[i]}
+            for i in range(nfields)
+        ]
         local = {
-            "physical_quad_points": (N @ xc)[:, None],
+            "physical_quad_points": (N_geom @ xc)[:, None],
             "fields": per_field,
             "field_index": field_index,
             "tag": "fem_gauss",
             "surface": False,
             "domain_context": ctx,
             "temporal_tags": (),
-            "runtime_parameter_tags": (),
-            "volume_vars": (),
+            "runtime_parameter_tags": runtime_parameter_tags,
+            "volume_vars": pvals,
+            "neural_coefficients": ntable,
         }
         return _integrate_term(domain, e, local, gw * h)  # (2*vec_test,)
 
-    def _bnd_local(nid, locs, e, dtype):
+    def _bnd_local(nid, locs, e, dtype, pvals=(), ntable=None):
         """Boundary contribution ``(vec_test,)`` at node ``nid`` from each field's own dof ``locs[i]``."""
         per_field = [
             {
@@ -974,19 +1308,34 @@ def _make_multifield_residual_1d(domain, term_list, boundary_term_list, fields, 
             "surface": True,
             "domain_context": ctx,
             "temporal_tags": (),
-            "runtime_parameter_tags": (),
-            "volume_vars": (),
+            "runtime_parameter_tags": runtime_parameter_tags,
+            "volume_vars": pvals,
+            "neural_coefficients": ntable,
         }
         return _integrate_term(domain, e, local, jnp.ones((1,), dtype=dtype))  # (vec_test,)
 
-    def residual(u_flat):
-        u_list = [u_flat[offs[i] : offs[i + 1]].reshape(n_nodes, vecs[i]) for i in range(nfields)]
+    def _split(u_flat):
+        """The flat block vector as one ``(n_dof_i, vec_i)`` array per field — sizes differ by order."""
+        return [u_flat[offs[i] : offs[i + 1]].reshape(n_dofs[i], vecs[i]) for i in range(nfields)]
+
+    def residual(u_flat, args=None):
+        u_list = _split(u_flat)
+        _nt = _neural_local_table(neural_slots, args)
         R = jnp.zeros(total, dtype=u_flat.dtype)
 
         # --- volume terms: per element, evaluate the coeff against all fields, scatter
-        #     into the test field's block ---
+        #     into the test field's block. vmapped over the element INDEX, not over the geometry
+        #     cell, because each field gathers its own element dofs (a P2 field's differ). ---
         for coeff, test_idx in term_list:
-            elem_res = jax.vmap(lambda c, e=coeff: _elem_local(c, [u_list[i][c] for i in range(nfields)], e))(cells)
+            elem_res = jax.vmap(
+                lambda el, e=coeff: _elem_local(
+                    cells[el],
+                    [u_list[i][elem_nodes[i][el]] for i in range(nfields)],
+                    e,
+                    _pack_params(cells[el], args, u_flat.dtype),
+                    _nt,
+                )
+            )(jnp.arange(n_elem, dtype=jnp.int32))
             R = R.at[cell_dofs[test_idx].reshape(-1)].add(elem_res.reshape(-1))
 
         # --- boundary terms: degenerate one-node element (shape val 1, weight 1) ---
@@ -994,7 +1343,8 @@ def _make_multifield_residual_1d(domain, term_list, boundary_term_list, fields, 
             vt = vecs[test_idx]
             for nid in nids:
                 locs = [u_list[i][nid : nid + 1] for i in range(nfields)]
-                contrib = _bnd_local(nid, locs, coeff, u_flat.dtype)  # (vec_test,)
+                _bp = _pack_params(jnp.asarray([nid]), args, u_flat.dtype)
+                contrib = _bnd_local(nid, locs, coeff, u_flat.dtype, _bp, _nt)  # (vec_test,)
                 R = R.at[offs[test_idx] + nid * vt + jnp.arange(vt)].add(contrib.reshape(vt))
 
         return R
@@ -1002,25 +1352,28 @@ def _make_multifield_residual_1d(domain, term_list, boundary_term_list, fields, 
     def sparse_jacobian(u_flat, args=None):
         """``dR/du`` as a **BCOO** for the coupled block system, scattered from element blocks.
 
-        A coupled term contributes, per element, one ``(2*vec_test, 2*vec_i)`` block per field ``i`` it
-        references — the off-diagonal blocks are exactly the field couplings. Every one is element-local,
-        so the whole block operator is assembled in ``O(nnz)`` instead of by an ``O(total²)`` global
+        A coupled term contributes, per element, one ``(nen_test*vec_test, nen_i*vec_i)`` block per
+        field ``i`` it references — the off-diagonal blocks are exactly the field couplings, and they
+        are rectangular when the two fields carry different orders. Every one is element-local, so the
+        whole block operator is assembled in ``O(nnz)`` instead of by an ``O(total²)`` global
         ``jacfwd`` over the concatenated block vector."""
         from jax.experimental import sparse as jsp
 
-        u_list = [u_flat[offs[i] : offs[i + 1]].reshape(n_nodes, vecs[i]) for i in range(nfields)]
+        u_list = _split(u_flat)
+        _nt = _neural_local_table(neural_slots, args)
         idx, dat = [], []
 
         for coeff, test_idx in term_list:
 
-            def _jac(cell, e=coeff):
-                locs = [u_list[i][cell] for i in range(nfields)]
-                return jax.jacfwd(lambda L: _elem_local(cell, L, e))(locs)  # list of (2*vt, 2, vec_i)
+            def _jac(el, e=coeff):
+                locs = [u_list[i][elem_nodes[i][el]] for i in range(nfields)]
+                pv = _pack_params(cells[el], args, u_flat.dtype)
+                return jax.jacfwd(lambda L: _elem_local(cells[el], L, e, pv, _nt))(locs)
 
-            Js = jax.vmap(_jac)(cells)
-            n_el, vt = cells.shape[0], vecs[test_idx]
+            Js = jax.vmap(_jac)(jnp.arange(n_elem, dtype=jnp.int32))
+            n_el, vt = n_elem, vecs[test_idx]
             for i in range(nfields):
-                Ji = jnp.asarray(Js[i]).reshape(n_el, 2 * vt, 2 * vecs[i])
+                Ji = jnp.asarray(Js[i]).reshape(n_el, cell_dofs[test_idx].shape[1], cell_dofs[i].shape[1])
                 rows = jnp.broadcast_to(cell_dofs[test_idx][:, :, None], Ji.shape)
                 cols = jnp.broadcast_to(cell_dofs[i][:, None, :], Ji.shape)
                 idx.append(jnp.stack([rows.reshape(-1), cols.reshape(-1)], axis=1))
@@ -1030,7 +1383,8 @@ def _make_multifield_residual_1d(domain, term_list, boundary_term_list, fields, 
             vt = vecs[test_idx]
             for nid in nids:
                 locs = [u_list[i][nid : nid + 1] for i in range(nfields)]
-                Jb = jax.jacfwd(lambda L: _bnd_local(nid, L, coeff, u_flat.dtype))(locs)
+                _bp = _pack_params(jnp.asarray([nid]), args, u_flat.dtype)
+                Jb = jax.jacfwd(lambda L: _bnd_local(nid, L, coeff, u_flat.dtype, _bp, _nt))(locs)
                 for i in range(nfields):
                     Bi = jnp.asarray(Jb[i]).reshape(vt, vecs[i])
                     r = offs[test_idx] + nid * vt + jnp.arange(vt)
@@ -1067,31 +1421,28 @@ def _typed_terms_1d(domain, bares, field_index):
     return out
 
 
-def assemble_fem_1d_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, *, quad_degree):
-    """Assemble a coupled (multi-field) 1D weak form into ``(op, mode)`` for :class:`FEM`.
+def assemble_fem_1d_multifield(
+    domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, *, quad_degree, second_order=False
+):
+    """Assemble a coupled (multi-field) 1D weak form into ``(op, mode, offsets)`` for :class:`FEM`.
 
     1D block analogue of the 2D/3D ``_assemble_multifield``. The
     field layout ``(fields, field_index)`` is inferred once from the volume trial
     functions and threaded into every block builder so the mass / operator / residual
-    blocks share one ordering."""
-    from ...trace import FemResidualOperator
+    blocks share one ordering. ``offsets`` reports that ordering to the caller in the same
+    ``[0, n_0, n_0+n_1, ...]`` form the 2D/3D path uses."""
+    from ...trace import FemLinearSystem, FemResidualOperator
     from .fem_utils import _infer_fields, _lower_statefield_to_trial
     from .weak_form import _contains_temporal_derivative, _is_obviously_nonlinear_in_unknown
 
-    # The coupled block builder threads no runtime parameters — its element kernels publish no
-    # ``runtime_parameter_tags``/``volume_vars``. Without this guard the parameter's value simply never
-    # reaches the kernel and the solve dies with an internal KeyError about InternalVars, which is what
-    # the single-field path did before it grew a parameter path. Fail loud and say so instead.
-    _c_tags, _, _c_neural, _c_exprs = _param_context(volume_terms, boundary_terms)
-    if _c_exprs:
-        raise NotImplementedError(
-            "jno.fem: a runtime parameter or neural coefficient on a COUPLED 1D system "
-            f"({sorted(_c_exprs)}) is not supported — the coupled 1D block assembler threads no runtime "
-            "parameters. A single-field 1D form is fully parametric (steady, transient, linear and "
-            "nonlinear); use one field, or a 2D/3D domain for the coupled case."
-        )
+    # Runtime parameters / neural coefficients on a COUPLED system. The block element kernels publish
+    # the same ``runtime_parameter_tags``/``volume_vars``/``neural_coefficients`` keys the single-field
+    # ones do, and the shared evaluator reads them without caring about the field layout — so a coupled
+    # 1D inverse needs no block-specific machinery, only the values threaded to the kernels.
+    _c_tags, _c_fields, _c_neural, _c_exprs = _param_context(volume_terms, boundary_terms)
 
     n_nodes = int(np.asarray(domain.mesh.points).shape[0])
+    n_elem = int(np.asarray(domain.mesh.cells_dict["line"]).shape[0])
 
     # Shared field layout: first appearance across the volume terms (same convention as
     # _infer_fields on the summed volume expr in the 2D/3D path).
@@ -1109,10 +1460,51 @@ def assemble_fem_1d_multifield(domain, volume_terms, boundary_terms, dirichlet_r
             "got a vector field. Use scalar fields, or a 2D/3D domain for vector unknowns."
         )
 
+    # Per-field block offsets, published to `FEM` exactly as the 2D/3D block path publishes them.
+    # They are not a convenience: `fem.offsets` is what every consumer slices a coupled solution by
+    # (the periodic reduction reduces block-wise through it, and post-processing splits the flat DOF
+    # vector with it). Returning them here is what keeps a coupled 1D system indistinguishable from a
+    # coupled 2D one on the outside. Each field is sized by its OWN order, so a mixed-order pair
+    # (the 1D Taylor-Hood shape) has unequal blocks.
+    offsets = _block_offsets(fields, n_nodes, n_elem)
+
+    # With mixed orders the block vector has no single coordinate list, so publish one per field —
+    # the convention `fem.field_points` reads, with field 0's list as the `fem.points` fallback.
+    _dof_coords = _field_dof_coords_1d(domain, fields)
+    domain._fem_native_dof_points = _dof_coords[0]
+    _orders = [int(f.get("order", 1)) for f in fields]
+    _publish_field_records_1d(domain, _dof_coords, _orders, [_elem_dof_nodes_1d_np(domain, o) for o in _orders])
+
     all_terms = list(volume_terms) + [t for ts in boundary_terms.values() for t in ts]
     if any(_contains_temporal_derivative(t) for t in all_terms):
-        dirichlet_pairs = _multifield_dirichlet_dofs_1d(domain, dirichlet_raw, fields, field_index, n_nodes)
-        return _assemble_1d_multifield_transient(
+        if _c_exprs:
+            # The coupled transient block assembles M and A ONCE, outside any per-args re-forming, so a
+            # parameter there would be read at its zero placeholder and silently baked in — the same
+            # reason the single-field transient refuses a parameter on the mass. The steady coupled path
+            # above IS parametric.
+            raise NotImplementedError(
+                "jno.fem: a runtime parameter or neural coefficient on a COUPLED 1D *transient* system "
+                f"({sorted(_c_exprs)}) is not supported — the coupled transient block is assembled once, "
+                "so the parameter would be silently frozen at its placeholder. A coupled STEADY 1D form "
+                "(linear or nonlinear) is fully parametric; single-field 1D is parametric transient too."
+            )
+        dirichlet_pairs = _multifield_dirichlet_dofs_1d(domain, dirichlet_raw, fields, field_index, offsets)
+        if second_order:
+            # `u_tt` carries the augmented [u_all; v_all] state, so it reports its OWN offsets
+            # (displacement blocks then velocity blocks) rather than the plain field layout.
+            return _assemble_1d_multifield_second_order(
+                domain,
+                volume_terms,
+                boundary_terms,
+                dirichlet_pairs,
+                ic_residuals,
+                fields,
+                field_index,
+                offsets=offsets,
+                dof_coords=_dof_coords,
+                quad_degree=quad_degree,
+            )
+        op, mode = _assemble_1d_multifield_transient(
             domain,
             volume_terms,
             boundary_terms,
@@ -1120,8 +1512,11 @@ def assemble_fem_1d_multifield(domain, volume_terms, boundary_terms, dirichlet_r
             ic_residuals,
             fields,
             field_index,
+            offsets=offsets,
+            dof_coords=_dof_coords,
             quad_degree=quad_degree,
         )
+        return op, mode, offsets
     if ic_residuals:
         raise ValueError("jno.fem: an initial condition was given but the 1D weak form has no time derivative.")
 
@@ -1131,47 +1526,230 @@ def assemble_fem_1d_multifield(domain, volume_terms, boundary_terms, dirichlet_r
         for region, bares in boundary_terms.items()
         for (coeff, tfi) in _typed_terms_1d(domain, bares, field_index)
     ]
-    dirichlet_pairs = _multifield_dirichlet_dofs_1d(domain, dirichlet_raw, fields, field_index, n_nodes)
-    total = _block_offsets(fields, n_nodes)[-1]
+    dirichlet_pairs = _multifield_dirichlet_dofs_1d(domain, dirichlet_raw, fields, field_index, offsets)
+    total = offsets[-1]
     residual_free = _make_multifield_residual_1d(
-        domain, volume_tl, boundary_tl, fields, field_index, n_nodes=n_nodes, quad_degree=quad_degree
+        domain,
+        volume_tl,
+        boundary_tl,
+        fields,
+        field_index,
+        offs=offsets,
+        quad_degree=quad_degree,
+        runtime_parameter_tags=_c_tags,
+        field_param_names=_c_fields,
+        neural_slots=_c_neural,
     )
 
     if any(_is_obviously_nonlinear_in_unknown(domain, t) for t in all_terms):
-        residual = _apply_dirichlet_rows(residual_free, dirichlet_pairs)
+        # `_apply_dirichlet_rows` keeps a single-argument contract on purpose (it is shared with
+        # `fem_nonnodal` and `fem_native`, whose free residuals have different trailing signatures —
+        # threading `args` through it would bind `args` to `t` in the native one and silently evaluate
+        # the form at the wrong time). Parametric callers close over `args` and wrap per call.
+        def res_p(u, args=None):
+            return _apply_dirichlet_rows(lambda uu: residual_free(uu, args), dirichlet_pairs)(jnp.asarray(u))
+
         op = FemResidualOperator(
-            residual_fn=lambda u, args=None: residual(jnp.asarray(u)),
-            jacobian_fn=lambda u, args=None: jax.jacfwd(residual)(jnp.asarray(u)),
+            residual_fn=res_p,
+            jacobian_fn=lambda u, args=None: jax.jacfwd(lambda uu: res_p(uu, args))(jnp.asarray(u)),
             size=total,
+            runtime_parameter_exprs=_c_exprs,
         )
-        return op, "nonlinear"
+        return op, "nonlinear", offsets
 
     zeros = jnp.zeros(total)
-    A = residual_free.sparse_jacobian(zeros)
-    b = -residual_free(zeros)
-    A, b = _apply_dirichlet_symmetric(A, b, dirichlet_pairs)
-    A = compress_eager(A)  # ~19x redundant triplets otherwise; see the helper
-    return (A, b), "linear"
+
+    def _system(args=None):
+        A = residual_free.sparse_jacobian(zeros, args)
+        b = -residual_free(zeros, args)
+        A, b = _apply_dirichlet_symmetric(A, b, dirichlet_pairs)
+        return compress_eager(A), b  # ~19x redundant triplets otherwise; see the helper
+
+    A0, b0 = _system(None)
+    if not _c_exprs:
+        return (A0, b0), "linear", offsets
+    # Parametric: re-form A(θ), b(θ) from the runtime args per call, so ∂u/∂θ flows through the block
+    # solve. Dirichlet elimination couples A and b (known columns move to the load), so each accessor
+    # assembles the pair and takes its half — same contract as the single-field path.
+    return (
+        FemLinearSystem(
+            A0,
+            b0,
+            operator_fn=lambda args: _system(args)[0],
+            rhs_fn=lambda args: _system(args)[1],
+            runtime_parameter_exprs=_c_exprs,
+        ),
+        "linear",
+        offsets,
+    )
 
 
-def _multifield_initial_state_1d(domain, fields, field_index, ic_residuals, n_nodes):
-    """Block initial state from per-field IC residuals (1D; all fields share the mesh)."""
+def _assemble_1d_multifield_second_order(
+    domain,
+    volume_terms,
+    boundary_terms,
+    dirichlet_pairs,
+    ic_residuals,
+    fields,
+    field_index,
+    *,
+    offsets,
+    dof_coords,
+    quad_degree,
+):
+    r"""Coupled 1D second-order-in-time: the augmented ``y = [u_all; v_all]`` block.
+
+    Same formula the single-field 1D path and the 2D/3D coupled path use, with the **coupled block**
+    ``M2``/``K`` in place of the single-field ones::
+
+        [M2  0 ] [u_all']   [ 0   -M2] [u_all]   [ 0 ]
+        [0   M2] [v_all'] + [ K    0 ] [v_all] = [ F ]
+
+    ``M2`` is block-diagonal over the fields; ``K`` carries the per-field spatial operators with the
+    couplings in its off-diagonal blocks. Two coupled 1D waves, a wave driven by a second membrane,
+    a chain of coupled oscillators.
+
+    Scope, matching the 2D/3D coupled route: every field must be second order. A bare ``u_t`` (damping,
+    or a first-order field) would need a per-field velocity augmentation and is refused — write it as
+    a first-order system with an explicit velocity field per second-order field.
+    """
+    from ..._fem import _bare, _bcoo_block, _ic_value_at_nodes
+    from .backend_blocks import SemidiscreteTimeBlock
+    from .fem_utils import _lower_statefield_to_trial, _test_field_index, bcoo_set_dirichlet_rows, bcoo_zero_rows
+    from .solver_helper import max_temporal_derivative_order as _mto
+    from .time_route import _infer_time_window, _strip_temporal_trial_derivative
+    from .weak_form import _apply_sign, _is_obviously_nonlinear_in_unknown, _split_additive_terms
+
+    all_terms = list(volume_terms) + [t for ts in boundary_terms.values() for t in ts]
+    if any(_is_obviously_nonlinear_in_unknown(domain, b) for b in all_terms):
+        raise NotImplementedError("jno.fem: a nonlinear coupled second-order-in-time 1D form is not supported.")
+
+    def _strip(coeff, times):
+        for _ in range(times):
+            coeff = _strip_temporal_trial_derivative(coeff)
+        return coeff
+
+    mass2_tl, spatial_tl = [], []
+    for bare in volume_terms:
+        for sign, sub in _split_additive_terms(domain, bare):
+            coeff = _lower_statefield_to_trial(_apply_sign(domain, sign, sub), {})
+            tfi = _test_field_index(coeff, field_index)
+            if tfi is None:
+                raise ValueError("jno.fem: each coupled 1D weak term must contain exactly one test field.")
+            o = _mto(sub)
+            if o >= 2:
+                mass2_tl.append((_strip(coeff, 2), tfi))
+            elif o == 1:
+                raise NotImplementedError(
+                    "jno.fem: a coupled second-order-in-time 1D form with a u_t term (damping or a "
+                    "first-order field) is not supported — every field must carry u_tt. Write the coupled "
+                    "problem as a first-order system with an explicit velocity field per second-order field."
+                )
+            else:
+                spatial_tl.append((coeff, tfi))
+    if not mass2_tl:
+        raise ValueError("jno.fem: the coupled 1D second-order route found no `u_tt * phi` mass term.")
+    if {fields[tfi]["field_key"] for _, tfi in mass2_tl} != {f["field_key"] for f in fields}:
+        raise NotImplementedError(
+            "jno.fem: coupled second-order-in-time 1D requires EVERY field to carry u_tt — a field with no "
+            "inertia is an algebraic constraint on the augmented block, which the [u; v] form cannot express. "
+            "Write it as a first-order system with an explicit velocity field."
+        )
+
+    boundary_tl = [
+        (coeff, tfi, _region_node_ids(domain, region))
+        for region, bares in boundary_terms.items()
+        for (coeff, tfi) in _typed_terms_1d(domain, bares, field_index)
+    ]
+
+    n = offsets[-1]
+    z = jnp.zeros(n)
+    M2 = _make_multifield_residual_1d(
+        domain, mass2_tl, [], fields, field_index, offs=offsets, quad_degree=quad_degree
+    ).sparse_jacobian(z)
+    spatial_res = _make_multifield_residual_1d(
+        domain, spatial_tl, boundary_tl, fields, field_index, offs=offsets, quad_degree=quad_degree
+    )
+    K = spatial_res.sparse_jacobian(z)
+    F = -spatial_res(z)
+    dtype = z.dtype
+
+    # Compose the 2n augmented block SPARSELY through the same three helpers the single-field 1D and
+    # native u_tt paths use, so the three augmented systems cannot drift apart.
+    M_aug = _bcoo_block([(M2, 0, 0, 1.0), (M2, n, n, 1.0)], (2 * n, 2 * n), dtype)
+    A_aug = _bcoo_block([(M2, 0, n, -1.0), (K, n, 0, 1.0)], (2 * n, 2 * n), dtype)
+    c_aug = jnp.concatenate([jnp.zeros((n,), dtype), F])
+
+    # ---- initial state y0 = [u_all; v_all]: each IC into its field block, displacement vs velocity ----
+    u0 = jnp.zeros((n,), dtype)
+    v0 = jnp.zeros((n,), dtype)
+    for ic in ic_residuals:
+        from ..._fem import _field_key_of
+
+        fi = field_index.get(_field_key_of(ic))
+        if fi is None:
+            continue
+        lo, hi = offsets[fi], offsets[fi + 1]
+        pts = jnp.asarray(dof_coords[fi])[:, : domain.dimension]
+        bare_ic = _bare(ic)
+        val = jnp.asarray(_ic_value_at_nodes(bare_ic, domain, pts, hi - lo, 1), dtype)
+        if _mto(bare_ic) >= 1:
+            v0 = v0.at[lo:hi].set(val)  # velocity IC u̇(0) for this field
+        else:
+            u0 = u0.at[lo:hi].set(val)  # displacement IC u(0) for this field
+
+    if dirichlet_pairs:  # u[d]=g on the displacement rows, v[d]=0 on the velocity rows
+        dd = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32)
+        dg = jnp.asarray([p[1] for p in dirichlet_pairs], dtype=dtype)
+        aug_d = jnp.concatenate([dd, dd + n])
+        M_aug = bcoo_zero_rows(M_aug, aug_d)  # the constrained mass rows are algebraic
+        A_aug = bcoo_set_dirichlet_rows(A_aug, aug_d)  # -> identity rows (columns kept)
+        c_aug = c_aug.at[dd].set(dg).at[dd + n].set(0.0)
+        u0, v0 = u0.at[dd].set(dg), v0.at[dd].set(0.0)
+
+    t0, t1, dt = _infer_time_window(domain)
+    block = SemidiscreteTimeBlock(
+        backend="transient",
+        mode="implicit",
+        time_order=2,
+        spatial_kind="weak_form",
+        M=M_aug,
+        A=A_aug,
+        affine_bias=c_aug,
+        state0=jnp.concatenate([u0, v0]),
+        t0=t0,
+        t1=t1,
+        dt=dt,
+        eval_context=getattr(domain, "_fem_eval_context", {}) or {},
+        metadata={"theta": 0.5, "second_order": True},
+    )
+    # Field slicing on the augmented state [u1..uF, v1..vF]: displacement blocks then velocity blocks
+    # (same convention as the 2D/3D coupled route).
+    return block, "transient", list(offsets[:-1]) + [n + o for o in offsets]
+
+
+def _multifield_initial_state_1d(domain, fields, field_index, ic_residuals, offs, dof_coords):
+    """Block initial state from per-field IC residuals.
+
+    Each field's IC is sampled on **that field's own** DOF coordinates: a P2 field's state must be
+    seeded at its element midpoints too, not only at the mesh vertices, or the march starts from a
+    state that is right on the vertices and zero in between."""
     from ..._fem import _bare, _constant_of, _essential_spec, _eval_value_node_at, _field_key_of
 
-    offs = _block_offsets(fields, n_nodes)
     state0 = jnp.zeros((offs[-1],))
-    pts = jnp.asarray(domain.mesh.points)[:, : domain.dimension]
     for ic in ic_residuals:
         fidx = field_index.get(_field_key_of(ic))
         if fidx is None:
             continue
+        pts = jnp.asarray(dof_coords[fidx])[:, : domain.dimension]
+        n_dof = int(pts.shape[0])
         _comp, node = _essential_spec(_bare(ic))
         const = _constant_of(node)
         if const is not None:
-            vals = jnp.full((n_nodes,), float(const))
+            vals = jnp.full((n_dof,), float(const))
         else:
             v = jnp.asarray(_eval_value_node_at(node, pts))
-            vals = jnp.broadcast_to(v, (n_nodes,)) if v.shape[0] == 1 else v
+            vals = jnp.broadcast_to(v, (n_dof,)) if v.shape[0] == 1 else v
         block = jnp.asarray(vals).reshape(-1)
         if block.shape[0] != offs[fidx + 1] - offs[fidx]:
             raise NotImplementedError(
@@ -1182,7 +1760,17 @@ def _multifield_initial_state_1d(domain, fields, field_index, ic_residuals, n_no
 
 
 def _assemble_1d_multifield_transient(
-    domain, volume_terms, boundary_terms, dirichlet_pairs, ic_residuals, fields, field_index, *, quad_degree
+    domain,
+    volume_terms,
+    boundary_terms,
+    dirichlet_pairs,
+    ic_residuals,
+    fields,
+    field_index,
+    *,
+    offsets,
+    dof_coords,
+    quad_degree,
 ):
     """Coupled 1D first-order transient: block mass + block spatial operator/residual.
 
@@ -1200,8 +1788,7 @@ def _assemble_1d_multifield_transient(
         _split_additive_terms,
     )
 
-    n_nodes = int(np.asarray(domain.mesh.points).shape[0])
-    total = _block_offsets(fields, n_nodes)[-1]
+    total = offsets[-1]
 
     mass_tl, spatial_tl = [], []
     for bare in volume_terms:
@@ -1216,11 +1803,11 @@ def _assemble_1d_multifield_transient(
                 spatial_tl.append((coeff, tfi))
     if not mass_tl:
         raise ValueError("jno.fem: a transient 1D weak form must contain a temporal-derivative term (u_t * phi).")
-    if {fields[tfi]["field_key"] for _, tfi in mass_tl} != {f["field_key"] for f in fields}:
-        raise NotImplementedError(
-            "jno.fem: coupled transient requires every field to carry a time derivative (u_t * test); "
-            "algebraic (DAE) fields are not supported yet."
-        )
+    # A field with NO temporal term is algebraic: its rows of M are simply zero, so the block is a DAE
+    # and the implicit step solves `(M/dt + A) u = M/dt u_old + c`, whose algebraic rows read `A u = c`.
+    # Nothing special is needed — the 2D/3D coupled path never required a time derivative per field
+    # either, and requiring one here ruled out constraint/closure fields (a pressure, a saturation, an
+    # equilibrium concentration) that only 1D refused.
 
     boundary_tl = [
         (coeff, tfi, _region_node_ids(domain, region))
@@ -1228,14 +1815,12 @@ def _assemble_1d_multifield_transient(
         for (coeff, tfi) in _typed_terms_1d(domain, bares, field_index)
     ]
 
-    mass_res = _make_multifield_residual_1d(
-        domain, mass_tl, [], fields, field_index, n_nodes=n_nodes, quad_degree=quad_degree
-    )
+    mass_res = _make_multifield_residual_1d(domain, mass_tl, [], fields, field_index, offs=offsets, quad_degree=quad_degree)
     spatial_res = _make_multifield_residual_1d(
-        domain, spatial_tl, boundary_tl, fields, field_index, n_nodes=n_nodes, quad_degree=quad_degree
+        domain, spatial_tl, boundary_tl, fields, field_index, offs=offsets, quad_degree=quad_degree
     )
     M = mass_res.sparse_jacobian(jnp.zeros(total))
-    state0 = _multifield_initial_state_1d(domain, fields, field_index, ic_residuals, n_nodes)
+    state0 = _multifield_initial_state_1d(domain, fields, field_index, ic_residuals, offsets, dof_coords)
     t0, t1, dt = _infer_time_window(domain)
     common = dict(
         backend="transient",

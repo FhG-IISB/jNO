@@ -41,17 +41,74 @@ u_h = fem.solve()          # matrix-free default; slots pick anything else (see 
   Use `value_shape=(2,)` for a vector unknown (elasticity, flow velocity), `order=k` for degree-`k`
   Lagrange (`order=2` quadratic P2, `order=3` cubic P3, … — any `k ≥ 1`), `space="RT"`/`"N1E"`/`"P0"`
   for the non-nodal families (see below), and call `fem_symbols` once per field for coupled systems.
-  On a **1D line domain** orders 1 (LINE2) and 2 (LINE3) are available — P2 adds a dof per element
-  midpoint, so read `fem.points` for the coordinates the solution lives on. Measured on
-  `-u'' + u = f`: P1 converges at O(h²) nodally and P2 at O(h⁴), which at an equal 41 dofs is
-  4.7e-5 against 2.4e-7. Higher orders, and P2 on a *coupled* 1D system, are not wired (clear errors).
+  On a **curved boundary**, `order ≥ 2` is capped by the straight-edge geometry — see *Known
+  limitations* for the measured rates before paying for P3 there.
+  A **1D line domain** takes a vector unknown too (`value_shape=(n,)`), so a 1D *system* — a
+  two-species model, a Timoshenko pair, a bar with several dofs per node — is one field with
+  node-major dofs and per-component essential conditions (`u(region)[i] - g`).
+  On a 1D line domain **any order `k ≥ 1`** is available: degree `k` adds `k-1` interior dofs per
+  element, laid out after all vertices, so read `fem.points` for the coordinates the solution lives
+  on. Orders above 2 are tabulated by basix on the reference interval through the same builder the
+  2D/3D path uses, so a P{k} line and a P{k} triangle agree on what degree `k` means. Measured on
+  `-u'' + u = f`: at the **vertices** 1D Lagrange is superconvergent at O(h^2k) — P1 gives O(h²), P2
+  O(h⁴), P3 O(h⁶) — and each P{k} reproduces a degree-`k` solution exactly.
+  A **coupled** 1D system carries a per-field order, so a mixed-order pair (the 1D Taylor-Hood shape)
+  assembles — the blocks are then unequal and the coupling blocks rectangular, so read
+  `fem.field_points` for each field's dof coordinates. In a coupled *transient* system a field may be
+  **algebraic** (no `u_t`): its mass rows are zero, so the block is a DAE and the implicit step solves
+  `A p = c` on those rows — which is how a constraint/closure field (a pressure, a saturation, an
+  equilibrium concentration) is written.
   A `jno.np.parameter` coefficient (scalar or nodal field) also works on a **steady linear** 1D form, so
   a 1D differentiable inverse problem runs through `crux.solve` — as does a **neural** (`jno.nn.wrap`)
   coefficient, so a learned `k(x)` can be trained from 1D data. Transient too — recovering a diffusivity
   from a 1D time series works — except that the transient **mass** must be parameter-free (it is
   assembled once, so a parameter there would be silently frozen; it fails loud). *Nonlinear* forms are
-  parametric too — Newton runs on `R(·, θ)` and implicit differentiation gives `∂u/∂θ`. Not wired in 1D:
-  anything parametric on a *coupled* system.
+  parametric too — Newton runs on `R(·, θ)` and implicit differentiation gives `∂u/∂θ`. A **coupled**
+  1D system is parametric too (steady, linear and nonlinear) — the block element kernels publish the
+  same `volume_vars` / neural-table keys the single-field ones do, so the shared evaluator reads them
+  regardless of field layout. Not wired in 1D: a parameter on a coupled *transient* block, which is
+  assembled once and would freeze the parameter at its placeholder (it fails loud). The vector and
+  triangle-only non-nodal families (`"RT"`, `"N1curl"`, `"Argyris"`, `"Morley"`) have no 1D counterpart
+  and raise a clear error on a line.
+* **VPINN in 1D** — a network trial (`u = net(x)` inside the weak form, test-projected onto the FE
+  test space) works on a line, so the cheapest dimension for prototyping a variational PINN is
+  available. The native `fem_context` it projects onto now builds on an interval: `lagrange_interval`
+  is the 1D sibling of `lagrange_triangle`/`lagrange_tet` from the same basix builder, and an
+  interval's facets are its two endpoints (outward normals ∓1). Still single-field only.
+* **Adaptivity in 1D** — `fem.solve(adapt=jno.solve.remesh(...))` works on a line, steady and
+  transient. mmg has no 1-D mode and needs none: an interval mesh is a sorted vertex list, so
+  honouring a size field is subdivision rather than remeshing (exact where mmg is approximate, and no
+  optional dependency), with mmg's `hgrad` gradation rule imposed by two monotone sweeps. Solution
+  transfer is the same code as 2D/3D — an interval is a 1-simplex, so its barycentric weights are the
+  two linear hat values. Measured on a boundary layer `-eps u'' + u' = 0`: adaptive refinement from 11
+  dofs reaches 5.7e-4 where uniform refinement at 81 dofs is at 1.2e-2. Not wired in 1D: mesh motion
+  via a geometry term (a 1-D "moving boundary" is a single endpoint).
+* **The beam element (`space="Hermite"` in 1D)** — the C¹ cubic Hermite, i.e. the classical
+  Euler-Bernoulli beam element and the 1D counterpart of Argyris/Morley on triangles. Two dofs per
+  vertex, `(w, dw/dx)`, laid out `2*node` / `2*node + 1`; sharing the slope dof across elements is what
+  makes the space C¹, so the fourth-order operator has a well-defined weak form:
+
+  ```python
+  u, v = d.fem_symbols(space="Hermite")
+  ui, vi = u.bind(x=xi), v.bind(x=xi)
+  lap = jno.np.laplacian
+  fem = jno.fem([EI * lap(ui, [xi]) * lap(vi, [xi]) - q * vi,   # EI w'''' = q
+                 u(xl) - 0.0, u.dn(xl) - 0.0])                  # clamped at the left end
+  ```
+
+  The classical supports are just *which* of a node's two dofs are pinned — `u(region)` alone is
+  **simply supported**, adding `u.dn(region)` makes it **clamped**, `u.dn` alone is **guided**, and
+  neither is **free**. The slope condition rides the same `u.dn` essential-rotation channel the 2D C¹
+  plate families use, so a beam and a plate are clamped by the same notation. The element is *nodally
+  exact* for a uniform load: a cantilever gives `qL⁴/8` at the tip and `qL³/6` for the tip slope to
+  machine precision, simply supported gives `5qL⁴/384` at mid-span and clamped-clamped `qL⁴/384`.
+* **Complex forms in 1D** — a `1j` anywhere in a 1D weak form routes through the same real-equivalent
+  Re/Im split the 2D/3D and non-nodal paths use, so 1D Helmholtz-type problems (complex coefficient,
+  complex source, or both) solve and return a complex `u`. A runtime parameter inside the complex
+  coefficient keeps both legs parametric, so the complex **inverse** works in 1D too. Scope: steady and
+  linear, single field. Complex *transient*, complex *nonlinear*, a complex *coupled* 1D system, and a
+  **complex essential value** each raise — the last because the two legs share one Dirichlet row set,
+  which can impose `Re u = g` with `Im u = 0` but not a prescribed `Im u`.
 * **Quadrature coordinates** — `d.variable("interior", split=True)` returns the volume
   coordinates; `d.variable("<edge>", split=True)` returns a boundary edge's coordinates. A
   `Shape.rect` auto-tags `"left"`, `"right"`, `"bottom"`, `"top"` (and `"front"`/`"back"` for a box);
@@ -112,7 +169,16 @@ no term.
 > and the curl is taken from the physical gradient. The essential **PEC wall** `n×E = 0` is supported,
 > written `u.vector.cross(d.variable(region, normals=True))` (facet-based; it pins every boundary-face edge
 > DOF of the region). On a tet mesh **only N1E is wired** — RT / P0 / Hermite / Argyris / Morley remain
-> 2-D-triangle only and raise.
+> 2-D-triangle only and raise. On a **line** mesh `"Hermite"` selects the 1D cubic beam element
+> (see above); the other families raise.
+>
+> **Each of these families has ONE intrinsic order** — RT₀ / N1E₀ lowest, P0 constant, Morley quadratic,
+> Hermite cubic, Argyris quintic — set by the element definition, not chosen. `order=` is a nodal-Lagrange
+> knob and **is refused** here rather than ignored: `space="N1E", order=2` used to hand back the same
+> lowest-order space silently (an identical operator), which is the worst failure shape for a wave problem
+> — you pay for accuracy, get first-order convergence, and only find out from a convergence study that
+> stalls. Refine the mesh instead (see *Mesh resolution for wave problems* below), or use a nodal Lagrange
+> field, where `order=` does apply.
 >
 > **Not yet:** the rest of the zoo in 3-D (RT / C¹ / plate are 2-D only); the *inhomogeneous* `n×E = g` on
 > N1E; higher order; other families (BDM, second-kind Nédélec, Bell); quad / non-triangular meshes; a
@@ -218,6 +284,40 @@ geometry).
 Tutorials: `mixed_poisson_rt_2d.py` (H(div)), `maxwell_nedelec_2d.py` (H(curl): magnetostatics + eddy
 current), and `maxwell_nedelec_3d.py` (the **3-D PEC cube cavity resonator** — recovers `k²=π²(l²+m²+n²)`,
 spurious-free, converging to `2π²` from below).
+
+### Mesh resolution for wave problems
+
+Because N1E is **lowest order only** (`order=` is refused, above), the mesh is your *only* accuracy
+knob on a wave problem — so it is worth knowing what a given resolution buys. Measured on the PEC cube
+cavity, whose lowest mode `k² = 2π²` is analytic, with `h` expressed as **points per wavelength**
+(`λ = 2π/k = √2` on the unit cube, `ppw = λ/h`):
+
+| `h` | ppw | DOFs | mean lowest triplet | rel. error |
+|-----|-----|------|--------------------|------------|
+| 0.50 | 2.8 | 53 | 14.52 | 26% |
+| 0.40 | 3.5 | 121 | 18.67 | 5.4% |
+| 0.30 | 4.7 | 217 | 19.48 | 1.3% |
+| 0.25 | 5.7 | 276 | 19.07 | 3.4% |
+| 0.20 | 7.1 | 532 | 19.27 | 2.4% |
+| 0.16 | 8.8 | 1083 | 19.46 | 1.4% |
+
+The fitted rate is **2.1 in `h`**, consistent with the theoretical `O(h²)` for *eigenvalues* with
+lowest-order edge elements (the *field* itself converges at `O(h)`). Extrapolating the fit: **~9 ppw for
+1%** and **~28 ppw for 0.1%** eigenvalue error.
+
+Read those numbers with two caveats, both real:
+
+- **The sequence is not monotone** (0.25 is worse than 0.30). gmsh meshes at different `h` are
+  unstructured and non-nested, and the mode is 3-fold degenerate, so the triplet mean wobbles by a
+  percent or so between meshes. Treat the table as a trend, not a per-`h` guarantee — and do your own
+  convergence check on your own geometry rather than reading a single number off a single mesh.
+- **A cavity eigenvalue is the friendly case.** A *driven* problem at high frequency additionally
+  suffers the **pollution effect**: holding `ppw` fixed as the domain grows in wavelengths does *not*
+  hold the error fixed — it degrades with `k(kh)^{2p}` (Babuška & Sauter, *Is the pollution effect of
+  the FEM avoidable for the Helmholtz equation considering high wave numbers?*, SIAM J. Numer. Anal.
+  **34**(6), 2392–2423, 1997). So an electrically large problem needs *more* points per wavelength
+  than a small one, and lowest order is where that bites hardest. If you need many wavelengths across
+  the domain, budget accordingly.
 
 ---
 
@@ -353,10 +453,13 @@ damped wave.
 > step `(M + ½·dt·A) w_next = (M − ½·dt·A) w + dt·c`.
 
 A **vector** field works too (`value_shape=(2,)`/`(3,)`) — that is elastodynamics,
-`ρ u_tt = ∇·σ(u)` (see the vibrating-cantilever tutorial). *Scope: linear, single field (scalar or
-vector), nodal Lagrange, 2D/3D, constant Dirichlet; nonlinear / multi-field / runtime-parameter /
-time-varying-Dirichlet second-order forms are rejected (fail-loud) — write those as a first-order
-system.*
+`ρ u_tt = ∇·σ(u)` (see the vibrating-cantilever tutorial). A **coupled system** where every field
+carries `u_tt` (spring-coupled membranes, coupled waves) rides the same augmented formula with the
+coupled blocks — damping `u_t` terms, a nonlinear spatial operator (Newton on the augmented
+residual) and a driven boundary `g(x, t)` all apply to the coupled case exactly as to a single
+field. *Scope: nodal Lagrange, 2D/3D (1D has its own narrower path). Fail-loud: a coupled field
+with no `u_tt` term (write a first-order field as an explicit first-order system), runtime
+parameters on a coupled form, a trainable Dirichlet value, and `g(x, t)` on a nonlinear form.*
 
 ---
 
@@ -420,17 +523,110 @@ low-level path; the packaged form reuses the **same `adapt=` slot** as h-refinem
 ```python
 xm, ym, _ = domain.variable("core", where=interior, split=True)
 xm.trainable(); ym.trainable()                              # BEFORE jno.fem(...)
-u = fem.solve(adapt=jno.AdaptSpec(relocate=True, max_iters=60))
+u = fem.solve(adapt=jno.solve.relocate(max_iters=60))
 ```
 
-`AdaptSpec(relocate=True)` descends the FE energy through the differentiable solve with a **backtracking
-`det J` line search** — so the fixed node set concentrates at solution features and the mesh never tangles
-(the validity constraint lives in the step control; a stock optimiser or an energy barrier alone cannot
-guarantee it on a stiff problem — see `run_adaptive_relocate`). It mutates the domain to the relocated mesh,
-returns the solution there, and **raises** if no coordinate was tagged. Works across **linear, nonlinear
-(Newton), transient (relocates for the whole trajectory via a time-averaged objective), periodic, and
-complex** problems, scalar or vector — the energy sums over every solution block, so a complex field's real
-and imaginary parts both contribute. Only complex-*transient* is not wired yet.
+`jno.solve.relocate()` descends the **equidistribution defect** of an arclength monitor through the
+differentiable solve, with a **backtracking `det J` line search** — so the fixed node set concentrates at
+solution features and the mesh never tangles (the validity constraint lives in the step control; a stock
+optimiser or an energy barrier alone cannot guarantee it on a stiff problem — see `run_adaptive_relocate`).
+It mutates the domain to the relocated mesh, returns the solution there, and **raises** if no coordinate was
+tagged. Works across **linear, nonlinear (Newton), transient (relocates for the whole trajectory via a
+time-averaged objective), periodic, and complex** problems, scalar or vector — the objective sums over every
+solution block, so a complex field's real and imaginary parts both contribute. Only complex-*transient* is
+not wired yet.
+
+Tagging is **literal and per-axis**: `xm.trainable()` frees only the x column. On a boundary that is the
+lever for sliding — free an edge's along-edge axis and its nodes redistribute *within* the wall, leave the
+normal axis untagged and the domain shape is preserved exactly.
+
+`method="monge_ampere"` swaps the descent for a Monge–Ampère mesh solve, `m·det(I + H(φ)) = θ` with
+`x = ξ + ∇φ` (McRae, Cotter & Budd, SIAM J. Sci. Comput. **40**(2) 2018, arXiv:1612.08077 §3.1). The
+displacement is a gradient, so the *whole* map cannot fold and no line search is needed, and it converges in
+3–6 rounds against descent's 30. It is **not** the default, because on the Allen–Cahn front the suite
+measures (`h=0.06`, `eps=0.03`, error on a common fine grid so the metric does not depend on where each mesh
+puts its nodes) it loses on the answer:
+
+| mesh | rel-L2 | vs uniform | min element quality |
+|---|---|---|---|
+| uniform | 1.096e-01 | 1.000 | 0.834 |
+| `relocate()` (descent) | 3.951e-02 | **0.361** | 0.503 |
+| `relocate(method="monge_ampere")` | 8.879e-02 | 0.811 | 0.160 |
+
+The cause is structural rather than a tuning miss: with one global `θ`, concentrating elements at the front
+forces the rest of the domain to stretch, which is why element quality collapses far from the feature. The
+control is under-relaxation — `relax_step=0.02` recovers quality to 0.318 and the ratio to 0.633.
+
+---
+
+## A moving mesh is a term
+
+A moving mesh is not a solve argument. Put `coord.d(t) - velocity` in the `jno.fem([...])` list — a residual
+like any other equation — and the mesh moves as it says:
+
+```python
+jax.config.update("jax_enable_x64", True)          # required; see the scope list below
+
+xb, yb, tb = domain.variable("boundary", split=True)
+fem = jno.fem([ui.t * vi + kappa * (ui.x * vi.x + ui.y * vi.y),   # the physics
+               u(xb, yb) - 0.0, u(ci[0], ci[1]) - 1.0,
+               yb.d(tb) - 0.5 * yb])                              # dy/dt = y/2 — the mesh
+traj = fem.solve()                                                # one frame per moved mesh
+```
+
+It is recognised **structurally**, by containing `d(spatial coordinate)/d(temporal variable)`, so there is no
+new spelling: `Variable.d` and the term list already exist. Nothing about it is boundary-specific — an
+interior region, a boundary and a `where=` predicate all resolve the same way — and tagging is **per-axis**,
+so a term on `yb` alone moves the y column and holds x exactly. The velocity is ordinary traced math, so an
+interface law may read the solved field (a Stefan front `-(k/L)·∇T·n`), the coordinates, the outward normals,
+the time, or a `jno.np.parameter` that then becomes a design variable. The march is differentiable in all of
+them, and in where the mesh started.
+
+Each step: evaluate every geometry term's velocity, scatter it into the vertices and axes those terms name,
+extend harmonically over everything they do not, move, re-assemble on the moved vertices, and carry the state
+across.
+
+**Scope** — the rest raises rather than guessing:
+
+* **Operator-split ALE, explicit in the velocity**, hence first order in the step — *measured*, against a
+  manufactured solution on a translating domain: observed rates 1.14 / 1.12 / 1.12 / 1.10 with the mesh
+  moving, 0.99 / 1.01 / 1.04 / 1.10 with it still. The motion multiplies the error *constant* by ~3× (that
+  is the state transfer) and leaves the *order* intact. Refining `h` converges too — 1.51 → 1.76 toward the
+  expected 2 for P1 — and P2 is ~18× more accurate than P1 on the same moving mesh, so higher order still
+  pays here.
+
+  If you repeat that measurement, compare against a fine-`dt` reference **on the same mesh**, not against
+  the exact solution: the temporal and spatial errors have opposite signs, so the direct comparison shows
+  rates of +1.4 then −0.4 as they cancel and separate again. That reads as a scheme that stops converging,
+  and is only a contaminated measurement.
+
+  The term list *reads* like a coupled equation and this is not one: an implicit mesh would need the
+  coordinates as unknowns in the monolithic system and the ALE convective term.
+* **The state transfer is a conservative L2 projection** onto the moved mesh, and it is still diffusive. On a
+  rigid translation carrying a marginally-resolved bump the peak falls ~9 % (the pointwise re-interpolation
+  this replaced fell ~33 %, and got *worse* as `dt` shrank). Conservation is algebraic — `Σφ = 1` — so the
+  residual is quadrature error on an integrand with kinks: ~2e-4 relative against the pointwise route's
+  3e-3 to 9e-3. Removing the diffusion entirely means not transferring at all (Lagrangian DOFs plus an ALE
+  `-w·∇u` term), which is a different semidiscretisation.
+* **Requires `jax_enable_x64`.** The transfer locates quadrature points in the previous mesh, and in float32
+  that carries ~4e-4 — enough for a mesh that never moves to drift 1.5e-3 over a march (2.6e-10 with x64).
+* **Backward Euler only**: `θ` comes from the block, and `time=jno.solve.theta(...)` is a solver slot, which
+  a geometry term does not compose with.
+* **Connectivity-preserving**: a move that would invert an element raises. Remesh-on-tangle is the next
+  extension.
+* A Dirichlet BC on the moving surface must be tied to a whole-boundary or held tag, not to a spatial
+  sub-predicate — a predicate does not follow the motion.
+* **Any nodal-Lagrange field(s), real, non-periodic**, 2D or 3D — scalar or vector, P1 or higher, and
+  *mixed orders* across a coupled system (a Taylor–Hood pair moves as one). **Nonlinear** problems work
+  too. Complex, periodic, a non-nodal family (RT / Nédélec / Hermite / Argyris / Morley), a custom
+  `solve_fn` and `save_ts=` each raise.
+
+  Higher order costs almost nothing structurally, for two reasons worth knowing: the mesh geometry is
+  **P1 whatever the field order** — a moved simplex stays straight-sided — so the quadrature map and the
+  point location are shared by every field; and a topology-preserving move leaves the P{k} **connectivity
+  unchanged**, so the seed assembly's tables stay valid for the whole march and the moved DOF
+  *coordinates* are never needed at all. The quadrature degree follows the order (`2k`), because the mass
+  `∫φᵢφⱼ` must be integrated exactly or the solve is not a projection.
 
 ---
 
@@ -526,6 +722,21 @@ answer is wrong by exactly that factor with no error raised, so bind `dV` once a
 > `ε_θθ = u_r/r`, and divergence picks up `u_r/r`. Neither can be produced by weighting the Cartesian
 > form by anything — they are extra terms you must write out. This is precisely why jNO does not offer
 > to apply the weighting automatically: it would be exact for scalars and quietly wrong for vectors.
+
+> **⚠️ This applies to vector EM too, and there is no guard.** An axisymmetric `(r, z)` **vector
+> Maxwell / eddy-current** form — the natural geometry for a coil, a solenoid, a tokamak vessel — is
+> *not* the Cartesian curl-curl weighted by `2πr`. In cylindrical coordinates the curl of a vector
+> field picks up its own `1/r` terms — `(∇×E)_z = (1/r)∂(rE_θ)/∂r` — and for an axisymmetric (`m=0`)
+> problem the meridional (`E_r, E_z`) and azimuthal (`E_θ`) components **decouple into two different
+> operators** that must each be written out. The azimuthal one reduces to a *scalar* equation (in
+> `E_θ`, or in `rA_θ` for the vector-potential/eddy-current form), not a component of the Cartesian
+> form, and it needs care on the axis where `1/r` is singular. Weighting an
+> `"N1E"` form by `2πr` therefore produces a **silently wrong** answer, not an approximate one.
+> Nothing raises: multiplying by `r` is ordinary arithmetic, and the assembler cannot tell it apart
+> from a legitimate radial coefficient — so this limit is stated here, where you choose the geometry,
+> rather than enforced at assembly. Use a **full 3-D** mesh for vector Maxwell (3-D N1E is wired and
+> validated), or derive and write the cylindrical operator yourself as an ordinary scalar/coupled
+> form. jNO ships no axisymmetric H(curl)/H(div) element and no meridional/azimuthal split.
 
 > **Enclosure radiation.** `domain.enclosure(tags, axisymmetric=True)` gives ring areas `2πr̄·L` and a
 > `gap.load(q)` that is **per full revolution** (W, not W/m). The weak form you add it to must carry
@@ -833,6 +1044,13 @@ block. Each step warm-starts from the previous state (so `x0=` is rejected).
 > host-path-only: `lu()` on GPU goes through cuSolver's `spsolve`, a single fused call with no
 > factorization object to keep.
 
+> **Adjoint memory: the march is gradient-checkpointed.** Reverse-mode through the default integrator
+> rematerializes each step in the backward pass instead of storing every step's solver internals for
+> the whole trajectory. Measured at 8,355 DOFs × 399 steps: peak memory **968 → 112 MB (8.6×)** for a
+> gradient cost of **+60%** (2.98 → 4.76 s), gradient identical to 10 digits. The trade is
+> deliberate: a differentiable march OOMs long before it is time-walled on consumer cards. A pure
+> forward solve is unaffected — checkpointing is the identity outside differentiation.
+
 **Complex problems** are assembled as one real `2n` system over the stacked `[Re; Im]` state — the
 real-equivalent block `[[A_r, -A_i], [A_i, A_r]]` — at assembly rather than at solve time. A complex
 transient is therefore an ordinary transient block (the slots configure its per-step solve as above, and
@@ -842,13 +1060,39 @@ block layout for you. Its default solver stays **sparse-direct**, not the matrix
 elliptic systems get — the real-equivalent block is indefinite for Helmholtz/PML, where Jacobi-BiCGStab
 does not converge.
 
-Two exceptions keep a dedicated path. A **complex-native** preconditioner (`ams`) solves `A_r + i·A_i`
-directly rather than the block, so the Re/Im legs are retained for it. And a **Bloch** (quasi-periodic)
-tie has a *complex* prolongation `P`, which does not split into two real legs — that case still solves
-through its own complex block routine, and `x0=` on it is rejected.
+One exception keeps a dedicated path: a **complex-native** preconditioner (`ams`) solves `A_r + i·A_i`
+directly rather than the block, so the Re/Im legs are retained for it.
 
-Not yet supported (clear errors): `adapt=` on a complex transient (the cross-remesh state transfer is
-not complex-aware yet).
+A **Bloch** (quasi-periodic) tie fuses like everything else. Its complex prolongation `P` cannot
+reduce the Re/Im legs independently, but on the fused `[Re; Im]` state the same tie is the *real*
+prolongation `B(P) = [[P_r, -P_i], [P_i, P_r]]`, and the ordinary real congruence `B(P)ᵀ A B(P)`
+equals the Hermitian reduction `P^H A_c P` the Bloch space requires. Consequences: `solve_fn=`, the
+`linear`/`precond` slots and `x0=` all apply to a Bloch problem (each used to be silently discarded by
+a dedicated block routine); a Bloch tie composes with a **complex transient** (the quasi-periodic
+plane-wave march, previously a dtype crash); and a **real** weak form with a Bloch tie is promoted to
+the complex path automatically — the phase makes the field complex anyway, and the real path's
+bilinear `Pᵀ A P` is not a Galerkin projection for a complex `P` (measured 8.1 rel-L2 off the
+Hermitian answer on a manufactured mode, with the tie itself satisfied exactly).
+
+A **coupled (multi-field) complex steady system** — coupled Helmholtz-type equations — takes the same
+Re/Im split through the coupled assembler: one fused real `2n` block over `[Re_all; Im_all]`, with
+`fem.offsets` still listing the per-field blocks of the recombined complex solution. Scope: steady and
+linear (a complex *nonlinear* coupled form and a complex coupled *transient* refuse, as everywhere).
+
+**Essential values on a complex form must be real.** The two legs share one Dirichlet row set, which
+imposes `Re u = g` with `Im u = 0` — right for a real `g`, and the usual case (the complexity lives in
+the operator and the source). A *complex* `g` is not expressible there: pinning `Im u = g_i` would need
+the imaginary leg's rows zeroed rather than set to identity, and the symmetric elimination's
+known-column lift is cross-leg (the real equation needs `A_r[:,j] g_r - A_i[:,j] g_i`, which no per-leg
+elimination produces). It raises a clear error. Carry the complex part in the operator or the source.
+
+`adapt=` composes with a complex **transient** too: the stacked `[Re; Im]` halves transfer across
+each remesh as a doubled field layout, the **modulus** `|u|` drives the remesh metric (refining on
+`Re` alone would miss a rotating phase), and the saved frames come back complex.
+
+Not yet supported (clear errors): a Bloch tie on a **real** transient march (the phase forces a
+complex field — make the problem complex, or use a plain tie) or on a **nonlinear** form (complex
+nonlinear forms are not wired).
 
 ### Multiple devices — `fem.solve(shard=...)`
 
@@ -1061,9 +1305,20 @@ trajectory`. Build your own (e.g. diffrax) from the block's `block.M` / `block.A
 
 ## Vector, coupled, and higher-order problems
 
-* **Vector / elasticity** — `u, phi = d.fem_symbols(value_shape=(2,))`; use `vi.component(i)`,
-  `jno.np.symgrad`, `jno.np.trace`, and `jno.np.inner(..., n_contract=2)` to write the
-  elasticity bilinear form `λ (∇·u)(∇·φ) + 2μ ε(u):ε(φ)`.
+* **Vector / elasticity** — `u, phi = d.fem_symbols(value_shape=(2,))`; write the elasticity bilinear
+  form `λ (∇·u)(∇·φ) + 2μ ε(u):ε(φ)` with `jno.np.symgrad` and `jno.np.inner(..., n_contract=2)` —
+  **or component-wise**: `u[i]` and `u[i].x` / `u[i].d(var)` are first-class on a vector Lagrange field,
+  and the two spellings mix freely in one term (the shape conventions are shared). A boundary traction on
+  one component is `-t * phi_b[i]`.
+* **Finite-strain (hyperelastic) mechanics** — the component spelling is what makes it expressible:
+  build `F = I + ∇u` from `u[i].d(x_j)`, then `det F`, `F⁻ᵀ` and `log` are ordinary term algebra, and a
+  form nonlinear in `∇u` routes to the matrix-free Newton automatically (use
+  `nonlinear=jno.solve.newton(line_search=True)` for large steps). Compressible Neo-Hookean
+  `P = μ(F − F⁻ᵀ) + λ ln(J) F⁻ᵀ` is verified in `tests/test_fem_vector_components.py`: it matches the
+  coupled-scalar spelling to machine precision and linear elasticity in the small-load limit. Ramp a hard
+  load with a warm-started **`sequence` axis**: `space.sequence("load", ramp, keep="last")` then
+  `crux.sweep(space)` — measured on the cantilever: cold *default* Newton fails at `load = 0.1` while
+  the four-step warm-started ramp reaches it.
 * **Coupled / mixed (Stokes)** — call `fem_symbols(...)` once per field and add one momentum and
   one continuity term; an inf-sup-stable Taylor–Hood pair is `order=2` velocity + `order=1`
   pressure. Pure-Dirichlet velocity leaves the pressure defined only up to a constant; gauge-fix
@@ -1169,9 +1424,12 @@ Maxwell / eddy-current** examples, and a **variational PINN** (a neural trial in
 
 ## Known limitations
 
-Each boundary below is an explicit, fail-loud `NotImplementedError` (never a silently wrong result),
-and applies only when you **assemble a weak form** or solve a **transient problem through the time
-route** — the residual-PINN path is unaffected. Full detail is inline in the sections above.
+Almost every boundary below is an explicit, fail-loud `NotImplementedError`. **Two are not, and say so
+in place**: affine (straight-edge) geometry on a curved boundary, and the `2πr` measure on an
+axisymmetric *vector* form — both are cases the assembler cannot distinguish from a legitimate choice,
+so they are stated where you make that choice rather than enforced. These apply when you **assemble a
+weak form** or solve a **transient problem through the time route** — the residual-PINN path is
+unaffected. Full detail is inline in the sections above.
 
 - **Transient mass terms must be parameter-free** — put affine trainable parameters on the stiffness /
   residual, not on `u_t * phi`.
@@ -1179,8 +1437,15 @@ route** — the residual-PINN path is unaffected. Full detail is inline in the s
   **nonlinear spatial** operator (sine-Gordon, cubic Klein–Gordon, large-deformation elastodynamics)
   *is* supported — Newton on the augmented `[u; v]` block — but the **temporal** side must stay linear:
   a state-dependent mass or damping `c(u)·u_tt` is refused, since `M2`/`C` are extracted by
-  differentiating at `u=0` and would otherwise be frozen there. Coupled multi-field is 2D/3D and
-  **all**-second-order only (1D is single-field); time-varying Dirichlet is refused on nonlinear forms.
+  differentiating at `u=0` and would otherwise be frozen there. A **coupled** 2D/3D system flows
+  through the *same* assembler as a single field, so damping, the nonlinear path and a driven
+  boundary `g(x,t)` compose with coupling; what a coupled form still refuses: a field with **no**
+  `u_tt` term (its velocity rows would be singular), **runtime parameters** (the parametric coupled
+  steady assembly underneath is not wired), and periodic ties. Time-varying Dirichlet is refused on
+  nonlinear forms. A **complex coefficient** on any `u_tt` form is refused by name — it used to be
+  silently cast to real (write the problem first-order in time; the complex transient is supported).
+  A coupled 1D system carries `u_tt` on narrower terms (linear, undamped): the augmented state is
+  `[u_all; v_all]`, so `fem.offsets` lists the displacement blocks then the velocity blocks.
 - **Reduced-order (`basis=`) solves** cover steady and **first-order transient** (linear and
   nonlinear). Second-order-in-time (`u_tt`), complex, and periodic-tied problems refuse, each with its
   own reason. Nonlinear reduces, but without hyper-reduction that is a memory win, not a speed one.
@@ -1197,5 +1462,35 @@ route** — the residual-PINN path is unaffected. Full detail is inline in the s
   internal-state readout runs on every cell (sub-region-restricted plasticity is not wired). Kinematic /
   nonlinear (Voce) hardening and contact are separate formulas / machinery, not built.
 
-Hitting one of these is a signal to reformulate (move the parameter, reduce the time order) rather than
-a bug — the error message names the offending term.
+- **Geometry is affine (straight-edge) at every order** — there is no isoparametric mapping, so on a
+  **curved boundary** the domain itself is approximated to O(h²) and that error caps every element
+  order above it. This one is *not* fail-loud: the solve is silently suboptimal. Measured on the unit
+  disk (`-Δu = 4`, `u|∂Ω = 0`, exact `u* = 1 − r²`), L2 rates under refinement:
+
+  | order | expected | measured | error at `h = 0.05` |
+  |---|---|---|---|
+  | P1 | 2 | **2.00** | 1.14e-03 (1 536 dofs) |
+  | P2 | 3 | **2.02** | 7.46e-04 (6 015 dofs) |
+  | P3 | 4 | **2.01** | 7.40e-04 (13 438 dofs) |
+
+  P3 buys *nothing* over P2 on a curved domain — 13 438 dofs for the same answer — and both are barely
+  ahead of P1. The cap comes from imposing the boundary condition at straight-edge nodes that sit on the
+  chord, O(h²) inside the true arc. On a **polygonal** domain the advertised rates hold exactly (the
+  suite measures P2/P3 there). Until an isoparametric mapping exists, prefer `h`-refinement (or the
+  adaptive loop) over `order ≥ 2` near curved boundaries.
+- **Element order on a non-nodal family is refused, not applied** — RT/N1E/P0/Hermite/Argyris/Morley
+  each have one intrinsic order. `space="N1E", order=2` used to return the same lowest-order space
+  silently; it now raises. The mesh is the only accuracy knob on an H(curl)/H(div) problem — see
+  *Mesh resolution for wave problems* for what a given points-per-wavelength buys, measured.
+- **`jno.solve.eigs` / `FEM.eigs` solve the SYMMETRIC pencil**, and now *refuse* a non-symmetric
+  operator instead of silently returning the spectrum of `½(K+Kᵀ)` — a different problem, since a
+  non-self-adjoint operator generally has complex eigenvalues and none of the symmetrized values need
+  be an eigenvalue of the original at all. Non-self-adjoint stability problems (resistive MHD growth
+  rates, drift waves, anything with a mean flow) need a non-symmetric eigensolver, which is **not
+  built**. The check is a randomized bilinear probe and is concrete-only, so it skips under trace.
+- **Axisymmetric `(r, z)` VECTOR forms are your responsibility, and this one is *not* fail-loud** —
+  the `2πr` measure is exact for scalars and wrong for vectors (elasticity hoop strain; and for vector
+  Maxwell the cylindrical curl's own `1/r` terms plus the meridional/azimuthal decoupling). jNO ships
+  no axisymmetric H(curl)/H(div) element, and multiplying by `r` is arithmetic the assembler cannot
+  distinguish from a legitimate radial coefficient, so nothing raises. Use a full 3-D mesh for vector
+  Maxwell, or write the cylindrical operator out yourself. See *Axisymmetric (bodies of revolution)*.

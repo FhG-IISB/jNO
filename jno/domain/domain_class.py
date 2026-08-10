@@ -42,26 +42,70 @@ def _is_facet_predicate(where) -> bool:
     return len(params) == 3 and params[1] in ("n", "normal", "normals") and params[2] in ("name", "names")
 
 
-def _facet_normals(ents, dim):
+def _point_normals_from_facets(sub, sub_n, bpts, dim):
+    """Per-point outward normal for a facet subset: average the incident facet normals at each point.
+
+    Shared by both boundary-tag paths so they agree by construction. They did not: the **facet**
+    predicate (:meth:`domain._tag_by_facet`) stored per-point normals while the ordinary **coordinate**
+    predicate (:meth:`domain._register_tag_boundary_region`) did not, so a tag's normals existed only
+    when the mesh happened to carry that name as a cell set. Anything reading ``normals_by_tag``
+    then saw a *silently missing* entry — see :func:`jno.rcwa._z_ambient_faces`, where a zero normal
+    disqualified every face and RCWA could not find its own superstrate/substrate.
+
+    Points are matched by rounded coordinate (9 dp), the same key ``_tag_by_facet`` has always used —
+    ``bpts`` comes from ``np.unique`` on those very vertices, so every point has at least one facet.
+    """
+    acc = {}
+    for f, fn in zip(sub, sub_n):
+        for v in f:
+            key = tuple(np.round(v[:dim], 9))
+            a = acc.get(key)
+            acc[key] = fn if a is None else a + fn
+    pn = np.array([acc[tuple(np.round(p[:dim], 9))] for p in bpts])
+    return pn / (np.linalg.norm(pn, axis=1, keepdims=True) + 1e-30)
+
+
+def _facet_normals(ents, dim, mesh=None):
     """Outward unit normal per boundary facet (``ents`` is ``(E, k, dim)`` facet-vertex coords).
 
-    Geometric normal oriented away from the boundary centroid -- a reasonable orientation for a
-    *selection* predicate (rough on strongly concave boundaries).
+    With ``mesh`` (a meshio mesh carrying volume cells) the orientation comes from the **topology**, via
+    :func:`~jno.utils.solver.fem_facets.compute_face_normals`: a boundary facet belongs to exactly one
+    cell, so "outward" is "away from that cell's opposite vertex". Exact for any shape.
+
+    Without volume cells there is no topology to ask, and it falls back to orienting away from the
+    boundary centroid. That fallback is only exact for a **star-shaped** domain: on an annulus it gives the
+    inner hole a normal pointing into the material, which is the wrong sign for any law linear in ``n``.
+    It was the unconditional rule here until the moving-boundary work measured it.
     """
     ents = np.asarray(ents, dtype=float)
-    ctr = ents.reshape(-1, dim).mean(axis=0)
-    out = np.zeros((len(ents), dim), dtype=float)
-    for i, f in enumerate(ents):
-        if dim == 2:
-            t = f[1] - f[0]
-            n = np.array([t[1], -t[0]])
-        else:
-            n = np.cross(f[1] - f[0], f[2] - f[0])
-        n = n / (np.linalg.norm(n) + 1e-30)
-        if np.dot(n, f.mean(axis=0) - ctr) < 0.0:
-            n = -n
-        out[i] = n
-    return out
+    if dim == 2:
+        t = ents[:, 1] - ents[:, 0]
+        out = np.stack([t[:, 1], -t[:, 0]], axis=1)
+    else:
+        out = np.cross(ents[:, 1] - ents[:, 0], ents[:, 2] - ents[:, 0])
+    out = out / (np.linalg.norm(out, axis=1, keepdims=True) + 1e-30)
+
+    cells = None
+    if mesh is not None:
+        key = "triangle" if dim == 2 else "tetra"
+        cells = getattr(mesh, "cells_dict", {}).get(key)
+    if cells is not None and len(cells):
+        from ..utils.solver.fem_facets import build_facet_connectivity, compute_face_normals
+
+        cell_type = "triangle" if dim == 2 else "tetrahedron"
+        conn = build_facet_connectivity(np.asarray(cells), cell_type)
+        good = compute_face_normals(np.asarray(mesh.points), conn, np.asarray(cells), cell_type)
+        # match each facet to its topological twin by centroid -- ``ents`` carries coordinates, not ids
+        from scipy.spatial import cKDTree
+
+        gmid = np.asarray(mesh.points)[np.asarray(conn.face_nodes), :dim].mean(axis=1)
+        d, j = cKDTree(gmid).query(ents.mean(axis=1)[:, :dim])
+        tol = 1e-8 * max(float(np.ptp(gmid)), 1.0) if gmid.size else 0.0
+        if float(np.max(d, initial=0.0)) <= tol:
+            return np.where((np.einsum("ij,ij->i", out, good[j]) < 0.0)[:, None], -out, out)
+
+    ctr = ents.reshape(-1, dim).mean(axis=0)  # fallback: away from the boundary centroid
+    return np.where((np.einsum("ij,ij->i", out, ents.mean(axis=1) - ctr) < 0.0)[:, None], -out, out)
 
 
 def _facet_current_names(boundary_regions, mid):
@@ -1422,7 +1466,7 @@ class domain(MeshIOMixin):
             raise ValueError(f"tag({name!r}): a facet predicate f(x, n, name) needs a meshed boundary.")
         ents = np.asarray(ents)  # (E, k, dim) facet-vertex coordinates
         mid = ents.mean(axis=1)  # (E, dim) facet centroids
-        nrm = _facet_normals(ents, dim)  # (E, dim) outward facet normals (geometric)
+        nrm = _facet_normals(ents, dim, getattr(self, "mesh", None))  # (E, dim) outward facet normals
         names = _facet_current_names(self._boundary_regions, mid)  # (E,) each facet's current name
         keep = np.asarray(where(mid, nrm, names)).reshape(-1).astype(bool)
         if not keep.any():
@@ -1437,17 +1481,18 @@ class domain(MeshIOMixin):
             triangles=sub if dim == 3 else None,
             tol=full.tol,
         )
-        self._mesh_pool[name] = bpts
+        # Time-dependent domains store pools as (n_time, n_pts, D) and `sample` indexes the SPATIAL axis
+        # as `group_points[:, idx, :]`. Storing the bare (n_pts, D) here made `variable(name)` raise
+        # "too many indices" on any time-dependent domain, so a facet predicate could name a boundary but
+        # never read its coordinates or normals. Same broadcast the pin-node path above uses.
+        _interior_pool = self._mesh_pool.get("interior")
+        if _interior_pool is not None and np.asarray(_interior_pool).ndim == 3:
+            _n_time = int(np.asarray(_interior_pool).shape[0])
+            self._mesh_pool[name] = np.broadcast_to(bpts, (_n_time,) + bpts.shape).copy()
+        else:
+            self._mesh_pool[name] = bpts
         # per-point outward normals for variable(name, normals=True): average the facet normals at each point
-        acc = {}
-        for f, fn in zip(sub, sub_n):
-            for v in f:
-                key = tuple(np.round(v[:dim], 9))
-                a = acc.get(key)
-                acc[key] = fn if a is None else a + fn
-        pn = np.array([acc[tuple(np.round(p[:dim], 9))] for p in bpts])
-        pn = pn / (np.linalg.norm(pn, axis=1, keepdims=True) + 1e-30)
-        self.normals_by_tag[name] = pn
+        self.normals_by_tag[name] = _point_normals_from_facets(sub, sub_n, bpts, dim)
         self.tag_indices[name] = np.arange(len(bpts))
         if name not in self.avaiable_mesh_tags:
             self.avaiable_mesh_tags.append(name)
@@ -1525,6 +1570,13 @@ class domain(MeshIOMixin):
             edges=sub if dim == 2 else None,
             triangles=sub if dim == 3 else None,
             tol=full.tol,
+        )
+        # Per-point outward normals, exactly as the facet-predicate path stores them. Without this a
+        # coordinate-tagged boundary had a region but NO entry in ``normals_by_tag``, so every reader
+        # of that dict silently saw nothing for the tag — the mesh cell-set path was the only source,
+        # which is why the miss only surfaced once a tag was re-derived from a predicate instead.
+        self.normals_by_tag[name] = _point_normals_from_facets(
+            sub, _facet_normals(sub, dim, getattr(self, "mesh", None)), bpts, dim
         )
 
     def _materialize_tag_pool(self, name, where):
@@ -2692,7 +2744,7 @@ class domain(MeshIOMixin):
         tags,
         *,
         axisymmetric=False,
-        n_quad=3,
+        n_quad=6,  # see build_enclosure: the closed-form azimuth has no near-field refinement
         n_phi=16,
         opaque_tags=None,
         medium_tags=None,

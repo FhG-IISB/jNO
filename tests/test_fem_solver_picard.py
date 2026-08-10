@@ -147,15 +147,20 @@ def test_line_search_rescues_divergent_fixed_step():
 
     ``f(u) = exp(u) - 1`` (root ``u = 0``). From ``u0 = -8`` the Jacobian ``exp(u)`` is tiny, so the
     Newton step is ~ +3000: the fixed full step lands at ``exp(3000) = inf`` and never recovers,
-    while the line search halves the step until the residual actually decreases."""
+    while the line search halves the step until the residual actually decreases.
+
+    The divergent leg now RAISES instead of returning a non-finite iterate: the drivers' step-cap
+    exit is guarded (see ``tests/test_newton_convergence_guard.py``), and a solve coming back as
+    ``nan`` is precisely the case that must not pass silently. The intent is unchanged -- the fixed
+    step cannot solve this and the line search can -- only the failure is loud instead of quiet."""
     from jno.utils.solver.newton_krylov import newton_krylov
 
     f = lambda u: jnp.exp(u) - 1.0
     diag_solve = lambda mv, rhs: rhs / mv(jnp.ones_like(rhs))  # exact 1x1 (diagonal) inner solve
     u0 = jnp.array([-8.0])
 
-    u_fixed = newton_krylov(f, u0, linear_solve=diag_solve, damping=1.0, line_search=False, max_steps=50)
-    assert not np.isfinite(np.asarray(u_fixed)).all()  # fixed full step diverges
+    with pytest.raises(RuntimeError, match="did not converge"):  # fixed full step diverges
+        newton_krylov(f, u0, linear_solve=diag_solve, damping=1.0, line_search=False, max_steps=50)
 
     u_ls = newton_krylov(f, u0, linear_solve=diag_solve, damping=1.0, line_search=True, max_steps=200)
     assert np.isfinite(np.asarray(u_ls)).all()

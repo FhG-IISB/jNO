@@ -428,11 +428,56 @@ def test_complex_transient_exponential_scheme_routes():
     assert out.dtype == np.complex128 and not np.any(np.isnan(out))
 
 
-def test_complex_transient_adapt_still_fails_loud():
-    """Scope limit, stated explicitly: fusing the block makes a complex transient *route* into the adaptive
-    transient driver, but that driver's cross-remesh state transfer interpolates a real nodal field and the
-    fused state is the stacked ``[Re; Im]`` pair. Until the transfer carries the two halves separately this
-    must fail loud rather than interpolate half a complex field."""
+def test_complex_transient_adapt_composes():
+    """The scope limit this test used to pin is GONE: the adaptive transient driver now carries the
+    fused ``[Re; Im]`` halves separately (a doubled field layout drives the transfer, the modulus
+    drives the metric), so a complex transient composes with ``adapt=`` instead of failing loud.
+    Smoke here — the analytic-recovery and zero-IC extremes live in test_fem_adapt_complex.py."""
+    # remeshing goes through mmgpy, an OPTIONAL dependency the adapt-dedicated files skip at module
+    # level; this file is not one of them, so guard per-test (as the matfree case above does).
+    pytest.importorskip("mmgpy", reason="mmgpy required for adaptive remeshing")
     _, fem = _complex_heat(mesh_size=0.3)
-    with pytest.raises(NotImplementedError, match="complex"):
-        fem.solve(adapt=jno.AdaptSpec(every=2))
+    traj = fem.solve(adapt=jno.solve.remesh(every=2, max_dofs=80))
+    final, _mesh = traj.final()
+    final = np.asarray(final)
+    assert np.iscomplexobj(final), "adaptive frames of a complex transient must be complex"
+    assert not np.isnan(final).any()
+
+
+def test_exhausted_budget_poison_reaches_the_adjoint():
+    """A starved ``max_steps`` must poison the **gradient**, not only the value.
+
+    ``adaptive_march`` NaN-poisons its trajectory when it cannot reach ``t1``.  Applied as
+    ``jnp.where(reached, out, nan)`` that poisons the value alone: the VJP of ``where`` w.r.t. the taken
+    branch is ``where(c, g, 0)``, so the gradient of a failed march came back as exactly **zero** — and an
+    inverse problem reads the gradient, so a starved budget looked like a converged optimisation.  The
+    poison is multiplicative, so the NaN reaches the cotangent.
+
+    Driven directly with a scalar step so the property is pinned at the marcher, independent of what any
+    particular block's adjoint does downstream.
+    """
+    from jno.utils.solver.timeschemes import adaptive_march
+
+    def step_fn(u, t, dt):
+        return u * (1.0 - dt * 3.0)
+
+    def march(p, max_steps):
+        out = adaptive_march(
+            lambda u, t, dt: step_fn(u * p, t, dt),
+            jnp.ones(1),
+            0.0,
+            1.0,
+            jnp.linspace(0.0, 1.0, 4),
+            rtol=1e-3,
+            atol=1e-6,
+            max_steps=max_steps,
+        )
+        return jnp.sum(out**2)
+
+    starved = float(jax.grad(lambda p: march(p, 2))(1.0))
+    assert np.isnan(float(march(1.0, 2))), "a march that cannot reach t1 must return a NaN trajectory"
+    assert np.isnan(starved), f"the poison must reach the adjoint, got {starved}"
+
+    fed = float(jax.grad(lambda p: march(p, 200))(1.0))
+    assert np.isfinite(float(march(1.0, 200))), "a march that reaches t1 must not be poisoned"
+    assert np.isfinite(fed), "and its gradient must stay finite — the poison is a no-op when reached"
