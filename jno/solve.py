@@ -135,7 +135,10 @@ def lu(*, backend: str = "device", host: bool | None = None) -> LinearSolver:
     # the name carries the placement, so two specs that factor in different memories are not
     # reported (or cached) as though they were the same solver
     name = {"device": "lu", "host": "lu-host", "cudss": "lu-cudss"}[backend]
-    return LinearSolver(_fn, name=name, direct=True, traits={"vmap": "no"})
+    # `multi_rhs` lets a caller holding a BLOCK of right-hand sides (the shift-invert eigensolver's
+    # subspace iteration) hand the whole block over in one call instead of looping its columns.
+    traits = {"vmap": "no", "multi_rhs": backend == "cudss"}
+    return LinearSolver(_fn, name=name, direct=True, traits=traits)
 
 
 def dense() -> LinearSolver:

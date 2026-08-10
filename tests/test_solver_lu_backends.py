@@ -303,3 +303,189 @@ def test_singular_operator_raises_instead_of_returning_finite_garbage():
     A = jsp.BCOO((jnp.asarray([1.0, 2.0, 0.0, 4.0]), idx), shape=(4, 4))
     with pytest.raises(RuntimeError, match="SINGULAR"):
         cudss_lu_solve(A, jnp.ones(4))
+
+
+# --------------------------------------------------------------------------------------
+# matrix-type detection (feature: SYMMETRIC/LDL^T instead of general LU)
+# --------------------------------------------------------------------------------------
+#
+# Enum-free by design, so the decision logic is testable on any machine; the @requires_cudss test
+# further down confirms cuDSS actually accepts what it decides.
+
+
+def _kind(M):
+    from jno.utils.solver.linear import _cudss_matrix_kind, _cudss_sym_perms
+
+    c = sp_coo(M)
+    order, orderT, pat = _cudss_sym_perms(c.row, c.col)
+    return _cudss_matrix_kind(c.data, order, orderT, pat)
+
+
+def sp_coo(M):
+    import scipy.sparse as sp
+
+    return sp.coo_matrix(np.asarray(M))
+
+
+def test_symmetric_matrix_is_detected():
+    assert _kind([[2.0, 1.0], [1.0, 3.0]]) == "symmetric"
+
+
+def test_nonsymmetric_values_fall_back_to_general():
+    """Symmetric PATTERN but asymmetric values -- the case a pattern-only test would get wrong."""
+    assert _kind([[2.0, 1.0], [5.0, 3.0]]) == "general"
+
+
+def test_nonsymmetric_pattern_falls_back_to_general():
+    assert _kind([[2.0, 1.0], [0.0, 3.0]]) == "general"
+
+
+def test_complex_hermitian_and_complex_symmetric_are_distinguished():
+    assert _kind(np.array([[2.0 + 0j, 1 + 1j], [1 - 1j, 3 + 0j]])) == "hermitian"
+    assert _kind(np.array([[2.0 + 0j, 1 + 1j], [1 + 1j, 3 + 0j]])) == "symmetric"
+
+
+def test_nearly_symmetric_is_NOT_treated_as_symmetric():
+    """The important one. A symmetric factorization reads one triangle, so accepting a matrix that is
+    symmetric only to ~1e-15 would silently factor (A+A^T)/2 -- an error of order cond(A)*1e-15."""
+    assert _kind([[2.0, 1.0], [1.0 + 1e-15, 3.0]]) == "general"
+
+
+def test_detection_is_indifferent_to_coo_entry_order():
+    """Assembly emits entries in whatever order; the test must not depend on it."""
+    import scipy.sparse as sp
+
+    from jno.utils.solver.linear import _cudss_matrix_kind, _cudss_sym_perms
+
+    rng = np.random.default_rng(0)
+    M = np.array([[2.0, 1.0, 0.0], [1.0, 3.0, 4.0], [0.0, 4.0, 5.0]])
+    c = sp.coo_matrix(M)
+    p = rng.permutation(c.nnz)
+    order, orderT, pat = _cudss_sym_perms(c.row[p], c.col[p])
+    assert _cudss_matrix_kind(c.data[p], order, orderT, pat) == "symmetric"
+
+
+def test_empty_and_diagonal_matrices_are_symmetric():
+    assert _kind(np.diag([1.0, 2.0, 3.0])) == "symmetric"
+    assert _kind(np.zeros((3, 3))) == "symmetric"  # no stored entries: vacuously symmetric
+
+
+# --------------------------------------------------------------------------------------
+# block right-hand side (feature: one cuDSS call for k columns)
+# --------------------------------------------------------------------------------------
+
+
+def test_only_cudss_advertises_multi_rhs():
+    assert jno.solve.lu(backend="cudss").traits["multi_rhs"] is True
+    assert jno.solve.lu(backend="host").traits["multi_rhs"] is False
+    assert jno.solve.lu(backend="device").traits["multi_rhs"] is False
+
+
+def test_wiring_solves_a_block_rhs_matching_the_column_loop(wired):
+    n, k = 40, 6
+    A = _spd(n, seed=12)
+    B = jnp.asarray(np.random.default_rng(13).normal(size=(n, k)))
+    X = wired(A, B)
+    assert X.shape == (n, k)
+    cols = jnp.stack([wired(A, B[:, j]) for j in range(k)], axis=1)
+    np.testing.assert_allclose(np.asarray(X), np.asarray(cols), rtol=1e-9, atol=1e-11)
+    assert np.linalg.norm(A @ X - B) / np.linalg.norm(B) < 1e-10
+
+
+def test_block_rhs_is_differentiable(wired):
+    n, k = 20, 3
+    A = _spd(n, seed=14)
+    B = jnp.asarray(np.random.default_rng(15).normal(size=(n, k)))
+
+    def loss(vals):
+        return jnp.sum(wired(jsp.BCOO((vals, A.indices), shape=A.shape), B) ** 2)
+
+    g = jax.grad(loss)(A.data)
+    eps = 1e-6
+    fd = np.array([(loss(A.data.at[i].add(eps)) - loss(A.data.at[i].add(-eps))) / (2 * eps) for i in range(4)])
+    np.testing.assert_allclose(np.asarray(g[:4]), fd, rtol=1e-5, atol=1e-8)
+
+
+def test_shift_invert_uses_one_block_call_when_the_solver_advertises_multi_rhs():
+    """The eigensolver must actually TAKE the block path -- otherwise the trait buys nothing."""
+    from jno.utils.solver.eigen import shift_invert_geneigh
+
+    n = 120  # above the n <= max(64, 4k+16) dense shortcut, so the inner solve is actually used
+    rng = np.random.default_rng(16)
+    Q = np.linalg.qr(rng.normal(size=(n, n)))[0]
+    K = jnp.asarray(Q @ np.diag(np.linspace(1.0, 30.0, n)) @ Q.T)
+    K = 0.5 * (K + K.T)
+
+    calls = {"n": 0, "widths": []}
+
+    def counting(A, b, **kw):
+        calls["n"] += 1
+        calls["widths"].append(1 if jnp.ndim(b) == 1 else b.shape[1])
+        dense = jnp.asarray(A.todense() if hasattr(A, "todense") else A)
+        return jnp.linalg.solve(dense, b)  # handles (n,) and (n,k) alike; the point is the WIDTH
+
+    counting.traits = {"multi_rhs": True}
+    lam, _ = shift_invert_geneigh(K, None, 3, 10.0, inner_solve=counting, tol=1e-8, maxiter=30)
+    ref = np.linalg.eigvalsh(np.asarray(K))
+    nearest = ref[np.argsort(np.abs(ref - 10.0))[:3]]
+    np.testing.assert_allclose(np.sort(np.asarray(lam)), np.sort(nearest), rtol=1e-6)
+    assert max(calls["widths"]) > 1, "block solver was still called column by column"
+
+
+@requires_cudss
+def test_cudss_accepts_the_detected_matrix_type_and_a_block_rhs():
+    n, k = 100, 5
+    A = _spd(n, seed=17)
+    S = A + A.T  # exactly symmetric -> must take the SYMMETRIC path and still be right
+    B = jnp.asarray(np.random.default_rng(18).normal(size=(n, k)))
+    X = cudss_lu_solve(S, B)
+    assert np.linalg.norm(S @ X - B) / np.linalg.norm(B) < 1e-10
+
+
+@requires_cudss
+def test_values_that_stop_being_symmetric_force_a_replan():
+    """Same sparsity, new values, DIFFERENT type: reusing the LDL^T plan would be silently wrong."""
+    n = 80
+    A = _spd(n, seed=19)
+    S = A + A.T
+    b = jnp.ones(n)
+    cudss_lu_solve(S, b)  # plans as SYMMETRIC
+    NS = S.at[0].set(S.data[0] + 3.0) if hasattr(S, "at") else S
+    NS = jsp.BCOO((S.data.at[0].add(3.0), S.indices), shape=S.shape)  # breaks symmetry
+    x = cudss_lu_solve(NS, b)
+    assert np.linalg.norm(NS @ x - b) / np.linalg.norm(b) < 1e-10
+
+
+def test_every_cache_field_read_is_a_field_that_gets_written():
+    """Catches cache-entry key drift -- which the @requires_cudss tests CANNOT, because they skip.
+
+    A real bug this file shipped for one commit: the entry was written with ``"mtype"`` while the
+    re-plan check read ``entry["kind"]``, so every value change would have raised ``KeyError`` on a
+    machine with cuDSS installed. Nothing here executes cuDSS, so the guard has to be structural.
+    """
+    import ast
+    import inspect
+
+    from jno.utils.solver import linear
+
+    tree = ast.parse(inspect.getsource(linear))
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_cudss_host_solve")
+
+    written = set()
+    for node in ast.walk(fn):  # the dict literal stored into the cache
+        if isinstance(node, ast.Dict) and any(
+            isinstance(k, ast.Constant) and k.value == "solver" for k in node.keys if k is not None
+        ):
+            written |= {k.value for k in node.keys if isinstance(k, ast.Constant)}
+    assert written, "could not locate the cache-entry literal"
+
+    read = {
+        node.slice.value
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Subscript)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "entry"
+        and isinstance(node.slice, ast.Constant)
+        and isinstance(node.slice.value, str)
+    }
+    assert read <= written, f"cache fields read but never written: {sorted(read - written)}"

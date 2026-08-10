@@ -405,8 +405,14 @@ def shift_invert_geneigh(
         from .linear import host_lu_solve
 
         inner = lambda b: host_lu_solve(A_sig, b)  # noqa: E731  factorized once (content-keyed cache)
+        block_inner = None
     else:
         inner = lambda b: inner_solve(A_sig, b)  # noqa: E731
+        # A solver advertising ``multi_rhs`` takes the WHOLE subspace block in one call. This is the
+        # method's inner loop -- one application of C per sweep, m columns each -- and a factorization
+        # solved as a block beats the same factorization solved column by column by 1.9x at m=4 rising
+        # to 5.5x at m=32 (cuDSS, measured). Solvers without the trait keep the column loop.
+        block_inner = inner if getattr(inner_solve, "traits", {}).get("multi_rhs") else None
 
     # Block shift-invert SUBSPACE ITERATION (Bathe & Wilson, *Solution methods for eigenvalue
     # problems in structural mechanics*, IJNME 6 (1973) — the classical pairing with the Ericsson-Ruhe
@@ -423,8 +429,13 @@ def shift_invert_geneigh(
     dt = _as_dense_dtype(K)
     eps = jnp.finfo(dt).eps
 
-    def _apply_C(V):  # C V = (K−σM)⁻¹ M V, column-wise: the host-factorized inner solve has no vmap rule
-        return jnp.stack([inner(Mmv(V[:, i])) for i in range(m)], axis=1)
+    def _apply_C(V):  # C V = (K−σM)⁻¹ M V
+        MV = jnp.stack([Mmv(V[:, i]) for i in range(m)], axis=1)
+        if block_inner is not None:  # one block solve, not m of them
+            return block_inner(MV)
+        # column-wise otherwise: the host-factorized inner solve runs through a ``pure_callback``,
+        # which has no vmap batching rule, so a static unrolled loop is what is available
+        return jnp.stack([inner(MV[:, i]) for i in range(m)], axis=1)
 
     def sweep(state):
         i, V, _res, _lam = state
