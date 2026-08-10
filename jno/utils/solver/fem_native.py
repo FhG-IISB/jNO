@@ -499,6 +499,11 @@ def assemble_fem_native(
 
     ctx = dict(getattr(domain, "context", {}) or {})
     ctx.pop("cell_size", None)  # `dom.cell_size` placeholder; the real per-cell h is packed per volume element below
+    # Same for every `u.gap(slave, master)` placeholder: dropping it means a gap that assembly has not
+    # packed raises as an unresolved symbol instead of silently evaluating to the zero placeholder --
+    # which would read as "everywhere exactly in contact" and be believed.
+    for _k in [k for k in ctx if str(k).startswith("gap_")]:
+        ctx.pop(_k, None)
 
     # -------------------------------------------------------------------------
     # Field layout inference
@@ -900,6 +905,51 @@ def assemble_fem_native(
             )
             _surf_region_faces[_R] = np.where(_mask)[0].astype(np.int32)
 
+    # ---- contact gaps: u.gap(slave, master) -> per-face tables, built once, on the host -----------
+    # For every slave face this precomputes where its quadrature points land on the master surface:
+    # the master nodes each point reads (`ids`), their shape weights (`w`), and the initial along-normal
+    # separation (`g0`). At solve time the moving part is a plain gather, so the gap is differentiable
+    # in the DOFs; the pairing itself is frozen, which is what limits this to SMALL SLIDING.
+    _gap_tables: Dict[str, dict] = {}
+    _contact_pairs = dict(getattr(domain, "_contact_pairs", {}) or {})
+    if _contact_pairs and conn.n_bfaces > 0:
+        from .fem_utils import interface_gap_data
+
+        _all_faces = np.arange(conn.n_bfaces)
+        for _key, (_slave, _master, _fkey) in _contact_pairs.items():
+            _fidx = field_index.get(_fkey)
+            if _fidx is None:  # the gap's field is not in this system -> nothing to pack
+                continue
+            _snodes = {int(n) for n in _region_node_ids(domain, _slave)}
+            _mnodes = {int(n) for n in _region_node_ids(domain, _master)}
+            _fn = conn.face_nodes
+            _is_in = lambda fi, S: all(int(_fn[fi, j]) in S for j in range(_fn.shape[1]))  # noqa: E731
+            _sf = np.array([fi for fi in _all_faces if _is_in(fi, _snodes)], dtype=np.int32)
+            _mf = np.array([_fn[fi] for fi in _all_faces if _is_in(fi, _mnodes)], dtype=np.int64)
+            if _sf.size == 0 or _mf.size == 0:
+                raise ValueError(
+                    f"u.gap({_slave!r}, {_master!r}): found {_sf.size} slave and {len(_mf)} master boundary "
+                    "facets. Both faces must select whole boundary facets -- check the tag predicates."
+                )
+            # Physical quadrature points of each slave face, formed exactly as `_surf_elem_res` does.
+            _fp_qp = np.asarray(face_tables_per_field[_fidx][2])  # (n_faces_local, n_q, dim)
+            _pc, _lk = np.asarray(conn.parent_cell)[_sf], np.asarray(conn.local_face)[_sf]
+            _verts = np.asarray(pts_f_all[_fidx])[np.asarray(cells_f_all[_fidx])[_pc][:, : dim + 1]]
+            _J = np.stack([_verts[:, i + 1] - _verts[:, 0] for i in range(dim)], axis=-1)  # (n_s, dim, dim)
+            _xq = _verts[:, 0][:, None, :] + np.einsum("fqd,fDd->fqD", _fp_qp[_lk], _J)
+            _nrm = np.broadcast_to(np.asarray(normals_np)[_sf][:, None, :], _xq.shape)
+            _ids, _w, _g0 = interface_gap_data(_xq, _mf, np.asarray(pts_f_all[_fidx]), _nrm)
+            _g0_full = np.zeros((conn.n_bfaces, np.asarray(_g0).shape[1]))
+            _g0_full[_sf] = np.asarray(_g0)
+            _gap_tables[_key] = {
+                "faces": jnp.asarray(_sf, dtype=jnp.int32),
+                "ids": jnp.asarray(np.asarray(_ids), dtype=jnp.int32),  # (n_s, n_q, k) master node ids
+                "w": jnp.asarray(np.asarray(_w)),  # (n_s, n_q, k)
+                "g0_full": jnp.asarray(_g0_full),  # (n_bfaces, n_q), zero off the slave face
+                "field": int(_fidx),
+                "slave": _slave,
+            }
+
     # -------------------------------------------------------------------------
     # Cell-level field data builder (called inside vmap'd kernels)
     # -------------------------------------------------------------------------
@@ -1181,7 +1231,30 @@ def assemble_fem_native(
             )
         return out
 
-    def _surf_elem_res(fi, local_all, bcoeff, btfi, region, t=0.0, args=None, pts=None, normals=None):
+    def _gap_gather(u_flat, key):
+        """``u_m . Phi`` at every slave-face quadrature point: ``(n_slave_faces, n_q, vec)``.
+
+        Done GLOBALLY, outside the per-face vmap, because the master nodes live on the other body's
+        cells -- they are not in the slave face's parent-cell DOF slice. A plain weighted gather, so
+        ``jax.linearize`` (the default JFNK path) picks up the master coupling in the tangent exactly,
+        with no assembled Jacobian block needed.
+        """
+        tb = _gap_tables[key]
+        fidx, vt = tb["field"], vecs[tb["field"]]
+        dofs = offs[fidx] + tb["ids"][..., None] * vt + jnp.arange(vt)  # (n_s, n_q, k, vec)
+        um = jnp.einsum("sqk,sqkv->sqv", tb["w"], u_flat[dofs])
+        # Scattered up to ALL boundary faces so a region's slice is a plain index -- the gap's own face
+        # list and a term's ``surface_work`` face list are built separately, and assuming they agree in
+        # order would be exactly the kind of silent mismatch this file keeps warning about.
+        return jnp.zeros((conn.n_bfaces,) + um.shape[1:], um.dtype).at[tb["faces"]].set(um)
+
+    def _gap_slices(region, fids, gap_um):
+        """``{key: (g0, u_m)}`` for every gap whose SLAVE face is this region, aligned with ``fids``."""
+        return {
+            k: (_gap_tables[k]["g0_full"][fids], gap_um[k][fids]) for k in _gap_tables if _gap_tables[k]["slave"] == region
+        } or None
+
+    def _surf_elem_res(fi, local_all, bcoeff, btfi, region, t=0.0, args=None, pts=None, normals=None, gaps=None):
         """Element residual of one surface term on boundary face ``fi`` as a function of the parent
         cell's gathered all-field local DOFs ``local_all`` -> ``(n_test_dofs_btfi,)``. ``pts`` / ``normals``
         are the coordinate-parameter-scattered geometry and its facet normals (``None`` -> static mesh)."""
@@ -1223,6 +1296,23 @@ def assemble_fem_native(
             "trial_value_shape": fields[btfi]["value_shape"],
             "trial_vec": vecs[btfi],
         }
+        # Contact gap g = g0 + n . (u_s - u_m . Phi) at this face's quadrature points. ``gaps`` carries
+        # this face's frozen g0 and its already-gathered master values -- see :func:`_gap_gather`.
+        if gaps:
+            for _k, (_g0_f, _um_f) in gaps.items():
+                _gfi = _gap_tables[_k]["field"]
+                _us = per_f[_gfi]["shape_vals"] @ per_f[_gfi]["cell_sol"]  # (n_q, vec)
+                _jump = _us.reshape(_us.shape[0], -1) - _um_f.reshape(_um_f.shape[0], -1)
+                # Explicit shape check: `jnp.einsum("d,qd->q", n, jump)` silently BROADCASTS a size-1
+                # component axis, so a scalar field would contract to `sum(n) * jump` -- right only when
+                # the normal happens to sum to 1, wrong on any tilted interface, and never an error.
+                if _jump.shape[1] != n_vec.shape[0]:
+                    raise ValueError(
+                        f"u.gap: the field has {_jump.shape[1]} component(s) but the interface normal has "
+                        f"{n_vec.shape[0]}. A normal gap needs a vector field with one component per "
+                        "dimension -- use fem_symbols(value_shape=(dim,))."
+                    )
+                loc["domain_context"][_k] = _g0_f + (_jump * n_vec[None, :]).sum(axis=1)
         if _field_param_names:
             loc["shape_vals"] = per_f[_field_param_field_idx]["shape_vals"]
         _nt = neural_local_table(_neural, args)
@@ -1439,22 +1529,50 @@ def assemble_fem_native(
                 R = R.at[cdofs[tfi].reshape(-1)].add(elem.reshape(-1))
 
             normals_dyn = _surface_normals(pts_dyn)  # differentiable facet normals under coordinate motion
+            # Master-side values for every contact gap, gathered ONCE over the whole slave face: the
+            # nodes read live on the other body's cells, so this cannot happen inside the per-face map.
+            gap_um = {k: _gap_gather(u_flat, k) for k in _gap_tables}
             for region, face_ids, btyped in surface_work:
                 fids = jnp.asarray(face_ids, dtype=jnp.int32)
                 pcells = parent_j[fids]
                 lv = u_flat[cell_all_dofs[pcells]]  # (n_face, n_local_all)
+                gslice = _gap_slices(region, fids, gap_um)  # {key: (g0, u_m)} for THIS region's faces
                 for bcoeff, btfi in btyped:
                     contribs = _elem_map(
-                        lambda fi, la, _e=bcoeff, _t=btfi, _r=region: _surf_elem_res(
-                            fi, la, _e, _t, _r, t, args, pts_dyn, normals_dyn
+                        lambda fi, la, gp, _e=bcoeff, _t=btfi, _r=region: _surf_elem_res(
+                            fi, la, _e, _t, _r, t, args, pts_dyn, normals_dyn, gp
                         ),
-                        (fids, lv),
+                        (fids, lv, gslice),
                         _cell_chunk(int(fids.shape[0]), cdofs[btfi].shape[1], cell_all_dofs.shape[1]),
                     )
                     R = R.at[cdofs[btfi][pcells].reshape(-1)].add(contribs.reshape(-1))
             return R
 
         return residual
+
+    def _gap_refuses_assembled_tangent(bterms):
+        """A contact gap is NON-LOCAL: it reads DOFs on the master body's cells, not the slave face's
+        parent cell. The assembled path builds each element block by ``jacfwd`` w.r.t. that element's
+        own DOFs and emits columns ``cell_all_dofs[pcells]``, so it would silently drop the whole
+        slave-master coupling -- a tangent that looks fine and just makes Newton crawl.
+
+        Emitting a second block with master columns is possible (``_emit`` takes arbitrary indices) but
+        costs another element-matrix buffer for every surface term, and the DEFAULT path never needs
+        it: contact is nonlinear, so ``newton_krylov`` takes matrix-free JVPs through
+        ``jax.linearize`` of the residual, which picks up the master coupling exactly. So the block is
+        not built at all, and this path refuses rather than being quietly wrong.
+
+        Raised on USE, not on construction -- ``_make_jacobian`` is called unconditionally at build
+        time even for problems that will only ever take the matrix-free route.
+        """
+        if _gap_tables and bterms:
+            raise NotImplementedError(
+                "jno.fem: a contact gap (u.gap) needs the matrix-free tangent -- its dependence on the "
+                "master body's DOFs cannot be expressed in this assembled per-element Jacobian, and "
+                "silently dropping it would degrade Newton with no error. Contact is nonlinear, so the "
+                "default fem.solve() already takes the matrix-free path; drop "
+                "`nonlinear=jno.solve.newton(direct=True)` if you set it."
+            )
 
     def _make_jacobian(terms, bterms=None):
         """Build the dense Jacobian ``J(u_flat) -> (total, total)`` by *per-element* forward-mode AD.
@@ -1501,6 +1619,7 @@ def assemble_fem_native(
             _idx_static, _plan = None, None  # fall back to the uncompressed (still correct) path
 
         def jacobian(u_flat, t=0.0, args=None):
+            _gap_refuses_assembled_tangent(bterms)  # non-local gap -> matrix-free tangent only
             # Assemble into COO triplets and build a BCOO -- never materialises the dense (total, total)
             # matrix (O(nnz), GPU-able at large N). Each per-element block is element-sized; duplicate
             # (i, j) triplets from neighbouring cells are summed by BCOO on matvec / todense, so the

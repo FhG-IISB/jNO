@@ -3526,6 +3526,73 @@ class TrialFunction(Placeholder):
 
     bind = partials
 
+    def gap(self, slave: str, master: str, *, domain):
+        """Signed **contact gap** between two tagged boundary faces, as a symbol usable in a weak form.
+
+        ``g = g0 + n . (u_slave - u_master . Phi)`` at the slave face's quadrature points: ``g0`` is the
+        initial along-normal separation, the second term how the two bodies have since moved relative
+        to each other. Positive is open, negative is penetrating -- the sign the augmented-Lagrangian
+        pressure ``max(0, lam + c*(-g))`` expects::
+
+            g = u.gap("sheet", "die", domain=d)
+            n = d.variable("sheet", normals=True, split=True)
+            p = jno.np.maximum(0.0, lam.i(-1) + c * (-g))      # AL pressure -- a formula
+            fem = jno.fem([..., p * jno.np.inner(n, phi.bind(...), n_contract=1), lam.evolves(p)])
+
+        The traction is an ordinary weak boundary term, so nothing is passed to ``fem.solve()``. The
+        gap is **non-local** -- it reads DOFs on the master body's cells, not the slave face's parent
+        cell -- so assembly emits a second Jacobian block whose columns are those master DOFs, which is
+        what keeps the tangent consistent.
+
+        Like ``domain.cell_size`` this is a placeholder symbol: the real per-quadrature-point value is
+        packed during assembly and overrides the context entry everywhere it is used.
+
+        **Scope:** small sliding (the pairing is frozen at build time, so a sliding configuration must
+        be rebuilt per load step); differentiable in the DOF values but **not** in the mesh coordinates,
+        since the projection weights are host-computed; and non-differentiable at contact onset --
+        ``max(0, .)`` gives a subgradient, which is what a semismooth Newton wants but an optimizer
+        differentiating through contact will see as a kink.
+        """
+        # ``domain`` is required and keyword-only ON PURPOSE. A fem symbol carries no domain, and
+        # ``Placeholder`` synthesises attribute access into trace nodes -- so a ``getattr(self,
+        # "_domain", None)`` fallback silently returns a *node* rather than None and builds a Variable
+        # bound to nonsense. Better to make the caller say which domain than to guess wrongly.
+        dom = domain
+        if not hasattr(dom, "context") or not hasattr(dom, "_boundary_regions"):
+            raise TypeError(f"u.gap: `domain=` must be a jno domain, got {type(dom).__name__}.")
+        breg = getattr(dom, "_boundary_regions", {}) or {}
+        for tag in (slave, master):
+            if tag not in breg:
+                raise ValueError(
+                    f"u.gap: {tag!r} is not a boundary region on this domain. Known: {sorted(breg)}. "
+                    "Tag each side of the interface first -- a non-conforming Shape.regions names them "
+                    "'a|b.a' / 'a|b.b' automatically."
+                )
+        if slave == master:
+            raise ValueError("u.gap: the slave and master faces must be different regions.")
+        _dim = int(getattr(dom, "dimension", 0) or 0)
+        if self.value_shape != (_dim,):
+            raise ValueError(
+                f"u.gap: a normal gap `n . (u_s - u_m)` needs a vector field with one component per "
+                f"dimension, but this field has value_shape={self.value_shape} on a {_dim}-D domain. "
+                f"Contact is a vector concept -- build the field with fem_symbols(value_shape=({_dim},))."
+            )
+
+        key = f"gap_{slave}"
+        pairs = dom.__dict__.setdefault("_contact_pairs", {})
+        prev = pairs.get(key)
+        if prev is not None and prev[:2] != (slave, master):
+            raise ValueError(
+                f"u.gap: {slave!r} is already the slave face of a gap against {prev[1]!r}; a face "
+                "carries at most one gap. Use a distinct slave tag for the second pair."
+            )
+        pairs[key] = (slave, master, self.field_key)
+        if key not in dom.context:  # placeholder so the Variable constructs; assembly packs the real g
+            import numpy as _np
+
+            dom.context[key] = _np.zeros((1, 1))
+        return Variable(tag=key, dim=[0, 1], domain=dom, axis="spatial")
+
     def pin(self, value=0.0):
         """Gauge-fix this field's constant null space by pinning one arbitrary DOF to ``value``.
 

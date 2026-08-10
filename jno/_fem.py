@@ -525,6 +525,10 @@ def _region_and_support(constraint: Any, domain: Any) -> Tuple[str, str]:
         # to its region, not a separate one -- so `g*(v·n)` on a boundary is a single-region term.
         if tag.startswith("n_") and tag[2:] in _bregions:
             tag = tag[2:]
+        # a contact-gap Variable `gap_<slave>` (from u.gap(slave, master)) likewise belongs to the slave
+        # face, not a region of its own -- so `p(g) * (n·v)` on that face stays a single-region term.
+        if tag.startswith("gap_") and tag[4:] in _bregions:
+            tag = tag[4:]
         return _normalize_quad_tag(tag, _bregions)
 
     def _effective_tag(v) -> str:
@@ -624,7 +628,11 @@ def _retag_coords_for_quadrature(constraint: Any, support: str, region_id: str) 
     for v in _spatial_coord_vars(constraint):
         # outward-normal Variables (`n_<region>`) and the element-size symbol (`cell_size`) are not
         # quadrature coordinates -- leave their tag so they stay resolvable from the domain context.
-        if isinstance(v.tag, str) and v.tag not in ("fem_gauss", "cell_size") and not v.tag.startswith(("gauss_", "n_")):
+        if (
+            isinstance(v.tag, str)
+            and v.tag not in ("fem_gauss", "cell_size")
+            and not v.tag.startswith(("gauss_", "n_", "gap_"))
+        ):
             # Remember the region before rebinding to the quadrature pool. The retag must persist for
             # lazy operators (nonlinear/transient re-read `.tag` at call time), but the SAME coord object
             # is often reused in a later jno.fem() call, where region detection must still recover the
