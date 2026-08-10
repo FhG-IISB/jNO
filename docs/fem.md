@@ -1493,9 +1493,14 @@ unaffected. Full detail is inline in the sections above.
   waves, anything with a mean flow), where the sign of the growth rate *is* the physics. Neither path
   ever returns the spectrum of `½(K+Kᵀ)` as though it were the answer. The routing probe is a
   randomized bilinear test and is concrete-only, so **under `jit` the symmetric path is assumed**.
-  Limits of the non-symmetric path, which are real: it runs on the host through a `pure_callback`, so
-  it is **not differentiable** (`jax.grad` raises rather than returning a wrong number — an adjoint
-  there needs left eigenvectors as well as right, i.e. a second Arnoldi run on `Kᴴ`, not built); it
+  Limits of the non-symmetric path, which are real: **the eigenvalues are differentiable in reverse
+  mode** — `dλ = wᴴ(dA − λ dB)v / (wᴴBv)` for a simple eigenvalue (Wilkinson 1965 ch. 2), with the left
+  eigenvector obtained by inverse iteration on `(A − λᵢB)ᴴ`, verified against finite differences to
+  1e-09 — but the **eigenvectors are not**, and differentiating through them yields **NaN** rather than
+  the silent zero a plain callback would give. A **defective** eigenvalue has no derivative at all (its
+  perturbation series runs in `√ε`) and is detected via the eigenvalue condition number, giving NaN
+  instead of the enormous finite number the formula would otherwise produce. Because that guard is a
+  `custom_vjp`, **forward mode (`jax.jvp`/`jacfwd`) is unavailable here** — use `jax.grad`/`jacrev`. It
   accepts `linear=jno.solve.lu(backend="pardiso"/"cudss"/"host")` to drive ARPACK's shift-invert
   factorization — those kernels are plain numpy functions, so ARPACK can call them from host code —
   but refuses `backend="device"` (a JAX primitive), the Krylov solvers, and `precond=` rather than

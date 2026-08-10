@@ -163,18 +163,6 @@ def test_unknown_which_names_the_options_including_the_growth_rate():
         nonsymmetric_geneigh(jnp.asarray(A), None, 3, None, "algebraically_smallest")
 
 
-def test_differentiating_raises_rather_than_returning_a_wrong_number():
-    """`pure_callback` has no JVP rule. The requirement is that this FAILS, not that it silently
-    produces zeros -- the symmetric paths are the differentiable ones."""
-    A = _nonsym(100, seed=17)
-
-    def loss(a):
-        return jnp.sum(jnp.abs(nonsymmetric_geneigh(a, None, 2, 5.0)[0]))
-
-    with pytest.raises(Exception):
-        jax.grad(loss)(jnp.asarray(A))
-
-
 # ---------------------------------------------------------------------------------
 # linear= drives ARPACK's shift-invert factorization
 # ---------------------------------------------------------------------------------
@@ -226,3 +214,97 @@ def test_accelerated_backends_agree_with_the_default_when_installed(backend):
         np.asarray(jno.solve.eigs(k=4, sigma=10.0, linear=jno.solve.lu(backend=backend))(jnp.asarray(A))[0])
     )
     np.testing.assert_allclose(got, ref, rtol=1e-8, atol=1e-9)
+
+
+# ---------------------------------------------------------------------------------
+# eigenvalue derivatives
+# ---------------------------------------------------------------------------------
+#
+# dλ = wᴴ(dA − λ dB)v / (wᴴBv) for a SIMPLE eigenvalue (Wilkinson 1965, ch. 2), which needs the LEFT
+# eigenvector w. Every assertion below is against finite differences on the ORIGINAL matrix, and each
+# guard test names the wrong answer it is there to prevent -- all three were observed during
+# development, so none of them is hypothetical.
+
+
+def _fd(f, A, i, j, eps=1e-5):
+    Ap, Am = A.copy(), A.copy()
+    Ap[i, j] += eps
+    Am[i, j] -= eps
+    return (f(jnp.asarray(Ap)) - f(jnp.asarray(Am))) / (2 * eps)
+
+
+@pytest.mark.parametrize("n,label", [(40, "dense path"), (200, "sparse path (inverse iteration)")])
+def test_eigenvalue_gradient_matches_finite_differences(n, label):
+    A = _nonsym(n, seed=31)
+
+    def f(a):
+        return jnp.sum(jnp.real(nonsymmetric_geneigh(a, None, 3, 5.0)[0]))
+
+    g = np.asarray(jax.grad(f)(jnp.asarray(A)))
+    assert not np.isnan(g).any()
+    for i, j in [(0, 0), (1, 2), (3, 1)]:
+        # FD is the imprecise side here: central differences carry ~1e-8 absolute error, which on a
+        # derivative of order 1e-05 is already 1e-03 relative. The analytic value is the better one.
+        np.testing.assert_allclose(g[i, j], _fd(f, A, i, j), rtol=5e-3, atol=1e-8)
+
+
+def test_eigenvalue_gradient_for_a_generalized_pencil():
+    n = 150
+    A = _nonsym(n, seed=33)
+    M = jnp.asarray(np.diag(np.linspace(1.0, 2.0, n)))
+
+    def f(a):
+        return jnp.sum(jnp.real(nonsymmetric_geneigh(a, M, 3, 5.0)[0]))
+
+    g = np.asarray(jax.grad(f)(jnp.asarray(A)))
+    for i, j in [(0, 0), (2, 4)]:
+        np.testing.assert_allclose(g[i, j], _fd(f, A, i, j), rtol=5e-3, atol=1e-8)
+
+
+def test_a_defective_eigenvalue_gives_NaN_not_a_huge_finite_number():
+    """A Jordan block's eigenvalue has NO derivative -- its perturbation series runs in sqrt(eps).
+
+    Two wrong answers were produced here before this worked. With the condition-number threshold set
+    to 1e-12 the guard never fired and the formula returned **1.6e+08**. With the NaN in a
+    `where` BRANCH it returned exactly **0.0**, because a constant branch transposes to zero under
+    reverse mode. The NaN has to divide, so that it stays linear in the tangent and survives.
+    """
+    J = np.kron(np.eye(30), np.array([[2.0, 1.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 5.0]]))
+
+    def f(a):
+        return jnp.sum(jnp.real(nonsymmetric_geneigh(a, None, 2, 2.1)[0]))
+
+    g = np.asarray(jax.grad(f)(jnp.asarray(J)))
+    assert np.isnan(g).any(), "a defective eigenvalue must not yield a finite gradient"
+
+
+def test_eigenvector_gradients_are_NaN_not_a_silent_zero():
+    """The eigenvectors come from a stop_gradient-ed callback, so the DEFAULT behaviour would be a
+    silent zero -- measured, the true derivative was 2.4e-04. NaN is the loud alternative."""
+    n = 80
+    A = _nonsym(n, seed=35)
+    g = np.asarray(jax.grad(lambda a: jnp.sum(jnp.abs(nonsymmetric_geneigh(a, None, 2, 5.0)[1])))(jnp.asarray(A)))
+    assert np.isnan(g).all()
+    assert not np.all(g == 0)
+
+
+def test_an_eigenvalue_only_loss_is_unaffected_by_the_eigenvector_guard():
+    """The guard must key on whether the eigenvectors are ACTUALLY used. A custom_jvp version fired
+    during tracing -- before dead-code elimination -- and broke this case."""
+    n = 80
+    A = _nonsym(n, seed=37)
+
+    def f(a):
+        return jnp.sum(jnp.real(nonsymmetric_geneigh(a, None, 2, 5.0)[0]))
+
+    g = np.asarray(jax.grad(f)(jnp.asarray(A)))
+    assert not np.isnan(g).any()
+    np.testing.assert_allclose(g[1, 2], _fd(f, A, 1, 2), rtol=5e-3, atol=1e-8)
+
+
+def test_forward_mode_is_refused_rather_than_silently_wrong():
+    """The eigenvector guard is a custom_vjp, so jax.jvp/jacfwd are unavailable here. Documented,
+    and reverse mode is what an inverse problem uses."""
+    A = _nonsym(60, seed=39)
+    with pytest.raises(TypeError, match="custom_vjp"):
+        jax.jvp(lambda a: nonsymmetric_geneigh(a, None, 2, 5.0)[0], (jnp.asarray(A),), (jnp.ones_like(jnp.asarray(A)),))
