@@ -900,7 +900,8 @@ Pick by structure:
 | symmetric **indefinite** (Stokes/Biot saddle, biharmonic) | `minres` | monotone residual, `O(1)` memory — Paige & Saunders, *SINUM* 12(4), 1975 |
 | SPD, batched/GPU-heavy | `chebyshev` | inner-product free (no reductions) — Golub & Varga 1961 |
 | indefinite, single solve | `lu` | sparse-direct; **no vmap rule** — use a Krylov solver inside batched solves |
-| cuSolver refuses it, or is slow | `lu(host=True)` | factors on the HOST (SuperLU) and drives it from the device; same answer and same gradients (wrapped in `custom_linear_solve`, transpose via SuperLU `trans="T"`). Measured **faster** where cuSolver also works — Stokes 21,839 DOFs 0.27 s vs 1.67 s, H(curl) 17,072 complex DOFs 13.3 s vs 36.4 s — and it runs meshes cuSolver rejects (Stokes 26,908, H(curl) 26,154, both of which fail on GPU). Affordable because a direct solve factorises **once**: the operator crosses PCIe once, not per iteration. Faster in all 12 points measured here (0.15–0.81× of cuSolver), but that is **hardware-specific** — this card's FP64 is 1/64-rate (~0.3 TFLOPS) against ~1.1 TFLOPS on 20 CPU cores, and a direct factorisation is FLOP-heavy; on a full-rate-FP64 GPU the ranking may invert |
+| cuSolver refuses it, or is slow | `lu(backend="host")` | factors on the HOST (SuperLU) and drives it from the device; same answer and same gradients (wrapped in `custom_linear_solve`, transpose via SuperLU `trans="T"`). Measured **faster** where cuSolver also works — Stokes 21,839 DOFs 0.27 s vs 1.67 s, H(curl) 17,072 complex DOFs 13.3 s vs 36.4 s — and it runs meshes cuSolver rejects (Stokes 26,908, H(curl) 26,154, both of which fail on GPU). Affordable because a direct solve factorises **once**: the operator crosses PCIe once, not per iteration. Read the win as *cuSolver's sparse LU is weak*, not *GPUs lose* — see the row below |
+| **a Newton loop, or shift-invert eigs** | `lu(backend="cudss")` | NVIDIA cuDSS — the **fastest** direct backend wherever it runs, because it separates the symbolic *plan* from the numeric *factorization* and jNO caches on the **sparsity**, so the plan survives a change of values. Against `backend="host"` on an RTX 3070 (fp64 at 1/64 rate — the *unfavourable* card): Stokes saddle factorization **3.4 ms vs 79.9 ms**, lap3d 50³ **576 ms vs 64,856 ms**, and **64.7× per Newton step** at n=64,000. Also factors the Stokes saddle cuSolver calls *singular*, with smaller residuals. Needs the optional stack (`nvmath-python`, `cudss`, `cupy`); raises a clear `ImportError` otherwise. Fill-in still governs 3-D (69×→218× nnz growth at lap3d 20³–40³), so it moves the ceiling and makes **device memory** the binding constraint — it is not a substitute for a preconditioner |
 | small systems / coarse blocks | `dense` | LAPACK, vmap-native |
 
 **Preconditioner specs** (declarative — materialized against the assembled operator at solve time; a
@@ -983,12 +984,12 @@ assembled tangent, so it does **not** apply to the matrix-free-only paths (a cou
 complex) — those fail loud.
 
 **A direct `linear=` slot selects it.** `lu`, `dense` and `amg` all need an assembled matrix, so pairing one
-with the *matrix-free* Newton has nothing to factorize. `fem.solve(linear=jno.solve.lu(host=True))` on a
+with the *matrix-free* Newton has nothing to factorize. `fem.solve(linear=jno.solve.lu(backend="host"))` on a
 nonlinear or transient problem therefore routes to the direct Newton, and that slot is the solver that runs on
 the assembled tangent (and on `Jᵀ` in the adjoint); `precond=` materializes against the same assembled
 operator. Which factorization you pick is not cosmetic here: on a 26-step Rayleigh–Bénard march (three fields,
 saddle, nonlinear) the default matrix-free Jacobi-BiCGStab takes 20.1 s, `linear=jno.solve.lu()` 7.6 s and
-`linear=jno.solve.lu(host=True)` **3.1 s**, all to the same 2.8e-07 per-step Newton residual. An *explicit*
+`linear=jno.solve.lu(backend="host")` **3.1 s**, all to the same 2.8e-07 per-step Newton residual. An *explicit*
 matrix-free `nonlinear=` alongside a direct `linear=` is contradictory and raises rather than picking one
 silently.
 
@@ -1029,7 +1030,7 @@ formed **once** and the preconditioner materialized **once before the time loop*
 each implicit step of a nonlinear block. Second-order-in-time (`u_tt`) flows through the same augmented
 block. Each step warm-starts from the previous state (so `x0=` is rejected).
 
-> **`lu(host=True)` factorizes a constant step operator once, not once per step.** The step matrix is
+> **`lu(backend="host")` factorizes a constant step operator once, not once per step.** The step matrix is
 > formed once (above), and the host factorization is cached on the operator's *content*, so a march
 > that solves against the same matrix every step pays one factorization for the whole trajectory — and
 > the transpose solve reuses it, so the adjoint pass adds none. On a 51-step heat march that is worth

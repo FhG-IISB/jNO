@@ -208,10 +208,15 @@ def newton_direct(
 
     ``linear_solve`` is an ``(A, b) -> x`` callable over the ASSEMBLED tangent -- the composed
     ``linear=``/``precond=`` slots. Default: ``sparse_lu_solve``. Without it the driver hardcoded
-    cuSolver, so ``fem.solve(nonlinear=newton(direct=True), linear=lu(host=True))`` silently ignored
-    the placement it was asked for -- and this is the one path where that choice decides whether the
-    problem runs at all, cuSolver being the ceiling on exactly the saddle systems the direct Newton
-    exists for.
+    cuSolver, so ``fem.solve(nonlinear=newton(direct=True), linear=lu(backend="host"))`` silently
+    ignored the placement it was asked for -- and this is the one path where that choice decides
+    whether the problem runs at all, cuSolver being the ceiling on exactly the saddle systems the
+    direct Newton exists for.
+
+    **This is the path ``lu(backend="cudss")`` was worth adding for.** A Newton step changes the
+    tangent's VALUES and holds its SPARSITY fixed, which is exactly the split cuDSS exposes and the
+    one host SuperLU cannot: the symbolic plan is computed once and every subsequent step pays only
+    the numeric factorization (measured 64.7x per step against ``backend="host"`` at n=64,000).
 
     Differentiable w.r.t. anything ``residual_fn`` closes over: the forward Newton runs to the root
     un-differentiated, then ``jax.lax.custom_root`` provides the implicit-function-theorem gradient via a

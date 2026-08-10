@@ -760,7 +760,7 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
     matrix, and a matrix-free tangent has none to give them, so pairing one with the matrix-free
     Newton cannot work -- it used to surface as ``LinearOperator.dense(): a matvec-only operator
     cannot densify`` from six frames inside the Krylov loop, on the perfectly reasonable
-    ``fem.solve(linear=jno.solve.lu(host=True))`` over a nonlinear or transient problem. jNO already
+    ``fem.solve(linear=jno.solve.lu(backend="host"))`` over a nonlinear or transient problem. jNO already
     has the path that honours it (``newton(direct=True)``, which assembles the tangent), so the
     default nonlinear driver follows the linear slot instead of crashing inside it. An EXPLICIT
     matrix-free ``nonlinear=`` with a direct ``linear=`` is a genuine contradiction and says so.

@@ -63,7 +63,7 @@ __all__ = [
 ]
 
 
-def lu(*, host: bool = False) -> LinearSolver:
+def lu(*, backend: str = "device", host: bool | None = None) -> LinearSolver:
     """Differentiable sparse-direct solve (JAX ``spsolve``: cuSolver on GPU, native LU on CPU).
 
     Wraps the existing :func:`jno.utils.solver.linear.sparse_lu_solve` -- robust on the
@@ -73,39 +73,56 @@ def lu(*, host: bool = False) -> LinearSolver:
     ``vmap="no"``) -- use a Krylov solver inside vmapped/batched solves.
 
     Args:
-        host: Factor on the HOST with SuperLU instead of on the accelerator, keeping the rest of the
-            solve where it is. cuSolver's sparse LU is the ceiling on jNO's hardest problems -- a
-            complex H(curl) eddy system stops near 20k DOFs and a Taylor-Hood Stokes system reports
-            "Singular matrix" at a mesh the CPU factors fine -- and host SuperLU was measured
-            reaching 3.1x the DOFs on the same problem. Affordable because a direct solve factorises
-            ONCE, so the operator crosses PCIe once rather than per iteration; see
-            :func:`jno.utils.solver.linear.host_lu_solve` for that argument and its limits.
+        backend: WHERE the factorization happens. All three obey the same ``(A, b) -> x`` contract and
+            are equally differentiable; they differ in speed, reach, and what they need installed.
 
-            ON THIS MACHINE it is not merely a reach extender but faster in every one of 12
-            measured points -- 0.15x to 0.81x of the cuSolver time across 2-D/3-D Poisson, Stokes,
-            H(curl) and a 51-step transient -- and it runs meshes cuSolver refuses (Stokes 26,908,
-            H(curl) 26,154, 3-D Poisson 87,284, all of which fail on GPU).
+            ``"device"`` (default) -- JAX's ``spsolve``: cuSolver on a CUDA GPU, a native LU on CPU.
+            No extra dependency, and the only one of the three that needs nothing installed.
 
-            DO NOT read that as general. This card's FP64 runs at 1/64 of its FP32 rate, ~0.3
-            TFLOPS, against ~1.1 TFLOPS for 20 AVX2 cores, and a sparse direct factorisation is
-            FLOP-heavy (dense supernodes) rather than bandwidth-bound like SpMV. The CPU is simply
-            the faster FP64 machine here. On a datacenter GPU with full-rate FP64 the ranking would
-            plausibly invert -- that is spec-sheet reasoning, not something measured here, so
-            benchmark it on your own hardware before choosing.
+            ``"host"`` -- SuperLU on the CPU via ``scipy``, keeping the rest of the solve where it is.
+            Affordable because a direct solve factorises ONCE, so the operator crosses PCIe once
+            rather than per iteration. It runs meshes cuSolver refuses outright (Stokes 26,908,
+            H(curl) 26,154, 3-D Poisson 87,284), and on this machine beat cuSolver in all 12 measured
+            points (0.15x-0.81x of its time). Read that as *cuSolver's sparse LU is weak*, not as
+            *GPUs lose*: see ``"cudss"``. Its factorization is cached on the operator's CONTENT, so a
+            constant-operator march factorizes once for the trajectory (measured 2.9x at 23,934 DOFs
+            over 51 steps) and the adjoint reuses it; a Newton loop gets nothing and pays a hash.
 
-            The factorization is CACHED on the operator's content, so a march that solves against the
-            same step matrix every step factorizes once for the whole trajectory (measured 2.9x at
-            23,934 DOFs over 51 steps), and the adjoint's transpose solve reuses it. A Newton loop
-            gets nothing -- its tangent changes every iteration -- and pays a content hash for the
-            miss; see :func:`jno.utils.solver.linear.host_lu_solve`.
+            ``"cudss"`` -- NVIDIA cuDSS on the GPU. **The fastest of the three wherever it runs**, and
+            the one to reach for on a Newton loop or a shift-invert eigensolve, because it separates
+            the symbolic plan from the numeric factorization and jNO caches on the SPARSITY: the plan
+            survives a change of values. Measured on an RTX 3070 (fp64 at 1/64 rate -- the
+            *unfavourable* card) against host SuperLU: factorization 3.4 ms vs 79.9 ms on a
+            Taylor-Hood Stokes saddle, 576 ms vs 64,856 ms on lap3d 50^3, and **64.7x per Newton step**
+            at n=64,000. It also factors that Stokes saddle cuSolver calls singular, with smaller
+            residuals. Needs the optional stack (``nvmath-python``, ``cudss``, ``cupy``) and a GPU;
+            raises a clear ``ImportError`` otherwise. Fill-in still governs 3-D (69x-218x nnz growth
+            at lap3d 20^3-40^3), so it moves the ceiling and makes device memory the binding
+            constraint -- it is not a substitute for a preconditioner.
 
-            Not the default regardless: no vmap rule.
+            There is deliberately no ``"auto"``: which backend wins depends on hardware jNO cannot
+            inspect, and silently choosing would violate the no-surprises rule.
+        host: Deprecated alias for ``backend="host"``, kept so existing calls keep working. Passing
+            both is an error.
     """
+    if host is not None:
+        if backend != "device":
+            raise ValueError(
+                f"jno.solve.lu() got both backend={backend!r} and host={host!r}. `host=` is the "
+                f'deprecated spelling of backend="host" -- pass only backend=.'
+            )
+        backend = "host" if host else "device"
+    if backend not in ("device", "host", "cudss"):
+        raise ValueError(
+            f"jno.solve.lu(backend={backend!r}) is not a known backend. Use 'device' (JAX spsolve: "
+            f"cuSolver on GPU, native LU on CPU), 'host' (CPU SuperLU via scipy), or 'cudss' (NVIDIA "
+            f"cuDSS on GPU -- fastest, needs nvmath-python + cudss + cupy installed)."
+        )
 
     def _fn(op: LinearOperator, b, *, M, x0):
-        from .utils.solver.linear import host_lu_solve, sparse_lu_solve
+        from .utils.solver.linear import cudss_lu_solve, host_lu_solve, sparse_lu_solve
 
-        solve = host_lu_solve if host else sparse_lu_solve
+        solve = {"device": sparse_lu_solve, "host": host_lu_solve, "cudss": cudss_lu_solve}[backend]
         if op.bcoo is not None:
             return solve(op.bcoo, b)
         # a dense operator gets the dense direct solve — BCOO.fromdense would need a concrete
@@ -117,7 +134,8 @@ def lu(*, host: bool = False) -> LinearSolver:
     # none to remove, so it would pay a compile for nothing.
     # the name carries the placement, so two specs that factor in different memories are not
     # reported (or cached) as though they were the same solver
-    return LinearSolver(_fn, name="lu-host" if host else "lu", direct=True, traits={"vmap": "no"})
+    name = {"device": "lu", "host": "lu-host", "cudss": "lu-cudss"}[backend]
+    return LinearSolver(_fn, name=name, direct=True, traits={"vmap": "no"})
 
 
 def dense() -> LinearSolver:
