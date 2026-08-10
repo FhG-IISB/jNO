@@ -25,7 +25,15 @@ the wrong master location. A periodic cell whose lattice vector is normal to its
 import numpy as np
 import pytest
 
-from jno.utils.solver.fem_utils import _interface_frame, build_periodic_prolongation
+from jno.utils.solver.fem_utils import (
+    _edge_shape,
+    _faces_span_the_same_extent,
+    _facet_dual_coeffs,
+    _interface_frame,
+    _mortar_rows_2d,
+    _periodic_facet_weights,
+    build_periodic_prolongation,
+)
 
 
 def _plane_frame(normal):
@@ -187,6 +195,201 @@ def test_tied_interface_with_a_slave_node_on_a_master_node():
     assert np.allclose(P.sum(axis=1), 1.0)
     field = 0.9 * pts[:, 0] + 1.7 * pts[:, 1] - 0.4
     assert np.allclose(P @ field[kept], field, atol=1e-10)
+
+
+# ------------------------------------------------------------------- 2-D dual mortar
+#
+# What the mortar coupling does and does not buy, measured rather than assumed:
+#
+# * A **linear** field transfers exactly under BOTH mortar and node-to-segment collocation, so the
+#   2-D linear patch test does not tell them apart. (It still gates the new code's correctness.)
+# * When the master nodes are a subset of the slave nodes -- e.g. 5 master against 9 slave nodes on
+#   the same interval -- the master basis lies *inside* the slave space, the dual basis reproduces it
+#   pointwise, and the two couplings are identical to machine precision. Any test built on nested
+#   meshes is therefore vacuous.
+# * The difference appears on **non-nested** meshes for a field the master space cannot represent:
+#   mortar returns the L2 projection, collocation the pointwise value. Measured below.
+#
+# The coupling's real payoff is 3-D, where point-in-triangle collocation is not a projection at all.
+
+
+def _edge_faces(n_master, n_slave, *, order=1):
+    """Master (x=1) and slave (x=0) edge faces, both spanning y in [0, 1], facets for BOTH sides."""
+
+    def side(x, n):
+        y = np.linspace(0.0, 1.0, n)
+        pts = np.column_stack([np.full(n, x), y])
+        if order == 1:
+            return pts, None
+        mids = np.column_stack([np.full(n - 1, x), 0.5 * (y[:-1] + y[1:])])
+        return pts, mids
+
+    m_pts, m_mid = side(1.0, n_master)
+    s_pts, s_mid = side(0.0, n_slave)
+    blocks = [m_pts, s_pts] if order == 1 else [m_pts, m_mid, s_pts, s_mid]
+    pts = np.vstack(blocks)
+    off = np.cumsum([0] + [len(b) for b in blocks])
+    m_ids, s_ids = np.arange(off[0], off[1]), (np.arange(off[1], off[2]) if order == 1 else np.arange(off[2], off[3]))
+    if order == 1:
+        mf = np.column_stack([m_ids[:-1], m_ids[1:]])
+        sf = np.column_stack([s_ids[:-1], s_ids[1:]])
+        tags = {"r": m_ids, "l": s_ids}
+    else:
+        m_mid_ids, s_mid_ids = np.arange(off[1], off[2]), np.arange(off[3], off[4])
+        mf = np.column_stack([m_ids[:-1], m_ids[1:], m_mid_ids])
+        sf = np.column_stack([s_ids[:-1], s_ids[1:], s_mid_ids])
+        tags = {"r": np.concatenate([m_ids, m_mid_ids]), "l": np.concatenate([s_ids, s_mid_ids])}
+    return pts, tags, {"r": mf, "l": sf}
+
+
+def _apply(rows, master_vals_by_id):
+    """Evaluate a row dict {slave: [(master, w)]} against master nodal values keyed by node id."""
+    return {s: sum(w * master_vals_by_id[m] for m, w in ws) for s, ws in rows.items()}
+
+
+def test_dual_basis_is_biorthogonal():
+    """The invariant D^-1 relies on: int psi_i N_j = delta_ij int N_i, element-locally."""
+    qp, qw = np.polynomial.legendre.leggauss(6)
+    qp, qw = 0.5 * (qp + 1.0), 0.5 * qw
+    for k in (2, 3):
+        n = _edge_shape(qp, k)
+        a = _facet_dual_coeffs(k, qp, qw)
+        psi = n @ a.T
+        pairing = psi.T @ (qw[:, None] * n)  # int psi_i N_j
+        assert np.allclose(pairing, np.diag(qw @ n), atol=1e-12)
+    # P1 recovers the textbook dual functions psi_0 = 2 - 3xi, psi_1 = 3xi - 1 (Wohlmuth 2000, §3)
+    a1 = _facet_dual_coeffs(2, qp, qw)
+    assert np.allclose(_edge_shape(np.array([0.0, 1.0]), 2) @ a1.T, [[2.0, -1.0], [-1.0, 2.0]], atol=1e-12)
+
+
+def test_mortar_is_selected_and_reported():
+    """Both faces faceted and co-extensive -> mortar. Master facets only -> collocation. The
+    ``coupling`` key says which, so a caller never has to infer it."""
+    pts, tags, facets = _edge_faces(5, 9)
+    assert build_periodic_prolongation(pts, [("r", "l")], tags, facets=facets)["coupling"] == "mortar"
+    only_master = {"r": facets["r"]}
+    assert build_periodic_prolongation(pts, [("r", "l")], tags, facets=only_master)["coupling"] == "collocated"
+
+
+@pytest.mark.parametrize("order,field", [(1, lambda y: 2.0 * y - 0.5), (2, lambda y: 0.7 * y**2 - 0.2 * y + 0.1)])
+def test_mortar_transfers_the_master_space_exactly(order, field):
+    """Correctness gate: a field the master facets represent exactly transfers exactly (linear for
+    P1 edges, quadratic for P2). Requires the assembled D to be genuinely diagonal."""
+    pts, tags, facets = _edge_faces(5, 8, order=order)
+    res = build_periodic_prolongation(pts, [("r", "l")], tags, facets=facets)
+    assert res["coupling"] == "mortar"
+    P = np.asarray(res["P_node"].todense())
+    kept = np.asarray(res["kept_nodes"])
+    assert np.allclose(P.sum(axis=1), 1.0)
+    f = field(pts[:, 1])
+    assert np.allclose(P @ f[kept], f, atol=1e-10)
+
+
+def test_mortar_is_the_l2_projection_not_collocation():
+    """The honest discriminator. On NON-nested meshes and a field outside the master space the two
+    couplings differ, and mortar is the L2 projection -- closer to the true field than the pointwise
+    value. On nested meshes (master nodes a subset of slave nodes) they provably coincide."""
+    f = lambda y: np.sin(3.0 * y)  # noqa: E731
+
+    def compare(n_master, n_slave):
+        pts, _tags, fc = _edge_faces(n_master, n_slave)
+        loc = pts[:, 1:2]
+        rows = _mortar_rows_2d(fc["l"], fc["r"], loc, span=1.0)
+        vals = {int(i): f(pts[i, 1]) for i in np.unique(fc["r"])}
+        mortar = _apply(rows, vals)
+        colloc = _apply({int(s): _periodic_facet_weights(loc[int(s)], fc["r"], loc) for s in np.unique(fc["l"])}, vals)
+        exact = {s: f(pts[s, 1]) for s in mortar}
+        gap = max(abs(mortar[s] - colloc[s]) for s in mortar)
+        return gap, max(abs(mortar[s] - exact[s]) for s in mortar), max(abs(colloc[s] - exact[s]) for s in mortar)
+
+    gap, e_mortar, e_colloc = compare(5, 8)  # non-nested
+    assert gap > 1e-3, "non-nested meshes must separate the two couplings"
+    assert e_mortar < e_colloc, "the L2 projection should beat pointwise collocation"
+
+    gap_nested, _, _ = compare(5, 9)  # 9 = 2*5-1 -> every master node is a slave node
+    assert gap_nested < 1e-12, "nested meshes make the master basis a subset of the slave space"
+
+
+def test_mortar_rows_match_an_independent_fine_quadrature():
+    """Validate the segmentation: rebuild D and M by midpoint quadrature on a fine uniform grid --
+    no clipping, no segment geometry -- and compare. Different decomposition, same integral."""
+    pts, _tags, fc = _edge_faces(4, 7)
+    t = pts[:, 1]
+    rows = _mortar_rows_2d(fc["l"], fc["r"], pts[:, 1:2], span=1.0)
+
+    ks, km = fc["l"].shape[1], fc["r"].shape[1]
+    qp, qw = np.polynomial.legendre.leggauss(max(ks, km) + 2)
+    dual = _facet_dual_coeffs(ks, 0.5 * (qp + 1.0), 0.5 * qw)
+    n = 200_000
+    h = 1.0 / n
+    tq = (np.arange(n) + 0.5) * h
+    s_nodes, m_nodes = np.unique(fc["l"]), np.unique(fc["r"])
+    s_at = {int(v): i for i, v in enumerate(s_nodes)}
+    m_at = {int(v): i for i, v in enumerate(m_nodes)}
+    D, M = np.zeros(len(s_nodes)), np.zeros((len(s_nodes), len(m_nodes)))
+    for e in range(len(fc["l"])):
+        a, b = t[fc["l"][e, 0]], t[fc["l"][e, 1]]
+        inside = (tq >= min(a, b)) & (tq <= max(a, b))
+        x = tq[inside]
+        n_s = _edge_shape((x - a) / (b - a), ks)
+        psi = n_s @ dual.T
+        r = [s_at[int(v)] for v in fc["l"][e]]
+        D[r] += np.einsum("qi,qi->i", psi, n_s) * h
+        for g in range(len(fc["r"])):
+            c, d = t[fc["r"][g, 0]], t[fc["r"][g, 1]]
+            sel = (x >= min(c, d)) & (x <= max(c, d))
+            if not sel.any():
+                continue
+            n_m = _edge_shape((x[sel] - c) / (d - c), km)
+            M[np.ix_(r, [m_at[int(v)] for v in fc["r"][g]])] += np.einsum("qi,qj->ij", psi[sel], n_m) * h
+
+    for node, i in s_at.items():
+        ref = M[i] / D[i]
+        got = np.zeros(len(m_nodes))
+        for m, w in rows[node]:
+            got[m_at[m]] = w
+        assert np.allclose(got, ref, atol=2e-4), f"slave {node}: {got} vs {ref}"
+
+
+def test_extent_mismatch_keeps_collocation():
+    """A face tagged without its corners is shorter than its partner; the master then does not cover
+    the slave and an integral over the slave face is not well posed. That tie must fall back to
+    collocation and REPORT it, not integrate over a domain the master does not span."""
+    pts, tags, facets = _edge_faces(5, 9)
+    trimmed = facets["r"][1:-1]  # drop the master's two end facets -> master no longer spans the slave
+    keep = np.unique(trimmed)
+    res = build_periodic_prolongation(
+        pts, [("r", "l")], {"r": keep, "l": tags["l"]}, facets={"r": trimmed, "l": facets["l"]}
+    )
+    assert res["coupling"] == "collocated"
+    assert not _faces_span_the_same_extent(facets["l"], trimmed, pts[:, 1:2], span=1.0)
+    assert _faces_span_the_same_extent(facets["l"], facets["r"], pts[:, 1:2], span=1.0)
+
+
+def test_hole_in_the_master_face_raises():
+    """Same extent but a missing interior facet: the slave face IS covered at its ends, so the
+    extent gate passes and the per-facet coverage check has to catch the hole."""
+    pts, _tags, facets = _edge_faces(6, 11)
+    holed = np.delete(facets["r"], 2, axis=0)  # remove an interior master facet
+    with pytest.raises(ValueError, match="HOLE in the master face"):
+        _mortar_rows_2d(facets["l"], holed, pts[:, 1:2], span=1.0)
+
+
+def test_mortar_survives_a_high_density_ratio_either_way():
+    """Extremes: 1:8 refinement, the reverse (master finer than slave), and a single master facet.
+
+    Node counts are chosen so the slave nodes do NOT all land on master nodes -- e.g. 17 master
+    against 3 slave nodes is fully conforming (0, 0.5, 1 are all master nodes) and would exercise
+    nothing."""
+    for n_master, n_slave in [(3, 17), (16, 7), (2, 25)]:
+        pts, tags, facets = _edge_faces(n_master, n_slave)
+        res = build_periodic_prolongation(pts, [("r", "l")], tags, facets=facets)
+        assert res["coupling"] == "mortar", f"master {n_master}, slave {n_slave}"
+        P = np.asarray(res["P_node"].todense())
+        kept = np.asarray(res["kept_nodes"])
+        assert np.allclose(P.sum(axis=1), 1.0)
+        f = 2.0 * pts[:, 1] - 0.5
+        assert np.allclose(P @ f[kept], f, atol=1e-10)
 
 
 def test_periodic_pair_still_ties_across_a_normal_offset():

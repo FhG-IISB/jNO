@@ -148,6 +148,44 @@ in the `jno.fem([...])` list, and `jno.fem` classifies each by the region it is 
 for a spatially varying Dirichlet value). A zero Neumann flux is the natural default and needs
 no term.
 
+### Tying two boundaries — `u(A) - u(B)`
+
+A term that names two boundary regions and carries no test function is a **tie**: it identifies the
+DOFs on region `A` with those on region `B`. It is enforced by algebraic reduction (a prolongation
+`P` that eliminates the `A` DOFs), not by assembly, so it composes with everything downstream —
+complex, transient, Bloch (`u(A) - c*u(B)`), and `basis=` all reuse the same `P`.
+
+```python
+d.tag("left",  lambda x, y: x < 1e-9)      # a tag predicate includes the corner nodes,
+d.tag("right", lambda x, y: x > 1 - 1e-9)  # which matters — see below
+
+fem = jno.fem([weak_form, u("left") - u("right")])
+```
+
+How the two faces are identified depends on their meshes:
+
+* **Conforming** (the node layouts match) — an exact node-to-node 0/1 map. This is the cheap path and
+  it keeps the fast selection-based reduction.
+* **Non-matching, 2-D** — a **dual-mortar** coupling (Bernardi/Maday/Patera 1994; dual multiplier
+  spaces from Wohlmuth 2000): the tie is imposed in the integral sense `∫ ψ (u_A − u_B∘Φ) = 0` over
+  the slave face, segmented against the master facets. Variationally consistent and momentum-balanced.
+* **Non-matching, otherwise** (3-D, native 1-D, or a face tagged without its corners so the two sides
+  do not span the same extent) — node-to-segment **collocation**: each slave node takes the master
+  facet value at its own location. Consistent and exact for fields the master facet represents, but
+  collocated rather than integrated.
+
+Worth being precise about what the mortar coupling buys, since it is less than it sounds. A **linear**
+field transfers exactly under *both* couplings, so the 2-D patch test does not separate them; and when
+the master nodes are a subset of the slave nodes the two are identical to machine precision. They
+differ on **non-nested** meshes for a field the master space cannot represent, where mortar returns the
+L² projection and collocation the pointwise value. The coupling's real payoff is 3-D, which is still
+collocated today.
+
+Two practical consequences: tag periodic faces with a **predicate** (`d.tag(name, lambda ...)`) so each
+face includes its corner nodes — a face tagged from geometry may drop them, leaving the two sides with
+different extents, which both disqualifies mortar and leaves the corner DOFs untied. And multidirectional
+periodicity *requires* shared corners; `jno.fem` raises rather than silently mis-solving if they are absent.
+
 ---
 
 ## Non-nodal element families: H(div) and H(curl)

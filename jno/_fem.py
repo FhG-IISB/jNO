@@ -2406,15 +2406,25 @@ def _build_periodic_reduction(domain: Any, ties: List[Any], points: Any, cells: 
             if tag not in faces and (f := _face_nodes(domain, points, bnodes, tag)) is not None:
                 faces[tag] = f
 
+    # Facet connectivity per tied face. The master side alone is enough for node-to-segment
+    # collocation, but a *mortar* coupling integrates over the slave face, so both sides are needed.
     facets: dict = {}
     if bfacets is not None and bfacets.size:
-        for master, _slave, *_ignore in ties:
-            fn = set(np.asarray(faces.get(master, np.empty(0, int))).tolist())
-            keep = np.array([set(row.tolist()).issubset(fn) for row in bfacets], dtype=bool)
-            if keep.any():
-                facets[master] = bfacets[keep]
+        for master, slave, *_ignore in ties:
+            for tag in (master, slave):
+                if tag in facets:
+                    continue
+                fn = set(np.asarray(faces.get(tag, np.empty(0, int))).tolist())
+                keep = np.array([set(row.tolist()).issubset(fn) for row in bfacets], dtype=bool)
+                if keep.any():
+                    facets[tag] = bfacets[keep]
     else:  # native 1D / no assembly cells -> flat-chain fallback
-        facets = {m: ff for (m, _s, *_ignore) in ties if (ff := _chain_facets(points, faces.get(m, ()))) is not None}
+        facets = {
+            t: ff
+            for (m, s, *_ignore) in ties
+            for t in (m, s)
+            if (ff := _chain_facets(points, faces.get(t, ()))) is not None
+        }
 
     return build_periodic_prolongation(points, pairs, faces, vec=vec, facets=facets, phases=phases)
 

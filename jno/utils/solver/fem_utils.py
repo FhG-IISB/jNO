@@ -2092,6 +2092,154 @@ def _interface_frame(m_pts: np.ndarray, s_pts: np.ndarray) -> Tuple[np.ndarray, 
     return np.ascontiguousarray(vt[: dim - 1]), origin
 
 
+def _edge_shape(xi: np.ndarray, k: int) -> np.ndarray:
+    """Lagrange shape values ``(..., k)`` on a reference edge at local coordinate(s) ``xi in [0, 1]``.
+
+    ``k == 2`` is the P1 edge ``(a, b)``; ``k == 3`` the P2 edge ``(a, b, mid)`` -- the node order the
+    facet tables use, with the midside node LAST."""
+    xi = np.asarray(xi, dtype=float)
+    if k == 2:
+        return np.stack([1.0 - xi, xi], axis=-1)
+    if k == 3:
+        return np.stack([2.0 * (xi - 0.5) * (xi - 1.0), 2.0 * xi * (xi - 0.5), -4.0 * xi * (xi - 1.0)], axis=-1)
+    raise ValueError(f"edge facets carry 2 (P1) or 3 (P2) nodes, got {k}")
+
+
+def _facet_dual_coeffs(k: int, qp: np.ndarray, qw: np.ndarray) -> np.ndarray:
+    """Element-local **dual** basis coefficients ``A``: ``psi_i = sum_k A_ik N_k`` is biorthogonal to
+    the primal basis, ``int psi_i N_j = delta_ij int N_i``.
+
+    Rather than hard-coding the dual functions per element order, build them from the facet mass
+    matrix: with ``Mass_ij = int N_i N_j`` and ``d_i = int N_i``, taking ``A = diag(d) Mass^-1`` gives
+    ``int psi_i N_j = (A Mass)_ij = d_i delta_ij`` by construction. For the P1 edge this recovers the
+    textbook ``psi_0 = 2 - 3xi``, ``psi_1 = 3xi - 1`` (Wohlmuth, SIAM J. Numer. Anal. 38(3):989-1012,
+    2000, §3), and it extends to P2 with no extra algebra.
+
+    Biorthogonality is **element-local**, so the assembled ``D`` is diagonal only when the segments
+    cover each slave facet completely -- which :func:`_mortar_rows_2d` checks and refuses otherwise.
+    The reference-element coefficients carry over unchanged to a straight physical edge, whose
+    Jacobian is constant and cancels between ``Mass`` and ``d``."""
+    n = _edge_shape(qp, k)  # (n_q, k)
+    mass = n.T @ (qw[:, None] * n)
+    d = qw @ n
+    return np.diag(d) @ np.linalg.inv(mass)
+
+
+def _faces_span_the_same_extent(s_facets: np.ndarray, m_facets: np.ndarray, loc: np.ndarray, *, span: float) -> bool:
+    """Does the master face cover the slave face, so a mortar integral over the slave is well posed?
+
+    A mortar constraint integrates over the slave face and needs the master basis defined everywhere
+    under it. Two tagged faces do **not** always cover the same extent: a face tagged from geometry
+    can exclude its corner nodes, leaving the two sides of a periodic pair with different lengths
+    (measured here: a master spanning ``y in [0.1, 0.9]`` against a slave spanning
+    ``[0.0435, 0.9565]``). Collocation tolerates that by clamping each stray slave node to the nearest
+    master facet's endpoint; an integral cannot, so such a tie keeps the collocated coupling and says
+    so through the ``coupling`` key rather than integrating over a domain the master does not cover.
+
+    Faces built from a ``domain.tag`` predicate include their corners by construction and pass.
+    """
+    t = np.asarray(loc, dtype=float)[:, 0]
+    s, m = t[np.asarray(s_facets, int)[:, :2]], t[np.asarray(m_facets, int)[:, :2]]
+    if s.size == 0 or m.size == 0:
+        return False
+    tol = 1.0e-8 * max(span, 1.0)
+    return bool(m.min() <= s.min() + tol and m.max() >= s.max() - tol)
+
+
+def _mortar_rows_2d(
+    s_facets: np.ndarray,
+    m_facets: np.ndarray,
+    loc: np.ndarray,
+    *,
+    span: float,
+) -> Dict[int, List[Tuple[int, float]]]:
+    """Dual-mortar prolongation rows for a **2-D** interface, whose facets are edges.
+
+    The tie is imposed in the integral sense of the mortar method (Bernardi/Maday/Patera 1994; dual
+    multiplier spaces from Wohlmuth 2000) rather than collocated at slave nodes:
+
+        ``int_G psi_i (u_s - u_m . Phi) dG = 0``   =>   ``D u_s = M u_m``,
+        ``D_ij = int_G psi_i N_j^s``,  ``M_ij = int_G psi_i (N_j^m . Phi)``
+
+    With the dual ``psi`` of :func:`_facet_dual_coeffs`, ``D`` is **diagonal**, so the slave DOFs
+    eliminate explicitly as ``u_s = D^-1 M u_m`` -- the same one-row-per-slave shape the collocated
+    path produces, and the same shape the existing reduction consumes. Unlike collocation this passes
+    the constant-stress patch test and transfers momentum in a variationally balanced way.
+
+    Both integrals are taken over the **segments**: each slave edge clipped against every master edge
+    it overlaps (Puso & Laursen, CMAME 193:601-629, 2004). In 2-D the interface coordinate is scalar,
+    so clipping is an interval intersection and is exact -- no polygon geometry is involved.
+
+    ``loc`` is the ``(n_nodes, 1)`` projection onto the interface frame; ``span`` is the interface
+    extent, used to scale the degeneracy and coverage tolerances. Returns
+    ``{slave_node_id: [(master_node_id, weight), ...]}``.
+    """
+    s_facets = np.asarray(s_facets, dtype=int)
+    m_facets = np.asarray(m_facets, dtype=int)
+    ks, km = int(s_facets.shape[1]), int(m_facets.shape[1])
+    t = np.asarray(loc, dtype=float)[:, 0]
+
+    # Columns 0, 1 are the edge endpoints at every order (a midside node is interior to the edge).
+    sa, sb = t[s_facets[:, 0]], t[s_facets[:, 1]]
+    ma, mb = t[m_facets[:, 0]], t[m_facets[:, 1]]
+
+    s_nodes = np.unique(s_facets)
+    m_nodes = np.unique(m_facets)
+    s_at = {int(n): i for i, n in enumerate(s_nodes)}
+    m_at = {int(n): i for i, n in enumerate(m_nodes)}
+    diag = np.zeros(len(s_nodes))
+    cross = np.zeros((len(s_nodes), len(m_nodes)))
+
+    # psi (degree p) x N^m (degree p) is degree 2p; this Gauss rule is exact through 2*max(ks,km)+1.
+    qp, qw = np.polynomial.legendre.leggauss(max(ks, km) + 2)
+    qp, qw = 0.5 * (qp + 1.0), 0.5 * qw  # [-1, 1] -> [0, 1]
+    dual = _facet_dual_coeffs(ks, qp, qw)
+    seg_tol = 1.0e-10 * max(span, 1.0)
+
+    for e in range(s_facets.shape[0]):
+        e_lo, e_hi = min(sa[e], sb[e]), max(sa[e], sb[e])
+        length = sb[e] - sa[e]  # signed: the local coordinate must follow the facet's own orientation
+        if abs(length) <= seg_tol:
+            continue
+        rows = [s_at[int(n)] for n in s_facets[e]]
+        covered = 0.0
+        for f in range(m_facets.shape[0]):
+            c0 = max(e_lo, min(ma[f], mb[f]))
+            c1 = min(e_hi, max(ma[f], mb[f]))
+            seg = c1 - c0
+            if seg <= seg_tol:
+                continue
+            covered += seg
+            tq = c0 + qp * seg  # quadrature points along the interface, in interface coordinates
+            n_s = _edge_shape((tq - sa[e]) / length, ks)  # (n_q, ks)
+            n_m = _edge_shape((tq - ma[f]) / (mb[f] - ma[f]), km)  # (n_q, km)
+            psi = n_s @ dual.T
+            w = qw * seg  # ds along a straight interface is dt, so these are physical lengths
+            cols = [m_at[int(n)] for n in m_facets[f]]
+            diag[rows] += np.einsum("qi,qi,q->i", psi, n_s, w)
+            cross[np.ix_(rows, cols)] += np.einsum("qi,qj,q->ij", psi, n_m, w)
+
+        if abs(covered - (e_hi - e_lo)) > 1.0e-8 * max(e_hi - e_lo, seg_tol):
+            raise ValueError(
+                f"Mortar segmentation covered {covered:.6g} of a slave facet of length "
+                f"{e_hi - e_lo:.6g}. The two faces span the same extent, so this is a HOLE in the "
+                "master face -- its facets do not tile it. Check the master tag selects a connected "
+                "set of whole boundary facets."
+            )
+
+    if np.any(np.abs(diag) <= seg_tol):
+        raise ValueError(
+            "Mortar coupling produced a singular slave mass diagonal; a tied slave node carries no "
+            "facet area. Check the slave tag selects whole boundary facets, not isolated nodes."
+        )
+    rows_out: Dict[int, List[Tuple[int, float]]] = {}
+    for node, i in s_at.items():
+        w_row = cross[i] / diag[i]
+        nz = np.flatnonzero(np.abs(w_row) > 1.0e-14)
+        rows_out[node] = [(int(m_nodes[j]), float(w_row[j])) for j in nz]
+    return rows_out
+
+
 def _periodic_facet_weights(
     t_query: np.ndarray,
     facet_node_ids: np.ndarray,
@@ -2185,10 +2333,22 @@ def build_periodic_prolongation(
     Identifies each slave-face node with the master face. When the two faces have
     the **same node layout** (structured / conforming) this is an exact 0/1
     node-to-node map. When they **don't** (unstructured / non-matching), a slave
-    that has no master node within ``tol`` is instead tied to the master *facet*
-    it lands on by **node-to-segment interpolation** (linear for P1, quadratic for
-    P2) — master–slave MPC elimination, consistent (partition of unity) though not
-    a full dual-mortar coupling. See :func:`_periodic_facet_weights`.
+    that has no master node within ``tol`` is tied to the master face by one of two
+    couplings, and the returned ``coupling`` key says which was used:
+
+    * ``"mortar"`` — a **2-D** interface (edge facets) whose two faces both carry
+      facet connectivity *and* span the same extent gets the integrated dual-mortar
+      constraint of :func:`_mortar_rows_2d`: variationally consistent,
+      momentum-balanced, and it passes the constant-stress patch test. Faces tagged
+      by a ``domain.tag`` predicate include their corners and qualify; a face tagged
+      from geometry that drops its corners does not — see
+      :func:`_faces_span_the_same_extent`.
+    * ``"collocated"`` — otherwise (3-D interfaces, native 1-D chains, a tag that
+      selects nodes but no whole facet) the slave is tied to the master *facet* it
+      lands on by **node-to-segment interpolation** (linear for P1, quadratic for
+      P2). Consistent (partition of unity) and exact for fields the master facet
+      can represent, but collocated rather than integrated: it does **not** pass
+      the 3-D patch test. See :func:`_periodic_facet_weights`.
 
     Parameters
     ----------
@@ -2237,6 +2397,7 @@ def build_periodic_prolongation(
     slave_to_master: Dict[int, int] = {}
     slave_phase: Dict[int, complex] = {}
     slave_interp: Dict[int, List[Tuple[int, float]]] = {}
+    n_mortar = n_collocated = 0  # how each non-matching slave was tied -> reported in ``coupling``
 
     for (master_tag, slave_tag), ph in zip(pairs, phases):
         if master_tag not in tag_indices or slave_tag not in tag_indices:
@@ -2264,13 +2425,30 @@ def build_periodic_prolongation(
         nn = np.argmin(d2, axis=1) if m_ids.size else np.zeros(len(s_ids), dtype=int)
         dist = np.sqrt(d2[np.arange(len(s_ids)), nn]) if m_ids.size and len(s_ids) else np.zeros(len(s_ids))
 
+        # A non-matching slave is tied by a MORTAR coupling when the interface is 2-D (edge facets) and
+        # both faces carry facet connectivity -- an integrated constraint that passes the patch test.
+        # Without slave facets (native 1-D chains, a tag that selects nodes but no whole facet) there is
+        # nothing to integrate over, so those nodes keep the collocated node-to-segment weights. Which
+        # one each tie used is reported back in ``coupling`` rather than left to guesswork.
+        mortar: Dict[int, List[Tuple[int, float]]] = {}
+        if loc.shape[1] == 1 and facets.get(master_tag) is not None and facets.get(slave_tag) is not None:
+            span = float(np.ptp(loc)) if loc.size else 1.0
+            if _faces_span_the_same_extent(facets[slave_tag], facets[master_tag], loc, span=span):
+                mortar = _mortar_rows_2d(facets[slave_tag], facets[master_tag], loc, span=span)
+
         for k, sid in enumerate(s_ids):
             if m_ids.size and dist[k] <= tol:  # conforming: exact node-to-node (corners land here too)
                 slave_to_master[int(sid)] = int(m_ids[nn[k]])
                 slave_phase[int(sid)] = complex(ph)
                 continue
-            # non-matching: tie to the master facet by interpolation (weights scaled by the Bloch phase)
-            w = _periodic_facet_weights(s_loc[k], facets.get(master_tag), loc) if facets else None
+            # non-matching: mortar rows when available, else collocated node-to-segment interpolation
+            # (either way the weights are scaled by the Bloch phase)
+            w = mortar.get(int(sid))
+            if w is not None:
+                n_mortar += 1
+            else:
+                w = _periodic_facet_weights(s_loc[k], facets.get(master_tag), loc) if facets else None
+                n_collocated += w is not None
             if w is None:
                 raise ValueError(
                     f"Periodic matching for ({master_tag!r}, {slave_tag!r}) failed at slave node {int(sid)}: "
@@ -2360,6 +2538,18 @@ def build_periodic_prolongation(
         # Bloch/quasi-periodic: P is complex, so the reduction is Hermitian (P^H A P) and the reduced
         # complex system can't be split into independent real/imag legs.
         "is_bloch": bool(is_bloch),
+        # How the NON-matching slaves were tied: "conforming" (there were none), "mortar" (integrated,
+        # passes the patch test), "collocated" (node-to-segment; no slave facets to integrate over) or
+        # "mixed". Reported rather than inferred, so a caller never has to guess which it got.
+        "coupling": (
+            "conforming"
+            if not (n_mortar or n_collocated)
+            else "mortar"
+            if not n_collocated
+            else "collocated"
+            if not n_mortar
+            else "mixed"
+        ),
     }
 
 
