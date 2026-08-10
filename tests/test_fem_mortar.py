@@ -44,6 +44,7 @@ from jno.utils.solver.fem_utils import (
     _tri_quadrature,
     _tri_shape,
     build_periodic_prolongation,
+    master_trace_weights,
 )
 
 
@@ -664,6 +665,67 @@ def test_mortar_3d_survives_a_high_density_ratio():
     assert len(kept) == 4 and np.allclose(P.sum(axis=1), 1.0)
     field = 1.3 * pts[:, 0] - 0.7 * pts[:, 1] + 2.0
     assert np.allclose(P @ field[kept], field, atol=1e-10)
+
+
+# ------------------------------------------------- the master-side trace at arbitrary points
+#
+# A tie only ever needs the master field AT SLAVE NODES, so that is all `_periodic_facet_weights`
+# offers. Contact needs it at **quadrature points**: the signed gap `g = g0 + n.(u_s - u_m.Phi)` is
+# integrated over the slave face, so the two sides must be comparable wherever the rule samples them.
+# `master_trace_weights` is that generalisation, batched -- and the two must agree where they overlap.
+
+
+def test_trace_weights_reproduce_the_master_space_at_off_node_points():
+    """The property that makes it a trace: exact for anything the master facets represent, evaluated
+    at points that are deliberately NOT master nodes."""
+    ym = np.linspace(0.0, 1.0, 5)
+    pts = np.column_stack([np.ones(5), ym])
+    mf = np.column_stack([np.arange(4), np.arange(1, 5)])
+    q = np.array([[0.03], [0.37], [0.5], [0.99]])
+    ids, w = master_trace_weights(q, mf, pts[:, 1:2])
+    assert np.allclose(w.sum(axis=1), 1.0)
+    got = (w * (3.0 * pts[ids, 1] - 1.0)).sum(axis=1)
+    assert np.allclose(got, 3.0 * q[:, 0] - 1.0, atol=1e-12)
+
+    p3, tris = _tri_grid(3, 1.0, 0)
+    q3 = np.array([[0.13, 0.71], [0.5, 0.5], [0.92, 0.08], [0.33, 0.33]])
+    ids3, w3 = master_trace_weights(q3, tris, p3[:, :2])
+    assert np.allclose(w3.sum(axis=1), 1.0)
+    f = lambda p: 2.0 * p[..., 0] - 1.5 * p[..., 1] + 0.3  # noqa: E731
+    assert np.allclose((w3 * f(p3[ids3])).sum(axis=1), f(q3), atol=1e-12)
+
+
+def test_trace_weights_agree_with_the_tie_weights_at_node_locations():
+    """Where the two overlap they must be the same operator — otherwise a contact gap and a tie would
+    disagree about what 'the master value here' means."""
+    p3, tris = _tri_grid(3, 1.0, 0)
+    loc = p3[:, :2]
+    q = np.array([[0.13, 0.71], [0.5, 0.5], [0.2, 0.05]])
+    ids, w = master_trace_weights(q, tris, loc)
+    # Compare the operators by what they COMPUTE, not by which nodes they list: a query on a shared
+    # edge has a zero barycentric, and the two may name different (equally valid) adjacent triangles.
+    for i, pt in enumerate(q):
+        ref = dict(_periodic_facet_weights(pt, tris, loc))
+        got = {int(n): float(v) for n, v in zip(ids[i], w[i])}
+        for f in (lambda p: 1.0 + 0 * p[0], lambda p: 2.0 * p[0] - 1.5 * p[1], lambda p: p[0] * p[1]):
+            a = sum(v * f(loc[n]) for n, v in got.items())
+            b = sum(v * f(loc[n]) for n, v in ref.items())
+            assert abs(a - b) < 1e-12, f"query {pt}: trace {a} vs tie {b}"
+
+
+def test_trace_weights_clamp_outside_the_face():
+    """A query off the face is clamped to the nearest facet rather than extrapolated: the weights stay
+    a partition of unity, so a constant field is still reproduced and nothing blows up."""
+    p3, tris = _tri_grid(2, 1.0, 0)
+    _ids, w = master_trace_weights(np.array([[1.4, 0.5], [-0.2, -0.2]]), tris, p3[:, :2])
+    assert np.allclose(w.sum(axis=1), 1.0)
+    assert np.all(w >= -1e-12), "clamped weights must stay non-negative (no extrapolation)"
+
+
+def test_trace_weights_handle_empty_input():
+    p3, tris = _tri_grid(2, 1.0, 0)
+    ids, w = master_trace_weights(np.zeros((0, 2)), tris, p3[:, :2])
+    assert ids.shape == (0, 3) and w.shape == (0, 3)
 
 
 def test_periodic_pair_still_ties_across_a_normal_offset():

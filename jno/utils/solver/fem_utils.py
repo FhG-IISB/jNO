@@ -2491,6 +2491,70 @@ def _mortar_rows_2d(
     return rows_out
 
 
+def master_trace_weights(
+    query: np.ndarray,
+    m_facets: np.ndarray,
+    loc: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Weights that evaluate a **master-side** field at arbitrary points of the interface.
+
+    A tie eliminates slave DOFs, so its weights are only ever needed *at slave nodes*. Contact needs
+    the same trace at **quadrature points**: the signed gap ``g = g0 + n.(u_s - u_m . Phi)`` compares
+    the two sides wherever the surface integral samples them, not just where the slave mesh happens to
+    put a node. This is that generalisation, batched.
+
+    ``query`` is ``(n_q, dim-1)`` in the interface frame of :func:`_interface_frame`; ``m_facets`` is
+    ``(n_f, k)`` master facet node ids; ``loc`` is every node projected into that frame. Returns
+    ``(ids, w)``, both ``(n_q, k)``: the master nodes each query point reads and their shape values.
+    ``sum(w, axis=1) == 1``, so a constant master field is reproduced exactly.
+
+    Host/NumPy by design -- locating a point in a facet is a discrete search, the same eager-setup
+    exception the rest of the tie machinery takes. The *result* is a plain gather, so a field read
+    through it stays differentiable in the DOF values. It is **not** differentiable in the mesh
+    coordinates: the weights are frozen at build time, so a shape derivative through a gap would need
+    them re-derived in JAX.
+
+    A query outside every facet is clamped to the nearest one, matching
+    :func:`_periodic_facet_weights` -- at a rounding-width overhang that is the intended answer, and a
+    genuine overhang is refused earlier by the coverage checks.
+    """
+    q = np.atleast_2d(np.asarray(query, dtype=float))
+    m_facets = np.asarray(m_facets, dtype=int)
+    k = int(m_facets.shape[1])
+    if q.shape[0] == 0 or m_facets.shape[0] == 0:
+        return np.zeros((0, k), dtype=int), np.zeros((0, k))
+
+    if q.shape[1] == 1:  # 2-D interface: facets are edges, locate by interval containment
+        t = q[:, 0]
+        a, b = loc[m_facets[:, 0], 0], loc[m_facets[:, 1], 0]
+        lo, hi = np.minimum(a, b), np.maximum(a, b)
+        eps = 1.0e-9 * float(np.max(hi - lo)) if m_facets.shape[0] else 0.0
+        inside = (t[:, None] >= lo[None, :] - eps) & (t[:, None] <= hi[None, :] + eps)
+        # the containing edge, else the nearest one (overhang by a rounding width)
+        dist = np.minimum(np.abs(t[:, None] - lo[None, :]), np.abs(t[:, None] - hi[None, :]))
+        idx = np.where(inside.any(axis=1), np.argmax(inside, axis=1), np.argmin(dist, axis=1))
+        span = b[idx] - a[idx]
+        xi = np.clip(np.where(np.abs(span) < 1e-300, 0.0, (t - a[idx]) / np.where(span == 0, 1.0, span)), 0.0, 1.0)
+        return m_facets[idx], _edge_shape(xi, k)
+
+    # 3-D interface: facets are triangles, locate by barycentric containment
+    v = loc[m_facets[:, :3]]  # (n_f, 3, 2)
+    v0, v1 = v[:, 1] - v[:, 0], v[:, 2] - v[:, 0]
+    det = v0[:, 0] * v1[:, 1] - v0[:, 1] * v1[:, 0]
+    det = np.where(np.abs(det) < 1e-300, 1e-300, det)
+    d = q[:, None, :] - v[None, :, 0, :]  # (n_q, n_f, 2)
+    l1 = (d[..., 0] * v1[None, :, 1] - d[..., 1] * v1[None, :, 0]) / det[None, :]
+    l2 = (v0[None, :, 0] * d[..., 1] - v0[None, :, 1] * d[..., 0]) / det[None, :]
+    l0 = 1.0 - l1 - l2
+    viol = np.maximum(0.0, -l0) + np.maximum(0.0, -l1) + np.maximum(0.0, -l2)
+    idx = np.argmin(viol, axis=1)  # containing triangle, else the least-violating one
+    rows = np.arange(q.shape[0])
+    bary = np.stack([l0[rows, idx], l1[rows, idx], l2[rows, idx]], axis=-1)
+    bary = np.clip(bary, 0.0, 1.0)
+    bary = bary / np.maximum(bary.sum(axis=1, keepdims=True), 1e-300)  # renormalise after clamping
+    return m_facets[idx], _tri_shape(bary, k)
+
+
 def _periodic_facet_weights(
     t_query: np.ndarray,
     facet_node_ids: np.ndarray,
