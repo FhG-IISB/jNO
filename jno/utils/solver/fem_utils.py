@@ -11,6 +11,7 @@ Responsibilities:
 - evaluate symbolic expressions at quadrature points inside volume/surface kernels,
 - normalize Dirichlet data and prepare residual/Jacobian runtime objects.
 """
+import hashlib as _hashlib
 from collections import OrderedDict
 from functools import partial
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -2588,6 +2589,19 @@ _ELEM_MAP_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
 #: at 128 that is bounded by ~20 dead problems rather than by the whole session.
 _ELEM_MAP_CACHE_MAX = 128
 
+#: Duplicate-collapse plans, keyed on the CONTENT of the triplet pattern they were computed from.
+#:
+#: See :func:`compress_plan` for why content rather than identity (a remesh changes the content and
+#: misses, so staleness is impossible) and for the measured hash-vs-work ratio.
+#:
+#: Bounded at 4 because an entry pins DEVICE arrays, and the ``inverse`` leg is one int32 per RAW
+#: triplet -- the largest array the plan holds (38 MiB at 9.5M triplets, against ~3 MiB for the unique
+#: indices). Four covers the two-to-three patterns one build registers plus a neighbour, which is the
+#: repeated-build case this exists for; holding a dead problem's pattern any longer costs device
+#: memory for nothing.
+_PLAN_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
+_PLAN_CACHE_MAX = 4
+
 
 def _bake_fingerprint(fn, chunk):
     """Identity of everything a ``jit`` of ``fn`` would BAKE IN: its code object, and the *leaves* of
@@ -2781,10 +2795,30 @@ def compress_plan(indices):
 
     Raises on a traced index array rather than guessing. Every caller builds its pattern from
     host-static mesh connectivity, so a tracer here means that invariant broke, and the caller must
-    fall back to the uncompressed path rather than ship a wrong count."""
+    fall back to the uncompressed path rather than ship a wrong count.
+
+    **Memoized on the pattern's CONTENT** (:data:`_PLAN_CACHE`). The sentence at the top of this
+    docstring -- the pattern is fixed by mesh and terms -- is also true *across builds*, and it was
+    being ignored: rebuilding the same problem on the same mesh recomputed an identical plan. Measured
+    on 3-D Poisson at 27,833 nodes, that was **0.68 s of a 1.5 s build, 45%**, and this path is
+    entered two to three times per build (here, the Dirichlet-row wrapper, and again inside
+    :func:`compress_eager` on the augmented pattern).
+
+    Content-keyed rather than keyed on the identity of the arrays the pattern was derived from, which
+    is the safer of the two: identical content provably yields an identical plan, and a **remeshed
+    domain changes the content and simply misses**, so no staleness is possible. Identity-keying would
+    have needed the mesh threaded into the key and a test to prove an adaptive remesh invalidates it.
+    The hash is not free but it is not close to the cost either -- measured at the 9.5M-triplet size,
+    ``blake2b`` 60 ms against the 800 ms ``np.unique`` it skips, i.e. **7.5%**."""
     arr = np.asarray(indices)  # raises on a tracer -- deliberately not caught
     if arr.size == 0 or arr.shape[0] == 0:
         return None
+    digest = _hashlib.blake2b(memoryview(np.ascontiguousarray(arr)).cast("B"), digest_size=16).digest()
+    key = (digest, arr.shape, arr.dtype.str)
+    hit = _PLAN_CACHE.get(key)
+    if hit is not None:
+        _PLAN_CACHE.move_to_end(key)
+        return hit
     rows = arr[:, 0].astype(np.int64)
     cols = arr[:, 1].astype(np.int64)
     stride = int(cols.max()) + 1
@@ -2792,7 +2826,11 @@ def compress_plan(indices):
     idx = np.stack([uniq // stride, uniq % stride], axis=1).astype(np.int32)
     # int32 inverse: it is one entry per RAW triplet, so on a large 3-D operator it is the biggest
     # array the plan holds -- halving it against numpy's int64 default is worth the cast.
-    return jnp.asarray(idx), jnp.asarray(inverse.reshape(-1).astype(np.int32)), int(uniq.shape[0])
+    plan = jnp.asarray(idx), jnp.asarray(inverse.reshape(-1).astype(np.int32)), int(uniq.shape[0])
+    _PLAN_CACHE[key] = plan
+    while len(_PLAN_CACHE) > _PLAN_CACHE_MAX:
+        _PLAN_CACHE.popitem(last=False)
+    return plan
 
 
 def compress_eager(A):
