@@ -230,7 +230,13 @@ def _facet_components(facet_idx, facet_nodes):
     return [np.asarray(facet_idx)[g] for g in groups.values()]
 
 
-def _to_meshio(dim: int, labels: Dict[int, Tuple[int, str]], region_items=None, nonconforming: bool = False):
+#: gmsh element types for the second-order (curved) simplices, keyed by (dim, n_nodes-per-cell).
+_TRI6, _TET10, _LINE3 = 9, 11, 8
+
+
+def _to_meshio(
+    dim: int, labels: Dict[int, Tuple[int, str]], region_items=None, nonconforming: bool = False, order: int = 1
+):
     """Assemble the generated gmsh mesh into a ``meshio.Mesh`` with named ``cell_sets``.
 
     ``region_items`` (``((name, sub_shape), ...)``, when the plan is a :meth:`Shape.regions`
@@ -256,12 +262,16 @@ def _to_meshio(dim: int, labels: Dict[int, Tuple[int, str]], region_items=None, 
     coords = np.asarray(coords, dtype=float).reshape(-1, 3)
     index = {int(t): i for i, t in enumerate(node_tags)}
 
+    curved = int(order) > 1
     if dim == 1:
-        vtype, npv, vblock = _LINE, 2, "line"
+        vtype, npv, vblock = (_LINE3, 3, "line3") if curved else (_LINE, 2, "line")
         btype, npb, bblock = _POINT, 1, "vertex"  # boundary of a 1-D domain = its two endpoints
+    elif dim == 3:
+        vtype, npv, vblock = (_TET10, 10, "tetra10") if curved else (_TET, 4, "tetra")
+        btype, npb, bblock = (_TRI6, 6, "triangle6") if curved else (_TRI, 3, "triangle")
     else:
-        vtype, npv, vblock = (_TET, 4, "tetra") if dim == 3 else (_TRI, 3, "triangle")
-        btype, npb, bblock = (_TRI, 3, "triangle") if dim == 3 else (_LINE, 2, "line")
+        vtype, npv, vblock = (_TRI6, 6, "triangle6") if curved else (_TRI, 3, "triangle")
+        btype, npb, bblock = (_LINE3, 3, "line3") if curved else (_LINE, 2, "line")
 
     _vtags, vnodes = gmsh.model.mesh.getElementsByType(vtype)
     vcells = np.asarray([index[int(t)] for t in vnodes], dtype=np.int64).reshape(-1, npv)
@@ -432,7 +442,7 @@ MESH_THREADS = 1
 MESH_ALGORITHM_2D = 6
 
 
-def _build_once(shape, split_full, periodic=None, algorithm=None, threads=None):
+def _build_once(shape, split_full, periodic=None, algorithm=None, threads=None, order=1):
     import gmsh
 
     started = not gmsh.isInitialized()
@@ -461,10 +471,19 @@ def _build_once(shape, split_full, periodic=None, algorithm=None, threads=None):
         if periodic:  # make named opposite faces conform (edge-element periodic ties need it)
             _apply_periodic(dim, labels, periodic)
         gmsh.model.mesh.generate(dim)
+        if int(order) > 1:
+            # CURVED (isoparametric) geometry. Without this the mesh is straight-sided and jNO
+            # SYNTHESISES its higher-order nodes by interpolating reference points through the affine
+            # map (`fem_native._get_mesh` -> `_promote_to_degree`), so a P2 midside node lands on the
+            # straight-edge midpoint and the domain stays a polygon however high the basis order goes.
+            # `setOrder` asks gmsh to place those nodes on the actual CAD surface instead; without
+            # `HighOrderOptimize` gmsh curves only the boundary entities, which is exactly the part
+            # that matters and keeps interior cells affine (so `detJ` cannot go negative on them).
+            gmsh.model.mesh.setOrder(int(order))
         is_regions = shape._node[0] == "regions"
         region_items = shape._node[1] if is_regions else None
         nonconforming = is_regions and len(shape._node) > 2 and not shape._node[2]
-        mesh = _to_meshio(dim, labels, region_items, nonconforming=nonconforming)
+        mesh = _to_meshio(dim, labels, region_items, nonconforming=nonconforming, order=int(order))
         return mesh, dim, ds
     finally:
         gmsh.model.remove()
@@ -472,7 +491,7 @@ def _build_once(shape, split_full, periodic=None, algorithm=None, threads=None):
             gmsh.finalize()
 
 
-def build(shape, periodic=None, *, algorithm=None, threads=None):
+def build(shape, periodic=None, *, algorithm=None, threads=None, order=1):
     """Mesh ``shape`` -> ``(meshio.Mesh, dim, ds)``.
 
     ``algorithm`` selects gmsh's meshing kernel for the shape's own dimension -- there is no
@@ -483,11 +502,17 @@ def build(shape, periodic=None, *, algorithm=None, threads=None):
     ``periodic`` is an optional list of ``(master_name, slave_name)`` boundary-face pairs meshed conforming
     (via :func:`_apply_periodic`) so opposite faces line up — needed for Nédélec edge periodic ties.
 
+    ``order=2`` meshes **curved (isoparametric)** geometry: gmsh places the midside nodes on the actual
+    CAD surface instead of jNO synthesising them at straight-edge midpoints, so a round boundary stays
+    round. Without it the domain is a polygon at every basis order, which caps the discretisation at
+    O(h^2) however high the element order goes, and leaves facet normals O(h) wrong. Emits second-order
+    meshio blocks (``triangle6`` / ``tetra10`` / ``line3``).
+
     A single-sweep full (2pi) revolve of a *detached* profile makes a periodic surface gmsh cannot mesh,
     while an axis-touching profile (a cone) meshes fine that way -- so we try the single sweep first and
     only fall back to the two-halves construction if meshing fails.
     """
-    opts = dict(algorithm=algorithm, threads=threads)
+    opts = dict(algorithm=algorithm, threads=threads, order=order)
     try:
         return _build_once(shape, split_full=False, periodic=periodic, **opts)
     except Exception as exc:  # noqa: BLE001 - narrow retry on the periodic-surface mesher failure
