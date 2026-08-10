@@ -142,6 +142,41 @@ def _cudss_available() -> bool:
     return True
 
 
+def _cudss_check_factorization(solver, Ag, bg, cp, shape):
+    """Raise if cuDSS silently factored a singular operator.
+
+    cuDSS does NOT report singularity through an exception, and -- unlike ``spsolve``, which returns
+    ``NaN`` -- it returns a FINITE, plausible-looking vector. Measured on ``diag(1, 2, 0, 4)``: it
+    returns ``1e+13`` in the null component with relative residual 1.0 and ``info == 0``. A wrong
+    number that looks right is the worst failure mode jNO can have, so this path checks.
+
+    ``npivots`` is the signal: it counts pivots cuDSS had to REPLACE, so a nonzero value means the
+    factorization is of a perturbed matrix, not the one asked for. Measured 0 on lap3d 30^3, on an
+    indefinite Stokes-shaped saddle, and on a cond-1e11 system -- i.e. it does not fire on
+    merely-hard problems -- and 1 on both a zero-pivot and a rank-deficient matrix.
+
+    The residual is only computed WHEN ``npivots`` fires, so the common path pays a host-side
+    attribute read and no SpMV. A perturbed pivot that still yields a good answer passes.
+    """
+    try:
+        npivots = int(solver.factorization_info.npivots)
+    except Exception:  # an older cuDSS that does not expose it -- do not fail the solve over this
+        return
+    if npivots == 0:
+        return
+    x = solver.solve()
+    denom = cp.linalg.norm(bg)
+    rel = float(cp.linalg.norm(Ag @ x - bg) / cp.where(denom > 0, denom, 1.0))
+    if rel > 1e-6:
+        raise RuntimeError(
+            f"cuDSS factorized a SINGULAR operator ({shape[0]}x{shape[1]}): it replaced {npivots} "
+            f"pivot(s) and the solution has relative residual {rel:.2e}. cuDSS reports this through "
+            f"neither an exception nor a NaN, so jNO checks it -- the returned vector would have been "
+            f"finite and wrong. Check for an unconstrained mode (a pure-Neumann problem with no gauge "
+            f"term, a floating region, or a saddle system whose constraint block has an empty row)."
+        )
+
+
 def _cudss_host_solve(data, indices, rhs, shape, transpose):
     """One cuDSS solve, with the plan/factorization cache described on :data:`_CUDSS_CACHE`.
 
@@ -182,6 +217,11 @@ def _cudss_host_solve(data, indices, rhs, shape, transpose):
         solver = nsa.DirectSolver(Ag, bg)
         solver.plan()
         solver.factorize()
+        try:
+            _cudss_check_factorization(solver, Ag, bg, cp, shape)
+        except Exception:
+            solver.free()  # never cached, so nothing else will ever free it
+            raise
         _CUDSS_CACHE[skey] = entry = {"solver": solver, "Ag": Ag, "bg": bg, "dhash": dhash, "rows": rows, "cols": cols}
         while len(_CUDSS_CACHE) > _CUDSS_CACHE_MAX:
             _, old = _CUDSS_CACHE.popitem(last=False)
@@ -196,6 +236,7 @@ def _cudss_host_solve(data, indices, rhs, shape, transpose):
             csr.sum_duplicates()
             entry["Ag"].data[:] = cp.asarray(csr.data)
             entry["solver"].factorize()
+            _cudss_check_factorization(entry["solver"], entry["Ag"], entry["bg"], cp, shape)
             entry["dhash"] = dhash
 
     entry["bg"][:] = cp.asarray(rhs.reshape(-1))

@@ -232,3 +232,74 @@ def test_wiring_accepts_a_dense_operator(wired):
     A = _spd(n, seed=10)
     b = jnp.asarray(np.random.default_rng(11).normal(size=n))
     np.testing.assert_allclose(np.asarray(wired(A.todense(), b)), np.asarray(wired(A, b)), rtol=1e-8, atol=1e-10)
+
+
+# --------------------------------------------------------------------------------------
+# the singular-operator guard
+# --------------------------------------------------------------------------------------
+#
+# cuDSS reports a singular factorization through NEITHER an exception NOR a NaN -- measured, it
+# returns a finite, plausible vector (`diag(1,2,0,4)` -> 1e+13 in the null slot, relative residual
+# 1.0, `info == 0`). `_cudss_check_factorization` catches that. It takes its array module as an
+# argument, so the decision logic is testable with fakes on any machine; the @requires_cudss test
+# below covers the real thing.
+
+
+class _FakeSolver:
+    def __init__(self, npivots, x):
+        self.factorization_info = type("I", (), {"npivots": npivots})()
+        self._x = x
+
+    def solve(self):
+        return self._x
+
+
+def _guard(npivots, x, A, b):
+    from jno.utils.solver.linear import _cudss_check_factorization
+
+    return _cudss_check_factorization(_FakeSolver(npivots, jnp.asarray(x)), jnp.asarray(A), jnp.asarray(b), jnp, (4, 4))
+
+
+def test_guard_is_silent_when_no_pivot_was_replaced():
+    """The common path must cost a host-side attribute read and NO SpMV."""
+    A = np.diag([1.0, 2.0, 3.0, 4.0])
+    assert _guard(0, [99.0, 99.0, 99.0, 99.0], A, np.ones(4)) is None  # garbage x, but npivots==0
+
+
+def test_guard_raises_on_a_replaced_pivot_with_a_bad_residual():
+    A = np.diag([1.0, 2.0, 0.0, 4.0])
+    with pytest.raises(RuntimeError, match="SINGULAR"):
+        _guard(1, [1.0, 0.5, 1e13, 0.25], A, np.ones(4))
+
+
+def test_guard_allows_a_replaced_pivot_that_still_solved():
+    """A perturbed pivot is only a *suspicion*; a good residual clears it, so no false failure."""
+    A = np.diag([1.0, 2.0, 3.0, 4.0])
+    assert _guard(1, [1.0, 0.5, 1 / 3, 0.25], A, np.ones(4)) is None
+
+
+def test_guard_tolerates_a_cudss_that_does_not_expose_npivots():
+    """An older cuDSS must not turn a working solve into an error."""
+
+    class _Old:
+        @property
+        def factorization_info(self):
+            raise AttributeError("npivots")
+
+    from jno.utils.solver.linear import _cudss_check_factorization
+
+    assert _cudss_check_factorization(_Old(), jnp.eye(4), jnp.ones(4), jnp, (4, 4)) is None
+
+
+def test_guard_handles_a_zero_rhs_without_dividing_by_zero():
+    A = np.diag([1.0, 2.0, 0.0, 4.0])
+    assert _guard(1, [0.0, 0.0, 0.0, 0.0], A, np.zeros(4)) is None  # 0 residual on a 0 rhs is correct
+
+
+@requires_cudss
+def test_singular_operator_raises_instead_of_returning_finite_garbage():
+    """The real thing: cuDSS would return a finite wrong answer here."""
+    idx = jnp.asarray(np.stack([np.arange(4), np.arange(4)], axis=1))
+    A = jsp.BCOO((jnp.asarray([1.0, 2.0, 0.0, 4.0]), idx), shape=(4, 4))
+    with pytest.raises(RuntimeError, match="SINGULAR"):
+        cudss_lu_solve(A, jnp.ones(4))
