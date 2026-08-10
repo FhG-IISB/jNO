@@ -100,6 +100,20 @@ def lu(*, backend: str = "device", host: bool | None = None) -> LinearSolver:
             at lap3d 20^3-40^3), so it moves the ceiling and makes device memory the binding
             constraint -- it is not a substitute for a preconditioner.
 
+            ``"pardiso"`` -- Intel MKL PARDISO on the CPU, multithreaded. **The fastest
+            FACTORIZATION of the four**, and the one to pick for a Newton loop: like cuDSS it splits
+            symbolic analysis from numeric factorization, so the analysis survives a change of values.
+            Measured on lap3d 50^3 (n=125,000) against single-threaded SuperLU's 65,212 ms:
+            factorization **298 ms**, and a Newton re-factorization **296 ms -- 220x**, where cuDSS
+            reaches 115x. Being on the CPU it is also the answer when a factorization will not fit in
+            device memory. Its adjoint is cheaper than cuDSS's too: ``A^T x = b`` comes from the SAME
+            factorization rather than a second one. Needs ``pypardiso`` (x86-64).
+
+            **Choosing between the last two: pick by the phase your problem repeats.** A Newton loop
+            re-FACTORIZES, so PARDISO wins. A shift-invert eigensolve or a constant-operator transient
+            re-SOLVES against one factorization, and there cuDSS is 11x faster per solve (3.5 ms vs
+            40 ms at lap3d 50^3) and additionally takes a whole block of right-hand sides at once.
+
             There is deliberately no ``"auto"``: which backend wins depends on hardware jNO cannot
             inspect, and silently choosing would violate the no-surprises rule.
         host: Deprecated alias for ``backend="host"``, kept so existing calls keep working. Passing
@@ -112,17 +126,23 @@ def lu(*, backend: str = "device", host: bool | None = None) -> LinearSolver:
                 f'deprecated spelling of backend="host" -- pass only backend=.'
             )
         backend = "host" if host else "device"
-    if backend not in ("device", "host", "cudss"):
+    if backend not in ("device", "host", "cudss", "pardiso"):
         raise ValueError(
             f"jno.solve.lu(backend={backend!r}) is not a known backend. Use 'device' (JAX spsolve: "
-            f"cuSolver on GPU, native LU on CPU), 'host' (CPU SuperLU via scipy), or 'cudss' (NVIDIA "
-            f"cuDSS on GPU -- fastest, needs nvmath-python + cudss + cupy installed)."
+            f"cuSolver on GPU, native LU on CPU), 'host' (CPU SuperLU via scipy), 'cudss' (NVIDIA "
+            f"cuDSS on GPU -- fastest repeated SOLVE), or 'pardiso' (Intel MKL PARDISO on CPU -- "
+            f"fastest FACTORIZATION). Install the last two with jax-numerical-operators[fem]."
         )
 
     def _fn(op: LinearOperator, b, *, M, x0):
-        from .utils.solver.linear import cudss_lu_solve, host_lu_solve, sparse_lu_solve
+        from .utils.solver.linear import cudss_lu_solve, host_lu_solve, pardiso_lu_solve, sparse_lu_solve
 
-        solve = {"device": sparse_lu_solve, "host": host_lu_solve, "cudss": cudss_lu_solve}[backend]
+        solve = {
+            "device": sparse_lu_solve,
+            "host": host_lu_solve,
+            "cudss": cudss_lu_solve,
+            "pardiso": pardiso_lu_solve,
+        }[backend]
         if op.bcoo is not None:
             return solve(op.bcoo, b)
         # a dense operator gets the dense direct solve — BCOO.fromdense would need a concrete
@@ -134,7 +154,7 @@ def lu(*, backend: str = "device", host: bool | None = None) -> LinearSolver:
     # none to remove, so it would pay a compile for nothing.
     # the name carries the placement, so two specs that factor in different memories are not
     # reported (or cached) as though they were the same solver
-    name = {"device": "lu", "host": "lu-host", "cudss": "lu-cudss"}[backend]
+    name = {"device": "lu", "host": "lu-host", "cudss": "lu-cudss", "pardiso": "lu-pardiso"}[backend]
     # `multi_rhs` lets a caller holding a BLOCK of right-hand sides (the shift-invert eigensolver's
     # subspace iteration) hand the whole block over in one call instead of looping its columns.
     traits = {"vmap": "no", "multi_rhs": backend == "cudss"}

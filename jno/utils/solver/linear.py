@@ -65,6 +65,25 @@ _FACTOR_CACHE_MAX = 2
 _CUDSS_CACHE: "OrderedDict[tuple, Any]" = OrderedDict()
 _CUDSS_CACHE_MAX = 4
 
+#: MKL PARDISO solvers, keyed on the operator's SPARSITY -- the same idea as :data:`_CUDSS_CACHE`,
+#: because PARDISO splits into the same phases: 11 (symbolic analysis, sparsity only), 22 (numeric
+#: factorization, values), 33 (solve). Driving those phases directly is the entire point: pypardiso's
+#: own reuse is keyed on the WHOLE matrix, so a Newton step whose values changed would redo the
+#: analysis, exactly the gap :func:`host_lu_solve` has.
+#:
+#: Measured on this machine (20 cores, MKL chose 14 threads) against single-threaded scipy SuperLU:
+#: lap3d 50^3 (n=125,000) factorization **298 ms vs 65,212 ms**, and a Newton re-factorization
+#: reusing the analysis is **296 ms -- 220x**. For comparison cuDSS on the same problem factors in
+#: 576 ms and re-factors at 115x, so PARDISO is the faster FACTORIZATION; cuDSS keeps the faster
+#: repeated SOLVE (3.5 ms against 40 ms), which is what makes the two complementary rather than
+#: redundant.
+#:
+#: Unlike cuDSS there is **no transpose entry**: PARDISO solves ``A^T x = b`` from the SAME
+#: factorization via ``iparm[12] = 2`` (verified to 2e-16), so the adjoint pass costs a solve rather
+#: than a whole second factorization.
+_PARDISO_CACHE: "OrderedDict[tuple, Any]" = OrderedDict()
+_PARDISO_CACHE_MAX = 4
+
 
 def matrix_diagonal(A):
     """Diagonal of ``A`` as a 1-D array, for a BCOO or dense operator (cheap: ``O(nnz)`` for BCOO)."""
@@ -384,6 +403,215 @@ def cudss_lu_solve(A, b):
     def _call(rhs, transpose):
         return jax.pure_callback(
             lambda d, i, r: _cudss_host_solve(d, i, r, shape, transpose),
+            jax.ShapeDtypeStruct(bshape, rhs.dtype),
+            A.data,
+            A.indices,
+            rhs,
+        )
+
+    return jax.lax.custom_linear_solve(
+        lambda x: A @ x,
+        b.reshape(bshape),
+        lambda _matvec, rhs: _call(rhs, False),
+        transpose_solve=lambda _matvec, rhs: _call(rhs, True),
+    )
+
+
+def _pardiso_available() -> bool:
+    """True when pypardiso imports AND exposes the private phase hooks this backend drives."""
+    try:
+        from pypardiso import PyPardisoSolver
+    except Exception:
+        return False
+    return all(hasattr(PyPardisoSolver, m) for m in ("_check_A", "_call_pardiso", "set_phase", "set_iparm"))
+
+
+#: real/complex x general/symmetric/hermitian -> PARDISO ``mtype``. The symmetric entries are the
+#: INDEFINITE ones (-2, -4) rather than the definite ones (2, 4) on purpose: they cost the same, they
+#: cover indefinite saddles, and claiming definiteness that does not hold is a way to be wrong.
+_PARDISO_MTYPE = {
+    (False, "general"): 11,
+    (False, "symmetric"): -2,
+    (False, "hermitian"): -2,
+    (True, "general"): 13,
+    (True, "symmetric"): 6,
+    (True, "hermitian"): -4,
+}
+
+
+def _pardiso_upper_with_diag(A, sp, np):
+    """Upper triangle with the diagonal stored EXPLICITLY -- what PARDISO's symmetric modes require.
+
+    The explicit diagonal is not a detail. A saddle system's constraint block sits entirely in the
+    LOWER triangle, so its rows would come back empty and PARDISO would reject the matrix as
+    structurally singular -- which is precisely the class of system (Stokes, Biot) this backend is
+    most wanted for. Storing a zero diagonal keeps those rows present.
+    """
+    C = A.tocoo()
+    keep = C.col >= C.row
+    d = np.arange(A.shape[0])
+    rows = np.concatenate([C.row[keep], d])
+    cols = np.concatenate([C.col[keep], d])
+    vals = np.concatenate([C.data[keep], np.zeros(A.shape[0], dtype=C.data.dtype)])
+    return sp.coo_matrix((vals, (rows, cols)), shape=A.shape).tocsr()
+
+
+def _pardiso_host_solve(data, indices, rhs, shape, transpose):
+    """One MKL PARDISO solve, with the phase-separated cache described on :data:`_PARDISO_CACHE`.
+
+    Runs inside a ``pure_callback``, so it sees concrete numpy arrays.
+
+    Driving the phases means reaching for ``PyPardisoSolver._check_A`` / ``._call_pardiso``, which are
+    private. That is deliberate and unavoidable -- the public ``solve``/``factorize`` decide phases
+    from their own whole-matrix hash, which is the behaviour this cache exists to replace -- but it
+    does mean the backend is coupled to pypardiso internals, so :func:`_pardiso_available` checks for
+    them and the import error says so.
+    """
+    import hashlib
+
+    import numpy as _np
+    import scipy.sparse as _sp
+    from pypardiso import PyPardisoSolver
+
+    def _h(*arrs):
+        d = hashlib.blake2b(digest_size=16)
+        for a in arrs:
+            a = _np.ascontiguousarray(a)
+            d.update(_np.asarray(a.shape, dtype=_np.int64).view(_np.uint8))
+            d.update(a.view(_np.uint8))
+        return d.digest()
+
+    data = _np.ascontiguousarray(data)
+    idx = _np.ascontiguousarray(_np.asarray(indices))
+    rhs2 = _np.asarray(rhs).reshape(rhs.shape[0], -1)
+    rows, cols = idx[:, 0], idx[:, 1]
+
+    order, orderT, pat = _cudss_sym_perms(rows, cols)
+    kind = _cudss_matrix_kind(data, order, orderT, pat)
+    mtype = _PARDISO_MTYPE[(bool(_np.iscomplexobj(data)), kind)]
+
+    # NO transpose in the key: one factorization serves both directions (iparm[12]).
+    skey = (_h(rows, cols), shape, data.dtype.str, mtype)
+    dhash = _h(data)
+    entry = _PARDISO_CACHE.get(skey)
+
+    def _build(values):
+        A = _sp.coo_matrix((values, (rows, cols)), shape=shape).tocsr()
+        A.sum_duplicates()
+        return _pardiso_upper_with_diag(A, _sp, _np) if mtype in (-2, 6, -4, 2, 4) else A
+
+    b = _np.asfortranarray(rhs2.astype(data.dtype if _np.iscomplexobj(data) else rhs2.dtype))
+
+    if entry is None:
+        A = _build(data)
+        solver = PyPardisoSolver(mtype=mtype)
+        solver._check_A(A)
+        solver.set_phase(11)  # symbolic analysis: the half that survives a value change
+        solver._call_pardiso(A, b)
+        solver.set_phase(22)
+        solver._call_pardiso(A, b)
+        _PARDISO_CACHE[skey] = entry = {"solver": solver, "A": A, "dhash": dhash}
+        while len(_PARDISO_CACHE) > _PARDISO_CACHE_MAX:
+            _, old = _PARDISO_CACHE.popitem(last=False)
+            old["solver"].free_memory()  # PARDISO holds its factors in MKL-owned memory
+    else:
+        _PARDISO_CACHE.move_to_end(skey)
+        if entry["dhash"] != dhash:
+            entry["A"] = _build(data)  # same sparsity -> phase 22 only, analysis reused
+            entry["solver"].set_phase(22)
+            entry["solver"]._call_pardiso(entry["A"], b)
+            entry["dhash"] = dhash
+
+    solver, A = entry["solver"], entry["A"]
+    _pardiso_check_factorization(solver, A, b, _np, shape)
+    solver.set_iparm(12, 2 if transpose else 0)  # A^T x = b from the SAME factorization
+    solver.set_phase(33)
+    try:
+        x = solver._call_pardiso(A, b)
+    finally:
+        solver.set_iparm(12, 0)
+    return _np.asarray(x.reshape(rhs.shape), dtype=rhs.dtype)
+
+
+def _pardiso_check_factorization(solver, A, b, np, shape):
+    """Raise if PARDISO silently factored a singular operator.
+
+    PARDISO behaves exactly like cuDSS here and exactly unlike ``spsolve``: measured on a rank-3
+    4x4 matrix it returned ``[-1e13, 5e12, 0.2, 0.4]`` -- finite, plausible, residual 0.5, no
+    exception. ``iparm[13]`` (perturbed pivots) is the tell, the direct analogue of cuDSS's
+    ``npivots``; it read 1 on that matrix. As there, the residual is only computed once the pivot
+    count fires, so a healthy factorization pays a single integer read.
+
+    pypardiso separately rejects a STRUCTURALLY singular matrix (an empty row or column) up front in
+    ``_check_A`` with its own clear message; this covers the numerically singular case it cannot see.
+    """
+    try:
+        perturbed = int(solver.get_iparm(14))
+    except Exception:  # a pypardiso that does not expose it -- do not fail a working solve over this
+        return
+    if perturbed == 0:
+        return
+    solver.set_phase(33)
+    x = solver._call_pardiso(A, b)
+    denom = np.linalg.norm(b)
+    rel = float(np.linalg.norm(A @ x - b) / (denom if denom > 0 else 1.0))
+    if rel > 1e-6:
+        raise RuntimeError(
+            f"MKL PARDISO factorized a SINGULAR operator ({shape[0]}x{shape[1]}): it perturbed "
+            f"{perturbed} pivot(s) and the solution has relative residual {rel:.2e}. PARDISO reports "
+            f"this through neither an exception nor a NaN, so jNO checks it -- the returned vector "
+            f"would have been finite and wrong. Check for an unconstrained mode (a pure-Neumann "
+            f"problem with no gauge term, a floating region, or a constraint block with an empty row)."
+        )
+
+
+def pardiso_lu_solve(A, b):
+    """Sparse-direct solve factored on the CPU by **Intel MKL PARDISO**, driven from the device.
+
+    Same contract as :func:`sparse_lu_solve` -- ``(A, b) -> x``, jit-compatible, reverse-mode
+    differentiable -- and the same structure as :func:`cudss_lu_solve`, including a cache keyed on the
+    SPARSITY so a Newton loop reuses the symbolic analysis (see :data:`_PARDISO_CACHE`).
+
+    **Fastest factorization of the three backends, measured.** lap3d 50^3 (n=125,000): factorization
+    298 ms against cuDSS's 576 ms and host SuperLU's 65,212 ms; the Newton re-factorization is 296 ms,
+    i.e. **220x** SuperLU where cuDSS reaches 115x. It runs on the CPU, so it is also the answer when
+    a factorization does not fit in device memory. cuDSS keeps the faster repeated SOLVE (3.5 ms vs
+    40 ms), which is what a shift-invert eigensolve or a constant-operator transient is made of -- so
+    pick by which phase your problem repeats.
+
+    An exactly symmetric operator is factored as symmetric-indefinite (LDL^T), which additionally
+    needs only the upper triangle. Measured 1.9x on the factorization at lap3d 50^3 and 13x on a
+    saddle. Symmetry is detected exactly, by the same :func:`_cudss_matrix_kind` the cuDSS path uses.
+
+    A **block right-hand side is not a win here** and is simply passed through: measured 0.32x at 4
+    columns and 1.12x at 32 against the same factorization solved column by column, PARDISO's
+    single-RHS solve already being threaded. Only cuDSS advertises ``multi_rhs``.
+
+    Requires ``pypardiso`` (which bundles MKL); raises a clear ``ImportError`` otherwise. Limitations
+    inherited from ``pure_callback``: no ``vmap`` batching rule, and the callback is forward-only.
+    """
+    import jax
+    import jax.experimental.sparse as jsp
+
+    if not _pardiso_available():
+        raise ImportError(
+            "jno.solve.lu(backend='pardiso') needs MKL PARDISO. Install it with "
+            "`pip install jax-numerical-operators[pardiso]` (or `pip install pypardiso`, which "
+            "bundles the MKL runtime; x86-64 only). If it IS installed, this jNO build drives "
+            "PARDISO's phases directly and needs PyPardisoSolver._check_A / ._call_pardiso, which "
+            "this pypardiso version does not expose -- pin pypardiso>=0.4.4. Use backend='host' for "
+            "the dependency-free CPU path."
+        )
+    if not (hasattr(A, "indices") and hasattr(A, "sum_duplicates")):
+        A = jsp.BCOO.fromdense(jnp.asarray(A))
+    n = int(A.shape[0])
+    shape = tuple(int(s) for s in A.shape)
+    b = jnp.asarray(b)
+    bshape = (n,) if b.ndim == 1 else (n, int(b.shape[1]))
+
+    def _call(rhs, transpose):
+        return jax.pure_callback(
+            lambda d, i, r: _pardiso_host_solve(d, i, r, shape, transpose),
             jax.ShapeDtypeStruct(bshape, rhs.dtype),
             A.data,
             A.indices,

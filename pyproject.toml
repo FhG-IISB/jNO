@@ -62,6 +62,38 @@ Issues = "https://github.com/FhG-IISB/jno/issues"
 # install (and every downstream app that depends on jNO) on machines without that toolchain.
 amg = ["jaxamg[cuda13]>=0.1.3,<0.2"]
 
+# ---------------------------------------------------------------------------------------------
+# FEM: everything jno.fem reaches for beyond the core install.
+#
+# `pip install jax-numerical-operators[fem]` is meant to be the one-liner that leaves nothing on the
+# table -- adaptive remeshing plus BOTH accelerated sparse-direct backends. Every one of these is
+# imported LAZILY, so the core install still works without them and each has its own clear
+# ImportError naming the fix.
+#
+# Environment markers, not optimism: MKL is x86-only, and the CUDA wheels are Linux x86-64, so an
+# arm64 mac gets the FEM extra WITHOUT a resolver failure -- it simply lands without the backends
+# that cannot run there. Note a marker can gate on platform but not on whether a CUDA *device* is
+# present; the cudss wheels install on any linux-x86_64 machine and raise at call time on a host
+# with no GPU, which is why `lu(backend=...)` never defaults to them.
+fem = [
+    "jax-numerical-operators[mesh,pardiso,cudss]",
+]
+# Anisotropic/adaptive remeshing behind fem.solve(adapt=...).
+mesh = ["mmgpy"]
+# jno.solve.lu(backend="pardiso") -- Intel MKL PARDISO, multithreaded CPU sparse-direct. The
+# fastest FACTORIZATION measured here and the one that reuses its symbolic analysis across a Newton
+# step; needs no GPU, so it is also the answer when a factorization exceeds device memory.
+pardiso = [
+    "pypardiso>=0.4.4; platform_machine == 'x86_64'",
+]
+# jno.solve.lu(backend="cudss") -- NVIDIA cuDSS. The fastest repeated SOLVE, which is what a
+# shift-invert eigensolve and a constant-operator transient are made of.
+cudss = [
+    "nvmath-python>=1.0; platform_machine == 'x86_64' and sys_platform == 'linux'",
+    "nvidia-cudss-cu12; platform_machine == 'x86_64' and sys_platform == 'linux'",
+    "cupy-cuda12x; platform_machine == 'x86_64' and sys_platform == 'linux'",
+]
+
 dev = ["pytest>=7.0",
         "black>=22.0",
         "flake8>=4.0",

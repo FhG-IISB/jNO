@@ -16,7 +16,12 @@ import pytest
 from jax.experimental import sparse as jsp
 
 import jno
-from jno.utils.solver.linear import _cudss_available, cudss_lu_solve
+from jno.utils.solver.linear import (
+    _cudss_available,
+    _pardiso_available,
+    cudss_lu_solve,
+    pardiso_lu_solve,
+)
 
 requires_cudss = pytest.mark.skipif(not _cudss_available(), reason="optional cuDSS stack not installed")
 
@@ -71,7 +76,7 @@ def test_unknown_backend_names_the_valid_ones():
     with pytest.raises(ValueError, match="not a known backend"):
         jno.solve.lu(backend="cuDSS")  # right solver, wrong case
     with pytest.raises(ValueError, match="not a known backend"):
-        jno.solve.lu(backend="pardiso")
+        jno.solve.lu(backend="mumps")  # a real solver, but not one jNO wraps
 
 
 def test_backend_and_host_together_is_an_error():
@@ -489,3 +494,112 @@ def test_every_cache_field_read_is_a_field_that_gets_written():
         and isinstance(node.slice.value, str)
     }
     assert read <= written, f"cache fields read but never written: {sorted(read - written)}"
+
+
+# --------------------------------------------------------------------------------------
+# MKL PARDISO backend
+# --------------------------------------------------------------------------------------
+
+requires_pardiso = pytest.mark.skipif(not _pardiso_available(), reason="optional MKL PARDISO not installed")
+
+
+def test_pardiso_is_a_distinct_backend_that_does_not_claim_multi_rhs():
+    """Measured 0.32x at 4 columns and 1.12x at 32 -- PARDISO's single-RHS solve is already threaded."""
+    spec = jno.solve.lu(backend="pardiso")
+    assert spec.name == "lu-pardiso"
+    assert spec.direct is True
+    assert spec.traits["multi_rhs"] is False
+
+
+@pytest.mark.skipif(_pardiso_available(), reason="PARDISO installed, so the missing-dependency path cannot run")
+def test_missing_pardiso_names_the_extra_and_the_fallback():
+    with pytest.raises(ImportError, match=r"\[pardiso\]"):
+        pardiso_lu_solve(_spd(8), jnp.ones(8))
+
+
+def test_pardiso_matrix_type_map_covers_every_detected_kind():
+    """The kind detector and the mtype table must not drift apart -- a missing pair is a KeyError
+    at solve time on a machine that has PARDISO, which the skipping tests would never reach."""
+    from jno.utils.solver.linear import _PARDISO_MTYPE
+
+    for complexity in (False, True):
+        for kind in ("general", "symmetric", "hermitian"):
+            assert (complexity, kind) in _PARDISO_MTYPE
+    # symmetric modes must be the INDEFINITE ones: claiming definiteness that does not hold is a
+    # way to be wrong, and the indefinite factorization costs the same
+    assert _PARDISO_MTYPE[(False, "symmetric")] == -2
+    assert _PARDISO_MTYPE[(True, "hermitian")] == -4
+
+
+def test_pardiso_upper_triangle_keeps_every_row_present():
+    """A saddle's constraint block lives entirely in the LOWER triangle, so a naive triu() empties
+    those rows and PARDISO rejects the matrix as structurally singular. The explicit diagonal is
+    what keeps them -- this is the Stokes/Biot case the backend is most wanted for."""
+    import numpy as _np
+    import scipy.sparse as sp
+
+    from jno.utils.solver.linear import _pardiso_upper_with_diag
+
+    K = sp.identity(4, format="csr")
+    B = sp.csr_matrix(_np.ones((2, 4)))
+    saddle = sp.bmat([[K, B.T], [B, None]], format="csr")
+    U = _pardiso_upper_with_diag(saddle, sp, _np)
+    assert (_np.diff(U.indptr) > 0).all(), "a row came back empty; PARDISO would reject this"
+    assert U.shape == saddle.shape
+    assert (U.tocoo().col >= U.tocoo().row).all(), "not upper-triangular"
+
+
+@requires_pardiso
+def test_pardiso_adjoint_reuses_the_SAME_factorization():
+    """PARDISO solves A^T x = b from the same factorization (iparm[12]), where cuDSS needs a second
+    plan. So a gradient -- which runs the transpose solve -- must leave the cache at ONE entry."""
+    from jno.utils.solver.linear import _PARDISO_CACHE
+
+    _PARDISO_CACHE.clear()
+    n = 120
+    A = _spd(n, seed=20)
+    b = jnp.asarray(np.random.default_rng(21).normal(size=n))
+
+    x = pardiso_lu_solve(A, b)
+    assert np.linalg.norm(A @ x - b) / np.linalg.norm(b) < 1e-10
+    after_forward = len(_PARDISO_CACHE)
+
+    g = jax.grad(lambda rhs: jnp.sum(pardiso_lu_solve(A, rhs)))(b)  # runs transpose_solve
+    dense = np.asarray(A.todense())
+    np.testing.assert_allclose(np.asarray(g), np.linalg.solve(dense.T, np.ones(n)), rtol=1e-8, atol=1e-9)
+    assert len(_PARDISO_CACHE) == after_forward, "the adjoint built a second factorization"
+    _PARDISO_CACHE.clear()
+
+
+@requires_pardiso
+def test_pardiso_new_values_are_not_stale():
+    n = 150
+    A1, A2 = _spd(n, shift=0.0), _spd(n, shift=3.0)
+    b = jnp.asarray(np.random.default_rng(22).normal(size=n))
+    pardiso_lu_solve(A1, b)
+    x2 = pardiso_lu_solve(A2, b)
+    assert np.linalg.norm(A2 @ x2 - b) / np.linalg.norm(b) < 1e-10
+    assert np.linalg.norm(A1 @ x2 - b) / np.linalg.norm(b) > 1e-3
+
+
+@requires_pardiso
+def test_pardiso_gradients_match_finite_differences():
+    n = 30
+    A = _spd(n, seed=23)
+    b = jnp.asarray(np.random.default_rng(24).normal(size=n))
+
+    def loss(vals):
+        return jnp.sum(pardiso_lu_solve(jsp.BCOO((vals, A.indices), shape=A.shape), b) ** 2)
+
+    g = jax.grad(loss)(A.data)
+    eps = 1e-6
+    fd = np.array([(loss(A.data.at[i].add(eps)) - loss(A.data.at[i].add(-eps))) / (2 * eps) for i in range(4)])
+    np.testing.assert_allclose(np.asarray(g[:4]), fd, rtol=1e-5, atol=1e-8)
+
+
+@requires_pardiso
+def test_pardiso_singular_operator_raises():
+    idx = jnp.asarray(np.stack([np.arange(4), np.arange(4)], axis=1))
+    A = jsp.BCOO((jnp.asarray([1.0, 2.0, 0.0, 4.0]), idx), shape=(4, 4))
+    with pytest.raises((RuntimeError, ValueError)):
+        pardiso_lu_solve(A, jnp.ones(4))
