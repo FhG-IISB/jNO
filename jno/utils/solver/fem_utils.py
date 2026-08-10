@@ -2045,21 +2045,68 @@ def _make_internal_vars(
     return fe_module.InternalVars(volume_vars=tuple(vol))
 
 
+def _interface_frame(m_pts: np.ndarray, s_pts: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Orthonormal tangential frame ``(dim-1, dim)`` and origin for a tied/periodic interface pair.
+
+    Matching a slave node against the master face means comparing the two **in the interface**, with
+    the across-interface coordinate removed. This used to be done by dropping the single global axis
+    whose tag means differed most, which silently assumes the faces are planar, axis-aligned, and
+    separated by a pure translation along that axis. A **tied** interface breaks that outright — both
+    faces are coincident, so every mean difference is ~0 and the dropped axis is whichever coordinate
+    happened to carry the largest rounding error — and so does any periodic cell whose lattice vector
+    is not a global axis.
+
+    The frame generalises it: its rows are the ``dim-1`` directions of greatest variance of the master
+    face's own point cloud — an orthonormal basis of the face's tangent plane, from an SVD. Projecting
+    onto them removes exactly the across-interface coordinate and nothing else.
+
+    For the planar axis-aligned case the rows span the same plane the transverse axes did, and
+    nearest-neighbour distances, edge parameters and barycentric weights are all invariant under a
+    rotation *within* that plane — so the existing conforming and non-matching periodic paths return
+    bit-comparable results.
+
+    **Limitation:** one frame per tie, so master and slave must be (near-)parallel. A wedge-shaped or
+    closed (cylindrical) interface has no single tangent plane; the degeneracy guard below catches the
+    fully-collapsed cases, but a strongly curved face is merely projected, not refused.
+    """
+    dim = int(m_pts.shape[1])
+    ref = m_pts if m_pts.shape[0] >= dim else np.concatenate([m_pts, s_pts], axis=0)
+    origin = ref.mean(axis=0)
+    if dim == 1:
+        # A 1-D "interface" is a single point: there is no in-interface coordinate at all. The empty
+        # (0, 1) frame projects every node to a zero-length vector, so every slave sits at distance 0
+        # from the master and ties exactly -- which is what dropping the only axis did before.
+        return np.zeros((0, 1)), origin
+    _u, sv, vt = np.linalg.svd(ref - origin, full_matrices=True)
+    if sv.size < dim - 1 or float(sv[0]) <= 0.0:
+        raise ValueError(
+            "Periodic/tied interface: the master face collapses to a single point, so no tangent "
+            "plane can be fitted. Check that the tagged region actually selects a boundary face."
+        )
+    if dim > 2 and float(sv[dim - 2]) <= 1.0e-8 * float(sv[0]):
+        raise ValueError(
+            "Periodic/tied interface: the master face is degenerate (its nodes are collinear), so no "
+            "tangent plane can be fitted. In 3-D a tied face must be a surface, not an edge — check "
+            "the tag predicate selects a 2-D patch of the boundary."
+        )
+    return np.ascontiguousarray(vt[: dim - 1]), origin
+
+
 def _periodic_facet_weights(
     t_query: np.ndarray,
     facet_node_ids: np.ndarray,
-    pts: np.ndarray,
-    transverse: List[int],
+    loc: np.ndarray,
 ) -> List[Tuple[int, float]] | None:
-    """Interpolation weights for a slave at transverse coord ``t_query`` on the
+    """Interpolation weights for a slave at in-interface coord ``t_query`` on the
     master boundary facets (node-to-segment / mortar-lite identification).
 
-    ``facet_node_ids`` is ``(n_facets, k)`` of global node ids. **2D** (transverse
-    1-D): facets are edges -- columns 0,1 are the vertices, optional column 2 the
-    midside node (``k == 3`` ⇒ P2). **3D** (transverse 2-D): facets are triangles --
-    columns 0,1,2 the vertices, optional columns 3,4,5 the edge midpoints (``k == 6``
-    ⇒ P2). Returns ``[(node_id, weight), ...]`` whose weights sum to 1 (partition of
-    unity ⇒ constants reproduced; linear/quadratic-on-the-facet reproduced exactly).
+    ``facet_node_ids`` is ``(n_facets, k)`` of global node ids; ``loc`` is the ``(n_nodes, dim-1)``
+    projection of every node onto the interface tangent frame (:func:`_interface_frame`), so this
+    routine never sees the across-interface coordinate. **2D** (``loc`` 1-D): facets are edges --
+    columns 0,1 are the vertices, optional column 2 the midside node (``k == 3`` ⇒ P2). **3D**
+    (``loc`` 2-D): facets are triangles -- columns 0,1,2 the vertices, optional columns 3,4,5 the
+    edge midpoints (``k == 6`` ⇒ P2). Returns ``[(node_id, weight), ...]`` whose weights sum to 1
+    (partition of unity ⇒ constants reproduced; linear/quadratic-on-the-facet reproduced exactly).
     """
     tq = np.atleast_1d(np.asarray(t_query, dtype=float))
     facet_node_ids = np.asarray(facet_node_ids, dtype=int)
@@ -2067,11 +2114,10 @@ def _periodic_facet_weights(
         return None
     k = facet_node_ids.shape[1]
 
-    if tq.shape[0] == 1:  # 2D: locate the master edge spanning the slave's transverse coord
+    if tq.shape[0] == 1:  # 2D: locate the master edge spanning the slave's in-interface coord
         t = float(tq[0])
-        tr = transverse[0]
         a_ids, b_ids = facet_node_ids[:, 0], facet_node_ids[:, 1]
-        ta, tb = pts[a_ids, tr], pts[b_ids, tr]
+        ta, tb = loc[a_ids, 0], loc[b_ids, 0]
         lo, hi = np.minimum(ta, tb), np.maximum(ta, tb)
         span = hi - lo
         eps = 1.0e-9 * (float(np.max(span)) if span.size else 1.0)
@@ -2090,10 +2136,9 @@ def _periodic_facet_weights(
         return [(a, 2.0 * (xi - 0.5) * (xi - 1.0)), (b, 2.0 * xi * (xi - 0.5)), (m, -4.0 * xi * (xi - 1.0))]
 
     if tq.shape[0] == 2:  # 3D: locate the master triangle containing the slave, barycentric weights
-        tr = transverse
-        pa = pts[facet_node_ids[:, 0]][:, tr]
-        pb = pts[facet_node_ids[:, 1]][:, tr]
-        pc = pts[facet_node_ids[:, 2]][:, tr]
+        pa = loc[facet_node_ids[:, 0]]
+        pb = loc[facet_node_ids[:, 1]]
+        pc = loc[facet_node_ids[:, 2]]
         v0, v1, v2 = pb - pa, pc - pa, tq[None, :] - pa
         d00 = (v0 * v0).sum(1)
         d01 = (v0 * v1).sum(1)
@@ -2123,8 +2168,6 @@ def _periodic_facet_weights(
             (mca, 4.0 * L2 * L0),
         ]
     return None
-
-    raise NotImplementedError("3D periodic interpolation (triangle facets) is milestone M2.")
 
 
 def build_periodic_prolongation(
@@ -2160,7 +2203,7 @@ def build_periodic_prolongation(
         Number of scalar components per node. ``vec > 1`` returns the
         node-major expansion ``kron(P_node, I_vec)``.
     tol:
-        Coordinate-matching tolerance for the transverse coordinates. When
+        Coordinate-matching tolerance for the in-interface coordinates. When
         ``None`` it is derived from the bounding-box diagonal.
     facets:
         Optional ``{master_tag: (n_facets, k) node-id array}`` of the master
@@ -2204,18 +2247,20 @@ def build_periodic_prolongation(
 
         m_ids = np.asarray(tag_indices[master_tag], dtype=int).reshape(-1)
         s_ids = np.asarray(tag_indices[slave_tag], dtype=int).reshape(-1)
+        if s_ids.size == 0:  # nothing to eliminate on this pair
+            continue
         m_pts = pts[m_ids]
         s_pts = pts[s_ids]
 
-        # Periodic axis = coordinate whose tag means differ the most.
-        axis = int(np.argmax(np.abs(m_pts.mean(axis=0) - s_pts.mean(axis=0))))
-        transverse = [d for d in range(pts.shape[1]) if d != axis]
+        # Project every node onto the interface's own tangent plane. That removes the across-interface
+        # coordinate whether the two faces are separated by a lattice vector (periodic) or coincident
+        # (tied) -- the axis-dropping this replaces could only express the former. See _interface_frame.
+        frame, origin = _interface_frame(m_pts, s_pts)
+        loc = (pts - origin) @ frame.T  # (n_nodes, dim-1) in-interface coordinates
+        m_loc, s_loc = loc[m_ids], loc[s_ids]
 
-        m_trans = m_pts[:, transverse]
-        s_trans = s_pts[:, transverse]
-
-        # Nearest transverse master node for every slave node.
-        d2 = np.sum((s_trans[:, None, :] - m_trans[None, :, :]) ** 2, axis=-1)
+        # Nearest in-interface master node for every slave node.
+        d2 = np.sum((s_loc[:, None, :] - m_loc[None, :, :]) ** 2, axis=-1)
         nn = np.argmin(d2, axis=1) if m_ids.size else np.zeros(len(s_ids), dtype=int)
         dist = np.sqrt(d2[np.arange(len(s_ids)), nn]) if m_ids.size and len(s_ids) else np.zeros(len(s_ids))
 
@@ -2225,7 +2270,7 @@ def build_periodic_prolongation(
                 slave_phase[int(sid)] = complex(ph)
                 continue
             # non-matching: tie to the master facet by interpolation (weights scaled by the Bloch phase)
-            w = _periodic_facet_weights(s_trans[k], facets.get(master_tag), pts, transverse) if facets else None
+            w = _periodic_facet_weights(s_loc[k], facets.get(master_tag), loc) if facets else None
             if w is None:
                 raise ValueError(
                     f"Periodic matching for ({master_tag!r}, {slave_tag!r}) failed at slave node {int(sid)}: "
