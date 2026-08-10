@@ -25,9 +25,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
+
+# JAX preallocates ~75% of the device by default, which fails outright when anything else (a browser,
+# another run) already holds a few GB -- measured here as a RESOURCE_EXHAUSTED on a `jit_true_divide`.
+# Allocating on demand costs a little speed but makes the benchmark runnable on a shared desktop GPU;
+# it applies equally to jNO and JAX-FEM, so it does not tilt the comparison.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 MESH_SIZE = 0.03  # ~31k nodes in 3-D, matching compare_libs.json's "large" case
 DIM = 3
@@ -86,8 +93,7 @@ def run_jax_fem():
     t_import, _ = _time(lambda: __import__("jax_fem"))
     import jax
     import numpy as np
-
-    from compare_libs import build_mesh, on_boundary
+    from compare_libs import build_mesh
 
     t_init, _ = _time(lambda: jax.block_until_ready(jax.numpy.ones(1) * 2))
     _, points, cells = build_mesh(MESH_SIZE, dim=DIM)
@@ -104,17 +110,26 @@ def run_jax_fem():
         def get_mass_map(self):
             return lambda _u, _x: jnp.array([-1.0])
 
-    mesh = Mesh(points, cells)
-    bnd = [lambda p: on_boundary(np.atleast_2d(p))[0]]
-    zero = [lambda _p: 0.0]
+    # jax-fem calls the location fn on TRACED points, so it must be jnp: numpy raises
+    # TracerArrayConversionError. p is a single point of shape (dim,).
+    def boundary(p):
+        return jnp.any((p < 1e-8) | (p > 1.0 - 1e-8))
+
+    mesh = Mesh(points, cells, ele_type="TET4")
 
     def build():
-        return Poisson(mesh=mesh, vec=1, dim=DIM, ele_type="TET4", dirichlet_bc_info=[bnd, [0], zero])
+        return Poisson(
+            mesh=mesh,
+            vec=1,
+            dim=DIM,
+            ele_type="TET4",
+            dirichlet_bc_info=[[boundary], [0], [lambda _p: 0.0]],
+        )
 
     b1, p1 = _time(build)
     b2, p2 = _time(build)
-    s1, sol = _time(lambda: np.asarray(solver(p1)).reshape(-1))
-    s2, _ = _time(lambda: np.asarray(solver(p2)).reshape(-1))
+    s1, sol = _time(lambda: np.asarray(solver(p1)[0]).reshape(-1))
+    s2, _ = _time(lambda: np.asarray(solver(p2)[0]).reshape(-1))
     return dict(
         lib="JAX-FEM",
         solver="jax_solver, preconditioned (GPU)",
@@ -133,10 +148,9 @@ def run_jax_fem():
 def run_skfem():
     t_import, _ = _time(lambda: __import__("skfem"))
     import numpy as np
+    from compare_libs import build_mesh, on_boundary
     from skfem import Basis, ElementTetP1, MeshTet, asm, condense, solve
     from skfem.models.poisson import laplace, unit_load
-
-    from compare_libs import build_mesh, on_boundary
 
     _, points, cells = build_mesh(MESH_SIZE, dim=DIM)
     t_init = 0.0  # CPU/numpy: no accelerator to warm
@@ -181,7 +195,8 @@ def main():
     rows = []
     for lib in ("jno", "jax-fem", "scikit-fem"):
         print(f"--- {lib} (own process) ---", flush=True)
-        p = subprocess.run([sys.executable, __file__, "--lib", lib], capture_output=True, text=True)
+        env = {**os.environ, "XLA_PYTHON_CLIENT_PREALLOCATE": "false"}
+        p = subprocess.run([sys.executable, __file__, "--lib", lib], capture_output=True, text=True, env=env)
         line = next((ln for ln in p.stdout.splitlines() if ln.startswith("@@RESULT@@")), None)
         if line is None:
             reason = (p.stderr.strip().splitlines() or ["(no stderr)"])[-1]
