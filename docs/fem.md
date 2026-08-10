@@ -166,20 +166,25 @@ How the two faces are identified depends on their meshes:
 
 * **Conforming** (the node layouts match) — an exact node-to-node 0/1 map. This is the cheap path and
   it keeps the fast selection-based reduction.
-* **Non-matching, 2-D** — a **dual-mortar** coupling (Bernardi/Maday/Patera 1994; dual multiplier
-  spaces from Wohlmuth 2000): the tie is imposed in the integral sense `∫ ψ (u_A − u_B∘Φ) = 0` over
-  the slave face, segmented against the master facets. Variationally consistent and momentum-balanced.
-* **Non-matching, otherwise** (3-D, native 1-D, or a face tagged without its corners so the two sides
-  do not span the same extent) — node-to-segment **collocation**: each slave node takes the master
-  facet value at its own location. Consistent and exact for fields the master facet represents, but
-  collocated rather than integrated.
+* **Non-matching**, when both faces carry facet connectivity and the master face covers the slave —
+  a **dual-mortar** coupling (Bernardi/Maday/Patera 1994; dual multiplier spaces from Wohlmuth 2000):
+  the tie is imposed in the integral sense `∫ ψ (u_A − u_B∘Φ) = 0` over the slave face, segmented
+  against the master facets. Interval clipping in 2-D, polygon clipping in 3-D.
+* **Non-matching, otherwise** (native 1-D chains, a tag that selects nodes but no whole facet, or two
+  faces that do not cover each other) — node-to-segment **collocation**: each slave node takes the
+  master facet value at its own location.
 
-Worth being precise about what the mortar coupling buys, since it is less than it sounds. A **linear**
-field transfers exactly under *both* couplings, so the 2-D patch test does not separate them; and when
-the master nodes are a subset of the slave nodes the two are identical to machine precision. They
-differ on **non-nested** meshes for a field the master space cannot represent, where mortar returns the
-L² projection and collocation the pointwise value. The coupling's real payoff is 3-D, which is still
-collocated today.
+Worth being precise about what the mortar coupling buys, because it is less than the usual framing
+suggests. jNO enforces a tie by master–slave **elimination** through a prolongation `P`, and such a
+scheme passes the linear patch test whenever `P` reproduces linear fields — which node-to-segment
+interpolation does, in 2-D *and* 3-D. So **the patch test does not separate the two couplings here**;
+the textbook "node-to-segment fails the patch test" result is about contact formulations that
+distribute nodal forces, not about a linearly-complete MPC elimination.
+
+What does differ: for a field the master space cannot represent, mortar returns the integral (L²)
+projection and collocation the pointwise value. Measured on a non-matching 3-D interface, mortar's RMS
+error is 4–40 % lower across a range of mesh ratios. The two also coincide exactly when the master
+nodes are a subset of the slave nodes, since the master basis then lies inside the slave space.
 
 Two practical consequences: tag periodic faces with a **predicate** (`d.tag(name, lambda ...)`) so each
 face includes its corner nodes — a face tagged from geometry may drop them, leaving the two sides with

@@ -22,18 +22,41 @@ tangent plane removes the across-interface offset only, so an in-plane shift wou
 the wrong master location. A periodic cell whose lattice vector is normal to its faces is fine.
 """
 
+import jax
 import numpy as np
 import pytest
 
 from jno.utils.solver.fem_utils import (
+    _as_ccw,
+    _clip_convex,
+    _dual_coeffs,
     _edge_shape,
     _faces_span_the_same_extent,
     _facet_dual_coeffs,
     _interface_frame,
+    _master_covers_slave_3d,
     _mortar_rows_2d,
+    _mortar_rows_3d,
     _periodic_facet_weights,
+    _signed_area,
+    _tri_bary,
+    _tri_dual_available,
+    _tri_quadrature,
+    _tri_shape,
     build_periodic_prolongation,
 )
+
+
+@pytest.fixture(autouse=True)
+def _x64():
+    """x64 so the reduction is exact: the prolongation weights are not binary fractions once the
+    interface is tilted, and float32 leaves ~1e-7 of noise in an otherwise exact transfer."""
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
 
 
 def _plane_frame(normal):
@@ -390,6 +413,257 @@ def test_mortar_survives_a_high_density_ratio_either_way():
         assert np.allclose(P.sum(axis=1), 1.0)
         f = 2.0 * pts[:, 1] - 0.5
         assert np.allclose(P @ f[kept], f, atol=1e-10)
+
+
+# ------------------------------------------------------------------- 3-D dual mortar
+#
+# The 3-D interface is where the segmentation is real geometry: triangle-against-triangle polygon
+# clipping rather than an interval intersection.
+#
+# It is NOT, however, where the patch test starts to discriminate. jNO enforces a tie by master-slave
+# elimination through a prolongation P, and such a scheme reproduces a linear solution exactly
+# whenever P does -- which node-to-segment barycentric interpolation does, in 3-D as in 2-D. The
+# textbook "node-to-segment fails the patch test" result concerns contact formulations that distribute
+# nodal forces, not a linearly-complete MPC elimination. The linear patch test below is therefore a
+# correctness gate on the new code, not evidence that mortar beats collocation.
+#
+# What separates them is that mortar imposes the INTEGRAL constraint: asserted directly below by
+# checking that the collocated weights leave a non-zero mortar residual while the mortar weights do
+# not, and quantified as a 4-40% lower RMS error on fields the master space cannot represent.
+
+
+def _tri_grid(n, z, base):
+    """An ``n x n`` structured triangulation of the unit square at height ``z``, ids from ``base``."""
+    g = np.linspace(0.0, 1.0, n + 1)
+    xx, yy = np.meshgrid(g, g, indexing="ij")
+    pts = np.column_stack([xx.ravel(), yy.ravel(), np.full((n + 1) ** 2, float(z))])
+    ids = base + np.arange((n + 1) ** 2).reshape(n + 1, n + 1)
+    tris = [
+        t
+        for i in range(n)
+        for j in range(n)
+        for t in ([ids[i, j], ids[i + 1, j], ids[i + 1, j + 1]], [ids[i, j], ids[i + 1, j + 1], ids[i, j + 1]])
+    ]
+    return pts, np.array(tris)
+
+
+def _tri_faces(n_master, n_slave):
+    """Master (z=1) and slave (z=0) triangulated faces, both covering the unit square."""
+    mp, mt = _tri_grid(n_master, 1.0, 0)
+    sp, st = _tri_grid(n_slave, 0.0, len(mp))
+    pts = np.vstack([mp, sp])
+    tags = {"top": np.unique(mt), "bot": np.unique(st)}
+    return pts, tags, {"top": mt, "bot": st}
+
+
+def test_duffy_quadrature_is_exact_on_monomials():
+    """The reference-triangle rule, verified against closed-form integrals rather than a table."""
+    bary, w = _tri_quadrature(4)
+    x, y = bary[..., 1], bary[..., 2]
+    for (i, j), exact in {
+        (0, 0): 0.5,
+        (1, 0): 1 / 6,
+        (0, 1): 1 / 6,
+        (2, 0): 1 / 12,
+        (1, 1): 1 / 24,
+        (3, 0): 1 / 20,
+    }.items():
+        assert abs(float(w @ (x**i * y**j)) - exact) < 1e-14, (i, j)
+
+
+def test_convex_clipping_handles_overlap_and_degeneracy():
+    """Sutherland-Hodgman on the cases that break clippers: identical, partial, disjoint, and the
+    degenerate contacts (a shared corner, a shared edge) that carry zero area."""
+    tri = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+    assert abs(abs(_signed_area(_clip_convex(_as_ccw(tri), _as_ccw(tri)))) - 0.5) < 1e-14
+    other = np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]])  # the square's other half
+    assert abs(abs(_signed_area(_clip_convex(_as_ccw(tri), _as_ccw(other)))) - 0.25) < 1e-14
+    assert _clip_convex(_as_ccw(tri), _as_ccw(tri + 5.0)).shape[0] == 0  # disjoint
+    assert _clip_convex(_as_ccw(tri), _as_ccw(tri + np.array([1.0, 1.0]))).shape[0] == 0  # corner touch
+    quad = np.array([[-0.5, 0.25], [0.75, -0.4], [1.2, 0.5], [0.1, 0.9]])
+    assert _clip_convex(_as_ccw(tri), _as_ccw(quad)).shape[0] == 5  # a genuine 5-gon overlap
+
+
+def test_clipping_is_orientation_independent():
+    """Facet node order is whatever the mesh gives; the overlap area must not depend on it."""
+    tri = np.array([[0.1, 0.0], [1.0, 0.2], [0.3, 0.9]])
+    other = np.array([[0.0, 0.1], [0.9, 0.0], [0.5, 1.0]])
+    ref = abs(_signed_area(_clip_convex(_as_ccw(tri), _as_ccw(other))))
+    for a in (tri, tri[::-1]):
+        for b in (other, other[::-1]):
+            assert abs(abs(_signed_area(_clip_convex(_as_ccw(a), _as_ccw(b)))) - ref) < 1e-14
+
+
+def test_triangle_dual_basis_is_biorthogonal():
+    bary, w = _tri_quadrature(5)
+    for k in (3, 6):
+        n = _tri_shape(bary, k)
+        pairing = (n @ _dual_coeffs(n, w).T).T @ (w[:, None] * n)
+        assert np.allclose(pairing, np.diag(w @ n), atol=1e-13), k
+
+
+def test_mortar_3d_is_selected_and_reported():
+    pts, tags, facets = _tri_faces(3, 5)
+    assert build_periodic_prolongation(pts, [("top", "bot")], tags, facets=facets)["coupling"] == "mortar"
+    assert (
+        build_periodic_prolongation(pts, [("top", "bot")], tags, facets={"top": facets["top"]})["coupling"] == "collocated"
+    )
+
+
+def test_mortar_3d_transfers_a_linear_field_exactly():
+    """Correctness gate on the clipping and quadrature: a linear field must survive the segmentation
+    to machine precision. (Collocation passes this too -- see the note above.)"""
+    pts, tags, facets = _tri_faces(3, 7)
+    res = build_periodic_prolongation(pts, [("top", "bot")], tags, facets=facets)
+    assert res["coupling"] == "mortar"
+    P = np.asarray(res["P_node"].todense())
+    kept = np.asarray(res["kept_nodes"])
+    assert np.allclose(P.sum(axis=1), 1.0)
+    for coef in [(0.0, 0.0, 1.0), (2.0, -1.5, 0.3)]:
+        field = coef[0] * pts[:, 0] + coef[1] * pts[:, 1] + coef[2]
+        assert np.allclose(P @ field[kept], field, atol=1e-10)
+
+
+def _mortar_residual(rows, s_facets, m_facets, loc, field, nq=20):
+    """``int psi_i (u_s - u_m.Phi) dG`` by independent per-slave-facet quadrature: every point is
+    located in the master face by barycentric search, so no clipping is involved.
+
+    The integrand is only piecewise smooth (the master field kinks at every master facet edge), so
+    this converges in ``nq`` rather than being exact -- which is why the test below asserts a ratio
+    and a convergence trend instead of an absolute threshold."""
+    xy = np.asarray(loc, float)
+    ks, km = s_facets.shape[1], m_facets.shape[1]
+    bary, w = _tri_quadrature(nq)
+    dual = _dual_coeffs(_tri_shape(bary, ks), w)
+    resid = {int(n): 0.0 for n in np.unique(s_facets)}
+    for e in range(len(s_facets)):
+        sv = xy[s_facets[e, :3]]
+        area = abs(_signed_area(sv))
+        xq = bary @ sv
+        n_s = _tri_shape(_tri_bary(xq, sv), ks)
+        psi = n_s @ dual.T
+        u_s = n_s @ np.array([rows[int(n)] for n in s_facets[e]])
+        u_m = np.zeros(len(xq))
+        for f in range(len(m_facets)):
+            mv = xy[m_facets[f, :3]]
+            b = _tri_bary(xq, mv)
+            sel = b.min(axis=1) >= -1e-12
+            if sel.any():
+                u_m[sel] = _tri_shape(b[sel], km) @ np.array([field[int(n)] for n in m_facets[f]])
+        contrib = psi.T @ ((u_s - u_m) * w * (area / 0.5))
+        for a, n in enumerate(s_facets[e]):
+            resid[int(n)] += float(contrib[a])
+    return np.array([resid[int(n)] for n in np.unique(s_facets)])
+
+
+def test_mortar_satisfies_the_integral_constraint_and_collocation_does_not():
+    """The defining difference, asserted rather than described. Mortar solves
+    ``int psi (u_s - u_m.Phi) = 0``; collocation solves ``u_s(x_i) = u_m(x_i)``, which leaves that
+    integral non-zero. Both are consistent; only one is the variational constraint."""
+    pts, _tags, fc = _tri_faces(3, 5)
+    loc = pts[:, :2]
+    field = {int(i): np.sin(3.0 * pts[i, 0]) * np.cos(2.5 * pts[i, 1]) for i in np.unique(fc["top"])}
+
+    rows = _mortar_rows_3d(fc["bot"], fc["top"], loc, span=1.0)
+    u_mortar = {s: sum(w * field[m] for m, w in ws) for s, ws in rows.items()}
+    u_colloc = {
+        int(s): sum(w * field[m] for m, w in _periodic_facet_weights(loc[int(s)], fc["top"], loc))
+        for s in np.unique(fc["bot"])
+    }
+    r_mortar, r_colloc = ({}, {})
+    for nq in (8, 20):
+        r_mortar[nq] = np.abs(_mortar_residual(u_mortar, fc["bot"], fc["top"], loc, field, nq)).max()
+        r_colloc[nq] = np.abs(_mortar_residual(u_colloc, fc["bot"], fc["top"], loc, field, nq)).max()
+
+    assert r_colloc[20] > 100 * r_mortar[20], "the two must enforce measurably different constraints"
+    # Mortar's residual is the REFERENCE integrator's quadrature error, so it shrinks as that rule is
+    # refined; collocation's is a genuine violation, so it does not. This is what makes the first
+    # assertion meaningful rather than a threshold that happens to hold.
+    assert r_mortar[20] < 0.5 * r_mortar[8], "mortar residual must converge away under refinement"
+    assert r_colloc[20] > 0.9 * r_colloc[8], "collocation residual must persist under refinement"
+
+
+@pytest.mark.parametrize("n_master,n_slave", [(3, 7), (4, 7), (5, 11), (7, 11)])
+def test_mortar_3d_is_more_accurate_than_collocation(n_master, n_slave):
+    """Quantify the gain honestly: RMS error over the slave nodes, on a field neither space
+    represents. Mortar is the L2 projection, so it should win -- measured 4-40% here."""
+    pts, _tags, fc = _tri_faces(n_master, n_slave)
+    loc = pts[:, :2]
+    f = lambda p: np.sin(3.0 * p[0]) * np.cos(2.5 * p[1])  # noqa: E731
+    field = {int(i): f(pts[i]) for i in np.unique(fc["top"])}
+    rows = _mortar_rows_3d(fc["bot"], fc["top"], loc, span=1.0)
+    ids = sorted(rows)
+    mortar = np.array([sum(w * field[m] for m, w in rows[s]) for s in ids])
+    colloc = np.array([sum(w * field[m] for m, w in _periodic_facet_weights(loc[s], fc["top"], loc)) for s in ids])
+    exact = np.array([f(pts[s]) for s in ids])
+    rms = lambda e: float(np.sqrt(np.mean(e**2)))  # noqa: E731
+    assert rms(mortar - exact) < rms(colloc - exact)
+
+
+def test_mortar_3d_gate_rejects_a_master_that_does_not_cover_the_slave():
+    pts, tags, facets = _tri_faces(4, 7)
+    trimmed = facets["top"][:-6]  # drop a strip of master triangles -> slave corner no longer covered
+    assert _master_covers_slave_3d(facets["bot"], facets["top"], pts[:, :2])
+    assert not _master_covers_slave_3d(facets["bot"], trimmed, pts[:, :2])
+    res = build_periodic_prolongation(
+        pts,
+        [("top", "bot")],
+        {"top": np.unique(trimmed), "bot": tags["bot"]},
+        facets={"top": trimmed, "bot": facets["bot"]},
+    )
+    assert res["coupling"] == "collocated"
+
+
+def test_mortar_3d_hole_in_the_master_face_raises():
+    """Covered at the vertices but missing an interior triangle: the gate passes and the per-facet
+    area conservation has to catch it. A bad clip yields a plausible wrong answer, so this raises."""
+    pts, _tags, facets = _tri_faces(4, 9)
+    holed = np.delete(facets["top"], 10, axis=0)
+    with pytest.raises(ValueError, match="HOLE in the master face"):
+        _mortar_rows_3d(facets["bot"], holed, pts[:, :2], span=1.0)
+
+
+def test_mortar_3d_on_a_tilted_interface():
+    """The frame and the segmentation must compose: a face whose normal is not a global axis is
+    projected onto its own tangent plane, where clipping happens."""
+    t1, t2, _n = _plane_frame([1.0, 1.0, 1.0])
+    pts, tags, facets = _tri_faces(3, 6)
+    tilted = pts[:, :1] * t1 + pts[:, 1:2] * t2 + pts[:, 2:3] * np.cross(t1, t2)
+    res = build_periodic_prolongation(tilted, [("top", "bot")], tags, facets=facets)
+    assert res["coupling"] == "mortar"
+    P = np.asarray(res["P_node"].todense())
+    kept = np.asarray(res["kept_nodes"])
+    assert np.allclose(P.sum(axis=1), 1.0)
+    # Linear in the IN-PLANE coordinates only: a tie identifies the two faces, so a field with a
+    # component along the interface normal genuinely differs across the gap and no tie reproduces it.
+    field = 2.0 * pts[:, 0] - 1.5 * pts[:, 1] + 0.3
+    assert np.allclose(P @ field[kept], field, atol=1e-9)
+
+
+def test_p2_triangles_have_no_dual_basis_and_keep_collocation():
+    """A real obstruction, not an oversight: the P2 triangle's vertex functions integrate to exactly
+    zero, so ``A = diag(int N) Mass^-1`` is singular and this dual construction does not exist. P2
+    EDGES are unaffected (``int N = 1/6``), which is why the 2-D quadratic path works."""
+    bary, w = _tri_quadrature(4)
+    d = w @ _tri_shape(bary, 6)
+    assert abs(d[0]) < 1e-15 and abs(d[1]) < 1e-15 and abs(d[2]) < 1e-15  # the three vertex functions
+    assert np.all(np.abs(d[3:]) > 1e-3)  # the midside functions are fine
+    assert _tri_dual_available(3) and not _tri_dual_available(6)
+
+    qp, qw = np.polynomial.legendre.leggauss(6)
+    assert np.all(np.abs(0.5 * qw @ _edge_shape(0.5 * (qp + 1.0), 3)) > 1e-3)  # P2 edge: all non-zero
+
+
+def test_mortar_3d_survives_a_high_density_ratio():
+    """Extreme: a single master facet pair against a 1:12-refined slave face."""
+    pts, tags, facets = _tri_faces(1, 12)
+    res = build_periodic_prolongation(pts, [("top", "bot")], tags, facets=facets)
+    assert res["coupling"] == "mortar"
+    P = np.asarray(res["P_node"].todense())
+    kept = np.asarray(res["kept_nodes"])
+    assert len(kept) == 4 and np.allclose(P.sum(axis=1), 1.0)
+    field = 1.3 * pts[:, 0] - 0.7 * pts[:, 1] + 2.0
+    assert np.allclose(P @ field[kept], field, atol=1e-10)
 
 
 def test_periodic_pair_still_ties_across_a_normal_offset():
