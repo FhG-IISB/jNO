@@ -1435,18 +1435,24 @@ solve slower, so compare **build + solve**, and remember jNO assembles *once* wh
 assembler pays again on every Newton iteration.
 
 Most of a cold build is **XLA compilation**, and the cost is fixed per problem *structure* rather than
-per DOF — a 15x larger mesh still compiles about the same number of programs. So it is cached across
-processes, and **`jno.setup(__file__)` enables that cache by default**:
+per DOF — a 15x larger mesh still compiles about the same number of programs. That makes it worth
+caching across processes, which is **opt-in**:
+
+```python
+dire = jno.setup(__file__, compile_cache=True)     # or, per project, in .jno.toml:
+                                                   #   [jno]
+                                                   #   compile_cache = true
+```
 
 | 3-D Poisson, 27,833 nodes | first build | repeat build |
 |---|---|---|
-| no cache | 4.75 s | 2.48 s |
-| `jno.setup(__file__)` (cache on) | **2.22 s** | **1.51 s** |
+| default (no cache) | 4.75 s | 2.48 s |
+| `compile_cache=True` | **2.22 s** | **1.51 s** |
 
-A bare `import jno` still writes nothing to disk — the cache is tied to `setup`, which is where jNO
-learns a script is being *run*. The one case it costs you is a **single cold run**: the run that
-populates the cache is slower and never collects the payback. Turn it off with
-`jno.setup(__file__, compile_cache=False)`, or `[jno] compile_cache = false` in `.jno.toml`.
+**Off by default on purpose**, for two reasons: a library should not write to your disk uninvited, and
+the run that *populates* the cache is **slower** than having none at all — so a single cold run is a
+straight loss. Turn it on for anything you run more than once: a sweep, an optimisation loop, a test
+suite, or simply re-running a script after an edit.
 
 ---
 

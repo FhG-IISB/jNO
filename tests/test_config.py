@@ -160,10 +160,10 @@ class TestEndToEnd:
 # setup(compile_cache=...) — the persistent XLA compilation cache
 # ======================================================================
 #
-# On by default: `jno.setup` is where jNO learns a script is being RUN rather than imported, and a
-# script is almost always run more than once. Measured on 3-D Poisson at 27,833 nodes: first build
-# 4.75 s -> 2.22 s, repeat build 2.48 s -> 1.51 s. The cost is that the run which POPULATES the cache
-# is slower, so the escape hatches below have to keep working.
+# OFF by default, deliberately: a library should not write to a user's disk uninvited, and the run
+# that POPULATES the cache is slower than no cache at all, so a single cold run would be a straight
+# loss. Worth opting into for anything run more than once — measured on 3-D Poisson at 27,833 nodes,
+# first build 4.75 s -> 2.22 s and repeat build 2.48 s -> 1.51 s.
 
 
 def _cache_dir():
@@ -183,25 +183,31 @@ def _restore_cache_dir():
         jax.config.update("jax_compilation_cache_dir", prev)
 
 
-def test_setup_enables_the_compile_cache_by_default(tmp_path, _restore_cache_dir):
+def test_setup_leaves_the_compile_cache_off_by_default(tmp_path, monkeypatch, _restore_cache_dir):
+    """jNO must not write to a user's disk unless asked. Also guards the cold-run case: populating
+    the cache is SLOWER than not having one, so on-by-default would penalise a single run."""
+    import jax
+
+    import jno
+
+    monkeypatch.chdir(tmp_path)  # no .jno.toml here, so nothing can opt in behind the test's back
+    cfg_module._CONFIG = None
+    jax.config.update("jax_compilation_cache_dir", None)
+    try:
+        jno.setup(str(tmp_path / "script.py"), name="cache_default")
+        assert _cache_dir() is None, "the compile cache must stay opt-in"
+    finally:
+        cfg_module._CONFIG = None
+
+
+def test_compile_cache_true_turns_it_on(tmp_path, _restore_cache_dir):
     import jax
 
     import jno
 
     jax.config.update("jax_compilation_cache_dir", None)
-    jno.setup(str(tmp_path / "script.py"), name="cache_default")
-    assert _cache_dir() is not None, "the compile cache is meant to be on by default"
-
-
-def test_compile_cache_false_turns_it_off(tmp_path, _restore_cache_dir):
-    """The escape hatch matters: a single cold run pays to populate the cache and never collects."""
-    import jax
-
-    import jno
-
-    jax.config.update("jax_compilation_cache_dir", None)
-    jno.setup(str(tmp_path / "script.py"), name="cache_off", compile_cache=False)
-    assert _cache_dir() is None
+    jno.setup(str(tmp_path / "script.py"), name="cache_on", compile_cache=True)
+    assert _cache_dir() is not None
 
 
 def test_compile_cache_accepts_an_explicit_directory(tmp_path, _restore_cache_dir):
@@ -215,19 +221,19 @@ def test_compile_cache_accepts_an_explicit_directory(tmp_path, _restore_cache_di
     assert _cache_dir() == str(target)
 
 
-def test_toml_can_turn_the_compile_cache_off(tmp_path, monkeypatch, _restore_cache_dir):
-    """`[jno] compile_cache = false` must beat the new on-by-default, for a project that does not
-    want jNO writing to disk at all."""
+def test_toml_can_turn_the_compile_cache_on(tmp_path, monkeypatch, _restore_cache_dir):
+    """`[jno] compile_cache = true` is the per-project opt-in — set once, rather than editing every
+    script that calls setup()."""
     import jax
 
     import jno
 
-    (tmp_path / ".jno.toml").write_text("[jno]\ncompile_cache = false\n")
+    (tmp_path / ".jno.toml").write_text("[jno]\ncompile_cache = true\n")
     monkeypatch.chdir(tmp_path)
     cfg_module._CONFIG = None  # force a re-read of the TOML from the new cwd
     jax.config.update("jax_compilation_cache_dir", None)
     try:
         jno.setup(str(tmp_path / "script.py"), name="cache_toml")
-        assert _cache_dir() is None
+        assert _cache_dir() is not None
     finally:
         cfg_module._CONFIG = None
