@@ -2555,6 +2555,52 @@ def master_trace_weights(
     return m_facets[idx], _tri_shape(bary, k)
 
 
+def interface_gap_data(
+    slave_qp: np.ndarray,
+    m_facets: np.ndarray,
+    points: np.ndarray,
+    normals: np.ndarray,
+    *,
+    frame: np.ndarray | None = None,
+    origin: np.ndarray | None = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Everything a signed contact gap needs, precomputed on the host: ``(ids, w, g0)``.
+
+    The gap between two surfaces is ``g = g0 + n . (u_s - u_m . Phi)``, split into a part fixed by the
+    geometry and a part that moves with the solution:
+
+    * ``g0 = n . (x_s - Phi(x_s))`` — the **initial** separation at each slave quadrature point, i.e.
+      how far it stands off the master surface along the normal. Positive = a gap, negative = initial
+      penetration. Zero for two coincident (tied) faces.
+    * ``(ids, w)`` — the :func:`master_trace_weights` gather, so ``u_m . Phi`` at those points is a
+      plain weighted sum of master DOFs and therefore differentiable in the solution.
+
+    ``slave_qp`` is ``(..., dim)`` physical quadrature points on the slave face; ``normals`` is the
+    matching outward unit normal per point (or one per face, broadcast by the caller). ``frame`` /
+    ``origin`` default to a fit of the **master** facets' own tangent plane (:func:`_interface_frame`),
+    which is what makes this work for coincident faces where no separating axis exists.
+
+    Host/NumPy: locating each point on the master face is a discrete search, frozen at build time. So
+    the gap is differentiable in the DOF values but **not** in the mesh coordinates -- shape-optimising
+    through a contact gap would need the projection re-derived in JAX. It also assumes **small
+    sliding**: the pairing is fixed, so a caller that slides must rebuild it per load step.
+    """
+    q = np.asarray(slave_qp, dtype=float)
+    pts = np.asarray(points, dtype=float)
+    m_facets = np.asarray(m_facets, dtype=int)
+    flat = q.reshape(-1, q.shape[-1])
+    if frame is None or origin is None:
+        m_pts = pts[np.unique(m_facets)]
+        frame, origin = _interface_frame(m_pts, flat if flat.size else m_pts)
+
+    ids, w = master_trace_weights((flat - origin) @ np.asarray(frame).T, m_facets, (pts - origin) @ np.asarray(frame).T)
+    proj = np.einsum("qk,qkd->qd", w, pts[ids])  # Phi(x_s): the master-surface point under each query
+    n = np.asarray(normals, dtype=float).reshape(-1, q.shape[-1])
+    g0 = np.einsum("qd,qd->q", n, flat - proj)
+    lead = q.shape[:-1]
+    return ids.reshape(*lead, -1), w.reshape(*lead, -1), g0.reshape(*lead)
+
+
 def _periodic_facet_weights(
     t_query: np.ndarray,
     facet_node_ids: np.ndarray,

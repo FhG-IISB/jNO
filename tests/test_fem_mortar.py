@@ -44,6 +44,7 @@ from jno.utils.solver.fem_utils import (
     _tri_quadrature,
     _tri_shape,
     build_periodic_prolongation,
+    interface_gap_data,
     master_trace_weights,
 )
 
@@ -726,6 +727,71 @@ def test_trace_weights_handle_empty_input():
     p3, tris = _tri_grid(2, 1.0, 0)
     ids, w = master_trace_weights(np.zeros((0, 2)), tris, p3[:, :2])
     assert ids.shape == (0, 3) and w.shape == (0, 3)
+
+
+# ------------------------------------------------------------------ the contact gap's geometry
+#
+# `g = g0 + n.(u_s - u_m.Phi)` splits into a part fixed by the geometry and a part that moves with the
+# solution. `interface_gap_data` precomputes both: `g0` (the initial along-normal separation) and the
+# gather that makes `u_m.Phi` a weighted sum of master DOFs — hence differentiable in the solution,
+# though NOT in the mesh coordinates, since the projection is frozen at build time.
+
+
+def _master_square(n=3, z=0.0, tilt=None):
+    """A triangulated unit square, optionally embedded in a tilted plane. Returns (pts, tris, normal)."""
+    pts, tris = _tri_grid(n, z, 0)
+    if tilt is None:
+        return pts, tris, np.array([0.0, 0.0, 1.0])
+    t1, t2, _ = _plane_frame(tilt)
+    return pts[:, 0:1] * t1 + pts[:, 1:2] * t2, tris, np.cross(t1, t2)
+
+
+@pytest.mark.parametrize("offset", [0.0, 0.25, -0.1])
+def test_initial_gap_is_the_signed_along_normal_separation(offset):
+    """Zero for coincident (tied) faces, positive for a standoff, negative for initial penetration —
+    the sign convention the contact pressure `max(0, lam + c*(-g))` depends on."""
+    mp, tris, n = _master_square()
+    qp = np.array([[[0.2, 0.3, offset], [0.6, 0.7, offset]], [[0.5, 0.5, offset], [0.9, 0.1, offset]]])
+    ids, w, g0 = interface_gap_data(qp, tris, mp, np.broadcast_to(n, (4, 3)))
+    assert ids.shape == (2, 2, 3) and w.shape == (2, 2, 3) and g0.shape == (2, 2)  # leading dims kept
+    assert np.allclose(w.sum(axis=-1), 1.0)
+    assert np.allclose(g0, offset, atol=1e-12)
+
+
+def test_initial_gap_on_a_tilted_interface():
+    """The separation is measured along the interface's OWN normal, not a global axis — the frame is
+    fitted to the master face exactly as a tie's is."""
+    mp, tris, n = _master_square(tilt=[0.0, -1.0, 1.0])
+    uv = np.array([[0.3, 0.4], [0.6, 0.2]])
+    t1, t2, _ = _plane_frame([0.0, -1.0, 1.0])
+    qp = (uv @ np.stack([t1, t2]))[None, :, :] + 0.37 * n
+    _ids, _w, g0 = interface_gap_data(qp, tris, mp, np.broadcast_to(n, (2, 3)))
+    assert np.allclose(g0, 0.37, atol=1e-12)
+
+
+def test_initial_gap_varies_over_the_face():
+    """A slave face that is not parallel to the master gives a per-point gap, not one number."""
+    mp, tris, n = _master_square()
+    heights = np.array([0.05, 0.2, 0.35])
+    qp = np.stack([np.array([0.25, 0.25, h]) for h in heights])[None, :, :]
+    _ids, _w, g0 = interface_gap_data(qp, tris, mp, np.broadcast_to(n, (3, 3)))
+    assert np.allclose(g0.ravel(), heights, atol=1e-12)
+
+
+def test_gap_gather_reads_the_master_field_exactly():
+    """The solution-dependent half: `u_m . Phi` must reproduce anything the master facets represent,
+    so a rigid relative motion produces exactly that change in gap and nothing spurious."""
+    mp, tris, n = _master_square()
+    qp = np.array([[[0.2, 0.3, 0.1], [0.63, 0.71, 0.1], [0.5, 0.5, 0.1]]])
+    ids, w, g0 = interface_gap_data(qp, tris, mp, np.broadcast_to(n, (3, 3)))
+    f = lambda p: 2.0 * p[..., 0] - 1.5 * p[..., 1] + 0.3  # noqa: E731
+    u_m = (w * f(mp[ids])).sum(axis=-1)
+    assert np.allclose(u_m, f(qp[..., :]), atol=1e-12)
+    # A uniform master displacement must read back exactly (partition of unity through the gather),
+    # so moving the master body rigidly by w0 closes the gap by exactly w0 and nothing else.
+    w0 = 0.04
+    assert np.allclose((w * np.full(ids.shape, w0)).sum(axis=-1), w0, atol=1e-15)
+    assert np.allclose(g0, 0.1, atol=1e-12)  # and the standoff itself is what was built
 
 
 def test_periodic_pair_still_ties_across_a_normal_offset():
