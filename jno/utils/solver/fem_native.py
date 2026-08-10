@@ -1634,6 +1634,50 @@ def assemble_fem_native(
     # Dirichlet pair builder
     # -------------------------------------------------------------------------
 
+    def _drop_interface_only_nodes(bf: np.ndarray, bnodes: np.ndarray, pts_all: np.ndarray) -> np.ndarray:
+        """Remove nodes that sit **only** on a non-conforming interface from the catch-all boundary.
+
+        ``Shape.regions(conforming=False)`` meshes each body independently, so the two sides of an
+        interface are each a facet of exactly one cell -- topologically boundary, and correctly so.
+        Semantically they are internal: a tie glues them. Without this filter a plain
+        ``u(boundary) - g`` pins the interface, which silently solves two disconnected bodies. Measured
+        on a tied 1x1x2 bar: ``u`` was **0.000000 at every interface node** and the peak sat at the
+        unit-cube value 0.0555 instead of the correct 0.0705, converging to the wrong answer at every
+        refinement rather than erroring.
+
+        The test is *at least one non-interface facet*, not *not on an interface facet*: the ring where
+        the interface meets the outer wall belongs to both and must stay pinned. A facet counts as
+        interface when all its **vertices** (the first ``dim`` columns) lie on a registered ``"a|b.x"``
+        region -- matched by coordinate, since a P2 assembly mesh renumbers relative to the P1 mesh the
+        tags were built on, and its edge midpoints are absent from the tag point cloud entirely.
+        """
+
+        # ONLY the per-side tags of a non-conforming interface, ``"a|b.a"`` -- the suffix must be one of
+        # the pair's own region names. A conforming ``"a|b"`` (or its disjoint components ``"a|b.0"``)
+        # is shared by two cells and never appears among boundary facets anyway, but excluding it here
+        # makes this filter a provable no-op on every existing domain rather than one that relies on
+        # that: a wall triangle whose three vertices all happen to sit on the interface seam would
+        # otherwise be dropped from the Dirichlet set.
+        def _is_side(t: str) -> bool:
+            head, dot, tail = t.rpartition(".")
+            return bool(dot) and "|" in head and tail in head.split("|")
+
+        sides = [t for t in (getattr(domain, "_interface_registry", {}) or {}) if _is_side(t)]
+        regions = getattr(domain, "_boundary_regions", {}) or {}
+        clouds = [np.asarray(regions[t].points) for t in sides if t in regions and regions[t].points is not None]
+        if not clouds:
+            return bnodes
+        tol = 1.0e-9 * max(float(np.ptp(pts_all)) if pts_all.size else 1.0, 1.0)
+        key = lambda a: {tuple(r) for r in np.round(np.asarray(a)[:, :dim] / max(tol, 1e-300)).astype(np.int64)}  # noqa: E731
+        iface_keys = set().union(*(key(c) for c in clouds))
+        node_keys = np.round(np.asarray(pts_all)[:, :dim] / max(tol, 1e-300)).astype(np.int64)
+        on_iface = np.array([tuple(r) in iface_keys for r in node_keys], dtype=bool)
+        verts = np.asarray(bf)[:, :dim]
+        outer = np.asarray(bf)[~on_iface[verts].all(axis=1)]
+        if outer.size == 0:  # every boundary facet is an interface -> nothing to pin; leave as-is
+            return bnodes
+        return np.intersect1d(bnodes, np.unique(outer.reshape(-1)))
+
     def _boundary_node_ids(fidx: int, region: str) -> List[int]:
         """Robust boundary-DOF-node ids of ``region`` for field ``fidx``.
 
@@ -1660,6 +1704,8 @@ def assemble_fem_native(
         if bf is None:
             return list(_region_node_ids_from_pts(domain, region, pts_all))
         bnodes = np.unique(np.asarray(bf).reshape(-1))
+        if region == "boundary":
+            bnodes = _drop_interface_only_nodes(np.asarray(bf), bnodes, pts_all)
         if region != "boundary":
             coords = pts_all[bnodes]
             pred = getattr(domain, "_tag_predicates", {}).get(region)

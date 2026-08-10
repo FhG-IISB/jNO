@@ -128,11 +128,21 @@ class Shape:
         ``inclusion`` (higher priority) and the remainder ``matrix``. Equivalent to combining named
         shapes with ``+`` — ``disk.name("inclusion") + plate.name("matrix")``. Must be the top-level
         shape (call ``.domain()`` on it); it is not composable with boolean operators/transforms.
+
+        ``conforming=False`` skips the fragment: every piece is meshed **independently**, so two
+        touching regions end up with two coincident but *non-matching* surfaces and duplicated nodes
+        instead of one shared interface. Each side is tagged ``"a|b.a"`` / ``"a|b.b"``, and tying them
+        with ``u("a|b.a") - u("a|b.b")`` in ``jno.fem`` glues them by a mortar coupling — which is how
+        you join two bodies meshed at *different* resolutions. ``conforming`` is therefore a reserved
+        region name.
         """
-        return cls._from_region_items(tuple(named.items()))
+        conforming = named.pop("conforming", True)
+        if not isinstance(conforming, bool):
+            raise TypeError(f"Shape.regions: `conforming` must be a bool, got {type(conforming).__name__}")
+        return cls._from_region_items(tuple(named.items()), conforming=conforming)
 
     @classmethod
-    def _from_region_items(cls, items) -> "Shape":
+    def _from_region_items(cls, items, conforming: bool = True) -> "Shape":
         if len(items) < 2:
             raise ValueError("a multi-material domain needs at least two named regions")
         names = [n for n, _ in items]
@@ -141,7 +151,7 @@ class Shape:
         dims = {sub.dim for _n, sub in items}
         if len(dims) != 1:
             raise ValueError(f"all regions must share one dimension, got {sorted(dims)}")
-        return cls(("regions", tuple(items)), items[0][1].dim, None)
+        return cls(("regions", tuple(items), bool(conforming)), items[0][1].dim, None)
 
     def name(self, name: str) -> "Shape":
         """Label this shape as a named material region, for combining with ``+`` (see :meth:`regions`).

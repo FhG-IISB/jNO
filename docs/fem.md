@@ -201,6 +201,42 @@ face includes its corner nodes — a face tagged from geometry may drop them, le
 different extents, which both disqualifies mortar and leaves the corner DOFs untied. And multidirectional
 periodicity *requires* shared corners; `jno.fem` raises rather than silently mis-solving if they are absent.
 
+### Gluing two independently meshed bodies
+
+`Shape.regions` fragments its pieces, so a shared interface meshes **conforming** — one node set, no tie
+needed. `conforming=False` skips the fragment: each piece is meshed on its own, and two touching regions
+end up with two coincident but non-matching surfaces and duplicated nodes. That is how you join bodies
+meshed at different resolutions, or couple subdomains you would rather mesh separately.
+
+The two sides are spatially *identical*, so no `d.tag` predicate can separate them — the emitter names
+them, extending the `"a|b"` convention it already uses for material interfaces:
+
+```python
+d = jno.Shape.regions(
+        lower=jno.Shape.box(0, 0, 0, 1, 1, 1),
+        upper=jno.Shape.box(0, 0, 1, 1, 1, 2.5),
+        conforming=False,
+    ).sized(0.18).domain()
+
+a = d.variable("lower|upper.lower", split=True)     # one tag per side
+b = d.variable("lower|upper.upper", split=True)
+
+fem = jno.fem([
+    weak_form,
+    u(a[0], a[1], a[2]) - u(b[0], b[1], b[2]),      # glue them
+    u(xb, yb, zb) - 0.0,
+])
+```
+
+The tie then resolves as above — conforming node-to-node where the layouts happen to match, mortar where
+they do not.
+
+One subtlety worth knowing, because it is invisible: each interface face **is** a facet of exactly one
+cell, so it is topologically part of the boundary. The catch-all `"boundary"` region therefore excludes
+nodes that lie *only* on an interface — otherwise `u(boundary) - g` would pin the interface and silently
+solve two disconnected bodies. Nodes where the interface meets the outer wall lie on a genuine outer
+facet too and stay pinned.
+
 ---
 
 ## Non-nodal element families: H(div) and H(curl)

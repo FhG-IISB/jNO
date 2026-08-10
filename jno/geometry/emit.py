@@ -43,6 +43,13 @@ def _emit_node(node, occ, split_full=False):
             pieces.extend(_emit_node(sub._node, occ, split_full))
         # Fragment every piece against the others: shared interfaces become conforming
         # (element edges align), and each material region survives as its own volume entity.
+        # `conforming=False` skips it, so each piece is meshed on its own and two touching regions
+        # get two coincident, NON-matching surfaces with duplicated nodes -- the configuration a
+        # mortar tie glues. Measured on two boxes sharing a face at different mesh sizes: fragment
+        # gives 44 interface nodes at 44 distinct coordinates (merged), no-fragment gives 56 at 52
+        # (only the 4 corners coincide).
+        if len(node) > 2 and not node[2]:
+            return pieces
         out, _ = occ.fragment(pieces[:1], pieces[1:])
         return out
     if kind in ("cut", "fuse", "inter"):
@@ -223,7 +230,7 @@ def _facet_components(facet_idx, facet_nodes):
     return [np.asarray(facet_idx)[g] for g in groups.values()]
 
 
-def _to_meshio(dim: int, labels: Dict[int, Tuple[int, str]], region_items=None):
+def _to_meshio(dim: int, labels: Dict[int, Tuple[int, str]], region_items=None, nonconforming: bool = False):
     """Assemble the generated gmsh mesh into a ``meshio.Mesh`` with named ``cell_sets``.
 
     ``region_items`` (``((name, sub_shape), ...)``, when the plan is a :meth:`Shape.regions`
@@ -232,6 +239,14 @@ def _to_meshio(dim: int, labels: Dict[int, Tuple[int, str]], region_items=None):
     auto-named by the region pair it separates (``"a|b"`` = every facet between those two materials,
     however many gmsh faces that spans). Only *topologically disjoint* interfaces of the same pair
     (e.g. two separate inclusions) additionally split into connected components ``"a|b.0"`` / ``"a|b.1"``.
+
+    ``nonconforming`` (``Shape.regions(conforming=False)``) changes how an interface is *found*. With
+    the fragment skipped, the two sides of an interface are separate OCC entities each adjacent to a
+    single volume, so the adjacency test above sees them as ordinary outer boundary. They are instead
+    matched **geometrically** — two boundary faces of different regions occupying the same bounding
+    box — and each side is tagged separately as ``"a|b.a"`` / ``"a|b.b"``, since the two are spatially
+    coincident and no ``domain.tag`` predicate could tell them apart. Tie them in ``jno.fem`` with
+    ``u("a|b.a") - u("a|b.b")``.
     """
     import gmsh
     import meshio
@@ -272,6 +287,7 @@ def _to_meshio(dim: int, labels: Dict[int, Tuple[int, str]], region_items=None):
     by_name: Dict[str, List[np.ndarray]] = {}
     external_ranges: List[np.ndarray] = []
     iface_entities: Dict[str, List[np.ndarray]] = {}  # "a|b" -> per-entity facet index ranges
+    nonconf_faces: List[Tuple[tuple, str, np.ndarray]] = []  # (bbox, owning region, facet range)
     for _edim, etag in gmsh.model.getEntities(bdim):
         adj = gmsh.model.getAdjacencies(bdim, etag)[0] if region_items is not None else ()
         interface_pair = None
@@ -301,16 +317,42 @@ def _to_meshio(dim: int, labels: Dict[int, Tuple[int, str]], region_items=None):
             external_ranges.append(rng)
             if label is not None:
                 by_name.setdefault(label[1], []).append(rng)
+            if nonconforming and len(adj) == 1 and int(adj[0]) in vol_region:
+                # Remember this face's owner + extent; coincident faces of DIFFERENT regions are the
+                # two sides of a non-conforming interface, matched after the loop.
+                bbox = tuple(np.round(gmsh.model.getBoundingBox(bdim, etag), 9))
+                nonconf_faces.append((bbox, vol_region[int(adj[0])], rng))
 
     facets = np.asarray(facet_rows, dtype=np.int64).reshape(-1, npb) if facet_rows else np.zeros((0, npb), dtype=np.int64)
     empty = np.array([], dtype=np.int64)
     cells = [(vblock, vcells), (bblock, facets)]
     cell_sets: Dict[str, list] = {"interior": [np.arange(len(vcells), dtype=np.int64), empty.copy()]}
+
+    # Non-conforming interfaces: group the region-owned outer faces by extent; any bounding box shared
+    # by two or more regions is an interface, and each region's side gets its own tag.
+    by_bbox: Dict[tuple, Dict[str, List[np.ndarray]]] = {}
+    for bbox, region, rng in nonconf_faces:
+        by_bbox.setdefault(bbox, {}).setdefault(region, []).append(rng)
+    nonconf_iface: List[np.ndarray] = []
+    for sides in by_bbox.values():
+        if len(sides) < 2:
+            continue  # only one region on this footprint -> a genuine outer face, not an interface
+        pair = "|".join(sorted(sides))
+        for region, chunks in sides.items():
+            idx = np.concatenate(chunks)
+            cell_sets[f"{pair}.{region}"] = [empty.copy(), idx]
+            nonconf_iface.append(idx)
+
+    # These faces are INTERNAL to the assembly even though each is topologically its own body's outer
+    # surface, so they must be withheld from "boundary" and from the auto face names exactly as a
+    # conforming "a|b" interface is. Leaving them in makes a `u(boundary) - g` Dirichlet pin the
+    # interface itself -- measured as a 24% drop in the peak solution before this was excluded.
+    drop = np.concatenate(nonconf_iface) if nonconf_iface else empty.copy()
+    _keep = (lambda a: a[~np.isin(a, drop)]) if drop.size else (lambda a: a)
     for name, chunks in by_name.items():
-        cell_sets[name] = [empty.copy(), np.concatenate(chunks) if chunks else empty.copy()]
+        cell_sets[name] = [empty.copy(), _keep(np.concatenate(chunks)) if chunks else empty.copy()]
     # "boundary" is the OUTER boundary only (internal interfaces are separate, named tags).
-    ext = np.concatenate(external_ranges) if external_ranges else empty.copy()
-    cell_sets["boundary"] = [empty.copy(), ext]
+    cell_sets["boundary"] = [empty.copy(), _keep(np.concatenate(external_ranges) if external_ranges else empty.copy())]
 
     for pair, ent_list in iface_entities.items():
         all_idx = np.concatenate(ent_list)  # every facet between this pair (across all its faces)
@@ -419,8 +461,10 @@ def _build_once(shape, split_full, periodic=None, algorithm=None, threads=None):
         if periodic:  # make named opposite faces conform (edge-element periodic ties need it)
             _apply_periodic(dim, labels, periodic)
         gmsh.model.mesh.generate(dim)
-        region_items = shape._node[1] if shape._node[0] == "regions" else None
-        mesh = _to_meshio(dim, labels, region_items)
+        is_regions = shape._node[0] == "regions"
+        region_items = shape._node[1] if is_regions else None
+        nonconforming = is_regions and len(shape._node) > 2 and not shape._node[2]
+        mesh = _to_meshio(dim, labels, region_items, nonconforming=nonconforming)
         return mesh, dim, ds
     finally:
         gmsh.model.remove()
