@@ -166,3 +166,72 @@ def test_coordinate_with_surface_term_builds():
     vb = phi.bind(x=xb, y=yb)
     fem = jno.fem([ui.x * vi.x + ui.y * vi.y + ui * vi - 1.0 * vi, -(nxb + nyb) * vb], quad_degree=3)
     assert type(fem.operator).__name__ == "FemLinearSystem", "coordinate + surface term did not build a solve operator"
+
+
+def test_transient_assembly_is_coordinate_parametric():
+    """A **transient** problem must carry the trainable coordinate into its assembly.
+
+    It did not. The transient gate in ``fem_native`` omitted ``_coord_specs`` (the steady gate has it), so a
+    linear transient fell to the static branch where ``A`` and ``M`` are built once with ``args=None`` and
+    ``_apply_coord_params`` short-circuits. ``block.step(..., args={coord: X})`` then silently ignored ``X``
+    and ``du/dX`` was exactly zero — a wrong gradient with no symptom, which
+    ``test_fem_relocate.py::test_relocate_transient`` could not see because its objective also has a purely
+    geometric part that kept falling.
+
+    The mass matters as much as the operator here: ``M = ∫φᵢφⱼ dx ∝ |K|``, so a static mass on a moving mesh
+    keeps the element volumes of the mesh you started from, at O(1/dt).
+    """
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.45).domain(time=(0.0, 0.2, 4))
+    u, phi = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    xm, ym, _ = d.variable("mov", where=lambda x, y: (x > 0.2) & (x < 0.8) & (y > 0.2) & (y < 0.8), split=True)
+    xm.trainable(name="ix")
+    ym.trainable(name="iy")
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi)
+    fem = jno.fem([ui.t * vi + ui.x * vi.x + ui.y * vi.y, u(xb, yb) - 0.0, u(ci[0], ci[1]) - 1.0])
+
+    op = fem.operator
+    assert op.operator_fn is not None, "transient operator is not a function of args — the coordinate is dropped"
+    assert op.mass_fn is not None, "transient mass is not a function of args — it keeps the seed volumes"
+    assert set(op.runtime_parameter_exprs or {}) >= {"ix", "iy"}, "coordinate params not exposed on the block"
+
+
+def test_transient_coordinate_gradient_matches_fd():
+    """The regression that would have caught it: ``du/dX`` through a marched transient, against central FD.
+
+    Asserted **non-zero** as well as correct — the failure mode this guards is a silently vanishing gradient,
+    which any relative-error check alone would happily pass.
+    """
+    from jno.utils.solver.fem_adapt import _transient_march_fn
+
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.45).domain(time=(0.0, 0.2, 4))
+    u, phi = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    xm, ym, _ = d.variable("mov", where=lambda x, y: (x > 0.2) & (x < 0.8) & (y > 0.2) & (y < 0.8), split=True)
+    xm.trainable(name="ix")
+    ym.trainable(name="iy")
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi)
+    fem = jno.fem([ui.t * vi + ui.x * vi.x + ui.y * vi.y, u(xb, yb) - 0.0, u(ci[0], ci[1]) - 1.0])
+
+    pts = np.asarray(d.mesh.points)
+    X = {s["name"]: jnp.asarray(pts[np.asarray(s["ids"]), s["axis"]]) for s in d._trainable_coords}
+    march = _transient_march_fn(fem.operator)
+
+    def loss(a):
+        return jnp.sum(march(a) ** 2)
+
+    g = jax.grad(loss)(X)
+    assert float(jnp.linalg.norm(g["ix"])) > 1e-6, "du/dX vanished — the coordinate never reached the assembly"
+    assert float(jnp.linalg.norm(g["iy"])) > 1e-6
+
+    h = 1e-6
+
+    def bumped(delta):
+        return float(loss({k: (v.at[0].add(delta) if k == "ix" else v) for k, v in X.items()}))
+
+    fd = (bumped(h) - bumped(-h)) / (2 * h)
+    assert fd == pytest.approx(float(g["ix"][0]), rel=1e-4), f"FD {fd:.6e} vs AD {float(g['ix'][0]):.6e}"

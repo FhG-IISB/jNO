@@ -803,3 +803,74 @@ def test_flux_dirichlet_shared_edge_precedence_3d():
     shared = on_right & on_adj  # right-face nodes shared with an adjacent Dirichlet face
     assert shared.sum() > 0, "expected right-face edge nodes shared with adjacent faces"
     assert np.max(np.abs(sol[shared] - 1.0)) < 1e-9, "Dirichlet must win at a shared flux/Dirichlet edge node"
+
+
+# --------------------------------------------------------------------------------------------------
+# Newton must not demand a tolerance the FD operator cannot deliver
+# --------------------------------------------------------------------------------------------------
+
+
+def test_fd_operator_noise_separates_exact_from_nested_stencils():
+    """The measurement the tolerance rule is built on. A strong-form second derivative defaults to
+    ``gradient_of_gradient`` — a NESTED gradient — and nesting amplifies roundoff, so the operator
+    carries a precision floor no solver can go below. The cotangent Laplacian on the same mesh does
+    not. Newton then stalled at ~||r||*noise and the convergence guard (correctly) raised; the fix is
+    to ask for what the discretization can actually deliver, not to loosen the guard."""
+    from jno.fdm import _fd_operator_noise, laplacian
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.06)
+    n = int(np.asarray(d.mesh.points).shape[0])
+    u = jnp.asarray(np.random.default_rng(0).normal(size=n))
+
+    exact = _fd_operator_noise(lambda z: laplacian(z, d, method="cotangent"), u)
+    assert exact < 1e-14, f"the cotangent stencil must be exact, measured {exact:.2e}"
+
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    uu = d.unknown()
+    ui = uu.bind(x=x, y=y)
+    prob = jno.fdm([-ui.d2(x) - ui.d2(y) - 1.0, uu(xb, yb) - 0.0])
+    nested = _fd_operator_noise(prob._pde_residual_fn(), u)
+    assert nested > 1e-10, f"the nested gradient_of_gradient stencil is noisy; measured {nested:.2e}"
+    assert nested > 1e4 * max(exact, 1e-17), "the two stencils must differ by orders, not a little"
+
+
+def test_fd_operator_noise_is_immune_to_nonlinearity_and_to_tracing():
+    """The probe leans on a JVP being exactly LINEAR IN ITS TANGENT for any differentiable residual,
+    so a genuinely nonlinear residual must still measure ~0 noise (otherwise the rule would loosen
+    Newton on every nonlinear problem). And it is eager-only: under a trace it returns 0.0, leaving
+    the driver's own defaults untouched rather than inventing a floor."""
+    import jax
+
+    from jno.fdm import _fd_newton_tolerances, _fd_operator_noise
+
+    u = jnp.asarray(np.random.default_rng(1).normal(size=64))
+    assert _fd_operator_noise(lambda z: z**3, u) < 1e-14, "nonlinearity must not read as noise"
+    assert _fd_operator_noise(lambda z: jnp.sin(z) * jnp.exp(0.1 * z), u) < 1e-14
+
+    # an exact operator keeps the driver's defaults (no override dict at all)
+    assert _fd_newton_tolerances(lambda z: 2.0 * z, u) == {}
+
+    # under a trace the probe must not raise (the parametric / crux inverse path hits this)
+    out = jax.jit(lambda z: jnp.sum(jnp.asarray(list(_fd_newton_tolerances(lambda w: 2.0 * w, z).values()) or [0.0])))(u)
+    assert np.isfinite(float(out))
+
+
+def test_fdm_poisson_converges_without_raising_on_the_default_stencil():
+    """End-to-end: the default (nested-FD) Poisson solve must converge and be accurate. Before the
+    floor-aware gate this raised `newton_krylov did not converge` — residual 7.0e-05 against a
+    1.07e-07 request — while the ANSWER was fine, which is why the suite passed until the Newton
+    convergence guard landed."""
+    import jno.jnp_ops as jnn
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.06)
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    p = _nodes(d)
+    exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    f = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+    sol = jno.fdm([-ui.d2(x) - ui.d2(y) - f, u(xb, yb) - 0.0]).solve()  # must not raise
+    rel = float(np.linalg.norm(np.asarray(sol).reshape(-1) - exact) / np.linalg.norm(exact))
+    assert rel < 3e-2, f"the answer must still be accurate: rel {rel:.3e}"

@@ -14,12 +14,42 @@ No external solver dependency (no optimistix / lineax).
 
 from __future__ import annotations
 
+import math
+
 import jax
 import jax.numpy as jnp
 
 __all__ = ["newton_krylov", "newton_direct", "bicgstab"]
 
 _EPS = 1e-300
+
+
+def _convergence_check(f0, u0, u, *, rtol, atol, max_steps, who):
+    """Raise (eagerly) if the Newton loop returned on its STEP CAP rather than on the tolerance.
+
+    Both drivers below iterate a ``jax.lax.while_loop`` whose condition is
+    ``(||r|| > atol + rtol*||r(u0)||) & (k < max_steps)``. Leaving on the *second* clause returns the
+    last iterate with no signal whatsoever, so a stalled solve is indistinguishable downstream from a
+    converged one -- it comes back as a perfectly plausible-looking field. The steady-linear default
+    already refuses to do that (``_fem._residual_check`` / ``solver_api._maybe_residual_check``); the
+    nonlinear path had no equivalent, which is the gap this closes.
+
+    No-op under ``jit``/``vmap``/``grad``: the test needs a concrete residual, so it would both force a
+    device->host sync and fail to concretise. Same guard, and same trade, as the two linear checks --
+    under a transform the solver's own iteration cap is all there is.
+    """
+    if any(isinstance(v, jax.core.Tracer) for v in (u, u0)):
+        return u
+    rn = float(jnp.linalg.norm(f0(u)))
+    bound = atol + rtol * float(jnp.linalg.norm(f0(u0)))
+    if not math.isfinite(rn) or rn > bound:
+        raise RuntimeError(
+            f"{who} did not converge in max_steps={max_steps}: residual norm {rn:.3e} against the "
+            f"tolerance atol + rtol*||r(u0)|| = {bound:.3e} (atol={atol:g}, rtol={rtol:g}). The last "
+            "iterate is NOT a root -- raise max_steps, loosen atol/rtol, globalize the iteration "
+            "(jno.solve.newton(line_search=True) or damping<1), or start from a better x0."
+        )
+    return u
 
 
 def bicgstab(matvec, b, *, tol=1e-10, maxit=2000):
@@ -149,7 +179,11 @@ def newton_krylov(
         return u
 
     tangent_solve = lambda g, y: inner(g, y)
-    return jax.lax.custom_root(f0, u0, solve, tangent_solve)
+    root = jax.lax.custom_root(f0, u0, solve, tangent_solve)
+    # Checked OUTSIDE custom_root: everything inside `solve` is traced, so an in-loop guard could
+    # never concretise. Here `root` is concrete whenever the caller was eager, which is exactly when
+    # the check can do any good.
+    return _convergence_check(f0, u0, root, rtol=rtol, atol=atol, max_steps=max_steps, who="newton_krylov")
 
 
 def newton_direct(
@@ -226,6 +260,7 @@ def newton_direct(
         return u
 
     root = _forward(u0)  # un-differentiated forward solve; custom_root below supplies the gradient
+    _convergence_check(f0, u0, root, rtol=rtol, atol=atol, max_steps=max_steps, who="newton_direct")
 
     def _tangent(g, y):  # solve J_root x = y (and Jᵀ on the reverse pass) DIRECTLY at the converged root
         J = jacobian_fn(root)

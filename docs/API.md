@@ -185,18 +185,27 @@ precond=…, time=…)` composes (see the [FEM guide](fem.md)). The families:
 | **Linear — iterative (Krylov)** | `cg`, `bicgstab`, `gmres`, `fgmres`, `minres`; `lstsq` (LSQR, least-squares); `chebyshev` (polynomial) |
 | **Linear — multigrid** | `amg` (GPU AMG / NVIDIA AmgX via jaxamg) |
 | **Nonlinear** | `newton`, `picard` |
-| **Eigenproblem** | `eigs` (generalized `Kx = λMx`) — dense reduction, or preconditioned LOBPCG with `precond=` |
+| **Eigenproblem** | `eigs` (generalized `Kx = λMx`) — dense reduction, preconditioned LOBPCG with `precond=`, or interior modes nearest a shift with `sigma=` |
 | **Singular values** | `svd` (partial SVD of a **rectangular**, matrix-free operator — POD bases, inverse-problem ill-posedness) |
 | **Matrix functions** (stochastic Lanczos, matrix-free) | `logdet`, `trace`, `applyfun` (`f(A)·v`), `diagonal` |
 | **Time integration** | `theta` (θ-method), `exponential` (exponential integrator), `adaptive` (step-doubling adaptive step size) |
 
 ### Eigenproblems at scale
 
-`jno.solve.eigs` / `FEM.eigs` have two paths, chosen by the arguments. With none of the iterative
+`jno.solve.eigs` / `FEM.eigs` have three paths, chosen by the arguments. With none of the iterative
 arguments the pencil is reduced **densely** — exact, and right when you want the whole low spectrum of
 a small problem, but it materializes the operator (`O(N²)` memory). Passing `precond=` selects
 **preconditioned LOBPCG** (Knyazev, *SIAM J. Sci. Comput.* **23**(2), 517–541, 2001), which only applies
-`K`/`M` as matvecs and so runs where the dense reduction cannot:
+`K`/`M` as matvecs and so runs where the dense reduction cannot. Passing `sigma=` targets the `k`
+eigenvalues **nearest the shift** — interior modes (a cavity resonance inside a band, a Brillouin-zone
+point away from the band edge), which no extremal-end iteration can reach — by shift-invert block
+subspace iteration (Ericsson & Ruhe, *Math. Comp.* **35**, 1980; Bathe & Wilson, *IJNME* **6**, 1973):
+`θ = 1/(λ−σ)` makes the near-σ modes dominant with enormous transformed gaps, so the transformation is
+its own preconditioner and `precond=` is rejected there. The inner solves against `K − σM` default to a
+host sparse LU **factorized once** (every sweep is then triangular substitutions); `linear=` swaps in a
+different inner solver when a factorization is too big. Constrained pencils (Dirichlet pins, periodic
+ties) compose: the reduced `K − σM` is assembled sparsely through the same triplet remap the periodic
+solve reduction uses.
 
 `K` is the **source-less** `jno.fem` whose bilinear form is the stiffness; `mass=` takes the mass form
 as a plain term list, which `eigs` assembles onto the same space for you:
@@ -209,10 +218,24 @@ ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
 K = jno.fem([ui.x * vi.x + ui.y * vi.y])                       # stiffness — no source term
 lam, X = K.eigs(mass=[ui * vi], k=6)                           # dense;  λ = ω² on a Neumann box
 lam, X = K.eigs(mass=[ui * vi], k=6, precond=jno.precond.amg())  # LOBPCG, never densified
+lam, X = K.eigs(mass=[ui * vi], k=4, sigma=60.0)               # the 4 modes nearest λ = 60
 ```
 
 `jno.solve.eigs(...)` is the lower-level form of the same thing and takes two **assembled operators**
 rather than a fem and a term list — `jno.solve.eigs(k=6)(K.operator[0], M)`.
+
+**Sweeps warm-start.** `X0=` seeds the LOBPCG block with eigenvector guesses in the full DOF space
+(restricted through any constraint elimination for you) — the classic sweep accelerator: a
+parameter/frequency/k-point sweep passes each point the previous point's eigenvectors, so the
+iteration only tracks the drift instead of re-finding the subspace from random. Fewer columns than
+`k` are padded with the seeded random block. `X0=` is rejected on the dense path (it would be
+silently ignored) and not yet wired into `sigma=` (the transformation converges from random in a
+handful of sweeps anyway):
+
+```python
+lam, X = K.eigs(mass=mass, k=6, precond=jno.precond.jacobi())            # first sweep point
+lam2, X2 = K2.eigs(mass=mass, k=6, precond=jno.precond.jacobi(), X0=X)   # next point: warm
+```
 
 The Rayleigh–Ritz runs in the **M-inner product**, so an ordinary FEM form's consistent (non-lumped)
 mass matrix is handled directly, and `XᵀMX = I` holds on both paths. Eigenvalues are differentiable on
@@ -221,11 +244,15 @@ trace of the cluster). LOBPCG freezes the converged eigenvector and differentiat
 quotient, which gives that derivative exactly without differentiating through the sweeps, but its
 **eigenvectors** carry no gradient where the dense path's do.
 
-`tol`/`maxiter` tune the iteration and are **rejected** without `precond=`, so a tolerance can never be
-silently ignored by the dense path. Do not set `tol` near machine precision: on an ill-conditioned
-pencil the residual floors well above it (≈`4.4e-8` on a singular all-Neumann Laplacian with
-`cond(K) ≈ 2e16`), and a tolerance below that floor burns the budget and **NaN-poisons** the result —
-which is the deliberate contract for an exhausted budget, never a quietly under-converged spectrum.
+`tol`/`maxiter` tune the iterative paths and are **rejected** without `precond=` or `sigma=`, so a
+tolerance can never be silently ignored by the dense path. Do not set `tol` near machine precision: on
+an ill-conditioned pencil the residual floors well above it (≈`4.4e-8` on a singular all-Neumann
+Laplacian with `cond(K) ≈ 2e16`), and a tolerance below that floor burns the budget and
+**NaN-poisons** the result — which is the deliberate contract for an exhausted budget, never a quietly
+under-converged spectrum. The shift-invert gate measures the **original pencil's** residual of the `k`
+returned pairs (a θ-space gate would flatter it), and a shift landing exactly ON an eigenvalue makes
+`K − σM` singular — the garbage its factorization produces fails the same gate; perturb σ off the
+eigenvalue.
 
 ### Singular values — `jno.solve.svd`
 

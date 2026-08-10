@@ -265,3 +265,26 @@ def test_nedelec_tet_field_parameter_kx_matches_analytic_and_differentiates():
 
     g = np.asarray(jax.grad(_loss)(k_lin))
     assert g.shape == k_lin.shape and np.all(np.isfinite(g)) and np.linalg.norm(g) > 0.0
+
+
+@pytest.mark.slow
+def test_nedelec_cavity_resolution_guidance_holds():
+    """Pins the *documented* mesh-resolution guidance for wave problems (docs/fem.md, "Mesh resolution
+    for wave problems"), since N1E is lowest-order-only and the mesh is the sole accuracy knob.
+
+    Deliberately NOT a tight convergence-rate assertion: gmsh meshes at different ``h`` are unstructured
+    and non-nested and the lowest mode is 3-fold degenerate, so the triplet mean wobbles by ~1% between
+    meshes (measured: h=0.25 is *worse* than h=0.30). What is robust — and what the docs promise — is the
+    span: a couple of points per wavelength is useless, and ~9 gets you to the low percent."""
+    k2 = 2.0 * np.pi**2
+    lam_wave = 2 * np.pi / (np.sqrt(2.0) * np.pi)  # = sqrt(2) on the unit cube
+
+    _n_coarse, w_coarse = _cavity_eigenvalues(0.5)  # ppw ~ 2.8
+    _n_fine, w_fine = _cavity_eigenvalues(0.16)  # ppw ~ 8.8
+    err_coarse = abs(float(np.mean(w_coarse[:3])) / k2 - 1.0)
+    err_fine = abs(float(np.mean(w_fine[:3])) / k2 - 1.0)
+
+    assert abs(lam_wave / 0.5 - 2.83) < 0.05 and abs(lam_wave / 0.16 - 8.84) < 0.05  # the ppw the docs quote
+    assert err_coarse > 0.15, f"~2.8 points/wavelength must be visibly wrong, got {err_coarse:.1%}"
+    assert err_fine < 0.03, f"~8.8 points/wavelength must reach the low percent, got {err_fine:.1%}"
+    assert err_fine < err_coarse / 5, "refining must buy a real improvement, not a marginal one"

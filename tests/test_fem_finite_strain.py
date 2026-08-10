@@ -109,7 +109,11 @@ def test_finite_strain_reduces_to_linear_elasticity_at_small_strain():
     sol_lin = np.asarray(jno.fem([lin, *bcs]).solve()).reshape(-1, 3)
     sol_fs = np.asarray(
         jno.fem([_svk_virtual_work(u, phi, X), *bcs]).solve(
-            nonlinear=jno.solve.newton(max_steps=30, rtol=1e-12, atol=1e-14)
+            # atol=1e-14 was BELOW the achievable residual on CPU (it floors at ~1.14e-14 against a
+            # 1.07e-14 gate), so Newton raised a spurious non-convergence there while passing on GPU.
+            # This is a SOLVER tolerance, not the property under test: the assertion below is the
+            # physics (rel < 1e-3), for which 1e-12 is still four orders tighter than needed.
+            nonlinear=jno.solve.newton(max_steps=30, rtol=1e-12, atol=1e-12)
         )
     ).reshape(-1, 3)
     rel = np.abs(sol_fs - sol_lin).max() / max(np.abs(sol_lin).max(), 1e-30)

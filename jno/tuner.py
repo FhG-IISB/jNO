@@ -112,6 +112,32 @@ class ArchSpace:
     def __init__(self) -> None:
         self._groups: List[Union[UniqueGroup, FloatGroup, IntGroup]] = []
         self._name_to_group: Dict[str, Union[UniqueGroup, FloatGroup, IntGroup]] = {}
+        self._sequences: Dict[str, Any] = {}  # ordered, warm-started axes -- see sequence()
+        self._sequence_keep: str = "all"
+
+    def sequence(self, name: str, values, *, keep: str = "all") -> "ArchSpace":
+        """An **ordered, warm-started** axis -- parameter continuation, not search.
+
+        Unlike ``unique``/``float_range``/``int_range`` (independent trials a search may visit in any
+        order), a sequence axis is marched **in order**, each solve warm-starting from the previous one
+        -- an EM frequency/material sweep, mechanics load stepping, numerical homotopy. Several sequence
+        axes march together (zipped; equal lengths). ``keep="all"`` collects the whole solution family;
+        ``keep="last"`` keeps only the final solution (homotopy). Consumed by ``crux.tune`` on a
+        constraint set containing a parametric ``fem.solve()`` node; the march runs through the same
+        engine as the solver tests (:func:`jno.utils.solver.solver_api.run_continuation`).
+        """
+        import numpy as _np
+
+        if name in self._name_to_group:
+            raise ValueError(f"sequence({name!r}): already declared as a search axis in this space.")
+        vals = _np.asarray(values)
+        if vals.ndim == 0 or vals.shape[0] < 1:
+            raise ValueError(f"sequence({name!r}): expected a 1D value sequence, got shape {vals.shape}.")
+        if keep not in ("all", "last"):
+            raise ValueError(f"sequence({name!r}): keep must be 'all' or 'last', got {keep!r}.")
+        self._sequences[name] = vals
+        self._sequence_keep = keep
+        return self
 
     def grid(self) -> List[Arch]:
         """Generate all parameter combinations for exhaustive grid search.
@@ -183,6 +209,10 @@ class ArchSpace:
 
         group = UniqueGroup(name=name, options=tuple(options), category=category)
         self._groups.append(group)
+        if name in getattr(self, "_sequences", {}):
+            raise ValueError(
+                f"{name!r} is already a sequence axis in this space -- an axis is ordered or searched, not both."
+            )
         self._name_to_group[name] = group
         return self
 
@@ -205,6 +235,10 @@ class ArchSpace:
         """
         group = FloatGroup(name=name, low=low, high=high, log_scale=log_scale, category=category)
         self._groups.append(group)
+        if name in getattr(self, "_sequences", {}):
+            raise ValueError(
+                f"{name!r} is already a sequence axis in this space -- an axis is ordered or searched, not both."
+            )
         self._name_to_group[name] = group
         return self
 
@@ -219,6 +253,10 @@ class ArchSpace:
         """
         group = IntGroup(name=name, low=low, high=high, category=category)
         self._groups.append(group)
+        if name in getattr(self, "_sequences", {}):
+            raise ValueError(
+                f"{name!r} is already a sequence axis in this space -- an axis is ordered or searched, not both."
+            )
         self._name_to_group[name] = group
         return self
 
@@ -426,6 +464,77 @@ class Tuner:
     def __init__(self, core_inst):
         self.core = core_inst
 
+    def _march_sequences(self, space):
+        """March the space's sequence axes through the continuation engine.
+
+        Finds the (single) FEM behind the core's constraints via the ``_fem_ref`` every lazy
+        ``fem.solve()`` node carries, resolves the runtime parameters that are NOT being marched to
+        their current values, and returns the solution family (``keep="all"``: ``(n_values, n_dofs)``)
+        or the final solution (``keep="last"``). Complex problems return complex arrays."""
+        import equinox as eqx
+        import jax
+        import jax.numpy as jnp
+
+        from .trace import Placeholder, _iter_placeholder_children
+        from .utils.solver.solver_api import ContinuationSpec, run_continuation
+
+        fems, seen = [], set()
+
+        def visit(n):
+            if not isinstance(n, Placeholder) or id(n) in seen:
+                return
+            seen.add(id(n))
+            ref = getattr(n, "_fem_ref", None)
+            if ref is not None and all(ref is not f for f in fems):
+                fems.append(ref)
+            for kind, _attr, val in _iter_placeholder_children(n):
+                for c in val if kind == "list" else (val,):
+                    visit(c)
+
+        for c in self.core.constraints:
+            visit(c._expr if hasattr(c, "_expr") else c)
+        if len(fems) != 1:
+            raise ValueError(
+                f"crux.sweep: a sequence axis needs exactly one parametric fem.solve() node in the "
+                f"constraints to march; found {len(fems)}. Build the core from `[fem.solve()]` (or a "
+                "loss containing it) and keep one FEM per tuned core."
+            )
+        fem = fems[0]
+
+        exprs = getattr(fem._op, "runtime_parameter_exprs", None) or {}
+        fixed = {}
+        for name, expr in exprs.items():
+            if name in space._sequences:
+                continue
+            # A parameter not being marched holds its CURRENT value -- the "resolved to their current
+            # values" semantics the lazy solve node documents. The value lives on the wrapper's eqx
+            # module; an .initialize(...) that has not materialized yet is applied here exactly as the
+            # training setup would, because the RAW module still holds zeros at this point and reading
+            # those would silently drop the declared value.
+            model = getattr(expr, "model", expr)
+            module = getattr(model, "module", model)
+            leaves = jax.tree_util.tree_leaves(eqx.filter(module, eqx.is_inexact_array))
+            if len(leaves) != 1:
+                raise NotImplementedError(
+                    f"crux.sweep: runtime parameter {name!r} is not a plain jno.np.parameter "
+                    f"({len(leaves)} array leaves), so its held value cannot be resolved for the march. "
+                    "Sweep it explicitly or freeze it."
+                )
+            val = jnp.asarray(leaves[0])
+            init_fn = getattr(model, "_initializer_fn", None)
+            if init_fn is not None:
+                key = getattr(model, "_initializer_key", None)
+                key = jax.random.PRNGKey(0) if key is None else key
+                val = jnp.asarray(init_fn(key, val.shape, val.dtype))
+            fixed[name] = val.reshape(-1)
+
+        spec = ContinuationSpec(params=dict(space._sequences), keep=space._sequence_keep)
+        self.core.log.info(
+            f"sequence march: {sorted(space._sequences)} over "
+            f"{next(iter(space._sequences.values())).shape[0]} values (keep={space._sequence_keep})"
+        )
+        return run_continuation(fem, spec, kwargs=fixed)
+
     def sweep(
         self,
         space: "ArchSpace",
@@ -450,6 +559,24 @@ class Tuner:
         Returns:
             Training statistics from the best configuration
         """
+        # Ordered (sequence) axes: parameter continuation, not search. They are marched through the
+        # warm-started engine rather than enumerated as trials, so they divert before any trial
+        # machinery. Composing them WITH search axes (a march per trial) is the next extension; an
+        # adaptive optimizer can never own them (it reorders points by design, and the order is the
+        # feature).
+        if getattr(space, "_sequences", None):
+            if optimizer is not None:
+                raise NotImplementedError(
+                    "crux.sweep: a sequence axis is ordered and warm-started, which a search optimizer "
+                    "would reorder. Use grid mode (optimizer=None) with sequence axes."
+                )
+            if space._groups:
+                raise NotImplementedError(
+                    "crux.sweep: sequence axes combined with search axes (a march per trial) is not wired "
+                    "yet -- run the sweep and the search separately for now."
+                )
+            return self._march_sequences(space)
+
         # Parse device configuration
         device_config = DeviceConfig.from_spec(devices)
         num_workers = device_config.num_workers

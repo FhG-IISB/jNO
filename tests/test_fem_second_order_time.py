@@ -71,7 +71,10 @@ def _trajectory(fem, theta=None):
         block.metadata["theta"] = theta
     ts = np.asarray(_block_time_grid(block))
     ys = np.asarray(_default_transient_integrate(block, {}, ts))
-    n = fem.offsets[1]
+    # The augmented state is [displacements | velocities], so the split is the MIDPOINT — the same
+    # thing as offsets[1] for a single field, but not for a coupled system, whose displacement half
+    # already spans several field blocks.
+    n = ys.shape[1] // 2
     return ts, ys[:, :n], ys[:, n:]  # times, displacement, velocity
 
 
@@ -465,16 +468,18 @@ def test_second_order_1d_state_dependent_mass_fails_loud():
         )
 
 
-def test_second_order_1d_coupled_fails_loud():
-    """The 1D ``u_tt`` path is single-field. A COUPLED second-order 1D system refuses by name rather
-    than assembling something plausible.
+def test_second_order_1d_coupled_gives_each_field_its_own_velocity_block():
+    """A COUPLED second-order 1D system (previously refused as "single-field only").
 
-    Worth pinning even though it is only a guard: the 1D augmented assembly composes ``[[M2,0],[0,M2]]``
-    and ``[[0,-M2],[K,C]]`` at fixed ``n`` offsets, so a second field would silently overlay the
-    velocity block rather than get its own — a wrong answer, not a crash, if the guard ever lapses.
-    2D/3D coupled second-order IS supported (see the mixed-order test above); this is a 1D-only limit."""
+    Worth pinning structurally: the augmented assembly composes ``[[M2,0],[0,M2]]`` and
+    ``[[0,-M2],[K,·]]`` over the *whole* block vector, so a second field must get its own displacement
+    AND velocity block rather than overlaying the first — that failure mode is a wrong answer, not a
+    crash. The layout is asserted directly, and the two fields are given different wave speeds so a
+    shared block could not reproduce both.
+
+    The dynamics themselves are covered in ``tests/test_fem_1d.py`` (the two-mode beat)."""
     pytest.importorskip("pygmsh", reason="pygmsh required for line meshing")
-    d = jno.domain(constructor=jno.domain.line(mesh_size=0.1), time=(0.0, 0.5, 10))
+    d = jno.domain(constructor=jno.domain.line(mesh_size=0.05), time=(0.0, 0.5, 60))
     u, phi = d.fem_symbols(names=("u", "phi"))
     p, q = d.fem_symbols(names=("p", "q"))
     xi, ti = d.variable("interior", split=True)[0], d.variable("interior", split=True)[-1]
@@ -483,19 +488,33 @@ def test_second_order_1d_coupled_fails_loud():
     ui, vi = u.bind(x=xi, t=ti), phi.bind(x=xi, t=ti)
     pi_, qi = p.bind(x=xi, t=ti), q.bind(x=xi, t=ti)
     ui0, pi0 = u.bind(x=xi0, t=ti0), p.bind(x=xi0, t=ti0)
-    with pytest.raises(NotImplementedError, match="single-field|first-order system"):
-        jno.fem(
-            [
-                ui.tt * vi + ui.x * vi.x,
-                pi_.tt * qi + pi_.x * qi.x,
-                u(xb) - 0.0,
-                p(xb) - 0.0,
-                u(xi0) - 0.0,
-                ui0.t - 0.0,
-                p(xi0) - 0.0,
-                pi0.t - 0.0,
-            ]
-        )
+    c2 = 4.0  # p travels at twice u's speed -> period halves
+    fem = jno.fem(
+        [
+            ui.tt * vi + ui.x * vi.x,
+            pi_.tt * qi + c2 * (pi_.x * qi.x),
+            u(xb) - 0.0,
+            p(xb) - 0.0,
+            u(xi0) - jno.fn(lambda x: jnp.sin(PI * x), [xi0]),
+            ui0.t - 0.0,
+            p(xi0) - jno.fn(lambda x: jnp.sin(PI * x), [xi0]),
+            pi0.t - 0.0,
+        ]
+    )
+    n_nodes = int(np.asarray(d.mesh.points).shape[0])
+    # [u, p | u̇, ṗ] — four blocks of n_nodes, not two
+    assert fem.offsets == [0, n_nodes, 2 * n_nodes, 3 * n_nodes, 4 * n_nodes]
+    assert int(np.asarray(fem.state0).shape[0]) == 4 * n_nodes
+
+    ts, U, _ = _trajectory(fem)
+    o = fem.offsets
+    xx = np.asarray(fem.points)[:, 0][:n_nodes]
+    w = np.sin(PI * xx)
+    au = (U[:, o[0] : o[1]] @ w) / (w @ w)
+    ap = (U[:, o[1] : o[2]] @ w) / (w @ w)
+    # each field oscillates at its own frequency: omega_u = pi, omega_p = 2 pi
+    assert np.max(np.abs(au - np.cos(PI * ts))) < 0.05, "u block does not track cos(pi t)"
+    assert np.max(np.abs(ap - np.cos(2 * PI * ts))) < 0.05, "p block does not track cos(2 pi t)"
 
 
 def test_second_order_1d_p2_wave_converges_at_second_order_in_time():
@@ -963,6 +982,288 @@ def test_second_order_coupled_membranes_beating():
     ex2 = 0.5 * (np.cos(om_s * ts) - np.cos(om_a * ts)) * phi_c
     assert np.linalg.norm(U1[:, ci] - ex1) / np.linalg.norm(ex1) < 0.03, "u1 does not track the beating analytic"
     assert np.linalg.norm(U2[:, ci] - ex2) / np.linalg.norm(ex2) < 0.03, "u2 does not track the beating analytic"
+
+
+def _coupled_membranes_domain(mesh_size, t1, n_steps, names):
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=mesh_size, time=(0.0, t1, n_steps))
+    u1, p1 = d.fem_symbols(names=(f"{names}u1", f"{names}p1"))
+    u2, p2 = d.fem_symbols(names=(f"{names}u2", f"{names}p2"))
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi0, yi0, ti0 = d.variable("initial", split=True)
+    a1, b1 = u1.bind(x=xi, y=yi, t=ti), p1.bind(x=xi, y=yi, t=ti)
+    a2, b2 = u2.bind(x=xi, y=yi, t=ti), p2.bind(x=xi, y=yi, t=ti)
+    return d, (u1, u2), (a1, b1, a2, b2), (xb, yb), (xi0, yi0, ti0)
+
+
+def test_second_order_coupled_with_damping_tracks_the_damped_beating():
+    """A ``u_t`` DAMPING term on a *coupled* second-order form (previously fail-loud: 'write it as a
+    first-order system'). Two spring-coupled membranes with uniform damping γ decouple into normal
+    modes obeying ``a'' + γ a' + ω² a = 0``, so each mode is the analytic underdamped oscillation
+    ``a(t) = e^{-γt/2}(cos ω̃t + γ/(2ω̃) sin ω̃t)``, ``ω̃ = √(ω² − γ²/4)`` — same beating as the
+    undamped test, inside a decaying envelope."""
+    k, gam = 40.0, 1.5
+    d, (u1, u2), (a1, b1, a2, b2), (xb, yb), (xi0, yi0, ti0) = _coupled_membranes_domain(0.1, 1.0, 110, "dmp")
+    a10, a20 = u1.bind(x=xi0, y=yi0, t=ti0), u2.bind(x=xi0, y=yi0, t=ti0)
+    weak = (
+        a1.tt * b1
+        + gam * a1.t * b1
+        + (a1.x * b1.x + a1.y * b1.y)
+        + k * (a1 - a2) * b1
+        + a2.tt * b2
+        + gam * a2.t * b2
+        + (a2.x * b2.x + a2.y * b2.y)
+        + k * (a2 - a1) * b2
+    )
+    u10 = jno.fn(lambda x, y: jnp.sin(PI * x) * jnp.sin(PI * y), [xi0, yi0])
+    fem = jno.fem(
+        [weak, u1(xb, yb) - 0.0, u2(xb, yb) - 0.0, u1(xi0, yi0) - u10, u2(xi0, yi0) - 0.0, a10.t - 0.0, a20.t - 0.0]
+    )
+    assert fem.is_transient and fem.is_linear
+    ts = np.asarray(_block_time_grid(fem.operator))
+    Yfull = np.asarray(_default_transient_integrate(fem.operator, {}, ts))
+    o = fem.offsets
+    U1, U2 = Yfull[:, o[0] : o[1]], Yfull[:, o[1] : o[2]]
+    pts = np.asarray(fem.points)[: o[1]]
+    ci = int(np.argmin(np.sum((pts - 0.5) ** 2, axis=1)))
+    phi_c = float(_mode11(pts[ci, 0], pts[ci, 1]))
+
+    def amode(om2, t):
+        omt = np.sqrt(om2 - gam**2 / 4.0)
+        return np.exp(-gam * t / 2.0) * (np.cos(omt * t) + gam / (2.0 * omt) * np.sin(omt * t))
+
+    ex1 = 0.5 * (amode(2 * PI**2, ts) + amode(2 * PI**2 + 2 * k, ts)) * phi_c
+    ex2 = 0.5 * (amode(2 * PI**2, ts) - amode(2 * PI**2 + 2 * k, ts)) * phi_c
+    assert np.linalg.norm(U1[:, ci] - ex1) / np.linalg.norm(ex1) < 0.04, "damped u1 off the analytic envelope"
+    assert np.linalg.norm(U2[:, ci] - ex2) / np.linalg.norm(ex2) < 0.04, "damped u2 off the analytic envelope"
+
+
+def test_second_order_coupled_nonlinear_matches_the_first_order_spelling():
+    """A NONLINEAR spatial operator on a *coupled* second-order form (previously fail-loud). Oracle:
+    the explicit-velocity FIRST-order spelling of the same system — exactly the workaround the old
+    error message prescribed — marched with the same θ=½ step. The two spellings assemble the same
+    semidiscrete block up to row ordering, so they must agree to solver tolerance, not merely to
+    discretization order."""
+    k, beta = 10.0, 5.0
+    t1, n_steps, h = 0.5, 30, 0.25
+
+    def _center_traj_second_order():
+        d, (u1, u2), (a1, b1, a2, b2), (xb, yb), (xi0, yi0, ti0) = _coupled_membranes_domain(h, t1, n_steps, "nl2")
+        a10, a20 = u1.bind(x=xi0, y=yi0, t=ti0), u2.bind(x=xi0, y=yi0, t=ti0)
+        weak = (
+            a1.tt * b1
+            + (a1.x * b1.x + a1.y * b1.y)
+            + k * (a1 - a2) * b1
+            + beta * (a1 * a1 * a1) * b1
+            + a2.tt * b2
+            + (a2.x * b2.x + a2.y * b2.y)
+            + k * (a2 - a1) * b2
+            + beta * (a2 * a2 * a2) * b2
+        )
+        u10 = jno.fn(lambda x, y: jnp.sin(PI * x) * jnp.sin(PI * y), [xi0, yi0])
+        fem = jno.fem(
+            [weak, u1(xb, yb) - 0.0, u2(xb, yb) - 0.0, u1(xi0, yi0) - u10, u2(xi0, yi0) - 0.0, a10.t - 0.0, a20.t - 0.0]
+        )
+        assert fem.is_transient and not fem.is_linear
+        ts = np.asarray(_block_time_grid(fem.operator))
+        Y = np.asarray(_default_transient_integrate(fem.operator, {}, ts))
+        o = fem.offsets
+        pts = np.asarray(fem.points)[: o[1]]
+        ci = int(np.argmin(np.sum((pts - 0.5) ** 2, axis=1)))
+        return ts, Y[:, o[0] : o[1]][:, ci], Y[:, o[1] : o[2]][:, ci]
+
+    def _center_traj_first_order():
+        d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=h, time=(0.0, t1, n_steps))
+        u1, p1 = d.fem_symbols(names=("nf1u1", "nf1p1"))
+        u2, p2 = d.fem_symbols(names=("nf1u2", "nf1p2"))
+        w1, q1 = d.fem_symbols(names=("nf1w1", "nf1q1"))
+        w2, q2 = d.fem_symbols(names=("nf1w2", "nf1q2"))
+        xi, yi, ti = d.variable("interior", split=True)
+        xb, yb, _ = d.variable("boundary", split=True)
+        xi0, yi0, _ = d.variable("initial", split=True)
+        A1, B1 = u1.bind(x=xi, y=yi, t=ti), p1.bind(x=xi, y=yi, t=ti)
+        A2, B2 = u2.bind(x=xi, y=yi, t=ti), p2.bind(x=xi, y=yi, t=ti)
+        W1, Q1 = w1.bind(x=xi, y=yi, t=ti), q1.bind(x=xi, y=yi, t=ti)
+        W2, Q2 = w2.bind(x=xi, y=yi, t=ti), q2.bind(x=xi, y=yi, t=ti)
+        weak = (
+            A1.t * Q1
+            - W1 * Q1  # the velocity definition u̇1 = w1
+            + A2.t * Q2
+            - W2 * Q2
+            + W1.t * B1
+            + (A1.x * B1.x + A1.y * B1.y)
+            + k * (A1 - A2) * B1
+            + beta * (A1 * A1 * A1) * B1
+            + W2.t * B2
+            + (A2.x * B2.x + A2.y * B2.y)
+            + k * (A2 - A1) * B2
+            + beta * (A2 * A2 * A2) * B2
+        )
+        u10 = jno.fn(lambda x, y: jnp.sin(PI * x) * jnp.sin(PI * y), [xi0, yi0])
+        fem = jno.fem(
+            [
+                weak,
+                u1(xb, yb) - 0.0,
+                u2(xb, yb) - 0.0,
+                w1(xb, yb) - 0.0,
+                w2(xb, yb) - 0.0,
+                u1(xi0, yi0) - u10,
+                u2(xi0, yi0) - 0.0,
+                w1(xi0, yi0) - 0.0,
+                w2(xi0, yi0) - 0.0,
+            ]
+        )
+        ts = np.asarray(_block_time_grid(fem.operator))
+        fem.operator.metadata["theta"] = 0.5  # match the second-order trapezoidal default
+        Y = np.asarray(_default_transient_integrate(fem.operator, {}, ts))
+        o = fem.offsets
+        pts = np.asarray(fem.points)[: o[1]]
+        ci = int(np.argmin(np.sum((pts - 0.5) ** 2, axis=1)))
+        return ts, Y[:, o[0] : o[1]][:, ci], Y[:, o[2] : o[3]][:, ci]
+
+    ts2, u_c2, v_c2 = _center_traj_second_order()
+    ts1, u_c1, w_c1 = _center_traj_first_order()
+    assert np.allclose(ts1, ts2)
+    rel_u = np.linalg.norm(u_c2 - u_c1) / np.linalg.norm(u_c1)
+    rel_v = np.linalg.norm(v_c2 - w_c1) / np.linalg.norm(w_c1)
+    assert rel_u < 1e-4, f"coupled nonlinear u_tt vs first-order spelling: displacement rel {rel_u:.2e}"
+    assert rel_v < 1e-3, f"coupled nonlinear u_tt vs first-order spelling: velocity rel {rel_v:.2e}"
+
+
+def test_second_order_coupled_driven_boundary_matches_dense_elimination():
+    """Time-varying Dirichlet ``g(x,t)`` on a *coupled* second-order form (previously fail-loud):
+    membrane 1 is shaken at its boundary, membrane 2 follows only through the spring coupling.
+
+    Oracle: dense numpy trapezoidal on the ELIMINATED interior system — the boundary DOFs are removed
+    and enter as the exact forcing ``−K_IB g_B(t)``, an independent imposition semantics (elimination)
+    and an independent integrator (numpy), reusing only the trusted steady coupled assembly for
+    ``M``/``K``. (The explicit-velocity first-order spelling would be the natural cross-check, but the
+    coupled first-order transient silently NaNs under a time-varying Dirichlet — a separate,
+    pre-existing defect.)"""
+    k, amp, om = 20.0, 0.1, 3.0
+    t1, n_steps, h = 1.0, 60, 0.25
+
+    # ---- the path under test: coupled u_tt with g(t) on membrane 1 ----
+    d, (u1, u2), (a1, b1, a2, b2), (xb, yb), (xi0, yi0, ti0) = _coupled_membranes_domain(h, t1, n_steps, "drv")
+    tb = d.variable("boundary", split=True)[2]
+    weak = (
+        a1.tt * b1
+        + (a1.x * b1.x + a1.y * b1.y)
+        + k * (a1 - a2) * b1
+        + a2.tt * b2
+        + (a2.x * b2.x + a2.y * b2.y)
+        + k * (a2 - a1) * b2
+    )
+    g = amp * jno.np.sin(om * tb)
+    fem = jno.fem([weak, u1(xb, yb) - g, u2(xb, yb) - 0.0, u1(xi0, yi0) - 0.0, u2(xi0, yi0) - 0.0])
+    ts = np.asarray(_block_time_grid(fem.operator))
+    Y = np.asarray(_default_transient_integrate(fem.operator, {}, ts))
+    o = fem.offsets
+    n = o[2]  # total displacement DOFs (both fields)
+    pts1 = np.asarray(fem.points)[: o[1]]
+    ci = int(np.argmin(np.sum((pts1 - 0.5) ** 2, axis=1)))
+    got = Y[:, o[0] : o[1]][:, ci]
+
+    # ---- oracle: steady coupled assembly of the same M / K, then dense trapezoidal on the interior ----
+    ds = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=h)
+    s1, r1 = ds.fem_symbols(names=("oru1", "orp1"))
+    s2, r2 = ds.fem_symbols(names=("oru2", "orp2"))
+    sxi, syi, *_ = ds.variable("interior", split=True)
+    S1, R1 = s1.bind(x=sxi, y=syi), r1.bind(x=sxi, y=syi)
+    S2, R2 = s2.bind(x=sxi, y=syi), r2.bind(x=sxi, y=syi)
+    K_fem = jno.fem([(S1.x * R1.x + S1.y * R1.y) + k * (S1 - S2) * R1 + (S2.x * R2.x + S2.y * R2.y) + k * (S2 - S1) * R2])
+    M_fem = jno.fem([S1 * R1 + S2 * R2 - 1.0 * R1])  # the -1*R1 load keeps the form non-degenerate; unused
+    K_d = np.asarray(K_fem.operator[0].todense())
+    M_d = np.asarray(M_fem.operator[0].todense())
+    assert K_d.shape == (n, n) and M_d.shape == (n, n)
+    onb = np.zeros(n, dtype=bool)  # boundary mask over [u1-block; u2-block]
+    e = 1e-9
+    for lo, p in ((0, pts1), (o[1], pts1)):
+        bmask = (np.abs(p[:, 0]) < e) | (np.abs(p[:, 0] - 1) < e) | (np.abs(p[:, 1]) < e) | (np.abs(p[:, 1] - 1) < e)
+        onb[lo : lo + p.shape[0]] = bmask
+    intr, B = np.where(~onb)[0], np.where(onb)[0]
+    b1_mask = B < o[1]  # boundary DOFs of membrane 1 carry g(t); membrane 2's stay 0
+    M_II = M_d[np.ix_(intr, intr)]
+    K_II = K_d[np.ix_(intr, intr)]
+    K_IB = K_d[np.ix_(intr, B)]
+    M_IB = M_d[np.ix_(intr, B)]  # consistent mass couples the boundary ACCELERATION into the interior
+
+    def _bvals(t, scale):
+        vals = np.zeros(B.shape[0])
+        vals[b1_mask] = scale * np.sin(om * t)
+        return vals
+
+    gB = lambda t: _bvals(t, amp)  # noqa: E731
+    gBdd = lambda t: _bvals(t, -amp * om**2)  # noqa: E731  — g̈ on the driven boundary
+
+    ni = intr.shape[0]
+    J = np.block([[np.zeros((ni, ni)), np.eye(ni)], [np.linalg.solve(M_II, -K_II), np.zeros((ni, ni))]])
+
+    def c_of(t):  # inhomogeneous term of ẏ = J y + c(t): M_II ü_I = −K_II u_I − K_IB g_B − M_IB g̈_B
+        return np.concatenate([np.zeros(ni), np.linalg.solve(M_II, -K_IB @ gB(t) - M_IB @ gBdd(t))])
+
+    dt = ts[1] - ts[0]
+    y = np.zeros(2 * ni)
+    lhs = np.eye(2 * ni) - 0.5 * dt * J
+    rhs_m = np.eye(2 * ni) + 0.5 * dt * J
+    ref = [y[:ni]]
+    for m in range(1, len(ts)):
+        y = np.linalg.solve(lhs, rhs_m @ y + 0.5 * dt * (c_of(ts[m - 1]) + c_of(ts[m])))
+        ref.append(y[:ni])
+    ref = np.asarray(ref)
+    ci_int = int(np.where(intr == ci)[0][0])  # the center node is interior
+    rel = np.linalg.norm(got - ref[:, ci_int]) / np.linalg.norm(ref[:, ci_int])
+    assert rel < 0.02, f"driven coupled u_tt vs dense elimination oracle: rel {rel:.2e}"
+
+
+def test_second_order_coupled_parametric_rejected():
+    """Runtime parameters on a coupled second-order form: the parametric coupled STEADY assembly
+    underneath does not exist, so this must refuse by name (previously it surfaced a confusing
+    'coupled steady form' error from inside the u_tt build)."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.3, time=(0.0, 1.0, 10))
+    u1, p1 = d.fem_symbols(names=("pr1", "pp1"))
+    u2, p2 = d.fem_symbols(names=("pr2", "pp2"))
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi0, yi0, _ = d.variable("initial", split=True)
+    a1, b1 = u1.bind(x=xi, y=yi, t=ti), p1.bind(x=xi, y=yi, t=ti)
+    a2, b2 = u2.bind(x=xi, y=yi, t=ti), p2.bind(x=xi, y=yi, t=ti)
+    c = jno.np.parameter((1,), name="wavespeed")
+    weak = a1.tt * b1 + c * (a1.x * b1.x + a1.y * b1.y) + a2.tt * b2 + (a2.x * b2.x + a2.y * b2.y)
+    with pytest.raises(NotImplementedError, match="COUPLED second-order"):
+        jno.fem([weak, u1(xb, yb) - 0.0, u2(xb, yb) - 0.0, u1(xi0, yi0) - 0.0, u2(xi0, yi0) - 0.0])
+
+
+def test_second_order_coupled_field_without_mass_rejected():
+    """A coupled field with NO temporal term at all (algebraic): its velocity rows would be silently
+    singular under the augmented formula — must refuse by name, not solve garbage."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.3, time=(0.0, 1.0, 10))
+    u1, p1 = d.fem_symbols(names=("al1", "ap1"))
+    u2, p2 = d.fem_symbols(names=("al2", "ap2"))
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi0, yi0, _ = d.variable("initial", split=True)
+    a1, b1 = u1.bind(x=xi, y=yi, t=ti), p1.bind(x=xi, y=yi, t=ti)
+    a2, b2 = u2.bind(x=xi, y=yi, t=ti), p2.bind(x=xi, y=yi, t=ti)
+    weak = a1.tt * b1 + (a1.x * b1.x + a1.y * b1.y) + (a2.x * b2.x + a2.y * b2.y) + (a1 - a2) * b2
+    with pytest.raises(NotImplementedError, match="u_tt mass term"):
+        jno.fem([weak, u1(xb, yb) - 0.0, u2(xb, yb) - 0.0, u1(xi0, yi0) - 0.0])
+
+
+def test_second_order_complex_coefficient_rejected():
+    """A COMPLEX coefficient on a u_tt form used to be silently CAST TO REAL — the march ran, the
+    trajectory came back real, and only a bare numpy ComplexWarning hinted the imaginary part of the
+    operator was gone. It must refuse by name (the 1D and non-nodal complex branches already do)."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.3, time=(0.0, 0.1, 9))
+    u, phi = d.fem_symbols(names=("cxso", "cxsop"))
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi0, yi0, _ = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    ic = jno.fn(lambda x, y: jnp.sin(PI * x) * jnp.sin(PI * y), [xi0, yi0])
+    weak = ui.tt * vi + (1.0 + 0.3j) * (ui.x * vi.x + ui.y * vi.y)
+    with pytest.raises(NotImplementedError, match="COMPLEX coefficient on a second-order"):
+        jno.fem([weak, u(xi0, yi0) - ic, u(xb, yb) - 0.0])
 
 
 def test_second_order_mixed_order_multifield_rejected():

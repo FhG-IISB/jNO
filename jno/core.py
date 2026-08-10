@@ -51,6 +51,7 @@ from .trace import (
     collect_tags,
     cse,
     dump_tree,
+    fuse_laplacian,
     get_primary_tag,
 )
 from .trace_compiler import TraceCompiler
@@ -1670,6 +1671,11 @@ class core:
 
         # === CSE: deduplicate shared sub-expressions ===
         constraints = [cse(c) for c in constraints]
+        # === Fuse Σᵢ ∂²u/∂xᵢ² into one Laplacian node ===
+        # Runs after CSE so structurally identical targets are already a single
+        # object and the per-coordinate terms can be matched by identity; the
+        # second CSE re-shares whatever the rewrite introduced.
+        constraints = [cse(fuse_laplacian(c)) for c in constraints]
         self.all_ops = self.collect_unique_operations(constraints)
 
         # === Prepare domain data ===
@@ -4821,8 +4827,8 @@ class core:
     def sweep(
         self,
         space: ArchSpace,
-        optimizer: Union[str, type],
-        budget: int,
+        optimizer: Union[str, type, None] = None,
+        budget: int = 0,
         devices: Union[None, int, str, List[int], DeviceConfig] = None,
     ) -> "statistics":
         """Run architecture and hyperparameter search with optional parallelism.
@@ -5012,7 +5018,10 @@ class core:
             if op_entry is None:
                 self._eval_cache[op] = op_entry = {}
             if min_consecutive not in op_entry:
-                raw_fn = TraceCompiler.compile_traced_expression(op, self.all_ops)
+                # Same rewrite the training path gets, so an expression evaluated here
+                # costs what it costs inside the loss. The cache stays keyed on the
+                # caller's original object.
+                raw_fn = TraceCompiler.compile_traced_expression(cse(fuse_laplacian(op)), self.all_ops)
                 # Bake min_consecutive into the closure — it controls array shapes
                 # inside the compiled function and must remain a static Python int
                 # for XLA to reuse the compiled kernel across calls.

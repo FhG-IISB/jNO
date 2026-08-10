@@ -279,7 +279,21 @@ def adaptive_march(
     save = jnp.asarray(save_ts, rt)
     out = jax.vmap(lambda col: _safe_interp(save, ts, col), in_axes=1, out_axes=1)(us)
     reached = t_end >= t1 - 2.0 * dt_min  # the last real step lands within dt_min of t1 (see ``done``)
-    return jnp.where(reached, out, jnp.asarray(jnp.nan, out.dtype))  # fail loud if max_steps was too small
+    # Fail loud if max_steps was too small -- and fail loud in the ADJOINT too. ``where(reached, out, nan)``
+    # would poison only the value: the VJP of ``where`` w.r.t. its taken branch is ``where(c, g, 0)``, so an
+    # unreached march returns a NaN trajectory whose gradient is exactly **zero**. An inverse problem reads
+    # the gradient, not the value, and a plausible zero reads as "converged" -- the budget being too small
+    # would look like a converged optimisation. Multiplying instead carries the NaN into the cotangent
+    # (``d(out·c)/d(out) = c``), so the failure survives differentiation. Exact no-op when reached: the
+    # factor is 1.0 in both the primal and the adjoint.
+    #
+    # KNOWN GAP: this fixes the poison at *this* site only. Something further down the transient adjoint
+    # still scrubs a NaN cotangent -- an unconditional ``out * nan`` here yields a NaN trajectory with a
+    # *finite* parameter gradient, while the same construction over a plain ``lax.scan`` propagates NaN
+    # correctly. Until that is located, a starved budget is loud in the value and unreliable in the
+    # gradient: CHECK THE VALUE. See plans/adaptive-api-and-differentiability.md, stage 1.
+    poison = jnp.where(reached, jnp.asarray(1.0, rt), jnp.asarray(jnp.nan, rt))
+    return out * poison
 
 
 def _exponential_integrate(block, args, save_ts, *, order, mass, symmetric):

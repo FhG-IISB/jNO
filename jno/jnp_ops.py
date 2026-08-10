@@ -79,7 +79,17 @@ def _guard(target, scheme: str = "automatic_differentiation") -> None:
     """Functional-API mirror of ``Placeholder``'s method-level guard: block an
     automatic-differentiation differential operator over a FieldView
     finite-difference partial (which would silently return 0).
+
+    Also catches the coordinates being passed positionally — the functional
+    operators take the variables as a *list*, so ``laplacian(u, x, y)`` lands ``y``
+    in the ``scheme`` slot and would otherwise fail much later inside the compiler
+    with an unrelated ``AttributeError``.
     """
+    if not isinstance(scheme, str):
+        raise TypeError(
+            f"scheme must be a string, got {type(scheme).__name__}. The functional operators take the "
+            f"coordinates as one list — write laplacian(u, [x, y]), or use the method form u.laplacian(x, y)."
+        )
     _guard_ad_on_fd(_u(target), scheme)
 
 
@@ -335,11 +345,18 @@ def concat(items, axis: int = -1) -> FunctionCall:
                 a = a[..., jnp.newaxis]
             expanded.append(a)
 
+        # A SINGLE operand needs no concatenation at all — and must not fall through to the
+        # rank-alignment fallback below, which is written for two or more. It becomes reachable on a
+        # **1D** domain, where `canonicalize_grad_coeff` stacks one component per dimension: with
+        # dim=1 that is a one-item stack, and the fallback then re-entered trace-node construction
+        # inside the evaluator, so a 1D VPINN never finished assembling its loss.
+        if len(expanded) == 1:
+            return expanded[0]
+
         # Fast path when shapes already match on non-concatenation dims.
-        if len(expanded) > 1:
-            ref = expanded[0].shape[:-1]
-            if all(a.shape[:-1] == ref for a in expanded[1:]):
-                return jnp.concatenate(expanded, axis=-1)
+        ref = expanded[0].shape[:-1]
+        if all(a.shape[:-1] == ref for a in expanded[1:]):
+            return jnp.concatenate(expanded, axis=-1)
 
         # Fallback: align ranks and only broadcast singleton dimensions.
         max_ndim = max(a.ndim for a in expanded)

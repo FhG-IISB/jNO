@@ -627,3 +627,32 @@ def test_n1e_parametric_transient_operator_fn_is_sparse_and_differentiable():
     np.testing.assert_allclose(_dense(A2), 2.0 * M, atol=1e-10)  # A(a) = a·M
     g = jax.grad(lambda av: fem.operator.operator_fn(fem.t0, {"a": av}).todense().sum())(2.0)  # differentiable in a
     assert np.isfinite(g) and abs(g - M.sum()) < 1e-8  # dA/da = M (through the sparse per-element assembly)
+
+
+@pytest.mark.parametrize(
+    "space, value_shape",
+    [("N1E", (2,)), ("RT", (2,)), ("Morley", ()), ("Argyris", ()), ("Hermite", ())],
+)
+def test_nonnodal_order_is_intrinsic_and_a_request_fails_loud(space, value_shape):
+    """``order=`` is a nodal-Lagrange knob. Every non-nodal family's order is fixed by the element
+    definition and was never plumbed, so ``space="N1E", order=2`` silently returned the SAME
+    lowest-order space (measured: an identical 179-DOF operator) — the worst failure shape for a wave
+    problem, where the user is explicitly paying for accuracy. It must refuse by name."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.4)
+    u, v = d.fem_symbols(space=space, value_shape=value_shape, order=2)
+    xi, yi, *_ = d.variable("interior", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    form = jno.np.inner(ui, vi) if value_shape else ui * vi
+    with pytest.raises(NotImplementedError, match=r"order=2 is not selectable"):
+        jno.fem([form - (jno.np.inner(jno.np.vector(1.0, 0.0), vi) if value_shape else 1.0 * vi)])
+
+
+def test_nonnodal_default_order_still_builds():
+    """The guard must not fire on the normal spelling — the default order with a non-nodal family is
+    how every one of these elements is used."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.4)
+    u, v = d.fem_symbols(space="N1E", value_shape=(2,))
+    xi, yi, *_ = d.variable("interior", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    fem = jno.fem([jno.np.inner(ui, vi) - jno.np.inner(jno.np.vector(1.0, 0.0), vi)])
+    assert int(fem.operator[0].shape[0]) > 0

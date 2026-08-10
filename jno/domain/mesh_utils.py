@@ -268,7 +268,23 @@ class MeshUtils:
         if "tetra" in mesh.cells_dict:
             bfaces, bapex = MeshUtils._boundary_faces_with_apex(mesh.cells_dict["tetra"])
             return MeshUtils._compute_normals_from_boundary_faces(points, bfaces, apex_points=points[bapex])
-        elif "triangle" in mesh.cells_dict:
+        if "triangle" in mesh.cells_dict:
+            # 2-D gets the SAME apex orientation 3-D has had: a boundary edge belongs to exactly one
+            # triangle, so "outward" is "away from that triangle's opposite vertex" -- exact for any
+            # geometry, concave included. It used to fall through to the k-NN PCA fit below. Measured on
+            # an annulus (32 boundary vertices), ``n·r̂`` where outward is -1 on the inner ring and +1 on
+            # the outer:
+            #
+            #     PCA fit    inner -0.34591 .. +0.31098      outer +0.87748 .. +1.00000
+            #     apex       inner -1.00000 .. -1.00000      outer +1.00000 .. +1.00000
+            #
+            # i.e. on the concave ring it was not merely mis-oriented but scattered across zero -- some
+            # normals pointing each way, none of them radial. The 3-D branch's docstring already called
+            # the centroid/PCA family "valid only for convex / star-shaped domains"; 2-D simply never got
+            # the exact path.
+            bedges, bapex = MeshUtils._boundary_edges_with_apex(mesh.cells_dict["triangle"])
+            if len(bedges):
+                return MeshUtils._compute_edge_normals_2d(points, bedges, points[bapex])
             boundary_elements = MeshUtils._get_boundary_elements(mesh.cells_dict["triangle"], "triangle")
             actual_dim = 2
         else:
@@ -276,6 +292,47 @@ class MeshUtils:
 
         boundary_indices = np.unique(boundary_elements)
         return MeshUtils._compute_normals_pca(points, boundary_indices, actual_dim, k, mesh=mesh)
+
+    @staticmethod
+    def _boundary_edges_with_apex(triangle_cells):
+        """Boundary edges of a triangle mesh, each with the apex of its owning element.
+
+        The 2-D twin of :meth:`_boundary_faces_with_apex`. ``_LOCAL_FACES_TRI[k]`` already stores the
+        opposite vertex as its 3rd entry, so the apex follows from the local face index with no search,
+        and ``_boundary_faces`` is the same cached sort+unique the assembler runs.
+        """
+        from ..utils.solver.fem_facets import _LOCAL_FACES_TRI, _boundary_faces
+
+        cells = np.asarray(triangle_cells, dtype=np.int64)
+        flat, sel, n_local = _boundary_faces(cells, _LOCAL_FACES_TRI, 2)
+        parent_cell, local_face = sel // n_local, sel % n_local
+        apex_local = np.asarray([entry[2] for entry in _LOCAL_FACES_TRI], dtype=np.int64)
+        return flat[sel], cells[parent_cell, apex_local[local_face]]
+
+    @staticmethod
+    def _compute_edge_normals_2d(points, boundary_edges, apex_points):
+        """Per-vertex outward normals for a 2-D boundary, oriented away from each edge's apex.
+
+        Returns ``(normals, boundary_indices)`` to match :meth:`_compute_normals_from_boundary_faces` and
+        :meth:`_compute_normals_pca`. Edge normals are accumulated at their two endpoints **unnormalised**,
+        so the average is length-weighted exactly as the 3-D path is area-weighted, then normalised once.
+        """
+        pts = np.asarray(points, dtype=np.float64)[:, :2]
+        e = np.asarray(boundary_edges, dtype=np.int64)
+        p0, p1 = pts[e[:, 0]], pts[e[:, 1]]
+        t = p1 - p0
+        n = np.stack([t[:, 1], -t[:, 0]], axis=1)  # rotate the tangent 90 degrees
+        flip = np.einsum("ij,ij->i", n, 0.5 * (p0 + p1) - np.asarray(apex_points, dtype=np.float64)[:, :2]) < 0.0
+        n = np.where(flip[:, None], -n, n)
+
+        acc = np.zeros_like(pts)
+        for c in range(2):
+            # ``e.ravel()`` interleaves per edge -- (e0a, e0b, e1a, e1b, ...) -- so the weights must
+            # ``repeat`` (each edge's normal twice, adjacent), not ``tile``.
+            acc[:, c] = np.bincount(e.ravel(), weights=np.repeat(n[:, c], 2), minlength=len(pts))
+        idx = np.unique(e)
+        out = acc[idx]
+        return out / (np.linalg.norm(out, axis=1, keepdims=True) + 1e-20), idx
 
     @staticmethod
     def _boundary_faces_with_apex(tetra_cells):

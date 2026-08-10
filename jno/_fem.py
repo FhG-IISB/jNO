@@ -49,6 +49,7 @@ from .trace import (
     TestFunction,
     TrialFunction,
     Variable,
+    mesh_velocity,
     state_updates,
 )
 
@@ -442,18 +443,18 @@ def _native_lagrange_ok(domain: Any, constraints: List[Any], weak_bares: List[An
 def _element_for(dimension: int, order: int) -> str:
     """Simplex element-type label for a ``(dimension, order)`` pair (2D/3D simplex, any order >= 1).
 
-    Legacy names ``TRI3``/``TRI6``/``TET4``/``TET10`` for orders 1-2; a generic ``TRI-P{k}`` / ``TET-P{k}``
-    for higher order. The native Lagrange assembler keys off the integer ``order`` (the basis and the
+    Legacy names ``TRI3``/``TRI6``/``TET4``/``TET10`` for orders 1-2; a generic
+    ``INT-P{k}`` / ``TRI-P{k}`` / ``TET-P{k}`` for every other case. The native Lagrange assembler keys off the integer ``order`` (the basis and the
     promoted P{k} node mesh both come from the same basix element), not this string -- the label is only
     consumed by the VPINN context builder."""
     key = (int(dimension), int(order))
     if key in _ELEMENT_FOR:
         return _ELEMENT_FOR[key]
-    if int(dimension) in (2, 3) and int(order) >= 1:
-        return f"{'TRI' if int(dimension) == 2 else 'TET'}-P{int(order)}"
+    if int(dimension) in (1, 2, 3) and int(order) >= 1:
+        return f"{ {1: 'INT', 2: 'TRI'}.get(int(dimension), 'TET') }-P{int(order)}"
     raise ValueError(
         f"jno.fem: no built-in element for dimension {dimension}, order {order} "
-        "(supported: 2D/3D simplex at order >= 1; pass element_type=... to override)."
+        "(supported: 1D/2D/3D simplex at order >= 1; pass element_type=... to override)."
     )
 
 
@@ -894,120 +895,53 @@ def _complex_operator(A_r: Any, A_i: Any) -> Any:
 
 def _solve_complex_block(
     ops: Any,
-    solve_fn: Optional[Callable] = None,
     periodic: Optional[dict] = None,
     complex_solve: Optional[Callable] = None,
-    from_slots: bool = False,
 ) -> Any:
-    """Solve a complex linear FEM system via the real-equivalent block (everything was
-    assembled as two *real* systems)::
+    """Solve a complex linear FEM system on its COMPLEX operator ``A_c = A_r + i·A_i`` — the
+    **complex-native** path.
 
-        [[A_r, -A_i], [A_i, A_r]] [u_r; u_i] = [b_r; b_i],     u = u_r + i u_i.
+    Every ordinary complex solve runs on the fused real-equivalent ``2n`` block (see
+    :func:`_fuse_complex_steady`); the one consumer that genuinely wants ``A_c`` itself is a
+    complex-native preconditioner (``precond=`` with ``complex_native=True``, i.e. AMS), whose
+    multigrid coarsens the complex-symmetric operator but diverges on the skew-dominated ``2n``
+    block. ``ops = (op_r, op_i)`` are the retained Re/Im legs (each a raw ``(A, b)`` or a parametric
+    :class:`FemLinearSystem`); a parametric leg makes this return a differentiable
+    :class:`FunctionCall` node that re-forms and re-solves per call.
 
-    ``ops = (op_r, op_i)`` are the Re-coeff and Im-coeff real systems (each a raw ``(A, b)``).
-
-    The real-equivalent block is itself **sparse** -- ``[[A_r,-A_i],[A_i,A_r]]`` is four sparse
-    sub-blocks -- so by default it is assembled as one BCOO (concatenating the triplets at the right
-    ``n`` offsets) and solved with the same sparse-direct path the real solves use, never densifying
-    (memory ``O(nnz)``; robust on the indefinite Helmholtz block). Pass ``solve_fn=(A, b) -> u`` to
-    use a dense/direct solver instead -- it receives the densified block.
-
-    Each leg is a raw ``(A, b)`` (forward solve) or a parametric :class:`FemLinearSystem` (the complex
-    *inverse*): when either leg is parametric this returns a differentiable :class:`FunctionCall` trace
-    node instead of an array, so a real ``jno.np.parameter`` recovered through a complex forward solve
-    trains through ``crux`` -- the same real-equivalent block, with ``A(θ), b(θ)`` re-formed and the
-    block re-solved on each call.
-
-    A periodic tie reduces *both* legs by the **same** prolongation ``P`` -- Re and Im live on one FE
-    space, so one ``P`` -- before the block is formed: ``A -> P^T A P``, ``b -> P^T b`` on each leg.
-    Because the same ``P`` hits both, ``blkdiag(P, P)^T [[A_r,-A_i],[A_i,A_r]] blkdiag(P, P)`` preserves
-    the real-equivalent structure exactly; the reduced complex solution is prolonged back ``u = P u_red``."""
+    A periodic tie reduces the legs BEFORE the complex operator is formed, with the Hermitian
+    ``P^H · P`` — identical to ``Pᵀ · P`` for a real ``P``, and the reduction the quasi-periodic
+    space requires for a Bloch (complex) ``P``. The reduced complex solution is prolonged back with
+    the same ``P``: directly when ``P`` is complex, per real/imag half when ``P`` is real (a direct
+    prolong would cast to ``P``'s real dtype and silently drop the imaginary part)."""
     from .trace import FemLinearSystem, FunctionCall
     from .utils.solver.fem_utils import prolong_periodic, reduce_matrix_periodic, reduce_vector_periodic
 
-    bloch = bool(periodic is not None and periodic.get("is_bloch", False))
+    if complex_solve is None:
+        raise ValueError(
+            "jno.fem internal: _solve_complex_block is the complex-native (AMS) path and requires "
+            "complex_solve; every other complex solve runs on the fused real-equivalent block."
+        )
 
-    def _ab(op, args, conj=False):
+    def _ab(op, args):
         A, b = op.evaluate(args) if isinstance(op, FemLinearSystem) else op
         b = jnp.asarray(b).reshape(-1)
         if periodic is not None:
-            A = reduce_matrix_periodic(periodic, A, conj=conj)  # P^T A P (P^H when Bloch); stays sparse
-            b = reduce_vector_periodic(periodic, b, conj=conj)  # P^T b (P^H when Bloch)
+            A = reduce_matrix_periodic(periodic, A, conj=True)  # P^H A P (= P^T A P for a real P)
+            b = reduce_vector_periodic(periodic, b, conj=True)
         return A, b  # keep A sparse (BCOO) -- do NOT densify
 
-    def _bloch_solve(args):
-        # Bloch/quasi-periodic: P is complex, so the reduced operator A_c = P^H (A_r + i A_i) P mixes
-        # Re/Im and cannot be split into independent legs. Reduce Hermitian, form the complex reduced
-        # operator, solve, and prolong with the complex P.
-        (A_r, b_r), (A_i, b_i) = _ab(ops[0], args, conj=True), _ab(ops[1], args, conj=True)
-        b_c = jnp.asarray(b_r) + 1j * jnp.asarray(b_i)
-        n = b_c.shape[0]
-        if hasattr(A_r, "indices") and hasattr(A_i, "indices"):
-            # Stay SPARSE. `reduce_matrix_periodic` already keeps the reduction sparse, so densifying here
-            # just to call `jnp.linalg.solve` reintroduced the O(n²) peak it exists to avoid — tolerable for
-            # a small reduced cell, ruinous for a 3-D metasurface unit cell. Both reduced legs are
-            # themselves COMPLEX (P^H is complex even for a real leg), so fuse them into A_c = A_r + i·A_i
-            # over the concatenated index set, split into Re/Im parts sharing that index set, and
-            # sparse-direct-solve the real-equivalent 2n block. Repeated (i, j) entries from the
-            # concatenation are merged by `sparse_lu_solve`'s `sum_duplicates`.
-            from jax.experimental import sparse as jsp
-
-            from .utils.solver.linear import sparse_lu_solve
-
-            idx = jnp.concatenate([A_r.indices, A_i.indices], axis=0)
-            dat = jnp.concatenate([jnp.asarray(A_r.data), 1j * jnp.asarray(A_i.data)])
-            re = jsp.BCOO((jnp.real(dat), idx), shape=(n, n))
-            im = jsp.BCOO((jnp.imag(dat), idx), shape=(n, n))
-            sol = sparse_lu_solve(_complex_block_bcoo(re, im, n), jnp.concatenate([jnp.real(b_c), jnp.imag(b_c)]))
-            u_red = sol[:n] + 1j * sol[n:]
-        else:  # dense fallback (1-D, or already-dense legs)
-            to_d = lambda M: jnp.asarray(M.todense() if hasattr(M, "todense") else M)  # noqa: E731
-            u_red = jnp.linalg.solve(to_d(A_r) + 1j * to_d(A_i), b_c)
-        return prolong_periodic(periodic, u_red)
-
     def _block_solve(args):
-        if bloch:
-            return _bloch_solve(args)
         (A_r, b_r), (A_i, b_i) = _ab(ops[0], args), _ab(ops[1], args)
-        n = b_r.shape[0]
-
-        if complex_solve is not None:
-            # Slot-composed iterative path (linear=/precond=): solve the COMPLEX system directly on the
-            # sparse operator A_r + i·A_i (never the dense 2n block), e.g. gmres + jno.precond.ams.
-            A_c = _complex_operator(A_r, A_i)
-            u = complex_solve(A_c, b_r + 1j * b_i)
-            return (
-                u
-                if periodic is None
-                else prolong_periodic(periodic, jnp.real(u)) + 1j * prolong_periodic(periodic, jnp.imag(u))
-            )
-
-        rhs = jnp.concatenate([b_r, b_i])
-        is_sparse = hasattr(A_r, "indices") and hasattr(A_i, "indices")
-
-        if solve_fn is not None and is_sparse:
-            # ANY solver -- yours or a slot-composed one -- gets the SPARSE 2n BCOO block
-            # [[A_r,-A_i],[A_i,A_r]] rather than a densified copy. Keeps it O(nnz), and it lets the
-            # composed solver's extreme-magnitude normalization fire (a dense block has no `.bcoo`, so
-            # a mass-dominated eddy system would otherwise stall the Krylov Arnoldi at real scale).
-            sol = jnp.asarray(solve_fn(_complex_block_bcoo(A_r, A_i, n), rhs))
-        elif solve_fn is not None:  # dense legs (vertex C1 families): nothing to keep sparse
-            Ar_d = jnp.asarray(A_r.todense() if hasattr(A_r, "todense") else A_r)
-            Ai_d = jnp.asarray(A_i.todense() if hasattr(A_i, "todense") else A_i)
-            sol = jnp.asarray(solve_fn(jnp.block([[Ar_d, -Ai_d], [Ai_d, Ar_d]]), rhs))
-        elif is_sparse:
-            from .utils.solver.linear import sparse_lu_solve
-
-            sol = sparse_lu_solve(_complex_block_bcoo(A_r, A_i, n), rhs)  # sparse-direct on the 2n block
-        else:
-            Ar_d, Ai_d = jnp.asarray(A_r), jnp.asarray(A_i)  # dense fallback (e.g. 1D / already dense)
-            sol = jnp.linalg.solve(jnp.block([[Ar_d, -Ai_d], [Ai_d, Ar_d]]), rhs)
-
+        # For a Bloch tie the Hermitian-reduced legs are each already complex; A_r + i·A_i is still the
+        # reduced complex operator (P^H A_r P + i·P^H A_i P), so the same fuse serves both cases.
+        A_c = _complex_operator(A_r, A_i)
+        u = complex_solve(A_c, b_r + 1j * b_i)
         if periodic is None:
-            return sol[:n] + 1j * sol[n:]
-        # Prolong the real and imaginary reduced halves *separately* (real P @ real vector); prolonging
-        # the complex vector directly would cast it to P's real dtype and silently drop the imaginary part.
-        return prolong_periodic(periodic, sol[:n]) + 1j * prolong_periodic(periodic, sol[n:])
+            return u
+        if periodic.get("is_bloch"):
+            return prolong_periodic(periodic, u)  # complex P prolongs the complex solution directly
+        return prolong_periodic(periodic, jnp.real(u)) + 1j * prolong_periodic(periodic, jnp.imag(u))
 
     # Forward (non-parametric): solve eagerly. Inverse: one or both legs are a parametric FemLinearSystem
     # -> return a trace node over the union of their runtime parameters so ∂u/∂θ flows through crux.
@@ -1203,6 +1137,7 @@ class FEM:
         self._term_source = None  # (domain, volume_terms); attached by fem() for the provisional term_kinds accessor
         self._constraints = None  # original constraint list; attached by fem() for the adaptive driver
         self._fem_kwargs = {}  # original fem() build options; attached by fem() for the adaptive driver
+        self._geometry = []  # `coord.d(t) - v` mesh-motion terms; attached by fem()
 
         self._A = self._b = None
         if mode == "linear":
@@ -1227,11 +1162,11 @@ class FEM:
     def is_complex(self) -> bool:
         """A complex-valued problem (steady or transient), solved via the real-equivalent block.
 
-        Both steady and transient complex problems are fused into one real 2n system at assembly, so
-        they are ordinary ``"linear"`` / ``"transient"`` modes: a steady one announces itself through
-        ``_complex_n`` (the half size), a transient one through its block's ``metadata["complex"]``.
-        The surviving ``"complex"`` mode is the **Bloch** case alone, whose complex prolongation does
-        not split into two real legs."""
+        Both steady and transient complex problems — Bloch included — are fused into one real 2n
+        system at assembly, so they are ordinary ``"linear"`` / ``"transient"`` modes: a steady one
+        announces itself through ``_complex_n`` (the half size), a transient one through its block's
+        ``metadata["complex"]``. ``"complex"`` survives only as the internal pre-fusion tag the
+        assembly hands to :func:`_fuse_complex_steady`; no finalized ``FEM`` carries it."""
         if self._mode == "complex" or self._complex_n is not None:
             return True
         return bool((getattr(self._op, "metadata", None) or {}).get("complex"))
@@ -1314,7 +1249,6 @@ class FEM:
         solve_fn=None,
         *,
         adapt=None,
-        move=None,
         x0=None,
         nonlinear=None,
         linear=None,
@@ -1327,21 +1261,22 @@ class FEM:
     ) -> Any:
         """Differentiable forward solve as a trace node — the inverse-problem entry.
 
-        Pass ``adapt=AdaptSpec(...)`` to run the **adaptive** loop
+        Pass ``adapt=jno.solve.remesh(...)`` to run the **adaptive** loop
         (``solve -> estimate -> mark -> refine``): the domain is remeshed in place to
         equidistribute a Zienkiewicz–Zhu error estimate, and this returns the solution
         on the final adapted mesh. After it returns, this ``FEM`` and its ``domain`` refer
         to that final mesh, and ``fem.adapt_history`` records the per-round trace. The
         refinement step is non-differentiable (discrete remeshing); gradients are exact on
         the frozen final mesh, so a differentiable inverse problem is run *after* adapting.
-        See :class:`jno.utils.solver.fem_adapt.AdaptSpec`.
+        See :func:`jno.solve.remesh` for h-adaptivity and :func:`jno.solve.relocate` for the
+        fixed-connectivity (r-adaptive) alternative, whose vertex map is differentiable in the monitor
+        and needs no cross-mesh transfer.
 
-        Pass ``move=MovingBoundary(velocity=...)`` on a **transient** problem to run the
-        **moving-boundary** loop: the domain boundary moves each step by the prescribed velocity, the
-        mesh deforms to follow it (harmonic interior extension), and the state is carried across each
-        move — for free-surface / deforming-domain physics. Returns an ``AdaptiveTrajectory`` (each frame
-        on its own moved mesh). See :class:`jno.utils.solver.fem_adapt.MovingBoundary` for the method and
-        its scope (operator-split ALE; scalar-P1, real, prescribed velocity for now).
+        A **moving mesh** is not a solve argument: put a geometry term ``coord.d(t) - velocity`` in the
+        ``jno.fem([...])`` list and the mesh moves as it says. Returns an ``AdaptiveTrajectory`` (each
+        frame on its own moved mesh). See :func:`jno.trace.mesh_velocity` for what makes a term a geometry
+        term and :func:`jno.utils.solver.fem_adapt.run_mesh_motion` for the method and its scope
+        (operator-split ALE; scalar-P1, real).
 
         Delegates to :meth:`FemLinearSystem.solve` (steady linear),
         :meth:`FemResidualOperator.solve` (steady nonlinear), or
@@ -1451,7 +1386,7 @@ class FEM:
         # Cleared on EVERY solve, not only a reduced one: a leftover value from an earlier
         # ``basis=`` call would read as "this answer was certified" on an answer that never was.
         self.basis_residual = None
-        reduction = None if basis is None else self._basis_reduction(basis, adapt=adapt, move=move)
+        reduction = None if basis is None else self._basis_reduction(basis, adapt=adapt)
 
         def _run():
             prev_periodic, prev_op = self._periodic, self._op
@@ -1468,7 +1403,6 @@ class FEM:
                 result = self._solve_dispatch(
                     solve_fn,
                     adapt=adapt,
-                    move=move,
                     x0=x0,
                     nonlinear=nonlinear,
                     linear=linear,
@@ -1486,6 +1420,9 @@ class FEM:
                 # Tag the solve node with its domain so jno.core can infer the domain straight from the graph
                 # (a data-misfit inverse `jno.core([(fem.solve() - u_obs).mse])` needs no explicit `domain=`).
                 result._domain = self.domain
+                # ... and with its FEM, so orchestration (the tune `sequence` axis) can find the operator
+                # behind a constraint without a side channel. Lazy nodes only: a concrete array needs none.
+                result._fem_ref = self
             return result
 
         if not profile:  # profile=True: run the (eager) solve inside a JAX Perfetto trace + print a summary
@@ -1499,10 +1436,10 @@ class FEM:
     #: merely resolving it coarsely — which is the legitimate use of a reduced basis.
     BASIS_RESIDUAL_LIMIT = 0.1
 
-    def _basis_reduction(self, basis, *, adapt=None, move=None):
+    def _basis_reduction(self, basis, *, adapt=None):
         """Validate ``basis=`` against this problem and wrap it as a reduction dict."""
-        if adapt is not None or move is not None:
-            which = "adapt=" if adapt is not None else "move="
+        if adapt is not None:
+            which = "adapt="
             raise NotImplementedError(
                 f"jno.fem: fem.solve(basis=..., {which}...) is not supported — {which} rebuilds or moves "
                 "the mesh, so the DOF count and layout the basis was built against change underneath it. "
@@ -1612,7 +1549,6 @@ class FEM:
         solve_fn=None,
         *,
         adapt=None,
-        move=None,
         x0=None,
         nonlinear=None,
         linear=None,
@@ -1629,21 +1565,24 @@ class FEM:
             or (precond is not None)
             or (time is not None)
         )
-        if move is not None:
+        if getattr(self, "_geometry", None):
+            # A geometry term (`coord.d(t) - velocity`) states that the mesh moves. Its driver owns the
+            # march, so it cannot share the call with anything else that also owns it.
             if adapt is not None or has_slots:
                 raise NotImplementedError(
-                    "fem.solve(move=...) does not compose with adapt= or the solver slots "
-                    "(x0/nonlinear/linear/precond/time) yet — the moving-boundary driver owns the march and "
-                    "re-assembles each move. Use move= on its own (default θ-stepper)."
+                    "jno.fem: a geometry term (`coord.d(t) - velocity`) does not compose with adapt= or "
+                    "the solver slots (x0/nonlinear/linear/precond/time) yet — the mesh-motion driver owns the "
+                    "march and re-assembles each step. Solve with the geometry term alone (default θ-stepper)."
                 )
             if self._mode != "transient":
                 raise NotImplementedError(
-                    f"fem.solve(move=...) needs a transient problem (a u.t term); this FEM is '{self._mode}'. "
-                    "A moving boundary evolves in time — add the time derivative and a domain time grid."
+                    f"jno.fem: a geometry term needs a transient problem (a u.t term); this FEM is "
+                    f"'{self._mode}'. `coord.d(t) - velocity` moves the mesh *in time* — add the time "
+                    "derivative and a domain time grid, or drop the geometry term."
                 )
-            from .utils.solver.fem_adapt import run_moving_boundary
+            from .utils.solver.fem_adapt import run_mesh_motion
 
-            return run_moving_boundary(self, move, solve_fn=solve_fn, **kwargs)
+            return run_mesh_motion(self, solve_fn=solve_fn, **kwargs)
         if adapt is not None:
             if getattr(adapt, "relocate", False):
                 # r-adaptivity: relocate the .trainable() vertices (fixed connectivity), not h-refinement.
@@ -1664,19 +1603,12 @@ class FEM:
             from .utils.solver.fem_adapt import run_adaptive_solve, run_adaptive_transient
 
             if self._mode == "transient":
-                if self.is_complex:
-                    # A complex transient is now an ordinary transient block, so it *routes* here — but the
-                    # adaptive driver's cross-remesh state transfer interpolates a real nodal field, and this
-                    # block's state is the stacked ``[u_r; u_i]`` pair on one mesh. Transferring it needs the
-                    # two halves carried separately. Fail loud rather than interpolate half a complex field.
-                    raise NotImplementedError(
-                        "jno.fem: fem.solve(adapt=...) on a complex *transient* problem is not supported yet — "
-                        "the adaptive state transfer is not complex-aware (the block state is the stacked "
-                        "[Re; Im] pair). A complex *steady* problem adapts, and a real transient adapts."
-                    )
                 # Adapt the mesh AS the problem marches: remesh every `adapt.every` steps and carry the
-                # state across (basis-aware transfer), tracking a moving feature. The nonlinear=/linear=/
-                # precond= slots configure the per-step (Newton / theta) solve. Returns an AdaptiveTrajectory.
+                # state across (basis-aware transfer), tracking a moving feature. A fused COMPLEX
+                # transient rides the same driver: the stacked ``[u_r; u_i]`` halves transfer as a
+                # doubled field layout, the modulus drives the metric, and each saved frame recombines
+                # to the complex field. The nonlinear=/linear=/precond= slots configure the per-step
+                # (Newton / theta) solve. Returns an AdaptiveTrajectory.
                 return run_adaptive_transient(
                     self, adapt, solve_fn=solve_fn, nonlinear=nonlinear, linear=linear, precond=precond, **kwargs
                 )
@@ -1725,12 +1657,6 @@ class FEM:
             # directly, never the real-equivalent block — so it wants the Re/Im legs the fusion retained,
             # not the fused 2n system. Real-equivalent preconditioners (form/jacobi/…) stay on the block.
             return _solve_complex_block(self._complex_legs, periodic=self._periodic, complex_solve=solve_fn)
-        if self._mode == "complex":
-            # Bloch only (a complex prolongation does not split into two real legs; everything else was
-            # fused into a real 2n system at assembly by `_fuse_complex_steady`).
-            if from_slots and getattr(precond, "complex_native", False):
-                return _solve_complex_block(self._op, periodic=self._periodic, complex_solve=solve_fn)
-            return _solve_complex_block(self._op, solve_fn, periodic=self._periodic, from_slots=from_slots)
         if self._mode == "linear" and not isinstance(self._op, FemLinearSystem):
             # Non-parametric steady linear. Default: matrix-free Jacobi-preconditioned BiCGStab on the
             # BCOO operator (never densifies -> memory O(nnz); GPU-safe; solves general systems). Pass
@@ -1904,13 +1830,6 @@ class FEM:
             return fn, kwargs
         if nonlinear is not None:
             raise ValueError(f"fem.solve: nonlinear= given, but this problem is {self._mode} (no linearization).")
-        if self._mode == "complex" and x0 is not None:
-            # Bloch only — the complex prolongation keeps this one off the real-equivalent block.
-            raise NotImplementedError(
-                "fem.solve: x0= on a *Bloch* (quasi-periodic) complex problem is not supported yet — "
-                "that path still solves through a complex prolongation rather than the real-equivalent "
-                "block. An ordinary complex problem accepts x0=."
-            )
         if self._complex_n is not None and x0 is not None:
             # A complex guess enters the real-equivalent layout the solve runs in: x0 = [Re; Im].
             _x0 = jnp.asarray(x0).reshape(-1)
@@ -1982,7 +1901,19 @@ class FEM:
             raise AttributeError(f"FEM is {self._mode}; .b is only for a steady linear problem (see .operator / .M).")
         return _as_flat(self._b)
 
-    def eigs(self, *, mass, k: int = 6, which: str = "smallest", precond=None, tol=None, maxiter=None):
+    def eigs(
+        self,
+        *,
+        mass,
+        k: int = 6,
+        which: str = "smallest",
+        sigma=None,
+        linear=None,
+        precond=None,
+        tol=None,
+        maxiter=None,
+        X0=None,
+    ):
         """Generalized eigenproblem ``K x = λ M x`` on this fem: ``K`` is this **source-less** fem's
         operator (its stiffness bilinear form) and ``M`` is the ``mass`` bilinear form assembled on the
         same space. Returns ``(λ, X)`` — the ``k`` eigenvalues at ``which`` (``'smallest'``/``'largest'``)
@@ -1995,10 +1926,15 @@ class FEM:
             lam, X = K.eigs(mass=[ui * vi], k=6)          # K x = λ M x  → λ = ω² (Neumann box)
 
         ``precond=`` switches from the dense reduction to **preconditioned LOBPCG**, which never
-        densifies the operator and so scales past it — ``tol``/``maxiter`` tune that iteration and are
-        rejected without it. See :func:`jno.solve.eigs` for the full contract::
+        densifies the operator and so scales past it; ``sigma=`` targets the ``k`` eigenvalues
+        **nearest the shift** (interior modes — a cavity resonance in a band, a Brillouin-zone point
+        away from the band edge) via the shift-invert transformation, with ``linear=`` picking the
+        inner solver against ``K − σM`` (default: a once-factorized host sparse LU). ``tol``/``maxiter``
+        tune the iterative paths and are rejected on the dense one. See :func:`jno.solve.eigs` for the
+        full contract::
 
             lam, X = K.eigs(mass=[ui * vi], k=6, precond=jno.precond.amg())
+            lam, X = K.eigs(mass=[ui * vi], k=4, sigma=60.0)   # the 4 modes nearest λ = 60
         """
         if self._mode != "linear":
             raise AttributeError(f"FEM.eigs needs a steady-linear (source-less) bilinear form; this fem is {self._mode}.")
@@ -2013,27 +1949,81 @@ class FEM:
         # an empty list — the elimination would then silently not happen and the row-replaced spurious
         # modes would come back.
         restrict, prolong, n_red, _kind = _eigs_constraint_maps(self, n_full)
+        # The Dirichlet DOF set must be captured NOW too (the sigma path assembles its selection P
+        # from it) — after the mass assembly below the domain stash is empty and a P built from it
+        # would silently be the identity.
+        _pairs = list(getattr(self.domain, "_fem_native_dirichlet_pairs", None) or [])
+        _dir_dofs = sorted({int(dof) for dof, _v in _pairs})
         M = fem(list(mass)).operator[0]  # mass matrix on the same FE space
+        # RESTORE the stash the (Dirichlet-free) mass assembly just cleared: without this, a SECOND
+        # eigs() on the same fem finds no constraints, skips the elimination, and silently returns the
+        # row-replaced spurious spectrum — eigs would not be idempotent (measured: the repeat call gave
+        # 47.2 where the true reduced spectrum has no such eigenvalue).
+        self.domain._fem_native_dirichlet_pairs = _pairs
 
-        solver = _solve.eigs(k=k, which=which, precond=precond, tol=tol, maxiter=maxiter)
+        # A warm start (the previous sweep point's eigenvectors) arrives in the FULL DOF space the
+        # caller sees; the constrained solve runs in the reduced one, so restrict its columns.
+        if X0 is not None and restrict is not None:
+            _W = jnp.asarray(X0)
+            _W = _W[:, None] if _W.ndim == 1 else _W
+            X0 = jax.vmap(restrict, in_axes=1, out_axes=1)(_W)
+        solver = _solve.eigs(k=k, which=which, sigma=sigma, linear=linear, precond=precond, tol=tol, maxiter=maxiter, X0=X0)
         if restrict is None:
             return solver(K, M)
+
+        if sigma is not None:
+            # Shift-invert factorizes K − σM, so the constrained pencil must be ASSEMBLED in the
+            # reduced space — sparsely, via the same triplet-remap the periodic solve reduction uses
+            # (a Dirichlet elimination is a selection P, a periodic tie its own P). The matvec-only
+            # reduction below cannot serve here: there is nothing to factorize.
+            import jax.experimental.sparse as jsparse
+
+            from .utils.solver.fem_utils import reduce_matrix, reduce_matrix_periodic
+
+            if _kind == "periodic":
+                K_red, M_red = reduce_matrix_periodic(self._periodic, K), reduce_matrix_periodic(self._periodic, M)
+            else:  # dirichlet: the free-DOF selection P as a BCOO, reduced by the sparse remap
+                free = jnp.asarray(sorted(set(range(n_full)) - set(_dir_dofs)), dtype=jnp.int32)
+                P = jsparse.BCOO(
+                    (jnp.ones(n_red, dtype=K.dtype), jnp.stack([free, jnp.arange(n_red)], axis=1)),
+                    shape=(n_full, n_red),
+                )
+                K_red, M_red = reduce_matrix(P, K, is_selection=True), reduce_matrix(P, M, is_selection=True)
+            lam, Xr = solver(K_red, M_red)
+            return lam, jax.vmap(prolong, in_axes=1, out_axes=1)(Xr)
 
         # Reduced pencil (PᵀKP) x̂ = λ (PᵀMP) x̂ as MATVECS — never assembled, so this composes with the
         # matrix-free LOBPCG path and never densifies a big operator just to drop some rows.
         Kop, Mop = LinearOperator(K), LinearOperator(M)
 
-        def red(op):
+        def _red_diag_fn(A_raw):
+            # diag(PᵀAP) for the diagonal-reading preconditioners (jacobi): a Dirichlet elimination is
+            # a SELECTION, so it is a gather of A's diagonal at the free DOFs; a periodic tie's diag
+            # comes from one sparse triplet-remap of the reduction (the operator itself stays
+            # matvec-only — only its diagonal is ever formed). Without this, `precond=jacobi()` on a
+            # constrained pencil died on `diag()` of a matvec-only operator — a hole the eigs
+            # idempotency fix exposed (the repeat call used to skip the reduction entirely, so the
+            # "reduced" LOBPCG quietly ran the FULL pencil and never asked for this diagonal).
+            from .utils.solver.fem_utils import reduce_matrix_periodic
+            from .utils.solver.linear import matrix_diagonal
+
+            if _kind == "dirichlet":
+                _free = jnp.asarray(sorted(set(range(n_full)) - {int(dof) for dof, _v in _pairs}), dtype=jnp.int32)
+                return lambda: matrix_diagonal(A_raw)[_free]
+            return lambda: matrix_diagonal(reduce_matrix_periodic(self._periodic, A_raw))
+
+        def red(op, A_raw):
             mv = lambda v: restrict(op.mv(prolong(v)))  # noqa: E731
             # `dense_fn` only fires on the small-problem dense path, which materializes anyway; the
             # LOBPCG path never calls it and so never builds the reduced matrix.
             return LinearOperator.from_matvec(
                 mv,
                 shape=(n_red, n_red),
+                diag_fn=_red_diag_fn(A_raw),
                 dense_fn=lambda: jax.vmap(mv, in_axes=1, out_axes=1)(jnp.eye(n_red)),
             )
 
-        lam, Xr = solver(red(Kop), red(Mop))
+        lam, Xr = solver(red(Kop, K), red(Mop, M))
         return lam, jax.vmap(prolong, in_axes=1, out_axes=1)(Xr)  # modes back on the full mesh
 
     # -- domain-decomposition coupling (`jno.core([...])`): the region this subdomain owns + a pinned solve --
@@ -2276,7 +2266,15 @@ def _boundary_facets(points: Any, cells: Any, dim: int, order: int) -> Optional[
         return None
     n_cells = cells.shape[0]
     verts = cells[:, : dim + 1]
-    combos = [(0, 1), (1, 2), (2, 0)] if dim == 2 else [(0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3)]
+    # A facet of a `dim`-simplex has `dim` vertices: in 1D that is a single endpoint, so the combos
+    # are the two 1-vertex sub-sets of an interval. (Higher-order facet nodes below are then vacuous —
+    # a point carries none — which the `order < 2` early return already handles for P1 and the
+    # reference-point search handles correctly for P{k}.)
+    combos = (
+        [(0,), (1,)]
+        if dim == 1
+        else ([(0, 1), (1, 2), (2, 0)] if dim == 2 else [(0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3)])
+    )
     allf = np.concatenate([verts[:, list(c)] for c in combos], axis=0)  # combo-major: row = combo*n_cells + cell
     # Same packed-int64 key the assembler's facet table uses, for the same reason -- and from the
     # same helper, so the two cannot drift again. See :func:`fem_facets.pack_face_keys`.
@@ -2617,15 +2615,17 @@ def _fuse_complex_steady(fem_obj: "FEM") -> "FEM":
     for one consumer: a **complex-native** preconditioner (AMS) solves ``A_r + i·A_i`` directly rather
     than the real-equivalent block, and needs the legs to build it.
 
-    **Bloch is left alone.** A quasi-periodic tie has a *complex* ``P``, so ``P^H A P`` mixes Re and Im
-    and does not reduce to two independent real legs — that needs ``P`` itself in real-equivalent form.
-    Until then a Bloch problem keeps the ``"complex"`` mode and its dedicated block solve.
+    **Bloch fuses too.** A quasi-periodic tie has a *complex* ``P``, so it cannot reduce the two real
+    legs independently — but on the fused ``[Re; Im]`` state the same tie IS a *real* prolongation,
+    ``B(P) = [[P_r, -P_i], [P_i, P_r]]`` (see :func:`_bloch_realify_periodic`), and the ordinary real
+    congruence ``B(P)ᵀ A_blk B(P)`` equals the Hermitian reduction ``P^H A_c P`` exactly. So a Bloch
+    problem takes the very same fused path — ``x0=``, the solver slots and the default sparse solve all
+    apply — where it previously kept a dedicated complex block solve that silently discarded
+    ``solve_fn=`` and the composed slots.
     """
     if fem_obj._mode != "complex":
         return fem_obj
     per = fem_obj._periodic
-    if per is not None and per.get("is_bloch"):
-        return fem_obj  # complex P — not expressible as two real legs; see the docstring
     from .trace import FemLinearSystem as _FLS
 
     op_r, op_i = fem_obj._op
@@ -2667,8 +2667,14 @@ def _fuse_complex_steady(fem_obj: "FEM") -> "FEM":
     fem_obj._complex_n = n
     fem_obj._complex_legs = (op_r, op_i)
     fem_obj._A, fem_obj._b = (fused.A, fused.b) if isinstance(fused, _FLS) else fused
-    # the solve runs on the 2n block, so its periodic reduction is blkdiag(P, P)
-    fem_obj._periodic_2n = None if per is None else _duplicate_periodic(per)
+    # the solve runs on the 2n block, so its periodic reduction is blkdiag(P, P) — except a Bloch tie,
+    # whose complex P becomes the real-equivalent B(P) over the stacked [Re; Im] halves
+    if per is None:
+        fem_obj._periodic_2n = None
+    elif per.get("is_bloch"):
+        fem_obj._periodic_2n = _bloch_realify_periodic(per)
+    else:
+        fem_obj._periodic_2n = _duplicate_periodic(per)
     return fem_obj
 
 
@@ -2683,7 +2689,17 @@ def _duplicate_periodic(periodic: dict) -> dict:
 
     Duplicating the field's periodic blocks into a lower and an upper block is exactly ``blkdiag(P, P)``,
     which is what preserves the real-equivalent structure: ``blkdiag(P,P)ᵀ [[A_r,-A_i],[A_i,A_r]]
-    blkdiag(P,P)`` is again of that form, with each sub-block reduced by the same ``P``."""
+    blkdiag(P,P)`` is again of that form, with each sub-block reduced by the same ``P``.
+
+    **Real ``P`` only.** A Bloch tie's complex ``P`` mixes the two halves — ``blkdiag(P, P)`` would
+    leak complex data into the real block (measured: a ``while_loop`` carry dtype crash deep in JAX on
+    the transient march). That case is :func:`_bloch_realify_periodic`; taking it here is a bug."""
+    if periodic.get("is_bloch"):
+        raise NotImplementedError(
+            "jno.fem internal: _duplicate_periodic received a Bloch (complex-phase) prolongation — "
+            "blkdiag(P, P) with a complex P is not the real-equivalent reduction. Use "
+            "_bloch_realify_periodic for the fused [Re; Im] state."
+        )
     from .utils.solver.fem_utils import _periodic_blocks
 
     b, of, orr = _periodic_blocks(periodic)
@@ -2693,6 +2709,81 @@ def _duplicate_periodic(periodic: dict) -> dict:
         "blocks": list(b) + list(b),
         "off_full": np.concatenate([of[:-1], of + nf]),
         "off_red": np.concatenate([orr[:-1], orr + nr]),
+    }
+
+
+def _bloch_realify_periodic(periodic: dict) -> dict:
+    """Real-equivalent form ``B(P)`` of a complex (Bloch) prolongation, for the fused ``[Re; Im]`` state.
+
+    A quasi-periodic tie ``u(A) = c·u(B)`` with a complex phase ``c`` builds a complex ``P``
+    (``u_full = P w``), so it cannot reduce the Re/Im legs independently. On the fused ``2n`` state
+    ``x = [x_r; x_i]`` the SAME tie is the **real** prolongation
+
+        ``B(P) = [[P_r, -P_i], [P_i, P_r]]``,      ``x = B(P) y``,  ``y = [w_r; w_i]``,
+
+    and because ``B(M^H) = B(M)ᵀ`` and ``B(MN) = B(M)B(N)``, the ordinary real congruence
+    ``B(P)ᵀ A_blk B(P)`` of the fused block **is** the Hermitian reduction ``P^H A_c P`` of the complex
+    pencil — the one the Bloch space requires (Floquet FEM; the bilinear ``Pᵀ A P`` is *not* a Galerkin
+    projection for a complex ``P`` and was measured 8.1 rel-L2 off on a manufactured Bloch mode).
+
+    Returns an ordinary **real** single-block periodic dict over ``(2n, 2m)`` — downstream reduction,
+    restriction and prolongation then need no complex branch and no ``conj=`` anywhere. Master rows
+    carry weight 1 in each half; a slave row ties to its master's Re and Im columns (arity 2), which the
+    weighted-interpolation sparse remap already handles (``is_selection=False``)."""
+    from .utils.solver.fem_utils import _periodic_blocks
+
+    # Normalize BOTH dict shapes first. The blocked form is NOT synonymous with "coupled": the N1E
+    # edge reduction emits one block per field and so uses it even for a SINGLE field. Gate on the
+    # block COUNT, not on the key's presence — testing the key rejected an ordinary single-field
+    # N1E Bloch problem.
+    _blocks, _off_f, _off_r = _periodic_blocks(periodic)
+    if len(_blocks) > 1:
+        raise NotImplementedError(
+            "jno.fem: a Bloch (complex-phase) tie on a coupled multifield problem is not supported — "
+            "the coupled complex assembly it needs does not exist yet. Use a single field, or a plain "
+            "periodic tie."
+        )
+    _b = _blocks[0]
+    P = _b["P"]
+    n, m = int(P.shape[0]), int(P.shape[1])
+    if hasattr(P, "indices"):  # BCOO (nodal path) — split the concrete triplets, drop exact-zero legs
+        idx = np.asarray(P.indices)
+        dat = np.asarray(P.data)
+        r, c = idx[:, 0], idx[:, 1]
+        rows = [r, r + n]
+        cols = [c, c + m]
+        vals = [dat.real, dat.real]
+        im_nz = dat.imag != 0.0
+        if im_nz.any():
+            ri, ci, wi = r[im_nz], c[im_nz], dat.imag[im_nz]
+            rows += [ri, ri + n]
+            cols += [ci + m, ci]
+            vals += [-wi, wi]
+        import jax.experimental.sparse as jsparse
+
+        B = jsparse.BCOO(
+            (
+                jnp.asarray(np.concatenate(vals), dtype=jnp.float64),
+                jnp.asarray(np.stack([np.concatenate(rows), np.concatenate(cols)], axis=1)),
+            ),
+            shape=(2 * n, 2 * m),
+        )
+    else:  # dense P (the N1E edge path)
+        Pd = np.asarray(P)
+        B = jnp.asarray(np.block([[Pd.real, -Pd.imag], [Pd.imag, Pd.real]]))
+    kept = np.asarray(_b["kept"], dtype=np.int64)  # normalized above: both dict shapes expose "kept"
+    vec = int(_b.get("vec", 1) or 1)
+    if vec > 1:  # expand node-level kept to DOF-level before stacking the halves
+        kept = (kept[:, None] * vec + np.arange(vec)[None, :]).reshape(-1)
+    return {
+        "P": B,
+        "P_node": B,
+        "kept_nodes": np.concatenate([kept, kept + n]),
+        "n_full": 2 * n,
+        "n_red": 2 * m,
+        "vec": 1,  # kept_nodes is already DOF-level
+        "is_selection": False,  # a slave row ties to two masters (Re, Im) — the weighted remap path
+        "is_bloch": False,  # B(P) is REAL: no conj, no complex branch downstream
     }
 
 
@@ -2724,8 +2815,19 @@ def _reduce_transient_block_periodic(block: Any, periodic: dict) -> Any:
     # assemblies produce that shape, and every reduction below (M, A, operator_fn, forcing, state0)
     # then acts on the 2N system.
     _meta_in = getattr(block, "metadata", None) or {}
+    _bloch = "blocks" not in periodic and bool(periodic.get("is_bloch"))
+    if _bloch and not _meta_in.get("complex"):
+        # A complex phase forces a complex-valued field; this march carries a REAL state (a plain or
+        # second-order transient). Reducing with the complex P used to leak complex128 into the scan
+        # carry and crash with a bare while_loop dtype error at evaluation time — name the cause.
+        raise NotImplementedError(
+            "jno.fem: a Bloch/quasi-periodic tie (`u(A) - c*u(B)` with a complex phase c) on a REAL "
+            "transient march is not supported — the phase forces a complex-valued field, which this "
+            "real time block cannot represent. Make the problem complex (a 1j coefficient, source or "
+            "initial condition), or use a plain periodic tie (`u(A) - u(B)`)."
+        )
     if _meta_in.get("second_order") or _meta_in.get("complex"):
-        periodic = _duplicate_periodic(periodic)
+        periodic = _bloch_realify_periodic(periodic) if _bloch else _duplicate_periodic(periodic)
 
     blocks, off_f, off_r = _periodic_blocks(periodic)
     n_full, n_red = int(off_f[-1]), int(off_r[-1])
@@ -3270,6 +3372,16 @@ def _fem_impl(
     # so they allocate the right per-quadrature-point buffer depth.
     _evolution = state_updates(constraints)  # {history_key: StateUpdate}
     constraints = [c for c in constraints if not isinstance(_bare(c), StateUpdate)]
+
+    # GEOMETRY terms (`yb.d(tb) - v`): how a mesh *coordinate* moves, stated as a residual like any other
+    # equation. Pulled out here for the same reason as the evolution bucket — the term carries no test
+    # function, so the weak-form classifier would not claim it, and the Dirichlet branch would try to read
+    # a coordinate as a field. Nothing about this is boundary-specific: `domain.variable` resolves an
+    # interior region, a boundary or a `where=` predicate identically, and the term is per-axis.
+    _geometry, _rest = [], []
+    for c in constraints:
+        (_geometry if mesh_velocity(c) is not None else _rest).append(c)
+    constraints = _rest
     if rotation_bcs and not (_trial_spaces(constraints) - {"Lagrange"}):
         raise NotImplementedError(
             "jno.fem: a rotation BC `u.dn(region) - h` is a 4th-order plate essential BC — it requires a field "
@@ -3315,12 +3427,6 @@ def _fem_impl(
                 raise NotImplementedError("jno.fem: a net-valued essential value is supported on Lagrange elements only.")
             if len(_field_keys(constraints)) > 1:
                 raise NotImplementedError("jno.fem: a net-valued essential value is single-field only.")
-        if getattr(domain, "dimension", None) == 1 and len(_field_keys(constraints)) > 1:
-            # the coupled 1D block assembler threads neither runtime parameters nor networks
-            raise NotImplementedError(
-                "jno.fem: a neural coefficient on a 1D domain is single-field only — the coupled 1D block "
-                "assembler threads no runtime parameters. Use a single field, or a 2D/3D domain."
-            )
         # Non-nodal: the scalar C¹ families (Argyris/Morley/Hermite) thread the network at the quad points
         # like their P1 field parameter. The vector edge families (RT/Nédélec) accept a *scalar coordinate*
         # net(x) coefficient (a spatially-varying permeability/permittivity multiplying a vector term), but
@@ -3369,6 +3475,7 @@ def _fem_impl(
         fem_obj._term_source = (domain, volume_terms)
         fem_obj._constraints = _orig_constraints
         fem_obj._fem_kwargs = _orig_fem_kwargs
+        fem_obj._geometry = list(_geometry)  # `coord.d(t) - v` terms: the mesh-motion driver reads these
         # Field-key snapshots for FEM.block_index: the assembler's list is offsets-ordered (and
         # must be captured NOW — a later assembly on the same domain overwrites the attribute);
         # the constraint-walk order is the fallback for paths that don't run the native assembler.
@@ -3419,10 +3526,38 @@ def _fem_impl(
             )
         else:
             periodic = _build_periodic_reduction(domain, periodic_ties, fem_obj.points, cells, ele_order, vec or 1)
+        if periodic.get("is_bloch") and fem_obj._mode in ("linear", "nonlinear"):
+            # A REAL form with a Bloch tie: the complex phase makes the field complex anyway, and the
+            # real path would reduce with the bilinear Pᵀ A P — which for a complex P is NOT a Galerkin
+            # projection (measured: rel-L2 8.1 off the Hermitian answer on a manufactured Bloch mode,
+            # with the tie itself satisfied exactly, so nothing looked wrong). Promote the operator to
+            # a complex pair with a ZERO imaginary leg; the fusion below then reduces the real 2n block
+            # by B(P), which equals the Hermitian P^H A P exactly.
+            if fem_obj._mode == "nonlinear":
+                raise NotImplementedError(
+                    "jno.fem: a Bloch/quasi-periodic tie on a NONLINEAR form is not supported — the "
+                    "complex phase makes the field complex, and a complex nonlinear form is not wired "
+                    "(complex forms assemble as linear real-equivalent blocks). Use a plain periodic "
+                    "tie, or linearize the form."
+                )
+            import jax.experimental.sparse as jsparse
+
+            from .trace import FemLinearSystem as _FLS_bloch
+
+            _op_r = fem_obj._op
+            _A0, _b0 = (_op_r.A, _op_r.b) if isinstance(_op_r, _FLS_bloch) else _op_r
+            _Az = (
+                jsparse.BCOO((jnp.zeros_like(_A0.data), _A0.indices), shape=_A0.shape)
+                if hasattr(_A0, "indices")
+                else jnp.zeros_like(jnp.asarray(_A0))
+            )
+            fem_obj._op = (_op_r, (_Az, jnp.zeros_like(jnp.asarray(_b0).reshape(-1))))
+            fem_obj._mode = "complex"
         # One op-level reduction combinator handles every representation: a transient block is reduced
         # now (P^T M P, ...) — including a fused complex transient, whose stacked [Re; Im] state reduces by
-        # blkdiag(P, P) — and a steady complex (re, im) tuple is reduced leg-wise with the same P; steady
-        # linear (A, b) and nonlinear residual ops are returned unchanged and reduce lazily in FEM.solve.
+        # blkdiag(P, P) (B(P) for a Bloch tie) — and a steady complex (re, im) tuple passes through
+        # unchanged (it reduces inside the fused 2n solve); steady linear (A, b) and nonlinear residual
+        # ops are returned unchanged and reduce lazily in FEM.solve.
         fem_obj._op = reduce_op_periodic(fem_obj._op, fem_obj._mode, periodic)
         fem_obj._periodic = periodic
         return _fuse_complex_steady(fem_obj)
@@ -3517,8 +3652,8 @@ def _fem_impl(
         else:
             raise ValueError("jno.fem: a residual contains neither the trial nor the test function.")
 
-    if is_vpinn and (getattr(domain, "dimension", None) == 1 or multifield):
-        raise NotImplementedError("jno.fem VPINN (network trial) is currently single-field 2D/3D only.")
+    if is_vpinn and multifield:
+        raise NotImplementedError("jno.fem VPINN (network trial) is currently single-field only.")
 
     # ---- second-order in time (`u_tt`): reduce to a first-order augmented (u, v=u_t) block ----
     # A weak term carrying a SECOND temporal derivative is lowered to the equivalent first-order
@@ -3534,19 +3669,23 @@ def _fem_impl(
     # only the 2D/3D nodal-Lagrange route is intercepted here (a non-nodal / 1D u_tt has its own path).
     _second_order = any(_max_temporal_order(_bare(c)) >= 2 for c in constraints)
     if _second_order and getattr(domain, "dimension", None) != 1 and not (_trial_spaces(constraints) - {"Lagrange"}):
-        if multifield:
-            # Coupled second-order-in-time: all fields must be second-order (u_tt) — reduces to the
-            # single-field formula with the coupled block M2/K. Mixed-order/damped/periodic/parametric
-            # coupled 2nd-order fail loud inside the assembler / here.
-            if periodic_ties:
-                raise NotImplementedError(
-                    "jno.fem: periodic ties on a coupled second-order-in-time form are not supported yet."
-                )
-            _so = _assemble_multifield_second_order(
-                domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, classification, quad_degree=quad_degree
+        _so_bares = (
+            list(volume_terms) + [e for exprs in boundary_terms.values() for e in exprs] + [_bare(c) for c in ic_residuals]
+        )
+        if _bares_have_complex_coeff(_so_bares):
+            # The augmented real [u; v] assembly casts complex coefficients to float — it silently
+            # DROPPED the imaginary part (measured: is_complex False, a bare numpy ComplexWarning the
+            # only trace). Raise instead; the 1D and non-nodal complex branches already do.
+            raise NotImplementedError(
+                "jno.fem: a COMPLEX coefficient on a second-order-in-time (u_tt) form is not wired — "
+                "the augmented real [u; v] block would silently drop the imaginary part. Keep the "
+                "u_tt coefficients real, or write the problem first-order in time (a complex "
+                "transient IS supported and fuses into the real 2n block)."
             )
-            _so._term_source = (domain, volume_terms)
-            return _so
+        if multifield and periodic_ties:
+            raise NotImplementedError(
+                "jno.fem: periodic ties on a coupled second-order-in-time form are not supported yet."
+            )
         if any(isinstance(n, RegionMask) for b in volume_terms for n in _walk(b)):
             raise NotImplementedError(
                 "jno.fem: per-region (RegionMask) integration on a second-order-in-time problem is not "
@@ -3554,6 +3693,9 @@ def _fem_impl(
                 "u_tt mass term. Use a jno.fn indicator coefficient instead, e.g. (1 + k*ind)*(u.x*v.x + "
                 "u.y*v.y), which gives the same piecewise-material dynamics."
             )
+        # Coupled second-order-in-time is the SAME augmented formula with the coupled M2/C/K blocks —
+        # one assembler serves both, so damping, a nonlinear spatial operator and driven boundaries
+        # apply to the coupled case with no second copy of the path.
         _so = _assemble_second_order_time(
             domain,
             volume_terms,
@@ -3562,9 +3704,10 @@ def _fem_impl(
             dirichlet_raw,
             ic_residuals,
             classification,
-            order=_infer_order(constraints),
+            order=1 if multifield else _infer_order(constraints),
             vec=vec or 1,
             quad_degree=quad_degree,
+            multifield=multifield,
         )
         _so._term_source = (domain, volume_terms)
         if periodic_ties:
@@ -3580,16 +3723,33 @@ def _fem_impl(
     # ---- non-nodal element families (RT / Nedelec / Argyris): native push-forward assembler ----
     # These families need a basis push-forward, so -- like the 1D path -- assemble natively and reuse
     # the shared integrand evaluator (which carries space-guarded branches for the physical basis).
-    if _trial_spaces(constraints) - {"Lagrange"}:
+    _nonnodal_families = _trial_spaces(constraints) - {"Lagrange"}
+    # A 1D Hermite field is NOT routed here: its element is the classical cubic beam, which the 1D
+    # assembler builds directly (no push-forward — a straight interval has a constant Jacobian).
+    _hermite_1d = getattr(domain, "dimension", None) == 1 and _nonnodal_families == {"Hermite"}
+    if _nonnodal_families and not _hermite_1d:
+        # The push-forward assembler is built on triangles/tets, so a non-nodal family on a LINE mesh
+        # died with a bare ``KeyError: 'triangle'`` from the topology lookup — a cryptic failure for a
+        # perfectly reasonable request. Name the dimension mismatch instead. Hermite is the exception:
+        # its 1D counterpart is the classical cubic beam element, assembled by the 1D path below.
+        # (RT/N1curl are vector H(div)/H(curl) spaces and Argyris/Morley are triangle elements.)
+        if getattr(domain, "dimension", None) == 1 and _nonnodal_families != {"Hermite"}:
+            _no1d = sorted(_nonnodal_families - {"Hermite"})
+            raise NotImplementedError(
+                f"jno.fem: the non-nodal element famil{'y' if len(_no1d) == 1 else 'ies'} {_no1d} "
+                f"{'is' if len(_no1d) == 1 else 'are'} defined on triangles/tets and "
+                "has no 1D counterpart — a 1D line domain supports Lagrange (any order) and Hermite "
+                "(the C1 cubic beam element). Use a 2D/3D domain, or space='Lagrange'/'Hermite' in 1D."
+            )
         from .utils.solver.fem_nonnodal import assemble_fem_nonnodal
 
         # ---- complex non-nodal (RT/Nédélec/Argyris): the Re/Im coefficient split, assembled by the
         # non-nodal push-forward assembler. The basis is real, so ``Re(c·T) = Re(c)·T``: wrapping each
-        # term in ``.real``/``.imag`` gives two ordinary real systems A_r/A_i, and FEM.solve() forms
-        # ``[[A_r,-A_i],[A_i,A_r]]`` (``mode="complex"`` → _solve_complex_block), recombining to a complex
+        # term in ``.real``/``.imag`` gives two ordinary real systems A_r/A_i, fused at finalize into
+        # the real 2n block ``[[A_r,-A_i],[A_i,A_r]]`` and recombined to a complex
         # ``u`` — needed for time-harmonic Maxwell (complex ε, the ``i k₀`` impedance BC). A runtime
         # parameter is allowed (the complex *inverse*): each ``.real``/``.imag`` leg carries the parameter,
-        # so ``assemble_fem_nonnodal`` returns parametric ``FemLinearSystem`` legs and ``_solve_complex_block``
+        # so ``assemble_fem_nonnodal`` returns parametric ``FemLinearSystem`` legs and the fused solve
         # builds a differentiable trace node — exactly like the nodal complex inverse. Without this split the
         # plain real assembler would SILENTLY cast the imaginary part away, so the compositions that are still
         # unwired (transient / nonlinear / neural-coefficient) raise rather than mislead. ----
@@ -3658,30 +3818,87 @@ def _fem_impl(
     # The native 1D assembler reuses the same integrand evaluator and returns the
     # same (op, mode) the FEM container expects; it needs no problem-object
     # scaffolding (coordinate vars resolve from the per-element quadrature points).
-    if getattr(domain, "dimension", None) == 1:
+    # A VPINN form is the exception: its trial is a NETWORK, not an FE field, so there is no linear
+    # system to assemble — it test-projects onto the FE test space further down, on the native
+    # fem_context (which now builds on an interval too).
+    if getattr(domain, "dimension", None) == 1 and not is_vpinn:
         from .utils.solver.fem_1d import assemble_fem_1d, assemble_fem_1d_multifield
 
         _order_1d = _infer_order(constraints)
-        if _order_1d > 2:
-            raise NotImplementedError(
-                f"jno.fem: 1D Lagrange elements are implemented for order 1 (LINE2) and 2 (LINE3); "
-                f"got order={_order_1d}. Use order<=2, or refine the mesh for accuracy."
-            )
-        if _order_1d > 1 and multifield:
-            raise NotImplementedError(
-                "jno.fem: higher-order (P2 / LINE3) elements on a 1D domain are single-field only for "
-                "now -- the coupled 1D block assembler is P1. Use order=1 for the coupled system."
-            )
-        if multifield:  # coupled 1D -> native block assembly
-            if _second_order:
+        # ---- complex 1D: the same real-equivalent split the 2D/3D and non-nodal paths use ----
+        # Every other `_is_complex_form` dispatch sits BELOW this branch, so before this a `1j` on a
+        # line domain reached the real assembler: the stiffness came out complex128 while the load
+        # scatter dropped its imaginary part (a numpy ComplexWarning, no jNO error), and the solve then
+        # died inside jax's spsolve on a dtype mismatch. Assemble the Re and Im legs separately and let
+        # `_fuse_complex_steady` build the real 2n block — which also carries the parametric legs, so a
+        # 1D complex *inverse* rides the same path.
+        _cx_bd = any(_bares_have_complex_coeff(exprs) for exprs in boundary_terms.values())
+        if _bares_have_complex_coeff(volume_terms) or _cx_bd:
+            from .utils.solver.fem_1d import complex_dirichlet_regions
+            from .utils.solver.weak_form import _contains_temporal_derivative as _ctd_1d
+            from .utils.solver.weak_form import _is_obviously_nonlinear_in_unknown as _nlin_1d
+
+            _cx_all = list(volume_terms) + [t for ts in boundary_terms.values() for t in ts]
+            # Each guard below refuses a path where the real assembler would silently drop the
+            # imaginary part rather than fail — the same reason the non-nodal complex branch raises.
+            if multifield:
                 raise NotImplementedError(
-                    "jno.fem: second-order-in-time (u_tt) 1D is single-field only for now; write the coupled "
-                    "problem as a first-order system (one velocity field per second-order field)."
+                    "jno.fem: a complex COUPLED 1D system is not wired — the 1D block assembler has no "
+                    "Re/Im split. Use a single complex field, or a 2D/3D domain for the coupled case."
                 )
-            op, mode = assemble_fem_1d_multifield(
-                domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, quad_degree=quad_degree
+            if ic_residuals or any(_ctd_1d(b) for b in _cx_all):
+                raise NotImplementedError(
+                    "jno.fem: a complex *transient* 1D form is not wired — only the steady linear complex "
+                    "form is. (The real assembler would silently drop the imaginary part, so this raises.)"
+                )
+            if any(_nlin_1d(domain, b) for b in _cx_all):
+                raise NotImplementedError(
+                    "jno.fem: a complex *nonlinear* 1D form is not wired — complex forms assemble as "
+                    "linear real-equivalent blocks. (Raises rather than dropping the imaginary part.)"
+                )
+            # Both legs share one Dirichlet row set, which imposes `Re u = g, Im u = 0` — right for a
+            # real g, inexpressible for a complex one (see `complex_dirichlet_regions`). 2D/3D takes
+            # the same shared-row route but reaches it by casting g to float, so it *silently* drops
+            # Im(g); refuse instead. A complex essential value is the one thing 1D says no to here.
+            if _cx_dbc := complex_dirichlet_regions(domain, dirichlet_values):
+                raise NotImplementedError(
+                    f"jno.fem: a COMPLEX essential value on region(s) {sorted(set(_cx_dbc))} of a 1D complex "
+                    "form is not supported — the Re/Im legs share one Dirichlet row set, which can impose "
+                    "Re u = g with Im u = 0 but not a prescribed Im u. Use a real essential value and carry "
+                    "the complex part in the operator or the source."
+                )
+            _cx_quad = max(quad_degree, 2 * _order_1d)
+            _cx_legs = [
+                assemble_fem_1d(
+                    domain,
+                    [getattr(b, _part) for b in volume_terms],
+                    {tag: [getattr(e, _part) for e in exprs] for tag, exprs in boundary_terms.items()},
+                    dirichlet_values,
+                    [],
+                    vec=vec,
+                    quad_degree=_cx_quad,
+                    order=_order_1d,
+                )[0]
+                for _part in ("real", "imag")
+            ]
+            return _finalize(
+                FEM(domain=domain, op=tuple(_cx_legs), classification=classification, mode="complex", offsets=None)
+            )
+
+        if multifield:  # coupled 1D -> native block assembly
+            # `u_tt` on a coupled system builds the augmented [u_all; v_all] block, which reports its
+            # own offsets (displacement blocks then velocity blocks) — hence no override below.
+            op, mode, offs_1d = assemble_fem_1d_multifield(
+                domain,
+                volume_terms,
+                boundary_terms,
+                dirichlet_raw,
+                ic_residuals,
+                quad_degree=quad_degree,
+                second_order=_second_order,
             )
         else:
+            offs_1d = None
             op, mode = assemble_fem_1d(
                 domain,
                 volume_terms,
@@ -3690,13 +3907,17 @@ def _fem_impl(
                 ic_residuals,
                 vec=vec,
                 # a P2 mass term is degree 4, so the rule must be raised with the order (mirrors the
-                # 2D/3D path); too few Gauss points would under-integrate the mass silently
-                quad_degree=max(quad_degree, 2 * _order_1d),
+                # 2D/3D path); too few Gauss points would under-integrate the mass silently. The
+                # Hermite beam's stiffness ∫w''v'' is degree 2 in xi but its mass ∫wv is degree 6, so
+                # it needs the same rule a P3 Lagrange field would.
+                quad_degree=max(quad_degree, 6 if _hermite_1d else 2 * _order_1d),
                 order=_order_1d,
+                space="Hermite" if _hermite_1d else "Lagrange",
+                rotation_bcs=rotation_bcs,
             )
-        # a second-order 1D block carries the augmented state y=[u; v] (size 2N) -> field offsets [0, N, 2N]
-        offs_1d = None
-        if _second_order and mode == "transient":
+        # a second-order SINGLE-FIELD 1D block carries the augmented state y=[u; v] (size 2N) -> field
+        # offsets [0, N, 2N]. The coupled route already returned its own augmented layout.
+        if _second_order and mode == "transient" and not multifield:
             _nh = int(np.asarray(op.state0).shape[0]) // 2
             offs_1d = [0, _nh, 2 * _nh]
         return _finalize(FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs_1d))
@@ -4039,7 +4260,7 @@ def _fem_impl(
     # It builds the native fem_context (init_fem_native) and test-projects the weak form. Every
     # standard single-field FEM problem has already returned natively above; anything else is rejected
     # explicitly below (fail loud -- never silently mis-assemble). ----
-    if is_vpinn and getattr(domain, "dimension", None) == 2 and not periodic_ties:
+    if is_vpinn and getattr(domain, "dimension", None) in (1, 2) and not periodic_ties:
         bcs = [domain.dirichlet(tag, value) for tag, value in dirichlet_values.items()]
         if boundary_terms:
             bcs.append(neumann(list(boundary_terms.keys())))
@@ -4235,14 +4456,41 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
         )
         return FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs)
 
-    # A coupled steady form `_native_ok` excluded -- a complex coefficient (vs the real-equivalent
-    # complex=True), or a runtime parameter. The native coupled assembler covers linear and nonlinear
-    # real forms (incl. complex=True); reject the rest explicitly rather than mis-assemble.
+    # ---- complex coupled steady: the same Re/Im coefficient split every other complex path makes,
+    # through the SAME coupled assembler (the basis is real, so ``Re(c·T) = Re(c)·T`` per term). Two
+    # real coupled systems with one shared field layout; ``_finalize`` fuses them into the real 2n
+    # block over ``[Re_all; Im_all]`` and the shared Dirichlet row set imposes ``Re u = g, Im u = 0``
+    # through the ± block structure — coupled Helmholtz systems in their natural spelling. ----
+    _cx_coupled = _is_complex_form(domain, ir)
+    _par_coupled = any(_contains_runtime_parameter(b) for b in weak_bares)
+    if _cx_coupled and not _par_coupled:
+        if any(_is_obviously_nonlinear_in_unknown(domain, b) for b in weak_bares):
+            raise NotImplementedError(
+                "jno.fem: a complex NONLINEAR coupled form is not wired — complex forms assemble as "
+                "linear real-equivalent blocks. (Raises rather than dropping the imaginary part.)"
+            )
+        from .utils.solver.fem_native import assemble_fem_native
+
+        real_bd = {tag: [e.real for e in exprs] for tag, exprs in boundary_terms.items()}
+        imag_bd = {tag: [e.imag for e in exprs] for tag, exprs in boundary_terms.items()}
+        domain._fem_problem = None
+        op_r, _mr, offs = assemble_fem_native(
+            domain, [b.real for b in volume_terms], real_bd, dirichlet_raw, [], vec=1, quad_degree=quad_degree
+        )
+        op_i, _mi, _oi = assemble_fem_native(
+            domain, [b.imag for b in volume_terms], imag_bd, dirichlet_raw, [], vec=1, quad_degree=quad_degree
+        )
+        return FEM(domain=domain, op=(op_r, op_i), classification=classification, mode="complex", offsets=offs)
+
+    # A coupled steady form `_native_ok` excluded -- a runtime parameter (the parametric coupled
+    # steady assembly is not wired). The native coupled assembler covers linear and nonlinear real
+    # forms (incl. complex=True) and, above, the linear complex split; reject the rest explicitly
+    # rather than mis-assemble.
     raise NotImplementedError(
-        "jno.fem: this coupled (multi-field) steady form is not supported natively -- it has a complex "
-        f"coefficient ({_is_complex_form(domain, ir)}) or a runtime parameter "
-        f"({any(_contains_runtime_parameter(b) for b in weak_bares)}). Use complex=True for a complex "
-        "field, or recover the parameter on a single-field reduced form."
+        "jno.fem: this coupled (multi-field) steady form is not supported natively -- it has a runtime "
+        f"parameter ({_par_coupled}); the parametric coupled steady assembly is not wired. Recover the "
+        "parameter on a single-field reduced form, or through a coupled first-order transient (which "
+        "does thread runtime parameters)."
     )
 
 
@@ -4259,6 +4507,28 @@ def _sum_forcings(f1, f2):
     return summed
 
 
+def _ic_trial_side(bare: Any) -> Any:
+    """The trial-carrying side of an IC residual ``<trial-expr>(initial) - g`` (or ``None``)."""
+    if getattr(bare, "op", None) == "-" and hasattr(bare, "left") and hasattr(bare, "right"):
+        left, right = bare.left, bare.right
+        if _contains(left, TrialFunction) and not _contains(right, TrialFunction):
+            return left
+        if _contains(right, TrialFunction) and not _contains(left, TrialFunction):
+            return right
+    return None
+
+
+def _ic_component(bare: Any) -> Any:
+    """Which component an IC residual addresses: ``i`` for ``u(initial)[i] - g``, ``None`` for all.
+
+    A vector field written with one IC *per component* produces several residuals, each of which
+    :func:`_ic_value_at_nodes` renders as a full-length vector that is zero outside its own stripe.
+    Combining them by plain assignment would let the last one blank the others, so a caller that
+    accumulates several ICs needs to know which stripe each owns."""
+    trial_side = _ic_trial_side(bare)
+    return None if trial_side is None else _component_index_of(trial_side)
+
+
 def _ic_value_at_nodes(bare: Any, domain: Any, pts: Any, n: int, vec: int = 1) -> Any:
     """Nodal value vector (``n`` dofs, node-major interleaved for ``vec>1``) from an IC residual
     ``<trial-expr>(initial) - g``.
@@ -4269,13 +4539,10 @@ def _ic_value_at_nodes(bare: Any, domain: Any, pts: Any, n: int, vec: int = 1) -
     evaluated at the **assembly** nodes ``pts`` (P2 carries edge nodes, so they differ from the
     linear mesh); a vector ``g`` may be a constant per-component tuple (broadcast to every node), a
     full ``(n_nodes·vec,)`` field, or a single scalar (broadcast to all components)."""
-    trial_side = value_node = None
-    if getattr(bare, "op", None) == "-" and hasattr(bare, "left") and hasattr(bare, "right"):
-        left, right = bare.left, bare.right
-        if _contains(left, TrialFunction) and not _contains(right, TrialFunction):
-            trial_side, value_node = left, right
-        elif _contains(right, TrialFunction) and not _contains(left, TrialFunction):
-            trial_side, value_node = right, left
+    trial_side = _ic_trial_side(bare)
+    value_node = None
+    if trial_side is not None:
+        value_node = bare.right if trial_side is bare.left else bare.left
     if value_node is None:
         return jnp.zeros((n,))
     from .utils.solver.parametric_helpers import _is_neural_coefficient
@@ -4356,6 +4623,7 @@ def _assemble_second_order_time(
     order,
     vec,
     quad_degree,
+    multifield=False,
 ):
     r"""Reduce a linear second-order-in-time weak form to a first-order augmented block.
 
@@ -4385,11 +4653,18 @@ def _assemble_second_order_time(
     well as ``operator_fn``. The constant Dirichlet ``g`` rides ``affine_bias`` and the (possibly
     parametric) load ``F`` rides the forcing.
 
-    Scope: linear, single field — **scalar or vector** (vector = elastodynamics, ``value_shape=(2,)``
-    / ``(3,)``) — nodal Lagrange, 2D/3D, constant Dirichlet. Two initial conditions: displacement
-    ``u(initial) - u0`` and (optional) velocity ``u.t(initial) - v0`` (default zero). Nonlinear,
-    multi-field, time-varying-Dirichlet ``g(x,t)``, or *trainable-Dirichlet-value* second-order forms
-    are rejected (fail-loud) rather than silently mis-assembled.
+    Scope: single field — **scalar or vector** (vector = elastodynamics, ``value_shape=(2,)`` /
+    ``(3,)``) — or, with ``multifield=True``, a **coupled system where every field carries**
+    ``u_tt`` (coupled membranes / waves; the couplings sit in the off-diagonal blocks of the same
+    coupled ``M₂``/``C``/``K``, so the augmented formula is unchanged). Nodal Lagrange, 2D/3D. Two
+    initial conditions per field: displacement ``u(initial) - u0`` and (optional) velocity
+    ``u.t(initial) - v0`` (default zero). Damping ``u_t`` terms, a nonlinear spatial operator
+    (Newton on the augmented residual) and driven boundaries ``g(x,t)`` all apply to the coupled
+    case through the same three branches below. Rejected fail-loud rather than silently
+    mis-assembled: a *trainable Dirichlet value*; a coupled field with **no** ``u_tt`` term (its
+    velocity rows would be silently singular — write a purely first-order field as an explicit
+    first-order system); runtime parameters on a *coupled* form (the parametric coupled steady
+    assembly underneath does not exist yet).
     """
     from .utils.solver.backend_blocks import SemidiscreteTimeBlock
     from .utils.solver.fem_native import assemble_fem_native
@@ -4423,6 +4698,16 @@ def _assemble_second_order_time(
             "jno.fem: a runtime/trainable Dirichlet value on a second-order-in-time problem is not "
             "supported (the held boundary value is a constant); keep the Dirichlet value fixed and "
             "recover the parameter through the operator or load instead."
+        )
+    if multifield and has_param:
+        # The parametric branch re-forms M₂/C/K per step through the STEADY assembly of each group,
+        # and the parametric coupled steady assembly does not exist — letting it run would surface a
+        # confusing "coupled steady form" error from inside a u_tt build.
+        raise NotImplementedError(
+            "jno.fem: runtime/trainable parameters on a COUPLED second-order-in-time form are not "
+            "supported yet — the parametric coupled steady assembly underneath is not wired. A "
+            "single-field parametric u_tt works, and a coupled FIRST-order parametric transient works "
+            "(write each second-order field with an explicit velocity field)."
         )
 
     # Wave / elastodynamics frequencies of soft modes are not resolvable in float32 (silent error).
@@ -4459,8 +4744,10 @@ def _assemble_second_order_time(
     # re-assembles at the runtime args each call, kept differentiable in args so the gradient reaches
     # the parameter through every step of the augmented march. ``A0``/``b0`` are the static
     # placeholders (parameters at 0 / stored weights) used for the ``.M``/``.A`` accessors and sizing.
+    _vec_asm = 1 if multifield else vec  # coupled fields carry their own per-field vec
+
     def _native_group(terms, bterms):
-        op, _mode, _offs = assemble_fem_native(domain, terms, bterms, [], [], vec=vec, quad_degree=quad_degree)
+        op, _mode, _offs = assemble_fem_native(domain, terms, bterms, [], [], vec=_vec_asm, quad_degree=quad_degree)
         if isinstance(op, tuple):  # static (A, b): a parameter-free group
             A0, b0 = _to_bcoo(op[0]), jnp.asarray(op[1]).reshape(-1)  # BCOO — the 2N block is composed sparsely
             return {
@@ -4470,6 +4757,7 @@ def _assemble_second_order_time(
                 "b0": b0,
                 "rpe": {},
                 "is_param": False,
+                "offs": list(_offs),
             }
         # parametric FemLinearSystem: operator_fn(args)/rhs_fn(args) re-assemble at the runtime args.
         return {
@@ -4479,20 +4767,47 @@ def _assemble_second_order_time(
             "b0": jnp.asarray(op.b).reshape(-1),
             "rpe": dict(getattr(op, "runtime_parameter_exprs", {}) or {}),
             "is_param": True,
+            "offs": list(_offs),
         }
 
-    gm = _native_group(mass2_raw, {})  # u_tt -> M2 (mass)
+    if multifield:
+        # Every coupled field must carry a u_tt mass term. The assembler sizes the system by the
+        # domain's registered fields, so a field with NO mass term would get a ZERO M₂ block: its
+        # velocity rows (0·v̇ = 0·v) are silently singular — the layouts would even match. Check by
+        # field key BEFORE assembling.
+        _mass_keys = {_field_key_of(t) for t in mass2_raw}
+        _all_keys = _field_keys(  # trial fields referenced anywhere in the weak form
+            [b for b in volume_terms] + [e for exprs in boundary_terms.values() for e in exprs]
+        )
+        _missing = [k for k in _all_keys if k not in _mass_keys]
+        if _missing:
+            raise NotImplementedError(
+                "jno.fem: a coupled second-order-in-time form needs EVERY field to carry a u_tt mass "
+                f"term; field(s) {sorted(map(str, _missing))} have none. A damping u_t term on a "
+                "second-order field is fine, but a purely first-order (or algebraic) field has no "
+                "velocity block — write the coupled problem as a first-order system with an explicit "
+                "velocity field per second-order field."
+            )
+
+    gm = _native_group(mass2_raw, {})  # u_tt -> M2 (mass; block-diagonal + couplings for multifield)
     n = int(gm["A0"].shape[0])
     dtype = gm["A0"].dtype
     Z = _bcoo_empty(n, n, dtype)  # the zero block / zero damping — sparse, so the 2N block never densifies
     gc = _native_group(damp_raw, {}) if damp_raw else None  # u_t -> C (damping)
     # A nonlinear spatial operator is assembled as a residual/jacobian below, not a linear K matrix.
     gk = None if is_nonlinear else _native_group(stiff_raw, boundary_terms)  # spatial operator K + load F
+    for _g, _nm in ((gc, "damping"), (gk, "stiffness")):
+        if multifield and _g is not None and _g["offs"] != gm["offs"]:
+            raise NotImplementedError(
+                f"jno.fem: coupled second-order-in-time requires one consistent block layout; the "
+                f"{_nm} assembly produced offsets {_g['offs']} against the mass layout {gm['offs']} — "
+                "a mixed-order coupling is not supported. Write it as a first-order system."
+            )
 
     # Dirichlet from the native assembler (it stashes them): constant (dof, value) pairs → the held
     # value rides the affine bias; time-varying entries (dofs, g(x,t) node, coords) → the displacement
     # rows carry u[d]=g(x_d,t) and the velocity rows the compatible v[d]=ġ(x_d,t), written per step.
-    assemble_fem_native(domain, stiff_raw, boundary_terms, dirichlet_raw, [], vec=vec, quad_degree=quad_degree)
+    assemble_fem_native(domain, stiff_raw, boundary_terms, dirichlet_raw, [], vec=_vec_asm, quad_degree=quad_degree)
     pairs = list(getattr(domain, "_fem_native_dirichlet_pairs", []) or [])
     rows = jnp.asarray([p[0] for p in pairs], dtype=int) if pairs else jnp.zeros((0,), dtype=int)
     g = jnp.asarray([p[1] for p in pairs], dtype=dtype) if pairs else jnp.zeros((0,), dtype=dtype)
@@ -4519,16 +4834,35 @@ def _assemble_second_order_time(
 
     # ---- initial state y0 = [u0; v0] from the ICs, made Dirichlet-consistent (u[d]=g, v[d]=0 or ġ(t0)) ----
     # The IC is sampled at the native assembly DOF coordinates (vertices + P2 edge-midpoints), stashed by
-    # the native assembler; ``n = N*vec`` flattens node-major, matching the block layout.
-    pts = jnp.asarray(getattr(domain, "_fem_native_dof_points", domain.mesh.points))[:, : domain.dimension]
+    # the native assembler; ``n = N*vec`` flattens node-major, matching the block layout. A coupled
+    # system places each IC into its field's block (per-field nodes, per-field vec).
     u0 = jnp.zeros((n,), dtype)
     v0 = jnp.zeros((n,), dtype)
-    for ic in ic_residuals:
-        val = jnp.asarray(_ic_value_at_nodes(_bare(ic), domain, pts, n, vec), dtype)
-        if _mto(_bare(ic)) >= 1:
-            v0 = val
-        else:
-            u0 = val
+    if multifield:
+        _keys = list(getattr(domain, "_fem_native_field_keys", []) or [])
+        _fidx = {k: i for i, k in enumerate(_keys)}
+        _moffs = gm["offs"]
+        _pts_all = getattr(domain, "_fem_native_dof_points_all", None)
+        for ic in ic_residuals:
+            fi = _fidx.get(_field_key_of(ic))
+            if fi is None:
+                continue
+            lo, hi = _moffs[fi], _moffs[fi + 1]
+            pts_f = jnp.asarray(_pts_all[fi] if _pts_all is not None else domain.mesh.points)[:, : domain.dimension]
+            vec_i = (hi - lo) // int(pts_f.shape[0])
+            val = jnp.asarray(_ic_value_at_nodes(_bare(ic), domain, pts_f, hi - lo, vec_i), dtype)
+            if _mto(_bare(ic)) >= 1:
+                v0 = v0.at[lo:hi].set(val)
+            else:
+                u0 = u0.at[lo:hi].set(val)
+    else:
+        pts = jnp.asarray(getattr(domain, "_fem_native_dof_points", domain.mesh.points))[:, : domain.dimension]
+        for ic in ic_residuals:
+            val = jnp.asarray(_ic_value_at_nodes(_bare(ic), domain, pts, n, vec), dtype)
+            if _mto(_bare(ic)) >= 1:
+                v0 = val
+            else:
+                u0 = val
     if int(rows.shape[0]):  # constant Dirichlet: u(0)=g, v(0)=0
         u0, v0 = u0.at[rows].set(g), v0.at[rows].set(0.0)
     for dofs, vnode, coords in tv:  # driven boundary: u(0)=g(x,t0), v(0)=ġ(x,t0)
@@ -4579,7 +4913,15 @@ def _assemble_second_order_time(
                 "supported; use a constant Dirichlet value."
             )
         M2, C = gm["A0"], (gc["A0"] if gc else Z)
-        sop, _sm, _so = assemble_fem_native(domain, stiff_raw, boundary_terms, [], [], vec=vec, quad_degree=quad_degree)
+        sop, _sm, _soffs = assemble_fem_native(
+            domain, stiff_raw, boundary_terms, [], [], vec=_vec_asm, quad_degree=quad_degree
+        )
+        if multifield and list(_soffs) != gm["offs"]:
+            raise NotImplementedError(
+                f"jno.fem: coupled second-order-in-time requires one consistent block layout; the "
+                f"nonlinear spatial assembly produced offsets {list(_soffs)} against the mass layout "
+                f"{gm['offs']} — a mixed-order coupling is not supported."
+            )
         M_aug = _dirichlet_M(_bcoo_block([(M2, 0, 0, 1.0), (M2, n, n, 1.0)], (2 * n, 2 * n), dtype))
         rpe = dict(getattr(sop, "runtime_parameter_exprs", {}) or {})
 
@@ -4655,142 +4997,9 @@ def _assemble_second_order_time(
             metadata={"theta": 0.5, "second_order": True, "runtime_parameter_names": list(rpe), "nonaffine_operator": True},
             **common,
         )
-    return FEM(domain=domain, op=block, classification=classification, mode="transient", offsets=[0, n, 2 * n])
-
-
-def _assemble_multifield_second_order(
-    domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, classification, *, quad_degree
-):
-    r"""Coupled multifield second-order-in-time where **every** field carries ``u_tt`` (undamped,
-    value-coupled). With all fields second-order the augmented state ``y=[u_all; v_all]`` reduces to
-    the *single-field* formula with the **coupled block** ``M₂``/``K``::
-
-        [M2  0 ] [u_all']   [ 0   -M2] [u_all]   [ 0 ]
-        [0   M2] [v_all'] + [ K    0 ] [v_all] = [ F ]
-
-    ``M₂`` is the block-diagonal mass over all fields; ``K`` carries the per-field spatial operators and
-    the (value) couplings in its off-diagonal blocks. Two coupled membranes, coupled waves, a system of
-    coupled oscillators — the clean case. **A mixed-order coupling** (a first-order field, i.e. a bare
-    ``u_t`` term) needs a per-field velocity augmentation and is rejected: write it as a first-order
-    system with an explicit velocity field per second-order field.
-    """
-    from .utils.solver.backend_blocks import SemidiscreteTimeBlock
-    from .utils.solver.fem_native import assemble_fem_native
-    from .utils.solver.fem_utils import bcoo_set_dirichlet_rows, bcoo_zero_rows
-    from .utils.solver.parametric_helpers import _contains_runtime_parameter
-    from .utils.solver.solver_helper import max_temporal_derivative_order as _mto
-    from .utils.solver.time_route import _infer_time_window, _strip_temporal_trial_derivative
-    from .utils.solver.weak_form import _apply_sign, _is_obviously_nonlinear_in_unknown, _split_additive_terms
-
-    weak_bares = list(volume_terms) + [e for exprs in boundary_terms.values() for e in exprs]
-    if any(_is_obviously_nonlinear_in_unknown(domain, b) for b in weak_bares):
-        raise NotImplementedError("jno.fem: a nonlinear coupled second-order-in-time form is not supported.")
-    if any(_contains_runtime_parameter(b) for b in weak_bares):
-        raise NotImplementedError(
-            "jno.fem: runtime parameters in a coupled second-order-in-time form are not supported yet."
-        )
-    if any(_is_temporal_value_node(vnode) for *_rest, vnode in dirichlet_raw):
-        raise NotImplementedError(
-            "jno.fem: time-varying Dirichlet on a coupled second-order-in-time form is not supported yet."
-        )
-    _warn_second_order_float32()
-    quad_degree = max(quad_degree, 2)
-
-    def _strip(coeff, times):
-        for _ in range(times):
-            coeff = _strip_temporal_trial_derivative(coeff)
-        return coeff
-
-    mass2_raw, spatial_raw = [], []
-    for bare in volume_terms:
-        for sign, sub in _split_additive_terms(domain, bare):
-            coeff = _apply_sign(domain, sign, sub)
-            o = _mto(sub)
-            if o >= 2:
-                mass2_raw.append(_strip(coeff, 2))
-            elif o == 1:  # a bare u_t → damping / a first-order field: the mixed-order case
-                raise NotImplementedError(
-                    "jno.fem: a coupled second-order-in-time form with a u_t term (damping or a first-order "
-                    "field) is not supported yet — every field must carry u_tt. Write the coupled problem as a "
-                    "first-order system with an explicit velocity field per second-order field."
-                )
-            else:
-                spatial_raw.append(coeff)
-    if not mass2_raw:
-        raise ValueError("jno.fem: coupled second-order route found no `u_tt * phi` mass term.")
-
-    def _mat(terms, bterms):
-        op, _mode, offs = assemble_fem_native(domain, terms, bterms, [], [], vec=1, quad_degree=quad_degree)
-        A = _to_bcoo(op[0] if isinstance(op, tuple) else op.A)  # BCOO — the 2N block is composed sparsely
-        b = jnp.asarray(op[1] if isinstance(op, tuple) else op.b).reshape(-1)
-        return A, b, list(offs)
-
-    M2, _mf, moffs = _mat(mass2_raw, {})  # block-diagonal coupled mass over all fields
-    K, F, koffs = _mat(spatial_raw, boundary_terms)  # coupled spatial operator + load (couplings off-diagonal)
-    if moffs != koffs:
-        raise NotImplementedError(
-            "jno.fem: coupled second-order-in-time requires every field to be second-order with a consistent "
-            "block layout; a mixed-order coupling is not supported yet — write it as a first-order system."
-        )
-    n = int(M2.shape[0])
-    dtype = M2.dtype
-
-    # Dirichlet (dof, value) pairs from the native assembler stash (constant g only)
-    assemble_fem_native(domain, spatial_raw, boundary_terms, dirichlet_raw, [], vec=1, quad_degree=quad_degree)
-    pairs = list(getattr(domain, "_fem_native_dirichlet_pairs", []) or [])
-    rows = jnp.asarray([p[0] for p in pairs], dtype=int) if pairs else jnp.zeros((0,), dtype=int)
-    g = jnp.asarray([p[1] for p in pairs], dtype=dtype) if pairs else jnp.zeros((0,), dtype=dtype)
-    nrows = int(rows.shape[0])
-
-    # ---- initial state y0 = [u_all; v_all] — each IC placed into its field block, displacement vs velocity ----
-    field_keys = list(getattr(domain, "_fem_native_field_keys", []) or [])
-    field_index = {k: i for i, k in enumerate(field_keys)}
-    pts_by_field = getattr(domain, "_fem_native_dof_points_all", None)
-    u0 = jnp.zeros((n,), dtype)
-    v0 = jnp.zeros((n,), dtype)
-    for ic in ic_residuals:
-        bare_ic = _bare(ic)
-        fi = field_index.get(_field_key_of(ic))
-        if fi is None:
-            continue
-        lo, hi = moffs[fi], moffs[fi + 1]
-        pts_f = jnp.asarray(pts_by_field[fi] if pts_by_field is not None else domain.mesh.points)[:, : domain.dimension]
-        val = jnp.asarray(_ic_value_at_nodes(bare_ic, domain, pts_f, hi - lo, 1), dtype)
-        if _mto(bare_ic) >= 1:
-            v0 = v0.at[lo:hi].set(val)  # velocity IC u̇(0)=v0 for this field
-        else:
-            u0 = u0.at[lo:hi].set(val)  # displacement IC u(0)=u0 for this field
-
-    # ---- compose the 2N augmented block (single-field formula, coupled M2/K) — SPARSELY (BCOO), so a large
-    #      coupled wave / membrane system never materialises the dense (2N × 2N) block ----
-    M_aug = _bcoo_block([(M2, 0, 0, 1.0), (M2, n, n, 1.0)], (2 * n, 2 * n), dtype)  # [[M2, 0], [0, M2]]
-    A_aug = _bcoo_block([(M2, 0, n, -1.0), (K, n, 0, 1.0)], (2 * n, 2 * n), dtype)  # [[0, -M2], [K, 0]]
-    c_aug = jnp.concatenate([jnp.zeros((n,), dtype), F])
-    if nrows:  # u[d]=g on displacement rows, v[d]=0 on velocity rows (identity rows, cols kept)
-        _md = jnp.concatenate([rows, rows + n])
-        M_aug = bcoo_zero_rows(M_aug, _md)
-        A_aug = bcoo_set_dirichlet_rows(A_aug, _md)
-        c_aug = c_aug.at[rows].set(g).at[rows + n].set(0.0)
-        u0, v0 = u0.at[rows].set(g), v0.at[rows].set(0.0)
-    domain._fem_problem = None
-    t0, t1, dt = _infer_time_window(domain)
-    block = SemidiscreteTimeBlock(
-        backend="transient",
-        mode="implicit",
-        time_order=2,
-        spatial_kind="weak_form",
-        M=M_aug,
-        A=A_aug,
-        affine_bias=c_aug,
-        state0=jnp.concatenate([u0, v0]),
-        t0=t0,
-        t1=t1,
-        dt=dt,
-        eval_context={},
-        metadata={"theta": 0.5, "second_order": True},
-    )
-    # Field slicing on the augmented state [u1..uF, v1..vF]: displacement blocks then velocity blocks.
-    aug_offsets = list(moffs[:-1]) + [n + o for o in moffs]
+    # Field slicing on the augmented state: displacement blocks then velocity blocks. Single-field
+    # offs = [0, n] gives the familiar [0, n, 2n]; a coupled system gets [u1..uF, v1..vF].
+    aug_offsets = list(gm["offs"][:-1]) + [n + o for o in gm["offs"]]
     return FEM(domain=domain, op=block, classification=classification, mode="transient", offsets=aug_offsets)
 
 

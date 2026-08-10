@@ -55,7 +55,7 @@ def test_transient_adaptive_matches_analytic_heat_decay():
     """The headline oracle: the adaptive trajectory reproduces the analytic decaying eigenmode."""
     kappa = 0.1
     fem, _ = _heat_fem(mesh_size=0.1, kappa=kappa, t_end=0.3, nt=21)
-    traj = fem.solve(adapt=jno.AdaptSpec(anisotropic=True, every=5, max_dofs=6000))
+    traj = fem.solve(adapt=jno.solve.remesh(anisotropic=True, every=5, max_dofs=6000))
 
     assert isinstance(traj, AdaptiveTrajectory)
     assert len(traj) >= 5 and len(traj.states) == len(traj) == len(traj.meshes)
@@ -76,7 +76,7 @@ def test_transient_adaptive_matches_analytic_heat_decay():
 
 def test_transient_adaptive_mesh_actually_changes():
     fem, _ = _heat_fem(mesh_size=0.12, t_end=0.2, nt=21)
-    traj = fem.solve(adapt=jno.AdaptSpec(anisotropic=True, every=4, max_dofs=5000))
+    traj = fem.solve(adapt=jno.solve.remesh(anisotropic=True, every=4, max_dofs=5000))
     sizes = [m[0].shape[0] for m in traj.meshes]
     assert len(set(sizes)) > 1, "the adapted mesh never changed size across the march"
 
@@ -85,14 +85,14 @@ def test_transient_adaptive_holds_a_constant_budget():
     """The transient driver targets a CONSTANT complexity each remesh (redistribute DOFs to follow the
     feature) — it must NOT ratchet the mesh up toward max_dofs every remesh like the steady loop does."""
     fem, _ = _heat_fem(mesh_size=0.1, t_end=0.24, nt=16)
-    traj = fem.solve(adapt=jno.AdaptSpec(anisotropic=True, every=3, max_dofs=4000))
+    traj = fem.solve(adapt=jno.solve.remesh(anisotropic=True, every=3, max_dofs=4000))
     post = [m[0].shape[0] for m in traj.meshes][4:]  # sizes after the first remesh settles
     assert max(post) < 1.5 * min(post), f"vertex count ratcheted instead of holding a budget: {min(post)}..{max(post)}"
 
 
 def test_resample_shape_and_final():
     fem, _ = _heat_fem(mesh_size=0.14, t_end=0.15, nt=13)
-    traj = fem.solve(adapt=jno.AdaptSpec(anisotropic=True, every=4))
+    traj = fem.solve(adapt=jno.solve.remesh(anisotropic=True, every=4))
     ref = jno.Shape.rect(0, 0, 1, 1, size=0.1).domain()
     ys = np.asarray(traj.resample(ref))
     assert ys.shape == (len(traj), len(np.asarray(ref.mesh.points)))
@@ -104,7 +104,7 @@ def test_resample_shape_and_final():
 def test_solve_fn_with_transient_adapt_raises():
     fem, _ = _heat_fem(mesh_size=0.15, t_end=0.1, nt=7)
     with pytest.raises(NotImplementedError, match="owns the time march|solve_fn"):
-        fem.solve(adapt=jno.AdaptSpec(every=3), solve_fn=lambda A, b: b)
+        fem.solve(adapt=jno.solve.remesh(every=3), solve_fn=lambda A, b: b)
 
 
 # ── basis-aware transfer: the ordering-invariant locks (no remesh needed) ─────
@@ -159,7 +159,7 @@ def test_transient_adaptive_p2_scalar_matches_reference():
     exact-to-order, not P1-collapsed."""
     kappa = 0.1
     fem, _ = _heat_fem(mesh_size=0.14, kappa=kappa, t_end=0.25, nt=16, order=2)
-    traj = fem.solve(adapt=jno.AdaptSpec(anisotropic=True, every=4, max_dofs=8000))
+    traj = fem.solve(adapt=jno.solve.remesh(anisotropic=True, every=4, max_dofs=8000))
     assert isinstance(traj, AdaptiveTrajectory)
     assert fem.adapt_history, "expected at least one remesh"
     ref = jno.Shape.rect(0, 0, 1, 1, size=0.08).domain()
@@ -176,7 +176,7 @@ def test_transient_adaptive_p2_scalar_matches_reference():
 def test_metric_field_out_of_range_raises():
     fem, _ = _heat_fem(mesh_size=0.2, t_end=0.1, nt=7)
     with pytest.raises(ValueError, match="out of range"):
-        fem.solve(adapt=jno.AdaptSpec(every=3, metric_field=5))
+        fem.solve(adapt=jno.solve.remesh(every=3, metric_field=5))
 
 
 # ── coupled multifield (scalar-P1) ────────────────────────────────────────────
@@ -204,7 +204,7 @@ def test_transient_adaptive_two_coupled_scalar_fields():
             w(xi0, yi0) - ic,
         ]
     )
-    traj = fem.solve(adapt=jno.AdaptSpec(anisotropic=True, every=5, max_dofs=6000, metric_field=0))
+    traj = fem.solve(adapt=jno.solve.remesh(anisotropic=True, every=5, max_dofs=6000, metric_field=0))
     assert isinstance(traj, AdaptiveTrajectory)
 
     ref = jno.Shape.rect(0, 0, 1, 1, size=0.08).domain()
@@ -247,7 +247,7 @@ def test_transient_adaptive_mixed_order_fields():
     )
     off = fem.offsets
     assert off[1] - off[0] > off[2] - off[1], "expected the P2 block (edge dofs) to be larger than the P1 block"
-    traj = fem.solve(adapt=jno.AdaptSpec(anisotropic=True, every=5, max_dofs=9000, metric_field=0))
+    traj = fem.solve(adapt=jno.solve.remesh(anisotropic=True, every=5, max_dofs=9000, metric_field=0))
     assert isinstance(traj, AdaptiveTrajectory)
 
     ref = jno.Shape.rect(0, 0, 1, 1, size=0.08).domain()
@@ -300,7 +300,7 @@ def test_transient_adaptive_nonlinear_matches_manufactured():
     ic = jno.fn(lambda x, y: jnp.sin(PI * x) * jnp.sin(PI * y), [xi0, yi0])
     fem = jno.fem([weak, u(xb, yb) - 0.0, u(xi0, yi0) - ic])
     assert fem._op.is_nonlinear(), "expected a nonlinear semidiscrete block (mass + residual)"
-    traj = fem.solve(adapt=jno.AdaptSpec(anisotropic=True, every=5, max_dofs=9000))
+    traj = fem.solve(adapt=jno.solve.remesh(anisotropic=True, every=5, max_dofs=9000))
     assert isinstance(traj, AdaptiveTrajectory) and fem.adapt_history
 
     ref = jno.Shape.rect(0, 0, 1, 1, size=0.08).domain()
@@ -319,7 +319,7 @@ def test_transient_adaptive_nonlinear_slot_composes():
     runs the same nonlinear adaptive march and lands close to the default-solver result."""
     fem, _ = _nonlinear_reaction_fem(0.11, t_end=0.15, nt=13)
     traj = fem.solve(
-        adapt=jno.AdaptSpec(anisotropic=True, every=4, max_dofs=8000),
+        adapt=jno.solve.remesh(anisotropic=True, every=4, max_dofs=8000),
         nonlinear=jno.solve.newton(max_steps=40, rtol=1e-9, atol=1e-11),
     )
     assert isinstance(traj, AdaptiveTrajectory) and fem.adapt_history
@@ -332,7 +332,7 @@ def test_transient_adapt_rejects_warm_start_x0():
     """x0= (warm start) still cannot compose with adapt= — the DOF layout changes across a remesh."""
     fem, _ = _heat_fem(mesh_size=0.2, t_end=0.1, nt=7)
     with pytest.raises(NotImplementedError, match="x0=|warm start|do not compose"):
-        fem.solve(adapt=jno.AdaptSpec(every=3), x0=jnp.zeros(1))
+        fem.solve(adapt=jno.solve.remesh(every=3), x0=jnp.zeros(1))
 
 
 # ── Taylor-Hood (vector P2 + scalar P1): the headline mixed case ──────────────
@@ -369,7 +369,7 @@ def test_transient_adaptive_vector_p2_plus_scalar_p1():
     )
     off = fem.offsets
     assert len(off) == 3 and (off[1] - off[0]) > (off[2] - off[1])  # vector-P2 block > scalar-P1 block
-    traj = fem.solve(adapt=jno.AdaptSpec(anisotropic=True, every=5, max_dofs=12000, metric_field=0))
+    traj = fem.solve(adapt=jno.solve.remesh(anisotropic=True, every=5, max_dofs=12000, metric_field=0))
     assert isinstance(traj, AdaptiveTrajectory)
 
     ref = jno.Shape.rect(0, 0, 1, 1, size=0.08).domain()
@@ -423,8 +423,63 @@ def test_transient_adaptive_pressure_pin_survives_remesh():
     cont = qb * (uxx + uyy)
     fem = jno.fem([mom, cont, u(xb, yb) - 0.0, p.pin(), u(xi0, yi0) - 0.0])
     assert len(fem.offsets) == 3 and not fem.is_linear  # P2 vel + P1 pressure saddle, nonlinear
-    traj = fem.solve(adapt=jno.AdaptSpec(anisotropic=True, every=2, max_dofs=4000, metric_field=0))
+    traj = fem.solve(adapt=jno.solve.remesh(anisotropic=True, every=2, max_dofs=4000, metric_field=0))
     assert isinstance(traj, AdaptiveTrajectory) and fem.adapt_history  # remeshed >= once -> pin re-derived each time
     ref = jno.Shape.rect(0, 0, 1, 1, size=0.1).domain()
     yv = np.asarray(traj.resample(ref, field=0))
     assert np.all(np.isfinite(yv)) and float(np.abs(yv[-1]).max()) > 1e-3  # a finite flow developed; the gauge held
+
+
+def test_builtin_edge_regions_survive_a_remesh():
+    """A Dirichlet condition on a **built-in** edge (``left``/``right``) must keep working across a remesh.
+
+    The mesh generator's named edge regions are baked into the ORIGINAL mesh as cell sets; the remeshed
+    mesh carries only ``interior``/``boundary``, so they used to vanish at the first remesh and the
+    condition bound to them reached ``jno.fem`` as a whole-domain residual with a trial but no test
+    function — an error naming neither the mesh nor the region that disappeared.  Only ``.tag()``
+    regions survived, because a predicate is mesh-independent.
+
+    Two edges at *different* Dirichlet values, which is what forces per-edge regions in the first place
+    (an aggregate ``boundary`` region cannot express it).  Pinned against the same problem with both
+    edges written as explicit ``.tag()`` predicates: the two must agree, since they are the same regions.
+    """
+
+    def build(builtin_left):
+        d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.15).domain(time=(0.0, 0.2, 6))
+        d.tag("right_edge", lambda x, y: x > 1.0 - 1e-9)
+        if builtin_left:
+            left = "left"
+        else:
+            d.tag("left_edge", lambda x, y: x < 1e-9)
+            left = "left_edge"
+        u, phi = d.fem_symbols()
+        xi, yi, ti = d.variable("interior", split=True)
+        xl, yl, _ = d.variable(left, split=True)
+        xr, yr, _ = d.variable("right_edge", split=True)
+        ci = d.variable("initial", split=True)
+        ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+        return jno.fem(
+            [
+                ui.t * vi + 0.05 * (ui.x * vi.x + ui.y * vi.y),
+                u(xl, yl) - (-1.0),
+                u(xr, yr) - (+1.0),
+                u(ci[0], ci[1]) - jno.fn(lambda x: 2.0 * x - 1.0, [ci[0]]),
+            ]
+        ), d
+
+    ref = jno.Shape.rect(0, 0, 1, 1, size=0.12).domain()
+    out = {}
+    for builtin in (True, False):
+        fem, _ = build(builtin)
+        traj = fem.solve(adapt=jno.solve.remesh(anisotropic=True, every=2, max_dofs=400))
+        assert fem.adapt_history, "expected at least one remesh"
+        out[builtin] = np.asarray(traj.resample(ref))
+
+    # The Dirichlet data is still imposed after remeshing: the field spans [-1, +1] across x.
+    final = out[True][-1]
+    assert np.all(np.isfinite(final))
+    xr_ = np.asarray(ref.mesh.points)[:, 0]
+    assert final[np.argmin(xr_)] < -0.5 < 0.5 < final[np.argmax(xr_)], "the per-edge Dirichlet values were lost"
+
+    # ... and the built-in edge names the same region as the equivalent predicate tag.
+    assert np.allclose(out[True], out[False], atol=1e-8), "built-in edge and .tag() predicate disagree"

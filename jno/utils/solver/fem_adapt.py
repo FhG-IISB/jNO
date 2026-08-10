@@ -27,6 +27,7 @@ across a remesh in a transient / moving-mesh loop), ``zz_error_indicators``, ``d
 from __future__ import annotations
 
 import copy
+import itertools
 from dataclasses import dataclass
 from typing import Any
 
@@ -171,11 +172,17 @@ def remesh_with_mmg(
     domain geometry is preserved exactly; boundary edges are left splittable so the
     boundary can still be refined along its straight segments.
     """
-    import mmgpy  # lazy: optional dependency, only needed for adaptive refinement
-
     dim = int(domain.dimension)
+    if dim == 1:
+        # mmg has no 1-D mode, and needs none: an interval mesh is a sorted list of vertices, so
+        # honouring a size field is subdivision rather than remeshing. Same signature and the same
+        # returned domain, so every caller (the steady AFEM loop, the transient re-mesher) is
+        # dimension-agnostic above this line.
+        return _remesh_line_1d(domain, vertex_size, hmin=hmin, hmax=hmax, hgrad=hgrad, copy=copy)
     if dim not in (2, 3):
-        raise NotImplementedError(f"remesh_with_mmg supports 2D/3D simplicial meshes; got dimension {dim}.")
+        raise NotImplementedError(f"remesh_with_mmg supports 1D line and 2D/3D simplicial meshes; got dimension {dim}.")
+
+    import mmgpy  # lazy: optional dependency, only needed for adaptive refinement
 
     pts = np.asarray(domain.mesh.points)[:, :dim].astype(np.float64)
     field = np.asarray(vertex_size, dtype=np.float64)
@@ -241,6 +248,59 @@ def remesh_with_mmg(
     return _domain_from_arrays(domain, v_out, np.asarray(t_out), np.asarray(f_out), copy=copy)
 
 
+def _remesh_line_1d(domain: Any, vertex_size: Any, *, hmin, hmax, hgrad: float, copy: bool):
+    """Rebuild a 1-D line mesh to honour a per-vertex target size — the 1-D face of
+    :func:`remesh_with_mmg`.
+
+    An interval mesh *is* a sorted vertex list, so there is nothing to remesh: each element is
+    subdivided into as many equal pieces as its requested size demands. That makes the 1-D path exact
+    where mmg is approximate, and it needs no optional dependency.
+
+    ``hgrad`` is the size gradation mmg applies in 2-D/3-D — the cap on the ratio between neighbouring
+    edge lengths. Without it a sharply peaked estimator produces a 100x jump between adjacent elements,
+    which is both wasteful and badly conditioned; it is imposed here by two monotone sweeps over the
+    sorted vertices (forward then backward), the 1-D form of mmg's gradation.
+
+    The endpoints are never moved, so the domain's geometry is preserved exactly.
+    """
+    verts = np.asarray(domain.mesh.points)[:, 0].astype(np.float64)
+    cells = np.asarray(domain.mesh.cells_dict["line"], dtype=np.int64)
+    sizes = np.asarray(vertex_size, dtype=np.float64).reshape(-1)
+    if sizes.shape[0] != verts.shape[0]:
+        raise ValueError(f"metric field has {sizes.shape[0]} entries but the mesh has {verts.shape[0]} vertices.")
+    if not np.all(sizes > 0):
+        raise ValueError("vertex_size must be strictly positive.")
+
+    lengths = np.abs(verts[cells[:, 1]] - verts[cells[:, 0]])
+    hmin = float(sizes.min()) * 0.5 if hmin is None else float(hmin)
+    hmax = float(sizes.max()) * 2.0 if hmax is None else float(hmax)
+    sizes = np.clip(sizes, hmin, hmax)
+
+    order = np.argsort(verts)
+    xs, s = verts[order], sizes[order].copy()
+    # Gradation, as mmg means it: the ratio between ADJACENT edge sizes is capped at `hgrad`. One
+    # forward and one backward sweep is enough — after them every neighbouring pair satisfies the cap,
+    # because each sweep is monotone in the direction it travels.
+    for i in range(1, len(xs)):
+        s[i] = min(s[i], s[i - 1] * hgrad)
+    for i in range(len(xs) - 2, -1, -1):
+        s[i] = min(s[i], s[i + 1] * hgrad)
+
+    out = [xs[0]]
+    for i in range(len(xs) - 1):
+        a, b = xs[i], xs[i + 1]
+        n_sub = max(1, int(np.ceil((b - a) / min(s[i], s[i + 1]))))
+        out.extend(np.linspace(a, b, n_sub + 1)[1:])
+    new_x = np.asarray(out, dtype=np.float64)
+    del lengths
+
+    n = new_x.shape[0] - 1
+    new_cells = np.column_stack([np.arange(n), np.arange(1, n + 1)]).astype(np.int64)
+    # the boundary of an interval is its two endpoint VERTICES (the block `jno.domain.line` builds)
+    bfacets = np.array([[0], [n]], dtype=np.int64)
+    return _domain_from_arrays(domain, new_x.reshape(-1, 1), new_cells, bfacets, copy=copy)
+
+
 def _domain_from_arrays(template: Any, points: np.ndarray, elems: np.ndarray, bfacets: np.ndarray, *, copy: bool):
     """Apply remeshed ``points / elements / boundary-facets`` to a domain.
 
@@ -260,7 +320,7 @@ def _domain_from_arrays(template: Any, points: np.ndarray, elems: np.ndarray, bf
     elems = np.asarray(elems, dtype=np.int64)
     bfacets = np.asarray(bfacets, dtype=np.int64)
 
-    elem_type, facet_type = ("triangle", "line") if dim == 2 else ("tetra", "triangle")
+    elem_type, facet_type = {1: ("line", "vertex"), 2: ("triangle", "line")}.get(dim, ("tetra", "triangle"))
     cells = [(elem_type, elems), (facet_type, bfacets)]
     n_e, n_f = len(elems), len(bfacets)
     empty = np.asarray([], dtype=np.int64)
@@ -268,6 +328,13 @@ def _domain_from_arrays(template: Any, points: np.ndarray, elems: np.ndarray, bf
         "interior": [np.arange(n_e, dtype=np.int64), empty],
         "boundary": [empty, np.arange(n_f, dtype=np.int64)],
     }
+    if dim == 1:
+        # `jno.domain.line` names the two endpoint vertices; re-declare them here so `left` / `right`
+        # survive the remesh as cell sets, exactly as the mesh generator's named edge regions are
+        # re-derived geometrically in 2D/3D by `_capture_geometric_boundary_tags`.
+        lo = int(np.argmin(points[:, 0][np.asarray(bfacets).reshape(-1)]))
+        cell_sets["left"] = [empty.copy(), np.array([lo], dtype=np.int64)]
+        cell_sets["right"] = [empty.copy(), np.array([1 - lo], dtype=np.int64)]
     new_mesh = meshio.Mesh(pts3, cells, cell_sets=cell_sets)
 
     target = _shallow_copy(template) if copy else template
@@ -275,6 +342,9 @@ def _domain_from_arrays(template: Any, points: np.ndarray, elems: np.ndarray, bf
     for attr in list(vars(target)):
         if attr.startswith("_fem_native") or attr in ("_fem_assembly_cache", "_integral_weight_cache"):
             delattr(target, attr)
+    # Give the mesh-generator's named boundary regions a predicate BEFORE the reset, so they are
+    # re-derived on the new mesh exactly like a user `.tag()` (see `_capture_geometric_boundary_tags`).
+    _capture_geometric_boundary_tags(target)
     # Drop the OLD mesh's predicate-tag state (boundary regions / indices / normals / pools /
     # context) so a re-tag re-derives it cleanly on the new mesh; stale surface-tag state otherwise
     # corrupts re-assembled Neumann/Robin/absorbing terms (predicates in `_tag_predicates` are kept).
@@ -288,6 +358,64 @@ def _domain_from_arrays(template: Any, points: np.ndarray, elems: np.ndarray, bf
     if getattr(target, "_is_time_dependent", False) and getattr(target, "time", None) is not None:
         target._add_time_dimension(*target.time)
     return target
+
+
+def _capture_geometric_boundary_tags(domain: Any) -> None:
+    """Give every named boundary region a **mesh-independent predicate**, so it survives a remesh.
+
+    The mesh generator's named edge regions (``left`` / ``right`` / ``top`` / ``bottom`` / any
+    ``Shape`` sub-boundary) are baked into the ORIGINAL mesh as *cell sets*.  A remeshed mesh carries
+    only ``interior`` and ``boundary`` (:func:`_domain_from_arrays` builds exactly those), so those
+    names vanish at the first remesh — and a Dirichlet condition bound to one of them then reaches
+    ``jno.fem`` as a whole-domain residual with a trial but no test function, failing with an error
+    that names neither the mesh nor the region that disappeared.  Only ``.tag()`` regions survived,
+    because a *predicate* is mesh-independent and the drivers re-apply it.
+
+    The domain does keep a mesh-independent description of each named boundary: the shapely curve it
+    registered in ``_polygon_tags``.  Turn that into the same kind of spatial predicate a user
+    ``.tag()`` supplies — "within tol of this curve" — and every existing re-tag path re-derives the
+    region on whatever mesh comes next.  A **distance** test, not ``contains``: these are curves, and
+    a point-in-curve test is false for essentially every floating-point node.  Remeshing preserves the
+    boundary *geometry* (only its discretisation changes), so the new nodes lie on the same curve.
+
+    The description used is the region's own ``BoundaryRegion`` — the segments (2-D) or triangles (3-D)
+    it was registered with — and its ``contains`` test, so no new geometry code is introduced and both
+    dimensions are covered by construction.  Remeshing preserves the boundary *geometry* (only its
+    discretisation changes), so the new nodes lie on those same facets.
+
+    A **distance-to-facet** test, not a point-in-curve one: these regions are curves/surfaces, and an
+    exact containment test is false for essentially every floating-point node.
+
+    Idempotent, and it never overrides a predicate that is already there — a user ``.tag()`` of the
+    same name keeps its own definition.  The aggregate ``boundary`` region is skipped: it is rebuilt
+    from the new mesh's cell sets directly.
+    """
+    regions = getattr(domain, "_boundary_regions", None)
+    if not isinstance(regions, dict):
+        return
+    preds = getattr(domain, "_tag_predicates", None)
+    if preds is None:
+        preds = domain._tag_predicates = {}
+
+    for name, region in list(regions.items()):
+        if name in preds or name == "boundary":
+            continue  # already predicate-backed (a user tag), or the aggregate (rebuilt from the mesh)
+        if region is None or not hasattr(region, "contains"):
+            continue
+        has_facets = any(
+            getattr(region, attr, None) is not None and len(getattr(region, attr)) > 0 for attr in ("edges", "triangles")
+        )
+        if not has_facets:
+            continue
+
+        def _on_region(*coords, _r=region):
+            import jax
+            import jax.numpy as jnp
+
+            pts = np.stack([np.asarray(c, dtype=float).reshape(-1) for c in coords], axis=-1)
+            return np.asarray(jax.vmap(_r.contains)(jnp.asarray(pts)))
+
+        preds[name] = _on_region
 
 
 def _shallow_copy(domain: Any):
@@ -350,6 +478,283 @@ def _locate_barycentric(src_pts: np.ndarray, src_cells: np.ndarray, qpts: np.nda
     return src_cells[cell_idx].astype(np.int64), weights, inside
 
 
+def _one_ring_cells(cells: np.ndarray, n_vert: int) -> tuple[np.ndarray, np.ndarray]:
+    """``(cand, mask)`` -- for each vertex, the cells incident to it, padded to a fixed width.
+
+    Connectivity only, so a connectivity-preserving march hoists this ONCE and it is a compile-time
+    constant. ``cand`` is ``(n_vert, R)`` cell indices (padding repeats the vertex's first cell, so a
+    padded slot is a *valid* simplex and never produces a singular solve) and ``mask`` ``(n_vert, R)``
+    marks the real entries."""
+    cells = np.asarray(cells, dtype=np.int64)
+    n_local = cells.shape[1]
+    vid = cells.reshape(-1)
+    cid = np.repeat(np.arange(cells.shape[0], dtype=np.int64), n_local)
+    order = np.argsort(vid, kind="stable")
+    vid, cid = vid[order], cid[order]
+    counts = np.bincount(vid, minlength=n_vert)
+    width = int(counts.max()) if len(counts) else 1
+    starts = np.concatenate([[0], np.cumsum(counts)[:-1]])
+    cand = np.zeros((n_vert, width), dtype=np.int64)
+    mask = np.zeros((n_vert, width), dtype=bool)
+    for j in range(width):
+        take = counts > j
+        cand[take, j] = cid[starts[take] + j]
+        mask[take, j] = True
+    # a vertex in no cell would leave an all-invalid row; point it at cell 0 so the solve stays regular
+    cand[~mask.any(axis=1), :] = 0
+    cand = np.where(mask, cand, cand[:, :1])
+    return cand, mask
+
+
+def _locate_in_one_ring_jax(src_pts, cells, cand, mask, qpts, *, tol: float = 1e-9):
+    """P1 stencil + weights for each query point, searching only its own vertex's incident cells.
+
+    The moving-mesh transfer asks a special question: query ``i`` is vertex ``i`` displaced by less than
+    an element, on a mesh with the SAME connectivity. Its containing simplex is therefore in vertex
+    ``i``'s one-ring, so the candidate set is fixed by connectivity instead of found by a KD-tree --
+    static shapes, and differentiable in the positions. Same barycentric algebra as
+    :func:`_locate_in_cells`, batched over a static candidate axis.
+
+    Returns ``(idx, weights, escaped, cell)``: ``idx`` ``(Q, D+1)`` source-vertex indices, ``weights``
+    ``(Q, D+1)`` barycentric coordinates, ``escaped`` ``(Q,)`` True where the point fell outside every
+    candidate (the caller decides; the host route clamps such points silently), and ``cell`` ``(Q,)`` the
+    chosen source cell. A P1 caller wants ``idx``, since a P1 field's DOFs *are* the vertices; a
+    higher-order one wants ``cell``, to index that cell's row of the P{k} connectivity. Both are returned
+    rather than derived by the caller, because re-deriving the cell from its vertex set is a search where
+    here it is already known."""
+    import jax.numpy as jnp
+
+    dim = qpts.shape[1]
+    cell_v = jnp.asarray(cells)[jnp.asarray(cand)]  # (Q, R, D+1)
+    V = src_pts[cell_v]  # (Q, R, D+1, D)
+    v0 = V[:, :, 0, :]
+    T = jnp.swapaxes(V[:, :, 1:, :] - v0[:, :, None, :], 2, 3)  # columns v_i - v0
+    rhs = qpts[:, None, :] - v0
+    det = jnp.linalg.det(T)
+    safe = jnp.abs(det) > 1e-300
+    Tsafe = jnp.where(safe[..., None, None], T, jnp.eye(dim, dtype=T.dtype))
+    lam_rest = jnp.linalg.solve(Tsafe, rhs[..., None])[..., 0]
+    lam = jnp.concatenate([(1.0 - lam_rest.sum(axis=-1))[..., None], lam_rest], axis=-1)  # (Q, R, D+1)
+
+    valid = jnp.asarray(mask) & safe
+    inside = valid & jnp.all(lam >= -tol, axis=-1)
+    worst = jnp.where(valid, jnp.min(lam, axis=-1), -jnp.inf)  # best-effort pick when nothing contains it
+    choice = jnp.where(jnp.any(inside, axis=1), jnp.argmax(inside.astype(jnp.int32), axis=1), jnp.argmax(worst, axis=1))
+    q = jnp.arange(qpts.shape[0])
+    chosen_lam, chosen_idx = lam[q, choice], cell_v[q, choice]
+    hit = jnp.any(inside, axis=1)
+
+    proj = jnp.clip(chosen_lam, 0.0, None)  # nearest-simplex projection, as the host route does
+    proj = proj / jnp.clip(proj.sum(axis=1, keepdims=True), 1e-300, None)
+    return chosen_idx, jnp.where(hit[:, None], chosen_lam, proj), ~hit, jnp.asarray(cand)[q, choice]
+
+
+def _cell_patch_cells(cells: np.ndarray, n_vert: int) -> tuple[np.ndarray, np.ndarray]:
+    """``(cand, mask)`` -- for each CELL, the cells sharing at least one vertex with it, padded to a fixed
+    width. The cell-level twin of :func:`_one_ring_cells`.
+
+    :func:`_l2_transfer_jax` asks a different question from the vertex transfer: its query points are a
+    cell's *quadrature* points on the moved mesh, not a moved vertex, so the containing old cell is not in
+    any one vertex's ring -- it is in the union of the rings of the cell's own vertices. Connectivity only,
+    so a connectivity-preserving march hoists this once and it rides the scan as a constant."""
+    cells = np.asarray(cells, dtype=np.int64)
+    ring, rmask = _one_ring_cells(cells, n_vert)
+    # union the incident-cell lists of a cell's own vertices, per cell
+    per = ring[cells]  # (n_cells, n_local, R)
+    flat = np.where(rmask[cells], per, -1).reshape(cells.shape[0], -1)  # (n_cells, n_local*R)
+
+    # Row-wise unique WITHOUT a Python loop. A per-row `np.unique` cost 87.7 ms at 23k cells and grows
+    # linearly (~0.4 s at 100k), which is real on this library's dominant cost, the build. Sorting puts
+    # duplicates adjacent and the -1 padding first, so "keep" is a shifted comparison, and a stable
+    # argsort on `~keep` compacts the survivors left in one gather.
+    s = np.sort(flat, axis=1)
+    keep = s >= 0
+    keep[:, 1:] &= s[:, 1:] != s[:, :-1]
+    order = np.argsort(~keep, axis=1, kind="stable")
+    s, keep = np.take_along_axis(s, order, axis=1), np.take_along_axis(keep, order, axis=1)
+    width = max(int(keep.sum(axis=1).max()), 1)
+    cand, mask = s[:, :width].copy(), keep[:, :width]
+    # padding repeats the row's first candidate, so a padded slot is a VALID simplex and never
+    # produces a singular solve -- the same convention `_one_ring_cells` uses
+    cand = np.where(mask, cand, cand[:, :1])
+    return cand, mask
+
+
+def _l2_transfer_jax(
+    X_old, X_new, cells, dim, u, off, *, orders=None, vecs=None, cells_f=None, qdeg=None, tol=None, maxiter: int = 200
+):
+    r"""Carry a finite-element state from the old mesh onto the moved one by **conservative L2
+    projection** -- the Galerkin transfer ``M(X_new) u_new = b``, ``b_i = ∫_{Ω_new} u_old φ_i^new``. Pure
+    JAX, static shapes, differentiable in both meshes and in ``u``.
+
+    Handles **any nodal-Lagrange order and value shape**, per field: pass ``orders`` / ``vecs`` /
+    ``cells_f`` from :func:`_field_layout` (defaults describe scalar P1). Two things make the
+    higher-order case cheap rather than a rewrite. The mesh geometry is **P1 whatever the field order**
+    -- a moved simplex stays straight-sided -- so the quadrature map and the point location are shared by
+    every field and computed once. And the P{k} connectivity is **unchanged by the move**, because the
+    move preserves topology; only the vertex positions differ, so the seed assembly's ``cells_f`` stays
+    valid for the whole march and the new DOF *coordinates* are never needed at all.
+
+    Replaces a pointwise re-interpolation (``u_new[i] = u_old(x_new[i])``, still available as
+    :func:`_locate_in_one_ring_jax`, which remains this function's point-location core and its test
+    oracle). Pointwise sampling is neither conservative nor optimal, and it is applied once per step so
+    its error **accumulates**: on a rigid translation carrying a Gaussian bump with ``κ ≈ 0`` -- where the
+    exact answer is "the field never changes at a fixed spatial point" -- the peak fell 27.6 % over 2
+    steps and 33.0 % over 16. Refining ``dt`` made the answer *worse*, which is the opposite of what a
+    first-order scheme should do.
+
+    Measured against the route it replaces (same problem, same mesh):
+
+    ============================  ==================  ==================
+    rigid translation, peak       pointwise           L2
+    ============================  ==================  ==================
+    2 steps                       -27.6 %             **-11.5 %**
+    16 steps                      -33.0 %             **-9.1 %**
+    ============================  ==================  ==================
+
+    -- three times less loss, and the sign of the *trend* flips: refining ``dt`` now helps, where before
+    every extra step cost more. A zero-velocity march is untouched either way (0.00 %), and transferring
+    between two identical meshes returns the field bit-for-bit, which is the sharp self-test: the system
+    is then ``M u_new = M u_old``.
+
+    **Conservation is algebraic but not exact.** ``Σ_i φ_i = 1`` gives ``Σ_i b_i = ∫_{Ω_new} u_old`` and
+    ``Σ_i (M u_new)_i = ∫_{Ω_new} u_new`` by construction, so the projection conserves whatever the load
+    vector integrated. What it integrated is only accurate to the quadrature, and the integrand
+    ``u_old·φ_i^new`` is piecewise-quadratic **with kinks** wherever an old cell edge crosses a new cell --
+    which no smooth rule integrates exactly. Measured on a fixed domain (interior vertices jittered, so
+    ``Ω`` cannot change), relative drift in ``∫u``:
+
+    ============  ================  ================
+    jitter        pointwise         L2
+    ============  ================  ================
+    0.004         3.2e-03           **1.5-2.5e-04**
+    0.012         8.6e-03           **2.4-5.8e-04**
+    ============  ================  ================
+
+    The spread is across ``qdeg`` 2/3/4 and is **not monotone in it** -- the residual is set by the kinks,
+    not by the rule, so raising the degree buys nothing. Exact conservation would need the old/new
+    supermesh (Farrell & Maddison, *Conservative interpolation between volume meshes*, CMAME **200**
+    (2011) 89-100), whose intersections are variable-size polygons and therefore not traceable. ``qdeg=3``
+    is the default because it is exact for the *unbroken* quadratic and measures no worse than 4.
+
+    **What this does not fix.** An L2 projection is still a contraction, so it reduces the peak loss
+    rather than removing it (and, not being monotone, it overshoots slightly where the pointwise route
+    undershoots). Removing it entirely means not transferring at all -- holding the DOFs on the moving
+    vertices (Lagrangian) and carrying the motion in an ALE ``-w·∇u`` term instead, which is a different
+    semidiscretisation, not a better transfer.
+
+    **Cost.** More location work than the pointwise route (a cell's quadrature points against a wider
+    patch, rather than one moved vertex against its own ring) plus a mass solve, but the march is
+    dominated by the θ-step: end to end, 513 vertices over 10 steps measured 2.03 s -> 2.24 s, i.e. ~10 %,
+    for an identical mesh trajectory.
+
+    Steps, all of them traceable: the reference rule comes from ``basix.make_quadrature`` (the same
+    builder the assembler uses); the physical points are affine in ``X_new``; each is located in the OLD
+    mesh over its cell's fixed-width patch (:func:`_cell_patch_cells`); the load vector is a
+    ``segment_sum`` scatter; and the mass is applied matrix-free under Jacobi-CG, the vector case being
+    ``M ⊗ I`` so every component rides one solve.
+
+    The test functions are tabulated on the host, at the fixed reference quadrature points. The old field
+    has to be read at the **located** points, which are tracers, so those go through
+    :func:`_lagrange_monomial_coeffs` instead. One basis, two evaluation routes, only because one input is
+    static and the other is not -- and both are built from the single ``_lagrange_basix`` element, so they
+    cannot drift apart.
+
+    ``Ω_new ⊄ Ω_old`` where a boundary moves outward: such quadrature points clamp to the nearest simplex
+    exactly as the pointwise route does, and conservation then holds against that clamped extension rather
+    than the true integral. The returned ``escaped`` flag reports it.
+
+    Returns ``(u_new, escaped)``.
+    """
+    import jax
+    import jax.numpy as jnp
+    from basix import CellType, make_quadrature
+
+    cells_j = jnp.asarray(cells)
+    n_cells = cells.shape[0]
+    n_fields = len(off) - 1
+    orders = [1] * n_fields if orders is None else [int(o) for o in orders]
+    vecs = [1] * n_fields if vecs is None else [int(v) for v in vecs]
+    cells_f = [cells] * n_fields if cells_f is None else [np.asarray(c) for c in cells_f]
+
+    # The mass ∫φᵢφⱼ is degree 2k and MUST be integrated exactly -- under-integrate it and ``M`` is not
+    # the mass matrix, so the solve is not a projection at all. One rule serves every field (a
+    # higher-degree rule is merely wasted on a lower-order one). The load vector cannot be exact at any
+    # degree, because its integrand has kinks; 2k is what makes the operator right, not the data.
+    if qdeg is None:
+        qdeg = max(3, 2 * max(orders))
+    qp, qw = make_quadrature(CellType.triangle if dim == 2 else CellType.tetrahedron, int(qdeg))
+    qp, qw = np.asarray(qp, dtype=np.float64), np.asarray(qw, dtype=np.float64)
+    qp_j, qw_j = jnp.asarray(qp, dtype=X_new.dtype), jnp.asarray(qw, dtype=X_new.dtype)
+
+    # physical quadrature points on the NEW mesh: affine in the moved vertices. The GEOMETRY is P1
+    # whatever the field order -- a moved simplex stays straight-sided -- so this is the same map for
+    # every field, and only the basis tabulated on it changes.
+    v_new = X_new[cells_j]  # (n_cells, n_loc, dim)
+    J_new = jnp.stack([v_new[:, i + 1] - v_new[:, 0] for i in range(dim)], axis=2)  # columns are edges
+    detJ = jnp.abs(jnp.linalg.det(J_new))  # (n_cells,)
+    # x(q) = v0 + sum_d xi_d * edge_d. `J_new[c, :, d]` IS edge d (columns are edges), so the contraction
+    # runs over J's LAST axis -- the batched form of the assembler's `verts[0] + qp @ J.T`.
+    xq = v_new[:, 0][:, None, :] + jnp.einsum("qd,ced->cqe", qp_j, J_new)  # (n_cells, nq, dim)
+
+    # Locate every new quadrature point in the OLD mesh. Done ONCE and shared by every field: the point
+    # set is the field-independent geometry, and only what is evaluated there differs.
+    cand, cmask = _cell_patch_cells(np.asarray(cells), X_new.shape[0])
+    _idx, w, esc, src_cell = _locate_in_one_ring_jax(
+        X_old,
+        cells,
+        np.repeat(cand, qp.shape[0], axis=0),
+        np.repeat(cmask, qp.shape[0], axis=0),
+        xq.reshape(-1, dim),
+    )
+    w = jnp.asarray(w, dtype=X_new.dtype)
+    # the located point's REFERENCE coordinates in its old cell: barycentric lambda_1..lambda_d, which is
+    # exactly the chart `_tabulate_lagrange_at` / `_lagrange_monomial_coeffs` are written on
+    xi_src = w[:, 1:]
+
+    if tol is None:
+        tol = max(1e-13, 100.0 * float(jnp.finfo(X_new.dtype).eps))
+
+    outs = []
+    for f in range(n_fields):
+        k, vec, cf = orders[f], vecs[f], jnp.asarray(cells_f[f])
+        n_nodes = (off[f + 1] - off[f]) // vec
+        phi_q = jnp.asarray(_tabulate_lagrange_at(dim, k, qp), dtype=X_new.dtype)  # (nq, n_dof) -- host
+
+        # The TEST functions sit at fixed reference quadrature points, so basix tabulates them on the
+        # host. The OLD field must be read at the LOCATED points, which are traced, so those go through
+        # the polynomial form. Same basis, two evaluation routes only because one input is static and the
+        # other is not -- both come from the one `_lagrange_basix` builder, so they cannot disagree.
+        exps, coef = _lagrange_monomial_coeffs(dim, k)
+        phi_src = _eval_lagrange_traced(xi_src, exps, coef)  # (n_cells*nq, n_dof)
+
+        blk = u[off[f] : off[f + 1]].reshape(n_nodes, vec)  # node-major: node*vec + comp
+        # u_old at every new quadrature point, all components at once
+        uq = jnp.einsum("pn,pnv->pv", phi_src, blk[cf[src_cell]]).reshape(n_cells, -1, vec)
+
+        # Mass on the NEW mesh from the SAME rule as the load vector -- not a closed form. Two
+        # computations of one integral disagree at round-off, and that difference IS the answer when the
+        # meshes coincide: `b - M u_old` must be exactly zero there. With two routes it was ~1e-7 in
+        # float32 and a still mesh drifted instead of transferring untouched.
+        m_loc = jnp.einsum("q,c,qi,qj->cij", qw_j, detJ, phi_q, phi_q)
+        m_diag = jax.ops.segment_sum(jnp.einsum("cii->ci", m_loc).reshape(-1), cf.reshape(-1), num_segments=n_nodes)
+        jac = 1.0 / jnp.where(jnp.abs(m_diag) > 1e-30, m_diag, 1.0)
+
+        def mass_apply(z, _m=m_loc, _cf=cf, _n=n_nodes):
+            """The scalar mass applied to every component at once -- the vector mass is M (x) I."""
+            out_c = jnp.einsum("cij,cjv->civ", _m, z[_cf])
+            return jax.ops.segment_sum(out_c.reshape(-1, z.shape[-1]), _cf.reshape(-1), num_segments=_n)
+
+        # b_i = sum_c sum_q w_q |det J_c| u_old(xq) phi_i(qp_q)
+        b_c = jnp.einsum("q,c,cqv,qi->civ", qw_j, detJ, uq, phi_q)
+        b = jax.ops.segment_sum(b_c.reshape(-1, vec), cf.reshape(-1), num_segments=n_nodes)
+        sol = jax.scipy.sparse.linalg.cg(
+            mass_apply, b, x0=blk, tol=tol, atol=0.0, maxiter=maxiter, M=lambda z, _j=jac: _j[:, None] * z
+        )[0]
+        outs.append(sol.reshape(-1))
+    return jnp.concatenate(outs), esc.reshape(n_cells, -1)
+
+
 def transfer_solution(
     source_domain: Any, values: Any, target_domain: Any, *, fill: Any = "nearest", tol: float = 1e-9, k: int = 32
 ):
@@ -403,14 +808,16 @@ def transfer_solution(
     import jax.numpy as jnp
 
     dim = int(source_domain.dimension)
-    if dim not in (2, 3):
-        raise NotImplementedError(f"transfer_solution supports 2D/3D simplicial meshes; got dimension {dim}.")
+    if dim not in (1, 2, 3):
+        raise NotImplementedError(f"transfer_solution supports 1D line and 2D/3D simplicial meshes; got {dim}.")
     if int(target_domain.dimension) != dim:
         raise ValueError(f"source ({dim}D) and target ({int(target_domain.dimension)}D) mesh dimensions differ.")
     if fill not in ("nearest", "error") and not isinstance(fill, (int, float)):
         raise ValueError(f"fill must be 'nearest', 'error', or a numeric constant; got {fill!r}.")
 
-    key = "triangle" if dim == 2 else "tetra"
+    # An interval IS a 1-simplex, so the barycentric location core below is dimension-agnostic: in 1D
+    # the "barycentric weights" are just the two linear hat values, which is exactly P1 interpolation.
+    key = {1: "line", 2: "triangle"}.get(dim, "tetra")
     src_pts = np.asarray(source_domain.mesh.points)[:, :dim].astype(np.float64)
     src_cells = np.asarray(source_domain.mesh.cells_dict[key]).astype(np.int64)
     qpts = np.asarray(target_domain.mesh.points)[:, :dim].astype(np.float64)
@@ -447,9 +854,72 @@ def _tabulate_lagrange_at(dim: int, order: int, xi: np.ndarray) -> np.ndarray:
 
     from .fem_lagrange import _lagrange_basix
 
-    cell = CellType.triangle if dim == 2 else CellType.tetrahedron
+    cell = {1: CellType.interval, 2: CellType.triangle}.get(int(dim), CellType.tetrahedron)
     tab = _lagrange_basix(cell, int(order)).tabulate(0, np.asarray(xi, dtype=np.float64))
     return np.asarray(tab[0, :, :, 0])  # (Q, n_dof): basis values (0th-derivative block, scalar value)
+
+
+def _lagrange_monomial_coeffs(dim: int, order: int) -> tuple[np.ndarray, np.ndarray]:
+    r"""``(exponents, C)`` for evaluating the P{order} simplex basis at **traced** reference coordinates.
+
+    :func:`_tabulate_lagrange_at` goes through basix, which is host-only, so it cannot be called on a
+    reference coordinate that is itself a tracer -- which is exactly what the moving-mesh transfer has,
+    since the point it must evaluate the old field at is located inside the scan. The basis is a
+    polynomial, so its coefficients can be found once on the host and the polynomial evaluated in-trace:
+
+    .. math:: \varphi_j(\xi) = \sum_m \xi^{e_m}\, C_{mj}
+
+    ``C`` is the inverse of the Vandermonde of the monomials at the element's own nodal points, which is
+    where this is well conditioned rather than merely correct: Lagrange nodes satisfy
+    :math:`\varphi_j(\text{node}_s) = \delta_{sj}`, so the tabulated right-hand side is the identity and
+    ``C = A^{-1}`` exactly. The monomial count :math:`\binom{k+d}{d}` equals the Lagrange DOF count, so
+    ``A`` is square.
+
+    Nodes and DOF order come from the same :func:`fem_lagrange._lagrange_basix` builder the assembler
+    uses, so the columns line up with the recorded P{order} connectivity -- the property that lets the
+    result be contracted against a cell's DOFs directly.
+    """
+    from basix import CellType
+
+    from .fem_lagrange import _lagrange_basix
+
+    cell = {1: CellType.interval, 2: CellType.triangle}.get(int(dim), CellType.tetrahedron)
+    nodes = np.asarray(_lagrange_basix(cell, int(order)).points, dtype=np.float64)  # (n_dof, dim)
+
+    exps = np.array(
+        [e for e in itertools.product(range(int(order) + 1), repeat=int(dim)) if sum(e) <= int(order)],
+        dtype=np.int64,
+    )
+    if exps.shape[0] != nodes.shape[0]:  # a Lagrange simplex is unisolvent on exactly this monomial set
+        raise AssertionError(f"P{order} on a {dim}-simplex: {nodes.shape[0]} nodes vs {exps.shape[0]} monomials.")
+    A = np.prod(nodes[:, None, :] ** exps[None, :, :], axis=2)  # (n_dof, n_mon)
+    return exps, np.linalg.inv(A)
+
+
+def _eval_lagrange_traced(xi, exps, coeffs):
+    """P{order} basis values at traced reference coordinates ``xi`` ``(..., dim)`` -> ``(..., n_dof)``.
+
+    The in-trace half of :func:`_lagrange_monomial_coeffs`.
+
+    The monomials are built from **cumulative products**, never from ``xi ** e``. ``xi ** 0`` has the
+    right *value* (1) everywhere, but its derivative is taken by the general power rule as
+    ``0 · xi**(-1)``, which is ``0 · inf = NaN`` at ``xi == 0`` -- and a reference coordinate is exactly
+    zero whenever a quadrature point lands on a cell edge, which some rules do. The value is unaffected,
+    so this shows up only under differentiation: it put NaNs in ``d(march)/dX₀`` while every forward test
+    stayed green. Repeated multiplication has the same value and is differentiable everywhere."""
+    import jax.numpy as jnp
+
+    exps = np.asarray(exps, dtype=np.int64)
+    dim, max_e = exps.shape[1], int(exps.max(initial=0))
+    pows = [jnp.ones_like(xi)]  # pows[k][..., a] == xi[..., a] ** k
+    for _ in range(max_e):
+        pows.append(pows[-1] * xi)
+    stack = jnp.stack(pows, axis=0)  # (max_e + 1, ..., dim)
+
+    mon = jnp.ones(xi.shape[:-1] + (exps.shape[0],), dtype=xi.dtype)
+    for a in range(dim):
+        mon = mon * jnp.moveaxis(stack[..., a], 0, -1)[..., exps[:, a]]
+    return mon @ jnp.asarray(coeffs, dtype=xi.dtype)
 
 
 def _eval_fe_fields_at_points(
@@ -558,11 +1028,11 @@ def _p1_element_gradients(domain: Any) -> tuple[np.ndarray, np.ndarray, np.ndarr
     """
     dim = int(domain.dimension)
     pts = np.asarray(domain.mesh.points)[:, :dim].astype(np.float64)
-    cells = np.asarray(domain.mesh.cells_dict["triangle" if dim == 2 else "tetra"])
+    cells = np.asarray(domain.mesh.cells_dict[_simplex_cell_key(dim)])
     v = pts[cells]  # (n_cells, dim+1, dim)
     edge = v[:, 1:, :] - v[:, :1, :]  # (n_cells, dim, dim): rows are (v_i - v_0), i=1..dim
     einv = np.linalg.inv(edge)  # column j = grad of barycentric lambda_{j+1}
-    measure = np.abs(np.linalg.det(edge)) / (2.0 if dim == 2 else 6.0)  # simplex volume = |det|/d!
+    measure = np.abs(np.linalg.det(edge)) / _simplex_measure_divisor(dim)  # simplex volume = |det|/d!
 
     grad = np.zeros((cells.shape[0], dim + 1, dim))
     grad[:, 1:, :] = np.transpose(einv, (0, 2, 1))  # grad lambda_i = column (i-1) of E^{-1}
@@ -697,7 +1167,7 @@ def size_field_from_marks(domain: Any, marked_cells: np.ndarray, *, refine_facto
     """
     dim = int(domain.dimension)
     pts = np.asarray(domain.mesh.points)[:, :dim]
-    tris = np.asarray(domain.mesh.cells_dict["triangle" if dim == 2 else "tetra"])
+    tris = np.asarray(domain.mesh.cells_dict[_simplex_cell_key(dim)])
     n_vert = pts.shape[0]
 
     # mean incident edge length per vertex
@@ -727,7 +1197,7 @@ def _mean_edge_length(domain: Any) -> float:
     """Mean triangle-edge length of the current mesh (a size scale for metric clamps)."""
     dim = int(domain.dimension)
     pts = np.asarray(domain.mesh.points)[:, :dim]
-    tris = np.asarray(domain.mesh.cells_dict["triangle" if dim == 2 else "tetra"])
+    tris = np.asarray(domain.mesh.cells_dict[_simplex_cell_key(dim)])
     n_local = tris.shape[1]
     lengths = [
         np.linalg.norm(pts[tris[:, a]] - pts[tris[:, b]], axis=1) for a in range(n_local) for b in range(a + 1, n_local)
@@ -747,45 +1217,170 @@ def _mean_edge_length(domain: Any) -> float:
 # These are the free-boundary companions of ``transfer_solution``; the outer driver (large deformation)
 # combines a move with an occasional ``remesh_with_mmg`` + ``transfer_solution`` when the mesh distorts.
 # ---------------------------------------------------------------------------
+def _simplex_cell_key(dim: int) -> str:
+    """meshio's cell-block name for the ``dim``-simplex: interval / triangle / tetrahedron.
+
+    One place, because every geometric helper below reads the same block and a per-helper conditional
+    is exactly how a dimension gets silently forgotten."""
+    return {1: "line", 2: "triangle"}.get(int(dim), "tetra")
+
+
+def _simplex_measure_divisor(dim: int) -> float:
+    """``d!`` — the simplex volume is ``|det(edge matrix)| / d!`` (length in 1D, area in 2D, volume in 3D)."""
+    return {1: 1.0, 2: 2.0}.get(int(dim), 6.0)
+
+
 def _mesh_cells(domain: Any) -> tuple[np.ndarray, int]:
     dim = int(domain.dimension)
-    return np.asarray(domain.mesh.cells_dict["triangle" if dim == 2 else "tetra"]).astype(np.int64), dim
+    return np.asarray(domain.mesh.cells_dict[_simplex_cell_key(dim)]).astype(np.int64), dim
 
 
 def _signed_simplex_measures(points: np.ndarray, cells: np.ndarray, dim: int) -> np.ndarray:
     """Signed area (2D) / volume (3D) of every simplex; the *sign* flips iff a cell inverts (tangles)."""
     v = np.asarray(points)[cells]  # (n_cells, dim+1, dim)
     edge = v[:, 1:, :] - v[:, :1, :]  # (n_cells, dim, dim): rows v_i - v_0
-    return np.linalg.det(edge) / (2.0 if dim == 2 else 6.0)
+    return np.linalg.det(edge) / _simplex_measure_divisor(dim)
+
+
+def _signed_simplex_measures_jax(points, cells, dim: int):
+    """:func:`_signed_simplex_measures` for traced points -- the tangle test inside a scanned march.
+
+    Same quantity by the same formula; only the sign is read, so a cell that inverts flips it. Separate
+    from the host version because that one is a plain NumPy path used by eager callers, and one
+    implementation cannot be both."""
+    import jax.numpy as jnp
+
+    v = points[jnp.asarray(cells)]
+    return jnp.linalg.det(v[:, 1:, :] - v[:, :1, :]) / _simplex_measure_divisor(dim)
 
 
 def _mesh_boundary_facets(domain: Any) -> tuple[np.ndarray, np.ndarray, int]:
     """Return ``(cells, boundary_facets, dim)`` -- the interior simplices, their topological boundary
     facets (edges in 2D / triangles in 3D), and the dimension."""
     cells, dim = _mesh_cells(domain)
-    bfacets = _boundary_edges_from_triangles(cells) if dim == 2 else _boundary_faces_from_tets(cells)
+    if dim == 1:
+        # the boundary of an interval mesh is its two endpoint vertices: the nodes referenced by
+        # exactly one element (an interior node is shared by two)
+        ids, counts = np.unique(cells.reshape(-1), return_counts=True)
+        bfacets = ids[counts == 1].reshape(-1, 1).astype(np.int64)
+    else:
+        bfacets = _boundary_edges_from_triangles(cells) if dim == 2 else _boundary_faces_from_tets(cells)
     return cells, bfacets, dim
 
 
-def _p1_stiffness(domain: Any):
-    """Assemble the P1 (linear-simplex) stiffness / discrete Laplacian ``K_ij = ∫_Ω ∇φ_i·∇φ_j``.
+def _p1_stiffness_jax(pts, cells, dim):
+    """``(matvec, diagonal)`` for the P1 stiffness ``K_ij = ∫_Ω ∇φ_i·∇φ_j`` on ``pts`` — matrix-free, pure
+    JAX, and **differentiable in the vertex positions**.
 
-    Returns a symmetric sparse ``(n_vert, n_vert)`` SciPy CSR matrix built from the constant per-element
-    barycentric gradients (:func:`_p1_element_gradients`).  This is the operator whose harmonic solve
-    (:func:`harmonic_extension`) propagates a boundary motion smoothly into the interior.
+    The element block is the standard ``|K|·(∇φᵢ·∇φⱼ)`` with barycentric gradients from the inverse edge
+    matrix. It replaces a numpy+scipy assembly that existed only to be factorized by
+    :func:`harmonic_extension`; there is deliberately **one** implementation, since two of the same
+    operator drift apart silently.
+
+    :func:`_dirichlet_energy_jax` carries the same quantity (it is ``Σ|∇u|²·vol = uᵀKu``, so ``½·∂E/∂u``
+    *is* this matvec). That equivalence is the **test oracle**, not the implementation: the gradient route
+    would pay a reverse-mode sweep over the element loop on every CG iteration.
+
+    Nothing here depends on the connectivity's values, only on positions, so a caller marching a
+    connectivity-preserving motion hoists ``cells`` once and re-calls this as the mesh moves.
     """
-    from scipy.sparse import coo_matrix
+    import jax.numpy as jnp
 
-    grad, measure, cells = _p1_element_gradients(domain)  # (n_cells, nv, dim), (n_cells,), (n_cells, nv)
-    nv = cells.shape[1]
-    ke = np.einsum("c,cad,cbd->cab", measure, grad, grad)  # (n_cells, nv, nv): measure * (∇φ_a·∇φ_b)
-    ii = np.broadcast_to(cells[:, :, None], (cells.shape[0], nv, nv)).reshape(-1)
-    jj = np.broadcast_to(cells[:, None, :], (cells.shape[0], nv, nv)).reshape(-1)
-    n = int(np.asarray(domain.mesh.points).shape[0])
-    return coo_matrix((ke.reshape(-1), (ii, jj)), shape=(n, n)).tocsr()
+    cells_j = jnp.asarray(cells)
+    v = pts[cells_j]
+    e = jnp.stack([v[:, i + 1] - v[:, 0] for i in range(dim)], axis=1)  # (n_cell, dim, dim)
+    measure = jnp.abs(jnp.linalg.det(e)) / (2.0 if dim == 2 else 6.0)
+    g = jnp.swapaxes(jnp.linalg.inv(e), 1, 2)  # ∇φ of vertices 1..d
+    sg = jnp.concatenate([-g.sum(axis=1, keepdims=True), g], axis=1)  # φ₀ closes the partition of unity
+    loc = jnp.einsum("cid,cjd->cij", sg, sg) * measure[:, None, None]
+
+    n_local, n_vert = cells.shape[1], pts.shape[0]
+
+    def matvec(u):
+        out_c = jnp.einsum("cij,cj->ci", loc, u[cells_j])
+        out = jnp.zeros((n_vert,), dtype=u.dtype)
+        for a in range(n_local):
+            out = out.at[cells_j[:, a]].add(out_c[:, a])
+        return out
+
+    diag = jnp.zeros((n_vert,), dtype=measure.dtype)
+    for a in range(n_local):
+        diag = diag.at[cells_j[:, a]].add(loc[:, a, a])
+    return matvec, diag
 
 
-def harmonic_extension(domain: Any, boundary_displacement: np.ndarray) -> np.ndarray:
+def _harmonic_extension_jax(pts, cells, dim, given, prescribed, *, tol=None, maxiter=2000):
+    r"""Harmonically extend ``given`` off the ``prescribed`` vertices — pure JAX, differentiable in both.
+
+    Solves ``(K d)ᵢ = 0`` on the free rows with ``d`` held at ``given`` on the prescribed rows, written as
+    a masked SPD system so the shapes stay static under trace. The free/prescribed split is a **multiply,
+    never a gather**, which is what lets this run inside a ``lax.scan``::
+
+        A(v) = mask·K(mask·v) + (1 − mask)·v          rhs = −mask·K((1 − mask)·given)
+
+    ``A`` is the identity on the prescribed block and ``K`` on the free block, hence SPD, so CG applies.
+    Jacobi-preconditioned :func:`jax.scipy.sparse.linalg.cg` — the same masked-CG idiom as
+    ``_consistent_m_solve`` in :mod:`~jno.utils.solver.timeschemes` — which is built on
+    ``lax.custom_linear_solve``, so the gradient is an exact adjoint solve rather than backpropagation
+    through the iterations.
+
+    ``tol`` defaults tight because the bar is **absolute**: an affine field is harmonic and so must come
+    back exactly (1e-9 in 2D, 1e-7 in 3D). Tight, but **reachable in the working precision** — it used to
+    be a hardcoded 1e-13, which is below float32 eps (1.2e-7), the default here since x64 is opt-in. The
+    relative termination test could then never fire and CG ground on to the float32 noise floor every
+    call. Measured at 1932 vertices: **8.26 ms -> 3.99 ms**, same answer. Same defect and the same
+    ``max(floor, 100*eps)`` repair as ``SemidiscreteTimeBlock.step``'s GMRES; in float64 the 1e-13 floor
+    keeps the previous behaviour exactly. Pass ``tol=`` to override.
+    """
+    import jax.numpy as jnp
+    from jax.scipy.sparse.linalg import cg
+
+    if tol is None:
+        tol = max(1e-13, 100.0 * float(jnp.finfo(jnp.asarray(pts).dtype).eps))
+    matvec, diag = _p1_stiffness_jax(pts, cells, dim)
+    mask = 1.0 - jnp.asarray(prescribed, dtype=pts.dtype)  # 1 free / 0 prescribed
+    held = (1.0 - mask)[:, None] * given
+    jac = 1.0 / (mask * diag + (1.0 - mask))  # Jacobi on the free block, identity on the held one
+
+    def op(v):
+        return mask * matvec(mask * v) + (1.0 - mask) * v
+
+    def solve_col(held_col):
+        return cg(op, -mask * matvec(held_col), tol=tol, atol=0.0, maxiter=maxiter, M=lambda z: jac * z)[0]
+
+    free = jnp.stack([solve_col(held[:, c]) for c in range(dim)], axis=1)
+    return mask[:, None] * free + held
+
+
+_HARMONIC_JIT: dict = {}
+
+
+def _harmonic_extension_compiled(pts, cells, dim, given, prescribed):
+    """:func:`_harmonic_extension_jax` under ``jax.jit``, compiled once per ``(dim, cell-array shape)``.
+
+    Eager, this solve costs ~160 ms *flat* regardless of mesh size (74 and 377 vertices measure the same),
+    because it is per-call JAX tracing overhead rather than arithmetic -- the CG itself is negligible.
+    Compiled it is 0.35 ms / 0.66 ms at those sizes: **466x / 242x**. ``cells`` rides as a runtime argument
+    rather than a static one, so meshes sharing a cell-array shape share the compiled kernel and a moving
+    mesh never recompiles; only ``dim`` and the shapes are static, which they must be to fix the loops.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    key = (int(dim), tuple(cells.shape), tuple(pts.shape))
+    fn = _HARMONIC_JIT.get(key)
+    if fn is None:
+
+        def _run(p, c, g, m, _d=int(dim)):
+            return _harmonic_extension_jax(p, c, _d, g, m)
+
+        fn = _HARMONIC_JIT[key] = jax.jit(_run)
+    return fn(pts, jnp.asarray(cells), given, prescribed)
+
+
+def harmonic_extension(
+    domain: Any, boundary_displacement: np.ndarray, *, prescribed: np.ndarray | None = None
+) -> np.ndarray:
     r"""Harmonically extend a **boundary** displacement into the mesh interior (ALE mesh motion).
 
     Solves the vector Laplace problem :math:`\nabla^2 d = 0` in the interior with :math:`d` fixed to
@@ -801,9 +1396,15 @@ def harmonic_extension(domain: Any, boundary_displacement: np.ndarray) -> np.nda
     domain
         A meshed 2-D/3-D simplicial ``jno`` domain.
     boundary_displacement
-        ``(n_vert, dim)`` array; **only its boundary-vertex rows are read** (as Dirichlet data).  Interior
+        ``(n_vert, dim)`` array; **only its prescribed rows are read** (as Dirichlet data).  The remaining
         rows are ignored and overwritten by the harmonic solve -- build a full-length array and set the
-        boundary rows to the desired boundary motion (e.g. an interface velocity times ``dt``).
+        prescribed rows to the desired motion (e.g. an interface velocity times ``dt``).
+    prescribed
+        Boolean ``(n_vert,)`` mask of the vertices whose displacement is *given*.  Defaults to the
+        geometric boundary, which is the ALE case.  Pass it when the motion is stated on an arbitrary
+        region -- a geometry term ``coord.d(t) - v`` may name an interior region or a ``where=`` predicate
+        just as well as a boundary, and then *those* vertices are the Dirichlet data and everything else
+        (including the outer boundary) relaxes around them.
 
     Returns
     -------
@@ -815,7 +1416,7 @@ def harmonic_extension(domain: Any, boundary_displacement: np.ndarray) -> np.nda
     Tezduyar, *Mesh update strategies in parallel FE computations of flows with moving boundaries*,
     Comput. Methods Appl. Mech. Engrg. 119 (1994) 73-94 (§3).
     """
-    from scipy.sparse.linalg import splu
+    import jax.numpy as jnp
 
     cells, dim = _mesh_cells(domain)
     pts = np.asarray(domain.mesh.points)[:, :dim]
@@ -827,21 +1428,27 @@ def harmonic_extension(domain: Any, boundary_displacement: np.ndarray) -> np.nda
             "Build a full-length array and set its boundary-vertex rows to the desired motion."
         )
 
-    bfacets = _boundary_edges_from_triangles(cells) if dim == 2 else _boundary_faces_from_tets(cells)
-    bverts = np.unique(bfacets.reshape(-1))
-    is_b = np.zeros(n, dtype=bool)
-    is_b[bverts] = True
-    iverts = np.where(~is_b)[0]
+    if prescribed is None:
+        bfacets = _boundary_edges_from_triangles(cells) if dim == 2 else _boundary_faces_from_tets(cells)
+        is_b = np.zeros(n, dtype=bool)
+        is_b[np.unique(bfacets.reshape(-1))] = True
+    else:
+        is_b = np.asarray(prescribed, dtype=bool).reshape(-1)
+        if is_b.shape != (n,):
+            raise ValueError(f"harmonic_extension: prescribed must be a ({n},) boolean mask; got {is_b.shape}.")
+        if not is_b.any():
+            raise ValueError("harmonic_extension: `prescribed` selects no vertices — there is no data to extend.")
+    if not (~is_b).any():
+        return np.where(is_b[:, None], bd, 0.0)  # everything prescribed: nothing to extend
 
-    disp = np.zeros((n, dim), dtype=np.float64)
-    disp[bverts] = bd[bverts]
-    if iverts.size:
-        k = _p1_stiffness(domain)
-        kii = k[iverts][:, iverts].tocsc()
-        kib = k[iverts][:, bverts]
-        rhs = -(kib @ bd[bverts])  # (n_i, dim): move the boundary term to the RHS
-        disp[iverts] = splu(kii).solve(np.asarray(rhs))  # one factorization, all `dim` columns at once
-    return disp
+    # A thin host wrapper over the JAX core, rather than a second numpy+scipy implementation of the same
+    # operator: two implementations of one solve is exactly the shape that drifts apart silently. The
+    # existing affine-reproduction and maximum-principle tests are therefore the acceptance bar for the
+    # traced path too.
+    return np.asarray(
+        _harmonic_extension_compiled(jnp.asarray(pts), cells, dim, jnp.asarray(bd), jnp.asarray(is_b)),
+        dtype=np.float64,
+    )
 
 
 def move_mesh(domain: Any, displacement: np.ndarray, *, copy: bool = True, check: bool = True) -> Any:
@@ -964,16 +1571,45 @@ class AdaptSpec:
     # --- r-adaptivity (mesh relocation) --------------------------------------------------------------
     relocate: bool = False
     """Switch ``FEM.solve(adapt=...)`` from h-refinement (add elements) to **r-adaptivity**: relocate the
-    mesh vertices tagged with :meth:`Variable.trainable` down the FE-energy gradient — *through the
-    differentiable solve* — at fixed connectivity and no new DOFs. Requires at least one coordinate tagged
+    mesh vertices tagged with :meth:`Variable.trainable` so the mesh equidistributes the solution's
+    features, at fixed connectivity and no new DOFs. Requires at least one coordinate tagged
     ``domain.variable(region)[i].trainable()`` before ``jno.fem`` (else it raises). See
-    :func:`run_adaptive_relocate`. ``max_iters`` sets the number of relocation steps; ``lr`` the step size."""
+    :func:`run_adaptive_relocate`; :attr:`relocate_method` picks *how* the vertices move."""
     quality_floor: float = 0.1
-    """Relocation only: a step is backtracked (halved) until no element's ``|det J|`` falls below this
-    fraction of the initial worst element — the mesh-validity line search that keeps the relocation from
-    tangling (a stock optimiser / a barrier alone cannot guarantee this on stiff problems)."""
+    """``relocate_method="descent"`` only: a step is backtracked (halved) until no element's ``|det J|``
+    falls below this fraction of the initial worst element — the mesh-validity line search that keeps the
+    descent from tangling (a stock optimiser / a barrier alone cannot guarantee this on stiff problems).
+    Unused by ``"monge_ampere"``, which needs no line search."""
     lr: float = 3e-3
-    """Relocation only: base step size for the RMS-normalised energy-gradient descent."""
+    """``relocate_method="descent"`` only: base step size for the RMS-normalised gradient descent."""
+    ma_relax: int = 60
+    """``relocate_method="monge_ampere"`` only: relaxation iterations per outer round (McRae et al. §3.1).
+    Each is one Poisson solve against a pre-factorized constant matrix, so these are cheap. The relaxation
+    is explicit in :attr:`ma_dt`, so more is not monotonically better — see :func:`jno.solve.relocate`."""
+    ma_dt: float = 0.1
+    """``relocate_method="monge_ampere"`` only: the relaxation pseudo-step ``Δt`` of eq. (3.7). Larger
+    converges faster and can overshoot; the nonlinearity is carried entirely by this outer relaxation."""
+    relocate_method: str = "descent"
+    """Relocation only: *how* the mesh is moved. ``"descent"`` — the default here and the default
+    :func:`jno.solve.relocate` builds — walks the vertices down :attr:`objective` with a mesh-validity
+    line search. ``"monge_ampere"`` instead solves a Monge-Ampère equation for a mesh potential ``φ`` and
+    takes the mesh as ``x = ξ + ∇φ`` (:func:`_monge_ampere_displacement`): no descent, no line search, and
+    non-folding by construction because the displacement is a gradient (for the *whole* map — see that
+    function on what holding a subset costs). With it, ``objective`` is only a *diagnostic* and ``lr`` /
+    ``quality_floor`` are unused.
+
+    Descent is the default **on the measured answer**, not on convergence rate. Monge-Ampère does converge
+    in far fewer rounds (3-6 against 30) and reaches a comparable equidistribution defect, but on the
+    Allen-Cahn front the suite measures it loses on accuracy and wrecks element quality: rel-L2 8.879e-02
+    against descent's 3.951e-02 (uniform 1.096e-01), min element quality 0.160 against 0.503. See
+    :func:`jno.solve.relocate` for the full table and the ``relax_step`` control that recovers part of it.
+    (This docstring previously claimed the opposite of all of that.)"""
+    objective: str = "equidistribution"
+    """Relocation only, **internal / not yet exposed** by :func:`jno.solve.relocate`: which mesh functional
+    to descend. ``"equidistribution"`` (default) is :func:`_equidistribution_jax`, the scale-free
+    equidistribution defect of an arclength monitor; ``"huang"`` is :func:`_huang_ea_jax`, Huang's
+    equidistribution+alignment functional with the same (isotropic) monitor. Present so the two can be
+    measured against each other on the same problem before either is given a public spelling."""
 
 
 # Consecutive rounds that must satisfy ``eps`` before the loop stops on convergence.
@@ -1132,6 +1768,304 @@ def _dirichlet_energy_jax(pts, u_nodal, cells, dim):
     return jnp.sum(jnp.sum(grad**2, axis=(1, 2)) * vol)
 
 
+def _equidistribution_jax(pts, u_nodal, cells, dim):
+    """Equidistribution defect of a **monitor function** over a P1 mesh — the r-adaptivity objective.
+
+    Classic moving-mesh r-adaptivity equidistributes a monitor ``ρ``: every element should carry the same
+    share of ``∫ρ``, which puts small elements where ``ρ`` is large (Huang & Russell, *Adaptive Moving Mesh
+    Methods*, Springer 2011, §2.1 — the equidistribution principle; Winslow / MMPDE build the same idea into
+    a mesh PDE).  Here ``ρ_T = sqrt(1 + |∇u_T|² / ⟨|∇u|²⟩)`` — the **arclength** monitor, normalised by the
+    mesh average so the functional is dimensionless and one ``lr`` works across problems.  The ``1 +`` floor
+    keeps a flat region from being emptied entirely.
+
+    Returns ``Σ_T (w_T − w̄)² / (n_T · w̄²)`` with ``w_T = ρ_T · |T|``: zero exactly when every element carries
+    an equal share, and scale-free.  Differentiable in ``pts`` (the moved vertices) and in ``u_nodal``.
+
+    **Why not the Dirichlet energy.**  Descending ``Σ|∇u|²·vol`` w.r.t. the vertices looks like the same idea
+    and is not: for a non-convex functional (Allen–Cahn's double well) the mesh can *lower* it by
+    under-resolving the layer.  Measured on the Allen–Cahn interface at 377 nodes, the energy objective cut
+    the energy 4.949 → 4.422 while making the final-time error 10.7× worse (1.68e-2 → 1.78e-1) and visibly
+    coarsening the mesh across the front.  Equidistribution targets resolution directly.
+
+    **Why arclength and not a Hessian monitor.**  P1 interpolation error is governed by curvature, so a
+    Hessian monitor is the textbook choice — but ``∇u`` is constant per P1 element, so the Hessian has to be
+    recovered (ZZ patch averaging), and that recovery is meaningless exactly where adaptivity matters: a
+    front spanning ~1 element gives a noisy Hessian, and equidistributing noise scatters nodes.  Measured
+    against a uniform mesh at equal node count (Allen–Cahn, ``h = 0.06``), relocated/uniform final error:
+
+    ==================  ==========  =================  ================
+    front width         arclength   recovered Hessian  verdict
+    ==================  ==========  =================  ================
+    0.47 (≈8 cells)     4.98        2.61               both worse
+    0.19 (≈3 cells)     **0.86**    1.36               arclength wins
+    0.09 (≈1.5 cells)   **0.55**    1.22               arclength wins
+    ==================  ==========  =================  ================
+
+    Arclength wins wherever relocation is worth doing.  Both lose on an already over-resolved front — there
+    is nothing to redistribute there, and moving nodes only costs; see the scope note on
+    :func:`run_adaptive_relocate`.
+    """
+    import jax.numpy as jnp
+
+    v = pts[cells]  # (n_cell, dim+1, dim)
+    u_nodal = u_nodal[:, None] if u_nodal.ndim == 1 else u_nodal
+    s = u_nodal[cells]
+    e = jnp.stack([v[:, i + 1] - v[:, 0] for i in range(dim)], axis=1)
+    du = jnp.stack([s[:, i + 1] - s[:, 0] for i in range(dim)], axis=1)
+    grad = jnp.linalg.solve(e, du)  # (n_cell, dim, n_comp)
+    vol = jnp.abs(jnp.linalg.det(e)) / (2.0 if dim == 2 else 6.0)
+
+    g2 = jnp.sum(grad**2, axis=(1, 2))  # |∇u|² per element, summed over components/blocks
+    scale = jnp.mean(g2) + 1e-30  # normalise so the monitor (and the step size) is problem-independent
+    rho = jnp.sqrt(1.0 + g2 / scale)  # the "1 +" floor keeps flat regions from being emptied entirely
+    w = rho * vol  # each element's share of ∫ρ
+    wbar = jnp.mean(w) + 1e-30
+    return jnp.mean((w - wbar) ** 2) / wbar**2
+
+
+def _huang_ea_jax(pts, pts0, u_nodal, cells, dim, *, theta=1.0 / 3.0, p=1.5):
+    r"""Huang's **equidistribution–alignment** meshing functional — the variational r-adaptivity objective.
+
+    Huang, *Variational mesh adaptation: isotropy and equidistribution* (2001); stated as Example 2.2 and
+    discretized as eq. (6) of Huang & Kamenski, *A geometric discretization and a simple implementation for
+    variational mesh generation and adaptation*, J. Comput. Phys. **301** (2015) 322–337
+    (arXiv:1410.7872)::
+
+        I[ξ] = θ ∫_Ω √det(M) · tr(J M⁻¹ Jᵀ)^(dp/2) dx
+             + (1−2θ)·d^(dp/2) ∫_Ω √det(M) · (det(J)/√det(M))^p dx
+
+    **Conventions, because both are easy to invert and the wrong one equidistributes backwards.**
+    ``J = ∂ξ/∂x`` is the Jacobian of the *inverse* map (computational-from-physical) — meshing functionals
+    are written in terms of it because the transformation so determined is less likely to be singular
+    (Dvinsky 1991). The integral is over the **physical** domain, so the discrete sum is weighted by the
+    **physical** element volume ``|K|``, and ``J`` is discretized as ``(F'_K)⁻¹`` with ``F_K: K_c → K`` the
+    affine element map — not by differentiating anything on the mesh, which is what preserves the
+    functional's geometric structure.
+
+    Here ``pts`` is the physical (moving) mesh and ``pts0`` the computational (fixed) one, so with ``E``
+    the physical and ``Ê`` the computational edge matrix, ``J_K = Ê E⁻¹`` and ``|K| = |det E|/d!``.
+
+    The two terms are the **alignment** condition (elements shaped and oriented by ``M``) and the
+    **equidistribution** condition (equal share of ``∫√det M``). :func:`_equidistribution_jax`, the
+    objective this one is measured against, is a scale-free proxy for the *second* term alone with an
+    isotropic monitor; the first term has no counterpart there.
+
+    ``M`` is isotropic here — ``M = ρ^(2/d) I`` for the same arclength density ``ρ`` that
+    :func:`_equidistribution_jax` uses, so a comparison between the two isolates the functional rather than
+    confounding it with a change of monitor. A genuine metric-tensor ``M`` (the anisotropic case, where the
+    alignment term earns its keep) needs a differentiable recovered Hessian and is deferred.
+
+    Defaults ``θ = 1/3``, ``p = 3/2`` are MMPDElab's (Huang, arXiv:1904.05535). They sit inside the
+    coercivity + polyconvexity conditions ``0 < θ ≤ 1/2``, ``dp ≥ 2``, ``p ≥ 1``, which is what underwrites
+    the mesh-nonsingularity result; ``1 − 2θ = θ`` there, so the two conditions carry equal weight.
+
+    **The barrier is the point.** ``det J → 0`` drives the second term to ``+∞``: an element cannot flatten
+    without paying infinite energy. That is the coercivity that replaces a ``det J`` step-control heuristic
+    — so ``det J`` is deliberately *not* clamped here. The gradient is only ever taken at a valid mesh.
+    """
+    import jax.numpy as jnp
+
+    v, v0 = pts[cells], pts0[cells]  # (n_cell, dim+1, dim)
+    u_nodal = u_nodal[:, None] if u_nodal.ndim == 1 else u_nodal
+    s = u_nodal[cells]
+    e = jnp.stack([v[:, i + 1] - v[:, 0] for i in range(dim)], axis=1)  # Eᵀ, physical
+    e0 = jnp.stack([v0[:, i + 1] - v0[:, 0] for i in range(dim)], axis=1)  # Êᵀ, computational
+    du = jnp.stack([s[:, i + 1] - s[:, 0] for i in range(dim)], axis=1)
+    grad = jnp.linalg.solve(e, du)  # (n_cell, dim, n_comp)
+
+    g2 = jnp.sum(grad**2, axis=(1, 2))  # |∇u|² per element
+    rho = jnp.sqrt(1.0 + g2 / (jnp.mean(g2) + 1e-30))  # arclength density, as in _equidistribution_jax
+
+    # J = Ê E⁻¹, so Jᵀ = (E⁻¹)ᵀ Êᵀ = solve(Eᵀ, Êᵀ) = solve(e, e0). Frobenius norm and det are
+    # transpose-invariant, so the transpose never has to be formed.
+    a = jnp.linalg.solve(e, e0)  # = Jᵀ
+    fro2 = jnp.sum(a**2, axis=(1, 2))  # tr(J Jᵀ)
+    det_j = jnp.linalg.det(a)
+    vol = jnp.abs(jnp.linalg.det(e)) / (2.0 if dim == 2 else 6.0)  # |K|, PHYSICAL
+
+    m_inv = rho ** (-2.0 / dim)  # M = ρ^(2/d)·I  ⇒  M⁻¹ = ρ^(-2/d)·I
+    align = rho * (m_inv * fro2) ** (dim * p / 2.0)
+    equi = rho * (det_j / rho) ** p
+    return jnp.sum(vol * (theta * align + (1.0 - 2.0 * theta) * dim ** (dim * p / 2.0) * equi))
+
+
+def _p1_operators(pts, cells, dim):
+    """Constant P1 operators on a **fixed** mesh: ``(sg, measure, wsum, stiffness+null-space shift)``.
+
+    ``sg`` ``(n_cell, dim+1, dim)`` barycentric gradients, ``measure`` the cell volumes, ``wsum`` the
+    per-vertex incident volume (the denominator of patch recovery), and ``K`` the P1 stiffness matrix
+    with a rank-one shift ``(1/n)·11ᵀ`` that removes its constant null space *without* perturbing the
+    solution: ``K·1 = 0``, so on the mean-zero subspace — which is where a compatible right-hand side
+    puts the answer — the shifted operator acts identically to ``K``.
+
+    Everything here depends only on the mesh geometry, and in :func:`_monge_ampere_displacement` that
+    mesh is the *computational* one, which never moves. So this is assembled and factorized **once** and
+    reused across every relaxation step and every outer round — the reason the Monge-Ampère route costs
+    no re-factorization, unlike a mesh flow whose operator changes as the mesh does.
+    """
+    v = pts[cells]
+    edge = v[:, 1:, :] - v[:, :1, :]
+    einv = np.linalg.inv(edge)
+    measure = np.abs(np.linalg.det(edge)) / (2.0 if dim == 2 else 6.0)
+    sg = np.zeros((cells.shape[0], dim + 1, dim))
+    sg[:, 1:, :] = np.transpose(einv, (0, 2, 1))
+    sg[:, 0, :] = -sg[:, 1:, :].sum(axis=1)
+
+    n = pts.shape[0]
+    wsum = np.zeros(n)
+    for lv in range(cells.shape[1]):
+        np.add.at(wsum, cells[:, lv], measure)
+
+    k = np.zeros((n, n))
+    loc = np.einsum("cid,cjd->cij", sg, sg) * measure[:, None, None]  # (n_cell, d+1, d+1)
+    for a in range(dim + 1):
+        for b in range(dim + 1):
+            np.add.at(k, (cells[:, a], cells[:, b]), loc[:, a, b])
+    return sg, measure, np.maximum(wsum, 1e-300), k + 1.0 / n
+
+
+def _nodal_grad_jax(f, sg_j, meas_j, wsum_j, cells_j, n_local, dim):
+    """Patch-recovered nodal gradient of a P1 field, in JAX — the volume-weighted average of the incident
+    elementwise-constant gradients. The JAX mirror of :func:`_recover_nodal_gradient` (which is numpy and
+    so cannot sit inside a trace), and the ``Π_[P1]^d`` projection of McRae et al. eq. (3.5)."""
+    import jax.numpy as jnp
+
+    g_cell = jnp.einsum("cld,cl->cd", sg_j, f[cells_j])  # (n_cell, dim), constant per element
+    num = jnp.zeros((wsum_j.shape[0], dim), dtype=g_cell.dtype)
+    for lv in range(n_local):
+        num = num.at[cells_j[:, lv]].add(meas_j[:, None] * g_cell)
+    return num / wsum_j[:, None]
+
+
+def _arclength_monitor_jax(u_nodal, sg_j, meas_j, wsum_j, cells_j, n_local, dim):
+    """Per-**vertex** arclength density ``ρ = sqrt(1 + |∇u|²/⟨|∇u|²⟩)`` — the same monitor
+    :func:`_equidistribution_jax` and :func:`_huang_ea_jax` use, but recovered at vertices (a P1 field on
+    the computational mesh) because that is what the Monge-Ampère solve integrates against. Summed over
+    components, so a vector field contributes all of them."""
+    import jax.numpy as jnp
+
+    u_nodal = u_nodal[:, None] if u_nodal.ndim == 1 else u_nodal
+    g2 = sum(
+        jnp.sum(_nodal_grad_jax(u_nodal[:, c], sg_j, meas_j, wsum_j, cells_j, n_local, dim) ** 2, axis=1)
+        for c in range(u_nodal.shape[1])
+    )
+    return jnp.sqrt(1.0 + g2 / (jnp.mean(g2) + 1e-30))
+
+
+def _monge_ampere_displacement(monitor, ops, cells, dim, *, n_relax=60, dt=0.1):
+    r"""Vertex displacement ``Π_[P1]^d ∇φ`` from one **Monge–Ampère** mesh solve — pure JAX.
+
+    Solves ``m(x)·det(I + H(φ)) = θ`` for a scalar mesh potential ``φ`` on the fixed computational mesh,
+    from which the adapted mesh is ``x(ξ) = ξ + ∇φ(ξ)``. Because the displacement is a *gradient*, the
+    map cannot fold — non-tangling is structural here, not a step-control heuristic, which is what makes
+    this route differentiable without a validity line search.
+
+    Reference: McRae, Cotter & Budd, *Optimal-transport-based mesh adaptivity on the plane and sphere
+    using finite elements*, SIAM J. Sci. Comput. **40**(2) (2018) A1121–A1148 (arXiv:1612.08077), §3.1 —
+    the relaxation method, their eqs. (3.5)–(3.8). Each iteration is
+
+    1. ``σᵏ = H(φᵏ)`` — recovered by patch averaging (their eq. (3.8) recovers it by a mass solve;
+       the P1 patch recovery already in this module plays the same role and needs no extra matrix),
+    2. ``θᵏ = ∫ m·det(I + σᵏ) / ∫ 1``  (eq. (3.6)) — the normalisation that makes the next system
+       *solvable*: it is exactly what makes the right-hand side orthogonal to the constant null space,
+    3. ``⟨∇v, ∇φᵏ⁺¹⟩ = ⟨∇v, ∇φᵏ⟩ + Δt⟨v, m·det(I + σᵏ) − θᵏ⟩``  (eq. (3.7)) — one Poisson solve.
+
+    So a step is a Poisson solve against a **pre-factorized constant** matrix plus a mass apply; the
+    nonlinearity is carried entirely by the outer relaxation in ``dt``.
+
+    **Scope — stated, not hidden.**
+
+    - ``m`` is taken as a function of the *computational* coordinate ``ξ``, not of ``x``. That is the
+      paper's "very straightforward" case (§3, above eq. (3.5)); the genuine problem has ``m = m(x)``,
+      an extra nonlinearity, and dropping it means the monitor lags the mesh it produces. The outer
+      loop in :func:`run_adaptive_relocate` recovers it approximately by re-solving and re-sampling.
+    - ``φ`` is P1 here, so ``∇φ`` is elementwise-constant and both it and ``σ`` are patch-recovered.
+      The paper takes ``φ ∈ P_n, n ≥ 2`` and L²-projects ``∇φ`` into ``[P1]^d`` (eq. (3.5)); patch
+      recovery is the cheaper stand-in and is the same order.
+    - Natural (Neumann) boundary treatment only. The caller decides which vertices may move and the
+      driver holds every untagged vertex exactly — but note that **holding vertices is what can tangle
+      the mesh**, not this solve. Non-folding is a property of the *whole* map ``x = ξ + ∇φ``; apply it
+      to a subset and the truncated map carries no such guarantee. Measured on a 21² unit square with a
+      diagonal front: applied to every vertex ``min det J`` stays positive across ``dt ∈ [0.01, 0.2]`` and
+      ``n_relax ∈ [40, 300]``, while freezing the boundary reaches ``-1.2e-03``. Freeing each boundary
+      edge's *tangential* axis only (``x`` on a horizontal edge, ``y`` on a vertical one — which per-axis
+      :meth:`~jno.trace.Placeholder.trainable` tagging expresses directly) recovers almost all of it and
+      equidistributes better, because the held component is then only the one normal to the wall.
+      Whatever the tagging, :func:`run_adaptive_relocate` checks ``det J`` and keeps the last valid mesh.
+    - The relaxation is **explicit in** ``dt`` and has a stability limit, so more iterations is not
+      monotonically better: at ``dt = 0.2`` the equidistribution spread on that same mesh *degrades*
+      from 0.111 at ``n_relax = 40`` to 0.292 at 300. Lower ``dt`` before raising ``n_relax``.
+
+    **The map is global, and that is intrinsic.** ``det(I + H(φ)) = θ/m`` carries a single *global* ``θ``, so
+    concentrating elements where ``m`` is large forces every region where ``m`` is small to stretch — area has
+    to come from somewhere. Elements far from the feature are therefore distorted whether or not that helps:
+    measured on the Allen-Cahn front, largest/smallest element area ratio 8.3 and worst radius-ratio quality
+    0.160, against 2.4 and 0.834 for the uniform mesh it started from (and 3.3 / 0.503 for ``"descent"``,
+    which reaches partial equidistribution in damped steps and so stays gentler).
+
+    The lever is **under-relaxation**, not a boundary condition: lowering ``dt`` stops short of exact
+    equidistribution and keeps the map closer to the identity away from the feature (``dt`` 0.10 → 0.02 moved
+    quality 0.160 → 0.318 and the error ratio 0.811 → 0.633). Imposing ``φ = 0`` on the held vertices does
+    *not* localize it — ``φ = 0`` does not make ``∇φ = 0``, so the recovered displacement at a held vertex
+    beside a free one is if anything *larger* (0.107 against 0.075 measured), and the truncation gets worse
+    rather than better. Genuine confinement needs the problem restricted to the tagged sub-mesh, which is not
+    implemented.
+
+    **Graded computational meshes.** What this solves equidistributes ``m`` against the *ratio*
+    ``|K_phys|/|K_comp|``, not against ``|K_phys|`` — so on a graded ξ (an already h-adapted mesh, i.e. the
+    ``remesh`` → ``relocate`` composition) the grading and the monitor would compound and the adaptation
+    would be applied twice. ``monitor`` is therefore pre-multiplied here by the local computational cell
+    size, after which ``m·|K_phys| = θ`` — true equidistribution — holds on any ξ. The size is the *mean*
+    incident element volume, not ``wsum`` (the incident volume *sum*, which halves at an edge and quarters
+    at a corner purely from patch arity and would push nodes off the boundary of a perfectly uniform mesh).
+    On a uniform ξ the factor is constant and this is a no-op.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    sg, measure, wsum, k_shift = ops
+    sg_j, meas_j, wsum_j = jnp.asarray(sg), jnp.asarray(measure), jnp.asarray(wsum)
+    cells_j = jnp.asarray(cells)
+    lu = jax.scipy.linalg.lu_factor(jnp.asarray(k_shift))  # constant mesh ⇒ factorize ONCE
+    n_vert = wsum.shape[0]
+    total = float(measure.sum())
+
+    counts = np.zeros(n_vert)  # incident element count per vertex (patch arity)
+    np.add.at(counts, cells.ravel(), 1.0)
+    k_comp = wsum / np.maximum(counts, 1.0)  # mean incident element volume = local computational cell size
+    monitor = monitor * jnp.asarray(k_comp / k_comp.mean())  # a global scale cancels in θ; kept O(1) for dt
+    fac = 1.0 / ((dim + 1) * (dim + 2))  # P1 consistent mass: ∫φᵢφⱼ = |K|·(1+δᵢⱼ)/((d+1)(d+2))
+
+    n_local = cells.shape[1]
+
+    def nodal_grad(f):
+        return _nodal_grad_jax(f, sg_j, meas_j, wsum_j, cells_j, n_local, dim)
+
+    def mass_apply(g):
+        """``(M g)ᵢ`` for the P1 consistent mass matrix, assembled on the fly (no matrix stored)."""
+        gc = g[cells_j]  # (n_cell, d+1)
+        s = gc.sum(axis=1, keepdims=True)
+        loc = fac * meas_j[:, None] * (s + gc)
+        out = jnp.zeros((n_vert,), dtype=g.dtype)
+        for lv in range(cells.shape[1]):
+            out = out.at[cells_j[:, lv]].add(loc[:, lv])
+        return out
+
+    eye = jnp.eye(dim)
+
+    def step(phi, _):
+        g = nodal_grad(phi)
+        sigma = jnp.stack([nodal_grad(g[:, j]) for j in range(dim)], axis=1)  # (n_vert, dim, dim)
+        sigma = 0.5 * (sigma + jnp.swapaxes(sigma, 1, 2))  # H(φ) is symmetric; recovery need not be
+        f = monitor * jnp.linalg.det(eye + sigma)  # m·det(I + σ)
+        theta = jnp.sum(meas_j * f[cells_j].mean(axis=1)) / total  # eq. (3.6)
+        rhs = jnp.asarray(k_shift) @ phi + dt * mass_apply(f - theta)  # eq. (3.7)
+        return jax.scipy.linalg.lu_solve(lu, rhs), None
+
+    phi, _ = jax.lax.scan(step, jnp.zeros((n_vert,), dtype=monitor.dtype), None, length=n_relax)
+    return nodal_grad(phi)
+
+
 def _transient_march_fn(block):
     """Build a differentiable ``args -> time-averaged nodal state`` for a :class:`SemidiscreteTimeBlock`.
 
@@ -1163,22 +2097,37 @@ def _transient_march_fn(block):
 def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwargs: Any) -> np.ndarray:
     """Drive ``FEM.solve(adapt=AdaptSpec(relocate=True, ...))`` -- **r-adaptivity** (mesh relocation).
 
-    Relocate the mesh vertices tagged with :meth:`Variable.trainable` down the FE Dirichlet-energy gradient
-    -- evaluated *through the differentiable solve* (``∂(solve)/∂X``) -- at **fixed connectivity** and no new
-    DOFs, with a **backtracking line search on ``det J``** so the mesh never tangles (a stock optimiser or a
-    barrier alone cannot guarantee validity on stiff problems -- the constraint must live in the step control).
-    Concentrates a *fixed* node set at solution features; the relocation companion of the h-refinement
-    :func:`run_adaptive_solve`.
+    Relocate the mesh vertices tagged with :meth:`Variable.trainable` at **fixed connectivity** and no new
+    DOFs, so a *fixed* node set concentrates at the solution's features; the relocation companion of the
+    h-refinement :func:`run_adaptive_solve`. ``spec.relocate_method`` picks how:
 
-    ``spec.max_iters`` relocation steps, ``spec.lr`` step size, ``spec.quality_floor`` the validity bound.
+    - ``"monge_ampere"`` (what :func:`jno.solve.relocate` builds) re-solves a Monge-Ampère problem each
+      round from the **original** mesh with a freshly sampled monitor, so rounds never compound. Needs no
+      line search -- the map is a gradient -- but each round is still validity-checked, because holding the
+      untagged vertices truncates that map (:func:`_monge_ampere_displacement`).
+    - ``"descent"`` walks the vertices down ``spec.objective`` -- evaluated *through the differentiable
+      solve* (``∂(solve)/∂X``) -- with a **backtracking line search on ``det J``**, since on a stiff problem
+      neither a stock optimiser nor an energy barrier can guarantee validity from outside the step control.
+
+    Either way the loop keeps the **last valid mesh**: a round that would invert or diverge is dropped and
+    the loop stops there rather than returning a broken mesh.
+
     Requires ≥1 coordinate tagged ``domain.variable(region)[i].trainable()`` before ``jno.fem`` (else raises).
     Mutates ``fem`` / its domain to the relocated mesh (like the refinement loop) and returns the solution there;
-    ``fem.adapt_history`` traces the per-step energy.
+    ``fem.adapt_history`` traces the per-round objective and energy.
+
+    **Scope.** 2D and 3D; scalar or vector; **any nodal-Lagrange order** (P1/P2/P3 measured); linear,
+    nonlinear, transient, periodic and complex — everything but complex-*transient*, which ``jno.fem``
+    rejects at build time. It does **not** compose with a geometry term (``coord.d(t) - v``): that driver
+    owns the march.
+
+    **The monitor only ever sees VERTEX values** (:func:`_vertex_values`), whatever the element order. At
+    P2 and above the mid-edge DOFs are invisible to it, so the mesh adapts to the P1 sub-sampling of the
+    field rather than to everything the field resolves. That is a real ceiling on what r-adaptivity buys
+    at higher order, not merely an implementation note — a monitor built on the full basis would see more.
     """
     import jax
     import jax.numpy as jnp
-
-    import jno
 
     dom = fem.domain
     coord_specs = list(getattr(dom, "_trainable_coords", None) or [])
@@ -1209,17 +2158,53 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
             p = p.at[jnp.asarray(sp["ids"]), sp["axis"]].set(vals[sp["name"]])
         return p
 
+    # Per-block value shape, needed to read VERTEX values out of a solution block. DOFs are node-major
+    # (``node*vec + comp``) and a nodal Lagrange element numbers the mesh vertices FIRST, so every
+    # component's vertex values are ``blk[: n_verts*vec].reshape(n_verts, vec)``.
+    #
+    # ``vec`` cannot be guessed from the block LENGTH, which is what this used to do. For a P2 vector
+    # field ``nb % n_verts != 0`` (634 against 88 vertices), so the guess fell through to ``blk[:n_verts]``
+    # -- the first ``n_verts/vec`` NODES times their components, read as though it were one value per
+    # vertex. It did not raise. It relocated against a misread array (measured 1.4e-02 away from the true
+    # component-0 vertex values, the scale of the solution itself), and it was the one configuration in a
+    # sweep where element quality got WORSE: min |det J| 8.7e-03 -> 4.7e-03. The sibling h-adaptive path,
+    # `_solve_vertex_values`, refuses this case outright -- so one of the two silently mangled what the
+    # other declined to touch.
+    #
+    # ``field_points`` and ``offsets`` are per-FEM snapshots (unlike the domain's ``_fem_native_*``
+    # records, which the next assembly clobbers), so reading them here is safe.
+    _fpts = getattr(fem, "field_points", None)
+    _off0 = list(fem.offsets) if getattr(fem, "offsets", None) is not None else None
+    _vecs = None
+    if _fpts is not None and _off0 is not None and len(_fpts) == len(_off0) - 1:
+        _vecs = []
+        for _i in range(len(_fpts)):
+            _nn = int(np.asarray(_fpts[_i]).shape[0])
+            _nb = int(_off0[_i + 1] - _off0[_i])
+            _vecs.append(_nb // _nn if _nn and _nb % _nn == 0 else 1)
+
+    def _vertex_values(blk, i):
+        """Block ``i``'s values at the mesh VERTICES: ``(n_verts,)`` scalar or ``(n_verts, vec)`` vector."""
+        nb = int(blk.shape[0])
+        vec = (
+            _vecs[i] if (_vecs is not None and i < len(_vecs)) else (nb // n_verts if n_verts and nb % n_verts == 0 else 1)
+        )
+        if vec > 1:
+            if nb < n_verts * vec:
+                raise NotImplementedError(
+                    f"AdaptSpec(relocate=True): solution block {i} has {nb} DOFs for {n_verts} vertices at "
+                    f"vec={vec}, so its vertex values are not a prefix and the monitor cannot be built."
+                )
+            return blk[: n_verts * vec].reshape(n_verts, vec)
+        return blk[:n_verts]
+
     def _block_energy(u, pts, bounds):
         """Total Dirichlet energy summed over EVERY solution block (``bounds``) — so a scalar, a vector (per
         component), a **complex** field (its real + imaginary blocks) and a coupled multifield all contribute.
-        A higher-order block (P2) falls back to its vertex DOFs."""
+        A higher-order block reads its vertex DOFs (see :func:`_vertex_values`)."""
         e = 0.0
         for i in range(len(bounds) - 1):
-            blk = u[bounds[i] : bounds[i + 1]]
-            nb = int(blk.shape[0])
-            veci = nb // n_verts if (n_verts and nb % n_verts == 0) else 1
-            bf = blk.reshape(n_verts, veci) if veci > 1 else blk[:n_verts]
-            e = e + _dirichlet_energy_jax(pts, bf, cells_j, dim)
+            e = e + _dirichlet_energy_jax(pts, _vertex_values(u[bounds[i] : bounds[i + 1]], i), cells_j, dim)
         return e
 
     _march = _transient_march_fn(fem.operator) if mode == "transient" else None
@@ -1244,12 +2229,36 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
             return newton_krylov(lambda uu: op.residual(uu, vals), u0)
         return _march(vals)  # transient: time-averaged nodal state over the marched trajectory
 
-    def _energy(vals):
-        u = _solve_at(vals)
-        bounds = list(fem.offsets) if fem.offsets is not None else [0, int(u.shape[0])]
-        return _block_energy(u, _scatter(vals), bounds)
+    if spec.objective not in ("equidistribution", "huang"):
+        raise ValueError(f"AdaptSpec.objective must be 'equidistribution' or 'huang'; got {spec.objective!r}.")
+    if spec.relocate_method not in ("descent", "monge_ampere"):
+        raise ValueError(f"AdaptSpec.relocate_method must be 'descent' or 'monge_ampere'; got {spec.relocate_method!r}.")
 
-    val_grad = jax.jit(jax.value_and_grad(lambda arrs: _energy(dict(zip(names, arrs)))))
+    def _block_defect(u, pts, bounds):
+        """Mesh functional summed over every solution block — the mirror of :func:`_block_energy`, so a
+        scalar / vector / complex / coupled multifield all contribute their own monitor. Which functional
+        is :attr:`AdaptSpec.objective`; both take the same arclength monitor, so switching between them
+        changes the functional alone."""
+        d_ = 0.0
+        for i in range(len(bounds) - 1):
+            bf = _vertex_values(u[bounds[i] : bounds[i + 1]], i)
+            if spec.objective == "huang":
+                d_ = d_ + _huang_ea_jax(pts, pts0_j, bf, cells_j, dim)
+            else:
+                d_ = d_ + _equidistribution_jax(pts, bf, cells_j, dim)
+        return d_
+
+    def _objective(vals):
+        """What relocation descends: the monitor's **equidistribution defect**, not the FE energy.
+
+        The energy is still computed and reported in ``adapt_history`` as a diagnostic — it is a useful
+        thing to watch, it just makes a bad objective (see :func:`_equidistribution_jax`)."""
+        u = _solve_at(vals)
+        pts = _scatter(vals)
+        bounds = list(fem.offsets) if fem.offsets is not None else [0, int(u.shape[0])]
+        return _block_defect(u, pts, bounds), _block_energy(u, pts, bounds)
+
+    val_grad = jax.jit(jax.value_and_grad(lambda arrs: _objective(dict(zip(names, arrs))), has_aux=True))
 
     def _min_detj(p):
         vv = p[cells]
@@ -1264,10 +2273,60 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
 
     floor = spec.quality_floor * _min_detj(pts0)
     arrs = [jnp.asarray(pts0[sp["ids"], sp["axis"]]) for sp in coord_specs]
-    msq = [jnp.zeros_like(a) for a in arrs]  # RMSProp running average (near-feature gradients dwarf the rest)
     history: list[dict] = []
+
+    if spec.relocate_method == "monge_ampere":
+        # x = ξ + ∇φ is ABSOLUTE, not incremental: every round re-solves from the same computational
+        # mesh with a freshly sampled monitor, so a round never compounds the previous round's error.
+        ops = _p1_operators(pts0, cells, dim)
+        sg_j, meas_j, wsum_j = (jnp.asarray(o) for o in ops[:3])
+        cells_j2, n_local = jnp.asarray(cells), cells.shape[1]
+
+        @jax.jit
+        def _ma_round(arrs_in):
+            vals = dict(zip(names, arrs_in))
+            u = _solve_at(vals)
+            pts = _scatter(vals)
+            bounds = list(fem.offsets) if fem.offsets is not None else [0, int(u.shape[0])]
+            blk = u[bounds[0] : bounds[1]]  # the monitor rides the FIRST field (cf. spec.metric_field)
+            nb = int(blk.shape[0])
+            veci = nb // n_verts if (n_verts and nb % n_verts == 0) else 1
+            bf = blk.reshape(n_verts, veci) if veci > 1 else blk[:n_verts]
+            m = _arclength_monitor_jax(bf, sg_j, meas_j, wsum_j, cells_j2, n_local, dim)
+            disp = _monge_ampere_displacement(m, ops, cells, dim, n_relax=spec.ma_relax, dt=spec.ma_dt)
+            return disp, _block_defect(u, pts, bounds), _block_energy(u, pts, bounds)
+
+        # `max_iters` MOVES need `max_iters + 1` evaluations, so each history entry's ``objective`` is the
+        # objective OF its own ``points`` rather than of the mesh one round earlier.
+        best = -1
+        for it in range(spec.max_iters + 1):
+            disp, obj, e = _ma_round(arrs)
+            history.append({"step": it, "objective": float(obj), "energy": float(e), "points": _moved(arrs)})
+            # Keep the BEST mesh, not the last. Monge-Ampère does not descend this objective -- it solves a
+            # different problem -- and holding the untagged vertices truncates its map, so a round genuinely
+            # can make the mesh worse (badly, when few vertices are free: 13 of 57 raised the defect ~10%).
+            # Descent cannot do this, its line search forbids it; the outer loop has to supply the guarantee.
+            if best < 0 or float(obj) < history[best]["objective"]:
+                best = it
+            if it == spec.max_iters:
+                break
+            cand = [pts0_j[sp["ids"], sp["axis"]] + disp[jnp.asarray(sp["ids"]), sp["axis"]] for sp in coord_specs]
+            # `not (x > 0)` rather than `x <= 0`: the relaxation is explicit in `ma_dt` and diverges past
+            # its stability limit, and `nan <= 0` is False -- a diverged solve would sail through the
+            # naive test and move the mesh to NaN. Folding should not happen for the whole map (it is a
+            # gradient); a truncated map and a diverged relaxation both can.
+            if not (_min_detj(_moved(cand)) > 0.0):
+                break
+            arrs = cand
+        # Truncate to the accepted trajectory so the last entry IS the mesh handed back (and an animation
+        # of `history` ends on it) rather than a rejected excursion past it.
+        history[:] = history[: best + 1]
+        arrs = [jnp.asarray(history[best]["points"][sp["ids"], sp["axis"]]) for sp in coord_specs]
+        return _finish_relocate(fem, dom, coord_specs, arrs, pts0, n_verts, dim, cells, history, solve_fn, kwargs)
+
+    msq = [jnp.zeros_like(a) for a in arrs]  # RMSProp running average (near-feature gradients dwarf the rest)
     for it in range(spec.max_iters):
-        e, g = val_grad(arrs)
+        (obj, e), g = val_grad(arrs)
         msq = [0.9 * m + 0.1 * gi**2 for m, gi in zip(msq, g)]
         stepdir = [gi / jnp.sqrt(m + 1e-8) for gi, m in zip(g, msq)]
         a = spec.lr
@@ -1279,13 +2338,32 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
         else:
             break  # at the mesh-quality limit -- no admissible step
         arrs = cand
-        history.append({"step": it, "energy": float(e), "points": _moved(arrs)})  # points: for a relocation animation
+        # ``objective`` is what is descended (the equidistribution defect); ``energy`` is kept as a
+        # diagnostic. ``points``: the moved vertices, so a relocation run can be animated.
+        history.append({"step": it, "objective": float(obj), "energy": float(e), "points": _moved(arrs)})
 
-    final = _moved(arrs)
-    if _min_detj(final) <= 0.0:  # fail loud rather than hand back / re-solve on a tangled mesh
+    return _finish_relocate(fem, dom, coord_specs, arrs, pts0, n_verts, dim, cells, history, solve_fn, kwargs)
+
+
+def _finish_relocate(fem, dom, coord_specs, arrs, pts0, n_verts, dim, cells, history, solve_fn, kwargs):
+    """Land a finished relocation: check validity, move the domain, drop the trainable tags, re-solve.
+
+    Shared by both :attr:`AdaptSpec.relocate_method` branches -- the mesh they hand over is just a set of
+    vertex positions, so everything downstream of "where do the nodes go" is identical."""
+    import jno
+
+    final = pts0.copy()
+    for i, sp in enumerate(coord_specs):
+        final[sp["ids"], sp["axis"]] = np.asarray(arrs[i])
+    vv = final[cells]
+    ee = np.stack([vv[:, i + 1] - vv[:, 0] for i in range(dim)], axis=1)
+    # `not (x > 0)`, not `x <= 0`: NaN must fail this test too (a diverged Monge-Ampere relaxation
+    # returns a non-finite mesh, and `nan <= 0` is False). Fail loud rather than re-solve on it.
+    if not (float(np.min(np.linalg.det(ee.transpose(0, 2, 1)))) > 0.0):
         raise RuntimeError(
-            "FEM.solve(adapt=relocate): the mesh tangled (min det J <= 0). Lower AdaptSpec.lr or raise "
-            "AdaptSpec.quality_floor."
+            "FEM.solve(adapt=relocate): the mesh is invalid (min det J <= 0, or non-finite). For "
+            "relocate_method='descent' lower AdaptSpec.lr or raise AdaptSpec.quality_floor; for "
+            "'monge_ampere' lower AdaptSpec.ma_dt (the relaxation is explicit and has a stability limit)."
         )
 
     # apply the relocation to the domain (connectivity-preserving), drop the trainable tags, re-solve plainly
@@ -1414,7 +2492,11 @@ def _field_layout(fem: Any) -> dict:
     d = fem.domain
     off = fem.offsets
     if off is None:  # single scalar field with no block structure
-        off = [0, int(jnp.asarray(fem._op.state0).reshape(-1).shape[0])]
+        n_state = int(jnp.asarray(fem._op.state0).reshape(-1).shape[0])
+        _meta = getattr(fem._op, "metadata", None) or {}
+        # A fused complex transient marches the stacked [Re; Im] state (2n) but its FIELD layout is the
+        # n complex DOFs — halve, or the layout would misread [Re; Im] as an interleaved vec-2 field.
+        off = [0, n_state // 2 if _meta.get("complex") else n_state]
     off = [int(x) for x in off]
     n_fields = len(off) - 1
     fpts = fem.field_points
@@ -1434,6 +2516,22 @@ def _field_layout(fem: Any) -> dict:
         "orders": [int(o) for o in orders],
         "cells_f": [np.asarray(c) for c in cells_f],
         "vecs": vecs,
+    }
+
+
+def _double_layout(layout: dict) -> dict:
+    """The transfer/metric layout for a fused complex transient: the block state is the stacked
+    ``[Re; Im]`` pair, so the imaginary half rides as a SECOND COPY of every field — same nodes, same
+    order, same vec, offset by the total. The basis-aware transfer then carries both halves with no
+    complex branch, exactly as :func:`jno._fem._duplicate_periodic` doubles the periodic blocks."""
+    off = layout["offsets"]
+    n_half = off[-1]
+    return {
+        "offsets": off + [n_half + o for o in off[1:]],
+        "field_points": layout["field_points"] + layout["field_points"],
+        "orders": layout["orders"] + layout["orders"],
+        "cells_f": layout["cells_f"] + layout["cells_f"],
+        "vecs": layout["vecs"] + layout["vecs"],
     }
 
 
@@ -1501,8 +2599,8 @@ def run_adaptive_transient(
 
     d = fem.domain
     dim = int(d.dimension)
-    if dim not in (2, 3):
-        raise NotImplementedError(f"transient adaptive remeshing supports 2D/3D simplicial meshes; got dimension {dim}.")
+    if dim not in (1, 2, 3):
+        raise NotImplementedError(f"transient adaptive remeshing supports 1D/2D/3D meshes; got dimension {dim}.")
 
     cons, kw = fem._constraints, fem._fem_kwargs
     block = fem._op
@@ -1510,14 +2608,20 @@ def run_adaptive_transient(
     state = jnp.asarray(block.state0).reshape(-1)
     if jnp.iscomplexobj(state):
         raise NotImplementedError(
-            "transient adaptive remeshing is real-only (the Hessian metric and the ZZ estimator are); a complex "
-            "transient is not supported yet."
+            "transient adaptive remeshing found a complex-dtype block state — a supported complex "
+            "transient marches the REAL stacked [Re; Im] block; this one assembled through another route."
         )
+    # A fused COMPLEX transient marches the real stacked [Re; Im] state: the transfer/metric see the
+    # DOUBLED layout (the Im half rides as a second copy of every field), the remesh metric is the
+    # MODULUS |u| = sqrt(Re² + Im²), and each saved frame is recombined to the complex field the user
+    # authored against.
+    is_cx = bool(block.metadata and block.metadata.get("complex"))
     # Per-field block layout (offsets / orders / vecs / P{order} connectivity / DOF coords), generalised
     # beyond scalar-P1: vector, higher-order (P2), and mixed (Taylor-Hood) fields are carried across a
     # remesh by the basis-aware transfer below. Read right after assembly — the domain's per-field
     # metadata is clobbered by the next one.
-    layout = _field_layout(fem)
+    layout = _field_layout(fem)  # the (complex) FIELD layout — what saved frames are described by
+    tlayout = _double_layout(layout) if is_cx else layout  # what the stacked block state is laid out as
     off = layout["offsets"]
     n_fields = len(off) - 1
     cur_nverts = n_verts  # current mesh's vertex count (updates each remesh; drives the metric slice)
@@ -1525,7 +2629,13 @@ def run_adaptive_transient(
     if not 0 <= mf < n_fields:
         raise ValueError(f"AdaptSpec.metric_field={spec.metric_field} is out of range for {n_fields} field(s).")
 
-    key = "triangle" if dim == 2 else "tetra"
+    def _frame(s):  # a saved frame: the complex field for a fused complex transient, the state itself else
+        if not is_cx:
+            return s
+        half = s.shape[0] // 2
+        return s[:half] + 1j * s[half:]
+
+    key = _simplex_cell_key(dim)
     ts = np.asarray(_block_time_grid(block))  # fixed t0..t1 at dt -- unchanged by remeshing
     dt = float(block.dt)
     theta = float(block.metadata.get("theta", 1.0)) if block.metadata else 1.0
@@ -1545,7 +2655,7 @@ def run_adaptive_transient(
         return (np.asarray(d.mesh.points)[:, :dim].astype(np.float64), np.asarray(d.mesh.cells_dict[key]).astype(np.int64))
 
     cur_mesh = _snapshot()
-    times, states, meshes, layouts = [float(ts[0])], [state], [cur_mesh], [layout]
+    times, states, meshes, layouts = [float(ts[0])], [_frame(state)], [cur_mesh], [layout]
     history: list[dict] = []
     cur = fem
 
@@ -1571,14 +2681,19 @@ def run_adaptive_transient(
         for j in range(chunk):
             i += 1
             times.append(float(ts[i]))
-            states.append(traj[j])
+            states.append(_frame(traj[j]))
             meshes.append(cur_mesh)
             layouts.append(layout)
         if i >= n_steps:
             break
 
         # remesh from the metric-driving field (fixed budget above), then carry every field's block over
-        u_v = _scalar_vertex_metric(state, layout, mf, cur_nverts)  # scalar VERTEX field (vector/P2 reduced)
+        if is_cx:  # the modulus drives the metric — refining on Re alone would miss a rotating phase
+            _re = _scalar_vertex_metric(state, tlayout, mf, cur_nverts)
+            _im = _scalar_vertex_metric(state, tlayout, mf + n_fields, cur_nverts)
+            u_v = np.sqrt(_re**2 + _im**2)
+        else:
+            u_v = _scalar_vertex_metric(state, tlayout, mf, cur_nverts)  # scalar VERTEX field (vector/P2 reduced)
         old_pts, old_cells = cur_mesh
         if spec.anisotropic:
             metric = hessian_metric(d, u_v, target_complexity=target, hmin=hmin, hmax=hmax)
@@ -1599,166 +2714,528 @@ def run_adaptive_transient(
         cur_mesh = _snapshot()
         new_n = int(cur_mesh[0].shape[0])
         new_layout = _field_layout(cur)  # per-field layout on the refined mesh (read now, before any re-assembly)
+        new_tlayout = _double_layout(new_layout) if is_cx else new_layout
         # Basis-aware, value-shape-aware state transfer: evaluate each OLD field at its NEW per-field DOF
         # coordinates using the OLD element's shape functions (P1 vertices / P2 midpoints / vector comps).
+        # For a fused complex transient the doubled layout carries the Re and Im halves separately.
         vals = _eval_fe_fields_at_points(
             old_pts,
             old_cells,
             state,
-            layout["offsets"],
-            layout["orders"],
-            layout["cells_f"],
-            layout["vecs"],
-            new_layout["field_points"],
+            tlayout["offsets"],
+            tlayout["orders"],
+            tlayout["cells_f"],
+            tlayout["vecs"],
+            new_tlayout["field_points"],
             dim=dim,
         )
         state = jnp.concatenate([v.reshape(-1) for v in vals])
-        off, layout, cur_nverts = new_layout["offsets"], new_layout, new_n
-        history.append({"t": float(ts[i]), "n_dofs": int(off[-1]), "fields": n_fields})
+        off, layout, tlayout, cur_nverts = new_layout["offsets"], new_layout, new_tlayout, new_n
+        history.append({"t": float(ts[i]), "n_dofs": int(tlayout["offsets"][-1]), "fields": n_fields})
 
     fem.__dict__.update(cur.__dict__)  # rebind to the final adapted mesh (matches the steady driver)
     fem.adapt_history = history
     return AdaptiveTrajectory(np.asarray(times), states, meshes, layouts=layouts)
 
 
-@dataclass
-class MovingBoundary:
-    """Free-surface / moving-boundary spec for ``FEM.solve(move=...)`` on a **transient** problem.
+def _geometry_motion_specs(fem: Any, dom: Any) -> list[dict]:
+    """One record per geometry term: which mesh vertices it moves, along which axis, and the residual to
+    evaluate. See :func:`jno.trace.mesh_velocity` for what makes a term a geometry term."""
+    from ...trace import Variable, frozen_fields_in, mesh_velocity, substitute
 
-    The domain boundary moves by a **prescribed velocity**; the mesh deforms to follow it (harmonic
-    interior extension -- :func:`harmonic_extension` + :func:`move_mesh`), the physics marches on the
-    moving mesh, and the state is carried across each move. Returns an :class:`AdaptiveTrajectory` (each
-    frame on its own moved mesh -- use ``.resample(ref)`` to project onto a fixed grid).
-
-    Attributes
-    ----------
-    velocity
-        The boundary velocity, in one of two forms (arity-detected):
-
-        - **prescribed** -- ``velocity(t, x) -> (n_boundary, dim)``: the velocity at time ``t`` evaluated
-          at the current boundary-vertex positions ``x`` (``(n_boundary, dim)``; position-based, so no
-          vertex indices needed);
-        - **state-dependent** (physics-driven) -- ``velocity(t, x, state, domain) -> (n_boundary, dim)``:
-          additionally receives the **current nodal field** ``state`` (the solution on the current mesh)
-          and the **current** ``domain``. Use this to read a functional of the solution and drive the
-          boundary with it -- e.g. a **Stefan** front ``v_n = -k/L · ∇T·n``. The boundary-functional
-          readout (``u.bind(x=xb, y=yb).freeze(state)`` then ``(Tf.x*nx + Tf.y*ny).eval()``; see
-          :class:`jno.trace.FrozenField`) expresses such a functional as traced math. Caveat: ``domain``
-          here carries the **transient time grid**, so evaluate a purely-spatial readout on a steady view
-          of the current mesh (or read ``∇field`` via nodal recovery); the standalone readout is
-          validated on a steady domain, and a transient-domain spatial ``.eval()`` is a follow-up.
-
-        In both callback forms, **return zero rows for the held (fixed) part of the boundary** and the
-        interface velocity for the moving surface -- the returned field *is* the specification of which
-        boundary moves.
-
-        - **trace expression** (velocity *as math*) -- a jNO trace node giving the **scalar normal
-          speed** at the boundary, referencing a frozen field for the current state::
-
-              xb, yb, _, nx, ny = d.variable("boundary", normals=True, split=True)
-              Tf = u.bind(x=xb, y=yb).freeze(state0)          # state0 = any placeholder (e.g. zeros/IC)
-              velocity = -(k / L) * (Tf.x * nx + Tf.y * ny)   # v_n = -k/L · ∇T·n, a Stefan front
-
-          The driver swaps the **live state** into ``Tf`` each step (via :func:`jno.trace.substitute` /
-          :func:`jno.trace.refreeze`), evaluates the expression, and moves each boundary vertex **along
-          its outward normal** at that speed. This is the fully-declarative form -- the interface law
-          *is* the input, and it is differentiable in the field. (Interpreted as a *normal* speed; a
-          callback returns the full velocity vector instead.)
-
-          **Only part of the boundary moves** -- because the boundary coordinates ``xb, yb`` are trace
-          nodes too, a coordinate-masked speed frees just the surface(s) you want and holds the rest
-          exactly (the mask *follows* the moving surface, since the coordinates re-sample each step). No
-          separate movable-tag is needed::
-
-              v = (-(k / L) * (Tf.x * nx + Tf.y * ny)) * (yb > y_base)   # top free, base held
-
-          (several parts: a compound mask; the held nodes get zero speed and are pinned by the harmonic
-          interior extension.)
-    every
-        Move + re-assemble every ``every`` steps (default 1 = every step, most accurate). Larger is
-        cheaper (fewer re-assemblies) but lags the domain shape within a chunk.
-
-    Method / scope (house rule: fail loud on the rest).
-    - **Operator-split ALE.** The physics marches on the current mesh; between steps the mesh is moved
-      and the field **re-interpolated** onto the moved vertices (:func:`transfer_solution`), which
-      transports the field under the mesh motion. This is first-order in ``every`` and is correct for a
-      field whose material is (quasi-)stationary while the *boundary* moves (a melt/free surface with a
-      quasi-static bulk); it does **not** add an ALE convective ``(c-w)·∇u`` term, so it is *not* the
-      right discretization when a represented material velocity ``c`` differs from the mesh velocity
-      ``w`` (coupled flow -- that would double-count advection). A **state-dependent** ``velocity`` (a
-      Stefan / kinematic law reading the current field) is supported via the 4-argument form above; the
-      velocity is still applied **explicitly** (evaluated from the state at the start of each move), not
-      solved implicitly with the interface position.
-    - **Connectivity-preserving move only.** A move that would invert an element raises
-      (:func:`move_mesh` ``check``); the remesh-on-tangle fallback (``remesh_with_mmg`` + transfer, for
-      large deformation) is the next extension. Reduce ``dt`` / the motion, or await it.
-    - **Boundary conditions on the moving surface must be *natural* (unconstrained) or a whole-boundary
-      / held-boundary tag** -- those re-derive correctly on the moved mesh. A Dirichlet/Robin BC pinned
-      to the moving surface by a spatial sub-predicate would not follow the motion; an index-carried
-      moving tag is the next extension.
-    - **scalar-P1 field(s), real, non-periodic**, default θ-stepper (mirrors the transient adaptive
-      driver): vector / higher-order / complex / periodic / a custom ``solve_fn`` each raise.
-    """
-
-    velocity: Any
-    every: int = 1
+    pts = np.asarray(dom.mesh.points)
+    specs = []
+    for term in fem._geometry:
+        coord, _tvar, jac = mesh_velocity(term)
+        ids = np.asarray(Variable._region_vertex_ids(dom, coord.tag, pts), dtype=int)
+        if ids.size == 0:
+            raise ValueError(f"jno.fem: the geometry term on region {coord.tag!r} matches no mesh vertices.")
+        # Store the BARE Placeholder, not a typed view. A velocity like `0.05*(Tf.x*nx + Tf.y*ny)*ny` comes
+        # back wrapped, and both `substitute` and `frozen_fields_in` walk the graph -- handed the wrapper
+        # they find nothing, so the frozen field is never re-pinned and the derivative is never replaced.
+        # The term then evaluates as `d(static coordinate)/dt`, which is identically zero: no motion, no error.
+        bare = term._expr if hasattr(term, "_expr") else term
+        # The two probe expressions are built ONCE here, not per step. They are what recovers the velocity
+        # from the residual (see :func:`_geometry_velocity`), and their structure does not depend on the
+        # mesh -- only their *values* do. Building them once is what lets `Crux.eval`'s compiled-function
+        # cache, which is keyed on the op object, hit for the whole march instead of compiling every step.
+        zero = 0.0 * coord
+        specs.append(
+            {
+                "ids": ids,
+                "axis": int(coord.dim[0]),
+                "term": bare,
+                "jac": jac,
+                "coord": coord,
+                "expr0": substitute(bare, {jac: zero}),
+                "expr1": substitute(bare, {jac: zero + 1.0}),
+            }
+        )
+    for s in specs:
+        s["frozen"] = frozen_fields_in(s["term"])
+    return specs
 
 
-def _velocity_wants_state(vel: Any) -> bool:
-    """True if ``vel`` takes the state-dependent form ``velocity(t, x, state, domain)`` (>=4 positional
-    parameters) rather than the prescribed ``velocity(t, x)``. Falls back to prescribed if unintrospectable."""
-    import inspect
+def _tags_read(expr) -> list:
+    """Every region tag the expression reads, in first-seen order.
 
-    try:
-        params = [
-            p for p in inspect.signature(vel).parameters.values() if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
-        ]
-        return len(params) >= 4
-    except (ValueError, TypeError):
-        return False
+    The mesh-motion driver rewrites a context entry per tag it hands to the compiled velocity, and it has
+    to rewrite **all** of them: everything left at its seed value is frozen for the whole march. A law
+    reading a second region's coordinates was silently stale -- with two tags over the identical vertex
+    set and ``dy/dt = y``, reading its own tag compounded to 1.46410 while reading the twin returned
+    1.40000, exactly the frozen-seed answer, with no error.
+
+    Walks with :func:`jno.trace._iter_placeholder_children`, the single traversal shape the other trace
+    walks use (:func:`mesh_velocity`, :func:`frozen_fields_in`)."""
+    from ...trace import Placeholder, Variable, _iter_placeholder_children
+
+    node = expr._expr if hasattr(expr, "_expr") else expr
+    seen: set = set()
+    tags: list = []
+
+    def visit(n):
+        if not isinstance(n, Placeholder) or id(n) in seen:
+            return
+        seen.add(id(n))
+        if isinstance(n, Variable):
+            t = getattr(n, "tag", None)
+            if isinstance(t, str) and t not in tags:
+                tags.append(t)
+        for kind, _attr, val in _iter_placeholder_children(n):
+            for c in val if kind == "list" else (val,):
+                visit(c)
+
+    visit(node)
+    return tags
 
 
-def _is_trace_velocity(vel: Any) -> bool:
-    """True if ``vel`` is a **trace expression** (a Placeholder / typed view) rather than a Python
-    callback — i.e. the user passed the velocity *as math* (`v = -(k/L)*(Tf.x*nx + Tf.y*ny)`)."""
-    from ...trace import Placeholder
+def _tag_facet_vertex_ids(dom: Any, tag: str, dim: int) -> np.ndarray:
+    """The tag's boundary facets as MESH-VERTEX INDICES ``(E, dim)``.
 
-    return isinstance(vel, Placeholder) or isinstance(getattr(vel, "expr", None), Placeholder)
-
-
-def _trace_velocity_vb(vexpr: Any, frozen_nodes: list, state: Any, dom: Any, bverts: np.ndarray, old_pts, dim: int):
-    """Turn a **trace-expression** velocity (a *scalar normal speed*) into a per-boundary-vertex velocity
-    VECTOR, moved along the outward normal. Swaps the live ``state`` into the static expression
-    (:func:`jno.trace.substitute` / :func:`jno.trace.refreeze`), evaluates it on the current domain (in
-    boundary-tag order), aligns to the driver's boundary vertices, and multiplies by the boundary normal.
-    The interface thus moves along its normal at the speed the expression gives (the Stefan/kinematic case)."""
+    ``BoundaryRegion`` stores facets as vertex *coordinates*; under a connectivity-preserving move the
+    incidence never changes, so resolving it to indices once lets the normals be recomputed from moved
+    positions without touching the domain object."""
     from scipy.spatial import cKDTree
 
+    region = (getattr(dom, "_boundary_regions", None) or {}).get(tag)
+    ents = None if region is None else (region.edges if dim == 2 else region.triangles)
+    if ents is None or len(ents) == 0:
+        return np.zeros((0, dim), dtype=np.int64)
+    ents = np.asarray(ents)[:, :, :dim]
+    tree = cKDTree(np.asarray(dom.mesh.points)[:, :dim])
+    return np.asarray(tree.query(ents.reshape(-1, dim))[1]).reshape(ents.shape[0], ents.shape[1]).astype(np.int64)
+
+
+def _facet_outward_sign(dom: Any, facet_ids: np.ndarray, dim: int) -> np.ndarray:
+    """``(E,)`` of ±1 fixing the outward orientation of each tag facet, from the mesh **topology**.
+
+    Delegates to :func:`jno.utils.solver.fem_facets.compute_face_normals`, which orients each boundary
+    facet *away from its parent cell's opposite vertex*. That is exact for any topology; the mesh-centroid
+    rule this replaces is only exact for a star-shaped domain, and on an annulus it gave the inner hole a
+    normal pointing into the solid (``n·r̂`` = +1 where outward-from-material is -1). The old test did not
+    see it because it asserted *agreement* with ``domain.normals_by_tag`` -- and both carried the same
+    wrong convention, which is exactly how a shared representation hides a defect.
+
+    The sign is resolved once on the seed mesh and then frozen, exactly as ``assemble_fem_native`` freezes
+    it for :func:`~jno.utils.solver.fem_native._face_normals_jax`: it is locally constant, flipping only
+    at element inversion, which the march's tangle check already rejects."""
+    from .fem_facets import build_facet_connectivity, compute_face_normals
+
+    facet_ids = np.asarray(facet_ids, dtype=np.int64)
+    if facet_ids.size == 0:
+        return np.zeros((0,), dtype=float)
+    cell_type = "triangle" if dim == 2 else "tetrahedron"
+    cells, _ = _mesh_cells(dom)
+    conn = build_facet_connectivity(cells, cell_type)
+    good = compute_face_normals(np.asarray(dom.mesh.points), conn, cells, cell_type)
+
+    # Match each tag facet to its global boundary facet by its (order-independent) vertex set. Sorted
+    # rows viewed as single records give a lexicographic key, so this is one searchsorted rather than a
+    # dict lookup per facet -- 29 ms at 2340 facets and growing, on a library whose cost is its build.
+    def _rowkey(a):
+        a = np.ascontiguousarray(np.sort(np.asarray(a, dtype=np.int64), axis=1))
+        return a.view([("", a.dtype)] * a.shape[1]).ravel()
+
+    gkey, tkey = _rowkey(conn.face_nodes), _rowkey(facet_ids)
+    order = np.argsort(gkey, kind="stable")
+    pos = np.searchsorted(gkey[order], tkey)
+    ok = pos < gkey.size
+    j = order[np.clip(pos, 0, max(gkey.size - 1, 0))]
+    ok &= gkey[j] == tkey
+    if not ok.all():
+        raise ValueError(
+            f"jno.fem: a moving region names {int((~ok).sum())} facet(s) that are not boundary facets of "
+            "the mesh. An interior facet has no outward normal -- tag the region on the boundary."
+        )
+
+    v = np.asarray(dom.mesh.points)[facet_ids, :dim]  # (E, k, dim)
+    if dim == 2:
+        t = v[:, 1] - v[:, 0]
+        raw = np.stack([t[:, 1], -t[:, 0]], axis=1)
+    else:
+        raw = np.cross(v[:, 1] - v[:, 0], v[:, 2] - v[:, 0])
+    return np.where(np.einsum("ij,ij->i", raw, good[j]) >= 0.0, 1.0, -1.0)
+
+
+def _vertex_normals_jax(pts, facet_ids, dim: int, sign):
+    """Per-vertex outward unit normals from moved vertex positions -- pure JAX, differentiable in ``pts``.
+
+    The facet normals come from :func:`~jno.utils.solver.fem_native._face_normals_jax` -- the one traced
+    normal builder in the library, already used by the native surface assembly -- with the frozen outward
+    ``sign`` from :func:`_facet_outward_sign`. Only the per-vertex averaging is here: accumulate each
+    facet's normal at its vertices and renormalise, mirroring ``domain_class.py:1450-1458``. With the
+    incidence resolved to indices that averaging is a scatter-add, which is what makes it traceable.
+
+    This used to carry its own facet-normal geometry *and* its own orientation rule, i.e. a second copy of
+    a quantity the library already computes. That is the shape this codebase's normal bugs keep taking, so
+    there is now one producer and this is a consumer of it."""
+    import jax.numpy as jnp
+
+    from .fem_native import _face_normals_jax
+
+    n = _face_normals_jax(pts, facet_ids, jnp.asarray(sign, dtype=pts.dtype))
+    acc = jnp.zeros_like(pts)
+    for a in range(facet_ids.shape[1]):
+        acc = acc.at[facet_ids[:, a]].add(n)
+    return acc / (jnp.linalg.norm(acc, axis=1, keepdims=True) + 1e-30)
+
+
+def _geometry_velocity_fn(spec: dict, dom: Any):
+    """Build ``velocity(pts, state, params, t) -> (n_ids,)`` for one geometry term: a **traced,
+    differentiable** function of the vertex positions, evaluated in the spec's own ``ids`` order.
+
+    This is what lets the march be scanned. :func:`Crux.eval` compiles each expression to
+    ``raw_fn(models, ctx, ...)`` where ``ctx`` is a pytree of **arrays** (``jno/core.py:5016-5029``), so
+    handing it a ctx whose tag entries are built from the *carried* positions makes the whole evaluation
+    traceable -- rather than going through ``prepare_domain_data``, which mutates host state and cannot run
+    inside ``lax.scan``. The compiler is reused rather than a second velocity evaluator written: two
+    evaluators for one expression drift apart silently.
+
+    Everything position-independent is resolved ONCE here -- the compiled expressions, the base context,
+    the sample<->vertex permutations, the facet incidence. Only values are rebuilt per call.
+
+    The two-point recovery is unchanged (see :func:`_geometry_velocity`): the term is a residual
+    ``a·d(coord)/dt - v``, so evaluating it with the derivative replaced by 0 and by 1 gives ``-v`` and
+    ``a - v``, hence ``v = -r0/(r1 - r0)``."""
+    import functools
+
+    import equinox as eqx
+    import jax
+    import jax.numpy as jnp
+    from scipy.spatial import cKDTree
+
+    import jno
+
+    from ...core import cse, fuse_laplacian
+    from ...trace_compiler import TraceCompiler
+
+    dim = int(dom.dimension)
+    tag = spec["coord"].tag
+    crux = jno.core([spec["expr0"], spec["expr1"]], domain=dom)
+    base_ctx = dict(crux.prepare_domain_data(dom).context)
+    models = eqx.tree_inference(crux._unwrapped_models)
+
+    def _compile(op):
+        raw = TraceCompiler.compile_traced_expression(cse(fuse_laplacian(op)), crux.all_ops)
+        return eqx.filter_jit(functools.partial(raw, min_consecutive=1))
+
+    fn0, fn1 = _compile(spec["expr0"]), _compile(spec["expr1"])
+
+    # How EVERY tag the law reads relates to mesh vertices -- not just the driven one. A tag is sampled as
+    # (B, T, N, D) on a transient domain; the samples are a spatial snapshot, so one (N, D) slice describes
+    # them all. Resolved on the SEED mesh and then held fixed, which is the material-set (Lagrangian)
+    # convention a moving driven set needs -- re-deriving it from moved points is what let a `where=`
+    # region drift out of its own tag.
+    verts = np.asarray(dom.mesh.points)[:, :dim]
+    vtree = cKDTree(verts)
+    live_tags: dict = {}  # tag -> {"sample_vid", "nkey", "facet_ids"}
+    for _t in _tags_read(spec["term"]):
+        # `n_<tag>` is that tag's NORMALS, not a point set -- `domain.variable(tag, normals=True)` hands
+        # back normal components carrying it as their own tag. It is refreshed together with its owning
+        # tag below; matching it against vertices would (and did) fail with a gap of exactly 1.0, a unit
+        # normal compared against a coordinate.
+        if _t.startswith("n_") and _t[2:] in base_ctx:
+            continue
+        _e = base_ctx.get(_t)
+        if _e is None:
+            continue  # not a context-backed region (a bare symbol / a parameter tag): nothing to refresh
+        _a = np.asarray(_e)
+        if _a.ndim < 2 or _a.shape[-1] < dim:
+            continue
+        _n = int(_a.shape[-2])
+        _pts = _a.reshape(-1, _a.shape[-1])[:_n, :dim]
+        _gap, _vid = vtree.query(_pts)
+        # A tag whose samples are NOT mesh vertices (a `gauss_*` quadrature pool, a mesh-free resampled
+        # region) cannot be moved with the mesh, so its values would go stale exactly as the second-tag
+        # defect did. Refuse, rather than march on frozen coordinates.
+        _tol = 1e-6 * max(float(np.ptp(_pts)), 1.0) if _pts.size else 1.0
+        if _pts.size and float(np.max(_gap)) > _tol:
+            raise NotImplementedError(
+                f"jno.fem: the geometry term on region {tag!r} reads region {_t!r}, whose sample points are "
+                f"not mesh vertices (worst gap {float(np.max(_gap)):.2e} > {_tol:.1e}) -- a quadrature pool "
+                "or a mesh-free region. The driver cannot move those with the mesh, so the law would read "
+                "the seed positions for the whole march. Write the law in terms of a vertex-backed region."
+            )
+        _nk = f"n_{_t}"
+        _fids = _tag_facet_vertex_ids(dom, _t, dim) if _nk in base_ctx else None
+        live_tags[_t] = {
+            "sample_vid": np.asarray(_vid, dtype=np.int64),
+            "nkey": _nk if _nk in base_ctx else None,
+            "facet_ids": _fids,
+            "sign": None if _fids is None else _facet_outward_sign(dom, _fids, dim),
+        }
+
+    # vertex -> sample, for the spec's DRIVEN ids: which entry of the evaluated residual belongs to which
+    # driven vertex. Position-based, as the boundary readout is.
+    ctx_tag = np.asarray(base_ctx[tag])
+    n_samp = int(ctx_tag.shape[-2])
+    tag_pts = ctx_tag.reshape(-1, ctx_tag.shape[-1])[:n_samp, :dim]
+    gap, perm = cKDTree(tag_pts).query(verts[np.asarray(spec["ids"], dtype=int)])
+    tol = 1e-6 * max(float(np.ptp(tag_pts)), 1.0)
+    if float(np.max(gap)) > tol:
+        raise ValueError(
+            f"jno.fem: could not match region {tag!r}'s sample points to its mesh vertices "
+            f"(worst gap {float(np.max(gap)):.2e} > {tol:.1e}). The velocity cannot be attributed to vertices."
+        )
+    perm = np.asarray(perm, dtype=np.int64)
+    # A state-reading interface law (a Stefan front reading the solved field) carries FrozenField nodes.
+    # Their nodal values and the mesh they sit on are delivered through the context -- see
+    # `trace_evaluator._eval_frozen_field`. Baking them into the graph with `refreeze` is what forced a
+    # host sync and pinned the law to the SEED state on the SEED mesh.
+    frozen_ids = [getattr(f, "frozen_id", None) for f in (spec.get("frozen") or [])]
+
+    # A parameter written INTO the law (`yb.d(tb) - v0*yb`) is what makes the interface law itself a
+    # design variable. It reaches the compiled expression through `models`, which is an ARGUMENT of
+    # `raw_fn`, so substituting a traced value there keeps `d/d(v0)` connected. Without this the
+    # parameter is not merely non-differentiable but INERT: a geometry term is pulled out before the
+    # weak-form assembly, so it never reaches the block's `runtime_parameter_exprs`, and the march ran
+    # with the parameter's seed (measured: no motion at all, and no error).
+    from .parametric_helpers import _collect_runtime_parameter_exprs
+
+    _law_nodes: dict = {}
+    for _e in (spec["expr0"], spec["expr1"]):
+        _collect_runtime_parameter_exprs(_e, _law_nodes)
+    law_param_lids = {nm: int(node.model.layer_id) for nm, node in _law_nodes.items()}
+
+    def _with_value(model, value):
+        """Replace a parameter model's single array leaf with ``value`` (traced or concrete)."""
+        arrs, static = eqx.partition(model, eqx.is_inexact_array)
+        leaves, treedef = jax.tree_util.tree_flatten(arrs)
+        if len(leaves) != 1:
+            raise NotImplementedError(
+                f"jno.fem: a geometry-term parameter must be a plain `jno.np.parameter`; this one carries "
+                f"{len(leaves)} array leaves, so its value cannot be substituted unambiguously."
+            )
+        new = jax.tree_util.tree_unflatten(treedef, [jnp.asarray(value, dtype=leaves[0].dtype).reshape(leaves[0].shape)])
+        return eqx.combine(new, static)
+
+    def _write(entry, values):
+        """Broadcast an (N, D) spatial array into a context entry's (..., N, D) layout.
+
+        Every leading (batch / time) slice gets the same positions: the mesh is one geometry per step, not
+        one per sampled time. Writing only the first slice happens to work for a purely spatial expression
+        and silently would not for anything that reads across the time axis."""
+        e = jnp.asarray(entry)
+        return jnp.broadcast_to(values.reshape((1,) * (e.ndim - 2) + values.shape), e.shape)
+
+    def velocity(pts, state=None, params=None, t=None):
+        mdl = models
+        for _nm, _lid in law_param_lids.items():
+            if params is not None and _nm in params:
+                mdl = {**mdl, _lid: _with_value(mdl[_lid], params[_nm])}
+        ctx = dict(base_ctx)
+        for _t, _lt in live_tags.items():
+            ctx[_t] = _write(base_ctx[_t], pts[_lt["sample_vid"]])
+            if _lt["facet_ids"] is not None:
+                ctx[_lt["nkey"]] = _write(
+                    base_ctx[_lt["nkey"]],
+                    _vertex_normals_jax(pts, _lt["facet_ids"], dim, _lt["sign"])[_lt["sample_vid"]],
+                )
+        if t is not None and "__time__" in base_ctx:
+            # The TIME the velocity is evaluated at. A temporal variable does not live in the tag's own
+            # pool -- the tag entry is (B, T, N, D) with D = dim, purely spatial -- it resolves from the
+            # separate `__time__` context key (``trace_evaluator._eval_variable``, axis == "temporal").
+            # Left at the seed grid, `r.reshape(-1)[perm]` reads the FIRST time slice, so a law with an
+            # explicit `t` marched at t = ts[0] forever: `yb.d(tb) - tb` gave no motion at all, and
+            # `- (1 + tb)` gave 1.40000 where forward Euler is 1.46000. No error either way.
+            #
+            # Every slice is filled with the SAME value rather than the step's sub-grid, which is what
+            # makes the existing `[perm]` gather correct by construction: the mesh has one geometry (and
+            # therefore one velocity) per step, not one per sampled time.
+            ctx["__time__"] = jnp.full_like(jnp.asarray(base_ctx["__time__"]), t)
+        if frozen_ids:
+            if state is None:
+                raise ValueError(
+                    f"jno.fem: the geometry term on region {tag!r} reads the solved field, so its velocity "
+                    "needs the current state. This is a driver bug -- report it."
+                )
+            ctx["__mesh_points__"] = pts
+            ctx["__frozen_values__"] = {fid: jnp.asarray(state).reshape(-1) for fid in frozen_ids}
+        r0 = jnp.asarray(fn0(mdl, ctx, batchsize=None, key=None)).reshape(-1)
+        r1 = jnp.asarray(fn1(mdl, ctx, batchsize=None, key=None)).reshape(-1)
+        # `[perm]` gathers the driven vertices out of the driven tag's FIRST (B, T) slice. With `__time__`
+        # held constant above every slice carries the same value, so which one is read does not matter.
+        return (-r0 / (r1 - r0))[perm]
+
+    velocity.law_params = frozenset(law_param_lids)  # names the driver must accept from `fem.solve(...)`
+    return velocity
+
+
+def _geometry_velocity(spec: dict, dom: Any, state: Any) -> np.ndarray:
+    """Evaluate one geometry term's velocity on the current mesh and state.
+
+    The term is a *residual* ``a·d(coord)/dt - v = 0``, not a velocity, so the velocity is recovered by
+    evaluating it twice with the derivative node replaced by a **constant field**: at 0 it reads ``-v``, at 1
+    it reads ``a - v``, hence ``a`` by difference and ``v = -r0/a``. Two evaluations, no symbolic
+    rearrangement, and it handles any term linear in the derivative (``2*yb.d(tb) - 1`` gives ``v = 0.5``).
+    The stand-in is ``0*coord`` rather than a bare float so the expression keeps its shape *and* its domain
+    reference -- a constant velocity would otherwise leave nothing for the evaluator to infer a domain from.
+
+    A frozen field in the term is re-pinned to the live ``state`` first, which is what lets an interface law
+    read the solution (a Stefan front ``-(k/L)·∇T·n``). ``substitute`` matches by identity and leaves nodes
+    off the replacement path shared, so the derivative node survives that first pass and can still be found.
+
+    **Not used by the march** — :func:`_geometry_velocity_fn` is, because this one goes through
+    ``Crux.eval``, which mutates host state and so cannot run inside a ``lax.scan``. This is kept as the
+    independent *oracle* the traced route is checked against (two evaluators for one expression drift
+    apart silently, so the parity test is what keeps them honest).
+
+    **Oracle scope: time-independent laws only.** It evaluates against the domain's own ``__time__`` grid
+    and takes no ``t``, where the traced route is given the step time. Giving it one would mean a third
+    substitution on top of the frozen-field/derivative pair below, whose ordering is already load-bearing
+    (see :func:`_at`). A law with an explicit ``t`` is checked against its closed-form forward-Euler answer
+    instead, which is a stronger oracle than this one anyway.
+    """
     from ...trace import refreeze, substitute
 
-    v_now = substitute(vexpr, {f: refreeze(f, np.asarray(state)) for f in frozen_nodes})
-    v_n = np.asarray(v_now.eval()).reshape(-1)  # scalar normal speed at the "boundary" tag points
+    live = {f: refreeze(f, np.asarray(state)) for f in spec["frozen"]}
 
-    parts = dom.variable("boundary", normals=True, split=True)  # (x, y, [z], t, nx, ny, [nz])
-    coords = np.column_stack([np.asarray(parts[i].eval()).reshape(-1) for i in range(dim)])
-    normals = np.column_stack([np.asarray(parts[len(parts) - dim + i].eval()).reshape(-1) for i in range(dim)])
-    if v_n.shape[0] != coords.shape[0]:
+    def _ev(node):
+        # One `Crux` per term, built once and reused. `Crux.eval` keys its compiled-function cache on the
+        # op OBJECT, so a *static* expression hits that cache and is compiled once for the whole march;
+        # `domain=` is what makes it re-read the moved mesh (without it the call returns the mesh the crux
+        # was built on). A term reading a frozen field still misses, because `refreeze` mints fresh nodes
+        # each step by design -- that is the 3b half, and it needs the state delivered through the context
+        # rather than baked into the graph.
+        crux = spec.get("_crux")
+        if crux is None:
+            import jno
+
+            crux = spec["_crux"] = jno.core([spec["expr0"], spec["expr1"]], domain=dom)
+        return np.asarray(crux.eval([node], domain=dom)).reshape(-1)
+
+    def _at(value):
+        """Replace the derivative node with ``value``, THEN re-pin the frozen fields — not the other way
+        round. ``substitute`` rebuilds every ancestor of what it replaces, so re-pinning first would rebuild
+        the derivative node's parents and lose the identity this second substitution matches on; the
+        replacement would silently do nothing and the recovered coefficient would read zero everywhere."""
+        return _ev(substitute(value, live) if live else value)
+
+    r0, r1 = _at(spec["expr0"]), _at(spec["expr1"])
+    a = r1 - r0
+    if not np.all(np.abs(a) > 1e-30):
         raise ValueError(
-            f"MovingBoundary trace velocity evaluated to {v_n.shape[0]} values but the boundary tag has "
-            f"{coords.shape[0]} points — a trace velocity must be a SCALAR per boundary point (the normal speed)."
+            f"jno.fem: the geometry term on region {spec['coord'].tag!r} has a vanishing coefficient on "
+            "d(coord)/dt somewhere, so it states no velocity there. Write it as `coord.d(t) - velocity`."
         )
-    _, perm = cKDTree(coords).query(np.asarray(old_pts)[bverts])  # align tag order → driver's boundary vertices
-    return v_n[perm][:, None] * normals[perm]  # v_n · n̂ : each vertex moves along its outward normal
+    v = -r0 / a
+
+    # The velocity comes out in the region's SAMPLE order, which is not the mesh-vertex order and need not
+    # even have the same length (a tag may sample a point that is not a vertex). Align by position, as the
+    # boundary readout does -- never by index, which would silently permute the motion.
+    #
+    # The sample coordinates are read straight out of `domain.context` rather than evaluated through the
+    # trace: it is the very array the trace would gather from, in the same order (checked at 2 mesh sizes),
+    # and evaluating it instead cost two evaluations per term per step -- half of this driver's trace work.
+    #
+    # Reusing one compiled `jno.core` across steps IS safe, as long as `domain=` is passed on every call:
+    # `Crux.eval` re-prepares the domain data when given one and reuses the cached data when not, so a bare
+    # `core.eval([expr])` returns the mesh it was built on (measured 0.5 where the moved mesh gives 0.75)
+    # while `core.eval([expr], domain=d)` returns 0.75 correctly. It is not done here because it is not
+    # worth much: measured 1.10x over 12 steps, since the per-call cost is the domain re-preparation rather
+    # than compilation. Cache the core when the re-preparation itself gets cheaper, not before.
+    dim = int(dom.dimension)
+    ctx = np.asarray(dom.context[spec["coord"].tag])
+    tag_pts = ctx.reshape(-1, ctx.shape[-1])[: ctx.shape[-2], :dim] if ctx.ndim > 2 else ctx[:, :dim]
+    if v.shape[0] != tag_pts.shape[0]:
+        raise ValueError(
+            f"jno.fem: the geometry term on region {spec['coord'].tag!r} evaluated to {v.shape[0]} values but the "
+            f"region samples {tag_pts.shape[0]} points. A velocity must be one value per sample point; an explicit "
+            "dependence on the time variable is not supported here (a region samples space x time) -- write the "
+            "law in terms of the coordinates and the solved field instead."
+        )
+    from scipy.spatial import cKDTree
+
+    verts = np.asarray(dom.mesh.points)[spec["ids"], :dim]
+    dist, perm = cKDTree(tag_pts).query(verts)
+    # 1e-6, not 1e-8: the sampled context is float32, so an exact match still lands ~1e-7 out. A genuine
+    # mismatch is a point that is not a vertex at all, i.e. ~one element away -- five orders clear of this.
+    tol = 1e-6 * max(float(np.ptp(tag_pts)), 1.0)
+    if float(np.max(dist)) > tol:
+        raise ValueError(
+            f"jno.fem: could not match region {spec['coord'].tag!r}'s sample points to its mesh vertices "
+            f"(worst gap {float(np.max(dist)):.2e} > {tol:.1e}). The velocity cannot be attributed to vertices."
+        )
+    return v[perm]
 
 
-def run_moving_boundary(
-    fem: Any, spec: MovingBoundary, *, solve_fn: Any = None, save_ts: Any = None, **kwargs: Any
-) -> "AdaptiveTrajectory":
-    """Drive ``FEM.solve(move=spec)``: march a transient problem while the **boundary moves** by the
-    prescribed ``spec.velocity``. Every ``spec.every`` steps the mesh is deformed to follow the boundary
-    (:func:`harmonic_extension` + :func:`move_mesh`), the problem re-assembled on the moved mesh, and the
-    state carried across (:func:`transfer_solution`, connectivity-preserving). Returns an
-    :class:`AdaptiveTrajectory`. See :class:`MovingBoundary` for the method and its scope."""
+def run_mesh_motion(fem: Any, *, solve_fn: Any = None, **kwargs: Any) -> "AdaptiveTrajectory":
+    """March a transient problem whose ``jno.fem([...])`` list contains **geometry terms** — the mesh moves
+    as those terms say, the physics marches on the moved mesh, and the state is carried across each move.
+
+    Each step: evaluate every geometry term's velocity on the current mesh and state, scatter it into the
+    vertices and axes those terms name, harmonically extend over everything they do *not* name
+    (:func:`harmonic_extension`), move, re-assemble, and carry the state onto the moved mesh by
+    conservative L2 projection (:func:`_l2_transfer_jax`). Returns an :class:`AdaptiveTrajectory`, one
+    frame per moved mesh.
+
+    **Method / scope** (house rule: fail loud on the rest).
+
+    - **Operator-split ALE, explicit in the velocity.** The velocity is evaluated from the state at the
+      *start* of each move, not solved implicitly with the interface position, so the scheme is first-order
+      in the step — **measured**, not asserted: against a manufactured solution on a translating domain
+      the observed rates are 1.14 / 1.12 / 1.12 / 1.10 moving, and 0.99 / 1.01 / 1.04 / 1.10 still. The
+      motion multiplies the error *constant* by ~3x (that is the state transfer) and leaves the *order*
+      intact. Refining ``h`` converges too, at 1.51 → 1.76 toward the expected 2 for P1, and P2 is ~18x
+      more accurate than P1 on the same moving mesh, so higher order still pays here.
+
+      A caveat for anyone repeating that measurement: the temporal and spatial errors have **opposite
+      signs**, so comparing directly against ``u*`` shows rates of +1.4 then −0.4 as they cancel and
+      separate again. That looks like a scheme that stops converging and is only a contaminated
+      measurement — compare against a fine-``dt`` reference on the *same* mesh instead, which cancels the
+      spatial error exactly.
+
+      The term-list spelling reads like a coupled equation and this is not one — moving the mesh
+      implicitly would need the coordinates as unknowns in the monolithic system *and* the ALE
+      convective ``(c-w)·∇u`` term. The state is re-projected onto the moved mesh, which transports the
+      field under the mesh motion; that is right for a field whose material is quasi-stationary while the
+      domain deforms, and wrong when a represented material velocity differs from the mesh velocity (it
+      would double-count advection).
+    - **The transfer is diffusive**, though far less so than the pointwise re-interpolation it replaced
+      (a marginally-resolved peak loses ~9 % rather than ~33 %, and refining ``dt`` now helps instead of
+      hurting). See :func:`_l2_transfer_jax` for the measurements and for what would remove it entirely.
+    - **Backward Euler only** in practice: ``θ`` is read from the block's metadata, and the only way to
+      set it is ``fem.solve(time=jno.solve.theta(...))``, which the slot guard below rejects. Crank–
+      Nicolson on a moving mesh is not reachable today.
+    - **Connectivity-preserving only.** A move that would invert an element raises (:func:`move_mesh`
+      ``check``); remesh-on-tangle for large deformation is the next extension. Reduce the step or the
+      motion.
+    - Boundary conditions on a moving surface must be **natural** or tied to a whole-boundary / held tag —
+      those re-derive on the moved mesh. A Dirichlet BC pinned to the moving surface by a spatial
+      sub-predicate would not follow the motion.
+    - **Any nodal-Lagrange field(s), real, non-periodic** — scalar or vector, P1 or higher, mixed orders
+      across a coupled system (a Taylor–Hood pair moves as one), in 2D or 3D, linear or **nonlinear** (the
+      block's Newton branch). All of those are covered by tests. Complex, periodic, a non-nodal family
+      (RT / Nédélec / Hermite / Argyris / Morley) and a custom ``solve_fn`` each raise. Note the nonlinear
+      branch does not take ``_step_solve``: ``SemidiscreteTimeBlock.step`` threads ``linear_solve`` only
+      through the linear path, so a nonlinear march runs ``newton_krylov`` at its own defaults.
+    - **Needs ``jax_enable_x64``** and raises without it — see the guard below for the measurement.
+    - **Every frame on the block's own time grid.** There is no ``save_ts=``: it used to be accepted here
+      and silently ignored (a request for 3 frames returned the grid's 4), and it evaded the
+      unknown-keyword check below precisely by being a named parameter. It now raises with everything
+      else. Sampling *between* frames would mean interpolating a state across two different meshes — a
+      second transfer error on top of the march's own, not a formatting choice.
+    """
     import jax
     import jax.numpy as jnp
 
@@ -1767,130 +3244,360 @@ def run_moving_boundary(
     from .backend_blocks import _block_time_grid
 
     if fem._constraints is None:
-        raise ValueError("FEM.solve(move=...) requires a FEM built by jno.fem(...) (its constraint list is retained).")
+        raise ValueError("A geometry term requires a FEM built by jno.fem(...) (its constraint list is retained).")
     if solve_fn is not None:
         raise NotImplementedError(
-            "fem.solve(move=..., solve_fn=...) is not supported: the moving-boundary driver owns the time march. "
-            "Drop solve_fn (use the default θ-stepper), or drop move=."
+            "fem.solve(solve_fn=...) with a geometry term is not supported: the mesh-motion driver owns the "
+            "time march. Drop solve_fn (use the default θ-stepper), or drop the geometry term."
         )
     if getattr(fem, "_periodic", None) is not None:
-        raise NotImplementedError("fem.solve(move=...) with periodic ties is not supported yet.")
-    _vel = getattr(spec, "velocity", None)
-    if not (callable(_vel) or _is_trace_velocity(_vel)):
-        raise TypeError(
-            "MovingBoundary.velocity must be a callable (velocity(t, x[, state, domain]) -> (n_boundary, dim)) "
-            "or a trace expression (a scalar normal speed, e.g. -(k/L)*(Tf.x*nx + Tf.y*ny))."
+        raise NotImplementedError("A geometry term with periodic ties is not supported yet.")
+    if not jax.config.jax_enable_x64:
+        # The state transfer projects onto the moved mesh, which means locating each cell's QUADRATURE
+        # points in the old mesh -- interior points, where the barycentric solve is far less accurate than
+        # it is at a vertex. Measured in float32: the located weights carry 3.9e-04 against the reference
+        # basis, and a mesh that does not move at all then drifts 1.5e-03 from the fixed-mesh march. With
+        # x64 the same case matches to 2.6e-10. Refusing beats returning that quietly; the assembly is
+        # float64 regardless (see `SemidiscreteTimeBlock.solve`).
+        raise NotImplementedError(
+            "jno.fem: a geometry term (`coord.d(t) - velocity`) needs jax_enable_x64. The state transfer "
+            "locates quadrature points in the previous mesh, and in float32 that carries ~4e-4, enough for "
+            "a stationary mesh to drift 1.5e-3 over a march. Enable x64:\n"
+            "    jax.config.update('jax_enable_x64', True)"
         )
 
     d = fem.domain
     dim = int(d.dimension)
     if dim not in (2, 3):
-        raise NotImplementedError(f"moving-boundary supports 2D/3D simplicial meshes; got dimension {dim}.")
+        raise NotImplementedError(f"mesh motion supports 2D/3D simplicial meshes; got dimension {dim}.")
 
     cons, kw = fem._constraints, fem._fem_kwargs
     block = fem._op
     n_verts = int(np.asarray(d.mesh.points).shape[0])
     state = jnp.asarray(block.state0).reshape(-1)
     if jnp.iscomplexobj(state):
-        raise NotImplementedError("moving-boundary is real-only (the state transfer / mesh motion are); complex is future.")
-    off = [int(x) for x in (fem.offsets or [0, int(state.shape[0])])]
-    n_fields = len(off) - 1
-    for _f in range(n_fields):
-        if off[_f + 1] - off[_f] != n_verts:
-            raise NotImplementedError(
-                f"moving-boundary supports scalar-P1 field(s) only for now: field {_f} has {off[_f + 1] - off[_f]} "
-                f"DOFs vs {n_verts} mesh vertices (vector / higher-order). Express it as scalar-P1 fields, or await it."
-            )
+        raise NotImplementedError("mesh motion is real-only (the state transfer / mesh motion are); complex is future.")
+    # The layout the transfer needs is read from the REBUILT problem below, since that is the one the
+    # march actually steps; this early `off` only sizes the complex check above.
 
-    key = "triangle" if dim == 2 else "tetra"
+    # Make the assembly a FUNCTION of the vertex positions, once, instead of rebuilding it every step.
+    # `Variable.trainable()` on a spatial coordinate registers it as a runtime parameter that
+    # `_apply_coord_params` scatters into the P1 geometry before the element Jacobian is formed; the
+    # transient block then re-forms A and M from `args` inside `step` (see `SemidiscreteTimeBlock`). One
+    # spec per axis, covering EVERY vertex, since any of them may move.
+    #
+    # ONE route, for prescribed and state-reading velocities alike. An earlier version split them, on the
+    # belief that a state-reading law needed the rebuild to refresh a host array behind the frozen-field
+    # readout. That was wrong twice over: `move_mesh` does refresh `domain.mesh_connectivity` (measured
+    # 1.0 -> 1.5 across a move), and the actual cause of the NaN was the BiCGStab breakdown that
+    # `_step_solve` now avoids. With that fixed, forcing the state-reading case down this route reproduces
+    # the rebuild route exactly (final ymax 0.9902 either way), so the split bought nothing and is gone.
+    _axis_names = [f"__meshmotion_x{a}__" for a in range(dim)]
+    # A coordinate the USER tagged `.trainable()` is where the mesh STARTS; the driver's own registration
+    # is where the mesh IS at each step. Different roles, so they compose -- this used to raise, on the
+    # reading that "two specs writing the same axis would silently let one win". They cannot: the user's
+    # tag seeds the scan's initial carry and is never put in `args`, while the driver's axis params carry
+    # the evolving positions and are supplied every step from that carry. Together they complete the
+    # coordinate table -- free AND determined = the march moves it, from a design-variable start.
+    #
+    # The driver's own registration from an earlier `solve()` on the same domain is neither: it is dropped
+    # and re-made below, so a second solve behaves like the first (without that distinction, solving twice
+    # raised).
+    _init_coords = [sp for sp in (getattr(d, "_trainable_coords", None) or []) if sp["name"] not in _axis_names]
+    _init_specs = [
+        {"ids": np.asarray(sp["ids"], dtype=int), "axis": int(sp["axis"]), "name": str(sp["name"])} for sp in _init_coords
+    ]
+    d._trainable_coords = []  # re-registered from the CURRENT mesh just below
+    _all_parts = d.variable("__meshmotion_all__", where=lambda *c: np.ones_like(np.asarray(c[0]), dtype=bool), split=True)
+    for _a, _nm in enumerate(_axis_names):
+        _all_parts[_a].trainable(name=_nm)
+    _coord_ids = np.asarray(d._trainable_coords[0]["ids"], dtype=int)
+    cur = jno.fem(cons, **kw)  # rebuilt ONCE, now parametric in the vertex positions
+    block = cur._op
+    state = jnp.asarray(block.state0).reshape(-1)
+
+    # Per-field element order / value shape / P{k} connectivity, for the state transfer. Read HERE,
+    # immediately after the rebuild, because the next assembly on this domain overwrites the
+    # `_fem_native_*` records it comes from. It also raises for a non-nodal family (RT / Nedelec /
+    # Hermite / Argyris / Morley), which is the fail-loud this driver wants: the transfer tabulates a
+    # nodal Lagrange basis, and there is nothing sensible it could do with an edge or a normal-moment DOF.
+    # The layout is CONSTANT over the march -- the move preserves topology, so every field's connectivity
+    # and DOF count are the same at every frame; only the vertex positions differ.
+    try:
+        layout = _field_layout(cur)
+    except NotImplementedError as _e:
+        raise NotImplementedError(f"jno.fem: a geometry term needs a nodal-Lagrange assembly. {_e}") from _e
+    off = [int(x) for x in layout["offsets"]]
+
+    # Runtime parameter VALUES (a coefficient, a neural field) travel with the coordinates. Without this
+    # they were accepted by `**kwargs` and silently discarded: the block exposes them in
+    # `runtime_parameter_exprs` and the assembly reads them from `args`, but `args` only ever held the
+    # mesh-motion axes -- so a moving-mesh solve used each parameter's SEED value and reported no error,
+    # and any gradient with respect to one was identically zero. An unknown name raises rather than being
+    # swallowed, matching what the ordinary (non-motion) transient path does.
+    # A parameter can live in the WEAK FORM (reaches the assembly through `args`) or in a GEOMETRY TERM
+    # (reaches the velocity through its compiled expression's `models`), and the two take different
+    # routes. Both are validated together and split below, once the velocity functions exist; the names
+    # are disjoint sets, so a parameter used in both places is delivered to both.
+    _step_params = set(getattr(block, "runtime_parameter_exprs", None) or {}) - set(_axis_names)
+    _user_args: dict = {}
+    _law_args: dict = {}
+
+    def _coord_args(pts_now):
+        """The moved vertices, in the layout `_apply_coord_params` scatters from (one per axis), plus any
+        weak-form parameter values the caller supplied."""
+        out = {nm: jnp.asarray(pts_now[_coord_ids, ax]) for ax, nm in enumerate(_axis_names)}
+        out.update(_user_args)
+        return out
+
+    def _step_solve(step_op, rhs, u0, diag_fn):
+        """The θ-step solve for this march, GMRES rather than the block's default BiCGStab.
+
+        BiCGStab **breaks down** on the parametric branch's step operator and returns NaN. Measured on a
+        29-dof heat problem whose step matrix has condition number 2.5: a direct solve gives a clean
+        answer, CG with the very same Jacobi preconditioner converges to 2.4e-10, BiCGStab *without* the
+        preconditioner converges to 1.4e-10 -- and BiCGStab *with* it returns NaN. The parametric branch
+        imposes Dirichlet by ROW REPLACEMENT, which leaves the operator non-symmetric, and JAX's BiCGStab
+        carries no breakdown handling. GMRES does not break down there (the same reason the complex
+        real-equivalent block already asks for it).
+
+        This is a **general** defect of that branch, not of mesh motion; it is repaired here rather than in
+        `SemidiscreteTimeBlock.step` because changing the default Krylov method for every parametric
+        transient is a wider blast radius than this change should carry.
+
+        **Tolerance and budget -- this is what the march's wall time was.** Two defects compounded:
+
+        1. ``tol=1e-10`` is below float32 eps (1.2e-7), the default working precision, so the termination
+           test could never fire and every solve ran to its cap.
+        2. ``maxiter=None`` means ``10*n`` OUTER iterations, each of ``restart`` inner ones -- 10140 outer
+           at 1014 dofs. That is a scipy convention for un-restarted GMRES and is wildly wrong here.
+
+        Jacobi-preconditioned GMRES on this row-replaced (non-symmetric) operator stagnates rather than
+        converging quickly, so the cap, not the tolerance, sets the price. Measured at 1014 dofs over 5
+        steps, all giving an IDENTICAL answer (final ymax 1.02525 against the forward-Euler reference
+        1.02525, field finite, max 1.0000):
+
+        ===========================  ==============
+        ``tol=1e-10``, no cap          159 s/step
+        ``tol=1e-6``, no cap          30.8 s/step
+        ``tol``=eps-scaled, cap 20    **0.80 s/step**
+        ===========================  ==============
+
+        i.e. ~200x, for a solve that was already converged after two outer iterations -- the previous
+        state is an excellent initial guess and the step correction is small.
+
+        **Limitation:** the budget is fixed, so a stiffer step (much larger ``dt*kappa``, or a mesh fine
+        enough that Jacobi is too weak) can exhaust it and return an under-solved step *silently* -- a
+        residual check here would be traced away, since this runs inside the jitted step. The march's
+        accuracy is covered instead by the first-order convergence test against the analytic domain.
+        """
+        import jax
+
+        dd = diag_fn()
+        inv = 1.0 / jnp.where(jnp.abs(dd) > 1e-30, dd, 1.0)
+        n = int(jnp.asarray(rhs).shape[0])
+        eps = float(jnp.finfo(jnp.asarray(rhs).dtype).eps)
+        out, _ = jax.scipy.sparse.linalg.gmres(
+            step_op,
+            rhs,
+            x0=u0,
+            tol=max(1e-10, 100.0 * eps),  # a tolerance the working precision can actually reach
+            atol=0.0,
+            restart=min(n, 40),
+            maxiter=20,  # bounded: this operator stagnates, so the cap is the price
+            M=lambda x: inv * x,
+        )
+        return out
+
+    key = _simplex_cell_key(dim)
     ts = np.asarray(_block_time_grid(block))  # fixed t0..t1 grid; moving the mesh never changes the grid
     dt = float(block.dt)
     theta = float(block.metadata.get("theta", 1.0)) if block.metadata else 1.0
     n_steps = len(ts) - 1
-    every = max(1, int(spec.every))
-    vel = spec.velocity
-    vel_is_trace = _is_trace_velocity(vel)
-    wants_state = (not vel_is_trace) and _velocity_wants_state(vel)
-    frozen_nodes = vexpr = None
-    if vel_is_trace:
-        from ...trace import Placeholder, frozen_fields_in
 
-        vexpr = vel if isinstance(vel, Placeholder) else vel.expr  # unwrap a typed view to its Placeholder
-        frozen_nodes = frozen_fields_in(vexpr)
-        if not frozen_nodes:
+    # The step is compiled ONCE and reused, so the march re-traces nothing per step. `dt`, `theta` and the
+    # linear solve are closed over as constants; only the state, the time and the moved vertices are
+    # traced. Worth **2.9x** end-to-end (21.1 s -> 7.3 s, 1014 vertices, 20 steps, identical answer).
+    #
+    # That win is only visible once `_step_solve` has a reachable tolerance and a bounded budget: while
+    # every step was burning its whole GMRES budget, the same jit measured 1.0x and looked worthless. A
+    # microbenchmark here once claimed 574x for it, which was wrong in the other direction -- it timed the
+    # jitted step without `block_until_ready`, measuring how long it took to QUEUE the step, not to run it.
+    _jstep = jax.jit(lambda u_, t_, a_: block.step(u_, t_, dt, args=a_, theta=theta, linear_solve=_step_solve))
+
+    # Connectivity is PRESERVED by construction here (move_mesh never retriangulates), so every frame can
+    # share one cell array instead of copying it. A frame-per-copy costs n_steps x n_cells x (dim+1) x 8 B
+    # of identical data -- ~240 MB for 100k cells over 100 steps, for nothing. Points genuinely differ per
+    # frame and are still copied.
+    shared_cells = np.asarray(d.mesh.cells_dict[key]).astype(np.int64)
+    _pts0 = np.asarray(d.mesh.points)[:, :dim].astype(np.float64)
+
+    # ── everything below here is hoisted: it depends on CONNECTIVITY and tag membership, never on where
+    # the vertices currently are, so it is resolved once and rides the scan as a constant.
+    #
+    # Region membership is FROZEN at t0. That is required for static shapes, and it is also the fix for a
+    # defect the per-step re-resolution carried: a `where=` region re-resolved on the MOVED points leaves
+    # its own predicate as soon as it succeeds in moving, so its vertices silently drop into the harmonic
+    # extension and the harder it is driven the less it moves. The driven set is a MATERIAL set -- the
+    # Lagrangian convention every ALE code uses. Freezing alone used not to be enough (the velocity was
+    # evaluated against the tag's re-sampled points, a different point set from the frozen vertices, so
+    # the alignment then failed); that is resolved because the velocity now reads the positions it is
+    # handed rather than the tag's context. The two had to land together, and do.
+    specs = _geometry_motion_specs(cur, d)
+    vel_fns = [_geometry_velocity_fn(sp, d) for sp in specs]
+
+    _law_params = set().union(*(getattr(vf, "law_params", frozenset()) for vf in vel_fns)) if vel_fns else set()
+    _init_params = {sp["name"] for sp in _init_specs}
+    _accepted = _step_params | _law_params | _init_params
+    _unknown = set(kwargs) - _accepted
+    if _unknown:
+        raise TypeError(
+            f"jno.fem: fem.solve() got unexpected keyword argument(s) {sorted(_unknown)!r} for a moving-mesh "
+            f"problem. Runtime parameters on this problem: {sorted(_accepted)!r}."
+        )
+    _user_args.update({k: jnp.asarray(v) for k, v in kwargs.items() if k in _step_params})
+    _law_args.update({k: jnp.asarray(v) for k, v in kwargs.items() if k in _law_params})
+
+    # The starting geometry. A `.trainable()` coordinate the caller supplied a value for is scattered into
+    # the seed positions, so `d(anything)/d(X0)` flows through the whole march; unsupplied, it is simply
+    # the mesh as meshed. This is the ONLY place a user coordinate tag enters -- deliberately not `args`,
+    # where it would race the driver's per-step axis parameters.
+    X0 = jnp.asarray(_pts0)
+    for sp in _init_specs:
+        if sp["name"] in kwargs:
+            X0 = X0.at[jnp.asarray(sp["ids"]), sp["axis"]].set(jnp.asarray(kwargs[sp["name"]]).reshape(-1))
+
+    disp_rows, disp_cols, named_np = [], [], np.zeros(n_verts, dtype=bool)
+    written = np.zeros((n_verts, dim), dtype=bool)
+    for sp in specs:
+        # Two terms naming the same vertex AND the same axis state two velocities for one degree of
+        # freedom. Regions may overlap (a corner belongs to both edges), so this is easy to write by
+        # accident -- and scattering in list order would just let the last one win. Index-only, so it is
+        # decided here rather than per step.
+        clash = written[sp["ids"], sp["axis"]]
+        if clash.any():
             raise ValueError(
-                "MovingBoundary.velocity given as a trace expression must reference a frozen field — build it "
-                "as `Tf = u.bind(x=xb, y=yb).freeze(state0)` and write the speed in terms of `Tf` (e.g. "
-                "`-(k/L)*(Tf.x*nx + Tf.y*ny)`); the driver swaps the live state into `Tf` each step."
+                f"jno.fem: two geometry terms both prescribe axis {sp['axis']} of "
+                f"{int(clash.sum())} vertex/vertices (region {sp['coord'].tag!r} overlaps an earlier "
+                "term). One coordinate can have only one velocity — narrow the regions so they do not "
+                "overlap on that axis."
             )
+        written[sp["ids"], sp["axis"]] = True
+        disp_rows.append(jnp.asarray(np.asarray(sp["ids"], dtype=np.int64)))
+        disp_cols.append(int(sp["axis"]))
+        # A vertex named on ANY axis is Dirichlet data for the extension, with its untagged columns held
+        # at zero -- per-axis tagging is literal, so an untagged column does not drift.
+        named_np[sp["ids"]] = True
+    named_j = jnp.asarray(named_np)
 
-    def _snapshot():
-        return (np.asarray(d.mesh.points)[:, :dim].astype(np.float64), np.asarray(d.mesh.cells_dict[key]).astype(np.int64))
+    cells_j = jnp.asarray(shared_cells)
+    # Only an INTERIOR cell whose quadrature leaves the old mesh is a fault: a cell touching the boundary
+    # genuinely leaves it when that boundary moves outward, and the transfer clamps those to the nearest
+    # simplex as the pointwise route did. Boundary-ness is connectivity, so it is hoisted.
+    _bfac = _mesh_boundary_facets(d)[1]
+    _on_bnd = np.zeros(n_verts, dtype=bool)
+    _on_bnd[np.unique(np.asarray(_bfac).reshape(-1))] = True
+    interior_cell_j = jnp.asarray(~_on_bnd[shared_cells].any(axis=1))
+    sgn0 = jnp.sign(_signed_simplex_measures_jax(X0, cells_j, dim))  # orientation baseline is the START, not the seed mesh
 
-    cur_mesh = _snapshot()
-    times, states, meshes = [float(ts[0])], [state], [cur_mesh]
-    history: list[dict] = []
-    cur = fem
+    def _march_step(carry, t0c):
+        u_c, X_c, bad = carry
+        # 1) MOVE: each geometry term drives its own vertices along its own axis; everything the terms do
+        #    not name relaxes harmonically around them (so a moving boundary drags the interior smoothly,
+        #    and a moving interior region lets the mesh around it accommodate).
+        disp = jnp.zeros((n_verts, dim), dtype=X_c.dtype)
+        for rows, col, vf in zip(disp_rows, disp_cols, vel_fns):
+            # `t0c`, not `t0c + dt`: the velocity is EXPLICIT, read at the start of the step. That is the
+            # documented scheme and what `test_prescribed_motion_converges_first_order_to_the_analytic_domain`
+            # pins -- it asserts the march reproduces forward Euler exactly.
+            disp = disp.at[rows, col].set(jnp.asarray(vf(X_c, u_c, _law_args, t0c), dtype=X_c.dtype) * dt)
+        X_n = X_c + _harmonic_extension_jax(X_c, shared_cells, dim, disp, named_j)
 
-    i = 0
-    while i < n_steps:
-        chunk = int(min(every, n_steps - i))
-        t0c, t1c = float(ts[i]), float(ts[i + chunk])
-        old_pts, old_cells = cur_mesh
+        # A tangled step cannot `raise` from inside a trace, so it is carried out and raised after the
+        # march -- the failure stays loud, the trace stays valid.
+        tangled = jnp.any(jnp.sign(_signed_simplex_measures_jax(X_n, cells_j, dim)) != sgn0)
 
-        # 1) MOVE the boundary from shape(t0c) toward shape(t1c) by the prescribed velocity, hold the rest.
-        bfacets = _boundary_edges_from_triangles(old_cells) if dim == 2 else _boundary_faces_from_tets(old_cells)
-        bverts = np.unique(bfacets.reshape(-1))
-        # Velocity in one of three forms: a trace expression (a scalar normal speed the driver moves along
-        # the normal), a state-dependent callback velocity(t, x, state, domain), or a prescribed
-        # velocity(t, x). The state-reading forms see the CURRENT field on the CURRENT mesh (before this
-        # move), e.g. a Stefan v_n = -k/L·∇T·n.
-        if vel_is_trace:
-            vb = np.asarray(_trace_velocity_vb(vexpr, frozen_nodes, state, d, bverts, old_pts, dim), dtype=np.float64)
-        elif wants_state:
-            vb = np.asarray(vel(t0c, old_pts[bverts], np.asarray(state), d), dtype=np.float64)
-        else:
-            vb = np.asarray(vel(t0c, old_pts[bverts]), dtype=np.float64)
-        if vb.shape != (bverts.shape[0], dim):
-            raise ValueError(
-                f"MovingBoundary.velocity must return (n_boundary, dim) = ({bverts.shape[0]}, {dim}); got {vb.shape}."
-            )
-        bdisp = np.zeros((old_pts.shape[0], dim), dtype=np.float64)
-        bdisp[bverts] = vb * (t1c - t0c)
-        move_mesh(d, harmonic_extension(d, bdisp), copy=False)  # fail loud on tangle (house rule 1)
+        # 2) carry the state onto the moved mesh -- a CONSERVATIVE L2 projection, which transports the
+        #    field under the motion; this IS the ALE convective term, treated semi-Lagrangian. The
+        #    pointwise re-interpolation this replaces lost 27.6 % of a marginally-resolved peak over 2
+        #    steps and 33.0 % over 16, i.e. it got worse as `dt` shrank. See `_l2_transfer_jax`.
+        u_t, q_esc = _l2_transfer_jax(
+            X_c,
+            X_n,
+            shared_cells,
+            dim,
+            u_c,
+            off,
+            orders=layout["orders"],
+            vecs=layout["vecs"],
+            cells_f=layout["cells_f"],
+        )
+        # An escaping quadrature point of an INTERIOR cell means the projection integrated against a
+        # clamped extension rather than the field: the same fault the vertex route reports, at the same
+        # place. A cell touching the boundary genuinely leaves the old mesh when that boundary moves
+        # outward, so it is not a fault there.
+        esc_cell = jnp.any(q_esc, axis=1) & interior_cell_j
 
-        # 2) re-tag (held boundaries re-derive on the moved facets) + re-assemble on the moved mesh
-        for _name, _pred in list(getattr(d, "_tag_predicates", {}).items()):
+        # 3) step on the moved mesh. The operator and the mass are re-formed from the moved vertices HERE,
+        #    inside the step, through `args` -- `_apply_coord_params` scatters them into the P1 geometry
+        #    before the element Jacobian, so J, detJ, JxW, physical gradients and the facet normals follow.
+        u_n = block.step(u_t, t0c.astype(u_c.dtype), dt, args=_coord_args(X_n), theta=theta, linear_solve=_step_solve)
+        bad = (bad[0] | tangled, bad[1] | jnp.any(esc_cell))
+        return (u_n, X_n, bad), (u_n, X_n)
+
+    (_u_f, _X_f, (tangled_any, escaped_any)), (u_hist, X_hist) = jax.lax.scan(
+        _march_step, (state, X0, (jnp.array(False), jnp.array(False))), jnp.asarray(ts[:-1])
+    )
+
+    if bool(tangled_any):
+        raise ValueError(
+            "jno.fem: the mesh motion inverts or collapses an element (the mesh would tangle). Take a "
+            "smaller time step, or drive the motion through a region whose harmonic extension can "
+            "accommodate it."
+        )
+    if bool(escaped_any):
+        raise ValueError(
+            "jno.fem: a step moved an interior vertex further than its own element, so the state transfer "
+            "could not locate it and would have silently clamped it to the nearest simplex. Take a smaller "
+            "time step, or refine the mesh where the motion is fastest."
+        )
+
+    times = [float(t) for t in ts]
+    states = [state] + [u_hist[i] for i in range(n_steps)]
+    meshes = [(X0, shared_cells)] + [(X_hist[i], shared_cells) for i in range(n_steps)]
+    history = [{"t": float(ts[i + 1]), "n_dofs": int(n_verts)} for i in range(n_steps)]
+
+    # Leave the domain on the final moved mesh, as the eager driver did -- callers inspect `fem.points`
+    # after a solve. Host state, so it can only take a concrete value: inside `jax.grad` the final
+    # positions are a tracer and the domain simply stays where it was, which is right (a differentiated
+    # solve should not mutate the caller's mesh as a side effect).
+    try:
+        _final_pts = np.asarray(_X_f)
+    except Exception:  # noqa: BLE001 -- a tracer: differentiating through the march, nothing to write back
+        _final_pts = None
+    if _final_pts is not None:
+        move_mesh(d, _final_pts - _pts0, copy=False, check=False)
+        # Re-tag and re-sample so the domain is left SELF-CONSISTENT: `move_mesh` moves
+        # `domain.mesh.points` without touching the cached tag pools / contexts, and a second `solve()`
+        # on the same domain resolves its sample<->vertex alignment against both. Stale pools made that
+        # second solve fail the alignment check by exactly the distance the mesh had moved. The eager
+        # driver paid this every step to keep the velocity current; the march no longer needs it (the
+        # velocity reads the positions it is handed), so it is paid ONCE, at the end.
+        _preds = getattr(d, "_tag_predicates", None) or {}
+        for _name, _pred in _preds.items() if hasattr(_preds, "items") else []:
             d.tag(_name, _pred)
-        cur = jno.fem(cons, **kw)
-        block = cur._op
-        new_mesh = _snapshot()
-        new_pts, _new_cells = new_mesh
-
-        # 3) carry the state onto the moved vertices (re-interpolate -> transports the field under the motion)
-        idx, w, _inside = _locate_barycentric(old_pts, old_cells, new_pts, tol=1e-9, k=32)
-        wj, ij = jnp.asarray(w, dtype=state.real.dtype), jnp.asarray(idx)
-        state = jnp.concatenate([jnp.einsum("qk,qk->q", wj, state[off[_f] : off[_f + 1]][ij]) for _f in range(n_fields)])
-
-        # 4) march the chunk on the moved mesh (the ordinary differentiable θ-stepper)
-        blk = block
-
-        def _body(u, t, _blk=blk):
-            un = _blk.step(u, t, dt, theta=theta)
-            return un, un
-
-        state, traj = jax.lax.scan(_body, state, jnp.asarray(ts[i : i + chunk], dtype=state.dtype))
-        cur_mesh = new_mesh
-        for j in range(chunk):
-            i += 1
-            times.append(float(ts[i]))
-            states.append(traj[j])
-            meshes.append(cur_mesh)
-        history.append({"t": float(ts[i]), "n_dofs": int(new_pts.shape[0])})
-
-    fem.__dict__.update(cur.__dict__)  # rebind to the final moved mesh
+        for _tag in {sp["coord"].tag for sp in specs}:
+            try:
+                d.variable(_tag, normals=True, split=True)  # keep the normals a Stefan-type law reads
+            except Exception:  # noqa: BLE001 -- an interior region has no normals; its coordinates suffice
+                d.variable(_tag, split=True)
+    fem.__dict__.update(cur.__dict__)
     fem.adapt_history = history
-    return AdaptiveTrajectory(np.asarray(times), states, meshes)
+    # One layout, repeated: the move preserves topology, so every frame has the same per-field orders,
+    # value shapes and connectivity. Carrying it is what lets `AdaptiveTrajectory.resample` take its
+    # basis-aware branch -- without it a P2 or vector trajectory falls to the legacy scalar-P1 path, which
+    # would mis-slice the state blocks rather than fail.
+    return AdaptiveTrajectory(np.asarray(times), states, meshes, layouts=[layout] * len(times))
 
 
 def run_adaptive_inverse(

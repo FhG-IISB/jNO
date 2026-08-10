@@ -123,3 +123,46 @@ def test_complex_vector_maxwell_via_complex_true():
     )
     rel = np.linalg.norm(np.concatenate([E_re - ex_re, E_im - ex_im])) / np.linalg.norm(np.concatenate([ex_re, ex_im]))
     assert rel < 5e-3, f"Maxwell not recovered: {rel:.2e}"  # coarse 0.1 mesh; the tutorial (0.06) hits 5e-4
+
+
+def test_a_parameter_composes_with_a_complex_pair():
+    """`jno.np.parameter() * pair` used to die with a TypeError INSIDE Placeholder.__mul__
+    (jnp.asarray(ComplexPair)), so Python never consulted the pair's reflected op. It now
+    distributes over (re, im). The parametric complex-pair ASSEMBLY remains its own explicit
+    NotImplementedError one layer down -- this pins the algebra, which every spelling needs first."""
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain()
+    u, _v = d.fem_symbols(complex=True)
+    xi, yi = d.variable("interior", split=True)[:2]
+    ui = u.bind(x=xi, y=yi)
+    k2 = jno.np.parameter((1,), name="k2")
+    from jno.trace.views import ComplexPair
+
+    for expr in (k2 * ui, ui * k2, k2 * ui * ui, (1.0 / (1.0 + 1j * k2)) * ui.x):
+        assert isinstance(expr, ComplexPair), f"expected a ComplexPair, got {type(expr).__name__}"
+
+
+def test_plain_symbol_2d_parametric_complex_solves():
+    """The workhorse spelling for a 2D EM sweep: PLAIN symbols + a 1j coefficient carrying a
+    runtime parameter (the 1D-proven idiom) is parametric in 2D too -- evaluate at a value,
+    solve the fused block, recombine, and the solution is genuinely complex."""
+    import jax.numpy as jnp
+
+    import jno.jnp_ops as J
+    from jno.utils.solver.linear import sparse_lu_solve
+
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain()
+    u, v = d.fem_symbols()
+    xi, yi = d.variable("interior", split=True)[:2]
+    xb, yb = d.variable("boundary", split=True)[:2]
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    sig = jno.np.parameter((1,), name="sig")
+    c = 1.0 / (1.0 + 1j * sig)
+    f = J.exp(-30.0 * ((xi - 0.5) ** 2 + (yi - 0.5) ** 2))
+    fem = jno.fem([c * ui.x * vi.x + c * ui.y * vi.y - f * vi, u(xb, yb) - 0.0])
+
+    A, b = fem.operator.evaluate({"sig": jnp.array([0.5])})
+    x = sparse_lu_solve(A, jnp.asarray(b).reshape(-1))
+    n = fem._complex_n
+    uc = np.asarray(x[:n] + 1j * x[n : 2 * n])
+    assert np.isfinite(np.asarray(x)).all()
+    assert np.abs(uc.imag).max() > 1e-3, "the parametric 2D complex solve lost its imaginary part"

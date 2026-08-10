@@ -259,3 +259,80 @@ def test_coupled_transient_time_varying_dirichlet():
     u_ex, p_ex = cc[:, 0] + fem.t1, cc[:, 1]
     assert np.linalg.norm(w[:n] - u_ex) / np.linalg.norm(u_ex) < 1e-9  # u = x + t
     assert np.linalg.norm(w[n:] - p_ex) / np.linalg.norm(p_ex) < 1e-9  # p = y
+
+
+def test_transient_purely_temporal_dirichlet_solves_without_nan():
+    """A time-varying Dirichlet with NO spatial part (``g = a·sin(ωt)``) and a zero IC made
+    ``fem.solve()`` march an all-NaN trajectory from step 1: jax's BiCGStab hit an unguarded
+    breakdown (exact mid-iteration convergence → ``omega = 0/0``, and NaN passes its ``omega != 0``
+    test) on the perfectly healthy step system (cond ≈ 6.5). The manual march was always fine, so
+    it was silent. The step now verifies its own residual and rescues with GMRES."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.3, time=(0.0, 0.4, 21))
+    u, p = d.fem_symbols(names=("ptv", "ptvp"))
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, tb = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, pi = u.bind(x=xi, y=yi, t=ti), p.bind(x=xi, y=yi, t=ti)
+    g = 0.1 * jno.np.sin(3.0 * tb)
+    fem = jno.fem([ui.t * pi + ui.x * pi.x + ui.y * pi.y, u(xb, yb) - g, u(ci[0], ci[1]) - 0.0])
+    res = fem.solve()
+    traj = np.asarray(res.fn() if hasattr(res, "fn") else res)
+    assert not np.isnan(traj).any(), "the default march must not NaN on a zero-IC driven problem"
+    w_ref = _march(fem)
+    rel = np.linalg.norm(traj[-1] - w_ref) / np.linalg.norm(w_ref)
+    assert rel < 1e-9, f"fem.solve() final state vs the canonical manual march: rel {rel:.2e}"
+
+
+def test_coupled_velocity_identity_driven_matches_manual_march():
+    """The explicit-velocity first-order spelling of a driven coupled wave (``u̇=w``, ``ẇ=−Ku``,
+    boundary ``g(t)``/``ġ(t)``): its step operator is genuinely NON-symmetric, and the default
+    BiCGStab used to EXIT SILENTLY at ~1e-2 relative residual per step — each step slightly wrong,
+    compounding to ~1e62 over 60 steps (once the NaN of the first step was rescued). The per-step
+    residual check now catches the stall and the GMRES rescue reproduces the exact march."""
+    k, amp, om = 20.0, 0.1, 3.0
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.25, time=(0.0, 1.0, 60))
+    u1, p1 = d.fem_symbols(names=("vd1u1", "vd1p1"))
+    u2, p2 = d.fem_symbols(names=("vd1u2", "vd1p2"))
+    w1, q1 = d.fem_symbols(names=("vd1w1", "vd1q1"))
+    w2, q2 = d.fem_symbols(names=("vd1w2", "vd1q2"))
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, tb = d.variable("boundary", split=True)
+    xi0, yi0, _ = d.variable("initial", split=True)
+    A1, B1 = u1.bind(x=xi, y=yi, t=ti), p1.bind(x=xi, y=yi, t=ti)
+    A2, B2 = u2.bind(x=xi, y=yi, t=ti), p2.bind(x=xi, y=yi, t=ti)
+    W1, Q1 = w1.bind(x=xi, y=yi, t=ti), q1.bind(x=xi, y=yi, t=ti)
+    W2, Q2 = w2.bind(x=xi, y=yi, t=ti), q2.bind(x=xi, y=yi, t=ti)
+    weak = (
+        A1.t * Q1
+        - W1 * Q1
+        + A2.t * Q2
+        - W2 * Q2
+        + W1.t * B1
+        + (A1.x * B1.x + A1.y * B1.y)
+        + k * (A1 - A2) * B1
+        + W2.t * B2
+        + (A2.x * B2.x + A2.y * B2.y)
+        + k * (A2 - A1) * B2
+    )
+    g = amp * jno.np.sin(om * tb)
+    gdot = amp * om * jno.np.cos(om * tb)
+    fem = jno.fem(
+        [
+            weak,
+            u1(xb, yb) - g,
+            u2(xb, yb) - 0.0,
+            w1(xb, yb) - gdot,
+            w2(xb, yb) - 0.0,
+            u1(xi0, yi0) - 0.0,
+            u2(xi0, yi0) - 0.0,
+            w1(xi0, yi0) - 0.0,
+            w2(xi0, yi0) - 0.0,
+        ]
+    )
+    res = fem.solve()
+    traj = np.asarray(res.fn() if hasattr(res, "fn") else res)
+    assert not np.isnan(traj).any()
+    assert np.abs(traj).max() < 10.0, f"the march must stay bounded, got max {np.abs(traj).max():.2e}"
+    w_ref = _march(fem)
+    rel = np.linalg.norm(traj[-1] - w_ref) / np.linalg.norm(w_ref)
+    assert rel < 1e-9, f"driven coupled first-order vs the canonical manual march: rel {rel:.2e}"
