@@ -486,38 +486,56 @@ def _pardiso_host_solve(data, indices, rhs, shape, transpose):
     rhs2 = _np.asarray(rhs).reshape(rhs.shape[0], -1)
     rows, cols = idx[:, 0], idx[:, 1]
 
-    order, orderT, pat = _cudss_sym_perms(rows, cols)
-    kind = _cudss_matrix_kind(data, order, orderT, pat)
-    mtype = _PARDISO_MTYPE[(bool(_np.iscomplexobj(data)), kind)]
-
-    # NO transpose in the key: one factorization serves both directions (iparm[12]).
-    skey = (_h(rows, cols), shape, data.dtype.str, mtype)
+    # NO transpose in the key: one factorization serves both directions (iparm[12]). The matrix TYPE
+    # is not in the key either -- it is a property of the values, so it lives in the entry and is
+    # re-checked only when the values change. Detecting it up front would put two lexsorts on EVERY
+    # call, which is ruinous for the workload this backend most wants: ARPACK's shift-invert applies
+    # one factorization ~70 times, and paying a sort per application made it 3x slower than scipy.
+    skey = (_h(rows, cols), shape, data.dtype.str)
     dhash = _h(data)
     entry = _PARDISO_CACHE.get(skey)
 
-    def _build(values):
+    def _build(values, mtype):
         A = _sp.coo_matrix((values, (rows, cols)), shape=shape).tocsr()
         A.sum_duplicates()
         return _pardiso_upper_with_diag(A, _sp, _np) if mtype in (-2, 6, -4, 2, 4) else A
 
     b = _np.asfortranarray(rhs2.astype(data.dtype if _np.iscomplexobj(data) else rhs2.dtype))
 
+    if entry is not None and entry["dhash"] != dhash:
+        # values changed -> they can change the TYPE, which is baked into the analysis
+        if _cudss_matrix_kind(data, entry["order"], entry["orderT"], entry["pat"]) != entry["kind"]:
+            _PARDISO_CACHE.pop(skey)["solver"].free_memory()
+            entry = None
+
     if entry is None:
-        A = _build(data)
+        order, orderT, pat = _cudss_sym_perms(rows, cols)
+        kind = _cudss_matrix_kind(data, order, orderT, pat)
+        mtype = _PARDISO_MTYPE[(bool(_np.iscomplexobj(data)), kind)]
+        A = _build(data, mtype)
         solver = PyPardisoSolver(mtype=mtype)
         solver._check_A(A)
         solver.set_phase(11)  # symbolic analysis: the half that survives a value change
         solver._call_pardiso(A, b)
         solver.set_phase(22)
         solver._call_pardiso(A, b)
-        _PARDISO_CACHE[skey] = entry = {"solver": solver, "A": A, "dhash": dhash}
+        _PARDISO_CACHE[skey] = entry = {
+            "solver": solver,
+            "A": A,
+            "dhash": dhash,
+            "order": order,
+            "orderT": orderT,
+            "pat": pat,
+            "kind": kind,
+            "mtype": mtype,
+        }
         while len(_PARDISO_CACHE) > _PARDISO_CACHE_MAX:
             _, old = _PARDISO_CACHE.popitem(last=False)
             old["solver"].free_memory()  # PARDISO holds its factors in MKL-owned memory
     else:
         _PARDISO_CACHE.move_to_end(skey)
         if entry["dhash"] != dhash:
-            entry["A"] = _build(data)  # same sparsity -> phase 22 only, analysis reused
+            entry["A"] = _build(data, entry["mtype"])  # same sparsity -> phase 22 only
             entry["solver"].set_phase(22)
             entry["solver"]._call_pardiso(entry["A"], b)
             entry["dhash"] = dhash

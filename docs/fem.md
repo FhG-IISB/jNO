@@ -1496,9 +1496,13 @@ unaffected. Full detail is inline in the sections above.
   Limits of the non-symmetric path, which are real: it runs on the host through a `pure_callback`, so
   it is **not differentiable** (`jax.grad` raises rather than returning a wrong number — an adjoint
   there needs left eigenvectors as well as right, i.e. a second Arnoldi run on `Kᴴ`, not built); it
-  does **not** use the `linear=`/`precond=` slots (ARPACK does its own shift-invert factorization) and
-  raises if you pass them rather than ignoring them; and it needs `k < n-1`, smaller pencils taking an
-  exact dense `scipy.linalg.eig`. Order with `which="LR"`/`"SR"` (real part — the growth rate) or
+  accepts `linear=jno.solve.lu(backend="pardiso"/"cudss"/"host")` to drive ARPACK's shift-invert
+  factorization — those kernels are plain numpy functions, so ARPACK can call them from host code —
+  but refuses `backend="device"` (a JAX primitive), the Krylov solvers, and `precond=` rather than
+  ignoring them. **`linear=` is opt-in because it is not always a win:** ARPACK applies the inverse
+  ~50–70 times, so it trades one fast factorization against per-application overhead — measured with
+  PARDISO, **0.72× at n=3,000** (slower) but **10.05× at n=20,000** (21.6 s vs 217 s). Finally it needs
+  `k < n-1`, smaller pencils taking an exact dense `scipy.linalg.eig`. Order with `which="LR"`/`"SR"` (real part — the growth rate) or
   target an interior region with `sigma=`.
 - **Axisymmetric `(r, z)` VECTOR forms are your responsibility, and this one is *not* fail-loud** —
   the `2πr` measure is exact for scalars and wrong for vectors (elasticity hoop strain; and for vector

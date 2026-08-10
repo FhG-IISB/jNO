@@ -337,7 +337,71 @@ def lobpcg_geneigh(
     return lam, X, res
 
 
-def nonsymmetric_geneigh(K, M, k: int, sigma, which: str = "smallest", *, tol: float = 0.0, maxiter=None):
+def _arnoldi_backend(inner_solve, sigma):
+    """Which host kernel ARPACK's ``OPinv`` should use -- or ``None`` for ARPACK's own SuperLU."""
+    if inner_solve is None:
+        return None
+    if sigma is None:
+        raise ValueError(
+            "jno.solve.eigs: linear= only applies to the shift-invert path, and no sigma= was given. "
+            "Without a shift there is no (K - sigma*M) to factor -- Arnoldi runs on plain matvecs. "
+            "Pass sigma= to target a region, or drop linear=."
+        )
+    backend = getattr(inner_solve, "traits", {}).get("host_kernel", "__missing__")
+    name = getattr(inner_solve, "name", type(inner_solve).__name__)
+    if backend == "__missing__" or not getattr(inner_solve, "direct", False):
+        raise ValueError(
+            f"jno.solve.eigs: linear={name} cannot drive the non-symmetric shift-invert. ARPACK asks "
+            "for (K - sigma*M)^-1 as an operator it applies every step, which wants ONE factorization "
+            "reused -- an iterative solver would need a tolerance tight enough to erase the saving. "
+            'Use jno.solve.lu(backend="pardiso") (fastest factorization), "cudss" (fastest repeated '
+            'solve, which is what this loop does) or "host".'
+        )
+    if backend is None:
+        raise ValueError(
+            'jno.solve.eigs: linear=jno.solve.lu(backend="device") cannot drive the non-symmetric '
+            "shift-invert -- it is a JAX primitive and ARPACK calls its operator from host code, "
+            'outside any trace. Use backend="pardiso", "cudss" or "host".'
+        )
+    return backend
+
+
+def _arnoldi_opinv(shifted, backend, np, spla):
+    """``(K - sigma*M)^-1`` as a scipy ``LinearOperator`` backed by a jNO host kernel.
+
+    This is why the kernels were written as plain numpy functions: ARPACK calls back into Python from
+    Fortran, so anything reached from here must work OUTSIDE a JAX trace. The backends' sparsity-keyed
+    caches then do the rest -- the factorization happens on the first application and every subsequent
+    Arnoldi step is a solve against it, which is exactly the workload cuDSS is fastest at.
+    """
+    import scipy.sparse as sp
+
+    if backend == "host":
+        lu = spla.splu(sp.coo_matrix(shifted).tocsc())
+        return spla.LinearOperator(shifted.shape, matvec=lu.solve, dtype=shifted.data.dtype)
+
+    from .linear import _cudss_available, _cudss_host_solve, _pardiso_available, _pardiso_host_solve
+
+    available, kernel = {
+        "cudss": (_cudss_available, _cudss_host_solve),
+        "pardiso": (_pardiso_available, _pardiso_host_solve),
+    }[backend]
+    if not available():
+        raise ImportError(
+            f"jno.solve.eigs: linear=jno.solve.lu(backend={backend!r}) needs that backend installed. "
+            "Install it with `pip install jax-numerical-operators[fem]`, or use backend='host'."
+        )
+    data = np.ascontiguousarray(shifted.data)
+    idx = np.ascontiguousarray(np.stack([shifted.row, shifted.col], axis=1))
+    shape = tuple(int(v) for v in shifted.shape)
+    return spla.LinearOperator(
+        shape,
+        matvec=lambda b: kernel(data, idx, np.asarray(b).reshape(-1), shape, False),
+        dtype=data.dtype,
+    )
+
+
+def nonsymmetric_geneigh(K, M, k: int, sigma, which: str = "smallest", *, inner_solve=None, tol: float = 0.0, maxiter=None):
     """The ``k`` eigenpairs of a **NON-self-adjoint** pencil ``K x = lambda M x`` -- COMPLEX spectrum.
 
     Everything else in this module reduces the *symmetric* pencil, and both of those reductions
@@ -362,8 +426,21 @@ def nonsymmetric_geneigh(K, M, k: int, sigma, which: str = "smallest", *, tol: f
       raises rather than returning a wrong number. The symmetric paths remain differentiable. An
       adjoint here needs LEFT eigenvectors as well as right ones (``dlambda = w^H (dA) v / (w^H v)``
       for a simple eigenvalue), which is a second Arnoldi run on ``K^H``; not done.
-    * **No ``linear=``.** The shift-invert inner solve is ARPACK's own sparse LU, not jNO's solver
-      slot, so passing ``linear=`` with a non-symmetric operator raises instead of being ignored.
+    * **``linear=`` selects the shift-invert factorization.** ARPACK asks for ``(K-sigma*M)^-1`` as an
+      operator and applies it once per Arnoldi step, so this is the "factor once, solve many" shape:
+      the factorization is built on the first application and every later step reuses it through the
+      backend's sparsity-keyed cache. ``jno.solve.lu(backend="cudss"/"pardiso"/"host")`` are accepted,
+      because those kernels are plain numpy-level functions that a host callback can call directly.
+      ``backend="device"`` and the Krylov solvers are not: the first is a JAX primitive with no
+      host-callable form, and an iterative inner solve would need tolerances tight enough to erase
+      the saving. Both raise rather than being quietly ignored.
+
+      **It is opt-in because it is not always a win, measured.** ARPACK applies the inverse ~50-70
+      times per run, so the trade is one fast factorization against a per-application overhead. On a
+      non-symmetric convection-like operator with PARDISO behind it: at n=3,000 **0.72x** (slower --
+      scipy SuperLU factors that quickly enough that the overhead dominates), at n=20,000 **10.05x**
+      (21.6 s against 217 s). Leave ``linear=None`` for small pencils; reach for it when the
+      factorization is what hurts.
     * ARPACK needs ``k < n-1``; smaller pencils take an exact dense ``scipy.linalg.eig``.
 
     Returns ``(lam, V)`` with **complex** dtype always -- a real return would be a lie about what a
@@ -378,6 +455,7 @@ def nonsymmetric_geneigh(K, M, k: int, sigma, which: str = "smallest", *, tol: f
         raise ValueError(f"jno.solve.eigs: k={k} out of range for an operator of size {n}.")
     if sigma is None:
         _which_code(which)  # eagerly: a bad `which` must raise plainly, not wrapped by the callback
+    backend = _arnoldi_backend(inner_solve, sigma)
     Kd = _as_dense_dtype(K)
     cdt = np.complex128 if jnp.finfo(jnp.zeros((), Kd).dtype).bits == 64 else np.complex64
 
@@ -396,6 +474,12 @@ def nonsymmetric_geneigh(K, M, k: int, sigma, which: str = "smallest", *, tol: f
             return lam[idx].astype(cdt), V[:, idx].astype(cdt)
         As = sp.csr_matrix(A)
         Bs = sp.csr_matrix(B) if B is not None else None
+        opinv = None
+        if backend is not None:
+            # ARPACK wants (K - sigma*M)^-1 as something it can APPLY; hand it a jNO backend so the
+            # one factorization it needs is the fast one, and every Arnoldi step reuses it.
+            Ms = Bs if Bs is not None else sp.identity(n, format="csr", dtype=As.dtype)
+            opinv = _arnoldi_opinv((As - sigma * Ms).tocoo(), backend, np, spla)
         lam, V = spla.eigs(
             As,
             k=k,
@@ -404,6 +488,7 @@ def nonsymmetric_geneigh(K, M, k: int, sigma, which: str = "smallest", *, tol: f
             which="LM" if sigma is not None else _which_code(which),
             tol=tol,
             maxiter=maxiter,
+            OPinv=opinv,
         )
         order = np.argsort(np.abs(lam - sigma)) if sigma is not None else _which_order(lam, which)
         return lam[order].astype(cdt), V[:, order].astype(cdt)

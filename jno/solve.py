@@ -157,7 +157,14 @@ def lu(*, backend: str = "device", host: bool | None = None) -> LinearSolver:
     name = {"device": "lu", "host": "lu-host", "cudss": "lu-cudss", "pardiso": "lu-pardiso"}[backend]
     # `multi_rhs` lets a caller holding a BLOCK of right-hand sides (the shift-invert eigensolver's
     # subspace iteration) hand the whole block over in one call instead of looping its columns.
-    traits = {"vmap": "no", "multi_rhs": backend == "cudss"}
+    # `host_kernel` names the numpy-level solve this spec corresponds to, for the callers that run
+    # on the host and cannot go back through JAX -- notably ARPACK's shift-invert OPinv in the
+    # non-symmetric eigensolver. "device" has none: it IS a JAX primitive.
+    traits = {
+        "vmap": "no",
+        "multi_rhs": backend == "cudss",
+        "host_kernel": None if backend == "device" else backend,
+    }
     return LinearSolver(_fn, name=name, direct=True, traits=traits)
 
 
@@ -619,13 +626,16 @@ def eigs(*, k: int = 6, which: str = "smallest", sigma=None, linear=None, precon
                     "shift-invert is ARPACK's own sparse LU. Drop precond=, and pass sigma= to target "
                     "an interior region."
                 )
-            if linear is not None:
-                raise ValueError(
-                    "jno.solve.eigs: linear= is not wired into the non-symmetric (Arnoldi) path -- "
-                    "ARPACK performs its own shift-invert factorization on the host. Drop linear=. "
-                    "(The symmetric sigma= path does use it.)"
-                )
-            return nonsymmetric_geneigh(K, M, k, sigma, which, tol=0.0 if tol is None else float(tol), maxiter=maxiter)
+            return nonsymmetric_geneigh(
+                K,
+                M,
+                k,
+                sigma,
+                which,
+                inner_solve=linear,
+                tol=0.0 if tol is None else float(tol),
+                maxiter=maxiter,
+            )
         _require_symmetric(K, "K")
         _require_symmetric(M, "M")
         if sigma is not None:

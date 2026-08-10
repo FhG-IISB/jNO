@@ -173,3 +173,56 @@ def test_differentiating_raises_rather_than_returning_a_wrong_number():
 
     with pytest.raises(Exception):
         jax.grad(loss)(jnp.asarray(A))
+
+
+# ---------------------------------------------------------------------------------
+# linear= drives ARPACK's shift-invert factorization
+# ---------------------------------------------------------------------------------
+#
+# ARPACK asks for (K - sigma*M)^-1 as an operator and applies it ~50-70 times per run, so this is the
+# "factor once, solve many" shape. It works at all only because the backends' host kernels are plain
+# numpy functions: ARPACK calls back into Python from Fortran, outside any JAX trace.
+
+
+def test_host_backend_gives_the_same_spectrum_as_the_default():
+    n = 300
+    A = _nonsym(n, seed=21)
+    ref = np.sort_complex(np.asarray(jno.solve.eigs(k=4, sigma=10.0)(jnp.asarray(A))[0]))
+    got = np.sort_complex(
+        np.asarray(jno.solve.eigs(k=4, sigma=10.0, linear=jno.solve.lu(backend="host"))(jnp.asarray(A))[0])
+    )
+    np.testing.assert_allclose(got, ref, rtol=1e-9, atol=1e-10)
+
+
+def test_device_backend_is_refused_because_arpack_calls_from_host_code():
+    A = _nonsym(200, seed=23)
+    with pytest.raises(ValueError, match="JAX primitive"):
+        jno.solve.eigs(k=3, sigma=5.0, linear=jno.solve.lu(backend="device"))(jnp.asarray(A))
+
+
+def test_an_iterative_solver_is_refused_with_the_reason():
+    A = _nonsym(200, seed=25)
+    with pytest.raises(ValueError, match="iterative solver"):
+        jno.solve.eigs(k=3, sigma=5.0, linear=jno.solve.bicgstab())(jnp.asarray(A))
+
+
+def test_linear_without_sigma_is_refused():
+    """No shift means no (K - sigma*M) to factor -- Arnoldi runs on plain matvecs."""
+    A = _nonsym(200, seed=27)
+    with pytest.raises(ValueError, match="shift-invert"):
+        jno.solve.eigs(k=3, linear=jno.solve.lu(backend="host"))(jnp.asarray(A))
+
+
+@pytest.mark.parametrize("backend", ["pardiso", "cudss"])
+def test_accelerated_backends_agree_with_the_default_when_installed(backend):
+    from jno.utils.solver.linear import _cudss_available, _pardiso_available
+
+    if not {"pardiso": _pardiso_available, "cudss": _cudss_available}[backend]():
+        pytest.skip(f"optional backend {backend} not installed")
+    n = 400
+    A = _nonsym(n, seed=29)
+    ref = np.sort_complex(np.asarray(jno.solve.eigs(k=4, sigma=10.0)(jnp.asarray(A))[0]))
+    got = np.sort_complex(
+        np.asarray(jno.solve.eigs(k=4, sigma=10.0, linear=jno.solve.lu(backend=backend))(jnp.asarray(A))[0])
+    )
+    np.testing.assert_allclose(got, ref, rtol=1e-8, atol=1e-9)
