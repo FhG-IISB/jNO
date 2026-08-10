@@ -599,11 +599,33 @@ def eigs(*, k: int = 6, which: str = "smallest", sigma=None, linear=None, precon
     _maxiter = 200 if maxiter is None else int(maxiter)
 
     def _fn(K, M=None):
-        from .utils.solver.eigen import _require_symmetric, dense_geneigh, lobpcg_geneigh, shift_invert_geneigh
+        from .utils.solver.eigen import (
+            _require_symmetric,
+            _symmetry_verdict,
+            dense_geneigh,
+            lobpcg_geneigh,
+            nonsymmetric_geneigh,
+            shift_invert_geneigh,
+        )
 
-        # Every path below reduces the SYMMETRIC pencil (both reductions Hermitianize by
-        # construction), so a non-self-adjoint operator would be silently answered with the spectrum
-        # of its symmetric part. Probe the bilinear form and refuse instead.
+        # The symmetric paths below Hermitianize by construction, so a non-self-adjoint operator
+        # would be silently answered with the spectrum of its symmetric part. Probe the bilinear
+        # form and ROUTE on the answer: Arnoldi (complex spectrum) rather than a refusal. A traced
+        # or unsized operator cannot be probed and keeps the historical symmetric assumption.
+        if "nonsymmetric" in (_symmetry_verdict(K), _symmetry_verdict(M)):
+            if precond is not None:
+                raise ValueError(
+                    "jno.solve.eigs: precond= is not used by the non-symmetric (Arnoldi) path -- its "
+                    "shift-invert is ARPACK's own sparse LU. Drop precond=, and pass sigma= to target "
+                    "an interior region."
+                )
+            if linear is not None:
+                raise ValueError(
+                    "jno.solve.eigs: linear= is not wired into the non-symmetric (Arnoldi) path -- "
+                    "ARPACK performs its own shift-invert factorization on the host. Drop linear=. "
+                    "(The symmetric sigma= path does use it.)"
+                )
+            return nonsymmetric_geneigh(K, M, k, sigma, which, tol=0.0 if tol is None else float(tol), maxiter=maxiter)
         _require_symmetric(K, "K")
         _require_symmetric(M, "M")
         if sigma is not None:

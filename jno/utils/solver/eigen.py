@@ -116,12 +116,35 @@ def _require_symmetric(op, name: str, *, probes: int = 2, seed: int = 12345) -> 
     under a trace the probes come back as tracers and the check is skipped, the same contract as
     :func:`jno.utils.solver.solver_api._maybe_residual_check`.
     """
+    if _symmetry_verdict(op, probes=probes, seed=seed) == "nonsymmetric":
+        raise ValueError(
+            f"jno.solve.eigs: {name} is NOT symmetric. This solver reduces the SYMMETRIC pencil, so "
+            f"it would silently return the spectrum of \u00bd({name}+{name}\u1d40) -- a different "
+            "problem: a non-self-adjoint operator generally has COMPLEX eigenvalues, and none of the "
+            f"symmetrized values need be an eigenvalue of {name} at all. Pass sigma= to use the "
+            "non-symmetric shift-invert path (ARPACK), or, if you are certain you want the "
+            f"symmetrized surrogate, pass it explicitly: 0.5*({name} + {name}.T)."
+        )
+
+
+def _symmetry_verdict(op, *, probes: int = 2, seed: int = 12345) -> str:
+    """``"symmetric"`` / ``"nonsymmetric"`` / ``"unknown"`` -- which pencil this operator really is.
+
+    Same bilinear-form probe :func:`_require_symmetric` has always used (``\u27e8w, Kv\u27e9 = \u27e8Kw, v\u27e9``
+    for all ``v, w`` iff ``K = K\u1d40``): two matvecs per probe, no transpose materialized, and it works
+    on a matvec-only operator. Split out so the dispatcher can ROUTE on the answer rather than only
+    refuse -- a non-symmetric operator now has somewhere to go.
+
+    ``"unknown"`` is returned for a traced or unsized operator, exactly where the old code declined to
+    fabricate a verdict. Callers must treat it as "assume symmetric", which preserves the historical
+    behaviour: under ``jit`` the symmetric path is still what runs.
+    """
     if op is None:
-        return
+        return "symmetric"
     o = _as_op(op)
     shape = getattr(o, "shape", None)
     if shape is None:  # an unsized matvec cannot be probed
-        return
+        return "unknown"
     import numpy as np
 
     n = int(shape[0])
@@ -134,20 +157,14 @@ def _require_symmetric(op, name: str, *, probes: int = 2, seed: int = 12345) -> 
         w = jnp.asarray(rng.standard_normal(n), dt)
         Kv, Kw = o.mv(v), o.mv(w)
         if isinstance(Kv, jax.core.Tracer) or isinstance(Kw, jax.core.Tracer):
-            return  # traced operator: cannot concretise, so do not fabricate a verdict
+            return "unknown"  # traced: cannot concretise, so do not fabricate a verdict
         # plain (non-conjugated) products: this tests K = Kᵀ, matching what dense_geneigh imposes
         num = abs(complex(jnp.sum(w * Kv) - jnp.sum(Kw * v)))
         den = float(jnp.linalg.norm(w) * jnp.linalg.norm(Kv)) + 1e-300
         worst = max(worst, num / den)
     if worst > tol:
-        raise ValueError(
-            f"jno.solve.eigs: {name} is NOT symmetric (relative asymmetry {worst:.2e} > {tol:.0e}). "
-            "This solver reduces the SYMMETRIC pencil, so it would silently return the spectrum of "
-            f"½({name}+{name}ᵀ) — a different problem: a non-self-adjoint operator generally has "
-            "COMPLEX eigenvalues, and none of the symmetrized values need be an eigenvalue of "
-            f"{name} at all. A non-symmetric eigensolver is not available yet. If you are certain "
-            f"you want the symmetrized surrogate, pass it explicitly: 0.5*({name} + {name}.T)."
-        )
+        return "nonsymmetric"
+    return "symmetric"
 
 
 def _m_orth_basis(V, MV, rtol):
@@ -318,6 +335,116 @@ def lobpcg_geneigh(
     KX, MX = _blockmv(Kop, X), _blockmv(Mop, X)
     lam = jnp.sum(X.conj() * KX, axis=0).real / jnp.sum(X.conj() * MX, axis=0).real
     return lam, X, res
+
+
+def nonsymmetric_geneigh(K, M, k: int, sigma, which: str = "smallest", *, tol: float = 0.0, maxiter=None):
+    """The ``k`` eigenpairs of a **NON-self-adjoint** pencil ``K x = lambda M x`` -- COMPLEX spectrum.
+
+    Everything else in this module reduces the *symmetric* pencil, and both of those reductions
+    Hermitianize by construction, so on a non-self-adjoint operator they answer a different question:
+    measured on a deliberately non-symmetric ``K``, the values returned were exactly the spectrum of
+    ``1/2(K+K^T)`` and **not one of them was an eigenvalue of** ``K``, whose true spectrum was complex.
+    That is the case this function exists for, and it is the normal case in plasma and flow stability
+    -- resistive tearing, drift waves, anything with a mean flow -- where the answer *is* a complex
+    growth rate and its sign is the physics.
+
+    Implicitly-restarted Arnoldi (Lehoucq & Sorensen, *SIAM J. Matrix Anal. Appl.* 17(4):789, 1996)
+    via ARPACK, reached through ``scipy.sparse.linalg.eigs``. Arnoldi rather than Lanczos precisely
+    because it does not assume self-adjointness: it builds a Hessenberg (not tridiagonal) projection
+    and so admits complex Ritz values. With ``sigma`` it runs the same Ericsson-Ruhe spectral
+    transformation the symmetric path uses, ``theta = 1/(lambda-sigma)``, which is what makes INTERIOR
+    eigenvalues reachable -- and interior is where a stability threshold lives.
+
+    **Runs on the host** through a ``pure_callback``: ARPACK is Fortran, and this is a small dense-ish
+    reduction over a handful of vectors, not a per-iteration inner loop. Consequences, stated plainly:
+
+    * **Not differentiable.** ``pure_callback`` carries no JVP rule, so ``jax.grad`` through this
+      raises rather than returning a wrong number. The symmetric paths remain differentiable. An
+      adjoint here needs LEFT eigenvectors as well as right ones (``dlambda = w^H (dA) v / (w^H v)``
+      for a simple eigenvalue), which is a second Arnoldi run on ``K^H``; not done.
+    * **No ``linear=``.** The shift-invert inner solve is ARPACK's own sparse LU, not jNO's solver
+      slot, so passing ``linear=`` with a non-symmetric operator raises instead of being ignored.
+    * ARPACK needs ``k < n-1``; smaller pencils take an exact dense ``scipy.linalg.eig``.
+
+    Returns ``(lam, V)`` with **complex** dtype always -- a real return would be a lie about what a
+    non-self-adjoint operator can produce, even when a particular spectrum happens to come out real.
+    """
+    import numpy as np
+
+    from .solver_api import LinearOperator
+
+    n = int(K.shape[0])
+    if k < 1 or k > n:
+        raise ValueError(f"jno.solve.eigs: k={k} out of range for an operator of size {n}.")
+    if sigma is None:
+        _which_code(which)  # eagerly: a bad `which` must raise plainly, not wrapped by the callback
+    Kd = _as_dense_dtype(K)
+    cdt = np.complex128 if jnp.finfo(jnp.zeros((), Kd).dtype).bits == 64 else np.complex64
+
+    def _host(Kh, Mh):
+        import scipy.linalg as sla
+        import scipy.sparse as sp
+        import scipy.sparse.linalg as spla
+
+        A = np.asarray(Kh)
+        B = None if Mh is None or np.ndim(Mh) == 0 else np.asarray(Mh)
+        if n <= max(64, 4 * k + 16) or k >= n - 1:
+            # exact, and cheaper than an iteration at this size -- mirrors the symmetric path's cutoff
+            lam, V = sla.eig(A, B)
+            order = np.argsort(np.abs(lam - sigma)) if sigma is not None else _which_order(lam, which)
+            idx = order[:k]
+            return lam[idx].astype(cdt), V[:, idx].astype(cdt)
+        As = sp.csr_matrix(A)
+        Bs = sp.csr_matrix(B) if B is not None else None
+        lam, V = spla.eigs(
+            As,
+            k=k,
+            M=Bs,
+            sigma=sigma,
+            which="LM" if sigma is not None else _which_code(which),
+            tol=tol,
+            maxiter=maxiter,
+        )
+        order = np.argsort(np.abs(lam - sigma)) if sigma is not None else _which_order(lam, which)
+        return lam[order].astype(cdt), V[:, order].astype(cdt)
+
+    Kop = K if isinstance(K, LinearOperator) else LinearOperator(K)
+    Kdense = Kop.dense() if hasattr(Kop, "dense") else jnp.asarray(K)
+    Mdense = None
+    if M is not None:
+        Mop = M if isinstance(M, LinearOperator) else LinearOperator(M)
+        Mdense = Mop.dense() if hasattr(Mop, "dense") else jnp.asarray(M)
+
+    return jax.pure_callback(
+        _host,
+        (jax.ShapeDtypeStruct((k,), cdt), jax.ShapeDtypeStruct((n, k), cdt)),
+        Kdense,
+        jnp.zeros(()) if Mdense is None else Mdense,
+    )
+
+
+def _which_code(which: str) -> str:
+    """jNO's ``which`` -> ARPACK's. Magnitude, not algebraic order: a complex spectrum has no order."""
+    table = {"smallest": "SM", "largest": "LM", "SM": "SM", "LM": "LM", "LR": "LR", "SR": "SR"}
+    if which not in table:
+        raise ValueError(
+            f"jno.solve.eigs: which={which!r} is not available for a NON-symmetric operator. Use "
+            "'smallest'/'largest' (by |lambda|), 'LR'/'SR' (by real part -- the growth rate, which is "
+            "usually what a stability question asks for), or pass sigma= to target an interior region."
+        )
+    return table[which]
+
+
+def _which_order(lam, which: str):
+    import numpy as np
+
+    if which in ("largest", "LM"):
+        return np.argsort(-np.abs(lam))
+    if which == "LR":
+        return np.argsort(-lam.real)
+    if which == "SR":
+        return np.argsort(lam.real)
+    return np.argsort(np.abs(lam))
 
 
 def shift_invert_geneigh(

@@ -1486,12 +1486,20 @@ unaffected. Full detail is inline in the sections above.
   each have one intrinsic order. `space="N1E", order=2` used to return the same lowest-order space
   silently; it now raises. The mesh is the only accuracy knob on an H(curl)/H(div) problem — see
   *Mesh resolution for wave problems* for what a given points-per-wavelength buys, measured.
-- **`jno.solve.eigs` / `FEM.eigs` solve the SYMMETRIC pencil**, and now *refuse* a non-symmetric
-  operator instead of silently returning the spectrum of `½(K+Kᵀ)` — a different problem, since a
-  non-self-adjoint operator generally has complex eigenvalues and none of the symmetrized values need
-  be an eigenvalue of the original at all. Non-self-adjoint stability problems (resistive MHD growth
-  rates, drift waves, anything with a mean flow) need a non-symmetric eigensolver, which is **not
-  built**. The check is a randomized bilinear probe and is concrete-only, so it skips under trace.
+- **`jno.solve.eigs` / `FEM.eigs` route on the operator's actual symmetry.** A symmetric pencil takes
+  the symmetric reductions (real spectrum, differentiable). A genuinely non-self-adjoint operator is
+  routed to **ARPACK/Arnoldi** (Lehoucq & Sorensen 1996) and returns the **complex** spectrum it
+  actually has — the case that matters for stability problems (resistive MHD growth rates, drift
+  waves, anything with a mean flow), where the sign of the growth rate *is* the physics. Neither path
+  ever returns the spectrum of `½(K+Kᵀ)` as though it were the answer. The routing probe is a
+  randomized bilinear test and is concrete-only, so **under `jit` the symmetric path is assumed**.
+  Limits of the non-symmetric path, which are real: it runs on the host through a `pure_callback`, so
+  it is **not differentiable** (`jax.grad` raises rather than returning a wrong number — an adjoint
+  there needs left eigenvectors as well as right, i.e. a second Arnoldi run on `Kᴴ`, not built); it
+  does **not** use the `linear=`/`precond=` slots (ARPACK does its own shift-invert factorization) and
+  raises if you pass them rather than ignoring them; and it needs `k < n-1`, smaller pencils taking an
+  exact dense `scipy.linalg.eig`. Order with `which="LR"`/`"SR"` (real part — the growth rate) or
+  target an interior region with `sigma=`.
 - **Axisymmetric `(r, z)` VECTOR forms are your responsibility, and this one is *not* fail-loud** —
   the `2πr` measure is exact for scalars and wrong for vectors (elasticity hoop strain; and for vector
   Maxwell the cylindrical curl's own `1/r` terms plus the meridional/azimuthal decoupling). jNO ships
