@@ -15,6 +15,9 @@ Oracles:
   buffered — no ``.evolves``) marches a decay-to-source correctly: depth-2 history + the primary path.
 * **fail-loud** — a ``.i(k)`` form on a non-``tau`` domain, and an internal state read at ``.i(-1)`` with
   no ``.evolves``, both error clearly.
+* **multifield** — a coupled march with an *inert* second field reproduces the one-field march in its own
+  block (and the second field's standalone solve in the other), and a genuinely coupled march carries an
+  *irreversible* per-quadrature-point state that both fields see.
 """
 
 import os
@@ -366,6 +369,130 @@ def test_stick_slip_friction_caps_at_the_cone():
 
 
 # --------------------------------------------------------------------------------------------------
+# Oracle 6 — MULTIFIELD: a coupled system marching a load path. The buffers are indexed by cell, never
+# by field, so a second field must change nothing about the state — this pins that. The second field is
+# *inert* (its own decoupled Poisson problem), so each block has an independent, already-trusted oracle:
+# the u block must equal the single-field plastic march, the w block its own standalone steady solve.
+# --------------------------------------------------------------------------------------------------
+def test_multifield_march_leaves_each_block_at_its_own_oracle():
+    sym, grad, trace, inner, sqrt, maximum, identity = _aliases()
+    nstep, peak, size = 6, 5.0, 0.5
+
+    def _mesh(**kw):
+        m = jno.Shape.box(0, 0, 0, 1, 1, 1, size=size).domain(**kw)
+        m.tag("bot", lambda x, y, z: z < 1e-6)
+        return m
+
+    d = _mesh(tau=(0.0, 1.0, nstep))
+    co, cb = d.variable("interior", split=True), d.variable("bot", split=True)
+    X, tau = [co[0], co[1], co[2]], co[-1]
+    u, phi = d.fem_symbols(value_shape=(3,))
+    w, psi = d.fem_symbols()  # the INERT second field — its own Poisson, no coupling to u
+    ep, _ = d.fem_symbols(value_shape=(3, 3))
+    al, _ = d.fem_symbols(value_shape=())
+    eps = lambda v: sym(grad(v, X))
+    sig, dg, n_dir = _j2_stress(u, X, ep.i(-1), al.i(-1))
+    zhat = jno.np.asarray([0.0, 0.0, 1.0])
+    P = peak * (1.0 - jno.np.abs(2 * tau - 1.0))
+    fem = jno.fem(
+        [
+            inner(sig, eps(phi), 2) - P * inner(zhat, phi, 1),
+            inner(grad(w, X), grad(psi, X), 1) - 1.0 * psi,
+            ep.evolves(ep.i(-1) + RT * dg * n_dir),
+            al.evolves(al.i(-1) + dg),
+            *[u(cb[0], cb[1], cb[2])[i] - 0.0 for i in range(3)],
+            w(cb[0], cb[1], cb[2]) - 0.0,
+        ]
+    )
+    assert len(fem.blocks) == 2, "two fem_symbols() unknowns must assemble as two blocks"
+    traj = np.asarray(fem.solve())  # nothing passed
+    assert traj.shape[0] == nstep
+    su, sw = fem.blocks[fem.block_index(u)], fem.blocks[fem.block_index(w)]
+
+    # Block u — the same plastic march, solved alone.
+    ref_u = np.asarray(_plastic_march_fem(nstep, peak=peak, size=size).solve())
+    assert traj[:, su].shape == ref_u.shape
+    assert np.abs(ref_u).max() > 1e-4, "the reference march never deformed — the comparison is vacuous"
+    err_u = np.abs(traj[:, su] - ref_u).max() / np.abs(ref_u).max()
+    assert err_u < 1e-6, f"the coupled u block drifted from the single-field march: rel {err_u:.2e}"
+
+    # Block w — the inert field's own standalone steady solve, identical at every load step.
+    dS = _mesh()
+    co, cb = dS.variable("interior", split=True), dS.variable("bot", split=True)
+    XS = [co[0], co[1], co[2]]
+    w2, psi2 = dS.fem_symbols()
+    ref_w = np.asarray(
+        jno.fem([inner(grad(w2, XS), grad(psi2, XS), 1) - 1.0 * psi2, w2(cb[0], cb[1], cb[2]) - 0.0]).solve()
+    )
+    assert np.abs(ref_w).max() > 1e-4
+    err_w = np.abs(traj[:, sw] - ref_w[None, :]).max() / np.abs(ref_w).max()
+    assert err_w < 1e-6, f"the inert block is not its own standalone solution: rel {err_w:.2e}"
+
+
+# --------------------------------------------------------------------------------------------------
+# Oracle 6b — MULTIFIELD + a genuinely COUPLED, IRREVERSIBLE per-quadrature-point state. This is the
+# phase-field shape: a damage field ``dm`` driven by ``H``, the running maximum of the elastic energy
+# density of ``u``, with ``u``'s stiffness degraded by ``(1-dm)^2`` in return.
+#
+# The oracle is the A/B that isolates irreversibility from everything else: the ONLY difference between
+# the two runs is ``maximum(H.i(-1), psi)`` vs ``psi`` in the update. Load up then back down. With the
+# running max the damage must PERSIST at zero load (a crack does not heal); without it the damage must
+# follow the load back down. Same mesh, same fields, same solver — so a difference can only come from
+# the buffered state surviving the march and being seen by both fields.
+# --------------------------------------------------------------------------------------------------
+def _coupled_damage_march(*, irreversible, nstep=7, load=1.5, ell=0.4, gc=1.0, floor=0.3):
+    """``(fem, damage_trajectory)`` for one leg of the A/B. ``irreversible`` selects the running max."""
+    sym, grad, trace, inner, sqrt, maximum, identity = _aliases()
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34).domain(tau=(0.0, 1.0, nstep))
+    d.tag("left", lambda x, y: x < 1e-9)
+    co, cl = d.variable("interior", split=True), d.variable("left", split=True)
+    X, tau = [co[0], co[1]], co[-1]
+    u, phi = d.fem_symbols()
+    dm, q = d.fem_symbols()
+    Hs, _ = d.fem_symbols(value_shape=())
+    psi_e = 0.5 * inner(grad(u, X), grad(u, X), 1)  # elastic energy density (the crack driving force)
+    deg = (1.0 - dm) ** 2 + floor  # degradation, floored: without `dm.bounds(0, 1)` the feedback runs away
+    ramp = 1.0 - jno.np.abs(2 * tau - 1.0)  # triangular: 0 -> 1 -> 0
+    fem = jno.fem(
+        [
+            deg * inner(grad(u, X), grad(phi, X), 1) - load * ramp * phi,
+            (gc / ell) * dm * q + gc * ell * inner(grad(dm, X), grad(q, X), 1) - 2.0 * (1.0 - dm) * Hs.i(-1) * q,
+            Hs.evolves(maximum(Hs.i(-1), psi_e) if irreversible else psi_e),
+            u(*cl) - 0.0,
+        ]
+    )
+    # Resolve the damage block by SYMBOL — the field order is first appearance in the term walk, and the
+    # degradation puts `dm` ahead of `u`, so a hardcoded index reads the wrong block.
+    return fem, np.asarray(fem.solve())[:, fem.blocks[fem.block_index(dm)]]
+
+
+def test_coupled_damage_state_is_irreversible_only_with_the_running_max():
+    irr, d_irr = _coupled_damage_march(irreversible=True)
+    _rev, d_rev = _coupled_damage_march(irreversible=False)
+
+    peak = np.abs(d_irr).max()
+    assert 1e-2 < peak < 1.0, f"the damage must grow into a physical range to mean anything (got {peak:.3f})"
+    assert d_irr.min() > -1e-12, "damage went negative — the regime is not the one being tested"
+
+    # On the RISING branch the running max IS the current value, so the two legs must coincide exactly:
+    # this pins that the A/B differs in nothing but the `maximum`.
+    mid = d_irr.shape[0] // 2  # τ = 0.5, peak load
+    assert np.abs(d_irr[mid] - d_rev[mid]).max() / peak < 1e-9, "the two updates must coincide on loading"
+
+    # At τ=1 the load is back to zero. Irreversible: the damage is retained. Reversible: it follows the
+    # load back down (not to exactly zero — the update is lagged one step, so it trails by one load level).
+    assert np.abs(d_irr[-1]).max() / peak > 0.999, "the running-max state did not survive unloading"
+    assert np.abs(d_rev[-1]).max() / peak < 0.35, "the control did not heal — the A/B proves nothing"
+
+    # Monotone non-decreasing under the running max — the defining property of the irreversible state.
+    assert np.all(np.diff(np.abs(d_irr).max(axis=1)) > -1e-9)
+
+    # And the state itself is a VOLUME (cell-quadrature) buffer, seen by a form with two solved fields.
+    assert len(irr.blocks) == 2 and len(irr._op.history_specs) == 1
+    assert not irr._op.surface_history_specs
+
+
+# --------------------------------------------------------------------------------------------------
 # Oracle 5 — fail loud.
 # --------------------------------------------------------------------------------------------------
 def test_history_form_on_non_tau_domain_fails_loud():
@@ -393,6 +520,33 @@ def test_history_form_on_non_tau_domain_fails_loud():
     )
     with pytest.raises((ValueError, NotImplementedError), match="pseudo-time|tau"):
         fem2.solve()
+
+
+def test_coupled_transient_with_evolves_fails_loud():
+    # Lifting the single-field restriction exposed a new route: a COUPLED form reaches the multifield
+    # assembler before the single-field transient check, so the `u.t` rejection has to exist there too.
+    # Without it the evolution terms would be silently dropped on a coupled transient.
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain(time=(0.0, 0.1, 4))
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _tb = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    u, phi = d.fem_symbols(names=("u", "phi"))
+    w, chi = d.fem_symbols(names=("w", "chi"))
+    s, _ = d.fem_symbols(value_shape=())
+    ui, pi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    wi, qi = w.bind(x=xi, y=yi, t=ti), chi.bind(x=xi, y=yi, t=ti)
+    with pytest.raises(NotImplementedError, match="tau"):
+        jno.fem(
+            [
+                ui.t * pi + (ui.x * pi.x + ui.y * pi.y) - (1.0 + s.i(-1)) * pi,
+                wi.t * qi + (wi.x * qi.x + wi.y * qi.y) - ui * qi,
+                s.evolves(s.i(-1) + 1.0),
+                u(xb, yb) - 0.0,
+                w(xb, yb) - 0.0,
+                u(ci[0], ci[1]) - 0.0,
+                w(ci[0], ci[1]) - 0.0,
+            ]
+        )
 
 
 def test_internal_state_without_evolves_fails_loud():

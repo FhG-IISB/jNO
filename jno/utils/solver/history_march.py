@@ -12,10 +12,12 @@ single ``lax.scan`` whose carry is ``(u, buffers)``, so it is reverse-mode diffe
 per-step ``newton_krylov`` root-find is implicit-diff (``custom_root``), and the state readout + buffer
 roll are pure JAX. See the FEM contract in the jNO skill.
 
-Scope (stated up front): real, steady, single-field native-Lagrange forms — the equilibrium residual is
+Scope (stated up front): real, steady native-Lagrange forms, **single-field or coupled** — the residual is
 solved to equilibrium at each τ with the previous state frozen (a fully implicit return map when the
-constitutive stress embeds it), then the state advances. Whole-domain state only (the readout runs on
-every cell; sub-region-restricted plasticity is not wired yet).
+constitutive stress embeds it), then the state advances. Nothing here is per-field: ``n_dofs`` is the whole
+block vector and the buffers are indexed by cell, so a state written by one field and read by another (a
+phase-field history coupling damage to displacement) marches identically. Whole-domain state only (the
+readout runs on every cell; sub-region-restricted plasticity is not wired yet).
 """
 
 from typing import Any, Dict

@@ -1641,6 +1641,35 @@ auto-buffered from the solved `u` — no `.evolves`; an **internal** state read 
 **Scope:** small-strain, isotropic, linear-hardening; 3-D (2-D is plane strain). Kinematic / nonlinear
 hardening and contact are separate (not built).
 
+**A state can be shared by a coupled system.** The march is not single-field: history buffers are indexed
+by *cell*, never by field, and the readout gathers every field's cell DOFs at once — so a state written
+by one field and read by another is the same march. That is the phase-field / gradient-damage shape,
+where an irreversible history `H = max_τ ψ⁺(u)` couples a displacement field to a damage field:
+
+```python
+psi = 0.5 * inner(grad(u, X), grad(u, X), 1)                 # driving force, from the u field
+deg = (1 - dm)**2 + eta                                      # degradation, from the dm field
+jno.fem([
+    deg * inner(grad(u, X), grad(phi, X), 1) - load(tau)*phi,        # equilibrium      (test phi)
+    (gc/l)*dm*q + gc*l*inner(grad(dm, X), grad(q, X), 1)
+        - 2*(1 - dm)*Hs.i(-1)*q,                                     # damage evolution (test q)
+    Hs.evolves(maximum(Hs.i(-1), psi)),                              # irreversibility  (a named update)
+    u(*bc) - 0.0,
+]).solve()                                                           # nothing passed
+```
+
+The running `maximum` is what makes it irreversible: at zero load the damage is retained rather than
+healing. Note the block order is *first appearance in the term walk* — here `dm` precedes `u`, because the
+degradation factor is written first — so resolve a block with `fem.block_index(dm)`, never a hardcoded
+index. A form that is **linear in every unknown** but reads `.i(k)` marches too (the AT1 damage equation
+with a lagged driving force is exactly that): each step is a different linear system, and it routes
+through the same residual operator, where Newton converges in one step.
+
+Not carried, each rejected with a clear error: a real `u.t` transient (drive time through `tau` instead),
+a complex form, 1D, non-nodal (Argyris/Morley/edge) elements, VPINN, and periodic ties. There is also no
+bound constraint yet — `dm ∈ [0, 1]` is not enforced, so a strongly-degrading form needs a floor `eta` on
+the degradation to stay well-posed.
+
 **Finite strain is also just a formula.** Tensor constants broadcast correctly (`jno.np.identity(n)` carries
 a leading batch axis), so `F = I + ∇u`, `E = ½(FᵀF − I)`, `S = λ tr(E) I + 2μ E` and the internal virtual
 work `∫ (F S):∇δu` are written directly — St. Venant-Kirchhoff in five lines, no module:
@@ -1763,8 +1792,8 @@ unaffected. Full detail is inline in the sections above.
   needs a direct linear solve; you write the radiosity and couple it yourself.
 - **Plasticity is small-strain, isotropic, linear-hardening, whole-domain.** Deformation theory
   (monotonic / proportional) and the path-dependent flow-theory **`tau=` load-path march** both run
-  today; the march assembles on the real, steady, single-field native-Lagrange path only (not
-  transient / complex / multifield / non-nodal / periodic — each rejected with a clear error). The
+  today; the march assembles on the real, steady native-Lagrange path — **single-field or coupled**
+  (not transient / complex / 1D / non-nodal / periodic — each rejected with a clear error). The
   internal-state readout runs on every cell (sub-region-restricted plasticity is not wired). Kinematic /
   nonlinear (Voce) hardening and contact are separate formulas / machinery, not built.
 

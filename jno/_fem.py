@@ -1654,8 +1654,8 @@ class FEM:
                 )
             if getattr(self._op, "state_readout", None) is None:
                 raise NotImplementedError(
-                    "jno.fem: the history march is only wired on the real, steady, single-field native "
-                    "Lagrange path; this form assembled through another route."
+                    "jno.fem: the history march is only wired on the real, steady native-Lagrange path "
+                    "(single-field or coupled); this form assembled through another route."
                 )
             from .utils.solver.history_march import run_history_march
 
@@ -3564,20 +3564,19 @@ def _fem_impl(
     if vec is None and not multifield:
         vec = _infer_vec(constraints)  # single-field only (coupled fields carry per-field vec)
 
-    # Evolution terms ride the real, steady, single-field native-Lagrange path only (the plasticity
-    # load-path march). Reject the structurally-incompatible routes up front — fail loud, never a
-    # silently dropped update. (transient / complex are rejected below, once the IR reveals them.)
+    # Evolution terms ride the real, steady, native-Lagrange path — single field or coupled. The history
+    # buffers are indexed by CELL, never by field, and the state readout gathers the concatenation of every
+    # field's cell DOFs, so a coupled form needs no per-field state machinery: a damage field reading the
+    # displacement field's energy history is the same march as one-field plasticity. Reject the
+    # structurally-incompatible routes up front — fail loud, never a silently dropped update.
+    # (transient / complex are rejected below, once the IR reveals them.)
     if _evolution and (
-        multifield
-        or is_vpinn
-        or getattr(domain, "dimension", None) == 1
-        or (_trial_spaces(constraints) - {"Lagrange"})
-        or periodic_ties
+        is_vpinn or getattr(domain, "dimension", None) == 1 or (_trial_spaces(constraints) - {"Lagrange"}) or periodic_ties
     ):
         raise NotImplementedError(
-            "jno.fem: `state.evolves(...)` evolution terms are supported on the real, steady, single-field "
-            "native-Lagrange path only (the plasticity load-path march over `domain(tau=...)`). Not yet: "
-            "multifield, VPINN, 1D, non-nodal (Argyris/Morley/edge) elements, or periodic ties."
+            "jno.fem: `state.evolves(...)` evolution terms are supported on the real, steady, "
+            "native-Lagrange path only (the load-path march over `domain(tau=...)`), single-field or "
+            "coupled. Not yet: VPINN, 1D, non-nodal (Argyris/Morley/edge) elements, or periodic ties."
         )
 
     # The transient route reduces M/A from the assembly context at *assembly* time, so its P must be
@@ -4049,7 +4048,14 @@ def _fem_impl(
     if multifield:
         return _finalize(
             _assemble_multifield(
-                domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, classification, quad_degree=quad_degree
+                domain,
+                volume_terms,
+                boundary_terms,
+                dirichlet_raw,
+                ic_residuals,
+                classification,
+                quad_degree=quad_degree,
+                evolution=_evolution,
             )
         )
 
@@ -4442,13 +4448,20 @@ def _fem_impl(
     )
 
 
-def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, classification, *, quad_degree):
+def _assemble_multifield(
+    domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, classification, *, quad_degree, evolution=None
+):
     """Assemble a coupled (multi-field) steady weak form into a block ``FEM``.
 
     Builds the same IR as the single-field path, buckets Dirichlet per field
     (field ordering taken from ``ir.volume_expr``), and hands off to the native
     assembler, which groups the per-tag surface terms into per-field surface
-    kernels and differentiates the coupled block matrix."""
+    kernels and differentiates the coupled block matrix.
+
+    ``evolution`` carries the ``state.evolves(...)`` updates for a load-path march. It is forwarded to
+    the native assembler, which allocates each state's per-quadrature-point buffer and builds the
+    readout — both indexed by cell, so the coupled case needs nothing extra here. The march is the
+    *pseudo-time* path, so it is rejected below for a real (``u.t``) transient and for a complex form."""
     from .utils.solver.fem_utils import _infer_fields
     from .utils.solver.parametric_helpers import _contains_runtime_parameter
     from .utils.solver.weak_form import (
@@ -4462,6 +4475,7 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
 
     weak_bares = volume_terms + [e for exprs in boundary_terms.values() for e in exprs]
     is_transient = bool(ic_residuals) or any(_contains_temporal_derivative(b) for b in weak_bares)
+    evolution = dict(evolution or {})
 
     domain._fem_quad_degree = quad_degree
     domain._variational_initialized = True
@@ -4535,6 +4549,15 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
     # g(x,t) for the LINEAR block (row-replacement + per-step Dirichlet-lift forcing); a nonlinear block
     # with a time-varying Dirichlet is rejected below (the native branch carries only constant Dirichlet).
     if is_transient:
+        if evolution:
+            # Same rejection the single-field path makes once its IR reveals the transient — restated here
+            # because a coupled form reaches this assembler FIRST, so it never gets there. The load path is
+            # the *pseudo-time* march over `domain(tau=...)`, not a `u.t` transient.
+            raise NotImplementedError(
+                "jno.fem: `state.evolves(...)` cannot combine with a real time derivative (`u.t`) on a "
+                "coupled (multi-field) form — the load path is the *pseudo-time* march over "
+                "`domain(tau=...)`, not a `u.t` transient. Drop `u.t`, or drive time through the `tau` grid."
+            )
         _tv_native = not dirichlet_tv or not any(_is_obviously_nonlinear_in_unknown(domain, b) for b in weak_bares)
         # The native coupled-transient assembler threads runtime SCALAR parameters through ``args``
         # (``fem_native._runtime_vals`` packs each parameter per cell, re-evaluated every step), so a
@@ -4572,7 +4595,14 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
 
         domain._fem_problem = None  # the native assembler owns this domain's FE state
         op, mode, offs = assemble_fem_native(
-            domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, vec=1, quad_degree=quad_degree
+            domain,
+            volume_terms,
+            boundary_terms,
+            dirichlet_raw,
+            ic_residuals,
+            vec=1,
+            quad_degree=quad_degree,
+            evolution=evolution,
         )
         return FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs)
 
@@ -4583,6 +4613,11 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
     # through the ± block structure — coupled Helmholtz systems in their natural spelling. ----
     _cx_coupled = _is_complex_form(domain, ir)
     _par_coupled = any(_contains_runtime_parameter(b) for b in weak_bares)
+    if evolution and _cx_coupled:
+        raise NotImplementedError(
+            "jno.fem: `state.evolves(...)` cannot combine with a complex coupled form — complex forms "
+            "assemble as two linear real-equivalent blocks, and the constitutive update is real."
+        )
     if _cx_coupled and not _par_coupled:
         if any(_is_obviously_nonlinear_in_unknown(domain, b) for b in weak_bares):
             raise NotImplementedError(

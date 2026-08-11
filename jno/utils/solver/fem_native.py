@@ -1415,8 +1415,16 @@ def assemble_fem_native(
         for key, formula in readout_formulas.items():
             if key not in history_specs:  # VOLUME states only; surface states advance in surface_state_readout
                 continue
-            out[key] = jax.vmap(lambda c, la, _f=formula: _vol_elem_readout(c, la, _f, t, args))(
-                jnp.arange(n_cells), local_all
+            # Chunked exactly like the residual/jacobian element maps -- a plain ``jax.vmap`` leaves the
+            # batched intermediate uncapped, and a coupled form gathers every field's DOFs into one
+            # ``local_all`` row, so the readout's per-cell working set grows with the field count. It also
+            # runs inside the march's differentiated scan, so those intermediates are retained for the
+            # backward pass. One test-DOF's worth of cost per cell is the honest proxy: the readout carries
+            # no test function, so there is no element block -- only the per-quadrature-point value.
+            out[key] = _elem_map(
+                lambda c, la, _f=formula: _vol_elem_readout(c, la, _f, t, args),
+                (jnp.arange(n_cells), local_all),
+                _cell_chunk(n_cells, 1, cell_all_dofs.shape[1]),
             )
         return out
 
