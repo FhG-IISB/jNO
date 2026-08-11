@@ -493,6 +493,62 @@ def test_coupled_damage_state_is_irreversible_only_with_the_running_max():
 
 
 # --------------------------------------------------------------------------------------------------
+# Oracle 6d — differentiability of the COUPLED march. A parametric coupled steady form is otherwise
+# refused (the coupled *linear* assembly has no parametric route), but a history-carrying form never
+# takes that route — it assembles as a residual operator that re-evaluates at the runtime args, which is
+# field-agnostic. Without this the coupled march could not do the material-identification inverse the
+# single-field march already does. FD-checked through the whole scan, both blocks in the objective.
+# --------------------------------------------------------------------------------------------------
+def test_gradient_flows_through_a_coupled_march_to_a_material_parameter():
+    from jno.utils.solver.newton_krylov import newton_krylov
+
+    sym, grad, trace, inner, sqrt, maximum, identity = _aliases()
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain(tau=(0.0, 1.0, 4))
+    d.tag("bdry", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
+    co, cb = d.variable("interior", split=True), d.variable("bdry", split=True)
+    X, tau = [co[0], co[1]], co[-1]
+    kP = jno.np.reshape(jno.np.parameter((1,), name="k"), ())  # the material parameter to recover
+    u, phi = d.fem_symbols()
+    dm, q = d.fem_symbols()
+    Hs, _ = d.fem_symbols(value_shape=())
+    fem = jno.fem(
+        [
+            inner(grad(u, X), grad(phi, X), 1) + 0.1 * u * u * phi - (1.0 + tau) * phi - kP * Hs.i(-1) * phi,
+            2.5 * dm * q + 0.4 * inner(grad(dm, X), grad(q, X), 1) - Hs.i(-1) * q,
+            Hs.evolves(maximum(Hs.i(-1), u)),
+            u(*cb) - 0.0,
+        ]
+    )
+    op = fem._op
+    assert len(fem.blocks) == 2 and op.is_parametric, "a coupled parametric march must build as parametric"
+    # The parametric march returns a differentiable trace node (composes with crux), not an array.
+    assert type(fem.solve()).__name__ == "FunctionCall"
+
+    tau_grid = jnp.asarray(np.asarray(d._time_points))
+    buffers0 = {k: jnp.zeros(v["shape"]) for k, v in op.history_specs.items()}
+    u0 = jnp.zeros(int(op.size))
+
+    def final_norm(kv):
+        args_p = {"k": jnp.reshape(kv, (1,))}
+
+        def step(carry, tau_k):
+            u_prev, bufs = carry
+            args = {"__history__": bufs, **args_p}
+            uu = newton_krylov(lambda z: op.residual(z, args, tau_k), u_prev)
+            ns = op.state_readout(uu, tau_k, args)
+            nb = {k: jnp.concatenate([ns[k][:, :, None, ...], bufs[k][:, :, :-1, ...]], axis=2) for k in bufs}
+            return (uu, nb), uu
+
+        _f, traj = jax.lax.scan(step, (u0, buffers0), tau_grid)
+        return jnp.sum(traj[-1] ** 2)  # both blocks — the gradient must reach the coupled field too
+
+    g = jax.grad(final_norm)(0.3)
+    assert np.isfinite(g) and abs(g) > 0, "gradient w.r.t. the coupled march's parameter vanished"
+    fd = (final_norm(0.3 + 1e-5) - final_norm(0.3 - 1e-5)) / 2e-5
+    assert np.allclose(g, fd, rtol=1e-6), f"AD grad {g:.8e} vs FD {fd:.8e}"
+
+
+# --------------------------------------------------------------------------------------------------
 # Oracle 6c — a form LINEAR in every unknown but carrying step history. Every load step is a different
 # linear system whose source the buffer sets, so it is still a march — but the linear assembly route
 # builds a matrix/rhs pair with no history to thread, and this used to raise at BUILD time. It is on the

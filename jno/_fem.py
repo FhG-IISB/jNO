@@ -4462,6 +4462,7 @@ def _assemble_multifield(
     the native assembler, which allocates each state's per-quadrature-point buffer and builds the
     readout — both indexed by cell, so the coupled case needs nothing extra here. The march is the
     *pseudo-time* path, so it is rejected below for a real (``u.t``) transient and for a complex form."""
+    from .trace import history_variables as _history_variables
     from .utils.solver.fem_utils import _infer_fields
     from .utils.solver.parametric_helpers import _contains_runtime_parameter
     from .utils.solver.weak_form import (
@@ -4476,6 +4477,9 @@ def _assemble_multifield(
     weak_bares = volume_terms + [e for exprs in boundary_terms.values() for e in exprs]
     is_transient = bool(ic_residuals) or any(_contains_temporal_derivative(b) for b in weak_bares)
     evolution = dict(evolution or {})
+    # Does this form carry step history? Scanned exactly as the assembler scans it — the weak terms plus
+    # every evolution formula, since a state can be read only inside its own update.
+    _carries_history = bool(_history_variables(weak_bares + [su.formula for su in evolution.values()]))
 
     domain._fem_quad_degree = quad_degree
     domain._variational_initialized = True
@@ -4541,7 +4545,14 @@ def _assemble_multifield(
         getattr(domain, "dimension", None) in (2, 3)
         and all(str(f.get("space", "Lagrange")) == "Lagrange" for f in fields)
         and not _is_complex_form(domain, ir)
-        and not any(_contains_runtime_parameter(b) for b in weak_bares)
+        # A runtime parameter is excluded because the coupled *linear* assembly has no parametric route --
+        # not because the parameter itself is a problem. A form carrying step history never takes that
+        # route: it assembles as a ``FemResidualOperator`` that re-evaluates at the runtime ``args`` each
+        # call, which is entirely field-agnostic (the coupled *transient* branch below already allows a
+        # parameter for exactly this reason). So gate on WHICH BRANCH the form will take. This is what
+        # makes a coupled load-path march differentiable in a material parameter, as the single-field
+        # march already is.
+        and (not any(_contains_runtime_parameter(b) for b in weak_bares) or bool(_carries_history))
     )
 
     # Coupled transient (multi-field + time): block M + block spatial operator A. Native handles
@@ -4637,15 +4648,17 @@ def _assemble_multifield(
         )
         return FEM(domain=domain, op=(op_r, op_i), classification=classification, mode="complex", offsets=offs)
 
-    # A coupled steady form `_native_ok` excluded -- a runtime parameter (the parametric coupled
-    # steady assembly is not wired). The native coupled assembler covers linear and nonlinear real
-    # forms (incl. complex=True) and, above, the linear complex split; reject the rest explicitly
+    # A coupled steady form `_native_ok` excluded -- a runtime parameter on the coupled LINEAR assembly,
+    # which has no parametric route. The native coupled assembler covers linear and nonlinear real forms
+    # (incl. complex=True), the linear complex split above, and a parametric form that carries step
+    # history (which assembles as a residual operator, not a matrix pair); reject the rest explicitly
     # rather than mis-assemble.
     raise NotImplementedError(
         "jno.fem: this coupled (multi-field) steady form is not supported natively -- it has a runtime "
-        f"parameter ({_par_coupled}); the parametric coupled steady assembly is not wired. Recover the "
-        "parameter on a single-field reduced form, or through a coupled first-order transient (which "
-        "does thread runtime parameters)."
+        f"parameter ({_par_coupled}) and carries no step history ({_carries_history}), so it would take "
+        "the coupled linear assembly, which has no parametric route. Recover the parameter on a "
+        "single-field reduced form, on a coupled load-path march (`domain(tau=...)` + `.i(k)`), or "
+        "through a coupled first-order transient -- all three thread runtime parameters."
     )
 
 

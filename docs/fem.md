@@ -1669,6 +1669,11 @@ coefficients the buffers set, so it routes through the same residual operator as
 (Newton converges in one step on a linear residual). You pay roughly one extra linear solve per step
 versus a pure linear assembly, in exchange for one march path rather than two.
 
+The coupled march is differentiable in a material parameter, exactly as the single-field one is: thread a
+`jno.np.parameter` into the form and `∂trajectory/∂θ` flows through the whole scan. (A coupled *steady*
+form still refuses a runtime parameter — the coupled linear assembly has no parametric route — but a
+history-carrying form never takes that route, so the march is unaffected.)
+
 Not carried, each rejected with a clear error: a real `u.t` transient (drive time through `tau` instead),
 a complex form, 1D, non-nodal (Argyris/Morley/edge) elements, VPINN, and periodic ties. There is also no
 bound constraint yet — `dm ∈ [0, 1]` is not enforced, so a strongly-degrading form needs a floor `eta` on
