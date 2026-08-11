@@ -387,6 +387,24 @@ def _reshape_components_last(arr, value_shape):
     return jnp.reshape(arr, arr.shape[:-1] + tuple(value_shape))
 
 
+def _drop_scalar_component_axis(grad_list):
+    """Per-direction gradients of a ``value_shape == ()`` field, without a component axis.
+
+    Each entry of ``grad_list`` is ``(n_quad, vec)`` and ``vec == 1`` for a scalar field, so the naive
+    stack carries a phantom component axis: ``(n_quad, 1)`` for one direction, ``(n_quad, 1, n_dims)``
+    for several. ``value_shape == ()`` says there is no component axis, so drop it — the value branch
+    makes exactly the same promise for the field itself, and the TEST-function branch already uses this
+    convention (``grads[..., d]``, stacked last), so trial and test now agree.
+
+    In a weak term the phantom axis was harmless (``_prefix_align`` inserts singletons after the quad
+    axis, absorbing it), which is why it survived. It is *not* harmless in a readout: an evolution
+    formula like ``maximum(H.i(-1), 0.5*inner(grad(u,X), grad(u,X), 1))`` compares a genuinely scalar
+    ``(n_quad,)`` buffer slice against a ``(n_quad, 1)`` energy and rank-broadcasts to
+    ``(n_quad, n_quad)`` — the phase-field driving force, silently the wrong shape."""
+    comps = [g[..., 0] for g in grad_list]
+    return comps[0] if len(comps) == 1 else jnp.stack(comps, axis=-1)
+
+
 def _expand_test_shape_vals(shape_vals, n_comp):
     if n_comp == 1:
         return shape_vals
@@ -1199,10 +1217,10 @@ def _eval_integrand(domain, node, local):
             _, grads, _ = _field_data(local, node.target)
             fz = _frozen_cell_values(local, node.target)  # (n_local, vec)
             grad_list = [jnp.sum(grads[:, :, dim0 : dim0 + 1] * fz[None, :, :], axis=1) for dim0 in dims]
-            flat = grad_list[0] if len(dims) == 1 else jnp.stack(grad_list, axis=-1)
             value_shape = getattr(node.target, "value_shape", ())
             if len(value_shape) == 0:
-                return flat
+                return _drop_scalar_component_axis(grad_list)
+            flat = grad_list[0] if len(dims) == 1 else jnp.stack(grad_list, axis=-1)
             if len(dims) == 1:
                 return _reshape_components_last(flat, value_shape)
             return jnp.reshape(flat, flat.shape[:1] + tuple(value_shape) + (len(dims),))
@@ -1215,10 +1233,10 @@ def _eval_integrand(domain, node, local):
                 contracted = jnp.einsum("qn...,n->q...", g, cell_sol)
                 return contracted[..., 0] if len(dims) == 1 else contracted
             grad_list = [jnp.sum(grads[:, :, dim0 : dim0 + 1] * cell_sol[None, :, :], axis=1) for dim0 in dims]
-            flat = grad_list[0] if len(dims) == 1 else jnp.stack(grad_list, axis=-1)
             value_shape = getattr(node.target, "value_shape", ())
             if len(value_shape) == 0:
-                return flat
+                return _drop_scalar_component_axis(grad_list)
+            flat = grad_list[0] if len(dims) == 1 else jnp.stack(grad_list, axis=-1)
             if len(dims) == 1:
                 return _reshape_components_last(flat, value_shape)
             return jnp.reshape(flat, flat.shape[:1] + tuple(value_shape) + (len(dims),))

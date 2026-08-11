@@ -460,3 +460,51 @@ def test_scalar_state_reading_the_bare_trial_keeps_its_rank():
     u_last = np.asarray(traj[-1])
     assert u_last.max() > 0.0
     assert np.all(np.diff(np.abs(traj).max(axis=1)) > -1e-12)  # monotone, so max_t u == u(t_end)
+
+
+# --------------------------------------------------------------------------------------------------
+# Oracle 5b — the same relationship for a scalar field's GRADIENT. ``value_shape == ()`` promises no
+# component axis in the value (above) and equally in the gradient, but the Lagrange interpolation built
+# ``(n_quad, 1, n_dims)``, so ``inner(grad(u,X), grad(u,X), 1)`` came out ``(n_quad, 1)`` — and
+# ``maximum(H.i(-1), psi)`` against a ``(n_quad,)`` buffer slice rank-broadcast to ``(n_quad, n_quad)``.
+# That expression IS the phase-field driving force. Checked here against an EXTERNAL oracle as well as
+# the rank: on affine P1 triangles ∇u is constant per cell and follows in closed form from the vertex
+# values, so the readout's energy density has an exact hand-computed reference.
+# --------------------------------------------------------------------------------------------------
+def test_scalar_gradient_energy_readout_matches_the_closed_form_p1_gradient():
+    sym, grad, trace, inner, sqrt, maximum, identity = _aliases()
+    N = 3
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain(tau=(0.0, 1.0, N))
+    d.tag("bdry", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
+    co, cb = d.variable("interior", split=True), d.variable("bdry", split=True)
+    X, tau = [co[0], co[1]], co[-1]
+    u, phi = d.fem_symbols()
+    Hs, _ = d.fem_symbols(value_shape=())
+    psi_e = 0.5 * inner(grad(u, X), grad(u, X), 1)  # the phase-field driving force
+    weak = inner(grad(u, X), grad(phi, X), 1) + 0.1 * u * u * phi - (1.0 + tau) * phi
+    fem = jno.fem([weak, Hs.evolves(maximum(Hs.i(-1), psi_e)), u(*cb) - 0.0])
+
+    spec = fem._op.history_specs[next(iter(fem._op.history_specs))]
+    n_cells, n_quad = int(spec["shape"][0]), int(spec["shape"][1])
+    assert spec["value_shape"] == ()
+
+    traj = np.asarray(fem.solve())
+    out = fem._op.state_readout(
+        jnp.asarray(traj[-1]), 1.0, {"__history__": {k: jnp.zeros(v["shape"]) for k, v in fem._op.history_specs.items()}}
+    )
+    got = np.asarray(next(iter(out.values())))
+    assert got.shape == (n_cells, n_quad), f"gradient-energy readout is {got.shape}, buffer wants {(n_cells, n_quad)}"
+
+    # External oracle: on an affine P1 triangle u is linear, so ∇u solves A g = Δu exactly, where A's
+    # rows are the two edge vectors from vertex 0 and Δu the matching vertex-value differences.
+    pts = np.asarray(d._fem_native_dof_points)[:, :2]
+    cells = np.asarray(d._fem_native_assembly_cells)
+    uv = np.asarray(traj[-1])[cells]  # (n_cells, 3) vertex values
+    p = pts[cells]  # (n_cells, 3, 2)
+    A = np.stack([p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]], axis=1)  # (n_cells, 2, 2) edge vectors as rows
+    du = np.stack([uv[:, 1] - uv[:, 0], uv[:, 2] - uv[:, 0]], axis=1)  # (n_cells, 2)
+    g = np.linalg.solve(A, du[..., None])[..., 0]  # (n_cells, 2)
+    ref = 0.5 * np.sum(g * g, axis=1)  # constant over each affine cell
+    assert ref.max() > 1e-6, "the solution is flat — the gradient oracle would be vacuous"
+    rel = np.abs(got - ref[:, None]).max() / ref.max()
+    assert rel < 1e-10, f"gradient energy density disagrees with the closed-form P1 gradient: rel {rel:.2e}"
