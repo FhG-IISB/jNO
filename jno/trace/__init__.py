@@ -3034,6 +3034,36 @@ class NormalDerivative(Placeholder):
         return f"NormalDerivative({self.target})"
 
 
+class _FieldComponentIndex:
+    """``field[i]`` is the i-th COMPONENT — the mixin that makes one spelling mean one thing.
+
+    :class:`Placeholder` indexes an array the ordinary way, i.e. the **leading** axis. That is right
+    for a plain tensor and wrong for a FEM field, whose leading axis at assembly is the quadrature
+    points (and, for a test function, the DOFs after it) — the component axis is **last**. The typed
+    views have always known this: ``VectorView[i]`` is :meth:`~views.VectorView.component`, built as
+    ``expr[..., i]``. So ``u.vector[0]`` and ``u(region)[0]`` selected a component while a bare
+    ``u[0]`` sliced quadrature points and blew up in the assembler with a raw broadcast error naming
+    no jNO concept.
+
+    Inserting the ellipsis here makes the raw spelling agree with the view. ``getitem_key`` then reads
+    ``(Ellipsis, i)`` exactly as the view's already did, so the consumers that recover a component
+    from it — the per-component Dirichlet spec and the component-gradient branch of the assembler —
+    are unaffected.
+    """
+
+    def __getitem__(self, key):
+        keys = key if isinstance(key, tuple) else (key,)
+        if any(k is Ellipsis for k in keys):
+            return Placeholder.__getitem__(self, key)  # explicit `u[..., i]`: already unambiguous
+        if not tuple(getattr(self, "value_shape", ()) or ()):
+            raise TypeError(
+                f"{type(self).__name__}[{key!r}]: this field is scalar (value_shape == ()), so it has no "
+                "components to index. For a derivative write `u.d(x)` (or `u.x` on a bound view); to index "
+                "a plain array, index the array rather than the field."
+            )
+        return Placeholder.__getitem__(self, (Ellipsis,) + keys)
+
+
 class DiffSlot(Placeholder):
     """A leaf standing in for a value injected at evaluation time — the hole :class:`Diff` differentiates
     through. Carries no children and no coordinates, so it composes as a plain value in any formula. Not
@@ -3554,7 +3584,7 @@ class GaugePin:
         return f"GaugePin(field={getattr(self.field, 'name', '?')!r}, value={self.value!r})"
 
 
-class TrialFunction(Placeholder):
+class TrialFunction(_FieldComponentIndex, Placeholder):
     """
     Generic variational unknown symbol.
 
@@ -4156,7 +4186,7 @@ def state_updates(terms):
     return out
 
 
-class TestFunction(Placeholder):
+class TestFunction(_FieldComponentIndex, Placeholder):
     """
     Generic variational test function.
 

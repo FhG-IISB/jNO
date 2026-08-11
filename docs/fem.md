@@ -148,6 +148,23 @@ in the `jno.fem([...])` list, and `jno.fem` classifies each by the region it is 
 for a spatially varying Dirichlet value). A zero Neumann flux is the natural default and needs
 no term.
 
+### Components and derivatives — `u[i]` vs `u.x`
+
+For a vector field the two are distinct spellings and each means one thing:
+
+| spelling | meaning |
+|---|---|
+| `u[i]`, `u[..., i]`, `u.vector[i]`, `u(region)[i]` | the **i-th component** |
+| `u.d(x)`, `u.x` on a bound view, `u.t` | the **derivative** |
+
+`u[i]` is the component *everywhere* — on a raw `fem_symbols` field exactly as on a typed view — and
+all four component spellings assemble the identical term. Indexing a **scalar** field raises: it has no
+components, and the message points at `u.d(x)`.
+
+(Historically a raw `u[0]` indexed the leading array axis, which at assembly is quadrature points, so
+it died inside the assembler with a broadcast error naming nothing — while `u(region)[0]` and
+`u.vector[0]`, built by the views as `u[..., 0]`, selected the component correctly.)
+
 ### Reading the reaction off a constrained region — `fem.eval`
 
 The quantity conjugate to an essential condition is the **reaction**: force in mechanics, total heat
