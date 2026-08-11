@@ -255,8 +255,8 @@ def test_tag_region_reaches_the_interface_at_all():
     assert "owned" in d._boundary_regions
 
 
-def test_a_coarse_slave_is_reordered_rather_than_left_wrong():
-    """In ``u(A) - u(B)`` the slave A is eliminated in favour of an interpolation from B, so the slave
+def test_a_coarse_secondary_is_reordered_rather_than_left_wrong():
+    """In ``u(A) - u(B)`` the secondary A is eliminated in favour of an interpolation from B, so the secondary
     must be the FINER side or the fine mesh's interface resolution is discarded. Measured on a
     coating/substrate tie (81 nodes against 10), the wrong order was off by 10.62% with no error at
     all — so the tie reorders itself and says so, rather than trusting the caller to know the rule."""

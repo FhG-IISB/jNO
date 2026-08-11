@@ -20,10 +20,13 @@ BiCGStab (steady linear) and Jacobian-free Newton-Krylov (nonlinear).
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import jax
 import jax.numpy as jnp
+
+if TYPE_CHECKING:  # runtime import stays lazy inside remesh()/relocate()
+    from .utils.solver.fem_adapt import AdaptSpec
 
 from .utils.solver.solver_api import (
     LinearOperator,
@@ -734,7 +737,7 @@ def remesh(
     max_iters: int = 8,
     tol: float | None = None,
     eps: float | None = None,
-):
+) -> AdaptSpec:
     """**h-adaptivity** for ``fem.solve(adapt=...)``: change the mesh to follow the solution.
 
     On a **steady** problem this is the refine loop — solve, estimate (Zienkiewicz–Zhu), mark
@@ -769,7 +772,7 @@ def remesh(
             (two consecutive rounds required).
 
     Returns:
-        The adaptation spec to pass as ``fem.solve(adapt=...)``.
+        AdaptSpec: The adaptation spec to pass as ``fem.solve(adapt=...)``.
 
     See :func:`relocate` for the fixed-connectivity (r-adaptive) alternative: it keeps the topology, so
     there is no mesh schedule to freeze and no cross-mesh transfer, and its vertex map is differentiable
@@ -800,7 +803,7 @@ def relocate(
     quality_floor: float = 0.1,
     relax: int = 60,
     relax_step: float = 0.1,
-):
+) -> AdaptSpec:
     """**r-adaptivity** for ``fem.solve(adapt=...)``: move the mesh vertices, keep the connectivity.
 
     Moves the vertices tagged ``domain.variable(region)[i].trainable()`` so the mesh **equidistributes**
@@ -871,7 +874,7 @@ def relocate(
         relax_step: ``"monge_ampere"`` only — the relaxation pseudo-step ``Δt``.
 
     Returns:
-        The adaptation spec to pass as ``fem.solve(adapt=...)``.
+        AdaptSpec: The adaptation spec to pass as ``fem.solve(adapt=...)``.
     """
     if method not in ("descent", "monge_ampere"):
         raise ValueError(f"jno.solve.relocate(method={method!r}): expected 'descent' or 'monge_ampere'.")

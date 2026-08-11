@@ -68,7 +68,7 @@ def test_bloch_prolongation_is_complex_plain_is_real():
     bloch = build_periodic_prolongation(pts, [("left", "right")], tags, phases=[np.exp(1j * 0.7)])
     assert plain["is_bloch"] is False and not np.iscomplexobj(np.asarray(plain["P"].data))
     assert bloch["is_bloch"] is True and np.iscomplexobj(np.asarray(bloch["P"].data))
-    # slave rows carry the Bloch factor e^{i 0.7}
+    # secondary rows carry the Bloch factor e^{i 0.7}
     assert np.allclose(np.abs(np.asarray(bloch["P"].data)), 1.0)
 
 
@@ -322,7 +322,7 @@ def test_bloch_realify_accepts_a_single_block_dict():
     dense_P = np.zeros((n, m), dtype=np.complex128)
     for j in range(m):
         dense_P[j, j] = 1.0
-    dense_P[3, 0] = ph  # one slave tied to master 0 through the Bloch phase
+    dense_P[3, 0] = ph  # one secondary tied to main 0 through the Bloch phase
 
     legacy = {"P": jnp.asarray(dense_P), "kept_nodes": np.arange(m), "vec": 1, "is_bloch": True}
     blocked = {  # the SAME single-field reduction in the blocked shape (what N1E builds)

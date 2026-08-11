@@ -1,11 +1,11 @@
 """Periodic ties on **unstructured** (non-matching) meshes via interpolatory prolongation.
 
-The structured/conforming case ties slave≡master node-to-node (exact 0/1 ``P``). When the two
-periodic faces carry *different* node layouts, a slave with no master node within ``tol`` is tied to
-the master *facet* it lands on by node-to-segment interpolation (linear P1 / quadratic P2). The
+The structured/conforming case ties secondary≡main node-to-node (exact 0/1 ``P``). When the two
+periodic faces carry *different* node layouts, a secondary with no main node within ``tol`` is tied to
+the main *facet* it lands on by node-to-segment interpolation (linear P1 / quadratic P2). The
 primary correctness gate is a **patch test**: the prolongation reproduces a constant and a
 linear-along-the-face field exactly (P1), a quadratic exactly (P2) — partition of unity + facet
-completeness. (Interpolatory master--slave elimination, not full dual-mortar; see
+completeness. (Interpolatory main--secondary elimination, not full dual-mortar; see
 ``_periodic_facet_weights``.)
 
 These exercise ``build_periodic_prolongation`` directly (no FEM assembly). x64 so the float64
@@ -29,34 +29,34 @@ def _x64():
         jax.config.update("jax_enable_x64", prev)
 
 
-def _two_faces(n_master, n_slave, *, order=1):
-    """Right (master, x=1) and left (slave, x=0) faces with independent node layouts.
+def _two_faces(n_main, n_secondary, *, order=1):
+    """Right (main, x=1) and left (secondary, x=0) faces with independent node layouts.
 
-    Returns ``(points, tag_indices, facets)``. For ``order==2`` the master face carries edge
+    Returns ``(points, tag_indices, facets)``. For ``order==2`` the main face carries edge
     midpoints and the facets are 3-node (a, b, mid)."""
-    ym = np.linspace(0.0, 1.0, n_master)
-    master = np.column_stack([np.ones_like(ym), ym])
-    ys = np.linspace(0.0, 1.0, n_slave)
-    slave = np.column_stack([np.zeros_like(ys), ys])
+    ym = np.linspace(0.0, 1.0, n_main)
+    main = np.column_stack([np.ones_like(ym), ym])
+    ys = np.linspace(0.0, 1.0, n_secondary)
+    secondary = np.column_stack([np.zeros_like(ys), ys])
     if order == 1:
-        pts = np.vstack([master, slave])
-        m_ids = np.arange(n_master)
-        s_ids = np.arange(n_master, n_master + n_slave)
+        pts = np.vstack([main, secondary])
+        m_ids = np.arange(n_main)
+        s_ids = np.arange(n_main, n_main + n_secondary)
         edges = np.column_stack([m_ids[:-1], m_ids[1:]])  # (a, b)
         return pts, {"right": m_ids, "left": s_ids}, {"right": edges}
-    # P2: insert master edge midpoints
+    # P2: insert main edge midpoints
     mids = 0.5 * (ym[:-1] + ym[1:])
-    master_mid = np.column_stack([np.ones_like(mids), mids])
-    pts = np.vstack([master, master_mid, slave])
-    m_ids = np.arange(n_master)
-    mid_ids = np.arange(n_master, n_master + len(mids))
-    s_ids = np.arange(n_master + len(mids), len(pts))
+    main_mid = np.column_stack([np.ones_like(mids), mids])
+    pts = np.vstack([main, main_mid, secondary])
+    m_ids = np.arange(n_main)
+    mid_ids = np.arange(n_main, n_main + len(mids))
+    s_ids = np.arange(n_main + len(mids), len(pts))
     edges = np.column_stack([m_ids[:-1], m_ids[1:], mid_ids])  # (a, b, mid)
     return pts, {"right": m_ids, "left": s_ids}, {"right": edges}
 
 
 def test_patch_test_p1_reproduces_constant_and_linear():
-    """Non-matching faces (5 master vs 9 slave nodes): P-rows are a partition of unity and the
+    """Non-matching faces (5 main vs 9 secondary nodes): P-rows are a partition of unity and the
     prolongation reproduces a constant and a linear-in-y field exactly."""
     pts, tags, facets = _two_faces(5, 9, order=1)
     res = build_periodic_prolongation(pts, [("right", "left")], tags, facets=facets)
@@ -69,7 +69,7 @@ def test_patch_test_p1_reproduces_constant_and_linear():
     # constant
     u_red = np.ones(len(kept))
     assert np.allclose(P @ u_red, 1.0)
-    # linear in the transverse coord y -> reproduced exactly at every slave node
+    # linear in the transverse coord y -> reproduced exactly at every secondary node
     for a, b in [(2.0, 0.3), (-1.5, 1.0)]:
         f = lambda y: a * y + b  # noqa: E731
         u_full = P @ f(pts[kept, 1])
@@ -77,7 +77,7 @@ def test_patch_test_p1_reproduces_constant_and_linear():
 
 
 def test_patch_test_p2_reproduces_quadratic():
-    """With 3-node (a, b, mid) master facets the interpolation reproduces a quadratic exactly."""
+    """With 3-node (a, b, mid) main facets the interpolation reproduces a quadratic exactly."""
     pts, tags, facets = _two_faces(3, 9, order=2)
     res = build_periodic_prolongation(pts, [("right", "left")], tags, facets=facets)
     P = np.asarray(res["P_node"].todense())  # P_node is BCOO
@@ -89,21 +89,21 @@ def test_patch_test_p2_reproduces_quadratic():
 
 
 def test_patch_test_3d_triangle_reproduces_linear():
-    """3D triangular facets: a slave face (z=0) ties to a master face (z=1) by point-in-triangle
+    """3D triangular facets: a secondary face (z=0) ties to a main face (z=1) by point-in-triangle
     barycentric interpolation. The prolongation reproduces a constant and a linear-in-(x,y) field
     exactly (partition of unity + barycentric completeness)."""
-    # master face z=1: unit square as two triangles over its 4 corners
-    master = np.array([[0, 0, 1.0], [1, 0, 1.0], [1, 1, 1.0], [0, 1, 1.0]])
-    tris = np.array([[0, 1, 2], [0, 2, 3]])  # local -> these are master node ids 0..3
-    # slave face z=0: interior points (fall inside the master triangles)
-    slave = np.array([[0.3, 0.2, 0.0], [0.7, 0.6, 0.0], [0.5, 0.5, 0.0], [0.2, 0.8, 0.0], [0.9, 0.1, 0.0]])
-    pts = np.vstack([master, slave])
-    tags = {"top": np.arange(4), "bot": np.arange(4, 4 + len(slave))}
+    # main face z=1: unit square as two triangles over its 4 corners
+    main = np.array([[0, 0, 1.0], [1, 0, 1.0], [1, 1, 1.0], [0, 1, 1.0]])
+    tris = np.array([[0, 1, 2], [0, 2, 3]])  # local -> these are main node ids 0..3
+    # secondary face z=0: interior points (fall inside the main triangles)
+    secondary = np.array([[0.3, 0.2, 0.0], [0.7, 0.6, 0.0], [0.5, 0.5, 0.0], [0.2, 0.8, 0.0], [0.9, 0.1, 0.0]])
+    pts = np.vstack([main, secondary])
+    tags = {"top": np.arange(4), "bot": np.arange(4, 4 + len(secondary))}
     res = build_periodic_prolongation(pts, [("top", "bot")], tags, facets={"top": tris})
     P = np.asarray(res["P_node"].todense())  # P_node is BCOO
     kept = np.asarray(res["kept_nodes"])
     assert np.allclose(P.sum(axis=1), 1.0)  # partition of unity
-    # reproduce constant and a linear field a·x + b·y + c exactly at every slave node
+    # reproduce constant and a linear field a·x + b·y + c exactly at every secondary node
     for a, b, c in [(0.0, 0.0, 1.0), (2.0, -1.5, 0.3)]:
         field = a * pts[:, 0] + b * pts[:, 1] + c
         assert np.allclose(P @ field[kept], field, atol=1e-10)
@@ -112,13 +112,13 @@ def test_patch_test_3d_triangle_reproduces_linear():
 def test_patch_test_3d_triangle_p2_reproduces_quadratic():
     """3D P2 triangular facets (6-node: 3 vertices + 3 edge midpoints) reproduce a quadratic-in-(x,y)
     field exactly via the quadratic-triangle shape functions."""
-    # master face z=1: 4 corners + 5 edge midpoints, two 6-node triangles
+    # main face z=1: 4 corners + 5 edge midpoints, two 6-node triangles
     c = np.array([[0, 0, 1.0], [1, 0, 1.0], [1, 1, 1.0], [0, 1, 1.0]])  # ids 0..3
     mids = np.array(
         [[0.5, 0, 1.0], [1, 0.5, 1.0], [0.5, 0.5, 1.0], [0.5, 1, 1.0], [0, 0.5, 1.0]]
     )  # m01,m12,m20,m23,m30 -> ids 4..8
-    slave = np.array([[0.3, 0.2, 0.0], [0.6, 0.5, 0.0], [0.5, 0.5, 0.0], [0.2, 0.7, 0.0]])  # ids 9..12
-    pts = np.vstack([c, mids, slave])
+    secondary = np.array([[0.3, 0.2, 0.0], [0.6, 0.5, 0.0], [0.5, 0.5, 0.0], [0.2, 0.7, 0.0]])  # ids 9..12
+    pts = np.vstack([c, mids, secondary])
     tris = np.array([[0, 1, 2, 4, 5, 6], [0, 2, 3, 6, 7, 8]])  # (a,b,c, mab,mbc,mca)
     tags = {"top": np.arange(9), "bot": np.arange(9, 13)}
     res = build_periodic_prolongation(pts, [("top", "bot")], tags, facets={"top": tris})
@@ -143,7 +143,7 @@ def test_conforming_stays_exact_0_1_permutation():
 def test_non_matching_without_facets_raises():
     """Non-matching faces and no facet connectivity -> a clear error (can't interpolate)."""
     pts, tags, _ = _two_faces(5, 9, order=1)
-    with pytest.raises(ValueError, match="no master facet connectivity"):
+    with pytest.raises(ValueError, match="no main facet connectivity"):
         build_periodic_prolongation(pts, [("right", "left")], tags)
 
 
@@ -185,7 +185,7 @@ def test_periodic_poisson_2d_p1_nonconforming():
         ]
     )
     assert fem._periodic is not None, "the u(left)-u(right) tie must be recognised and reduce the system"
-    assert fem._periodic["n_red"] < fem._periodic["n_full"], "the tie must eliminate the slave-face DOFs"
+    assert fem._periodic["n_red"] < fem._periodic["n_full"], "the tie must eliminate the secondary-face DOFs"
 
     uh = np.asarray(fem.solve())
     pts = np.asarray(fem.points)
@@ -259,7 +259,7 @@ def test_doubly_periodic_reaction_diffusion():
     """Multi-direction periodicity (a doubly-periodic cell): ``-Δu + u = f`` periodic in **both** x
     and y, via two ties ``u(left)-u(right)`` and ``u(bottom)-u(top)``. The reaction term makes the
     all-periodic problem well-posed. This exercises the general transitive corner resolution -- the
-    four corners are each a slave in two directions and must all collapse onto one kept master.
+    four corners are each a secondary in two directions and must all collapse onto one kept main.
     Manufactured ``u = cos(2πx) cos(2πy)``."""
     from shapely.geometry import box
 
@@ -355,8 +355,8 @@ def test_periodic_poisson_2d_p2_nonconforming():
 
 def test_triply_periodic_3d_cube():
     """3D: a **triply-periodic** unit cube (`-Δu + u = f`, periodic in x, y AND z) -- the full
-    corner→edge→face hierarchy. Exercises the transitive `_expand` composition (a master triangle's
-    edge/corner node is itself a slave on adjacent faces). Manufactured `u = cos2πx·cos2πy·cos2πz`;
+    corner→edge→face hierarchy. Exercises the transitive `_expand` composition (a main triangle's
+    edge/corner node is itself a secondary on adjacent faces). Manufactured `u = cos2πx·cos2πy·cos2πz`;
     assert the solve converges and the 8 cube corners are all identified."""
     import jno
 
@@ -563,7 +563,7 @@ def test_periodic_transient_heat():
 def test_multidirection_on_auto_faces_shares_corners():
     """Multidirectional periodicity now works on **auto-generated** face tags (no domain.tag): a face
     chain keeps both endpoints, so each corner belongs to every face it touches (left AND bottom), and
-    the transitive corner resolution collapses the four corners onto one master. Manufactured
+    the transitive corner resolution collapses the four corners onto one main. Manufactured
     ``u = cos(2πx) cos(2πy)`` -- the guard only rejects genuinely corner-partitioned tags."""
     from shapely.geometry import box
 

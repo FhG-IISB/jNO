@@ -68,12 +68,12 @@ def _periodic_fem(kappa, mesh_size=0.07):
 
 def test_periodic_parametric_operator_is_reduced():
     """The parametric periodic problem yields a parametric ``FemLinearSystem`` and a periodic reduction
-    that eliminates the slave-face DOFs (previously this combination raised NotImplementedError)."""
+    that eliminates the secondary-face DOFs (previously this combination raised NotImplementedError)."""
     fem = _periodic_fem(_kappa(start=1.0))
     assert fem.operator.is_parametric, "a runtime κ must produce a parametric FemLinearSystem"
     assert list(fem.operator.runtime_parameter_exprs) == ["kappa"]
     assert fem._periodic is not None, "the u(left)-u(right) tie must reduce the parametric system"
-    assert fem._periodic["n_red"] < fem._periodic["n_full"], "the tie must eliminate the slave-face DOFs"
+    assert fem._periodic["n_red"] < fem._periodic["n_full"], "the tie must eliminate the secondary-face DOFs"
 
 
 def test_periodic_parametric_forward_matches_nonparametric():

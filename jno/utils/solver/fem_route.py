@@ -57,7 +57,7 @@ class PeriodicBC:
     """
     Periodic boundary-condition descriptor.
 
-    Each pair identifies a master and slave boundary whose degrees of freedom
+    Each pair identifies a main and secondary boundary whose degrees of freedom
     must be identified through a prolongation matrix.
     """
 
@@ -79,7 +79,7 @@ def periodic(*pairs):
 
     for pair in pairs:
         if not isinstance(pair, (tuple, list)) or len(pair) != 2:
-            raise TypeError("Each periodic pair must be `(master_tag, slave_tag)`.")
+            raise TypeError("Each periodic pair must be `(main_tag, secondary_tag)`.")
 
         normalized.append(
             (
@@ -178,7 +178,7 @@ def expand_bcs(bcs, vec: int):
     -------
     tuple
         ``(dirichlet_tags, dirichlet_value_fns, neumann_tags, periodic_pairs)``.
-        ``periodic_pairs`` is a list of ``(master_tag, slave_tag)`` tuples.
+        ``periodic_pairs`` is a list of ``(main_tag, secondary_tag)`` tuples.
     """
     dirichlet_tags = []
     dirichlet_value_fns = {}

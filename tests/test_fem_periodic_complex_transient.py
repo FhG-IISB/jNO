@@ -2,7 +2,7 @@
 
 A complex transient (e.g. Schrodinger/complex-diffusion) integrates the real-equivalent 2N time block
 ``[[M_r,-M_i],[M_i,M_r]]`` etc. A periodic tie reduces *both* real/imag blocks by the same ``P`` (the
-combinator recurses into the ``(block_r, block_i)`` legs), the integration runs in the reduced master-
+combinator recurses into the ``(block_r, block_i)`` legs), the integration runs in the reduced main-
 DOF space, and each saved slice is prolonged back -- real/imag separately. (Previously this raised
 NotImplementedError.) Pinned with a manufactured decaying periodic mode and a zero-IC extreme.
 
@@ -68,7 +68,7 @@ def test_periodic_complex_transient_recovers_decaying_mode():
     fem, c = _build(amp_ic=1.0)
     assert fem.is_complex and fem.is_transient
     assert fem._periodic is not None, "the u(left)-u(right) tie must reduce the complex transient block"
-    assert fem._periodic["n_red"] < fem._periodic["n_full"], "the tie must eliminate the slave-face DOFs"
+    assert fem._periodic["n_red"] < fem._periodic["n_full"], "the tie must eliminate the secondary-face DOFs"
 
     traj = np.asarray(fem.solve())
     assert np.iscomplexobj(traj)

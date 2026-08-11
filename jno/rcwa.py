@@ -875,7 +875,7 @@ def _periodic_period(femobj, domain):
     for c in getattr(femobj, "_constraints", []):
         spec = _periodic_tie_spec(c, domain)
         if spec is not None:
-            ties.append((spec[0], spec[1]))  # (master, slave) tags
+            ties.append((spec[0], spec[1]))  # (main, secondary) tags
     if not ties:
         raise RcwaError(
             "no Floquet/periodic ties found: RCWA solves an infinitely periodic cell. Author the "

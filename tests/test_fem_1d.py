@@ -1519,7 +1519,7 @@ def test_coupled_1d_periodic_recovers_manufactured():
         ]
     )
     assert fem._periodic is not None, "the coupled ties were not read as a periodic reduction"
-    # one master/slave identification per field -> the reduced space loses exactly 2 dofs
+    # one main/secondary identification per field -> the reduced space loses exactly 2 dofs
     assert fem._periodic["n_red"] == fem._periodic["n_full"] - 2
 
     sol = np.asarray(fem.solve()).reshape(-1)
@@ -1898,3 +1898,184 @@ def test_complex_1d_scope_limits_fail_loud():
     ui4, vi4 = u4.bind(x=xi4), phi4.bind(x=xi4)
     with pytest.raises(NotImplementedError, match="COMPLEX essential value"):
         jno.fem([ui4.x * vi4.x + 0.0j * (ui4 * vi4), u4(xl4) - 0.0, u4(xr4) - (1.0 + 2.0j)])
+
+
+# ==========================================================================
+# tagged boundaries, and the assembled tangent
+# ==========================================================================
+def test_a_coordinate_tag_becomes_a_dirichlet_boundary_region():
+    """``d.tag(...)`` must register a BOUNDARY region in 1-D as it does in 2-D/3-D.
+
+    A 1-D boundary facet **is** a vertex, but the registration searched only ``edges`` (2-D) /
+    ``triangles`` (3-D) and so returned without registering anything. The failure was silent in the
+    worst way: the tag still existed as a sampling region, ``d.variable(name)`` still returned its
+    coordinate, and nothing complained until ``jno.fem`` rejected ``u(tag) - g`` as a *whole-domain*
+    residual — an error that blames the residual for a defect in the tag.
+    """
+    d = _line(0.1)
+    d.tag("right_end", lambda x: x > 1.0 - 1e-9)
+    assert "right_end" in d._boundary_regions, "the tag never became a boundary region"
+    # and it must carry the outward normal, like every other boundary tag: +1 at the right end
+    assert float(np.asarray(d.normals_by_tag["right_end"]).ravel()[0]) == pytest.approx(1.0)
+
+    u, phi = d.fem_symbols()
+    xi = d.variable("interior", split=True)[0]
+    xl = d.variable("left", split=True)[0]  # built-in
+    xr = d.variable("right_end", split=True)[0]  # ours
+    ui, vi = u.bind(x=xi), phi.bind(x=xi)
+    fem = jno.fem([ui.x * vi.x, u(xl) - 0.0, u(xr) - 1.0])
+    sol = np.asarray(fem.solve()).reshape(-1)
+    assert np.allclose(sol, _x(d), atol=1e-10), "-u'' = 0 with u(0)=0, u(1)=1 is u = x"
+
+
+def test_a_tag_matching_no_boundary_node_stays_interior():
+    """The early return is still right when the predicate genuinely misses the boundary — a tag over
+    the middle of the line is an interior sampling region, not a Dirichlet one."""
+    d = _line(0.1)
+    d.tag("middle", lambda x: jnp.abs(x - 0.5) < 1e-9)
+    assert "middle" not in d._boundary_regions
+
+
+def _allen_cahn(eps=0.15, T=2.0, nstep=24, mesh_size=0.02, wide=0.30):
+    """Transient Allen-Cahn, u_t = eps^2 u_xx + u - u^3, from a deliberately over-wide interface.
+
+    The stationary profile is tanh((x - 1/2) / (sqrt2 eps)) — Allen & Cahn, Acta Metall. 27 (1979)
+    1085-1095, Sec. 2. Nonlinear AND transient, so it exercises the transient assembled tangent; the
+    right edge comes from ``d.tag`` rather than the built-in tag so one test covers both 1-D gaps at
+    once, which is how the two were actually met."""
+    profile = lambda x: np.tanh((x - 0.5) / (np.sqrt(2.0) * eps))  # noqa: E731
+    d = _line(mesh_size, time=(0.0, T, nstep))
+    d.tag("right_end", lambda x: x > 1.0 - 1e-9)
+    u, v = d.fem_symbols()
+    co = d.variable("interior", split=True)
+    xi, ti = co[0], co[-1]
+    xl = d.variable("left", split=True)[0]
+    xr = d.variable("right_end", split=True)[0]
+    ci = d.variable("initial", split=True)[0]
+    ui, vi = u.bind(x=xi, t=ti), v.bind(x=xi)
+    fem = jno.fem(
+        [
+            ui.t * vi + eps**2 * (ui.x * vi.x) + (u**3 - u) * vi,
+            u(xl) - profile(0.0),
+            u(xr) - profile(1.0),
+            u(ci) - jno.np.tanh((ci - 0.5) / (np.sqrt(2.0) * wide)),
+        ]
+    )
+    return fem, profile(np.asarray(fem.points).reshape(-1))
+
+
+def test_the_assembled_tangent_of_a_nonlinear_1d_problem_is_sparse():
+    """``newton(direct=True)`` factorises the ASSEMBLED tangent, and its contract is a **BCOO**.
+
+    1-D handed it a dense global ``jacfwd`` instead. Inside the Newton ``lax.while_loop`` that made
+    ``sparse_lu_solve`` call ``BCOO.fromdense`` on a tracer, whose ``nse`` cannot be concrete, so every
+    ``direct=True`` solve died with a ``ConcretizationTypeError`` — and it is an ``O(N^2)`` tangent
+    besides, on the one dimension where node counts are meant to be large.
+    """
+    fem, ref = _allen_cahn()
+    traj = np.asarray(fem.solve(nonlinear=jno.solve.newton(direct=True)).fn())
+    assert np.isfinite(traj).all(), "the direct Newton produced non-finite values"
+    rel = lambda s: float(np.linalg.norm(ref - s) / np.linalg.norm(ref))  # noqa: E731
+    assert rel(traj[0]) > 0.2, "the initial interface should start visibly too wide"
+    assert rel(traj[-1]) < 0.02, f"did not sharpen onto the stationary profile: rel_L2 = {rel(traj[-1]):.3e}"
+
+
+def test_a_steady_nonlinear_1d_problem_takes_the_direct_newton():
+    """Same assembled-tangent contract on the steady nonlinear path (a different jacobian site).
+
+    ``-u'' + u^3 = 0`` with ``u(0)=0, u(1)=1``: monotone between the two ends, which the linear
+    solution is not once the cubic bites."""
+    d = _line(0.05)
+    u, phi = d.fem_symbols()
+    xi = d.variable("interior", split=True)[0]
+    xl = d.variable("left", split=True)[0]
+    xr = d.variable("right", split=True)[0]
+    ui, vi = u.bind(x=xi), phi.bind(x=xi)
+    fem = jno.fem([ui.x * vi.x + (ui**3) * vi, u(xl) - 0.0, u(xr) - 1.0])
+    sol = np.asarray(fem.solve(nonlinear=jno.solve.newton(direct=True))).reshape(-1)
+    x = _x(d)
+    assert np.isfinite(sol).all()
+    assert sol[np.argmin(x)] == pytest.approx(0.0, abs=1e-10)
+    assert sol[np.argmax(x)] == pytest.approx(1.0, abs=1e-10)
+    assert np.all(np.diff(sol[np.argsort(x)]) > -1e-12), "the solution must stay monotone"
+    # the cubic sink pulls the profile BELOW the straight line -u''=0 would give
+    assert np.max(np.sort(x) - sol[np.argsort(x)]) > 1e-3
+
+
+# ==========================================================================
+# tag resolution
+# ==========================================================================
+@pytest.mark.parametrize("x64", [False, True], ids=["f32", "f64"])
+def test_a_tagged_endpoint_carries_its_dirichlet_at_either_precision(x64):
+    """A ``domain.tag`` predicate must select the same node whether or not x64 is on.
+
+    It did not. The 1D assembler read the mesh points into a **JAX** array to evaluate the tag's
+    location function, which is float32 with x64 off — and ``1 - 1e-9`` is not representable there,
+    it rounds to exactly ``1.0``, so the strict ``>`` below matched no node. The essential condition
+    was then dropped in **silence**: ``fem.classification`` still reported ``dirichlet@right_edge``,
+    the solve succeeded, and the answer was a different BVP (``-u'' = 0`` with one end free is
+    constant, so ``u(1)`` came back at the *left* value). Every other test in this file opts into
+    x64 through the autouse fixture, which is precisely why it went unnoticed — hence the explicit
+    parametrization here.
+
+    ``-u'' = 0`` with ``u(0) = -1``, ``u(1) = +1`` is nodally exact, so a missing condition cannot
+    hide inside discretisation error.
+    """
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", x64)
+    try:
+        d = _line(0.02)
+        d.tag("right_edge", lambda x: x > 1.0 - 1e-9)
+        u, phi = d.fem_symbols()
+        xi = d.variable("interior", split=True)[0]
+        xl = d.variable("left", split=True)[0]
+        xr = d.variable("right_edge", split=True)[0]
+        ui, vi = u.bind(x=xi), phi.bind(x=xi)
+        fem = jno.fem([ui.x * vi.x, u(xl) - (-1.0), u(xr) - 1.0])
+        sol = np.asarray(fem.solve()).reshape(-1)
+        x = np.asarray(fem.points)[:, 0]
+        assert sol[np.argmax(x)] == pytest.approx(1.0, abs=1e-4), "the tagged end lost its Dirichlet value"
+        assert sol[np.argmin(x)] == pytest.approx(-1.0, abs=1e-4)
+        assert np.linalg.norm(sol - (2 * x - 1)) / np.linalg.norm(2 * x - 1) < 1e-3
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
+
+def test_an_essential_condition_matching_no_node_is_refused():
+    """An essential condition that selects nothing is a different problem, not a no-op.
+
+    The tag below is deliberately off the domain (the line ends at x = 1) — what a mis-specified
+    predicate looks like, now that the precision bug above can no longer produce one. Two guards
+    catch it and either is fine, so this pins the *refusal*, not the wording: a tag matching nothing
+    never registers as a boundary region, so ``jno.fem`` rejects the term while classifying it; and
+    if one ever did register while still resolving to no node — exactly the shape of the float32 bug
+    — ``_essential_node_ids`` raises at DOF resolution. What must never happen is a solve that
+    succeeds with the condition quietly missing.
+    """
+    d = _line(0.05)
+    d.tag("nowhere", lambda x: x > 5.0)
+    u, phi = d.fem_symbols()
+    xi = d.variable("interior", split=True)[0]
+    xl = d.variable("left", split=True)[0]
+    xn = d.variable("nowhere", split=True)[0]
+    ui, vi = u.bind(x=xi), phi.bind(x=xi)
+    with pytest.raises(ValueError, match="matched no mesh node|must live on a boundary region"):
+        jno.fem([ui.x * vi.x, u(xl) - 0.0, u(xn) - 1.0]).solve()
+
+
+def test_tag_node_mask_resolves_a_fine_tolerance_without_x64():
+    """The unit behind both tests above: the predicate is evaluated in float64, not at the ambient dtype."""
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", False)
+    try:
+        d = _line(0.02)
+        d.tag("right_edge", lambda x: x > 1.0 - 1e-9)
+        pts = np.asarray(d.mesh.points)
+        mask = d.tag_node_mask("right_edge", pts)
+        assert mask.sum() == 1, "a 1e-9 tolerance at x = 1 is below float32 resolution"
+        assert pts[mask, 0] == pytest.approx(1.0)
+        # the built-in tag names the same node, and always did (it never evaluates a user tolerance)
+        assert np.array_equal(mask, d.tag_node_mask("right", pts))
+        assert d.tag_node_mask("no_such_tag", pts) is None
+    finally:
+        jax.config.update("jax_enable_x64", prev)

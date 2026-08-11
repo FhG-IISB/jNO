@@ -3526,10 +3526,10 @@ class TrialFunction(Placeholder):
 
     bind = partials
 
-    def gap(self, slave: str, master: str, *, domain):
+    def gap(self, secondary: str, main: str, *, domain):
         """Signed **contact gap** between two tagged boundary faces, as a symbol usable in a weak form.
 
-        ``g = g0 + n . (u_slave - u_master . Phi)`` at the slave face's quadrature points: ``g0`` is the
+        ``g = g0 - n . (u_secondary - u_main . Phi)`` at the secondary face's quadrature points: ``g0`` is the
         initial along-normal separation, the second term how the two bodies have since moved relative
         to each other. Positive is open, negative is penetrating -- the sign the augmented-Lagrangian
         pressure ``max(0, lam + c*(-g))`` expects::
@@ -3540,9 +3540,16 @@ class TrialFunction(Placeholder):
             fem = jno.fem([..., p * jno.np.inner(n, phi.bind(...), n_contract=1), lam.evolves(p)])
 
         The traction is an ordinary weak boundary term, so nothing is passed to ``fem.solve()``. The
-        gap is **non-local** -- it reads DOFs on the master body's cells, not the slave face's parent
-        cell -- so assembly emits a second Jacobian block whose columns are those master DOFs, which is
+        gap is **non-local** -- it reads DOFs on the main body's cells, not the secondary face's parent
+        cell -- so assembly emits a second Jacobian block whose columns are those main DOFs, which is
         what keeps the tangent consistent.
+
+        Write the traction **once**, on the secondary face. The equal-and-opposite traction on the main
+        body is the same integrand tested against the main's projected trace, and the pairing supplies
+        it -- so Newton's third law holds without restating it, and two bonded bodies converge to the
+        single-body answer as ``c`` stiffens. ``n`` is the secondary's *outward* normal, which points at the
+        main; ``g > 0`` is open, ``g < 0`` penetrating, and the traction sign is ``+p * inner(n, phi)``
+        (with ``dg/du_s = -n``, that is the one that makes the tangent contribution positive-definite).
 
         Like ``domain.cell_size`` this is a placeholder symbol: the real per-quadrature-point value is
         packed during assembly and overrides the context entry everywhere it is used.
@@ -3561,15 +3568,15 @@ class TrialFunction(Placeholder):
         if not hasattr(dom, "context") or not hasattr(dom, "_boundary_regions"):
             raise TypeError(f"u.gap: `domain=` must be a jno domain, got {type(dom).__name__}.")
         breg = getattr(dom, "_boundary_regions", {}) or {}
-        for tag in (slave, master):
+        for tag in (secondary, main):
             if tag not in breg:
                 raise ValueError(
                     f"u.gap: {tag!r} is not a boundary region on this domain. Known: {sorted(breg)}. "
                     "Tag each side of the interface first -- a non-conforming Shape.regions names them "
                     "'a|b.a' / 'a|b.b' automatically."
                 )
-        if slave == master:
-            raise ValueError("u.gap: the slave and master faces must be different regions.")
+        if secondary == main:
+            raise ValueError("u.gap: the secondary and main faces must be different regions.")
         _dim = int(getattr(dom, "dimension", 0) or 0)
         if self.value_shape != (_dim,):
             raise ValueError(
@@ -3578,15 +3585,15 @@ class TrialFunction(Placeholder):
                 f"Contact is a vector concept -- build the field with fem_symbols(value_shape=({_dim},))."
             )
 
-        key = f"gap_{slave}"
+        key = f"gap_{secondary}"
         pairs = dom.__dict__.setdefault("_contact_pairs", {})
         prev = pairs.get(key)
-        if prev is not None and prev[:2] != (slave, master):
+        if prev is not None and prev[:2] != (secondary, main):
             raise ValueError(
-                f"u.gap: {slave!r} is already the slave face of a gap against {prev[1]!r}; a face "
-                "carries at most one gap. Use a distinct slave tag for the second pair."
+                f"u.gap: {secondary!r} is already the secondary face of a gap against {prev[1]!r}; a face "
+                "carries at most one gap. Use a distinct secondary tag for the second pair."
             )
-        pairs[key] = (slave, master, self.field_key)
+        pairs[key] = (secondary, main, self.field_key)
         if key not in dom.context:  # placeholder so the Variable constructs; assembly packs the real g
             import numpy as _np
 

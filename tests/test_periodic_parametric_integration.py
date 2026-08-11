@@ -153,7 +153,7 @@ class TestPeriodicReductionStructure:
         assert P.shape[1] < n_full  # reduced columns
         assert block.metadata["full_state_size"] == n_full
         assert block.metadata["reduced_state_size"] == P.shape[1]
-        # Each row of P selects exactly one master DOF (partition-of-unity rows).
+        # Each row of P selects exactly one main DOF (partition-of-unity rows).
         assert np.allclose(P.sum(axis=1), 1.0)
 
     def test_periodic_block_carries_reduced_system_and_prolongation(self):
@@ -280,7 +280,7 @@ class TestPeriodicMeshGuard:
     def test_multidirection_without_tag_predicates_now_accepted(self):
         """Auto-generated face tags (no ``domain.tag`` predicate) now carry their shared corners: a
         boundary face is chained as an *open* edge chain that keeps both endpoints, so each corner
-        belongs to every face it touches (a slave in two directions). jno.fem therefore ACCEPTS
+        belongs to every face it touches (a secondary in two directions). jno.fem therefore ACCEPTS
         multidirectional periodicity on auto tags -- here in the transient + parametric setting --
         instead of rejecting it. The full numeric solve on auto faces is verified in
         test_fem_periodic_unstructured.py; this locks in the accept path and the shared-corner mesh
@@ -298,7 +298,7 @@ class TestPeriodicMeshGuard:
         xt, yt, _ = dom.variable("top", split=True)
 
         # The invariant the accept path relies on: the (0,0) corner belongs to BOTH perpendicular
-        # faces' auto tags (left AND bottom), so it resolves as a slave in two directions.
+        # faces' auto tags (left AND bottom), so it resolves as a secondary in two directions.
         pts0 = np.asarray(dom.mesh.points)
         c00 = int(np.argmin(np.sum(pts0[:, :2] ** 2, axis=1)))
         assert c00 in set(np.asarray(dom.tag_indices["left"]).ravel().tolist())

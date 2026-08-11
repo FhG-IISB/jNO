@@ -1,9 +1,9 @@
 """The interface frame that tied/periodic ties project through.
 
-Matching a slave node against the master face means comparing the two **in the interface**, with the
+Matching a secondary node against the main face means comparing the two **in the interface**, with the
 across-interface coordinate removed. That used to be done by dropping the single global axis whose tag
 means differed most, which assumes the two faces are planar, axis-aligned and separated by a pure
-translation along that axis. :func:`_interface_frame` replaces it with an SVD fit of the master face's
+translation along that axis. :func:`_interface_frame` replaces it with an SVD fit of the main face's
 own tangent plane.
 
 Two things are checked here:
@@ -18,8 +18,8 @@ Two things are checked here:
 
 **Not** covered, because it is not supported by either the old or the new code: a *sheared* lattice,
 where the offset between the two faces has a component **along** the interface. Projecting onto the
-tangent plane removes the across-interface offset only, so an in-plane shift would tie each slave to
-the wrong master location. A periodic cell whose lattice vector is normal to its faces is fine.
+tangent plane removes the across-interface offset only, so an in-plane shift would tie each secondary to
+the wrong main location. A periodic cell whose lattice vector is normal to its faces is fine.
 """
 
 import jax
@@ -34,7 +34,7 @@ from jno.utils.solver.fem_utils import (
     _faces_span_the_same_extent,
     _facet_dual_coeffs,
     _interface_frame,
-    _master_covers_slave_3d,
+    _main_covers_secondary_3d,
     _mortar_rows_2d,
     _mortar_rows_3d,
     _periodic_facet_weights,
@@ -45,7 +45,7 @@ from jno.utils.solver.fem_utils import (
     _tri_shape,
     build_periodic_prolongation,
     interface_gap_data,
-    master_trace_weights,
+    main_trace_weights,
 )
 
 
@@ -113,8 +113,8 @@ def test_frame_fits_a_face_whose_normal_is_not_a_global_axis():
 
 
 def test_frame_handles_coincident_faces():
-    """The tied case: master and slave occupy the SAME plane, so the mean difference is ~0 and the
-    old axis-drop had nothing to key on. The frame comes from the master face's own geometry, so it
+    """The tied case: main and secondary occupy the SAME plane, so the mean difference is ~0 and the
+    old axis-drop had nothing to key on. The frame comes from the main face's own geometry, so it
     is unaffected."""
     m = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]])
     s = np.array([[0.3, 0.2, 0.0], [0.6, 0.7, 0.0]])
@@ -126,8 +126,8 @@ def test_frame_handles_coincident_faces():
 
 
 def test_frame_is_empty_in_1d():
-    """A 1-D interface is a single point: no in-interface coordinate exists, and every slave ties to
-    the master exactly (distance 0), which is what dropping the only axis did."""
+    """A 1-D interface is a single point: no in-interface coordinate exists, and every secondary ties to
+    the main exactly (distance 0), which is what dropping the only axis did."""
     frame, origin = _interface_frame(np.array([[1.0]]), np.array([[0.0]]))
     assert frame.shape == (0, 1)
     loc = (np.array([[0.0], [1.0]]) - origin) @ frame.T
@@ -152,13 +152,13 @@ def test_frame_refuses_a_point_face():
 # ------------------------------------------------------- end-to-end through the prolongation
 
 
-def _coincident_faces(slave_uv, *, z=0.0):
-    """A master unit square (4 corners, 2 triangles) and a slave node set in the SAME plane."""
-    master = np.array([[0.0, 0.0, z], [1.0, 0.0, z], [1.0, 1.0, z], [0.0, 1.0, z]])
+def _coincident_faces(secondary_uv, *, z=0.0):
+    """A main unit square (4 corners, 2 triangles) and a secondary node set in the SAME plane."""
+    main = np.array([[0.0, 0.0, z], [1.0, 0.0, z], [1.0, 1.0, z], [0.0, 1.0, z]])
     tris = np.array([[0, 1, 2], [0, 2, 3]])
-    slave = np.column_stack([slave_uv, np.full(len(slave_uv), z)])
-    pts = np.vstack([master, slave])
-    tags = {"a": np.arange(4), "b": np.arange(4, 4 + len(slave))}
+    secondary = np.column_stack([secondary_uv, np.full(len(secondary_uv), z)])
+    pts = np.vstack([main, secondary])
+    tags = {"a": np.arange(4), "b": np.arange(4, 4 + len(secondary))}
     return pts, tags, {"a": tris}
 
 
@@ -171,7 +171,7 @@ def test_tied_coincident_interface_reproduces_constant_and_linear():
     P = np.asarray(res["P_node"].todense())
     kept = np.asarray(res["kept_nodes"])
 
-    assert res["n_red"] == 4  # the 5 slave nodes are eliminated onto the 4 master corners
+    assert res["n_red"] == 4  # the 5 secondary nodes are eliminated onto the 4 main corners
     assert np.allclose(P.sum(axis=1), 1.0)
     for a, b, c in [(0.0, 0.0, 1.0), (2.0, -1.5, 0.3)]:
         field = a * pts[:, 0] + b * pts[:, 1] + c
@@ -181,11 +181,11 @@ def test_tied_coincident_interface_reproduces_constant_and_linear():
 def test_tied_interface_on_a_tilted_plane_reproduces_linear():
     """Same, on a plane whose normal is not a global axis — the frame has to be fitted, not guessed."""
     t1, t2, n = _plane_frame([1.0, 1.0, 1.0])
-    master, tris = _square_patch(np.zeros(3), t1, t2)
+    main, tris = _square_patch(np.zeros(3), t1, t2)
     uv = np.array([[0.3, 0.2], [0.7, 0.6], [0.25, 0.65]])
-    slave = uv[:, :1] * t1 + uv[:, 1:] * t2
-    pts = np.vstack([master, slave])
-    tags = {"a": np.arange(4), "b": np.arange(4, 4 + len(slave))}
+    secondary = uv[:, :1] * t1 + uv[:, 1:] * t2
+    pts = np.vstack([main, secondary])
+    tags = {"a": np.arange(4), "b": np.arange(4, 4 + len(secondary))}
     res = build_periodic_prolongation(pts, [("a", "b")], tags, facets={"a": tris})
     P = np.asarray(res["P_node"].todense())
     kept = np.asarray(res["kept_nodes"])
@@ -196,7 +196,7 @@ def test_tied_interface_on_a_tilted_plane_reproduces_linear():
 
 
 def test_tied_interface_survives_a_high_density_ratio():
-    """Extreme: one master facet pair against a 1:8-refined slave face (81 nodes)."""
+    """Extreme: one main facet pair against a 1:8-refined secondary face (81 nodes)."""
     g = np.linspace(0.02, 0.98, 9)
     uv = np.stack(np.meshgrid(g, g, indexing="ij"), axis=-1).reshape(-1, 2)
     pts, tags, facets = _coincident_faces(uv)
@@ -209,10 +209,10 @@ def test_tied_interface_survives_a_high_density_ratio():
     assert np.allclose(P @ field[kept], field, atol=1e-10)
 
 
-def test_tied_interface_with_a_slave_node_on_a_master_node():
-    """Degenerate overlap: a slave node coincident with a master node ties exactly (distance 0),
+def test_tied_interface_with_a_secondary_node_on_a_main_node():
+    """Degenerate overlap: a secondary node coincident with a main node ties exactly (distance 0),
     the rest interpolate. Both branches must coexist in one tie."""
-    uv = np.array([[0.0, 0.0], [1.0, 1.0], [0.4, 0.3]])  # first two land ON master corners
+    uv = np.array([[0.0, 0.0], [1.0, 1.0], [0.4, 0.3]])  # first two land ON main corners
     pts, tags, facets = _coincident_faces(uv)
     res = build_periodic_prolongation(pts, [("a", "b")], tags, facets=facets)
     P = np.asarray(res["P_node"].todense())
@@ -228,18 +228,18 @@ def test_tied_interface_with_a_slave_node_on_a_master_node():
 #
 # * A **linear** field transfers exactly under BOTH mortar and node-to-segment collocation, so the
 #   2-D linear patch test does not tell them apart. (It still gates the new code's correctness.)
-# * When the master nodes are a subset of the slave nodes -- e.g. 5 master against 9 slave nodes on
-#   the same interval -- the master basis lies *inside* the slave space, the dual basis reproduces it
+# * When the main nodes are a subset of the secondary nodes -- e.g. 5 main against 9 secondary nodes on
+#   the same interval -- the main basis lies *inside* the secondary space, the dual basis reproduces it
 #   pointwise, and the two couplings are identical to machine precision. Any test built on nested
 #   meshes is therefore vacuous.
-# * The difference appears on **non-nested** meshes for a field the master space cannot represent:
+# * The difference appears on **non-nested** meshes for a field the main space cannot represent:
 #   mortar returns the L2 projection, collocation the pointwise value. Measured below.
 #
 # The coupling's real payoff is 3-D, where point-in-triangle collocation is not a projection at all.
 
 
-def _edge_faces(n_master, n_slave, *, order=1):
-    """Master (x=1) and slave (x=0) edge faces, both spanning y in [0, 1], facets for BOTH sides."""
+def _edge_faces(n_main, n_secondary, *, order=1):
+    """Main (x=1) and secondary (x=0) edge faces, both spanning y in [0, 1], facets for BOTH sides."""
 
     def side(x, n):
         y = np.linspace(0.0, 1.0, n)
@@ -249,8 +249,8 @@ def _edge_faces(n_master, n_slave, *, order=1):
         mids = np.column_stack([np.full(n - 1, x), 0.5 * (y[:-1] + y[1:])])
         return pts, mids
 
-    m_pts, m_mid = side(1.0, n_master)
-    s_pts, s_mid = side(0.0, n_slave)
+    m_pts, m_mid = side(1.0, n_main)
+    s_pts, s_mid = side(0.0, n_secondary)
     blocks = [m_pts, s_pts] if order == 1 else [m_pts, m_mid, s_pts, s_mid]
     pts = np.vstack(blocks)
     off = np.cumsum([0] + [len(b) for b in blocks])
@@ -267,9 +267,9 @@ def _edge_faces(n_master, n_slave, *, order=1):
     return pts, tags, {"r": mf, "l": sf}
 
 
-def _apply(rows, master_vals_by_id):
-    """Evaluate a row dict {slave: [(master, w)]} against master nodal values keyed by node id."""
-    return {s: sum(w * master_vals_by_id[m] for m, w in ws) for s, ws in rows.items()}
+def _apply(rows, main_vals_by_id):
+    """Evaluate a row dict {secondary: [(main, w)]} against main nodal values keyed by node id."""
+    return {s: sum(w * main_vals_by_id[m] for m, w in ws) for s, ws in rows.items()}
 
 
 def test_dual_basis_is_biorthogonal():
@@ -288,17 +288,17 @@ def test_dual_basis_is_biorthogonal():
 
 
 def test_mortar_is_selected_and_reported():
-    """Both faces faceted and co-extensive -> mortar. Master facets only -> collocation. The
+    """Both faces faceted and co-extensive -> mortar. Main facets only -> collocation. The
     ``coupling`` key says which, so a caller never has to infer it."""
     pts, tags, facets = _edge_faces(5, 9)
     assert build_periodic_prolongation(pts, [("r", "l")], tags, facets=facets)["coupling"] == "mortar"
-    only_master = {"r": facets["r"]}
-    assert build_periodic_prolongation(pts, [("r", "l")], tags, facets=only_master)["coupling"] == "collocated"
+    only_main = {"r": facets["r"]}
+    assert build_periodic_prolongation(pts, [("r", "l")], tags, facets=only_main)["coupling"] == "collocated"
 
 
 @pytest.mark.parametrize("order,field", [(1, lambda y: 2.0 * y - 0.5), (2, lambda y: 0.7 * y**2 - 0.2 * y + 0.1)])
-def test_mortar_transfers_the_master_space_exactly(order, field):
-    """Correctness gate: a field the master facets represent exactly transfers exactly (linear for
+def test_mortar_transfers_the_main_space_exactly(order, field):
+    """Correctness gate: a field the main facets represent exactly transfers exactly (linear for
     P1 edges, quadratic for P2). Requires the assembled D to be genuinely diagonal."""
     pts, tags, facets = _edge_faces(5, 8, order=order)
     res = build_periodic_prolongation(pts, [("r", "l")], tags, facets=facets)
@@ -311,13 +311,13 @@ def test_mortar_transfers_the_master_space_exactly(order, field):
 
 
 def test_mortar_is_the_l2_projection_not_collocation():
-    """The honest discriminator. On NON-nested meshes and a field outside the master space the two
+    """The honest discriminator. On NON-nested meshes and a field outside the main space the two
     couplings differ, and mortar is the L2 projection -- closer to the true field than the pointwise
-    value. On nested meshes (master nodes a subset of slave nodes) they provably coincide."""
+    value. On nested meshes (main nodes a subset of secondary nodes) they provably coincide."""
     f = lambda y: np.sin(3.0 * y)  # noqa: E731
 
-    def compare(n_master, n_slave):
-        pts, _tags, fc = _edge_faces(n_master, n_slave)
+    def compare(n_main, n_secondary):
+        pts, _tags, fc = _edge_faces(n_main, n_secondary)
         loc = pts[:, 1:2]
         rows = _mortar_rows_2d(fc["l"], fc["r"], loc, span=1.0)
         vals = {int(i): f(pts[i, 1]) for i in np.unique(fc["r"])}
@@ -331,8 +331,8 @@ def test_mortar_is_the_l2_projection_not_collocation():
     assert gap > 1e-3, "non-nested meshes must separate the two couplings"
     assert e_mortar < e_colloc, "the L2 projection should beat pointwise collocation"
 
-    gap_nested, _, _ = compare(5, 9)  # 9 = 2*5-1 -> every master node is a slave node
-    assert gap_nested < 1e-12, "nested meshes make the master basis a subset of the slave space"
+    gap_nested, _, _ = compare(5, 9)  # 9 = 2*5-1 -> every main node is a secondary node
+    assert gap_nested < 1e-12, "nested meshes make the main basis a subset of the secondary space"
 
 
 def test_mortar_rows_match_an_independent_fine_quadrature():
@@ -373,15 +373,15 @@ def test_mortar_rows_match_an_independent_fine_quadrature():
         got = np.zeros(len(m_nodes))
         for m, w in rows[node]:
             got[m_at[m]] = w
-        assert np.allclose(got, ref, atol=2e-4), f"slave {node}: {got} vs {ref}"
+        assert np.allclose(got, ref, atol=2e-4), f"secondary {node}: {got} vs {ref}"
 
 
 def test_extent_mismatch_keeps_collocation():
-    """A face tagged without its corners is shorter than its partner; the master then does not cover
-    the slave and an integral over the slave face is not well posed. That tie must fall back to
-    collocation and REPORT it, not integrate over a domain the master does not span."""
+    """A face tagged without its corners is shorter than its partner; the main then does not cover
+    the secondary and an integral over the secondary face is not well posed. That tie must fall back to
+    collocation and REPORT it, not integrate over a domain the main does not span."""
     pts, tags, facets = _edge_faces(5, 9)
-    trimmed = facets["r"][1:-1]  # drop the master's two end facets -> master no longer spans the slave
+    trimmed = facets["r"][1:-1]  # drop the main's two end facets -> main no longer spans the secondary
     keep = np.unique(trimmed)
     res = build_periodic_prolongation(
         pts, [("r", "l")], {"r": keep, "l": tags["l"]}, facets={"r": trimmed, "l": facets["l"]}
@@ -391,25 +391,25 @@ def test_extent_mismatch_keeps_collocation():
     assert _faces_span_the_same_extent(facets["l"], facets["r"], pts[:, 1:2], span=1.0)
 
 
-def test_hole_in_the_master_face_raises():
-    """Same extent but a missing interior facet: the slave face IS covered at its ends, so the
+def test_hole_in_the_main_face_raises():
+    """Same extent but a missing interior facet: the secondary face IS covered at its ends, so the
     extent gate passes and the per-facet coverage check has to catch the hole."""
     pts, _tags, facets = _edge_faces(6, 11)
-    holed = np.delete(facets["r"], 2, axis=0)  # remove an interior master facet
-    with pytest.raises(ValueError, match="HOLE in the master face"):
+    holed = np.delete(facets["r"], 2, axis=0)  # remove an interior main facet
+    with pytest.raises(ValueError, match="HOLE in the main face"):
         _mortar_rows_2d(facets["l"], holed, pts[:, 1:2], span=1.0)
 
 
 def test_mortar_survives_a_high_density_ratio_either_way():
-    """Extremes: 1:8 refinement, the reverse (master finer than slave), and a single master facet.
+    """Extremes: 1:8 refinement, the reverse (main finer than secondary), and a single main facet.
 
-    Node counts are chosen so the slave nodes do NOT all land on master nodes -- e.g. 17 master
-    against 3 slave nodes is fully conforming (0, 0.5, 1 are all master nodes) and would exercise
+    Node counts are chosen so the secondary nodes do NOT all land on main nodes -- e.g. 17 main
+    against 3 secondary nodes is fully conforming (0, 0.5, 1 are all main nodes) and would exercise
     nothing."""
-    for n_master, n_slave in [(3, 17), (16, 7), (2, 25)]:
-        pts, tags, facets = _edge_faces(n_master, n_slave)
+    for n_main, n_secondary in [(3, 17), (16, 7), (2, 25)]:
+        pts, tags, facets = _edge_faces(n_main, n_secondary)
         res = build_periodic_prolongation(pts, [("r", "l")], tags, facets=facets)
-        assert res["coupling"] == "mortar", f"master {n_master}, slave {n_slave}"
+        assert res["coupling"] == "mortar", f"main {n_main}, secondary {n_secondary}"
         P = np.asarray(res["P_node"].todense())
         kept = np.asarray(res["kept_nodes"])
         assert np.allclose(P.sum(axis=1), 1.0)
@@ -422,7 +422,7 @@ def test_mortar_survives_a_high_density_ratio_either_way():
 # The 3-D interface is where the segmentation is real geometry: triangle-against-triangle polygon
 # clipping rather than an interval intersection.
 #
-# It is NOT, however, where the patch test starts to discriminate. jNO enforces a tie by master-slave
+# It is NOT, however, where the patch test starts to discriminate. jNO enforces a tie by main-secondary
 # elimination through a prolongation P, and such a scheme reproduces a linear solution exactly
 # whenever P does -- which node-to-segment barycentric interpolation does, in 3-D as in 2-D. The
 # textbook "node-to-segment fails the patch test" result concerns contact formulations that distribute
@@ -431,7 +431,7 @@ def test_mortar_survives_a_high_density_ratio_either_way():
 #
 # What separates them is that mortar imposes the INTEGRAL constraint: asserted directly below by
 # checking that the collocated weights leave a non-zero mortar residual while the mortar weights do
-# not, and quantified as a 4-40% lower RMS error on fields the master space cannot represent.
+# not, and quantified as a 4-40% lower RMS error on fields the main space cannot represent.
 
 
 def _tri_grid(n, z, base):
@@ -449,10 +449,10 @@ def _tri_grid(n, z, base):
     return pts, np.array(tris)
 
 
-def _tri_faces(n_master, n_slave):
-    """Master (z=1) and slave (z=0) triangulated faces, both covering the unit square."""
-    mp, mt = _tri_grid(n_master, 1.0, 0)
-    sp, st = _tri_grid(n_slave, 0.0, len(mp))
+def _tri_faces(n_main, n_secondary):
+    """Main (z=1) and secondary (z=0) triangulated faces, both covering the unit square."""
+    mp, mt = _tri_grid(n_main, 1.0, 0)
+    sp, st = _tri_grid(n_secondary, 0.0, len(mp))
     pts = np.vstack([mp, sp])
     tags = {"top": np.unique(mt), "bot": np.unique(st)}
     return pts, tags, {"top": mt, "bot": st}
@@ -527,10 +527,10 @@ def test_mortar_3d_transfers_a_linear_field_exactly():
 
 
 def _mortar_residual(rows, s_facets, m_facets, loc, field, nq=20):
-    """``int psi_i (u_s - u_m.Phi) dG`` by independent per-slave-facet quadrature: every point is
-    located in the master face by barycentric search, so no clipping is involved.
+    """``int psi_i (u_s - u_m.Phi) dG`` by independent per-secondary-facet quadrature: every point is
+    located in the main face by barycentric search, so no clipping is involved.
 
-    The integrand is only piecewise smooth (the master field kinks at every master facet edge), so
+    The integrand is only piecewise smooth (the main field kinks at every main facet edge), so
     this converges in ``nq`` rather than being exact -- which is why the test below asserts a ratio
     and a convergence trend instead of an absolute threshold."""
     xy = np.asarray(loc, float)
@@ -585,11 +585,11 @@ def test_mortar_satisfies_the_integral_constraint_and_collocation_does_not():
     assert r_colloc[20] > 0.9 * r_colloc[8], "collocation residual must persist under refinement"
 
 
-@pytest.mark.parametrize("n_master,n_slave", [(3, 7), (4, 7), (5, 11), (7, 11)])
-def test_mortar_3d_is_more_accurate_than_collocation(n_master, n_slave):
-    """Quantify the gain honestly: RMS error over the slave nodes, on a field neither space
+@pytest.mark.parametrize("n_main,n_secondary", [(3, 7), (4, 7), (5, 11), (7, 11)])
+def test_mortar_3d_is_more_accurate_than_collocation(n_main, n_secondary):
+    """Quantify the gain honestly: RMS error over the secondary nodes, on a field neither space
     represents. Mortar is the L2 projection, so it should win -- measured 4-40% here."""
-    pts, _tags, fc = _tri_faces(n_master, n_slave)
+    pts, _tags, fc = _tri_faces(n_main, n_secondary)
     loc = pts[:, :2]
     f = lambda p: np.sin(3.0 * p[0]) * np.cos(2.5 * p[1])  # noqa: E731
     field = {int(i): f(pts[i]) for i in np.unique(fc["top"])}
@@ -602,11 +602,11 @@ def test_mortar_3d_is_more_accurate_than_collocation(n_master, n_slave):
     assert rms(mortar - exact) < rms(colloc - exact)
 
 
-def test_mortar_3d_gate_rejects_a_master_that_does_not_cover_the_slave():
+def test_mortar_3d_gate_rejects_a_main_that_does_not_cover_the_secondary():
     pts, tags, facets = _tri_faces(4, 7)
-    trimmed = facets["top"][:-6]  # drop a strip of master triangles -> slave corner no longer covered
-    assert _master_covers_slave_3d(facets["bot"], facets["top"], pts[:, :2])
-    assert not _master_covers_slave_3d(facets["bot"], trimmed, pts[:, :2])
+    trimmed = facets["top"][:-6]  # drop a strip of main triangles -> secondary corner no longer covered
+    assert _main_covers_secondary_3d(facets["bot"], facets["top"], pts[:, :2])
+    assert not _main_covers_secondary_3d(facets["bot"], trimmed, pts[:, :2])
     res = build_periodic_prolongation(
         pts,
         [("top", "bot")],
@@ -616,12 +616,12 @@ def test_mortar_3d_gate_rejects_a_master_that_does_not_cover_the_slave():
     assert res["coupling"] == "collocated"
 
 
-def test_mortar_3d_hole_in_the_master_face_raises():
+def test_mortar_3d_hole_in_the_main_face_raises():
     """Covered at the vertices but missing an interior triangle: the gate passes and the per-facet
     area conservation has to catch it. A bad clip yields a plausible wrong answer, so this raises."""
     pts, _tags, facets = _tri_faces(4, 9)
     holed = np.delete(facets["top"], 10, axis=0)
-    with pytest.raises(ValueError, match="HOLE in the master face"):
+    with pytest.raises(ValueError, match="HOLE in the main face"):
         _mortar_rows_3d(facets["bot"], holed, pts[:, :2], span=1.0)
 
 
@@ -657,7 +657,7 @@ def test_p2_triangles_have_no_dual_basis_and_keep_collocation():
 
 
 def test_mortar_3d_survives_a_high_density_ratio():
-    """Extreme: a single master facet pair against a 1:12-refined slave face."""
+    """Extreme: a single main facet pair against a 1:12-refined secondary face."""
     pts, tags, facets = _tri_faces(1, 12)
     res = build_periodic_prolongation(pts, [("top", "bot")], tags, facets=facets)
     assert res["coupling"] == "mortar"
@@ -668,29 +668,29 @@ def test_mortar_3d_survives_a_high_density_ratio():
     assert np.allclose(P @ field[kept], field, atol=1e-10)
 
 
-# ------------------------------------------------- the master-side trace at arbitrary points
+# ------------------------------------------------- the main-side trace at arbitrary points
 #
-# A tie only ever needs the master field AT SLAVE NODES, so that is all `_periodic_facet_weights`
+# A tie only ever needs the main field AT SECONDARY NODES, so that is all `_periodic_facet_weights`
 # offers. Contact needs it at **quadrature points**: the signed gap `g = g0 + n.(u_s - u_m.Phi)` is
-# integrated over the slave face, so the two sides must be comparable wherever the rule samples them.
-# `master_trace_weights` is that generalisation, batched -- and the two must agree where they overlap.
+# integrated over the secondary face, so the two sides must be comparable wherever the rule samples them.
+# `main_trace_weights` is that generalisation, batched -- and the two must agree where they overlap.
 
 
-def test_trace_weights_reproduce_the_master_space_at_off_node_points():
-    """The property that makes it a trace: exact for anything the master facets represent, evaluated
-    at points that are deliberately NOT master nodes."""
+def test_trace_weights_reproduce_the_main_space_at_off_node_points():
+    """The property that makes it a trace: exact for anything the main facets represent, evaluated
+    at points that are deliberately NOT main nodes."""
     ym = np.linspace(0.0, 1.0, 5)
     pts = np.column_stack([np.ones(5), ym])
     mf = np.column_stack([np.arange(4), np.arange(1, 5)])
     q = np.array([[0.03], [0.37], [0.5], [0.99]])
-    ids, w = master_trace_weights(q, mf, pts[:, 1:2])
+    ids, w = main_trace_weights(q, mf, pts[:, 1:2])
     assert np.allclose(w.sum(axis=1), 1.0)
     got = (w * (3.0 * pts[ids, 1] - 1.0)).sum(axis=1)
     assert np.allclose(got, 3.0 * q[:, 0] - 1.0, atol=1e-12)
 
     p3, tris = _tri_grid(3, 1.0, 0)
     q3 = np.array([[0.13, 0.71], [0.5, 0.5], [0.92, 0.08], [0.33, 0.33]])
-    ids3, w3 = master_trace_weights(q3, tris, p3[:, :2])
+    ids3, w3 = main_trace_weights(q3, tris, p3[:, :2])
     assert np.allclose(w3.sum(axis=1), 1.0)
     f = lambda p: 2.0 * p[..., 0] - 1.5 * p[..., 1] + 0.3  # noqa: E731
     assert np.allclose((w3 * f(p3[ids3])).sum(axis=1), f(q3), atol=1e-12)
@@ -698,11 +698,11 @@ def test_trace_weights_reproduce_the_master_space_at_off_node_points():
 
 def test_trace_weights_agree_with_the_tie_weights_at_node_locations():
     """Where the two overlap they must be the same operator — otherwise a contact gap and a tie would
-    disagree about what 'the master value here' means."""
+    disagree about what 'the main value here' means."""
     p3, tris = _tri_grid(3, 1.0, 0)
     loc = p3[:, :2]
     q = np.array([[0.13, 0.71], [0.5, 0.5], [0.2, 0.05]])
-    ids, w = master_trace_weights(q, tris, loc)
+    ids, w = main_trace_weights(q, tris, loc)
     # Compare the operators by what they COMPUTE, not by which nodes they list: a query on a shared
     # edge has a zero barycentric, and the two may name different (equally valid) adjacent triangles.
     for i, pt in enumerate(q):
@@ -718,7 +718,7 @@ def test_trace_weights_clamp_outside_the_face():
     """A query off the face is clamped to the nearest facet rather than extrapolated: the weights stay
     a partition of unity, so a constant field is still reproduced and nothing blows up."""
     p3, tris = _tri_grid(2, 1.0, 0)
-    _ids, w = master_trace_weights(np.array([[1.4, 0.5], [-0.2, -0.2]]), tris, p3[:, :2])
+    _ids, w = main_trace_weights(np.array([[1.4, 0.5], [-0.2, -0.2]]), tris, p3[:, :2])
     assert np.allclose(w.sum(axis=1), 1.0)
     assert np.all(w >= -1e-12), "clamped weights must stay non-negative (no extrapolation)"
 
@@ -757,19 +757,29 @@ def test_the_shape_tabulators_refuse_beyond_p2():
 
 def test_trace_weights_handle_empty_input():
     p3, tris = _tri_grid(2, 1.0, 0)
-    ids, w = master_trace_weights(np.zeros((0, 2)), tris, p3[:, :2])
+    ids, w = main_trace_weights(np.zeros((0, 2)), tris, p3[:, :2])
     assert ids.shape == (0, 3) and w.shape == (0, 3)
 
 
 # ------------------------------------------------------------------ the contact gap's geometry
 #
-# `g = g0 + n.(u_s - u_m.Phi)` splits into a part fixed by the geometry and a part that moves with the
+# `g = g0 - n.(u_s - u_m.Phi)` splits into a part fixed by the geometry and a part that moves with the
 # solution. `interface_gap_data` precomputes both: `g0` (the initial along-normal separation) and the
-# gather that makes `u_m.Phi` a weighted sum of master DOFs — hence differentiable in the solution,
+# gather that makes `u_m.Phi` a weighted sum of main DOFs — hence differentiable in the solution,
 # though NOT in the mesh coordinates, since the projection is frozen at build time.
+#
+# `n` is the SECONDARY's outward normal, which points at the main — so a secondary face standing off ABOVE a
+# main at z=0 is handed `-n_main`, i.e. [0,0,-1]. These tests are the only place the orientation is
+# stated as an input rather than inherited from the mesh, so they pass it explicitly; `_secondary_n` names
+# it once so a future reader cannot mistake it for the main's.
 
 
-def _master_square(n=3, z=0.0, tilt=None):
+def _secondary_n(main_normal, n_rows):
+    """The secondary's outward normal for a secondary standing off along `+main_normal`: the opposite one."""
+    return np.broadcast_to(-np.asarray(main_normal, dtype=float), (n_rows, 3))
+
+
+def _main_square(n=3, z=0.0, tilt=None):
     """A triangulated unit square, optionally embedded in a tilted plane. Returns (pts, tris, normal)."""
     pts, tris = _tri_grid(n, z, 0)
     if tilt is None:
@@ -782,9 +792,9 @@ def _master_square(n=3, z=0.0, tilt=None):
 def test_initial_gap_is_the_signed_along_normal_separation(offset):
     """Zero for coincident (tied) faces, positive for a standoff, negative for initial penetration —
     the sign convention the contact pressure `max(0, lam + c*(-g))` depends on."""
-    mp, tris, n = _master_square()
+    mp, tris, n = _main_square()
     qp = np.array([[[0.2, 0.3, offset], [0.6, 0.7, offset]], [[0.5, 0.5, offset], [0.9, 0.1, offset]]])
-    ids, w, g0 = interface_gap_data(qp, tris, mp, np.broadcast_to(n, (4, 3)))
+    ids, w, g0 = interface_gap_data(qp, tris, mp, _secondary_n(n, 4))
     assert ids.shape == (2, 2, 3) and w.shape == (2, 2, 3) and g0.shape == (2, 2)  # leading dims kept
     assert np.allclose(w.sum(axis=-1), 1.0)
     assert np.allclose(g0, offset, atol=1e-12)
@@ -792,35 +802,35 @@ def test_initial_gap_is_the_signed_along_normal_separation(offset):
 
 def test_initial_gap_on_a_tilted_interface():
     """The separation is measured along the interface's OWN normal, not a global axis — the frame is
-    fitted to the master face exactly as a tie's is."""
-    mp, tris, n = _master_square(tilt=[0.0, -1.0, 1.0])
+    fitted to the main face exactly as a tie's is."""
+    mp, tris, n = _main_square(tilt=[0.0, -1.0, 1.0])
     uv = np.array([[0.3, 0.4], [0.6, 0.2]])
     t1, t2, _ = _plane_frame([0.0, -1.0, 1.0])
     qp = (uv @ np.stack([t1, t2]))[None, :, :] + 0.37 * n
-    _ids, _w, g0 = interface_gap_data(qp, tris, mp, np.broadcast_to(n, (2, 3)))
+    _ids, _w, g0 = interface_gap_data(qp, tris, mp, _secondary_n(n, 2))
     assert np.allclose(g0, 0.37, atol=1e-12)
 
 
 def test_initial_gap_varies_over_the_face():
-    """A slave face that is not parallel to the master gives a per-point gap, not one number."""
-    mp, tris, n = _master_square()
+    """A secondary face that is not parallel to the main gives a per-point gap, not one number."""
+    mp, tris, n = _main_square()
     heights = np.array([0.05, 0.2, 0.35])
     qp = np.stack([np.array([0.25, 0.25, h]) for h in heights])[None, :, :]
-    _ids, _w, g0 = interface_gap_data(qp, tris, mp, np.broadcast_to(n, (3, 3)))
+    _ids, _w, g0 = interface_gap_data(qp, tris, mp, _secondary_n(n, 3))
     assert np.allclose(g0.ravel(), heights, atol=1e-12)
 
 
-def test_gap_gather_reads_the_master_field_exactly():
-    """The solution-dependent half: `u_m . Phi` must reproduce anything the master facets represent,
+def test_gap_gather_reads_the_main_field_exactly():
+    """The solution-dependent half: `u_m . Phi` must reproduce anything the main facets represent,
     so a rigid relative motion produces exactly that change in gap and nothing spurious."""
-    mp, tris, n = _master_square()
+    mp, tris, n = _main_square()
     qp = np.array([[[0.2, 0.3, 0.1], [0.63, 0.71, 0.1], [0.5, 0.5, 0.1]]])
-    ids, w, g0 = interface_gap_data(qp, tris, mp, np.broadcast_to(n, (3, 3)))
+    ids, w, g0 = interface_gap_data(qp, tris, mp, _secondary_n(n, 3))
     f = lambda p: 2.0 * p[..., 0] - 1.5 * p[..., 1] + 0.3  # noqa: E731
     u_m = (w * f(mp[ids])).sum(axis=-1)
     assert np.allclose(u_m, f(qp[..., :]), atol=1e-12)
-    # A uniform master displacement must read back exactly (partition of unity through the gather),
-    # so moving the master body rigidly by w0 closes the gap by exactly w0 and nothing else.
+    # A uniform main displacement must read back exactly (partition of unity through the gather),
+    # so moving the main body rigidly by w0 closes the gap by exactly w0 and nothing else.
     w0 = 0.04
     assert np.allclose((w * np.full(ids.shape, w0)).sum(axis=-1), w0, atol=1e-15)
     assert np.allclose(g0, 0.1, atol=1e-12)  # and the standoff itself is what was built
@@ -829,10 +839,10 @@ def test_gap_gather_reads_the_master_field_exactly():
 def test_periodic_pair_still_ties_across_a_normal_offset():
     """No-regression at the prolongation level: the ordinary periodic case (faces separated along
     their own normal) is unchanged — a linear in-plane field is still reproduced exactly."""
-    master = np.array([[0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [1.0, 1.0, 1.0], [0.0, 1.0, 1.0]])
+    main = np.array([[0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [1.0, 1.0, 1.0], [0.0, 1.0, 1.0]])
     tris = np.array([[0, 1, 2], [0, 2, 3]])
-    slave = np.array([[0.3, 0.2, 0.0], [0.7, 0.6, 0.0], [0.5, 0.5, 0.0]])
-    pts = np.vstack([master, slave])
+    secondary = np.array([[0.3, 0.2, 0.0], [0.7, 0.6, 0.0], [0.5, 0.5, 0.0]])
+    pts = np.vstack([main, secondary])
     tags = {"top": np.arange(4), "bot": np.arange(4, 7)}
     res = build_periodic_prolongation(pts, [("top", "bot")], tags, facets={"top": tris})
     P = np.asarray(res["P_node"].todense())

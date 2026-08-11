@@ -439,8 +439,8 @@ def _to_meshio(
 
 
 def _apply_periodic(dim, labels, periodic):
-    """gmsh ``setPeriodic`` for each ``(master_name, slave_name)`` boundary-face pair: mesh the slave face
-    as a *translated copy* of the master so opposite boundaries mesh identically (conforming) — required
+    """gmsh ``setPeriodic`` for each ``(main_name, secondary_name)`` boundary-face pair: mesh the secondary face
+    as a *translated copy* of the main so opposite boundaries mesh identically (conforming) — required
     for edge-element (Nédélec) periodic ties, whose per-edge DOFs must line up one-to-one across the cell.
     The translation is read from the face bounding-box centroids; a pair whose faces aren't both present is
     skipped (nothing to tie)."""
@@ -457,11 +457,11 @@ def _apply_periodic(dim, labels, periodic):
         bb = np.array([gmsh.model.getBoundingBox(bdim, t) for t in tags])  # (n, 6): (xlo,ylo,zlo,xhi,yhi,zhi)
         return 0.5 * (bb[:, :3].min(axis=0) + bb[:, 3:].max(axis=0))
 
-    for master, slave in periodic:
-        m_tags, s_tags = by_name.get(master, []), by_name.get(slave, [])
+    for main, secondary in periodic:
+        m_tags, s_tags = by_name.get(main, []), by_name.get(secondary, [])
         if not m_tags or not s_tags:
             continue
-        t = _centroid(s_tags) - _centroid(m_tags)  # translation master -> slave
+        t = _centroid(s_tags) - _centroid(m_tags)  # translation main -> secondary
         affine = [1, 0, 0, t[0], 0, 1, 0, t[1], 0, 0, 1, t[2], 0, 0, 0, 1]  # row-major 4×4
         gmsh.model.mesh.setPeriodic(bdim, s_tags, m_tags, affine)
 
@@ -555,7 +555,7 @@ def build(shape, periodic=None, *, algorithm=None, threads=None, order=1):
     thread count. ``None`` uses :data:`MESH_ALGORITHM_2D` / :data:`MESH_ALGORITHM_3D` /
     :data:`MESH_THREADS`, whose docstrings record the measurements behind each default.
 
-    ``periodic`` is an optional list of ``(master_name, slave_name)`` boundary-face pairs meshed conforming
+    ``periodic`` is an optional list of ``(main_name, secondary_name)`` boundary-face pairs meshed conforming
     (via :func:`_apply_periodic`) so opposite faces line up — needed for Nédélec edge periodic ties.
 
     ``order=2`` meshes **curved (isoparametric)** geometry: gmsh places the midside nodes on the actual

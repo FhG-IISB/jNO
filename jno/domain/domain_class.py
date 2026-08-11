@@ -940,12 +940,12 @@ class domain(MeshIOMixin):
         eliminates, rather than inferring it from alphabetical order.
 
         **Order matters, and there is a right answer.** In ``u(A) - u(B)`` the first region is the
-        **slave**: its interface DOFs are eliminated in favour of an interpolation from the master. So
-        the slave must be the more finely meshed side, or the fine mesh's resolution at the interface
+        **secondary**: its interface DOFs are eliminated in favour of an interpolation from the main. So
+        the secondary must be the more finely meshed side, or the fine mesh's resolution at the interface
         is discarded. Measured on a coating/substrate tie with 81 nodes against 10::
 
-            slave = the 81-node side  ->  interface value exact       (0.00% error)
-            slave = the 10-node side  ->  interface value off by 10.62%
+            secondary = the 81-node side  ->  interface value exact       (0.00% error)
+            secondary = the 10-node side  ->  interface value off by 10.62%
 
         Nothing detects this today, and the wrong choice produces a plausible number rather than an
         error -- so pass the finer region first.
@@ -1454,6 +1454,56 @@ class domain(MeshIOMixin):
             return None
         return lambda p: region.contains(p)
 
+    def tag_node_mask(self, tag, points):
+        """Boolean mask of which ``points`` belong to ``tag`` -- the float64-safe resolution.
+
+        The companion to :meth:`_make_tag_location_fn`, and the one an assembler should use when it
+        already holds concrete coordinates. A ``domain.tag(name, where)`` predicate is evaluated **in
+        numpy float64** here rather than under JAX, because ``jnp.asarray`` truncates coordinates to
+        float32 unless x64 is enabled -- and a tag tolerance finer than float32 eps then matches no
+        point at all. ``d.tag("right", lambda x: x > 1 - 1e-9)`` on a domain reaching x = 1 is the
+        canonical case: in float32 ``1 - 1e-9`` rounds to exactly 1.0, the strict ``>`` is false for
+        every node, and an essential condition bound to that tag is dropped in silence.
+
+        Only the *user* predicate moves off the JAX path. The boundary restriction it is intersected
+        with stays where it was -- a tolerance-based proximity test against the region's own points,
+        which float32 cannot break.
+
+        Returns ``None`` when the tag is unknown, matching ``_make_tag_location_fn``.
+        """
+        import jax
+        import jax.numpy as jnp
+
+        loc = self._make_tag_location_fn(tag)
+        if loc is None:
+            return None
+        pts = np.asarray(points)
+        n = int(pts.shape[0])
+
+        def _vmapped(fn, num_args=1):
+            # Chunked for the same reason the callers chunked: a geometric region predicate tests one
+            # point against every boundary facet, so an unchunked vmap materialises (n x n_facets) --
+            # 804 MB on a realistic 3-D mesh, which exhausts the device before assembly starts.
+            pj, chunk, out = jnp.asarray(pts), 512, []
+            for s in range(0, n, chunk):
+                blk = pj[s : min(s + chunk, n)]
+                hit = jax.vmap(fn)(blk) if num_args == 1 else jax.vmap(fn)(blk, jnp.arange(s, s + blk.shape[0]))
+                out.append(np.asarray(hit).reshape(-1))
+            return np.concatenate(out) if out else np.zeros(0, dtype=bool)
+
+        where = (getattr(self, "_tag_predicates", {}) or {}).get(tag)
+        if where is not None:
+            pts64 = np.asarray(points, dtype=np.float64)
+            dim = int(self.dimension)
+            mask = np.asarray(where(*(pts64[:, i] for i in range(dim)))).reshape(-1).astype(bool)
+            full = self._boundary_regions.get("boundary", None)
+            if full is not None:
+                mask &= _vmapped(full.contains).astype(bool)
+            return mask
+
+        num_args = loc.__code__.co_argcount if hasattr(loc, "__code__") else 1
+        return _vmapped(loc, num_args).astype(bool)
+
     def tag(self, name, where, region=None):
         """Define a named region from a **spatial** predicate ``where(x, y[, z]) -> bool``.
 
@@ -1619,16 +1669,16 @@ class domain(MeshIOMixin):
                 m = RegionMask(str(region))
                 covered = m if covered is None else covered + m
             expr = expr + default * (1.0 - covered)  # cells in no listed region get `default`
-        get_logger(__name__).info(
-            f"by_region: per-region coefficient over {len(values)} region(s): {sorted(map(str, values))}"
-        )
+        # NB: get_logger's first positional is a log *directory* -- get_logger(__name__) literally
+        # creates a folder named `jno.domain.domain_class/` in the caller's cwd.
+        get_logger().info(f"by_region: per-region coefficient over {len(values)} region(s): {sorted(map(str, values))}")
         return expr
 
     def _register_tag_boundary_region(self, name, where, region=None):
         """If any **boundary** facets satisfy ``where``, register a ``BoundaryRegion`` for ``name``
         so a ``jno.fem`` term bound to it classifies as a boundary (Dirichlet / Neumann) condition
         and ``variable(name, normals=True)`` works. Interior-only tags add nothing here (they stay
-        interior sampling regions). 2-D edges; 3-D triangles.
+        interior sampling regions). **1-D vertices**; 2-D edges; 3-D triangles.
 
         With ``region=`` the search also covers **interface** facets. It has to: a non-conforming
         interface is deliberately kept out of the ``"boundary"`` region -- otherwise a plain
@@ -1641,6 +1691,24 @@ class domain(MeshIOMixin):
         if full is None:
             return
         dim = self.dimension
+        if dim == 1:
+            # A 1-D boundary facet IS a vertex, so there are no edges/triangles to search and the
+            # endpoints themselves are the entities. Without this branch the `triangles` lookup below
+            # found nothing and returned, leaving `d.tag` with no boundary region at all -- silently:
+            # the tag still sampled, `d.variable(name)` still worked, and nothing complained until
+            # `jno.fem` rejected `u(tag) - g` as a whole-domain residual and blamed the residual.
+            _bp = np.asarray(full.points, dtype=float).reshape(len(np.asarray(full.points)), -1)
+            _keep = np.asarray(where(_bp[:, 0])).reshape(-1).astype(bool)
+            if not _keep.any():
+                return
+            self._boundary_regions[name] = BoundaryRegion(tag=name, dim=1, points=_bp[_keep][:, :1], tol=full.tol)
+            # The outward sign (-1 at the left end, +1 at the right) is taken from the "boundary"
+            # region's OWN per-point normals rather than recomputed, so a tagged endpoint can never
+            # disagree with the built-in tag naming the same point.
+            _bn = self.normals_by_tag.get("boundary")
+            if _bn is not None and len(np.asarray(_bn)) == len(_bp):
+                self.normals_by_tag[name] = np.asarray(_bn).reshape(len(_bp), -1)[_keep]
+            return
         attr = "edges" if dim == 2 else "triangles"
         blocks = [getattr(full, attr)]
         if region is not None:
@@ -1918,7 +1986,7 @@ class domain(MeshIOMixin):
 
     def _remesh_periodic(self, pairs) -> bool:
         """Re-mesh IN PLACE from the stored ``jno.Shape`` geometry, making the named opposite-face ``pairs``
-        (``[(master, slave), ...]``) conforming via gmsh ``setPeriodic`` — so a Nédélec (edge) field's
+        (``[(main, secondary), ...]``) conforming via gmsh ``setPeriodic`` — so a Nédélec (edge) field's
         per-edge DOFs line up one-to-one across the periodic faces. Inferred from the constraint list (the
         periodic ties), never requested explicitly. Idempotent: returns ``False`` (a no-op) when the domain
         is not ``Shape``-backed (a user-supplied conforming mesh is used as-is) or the pairs are already

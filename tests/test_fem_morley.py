@@ -171,7 +171,7 @@ def test_morley_periodic_biharmonic_convergence():
     """Periodic-in-y biharmonic ``Δ²u = f`` on the non-nodal (C¹-ish) Morley element — the regression that pins
     the **edge-derivative periodic tie sign**. The DOF-level periodic prolongation must tie both the vertex value
     DOFs and the edge-normal-derivative DOFs across the matched top/bottom boundary; the edge block carries a
-    ``sign(n_slave·n_master)`` weight, and a flipped sign gives a wrong solution.
+    ``sign(n_secondary·n_main)`` weight, and a flipped sign gives a wrong solution.
 
     The manufactured ``u* = sin(πx) sin(2πy)`` is periodic in y (period 1) and has ``∂ᵧu = 2π cos(2πy) sin(πx)``
     NON-ZERO and EQUAL at y=0 and y=1 — so the tie genuinely couples the normal-derivative DOFs and a wrong sign
@@ -316,7 +316,7 @@ def test_morley_periodic_rejects_a_bloch_phase():
     prolongation (``P^H A P`` mixes Re and Im). The nodal Lagrange and N1E builders both read the phase off
     the tie spec, so this element is the odd one out and has to say so.
 
-    This also pins the tie-spec ARITY. The spec is ``(master, slave, comp, field_key, phase)`` and this
+    This also pins the tie-spec ARITY. The spec is ``(main, secondary, comp, field_key, phase)`` and this
     builder used to unpack exactly four, so appending the Bloch phase broke *every* periodic Morley
     problem with ``ValueError: too many values to unpack (expected 4)`` — a plain-periodic tie included.
     The two convergence tests above are the regression for that; this one covers the phase itself."""

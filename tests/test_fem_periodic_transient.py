@@ -1,5 +1,5 @@
 """Real (non-complex) periodic transient: the tie reduces the semidiscrete block, so ``fem.solve()`` must
-return the trajectory on the FULL nodal layout -- prolonged ``u = P·u_red`` -- not the reduced master DOFs.
+return the trajectory on the FULL nodal layout -- prolonged ``u = P·u_red`` -- not the reduced main DOFs.
 
 Every steady operator (``FemLinearSystem.solve``) and the complex-transient path already prolong; the real
 transient path did **not**, so a periodic transient handed back a reduced trajectory that a caller then
@@ -75,11 +75,11 @@ def test_periodic_transient_returns_full_prolonged_trajectory():
     prolongation the trajectory has the reduced length and cannot match the full-mesh analytic field."""
     fem, c = _build(amp_ic=1.0)
     assert fem.is_transient and fem._periodic is not None
-    assert fem._periodic["n_red"] < fem._periodic["n_full"], "the u(left)-u(right) tie must eliminate slave DOFs"
+    assert fem._periodic["n_red"] < fem._periodic["n_full"], "the u(left)-u(right) tie must eliminate secondary DOFs"
 
     traj = _traj(fem)
     pts = np.asarray(fem.points)
-    # the returned trajectory lives on the FULL nodal layout (prolonged), not the reduced master DOFs
+    # the returned trajectory lives on the FULL nodal layout (prolonged), not the reduced main DOFs
     assert traj.shape[1] == pts.shape[0] == fem._periodic["n_full"], (
         f"trajectory width {traj.shape[1]} must be the full node count {fem._periodic['n_full']} (prolonged), "
         f"not the reduced {fem._periodic['n_red']}"
@@ -92,14 +92,14 @@ def test_periodic_transient_returns_full_prolonged_trajectory():
 
 def test_periodic_transient_ties_left_to_right_after_prolong():
     """The prolonged field satisfies the periodic tie itself: at every saved step the left-face values equal
-    the right-face values (the eliminated slave DOFs were reconstructed from their masters, ``u = P·u_red``).
+    the right-face values (the eliminated secondary DOFs were reconstructed from their mains, ``u = P·u_red``).
     A reduced (un-prolonged) trajectory has no left/right columns at all to compare."""
     fem, _ = _build(amp_ic=1.0)
     traj = _traj(fem)
     pts = np.asarray(fem.points)
     left = np.where(pts[:, 0] < 1e-6)[0]
     right = np.where(pts[:, 0] > 1 - 1e-6)[0]
-    lo = left[np.argsort(pts[left, 1])]  # order both faces by y so the master/slave pairs line up
+    lo = left[np.argsort(pts[left, 1])]  # order both faces by y so the main/secondary pairs line up
     ro = right[np.argsort(pts[right, 1])]
     assert lo.size > 1 and lo.size == ro.size
     np.testing.assert_allclose(traj[:, lo], traj[:, ro], atol=1e-8)
