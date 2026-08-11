@@ -60,6 +60,62 @@ class MeshConnectivity(dict):
         return (super().keys() | self._deferred.keys()) if self._deferred else super().keys()
 
 
+#: Curved (isoparametric) block -> its first-order block and the vertex count per cell.
+_CURVED_BLOCKS = {"tetra10": ("tetra", 4), "triangle6": ("triangle", 3), "line3": ("line", 2)}
+
+
+def base_cell_type(name):
+    """The first-order name of a cell block: ``"triangle6" -> "triangle"``, identity otherwise.
+
+    The companion of :func:`p1_cells_dict` for the *other* shape this leak takes — code that compares
+    block names rather than indexing them, e.g. ``cell_block.type == "triangle"``. A curved mesh's
+    volume block is ``triangle6``, so those comparisons silently answer False and every tag derived
+    from them is mis-classified (measured: a plain Dirichlet term stopped classifying onto its own
+    boundary region).
+    """
+    entry = _CURVED_BLOCKS.get(name)
+    return entry[0] if entry else name
+
+
+def curved_block_of(mesh):
+    """The curved volume/facet block names present on ``mesh``, or ``()``. Non-empty means the mesh
+    came from :meth:`jno.Shape.curved` and carries geometry a straight-sided path must not silently
+    reinterpret."""
+    return tuple(k for k in _CURVED_BLOCKS if k in mesh.cells_dict)
+
+
+def refuse_curved(mesh, what: str):
+    """Raise if ``mesh`` is curved and ``what`` cannot honour it.
+
+    Deliberately a refusal rather than a fallback. Reading a curved mesh through
+    :func:`p1_cells_dict` would make these paths *appear* to work while quietly reinstating the O(h²)
+    straight-sided geometry error that ``Shape.curved()`` exists to remove -- the answer would look
+    plausible and be wrong, which is the failure mode this codebase keeps paying for.
+    """
+    blocks = curved_block_of(mesh)
+    if blocks:
+        raise NotImplementedError(
+            f"{what} does not support curved (isoparametric) geometry; this mesh carries {blocks[0]!r} "
+            "cells from Shape.curved(). Drop .curved() for this path -- reading it as straight-sided "
+            "would silently restore the O(h^2) geometry error that curving removes."
+        )
+
+
+def p1_cells_dict(mesh):
+    """``mesh.cells_dict`` with the P1 blocks filled in from any curved ones.
+
+    A mesh from ``Shape.curved()`` stores ``triangle6`` / ``tetra10`` / ``line3``, and the first
+    ``dim+1`` columns of such a cell are its vertices. Everything that works on mesh *topology* —
+    boundary extraction, apex orientation, nodal volumes, the FD connectivity — wants those vertices
+    and is unchanged by the curving, so it reads through here instead of each site learning the
+    second-order names. Only code that needs the curved *geometry* (the assembler's Jacobian) should
+    go to the second-order block directly.
+    """
+    cd = mesh.cells_dict
+    extra = {p1: np.asarray(cd[c])[:, :n] for c, (p1, n) in _CURVED_BLOCKS.items() if c in cd and p1 not in cd}
+    return {**cd, **extra} if extra else cd
+
+
 class MeshUtils:
     #: Memory budget, in float64 elements, for one row-block of the axisymmetric ring kernel's
     #: (M, M, n_phi) intermediate. Lower it if the view-factor build OOMs on a small GPU; it changes
@@ -74,29 +130,30 @@ class MeshUtils:
 
         points = mesh.points[:, :dimension]
         n_points = len(points)
+        cells_dict = p1_cells_dict(mesh)  # curved meshes carry only second-order blocks
 
         if dimension == 1:
             # Check for line elements in the mesh
-            if "line" not in mesh.cells_dict:
+            if "line" not in cells_dict:
                 raise ValueError("1D finite difference support requires line meshes")
 
-            elements = mesh.cells_dict["line"]
+            elements = cells_dict["line"]
             element_type = "lines"
 
         elif dimension == 2:
-            if "triangle" not in mesh.cells_dict:
+            if "triangle" not in cells_dict:
                 raise ValueError("2D finite difference support requires triangular meshes")
 
-            elements = mesh.cells_dict["triangle"]
+            elements = cells_dict["triangle"]
             element_type = "triangles"
 
             area, grad_phi = MeshUtils.precompute_p1_triangle_geometry(points, elements)
 
         elif dimension == 3:
-            if "tetra" not in mesh.cells_dict:
+            if "tetra" not in cells_dict:
                 raise ValueError("3D finite difference support requires tetrahedral meshes")
 
-            elements = mesh.cells_dict["tetra"]
+            elements = cells_dict["tetra"]
             element_type = "tetrahedra"
 
         else:
@@ -130,8 +187,8 @@ class MeshUtils:
         mesh_connectivity["boundary_points"] = bp
         # Use raytrace-based visibility for multi-connected domains (holes),
         # fall back to ordered method for simple single-loop boundaries.
-        if dimension == 2 and "triangle" in mesh.cells_dict:
-            bpe_global = MeshUtils.extract_boundary_edges(mesh.cells_dict["triangle"], len(bp))
+        if dimension == 2 and "triangle" in cells_dict:
+            bpe_global = MeshUtils.extract_boundary_edges(cells_dict["triangle"], len(bp))
             bpe_global = np.asarray(bpe_global)
 
             # Re-map edge indices from full-mesh space to boundary-only space
@@ -265,10 +322,15 @@ class MeshUtils:
     @staticmethod
     def get_boundary_normals(mesh, k=8):
         points = mesh.points
-        if "tetra" in mesh.cells_dict:
-            bfaces, bapex = MeshUtils._boundary_faces_with_apex(mesh.cells_dict["tetra"])
+        # A curved mesh stores second-order blocks; boundary topology and apex orientation come from
+        # the vertices, which `p1_cells_dict` supplies. The normals stay straight-facet for now --
+        # making them follow the curved surface (Nanson) is a separate step, and slipping it in here
+        # would silently change every flux and radiation term.
+        cd = p1_cells_dict(mesh)
+        if "tetra" in cd:
+            bfaces, bapex = MeshUtils._boundary_faces_with_apex(cd["tetra"])
             return MeshUtils._compute_normals_from_boundary_faces(points, bfaces, apex_points=points[bapex])
-        if "triangle" in mesh.cells_dict:
+        if "triangle" in cd:
             # 2-D gets the SAME apex orientation 3-D has had: a boundary edge belongs to exactly one
             # triangle, so "outward" is "away from that triangle's opposite vertex" -- exact for any
             # geometry, concave included. It used to fall through to the k-NN PCA fit below. Measured on
@@ -282,10 +344,10 @@ class MeshUtils:
             # normals pointing each way, none of them radial. The 3-D branch's docstring already called
             # the centroid/PCA family "valid only for convex / star-shaped domains"; 2-D simply never got
             # the exact path.
-            bedges, bapex = MeshUtils._boundary_edges_with_apex(mesh.cells_dict["triangle"])
+            bedges, bapex = MeshUtils._boundary_edges_with_apex(cd["triangle"])
             if len(bedges):
                 return MeshUtils._compute_edge_normals_2d(points, bedges, points[bapex])
-            boundary_elements = MeshUtils._get_boundary_elements(mesh.cells_dict["triangle"], "triangle")
+            boundary_elements = MeshUtils._get_boundary_elements(cd["triangle"], "triangle")
             actual_dim = 2
         else:
             raise ValueError("Unsupported mesh type.")

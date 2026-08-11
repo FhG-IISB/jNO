@@ -92,6 +92,65 @@ def test_curving_works_in_3d():
     assert np.abs(r - 1.0).max() < 1e-12
 
 
+def _curved_disk_domain(size=0.3):
+    return jno.Shape.disk(0.0, 0.0, 1.0, size=size).curved().domain()
+
+
+def test_the_domain_tags_the_whole_curved_facet():
+    """The tag machinery derives a boundary node set by walking the P1 edge chain, which returns only
+    the facet VERTICES. A curved facet also carries midside nodes, and those are genuine boundary DOFs
+    — without them a Dirichlet condition pins each facet's corners and leaves its interior free."""
+    d = _curved_disk_domain()
+    mesh = d.built_mesh
+    tagged = set(np.asarray(d.tag_indices["boundary"]).reshape(-1).tolist())
+    facet_nodes = set(np.unique(mesh.cells_dict["line3"]).tolist())
+    assert tagged == facet_nodes, "the boundary tag must cover the whole facet, not just its vertices"
+    r = np.linalg.norm(np.asarray(mesh.points)[sorted(tagged), :2], axis=1)
+    assert np.abs(r - 1.0).max() < 1e-12
+
+
+def test_mesh_order_survives_the_csg_operators():
+    """`.curved()` must not be silently dropped by a later boolean or transform — every Shape
+    constructor rebuilds the dataclass, and each one that forgot the flag would lose the curving with
+    no indication."""
+    disk = jno.Shape.disk(0.0, 0.0, 1.0, size=0.4).curved()
+    hole = jno.Shape.disk(0.0, 0.0, 0.3, size=0.4)
+    for shape, what in (
+        (disk - hole, "cut"),
+        (disk | hole, "fuse"),
+        (disk.translate((0.1, 0.0)), "translate"),
+        (disk.sized(0.5), "sized"),
+        (disk.name("part"), "name"),
+    ):
+        assert shape._mesh_order == 2, what
+
+
+def _poisson_terms(d, order):
+    u, v = d.fem_symbols(order=order)
+    c = d.variable("interior", split=True)
+    b = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=c[0], y=c[1]), v.bind(x=c[0], y=c[1])
+    return [ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(b[0], b[1]) - 0.0]
+
+
+def test_a_p1_basis_on_a_curved_mesh_is_refused():
+    """Isoparametric means geometry order == basis order. A curved mesh under a P1 basis puts the
+    midside DOF coordinates (on the arc) and the geometric map (from the chord) in disagreement — an
+    inconsistent discretisation, not merely a coarse one."""
+    d = _curved_disk_domain(0.35)
+    with pytest.raises(ValueError, match="order-2 geometry but this field is P1"):
+        jno.fem(_poisson_terms(d, 1))
+
+
+def test_the_assembler_refuses_curved_geometry_for_now():
+    """The assembler still builds one constant Jacobian per cell from its vertices. Solving on a
+    curved mesh with that map would use chord geometry with arc-positioned DOFs — wrong in a way no
+    test would flag — so it refuses until the per-quadrature-point Jacobian lands."""
+    d = _curved_disk_domain(0.35)
+    with pytest.raises(NotImplementedError, match="per-quadrature-point Jacobian"):
+        jno.fem(_poisson_terms(d, 2))
+
+
 @pytest.mark.parametrize("size", [1.2, 0.8])
 def test_a_very_coarse_curved_boundary_is_still_exact(size):
     """Extreme: so few edges that each spans a large arc. The nodes are placed by the CAD kernel, not

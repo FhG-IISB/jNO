@@ -81,6 +81,7 @@ class Shape:
     dim: int
     _size: Size = field(default=None, compare=False)
     _region_name: Optional[str] = field(default=None, compare=False)
+    _mesh_order: int = field(default=1, compare=False)
 
     # ----- primitive constructors ------------------------------------------------
     @classmethod
@@ -151,14 +152,17 @@ class Shape:
         dims = {sub.dim for _n, sub in items}
         if len(dims) != 1:
             raise ValueError(f"all regions must share one dimension, got {sorted(dims)}")
-        return cls(("regions", tuple(items), bool(conforming)), items[0][1].dim, None)
+        # curving is a property of the whole mesh, so a multi-material domain is curved if ANY of its
+        # regions asked for it -- otherwise `.curved()` on one part would be silently dropped
+        order = max(int(getattr(sub, "_mesh_order", 1)) for _n, sub in items)
+        return cls(("regions", tuple(items), bool(conforming)), items[0][1].dim, None, None, order)
 
     def name(self, name: str) -> "Shape":
         """Label this shape as a named material region, for combining with ``+`` (see :meth:`regions`).
 
         ``core.name("core") + clad.name("clad")`` builds a multi-material domain whose regions are
         ``core`` and ``clad``. Apply ``name`` last (a later transform drops the label)."""
-        return Shape(self._node, self.dim, self._size, str(name))
+        return Shape(self._node, self.dim, self._size, str(name), self._mesh_order)
 
     def _region_items(self):
         """This shape as ``((name, shape), ...)`` region items — its own group, or a single named leaf."""
@@ -180,19 +184,19 @@ class Shape:
 
     # ----- boolean operators -----------------------------------------------------
     def __sub__(self, other: "Shape") -> "Shape":
-        return Shape(("cut", self, other), self.dim, self._size)
+        return Shape(("cut", self, other), self.dim, self._size, None, max(self._mesh_order, other._mesh_order))
 
     def __or__(self, other: "Shape") -> "Shape":
-        return Shape(("fuse", self, other), self.dim, self._size)
+        return Shape(("fuse", self, other), self.dim, self._size, None, max(self._mesh_order, other._mesh_order))
 
     def __and__(self, other: "Shape") -> "Shape":
-        return Shape(("inter", self, other), self.dim, self._size)
+        return Shape(("inter", self, other), self.dim, self._size, None, max(self._mesh_order, other._mesh_order))
 
     # ----- transforms ------------------------------------------------------------
     def extrude(self, height: float) -> "Shape":
         if self.dim != 2:
             raise ValueError("extrude requires a 2-D shape")
-        return Shape(("extrude", self, float(height)), 3, self._size)
+        return Shape(("extrude", self, float(height)), 3, self._size, None, self._mesh_order)
 
     def revolve(self, axis_point, axis_dir, angle: float = 2.0 * math.pi) -> "Shape":
         """Sweep a 2-D shape around an axis by ``angle`` radians into a 3-D solid.
@@ -217,20 +221,20 @@ class Shape:
                 "revolve currently supports the x- or y-axis through the origin (axisymmetric); "
                 f"got axis_point={ap}, axis_dir={ad}."
             )
-        return Shape(("revolve", self, ap, ad, float(angle)), 3, self._size)
+        return Shape(("revolve", self, ap, ad, float(angle)), 3, self._size, None, self._mesh_order)
 
     def translate(self, vector) -> "Shape":
         """Move the shape by ``vector`` (2- or 3-component). Boundary names are preserved."""
         v = tuple(float(c) for c in vector)
         if len(v) == 2:
             v = (v[0], v[1], 0.0)
-        return Shape(("translate", self, v), self.dim, self._size)
+        return Shape(("translate", self, v), self.dim, self._size, None, self._mesh_order)
 
     def rotate(self, axis_point, axis_dir, angle: float) -> "Shape":
         """Rotate ``angle`` radians about the axis through ``axis_point`` along ``axis_dir``."""
         ap = tuple(float(c) for c in axis_point)
         ad = tuple(float(c) for c in axis_dir)
-        return Shape(("rotate", self, ap, ad, float(angle)), self.dim, self._size)
+        return Shape(("rotate", self, ap, ad, float(angle)), self.dim, self._size, None, self._mesh_order)
 
     def sweep(self, path) -> "Shape":
         """Sweep this 2-D profile along an open :class:`~jno.geometry.path.Path` trajectory.
@@ -245,7 +249,7 @@ class Shape:
         h = path._as_extrude()
         if h is not None:
             return self.extrude(h)  # a straight vertical sweep IS an extrude -- reuse its rich naming
-        return Shape(("sweep", self, path), 3, self._size)
+        return Shape(("sweep", self, path), 3, self._size, None, self._mesh_order)
 
     def array(self, n: int, step=None, about=None, angle: float = 2.0 * math.pi) -> "Shape":
         """``n`` fused copies of this shape: a **linear** array (``step=`` vector between copies)
@@ -273,11 +277,29 @@ class Shape:
         edges). The rounded blend faces are unnamed (they fall into ``boundary``); the flat
         faces keep their names.
         """
-        return Shape(("fillet", self, float(radius), where), self.dim, self._size)
+        return Shape(("fillet", self, float(radius), where), self.dim, self._size, None, self._mesh_order)
 
     def sized(self, size: Size) -> "Shape":
         """Return a copy of this shape with its target mesh size set (scalar or ``f(x,y,z)``)."""
-        return Shape(self._node, self.dim, size, self._region_name)
+        return Shape(self._node, self.dim, size, self._region_name, self._mesh_order)
+
+    def curved(self, order: int = 2) -> "Shape":
+        """Return a copy meshed with **curved (isoparametric)** geometry of the given order.
+
+        By default jNO meshes straight-sided and *synthesises* any higher-order nodes at the
+        straight-edge midpoints, so the domain stays a polygon however high the element order goes.
+        That polygonal approximation carries an **O(h²)** domain error at every basis order — it is
+        what caps P2/P3 at second order on a round boundary — and leaves facet normals O(h) wrong.
+        ``curved()`` asks the CAD kernel to place those nodes on the true surface instead::
+
+            d = jno.Shape.disk(0, 0, 1, size=0.1).curved().domain()
+
+        Worth pairing with a matching element order (``jno.fem(..., order=2)``); a curved mesh under a
+        P1 basis buys only the geometry, not the convergence rate. Meshing is a property of the shape,
+        which is why this lives here beside :meth:`sized` rather than on the solve."""
+        if int(order) not in (1, 2):
+            raise ValueError(f"Shape.curved: only order 1 (straight) or 2 is supported, got {order!r}.")
+        return Shape(self._node, self.dim, self._size, self._region_name, int(order))
 
     # ----- introspection (pure; used by emit + selection) ------------------------
     def leaves(self, _inherit: Size = None) -> Tuple[Tuple[object, Size, int], ...]:
@@ -340,7 +362,7 @@ class Shape:
         """
         from .emit import build as _build
 
-        return _build(self, algorithm=algorithm, threads=threads)
+        return _build(self, algorithm=algorithm, threads=threads, order=self._mesh_order)
 
     def __call__(self, geo=None):
         # Callable-constructor compatibility (jno.domain runs constructor()).

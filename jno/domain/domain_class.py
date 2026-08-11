@@ -19,6 +19,7 @@ from ..utils.dtypes import default_np_float_dtype
 from ..utils.logger import get_logger
 from .boundary_region import BoundaryRegion
 from .geometries import Geometries
+from .mesh_utils import base_cell_type as _base_cell_type
 from .meshio_mixin import MeshIOMixin
 from .simplex_pool import SimplexPool
 
@@ -1984,7 +1985,7 @@ class domain(MeshIOMixin):
                 # Boundary tags live in the facet block (block 1); point clouds (block 0 = vertex)
                 # are not volume-filling, so they still get PCA normals.
                 _vol_elem = {1: "line", 2: "triangle", 3: "tetra"}.get(self.dimension)
-                block0_is_volume = bool(mesh.cells) and mesh.cells[0].type == _vol_elem
+                block0_is_volume = bool(mesh.cells) and _base_cell_type(mesh.cells[0].type) == _vol_elem
                 has_volume_cells = False
 
                 if isinstance(cell_data, dict):
@@ -2000,17 +2001,21 @@ class domain(MeshIOMixin):
                                     if len(sel):  # vertex data contains the point index
                                         tag_point_blocks.append(sel.reshape(len(sel), -1)[:, 0])
                         else:
-                            if block0_is_volume and cell_type == _vol_elem and len(indices) > 0:
+                            if block0_is_volume and _base_cell_type(cell_type) == _vol_elem and len(indices) > 0:
                                 has_volume_cells = True
                             for b_idx, cell_block in enumerate(mesh.cells):
                                 if cell_block.type == cell_type:
                                     sel = self._cells_of(cell_block.data, indices, block_offsets.get((b_idx, cell_type), 0))
                                     if len(sel):
                                         tag_point_blocks.append(sel.ravel())
-                                        if cell_block.type == "line":
-                                            tag_edge_blocks.append(sel)
-                                        elif cell_block.type == "triangle":
-                                            tag_tri_blocks.append(sel)
+                                        # A curved facet ("line3"/"triangle6") is still an edge/face;
+                                        # downstream these arrays are P1 (2- and 3-node), so truncate
+                                        # to the vertex columns rather than change every consumer.
+                                        _bt = _base_cell_type(cell_block.type)
+                                        if _bt == "line":
+                                            tag_edge_blocks.append(sel[:, :2])
+                                        elif _bt == "triangle":
+                                            tag_tri_blocks.append(sel[:, :3])
                 else:
                     # Handle list-style cell_data. meshio cell-set indices
                     # can be either block-local (manually written `.inp`
@@ -2041,10 +2046,11 @@ class domain(MeshIOMixin):
                                     tag_point_blocks.append(sel.reshape(len(sel), -1)[:, 0])
                                 else:
                                     tag_point_blocks.append(sel.ravel())
-                                    if cell_block.type == "line":
-                                        tag_edge_blocks.append(sel)
-                                    elif cell_block.type == "triangle":
-                                        tag_tri_blocks.append(sel)
+                                    _bt = _base_cell_type(cell_block.type)
+                                    if _bt == "line":
+                                        tag_edge_blocks.append(sel[:, :2])
+                                    elif _bt == "triangle":
+                                        tag_tri_blocks.append(sel[:, :3])
 
                 tag_edges = np.concatenate(tag_edge_blocks, axis=0) if tag_edge_blocks else np.zeros((0, 2), int)
                 tag_tris = np.concatenate(tag_tri_blocks, axis=0) if tag_tri_blocks else np.zeros((0, 3), int)
@@ -2061,6 +2067,15 @@ class domain(MeshIOMixin):
                         self._boundary_loop_tags.add(name)
                         # the chain walk is a Python graph traversal: hand it plain ints, as before
                         indices_list = self._chain_edges_to_loop(tag_edges.tolist())
+                        # The walk runs over P1 edges, so it returns only their vertices. A CURVED
+                        # facet also carries midside nodes, which are genuine boundary DOFs -- without
+                        # them a Dirichlet condition would pin the corners of each facet and leave its
+                        # interior free. Append rather than merge, so the ordered loop stays a prefix
+                        # for the consumers that rely on it. Empty for a straight mesh, where the chain
+                        # already covers every node, so this path is unchanged there.
+                        _extra = np.setdiff1d(tag_points, np.asarray(indices_list, dtype=int))
+                        if _extra.size:
+                            indices_list = np.concatenate([np.asarray(indices_list, dtype=int), _extra])
                     else:
                         indices_list = np.asarray(tag_points, dtype=int)
 

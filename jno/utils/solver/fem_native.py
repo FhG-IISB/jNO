@@ -115,8 +115,37 @@ def _get_mesh(domain, dim: int, order: int):
     # meshio names the simplex cell block "triangle" (2D) / "tetra" (3D) -- distinct from the basix
     # CellType name "tetrahedron" the facet machinery uses.
     meshio_key = {1: "line", 2: "triangle"}.get(dim, "tetra")
-    pts_p1 = np.asarray(domain.mesh.points)[:, :dim]
-    cells_p1 = np.asarray(domain.mesh.cells_dict[meshio_key], dtype=np.int64)
+    curved_key = {1: "line3", 2: "triangle6"}.get(dim, "tetra10")
+    cd = domain.mesh.cells_dict
+    pts_all = np.asarray(domain.mesh.points)[:, :dim]
+
+    if curved_key in cd:
+        # CURVED (isoparametric) mesh from `Shape.curved()`: gmsh already placed the higher-order nodes
+        # on the CAD surface, so they must be USED, never re-synthesised. The first dim+1 columns of a
+        # curved cell are its vertices, giving the P1 sub-mesh the facet/region machinery wants -- kept
+        # in the SAME id space as the curved mesh so a node id means one thing everywhere (the promoted
+        # path below builds a second array precisely because it has no such nodes to point at).
+        cells_c = np.asarray(cd[curved_key], dtype=np.int64)
+        cells_v = cells_c[:, : dim + 1]
+        if order != 2:
+            # Isoparametric means geometry order == basis order. A curved mesh under a P1 basis puts
+            # the midside DOF coordinates (on the arc) and the geometric map (from the chord) in
+            # disagreement -- an inconsistent discretisation, not merely a coarse one.
+            raise ValueError(
+                f"Shape.curved() gives order-2 geometry but this field is P{order}. Isoparametric "
+                f"geometry needs a matching basis: pass element_type='{'TRI6' if dim == 2 else 'TET10'}' "
+                "(or order=2) to jno.fem, or drop .curved() to mesh straight-sided."
+            )
+        raise NotImplementedError(
+            "Curved (isoparametric) geometry is meshed and tagged, but the assembler still builds one "
+            "constant Jacobian per cell from its vertices. Solving on it would use chord geometry with "
+            "arc-positioned DOFs -- inconsistent, and wrong in a way no test would flag. The "
+            "per-quadrature-point Jacobian is the next step; drop .curved() until then."
+        )
+        return pts_all, cells_v, pts_all, cells_c  # noqa: B012  (re-enabled with the per-qp Jacobian)
+
+    pts_p1 = pts_all
+    cells_p1 = np.asarray(cd[meshio_key], dtype=np.int64)
     if order == 1:
         return pts_p1, cells_p1, pts_p1, cells_p1
     if dim not in (1, 2, 3):
@@ -1254,6 +1283,29 @@ def assemble_fem_native(
             k: (_gap_tables[k]["g0_full"][fids], gap_um[k][fids]) for k in _gap_tables if _gap_tables[k]["slave"] == region
         } or None
 
+    def _pack_gaps(loc, per_f, n_vec, gaps):
+        """Write each contact gap's per-quadrature-point value into ``loc["domain_context"]``.
+
+        ``g = g0 + n . (u_s - u_m . Phi)``. Shared by the residual and by the surface-state readout, so
+        an augmented-Lagrangian update ``lam.evolves(max(0, lam.i(-1) - c*g))`` sees exactly the gap the
+        traction term saw -- if the two drifted apart the multiplier would converge to the wrong
+        pressure, and nothing would report it.
+        """
+        for _k, (_g0_f, _um_f) in (gaps or {}).items():
+            _gfi = _gap_tables[_k]["field"]
+            _us = per_f[_gfi]["shape_vals"] @ per_f[_gfi]["cell_sol"]  # (n_q, vec)
+            _jump = _us.reshape(_us.shape[0], -1) - _um_f.reshape(_um_f.shape[0], -1)
+            # Explicit shape check: `jnp.einsum("d,qd->q", n, jump)` silently BROADCASTS a size-1
+            # component axis, so a scalar field would contract to `sum(n) * jump` -- right only when the
+            # normal happens to sum to 1, wrong on any tilted interface, and never an error.
+            if _jump.shape[1] != n_vec.shape[0]:
+                raise ValueError(
+                    f"u.gap: the field has {_jump.shape[1]} component(s) but the interface normal has "
+                    f"{n_vec.shape[0]}. A normal gap needs a vector field with one component per "
+                    "dimension -- use fem_symbols(value_shape=(dim,))."
+                )
+            loc["domain_context"][_k] = _g0_f + (_jump * n_vec[None, :]).sum(axis=1)
+
     def _surf_elem_res(fi, local_all, bcoeff, btfi, region, t=0.0, args=None, pts=None, normals=None, gaps=None):
         """Element residual of one surface term on boundary face ``fi`` as a function of the parent
         cell's gathered all-field local DOFs ``local_all`` -> ``(n_test_dofs_btfi,)``. ``pts`` / ``normals``
@@ -1298,21 +1350,7 @@ def assemble_fem_native(
         }
         # Contact gap g = g0 + n . (u_s - u_m . Phi) at this face's quadrature points. ``gaps`` carries
         # this face's frozen g0 and its already-gathered master values -- see :func:`_gap_gather`.
-        if gaps:
-            for _k, (_g0_f, _um_f) in gaps.items():
-                _gfi = _gap_tables[_k]["field"]
-                _us = per_f[_gfi]["shape_vals"] @ per_f[_gfi]["cell_sol"]  # (n_q, vec)
-                _jump = _us.reshape(_us.shape[0], -1) - _um_f.reshape(_um_f.shape[0], -1)
-                # Explicit shape check: `jnp.einsum("d,qd->q", n, jump)` silently BROADCASTS a size-1
-                # component axis, so a scalar field would contract to `sum(n) * jump` -- right only when
-                # the normal happens to sum to 1, wrong on any tilted interface, and never an error.
-                if _jump.shape[1] != n_vec.shape[0]:
-                    raise ValueError(
-                        f"u.gap: the field has {_jump.shape[1]} component(s) but the interface normal has "
-                        f"{n_vec.shape[0]}. A normal gap needs a vector field with one component per "
-                        "dimension -- use fem_symbols(value_shape=(dim,))."
-                    )
-                loc["domain_context"][_k] = _g0_f + (_jump * n_vec[None, :]).sum(axis=1)
+        _pack_gaps(loc, per_f, n_vec, gaps)
         if _field_param_names:
             loc["shape_vals"] = per_f[_field_param_field_idx]["shape_vals"]
         _nt = neural_local_table(_neural, args)
@@ -1330,7 +1368,7 @@ def assemble_fem_native(
                 loc["qp_history"] = {k: sbuf[k][fi] for k in surface_history_specs if k in sbuf}
         return _integrate_term(domain, bcoeff, loc, face_w * jac_f)
 
-    def _surf_elem_readout(fi, local_all, formula, region, t=0.0, args=None):
+    def _surf_elem_readout(fi, local_all, formula, region, t=0.0, args=None, gaps=None):
         """Per-quad-point VALUE of a surface evolution formula on boundary face ``fi`` -> (n_q, *shape).
 
         The surface analogue of :func:`_vol_elem_readout`: the same surface ``loc`` as ``_surf_elem_res``
@@ -1370,6 +1408,7 @@ def assemble_fem_native(
             "trial_value_shape": fields[0]["value_shape"],
             "trial_vec": vecs[0],
         }
+        _pack_gaps(loc, per_f, n_vec, gaps)  # so an AL multiplier update can read the same gap
         if _field_param_names:
             loc["shape_vals"] = per_f[_field_param_field_idx]["shape_vals"]
         _nt = neural_local_table(_neural, args)
@@ -1401,7 +1440,12 @@ def assemble_fem_native(
                 continue
             fids = jnp.asarray(faces, dtype=jnp.int32)
             lv = u_flat[cell_all_dofs[parent_j[fids]]]  # (n_face_R, n_local_all)
-            vals = jax.vmap(lambda fi, la, _f=formula, _r=region: _surf_elem_readout(fi, la, _f, _r, t, args))(fids, lv)
+            # An augmented-Lagrangian update `lam.evolves(max(0, lam.i(-1) - c*g))` reads the gap here,
+            # so the same master-side gather the residual uses has to reach the readout.
+            gsl = _gap_slices(region, fids, {k: _gap_gather(u_flat, k) for k in _gap_tables})
+            vals = jax.vmap(lambda fi, la, gp, _f=formula, _r=region: _surf_elem_readout(fi, la, _f, _r, t, args, gp))(
+                fids, lv, gsl if gsl else {}
+            )
             # Normalize to the state's declared per-face shape (n_faces, n_quad_surf, *value_shape): a
             # scalar update written with `inner(dir, u.bind(...), 1)` keeps a spurious trailing size-1 axis
             # (harmless in the residual, where it contracts with the test) that must be squeezed here.
