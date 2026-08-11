@@ -143,6 +143,14 @@ def _gmsh_to_basix_perm(pts: np.ndarray, cells_c: np.ndarray, dim: int, order: i
     return np.asarray(perm)
 
 
+def _is_nonconforming_side(tag: str) -> bool:
+    """Is ``tag`` one *side* of a non-conforming interface (``"a|b.a"``), rather than a conforming
+    ``"a|b"`` or one of its disjoint components ``"a|b.0"``? The suffix must be one of the pair's own
+    region names, which is what distinguishes a duplicated surface from a shared one."""
+    head, dot, tail = str(tag).rpartition(".")
+    return bool(dot) and "|" in head and tail in head.split("|")
+
+
 def _get_mesh(domain, dim: int, order: int):
     """P1 base mesh + optionally promoted P{order} mesh, both as NumPy arrays.
 
@@ -181,6 +189,21 @@ def _get_mesh(domain, dim: int, order: int):
     cells_p1 = np.asarray(cd[meshio_key], dtype=np.int64)
     if order == 1:
         return pts_p1, cells_p1, pts_p1, cells_p1
+    # `_promote_to_degree` dedups synthesised nodes by physical COORDINATE, which is the right
+    # conformity test for one body and the wrong one for two: a `conforming=False` interface is
+    # coincident *on purpose*, so every P2+ node the promotion adds there is merged across the two
+    # bodies and welds them. Measured on a two-body bar: 37 nodes referenced by BOTH bodies, all at the
+    # interface. Harmless for a tie (it wanted continuity anyway) but wrong for contact, where those
+    # DOFs can then never separate -- and silent either way. See plans/p2-promotion-entity-keys.md for
+    # the fix (key on the topological entity instead); refused until then.
+    if any(_is_nonconforming_side(t) for t in (getattr(domain, "_interface_registry", {}) or {})):
+        raise NotImplementedError(
+            f"P{order} elements on a Shape.regions(..., conforming=False) domain: the higher-order node "
+            "promotion deduplicates by coordinate, so it would silently WELD the two bodies at every "
+            "interface node it adds -- which a contact gap could then never open. Use order-1 elements "
+            "for a non-conforming interface, or Shape.curved() (which reads gmsh's nodes instead of "
+            "synthesising them, and is unaffected)."
+        )
     if dim not in (1, 2, 3):
         raise NotImplementedError(f"Dimension {dim} not supported by native assembler.")
     # P{order} node mesh: place the element's reference interpolation points (basix DOF order) on each
@@ -991,6 +1014,15 @@ def assemble_fem_native(
         _all_faces = np.arange(conn.n_bfaces)
         for _key, (_slave, _master, _fkey) in _contact_pairs.items():
             _fidx = field_index.get(_fkey)
+            if _fidx is not None and face_tables_per_field[_fidx] is None:
+                # Face tables are only built when the form HAS boundary terms. A gap that no term ever
+                # reads has nothing to pack -- and crashing on the missing tables would blame the
+                # assembler for what is really a declared-but-unused `u.gap`.
+                raise ValueError(
+                    f"u.gap({_slave!r}, {_master!r}) was declared but no boundary term reads it, so there "
+                    "is no surface to evaluate it on. Use the gap in a term on the slave face (a contact "
+                    "traction), or drop the u.gap call."
+                )
             if _fidx is None:  # the gap's field is not in this system -> nothing to pack
                 continue
             _snodes = {int(n) for n in _region_node_ids(domain, _slave)}

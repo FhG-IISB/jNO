@@ -283,6 +283,29 @@ def test_a_coarse_slave_is_reordered_rather_than_left_wrong():
             assert abs(got - ref) / ref < 1e-3, f"both orderings must agree: {got:.6f} vs {ref:.6f}"
 
 
+def test_p2_on_a_nonconforming_domain_is_refused():
+    """``_promote_to_degree`` deduplicates synthesised nodes by physical COORDINATE — the right
+    conformity test for one body, the wrong one for two. A ``conforming=False`` interface is coincident
+    *on purpose*, so every P2 node added there is merged across the bodies and welds them: measured on
+    a two-body bar, 37 nodes were referenced by cells of BOTH bodies, all at the interface. Benign for a
+    tie, wrong for contact (those DOFs can then never separate), and silent either way — so it is
+    refused until the promotion keys on topological entities instead. See
+    ``plans/p2-promotion-entity-keys.md``."""
+
+    def build(conforming, order):
+        d = _bar(conforming, 0.6)
+        u, v = d.fem_symbols(order=order)
+        c = d.variable("interior", split=True)
+        b = d.variable("boundary", split=True)
+        ui, vi = u.bind(x=c[0], y=c[1], z=c[2]), v.bind(x=c[0], y=c[1], z=c[2])
+        return jno.fem([ui.x * vi.x + ui.y * vi.y + ui.z * vi.z - 1.0 * vi, u(b[0], b[1], b[2]) - 0.0])
+
+    with pytest.raises(NotImplementedError, match="would silently WELD"):
+        build(False, 2)
+    assert build(True, 2) is not None  # a conforming interface shares its surface anyway — unaffected
+    assert build(False, 1) is not None  # P1 duplicates the interface nodes correctly
+
+
 def test_conforming_is_a_reserved_region_name():
     with pytest.raises(TypeError, match="must be a bool"):
         jno.Shape.regions(a=jno.Shape.box(0, 0, 0, 1, 1, 1), b=jno.Shape.box(0, 0, 1, 1, 1, 2), conforming="no")
