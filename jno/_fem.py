@@ -2102,6 +2102,97 @@ class FEM:
             return lambda u, t, args=None: _as_flat(self._op.residual(u, t, args or {}))
         raise AttributeError(f"FEM is {self._mode}; .residual is for a steady-nonlinear or transient problem.")
 
+    def eval(self, term, u, *, args=None):
+        """Assemble one **weak term** at the solution ``u`` — the free ``(n_dofs,)`` vector, with **no**
+        essential elimination applied.
+
+        This is the readout primitive. The conjugate quantity on a constrained region — **reaction
+        force** in mechanics, **total heat flux** through a Dirichlet wall, **current** in
+        electrostatics, **flow rate** in Darcy — is that vector summed over the region's DOFs::
+
+            fem = jno.fem([mech, *bcs])
+            u   = fem.solve()
+            R   = fem.eval(mech, u)                       # internal force at every DOF
+            Fy  = R[fem.region_dofs("top", component=1)].sum()   # reaction on the top edge
+
+        It has to be a separate entry point because every solve path elimination-mutates the system it
+        keeps: the linear route applies symmetric elimination (``A``/``b`` here have the constrained rows
+        zeroed and a unit diagonal set), and Newton replaces those rows with ``u[d] - g``. Both are
+        correct for solving and both return **exactly zero** at the DOFs a reaction readout is asking
+        about — so reading it off ``fem.A``/``fem.b``/``fem.residual`` gives a plausible, silent zero.
+
+        ``term`` is any weak term built from this domain's symbols (it carries the test function); it does
+        **not** have to be one of the terms this FEM was built from, so a diagnostic form — a sub-term, a
+        different stress measure — can be assembled against an existing solution. A term with no test
+        function is a field readout rather than an assembly and is refused by name.
+        """
+        from .utils.solver.solver_helper import contains_node_type
+
+        factory = getattr(self, "_term_residual_factory", None)
+        if factory is None:
+            raise NotImplementedError(
+                "fem.eval: this problem was not assembled through the native Lagrange assembler, which is "
+                "the only route that publishes a free (pre-Dirichlet) residual. Not wired for: non-nodal "
+                "(Argyris/Morley/edge) elements, 1-D, and the VPINN path."
+            )
+        terms = list(term) if isinstance(term, (list, tuple)) else [term]
+        bares = []
+        for t in terms:
+            bare = getattr(t, "expr", t)
+            if not contains_node_type(bare, TestFunction):
+                raise ValueError(
+                    "fem.eval(term, u): every entry must be a WEAK TERM — it must contain the test "
+                    "function, so it assembles to one value per DOF. An expression without a test "
+                    "function is a field readout (a stress, an energy density) at quadrature points, "
+                    "which is a different operation and is not wired yet."
+                )
+            support, region = _region_and_support(t, self.domain)
+            if support != "volume":
+                raise NotImplementedError(
+                    f"fem.eval: this term lives on boundary region {region!r}. Only volume terms are "
+                    "assembled here; a surface term needs the per-region facet bucketing the front-end "
+                    "does at build time. Pass the volume terms and add the known applied load yourself."
+                )
+            bares.append(bare)
+        return _as_flat(factory(bares)(jnp.asarray(u).reshape(-1), 0.0, args))
+
+    def region_dofs(self, region, *, field=0, component=None):
+        """Global DOF indices of a tagged region — the companion to :meth:`eval`.
+
+        ``field`` selects the block (a trial symbol or an index, resolved by :meth:`block_index`);
+        ``component`` picks one component of a vector field (``None`` = all of them). Returns a plain
+        ``numpy`` int array, so it indexes a solution or a residual directly.
+        """
+        from .utils.solver.fem_utils import _value_shape_num_components
+
+        idx = field if isinstance(field, int) else self.block_index(field)
+        pts = self.field_points
+        if pts is None:
+            raise NotImplementedError("fem.region_dofs: this assembly route does not expose DOF coordinates.")
+        pts_f = np.asarray(pts[idx])
+        mask = self.domain.tag_node_mask(region, pts_f)
+        if mask is None:
+            known = sorted(getattr(self.domain, "_boundary_regions", {}) or {})
+            raise KeyError(f"fem.region_dofs: unknown region {region!r}. Tagged regions: {known}")
+        nodes = np.flatnonzero(np.asarray(mask))
+        if nodes.size == 0:
+            raise ValueError(
+                f"fem.region_dofs: region {region!r} matched no DOF node of field {idx}. A tag tolerance "
+                "finer than the mesh, or a region on a different field's nodes, is the usual cause."
+            )
+        offs = self.offsets
+        vec = int(_value_shape_num_components(self._field_value_shape(idx)))
+        base = int(offs[idx]) if offs is not None else 0
+        comps = range(vec) if component is None else [int(component)]
+        return np.concatenate([base + nodes * vec + c for c in comps])
+
+    def _field_value_shape(self, idx):
+        """The ``value_shape`` of block ``idx`` — from the assembler's own field list."""
+        shapes = getattr(self, "_block_value_shapes", None)
+        if shapes and idx < len(shapes):
+            return shapes[idx]
+        return ()
+
     @property
     def jacobian(self):
         """Jacobian callable for a custom solver, returning a dense ``(n_dofs, n_dofs)`` JAX
@@ -3507,6 +3598,9 @@ def _fem_impl(
         # the constraint-walk order is the fallback for paths that don't run the native assembler.
         fem_obj._block_field_keys = list(getattr(domain, "_fem_native_field_keys", None) or ())
         fem_obj._trial_field_keys = _field_keys(_orig_constraints)
+        # Free (pre-Dirichlet) residual factory behind FEM.eval — same capture-now reason as above.
+        fem_obj._term_residual_factory = getattr(domain, "_fem_native_term_residual", None)
+        fem_obj._block_value_shapes = list(getattr(domain, "_fem_native_field_shapes", None) or ())
         # Same snapshot treatment for the DOF coordinates behind .points / .field_points — an
         # auxiliary assembly (jno.precond.form) would otherwise clobber them mid-solve.
         fem_obj._native_dof_points = getattr(domain, "_fem_native_dof_points", None)

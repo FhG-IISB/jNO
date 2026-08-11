@@ -661,6 +661,7 @@ def assemble_fem_native(
     domain._fem_native_assembly_cells_all = [np.asarray(cf) for cf in cells_f_all]
     domain._fem_native_field_orders = [int(f["order"]) for f in fields]
     domain._fem_native_field_keys = [f["field_key"] for f in fields]
+    domain._fem_native_field_shapes = [tuple(f["value_shape"]) for f in fields]
 
     # -------------------------------------------------------------------------
     # Element specs and JAX constants
@@ -2610,6 +2611,11 @@ def assemble_fem_native(
     # === steady ===
     dirichlet_pairs = _build_dirichlet_pairs()
     residual = _make_residual(volume_terms, boundary_terms)
+    # Publish the FREE (pre-Dirichlet) residual factory so `FEM.eval` can assemble an arbitrary weak
+    # term at a solution. Every solve path elimination-mutates its own copy -- symmetric elimination for
+    # the linear system, row replacement for Newton -- which zeroes exactly the rows a reaction/flux
+    # readout needs. Snapshotted onto the FEM in `_finalize`, like the field keys and DOF points.
+    domain._fem_native_term_residual = _make_residual
     jacobian = _make_jacobian(volume_terms, boundary_terms)
     nonlinear = any(_is_obviously_nonlinear_in_unknown(domain, t) for t in all_terms)
     s_d_dofs = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32) if dirichlet_pairs else None

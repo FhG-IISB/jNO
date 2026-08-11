@@ -148,6 +148,37 @@ in the `jno.fem([...])` list, and `jno.fem` classifies each by the region it is 
 for a spatially varying Dirichlet value). A zero Neumann flux is the natural default and needs
 no term.
 
+### Reading the reaction off a constrained region — `fem.eval`
+
+The quantity conjugate to an essential condition is the **reaction**: force in mechanics, total heat
+flux through a Dirichlet wall, current in electrostatics, flow rate in Darcy. It is one operation, and
+it is arithmetic on a residual — but not on the residual any solve path keeps:
+
+```python
+fem = jno.fem([mech, u(*left)[0] - 0.0, u(*left)[1] - 0.0])
+u_h = fem.solve()
+R   = fem.eval(mech, u_h)                                  # free residual, one value per DOF
+Fx  = R[fem.region_dofs("left", component=0)].sum()        # reaction on the pinned face
+```
+
+`fem.eval(term, u)` assembles a weak term at a solution with **no essential elimination applied**, and
+`fem.region_dofs(region, field=…, component=…)` gives that region's global DOF indices.
+
+**Why this needs its own entry point.** Every solve path elimination-mutates the system it keeps: the
+linear route applies symmetric elimination (`fem.A`/`fem.b` have the constrained rows zeroed and a unit
+diagonal set), and Newton replaces those rows with `u[d] - g`. Both are right for solving, and both are
+**exactly zero** at the DOFs a reaction asks about — so reading it off `fem.A`, `fem.b` or
+`fem.residual` returns a plausible, silent zero rather than an error. (`fem.residual` also refuses
+outright on a linear problem, which is the commonest reaction case.)
+
+`term` is any weak term built from this domain's symbols and does not have to be one the FEM was built
+from, so a diagnostic form can be assembled against an existing solution. **Scope:** volume terms on
+the native Lagrange assembler. A term with no test function is a field readout rather than an assembly,
+and a surface term needs the front-end's per-region facet bucketing — both are refused by name.
+
+Verified by global balance, not by restating the assembly: the wall flux equals the integrated source,
+and the reaction equals the applied load.
+
 ### Tying two boundaries — `u(A) - u(B)`
 
 A term that names two boundary regions and carries no test function is a **tie**: it identifies the
