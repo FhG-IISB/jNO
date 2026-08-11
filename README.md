@@ -85,6 +85,8 @@ pip install jax-numerical-operators
 
 One install — FEM, FDM, the solver stack, PINNs, and the scientific-ML tooling all come in the box, running on CPU out of the box. An NVIDIA GPU is one extra away — `pip install "jax-numerical-operators[cuda]"` — and the heavy, self-contained backends stay behind extras too: `[fem]` (adaptive remeshing + the PARDISO/cuDSS sparse-direct backends), `[rcwa]` (the Fourier-modal EM solver), `[amg]` (GPU algebraic multigrid), `[iree]`, combinable as `[cuda,fem]`. The [Installation guide](https://fhg-iisb.github.io/jNO/Installation/) has the full table, plus Pixi, Docker, and pinning a specific CUDA build.
 
+PS: I recommend pulling the latest main branch to always be up to date!
+
 ## Example
 
 <details open>
