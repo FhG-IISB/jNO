@@ -5,6 +5,7 @@ from typing import Any
 from ...trace import (
     Assembly,
     BinaryOp,
+    BoundConstraint,
     Diff,
     DiffSlot,
     FunctionCall,
@@ -103,6 +104,14 @@ def iter_children(node: Any):
 
     if isinstance(node, DiffSlot):
         # Leaf: a value injected at evaluation time, wraps no traced sub-expression.
+        return
+
+    if isinstance(node, BoundConstraint):
+        # Only the bounded FIELD is a traced child, so a bound term still reports the unknown it
+        # constrains. `lo`/`hi` are deliberately NOT yielded: they are resolved in DOF space at solve
+        # time, and walking them would let a `u.i(-1)` bound be mistaken for a quadrature-point history
+        # read and allocate a buffer nothing consumes.
+        yield node.target
         return
 
     if isinstance(node, Tracker):

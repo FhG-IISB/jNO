@@ -45,6 +45,8 @@ __all__ = [
     "Jacobian",
     "Diff",
     "DiffSlot",
+    "BoundConstraint",
+    "bound_constraints",
     "NormalDerivative",
     "TemporalDerivative",
     "NetworkGradient",
@@ -831,6 +833,33 @@ class Placeholder:
         passed to ``.bind()``.
         """
         return HistoryRef(self, offset)
+
+    def bounds(self, lo=None, hi=None) -> "BoundConstraint":
+        """Declare a **box constraint** ``lo <= self <= hi`` on this unknown.
+
+        A bound is part of the problem *statement* — the inequality sibling of a Dirichlet condition —
+        so it goes in the ``jno.fem([...])`` list beside the equations and ``fem.solve()`` still takes
+        nothing. It turns the solve into a **variational inequality**: instead of ``R(u) = 0``
+        everywhere, the solution satisfies the KKT conditions ``R = 0`` strictly inside the box,
+        ``R >= 0`` where ``u`` sits on ``lo`` and ``R <= 0`` where it sits on ``hi`` (the contact
+        reaction / multiplier). That is a *solve*, not a clip: clipping an unconstrained solution
+        satisfies the bound too, and puts the free boundary in the wrong place.
+
+        Pass ``None`` for either side to leave it unbounded::
+
+            dm.bounds(0.0, 1.0)          # a damage variable is a fraction
+            u.bounds(psi, None)          # an obstacle from below (one-sided)
+            dm.bounds(dm.i(-1), 1.0)     # bound-constrained irreversibility on a load-path march
+
+        ``lo``/``hi`` accept a number, a coordinate expression (evaluated at this field's DOF points,
+        like a Dirichlet value), or ``self.i(-1)`` — the previous load step's values on a
+        ``domain(tau=...)`` march. They may not depend on the *live* unknown; that would be a general
+        complementarity problem, not a box, and is rejected.
+
+        The residual must be written in the standard variational orientation ``a(u,v) - L(v)`` (the
+        gradient of an energy), which is what fixes the sign of the multiplier above. A form written
+        with the opposite sign states a different inequality — see ``docs/fem.md``."""
+        return BoundConstraint(self, lo, hi)
 
     def evolves(self, formula) -> "StateUpdate":
         """Declare a per-step **state update** for this (internal-state) field: at the current step it
@@ -4087,6 +4116,90 @@ class StateUpdate(Placeholder):
 
     def __repr__(self):
         return f"StateUpdate({getattr(self.target, 'name', 'state')})"
+
+
+class BoundConstraint(Placeholder):
+    """A **box constraint** on an unknown — ``u.bounds(lo, hi)``, produced by :meth:`Placeholder.bounds`.
+
+    Not a residual (it carries no test function) and not an equation: it states the feasible set the
+    solution must lie in. The FEM front-end pulls it out into its own bucket before the weak-form /
+    Dirichlet classification — like :class:`StateUpdate` — and the solve enforces it through the KKT
+    conditions of the resulting variational inequality.
+
+    ``lo``/``hi`` are kept raw (a number, a coordinate expression, or a :class:`HistoryRef`); resolving
+    them to DOF-space vectors needs the assembled field layout, so it happens at solve time. Either may
+    be ``None`` for a one-sided bound. Only ``target`` is walked as a child: ``lo``/``hi`` live in
+    DOF space, and walking them would let a ``self.i(-1)`` bound allocate a per-quadrature-point history
+    buffer it never reads."""
+
+    def __init__(self, base, lo=None, hi=None):
+        base = base._expr if hasattr(base, "_expr") else base  # unwrap a typed view
+        if lo is None and hi is None:
+            raise ValueError(
+                "jno.fem: `.bounds(lo, hi)` needs at least one side — pass a number or expression for "
+                "`lo`, `hi`, or both. `bounds(None, None)` constrains nothing."
+            )
+        if getattr(base, "field_key", None) is None:
+            raise TypeError(
+                "jno.fem: `.bounds(...)` applies to a field from `domain.fem_symbols()` (the unknown "
+                f"being solved for), not to {type(base).__name__}. A bound on a general expression is a "
+                "nonlinear complementarity problem, not a box constraint."
+            )
+
+        def _reads_live_unknown(node, seen=None):
+            """Does ``node`` reach a trial/test field other than through a ``.i(k)`` history read?"""
+            if not isinstance(node, Placeholder):
+                return False
+            seen = seen if seen is not None else set()
+            if id(node) in seen:
+                return False
+            seen.add(id(node))
+            if isinstance(node, HistoryRef):
+                return False  # a past value is data, not the live unknown
+            if isinstance(node, (TrialFunction, TestFunction)):
+                return True
+            for _kind, _attr, child in _iter_placeholder_children(node):
+                kids = [child] if isinstance(child, Placeholder) else list(child)
+                if any(_reads_live_unknown(k, seen) for k in kids):
+                    return True
+            return False
+
+        for side, val in (("lo", lo), ("hi", hi)):
+            if _reads_live_unknown(val):
+                raise ValueError(
+                    f"jno.fem: the `{side}` of `.bounds(...)` may not depend on the live unknown — that is a "
+                    "general complementarity problem, not a box. Use a number, a coordinate expression, or "
+                    "`self.i(-1)` (the previous load step)."
+                )
+        if isinstance(lo, (int, float)) and isinstance(hi, (int, float)) and float(lo) > float(hi):
+            raise ValueError(f"jno.fem: `.bounds(lo, hi)` has an empty box — lo={float(lo)} is above hi={float(hi)}.")
+        self.target = base
+        self.lo = lo
+        self.hi = hi
+        self.name = f"{getattr(base, 'name', 'u')}.bounds({lo}, {hi})"
+        self.value_shape = tuple(getattr(base, "value_shape", ()))
+        self.order = int(getattr(base, "order", 1))
+        self.space = str(getattr(base, "space", "Lagrange"))
+        self.field_key = getattr(base, "field_key", None)
+        self.op_id = _next_op_id()
+
+    def __repr__(self):
+        return f"BoundConstraint({getattr(self.target, 'name', 'u')}, lo={self.lo}, hi={self.hi})"
+
+
+def bound_constraints(terms):
+    """The top-level :class:`BoundConstraint` nodes in ``terms``, as ``{field_key: BoundConstraint}``.
+
+    One box per field (a later declaration wins). The FEM front-end uses this to pull ``u.bounds(...)``
+    out of the weak-form / Dirichlet classification and into its own bucket."""
+    if isinstance(terms, Placeholder):
+        terms = [terms]
+    out: dict = {}
+    for t in terms:
+        node = t._expr if hasattr(t, "_expr") else t
+        if isinstance(node, BoundConstraint):
+            out[node.field_key] = node
+    return out
 
 
 def history_variables(terms):

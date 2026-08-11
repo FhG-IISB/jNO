@@ -148,6 +148,64 @@ in the `jno.fem([...])` list, and `jno.fem` classifies each by the region it is 
 for a spatially varying Dirichlet value). A zero Neumann flux is the natural default and needs
 no term.
 
+### Inequalities — `u.bounds(lo, hi)`
+
+A **box constraint** is the inequality sibling of a Dirichlet condition, so it is a term too, and
+`fem.solve()` still takes nothing:
+
+```python
+jno.fem([
+    inner(grad(u, X), grad(phi, X), 1) + 1.0 * phi,   # -Δu = -1
+    u(*ends) - 0.0,
+    u.bounds(-c, None),                               # an obstacle from below (one side; None = free)
+])
+```
+
+This turns the solve into a **variational inequality**. Instead of `R(u) = 0` everywhere, the solution
+satisfies the KKT conditions
+
+| where | condition |
+|---|---|
+| `lo < u < hi` | `R = 0` (equilibrium) |
+| `u = lo` | `R ≥ 0` (the constraint pushes back) |
+| `u = hi` | `R ≤ 0` |
+
+which are exactly the zeros of the **min-map** `min(max(R, u - hi), u - lo)` — the natural residual of
+a box-constrained VI (Facchinei & Pang, *Finite-Dimensional Variational Inequalities and
+Complementarity Problems*, Springer 2003, §1.5). That function is semismooth rather than smooth, and
+Newton on it converges locally superlinearly (Qi & Sun, *A nonsmooth version of Newton's method*,
+Math. Programming **58**, 1993). No new solver is involved: `jax.linearize` differentiates through
+`min`/`max` by selecting the active branch, which *is* the semismooth Jacobian, so the existing
+Newton–Krylov and sparse-direct drivers apply unchanged — and `lax.custom_root` differentiates the
+result on the same operator.
+
+**A bound is solved, not clipped.** Clipping an unconstrained solution satisfies the bound just as
+exactly and gives the wrong answer, because it puts the *free boundary* in the wrong place. On the
+classic obstacle problem `-u'' = -1`, `u(0)=u(1)=0`, `u ≥ -c`, the membrane leaves the obstacle where
+it meets it **tangentially**, at `x = √(2c)`; a clip detaches where the unconstrained parabola
+**crosses** `-c`, at `x = (1-√(1-8c))/2`. At `c = 1/18` that is 0.333 versus 0.127.
+
+`lo`/`hi` accept a number, a coordinate expression (evaluated at that field's DOF points, like a
+Dirichlet value), or `u.i(-1)` — the previous load step on a `domain(tau=...)` march, which gives
+**bound-constrained irreversibility**: `u.bounds(u.i(-1), None)` lets a field ratchet up and never
+come back down. They may not depend on the live unknown; that is a general complementarity problem
+rather than a box, and is rejected.
+
+!!! warning "Sign convention"
+    The min-map takes the multiplier's sign from the residual's, so the weak form must be written in
+    the standard variational orientation `a(u,v) - L(v)` — the gradient of an energy, which is how
+    every form in these docs is written. Written with the opposite sign it states the *other*
+    inequality. This cannot be detected from the residual alone, so it is a convention, not a check.
+
+**Scope.** Bounds are wired on the steady residual path (real, 2D/3D native Lagrange, single-field or
+coupled), including inside a `tau=` load-path march; a transient or complex assembly is rejected with
+a clear error. One box per field. Note that a bound is not a cure for an ill-posed operator: in a
+phase-field form `dm.bounds(0, 1)` keeps the damage in range but does **not** remove the need for a
+floor on `(1-dm)²`, which at `dm = 1` would otherwise make the displacement block singular. And on a
+non-convex energy a monolithic Newton is not expected to converge whether or not a bound is present —
+see the staggered driver. Non-convergence raises on an eager solve; inside a march it cannot (the
+step runs under `lax.scan`), which is the same pre-existing limitation every marched Newton has.
+
 ### Components and derivatives — `u[i]` vs `u.x`
 
 For a vector field the two are distinct spellings and each means one thing:
@@ -344,7 +402,10 @@ answer `uy(y=1) = -0.01` to 1.5e-05 at `c = 1e6`.
 > The gap is non-local (it reads DOFs on the other body's cells), so the tangent is matrix-free;
 > `newton(direct=True)` is refused. **One-sided contact does not yet converge to tight tolerances**: the
 > `max(0, ·)` kink is non-smooth and the residual stalls around 1e-2 with a line search, against a 1e-8
-> target. The bonded two-sided path is smooth and converges.
+> target. The bonded two-sided path is smooth and converges. Signorini contact is the same kind of
+> object as [`u.bounds(lo, hi)`](#inequalities--uboundslo-hi) — a complementarity condition rather than
+> a penalty — so that machinery is the natural route for it, but the reformulation has **not** been
+> done and the penalty path above is what exists today.
 
 ---
 

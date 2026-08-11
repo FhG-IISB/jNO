@@ -565,6 +565,7 @@ def assemble_fem_native(
     vec: int,
     quad_degree: int,
     evolution: Optional[Dict[Any, Any]] = None,
+    bounded: bool = False,
 ) -> Tuple[Any, str]:
     """Assemble a Lagrange FEM system into ``(op, mode, offs)`` for :class:`FEM`.
 
@@ -2634,6 +2635,12 @@ def assemble_fem_native(
     # same linear solve and there is exactly one march path to maintain. The AT1 phase-field damage
     # equation with a lagged driving force is precisely this shape, so it is on the critical path.
     if history_specs or surface_history_specs:
+        nonlinear = True
+    # A BOX CONSTRAINT (`u.bounds(lo, hi)`) makes the problem a variational inequality even when the
+    # operator is linear -- the obstacle problem is a linear operator whose answer is decided by the free
+    # boundary. Its KKT conditions are the root of a min-map residual, so it needs the residual path, not
+    # a matrix/rhs pair. Same reason as history above, different cause.
+    if bounded:
         nonlinear = True
     s_d_dofs = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32) if dirichlet_pairs else None
     s_d_vals = jnp.asarray([p[1] for p in dirichlet_pairs], dtype=zeros.dtype) if dirichlet_pairs else None

@@ -451,7 +451,10 @@ def _coupled_damage_march(*, irreversible, nstep=7, load=1.5, ell=0.4, gc=1.0, f
     dm, q = d.fem_symbols()
     Hs, _ = d.fem_symbols(value_shape=())
     psi_e = 0.5 * inner(grad(u, X), grad(u, X), 1)  # elastic energy density (the crack driving force)
-    deg = (1.0 - dm) ** 2 + floor  # degradation, floored: without `dm.bounds(0, 1)` the feedback runs away
+    # Degradation, floored. The floor does two jobs and only one of them is a bound's: it keeps the
+    # damage feedback from running away (unbounded, this reaches dm ~ 1e6), AND it keeps the u block
+    # non-singular at dm = 1, which `dm.bounds(0, 1)` does not fix — see tests/test_fem_bounds.py.
+    deg = (1.0 - dm) ** 2 + floor
     ramp = 1.0 - jno.np.abs(2 * tau - 1.0)  # triangular: 0 -> 1 -> 0
     fem = jno.fem(
         [

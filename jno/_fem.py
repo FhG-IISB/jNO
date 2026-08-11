@@ -37,6 +37,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from .trace import (
+    BoundConstraint,
     FemLinearSystem,
     FemResidualOperator,
     FunctionCall,
@@ -49,11 +50,22 @@ from .trace import (
     TestFunction,
     TrialFunction,
     Variable,
+    bound_constraints,
     mesh_velocity,
     state_updates,
 )
 
 __all__ = ["fem", "FEM"]
+
+
+def _default_newton(residual_fn, u0):
+    """The operator's own default nonlinear driver, called explicitly.
+
+    ``FemResidualOperator.solve(None)`` picks this internally; the bound wrapper has to name it because
+    it always hands the operator a ``solve_fn``, so "no slot passed" can no longer mean "use the default"."""
+    from .utils.solver.newton_krylov import newton_krylov
+
+    return newton_krylov(residual_fn, u0)
 
 
 def _as_dense(x):
@@ -1639,6 +1651,13 @@ class FEM:
         else:
             from_slots = False
 
+        # ---- BOX CONSTRAINTS (`u.bounds(lo, hi)`): wrap whatever nonlinear driver was composed above so
+        # it root-finds the min-map instead of the bare residual. Done here, once, so the same wrapper
+        # serves the plain steady solve and every step of the history march below, and composes with any
+        # `nonlinear=` slot the caller picked. ----
+        if getattr(self, "_bound_specs", None):
+            solve_fn = self._bounded_solve_fn(solve_fn)
+
         # ---- pseudo-time HISTORY MARCH (path-dependent state, e.g. plasticity): the op carries step-
         # history buffers (``.i(k)`` in the form) and the domain a ``tau=`` pseudo-time grid. March the
         # grid, threading τ as the load coordinate and the per-QP internal state on ``args["__history__"]``;
@@ -2192,6 +2211,127 @@ class FEM:
         if shapes and idx < len(shapes):
             return shapes[idx]
         return ()
+
+    # ---- box constraints (``u.bounds(lo, hi)``) -------------------------------------------------
+    def _bounded_solve_fn(self, solve_fn):
+        """Wrap a ``(residual_fn, u0) -> u`` solver so it root-finds the box's **min-map** instead.
+
+        The KKT conditions of the box-constrained problem — ``R = 0`` strictly inside, ``R >= 0`` on
+        ``lo``, ``R <= 0`` on ``hi`` — are exactly the zeros of
+
+            Phi(u) = min( max( R(u), u - hi ), u - lo )
+
+        the *natural residual* / min function of the box-constrained variational inequality (Facchinei &
+        Pang, *Finite-Dimensional Variational Inequalities and Complementarity Problems*, Springer 2003,
+        §1.5). ``Phi`` is semismooth rather than smooth, and Newton on it converges locally
+        superlinearly (Qi & Sun, *A nonsmooth version of Newton's method*, Math. Programming 58, 1993).
+
+        This needs no new solver: ``jax.linearize`` differentiates through ``min``/``max`` by selecting
+        the active branch, which IS the semismooth Jacobian (the residual row where the constraint is
+        inactive, an identity row where it is active), so the existing Newton-Krylov and sparse-direct
+        drivers apply unchanged — and ``lax.custom_root`` differentiates the result on that same
+        operator, which is the implicit-function theorem for the active set at the solution.
+
+        **Sign convention.** ``Phi`` fixes the multiplier's sign from the residual's, so the weak form
+        must be written in the standard variational orientation ``a(u,v) - L(v)`` (the gradient of an
+        energy). Written with the opposite sign it states the *other* inequality. There is no way to
+        detect this from the residual alone, so it is a documented convention, not a checked one."""
+
+        def _bounded(residual_fn, u0):
+            u0 = jnp.asarray(u0).reshape(-1)
+            resolved = self._resolve_bounds(u0)
+            if resolved is None:
+                return solve_fn(residual_fn, u0) if solve_fn is not None else _default_newton(residual_fn, u0)
+            lo, hi = resolved
+            has_lo, has_hi = jnp.isfinite(lo), jnp.isfinite(hi)
+            # Finite stand-ins under the `where`: an infinite bound would put +-inf into the arithmetic
+            # (and its tangent) even on the branch that is discarded.
+            lo_s = jnp.where(has_lo, lo, 0.0)
+            hi_s = jnp.where(has_hi, hi, 0.0)
+
+            def phi(u):
+                u = jnp.asarray(u).reshape(-1)
+                r = jnp.asarray(residual_fn(u)).reshape(-1)
+                r = jnp.where(has_hi, jnp.maximum(r, u - hi_s), r)
+                return jnp.where(has_lo, jnp.minimum(r, u - lo_s), r)
+
+            # Start inside the box: the min-map is only informative on a feasible iterate, and a warm
+            # start from the previous load step can sit exactly on the old bound.
+            start = jnp.clip(u0, jnp.where(has_lo, lo, -jnp.inf), jnp.where(has_hi, hi, jnp.inf))
+            return solve_fn(phi, start) if solve_fn is not None else _default_newton(phi, start)
+
+        return _bounded
+
+    def _resolve_bounds(self, u_warm):
+        """``(lo, hi)`` over the whole DOF vector for the declared boxes, or ``None`` if there are none.
+
+        Unbounded entries come back as ``-inf`` / ``+inf``, so an unconstrained DOF passes through the
+        min-map untouched. ``u_warm`` is the solve's warm start; a ``field.i(-1)`` bound reads that
+        field's block out of it, which on a ``domain(tau=...)`` march is the previous load step."""
+        specs = getattr(self, "_bound_specs", None)
+        if not specs:
+            return None
+        n = int(self.dofs)
+        lo = jnp.full((n,), -jnp.inf, dtype=jnp.zeros(()).dtype)
+        hi = jnp.full((n,), jnp.inf, dtype=lo.dtype)
+        u_warm = jnp.asarray(u_warm).reshape(-1)
+        for field_key, spec in specs.items():
+            idx = self.block_index(spec.target)
+            sl = self.blocks[idx] if self.blocks is not None else slice(0, n)
+            width = int(sl.stop) - int(sl.start)
+            for side, node in (("lo", spec.lo), ("hi", spec.hi)):
+                if node is None:
+                    continue
+                vals = self._bound_side_values(node, idx, width, u_warm, sl, side, field_key)
+                if side == "lo":
+                    lo = lo.at[sl].set(vals)
+                else:
+                    hi = hi.at[sl].set(vals)
+        return lo, hi
+
+    def _bound_side_values(self, node, idx, width, u_warm, sl, side, own_key):
+        """One side of a box, as a ``(width,)`` vector over that field's DOF block."""
+        from .trace import HistoryRef, Placeholder
+
+        if isinstance(node, (int, float, np.floating, np.integer)):
+            return jnp.full((width,), float(node), dtype=u_warm.dtype)
+        if isinstance(node, HistoryRef):
+            # ``u.i(-1)``: the previous load step's values for this field — which is exactly the warm
+            # start the march hands the solver. Only depth 1 means anything here; a deeper read would
+            # need a DOF-space trajectory the solve does not carry.
+            if int(node.offset) != -1:
+                raise NotImplementedError(
+                    f"jno.fem: `.bounds(...)` accepts `.i(-1)` (the previous load step) as the {side} bound; "
+                    f"`.i({int(node.offset)})` would need a DOF-space history the solve does not carry."
+                )
+            if getattr(node.base, "field_key", None) != own_key:
+                raise NotImplementedError(
+                    "jno.fem: a `.i(-1)` bound must read the field it bounds — a cross-field history bound "
+                    "is not wired (the two fields need not share a DOF layout)."
+                )
+            if not getattr(self.domain, "_is_pseudo_time", False):
+                raise ValueError(
+                    "jno.fem: `.bounds(..., u.i(-1), ...)` means *the previous load step*, so it needs a "
+                    "pseudo-time load path — build the domain with `domain(tau=(start, end, n))`. On a plain "
+                    "steady solve there is no previous step for the bound to refer to."
+                )
+            return u_warm[sl]
+        if isinstance(node, Placeholder):
+            # A coordinate expression: evaluated at this field's own DOF points, exactly as a
+            # spatially-varying Dirichlet value is (the mesh is built, so this is one forward pass).
+            pts = np.asarray(self.field_points[idx])
+            vals = jnp.reshape(jnp.asarray(_eval_value_node_at(node, pts)), (-1,))
+            vec = max(1, width // max(1, int(pts.shape[0])))
+            if vals.shape[0] * vec != width:
+                raise ValueError(
+                    f"jno.fem: the {side} bound expression produced {vals.shape[0]} values for a field with "
+                    f"{pts.shape[0]} DOF nodes — a bound must be a scalar function of the coordinates."
+                )
+            return jnp.repeat(vals, vec) if vec > 1 else vals
+        raise TypeError(
+            f"jno.fem: the {side} of `.bounds(...)` must be a number, a coordinate expression, or `u.i(-1)`; "
+            f"got {type(node).__name__}."
+        )
 
     @property
     def jacobian(self):
@@ -3490,6 +3630,13 @@ def _fem_impl(
     _evolution = state_updates(constraints)  # {history_key: StateUpdate}
     constraints = [c for c in constraints if not isinstance(_bare(c), StateUpdate)]
 
+    # BOX CONSTRAINTS (`u.bounds(lo, hi)`): pulled out here for the same reason — the term carries no
+    # test function and is not an equation, so the weak-form classifier would not claim it and the
+    # Dirichlet branch would read its bound as an essential value. What it states is the feasible SET,
+    # which the solve enforces through the KKT conditions of the resulting variational inequality.
+    _bounds = bound_constraints(constraints)  # {field_key: BoundConstraint}
+    constraints = [c for c in constraints if not isinstance(_bare(c), BoundConstraint)]
+
     # GEOMETRY terms (`yb.d(tb) - v`): how a mesh *coordinate* moves, stated as a residual like any other
     # equation. Pulled out here for the same reason as the evolution bucket — the term carries no test
     # function, so the weak-form classifier would not claim it, and the Dirichlet branch would try to read
@@ -3605,6 +3752,17 @@ def _fem_impl(
         fem_obj._native_dof_points = getattr(domain, "_fem_native_dof_points", None)
         _all = getattr(domain, "_fem_native_dof_points_all", None)
         fem_obj._native_dof_points_all = list(_all) if _all is not None else None
+        # Box constraints, resolved to DOF-space vectors lazily at solve time (they need the assembled
+        # field layout, which only exists now). Kept raw here so a `u.i(-1)` bound can read the warm start.
+        fem_obj._bound_specs = dict(_bounds)
+        if _bounds and fem_obj._mode not in ("nonlinear",):
+            raise NotImplementedError(
+                "jno.fem: `u.bounds(lo, hi)` is wired on the steady residual path (real, 2D/3D "
+                f"native-Lagrange, single-field or coupled); this form assembled as '{fem_obj._mode}'. A "
+                "bound states a feasible set enforced through the KKT conditions of a variational "
+                "inequality, which needs a residual to test — not a transient stepper or a complex "
+                "real-equivalent block."
+            )
         if couplings and periodic_ties and fem_obj.is_transient:
             # The native periodic *transient* block reduces eagerly into a main-DOF space; the coupling
             # residual is written in the full nodal space, so the two cannot be composed on that path yet.
@@ -4056,6 +4214,7 @@ def _fem_impl(
                 classification,
                 quad_degree=quad_degree,
                 evolution=_evolution,
+                bounded=bool(_bounds),
             )
         )
 
@@ -4154,6 +4313,7 @@ def _fem_impl(
                 vec=vec or 1,
                 quad_degree=quad_degree,
                 evolution=_evolution,
+                bounded=bool(_bounds),
             )
             return _finalize(FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs))
 
@@ -4449,7 +4609,16 @@ def _fem_impl(
 
 
 def _assemble_multifield(
-    domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, classification, *, quad_degree, evolution=None
+    domain,
+    volume_terms,
+    boundary_terms,
+    dirichlet_raw,
+    ic_residuals,
+    classification,
+    *,
+    quad_degree,
+    evolution=None,
+    bounded=False,
 ):
     """Assemble a coupled (multi-field) steady weak form into a block ``FEM``.
 
@@ -4614,6 +4783,7 @@ def _assemble_multifield(
             vec=1,
             quad_degree=quad_degree,
             evolution=evolution,
+            bounded=bounded,
         )
         return FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs)
 
