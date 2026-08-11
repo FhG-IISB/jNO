@@ -25,6 +25,8 @@ from jax.flatten_util import ravel_pytree
 from ...trace import (
     BinaryOp,
     Constant,
+    Diff,
+    DiffSlot,
     FrozenField,
     FunctionCall,
     Hessian,
@@ -1102,6 +1104,35 @@ def _eval_integrand(domain, node, local):
             # produced a buffer of the wrong rank. Squeeze here, at the one place the axis is created.
             return flat_interp[..., 0]
         return _reshape_components_last(flat_interp, value_shape)
+
+    if isinstance(node, DiffSlot):
+        # The hole a `Diff` differentiates through: its value is injected by the branch below.
+        slots = local.get("__diff_slots__") or {}
+        if node.key not in slots:
+            raise RuntimeError(
+                f"jno.fem: a diff value slot ({node.key}) was evaluated outside its `jno.np.diff(...)`. "
+                "A DiffSlot is internal — it must not appear in a weak form on its own."
+            )
+        return slots[node.key]
+
+    if isinstance(node, Diff):
+        # d(target)/d(wrt), evaluated POINTWISE at this cell's quadrature points.
+        #
+        # `wrt` is evaluated to a concrete array (n_quad, *value_shape); `target` is re-evaluated with
+        # `wrt` swapped for a value slot, so it becomes an ordinary JAX function of that array. Because a
+        # constitutive energy is pointwise in `wrt`, the quadrature axis is a batch axis and the Jacobian
+        # of the SUMMED scalar is block-diagonal — so `grad(sum(...))` returns exactly d(target_q)/d(wrt_q)
+        # per point, with `wrt`'s own shape and no vmap or reshape. Forward-over-reverse through the
+        # element `jacfwd` then yields the consistent tangent d(P)/d(F) for free.
+        wrt_val = _eval_integrand(domain, node.wrt, local)
+        rewritten = node.rewritten()
+
+        def _scalar_of(value):
+            sub = {**(local.get("__diff_slots__") or {}), node._slot.key: value}
+            out = _eval_integrand(domain, rewritten, {**local, "__diff_slots__": sub})
+            return jnp.sum(out)
+
+        return jax.grad(_scalar_of)(wrt_val)
 
     if isinstance(node, HistoryRef):
         # STEP-history read ``v.i(k)``: the driver threads this cell's per-quadrature-point buffer slice

@@ -1607,6 +1607,36 @@ mech = inner(einsum("...ij,...jk->...ik", F, S), H(phi), 2)      # ∫ (F S):∇
 `jno.fem` routes the nonlinear form to Newton (exact 20%-stretch patch test; reduces to linear elasticity
 as strain → 0). Combine with the plastic return map for finite-strain plasticity — both are formulas.
 
+**A hyperelastic material IS its stored energy — `jno.np.diff(psi, F)`.** For anything past St. Venant-
+Kirchhoff, hand-deriving the stress is where the algebra errors live. `diff` differentiates a **scalar
+expression with respect to another expression** (the constitutive counterpart of `grad`, which
+differentiates w.r.t. a coordinate), so you write the energy from the paper and get the 1st
+Piola-Kirchhoff stress:
+
+```python
+det, trace, einsum, jac, I = jno.np.det, jno.np.trace, jno.np.einsum, jno.np.jacobian, jno.np.identity(3)
+F   = I + jac(u, X)                                     # bind it ONCE, then reuse
+I1b = det(F)**(-2/3) * trace(einsum("...ki,...kj->...ij", F, F))    # first isochoric invariant
+psi = C10*(I1b - 3) + C20*(I1b - 3)**2 + C30*(I1b - 3)**3           # Yeoh, 3rd order
+mech = inner(jno.np.diff(psi, F), jac(phi, X), 2)       # P = ∂psi/∂F, then ∫ P:∇δu
+```
+
+Measured: on a Yeoh solid this reproduces the hand-derived `S = 2 ∂psi/∂C`, `P = F S` residual
+**bit-for-bit**, and the Neo-Hookean `P = μ(F − F⁻ᵀ) + λ ln(J) F⁻ᵀ` to 1e-11. The consistent tangent
+`∂P/∂F` comes out of the assembler's own element differentiation — you never write it.
+
+Two scope limits, both fail-loud rather than silent:
+
+* **It is pointwise.** The derivative is taken independently at each quadrature point, which is what a
+  constitutive law is; an `Integral` inside the target is refused (differentiate the integrand, then
+  integrate).
+* **`wrt` is matched by identity.** Bind `F` to a variable and pass that same object. A rebuilt copy
+  (`diff(psi, I + jac(u, X))` written inline) is a different node, and rather than differentiate to a
+  silent zero it raises.
+
+Any energy-derived law works the same way — Mooney-Rivlin, Ogden, Gent, anisotropic tissue models — as
+does a chemical potential `mu = diff(f, c)` or an electro/magnetostrictive coupling.
+
 ---
 
 ## Worked examples

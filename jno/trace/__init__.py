@@ -43,6 +43,8 @@ __all__ = [
     "Integral",
     "IntegralTime",
     "Jacobian",
+    "Diff",
+    "DiffSlot",
     "NormalDerivative",
     "TemporalDerivative",
     "NetworkGradient",
@@ -3032,6 +3034,91 @@ class NormalDerivative(Placeholder):
         return f"NormalDerivative({self.target})"
 
 
+class DiffSlot(Placeholder):
+    """A leaf standing in for a value injected at evaluation time — the hole :class:`Diff` differentiates
+    through. Carries no children and no coordinates, so it composes as a plain value in any formula. Not
+    user-facing: it exists only inside the rewritten copy of a :class:`Diff` target."""
+
+    def __init__(self, key: str, value_shape=()):
+        self.key = str(key)
+        self.value_shape = tuple(value_shape)
+
+    def __repr__(self):
+        return f"DiffSlot({self.key})"
+
+
+class Diff(Placeholder):
+    """``∂(target)/∂(wrt)`` — a scalar trace expression differentiated w.r.t. another **expression**.
+
+    The constitutive counterpart of :class:`Jacobian`, which differentiates w.r.t. a spatial coordinate.
+    It is what lets a hyperelastic material be written as its stored energy: given ``psi(F)``, the 1st
+    Piola-Kirchhoff stress is ``P = diff(psi, F)`` rather than a hand-derived ``S = 2 dpsi/dC`` followed
+    by ``P = F S``. See :func:`jno.np.diff`.
+
+    ``wrt`` is matched **by identity** inside ``target`` — bind it to a variable and reuse that variable.
+    A freshly rebuilt expression is a different node, would match nothing, and would differentiate to a
+    silent zero, so the constructor rejects it here rather than at assembly.
+    """
+
+    _slot_counter = 0
+
+    def __init__(self, target: "Placeholder", wrt: "Placeholder"):
+        target = target._expr if hasattr(target, "_expr") else target
+        wrt = wrt._expr if hasattr(wrt, "_expr") else wrt
+        if not isinstance(wrt, Placeholder):
+            raise TypeError(f"jno.np.diff: `wrt` must be a trace expression, got {type(wrt).__name__}.")
+        if contains_integral(target):
+            raise ValueError(
+                "jno.np.diff: the differentiated expression contains an Integral. `diff` is POINTWISE — it "
+                "differentiates a value at each quadrature point — so a reduced (integrated) target would "
+                "silently give the derivative of the sum. Differentiate the integrand, then integrate."
+            )
+        Diff._slot_counter += 1
+        self._slot = DiffSlot(f"__diff_{Diff._slot_counter}__", getattr(wrt, "value_shape", ()))
+        rewritten = substitute(target, {wrt: self._slot})
+        if rewritten is target:
+            raise ValueError(
+                "jno.np.diff: `wrt` does not occur in the expression being differentiated, so the "
+                "derivative would be identically zero. `wrt` is matched by IDENTITY: bind it once "
+                "(`F = I + grad(u, X)`) and pass that same object, rather than rebuilding it inline."
+            )
+        del rewritten  # built only to validate; the evaluator rebuilds it from the CURRENT children,
+        # because `substitute` may later rewrite this node's own target/wrt and a cached copy would go stale.
+        self.target = target  # kept so trial/field/region detection walks the ORIGINAL expression
+        self.wrt = wrt
+        self.value_shape = tuple(getattr(wrt, "value_shape", ()))
+        _propagate_weak(self, target, wrt)
+
+    def rewritten(self):
+        """``target`` with ``wrt`` replaced by this node's value slot — rebuilt on demand."""
+        return substitute(self.target, {self.wrt: self._slot})
+
+    def __repr__(self):
+        return f"Diff({self.target}, wrt={self.wrt})"
+
+
+def contains_integral(expr) -> bool:
+    """True if ``expr`` contains an :class:`Integral` / :class:`IntegralTime` reduction anywhere."""
+    seen: set = set()
+
+    def walk(node) -> bool:
+        if not isinstance(node, Placeholder) or id(node) in seen:
+            return False
+        seen.add(id(node))
+        if isinstance(node, (Integral, IntegralTime)):
+            return True
+        for _kind, _attr, val in _iter_placeholder_children(node):
+            if isinstance(val, Placeholder):
+                if walk(val):
+                    return True
+            else:
+                if any(walk(c) for c in val if isinstance(c, Placeholder)):
+                    return True
+        return False
+
+    return walk(expr)
+
+
 class Integral(Placeholder):
     """Mesh-based integral reduction of an expression over its domain region.
 
@@ -3797,7 +3884,7 @@ def _iter_placeholder_children(node):
     """Yield ``(kind, attr, value)`` for each Placeholder-bearing child of a trace node — the scalar
     child attributes (``target``/``left``/``right``/``expr``/``operation``) and the list attributes
     (``args``/``variables``/``options``). The single traversal shape used by all trace walks here."""
-    for attr in ("target", "left", "right", "expr", "operation"):
+    for attr in ("target", "wrt", "left", "right", "expr", "operation"):
         child = getattr(node, attr, None)
         if isinstance(child, Placeholder):
             yield "scalar", attr, child
