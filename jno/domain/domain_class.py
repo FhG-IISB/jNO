@@ -919,13 +919,65 @@ class domain(MeshIOMixin):
         """
         return sorted(self._boundary_registry.keys())
 
-    def interface_tags(self):
-        """Return the internal material-interface tags (``"a|b"``) from a :meth:`Shape.regions` domain.
+    def interface_tags(self, *regions: str):
+        """Internal material-interface tags from a :meth:`Shape.regions` domain.
 
-        These are facet regions between two materials — impose a coupling/flux condition on one, or
-        sample it — but they are *not* part of :meth:`boundary_tags` (the outer boundary).
+        With no arguments, every interface tag (``"a|b"``) — facet regions between two materials, on
+        which you can impose a coupling or flux condition. They are deliberately *not* part of
+        :meth:`boundary_tags`, which is the outer boundary only.
+
+        Given **two region names**, the two *sides* of that interface, in the order asked::
+
+            lo, hi = d.interface_tags("substrate", "coating")   # ("...substrate", "...coating")
+            a, b = d.variable(lo, split=True), d.variable(hi, split=True)
+            fem = jno.fem([..., T(a[0], a[1]) - T(b[0], b[1])])   # glue the two bodies
+
+        A ``conforming=False`` domain meshes each region separately, so the shared surface exists
+        **twice** — once per body, spatially coincident, with different node layouts. No ``domain.tag``
+        predicate can separate them (they occupy the same points), which is why the emitter names them
+        ``"a|b.a"`` / ``"a|b.b"`` and why they are reached through their region names rather than
+        geometrically. Returning them in the order asked means the caller chooses which side a tie
+        eliminates, rather than inferring it from alphabetical order.
+
+        **Order matters, and there is a right answer.** In ``u(A) - u(B)`` the first region is the
+        **slave**: its interface DOFs are eliminated in favour of an interpolation from the master. So
+        the slave must be the more finely meshed side, or the fine mesh's resolution at the interface
+        is discarded. Measured on a coating/substrate tie with 81 nodes against 10::
+
+            slave = the 81-node side  ->  interface value exact       (0.00% error)
+            slave = the 10-node side  ->  interface value off by 10.62%
+
+        Nothing detects this today, and the wrong choice produces a plausible number rather than an
+        error -- so pass the finer region first.
         """
-        return sorted(getattr(self, "_interface_registry", {}).keys())
+        registry = getattr(self, "_interface_registry", {}) or {}
+        if not regions:
+            return sorted(registry)
+        if len(regions) != 2:
+            raise TypeError(f"domain.interface_tags: pass no regions, or exactly two; got {len(regions)}.")
+
+        pair = "|".join(sorted(str(r) for r in regions))
+        sides = {t.rpartition(".")[2]: t for t in registry if t.rpartition(".")[0] == pair}
+        if not sides:
+            if pair in registry:
+                raise ValueError(
+                    f"domain.interface_tags({regions[0]!r}, {regions[1]!r}): this is a CONFORMING "
+                    f"interface, so the two regions share one surface ({pair!r}) and there are no "
+                    "separate sides to tie. Build the domain with Shape.regions(..., conforming=False) "
+                    "to mesh each body independently."
+                )
+            known = sorted({t.rpartition(".")[0] or t for t in registry})
+            raise ValueError(
+                f"domain.interface_tags: no interface between {regions[0]!r} and {regions[1]!r}. "
+                f"Known interfaces: {known}. Two regions only share one when they touch."
+            )
+        missing = [r for r in regions if str(r) not in sides]
+        if missing:
+            raise ValueError(
+                f"domain.interface_tags: {pair!r} has sides {sorted(sides)}, which does not include "
+                f"{missing}. Pass the two region names that form the interface."
+            )
+        return tuple(sides[str(r)] for r in regions)
 
     def dirichlet(self, tags, values=None):
         """

@@ -60,9 +60,15 @@ xc, yc, _ = d.variable("coating", split=True)
 Ts, ps = T.bind(x=xs, y=ys), phi.bind(x=xs, y=ys)
 Tc, pc = T.bind(x=xc, y=yc), phi.bind(x=xc, y=yc)
 
-# The two sides of the interface, auto-named by the emitter: they are spatially coincident, so no
-# spatial predicate could tell them apart.
-lo, hi = sorted(t for t in d.built_mesh.cell_sets if "|" in t)
+# The two sides of the interface. They are spatially coincident -- the shared surface exists twice,
+# once per body -- so no `d.tag` predicate could separate them; they are reached by region name.
+#
+# ORDER MATTERS: the first region is the SLAVE, whose interface DOFs are eliminated in favour of an
+# interpolation from the master. The slave must therefore be the *finer* side, or the fine mesh's
+# resolution at the interface is thrown away. Measured on this geometry:
+#     slave = coating   (81 nodes)  ->  T_interface = 0.05000   exact, 0.00% error
+#     slave = substrate (10 nodes)  ->  T_interface = 0.05531          10.62% error
+lo, hi = d.interface_tags("coating", "substrate")
 a, b = d.variable(lo, split=True), d.variable(hi, split=True)
 xt, yt, _ = d.variable("top", split=True)  # coating outer surface: flux q in
 xb, yb, _ = d.variable("bottom", split=True)  # substrate base: T = 0
