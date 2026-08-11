@@ -2345,7 +2345,15 @@ def _face_nodes(domain: Any, points: Any, bnodes: Optional[np.ndarray], tag: str
         coords = np.asarray(points)[bnodes]
         mask = np.asarray(pred(*(coords[:, i] for i in range(coords.shape[1]))), dtype=bool).reshape(-1)
         if mask.any():
-            return np.asarray(bnodes)[mask]
+            sel = np.asarray(bnodes)[mask]
+            # `d.tag(..., region=...)`: the predicate alone selects BOTH coincident sides of a
+            # non-conforming interface, since they share coordinates. Without the ownership filter the
+            # tie sees each face twice and the mortar segmentation covers a slave facet twice over.
+            owner = (getattr(domain, "_tag_regions", {}) or {}).get(tag)
+            if owner is not None and owner in ti:
+                sel = np.intersect1d(sel, np.asarray(ti[owner], dtype=int).reshape(-1))
+            if len(sel):
+                return sel
     return np.asarray(ti[tag], dtype=int).reshape(-1) if tag in ti else None
 
 

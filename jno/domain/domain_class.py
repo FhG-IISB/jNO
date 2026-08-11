@@ -1454,8 +1454,21 @@ class domain(MeshIOMixin):
             return None
         return lambda p: region.contains(p)
 
-    def tag(self, name, where):
+    def tag(self, name, where, region=None):
         """Define a named region from a **spatial** predicate ``where(x, y[, z]) -> bool``.
+
+        ``region=`` restricts the predicate to **one body's** nodes. It exists because a spatial
+        predicate cannot always separate what you mean: a ``Shape.regions(..., conforming=False)``
+        domain meshes each body independently, so the shared surface exists *twice* -- two coincident
+        sets of nodes at identical coordinates. No function of ``(x, y, z)`` can tell them apart.
+        Naming which body owns the facet supplies the missing discriminator::
+
+            d.tag("film_face", lambda x, y: abs(y - 1.0) < 1e-9, region="coating")
+            d.tag("base_face", lambda x, y: abs(y - 1.0) < 1e-9, region="substrate")
+            fem = jno.fem([..., T(a[0], a[1]) - T(b[0], b[1])])   # glue the two bodies
+
+        It is equally the answer to "the part of the outer boundary belonging to *this* body", which a
+        coordinate predicate also cannot express once two bodies touch.
 
         One general method for naming any subset of the domain -- interior *or* boundary. The
         region is abstract (predicate-based), so it is carried even without a mesh: the PINN
@@ -1492,8 +1505,22 @@ class domain(MeshIOMixin):
                 return np.asarray(_cxy(_g, np.asarray(x), np.asarray(y)))
 
         self._tag_predicates[name] = where
+        if region is not None:
+            # Stored, not applied here: `_register_tag_boundary_region` works on facet COORDINATES and
+            # dedups them, so the two coincident sides of a non-conforming interface are already
+            # indistinguishable by the time it runs. The restriction is resolved where node IDs still
+            # exist -- see `fem_native._boundary_node_ids`.
+            known = set(getattr(self, "tag_indices", {}) or {})
+            if str(region) not in known:
+                raise ValueError(
+                    f"tag({name!r}, region={region!r}): unknown region. Known: {sorted(known)}. "
+                    "`region=` names the BODY that owns the facets (a Shape.regions name), which is "
+                    "what tells two coincident interface surfaces apart."
+                )
+            self._tag_regions = getattr(self, "_tag_regions", {})
+            self._tag_regions[name] = str(region)
         self._materialize_tag_pool(name, where)
-        self._register_tag_boundary_region(name, where)
+        self._register_tag_boundary_region(name, where, region)
         # Lazy mesh-free sampling: register the parent geometry so PolygonDomain.sample can draw the
         # region with sample=(n, None); _sample_interior filters by the predicate (resampled each step).
         poly_tags = getattr(self, "_polygon_tags", None)
@@ -1597,16 +1624,33 @@ class domain(MeshIOMixin):
         )
         return expr
 
-    def _register_tag_boundary_region(self, name, where):
+    def _register_tag_boundary_region(self, name, where, region=None):
         """If any **boundary** facets satisfy ``where``, register a ``BoundaryRegion`` for ``name``
         so a ``jno.fem`` term bound to it classifies as a boundary (Dirichlet / Neumann) condition
         and ``variable(name, normals=True)`` works. Interior-only tags add nothing here (they stay
-        interior sampling regions). 2-D edges; 3-D triangles."""
+        interior sampling regions). 2-D edges; 3-D triangles.
+
+        With ``region=`` the search also covers **interface** facets. It has to: a non-conforming
+        interface is deliberately kept out of the ``"boundary"`` region -- otherwise a plain
+        ``u(boundary) - g`` would pin it and silently solve two disconnected bodies -- so a predicate
+        over the interface plane would otherwise match nothing at all and the tag would never register.
+        The facets of the two sides are coincident, so this cannot separate them (it dedups by
+        coordinate); that is resolved later against node IDs in ``fem_native._boundary_node_ids``.
+        """
         full = self._boundary_regions.get("boundary")
         if full is None:
             return
         dim = self.dimension
-        ents = full.edges if dim == 2 else full.triangles
+        attr = "edges" if dim == 2 else "triangles"
+        blocks = [getattr(full, attr)]
+        if region is not None:
+            blocks += [
+                getattr(r, attr)
+                for t, r in self._boundary_regions.items()
+                if "|" in t and getattr(r, attr) is not None and len(getattr(r, attr))
+            ]
+        blocks = [np.asarray(b) for b in blocks if b is not None and len(b)]
+        ents = np.concatenate(blocks, axis=0) if blocks else None
         if ents is None or len(ents) == 0:
             return
         ents = np.asarray(ents)  # (E, k, dim)

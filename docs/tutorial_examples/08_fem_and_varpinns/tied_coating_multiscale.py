@@ -60,16 +60,20 @@ xc, yc, _ = d.variable("coating", split=True)
 Ts, ps = T.bind(x=xs, y=ys), phi.bind(x=xs, y=ys)
 Tc, pc = T.bind(x=xc, y=yc), phi.bind(x=xc, y=yc)
 
-# The two sides of the interface. They are spatially coincident -- the shared surface exists twice,
-# once per body -- so no `d.tag` predicate could separate them; they are reached by region name.
+# The two sides of the interface. The shared surface exists TWICE -- once per body, at identical
+# coordinates -- so a spatial predicate selects both; `region=` names which body owns the facets, and
+# is the only thing that can tell them apart.
 #
-# ORDER MATTERS: the first region is the SLAVE, whose interface DOFs are eliminated in favour of an
-# interpolation from the master. The slave must therefore be the *finer* side, or the fine mesh's
-# resolution at the interface is thrown away. Measured on this geometry:
-#     slave = coating   (81 nodes)  ->  T_interface = 0.05000   exact, 0.00% error
-#     slave = substrate (10 nodes)  ->  T_interface = 0.05531          10.62% error
-lo, hi = d.interface_tags("coating", "substrate")
-a, b = d.variable(lo, split=True), d.variable(hi, split=True)
+# ORDER MATTERS: in `u(A) - u(B)` the first is the SLAVE, whose interface DOFs are eliminated in favour
+# of an interpolation from the master, so the slave must be the *finer* side or the fine mesh's
+# resolution at the interface is discarded. Measured here:
+#     slave = coating   (81 interface nodes)  ->  T_interface = 0.05000   exact
+#     slave = substrate (10 interface nodes)  ->  T_interface = 0.05531   10.62% error
+on_interface = lambda x, y: np.abs(y - L_SUB) < 1e-9  # noqa: E731
+d.tag("film_face", on_interface, region="coating")  # slave: the finer side
+d.tag("base_face", on_interface, region="substrate")  # master
+a, b = d.variable("film_face", split=True), d.variable("base_face", split=True)
+
 xt, yt, _ = d.variable("top", split=True)  # coating outer surface: flux q in
 xb, yb, _ = d.variable("bottom", split=True)  # substrate base: T = 0
 

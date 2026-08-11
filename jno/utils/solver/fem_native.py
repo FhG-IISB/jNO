@@ -1937,6 +1937,26 @@ def assemble_fem_native(
                     return []
                 mask = np.asarray(jax.vmap(loc)(jnp.asarray(coords)), dtype=bool).reshape(-1)
             bnodes = bnodes[mask]
+        # `d.tag(..., region=...)`: keep only the nodes belonging to that body. Two coincident faces of
+        # a non-conforming interface have identical coordinates, so the predicate above selects BOTH;
+        # ownership is the only thing that separates them, and it lives in the node ids.
+        _owner = (getattr(domain, "_tag_regions", {}) or {}).get(region)
+        if _owner is not None and bnodes.size:
+            own = np.asarray(_region_node_ids(domain, _owner), dtype=np.int64)
+            if own.size == 0:
+                raise ValueError(f"tag region {_owner!r} has no nodes on this mesh; cannot restrict {region!r}.")
+            if int(fields[fidx]["order"]) != 1:
+                raise NotImplementedError(
+                    f"tag({region!r}, region={_owner!r}) is resolved against the P1 node numbering, but "
+                    f"this field is P{fields[fidx]['order']}. Use order-1 elements for a region-restricted "
+                    "tag, or tag the two sides by their auto names from domain.interface_tags()."
+                )
+            bnodes = np.intersect1d(bnodes, own)
+            if bnodes.size == 0:
+                raise ValueError(
+                    f"tag({region!r}, region={_owner!r}) selected no nodes: the predicate and the body "
+                    "do not overlap. Check the predicate reaches that body's surface."
+                )
         if bnodes.size == 0:  # interior pin (no boundary facet matched) -> predicate over all nodes
             return list(_region_node_ids_from_pts(domain, region, pts_all))
         return [int(n) for n in bnodes]

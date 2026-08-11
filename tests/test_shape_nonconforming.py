@@ -211,6 +211,50 @@ def test_a_graded_interface_uses_the_mortar_coupling():
     assert abs(graded - same) / same < 0.05, f"graded {graded:.6f} vs uniform {same:.6f}"
 
 
+def _graded_stack():
+    """Coarse base under a finer film, meshed independently — a genuinely non-matching interface."""
+    return jno.Shape.regions(
+        base=jno.Shape.rect(0.0, 0.0, 2.0, 1.0, size=0.25),
+        film=jno.Shape.rect(0.0, 1.0, 2.0, 1.4, size=0.08),
+        conforming=False,
+    ).domain()
+
+
+def test_tag_region_separates_two_coincident_faces():
+    """The two sides of a non-conforming interface share coordinates exactly, so no ``d.tag``
+    predicate can separate them — ``region=`` names the owning body, which is the only discriminator.
+    Both must register as boundary regions AND resolve to *different* node sets."""
+    d = _graded_stack()
+    on = lambda x, y: np.abs(y - 1.0) < 1e-9  # noqa: E731
+    d.tag("film_face", on, region="film")
+    d.tag("base_face", on, region="base")
+
+    assert "film_face" in d._boundary_regions and "base_face" in d._boundary_regions
+    assert d._tag_regions == {"film_face": "film", "base_face": "base"}
+
+    from jno._fem import _face_nodes
+
+    pts = np.asarray(d.built_mesh.points)
+    bn = np.unique(np.asarray(d.built_mesh.cells_dict["line"]))
+    f = _face_nodes(d, pts[:, :2], bn, "film_face")
+    b = _face_nodes(d, pts[:, :2], bn, "base_face")
+    assert len(set(f.tolist()) & set(b.tolist())) == 0, "the two sides must not share nodes"
+    assert len(f) != len(b), "a graded interface should give the two sides different node counts"
+
+
+def test_tag_region_reaches_the_interface_at_all():
+    """A non-conforming interface is deliberately kept OUT of the catch-all ``"boundary"`` region, so
+    a predicate over the interface plane finds nothing there. ``region=`` has to widen the facet search
+    to interface facets, or the tag silently never registers."""
+    d = _graded_stack()
+    with pytest.raises(ValueError, match="unknown region"):
+        d.tag("bad", lambda x, y: np.abs(y - 1.0) < 1e-9, region="not_a_body")
+    d.tag("plain", lambda x, y: np.abs(y - 1.0) < 1e-9)  # no region= -> never reaches the interface
+    assert "plain" not in d._boundary_regions
+    d.tag("owned", lambda x, y: np.abs(y - 1.0) < 1e-9, region="film")
+    assert "owned" in d._boundary_regions
+
+
 def test_conforming_is_a_reserved_region_name():
     with pytest.raises(TypeError, match="must be a bool"):
         jno.Shape.regions(a=jno.Shape.box(0, 0, 0, 1, 1, 1), b=jno.Shape.box(0, 0, 1, 1, 1, 2), conforming="no")
