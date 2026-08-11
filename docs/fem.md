@@ -1271,6 +1271,36 @@ marker, `picard(damping=…)` is exactly damped Newton (`jno.solve.newton(dampin
 problems: implicit differentiation then also uses the lagged Jacobian — drop `lag` when exact parameter
 gradients matter more than per-step solvability.
 
+**Alternate minimization — `jno.solve.staggered([u, d])`.** Some coupled energies are **non-convex in
+the fields jointly but convex in each separately**. A monolithic Newton then has no descent guarantee
+and simply diverges; solving one field at a time turns the problem into a sequence of convex solves:
+
+```python
+sol = fem.solve(nonlinear=jno.solve.staggered([u, dm]))   # sweep u, then dm, until both converge
+```
+
+Variational phase-field fracture is the canonical case — `(1-d)²|∇u|²` is quartic in the pair, while
+`u` alone is a linear elasticity problem and `d` alone a linear elliptic one. Measured on the coupled
+damage form in `tests/test_fem_staggered.py`: `newton()` leaves with a residual around **1e+25** (it
+raises), and the staggered sweep converges to a genuine root of the *coupled* system. Fixed-stress Biot
+poroelasticity and thermo-mechanical staggering have the same shape.
+
+Algorithm: Bourdin, Francfort & Marigo, *Numerical experiments in revisited brittle fracture*, JMPS
+**48** (2000), §3 — as the staggered operator split with a history field, Miehe, Welschinger & Hofacker,
+IJNME **83** (2010).
+
+**The trade is the convergence rate, and it is not small.** Alternate minimization converges *linearly*
+where Newton is quadratic, so it can need hundreds of sweeps near a propagating crack — hence the
+`max_sweeps=200` default. It buys robustness, not speed: where Newton converges, Newton is the better
+choice (Farrell & Maurini, CMAME **312**, 2017, compare the two directly). Sweeping is Gauss-Seidel, so
+the **order matters**, and every field block must be listed — an unlisted field's equations would never
+be solved, which is rejected rather than skipped. Each field is solved alone; sweeping a *group* of
+fields together (a Stokes velocity/pressure pair inside one sweep) is not wired.
+
+Differentiable in the ordinary way: at convergence the full residual is zero, so the sweep is just a way
+of *finding* that root and `lax.custom_root` supplies the gradient from the full Jacobian — the
+alternating structure is absent from the derivative by construction.
+
 **Sparse-direct Newton — `jno.solve.newton(direct=True)`.** The default Newton solves each linear step
 **matrix-free** (BiCGStab on the JVP), which stalls on an **indefinite / ill-conditioned** tangent with no
 good preconditioner — a Taylor–Hood velocity/pressure saddle, a stiff Carman–Kozeny phase-change drag in a
@@ -1731,14 +1761,20 @@ coefficients the buffers set, so it routes through the same residual operator as
 versus a pure linear assembly, in exchange for one march path rather than two.
 
 The coupled march is differentiable in a material parameter, exactly as the single-field one is: thread a
-`jno.np.parameter` into the form and `∂trajectory/∂θ` flows through the whole scan. (A coupled *steady*
-form still refuses a runtime parameter — the coupled linear assembly has no parametric route — but a
-history-carrying form never takes that route, so the march is unaffected.)
+`jno.np.parameter` into the form and `∂trajectory/∂θ` flows through the whole scan. The same holds for a
+coupled *steady* **nonlinear** form. What still refuses a runtime parameter is a coupled form that is
+**linear and carries no history**, because that one assembles as a matrix/rhs pair and the coupled linear
+assembly has no parametric route; anything on the residual path re-evaluates at the runtime args and is
+field-agnostic.
 
 Not carried, each rejected with a clear error: a real `u.t` transient (drive time through `tau` instead),
-a complex form, 1D, non-nodal (Argyris/Morley/edge) elements, VPINN, and periodic ties. There is also no
-bound constraint yet — `dm ∈ [0, 1]` is not enforced, so a strongly-degrading form needs a floor `eta` on
-the degradation to stay well-posed.
+a complex form, 1D, non-nodal (Argyris/Morley/edge) elements, VPINN, and periodic ties.
+
+Keep `dm` in range with [`dm.bounds(0, 1)`](#inequalities--uboundslo-hi), which composes with the march.
+Note that the bound does **not** replace the floor `eta` on the degradation: at `dm = 1` exactly,
+`(1-dm)²` makes the displacement block singular, so the floor is a well-posedness requirement in its own
+right. And a monolithic Newton is not expected to converge on this energy at all — drive it with
+[`jno.solve.staggered([u, dm])`](#choosing-the-solver--the-slot-api-jnosolve--jnoprecond).
 
 **Finite strain is also just a formula.** Tensor constants broadcast correctly (`jno.np.identity(n)` carries
 a leading batch axis), so `F = I + ∇u`, `E = ½(FᵀF − I)`, `S = λ tr(E) I + 2μ E` and the internal virtual

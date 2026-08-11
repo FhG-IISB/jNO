@@ -4649,6 +4649,11 @@ def _assemble_multifield(
     # Does this form carry step history? Scanned exactly as the assembler scans it — the weak terms plus
     # every evolution formula, since a state can be read only inside its own update.
     _carries_history = bool(_history_variables(weak_bares + [su.formula for su in evolution.values()]))
+    # Will this form assemble as a RESIDUAL operator rather than a matrix/rhs pair? Either trigger does
+    # it: a nonlinearity in the unknown, or step history. That is the question the runtime-parameter gate
+    # below actually needs answered — a residual operator re-evaluates at the runtime args and is
+    # entirely field-agnostic, while the coupled linear assembly has no parametric route.
+    _residual_path = _carries_history or any(_is_obviously_nonlinear_in_unknown(domain, b) for b in weak_bares)
 
     domain._fem_quad_degree = quad_degree
     domain._variational_initialized = True
@@ -4715,13 +4720,14 @@ def _assemble_multifield(
         and all(str(f.get("space", "Lagrange")) == "Lagrange" for f in fields)
         and not _is_complex_form(domain, ir)
         # A runtime parameter is excluded because the coupled *linear* assembly has no parametric route --
-        # not because the parameter itself is a problem. A form carrying step history never takes that
+        # not because the parameter itself is a problem. A form on the RESIDUAL path never takes that
         # route: it assembles as a ``FemResidualOperator`` that re-evaluates at the runtime ``args`` each
         # call, which is entirely field-agnostic (the coupled *transient* branch below already allows a
         # parameter for exactly this reason). So gate on WHICH BRANCH the form will take. This is what
-        # makes a coupled load-path march differentiable in a material parameter, as the single-field
-        # march already is.
-        and (not any(_contains_runtime_parameter(b) for b in weak_bares) or bool(_carries_history))
+        # makes a coupled load-path march — and a coupled nonlinear inverse problem, the shape a
+        # staggered solve identifies material parameters with — differentiable in a material parameter,
+        # as the single-field paths already were.
+        and (not any(_contains_runtime_parameter(b) for b in weak_bares) or _residual_path)
     )
 
     # Coupled transient (multi-field + time): block M + block spatial operator A. Native handles
@@ -4825,10 +4831,10 @@ def _assemble_multifield(
     # rather than mis-assemble.
     raise NotImplementedError(
         "jno.fem: this coupled (multi-field) steady form is not supported natively -- it has a runtime "
-        f"parameter ({_par_coupled}) and carries no step history ({_carries_history}), so it would take "
-        "the coupled linear assembly, which has no parametric route. Recover the parameter on a "
-        "single-field reduced form, on a coupled load-path march (`domain(tau=...)` + `.i(k)`), or "
-        "through a coupled first-order transient -- all three thread runtime parameters."
+        f"parameter ({_par_coupled}) and is linear with no step history, so it would take the coupled "
+        "linear assembly, which has no parametric route. Recover the parameter on a single-field "
+        "reduced form, on a coupled NONLINEAR form or a load-path march (`domain(tau=...)` + `.i(k)`) "
+        "-- both assemble as a residual operator -- or through a coupled first-order transient."
     )
 
 
