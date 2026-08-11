@@ -255,6 +255,34 @@ def test_tag_region_reaches_the_interface_at_all():
     assert "owned" in d._boundary_regions
 
 
+def test_a_coarse_slave_is_reordered_rather_than_left_wrong():
+    """In ``u(A) - u(B)`` the slave A is eliminated in favour of an interpolation from B, so the slave
+    must be the FINER side or the fine mesh's interface resolution is discarded. Measured on a
+    coating/substrate tie (81 nodes against 10), the wrong order was off by 10.62% with no error at
+    all — so the tie reorders itself and says so, rather than trusting the caller to know the rule."""
+    ref = None
+    for first, second in (("film", "base"), ("base", "film")):
+        d = _graded_stack()
+        on = lambda x, y: np.abs(y - 1.0) < 1e-9  # noqa: E731
+        a = d.variable("A", where=on, region=first, split=True)
+        b = d.variable("B", where=on, region=second, split=True)
+        u, v = d.fem_symbols()
+        c = d.variable("interior", split=True)
+        bb = d.variable("boundary", split=True)
+        ui, vi = u.bind(x=c[0], y=c[1]), v.bind(x=c[0], y=c[1])
+        got = float(
+            np.asarray(
+                jno.fem(
+                    [ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(a[0], a[1]) - u(b[0], b[1]), u(bb[0], bb[1]) - 0.0]
+                ).solve()
+            ).max()
+        )
+        if ref is None:
+            ref = got
+        else:
+            assert abs(got - ref) / ref < 1e-3, f"both orderings must agree: {got:.6f} vs {ref:.6f}"
+
+
 def test_conforming_is_a_reserved_region_name():
     with pytest.raises(TypeError, match="must be a bool"):
         jno.Shape.regions(a=jno.Shape.box(0, 0, 0, 1, 1, 1), b=jno.Shape.box(0, 0, 1, 1, 1, 2), conforming="no")

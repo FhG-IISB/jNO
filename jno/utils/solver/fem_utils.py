@@ -42,6 +42,7 @@ from ...trace import (
     TrialFunction,
     Variable,
 )
+from ...utils.logger import get_logger
 from .solver_helper import contains_node_type, iter_children
 
 
@@ -2790,6 +2791,36 @@ def build_periodic_prolongation(
         s_ids = np.asarray(tag_indices[slave_tag], dtype=int).reshape(-1)
         if s_ids.size == 0:  # nothing to eliminate on this pair
             continue
+
+        # THE SLAVE MUST BE THE FINER SIDE. Its DOFs are eliminated in favour of an interpolation from
+        # the master, so eliminating the fine side onto a coarse one is right, and the reverse discards
+        # exactly the resolution the fine mesh was built for. Measured on a coating/substrate tie with
+        # 81 nodes against 10: correct order gave the exact interface value, reversed was off by 10.62%
+        # -- with no error, which is why this reorders rather than trusting the caller to know.
+        # Only when the side that would BECOME the master carries facet connectivity: the master is
+        # what a non-matching slave interpolates from, so swapping without it just moves the
+        # problem (and a caller that supplied one side's facets meant that side to be the master).
+        _can_swap = (facets or {}).get(slave_tag) is not None
+        if _can_swap and s_ids.size < 0.9 * m_ids.size:
+            if abs(complex(ph) - 1.0) > 1e-12:
+                # A Bloch tie carries a phase e^{ik.L} that is direction-dependent: swapping the two
+                # sides requires conjugating it. Rather than do that silently, say so and leave it.
+                _log.warning(
+                    f"periodic tie ({slave_tag!r} -> {master_tag!r}): the eliminated (slave) side has "
+                    f"{s_ids.size} nodes against the master's {m_ids.size}, which discards the finer "
+                    "side's interface resolution. This is a BLOCH tie, whose phase is direction-"
+                    "dependent, so it was NOT reordered automatically -- swap the operands and "
+                    "conjugate the phase to fix it."
+                )
+            else:
+                _log.warning(
+                    f"periodic tie ({slave_tag!r} -> {master_tag!r}): the eliminated (slave) side has "
+                    f"{s_ids.size} nodes against the master's {m_ids.size}. The slave must be the finer "
+                    f"side, so the two were swapped -- write u({master_tag}) - u({slave_tag}) to make "
+                    "that explicit."
+                )
+                master_tag, slave_tag = slave_tag, master_tag
+                m_ids, s_ids = s_ids, m_ids
         m_pts = pts[m_ids]
         s_pts = pts[s_ids]
 
@@ -3504,6 +3535,9 @@ def bcoo_set_dirichlet_rows(A, dofs):
 # ---------------------------------------------------------------------------
 # Operator / state reduction and prolongation
 # ---------------------------------------------------------------------------
+
+
+_log = get_logger()
 
 
 def _is_selection(P):
