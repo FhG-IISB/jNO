@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jax-numerical-operators"
-version = "0.2.3"
+version = "0.3.0"
 description = "Differentiable numerical methods in JAX (FEM, FDM, spectral) with scientific machine learning"
 readme = "README.md"
 requires-python = ">=3.11, <3.14"
@@ -27,7 +27,11 @@ classifiers = [
 # do not duplicate it as a classifier — modern setuptools rejects that.
 
 dependencies = [
-    "jax[cuda]>=0.10.1,<0.11",
+    # Plain (CPU) jax on purpose: the library runs fully on CPU, and the CUDA wheels are a
+    # multi-GB download that a laptop / CI / macOS install should not pay for. GPU is one extra
+    # away: `pip install jax-numerical-operators[cuda]`. The pin stays tight either way -- jNO
+    # tracks a single JAX minor version per release.
+    "jax>=0.10.1,<0.11",
     "equinox>=0.11.0",
     "optax>=0.2.0",
     "orbax-checkpoint>=0.6.0",
@@ -50,10 +54,10 @@ Source = "https://github.com/FhG-IISB/jno"
 Issues = "https://github.com/FhG-IISB/jno/issues"
 
 [project.optional-dependencies]
-# `cuda` is intentionally *not* a separate extra: the core `jax[cuda]`
-# constraint above already covers GPU installs. If you need to override
-# the JAX wheel for a specific CUDA version, install JAX from its own
-# index (see docs/Installation.md).
+# NVIDIA GPU support: swaps in the CUDA-capable JAX build. Same version pin as the core `jax`
+# dependency, so the two can never drift apart silently. To pin a specific CUDA toolkit version
+# instead, install JAX from its own index first (see docs/Installation.md).
+cuda = ["jax[cuda]>=0.10.1,<0.11"]
 
 # GPU algebraic multigrid (`jno.solve.amg` / `jno.precond.ams` / inner-AMG smoothers) via jaxamg
 # (NVIDIA AmgX wrapped as a JAX primitive). It is imported **lazily**, so the core installs WITHOUT it —
@@ -180,9 +184,9 @@ paramax = ">=0.0.5"
 blackjax = ">=1.2"
 
 [tool.pixi.environments]
-# The default environment already includes a CUDA-capable JAX wheel via
-# the core `jax[cuda]` dependency and the `jax-cuda12-plugin` pypi entry
-# below — no separate `cuda` environment is needed.
+# The default environment is CUDA-capable through the explicit `jax-cuda12-plugin` pypi entry
+# above — deliberately independent of the published wheel's core dependency, which is plain
+# (CPU) jax with GPU behind the `[cuda]` extra. Local dev and the test suite run on GPU either way.
 default = { solve-group = "default" }
 dev = { features = ["dev"], solve-group = "default" }
 fem = { features = ["fem"], solve-group = "default" }

@@ -38,7 +38,13 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     permissions:
+      # OIDC token for PyPI trusted publishing -- this is what stands in for an API token.
       id-token: write
+    # These three must match the trusted publisher registered on PyPI for the project:
+    # owner/repo `FhG-IISB/jNO`, workflow file `publish-pypi.yml`, environment `pypi`. Renaming this
+    # environment, this file, or the repo silently stops matching, and the upload is rejected at
+    # publish time -- so change them together with the PyPI side. `pypi` is an environment that
+    # already exists on the repo; creating a differently-named one needs admin.
     environment:
       name: pypi
       url: https://pypi.org/p/jax-numerical-operators
@@ -50,8 +56,8 @@ jobs:
           path: dist/
 
       - name: Publish package to PyPI
+        # No `user`/`password`: with the trusted publisher above the action mints a short-lived token
+        # from the OIDC identity. Passing an API token here would take precedence and bypass it.
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          user: __token__
-          password: ${{ secrets.PYPI_API_TOKEN }}
           verbose: true
