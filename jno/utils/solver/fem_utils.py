@@ -2622,6 +2622,18 @@ def _periodic_facet_weights(
     if facet_node_ids.ndim != 2 or facet_node_ids.shape[0] == 0:
         return None
     k = facet_node_ids.shape[1]
+    # Only P1 and P2 facets have shape functions here. The branches below used to read `k < 3` /
+    # `k < 6` and fall through to the P2 formulas for ANYTHING larger, so a P3 edge was interpolated
+    # as if its node at 1/3 were the midpoint and its node at 2/3 did not exist. Weights still summed
+    # to 1, so a constant transferred and nothing complained -- but a LINEAR field came out wrong by
+    # 0.25-0.33 on a field of range 2. Refuse instead.
+    _max_k = 3 if tq.shape[0] == 1 else 6
+    if k > _max_k:
+        raise NotImplementedError(
+            f"A non-matching periodic/tied interface supports P1 and P2 facets; this one has {k}-node "
+            f"facets (P{k - 1} edge / higher-order face). Use a conforming mesh for the tie, or drop to "
+            "order 2 -- interpolating it with the P2 formulas would silently misplace the extra nodes."
+        )
 
     if tq.shape[0] == 1:  # 2D: locate the master edge spanning the slave's in-interface coord
         t = float(tq[0])

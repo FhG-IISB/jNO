@@ -723,6 +723,38 @@ def test_trace_weights_clamp_outside_the_face():
     assert np.all(w >= -1e-12), "clamped weights must stay non-negative (no extrapolation)"
 
 
+def test_a_higher_order_facet_is_refused_not_mis_interpolated():
+    """A pre-existing silent bug, found by asking what happens above P2.
+
+    Both branches of the collocated path read ``k < 3`` / ``k < 6`` and fell through to the P2
+    formulas for anything larger. A P3 edge was therefore interpolated as if its node at 1/3 were the
+    midpoint, with the node at 2/3 ignored entirely. The weights still summed to 1, so a constant
+    transferred and nothing complained -- but a LINEAR field came out wrong by 0.25-0.33 on a field of
+    range 2. Refusing is the only honest answer while P3 facet shape functions do not exist here."""
+    loc = np.array([[0.0], [1.0], [1 / 3], [2 / 3]])
+    for k, ok in ((2, True), (3, True), (4, False)):
+        ids = np.arange(k).reshape(1, k)
+        if ok:
+            w = _periodic_facet_weights(np.array([0.5]), ids, loc)
+            assert abs(sum(float(x) for _, x in w) - 1.0) < 1e-12
+        else:
+            with pytest.raises(NotImplementedError, match="supports P1 and P2 facets"):
+                _periodic_facet_weights(np.array([0.5]), ids, loc)
+
+    tri_loc = np.zeros((10, 2))
+    with pytest.raises(NotImplementedError, match="supports P1 and P2 facets"):
+        _periodic_facet_weights(np.array([0.3, 0.3]), np.arange(10).reshape(1, 10), tri_loc)
+
+
+def test_the_shape_tabulators_refuse_beyond_p2():
+    """The mortar path's own tabulators bound the same way, so nothing silently reaches P3+."""
+    for k in (4, 5):
+        with pytest.raises(ValueError, match="2 \\(P1\\) or 3 \\(P2\\)"):
+            _edge_shape(np.array([0.3]), k)
+    with pytest.raises(ValueError, match="3 \\(P1\\) or 6 \\(P2\\)"):
+        _tri_shape(np.array([[0.3, 0.3, 0.4]]), 10)
+
+
 def test_trace_weights_handle_empty_input():
     p3, tris = _tri_grid(2, 1.0, 0)
     ids, w = master_trace_weights(np.zeros((0, 2)), tris, p3[:, :2])
