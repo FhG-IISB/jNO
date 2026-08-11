@@ -70,9 +70,8 @@ Tc, pc = T.bind(x=xc, y=yc), phi.bind(x=xc, y=yc)
 #     slave = coating   (81 interface nodes)  ->  T_interface = 0.05000   exact
 #     slave = substrate (10 interface nodes)  ->  T_interface = 0.05531   10.62% error
 on_interface = lambda x, y: np.abs(y - L_SUB) < 1e-9  # noqa: E731
-d.tag("film_face", on_interface, region="coating")  # slave: the finer side
-d.tag("base_face", on_interface, region="substrate")  # master
-a, b = d.variable("film_face", split=True), d.variable("base_face", split=True)
+a = d.variable("film_face", where=on_interface, region="coating", split=True)  # slave: the finer side
+b = d.variable("base_face", where=on_interface, region="substrate", split=True)  # master
 
 xt, yt, _ = d.variable("top", split=True)  # coating outer surface: flux q in
 xb, yb, _ = d.variable("bottom", split=True)  # substrate base: T = 0

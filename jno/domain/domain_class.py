@@ -2319,6 +2319,7 @@ class domain(MeshIOMixin):
         return_indices: Literal[False] = False,
         time_value: Optional[float] = None,
         where=None,
+        region=None,
     ) -> "tuple[Variable, ...]": ...
 
     @overload
@@ -2335,6 +2336,7 @@ class domain(MeshIOMixin):
         return_indices: bool = False,
         time_value: Optional[float] = None,
         where=None,
+        region=None,
     ) -> Any: ...
     @property
     def cell_size(self):
@@ -2372,6 +2374,7 @@ class domain(MeshIOMixin):
         return_indices=False,
         time_value: Optional[float] = None,
         where=None,
+        region=None,
     ) -> Any:
         """Create Variable placeholders for a tagged point set or tensor.
 
@@ -2415,8 +2418,12 @@ class domain(MeshIOMixin):
         """
 
         # Define-and-fetch: a predicate names the region here, then we return its coordinates.
+        # `region=` restricts it to one body -- the only way to pick a single side of a
+        # non-conforming interface, whose two surfaces share coordinates exactly. See `tag`.
         if where is not None:
-            self.tag(tag, where)
+            self.tag(tag, where, region=region)
+        elif region is not None:
+            raise TypeError("domain.variable: `region=` applies only with `where=`, which is what it restricts.")
 
         # Optional sampling / tensor-tag attachment
         if sample is not None:
