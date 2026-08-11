@@ -59,7 +59,7 @@ u_h = fem.solve()          # matrix-free default; slots pick anything else (see 
   `A p = c` on those rows — which is how a constraint/closure field (a pressure, a saturation, an
   equilibrium concentration) is written.
   A `jno.np.parameter` coefficient (scalar or nodal field) also works on a **steady linear** 1D form, so
-  a 1D differentiable inverse problem runs through `crux.solve` — as does a **neural** (`jno.nn.wrap`)
+  a 1D differentiable inverse problem runs through `crux.solve` — as does a **neural** (`jno.nn(...)`)
   coefficient, so a learned `k(x)` can be trained from 1D data. Transient too — recovering a diffusivity
   from a 1D time series works — except that the transient **mass** must be parameter-free (it is
   assembled once, so a parameter there would be silently frozen; it fails loud). *Nonlinear* forms are
@@ -147,6 +147,156 @@ in the `jno.fem([...])` list, and `jno.fem` classifies each by the region it is 
 `g` may be a constant or a coordinate expression (e.g. `u(xb, yb) - jno.np.sin(jno.np.pi * xb)`
 for a spatially varying Dirichlet value). A zero Neumann flux is the natural default and needs
 no term.
+
+### Tying two boundaries — `u(A) - u(B)`
+
+A term that names two boundary regions and carries no test function is a **tie**: it identifies the
+DOFs on region `A` with those on region `B`. It is enforced by algebraic reduction (a prolongation
+`P` that eliminates the `A` DOFs), not by assembly, so it composes with everything downstream —
+complex, transient, Bloch (`u(A) - c*u(B)`), and `basis=` all reuse the same `P`.
+
+```python
+d.tag("left",  lambda x, y: x < 1e-9)      # a tag predicate includes the corner nodes,
+d.tag("right", lambda x, y: x > 1 - 1e-9)  # which matters — see below
+
+fem = jno.fem([weak_form, u("left") - u("right")])
+```
+
+How the two faces are identified depends on their meshes:
+
+* **Conforming** (the node layouts match) — an exact node-to-node 0/1 map. This is the cheap path and
+  it keeps the fast selection-based reduction.
+* **Non-matching**, when both faces carry facet connectivity and the main face covers the secondary —
+  a **dual-mortar** coupling (Bernardi/Maday/Patera 1994; dual multiplier spaces from Wohlmuth 2000):
+  the tie is imposed in the integral sense `∫ ψ (u_A − u_B∘Φ) = 0` over the secondary face, segmented
+  against the main facets. Interval clipping in 2-D, polygon clipping in 3-D.
+* **Non-matching, otherwise** (native 1-D chains, a tag that selects nodes but no whole facet, or two
+  faces that do not cover each other) — node-to-segment **collocation**: each secondary node takes the
+  main facet value at its own location.
+
+Worth being precise about what the mortar coupling buys, because it is less than the usual framing
+suggests. jNO enforces a tie by main–secondary **elimination** through a prolongation `P`, and such a
+scheme passes the linear patch test whenever `P` reproduces linear fields — which node-to-segment
+interpolation does, in 2-D *and* 3-D. So **the patch test does not separate the two couplings here**;
+the textbook "node-to-segment fails the patch test" result is about contact formulations that
+distribute nodal forces, not about a linearly-complete MPC elimination.
+
+What does differ: for a field the main space cannot represent, mortar returns the integral (L²)
+projection and collocation the pointwise value. Measured on a non-matching 3-D interface, mortar's RMS
+error is 4–40 % lower across a range of mesh ratios. The two also coincide exactly when the main
+nodes are a subset of the secondary nodes, since the main basis then lies inside the secondary space.
+
+**P2 triangular interfaces (3-D quadratic) stay collocated**, and this is a theorem rather than a gap
+in the implementation. The dual basis is built from the facet mass matrix as `A = diag(∫N)·Mass⁻¹`, and
+the P2 triangle's vertex functions integrate to *exactly zero* (`∫L(2L−1) = 2/12 − 1/6`), so the
+scaling is singular. Rescaling does produce a biorthogonal basis, but not one whose span contains the
+linear functions — and Lemma 3.4 of Lamichhane's thesis proves no locally supported dual space of that
+dimension can, which is precisely what the optimal error estimate requires. The published remedy uses
+*fewer* multipliers than secondary DOFs, making the tie a constrained solve rather than an elimination,
+which a prolongation cannot express. P2 **edges** (2-D) are unaffected — there `∫N = 1/6` — and the
+same source confirms the 2-D quadratic dual space does contain the linear hats.
+
+Two practical consequences: tag periodic faces with a **predicate** (`d.tag(name, lambda ...)`) so each
+face includes its corner nodes — a face tagged from geometry may drop them, leaving the two sides with
+different extents, which both disqualifies mortar and leaves the corner DOFs untied. And multidirectional
+periodicity *requires* shared corners; `jno.fem` raises rather than silently mis-solving if they are absent.
+
+### Gluing two independently meshed bodies
+
+`Shape.regions` fragments its pieces, so a shared interface meshes **conforming** — one node set, no tie
+needed. `conforming=False` skips the fragment: each piece is meshed on its own, and two touching regions
+end up with two coincident but non-matching surfaces and duplicated nodes. That is how you join bodies
+meshed at different resolutions, or couple subdomains you would rather mesh separately.
+
+The two sides are spatially *identical*, so no `d.tag` predicate can separate them — the emitter names
+them, extending the `"a|b"` convention it already uses for material interfaces:
+
+```python
+d = jno.Shape.regions(
+        lower=jno.Shape.box(0, 0, 0, 1, 1, 1),
+        upper=jno.Shape.box(0, 0, 1, 1, 1, 2.5),
+        conforming=False,
+    ).sized(0.18).domain()
+
+a = d.variable("lower|upper.lower", split=True)     # one tag per side
+b = d.variable("lower|upper.upper", split=True)
+
+fem = jno.fem([
+    weak_form,
+    u(*a) - u(*b),                                  # glue them
+    u(xb, yb, zb) - 0.0,
+])
+```
+
+The tie then resolves as above — conforming node-to-node where the layouts happen to match, mortar where
+they do not.
+
+One subtlety worth knowing, because it is invisible: each interface face **is** a facet of exactly one
+cell, so it is topologically part of the boundary. The catch-all `"boundary"` region therefore excludes
+nodes that lie *only* on an interface — otherwise `u(boundary) - g` would pin the interface and silently
+solve two disconnected bodies. Nodes where the interface meets the outer wall lie on a genuine outer
+facet too and stay pinned.
+
+Because the two sides are spatially identical, **name them by the mesh's own tags** (above) or by
+`d.tag(pred, region=...)`, which says which body owns the facets:
+
+```python
+d.tag("cap_face",  lambda x, y: jnp.abs(y - 1.0) < 1e-9, region="cap")
+d.tag("base_face", lambda x, y: jnp.abs(y - 1.0) < 1e-9, region="base")
+```
+
+A bare coordinate predicate cannot tell them apart, and a surface term written on such a tag is applied
+to **both** bodies.
+
+### Contact — `u.gap(secondary, main)`
+
+A tie makes two surfaces move together. Contact lets them separate and push, and the difference is one
+term. `u.gap` is the signed normal gap at the secondary face's quadrature points:
+
+$$g = g_0 - n \cdot (u_s - u_m \circ \Phi)$$
+
+`g0` is the initial along-normal separation and `Φ` the mortar projection onto the main surface — the
+same projection a tie uses, so a gap and a tie are the same machinery read two ways. The gap is a
+symbol, so the contact traction is an ordinary boundary term and **nothing is passed to `fem.solve()`**:
+
+```python
+n = d.variable(secondary, normals=True)          # the secondary's OUTWARD normal
+g = u.gap(secondary, main, domain=d)
+p = jno.np.maximum(0.0, -c * g)              # pressure: positive only when penetrating
+fem = jno.fem([..., p * jno.np.inner(n, phi.bind(x=sv[0], y=sv[1]), n_contract=1)])
+```
+
+**The sign convention, spelled out**, because every downstream sign follows it:
+
+| quantity | meaning |
+|---|---|
+| `n` | the **secondary's outward** normal — on a contacting pair it points *at* the main |
+| `g > 0` | separated (open) |
+| `g < 0` | interpenetrating |
+| `p = max(0, -c*g)` | contact pressure, `≥ 0`, active only in penetration |
+| `+p * inner(n, phi)` | the traction term — **not** `-p * ...` |
+
+The `+` is not a convention you may flip: since `∂g/∂u_s = -n`, it is the sign that adds a
+positive-definite `+c (n·δu)(n·φ)` to the tangent. The opposite sign is anti-stabilising and, measured
+on a weakly penalised interface, leaves the jump *larger* than not penalising at all.
+
+You write **one** term, on the secondary face. The equal-and-opposite traction on the main body is
+supplied by the pairing — it is the same integrand tested against the main's projected trace — so
+Newton's third law holds without you restating it. Ablating that reaction leaves the main body
+identically zero.
+
+For a bonded (tied) interface use the two-sided penalty `p = -c*g` instead of the `max`; it is smooth,
+and stiffening `c` converges to the tie: two bonded unit blocks squeezed by 0.02 reproduce the single-bar
+answer `uy(y=1) = -0.01` to 1.5e-05 at `c = 1e6`.
+
+> **Scope.** Small sliding — the pairing is frozen at build time, so a configuration that slides must be
+> rebuilt per load step. Differentiable in the DOF values but **not** in the mesh coordinates (the
+> projection weights are host-computed). Frictionless: no tangential traction, so a body held *only* by
+> contact is free to slide and its system is singular — constrain the tangential direction independently.
+> The gap is non-local (it reads DOFs on the other body's cells), so the tangent is matrix-free;
+> `newton(direct=True)` is refused. **One-sided contact does not yet converge to tight tolerances**: the
+> `max(0, ·)` kink is non-smooth and the residual stalls around 1e-2 with a line search, against a 1e-8
+> target. The bonded two-sided path is smooth and converges.
 
 ---
 
@@ -284,6 +434,44 @@ geometry).
 Tutorials: `mixed_poisson_rt_2d.py` (H(div)), `maxwell_nedelec_2d.py` (H(curl): magnetostatics + eddy
 current), and `maxwell_nedelec_3d.py` (the **3-D PEC cube cavity resonator** — recovers `k²=π²(l²+m²+n²)`,
 spurious-free, converging to `2π²` from below).
+
+## Curved (isoparametric) geometry — `Shape.curved()`
+
+By default jNO meshes straight-sided and *synthesises* higher-order nodes at the straight-edge
+midpoints, so the domain stays a polygon however high the element order goes. That approximation
+carries an **O(h²) domain error at every basis order** — it is what caps P2/P3 at second order on a
+round boundary, no matter how good the basis is. `curved()` asks the CAD kernel to place those nodes on
+the true surface instead:
+
+```python
+d = jno.Shape.disk(0, 0, 1, size=0.1).curved().domain()
+u, v = d.fem_symbols(order=2)          # the basis order must MATCH the geometry order
+```
+
+Measured on `-Δu = 1` on the unit disk (exact `u = (1−r²)/4`), RMS nodal error:
+
+| mesh size | straight-sided | curved |
+|---|---|---|
+| 0.4 | 6.73e-03 | 7.63e-05 |
+| 0.2 | 1.66e-03 | 7.67e-06 |
+| 0.1 | 4.23e-04 | 7.36e-07 |
+| **rate per halving** | **≈4× (O(h²))** | **≈10× (O(h³))** |
+
+Straight-sided is capped at second order by the geometry; curved recovers P2's own third order, and is
+**570× more accurate** at the finest resolution.
+
+**Scope — what this does not cover.** Order 2 and simplices only. An **order mismatch is refused**:
+isoparametric means geometry order == basis order, and a curved mesh under a P1 basis puts the midside
+DOF coordinates (on the arc) and the geometric map (from the chord) in disagreement. **Non-nodal
+families keep affine geometry** — Nédélec, RT, Argyris and Morley need Piola/curvature push-forwards
+that are a separate change, so curved EM does *not* benefit yet — and a **4th-order form is refused** on
+a curved cell, because the physical-Hessian transform is derived for an affine map and would gain a
+curvature term it does not carry. **Facet normals are still straight-facet**, so the O(h) normal error
+that affects radiation view factors, flux BCs and RCWA's field decomposition is unchanged by this.
+
+Note also that a curved map makes the integrand rational, so **no quadrature rule is exact** any more.
+The default degree is raised by 2 on curved cells and `jno.fem(quad_degree=...)` still overrides;
+measured on the study above, refining the rule moves the answer by less than 0.01 %.
 
 ### Mesh resolution for wave problems
 
@@ -569,7 +757,7 @@ jax.config.update("jax_enable_x64", True)          # required; see the scope lis
 
 xb, yb, tb = domain.variable("boundary", split=True)
 fem = jno.fem([ui.t * vi + kappa * (ui.x * vi.x + ui.y * vi.y),   # the physics
-               u(xb, yb) - 0.0, u(ci[0], ci[1]) - 1.0,
+               u(xb, yb) - 0.0, u(*ci) - 1.0,
                yb.d(tb) - 0.5 * yb])                              # dy/dt = y/2 — the mesh
 traj = fem.solve()                                                # one frame per moved mesh
 ```
@@ -900,8 +1088,12 @@ Pick by structure:
 | symmetric **indefinite** (Stokes/Biot saddle, biharmonic) | `minres` | monotone residual, `O(1)` memory — Paige & Saunders, *SINUM* 12(4), 1975 |
 | SPD, batched/GPU-heavy | `chebyshev` | inner-product free (no reductions) — Golub & Varga 1961 |
 | indefinite, single solve | `lu` | sparse-direct; **no vmap rule** — use a Krylov solver inside batched solves |
-| cuSolver refuses it, or is slow | `lu(host=True)` | factors on the HOST (SuperLU) and drives it from the device; same answer and same gradients (wrapped in `custom_linear_solve`, transpose via SuperLU `trans="T"`). Measured **faster** where cuSolver also works — Stokes 21,839 DOFs 0.27 s vs 1.67 s, H(curl) 17,072 complex DOFs 13.3 s vs 36.4 s — and it runs meshes cuSolver rejects (Stokes 26,908, H(curl) 26,154, both of which fail on GPU). Affordable because a direct solve factorises **once**: the operator crosses PCIe once, not per iteration. Faster in all 12 points measured here (0.15–0.81× of cuSolver), but that is **hardware-specific** — this card's FP64 is 1/64-rate (~0.3 TFLOPS) against ~1.1 TFLOPS on 20 CPU cores, and a direct factorisation is FLOP-heavy; on a full-rate-FP64 GPU the ranking may invert |
+| cuSolver refuses it, or is slow | `lu(backend="host")` | factors on the HOST (SuperLU) and drives it from the device; same answer and same gradients (wrapped in `custom_linear_solve`, transpose via SuperLU `trans="T"`). Measured **faster** where cuSolver also works — Stokes 21,839 DOFs 0.27 s vs 1.67 s, H(curl) 17,072 complex DOFs 13.3 s vs 36.4 s — and it runs meshes cuSolver rejects (Stokes 26,908, H(curl) 26,154, both of which fail on GPU). Affordable because a direct solve factorises **once**: the operator crosses PCIe once, not per iteration. Read the win as *cuSolver's sparse LU is weak*, not *GPUs lose* — see the row below |
+| **shift-invert eigs, or a constant-operator transient** | `lu(backend="cudss")` | NVIDIA cuDSS — the **fastest** direct backend wherever it runs, because it separates the symbolic *plan* from the numeric *factorization* and jNO caches on the **sparsity**, so the plan survives a change of values. Against `backend="host"` on an RTX 3070 (fp64 at 1/64 rate — the *unfavourable* card): Stokes saddle factorization **3.4 ms vs 79.9 ms**, lap3d 50³ **576 ms vs 64,856 ms**, and **64.7× per Newton step** at n=64,000. Also factors the Stokes saddle cuSolver calls *singular*, with smaller residuals. Needs the optional stack (`nvmath-python`, `cudss`, `cupy`); raises a clear `ImportError` otherwise. Fill-in still governs 3-D (69×→218× nnz growth at lap3d 20³–40³), so it moves the ceiling and makes **device memory** the binding constraint — it is not a substitute for a preconditioner  Two things happen automatically: a **block right-hand side** `(n, k)` is solved in one call (measured **2.7× at k=4 to 5.4× at k=16** over the same factorization solved column by column — this is what the shift-invert eigensolver's subspace iteration needs every sweep), and an exactly symmetric operator is factored as **LDLᵀ instead of general LU** (1.41× faster, **1.38× less peak device memory** on lap3d 40³). Symmetry is tested *bitwise* and SPD is never inferred — a matrix symmetric only to ~1e-15 would otherwise be silently factored as `(A+Aᵀ)/2`, and a wrong SPD guess returns NaN. A singular operator **raises**: cuDSS signals it through neither an exception nor a NaN, returning a finite plausible vector instead |
+| **a Newton loop** (or no GPU / a factorization too big for device memory) | `lu(backend="pardiso")` | Intel MKL PARDISO, multithreaded CPU. **The fastest factorization of the four**, and like cuDSS it splits symbolic analysis from numeric factorization, so a Newton step reuses the analysis. On lap3d 50³ (n=125,000) against single-threaded SuperLU's 65,212 ms: factorization **298 ms**, Newton re-factorization **296 ms — 220×**, where cuDSS reaches 115×. Its adjoint is cheaper too — `Aᵀx = b` comes from the *same* factorization rather than a second one. An exactly symmetric operator uses LDLᵀ (1.9× on lap3d 50³, 13× on a saddle), which needs the upper triangle with an **explicit diagonal** — without that a saddle's constraint rows come back empty and PARDISO rejects the matrix. Like cuDSS it returns finite garbage on a singular operator, so jNO checks the perturbed-pivot count and **raises**. `pip install jax-numerical-operators[pardiso]`, x86-64 |
 | small systems / coarse blocks | `dense` | LAPACK, vmap-native |
+
+> **Choosing between `cudss` and `pardiso`: pick by the phase your problem repeats.** A Newton loop re-*factorizes* every iteration, so PARDISO wins (220× vs 115× over SuperLU). A shift-invert eigensolve or a constant-operator transient re-*solves* against one factorization, and there cuDSS is ~11× faster per solve (3.5 ms vs 40 ms at lap3d 50³) and takes a whole block of right-hand sides at once. There is deliberately no `auto`: which wins depends on hardware jNO cannot inspect. Install both with `pip install jax-numerical-operators[fem]`.
 
 **Preconditioner specs** (declarative — materialized against the assembled operator at solve time; a
 preconditioner never changes the converged solution, only the speed, so specs need no gradient path):
@@ -982,13 +1174,19 @@ solves `Jᵀ` directly too, not with a stalling Krylov). `damping` / `line_searc
 assembled tangent, so it does **not** apply to the matrix-free-only paths (a coupled-residual wrapper,
 complex) — those fail loud.
 
+The tangent it factorizes is always the **element-scattered sparse** one, in 1-D as in 2-D/3-D. 1-D used
+to build its nonlinear tangent with a global `jax.jacfwd` instead, on the assumption that only the
+matrix-free default would ever ask for it; `direct=True` does ask, from inside the Newton loop, where a
+dense tangent cannot be sparsified at all (`BCOO.fromdense` needs a concrete `nse`). Besides working, the
+scattered tangent is `O(nnz)` rather than `O(N²)` — which is what 1-D node counts want.
+
 **A direct `linear=` slot selects it.** `lu`, `dense` and `amg` all need an assembled matrix, so pairing one
-with the *matrix-free* Newton has nothing to factorize. `fem.solve(linear=jno.solve.lu(host=True))` on a
+with the *matrix-free* Newton has nothing to factorize. `fem.solve(linear=jno.solve.lu(backend="host"))` on a
 nonlinear or transient problem therefore routes to the direct Newton, and that slot is the solver that runs on
 the assembled tangent (and on `Jᵀ` in the adjoint); `precond=` materializes against the same assembled
 operator. Which factorization you pick is not cosmetic here: on a 26-step Rayleigh–Bénard march (three fields,
 saddle, nonlinear) the default matrix-free Jacobi-BiCGStab takes 20.1 s, `linear=jno.solve.lu()` 7.6 s and
-`linear=jno.solve.lu(host=True)` **3.1 s**, all to the same 2.8e-07 per-step Newton residual. An *explicit*
+`linear=jno.solve.lu(backend="host")` **3.1 s**, all to the same 2.8e-07 per-step Newton residual. An *explicit*
 matrix-free `nonlinear=` alongside a direct `linear=` is contradictory and raises rather than picking one
 silently.
 
@@ -1029,7 +1227,7 @@ formed **once** and the preconditioner materialized **once before the time loop*
 each implicit step of a nonlinear block. Second-order-in-time (`u_tt`) flows through the same augmented
 block. Each step warm-starts from the previous state (so `x0=` is rejected).
 
-> **`lu(host=True)` factorizes a constant step operator once, not once per step.** The step matrix is
+> **`lu(backend="host")` factorizes a constant step operator once, not once per step.** The step matrix is
 > formed once (above), and the host factorization is cached on the operator's *content*, so a march
 > that solves against the same matrix every step pays one factorization for the whole trajectory — and
 > the transpose solve reuses it, so the adjoint pass adds none. On a 51-step heat march that is worth
@@ -1293,7 +1491,7 @@ Euler over the assembled `dt`, sampled at the domain time grid), differentiable 
 parameters — so a rate constant is recovered from a time series:
 
 ```python
-fem = jno.fem([ui.t * vi + alpha * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - u0])
+fem = jno.fem([ui.t * vi + alpha * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(*ci) - u0])
 crux = jno.core([(fem.solve() - u_traj).mse], domain=obs).solve(200)   # recovers alpha
 ```
 
@@ -1422,6 +1620,36 @@ Maxwell / eddy-current** examples, and a **variational PINN** (a neural trial in
 
 ---
 
+## Build time: what to expect, and the one knob
+
+`jno.fem([...])` **fully assembles** the operator — it returns concrete matrix values, which is why
+`fem.solve()` is then only the linear solve (measured **7 ms** on 3-D Poisson at 27,833 nodes). Some
+libraries instead defer assembly into their solve; that makes their "build" look faster and their
+solve slower, so compare **build + solve**, and remember jNO assembles *once* while a per-solve
+assembler pays again on every Newton iteration.
+
+Most of a cold build is **XLA compilation**, and the cost is fixed per problem *structure* rather than
+per DOF — a 15x larger mesh still compiles about the same number of programs. That makes it worth
+caching across processes, which is **opt-in**:
+
+```python
+dire = jno.setup(__file__, compile_cache=True)     # or, per project, in .jno.toml:
+                                                   #   [jno]
+                                                   #   compile_cache = true
+```
+
+| 3-D Poisson, 27,833 nodes | first build | repeat build |
+|---|---|---|
+| default (no cache) | 4.75 s | 2.48 s |
+| `compile_cache=True` | **2.22 s** | **1.51 s** |
+
+**Off by default on purpose**, for two reasons: a library should not write to your disk uninvited, and
+the run that *populates* the cache is **slower** than having none at all — so a single cold run is a
+straight loss. Turn it on for anything you run more than once: a sweep, an optimisation loop, a test
+suite, or simply re-running a script after an edit.
+
+---
+
 ## Known limitations
 
 Almost every boundary below is an explicit, fail-loud `NotImplementedError`. **Two are not, and say so
@@ -1482,12 +1710,29 @@ unaffected. Full detail is inline in the sections above.
   each have one intrinsic order. `space="N1E", order=2` used to return the same lowest-order space
   silently; it now raises. The mesh is the only accuracy knob on an H(curl)/H(div) problem — see
   *Mesh resolution for wave problems* for what a given points-per-wavelength buys, measured.
-- **`jno.solve.eigs` / `FEM.eigs` solve the SYMMETRIC pencil**, and now *refuse* a non-symmetric
-  operator instead of silently returning the spectrum of `½(K+Kᵀ)` — a different problem, since a
-  non-self-adjoint operator generally has complex eigenvalues and none of the symmetrized values need
-  be an eigenvalue of the original at all. Non-self-adjoint stability problems (resistive MHD growth
-  rates, drift waves, anything with a mean flow) need a non-symmetric eigensolver, which is **not
-  built**. The check is a randomized bilinear probe and is concrete-only, so it skips under trace.
+- **`jno.solve.eigs` / `FEM.eigs` route on the operator's actual symmetry.** A symmetric pencil takes
+  the symmetric reductions (real spectrum, differentiable). A genuinely non-self-adjoint operator is
+  routed to **ARPACK/Arnoldi** (Lehoucq & Sorensen 1996) and returns the **complex** spectrum it
+  actually has — the case that matters for stability problems (resistive MHD growth rates, drift
+  waves, anything with a mean flow), where the sign of the growth rate *is* the physics. Neither path
+  ever returns the spectrum of `½(K+Kᵀ)` as though it were the answer. The routing probe is a
+  randomized bilinear test and is concrete-only, so **under `jit` the symmetric path is assumed**.
+  Limits of the non-symmetric path, which are real: **the eigenvalues are differentiable in reverse
+  mode** — `dλ = wᴴ(dA − λ dB)v / (wᴴBv)` for a simple eigenvalue (Wilkinson 1965 ch. 2), with the left
+  eigenvector obtained by inverse iteration on `(A − λᵢB)ᴴ`, verified against finite differences to
+  1e-09 — but the **eigenvectors are not**, and differentiating through them yields **NaN** rather than
+  the silent zero a plain callback would give. A **defective** eigenvalue has no derivative at all (its
+  perturbation series runs in `√ε`) and is detected via the eigenvalue condition number, giving NaN
+  instead of the enormous finite number the formula would otherwise produce. Because that guard is a
+  `custom_vjp`, **forward mode (`jax.jvp`/`jacfwd`) is unavailable here** — use `jax.grad`/`jacrev`. It
+  accepts `linear=jno.solve.lu(backend="pardiso"/"cudss"/"host")` to drive ARPACK's shift-invert
+  factorization — those kernels are plain numpy functions, so ARPACK can call them from host code —
+  but refuses `backend="device"` (a JAX primitive), the Krylov solvers, and `precond=` rather than
+  ignoring them. **`linear=` is opt-in because it is not always a win:** ARPACK applies the inverse
+  ~50–70 times, so it trades one fast factorization against per-application overhead — measured with
+  PARDISO, **0.72× at n=3,000** (slower) but **10.05× at n=20,000** (21.6 s vs 217 s). Finally it needs
+  `k < n-1`, smaller pencils taking an exact dense `scipy.linalg.eig`. Order with `which="LR"`/`"SR"` (real part — the growth rate) or
+  target an interior region with `sigma=`.
 - **Axisymmetric `(r, z)` VECTOR forms are your responsibility, and this one is *not* fail-loud** —
   the `2πr` measure is exact for scalars and wrong for vectors (elasticity hoop strain; and for vector
   Maxwell the cylindrical curl's own `1/r` terms plus the meridional/azimuthal decoupling). jNO ships

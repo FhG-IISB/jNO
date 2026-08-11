@@ -295,7 +295,7 @@ def _eigs_constraint_maps(fem_obj: Any, n_full: int):
         raise NotImplementedError(
             "jno.fem eigs: combining periodic ties with a Dirichlet pin is not supported yet — the "
             "Dirichlet DOFs are numbered in the FULL space and would have to be re-indexed into the "
-            "periodic master space to compose the two reductions. Use one or the other for now."
+            "periodic main space to compose the two reductions. Use one or the other for now."
         )
 
     if per is not None:
@@ -525,6 +525,10 @@ def _region_and_support(constraint: Any, domain: Any) -> Tuple[str, str]:
         # to its region, not a separate one -- so `g*(v·n)` on a boundary is a single-region term.
         if tag.startswith("n_") and tag[2:] in _bregions:
             tag = tag[2:]
+        # a contact-gap Variable `gap_<secondary>` (from u.gap(secondary, main)) likewise belongs to the secondary
+        # face, not a region of its own -- so `p(g) * (n·v)` on that face stays a single-region term.
+        if tag.startswith("gap_") and tag[4:] in _bregions:
+            tag = tag[4:]
         return _normalize_quad_tag(tag, _bregions)
 
     def _effective_tag(v) -> str:
@@ -624,7 +628,11 @@ def _retag_coords_for_quadrature(constraint: Any, support: str, region_id: str) 
     for v in _spatial_coord_vars(constraint):
         # outward-normal Variables (`n_<region>`) and the element-size symbol (`cell_size`) are not
         # quadrature coordinates -- leave their tag so they stay resolvable from the domain context.
-        if isinstance(v.tag, str) and v.tag not in ("fem_gauss", "cell_size") and not v.tag.startswith(("gauss_", "n_")):
+        if (
+            isinstance(v.tag, str)
+            and v.tag not in ("fem_gauss", "cell_size")
+            and not v.tag.startswith(("gauss_", "n_", "gap_"))
+        ):
             # Remember the region before rebinding to the quadrature pool. The retag must persist for
             # lazy operators (nonlinear/transient re-read `.tag` at call time), but the SAME coord object
             # is often reused in a later jno.fem() call, where region detection must still recover the
@@ -669,12 +677,12 @@ def _tie_phase(bare: Any) -> Optional[complex]:
     """The Bloch phase of a tie ``u(A) - phase*u(B)``: ``1`` for plain periodic, a complex scalar for a
     quasi-periodic (Bloch) tie, or ``None`` when the relation is not a valid tie (anti-periodic, etc.).
 
-    The slave side (left) must be a bare trial; the master side (right) is a bare trial (phase 1) or a
+    The secondary side (left) must be a bare trial; the main side (right) is a bare trial (phase 1) or a
     constant-scalar times a bare trial (the Bloch factor ``e^{i k·L}``)."""
     if getattr(bare, "op", None) != "-":
         return None
     left, right = bare.left, bare.right
-    if getattr(left, "op", None) in {"+", "-", "*", "/"}:  # slave side must be a bare trial
+    if getattr(left, "op", None) in {"+", "-", "*", "/"}:  # secondary side must be a bare trial
         return None
     rop = getattr(right, "op", None)
     if rop is None:
@@ -1669,7 +1677,7 @@ class FEM:
             _per = self._periodic_2n if self._complex_n is not None else self._periodic
             _fin = _complex_recombine(self._complex_n) if self._complex_n is not None else (lambda x: x)
             if _per is not None:
-                # periodic tie: eliminate slave DOFs via the prolongation P, solve the reduced
+                # periodic tie: eliminate secondary DOFs via the prolongation P, solve the reduced
                 # (P^T A P) u_red = P^T b, then prolong u = P u_red back to the full nodal layout.
                 # The reduction stays sparse (BCOO triplet-remap) -- it never materialises the dense
                 # full operator, so it is GPU-able at large N. The *_periodic helpers reduce block-wise
@@ -2179,13 +2187,13 @@ class FEM:
 # periodic ties:  u(A) - u(B)  (same trial, two boundary regions)
 # ---------------------------------------------------------------------------
 def _periodic_tie_spec(constraint: Any, domain: Any) -> Optional[Tuple[str, str, Optional[int], Any]]:
-    """Recognise a **periodic tie** ``u(A) - u(B)`` and return ``(master_tag, slave_tag, comp,
+    """Recognise a **periodic tie** ``u(A) - u(B)`` and return ``(main_tag, secondary_tag, comp,
     field_key)``; ``None`` for any non-tie constraint.
 
     The two regions are carried on the constraint's ``_periodic_tie`` attribute, stamped by the trace
     layer when it builds ``u(A) - u(B)`` (the only point where each side's region survives — the
     ``BinaryOp`` discards the per-side bound views). ``self`` (the left operand) is the eliminated
-    slave; ``other`` (right) is the retained master — the relation ``u(A)=u(B)`` is symmetric.
+    secondary; ``other`` (right) is the retained main — the relation ``u(A)=u(B)`` is symmetric.
     """
     tie = getattr(constraint, "_periodic_tie", None)
     if tie is None:
@@ -2200,16 +2208,16 @@ def _periodic_tie_spec(constraint: Any, domain: Any) -> Optional[Tuple[str, str,
             "jno.fem: a periodic tie must be `u(A) - u(B)` (periodic) or `u(A) - c*u(B)` with a constant "
             "scalar `c` (Bloch/quasi-periodic). Anti-periodic (`+`) or non-scalar relations are not supported."
         )
-    slave_tag, master_tag = tie
+    secondary_tag, main_tag = tie
     breg = getattr(domain, "_boundary_regions", {})
-    if not (isinstance(slave_tag, str) and isinstance(master_tag, str)):
+    if not (isinstance(secondary_tag, str) and isinstance(main_tag, str)):
         return None
-    if slave_tag == master_tag or slave_tag not in breg or master_tag not in breg:
+    if secondary_tag == main_tag or secondary_tag not in breg or main_tag not in breg:
         raise ValueError(
             f"jno.fem: a periodic tie `u(A) - u(B)` must connect two distinct boundary regions; "
-            f"got {slave_tag!r} and {master_tag!r} (known boundary tags: {sorted(breg)})."
+            f"got {secondary_tag!r} and {main_tag!r} (known boundary tags: {sorted(breg)})."
         )
-    return (master_tag, slave_tag, None, _field_key_of(constraint), phase)
+    return (main_tag, secondary_tag, None, _field_key_of(constraint), phase)
 
 
 def _ref_interior_facet_dofs(ref_pts: np.ndarray, fv: np.ndarray, dim: int, tol: float = 1e-9) -> List[int]:
@@ -2337,7 +2345,15 @@ def _face_nodes(domain: Any, points: Any, bnodes: Optional[np.ndarray], tag: str
         coords = np.asarray(points)[bnodes]
         mask = np.asarray(pred(*(coords[:, i] for i in range(coords.shape[1]))), dtype=bool).reshape(-1)
         if mask.any():
-            return np.asarray(bnodes)[mask]
+            sel = np.asarray(bnodes)[mask]
+            # `d.tag(..., region=...)`: the predicate alone selects BOTH coincident sides of a
+            # non-conforming interface, since they share coordinates. Without the ownership filter the
+            # tie sees each face twice and the mortar segmentation covers a secondary facet twice over.
+            owner = (getattr(domain, "_tag_regions", {}) or {}).get(tag)
+            if owner is not None and owner in ti:
+                sel = np.intersect1d(sel, np.asarray(ti[owner], dtype=int).reshape(-1))
+            if len(sel):
+                return sel
     return np.asarray(ti[tag], dtype=int).reshape(-1) if tag in ti else None
 
 
@@ -2371,7 +2387,7 @@ def _build_periodic_reduction(domain: Any, ties: List[Any], points: Any, cells: 
 
     points = np.asarray(points)
 
-    # Multidirectional periodicity needs each face to carry its shared corners (a corner is a slave in
+    # Multidirectional periodicity needs each face to carry its shared corners (a corner is a secondary in
     # several directions). A ``domain.tag`` predicate face includes corners by construction. An auto face
     # (from Shape/emit) does too now that a face chain keeps both endpoints (``_chain_edges_to_loop``) --
     # accept it when the mesh confirms corners are shared: every pair of perpendicular periodic faces
@@ -2397,24 +2413,34 @@ def _build_periodic_reduction(domain: Any, ties: List[Any], points: Any, cells: 
     bfacets = _boundary_facets(points, cells, dim, ele_order) if cells is not None else None
     bnodes = np.unique(bfacets) if bfacets is not None and bfacets.size else None
 
-    pairs = [(master, slave) for (master, slave, *_ignore) in ties]
+    pairs = [(main, secondary) for (main, secondary, *_ignore) in ties]
     # Bloch phase per pair (``e^{i k·L}``); 1.0 = plain periodic (the ties may be 4-tuples pre-Bloch).
     phases = [complex(t[4]) if len(t) > 4 else 1.0 + 0.0j for t in ties]
     faces: dict = {}
-    for master, slave, *_ignore in ties:
-        for tag in (master, slave):
+    for main, secondary, *_ignore in ties:
+        for tag in (main, secondary):
             if tag not in faces and (f := _face_nodes(domain, points, bnodes, tag)) is not None:
                 faces[tag] = f
 
+    # Facet connectivity per tied face. The main side alone is enough for node-to-segment
+    # collocation, but a *mortar* coupling integrates over the secondary face, so both sides are needed.
     facets: dict = {}
     if bfacets is not None and bfacets.size:
-        for master, _slave, *_ignore in ties:
-            fn = set(np.asarray(faces.get(master, np.empty(0, int))).tolist())
-            keep = np.array([set(row.tolist()).issubset(fn) for row in bfacets], dtype=bool)
-            if keep.any():
-                facets[master] = bfacets[keep]
+        for main, secondary, *_ignore in ties:
+            for tag in (main, secondary):
+                if tag in facets:
+                    continue
+                fn = set(np.asarray(faces.get(tag, np.empty(0, int))).tolist())
+                keep = np.array([set(row.tolist()).issubset(fn) for row in bfacets], dtype=bool)
+                if keep.any():
+                    facets[tag] = bfacets[keep]
     else:  # native 1D / no assembly cells -> flat-chain fallback
-        facets = {m: ff for (m, _s, *_ignore) in ties if (ff := _chain_facets(points, faces.get(m, ()))) is not None}
+        facets = {
+            t: ff
+            for (m, s, *_ignore) in ties
+            for t in (m, s)
+            if (ff := _chain_facets(points, faces.get(t, ()))) is not None
+        }
 
     return build_periodic_prolongation(points, pairs, faces, vec=vec, facets=facets, phases=phases)
 
@@ -2433,7 +2459,7 @@ def _build_periodic_reduction_n1e(domain: Any, ties: List[Any], offsets: Any) ->
     emid = np.asarray(topo["edge_midpoints"])
     edir = np.asarray(topo["edge_dirs"])
 
-    pairs = [(master, slave) for (master, slave, *_rest) in ties]
+    pairs = [(main, secondary) for (main, secondary, *_rest) in ties]
     phases = [(t[4] if len(t) > 4 and t[4] is not None else 1.0) for t in ties]  # Bloch phase (e^{iφ}) per tie
     etags: dict = {}
     for tag in {t for tie in ties for t in tie[:2]}:
@@ -2484,7 +2510,7 @@ def _build_periodic_reduction_nonnodal(domain: Any, ties: List[Any], offsets: An
     vpts = np.asarray(topo["vertex_points"])
     ev = np.asarray(topo["edge_vertices"])
 
-    # A tie spec is ``(master, slave, comp, field_key, phase)``. Unpack it TOLERANTLY, as the nodal and
+    # A tie spec is ``(main, secondary, comp, field_key, phase)``. Unpack it TOLERANTLY, as the nodal and
     # N1E builders do: this one hard-unpacked exactly four and so broke outright the moment the Bloch
     # ``phase`` was appended — every periodic Morley problem raised "too many values to unpack".
     phases = [(t[4] if len(t) > 4 and t[4] is not None else 1.0) for t in ties]
@@ -2496,7 +2522,7 @@ def _build_periodic_reduction_nonnodal(domain: Any, ties: List[Any], offsets: An
             "or a nodal Lagrange / N1E space, both of which do carry the phase."
         )
 
-    pairs = [(master, slave) for (master, slave, *_rest) in ties]
+    pairs = [(main, secondary) for (main, secondary, *_rest) in ties]
     vtags: dict = {}
     etags: dict = {}
     for tag in {t for (m, s, *_rest) in ties for t in (m, s)}:
@@ -2574,7 +2600,7 @@ def _build_periodic_reduction_multifield(
         if ties_i:
             red_i = _build_periodic_reduction(domain, ties_i, pts_i, cells_all[i], int(orders[i]), int(vec_i))
             P_i, kept_i, v_i, sel_i = red_i["P"], red_i["kept_nodes"], red_i["vec"], red_i["is_selection"]
-        else:  # a field with no periodic tie -> sparse identity (a selection: one master per row)
+        else:  # a field with no periodic tie -> sparse identity (a selection: one main per row)
             import jax.experimental.sparse as jsparse
 
             ni = int(sizes[i])
@@ -2727,8 +2753,8 @@ def _bloch_realify_periodic(periodic: dict) -> dict:
     projection for a complex ``P`` and was measured 8.1 rel-L2 off on a manufactured Bloch mode).
 
     Returns an ordinary **real** single-block periodic dict over ``(2n, 2m)`` — downstream reduction,
-    restriction and prolongation then need no complex branch and no ``conj=`` anywhere. Master rows
-    carry weight 1 in each half; a slave row ties to its master's Re and Im columns (arity 2), which the
+    restriction and prolongation then need no complex branch and no ``conj=`` anywhere. Main rows
+    carry weight 1 in each half; a secondary row ties to its main's Re and Im columns (arity 2), which the
     weighted-interpolation sparse remap already handles (``is_selection=False``)."""
     from .utils.solver.fem_utils import _periodic_blocks
 
@@ -2782,7 +2808,7 @@ def _bloch_realify_periodic(periodic: dict) -> dict:
         "n_full": 2 * n,
         "n_red": 2 * m,
         "vec": 1,  # kept_nodes is already DOF-level
-        "is_selection": False,  # a slave row ties to two masters (Re, Im) — the weighted remap path
+        "is_selection": False,  # a secondary row ties to two mains (Re, Im) — the weighted remap path
         "is_bloch": False,  # B(P) is REAL: no conj, no complex branch downstream
     }
 
@@ -2794,7 +2820,7 @@ def _reduce_transient_block_periodic(block: Any, periodic: dict) -> Any:
     Galerkin reduction is applied to every populated payload: ``M -> P^T M P``, a constant
     ``A -> P^T A P``, a runtime ``operator_fn(t, args) -> P^T A(t, args) P`` (so the reduction
     composes with re-assembly and stays differentiable in ``args``), the loads ``affine_bias`` and
-    ``forcing_vector_fn(t, args) -> P^T(...)``, and the initial state is restricted to the master
+    ``forcing_vector_fn(t, args) -> P^T(...)``, and the initial state is restricted to the main
     DOFs. A NONLINEAR block is reduced in the same spirit: ``mass`` / ``residual`` / ``jacobian`` are
     wrapped to act on the reduced state (prolong the input, reduce the output), so the integrator's
     matrix-free Newton then solves ``M_red(u_red⁺ - u_red)/dt + r_red(u_red⁺, t) = 0`` in the reduced
@@ -3335,7 +3361,7 @@ def _fem_impl(
             domain._remesh_periodic(_pairs)
 
     # Periodic ties `u(A) - u(B)` are enforced by algebraic reduction (a prolongation P that
-    # eliminates the slave-face DOFs), not by assembly. Separate them out *before* the weak/Dirichlet
+    # eliminates the secondary-face DOFs), not by assembly. Separate them out *before* the weak/Dirichlet
     # classification (`_region_and_support` would otherwise reject a residual that spans two regions).
     periodic_ties: List[Any] = []
     core_constraints: List[Any] = []
@@ -3487,7 +3513,7 @@ def _fem_impl(
         _all = getattr(domain, "_fem_native_dof_points_all", None)
         fem_obj._native_dof_points_all = list(_all) if _all is not None else None
         if couplings and periodic_ties and fem_obj.is_transient:
-            # The native periodic *transient* block reduces eagerly into a master-DOF space; the coupling
+            # The native periodic *transient* block reduces eagerly into a main-DOF space; the coupling
             # residual is written in the full nodal space, so the two cannot be composed on that path yet.
             raise NotImplementedError(
                 "jno.fem: periodic ties combined with a *transient* nonlocal Coupling are not yet supported."

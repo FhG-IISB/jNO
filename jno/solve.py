@@ -20,10 +20,13 @@ BiCGStab (steady linear) and Jacobian-free Newton-Krylov (nonlinear).
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import jax
 import jax.numpy as jnp
+
+if TYPE_CHECKING:  # runtime import stays lazy inside remesh()/relocate()
+    from .utils.solver.fem_adapt import AdaptSpec
 
 from .utils.solver.solver_api import (
     LinearOperator,
@@ -63,7 +66,7 @@ __all__ = [
 ]
 
 
-def lu(*, host: bool = False) -> LinearSolver:
+def lu(*, backend: str = "device", host: bool | None = None) -> LinearSolver:
     """Differentiable sparse-direct solve (JAX ``spsolve``: cuSolver on GPU, native LU on CPU).
 
     Wraps the existing :func:`jno.utils.solver.linear.sparse_lu_solve` -- robust on the
@@ -73,39 +76,76 @@ def lu(*, host: bool = False) -> LinearSolver:
     ``vmap="no"``) -- use a Krylov solver inside vmapped/batched solves.
 
     Args:
-        host: Factor on the HOST with SuperLU instead of on the accelerator, keeping the rest of the
-            solve where it is. cuSolver's sparse LU is the ceiling on jNO's hardest problems -- a
-            complex H(curl) eddy system stops near 20k DOFs and a Taylor-Hood Stokes system reports
-            "Singular matrix" at a mesh the CPU factors fine -- and host SuperLU was measured
-            reaching 3.1x the DOFs on the same problem. Affordable because a direct solve factorises
-            ONCE, so the operator crosses PCIe once rather than per iteration; see
-            :func:`jno.utils.solver.linear.host_lu_solve` for that argument and its limits.
+        backend: WHERE the factorization happens. All three obey the same ``(A, b) -> x`` contract and
+            are equally differentiable; they differ in speed, reach, and what they need installed.
 
-            ON THIS MACHINE it is not merely a reach extender but faster in every one of 12
-            measured points -- 0.15x to 0.81x of the cuSolver time across 2-D/3-D Poisson, Stokes,
-            H(curl) and a 51-step transient -- and it runs meshes cuSolver refuses (Stokes 26,908,
-            H(curl) 26,154, 3-D Poisson 87,284, all of which fail on GPU).
+            ``"device"`` (default) -- JAX's ``spsolve``: cuSolver on a CUDA GPU, a native LU on CPU.
+            No extra dependency, and the only one of the three that needs nothing installed.
 
-            DO NOT read that as general. This card's FP64 runs at 1/64 of its FP32 rate, ~0.3
-            TFLOPS, against ~1.1 TFLOPS for 20 AVX2 cores, and a sparse direct factorisation is
-            FLOP-heavy (dense supernodes) rather than bandwidth-bound like SpMV. The CPU is simply
-            the faster FP64 machine here. On a datacenter GPU with full-rate FP64 the ranking would
-            plausibly invert -- that is spec-sheet reasoning, not something measured here, so
-            benchmark it on your own hardware before choosing.
+            ``"host"`` -- SuperLU on the CPU via ``scipy``, keeping the rest of the solve where it is.
+            Affordable because a direct solve factorises ONCE, so the operator crosses PCIe once
+            rather than per iteration. It runs meshes cuSolver refuses outright (Stokes 26,908,
+            H(curl) 26,154, 3-D Poisson 87,284), and on this machine beat cuSolver in all 12 measured
+            points (0.15x-0.81x of its time). Read that as *cuSolver's sparse LU is weak*, not as
+            *GPUs lose*: see ``"cudss"``. Its factorization is cached on the operator's CONTENT, so a
+            constant-operator march factorizes once for the trajectory (measured 2.9x at 23,934 DOFs
+            over 51 steps) and the adjoint reuses it; a Newton loop gets nothing and pays a hash.
 
-            The factorization is CACHED on the operator's content, so a march that solves against the
-            same step matrix every step factorizes once for the whole trajectory (measured 2.9x at
-            23,934 DOFs over 51 steps), and the adjoint's transpose solve reuses it. A Newton loop
-            gets nothing -- its tangent changes every iteration -- and pays a content hash for the
-            miss; see :func:`jno.utils.solver.linear.host_lu_solve`.
+            ``"cudss"`` -- NVIDIA cuDSS on the GPU. **The fastest of the three wherever it runs**, and
+            the one to reach for on a Newton loop or a shift-invert eigensolve, because it separates
+            the symbolic plan from the numeric factorization and jNO caches on the SPARSITY: the plan
+            survives a change of values. Measured on an RTX 3070 (fp64 at 1/64 rate -- the
+            *unfavourable* card) against host SuperLU: factorization 3.4 ms vs 79.9 ms on a
+            Taylor-Hood Stokes saddle, 576 ms vs 64,856 ms on lap3d 50^3, and **64.7x per Newton step**
+            at n=64,000. It also factors that Stokes saddle cuSolver calls singular, with smaller
+            residuals. Needs the optional stack (``nvmath-python``, ``cudss``, ``cupy``) and a GPU;
+            raises a clear ``ImportError`` otherwise. Fill-in still governs 3-D (69x-218x nnz growth
+            at lap3d 20^3-40^3), so it moves the ceiling and makes device memory the binding
+            constraint -- it is not a substitute for a preconditioner.
 
-            Not the default regardless: no vmap rule.
+            ``"pardiso"`` -- Intel MKL PARDISO on the CPU, multithreaded. **The fastest
+            FACTORIZATION of the four**, and the one to pick for a Newton loop: like cuDSS it splits
+            symbolic analysis from numeric factorization, so the analysis survives a change of values.
+            Measured on lap3d 50^3 (n=125,000) against single-threaded SuperLU's 65,212 ms:
+            factorization **298 ms**, and a Newton re-factorization **296 ms -- 220x**, where cuDSS
+            reaches 115x. Being on the CPU it is also the answer when a factorization will not fit in
+            device memory. Its adjoint is cheaper than cuDSS's too: ``A^T x = b`` comes from the SAME
+            factorization rather than a second one. Needs ``pypardiso`` (x86-64).
+
+            **Choosing between the last two: pick by the phase your problem repeats.** A Newton loop
+            re-FACTORIZES, so PARDISO wins. A shift-invert eigensolve or a constant-operator transient
+            re-SOLVES against one factorization, and there cuDSS is 11x faster per solve (3.5 ms vs
+            40 ms at lap3d 50^3) and additionally takes a whole block of right-hand sides at once.
+
+            There is deliberately no ``"auto"``: which backend wins depends on hardware jNO cannot
+            inspect, and silently choosing would violate the no-surprises rule.
+        host: Deprecated alias for ``backend="host"``, kept so existing calls keep working. Passing
+            both is an error.
     """
+    if host is not None:
+        if backend != "device":
+            raise ValueError(
+                f"jno.solve.lu() got both backend={backend!r} and host={host!r}. `host=` is the "
+                f'deprecated spelling of backend="host" -- pass only backend=.'
+            )
+        backend = "host" if host else "device"
+    if backend not in ("device", "host", "cudss", "pardiso"):
+        raise ValueError(
+            f"jno.solve.lu(backend={backend!r}) is not a known backend. Use 'device' (JAX spsolve: "
+            f"cuSolver on GPU, native LU on CPU), 'host' (CPU SuperLU via scipy), 'cudss' (NVIDIA "
+            f"cuDSS on GPU -- fastest repeated SOLVE), or 'pardiso' (Intel MKL PARDISO on CPU -- "
+            f"fastest FACTORIZATION). Install the last two with jax-numerical-operators[fem]."
+        )
 
     def _fn(op: LinearOperator, b, *, M, x0):
-        from .utils.solver.linear import host_lu_solve, sparse_lu_solve
+        from .utils.solver.linear import cudss_lu_solve, host_lu_solve, pardiso_lu_solve, sparse_lu_solve
 
-        solve = host_lu_solve if host else sparse_lu_solve
+        solve = {
+            "device": sparse_lu_solve,
+            "host": host_lu_solve,
+            "cudss": cudss_lu_solve,
+            "pardiso": pardiso_lu_solve,
+        }[backend]
         if op.bcoo is not None:
             return solve(op.bcoo, b)
         # a dense operator gets the dense direct solve — BCOO.fromdense would need a concrete
@@ -117,7 +157,18 @@ def lu(*, host: bool = False) -> LinearSolver:
     # none to remove, so it would pay a compile for nothing.
     # the name carries the placement, so two specs that factor in different memories are not
     # reported (or cached) as though they were the same solver
-    return LinearSolver(_fn, name="lu-host" if host else "lu", direct=True, traits={"vmap": "no"})
+    name = {"device": "lu", "host": "lu-host", "cudss": "lu-cudss", "pardiso": "lu-pardiso"}[backend]
+    # `multi_rhs` lets a caller holding a BLOCK of right-hand sides (the shift-invert eigensolver's
+    # subspace iteration) hand the whole block over in one call instead of looping its columns.
+    # `host_kernel` names the numpy-level solve this spec corresponds to, for the callers that run
+    # on the host and cannot go back through JAX -- notably ARPACK's shift-invert OPinv in the
+    # non-symmetric eigensolver. "device" has none: it IS a JAX primitive.
+    traits = {
+        "vmap": "no",
+        "multi_rhs": backend == "cudss",
+        "host_kernel": None if backend == "device" else backend,
+    }
+    return LinearSolver(_fn, name=name, direct=True, traits=traits)
 
 
 def dense() -> LinearSolver:
@@ -558,11 +609,36 @@ def eigs(*, k: int = 6, which: str = "smallest", sigma=None, linear=None, precon
     _maxiter = 200 if maxiter is None else int(maxiter)
 
     def _fn(K, M=None):
-        from .utils.solver.eigen import _require_symmetric, dense_geneigh, lobpcg_geneigh, shift_invert_geneigh
+        from .utils.solver.eigen import (
+            _require_symmetric,
+            _symmetry_verdict,
+            dense_geneigh,
+            lobpcg_geneigh,
+            nonsymmetric_geneigh,
+            shift_invert_geneigh,
+        )
 
-        # Every path below reduces the SYMMETRIC pencil (both reductions Hermitianize by
-        # construction), so a non-self-adjoint operator would be silently answered with the spectrum
-        # of its symmetric part. Probe the bilinear form and refuse instead.
+        # The symmetric paths below Hermitianize by construction, so a non-self-adjoint operator
+        # would be silently answered with the spectrum of its symmetric part. Probe the bilinear
+        # form and ROUTE on the answer: Arnoldi (complex spectrum) rather than a refusal. A traced
+        # or unsized operator cannot be probed and keeps the historical symmetric assumption.
+        if "nonsymmetric" in (_symmetry_verdict(K), _symmetry_verdict(M)):
+            if precond is not None:
+                raise ValueError(
+                    "jno.solve.eigs: precond= is not used by the non-symmetric (Arnoldi) path -- its "
+                    "shift-invert is ARPACK's own sparse LU. Drop precond=, and pass sigma= to target "
+                    "an interior region."
+                )
+            return nonsymmetric_geneigh(
+                K,
+                M,
+                k,
+                sigma,
+                which,
+                inner_solve=linear,
+                tol=0.0 if tol is None else float(tol),
+                maxiter=maxiter,
+            )
         _require_symmetric(K, "K")
         _require_symmetric(M, "M")
         if sigma is not None:
@@ -661,7 +737,7 @@ def remesh(
     max_iters: int = 8,
     tol: float | None = None,
     eps: float | None = None,
-):
+) -> AdaptSpec:
     """**h-adaptivity** for ``fem.solve(adapt=...)``: change the mesh to follow the solution.
 
     On a **steady** problem this is the refine loop — solve, estimate (Zienkiewicz–Zhu), mark
@@ -696,7 +772,7 @@ def remesh(
             (two consecutive rounds required).
 
     Returns:
-        The adaptation spec to pass as ``fem.solve(adapt=...)``.
+        AdaptSpec: The adaptation spec to pass as ``fem.solve(adapt=...)``.
 
     See :func:`relocate` for the fixed-connectivity (r-adaptive) alternative: it keeps the topology, so
     there is no mesh schedule to freeze and no cross-mesh transfer, and its vertex map is differentiable
@@ -727,7 +803,7 @@ def relocate(
     quality_floor: float = 0.1,
     relax: int = 60,
     relax_step: float = 0.1,
-):
+) -> AdaptSpec:
     """**r-adaptivity** for ``fem.solve(adapt=...)``: move the mesh vertices, keep the connectivity.
 
     Moves the vertices tagged ``domain.variable(region)[i].trainable()`` so the mesh **equidistributes**
@@ -798,7 +874,7 @@ def relocate(
         relax_step: ``"monge_ampere"`` only — the relaxation pseudo-step ``Δt``.
 
     Returns:
-        The adaptation spec to pass as ``fem.solve(adapt=...)``.
+        AdaptSpec: The adaptation spec to pass as ``fem.solve(adapt=...)``.
     """
     if method not in ("descent", "monge_ampere"):
         raise ValueError(f"jno.solve.relocate(method={method!r}): expected 'descent' or 'monge_ampere'.")

@@ -1,0 +1,1333 @@
+# jNO — jax Numerical Operators (guide for LLMs)
+
+<!--
+This file is written for language models: a single, self-contained briefing on how to write
+correct, idiomatic jNO code. Paste it into a system prompt, point a coding agent at it, or drop
+it into an agent skill. Canonical URL: https://fhg-iisb.github.io/jNO/llms-full.txt
+Human-readable docs: https://fhg-iisb.github.io/jNO/   Paper: https://arxiv.org/abs/2605.10159
+-->
+
+jNO is a JAX-native library for **differentiable numerical methods**. Classical solvers (finite
+elements, finite differences, spectral/RCWA) and scientific machine learning (PINNs, neural
+operators, Bayesian inference) sit on **one substrate**: you write the math — a weak form, a
+strong-form stencil, a PDE residual, a data loss — and it lowers to a single GPU-ready,
+end-to-end reverse-mode-differentiable, `jit`-compiled graph.
+
+Because every solve is differentiable, things that are normally separate frameworks are the same
+tool here: an inverse problem, a PDE-constrained optimisation, and a neural-network coefficient
+are one composition away from a forward solve.
+
+> **Every example in §12 was executed against jNO 0.3.0 and exited 0.** This file records what
+> actually runs, not what reads plausibly — the measured traps live in §11.
+
+---
+
+## 1. House convention — write jNO this way
+
+Four rules. They are not stylistic; they keep PINN, FEM and FDM code reading identically, and
+three of them route around API spellings that no longer exist.
+
+### 1.1 Derivatives: `.bind` first, then attributes
+
+```python
+u  = (x * (1 - x) * net(x)).scalar.bind(x=x)     # PINN: .scalar.bind, then u.x / u.xx / u.t / u.tt
+ui = u.bind(x=xi, y=yi, t=ti)                     # FEM & FDM: bind the symbol, then ui.x / ui.xx / ui.t
+pde = ui.xx + ui.yy + f                           # ✓
+```
+
+Not `u.d2(x) + u.d2(y)`, not `u.laplacian(x, y)`. Those work, but the bound-attribute form is the
+one convention across all three solvers, and `.bind` is what makes attribute derivatives available
+even when the coordinate is not the network's own input. Costs nothing: `u.xx + u.yy` folds to a
+single Laplacian node in the trace.
+
+Available on a bound view: `.x .y .z .t`, `.xx .yy .zz .tt`, `.xy` and other mixed partials.
+
+### 1.2 Domains: `jno.Shape` / `jno.Path` only
+
+```python
+d = jno.Shape.rect(0, 0, 1, 1, size=0.05).domain()                    # 2-D
+d = jno.Shape.rect(0, 0, 1, 1, size=0.05).domain(time=(0, 0.5, 4))    # 2-D + time
+d = jno.Path(0, 0).line_to(1, 0).curve(size=0.02).domain()            # 1-D, ends named left/right
+d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.1).domain()                # 3-D
+```
+
+Never `shapely.geometry.box`, never `jno.domain.rect(...)` / `.line(...)` / `.cube(...)` /
+`.l_shape(...)`. The `jno.domain.*` constructors **have been removed** — they are the single
+largest source of stale example code (see §11).
+
+### 1.3 `jno.setup` always, first line after the imports
+
+```python
+run = jno.setup(__file__)     # -> "./runs/<script-stem>"; also initialises logging
+```
+
+Everything written during the run goes under `run`: `stats.plot(f"{run}/training.png")`,
+`jno.save(crux, f"{run}/model.pkl")`.
+
+### 1.4 Inline and short where it stays readable
+
+One line per idea. Chain the controls that return `self`. Build the constraint list inside
+`jno.core([...])` when the expressions are short enough to read there.
+
+```python
+run = jno.setup(__file__)
+d = jno.Shape.rect(0, 0, 1, 1, size=0.05).domain()
+x, y, _ = d.variable("interior")
+
+net = jno.nn(foundax.mlp(in_features=2, hidden_dims=64, num_layers=4, key=jax.random.PRNGKey(0)))
+net.optimizer(optax.adam(1e-3))
+
+u = (net(x, y) * x * (1 - x) * y * (1 - y)).scalar.bind(x=x, y=y)      # hard BC
+pde = u.xx + u.yy + 2 * pi**2 * sin(pi * x) * sin(pi * y)
+
+jno.core([pde.mse]).solve(5000).plot(f"{run}/training.png")
+```
+
+Also settled: **`jno.nn(...)`** over `jno.nn.wrap(...)` (identical, shorter), **`jno.np`** over
+`import jno.numpy as jnn` (one namespace, no alias), and **splat a split coordinate tuple** into a
+field call — `u(*a) - u(*b)` to glue two faces, `u(*bb) - 0.0` for a Dirichlet edge, `u(*ci) - g`
+for an initial condition — never `u(a[0], a[1], a[2])`. The call accepts the whole tuple including
+the trailing time coordinate (measured on Dirichlet, ties and ICs). Indexing stays only where you
+genuinely want one coordinate (`ci[0]` inside a formula) or a keyword bind (`.bind(x=sv[0], ...)`).
+
+---
+
+## 2. The one idea: everything is a trace
+
+You describe the problem as a **symbolic expression**, not as a training loop. Domain points,
+network calls, derivatives, PDE residuals, weak forms, integrals, noise, and trainable parameters
+are all nodes in one graph. `jno.core(...)` JIT-compiles that graph **once** into a JAX function
+reused by both `crux.solve()` (training) and `crux.eval()` (evaluation) — which is why the same
+expression can be a residual *loss* during training and a *quantity of interest* afterwards.
+
+Four normally-separate workflows are just different nodes in that graph, so they compose and
+differentiate uniformly:
+
+| Workflow | Trial | Loss / operator |
+|---|---|---|
+| **PINN** | a network | strong-form residual `u.xx + f`, derivatives by autodiff |
+| **Plain NN / operator learning** | a network | supervised `(pred - data).mse` |
+| **FEM** | FE basis | weak form as a term list → `jno.fem([...])`, differentiable `fem.solve()` |
+| **FDM** | nodal unknown | same term list, no test function → `jno.fdm([...])` |
+
+Mix them in one `jno.core(...)` and **inverse problems fall out for free**: put a trainable
+`jno.np.parameter` (or a whole network) anywhere in the graph, compare to data, and the gradient
+flows back through the derivatives, the solve, and the network in one pass.
+
+| Term | What it is |
+|---|---|
+| **Placeholder** | base symbolic node — a coordinate, a network call, an operation, a residual |
+| **Constraint** | any expression reduced to a scalar (`expr.mse`) and handed to `jno.core` |
+| **Crux** | what `jno.core(...)` returns — compiled step, optimiser state, history |
+| **Model** | what `jno.nn(module)` returns — a wrapped Equinox module with per-model controls |
+| **Tag** | a string label on a domain mapping to a point set (`"interior"`, `"boundary"`, `"left"`) |
+
+---
+
+## 3. Install and environments
+
+```bash
+pip install jax-numerical-operators             # FEM, FDM, solvers, PINNs, SciML — CPU out of the box
+pip install "jax-numerical-operators[cuda]"     # NVIDIA GPU (CUDA-capable JAX build, same pin)
+```
+
+Optional extras: `[cuda]` (GPU JAX), `[fem]` (meta-extra = `[mesh]` remeshing + `[pardiso]` +
+`[cudss]` sparse-direct backends), `[rcwa]` (Fourier solver, pulls `fmmax`), `[amg]` (GPU algebraic
+multigrid), `[iree]`; combinable as `[cuda,fem]`. There is deliberately no `[fdm]` extra — FDM is
+core. Models come from **foundax** — jNO ships no model zoo of its own.
+
+In the jNO repo itself everything runs through **pixi**:
+
+```bash
+pixi run -e dev  python script.py     # dev adds matplotlib
+pixi run -e rcwa python script.py
+pixi run test                         # pytest -x --tb=short
+pixi run ci-test                      # skips @pytest.mark.slow
+```
+
+---
+
+## 4. Domains and geometry
+
+`variable` **always** returns a trailing time coordinate (constant on a steady domain): a 1-D
+domain unpacks as `x, t`, 2-D as `x, y, t`, 3-D as `x, y, z, t`. Forgetting the trailing `_` is the
+most common beginner error.
+
+```python
+x, y, _ = d.variable("interior")                          # PINN collocation coords
+xi, yi, _ = d.variable("interior", split=True)            # FEM/FDM quadrature coords
+xb, yb, _, nx, ny = d.variable("top", normals=True, split=True)
+x, y, _ = d.variable("interior", sample=(500, None))      # 500 sampled points
+x0, y0, t0 = d.variable("initial")                        # the t = t0 slice
+```
+
+### The `Shape` DSL
+
+A `Shape` is an immutable build-plan (gmsh-OpenCASCADE); every call returns a new shape.
+
+| Primitive | Auto-named boundaries |
+|---|---|
+| `Shape.rect(x0, y0, x1, y1)` | `left` `right` `top` `bottom` |
+| `Shape.disk(cx, cy, r)` | `arc` |
+| `Shape.polygon(points)` | `e0 e1 … eN` |
+| `Shape.box(x0, y0, z0, x1, y1, z1)` | `left right top bottom front back` |
+| `Shape.cylinder(x, y, z, dx, dy, dz, r)` | `side` `top` `bottom` |
+| `Shape.sphere(cx, cy, cz, r)` | `surface` |
+| `Path(…).face()` | per-segment, `name=` as you draw |
+
+`interior` and `boundary` always exist. Combine with `a - b` (cut), `a | b` (fuse), `a & b`
+(intersect). Transforms: `.extrude(h)`, `.revolve(pt, dir, angle)`, `.sweep(path)`, `.array(n, …)`,
+`.translate(v)`, `.rotate(...)`, `.fillet(r, where=…)`, `.sized(size)`.
+
+`Path` chains `line_to` / `arc_to`; `.face()` closes it into a 2-D shape, `.curve(size=)` makes it a
+1-D domain, and an open `Path` is a sweep trajectory. A sharp `line_to→line_to` corner is rejected —
+round it with `arc_to`.
+
+Mesh density lives on the **shape**, not the domain — a small `size=` on the shape covering the
+region you want refined, or `.sized(lambda x, y, z: 0.03 + 0.10*y)` for grading.
+
+### Naming, selection, materials
+
+```python
+d.tag("inlet",  lambda x, y, z: x < 1e-6)                                # coordinate predicate
+d.tag("outlet", lambda x, n, name: (n[:, 0] > 0.9) & (name != "left"))   # coords + normal + name
+xl, yl, _ = d.variable("left", where=lambda x, y, z: x < 1e-6)           # tag AND bind in one call
+
+d = (core.name("inclusion") + plate.name("matrix")).sized(0.05).domain()  # conforming multi-material
+d.variable("inclusion|matrix")     # the interface facets, auto-named by the sorted region pair
+```
+
+`+` keeps distinct materials with a conforming interface; `|` fuses them into one. Interfaces are
+listed by `d.interface_tags()` and kept **out** of `d.boundary_tags()`.
+
+### Other domain sources
+
+```python
+d = jno.domain("part.msh")                                        # physical groups become tags
+d = jno.domain.from_array({"interior": pts, "boundary": bpts})    # point cloud (no mesh ⇒ no integrate/FD)
+d = jno.Shape.rect(0, 0, 1, 1, size=0.02).domain(structured=True) # uniform grid → fast FD stencils
+dom = 500 * jno.Shape.rect(0, 0, 2, 1, size=0.05).domain()        # replicate for operator learning
+```
+
+`d.plot("domain.png")` renders mesh, regions and normals. Node coordinates: `d.built_mesh.points`,
+or `d.mesh_connectivity["points"]` on an FDM domain.
+
+---
+
+## 5. Expressions
+
+### Integration
+
+`.integrate()` collapses a field to a scalar; the region (volume vs boundary) is **auto-detected**
+from the `Variable` tags inside the expression, so you pass no region argument.
+
+```python
+vol  = u.integrate()               # ∫_Ω u dV
+bnd  = u_b.integrate()             # ∮_∂Ω u ds
+heat = (u * v).integrate(ti)       # time-window integral (trapezoid)
+Ku   = (kernel(x, y) * u_of(y)).integrate(var=x)   # non-local / Fredholm — one value per point
+
+xb, yb, _, nx, ny = d.variable("boundary", normals=True, split=True)
+flux = (u_b.x * nx + u_b.y * ny).integrate()       # ∮ ∂u/∂n ds — flux is written explicitly
+```
+
+Needs `compute_mesh_connectivity=True`. A temporal `.integrate(t)` needs `min_consecutive=None`
+(or `>= 2`) in `solve()`.
+
+### Reductions, math, views
+
+```python
+u.mse  u.mae  u.mean  u.sum  u.min  u.max  u.std       # → scalar nodes
+u.shape  u.T  u.real  u.imag       a.equal(b)   a > b
+u.scalar  u.vector  u.complex  u.matrix  u.voigt  u.field    # typed views, each with .bind
+```
+
+`jno.np` carries the elementwise library: `sin cos tan exp log sqrt cbrt abs sign square power
+floor ceil round`, `where maximum minimum`, `concat stack reshape squeeze expand_dims transpose`,
+`dot matmul cross norm inner`, `inv det eigvalsh logm expm sqrtm`, `symgrad trace vector`,
+constants `pi e inf nan`. Vector calculus: `jno.np.jacobian/divergence/curl_2d/curl_3d`, and on a
+`VectorView` directly — `jno.np.vector(a, b).div(x, y)`.
+
+### Differentiation schemes
+
+The scheme rides on the call: `u.d(x, scheme="finite_difference")`. (Attribute derivatives use the
+default; drop to the method form only when you need a non-default scheme.)
+
+| Scheme string | Grad | Lap/Hess | Notes |
+|---|:--:|:--:|---|
+| `"automatic_differentiation"` *(default)* | ✅ | ✅ | exact, any domain |
+| `":forward"` / `":reverse"` | ✅ | — | `jacfwd` / `jacrev` |
+| `":fwd-over-rev"` *(default Hessian)*, `":fwd-over-fwd"`, `":rev-over-rev"`, `":rev-over-fwd"` | — | ✅ | 2nd-order AD variants |
+| `"finite_difference"` | ✅ | ✅ | area-weighted, unstructured meshes |
+| `":lsq"` / `":uniform"` / `":inverse_distance"` | ✅ | ✅ | |
+| `":cotangent"` | — | ✅ | cotangent Laplacian, **2-D only** |
+
+Forward mode is cheaper when input dim ≤ output dim (typical for PINNs); reverse for scalar losses
+with many inputs. Project-wide default via `.jno.toml` or
+`jno.setup(__file__, diff_type="forward", hessian_type="fwd-over-rev")`.
+
+> **Trap.** `":cotangent"` and `":lsq"` return the **whole** Laplacian in one shot, so
+> `u.d2(x, scheme="finite_difference:cotangent") + u.d2(y, …)` **doubles** it.
+
+### Units, escape hatch, trackers
+
+```python
+x = x.unit("m").scale(L);  u = net(x, t).unit("K").scale(U)
+jno.units.check(res);  jno.units.nondimensionalize(res);  jno.units.rescale(res)
+
+result = jno.fn(lambda x, y: jnp.exp(-x**2) * jnp.sin(y), [x, y])   # any JAX fn, differentiable
+val = jno.np.mean(jno.np.abs(u - u_exact)).tracker(100)             # logged, NOT part of the loss
+J = u.grad(u_net)                                                    # ∂u/∂θ, (B, N, P) — the NTK's J
+J_sg = J.stop_gradient                                               # identity fwd, zero bwd
+```
+
+`.name("label")` tags an expression for logs/W&B; `.print(what="shape")` emits a runtime shape and
+passes the value through. Both chain.
+
+---
+
+## 6. Training — `jno.core`
+
+```python
+crux = jno.core(constraints=[pde.mse, bc.mse], domain=d, rng_seed=42,
+                weights=[1.0, 10.0], mesh=(1, 1))   # mesh = (batch_devices, model_devices)
+stats = crux.solve(epochs=10_000, batchsize=32, callbacks=[...], min_consecutive=None)
+stats.plot(f"{run}/training.png")
+```
+
+**Every non-frozen model must have an optimiser before `solve()`.**
+
+```python
+from jno import LearningRateSchedule as lrs
+
+net.optimizer(optax.adam(1e-3))                                              # bake the rate in
+net.optimizer(optax.adam(1)).scale(lrs.exponential(1e-3, 0.9, 2000, 1e-5))   # or attach a schedule
+net.optimizer(optax.chain(optax.clip_by_global_norm(1.0), optax.adam(1e-3)))
+```
+
+Construct with a placeholder rate of `1` when using `.scale(...)` — the schedule sets the effective
+rate and is re-evaluated every step. Factories: `lrs.constant`, `lrs.exponential`, `lrs.cosine`,
+`lrs.warmup_cosine`, `lrs.piecewise_constant`, all taking `min_lr`/`max_lr`; any
+`(epoch, losses) -> scalar` callable is a schedule. `jno.optimizers` adds second-order optimisers
+absent from optax: `engd`, `ssbroyden`, `ssbfgs`, `soap`, `md`.
+
+### What `solve()` actually returns
+
+```python
+stats.total_loss           # FINAL SCALAR total loss (a float, NOT an array)
+stats.total_loss_history   # 1-D array, concatenated across every solve() call
+stats.training_logs        # list of per-solve()-call dicts
+stats.plot(path)           # returns self, so it chains off solve()
+stats.summary()
+```
+
+### Evaluation and debugging
+
+```python
+pred = crux.eval(u)                                # on the training domain
+pred = crux.eval(u, domain=fine_domain)            # on any other domain
+a, b = crux.eval([a, b])                           # several nodes at once
+crux.print_tree("tree.txt");  crux.print_shapes()
+crux.solve(5000, profile=True)                     # Perfetto trace in <run>/traces/
+crux.checkpoints                                    # every solve() call checkpoints
+```
+
+### Adaptive weights, resampling, callbacks
+
+```python
+w_pde, w_bc = jno.fn.adaptive.relobralo([pde, bc])          # also softadapt, dwa
+crux = jno.core([w_pde * pde, w_bc * bc, w_pde.tracker(), w_bc.tracker()])
+
+x, y, _ = d.variable("interior", sample=(None, None),
+                     resampling_strategy=jno.sampler.rad(resample_every=100,
+                                                         resample_fraction=0.1, start_epoch=1000))
+
+cb = jno.callbacks.early_stopping(patience=1000, min_delta=1e-6, mode="min")
+crux.solve(100_000, callbacks=[cb]);  print(cb.stopped_epoch, cb.best_metric)
+```
+
+Samplers: `random`, `rad`, `rard`, `ha`, `cr3` (time-causal), `pinnfluence`. Always delay with
+`start_epoch > 0`; fractions of 0.1–0.3 are typical. Custom callbacks subclass
+`jno.utils.adaptive.callbacks.Callback` and override `on_solve_begin`, `on_before_update`,
+`on_epoch_end` (return `True` to stop) or `on_training_end`.
+
+### Model controls
+
+```python
+net.freeze()  net.unfreeze()
+net.mask(param_mask)                    # one-shot boolean-pytree scope for the NEXT control
+net.constrain(jax.nn.softplus)          # reparameterise WEIGHTS before every forward pass
+net.lora(rank=4, alpha=1.0)
+net.dtype(jnp.float64);  net.initialize("weights.eqx")
+net.summary();  net.reset();  net.to_iree(sample_inputs)
+```
+
+> `.scale(...)` is overloaded by receiver: on an **expression** it declares a characteristic
+> magnitude for non-dimensionalisation; on a **model** it sets the learning-rate schedule.
+
+> `constrain()` shapes the **weights**, not the field values — `softplus` on every weight does not
+> make the output positive. For a positive field use an output transform: `k = jno.fn.exp(k_raw(x))`.
+
+---
+
+## 7. FEM — `jno.fem`
+
+Write the weak form as a plain list of **residual terms**: volume physics, natural boundary terms,
+and essential boundary conditions all in the same list. There is no `dirichlet(...)`/`neumann(...)`
+call — `jno.fem` classifies each term by the region its symbols are bound to.
+
+### Symbols
+
+`d.fem_symbols(value_shape=(), order=1, space=None, names=("u", "phi"))`
+
+- `value_shape=(2,)` → vector unknown (elasticity, velocity)
+- `order=k` → degree-`k` Lagrange (any `k ≥ 1`)
+- `space="RT"` (H(div)), `"N1curl"` (H(curl) — Maxwell, eddy currents), `"Argyris"`/`"Morley"`
+  (C¹, plates/biharmonic), `"Hermite"` (1-D beam), `"P0"`
+- call `fem_symbols` **once per field** for coupled systems
+
+### Boundary conditions are terms
+
+| Condition | Term |
+|---|---|
+| Dirichlet `u = g` | `u(xb, yb) - g` |
+| Per-component (roller) | `u(xb, yb)[i] - g` |
+| Neumann flux `∂u/∂n = g` | `-g * phi.bind(x=xb, y=yb)` |
+| Robin `∂u/∂n + a u = g` | `(a * u.bind(x=xb, y=yb) - g) * phi.bind(x=xb, y=yb)` |
+| Vector traction `t` | `-jno.np.inner(t, phi.bind(x=xb, y=yb), n_contract=1)` |
+| Periodic / tie | `u("left") - u("right")` (no test function ⇒ a tie) |
+| Bloch | `u(A) - c * u(B)` |
+
+`g` may be a constant or a coordinate expression. **Zero Neumann is the natural default and needs
+no term.** Tag periodic faces with a **predicate** so both sides include their corner nodes.
+
+### Vocabulary inside a term
+
+Closed-form nonlinear physics is already symbolic — `+ - * / **` and `jno.np` compose straight in:
+
+```python
+D      = k * (1e-3 + ui.x**2 + ui.y**2) ** 0.3     # nonlinear diffusivity D(|∇u|)
+react  = ui * ui * vi                               # u² reaction
+energy = (ui.x**2 + ui.y**2).integrate()            # ∫|∇u|²
+tau    = d.cell_size / (2 * beta.norm())            # SUPG stabilisation from the element size
+```
+
+Geometry symbols: `d.variable(tag, normals=True, split=True)` → `nx, ny`; `d.cell_size`;
+`d.enclosure(tags)` (view factors for grey-body radiation). Second derivatives for 4th-order forms:
+`jno.np.laplacian(ui, [xi, yi])`, `jno.np.hessian(ui, [xi, yi])` — needs `order >= 2`.
+
+> **Conformity caveat.** Lagrange is C⁰, so `∫Δu·Δv` over P2 is *non-conforming* and does not give
+> a convergent biharmonic discretisation. Use `space="Argyris"` (C¹), `space="Morley"`, or the
+> mixed Ciarlet–Raviart pair.
+
+Escape hatch: `jno.fn(lambda a, b: ..., [ui, vi])` turns any differentiable JAX function of traced
+arguments into a term.
+
+### What `jno.fem` returns
+
+| Form | flags | Use |
+|---|---|---|
+| steady, linear | `is_linear=True`, `is_transient=False` | `fem.A`, `fem.b` |
+| steady, nonlinear | `is_linear=False` | `fem.residual(u)`, `fem.jacobian(u)`, `fem.dofs` |
+| has a `ui.t` term | `is_transient=True` | `fem.M`, `fem.operator.A`, `fem.state0`, `fem.dt`, `fem.t0`, `fem.t1` |
+
+Always available: `fem.dofs`, `fem.points` (the coordinates the DOFs live on — **use these, not
+mesh vertices, for P2+**), `fem.operator`, `fem.classification`, `fem.offsets`, `fem.blocks`.
+`fem.operator.evaluate({"k": values})` materialises a parametric operator at given coefficients.
+
+A second time derivative (`ui.tt`) is auto-reduced to the first-order system `y = [u, v]` and
+integrated by the energy-conserving **trapezoidal rule**. It needs **two** initial conditions
+(displacement and velocity). Do **not** hand-roll backward Euler on a second-order block — it
+spuriously damps the wave.
+
+### Coefficients — known vs trainable
+
+```python
+k = jno.np.parameter(phi).initialize(lambda x, y: 1.0 + 4.0*x).freeze()   # KNOWN → assembles normally
+k = jno.np.parameter(phi, name="k")                                        # TRAINABLE → parametric, via crux
+k = d.variable("kappa", sample=k0).trainable()                             # promote anything to a parameter
+```
+
+A `jno.np.parameter` is **trainable by default**, which makes the system runtime-parametric — so
+`fem.A` / `fem.b` are unavailable until you `.freeze()` it. A frozen value must be a scalar or a
+coordinate function; a raw per-node array fails loud. `.trainable()` on a *coordinate* makes the
+mesh vertices a design variable (shape optimisation, r-adaptivity).
+
+### Solving — the slot API
+
+Every slot is a configured **callable** (never a string); every `None` keeps the default.
+
+```python
+u = fem.solve(x0        = u_guess,                 # warm start
+              nonlinear = jno.solve.newton(),      # or picard(damping=0.7)
+              linear    = jno.solve.gmres(),
+              precond   = jno.precond.jacobi())
+```
+
+| Structure | Solver |
+|---|---|
+| SPD (Poisson, elasticity, mass) | `cg` |
+| non-symmetric (advection, SUPG) | `bicgstab` / `gmres` — `bicgstab + jacobi` is the default |
+| iterative preconditioner inside | `fgmres` |
+| symmetric **indefinite** (Stokes/Biot saddle, biharmonic) | `minres` |
+| SPD, batched/GPU-heavy | `chebyshev` (inner-product free) |
+| indefinite, single solve | `lu` — **no vmap rule**, use a Krylov inside batched solves |
+| cuSolver refuses it or is slow | `lu(backend="host")` (SuperLU) |
+| shift-invert eigs, constant-operator transient | `lu(backend="cudss")` |
+| a Newton loop, or no GPU | `lu(backend="pardiso")` |
+| small systems / coarse blocks | `dense` |
+
+`jno.solve.newton(damping=, rtol=1e-8, atol=1e-8, max_steps=100, line_search=, direct=)` —
+note **`rtol`/`atol`, there is no `tol=`**. `direct=True` factorises the assembled tangent each
+step; it is required, not preferred, when the matrix-free Newton-Krylov has no preconditioner to
+lean on (stiff tangents, saddle points) — otherwise it diverges to NaN.
+
+Preconditioners: `jacobi`, `chebyshev(degree=)`, `nystrom(rank=)` (**SPD only**), `amg(cycles=)`,
+`gmg()`, `ams`, `form([terms], inner=)`, `inner(solver)`, `block_diag`/`triangular` (per-field over
+`fem.blocks`), `cached`.
+
+**AMG is for repeated solves against the same operator** — build the hierarchy once, or an unbuilt
+spec re-runs pyamg's host-side setup every solve:
+
+```python
+M = jno.precond.amg().build(fem.operator[0])
+u = fem.solve(linear=jno.solve.cg(tol=1e-10), precond=M)
+```
+
+Break-even is ~7 solves at 95k DOFs, ~66 at 3k. Below ~100k DOFs for a *single* solve, Jacobi wins.
+
+**Picard for lagged coefficients** — when a solution-dependent coefficient's Newton tangent
+destroys the linearised structure (shear-thinning viscosity in non-Newtonian Stokes), freeze it
+with `jno.lag(...)` and drive with `jno.solve.picard()`. `lag` is `stop_gradient` on the traced
+expression, so the linearisation *is* the Picard iteration.
+
+### Eigenproblems and SVD
+
+```python
+K = jno.fem([ui.x*vi.x + ui.y*vi.y, u(xb, yb) - 0.0])   # stiffness, no source term
+lam, X = K.eigs(mass=[ui*vi], k=6)                       # dense reduction — exact, O(N²) memory
+lam, X = K.eigs(mass=[ui*vi], k=6, precond=jno.precond.amg())   # LOBPCG, never densified
+lam, X = K.eigs(mass=[ui*vi], k=4, sigma=60.0)           # the 4 modes nearest λ = 60
+lam2, X2 = K2.eigs(mass=mass, k=6, precond=…, X0=X)      # warm-start a sweep
+U, s, Vt = jno.solve.svd(snapshots, k=6)                 # POD basis; depth must exceed k
+```
+
+`tol`/`maxiter` are **rejected** without `precond=` or `sigma=`, so a tolerance can never be
+silently ignored by the dense path. Do not set `tol` near machine precision — an exhausted budget
+**NaN-poisons** the result by design.
+
+### Build time and memory
+
+A 13.8k-DOF 2-D Poisson issues ~209 XLA compilations (~3.7 s), paid **once per distinct mesh
+shape** and cached in-process (~320 ms to rebuild). A remeshing loop pays it per iteration. Across
+separate processes nothing is reused unless you opt in:
+
+```python
+jax.config.update("jax_compilation_cache_dir", "~/.cache/jax")
+jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)   # REQUIRED — default is 1.0s
+```
+
+The second line is not optional here: every one of these compilations is far below the 1 s default,
+so the cache directory alone writes nothing. `jno.fem(chunk=)` bounds the element loop's peak
+memory (default ~0.15 % of device memory per chunk, floor 8192 cells); `chunk=False` restores a
+single `vmap`.
+
+---
+
+## 8. FDM — `jno.fdm`
+
+The **strong-form sibling** of `jno.fem`: the same kind of constraint list, but the strong residual
+is collocated at the mesh nodes with finite-difference stencils. No test function, no mass matrix,
+no quadrature — and the solve is differentiable through `custom_root`, so it composes into inverse
+problems exactly like `fem.solve()`.
+
+`d.unknown()` is the strong-form counterpart of `fem_symbols()`: a valued P1 nodal field. Autodiff
+against a coordinate is meaningless on a discrete field, so the bound view's derivatives are
+**finite differences by default** — no `scheme=` needed.
+
+Flux BCs are written with the edge's own normal; `jno.fdm` handles **any condition affine in
+`∂u/∂n`**, and any mix of Dirichlet/Neumann/Robin composes. A non-affine condition **raises**
+rather than returning a wrong answer. In 2-D a corner node shared by two flux edges has no single
+normal and falls back to the interior residual — give it an explicit Dirichlet value if it needs
+anchoring.
+
+**Structured grids.** `structured=True` on an axis-aligned `Shape.rect`/`Shape.box` builds a
+uniform grid and switches the interior operators to direct 5-point (2-D) / 7-point (3-D) stencils
+by array reshaping. Same answer as the unstructured cotangent operator, cheaper. The inner Krylov
+defaults to **GMRES + geometric-multigrid V-cycle** because row-replaced Dirichlet makes the
+reduced operator nonsymmetric. Pick a size giving an **even** (ideally power-of-two) cell count per
+axis or multigrid falls back to plain GMRES. Periodic boundaries and complex fields are **not**
+supported in `jno.fdm`.
+
+---
+
+## 9. Inverse problems
+
+Always the same shape: put an unknown in the graph, compare to data, `crux.solve`.
+
+```python
+# scalar
+a = jno.np.parameter((1,), key=k1, name="a").optimizer(optax.adam(1e-2))
+
+# through a FEM forward solve — the gradient flows through the assembled solve
+k = jno.np.parameter((1,), name="k")
+k.dtype(jnp.float64); k.initialize(jax.nn.initializers.constant(2.0)); k.optimizer(optax.adam(5e-2))
+fem  = jno.fem([k * (ui.x*vi.x + ui.y*vi.y) - f*vi, u(xb, yb) - 0.0])
+crux = jno.core([(fem.solve() - u_obs).mse], domain=obs_domain)
+```
+
+For a **transient** weak form `fem.solve()` returns the trajectory, so a rate constant is recovered
+from a time series.
+
+**Regularisation.** `.regularize(kind, *vars)` returns an **unreduced pointwise** placeholder —
+apply `.mean` or `.mse` yourself. Kinds: `"smooth"` / `"h1seminorm"` (H1 seminorm, good default),
+`"tv"` (sharp interfaces), `"l2"`, `"nonneg"`, `"bounded"(lo=, hi=)`. For a FEM nodal-parameter
+field the penalty is assembled FE-exact; for a coordinate field it uses autodiff, so pass the
+spatial variables.
+
+> `.regularize` lives on the **network call or the parameter**, not on an arbitrary expression.
+> `jno.fn.exp(k_raw(x)).regularize(...)` raises `AttributeError` — regularise `k_raw(x)` and apply
+> the transform separately (see example 08).
+
+Enforce positivity of the **field** with an output transform (`k = jno.fn.exp(k_raw(x))`), not with
+`constrain()` on the weights.
+
+---
+
+## 10. Models, RCWA, Bayesian, save/load
+
+### Models
+
+Every model comes from **foundax**, wrapped with `jno.nn(...)`. Any Equinox module works.
+
+| Family | foundax constructors |
+|---|---|
+| Linear / MLP | `foundax.linear`, `foundax.mlp` |
+| DeepONet | `foundax.deeponet` |
+| FNO / CNO / U-Net / MgNO | `foundax.fno1d/2d/3d`, `cno2d`, `unet1d/2d/3d`, `mgno1d/2d` |
+| Geometry-aware | `foundax.geofno`, `pcno`, `pit`, `pointnet` |
+| GNOT family | `foundax.cgptno`, `gnot`, `moegptno` |
+| Transformer | `foundax.transformer` |
+| Foundation models | `foundax.poseidon`, `morph`, `mpp`, `walrus`, `dpot`, `prose`, … |
+
+### Bayesian
+
+`model.bayesian(kernel_factory, **kw)` replaces the per-step gradient update with one blackjax MCMC
+transition. It mirrors `.optimizer(...)` — each parameter is independently optimised or sampled,
+mixed freely, and `crux.solve()` dispatches per model.
+
+`Model.bayesian(kernel_factory, *, prior=None, warmup=500, keep=1000, thin=1, **kernel_kwargs)`.
+The factory is duck-typed by its **first parameter name**: `logdensity_fn` → full-data MCMC
+(`blackjax.nuts`, `hmc`, `mala`); `grad_estimator` → stochastic-gradient (`sgld`, `sghmc`).
+`step_size=` is required except for HMC-family kernels with `adapt=True` and `warmup > 0`.
+Afterwards: `p.posterior_samples`, `p.posterior_diagnostics`, `crux.eval([u], samples="chain")`.
+`.vi(blackjax.meanfield_vi, optimizer=…)` is the variational alternative, mutually exclusive.
+
+### RCWA
+
+Optional (`[rcwa]`, built on `fmmax`, imported lazily). Hand it **the same constraint list you
+would give `jno.fem`** — it infers period (from the Floquet ties — **absent ⇒ raise**), ambients,
+permittivity, wavelength, and the incident wave. Only `orders` is genuinely yours.
+
+```python
+sol = jno.rcwa(constraints, orders=300).solve()
+sol.efficiency("T");  sol.order(+1, 0);  sol.power("up");  sol.extraction("up")
+```
+
+A finite aperture with no ties is **rejected** rather than silently periodicised; model an isolated
+scatterer by keeping the ties and adding an in-plane PML frame.
+
+### Save, load, configuration
+
+```python
+jno.save(crux, f"{run}/model.pkl");   crux = jno.load(f"{run}/model.pkl")
+```
+
+cloudpickle serialises weights, optimiser state, logs, the domain and mesh, the expression tree,
+checkpoints and the RNG state. **After loading, Python variable references no longer point at the
+models inside the solver** — reassign in one call: `crux.set_optimizer(optax.adam, scale=lrs(1e-4))`.
+
+`.jno.toml` in the cwd (or `~/.jno/config.toml`) sets `[jno] seed`, `[runs] base_dir`, `[rsa]` keys
+for signed save/load, and the AD defaults `diff_type` / `hessian_type`.
+
+---
+
+## 11. Gotchas — measured traps
+
+These were found by running code, not by reading. (Earlier revisions of this file listed docs
+pages that contradicted the measurements; those pages have since been fixed — the API facts below
+remain the part worth keeping loaded.)
+
+**Removed API — these raise `AttributeError` and appear all over older examples:**
+
+| Stale | Current |
+|---|---|
+| `jno.domain.rect(mesh_size=…, time=…)` | `jno.Shape.rect(…, size=…).domain(time=…)` |
+| `jno.domain.cube(...)` | `jno.Shape.box(...).domain()` |
+| `jno.domain.l_shape(...)` | build it from `Shape` booleans |
+| `jno.AdaptSpec` | gone |
+
+(`jno.domain.line(mesh_size=…)` still exists as a 1-D shorthand, but the house form — and what the
+docs use everywhere — is `jno.Path(0,0).line_to(1,0).curve(size=…).domain()`.)
+
+**API facts that trip people up:**
+
+- `crux.eval` on a `jno.np.parameter` of shape `(1,)` returns the **array**. `float(_a)` raises
+  `TypeError: Only scalar arrays can be converted to Python scalars`. Use `_a[0]`.
+- `.regularize(...)` is **not** available on the result of `jno.fn.exp(...)` —
+  `AttributeError: 'FunctionCall' object has no attribute 'regularize'`. Regularise the network
+  call and apply the transform separately.
+- `solve()` returns a `statistics` whose `total_loss` is the **final scalar**, not a history array;
+  the array is `total_loss_history`. There is no `stats.epoch`, `stats.losses`, `stats.weights`,
+  `stats.training_time`, `stats.trainable_params` or `stats.total_params` — that data lives in the
+  `stats.training_logs` dicts.
+- `jno.solve.newton` takes `rtol=` / `atol=`, **not** `tol=`. Its default `1e-8` is tighter than
+  some well-posed problems reach — a stationary Allen–Cahn floors at ~3.5e-8 and raises
+  `RuntimeError: newton_direct did not converge`. Relax to `atol=1e-7, rtol=1e-7`.
+
+**Ordinary traps:**
+
+- **`variable` returns a trailing time coordinate** — 1-D unpacks as `x, t`, 2-D as `x, y, t`.
+  Use `split=True` for FEM/FDM quadrature coordinates.
+- **Every non-frozen model needs an optimiser** before `solve()`.
+- **`.integrate()` and finite-difference schemes need `compute_mesh_connectivity=True`.**
+- **`fem.points`, not mesh vertices**, for P2 and above.
+- **Hard BC enforcement beats a soft BC loss** whenever the geometry admits a vanishing factor.
+- **A temporal `.integrate(t)` needs `min_consecutive=None` or `>= 2`** in `solve()`.
+- **`jno.solve.lu` has no vmap rule** — use a Krylov solver inside batched/parametric solves.
+- **A trainable `jno.np.parameter` makes the FEM system runtime-parametric**, so `fem.A`/`fem.b`
+  are unavailable until you `.freeze()` it.
+- **`jax.config.update("jax_enable_x64", True)` must precede the first JAX array**, and `jno.fdm`
+  wants it.
+- Optional backends fail at import, not at call: `mmgpy` (adaptive remeshing), `diffrax`,
+  `fmmax` (RCWA), `pyamg` (AMG). Check before recommending them.
+
+---
+
+## 12. Verified examples
+
+Every script below ran to completion, exit code 0, against jNO 0.3.0 with a CUDA JAX build. Each
+is standalone and self-checking: run it and the final `assert` tells you whether it still works.
+
+### 12.1 PINN — 1-D Poisson, hard BC
+
+```python
+"""1-D Poisson  -u'' = sin(pi x),  u(0) = u(1) = 0,  hard BC ansatz."""
+import foundax, jax, optax, jno
+
+run = jno.setup(__file__)
+pi = jno.np.pi
+
+d = jno.Path(0, 0).line_to(1, 0).curve(size=0.02).domain()
+x, _ = d.variable("interior")
+
+net = jno.nn(foundax.mlp(in_features=1, hidden_dims=32, num_layers=3, key=jax.random.PRNGKey(0)))
+net.optimizer(optax.adam(optax.exponential_decay(1e-3, 1000, 0.5, end_value=1e-5)))
+
+u = (x * (1 - x) * net(x)).scalar.bind(x=x)          # hard u(0)=u(1)=0
+pde = u.xx + jno.np.sin(pi * x)                       # -u'' = sin(pi x)
+
+crux = jno.core([pde.mse])
+crux.solve(5000).plot(f"{run}/training.png")
+
+_u, _exact = crux.eval([u, jno.np.sin(pi * x) / pi**2])
+rel = float(jax.numpy.linalg.norm(_u - _exact) / jax.numpy.linalg.norm(_exact))
+print(f"rel_L2 = {rel:.3e}")
+assert rel < 1e-1
+```
+
+### 12.2 PINN — 2-D Poisson
+
+```python
+"""2-D Poisson  -Delta u = 2 pi^2 sin(pi x) sin(pi y)  on the unit square, u = 0 on the boundary."""
+import foundax, jax, optax, jno
+
+run = jno.setup(__file__)
+pi, sin = jno.np.pi, jno.np.sin
+
+d = jno.Shape.rect(0, 0, 1, 1, size=0.05).domain()
+x, y, _ = d.variable("interior")
+
+net = jno.nn(foundax.mlp(in_features=2, hidden_dims=64, num_layers=4, key=jax.random.PRNGKey(0)))
+net.optimizer(optax.adam(optax.exponential_decay(1e-3, 1000, 0.5, end_value=1e-5)))
+
+u = (net(x, y) * x * (1 - x) * y * (1 - y)).scalar.bind(x=x, y=y)   # hard u = 0 on the boundary
+pde = u.xx + u.yy + 2 * pi**2 * sin(pi * x) * sin(pi * y)
+
+crux = jno.core([pde.mse])
+crux.solve(5000).plot(f"{run}/training.png")
+
+_u, _exact = crux.eval([u, sin(pi * x) * sin(pi * y)])
+rel = float(jax.numpy.linalg.norm(_u - _exact) / jax.numpy.linalg.norm(_exact))
+print(f"rel_L2 = {rel:.3e}")
+assert rel < 1e-1
+```
+
+### 12.3 PINN — transient heat (`u.t`, IC + BC)
+
+```python
+"""1-D heat  u_t = alpha u_xx  on a time-dependent 1-D domain (soft IC + BC)."""
+import foundax, jax, optax, jno
+
+run = jno.setup(__file__)
+pi, alpha, T = jno.np.pi, 0.1, 0.5
+
+d = jno.Path(0, 0).line_to(1, 0).curve(size=0.05).domain(time=(0, T, 4))
+x, t = d.variable("interior")
+x0, t0 = d.variable("initial")          # the t = t0 slice
+xb, tb = d.variable("boundary")
+
+net = jno.nn(foundax.deeponet(n_sensors=1, coord_dim=1, n_outputs=1, n_layers=3,
+                              basis_functions=48, hidden_dim=32, key=jax.random.PRNGKey(0)))
+net.optimizer(optax.adam(optax.exponential_decay(1e-3, 2000, 0.5, end_value=1e-5)))
+
+u = net(t, x).scalar.bind(x=x, t=t)
+crux = jno.core([(u.t - alpha * u.xx).mse,                     # PDE
+                 (net(t0, x0) - jno.np.sin(pi * x0)).mse,      # initial condition
+                 net(tb, xb).mse])                             # u = 0 on the spatial boundary
+crux.solve(5000).plot(f"{run}/training.png")
+
+_u, _exact = crux.eval([u, jno.np.exp(-alpha * pi**2 * t) * jno.np.sin(pi * x)])
+rel = float(jax.numpy.linalg.norm(_u - _exact) / jax.numpy.linalg.norm(_exact))
+print(f"rel_L2 = {rel:.3e}")
+assert rel < 2e-1
+```
+
+### 12.4 PINN — wave equation (`u.tt`, two initial conditions)
+
+```python
+"""1-D wave  u_tt = c^2 u_xx  — second order in time needs TWO initial conditions."""
+import foundax, jax, optax, jno
+
+run = jno.setup(__file__)
+pi, c, T = jno.np.pi, 1.0, 1.0
+
+d = jno.Path(0, 0).line_to(1, 0).curve(size=0.05).domain(time=(0, T, 8))
+x, t = d.variable("interior")
+x0, t0 = d.variable("initial")
+xb, tb = d.variable("boundary")
+
+net = jno.nn(foundax.deeponet(n_sensors=1, coord_dim=1, n_outputs=1, n_layers=4, basis_functions=64,
+                              hidden_dim=48, activation=jax.nn.tanh, key=jax.random.PRNGKey(7)))
+net.optimizer(optax.adam(optax.warmup_cosine_decay_schedule(1e-6, 1e-3, 100, 10_000, 1e-6)))
+
+u = net(t, x).scalar.bind(x=x, t=t)
+u0 = net(t0, x0).scalar.bind(x=x0, t=t0)
+
+crux = jno.core([(u.tt - c**2 * u.xx).mse,                 # PDE
+                 (u0 - jno.np.sin(pi * x0)).mse,           # displacement IC
+                 u0.t.mse,                                  # velocity IC (at rest)
+                 net(tb, xb).mse])                          # u = 0 on the spatial boundary
+crux.solve(10_000).plot(f"{run}/training.png")
+
+_u, _exact = crux.eval([u, jno.np.cos(c * pi * t) * jno.np.sin(pi * x)])
+rel = float(jax.numpy.linalg.norm(_u - _exact) / jax.numpy.linalg.norm(_exact))
+print(f"rel_L2 = {rel:.3e}")
+assert rel < 3e-1
+```
+
+### 12.5 PINN — coupled system (two networks, one core)
+
+```python
+"""Coupled elliptic system: two networks, two residuals, one core."""
+import foundax, jax, optax, jno
+
+run = jno.setup(__file__)
+pi, sin = jno.np.pi, jno.np.sin
+
+d = jno.Shape.rect(0, 0, 1, 1, size=0.1).domain()
+x, y, _ = d.variable("interior")
+
+f = 2 * pi**2 * sin(pi * x) * sin(pi * y) + sin(2 * pi * x) * sin(pi * y)
+g = 5 * pi**2 * sin(2 * pi * x) * sin(pi * y) + sin(pi * x) * sin(pi * y)
+
+k1, k2 = jax.random.split(jax.random.PRNGKey(0))
+u_net = jno.nn(foundax.mlp(in_features=2, hidden_dims=48, num_layers=4, key=k1))
+v_net = jno.nn(foundax.mlp(in_features=2, hidden_dims=48, num_layers=4, key=k2))
+for net in (u_net, v_net):
+    net.optimizer(optax.adam(optax.warmup_cosine_decay_schedule(0.0, 1e-3, 50, 5000, 1e-5)))
+
+ansatz = 16.0 * x * (1 - x) * y * (1 - y)          # peaks at 1 — keeps the field O(1)
+u = (u_net(x, y) * ansatz).scalar.bind(x=x, y=y)
+v = (v_net(x, y) * ansatz).scalar.bind(x=x, y=y)
+
+crux = jno.core([(-(u.xx + u.yy) + v - f).mse,
+                 (-(v.xx + v.yy) + u - g).mse])
+crux.solve(5000).plot(f"{run}/training.png")
+
+_u, _ue, _v, _ve = crux.eval([u, sin(pi * x) * sin(pi * y), v, sin(2 * pi * x) * sin(pi * y)])
+nrm = jax.numpy.linalg.norm
+print(f"u rel_L2 = {float(nrm(_u - _ue) / nrm(_ue)):.3e}   v rel_L2 = {float(nrm(_v - _ve) / nrm(_ve)):.3e}")
+assert float(nrm(_u - _ue) / nrm(_ue)) < 1.5e-1 and float(nrm(_v - _ve) / nrm(_ve)) < 1.5e-1
+```
+
+### 12.6 PINN — Fokker–Planck (Path geometry, `.div`, an integral constraint, a noise node)
+
+```python
+"""2-D Fokker-Planck on a disc: a VectorView divergence, a normalisation INTEGRAL, and a noise node."""
+import foundax, jax, optax, jno
+
+run = jno.setup(__file__)
+pi = jno.np.pi
+
+d = (jno.Path(3, 0).arc_to(-3, 0, through=(0, 3)).arc_to(3, 0, through=(0, -3))
+     .face().sized(0.25).domain())                       # a disc of radius 3, Shape/Path only
+x, y, _ = d.variable("interior")
+xb, yb, _ = d.variable("boundary")
+
+net = jno.nn(foundax.mlp(in_features=2, hidden_dims=64, num_layers=5, key=jax.random.PRNGKey(0)))
+net.optimizer(optax.adam(optax.exponential_decay(1e-3, 2000, 0.5, end_value=1e-5)))
+
+p = net(x, y).scalar.bind(x=x, y=y)
+drift = jno.np.vector(x * p, y * p).div(x, y)             # the OU probability flux, div of a VectorView
+crux = jno.core([(drift + 0.5 * (p.xx + p.yy)).mse,       # Fokker-Planck residual
+                 (p.integrate() - 1.0).mse,                # normalisation over the disc
+                 (net(xb, yb) - (jno.np.exp(-(xb**2 + yb**2)) / pi
+                                 + jno.noise.gaussian(std=1e-4))).mse])
+crux.solve(15_000).plot(f"{run}/training.png")
+
+_p, _exact = crux.eval([p, jno.np.exp(-(x**2 + y**2)) / pi])
+rel = float(jax.numpy.linalg.norm(_p - _exact) / jax.numpy.linalg.norm(_exact))
+print(f"rel_L2 = {rel:.3e}")
+assert rel < 3e-1
+```
+
+### 12.7 Inverse — scalar parameters
+
+```python
+"""Recover three unknown scalars from data: jno.np.parameter optimises like a network."""
+import jax, optax, jno
+
+run = jno.setup(__file__)
+pi = jno.np.pi
+A, B, C = 3.14, -2.71, 42.0
+
+d = jno.Path(0, 0).line_to(1, 0).curve(size=0.01).domain()
+x, _ = d.variable("interior")
+target = A * jno.np.sin(pi * x) + B * jno.np.cos(pi * x) + C * x * (1 - x)
+
+k1, k2, k3 = jax.random.split(jax.random.PRNGKey(0), 3)
+a = jno.np.parameter((1,), key=k1, name="a").optimizer(optax.adam(1e-2))
+b = jno.np.parameter((1,), key=k2, name="b").optimizer(optax.adam(1e-2))
+c = jno.np.parameter((1,), key=k3, name="c").optimizer(optax.adam(1e-2))
+
+crux = jno.core([((a * jno.np.sin(pi * x) + b * jno.np.cos(pi * x) + c * x * (1 - x)) - target).mse])
+crux.solve(30_000).plot(f"{run}/training.png")
+
+_a, _b, _c = crux.eval([a, b, c])
+# crux.eval returns the parameter ARRAY, shape (1,) — index it, float() on it raises.
+print(f"recovered a={_a[0]:.3f} b={_b[0]:.3f} c={_c[0]:.3f}   truth {A} {B} {C}")
+assert abs(_a[0] - A) / abs(A) < 0.1 and abs(_b[0] - B) / abs(B) < 0.1 and abs(_c[0] - C) / abs(C) < 0.1
+```
+
+### 12.8 Inverse — a coefficient field with a smoothness prior
+
+```python
+"""Recover an unknown coefficient FIELD k(x) with a network + a smoothness prior.
+
+k > 0 is enforced by an output transform (jno.fn.exp), not by constraining weights.
+"""
+import foundax, jax, optax, jno
+
+run = jno.setup(__file__)
+pi = jno.np.pi
+
+d = jno.Path(0, 0).line_to(1, 0).curve(size=0.01).domain()
+x, _ = d.variable("interior")
+
+f_pde = -(pi**2) * jno.np.sin(pi * x)      # k_true = 1, u_true = sin(pi x)  =>  k u'' = f
+u_obs = jno.np.sin(pi * x)
+
+k1, k2 = jax.random.split(jax.random.PRNGKey(0))
+k_raw = jno.nn(foundax.mlp(in_features=1, output_dim=1, hidden_dims=16, num_layers=2, key=k1))
+u_net = jno.nn(foundax.mlp(in_features=1, output_dim=1, hidden_dims=32, num_layers=3, key=k2))
+k_raw.optimizer(optax.adam(1e-3))
+u_net.optimizer(optax.adam(1e-3))
+
+k_field = k_raw(x)                                          # regularize lives on the network CALL
+k = jno.fn.exp(k_field)                                     # > 0 by construction
+u = (u_net(x) * x * (1 - x)).scalar.bind(x=x)               # hard zero Dirichlet
+
+crux = jno.core([(k * u.xx - f_pde).mse, (u - u_obs).mse, k_field.regularize("smooth", x).mean])
+crux.solve(5_000).plot(f"{run}/training.png")
+
+_u, _k, _obs = crux.eval([u, k, u_obs])
+rel = float(jax.numpy.linalg.norm(_u - _obs) / jax.numpy.linalg.norm(_obs))
+print(f"u rel_L2 = {rel:.3e}   k min/mean = {_k.min():.3f}/{_k.mean():.3f}")
+assert rel < 1e-1 and _k.min() > 0
+```
+
+### 12.9 FEM — Poisson
+
+```python
+"""FEM Poisson: the weak form IS the term list.  -Delta u = f,  u = 0 on the boundary."""
+import jax.numpy as jnp, numpy as np, jno
+
+run = jno.setup(__file__)
+
+d = jno.Shape.rect(0, 0, 1, 1, size=0.18).domain()
+u, phi = d.fem_symbols()                                  # trial / test
+xi, yi, _ = d.variable("interior", split=True)
+xb, yb, _ = d.variable("boundary", split=True)
+ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+
+f = 2.0 * (xi * (1 - xi) + yi * (1 - yi))                 # -Delta[x(1-x)y(1-y)]
+fem = jno.fem([ui.x * vi.x + ui.y * vi.y - f * vi,        # volume: grad u . grad v - f v
+               u(xb, yb) - 0.0],                          # essential BC is just another term
+              quad_degree=3)
+u_h = jnp.asarray(fem.solve(linear=jno.solve.cg(), precond=jno.precond.jacobi()))   # SPD -> CG
+
+pts = np.asarray(fem.points)                              # the coords the DOFs live on (NOT mesh vertices)
+exact = pts[:, 0] * (1 - pts[:, 0]) * pts[:, 1] * (1 - pts[:, 1])
+rel = float(jnp.linalg.norm(exact - u_h) / jnp.linalg.norm(exact))
+print(f"dofs={fem.dofs} linear={fem.is_linear} rel_L2={rel:.3e}")
+assert fem.is_linear and rel < 5e-2
+```
+
+### 12.10 FEM — mixed Dirichlet + Robin
+
+```python
+"""Mixed Dirichlet + Robin.  -Delta u + sigma u = f,  exact u = x sin(pi y) + y.
+
+A Robin condition du/dn + a u = g enters the weak form as the natural surface term
+(a u - g) * phi bound to THAT edge — no BC objects, the binding carries the region.
+"""
+import jax.numpy as jnp, numpy as np, jno
+
+run = jno.setup(__file__)
+pi, sigma, a_r, a_t = np.pi, 4.0, 2.0, 3.0
+sin = jno.np.sin
+
+d = jno.Shape.rect(0, 0, 1, 1, size=0.22).domain()
+u, phi = d.fem_symbols()
+xi, yi, _ = d.variable("interior", split=True)
+xl, yl, _ = d.variable("left", split=True)
+xbo, ybo, _ = d.variable("bottom", split=True)
+xr, yr, _ = d.variable("right", split=True)
+xt, yt, _ = d.variable("top", split=True)
+ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+
+f = xi * pi**2 * sin(pi * yi) + sigma * (xi * sin(pi * yi) + yi)
+fem = jno.fem([
+    ui.x * vi.x + ui.y * vi.y + sigma * u * vi - f * vi,                                   # volume
+    (a_r * u.bind(x=xr, y=yr) - (sin(pi * yr) + a_r * (sin(pi * yr) + yr))) * phi.bind(x=xr, y=yr),
+    (a_t * u.bind(x=xt, y=yt) - (1.0 - pi * xt + a_t)) * phi.bind(x=xt, y=yt),              # Robin
+    u(xl, yl) - yl,                                                                         # Dirichlet
+    u(xbo, ybo) - 0.0,
+], quad_degree=3)
+u_h = jnp.asarray(fem.solve())                                # default: Jacobi-BiCGStab, matrix-free
+
+pts = np.asarray(fem.points)
+exact = pts[:, 0] * np.sin(np.pi * pts[:, 1]) + pts[:, 1]
+rel = float(jnp.linalg.norm(exact - u_h) / jnp.linalg.norm(exact))
+print(f"dofs={fem.dofs} rel_L2={rel:.3e}")
+assert rel < 5e-2
+```
+
+### 12.11 FEM — vector P2 elasticity
+
+```python
+"""Vector P2 elasticity: a cantilever under an end shear, checked against Euler-Bernoulli."""
+import jax.numpy as jnp, numpy as np, jno
+
+run = jno.setup(__file__)
+E, nu, L, H, q = 1000.0, 0.3, 10.0, 1.0, 0.1
+lam, mu = E * nu / (1.0 - nu**2), E / (2.0 * (1.0 + nu))       # plane stress
+inner, symgrad, trace = jno.np.inner, jno.np.symgrad, jno.np.trace
+
+d = jno.Shape.rect(0, 0, L, H, size=0.5).domain()
+u, phi = d.fem_symbols(value_shape=(2,), order=2)              # P2 vector displacement
+xi, yi, _ = d.variable("interior", split=True)
+xl, yl, _ = d.variable("left", split=True)                     # clamped root
+xr, yr, _ = d.variable("right", split=True)                    # loaded tip
+eu, ep = symgrad(u, [xi, yi]), symgrad(phi, [xi, yi])
+
+fem = jno.fem([lam * trace(eu) * trace(ep) + 2.0 * mu * inner(eu, ep, n_contract=2),
+               u(xl, yl) - (0.0, 0.0),
+               -1.0 * inner(jnp.array([0.0, -q]), phi.bind(x=xr, y=yr), n_contract=1)])
+# A slender P2 stiffness is too ill-conditioned for Jacobi-CG in float32 -> sparse direct.
+sol = jnp.asarray(fem.solve(linear=jno.solve.lu())).reshape(-1, 2)
+
+tip = np.asarray(fem.points)[:, 0] > L - 1e-6
+delta, eb = float(-jnp.mean(sol[tip, 1])), (q * H) * L**3 / (3.0 * E * (H**3 / 12.0))
+print(f"dofs={fem.dofs}  FEM tip={delta:.4f}  Euler-Bernoulli={eb:.4f}  ratio={delta / eb:.3f}")
+assert fem.is_linear and abs(delta - eb) / eb < 0.05
+```
+
+### 12.12 FEM — transient (`M`, `A`, `state0`)
+
+```python
+"""Transient FEM: time=(t0,t1,n) on the domain + a ui.t term gives the semidiscrete M u' + A u = 0."""
+import jax.numpy as jnp, numpy as np, jno
+
+run = jno.setup(__file__)
+nu = 1.0
+dense = lambda A: jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)  # noqa: E731
+
+d = jno.Shape.rect(0, 0, 1, 1, size=0.08).domain(time=(0.0, 0.05, 26))
+u, phi = d.fem_symbols()
+xi, yi, ti = d.variable("interior", split=True)
+xb, yb, _ = d.variable("boundary", split=True)
+xi0, yi0, _ = d.variable("initial", split=True)             # the t = t0 slice
+ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+
+fem = jno.fem([ui.t * vi + nu * (ui.x * vi.x + ui.y * vi.y),
+               u(xb, yb) - 0.0,
+               u(xi0, yi0) - jno.fn(lambda x, y: jnp.sin(jnp.pi * x) * jnp.sin(jnp.pi * y), [xi0, yi0])])
+assert fem.is_transient
+
+M, A, dt = dense(fem.M), dense(fem.operator.A), float(fem.dt)
+w = jnp.asarray(fem.state0)
+for _ in range(round((fem.t1 - fem.t0) / dt)):              # backward Euler: (M + dt A) w' = M w
+    w = jnp.linalg.solve(M + dt * A, M @ w)
+
+pts = np.asarray(fem.points)
+exact = np.exp(-2.0 * nu * np.pi**2 * fem.t1) * np.sin(np.pi * pts[:, 0]) * np.sin(np.pi * pts[:, 1])
+rel = float(jnp.linalg.norm(exact - w) / jnp.linalg.norm(exact))
+print(f"dofs={fem.dofs} rel_L2 at t={fem.t1}: {rel:.3e}")
+assert rel < 5e-2
+```
+
+### 12.13 FEM — nonlinear (Newton)
+
+```python
+"""Nonlinear FEM: a cubic reaction makes the form nonlinear, so jno.fem returns a RESIDUAL operator.
+
+Newton is driven through fem.solve() so the implicit-function gradient survives.
+direct=True is required here: the matrix-free Newton-Krylov diverges to NaN from this
+deliberately over-wide interface, because the cubic makes the tangent stiff.
+"""
+import jax.numpy as jnp, numpy as np, jno
+
+run = jno.setup(__file__)
+eps = 0.15
+exact = lambda x: np.tanh((x - 0.5) / (np.sqrt(2.0) * eps))  # noqa: E731
+
+d = jno.Shape.rect(0, 0, 1, 1, size=0.06).domain()
+u, phi = d.fem_symbols()
+xi, yi, _ = d.variable("interior", split=True)
+xl, yl, _ = d.variable("left", split=True)
+xr, yr, _ = d.variable("right", split=True)
+ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+
+fem = jno.fem([eps**2 * (ui.x * vi.x + ui.y * vi.y) + (u**3 - u) * vi,
+               u(xl, yl) - exact(0.0), u(xr, yr) - exact(1.0)], quad_degree=3)
+assert not fem.is_linear
+
+pts = np.asarray(fem.points)
+u0 = np.tanh((pts[:, 0] - 0.5) / (np.sqrt(2.0) * 0.30))     # over-wide interface = the Newton start
+uh = np.asarray(fem.solve(nonlinear=jno.solve.newton(direct=True, atol=1e-7, rtol=1e-7),
+                          x0=jnp.asarray(u0))).reshape(-1)
+
+rel = float(jnp.linalg.norm(exact(pts[:, 0]) - uh) / jnp.linalg.norm(exact(pts[:, 0])))
+res = float(jnp.linalg.norm(jnp.asarray(fem.residual(jnp.asarray(uh)))))
+print(f"dofs={fem.dofs} |residual|={res:.2e} rel_L2={rel:.3e}")
+assert res < 1e-6 and rel < 1e-2
+```
+
+### 12.14 FEM — generalized eigenproblem
+
+```python
+"""Generalized eigenproblem K x = lambda M x through fem.eigs — the Dirichlet-Laplacian spectrum."""
+import numpy as np, jno
+
+run = jno.setup(__file__)
+
+d = jno.Shape.rect(0, 0, 1, 1, size=0.06).domain()
+u, phi = d.fem_symbols()
+xi, yi, _ = d.variable("interior", split=True)
+xb, yb, _ = d.variable("boundary", split=True)
+ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+
+K = jno.fem([ui.x * vi.x + ui.y * vi.y, u(xb, yb) - 0.0])    # stiffness, no source term
+lam, X = K.eigs(mass=[ui * vi], k=5)                          # dense reduction: exact, O(N^2) memory
+
+got = np.asarray(lam)[:5] / np.pi**2
+exact = np.array([2, 5, 5, 8, 10])                            # pi^2 (m^2 + n^2)
+print(f"lambda/pi^2 computed = {np.round(got, 3)}")
+print(f"lambda/pi^2 analytic = {exact}")
+assert np.max(np.abs(got - exact) / exact) < 5e-2
+```
+
+### 12.15 FEM — inverse through a differentiable solve
+
+```python
+"""Inverse problem THROUGH a differentiable FEM solve: recover a whole nodal field k(x).
+
+fem.solve() is a trace node, so the gradient of the data misfit flows back through the
+assembled solve to the parameter. Field inversion is ill-posed, hence the H1 prior.
+"""
+import jax, jax.numpy as jnp, numpy as np, optax, jno
+
+run = jno.setup(__file__)
+
+d = jno.Shape.rect(0, 0, 1, 1, size=0.1).domain()
+u, phi = d.fem_symbols()
+xi, yi, _ = d.variable("interior", split=True)
+xb, yb, _ = d.variable("boundary", split=True)
+ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+f = 30.0 * (xi * (1 - xi) + yi * (1 - yi))                    # strong source: u is sensitive to k
+
+nodes = np.asarray(d.built_mesh.points)[:, :2]
+k_true = 1.0 + 0.8 * np.exp(-((nodes[:, 0] - 0.5) ** 2 + (nodes[:, 1] - 0.5) ** 2) / (2 * 0.12**2))
+
+k = jno.np.parameter(phi, name="k")                           # trainable P1 field on the trial space
+fem = jno.fem([k * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+
+A, b = fem.operator.evaluate({"k": jnp.asarray(k_true)})       # synthesise data at the true k
+A = A.todense() if hasattr(A, "todense") else jnp.asarray(A)
+u_obs = jnp.linalg.solve(A, jnp.asarray(b).reshape(-1))
+
+k.dtype(jnp.float64)
+k.initialize(jax.nn.initializers.constant(1.0))                # start from a uniform field
+k.optimizer(optax.adam(2e-2))
+crux = jno.core([(fem.solve() - u_obs).mse, 1e-3 * k.regularize("h1seminorm").mean],
+                domain=jno.domain.from_array({"_": np.zeros((1, 1))}))   # no spatial domain needed
+crux.solve(500).plot(f"{run}/training.png")
+
+rec = np.asarray(crux.eval([k])).reshape(-1)                   # the recovered field (do NOT index [0])
+rel = float(np.linalg.norm(rec - k_true) / np.linalg.norm(k_true))
+print(f"nodes={k_true.shape[0]}  k(x) rel_L2={rel:.3e}  peak rec/true={rec.max():.3f}/{k_true.max():.3f}")
+assert rel < 0.1
+```
+
+### 12.16 FDM — Poisson
+
+```python
+"""FDM Poisson: the strong form, collocated at the mesh nodes.
+
+domain.unknown() is the strong-form counterpart of fem_symbols(). Autodiff is meaningless on
+a discrete nodal field, so the bound view's derivatives are finite differences by default —
+no scheme= needed. The Dirichlet condition is the same u(region) - g term jno.fem uses.
+"""
+import jax
+jax.config.update("jax_enable_x64", True)      # the strong-form solve accumulates in float64
+
+import numpy as np  # noqa: E402
+import jno  # noqa: E402
+
+run = jno.setup(__file__)
+
+d = jno.Shape.rect(0, 0, 1, 1, size=0.06).domain()
+x, y, _ = d.variable("interior", split=True)
+xb, yb, _ = d.variable("boundary", split=True)
+u = d.unknown()                                 # valued P1 nodal field
+ui = u.bind(x=x, y=y)                           # bound view: .x/.xx are FD stencils
+
+f = 2.0 * np.pi**2 * jno.np.sin(np.pi * x) * jno.np.sin(np.pi * y)
+sol = jno.fdm([-ui.xx - ui.yy - f,              # -Delta u = f
+               u(xb, yb) - 0.0]).solve()
+
+p = np.asarray(d.mesh_connectivity["points"])[:, :2]
+exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+rel = float(np.linalg.norm(np.asarray(sol).reshape(-1) - exact) / np.linalg.norm(exact))
+print(f"nodes={p.shape[0]} rel_L2={rel:.3e}")
+assert rel < 3e-2
+```
+
+### 12.17 FDM — Dirichlet + Neumann + Robin at once
+
+```python
+"""FDM with Dirichlet + Neumann + Robin at once. Exact u = y^2.
+
+A flux BC is written with THAT edge's own tags: bind the field to the edge and take its
+normal derivative against the edge's outward normal. Any condition affine in du/dn works.
+"""
+import jax
+jax.config.update("jax_enable_x64", True)
+
+import numpy as np  # noqa: E402
+import jno  # noqa: E402
+
+run = jno.setup(__file__)
+
+d = jno.Shape.rect(0, 0, 1, 1, size=0.05).domain()
+x, y, _ = d.variable("interior", split=True)
+xbo, ybo, _ = d.variable("bottom", split=True)
+xl, yl, _ = d.variable("left", split=True)
+xr, yr, _ = d.variable("right", split=True)
+xt, yt, _ = d.variable("top", split=True)
+nl, nr, nt = (d.variable(t, normals=True) for t in ("left", "right", "top"))
+
+u = d.unknown()
+ui = u.bind(x=x, y=y)                                    # interior view for the PDE
+ul, ur, ut = u.bind(x=xl, y=yl), u.bind(x=xr, y=yr), u.bind(x=xt, y=yt)
+
+sol = jno.fdm([-ui.xx - ui.yy + 2.0,                     # -Delta u = -2
+               u(xbo, ybo) - 0.0,                        # Dirichlet: bottom held at 0
+               ul.d(nl) - 0.0,                           # Neumann: left insulated
+               ur.d(nr) - 0.0,                           # Neumann: right insulated
+               ut.d(nt) + 1.0 * (ut - 3.0)]).solve()     # Robin: top convects to u_inf = 3
+
+p = np.asarray(d.mesh_connectivity["points"])[:, :2]
+rel = float(np.linalg.norm(np.asarray(sol).reshape(-1) - p[:, 1] ** 2) / np.linalg.norm(p[:, 1] ** 2))
+print(f"nodes={p.shape[0]} rel_L2={rel:.3e}")
+assert rel < 5e-2
+```
+
+### 12.18 Operator learning — DeepONet on a PDE residual
+
+```python
+"""Operator learning: one DeepONet over 50 random coefficients, trained on the PDE residual.
+
+N * domain replicates one mesh across N operator-learning samples; domain.variable(name, array)
+attaches the per-sample coefficient as a tensor tag.
+"""
+import foundax, jax, optax, jno
+
+run = jno.setup(__file__)
+KEY, N, EPOCHS = jax.random.PRNGKey(0), 50, 2_000
+
+d = N * jno.Shape.rect(0, 0, 2, 1, size=0.05).domain()
+x, y, _ = d.variable("interior")
+k = d.variable("k", jax.random.uniform(KEY, shape=(N, 1, 1), minval=0.5, maxval=1.5))
+
+net = jno.nn(foundax.deeponet(n_sensors=1, coord_dim=2, basis_functions=32, hidden_dim=128,
+                              activation=jax.numpy.tanh, key=KEY))
+net.optimizer(optax.adam(optax.cosine_decay_schedule(1e-3, EPOCHS, alpha=1e-2)))
+
+u = (net(k, jno.np.concat([x, y], axis=-1)) * x * (2 - x) * y * (1 - y)).scalar.bind(x=x, y=y)
+crux = jno.core(constraints=[(k * (u.xx + u.yy) + 1.0).mse])
+stats = crux.solve(epochs=EPOCHS, batchsize=32)
+stats.plot(f"{run}/training.png")
+
+# stats.total_loss is the FINAL SCALAR; the array is stats.total_loss_history.
+hist = stats.total_loss_history
+print(f"loss {hist[0]:.3e} -> {stats.total_loss:.3e} over {hist.size} logged epochs")
+assert stats.total_loss < hist[0]
+```
+
+### 12.19 Bayesian — NUTS posterior over unknown coefficients
+
+```python
+"""Bayesian inverse problem: .bayesian replaces the gradient update with a blackjax NUTS transition.
+
+Each parameter is independently optimised (optax) or sampled (blackjax) — mix freely.
+"""
+import blackjax, jax, jax.numpy as jnp, jno
+
+run = jno.setup(__file__)
+pi = jno.np.pi
+A, B = 3.14, -2.71
+
+d = jno.Path(0, 0).line_to(1, 0).curve(size=0.02).domain()
+x, _ = d.variable("interior")
+target = A * jno.np.sin(pi * x) + B * jno.np.cos(pi * x)
+
+k1, k2 = jax.random.split(jax.random.PRNGKey(0), 2)
+a = jno.np.parameter((1,), key=k1, name="a")
+b = jno.np.parameter((1,), key=k2, name="b")
+for p in (a, b):
+    # adapt=True (default) runs window adaptation for `warmup` steps and tunes step_size
+    # + inverse_mass_matrix; the step_size given here is only the adapter's initial guess.
+    p.bayesian(blackjax.nuts, step_size=1e-2, warmup=300, keep=500)
+
+crux = jno.core([(a * jno.np.sin(pi * x) + b * jno.np.cos(pi * x) - target).mse])
+crux.solve(800)
+
+for name, chain, truth in (("A", a.posterior_samples, A), ("B", b.posterior_samples, B)):
+    mean = float(jnp.mean(chain))
+    lo, hi = (float(v) for v in jnp.quantile(chain, jnp.array([0.05, 0.95])))
+    print(f"{name} = {mean:.3f}  90% CI [{lo:.3f}, {hi:.3f}]   truth {truth}")
+    assert abs(mean - truth) / abs(truth) < 0.3
+```

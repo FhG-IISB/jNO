@@ -442,7 +442,7 @@ class SemidiscreteTimeBlock:
         def _solve(*values):
             ys = solve_fn(self, dict(zip(names, values)), save_ts)
             if self.prolongation is not None:
-                # Periodic tie: the block integrates in the reduced master-DOF space. Prolong each saved
+                # Periodic tie: the block integrates in the reduced main-DOF space. Prolong each saved
                 # step ``u = P·u_red`` back to the full nodal layout, so the returned trajectory lives on the
                 # mesh nodes (matching ``fem.points`` / ``fem.offsets``) -- exactly as the steady operators
                 # (``FemLinearSystem.solve``) and the complex-transient path already do. Without this a

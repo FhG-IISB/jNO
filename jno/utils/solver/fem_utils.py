@@ -11,6 +11,7 @@ Responsibilities:
 - evaluate symbolic expressions at quadrature points inside volume/surface kernels,
 - normalize Dirichlet data and prepare residual/Jacobian runtime objects.
 """
+import hashlib as _hashlib
 from collections import OrderedDict
 from functools import partial
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -41,6 +42,7 @@ from ...trace import (
     TrialFunction,
     Variable,
 )
+from ...utils.logger import get_logger
 from .solver_helper import contains_node_type, iter_children
 
 
@@ -1066,6 +1068,15 @@ def _eval_integrand(domain, node, local):
 
     if isinstance(node, TestFunction):
         shape_vals, _, _ = _field_data(local, node)
+        # Contact reaction: the main body's share of an interface traction is the SAME integrand
+        # tested against the main's projected trace. Test and trial otherwise read one table, so the
+        # substitution has to happen here -- the trial values must keep the secondary face's own basis.
+        _ov = local.get("test_shape_vals")
+        if _ov:
+            _key = getattr(node, "field_key", getattr(node, "op_id", None))
+            _fi = (local.get("field_index") or {}).get(_key)
+            if _fi in _ov:
+                shape_vals = _ov[_fi]
         if _field_space(local, node) != "Lagrange":
             # non-nodal: shape_vals is already the per-DOF *physical* basis (n_quad, n_dof, *value)
             return shape_vals
@@ -2044,33 +2055,614 @@ def _make_internal_vars(
     return fe_module.InternalVars(volume_vars=tuple(vol))
 
 
+def _interface_frame(m_pts: np.ndarray, s_pts: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Orthonormal tangential frame ``(dim-1, dim)`` and origin for a tied/periodic interface pair.
+
+    Matching a secondary node against the main face means comparing the two **in the interface**, with
+    the across-interface coordinate removed. This used to be done by dropping the single global axis
+    whose tag means differed most, which silently assumes the faces are planar, axis-aligned, and
+    separated by a pure translation along that axis. A **tied** interface breaks that outright — both
+    faces are coincident, so every mean difference is ~0 and the dropped axis is whichever coordinate
+    happened to carry the largest rounding error — and so does any periodic cell whose lattice vector
+    is not a global axis.
+
+    The frame generalises it: its rows are the ``dim-1`` directions of greatest variance of the main
+    face's own point cloud — an orthonormal basis of the face's tangent plane, from an SVD. Projecting
+    onto them removes exactly the across-interface coordinate and nothing else.
+
+    For the planar axis-aligned case the rows span the same plane the transverse axes did, and
+    nearest-neighbour distances, edge parameters and barycentric weights are all invariant under a
+    rotation *within* that plane — so the existing conforming and non-matching periodic paths return
+    bit-comparable results.
+
+    **Limitation:** one frame per tie, so main and secondary must be (near-)parallel. A wedge-shaped or
+    closed (cylindrical) interface has no single tangent plane; the degeneracy guard below catches the
+    fully-collapsed cases, but a strongly curved face is merely projected, not refused.
+    """
+    dim = int(m_pts.shape[1])
+    ref = m_pts if m_pts.shape[0] >= dim else np.concatenate([m_pts, s_pts], axis=0)
+    origin = ref.mean(axis=0)
+    if dim == 1:
+        # A 1-D "interface" is a single point: there is no in-interface coordinate at all. The empty
+        # (0, 1) frame projects every node to a zero-length vector, so every secondary sits at distance 0
+        # from the main and ties exactly -- which is what dropping the only axis did before.
+        return np.zeros((0, 1)), origin
+    _u, sv, vt = np.linalg.svd(ref - origin, full_matrices=True)
+    if sv.size < dim - 1 or float(sv[0]) <= 0.0:
+        raise ValueError(
+            "Periodic/tied interface: the main face collapses to a single point, so no tangent "
+            "plane can be fitted. Check that the tagged region actually selects a boundary face."
+        )
+    if dim > 2 and float(sv[dim - 2]) <= 1.0e-8 * float(sv[0]):
+        raise ValueError(
+            "Periodic/tied interface: the main face is degenerate (its nodes are collinear), so no "
+            "tangent plane can be fitted. In 3-D a tied face must be a surface, not an edge — check "
+            "the tag predicate selects a 2-D patch of the boundary."
+        )
+    return np.ascontiguousarray(vt[: dim - 1]), origin
+
+
+def _edge_shape(xi: np.ndarray, k: int) -> np.ndarray:
+    """Lagrange shape values ``(..., k)`` on a reference edge at local coordinate(s) ``xi in [0, 1]``.
+
+    ``k == 2`` is the P1 edge ``(a, b)``; ``k == 3`` the P2 edge ``(a, b, mid)`` -- the node order the
+    facet tables use, with the midside node LAST."""
+    xi = np.asarray(xi, dtype=float)
+    if k == 2:
+        return np.stack([1.0 - xi, xi], axis=-1)
+    if k == 3:
+        return np.stack([2.0 * (xi - 0.5) * (xi - 1.0), 2.0 * xi * (xi - 0.5), -4.0 * xi * (xi - 1.0)], axis=-1)
+    raise ValueError(f"edge facets carry 2 (P1) or 3 (P2) nodes, got {k}")
+
+
+def _facet_dual_coeffs(k: int, qp: np.ndarray, qw: np.ndarray) -> np.ndarray:
+    """Element-local **dual** basis coefficients ``A``: ``psi_i = sum_k A_ik N_k`` is biorthogonal to
+    the primal basis, ``int psi_i N_j = delta_ij int N_i``.
+
+    Rather than hard-coding the dual functions per element order, build them from the facet mass
+    matrix: with ``Mass_ij = int N_i N_j`` and ``d_i = int N_i``, taking ``A = diag(d) Mass^-1`` gives
+    ``int psi_i N_j = (A Mass)_ij = d_i delta_ij`` by construction. For the P1 edge this recovers the
+    textbook ``psi_0 = 2 - 3xi``, ``psi_1 = 3xi - 1`` (Wohlmuth, SIAM J. Numer. Anal. 38(3):989-1012,
+    2000, §3), and it extends to P2 with no extra algebra.
+
+    Biorthogonality is **element-local**, so the assembled ``D`` is diagonal only when the segments
+    cover each secondary facet completely -- which :func:`_mortar_rows_2d` checks and refuses otherwise.
+    The reference-element coefficients carry over unchanged to a straight physical edge, whose
+    Jacobian is constant and cancels between ``Mass`` and ``d``."""
+    return _dual_coeffs(_edge_shape(qp, k), qw)
+
+
+def _dual_coeffs(shape_vals: np.ndarray, qw: np.ndarray) -> np.ndarray:
+    """Dual coefficients ``A = diag(d) Mass^-1`` from tabulated shape values ``(n_q, n_loc)`` and
+    quadrature weights -- the element-shape-agnostic core of :func:`_facet_dual_coeffs`, shared by the
+    2-D (edge) and 3-D (triangle) mortar paths."""
+    mass = shape_vals.T @ (qw[:, None] * shape_vals)
+    return np.diag(qw @ shape_vals) @ np.linalg.inv(mass)
+
+
+def _tri_shape(bary: np.ndarray, k: int) -> np.ndarray:
+    """Lagrange shape values ``(..., k)`` on a triangle from barycentric coordinates ``(..., 3)``.
+
+    ``k == 3`` is the P1 triangle ``(a, b, c)``; ``k == 6`` the P2 triangle
+    ``(a, b, c, mab, mbc, mca)`` -- the node order the facet tables use, matching the 3-D branch of
+    :func:`_periodic_facet_weights`."""
+    l0, l1, l2 = bary[..., 0], bary[..., 1], bary[..., 2]
+    if k == 3:
+        return np.stack([l0, l1, l2], axis=-1)
+    if k == 6:
+        return np.stack(
+            [
+                l0 * (2.0 * l0 - 1.0),
+                l1 * (2.0 * l1 - 1.0),
+                l2 * (2.0 * l2 - 1.0),
+                4.0 * l0 * l1,
+                4.0 * l1 * l2,
+                4.0 * l2 * l0,
+            ],
+            axis=-1,
+        )
+    raise ValueError(f"triangle facets carry 3 (P1) or 6 (P2) nodes, got {k}")
+
+
+def _tri_bary(x: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """Barycentric coordinates ``(n, 3)`` of planar points ``x`` ``(n, 2)`` in the triangle ``v``
+    ``(3, 2)``. Affine, so it is invariant to the in-plane rotation the interface frame is free in."""
+    jac = np.column_stack([v[1] - v[0], v[2] - v[0]])  # (2, 2)
+    lam = np.linalg.solve(jac, (np.atleast_2d(x) - v[0]).T)  # (2, n)
+    return np.stack([1.0 - lam[0] - lam[1], lam[0], lam[1]], axis=-1)
+
+
+def _signed_area(poly: np.ndarray) -> float:
+    """Shoelace signed area of a planar polygon ``(n, 2)``; positive when counter-clockwise."""
+    x, y = poly[:, 0], poly[:, 1]
+    return 0.5 * float(np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))
+
+
+def _as_ccw(poly: np.ndarray) -> np.ndarray:
+    """The same polygon wound counter-clockwise, which is what :func:`_clip_convex` assumes."""
+    return poly[::-1] if _signed_area(poly) < 0.0 else poly
+
+
+def _clip_convex(subject: np.ndarray, clip: np.ndarray) -> np.ndarray:
+    """Intersection of two **convex, counter-clockwise** planar polygons (Sutherland & Hodgman,
+    *Commun. ACM* 17(1):32-42, 1974): clip the subject successively against each half-plane of the
+    clip polygon.
+
+    Two triangles intersect in a convex polygon of at most 6 vertices. Returns ``(n, 2)``; fewer than
+    3 vertices means the overlap is empty or degenerate (a touching edge or corner), which the caller
+    drops -- such a contact carries zero area and contributes nothing to the mortar integral.
+    """
+    out = [np.asarray(p, dtype=float) for p in subject]
+    n_clip = len(clip)
+    for i in range(n_clip):
+        if len(out) < 3:
+            return np.zeros((0, 2))
+        a, b = clip[i], clip[(i + 1) % n_clip]
+        edge = b - a
+        prev, out = out, []
+        for j in range(len(prev)):
+            p, q = prev[j - 1], prev[j]
+            # >= 0 is "left of / on" the directed edge a->b, i.e. inside a CCW clip polygon
+            sp = edge[0] * (p[1] - a[1]) - edge[1] * (p[0] - a[0])
+            sq = edge[0] * (q[1] - a[1]) - edge[1] * (q[0] - a[0])
+            if sq >= 0.0:
+                if sp < 0.0:
+                    out.append(p + (q - p) * (sp / (sp - sq)))
+                out.append(q)
+            elif sp >= 0.0:
+                out.append(p + (q - p) * (sp / (sp - sq)))
+    return np.asarray(out) if len(out) >= 3 else np.zeros((0, 2))
+
+
+def _tri_quadrature(n: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Gauss x Gauss on the unit square, Duffy-mapped to the reference triangle.
+
+    ``(u, v) -> (u, v(1-u))`` has Jacobian ``1-u``, so an ``n x n`` tensor rule integrates a degree
+    ``2n-2`` polynomial exactly (the Jacobian costs one degree in ``u``). Returns barycentric
+    coordinates ``(n_q, 3)`` and weights summing to 1/2 -- the reference triangle's area.
+
+    Chosen over a tabulated symmetric rule because it is one formula at every order, so the P1 and P2
+    facet cases share it and the exactness is checkable by integrating monomials."""
+    g, gw = np.polynomial.legendre.leggauss(n)
+    g, gw = 0.5 * (g + 1.0), 0.5 * gw
+    u, v = (a.ravel() for a in np.meshgrid(g, g, indexing="ij"))
+    wu, wv = (a.ravel() for a in np.meshgrid(gw, gw, indexing="ij"))
+    x, y = u, v * (1.0 - u)
+    return np.stack([1.0 - x - y, x, y], axis=-1), wu * wv * (1.0 - u)
+
+
+def _tri_dual_available(k: int) -> bool:
+    """Can a biorthogonal dual basis be built on a ``k``-node triangle by ``A = diag(d) Mass^-1``?
+
+    Only when every ``d_i = int N_i`` is non-zero. That holds for edges at any order and for the P1
+    triangle, but **the P2 triangle's vertex functions integrate to exactly zero**::
+
+        int_T L_a (2 L_a - 1) dA = 2/12 - 1/6 = 0
+
+    so ``diag(d)`` is singular and this construction collapses.
+
+    **Rescaling does not rescue it, and no better basis exists for this architecture.** Taking
+    ``c_i = 1`` (``psi = Mass^-1 N``) does give an exactly biorthogonal basis with ``D = I``, and it
+    transfers constant/linear/quadratic fields exactly -- but its span does not contain the linear
+    functions, because the coefficients needed for that are ``Mass_e . 1``, which varies per element
+    while the basis coefficients are global. Lamichhane's thesis proves this is unavoidable: under
+    ``supp phi_i == supp mu_i`` (a locally supported dual basis, one multiplier per secondary DOF, exactly
+    jNO's structure) **Lemma 3.4** shows there is *no* dual multiplier space containing the piecewise
+    linear hat functions for quadratic simplicial elements in 3-D -- and containing them is what the
+    optimal a priori error estimate needs. The published remedy uses a multiplier space of *lower*
+    dimension than the secondary trace space, which makes ``D`` rectangular and the tie a constrained
+    solve rather than an elimination; jNO's prolongation cannot express that.
+
+    Note the boundary matches exactly: the same source records that in **two** dimensions the
+    quadratic dual space *does* contain the linear hats, which is why the P2 edge path above is sound.
+
+    B. Lamichhane, *Higher Order Mortar Finite Elements with Dual Lagrange Multiplier Spaces and
+    Applications*, PhD thesis, Univ. Stuttgart 2006, Remark 2.10 and Lemma 3.4; see also Lamichhane,
+    Stevenson & Wohlmuth, *Numer. Math.* 102:93-121, 2005.
+
+    So a P2 triangular interface keeps the collocated coupling and the ``coupling`` key reports it.
+    The check is computed rather than hard-coded to the node count so it also guards any element type
+    added later whose shape functions have a zero integral.
+    """
+    bary, w = _tri_quadrature(k // 3 + 2)
+    d = np.abs(w @ _tri_shape(bary, k))
+    return bool(d.min() > 1.0e-12 * float(d.max()))
+
+
+def _main_covers_secondary_3d(s_facets: np.ndarray, m_facets: np.ndarray, loc: np.ndarray) -> bool:
+    """Does every secondary facet vertex lie inside some main triangle? The 3-D counterpart of
+    :func:`_faces_span_the_same_extent`.
+
+    A mortar integral over the secondary face needs the main basis defined underneath all of it. In 2-D
+    that reduces to an interval containment; in 3-D the faces can also be *ragged* (equal bounding
+    boxes, mismatched boundaries), so the test is per-vertex containment rather than an extent
+    comparison. Failing it means the tie keeps the collocated coupling and reports so.
+    """
+    s = np.asarray(s_facets, int)[:, :3]
+    m = np.asarray(m_facets, int)[:, :3]
+    if s.size == 0 or m.size == 0:
+        return False
+    pts = np.asarray(loc, dtype=float)[np.unique(s)]
+    best = np.full(len(pts), -np.inf)
+    for f in range(m.shape[0]):
+        v = np.asarray(loc, dtype=float)[m[f]]
+        if abs(_signed_area(v)) <= 0.0:
+            continue
+        best = np.maximum(best, _tri_bary(pts, v).min(axis=1))
+    return bool(np.all(best >= -1.0e-9))
+
+
+def _mortar_rows_3d(
+    s_facets: np.ndarray,
+    m_facets: np.ndarray,
+    loc: np.ndarray,
+    *,
+    span: float,
+) -> Dict[int, List[Tuple[int, float]]]:
+    """Dual-mortar prolongation rows for a **3-D** interface, whose facets are triangles.
+
+    Same constraint as :func:`_mortar_rows_2d` -- ``D u_s = M u_m`` with a diagonal ``D`` from the
+    dual basis -- but the segmentation is genuine polygon geometry rather than an interval
+    intersection: each secondary triangle is clipped against every main triangle it overlaps
+    (:func:`_clip_convex`), the clip polygon is fan-triangulated, and each sub-triangle carries its
+    own quadrature (Puso & Laursen, *CMAME* 193:601-629, 2004).
+
+    This is the case that motivates the whole coupling: point-in-triangle collocation is not an L2
+    projection on a surface, so it fails the constant-stress patch test in 3-D where the 2-D edge case
+    happens to pass it.
+
+    **Areas are measured in the interface frame**, so the interface must be (near-)planar -- the same
+    assumption :func:`_interface_frame` already makes. A curved tied surface is projected, and its
+    segment areas are the projected ones.
+    """
+    s_facets = np.asarray(s_facets, dtype=int)
+    m_facets = np.asarray(m_facets, dtype=int)
+    ks, km = int(s_facets.shape[1]), int(m_facets.shape[1])
+    xy = np.asarray(loc, dtype=float)
+
+    s_nodes, m_nodes = np.unique(s_facets), np.unique(m_facets)
+    s_at = {int(v): i for i, v in enumerate(s_nodes)}
+    m_at = {int(v): i for i, v in enumerate(m_nodes)}
+    diag = np.zeros(len(s_nodes))
+    cross = np.zeros((len(s_nodes), len(m_nodes)))
+
+    bary_q, w_q = _tri_quadrature(max(ks, km) // 3 + 2)
+    dual = _dual_coeffs(_tri_shape(bary_q, ks), w_q)
+    area_tol = 1.0e-12 * max(span, 1.0) ** 2
+
+    # Bounding boxes make the facet pairing O(n_s + n_m) per secondary in practice instead of a full
+    # O(n_s * n_m) Python double loop, which a face of a few thousand triangles would not survive.
+    m_v = xy[m_facets[:, :3]]  # (n_m, 3, 2)
+    m_lo, m_hi = m_v.min(axis=1), m_v.max(axis=1)
+
+    for e in range(s_facets.shape[0]):
+        sv = xy[s_facets[e, :3]]
+        area_e = abs(_signed_area(sv))
+        if area_e <= area_tol:
+            continue
+        s_lo, s_hi = sv.min(axis=0), sv.max(axis=0)
+        near = np.flatnonzero(np.all(m_lo <= s_hi, axis=1) & np.all(m_hi >= s_lo, axis=1))
+        rows = [s_at[int(v)] for v in s_facets[e]]
+        sv_ccw = _as_ccw(sv)
+        covered = 0.0
+        for f in near:
+            mv = xy[m_facets[f, :3]]
+            poly = _clip_convex(sv_ccw, _as_ccw(mv))
+            if poly.shape[0] < 3:
+                continue
+            cols = [m_at[int(v)] for v in m_facets[f]]
+            for i in range(1, poly.shape[0] - 1):  # fan-triangulate the convex clip polygon
+                sub = poly[[0, i, i + 1]]
+                a_sub = abs(_signed_area(sub))
+                if a_sub <= area_tol:
+                    continue
+                covered += a_sub
+                x_q = bary_q @ sub  # barycentric -> cartesian on the sub-triangle
+                n_s = _tri_shape(_tri_bary(x_q, sv), ks)
+                n_m = _tri_shape(_tri_bary(x_q, mv), km)
+                psi = n_s @ dual.T
+                w = w_q * (a_sub / 0.5)  # reference weights sum to 1/2; rescale to the real area
+                diag[rows] += np.einsum("qi,qi,q->i", psi, n_s, w)
+                cross[np.ix_(rows, cols)] += np.einsum("qi,qj,q->ij", psi, n_m, w)
+
+        if abs(covered - area_e) > 1.0e-8 * area_e:
+            raise ValueError(
+                f"Mortar segmentation covered {covered:.6g} of a secondary facet of area {area_e:.6g}. "
+                "The main face contains the secondary face's vertices, so this is a HOLE in the main "
+                "face -- its triangles do not tile it. Check the main tag selects a connected set "
+                "of whole boundary facets."
+            )
+
+    if np.any(np.abs(diag) <= area_tol):
+        raise ValueError(
+            "Mortar coupling produced a singular secondary mass diagonal; a tied secondary node carries no "
+            "facet area. Check the secondary tag selects whole boundary facets, not isolated nodes."
+        )
+    rows_out: Dict[int, List[Tuple[int, float]]] = {}
+    for node, i in s_at.items():
+        w_row = cross[i] / diag[i]
+        nz = np.flatnonzero(np.abs(w_row) > 1.0e-14)
+        rows_out[node] = [(int(m_nodes[j]), float(w_row[j])) for j in nz]
+    return rows_out
+
+
+def _faces_span_the_same_extent(s_facets: np.ndarray, m_facets: np.ndarray, loc: np.ndarray, *, span: float) -> bool:
+    """Does the main face cover the secondary face, so a mortar integral over the secondary is well posed?
+
+    A mortar constraint integrates over the secondary face and needs the main basis defined everywhere
+    under it. Two tagged faces do **not** always cover the same extent: a face tagged from geometry
+    can exclude its corner nodes, leaving the two sides of a periodic pair with different lengths
+    (measured here: a main spanning ``y in [0.1, 0.9]`` against a secondary spanning
+    ``[0.0435, 0.9565]``). Collocation tolerates that by clamping each stray secondary node to the nearest
+    main facet's endpoint; an integral cannot, so such a tie keeps the collocated coupling and says
+    so through the ``coupling`` key rather than integrating over a domain the main does not cover.
+
+    Faces built from a ``domain.tag`` predicate include their corners by construction and pass.
+    """
+    t = np.asarray(loc, dtype=float)[:, 0]
+    s, m = t[np.asarray(s_facets, int)[:, :2]], t[np.asarray(m_facets, int)[:, :2]]
+    if s.size == 0 or m.size == 0:
+        return False
+    tol = 1.0e-8 * max(span, 1.0)
+    return bool(m.min() <= s.min() + tol and m.max() >= s.max() - tol)
+
+
+def _mortar_rows_2d(
+    s_facets: np.ndarray,
+    m_facets: np.ndarray,
+    loc: np.ndarray,
+    *,
+    span: float,
+) -> Dict[int, List[Tuple[int, float]]]:
+    """Dual-mortar prolongation rows for a **2-D** interface, whose facets are edges.
+
+    The tie is imposed in the integral sense of the mortar method (Bernardi/Maday/Patera 1994; dual
+    multiplier spaces from Wohlmuth 2000) rather than collocated at secondary nodes:
+
+        ``int_G psi_i (u_s - u_m . Phi) dG = 0``   =>   ``D u_s = M u_m``,
+        ``D_ij = int_G psi_i N_j^s``,  ``M_ij = int_G psi_i (N_j^m . Phi)``
+
+    With the dual ``psi`` of :func:`_facet_dual_coeffs`, ``D`` is **diagonal**, so the secondary DOFs
+    eliminate explicitly as ``u_s = D^-1 M u_m`` -- the same one-row-per-secondary shape the collocated
+    path produces, and the same shape the existing reduction consumes. Unlike collocation this passes
+    the constant-stress patch test and transfers momentum in a variationally balanced way.
+
+    Both integrals are taken over the **segments**: each secondary edge clipped against every main edge
+    it overlaps (Puso & Laursen, CMAME 193:601-629, 2004). In 2-D the interface coordinate is scalar,
+    so clipping is an interval intersection and is exact -- no polygon geometry is involved.
+
+    ``loc`` is the ``(n_nodes, 1)`` projection onto the interface frame; ``span`` is the interface
+    extent, used to scale the degeneracy and coverage tolerances. Returns
+    ``{secondary_node_id: [(main_node_id, weight), ...]}``.
+    """
+    s_facets = np.asarray(s_facets, dtype=int)
+    m_facets = np.asarray(m_facets, dtype=int)
+    ks, km = int(s_facets.shape[1]), int(m_facets.shape[1])
+    t = np.asarray(loc, dtype=float)[:, 0]
+
+    # Columns 0, 1 are the edge endpoints at every order (a midside node is interior to the edge).
+    sa, sb = t[s_facets[:, 0]], t[s_facets[:, 1]]
+    ma, mb = t[m_facets[:, 0]], t[m_facets[:, 1]]
+
+    s_nodes = np.unique(s_facets)
+    m_nodes = np.unique(m_facets)
+    s_at = {int(n): i for i, n in enumerate(s_nodes)}
+    m_at = {int(n): i for i, n in enumerate(m_nodes)}
+    diag = np.zeros(len(s_nodes))
+    cross = np.zeros((len(s_nodes), len(m_nodes)))
+
+    # psi (degree p) x N^m (degree p) is degree 2p; this Gauss rule is exact through 2*max(ks,km)+1.
+    qp, qw = np.polynomial.legendre.leggauss(max(ks, km) + 2)
+    qp, qw = 0.5 * (qp + 1.0), 0.5 * qw  # [-1, 1] -> [0, 1]
+    dual = _facet_dual_coeffs(ks, qp, qw)
+    seg_tol = 1.0e-10 * max(span, 1.0)
+
+    for e in range(s_facets.shape[0]):
+        e_lo, e_hi = min(sa[e], sb[e]), max(sa[e], sb[e])
+        length = sb[e] - sa[e]  # signed: the local coordinate must follow the facet's own orientation
+        if abs(length) <= seg_tol:
+            continue
+        rows = [s_at[int(n)] for n in s_facets[e]]
+        covered = 0.0
+        for f in range(m_facets.shape[0]):
+            c0 = max(e_lo, min(ma[f], mb[f]))
+            c1 = min(e_hi, max(ma[f], mb[f]))
+            seg = c1 - c0
+            if seg <= seg_tol:
+                continue
+            covered += seg
+            tq = c0 + qp * seg  # quadrature points along the interface, in interface coordinates
+            n_s = _edge_shape((tq - sa[e]) / length, ks)  # (n_q, ks)
+            n_m = _edge_shape((tq - ma[f]) / (mb[f] - ma[f]), km)  # (n_q, km)
+            psi = n_s @ dual.T
+            w = qw * seg  # ds along a straight interface is dt, so these are physical lengths
+            cols = [m_at[int(n)] for n in m_facets[f]]
+            diag[rows] += np.einsum("qi,qi,q->i", psi, n_s, w)
+            cross[np.ix_(rows, cols)] += np.einsum("qi,qj,q->ij", psi, n_m, w)
+
+        if abs(covered - (e_hi - e_lo)) > 1.0e-8 * max(e_hi - e_lo, seg_tol):
+            raise ValueError(
+                f"Mortar segmentation covered {covered:.6g} of a secondary facet of length "
+                f"{e_hi - e_lo:.6g}. The two faces span the same extent, so this is a HOLE in the "
+                "main face -- its facets do not tile it. Check the main tag selects a connected "
+                "set of whole boundary facets."
+            )
+
+    if np.any(np.abs(diag) <= seg_tol):
+        raise ValueError(
+            "Mortar coupling produced a singular secondary mass diagonal; a tied secondary node carries no "
+            "facet area. Check the secondary tag selects whole boundary facets, not isolated nodes."
+        )
+    rows_out: Dict[int, List[Tuple[int, float]]] = {}
+    for node, i in s_at.items():
+        w_row = cross[i] / diag[i]
+        nz = np.flatnonzero(np.abs(w_row) > 1.0e-14)
+        rows_out[node] = [(int(m_nodes[j]), float(w_row[j])) for j in nz]
+    return rows_out
+
+
+def main_trace_weights(
+    query: np.ndarray,
+    m_facets: np.ndarray,
+    loc: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Weights that evaluate a **main-side** field at arbitrary points of the interface.
+
+    A tie eliminates secondary DOFs, so its weights are only ever needed *at secondary nodes*. Contact needs
+    the same trace at **quadrature points**: the signed gap ``g = g0 + n.(u_s - u_m . Phi)`` compares
+    the two sides wherever the surface integral samples them, not just where the secondary mesh happens to
+    put a node. This is that generalisation, batched.
+
+    ``query`` is ``(n_q, dim-1)`` in the interface frame of :func:`_interface_frame`; ``m_facets`` is
+    ``(n_f, k)`` main facet node ids; ``loc`` is every node projected into that frame. Returns
+    ``(ids, w)``, both ``(n_q, k)``: the main nodes each query point reads and their shape values.
+    ``sum(w, axis=1) == 1``, so a constant main field is reproduced exactly.
+
+    Host/NumPy by design -- locating a point in a facet is a discrete search, the same eager-setup
+    exception the rest of the tie machinery takes. The *result* is a plain gather, so a field read
+    through it stays differentiable in the DOF values. It is **not** differentiable in the mesh
+    coordinates: the weights are frozen at build time, so a shape derivative through a gap would need
+    them re-derived in JAX.
+
+    A query outside every facet is clamped to the nearest one, matching
+    :func:`_periodic_facet_weights` -- at a rounding-width overhang that is the intended answer, and a
+    genuine overhang is refused earlier by the coverage checks.
+    """
+    q = np.atleast_2d(np.asarray(query, dtype=float))
+    m_facets = np.asarray(m_facets, dtype=int)
+    k = int(m_facets.shape[1])
+    if q.shape[0] == 0 or m_facets.shape[0] == 0:
+        return np.zeros((0, k), dtype=int), np.zeros((0, k))
+
+    if q.shape[1] == 1:  # 2-D interface: facets are edges, locate by interval containment
+        t = q[:, 0]
+        a, b = loc[m_facets[:, 0], 0], loc[m_facets[:, 1], 0]
+        lo, hi = np.minimum(a, b), np.maximum(a, b)
+        eps = 1.0e-9 * float(np.max(hi - lo)) if m_facets.shape[0] else 0.0
+        inside = (t[:, None] >= lo[None, :] - eps) & (t[:, None] <= hi[None, :] + eps)
+        # the containing edge, else the nearest one (overhang by a rounding width)
+        dist = np.minimum(np.abs(t[:, None] - lo[None, :]), np.abs(t[:, None] - hi[None, :]))
+        idx = np.where(inside.any(axis=1), np.argmax(inside, axis=1), np.argmin(dist, axis=1))
+        span = b[idx] - a[idx]
+        xi = np.clip(np.where(np.abs(span) < 1e-300, 0.0, (t - a[idx]) / np.where(span == 0, 1.0, span)), 0.0, 1.0)
+        return m_facets[idx], _edge_shape(xi, k)
+
+    # 3-D interface: facets are triangles, locate by barycentric containment
+    v = loc[m_facets[:, :3]]  # (n_f, 3, 2)
+    v0, v1 = v[:, 1] - v[:, 0], v[:, 2] - v[:, 0]
+    det = v0[:, 0] * v1[:, 1] - v0[:, 1] * v1[:, 0]
+    det = np.where(np.abs(det) < 1e-300, 1e-300, det)
+    d = q[:, None, :] - v[None, :, 0, :]  # (n_q, n_f, 2)
+    l1 = (d[..., 0] * v1[None, :, 1] - d[..., 1] * v1[None, :, 0]) / det[None, :]
+    l2 = (v0[None, :, 0] * d[..., 1] - v0[None, :, 1] * d[..., 0]) / det[None, :]
+    l0 = 1.0 - l1 - l2
+    viol = np.maximum(0.0, -l0) + np.maximum(0.0, -l1) + np.maximum(0.0, -l2)
+    idx = np.argmin(viol, axis=1)  # containing triangle, else the least-violating one
+    rows = np.arange(q.shape[0])
+    bary = np.stack([l0[rows, idx], l1[rows, idx], l2[rows, idx]], axis=-1)
+    bary = np.clip(bary, 0.0, 1.0)
+    bary = bary / np.maximum(bary.sum(axis=1, keepdims=True), 1e-300)  # renormalise after clamping
+    return m_facets[idx], _tri_shape(bary, k)
+
+
+def interface_gap_data(
+    secondary_qp: np.ndarray,
+    m_facets: np.ndarray,
+    points: np.ndarray,
+    secondary_normals: np.ndarray,
+    *,
+    frame: np.ndarray | None = None,
+    origin: np.ndarray | None = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Everything a signed contact gap needs, precomputed on the host: ``(ids, w, g0)``.
+
+    The gap between two surfaces is ``g = g0 - n . (u_s - u_m . Phi)``, split into a part fixed by the
+    geometry and a part that moves with the solution:
+
+    * ``g0 = n . (Phi(x_s) - x_s)`` — the **initial** separation at each secondary quadrature point, i.e.
+      how far it stands off the main surface along the normal. Positive = a gap, negative = initial
+      penetration. Zero for two coincident (tied) faces.
+    * ``(ids, w)`` — the :func:`main_trace_weights` gather, so ``u_m . Phi`` at those points is a
+      plain weighted sum of main DOFs and therefore differentiable in the solution.
+
+    **Orientation — the one thing to get right.** ``n`` is the **secondary face's outward normal**, which on
+    a contacting pair points *toward* the main body. Secondary motion along ``n`` therefore *closes* the
+    gap, which is where the minus sign on the displacement term comes from. Handed the opposite normal
+    this returns ``-g``, and every downstream sign follows it: a penetrating body reads as open, and
+    ``max(0, -c*g)`` never activates, so free interpenetration is an exact root of the residual and
+    Newton converges to it without complaint. The parameter is named ``secondary_normals`` rather than
+    ``normals`` because there is nothing in the arrays themselves that distinguishes the two cases.
+
+    The convention that follows is ``g > 0`` separated, ``g < 0`` interpenetrating, contact pressure
+    ``p = max(0, -c*g) >= 0``, and a traction term ``+p * inner(n, phi)`` — the sign that adds a
+    *positive*-definite ``+c (n.du)(n.phi)`` to the tangent, since ``dg/du_s = -n``.
+
+    ``secondary_qp`` is ``(..., dim)`` physical quadrature points on the secondary face; ``secondary_normals`` is the
+    matching outward unit normal per point (or one per face, broadcast by the caller). ``frame`` /
+    ``origin`` default to a fit of the **main** facets' own tangent plane (:func:`_interface_frame`),
+    which is what makes this work for coincident faces where no separating axis exists.
+
+    Host/NumPy: locating each point on the main face is a discrete search, frozen at build time. So
+    the gap is differentiable in the DOF values but **not** in the mesh coordinates -- shape-optimising
+    through a contact gap would need the projection re-derived in JAX. It also assumes **small
+    sliding**: the pairing is fixed, so a caller that slides must rebuild it per load step.
+    """
+    q = np.asarray(secondary_qp, dtype=float)
+    pts = np.asarray(points, dtype=float)
+    m_facets = np.asarray(m_facets, dtype=int)
+    flat = q.reshape(-1, q.shape[-1])
+    if frame is None or origin is None:
+        m_pts = pts[np.unique(m_facets)]
+        frame, origin = _interface_frame(m_pts, flat if flat.size else m_pts)
+
+    ids, w = main_trace_weights((flat - origin) @ np.asarray(frame).T, m_facets, (pts - origin) @ np.asarray(frame).T)
+    proj = np.einsum("qk,qkd->qd", w, pts[ids])  # Phi(x_s): the main-surface point under each query
+    n = np.asarray(secondary_normals, dtype=float).reshape(-1, q.shape[-1])
+    # Measured from the secondary TOWARD the main (``proj - x_s``), because ``n`` points that way -- see
+    # the orientation paragraph above, which is the whole reason this line is not the other way round.
+    g0 = np.einsum("qd,qd->q", n, proj - flat)
+    lead = q.shape[:-1]
+    return ids.reshape(*lead, -1), w.reshape(*lead, -1), g0.reshape(*lead)
+
+
 def _periodic_facet_weights(
     t_query: np.ndarray,
     facet_node_ids: np.ndarray,
-    pts: np.ndarray,
-    transverse: List[int],
+    loc: np.ndarray,
 ) -> List[Tuple[int, float]] | None:
-    """Interpolation weights for a slave at transverse coord ``t_query`` on the
-    master boundary facets (node-to-segment / mortar-lite identification).
+    """Interpolation weights for a secondary at in-interface coord ``t_query`` on the
+    main boundary facets (node-to-segment / mortar-lite identification).
 
-    ``facet_node_ids`` is ``(n_facets, k)`` of global node ids. **2D** (transverse
-    1-D): facets are edges -- columns 0,1 are the vertices, optional column 2 the
-    midside node (``k == 3`` ⇒ P2). **3D** (transverse 2-D): facets are triangles --
-    columns 0,1,2 the vertices, optional columns 3,4,5 the edge midpoints (``k == 6``
-    ⇒ P2). Returns ``[(node_id, weight), ...]`` whose weights sum to 1 (partition of
-    unity ⇒ constants reproduced; linear/quadratic-on-the-facet reproduced exactly).
+    ``facet_node_ids`` is ``(n_facets, k)`` of global node ids; ``loc`` is the ``(n_nodes, dim-1)``
+    projection of every node onto the interface tangent frame (:func:`_interface_frame`), so this
+    routine never sees the across-interface coordinate. **2D** (``loc`` 1-D): facets are edges --
+    columns 0,1 are the vertices, optional column 2 the midside node (``k == 3`` ⇒ P2). **3D**
+    (``loc`` 2-D): facets are triangles -- columns 0,1,2 the vertices, optional columns 3,4,5 the
+    edge midpoints (``k == 6`` ⇒ P2). Returns ``[(node_id, weight), ...]`` whose weights sum to 1
+    (partition of unity ⇒ constants reproduced; linear/quadratic-on-the-facet reproduced exactly).
     """
     tq = np.atleast_1d(np.asarray(t_query, dtype=float))
     facet_node_ids = np.asarray(facet_node_ids, dtype=int)
     if facet_node_ids.ndim != 2 or facet_node_ids.shape[0] == 0:
         return None
     k = facet_node_ids.shape[1]
+    # Only P1 and P2 facets have shape functions here. The branches below used to read `k < 3` /
+    # `k < 6` and fall through to the P2 formulas for ANYTHING larger, so a P3 edge was interpolated
+    # as if its node at 1/3 were the midpoint and its node at 2/3 did not exist. Weights still summed
+    # to 1, so a constant transferred and nothing complained -- but a LINEAR field came out wrong by
+    # 0.25-0.33 on a field of range 2. Refuse instead.
+    _max_k = 3 if tq.shape[0] == 1 else 6
+    if k > _max_k:
+        raise NotImplementedError(
+            f"A non-matching periodic/tied interface supports P1 and P2 facets; this one has {k}-node "
+            f"facets (P{k - 1} edge / higher-order face). Use a conforming mesh for the tie, or drop to "
+            "order 2 -- interpolating it with the P2 formulas would silently misplace the extra nodes."
+        )
 
-    if tq.shape[0] == 1:  # 2D: locate the master edge spanning the slave's transverse coord
+    if tq.shape[0] == 1:  # 2D: locate the main edge spanning the secondary's in-interface coord
         t = float(tq[0])
-        tr = transverse[0]
         a_ids, b_ids = facet_node_ids[:, 0], facet_node_ids[:, 1]
-        ta, tb = pts[a_ids, tr], pts[b_ids, tr]
+        ta, tb = loc[a_ids, 0], loc[b_ids, 0]
         lo, hi = np.minimum(ta, tb), np.maximum(ta, tb)
         span = hi - lo
         eps = 1.0e-9 * (float(np.max(span)) if span.size else 1.0)
@@ -2088,11 +2680,10 @@ def _periodic_facet_weights(
         m = int(facet_node_ids[idx, 2])  # P2 edge (a, b, mid): quadratic Lagrange at xi = 0, 1, 0.5
         return [(a, 2.0 * (xi - 0.5) * (xi - 1.0)), (b, 2.0 * xi * (xi - 0.5)), (m, -4.0 * xi * (xi - 1.0))]
 
-    if tq.shape[0] == 2:  # 3D: locate the master triangle containing the slave, barycentric weights
-        tr = transverse
-        pa = pts[facet_node_ids[:, 0]][:, tr]
-        pb = pts[facet_node_ids[:, 1]][:, tr]
-        pc = pts[facet_node_ids[:, 2]][:, tr]
+    if tq.shape[0] == 2:  # 3D: locate the main triangle containing the secondary, barycentric weights
+        pa = loc[facet_node_ids[:, 0]]
+        pb = loc[facet_node_ids[:, 1]]
+        pc = loc[facet_node_ids[:, 2]]
         v0, v1, v2 = pb - pa, pc - pa, tq[None, :] - pa
         d00 = (v0 * v0).sum(1)
         d01 = (v0 * v1).sum(1)
@@ -2123,8 +2714,6 @@ def _periodic_facet_weights(
         ]
     return None
 
-    raise NotImplementedError("3D periodic interpolation (triangle facets) is milestone M2.")
-
 
 def build_periodic_prolongation(
     points: np.ndarray,
@@ -2138,20 +2727,39 @@ def build_periodic_prolongation(
 ) -> Dict[str, object]:
     """Build the node-level periodic prolongation matrix ``P``.
 
-    Identifies each slave-face node with the master face. When the two faces have
+    Identifies each secondary-face node with the main face. When the two faces have
     the **same node layout** (structured / conforming) this is an exact 0/1
-    node-to-node map. When they **don't** (unstructured / non-matching), a slave
-    that has no master node within ``tol`` is instead tied to the master *facet*
-    it lands on by **node-to-segment interpolation** (linear for P1, quadratic for
-    P2) — master–slave MPC elimination, consistent (partition of unity) though not
-    a full dual-mortar coupling. See :func:`_periodic_facet_weights`.
+    node-to-node map. When they **don't** (unstructured / non-matching), a secondary
+    that has no main node within ``tol`` is tied to the main face by one of two
+    couplings, and the returned ``coupling`` key says which was used:
+
+    * ``"mortar"`` — both faces carry facet connectivity and the main face covers
+      the secondary face, so the integrated dual-mortar constraint applies:
+      :func:`_mortar_rows_2d` in 2-D (edge facets, interval clipping) or
+      :func:`_mortar_rows_3d` in 3-D (triangle facets, polygon clipping).
+      Variationally consistent, momentum-balanced, and it passes the constant-stress
+      patch test. Faces tagged by a ``domain.tag`` predicate include their corners and
+      qualify; a face tagged from geometry that drops its corners does not — see
+      :func:`_faces_span_the_same_extent` / :func:`_main_covers_secondary_3d`.
+    * ``"collocated"`` — otherwise (native 1-D chains, a tag that selects nodes but
+      no whole facet, or two faces that do not cover each other) the secondary is tied to
+      the main *facet* it lands on by **node-to-segment interpolation** (linear for
+      P1, quadratic for P2). Consistent (partition of unity) and exact for fields the
+      main facet can represent, but collocated rather than integrated. See
+      :func:`_periodic_facet_weights`.
+
+    Both couplings pass the **linear patch test**: this is a main-secondary elimination,
+    which reproduces a linear solution exactly whenever ``P`` does, and node-to-segment
+    interpolation is linearly complete. What separates them is that mortar imposes the
+    integral (L2) constraint, so it is more accurate for fields the main space cannot
+    represent — measured at 4-40% lower RMS error on a non-matching 3-D interface.
 
     Parameters
     ----------
     points:
         ``(n_nodes, dim)`` array of FEM node coordinates (the assembly mesh).
     pairs:
-        Ordered ``(master_tag, slave_tag)`` boundary pairings, e.g.
+        Ordered ``(main_tag, secondary_tag)`` boundary pairings, e.g.
         ``[("left", "right"), ("bottom", "top")]``.
     tag_indices:
         Mapping from boundary tag name to the global node ids on that tag.
@@ -2159,10 +2767,10 @@ def build_periodic_prolongation(
         Number of scalar components per node. ``vec > 1`` returns the
         node-major expansion ``kron(P_node, I_vec)``.
     tol:
-        Coordinate-matching tolerance for the transverse coordinates. When
+        Coordinate-matching tolerance for the in-interface coordinates. When
         ``None`` it is derived from the bounding-box diagonal.
     facets:
-        Optional ``{master_tag: (n_facets, k) node-id array}`` of the master
+        Optional ``{main_tag: (n_facets, k) node-id array}`` of the main
         boundary facets, required only for the non-matching (interpolatory) path.
 
     Returns
@@ -2170,8 +2778,8 @@ def build_periodic_prolongation(
     dict with keys:
         ``P``               : ``(n_full, n_red)`` dense jnp prolongation matrix.
         ``P_node``          : node-level prolongation (``vec == 1`` form).
-        ``kept_nodes``      : sorted global ids of the retained (master/free) nodes.
-        ``slave_to_master`` : resolved slave-node -> master-node mapping (exact ties).
+        ``kept_nodes``      : sorted global ids of the retained (main/free) nodes.
+        ``secondary_to_main`` : resolved secondary-node -> main-node mapping (exact ties).
         ``n_full``          : full node count.
         ``n_red``           : reduced node count.
         ``vec``             : component count used.
@@ -2189,66 +2797,122 @@ def build_periodic_prolongation(
         span = float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0)))
         tol = max(span, 1.0) * 1.0e-6
 
-    # slave -> master node (exact tie, weight = Bloch phase); slave -> [(master node, weight)] (interp).
-    slave_to_master: Dict[int, int] = {}
-    slave_phase: Dict[int, complex] = {}
-    slave_interp: Dict[int, List[Tuple[int, float]]] = {}
+    # secondary -> main node (exact tie, weight = Bloch phase); secondary -> [(main node, weight)] (interp).
+    secondary_to_main: Dict[int, int] = {}
+    secondary_phase: Dict[int, complex] = {}
+    secondary_interp: Dict[int, List[Tuple[int, float]]] = {}
+    n_mortar = n_collocated = 0  # how each non-matching secondary was tied -> reported in ``coupling``
 
-    for (master_tag, slave_tag), ph in zip(pairs, phases):
-        if master_tag not in tag_indices or slave_tag not in tag_indices:
+    for (main_tag, secondary_tag), ph in zip(pairs, phases):
+        if main_tag not in tag_indices or secondary_tag not in tag_indices:
             raise KeyError(
-                f"Periodic pair ({master_tag!r}, {slave_tag!r}) refers to a tag "
+                f"Periodic pair ({main_tag!r}, {secondary_tag!r}) refers to a tag "
                 f"that is not present in the mesh. Known tags: {sorted(tag_indices)}."
             )
 
-        m_ids = np.asarray(tag_indices[master_tag], dtype=int).reshape(-1)
-        s_ids = np.asarray(tag_indices[slave_tag], dtype=int).reshape(-1)
+        m_ids = np.asarray(tag_indices[main_tag], dtype=int).reshape(-1)
+        s_ids = np.asarray(tag_indices[secondary_tag], dtype=int).reshape(-1)
+        if s_ids.size == 0:  # nothing to eliminate on this pair
+            continue
+
+        # THE SECONDARY MUST BE THE FINER SIDE. Its DOFs are eliminated in favour of an interpolation from
+        # the main, so eliminating the fine side onto a coarse one is right, and the reverse discards
+        # exactly the resolution the fine mesh was built for. Measured on a coating/substrate tie with
+        # 81 nodes against 10: correct order gave the exact interface value, reversed was off by 10.62%
+        # -- with no error, which is why this reorders rather than trusting the caller to know.
+        # Only when the side that would BECOME the main carries facet connectivity: the main is
+        # what a non-matching secondary interpolates from, so swapping without it just moves the
+        # problem (and a caller that supplied one side's facets meant that side to be the main).
+        _can_swap = (facets or {}).get(secondary_tag) is not None
+        if _can_swap and s_ids.size < 0.9 * m_ids.size:
+            if abs(complex(ph) - 1.0) > 1e-12:
+                # A Bloch tie carries a phase e^{ik.L} that is direction-dependent: swapping the two
+                # sides requires conjugating it. Rather than do that silently, say so and leave it.
+                _log.warning(
+                    f"periodic tie ({secondary_tag!r} -> {main_tag!r}): the eliminated (secondary) side has "
+                    f"{s_ids.size} nodes against the main's {m_ids.size}, which discards the finer "
+                    "side's interface resolution. This is a BLOCH tie, whose phase is direction-"
+                    "dependent, so it was NOT reordered automatically -- swap the operands and "
+                    "conjugate the phase to fix it."
+                )
+            else:
+                _log.warning(
+                    f"periodic tie ({secondary_tag!r} -> {main_tag!r}): the eliminated (secondary) side has "
+                    f"{s_ids.size} nodes against the main's {m_ids.size}. The secondary must be the finer "
+                    f"side, so the two were swapped -- write u({main_tag}) - u({secondary_tag}) to make "
+                    "that explicit."
+                )
+                main_tag, secondary_tag = secondary_tag, main_tag
+                m_ids, s_ids = s_ids, m_ids
         m_pts = pts[m_ids]
         s_pts = pts[s_ids]
 
-        # Periodic axis = coordinate whose tag means differ the most.
-        axis = int(np.argmax(np.abs(m_pts.mean(axis=0) - s_pts.mean(axis=0))))
-        transverse = [d for d in range(pts.shape[1]) if d != axis]
+        # Project every node onto the interface's own tangent plane. That removes the across-interface
+        # coordinate whether the two faces are separated by a lattice vector (periodic) or coincident
+        # (tied) -- the axis-dropping this replaces could only express the former. See _interface_frame.
+        frame, origin = _interface_frame(m_pts, s_pts)
+        loc = (pts - origin) @ frame.T  # (n_nodes, dim-1) in-interface coordinates
+        m_loc, s_loc = loc[m_ids], loc[s_ids]
 
-        m_trans = m_pts[:, transverse]
-        s_trans = s_pts[:, transverse]
-
-        # Nearest transverse master node for every slave node.
-        d2 = np.sum((s_trans[:, None, :] - m_trans[None, :, :]) ** 2, axis=-1)
+        # Nearest in-interface main node for every secondary node.
+        d2 = np.sum((s_loc[:, None, :] - m_loc[None, :, :]) ** 2, axis=-1)
         nn = np.argmin(d2, axis=1) if m_ids.size else np.zeros(len(s_ids), dtype=int)
         dist = np.sqrt(d2[np.arange(len(s_ids)), nn]) if m_ids.size and len(s_ids) else np.zeros(len(s_ids))
 
+        # A non-matching secondary is tied by a MORTAR coupling when the interface is 2-D (edge facets) and
+        # both faces carry facet connectivity -- an integrated constraint that passes the patch test.
+        # Without secondary facets (native 1-D chains, a tag that selects nodes but no whole facet) there is
+        # nothing to integrate over, so those nodes keep the collocated node-to-segment weights. Which
+        # one each tie used is reported back in ``coupling`` rather than left to guesswork.
+        mortar: Dict[int, List[Tuple[int, float]]] = {}
+        s_fc, m_fc = facets.get(secondary_tag), facets.get(main_tag)
+        if s_fc is not None and m_fc is not None and loc.shape[1] in (1, 2):
+            span = float(np.ptp(loc)) if loc.size else 1.0
+            if loc.shape[1] == 1:  # 2-D interface: edge facets, clipping is an interval intersection
+                if _faces_span_the_same_extent(s_fc, m_fc, loc, span=span):
+                    mortar = _mortar_rows_2d(s_fc, m_fc, loc, span=span)
+            # 3-D: triangle facets, polygon clipping. P2 triangles have no dual basis of this form
+            # (their vertex functions integrate to zero) -- see _tri_dual_available.
+            elif _tri_dual_available(int(np.shape(s_fc)[1])) and _main_covers_secondary_3d(s_fc, m_fc, loc):
+                mortar = _mortar_rows_3d(s_fc, m_fc, loc, span=span)
+
         for k, sid in enumerate(s_ids):
             if m_ids.size and dist[k] <= tol:  # conforming: exact node-to-node (corners land here too)
-                slave_to_master[int(sid)] = int(m_ids[nn[k]])
-                slave_phase[int(sid)] = complex(ph)
+                secondary_to_main[int(sid)] = int(m_ids[nn[k]])
+                secondary_phase[int(sid)] = complex(ph)
                 continue
-            # non-matching: tie to the master facet by interpolation (weights scaled by the Bloch phase)
-            w = _periodic_facet_weights(s_trans[k], facets.get(master_tag), pts, transverse) if facets else None
+            # non-matching: mortar rows when available, else collocated node-to-segment interpolation
+            # (either way the weights are scaled by the Bloch phase)
+            w = mortar.get(int(sid))
+            if w is not None:
+                n_mortar += 1
+            else:
+                w = _periodic_facet_weights(s_loc[k], facets.get(main_tag), loc) if facets else None
+                n_collocated += w is not None
             if w is None:
                 raise ValueError(
-                    f"Periodic matching for ({master_tag!r}, {slave_tag!r}) failed at slave node {int(sid)}: "
-                    f"nearest master node is {float(dist[k]):.3e} away (tol {tol:.3e}) and no master facet "
+                    f"Periodic matching for ({main_tag!r}, {secondary_tag!r}) failed at secondary node {int(sid)}: "
+                    f"nearest main node is {float(dist[k]):.3e} away (tol {tol:.3e}) and no main facet "
                     "connectivity was supplied for interpolation. Pass `facets=` (unstructured) or use a "
                     "conforming mesh."
                 )
-            slave_interp[int(sid)] = [(int(m), complex(ph) * wt) for (m, wt) in w]
+            secondary_interp[int(sid)] = [(int(m), complex(ph) * wt) for (m, wt) in w]
 
-    slave_set = set(slave_to_master) | set(slave_interp)
+    secondary_set = set(secondary_to_main) | set(secondary_interp)
 
-    # Each slave is a linear combination of other nodes (exact: one master, weight 1; interpolated:
-    # facet shape-function weights). Those nodes may themselves be slaves — a corner is a slave in
-    # several directions, and an interpolation can land on a master edge whose endpoint is itself a
-    # slave — so resolve every slave **transitively** to kept (master) nodes. This handles any number
+    # Each secondary is a linear combination of other nodes (exact: one main, weight 1; interpolated:
+    # facet shape-function weights). Those nodes may themselves be secondarys — a corner is a secondary in
+    # several directions, and an interpolation can land on a main edge whose endpoint is itself a
+    # secondary — so resolve every secondary **transitively** to kept (main) nodes. This handles any number
     # of periodic directions (e.g. a doubly-periodic cell) with a single general mechanism.
     raw: Dict[int, List[Tuple[int, complex]]] = {
-        sid: [(m, slave_phase.get(sid, 1.0))] for sid, m in slave_to_master.items()
+        sid: [(m, secondary_phase.get(sid, 1.0))] for sid, m in secondary_to_main.items()
     }
-    raw.update({sid: list(ws) for sid, ws in slave_interp.items()})
+    raw.update({sid: list(ws) for sid, ws in secondary_interp.items()})
     resolved: Dict[int, Dict[int, float]] = {}
 
     def _expand(node: int, stack: frozenset) -> Dict[int, float]:
-        if node not in slave_set:
+        if node not in secondary_set:
             return {node: 1.0}
         if node in resolved:
             return resolved[node]
@@ -2262,7 +2926,7 @@ def build_periodic_prolongation(
         resolved[node] = out
         return out
 
-    kept_nodes: List[int] = [i for i in range(n_nodes) if i not in slave_set]
+    kept_nodes: List[int] = [i for i in range(n_nodes) if i not in secondary_set]
     reduced_index = {node: r for r, node in enumerate(kept_nodes)}
     n_red = len(kept_nodes)
 
@@ -2276,7 +2940,7 @@ def build_periodic_prolongation(
     cols: List[int] = []
     data: List[complex] = []
     for i in range(n_nodes):
-        if i in slave_set:
+        if i in secondary_set:
             for kept_node, weight in _expand(i, frozenset()).items():
                 rows.append(i)
                 cols.append(reduced_index[kept_node])
@@ -2286,8 +2950,8 @@ def build_periodic_prolongation(
             cols.append(reduced_index[i])
             data.append(1.0)
 
-    # Informational exact-chain map (single kept master per exact slave); interpolated slaves omitted.
-    final_master = {sid: next(iter(_expand(sid, frozenset()))) for sid in slave_to_master}
+    # Informational exact-chain map (single kept main per exact secondary); interpolated secondarys omitted.
+    final_main = {sid: next(iter(_expand(sid, frozenset()))) for sid in secondary_to_main}
 
     rows_a = np.asarray(rows, dtype=np.int64)
     cols_a = np.asarray(cols, dtype=np.int64)
@@ -2304,16 +2968,28 @@ def build_periodic_prolongation(
         "P": P,
         "P_node": P,  # sparse; equals the node-level map when vec == 1
         "kept_nodes": np.asarray(kept_nodes, dtype=np.int64),
-        "slave_to_master": final_master,
+        "secondary_to_main": final_main,
         "n_full": n_full,
         "n_red": n_red_full,
         "vec": int(vec),
-        # whether P is a one-master-per-slave selection (conforming) -> the sparse remap reduction is
+        # whether P is a one-main-per-secondary selection (conforming) -> the sparse remap reduction is
         # exact; computed once here (eager, concrete P) so the reduce path never inspects P under trace.
         "is_selection": _is_selection(P),
         # Bloch/quasi-periodic: P is complex, so the reduction is Hermitian (P^H A P) and the reduced
         # complex system can't be split into independent real/imag legs.
         "is_bloch": bool(is_bloch),
+        # How the NON-matching secondarys were tied: "conforming" (there were none), "mortar" (integrated,
+        # passes the patch test), "collocated" (node-to-segment; no secondary facets to integrate over) or
+        # "mixed". Reported rather than inferred, so a caller never has to guess which it got.
+        "coupling": (
+            "conforming"
+            if not (n_mortar or n_collocated)
+            else "mortar"
+            if not n_collocated
+            else "collocated"
+            if not n_mortar
+            else "mixed"
+        ),
     }
 
 
@@ -2339,11 +3015,11 @@ def build_periodic_prolongation_nonnodal(
     * **value DOFs** — tie by vertex coordinate, weight ``+1`` (delegated to the nodal builder on the
       vertex points, so corners / transitive chains are handled identically to Lagrange);
     * **edge normal-derivative DOFs** — tie boundary-edge → boundary-edge by *midpoint*, weight
-      ``sign(n_slave · n_master)`` where each edge's normal is its globally-oriented reference normal
+      ``sign(n_secondary · n_main)`` where each edge's normal is its globally-oriented reference normal
       (``fem_nonnodal``: ``n = R90·(P[hi] − P[lo])``). For axis-aligned periodic boundaries this dot is
       ``±1`` — the tie **sign is derived from geometry, not assumed** (and gated by an MMS test).
 
-    Non-conforming periodic boundaries (a slave edge with no transverse-matching master edge) raise a
+    Non-conforming periodic boundaries (a secondary edge with no transverse-matching main edge) raise a
     clear error rather than silently mis-coupling (mortar interpolation of derivative DOFs is out of
     scope). Returns the same dict shape as :func:`build_periodic_prolongation`.
     """
@@ -2360,7 +3036,7 @@ def build_periodic_prolongation_nonnodal(
     enrm = np.asarray(edge_normals, dtype=np.float64).reshape(n_edges, -1)
     span = float(np.linalg.norm(emid.max(0) - emid.min(0))) if n_edges else 1.0
     etol = tol if tol is not None else max(span, 1.0) * 1.0e-6
-    e_slave_master: Dict[int, Tuple[int, float]] = {}
+    e_secondary_main: Dict[int, Tuple[int, float]] = {}
     for mtag, stag in pairs:
         me = np.asarray(etags.get(mtag, []), dtype=int).reshape(-1)
         se = np.asarray(etags.get(stag, []), dtype=int).reshape(-1)
@@ -2375,27 +3051,27 @@ def build_periodic_prolongation_nonnodal(
         for kk, sid in enumerate(se):
             if dist[kk] > etol:
                 raise ValueError(
-                    f"jno.fem periodic (non-nodal C¹): slave edge {int(sid)} on {stag!r} has no "
-                    f"transverse-matching master edge on {mtag!r} (nearest {dist[kk]:.3e} > tol {etol:.3e}). "
+                    f"jno.fem periodic (non-nodal C¹): secondary edge {int(sid)} on {stag!r} has no "
+                    f"transverse-matching main edge on {mtag!r} (nearest {dist[kk]:.3e} > tol {etol:.3e}). "
                     "Periodic C¹ needs a conforming (matching) periodic boundary; non-matching edge "
                     "coupling (mortar interpolation of derivative DOFs) is not supported."
                 )
             mid = int(me[nn[kk]])
             dot = float(np.dot(enrm[int(sid)], enrm[mid]))
-            e_slave_master[int(sid)] = (mid, 1.0 if dot >= 0.0 else -1.0)
+            e_secondary_main[int(sid)] = (mid, 1.0 if dot >= 0.0 else -1.0)
 
     def _resolve_edge(e: int) -> Tuple[int, float]:
         seen: set = set()
         sign = 1.0
-        while e in e_slave_master:
+        while e in e_secondary_main:
             if e in seen:
                 raise ValueError(f"jno.fem periodic (non-nodal C¹): cyclic edge tie at edge {e}.")
             seen.add(e)
-            e, s = e_slave_master[e]
+            e, s = e_secondary_main[e]
             sign *= s
         return e, sign
 
-    ekept = [e for e in range(n_edges) if e not in e_slave_master]
+    ekept = [e for e in range(n_edges) if e not in e_secondary_main]
     e_red_idx = {e: r for r, e in enumerate(ekept)}
     n_ered = len(ekept)
 
@@ -2424,7 +3100,7 @@ def build_periodic_prolongation_nonnodal(
         "P": P,
         "P_node": P,
         "kept_nodes": kept,
-        "slave_to_master": {},
+        "secondary_to_main": {},
         "n_full": n_full,
         "n_red": n_red,
         "vec": 1,
@@ -2587,6 +3263,19 @@ _ELEM_MAP_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
 #: :func:`_bake_fingerprint`), which for a discarded problem means keeping that mesh's arrays alive;
 #: at 128 that is bounded by ~20 dead problems rather than by the whole session.
 _ELEM_MAP_CACHE_MAX = 128
+
+#: Duplicate-collapse plans, keyed on the CONTENT of the triplet pattern they were computed from.
+#:
+#: See :func:`compress_plan` for why content rather than identity (a remesh changes the content and
+#: misses, so staleness is impossible) and for the measured hash-vs-work ratio.
+#:
+#: Bounded at 4 because an entry pins DEVICE arrays, and the ``inverse`` leg is one int32 per RAW
+#: triplet -- the largest array the plan holds (38 MiB at 9.5M triplets, against ~3 MiB for the unique
+#: indices). Four covers the two-to-three patterns one build registers plus a neighbour, which is the
+#: repeated-build case this exists for; holding a dead problem's pattern any longer costs device
+#: memory for nothing.
+_PLAN_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
+_PLAN_CACHE_MAX = 4
 
 
 def _bake_fingerprint(fn, chunk):
@@ -2781,10 +3470,30 @@ def compress_plan(indices):
 
     Raises on a traced index array rather than guessing. Every caller builds its pattern from
     host-static mesh connectivity, so a tracer here means that invariant broke, and the caller must
-    fall back to the uncompressed path rather than ship a wrong count."""
+    fall back to the uncompressed path rather than ship a wrong count.
+
+    **Memoized on the pattern's CONTENT** (:data:`_PLAN_CACHE`). The sentence at the top of this
+    docstring -- the pattern is fixed by mesh and terms -- is also true *across builds*, and it was
+    being ignored: rebuilding the same problem on the same mesh recomputed an identical plan. Measured
+    on 3-D Poisson at 27,833 nodes, that was **0.68 s of a 1.5 s build, 45%**, and this path is
+    entered two to three times per build (here, the Dirichlet-row wrapper, and again inside
+    :func:`compress_eager` on the augmented pattern).
+
+    Content-keyed rather than keyed on the identity of the arrays the pattern was derived from, which
+    is the safer of the two: identical content provably yields an identical plan, and a **remeshed
+    domain changes the content and simply misses**, so no staleness is possible. Identity-keying would
+    have needed the mesh threaded into the key and a test to prove an adaptive remesh invalidates it.
+    The hash is not free but it is not close to the cost either -- measured at the 9.5M-triplet size,
+    ``blake2b`` 60 ms against the 800 ms ``np.unique`` it skips, i.e. **7.5%**."""
     arr = np.asarray(indices)  # raises on a tracer -- deliberately not caught
     if arr.size == 0 or arr.shape[0] == 0:
         return None
+    digest = _hashlib.blake2b(memoryview(np.ascontiguousarray(arr)).cast("B"), digest_size=16).digest()
+    key = (digest, arr.shape, arr.dtype.str)
+    hit = _PLAN_CACHE.get(key)
+    if hit is not None:
+        _PLAN_CACHE.move_to_end(key)
+        return hit
     rows = arr[:, 0].astype(np.int64)
     cols = arr[:, 1].astype(np.int64)
     stride = int(cols.max()) + 1
@@ -2792,7 +3501,11 @@ def compress_plan(indices):
     idx = np.stack([uniq // stride, uniq % stride], axis=1).astype(np.int32)
     # int32 inverse: it is one entry per RAW triplet, so on a large 3-D operator it is the biggest
     # array the plan holds -- halving it against numpy's int64 default is worth the cast.
-    return jnp.asarray(idx), jnp.asarray(inverse.reshape(-1).astype(np.int32)), int(uniq.shape[0])
+    plan = jnp.asarray(idx), jnp.asarray(inverse.reshape(-1).astype(np.int32)), int(uniq.shape[0])
+    _PLAN_CACHE[key] = plan
+    while len(_PLAN_CACHE) > _PLAN_CACHE_MAX:
+        _PLAN_CACHE.popitem(last=False)
+    return plan
 
 
 def compress_eager(A):
@@ -2847,10 +3560,13 @@ def bcoo_set_dirichlet_rows(A, dofs):
 # ---------------------------------------------------------------------------
 
 
+_log = get_logger()
+
+
 def _is_selection(P):
-    """True iff BCOO ``P`` has exactly one nonzero per full row — a periodic *selection* (each slave
-    DOF equals a single master), for which the remap-sum reduction is exact. A **nonconforming** tie
-    builds an *interpolation* ``P`` (several weighted masters per slave row), which needs a genuine
+    """True iff BCOO ``P`` has exactly one nonzero per full row — a periodic *selection* (each secondary
+    DOF equals a single main), for which the remap-sum reduction is exact. A **nonconforming** tie
+    builds an *interpolation* ``P`` (several weighted mains per secondary row), which needs a genuine
     ``P^T M P`` (the dense fallback). ``P.indices`` is static (built from connectivity), so this is a
     trace-time constant even when ``reduce_matrix`` runs inside a jitted ``operator_fn``."""
     if not hasattr(P, "indices"):
@@ -2861,12 +3577,12 @@ def _is_selection(P):
 
 
 def _selection_maps(P, dtype):
-    """For a periodic selection ``P`` (BCOO, one nonzero per full row), return ``(master, pval)``:
-    ``master[i]`` = the reduced DOF that full DOF ``i`` maps to; ``pval[i]`` = the tie coefficient
+    """For a periodic selection ``P`` (BCOO, one nonzero per full row), return ``(main, pval)``:
+    ``main[i]`` = the reduced DOF that full DOF ``i`` maps to; ``pval[i]`` = the tie coefficient
     (``1``, or ``-1`` for an antiperiodic tie)."""
-    master = jnp.zeros(P.shape[0], P.indices.dtype).at[P.indices[:, 0]].set(P.indices[:, 1])
+    main = jnp.zeros(P.shape[0], P.indices.dtype).at[P.indices[:, 0]].set(P.indices[:, 1])
     pval = jnp.zeros(P.shape[0], dtype).at[P.indices[:, 0]].set(jnp.asarray(P.data, dtype))
-    return master, pval
+    return main, pval
 
 
 def _remap_bcoo(mat, m_row, p_row, m_col, p_col, shape):
@@ -2883,11 +3599,11 @@ def _remap_bcoo(mat, m_row, p_row, m_col, p_col, shape):
 def _remap_bcoo_weighted(mat, P, conj=False):
     """Sparse Galerkin reduction ``P^T mat P`` (or ``P^H mat P`` when ``conj``) for an *interpolation*
     (nonconforming) periodic ``P``
-    -- a few masters per slave, weighted. Generalises :func:`_remap_bcoo` (one master, weight 1) by
-    spreading each ``mat`` triplet ``(r, c, v)`` across the ``D x D`` master pairs of its row and
-    column with the interpolation weights: ``v -> v · w_r[a] · w_c[b]`` at ``(master_r[a], master_c[b])``.
-    Stays sparse (no dense ``n_full × n_full`` intermediate); ``D = max masters/slave`` (small: the
-    nodes of a master facet). Returns ``None`` if ``P``'s indices are not concrete (built under trace),
+    -- a few mains per secondary, weighted. Generalises :func:`_remap_bcoo` (one main, weight 1) by
+    spreading each ``mat`` triplet ``(r, c, v)`` across the ``D x D`` main pairs of its row and
+    column with the interpolation weights: ``v -> v · w_r[a] · w_c[b]`` at ``(main_r[a], main_c[b])``.
+    Stays sparse (no dense ``n_full × n_full`` intermediate); ``D = max mains/secondary`` (small: the
+    nodes of a main facet). Returns ``None`` if ``P``'s indices are not concrete (built under trace),
     so the caller falls back to the dense product -- the nonconforming reduction is built eagerly."""
     try:
         pidx = np.asarray(P.indices)  # concrete only; a tracer raises
@@ -2903,13 +3619,13 @@ def _remap_bcoo_weighted(mat, P, conj=False):
     is_new = np.concatenate([[True], rows[1:] != rows[:-1]])
     slot = np.arange(len(rows)) - np.maximum.accumulate(np.where(is_new, np.arange(len(rows)), 0))
     D = int(slot.max()) + 1
-    master = np.zeros((n_full, D), np.int64)
-    master[rows, slot] = cols
+    main = np.zeros((n_full, D), np.int64)
+    main[rows, slot] = cols
     weight = np.zeros((n_full, D), np.complex128 if np.iscomplexobj(pdat) else np.float64)
     weight[rows, slot] = wts
-    master, weight = jnp.asarray(master), jnp.asarray(weight)
+    main, weight = jnp.asarray(main), jnp.asarray(weight)
     r, c, v = mat.indices[:, 0], mat.indices[:, 1], mat.data
-    mr, wr, mc, wc = master[r], weight[r], master[c], weight[c]  # (nnz, D)
+    mr, wr, mc, wc = main[r], weight[r], main[c], weight[c]  # (nnz, D)
     if conj:  # P^H mat P conjugates the row (left) weights
         wr = jnp.conj(wr)
     nnz = r.shape[0]
@@ -2924,13 +3640,13 @@ def reduce_matrix(P, mat, is_selection=None, conj=False):
     """Galerkin reduction ``P^T mat P`` (or the Hermitian ``P^H mat P`` when ``conj`` — for a complex
     Bloch/quasi-periodic ``P``, where the left factor must be conjugated).
 
-    When ``mat`` is BCOO and ``P`` is a BCOO *selection* (conforming/structured tie, one master per
-    slave — e.g. the doubly-periodic PEB) the reduction remaps ``mat``'s triplets to their master
+    When ``mat`` is BCOO and ``P`` is a BCOO *selection* (conforming/structured tie, one main per
+    secondary — e.g. the doubly-periodic PEB) the reduction remaps ``mat``'s triplets to their main
     indices: it stays sparse and never materialises the dense ``n_full × n_full`` matrix (``O(nnz)``;
     the reduction is otherwise the dominant memory peak of a periodic solve). An *interpolation* ``P``
     (nonconforming tie) or a dense ``P``/``mat`` (1D path) falls back to the exact dense ``P^T mat P``.
 
-    ``is_selection`` (whether ``P`` is a one-master-per-slave selection) is passed precomputed by the
+    ``is_selection`` (whether ``P`` is a one-main-per-secondary selection) is passed precomputed by the
     periodic builders so the reduction never inspects ``P.indices`` at run time — that matters because
     a parametric ``operator_fn`` reduces inside a jitted ``scan`` where ``P.indices`` is a tracer. When
     ``None`` (a direct/eager call) it is computed once here."""
@@ -2948,9 +3664,9 @@ def reduce_matrix(P, mat, is_selection=None, conj=False):
 
     pdtype = np.result_type(_dt(P), _dt(mat))
     if hasattr(mat, "indices") and is_selection:
-        master, pval = _selection_maps(P, pdtype)
+        main, pval = _selection_maps(P, pdtype)
         prow = jnp.conj(pval) if conj else pval  # P^H remap conjugates the row (left) factor
-        return _remap_bcoo(mat, master, prow, master, pval, (int(P.shape[1]), int(P.shape[1])))
+        return _remap_bcoo(mat, main, prow, main, pval, (int(P.shape[1]), int(P.shape[1])))
     if hasattr(mat, "indices") and hasattr(P, "indices"):
         # nonconforming (interpolation) tie: weighted triplet-remap, stays sparse (falls back to the
         # dense product below only if P was built under trace, which the nonconforming path never is)
@@ -2974,14 +3690,14 @@ def reduce_vector(P, vec, conj=False):
 
 
 def restrict_state(P, state_full, kept_nodes, vec: int = 1):
-    """Restrict a full initial state to the reduced master DOFs.
+    """Restrict a full initial state to the reduced main DOFs.
 
     For a consistent periodic initial condition (matching values on opposite
     faces) gathering the kept-node entries is exact and avoids the doubling
-    that ``P^T`` would introduce on master nodes.
+    that ``P^T`` would introduce on main nodes.
 
     ``kept_nodes=None`` means ``P`` is a **Galerkin basis** (``fem.solve(basis=...)``) rather than a
-    master/slave selection: its columns are not a subset of the full DOFs, so there is nothing to
+    main/secondary selection: its columns are not a subset of the full DOFs, so there is nothing to
     gather and the restriction is the projection ``P^T state``. For an orthonormal ``P`` that is the
     best approximation of the state within the span, which is exactly what the reduced solve wants.
     """
@@ -3042,11 +3758,11 @@ def _periodic_blocks(periodic):
 def build_periodic_prolongation_n1e(n_edges, edge_midpoints, edge_dirs, etags, pairs, phases=None, tol=None):
     """DOF-level periodic (Floquet/Bloch) prolongation for a lowest-order Nédélec (N1E) edge field.
 
-    Each edge carries one tangential-moment DOF. A slave-face edge ties to the master-face edge at the same
+    Each edge carries one tangential-moment DOF. A secondary-face edge ties to the main-face edge at the same
     transverse position; the tie weight is the Bloch phase times an orientation **sign** (+1 if the two
     edges point the same way along their lo→hi canonical direction, −1 if opposed — the tangential moment
     flips with the edge orientation). Corner edges shared by two periodic faces are tied twice; the chain is
-    resolved to a single retained master DOF. Returns a legacy single-field prolongation dict."""
+    resolved to a single retained main DOF. Returns a legacy single-field prolongation dict."""
     mid = np.asarray(edge_midpoints, dtype=np.float64)
     dirs = np.asarray(edge_dirs, dtype=np.float64)
     if phases is None:
@@ -3056,8 +3772,8 @@ def build_periodic_prolongation_n1e(n_edges, edge_midpoints, edge_dirs, etags, p
         span = float(np.linalg.norm(mid.max(axis=0) - mid.min(axis=0)))
         tol = max(span, 1.0) * 1.0e-6
 
-    s2m: Dict[int, int] = {}  # slave edge -> master edge
-    weight: Dict[int, complex] = {}  # slave edge -> tie weight (orientation sign × Bloch phase)
+    s2m: Dict[int, int] = {}  # secondary edge -> main edge
+    weight: Dict[int, complex] = {}  # secondary edge -> tie weight (orientation sign × Bloch phase)
     for (mtag, stag), ph in zip(pairs, phases):
         me, se = np.asarray(etags[mtag], dtype=int), np.asarray(etags[stag], dtype=int)
         if me.size == 0 or se.size == 0:
@@ -3072,20 +3788,20 @@ def build_periodic_prolongation_n1e(n_edges, edge_midpoints, edge_dirs, etags, p
         for k, s in enumerate(se):
             if dist[k] > tol:
                 raise ValueError(
-                    f"periodic N1E: slave edge {int(s)} has no transverse master match "
+                    f"periodic N1E: secondary edge {int(s)} has no transverse main match "
                     f"(nearest {dist[k]:.2e} > tol {tol:.2e}); a conforming periodic mesh is required."
                 )
             m = int(me[nn[k]])
             sign = 1.0 if float(dirs[int(s)] @ dirs[m]) >= 0.0 else -1.0
             s2m[int(s)], weight[int(s)] = m, sign * complex(ph)
 
-    slaves = set(s2m)
-    kept = np.array([e for e in range(n_edges) if e not in slaves], dtype=int)
+    secondarys = set(s2m)
+    kept = np.array([e for e in range(n_edges) if e not in secondarys], dtype=int)
     col = {int(e): j for j, e in enumerate(kept)}
     P = np.zeros((n_edges, len(kept)), dtype=(np.complex128 if is_bloch else np.float64))
     for j, e in enumerate(kept):
         P[e, j] = 1.0
-    for s in slaves:  # resolve a possibly-chained tie (corner edge tied via two faces) to a kept master
+    for s in secondarys:  # resolve a possibly-chained tie (corner edge tied via two faces) to a kept main
         m, w = s2m[s], weight[s]
         while m in s2m:
             w *= weight[m]
@@ -3107,7 +3823,7 @@ def reduce_matrix_periodic(periodic, mat, conj=False):
 
     When ``mat`` and every field's ``P_i`` are BCOO, the whole blocked reduction
     ``reduced[i,j] = P_i^T mat[i,j] P_j`` is one global triplet-remap (the per-field offsets are
-    folded into a single full→reduced master map), so it stays sparse and never densifies — the fix
+    folded into a single full→reduced main map), so it stays sparse and never densifies — the fix
     for the ``O(n^2)`` reduction peak at large ``N``. A dense ``mat`` falls back to the per-block
     dense reduction (no block-diagonal ``P`` is ever materialised)."""
     blocks, off_f, off_r = _periodic_blocks(periodic)
@@ -3120,17 +3836,15 @@ def reduce_matrix_periodic(periodic, mat, conj=False):
     if hasattr(mat, "indices") and all(_sel(b) for b in blocks):
         n_full, n_red = int(off_f[-1]), int(off_r[-1])
         pdtype = np.result_type(*[b["P"].data.dtype for b in blocks], mat.data.dtype)
-        gmaster = jnp.zeros(n_full, mat.indices.dtype)
+        gmain = jnp.zeros(n_full, mat.indices.dtype)
         gpval = jnp.zeros(n_full, pdtype)
         for i, b in enumerate(blocks):
             Pi = b["P"]
             full_local = Pi.indices[:, 0]  # field-i local full DOF
-            gmaster = gmaster.at[int(off_f[i]) + full_local].set(
-                (int(off_r[i]) + Pi.indices[:, 1]).astype(mat.indices.dtype)
-            )
+            gmain = gmain.at[int(off_f[i]) + full_local].set((int(off_r[i]) + Pi.indices[:, 1]).astype(mat.indices.dtype))
             gpval = gpval.at[int(off_f[i]) + full_local].set(jnp.asarray(Pi.data, pdtype))
         prow = jnp.conj(gpval) if conj else gpval
-        return _remap_bcoo(mat, gmaster, prow, gmaster, gpval, (n_red, n_red))
+        return _remap_bcoo(mat, gmain, prow, gmain, gpval, (n_red, n_red))
     mat = jnp.asarray(mat.todense()) if hasattr(mat, "todense") else jnp.asarray(mat)
     pdtype = np.result_type(
         *[np.asarray(b["P"].todense() if hasattr(b["P"], "todense") else b["P"]).dtype for b in blocks], mat.dtype
@@ -3163,7 +3877,7 @@ def reduce_vector_periodic(periodic, vec, conj=False):
 
 
 def restrict_state_periodic(periodic, state):
-    """Restrict a full state to the reduced master DOFs (per-field block)."""
+    """Restrict a full state to the reduced main DOFs (per-field block)."""
     blocks, off_f, _ = _periodic_blocks(periodic)
     if len(blocks) == 1:
         return restrict_state(blocks[0]["P"], state, blocks[0]["kept"], blocks[0]["vec"])

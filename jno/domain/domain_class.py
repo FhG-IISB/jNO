@@ -19,6 +19,7 @@ from ..utils.dtypes import default_np_float_dtype
 from ..utils.logger import get_logger
 from .boundary_region import BoundaryRegion
 from .geometries import Geometries
+from .mesh_utils import base_cell_type as _base_cell_type
 from .meshio_mixin import MeshIOMixin
 from .simplex_pool import SimplexPool
 
@@ -918,13 +919,65 @@ class domain(MeshIOMixin):
         """
         return sorted(self._boundary_registry.keys())
 
-    def interface_tags(self):
-        """Return the internal material-interface tags (``"a|b"``) from a :meth:`Shape.regions` domain.
+    def interface_tags(self, *regions: str):
+        """Internal material-interface tags from a :meth:`Shape.regions` domain.
 
-        These are facet regions between two materials — impose a coupling/flux condition on one, or
-        sample it — but they are *not* part of :meth:`boundary_tags` (the outer boundary).
+        With no arguments, every interface tag (``"a|b"``) — facet regions between two materials, on
+        which you can impose a coupling or flux condition. They are deliberately *not* part of
+        :meth:`boundary_tags`, which is the outer boundary only.
+
+        Given **two region names**, the two *sides* of that interface, in the order asked::
+
+            lo, hi = d.interface_tags("substrate", "coating")   # ("...substrate", "...coating")
+            a, b = d.variable(lo, split=True), d.variable(hi, split=True)
+            fem = jno.fem([..., T(a[0], a[1]) - T(b[0], b[1])])   # glue the two bodies
+
+        A ``conforming=False`` domain meshes each region separately, so the shared surface exists
+        **twice** — once per body, spatially coincident, with different node layouts. No ``domain.tag``
+        predicate can separate them (they occupy the same points), which is why the emitter names them
+        ``"a|b.a"`` / ``"a|b.b"`` and why they are reached through their region names rather than
+        geometrically. Returning them in the order asked means the caller chooses which side a tie
+        eliminates, rather than inferring it from alphabetical order.
+
+        **Order matters, and there is a right answer.** In ``u(A) - u(B)`` the first region is the
+        **secondary**: its interface DOFs are eliminated in favour of an interpolation from the main. So
+        the secondary must be the more finely meshed side, or the fine mesh's resolution at the interface
+        is discarded. Measured on a coating/substrate tie with 81 nodes against 10::
+
+            secondary = the 81-node side  ->  interface value exact       (0.00% error)
+            secondary = the 10-node side  ->  interface value off by 10.62%
+
+        Nothing detects this today, and the wrong choice produces a plausible number rather than an
+        error -- so pass the finer region first.
         """
-        return sorted(getattr(self, "_interface_registry", {}).keys())
+        registry = getattr(self, "_interface_registry", {}) or {}
+        if not regions:
+            return sorted(registry)
+        if len(regions) != 2:
+            raise TypeError(f"domain.interface_tags: pass no regions, or exactly two; got {len(regions)}.")
+
+        pair = "|".join(sorted(str(r) for r in regions))
+        sides = {t.rpartition(".")[2]: t for t in registry if t.rpartition(".")[0] == pair}
+        if not sides:
+            if pair in registry:
+                raise ValueError(
+                    f"domain.interface_tags({regions[0]!r}, {regions[1]!r}): this is a CONFORMING "
+                    f"interface, so the two regions share one surface ({pair!r}) and there are no "
+                    "separate sides to tie. Build the domain with Shape.regions(..., conforming=False) "
+                    "to mesh each body independently."
+                )
+            known = sorted({t.rpartition(".")[0] or t for t in registry})
+            raise ValueError(
+                f"domain.interface_tags: no interface between {regions[0]!r} and {regions[1]!r}. "
+                f"Known interfaces: {known}. Two regions only share one when they touch."
+            )
+        missing = [r for r in regions if str(r) not in sides]
+        if missing:
+            raise ValueError(
+                f"domain.interface_tags: {pair!r} has sides {sorted(sides)}, which does not include "
+                f"{missing}. Pass the two region names that form the interface."
+            )
+        return tuple(sides[str(r)] for r in regions)
 
     def dirichlet(self, tags, values=None):
         """
@@ -1401,8 +1454,71 @@ class domain(MeshIOMixin):
             return None
         return lambda p: region.contains(p)
 
-    def tag(self, name, where):
+    def tag_node_mask(self, tag, points):
+        """Boolean mask of which ``points`` belong to ``tag`` -- the float64-safe resolution.
+
+        The companion to :meth:`_make_tag_location_fn`, and the one an assembler should use when it
+        already holds concrete coordinates. A ``domain.tag(name, where)`` predicate is evaluated **in
+        numpy float64** here rather than under JAX, because ``jnp.asarray`` truncates coordinates to
+        float32 unless x64 is enabled -- and a tag tolerance finer than float32 eps then matches no
+        point at all. ``d.tag("right", lambda x: x > 1 - 1e-9)`` on a domain reaching x = 1 is the
+        canonical case: in float32 ``1 - 1e-9`` rounds to exactly 1.0, the strict ``>`` is false for
+        every node, and an essential condition bound to that tag is dropped in silence.
+
+        Only the *user* predicate moves off the JAX path. The boundary restriction it is intersected
+        with stays where it was -- a tolerance-based proximity test against the region's own points,
+        which float32 cannot break.
+
+        Returns ``None`` when the tag is unknown, matching ``_make_tag_location_fn``.
+        """
+        import jax
+        import jax.numpy as jnp
+
+        loc = self._make_tag_location_fn(tag)
+        if loc is None:
+            return None
+        pts = np.asarray(points)
+        n = int(pts.shape[0])
+
+        def _vmapped(fn, num_args=1):
+            # Chunked for the same reason the callers chunked: a geometric region predicate tests one
+            # point against every boundary facet, so an unchunked vmap materialises (n x n_facets) --
+            # 804 MB on a realistic 3-D mesh, which exhausts the device before assembly starts.
+            pj, chunk, out = jnp.asarray(pts), 512, []
+            for s in range(0, n, chunk):
+                blk = pj[s : min(s + chunk, n)]
+                hit = jax.vmap(fn)(blk) if num_args == 1 else jax.vmap(fn)(blk, jnp.arange(s, s + blk.shape[0]))
+                out.append(np.asarray(hit).reshape(-1))
+            return np.concatenate(out) if out else np.zeros(0, dtype=bool)
+
+        where = (getattr(self, "_tag_predicates", {}) or {}).get(tag)
+        if where is not None:
+            pts64 = np.asarray(points, dtype=np.float64)
+            dim = int(self.dimension)
+            mask = np.asarray(where(*(pts64[:, i] for i in range(dim)))).reshape(-1).astype(bool)
+            full = self._boundary_regions.get("boundary", None)
+            if full is not None:
+                mask &= _vmapped(full.contains).astype(bool)
+            return mask
+
+        num_args = loc.__code__.co_argcount if hasattr(loc, "__code__") else 1
+        return _vmapped(loc, num_args).astype(bool)
+
+    def tag(self, name, where, region=None):
         """Define a named region from a **spatial** predicate ``where(x, y[, z]) -> bool``.
+
+        ``region=`` restricts the predicate to **one body's** nodes. It exists because a spatial
+        predicate cannot always separate what you mean: a ``Shape.regions(..., conforming=False)``
+        domain meshes each body independently, so the shared surface exists *twice* -- two coincident
+        sets of nodes at identical coordinates. No function of ``(x, y, z)`` can tell them apart.
+        Naming which body owns the facet supplies the missing discriminator::
+
+            d.tag("film_face", lambda x, y: abs(y - 1.0) < 1e-9, region="coating")
+            d.tag("base_face", lambda x, y: abs(y - 1.0) < 1e-9, region="substrate")
+            fem = jno.fem([..., T(a[0], a[1]) - T(b[0], b[1])])   # glue the two bodies
+
+        It is equally the answer to "the part of the outer boundary belonging to *this* body", which a
+        coordinate predicate also cannot express once two bodies touch.
 
         One general method for naming any subset of the domain -- interior *or* boundary. The
         region is abstract (predicate-based), so it is carried even without a mesh: the PINN
@@ -1439,8 +1555,22 @@ class domain(MeshIOMixin):
                 return np.asarray(_cxy(_g, np.asarray(x), np.asarray(y)))
 
         self._tag_predicates[name] = where
+        if region is not None:
+            # Stored, not applied here: `_register_tag_boundary_region` works on facet COORDINATES and
+            # dedups them, so the two coincident sides of a non-conforming interface are already
+            # indistinguishable by the time it runs. The restriction is resolved where node IDs still
+            # exist -- see `fem_native._boundary_node_ids`.
+            known = set(getattr(self, "tag_indices", {}) or {})
+            if str(region) not in known:
+                raise ValueError(
+                    f"tag({name!r}, region={region!r}): unknown region. Known: {sorted(known)}. "
+                    "`region=` names the BODY that owns the facets (a Shape.regions name), which is "
+                    "what tells two coincident interface surfaces apart."
+                )
+            self._tag_regions = getattr(self, "_tag_regions", {})
+            self._tag_regions[name] = str(region)
         self._materialize_tag_pool(name, where)
-        self._register_tag_boundary_region(name, where)
+        self._register_tag_boundary_region(name, where, region)
         # Lazy mesh-free sampling: register the parent geometry so PolygonDomain.sample can draw the
         # region with sample=(n, None); _sample_interior filters by the predicate (resampled each step).
         poly_tags = getattr(self, "_polygon_tags", None)
@@ -1539,21 +1669,56 @@ class domain(MeshIOMixin):
                 m = RegionMask(str(region))
                 covered = m if covered is None else covered + m
             expr = expr + default * (1.0 - covered)  # cells in no listed region get `default`
-        get_logger(__name__).info(
-            f"by_region: per-region coefficient over {len(values)} region(s): {sorted(map(str, values))}"
-        )
+        # NB: get_logger's first positional is a log *directory* -- get_logger(__name__) literally
+        # creates a folder named `jno.domain.domain_class/` in the caller's cwd.
+        get_logger().info(f"by_region: per-region coefficient over {len(values)} region(s): {sorted(map(str, values))}")
         return expr
 
-    def _register_tag_boundary_region(self, name, where):
+    def _register_tag_boundary_region(self, name, where, region=None):
         """If any **boundary** facets satisfy ``where``, register a ``BoundaryRegion`` for ``name``
         so a ``jno.fem`` term bound to it classifies as a boundary (Dirichlet / Neumann) condition
         and ``variable(name, normals=True)`` works. Interior-only tags add nothing here (they stay
-        interior sampling regions). 2-D edges; 3-D triangles."""
+        interior sampling regions). **1-D vertices**; 2-D edges; 3-D triangles.
+
+        With ``region=`` the search also covers **interface** facets. It has to: a non-conforming
+        interface is deliberately kept out of the ``"boundary"`` region -- otherwise a plain
+        ``u(boundary) - g`` would pin it and silently solve two disconnected bodies -- so a predicate
+        over the interface plane would otherwise match nothing at all and the tag would never register.
+        The facets of the two sides are coincident, so this cannot separate them (it dedups by
+        coordinate); that is resolved later against node IDs in ``fem_native._boundary_node_ids``.
+        """
         full = self._boundary_regions.get("boundary")
         if full is None:
             return
         dim = self.dimension
-        ents = full.edges if dim == 2 else full.triangles
+        if dim == 1:
+            # A 1-D boundary facet IS a vertex, so there are no edges/triangles to search and the
+            # endpoints themselves are the entities. Without this branch the `triangles` lookup below
+            # found nothing and returned, leaving `d.tag` with no boundary region at all -- silently:
+            # the tag still sampled, `d.variable(name)` still worked, and nothing complained until
+            # `jno.fem` rejected `u(tag) - g` as a whole-domain residual and blamed the residual.
+            _bp = np.asarray(full.points, dtype=float).reshape(len(np.asarray(full.points)), -1)
+            _keep = np.asarray(where(_bp[:, 0])).reshape(-1).astype(bool)
+            if not _keep.any():
+                return
+            self._boundary_regions[name] = BoundaryRegion(tag=name, dim=1, points=_bp[_keep][:, :1], tol=full.tol)
+            # The outward sign (-1 at the left end, +1 at the right) is taken from the "boundary"
+            # region's OWN per-point normals rather than recomputed, so a tagged endpoint can never
+            # disagree with the built-in tag naming the same point.
+            _bn = self.normals_by_tag.get("boundary")
+            if _bn is not None and len(np.asarray(_bn)) == len(_bp):
+                self.normals_by_tag[name] = np.asarray(_bn).reshape(len(_bp), -1)[_keep]
+            return
+        attr = "edges" if dim == 2 else "triangles"
+        blocks = [getattr(full, attr)]
+        if region is not None:
+            blocks += [
+                getattr(r, attr)
+                for t, r in self._boundary_regions.items()
+                if "|" in t and getattr(r, attr) is not None and len(getattr(r, attr))
+            ]
+        blocks = [np.asarray(b) for b in blocks if b is not None and len(b)]
+        ents = np.concatenate(blocks, axis=0) if blocks else None
         if ents is None or len(ents) == 0:
             return
         ents = np.asarray(ents)  # (E, k, dim)
@@ -1821,7 +1986,7 @@ class domain(MeshIOMixin):
 
     def _remesh_periodic(self, pairs) -> bool:
         """Re-mesh IN PLACE from the stored ``jno.Shape`` geometry, making the named opposite-face ``pairs``
-        (``[(master, slave), ...]``) conforming via gmsh ``setPeriodic`` — so a Nédélec (edge) field's
+        (``[(main, secondary), ...]``) conforming via gmsh ``setPeriodic`` — so a Nédélec (edge) field's
         per-edge DOFs line up one-to-one across the periodic faces. Inferred from the constraint list (the
         periodic ties), never requested explicitly. Idempotent: returns ``False`` (a no-op) when the domain
         is not ``Shape``-backed (a user-supplied conforming mesh is used as-is) or the pairs are already
@@ -1984,7 +2149,7 @@ class domain(MeshIOMixin):
                 # Boundary tags live in the facet block (block 1); point clouds (block 0 = vertex)
                 # are not volume-filling, so they still get PCA normals.
                 _vol_elem = {1: "line", 2: "triangle", 3: "tetra"}.get(self.dimension)
-                block0_is_volume = bool(mesh.cells) and mesh.cells[0].type == _vol_elem
+                block0_is_volume = bool(mesh.cells) and _base_cell_type(mesh.cells[0].type) == _vol_elem
                 has_volume_cells = False
 
                 if isinstance(cell_data, dict):
@@ -2000,17 +2165,21 @@ class domain(MeshIOMixin):
                                     if len(sel):  # vertex data contains the point index
                                         tag_point_blocks.append(sel.reshape(len(sel), -1)[:, 0])
                         else:
-                            if block0_is_volume and cell_type == _vol_elem and len(indices) > 0:
+                            if block0_is_volume and _base_cell_type(cell_type) == _vol_elem and len(indices) > 0:
                                 has_volume_cells = True
                             for b_idx, cell_block in enumerate(mesh.cells):
                                 if cell_block.type == cell_type:
                                     sel = self._cells_of(cell_block.data, indices, block_offsets.get((b_idx, cell_type), 0))
                                     if len(sel):
                                         tag_point_blocks.append(sel.ravel())
-                                        if cell_block.type == "line":
-                                            tag_edge_blocks.append(sel)
-                                        elif cell_block.type == "triangle":
-                                            tag_tri_blocks.append(sel)
+                                        # A curved facet ("line3"/"triangle6") is still an edge/face;
+                                        # downstream these arrays are P1 (2- and 3-node), so truncate
+                                        # to the vertex columns rather than change every consumer.
+                                        _bt = _base_cell_type(cell_block.type)
+                                        if _bt == "line":
+                                            tag_edge_blocks.append(sel[:, :2])
+                                        elif _bt == "triangle":
+                                            tag_tri_blocks.append(sel[:, :3])
                 else:
                     # Handle list-style cell_data. meshio cell-set indices
                     # can be either block-local (manually written `.inp`
@@ -2041,10 +2210,11 @@ class domain(MeshIOMixin):
                                     tag_point_blocks.append(sel.reshape(len(sel), -1)[:, 0])
                                 else:
                                     tag_point_blocks.append(sel.ravel())
-                                    if cell_block.type == "line":
-                                        tag_edge_blocks.append(sel)
-                                    elif cell_block.type == "triangle":
-                                        tag_tri_blocks.append(sel)
+                                    _bt = _base_cell_type(cell_block.type)
+                                    if _bt == "line":
+                                        tag_edge_blocks.append(sel[:, :2])
+                                    elif _bt == "triangle":
+                                        tag_tri_blocks.append(sel[:, :3])
 
                 tag_edges = np.concatenate(tag_edge_blocks, axis=0) if tag_edge_blocks else np.zeros((0, 2), int)
                 tag_tris = np.concatenate(tag_tri_blocks, axis=0) if tag_tri_blocks else np.zeros((0, 3), int)
@@ -2061,6 +2231,15 @@ class domain(MeshIOMixin):
                         self._boundary_loop_tags.add(name)
                         # the chain walk is a Python graph traversal: hand it plain ints, as before
                         indices_list = self._chain_edges_to_loop(tag_edges.tolist())
+                        # The walk runs over P1 edges, so it returns only their vertices. A CURVED
+                        # facet also carries midside nodes, which are genuine boundary DOFs -- without
+                        # them a Dirichlet condition would pin the corners of each facet and leave its
+                        # interior free. Append rather than merge, so the ordered loop stays a prefix
+                        # for the consumers that rely on it. Empty for a straight mesh, where the chain
+                        # already covers every node, so this path is unchanged there.
+                        _extra = np.setdiff1d(tag_points, np.asarray(indices_list, dtype=int))
+                        if _extra.size:
+                            indices_list = np.concatenate([np.asarray(indices_list, dtype=int), _extra])
                     else:
                         indices_list = np.asarray(tag_points, dtype=int)
 
@@ -2208,6 +2387,7 @@ class domain(MeshIOMixin):
         return_indices: Literal[False] = False,
         time_value: Optional[float] = None,
         where=None,
+        region=None,
     ) -> "tuple[Variable, ...]": ...
 
     @overload
@@ -2224,6 +2404,7 @@ class domain(MeshIOMixin):
         return_indices: bool = False,
         time_value: Optional[float] = None,
         where=None,
+        region=None,
     ) -> Any: ...
     @property
     def cell_size(self):
@@ -2261,6 +2442,7 @@ class domain(MeshIOMixin):
         return_indices=False,
         time_value: Optional[float] = None,
         where=None,
+        region=None,
     ) -> Any:
         """Create Variable placeholders for a tagged point set or tensor.
 
@@ -2304,8 +2486,12 @@ class domain(MeshIOMixin):
         """
 
         # Define-and-fetch: a predicate names the region here, then we return its coordinates.
+        # `region=` restricts it to one body -- the only way to pick a single side of a
+        # non-conforming interface, whose two surfaces share coordinates exactly. See `tag`.
         if where is not None:
-            self.tag(tag, where)
+            self.tag(tag, where, region=region)
+        elif region is not None:
+            raise TypeError("domain.variable: `region=` applies only with `where=`, which is what it restricts.")
 
         # Optional sampling / tensor-tag attachment
         if sample is not None:

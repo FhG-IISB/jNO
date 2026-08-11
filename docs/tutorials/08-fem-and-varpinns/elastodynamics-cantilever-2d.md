@@ -2,7 +2,7 @@
 
 <div class="hero-actions" markdown>
 <a class="md-button md-button--primary" href="/jNO/tutorial_examples/08_fem_and_varpinns/elastodynamics_cantilever_2d.py" download>Download .py</a>
-<a class="md-button" href="/jNO/tutorials/08-fem-and-varpinns/">Back to chapter</a>
+<a class="md-button" href="/jNO/#tutorials">All tutorials</a>
 </div>
 
 The **vector** sibling of the [vibrating membrane](wave-membrane-2d.md): a plane-stress beam clamped

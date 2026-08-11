@@ -41,7 +41,7 @@ K_TRUE = 2.0  # the reaction coefficient we will recover
 SIGMA_U = 0.02  # sensor noise on the observed field u
 SIGMA_PHYS = 0.05  # physics likelihood scale (obs noise + surrogate model error)
 
-domain = jno.domain.line(mesh_size=0.02)
+domain = jno.Path(0.0, 0.0).line_to(1.0, 0.0).curve(size=0.02).domain()
 x, _ = domain.variable("interior")
 x_np = np.asarray(domain.context["interior"]).reshape(-1, 1)
 

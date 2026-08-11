@@ -464,7 +464,7 @@ def test_3d_tet_multifield_routes_native_and_recovers():
 
 def test_periodic_steady_scalar_routes_native_and_reduces():
     """A steady scalar Poisson, periodic in x (``u(left) - u(right)``) + Dirichlet in y, assembles
-    natively (``fem.problem`` is None) and the periodic tie still reduces the system (slave DOFs eliminated)
+    natively (``fem.problem`` is None) and the periodic tie still reduces the system (secondary DOFs eliminated)
     and recovers the manufactured solution -- the reduction reads the native assembly cells."""
     pi = np.pi
     dom = jno.domain({"fine": box(0, 0, 0.5, 1), "coarse": box(0.5, 0, 1, 1)}).build_mesh(0.12, sizes={"fine": 0.06})

@@ -70,7 +70,7 @@ def test_periodic_complex_helmholtz_recovers_manufactured():
     assert fem.is_complex
     assert fem.problem is None  # native real-equivalent assembly
     assert fem._periodic is not None, "the u(left)-u(right) tie must reduce the complex system"
-    assert fem._periodic["n_red"] < fem._periodic["n_full"], "the tie must eliminate the slave-face DOFs"
+    assert fem._periodic["n_red"] < fem._periodic["n_full"], "the tie must eliminate the secondary-face DOFs"
 
     u_num = np.asarray(fem.solve())
     assert np.iscomplexobj(u_num)
@@ -114,8 +114,8 @@ def test_periodic_complex_homogeneous_is_zero():
 
 def test_doubly_periodic_complex_reaction_diffusion():
     """Extreme: two tied face-pairs (a doubly-periodic complex cell). ``c(-Δu) + d·u = f`` periodic in
-    **both** x and y -- the four corners are each a slave in two directions and must collapse onto one
-    kept master (transitive corner resolution) *through* the complex real-equivalent block. Manufactured
+    **both** x and y -- the four corners are each a secondary in two directions and must collapse onto one
+    kept main (transitive corner resolution) *through* the complex real-equivalent block. Manufactured
     ``u* = (1+0.5i) cos(2πx) cos(2πy)`` with ``-Δu* = 8π² u*``."""
     dom = jno.domain(box(0.0, 0.0, 1.0, 1.0)).build_mesh(0.06)
     for nm, pred in {

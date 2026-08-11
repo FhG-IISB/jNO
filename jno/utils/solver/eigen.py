@@ -116,12 +116,35 @@ def _require_symmetric(op, name: str, *, probes: int = 2, seed: int = 12345) -> 
     under a trace the probes come back as tracers and the check is skipped, the same contract as
     :func:`jno.utils.solver.solver_api._maybe_residual_check`.
     """
+    if _symmetry_verdict(op, probes=probes, seed=seed) == "nonsymmetric":
+        raise ValueError(
+            f"jno.solve.eigs: {name} is NOT symmetric. This solver reduces the SYMMETRIC pencil, so "
+            f"it would silently return the spectrum of \u00bd({name}+{name}\u1d40) -- a different "
+            "problem: a non-self-adjoint operator generally has COMPLEX eigenvalues, and none of the "
+            f"symmetrized values need be an eigenvalue of {name} at all. Pass sigma= to use the "
+            "non-symmetric shift-invert path (ARPACK), or, if you are certain you want the "
+            f"symmetrized surrogate, pass it explicitly: 0.5*({name} + {name}.T)."
+        )
+
+
+def _symmetry_verdict(op, *, probes: int = 2, seed: int = 12345) -> str:
+    """``"symmetric"`` / ``"nonsymmetric"`` / ``"unknown"`` -- which pencil this operator really is.
+
+    Same bilinear-form probe :func:`_require_symmetric` has always used (``\u27e8w, Kv\u27e9 = \u27e8Kw, v\u27e9``
+    for all ``v, w`` iff ``K = K\u1d40``): two matvecs per probe, no transpose materialized, and it works
+    on a matvec-only operator. Split out so the dispatcher can ROUTE on the answer rather than only
+    refuse -- a non-symmetric operator now has somewhere to go.
+
+    ``"unknown"`` is returned for a traced or unsized operator, exactly where the old code declined to
+    fabricate a verdict. Callers must treat it as "assume symmetric", which preserves the historical
+    behaviour: under ``jit`` the symmetric path is still what runs.
+    """
     if op is None:
-        return
+        return "symmetric"
     o = _as_op(op)
     shape = getattr(o, "shape", None)
     if shape is None:  # an unsized matvec cannot be probed
-        return
+        return "unknown"
     import numpy as np
 
     n = int(shape[0])
@@ -134,20 +157,14 @@ def _require_symmetric(op, name: str, *, probes: int = 2, seed: int = 12345) -> 
         w = jnp.asarray(rng.standard_normal(n), dt)
         Kv, Kw = o.mv(v), o.mv(w)
         if isinstance(Kv, jax.core.Tracer) or isinstance(Kw, jax.core.Tracer):
-            return  # traced operator: cannot concretise, so do not fabricate a verdict
+            return "unknown"  # traced: cannot concretise, so do not fabricate a verdict
         # plain (non-conjugated) products: this tests K = Kᵀ, matching what dense_geneigh imposes
         num = abs(complex(jnp.sum(w * Kv) - jnp.sum(Kw * v)))
         den = float(jnp.linalg.norm(w) * jnp.linalg.norm(Kv)) + 1e-300
         worst = max(worst, num / den)
     if worst > tol:
-        raise ValueError(
-            f"jno.solve.eigs: {name} is NOT symmetric (relative asymmetry {worst:.2e} > {tol:.0e}). "
-            "This solver reduces the SYMMETRIC pencil, so it would silently return the spectrum of "
-            f"½({name}+{name}ᵀ) — a different problem: a non-self-adjoint operator generally has "
-            "COMPLEX eigenvalues, and none of the symmetrized values need be an eigenvalue of "
-            f"{name} at all. A non-symmetric eigensolver is not available yet. If you are certain "
-            f"you want the symmetrized surrogate, pass it explicitly: 0.5*({name} + {name}.T)."
-        )
+        return "nonsymmetric"
+    return "symmetric"
 
 
 def _m_orth_basis(V, MV, rtol):
@@ -320,6 +337,388 @@ def lobpcg_geneigh(
     return lam, X, res
 
 
+def _left_eigenvectors(A, B, lam, V, np, sp, spla, sla, dense):
+    """Left eigenvectors ``w`` with ``w^H A = lambda w^H B``, paired to ``lam`` by construction.
+
+    Needed only for the derivative: for a SIMPLE eigenvalue,
+    ``dlambda = w^H (dA - lambda dB) v / (w^H B v)`` (Wilkinson, *The Algebraic Eigenvalue Problem*,
+    1965, ch. 2). The symmetric case never needed this because there ``w = v``.
+
+    Two routes, and the pairing is why:
+
+    * **dense** -- ``scipy.linalg.eig(..., left=True)`` returns both families in ONE ordering, so
+      ``w_i`` already belongs to ``lambda_i``. Free and unambiguous.
+    * **sparse** -- INVERSE ITERATION on ``(A - lambda_i B)^H`` using the eigenvalue already in hand.
+      The obvious alternative, a second Arnoldi run on ``A^H``, would return the conjugated spectrum
+      in its own order and leave us matching each value to its partner -- ambiguous exactly when the
+      spectrum clusters, which is exactly when the derivative is most delicate. Inverse iteration has
+      no pairing step at all: it targets one eigenvalue by construction. The shifted matrix is
+      near-singular, which is what makes the iteration converge in a step or two rather than a
+      difficulty; the growing component IS the eigenvector.
+
+    Cost, stated: the sparse route factors once PER EIGENVALUE, so a gradient costs ``k`` extra
+    factorizations on top of the forward solve. Small ``k`` is the normal case here.
+    """
+    n = A.shape[0]
+    k = len(lam)
+    if dense:
+        Aq = np.asarray(A)
+        Bq = None if B is None else np.asarray(B)
+        lam_all, W_all, V_all = sla.eig(Aq, Bq, left=True, right=True)
+        # match by value: sla.eig's own order, restricted to the k we returned
+        used = np.zeros(len(lam_all), bool)
+        cols = []
+        for value in lam:
+            d = np.abs(lam_all - value) + np.where(used, np.inf, 0.0)
+            j = int(np.argmin(d))
+            used[j] = True
+            cols.append(W_all[:, j])
+        return np.stack(cols, axis=1)
+
+    As = sp.csr_matrix(A)
+    Bs = sp.csr_matrix(B) if B is not None else sp.identity(n, format="csr", dtype=As.dtype)
+    # complex128 throughout: SuperLU's solve inherits the factorization's dtype and refuses a wider
+    # right-hand side, and inverse iteration runs on a DELIBERATELY near-singular matrix, which is no
+    # place to be in single precision. The forward eigenpairs keep the caller's dtype.
+    cdt128 = np.complex128
+    As = As.astype(cdt128)
+    Bs = Bs.astype(cdt128)
+    W = np.empty((n, k), dtype=cdt128)
+    BH = Bs.conj().T.tocsc()
+    for i in range(k):
+        S = (As - lam[i] * Bs).conj().T.tocsc()
+        try:
+            lu = spla.splu(S)
+        except RuntimeError:  # exactly singular: the eigenvalue is converged to machine precision
+            lu = spla.splu(S + (1e3 * np.finfo(float).eps * abs(lam[i]) + 1e-300) * sp.identity(n, format="csc"))
+        w = np.asarray(V[:, i], dtype=W.dtype)  # the right eigenvector is already a good start
+        for _ in range(3):  # 2 is normally enough; the third is cheap insurance
+            w = lu.solve(BH @ w)
+            nrm = np.linalg.norm(w)
+            if not np.isfinite(nrm) or nrm == 0:
+                break
+            w = w / nrm
+        # Did it actually converge to a LEFT eigenvector? ||A^H w - conj(lambda) B^H w|| says so
+        # directly. It does not converge at a DEFECTIVE eigenvalue -- where the derivative genuinely
+        # does not exist -- and inverse iteration can wander inside a degenerate subspace, returning a
+        # plausible vector that is not the partner of v. Poison the column rather than hand back a
+        # finite wrong derivative; the NaN carries through w^H B v into the gradient.
+        resid = np.linalg.norm(As.conj().T @ w - np.conj(lam[i]) * (BH @ w))
+        floor = abs(np.abs(As).max()) * max(np.linalg.norm(w), 1e-300)
+        W[:, i] = w if resid <= 1e-6 * floor else np.nan
+
+    return W
+
+
+@jax.custom_vjp
+def _no_eigenvector_grad(V, A):
+    """Identity on the eigenvectors, whose derivative is **NaN** rather than a silent zero.
+
+    The eigenvectors come out of a ``stop_gradient``-ed host callback, so without this ``jax.grad``
+    reports **zero** for them -- measured against finite differences the true derivative was 2.4e-04,
+    and a silent zero is a wrong answer wearing the shape of a right one.
+
+    Reverse mode, not forward, and that is the whole design. A ``custom_jvp`` rule runs during
+    tracing, before dead-code elimination, so it cannot tell whether the eigenvectors are actually
+    used -- a first attempt raised even for a loss built purely from eigenvalues. The VJP rule instead
+    receives ``V``'s COTANGENT, which is exactly the question being asked: nonzero means something
+    downstream really does depend on the eigenvectors, and only then is the operator's gradient
+    poisoned. A loss that touches only the eigenvalues differentiates normally.
+
+    NaN rather than an exception because the answer is only known inside the backward pass, where a
+    Python ``raise`` would fire on a traced predicate. It propagates and cannot be mistaken for a
+    gradient; see :func:`_attach_eigenvalue_grad` for what IS differentiable here.
+    """
+    del A
+    return V
+
+
+def _no_eigenvector_grad_fwd(V, A):
+    return V, jnp.zeros_like(A)
+
+
+def _no_eigenvector_grad_bwd(zeros_like_A, g):
+    used = jnp.any(g != 0)
+    return jnp.zeros_like(g), jnp.where(used, jnp.nan, 0.0) + zeros_like_A
+
+
+_no_eigenvector_grad.defvjp(_no_eigenvector_grad_fwd, _no_eigenvector_grad_bwd)
+
+
+@jax.custom_jvp
+def _attach_eigenvalue_grad(A, B, lam, V, W):
+    """Identity in ``lam``, carrying the eigenvalue derivative w.r.t. ``A`` and ``B``.
+
+    The eigen-decomposition itself runs in a ``pure_callback`` and is not differentiable, so the
+    gradient is *attached* here instead: ``lam``, ``V`` and ``W`` arrive as constants and this adds the
+    analytic first-order rule. That keeps the host solver exactly as it was and still gives
+    ``jax.grad`` the right answer -- the same trick ``custom_linear_solve`` plays for a direct solve.
+
+    **Eigenvalues only.** ``V`` is returned straight from the callback and stays non-differentiable:
+    an eigenvector derivative needs the rest of the spectrum (or a projected solve against the
+    deflated operator), which this does not compute. Differentiating through the eigenvectors raises,
+    rather than returning a plausible wrong number.
+    """
+    return lam
+
+
+@_attach_eigenvalue_grad.defjvp
+def _attach_eigenvalue_grad_jvp(primals, tangents):
+    A, B, lam, V, W = primals
+    dA, dB, _, _, _ = tangents
+    Wc = jnp.conj(W)
+
+    def quad(Mat):  # w_i^H Mat v_i for every i, without forming anything n x n
+        return jnp.einsum("ni,nm,mi->i", Wc, Mat.astype(Wc.dtype), V)
+
+    denom = quad(B) if B is not None else jnp.einsum("ni,ni->i", Wc, V)
+    num = quad(dA) if type(dA) is not object and dA is not None else jnp.zeros_like(lam)
+    if B is not None and dB is not None:
+        num = num - lam * quad(dB)
+    # |w^H B v| / (||w|| ||v||) is 1/kappa, the reciprocal CONDITION NUMBER of the eigenvalue -- the
+    # cosine of the angle between its left and right eigenvectors. It goes to zero at a DEFECTIVE
+    # eigenvalue, where the derivative does not exist at all: the perturbation series there is in
+    # sqrt(eps), not eps, so no first-order rule can be right. sqrt(eps) is therefore the threshold,
+    # not some arbitrarily small number -- measured on a Jordan-block pencil the cosine came out
+    # 6.7e-09, comfortably above a 1e-12 cutoff, and the "gradient" returned was 1.6e+08. A huge
+    # finite number is the worst possible answer here, so this returns NaN instead.
+    real_dt = jnp.real(jnp.zeros((), denom.dtype)).dtype
+    eps = jnp.finfo(real_dt).eps
+    scale = jnp.maximum(jnp.linalg.norm(Wc, axis=0) * jnp.linalg.norm(V, axis=0), jnp.finfo(real_dt).tiny)
+    safe = jnp.abs(denom) > jnp.sqrt(eps) * scale
+    # The NaN goes in the DENOMINATOR, not in a where-branch. `where(safe, num/denom, nan)` puts it in
+    # a CONSTANT branch, and constants transpose to zero under reverse mode -- measured, that returned
+    # a gradient of exactly 0.0 for a defective eigenvalue, which is precisely the silent answer this
+    # guard exists to prevent. Dividing by NaN keeps the tangent LINEAR in `num`, so the transpose
+    # carries it into `jax.grad`.
+    return lam, num / jnp.where(safe, denom, jnp.nan)
+
+
+def _arnoldi_backend(inner_solve, sigma):
+    """Which host kernel ARPACK's ``OPinv`` should use -- or ``None`` for ARPACK's own SuperLU."""
+    if inner_solve is None:
+        return None
+    if sigma is None:
+        raise ValueError(
+            "jno.solve.eigs: linear= only applies to the shift-invert path, and no sigma= was given. "
+            "Without a shift there is no (K - sigma*M) to factor -- Arnoldi runs on plain matvecs. "
+            "Pass sigma= to target a region, or drop linear=."
+        )
+    backend = getattr(inner_solve, "traits", {}).get("host_kernel", "__missing__")
+    name = getattr(inner_solve, "name", type(inner_solve).__name__)
+    if backend == "__missing__" or not getattr(inner_solve, "direct", False):
+        raise ValueError(
+            f"jno.solve.eigs: linear={name} cannot drive the non-symmetric shift-invert. ARPACK asks "
+            "for (K - sigma*M)^-1 as an operator it applies every step, which wants ONE factorization "
+            "reused -- an iterative solver would need a tolerance tight enough to erase the saving. "
+            'Use jno.solve.lu(backend="pardiso") (fastest factorization), "cudss" (fastest repeated '
+            'solve, which is what this loop does) or "host".'
+        )
+    if backend is None:
+        raise ValueError(
+            'jno.solve.eigs: linear=jno.solve.lu(backend="device") cannot drive the non-symmetric '
+            "shift-invert -- it is a JAX primitive and ARPACK calls its operator from host code, "
+            'outside any trace. Use backend="pardiso", "cudss" or "host".'
+        )
+    return backend
+
+
+def _arnoldi_opinv(shifted, backend, np, spla):
+    """``(K - sigma*M)^-1`` as a scipy ``LinearOperator`` backed by a jNO host kernel.
+
+    This is why the kernels were written as plain numpy functions: ARPACK calls back into Python from
+    Fortran, so anything reached from here must work OUTSIDE a JAX trace. The backends' sparsity-keyed
+    caches then do the rest -- the factorization happens on the first application and every subsequent
+    Arnoldi step is a solve against it, which is exactly the workload cuDSS is fastest at.
+    """
+    import scipy.sparse as sp
+
+    if backend == "host":
+        lu = spla.splu(sp.coo_matrix(shifted).tocsc())
+        return spla.LinearOperator(shifted.shape, matvec=lu.solve, dtype=shifted.data.dtype)
+
+    from .linear import _cudss_available, _cudss_host_solve, _pardiso_available, _pardiso_host_solve
+
+    available, kernel = {
+        "cudss": (_cudss_available, _cudss_host_solve),
+        "pardiso": (_pardiso_available, _pardiso_host_solve),
+    }[backend]
+    if not available():
+        raise ImportError(
+            f"jno.solve.eigs: linear=jno.solve.lu(backend={backend!r}) needs that backend installed. "
+            "Install it with `pip install jax-numerical-operators[fem]`, or use backend='host'."
+        )
+    data = np.ascontiguousarray(shifted.data)
+    idx = np.ascontiguousarray(np.stack([shifted.row, shifted.col], axis=1))
+    shape = tuple(int(v) for v in shifted.shape)
+    return spla.LinearOperator(
+        shape,
+        matvec=lambda b: kernel(data, idx, np.asarray(b).reshape(-1), shape, False),
+        dtype=data.dtype,
+    )
+
+
+def nonsymmetric_geneigh(K, M, k: int, sigma, which: str = "smallest", *, inner_solve=None, tol: float = 0.0, maxiter=None):
+    """The ``k`` eigenpairs of a **NON-self-adjoint** pencil ``K x = lambda M x`` -- COMPLEX spectrum.
+
+    Everything else in this module reduces the *symmetric* pencil, and both of those reductions
+    Hermitianize by construction, so on a non-self-adjoint operator they answer a different question:
+    measured on a deliberately non-symmetric ``K``, the values returned were exactly the spectrum of
+    ``1/2(K+K^T)`` and **not one of them was an eigenvalue of** ``K``, whose true spectrum was complex.
+    That is the case this function exists for, and it is the normal case in plasma and flow stability
+    -- resistive tearing, drift waves, anything with a mean flow -- where the answer *is* a complex
+    growth rate and its sign is the physics.
+
+    Implicitly-restarted Arnoldi (Lehoucq & Sorensen, *SIAM J. Matrix Anal. Appl.* 17(4):789, 1996)
+    via ARPACK, reached through ``scipy.sparse.linalg.eigs``. Arnoldi rather than Lanczos precisely
+    because it does not assume self-adjointness: it builds a Hessenberg (not tridiagonal) projection
+    and so admits complex Ritz values. With ``sigma`` it runs the same Ericsson-Ruhe spectral
+    transformation the symmetric path uses, ``theta = 1/(lambda-sigma)``, which is what makes INTERIOR
+    eigenvalues reachable -- and interior is where a stability threshold lives.
+
+    **Runs on the host** through a ``pure_callback``: ARPACK is Fortran, and this is a small dense-ish
+    reduction over a handful of vectors, not a per-iteration inner loop. Consequences, stated plainly:
+
+    * **The EIGENVALUES are differentiable, in reverse mode.** ``dlambda = w^H (dA - lambda dB) v /
+      (w^H B v)`` for a simple eigenvalue (Wilkinson 1965, ch. 2), attached by a ``custom_jvp`` over
+      the host solve; verified against finite differences to 1e-09. The eigenVECTORS are not -- their
+      derivative needs the rest of the spectrum -- and differentiating through them yields **NaN**
+      rather than the silent zero the plain callback would give. Because that guard is a
+      ``custom_vjp``, **forward mode (``jax.jvp``/``jacfwd``) is unavailable on this function**; use
+      ``jax.grad``/``jacrev``, which is what an inverse problem wants anyway.
+    * A **defective** eigenvalue has no derivative at all (its perturbation series runs in
+      ``sqrt(eps)``), and it is detected by the eigenvalue condition number ``|w^H B v|/(||w|| ||v||)``
+      falling below ``sqrt(eps)``: the gradient is NaN there rather than the enormous finite number
+      the formula would otherwise produce (measured 1.6e+08 on a Jordan-block pencil).
+    * **``linear=`` selects the shift-invert factorization.** ARPACK asks for ``(K-sigma*M)^-1`` as an
+      operator and applies it once per Arnoldi step, so this is the "factor once, solve many" shape:
+      the factorization is built on the first application and every later step reuses it through the
+      backend's sparsity-keyed cache. ``jno.solve.lu(backend="cudss"/"pardiso"/"host")`` are accepted,
+      because those kernels are plain numpy-level functions that a host callback can call directly.
+      ``backend="device"`` and the Krylov solvers are not: the first is a JAX primitive with no
+      host-callable form, and an iterative inner solve would need tolerances tight enough to erase
+      the saving. Both raise rather than being quietly ignored.
+
+      **It is opt-in because it is not always a win, measured.** ARPACK applies the inverse ~50-70
+      times per run, so the trade is one fast factorization against a per-application overhead. On a
+      non-symmetric convection-like operator with PARDISO behind it: at n=3,000 **0.72x** (slower --
+      scipy SuperLU factors that quickly enough that the overhead dominates), at n=20,000 **10.05x**
+      (21.6 s against 217 s). Leave ``linear=None`` for small pencils; reach for it when the
+      factorization is what hurts.
+    * ARPACK needs ``k < n-1``; smaller pencils take an exact dense ``scipy.linalg.eig``.
+
+    Returns ``(lam, V)`` with **complex** dtype always -- a real return would be a lie about what a
+    non-self-adjoint operator can produce, even when a particular spectrum happens to come out real.
+    """
+    import numpy as np
+
+    from .solver_api import LinearOperator
+
+    n = int(K.shape[0])
+    if k < 1 or k > n:
+        raise ValueError(f"jno.solve.eigs: k={k} out of range for an operator of size {n}.")
+    if sigma is None:
+        _which_code(which)  # eagerly: a bad `which` must raise plainly, not wrapped by the callback
+    backend = _arnoldi_backend(inner_solve, sigma)
+    Kd = _as_dense_dtype(K)
+    cdt = np.complex128 if jnp.finfo(jnp.zeros((), Kd).dtype).bits == 64 else np.complex64
+
+    def _host(Kh, Mh):
+        import scipy.linalg as sla
+        import scipy.sparse as sp
+        import scipy.sparse.linalg as spla
+
+        A = np.asarray(Kh)
+        B = None if Mh is None or np.ndim(Mh) == 0 else np.asarray(Mh)
+        if n <= max(64, 4 * k + 16) or k >= n - 1:
+            # exact, and cheaper than an iteration at this size -- mirrors the symmetric path's cutoff
+            lam, V = sla.eig(A, B)
+            order = np.argsort(np.abs(lam - sigma)) if sigma is not None else _which_order(lam, which)
+            idx = order[:k]
+            lam, V = lam[idx], V[:, idx]
+            W = _left_eigenvectors(A, B, lam, V, np, sp, spla, sla, dense=True)
+            return lam.astype(cdt), V.astype(cdt), W.astype(cdt)
+        As = sp.csr_matrix(A)
+        Bs = sp.csr_matrix(B) if B is not None else None
+        opinv = None
+        if backend is not None:
+            # ARPACK wants (K - sigma*M)^-1 as something it can APPLY; hand it a jNO backend so the
+            # one factorization it needs is the fast one, and every Arnoldi step reuses it.
+            Ms = Bs if Bs is not None else sp.identity(n, format="csr", dtype=As.dtype)
+            opinv = _arnoldi_opinv((As - sigma * Ms).tocoo(), backend, np, spla)
+        try:
+            lam, V = spla.eigs(
+                As,
+                k=k,
+                M=Bs,
+                sigma=sigma,
+                which="LM" if sigma is not None else _which_code(which),
+                tol=tol,
+                maxiter=maxiter,
+                OPinv=opinv,
+            )
+        except RuntimeError as exc:
+            if "singular" not in str(exc).lower():
+                raise
+            raise RuntimeError(
+                f"jno.solve.eigs: shift-invert failed because K - {sigma}*M is exactly singular, "
+                f"i.e. sigma={sigma} IS an eigenvalue. Shift-invert needs to factor that matrix, so "
+                "the shift must not sit exactly on the spectrum. Move sigma slightly off it (the "
+                "transformation still makes nearby eigenvalues dominant, so a small offset costs "
+                "nothing)."
+            ) from exc
+        order = np.argsort(np.abs(lam - sigma)) if sigma is not None else _which_order(lam, which)
+        lam, V = lam[order], V[:, order]
+        W = _left_eigenvectors(As, Bs, lam, V, np, sp, spla, sla, dense=False)
+        return lam.astype(cdt), V.astype(cdt), W.astype(cdt)
+
+    Kop = K if isinstance(K, LinearOperator) else LinearOperator(K)
+    Kdense = Kop.dense() if hasattr(Kop, "dense") else jnp.asarray(K)
+    Mdense = None
+    if M is not None:
+        Mop = M if isinstance(M, LinearOperator) else LinearOperator(M)
+        Mdense = Mop.dense() if hasattr(Mop, "dense") else jnp.asarray(M)
+
+    lam, V, W = jax.pure_callback(
+        _host,
+        (
+            jax.ShapeDtypeStruct((k,), cdt),
+            jax.ShapeDtypeStruct((n, k), cdt),
+            jax.ShapeDtypeStruct((n, k), cdt),
+        ),
+        jax.lax.stop_gradient(Kdense),
+        jax.lax.stop_gradient(jnp.zeros(()) if Mdense is None else Mdense),
+    )
+    # the decomposition itself is a host callback and carries no derivative; attach the analytic
+    # eigenvalue rule here, with lam/V/W entering as constants
+    lam = _attach_eigenvalue_grad(Kdense, Mdense, lam, V, W)
+    return lam, _no_eigenvector_grad(V, Kdense)
+
+
+def _which_code(which: str) -> str:
+    """jNO's ``which`` -> ARPACK's. Magnitude, not algebraic order: a complex spectrum has no order."""
+    table = {"smallest": "SM", "largest": "LM", "SM": "SM", "LM": "LM", "LR": "LR", "SR": "SR"}
+    if which not in table:
+        raise ValueError(
+            f"jno.solve.eigs: which={which!r} is not available for a NON-symmetric operator. Use "
+            "'smallest'/'largest' (by |lambda|), 'LR'/'SR' (by real part -- the growth rate, which is "
+            "usually what a stability question asks for), or pass sigma= to target an interior region."
+        )
+    return table[which]
+
+
+def _which_order(lam, which: str):
+    import numpy as np
+
+    if which in ("largest", "LM"):
+        return np.argsort(-np.abs(lam))
+    if which == "LR":
+        return np.argsort(-lam.real)
+    if which == "SR":
+        return np.argsort(lam.real)
+    return np.argsort(np.abs(lam))
+
+
 def shift_invert_geneigh(
     K, M, k: int, sigma: float, *, inner_solve=None, tol: float = 1e-6, maxiter: int = 200, seed: int = 0
 ):
@@ -405,8 +804,14 @@ def shift_invert_geneigh(
         from .linear import host_lu_solve
 
         inner = lambda b: host_lu_solve(A_sig, b)  # noqa: E731  factorized once (content-keyed cache)
+        block_inner = None
     else:
         inner = lambda b: inner_solve(A_sig, b)  # noqa: E731
+        # A solver advertising ``multi_rhs`` takes the WHOLE subspace block in one call. This is the
+        # method's inner loop -- one application of C per sweep, m columns each -- and a factorization
+        # solved as a block beats the same factorization solved column by column by 1.9x at m=4 rising
+        # to 5.5x at m=32 (cuDSS, measured). Solvers without the trait keep the column loop.
+        block_inner = inner if getattr(inner_solve, "traits", {}).get("multi_rhs") else None
 
     # Block shift-invert SUBSPACE ITERATION (Bathe & Wilson, *Solution methods for eigenvalue
     # problems in structural mechanics*, IJNME 6 (1973) — the classical pairing with the Ericsson-Ruhe
@@ -423,8 +828,13 @@ def shift_invert_geneigh(
     dt = _as_dense_dtype(K)
     eps = jnp.finfo(dt).eps
 
-    def _apply_C(V):  # C V = (K−σM)⁻¹ M V, column-wise: the host-factorized inner solve has no vmap rule
-        return jnp.stack([inner(Mmv(V[:, i])) for i in range(m)], axis=1)
+    def _apply_C(V):  # C V = (K−σM)⁻¹ M V
+        MV = jnp.stack([Mmv(V[:, i]) for i in range(m)], axis=1)
+        if block_inner is not None:  # one block solve, not m of them
+            return block_inner(MV)
+        # column-wise otherwise: the host-factorized inner solve runs through a ``pure_callback``,
+        # which has no vmap batching rule, so a static unrolled loop is what is available
+        return jnp.stack([inner(MV[:, i]) for i in range(m)], axis=1)
 
     def sweep(state):
         i, V, _res, _lam = state

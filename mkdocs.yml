@@ -148,3 +148,4 @@ nav:
       - Overview: tutorials/10-bayesian-pinns/index.md
       - Bayesian Inverse Coefficient: tutorials/10-bayesian-pinns/bayesian-inverse-coefficient.md
   - API Reference: API.md
+  - For LLMs: llm.md

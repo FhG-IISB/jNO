@@ -14,7 +14,6 @@ class statistics:
         history.training_logs         # list of per-solve()-call dicts
         history.training_logs[-1]["total_loss"]   # full array from last call
         history.plot("./runs/loss.png")           # quick visualization
-        history.summary()                          # printed run summary
     """
 
     def __init__(self, logs):

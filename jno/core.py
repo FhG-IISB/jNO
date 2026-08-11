@@ -2890,7 +2890,7 @@ class core:
                         nll, _ = _adapt_loss_fn(full, _adapt_ctx, _key)
                         return -_h.likelihood_scale * nll + _h.prior_fn(p)
 
-                # Master PRNG: user-supplied key wins; else derived
+                # Main PRNG: user-supplied key wins; else derived
                 # from self.rng so multi-init runs stay reproducible.
                 _user_key = getattr(_fm, "_bayesian_initializer_key", None)
                 if _user_key is None:

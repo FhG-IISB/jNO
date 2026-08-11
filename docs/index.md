@@ -29,7 +29,7 @@ instead of living in separate frameworks.
 
 -   :material-book-open-page-variant-outline: **[Tutorials](#tutorials)**
 
-    ~50 worked examples across elliptic, parabolic, hyperbolic, coupled,
+    29 worked examples across elliptic, parabolic, hyperbolic, coupled,
     inverse, integral, stochastic, FEM, and Bayesian problems.
 
 -   :material-language-python: **[API Reference](API.md)**

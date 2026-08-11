@@ -2,7 +2,7 @@
 
 <div class="hero-actions" markdown>
 <a class="md-button md-button--primary" href="/jNO/tutorial_examples/04_hyperbolic/burgers_viscous_1d.py" download>Download .py</a>
-<a class="md-button" href="/jNO/tutorials/04-hyperbolic/">Back to chapter</a>
+<a class="md-button" href="/jNO/#tutorials">All tutorials</a>
 </div>
 
 This example solves the viscous Burgers equation with a manufactured exact solution and demonstrates **RAD adaptive resampling** — a technique that concentrates collocation points in high-residual regions to accelerate convergence.
@@ -87,7 +87,7 @@ The trained network reproduces the manufactured travelling profile at every time
 
 <div class="hero-actions" markdown>
 <a class="md-button md-button--primary" href="/jNO/tutorial_examples/04_hyperbolic/burgers_viscous_1d.py" download>Download full script</a>
-<a class="md-button" href="/jNO/tutorials/04-hyperbolic/">Back to 04 Hyperbolic</a>
+<a class="md-button" href="/jNO/#tutorials">All tutorials</a>
 </div>
 
 ## Script Snippet

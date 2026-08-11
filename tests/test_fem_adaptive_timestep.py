@@ -255,7 +255,7 @@ def test_adaptive_real_vector():
 
 
 def test_adaptive_real_periodic():
-    """Periodic ties pre-reduce the block; adaptive marches the reduced master-DOF space (``block.step``
+    """Periodic ties pre-reduce the block; adaptive marches the reduced main-DOF space (``block.step``
     runs there), transparently — same reduced trajectory shape as the default stepper, no NaN."""
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.25, time=(0.0, 0.05, 6))
     u, phi = d.fem_symbols()

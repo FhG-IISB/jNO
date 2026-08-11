@@ -52,14 +52,14 @@ def _periodic_box(size=0.3):
 
 
 def test_periodic_n1e_reduces_and_is_symmetric_pd():
-    """Periodic ties on an N1E field eliminate the slave-face edge DOFs (``n_red < n_full``) and the reduced
+    """Periodic ties on an N1E field eliminate the secondary-face edge DOFs (``n_red < n_full``) and the reduced
     curl-curl + mass operator PᵀAP stays symmetric positive-definite. The box is auto-re-meshed conforming."""
     from jno.utils.solver.fem_utils import reduce_matrix_periodic
 
     d, vol, ties = _periodic_box(0.3)
     fem = jno.fem([vol, *ties])  # triggers the conforming re-mesh + edge reduction
     per = fem._periodic
-    assert per is not None and per["n_red"] < per["n_full"], "periodic reduction eliminated no slave-face edges"
+    assert per is not None and per["n_red"] < per["n_full"], "periodic reduction eliminated no secondary-face edges"
 
     A_red = _dense(reduce_matrix_periodic(per, fem.A))
     assert A_red.shape == (per["n_red"], per["n_red"])
