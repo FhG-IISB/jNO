@@ -58,6 +58,11 @@ from .trace import (
 __all__ = ["fem", "FEM"]
 
 
+def _any_step_slot(x0, nonlinear, linear, precond, time) -> bool:
+    """Is any slot that configures the PER-STEP solve set? (``tau=`` configures the march instead.)"""
+    return any(s is not None for s in (x0, nonlinear, linear, precond, time))
+
+
 def _default_newton(residual_fn, u0):
     """The operator's own default nonlinear driver, called explicitly.
 
@@ -1274,6 +1279,7 @@ class FEM:
         linear=None,
         precond=None,
         time=None,
+        tau=None,
         basis=None,
         shard=None,
         profile=False,
@@ -1428,6 +1434,7 @@ class FEM:
                     linear=linear,
                     precond=precond,
                     time=time,
+                    tau=tau,
                     shard=shard,
                     **kwargs,
                 )
@@ -1574,6 +1581,7 @@ class FEM:
         linear=None,
         precond=None,
         time=None,
+        tau=None,
         shard=None,
         **kwargs,
     ):
@@ -1584,6 +1592,7 @@ class FEM:
             or (linear is not None)
             or (precond is not None)
             or (time is not None)
+            or (tau is not None)
         )
         if getattr(self, "_geometry", None):
             # A geometry term (`coord.d(t) - velocity`) states that the mesh moves. Its driver owns the
@@ -1636,7 +1645,10 @@ class FEM:
             # (complex) recovered-gradient gap; only the anisotropic Hessian metric is real-only (guarded in
             # run_adaptive_solve).
             return run_adaptive_solve(self, adapt, solve_fn=solve_fn, **kwargs)
-        if has_slots:
+        # `tau=` sizes the load-path steps; it configures the MARCH, not the per-step solve, so it is
+        # consumed below rather than composed into `solve_fn` (and on its own it must not force the
+        # composition, which would replace the operator's default driver with an explicit equivalent).
+        if has_slots and not (tau is not None and not _any_step_slot(x0, nonlinear, linear, precond, time)):
             solve_fn, kwargs = self._compose_slots(
                 solve_fn,
                 x0=x0,
@@ -1678,7 +1690,13 @@ class FEM:
                 )
             from .utils.solver.history_march import run_history_march
 
-            return run_history_march(self, solve_fn if from_slots else solve_fn)
+            return run_history_march(self, solve_fn if from_slots else solve_fn, path=tau)
+        if tau is not None:
+            raise ValueError(
+                "fem.solve(tau=...) sizes the steps of a pseudo-time LOAD-PATH march, but this form does "
+                "not march one: the march is triggered by step history (`.i(k)` in the terms) together "
+                "with a `domain(tau=(start, end, n))` grid. Add both, or drop tau=."
+            )
         if from_slots and getattr(precond, "complex_native", False) and self._complex_legs is not None:
             # A complex-native preconditioner (AMS) solves the sparse COMPLEX operator ``A_r + i·A_i``
             # directly, never the real-equivalent block — so it wants the Re/Im legs the fusion retained,
@@ -1826,6 +1844,16 @@ class FEM:
         if time is not None and self._mode != "transient":
             raise ValueError(
                 f"fem.solve(time=...) picks a time-integration scheme, but this problem is {self._mode}, not transient."
+            )
+        if time is not None and getattr(time, "limit", None) is not None:
+            # Checked here rather than in the scheme, because not every transient route reaches a
+            # scheme's own `integrate` — and applying the wrong step-size criterion silently would be a
+            # plausible wrong answer, which is exactly what this codebase refuses to do.
+            raise ValueError(
+                "fem.solve(time=jno.solve.adaptive(limit=...)): `limit` bounds the per-step SOLUTION "
+                "CHANGE on a pseudo-time LOAD PATH, and belongs in the `tau=` slot of a "
+                "`domain(tau=...)` march. A transient is sized by its local truncation error instead — "
+                "drop `limit` and use rtol/atol here."
             )
         if self._mode == "transient":
             # thread the slots into the default theta-stepper as per-step solvers: the linear
@@ -2211,6 +2239,17 @@ class FEM:
         if shapes and idx < len(shapes):
             return shapes[idx]
         return ()
+
+    @property
+    def tau_schedule(self):
+        """The load-path τ values the last ``fem.solve(tau=...)`` actually stepped through (``None`` if
+        no adaptive/explicit path has run).
+
+        Pass it straight back as ``fem.solve(tau=fem.tau_schedule)`` to replay that schedule — which is
+        how a *differentiable* run gets an adapted path, since the pilot that discovers one needs
+        concrete values and a differentiable solve has only tracers."""
+        s = getattr(self, "_tau_schedule", None)
+        return None if s is None else np.asarray(s)
 
     # ---- box constraints (``u.bounds(lo, hi)``) -------------------------------------------------
     def _bounded_solve_fn(self, solve_fn):

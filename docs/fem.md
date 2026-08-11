@@ -1770,6 +1770,53 @@ field-agnostic.
 Not carried, each rejected with a clear error: a real `u.t` transient (drive time through `tau` instead),
 a complex form, 1D, non-nodal (Argyris/Morley/edge) elements, VPINN, and periodic ties.
 
+**Adaptive load stepping — `fem.solve(tau=jno.solve.adaptive(limit=...))`.** A uniform load grid is
+wrong in both directions at once: it wastes steps while nothing happens and takes too-large ones through
+the event. On a path-dependent march that second failure is not merely coarse — a step can converge
+perfectly and skip the entire transition, leaving a valid sequence of equilibria with no resolved event
+between them, which is a *different* answer, not a coarser one.
+
+```python
+sol = fem.solve(tau=jno.solve.adaptive(limit=0.05))            # bound every DOF's per-step change
+sol = fem.solve(tau=jno.solve.adaptive(limit=[(dm, 0.05)]))    # per field — the usual case
+```
+
+The criterion is deliberately not the transient's. A rate-independent load path has **no local
+truncation error to estimate** — each step is an equilibrium, not an approximation to a trajectory — so
+the `rtol`/`atol` step-doubling estimate that sizes `time=` measures nothing here. `limit` bounds how
+much the solution may change in one step; a step is rejected (and cut by `shrink`) when the solve fails
+to converge *or* the change exceeds `limit`, and a comfortable step grows by `grow`.
+
+Mechanism: **pilot → freeze → replay**. March eagerly with rejection to discover the schedule, freeze
+it, replay it as a fixed-length differentiable scan. Rejection is exactly why the pilot must be
+separate: the transient marcher accepts every attempt on purpose, because a discarded state makes the
+per-step adjoint run at zero cotangent and returns a NaN gradient. The replay has nothing to reject.
+The schedule is piecewise constant in the parameters, so the gradient over a frozen one is the true
+derivative almost everywhere — the same contract `adapt=` makes for a frozen mesh sequence.
+
+The trajectory is resampled back onto the domain's declared `tau=` grid (as the transient resamples onto
+`save_ts`), so the returned shape does not depend on the steps taken and the resampling error is bounded
+by `limit` itself. `fem.tau_schedule` reports what the pilot chose.
+
+**A parametric form refuses to pilot, by design.** The pilot needs concrete values to accept or reject a
+step and a differentiable solve hands it tracers; piloting at the parameters' *stored* values would
+silently adapt to whatever they happen to be — 0.0 for a fresh `jno.np.parameter`, i.e. a load path that
+never happened. Discover the schedule forward, then replay it:
+
+```python
+fem.solve(tau=jno.solve.adaptive(limit=0.05))   # forward, at the values you want
+fem.solve(tau=fem.tau_schedule)                 # differentiable replay of that schedule
+```
+
+`tau=<array>` accepts any strictly increasing grid spanning the declared path, so it doubles as the
+"non-uniform grid I chose myself" spelling. Not composable with a per-load-step field
+(`freeze_path(frames)`), whose frames are indexed by the declared step count.
+
+Note what adaptivity does **not** fix. If the step is cut to the floor and the change still exceeds
+`limit`, that is an **unstable branch**, not a step that is merely too big: under load control a
+snap-back has no nearby equilibrium, so no refinement finds one. The error says so and points at
+displacement/arc-length control, which is a different instrument and is not built.
+
 Keep `dm` in range with [`dm.bounds(0, 1)`](#inequalities--uboundslo-hi), which composes with the march.
 Note that the bound does **not** replace the floor `eta` on the degradation: at `dm = 1` exactly,
 `(1-dm)²` makes the displacement block singular, so the floor is a well-posedness requirement in its own

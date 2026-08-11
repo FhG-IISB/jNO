@@ -121,10 +121,17 @@ class _AdaptiveScheme(_TimeScheme):
     the bare :func:`jno.solve.adaptive` produces — means "whatever θ-step the assembly picked for this
     block", which is backward Euler for a parabolic block and trapezoidal for a second-order one."""
 
-    def __init__(self, base, rtol: float, atol: float, max_steps: int, dt0: float | None = None):
+    def __init__(
+        self, base, rtol: float, atol: float, max_steps: int, dt0: float | None = None, limit=None, shrink=0.5, grow=1.5
+    ):
         self.base = base
         self.rtol, self.atol, self.max_steps = float(rtol), float(atol), int(max_steps)
         self.dt0 = None if dt0 is None else float(dt0)
+        # `limit` switches the controller from Richardson local error (a TIME-accuracy notion, meaningless
+        # on a rate-independent load path) to a bound on how much the solution may change in one step.
+        # Only the `tau=` load-path slot reads it; `time=` rejects it. See `jno.solve.adaptive`.
+        self.limit = limit
+        self.shrink, self.grow = float(shrink), float(grow)
 
     def base_for(self, block):
         """The base scheme this will actually step with — ``self.base``, or the block's own θ-step."""
@@ -137,6 +144,13 @@ class _AdaptiveScheme(_TimeScheme):
         raise NotImplementedError("this scheme is already adaptively sized; .adaptive() does not nest.")
 
     def integrate(self, block, args, save_ts, *, linear_solve=None, nonlinear_solve=None):
+        if self.limit is not None:
+            raise ValueError(
+                "fem.solve(time=jno.solve.adaptive(limit=...)): `limit` bounds the per-step SOLUTION CHANGE "
+                "on a pseudo-time load path (`fem.solve(tau=...)` over a `domain(tau=...)` march). A "
+                "transient is sized by the local truncation error instead — drop `limit` and use "
+                "rtol/atol, or move the spec to the tau= slot."
+            )
         s0f = getattr(block, "state0_fn", None)
         u0 = jnp.asarray(s0f(args) if s0f is not None else block.state0).reshape(-1)
         base = self.base_for(block)

@@ -1030,7 +1030,16 @@ def exponential(*, order: int = 40, mass: str = "lumped", symmetric: bool = True
     return _ExponentialScheme(order, mass, symmetric)
 
 
-def adaptive(*, rtol: float = 1e-4, atol: float = 1e-6, max_steps: int = 1000, dt0: float | None = None):
+def adaptive(
+    *,
+    rtol: float = 1e-4,
+    atol: float = 1e-6,
+    max_steps: int = 1000,
+    dt0: float | None = None,
+    limit=None,
+    shrink: float = 0.5,
+    grow: float = 1.5,
+):
     """**Adaptive step-size** time scheme for ``fem.solve(time=...)``: the step size is chosen per step
     from a **step-doubling** (Richardson) local-error estimate — one full step compared with two
     half-steps — so a stiff / sharp / multi-rate transient takes small steps only where it needs them and
@@ -1081,7 +1090,27 @@ def adaptive(*, rtol: float = 1e-4, atol: float = 1e-6, max_steps: int = 1000, d
     dt matches or beats it at equal work, because the optimal step size is nearly constant and the error
     estimate costs 3x. Reach for ``adaptive`` when you **cannot** pick dt in advance — unknown or
     parameter-dependent stiffness, sweeps, inverse problems whose fitted parameter moves the timescale —
-    not as a speed optimization."""
+    not as a speed optimization.
+
+    **On a pseudo-time LOAD PATH** — ``fem.solve(tau=jno.solve.adaptive(limit=...))`` on a
+    ``domain(tau=...)`` history march — the criterion is different, and it has to be. A rate-independent
+    load path has no local truncation error to estimate: each step is an *equilibrium*, not an
+    approximation to a trajectory, so Richardson measures nothing. ``limit`` instead bounds how much the
+    solution may change in one step::
+
+        fem.solve(tau=jno.solve.adaptive(limit=0.05))            # every DOF
+        fem.solve(tau=jno.solve.adaptive(limit=[(dm, 0.05)]))    # per field — the usual case
+
+    A step is **rejected** (and the step size cut by ``shrink``) when the solve fails to converge or the
+    change exceeds ``limit``; a comfortable step grows by ``grow``. That matters beyond cost: with a
+    fixed grid a step can converge perfectly and still skip an entire propagation event, giving a valid
+    sequence of equilibria with no resolved event between them — and because the march is path-dependent
+    (history + irreversibility), that is a different answer, not just a coarser one.
+
+    ``limit`` is **required** in the ``tau=`` slot and rejected in ``time=`` (and vice versa for
+    ``rtol``/``atol``) — the two controllers measure different things and silently applying one where the
+    other was meant would be a plausible wrong answer.
+    """
     from .utils.solver.timeschemes import _AdaptiveScheme
 
-    return _AdaptiveScheme(None, rtol, atol, max_steps, dt0)
+    return _AdaptiveScheme(None, rtol, atol, max_steps, dt0, limit=limit, shrink=shrink, grow=grow)
