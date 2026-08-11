@@ -104,6 +104,45 @@ _LOCAL_FACES_TRI = ((0, 1, 2), (1, 2, 0), (2, 0, 1))
 # ---------------------------------------------------------------------------
 
 
+def _gmsh_to_basix_perm(pts: np.ndarray, cells_c: np.ndarray, dim: int, order: int) -> np.ndarray:
+    """Column permutation taking gmsh's higher-order node order to basix's DOF order.
+
+    The two disagree, and silently. For a P2 triangle the reference nodes come out::
+
+        basix:  (0,0) (1,0) (0,1) | (0.5,0.5) (0,0.5)   (0.5,0)
+        gmsh:   (0,0) (1,0) (0,1) | (0.5,0)   (0.5,0.5) (0,0.5)
+
+    so using gmsh's cells directly pairs each geometry node with the wrong shape function. Nothing
+    errors -- the Jacobian is simply built from a scrambled map, and the only symptom is a wrecked
+    convergence rate (measured: L2 got *worse* than straight-sided, converging at 1.8x per halving
+    instead of 8x).
+
+    Derived numerically rather than hard-coded from two conventions: each node's reference coordinate
+    is recovered through the cell's own affine vertex map and matched to
+    :func:`lagrange_interp_points`. A curved cell displaces its midside nodes by O(h²), far below the
+    O(1) spacing of the reference points, so the nearest match stays unambiguous. Several cells are
+    checked and must agree, which is what turns a silent mis-order into a loud failure.
+    """
+    ref = np.asarray(lagrange_interp_points(dim, order), dtype=float)  # (n_loc, dim), basix DOF order
+    n_loc = ref.shape[0]
+    if cells_c.shape[1] != n_loc:
+        raise ValueError(f"curved cells have {cells_c.shape[1]} nodes but the P{order} element wants {n_loc}.")
+
+    perm = None
+    for cell in cells_c[: min(8, len(cells_c))]:
+        v = pts[cell[: dim + 1]]
+        jac = np.column_stack([v[i + 1] - v[0] for i in range(dim)])
+        local = np.linalg.solve(jac, (pts[cell] - v[0]).T).T  # (n_loc, dim) reference coords
+        near = np.argmin(((ref[:, None, :] - local[None, :, :]) ** 2).sum(-1), axis=1)  # basix -> gmsh
+        if sorted(near.tolist()) != list(range(n_loc)):
+            raise ValueError("curved cell nodes do not match the reference element one-to-one.")
+        if perm is None:
+            perm = near
+        elif not np.array_equal(perm, near):
+            raise ValueError("gmsh's higher-order node order is not consistent across cells.")
+    return np.asarray(perm)
+
+
 def _get_mesh(domain, dim: int, order: int):
     """P1 base mesh + optionally promoted P{order} mesh, both as NumPy arrays.
 
@@ -136,13 +175,7 @@ def _get_mesh(domain, dim: int, order: int):
                 f"geometry needs a matching basis: pass element_type='{'TRI6' if dim == 2 else 'TET10'}' "
                 "(or order=2) to jno.fem, or drop .curved() to mesh straight-sided."
             )
-        raise NotImplementedError(
-            "Curved (isoparametric) geometry is meshed and tagged, but the assembler still builds one "
-            "constant Jacobian per cell from its vertices. Solving on it would use chord geometry with "
-            "arc-positioned DOFs -- inconsistent, and wrong in a way no test would flag. The "
-            "per-quadrature-point Jacobian is the next step; drop .curved() until then."
-        )
-        return pts_all, cells_v, pts_all, cells_c  # noqa: B012  (re-enabled with the per-qp Jacobian)
+        return pts_all, cells_v, pts_all, cells_c[:, _gmsh_to_basix_perm(pts_all, cells_c, dim, order)]
 
     pts_p1 = pts_all
     cells_p1 = np.asarray(cd[meshio_key], dtype=np.int64)
@@ -570,6 +603,11 @@ def assemble_fem_native(
 
     pts_f_all = [d[2] for d in mesh_data]  # per-field node coords (P2 or P1)
     cells_f_all = [d[3] for d in mesh_data]  # per-field connectivity
+    # CURVED (isoparametric) geometry: the reference->physical map is the order-2 nodal map, so its
+    # Jacobian VARIES over the cell and must be formed per quadrature point. `_get_mesh` already
+    # refused an order mismatch, so every field here is order 2 and any of them serves as the geometry.
+    _curved = {1: "line3", 2: "triangle6"}.get(dim, "tetra10") in domain.mesh.cells_dict
+    _geom_field = 0
     n_nodes_f = [d[2].shape[0] for d in mesh_data]  # number of DOF nodes per field
     vecs = [int(f["vec"]) for f in fields]
 
@@ -604,7 +642,13 @@ def assemble_fem_native(
     # Element specs and JAX constants
     # -------------------------------------------------------------------------
 
-    specs = [_lagrange_simplex(dim, f["order"], quad_degree) for f in fields]
+    # On a CURVED cell the map is not affine, so `1/detJ` makes the integrand RATIONAL and no rule is
+    # exact any more -- the degree stops being a correctness setting and becomes an accuracy one. Two
+    # extra degrees by default, with `jno.fem(quad_degree=...)` still overriding. Measured on the disk
+    # rate study this changes the answer by <0.01% (7.6721e-06 -> 7.6719e-06 at degree 8), so it is
+    # insurance against a form whose coefficients vary more sharply, not a fix for anything observed.
+    _qd = (quad_degree + 2) if _curved else quad_degree
+    specs = [_lagrange_simplex(dim, f["order"], _qd) for f in fields]
     # All specs share the same simplex quadrature rule (basix is deterministic)
     qp_shared = jnp.asarray(specs[0].quad_points)  # (n_quad, dim)
     qw_shared = jnp.asarray(specs[0].quad_weights)  # (n_quad,)
@@ -1004,11 +1048,20 @@ def assemble_fem_native(
         an element-sized (not global) input — keeping the AD intermediate O(n_local), not
         O(n_dofs). ``pts`` is the (possibly coordinate-parameter-scattered) P1 geometry points;
         it defaults to the static mesh and is overridden per-eval when coordinates are trainable."""
-        verts = pts[cells_j[c]]  # (dim+1, dim)
-        J = jnp.stack([verts[i + 1] - verts[0] for i in range(dim)], axis=1)  # (dim, dim) columns = edges
-        detJ = jnp.linalg.det(J)
-        xq = verts[0][None, :] + qp_shared @ J.T  # (n_quad, dim) physical qp
-        meas = jnp.abs(detJ)
+        if _curved:
+            # x(ξ) = Σ_a x_a N_a(ξ) over the order-2 geometry nodes, so J_dn(ξ) = Σ_a x_a[d] ∂N_a/∂ξ_n
+            # is a function of ξ. Everything downstream that was one number per cell -- detJ, the
+            # measure, the push-forward's J⁻¹ -- becomes one per quadrature point.
+            gverts = pts[cells_f_j[_geom_field][c]]  # (n_geom, dim)
+            J = jnp.einsum("ad,qan->qdn", gverts, ref_grads_all[_geom_field][..., 0, :])  # (n_q, dim, dim)
+            detJ = jnp.linalg.det(J)  # (n_q,)
+            xq = ref_vals_all[_geom_field][..., 0] @ gverts  # (n_q, dim)
+        else:
+            verts = pts[cells_j[c]]  # (dim+1, dim)
+            J = jnp.stack([verts[i + 1] - verts[0] for i in range(dim)], axis=1)  # (dim, dim) columns = edges
+            detJ = jnp.linalg.det(J)
+            xq = verts[0][None, :] + qp_shared @ J.T  # (n_quad, dim) physical qp
+        meas = jnp.abs(detJ)  # scalar (affine) or (n_quad,) (curved)
 
         per = []
         for i in range(len(fields)):
@@ -1169,7 +1222,9 @@ def assemble_fem_native(
         per, xq, meas = _cell_fields(c, cell_sols, pts_j if pts is None else pts)
         # Element size h = |detJ|^(1/dim) at the quad points -> the `dom.cell_size` symbol (SUPG/GLS).
         # Constant w.r.t. the cell DOFs (geometry only), so the per-cell Jacobian sees it as a constant.
-        h_qp = jnp.broadcast_to(meas ** (1.0 / dim), (qw_shared.shape[0], 1))
+        h_qp = jnp.broadcast_to(
+            jnp.reshape(meas ** (1.0 / dim), (-1, 1)), (qw_shared.shape[0], 1)
+        )  # meas: scalar (affine) or per-qp (curved)
         cell_masks = tuple(region_mask_arrays[_region_mask_index[r]][c] for r in rnames)
         loc = {
             "physical_quad_points": xq,
@@ -1214,7 +1269,9 @@ def assemble_fem_native(
         Reverse-mode differentiable in ``local_all`` (the solved DOFs) and the history buffers."""
         cell_sols = _split_cell_local(local_all)
         per, xq, meas = _cell_fields(c, cell_sols)
-        h_qp = jnp.broadcast_to(meas ** (1.0 / dim), (qw_shared.shape[0], 1))
+        h_qp = jnp.broadcast_to(
+            jnp.reshape(meas ** (1.0 / dim), (-1, 1)), (qw_shared.shape[0], 1)
+        )  # meas: scalar (affine) or per-qp (curved)
         loc = {
             "physical_quad_points": xq,
             "fields": per,

@@ -374,6 +374,44 @@ Tutorials: `mixed_poisson_rt_2d.py` (H(div)), `maxwell_nedelec_2d.py` (H(curl): 
 current), and `maxwell_nedelec_3d.py` (the **3-D PEC cube cavity resonator** — recovers `k²=π²(l²+m²+n²)`,
 spurious-free, converging to `2π²` from below).
 
+## Curved (isoparametric) geometry — `Shape.curved()`
+
+By default jNO meshes straight-sided and *synthesises* higher-order nodes at the straight-edge
+midpoints, so the domain stays a polygon however high the element order goes. That approximation
+carries an **O(h²) domain error at every basis order** — it is what caps P2/P3 at second order on a
+round boundary, no matter how good the basis is. `curved()` asks the CAD kernel to place those nodes on
+the true surface instead:
+
+```python
+d = jno.Shape.disk(0, 0, 1, size=0.1).curved().domain()
+u, v = d.fem_symbols(order=2)          # the basis order must MATCH the geometry order
+```
+
+Measured on `-Δu = 1` on the unit disk (exact `u = (1−r²)/4`), RMS nodal error:
+
+| mesh size | straight-sided | curved |
+|---|---|---|
+| 0.4 | 6.73e-03 | 7.63e-05 |
+| 0.2 | 1.66e-03 | 7.67e-06 |
+| 0.1 | 4.23e-04 | 7.36e-07 |
+| **rate per halving** | **≈4× (O(h²))** | **≈10× (O(h³))** |
+
+Straight-sided is capped at second order by the geometry; curved recovers P2's own third order, and is
+**570× more accurate** at the finest resolution.
+
+**Scope — what this does not cover.** Order 2 and simplices only. An **order mismatch is refused**:
+isoparametric means geometry order == basis order, and a curved mesh under a P1 basis puts the midside
+DOF coordinates (on the arc) and the geometric map (from the chord) in disagreement. **Non-nodal
+families keep affine geometry** — Nédélec, RT, Argyris and Morley need Piola/curvature push-forwards
+that are a separate change, so curved EM does *not* benefit yet — and a **4th-order form is refused** on
+a curved cell, because the physical-Hessian transform is derived for an affine map and would gain a
+curvature term it does not carry. **Facet normals are still straight-facet**, so the O(h) normal error
+that affects radiation view factors, flux BCs and RCWA's field decomposition is unchanged by this.
+
+Note also that a curved map makes the integrand rational, so **no quadrature rule is exact** any more.
+The default degree is raised by 2 on curved cells and `jno.fem(quad_degree=...)` still overrides;
+measured on the study above, refining the rule moves the answer by less than 0.01 %.
+
 ### Mesh resolution for wave problems
 
 Because N1E is **lowest order only** (`order=` is refused, above), the mesh is your *only* accuracy

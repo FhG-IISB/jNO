@@ -9,16 +9,34 @@ That polygonal approximation carries an **O(h²)** domain error regardless of ba
 caps P2/P3 at second order on any curved boundary, and leaves facet normals O(h) wrong. ``order=2`` asks
 gmsh to place those nodes on the actual CAD surface instead.
 
-This file covers the **geometry only** — that the nodes land where they should. Using them (the
-per-quadrature-point Jacobian) is the next step; until then the assembler still treats every cell as
-affine, so nothing here changes a solve.
+The assembler forms the Jacobian **per quadrature point** on such a mesh, since the map is no longer
+affine. The gate is a convergence RATE, not an error number: straight-sided P2 is capped at O(h^2) by
+the polygonal domain, curved P2 recovers its own O(h^3).
+
+Deliberately out of scope, and refused rather than approximated: an order mismatch (a P1 basis on
+order-2 geometry), a 4th-order form (the physical-Hessian transform is derived for an affine cell), and
+the non-nodal families. Facet normals are still straight-facet, so the O(h) normal error is untouched.
 """
 
+import jax
 import numpy as np
 import pytest
 
 import jno
 from jno.geometry.emit import build
+
+
+@pytest.fixture(autouse=True)
+def _x64():
+    """The rate study resolves errors down to ~7e-7 on a solution of size 0.25 — below what float32
+    can represent, where the curved and straight results stop being distinguishable (measured: the
+    curved error floors at 5e-5 and moves 4% under a quadrature refinement that should not move it)."""
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
 
 
 def _disk(size, order):
@@ -133,6 +151,46 @@ def _poisson_terms(d, order):
     return [ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(b[0], b[1]) - 0.0]
 
 
+def _poisson_l2(curved, size, quad_degree=None):
+    """-Δu = 1 on the unit disk (exact ``u = (1-r²)/4``), P2. Returns the RMS nodal error."""
+    sh = jno.Shape.disk(0.0, 0.0, 1.0, size=size)
+    d = (sh.curved() if curved else sh).domain()
+    u, v = d.fem_symbols(order=2)
+    c = d.variable("interior", split=True)
+    b = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=c[0], y=c[1]), v.bind(x=c[0], y=c[1])
+    kw = {} if quad_degree is None else {"quad_degree": quad_degree}
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(b[0], b[1]) - 0.0], **kw)
+    sol = np.asarray(fem.solve()).reshape(-1)
+    pts = np.asarray(fem.points)[:, :2]
+    return float(np.sqrt(np.mean((sol - (1.0 - (pts**2).sum(1)) / 4.0) ** 2)))
+
+
+def test_curved_geometry_lifts_p2_from_second_to_third_order():
+    """The gate for the whole feature, and the only unambiguous one: a RATE, not an error number.
+
+    Straight-sided P2 on a curved domain is capped at O(h²) by the polygonal approximation — the basis
+    can do better and the geometry will not let it. With curved geometry the same basis recovers its
+    O(h³). Measured 4.05x / 3.93x per halving against 9.95x / 10.43x."""
+    sizes = (0.4, 0.2, 0.1)
+    straight = [_poisson_l2(False, s) for s in sizes]
+    curved = [_poisson_l2(True, s) for s in sizes]
+
+    for lo, hi in zip(straight, straight[1:]):
+        assert 3.0 < lo / hi < 5.5, f"straight-sided must stay O(h^2), got {lo / hi:.2f}x"
+    for lo, hi in zip(curved, curved[1:]):
+        assert lo / hi > 7.0, f"curved must reach O(h^3), got {lo / hi:.2f}x"
+    assert curved[-1] < straight[-1] / 100.0, "curved must be dramatically more accurate at the finest h"
+
+
+def test_the_result_is_not_limited_by_quadrature():
+    """A curved map makes the integrand rational, so no rule is exact and under-integration would look
+    exactly like a geometry bug. Refining the rule must not move the answer."""
+    base = _poisson_l2(True, 0.2)
+    for qd in (6, 8):
+        assert abs(_poisson_l2(True, 0.2, quad_degree=qd) - base) < 1e-3 * base
+
+
 def test_a_p1_basis_on_a_curved_mesh_is_refused():
     """Isoparametric means geometry order == basis order. A curved mesh under a P1 basis puts the
     midside DOF coordinates (on the arc) and the geometric map (from the chord) in disagreement — an
@@ -142,13 +200,16 @@ def test_a_p1_basis_on_a_curved_mesh_is_refused():
         jno.fem(_poisson_terms(d, 1))
 
 
-def test_the_assembler_refuses_curved_geometry_for_now():
-    """The assembler still builds one constant Jacobian per cell from its vertices. Solving on a
-    curved mesh with that map would use chord geometry with arc-positioned DOFs — wrong in a way no
-    test would flag — so it refuses until the per-quadrature-point Jacobian lands."""
-    d = _curved_disk_domain(0.35)
-    with pytest.raises(NotImplementedError, match="per-quadrature-point Jacobian"):
-        jno.fem(_poisson_terms(d, 2))
+def test_a_fourth_order_form_on_a_curved_cell_is_refused():
+    """The physical-Hessian push-forward is derived for an AFFINE cell (``∂²ξ/∂x² ≡ 0``). On a curved
+    cell it gains a curvature term this does not carry, so Argyris / Morley / phase-field / plates
+    would be wrong with nothing to flag it."""
+    from jno.utils.solver.fem_lagrange import identity_pushforward_hess
+
+    ref_hess = np.zeros((3, 6, 1, 2, 2))
+    identity_pushforward_hess(ref_hess, np.eye(2))  # affine: fine
+    with pytest.raises(NotImplementedError, match="AFFINE cell"):
+        identity_pushforward_hess(ref_hess, np.broadcast_to(np.eye(2), (3, 2, 2)))
 
 
 @pytest.mark.parametrize("size", [1.2, 0.8])
