@@ -1661,9 +1661,13 @@ jno.fem([
 The running `maximum` is what makes it irreversible: at zero load the damage is retained rather than
 healing. Note the block order is *first appearance in the term walk* — here `dm` precedes `u`, because the
 degradation factor is written first — so resolve a block with `fem.block_index(dm)`, never a hardcoded
-index. A form that is **linear in every unknown** but reads `.i(k)` marches too (the AT1 damage equation
-with a lagged driving force is exactly that): each step is a different linear system, and it routes
-through the same residual operator, where Newton converges in one step.
+index.
+
+A form that is **linear in every unknown** but reads `.i(k)` marches too — the AT1 damage equation with a
+fully lagged driving force is exactly that shape. Each load step is a different linear system whose
+coefficients the buffers set, so it routes through the same residual operator as the nonlinear march
+(Newton converges in one step on a linear residual). You pay roughly one extra linear solve per step
+versus a pure linear assembly, in exchange for one march path rather than two.
 
 Not carried, each rejected with a clear error: a real `u.t` transient (drive time through `tau` instead),
 a complex form, 1D, non-nodal (Argyris/Morley/edge) elements, VPINN, and periodic ties. There is also no

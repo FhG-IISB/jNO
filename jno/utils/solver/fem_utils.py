@@ -1161,9 +1161,12 @@ def _eval_integrand(domain, node, local):
         table = local.get("qp_history")
         if table is None or node.history_key not in table:
             raise NotImplementedError(
-                f"history read {node.name!r} has no buffer — a form using ``.i(k)`` must be solved through "
-                "the load-step driver (fem.solve(load=...)), which allocates and threads the per-step "
-                "history. A plain fem.solve() does not carry step history."
+                f"jno.fem: history read {node.name!r} has no per-quadrature-point buffer — this assembly "
+                "path does not allocate or thread step history. `.i(k)` history is wired on the real, "
+                "steady, native-Lagrange path (2D/3D, single-field or coupled), marched over a "
+                "`domain(tau=(start, end, n))` pseudo-time grid by a plain `fem.solve()` — nothing is "
+                "passed to it. Not carried by: 1D, non-nodal (Argyris/Morley/edge) elements, VPINN, "
+                "periodic ties, a `u.t` transient, or a complex form."
             )
         buf_c = table[node.history_key]  # (n_quad, depth, *value_shape) for this cell
         return buf_c[:, -node.offset - 1]  # offset -1 -> slot 0, -2 -> slot 1, ...  -> (n_quad, *value_shape)

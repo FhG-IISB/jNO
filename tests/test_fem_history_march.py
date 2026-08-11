@@ -493,6 +493,55 @@ def test_coupled_damage_state_is_irreversible_only_with_the_running_max():
 
 
 # --------------------------------------------------------------------------------------------------
+# Oracle 6c — a form LINEAR in every unknown but carrying step history. Every load step is a different
+# linear system whose source the buffer sets, so it is still a march — but the linear assembly route
+# builds a matrix/rhs pair with no history to thread, and this used to raise at BUILD time. It is on the
+# phase-field critical path: the AT1 damage equation with a lagged driving force is exactly this shape.
+#
+# The oracle is exact superposition. With `s.evolves(s.i(-1) + 1)` the state at step k is exactly k, so
+# each field solves its own linear problem at source ∝ (1+k) — and linearity makes the step-k solution
+# exactly (1+k) times the step-0 one, at machine precision, in BOTH blocks (the second is driven only
+# through the first, so it also pins the coupling).
+# --------------------------------------------------------------------------------------------------
+@pytest.mark.parametrize("coupled", [False, True])
+def test_linear_form_with_step_history_marches_by_exact_superposition(coupled):
+    sym, grad, trace, inner, sqrt, maximum, identity = _aliases()
+    N = 5
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34).domain(tau=(0.0, 1.0, N))
+    d.tag("bdry", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
+    co, cb = d.variable("interior", split=True), d.variable("bdry", split=True)
+    X = [co[0], co[1]]
+    u, phi = d.fem_symbols()
+    s, _ = d.fem_symbols(value_shape=())
+    terms = [inner(grad(u, X), grad(phi, X), 1) - (1.0 + s.i(-1)) * phi, s.evolves(s.i(-1) + 1.0), u(*cb) - 0.0]
+    if coupled:
+        w, chi = d.fem_symbols()
+        terms += [inner(grad(w, X), grad(chi, X), 1) - 2.0 * u * chi, w(*cb) - 0.0]
+    fem = jno.fem(terms)
+    assert getattr(fem._op, "state_readout", None) is not None, "a linear history form must still build a march op"
+    traj = np.asarray(fem.solve())  # nothing passed
+    assert traj.shape[0] == N
+
+    for blk in fem.blocks:
+        step = traj[:, blk]
+        assert np.abs(step[0]).max() > 1e-4, "a block never responded — the comparison would be vacuous"
+        # u_k = (1+k)·u_0 exactly: the state is k, the equations are linear, so the solution scales.
+        scaled = step / (1.0 + np.arange(N))[:, None]
+        rel = np.abs(scaled - scaled[0]).max() / np.abs(scaled[0]).max()
+        assert rel < 1e-9, f"superposition broke: the march is not linear in the state, rel {rel:.2e}"
+
+    # And step 0 (virgin state, s = 0) is the plain steady solve of the same BVP.
+    dS = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34).domain()
+    dS.tag("bdry", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
+    co, cb = dS.variable("interior", split=True), dS.variable("bdry", split=True)
+    XS = [co[0], co[1]]
+    u2, phi2 = dS.fem_symbols()
+    ref = np.asarray(jno.fem([inner(grad(u2, XS), grad(phi2, XS), 1) - 1.0 * phi2, u2(*cb) - 0.0]).solve())
+    got = traj[0, fem.blocks[fem.block_index(u)]]
+    assert np.abs(got - ref).max() / np.abs(ref).max() < 1e-8, "the virgin step is not the plain steady solve"
+
+
+# --------------------------------------------------------------------------------------------------
 # Oracle 5 — fail loud.
 # --------------------------------------------------------------------------------------------------
 def test_history_form_on_non_tau_domain_fails_loud():

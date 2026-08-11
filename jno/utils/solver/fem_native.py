@@ -2626,6 +2626,15 @@ def assemble_fem_native(
     domain._fem_native_term_residual = _make_residual
     jacobian = _make_jacobian(volume_terms, boundary_terms)
     nonlinear = any(_is_obviously_nonlinear_in_unknown(domain, t) for t in all_terms)
+    # A form that is LINEAR in the unknown but READS step history is still a march: every load step is a
+    # different linear system whose coefficients the buffers set. The linear branch below builds a
+    # ``FemLinearSystem`` from ``_assemble_at(args)``, which has no ``__history__`` to thread — so the
+    # history read raised at BUILD time, from deep inside the integrand evaluator. Route it through the
+    # residual operator instead: Newton on a linear residual converges in one step, so the answer is the
+    # same linear solve and there is exactly one march path to maintain. The AT1 phase-field damage
+    # equation with a lagged driving force is precisely this shape, so it is on the critical path.
+    if history_specs or surface_history_specs:
+        nonlinear = True
     s_d_dofs = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32) if dirichlet_pairs else None
     s_d_vals = jnp.asarray([p[1] for p in dirichlet_pairs], dtype=zeros.dtype) if dirichlet_pairs else None
 
