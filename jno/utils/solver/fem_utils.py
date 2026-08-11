@@ -1094,7 +1094,13 @@ def _eval_integrand(domain, node, local):
         flat_interp = jnp.sum(vals[:, :, None] * cell_sol[None, :, :], axis=1)
         value_shape = getattr(node, "value_shape", ())
         if len(value_shape) == 0:
-            return flat_interp
+            # A scalar field is ``(n_quad,)``, NOT ``(n_quad, 1)`` -- ``value_shape == ()`` says there is
+            # no component axis, so the interpolation must not invent one. Keeping it is invisible in a
+            # weak term (it contracts with the test function) but RANK-BROADCASTS against anything
+            # genuinely scalar: a scalar ``state.i(-1)`` buffer slice is ``(n_quad,)``, so
+            # ``maximum(H.i(-1), u)`` silently became ``(n_quad, n_quad)`` and the state readout then
+            # produced a buffer of the wrong rank. Squeeze here, at the one place the axis is created.
+            return flat_interp[..., 0]
         return _reshape_components_last(flat_interp, value_shape)
 
     if isinstance(node, HistoryRef):

@@ -418,3 +418,45 @@ def test_internal_state_without_evolves_fails_loud():
                 *[u(cb[0], cb[1], cb[2])[i] - 0.0 for i in range(3)],
             ]
         )
+
+
+# --------------------------------------------------------------------------------------------------
+# Oracle 5 — a SCALAR volume state whose evolution reads the BARE trial. This is the phase-field shape
+# (`H.evolves(maximum(H.i(-1), psi(u)))`) and it is a *relationship* test, not a restatement: a scalar
+# field's interpolated value and a scalar state's buffer slice must agree on rank. They did not — a
+# bare scalar trial carried a spurious `(n_quad, 1)` component axis (invisible in a weak term, where it
+# contracts with the test function) while the buffer slice is `(n_quad,)`, so `maximum(H.i(-1), u)`
+# rank-broadcast to `(n_quad, n_quad)` and the readout wrote a buffer of the wrong rank.
+# --------------------------------------------------------------------------------------------------
+def test_scalar_state_reading_the_bare_trial_keeps_its_rank():
+    sym, grad, trace, inner, sqrt, maximum, identity = _aliases()
+    N = 4
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain(tau=(0.0, 1.0, N))
+    d.tag("bdry", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
+    co, cb = d.variable("interior", split=True), d.variable("bdry", split=True)
+    X, tau = [co[0], co[1]], co[-1]
+    u, phi = d.fem_symbols()
+    Hs, _ = d.fem_symbols(value_shape=())  # a SCALAR volume state
+
+    # Nonlinear (so the form takes the march route), driven up with tau; Hs tracks the running max of u.
+    weak = inner(grad(u, X), grad(phi, X), 1) + 0.1 * u * u * phi - (1.0 + tau) * phi
+    fem = jno.fem([weak, Hs.evolves(maximum(Hs.i(-1), u)), u(*cb) - 0.0])
+
+    spec = fem._op.history_specs[next(iter(fem._op.history_specs))]
+    n_cells, n_quad = int(spec["shape"][0]), int(spec["shape"][1])
+    assert spec["value_shape"] == ()  # declared scalar...
+
+    traj = np.asarray(fem.solve())
+    assert traj.shape[0] == N
+
+    # THE RELATIONSHIP: the readout's per-state array must match the buffer's declared rank exactly.
+    out = fem._op.state_readout(
+        jnp.asarray(traj[-1]), 1.0, {"__history__": {k: jnp.zeros(v["shape"]) for k, v in fem._op.history_specs.items()}}
+    )
+    got = np.asarray(next(iter(out.values())))
+    assert got.shape == (n_cells, n_quad), f"scalar state readout is {got.shape}, buffer wants {(n_cells, n_quad)}"
+
+    # ...and the physics: with a monotonically rising load the running max IS the current value.
+    u_last = np.asarray(traj[-1])
+    assert u_last.max() > 0.0
+    assert np.all(np.diff(np.abs(traj).max(axis=1)) > -1e-12)  # monotone, so max_t u == u(t_end)
