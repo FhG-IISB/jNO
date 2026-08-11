@@ -94,6 +94,10 @@ The second form selects **boundary facets** by position, orientation, and existi
 and exclusion in one predicate. `n` is the outward normal (boundary only), `name` each facet's
 current region.
 
+A coordinate predicate works in **1-D too**, where a boundary facet is a single vertex: `d.tag("right_end",
+lambda x: x > 1 - 1e-9)` names an endpoint, carries its outward normal (`-1` at the left end, `+1` at the
+right), and a `u(right_end) - g` term is an ordinary Dirichlet condition.
+
 To name a region **and** grab its coordinates in one line, pass the predicate straight to
 `variable` (it forwards to `tag`, then returns the split coords):
 
@@ -200,8 +204,9 @@ d = jno.domain("part.msh")     # .msh / .vtk / .med … built anywhere (gmsh, CA
 d = jno.domain.from_array({"interior": interior_coords, "boundary": boundary_coords})
 ```
 
-**1-D domains** — either the `jno.domain.line(...)` shorthand or, `Shape`-native, an open path:
-`jno.Path(0, 0).line_to(1, 0).curve(size=0.01).domain()` (ends named `left`/`right`). `jno.domain`
+**1-D domains** — an open path, exactly like every other dimension's `Shape`:
+`jno.Path(0, 0).line_to(1, 0).curve(size=0.01).domain()` (ends named `left`/`right`). This is the
+form used throughout the docs; the `jno.domain.line(...)` shorthand still exists. `jno.domain`
 also keeps the structured grids `equi_distant_rect` / `poseidon` and the point-cloud `from_array`.
 For 2-D/3-D geometry build the shape with `Shape` — `Shape.rect(...).domain()`,
 `Shape.box(...).domain()`, and so on. (Shapely geometries and vertex lists are also still accepted.)

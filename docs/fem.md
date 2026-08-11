@@ -59,7 +59,7 @@ u_h = fem.solve()          # matrix-free default; slots pick anything else (see 
   `A p = c` on those rows — which is how a constraint/closure field (a pressure, a saturation, an
   equilibrium concentration) is written.
   A `jno.np.parameter` coefficient (scalar or nodal field) also works on a **steady linear** 1D form, so
-  a 1D differentiable inverse problem runs through `crux.solve` — as does a **neural** (`jno.nn.wrap`)
+  a 1D differentiable inverse problem runs through `crux.solve` — as does a **neural** (`jno.nn(...)`)
   coefficient, so a learned `k(x)` can be trained from 1D data. Transient too — recovering a diffusivity
   from a 1D time series works — except that the transient **mass** must be parameter-free (it is
   assembled once, so a parameter there would be silently frozen; it fails loud). *Nonlinear* forms are
@@ -166,25 +166,25 @@ How the two faces are identified depends on their meshes:
 
 * **Conforming** (the node layouts match) — an exact node-to-node 0/1 map. This is the cheap path and
   it keeps the fast selection-based reduction.
-* **Non-matching**, when both faces carry facet connectivity and the master face covers the slave —
+* **Non-matching**, when both faces carry facet connectivity and the main face covers the secondary —
   a **dual-mortar** coupling (Bernardi/Maday/Patera 1994; dual multiplier spaces from Wohlmuth 2000):
-  the tie is imposed in the integral sense `∫ ψ (u_A − u_B∘Φ) = 0` over the slave face, segmented
-  against the master facets. Interval clipping in 2-D, polygon clipping in 3-D.
+  the tie is imposed in the integral sense `∫ ψ (u_A − u_B∘Φ) = 0` over the secondary face, segmented
+  against the main facets. Interval clipping in 2-D, polygon clipping in 3-D.
 * **Non-matching, otherwise** (native 1-D chains, a tag that selects nodes but no whole facet, or two
-  faces that do not cover each other) — node-to-segment **collocation**: each slave node takes the
-  master facet value at its own location.
+  faces that do not cover each other) — node-to-segment **collocation**: each secondary node takes the
+  main facet value at its own location.
 
 Worth being precise about what the mortar coupling buys, because it is less than the usual framing
-suggests. jNO enforces a tie by master–slave **elimination** through a prolongation `P`, and such a
+suggests. jNO enforces a tie by main–secondary **elimination** through a prolongation `P`, and such a
 scheme passes the linear patch test whenever `P` reproduces linear fields — which node-to-segment
 interpolation does, in 2-D *and* 3-D. So **the patch test does not separate the two couplings here**;
 the textbook "node-to-segment fails the patch test" result is about contact formulations that
 distribute nodal forces, not about a linearly-complete MPC elimination.
 
-What does differ: for a field the master space cannot represent, mortar returns the integral (L²)
+What does differ: for a field the main space cannot represent, mortar returns the integral (L²)
 projection and collocation the pointwise value. Measured on a non-matching 3-D interface, mortar's RMS
-error is 4–40 % lower across a range of mesh ratios. The two also coincide exactly when the master
-nodes are a subset of the slave nodes, since the master basis then lies inside the slave space.
+error is 4–40 % lower across a range of mesh ratios. The two also coincide exactly when the main
+nodes are a subset of the secondary nodes, since the main basis then lies inside the secondary space.
 
 **P2 triangular interfaces (3-D quadratic) stay collocated**, and this is a theorem rather than a gap
 in the implementation. The dual basis is built from the facet mass matrix as `A = diag(∫N)·Mass⁻¹`, and
@@ -192,7 +192,7 @@ the P2 triangle's vertex functions integrate to *exactly zero* (`∫L(2L−1) = 
 scaling is singular. Rescaling does produce a biorthogonal basis, but not one whose span contains the
 linear functions — and Lemma 3.4 of Lamichhane's thesis proves no locally supported dual space of that
 dimension can, which is precisely what the optimal error estimate requires. The published remedy uses
-*fewer* multipliers than slave DOFs, making the tie a constrained solve rather than an elimination,
+*fewer* multipliers than secondary DOFs, making the tie a constrained solve rather than an elimination,
 which a prolongation cannot express. P2 **edges** (2-D) are unaffected — there `∫N = 1/6` — and the
 same source confirms the 2-D quadratic dual space does contain the linear hats.
 
@@ -223,7 +223,7 @@ b = d.variable("lower|upper.upper", split=True)
 
 fem = jno.fem([
     weak_form,
-    u(a[0], a[1], a[2]) - u(b[0], b[1], b[2]),      # glue them
+    u(*a) - u(*b),                                  # glue them
     u(xb, yb, zb) - 0.0,
 ])
 ```
@@ -236,6 +236,67 @@ cell, so it is topologically part of the boundary. The catch-all `"boundary"` re
 nodes that lie *only* on an interface — otherwise `u(boundary) - g` would pin the interface and silently
 solve two disconnected bodies. Nodes where the interface meets the outer wall lie on a genuine outer
 facet too and stay pinned.
+
+Because the two sides are spatially identical, **name them by the mesh's own tags** (above) or by
+`d.tag(pred, region=...)`, which says which body owns the facets:
+
+```python
+d.tag("cap_face",  lambda x, y: jnp.abs(y - 1.0) < 1e-9, region="cap")
+d.tag("base_face", lambda x, y: jnp.abs(y - 1.0) < 1e-9, region="base")
+```
+
+A bare coordinate predicate cannot tell them apart, and a surface term written on such a tag is applied
+to **both** bodies.
+
+### Contact — `u.gap(secondary, main)`
+
+A tie makes two surfaces move together. Contact lets them separate and push, and the difference is one
+term. `u.gap` is the signed normal gap at the secondary face's quadrature points:
+
+$$g = g_0 - n \cdot (u_s - u_m \circ \Phi)$$
+
+`g0` is the initial along-normal separation and `Φ` the mortar projection onto the main surface — the
+same projection a tie uses, so a gap and a tie are the same machinery read two ways. The gap is a
+symbol, so the contact traction is an ordinary boundary term and **nothing is passed to `fem.solve()`**:
+
+```python
+n = d.variable(secondary, normals=True)          # the secondary's OUTWARD normal
+g = u.gap(secondary, main, domain=d)
+p = jno.np.maximum(0.0, -c * g)              # pressure: positive only when penetrating
+fem = jno.fem([..., p * jno.np.inner(n, phi.bind(x=sv[0], y=sv[1]), n_contract=1)])
+```
+
+**The sign convention, spelled out**, because every downstream sign follows it:
+
+| quantity | meaning |
+|---|---|
+| `n` | the **secondary's outward** normal — on a contacting pair it points *at* the main |
+| `g > 0` | separated (open) |
+| `g < 0` | interpenetrating |
+| `p = max(0, -c*g)` | contact pressure, `≥ 0`, active only in penetration |
+| `+p * inner(n, phi)` | the traction term — **not** `-p * ...` |
+
+The `+` is not a convention you may flip: since `∂g/∂u_s = -n`, it is the sign that adds a
+positive-definite `+c (n·δu)(n·φ)` to the tangent. The opposite sign is anti-stabilising and, measured
+on a weakly penalised interface, leaves the jump *larger* than not penalising at all.
+
+You write **one** term, on the secondary face. The equal-and-opposite traction on the main body is
+supplied by the pairing — it is the same integrand tested against the main's projected trace — so
+Newton's third law holds without you restating it. Ablating that reaction leaves the main body
+identically zero.
+
+For a bonded (tied) interface use the two-sided penalty `p = -c*g` instead of the `max`; it is smooth,
+and stiffening `c` converges to the tie: two bonded unit blocks squeezed by 0.02 reproduce the single-bar
+answer `uy(y=1) = -0.01` to 1.5e-05 at `c = 1e6`.
+
+> **Scope.** Small sliding — the pairing is frozen at build time, so a configuration that slides must be
+> rebuilt per load step. Differentiable in the DOF values but **not** in the mesh coordinates (the
+> projection weights are host-computed). Frictionless: no tangential traction, so a body held *only* by
+> contact is free to slide and its system is singular — constrain the tangential direction independently.
+> The gap is non-local (it reads DOFs on the other body's cells), so the tangent is matrix-free;
+> `newton(direct=True)` is refused. **One-sided contact does not yet converge to tight tolerances**: the
+> `max(0, ·)` kink is non-smooth and the residual stalls around 1e-2 with a line search, against a 1e-8
+> target. The bonded two-sided path is smooth and converges.
 
 ---
 
@@ -696,7 +757,7 @@ jax.config.update("jax_enable_x64", True)          # required; see the scope lis
 
 xb, yb, tb = domain.variable("boundary", split=True)
 fem = jno.fem([ui.t * vi + kappa * (ui.x * vi.x + ui.y * vi.y),   # the physics
-               u(xb, yb) - 0.0, u(ci[0], ci[1]) - 1.0,
+               u(xb, yb) - 0.0, u(*ci) - 1.0,
                yb.d(tb) - 0.5 * yb])                              # dy/dt = y/2 — the mesh
 traj = fem.solve()                                                # one frame per moved mesh
 ```
@@ -1113,6 +1174,12 @@ solves `Jᵀ` directly too, not with a stalling Krylov). `damping` / `line_searc
 assembled tangent, so it does **not** apply to the matrix-free-only paths (a coupled-residual wrapper,
 complex) — those fail loud.
 
+The tangent it factorizes is always the **element-scattered sparse** one, in 1-D as in 2-D/3-D. 1-D used
+to build its nonlinear tangent with a global `jax.jacfwd` instead, on the assumption that only the
+matrix-free default would ever ask for it; `direct=True` does ask, from inside the Newton loop, where a
+dense tangent cannot be sparsified at all (`BCOO.fromdense` needs a concrete `nse`). Besides working, the
+scattered tangent is `O(nnz)` rather than `O(N²)` — which is what 1-D node counts want.
+
 **A direct `linear=` slot selects it.** `lu`, `dense` and `amg` all need an assembled matrix, so pairing one
 with the *matrix-free* Newton has nothing to factorize. `fem.solve(linear=jno.solve.lu(backend="host"))` on a
 nonlinear or transient problem therefore routes to the direct Newton, and that slot is the solver that runs on
@@ -1424,7 +1491,7 @@ Euler over the assembled `dt`, sampled at the domain time grid), differentiable 
 parameters — so a rate constant is recovered from a time series:
 
 ```python
-fem = jno.fem([ui.t * vi + alpha * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - u0])
+fem = jno.fem([ui.t * vi + alpha * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(*ci) - u0])
 crux = jno.core([(fem.solve() - u_traj).mse], domain=obs).solve(200)   # recovers alpha
 ```
 

@@ -97,17 +97,20 @@ history = crux.solve(5000, profile=True)
 ```python
 stats = crux.solve(5000)
 
-stats.plot("history.png")           # save loss curves
+stats.plot("history.png")            # save loss curves; returns self, so it chains off solve()
 
 # Access raw data
-stats.epoch                          # epoch indices
-stats.total_loss                     # total weighted loss per logged epoch
-stats.losses                         # per-constraint losses, shape (log_steps, n_constraints)
-stats.weights                        # constraint weights, shape (log_steps, n_constraints)
-stats.training_time                  # wall-clock time in seconds
-stats.trainable_params               # number of trainable parameters
-stats.total_params                   # total parameters
+stats.total_loss                     # FINAL scalar total loss (a float, not an array)
+stats.total_loss_history             # 1-D array, concatenated across every solve() call
+stats.training_logs                  # list of per-solve()-call dicts; each carries the raw
+                                     # "epoch", "total_loss", "losses", "timestamps",
+                                     # "training_time" and "trainable_params" records
+stats.training_logs[-1]["losses"]    # e.g. per-constraint losses from the last call
 ```
+
+Note `total_loss` is the *final* value — the curve lives in `total_loss_history`, and everything
+else (epoch indices, per-constraint losses, wall-clock time, parameter counts) is read from the
+`training_logs` dicts rather than from attributes.
 
 ---
 

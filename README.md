@@ -67,15 +67,15 @@ forward solve — no glue code, no finite differences, no leaving JAX.
 | Operator learning (DeepONet, FNO, U-Net, PROSE via [foundax](https://github.com/FhG-IISB/foundax)) | [stable](https://fhg-iisb.github.io/jNO/tutorials/11-operator-learning/) | PDE-residual or data-driven |
 | Adaptive resampling (RAD, RARD, CR3, R3, pinnfluence) | [stable](https://fhg-iisb.github.io/jNO/adaptive/resampling/) | |
 | Stochastic PDEs & noise nodes (gaussian / uniform / laplace) | [stable](https://fhg-iisb.github.io/jNO/tutorials/07-stochastic/fokker-planck-2d/) | Fokker–Planck, stochastic forcing |
-| Bayesian PINNs (NUTS, HMC, MALA, SGLD, SGHMC, VI) | [stable](https://fhg-iisb.github.io/jNO/tutorials/10-bayesian-pinns/) | 14 worked tutorials |
+| Bayesian PINNs (NUTS, HMC, MALA, SGLD, SGHMC, VI) | [stable](https://fhg-iisb.github.io/jNO/tutorials/10-bayesian-pinns/) | `model.bayesian(kernel_factory)` mirrors `.optimizer()` — per-parameter, mixed freely |
 | Parameter-efficient fine-tuning (LoRA, DoRA, rsLoRA, PiSSA, VeRA, LoKr, OFT, IA3) | [stable](https://fhg-iisb.github.io/jNO/model-controls/lora/) | Chain `.lora(...)` on any wrapped model |
 | Training explainability (gradient conflict, NTK, Hessian, loss landscape, input sensitivity) | [stable](https://fhg-iisb.github.io/jNO/tutorials/07-analysis/gradient-conflict/) | |
-| Foundation-model integration ([foundax](https://github.com/FhG-IISB/foundax) MLPs, transformers, DeepONet, FNO, PROSE) | [stable](https://fhg-iisb.github.io/jNO/foundation_models/) | Wrap any Equinox module via `jno.nn.wrap(...)` |
+| Foundation-model integration ([foundax](https://github.com/FhG-IISB/foundax) MLPs, transformers, DeepONet, FNO, PROSE) | [stable](https://fhg-iisb.github.io/jNO/foundation_models/) | Wrap any Equinox module via `jno.nn(...)` |
 | Hybrid data + model parallelism | [stable](https://fhg-iisb.github.io/jNO/training/parallelism/) | `jno.core(..., mesh=(batch, model))` |
 | W&B logging + Orbax checkpointing | [stable](https://fhg-iisb.github.io/jNO/tutorials/09-wandb/wandb-integration/) | |
 | IREE / MLIR compiled inference for deployment | [stable](https://fhg-iisb.github.io/jNO/model-controls/iree/) | |
 
-**One tracing language bridges the two.** A weak form, a strong-form stencil, a PDE residual for a network, and a supervised loss all lower to the same differentiable, `jit`-compiled graph — so a classical solve, a PINN, and an inverse problem *compose* rather than living in separate stacks. ~50 worked tutorials span elliptic, parabolic, hyperbolic, coupled, inverse, integral, stochastic, FEM / variational, Bayesian, and operator-learning problems — browse the [tutorials index](https://fhg-iisb.github.io/jNO/#tutorials).
+**One tracing language bridges the two.** A weak form, a strong-form stencil, a PDE residual for a network, and a supervised loss all lower to the same differentiable, `jit`-compiled graph — so a classical solve, a PINN, and an inverse problem *compose* rather than living in separate stacks. 29 worked tutorials span elliptic, parabolic, hyperbolic, coupled, inverse, integral, stochastic, FEM / variational, Bayesian, and operator-learning problems — browse the [tutorials index](https://fhg-iisb.github.io/jNO/#tutorials).
 
 ## Install
 
@@ -83,7 +83,7 @@ forward solve — no glue code, no finite differences, no leaving JAX.
 pip install jax-numerical-operators
 ```
 
-One install — FEM, FDM, the solver stack, PINNs, and the scientific-ML tooling all come in the box, with GPU support on by default (jNO depends on `jax[cuda]`). A couple of heavy, self-contained backends (the RCWA Fourier solver and GPU algebraic multigrid) stay optional; the [Installation guide](https://fhg-iisb.github.io/jNO/Installation/) covers those, plus Pixi, Docker, and pinning a specific CUDA build.
+One install — FEM, FDM, the solver stack, PINNs, and the scientific-ML tooling all come in the box, running on CPU out of the box. An NVIDIA GPU is one extra away — `pip install "jax-numerical-operators[cuda]"` — and the heavy, self-contained backends stay behind extras too: `[fem]` (adaptive remeshing + the PARDISO/cuDSS sparse-direct backends), `[rcwa]` (the Fourier-modal EM solver), `[amg]` (GPU algebraic multigrid), `[iree]`, combinable as `[cuda,fem]`. The [Installation guide](https://fhg-iisb.github.io/jNO/Installation/) has the full table, plus Pixi, Docker, and pinning a specific CUDA build.
 
 ## Example
 
@@ -176,7 +176,7 @@ k = dom.variable("k", jax.random.uniform(jax.random.PRNGKey(0), shape=(500, 1, 1
 
 # Network + optimizer
 fx = foundax.deeponet(n_sensors=1, coord_dim=2, basis_functions=32, hidden_dim=128, activation=jax.numpy.tanh)
-net = jno.nn.wrap(fx)
+net = jno.nn(fx)
 net.optimizer(optax.adam(optax.schedules.cosine_decay_schedule(1e-3, 20_000, alpha=1e-5)))
 
 # Hard BC enforcement via an output transform; the PDE residual is the loss

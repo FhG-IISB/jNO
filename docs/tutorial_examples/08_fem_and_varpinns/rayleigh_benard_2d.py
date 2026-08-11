@@ -76,8 +76,8 @@ fem = jno.fem(
         u(xb, yb) - 0.0,  # no-slip walls (all-component vector Dirichlet)
         T(xb, yb) - (1.0 - yb / Ly),  # hot floor / cold lid, conductive profile on the walls
         p.pin(),  # gauge-fix: remove the pressure null space
-        u(ci[0], ci[1]) - 0.0,  # start at rest (all-component vector initial condition)
-        T(ci[0], ci[1]) - T0,
+        u(*ci) - 0.0,  # start at rest (all-component vector initial condition)
+        T(*ci) - T0,
     ]
 )
 assert fem.is_transient and not fem.is_linear, "Boussinesq convection is transient + nonlinear"

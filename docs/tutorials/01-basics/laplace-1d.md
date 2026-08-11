@@ -2,7 +2,7 @@
 
 <div class="hero-actions" markdown>
 <a class="md-button md-button--primary" href="/jNO/tutorial_examples/01_basics/laplace_1d.py" download>Download .py</a>
-<a class="md-button" href="/jNO/tutorials/01-basics/">Back to chapter</a>
+<a class="md-button" href="/jNO/#tutorials">All tutorials</a>
 </div>
 
 The smallest complete jNO example. Solves the 1-D Laplace equation with **non-homogeneous** Dirichlet boundary conditions and a hard-enforced linear-interpolant ansatz.
@@ -71,7 +71,7 @@ The hard-BC ansatz reproduces the exact line to rel-$L^2 \approx 9\times10^{-6}$
 
 <div class="hero-actions" markdown>
 <a class="md-button md-button--primary" href="/jNO/tutorial_examples/01_basics/laplace_1d.py" download>Download full script</a>
-<a class="md-button" href="/jNO/tutorials/01-basics/">Back to 01 Basics</a>
+<a class="md-button" href="/jNO/#tutorials">All tutorials</a>
 </div>
 
 ## Script Snippet

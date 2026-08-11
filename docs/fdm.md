@@ -186,7 +186,7 @@ jno.fdm([
 This is **structured-only**: the tie wraps that grid axis so the `jnp.roll` stencil gives the true
 periodic 5-/7-point Laplacian (a strong-form stencil must *wrap* — a mere boundary tie on an unstructured
 mesh would keep a one-sided edge and solve the wrong problem, so it raises). The redundant `x=L ≡ x=0`
-face is pinned to its master by the tie. Note: a periodic structured solve is currently un-preconditioned
+face is pinned to its main by the tie. Note: a periodic structured solve is currently un-preconditioned
 (the geometric-multigrid V-cycle assumes Dirichlet boundaries), so it is slow on fine grids — periodic GMG
 is a planned extension.
 
@@ -239,7 +239,7 @@ matrix-free residual does not assemble, so it fails loud pointing you to a θ-sc
 ## Differentiable inverse problems
 
 When the constraint list carries a **trainable** `jno.np.parameter` — a source amplitude, a
-diffusivity, a `jno.nn.wrap` network — `jno.fdm([...]).solve()` returns a differentiable **trace node**
+diffusivity, a `jno.nn(...)` network — `jno.fdm([...]).solve()` returns a differentiable **trace node**
 (not an array), exactly as `fem.solve()` does. It therefore composes straight into `jno.core`: put the
 solve inside a data-misfit loss and let the parameter's attached optimizer recover it.
 

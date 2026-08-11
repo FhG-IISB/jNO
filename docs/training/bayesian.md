@@ -18,7 +18,7 @@ import blackjax, jax, jno
 import jax.numpy as jnp
 
 π = jno.np.pi
-dom = jno.domain(constructor=jno.domain.line(mesh_size=0.01))
+dom = jno.Path(0.0, 0.0).line_to(1.0, 0.0).curve(size=0.01).domain()
 x, _ = dom.variable("interior")
 
 A_true, B_true = 3.14, -2.71
@@ -149,7 +149,7 @@ import blackjax, foundax, jax, jno
 import jax.numpy as jnp
 
 π = jno.np.pi
-dom = jno.domain(constructor=jno.domain.line(mesh_size=0.01))
+dom = jno.Path(0.0, 0.0).line_to(1.0, 0.0).curve(size=0.01).domain()
 x, _  = dom.variable("interior")
 xb, _ = dom.variable("boundary")
 

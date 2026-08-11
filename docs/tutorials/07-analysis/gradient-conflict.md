@@ -2,7 +2,7 @@
 
 <div class="hero-actions" markdown>
 <a class="md-button md-button--primary" href="/jNO/tutorial_examples/07_analysis/gradient_conflict.py" download>Download .py</a>
-<a class="md-button" href="/jNO/tutorials/07-analysis/">Back to chapter</a>
+<a class="md-button" href="/jNO/#tutorials">All tutorials</a>
 </div>
 
 This tutorial shows how to use `u.grad(net)` — the **parameter Jacobian** — to monitor what a PINN is learning *during* training. The key technique is computing the **cosine similarity** between domain regions as a `.tracker()`, so you can spot gradient conflict before the solve finishes.
@@ -58,7 +58,7 @@ $$-u''(x) = \sin(\pi x), \quad x \in [0, 1], \quad u(0) = u(1) = 0$$
 Exact solution: $u(x) = \sin(\pi x) / \pi^2$.
 
 ```python
-domain = jno.domain.line(mesh_size=0.1)
+domain = jno.Path(0.0, 0.0).line_to(1.0, 0.0).curve(size=0.1).domain()
 x, _ = domain.variable("interior")
 
 u_net = jno.nn(
@@ -227,7 +227,7 @@ The trained network matches the analytic $\sin(\pi x)/\pi^2$ to rel-$L^2\approx3
 
 <div class="hero-actions" markdown>
 <a class="md-button md-button--primary" href="/jNO/tutorial_examples/07_analysis/gradient_conflict.py" download>Download full script</a>
-<a class="md-button" href="/jNO/tutorials/07-analysis/">Back to 07 Analysis</a>
+<a class="md-button" href="/jNO/#tutorials">All tutorials</a>
 </div>
 
 ## Script Snippet

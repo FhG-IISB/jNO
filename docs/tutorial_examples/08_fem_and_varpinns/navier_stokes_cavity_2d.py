@@ -49,8 +49,8 @@ fem = jno.fem(
         u(xb, yb)[0] - jno.np.where(yb > 1 - 1e-6, lid, 0.0),  # moving lid on top, no-slip elsewhere
         u(xb, yb)[1] - 0.0,
         p.pin(),  # gauge-fix: remove the pressure null space (any single DOF)
-        u(ci[0], ci[1])[0] - 0.0,  # start from rest
-        u(ci[0], ci[1])[1] - 0.0,
+        u(*ci)[0] - 0.0,  # start from rest
+        u(*ci)[1] - 0.0,
     ]
 )
 assert fem.is_transient and not fem.is_linear, "transient Navier-Stokes must be nonlinear"

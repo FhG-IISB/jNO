@@ -64,14 +64,14 @@ Tc, pc = T.bind(x=xc, y=yc), phi.bind(x=xc, y=yc)
 # coordinates -- so a spatial predicate selects both; `region=` names which body owns the facets, and
 # is the only thing that can tell them apart.
 #
-# ORDER MATTERS: in `u(A) - u(B)` the first is the SLAVE, whose interface DOFs are eliminated in favour
-# of an interpolation from the master, so the slave must be the *finer* side or the fine mesh's
+# ORDER MATTERS: in `u(A) - u(B)` the first is the SECONDARY, whose interface DOFs are eliminated in favour
+# of an interpolation from the main, so the secondary must be the *finer* side or the fine mesh's
 # resolution at the interface is discarded. Measured here:
-#     slave = coating   (81 interface nodes)  ->  T_interface = 0.05000   exact
-#     slave = substrate (10 interface nodes)  ->  T_interface = 0.05531   10.62% error
+#     secondary = coating   (81 interface nodes)  ->  T_interface = 0.05000   exact
+#     secondary = substrate (10 interface nodes)  ->  T_interface = 0.05531   10.62% error
 on_interface = lambda x, y: np.abs(y - L_SUB) < 1e-9  # noqa: E731
-a = d.variable("film_face", where=on_interface, region="coating", split=True)  # slave: the finer side
-b = d.variable("base_face", where=on_interface, region="substrate", split=True)  # master
+a = d.variable("film_face", where=on_interface, region="coating", split=True)  # secondary: the finer side
+b = d.variable("base_face", where=on_interface, region="substrate", split=True)  # main
 
 xt, yt, _ = d.variable("top", split=True)  # coating outer surface: flux q in
 xb, yb, _ = d.variable("bottom", split=True)  # substrate base: T = 0
@@ -81,7 +81,7 @@ fem = jno.fem(
         K_SUB * (Ts.x * ps.x + Ts.y * ps.y),  # steady conduction in the metal substrate
         K_FILM * (Tc.x * pc.x + Tc.y * pc.y),  # ... and in the ceramic coating
         -Q * phi.bind(x=xt, y=yt),  # flux in at the top (a natural BC)
-        T(a[0], a[1]) - T(b[0], b[1]),  # glue the two bodies
+        T(*a) - T(*b),  # glue the two bodies
         T(xb, yb) - 0.0,  # T = 0 at the base
     ]
 )

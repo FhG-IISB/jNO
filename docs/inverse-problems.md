@@ -11,7 +11,7 @@ The simplest case: recover scalar constants from residual constraints. `jno.np.p
 ```python
 import jax, jax.numpy as jnp, optax, jno
 
-domain = jno.domain(constructor=jno.domain.line(mesh_size=0.01))
+domain = jno.Path(0.0, 0.0).line_to(1.0, 0.0).curve(size=0.01).domain()
 x, _ = domain.variable("interior")
 
 # Ground-truth data (synthetic here, replace with measurements)
@@ -28,7 +28,8 @@ crux = jno.core([residual.mse])
 crux.solve(10_000)
 
 _a, _b = crux.eval([a, b])
-print(f"a={float(_a):.3f}  b={float(_b):.3f}")  # → a≈3.14  b≈-2.71
+# a parameter of shape (1,) evaluates to the ARRAY -- float(_a) raises TypeError; index it
+print(f"a={_a[0]:.3f}  b={_b[0]:.3f}")  # → a≈3.14  b≈-2.71
 ```
 
 ---
@@ -39,7 +40,7 @@ When the unknown is a spatially-varying field `k(x,y)`, represent it as a neural
 
 ### `field.regularize(...)`
 
-Call `.regularize(kind, ...)` on the field itself. It returns an **unreduced pointwise** `Placeholder` — apply `.mean` or `.mse` to get a scalar loss term. (For a FEM nodal-parameter field the same call assembles the FEM-exact penalty on the element space; for a coordinate field it uses autodiff, so pass the spatial variables.)
+Call `.regularize(kind, ...)` on the **network call or the parameter** — not on a derived expression (`jno.fn.exp(k_raw(x)).regularize(...)` raises `AttributeError`; regularize `k_raw(x)` and apply the transform separately). It returns an **unreduced pointwise** `Placeholder` — apply `.mean` or `.mse` to get a scalar loss term. (For a FEM nodal-parameter field the same call assembles the FEM-exact penalty on the element space; for a coordinate field it uses autodiff, so pass the spatial variables.)
 
 #### `regularize('smooth', *variables)` — H1 seminorm
 
@@ -181,7 +182,7 @@ import foundax, jno
 
 π = jno.np.pi
 
-domain = jno.domain(constructor=jno.domain.line(mesh_size=0.01))
+domain = jno.Path(0.0, 0.0).line_to(1.0, 0.0).curve(size=0.01).domain()
 x, _ = domain.variable("interior")
 
 # Manufactured source and noiseless observations
@@ -203,7 +204,10 @@ u = u_net(x) * x * (1 - x)      # hard zero Dirichlet BCs
 
 pde  = k * u.dd(x) - f_pde
 data = u - u_obs
-reg  = k.regularize('smooth', x)
+# Regularize the NETWORK CALL, not the transformed field: `.regularize` lives on the network call
+# or the parameter, and `jno.fn.exp(...)` has no `.regularize`. Smoothness of log-k is smoothness
+# of k, so the penalty means the same thing.
+reg  = k_raw(x).regularize('smooth', x)
 
 crux = jno.core([pde.mse, data.mse, reg.mean])
 crux.solve(5_000)
