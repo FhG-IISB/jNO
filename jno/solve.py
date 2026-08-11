@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Optional
 
 import jax
 import jax.numpy as jnp
+import numpy as _np
 
 if TYPE_CHECKING:  # runtime import stays lazy inside remesh()/relocate()
     from .utils.solver.fem_adapt import AdaptSpec
@@ -51,6 +52,7 @@ __all__ = [
     "amg",
     "newton",
     "picard",
+    "staggered",
     "eigs",
     "logdet",
     "trace",
@@ -524,6 +526,107 @@ def picard(
         ls_max=ls_max,
         ls_c=ls_c,
     )
+
+
+def staggered(
+    fields,
+    *,
+    rtol: float = 1e-8,
+    atol: float = 1e-8,
+    max_sweeps: int = 200,
+    inner_steps: int = 20,
+    inner_tol: float = 1e-10,
+    inner_maxit: int = 2000,
+    line_search: bool = False,
+    damping: float = 1.0,
+    ls_max: int = 25,
+    ls_c: float = 1e-4,
+) -> NonlinearSolver:
+    """**Alternate minimization** — solve a coupled system one field at a time, sweeping until the full
+    residual converges. ``fields`` is the trial symbols in the order to sweep them::
+
+        fem.solve(nonlinear=jno.solve.staggered([u, dm]))
+
+    Reach for it when the coupled energy is **non-convex in the fields jointly but convex in each
+    separately** — the case where a monolithic Newton has no descent guarantee and diverges outright.
+    Variational phase-field fracture is the canonical one: the ``(1-d)^2 |grad u|^2`` coupling is quartic
+    in the pair, while ``u`` alone solves a linear elasticity problem and ``d`` alone a linear elliptic
+    one. Alternate minimization turns that into a sequence of convex solves, each decreasing the energy.
+    Fixed-stress Biot poroelasticity and thermo-mechanical staggering have the same shape.
+
+    Algorithm: Bourdin, Francfort & Marigo, *Numerical experiments in revisited brittle fracture*,
+    J. Mech. Phys. Solids **48** (2000), §3 — as the staggered operator split with a history field,
+    Miehe, Welschinger & Hofacker, IJNME **83** (2010).
+
+    **The trade is the convergence rate, and it is not small.** Alternate minimization converges
+    *linearly* where Newton is quadratic, so it can need hundreds of sweeps near a propagating crack —
+    hence ``max_sweeps=200``. It buys robustness, not speed; on a problem where Newton converges,
+    Newton is the better choice (Farrell & Maurini, CMAME **312**, 2017, compare the two directly).
+
+    Sweeping is Gauss-Seidel: each sub-solve sees the updates made earlier in the same sweep, so the
+    ORDER of ``fields`` matters. Every block must be listed — an omitted field's equations would never be
+    solved, which is rejected rather than silently skipped.
+
+    Differentiable in the ordinary way: at convergence the full residual is zero, so the sweep is just a
+    way of *finding* that root, and ``lax.custom_root`` supplies the gradient from the full Jacobian.
+
+    Scope: composes through ``fem.solve(nonlinear=...)`` on a multifield problem, which is where the
+    block layout comes from; it has no meaning on a single field and says so. Each field is solved on
+    its own — solving a GROUP of fields together (a Stokes velocity/pressure pair inside one sweep) is
+    not wired.
+    """
+    resolved: dict = {"blocks": None, "names": None}
+
+    def _prepare(fem):
+        blocks = getattr(fem, "blocks", None)
+        if blocks is None or len(blocks) < 2:
+            raise ValueError(
+                "jno.solve.staggered: this problem has a single field block, so there is nothing to "
+                "alternate between. Use jno.solve.newton() (or picard) instead."
+            )
+        want = list(fields)
+        idxs = [fem.block_index(f) for f in want]
+        if len(set(idxs)) != len(idxs):
+            raise ValueError(f"jno.solve.staggered: a field is listed twice (resolved block indices {idxs}).")
+        if set(idxs) != set(range(len(blocks))):
+            missing = sorted(set(range(len(blocks))) - set(idxs))
+            raise ValueError(
+                f"jno.solve.staggered: every field block must be swept, but blocks {missing} were not "
+                f"listed (got {idxs} of {len(blocks)}). An unlisted field's equations would never be "
+                "solved — list all of them, in the order you want them swept."
+            )
+        resolved["blocks"] = [_np.arange(int(blocks[i].start), int(blocks[i].stop), dtype=_np.int32) for i in idxs]
+        resolved["names"] = idxs
+
+    def _fn(residual_fn, u0, *, linear_solve=None, jacobian=None):
+        if resolved["blocks"] is None:
+            raise ValueError(
+                "jno.solve.staggered needs the problem's block layout, which only `fem.solve(...)` can "
+                "supply — it resolves the trial symbols you passed to their DOF blocks. Used as a bare "
+                "callable there is nothing to alternate over."
+            )
+        from .utils.solver.newton_krylov import staggered_newton
+
+        return staggered_newton(
+            residual_fn,
+            u0,
+            resolved["blocks"],
+            rtol=rtol,
+            atol=atol,
+            max_sweeps=max_sweeps,
+            inner_steps=inner_steps,
+            inner_tol=inner_tol,
+            inner_maxit=inner_maxit,
+            linear_solve=linear_solve,
+            damping=damping,
+            line_search=line_search,
+            ls_max=ls_max,
+            ls_c=ls_c,
+        )
+
+    spec = NonlinearSolver(_fn, name="staggered", traits={"vmap": "native", "jit": True})
+    spec.prepare = _prepare  # eager block resolution at compose time (mirrors a precond spec's .prepare)
+    return spec
 
 
 def eigs(*, k: int = 6, which: str = "smallest", sigma=None, linear=None, precond=None, tol=None, maxiter=None, X0=None):

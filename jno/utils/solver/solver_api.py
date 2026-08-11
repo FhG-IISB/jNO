@@ -780,6 +780,14 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
             "linear= (cg/bicgstab/gmres/fgmres)."
         )
 
+    # A nonlinear spec may need eager setup against the assembled problem, for the same reason a precond
+    # spec does: it must not happen inside the traced Newton loop. ``jno.solve.staggered`` uses it to
+    # resolve the trial symbols it was given into DOF blocks — information the driver protocol
+    # (``residual_fn, u0``) deliberately does not carry.
+    _prep = getattr(nonlinear, "prepare", None)
+    if _prep is not None and fem is not None:
+        _prep(fem)
+
     inner = None
     if linear is not None or precond is not None:
         solver = linear if linear is not None else _solve_ns.bicgstab()  # historic matrix-free default

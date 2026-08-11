@@ -19,7 +19,7 @@ import math
 import jax
 import jax.numpy as jnp
 
-__all__ = ["newton_krylov", "newton_direct", "bicgstab"]
+__all__ = ["newton_krylov", "newton_direct", "staggered_newton", "bicgstab"]
 
 _EPS = 1e-300
 
@@ -274,3 +274,119 @@ def newton_direct(
         return jax.lax.custom_linear_solve(g, y, fwd, transpose_solve=tsp)
 
     return jax.lax.custom_root(f0, root, lambda _f, _x0: root, _tangent)
+
+
+def staggered_newton(
+    residual_fn,
+    u0,
+    blocks,
+    *,
+    rtol=1e-8,
+    atol=1e-8,
+    max_sweeps=200,
+    inner_steps=20,
+    inner_tol=1e-10,
+    inner_maxit=2000,
+    linear_solve=None,
+    damping=1.0,
+    line_search=False,
+    ls_max=25,
+    ls_c=1e-4,
+):
+    """**Alternate minimization** (staggered / operator-split) root find over a block-partitioned system.
+
+    Sweep the blocks in order, solving each field's equations with the others held fixed, and repeat
+    until the FULL residual is converged. Gauss-Seidel in the blocks: each sub-solve sees the updates
+    made earlier in the same sweep.
+
+    Why it exists: a coupled energy can be **non-convex in the fields jointly while convex in each
+    separately**, and a monolithic Newton then has no descent guarantee and diverges. The canonical case
+    is variational phase-field fracture, where the ``(1-d)^2 |grad u|^2`` coupling is quartic in the pair
+    but each field's own problem is a linear elliptic one. Alternate minimization turns that into a
+    sequence of convex solves, each decreasing the energy. Introduced for exactly this by Bourdin,
+    Francfort & Marigo, *Numerical experiments in revisited brittle fracture*, J. Mech. Phys. Solids
+    **48** (2000), §3; as the staggered operator split with a history field by Miehe, Welschinger &
+    Hofacker, IJNME **83** (2010). The trade is convergence RATE: alternate minimization is linear where
+    Newton is quadratic, hence the high ``max_sweeps`` default (see Farrell & Maurini, *Linear and
+    nonlinear solvers for variational phase-field models of brittle fracture*, CMAME **312**, 2017).
+
+    ``blocks`` is a list of index arrays, one per field, partitioning the DOF vector. Each sub-solve is
+    an ordinary matrix-free Newton on the restricted residual ``x -> R(u with block set to x)[block]``,
+    so ``jax.linearize`` gives that field's DIAGONAL Jacobian block, matrix-free, with no assembly.
+
+    Differentiable, and for the ordinary reason: at convergence the full residual is zero, so the sweep
+    is just *a way of finding that root*. ``lax.custom_root`` therefore wraps the whole loop with the
+    tangent solve on the FULL Jacobian — the implicit-function theorem does not care how the root was
+    reached, and the alternating structure disappears from the derivative. (Which also means the tangent
+    solve is a coupled linear solve even though the forward iteration never formed one; that is correct,
+    and it is cheap, because the tangent at a converged root is well behaved even when the nonlinear
+    monolithic iteration was not.)
+    """
+    f0 = lambda u: jnp.asarray(residual_fn(u)).reshape(-1)  # noqa: E731
+    u0 = jnp.asarray(u0).reshape(-1)
+    idx = [jnp.asarray(b, dtype=jnp.int32) for b in blocks]
+    if linear_solve is None:
+        inner = lambda mv, rhs: _linsolve(mv, rhs, tol=inner_tol, maxit=inner_maxit)  # noqa: E731
+    else:
+        _slot = linear_solve
+        inner = lambda mv, rhs: jax.lax.custom_linear_solve(mv, rhs, _slot, transpose_solve=_slot)  # noqa: E731
+
+    def _sweep(u):
+        """One Gauss-Seidel pass: solve each block's own equations with the others frozen."""
+        for b in idx:
+
+            def _restricted(x, _u=u, _b=b):
+                return f0(_u.at[_b].set(x))[_b]
+
+            # No `custom_root` on the sub-solve: the OUTER one below supplies every derivative, so the
+            # inner iteration only has to land on the sub-root.
+            u = u.at[b].set(_newton_inner(_restricted, u[b]))
+        return u
+
+    def _newton_inner(f, x0):
+        def cond(state):
+            _x, r, k = state
+            return (jnp.linalg.norm(r) > atol) & (k < inner_steps)
+
+        def body(state):
+            x, _r, k = state
+            rx, jvp = jax.linearize(f, x)
+            dx = inner(jvp, -rx)
+            a = _inner_backtrack(f, x, dx, jnp.linalg.norm(rx)) if line_search else damping
+            x = x + a * dx
+            return x, f(x), k + 1
+
+        x, _r, _k = jax.lax.while_loop(cond, body, (x0, f(x0), 0))
+        return x
+
+    def _inner_backtrack(f, x, dx, rn):
+        def cond(s):
+            _a, ok, it = s
+            return (~ok) & (it < ls_max)
+
+        def step(s):
+            a, _ok, it = s
+            ok = jnp.linalg.norm(f(x + a * dx)) <= (1.0 - ls_c * a) * rn
+            return jnp.where(ok, a, 0.5 * a), ok, it + 1
+
+        a, _ok, _it = jax.lax.while_loop(cond, step, (jnp.asarray(damping, x.dtype), False, 0))
+        return a
+
+    def solve(f, x0):
+        r0n = jnp.linalg.norm(f(x0))
+
+        def cond(state):
+            _u, r, k = state
+            return (jnp.linalg.norm(r) > atol + rtol * r0n) & (k < max_sweeps)
+
+        def body(state):
+            u, _r, k = state
+            u = _sweep(u)
+            return u, f(u), k + 1
+
+        u, _r, _k = jax.lax.while_loop(cond, body, (x0, f(x0), 0))
+        return u
+
+    tangent_solve = lambda g, y: inner(g, y)  # noqa: E731
+    root = jax.lax.custom_root(f0, u0, solve, tangent_solve)
+    return _convergence_check(f0, u0, root, rtol=rtol, atol=atol, max_steps=max_sweeps, who="staggered")
