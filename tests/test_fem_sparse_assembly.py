@@ -143,3 +143,96 @@ def _classify(d):
             comp, value, value_node = _dirichlet_spec(_bare(c))
             dr.append((_field_key_of(c), region, comp, value, value_node))
     return vt, bt, dr, []
+
+
+# ---------------------------------------------------------------------------------------------
+# compress_plan memoization
+# ---------------------------------------------------------------------------------------------
+#
+# The duplicate-collapse plan is a pure function of the triplet pattern, and the pattern is fixed by
+# mesh and terms — so rebuilding the same problem recomputed an identical plan. Measured on 3-D
+# Poisson at 27,833 nodes that was 0.68 s of a 1.5 s build. The cache is keyed on the pattern's
+# CONTENT, which is what makes it safe: a remeshed domain changes the content and simply misses.
+
+
+def _plan_cache():
+    from jno.utils.solver import fem_utils
+
+    return fem_utils._PLAN_CACHE
+
+
+def test_compress_plan_is_reused_for_an_identical_pattern():
+    from jno.utils.solver.fem_utils import compress_plan
+
+    _plan_cache().clear()
+    idx = jnp.asarray(np.array([[0, 0], [0, 1], [1, 1], [0, 0], [2, 2]], dtype=np.int32))
+    first = compress_plan(idx)
+    assert len(_plan_cache()) == 1
+    # a DIFFERENT array object holding the same values must hit: the key is content, not identity
+    second = compress_plan(jnp.asarray(np.asarray(idx)))
+    assert len(_plan_cache()) == 1, "identical content must not create a second entry"
+    assert second is first
+    _plan_cache().clear()
+
+
+def test_a_different_pattern_gets_its_own_plan():
+    from jno.utils.solver.fem_utils import compress_plan
+
+    _plan_cache().clear()
+    a = compress_plan(jnp.asarray(np.array([[0, 0], [1, 1], [0, 0]], dtype=np.int32)))
+    b = compress_plan(jnp.asarray(np.array([[0, 0], [1, 1], [1, 1]], dtype=np.int32)))
+    assert len(_plan_cache()) == 2
+    assert a[2] == 2 and b[2] == 2
+    # the INVERSE differs even though both collapse to 2 slots — a shared plan would be wrong
+    assert not np.array_equal(np.asarray(a[1]), np.asarray(b[1]))
+    _plan_cache().clear()
+
+
+def test_the_plan_cache_is_bounded():
+    from jno.utils.solver.fem_utils import _PLAN_CACHE_MAX, compress_plan
+
+    _plan_cache().clear()
+    for k in range(_PLAN_CACHE_MAX + 3):
+        compress_plan(jnp.asarray(np.array([[0, 0], [1, 1], [k % 7, k]], dtype=np.int32)))
+    assert len(_plan_cache()) <= _PLAN_CACHE_MAX
+    _plan_cache().clear()
+
+
+def test_memoized_plan_matches_an_uncached_recomputation():
+    """The oracle: what the cache returns must equal what the algorithm computes from scratch."""
+    from jno.utils.solver.fem_utils import compress_plan
+
+    rng = np.random.default_rng(0)
+    idx = jnp.asarray(np.stack([rng.integers(0, 12, 400), rng.integers(0, 12, 400)], axis=1).astype(np.int32))
+    _plan_cache().clear()
+    fresh = compress_plan(idx)
+    cached = compress_plan(idx)
+    _plan_cache().clear()
+    recomputed = compress_plan(idx)
+    for got, ref in ((cached, fresh), (recomputed, fresh)):
+        np.testing.assert_array_equal(np.asarray(got[0]), np.asarray(ref[0]))
+        np.testing.assert_array_equal(np.asarray(got[1]), np.asarray(ref[1]))
+        assert got[2] == ref[2]
+    _plan_cache().clear()
+
+
+def test_a_remeshed_domain_does_not_reuse_a_stale_plan():
+    """The one way a plan cache could be silently wrong. Two different meshes of the same problem
+    must produce different operators, not the first mesh's sparsity applied to the second."""
+    _plan_cache().clear()
+    sols, nnzs = [], []
+    for res in (6, 9):
+        d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=1.0 / res)
+        u, v = d.fem_symbols()
+        xi, yi = d.variable("interior", split=True)[:2]
+        xb, yb = d.variable("boundary", split=True)[:2]
+        ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+        fem = jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0])
+        A, _b = fem.operator
+        nnzs.append(int(np.asarray(A.data).size))
+        sols.append(np.asarray(fem.solve()).reshape(-1))
+    assert nnzs[0] != nnzs[1], "the two meshes must not share a sparsity pattern"
+    assert sols[0].size != sols[1].size
+    for s in sols:
+        assert np.all(np.isfinite(s)) and np.max(s) > 0.0
+    _plan_cache().clear()

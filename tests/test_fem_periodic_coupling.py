@@ -80,7 +80,7 @@ def test_periodic_coupling_promotes_and_reduces():
     fem = _build(coupling=lambda w: jnp.zeros_like(jnp.asarray(w).reshape(-1)))
     assert fem._mode == "nonlinear", "the coupling must promote the linear periodic form to nonlinear"
     assert fem._periodic is not None, "the u(left)-u(right) tie must still reduce the coupled system"
-    assert fem._periodic["n_red"] < fem._periodic["n_full"], "the tie must eliminate the slave-face DOFs"
+    assert fem._periodic["n_red"] < fem._periodic["n_full"], "the tie must eliminate the secondary-face DOFs"
 
 
 def test_periodic_coupling_zero_is_plain_periodic():

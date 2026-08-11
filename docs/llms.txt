@@ -1,0 +1,29 @@
+# jNO — jax Numerical Operators
+
+> A JAX-native library for differentiable numerical methods. Classical solvers (FEM, FDM,
+> spectral/RCWA) and scientific machine learning (PINNs, neural operators, Bayesian inference) on
+> one substrate: you write the math — a weak form, a strong-form stencil, a PDE residual, a data
+> loss — and it lowers to a single GPU-ready, end-to-end reverse-mode-differentiable,
+> jit-compiled graph. Import name `jno`, PyPI `jax-numerical-operators`.
+
+The complete LLM briefing — house conventions, API vocabulary, measured gotchas, verified
+end-to-end examples — is one file:
+
+- [Full guide](https://fhg-iisb.github.io/jNO/llms-full.txt): paste-into-a-system-prompt complete
+
+## Docs
+
+- [Installation](https://fhg-iisb.github.io/jNO/Installation/): pip / extras / pixi / Docker; CPU by default, GPU via the [cuda] extra
+- [Getting started](https://fhg-iisb.github.io/jNO/Getting-Started/): first end-to-end problem
+- [Concepts](https://fhg-iisb.github.io/jNO/concepts/): the trace, constraints, crux, models
+- [Domain and geometry](https://fhg-iisb.github.io/jNO/Domain-and-Geometry/): jno.Shape / jno.Path CSG, tags, sampling
+- [FEM](https://fhg-iisb.github.io/jNO/fem/): weak forms as term lists, solver slots, eigenproblems, contact
+- [FDM](https://fhg-iisb.github.io/jNO/fdm/): strong-form collocation from the same term lists
+- [RCWA](https://fhg-iisb.github.io/jNO/rcwa/): periodic-layered electromagnetics
+- [Inverse problems](https://fhg-iisb.github.io/jNO/inverse-problems/): parameters, fields, regularization
+- [Tutorials](https://fhg-iisb.github.io/jNO/#tutorials): 29 worked, verified examples
+
+## Source
+
+- [Repository](https://github.com/FhG-IISB/jNO)
+- [Paper](https://arxiv.org/abs/2605.10159)

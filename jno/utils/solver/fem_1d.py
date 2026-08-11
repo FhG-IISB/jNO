@@ -145,31 +145,17 @@ def line_dof_nodes(order: int) -> np.ndarray:
 # boundary node lookup
 # --------------------------------------------------------------------------
 def _region_node_ids(domain: Any, region: str) -> List[int]:
-    """Mesh node ids whose coordinates satisfy ``region``'s location predicate."""
-    loc = domain._make_tag_location_fn(region)
-    if loc is None:
+    """Mesh node ids whose coordinates satisfy ``region``'s location predicate.
+
+    Resolution goes through ``domain.tag_node_mask``, which evaluates a ``domain.tag`` predicate in
+    numpy float64. Reading the mesh points into a JAX array here instead truncated them to float32
+    (x64 off), so a tag tolerance finer than float32 eps matched no node and its essential condition
+    was dropped in silence -- see that method for the worked case.
+    """
+    mask = domain.tag_node_mask(region, np.asarray(domain.mesh.points))
+    if mask is None:
         raise ValueError(f"jno.fem (1D): boundary region {region!r} has no location function.")
-    pts = jnp.asarray(domain.mesh.points)
-    n = int(pts.shape[0])
-    num_args = loc.__code__.co_argcount if hasattr(loc, "__code__") else 1
-
-    # Map over the points in CHUNKS, not all at once. A geometric region predicate
-    # (`BoundaryRegion.contains`) tests ONE point against every boundary facet, so vmapping it over the
-    # whole mesh materialises an (n_points x n_facets) intermediate -- on a realistic 3-D mesh that is
-    # 11820 x 8502 f64 = 804 MB, which exhausts the device before the problem is even assembled.
-    # Chunking bounds the peak at O(chunk x n_facets) and the result is identical (a pointwise predicate
-    # does not couple points). This runs eagerly (the caller wants concrete ids), so the Python loop is free.
-    chunk = 512
-
-    def _eval(lo, hi):
-        blk = pts[lo:hi]
-        return jax.vmap(loc)(blk) if num_args == 1 else jax.vmap(loc)(blk, jnp.arange(lo, hi))
-
-    if n <= chunk:
-        hits = np.asarray(_eval(0, n)).reshape(-1)
-    else:
-        hits = np.concatenate([np.asarray(_eval(s, min(s + chunk, n))).reshape(-1) for s in range(0, n, chunk)])
-    return list(np.where(hits)[0])
+    return list(np.where(mask)[0])
 
 
 def hermite_dirichlet_dofs(domain: Any, dirichlet_values: Dict[str, Any], rotation_bcs: Any) -> List[Tuple[int, float]]:
@@ -193,12 +179,12 @@ def hermite_dirichlet_dofs(domain: Any, dirichlet_values: Dict[str, Any], rotati
     xs = pts[:, 0]
     pairs: List[Tuple[int, float]] = []
     for region, value in dirichlet_values.items():
-        for nid in _region_node_ids(domain, region):
+        for nid in _essential_node_ids(domain, region):
             g = float(value(pts[nid])) if callable(value) else float(value)
             pairs.append((2 * int(nid), g))
     x_lo, x_hi = float(np.min(xs)), float(np.max(xs))
     for _field_key, region, value_node in rotation_bcs or []:
-        for nid in _region_node_ids(domain, region):
+        for nid in _essential_node_ids(domain, region):
             raw = _eval_value_node_at(value_node, np.asarray(pts[nid]).reshape(1, -1))
             s = float(np.asarray(raw).reshape(-1)[0])
             # du/dn -> du/dx: the outward normal is -1 at the left end, +1 at the right
@@ -231,12 +217,33 @@ def complex_dirichlet_regions(domain: Any, dirichlet_values: Dict[str, Any]) -> 
     return out
 
 
+def _essential_node_ids(domain: Any, region: str) -> List[int]:
+    """``_region_node_ids`` for a region carrying an ESSENTIAL condition -- empty is an error.
+
+    An essential condition that resolves to no node is not a no-op, it is a *different problem*:
+    the row is never pinned, the solve succeeds, and the answer is quietly missing a boundary
+    condition. Refusing here is what makes a mis-specified tag cost a traceback instead of a
+    plausible wrong field.
+    """
+    nids = _region_node_ids(domain, region)
+    if not nids:
+        known = sorted(getattr(domain, "_boundary_regions", {}) or {})
+        raise ValueError(
+            f"jno.fem (1D): the essential condition on region {region!r} matched no mesh node, so it "
+            f"would be dropped and the problem solved without it. Known regions: {known}. "
+            "If this is a domain.tag(...) predicate, check its tolerance against the node "
+            "coordinates -- `d.variable(region)` samples a pool and can be non-empty where the "
+            "predicate still selects no mesh node."
+        )
+    return nids
+
+
 def _dirichlet_dofs(domain: Any, dirichlet_values: Dict[str, Any], vec: int) -> List[Tuple[int, float]]:
     """Resolve ``{region: value}`` into a list of ``(global_dof, value)`` pairs."""
     pts = np.asarray(domain.mesh.points)
     pairs: List[Tuple[int, float]] = []
     for region, value in dirichlet_values.items():
-        for nid in _region_node_ids(domain, region):
+        for nid in _essential_node_ids(domain, region):
             p = pts[nid]
             if isinstance(value, dict):
                 for key, v in value.items():
@@ -703,6 +710,28 @@ def _apply_dirichlet_rows(residual_free, dirichlet_pairs: List[Tuple[int, float]
     return residual
 
 
+def _sparse_dirichlet_jacobian(residual_obj, dirichlet_pairs: List[Tuple[int, float]]):
+    """``(u, args) -> BCOO``: the assembled tangent of the Dirichlet-row-replaced residual.
+
+    The matrix-level companion of :func:`_apply_dirichlet_rows` — the free tangent comes from the
+    residual's own element scatter (``sparse_jacobian``), and each pinned row becomes an identity row,
+    which is exactly what differentiating ``u[d] - g`` gives.
+
+    ``newton_direct`` documents its tangent as an **assembled BCOO**. 1-D handed it a global
+    ``jax.jacfwd`` instead, which is ``O(N^2)`` on the one dimension where node counts are meant to be
+    large, and — inside the Newton ``lax.while_loop`` — fatal: ``sparse_lu_solve`` then reaches
+    ``BCOO.fromdense`` on a tracer, whose ``nse`` cannot be concrete, so every
+    ``newton(direct=True)`` solve died with a ``ConcretizationTypeError``.
+    """
+    dofs = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32) if dirichlet_pairs else None
+
+    def jacobian(u, args=None):
+        A = residual_obj.sparse_jacobian(jnp.asarray(u), args)
+        return A if dofs is None else bcoo_set_dirichlet_rows(A, dofs)
+
+    return jacobian
+
+
 # --------------------------------------------------------------------------
 # public entry: assemble a 1D problem into (op, mode) for the FEM container
 # --------------------------------------------------------------------------
@@ -807,14 +836,16 @@ def assemble_fem_1d(
         # The residual already re-evaluates its coefficients from ``args`` (that is what made the linear
         # path parametric), and ``FemResidualOperator`` takes ``R(u, args)`` — so a parameter or network
         # in a NONLINEAR form threads with no extra machinery: Newton runs on R(·, θ) and the implicit
-        # derivative gives ∂u/∂θ. NOTE the jacobian_fn stays a dense global jacfwd; the matrix-free
-        # Newton-Krylov default never calls it, so it is a latent cost rather than an active one.
+        # derivative gives ∂u/∂θ. The jacobian_fn is the element-scattered BCOO, not a global jacfwd:
+        # the matrix-free Newton-Krylov default never calls it, but `newton(direct=True)` does — from
+        # inside a `lax.while_loop`, where a dense tangent cannot be sparsified (see
+        # :func:`_sparse_dirichlet_jacobian`).
         def res_p(u, args=None):
             return _apply_dirichlet_rows(lambda uu: residual_free(uu, args), dirichlet_pairs)(jnp.asarray(u))
 
         op = FemResidualOperator(
             residual_fn=res_p,
-            jacobian_fn=lambda u, args=None: jax.jacfwd(lambda uu: res_p(uu, args))(jnp.asarray(u)),
+            jacobian_fn=_sparse_dirichlet_jacobian(residual_free, dirichlet_pairs),
             size=ndof,
             runtime_parameter_exprs=_param_and_neural_exprs,
         )
@@ -1110,7 +1141,9 @@ def _assemble_1d_transient(
         block = SemidiscreteTimeBlock(
             mass=lambda t, args=None, _M=compress_eager(M_nl): _M,
             residual=res_pt,
-            jacobian=lambda u, t, args=None: jax.jacfwd(lambda uu: res_pt(uu, t, args))(jnp.asarray(u)),
+            # `res_pt` is the spatial residual with Dirichlet rows (the mass is carried separately
+            # above), so its tangent is exactly the Dirichlet-row-replaced spatial one.
+            jacobian=lambda u, t, args=None, _j=_sparse_dirichlet_jacobian(spatial_res, dirichlet_pairs): _j(u, args),
             runtime_parameter_exprs=_param_exprs,
             **common,
         )
@@ -1551,7 +1584,7 @@ def assemble_fem_1d_multifield(
 
         op = FemResidualOperator(
             residual_fn=res_p,
-            jacobian_fn=lambda u, args=None: jax.jacfwd(lambda uu: res_p(uu, args))(jnp.asarray(u)),
+            jacobian_fn=_sparse_dirichlet_jacobian(residual_free, dirichlet_pairs),
             size=total,
             runtime_parameter_exprs=_c_exprs,
         )

@@ -2,7 +2,7 @@
 
 <div class="hero-actions" markdown>
 <a class="md-button md-button--primary" href="/jNO/tutorial_examples/09_fdm/inverse_source_fdm.py" download>Download .py</a>
-<a class="md-button" href="/jNO/tutorials/09-fdm/">Back to chapter</a>
+<a class="md-button" href="/jNO/#tutorials">All tutorials</a>
 </div>
 
 When the constraint list carries a trainable `jno.np.parameter`, `jno.fdm([...]).solve()` returns a

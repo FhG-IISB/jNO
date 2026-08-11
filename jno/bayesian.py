@@ -790,7 +790,7 @@ class _BayesianInitializer:
     ``__call__(rng_key, logdensity_fn, position, num_chains)
     -> (new_position, extra_kwargs_update)``
 
-    * ``rng_key`` — master PRNG key for this initializer.
+    * ``rng_key`` — root PRNG key for this initializer.
     * ``logdensity_fn`` — closes over the loss + prior.  Already
       mask-wrapped if the model was configured via
       ``.mask(M).bayesian(...)`` — subclasses see only the masked

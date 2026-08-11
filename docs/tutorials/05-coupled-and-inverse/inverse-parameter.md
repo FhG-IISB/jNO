@@ -2,7 +2,7 @@
 
 <div class="hero-actions" markdown>
 <a class="md-button md-button--primary" href="/jNO/tutorial_examples/05_coupled_and_inverse/inverse_parameter.py" download>Download .py</a>
-<a class="md-button" href="/jNO/tutorials/05-coupled-and-inverse/">Back to chapter</a>
+<a class="md-button" href="/jNO/#tutorials">All tutorials</a>
 </div>
 
 This example is an inverse problem rather than a field solve: it learns unknown scalar coefficients from residual constraints.
@@ -18,7 +18,7 @@ Instead of only training a neural field, the script creates scalar parameter mod
 ```python
 A_true, B_true, C_true = 3.14, -2.71, 42.0
 
-domain = jno.domain.line(mesh_size=0.01)
+domain = jno.Path(0.0, 0.0).line_to(1.0, 0.0).curve(size=0.01).domain()
 x, _ = domain.variable("interior")
 
 target = A_true * jno.np.sin(π * x) + B_true * jno.np.cos(π * x) + C_true * x * (1 - x)
@@ -74,7 +74,7 @@ For field identification (recovering a spatially-varying `k(x,y)` rather than a 
 
 <div class="hero-actions" markdown>
 <a class="md-button md-button--primary" href="/jNO/tutorial_examples/05_coupled_and_inverse/inverse_parameter.py" download>Download full script</a>
-<a class="md-button" href="/jNO/tutorials/05-coupled-and-inverse/">Back to 05 Coupled and Inverse</a>
+<a class="md-button" href="/jNO/#tutorials">All tutorials</a>
 </div>
 
 ## Script Snippet

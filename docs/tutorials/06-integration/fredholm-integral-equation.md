@@ -2,7 +2,7 @@
 
 <div class="hero-actions" markdown>
 <a class="md-button md-button--primary" href="/jNO/tutorial_examples/06_integration/fredholm_integral_equation.py" download>Download .py</a>
-<a class="md-button" href="/jNO/tutorials/06-integration/">Back to chapter</a>
+<a class="md-button" href="/jNO/#tutorials">All tutorials</a>
 </div>
 
 This example solves a **Fredholm integral equation of the second kind** — an equation where the unknown function appears both outside and inside an integral.  The exact solution is known, so the trained network's accuracy can be measured directly.
@@ -40,7 +40,7 @@ $C$ is a **scalar** independent of $x$.  jno computes it with one `.integrate()`
 ## Step 1: Set up the domain
 
 ```python
-domain = jno.domain.line(mesh_size=0.01)
+domain = jno.Path(0.0, 0.0).line_to(1.0, 0.0).curve(size=0.01).domain()
 x, _ = domain.variable("interior")
 ```
 
@@ -106,5 +106,5 @@ The trained network reproduces the analytic solution $u^*(x)=\sin(\pi x)$ to rel
 
 <div class="hero-actions" markdown>
 <a class="md-button md-button--primary" href="/jNO/tutorial_examples/06_integration/fredholm_integral_equation.py" download>Download full script</a>
-<a class="md-button" href="/jNO/tutorials/06-integration/">Back to 06 Integration</a>
+<a class="md-button" href="/jNO/#tutorials">All tutorials</a>
 </div>

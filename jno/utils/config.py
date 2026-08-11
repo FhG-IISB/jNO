@@ -248,7 +248,8 @@ def enable_compile_cache(directory: str | None = None) -> str:
     for 187 entries and 7.2 MB.
 
     Off by default because a library should not write to a user's disk uninvited; this is the
-    opt-in, also reachable as ``jno.setup(__file__, compile_cache=True)``.
+    opt-in, also reachable as ``jno.setup(__file__, compile_cache=True)`` or, per project,
+    ``[jno] compile_cache = true`` in ``.jno.toml``.
 
     **The first run is SLOWER, sometimes much slower** -- writing the entries is not free. A 75k-node
     3-D Poisson build measured 7.45 s with no cache, 18.30 s on the run that populates one, and
@@ -345,7 +346,11 @@ def setup(
             * ``False`` — off. ``True`` — on, at ``~/.cache/jno/xla``.
             * ``str`` — on, at that directory.
 
-            Off by default deliberately: a library should not write to a user's disk uninvited.
+            **Off by default, deliberately: a library should not write to a user's disk uninvited.**
+            Worth turning on for anything run more than once — a sweep, an optimisation loop, a test
+            suite, or just re-running a script after an edit. Measured on 3-D Poisson at 27,833 nodes:
+            first build 4.75 s -> 2.22 s, repeat build 2.48 s -> 1.51 s. Set it once per project with
+            ``[jno] compile_cache = true`` in ``.jno.toml`` rather than editing each script.
 
     Returns:
         The path of the run directory (created if absent).

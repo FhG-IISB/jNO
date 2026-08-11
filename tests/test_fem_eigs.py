@@ -479,34 +479,45 @@ def _nonsymmetric_pencil(n=40, skew=2.0, seed=0):
     return S + skew * A
 
 
-def test_eigs_refuses_a_nonsymmetric_operator():
+def test_eigs_solves_a_nonsymmetric_operator_instead_of_symmetrizing_it():
     """A non-symmetric K used to be SILENTLY symmetrized: the solver returned the spectrum of
     ½(K+Kᵀ), and (measured) not one returned value was an eigenvalue of K, whose true spectrum was
-    complex. Every plasma/flow stability operator is non-self-adjoint, so this must refuse."""
+    complex. That was then made a hard refusal; it is now ROUTED to Arnoldi, which answers the
+    question asked. The invariant across all three eras is the same and is what this asserts: the
+    symmetrized surrogate must never come back as if it were the answer."""
     K = _nonsymmetric_pencil()
     n = K.shape[0]
     true = np.linalg.eigvals(K)
     assert np.abs(true.imag).max() > 1.0, "fixture must have a genuinely complex spectrum"
 
-    with pytest.raises(ValueError, match="NOT symmetric"):
-        jno.solve.eigs(k=4)(jnp.asarray(K), jnp.eye(n))
-    # the message must name the measured asymmetry and the escape hatch
-    with pytest.raises(ValueError, match=r"0\.5\*\(K \+ K\.T\)"):
-        jno.solve.eigs(k=4)(jnp.asarray(K), jnp.eye(n))
-    # ... and it must guard the iterative and shift-invert paths too, not just the dense reduction
-    with pytest.raises(ValueError, match="NOT symmetric"):
+    lam, _ = jno.solve.eigs(k=4)(jnp.asarray(K), jnp.eye(n))
+    lam = np.asarray(lam)
+    assert np.iscomplexobj(lam)
+    surrogate = np.linalg.eigvalsh(0.5 * (K + K.T))
+    for value in lam:  # every value is K's, none is the surrogate's
+        assert np.min(np.abs(true - value)) < 1e-8
+        assert np.min(np.abs(surrogate - value)) > 1e-8
+
+    # the shift-invert path reaches the interior of that complex spectrum too
+    lam_s = np.asarray(jno.solve.eigs(k=2, sigma=0.5)(jnp.asarray(K), jnp.eye(n))[0])
+    near = true[np.argsort(np.abs(true - 0.5))[:2]]
+    np.testing.assert_allclose(np.sort_complex(lam_s), np.sort_complex(near), rtol=1e-7, atol=1e-8)
+
+    # ...but a slot Arnoldi cannot honour is refused rather than quietly dropped
+    with pytest.raises(ValueError, match="non-symmetric"):
         jno.solve.eigs(k=4, precond=jno.precond.jacobi())(jnp.asarray(K), jnp.eye(n))
-    with pytest.raises(ValueError, match="NOT symmetric"):
-        jno.solve.eigs(k=2, sigma=0.5)(jnp.asarray(K), jnp.eye(n))
 
 
-def test_eigs_refuses_a_nonsymmetric_mass():
-    """M is checked too — an asymmetric mass breaks the M-inner product every path relies on."""
+def test_a_nonsymmetric_mass_also_routes_to_the_nonsymmetric_path():
+    """M is checked too -- an asymmetric mass breaks the M-inner product every symmetric path relies
+    on, so the pencil must go to Arnoldi even when K itself is symmetric."""
     n = 30
     K = np.eye(n) * 2.0
     M = np.eye(n) + 0.3 * np.tril(np.ones((n, n)), -1)  # lower-triangular perturbation: asymmetric
-    with pytest.raises(ValueError, match="M is NOT symmetric"):
-        jno.solve.eigs(k=3)(jnp.asarray(K), jnp.asarray(M))
+    lam, _ = jno.solve.eigs(k=3)(jnp.asarray(K), jnp.asarray(M))
+    ref = np.linalg.eigvals(np.linalg.solve(M, K))
+    for value in np.asarray(lam):
+        assert np.min(np.abs(ref - value)) < 1e-8
 
 
 def test_eigs_symmetrized_surrogate_is_still_reachable_explicitly():
@@ -519,12 +530,15 @@ def test_eigs_symmetrized_surrogate_is_still_reachable_explicitly():
     assert np.allclose(np.sort(np.asarray(lam)), np.sort(np.linalg.eigvalsh(Ks))[:4], rtol=1e-8)
 
 
-def test_eigs_symmetry_guard_tolerates_assembly_roundoff():
-    """The guard must not fire on a real FEM pencil, whose asymmetry is summation roundoff — that is
-    exactly what the reductions' Hermitianization is legitimately for."""
+def test_assembly_roundoff_still_takes_the_SYMMETRIC_path():
+    """The routing must not flip on summation roundoff -- that is exactly what the reductions'
+    Hermitianization is legitimately for. A real FEM pencil has to stay on the real, differentiable
+    symmetric path; only a genuinely non-self-adjoint operator earns the complex one."""
     K, mass = _laplacian(0.09)
     lam, _ = K.eigs(mass=mass, k=4)
     assert np.all(np.isfinite(np.asarray(lam)))
+    assert not np.iscomplexobj(np.asarray(lam)), "a FEM Laplacian must not be routed to Arnoldi"
+
     # explicit perturbation just under / over the threshold, to pin where the line sits
     A = _dense(K.operator[0])
     n = A.shape[0]
@@ -532,9 +546,10 @@ def test_eigs_symmetry_guard_tolerates_assembly_roundoff():
     P = rng.normal(size=(n, n))
     P = 0.5 * (P - P.T)
     scale = np.abs(A).max()
-    jno.solve.eigs(k=2)(jnp.asarray(A + 1e-12 * scale * P), jnp.eye(n))  # roundoff-level: accepted
-    with pytest.raises(ValueError, match="NOT symmetric"):
-        jno.solve.eigs(k=2)(jnp.asarray(A + 1e-3 * scale * P), jnp.eye(n))
+    roundoff = jno.solve.eigs(k=2)(jnp.asarray(A + 1e-12 * scale * P), jnp.eye(n))[0]
+    assert not np.iscomplexobj(np.asarray(roundoff)), "roundoff-level asymmetry must stay symmetric"
+    genuine = jno.solve.eigs(k=2)(jnp.asarray(A + 1e-3 * scale * P), jnp.eye(n))[0]
+    assert np.iscomplexobj(np.asarray(genuine)), "a real asymmetry must switch paths"
 
 
 def test_eigs_symmetry_guard_is_silent_under_trace():

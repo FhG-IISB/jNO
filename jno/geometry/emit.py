@@ -43,6 +43,13 @@ def _emit_node(node, occ, split_full=False):
             pieces.extend(_emit_node(sub._node, occ, split_full))
         # Fragment every piece against the others: shared interfaces become conforming
         # (element edges align), and each material region survives as its own volume entity.
+        # `conforming=False` skips it, so each piece is meshed on its own and two touching regions
+        # get two coincident, NON-matching surfaces with duplicated nodes -- the configuration a
+        # mortar tie glues. Measured on two boxes sharing a face at different mesh sizes: fragment
+        # gives 44 interface nodes at 44 distinct coordinates (merged), no-fragment gives 56 at 52
+        # (only the 4 corners coincide).
+        if len(node) > 2 and not node[2]:
+            return pieces
         out, _ = occ.fragment(pieces[:1], pieces[1:])
         return out
     if kind in ("cut", "fuse", "inter"):
@@ -134,6 +141,60 @@ def _plan_sizes(shape):
     return out
 
 
+def _apply_region_sizes(dim: int, shape) -> Optional[float]:
+    """Per-**region** mesh size for a ``conforming=False`` multi-material shape.
+
+    The ordinary path (:func:`_apply_size_fields`) turns each ``size=`` into a Distance+Threshold
+    *field*, which is a function of POSITION. Two coincident faces sit at the same position, so both
+    bodies of a non-conforming interface get the same target size and gmsh meshes them identically --
+    the two sides come out matching, the tie resolves node-to-node, and the mortar coupling is never
+    reached. Measured: a 3x size ratio between two stacked blocks still gave 41 nodes on each side.
+
+    Sizing each region's own OCC entities instead is what makes "coarse body, fine body" expressible.
+    Entities are attributed to regions by centroid containment -- the same test ``_to_meshio`` uses for
+    cells -- so no extra plumbing is needed from the emitter. Note this only makes sense when the
+    pieces are NOT fragmented: a conforming interface shares its points between both regions, so a
+    per-region size would just be whichever was written last.
+
+    Returns a representative ``ds``, or ``None`` when it does not apply (leaving the field path in
+    charge).
+    """
+    node = shape._node
+    if node[0] != "regions" or (len(node) > 2 and node[2]):
+        return None  # not a regions shape, or conforming -> shared entities, per-region size is moot
+    items = node[1]
+    sizes = {name: sub._size for name, sub in items if isinstance(sub._size, (int, float))}
+    if not sizes:
+        return None
+
+    import gmsh
+    import numpy as np
+
+    applied: List[float] = []
+    for edim, etag in gmsh.model.getEntities(dim):
+        centre = np.asarray(gmsh.model.occ.getCenterOfMass(edim, etag), dtype=float).reshape(1, 3)
+        for name, sub in items:
+            if name not in sizes:
+                continue
+            try:
+                inside = bool(np.asarray(sub.contains(centre[:, : sub.dim]))[0])
+            except NotImplementedError:
+                inside = False  # a swept/revolved region has no closed-form membership; skip it
+            if inside:
+                pts = [e for e in gmsh.model.getBoundary([(edim, etag)], oriented=False, recursive=True) if e[0] == 0]
+                if pts:
+                    gmsh.model.mesh.setSize(pts, float(sizes[name]))
+                    applied.append(float(sizes[name]))
+                break
+    if not applied:
+        return None
+    # The field path disables point sizes; this one depends on them.
+    gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 1)
+    gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 1)
+    gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
+    return float(min(applied))
+
+
 def _apply_size_fields(dim: int, leaves, labels: Dict[int, Tuple[int, str]], shape) -> Optional[float]:
     """Turn per-shape ``size`` into gmsh mesh-size controls. Returns a representative ``ds``.
 
@@ -223,7 +284,13 @@ def _facet_components(facet_idx, facet_nodes):
     return [np.asarray(facet_idx)[g] for g in groups.values()]
 
 
-def _to_meshio(dim: int, labels: Dict[int, Tuple[int, str]], region_items=None):
+#: gmsh element types for the second-order (curved) simplices, keyed by (dim, n_nodes-per-cell).
+_TRI6, _TET10, _LINE3 = 9, 11, 8
+
+
+def _to_meshio(
+    dim: int, labels: Dict[int, Tuple[int, str]], region_items=None, nonconforming: bool = False, order: int = 1
+):
     """Assemble the generated gmsh mesh into a ``meshio.Mesh`` with named ``cell_sets``.
 
     ``region_items`` (``((name, sub_shape), ...)``, when the plan is a :meth:`Shape.regions`
@@ -232,6 +299,14 @@ def _to_meshio(dim: int, labels: Dict[int, Tuple[int, str]], region_items=None):
     auto-named by the region pair it separates (``"a|b"`` = every facet between those two materials,
     however many gmsh faces that spans). Only *topologically disjoint* interfaces of the same pair
     (e.g. two separate inclusions) additionally split into connected components ``"a|b.0"`` / ``"a|b.1"``.
+
+    ``nonconforming`` (``Shape.regions(conforming=False)``) changes how an interface is *found*. With
+    the fragment skipped, the two sides of an interface are separate OCC entities each adjacent to a
+    single volume, so the adjacency test above sees them as ordinary outer boundary. They are instead
+    matched **geometrically** — two boundary faces of different regions occupying the same bounding
+    box — and each side is tagged separately as ``"a|b.a"`` / ``"a|b.b"``, since the two are spatially
+    coincident and no ``domain.tag`` predicate could tell them apart. Tie them in ``jno.fem`` with
+    ``u("a|b.a") - u("a|b.b")``.
     """
     import gmsh
     import meshio
@@ -241,12 +316,16 @@ def _to_meshio(dim: int, labels: Dict[int, Tuple[int, str]], region_items=None):
     coords = np.asarray(coords, dtype=float).reshape(-1, 3)
     index = {int(t): i for i, t in enumerate(node_tags)}
 
+    curved = int(order) > 1
     if dim == 1:
-        vtype, npv, vblock = _LINE, 2, "line"
+        vtype, npv, vblock = (_LINE3, 3, "line3") if curved else (_LINE, 2, "line")
         btype, npb, bblock = _POINT, 1, "vertex"  # boundary of a 1-D domain = its two endpoints
+    elif dim == 3:
+        vtype, npv, vblock = (_TET10, 10, "tetra10") if curved else (_TET, 4, "tetra")
+        btype, npb, bblock = (_TRI6, 6, "triangle6") if curved else (_TRI, 3, "triangle")
     else:
-        vtype, npv, vblock = (_TET, 4, "tetra") if dim == 3 else (_TRI, 3, "triangle")
-        btype, npb, bblock = (_TRI, 3, "triangle") if dim == 3 else (_LINE, 2, "line")
+        vtype, npv, vblock = (_TRI6, 6, "triangle6") if curved else (_TRI, 3, "triangle")
+        btype, npb, bblock = (_LINE3, 3, "line3") if curved else (_LINE, 2, "line")
 
     _vtags, vnodes = gmsh.model.mesh.getElementsByType(vtype)
     vcells = np.asarray([index[int(t)] for t in vnodes], dtype=np.int64).reshape(-1, npv)
@@ -272,6 +351,7 @@ def _to_meshio(dim: int, labels: Dict[int, Tuple[int, str]], region_items=None):
     by_name: Dict[str, List[np.ndarray]] = {}
     external_ranges: List[np.ndarray] = []
     iface_entities: Dict[str, List[np.ndarray]] = {}  # "a|b" -> per-entity facet index ranges
+    nonconf_faces: List[Tuple[tuple, str, np.ndarray]] = []  # (bbox, owning region, facet range)
     for _edim, etag in gmsh.model.getEntities(bdim):
         adj = gmsh.model.getAdjacencies(bdim, etag)[0] if region_items is not None else ()
         interface_pair = None
@@ -301,16 +381,42 @@ def _to_meshio(dim: int, labels: Dict[int, Tuple[int, str]], region_items=None):
             external_ranges.append(rng)
             if label is not None:
                 by_name.setdefault(label[1], []).append(rng)
+            if nonconforming and len(adj) == 1 and int(adj[0]) in vol_region:
+                # Remember this face's owner + extent; coincident faces of DIFFERENT regions are the
+                # two sides of a non-conforming interface, matched after the loop.
+                bbox = tuple(np.round(gmsh.model.getBoundingBox(bdim, etag), 9))
+                nonconf_faces.append((bbox, vol_region[int(adj[0])], rng))
 
     facets = np.asarray(facet_rows, dtype=np.int64).reshape(-1, npb) if facet_rows else np.zeros((0, npb), dtype=np.int64)
     empty = np.array([], dtype=np.int64)
     cells = [(vblock, vcells), (bblock, facets)]
     cell_sets: Dict[str, list] = {"interior": [np.arange(len(vcells), dtype=np.int64), empty.copy()]}
+
+    # Non-conforming interfaces: group the region-owned outer faces by extent; any bounding box shared
+    # by two or more regions is an interface, and each region's side gets its own tag.
+    by_bbox: Dict[tuple, Dict[str, List[np.ndarray]]] = {}
+    for bbox, region, rng in nonconf_faces:
+        by_bbox.setdefault(bbox, {}).setdefault(region, []).append(rng)
+    nonconf_iface: List[np.ndarray] = []
+    for sides in by_bbox.values():
+        if len(sides) < 2:
+            continue  # only one region on this footprint -> a genuine outer face, not an interface
+        pair = "|".join(sorted(sides))
+        for region, chunks in sides.items():
+            idx = np.concatenate(chunks)
+            cell_sets[f"{pair}.{region}"] = [empty.copy(), idx]
+            nonconf_iface.append(idx)
+
+    # These faces are INTERNAL to the assembly even though each is topologically its own body's outer
+    # surface, so they must be withheld from "boundary" and from the auto face names exactly as a
+    # conforming "a|b" interface is. Leaving them in makes a `u(boundary) - g` Dirichlet pin the
+    # interface itself -- measured as a 24% drop in the peak solution before this was excluded.
+    drop = np.concatenate(nonconf_iface) if nonconf_iface else empty.copy()
+    _keep = (lambda a: a[~np.isin(a, drop)]) if drop.size else (lambda a: a)
     for name, chunks in by_name.items():
-        cell_sets[name] = [empty.copy(), np.concatenate(chunks) if chunks else empty.copy()]
+        cell_sets[name] = [empty.copy(), _keep(np.concatenate(chunks)) if chunks else empty.copy()]
     # "boundary" is the OUTER boundary only (internal interfaces are separate, named tags).
-    ext = np.concatenate(external_ranges) if external_ranges else empty.copy()
-    cell_sets["boundary"] = [empty.copy(), ext]
+    cell_sets["boundary"] = [empty.copy(), _keep(np.concatenate(external_ranges) if external_ranges else empty.copy())]
 
     for pair, ent_list in iface_entities.items():
         all_idx = np.concatenate(ent_list)  # every facet between this pair (across all its faces)
@@ -333,8 +439,8 @@ def _to_meshio(dim: int, labels: Dict[int, Tuple[int, str]], region_items=None):
 
 
 def _apply_periodic(dim, labels, periodic):
-    """gmsh ``setPeriodic`` for each ``(master_name, slave_name)`` boundary-face pair: mesh the slave face
-    as a *translated copy* of the master so opposite boundaries mesh identically (conforming) — required
+    """gmsh ``setPeriodic`` for each ``(main_name, secondary_name)`` boundary-face pair: mesh the secondary face
+    as a *translated copy* of the main so opposite boundaries mesh identically (conforming) — required
     for edge-element (Nédélec) periodic ties, whose per-edge DOFs must line up one-to-one across the cell.
     The translation is read from the face bounding-box centroids; a pair whose faces aren't both present is
     skipped (nothing to tie)."""
@@ -351,11 +457,11 @@ def _apply_periodic(dim, labels, periodic):
         bb = np.array([gmsh.model.getBoundingBox(bdim, t) for t in tags])  # (n, 6): (xlo,ylo,zlo,xhi,yhi,zhi)
         return 0.5 * (bb[:, :3].min(axis=0) + bb[:, 3:].max(axis=0))
 
-    for master, slave in periodic:
-        m_tags, s_tags = by_name.get(master, []), by_name.get(slave, [])
+    for main, secondary in periodic:
+        m_tags, s_tags = by_name.get(main, []), by_name.get(secondary, [])
         if not m_tags or not s_tags:
             continue
-        t = _centroid(s_tags) - _centroid(m_tags)  # translation master -> slave
+        t = _centroid(s_tags) - _centroid(m_tags)  # translation main -> secondary
         affine = [1, 0, 0, t[0], 0, 1, 0, t[1], 0, 0, 1, t[2], 0, 0, 0, 1]  # row-major 4×4
         gmsh.model.mesh.setPeriodic(bdim, s_tags, m_tags, affine)
 
@@ -390,7 +496,7 @@ MESH_THREADS = 1
 MESH_ALGORITHM_2D = 6
 
 
-def _build_once(shape, split_full, periodic=None, algorithm=None, threads=None):
+def _build_once(shape, split_full, periodic=None, algorithm=None, threads=None, order=1):
     import gmsh
 
     started = not gmsh.isInitialized()
@@ -415,12 +521,25 @@ def _build_once(shape, split_full, periodic=None, algorithm=None, threads=None):
         dim = shape.dim
         leaves = shape.leaves()
         labels = classify_boundary(dim, shape)
-        ds = _apply_size_fields(dim, leaves, labels, shape)
+        # A non-conforming multi-material shape sizes each region's own entities; the position-based
+        # field path cannot distinguish two coincident faces and would mesh both bodies identically.
+        ds = _apply_region_sizes(dim, shape) or _apply_size_fields(dim, leaves, labels, shape)
         if periodic:  # make named opposite faces conform (edge-element periodic ties need it)
             _apply_periodic(dim, labels, periodic)
         gmsh.model.mesh.generate(dim)
-        region_items = shape._node[1] if shape._node[0] == "regions" else None
-        mesh = _to_meshio(dim, labels, region_items)
+        if int(order) > 1:
+            # CURVED (isoparametric) geometry. Without this the mesh is straight-sided and jNO
+            # SYNTHESISES its higher-order nodes by interpolating reference points through the affine
+            # map (`fem_native._get_mesh` -> `_promote_to_degree`), so a P2 midside node lands on the
+            # straight-edge midpoint and the domain stays a polygon however high the basis order goes.
+            # `setOrder` asks gmsh to place those nodes on the actual CAD surface instead; without
+            # `HighOrderOptimize` gmsh curves only the boundary entities, which is exactly the part
+            # that matters and keeps interior cells affine (so `detJ` cannot go negative on them).
+            gmsh.model.mesh.setOrder(int(order))
+        is_regions = shape._node[0] == "regions"
+        region_items = shape._node[1] if is_regions else None
+        nonconforming = is_regions and len(shape._node) > 2 and not shape._node[2]
+        mesh = _to_meshio(dim, labels, region_items, nonconforming=nonconforming, order=int(order))
         return mesh, dim, ds
     finally:
         gmsh.model.remove()
@@ -428,7 +547,7 @@ def _build_once(shape, split_full, periodic=None, algorithm=None, threads=None):
             gmsh.finalize()
 
 
-def build(shape, periodic=None, *, algorithm=None, threads=None):
+def build(shape, periodic=None, *, algorithm=None, threads=None, order=1):
     """Mesh ``shape`` -> ``(meshio.Mesh, dim, ds)``.
 
     ``algorithm`` selects gmsh's meshing kernel for the shape's own dimension -- there is no
@@ -436,14 +555,20 @@ def build(shape, periodic=None, *, algorithm=None, threads=None):
     thread count. ``None`` uses :data:`MESH_ALGORITHM_2D` / :data:`MESH_ALGORITHM_3D` /
     :data:`MESH_THREADS`, whose docstrings record the measurements behind each default.
 
-    ``periodic`` is an optional list of ``(master_name, slave_name)`` boundary-face pairs meshed conforming
+    ``periodic`` is an optional list of ``(main_name, secondary_name)`` boundary-face pairs meshed conforming
     (via :func:`_apply_periodic`) so opposite faces line up — needed for Nédélec edge periodic ties.
+
+    ``order=2`` meshes **curved (isoparametric)** geometry: gmsh places the midside nodes on the actual
+    CAD surface instead of jNO synthesising them at straight-edge midpoints, so a round boundary stays
+    round. Without it the domain is a polygon at every basis order, which caps the discretisation at
+    O(h^2) however high the element order goes, and leaves facet normals O(h) wrong. Emits second-order
+    meshio blocks (``triangle6`` / ``tetra10`` / ``line3``).
 
     A single-sweep full (2pi) revolve of a *detached* profile makes a periodic surface gmsh cannot mesh,
     while an axis-touching profile (a cone) meshes fine that way -- so we try the single sweep first and
     only fall back to the two-halves construction if meshing fails.
     """
-    opts = dict(algorithm=algorithm, threads=threads)
+    opts = dict(algorithm=algorithm, threads=threads, order=order)
     try:
         return _build_once(shape, split_full=False, periodic=periodic, **opts)
     except Exception as exc:  # noqa: BLE001 - narrow retry on the periodic-surface mesher failure

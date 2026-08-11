@@ -2,7 +2,7 @@
 
 <div class="hero-actions" markdown>
 <a class="md-button md-button--primary" href="/jNO/tutorial_examples/09_fdm/poisson_2d_fdm.py" download>Download .py</a>
-<a class="md-button" href="/jNO/tutorials/09-fdm/">Back to chapter</a>
+<a class="md-button" href="/jNO/#tutorials">All tutorials</a>
 </div>
 
 The strong-form counterpart of the [Poisson FEM primer](../08-fem-and-varpinns/poisson-2d-fem.md):

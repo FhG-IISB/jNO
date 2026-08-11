@@ -2,7 +2,7 @@
 
 <div class="hero-actions" markdown>
 <a class="md-button md-button--primary" href="/jNO/tutorial_examples/07_stochastic/fokker_planck_2d.py" download>Download .py</a>
-<a class="md-button" href="/jNO/tutorials/07-stochastic/">Back to chapter</a>
+<a class="md-button" href="/jNO/#tutorials">All tutorials</a>
 </div>
 
 This example solves the **stationary Fokker-Planck equation** for a 2-D Ornstein-Uhlenbeck process — a PDE that describes how a probability density evolves under drift and diffusion.  It introduces `jno.noise` to add stochastic measurement uncertainty to the boundary observations, so the network sees freshly-sampled noisy data every training step.
@@ -116,5 +116,5 @@ The network's stationary density (left) matches the analytic Ornstein-Uhlenbeck 
 
 <div class="hero-actions" markdown>
 <a class="md-button md-button--primary" href="/jNO/tutorial_examples/07_stochastic/fokker_planck_2d.py" download>Download full script</a>
-<a class="md-button" href="/jNO/tutorials/07-stochastic/">Back to 07 Stochastic</a>
+<a class="md-button" href="/jNO/#tutorials">All tutorials</a>
 </div>

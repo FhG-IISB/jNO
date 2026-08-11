@@ -2,7 +2,7 @@
 
 <div class="hero-actions" markdown>
 <a class="md-button md-button--primary" href="/jNO/tutorial_examples/02_elliptic/variable_coefficient_poisson_2d.py" download>Download .py</a>
-<a class="md-button" href="/jNO/tutorials/02-elliptic/">Back to chapter</a>
+<a class="md-button" href="/jNO/#tutorials">All tutorials</a>
 </div>
 
 Same square geometry as the constant-coefficient example, but with a spatially varying conductivity field.
@@ -54,7 +54,7 @@ Evaluated on the mesh nodes, the trained network reproduces the manufactured sol
 
 <div class="hero-actions" markdown>
 <a class="md-button md-button--primary" href="/jNO/tutorial_examples/02_elliptic/variable_coefficient_poisson_2d.py" download>Download full script</a>
-<a class="md-button" href="/jNO/tutorials/02-elliptic/">Back to 02 Elliptic</a>
+<a class="md-button" href="/jNO/#tutorials">All tutorials</a>
 </div>
 
 ## Full script

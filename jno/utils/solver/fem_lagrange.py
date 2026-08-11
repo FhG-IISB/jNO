@@ -210,19 +210,34 @@ def identity_pushforward(
     ----------
     ref_values : ``(n_quad, n_dof, 1)``  scalar shape values from basix tabulation.
     ref_grads  : ``(n_quad, n_dof, 1, tdim)``  ``∂φ/∂ξ`` from basix (value_size=1).
-    J          : ``(tdim, tdim)``  affine cell Jacobian (columns = physical edge vectors).
-    detJ       : scalar, unused (kept for API symmetry with the Piola push-forwards).
+    J          : ``(tdim, tdim)`` affine cell Jacobian (columns = physical edge vectors), **or**
+                 ``(n_quad, tdim, tdim)`` for **curved (isoparametric)** geometry, where the map is
+                 no longer affine and ``J`` varies over the cell.
+    detJ       : scalar or ``(n_quad,)``, unused (kept for API symmetry with the Piola push-forwards).
 
     Returns
     -------
     phi       : ``(n_quad, n_dof)``  physical shape values (``= ref_values[..., 0]``).
     dphi_phys : ``(n_quad, n_dof, tdim)``  physical gradients ``∂φ/∂x``.
     """
-    K = jnp.linalg.inv(J)  # J⁻¹, (tdim, tdim)
+    K = jnp.linalg.inv(J)  # J⁻¹, (tdim, tdim) or (n_quad, tdim, tdim)
     phi = ref_values[..., 0]  # (n_quad, n_dof)
     dphi_ref = ref_grads[..., 0, :]  # (n_quad, n_dof, tdim)
-    dphi_phys = jnp.einsum("qnd,dD->qnD", dphi_ref, K)  # (n_quad, n_dof, tdim)
+    # One inverse per quadrature point when the geometry is curved; one for the whole cell when affine.
+    spec = "qnd,qdD->qnD" if K.ndim == 3 else "qnd,dD->qnD"
+    dphi_phys = jnp.einsum(spec, dphi_ref, K)  # (n_quad, n_dof, tdim)
     return phi, dphi_phys
+
+
+def _refuse_curved_hessian(J: jnp.ndarray) -> None:
+    """A curved cell has ``∂²ξ/∂x² ≠ 0``, which this push-forward's derivation drops."""
+    if getattr(J, "ndim", 2) == 3:
+        raise NotImplementedError(
+            "A 4th-order weak form (Argyris / Morley / Hermite, phase-field, plates) needs the physical "
+            "Hessian, whose transform assumes an AFFINE cell -- on curved geometry it gains a curvature "
+            "term this does not carry, and the result would be wrong with nothing to flag it. Drop "
+            "Shape.curved() for a 4th-order form, or use a straight-sided domain."
+        )
 
 
 def identity_pushforward_hess(ref_hess: jnp.ndarray, J: jnp.ndarray) -> jnp.ndarray:
@@ -243,5 +258,6 @@ def identity_pushforward_hess(ref_hess: jnp.ndarray, J: jnp.ndarray) -> jnp.ndar
     -------
     hess_phys : ``(n_quad, n_dof, tdim, tdim)``  physical Hessian ``∂²φ/∂x∂x`` (symmetric).
     """
+    _refuse_curved_hessian(J)
     K = jnp.linalg.inv(J)  # J⁻¹
     return jnp.einsum("qnij,ia,jb->qnab", ref_hess[..., 0, :, :], K, K)

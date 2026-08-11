@@ -38,7 +38,7 @@ the time scheme selectable via ``.solve(time=…)`` exactly as ``fem.solve(time=
 for backward Euler / Crank–Nicolson, ``jno.solve.adaptive``; backward Euler by default — the exponential
 integrator needs a linear block the matrix-free residual doesn't assemble, so it fails loud). **Flux BCs
 compose with transient too** — a flux node becomes an algebraic zero-mass-row constraint imposing the
-same ``a·(∇u·n) + b`` at each instant (its value slaved to the interior via the flux). **Periodic**
+same ``a·(∇u·n) + b`` at each instant (its value determined by the interior via the flux). **Periodic**
 boundaries are a tie constraint ``u(left) - u(right)`` (opposite faces, exactly as ``jno.fem``): on a
 **structured grid** it wraps that axis (the ``jnp.roll`` stencil gives the true periodic Laplacian, not a
 one-sided edge), structured-only since a strong-form stencil must wrap. A pure-Neumann
@@ -790,8 +790,8 @@ class _TraceFDM:
         return rows
 
     def _periodic_rows(self):
-        """``(slave_idx, master_idx)`` per periodic axis: the slave (last-index) face DOFs tied to the
-        master (first-index) face DOFs, matched by the other-axis indices — the tie ``u[slave] = u[master]``
+        """``(secondary_idx, main_idx)`` per periodic axis: the secondary (last-index) face DOFs tied to the
+        main (first-index) face DOFs, matched by the other-axis indices — the tie ``u[secondary] = u[main]``
         pinning the redundant face (node ``L ≡ 0``) that the wrap stencil already identifies."""
         if not self._periodic_axes:
             return []
@@ -799,9 +799,9 @@ class _TraceFDM:
         idx = np.arange(self._N).reshape(shape)
         rows = []
         for ax in self._periodic_axes:
-            master = np.take(idx, 0, axis=ax).ravel()
-            slave = np.take(idx, shape[ax] - 1, axis=ax).ravel()
-            rows.append((jnp.asarray(slave), jnp.asarray(master)))
+            main = np.take(idx, 0, axis=ax).ravel()
+            secondary = np.take(idx, shape[ax] - 1, axis=ax).ravel()
+            rows.append((jnp.asarray(secondary), jnp.asarray(main)))
         return rows
 
     def _node_normals(self, region):
@@ -976,7 +976,7 @@ class _TraceFDM:
         residual_fn = self._pde_residual_fn(extra_params=extra_params)
         rows = self._dirichlet_rows()
         flux_rows = self._flux_rows(extra_params) if single else []  # flux is single-field (guarded at build)
-        periodic_rows = self._periodic_rows()  # (slave, master) face DOF pairs per periodic axis
+        periodic_rows = self._periodic_rows()  # (secondary, main) face DOF pairs per periodic axis
 
         def residual_with_bc(u):
             r = residual_fn(u)
@@ -989,8 +989,8 @@ class _TraceFDM:
                 b = v0(u)
                 a = v1(u) - b
                 r = r.at[idx].set(a[idx] * flux + b[idx])
-            for slave, master in periodic_rows:  # periodic: the redundant slave face ≡ the master face
-                r = r.at[slave].set(u[slave] - u[master])
+            for secondary, main in periodic_rows:  # periodic: the redundant secondary face ≡ the main face
+                r = r.at[secondary].set(u[secondary] - u[main])
             if extra_pins is not None:  # interface pin (a coupled subdomain's complement) — before the
                 pidx, pvals = extra_pins  # authored Dirichlet, so the physical outer BC still wins on ∂Ω
                 r = r.at[pidx].set(u[pidx] - pvals)
@@ -1073,7 +1073,7 @@ class _TraceFDM:
         :class:`SemidiscreteTimeBlock` integrator (``custom_root`` differentiable). ``M = I`` on interior
         nodes; **Dirichlet and Neumann/Robin flux nodes carry a zero mass row** — Dirichlet pins to ``g``,
         a flux node imposes the SAME ``a·(∇u·n) + b`` the steady solve folds in, as an index-1 DAE
-        constraint the boundary value satisfies at each instant (its value is slaved to the interior via
+        constraint the boundary value satisfies at each instant (its value is determined by the interior via
         the flux). ``t_span``/``dt`` come from ``domain.time``; ``time=`` picks the scheme (backward Euler
         by default)."""
         import jax.experimental.sparse as jsparse

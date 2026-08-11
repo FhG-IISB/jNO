@@ -45,6 +45,11 @@ docs/tutorial_results.txt
 # Whitepaper skill build artifacts (LaTeX intermediates, generated figures)
 whitepapers/
 
+# Benchmark outputs (results, figures) stay local. The runner scripts committed before this rule
+# stay tracked -- gitignore never hides tracked files -- but ADDING a new script here needs
+# `git add -f benchmarks/<name>.py`.
+benchmarks/
+
 # pixi environments
 .pixi/*
 !.pixi/config.toml

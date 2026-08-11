@@ -2404,7 +2404,7 @@ class TestUnderTheHood:
         )
         assert jnp.allclose(chain_a, chain_b), (
             "multi-chain solve with adapt=True is not reproducible under a fixed seed; "
-            "window_adaptation RNG is not threaded from the master seed"
+            "window_adaptation RNG is not threaded from the root seed"
         )
 
 
@@ -2730,7 +2730,7 @@ class TestPathfinderInitializer:
     # ─── 11. reproducibility ──────────────────────────────────────────
 
     def test_pathfinder_reproducible_with_fixed_seed(self):
-        """Two solves with identical master seed produce identical
+        """Two solves with identical root seed produce identical
         posteriors.  Verifies pathfinder's L-BFGS RNG is threaded
         deterministically."""
         a1 = self._harmonic_inverse(
@@ -2970,7 +2970,7 @@ class TestLaplaceInitializer:
     # ─── 6. reproducible under a fixed seed ──────────────────────────
 
     def test_laplace_reproducible_with_fixed_seed(self):
-        """Two solves with identical master seed produce identical
+        """Two solves with identical root seed produce identical
         posteriors.  Verifies the MAP scan + Hessian Cholesky path is
         deterministic."""
         a1 = self._harmonic_inverse(initializer=jno.bayesian.laplace(map_steps=100, map_optimizer=optax.adam(5e-2)))
@@ -3125,7 +3125,7 @@ class TestSVGDInitializer:
     # ─── 6. reproducibility ──────────────────────────────────────────
 
     def test_svgd_reproducible_with_fixed_seed(self):
-        """Two solves with identical master seed produce identical
+        """Two solves with identical root seed produce identical
         posteriors.  Verifies the SVGD scan threads PRNG keys
         deterministically."""
         a1 = self._harmonic_inverse(initializer=jno.bayesian.svgd(num_iters=80, num_particles=16, init_jitter=1.0))
@@ -3518,7 +3518,7 @@ class TestPatternB:
     # ─── 4. Reproducibility ─────────────────────────────────────────
 
     def test_pattern_b_reproducible_with_fixed_seed(self):
-        """Two solves with identical master seed produce identical
+        """Two solves with identical root seed produce identical
         chains AND identical final body values."""
 
         def _solve():

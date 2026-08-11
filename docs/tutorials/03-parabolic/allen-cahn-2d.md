@@ -2,7 +2,7 @@
 
 <div class="hero-actions" markdown>
 <a class="md-button md-button--primary" href="/jNO/tutorial_examples/03_parabolic/allen_cahn_2d.py" download>Download .py</a>
-<a class="md-button" href="/jNO/tutorials/03-parabolic/">Back to chapter</a>
+<a class="md-button" href="/jNO/#tutorials">All tutorials</a>
 </div>
 
 This example solves a manufactured 2D Allen-Cahn problem and introduces a nonlinear cubic reaction term.
@@ -85,7 +85,7 @@ At the final time the prediction matches the manufactured solution to rel-$L^2 \
 
 <div class="hero-actions" markdown>
 <a class="md-button md-button--primary" href="/jNO/tutorial_examples/03_parabolic/allen_cahn_2d.py" download>Download full script</a>
-<a class="md-button" href="/jNO/tutorials/03-parabolic/">Back to 03 Parabolic</a>
+<a class="md-button" href="/jNO/#tutorials">All tutorials</a>
 </div>
 
 ## Script Snippet
