@@ -155,6 +155,62 @@ def test_the_tie_is_what_makes_the_field_continuous():
     assert np.abs(untied[a] - untied[b]).max() > 1e-2 * scale, "without it the sides must drift apart"
 
 
+def _stack(base_size, film_size):
+    """Two stacked blocks sharing a full face, meshed independently at their own resolutions."""
+    return jno.Shape.regions(
+        base=jno.Shape.rect(0.0, 0.0, 2.0, 1.0, size=base_size),
+        film=jno.Shape.rect(0.0, 1.0, 2.0, 1.4, size=film_size),
+        conforming=False,
+    ).domain()
+
+
+def test_each_region_is_meshed_at_its_own_resolution():
+    """Mesh size used to be a Distance+Threshold *field*, i.e. a function of POSITION — and the two
+    sides of a non-conforming interface sit at the same position, so both bodies were meshed
+    identically however different their requested sizes (measured: a 3x ratio still gave 41 nodes on
+    each side). Sizing each region's own entities is what makes 'coarse body, fine body' expressible,
+    and therefore what makes a genuinely non-matching interface reachable at all."""
+    same = _stack(0.25, 0.25)
+    lo, hi = (len(np.asarray(same.tag_indices[t]).reshape(-1)) for t in _interface_tags(same))
+    assert lo == hi, "equal sizes should still mesh the two sides alike"
+
+    graded = _stack(0.25, 0.08)
+    lo, hi = (len(np.asarray(graded.tag_indices[t]).reshape(-1)) for t in _interface_tags(graded))
+    assert hi > 2 * lo, f"a 3x size ratio must give genuinely different node counts, got {lo} vs {hi}"
+
+
+def _poisson_2d(d):
+    u, v = d.fem_symbols()
+    s, m = _interface_tags(d)
+    c = d.variable("interior", split=True)
+    b = d.variable("boundary", split=True)
+    a1, b1 = d.variable(s, split=True), d.variable(m, split=True)
+    ui, vi = u.bind(x=c[0], y=c[1]), v.bind(x=c[0], y=c[1])
+    terms = [ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(a1[0], a1[1]) - u(b1[0], b1[1]), u(b[0], b[1]) - 0.0]
+    return float(np.asarray(jno.fem(terms).solve()).max())
+
+
+def test_a_graded_interface_uses_the_mortar_coupling():
+    """The end of the chain: two bodies meshed at different resolutions, glued, and the tie reaches
+    the *integrated* coupling rather than node-to-node matching. Equal sizes must still take the exact
+    path — there is nothing to interpolate there, and using mortar would be strictly worse."""
+    import jno.utils.solver.fem_utils as fu
+
+    seen = {}
+    orig = fu.build_periodic_prolongation
+    fu.build_periodic_prolongation = lambda *a, **k: (lambda r: (seen.__setitem__("coupling", r["coupling"]), r)[1])(
+        orig(*a, **k)
+    )
+    try:
+        same = _poisson_2d(_stack(0.25, 0.25))
+        assert seen["coupling"] == "conforming"
+        graded = _poisson_2d(_stack(0.25, 0.08))
+        assert seen["coupling"] == "mortar", "a graded interface must reach the integrated coupling"
+    finally:
+        fu.build_periodic_prolongation = orig
+    assert abs(graded - same) / same < 0.05, f"graded {graded:.6f} vs uniform {same:.6f}"
+
+
 def test_conforming_is_a_reserved_region_name():
     with pytest.raises(TypeError, match="must be a bool"):
         jno.Shape.regions(a=jno.Shape.box(0, 0, 0, 1, 1, 1), b=jno.Shape.box(0, 0, 1, 1, 1, 2), conforming="no")

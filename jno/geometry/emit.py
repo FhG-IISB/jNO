@@ -141,6 +141,60 @@ def _plan_sizes(shape):
     return out
 
 
+def _apply_region_sizes(dim: int, shape) -> Optional[float]:
+    """Per-**region** mesh size for a ``conforming=False`` multi-material shape.
+
+    The ordinary path (:func:`_apply_size_fields`) turns each ``size=`` into a Distance+Threshold
+    *field*, which is a function of POSITION. Two coincident faces sit at the same position, so both
+    bodies of a non-conforming interface get the same target size and gmsh meshes them identically --
+    the two sides come out matching, the tie resolves node-to-node, and the mortar coupling is never
+    reached. Measured: a 3x size ratio between two stacked blocks still gave 41 nodes on each side.
+
+    Sizing each region's own OCC entities instead is what makes "coarse body, fine body" expressible.
+    Entities are attributed to regions by centroid containment -- the same test ``_to_meshio`` uses for
+    cells -- so no extra plumbing is needed from the emitter. Note this only makes sense when the
+    pieces are NOT fragmented: a conforming interface shares its points between both regions, so a
+    per-region size would just be whichever was written last.
+
+    Returns a representative ``ds``, or ``None`` when it does not apply (leaving the field path in
+    charge).
+    """
+    node = shape._node
+    if node[0] != "regions" or (len(node) > 2 and node[2]):
+        return None  # not a regions shape, or conforming -> shared entities, per-region size is moot
+    items = node[1]
+    sizes = {name: sub._size for name, sub in items if isinstance(sub._size, (int, float))}
+    if not sizes:
+        return None
+
+    import gmsh
+    import numpy as np
+
+    applied: List[float] = []
+    for edim, etag in gmsh.model.getEntities(dim):
+        centre = np.asarray(gmsh.model.occ.getCenterOfMass(edim, etag), dtype=float).reshape(1, 3)
+        for name, sub in items:
+            if name not in sizes:
+                continue
+            try:
+                inside = bool(np.asarray(sub.contains(centre[:, : sub.dim]))[0])
+            except NotImplementedError:
+                inside = False  # a swept/revolved region has no closed-form membership; skip it
+            if inside:
+                pts = [e for e in gmsh.model.getBoundary([(edim, etag)], oriented=False, recursive=True) if e[0] == 0]
+                if pts:
+                    gmsh.model.mesh.setSize(pts, float(sizes[name]))
+                    applied.append(float(sizes[name]))
+                break
+    if not applied:
+        return None
+    # The field path disables point sizes; this one depends on them.
+    gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 1)
+    gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 1)
+    gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
+    return float(min(applied))
+
+
 def _apply_size_fields(dim: int, leaves, labels: Dict[int, Tuple[int, str]], shape) -> Optional[float]:
     """Turn per-shape ``size`` into gmsh mesh-size controls. Returns a representative ``ds``.
 
@@ -467,7 +521,9 @@ def _build_once(shape, split_full, periodic=None, algorithm=None, threads=None, 
         dim = shape.dim
         leaves = shape.leaves()
         labels = classify_boundary(dim, shape)
-        ds = _apply_size_fields(dim, leaves, labels, shape)
+        # A non-conforming multi-material shape sizes each region's own entities; the position-based
+        # field path cannot distinguish two coincident faces and would mesh both bodies identically.
+        ds = _apply_region_sizes(dim, shape) or _apply_size_fields(dim, leaves, labels, shape)
         if periodic:  # make named opposite faces conform (edge-element periodic ties need it)
             _apply_periodic(dim, labels, periodic)
         gmsh.model.mesh.generate(dim)
