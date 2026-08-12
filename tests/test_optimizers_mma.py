@@ -191,3 +191,44 @@ class TestGuards:
         vol = jno.fn(lambda xv: jnp.sum(xv), [x], name="vol")
         with pytest.raises(ValueError, match="lower= and upper= are required"):
             jno.core([f0, jno.le(vol, 1.0)], domain=d).solve(1)
+
+
+class TestPerVariableBounds:
+    """A nodal-movement design variable is bounded per node, about its OWN initial position.
+
+    Jung, Yun & Kim, *Computers & Structures* **331** (2026) 108403, eq. (34) and Sec. 3: the
+    limit is +/-2 on the movement ``d_x,i``, while ``.trainable()`` seeds the parameter at the
+    absolute coordinates — so the box is a different interval for each variable.
+    """
+
+    def test_an_array_bound_is_honoured_per_variable(self):
+        n = 8
+        x0 = np.linspace(0.0, 7.0, n)
+        lo, hi = x0 - 0.5, x0 + 0.5
+
+        d = jno.domain.from_array({"_": np.zeros((1, 1))})
+        x = jno.np.parameter((n,), name="x")
+        x.dtype(jnp.float64)
+        x.initialize(lambda key, shape, dtype=None: jnp.asarray(x0))
+        x.optimizer(jno.optimizers.mma(move=0.5, lower=lo, upper=hi))
+        # Pulls every variable hard towards -inf, so the LOWER bound is what stops it.
+        f0 = jno.fn(lambda xv: jnp.sum(xv), [x], name="f0")
+        vol = jno.fn(lambda xv: jnp.sum(xv * 0.0), [x], name="vol")
+
+        crux = jno.core([f0, jno.le(vol, 1.0)], domain=d)
+        crux.solve(30)
+        xf = np.asarray(crux.eval([x])).reshape(-1)
+
+        assert np.all(xf >= lo - 1e-9) and np.all(xf <= hi + 1e-9), "the per-variable box must hold"
+        np.testing.assert_allclose(xf, lo, atol=1e-6), "and a descent this strong must reach it"
+        # A single scalar box could not express this: the intervals do not overlap.
+        assert lo[-1] > hi[0]
+
+    def test_a_wrong_length_bound_is_refused(self):
+        d = jno.domain.from_array({"_": np.zeros((1, 1))})
+        x = jno.np.parameter((4,), name="x")
+        x.optimizer(jno.optimizers.mma(move=0.2, lower=np.zeros(3), upper=np.ones(4)))
+        f0 = jno.fn(lambda xv: jnp.sum(xv**2), [x], name="f0")
+        vol = jno.fn(lambda xv: jnp.sum(xv), [x], name="vol")
+        with pytest.raises(ValueError, match="3 entries but the design variable has 4"):
+            jno.core([f0, jno.le(vol, 1.0)], domain=d).solve(1)

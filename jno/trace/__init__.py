@@ -595,7 +595,7 @@ class Placeholder:
     def mae(self) -> FunctionCall:
         return FunctionCall(lambda x: jnp.squeeze(jnp.mean(jnp.abs(x))), [self], "mae", True)
 
-    def pnorm(self, p: float = 50.0) -> FunctionCall:
+    def pnorm(self, p: float = 50.0, *, normalize: bool = False) -> FunctionCall:
         """``(Σ xᵢ^p)^(1/p)`` — a smooth, differentiable stand-in for the maximum.
 
         The standard aggregation for a constraint that must hold at *every* element: imposing it
@@ -606,12 +606,30 @@ class Placeholder:
         Written for quantities already normalised so the bound is ``1`` (``g.pnorm(50) <= 1``),
         which is what keeps the aggregation numerically sane across constraints of different
         magnitudes. Negative entries are not meaningful here — normalise first.
+
+        Args:
+            p: The exponent.
+            normalize: Scale the result by ``max(x) / pnorm(x)``, held constant under
+                differentiation, so the constraint's **value** is the true maximum while its
+                **gradient** stays the p-norm's smooth one. Without this the aggregation
+                overshoots with the element count -- ``N`` entries all at ``r`` give
+                ``N^(1/p) · r``, which for 840 angles at ``p = 50`` is already a 14 % inflation,
+                enough to report a satisfied constraint as violated from the first iteration and
+                stall the optimiser on it. This is the normalisation of Le et al., *Struct.
+                Multidisc. Optim.* **41**(4), 2010, 605-620, as adopted by Jung, Yun & Kim,
+                *Computers & Structures* **331** (2026) 108403, eq. (29)-(30) -- there with an
+                extra ``α``-damped lag over iterations, which is dropped here so the value stays a
+                pure function of the design.
         """
 
-        def fn(x, _p=float(p)):
-            return jnp.squeeze(jnp.sum(jnp.abs(x) ** _p) ** (1.0 / _p))
+        def fn(x, _p=float(p), _n=bool(normalize)):
+            v = jnp.abs(x)
+            agg = jnp.squeeze(jnp.sum(v**_p) ** (1.0 / _p))
+            if not _n:
+                return agg
+            return jax.lax.stop_gradient(jnp.max(v) / (agg + 1e-30)) * agg
 
-        return FunctionCall(fn, [self], f"pnorm{p:g}", True)
+        return FunctionCall(fn, [self], f"pnorm{p:g}" + ("n" if normalize else ""), True)
 
     @property
     def T(self) -> FunctionCall:
@@ -1484,9 +1502,26 @@ class Variable(Placeholder):
     def _region_vertex_ids(dom, tag, pts):
         """Mesh-vertex ids of region ``tag`` for coordinate trainability -- interior OR boundary.
 
-        A ``where=`` predicate is applied to **all** nodes (not intersected with the domain boundary
-        as the Dirichlet location fn is), so an interior region selects its interior vertices. Falls back
-        to the assembler's region resolver for polygon / named-boundary tags."""
+        Three routes, in order:
+
+        1. A ``where=`` predicate, applied to **all** nodes (not intersected with the domain boundary
+           as the Dirichlet location fn is), so an interior region selects its interior vertices.
+        2. The assembler's region resolver -- polygon tags (``domain.region(name, polygon)``) and
+           named boundaries with a location function.
+        3. The mesh's own tag, ``domain.tag_indices[tag]``.
+
+        Route 3 is what makes the built-in ``"interior"`` work. On a gmsh / ``jno.Shape`` domain it is
+        a **volume** tag: it lives in ``tag_indices`` and never in ``_boundary_regions``, and it has no
+        location function, so routes 1 and 2 both have nothing to say about it and this used to raise --
+        even though ``domain.variable("interior").trainable()`` is the r-adaptivity API's own example.
+
+        A volume tag names **every** vertex of that volume, the ones on its boundary included (gmsh's
+        surface tag does; ``Sampled 28 points for 'interior'`` on a 28-node rect is all of them). That is
+        the literal reading of "this region's vertices" and is what the mesh-motion driver wants, but it
+        does mean the domain outline is free to move. Pass a ``where=`` predicate instead to promote a
+        strict subset -- which is also what a topology optimisation wants, since the nodes carrying a
+        boundary condition or a load must stay put.
+        """
         import numpy as _np
 
         preds = getattr(dom, "_tag_predicates", {}) or {}
@@ -1501,7 +1536,16 @@ class Variable(Placeholder):
 
         from ..utils.solver.fem_native import _region_node_ids_from_pts
 
-        return list(_region_node_ids_from_pts(dom, tag, pts))
+        try:
+            return list(_region_node_ids_from_pts(dom, tag, pts))
+        except ValueError:
+            # No polygon and no location function. The resolver stays authoritative -- it is tried
+            # first and its answer is never overridden -- so this branch changes nothing that already
+            # worked; it only fills the case that used to be a dead end.
+            ids = _np.asarray((getattr(dom, "tag_indices", None) or {}).get(tag, ()), dtype=int).reshape(-1)
+            if ids.size:
+                return list(ids)
+            raise
 
 
 class TensorTag(Placeholder):

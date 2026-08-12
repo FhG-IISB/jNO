@@ -80,9 +80,10 @@ def mma(
         move: Move limit as a fraction of the box width -- the most a variable may change in one
             iteration. The single most important knob: too large oscillates, too small crawls.
             ``0.1``-``0.2`` is usual for densities, much smaller for geometry.
-        lower, upper: Box bounds. Required unless the variable is naturally bounded; a density is
-            ``lower=1e-3`` (not 0, which makes the stiffness singular) and ``upper=1.0``, a nodal
-            movement is a symmetric pair like ``-2.0`` / ``2.0``.
+        lower, upper: Box bounds — a scalar, or an array of one bound per variable. A density is
+            ``lower=1e-3`` (not 0, which makes the stiffness singular) and ``upper=1.0``. A nodal
+            coordinate is bounded per node, since the limit is on its movement about its OWN
+            initial position: ``lower=x0 - 2``, ``upper=x0 + 2``.
         asy_init: Initial asymptote distance, as a fraction of the box width.
         asy_shrink, asy_grow: Asymptote adaptation. A variable that just reversed direction has its
             asymptotes pulled in by ``asy_shrink`` (damping the oscillation); one moving steadily
@@ -350,17 +351,17 @@ class MMACallback(_Callback):
         # Per-block box bounds, concatenated in the same order.
         xmin, xmax = [], []
         for (lid, spec), part in zip(self._blocks, x_parts):
-            lo = -np.inf if spec.lower is None else float(spec.lower)
-            hi = np.inf if spec.upper is None else float(spec.upper)
-            if not (np.isfinite(lo) and np.isfinite(hi)):
+            lo = _bound_vector(spec.lower, part.size, lid, "lower")
+            hi = _bound_vector(spec.upper, part.size, lid, "upper")
+            if not (np.all(np.isfinite(lo)) and np.all(np.isfinite(hi))):
                 raise ValueError(
                     "jno.optimizers.mma: lower= and upper= are required. MMA works in the design "
                     "variable's own space: the asymptotes, the move limit and the dual are all "
                     "scaled by the box width, so an unbounded variable has no step to take "
                     f"(model layer_id={lid})."
                 )
-            xmin.append(np.full(part.size, lo))
-            xmax.append(np.full(part.size, hi))
+            xmin.append(lo)
+            xmax.append(hi)
         xmin, xmax = np.concatenate(xmin), np.concatenate(xmax)
 
         # Constraint VALUES come free with the hook -- they were evaluated on this step's batch, so
@@ -388,6 +389,28 @@ class MMACallback(_Callback):
             out[lid] = un(jax.numpy.asarray(delta[off : off + size], dtype=jax.numpy.float32))
             off += size
         return out
+
+
+def _bound_vector(bound, size: int, lid, which: str) -> np.ndarray:
+    """A box bound as a ``(size,)`` vector — a scalar broadcast, or a per-variable array as given.
+
+    Per-variable bounds are what a **nodal movement** design variable needs: the paper's movement
+    limit is +/-2 about each node's OWN initial position (Jung, Yun & Kim 2026, eq. 34 and Sec. 3),
+    so the box is a different interval for every node. `.trainable()` seeds the parameter at the
+    absolute coordinates, so the caller spells that limit literally as ``lower=x0 - 2``,
+    ``upper=x0 + 2``.
+    """
+    if bound is None:
+        return np.full(int(size), -np.inf if which == "lower" else np.inf)
+    arr = np.asarray(bound, dtype=np.float64).reshape(-1)
+    if arr.size == 1:
+        return np.full(int(size), float(arr[0]))
+    if arr.size != int(size):
+        raise ValueError(
+            f"jno.optimizers.mma: {which}= has {arr.size} entries but the design variable has "
+            f"{int(size)} (model layer_id={lid}). Pass a scalar, or one bound per variable."
+        )
+    return arr
 
 
 class _BlendedSpec:

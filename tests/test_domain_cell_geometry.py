@@ -195,3 +195,47 @@ class TestConstraintComposition:
         node = jno.le(d.measure() / 4.0, 1.0)
         assert node.sense == "le"
         assert float(np.asarray(node.residual.eval())) == pytest.approx(2.0 / 4.0 - 1.0, abs=1e-9)
+
+
+class TestNormalisedPnorm:
+    """``pnorm(normalize=True)`` — the value is the true max, the gradient stays the p-norm's.
+
+    Without it the aggregation overshoots with the entry count: ``N`` entries all equal to ``r``
+    give ``N^(1/p) r``, which is enough to report a satisfied constraint as violated from the
+    first iteration. Le et al., *Struct. Multidisc. Optim.* **41**(4), 2010, 605-620; used by
+    Jung, Yun & Kim, *Computers & Structures* **331** (2026) 108403, eq. (29)-(30).
+    """
+
+    @staticmethod
+    def _agg(r, p, normalize):
+        v = jnp.abs(r)
+        agg = jnp.sum(v**p) ** (1.0 / p)
+        return jax.lax.stop_gradient(jnp.max(v) / (agg + 1e-30)) * agg if normalize else agg
+
+    def test_the_plain_pnorm_overshoots_with_the_entry_count(self):
+        """Quantifies the defect the flag exists for, on the paper's own numbers."""
+        p, n = 50.0, 840  # 280 triangles x 3 angles
+        r = jnp.full(n, 0.941)  # the angle ratio at a 40 deg minimum against a 20 deg bound
+        plain = float(self._agg(r, p, False))
+        assert plain > 1.0, "a satisfied constraint reported as violated is the whole problem"
+        assert float(self._agg(r, p, True)) == pytest.approx(0.941, rel=1e-9)
+
+    def test_the_normalised_value_is_the_maximum(self):
+        p = 50.0
+        r = jnp.asarray(np.random.default_rng(0).uniform(0.1, 0.9, 200))
+        assert float(self._agg(r, p, True)) == pytest.approx(float(jnp.max(jnp.abs(r))), rel=1e-12)
+
+    def test_the_gradient_keeps_the_pnorm_direction(self):
+        """A true max has a one-hot gradient; the point of the p-norm is that this one does not."""
+        p = 50.0
+        r = jnp.asarray(np.random.default_rng(1).uniform(0.3, 0.9, 40))
+        g_norm = jax.grad(lambda z: self._agg(z, p, True))(r)
+        g_plain = jax.grad(lambda z: self._agg(z, p, False))(r)
+        scale = float(jnp.max(jnp.abs(r)) / (jnp.sum(jnp.abs(r) ** p) ** (1.0 / p)))
+        np.testing.assert_allclose(np.asarray(g_norm), scale * np.asarray(g_plain), rtol=1e-10)
+        assert int(np.sum(np.abs(np.asarray(g_norm)) > 1e-12)) > 1, "must not collapse to one-hot"
+
+    def test_it_reaches_the_trace_through_a_node(self):
+        d = jno.Shape.rect(0.0, 0.0, 2.0, 1.0, size=0.4).domain()
+        got = float(np.asarray(d.cell_volume().pnorm(50.0, normalize=True).eval()).reshape(-1)[0])
+        assert got == pytest.approx(float(np.asarray(d.cell_volume().eval()).max()), rel=1e-9)
