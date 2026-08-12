@@ -33,6 +33,7 @@ __all__ = [
     "RegionMask",
     "BinaryOp",
     "Tracker",
+    "Constraint",
     "Model",
     "TunableModule",
     "TunableModuleCall",
@@ -1549,6 +1550,37 @@ class Tracker(Placeholder):
 
     def __repr__(self):
         return f"Tracker({self.expr!r}, interval={self.interval})"
+
+
+class Constraint(Placeholder):
+    """Wraps an expression that is an **inequality constraint**, not a loss to minimise.
+
+    ``jno.core`` evaluates it exactly like a constraint entry -- same compiled function, same
+    differentiation -- so its value and gradient are available to a constrained optimiser. What it
+    does *not* do is enter the loss the optimiser descends. That distinction is the whole point:
+    summing a constraint into the objective makes it a soft penalty, which double-counts against an
+    optimiser (MMA, OC, SQP) that already handles it in the dual.
+
+    ``sense`` is ``"le"`` (``expr <= bound``) or ``"ge"``; the stored residual is normalised to the
+    ``g <= 0`` convention either way, so a consumer never has to branch on the sense.
+
+    Contrast with :class:`Tracker`, which is also kept out of the loss but is evaluated by a
+    *separate* function on an interval, is not differentiated, and is invisible to the optimiser.
+    """
+
+    def __init__(self, expr: Placeholder, bound: float = 0.0, sense: str = "le"):
+        if sense not in ("le", "ge"):
+            raise ValueError(f"Constraint: sense must be 'le' or 'ge', got {sense!r}.")
+        self.expr = expr
+        self.bound = bound
+        self.sense = sense
+        # g <= 0 when feasible, whichever way the user wrote it.
+        self.residual = (expr - bound) if sense == "le" else (bound - expr)
+        self.op_id = _next_op_id()
+
+    def __repr__(self):
+        op = "<=" if self.sense == "le" else ">="
+        return f"Constraint({self.expr!r} {op} {self.bound})"
 
 
 class Model(Placeholder):

@@ -35,6 +35,7 @@ from .domain import DomainData, domain
 from .trace import (
     BinaryOp,
     Choice,
+    Constraint,
     FunctionCall,
     Hessian,
     IntegralTime,
@@ -1000,6 +1001,13 @@ class core:
         min_consecutive=1,
     ):
         """Create loss function — evaluates ALL constraints in one combined call."""
+        # Only build a mask when `jno.le`/`jno.ge` is actually in use. With no inequality
+        # constraints the aggregate stays the plain `jnp.mean(losses)` it has always been --
+        # identical code, not merely an equivalent formula -- so nothing downstream shifts by an
+        # ulp. It also keeps this correct for callers that compile a SUBSET of the constraints
+        # (substeps, `compiled_constraints_fn=`), where a full-length mask would not broadcast.
+        objective_mask = getattr(self, "_objective_mask", None) if getattr(self, "_inequality_idx", None) else None
+        n_objective = float(int(np.asarray(objective_mask).sum())) if objective_mask is not None else 0.0
 
         def loss_fn(trainable, context, rng):
             full_models = eqx.combine(trainable, frozen, static)
@@ -1032,7 +1040,14 @@ class core:
 
             # all_residuals is a list of (B, T, ...) arrays — one per constraint
             losses = jnp.stack([jnp.mean(r) for r in all_residuals])
-            return jnp.mean(losses), losses
+            if objective_mask is None:
+                return jnp.mean(losses), losses
+            # `jno.le`/`jno.ge` entries are evaluated and differentiated with everything else --
+            # they stay in `losses`, which is what reaches the optimiser hook -- but they are held
+            # out of the scalar being descended. Summing a constraint into the objective would make
+            # it a soft penalty on top of whatever the constrained optimiser does in the dual.
+            obj = jnp.where(objective_mask, losses, 0.0)
+            return jnp.sum(obj) / n_objective, losses
 
         return loss_fn
 
@@ -1710,11 +1725,18 @@ class core:
         self._constraint_names: list[str | None] = []
         self._tracker_names: list[str | None] = []
         constraint_exprs = []
+        # Indices (into the constraint vector) of entries that are INEQUALITY CONSTRAINTS rather
+        # than losses. They are compiled and differentiated with everything else -- a constrained
+        # optimiser needs their value and gradient -- but they are left out of the scalar the
+        # optimiser descends. See `jno.le` and `_make_loss_fn`.
+        self._inequality_idx: list[int] = []
+        self._inequality_senses: list[str] = []
 
         for orig_expr, expr in zip(self.constraints, constraints):
             inner = expr
             tracker_interval = None
             tracker_reduce = None
+            inequality_sense = None
             if isinstance(expr, OperationDef) and isinstance(expr.expr, Tracker):
                 tracker_interval = expr.expr.interval
                 tracker_reduce = expr.expr.reduce
@@ -1723,6 +1745,16 @@ class core:
                 tracker_interval = expr.interval
                 tracker_reduce = expr.reduce
                 inner = expr.expr
+            elif isinstance(expr, OperationDef) and isinstance(expr.expr, Constraint):
+                inequality_sense = expr.expr.sense
+                inner = OperationDef(expr.expr.residual)
+            elif isinstance(expr, Constraint):
+                inequality_sense = expr.sense
+                inner = expr.residual
+
+            if inequality_sense is not None:
+                self._inequality_idx.append(len(constraint_exprs))
+                self._inequality_senses.append(inequality_sense)
 
             if tracker_interval is not None:
                 fn_expr = TraceCompiler.compile_traced_expression(inner, self.all_ops)
@@ -1740,6 +1772,17 @@ class core:
         # can apply CSE across shared sub-expressions.
         self.compiled_constraints_fn = TraceCompiler.compile_multi_expression(constraint_exprs, self.all_ops)
         self.n_constraints = len(constraint_exprs)
+        # Boolean row selector for the entries the loss is the mean OF. Built once, here, so the
+        # step function stays free of Python-level branching.
+        _obj = np.ones(self.n_constraints, dtype=bool)
+        for _i in self._inequality_idx:
+            _obj[_i] = False
+        if self._inequality_idx and not _obj.any():
+            raise ValueError(
+                "jno.core: every entry is an inequality constraint, so there is no objective to "
+                "minimise. Add the quantity you want minimised as a plain (unwrapped) entry."
+            )
+        self._objective_mask = jnp.asarray(_obj)
 
         # Keep tag metadata and a pointwise residual function for adaptive
         # resampling. The normal training loss still uses reduced constraints
@@ -3236,6 +3279,17 @@ class core:
 
             # ── 7b. Build per-substep JIT step functions ──
             if _use_substeps:
+                if getattr(self, "_inequality_idx", None):
+                    # A substep compiles a SUBSET of the constraint list and descends its own mean.
+                    # An inequality constraint has no meaning in that scalar -- it would be summed
+                    # in as a penalty in whichever substep happened to include it, which is exactly
+                    # what `jno.le` exists to prevent. Refuse rather than mis-optimise quietly.
+                    raise ValueError(
+                        "jno.core: substeps= cannot be combined with jno.le/jno.ge inequality "
+                        "constraints. A substep minimises the mean of its own subset, so a "
+                        "constraint routed into one would act as a soft penalty there. Drop "
+                        "substeps=, or express the constraint as an ordinary penalty term."
+                    )
                 _substep_jit_steps = []
                 _substep_opt_states_list = []
                 _substep_n_steps_list = []
@@ -4029,6 +4083,8 @@ class core:
                                     context=micro_ctx,
                                     rng=self.rng,
                                     epoch=outer_epoch,
+                                    total_loss=_acc_total,
+                                    individual_losses=_acc_losses,
                                 )
                                 if _modified is not None:
                                     _acc_grads = _modified
@@ -4077,6 +4133,8 @@ class core:
                                     context=context,
                                     rng=self.rng,
                                     epoch=outer_epoch,
+                                    total_loss=total_loss,
+                                    individual_losses=individual_losses,
                                 )
                                 if _modified is not None:
                                     _hgrads = _modified

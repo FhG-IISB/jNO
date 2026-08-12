@@ -507,3 +507,104 @@ class TestDomainInference:
         assert dom_a is not dom_b
         with pytest.raises(ValueError, match="2 distinct domains"):
             jno.core([pde_a, pde_b])
+
+
+class TestInequalityConstraints:
+    """``jno.le`` / ``jno.ge`` — evaluated and reported, but never summed into the loss.
+
+    The distinction matters because a constrained optimiser (MMA, OC, SQP) handles the constraint
+    in its dual. Summing it into the objective as well would penalise it twice, which is what
+    every entry of a plain ``jno.core`` list does today.
+    """
+
+    @staticmethod
+    def _problem(entries):
+        d = jno.Path(0, 0).line_to(1, 0).curve(size=0.1).domain()
+        x, _ = d.variable("interior")
+        a = jnn.parameter((1,), key=jax.random.PRNGKey(0), name="a").optimizer(optax.adam(1e-2))
+        return d, x, a, entries
+
+    def test_a_constraint_is_compiled_but_held_out_of_the_loss(self):
+        d = jno.Path(0, 0).line_to(1, 0).curve(size=0.1).domain()
+        x, _ = d.variable("interior")
+        a = jnn.parameter((1,), key=jax.random.PRNGKey(0), name="a").optimizer(optax.adam(1e-2))
+
+        crux = jno.core([(a * x - 2.0).mse, jno.le((a * x).mean, 0.4)], domain=d)
+        assert crux.n_constraints == 2, "the constraint must still be compiled and evaluated"
+        assert crux._inequality_idx == [1]
+
+        stats = crux.solve(1)
+        logs = stats.training_logs[-1]
+        losses, total = jnp.asarray(logs["losses"])[0], jnp.asarray(logs["total_loss"])[0]
+        assert losses.shape == (2,), "both entries must be reported"
+        assert total == pytest.approx(float(losses[0]), rel=1e-6), "the loss is the objective alone"
+        assert total != pytest.approx(float(losses.mean()), rel=1e-6), "it must not be the mean"
+
+    def test_ge_flips_the_residual_to_the_g_le_zero_convention(self):
+        d = jno.Path(0, 0).line_to(1, 0).curve(size=0.1).domain()
+        x, _ = d.variable("interior")
+        # x has mean 0.5 on [0, 1]; `>= 0.2` is satisfied, so the residual must be negative.
+        assert jno.ge(x.mean, 0.2).sense == "ge"
+        assert jno.le(x.mean, 0.2).sense == "le"
+        a = jnn.parameter((1,), key=jax.random.PRNGKey(0), name="a").optimizer(optax.adam(1e-2))
+        for sense, expect_negative in (("ge", True), ("le", False)):
+            node = (jno.ge if sense == "ge" else jno.le)(x.mean, 0.2)
+            crux = jno.core([(a * x).mse, node], domain=d)
+            g = float(jnp.asarray(crux.solve(1).training_logs[-1]["losses"])[0][1])
+            assert (g < 0) is expect_negative, f"{sense}: g = {g}, feasible should be g <= 0"
+
+    def test_an_all_constraint_list_is_refused(self):
+        d = jno.Path(0, 0).line_to(1, 0).curve(size=0.1).domain()
+        x, _ = d.variable("interior")
+        a = jnn.parameter((1,), key=jax.random.PRNGKey(0), name="a").optimizer(optax.adam(1e-2))
+        with pytest.raises(ValueError, match="no objective to minimise"):
+            jno.core([jno.le((a * x).mean, 0.4)], domain=d)
+
+    def test_a_list_with_no_constraints_is_unchanged(self):
+        """The aggregate must stay exactly ``mean(losses)`` when nobody uses jno.le."""
+        d = jno.Path(0, 0).line_to(1, 0).curve(size=0.1).domain()
+        x, _ = d.variable("interior")
+        a = jnn.parameter((1,), key=jax.random.PRNGKey(0), name="a").optimizer(optax.adam(1e-2))
+        crux = jno.core([(a * x - 2.0).mse, (a * x).mean], domain=d)
+        assert crux._inequality_idx == []
+        logs = crux.solve(1).training_logs[-1]
+        losses, total = jnp.asarray(logs["losses"])[0], jnp.asarray(logs["total_loss"])[0]
+        assert total == pytest.approx(float(losses.mean()), rel=1e-6)
+
+    def test_constraint_values_reach_the_optimiser_hook(self):
+        """A constrained optimiser reads ``g_j`` off ``on_before_update`` rather than recomputing."""
+        from jno.utils.adaptive.callbacks import Callback
+
+        seen = []
+
+        class Spy(Callback):
+            def on_before_update(self, *, grads, trainable, context, rng, epoch, **kw):
+                seen.append(kw)
+                return None
+
+        d = jno.Path(0, 0).line_to(1, 0).curve(size=0.1).domain()
+        x, _ = d.variable("interior")
+        a = jnn.parameter((1,), key=jax.random.PRNGKey(0), name="a").optimizer(optax.adam(1e-2))
+        jno.core([(a * x - 2.0).mse, jno.le((a * x).mean, 0.4)], domain=d).solve(2, callbacks=[Spy()])
+
+        assert seen, "the hook never fired"
+        assert "individual_losses" in seen[0] and "total_loss" in seen[0]
+        g = jnp.asarray(seen[0]["individual_losses"]).reshape(-1)
+        assert g.size == 2, "the constraint must be visible to the hook, not just the objective"
+        assert float(seen[0]["total_loss"]) == pytest.approx(float(g[0]), rel=1e-6)
+
+    def test_substeps_and_inequality_constraints_are_refused(self):
+        """A substep descends the mean of its own SUBSET, where a constraint would act as a penalty.
+
+        That is precisely what ``jno.le`` exists to prevent, so the combination is refused rather
+        than silently mis-optimised. (It is also why the loss aggregate keeps the plain
+        ``jnp.mean`` path whenever no inequality constraint is declared — a subset-compiled
+        constraint function must not meet a full-length mask.)
+        """
+        d = jno.Path(0, 0).line_to(1, 0).curve(size=0.1).domain()
+        x, _ = d.variable("interior")
+        a = jnn.parameter((1,), key=jax.random.PRNGKey(0), name="a").optimizer(optax.adam(1e-2))
+        b = jnn.parameter((1,), key=jax.random.PRNGKey(1), name="b").optimizer(optax.adam(1e-2))
+        crux = jno.core([(a * x - 2.0).mse, (b * x - 1.0).mse, jno.le((a * x).mean, 0.4)], domain=d)
+        with pytest.raises(ValueError, match="substeps"):
+            crux.solve(2, substeps=[[0], [1]])
