@@ -744,6 +744,14 @@ def assemble_fem_native(
             _collect_runtime_parameter_exprs(bare, _rt_param_exprs)
     runtime_parameter_tags: Tuple[str, ...] = tuple(sorted(_rt_param_exprs))
     _field_param_names: set = {n for n, expr in _rt_param_exprs.items() if _is_fem_field_parameter(expr)}
+    # P0 field parameters carry ONE value per element rather than per node, so they gather by cell
+    # index and need no interpolation -- the kernel's scalar branch broadcasts them over the quad
+    # points. The design variable of density-based topology optimisation is exactly this.
+    from .parametric_helpers import _fem_field_kind
+
+    _cell_field_names: set = {
+        n for n, expr in _rt_param_exprs.items() if _fem_field_kind(expr) == "cell"
+    }
 
     # Neural coefficients (``jno.nn.wrap(net)`` called inside the weak form, e.g. ``net(x,y)*u.dx*v.dx``).
     # Unlike scalar/nodal parameters they never enter the per-cell ``volume_vars`` -- a weight pytree is
@@ -1289,12 +1297,22 @@ def assemble_fem_native(
                 # Parameter not supplied for this assembly (e.g. the mass matrix, which references no
                 # parameter): pack a zero placeholder of the right width. It is only ever read back if
                 # the term actually contains the parameter node, in which case args carries its value.
-                pv.append(jnp.zeros((n_local_f[_field_param_field_idx] if name in _field_param_names else 1,), dtype))
+                _w = (
+                    n_local_f[_field_param_field_idx]
+                    if (name in _field_param_names and name not in _cell_field_names)
+                    else 1
+                )
+                pv.append(jnp.zeros((_w,), dtype))
                 continue
             flat = jnp.reshape(jnp.asarray(a[name], dtype=dtype), (-1,))
-            # Nodal field parameter -> this cell's local nodal values on its field's mesh (field 0 for a
-            # single-field problem; the resolved field for a coupled one).
-            pv.append(flat[cells_f_j[_field_param_field_idx][c]] if name in _field_param_names else flat[:1])
+            if name in _cell_field_names:
+                # P0 -> this cell's single value. Width 1, so the kernel takes its scalar branch and
+                # broadcasts it over the quad points -- which is what a per-element constant is.
+                pv.append(jnp.reshape(flat[c], (1,)))
+            else:
+                # Nodal field parameter -> this cell's local nodal values on its field's mesh (field 0
+                # for a single-field problem; the resolved field for a coupled one).
+                pv.append(flat[cells_f_j[_field_param_field_idx][c]] if name in _field_param_names else flat[:1])
         return tv + tuple(pv)
 
     # -------------------------------------------------------------------------

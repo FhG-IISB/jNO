@@ -91,16 +91,28 @@ def parameter(shape: tuple, *, key: jax.Array | None = None, name: str | None = 
     fem_field_domain = None
     if hasattr(shape, "field_key") and getattr(shape, "_domain", None) is not None:
         sym = shape
-        if int(getattr(sym, "order", 1)) != 1:
-            raise NotImplementedError(
-                "jno.np.parameter(<symbol>): nodal field parameters support P1 (order=1) "
-                "symbols only for now (higher-order spaces add nodes during init_fem)."
-            )
         mesh = getattr(sym._domain, "built_mesh", None)
         if mesh is None:
             raise ValueError("jno.np.parameter(<symbol>): the symbol's domain has no mesh yet.")
-        shape = (int(mesh.points.shape[0]),)
-        fem_field = "node"
+        if str(getattr(sym, "space", "") or "").upper() == "P0":
+            # A **P0 symbol gives one value per ELEMENT**, not per node. This is the density
+            # variable of density-based topology optimisation (Bendsoe & Sigmund, *Topology
+            # Optimization*, Springer 2004; Jung, Yun & Kim, *Computers & Structures* **331**
+            # (2026) 108403, eq. 12), where the design lives on elements and a nodal field would
+            # both mis-size the parameter and smear the design across element boundaries.
+            # `sym.order` does NOT distinguish it -- a P0 symbol reports order 1 -- so the space
+            # is the discriminator, and without this branch a P0 symbol silently produced a
+            # node-sized parameter.
+            shape = (int(sym._domain._cells_p1().shape[0]),)
+            fem_field = "cell"
+        else:
+            if int(getattr(sym, "order", 1)) != 1:
+                raise NotImplementedError(
+                    "jno.np.parameter(<symbol>): nodal field parameters support P1 (order=1) "
+                    "symbols only for now (higher-order spaces add nodes during init_fem)."
+                )
+            shape = (int(mesh.points.shape[0]),)
+            fem_field = "node"
         fem_field_key = getattr(sym, "field_key", None)
         fem_field_domain = sym._domain  # so the regularizer can recover the FE space
 

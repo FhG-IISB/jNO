@@ -159,3 +159,105 @@ class TestComplianceMinimisation:
             f"a tighter budget must give higher compliance: "
             f"C(0.25)={results[0.25]:.4f} vs C(0.5)={results[0.5]:.4f}"
         )
+
+
+class TestP0DensityParameter:
+    """``jno.np.parameter(<P0 symbol>)`` — one design value per ELEMENT.
+
+    This is the density variable of the method (Jung, Yun & Kim, *Computers & Structures* **331**
+    (2026) 108403, eq. 12; Bendsoe & Sigmund, *Topology Optimization*, Springer 2004). A P0 symbol
+    reports ``order == 1``, so the space -- not the order -- is what distinguishes it, and without
+    that branch a P0 symbol silently produced a NODE-sized parameter: 18 values for 22 cells on the
+    mesh below, with the design smeared across element boundaries by the P1 interpolation.
+    """
+
+    @staticmethod
+    def _build(size=0.5):
+        inner, symgrad, trace = jno.np.inner, jno.np.symgrad, jno.np.trace
+        d = jno.Shape.rect(0, 0, 2, 1, size=size).domain()
+        u, phi = d.fem_symbols(value_shape=(2,))
+        _r, s = d.fem_symbols(space="P0", names=("r", "s"))
+        xi, yi, _ = d.variable("interior", split=True)
+        xl, yl, _ = d.variable("left", split=True)
+        rho = jno.np.parameter(s, name="rho")
+        eu, ep = symgrad(u, [xi, yi]), symgrad(phi, [xi, yi])
+        # Linear in rho on purpose: a one-hot design then assembles exactly one element matrix,
+        # which is what makes the two checks below exact rather than approximate.
+        fem = jno.fem(
+            [
+                rho * (LAM * trace(eu) * trace(ep) + 2 * MU * inner(eu, ep, n_contract=2)),
+                u(xl, yl) - (0.0, 0.0),
+            ],
+            quad_degree=2,
+        )
+        return d, np.asarray(d._cells_p1()), fem
+
+    def test_the_parameter_is_sized_by_cells_not_nodes(self):
+        d = jno.Shape.rect(0, 0, 2, 1, size=0.5).domain()
+        _r, s = d.fem_symbols(space="P0", names=("r", "s"))
+        n_cells = int(np.asarray(d._cells_p1()).shape[0])
+        n_nodes = int(np.asarray(d.built_mesh.points).shape[0])
+        assert n_cells != n_nodes, "the mesh must distinguish the two for this to test anything"
+
+        rho = jno.np.parameter(s, name="rho_p0")
+        assert rho.model._fem_field == "cell", "a P0 symbol must mark the parameter as a cell field"
+        shapes = [lf.shape for lf in jax.tree_util.tree_leaves(rho.model.module)]
+        assert shapes == [(n_cells,)], f"expected [({n_cells},)], got {shapes}"
+
+    def test_each_value_lands_on_its_own_element_and_nowhere_else(self):
+        d, cells, fem = self._build()
+        n_cells = cells.shape[0]
+
+        def K(vals):
+            a, _ = fem.operator.evaluate({"rho": jnp.asarray(vals, dtype=jnp.float64)})
+            return np.asarray(jnp.asarray(a.todense()))
+
+        k_all = K(np.ones(n_cells))
+        eye = np.eye(k_all.shape[0])
+        # The Dirichlet rows are replaced by the identity in EVERY assembly, so they would
+        # accumulate across the sum below; compare on the free block.
+        dirichlet = np.where(np.all(np.isclose(k_all, eye), axis=1))[0]
+        free = np.setdiff1d(np.arange(k_all.shape[0]), dirichlet)
+
+        # 1. Linearity: with a coefficient linear in rho, one-hot designs must sum to the whole.
+        acc = sum(K(np.eye(n_cells)[j])[np.ix_(free, free)] for j in range(n_cells))
+        np.testing.assert_allclose(acc, k_all[np.ix_(free, free)], atol=1e-12)
+
+        # 2. Support: a one-hot design assembles ONLY that element's block. A node-sized
+        #    parameter would leak into every element touching those nodes.
+        j = 5
+        k_j = K(np.eye(n_cells)[j])[np.ix_(free, free)]
+        cell_dofs = set(np.concatenate([2 * cells[j], 2 * cells[j] + 1]).tolist())
+        elsewhere = np.array([i for i, dof in enumerate(free) if dof not in cell_dofs])
+        assert np.abs(k_j[np.ix_(elsewhere, elsewhere)]).max() == 0.0
+        here = np.array([i for i, dof in enumerate(free) if dof in cell_dofs])
+        assert np.abs(k_j[np.ix_(here, here)]).max() > 0.0
+
+    def test_a_uniform_p0_density_matches_a_uniform_p1_density(self):
+        """The two spaces must agree exactly where they can — on a constant field."""
+        inner, symgrad, trace = jno.np.inner, jno.np.symgrad, jno.np.trace
+
+        def assemble(space):
+            d = jno.Shape.rect(0, 0, 2, 1, size=0.5).domain()
+            u, phi = d.fem_symbols(value_shape=(2,))
+            _r, s = d.fem_symbols(names=("r", "s")) if space == "P1" else d.fem_symbols(
+                space="P0", names=("r", "s")
+            )
+            xi, yi, _ = d.variable("interior", split=True)
+            xl, yl, _ = d.variable("left", split=True)
+            rho = jno.np.parameter(s, name="rho")
+            eu, ep = symgrad(u, [xi, yi]), symgrad(phi, [xi, yi])
+            fem = jno.fem(
+                [
+                    rho * (LAM * trace(eu) * trace(ep) + 2 * MU * inner(eu, ep, n_contract=2)),
+                    u(xl, yl) - (0.0, 0.0),
+                ],
+                quad_degree=2,
+            )
+            n = int(np.asarray(d._cells_p1()).shape[0]) if space == "P0" else int(
+                np.asarray(d.built_mesh.points).shape[0]
+            )
+            a, _ = fem.operator.evaluate({"rho": jnp.full(n, 0.7, dtype=jnp.float64)})
+            return np.asarray(jnp.asarray(a.todense()))
+
+        np.testing.assert_allclose(assemble("P0"), assemble("P1"), atol=1e-12)

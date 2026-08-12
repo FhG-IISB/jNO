@@ -68,6 +68,18 @@ def _is_fem_field_parameter(node) -> bool:
     return _is_runtime_scalar_parameter(node) and getattr(node.model, "_fem_field", None) is not None
 
 
+def _fem_field_kind(node):
+    """``"node"``, ``"cell"`` or ``None`` — which FE space a field parameter's values live on.
+
+    A ``"cell"`` field is P0: one value per element, broadcast over that element's quadrature
+    points. A ``"node"`` field is P1: the cell's vertex values, interpolated with the shape
+    functions. They gather differently, so the assembler has to tell them apart.
+    """
+    if not _is_fem_field_parameter(node):
+        return None
+    return getattr(node.model, "_fem_field", None)
+
+
 def _contains_fem_field_parameter(node) -> bool:
     """Recursively detect a FEM field parameter in one trace subtree."""
     if _is_fem_field_parameter(node):
