@@ -302,16 +302,24 @@ class MMACallback(_Callback):
             )
             return jnp.stack([jnp.mean(r) for r in residuals])
 
+        # One gradient per constraint, NOT a `jacrev` over the whole constraint vector. `jacrev`
+        # vmaps its VJP across the output rows, and a differentiable FEM solve bottoms out in
+        # `spsolve`, which has no batching rule -- so the Jacobian of a constraint that depends on
+        # `fem.solve()` cannot be taken that way at all. Separate reverse passes also cost less
+        # here: only the `jno.le` rows are needed, and the objective's gradient already arrives
+        # through `grads`.
+        rows = list(self._ineq)
+
         def jac(trainable, context, rng):
             sub = {lid: trainable[lid] for lid in lids}
             rest = {k: v for k, v in trainable.items() if k not in sub}
-            # jacrev over the design block only: one row per constraint entry, and the rows for the
-            # `jno.le` entries are precisely MMA's constraint gradients.
-            per = jax.jacrev(lambda s: _losses(s, rest, context, rng))(sub)
-            leaves = [leaf for lid in lids for leaf in jax.tree_util.tree_leaves(per[lid])]
-            return jnp.stack(
-                [jnp.concatenate([leaf[i].ravel() for leaf in leaves]) for i in range(self._n_constraints)]
-            )
+
+            def one(i):
+                g = jax.grad(lambda s: _losses(s, rest, context, rng)[i])(sub)
+                leaves = [leaf for lid in lids for leaf in jax.tree_util.tree_leaves(g[lid])]
+                return jnp.concatenate([leaf.ravel() for leaf in leaves])
+
+            return jnp.stack([one(i) for i in rows]) if rows else jnp.zeros((0, 1))
 
         self._jac_fn = jax.jit(jac)
 
@@ -351,11 +359,12 @@ class MMACallback(_Callback):
             xmax.append(np.full(part.size, hi))
         xmin, xmax = np.concatenate(xmin), np.concatenate(xmax)
 
+        # Constraint VALUES come free with the hook -- they were evaluated on this step's batch, so
+        # they are consistent with the gradients by construction. Only the Jacobian needs work.
         g_all = np.asarray(kw.get("individual_losses")).reshape(-1)
         if self._ineq:
             g = g_all[np.asarray(self._ineq)]
-            G_full = np.asarray(self._jac_fn(trainable, context, rng), dtype=np.float64)
-            dg = G_full[np.asarray(self._ineq)]
+            dg = np.asarray(self._jac_fn(trainable, context, rng), dtype=np.float64)
         else:
             g, dg = np.zeros(0), np.zeros((0, x.size))
 
