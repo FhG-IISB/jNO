@@ -49,8 +49,12 @@ class MMAOptimizer:
         asy_grow: float = 1.2,
         raa: float = 1e-5,
         dual_iters: int = 400,
+        move_gamma: float = 1.0,
+        move_min: float = 0.0,
     ):
         self.move = float(move)
+        self.move_gamma = float(move_gamma)
+        self.move_min = float(move_min)
         self.lower = lower
         self.upper = upper
         self.asy_init = float(asy_init)
@@ -73,6 +77,8 @@ def mma(
     asy_grow: float = 1.2,
     raa: float = 1e-5,
     dual_iters: int = 400,
+    move_gamma: float = 1.0,
+    move_min: float = 0.0,
 ) -> MMAOptimizer:
     """Return an MMA sentinel to pass to ``.optimizer()`` on a design variable.
 
@@ -89,6 +95,12 @@ def mma(
             asymptotes pulled in by ``asy_shrink`` (damping the oscillation); one moving steadily
             has them pushed out by ``asy_grow`` (accelerating). This history-dependence is what
             distinguishes MMA from a fixed convex approximation.
+        move_gamma: Per-iteration decay of the move limit, ``move_k = move * move_gamma**k``,
+            floored at ``move_min``. MMA does not converge to a point: near the optimum the
+            iterates keep chattering at the scale of the move limit, which is fine for the design
+            but means a relative-change convergence test never fires. Shrinking the limit late in
+            the run damps that chatter. ``1.0`` (the default) is no decay, i.e. the classic method.
+        move_min: Floor on the decayed move limit, so the design never freezes outright.
         raa: Small positive term keeping the approximation strictly convex when a gradient vanishes.
         dual_iters: Projected-gradient iterations on the dual. The dual is concave in ``lambda``
             and low-dimensional (one per constraint), so this is cheap; a single constraint is
@@ -112,6 +124,8 @@ def mma(
         asy_grow=asy_grow,
         raa=raa,
         dual_iters=dual_iters,
+        move_gamma=move_gamma,
+        move_min=move_min,
     )
 
 
@@ -373,7 +387,7 @@ class MMACallback(_Callback):
         else:
             g, dg = np.zeros(0), np.zeros((0, x.size))
 
-        spec = _BlendedSpec(self._blocks, [p.size for p in x_parts])
+        spec = _BlendedSpec(self._blocks, [p.size for p in x_parts], k=self._k)
         x_new, self._low, self._upp = mma_subproblem(
             x, None, df0, g, dg, self._low, self._upp, xmin, xmax,
             self._xold1, self._xold2, self._k, spec, spec.dual_iters,
@@ -423,13 +437,23 @@ class _BlendedSpec:
     approximations.
     """
 
-    def __init__(self, blocks, sizes):
+    def __init__(self, blocks, sizes, k: int = 0):
         first = blocks[0][1]
         self.asy_init = first.asy_init
         self.asy_shrink = first.asy_shrink
         self.asy_grow = first.asy_grow
         self.raa = first.raa
         self.dual_iters = first.dual_iters
+        # Decayed per block, then concatenated: `move_k = max(move * gamma**k, move_min)`.
         self.move = np.concatenate(
-            [np.full(int(s), float(spec.move)) for (_lid, spec), s in zip(blocks, sizes)]
+            [
+                np.full(
+                    int(s),
+                    max(
+                        float(spec.move) * float(getattr(spec, "move_gamma", 1.0)) ** int(k),
+                        float(getattr(spec, "move_min", 0.0)),
+                    ),
+                )
+                for (_lid, spec), s in zip(blocks, sizes)
+            ]
         )

@@ -232,3 +232,51 @@ class TestPerVariableBounds:
         vol = jno.fn(lambda xv: jnp.sum(xv), [x], name="vol")
         with pytest.raises(ValueError, match="3 entries but the design variable has 4"):
             jno.core([f0, jno.le(vol, 1.0)], domain=d).solve(1)
+
+
+class TestMoveLimitDamping:
+    """``move_gamma`` — shrink the move limit as the run proceeds.
+
+    MMA does not converge to a point: near the optimum the iterates chatter at the scale of the
+    move limit. Harmless for the design, fatal for any relative-change convergence test built on
+    top of it — on the deformable cantilever the SIMP continuation could never fire until this
+    existed, and fired twice immediately after.
+    """
+
+    def test_the_spec_decays_and_floors_the_move_limit(self):
+        from jno.optimizers.mma import _BlendedSpec
+
+        spec = jno.optimizers.mma(move=0.2, lower=0.0, upper=1.0, move_gamma=0.9, move_min=0.05)
+        blocks = [(0, spec)]
+        assert float(_BlendedSpec(blocks, [3], k=0).move[0]) == pytest.approx(0.2)
+        assert float(_BlendedSpec(blocks, [3], k=5).move[0]) == pytest.approx(0.2 * 0.9**5)
+        assert float(_BlendedSpec(blocks, [3], k=500).move[0]) == pytest.approx(0.05), "the floor holds"
+
+    def test_the_default_is_the_classic_method(self):
+        from jno.optimizers.mma import _BlendedSpec
+
+        blocks = [(0, jno.optimizers.mma(move=0.2, lower=0.0, upper=1.0))]
+        for k in (0, 10, 1000):
+            assert float(_BlendedSpec(blocks, [3], k=k).move[0]) == pytest.approx(0.2)
+
+    def test_damping_still_reaches_the_analytic_optimum(self):
+        """A smaller late-stage step must not cost the answer — only the chatter around it."""
+        c = _problem()
+        V, n = 6.0, c.size
+        x_star, f_star = _analytic(c, V)
+
+        d = jno.domain.from_array({"_": np.zeros((1, 1))})
+        x = jno.np.parameter((n,), name="x_damp")
+        x.dtype(jnp.float64)
+        x.initialize(jax.nn.initializers.constant(V / n))
+        x.optimizer(
+            jno.optimizers.mma(move=0.2, lower=0.05, upper=5.0, move_gamma=0.99, move_min=0.01)
+        )
+        f0 = jno.fn(lambda xv: jnp.sum(jnp.asarray(c) / xv), [x], name="f0")
+        vol = jno.fn(lambda xv: jnp.sum(xv), [x], name="vol")
+
+        crux = jno.core([f0, jno.le(vol, V)], domain=d)
+        crux.solve(150)
+        xf = np.asarray(crux.eval([x])).reshape(-1)
+        assert float(np.sum(c / xf)) == pytest.approx(f_star, rel=1e-5)
+        assert xf.sum() <= V + 1e-8
