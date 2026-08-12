@@ -2729,6 +2729,65 @@ class ModelCall(Placeholder):
 
         return _jno.fn(dom.patch_filter(), [self], name="patch")
 
+    def perimeter(self, zeta: float = 0.1) -> "FunctionCall":
+        """Smoothed structural perimeter of a P0 density — eq. (38), as a scalar node.
+
+        Jung, Yun & Kim, *Computers & Structures* **331** (2026) 108403, Sec. 3.5, after Haber,
+        Jog & Bendsoe, *Struct. Optim.* **11**, 1996, 1-12:
+
+            P = sum_k  l_k * ( sqrt( (1 + 2 zeta) <rho>_k^2 + zeta^2 ) - zeta )
+
+        over the **interior** edges, with ``<rho>_k`` the density jump across edge ``k`` and
+        ``l_k`` its length. The bracket is a smoothed ``|<rho>|``: it is exactly 0 for no jump and
+        exactly 1 for a full one, so ``P`` measures the total length of the material boundary while
+        staying differentiable where a bare absolute value would not be.
+
+        This is the **feature-scale** lever, and the one constraint here that is about
+        manufacturability rather than mesh validity. A design fragmented into many thin members has
+        a large perimeter for the same volume; bounding it forces fewer, thicker members. Used as a
+        logarithmic barrier against a target ``P*`` (eq. 39-40)::
+
+            P = rho.perimeter(zeta=0.1)
+            penalty = jno.fn(lambda p: -P_star * jnp.log(P_star - p), [P], name="R")
+            jno.core([C, beta * penalty, jno.le(...)], domain=d)
+
+        The barrier diverges as ``P`` approaches ``P*`` from below, so the design can never cross
+        it; ``beta`` is decayed geometrically (eq. 41) to tighten it as the run proceeds.
+
+        Evaluated on whatever this parameter currently *is* — under
+        ``rho.constrain(d.patch_filter())`` that is the physical density, which is the field whose
+        boundary one actually wants to measure. Differentiable in the density **and** in the mesh,
+        since the edge lengths come from the moving vertices.
+
+        Args:
+            zeta: Smoothing parameter; the paper uses 0.1. Smaller is a sharper approximation to
+                ``|<rho>|`` and a worse-conditioned one.
+        """
+        dom = getattr(self.model, "_fem_field_domain", None)
+        if getattr(self.model, "_fem_field", None) != "cell" or dom is None:
+            raise TypeError(
+                "ModelCall.perimeter(): needs a P0 (per-element) density -- the jump is taken "
+                "ACROSS an edge, between the two elements meeting there, so a nodal field (which "
+                "is continuous and jumps nowhere) has no perimeter to measure."
+            )
+        import jno as _jno
+
+        edges = dom.interior_edges()
+        ecells = jnp.asarray(edges["cells"], dtype=jnp.int32)
+        enodes = jnp.asarray(edges["nodes"], dtype=jnp.int32)
+        args, rebuild = dom._moving_points()
+        z = float(zeta)
+
+        def _perimeter(rv, *coord_vals):
+            r = jnp.asarray(rv).reshape(-1)
+            pts = rebuild(*coord_vals)
+            length = jnp.linalg.norm(pts[enodes[:, 0]] - pts[enodes[:, 1]], axis=-1)
+            jump = r[ecells[:, 0]] - r[ecells[:, 1]]
+            smooth = jnp.sqrt((1.0 + 2.0 * z) * jump**2 + z * z) - z
+            return jnp.sum(length * smooth)
+
+        return _jno.fn(_perimeter, [self, *args], name="perimeter")
+
 
     def __call__(self, *coords, **named):
         """For a **nodal-field unknown** (``domain.unknown()``), ``u(xb, yb)`` is sugar for

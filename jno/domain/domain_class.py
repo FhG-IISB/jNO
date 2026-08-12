@@ -2529,6 +2529,34 @@ class domain(MeshIOMixin):
         """
         return self.cell_volume().sum
 
+    def interior_edges(self):
+        """Interior facets — the edges shared by exactly two triangles.
+
+        Returns a dict of host-side numpy arrays:
+            ``cells`` ``(n_edges, 2)`` int — the two triangles meeting at each edge.
+            ``nodes`` ``(n_edges, 2)`` int — the edge's two endpoints, for its length.
+
+        Boundary edges are excluded: they carry no density jump, since there is no element on the
+        far side. This is the traversal a perimeter functional needs (Haber, Jog & Bendsoe,
+        *Struct. Optim.* **11**, 1996, 1-12).
+        """
+        cells = self._cells_p1()
+        if int(self.dimension) != 2 or cells.shape[1] != 3:
+            raise NotImplementedError(
+                f"domain.interior_edges(): triangles in 2-D only; got {cells.shape[1]}-node cells "
+                f"in {self.dimension}-D."
+            )
+        seen: dict = {}
+        for k, tri in enumerate(cells):
+            for a, b in ((0, 1), (1, 2), (2, 0)):
+                key = (int(min(tri[a], tri[b])), int(max(tri[a], tri[b])))
+                seen.setdefault(key, []).append(k)
+        keys = [e for e, ks in seen.items() if len(ks) == 2]
+        return {
+            "cells": np.asarray([seen[e] for e in keys], dtype=np.int64),
+            "nodes": np.asarray(keys, dtype=np.int64),
+        }
+
     def patch_filter(self):
         """The patch filter of eq. (17)-(19) as a pure ``(n_cells,) -> (n_cells,)`` callable.
 

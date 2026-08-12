@@ -388,3 +388,56 @@ class TestPatchFilter:
         _r, s = d.fem_symbols(names=("r", "s"))
         with pytest.raises(TypeError, match="P0"):
             jno.np.parameter(s, name="rho_nodal").patch()
+
+
+class TestPerimeter:
+    """Smoothed structural perimeter — eq. (38), after Haber, Jog & Bendsoe (1996)."""
+
+    @staticmethod
+    def _setup(size=2.0):
+        d = jno.Shape.rect(0, 0, 60, 30, size=size).domain()
+        _r, s = d.fem_symbols(space="P0", names=("r", "s"))
+        rho = jno.np.parameter(s, name="rho_perim")
+        cells = np.asarray(d._cells_p1())
+        centroids = np.asarray(d.mesh.points)[:, :2][cells].mean(axis=1)
+        return d, rho.perimeter(zeta=0.1).fn, cells.shape[0], centroids
+
+    def test_a_uniform_density_has_no_perimeter(self):
+        """No jump anywhere means no material boundary — the smoothing must vanish exactly."""
+        _d, p, n_cells, _c = self._setup()
+        for value in (0.0, 0.4, 1.0):
+            assert float(p(jnp.full(n_cells, value))) == pytest.approx(0.0, abs=1e-12)
+
+    def test_a_bar_measures_its_own_boundary_length(self):
+        """A bar spanning the domain has two interfaces of length 60, so P must be ~120.
+
+        Slightly ABOVE 120 is correct, not an error: the interface follows the mesh edges, and a
+        zig-zag through triangles is longer than the straight line it approximates.
+        """
+        _d, p, n_cells, centroids = self._setup()
+        bar = np.where(np.abs(centroids[:, 1] - 15.0) < 6.0, 1.0, 0.0)
+        got = float(p(jnp.asarray(bar)))
+        assert 120.0 <= got < 132.0, f"a full-width bar should measure ~120, got {got:.2f}"
+
+    def test_a_fragmented_layout_costs_more_perimeter_than_a_compact_one(self):
+        """The whole point: same volume, more pieces, more boundary. This is the feature-scale
+        signal a barrier on P acts on."""
+        _d, p, n_cells, centroids = self._setup()
+        rng = np.random.default_rng(0)
+        one_bar = np.where(np.abs(centroids[:, 1] - 15.0) < 6.0, 1.0, 0.0)
+        scattered = np.zeros(n_cells)
+        scattered[rng.choice(n_cells, int(one_bar.sum()), replace=False)] = 1.0
+        assert float(p(jnp.asarray(scattered))) > 3.0 * float(p(jnp.asarray(one_bar)))
+
+    def test_the_smoothing_is_exact_at_both_ends(self):
+        """eq. (38)'s bracket is 0 at no jump and exactly 1 at a full one, for any zeta."""
+        for zeta in (0.05, 0.1, 0.5):
+            f = lambda j, z=zeta: np.sqrt((1 + 2 * z) * j**2 + z * z) - z  # noqa: E731
+            assert f(0.0) == pytest.approx(0.0, abs=1e-15)
+            assert f(1.0) == pytest.approx(1.0, abs=1e-12)
+
+    def test_a_nodal_density_is_refused(self):
+        d = jno.Shape.rect(0, 0, 2, 1, size=0.4).domain()
+        _r, s = d.fem_symbols(names=("r", "s"))
+        with pytest.raises(TypeError, match="P0"):
+            jno.np.parameter(s, name="rho_nodal_p").perimeter()
