@@ -2529,6 +2529,156 @@ class domain(MeshIOMixin):
         """
         return self.cell_volume().sum
 
+    def patch_filter(self):
+        """The patch filter of eq. (17)-(19) as a pure ``(n_cells,) -> (n_cells,)`` callable.
+
+        Jung, Yun & Kim, *Computers & Structures* **331** (2026) 108403, Sec. 2.3.2. It maps the
+        design density to the **physical** density, and it is a manufacturability operator rather
+        than a smoothing one: it drives to zero exactly those elements whose surroundings make the
+        layout unbuildable, and leaves every other element untouched.
+
+        Around each vertex of element ``k`` the elements form a patch, walked counterclockwise
+        (:meth:`patch_topology`). For that patch,
+
+            f_k = [ prod_{i=2}^{N-2} { 1 - r_i (1 - mean(r_1..r_{i-1})) (1 - mean(r_{i+1}..r_{N-1})) }
+                    * { 1 - r_k (1 - (r_1 + r_{N-1}) / 2) } ] ^ (1 / (N - 2))
+
+        with ``r_1 ... r_{N-1}`` the other elements in order. The product detects a **one-node
+        connection** -- a dense element joined to the rest of the structure through this vertex
+        alone -- and the final factor a **single dense element** in an otherwise void patch, which
+        puts a sharp corner on the boundary. Both drive ``f_k`` to zero; a sound patch leaves it at
+        one. The physical density is ``rho_bar_k = rho_k (f^I + f^J + f^K) / P_k`` over the
+        element's three vertices, ``P_k`` counting only the patches with at least three elements
+        (eq. 19). With SIMP downstream a suppressed element's stiffness vanishes, so the
+        configuration removes itself.
+
+        **Boundary patches drop the final factor** (Fig. 2d): one-node connections are still
+        suppressed there, but a single dense element on the domain boundary is *preserved*, since
+        it costs little smoothness and helps keep a natural boundary profile. The paper states this
+        rule in prose without an equation, so the placement is our reading; the value stays 1 when
+        nothing is detected either way, so both branches remain on one scale.
+
+        Two ways to use it, and a design needs both::
+
+            rho.constrain(d.patch_filter())   # the PHYSICS sees rho_bar (paramax reparameterises
+                                              # before every forward pass; MMA still steps in rho)
+            rho_bar = rho.patch()             # the same map as a trace node, for constraints,
+                                              # reporting and `crux.eval`
+
+        The filter is non-local -- an element's physical density depends on its whole
+        neighbourhood -- so it cannot be written inside the weak form, where the kernel sees one
+        element at a time. That is why the physics route is a reparameterisation.
+        """
+        topo = self.patch_topology()
+        others = jnp.asarray(topo["others"], dtype=jnp.int32)      # (K, 3, M) with -1 padding
+        n_int = jnp.asarray(topo["size"], dtype=jnp.int32)         # (K, 3)
+        interior = jnp.asarray(~topo["boundary"])                  # (K, 3)
+        m = others.shape[-1]
+        pos = jnp.arange(m, dtype=jnp.int32)[None, None, :]        # array index p; r_{p+1} of the paper
+
+        def _patch(rv):
+            r = jnp.asarray(rv).reshape(-1)
+            n = n_int                                              # (K, 3) patch size N
+            vals = jnp.where(others >= 0, r[jnp.maximum(others, 0)], 0.0)   # (K, 3, M)
+            live = (pos < (n - 1)[..., None]).astype(vals.dtype)   # entries 1..N-1 are real
+            vals = vals * live
+            csum = jnp.cumsum(vals, axis=-1)                       # csum[p] = sum_{j<=p+1} r_j
+            total = jnp.sum(vals, axis=-1, keepdims=True)
+
+            # Factor i of the product, at array index p = i - 1, live for 1 <= p <= N-3.
+            denom_pre = jnp.maximum(pos, 1).astype(vals.dtype)                       # i - 1
+            pre = jnp.concatenate([jnp.zeros_like(csum[..., :1]), csum[..., :-1]], -1) / denom_pre
+            denom_suf = jnp.maximum((n - 2)[..., None] - pos, 1).astype(vals.dtype)  # N - i - 1
+            suf = (total - csum) / denom_suf
+            term = 1.0 - vals * (1.0 - pre) * (1.0 - suf)
+            active = ((pos >= 1) & (pos <= (n - 3)[..., None])).astype(vals.dtype)
+            prod = jnp.prod(jnp.where(active > 0, term, 1.0), axis=-1)               # (K, 3)
+
+            # The final factor: k itself dense between two void neighbours in the patch.
+            r_first = vals[..., 0]
+            r_last = jnp.take_along_axis(vals, jnp.clip(n - 2, 0, m - 1)[..., None], axis=-1)[..., 0]
+            rk = r[:, None]
+            last = 1.0 - rk * (1.0 - 0.5 * (r_first + r_last))
+            last = jnp.where(interior, last, 1.0)   # preserved on the boundary (Fig. 2d)
+
+            valid = n >= 3
+            expo = 1.0 / jnp.maximum(n.astype(vals.dtype) - 2.0, 1.0)
+            f = jnp.where(valid, jnp.clip(prod * last, 0.0, None) ** expo, 0.0)
+            p_k = jnp.sum(valid.astype(f.dtype), axis=-1)                            # (K,)
+            # P_k = 0 means no patch around this element reaches three elements; there is nothing
+            # to judge it by, so it passes through unchanged rather than becoming 0/0.
+            return r * jnp.where(p_k > 0, jnp.sum(f, axis=-1) / jnp.maximum(p_k, 1.0), 1.0)
+
+        return _patch
+
+    def patch_topology(self):
+        """Node→element patches, ordered counterclockwise — the connectivity eq. (17)-(19) needs.
+
+        For every triangle ``k`` and every one of its three vertices, returns the OTHER elements of
+        that vertex's patch in counterclockwise order starting from the one adjacent to ``k``. This
+        is what makes the patch formula of Jung, Yun & Kim, *Computers & Structures* **331** (2026)
+        108403 evaluable: its indices ``rho_{k,1} ... rho_{k,N-1}`` are an angular walk around the
+        node, and ``rho_{k,1}`` / ``rho_{k,N-1}`` — the first and last — are precisely the two
+        elements sharing an edge with ``k``.
+
+        Returns a dict of numpy arrays, all host-side and computed once:
+            ``others``   ``(n_cells, 3, Nmax-1)`` int — the ordered other-element ids, ``-1`` padded.
+            ``size``     ``(n_cells, 3)`` int — ``N^I``, the patch's element count.
+            ``boundary`` ``(n_cells, 3)`` bool — whether that vertex lies on the domain boundary.
+
+        The **ordering is taken once, from the current mesh**. Connectivity is fixed under
+        ``.trainable()`` coordinates (relocation, not remeshing), so the patches themselves never
+        change; only a distortion large enough to reorder the angular fan would invalidate the walk,
+        which the geometric constraints of eq. (24)-(28) exist to prevent.
+        """
+        cells = self._cells_p1()
+        pts = np.asarray(self.mesh.points)[:, : int(self.dimension)]
+        if int(self.dimension) != 2 or cells.shape[1] != 3:
+            raise NotImplementedError(
+                f"domain.patch_topology(): triangles in 2-D only; got {cells.shape[1]}-node cells "
+                f"in {self.dimension}-D. The patch formulation is 2-D (paper, Sec. 2.3.2)."
+            )
+        n_cells = cells.shape[0]
+        centroids = pts[cells].mean(axis=1)
+
+        incident: List[List[int]] = [[] for _ in range(pts.shape[0])]
+        for k, tri in enumerate(cells):
+            for n in tri:
+                incident[int(n)].append(k)
+
+        # A vertex is on the domain boundary iff one of its incident edges is used by one cell only.
+        edge_count: dict = {}
+        for tri in cells:
+            for a, b in ((0, 1), (1, 2), (2, 0)):
+                e = (int(min(tri[a], tri[b])), int(max(tri[a], tri[b])))
+                edge_count[e] = edge_count.get(e, 0) + 1
+        on_boundary = np.zeros(pts.shape[0], dtype=bool)
+        for (a, b), c in edge_count.items():
+            if c == 1:
+                on_boundary[a] = on_boundary[b] = True
+
+        ccw = {}
+        for n, ks in enumerate(incident):
+            if not ks:
+                continue
+            rel = centroids[ks] - pts[n]
+            ang = np.arctan2(rel[:, 1], rel[:, 0])
+            ccw[n] = [ks[i] for i in np.argsort(ang)]
+
+        n_max = max((len(v) for v in ccw.values()), default=1)
+        others = np.full((n_cells, 3, max(n_max - 1, 1)), -1, dtype=np.int64)
+        size = np.zeros((n_cells, 3), dtype=np.int64)
+        boundary = np.zeros((n_cells, 3), dtype=bool)
+        for k, tri in enumerate(cells):
+            for v, n in enumerate(tri):
+                ring = ccw[int(n)]
+                q = ring.index(k)
+                rest = ring[q + 1 :] + ring[:q]  # counterclockwise, starting adjacent to k
+                others[k, v, : len(rest)] = rest
+                size[k, v] = len(ring)
+                boundary[k, v] = bool(on_boundary[int(n)])
+        return {"others": others, "size": size, "boundary": boundary}
+
     def variable(
         self,
         tag: str,

@@ -2706,6 +2706,30 @@ class ModelCall(Placeholder):
 
     bind = partials
 
+    def patch(self) -> "FunctionCall":
+        """Physical density from the design density — the patch filter, eq. (17)-(19), as a node.
+
+        Sugar for ``jno.fn(domain.patch_filter(), [self])``; see
+        :meth:`~jno.domain.Domain.patch_filter` for what the filter does and why the **physics**
+        route is ``rho.constrain(d.patch_filter())`` rather than this node. Use this one for the
+        constraints, the reporting and ``crux.eval`` — anywhere outside the weak form.
+
+        Returns:
+            A ``(n_cells,)`` node, differentiable in the design density.
+        """
+        dom = getattr(self.model, "_fem_field_domain", None)
+        if getattr(self.model, "_fem_field", None) != "cell" or dom is None:
+            raise TypeError(
+                "ModelCall.patch(): the patch filter needs a P0 (per-element) design density -- "
+                "`jno.np.parameter(<symbol>)` on a symbol made with `space=\"P0\"`. It maps one "
+                "value per element to one physical value per element; a nodal field has no "
+                "element to be the patch's reference."
+            )
+        import jno as _jno
+
+        return _jno.fn(dom.patch_filter(), [self], name="patch")
+
+
     def __call__(self, *coords, **named):
         """For a **nodal-field unknown** (``domain.unknown()``), ``u(xb, yb)`` is sugar for
         ``u.bind(x=xb, y=yb)`` — the region-restricted form used to write fem-identical BCs / IC

@@ -261,3 +261,130 @@ class TestP0DensityParameter:
             return np.asarray(jnp.asarray(a.todense()))
 
         np.testing.assert_allclose(assemble("P0"), assemble("P1"), atol=1e-12)
+
+
+def _f_patch_reference(rk, others, boundary):
+    """eq. (18) written out literally, one patch at a time, from the paper.
+
+    Deliberately a slow transcription with an explicit loop: the vectorised implementation in
+    ``domain.patch_filter`` has to agree with THIS, and a shared helper would let one bug hide
+    in both.
+    """
+    n = len(others) + 1
+    if n < 3:
+        return 0.0
+    prod = 1.0
+    for i in range(2, n - 1):
+        pre = sum(others[: i - 1]) / (i - 1)
+        suf = sum(others[i : n - 1]) / (n - i - 1)
+        prod *= 1 - others[i - 1] * (1 - pre) * (1 - suf)
+    last = 1.0 if boundary else 1 - rk * (1 - (others[0] + others[n - 2]) / 2)
+    return (prod * last) ** (1.0 / (n - 2))
+
+
+class TestPatchFilter:
+    """The patch filter, eq. (17)-(19) — Jung, Yun & Kim, *Comput. Struct.* **331** (2026) 108403."""
+
+    def test_it_reproduces_the_configurations_the_paper_names(self):
+        """Fig. 2b, a five-element patch with the reference element dense.
+
+        The paper states the rule in words: "when rho_{k,2} = 1, a valid connection requires either
+        rho_{k,1} = 1, or both rho_{k,3} = 1 and rho_{k,4} = 1". Both alternatives must survive and
+        everything else in that family must be suppressed — this is the behaviour the formula is
+        FOR, so it is checked directly rather than through the algebra.
+        """
+        f = _f_patch_reference
+        assert f(1.0, [0, 0, 0, 0], False) == pytest.approx(0.0), "a lone dense element must go"
+        assert f(1.0, [0, 1, 0, 0], False) == pytest.approx(0.0), "a one-node connection must go"
+        assert f(1.0, [1, 1, 0, 0], False) > 0.5, "valid: adjacent, must survive"
+        assert f(1.0, [0, 1, 1, 1], False) > 0.5, "valid: the other alternative, must survive"
+        assert f(1.0, [1, 1, 1, 1], False) == pytest.approx(1.0), "a full patch is untouched"
+        # N = 3 collapses to the last term alone, as the paper says it does.
+        assert f(1.0, [0, 0], False) == pytest.approx(0.0)
+        assert f(1.0, [1, 1], False) == pytest.approx(1.0)
+
+    def test_the_vectorised_filter_matches_the_literal_formula(self):
+        d = jno.Shape.rect(0, 0, 2, 1, size=0.25).domain()
+        topo = d.patch_topology()
+        n_cells = int(d._cells_p1().shape[0])
+        assert topo["size"].max() >= 5, "the mesh must contain patches big enough to exercise eq. (18)"
+        assert topo["boundary"].any() and (~topo["boundary"]).any(), "both branches must be covered"
+
+        filt = d.patch_filter()
+        rng = np.random.default_rng(0)
+        for r in (
+            np.ones(n_cells),
+            np.full(n_cells, 0.4),
+            rng.uniform(0.0, 1.0, n_cells),
+            (rng.random(n_cells) > 0.6).astype(float),
+        ):
+            expected = np.empty_like(r)
+            for k in range(n_cells):
+                fs = []
+                for v in range(3):
+                    n = int(topo["size"][k, v])
+                    if n < 3:
+                        continue
+                    fs.append(
+                        _f_patch_reference(
+                            float(r[k]),
+                            [float(r[j]) for j in topo["others"][k, v, : n - 1]],
+                            bool(topo["boundary"][k, v]),
+                        )
+                    )
+                expected[k] = r[k] * (sum(fs) / len(fs) if fs else 1.0)
+            np.testing.assert_allclose(np.asarray(filt(jnp.asarray(r))), expected, atol=1e-7)
+
+    def test_a_full_density_field_passes_through_untouched(self):
+        """rho = 1 everywhere has no bad configuration anywhere, so the filter must be the identity.
+
+        The sharpest single check that the walk and the padding are right: any mis-indexed
+        neighbour would read a padded zero and pull the product below one.
+        """
+        d = jno.Shape.rect(0, 0, 2, 1, size=0.2).domain()
+        n_cells = int(d._cells_p1().shape[0])
+        out = np.asarray(d.patch_filter()(jnp.ones(n_cells, dtype=jnp.float64)))
+        np.testing.assert_allclose(out, 1.0, atol=1e-12)
+
+    def test_it_suppresses_an_isolated_element_on_a_real_mesh(self):
+        """One dense element in a void field is unbuildable; the filter must knock it down.
+
+        Note what "suppress" actually means numerically. The ``1 / (N - 2)`` exponent softens the
+        near-zero product: on a six-element patch a fully isolated element lands near
+        ``0.001 ** 0.25 ~ 0.18``, not at zero. That is the formula's own behaviour, not a defect —
+        **SIMP finishes the job**, since the stiffness carries ``rho_bar ** penal`` and 0.18 cubed
+        is under 1 % of solid, which is why the paper also raises ``penal`` as it converges.
+        """
+        d = jno.Shape.rect(0, 0, 2, 1, size=0.2).domain()
+        topo = d.patch_topology()
+        n_cells = int(d._cells_p1().shape[0])
+        # Pick an element all of whose patches are interior, so no vertex takes the boundary rule.
+        k = int(np.where(~topo["boundary"].any(axis=1))[0][0])
+        r = np.full(n_cells, 1e-3)
+        r[k] = 1.0
+        out = np.asarray(d.patch_filter()(jnp.asarray(r)))
+        assert out[k] < 0.35, f"an isolated dense element barely moved: rho_bar = {out[k]:.4f}"
+        assert out[k] ** PENAL < 0.01, "and its SIMP stiffness must be under 1 % of solid"
+        # Its void neighbours stay essentially void: the filter scales each element by its OWN
+        # patches, so a neighbour only feels this one through its own (already near-zero) density.
+        assert np.abs(np.delete(out, k) - np.delete(r, k)).max() < 1e-3
+
+    def test_the_node_and_the_filter_agree_and_the_node_carries_a_gradient(self):
+        d = jno.Shape.rect(0, 0, 2, 1, size=0.25).domain()
+        _r, s = d.fem_symbols(space="P0", names=("r", "s"))
+        rho = jno.np.parameter(s, name="rho_patch")
+        n_cells = int(d._cells_p1().shape[0])
+        r = jnp.asarray(np.random.default_rng(2).uniform(0, 1, n_cells))
+
+        np.testing.assert_allclose(
+            np.asarray(rho.patch().fn(r)), np.asarray(d.patch_filter()(r)), atol=0.0
+        )
+        g = jax.grad(lambda z: jnp.sum(d.patch_filter()(z)))(r)
+        assert np.all(np.isfinite(np.asarray(g))) and np.any(np.asarray(g) != 0.0)
+
+    def test_a_nodal_density_is_refused(self):
+        """The reference element of a patch is an ELEMENT; a nodal field has none."""
+        d = jno.Shape.rect(0, 0, 2, 1, size=0.4).domain()
+        _r, s = d.fem_symbols(names=("r", "s"))
+        with pytest.raises(TypeError, match="P0"):
+            jno.np.parameter(s, name="rho_nodal").patch()
