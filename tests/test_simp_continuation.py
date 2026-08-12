@@ -212,3 +212,51 @@ def test_the_continuation_can_watch_one_loss_term():
             individual_losses=np.array([5.0, 95.0 - e]),  # term 0 settled
         )
     assert cont.penal > 3.0, "watching a settled term must let the continuation fire"
+
+
+class TestIntervalStride:
+    """``every=n`` samples the convergence window over an *interval*, as the paper's test does."""
+
+    @staticmethod
+    def _rig(**kw):
+        rho = jno.np.parameter((20,), name="rho_e")
+        penal = jno.np.parameter((1,), name="penal_e")
+        cont = jno.optimizers.simp_continuation(penal, rho, **kw)
+        lid = penal.model.layer_id
+        t = {rho.model.layer_id: jnp.full(20, 0.5), lid: jnp.asarray([cont.penal])}
+        return cont, {k: jnp.zeros_like(v) for k, v in t.items()}, t, lid
+
+    def test_it_owns_the_penal_gradient_on_every_step(self):
+        """The bug this stride first introduced, and the reason it is a regression test.
+
+        The hook OWNS the ``penal`` entry. On any step where it does not overwrite it, the raw
+        loss gradient w.r.t. ``penal`` survives and the injected ``sgd(1.0)`` applies it, so
+        ``penal`` random-walks and the whole run diverges — measured as compliance 79 -> 3.7e10
+        on the cantilever. Striding may skip the bookkeeping; it must never skip the write.
+        """
+        cont, _g, t, lid = self._rig(every=25, window=3)
+        loss_grad = {k: jnp.full_like(v, 7.0) for k, v in t.items()}  # a large, nonzero gradient
+        for e in range(1, 25):  # every step that is NOT a sampling step
+            out = cont.on_before_update(grads=loss_grad, trainable=t, epoch=e, total_loss=5.0)
+            assert float(out[lid][0]) == 0.0, f"epoch {e}: penal gradient was not overwritten"
+
+    def test_the_window_spans_the_stride(self):
+        """With every=10 and window=3 the test covers 30 iterations, not 3."""
+        cont, g, t, lid = self._rig(every=10, window=3)
+        for e in range(30):  # only epochs 0, 10, 20 are sampled -> 3 samples, one short
+            cont.on_before_update(grads=g, trainable=t, epoch=e, total_loss=5.0)
+        assert cont.penal == 3.0, "three samples is one short of closing a window of three"
+        cont.on_before_update(grads=g, trainable=t, epoch=30, total_loss=5.0)
+        assert cont.penal == 4.0, "the fourth sample closes it"
+
+    def test_a_stride_makes_a_slow_drift_look_converged(self):
+        """The point of the stride is a LOOSER test — but it must still be the real quantity.
+
+        A drift too small to register per interval is what "converged" means at that resolution.
+        """
+        cont, g, t, lid = self._rig(every=5, window=3, tol=1e-4)
+        loss = 100.0
+        for e in range(21):
+            cont.on_before_update(grads=g, trainable=t, epoch=e, total_loss=loss)
+            loss -= 1e-4  # 5e-4 per interval on a value of 100 -> 5e-6 relative, under tol
+        assert cont.penal > 3.0

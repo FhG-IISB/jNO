@@ -50,8 +50,10 @@ class SIMPContinuation(_Callback):
         mnd_tol: float = 1e-2,
         physical=None,
         watch: Optional[int] = None,
+        every: int = 1,
     ):
         self._watch = watch
+        self.every = max(int(every), 1)
         self._physical = physical
         self._penal_lid = penal.model.layer_id
         self._rho_lid = density.model.layer_id
@@ -76,18 +78,30 @@ class SIMPContinuation(_Callback):
         import jax
         import jax.numpy as jnp
 
+        # The convergence window samples every `every` iterations, so it spans an INTERVAL rather
+        # than a single step -- which is what the paper's criterion is ("the relative changes in
+        # the objective function over three consecutive iteration intervals"). Per-iteration
+        # sampling is far stricter: an optimiser still making steady progress trips it never, and
+        # `penal` then sits at its initial value for the whole run.
+        sample = int(epoch) % self.every == 0
+        # NOTE: returning early here would be a bug, not an optimisation. This hook OWNS the
+        # `penal` entry: on any step where it does not overwrite it, the raw loss gradient w.r.t.
+        # `penal` survives and `sgd(1.0)` applies it, so `penal` random-walks and the run diverges
+        # (measured: compliance 79 -> 3.7e10 with `every=25`). Only the bookkeeping is strided.
+
         # Which quantity has to settle. `total_loss` is the whole objective, which under a
         # perimeter barrier is C - beta R -- and that moves for as long as beta decays, so the
         # window would never close. `watch=i` follows `individual_losses[i]` instead, i.e. the
         # compliance alone, which is what Fig. 4a's "C converged?" actually asks.
-        if self._watch is not None:
-            indiv = kw.get("individual_losses")
-            if indiv is not None:
-                self._losses.append(float(np.asarray(indiv).reshape(-1)[self._watch]))
-        else:
-            total = kw.get("total_loss")
-            if total is not None:
-                self._losses.append(float(total))
+        if sample:
+            if self._watch is not None:
+                indiv = kw.get("individual_losses")
+                if indiv is not None:
+                    self._losses.append(float(np.asarray(indiv).reshape(-1)[self._watch]))
+            else:
+                total = kw.get("total_loss")
+                if total is not None:
+                    self._losses.append(float(total))
 
         # M_nd on the PHYSICAL density. `trainable` is the partitioned half, so a paramax
         # `constrain(...)` wrapper is NOT applied here -- its function lives in the static half and
@@ -103,7 +117,7 @@ class SIMPContinuation(_Callback):
         self.m_nd = float(4.0 * jnp.mean(r * (1.0 - r)))
 
         new = self.penal
-        if self._converged() and self.m_nd >= self.mnd_tol and self.penal < self.maximum - 1e-12:
+        if sample and self._converged() and self.m_nd >= self.mnd_tol and self.penal < self.maximum - 1e-12:
             new = min(self.penal + self.step, self.maximum)
             self.history.append((int(epoch), new))
             self._losses = []  # the window restarts at each continuation step (Sec. 2.4)
@@ -131,6 +145,7 @@ def simp_continuation(
     mnd_tol: float = 1e-2,
     physical=None,
     watch: Optional[int] = None,
+    every: int = 1,
 ) -> SIMPContinuation:
     """Raise the SIMP exponent once the objective settles and the design is still grey.
 
@@ -156,6 +171,10 @@ def simp_continuation(
             loss. Pass the compliance term's index whenever the objective also carries a decaying
             penalty -- the total then keeps moving because the penalty does, and the window never
             closes.
+        every: Sample the convergence window every ``n`` iterations, so ``window`` samples span an
+            *interval* rather than ``window`` consecutive steps. The paper's criterion is over
+            three iteration intervals; with ``every=1`` the test is much stricter than theirs and
+            a run that is still making steady progress never satisfies it.
 
     Example::
 
@@ -181,6 +200,7 @@ def simp_continuation(
         mnd_tol=mnd_tol,
         physical=physical,
         watch=watch,
+        every=every,
     )
 
 
