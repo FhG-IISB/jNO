@@ -288,6 +288,8 @@ class MMACallback(_Callback):
         import jax.numpy as jnp
         import paramax as _paramax
 
+        from jno.utils.ad_mode import rowwise_jacobian
+
         compiled_fn = kw["compiled_constraints_fn"]
         frozen, static = kw["frozen"], kw["static"]
         batchsize, min_consecutive = kw["batchsize"], kw["min_consecutive"]
@@ -302,24 +304,26 @@ class MMACallback(_Callback):
             )
             return jnp.stack([jnp.mean(r) for r in residuals])
 
-        # One gradient per constraint, NOT a `jacrev` over the whole constraint vector. `jacrev`
-        # vmaps its VJP across the output rows, and a differentiable FEM solve bottoms out in
-        # `spsolve`, which has no batching rule -- so the Jacobian of a constraint that depends on
-        # `fem.solve()` cannot be taken that way at all. Separate reverse passes also cost less
-        # here: only the `jno.le` rows are needed, and the objective's gradient already arrives
-        # through `grads`.
+        # `rowwise_jacobian`, NOT `jacrev`: `jacrev` vmaps its pullback across the output rows, and
+        # a differentiable FEM solve bottoms out in `spsolve`, which has no batching rule -- so the
+        # Jacobian of a constraint that depends on `fem.solve()` cannot be taken that way at all.
+        # Only the `jno.le` rows are asked for; the objective's gradient already arrives through
+        # `grads`.
         rows = list(self._ineq)
 
         def jac(trainable, context, rng):
             sub = {lid: trainable[lid] for lid in lids}
             rest = {k: v for k, v in trainable.items() if k not in sub}
-
-            def one(i):
-                g = jax.grad(lambda s: _losses(s, rest, context, rng)[i])(sub)
-                leaves = [leaf for lid in lids for leaf in jax.tree_util.tree_leaves(g[lid])]
-                return jnp.concatenate([leaf.ravel() for leaf in leaves])
-
-            return jnp.stack([one(i) for i in rows]) if rows else jnp.zeros((0, 1))
+            if not rows:
+                return jnp.zeros((0, 1))
+            # Differentiate w.r.t. a LIST of blocks, not the dict: a dict's leaves come out in
+            # sorted-key order, while the design vector in `on_before_update` is concatenated in
+            # `self._blocks` order. A list preserves that order, so the Jacobian's columns line up
+            # with `x`, `df0`, `xmin` and `xmax`.
+            parts = [sub[lid] for lid in lids]
+            return rowwise_jacobian(
+                lambda ps: _losses(dict(zip(lids, ps)), rest, context, rng), parts, rows
+            )
 
         self._jac_fn = jax.jit(jac)
 
