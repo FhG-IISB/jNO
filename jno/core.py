@@ -2007,6 +2007,38 @@ class core:
 
                 _engd_opt_overrides[_lid] = _optax_engd.sgd(1.0)
 
+        # ── MMA optimizer auto-expansion ─────────────────────────────────────
+        # Same sentinel trick as ENGD, with one difference: MMA solves a SINGLE subproblem over
+        # every design variable at once, because they are coupled through the shared constraints.
+        # So all the marked models get one callback between them, not one each.
+        from .optimizers import MMACallback as _MMACallback
+        from .optimizers import MMAOptimizer as _MMAOptimizer
+
+        _mma_blocks = [
+            (_lid, _fm._opt_fn)
+            for _lid, _fm in sorted(self._collect_flax_modules().items())
+            if isinstance(_fm._opt_fn, _MMAOptimizer)
+        ]
+        if _mma_blocks:
+            if not getattr(self, "_inequality_idx", None):
+                raise ValueError(
+                    "jno.optimizers.mma: no inequality constraints were declared, so MMA has "
+                    "nothing to enforce and reduces to an expensive gradient step. Wrap the "
+                    "constrained quantities with jno.le(...) / jno.ge(...) in the jno.core list."
+                )
+            import optax as _optax_mma
+
+            _cb_mma = _MMACallback(_mma_blocks, list(self._inequality_idx))
+            callbacks = [_cb_mma] + list(callbacks or [])
+            for _lid, _ in _mma_blocks:
+                _engd_opt_overrides[_lid] = _optax_mma.sgd(1.0)
+        elif getattr(self, "_inequality_idx", None):
+            raise ValueError(
+                "jno.core: jno.le/jno.ge constraints were declared but no constrained optimiser "
+                "is attached, so they would be evaluated and then ignored. Attach one — e.g. "
+                "`param.optimizer(jno.optimizers.mma(move=0.2, lower=..., upper=...))`."
+            )
+
         # Guard: on_before_update hook callbacks (e.g. ENGDCallback).
         from .utils.adaptive.callbacks import Callback as _Callback
 

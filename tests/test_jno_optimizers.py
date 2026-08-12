@@ -44,7 +44,9 @@ def _minimise_grad(opt, steps):
 
 def test_namespace_is_just_the_optimizers():
     o = jno.optimizers
-    # exactly the custom optimizers — each an optax GradientTransformation
+    # exactly the custom optimizers. Most are optax GradientTransformations; `engd`, `md` and
+    # `mma` are sentinels that jno.core.solve() expands, because each needs information the optax
+    # update() contract does not carry.
     assert set(o.__all__) == {
         "ssbroyden",
         "ssbfgs",
@@ -56,6 +58,8 @@ def test_namespace_is_just_the_optimizers():
         "md",
         "md_decouple",
         "MDOptimizer",
+        "mma",
+        "MMAOptimizer",
     }
     for factory in (o.ssbroyden, o.ssbfgs, o.soap):
         opt = factory()

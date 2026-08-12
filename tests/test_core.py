@@ -527,7 +527,8 @@ class TestInequalityConstraints:
     def test_a_constraint_is_compiled_but_held_out_of_the_loss(self):
         d = jno.Path(0, 0).line_to(1, 0).curve(size=0.1).domain()
         x, _ = d.variable("interior")
-        a = jnn.parameter((1,), key=jax.random.PRNGKey(0), name="a").optimizer(optax.adam(1e-2))
+        a = jnn.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        a.optimizer(jno.optimizers.mma(move=0.2, lower=-10.0, upper=10.0))
 
         crux = jno.core([(a * x - 2.0).mse, jno.le((a * x).mean, 0.4)], domain=d)
         assert crux.n_constraints == 2, "the constraint must still be compiled and evaluated"
@@ -546,7 +547,8 @@ class TestInequalityConstraints:
         # x has mean 0.5 on [0, 1]; `>= 0.2` is satisfied, so the residual must be negative.
         assert jno.ge(x.mean, 0.2).sense == "ge"
         assert jno.le(x.mean, 0.2).sense == "le"
-        a = jnn.parameter((1,), key=jax.random.PRNGKey(0), name="a").optimizer(optax.adam(1e-2))
+        a = jnn.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        a.optimizer(jno.optimizers.mma(move=0.2, lower=-10.0, upper=10.0))
         for sense, expect_negative in (("ge", True), ("le", False)):
             node = (jno.ge if sense == "ge" else jno.le)(x.mean, 0.2)
             crux = jno.core([(a * x).mse, node], domain=d)
@@ -584,7 +586,8 @@ class TestInequalityConstraints:
 
         d = jno.Path(0, 0).line_to(1, 0).curve(size=0.1).domain()
         x, _ = d.variable("interior")
-        a = jnn.parameter((1,), key=jax.random.PRNGKey(0), name="a").optimizer(optax.adam(1e-2))
+        a = jnn.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        a.optimizer(jno.optimizers.mma(move=0.2, lower=-10.0, upper=10.0))
         jno.core([(a * x - 2.0).mse, jno.le((a * x).mean, 0.4)], domain=d).solve(2, callbacks=[Spy()])
 
         assert seen, "the hook never fired"
@@ -603,7 +606,8 @@ class TestInequalityConstraints:
         """
         d = jno.Path(0, 0).line_to(1, 0).curve(size=0.1).domain()
         x, _ = d.variable("interior")
-        a = jnn.parameter((1,), key=jax.random.PRNGKey(0), name="a").optimizer(optax.adam(1e-2))
+        a = jnn.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        a.optimizer(jno.optimizers.mma(move=0.2, lower=-10.0, upper=10.0))
         b = jnn.parameter((1,), key=jax.random.PRNGKey(1), name="b").optimizer(optax.adam(1e-2))
         crux = jno.core([(a * x - 2.0).mse, (b * x - 1.0).mse, jno.le((a * x).mean, 0.4)], domain=d)
         with pytest.raises(ValueError, match="substeps"):

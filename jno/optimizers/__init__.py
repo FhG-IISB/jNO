@@ -15,6 +15,10 @@ with ``optax.chain`` and drops straight into ``model.optimizer(...)`` /
   PINN / inverse losses.
 - :func:`soap` — SOAP, Shampoo with Adam in the preconditioner's eigenbasis
   (Vyas et al. 2024, arXiv:2409.11321).
+- :func:`mma` — Method of Moving Asymptotes (Svanberg, *IJNME* **24**(2), 1987), the standard
+  optimiser for *constrained* structural design. Unlike everything else here it is a **sentinel**,
+  not a ``GradientTransformation``: an optax ``update()`` never sees the individual constraint
+  values and gradients MMA needs. Pair it with :func:`jno.le` / :func:`jno.ge`.
 - :func:`md` — Magnitude–Direction Decoupling: a generic wrapper that factorizes each weight
   matrix into a fixed-norm direction + learnable magnitude gains and steps any optax base optimizer
   on the direction (Hägele et al. 2026, arXiv:2606.25971). Pass it as a sentinel via
@@ -29,12 +33,15 @@ this package and re-export it below.
 
 from .engd import ENGDOptimizer, engd
 from .md_decouple import MDOptimizer, md, md_decouple
+from .mma import MMACallback, MMAOptimizer, mma
 from .soap import scale_by_soap, soap
 from .ssbroyden import scale_by_ss_quasi_newton, ssbfgs, ssbroyden
 
 __all__ = [
     "engd",
     "ENGDOptimizer",
+    "mma",
+    "MMAOptimizer",
     "ssbroyden",
     "ssbfgs",
     "scale_by_ss_quasi_newton",
