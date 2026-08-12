@@ -33,6 +33,7 @@ this package and re-export it below.
 
 from .engd import ENGDOptimizer, engd
 from .md_decouple import MDOptimizer, md, md_decouple
+from .continuation import SIMPContinuation, simp_continuation
 from .mma import MMACallback, MMAOptimizer, mma
 from .soap import scale_by_soap, soap
 from .ssbroyden import scale_by_ss_quasi_newton, ssbfgs, ssbroyden
@@ -41,6 +42,8 @@ __all__ = [
     "engd",
     "ENGDOptimizer",
     "mma",
+    "simp_continuation",
+    "SIMPContinuation",
     "MMAOptimizer",
     "ssbroyden",
     "ssbfgs",

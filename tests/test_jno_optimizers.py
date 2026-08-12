@@ -46,7 +46,9 @@ def test_namespace_is_just_the_optimizers():
     o = jno.optimizers
     # exactly the custom optimizers. Most are optax GradientTransformations; `engd`, `md` and
     # `mma` are sentinels that jno.core.solve() expands, because each needs information the optax
-    # update() contract does not carry.
+    # update() contract does not carry. `simp_continuation` is neither -- it is a schedule over a
+    # parameter that is not a design variable, and it lives here because it drives the optimisation
+    # rather than diagnosing it.
     assert set(o.__all__) == {
         "ssbroyden",
         "ssbfgs",
@@ -60,6 +62,8 @@ def test_namespace_is_just_the_optimizers():
         "MDOptimizer",
         "mma",
         "MMAOptimizer",
+        "simp_continuation",
+        "SIMPContinuation",
     }
     for factory in (o.ssbroyden, o.ssbfgs, o.soap):
         opt = factory()
