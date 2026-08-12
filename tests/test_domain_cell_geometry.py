@@ -239,3 +239,68 @@ class TestNormalisedPnorm:
         d = jno.Shape.rect(0.0, 0.0, 2.0, 1.0, size=0.4).domain()
         got = float(np.asarray(d.cell_volume().pnorm(50.0, normalize=True).eval()).reshape(-1)[0])
         assert got == pytest.approx(float(np.asarray(d.cell_volume().eval()).max()), rel=1e-9)
+
+
+class TestLogBarrier:
+    """``log_barrier(b)`` — keeps a quantity below ``b``, and keeps a GRADIENT above it."""
+
+    @staticmethod
+    def _f(x, b=350.0, tau=1e-3):
+        t = tau * abs(b)
+        sw = b - t
+        gap = jnp.maximum(b - x, t)
+        dx = x - sw
+        return jnp.squeeze(
+            jnp.where(x <= sw, -b * jnp.log(gap),
+                      -b * jnp.log(t) + (b / t) * dx + 0.5 * (b / t**2) * dx**2)
+        )
+
+    def test_it_is_the_log_below_the_switch(self):
+        b = 350.0
+        for x in (0.0, 100.0, 349.0):
+            assert float(self._f(x, b)) == pytest.approx(float(-b * np.log(b - x)), rel=1e-12)
+
+    def test_it_is_continuous_and_smooth_at_the_switch(self):
+        b, tau = 350.0, 1e-3
+        sw = b - tau * b
+        # Compare the two BRANCHES at the switch, not the function either side of it: the slope
+        # there is b/t = 1000, so f(sw +- eps) differ by 2 eps b/t for any eps, which says nothing.
+        assert float(self._f(sw, b)) == pytest.approx(float(-b * np.log(tau * b)), rel=1e-9)
+        # The one-sided slopes both equal b/t.
+        g = jax.grad(lambda z: self._f(z, b))
+        for x in (sw - 1e-6, sw + 1e-6):
+            assert float(g(x)) == pytest.approx(b / (tau * b), rel=1e-5)
+
+    def test_the_gradient_survives_above_the_bound(self):
+        """The whole reason this exists.
+
+        ``log(maximum(b - x, eps))`` is finite above the bound but CONSTANT, so its gradient is
+        exactly zero and the constraint silently stops constraining — measured on the cantilever
+        as a perimeter of 992 against a target of 350, with nothing pushing back.
+        """
+        b = 350.0
+        g = jax.grad(lambda z: self._f(z, b))
+        for x in (350.0, 500.0, 992.0):
+            grad = float(g(x))
+            assert np.isfinite(grad) and grad > 1e3, f"no restoring gradient at x = {x}: {grad}"
+        # and it strengthens the further out it goes, so an overshoot is pushed back harder
+        assert float(g(992.0)) > float(g(500.0)) > float(g(350.0))
+
+        naive = jax.grad(lambda z: -b * jnp.log(jnp.maximum(b - z, 1e-8)))
+        assert float(naive(500.0)) == 0.0, "the naive clamp is exactly the failure this avoids"
+
+    def test_everything_stays_finite(self):
+        b = 350.0
+        for x in (-1e4, 0.0, 349.9999, 350.0, 1e4):
+            assert np.isfinite(float(self._f(x, b))) and np.isfinite(float(jax.grad(lambda z: self._f(z, b))(x)))
+
+    def test_it_reaches_the_trace_through_a_node(self):
+        d = jno.Shape.rect(0.0, 0.0, 2.0, 1.0, size=0.4).domain()
+        total = d.cell_volume().sum          # the domain area, 2.0
+        got = float(np.asarray(total.log_barrier(10.0).eval()).reshape(-1)[0])
+        assert got == pytest.approx(float(-10.0 * np.log(10.0 - 2.0)), rel=1e-6)
+
+    def test_a_non_positive_tau_is_refused(self):
+        d = jno.Shape.rect(0.0, 0.0, 2.0, 1.0, size=0.4).domain()
+        with pytest.raises(ValueError, match="tau must be positive"):
+            d.cell_volume().sum.log_barrier(10.0, tau=0.0)

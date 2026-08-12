@@ -631,6 +631,48 @@ class Placeholder:
 
         return FunctionCall(fn, [self], f"pnorm{p:g}" + ("n" if normalize else ""), True)
 
+    def log_barrier(self, bound: float, *, tau: float = 1e-3) -> "FunctionCall":
+        """``-b log(b - x)`` — a logarithmic barrier keeping ``x`` below ``bound``.
+
+        The interior-point penalty for a one-sided constraint: it is finite and smooth for
+        ``x < b`` and diverges as ``x`` approaches ``b``, so a descent method cannot step across.
+        Used for the perimeter target of Jung, Yun & Kim, *Computers & Structures* **331** (2026)
+        108403, eq. (39)-(40), where the objective is ``C - beta R`` with ``R = P* log(P* - P)``.
+
+        Above ``b - tau*|b|`` it continues as the second-order Taylor extension of the log, matching
+        value and slope, so it **keeps a gradient everywhere**. That is the whole point of this
+        existing rather than being written inline: the obvious safeguard,
+        ``log(maximum(b - x, eps))``, is a trap. It stops the NaN, but it also makes the penalty
+        *constant* once the bound is crossed, so its gradient is exactly zero and the constraint it
+        was guarding silently switches off. Measured: a perimeter target of 350 ended at 992 with
+        no sign that anything had gone wrong, because nothing ever pushed back.
+
+        A design that starts feasible never reaches the extension. It exists so that one that does
+        -- through an overshooting step, or a bound tightened mid-run -- is pushed back rather than
+        set free.
+
+        Args:
+            bound: The upper bound ``b``. ``x`` is kept strictly below it.
+            tau: Switch point as a fraction of ``|b|``. Smaller follows the true log further and
+                gives a stiffer extension.
+        """
+        b = float(bound)
+        t = float(tau) * abs(b)
+        if t <= 0.0:
+            raise ValueError(f"log_barrier: tau must be positive, got {tau!r}.")
+
+        def fn(x, _b=b, _t=t):
+            switch = _b - _t
+            # Clamped inside the log so the UNTAKEN branch is finite too -- jnp.where propagates
+            # NaN gradients from a branch it does not select.
+            gap = jnp.maximum(_b - x, _t)
+            inside = -_b * jnp.log(gap)
+            dx = x - switch
+            outside = -_b * jnp.log(_t) + (_b / _t) * dx + 0.5 * (_b / _t**2) * dx**2
+            return jnp.squeeze(jnp.where(x <= switch, inside, outside))
+
+        return FunctionCall(fn, [self], f"log_barrier{b:g}", True)
+
     @property
     def T(self) -> FunctionCall:
         return FunctionCall(lambda x: x.T, [self], "transpose", True)
