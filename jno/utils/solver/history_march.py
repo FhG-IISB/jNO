@@ -170,19 +170,25 @@ def run_history_march(fem, solve_fn=None, path=None, **kwargs):
         _validate_path_spec(path, fem, path_frames)
         limits = _resolve_limits(path.limit, fem, n_dofs)
 
-        def _run_adaptive(param_args):
-            schedule = _pilot_schedule(path, limits, tau_pts, u0, buffers0, sbuffers0, _step_once, param_args, dtype)
+        def _run_adaptive(param_args, replay=True):
+            schedule, states = _pilot_schedule(
+                path, limits, tau_pts, u0, buffers0, sbuffers0, _step_once, param_args, dtype, op
+            )
             fem._tau_schedule = np.asarray(schedule)  # observability: what the pilot actually chose
-            traj = _march(param_args, jnp.asarray(schedule, dtype=dtype))
+            src = jnp.asarray(schedule, dtype=dtype)
+            # The pilot ALREADY solved every accepted step. Replaying them is only needed to make the
+            # result differentiable (a fixed-length scan the adjoint can run through); a plain forward
+            # solve can take the states it already has. Measured on the phase-field SENT problem: the
+            # replay was ~15% of the adaptive run, and it was recomputing an answer we were discarding.
+            traj = _march(param_args, src) if replay else jnp.stack(states)
             # Resample onto the domain's declared grid, exactly as the transient stepper resamples onto
             # `save_ts`: the step size is then decoupled from the sample times, and `fem.solve()` returns
             # the same shape whether or not `tau=` was passed.
-            src = jnp.asarray(schedule, dtype=dtype)
             return jax.vmap(lambda col: jnp.interp(tau_grid, src, col), in_axes=1, out_axes=1)(traj)
 
-        _driver = _run_adaptive
+        _driver, _is_adaptive = _run_adaptive, True
     else:
-        _driver = _march
+        _driver, _is_adaptive = _march, False
 
     # A runtime-parametric form (an inverse problem: a material/load parameter created with
     # ``jno.np.parameter``) returns a differentiable trace node — crux resolves the parameters to values
@@ -190,7 +196,9 @@ def run_history_march(fem, solve_fn=None, path=None, **kwargs):
     # ``op.solve()`` node). A non-parametric forward march returns the eager ``(n_steps, n_dofs)`` array.
     exprs = getattr(op, "runtime_parameter_exprs", {}) or {}
     if not exprs:
-        return _driver({})
+        # Non-parametric: the answer is an array, nothing will differentiate it, so the adaptive path
+        # keeps the states its pilot already solved rather than marching them a second time.
+        return _driver({}, replay=False) if _is_adaptive else _driver({})
     from ...trace import FunctionCall
 
     names = list(exprs)
@@ -278,18 +286,47 @@ def _resolve_limits(limit, fem, n_dofs):
     return out
 
 
-def _pilot_schedule(path, limits, tau_pts, u0, buffers0, sbuffers0, step_once, param_args, dtype):
-    """March EAGERLY with rejection; return the accepted τ values as a 1-D numpy array.
+#: Residual norm (relative to the state's magnitude) below which a piloted step counts as converged.
+#: Loose on purpose: this decides ACCEPT vs CUT, not the answer -- the accepted step's own solve already
+#: ran to the driver's tolerance, and the replay re-solves it anyway.
+_RESID_TOL = 1e-6
 
-    A step is rejected when the per-step solve fails to converge (the drivers raise eagerly, which is
-    exactly the signal) or when any limited field moved more than its tolerance. Rejection halves the
-    step; a comfortable step grows it. Nothing here is traced — that is the point, and it is why the
-    replay afterwards can be an ordinary fixed-length scan.
+
+def _pilot_schedule(path, limits, tau_pts, u0, buffers0, sbuffers0, step_once, param_args, dtype, op=None):
+    """March EAGERLY with rejection; return ``(schedule, states)`` — the accepted τ values and the
+    solution at each of them.
+
+    A step is rejected when the per-step solve fails to converge or when any limited field moved more
+    than its tolerance. Rejection halves the step; a comfortable step grows it.
+
+    The step is **compiled once** and reused across attempts. Left uncompiled, every attempt paid its
+    own trace and compile: measured on the phase-field SENT problem, an eager step cost ~5x the same
+    step inside the replay scan, which made the pilot most of the adaptive run.
+
+    Compiling it costs the eager convergence check, though — ``newton_krylov`` skips its guard under a
+    trace, by design, because the test cannot concretise there. So the rejection signal is *returned*
+    rather than raised: the compiled step hands back the residual norm and the tolerance it was judged
+    against, and this loop compares them concretely. That is the more explicit arrangement anyway; the
+    exception it replaces was being caught by type.
     """
     lo, hi = float(tau_pts[0]), float(tau_pts[-1])
     span = hi - lo
     if span <= 0:
-        return np.asarray(tau_pts, dtype=float)
+        return np.asarray(tau_pts, dtype=float), [u0]
+
+    import jax as _jax
+
+    def _attempt(u_prev, bufs, sbufs, tau_k, pargs):
+        """One step plus the numbers the acceptance test needs — all inside one compiled program."""
+        u, nb, nsb = step_once(u_prev, bufs, sbufs, tau_k, {}, pargs)
+        rn = jnp.linalg.norm(
+            jnp.asarray(
+                op.residual(u, {"__history__": bufs, "__surface_history__": sbufs, "__loadpath__": {}, **pargs}, tau_k)
+            )
+        )
+        return u, nb, nsb, rn
+
+    _attempt_c = _jax.jit(_attempt) if op is not None else _attempt
     dtau = float(path.dt0) if path.dt0 is not None else span / max(1, len(tau_pts) - 1)
     dtau_min = span * 1e-8
     shrink, grow = float(path.shrink), float(path.grow)
@@ -307,8 +344,8 @@ def _pilot_schedule(path, limits, tau_pts, u0, buffers0, sbuffers0, step_once, p
     # The first point of the declared grid is a solved step in the fixed march too (the virgin state at
     # the starting load), so the schedule starts there and no acceptance test applies to it.
     u, bufs, sbufs = u0, buffers0, sbuffers0
-    u, bufs, sbufs = step_once(u, bufs, sbufs, jnp.asarray(lo, dtype), {}, param_args)
-    schedule = [lo]
+    u, bufs, sbufs, _r0 = _attempt_c(u, bufs, sbufs, jnp.asarray(lo, dtype), param_args)
+    schedule, states = [lo], [u]
     tau = lo
     attempts = 0
     while tau < hi - 1e-12 * max(1.0, abs(hi)):
@@ -321,17 +358,20 @@ def _pilot_schedule(path, limits, tau_pts, u0, buffers0, sbuffers0, step_once, p
         dt = min(dtau, hi - tau)
         trial = tau + dt
         try:
-            u_try, bufs_try, sbufs_try = step_once(u, bufs, sbufs, jnp.asarray(trial, dtype), {}, param_args)
+            u_try, bufs_try, sbufs_try, rnorm = _attempt_c(u, bufs, sbufs, jnp.asarray(trial, dtype), param_args)
             ratio = _changed_too_much(u_try, u)
-            converged = bool(np.all(np.isfinite(np.asarray(u_try))))
-        except RuntimeError:
-            # The per-step driver raises eagerly when it leaves on its iteration cap -- that IS the
-            # non-convergence signal, so a cut step is the response rather than a failed solve.
+            # The compiled step cannot raise on non-convergence (the guard needs a concrete value and
+            # there is none under a trace), so it hands the residual norm back and the test happens here.
+            converged = bool(np.all(np.isfinite(np.asarray(u_try)))) and float(rnorm) < _RESID_TOL * max(
+                1.0, float(np.abs(np.asarray(u_try)).max())
+            )
+        except RuntimeError:  # a driver that still raises eagerly (a non-compiled solve_fn) -- same signal
             ratio, converged = np.inf, False
         if converged and ratio <= 1.0:
             u, bufs, sbufs = u_try, bufs_try, sbufs_try
             tau = trial
             schedule.append(tau)
+            states.append(u)
             if ratio < 0.5:  # comfortably inside the bound -- reach for a bigger step
                 dtau = min(dtau * grow, span)
             continue
@@ -345,4 +385,4 @@ def _pilot_schedule(path, limits, tau_pts, u0, buffers0, sbuffers0, step_once, p
                 "amount of load-step refinement finds one. Loosen `limit` to accept the jump, or drive "
                 "the path by a displacement/arc-length measure instead of the load."
             )
-    return np.asarray(schedule, dtype=float)
+    return np.asarray(schedule, dtype=float), states

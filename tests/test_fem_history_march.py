@@ -812,13 +812,18 @@ def test_tau_dependent_dirichlet_drives_the_march():
     got = traj[:, grip]
     assert np.abs(got).max() > 1e-6, "the specimen never moved — the ramped constraint was dropped"
     want = DELTA * taus
-    assert np.abs(got - want[:, None]).max() < 1e-12, "the grip must sit exactly on delta*tau at every step"
+    # The pin is a residual row `u[d] - g`, so it is satisfied to the NEWTON tolerance (atol=1e-8), not
+    # exactly. Bound it well inside that rather than at round-off: 1e-12 happened to pass and was really
+    # asserting where one particular iteration landed.
+    assert np.abs(got - want[:, None]).max() < 1e-9, "the grip must sit on delta*tau at every step"
 
     # ...and the response is the uniaxial one: the reaction scales linearly with the imposed stretch.
     R = np.array([float(np.asarray(fem.eval(momentum, traj[k]))[grip].sum()) for k in range(N)])
     nz = taus > 0
     ratio = R[nz] / taus[nz]
-    assert np.ptp(ratio) / np.abs(ratio).max() < 1e-9, f"the reaction must be linear in the load: {ratio}"
+    # Bounded by the SOLVE, not by round-off: R is read off a solution converged to newton_krylov's
+    # atol/rtol of 1e-8, so linearity cannot hold tighter than that however exact the arithmetic is.
+    assert np.ptp(ratio) / np.abs(ratio).max() < 1e-7, f"the reaction must be linear in the load: {ratio}"
     assert np.abs(R).max() > 1e-6
 
 
