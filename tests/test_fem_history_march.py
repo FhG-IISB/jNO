@@ -770,3 +770,74 @@ def test_scalar_gradient_energy_readout_matches_the_closed_form_p1_gradient():
     assert ref.max() > 1e-6, "the solution is flat — the gradient oracle would be vacuous"
     rel = np.abs(got - ref[:, None]).max() / ref.max()
     assert rel < 1e-10, f"gradient energy density disagrees with the closed-form P1 gradient: rel {rel:.2e}"
+
+
+# --------------------------------------------------------------------------------------------------
+# Oracle 6e — a τ-DEPENDENT essential value on the march: `u(top) - delta*tau`, i.e. DISPLACEMENT
+# CONTROL. It is how a softening test is driven at all — under load control a specimen snaps at the
+# peak and there is no branch left to follow — so it is not an optional spelling.
+#
+# It used to be collected and then silently DROPPED: the constraint vanished, and the solve returned
+# u = 0, which is exactly what an un-loaded specimen looks like. The oracle is analytic: a clamped-base
+# strip pulled at the top by delta*tau is in uniaxial extension, so every step's grip displacement is
+# delta*tau_k exactly and the reaction is proportional to it.
+# --------------------------------------------------------------------------------------------------
+def test_tau_dependent_dirichlet_drives_the_march():
+    sym, grad, trace, inner, sqrt, maximum, identity = _aliases()
+    N, DELTA, LY = 5, 0.02, 1.0
+    d = jno.Shape.rect(0.0, 0.0, 0.5, LY, size=0.15).domain(tau=(0.0, 1.0, N))
+    d.tag("bot", lambda x, y: y < 1e-9)
+    d.tag("top", lambda x, y: y > LY - 1e-9)
+    co, cb, ct = (d.variable(r, split=True) for r in ("interior", "bot", "top"))
+    X, I2 = [co[0], co[1]], identity(2)
+    u, phi = d.fem_symbols(value_shape=(2,))
+    s, _ = d.fem_symbols(value_shape=())
+    eps = lambda w: sym(grad(w, X))
+    sig = LAM * trace(eps(u)) * I2 + 2 * MU * eps(u)
+    momentum = inner(sig, eps(phi), 2)
+    fem = jno.fem(
+        [
+            momentum + 0.0 * s.i(-1) * inner(jno.np.asarray([0.0, 1.0]), phi, 1),
+            s.evolves(s.i(-1)),
+            u(*cb)[0] - 0.0,
+            u(*cb)[1] - 0.0,
+            u(*ct)[0] - 0.0,
+            u(*ct)[1] - DELTA * ct[-1],  # the ramp: the TOP region's own tau
+        ]
+    )
+    traj = np.asarray(fem.solve())
+    taus = np.asarray(d._time_points)
+
+    grip = fem.region_dofs("top", field=u, component=1)
+    got = traj[:, grip]
+    assert np.abs(got).max() > 1e-6, "the specimen never moved — the ramped constraint was dropped"
+    want = DELTA * taus
+    assert np.abs(got - want[:, None]).max() < 1e-12, "the grip must sit exactly on delta*tau at every step"
+
+    # ...and the response is the uniaxial one: the reaction scales linearly with the imposed stretch.
+    R = np.array([float(np.asarray(fem.eval(momentum, traj[k]))[grip].sum()) for k in range(N)])
+    nz = taus > 0
+    ratio = R[nz] / taus[nz]
+    assert np.ptp(ratio) / np.abs(ratio).max() < 1e-9, f"the reaction must be linear in the load: {ratio}"
+    assert np.abs(R).max() > 1e-6
+
+
+def test_tau_dependent_dirichlet_off_the_march_fails_loud():
+    """A path that cannot thread the ramp must say so — dropping it returns a plausible u = 0."""
+    sym, grad, trace, inner, sqrt, maximum, identity = _aliases()
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain(tau=(0.0, 1.0, 4))
+    d.tag("bot", lambda x, y: y < 1e-9)
+    d.tag("top", lambda x, y: y > 1 - 1e-9)
+    co, cb, ct = (d.variable(r, split=True) for r in ("interior", "bot", "top"))
+    X = [co[0], co[1]]
+    u, phi = d.fem_symbols()
+    # Nonlinear, but NO history — so this is a plain steady solve, not a march, and there is no τ to
+    # evaluate the ramp at.
+    with pytest.raises(NotImplementedError, match="time/τ-dependent essential value|essential value"):
+        jno.fem(
+            [
+                inner(grad(u, X), grad(phi, X), 1) + 0.1 * u * u * phi,
+                u(*cb) - 0.0,
+                u(*ct) - 0.5 * ct[-1],
+            ]
+        )

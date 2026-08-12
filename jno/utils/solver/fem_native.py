@@ -2619,6 +2619,9 @@ def assemble_fem_native(
 
     # === steady ===
     dirichlet_pairs = _build_dirichlet_pairs()
+    # τ-dependent essential values (`u(top) - delta*tau`): collected as (dofs, node, coords) rather than
+    # constant pairs, because their held value changes every load step. The march threads them below.
+    _tv_dirichlet = list(getattr(domain, "_fem_native_dirichlet_tv", []) or [])
     residual = _make_residual(volume_terms, boundary_terms)
     # Publish the FREE (pre-Dirichlet) residual factory so `FEM.eval` can assemble an arbitrary weak
     # term at a solution. Every solve path elimination-mutates its own copy -- symmetric elimination for
@@ -2682,6 +2685,33 @@ def assemble_fem_native(
 
                 def jac_p(u, args=None, t=0.0, _d=_npd):
                     return bcoo_set_dirichlet_rows(jacobian(jnp.asarray(u), t, args), _d)
+            elif _tv_dirichlet:
+                # A τ-DEPENDENT essential value on the load path -- `u(top)[1] - delta*tau`, i.e.
+                # DISPLACEMENT CONTROL, which is how a softening test is driven at all (under load
+                # control the specimen snaps at the peak and there is no branch to follow). The value is
+                # not a constant pair, so it is re-evaluated at this step's τ and written into the same
+                # row-replacement the constant pairs use. Before this it was collected and then dropped:
+                # the constraint simply vanished and the solve returned u = 0, which looks entirely
+                # plausible. The dof set is static, so only the held VALUES ride τ.
+                from ..._fem import _eval_value_node_at_time
+
+                _tvd = jnp.concatenate([d for d, _n, _c in _tv_dirichlet])
+                _all_d = _tvd if s_d_dofs is None else jnp.concatenate([s_d_dofs, _tvd])
+
+                def _tv_hold(t):
+                    return jnp.concatenate(
+                        [jnp.reshape(jnp.asarray(_eval_value_node_at_time(n, c, t)), (-1,)) for _d, n, c in _tv_dirichlet]
+                    )
+
+                def res_p(u, args=None, t=0.0, _d=s_d_dofs, _g=s_d_vals, _t=_tvd):
+                    u = jnp.asarray(u)
+                    R = residual(u, t, args)
+                    if _d is not None:
+                        R = R.at[_d].set(u[_d] - _g)
+                    return R.at[_t].set(u[_t] - _tv_hold(t))
+
+                def jac_p(u, args=None, t=0.0, _d=_all_d):
+                    return bcoo_set_dirichlet_rows(jacobian(jnp.asarray(u), t, args), _d)
             else:
 
                 def res_p(u, args=None, t=0.0, _d=s_d_dofs, _g=s_d_vals):
@@ -2727,6 +2757,16 @@ def assemble_fem_native(
             metadata={"nonaffine_operator": True},
         )
         return op, "linear", offs
+
+    # A τ/t-dependent essential value that no branch above threaded would be silently DROPPED here --
+    # the constraint disappears and the solve returns a plausible-looking wrong answer. Fail instead.
+    if _tv_dirichlet:
+        raise NotImplementedError(
+            "jno.fem: a time/τ-dependent essential value (e.g. `u(top) - delta*tau`) is threaded on the "
+            "steady residual path -- the load-path march and the runtime-parametric solve -- and by the "
+            "linear transient stepper. This form assembled through neither. Use a constant essential "
+            "value, or drive the load through a Neumann/body term written as a function of τ."
+        )
 
     # nonlinear (non-parametric)
     if nonlinear:
