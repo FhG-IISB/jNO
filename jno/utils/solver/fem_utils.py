@@ -3609,8 +3609,30 @@ def apply_compress_plan(data, plan, shape):
 
 def bcoo_set_dirichlet_rows(A, dofs):
     """``A.at[dofs, :].set(0).at[dofs, dofs].set(1)`` for a BCOO ``A`` — row-replacement (identity row,
-    columns kept): the matrix-level analogue of the Newton row-replacement residual."""
+    **columns kept**), the matrix-level analogue of a row-replacement residual.
+
+    Retained only for the paths still on row replacement (the second-order-in-time augmented block and
+    the transient stepper); everything on the steady residual path uses
+    :func:`bcoo_eliminate_dirichlet`, which is symmetric. Keeping the two apart is deliberate: a
+    residual and its tangent must agree on which convention they use, and mixing them silently breaks
+    Newton rather than erroring."""
     return bcoo_set_unit_diag(bcoo_zero_rows(A, dofs), dofs)
+
+
+def bcoo_eliminate_dirichlet(A, dofs):
+    """Symmetric Dirichlet elimination of a BCOO tangent: zero the constrained rows **and columns**,
+    then set a unit diagonal.
+
+    The matrix-level companion of :func:`~jno.utils.solver.fem_1d._apply_dirichlet_projected` — that
+    residual evaluates the free form at the projected point ``P(u)``, whose derivative is
+    ``M·J·M + (I−M)``, and this is exactly that. It replaced a row-only version, which left the
+    constrained columns populated and so made the tangent non-symmetric even for a symmetric operator:
+    jNO tests symmetry *bitwise* (see ``linear._matrix_structure``), so every Dirichlet nonlinear
+    problem was factored as a general LU instead of LDLᵀ.
+
+    Both maskers keep the index array and only zero ``A.data``, so the sparsity pattern is unchanged —
+    which is why the static ``compress_plan`` machinery around this needs no rework."""
+    return bcoo_set_unit_diag(bcoo_zero_rows_cols(A, dofs), dofs)
 
 
 # ---------------------------------------------------------------------------

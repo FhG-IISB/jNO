@@ -46,12 +46,13 @@ import jax.numpy as jnp
 import numpy as np
 
 from .fem_1d import (
-    _apply_dirichlet_rows,
+    _apply_dirichlet_projected,
     _apply_dirichlet_symmetric,
     _apply_dirichlet_transient,
     _integrate_term,
     _line_quadrature,
     _region_node_ids,
+    dirichlet_projection,
 )
 from .fem_facets import _LOCAL_FACES_TET, build_facet_connectivity, compute_face_normals
 from .fem_lagrange import (
@@ -75,6 +76,7 @@ from .fem_utils import (
     _promote_to_degree,
     _test_field_index,
     apply_compress_plan,
+    bcoo_eliminate_dirichlet,
     bcoo_set_dirichlet_rows,
     bcoo_zero_rows,
     bcoo_zero_rows_cols,
@@ -1990,14 +1992,18 @@ def assemble_fem_native(
         return jacobian
 
     def _dirichlet_jac_rows(jac_fn, pairs):
-        """Wrap an assembled-Jacobian callable so Dirichlet rows become the identity row — the
-        matrix-level analogue of :func:`_apply_dirichlet_rows` (row-replacement, columns kept), so it
-        matches ``jacfwd`` of the row-replaced residual that the Newton step expects."""
+        """Wrap an assembled-Jacobian callable so the constrained system is eliminated symmetrically —
+        the matrix-level analogue of :func:`_apply_dirichlet_projected`.
+
+        Two things must line up with that residual or Newton silently solves a different system: the
+        tangent is evaluated at the **projected** state ``P(u)`` (which is where the residual samples
+        the free form), and the constrained rows *and columns* are zeroed with a unit diagonal (which
+        is what differentiating through the projection gives)."""
         if not pairs:
             return jac_fn
-        dofs = jnp.asarray([p[0] for p in pairs], dtype=jnp.int32)
+        dofs, _vals, _project = dirichlet_projection(pairs)
 
-        # `bcoo_set_dirichlet_rows` zeroes the constrained rows and then APPENDS one (d, d, 1) triplet
+        # `bcoo_eliminate_dirichlet` zeroes the constrained rows and then APPENDS one (d, d, 1) triplet
         # per constrained DOF, so its output carries up to `len(dofs)` duplicates however well the
         # inner Jacobian was compressed. That count is static too: the union of the inner pattern with
         # the Dirichlet diagonal. Derived from the inner assembler's own published pattern so the two
@@ -2014,7 +2020,7 @@ def assemble_fem_native(
                 _dir_plan = None
 
         def jac(u_flat):
-            A = bcoo_set_dirichlet_rows(jac_fn(jnp.asarray(u_flat)), dofs)
+            A = bcoo_eliminate_dirichlet(jac_fn(_project(u_flat)), dofs)
             # Same host-decided plan, so this is an O(nnz) scatter-add per Newton step, not a sort.
             return apply_compress_plan(A.data, _dir_plan, A.shape) if _dir_plan is not None else A
 
@@ -2679,12 +2685,16 @@ def assemble_fem_native(
                 def _np_hold(args):  # held value on every Dirichlet dof (const + net), net entries live
                     return jnp.stack([jnp.asarray(p[1]).reshape(()) for p in _dirichlet_pairs_at(args)])
 
+                def _np_project(u, args, _d=_npd):
+                    return jnp.asarray(u).at[_d].set(_np_hold(args))
+
                 def res_p(u, args=None, t=0.0, _d=_npd):
-                    R = residual(jnp.asarray(u), t, args)
-                    return R.at[_d].set(jnp.asarray(u)[_d] - _np_hold(args))
+                    u = jnp.asarray(u)
+                    R = residual(_np_project(u, args), t, args)
+                    return R.at[_d].set(u[_d] - _np_hold(args))
 
                 def jac_p(u, args=None, t=0.0, _d=_npd):
-                    return bcoo_set_dirichlet_rows(jacobian(jnp.asarray(u), t, args), _d)
+                    return bcoo_eliminate_dirichlet(jacobian(_np_project(u, args), t, args), _d)
             elif _tv_dirichlet:
                 # A τ-DEPENDENT essential value on the load path -- `u(top)[1] - delta*tau`, i.e.
                 # DISPLACEMENT CONTROL, which is how a softening test is driven at all (under load
@@ -2703,24 +2713,35 @@ def assemble_fem_native(
                         [jnp.reshape(jnp.asarray(_eval_value_node_at_time(n, c, t)), (-1,)) for _d, n, c in _tv_dirichlet]
                     )
 
+                def _tv_project(u, t, _d=s_d_dofs, _g=s_d_vals, _t=_tvd):
+                    u = jnp.asarray(u)
+                    if _d is not None:
+                        u = u.at[_d].set(_g.astype(u.dtype))
+                    return u.at[_t].set(_tv_hold(t).astype(u.dtype))
+
                 def res_p(u, args=None, t=0.0, _d=s_d_dofs, _g=s_d_vals, _t=_tvd):
                     u = jnp.asarray(u)
-                    R = residual(u, t, args)
+                    R = residual(_tv_project(u, t), t, args)
                     if _d is not None:
                         R = R.at[_d].set(u[_d] - _g)
                     return R.at[_t].set(u[_t] - _tv_hold(t))
 
                 def jac_p(u, args=None, t=0.0, _d=_all_d):
-                    return bcoo_set_dirichlet_rows(jacobian(jnp.asarray(u), t, args), _d)
+                    return bcoo_eliminate_dirichlet(jacobian(_tv_project(u, t), t, args), _d)
             else:
 
+                def _s_project(u, _d=s_d_dofs, _g=s_d_vals):
+                    u = jnp.asarray(u)
+                    return u if _d is None else u.at[_d].set(_g.astype(u.dtype))
+
                 def res_p(u, args=None, t=0.0, _d=s_d_dofs, _g=s_d_vals):
-                    R = residual(jnp.asarray(u), t, args)
-                    return R if _d is None else R.at[_d].set(jnp.asarray(u)[_d] - _g)
+                    u = jnp.asarray(u)
+                    R = residual(_s_project(u), t, args)
+                    return R if _d is None else R.at[_d].set(u[_d] - _g)
 
                 def jac_p(u, args=None, t=0.0, _d=s_d_dofs):
-                    J = jacobian(jnp.asarray(u), t, args)
-                    return J if _d is None else bcoo_set_dirichlet_rows(J, _d)
+                    J = jacobian(_s_project(u), t, args)
+                    return J if _d is None else bcoo_eliminate_dirichlet(J, _d)
 
             _op = FemResidualOperator(res_p, jac_p, total, runtime_parameter_exprs=dict(_param_and_neural_exprs))
             _op.history_specs = history_specs  # VOLUME step-history buffer layout for the load-step driver
@@ -2770,7 +2791,7 @@ def assemble_fem_native(
 
     # nonlinear (non-parametric)
     if nonlinear:
-        res_bc = _apply_dirichlet_rows(residual, dirichlet_pairs)
+        res_bc = _apply_dirichlet_projected(residual, dirichlet_pairs)
         jac = _dirichlet_jac_rows(jacobian, dirichlet_pairs)
         return (
             FemResidualOperator(
