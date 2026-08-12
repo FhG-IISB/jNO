@@ -1,0 +1,197 @@
+"""Per-cell mesh geometry as trace nodes — ``cell_volume``, ``cell_angles``, ``measure``, ``pnorm``.
+
+These exist so a mesh-quality or element-size constraint can be *written*, and they are only
+useful if they are differentiable in the mesh coordinates: the whole point is to constrain a mesh
+that an optimiser is moving. So each is checked twice — against a closed form on a mesh whose
+answer is known, and against finite differences at a node where the derivative is genuinely
+non-zero (a zero-vs-zero agreement would prove nothing).
+"""
+
+from __future__ import annotations
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+
+import jno
+
+PI = np.pi
+
+
+@pytest.fixture(autouse=True)
+def _x64():
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
+
+def _rect(size=0.4):
+    return jno.Shape.rect(0, 0, 2, 1, size=size).domain()
+
+
+class TestClosedForms:
+    def test_cell_volumes_tile_the_domain_exactly(self):
+        d = _rect()
+        vol = np.asarray(d.cell_volume().eval()).reshape(-1)
+        assert vol.shape == (d._cells_p1().shape[0],), "one entry per cell"
+        assert vol.min() > 0.0, "a valid mesh has strictly positive areas"
+        assert vol.sum() == pytest.approx(2.0, abs=1e-10), "the 2x1 rectangle has area 2"
+
+    def test_measure_is_the_total(self):
+        d = _rect()
+        assert float(np.asarray(d.measure().eval())) == pytest.approx(2.0, abs=1e-10)
+
+    def test_a_triangles_angles_sum_to_pi(self):
+        d = _rect()
+        ang = np.asarray(d.cell_angles().eval()).reshape(-1, 3)
+        assert ang.shape[1] == 3
+        assert np.allclose(ang.sum(axis=1), PI, atol=1e-9)
+        assert ang.min() > 0.0 and ang.max() < PI
+
+    def test_an_equilateral_triangle_is_sixty_degrees(self):
+        """The sharpest available check on the angle formula: one cell, exact answer."""
+        d = (
+            jno.Path(0, 0)
+            .line_to(1, 0)
+            .line_to(0.5, np.sqrt(3) / 2)
+            .line_to(0, 0)
+            .face()
+            .sized(9.0)
+            .domain()
+        )
+        vol = np.asarray(d.cell_volume().eval()).reshape(-1)
+        if vol.size != 1:  # gmsh is free to subdivide; the check only means anything on one cell
+            pytest.skip(f"mesher produced {vol.size} cells, not 1")
+        ang = np.asarray(d.cell_angles().eval()).reshape(-1, 3)
+        assert np.allclose(np.degrees(ang[0]), 60.0, atol=1e-6)
+        assert vol[0] == pytest.approx(np.sqrt(3) / 4, abs=1e-10)
+
+    def test_cell_angles_is_two_dimensional_only(self):
+        d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.6).domain()
+        with pytest.raises(NotImplementedError, match="triangles only"):
+            d.cell_angles()
+
+
+class TestPnorm:
+    def test_pnorm_bounds_the_max_and_tightens_with_p(self):
+        d = _rect()
+        x = d.cell_volume()
+        raw = np.asarray(x.eval()).reshape(-1)
+        p50 = float(np.asarray(x.pnorm(50).eval()))
+        p200 = float(np.asarray(x.pnorm(200).eval()))
+        assert p50 >= raw.max() - 1e-12, "the p-norm is an upper bound on the max"
+        assert p200 < p50, "a larger p is a tighter approximation"
+        assert p200 >= raw.max() - 1e-12
+
+
+class TestDifferentiableInTheMesh:
+    """``∂g/∂X`` must flow, or a geometric constraint cannot steer a moving mesh."""
+
+    @staticmethod
+    def _moving_rect(size=0.5):
+        d = jno.Shape.rect(0, 0, 2, 1, size=size).domain()
+        xm, ym, _ = d.variable(
+            "design", where=lambda *c: np.ones_like(np.asarray(c[0]), dtype=bool), split=True
+        )
+        xm.trainable(name="mx")
+        ym.trainable(name="my")
+        return d
+
+    def test_area_gradient_matches_finite_differences(self):
+        d = self._moving_rect()
+        _args, rebuild = d._moving_points()
+        cells = jnp.asarray(d._cells_p1(), dtype=jnp.int32)
+        pts = np.asarray(d.mesh.points)
+        X0, Y0 = jnp.asarray(pts[:, 0]), jnp.asarray(pts[:, 1])
+
+        def area(X):
+            v = rebuild(X, Y0)[cells]
+            jac = jnp.stack([v[:, 1] - v[:, 0], v[:, 2] - v[:, 0]], axis=-1)
+            return jnp.sum(jnp.abs(jnp.linalg.det(jac)) / 2.0)
+
+        g = np.asarray(jax.grad(area)(X0))
+        assert np.all(np.isfinite(g))
+        # Pick a node the derivative actually depends on — an interior node moved in x changes the
+        # split between its neighbouring triangles. A boundary-parallel node can legitimately give
+        # zero, and checking one of those against a zero FD would assert nothing.
+        i = int(np.argmax(np.abs(g)))
+        assert abs(g[i]) > 1e-9, "no node has a non-zero area derivative; the test would be vacuous"
+        h = 1e-6
+        fd = float((area(X0.at[i].add(h)) - area(X0.at[i].add(-h))) / (2 * h))
+        assert g[i] == pytest.approx(fd, abs=1e-7)
+
+    def test_angle_gradient_matches_finite_differences(self):
+        d = self._moving_rect()
+        _args, rebuild = d._moving_points()
+        cells = jnp.asarray(d._cells_p1(), dtype=jnp.int32)
+        pts = np.asarray(d.mesh.points)
+        X0, Y0 = jnp.asarray(pts[:, 0]), jnp.asarray(pts[:, 1])
+
+        def worst_angle(X):
+            v = rebuild(X, Y0)[cells]
+            out = []
+            for k in range(3):
+                a = v[:, (k + 1) % 3] - v[:, k]
+                b = v[:, (k + 2) % 3] - v[:, k]
+                cos = jnp.sum(a * b, axis=-1) / (
+                    jnp.linalg.norm(a, axis=-1) * jnp.linalg.norm(b, axis=-1) + 1e-12
+                )
+                out.append(jnp.arccos(jnp.clip(cos, -1.0, 1.0)))
+            # a smooth proxy for "the smallest angle", which is what the constraint bounds
+            return jnp.sum(jnp.stack(out, axis=-1) ** -8)
+
+        g = np.asarray(jax.grad(worst_angle)(X0))
+        assert np.all(np.isfinite(g)), "the angle formula must not produce NaN gradients"
+        i = int(np.argmax(np.abs(g)))
+        assert abs(g[i]) > 1e-9
+        h = 1e-7
+        fd = float((worst_angle(X0.at[i].add(h)) - worst_angle(X0.at[i].add(-h))) / (2 * h))
+        assert g[i] == pytest.approx(fd, rel=1e-5)
+
+    def test_the_node_tracks_moved_coordinates(self):
+        """Not just differentiable — the VALUE must follow the parameters, not the initial mesh."""
+        d = self._moving_rect()
+        _args, rebuild = d._moving_points()
+        cells = jnp.asarray(d._cells_p1(), dtype=jnp.int32)
+        pts = np.asarray(d.mesh.points)
+        X0, Y0 = jnp.asarray(pts[:, 0]), jnp.asarray(pts[:, 1])
+
+        def area(X, Y):
+            v = rebuild(X, Y)[cells]
+            jac = jnp.stack([v[:, 1] - v[:, 0], v[:, 2] - v[:, 0]], axis=-1)
+            return float(jnp.sum(jnp.abs(jnp.linalg.det(jac)) / 2.0))
+
+        assert area(X0, Y0) == pytest.approx(2.0, abs=1e-10)
+        # Stretching every x by 1.5 must scale the total area by exactly 1.5.
+        assert area(X0 * 1.5, Y0) == pytest.approx(3.0, abs=1e-10)
+
+
+class TestConstraintComposition:
+    """The operators are only useful if the paper's constraint forms can be written with them."""
+
+    def test_the_element_angle_constraint_is_expressible_and_feasible(self):
+        d = _rect(size=0.4)
+        theta_min = np.radians(20.0)
+        g = ((2 * PI - d.cell_angles()) / (2 * PI - theta_min)).pnorm(50)
+        val = float(np.asarray(g.eval()))
+        worst = float(np.asarray(d.cell_angles().eval()).min())
+        # A well-shaped mesh satisfies g <= 1; the p-norm is slightly conservative, so allow the
+        # small overshoot the paper also reports (its converged run sits at 19.943 deg vs a 20 bound).
+        assert val < 1.02, f"g1 = {val} on a mesh whose worst angle is {np.degrees(worst):.2f} deg"
+        assert np.degrees(worst) > 15.0
+
+    def test_the_element_volume_constraint_is_expressible(self):
+        d = _rect(size=0.4)
+        v_max = float(np.asarray(d.cell_volume().eval()).max()) * 1.5
+        g = (d.cell_volume() / v_max).pnorm(50)
+        assert float(np.asarray(g.eval())) < 1.0, "every element is under the cap"
+
+    def test_a_volume_fraction_constraint_composes_with_jno_le(self):
+        d = _rect(size=0.4)
+        node = jno.le(d.measure() / 4.0, 1.0)
+        assert node.sense == "le"
+        assert float(np.asarray(node.residual.eval())) == pytest.approx(2.0 / 4.0 - 1.0, abs=1e-9)

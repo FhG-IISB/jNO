@@ -2429,6 +2429,106 @@ class domain(MeshIOMixin):
             self.context["cell_size"] = np.ones((1, 1), dtype=default_np_float_dtype())
         return Variable(tag="cell_size", dim=[0, 1], domain=self, axis="spatial")
 
+    # ------------------------------------------------------------------
+    # Per-cell mesh geometry as trace nodes (differentiable in the mesh)
+    # ------------------------------------------------------------------
+    def _cells_p1(self):
+        """``(n_cells, dim+1)`` vertex ids of the P1 simplices."""
+        mesh = self.built_mesh
+        key = "triangle" if self.dimension == 2 else ("tetra" if self.dimension == 3 else "line")
+        cells = getattr(mesh, "cells_dict", {}).get(key)
+        if cells is None:
+            raise ValueError(f"domain: no {key!r} cells on this mesh — cell geometry is unavailable.")
+        return np.asarray(cells, dtype=np.int64)
+
+    def _moving_points(self):
+        """``(arg_exprs, rebuild)`` for the mesh coordinates *as the optimiser currently has them*.
+
+        ``rebuild(*vals)`` returns the ``(n_points, dim)`` array with every ``.trainable()``
+        coordinate scattered in. Passing ``arg_exprs`` as the traced arguments of a
+        :func:`jno.fn` node is what makes a geometric quantity differentiable w.r.t. the mesh:
+        the node depends on the coordinate parameters, so ``∂g/∂X`` flows without anyone writing
+        a shape derivative. With no trainable coordinates the mesh is fixed and ``arg_exprs`` is
+        empty, which is still valid — the quantity is then simply a constant.
+        """
+        dim = int(self.dimension)
+        pts0 = jnp.asarray(np.asarray(self.mesh.points)[:, :dim])
+        specs = list(getattr(self, "_trainable_coords", None) or [])
+        meta = [(jnp.asarray(s["ids"], dtype=jnp.int32), int(s["axis"])) for s in specs]
+
+        def rebuild(*vals):
+            pts = pts0
+            for (ids, axis), v in zip(meta, vals):
+                pts = pts.at[ids, axis].set(jnp.asarray(v).reshape(-1))
+            return pts
+
+        return [s["expr"] for s in specs], rebuild
+
+    def cell_volume(self):
+        """Per-cell volume (area in 2-D) as a ``(n_cells,)`` node, differentiable in the mesh.
+
+        ``|det J| / d!`` from the cell's own vertices, so it tracks ``.trainable()`` coordinates.
+        The handle for an element-size constraint in shape or topology optimisation::
+
+            g = (d.cell_volume() / ((2 - rho) * v_max)).pnorm(50)
+            jno.core([compliance, jno.le(g, 1.0)])
+        """
+        import jno as _jno
+
+        dim = int(self.dimension)
+        cells = jnp.asarray(self._cells_p1(), dtype=jnp.int32)
+        args, rebuild = self._moving_points()
+        fact = {1: 1.0, 2: 2.0, 3: 6.0}[dim]  # d! — the simplex volume factor
+
+        def _vol(*vals):
+            v = rebuild(*vals)[cells]  # (n_cells, dim+1, dim)
+            jac = jnp.stack([v[:, i + 1] - v[:, 0] for i in range(dim)], axis=-1)
+            return jnp.abs(jnp.linalg.det(jac)) / fact
+
+        return _jno.fn(_vol, args, name="cell_volume")
+
+    def cell_angles(self, eps: float = 1e-12):
+        """Per-cell interior angles in radians, ``(n_cells, 3)``, differentiable in the mesh. **2-D.**
+
+        The angle at each vertex from the inverse cosine of its two incident edge vectors. This is
+        the quantity a mesh-quality constraint is written on — a lower bound on the minimum angle
+        prevents the element tangling that free nodal movement otherwise causes::
+
+            g = ((2 * jno.np.pi - d.cell_angles()) / (2 * jno.np.pi - theta_min)).pnorm(50)
+            jno.core([compliance, jno.le(g, 1.0)])
+
+        Bounding the minimum angle bounds the maximum implicitly, since the three sum to ``π``.
+        ``eps`` guards the denominator; it does not otherwise shift the angles.
+        """
+        import jno as _jno
+
+        if int(self.dimension) != 2:
+            raise NotImplementedError(
+                f"domain.cell_angles(): triangles only (2-D); this domain is {self.dimension}-D."
+            )
+        cells = jnp.asarray(self._cells_p1(), dtype=jnp.int32)
+        args, rebuild = self._moving_points()
+
+        def _ang(*vals):
+            v = rebuild(*vals)[cells]  # (n_cells, 3, 2)
+            out = []
+            for i in range(3):
+                a = v[:, (i + 1) % 3] - v[:, i]
+                b = v[:, (i + 2) % 3] - v[:, i]
+                cos = jnp.sum(a * b, axis=-1) / (jnp.linalg.norm(a, axis=-1) * jnp.linalg.norm(b, axis=-1) + eps)
+                out.append(jnp.arccos(jnp.clip(cos, -1.0, 1.0)))
+            return jnp.stack(out, axis=-1)  # (n_cells, 3)
+
+        return _jno.fn(_ang, args, name="cell_angles")
+
+    def measure(self):
+        """Total volume (area in 2-D) of the domain, as a node differentiable in the mesh.
+
+        The denominator of a volume fraction. A node rather than a cached float because the mesh
+        deforms: anything summed over element measures has to track the moving geometry.
+        """
+        return self.cell_volume().sum
+
     def variable(
         self,
         tag: str,

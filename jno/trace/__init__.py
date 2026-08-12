@@ -595,6 +595,24 @@ class Placeholder:
     def mae(self) -> FunctionCall:
         return FunctionCall(lambda x: jnp.squeeze(jnp.mean(jnp.abs(x))), [self], "mae", True)
 
+    def pnorm(self, p: float = 50.0) -> FunctionCall:
+        """``(Σ xᵢ^p)^(1/p)`` — a smooth, differentiable stand-in for the maximum.
+
+        The standard aggregation for a constraint that must hold at *every* element: imposing it
+        pointwise would add one inequality per element, so the p-norm collapses them into one at
+        the cost of a slight, predictable violation near the bound. Larger ``p`` is a tighter
+        approximation and a more nonlinear one; ``p = 50`` is the usual compromise.
+
+        Written for quantities already normalised so the bound is ``1`` (``g.pnorm(50) <= 1``),
+        which is what keeps the aggregation numerically sane across constraints of different
+        magnitudes. Negative entries are not meaningful here — normalise first.
+        """
+
+        def fn(x, _p=float(p)):
+            return jnp.squeeze(jnp.sum(jnp.abs(x) ** _p) ** (1.0 / _p))
+
+        return FunctionCall(fn, [self], f"pnorm{p:g}", True)
+
     @property
     def T(self) -> FunctionCall:
         return FunctionCall(lambda x: x.T, [self], "transpose", True)
