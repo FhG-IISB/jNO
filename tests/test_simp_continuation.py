@@ -148,3 +148,67 @@ def test_penal_as_a_runtime_exponent_scales_the_stiffness():
     for p in (1.0, 2.0, 3.0, 4.0, 5.0):
         got = np.linalg.norm(k(np.full(n_cells, 0.5), p)[np.ix_(free, free)]) / solid
         assert got == pytest.approx(0.5**p, rel=1e-10), f"penal={p} did not scale the stiffness"
+
+
+class TestGeometricDecay:
+    """eq. (41): ``beta_iter = gamma * beta_(iter-1)``, every iteration."""
+
+    @staticmethod
+    def _rig(gamma, **kw):
+        b = jno.np.parameter((1,), name="beta_c")
+        dec = jno.optimizers.geometric_decay(b, gamma, **kw)
+        lid = b.model.layer_id
+        trainable = {lid: jnp.asarray([dec.value])}
+        return dec, {lid: jnp.zeros((1,))}, trainable, lid
+
+    def test_it_decays_geometrically(self):
+        dec, g, t, lid = self._rig(0.9, start=1.0)
+        for e in range(10):
+            dec.on_before_update(grads=g, trainable=t, epoch=e)
+        assert dec.value == pytest.approx(0.9**10, rel=1e-12)
+        assert len(dec.history) == 10
+
+    def test_the_step_lands_the_new_value(self):
+        dec, g, t, lid = self._rig(0.5, start=1.0)
+        out = dec.on_before_update(grads=g, trainable=t, epoch=0)
+        assert float(t[lid][0] - out[lid][0]) == pytest.approx(0.5), "sgd(1.0) must land beta*gamma"
+
+    def test_the_floor_holds(self):
+        """Without a floor the barrier eventually vanishes and the design can cross P*."""
+        dec, g, t, lid = self._rig(0.5, start=1.0, minimum=0.01)
+        for e in range(50):
+            dec.on_before_update(grads=g, trainable=t, epoch=e)
+        assert dec.value == pytest.approx(0.01)
+
+    def test_gamma_one_is_no_decay(self):
+        dec, g, t, lid = self._rig(1.0, start=0.2)
+        for e in range(5):
+            dec.on_before_update(grads=g, trainable=t, epoch=e)
+        assert dec.value == pytest.approx(0.2)
+
+    @pytest.mark.parametrize("bad", [0.0, -0.1, 1.5])
+    def test_an_out_of_range_gamma_is_refused(self, bad):
+        b = jno.np.parameter((1,), name="beta_bad")
+        with pytest.raises(ValueError, match="gamma must be in"):
+            jno.optimizers.geometric_decay(b, bad)
+
+
+def test_the_continuation_can_watch_one_loss_term():
+    """Under a decaying barrier the TOTAL objective keeps moving because beta does, so a window
+    on the total never closes. `watch=` follows the compliance term alone — Fig. 4a's question."""
+    d = jno.domain.from_array({"_": np.zeros((1, 1))})
+    rho = jno.np.parameter((20,), name="rho_w")
+    penal = jno.np.parameter((1,), name="penal_w")
+    cont = jno.optimizers.simp_continuation(penal, rho, window=3, watch=0)
+    lid = penal.model.layer_id
+    trainable = {rho.model.layer_id: jnp.full(20, 0.5), lid: jnp.asarray([3.0])}
+    grads = {k: jnp.zeros_like(v) for k, v in trainable.items()}
+
+    # Term 0 (compliance) is settled; term 1 (the barrier) drifts, so the TOTAL never settles.
+    for e in range(6):
+        cont.on_before_update(
+            grads=grads, trainable=trainable, epoch=e,
+            total_loss=100.0 - e,                       # moving
+            individual_losses=np.array([5.0, 95.0 - e]),  # term 0 settled
+        )
+    assert cont.penal > 3.0, "watching a settled term must let the continuation fire"

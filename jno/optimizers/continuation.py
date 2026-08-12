@@ -49,7 +49,9 @@ class SIMPContinuation(_Callback):
         window: int = 3,
         mnd_tol: float = 1e-2,
         physical=None,
+        watch: Optional[int] = None,
     ):
+        self._watch = watch
         self._physical = physical
         self._penal_lid = penal.model.layer_id
         self._rho_lid = density.model.layer_id
@@ -74,9 +76,18 @@ class SIMPContinuation(_Callback):
         import jax
         import jax.numpy as jnp
 
-        total = kw.get("total_loss")
-        if total is not None:
-            self._losses.append(float(total))
+        # Which quantity has to settle. `total_loss` is the whole objective, which under a
+        # perimeter barrier is C - beta R -- and that moves for as long as beta decays, so the
+        # window would never close. `watch=i` follows `individual_losses[i]` instead, i.e. the
+        # compliance alone, which is what Fig. 4a's "C converged?" actually asks.
+        if self._watch is not None:
+            indiv = kw.get("individual_losses")
+            if indiv is not None:
+                self._losses.append(float(np.asarray(indiv).reshape(-1)[self._watch]))
+        else:
+            total = kw.get("total_loss")
+            if total is not None:
+                self._losses.append(float(total))
 
         # M_nd on the PHYSICAL density. `trainable` is the partitioned half, so a paramax
         # `constrain(...)` wrapper is NOT applied here -- its function lives in the static half and
@@ -119,6 +130,7 @@ def simp_continuation(
     window: int = 3,
     mnd_tol: float = 1e-2,
     physical=None,
+    watch: Optional[int] = None,
 ) -> SIMPContinuation:
     """Raise the SIMP exponent once the objective settles and the design is still grey.
 
@@ -140,6 +152,10 @@ def simp_continuation(
             ``d.patch_filter()``. Pass it whenever the density is reparameterised with
             ``constrain(...)``: the hook sees the partitioned trainable half, where the paramax
             wrapper cannot be applied, so ``M_nd`` would otherwise be measured on the wrong field.
+        watch: Index into ``individual_losses`` whose convergence is tested, instead of the total
+            loss. Pass the compliance term's index whenever the objective also carries a decaying
+            penalty -- the total then keeps moving because the penalty does, and the window never
+            closes.
 
     Example::
 
@@ -164,4 +180,51 @@ def simp_continuation(
         window=window,
         mnd_tol=mnd_tol,
         physical=physical,
+        watch=watch,
     )
+
+
+class GeometricDecay(_Callback):
+    """Multiply a scalar parameter by ``gamma`` every iteration. See :func:`geometric_decay`."""
+
+    def __init__(self, param: Any, gamma: float, *, start: float = 1.0, minimum: float = 0.0):
+        if not 0.0 < float(gamma) <= 1.0:
+            raise ValueError(f"geometric_decay: gamma must be in (0, 1], got {gamma!r}.")
+        self._lid = param.model.layer_id
+        self.gamma, self.minimum = float(gamma), float(minimum)
+        self.value = float(start)
+        self.history: List[float] = []
+
+    def on_before_update(self, *, grads, epoch, **kw):
+        import jax
+        import jax.numpy as jnp
+
+        new = max(self.value * self.gamma, self.minimum)
+        delta = self.value - new
+        self.value = new
+        self.history.append(new)
+        grads = dict(grads)
+        grads[self._lid] = jax.tree_util.tree_map(lambda x: jnp.full_like(x, delta), grads[self._lid])
+        return grads
+
+
+def geometric_decay(param: Any, gamma: float, *, start: float = 1.0, minimum: float = 0.0) -> GeometricDecay:
+    """Decay a scalar parameter geometrically, ``b_iter = gamma * b_(iter-1)`` — eq. (41).
+
+    Written for the perimeter barrier's weight (Jung, Yun & Kim, *Computers & Structures* **331**
+    (2026) 108403, eq. 40-41). The objective is ``C - beta * P* log(P* - P)``: with ``beta`` fixed,
+    the barrier holds the design well short of the target ``P*`` forever, because the penalty is
+    still paying for perimeter it is allowed to spend. Shrinking ``beta`` lets the design approach
+    ``P*`` from below as the run proceeds — the paper's own words, "to reduce the approximation
+    error of the perimeter constraint", and the standard interior-point continuation.
+
+    Give the parameter ``optax.sgd(1.0)`` and initialise it to ``start``; this hook writes it
+    directly, the same way :class:`SIMPContinuation` writes ``penal``.
+
+    Args:
+        param: The scalar ``jno.np.parameter`` to decay.
+        gamma: Decay factor per iteration, in ``(0, 1]``. ``1.0`` is no decay.
+        start: Initial value. Must match the parameter's initializer.
+        minimum: Floor, so the barrier never vanishes entirely and let the design cross ``P*``.
+    """
+    return GeometricDecay(param, gamma, start=start, minimum=minimum)

@@ -64,6 +64,8 @@ def test_namespace_is_just_the_optimizers():
         "MMAOptimizer",
         "simp_continuation",
         "SIMPContinuation",
+        "geometric_decay",
+        "GeometricDecay",
     }
     for factory in (o.ssbroyden, o.ssbfgs, o.soap):
         opt = factory()
