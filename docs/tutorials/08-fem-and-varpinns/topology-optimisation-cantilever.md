@@ -120,8 +120,17 @@ control is how a load-application bug or a plain refinement effect gets reported
 
 Perimeter control earns its place. Running the same script with `PSTAR = 0.0` gives $P=849.2$,
 $C=80.23$, $M_{nd}=0.127$ and an over-report of $+21.6\%$ — so constraining the perimeter produced a
-design that is **more binary, no less stiff, and substantially more honest about its own stiffness**,
-because it has fewer fine features with which to farm discretisation error.
+design that is **more binary and substantially more honest about its own stiffness**, because it has
+fewer fine features with which to farm discretisation error.
+
+Do **not** read the accompanying drop in compliance ($80.23 \to 78.45$) as perimeter control being
+free. Without a length-scale restriction the continuum problem is not well posed — that is exactly
+why Ambrosio & Buttazzo introduced the perimeter constraint and Haber, Jog & Bendsøe implemented it —
+and numerically the unregularised run fragments instead of converging. On the companion half-MBB
+problem the uncontrolled run measurably fails to settle: doubling the iteration budget moved
+compliance the *wrong* way, $209.9 \to 224.5$, with perimeter rising $1274 \to 1302$. An
+uncontrolled baseline is therefore a poor reference point, and the honest claim here is that
+perimeter control makes the problem tractable enough to converge — not that it costs nothing.
 
 For scale, the paper reports $+17.6\%$ for conventional elements on its own cantilever and closes the
 gap to $-0.5\%$ with the interpolation-cover enrichment of its 2026 follow-up
