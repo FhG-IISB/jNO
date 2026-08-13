@@ -138,6 +138,7 @@ nav:
       - "Full-Waveform Inversion (recover a wave speed)": tutorials/08-fem-and-varpinns/inverse-wave-speed-2d.md
       - Inverse Diffusivity Field: tutorials/08-fem-and-varpinns/inverse-diffusivity-field.md
       - Adaptive Mesh Refinement (L-shape): tutorials/08-fem-and-varpinns/adaptive-l-shape.md
+      - "Topology Optimisation (deformable mesh)": tutorials/08-fem-and-varpinns/topology-optimisation-cantilever.md
       - 2D Maxwell (complex vector E): tutorials/08-fem-and-varpinns/maxwell-2d-vector.md
     - FDM:
       - Poisson 2D: tutorials/09-fdm/poisson-2d-fdm.md
