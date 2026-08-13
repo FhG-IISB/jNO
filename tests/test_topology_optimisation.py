@@ -441,3 +441,64 @@ class TestPerimeter:
         _r, s = d.fem_symbols(names=("r", "s"))
         with pytest.raises(TypeError, match="P0"):
             jno.np.parameter(s, name="rho_nodal_p").perimeter()
+
+
+class TestCrossMeshTransfer:
+    """``transfer_cell_field`` — the machinery a reanalysis needs.
+
+    An optimisation whose mesh coordinates are design variables can lower its objective by
+    distorting elements into under-integrating strain energy, and cannot tell that apart from
+    genuine stiffness. Re-solving the converged density on a clean mesh is the only check that
+    separates them: measured once at +163 % on a design that looked entirely correct.
+    """
+
+    def test_a_constant_field_survives_transfer(self):
+        coarse = jno.Shape.rect(0, 0, 60, 30, size=4.0).domain()
+        fine = jno.Shape.rect(0, 0, 60, 30, size=1.5).domain()
+        vals = np.full(int(coarse._cells_p1().shape[0]), 0.7)
+        out = coarse.transfer_cell_field(vals, fine)
+        assert out.shape == (int(fine._cells_p1().shape[0]),)
+        np.testing.assert_allclose(out, 0.7, atol=1e-12), "a constant must be carried exactly"
+
+    def test_a_region_lands_in_the_right_place(self):
+        """A bar transfers to a bar: the geometry, not just the values, must survive."""
+        coarse = jno.Shape.rect(0, 0, 60, 30, size=2.0).domain()
+        fine = jno.Shape.rect(0, 0, 60, 30, size=1.0).domain()
+        c_cen = np.asarray(coarse.mesh.points)[:, :2][coarse._cells_p1()].mean(axis=1)
+        bar = np.where(np.abs(c_cen[:, 1] - 15.0) < 6.0, 1.0, 0.0)
+
+        out = coarse.transfer_cell_field(bar, fine)
+        f_cen = np.asarray(fine.mesh.points)[:, :2][fine._cells_p1()].mean(axis=1)
+        # Every target centroid well inside the bar must be solid, and well outside must be void.
+        deep_in = np.abs(f_cen[:, 1] - 15.0) < 4.0
+        deep_out = np.abs(f_cen[:, 1] - 15.0) > 8.0
+        assert out[deep_in].min() == 1.0 and out[deep_out].max() == 0.0
+        # Area is preserved to the resolution of the coarser mesh.
+        assert out.mean() == pytest.approx(bar.mean(), abs=0.05)
+
+    def test_deformed_source_coordinates_are_honoured(self):
+        """The source domain still holds the positions it was BUILT with, so a mesh moved by
+        `.trainable()` has to pass its deformed coordinates explicitly — otherwise the transfer
+        reads the design off the wrong geometry and silently reports the wrong answer."""
+        coarse = jno.Shape.rect(0, 0, 60, 30, size=3.0).domain()
+        fine = jno.Shape.rect(0, 0, 60, 30, size=1.5).domain()
+        pts = np.asarray(coarse.mesh.points)[:, :2]
+        cells = coarse._cells_p1()
+        bar = np.where(np.abs(pts[cells].mean(axis=1)[:, 1] - 15.0) < 4.0, 1.0, 0.0)
+
+        # A gentle shift of the interior nodes only, small enough not to tangle the mesh.
+        shifted = pts.copy()
+        interior = (pts[:, 1] > 1e-9) & (pts[:, 1] < 30.0 - 1e-9)
+        shifted[interior, 1] += 2.0
+
+        same = coarse.transfer_cell_field(bar, fine)
+        moved = coarse.transfer_cell_field(bar, fine, points=shifted)
+        assert not np.allclose(same, moved), "moving the source nodes must move the field"
+        # Same amount of material, in a different place — the geometry moved, not the design.
+        assert moved.sum() == pytest.approx(same.sum(), rel=0.25)
+
+    def test_a_mis_sized_field_is_refused(self):
+        coarse = jno.Shape.rect(0, 0, 60, 30, size=4.0).domain()
+        fine = jno.Shape.rect(0, 0, 60, 30, size=2.0).domain()
+        with pytest.raises(ValueError, match="entries but this mesh has"):
+            coarse.transfer_cell_field(np.ones(3), fine)
