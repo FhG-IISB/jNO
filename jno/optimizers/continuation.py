@@ -62,7 +62,8 @@ class SIMPContinuation(_Callback):
         self.tol, self.window, self.mnd_tol = float(tol), int(window), float(mnd_tol)
         self.patience = None if patience is None else max(int(patience), 1)
         self.penal = float(start)
-        self.history: List[float] = []          # (epoch, penal) at each raise
+        # (epoch, penal, reason) at each raise -- three-tuples since `patience` added `reason`.
+        self.history: List[tuple] = []
         self.m_nd: Optional[float] = None
         self._losses: List[float] = []
         self._waited = 0                        # samples since the last raise, for `patience`
@@ -195,6 +196,17 @@ def simp_continuation(
             *interval* rather than ``window`` consecutive steps. The paper's criterion is over
             three iteration intervals; with ``every=1`` the test is much stricter than theirs and
             a run that is still making steady progress never satisfies it.
+        patience: Raise ``penal`` after this many samples without a raise, even if the objective
+            has not converged. Left ``None`` the behaviour is exactly the paper's. Set it when the
+            objective does not settle -- an unregularised run that fragments rather than
+            converging, or an MMA iterate that keeps oscillating above ``tol`` -- because there
+            ``penal`` otherwise sits at ``start`` for the whole run and the design has no reason to
+            go binary, which is backwards: penalisation is needed most where convergence is worst.
+
+    Attributes:
+        history: One ``(epoch, penal, reason)`` per raise, ``reason`` being ``"converged"`` or
+            ``"stalled"``. **Three-tuples**, not pairs -- ``reason`` was added with ``patience``.
+        m_nd: The grey-level indicator (eq. 20) at the last sample, on the physical density.
 
     Example::
 
@@ -203,7 +215,8 @@ def simp_continuation(
         penal.optimizer(optax.sgd(1.0))
         cont = jno.optimizers.simp_continuation(penal, rho)
         jno.core([...], domain=d).solve(300, callbacks=[cont])
-        print(cont.history)   # [(epoch, penal), ...] -- when each step fired
+        for epoch, penal_new, why in cont.history:
+            print(epoch, penal_new, why)   # when each step fired, and what fired it
 
     References:
         Jung, Yun & Kim, *Computers & Structures* **331** (2026) 108403, Sec. 2.3.2, Fig. 4a.
