@@ -1289,6 +1289,110 @@ Algorithm: Bourdin, Francfort & Marigo, *Numerical experiments in revisited brit
 **48** (2000), §3 — as the staggered operator split with a history field, Miehe, Welschinger & Hofacker,
 IJNME **83** (2010).
 
+**`direct=True` factorizes each field's diagonal block** rather than solving it matrix-free, and pairs
+with a `linear=` slot:
+
+```python
+fem.solve(nonlinear=jno.solve.staggered([u, dm], direct=True), linear=jno.solve.lu(backend="pardiso"))
+```
+
+It exists because the matrix-free sub-solve **cannot be preconditioned**. A `precond=` spec materializes
+against an assembled operator, and a staggered sub-problem is a restriction *closure*
+(`x -> R(u with block set to x)[block]`) with no matrix, so an ill-conditioned block is solved by
+**unpreconditioned BiCGStab** — near-incompressible elasticity (ν → 0.5) being the usual victim. That
+was also why a direct `linear=` slot used to be refused against `staggered` outright: there was nothing
+to factorize.
+
+The extraction avoids a data-dependent `nnz` (which would break the static shapes a traced Newton
+needs): instead of slicing `J[b][:, b]` out, the *complement's* rows and columns are zeroed and given a
+unit diagonal, so the block is solved as `[[J_bb, 0], [0, I]]` against `[-r_b, 0]`. The padding is pure
+diagonal — no fill-in — so the factorization cost stays the block's. With `bounds`, the matrix handed to
+the factorization is the **min-map's** semismooth Jacobian (identity rows on the active set), which
+`jax.linearize` derives for free on the matrix-free path but an assembled tangent does not.
+
+Measured on a 3-D Yeoh phase-field march (576 DOFs, 8 load steps, CPU): **42.80 s → 10.78 s, 4.0×**, to
+the same answer. Two honest caveats: the **full** tangent is assembled to use one block of it (a
+sparsity-caching backend — `pardiso`/`cudss` — then pays only the numeric re-factorization per sweep),
+and on a well-conditioned problem the matrix-free default is cheaper. This is not a free upgrade and it
+is not the default. The load-path march threads the tangent too, which it previously never did: before
+this, a direct driver inside a `tau=` path silently fell back to the matrix-free inner solve.
+
+**`line_search=` globalizes each sub-solve's Newton steps**, and it is now on by default:
+
+| value | what it does |
+|---|---|
+| `"backtrack"` *(default)* | residual-norm Armijo, halving from `damping`. What this used to do under `line_search=True`. |
+| `True` | **exact** line search — bisect for the root of the directional derivative `R(x+λd)·d`, i.e. the minimizer of the energy along the Newton direction |
+| `False` | no line search; take `damping` |
+
+The default moved from `False` to `"backtrack"` because no line search is a genuine footgun on
+finite-strain forms: measured here, a 3-D Yeoh P2 march produced **NaN on load step 1** without one
+(the undamped step inverts an element, `det F ≤ 0`, and `J^(-2/3)` is NaN) and solved cleanly with one.
+
+`True` implements Heinzmann, Vicentini, Carrara et al., *Iterative convergence in phase-field brittle
+fracture computations: exact line search is all you need*, Computational Mechanics (2026),
+[arXiv:2511.23064](https://arxiv.org/abs/2511.23064), §3 Algorithm 2 — the same algorithm they
+contributed to PETSc as `SNESLineSearchBisection`. Their Props. 1–2 and Remark 4 chain into a
+convergence guarantee for the whole alternate-minimization scheme, provided each sub-problem is
+strictly convex and coercive (jNO's `bounds` min-map is semismooth, so that proof does not cover it —
+the same gap they note for reduced-space active sets).
+
+**It is not the default, because we have not measured it beating backtracking.** On the problems
+tested here — a 2-D SENT plate with and without a volumetric-deviatoric split, at several load levels —
+both need the same 21–22 staggered sweeps, and the exact search costs ~15% more wall time from the
+extra residual evaluations. Note the paper's own failure cases arise only where the *mechanical*
+sub-problem is non-linear (their §: the residual "reduces to an affine form in the absence of an energy
+decomposition"), at critical load steps reached along a path — a regime not reproduced here. Reach for
+`True` when a sub-solve stalls; the theory is on its side even where our measurements are neutral.
+
+**`over_relax=ω` accelerates the sweep itself.** Alternate minimization *is* a nonlinear block
+Gauss–Seidel iteration, so over-relaxation accelerates it exactly as it does the linear one — go `ω`
+times as far along each sub-step's own update direction, per block:
+
+```python
+fem.solve(nonlinear=jno.solve.staggered([u, dm], over_relax=1.4))
+```
+
+Algorithm: Farrell & Maurini, *Linear and nonlinear solvers for variational phase-field models of
+brittle fracture*, IJNME **109** (2017) 648–667, **Algorithm 2 (ORAM), §2.1**. `ω = 1` is plain
+alternate minimization. Kahan's classical bound gives `ω ∈ (0, 2)` as necessary for SOR to converge, and
+anything outside raises.
+
+**Whether it pays is problem-dependent, and there is no way to know in advance.** The paper is explicit —
+they "rely on the naïve strategy of numerical experimentation on coarser problems" and defer automatic
+selection to future work. Their own results split cleanly: Table I (a propagating crack, where AM
+converges slowly) gains **58–73% fewer iterations**; Table II (where AM already converges fast) gets
+**0% — over-relaxation hinders it**, going 37 → 111 → 185 → 326 → 747 iterations as ω runs 1.0 → 1.8.
+On a 2-D small-strain phase-field problem that drives damage to 1, ω = 1.4 was **1.95× faster**
+(3096 → 1587 ms, warm median of 3). So it defaults to 1, and a short ω sweep on a coarse version of the
+problem is the only way to know — the paper's own two tables disagree with each other.
+
+**ω cannot diverge.** The extrapolation is not taken on trust: the step retreats by bisection on
+`[1, ω]` until the trial point has a **finite** residual and is **feasible**, and `ω = 1` is the
+sub-solve's own converged answer, already evaluated and therefore admissible by construction. So the
+worst case is that the sweep degrades to plain alternate minimization. This matters most on
+finite-strain forms, where an unguarded step past a converged answer inverts an element (`det F ≤ 0`,
+so `J^(-2/3)` is NaN) — measured on the 3-D Yeoh SENT march, which NaN'd on load step 1 at *every* ω
+down to 1.1 before the guard and runs to completion with it.
+
+The test is finiteness and feasibility, **not** descent. Over-relaxation is deliberately not a descent
+method, so demanding a residual decrease would reject almost every ω > 1 and silently collapse the
+feature back to ω = 1 while appearing to keep it. Feasibility is the paper's own rule (§2.1 backs ω off
+by bisection on `[1, ω]` for the bound constraint); finiteness is the generalization.
+
+Over-relaxation also acts on the **free** DOFs only. Farrell & Maurini's `ũ` lives in the constrained
+space `C_ū`, where a prescribed DOF has `δ = 0`; jNO imposes essential conditions as residual rows, so
+without the mask the sub-solve's exact hit on the prescribed value gets extrapolated past — measured on
+one row with `g = 2`, ω = 1.7 gave 3.40 → 1.02 → 2.69, an oscillation decaying only as `|1−ω|ᵏ`, worst
+on a *ramped* condition where `g` moves every load step.
+
+Cost when ω ≠ 1: one extra full residual evaluation per block per sweep.
+
+Under `bounds`, over-relaxation steps *past* the sub-solve's answer — which is feasible by construction,
+while the extrapolation need not be — so the driver takes the box projector from the `bounds` wrapper and
+clips. That deviates from the paper, which backs the scalar `ω` off to the largest feasible value;
+clipping is componentwise, also feasible, and keeps more of the step.
+
 **The trade is the convergence rate, and it is not small.** Alternate minimization converges *linearly*
 where Newton is quadratic, so it can need hundreds of sweeps near a propagating crack — hence the
 `max_sweeps=200` default. It buys robustness, not speed: where Newton converges, Newton is the better
@@ -1769,6 +1873,31 @@ field-agnostic.
 
 Not carried, each rejected with a clear error: a real `u.t` transient (drive time through `tau` instead),
 a complex form, 1D, non-nodal (Argyris/Morley/edge) elements, VPINN, and periodic ties.
+
+**A step that did not converge is refused, not carried forward.** The march runs its per-step Newton
+inside a single `lax.scan`, and the driver's own convergence check needs a *concrete* residual — so
+inside the scan it disables itself, exactly where the signal matters most. A load path compounds the
+loss: a non-converged step becomes the next step's initial state *and* its history buffers, so one
+silent failure contaminates everything after it, and the trajectory still comes back finite and
+entirely plausible. Measured on a 3-D Yeoh phase-field march whose undamped Newton overshot into an
+inverted element (`J = det F ≤ 0`, so `J**(-2/3)` is NaN, which is absorbing): with the grip *pinned*
+to 0.4 the returned displacement read 0.70, with no error raised.
+
+So the per-step residual is carried out of the scan and tested where it is concrete, against the
+driver's **own** `rtol`/`atol` — the net can only catch what the driver would have caught eagerly, and
+never second-guesses a solve configured loosely. Under `bounds` it scores the **min-map**, not the bare
+residual: on an active constraint that residual is non-zero by construction (it *is* the multiplier),
+and scoring against it would read a correct answer as a divergence. The check costs two residual
+evaluations per step — measured at **2.4%** (30.30 s → 31.03 s) of an 8-step, 576-DOF Yeoh march. It is
+a no-op under `jax.grad` of a runtime-parametric march, where the norms are themselves traced; there,
+as everywhere else in jNO, the solver's iteration cap is all there is.
+
+The error names the fixes in order of what usually works: globalize the per-step solve
+(`jno.solve.newton(line_search=True)` / `staggered(line_search=True)`, or `damping<1`), take smaller
+steps (a finer `domain(tau=(...))` grid, or the adaptive path below), or raise `max_steps`. In the Yeoh
+case above, `line_search=True` alone recovers the exact answer — and note P1 solves the same form
+undamped: a higher-order element's full Newton step produces larger gradients at its extra quadrature
+points, so P2 is the more exposed one.
 
 **Adaptive load stepping — `fem.solve(tau=jno.solve.adaptive(limit=...))`.** A uniform load grid is
 wrong in both directions at once: it wastes steps while nothing happens and takes too-large ones through
