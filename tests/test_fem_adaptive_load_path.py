@@ -272,3 +272,65 @@ def test_a_slack_limit_keeps_the_declared_grid_cost():
     fem = _burst_march(9, power=1.0, peak=0.01)
     fem.solve(tau=jno.solve.adaptive(limit=10.0))
     assert len(fem._tau_schedule) <= 10, f"a slack limit still took {len(fem._tau_schedule)} steps"
+
+
+def test_a_shrinking_step_does_not_make_acceptance_harder():
+    """The pilot's accept test must not tighten as the step shrinks.
+
+    It used to be a pure residual REDUCTION, ``r_after <= 1e-6 * r_before``. Shrinking a step leaves
+    the previous state closer to equilibrium at the new τ, so ``r_before`` falls with ``dtau`` and the
+    bar falls with it — every cut made acceptance strictly HARDER, so a step rejected once for any
+    reason spiralled to the floor and reported an "unstable branch" whatever the true cause was.
+    Observed on the 3-D SENT march: it died at τ=0 with the LIMIT satisfied (overshoot ×0).
+
+    Driving with a deliberately tiny `dt0` puts every step in exactly that regime — the previous state
+    is already nearly in equilibrium at the next τ — so this march is unsolvable under the old rule and
+    routine under the new one.
+    """
+    fem = _burst_march(6)
+    # dt0 tiny => the previous state is already nearly in equilibrium at the next τ on EVERY step, which
+    # is precisely the regime the old reduction test could not pass.
+    sol = np.asarray(fem.solve(tau=jno.solve.adaptive(limit=0.5, dt0=1e-6, max_steps=400)))
+    assert np.all(np.isfinite(sol))
+    ref = np.asarray(_burst_march(6).solve())
+    # Compare at τ = 1: the schedule ends exactly there, so that frame is a solved node rather than an
+    # interpolation onto the declared grid (interior frames carry resampling error bounded by `limit`,
+    # which this file documents elsewhere and which is not what this test is about).
+    assert np.abs(ref[-1]).max() > 1e-3, "the reference is trivial — the comparison would be vacuous"
+    assert np.abs(sol[-1] - ref[-1]).max() / np.abs(ref[-1]).max() < 1e-6, "the adaptive path moved the answer"
+    sched = np.asarray(fem.tau_schedule)
+    assert sched[0] == 0.0 and abs(sched[-1] - 1.0) < 1e-9, "the schedule must span the declared path"
+    assert len(sched) > 2, "the pilot never took a step"
+
+
+def test_the_pilot_scores_the_min_map_on_a_bounded_march():
+    """The pilot judged a trial step by ``op.residual``. Under ``field.bounds(lo, hi)`` that is the wrong
+    function: the driver root-finds the min-map, and on an ACTIVE bound the bare residual is non-zero by
+    construction (it is the multiplier), so it never falls however well the step solved. Every step then
+    looked unconverged — and since a rejection only shrinks the step, which cannot release a bound, the
+    pilot cut to its floor and reported an UNSTABLE BRANCH. Measured on the 3-D SENT march: it died at
+    τ=0 with the limit satisfied (overshoot ×0).
+
+    Here the bound is genuinely active (the source drives the field well past the cap), so the pilot
+    cannot finish at all unless it scores the right function.
+    """
+    grad, inner = _aliases()
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain(tau=(0.0, 1.0, 5))
+    d.tag("left", lambda x, y: x < 1e-9)
+    co, cl = d.variable("interior", split=True), d.variable("left", split=True)
+    X, tau = [co[0], co[1]], co[-1]
+    u, phi = d.fem_symbols()
+    s, _ = d.fem_symbols(value_shape=())
+    fem = jno.fem(
+        [
+            inner(grad(u, X), grad(phi, X), 1) + 10.0 * (u - 5.0 * tau) * phi + 0.0 * s.i(-1) * phi,
+            s.evolves(u),
+            u.bounds(0.0, 1.0),
+            u(*cl) - 0.0,
+        ]
+    )
+    traj = np.asarray(fem.solve(tau=jno.solve.adaptive(limit=0.25, max_steps=300)))
+    sched = np.asarray(fem.tau_schedule)
+    assert abs(sched[-1] - 1.0) < 1e-9, "the pilot never reached the end of the path"
+    assert traj.max() <= 1.0 + 1e-9, "the upper bound must hold"
+    assert traj.max() > 1.0 - 1e-6, "the bound must actually be ACTIVE, or this tests nothing"

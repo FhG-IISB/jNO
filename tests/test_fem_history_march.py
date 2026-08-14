@@ -846,3 +846,228 @@ def test_tau_dependent_dirichlet_off_the_march_fails_loud():
                 u(*ct) - 0.5 * ct[-1],
             ]
         )
+
+
+# --------------------------------------------------------------------------------------------------
+# The march runs its per-step Newton inside `lax.scan`, where the driver's own convergence check
+# self-disables (it needs a concrete residual). Without a check OUTSIDE the scan a diverged step is
+# carried forward as the next step's state AND history, so one silent failure contaminates the whole
+# remaining path — and the trajectory comes back finite and plausible.
+# --------------------------------------------------------------------------------------------------
+
+
+def _yeoh_march(*, order_u, line_search, n_steps=4, load=0.4):
+    """A 3-D Yeoh phase-field march. Undamped Newton on this form overshoots into an INVERTED element
+    (``J = det F <= 0``, so ``J**(-2/3)`` is NaN, which is absorbing) at P2 but not at P1 — the
+    higher-order element's full step produces larger gradients at its extra quadrature points."""
+    n = jno.np
+    sym, grad, trace, inner, sqrt, maximum, identity = _aliases()
+    det, einsum, diff = n.det, n.einsum, n.diff
+    c10, c20, c30, nu = 0.024, 1e-3, 8e-5, 0.49
+    kb = 2 * (2 * c10) * (1 + nu) / (3 * (1 - 2 * nu))
+    W = 4.0
+
+    d = jno.Shape.box(0, 0, 0, W, W, 0.4, size=W / 2).domain(tau=(0.0, 1.0, n_steps))
+    d.tag("bot", lambda x, y, z: y < 1e-9)
+    d.tag("top", lambda x, y, z: y > W - 1e-9)
+    d.tag("bk", lambda x, y, z: z < 1e-9)
+    co, cb, ct, cz = (d.variable(r, split=True) for r in ("interior", "bot", "top", "bk"))
+    X, I3 = [co[0], co[1], co[2]], identity(3)
+
+    u, phi = d.fem_symbols(value_shape=(3,), order=order_u)
+    dm, q = d.fem_symbols(order=1)
+    hs, _ = d.fem_symbols(order=1)
+
+    F = I3 + grad(u, X)
+    J = det(F)
+    i1b = J ** (-2 / 3) * trace(einsum("...ki,...kj->...ij", F, F))
+    psi = c10 * (i1b - 3) + c20 * (i1b - 3) ** 2 + c30 * (i1b - 3) ** 3
+    hist = maximum(psi, hs.i(-1))
+    P = diff(((1 - dm) ** 2 + 0.002) * psi + 0.5 * kb * (J - 1) ** 2, F)
+
+    fem = jno.fem(
+        [
+            inner(P, grad(phi, X), 2),
+            2.5 * dm * q + 0.4 * inner(grad(dm, X), grad(q, X), 1) - 2.0 * (1 - dm) * hist * q,
+            hs.evolves(hist),
+            dm.bounds(0.0, 1.0),
+            u(*cb)[0] - 0.0,
+            u(*cb)[1] - 0.0,
+            u(*ct)[0] - 0.0,
+            u(*ct)[1] - load * ct[-1],
+            u(*cz)[2] - 0.0,
+        ]
+    )
+    alt = jno.solve.staggered([u, dm], max_sweeps=40, rtol=1e-6, atol=1e-9, line_search=line_search)
+    return fem, u, alt, load
+
+
+@pytest.mark.slow
+def test_march_refuses_a_step_that_did_not_converge():
+    """The wrong-answer case: without globalization the P2 solve diverges, and the returned trajectory
+    is finite and plausible — it reported |u| = 0.70 against a grip PINNED to 0.40."""
+    fem, u, alt, load = _yeoh_march(order_u=2, line_search=False)
+    with pytest.raises(RuntimeError, match="load-path march did not converge"):
+        fem.solve(nonlinear=alt)
+
+
+@pytest.mark.slow
+def test_march_converges_once_the_step_solve_is_globalized():
+    """...and the same form with a line search reaches the grip exactly — so the guard above is
+    reporting a real failure, not refusing a solvable problem."""
+    fem, u, alt, load = _yeoh_march(order_u=2, line_search=True)
+    traj = np.asarray(fem.solve(nonlinear=alt))
+    got = np.abs(traj[..., fem.blocks[fem.block_index(u)]]).max()
+    assert abs(got - load) < 1e-6, f"the grip is pinned to {load}, got max|u| = {got}"
+
+
+@pytest.mark.slow
+def test_march_guard_passes_the_case_p1_already_solved():
+    """P1 solves this undamped — the guard must not turn a working march into a failure."""
+    fem, u, alt, load = _yeoh_march(order_u=1, line_search=False)
+    traj = np.asarray(fem.solve(nonlinear=alt))
+    got = np.abs(traj[..., fem.blocks[fem.block_index(u)]]).max()
+    assert abs(got - load) < 1e-6, f"the grip is pinned to {load}, got max|u| = {got}"
+
+
+def test_march_guard_scores_the_min_map_not_the_bare_residual():
+    """An ACTIVE box constraint leaves the bare residual non-zero by construction — that non-zero IS the
+    multiplier. Scoring a converged bounded march against ``op.residual`` would read a correct answer as
+    a divergence, so the guard must ask the bounds wrapper for the function it actually root-found.
+
+    Driven hard enough that the bound is genuinely active: without ``bounds`` the state would run past 1.
+    """
+    sym, grad, trace, inner, sqrt, maximum, identity = _aliases()
+    N = 4
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain(tau=(0.0, 1.0, N))
+    d.tag("left", lambda x, y: x < 1e-9)
+    co, cl = (d.variable(r, split=True) for r in ("interior", "left"))
+    X = [co[0], co[1]]
+    u, phi = d.fem_symbols()
+    s, _ = d.fem_symbols()
+
+    # A source ramped well past what the upper bound allows: u is pushed toward 5*tau but capped at 1.
+    fem = jno.fem(
+        [
+            inner(grad(u, X), grad(phi, X), 1) + 10.0 * (u - 5.0 * co[-1]) * phi + 0.0 * s.i(-1) * phi,
+            s.evolves(u),
+            u.bounds(0.0, 1.0),
+            u(*cl) - 0.0,
+        ]
+    )
+    traj = np.asarray(fem.solve())  # must NOT raise: the cap is the answer, not a failure
+    assert traj.shape[0] == N
+    assert traj.max() <= 1.0 + 1e-9, "the upper bound must hold"
+    assert traj.max() > 1.0 - 1e-6, "the bound must actually be ACTIVE, or this tests nothing"
+
+
+def test_march_guard_uses_the_drivers_own_tolerance():
+    """The net may only catch what the driver would have caught eagerly. A driver configured loosely
+    must not be second-guessed — its tolerance travels with the spec and through the bounds wrapper."""
+    from jno.utils.solver.solver_api import compose_nonlinear_solve_fn
+
+    spec = jno.solve.newton(rtol=1e-3, atol=1e-4)
+    assert (spec.traits["rtol"], spec.traits["atol"]) == (1e-3, 1e-4)
+    composed = compose_nonlinear_solve_fn(spec, None, None, fem=None)
+    assert composed.tolerances == (1e-3, 1e-4)
+
+    stag = jno.solve.staggered([object()], rtol=1e-5, atol=1e-6)
+    assert (stag.traits["rtol"], stag.traits["atol"]) == (1e-5, 1e-6)
+
+
+def test_direct_driver_reaches_the_march():
+    """The march runs its per-step solve through `solve_fn`, but never handed it an assembled tangent —
+    so `newton(direct=True)` / `staggered(direct=True)` silently fell back to the matrix-free inner
+    solve inside a `tau=` path. The answer must be unchanged, and the tangent must actually arrive."""
+    sym, grad, trace, inner, sqrt, maximum, identity = _aliases()
+    N = 4
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34).domain(tau=(0.0, 1.0, N))
+    d.tag("left", lambda x, y: x < 1e-9)
+    co, cl = (d.variable(r, split=True) for r in ("interior", "left"))
+    X = [co[0], co[1]]
+    u, phi = d.fem_symbols()
+    s, _ = d.fem_symbols()
+    fem = jno.fem(
+        [
+            inner(grad(u, X), grad(phi, X), 1) + 0.4 * u * u * phi - 3.0 * co[-1] * phi + 0.0 * s.i(-1) * phi,
+            s.evolves(u),
+            u(*cl) - 0.0,
+        ]
+    )
+    ref = np.asarray(fem.solve())
+    got = np.asarray(fem.solve(nonlinear=jno.solve.newton(direct=True)))
+    assert np.abs(ref).max() > 1e-3, "the march is trivial — the comparison would be vacuous"
+    assert np.abs(got - ref).max() / np.abs(ref).max() < 1e-7, "the direct march moved the answer"
+
+    # ...and the tangent genuinely arrives: a driver that DEMANDS one must not be handed None.
+    seen = {"jac": False}
+
+    def spy(residual_fn, u0, *, jacobian=None):
+        seen["jac"] = seen["jac"] or (jacobian is not None)
+        from jno.utils.solver.newton_krylov import newton_krylov
+
+        return newton_krylov(residual_fn, u0)
+
+    spy.wants_jacobian = True
+    from jno.utils.solver.history_march import run_history_march
+
+    run_history_march(fem, spy)
+    assert seen["jac"], "the march never threaded the assembled tangent to a wants_jacobian driver"
+
+
+def test_direct_staggered_marches_a_coupled_load_path():
+    """The combination this was built for: a coupled march whose displacement block is solved by a
+    factorization instead of unpreconditioned Krylov — including through the `bounds` min-map."""
+    sym, grad, trace, inner, sqrt, maximum, identity = _aliases()
+    N = 4
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34).domain(tau=(0.0, 1.0, N))
+    d.tag("left", lambda x, y: x < 1e-9)
+    co, cl = (d.variable(r, split=True) for r in ("interior", "left"))
+    X = [co[0], co[1]]
+    u, phi = d.fem_symbols()
+    dm, q = d.fem_symbols()
+    hs, _ = d.fem_symbols()
+    psi = 0.5 * inner(grad(u, X), grad(u, X), 1)
+    hist = maximum(psi, hs.i(-1))
+    fem = jno.fem(
+        [
+            ((1.0 - dm) ** 2 + 1e-4) * inner(grad(u, X), grad(phi, X), 1) - 2.0 * co[-1] * phi,
+            2.5 * dm * q + 0.4 * inner(grad(dm, X), grad(q, X), 1) - 2.0 * (1.0 - dm) * hist * q,
+            hs.evolves(hist),
+            dm.bounds(0.0, 1.0),
+            u(*cl) - 0.0,
+        ]
+    )
+    kw = dict(max_sweeps=400, rtol=1e-7, atol=1e-9)
+    mf = np.asarray(fem.solve(nonlinear=jno.solve.staggered([u, dm], **kw)))
+    dr = np.asarray(fem.solve(nonlinear=jno.solve.staggered([u, dm], direct=True, **kw)))
+    bd = fem.block_index(dm)
+    assert np.abs(mf).max() > 1e-3
+    assert mf[..., fem.blocks[bd]].max() > 1e-2, "no damage — the coupling did nothing"
+    assert dr[..., fem.blocks[bd]].max() <= 1.0 + 1e-9, "the bound must hold on the direct route too"
+    assert np.abs(dr - mf).max() / np.abs(mf).max() < 1e-6, "direct and matrix-free marches disagree"
+
+
+def test_adapt_on_a_march_fails_loud():
+    """`adapt=` is dispatched before the march, so it used to return a single STEADY solve — shape
+    (n_dofs,) where the caller asked for (n_steps, n_dofs) — and drop a `tau=` alongside it in silence.
+    Remeshing cannot compose with the march because the per-quadrature-point state would have to be
+    transferred onto each new mesh; that is wired for the transient stepper, not for `tau=`."""
+    sym, grad, trace, inner, sqrt, maximum, identity = _aliases()
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain(tau=(0.0, 1.0, 4))
+    d.tag("left", lambda x, y: x < 1e-9)
+    co, cl = d.variable("interior", split=True), d.variable("left", split=True)
+    X = [co[0], co[1]]
+    u, phi = d.fem_symbols()
+    s, _ = d.fem_symbols()
+    fem = jno.fem(
+        [
+            inner(grad(u, X), grad(phi, X), 1) + 0.4 * u * u * phi - 3.0 * co[-1] * phi + 0.0 * s.i(-1) * phi,
+            s.evolves(u),
+            u(*cl) - 0.0,
+        ]
+    )
+    assert np.asarray(fem.solve()).shape[0] == 4, "the plain march must return one frame per load step"
+    for kw in ({}, {"tau": jno.solve.adaptive(limit=0.5)}):
+        with pytest.raises(NotImplementedError, match="LOAD-PATH march"):
+            fem.solve(adapt=jno.solve.remesh(max_iters=1), **kw)

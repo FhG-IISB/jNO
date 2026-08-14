@@ -72,12 +72,28 @@ def run_history_march(fem, solve_fn=None, path=None, **kwargs):
             )
         path_frames[_fid] = _fr
 
-    def _newton(res, u_prev):
+    def _newton(res, u_prev, jac=None):
         if solve_fn is not None:
+            # A sparse-direct driver (``newton(direct=True)`` / ``staggered(direct=True)``) flags
+            # ``wants_jacobian`` and factorizes the ASSEMBLED tangent; hand it this step's. Every other
+            # driver stays matrix-free. Mirrors the steady path in ``FemResidualOperator.solve``, which
+            # already did this — the march did not, so a direct slot silently fell back to Krylov.
+            if jac is not None and getattr(solve_fn, "wants_jacobian", False):
+                return jnp.asarray(solve_fn(res, u_prev, jacobian=jac)).reshape(-1)
             return jnp.asarray(solve_fn(res, u_prev)).reshape(-1)
         from .newton_krylov import newton_krylov
 
         return newton_krylov(res, u_prev)
+
+    def _root_of(res, u_prev):
+        """``(root_fn, start)`` — the function ``_newton`` above actually drives to zero, and from where.
+
+        Usually just ``(res, u_prev)``. A box-constrained form (``field.bounds(lo, hi)``) is different:
+        its driver root-finds the **min-map** ``Phi``, not ``res``, and on an active bound ``res`` is
+        non-zero *by construction*. Asking the wrapper for its own root function is what lets the
+        convergence check below score the step against the right thing."""
+        prep = getattr(solve_fn, "prepare_residual", None)
+        return prep(res, u_prev) if prep is not None else (res, u_prev)
 
     def _roll(buf, nv):
         """Push the just-computed state ``nv`` (n_cell, n_quad, *shape) into slot 0 — the next step's
@@ -94,7 +110,8 @@ def run_history_march(fem, solve_fn=None, path=None, **kwargs):
         # Equilibrium at this load level, previous state frozen on the buffers. τ enters the load
         # through the residual's temporal coordinate (and the load-path field slices its frames); jacfwd
         # sees the buffers (volume AND surface) and the path slice as constants → the consistent tangent.
-        u = _newton(lambda u: op.residual(u, args, tau_k), u_prev)
+        _jac = (lambda u: op.jacobian(u, args, tau_k)) if getattr(op, "jacobian", None) is not None else None
+        u = _newton(lambda u: op.residual(u, args, tau_k), u_prev, _jac)
         # Advance every buffered state: volume states via their `.evolves` formula / a primary-unknown
         # history; surface states (a friction slip) via the surface readout on the region's faces.
         new_states = readout(u, tau_k, args)
@@ -120,9 +137,19 @@ def run_history_march(fem, solve_fn=None, path=None, **kwargs):
             tau_k, path_k = xs  # this step's τ and its per-load-step field slices ({fid: (n_nodes,)})
             u_prev, buffers, sbuffers = carry
             u, new_buffers, new_sbuffers = _step_once(u_prev, buffers, sbuffers, tau_k, path_k, param_args)
-            return (u, new_buffers, new_sbuffers), u
+            # The per-step solver's OWN convergence check is a no-op in here (it needs a concrete
+            # residual, and everything under the scan is a tracer), so carry the numbers it would have
+            # tested back out — see `_check_march_converged`. Costs two residual evaluations per step
+            # against a whole Newton solve: measured at 2.4% (30.30 s -> 31.03 s, median of 3) on an
+            # 8-step, 576-DOF Yeoh phase-field march.
+            args = {"__history__": buffers, "__surface_history__": sbuffers, "__loadpath__": path_k, **param_args}
+            root_fn, u_ref = _root_of(lambda uu: op.residual(uu, args, tau_k), u_prev)
+            r_end = jnp.linalg.norm(jnp.asarray(root_fn(u)))
+            r_start = jnp.linalg.norm(jnp.asarray(root_fn(u_ref)))
+            return (u, new_buffers, new_sbuffers), (u, r_end, r_start)
 
-        _final, traj = lax.scan(step, (u0, buffers0, sbuffers0), (_grid, _frames))
+        _final, (traj, r_end, r_start) = lax.scan(step, (u0, buffers0, sbuffers0), (_grid, _frames))
+        _check_march_converged(r_end, r_start, _grid, solve_fn)
         return traj  # (n_steps, n_dofs)
 
     # ---- ADAPTIVE load stepping (`fem.solve(tau=jno.solve.adaptive(limit=...))`) --------------------
@@ -172,7 +199,7 @@ def run_history_march(fem, solve_fn=None, path=None, **kwargs):
 
         def _run_adaptive(param_args, replay=True):
             schedule, states = _pilot_schedule(
-                path, limits, tau_pts, u0, buffers0, sbuffers0, _step_once, param_args, dtype, op
+                path, limits, tau_pts, u0, buffers0, sbuffers0, _step_once, param_args, dtype, op, solve_fn, _root_of
             )
             fem._tau_schedule = np.asarray(schedule)  # observability: what the pilot actually chose
             src = jnp.asarray(schedule, dtype=dtype)
@@ -286,13 +313,60 @@ def _resolve_limits(limit, fem, n_dofs):
     return out
 
 
-#: Residual norm (relative to the state's magnitude) below which a piloted step counts as converged.
-#: Loose on purpose: this decides ACCEPT vs CUT, not the answer -- the accepted step's own solve already
-#: ran to the driver's tolerance, and the replay re-solves it anyway.
-_RESID_TOL = 1e-6
+#: (Retired.) The pilot used to accept a step on a pure residual REDUCTION, ``r_after <= 1e-6*r_before``.
+#: That test tightens as the step shrinks -- see ``_accept_bound`` -- so acceptance now uses the driver's
+#: own ``atol + rtol*r``, which the pilot reads off ``solve_fn.tolerances``.
+
+#: Fallback tolerances when the composed ``solve_fn`` does not advertise its own (a caller-supplied
+#: driver that is not a ``jno.solve`` spec). Matches the ``newton_krylov``/``newton_direct`` defaults.
+_MARCH_FALLBACK_TOL = (1e-8, 1e-8)
 
 
-def _pilot_schedule(path, limits, tau_pts, u0, buffers0, sbuffers0, step_once, param_args, dtype, op=None):
+def _check_march_converged(r_end, r_start, grid, solve_fn=None):
+    """Raise if any load step of the ``lax.scan`` march returned a non-root.
+
+    The per-step driver already knows how to refuse a stalled solve — ``newton_krylov``'s
+    ``_convergence_check`` does exactly that — but it needs a *concrete* residual, so it disables itself
+    under a trace. Every step of this march runs inside ``lax.scan``, which is precisely where it cannot
+    fire, and a load path is the worst place to lose the signal: one non-converged step is carried
+    forward as the next step's initial state and its history buffers, so a single silent failure
+    contaminates the whole remaining path. Measured on a Yeoh phase-field march whose undamped Newton
+    overshot into an inverted element: the trajectory came back finite, plausible, and wrong — with a
+    grip pinned to 0.4 the displacement reported 0.70.
+
+    So the numbers the check needs are carried OUT of the scan and tested here, where they are concrete.
+    Same tolerance the driver itself used (forwarded on ``solve_fn.tolerances``), so this net can only
+    catch what the driver would have caught eagerly — it never second-guesses a solve the user
+    configured loosely.
+
+    No-op on tracers: under ``jax.grad`` of a runtime-parametric march the norms are themselves traced,
+    and the same trade applies as everywhere else in jNO — under a transform the solver's iteration cap
+    is all there is.
+    """
+    if any(isinstance(v, jax.core.Tracer) for v in (r_end, r_start)):
+        return
+    rtol, atol = getattr(solve_fn, "tolerances", None) or _MARCH_FALLBACK_TOL
+    r_end = np.asarray(r_end, dtype=float)
+    bound = atol + rtol * np.asarray(r_start, dtype=float)
+    bad = ~np.isfinite(r_end) | (r_end > bound)
+    if not bad.any():
+        return
+    k = int(np.argmax(bad))
+    tau_k = float(np.asarray(grid)[k]) if np.asarray(grid).size > k else float("nan")
+    raise RuntimeError(
+        f"fem.solve: the load-path march did not converge at step {k} of {int(r_end.size)} (τ={tau_k:.6g}): "
+        f"residual norm {r_end[k]:.3e} against the tolerance atol + rtol*||r(u_prev)|| = {bound[k]:.3e} "
+        f"(atol={atol:g}, rtol={rtol:g}). That step is NOT an equilibrium, and every later step inherited "
+        "it as its starting state and history — the whole trajectory past this point is unreliable. "
+        "Globalize the per-step solve (jno.solve.newton(line_search=True) / staggered(line_search=True), "
+        "or damping<1), take smaller load steps (a finer domain(tau=(...)) grid, or "
+        "tau=jno.solve.adaptive(limit=...)), or raise the driver's max_steps."
+    )
+
+
+def _pilot_schedule(
+    path, limits, tau_pts, u0, buffers0, sbuffers0, step_once, param_args, dtype, op=None, solve_fn=None, root_of=None
+):
     """March EAGERLY with rejection; return ``(schedule, states)`` — the accepted τ values and the
     solution at each of them.
 
@@ -317,20 +391,50 @@ def _pilot_schedule(path, limits, tau_pts, u0, buffers0, sbuffers0, step_once, p
     import jax as _jax
 
     def _attempt(u_prev, bufs, sbufs, tau_k, pargs):
-        """One step plus the numbers the acceptance test needs — all inside one compiled program."""
+        """One step plus the numbers the acceptance test needs — all inside one compiled program.
+
+        Both norms are for the SAME equation (the step's own, with the pre-roll buffers), one at the
+        incoming iterate and one at the solved state, so the caller can judge the step by both a
+        reduction and the driver's absolute floor -- see ``_accept_bound``.
+
+        It must be the function the driver actually ROOT-FINDS, not ``op.residual``. Under
+        ``field.bounds(lo, hi)`` those differ: the driver solves the min-map, and on an active bound the
+        bare residual is non-zero *by construction* (it is the constraint multiplier), so it never falls
+        however well the step solved. Scoring against it made every step of a bounded march look
+        unconverged, and since a rejection only shrinks the step -- which cannot release a bound -- the
+        pilot cut to its floor and blamed an unstable branch. Measured on the 3-D SENT march, which
+        died at τ=0 with the limit satisfied (overshoot ×0)."""
+        args = {"__history__": bufs, "__surface_history__": sbufs, "__loadpath__": {}, **pargs}
+        _res = lambda uu: op.residual(uu, args, tau_k)  # noqa: E731
+        root_fn, u_ref = root_of(_res, u_prev)
+        r_before = jnp.linalg.norm(jnp.asarray(root_fn(u_ref)))
         u, nb, nsb = step_once(u_prev, bufs, sbufs, tau_k, {}, pargs)
-        rn = jnp.linalg.norm(
-            jnp.asarray(
-                op.residual(u, {"__history__": bufs, "__surface_history__": sbufs, "__loadpath__": {}, **pargs}, tau_k)
-            )
-        )
-        return u, nb, nsb, rn
+        r_after = jnp.linalg.norm(jnp.asarray(root_fn(u)))
+        return u, nb, nsb, r_before, r_after
 
     _attempt_c = _jax.jit(_attempt) if op is not None else _attempt
     dtau = float(path.dt0) if path.dt0 is not None else span / max(1, len(tau_pts) - 1)
     dtau_min = span * 1e-8
     shrink, grow = float(path.shrink), float(path.grow)
     max_steps = int(path.max_steps)
+
+    _rtol_a, _atol_a = getattr(solve_fn, "tolerances", None) or _MARCH_FALLBACK_TOL
+    root_of = root_of if root_of is not None else (lambda res, up: (res, up))
+
+    def _accept_bound(r_before):
+        """How small ``||r_after||`` must be for a trial step to count as solved.
+
+        It needs the ABSOLUTE term, and that is the whole subtlety. A pure reduction test
+        (``r_after <= tol * r_before``) is self-defeating here: shrinking the step leaves the previous
+        state closer to equilibrium at the new τ, so ``r_before`` falls with ``dtau`` and the bar drops
+        with it. Every cut then makes acceptance strictly HARDER, and a step rejected once spirals to
+        the floor and reports an unstable branch whatever the real cause was — observed on the SENT
+        march, which died at τ=0 with the limit satisfied (overshoot ×0) purely on this test.
+
+        So it is the same ``atol + rtol*r`` the driver itself uses, at the driver's own tolerances: this
+        gate can then only accept what the driver would call converged, and it cannot ask for a residual
+        smaller than the solve was ever going to deliver."""
+        return _atol_a + _rtol_a * max(r_before, 0.0)
 
     def _changed_too_much(u_new, u_old):
         """The largest per-limit overshoot ratio (<= 1 means every field is inside its bound)."""
@@ -344,7 +448,7 @@ def _pilot_schedule(path, limits, tau_pts, u0, buffers0, sbuffers0, step_once, p
     # The first point of the declared grid is a solved step in the fixed march too (the virgin state at
     # the starting load), so the schedule starts there and no acceptance test applies to it.
     u, bufs, sbufs = u0, buffers0, sbuffers0
-    u, bufs, sbufs, _r0 = _attempt_c(u, bufs, sbufs, jnp.asarray(lo, dtype), param_args)
+    u, bufs, sbufs, _rb0, _ra0 = _attempt_c(u, bufs, sbufs, jnp.asarray(lo, dtype), param_args)
     schedule, states = [lo], [u]
     tau = lo
     attempts = 0
@@ -358,13 +462,14 @@ def _pilot_schedule(path, limits, tau_pts, u0, buffers0, sbuffers0, step_once, p
         dt = min(dtau, hi - tau)
         trial = tau + dt
         try:
-            u_try, bufs_try, sbufs_try, rnorm = _attempt_c(u, bufs, sbufs, jnp.asarray(trial, dtype), param_args)
+            u_try, bufs_try, sbufs_try, r_before, r_after = _attempt_c(
+                u, bufs, sbufs, jnp.asarray(trial, dtype), param_args
+            )
             ratio = _changed_too_much(u_try, u)
             # The compiled step cannot raise on non-convergence (the guard needs a concrete value and
-            # there is none under a trace), so it hands the residual norm back and the test happens here.
-            converged = bool(np.all(np.isfinite(np.asarray(u_try)))) and float(rnorm) < _RESID_TOL * max(
-                1.0, float(np.abs(np.asarray(u_try)).max())
-            )
+            # there is none under a trace), so the two residual norms come back and the test happens
+            # here — as a REDUCTION, which is the only scale-free way to ask it.
+            converged = bool(np.all(np.isfinite(np.asarray(u_try)))) and float(r_after) <= _accept_bound(float(r_before))
         except RuntimeError:  # a driver that still raises eagerly (a non-compiled solve_fn) -- same signal
             ratio, converged = np.inf, False
         if converged and ratio <= 1.0:
