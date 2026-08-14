@@ -502,3 +502,62 @@ class TestCrossMeshTransfer:
         fine = jno.Shape.rect(0, 0, 60, 30, size=2.0).domain()
         with pytest.raises(ValueError, match="entries but this mesh has"):
             coarse.transfer_cell_field(np.ones(3), fine)
+
+
+class TestFacetTractionTotal:
+    """A traction band must apply the resultant it was asked for, at every mesh size.
+
+    This is a regression test for a defect that produced two wrong results before it was found. A
+    boundary term integrates over FACETS, and a facet is selected only when all of its nodes satisfy
+    the region predicate. Selecting a band of width ``span`` with a strict ``y < span`` therefore
+    drops the facet whose upper node sits exactly at ``y == span``, and the applied resultant
+    silently becomes ``(span - h) / span`` instead of 1 -- zero on a mesh with ``h == span``.
+
+    Nothing raises, nothing looks wrong, and compliance depends on the load QUADRATICALLY, so the
+    error is 4x at ``h = span / 2``. Measured on a 60x30 domain with ``span = 2``: the resultant
+    came out 0.000 / -0.500 / -0.750 / -0.875 at ``h = 2 / 1 / 0.5 / 0.25``.
+    """
+
+    @staticmethod
+    def _resultant(size, pad, span=2.0, L=60.0, H=30.0):
+        tol = 1e-6 * L
+        d = jno.Shape.rect(0, 0, L, H, size=size).domain()
+        u, phi = d.fem_symbols(value_shape=(2,))
+        _r, s = d.fem_symbols(space="P0", names=("r", "s"))
+        xi, yi, _ = d.variable("interior", split=True)
+        xl, yl, _ = d.variable("left", split=True)
+        xt, yt, _ = d.variable(
+            "tip", where=lambda x, y: (x > L - tol) & (y < span + pad), split=True)
+        rho = jno.np.parameter(s, name="rho_traction")
+        rho.dtype(jnp.float64)
+        eu, ep = jno.np.symgrad(u, [xi, yi]), jno.np.symgrad(phi, [xi, yi])
+        fem = jno.fem(
+            [
+                (EMIN + rho**PENAL * (E0 - EMIN))
+                * (LAM * jno.np.trace(eu) * jno.np.trace(ep)
+                   + 2 * MU * jno.np.inner(eu, ep, n_contract=2)),
+                u(xl, yl) - (0.0, 0.0),
+                -1.0 * jno.np.inner(jnp.array([0.0, -1.0 / span]),
+                                    phi.bind(x=xt, y=yt), n_contract=1),
+            ],
+            quad_degree=2,
+        )
+        n_cells = np.asarray(d._cells_p1()).shape[0]
+        _a, b = fem.operator.evaluate({"rho_traction": jnp.full(n_cells, VOLFRAC)})
+        return float(np.asarray(jnp.asarray(b).reshape(-1, 2))[:, 1].sum())
+
+    @pytest.mark.parametrize("size", [2.0, 1.0])
+    def test_padded_predicate_applies_the_full_resultant(self, size):
+        """The inclusive band integrates to exactly -1 regardless of the mesh."""
+        got = self._resultant(size, pad=1e-6 * 60.0)
+        assert got == pytest.approx(-1.0, abs=1e-9), (
+            f"h={size}: traction band integrated to {got:.6f}, not -1"
+        )
+
+    def test_strict_predicate_loses_load_and_is_mesh_dependent(self):
+        """Pins WHY the tolerance is needed: without it the load depends on the discretisation."""
+        coarse, fine = self._resultant(2.0, pad=0.0), self._resultant(1.0, pad=0.0)
+        assert coarse == pytest.approx(0.0, abs=1e-9), (
+            f"h == span should lose the only facet, got {coarse:.6f}"
+        )
+        assert fine == pytest.approx(-0.5, abs=1e-9), f"expected (span-h)/span, got {fine:.6f}"
