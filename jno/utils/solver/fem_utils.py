@@ -599,8 +599,29 @@ def _cell_region_mask(domain, region):
     elif region in preds:
         m = np.asarray(preds[region](*[centroids[:, i] for i in range(dim)]))
     elif region in shape_regions:
-        # A Shape.regions sub-region: analytic CSG membership of the cell centroid (2-D and 3-D).
-        m = np.asarray(shape_regions[region].contains(centroids))
+        # A Shape.regions sub-region: analytic CSG membership of the cell centroid (2-D and 3-D),
+        # MINUS every higher-priority region, because Shape.regions lets regions overlap and resolves
+        # them by declaration order -- a cell belongs to the FIRST region containing it, which is how
+        # the mesh itself is labelled (`emit._to_meshio`).
+        #
+        # Without the subtraction these masks are not a partition, and `domain.by_region` (a sum of
+        # RegionMask * value) silently double counts. The failure is quiet and physical rather than an
+        # error: an enclosing background region -- e.g. a bounding rect declared last to pick up the
+        # leftover void -- contains EVERY cell, so its coefficient is added to every other region's.
+        # Measured on the furnace: the graphite-felt insulation ran at k = 0.5 + 0.186 instead of 0.5,
+        # a 37% leak that pulled the whole crystal region 780 K cold.
+        names = list(shape_regions)
+        m = np.asarray(shape_regions[region].contains(centroids), dtype=bool)
+        for earlier in names[: names.index(region)]:
+            try:
+                m &= ~np.asarray(shape_regions[earlier].contains(centroids), dtype=bool)
+            except NotImplementedError as exc:
+                raise NotImplementedError(
+                    f"jno.fem per-region integration: region {region!r} is declared after {earlier!r}, "
+                    f"so resolving it needs to exclude {earlier!r}'s cells -- but {earlier!r} has no "
+                    f"closed-form point membership. Declare it first, or give it a CSG-representable "
+                    f"shape."
+                ) from exc
     else:
         raise ValueError(
             f"jno.fem per-region integration: unknown region {region!r}. Define it with "
@@ -3193,6 +3214,21 @@ def bcoo_zero_rows_cols(A, dofs):
     isd = jnp.zeros(A.shape[0], A.data.dtype).at[dofs].set(1.0)
     keep = (1.0 - isd[A.indices[:, 0]]) * (1.0 - isd[A.indices[:, 1]])
     return jsparse.BCOO((A.data * keep, A.indices), shape=A.shape)
+
+
+def bcoo_identity_rows(A, mask):
+    """Replace the rows of a BCOO ``A`` selected by a **traced boolean mask** with identity rows.
+
+    The index-array helpers above cannot serve here: a min-map's active set is a function of the current
+    iterate, so it is a traced mask of static length, not a list of DOF numbers. Same two moves — scale
+    the stored entries by the row's keep factor, then append a full diagonal carrying the mask as its
+    value (0 on an inactive row, so those appended entries are exact no-ops and duplicate indices sum)."""
+    m = jnp.asarray(mask).astype(A.data.dtype)
+    n = A.shape[0]
+    data = A.data * (1.0 - m[A.indices[:, 0]])
+    diag = jnp.arange(n, dtype=A.indices.dtype)
+    eye_idx = jnp.stack([diag, diag], axis=1)
+    return jsparse.BCOO((jnp.concatenate([data, m]), jnp.concatenate([A.indices, eye_idx])), shape=A.shape)
 
 
 def bcoo_set_unit_diag(A, dofs):
