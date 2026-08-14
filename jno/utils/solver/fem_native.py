@@ -2695,6 +2695,8 @@ def assemble_fem_native(
 
                 def jac_p(u, args=None, t=0.0, _d=_npd):
                     return bcoo_eliminate_dirichlet(jacobian(_np_project(u, args), t, args), _d)
+
+                _constrained = _npd  # the dof set is static here; only the HELD VALUES ride the weights
             elif _tv_dirichlet:
                 # A τ-DEPENDENT essential value on the load path -- `u(top)[1] - delta*tau`, i.e.
                 # DISPLACEMENT CONTROL, which is how a softening test is driven at all (under load
@@ -2728,6 +2730,8 @@ def assemble_fem_native(
 
                 def jac_p(u, args=None, t=0.0, _d=_all_d):
                     return bcoo_eliminate_dirichlet(jacobian(_tv_project(u, t), t, args), _d)
+
+                _constrained = _all_d
             else:
 
                 def _s_project(u, _d=s_d_dofs, _g=s_d_vals):
@@ -2743,7 +2747,14 @@ def assemble_fem_native(
                     J = jacobian(_s_project(u), t, args)
                     return J if _d is None else bcoo_eliminate_dirichlet(J, _d)
 
+                _constrained = s_d_dofs
+
             _op = FemResidualOperator(res_p, jac_p, total, runtime_parameter_exprs=dict(_param_and_neural_exprs))
+            # Which DOFs carry an ESSENTIAL condition rather than an equation. A solver that extrapolates
+            # (``staggered(over_relax>1)``) must leave these alone: the sub-solve already puts them exactly
+            # on the prescribed value, and stepping past it makes the constraint oscillate as (1-omega)^k
+            # while every other field is solved against the wrong boundary value.
+            _op.dirichlet_dofs = _constrained
             _op.history_specs = history_specs  # VOLUME step-history buffer layout for the load-step driver
             _op.surface_history_specs = surface_history_specs  # SURFACE (per-face) step-history layout
             _op.history_roles = history_roles  # {key: "primary" | "internal"} — how each state advances

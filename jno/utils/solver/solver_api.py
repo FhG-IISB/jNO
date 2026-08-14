@@ -324,8 +324,9 @@ class NonlinearSolver:
         self.direct = direct
         self.traits = {"vmap": "native", "jit": True, **(traits or {})}
 
-    def __call__(self, residual_fn, u0, *, linear_solve=None, jacobian=None):
-        return self._fn(residual_fn, u0, linear_solve=linear_solve, jacobian=jacobian)
+    def __call__(self, residual_fn, u0, *, linear_solve=None, jacobian=None, project=None):
+        kw = {"project": project} if project is not None else {}
+        return self._fn(residual_fn, u0, linear_solve=linear_solve, jacobian=jacobian, **kw)
 
     def __repr__(self):
         return f"jno.solve.{self.name}()"
@@ -808,12 +809,21 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
             M = materialize_precond(precond, PrecondContext(op, fem)) if precond is not None else None
             return solver(op, rhs, M=M)
 
-    def _composed(residual_fn, u0, *, jacobian=None):
-        return nonlinear(residual_fn, u0, linear_solve=inner, jacobian=jacobian)
+    def _composed(residual_fn, u0, *, jacobian=None, project=None):
+        return nonlinear(residual_fn, u0, linear_solve=inner, jacobian=jacobian, project=project)
 
     # A direct (assembled-Jacobian) Newton needs the step Jacobian threaded in; flag it so the caller
     # (SemidiscreteTimeBlock.step) builds ``M/dt + jacobian`` and passes it via ``jacobian=``.
     _composed.wants_jacobian = bool(getattr(nonlinear, "direct", False))
+    # An over-relaxed driver steps past its sub-solve's answer and needs the box projector to stay
+    # feasible; the `bounds` wrapper is the only thing that owns one.
+    _composed.wants_project = bool(getattr(nonlinear, "wants_project", False))
+    # The driver's own convergence tolerances, forwarded so a caller that runs it inside a trace (the
+    # load-path march's ``lax.scan``, where the driver's eager check self-disables) can re-check the
+    # result outside the trace against the tolerance the user actually configured.
+    _traits = getattr(nonlinear, "traits", None) or {}
+    if "rtol" in _traits and "atol" in _traits:
+        _composed.tolerances = (float(_traits["rtol"]), float(_traits["atol"]))
     return _composed
 
 

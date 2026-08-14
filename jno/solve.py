@@ -439,7 +439,10 @@ def _root_driver(
             ls_c=ls_c,
         )
 
-    return NonlinearSolver(_fn, name=name, direct=direct)
+    # The tolerances travel WITH the spec, not just inside the closure: a driver run under `lax.scan`
+    # (the load-path march) cannot raise on non-convergence from inside the trace, so the caller
+    # re-checks outside it — and it must judge against the tolerance the user actually asked for.
+    return NonlinearSolver(_fn, name=name, direct=direct, traits={"rtol": rtol, "atol": atol})
 
 
 def newton(
@@ -537,10 +540,12 @@ def staggered(
     inner_steps: int = 20,
     inner_tol: float = 1e-10,
     inner_maxit: int = 2000,
-    line_search: bool = False,
+    line_search="backtrack",
     damping: float = 1.0,
     ls_max: int = 25,
     ls_c: float = 1e-4,
+    direct: bool = False,
+    over_relax: float = 1.0,
 ) -> NonlinearSolver:
     """**Alternate minimization** — solve a coupled system one field at a time, sweeping until the full
     residual converges. ``fields`` is the trial symbols in the order to sweep them::
@@ -570,12 +575,25 @@ def staggered(
     Differentiable in the ordinary way: at convergence the full residual is zero, so the sweep is just a
     way of *finding* that root, and ``lax.custom_root`` supplies the gradient from the full Jacobian.
 
+    **``direct=True`` factorizes each field's assembled diagonal block** instead of solving it
+    matrix-free, and pairs with a ``linear=`` slot::
+
+        fem.solve(nonlinear=jno.solve.staggered([u, dm], direct=True), linear=jno.solve.lu(backend="pardiso"))
+
+    Reach for it when a *sub-block* is ill-conditioned — near-incompressible elasticity (ν → 0.5) is the
+    common one. The matrix-free default cannot help there: a ``precond=`` spec materializes against an
+    assembled operator, and a sub-solve is a restriction *closure* with none, so the block is solved by
+    **unpreconditioned** BiCGStab. The trade is that the full tangent is assembled to use one block of
+    it; a sparsity-caching backend (``pardiso``/``cudss``) then pays only the numeric re-factorization
+    per sweep. On a well-conditioned problem the matrix-free default is cheaper — this is not a
+    free upgrade, and it is not the default.
+
     Scope: composes through ``fem.solve(nonlinear=...)`` on a multifield problem, which is where the
     block layout comes from; it has no meaning on a single field and says so. Each field is solved on
     its own — solving a GROUP of fields together (a Stokes velocity/pressure pair inside one sweep) is
     not wired.
     """
-    resolved: dict = {"blocks": None, "names": None}
+    resolved: dict = {"blocks": None, "names": None, "constrained": None}
 
     def _prepare(fem):
         blocks = getattr(fem, "blocks", None)
@@ -597,8 +615,25 @@ def staggered(
             )
         resolved["blocks"] = [_np.arange(int(blocks[i].start), int(blocks[i].stop), dtype=_np.int32) for i in idxs]
         resolved["names"] = idxs
+        # Essential-condition dofs, so over-relaxation can leave them alone (see staggered_newton).
+        _dd = getattr(getattr(fem, "_op", None), "dirichlet_dofs", None)
+        resolved["constrained"] = None if _dd is None else _np.asarray(_dd, dtype=_np.int64)
 
-    def _fn(residual_fn, u0, *, linear_solve=None, jacobian=None):
+    if line_search not in (True, False, "backtrack"):
+        raise ValueError(
+            f"jno.solve.staggered: line_search={line_search!r} is not a known choice. True (the default) "
+            "is the EXACT line search — bisection for the minimizer of the energy along the Newton "
+            'direction; "backtrack" is the older residual-norm Armijo; False takes the fixed `damping`.'
+        )
+    if not (0.0 < float(over_relax) < 2.0):
+        raise ValueError(
+            f"jno.solve.staggered: over_relax must lie in (0, 2), got {over_relax}. Kahan's condition — "
+            "outside that range the over-relaxed Gauss-Seidel iteration is not guaranteed to converge "
+            "(Farrell & Maurini, IJNME 109 (2017), section 2.1). over_relax=1 is plain alternate "
+            "minimization."
+        )
+
+    def _fn(residual_fn, u0, *, linear_solve=None, jacobian=None, project=None, constrained=None):
         if resolved["blocks"] is None:
             raise ValueError(
                 "jno.solve.staggered needs the problem's block layout, which only `fem.solve(...)` can "
@@ -607,6 +642,14 @@ def staggered(
             )
         from .utils.solver.newton_krylov import staggered_newton
 
+        if direct and jacobian is None:
+            raise ValueError(
+                "jno.solve.staggered(direct=True) factorizes each field's ASSEMBLED diagonal block, and "
+                "nothing supplied the tangent. It composes where the assembler provides one — a native "
+                "nonlinear FEM problem, steady or on a `tau=` load-path march — reached via "
+                "fem.solve(nonlinear=jno.solve.staggered([...], direct=True)). On a matrix-free-only "
+                "problem drop direct= (the sub-solves are then unpreconditioned Krylov)."
+            )
         return staggered_newton(
             residual_fn,
             u0,
@@ -618,13 +661,22 @@ def staggered(
             inner_tol=inner_tol,
             inner_maxit=inner_maxit,
             linear_solve=linear_solve,
+            jacobian=jacobian if direct else None,
+            over_relax=float(over_relax),
+            project=project,
+            constrained=constrained if constrained is not None else resolved["constrained"],
             damping=damping,
             line_search=line_search,
             ls_max=ls_max,
             ls_c=ls_c,
         )
 
-    spec = NonlinearSolver(_fn, name="staggered", traits={"vmap": "native", "jit": True})
+    spec = NonlinearSolver(
+        _fn, name="staggered", direct=direct, traits={"vmap": "native", "jit": True, "rtol": rtol, "atol": atol}
+    )
+    # Over-relaxation steps PAST the sub-solve's answer, so a box-constrained field needs the projector
+    # the `bounds` wrapper owns; ask for it only when it is actually needed.
+    spec.wants_project = float(over_relax) != 1.0
     spec.prepare = _prepare  # eager block resolution at compose time (mirrors a precond spec's .prepare)
     return spec
 

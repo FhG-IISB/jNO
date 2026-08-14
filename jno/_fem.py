@@ -1613,6 +1613,19 @@ class FEM:
 
             return run_mesh_motion(self, solve_fn=solve_fn, **kwargs)
         if adapt is not None:
+            # A load-path march is dispatched BELOW this branch, so an `adapt=` on a form carrying step
+            # history used to return here with a single STEADY solve -- shape (n_dofs,) where the caller
+            # asked for a (n_steps, n_dofs) trajectory -- and a `tau=` alongside it was dropped without a
+            # word. Silently solving a different problem is the one thing this codebase does not do.
+            if getattr(self._op, "history_specs", None) or getattr(self._op, "surface_history_specs", None):
+                raise NotImplementedError(
+                    "fem.solve: adapt= does not compose with a pseudo-time LOAD-PATH march (this form "
+                    "reads step history via `.i(k)`). Remeshing changes the DOF layout, and the march "
+                    "carries per-quadrature-point state across every step, so the state would have to be "
+                    "transferred onto each new mesh — wired for the transient stepper, not for `tau=`. "
+                    "For a fixed graded mesh instead, put the refinement in the geometry: "
+                    "`Shape.box(...).sized(lambda x, y, z: fine if <in band> else coarse)`."
+                )
             if getattr(adapt, "relocate", False):
                 # r-adaptivity: relocate the .trainable() vertices (fixed connectivity), not h-refinement.
                 from .utils.solver.fem_adapt import run_adaptive_relocate
@@ -2276,11 +2289,18 @@ class FEM:
         energy). Written with the opposite sign it states the *other* inequality. There is no way to
         detect this from the residual alone, so it is a documented convention, not a checked one."""
 
-        def _bounded(residual_fn, u0):
+        def _prepare_residual(residual_fn, u0):
+            """``(root_fn, start)`` — what the driver is actually handed for this warm start.
+
+            Split out from ``_bounded`` so a caller that must *judge* the solve afterwards measures the
+            same function the driver root-found. It matters: on an ACTIVE bound the bare residual is
+            deliberately non-zero (it is the constraint's multiplier), so scoring a converged
+            box-constrained solve against ``residual_fn`` reads a correct answer as a failure. Only
+            ``Phi`` vanishes at the solution."""
             u0 = jnp.asarray(u0).reshape(-1)
             resolved = self._resolve_bounds(u0)
             if resolved is None:
-                return solve_fn(residual_fn, u0) if solve_fn is not None else _default_newton(residual_fn, u0)
+                return residual_fn, u0
             lo, hi = resolved
             has_lo, has_hi = jnp.isfinite(lo), jnp.isfinite(hi)
             # Finite stand-ins under the `where`: an infinite bound would put +-inf into the arithmetic
@@ -2297,8 +2317,67 @@ class FEM:
             # Start inside the box: the min-map is only informative on a feasible iterate, and a warm
             # start from the previous load step can sit exactly on the old bound.
             start = jnp.clip(u0, jnp.where(has_lo, lo, -jnp.inf), jnp.where(has_hi, hi, jnp.inf))
-            return solve_fn(phi, start) if solve_fn is not None else _default_newton(phi, start)
+            return phi, start
 
+        def _prepare_jacobian(residual_fn, jacobian_fn, u0):
+            """``Phi``'s **semismooth** Jacobian: the residual row where the box is inactive, an identity
+            row where it is active.
+
+            ``jax.linearize`` derives exactly this by selecting the live branch of the ``min``/``max``,
+            which is what makes the matrix-free driver work with no extra code. A driver that factorizes
+            an ASSEMBLED tangent gets no such help — it is handed the bare ``R``'s Jacobian, which is the
+            wrong operator for the constrained problem — so the same selection is applied to the matrix
+            here. The active set is a function of the iterate, hence a traced mask rather than a DOF
+            list, which is what :func:`bcoo_identity_rows` exists for."""
+            resolved = self._resolve_bounds(u0)
+            if resolved is None:
+                return jacobian_fn
+            from .utils.solver.fem_utils import bcoo_identity_rows
+
+            lo, hi = resolved
+            has_lo, has_hi = jnp.isfinite(lo), jnp.isfinite(hi)
+            lo_s = jnp.where(has_lo, lo, 0.0)
+            hi_s = jnp.where(has_hi, hi, 0.0)
+
+            def jac(u):
+                u = jnp.asarray(u).reshape(-1)
+                r = jnp.asarray(residual_fn(u)).reshape(-1)
+                # Which branch `phi` took, row by row — the `min` is applied to the `max`'s OUTPUT, so
+                # the lower test reads `r1`, not `r`.
+                r1 = jnp.where(has_hi, jnp.maximum(r, u - hi_s), r)
+                active = (has_hi & ((u - hi_s) > r)) | (has_lo & ((u - lo_s) < r1))
+                return bcoo_identity_rows(jacobian_fn(u), active)
+
+            return jac
+
+        def _box_projector(u0):
+            """``u -> clip(u, lo, hi)`` for the declared boxes, or ``None`` if there are none.
+
+            Handed to a driver that extrapolates past its own sub-solve (``staggered(over_relax>1)``):
+            the sub-solve's answer is feasible by construction, a step BEYOND it need not be."""
+            resolved = self._resolve_bounds(u0)
+            if resolved is None:
+                return None
+            lo, hi = resolved
+            return lambda u: jnp.clip(jnp.asarray(u).reshape(-1), lo, hi)
+
+        def _bounded(residual_fn, u0, *, jacobian=None):
+            root_fn, start = _prepare_residual(residual_fn, u0)
+            if solve_fn is None:
+                return _default_newton(root_fn, start)
+            extra = {}
+            if jacobian is not None and getattr(solve_fn, "wants_jacobian", False):
+                extra["jacobian"] = _prepare_jacobian(residual_fn, jacobian, u0)
+            if getattr(solve_fn, "wants_project", False):
+                extra["project"] = _box_projector(u0)
+            return solve_fn(root_fn, start, **extra)
+
+        _bounded.prepare_residual = _prepare_residual
+        # Keep the wrapped driver's own flags visible THROUGH the wrapper: the caller decides whether to
+        # assemble a tangent at all by reading `wants_jacobian`, and judges convergence by `tolerances`.
+        for _attr in ("tolerances", "wants_jacobian", "wants_project"):
+            if getattr(solve_fn, _attr, None) is not None:
+                setattr(_bounded, _attr, getattr(solve_fn, _attr))
         return _bounded
 
     def _resolve_bounds(self, u_warm):
