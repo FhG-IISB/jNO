@@ -260,3 +260,58 @@ class TestIntervalStride:
             cont.on_before_update(grads=g, trainable=t, epoch=e, total_loss=loss)
             loss -= 1e-4  # 5e-4 per interval on a value of 100 -> 5e-6 relative, under tol
         assert cont.penal > 3.0
+
+
+class TestStallFallback:
+    """`patience`: raise the exponent when the objective never settles.
+
+    The paper's trigger assumes the objective converges. An unregularised topology-optimisation
+    run fragments instead of converging, and an MMA iterate can oscillate above `tol` forever;
+    in both cases `penal` sits at `start` for the whole run and the design has no reason to go
+    binary. Measured on the half-MBB beam: 800 iterations, five sampled intervals, `penal` never
+    moved off 3.0 and the design ended at M_nd = 0.37. Penalisation is needed MOST where
+    convergence is worst, so the gate must not be the only route.
+    """
+
+    @staticmethod
+    def _falling(n):
+        """A loss that always decreases -- never converges under any finite tol."""
+        return [100.0 * (0.97**i) for i in range(n)]
+
+    def test_a_stalled_run_never_raises_without_patience(self):
+        cont, g, t, lid = _make(np.full(20, 0.5), tol=1e-4, window=3)
+        for e, loss in enumerate(self._falling(40)):
+            _step(cont, g, t, lid, loss, e)
+        assert cont.penal == 3.0 and cont.history == [], "the paper's rule, unchanged by default"
+
+    def test_patience_raises_a_stalled_run(self):
+        cont, g, t, lid = _make(np.full(20, 0.5), tol=1e-4, window=3, patience=3)
+        landed = [_step(cont, g, t, lid, loss, e) for e, loss in enumerate(self._falling(9))]
+        assert cont.penal == 6.0, "one raise per `patience` samples while the objective stalls"
+        assert [h[1] for h in cont.history] == [4.0, 5.0, 6.0]
+        assert all(h[2] == "stalled" for h in cont.history), "and each is recorded as a stall"
+        # `_step` reads the harness's frozen penal entry (3.0), so a firing step returns
+        # 3.0 + step and a quiet one returns 3.0 exactly -- one +1 delta per raise, no more.
+        assert set(landed) == {3.0, 4.0}
+        assert landed.count(4.0) == 3, "exactly one non-zero delta per raise"
+
+    def test_convergence_still_takes_precedence_and_is_labelled(self):
+        """A run that genuinely settles must fire on that, not be mislabelled a stall."""
+        cont, g, t, lid = _make(np.full(20, 0.5), tol=1e-4, window=3, patience=999)
+        for e in range(4):
+            _step(cont, g, t, lid, 5.0, e)
+        assert cont.penal == 4.0
+        assert cont.history[0][2] == "converged"
+
+    def test_patience_still_respects_the_grey_gate(self):
+        """M_nd is the other half of the condition; a binary design needs no more penalisation."""
+        cont, g, t, lid = _make(np.array([1.0, 0.0] * 10), patience=1)
+        for e, loss in enumerate(self._falling(20)):
+            _step(cont, g, t, lid, loss, e)
+        assert cont.penal == 3.0 and cont.history == []
+
+    def test_the_ceiling_holds_under_patience(self):
+        cont, g, t, lid = _make(np.full(20, 0.5), patience=1, maximum=5.0)
+        for e, loss in enumerate(self._falling(40)):
+            _step(cont, g, t, lid, loss, e)
+        assert cont.penal == 5.0

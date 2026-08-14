@@ -51,6 +51,7 @@ class SIMPContinuation(_Callback):
         physical=None,
         watch: Optional[int] = None,
         every: int = 1,
+        patience: Optional[int] = None,
     ):
         self._watch = watch
         self.every = max(int(every), 1)
@@ -59,10 +60,12 @@ class SIMPContinuation(_Callback):
         self._rho_lid = density.model.layer_id
         self.start, self.step, self.maximum = float(start), float(step), float(maximum)
         self.tol, self.window, self.mnd_tol = float(tol), int(window), float(mnd_tol)
+        self.patience = None if patience is None else max(int(patience), 1)
         self.penal = float(start)
         self.history: List[float] = []          # (epoch, penal) at each raise
         self.m_nd: Optional[float] = None
         self._losses: List[float] = []
+        self._waited = 0                        # samples since the last raise, for `patience`
 
     def _converged(self) -> bool:
         """Relative change below ``tol`` across ``window`` consecutive steps."""
@@ -116,11 +119,27 @@ class SIMPContinuation(_Callback):
             r = jnp.asarray(self._physical(r)).reshape(-1)
         self.m_nd = float(4.0 * jnp.mean(r * (1.0 - r)))
 
+        # The convergence gate assumes the objective eventually settles. When it does not -- an
+        # unregularised run that fragments instead of converging, or an MMA iterate that keeps
+        # oscillating above `tol` -- `penal` stays at `start` for the whole run and the design has
+        # no reason to go binary. That is backwards: penalisation is needed MOST where convergence
+        # is worst. `patience` raises anyway after that many samples without a raise, so a stalled
+        # run still gets its continuation. Left as None the behaviour is exactly the paper's.
+        if sample:
+            self._waited += 1
+        stalled = self.patience is not None and self._waited >= self.patience
+
         new = self.penal
-        if sample and self._converged() and self.m_nd >= self.mnd_tol and self.penal < self.maximum - 1e-12:
+        if (
+            sample
+            and (self._converged() or stalled)
+            and self.m_nd >= self.mnd_tol
+            and self.penal < self.maximum - 1e-12
+        ):
             new = min(self.penal + self.step, self.maximum)
-            self.history.append((int(epoch), new))
+            self.history.append((int(epoch), new, "stalled" if stalled and not self._converged() else "converged"))
             self._losses = []  # the window restarts at each continuation step (Sec. 2.4)
+            self._waited = 0
 
         delta = self.penal - new
         self.penal = new
@@ -146,6 +165,7 @@ def simp_continuation(
     physical=None,
     watch: Optional[int] = None,
     every: int = 1,
+    patience: Optional[int] = None,
 ) -> SIMPContinuation:
     """Raise the SIMP exponent once the objective settles and the design is still grey.
 
@@ -201,6 +221,7 @@ def simp_continuation(
         physical=physical,
         watch=watch,
         every=every,
+        patience=patience,
     )
 
 
