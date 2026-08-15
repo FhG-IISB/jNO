@@ -62,6 +62,8 @@ from .utils import Logger
 from .utils import init_default_logger as logger
 from .utils.adaptive import LearningRateSchedule, WeightSchedule, callbacks, sampler
 from .utils.config import (
+    _auto_compile_cache,
+    disable_compile_cache,
     enable_compile_cache,
     get_config,
     get_config_path,
@@ -146,6 +148,7 @@ __all__ = [
     "iree",
     "save",
     "load",
+    "disable_compile_cache",
     "enable_compile_cache",
     "setup",
     "wandb_finish",
@@ -184,3 +187,8 @@ __all__ = [
     "NamedMatrixViewWithPartials",
     "NamedVoigtViewWithPartials",
 ]
+
+# Persistent XLA compilation cache, ON by default (opt out: JNO_COMPILE_CACHE=0, `[jno]
+# compile_cache = false`, or jno.setup(compile_cache=False)). Measured 2.1x-4.3x on warm builds;
+# see `jno.utils.config.enable_compile_cache` for the numbers and the first-run populate cost.
+_auto_compile_cache()
