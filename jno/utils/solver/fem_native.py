@@ -2306,13 +2306,23 @@ def assemble_fem_native(
         domain._fem_native_dirichlet_tv = tv_stash
         return pairs
 
+    _static_dirichlet_cache: Dict[str, Any] = {}
+
     def _dirichlet_pairs_at(args):
         """Dirichlet ``(dof, value)`` pairs with the net-valued profiles evaluated from the runtime
         ``args`` (an unknown BC ``u(region) - net(x)``): the net is called on the region's boundary-node
         coordinates, so the value stays a differentiable JAX scalar and ``∂b/∂weights`` flows through the
         symmetric elimination. Non-net conditions reuse the concrete ``_build_dirichlet_pairs`` values."""
         a = args or {}
-        pairs = list(_build_dirichlet_pairs())  # concrete (non-net, non-parametric) conditions
+        # The concrete (non-net, non-parametric) pairs are ARG-INDEPENDENT, and rebuilding them here
+        # is not just wasted work: this runs inside the traced Newton residual (`_np_hold(args)`),
+        # where the host-side tag resolution in `_build_dirichlet_pairs` can meet traced state a
+        # contact assembly stashed (measured: TracerArrayConversionError from the tag location fn on
+        # a gap-carrying form). Built ONCE, on the first call -- which is always the eager dof-layout
+        # probe `_dirichlet_pairs_at(_dir_static_args())`, outside any trace.
+        if "pairs" not in _static_dirichlet_cache:
+            _static_dirichlet_cache["pairs"] = _build_dirichlet_pairs()
+        pairs = list(_static_dirichlet_cache["pairs"])
         for _row_i, (field_key, region, comp, value, value_node) in enumerate(dirichlet_raw):
             fidx = field_index.get(field_key)
             if fidx is None:
@@ -2324,12 +2334,23 @@ def assemble_fem_native(
                 # value stays a traced JAX scalar and ∂b/∂g (steady) / ∂step/∂g (transient) flows --
                 # the same contract as the net branch below. `_eval_value_node_at(params=...)` is the
                 # existing parametric-coefficient evaluator; no bespoke walker.
+                #
+                # The node LAYOUT is static per (field, region) and memoized from the first (eager)
+                # call: this body re-runs inside the traced Newton residual, where the host tag
+                # resolution behind `_boundary_node_ids` can meet traced state (measured on a
+                # gap-carrying form: TracerArrayConversionError out of the tag location fn).
                 from ..._fem import _eval_value_node_at as _eval_at
 
                 vt = vecs[fidx]
-                pts_all = np.asarray(pts_f_all[fidx])
-                node_ids = list(_boundary_node_ids(fidx, region))
-                pts = pts_all[np.asarray(node_ids, dtype=np.int64)] if node_ids else np.zeros((0, dim))
+                _lk = ("layout", fidx, region)
+                if _lk not in _static_dirichlet_cache:
+                    pts_all = np.asarray(pts_f_all[fidx])
+                    nid_list = list(_boundary_node_ids(fidx, region))
+                    _static_dirichlet_cache[_lk] = (
+                        nid_list,
+                        pts_all[np.asarray(nid_list, dtype=np.int64)] if nid_list else np.zeros((0, dim)),
+                    )
+                node_ids, pts = _static_dirichlet_cache[_lk]
                 raw = jnp.asarray(_eval_at(value_node, jnp.asarray(pts), params=a)).reshape(-1)
                 # Constant vs spatial profile: a constant returns the same shape for ANY batch (the
                 # static-path trick) -- one extra single-point evaluation decides, shapes are static.
