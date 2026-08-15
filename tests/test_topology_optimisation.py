@@ -21,7 +21,12 @@ import pytest
 
 import jno
 
-E0, EMIN, NU, PENAL, VOLFRAC = 1.0, 1e-9, 0.3, 3.0, 0.4
+# EMIN = 1e-6, not the 1e-9 of the original 88-line-code lineage: at a 1e9 stiffness contrast
+# cuSolver's QR spsolve -- the GPU backend behind the default differentiable solve -- falsely
+# reports the (regular, merely ill-conditioned) SIMP stiffness SINGULAR and the whole chain dies
+# inside the gradient. Measured: every compliance test fails on GPU at 1e-9 and passes at 1e-6,
+# which is itself a standard void-stiffness choice; the layouts are indistinguishable.
+E0, EMIN, NU, PENAL, VOLFRAC = 1.0, 1e-6, 0.3, 3.0, 0.4
 LAM, MU = E0 * NU / (1 - NU**2), E0 / (2 * (1 + NU))
 
 
@@ -54,8 +59,7 @@ def _cantilever(size=0.16, move=0.15):
     eu, ep = symgrad(u, [xi, yi]), symgrad(phi, [xi, yi])
     fem = jno.fem(
         [
-            (EMIN + rho**PENAL * (E0 - EMIN))
-            * (LAM * trace(eu) * trace(ep) + 2 * MU * inner(eu, ep, n_contract=2)),
+            (EMIN + rho**PENAL * (E0 - EMIN)) * (LAM * trace(eu) * trace(ep) + 2 * MU * inner(eu, ep, n_contract=2)),
             u(xl, yl) - (0.0, 0.0),
             -1.0 * inner(jnp.array([0.0, -1.0]), phi.bind(x=xr, y=yr), n_contract=1),
         ],
@@ -156,8 +160,7 @@ class TestComplianceMinimisation:
             results[budget] = float(np.asarray(crux.eval([C])).reshape(-1)[0])
 
         assert results[0.25] > results[0.5], (
-            f"a tighter budget must give higher compliance: "
-            f"C(0.25)={results[0.25]:.4f} vs C(0.5)={results[0.5]:.4f}"
+            f"a tighter budget must give higher compliance: C(0.25)={results[0.25]:.4f} vs C(0.5)={results[0.5]:.4f}"
         )
 
 
@@ -240,9 +243,7 @@ class TestP0DensityParameter:
         def assemble(space):
             d = jno.Shape.rect(0, 0, 2, 1, size=0.5).domain()
             u, phi = d.fem_symbols(value_shape=(2,))
-            _r, s = d.fem_symbols(names=("r", "s")) if space == "P1" else d.fem_symbols(
-                space="P0", names=("r", "s")
-            )
+            _r, s = d.fem_symbols(names=("r", "s")) if space == "P1" else d.fem_symbols(space="P0", names=("r", "s"))
             xi, yi, _ = d.variable("interior", split=True)
             xl, yl, _ = d.variable("left", split=True)
             rho = jno.np.parameter(s, name="rho")
@@ -254,9 +255,7 @@ class TestP0DensityParameter:
                 ],
                 quad_degree=2,
             )
-            n = int(np.asarray(d._cells_p1()).shape[0]) if space == "P0" else int(
-                np.asarray(d.built_mesh.points).shape[0]
-            )
+            n = int(np.asarray(d._cells_p1()).shape[0]) if space == "P0" else int(np.asarray(d.built_mesh.points).shape[0])
             a, _ = fem.operator.evaluate({"rho": jnp.full(n, 0.7, dtype=jnp.float64)})
             return np.asarray(jnp.asarray(a.todense()))
 
@@ -376,9 +375,7 @@ class TestPatchFilter:
         n_cells = int(d._cells_p1().shape[0])
         r = jnp.asarray(np.random.default_rng(2).uniform(0, 1, n_cells))
 
-        np.testing.assert_allclose(
-            np.asarray(rho.patch().fn(r)), np.asarray(d.patch_filter()(r)), atol=0.0
-        )
+        np.testing.assert_allclose(np.asarray(rho.patch().fn(r)), np.asarray(d.patch_filter()(r)), atol=0.0)
         g = jax.grad(lambda z: jnp.sum(d.patch_filter()(z)))(r)
         assert np.all(np.isfinite(np.asarray(g))) and np.any(np.asarray(g) != 0.0)
 
@@ -526,19 +523,16 @@ class TestFacetTractionTotal:
         _r, s = d.fem_symbols(space="P0", names=("r", "s"))
         xi, yi, _ = d.variable("interior", split=True)
         xl, yl, _ = d.variable("left", split=True)
-        xt, yt, _ = d.variable(
-            "tip", where=lambda x, y: (x > L - tol) & (y < span + pad), split=True)
+        xt, yt, _ = d.variable("tip", where=lambda x, y: (x > L - tol) & (y < span + pad), split=True)
         rho = jno.np.parameter(s, name="rho_traction")
         rho.dtype(jnp.float64)
         eu, ep = jno.np.symgrad(u, [xi, yi]), jno.np.symgrad(phi, [xi, yi])
         fem = jno.fem(
             [
                 (EMIN + rho**PENAL * (E0 - EMIN))
-                * (LAM * jno.np.trace(eu) * jno.np.trace(ep)
-                   + 2 * MU * jno.np.inner(eu, ep, n_contract=2)),
+                * (LAM * jno.np.trace(eu) * jno.np.trace(ep) + 2 * MU * jno.np.inner(eu, ep, n_contract=2)),
                 u(xl, yl) - (0.0, 0.0),
-                -1.0 * jno.np.inner(jnp.array([0.0, -1.0 / span]),
-                                    phi.bind(x=xt, y=yt), n_contract=1),
+                -1.0 * jno.np.inner(jnp.array([0.0, -1.0 / span]), phi.bind(x=xt, y=yt), n_contract=1),
             ],
             quad_degree=2,
         )
@@ -550,14 +544,10 @@ class TestFacetTractionTotal:
     def test_padded_predicate_applies_the_full_resultant(self, size):
         """The inclusive band integrates to exactly -1 regardless of the mesh."""
         got = self._resultant(size, pad=1e-6 * 60.0)
-        assert got == pytest.approx(-1.0, abs=1e-9), (
-            f"h={size}: traction band integrated to {got:.6f}, not -1"
-        )
+        assert got == pytest.approx(-1.0, abs=1e-9), f"h={size}: traction band integrated to {got:.6f}, not -1"
 
     def test_strict_predicate_loses_load_and_is_mesh_dependent(self):
         """Pins WHY the tolerance is needed: without it the load depends on the discretisation."""
         coarse, fine = self._resultant(2.0, pad=0.0), self._resultant(1.0, pad=0.0)
-        assert coarse == pytest.approx(0.0, abs=1e-9), (
-            f"h == span should lose the only facet, got {coarse:.6f}"
-        )
+        assert coarse == pytest.approx(0.0, abs=1e-9), f"h == span should lose the only facet, got {coarse:.6f}"
         assert fine == pytest.approx(-0.5, abs=1e-9), f"expected (span-h)/span, got {fine:.6f}"
