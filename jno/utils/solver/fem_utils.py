@@ -3403,6 +3403,289 @@ _PLAN_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
 _PLAN_CACHE_MAX = 4
 
 
+#: Content digests of baked array leaves, keyed by object id. Each entry PINS the array it was
+#: computed from -- numpy arrays are not weakref-able, and pinning is what keeps the id in the key
+#: from being recycled onto a different array while the entry is live (the same pattern
+#: ``_ELEM_MAP_CACHE`` documents for its baked leaves). Bounded: an entry is one array pin + a small
+#: digest tuple, and one build touches ~20 array leaves.
+_LEAF_DIGEST_CACHE: "OrderedDict[int, tuple]" = OrderedDict()
+_LEAF_DIGEST_CACHE_MAX = 4096
+
+#: The CONTENT-keyed twin of ``_ELEM_MAP_CACHE`` -- same values (``(jitted, pins)`` tuples), keyed on
+#: what the compilation depends on *by value* rather than by object identity. This is what makes a
+#: REBUILD of an identical problem (fresh mesh arrays, fresh closures, identical content) reuse the
+#: compiled programs instead of paying trace + XLA compile again: measured on 3-D Poisson at 10k
+#: nodes, the 8 recompiles were 1.25 s of a 1.56 s warm rebuild.
+_ELEM_MAP_CONTENT: "OrderedDict[tuple, tuple]" = OrderedDict()
+_ELEM_MAP_CONTENT_MAX = 128
+
+#: Diagnostics for tests and for finding out WHY a rebuild failed to hit: hit/miss counters plus a
+#: per-type tally of the leaves that defeated content keying (``content_bail``).
+_ELEM_MAP_STATS: Dict[str, Any] = {"id_hits": 0, "content_hits": 0, "misses": 0, "content_bail": {}}
+
+
+def _array_digest(leaf):
+    """Content identity of a baked array leaf, memoized by object id (arrays are immutable).
+
+    Includes dtype, shape and -- for JAX arrays -- ``weak_type`` and the sharding string, because each
+    of those changes the program a jit would bake, not just the numbers in it. ``np.asarray`` on a
+    device array is a host transfer; it happens once per array object (the memo), at build time, and
+    only on the rebuild-miss path -- never per solve."""
+    key = id(leaf)
+    hit = _LEAF_DIGEST_CACHE.get(key)
+    if hit is not None and hit[0] is leaf:
+        _LEAF_DIGEST_CACHE.move_to_end(key)
+        return hit[1]
+    if isinstance(leaf, jax.core.Tracer):
+        return None
+    extra = ()
+    if isinstance(leaf, jax.Array):
+        extra = (bool(getattr(leaf, "weak_type", False)), str(getattr(leaf, "sharding", "")))
+    arr = np.ascontiguousarray(np.asarray(leaf))
+    digest = (
+        "arr",
+        arr.dtype.str,
+        arr.shape,
+        extra,
+        _hashlib.blake2b(memoryview(arr).cast("B"), digest_size=16).digest(),
+    )
+    _LEAF_DIGEST_CACHE[key] = (leaf, digest)
+    while len(_LEAF_DIGEST_CACHE) > _LEAF_DIGEST_CACHE_MAX:
+        _LEAF_DIGEST_CACHE.popitem(last=False)
+    return digest
+
+
+def _callable_token(fn, seen):
+    """Content token of a plain Python function: its code object plus the recursive tokens of its
+    closure -- ``_fn_content_key`` without the treedef packaging. Bound methods and builtins hash by
+    their qualified name (their behaviour is version-stable within a process)."""
+    import types as _types
+
+    if isinstance(fn, _types.FunctionType):
+        sub = _fn_content_key(fn, None, seen)
+        return None if sub is None else ("fn",) + sub
+    qual = getattr(fn, "__qualname__", None) or getattr(fn, "__name__", None)
+    mod = getattr(fn, "__module__", None)
+    if qual and mod:
+        return ("callable", mod, qual)
+    return None
+
+
+def _expr_digest(node, seen=None):
+    """Structural content digest of a traced expression -- the coefficient trees the element
+    functions bake in. **Allow-list, strict**: a node type this walker does not positively know how
+    to fingerprint returns ``None``, which disables content keying for that closure (safe: a miss
+    costs a recompile, a wrong hit would be a wrong operator). The bail is tallied by type in
+    ``_ELEM_MAP_STATS["content_bail"]`` so coverage gaps are measurable, not guessed.
+
+    Deliberately EXCLUDED from every token: per-build counters (``op_id``, ``frozen_id``,
+    ``layer_id``) -- they differ across rebuilds without changing the compiled program, and any node
+    whose counter DOES key runtime lookups (``FrozenField``'s gather table, ``ModelCall``) is not on
+    the allow-list at all."""
+    from ...trace import RegionMask as _RM
+    from ...trace import TagMask as _TM
+
+    if seen is None:
+        seen = set()
+    if id(node) in seen:
+        return None  # a true back-edge (ancestor on the CURRENT path); a DAG is fine -- see below
+    seen.add(id(node))
+
+    def _val(v):
+        if isinstance(v, (np.ndarray, jax.Array)):
+            return _array_digest(v)
+        if isinstance(v, (bool, int, float, complex, str, bytes, type(None), np.integer, np.floating)):
+            return ("v", type(v).__name__, v)
+        if isinstance(v, (tuple, list)):
+            parts = tuple(_val(x) for x in v)
+            return None if any(p is None for p in parts) else ("seq", parts)
+        return None
+
+    t = type(node).__name__
+    if isinstance(node, Literal) or isinstance(node, Constant):
+        head = _val(node.value)
+    elif isinstance(node, _RM):
+        head = ("region", node.region)
+    elif isinstance(node, _TM):
+        head = ("tag", node.tag)
+    elif isinstance(node, Variable):
+        head = _val((node.tag, tuple(np.atleast_1d(node.dim).tolist()), getattr(node, "axis", "spatial")))
+    elif isinstance(node, (TrialFunction, TestFunction)):
+        head = _val(
+            (
+                getattr(node, "name", ""),
+                tuple(getattr(node, "value_shape", ()) or ()),
+                int(getattr(node, "order", 1)),
+                str(getattr(node, "space", "Lagrange")),
+            )
+        )
+    elif isinstance(node, (Jacobian, Hessian)):
+        head = ("d", str(getattr(node, "scheme", "")))
+    elif isinstance(node, BinaryOp):
+        head = ("op", node.op)
+    elif isinstance(node, FunctionCall):
+        fn_tok = _callable_token(node.fn, seen)
+        kw = _val(tuple(sorted((node.kwargs or {}).items()))) if getattr(node, "kwargs", None) else ()
+        if fn_tok is None or kw is None:
+            fn_tok = None
+        head = None if fn_tok is None else ("call", node._name, fn_tok, getattr(node, "reduces_axis", None), kw)
+    else:
+        head = None
+    if head is None:
+        _ELEM_MAP_STATS["content_bail"][t] = _ELEM_MAP_STATS["content_bail"].get(t, 0) + 1
+        return None
+    child_digests = []
+    from .solver_helper import iter_children
+
+    for child in iter_children(node) or ():
+        d = _expr_digest(child, seen)
+        if d is None:
+            return None
+        child_digests.append(d)
+    # PATH-based guard, not visited-based: an expression is a DAG (`ui` appears once per term but is
+    # ONE object), so a shared node must digest normally on every path -- only a genuine cycle, where
+    # a node is its own ancestor, is refused. Hence the discard on exit.
+    seen.discard(id(node))
+    return (t, head, tuple(child_digests))
+
+
+def _leaf_content_token(leaf, seen):
+    """Content token of ONE baked closure leaf, or ``None`` when this leaf cannot be keyed by value.
+
+    The probe over a real build's element functions found exactly these kinds: arrays, plain scalars,
+    coefficient expression trees, nested functions, empty sets, an empty ``NeuralSlots``, and the
+    owning ``domain``. Everything else bails -- tallied, so the next kind to support is measured."""
+    import types as _types
+
+    from ...trace import Placeholder as _Ph
+
+    if isinstance(leaf, (np.ndarray, jax.Array)):
+        return _array_digest(leaf)
+    if isinstance(leaf, (bool, int, float, complex, str, bytes, type(None), np.integer, np.floating, np.bool_)):
+        return ("v", type(leaf).__name__, leaf)
+    if isinstance(leaf, (set, frozenset)):
+        try:
+            return ("set", frozenset(leaf))
+        except TypeError:
+            return None
+    if isinstance(leaf, _types.FunctionType):
+        sub = _fn_content_key(leaf, None, seen)
+        return None if sub is None else ("fn",) + sub
+    if isinstance(leaf, _Ph):
+        d = _expr_digest(leaf)
+        return None if d is None else ("expr", d)
+    tname = type(leaf).__name__
+    if tname == "domain" and type(leaf).__module__.startswith("jno."):
+        return _domain_content_token(leaf)
+    if tname == "NeuralSlots" and not getattr(leaf, "models", None):
+        return ("neural", tuple(getattr(leaf, "all_names", ())), tuple(getattr(leaf, "param_names", ())))
+    _ELEM_MAP_STATS["content_bail"][tname] = _ELEM_MAP_STATS["content_bail"].get(tname, 0) + 1
+    return None
+
+
+def _domain_content_token(d):
+    """Mesh-content identity of a ``jno.domain``: dimension, point and cell digests, and the tag
+    names. Memoized on the instance (a domain's mesh is fixed after build; adaptivity REPLACES the
+    domain object). Everything an element function reads from the domain at trace time is either
+    covered here or reaches the closure as a separately-digested array (masks, facet ids, context
+    tensors), so identical tokens imply identical compiled programs."""
+    cached = d.__dict__.get("_elem_map_content_token")
+    if cached is not None:
+        return cached
+    try:
+        mesh = d.mesh
+        parts = [("dim", int(d.dimension)), _array_digest(np.asarray(mesh.points))]
+        for name in sorted(mesh.cells_dict):
+            parts.append((name, _array_digest(np.asarray(mesh.cells_dict[name]))))
+        parts.append(("tags", tuple(sorted(map(str, getattr(d, "avaiable_mesh_tags", ()) or ())))))
+        token = ("domain", tuple(parts))
+    except Exception:  # noqa: BLE001 -- no mesh (point cloud), exotic state: just do not key it
+        return None
+    d.__dict__["_elem_map_content_token"] = token
+    return token
+
+
+def _structure_token(obj, seen, renumber):
+    """Canonical content token of one baked value -- container structure INCLUDED, walked by hand
+    rather than through ``tree_flatten``, for one reason: **integer dict keys are per-build counters**.
+
+    The assembler's closures carry tables keyed by ``field_key`` (= ``op_id``, a process-global
+    counter), so two builds of the identical problem capture ``{1: ...}`` and ``{3: ...}`` -- same
+    structure, different key -- and a treedef-based key can never match across builds. Those keys are
+    pure within-problem lookup indices: the compiled program depends on WHICH entry a trace-time
+    lookup resolved to, never on the integer's value. So they are alpha-renumbered by first
+    appearance (De Bruijn-style), and an int LEAF equal to a renumbered key is renumbered with it (it
+    is the same field key stored as a value, e.g. ``fields[i]['field_key']``). A literal int that
+    merely collides with a field key makes the maps diverge and the lookup MISS -- the safe
+    direction; a false hit would need two different programs with identical canonical forms, which
+    the consistent renumbering excludes.
+
+    String dict keys and everything else compare by value. Unknown container/leaf types fall through
+    to :func:`_leaf_content_token`, whose bail disables keying for the whole closure."""
+    if isinstance(obj, dict):
+        # NUMERIC sort for int keys, in both the renumber assignment and the item order: counters
+        # increase monotonically per build, so numeric order preserves the cross-build semantic
+        # correspondence (1<->3, 10<->12), where a repr sort would flip it ("12" < "3").
+        def _is_int(k):
+            return isinstance(k, (int, np.integer)) and not isinstance(k, bool)
+
+        for k in sorted(k for k in obj if _is_int(k)):
+            renumber.setdefault(int(k), len(renumber))
+        # A field key also travels as a VALUE under its own name (``fields[i]['field_key']``), where
+        # no int dict key ever introduces it. The entry name identifies the semantics, so it joins
+        # the same renumbering -- consistently with any table keyed by the same counter.
+        for k in sorted(obj, key=lambda k: (0, int(k)) if _is_int(k) else (1, repr(k))):
+            if k == "field_key" and _is_int(obj[k]):
+                renumber.setdefault(int(obj[k]), len(renumber))
+        items = []
+        for k in sorted(obj, key=lambda k: (0, int(k)) if _is_int(k) else (1, repr(k))):
+            kk = ("#", renumber[int(k)]) if _is_int(k) else k
+            if k == "field_key" and _is_int(obj[k]):
+                # Renumbered HERE, at the semantically-identified site -- never as a bare int leaf,
+                # where a literal 1 colliding with field_key=1 would be renumbered in one build and
+                # not the other, guaranteeing a miss for the commonest small-int literals.
+                v = ("#", renumber[int(obj[k])])
+            else:
+                v = _structure_token(obj[k], seen, renumber)
+            if v is None:
+                return None
+            items.append((kk, v))
+        return ("dict", tuple(items))
+    if isinstance(obj, (list, tuple)):
+        parts = tuple(_structure_token(x, seen, renumber) for x in obj)
+        return None if any(p is None for p in parts) else (type(obj).__name__, parts)
+    import types as _types
+
+    if isinstance(obj, _types.FunctionType):
+        sub = _fn_content_key(obj, None, seen, renumber)
+        return None if sub is None else ("fn",) + sub
+    return _leaf_content_token(obj, seen)
+
+
+def _fn_content_key(fn, chunk, seen=None, renumber=None):
+    """The CONTENT twin of :func:`_bake_fingerprint`: everything a jit of ``fn`` would bake, keyed by
+    value -- recursing through nested functions (fresh objects per build, identical code and captures
+    across rebuilds), containers walked canonically (see :func:`_structure_token`). ``None`` disables
+    content keying for this call; the reason is tallied in ``_ELEM_MAP_STATS['content_bail']``."""
+    if seen is None:
+        seen = set()
+    if renumber is None:
+        renumber = {}
+    if id(fn) in seen:
+        _ELEM_MAP_STATS["content_bail"]["<recursive-fn>"] = _ELEM_MAP_STATS["content_bail"].get("<recursive-fn>", 0) + 1
+        return None
+    seen.add(id(fn))
+    try:
+        captured = tuple(c.cell_contents for c in (fn.__closure__ or ()))
+    except ValueError:
+        _ELEM_MAP_STATS["content_bail"]["<unfilled-cell>"] = _ELEM_MAP_STATS["content_bail"].get("<unfilled-cell>", 0) + 1
+        return None
+    tok = _structure_token((captured, fn.__defaults__ or ()), seen, renumber)
+    if tok is None:
+        return None
+    return (fn.__code__, tok, chunk)
+
+
 def _bake_fingerprint(fn, chunk):
     """Identity of everything a ``jit`` of ``fn`` would BAKE IN: its code object, and the *leaves* of
     its closure cells and default arguments.
@@ -3480,11 +3763,35 @@ def elem_map(fn, xs, chunk):
     key, pins = fp
     hit = _ELEM_MAP_CACHE.get(key)
     if hit is None:
-        hit = (jax.jit(run), pins)
+        # Identity miss. Before compiling, try the CONTENT key: a rebuild of an identical problem
+        # bakes fresh objects with identical values, and identical values compile to the identical
+        # program. On a hit the id key is inserted as an ALIAS, so every subsequent call from this
+        # build fast-paths without touching a digest again. A ``None`` content key (a leaf the
+        # tokenizer cannot key by value) falls through to compile -- a miss is safe, a wrong hit
+        # would be a wrong operator.
+        ckey = _fn_content_key(fn, chunk)
+        if ckey is not None:
+            hit = _ELEM_MAP_CONTENT.get(ckey)
+        if hit is not None:
+            _ELEM_MAP_STATS["content_hits"] += 1
+            _ELEM_MAP_CONTENT.move_to_end(ckey)
+            # Share the COMPILED program but pin THIS call's leaves: the id key contains this build's
+            # object ids, and the entry's pins are what stop those ids from being recycled onto
+            # different objects after a GC -- the invariant the id fast path rests on. Pinning the
+            # old build's leaves instead would leave the new ids unguarded.
+            hit = (hit[0], pins)
+        else:
+            _ELEM_MAP_STATS["misses"] += 1
+            hit = (jax.jit(run), pins)
+            if ckey is not None:
+                _ELEM_MAP_CONTENT[ckey] = hit
+                while len(_ELEM_MAP_CONTENT) > _ELEM_MAP_CONTENT_MAX:
+                    _ELEM_MAP_CONTENT.popitem(last=False)
         _ELEM_MAP_CACHE[key] = hit
         if len(_ELEM_MAP_CACHE) > _ELEM_MAP_CACHE_MAX:
             _ELEM_MAP_CACHE.popitem(last=False)
     else:
+        _ELEM_MAP_STATS["id_hits"] += 1
         _ELEM_MAP_CACHE.move_to_end(key)
     return hit[0](*arrays)
 
