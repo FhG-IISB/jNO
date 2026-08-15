@@ -110,9 +110,9 @@ def _auto_gram_terms(constraints, fm) -> list:
         # Trackers are monitoring-only — never contribute to the Gram
         if isinstance(inner, Tracker):
             continue
-        # Strip any axis-reducing wrapper via FunctionCall.reduces_axis rather
+        # Strip any axis-reducing wrapper via FunctionCall.reduces rather
         # than checking the name string (which would miss custom reductions).
-        if isinstance(inner, FunctionCall) and inner.reduces_axis:
+        if isinstance(inner, FunctionCall) and inner.reduces:
             raw = inner.args[0]
         else:
             raw = inner
@@ -773,7 +773,7 @@ class core:
     @staticmethod
     def _strip_reduction_inner(node: Placeholder) -> Placeholder:
         """Peel off terminal FunctionCall nodes that reduce an axis."""
-        while isinstance(node, FunctionCall) and getattr(node, "reduces_axis", False) and len(node.args) == 1:
+        while isinstance(node, FunctionCall) and getattr(node, "reduces", False) and len(node.args) == 1:
             node = node.args[0]
         return node
 

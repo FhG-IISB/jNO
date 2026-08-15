@@ -74,6 +74,16 @@ jnn.norm(x, ord=None, axis=None)
 
 All support `axis=` and `keepdims=` keyword arguments.
 
+!!! note "Reductions with no `axis=` are not registered as reductions"
+
+    Passing an explicit axis (`jnn.mean(r, axis=0)`) marks the node as a reduction, which is what
+    lets the ENGD Gram builder and residual-based resampling unwrap it to reach the **vector**
+    residual underneath. Omitting the axis (`jnn.mean(r)`) does not: a bare `axis=None` is
+    indistinguishable from the `jno.fn(f, args)` escape hatch, which uses the same default.
+
+    Only matters if you write a custom loss with a functional reduction. The `.mse` / `.mae`
+    properties always register correctly, so the common path is unaffected.
+
 ---
 
 ## Reduction Properties on Placeholders
