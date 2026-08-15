@@ -120,7 +120,7 @@ def assemble_fem_nonnodal(
     natural-BC load is non-differentiable).
     """
     from ...trace import FemResidualOperator
-    from .fem_1d import _apply_dirichlet_rows, _apply_dirichlet_symmetric, _integrate_term
+    from .fem_1d import _apply_dirichlet_projected, _apply_dirichlet_symmetric, _integrate_term, dirichlet_projection
     from .fem_elements import (
         argyris_pushforward,
         argyris_triangle,
@@ -141,7 +141,7 @@ def assemble_fem_nonnodal(
         _infer_fields,
         _lower_statefield_to_trial,
         _test_field_index,
-        bcoo_set_dirichlet_rows,
+        bcoo_eliminate_dirichlet,
         bcoo_zero_rows_cols,
         compress_eager,
         sum_duplicate_triplets,
@@ -239,6 +239,20 @@ def assemble_fem_nonnodal(
         for bare in _terms:
             _collect_runtime_parameter_exprs(bare, _rt_param_exprs)
     runtime_parameter_tags: Tuple[str, ...] = tuple(sorted(_rt_param_exprs))
+    # `domain.by_tag` is a per-FACET coefficient, threaded only by the nodal (fem_native) surface
+    # kernel. Reject it here explicitly rather than trusting that it happens to reach the evaluator:
+    # this path CLASSIFIES boundary terms by pattern (`_n1e_surface_mass_spec` and friends) and lifts
+    # the matched coefficient out, so an unevaluated TagMask inside one could be carried into a
+    # host-assembled surface mass and silently weight every facet alike.
+    from .fem_utils import _collect_tag_mask_names as _tag_names_nn
+
+    _bad_tags = sorted({t for _terms in (boundary_terms or {}).values() for bare in _terms for t in _tag_names_nn(bare)})
+    if _bad_tags:
+        raise NotImplementedError(
+            f"jno.fem: domain.by_tag({_bad_tags}) is not supported on a non-nodal space (N1E / RT / "
+            f"Morley / Argyris) -- its per-facet mask is threaded only by the nodal Lagrange surface "
+            f"kernel. Write one boundary term per tag instead, or use a Lagrange space."
+        )
     # Per-region volume integration: a `RegionMask` node restricts a term to one material's cells. The
     # evaluator reads its 0/1 per-cell value out of `volume_vars` at the slot AFTER the temporal and
     # runtime-parameter slots (layout [temporal..., runtime_param..., region_mask...]) and raises loudly
@@ -1100,7 +1114,7 @@ def assemble_fem_nonnodal(
             if runtime_parameter_tags or neural_param_names:  # transient inverse: thread args through res + jac
 
                 def res_pt(u, t, args=None):
-                    return _apply_dirichlet_rows(lambda uu: spatial_res(uu, args) - nat_load, pins)(jnp.asarray(u))
+                    return _apply_dirichlet_projected(lambda uu: spatial_res(uu, args) - nat_load, pins)(jnp.asarray(u))
 
                 def jac_pt(u, t, args=None):
                     return _sparse_tangent(_assemble_spatial, u, args)
@@ -1113,7 +1127,7 @@ def assemble_fem_nonnodal(
                     **common,
                 )
                 return block, "transient", offs
-            res_bc = _apply_dirichlet_rows(lambda u: spatial_res(u) - nat_load, pins)
+            res_bc = _apply_dirichlet_projected(lambda u: spatial_res(u) - nat_load, pins)
 
             def jac(u, _asm=_assemble_spatial):
                 return _sparse_tangent(_asm, u)
@@ -1127,7 +1141,7 @@ def assemble_fem_nonnodal(
             return block, "transient", offs
 
         if runtime_parameter_tags or neural_param_names:  # linear transient inverse: A(args) re-assembled each
-            #   step (SPARSELY for edge/cell families), Dirichlet rows -> identity via `bcoo_set_dirichlet_rows`.
+            #   step (SPARSELY for edge/cell families), Dirichlet rows -> identity via `bcoo_eliminate_dirichlet`.
             M_bc = (
                 M
                 if pin_dofs is None
@@ -1145,7 +1159,7 @@ def assemble_fem_nonnodal(
             def operator_fn(t, args=None, _d=pin_dofs, _sm=surf_mass, _asm=_assemble_spatial):
                 if _asm is not None:  # edge/cell families: per-element sparse A(args), folds in the surface mass
                     A = _asm(args)
-                    return A if _d is None else bcoo_set_dirichlet_rows(A, _d)  # Dirichlet rows -> identity
+                    return A if _d is None else bcoo_eliminate_dirichlet(A, _d)  # Dirichlet rows -> identity
                 A = jax.jacfwd(lambda u: spatial_res(u, args))(zeros)  # C¹ vertex families: dense (small 2-D)
                 if _sm is not None:  # N1E tangential-trace surface mass (impedance) → the spatial operator A
                     A = A + _sm
@@ -1197,18 +1211,21 @@ def assemble_fem_nonnodal(
     # re-run every optimizer step); ``args=None`` reduces to the non-parametric assembly exactly. Vertex C0/C1
     # families keep the dense path below (their Hessian-shape element assembly is not ported; small 2-D problems).
     # --- the NONLINEAR tangent, assembled per element ------------------------------------------
-    # `_apply_dirichlet_rows` replaces the pinned rows of the residual with `u[d] - g`, so the tangent
-    # of that is the free tangent with those rows set to the identity -- `bcoo_set_dirichlet_rows`,
+    # `_apply_dirichlet_projected` replaces the pinned rows of the residual with `u[d] - g`, so the tangent
+    # of that is the free tangent with those rows set to the identity -- `bcoo_eliminate_dirichlet`,
     # the same row-replacement `fem_native._dirichlet_jac_rows` performs.
     #
     # `surface=False` matches the dense `jacfwd(res_bc)` it replaces EXACTLY: `_make_residual` is
     # volume-only and the nonlinear path never added `surf_mass` to its tangent. Whether it should is
     # a separate question about the residual too, not something a storage change may decide quietly.
-    _pin_dofs_j = jnp.asarray([p[0] for p in pins], dtype=jnp.int32) if pins else None
+    _pin_dofs_j, _, _pin_project = dirichlet_projection(pins) if pins else (None, None, None)
 
     def _sparse_tangent(asm, u, args=None):
-        J = asm(args, surface=False, u_flat=jnp.asarray(u).reshape(-1))
-        return J if _pin_dofs_j is None else bcoo_set_dirichlet_rows(J, _pin_dofs_j)
+        # At the PROJECTED state and eliminated on both sides, matching `_apply_dirichlet_projected`.
+        _u = jnp.asarray(u).reshape(-1)
+        _u = _u if _pin_project is None else _pin_project(_u)
+        J = asm(args, surface=False, u_flat=_u)
+        return J if _pin_dofs_j is None else bcoo_eliminate_dirichlet(J, _pin_dofs_j)
 
     _assemble_sparse_A = _make_sparse_assembler(volume_terms)
 
@@ -1217,7 +1234,7 @@ def assemble_fem_nonnodal(
         if runtime_parameter_tags or neural_param_names:  # parametric (inverse): thread args through res + jac
 
             def res_p(u, args=None):
-                return _apply_dirichlet_rows(lambda uu: full_residual(uu, args), pins)(jnp.asarray(u))
+                return _apply_dirichlet_projected(lambda uu: full_residual(uu, args), pins)(jnp.asarray(u))
 
             def jac_p(u, args=None):
                 return _sparse_tangent(_assemble_sparse_A, u, args)
@@ -1227,7 +1244,7 @@ def assemble_fem_nonnodal(
                 "nonlinear",
                 offs,
             )
-        res_bc = _apply_dirichlet_rows(full_residual, pins)  # essential pins as residual rows R[d]=u[d]-g
+        res_bc = _apply_dirichlet_projected(full_residual, pins)  # essential pins as residual rows R[d]=u[d]-g
 
         def jac(u):
             return _sparse_tangent(_assemble_sparse_A, u)

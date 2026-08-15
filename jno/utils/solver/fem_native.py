@@ -46,12 +46,13 @@ import jax.numpy as jnp
 import numpy as np
 
 from .fem_1d import (
-    _apply_dirichlet_rows,
+    _apply_dirichlet_projected,
     _apply_dirichlet_symmetric,
     _apply_dirichlet_transient,
     _integrate_term,
     _line_quadrature,
     _region_node_ids,
+    dirichlet_projection,
 )
 from .fem_facets import _LOCAL_FACES_TET, build_facet_connectivity, compute_face_normals
 from .fem_lagrange import (
@@ -68,6 +69,7 @@ from .fem_utils import (
     _CHUNK_OVERRIDE,
     _cell_region_mask,
     _collect_region_mask_names,
+    _collect_tag_mask_names,
     _eval_integrand,
     _gather_temporal_tags,
     _infer_fields,
@@ -75,6 +77,7 @@ from .fem_utils import (
     _promote_to_degree,
     _test_field_index,
     apply_compress_plan,
+    bcoo_eliminate_dirichlet,
     bcoo_set_dirichlet_rows,
     bcoo_zero_rows,
     bcoo_zero_rows_cols,
@@ -565,6 +568,7 @@ def assemble_fem_native(
     vec: int,
     quad_degree: int,
     evolution: Optional[Dict[Any, Any]] = None,
+    bounded: bool = False,
 ) -> Tuple[Any, str]:
     """Assemble a Lagrange FEM system into ``(op, mode, offs)`` for :class:`FEM`.
 
@@ -661,6 +665,7 @@ def assemble_fem_native(
     domain._fem_native_assembly_cells_all = [np.asarray(cf) for cf in cells_f_all]
     domain._fem_native_field_orders = [int(f["order"]) for f in fields]
     domain._fem_native_field_keys = [f["field_key"] for f in fields]
+    domain._fem_native_field_shapes = [tuple(f["value_shape"]) for f in fields]
 
     # -------------------------------------------------------------------------
     # Element specs and JAX constants
@@ -1056,6 +1061,41 @@ def assemble_fem_native(
         for _R in set(_surf_read_regions.values()):
             _surf_region_faces[_R] = _region_faces(_R)
 
+    # ---- per-tag facet masks: the surface twin of `region_mask_arrays` -----------------------------
+    # `domain.by_tag({tag: value})` desugars to `sum_t TagMask(t) * value`, which lets ONE boundary
+    # term carry a coefficient that varies across tags -- the surface mirror of `by_region`.
+    #
+    # The mask comes from `_region_faces`, the assembler's OWN facet selection, not from re-evaluating
+    # the tag predicate. Two reasons: a `TagMask("wall")` then covers exactly the facets a Dirichlet
+    # condition on "wall" pins (one selection rule, not a second one that can disagree), and no
+    # tolerance-tight predicate is re-run under float32, where `x > 1 - 1e-9` rounds to `x > 1.0` and
+    # matches nothing at all (`domain.tag_node_mask` moved the node path off JAX for exactly this).
+    #
+    # Indexed by the GLOBAL boundary-face id `fi`, which is what `_surf_elem_res` already receives, so
+    # no alignment against a per-region `fids` slice is needed.
+    _tag_mask_names: Tuple[str, ...] = tuple(
+        sorted(
+            {
+                t
+                for _terms in (boundary_terms or {}).values()
+                for bare in _terms
+                for _, sub in _split_additive_terms(domain, bare)
+                for t in _collect_tag_mask_names(_lower_statefield_to_trial(sub, {}))
+            }
+        )
+    )
+    _tag_mask_arrays: Dict[str, Any] = {}
+    for _t in _tag_mask_names:
+        _faces_t = np.asarray(_region_faces(_t), dtype=np.int64) if conn.n_bfaces > 0 else np.zeros(0, dtype=np.int64)
+        if _faces_t.size == 0:
+            raise ValueError(
+                f"domain.by_tag: tag {_t!r} owns no boundary facet on this mesh, so its term would "
+                f"integrate over nothing. Check the tag's predicate, or drop it from the mapping."
+            )
+        _m = np.zeros(int(conn.n_bfaces), dtype=np.float64)
+        _m[_faces_t] = 1.0
+        _tag_mask_arrays[_t] = jnp.asarray(_m, dtype=qw_shared.dtype)
+
     # ---- contact gaps: u.gap(secondary, main) -> per-face tables, built once, on the host -----------
     # For every secondary face this precomputes where its quadrature points land on the main surface:
     # the main nodes each point reads (`ids`), their shape weights (`w`), and the initial along-normal
@@ -1414,8 +1454,16 @@ def assemble_fem_native(
         for key, formula in readout_formulas.items():
             if key not in history_specs:  # VOLUME states only; surface states advance in surface_state_readout
                 continue
-            out[key] = jax.vmap(lambda c, la, _f=formula: _vol_elem_readout(c, la, _f, t, args))(
-                jnp.arange(n_cells), local_all
+            # Chunked exactly like the residual/jacobian element maps -- a plain ``jax.vmap`` leaves the
+            # batched intermediate uncapped, and a coupled form gathers every field's DOFs into one
+            # ``local_all`` row, so the readout's per-cell working set grows with the field count. It also
+            # runs inside the march's differentiated scan, so those intermediates are retained for the
+            # backward pass. One test-DOF's worth of cost per cell is the honest proxy: the readout carries
+            # no test function, so there is no element block -- only the per-quadrature-point value.
+            out[key] = _elem_map(
+                lambda c, la, _f=formula: _vol_elem_readout(c, la, _f, t, args),
+                (jnp.arange(n_cells), local_all),
+                _cell_chunk(n_cells, 1, cell_all_dofs.shape[1]),
             )
         return out
 
@@ -1564,6 +1612,9 @@ def assemble_fem_native(
             "runtime_parameter_tags": runtime_parameter_tags,
             "region_mask_names": (),
             "volume_vars": _runtime_vals(c, t, args, local_all.dtype),
+            # This face's 0/1 value for every tag the boundary terms reference, so `TagMask` resolves
+            # to a scalar here exactly as `RegionMask` does per cell. `fi` is the global face id.
+            "tag_masks": {_t: _arr[fi] for _t, _arr in _tag_mask_arrays.items()},
             "trial_value_shape": fields[btfi]["value_shape"],
             "trial_vec": vecs[btfi],
         }
@@ -1980,14 +2031,18 @@ def assemble_fem_native(
         return jacobian
 
     def _dirichlet_jac_rows(jac_fn, pairs):
-        """Wrap an assembled-Jacobian callable so Dirichlet rows become the identity row — the
-        matrix-level analogue of :func:`_apply_dirichlet_rows` (row-replacement, columns kept), so it
-        matches ``jacfwd`` of the row-replaced residual that the Newton step expects."""
+        """Wrap an assembled-Jacobian callable so the constrained system is eliminated symmetrically —
+        the matrix-level analogue of :func:`_apply_dirichlet_projected`.
+
+        Two things must line up with that residual or Newton silently solves a different system: the
+        tangent is evaluated at the **projected** state ``P(u)`` (which is where the residual samples
+        the free form), and the constrained rows *and columns* are zeroed with a unit diagonal (which
+        is what differentiating through the projection gives)."""
         if not pairs:
             return jac_fn
-        dofs = jnp.asarray([p[0] for p in pairs], dtype=jnp.int32)
+        dofs, _vals, _project = dirichlet_projection(pairs)
 
-        # `bcoo_set_dirichlet_rows` zeroes the constrained rows and then APPENDS one (d, d, 1) triplet
+        # `bcoo_eliminate_dirichlet` zeroes the constrained rows and then APPENDS one (d, d, 1) triplet
         # per constrained DOF, so its output carries up to `len(dofs)` duplicates however well the
         # inner Jacobian was compressed. That count is static too: the union of the inner pattern with
         # the Dirichlet diagonal. Derived from the inner assembler's own published pattern so the two
@@ -2004,7 +2059,7 @@ def assemble_fem_native(
                 _dir_plan = None
 
         def jac(u_flat):
-            A = bcoo_set_dirichlet_rows(jac_fn(jnp.asarray(u_flat)), dofs)
+            A = bcoo_eliminate_dirichlet(jac_fn(_project(u_flat)), dofs)
             # Same host-decided plan, so this is an O(nnz) scatter-add per Newton step, not a sort.
             return apply_compress_plan(A.data, _dir_plan, A.shape) if _dir_plan is not None else A
 
@@ -2609,9 +2664,32 @@ def assemble_fem_native(
 
     # === steady ===
     dirichlet_pairs = _build_dirichlet_pairs()
+    # τ-dependent essential values (`u(top) - delta*tau`): collected as (dofs, node, coords) rather than
+    # constant pairs, because their held value changes every load step. The march threads them below.
+    _tv_dirichlet = list(getattr(domain, "_fem_native_dirichlet_tv", []) or [])
     residual = _make_residual(volume_terms, boundary_terms)
+    # Publish the FREE (pre-Dirichlet) residual factory so `FEM.eval` can assemble an arbitrary weak
+    # term at a solution. Every solve path elimination-mutates its own copy -- symmetric elimination for
+    # the linear system, row replacement for Newton -- which zeroes exactly the rows a reaction/flux
+    # readout needs. Snapshotted onto the FEM in `_finalize`, like the field keys and DOF points.
+    domain._fem_native_term_residual = _make_residual
     jacobian = _make_jacobian(volume_terms, boundary_terms)
     nonlinear = any(_is_obviously_nonlinear_in_unknown(domain, t) for t in all_terms)
+    # A form that is LINEAR in the unknown but READS step history is still a march: every load step is a
+    # different linear system whose coefficients the buffers set. The linear branch below builds a
+    # ``FemLinearSystem`` from ``_assemble_at(args)``, which has no ``__history__`` to thread — so the
+    # history read raised at BUILD time, from deep inside the integrand evaluator. Route it through the
+    # residual operator instead: Newton on a linear residual converges in one step, so the answer is the
+    # same linear solve and there is exactly one march path to maintain. The AT1 phase-field damage
+    # equation with a lagged driving force is precisely this shape, so it is on the critical path.
+    if history_specs or surface_history_specs:
+        nonlinear = True
+    # A BOX CONSTRAINT (`u.bounds(lo, hi)`) makes the problem a variational inequality even when the
+    # operator is linear -- the obstacle problem is a linear operator whose answer is decided by the free
+    # boundary. Its KKT conditions are the root of a min-map residual, so it needs the residual path, not
+    # a matrix/rhs pair. Same reason as history above, different cause.
+    if bounded:
+        nonlinear = True
     s_d_dofs = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32) if dirichlet_pairs else None
     s_d_vals = jnp.asarray([p[1] for p in dirichlet_pairs], dtype=zeros.dtype) if dirichlet_pairs else None
 
@@ -2646,23 +2724,76 @@ def assemble_fem_native(
                 def _np_hold(args):  # held value on every Dirichlet dof (const + net), net entries live
                     return jnp.stack([jnp.asarray(p[1]).reshape(()) for p in _dirichlet_pairs_at(args)])
 
+                def _np_project(u, args, _d=_npd):
+                    return jnp.asarray(u).at[_d].set(_np_hold(args))
+
                 def res_p(u, args=None, t=0.0, _d=_npd):
-                    R = residual(jnp.asarray(u), t, args)
-                    return R.at[_d].set(jnp.asarray(u)[_d] - _np_hold(args))
+                    u = jnp.asarray(u)
+                    R = residual(_np_project(u, args), t, args)
+                    return R.at[_d].set(u[_d] - _np_hold(args))
 
                 def jac_p(u, args=None, t=0.0, _d=_npd):
-                    return bcoo_set_dirichlet_rows(jacobian(jnp.asarray(u), t, args), _d)
+                    return bcoo_eliminate_dirichlet(jacobian(_np_project(u, args), t, args), _d)
+
+                _constrained = _npd  # the dof set is static here; only the HELD VALUES ride the weights
+            elif _tv_dirichlet:
+                # A τ-DEPENDENT essential value on the load path -- `u(top)[1] - delta*tau`, i.e.
+                # DISPLACEMENT CONTROL, which is how a softening test is driven at all (under load
+                # control the specimen snaps at the peak and there is no branch to follow). The value is
+                # not a constant pair, so it is re-evaluated at this step's τ and written into the same
+                # row-replacement the constant pairs use. Before this it was collected and then dropped:
+                # the constraint simply vanished and the solve returned u = 0, which looks entirely
+                # plausible. The dof set is static, so only the held VALUES ride τ.
+                from ..._fem import _eval_value_node_at_time
+
+                _tvd = jnp.concatenate([d for d, _n, _c in _tv_dirichlet])
+                _all_d = _tvd if s_d_dofs is None else jnp.concatenate([s_d_dofs, _tvd])
+
+                def _tv_hold(t):
+                    return jnp.concatenate(
+                        [jnp.reshape(jnp.asarray(_eval_value_node_at_time(n, c, t)), (-1,)) for _d, n, c in _tv_dirichlet]
+                    )
+
+                def _tv_project(u, t, _d=s_d_dofs, _g=s_d_vals, _t=_tvd):
+                    u = jnp.asarray(u)
+                    if _d is not None:
+                        u = u.at[_d].set(_g.astype(u.dtype))
+                    return u.at[_t].set(_tv_hold(t).astype(u.dtype))
+
+                def res_p(u, args=None, t=0.0, _d=s_d_dofs, _g=s_d_vals, _t=_tvd):
+                    u = jnp.asarray(u)
+                    R = residual(_tv_project(u, t), t, args)
+                    if _d is not None:
+                        R = R.at[_d].set(u[_d] - _g)
+                    return R.at[_t].set(u[_t] - _tv_hold(t))
+
+                def jac_p(u, args=None, t=0.0, _d=_all_d):
+                    return bcoo_eliminate_dirichlet(jacobian(_tv_project(u, t), t, args), _d)
+
+                _constrained = _all_d
             else:
 
+                def _s_project(u, _d=s_d_dofs, _g=s_d_vals):
+                    u = jnp.asarray(u)
+                    return u if _d is None else u.at[_d].set(_g.astype(u.dtype))
+
                 def res_p(u, args=None, t=0.0, _d=s_d_dofs, _g=s_d_vals):
-                    R = residual(jnp.asarray(u), t, args)
-                    return R if _d is None else R.at[_d].set(jnp.asarray(u)[_d] - _g)
+                    u = jnp.asarray(u)
+                    R = residual(_s_project(u), t, args)
+                    return R if _d is None else R.at[_d].set(u[_d] - _g)
 
                 def jac_p(u, args=None, t=0.0, _d=s_d_dofs):
-                    J = jacobian(jnp.asarray(u), t, args)
-                    return J if _d is None else bcoo_set_dirichlet_rows(J, _d)
+                    J = jacobian(_s_project(u), t, args)
+                    return J if _d is None else bcoo_eliminate_dirichlet(J, _d)
+
+                _constrained = s_d_dofs
 
             _op = FemResidualOperator(res_p, jac_p, total, runtime_parameter_exprs=dict(_param_and_neural_exprs))
+            # Which DOFs carry an ESSENTIAL condition rather than an equation. A solver that extrapolates
+            # (``staggered(over_relax>1)``) must leave these alone: the sub-solve already puts them exactly
+            # on the prescribed value, and stepping past it makes the constraint oscillate as (1-omega)^k
+            # while every other field is solved against the wrong boundary value.
+            _op.dirichlet_dofs = _constrained
             _op.history_specs = history_specs  # VOLUME step-history buffer layout for the load-step driver
             _op.surface_history_specs = surface_history_specs  # SURFACE (per-face) step-history layout
             _op.history_roles = history_roles  # {key: "primary" | "internal"} — how each state advances
@@ -2698,9 +2829,19 @@ def assemble_fem_native(
         )
         return op, "linear", offs
 
+    # A τ/t-dependent essential value that no branch above threaded would be silently DROPPED here --
+    # the constraint disappears and the solve returns a plausible-looking wrong answer. Fail instead.
+    if _tv_dirichlet:
+        raise NotImplementedError(
+            "jno.fem: a time/τ-dependent essential value (e.g. `u(top) - delta*tau`) is threaded on the "
+            "steady residual path -- the load-path march and the runtime-parametric solve -- and by the "
+            "linear transient stepper. This form assembled through neither. Use a constant essential "
+            "value, or drive the load through a Neumann/body term written as a function of τ."
+        )
+
     # nonlinear (non-parametric)
     if nonlinear:
-        res_bc = _apply_dirichlet_rows(residual, dirichlet_pairs)
+        res_bc = _apply_dirichlet_projected(residual, dirichlet_pairs)
         jac = _dirichlet_jac_rows(jacobian, dirichlet_pairs)
         return (
             FemResidualOperator(

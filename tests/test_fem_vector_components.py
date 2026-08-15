@@ -193,3 +193,113 @@ def test_component_and_whole_field_spellings_mix_in_one_term():
     sol_c = np.asarray(jno.fem([weak_c, u2(xl2, yl2)[0] - 0.0, u2(xl2, yl2)[1] - 0.0, -0.01 * vr2[1]]).solve())
 
     assert sol_m == pytest.approx(sol_c, abs=5e-9), f"mixed spelling drifted: {np.abs(sol_m - sol_c).max():.3e}"
+
+
+# ==================================================================================================
+# One spelling, one meaning: `field[i]` is the i-th COMPONENT, on a raw field exactly as on a view.
+#
+# `Placeholder.__getitem__` indexes the LEADING axis, which is right for a plain array and wrong for
+# a FEM field — at assembly the leading axis is quadrature points (then DOFs, for a test function)
+# and the component axis is last. So `u.vector[0]` and `u(region)[0]` (both built as `expr[..., i]`
+# by the typed views) selected a component while a bare `u[0]` sliced quadrature points and died in
+# the assembler with a raw broadcast error that named nothing.
+# ==================================================================================================
+def _bar(size=0.5):
+    d = jno.Shape.rect(0.0, 0.0, 2.0, 1.0, size=size).domain()
+    d.tag("left", lambda x, y: x < 1e-9)
+    return d
+
+
+def _elastic_term(d, load_term_of):
+    """Assemble the bar's volume term at a FIXED state, via ``fem.eval``.
+
+    Comparing the assembled term rather than the solve is what makes "these spellings are the same
+    term" testable exactly: two identical operators can still differ by ~1e-11 after an iterative
+    solve, because a Krylov reduction is not order-deterministic on GPU. Evaluating at a fixed state
+    also works whether the form classifies linear or nonlinear."""
+    LAM, MU = 115.4, 76.9
+    sym, grad, trace, inner = J.sym, J.grad, J.trace, J.inner
+    co, cl = d.variable("interior", split=True), d.variable("left", split=True)
+    X = [co[0], co[1]]
+    u, phi = d.fem_symbols(value_shape=(2,))
+    eps = lambda w: sym(grad(w, X))
+    bulk = LAM * trace(eps(u)) * trace(eps(phi)) + 2 * MU * inner(eps(u), eps(phi), 2)
+    term = bulk - load_term_of(u, phi)
+    fem = jno.fem([term, u(*cl)[0] - 0.0, u(*cl)[1] - 0.0])
+    rng = np.random.default_rng(3)
+    u0 = rng.normal(scale=0.01, size=fem.dofs)
+    return np.asarray(fem.eval(term, u0))
+
+
+def test_every_component_spelling_assembles_the_same_term():
+    """The relationship that was broken: a raw `phi[0]`, the ellipsis form, the typed view and the
+    idiomatic contraction must be the SAME term. Three of the four already agreed; `phi[0]` raised."""
+    b = 2.5
+    spellings = {
+        "raw phi[0]": lambda u, phi: b * phi[0],
+        "phi[..., 0]": lambda u, phi: b * phi[..., 0],
+        "phi.vector[0]": lambda u, phi: b * phi.vector[0],
+        "inner(b, phi)": lambda u, phi: J.inner(J.asarray([b, 0.0]), phi, 1),
+    }
+    terms = {k: _elastic_term(_bar(), f) for k, f in spellings.items()}
+    ref = terms["inner(b, phi)"]
+    assert np.abs(ref).max() > 1e-6  # a real term, not a trivially-zero agreement
+    scale = max(1.0, float(np.abs(ref).max()))
+    for k, v in terms.items():
+        # Not bit-for-bit: a GPU reduction is not order-deterministic, so the same term reassociates
+        # to ~1e-15. The bound is still ~9 orders tighter than any real difference — indexing the
+        # wrong axis changes the answer by O(1) or fails outright.
+        assert np.abs(v - ref).max() <= 1e-12 * scale, f"{k} assembles a different term"
+
+
+def test_a_raw_trial_component_works_in_a_weak_term():
+    """The trial side of the same fix — `u[0]` used as a VALUE (not a derivative) in a volume term."""
+    K = 30.0
+    raw = _elastic_term(_bar(0.4), lambda u, phi: J.inner(J.asarray([2.5, 0.0]), phi, 1) - K * u[0] * phi[0])
+    ell = _elastic_term(_bar(0.4), lambda u, phi: J.inner(J.asarray([2.5, 0.0]), phi, 1) - K * u[..., 0] * phi[..., 0])
+    assert np.abs(raw).max() > 1e-6
+    assert np.abs(raw - ell).max() <= 1e-12 * max(1.0, float(np.abs(ell).max()))
+
+
+def test_component_index_still_recovers_for_per_component_dirichlet():
+    """The pin path reads `getitem_key` to recover the component. Inserting the ellipsis must leave
+    that untouched, so a per-component (roller) BC still pins exactly ONE component's DOFs.
+
+    Asserted on the pin set rather than a solve: pinning only u_x leaves rigid-body motion in y, so a
+    solve would be singular for reasons that have nothing to do with the component index."""
+    LAM, MU = 115.4, 76.9
+    sym, grad, trace, inner = J.sym, J.grad, J.trace, J.inner
+    d = _bar(0.4)
+    co, cl = d.variable("interior", split=True), d.variable("left", split=True)
+    X = [co[0], co[1]]
+    u, phi = d.fem_symbols(value_shape=(2,))
+    eps = lambda w: sym(grad(w, X))
+    bulk = LAM * trace(eps(u)) * trace(eps(phi)) + 2 * MU * inner(eps(u), eps(phi), 2)
+    body = inner(J.asarray([1.0, 1.0]), phi, 1)
+
+    fem = jno.fem([bulk - body, u(*cl)[0] - 0.0])  # roller: x only
+    pinned = {int(dof) for dof, _v in (d._fem_native_dirichlet_pairs or [])}
+    assert pinned == set(int(i) for i in fem.region_dofs("left", component=0)), (
+        "a per-component pin must reach exactly the x-DOFs of the region"
+    )
+
+    fem_all = jno.fem([bulk - body, u(*cl) - 0.0])  # all components, for contrast
+    pinned_all = {int(dof) for dof, _v in (d._fem_native_dirichlet_pairs or [])}
+    assert pinned_all == set(int(i) for i in fem_all.region_dofs("left"))
+    assert len(pinned_all) == 2 * len(pinned)
+
+
+def test_component_index_on_a_scalar_field_raises():
+    """A scalar has no components. Before, `u[0]` there sliced quadrature points; now it says so."""
+    d = _bar()
+    u, _ = d.fem_symbols()
+    with pytest.raises(TypeError, match="scalar"):
+        u[0]
+
+
+def test_explicit_ellipsis_is_left_alone():
+    """`u[..., i]` was already unambiguous and must keep its exact meaning (and its getitem_key)."""
+    d = _bar()
+    u, _ = d.fem_symbols(value_shape=(2,))
+    assert u[..., 1].getitem_key == (Ellipsis, 1)
+    assert u[1].getitem_key == (Ellipsis, 1)  # the raw spelling now agrees

@@ -25,6 +25,8 @@ from jax.flatten_util import ravel_pytree
 from ...trace import (
     BinaryOp,
     Constant,
+    Diff,
+    DiffSlot,
     FrozenField,
     FunctionCall,
     Hessian,
@@ -36,6 +38,7 @@ from ...trace import (
     OperationDef,
     RegionMask,
     StateField,
+    TagMask,
     TensorTag,
     TestFunction,
     Tracker,
@@ -385,6 +388,24 @@ def _reshape_components_last(arr, value_shape):
     return jnp.reshape(arr, arr.shape[:-1] + tuple(value_shape))
 
 
+def _drop_scalar_component_axis(grad_list):
+    """Per-direction gradients of a ``value_shape == ()`` field, without a component axis.
+
+    Each entry of ``grad_list`` is ``(n_quad, vec)`` and ``vec == 1`` for a scalar field, so the naive
+    stack carries a phantom component axis: ``(n_quad, 1)`` for one direction, ``(n_quad, 1, n_dims)``
+    for several. ``value_shape == ()`` says there is no component axis, so drop it — the value branch
+    makes exactly the same promise for the field itself, and the TEST-function branch already uses this
+    convention (``grads[..., d]``, stacked last), so trial and test now agree.
+
+    In a weak term the phantom axis was harmless (``_prefix_align`` inserts singletons after the quad
+    axis, absorbing it), which is why it survived. It is *not* harmless in a readout: an evolution
+    formula like ``maximum(H.i(-1), 0.5*inner(grad(u,X), grad(u,X), 1))`` compares a genuinely scalar
+    ``(n_quad,)`` buffer slice against a ``(n_quad, 1)`` energy and rank-broadcasts to
+    ``(n_quad, n_quad)`` — the phase-field driving force, silently the wrong shape."""
+    comps = [g[..., 0] for g in grad_list]
+    return comps[0] if len(comps) == 1 else jnp.stack(comps, axis=-1)
+
+
 def _expand_test_shape_vals(shape_vals, n_comp):
     if n_comp == 1:
         return shape_vals
@@ -548,6 +569,20 @@ def _collect_region_mask_names(node, out=None):
     return out
 
 
+def _collect_tag_mask_names(node, out=None):
+    """Sorted-unique tag names appearing as ``TagMask`` leaves in a lowered expression/IR.
+
+    The surface twin of :func:`_collect_region_mask_names`: the assembler uses it to build only the
+    per-facet masks a term actually references."""
+    if out is None:
+        out = set()
+    if isinstance(node, TagMask):
+        out.add(node.tag)
+    for child in iter_children(node) or ():
+        _collect_tag_mask_names(child, out)
+    return out
+
+
 def _cell_region_mask(domain, region):
     """``(num_cells,)`` 0/1 indicator: a mesh cell is in ``region`` iff its **centroid** is.
 
@@ -579,8 +614,29 @@ def _cell_region_mask(domain, region):
     elif region in preds:
         m = np.asarray(preds[region](*[centroids[:, i] for i in range(dim)]))
     elif region in shape_regions:
-        # A Shape.regions sub-region: analytic CSG membership of the cell centroid (2-D and 3-D).
-        m = np.asarray(shape_regions[region].contains(centroids))
+        # A Shape.regions sub-region: analytic CSG membership of the cell centroid (2-D and 3-D),
+        # MINUS every higher-priority region, because Shape.regions lets regions overlap and resolves
+        # them by declaration order -- a cell belongs to the FIRST region containing it, which is how
+        # the mesh itself is labelled (`emit._to_meshio`).
+        #
+        # Without the subtraction these masks are not a partition, and `domain.by_region` (a sum of
+        # RegionMask * value) silently double counts. The failure is quiet and physical rather than an
+        # error: an enclosing background region -- e.g. a bounding rect declared last to pick up the
+        # leftover void -- contains EVERY cell, so its coefficient is added to every other region's.
+        # Measured on the furnace: the graphite-felt insulation ran at k = 0.5 + 0.186 instead of 0.5,
+        # a 37% leak that pulled the whole crystal region 780 K cold.
+        names = list(shape_regions)
+        m = np.asarray(shape_regions[region].contains(centroids), dtype=bool)
+        for earlier in names[: names.index(region)]:
+            try:
+                m &= ~np.asarray(shape_regions[earlier].contains(centroids), dtype=bool)
+            except NotImplementedError as exc:
+                raise NotImplementedError(
+                    f"jno.fem per-region integration: region {region!r} is declared after {earlier!r}, "
+                    f"so resolving it needs to exclude {earlier!r}'s cells -- but {earlier!r} has no "
+                    f"closed-form point membership. Declare it first, or give it a CSG-representable "
+                    f"shape."
+                ) from exc
     else:
         raise ValueError(
             f"jno.fem per-region integration: unknown region {region!r}. Define it with "
@@ -969,6 +1025,7 @@ def _eval_integrand(domain, node, local):
             Constant,
             TensorTag,
             RegionMask,
+            TagMask,
             Variable,
             TestFunction,
             TrialFunction,
@@ -1010,6 +1067,21 @@ def _eval_integrand(domain, node, local):
                 f"reach this on such a form, the mask wiring for that specific path is missing — please report it."
             )
         return jnp.reshape(jnp.asarray(volume_vars[idx]), (-1,))[0]
+
+    if isinstance(node, TagMask):
+        # Per-facet tag indicator, already sliced to THIS boundary face by the surface kernel. Fail
+        # loud rather than defaulting to 1 (which would integrate the term over the whole boundary) or
+        # to 0 (which would drop it) -- both are silent physics errors. This is also what rejects a
+        # TagMask in a VOLUME term, where `tag_masks` is never populated because there is no facet.
+        tag_masks = local.get("tag_masks", None)
+        if not tag_masks or node.tag not in tag_masks:
+            raise NotImplementedError(
+                f"jno.fem per-tag surface integration: the per-facet mask for tag '{node.tag}' was not "
+                f"threaded into this assembly path. `domain.by_tag` builds a coefficient for a SURFACE "
+                f"term -- one bound to a boundary tag's coordinates. Using it in a volume term, on a "
+                f"non-nodal space, or in 1-D is not supported (see docs/fem.md)."
+            )
+        return jnp.asarray(tag_masks[node.tag])
 
     if isinstance(node, TensorTag):
         if node.tag not in local["domain_context"]:
@@ -1094,8 +1166,43 @@ def _eval_integrand(domain, node, local):
         flat_interp = jnp.sum(vals[:, :, None] * cell_sol[None, :, :], axis=1)
         value_shape = getattr(node, "value_shape", ())
         if len(value_shape) == 0:
-            return flat_interp
+            # A scalar field is ``(n_quad,)``, NOT ``(n_quad, 1)`` -- ``value_shape == ()`` says there is
+            # no component axis, so the interpolation must not invent one. Keeping it is invisible in a
+            # weak term (it contracts with the test function) but RANK-BROADCASTS against anything
+            # genuinely scalar: a scalar ``state.i(-1)`` buffer slice is ``(n_quad,)``, so
+            # ``maximum(H.i(-1), u)`` silently became ``(n_quad, n_quad)`` and the state readout then
+            # produced a buffer of the wrong rank. Squeeze here, at the one place the axis is created.
+            return flat_interp[..., 0]
         return _reshape_components_last(flat_interp, value_shape)
+
+    if isinstance(node, DiffSlot):
+        # The hole a `Diff` differentiates through: its value is injected by the branch below.
+        slots = local.get("__diff_slots__") or {}
+        if node.key not in slots:
+            raise RuntimeError(
+                f"jno.fem: a diff value slot ({node.key}) was evaluated outside its `jno.np.diff(...)`. "
+                "A DiffSlot is internal — it must not appear in a weak form on its own."
+            )
+        return slots[node.key]
+
+    if isinstance(node, Diff):
+        # d(target)/d(wrt), evaluated POINTWISE at this cell's quadrature points.
+        #
+        # `wrt` is evaluated to a concrete array (n_quad, *value_shape); `target` is re-evaluated with
+        # `wrt` swapped for a value slot, so it becomes an ordinary JAX function of that array. Because a
+        # constitutive energy is pointwise in `wrt`, the quadrature axis is a batch axis and the Jacobian
+        # of the SUMMED scalar is block-diagonal — so `grad(sum(...))` returns exactly d(target_q)/d(wrt_q)
+        # per point, with `wrt`'s own shape and no vmap or reshape. Forward-over-reverse through the
+        # element `jacfwd` then yields the consistent tangent d(P)/d(F) for free.
+        wrt_val = _eval_integrand(domain, node.wrt, local)
+        rewritten = node.rewritten()
+
+        def _scalar_of(value):
+            sub = {**(local.get("__diff_slots__") or {}), node._slot.key: value}
+            out = _eval_integrand(domain, rewritten, {**local, "__diff_slots__": sub})
+            return jnp.sum(out)
+
+        return jax.grad(_scalar_of)(wrt_val)
 
     if isinstance(node, HistoryRef):
         # STEP-history read ``v.i(k)``: the driver threads this cell's per-quadrature-point buffer slice
@@ -1106,9 +1213,12 @@ def _eval_integrand(domain, node, local):
         table = local.get("qp_history")
         if table is None or node.history_key not in table:
             raise NotImplementedError(
-                f"history read {node.name!r} has no buffer — a form using ``.i(k)`` must be solved through "
-                "the load-step driver (fem.solve(load=...)), which allocates and threads the per-step "
-                "history. A plain fem.solve() does not carry step history."
+                f"jno.fem: history read {node.name!r} has no per-quadrature-point buffer — this assembly "
+                "path does not allocate or thread step history. `.i(k)` history is wired on the real, "
+                "steady, native-Lagrange path (2D/3D, single-field or coupled), marched over a "
+                "`domain(tau=(start, end, n))` pseudo-time grid by a plain `fem.solve()` — nothing is "
+                "passed to it. Not carried by: 1D, non-nodal (Argyris/Morley/edge) elements, VPINN, "
+                "periodic ties, a `u.t` transient, or a complex form."
             )
         buf_c = table[node.history_key]  # (n_quad, depth, *value_shape) for this cell
         return buf_c[:, -node.offset - 1]  # offset -1 -> slot 0, -2 -> slot 1, ...  -> (n_quad, *value_shape)
@@ -1162,10 +1272,10 @@ def _eval_integrand(domain, node, local):
             _, grads, _ = _field_data(local, node.target)
             fz = _frozen_cell_values(local, node.target)  # (n_local, vec)
             grad_list = [jnp.sum(grads[:, :, dim0 : dim0 + 1] * fz[None, :, :], axis=1) for dim0 in dims]
-            flat = grad_list[0] if len(dims) == 1 else jnp.stack(grad_list, axis=-1)
             value_shape = getattr(node.target, "value_shape", ())
             if len(value_shape) == 0:
-                return flat
+                return _drop_scalar_component_axis(grad_list)
+            flat = grad_list[0] if len(dims) == 1 else jnp.stack(grad_list, axis=-1)
             if len(dims) == 1:
                 return _reshape_components_last(flat, value_shape)
             return jnp.reshape(flat, flat.shape[:1] + tuple(value_shape) + (len(dims),))
@@ -1178,10 +1288,10 @@ def _eval_integrand(domain, node, local):
                 contracted = jnp.einsum("qn...,n->q...", g, cell_sol)
                 return contracted[..., 0] if len(dims) == 1 else contracted
             grad_list = [jnp.sum(grads[:, :, dim0 : dim0 + 1] * cell_sol[None, :, :], axis=1) for dim0 in dims]
-            flat = grad_list[0] if len(dims) == 1 else jnp.stack(grad_list, axis=-1)
             value_shape = getattr(node.target, "value_shape", ())
             if len(value_shape) == 0:
-                return flat
+                return _drop_scalar_component_axis(grad_list)
+            flat = grad_list[0] if len(dims) == 1 else jnp.stack(grad_list, axis=-1)
             if len(dims) == 1:
                 return _reshape_components_last(flat, value_shape)
             return jnp.reshape(flat, flat.shape[:1] + tuple(value_shape) + (len(dims),))
@@ -3137,6 +3247,21 @@ def bcoo_zero_rows_cols(A, dofs):
     return jsparse.BCOO((A.data * keep, A.indices), shape=A.shape)
 
 
+def bcoo_identity_rows(A, mask):
+    """Replace the rows of a BCOO ``A`` selected by a **traced boolean mask** with identity rows.
+
+    The index-array helpers above cannot serve here: a min-map's active set is a function of the current
+    iterate, so it is a traced mask of static length, not a list of DOF numbers. Same two moves — scale
+    the stored entries by the row's keep factor, then append a full diagonal carrying the mask as its
+    value (0 on an inactive row, so those appended entries are exact no-ops and duplicate indices sum)."""
+    m = jnp.asarray(mask).astype(A.data.dtype)
+    n = A.shape[0]
+    data = A.data * (1.0 - m[A.indices[:, 0]])
+    diag = jnp.arange(n, dtype=A.indices.dtype)
+    eye_idx = jnp.stack([diag, diag], axis=1)
+    return jsparse.BCOO((jnp.concatenate([data, m]), jnp.concatenate([A.indices, eye_idx])), shape=A.shape)
+
+
 def bcoo_set_unit_diag(A, dofs):
     """Append unit-diagonal triplets ``(d, d, 1)`` for ``d in dofs`` to a BCOO ``A`` (after the rows
     were zeroed, this makes ``A[d, d] == 1`` exactly — duplicate indices are summed)."""
@@ -3551,8 +3676,30 @@ def apply_compress_plan(data, plan, shape):
 
 def bcoo_set_dirichlet_rows(A, dofs):
     """``A.at[dofs, :].set(0).at[dofs, dofs].set(1)`` for a BCOO ``A`` — row-replacement (identity row,
-    columns kept): the matrix-level analogue of the Newton row-replacement residual."""
+    **columns kept**), the matrix-level analogue of a row-replacement residual.
+
+    Retained only for the paths still on row replacement (the second-order-in-time augmented block and
+    the transient stepper); everything on the steady residual path uses
+    :func:`bcoo_eliminate_dirichlet`, which is symmetric. Keeping the two apart is deliberate: a
+    residual and its tangent must agree on which convention they use, and mixing them silently breaks
+    Newton rather than erroring."""
     return bcoo_set_unit_diag(bcoo_zero_rows(A, dofs), dofs)
+
+
+def bcoo_eliminate_dirichlet(A, dofs):
+    """Symmetric Dirichlet elimination of a BCOO tangent: zero the constrained rows **and columns**,
+    then set a unit diagonal.
+
+    The matrix-level companion of :func:`~jno.utils.solver.fem_1d._apply_dirichlet_projected` — that
+    residual evaluates the free form at the projected point ``P(u)``, whose derivative is
+    ``M·J·M + (I−M)``, and this is exactly that. It replaced a row-only version, which left the
+    constrained columns populated and so made the tangent non-symmetric even for a symmetric operator:
+    jNO tests symmetry *bitwise* (see ``linear._matrix_structure``), so every Dirichlet nonlinear
+    problem was factored as a general LU instead of LDLᵀ.
+
+    Both maskers keep the index array and only zero ``A.data``, so the sparsity pattern is unchanged —
+    which is why the static ``compress_plan`` machinery around this needs no rework."""
+    return bcoo_set_unit_diag(bcoo_zero_rows_cols(A, dofs), dofs)
 
 
 # ---------------------------------------------------------------------------

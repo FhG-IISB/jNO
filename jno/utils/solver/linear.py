@@ -207,6 +207,60 @@ def _cudss_matrix_kind(values, order, orderT, pat) -> str:
     return "general"
 
 
+#: How far from bitwise symmetric a matrix may be and still be treated as symmetric, in units of
+#: machine epsilon relative to ``max|A|``. Measured on this repo's own assemblies: a vector elasticity
+#: tangent lands at **0.29-0.50 ulps** (the element block contracts components in a different order for
+#: ``(a,i),(b,j)`` than for ``(b,j),(a,i)``), while the weakest GENUINE asymmetry that can be
+#: constructed -- an advection coefficient of 1e-12, physically meaningless beside the Laplacian -- is
+#: **191 ulps**. The gate sits between two populations nearly three orders apart, not on a continuum.
+_SYM_ULPS = 64.0
+
+
+def _symmetrized_kind_and_values(values, order, orderT, pat):
+    """``(kind, values)`` — the matrix type, and the values the factorization should actually use.
+
+    An assembled tangent for a symmetric form is symmetric only up to **assembly round-off**, so a
+    bitwise test rejects it and the matrix is factored as a general LU — throwing away LDLᵀ, which is
+    1.41x faster with 1.38x less peak device memory on cuDSS and up to 1.9x on PARDISO. That is the
+    common case, not a corner: every vector or coupled FEM tangent is in it.
+
+    When the two triangles agree to within :data:`_SYM_ULPS`, this averages them. That is a bounded
+    correction rather than a guess:
+
+    * the perturbation is ``||A - Aᵀ||/2``, i.e. at most ``(_SYM_ULPS/2)·eps·max|A|`` — the same order
+      as the round-off already in ``A``, so it adds no error the assembly had not already made. For an
+      operator that genuinely IS symmetric, ``(A + Aᵀ)/2`` is strictly the *better* estimate: it
+      averages two round-off-perturbed measurements of the same number.
+    * the margin is large and was measured, not assumed (see :data:`_SYM_ULPS`).
+
+    Anything outside the gate is left strictly alone — a genuinely non-symmetric operator is never
+    averaged, which is the failure this must not have. This deliberately relaxes the *bitwise* test
+    :func:`_cudss_matrix_kind` still applies on its own; that stricter rule was written to stop a
+    backend silently factoring ``(A+Aᵀ)/2`` for a matrix whose asymmetry might be meaningful, and the
+    gate here is three orders tighter than the regime it was guarding against.
+    """
+    import numpy as _np
+
+    if not pat:
+        return "general", values
+    lower, upper = values[order], values[orderT]
+    if _np.array_equal(lower, upper):
+        return "symmetric", values  # already bitwise: nothing to do
+    if _np.iscomplexobj(values) and _np.array_equal(lower, _np.conj(upper)):
+        return "hermitian", values
+    scale = float(_np.abs(values).max()) if values.size else 0.0
+    if scale == 0.0:
+        return "symmetric", values
+    gap = float(_np.abs(lower - upper).max())
+    if gap > _SYM_ULPS * float(_np.finfo(values.real.dtype).eps) * scale:
+        return "general", values
+    sym = values.copy()
+    avg = 0.5 * (lower + upper)  # float addition is commutative, so this IS bitwise symmetric
+    sym[order] = avg
+    sym[orderT] = avg
+    return "symmetric", sym
+
+
 def _cudss_check_factorization(solver, Ag, bg, cp, shape):
     """Raise if cuDSS silently factored a singular operator.
 
@@ -292,13 +346,16 @@ def _cudss_host_solve(data, indices, rhs, shape, transpose):
         # symmetric need not stay symmetric), and the type is baked into the plan -- so re-detect
         # first and throw the plan away if it no longer applies. Only reached when the values
         # actually differ, so a repeat solve still costs no detection.
-        if _cudss_matrix_kind(data, entry["order"], entry["orderT"], entry["pat"]) != entry["kind"]:
+        _kind_now, _data_sym = _symmetrized_kind_and_values(data, entry["order"], entry["orderT"], entry["pat"])
+        if _kind_now != entry["kind"]:
             _CUDSS_CACHE.pop(skey)["solver"].free()
             entry = None
+        else:
+            data = _data_sym  # the refactorize below must see the same values the plan was built for
 
     if entry is None:
         order, orderT, pat = _cudss_sym_perms(rows, cols)
-        kind = _cudss_matrix_kind(data, order, orderT, pat)
+        kind, data = _symmetrized_kind_and_values(data, order, orderT, pat)
         mtype = _KIND[kind]
         csr = _sp.coo_matrix((data, (rows, cols)), shape=shape).tocsr()
         csr.sum_duplicates()
@@ -504,13 +561,16 @@ def _pardiso_host_solve(data, indices, rhs, shape, transpose):
 
     if entry is not None and entry["dhash"] != dhash:
         # values changed -> they can change the TYPE, which is baked into the analysis
-        if _cudss_matrix_kind(data, entry["order"], entry["orderT"], entry["pat"]) != entry["kind"]:
+        _kind_now, _data_sym = _symmetrized_kind_and_values(data, entry["order"], entry["orderT"], entry["pat"])
+        if _kind_now != entry["kind"]:
             _PARDISO_CACHE.pop(skey)["solver"].free_memory()
             entry = None
+        else:
+            data = _data_sym  # the phase-22 refactorize below must see the plan's own values
 
     if entry is None:
         order, orderT, pat = _cudss_sym_perms(rows, cols)
-        kind = _cudss_matrix_kind(data, order, orderT, pat)
+        kind, data = _symmetrized_kind_and_values(data, order, orderT, pat)
         mtype = _PARDISO_MTYPE[(bool(_np.iscomplexobj(data)), kind)]
         A = _build(data, mtype)
         solver = PyPardisoSolver(mtype=mtype)

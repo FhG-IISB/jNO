@@ -424,3 +424,69 @@ def test_coupled_complex_nonlinear_rejected():
                 w(xb, yb) - 0.0,
             ]
         )
+
+
+def test_coupled_nonlinear_form_threads_a_runtime_parameter():
+    """A coupled steady form carrying a `jno.np.parameter` is refused only when it is LINEAR — that is
+    the branch (a matrix/rhs pair) with no parametric route. A NONLINEAR coupled form assembles as a
+    residual operator that re-evaluates at the runtime args, which is entirely field-agnostic, so it
+    threads the parameter and differentiates like any other inverse problem.
+
+    This is the shape a coupled material-identification inverse takes (recovering a coupling constant
+    from an observed pair of fields), and it is what makes a staggered solve on such a system usable.
+    """
+    import jax
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.25)
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    k = jno.np.reshape(jno.np.parameter((1,), name="kc"), ())
+    a, phi = d.fem_symbols(names=("pa", "pphi"))
+    b, chi = d.fem_symbols(names=("pb", "pchi"))
+    ai, pi = a.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    bi, qi = b.bind(x=xi, y=yi), chi.bind(x=xi, y=yi)
+    fem = jno.fem(
+        [
+            (ai.x * pi.x + ai.y * pi.y) + 0.1 * (a * a) * pi - 1.0 * pi - k * b * pi,
+            (bi.x * qi.x + bi.y * qi.y) + b * qi - 2.0 * a * qi,
+            a(xb, yb) - 0.0,
+            b(xb, yb) - 0.0,
+        ]
+    )
+    assert len(fem.blocks) == 2 and fem._op.is_parametric, "the coupled nonlinear form must stay parametric"
+
+    op = fem._op
+    from jno.utils.solver.newton_krylov import newton_krylov
+
+    u0 = jnp.zeros(int(op.size))
+
+    def norm_at(kv):
+        sol = newton_krylov(lambda z: op.residual(z, {"kc": jnp.reshape(kv, (1,))}), u0, rtol=1e-12, atol=1e-14)
+        return jnp.sum(sol**2)
+
+    g = jax.grad(norm_at)(0.4)
+    fd = (norm_at(0.4 + 1e-6) - norm_at(0.4 - 1e-6)) / 2e-6
+    assert np.isfinite(g) and abs(g) > 0, "the gradient to the coupling parameter vanished"
+    assert np.allclose(g, fd, rtol=1e-6), f"AD {g:.8e} vs FD {fd:.8e}"
+
+
+def test_coupled_linear_form_with_a_runtime_parameter_still_fails_loud():
+    """The other side of the same gate: linear + no history really has no parametric route, and the
+    message must say which of the two facts decided it."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.3)
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    k = jno.np.reshape(jno.np.parameter((1,), name="kl"), ())
+    a, phi = d.fem_symbols(names=("la", "lphi"))
+    b, chi = d.fem_symbols(names=("lb", "lchi"))
+    ai, pi = a.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    bi, qi = b.bind(x=xi, y=yi), chi.bind(x=xi, y=yi)
+    with pytest.raises(NotImplementedError, match="linear with no step history"):
+        jno.fem(
+            [
+                (ai.x * pi.x + ai.y * pi.y) - 1.0 * pi - k * b * pi,
+                (bi.x * qi.x + bi.y * qi.y) + b * qi - 2.0 * a * qi,
+                a(xb, yb) - 0.0,
+                b(xb, yb) - 0.0,
+            ]
+        )

@@ -37,6 +37,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from .trace import (
+    BoundConstraint,
     FemLinearSystem,
     FemResidualOperator,
     FunctionCall,
@@ -49,11 +50,27 @@ from .trace import (
     TestFunction,
     TrialFunction,
     Variable,
+    bound_constraints,
     mesh_velocity,
     state_updates,
 )
 
 __all__ = ["fem", "FEM"]
+
+
+def _any_step_slot(x0, nonlinear, linear, precond, time) -> bool:
+    """Is any slot that configures the PER-STEP solve set? (``tau=`` configures the march instead.)"""
+    return any(s is not None for s in (x0, nonlinear, linear, precond, time))
+
+
+def _default_newton(residual_fn, u0):
+    """The operator's own default nonlinear driver, called explicitly.
+
+    ``FemResidualOperator.solve(None)`` picks this internally; the bound wrapper has to name it because
+    it always hands the operator a ``solve_fn``, so "no slot passed" can no longer mean "use the default"."""
+    from .utils.solver.newton_krylov import newton_krylov
+
+    return newton_krylov(residual_fn, u0)
 
 
 def _as_dense(x):
@@ -1262,6 +1279,7 @@ class FEM:
         linear=None,
         precond=None,
         time=None,
+        tau=None,
         basis=None,
         shard=None,
         profile=False,
@@ -1416,6 +1434,7 @@ class FEM:
                     linear=linear,
                     precond=precond,
                     time=time,
+                    tau=tau,
                     shard=shard,
                     **kwargs,
                 )
@@ -1562,6 +1581,7 @@ class FEM:
         linear=None,
         precond=None,
         time=None,
+        tau=None,
         shard=None,
         **kwargs,
     ):
@@ -1572,6 +1592,7 @@ class FEM:
             or (linear is not None)
             or (precond is not None)
             or (time is not None)
+            or (tau is not None)
         )
         if getattr(self, "_geometry", None):
             # A geometry term (`coord.d(t) - velocity`) states that the mesh moves. Its driver owns the
@@ -1592,6 +1613,19 @@ class FEM:
 
             return run_mesh_motion(self, solve_fn=solve_fn, **kwargs)
         if adapt is not None:
+            # A load-path march is dispatched BELOW this branch, so an `adapt=` on a form carrying step
+            # history used to return here with a single STEADY solve -- shape (n_dofs,) where the caller
+            # asked for a (n_steps, n_dofs) trajectory -- and a `tau=` alongside it was dropped without a
+            # word. Silently solving a different problem is the one thing this codebase does not do.
+            if getattr(self._op, "history_specs", None) or getattr(self._op, "surface_history_specs", None):
+                raise NotImplementedError(
+                    "fem.solve: adapt= does not compose with a pseudo-time LOAD-PATH march (this form "
+                    "reads step history via `.i(k)`). Remeshing changes the DOF layout, and the march "
+                    "carries per-quadrature-point state across every step, so the state would have to be "
+                    "transferred onto each new mesh — wired for the transient stepper, not for `tau=`. "
+                    "For a fixed graded mesh instead, put the refinement in the geometry: "
+                    "`Shape.box(...).sized(lambda x, y, z: fine if <in band> else coarse)`."
+                )
             if getattr(adapt, "relocate", False):
                 # r-adaptivity: relocate the .trainable() vertices (fixed connectivity), not h-refinement.
                 from .utils.solver.fem_adapt import run_adaptive_relocate
@@ -1624,7 +1658,10 @@ class FEM:
             # (complex) recovered-gradient gap; only the anisotropic Hessian metric is real-only (guarded in
             # run_adaptive_solve).
             return run_adaptive_solve(self, adapt, solve_fn=solve_fn, **kwargs)
-        if has_slots:
+        # `tau=` sizes the load-path steps; it configures the MARCH, not the per-step solve, so it is
+        # consumed below rather than composed into `solve_fn` (and on its own it must not force the
+        # composition, which would replace the operator's default driver with an explicit equivalent).
+        if has_slots and not (tau is not None and not _any_step_slot(x0, nonlinear, linear, precond, time)):
             solve_fn, kwargs = self._compose_slots(
                 solve_fn,
                 x0=x0,
@@ -1638,6 +1675,13 @@ class FEM:
             from_slots = True
         else:
             from_slots = False
+
+        # ---- BOX CONSTRAINTS (`u.bounds(lo, hi)`): wrap whatever nonlinear driver was composed above so
+        # it root-finds the min-map instead of the bare residual. Done here, once, so the same wrapper
+        # serves the plain steady solve and every step of the history march below, and composes with any
+        # `nonlinear=` slot the caller picked. ----
+        if getattr(self, "_bound_specs", None):
+            solve_fn = self._bounded_solve_fn(solve_fn)
 
         # ---- pseudo-time HISTORY MARCH (path-dependent state, e.g. plasticity): the op carries step-
         # history buffers (``.i(k)`` in the form) and the domain a ``tau=`` pseudo-time grid. March the
@@ -1654,12 +1698,18 @@ class FEM:
                 )
             if getattr(self._op, "state_readout", None) is None:
                 raise NotImplementedError(
-                    "jno.fem: the history march is only wired on the real, steady, single-field native "
-                    "Lagrange path; this form assembled through another route."
+                    "jno.fem: the history march is only wired on the real, steady native-Lagrange path "
+                    "(single-field or coupled); this form assembled through another route."
                 )
             from .utils.solver.history_march import run_history_march
 
-            return run_history_march(self, solve_fn if from_slots else solve_fn)
+            return run_history_march(self, solve_fn if from_slots else solve_fn, path=tau)
+        if tau is not None:
+            raise ValueError(
+                "fem.solve(tau=...) sizes the steps of a pseudo-time LOAD-PATH march, but this form does "
+                "not march one: the march is triggered by step history (`.i(k)` in the terms) together "
+                "with a `domain(tau=(start, end, n))` grid. Add both, or drop tau=."
+            )
         if from_slots and getattr(precond, "complex_native", False) and self._complex_legs is not None:
             # A complex-native preconditioner (AMS) solves the sparse COMPLEX operator ``A_r + i·A_i``
             # directly, never the real-equivalent block — so it wants the Re/Im legs the fusion retained,
@@ -1807,6 +1857,16 @@ class FEM:
         if time is not None and self._mode != "transient":
             raise ValueError(
                 f"fem.solve(time=...) picks a time-integration scheme, but this problem is {self._mode}, not transient."
+            )
+        if time is not None and getattr(time, "limit", None) is not None:
+            # Checked here rather than in the scheme, because not every transient route reaches a
+            # scheme's own `integrate` — and applying the wrong step-size criterion silently would be a
+            # plausible wrong answer, which is exactly what this codebase refuses to do.
+            raise ValueError(
+                "fem.solve(time=jno.solve.adaptive(limit=...)): `limit` bounds the per-step SOLUTION "
+                "CHANGE on a pseudo-time LOAD PATH, and belongs in the `tau=` slot of a "
+                "`domain(tau=...)` march. A transient is sized by its local truncation error instead — "
+                "drop `limit` and use rtol/atol here."
             )
         if self._mode == "transient":
             # thread the slots into the default theta-stepper as per-step solvers: the linear
@@ -2101,6 +2161,295 @@ class FEM:
         if self._mode == "transient":
             return lambda u, t, args=None: _as_flat(self._op.residual(u, t, args or {}))
         raise AttributeError(f"FEM is {self._mode}; .residual is for a steady-nonlinear or transient problem.")
+
+    def eval(self, term, u, *, args=None):
+        """Assemble one **weak term** at the solution ``u`` — the free ``(n_dofs,)`` vector, with **no**
+        essential elimination applied.
+
+        This is the readout primitive. The conjugate quantity on a constrained region — **reaction
+        force** in mechanics, **total heat flux** through a Dirichlet wall, **current** in
+        electrostatics, **flow rate** in Darcy — is that vector summed over the region's DOFs::
+
+            fem = jno.fem([mech, *bcs])
+            u   = fem.solve()
+            R   = fem.eval(mech, u)                       # internal force at every DOF
+            Fy  = R[fem.region_dofs("top", component=1)].sum()   # reaction on the top edge
+
+        It has to be a separate entry point because every solve path elimination-mutates the system it
+        keeps: the linear route applies symmetric elimination (``A``/``b`` here have the constrained rows
+        zeroed and a unit diagonal set), and Newton replaces those rows with ``u[d] - g``. Both are
+        correct for solving and both return **exactly zero** at the DOFs a reaction readout is asking
+        about — so reading it off ``fem.A``/``fem.b``/``fem.residual`` gives a plausible, silent zero.
+
+        ``term`` is any weak term built from this domain's symbols (it carries the test function); it does
+        **not** have to be one of the terms this FEM was built from, so a diagnostic form — a sub-term, a
+        different stress measure — can be assembled against an existing solution. A term with no test
+        function is a field readout rather than an assembly and is refused by name.
+        """
+        from .utils.solver.solver_helper import contains_node_type
+
+        factory = getattr(self, "_term_residual_factory", None)
+        if factory is None:
+            raise NotImplementedError(
+                "fem.eval: this problem was not assembled through the native Lagrange assembler, which is "
+                "the only route that publishes a free (pre-Dirichlet) residual. Not wired for: non-nodal "
+                "(Argyris/Morley/edge) elements, 1-D, and the VPINN path."
+            )
+        terms = list(term) if isinstance(term, (list, tuple)) else [term]
+        bares = []
+        for t in terms:
+            bare = getattr(t, "expr", t)
+            if not contains_node_type(bare, TestFunction):
+                raise ValueError(
+                    "fem.eval(term, u): every entry must be a WEAK TERM — it must contain the test "
+                    "function, so it assembles to one value per DOF. An expression without a test "
+                    "function is a field readout (a stress, an energy density) at quadrature points, "
+                    "which is a different operation and is not wired yet."
+                )
+            support, region = _region_and_support(t, self.domain)
+            if support != "volume":
+                raise NotImplementedError(
+                    f"fem.eval: this term lives on boundary region {region!r}. Only volume terms are "
+                    "assembled here; a surface term needs the per-region facet bucketing the front-end "
+                    "does at build time. Pass the volume terms and add the known applied load yourself."
+                )
+            bares.append(bare)
+        return _as_flat(factory(bares)(jnp.asarray(u).reshape(-1), 0.0, args))
+
+    def region_dofs(self, region, *, field=0, component=None):
+        """Global DOF indices of a tagged region — the companion to :meth:`eval`.
+
+        ``field`` selects the block (a trial symbol or an index, resolved by :meth:`block_index`);
+        ``component`` picks one component of a vector field (``None`` = all of them). Returns a plain
+        ``numpy`` int array, so it indexes a solution or a residual directly.
+        """
+        from .utils.solver.fem_utils import _value_shape_num_components
+
+        idx = field if isinstance(field, int) else self.block_index(field)
+        pts = self.field_points
+        if pts is None:
+            raise NotImplementedError("fem.region_dofs: this assembly route does not expose DOF coordinates.")
+        pts_f = np.asarray(pts[idx])
+        mask = self.domain.tag_node_mask(region, pts_f)
+        if mask is None:
+            known = sorted(getattr(self.domain, "_boundary_regions", {}) or {})
+            raise KeyError(f"fem.region_dofs: unknown region {region!r}. Tagged regions: {known}")
+        nodes = np.flatnonzero(np.asarray(mask))
+        if nodes.size == 0:
+            raise ValueError(
+                f"fem.region_dofs: region {region!r} matched no DOF node of field {idx}. A tag tolerance "
+                "finer than the mesh, or a region on a different field's nodes, is the usual cause."
+            )
+        offs = self.offsets
+        vec = int(_value_shape_num_components(self._field_value_shape(idx)))
+        base = int(offs[idx]) if offs is not None else 0
+        comps = range(vec) if component is None else [int(component)]
+        return np.concatenate([base + nodes * vec + c for c in comps])
+
+    def _field_value_shape(self, idx):
+        """The ``value_shape`` of block ``idx`` — from the assembler's own field list."""
+        shapes = getattr(self, "_block_value_shapes", None)
+        if shapes and idx < len(shapes):
+            return shapes[idx]
+        return ()
+
+    @property
+    def tau_schedule(self):
+        """The load-path τ values the last ``fem.solve(tau=...)`` actually stepped through (``None`` if
+        no adaptive/explicit path has run).
+
+        Pass it straight back as ``fem.solve(tau=fem.tau_schedule)`` to replay that schedule — which is
+        how a *differentiable* run gets an adapted path, since the pilot that discovers one needs
+        concrete values and a differentiable solve has only tracers."""
+        s = getattr(self, "_tau_schedule", None)
+        return None if s is None else np.asarray(s)
+
+    # ---- box constraints (``u.bounds(lo, hi)``) -------------------------------------------------
+    def _bounded_solve_fn(self, solve_fn):
+        """Wrap a ``(residual_fn, u0) -> u`` solver so it root-finds the box's **min-map** instead.
+
+        The KKT conditions of the box-constrained problem — ``R = 0`` strictly inside, ``R >= 0`` on
+        ``lo``, ``R <= 0`` on ``hi`` — are exactly the zeros of
+
+            Phi(u) = min( max( R(u), u - hi ), u - lo )
+
+        the *natural residual* / min function of the box-constrained variational inequality (Facchinei &
+        Pang, *Finite-Dimensional Variational Inequalities and Complementarity Problems*, Springer 2003,
+        §1.5). ``Phi`` is semismooth rather than smooth, and Newton on it converges locally
+        superlinearly (Qi & Sun, *A nonsmooth version of Newton's method*, Math. Programming 58, 1993).
+
+        This needs no new solver: ``jax.linearize`` differentiates through ``min``/``max`` by selecting
+        the active branch, which IS the semismooth Jacobian (the residual row where the constraint is
+        inactive, an identity row where it is active), so the existing Newton-Krylov and sparse-direct
+        drivers apply unchanged — and ``lax.custom_root`` differentiates the result on that same
+        operator, which is the implicit-function theorem for the active set at the solution.
+
+        **Sign convention.** ``Phi`` fixes the multiplier's sign from the residual's, so the weak form
+        must be written in the standard variational orientation ``a(u,v) - L(v)`` (the gradient of an
+        energy). Written with the opposite sign it states the *other* inequality. There is no way to
+        detect this from the residual alone, so it is a documented convention, not a checked one."""
+
+        def _prepare_residual(residual_fn, u0):
+            """``(root_fn, start)`` — what the driver is actually handed for this warm start.
+
+            Split out from ``_bounded`` so a caller that must *judge* the solve afterwards measures the
+            same function the driver root-found. It matters: on an ACTIVE bound the bare residual is
+            deliberately non-zero (it is the constraint's multiplier), so scoring a converged
+            box-constrained solve against ``residual_fn`` reads a correct answer as a failure. Only
+            ``Phi`` vanishes at the solution."""
+            u0 = jnp.asarray(u0).reshape(-1)
+            resolved = self._resolve_bounds(u0)
+            if resolved is None:
+                return residual_fn, u0
+            lo, hi = resolved
+            has_lo, has_hi = jnp.isfinite(lo), jnp.isfinite(hi)
+            # Finite stand-ins under the `where`: an infinite bound would put +-inf into the arithmetic
+            # (and its tangent) even on the branch that is discarded.
+            lo_s = jnp.where(has_lo, lo, 0.0)
+            hi_s = jnp.where(has_hi, hi, 0.0)
+
+            def phi(u):
+                u = jnp.asarray(u).reshape(-1)
+                r = jnp.asarray(residual_fn(u)).reshape(-1)
+                r = jnp.where(has_hi, jnp.maximum(r, u - hi_s), r)
+                return jnp.where(has_lo, jnp.minimum(r, u - lo_s), r)
+
+            # Start inside the box: the min-map is only informative on a feasible iterate, and a warm
+            # start from the previous load step can sit exactly on the old bound.
+            start = jnp.clip(u0, jnp.where(has_lo, lo, -jnp.inf), jnp.where(has_hi, hi, jnp.inf))
+            return phi, start
+
+        def _prepare_jacobian(residual_fn, jacobian_fn, u0):
+            """``Phi``'s **semismooth** Jacobian: the residual row where the box is inactive, an identity
+            row where it is active.
+
+            ``jax.linearize`` derives exactly this by selecting the live branch of the ``min``/``max``,
+            which is what makes the matrix-free driver work with no extra code. A driver that factorizes
+            an ASSEMBLED tangent gets no such help — it is handed the bare ``R``'s Jacobian, which is the
+            wrong operator for the constrained problem — so the same selection is applied to the matrix
+            here. The active set is a function of the iterate, hence a traced mask rather than a DOF
+            list, which is what :func:`bcoo_identity_rows` exists for."""
+            resolved = self._resolve_bounds(u0)
+            if resolved is None:
+                return jacobian_fn
+            from .utils.solver.fem_utils import bcoo_identity_rows
+
+            lo, hi = resolved
+            has_lo, has_hi = jnp.isfinite(lo), jnp.isfinite(hi)
+            lo_s = jnp.where(has_lo, lo, 0.0)
+            hi_s = jnp.where(has_hi, hi, 0.0)
+
+            def jac(u):
+                u = jnp.asarray(u).reshape(-1)
+                r = jnp.asarray(residual_fn(u)).reshape(-1)
+                # Which branch `phi` took, row by row — the `min` is applied to the `max`'s OUTPUT, so
+                # the lower test reads `r1`, not `r`.
+                r1 = jnp.where(has_hi, jnp.maximum(r, u - hi_s), r)
+                active = (has_hi & ((u - hi_s) > r)) | (has_lo & ((u - lo_s) < r1))
+                return bcoo_identity_rows(jacobian_fn(u), active)
+
+            return jac
+
+        def _box_projector(u0):
+            """``u -> clip(u, lo, hi)`` for the declared boxes, or ``None`` if there are none.
+
+            Handed to a driver that extrapolates past its own sub-solve (``staggered(over_relax>1)``):
+            the sub-solve's answer is feasible by construction, a step BEYOND it need not be."""
+            resolved = self._resolve_bounds(u0)
+            if resolved is None:
+                return None
+            lo, hi = resolved
+            return lambda u: jnp.clip(jnp.asarray(u).reshape(-1), lo, hi)
+
+        def _bounded(residual_fn, u0, *, jacobian=None):
+            root_fn, start = _prepare_residual(residual_fn, u0)
+            if solve_fn is None:
+                return _default_newton(root_fn, start)
+            extra = {}
+            if jacobian is not None and getattr(solve_fn, "wants_jacobian", False):
+                extra["jacobian"] = _prepare_jacobian(residual_fn, jacobian, u0)
+            if getattr(solve_fn, "wants_project", False):
+                extra["project"] = _box_projector(u0)
+            return solve_fn(root_fn, start, **extra)
+
+        _bounded.prepare_residual = _prepare_residual
+        # Keep the wrapped driver's own flags visible THROUGH the wrapper: the caller decides whether to
+        # assemble a tangent at all by reading `wants_jacobian`, and judges convergence by `tolerances`.
+        for _attr in ("tolerances", "wants_jacobian", "wants_project"):
+            if getattr(solve_fn, _attr, None) is not None:
+                setattr(_bounded, _attr, getattr(solve_fn, _attr))
+        return _bounded
+
+    def _resolve_bounds(self, u_warm):
+        """``(lo, hi)`` over the whole DOF vector for the declared boxes, or ``None`` if there are none.
+
+        Unbounded entries come back as ``-inf`` / ``+inf``, so an unconstrained DOF passes through the
+        min-map untouched. ``u_warm`` is the solve's warm start; a ``field.i(-1)`` bound reads that
+        field's block out of it, which on a ``domain(tau=...)`` march is the previous load step."""
+        specs = getattr(self, "_bound_specs", None)
+        if not specs:
+            return None
+        n = int(self.dofs)
+        lo = jnp.full((n,), -jnp.inf, dtype=jnp.zeros(()).dtype)
+        hi = jnp.full((n,), jnp.inf, dtype=lo.dtype)
+        u_warm = jnp.asarray(u_warm).reshape(-1)
+        for field_key, spec in specs.items():
+            idx = self.block_index(spec.target)
+            sl = self.blocks[idx] if self.blocks is not None else slice(0, n)
+            width = int(sl.stop) - int(sl.start)
+            for side, node in (("lo", spec.lo), ("hi", spec.hi)):
+                if node is None:
+                    continue
+                vals = self._bound_side_values(node, idx, width, u_warm, sl, side, field_key)
+                if side == "lo":
+                    lo = lo.at[sl].set(vals)
+                else:
+                    hi = hi.at[sl].set(vals)
+        return lo, hi
+
+    def _bound_side_values(self, node, idx, width, u_warm, sl, side, own_key):
+        """One side of a box, as a ``(width,)`` vector over that field's DOF block."""
+        from .trace import HistoryRef, Placeholder
+
+        if isinstance(node, (int, float, np.floating, np.integer)):
+            return jnp.full((width,), float(node), dtype=u_warm.dtype)
+        if isinstance(node, HistoryRef):
+            # ``u.i(-1)``: the previous load step's values for this field — which is exactly the warm
+            # start the march hands the solver. Only depth 1 means anything here; a deeper read would
+            # need a DOF-space trajectory the solve does not carry.
+            if int(node.offset) != -1:
+                raise NotImplementedError(
+                    f"jno.fem: `.bounds(...)` accepts `.i(-1)` (the previous load step) as the {side} bound; "
+                    f"`.i({int(node.offset)})` would need a DOF-space history the solve does not carry."
+                )
+            if getattr(node.base, "field_key", None) != own_key:
+                raise NotImplementedError(
+                    "jno.fem: a `.i(-1)` bound must read the field it bounds — a cross-field history bound "
+                    "is not wired (the two fields need not share a DOF layout)."
+                )
+            if not getattr(self.domain, "_is_pseudo_time", False):
+                raise ValueError(
+                    "jno.fem: `.bounds(..., u.i(-1), ...)` means *the previous load step*, so it needs a "
+                    "pseudo-time load path — build the domain with `domain(tau=(start, end, n))`. On a plain "
+                    "steady solve there is no previous step for the bound to refer to."
+                )
+            return u_warm[sl]
+        if isinstance(node, Placeholder):
+            # A coordinate expression: evaluated at this field's own DOF points, exactly as a
+            # spatially-varying Dirichlet value is (the mesh is built, so this is one forward pass).
+            pts = np.asarray(self.field_points[idx])
+            vals = jnp.reshape(jnp.asarray(_eval_value_node_at(node, pts)), (-1,))
+            vec = max(1, width // max(1, int(pts.shape[0])))
+            if vals.shape[0] * vec != width:
+                raise ValueError(
+                    f"jno.fem: the {side} bound expression produced {vals.shape[0]} values for a field with "
+                    f"{pts.shape[0]} DOF nodes — a bound must be a scalar function of the coordinates."
+                )
+            return jnp.repeat(vals, vec) if vec > 1 else vals
+        raise TypeError(
+            f"jno.fem: the {side} of `.bounds(...)` must be a number, a coordinate expression, or `u.i(-1)`; "
+            f"got {type(node).__name__}."
+        )
 
     @property
     def jacobian(self):
@@ -3399,6 +3748,13 @@ def _fem_impl(
     _evolution = state_updates(constraints)  # {history_key: StateUpdate}
     constraints = [c for c in constraints if not isinstance(_bare(c), StateUpdate)]
 
+    # BOX CONSTRAINTS (`u.bounds(lo, hi)`): pulled out here for the same reason — the term carries no
+    # test function and is not an equation, so the weak-form classifier would not claim it and the
+    # Dirichlet branch would read its bound as an essential value. What it states is the feasible SET,
+    # which the solve enforces through the KKT conditions of the resulting variational inequality.
+    _bounds = bound_constraints(constraints)  # {field_key: BoundConstraint}
+    constraints = [c for c in constraints if not isinstance(_bare(c), BoundConstraint)]
+
     # GEOMETRY terms (`yb.d(tb) - v`): how a mesh *coordinate* moves, stated as a residual like any other
     # equation. Pulled out here for the same reason as the evolution bucket — the term carries no test
     # function, so the weak-form classifier would not claim it, and the Dirichlet branch would try to read
@@ -3473,20 +3829,19 @@ def _fem_impl(
     if vec is None and not multifield:
         vec = _infer_vec(constraints)  # single-field only (coupled fields carry per-field vec)
 
-    # Evolution terms ride the real, steady, single-field native-Lagrange path only (the plasticity
-    # load-path march). Reject the structurally-incompatible routes up front — fail loud, never a
-    # silently dropped update. (transient / complex are rejected below, once the IR reveals them.)
+    # Evolution terms ride the real, steady, native-Lagrange path — single field or coupled. The history
+    # buffers are indexed by CELL, never by field, and the state readout gathers the concatenation of every
+    # field's cell DOFs, so a coupled form needs no per-field state machinery: a damage field reading the
+    # displacement field's energy history is the same march as one-field plasticity. Reject the
+    # structurally-incompatible routes up front — fail loud, never a silently dropped update.
+    # (transient / complex are rejected below, once the IR reveals them.)
     if _evolution and (
-        multifield
-        or is_vpinn
-        or getattr(domain, "dimension", None) == 1
-        or (_trial_spaces(constraints) - {"Lagrange"})
-        or periodic_ties
+        is_vpinn or getattr(domain, "dimension", None) == 1 or (_trial_spaces(constraints) - {"Lagrange"}) or periodic_ties
     ):
         raise NotImplementedError(
-            "jno.fem: `state.evolves(...)` evolution terms are supported on the real, steady, single-field "
-            "native-Lagrange path only (the plasticity load-path march over `domain(tau=...)`). Not yet: "
-            "multifield, VPINN, 1D, non-nodal (Argyris/Morley/edge) elements, or periodic ties."
+            "jno.fem: `state.evolves(...)` evolution terms are supported on the real, steady, "
+            "native-Lagrange path only (the load-path march over `domain(tau=...)`), single-field or "
+            "coupled. Not yet: VPINN, 1D, non-nodal (Argyris/Morley/edge) elements, or periodic ties."
         )
 
     # The transient route reduces M/A from the assembly context at *assembly* time, so its P must be
@@ -3507,11 +3862,25 @@ def _fem_impl(
         # the constraint-walk order is the fallback for paths that don't run the native assembler.
         fem_obj._block_field_keys = list(getattr(domain, "_fem_native_field_keys", None) or ())
         fem_obj._trial_field_keys = _field_keys(_orig_constraints)
+        # Free (pre-Dirichlet) residual factory behind FEM.eval — same capture-now reason as above.
+        fem_obj._term_residual_factory = getattr(domain, "_fem_native_term_residual", None)
+        fem_obj._block_value_shapes = list(getattr(domain, "_fem_native_field_shapes", None) or ())
         # Same snapshot treatment for the DOF coordinates behind .points / .field_points — an
         # auxiliary assembly (jno.precond.form) would otherwise clobber them mid-solve.
         fem_obj._native_dof_points = getattr(domain, "_fem_native_dof_points", None)
         _all = getattr(domain, "_fem_native_dof_points_all", None)
         fem_obj._native_dof_points_all = list(_all) if _all is not None else None
+        # Box constraints, resolved to DOF-space vectors lazily at solve time (they need the assembled
+        # field layout, which only exists now). Kept raw here so a `u.i(-1)` bound can read the warm start.
+        fem_obj._bound_specs = dict(_bounds)
+        if _bounds and fem_obj._mode not in ("nonlinear",):
+            raise NotImplementedError(
+                "jno.fem: `u.bounds(lo, hi)` is wired on the steady residual path (real, 2D/3D "
+                f"native-Lagrange, single-field or coupled); this form assembled as '{fem_obj._mode}'. A "
+                "bound states a feasible set enforced through the KKT conditions of a variational "
+                "inequality, which needs a residual to test — not a transient stepper or a complex "
+                "real-equivalent block."
+            )
         if couplings and periodic_ties and fem_obj.is_transient:
             # The native periodic *transient* block reduces eagerly into a main-DOF space; the coupling
             # residual is written in the full nodal space, so the two cannot be composed on that path yet.
@@ -3955,7 +4324,15 @@ def _fem_impl(
     if multifield:
         return _finalize(
             _assemble_multifield(
-                domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, classification, quad_degree=quad_degree
+                domain,
+                volume_terms,
+                boundary_terms,
+                dirichlet_raw,
+                ic_residuals,
+                classification,
+                quad_degree=quad_degree,
+                evolution=_evolution,
+                bounded=bool(_bounds),
             )
         )
 
@@ -4054,6 +4431,7 @@ def _fem_impl(
                 vec=vec or 1,
                 quad_degree=quad_degree,
                 evolution=_evolution,
+                bounded=bool(_bounds),
             )
             return _finalize(FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs))
 
@@ -4348,13 +4726,30 @@ def _fem_impl(
     )
 
 
-def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, classification, *, quad_degree):
+def _assemble_multifield(
+    domain,
+    volume_terms,
+    boundary_terms,
+    dirichlet_raw,
+    ic_residuals,
+    classification,
+    *,
+    quad_degree,
+    evolution=None,
+    bounded=False,
+):
     """Assemble a coupled (multi-field) steady weak form into a block ``FEM``.
 
     Builds the same IR as the single-field path, buckets Dirichlet per field
     (field ordering taken from ``ir.volume_expr``), and hands off to the native
     assembler, which groups the per-tag surface terms into per-field surface
-    kernels and differentiates the coupled block matrix."""
+    kernels and differentiates the coupled block matrix.
+
+    ``evolution`` carries the ``state.evolves(...)`` updates for a load-path march. It is forwarded to
+    the native assembler, which allocates each state's per-quadrature-point buffer and builds the
+    readout — both indexed by cell, so the coupled case needs nothing extra here. The march is the
+    *pseudo-time* path, so it is rejected below for a real (``u.t``) transient and for a complex form."""
+    from .trace import history_variables as _history_variables
     from .utils.solver.fem_utils import _infer_fields
     from .utils.solver.parametric_helpers import _contains_runtime_parameter
     from .utils.solver.weak_form import (
@@ -4368,6 +4763,15 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
 
     weak_bares = volume_terms + [e for exprs in boundary_terms.values() for e in exprs]
     is_transient = bool(ic_residuals) or any(_contains_temporal_derivative(b) for b in weak_bares)
+    evolution = dict(evolution or {})
+    # Does this form carry step history? Scanned exactly as the assembler scans it — the weak terms plus
+    # every evolution formula, since a state can be read only inside its own update.
+    _carries_history = bool(_history_variables(weak_bares + [su.formula for su in evolution.values()]))
+    # Will this form assemble as a RESIDUAL operator rather than a matrix/rhs pair? Either trigger does
+    # it: a nonlinearity in the unknown, or step history. That is the question the runtime-parameter gate
+    # below actually needs answered — a residual operator re-evaluates at the runtime args and is
+    # entirely field-agnostic, while the coupled linear assembly has no parametric route.
+    _residual_path = _carries_history or any(_is_obviously_nonlinear_in_unknown(domain, b) for b in weak_bares)
 
     domain._fem_quad_degree = quad_degree
     domain._variational_initialized = True
@@ -4433,7 +4837,15 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
         getattr(domain, "dimension", None) in (2, 3)
         and all(str(f.get("space", "Lagrange")) == "Lagrange" for f in fields)
         and not _is_complex_form(domain, ir)
-        and not any(_contains_runtime_parameter(b) for b in weak_bares)
+        # A runtime parameter is excluded because the coupled *linear* assembly has no parametric route --
+        # not because the parameter itself is a problem. A form on the RESIDUAL path never takes that
+        # route: it assembles as a ``FemResidualOperator`` that re-evaluates at the runtime ``args`` each
+        # call, which is entirely field-agnostic (the coupled *transient* branch below already allows a
+        # parameter for exactly this reason). So gate on WHICH BRANCH the form will take. This is what
+        # makes a coupled load-path march — and a coupled nonlinear inverse problem, the shape a
+        # staggered solve identifies material parameters with — differentiable in a material parameter,
+        # as the single-field paths already were.
+        and (not any(_contains_runtime_parameter(b) for b in weak_bares) or _residual_path)
     )
 
     # Coupled transient (multi-field + time): block M + block spatial operator A. Native handles
@@ -4441,6 +4853,15 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
     # g(x,t) for the LINEAR block (row-replacement + per-step Dirichlet-lift forcing); a nonlinear block
     # with a time-varying Dirichlet is rejected below (the native branch carries only constant Dirichlet).
     if is_transient:
+        if evolution:
+            # Same rejection the single-field path makes once its IR reveals the transient — restated here
+            # because a coupled form reaches this assembler FIRST, so it never gets there. The load path is
+            # the *pseudo-time* march over `domain(tau=...)`, not a `u.t` transient.
+            raise NotImplementedError(
+                "jno.fem: `state.evolves(...)` cannot combine with a real time derivative (`u.t`) on a "
+                "coupled (multi-field) form — the load path is the *pseudo-time* march over "
+                "`domain(tau=...)`, not a `u.t` transient. Drop `u.t`, or drive time through the `tau` grid."
+            )
         _tv_native = not dirichlet_tv or not any(_is_obviously_nonlinear_in_unknown(domain, b) for b in weak_bares)
         # The native coupled-transient assembler threads runtime SCALAR parameters through ``args``
         # (``fem_native._runtime_vals`` packs each parameter per cell, re-evaluated every step), so a
@@ -4478,7 +4899,15 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
 
         domain._fem_problem = None  # the native assembler owns this domain's FE state
         op, mode, offs = assemble_fem_native(
-            domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, vec=1, quad_degree=quad_degree
+            domain,
+            volume_terms,
+            boundary_terms,
+            dirichlet_raw,
+            ic_residuals,
+            vec=1,
+            quad_degree=quad_degree,
+            evolution=evolution,
+            bounded=bounded,
         )
         return FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs)
 
@@ -4489,6 +4918,11 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
     # through the ± block structure — coupled Helmholtz systems in their natural spelling. ----
     _cx_coupled = _is_complex_form(domain, ir)
     _par_coupled = any(_contains_runtime_parameter(b) for b in weak_bares)
+    if evolution and _cx_coupled:
+        raise NotImplementedError(
+            "jno.fem: `state.evolves(...)` cannot combine with a complex coupled form — complex forms "
+            "assemble as two linear real-equivalent blocks, and the constitutive update is real."
+        )
     if _cx_coupled and not _par_coupled:
         if any(_is_obviously_nonlinear_in_unknown(domain, b) for b in weak_bares):
             raise NotImplementedError(
@@ -4508,15 +4942,17 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
         )
         return FEM(domain=domain, op=(op_r, op_i), classification=classification, mode="complex", offsets=offs)
 
-    # A coupled steady form `_native_ok` excluded -- a runtime parameter (the parametric coupled
-    # steady assembly is not wired). The native coupled assembler covers linear and nonlinear real
-    # forms (incl. complex=True) and, above, the linear complex split; reject the rest explicitly
+    # A coupled steady form `_native_ok` excluded -- a runtime parameter on the coupled LINEAR assembly,
+    # which has no parametric route. The native coupled assembler covers linear and nonlinear real forms
+    # (incl. complex=True), the linear complex split above, and a parametric form that carries step
+    # history (which assembles as a residual operator, not a matrix pair); reject the rest explicitly
     # rather than mis-assemble.
     raise NotImplementedError(
         "jno.fem: this coupled (multi-field) steady form is not supported natively -- it has a runtime "
-        f"parameter ({_par_coupled}); the parametric coupled steady assembly is not wired. Recover the "
-        "parameter on a single-field reduced form, or through a coupled first-order transient (which "
-        "does thread runtime parameters)."
+        f"parameter ({_par_coupled}) and is linear with no step history, so it would take the coupled "
+        "linear assembly, which has no parametric route. Recover the parameter on a single-field "
+        "reduced form, on a coupled NONLINEAR form or a load-path march (`domain(tau=...)` + `.i(k)`) "
+        "-- both assemble as a residual operator -- or through a coupled first-order transient."
     )
 
 

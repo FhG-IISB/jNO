@@ -39,6 +39,11 @@ sampling, and tensor tags.
         - variable
         - sample
         - summary
+        - tag
+        - by_region
+        - by_tag
+        - attach
+        - attached
         - line
         - rect
         - polygon

@@ -185,3 +185,58 @@ def test_fem_term_restricts_to_a_shape_region():
         assert abs(area - math.pi * 0.3**2) < 5e-3, f"inclusion load should integrate to ~pi r^2, got {area:.4f}"
     finally:
         jax.config.update("jax_enable_x64", prev)
+
+
+# ==========================================================================
+# naming regions that are not Python identifiers, and sizing them
+# ==========================================================================
+def test_regions_accepts_a_dict_for_non_identifier_names():
+    """`Shape.regions(**named)` cannot express "Quartz.1" — a dot is not a valid keyword."""
+    s = jno.Shape.regions(
+        {
+            "Quartz.1": jno.Shape.rect(0, 0, 1, 1, size=0.3),
+            "Quartz.2": jno.Shape.rect(0, 0, 2, 1, size=0.3),
+        }
+    )
+    assert [n for n, _ in s._node[1]] == ["Quartz.1", "Quartz.2"]
+    assert sorted(s.domain()._shape_regions) == ["Quartz.1", "Quartz.2"]
+
+
+def test_regions_dict_and_keywords_compose():
+    s = jno.Shape.regions(
+        {"a.1": jno.Shape.rect(0, 0, 1, 1, size=0.3)},
+        b=jno.Shape.rect(0, 0, 2, 1, size=0.3),
+    )
+    assert [n for n, _ in s._node[1]] == ["a.1", "b"]  # dict entries first, then keywords
+
+
+def test_regions_rejects_a_non_dict_positional():
+    with pytest.raises(TypeError, match="must be a .* dict"):
+        jno.Shape.regions(jno.Shape.rect(0, 0, 1, 1), b=jno.Shape.rect(0, 0, 2, 1))
+
+
+def test_size_is_an_alias_for_sized():
+    assert jno.Shape.rect(0, 0, 1, 1).size(0.25)._size == jno.Shape.rect(0, 0, 1, 1).sized(0.25)._size
+
+
+# ==========================================================================
+# by_region over Shape region names
+# ==========================================================================
+def _two_named_regions():
+    a = jno.Shape.rect(0, 0, 1, 1, size=0.3).name("a")
+    b = jno.Shape.rect(0, 0, 2, 1, size=0.3).name("b")
+    return (a + b).domain()
+
+
+def test_by_region_accepts_shape_region_names():
+    """Before this, `by_region` validated only against geometry parts and tag predicates, so a
+    Shape-built multi-material domain could not use it at all."""
+    d = _two_named_regions()
+    expr = d.by_region({"a": 1.0, "b": 2.0})
+    assert "RegionMask(a)" in str(expr) and "RegionMask(b)" in str(expr)
+
+
+def test_by_region_still_rejects_an_unknown_region():
+    d = _two_named_regions()
+    with pytest.raises(ValueError, match="unknown region"):
+        d.by_region({"a": 1.0, "nope": 2.0})

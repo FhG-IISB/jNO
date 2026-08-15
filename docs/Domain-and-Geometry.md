@@ -145,6 +145,63 @@ and `inclusion` wins inside the disk because it is listed first. Use each region
 PINN. A multi-material shape is a top-level construct — call `.domain()` on it directly; it does not
 compose with boolean operators or transforms.
 
+Region names that are not valid Python identifiers go through the dict form:
+`Shape.regions({"Quartz.1": q1, "Quartz.2": q2})`. Dict order is priority order exactly as for
+keywords, and the two forms combine (dict entries first).
+
+### Material properties — `.attach(...)`
+
+A region can carry its own material properties, read back off the domain as a **per-region
+coefficient** ready to drop into a weak form. `d.k` is exactly the `d.by_region({...})` assembled from
+every region that declared a `k`:
+
+```python
+kri = Shape.polygon(v).name("Kristall").attach(k=220.0, eps=0.794)
+gas = Shape.polygon(w).name("Gas").attach(k=0.186, eps=1.0)
+d   = (kri + gas).domain()
+
+heat = d.k * (T.x*s.x + T.y*s.y) - d.q * s      # one equation, both materials
+```
+
+A value may be anything jNO treats as a coefficient: a scalar, an array, a symbolic expression, a
+typed view (`ScalarView` / `VectorView` / `MatrixView` — the view type survives, so `d.eps @ u` still
+works), or a trainable `jno.np.parameter`, so an attached property can be fitted or differentiated
+through. A plain **function** is also accepted and is called with the domain's spatial coordinates
+when the property is read (`.attach(k=lambda r, z: 2.0 + 0.5*z)`); it has to be deferred that way
+because a spatially varying coefficient is built from `d.variable(...)`, which does not exist while
+the geometry plan is being written.
+
+`d.attached("eps")` gives the raw `{region: value}` mapping instead of the coefficient, for consumers
+that need a dict — `gap.emissivity(d.attached("eps"))`.
+
+Rules worth knowing:
+
+* Apply after `.name(...)`; like `name`, a later transform drops the attachment, and attaching to a
+  shape that was never named raises.
+* Repeated calls merge (last wins), so properties can be built up in stages.
+* `d.<name>` raises if **any** region failed to declare that name, listing the ones that did not — a
+  forgotten material surfaces at first use rather than as a region that silently conducts nothing. Use
+  `d.by_region({...}, default=...)` explicitly when some regions genuinely have none.
+* Values must agree on one view type across regions; a matrix on one region and a vector on another
+  raises rather than silently taking whichever came last.
+* Properties are **declared, not typed** for volume regions: whether `eps` is used as a volume or a
+  surface quantity is decided by the term that consumes it. Boundary tags are the exception — see
+  `d.attach(...)` below, where the kind is resolved when it is declared.
+
+A property can also be attached **after** the domain exists, which is the only way to attach to a
+`domain.tag` — or to a mesh-file domain, which has no `Shape` to declare on:
+
+```python
+d.tag("wall", lambda x, y: x < 1e-9)
+d.tag("lid",  lambda x, y: y > 1 - 1e-9)
+d.attach("wall", h=25.0).attach("lid", h=5.0)     # a SURFACE property, per boundary facet
+```
+
+Here the kind is decided once, from what the target owns on this mesh: a tag owning boundary facets
+is a surface quantity (`d.h` becomes a per-facet `by_tag` coefficient, see the `jno.fem` docs), a tag
+owning only cells is a volume quantity, and a tag owning **both** is ambiguous and raises rather than
+guessing — split it in two, or build the coefficient explicitly.
+
 **Interfaces** between materials are auto-named by the region pair, sorted — `d.variable("inclusion|matrix")`
 gives *every* facet where those two materials meet (however many flat faces that spans — an E-core's
 `air|core` boundary is one tag, not one per face). Impose a coupling/flux condition there, or sample it.

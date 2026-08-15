@@ -229,3 +229,9 @@ matplotlib = ">=3.11.0,<4"
 
 [tool.pixi.feature.fem.dependencies]
 plotly = ">=6.9.0,<7"
+
+# Intel MKL PARDISO, the sparse-direct backend behind `jno.solve.lu(backend="pardiso")`. Optional for
+# users (the `[pardiso]` extra); here so `pixi run -e fem` can actually exercise that path — its
+# symmetric (LDLᵀ) branch is otherwise untestable locally.
+[tool.pixi.feature.fem.pypi-dependencies]
+pypardiso = ">=0.4.4"

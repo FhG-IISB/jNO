@@ -11,6 +11,7 @@ from .integration_operators import IntegrationOperators  # noqa: F401
 from .trace import (
     Choice,
     ConstantNamespace,
+    Diff,
     FunctionCall,
     Hessian,
     Integral,
@@ -573,6 +574,35 @@ def det(x) -> FunctionCall:
     J = jnn.det(F)                        # volumetric part of the deformation
     """
     return _attach_coords(FunctionCall(jnp.linalg.det, [_u(x)], name="det"), [x])
+
+
+def diff(target, wrt) -> Diff:
+    """Differentiate a **scalar** expression w.r.t. another **expression** — ``∂target/∂wrt``.
+
+    The constitutive counterpart of :func:`grad`, which differentiates w.r.t. a spatial coordinate.
+    This is what lets a hyperelastic material be written as the thing it actually is — a stored
+    energy — instead of a hand-derived stress::
+
+        F   = I + jacobian(u, X)                      # bind it ONCE, then reuse
+        I1b = det(F) ** (-2 / 3) * trace(matmul(transpose(F), F))
+        psi = C10 * (I1b - 3) + C20 * (I1b - 3) ** 2  # Yeoh, the energy from the paper
+        P   = diff(psi, F)                            # 1st Piola-Kirchhoff, by autodiff
+
+    ``P`` then goes into the weak form as usual, ``inner(P, jacobian(phi, X), 2)``. The element tangent
+    (``∂P/∂F``, the consistent modulus) comes out of the assembler's own differentiation for free.
+
+    It is **pointwise**: the derivative is taken at each quadrature point independently, which is what a
+    constitutive law is. An ``Integral`` inside ``target`` is therefore refused — differentiate the
+    integrand, then integrate.
+
+    ``wrt`` is matched **by identity**, so bind it to a variable and pass that same object; a rebuilt
+    copy is a different node and is rejected rather than silently differentiating to zero.
+
+    Works for any energy-derived law — Neo-Hookean, Mooney-Rivlin, Yeoh, Ogden, Gent, anisotropic
+    tissue models — and equally for a chemical potential ``mu = diff(f, c)`` or an electro/magneto-
+    strictive coupling.
+    """
+    return Diff(_u(target), _u(wrt))
 
 
 def eigvalsh(x) -> FunctionCall:
