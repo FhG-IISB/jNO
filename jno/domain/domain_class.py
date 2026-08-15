@@ -2556,8 +2556,6 @@ class domain(MeshIOMixin):
             Jung, Yun & Kim, *Computers & Structures* **331** (2026) 108403, Fig. 7c-d, where the
             gap is +17.6 % for conventional elements and -0.5 % with the enriched formulation.
         """
-        from matplotlib.tri import TrapezoidMapTriFinder, Triangulation
-
         if int(self.dimension) != 2:
             raise NotImplementedError(
                 f"domain.transfer_cell_field(): 2-D triangles only; this domain is {self.dimension}-D."
@@ -2573,9 +2571,10 @@ class domain(MeshIOMixin):
         tgt_cells = target._cells_p1()
         tgt_centroids = np.asarray(target.mesh.points)[:, :2][tgt_cells].mean(axis=1)
 
-        finder = TrapezoidMapTriFinder(Triangulation(src_pts[:, 0], src_pts[:, 1], src_cells))
-        owner = np.asarray(finder(tgt_centroids[:, 0], tgt_centroids[:, 1]))
-        return np.where(owner >= 0, vals[np.maximum(owner, 0)], float(outside))
+        from jno.utils.solver.fem_adapt import _locate_in_cells
+
+        owner, _, inside = _locate_in_cells(src_pts, src_cells, tgt_centroids, tol=1e-9, k=32)
+        return np.where(inside, vals[owner], float(outside))
 
     def interior_edges(self):
         """Interior facets — the edges shared by exactly two triangles.
