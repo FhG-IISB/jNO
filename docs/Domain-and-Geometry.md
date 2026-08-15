@@ -285,3 +285,30 @@ domain by an integer `B` (`B * jno.domain(...)`, or `B * shape.domain()`) to rep
 operator-learning samples. `shape.domain(**kwargs)` forwards the *domain* arguments (`time=`, `sample=`,
 `name=`, …) — but not a constructor or `mesh_size`, since size lives on the shape — so a full domain is
 one line. `d.plot("domain.png")` renders the mesh, regions, and normals.
+
+### Attaching a tensor
+
+Pass an array instead of a sampling spec to attach it as a **tensor tag** — the operator-learning
+pattern, where each batch sample carries its own field:
+
+```python
+dom = 256 * jno.domain(constructor=jno.domain.poseidon(nx=64, ny=64))
+dom.variable("_f", forcing)          # (256, 64, 64, 1) — the shape you actually have
+```
+
+Context tensors are laid out `(B, T, ...)`. On a **steady** domain the time axis is `1` by
+definition, so it is inserted for you: attach `(B, H, W, C)` and it is stored as `(B, 1, H, W, C)`.
+Writing the axis yourself still works and is left untouched.
+
+!!! warning "This is load-bearing, not cosmetic"
+
+    Without a time axis the compiler reads the first grid axis *as* the timestep count and hands
+    the expression a single slice — an `(4, 8, 5, 1)` attach used to arrive as `(5, 1)`, with the
+    rest of the field discarded and no error raised.
+
+    On a **time-dependent** domain axis 1 is genuinely ambiguous (is it `T`, or a grid axis?), so a
+    mismatch raises instead: pass `T` entries, or `1` to share one field across all steps.
+
+    Only tensors of rank ≥ 4 whose leading dimension is `B` or `1` are touched — a parameter like
+    `(B, 1, 1)` or a shared lookup table is left exactly as given. Multiply the domain by `B`
+    **before** attaching, so the batch count is known.

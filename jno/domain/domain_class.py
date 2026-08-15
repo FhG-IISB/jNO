@@ -786,6 +786,48 @@ class domain(MeshIOMixin):
         """Batch the domain n times: domain * 2 samples 2x independently."""
         return self.__rmul__(n)
 
+    def _normalize_tensor_time_axis(self, tag, tensor):
+        """Give a grid-valued tensor tag the time axis the layout requires, or refuse.
+
+        Context tensors are ``(B, T, ...)``. The compiler peels ``B`` with a vmap and then
+        ``scan_over_time`` infers the time extent as ``max(v.shape[0])`` over every remaining value
+        with ``ndim >= 3`` -- so a tensor attached as ``(B, H, W, C)``, the shape a user actually
+        has, gets ``H`` read as the number of timesteps. One "timestep" then reaches the expression
+        and the rest of the field is **silently discarded**: measured, a ``(4, 8, 5, 1)`` attach
+        arrives at the evaluator as ``(5, 1)``.
+
+        Nothing about that is discoverable -- the docstring above documents the *leading* dimension
+        conventions and says nothing about axis 1 -- so it is normalized here, where the batch
+        count, the time extent and the array are all still in hand.
+
+        Only tensors the compiler routes as **spatial** (``shape[0] in (B, 1)``) are touched; a
+        "shared" tag is never vmapped and so never reaches the time inference. Tensors of rank < 4
+        are left alone for the same reason: after the batch axis is peeled they fall below the
+        ``ndim >= 3`` test, so a parameter like ``(B, 1, 1)`` is untouched.
+        """
+        b = self._effective_batch_count()
+        if tensor.ndim < 4 or tensor.shape[0] not in (b, 1):
+            return tensor
+
+        n_t = 1
+        if getattr(self, "_is_time_dependent", False):
+            t_ctx = self.context.get("__time__")
+            n_t = int(t_ctx.shape[0]) if t_ctx is not None and hasattr(t_ctx, "shape") else 1
+
+        if tensor.shape[1] in (n_t, 1):
+            return tensor  # already carries a time axis (or a broadcast one)
+
+        if getattr(self, "_is_time_dependent", False):
+            raise ValueError(
+                f"domain.variable({tag!r}, ...): the array has shape {tuple(tensor.shape)}, whose axis 1 is "
+                f"{tensor.shape[1]}, but this domain has {n_t} timesteps. Context tensors are (B, T, ...), so "
+                f"axis 1 must be {n_t} (one entry per step) or 1 (shared across steps). Insert the time axis "
+                f"explicitly -- arr[:, None, ...] to share one field across all steps."
+            )
+
+        # Steady domain: T is 1 by definition, so there is exactly one thing axis 1 can be.
+        return tensor[:, None, ...]
+
     def _effective_batch_count(self) -> int:
         """Infer the current batch size from metadata and existing batched context."""
         declared = int(getattr(self, "_batch_count", getattr(self, "total_samples", 1)))
@@ -2769,7 +2811,7 @@ class domain(MeshIOMixin):
                     tensor = jnp.asarray(sample)
                     if tensor.ndim < 1:
                         tensor = tensor.reshape(1, 1)
-                    self.context[tag] = tensor
+                    self.context[tag] = self._normalize_tensor_time_axis(tag, tensor)
                     self._param_tags.add(tag)
 
         # ------------------------------------------------------------------
