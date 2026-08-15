@@ -2763,7 +2763,7 @@ class ModelCall(Placeholder):
         if getattr(self.model, "_fem_field", None) != "cell" or dom is None:
             raise TypeError(
                 "ModelCall.patch(): the patch filter needs a P0 (per-element) design density -- "
-                "`jno.np.parameter(<symbol>)` on a symbol made with `space=\"P0\"`. It maps one "
+                '`jno.np.parameter(<symbol>)` on a symbol made with `space="P0"`. It maps one '
                 "value per element to one physical value per element; a nodal field has no "
                 "element to be the patch's reference."
             )
@@ -2829,7 +2829,6 @@ class ModelCall(Placeholder):
             return jnp.sum(length * smooth)
 
         return _jno.fn(_perimeter, [self, *args], name="perimeter")
-
 
     def __call__(self, *coords, **named):
         """For a **nodal-field unknown** (``domain.unknown()``), ``u(xb, yb)`` is sugar for

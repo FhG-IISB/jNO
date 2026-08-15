@@ -2503,9 +2503,7 @@ class domain(MeshIOMixin):
         import jno as _jno
 
         if int(self.dimension) != 2:
-            raise NotImplementedError(
-                f"domain.cell_angles(): triangles only (2-D); this domain is {self.dimension}-D."
-            )
+            raise NotImplementedError(f"domain.cell_angles(): triangles only (2-D); this domain is {self.dimension}-D.")
         cells = jnp.asarray(self._cells_p1(), dtype=jnp.int32)
         args, rebuild = self._moving_points()
 
@@ -2562,8 +2560,7 @@ class domain(MeshIOMixin):
 
         if int(self.dimension) != 2:
             raise NotImplementedError(
-                f"domain.transfer_cell_field(): 2-D triangles only; this domain is "
-                f"{self.dimension}-D."
+                f"domain.transfer_cell_field(): 2-D triangles only; this domain is {self.dimension}-D."
             )
         src_cells = self._cells_p1()
         src_pts = np.asarray(self.mesh.points)[:, :2] if points is None else np.asarray(points)[:, :2]
@@ -2594,8 +2591,7 @@ class domain(MeshIOMixin):
         cells = self._cells_p1()
         if int(self.dimension) != 2 or cells.shape[1] != 3:
             raise NotImplementedError(
-                f"domain.interior_edges(): triangles in 2-D only; got {cells.shape[1]}-node cells "
-                f"in {self.dimension}-D."
+                f"domain.interior_edges(): triangles in 2-D only; got {cells.shape[1]}-node cells in {self.dimension}-D."
             )
         seen: dict = {}
         for k, tri in enumerate(cells):
@@ -2649,41 +2645,41 @@ class domain(MeshIOMixin):
         element at a time. That is why the physics route is a reparameterisation.
         """
         topo = self.patch_topology()
-        others = jnp.asarray(topo["others"], dtype=jnp.int32)      # (K, 3, M) with -1 padding
-        n_int = jnp.asarray(topo["size"], dtype=jnp.int32)         # (K, 3)
-        interior = jnp.asarray(~topo["boundary"])                  # (K, 3)
+        others = jnp.asarray(topo["others"], dtype=jnp.int32)  # (K, 3, M) with -1 padding
+        n_int = jnp.asarray(topo["size"], dtype=jnp.int32)  # (K, 3)
+        interior = jnp.asarray(~topo["boundary"])  # (K, 3)
         m = others.shape[-1]
-        pos = jnp.arange(m, dtype=jnp.int32)[None, None, :]        # array index p; r_{p+1} of the paper
+        pos = jnp.arange(m, dtype=jnp.int32)[None, None, :]  # array index p; r_{p+1} of the paper
 
         def _patch(rv):
             r = jnp.asarray(rv).reshape(-1)
-            n = n_int                                              # (K, 3) patch size N
-            vals = jnp.where(others >= 0, r[jnp.maximum(others, 0)], 0.0)   # (K, 3, M)
-            live = (pos < (n - 1)[..., None]).astype(vals.dtype)   # entries 1..N-1 are real
+            n = n_int  # (K, 3) patch size N
+            vals = jnp.where(others >= 0, r[jnp.maximum(others, 0)], 0.0)  # (K, 3, M)
+            live = (pos < (n - 1)[..., None]).astype(vals.dtype)  # entries 1..N-1 are real
             vals = vals * live
-            csum = jnp.cumsum(vals, axis=-1)                       # csum[p] = sum_{j<=p+1} r_j
+            csum = jnp.cumsum(vals, axis=-1)  # csum[p] = sum_{j<=p+1} r_j
             total = jnp.sum(vals, axis=-1, keepdims=True)
 
             # Factor i of the product, at array index p = i - 1, live for 1 <= p <= N-3.
-            denom_pre = jnp.maximum(pos, 1).astype(vals.dtype)                       # i - 1
+            denom_pre = jnp.maximum(pos, 1).astype(vals.dtype)  # i - 1
             pre = jnp.concatenate([jnp.zeros_like(csum[..., :1]), csum[..., :-1]], -1) / denom_pre
             denom_suf = jnp.maximum((n - 2)[..., None] - pos, 1).astype(vals.dtype)  # N - i - 1
             suf = (total - csum) / denom_suf
             term = 1.0 - vals * (1.0 - pre) * (1.0 - suf)
             active = ((pos >= 1) & (pos <= (n - 3)[..., None])).astype(vals.dtype)
-            prod = jnp.prod(jnp.where(active > 0, term, 1.0), axis=-1)               # (K, 3)
+            prod = jnp.prod(jnp.where(active > 0, term, 1.0), axis=-1)  # (K, 3)
 
             # The final factor: k itself dense between two void neighbours in the patch.
             r_first = vals[..., 0]
             r_last = jnp.take_along_axis(vals, jnp.clip(n - 2, 0, m - 1)[..., None], axis=-1)[..., 0]
             rk = r[:, None]
             last = 1.0 - rk * (1.0 - 0.5 * (r_first + r_last))
-            last = jnp.where(interior, last, 1.0)   # preserved on the boundary (Fig. 2d)
+            last = jnp.where(interior, last, 1.0)  # preserved on the boundary (Fig. 2d)
 
             valid = n >= 3
             expo = 1.0 / jnp.maximum(n.astype(vals.dtype) - 2.0, 1.0)
             f = jnp.where(valid, jnp.clip(prod * last, 0.0, None) ** expo, 0.0)
-            p_k = jnp.sum(valid.astype(f.dtype), axis=-1)                            # (K,)
+            p_k = jnp.sum(valid.astype(f.dtype), axis=-1)  # (K,)
             # P_k = 0 means no patch around this element reaches three elements; there is nothing
             # to judge it by, so it passes through unchanged rather than becoming 0/0.
             return r * jnp.where(p_k > 0, jnp.sum(f, axis=-1) / jnp.maximum(p_k, 1.0), 1.0)

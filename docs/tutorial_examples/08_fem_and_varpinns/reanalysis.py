@@ -13,6 +13,7 @@ If they agree the reported stiffness is real. If C_reanalysis is much higher, th
 discretisation error. The paper measures +17.6 % for the conventional element and -0.5 % with
 E-FEM; that gap is what the enrichment exists to close.
 """
+
 import argparse
 import logging
 
@@ -22,15 +23,14 @@ jax.config.update("jax_enable_x64", True)
 
 import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
-from matplotlib.tri import Triangulation, TrapezoidMapTriFinder  # noqa: E402
+from matplotlib.tri import TrapezoidMapTriFinder, Triangulation  # noqa: E402
 
 import jno  # noqa: E402
 
 inner, symgrad, trace = jno.np.inner, jno.np.symgrad, jno.np.trace
 
 p = argparse.ArgumentParser()
-BASE = ("/tmp/claude-1000/-home-fleef-Work-projects-voithos/"
-        "a8003704-902f-43f1-840f-06dc9c329d5c/scratchpad/")
+BASE = "/tmp/claude-1000/-home-fleef-Work-projects-voithos/a8003704-902f-43f1-840f-06dc9c329d5c/scratchpad/"
 p.add_argument("--design", default=BASE + "fine_perim_deform_p0_patch_cont.npz")
 p.add_argument("--h-fine", type=float, default=0.5, help="reanalysis mesh size")
 p.add_argument("--threshold", type=float, default=0.5)
@@ -47,9 +47,7 @@ def build(size, trainable=False):
     """The SAME weak form as the optimisation run: clamped left, unit traction on the right."""
     d = jno.Shape.rect(0, 0, L, H, size=size).domain()
     if trainable:
-        xm, ym, _ = d.variable(
-            "mv", where=lambda x, y: (x > TOL) & (x < L - TOL) & (y > TOL) & (y < H - TOL),
-            split=True)
+        xm, ym, _ = d.variable("mv", where=lambda x, y: (x > TOL) & (x < L - TOL) & (y > TOL) & (y < H - TOL), split=True)
         xm.trainable(name="mesh_x"), ym.trainable(name="mesh_y")
     u, phi = d.fem_symbols(value_shape=(2,))
     _r, s = d.fem_symbols(space="P0", names=("r", "s"))
@@ -61,8 +59,7 @@ def build(size, trainable=False):
     eu, ep = symgrad(u, [xi, yi]), symgrad(phi, [xi, yi])
     fem = jno.fem(
         [
-            (EMIN + rho**3.0 * (E0 - EMIN))
-            * (LAM * trace(eu) * trace(ep) + 2 * MU * inner(eu, ep, n_contract=2)),
+            (EMIN + rho**3.0 * (E0 - EMIN)) * (LAM * trace(eu) * trace(ep) + 2 * MU * inner(eu, ep, n_contract=2)),
             u(xl, yl) - (0.0, 0.0),
             -1.0 * inner(jnp.array([0.0, -1.0 / H]), phi.bind(x=xr, y=yr), n_contract=1),
         ],
@@ -84,8 +81,7 @@ z = np.load(args.design)
 pts_def, cells_def, rho_e = z["pts"], z["cells"], z["rho_e"]
 solid = rho_e > args.threshold
 binary = np.where(solid, 1.0, 1e-3)
-print(f"design: {cells_def.shape[0]} elements, {int(solid.sum())} solid "
-      f"({solid.mean():.3f} by count), reported C = 77.974")
+print(f"design: {cells_def.shape[0]} elements, {int(solid.sum())} solid ({solid.mean():.3f} by count), reported C = 77.974")
 
 # --- 1. the design's own number, on its own deformed mesh, made BINARY --------------------------
 d_def, fem_def = build(1.0, trainable=True)
@@ -110,8 +106,10 @@ finder = TrapezoidMapTriFinder(Triangulation(pts_def[:, 0], pts_def[:, 1], cells
 owner = finder(cen_new[:, 0], cen_new[:, 1])
 outside = int((owner < 0).sum())
 rho_new = np.where(owner >= 0, rho_e[np.maximum(owner, 0)], 1e-3)
-print(f"reanalysis mesh: {cells_new.shape[0]} elements ({outside} centroids outside), "
-      f"solid fraction {float((rho_new > 0.5).mean()):.3f}")
+print(
+    f"reanalysis mesh: {cells_new.shape[0]} elements ({outside} centroids outside), "
+    f"solid fraction {float((rho_new > 0.5).mean()):.3f}"
+)
 
 c_re, _ = compliance(fem_new, {"rho": jnp.asarray(rho_new)})
 rho_new_bin = np.where(owner >= 0, binary[np.maximum(owner, 0)], 1e-3)
@@ -126,7 +124,6 @@ print(f"  C reported by the design, on its deformed mesh   : {c_grey:10.4f}")
 print(f"  C of the same density field on a clean fine mesh : {c_re:10.4f}")
 print(f"  the design over-reports its stiffness by         : {gap:+9.2f} %")
 print("  --")
-print(f"  thresholded at {args.threshold}: deformed {c_bin_def:.3e} -> clean {c_re_bin:.3e} "
-      f"({gap_bin:+.2f} %)")
-print(f"  (paper: +17.6 % conventional, -0.5 % with E-FEM)")
+print(f"  thresholded at {args.threshold}: deformed {c_bin_def:.3e} -> clean {c_re_bin:.3e} ({gap_bin:+.2f} %)")
+print("  (paper: +17.6 % conventional, -0.5 % with E-FEM)")
 print("=" * 68)

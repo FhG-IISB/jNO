@@ -11,7 +11,6 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 import pytest
 
 import jno
@@ -29,7 +28,7 @@ def _x64():
 
 def _make(rho_values, *, physical=None, **kw):
     """A continuation hook plus the (grads, trainable) a step would hand it."""
-    d = jno.domain.from_array({"_": np.zeros((1, 1))})
+    _d = jno.domain.from_array({"_": np.zeros((1, 1))})  # side effect: registers the array domain
     rho = jno.np.parameter((len(rho_values),), name="rho_c")
     penal = jno.np.parameter((1,), name="penal_c")
     cont = jno.optimizers.simp_continuation(penal, rho, physical=physical, **kw)
@@ -100,7 +99,7 @@ class TestPhysicalDensity:
         """`trainable` holds the RAW design density: a `constrain(...)` wrapper lives in the static
         half and cannot be applied here. Measuring the raw field would call this design binary
         while the field the stiffness sees is entirely grey."""
-        raw = np.array([1.0, 0.0] * 10)                      # M_nd(raw) = 0
+        raw = np.array([1.0, 0.0] * 10)  # M_nd(raw) = 0
         half = lambda r: jnp.full_like(r, 0.5)  # noqa: E731  # M_nd(physical) = 1
 
         plain, g, t, lid = _make(raw)
@@ -196,7 +195,7 @@ class TestGeometricDecay:
 def test_the_continuation_can_watch_one_loss_term():
     """Under a decaying barrier the TOTAL objective keeps moving because beta does, so a window
     on the total never closes. `watch=` follows the compliance term alone — Fig. 4a's question."""
-    d = jno.domain.from_array({"_": np.zeros((1, 1))})
+    _d = jno.domain.from_array({"_": np.zeros((1, 1))})  # side effect: registers the array domain
     rho = jno.np.parameter((20,), name="rho_w")
     penal = jno.np.parameter((1,), name="penal_w")
     cont = jno.optimizers.simp_continuation(penal, rho, window=3, watch=0)
@@ -207,8 +206,10 @@ def test_the_continuation_can_watch_one_loss_term():
     # Term 0 (compliance) is settled; term 1 (the barrier) drifts, so the TOTAL never settles.
     for e in range(6):
         cont.on_before_update(
-            grads=grads, trainable=trainable, epoch=e,
-            total_loss=100.0 - e,                       # moving
+            grads=grads,
+            trainable=trainable,
+            epoch=e,
+            total_loss=100.0 - e,  # moving
             individual_losses=np.array([5.0, 95.0 - e]),  # term 0 settled
         )
     assert cont.penal > 3.0, "watching a settled term must let the continuation fire"

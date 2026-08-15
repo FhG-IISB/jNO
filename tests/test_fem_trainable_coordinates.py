@@ -263,7 +263,6 @@ def test_a_volume_tag_is_promotable_without_a_where_predicate():
 def test_a_named_boundary_still_resolves_through_the_existing_route():
     """The tag fallback must not shadow the resolver: a boundary tag has a location function, and
     that answer — not the mesh tag's node list — stays authoritative."""
-    from jno.trace import Variable
     from jno.utils.solver.fem_native import _region_node_ids_from_pts
 
     d = jno.Shape.rect(0.0, 0.0, 2.0, 1.0, size=0.4).domain()

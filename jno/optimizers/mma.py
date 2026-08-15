@@ -174,9 +174,7 @@ def _primal(lam, p0, q0, P, Q, low, upp, alpha, beta):
     return np.clip(x, alpha, beta)
 
 
-def mma_subproblem(
-    x, f0, df0, g, dg, low, upp, xmin, xmax, xold1, xold2, k, spec, dual_iters=400
-):
+def mma_subproblem(x, f0, df0, g, dg, low, upp, xmin, xmax, xold1, xold2, k, spec, dual_iters=400):
     """One MMA step: build the convex approximation, solve its dual, return the new point.
 
     Args:
@@ -187,9 +185,7 @@ def mma_subproblem(
     Returns ``(x_new, low, upp)``.
     """
     span = np.maximum(xmax - xmin, 1e-12)
-    low, upp = _asymptotes(
-        x, xold1, xold2, low, upp, xmin, xmax, k, spec.asy_init, spec.asy_shrink, spec.asy_grow
-    )
+    low, upp = _asymptotes(x, xold1, xold2, low, upp, xmin, xmax, k, spec.asy_init, spec.asy_shrink, spec.asy_grow)
 
     # Move limits: never leave the box, never reach the asymptote (the approximation is singular
     # there), never travel more than `move` of the box width in one iteration.
@@ -314,9 +310,7 @@ class MMACallback(_Callback):
         def _losses(sub, rest, context, rng):
             trainable = {**rest, **sub}
             full = _paramax.unwrap(eqx.combine(trainable, frozen, static))
-            residuals = compiled_fn(
-                full, context, batchsize=batchsize, key=rng, min_consecutive=min_consecutive
-            )
+            residuals = compiled_fn(full, context, batchsize=batchsize, key=rng, min_consecutive=min_consecutive)
             return jnp.stack([jnp.mean(r) for r in residuals])
 
         # `rowwise_jacobian`, NOT `jacrev`: `jacrev` vmaps its pullback across the output rows, and
@@ -336,9 +330,7 @@ class MMACallback(_Callback):
             # `self._blocks` order. A list preserves that order, so the Jacobian's columns line up
             # with `x`, `df0`, `xmin` and `xmax`.
             parts = [sub[lid] for lid in lids]
-            return rowwise_jacobian(
-                lambda ps: _losses(dict(zip(lids, ps)), rest, context, rng), parts, rows
-            )
+            return rowwise_jacobian(lambda ps: _losses(dict(zip(lids, ps)), rest, context, rng), parts, rows)
 
         self._jac_fn = jax.jit(jac)
 
@@ -389,8 +381,20 @@ class MMACallback(_Callback):
 
         spec = _BlendedSpec(self._blocks, [p.size for p in x_parts], k=self._k)
         x_new, self._low, self._upp = mma_subproblem(
-            x, None, df0, g, dg, self._low, self._upp, xmin, xmax,
-            self._xold1, self._xold2, self._k, spec, spec.dual_iters,
+            x,
+            None,
+            df0,
+            g,
+            dg,
+            self._low,
+            self._upp,
+            xmin,
+            xmax,
+            self._xold1,
+            self._xold2,
+            self._k,
+            spec,
+            spec.dual_iters,
         )
         self._xold2, self._xold1 = self._xold1, x.copy()
         self._k += 1

@@ -31,9 +31,9 @@ building your own optax chains.
 this package and re-export it below.
 """
 
+from .continuation import GeometricDecay, SIMPContinuation, geometric_decay, simp_continuation
 from .engd import ENGDOptimizer, engd
 from .md_decouple import MDOptimizer, md, md_decouple
-from .continuation import GeometricDecay, SIMPContinuation, geometric_decay, simp_continuation
 from .mma import MMACallback, MMAOptimizer, mma
 from .soap import scale_by_soap, soap
 from .ssbroyden import scale_by_ss_quasi_newton, ssbfgs, ssbroyden

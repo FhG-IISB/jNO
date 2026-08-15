@@ -135,6 +135,7 @@ def ge(expr, bound=0.0):
     """An inequality constraint ``expr >= bound``. See :func:`le`."""
     return Constraint(expr, bound, "ge")
 
+
 __all__ = [
     "schedule",
     "core",

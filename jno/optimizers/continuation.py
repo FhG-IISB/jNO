@@ -66,16 +66,14 @@ class SIMPContinuation(_Callback):
         self.history: List[tuple] = []
         self.m_nd: Optional[float] = None
         self._losses: List[float] = []
-        self._waited = 0                        # samples since the last raise, for `patience`
+        self._waited = 0  # samples since the last raise, for `patience`
 
     def _converged(self) -> bool:
         """Relative change below ``tol`` across ``window`` consecutive steps."""
         if len(self._losses) < self.window + 1:
             return False
         recent = self._losses[-(self.window + 1) :]
-        return all(
-            abs(b - a) <= self.tol * max(abs(a), 1e-30) for a, b in zip(recent[:-1], recent[1:])
-        )
+        return all(abs(b - a) <= self.tol * max(abs(a), 1e-30) for a, b in zip(recent[:-1], recent[1:]))
 
     def on_before_update(self, *, grads, trainable, epoch, **kw):
         import equinox as eqx
@@ -112,9 +110,7 @@ class SIMPContinuation(_Callback):
         # unwrapping raises. Pass the same map as `physical=` and it is applied explicitly;
         # measuring the raw design density instead would call a design binary while the field the
         # stiffness actually sees is still grey.
-        leaves = [
-            lf for lf in jax.tree_util.tree_leaves(trainable[self._rho_lid]) if eqx.is_inexact_array(lf)
-        ]
+        leaves = [lf for lf in jax.tree_util.tree_leaves(trainable[self._rho_lid]) if eqx.is_inexact_array(lf)]
         r = jnp.concatenate([lf.reshape(-1) for lf in leaves])
         if self._physical is not None:
             r = jnp.asarray(self._physical(r)).reshape(-1)
@@ -131,12 +127,7 @@ class SIMPContinuation(_Callback):
         stalled = self.patience is not None and self._waited >= self.patience
 
         new = self.penal
-        if (
-            sample
-            and (self._converged() or stalled)
-            and self.m_nd >= self.mnd_tol
-            and self.penal < self.maximum - 1e-12
-        ):
+        if sample and (self._converged() or stalled) and self.m_nd >= self.mnd_tol and self.penal < self.maximum - 1e-12:
             new = min(self.penal + self.step, self.maximum)
             self.history.append((int(epoch), new, "stalled" if stalled and not self._converged() else "converged"))
             self._losses = []  # the window restarts at each continuation step (Sec. 2.4)
@@ -147,9 +138,7 @@ class SIMPContinuation(_Callback):
         # `sgd(1.0)` applies `x - returned`, so hand it the negated step -- ENGD and MMA both
         # abuse the return value this way, and zero when nothing changes leaves penal alone.
         grads = dict(grads)
-        grads[self._penal_lid] = jax.tree_util.tree_map(
-            lambda x: jnp.full_like(x, delta), grads[self._penal_lid]
-        )
+        grads[self._penal_lid] = jax.tree_util.tree_map(lambda x: jnp.full_like(x, delta), grads[self._penal_lid])
         return grads
 
 

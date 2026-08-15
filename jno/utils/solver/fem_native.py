@@ -749,9 +749,7 @@ def assemble_fem_native(
     # points. The design variable of density-based topology optimisation is exactly this.
     from .parametric_helpers import _fem_field_kind
 
-    _cell_field_names: set = {
-        n for n, expr in _rt_param_exprs.items() if _fem_field_kind(expr) == "cell"
-    }
+    _cell_field_names: set = {n for n, expr in _rt_param_exprs.items() if _fem_field_kind(expr) == "cell"}
 
     # Neural coefficients (``jno.nn.wrap(net)`` called inside the weak form, e.g. ``net(x,y)*u.dx*v.dx``).
     # Unlike scalar/nodal parameters they never enter the per-cell ``volume_vars`` -- a weight pytree is

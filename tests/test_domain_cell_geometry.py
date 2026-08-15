@@ -54,15 +54,7 @@ class TestClosedForms:
 
     def test_an_equilateral_triangle_is_sixty_degrees(self):
         """The sharpest available check on the angle formula: one cell, exact answer."""
-        d = (
-            jno.Path(0, 0)
-            .line_to(1, 0)
-            .line_to(0.5, np.sqrt(3) / 2)
-            .line_to(0, 0)
-            .face()
-            .sized(9.0)
-            .domain()
-        )
+        d = jno.Path(0, 0).line_to(1, 0).line_to(0.5, np.sqrt(3) / 2).line_to(0, 0).face().sized(9.0).domain()
         vol = np.asarray(d.cell_volume().eval()).reshape(-1)
         if vol.size != 1:  # gmsh is free to subdivide; the check only means anything on one cell
             pytest.skip(f"mesher produced {vol.size} cells, not 1")
@@ -94,9 +86,7 @@ class TestDifferentiableInTheMesh:
     @staticmethod
     def _moving_rect(size=0.5):
         d = jno.Shape.rect(0, 0, 2, 1, size=size).domain()
-        xm, ym, _ = d.variable(
-            "design", where=lambda *c: np.ones_like(np.asarray(c[0]), dtype=bool), split=True
-        )
+        xm, ym, _ = d.variable("design", where=lambda *c: np.ones_like(np.asarray(c[0]), dtype=bool), split=True)
         xm.trainable(name="mx")
         ym.trainable(name="my")
         return d
@@ -137,9 +127,7 @@ class TestDifferentiableInTheMesh:
             for k in range(3):
                 a = v[:, (k + 1) % 3] - v[:, k]
                 b = v[:, (k + 2) % 3] - v[:, k]
-                cos = jnp.sum(a * b, axis=-1) / (
-                    jnp.linalg.norm(a, axis=-1) * jnp.linalg.norm(b, axis=-1) + 1e-12
-                )
+                cos = jnp.sum(a * b, axis=-1) / (jnp.linalg.norm(a, axis=-1) * jnp.linalg.norm(b, axis=-1) + 1e-12)
                 out.append(jnp.arccos(jnp.clip(cos, -1.0, 1.0)))
             # a smooth proxy for "the smallest angle", which is what the constraint bounds
             return jnp.sum(jnp.stack(out, axis=-1) ** -8)
@@ -250,10 +238,7 @@ class TestLogBarrier:
         sw = b - t
         gap = jnp.maximum(b - x, t)
         dx = x - sw
-        return jnp.squeeze(
-            jnp.where(x <= sw, -b * jnp.log(gap),
-                      -b * jnp.log(t) + (b / t) * dx + 0.5 * (b / t**2) * dx**2)
-        )
+        return jnp.squeeze(jnp.where(x <= sw, -b * jnp.log(gap), -b * jnp.log(t) + (b / t) * dx + 0.5 * (b / t**2) * dx**2))
 
     def test_it_is_the_log_below_the_switch(self):
         b = 350.0
@@ -296,7 +281,7 @@ class TestLogBarrier:
 
     def test_it_reaches_the_trace_through_a_node(self):
         d = jno.Shape.rect(0.0, 0.0, 2.0, 1.0, size=0.4).domain()
-        total = d.cell_volume().sum          # the domain area, 2.0
+        total = d.cell_volume().sum  # the domain area, 2.0
         got = float(np.asarray(total.log_barrier(10.0).eval()).reshape(-1)[0])
         assert got == pytest.approx(float(-10.0 * np.log(10.0 - 2.0)), rel=1e-6)
 

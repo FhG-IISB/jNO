@@ -206,7 +206,10 @@ C_u_fine = solve_C(fem_ref.operator, {"rho2": jnp.full(n_f, VOLFRAC)})
 discretisation = C_u_fine / C_u_coarse  # the coarse mesh's intrinsic over-stiffness
 excess = (C_ref / C) / discretisation - 1.0  # what the node movement bought that was not real
 
-vol = np.abs(np.linalg.det(np.stack([pts_f[cells][:, 1] - pts_f[cells][:, 0], pts_f[cells][:, 2] - pts_f[cells][:, 0]], -1))) / 2
+vol = (
+    np.abs(np.linalg.det(np.stack([pts_f[cells][:, 1] - pts_f[cells][:, 0], pts_f[cells][:, 2] - pts_f[cells][:, 0]], -1)))
+    / 2
+)
 print(
     f"\nTopology optimisation: {n_c} elements, {fem.dofs} dofs, {ITERS} iterations"
     f"\n  compliance (own deformed mesh)          = {C:9.4f}"
@@ -214,7 +217,8 @@ print(
     f"\n  control, uniform density, no distortion = {C_u_coarse:9.4f} -> {C_u_fine:9.4f}"
     f"   ({100 * (discretisation - 1):+.1f} % is pure discretisation)"
     f"\n  => stiffness over-report attributable to the moved nodes: {100 * excess:+.1f} %"
-    f"\n  perimeter P = {P:.3f}" + (f" against target P* = {PSTAR:.1f}" if PSTAR > 0 else " (uncontrolled)")
+    f"\n  perimeter P = {P:.3f}"
+    + (f" against target P* = {PSTAR:.1f}" if PSTAR > 0 else " (uncontrolled)")
     + f"\n  volume fraction = {np.sum(rho_f * vol) / np.sum(vol):.4f}   "
     f"M_nd = {4 * np.mean(rho_f * (1 - rho_f)):.4f}   inverted elements = {int((vol <= 0).sum())}"
 )
@@ -253,7 +257,9 @@ ax = fig.add_subplot(gs[2, 0])
 # Plot the reanalysis against the discretisation control, so the bar the eye compares is the one
 # that means something. C * discretisation is what a NON-distorting design would have read.
 bars = [C, C * discretisation, C_ref]
-ax.bar(["own\nmesh", "clean mesh,\nexpected", "clean mesh,\nactual"], bars, color=["#3b6fb6", "#b6b6b6", "#c1543a"], width=0.55)
+ax.bar(
+    ["own\nmesh", "clean mesh,\nexpected", "clean mesh,\nactual"], bars, color=["#3b6fb6", "#b6b6b6", "#c1543a"], width=0.55
+)
 for i, v in enumerate(bars):
     ax.text(i, v, f"{v:.2f}", ha="center", va="bottom", fontsize=8.5)
 ax.set_ylabel("compliance"), ax.margins(y=0.25)

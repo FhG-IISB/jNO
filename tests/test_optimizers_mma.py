@@ -117,8 +117,19 @@ class TestSubproblem:
         f_before = float(np.sum(c / x))
         spec = _Spec(n)
         x, _, _ = mma_subproblem(
-            x, None, -c / x**2, np.zeros(0), np.zeros((0, n)),
-            None, None, np.full(n, 0.05), np.full(n, 5.0), None, None, 0, spec,
+            x,
+            None,
+            -c / x**2,
+            np.zeros(0),
+            np.zeros((0, n)),
+            None,
+            None,
+            np.full(n, 0.05),
+            np.full(n, 5.0),
+            None,
+            None,
+            0,
+            spec,
         )
         assert float(np.sum(c / x)) < f_before
 
@@ -269,9 +280,7 @@ class TestMoveLimitDamping:
         x = jno.np.parameter((n,), name="x_damp")
         x.dtype(jnp.float64)
         x.initialize(jax.nn.initializers.constant(V / n))
-        x.optimizer(
-            jno.optimizers.mma(move=0.2, lower=0.05, upper=5.0, move_gamma=0.99, move_min=0.01)
-        )
+        x.optimizer(jno.optimizers.mma(move=0.2, lower=0.05, upper=5.0, move_gamma=0.99, move_min=0.01))
         f0 = jno.fn(lambda xv: jnp.sum(jnp.asarray(c) / xv), [x], name="f0")
         vol = jno.fn(lambda xv: jnp.sum(xv), [x], name="vol")
 
