@@ -887,7 +887,7 @@ def assemble_fem_native(
     # runtime args in ``_dirichlet_pairs_at`` so ``∂b/∂weights`` flows through the solve.
     from ..._fem import _bare as _bare_node
     from ..._fem import _essential_spec as _essential_spec_node
-    from ...trace import ModelWeights
+    from ...trace import ModelCall, ModelWeights
     from .parametric_helpers import _is_neural_coefficient, _neural_coefficient_name
 
     _dir_net_models: Dict[str, Any] = {}
@@ -895,6 +895,61 @@ def assemble_fem_native(
         _vn = _bare_node(_vnode) if _vnode is not None else None
         if _vn is not None and _is_neural_coefficient(_vn):
             _dir_net_models[_neural_coefficient_name(_vn)] = _vn.model
+    # A trainable ``jno.np.parameter`` in an ESSENTIAL value -- ``u(top) - g``, or ``u(top) -
+    # g*profile(x)``. Exactly the coord-params pattern above: it rides ``runtime_parameter_exprs``
+    # (crux discovers it, its value arrives in ``args``) but stays OUT of ``runtime_parameter_tags``
+    # -- it is not a term coefficient, and ``_runtime_vals`` must not pack it per cell. The rows are
+    # recorded so ``_dirichlet_pairs_at`` re-forms the lift from args (``∂b/∂g`` flows through the
+    # symmetric elimination, the same contract the net-valued branch documents) and
+    # ``_build_dirichlet_pairs`` skips them instead of freezing the stored value behind ``float(g)``.
+    #
+    # The one exclusion: an optimizer-less FIELD-sized parameter stays the nodal DATA-field value the
+    # branch in ``_build_dirichlet_pairs`` gathers per node (a neighbour's field in a DD solve). A
+    # SCALAR optimizer-less parameter is runtime-parametric here -- the old path crashed on it
+    # (IndexError gathering a length-1 value by node id) rather than meaning anything.
+    _dir_param_exprs: Dict[str, Any] = {}
+    _dir_param_rows: set = set()
+    for _i, (_fk, _rg, _comp, _val, _vnode) in enumerate(dirichlet_raw):
+        _vn = _bare_node(_vnode) if _vnode is not None else None
+        if _vn is None or _is_neural_coefficient(_vn):
+            continue
+        if (
+            isinstance(_vn, ModelCall)
+            and getattr(_vn.model, "_is_parameter", False)
+            and getattr(_vn.model, "_opt_fn", None) is None
+            and np.asarray(_vn.model.module.value).size > 1
+        ):
+            continue  # nodal data field -- the per-node gather branch owns it
+        _found: Dict[str, Any] = {}
+        _collect_runtime_parameter_exprs(_vnode, _found)
+        if _found:
+            from ..._fem import _is_temporal_value_node as _is_tv
+
+            if _is_tv(_vnode):
+                # `u(top) - g * tau`: the value is BOTH parametric and time/τ-dependent. The parametric
+                # branch would hold it constant in τ (silently un-ramping the load); the temporal branch
+                # would freeze the parameter at its stored value (silently un-training it). Neither is
+                # right, so refuse until the two held-value mechanisms compose.
+                raise NotImplementedError(
+                    f"jno.fem: the essential value on {_rg!r} is BOTH runtime-parametric "
+                    f"({sorted(_found)}) and time/τ-dependent. A trainable parameter in a t/τ-varying "
+                    "essential value is not supported yet -- train the amplitude through a Neumann/body "
+                    "term written as a function of τ, or fix one of the two."
+                )
+            _dir_param_exprs.update(_found)
+            _dir_param_rows.add(_i)
+    if _dir_param_exprs:
+        _param_and_neural_exprs = {**_param_and_neural_exprs, **_dir_param_exprs}
+
+    def _dir_static_args() -> Dict[str, Any]:
+        """Stored-value args for every args-dependent Dirichlet slot (net modules + parameter values) --
+        what the static placeholders and dof-layout probes evaluate at, in place of runtime args."""
+        return {n: m.module for n, m in _dir_net_models.items()} | {
+            n: jnp.asarray(nd.model.module.value) for n, nd in _dir_param_exprs.items()
+        }
+
+    #: any Dirichlet condition whose held value must be (re-)formed from runtime ``args``.
+    _dir_args_dependent = bool(_dir_net_models) or bool(_dir_param_rows)
     # A net-valued INITIAL condition ``u(initial) - net(x)`` (a trainable starting state, recovered from a
     # trajectory): its weights join the runtime slots the same way, and the initial state is (re-)formed
     # from the runtime args in ``_state0_at`` so ``∂traj/∂weights`` flows through the IC.
@@ -2182,10 +2237,12 @@ def assemble_fem_native(
 
         pairs: List[Tuple[int, float]] = []
         tv_stash: List[Tuple[Any, Any, Any]] = []  # (dofs, value_node, coords) for time-varying g(x,t)
-        for field_key, region, comp, value, value_node in dirichlet_raw:
+        for _row_i, (field_key, region, comp, value, value_node) in enumerate(dirichlet_raw):
             fidx = field_index.get(field_key)
             if fidx is None:
                 continue
+            if _row_i in _dir_param_rows:
+                continue  # args-dependent value: (re-)formed per args in _dirichlet_pairs_at, never frozen here
             # Time-varying Dirichlet g(x,t): no constant pair — stash (dofs, value_node, coords) so a
             # transient caller (e.g. the second-order augmented block) writes g(x_d, t) each step.
             if value_node is not None and _is_temporal_value_node(value_node):
@@ -2255,12 +2312,36 @@ def assemble_fem_native(
         coordinates, so the value stays a differentiable JAX scalar and ``∂b/∂weights`` flows through the
         symmetric elimination. Non-net conditions reuse the concrete ``_build_dirichlet_pairs`` values."""
         a = args or {}
-        pairs = list(_build_dirichlet_pairs())  # concrete (non-net) conditions
-        for field_key, region, comp, value, value_node in dirichlet_raw:
+        pairs = list(_build_dirichlet_pairs())  # concrete (non-net, non-parametric) conditions
+        for _row_i, (field_key, region, comp, value, value_node) in enumerate(dirichlet_raw):
             fidx = field_index.get(field_key)
             if fidx is None:
                 continue
             _vn = _bare_node(value_node) if value_node is not None else None
+            if _row_i in _dir_param_rows:
+                # A trainable parameter in the value (`u(top) - g`, `u(top) - g*profile(x)`): evaluate
+                # the value NODE at the boundary nodes with the args-substituted parameter, so the held
+                # value stays a traced JAX scalar and ∂b/∂g (steady) / ∂step/∂g (transient) flows --
+                # the same contract as the net branch below. `_eval_value_node_at(params=...)` is the
+                # existing parametric-coefficient evaluator; no bespoke walker.
+                from ..._fem import _eval_value_node_at as _eval_at
+
+                vt = vecs[fidx]
+                pts_all = np.asarray(pts_f_all[fidx])
+                node_ids = list(_boundary_node_ids(fidx, region))
+                pts = pts_all[np.asarray(node_ids, dtype=np.int64)] if node_ids else np.zeros((0, dim))
+                raw = jnp.asarray(_eval_at(value_node, jnp.asarray(pts), params=a)).reshape(-1)
+                # Constant vs spatial profile: a constant returns the same shape for ANY batch (the
+                # static-path trick) -- one extra single-point evaluation decides, shapes are static.
+                one = jnp.asarray(_eval_at(value_node, jnp.asarray(pts[:1]), params=a)).reshape(-1)
+                if raw.shape == one.shape or not node_ids:
+                    gvals = jnp.broadcast_to(raw.reshape(-1)[:1], (len(node_ids),))
+                else:
+                    gvals = raw.reshape(len(node_ids), -1)[:, 0]
+                for i, nid in enumerate(node_ids):
+                    for c in range(vt) if comp is None else [int(comp)]:
+                        pairs.append((offs[fidx] + nid * vt + c, gvals[i]))
+                continue
             if _vn is None or not _is_neural_coefficient(_vn):
                 continue
             vt = vecs[fidx]
@@ -2472,19 +2553,19 @@ def assemble_fem_native(
                     "form is not wired yet (state0_fn threads only the linear stepper). Use a linear "
                     "transient form (a net IC threads there)."
                 )
-            if _dir_net_models and _nonlinear_mass:
+            if _dir_args_dependent and _nonlinear_mass:
                 raise NotImplementedError(
                     "jno.fem: a net-valued Dirichlet with a state-dependent (nonlinear) mass c(u)·u_t on a "
                     "transient form is not supported (the mass residual holds a static Dirichlet dof set). "
                     "Use a linear/parametric mass."
                 )
 
-            if _dir_net_models:
-                # net-valued Dirichlet u(∂Ω) - net(x): the held value is re-formed from the net weights each
+            if _dir_args_dependent:
+                # net- or parameter-valued Dirichlet: the held value is re-formed from the args each
                 # Newton residual (mirrors the nonlinear STEADY path ``res_p``); the dof set is static, only
-                # the held values ride the weights, and ``∂/∂weights`` flows through the step's custom_root.
+                # the held values ride the args, and ``∂/∂args`` flows through the step's custom_root.
                 _tnpd = jnp.asarray(
-                    [p[0] for p in _dirichlet_pairs_at({n: m.module for n, m in _dir_net_models.items()})],
+                    [p[0] for p in _dirichlet_pairs_at(_dir_static_args())],
                     dtype=jnp.int32,
                 )
 
@@ -2541,8 +2622,8 @@ def assemble_fem_native(
         # falls to the static branch, where A and M are built once with ``args=None`` and
         # ``_apply_coord_params`` short-circuits -- so ``block.step(..., args={coord: X})`` silently ignores
         # X and ``du/dX`` is exactly ZERO. That is a wrong gradient with no symptom, not a missing feature.
-        if runtime_parameter_tags or neural_param_names or _dir_net_models or _ic_net_models or _coord_specs:
-            if _dir_net_models:
+        if runtime_parameter_tags or neural_param_names or _dir_args_dependent or _ic_net_models or _coord_specs:
+            if _dir_args_dependent:
                 if getattr(domain, "_fem_native_dirichlet_tv", None):
                     raise NotImplementedError(
                         "jno.fem: a net-valued Dirichlet combined with a time-varying g(x, t) Dirichlet on a "
@@ -2551,7 +2632,7 @@ def assemble_fem_native(
                     )
                 # const + net Dirichlet dofs (static boundary-node layout); held values re-formed from args.
                 _dd = jnp.asarray(
-                    [p[0] for p in _dirichlet_pairs_at({n: m.module for n, m in _dir_net_models.items()})],
+                    [p[0] for p in _dirichlet_pairs_at(_dir_static_args())],
                     dtype=jnp.int32,
                 )
 
@@ -2568,8 +2649,8 @@ def assemble_fem_native(
                 A = spatial_jac(zeros, t, args)
                 return A if _d is None else bcoo_set_dirichlet_rows(A, _d)
 
-            if _dir_net_models:
-                c_bias = zeros  # every held value (const + net) rides the forcing
+            if _dir_args_dependent:
+                c_bias = zeros  # every held value (const + net + parameter) rides the forcing
 
                 def forcing_vector_fn(t, args=None, _mask=free_mask, _d=_dd):
                     f = _mask * (-spatial_res(zeros, t, args))
@@ -2700,7 +2781,7 @@ def assemble_fem_native(
     if (
         runtime_parameter_tags
         or neural_param_names
-        or _dir_net_models
+        or _dir_args_dependent
         or history_specs
         or surface_history_specs
         or _coord_specs
@@ -2711,13 +2792,13 @@ def assemble_fem_native(
             # ``t`` carries the pseudo-time (load) coordinate τ for the history march — the load written
             # as a function of τ in the weak form varies through it. Defaults to 0.0, so the ordinary
             # (non-marching) parametric/inverse call sites are unchanged.
-            if _dir_net_models:
-                # net-valued Dirichlet u(∂Ω) - net(x): the held value is a differentiable function of the
-                # net weights (delivered on args), so the row-replacement value is re-evaluated from args
-                # each residual call (mirrors the linear parametric path's ``_dirichlet_pairs_at``). The
-                # dof set is static (boundary-node layout); only the held values ride the weights.
+            if _dir_args_dependent:
+                # net- or parameter-valued Dirichlet: the held value is a differentiable function of the
+                # args (net weights or a trainable boundary value), so the row-replacement value is
+                # re-evaluated from args each residual call (mirrors the linear parametric path's
+                # ``_dirichlet_pairs_at``). The dof set is static; only the held values ride the args.
                 _npd = jnp.asarray(
-                    [p[0] for p in _dirichlet_pairs_at({n: m.module for n, m in _dir_net_models.items()})],
+                    [p[0] for p in _dirichlet_pairs_at(_dir_static_args())],
                     dtype=jnp.int32,
                 )
 
@@ -2805,17 +2886,20 @@ def assemble_fem_native(
         def _assemble_at(args):
             A = jacobian(zeros, 0.0, args)
             b = -residual(zeros, 0.0, args)
-            # a net-valued Dirichlet re-forms the lift from args each call; otherwise the static pairs.
-            pairs = _dirichlet_pairs_at(args) if _dir_net_models else dirichlet_pairs
+            # a net- or parameter-valued Dirichlet re-forms the lift from args each call; else static.
+            pairs = _dirichlet_pairs_at(args) if (_dir_net_models or _dir_param_rows) else dirichlet_pairs
             if pairs:
                 A, b = _apply_dirichlet_symmetric(A, b, pairs)
             return A, b
 
-        # Static placeholder for .A/.b: scalar params at 0, networks (coefficient + Dirichlet) at stored weights.
+        # Static placeholder for .A/.b: scalar params at 0, networks (coefficient + Dirichlet) at stored
+        # weights, Dirichlet-value parameters at their STORED value (like the nets: `fem.b` then reflects
+        # the initialized boundary value rather than an arbitrary zero condition).
         a0, b0 = _assemble_at(
             {n: 0.0 for n in runtime_parameter_tags}
             | {n: _neural_models[n].module for n in neural_param_names}
             | {n: m.module for n, m in _dir_net_models.items()}
+            | {n: jnp.asarray(nd.model.module.value) for n, nd in _dir_param_exprs.items()}
         )
         op = FemLinearSystem(
             a0,
