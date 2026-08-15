@@ -79,10 +79,11 @@ class _Spec:
     key = None
     complex_ok = False  # conservative: a consumer reformulates unless the spec says it takes complex
 
-    def cached(self, *, refresh: bool = False):
+    def cached(self, *, refresh=False):
         """Wrap this preconditioner so its setup is built **once** and reused across solves — the
         fluent form of :func:`cached`. E.g. ``jno.precond.amg().cached()``. ``refresh`` controls
-        invalidation (``False`` frozen, ``True`` on shape/sparsity change, or a ``ctx -> key`` callable)."""
+        invalidation (``False`` frozen, ``True`` on shape/sparsity change, an ``int k`` to rebuild
+        every k-th materialization, or a ``ctx -> key`` callable)."""
         return _Cached(self, refresh)
 
     def __eq__(self, other):
@@ -259,20 +260,54 @@ class _Form(_Spec):
     """Spec assembling an auxiliary weak form as the preconditioner operator; see :func:`form`."""
 
     def __init__(self, terms, inner_solver, quad_degree):
-        self.terms = list(terms)
+        # A CALLABLE is the solution-dependent variant: ``fn(sol) -> term list``, re-assembled from
+        # the current outer iterate (see :meth:`refresh_from`). A plain list stays what it was: one
+        # parameter-independent assembly, cached forever.
+        self._terms_fn = terms if callable(terms) and not isinstance(terms, (list, tuple)) else None
+        self.terms = None if self._terms_fn is not None else list(terms)
         self.inner = inner_solver
         self.quad_degree = quad_degree
-        self._op = None  # assembled once; the auxiliary operator is parameter-independent
+        self._op = None  # assembled once (static terms); rebuilt per refresh (callable terms)
 
     def prepare(self, fem):
         """Eager one-time assembly (called at compose time, OUTSIDE any trace — assembling a
-        fresh ``jno.fem`` inside the Newton/Picard ``while_loop`` entangles with loop tracers)."""
-        if self._op is None:
+        fresh ``jno.fem`` inside the Newton/Picard ``while_loop`` entangles with loop tracers).
+        The callable variant skips this: it has no terms until a concrete iterate arrives."""
+        if self._op is None and self._terms_fn is None:
             from .utils.solver.solver_api import PrecondContext as _Ctx
 
             self._op = _Ctx(None, fem).assemble(self.terms, quad_degree=self.quad_degree)
 
+    def refresh_from(self, sol, fem):
+        """Re-assemble the auxiliary operator from the CONCRETE outer iterate ``sol``.
+
+        Called by the composed nonlinear solve once per invocation, with the solve's entry iterate
+        (the warm start / previous march step) — the **Picard-lagged preconditioner**: the
+        coefficient trails the solution by one outer solve, which changes convergence *speed* only,
+        never the answer (Elman, Silvester & Wathen, *Finite Elements and Fast Iterative Solvers*,
+        2nd ed., OUP 2014, §9.2 uses exactly this lag for the viscosity-weighted Schur mass).
+
+        Eager by necessity: every Newton driver's loop is a ``lax.while_loop``, so the per-step
+        iterate is a tracer and no host assembly can see it. The lag is therefore not a shortcut but
+        the only place a solution-dependent auxiliary CAN be assembled."""
+        if self._terms_fn is None:
+            return
+        import numpy as _np
+
+        from .utils.solver.solver_api import PrecondContext as _Ctx
+
+        self.terms = list(self._terms_fn(_np.asarray(sol).reshape(-1)))
+        self._op = _Ctx(None, fem).assemble(self.terms, quad_degree=self.quad_degree)
+
     def materialize(self, ctx: PrecondContext):
+        if self._op is None and self._terms_fn is not None:
+            raise NotImplementedError(
+                "jno.precond.form(<callable>): this solution-dependent auxiliary was never assembled "
+                "-- no concrete iterate reached it. It refreshes from the outer solve's entry iterate "
+                "on the composed nonlinear path (fem.solve(nonlinear=..., precond=...)); a fully "
+                "traced context (jit/vmap over the whole solve, a lax.scan march) never has one. "
+                "Run the solve eagerly, or use a static form([...]) with a frozen coefficient."
+            )
         if self._op is None:
             self._op = ctx.assemble(self.terms, quad_degree=self.quad_degree)
         op = self._op
@@ -286,7 +321,8 @@ class _Form(_Spec):
         return PrecondApplier(lambda v: solver(op, v), lambda v: solver(op.T, v))
 
     def __repr__(self):
-        return f"jno.precond.form(<{len(self.terms)} terms>, inner={self.inner})"
+        what = "<solution-dependent>" if self._terms_fn is not None else f"<{len(self.terms)} terms>"
+        return f"jno.precond.form({what}, inner={self.inner})"
 
 
 def form(terms, *, inner=None, quad_degree: int = 2) -> _Form:
@@ -1019,8 +1055,11 @@ def ams(*, aux=None) -> _AMS:
 class _JaxAMG(_Spec):
     """Spec for the GPU AMG preconditioner via jaxamg (NVIDIA AmgX); see :func:`jaxamg`."""
 
-    def __init__(self, config):
+    complex_ok = False  # AmgX is real-only -- a complex operator must take the 2n real-equivalent path
+
+    def __init__(self, config, symmetric=True):
         self.config = config
+        self.symmetric = bool(symmetric)
 
     def materialize(self, ctx: PrecondContext):
         from .solve import _require_jaxamg  # reuse the lazy import + install-requirements error
@@ -1034,13 +1073,23 @@ class _JaxAMG(_Spec):
         jax_amg = _require_jaxamg()
         cfg = dict(self.config) if self.config is not None else {"solver": "AMG"}
         apply = jax_amg.make_preconditioner(A, config=cfg)  # build-once M⁻¹ apply (single AMG cycle)
-        return PrecondApplier(lambda v: apply(v))
+        if self.symmetric:
+            return PrecondApplier(lambda v: apply(v))  # .T reuses the applier -- right for SPD
+        # The reverse pass of a differentiable solve preconditions A^T and needs M^T (see
+        # PrecondApplier): an AMG hierarchy is not structurally transposable, so build a SECOND
+        # hierarchy on the transposed matrix. Costs one extra setup; without it the adjoint Krylov
+        # solve of a non-symmetric operator runs effectively unpreconditioned.
+        import jax.experimental.sparse as _js
+
+        At = _js.BCOO((jnp.asarray(A.data), jnp.asarray(A.indices)[:, ::-1]), shape=(A.shape[1], A.shape[0]))
+        apply_t = jax_amg.make_preconditioner(At, config=cfg)
+        return PrecondApplier(lambda v: apply(v), lambda v: apply_t(v))
 
     def __repr__(self):
-        return "jno.precond.jaxamg()"
+        return f"jno.precond.jaxamg(symmetric={self.symmetric})"
 
 
-def jaxamg(*, config: "dict | None" = None) -> _JaxAMG:
+def jaxamg(*, config: "dict | None" = None, symmetric: bool = True) -> _JaxAMG:
     """GPU AMG **preconditioner** via jaxamg (NVIDIA AmgX wrapped as a JAX primitive) — the
     on-device counterpart of :func:`amg`, and the natural smoother for large elliptic blocks or the
     auxiliary nodal solves of an H(curl) AMS preconditioner on the GPU.
@@ -1054,9 +1103,16 @@ def jaxamg(*, config: "dict | None" = None) -> _JaxAMG:
     ``config`` is a full AmgX-format dict (default ``{"solver": "AMG"}``). Needs an **assembled**
     operator. Optional dependency — jaxamg (AmgX 2.5+, CUDA 12+, mpi4py/mpi4jax) is imported lazily.
 
-    Reference: Liu, Fan & Wang, arXiv:2606.09001 (2026), wrapping NVIDIA AmgX (Naumov et al., 2015).
+    ``symmetric=False`` builds a **second hierarchy on** ``A^T`` so the adjoint (reverse-mode) solve
+    is preconditioned too — an AMG hierarchy is not structurally transposable, and without this the
+    reverse pass of a differentiable non-symmetric solve runs effectively unpreconditioned (see
+    ``PrecondApplier``). Leave the default for SPD operators, where one hierarchy serves both
+    directions. Real-valued operators only — AmgX has no complex mode.
+
+    Reference: Liu, Fan & Wang, arXiv:2606.09001 (2026), wrapping NVIDIA AmgX (Naumov et al.,
+    *SIAM J. Sci. Comput.* 37(5), 2015).
     """
-    return _JaxAMG(config)
+    return _JaxAMG(config, symmetric)
 
 
 _MISS = object()  # sentinel so the first materialize always builds
@@ -1067,9 +1123,12 @@ class _Cached(_Spec):
 
     def __init__(self, spec, refresh):
         self.spec = spec
-        self.refresh = refresh  # False → frozen | True → rebuild on sparsity change | callable ctx→key
+        # False → frozen | True → rebuild on sparsity change | int k → rebuild every k-th
+        # materialization | callable ctx→key
+        self.refresh = refresh
         self._applier = None
         self._key = _MISS
+        self._count = 0  # materializations since construction, for the int-k policy
 
     @property
     def traceable(self):
@@ -1094,7 +1153,7 @@ class _Cached(_Spec):
         ``id`` cannot be recycled while this spec is alive."""
         return (type(self), id(self._applier)) if self.traceable else None
 
-    def cached(self, *, refresh: bool = False):
+    def cached(self, *, refresh=False):
         return self  # already cached — .cached() is idempotent (no double-wrapping)
 
     def prepare(self, fem):  # forward the eager (out-of-trace) build hook, if the inner spec has one
@@ -1105,13 +1164,22 @@ class _Cached(_Spec):
     def _key_of(self, ctx):
         if self.refresh is False:
             return "frozen"
+        if isinstance(self.refresh, bool):  # True → key on the operator's shape + sparsity size
+            A = ctx.A
+            return (A.shape, int(A.bcoo.nse)) if A.bcoo is not None else (A.shape,)
+        if isinstance(self.refresh, int):
+            # Every k-th materialization: the operator's values drift step by step (a Newton loop, a
+            # transient march driving one solve per step), so the hierarchy is rebuilt on a cadence
+            # rather than frozen forever or rebuilt every time. In between, the stale setup is a
+            # legitimate preconditioner: speed degrades gracefully, correctness never.
+            return self._count // max(1, int(self.refresh))
         if callable(self.refresh):
             return self.refresh(ctx)
-        A = ctx.A  # refresh=True → key on the operator's shape + sparsity size
-        return (A.shape, int(A.bcoo.nse)) if A.bcoo is not None else (A.shape,)
+        raise TypeError(f"cached(refresh=...): expected bool, int, or callable, got {type(self.refresh).__name__}")
 
     def materialize(self, ctx: PrecondContext):
         key = self._key_of(ctx)
+        self._count += 1
         if self._applier is None or key != self._key:
             self._applier = materialize_precond(self.spec, ctx)  # build the wrapped preconditioner once
             self._key = key
@@ -1121,7 +1189,7 @@ class _Cached(_Spec):
         return f"jno.precond.cached({self.spec!r}, refresh={self.refresh}, built={self._applier is not None})"
 
 
-def cached(spec, *, refresh: bool = False):
+def cached(spec, *, refresh=False):
     """Memoise any preconditioner's setup so it is built **once** and reused across solves — the
     plug-and-play way to amortise an expensive setup (a multigrid hierarchy, an assembled auxiliary
     operator, a jaxamg/AmgX coloring) over a frequency sweep, a Newton loop, or an inverse-problem
@@ -1132,8 +1200,9 @@ def cached(spec, *, refresh: bool = False):
     reuses it forever — the standard frozen-preconditioner trade (a preconditioner only changes
     convergence *speed*, never the solution, so reusing a slightly-stale setup is always correct and
     usually cheap). ``refresh=True`` rebuilds when the operator's shape/sparsity changes (values may
-    still drift under the frozen setup); pass a callable ``ctx -> hashable`` for a custom invalidation
-    key. The wrapped spec's eager ``prepare(fem)`` hook (if any) is forwarded, so it composes with the
+    still drift under the frozen setup); an ``int k`` rebuilds every k-th materialization — the
+    cadence policy for a Newton loop or transient march whose operator values drift step by step;
+    pass a callable ``ctx -> hashable`` for a custom invalidation key. The wrapped spec's eager ``prepare(fem)`` hook (if any) is forwarded, so it composes with the
     ``jit``/``vmap``/parametric-inverse build-eagerly requirement unchanged.
 
     Reuse the SAME ``cached(...)`` object across the solves you want to share the setup::

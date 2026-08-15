@@ -247,9 +247,11 @@ def enable_compile_cache(directory: str | None = None) -> str:
     -- the same Stokes assembly measured **9.43 s cold, 2.20 s warm (4.3x)** on a second process,
     for 187 entries and 7.2 MB.
 
-    Off by default because a library should not write to a user's disk uninvited; this is the
-    opt-in, also reachable as ``jno.setup(__file__, compile_cache=True)`` or, per project,
-    ``[jno] compile_cache = true`` in ``.jno.toml``.
+    **ON by default** since the warm-cache build was measured at 2.1x (and 4.3x on Stokes): jNO's
+    audience re-runs scripts, sweeps and test suites, where the cache pays back from the second
+    process onward. Opt out with ``JNO_COMPILE_CACHE=0``, ``[jno] compile_cache = false`` in
+    ``.jno.toml``, or ``jno.setup(__file__, compile_cache=False)`` — see
+    :func:`_auto_compile_cache` / :func:`disable_compile_cache`.
 
     **The first run is SLOWER, sometimes much slower** -- writing the entries is not free. A 75k-node
     3-D Poisson build measured 7.45 s with no cache, 18.30 s on the run that populates one, and
@@ -278,6 +280,40 @@ def enable_compile_cache(directory: str | None = None) -> str:
     jax.config.update("jax_compilation_cache_dir", path)
     jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
     return path
+
+
+def disable_compile_cache() -> None:
+    """Turn the persistent compilation cache back off (it is on by default) — the programmatic twin
+    of ``JNO_COMPILE_CACHE=0`` / ``[jno] compile_cache = false``."""
+    import jax
+
+    jax.config.update("jax_compilation_cache_dir", None)
+    jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
+
+
+def _auto_compile_cache() -> None:
+    """Enable the persistent XLA cache at ``import jno`` unless the user opted out.
+
+    Precedence: ``JNO_COMPILE_CACHE`` env (0/false/off/no disables; a path enables *there*), then
+    ``[jno] compile_cache`` in the TOML config (``false`` disables, a string names the directory),
+    then on. An unwritable cache directory must never break ``import jno`` — the failure is logged
+    and the session simply runs uncached, exactly as before the default flipped."""
+    env = os.getenv("JNO_COMPILE_CACHE")
+    if env is not None:
+        if env.strip().lower() in ("0", "false", "off", "no"):
+            return
+        directory = env if os.sep in env or env.startswith("~") else None
+    else:
+        opt = get_config().get("jno", {}).get("compile_cache", True)
+        if opt is False:
+            return
+        directory = opt if isinstance(opt, str) else None
+    try:
+        enable_compile_cache(directory)
+    except Exception as e:  # noqa: BLE001 — an uncached session beats a broken import
+        import logging
+
+        logging.getLogger("jno").debug(f"persistent compile cache not enabled: {e}")
 
 
 def setup(
@@ -392,9 +428,13 @@ def setup(
     # over the historical defaults already in ad_mode.py.
     apply_ad_mode_defaults(diff_type, hessian_type)
 
-    # --- Optional persistent XLA compilation cache (explicit kwarg wins over TOML) ---
-    cache_opt = get_config().get("jno", {}).get("compile_cache", False) if compile_cache is None else compile_cache
-    if cache_opt:
+    # --- Persistent XLA compilation cache: ON by default (enabled at import); an explicit kwarg
+    # wins over TOML, and False here actively disables what the import turned on. ---
+    cache_opt = get_config().get("jno", {}).get("compile_cache", True) if compile_cache is None else compile_cache
+    if cache_opt is False:
+        disable_compile_cache()
+        _logger_mod._default_logger.info("XLA compilation cache disabled")
+    elif cache_opt:
         cache_dir = enable_compile_cache(cache_opt if isinstance(cache_opt, str) else None)
         _logger_mod._default_logger.info(f"XLA compilation cache enabled at {cache_dir}")
 

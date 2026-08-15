@@ -183,21 +183,41 @@ def _restore_cache_dir():
         jax.config.update("jax_compilation_cache_dir", prev)
 
 
-def test_setup_leaves_the_compile_cache_off_by_default(tmp_path, monkeypatch, _restore_cache_dir):
-    """jNO must not write to a user's disk unless asked. Also guards the cold-run case: populating
-    the cache is SLOWER than not having one, so on-by-default would penalise a single run."""
+def test_setup_turns_the_compile_cache_on_by_default(tmp_path, monkeypatch, _restore_cache_dir):
+    """The default FLIPPED (2026-08-15): the warm-cache build measured 2.1x (4.3x on Stokes) and
+    jNO's normal life is the repeated run, so the persistent cache is ON unless opted out —
+    `JNO_COMPILE_CACHE=0`, `[jno] compile_cache = false`, or `setup(compile_cache=False)`. This test
+    used to pin the opposite ('must not write to a user's disk unless asked'); the populate-cost
+    caveat it guarded is now documented in `enable_compile_cache` and docs/fem.md instead."""
     import jax
 
     import jno
 
-    monkeypatch.chdir(tmp_path)  # no .jno.toml here, so nothing can opt in behind the test's back
+    monkeypatch.chdir(tmp_path)  # no .jno.toml here, so nothing can opt OUT behind the test's back
+    monkeypatch.delenv("JNO_COMPILE_CACHE", raising=False)
     cfg_module._CONFIG = None
     jax.config.update("jax_compilation_cache_dir", None)
     try:
         jno.setup(str(tmp_path / "script.py"), name="cache_default")
-        assert _cache_dir() is None, "the compile cache must stay opt-in"
+        assert _cache_dir() is not None, "the compile cache is ON by default since the 08-15 flip"
     finally:
         cfg_module._CONFIG = None
+
+
+def test_setup_compile_cache_false_disables_the_default(tmp_path, monkeypatch, _restore_cache_dir):
+    """The explicit opt-out must actively disable what the import-time default turned on."""
+    import jax
+
+    import jno
+
+    monkeypatch.chdir(tmp_path)
+    cfg_module._CONFIG = None
+    try:
+        jno.setup(str(tmp_path / "script.py"), name="cache_off", compile_cache=False)
+        assert _cache_dir() is None, "setup(compile_cache=False) must disable the cache"
+    finally:
+        cfg_module._CONFIG = None
+        jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
 
 
 def test_compile_cache_true_turns_it_on(tmp_path, _restore_cache_dir):

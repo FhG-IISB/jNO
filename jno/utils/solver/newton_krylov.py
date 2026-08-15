@@ -29,7 +29,15 @@ __all__ = ["newton_krylov", "newton_direct", "staggered_newton", "bicgstab"]
 _EPS = 1e-300
 
 
-def _convergence_check(f0, u0, u, *, rtol, atol, max_steps, who):
+#: Last eager nonlinear solve's outcome, written by ``_convergence_check`` and read by
+#: ``fem.solve`` into ``fem.stats``. A module-level slot rather than a return-value change on
+#: purpose: the drivers' ``(residual_fn, u0) -> u`` contract has many callers, and observability
+#: must not alter it. Under jit/vmap/grad the check self-disables (concrete-only, as documented
+#: below) and this slot simply keeps its previous content -- the same silence the guard itself has.
+LAST_NEWTON_STATS: dict = {}
+
+
+def _convergence_check(f0, u0, u, *, rtol, atol, max_steps, who, steps=None):
     """Raise (eagerly) if the Newton loop returned on its STEP CAP rather than on the tolerance.
 
     Both drivers below iterate a ``jax.lax.while_loop`` whose condition is
@@ -47,6 +55,14 @@ def _convergence_check(f0, u0, u, *, rtol, atol, max_steps, who):
         return u
     rn = float(jnp.linalg.norm(f0(u)))
     bound = atol + rtol * float(jnp.linalg.norm(f0(u0)))
+    LAST_NEWTON_STATS.clear()
+    LAST_NEWTON_STATS.update(
+        driver=who,
+        residual=rn,
+        bound=bound,
+        steps=None if steps is None or isinstance(steps, jax.core.Tracer) else int(steps),
+        converged=bool(math.isfinite(rn) and rn <= bound),
+    )
     if not math.isfinite(rn) or rn > bound:
         raise RuntimeError(
             f"{who} did not converge in max_steps={max_steps}: residual norm {rn:.3e} against the "
@@ -372,11 +388,11 @@ def newton_direct(
             u = u + alpha * delta
             return u, f0(u), k + 1
 
-        u, _r, _k = jax.lax.while_loop(cond, body, (x0, f0(x0), 0))
-        return u
+        u, _r, k = jax.lax.while_loop(cond, body, (x0, f0(x0), 0))
+        return u, k
 
-    root = _forward(u0)  # un-differentiated forward solve; custom_root below supplies the gradient
-    _convergence_check(f0, u0, root, rtol=rtol, atol=atol, max_steps=max_steps, who="newton_direct")
+    root, _steps = _forward(u0)  # un-differentiated forward solve; custom_root supplies the gradient
+    _convergence_check(f0, u0, root, rtol=rtol, atol=atol, max_steps=max_steps, who="newton_direct", steps=_steps)
 
     def _tangent(g, y):  # solve J_root x = y (and Jᵀ on the reverse pass) DIRECTLY at the converged root
         J = jacobian_fn(root)
