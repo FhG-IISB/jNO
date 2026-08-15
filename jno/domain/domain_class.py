@@ -1783,6 +1783,73 @@ class domain(MeshIOMixin):
         self._region_attachments = attached
         self._attachment_kind = kinds
 
+    def attach(self, target: str, **props):
+        """Declare material properties on an existing **region or boundary tag**, after the domain is built.
+
+        The runtime counterpart of :meth:`Shape.attach`, and the only way to attach to a
+        ``domain.tag`` — or to a mesh-file domain, which has no ``Shape`` to declare them on::
+
+            d.tag("wall", lambda x, y: x < 1e-9)
+            d.tag("lid",  lambda x, y: y > 1 - 1e-9)
+            d.attach("wall", h=25.0).attach("lid", h=5.0)
+            robin = d.h * (ub - T_inf) * vb          # ONE term over the whole boundary
+
+        Whether a target is a **volume** or a **surface** quantity is decided here, once, from what the
+        target actually owns on this mesh -- a tag owning boundary facets is a surface, a tag owning
+        only cells is a volume, and a tag owning both is ambiguous and raises rather than guessing.
+        ``d.<prop>`` then emits the matching coefficient (:meth:`by_region` or :meth:`by_tag`).
+
+        Returns ``self`` so declarations chain. Repeated calls merge (last wins).
+        """
+        target = str(target)
+        kind = self._attachment_target_kind(target)
+        attached = self.__dict__.setdefault("_region_attachments", {})
+        kinds = self.__dict__.setdefault("_attachment_kind", {})
+        for prop, value in props.items():
+            attached.setdefault(str(prop), {})[target] = value
+        kinds[target] = kind
+        self._check_attachment_clashes()
+        return self
+
+    def _attachment_target_kind(self, target: str) -> str:
+        """``"volume"`` or ``"surface"`` for an attach target — resolved from what it owns on this mesh.
+
+        A ``domain.tag`` is deliberately general (the docstring of :meth:`tag` says so): it names any
+        subset, interior *or* boundary. So the kind cannot be read off the name, and guessing it wrong
+        picks the wrong mask -- a surface coefficient integrated over cells, or the reverse, which is
+        wrong physics and not an error anywhere. Decide it once, here, and refuse the ambiguous case.
+        """
+        if target in (getattr(self, "_shape_regions", {}) or {}) or target in (getattr(self, "_source_regions", {}) or {}):
+            return "volume"
+        if target not in (getattr(self, "_tag_predicates", {}) or {}) and target not in (
+            getattr(self, "_boundary_regions", {}) or {}
+        ):
+            known_r = sorted(
+                set(getattr(self, "_shape_regions", {}) or {}) | set(getattr(self, "_source_regions", {}) or {})
+            )
+            known_t = sorted(getattr(self, "_tag_predicates", {}) or {})
+            raise ValueError(f"domain.attach: unknown target {target!r}. Known regions: {known_r}; known tags: {known_t}.")
+        has_facets = target in (getattr(self, "_boundary_regions", {}) or {})
+        has_cells = False
+        try:
+            from ..utils.solver.fem_utils import _cell_region_mask
+
+            has_cells = bool(np.asarray(_cell_region_mask(self, target)).any())
+        except Exception:  # noqa: BLE001 - no mesh yet, or a predicate this path cannot evaluate
+            has_cells = False
+        if has_facets and has_cells:
+            raise ValueError(
+                f"domain.attach: tag {target!r} owns both interior cells and boundary facets, so whether "
+                f"its properties are volume or surface quantities is ambiguous. Split it into two tags, "
+                f"or build the coefficient explicitly with d.by_region({{...}}) / d.by_tag({{...}})."
+            )
+        if not has_facets and not has_cells:
+            raise ValueError(
+                f"domain.attach: tag {target!r} owns neither a cell nor a boundary facet on this mesh, so "
+                f"nothing attached to it could ever be integrated. Check the tag's predicate."
+            )
+        return "surface" if has_facets else "volume"
+
     def _check_attachment_clashes(self):
         """Reject an attached name that collides with a real ``domain`` attribute, at build time.
 

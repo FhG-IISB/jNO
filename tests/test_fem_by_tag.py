@@ -154,6 +154,74 @@ def test_mixed_view_types_across_tags_raise():
 
 
 # --------------------------------------------------------------------------------------
+# attach on a tag
+# --------------------------------------------------------------------------------------
+def test_attach_on_a_tag_reads_back_as_the_per_facet_coefficient():
+    d, _u, _v, binds, stiff = _square()
+    ub, vb = binds["boundary"]
+    ul, vl = binds["left"]
+    ur, vr = binds["right"]
+    d.attach("left", h=3.0).attach("right", h=7.0)
+
+    one = _A(jno.fem([stiff, d.h * ub * vb]))
+    loop = _A(jno.fem([stiff, 3.0 * ul * vl, 7.0 * ur * vr]))
+    np.testing.assert_allclose(one, loop, rtol=1e-5, atol=1e-5)
+
+
+def test_attach_returns_self_so_declarations_chain():
+    d, *_ = _square()
+    assert d.attach("left", h=1.0) is d
+
+
+def test_attach_records_the_kind_from_what_the_target_owns():
+    d, *_ = _square()
+    d.tag("blob", lambda x, y: (x > 0.3) & (x < 0.7) & (y > 0.3) & (y < 0.7))  # cells, no facets
+    d.attach("left", h=1.0)
+    d.attach("blob", q=1.0)
+    kinds = d.__dict__["_attachment_kind"]
+    assert kinds["left"] == "surface" and kinds["blob"] == "volume"
+    assert "TagMask(left)" in str(d.h)
+    assert "RegionMask(blob)" in str(d.q)  # an interior tag is still a VOLUME coefficient
+
+
+def test_a_tag_owning_both_cells_and_facets_is_ambiguous_and_raises():
+    """`domain.tag` names any subset, interior or boundary. A half-plane owns both, so whether its
+    properties are volume or surface quantities cannot be decided -- and guessing picks the wrong
+    mask, which is wrong physics rather than an error."""
+    d, *_ = _square()
+    d.tag("halfplane", lambda x, y: x < 0.5)
+    with pytest.raises(ValueError, match="owns both interior cells and boundary facets"):
+        d.attach("halfplane", k=1.0)
+
+
+def test_attach_rejects_an_unknown_target():
+    d, *_ = _square()
+    with pytest.raises(ValueError, match="unknown target"):
+        d.attach("nope", k=1.0)
+
+
+def test_a_property_declared_on_both_a_region_and_a_tag_raises_on_read():
+    """One name, two meanings: integrated over cells in one place and over facets in another."""
+    d = (
+        jno.Shape.rect(0, 0, 1, 1, size=0.5).name("a").attach(rho=1.0)
+        + jno.Shape.rect(0, 0, 2, 1, size=0.5).name("b").attach(rho=2.0)
+    ).domain()
+    d.tag("edge", lambda x, y: y < 1e-9)
+    d.attach("edge", rho=5.0)
+    with pytest.raises(AttributeError, match="declared on both a volume region and a boundary tag"):
+        d.rho
+
+
+def test_a_surface_property_needs_no_completeness_rule():
+    """Unlike regions, tags are NOT a partition of the boundary -- untagged boundary is deliberately
+    natural in jNO -- so declaring `h` on one tag only must work, not raise."""
+    d, _u, _v, binds, stiff = _square()
+    ub, vb = binds["boundary"]
+    d.attach("left", h=3.0)
+    assert np.all(np.isfinite(_A(jno.fem([stiff, d.h * ub * vb]))))
+
+
+# --------------------------------------------------------------------------------------
 # scope limits — each must be LOUD
 # --------------------------------------------------------------------------------------
 def test_a_tag_mask_in_a_volume_term_raises():

@@ -188,6 +188,20 @@ Rules worth knowing:
   surface quantity is decided by the term that consumes it. Boundary tags are the exception — see
   `d.attach(...)` below, where the kind is resolved when it is declared.
 
+A property can also be attached **after** the domain exists, which is the only way to attach to a
+`domain.tag` — or to a mesh-file domain, which has no `Shape` to declare on:
+
+```python
+d.tag("wall", lambda x, y: x < 1e-9)
+d.tag("lid",  lambda x, y: y > 1 - 1e-9)
+d.attach("wall", h=25.0).attach("lid", h=5.0)     # a SURFACE property, per boundary facet
+```
+
+Here the kind is decided once, from what the target owns on this mesh: a tag owning boundary facets
+is a surface quantity (`d.h` becomes a per-facet `by_tag` coefficient, see the `jno.fem` docs), a tag
+owning only cells is a volume quantity, and a tag owning **both** is ambiguous and raises rather than
+guessing — split it in two, or build the coefficient explicitly.
+
 **Interfaces** between materials are auto-named by the region pair, sorted — `d.variable("inclusion|matrix")`
 gives *every* facet where those two materials meet (however many flat faces that spans — an E-core's
 `air|core` boundary is one tag, not one per face). Impose a coupling/flux condition there, or sample it.
