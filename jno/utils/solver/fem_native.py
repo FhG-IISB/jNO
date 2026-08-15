@@ -569,6 +569,7 @@ def assemble_fem_native(
     quad_degree: int,
     evolution: Optional[Dict[Any, Any]] = None,
     bounded: bool = False,
+    tv_dirichlet_external: bool = False,
 ) -> Tuple[Any, str]:
     """Assemble a Lagrange FEM system into ``(op, mode, offs)`` for :class:`FEM`.
 
@@ -3060,7 +3061,12 @@ def assemble_fem_native(
 
     # A τ/t-dependent essential value that no branch above threaded would be silently DROPPED here --
     # the constraint disappears and the solve returns a plausible-looking wrong answer. Fail instead.
-    if _tv_dirichlet:
+    # EXCEPT when the caller declared it consumes the tv stash itself (`tv_dirichlet_external=True`):
+    # the second-order u_tt block calls this assembler for the spatial operator and the Dirichlet
+    # stashes, then writes g(x_d, t) and the compatible ġ(x_d, t) onto its augmented [u, v] system per
+    # step -- a legitimate consumer this guard was firing on (found by the pre-push suite: two wave
+    # oracles that pass on origin/main NotImplementedError'd from the guard's own commit onward).
+    if _tv_dirichlet and not tv_dirichlet_external:
         raise NotImplementedError(
             "jno.fem: a time/τ-dependent essential value (e.g. `u(top) - delta*tau`) is threaded on the "
             "steady residual path -- the load-path march and the runtime-parametric solve -- and by the "
