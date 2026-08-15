@@ -3575,7 +3575,10 @@ def _leaf_content_token(leaf, seen):
         d = _expr_digest(leaf)
         return None if d is None else ("expr", d)
     tname = type(leaf).__name__
-    if tname == "domain" and type(leaf).__module__.startswith("jno."):
+    # MRO walk, not a name match on the leaf class: ``PolygonDomain(domain)`` and any other subclass
+    # must token the same way -- matching only the base name made every shapely-built domain bail,
+    # which the tally surfaced as ``{'PolygonDomain': 12}`` on the first multifield rebuild measured.
+    if any(c.__name__ == "domain" and c.__module__.startswith("jno.") for c in type(leaf).__mro__):
         return _domain_content_token(leaf)
     if tname == "NeuralSlots" and not getattr(leaf, "models", None):
         return ("neural", tuple(getattr(leaf, "all_names", ())), tuple(getattr(leaf, "param_names", ())))

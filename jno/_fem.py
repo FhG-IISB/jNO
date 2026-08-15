@@ -379,7 +379,14 @@ def _lower_gauge_pin(pin: GaugePin) -> Any:
     # Single leading underscore (not "__...__"): the pin node is a genuine single-vertex boundary
     # region that `_region_and_support` must SEE, so its tag must not match the reserved
     # double-underscore filter that hides internal/temporal tags from region detection.
-    tag = f"_gauge_pin_{field.field_key}"
+    #
+    # Keyed on the field NAME, not `field_key`: the key is a process-global counter, so the tag came
+    # out `_gauge_pin_3` on one build and `_gauge_pin_7` on the next -- the one string that kept two
+    # otherwise-identical problems from sharing their compiled assembly kernels (the rebuild cache
+    # keys on content). The name is deterministic, and just as unique where uniqueness matters:
+    # trial names are distinct within a problem, and the per-domain cache WANTS two problems pinning
+    # the same-named field on the same domain to share the pin region.
+    tag = f"_gauge_pin_{getattr(field, 'name', None) or field.field_key}"
     cache = domain.__dict__.setdefault("_gauge_pin_coords", {})
     if tag not in cache:
         pts = _np.asarray(domain.mesh.points)[:, :dim]
