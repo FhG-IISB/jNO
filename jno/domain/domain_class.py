@@ -1650,12 +1650,20 @@ class domain(MeshIOMixin):
         and an unknown region name raises. Desugars to ``sum_r RegionMask(r) * values[r]`` -- the proven
         per-region integration path (``tests/test_fem_per_region.py``); ``jno.fem`` logs the expansion.
         """
-        valid = set(getattr(self, "_source_regions", {}) or {}) | set(getattr(self, "_tag_predicates", {}) or {})
+        # ``_shape_regions`` are the named sub-regions of a ``Shape.regions`` / ``a.name(..) + b.name(..)``
+        # plan. They belong here for the same reason geometry parts do -- ``RegionMask`` resolves them
+        # through the same centroid-membership path (``_cell_region_mask``). Without them a
+        # Shape-built multi-material domain could not use ``by_region`` at all.
+        valid = (
+            set(getattr(self, "_source_regions", {}) or {})
+            | set(getattr(self, "_tag_predicates", {}) or {})
+            | set(getattr(self, "_shape_regions", {}) or {})
+        )
         unknown = [r for r in values if r not in valid]
         if unknown:
             raise ValueError(
-                f"domain.by_region: unknown region(s) {sorted(unknown)}; each key must be a geometry part "
-                f"or a domain.tag predicate. Known regions: {sorted(valid)}."
+                f"domain.by_region: unknown region(s) {sorted(unknown)}; each key must be a geometry part, "
+                f"a Shape.regions sub-region, or a domain.tag predicate. Known regions: {sorted(valid)}."
             )
         expr = None
         for region, value in values.items():

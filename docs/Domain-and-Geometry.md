@@ -145,6 +145,10 @@ and `inclusion` wins inside the disk because it is listed first. Use each region
 PINN. A multi-material shape is a top-level construct — call `.domain()` on it directly; it does not
 compose with boolean operators or transforms.
 
+Region names that are not valid Python identifiers go through the dict form:
+`Shape.regions({"Quartz.1": q1, "Quartz.2": q2})`. Dict order is priority order exactly as for
+keywords, and the two forms combine (dict entries first).
+
 **Interfaces** between materials are auto-named by the region pair, sorted — `d.variable("inclusion|matrix")`
 gives *every* facet where those two materials meet (however many flat faces that spans — an E-core's
 `air|core` boundary is one tag, not one per face). Impose a coupling/flux condition there, or sample it.

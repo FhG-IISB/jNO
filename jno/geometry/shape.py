@@ -115,7 +115,7 @@ class Shape:
         return cls(("leaf", Sphere(cx, cy, cz, r), next(_LEAF_KEYS)), 3, size)
 
     @classmethod
-    def regions(cls, **named: "Shape") -> "Shape":
+    def regions(cls, mapping=None, /, **named: "Shape") -> "Shape":
         """A multi-material domain: named sub-regions meshed **conforming** to their interfaces.
 
         Each keyword names a sub-region shape (all same ``dim``); the pieces are fragmented
@@ -136,11 +136,23 @@ class Shape:
         with ``u("a|b.a") - u("a|b.b")`` in ``jno.fem`` glues them by a mortar coupling — which is how
         you join two bodies meshed at *different* resolutions. ``conforming`` is therefore a reserved
         region name.
+
+        A positional ``{name: shape}`` **dict** is accepted for names that are not valid Python
+        identifiers -- ``Shape.regions({"Quartz.1": q1, "Quartz.2": q2})``. Dict order is priority
+        order, exactly as for keywords, and the two forms may be combined (dict entries first).
         """
         conforming = named.pop("conforming", True)
         if not isinstance(conforming, bool):
             raise TypeError(f"Shape.regions: `conforming` must be a bool, got {type(conforming).__name__}")
-        return cls._from_region_items(tuple(named.items()), conforming=conforming)
+        items: Tuple[Tuple[str, "Shape"], ...] = ()
+        if mapping is not None:
+            if not isinstance(mapping, dict):
+                raise TypeError(
+                    f"Shape.regions: the positional argument must be a {{name: shape}} dict, got "
+                    f"{type(mapping).__name__}. Pass shapes as keywords, or as one dict."
+                )
+            items += tuple((str(k), v) for k, v in mapping.items())
+        return cls._from_region_items(items + tuple(named.items()), conforming=conforming)
 
     @classmethod
     def _from_region_items(cls, items, conforming: bool = True) -> "Shape":
@@ -282,6 +294,10 @@ class Shape:
     def sized(self, size: Size) -> "Shape":
         """Return a copy of this shape with its target mesh size set (scalar or ``f(x,y,z)``)."""
         return Shape(self._node, self.dim, size, self._region_name, self._mesh_order)
+
+    def size(self, size: Size) -> "Shape":
+        """Alias for :meth:`sized` -- ``.size(h)`` reads better in a chain than ``.sized(h)``."""
+        return self.sized(size)
 
     def curved(self, order: int = 2) -> "Shape":
         """Return a copy meshed with **curved (isoparametric)** geometry of the given order.
