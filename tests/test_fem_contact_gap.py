@@ -421,3 +421,193 @@ def test_the_documented_contact_sign_engages_instead_of_finding_the_free_root():
     # (the max() kink chatters -- see item 2 in plans/contact-main-reaction.md), so the position is
     # not yet trustworthy enough to gate on. That the base is loaded at all is the sign question, and
     # it is the half that inverts.
+
+
+# ---------------------------------------------------------------------------
+# ONE-SIDED (separating, Signorini) contact -- the max(0,.) case, measured.
+#
+# The old note here deferred one-sided contact as "a solver question: the max() kink chatters". The
+# measurement that closed it: the chatter was a FLOAT32 RESIDUAL FLOOR (~1.6e-5 on the pressed
+# stack, line search or not), not active-set cycling -- under x64 the same iteration converges to
+# 3.6e-10 at rtol=1e-8. `jax.linearize` through `max` selects the active branch, which IS the
+# semismooth Jacobian (the same argument `u.bounds` documents), so the solver was never the problem;
+# the tolerance expectation was. These tests pin the physics at honest float32 tolerances and the
+# x64 discriminator that proves the iteration superlinear.
+# ---------------------------------------------------------------------------
+
+
+def _one_sided(c, squeeze, *, rtol=1e-6):
+    """The pressed stack with the ONE-SIDED penalty `max(0, -c*g)`; squeeze>0 lifts the platen."""
+    inner, sym, trace = jno.np.inner, jno.np.symgrad, jno.np.trace
+    d = _stacked_blocks()
+    sides = sorted(t for t in d.built_mesh.cell_sets if "|" in t)
+    secondary = next(t for t in sides if t.endswith(".cap"))
+    main = next(t for t in sides if t.endswith(".base"))
+    u, phi = d.fem_symbols(value_shape=(2,))
+    X = d.variable("interior", split=True)[:2]
+    eu, ep = sym(u, list(X)), sym(phi, list(X))
+    terms = [LAM_ * trace(eu) * trace(ep) + 2 * MU_ * inner(eu, ep, n_contract=2)]
+    sv = d.variable(secondary, split=True)
+    n = d.variable(secondary, normals=True)
+    g = u.gap(secondary, main, domain=d)
+    terms.append(jno.np.maximum(0.0, -c * g) * inner(n, phi.bind(x=sv[0], y=sv[1]), n_contract=1))
+    xb, yb, _ = d.variable("bottom", split=True)
+    xt, yt, _ = d.variable("top", split=True)
+    terms += [u(xb, yb)[0] - 0.0, u(xb, yb)[1] - 0.0, u(xt, yt)[0] - 0.0, u(xt, yt)[1] - squeeze]
+    fem = jno.fem(terms)
+    sol = np.asarray(fem.solve(nonlinear=jno.solve.newton(line_search=True, rtol=rtol, atol=rtol))).reshape(-1, 2)
+    return d, sol, np.asarray(d.tag_indices[secondary]).reshape(-1), np.asarray(d.tag_indices[main]).reshape(-1)
+
+
+def test_one_sided_press_converges_to_the_bonded_oracle_like_one_over_c():
+    """Under compression the closed one-sided contact must agree with the bonded interface: the
+    uniform-bar oracle has uy(y=1) = -0.01, approached as the penalty stiffens."""
+    errs = {}
+    for c in (1e3, 1e4, 1e5):
+        _d, sol, _s, main = _one_sided(c, -0.02)
+        errs[c] = abs(sol[main, 1].mean() - (-0.01))
+    assert errs[1e3] > errs[1e4] > errs[1e5], f"not converging to the bonded limit: {errs}"
+    assert errs[1e5] < 3e-4, f"closed one-sided contact should sit near the bonded answer: {errs[1e5]:.2e}"
+
+
+def test_one_sided_release_separates_without_adhesion():
+    """THE defining physics: lift the platen and the traction must be exactly zero -- the main body
+    undisturbed, the cap carried up rigidly, no tension transmitted across the open gap."""
+    d, sol, secondary, main = _one_sided(1e4, +0.02)
+    base = np.asarray(d.built_mesh.points)[:, 1] < 0.999
+    assert np.abs(sol[base]).max() < 1e-9, (
+        f"the open gap transmitted load: base max|u| = {np.abs(sol[base]).max():.3e} -- adhesion where there must be none"
+    )
+    assert sol[secondary, 1].mean() > 0.01, "the cap must move up with the platen once free"
+
+
+def test_one_sided_zero_load_is_the_unconstrained_solve():
+    """Extreme: no squeeze at all -- the contact term must contribute nothing anywhere."""
+    _d, sol, _s, _m = _one_sided(1e4, 0.0)
+    assert np.abs(sol).max() < 1e-9
+
+
+def test_one_sided_complementarity_via_the_interface_jump():
+    """p.g = 0, observed through displacements: pressed, the interface jump is O(1/c) (contact
+    active, gap ~ 0); released, the jump is the full opening with zero transmitted force (gap open,
+    traction 0). The two regimes may never mix."""
+    _d, press, s_ids, m_ids = _one_sided(1e5, -0.02)
+    jump_pressed = abs(press[s_ids, 1].mean() - press[m_ids, 1].mean())
+    assert jump_pressed < 5e-4, f"pressed: the gap must be ~closed, jump {jump_pressed:.2e}"
+    d, rel, s_ids, m_ids = _one_sided(1e5, +0.02)
+    jump_open = rel[s_ids, 1].mean() - rel[m_ids, 1].mean()
+    assert jump_open > 0.015, f"released: the gap must be OPEN by ~the lift, got {jump_open:.2e}"
+
+
+def test_one_sided_tight_tolerance_is_a_float32_floor_not_a_solver_stall():
+    """The discriminator that re-classified the recorded 'max() kink stalls Newton': under x64 the
+    SAME iteration meets rtol=1e-8 (measured residual 3.6e-10) -- superlinear semismooth Newton,
+    exactly as the `u.bounds` machinery argues. The float32 failure at 1e-8 is a precision floor."""
+    import jax as _jax
+
+    prev = _jax.config.jax_enable_x64
+    _jax.config.update("jax_enable_x64", True)
+    try:
+        _d, sol, _s, main = _one_sided(1e4, -0.02, rtol=1e-8)
+        assert abs(sol[main, 1].mean() - (-0.01)) < 1e-3
+    finally:
+        _jax.config.update("jax_enable_x64", prev)
+
+
+def test_gradient_through_closed_one_sided_contact_fd_checks():
+    """Differentiability through the ACTIVE contact: the platen displacement is a runtime Dirichlet
+    PARAMETER, and d(mean base uy)/d(squeeze) flows through custom_root across the max() branch
+    selection. FD-checked; away from onset the subgradient is the gradient."""
+    import jax as _jax
+
+    inner, sym, trace = jno.np.inner, jno.np.symgrad, jno.np.trace
+    d = _stacked_blocks()
+    sides = sorted(t for t in d.built_mesh.cell_sets if "|" in t)
+    secondary = next(t for t in sides if t.endswith(".cap"))
+    main = next(t for t in sides if t.endswith(".base"))
+    u, phi = d.fem_symbols(value_shape=(2,))
+    X = d.variable("interior", split=True)[:2]
+    eu, ep = sym(u, list(X)), sym(phi, list(X))
+    sv = d.variable(secondary, split=True)
+    n = d.variable(secondary, normals=True)
+    g = u.gap(secondary, main, domain=d)
+    sq = jno.np.parameter((1,), name="sq", key=_jax.random.PRNGKey(0))
+    xb, yb, _ = d.variable("bottom", split=True)
+    xt, yt, _ = d.variable("top", split=True)
+    fem = jno.fem(
+        [
+            LAM_ * trace(eu) * trace(ep) + 2 * MU_ * inner(eu, ep, n_contract=2),
+            jno.np.maximum(0.0, -1e4 * g) * inner(n, phi.bind(x=sv[0], y=sv[1]), n_contract=1),
+            u(xb, yb)[0] - 0.0,
+            u(xb, yb)[1] - 0.0,
+            u(xt, yt)[0] - 0.0,
+            u(xt, yt)[1] - sq,
+        ]
+    )
+    base_ids = np.asarray(d.tag_indices[main]).reshape(-1)
+
+    import jax.numpy as jnp
+
+    op = fem.operator  # FemResidualOperator: residual(u, args, t) with the held value re-formed per call
+    ndofs = int(fem.dofs)
+    drv = jno.solve.newton(line_search=True, rtol=1e-6, atol=1e-6)
+
+    def out(sqv):
+        r = lambda w: jnp.asarray(op.residual(w, {"sq": jnp.asarray(sqv).reshape(-1)})).reshape(-1)  # noqa: E731
+        w = drv(r, jnp.zeros(ndofs))
+        return w.reshape(-1, 2)[base_ids, 1].mean()
+
+    grad = float(_jax.grad(out)(jnp.asarray(-0.02)))
+    fd = float((out(jnp.asarray(-0.022)) - out(jnp.asarray(-0.020))) / (-0.002))
+    # jax.grad runs through the driver's custom_root on the branch-selected (semismooth) operator;
+    # in the closed regime the response is smooth in the platen displacement and the two must agree.
+    assert 0.1 < fd < 1.0, f"FD slope {fd:.3f} outside the physical (0,1) load-share range"
+    assert abs(grad - fd) < 0.05 * abs(fd), f"gradient through closed one-sided contact: jax.grad {grad:.4f} vs FD {fd:.4f}"
+
+
+def test_augmented_lagrangian_beats_the_penalty_error_at_the_same_c():
+    """AL exactness. The pure penalty carries an O(1/c) penetration error by construction; the
+    Uzawa multiplier update `lam.evolves(max(0, lam.i(-1) - c*g))` absorbs it, so at the SAME
+    c the marched AL answer must land far closer to the bonded oracle. Measured while writing
+    this test: penalty err 3.4e-3 at c=1e3; AL err 1.1e-5 after 8 updates -- monotone geometric
+    convergence (-0.00663 -> -0.00886 -> ... -> -0.00999). The multiplier is an ordinary scalar
+    SURFACE state on the secondary face: the machinery is `evolves` + the tau march, no new API."""
+    inner, sym, trace = jno.np.inner, jno.np.symgrad, jno.np.trace
+    c, nsteps = 1e3, 8
+    d = jno.Shape.regions(
+        base=jno.Shape.rect(0, 0, 1, 1, size=0.22),
+        cap=jno.Shape.rect(0, 1, 1, 2, size=0.09),
+        conforming=False,
+    ).domain(tau=(0.0, 1.0, nsteps))
+    sides = sorted(t for t in d.built_mesh.cell_sets if "|" in t)
+    secondary = next(t for t in sides if t.endswith(".cap"))
+    main = next(t for t in sides if t.endswith(".base"))
+    u, phi = d.fem_symbols(value_shape=(2,))
+    lam, _ = d.fem_symbols(value_shape=())  # the AL multiplier: a scalar surface state
+    X = d.variable("interior", split=True)[:2]
+    eu, ep = sym(u, list(X)), sym(phi, list(X))
+    sv = d.variable(secondary, split=True)
+    n = d.variable(secondary, normals=True)
+    g = u.gap(secondary, main, domain=d)
+    p = jno.np.maximum(0.0, lam.i(-1) + c * (-g))
+    xb, yb, _ = d.variable("bottom", split=True)
+    xt, yt, _ = d.variable("top", split=True)
+    fem = jno.fem(
+        [
+            LAM_ * trace(eu) * trace(ep) + 2 * MU_ * inner(eu, ep, n_contract=2),
+            p * inner(n, phi.bind(x=sv[0], y=sv[1]), n_contract=1),
+            lam.evolves(p),
+            u(xb, yb)[0] - 0.0,
+            u(xb, yb)[1] - 0.0,
+            u(xt, yt)[0] - 0.0,
+            u(xt, yt)[1] - (-0.02),
+        ]
+    )
+    # atol above the measured float32 residual floor (~1.7e-5): the march guard re-checks each step.
+    traj = np.asarray(fem.solve(nonlinear=jno.solve.newton(line_search=True, rtol=1e-5, atol=3e-5)))
+    m = np.asarray(d.tag_indices[main]).reshape(-1)
+    uys = [traj[k].reshape(-1, 2)[m, 1].mean() for k in range(traj.shape[0])]
+    errs = [abs(v - (-0.01)) for v in uys]
+    assert errs[0] > 2e-3, "step 0 is the pure-penalty answer and must carry the 1/c error"
+    assert all(e2 <= e1 * 1.05 for e1, e2 in zip(errs, errs[1:])), f"AL error must fall monotonically: {errs}"
+    assert errs[-1] < 1e-4, f"AL must beat the penalty error by orders of magnitude: final err {errs[-1]:.2e}"
