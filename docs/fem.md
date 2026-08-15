@@ -424,17 +424,40 @@ For a bonded (tied) interface use the two-sided penalty `p = -c*g` instead of th
 and stiffening `c` converges to the tie: two bonded unit blocks squeezed by 0.02 reproduce the single-bar
 answer `uy(y=1) = -0.01` to 1.5e-05 at `c = 1e6`.
 
+**One-sided (separating, Signorini) contact works** with the `max(0, -c*g)` spelling above, and the
+earlier "the kink stalls Newton" note was re-measured and re-classified: the stall was a **float32
+residual floor** (~2e-5 on the reference stack), not active-set cycling — `jax.linearize` through
+`max` selects the active branch, which *is* the semismooth Jacobian, and under x64 the identical
+iteration meets `rtol=1e-8` at residual 4e-10, superlinearly. Practical guidance: set tolerances the
+precision can reach (`newton(line_search=True, rtol=1e-6, atol=1e-6)` in float32; anything tighter
+wants x64), press converges to the bonded answer like `1/c`, and release separates exactly — no
+adhesion, measured `max|u| < 1e-9` on the far body.
+
+To remove the penalty's `O(1/c)` penetration error, add the **augmented-Lagrangian** multiplier — a
+scalar *surface state* on the secondary face riding the existing `evolves` + `tau=` march machinery,
+no new API:
+
+```python
+lam, _ = d.fem_symbols(value_shape=())            # the multiplier, per face quadrature point
+p = jno.np.maximum(0.0, lam.i(-1) + c*(-g))       # AL pressure
+fem = jno.fem([..., p * inner(n, phi_s, 1), lam.evolves(p), *bcs])   # tau march = Uzawa updates
+```
+
+Measured on the reference stack at the *same* `c = 1e3`: penalty error 3.4e-3, AL error **1.1e-5**
+after 8 updates, falling monotonically. Differentiable through *closed* contact: `jax.grad` of a
+response w.r.t. a load or (parametric-Dirichlet) grip displacement runs through the driver's
+`custom_root` on the branch-selected operator and FD-checks; at contact *onset* the derivative is a
+subgradient (the `max` kink).
+
 > **Scope.** Small sliding — the pairing is frozen at build time, so a configuration that slides must be
 > rebuilt per load step. Differentiable in the DOF values but **not** in the mesh coordinates (the
 > projection weights are host-computed). Frictionless: no tangential traction, so a body held *only* by
 > contact is free to slide and its system is singular — constrain the tangential direction independently.
-> The gap is non-local (it reads DOFs on the other body's cells), so the tangent is matrix-free;
-> `newton(direct=True)` is refused. **One-sided contact does not yet converge to tight tolerances**: the
-> `max(0, ·)` kink is non-smooth and the residual stalls around 1e-2 with a line search, against a 1e-8
-> target. The bonded two-sided path is smooth and converges. Signorini contact is the same kind of
-> object as [`u.bounds(lo, hi)`](#inequalities--uboundslo-hi) — a complementarity condition rather than
-> a penalty — so that machinery is the natural route for it, but the reformulation has **not** been
-> done and the penalty path above is what exists today.
+> The **assembled tangent now carries the gap's nonlocal blocks** — `(s,m)` from `jacfwd` w.r.t. the
+> gathered main values chained through the frozen mortar weights, plus the reaction rows' `(m,s)` and
+> `(m,m)` — verified against the matrix-free JVP on random probes in both the active and separated
+> branches, so `newton(direct=True)` + `lu`/cuDSS works with contact (the pattern is static; inactive
+> contact contributes zeros in the data, which keeps the sparsity-keyed factorization caches valid).
 
 ---
 
