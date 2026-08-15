@@ -218,3 +218,27 @@ rel_l2_u = float(jnp.linalg.norm(_u - _u_obs) / (jnp.linalg.norm(_u_obs) + 1e-8)
 print(f"u  rel-L2 error : {rel_l2_u:.3e}")           # should be < 10 %
 print(f"k  min / mean   : {_k.min():.3f} / {_k.mean():.3f}")  # k > 0 from exp; mean ≈ 1.0
 ```
+
+## Recovering a boundary value — runtime Dirichlet parameters
+
+An essential (Dirichlet) boundary *value* can itself be the unknown: a grip displacement, an inlet
+temperature, a prescribed potential you only observe indirectly. Put a `jno.np.parameter` in the
+essential term and train it like any other parameter — the held boundary value stays a traced JAX
+scalar, so the gradient flows through the symmetric elimination (steady linear) or the solve's
+`custom_root` (nonlinear, and each step of a linear transient march):
+
+```python
+g = jno.np.parameter((1,), name="g")
+g.initialize(jax.nn.initializers.constant(1.0))
+
+fem  = jno.fem([ui.x*vi.x + ui.y*vi.y - f*vi, u(xb, yb) - g])   # g is the unknown boundary value
+crux = jno.core([(fem.solve() - u_obs).mse])                     # u_obs generated at g* = 2.5
+g.optimizer(optax.adam(1e-1))
+crux.solve(300)                                                  # recovers g = 2.5 exactly
+```
+
+The parameter may scale a spatial profile (`u(xb, yb) - g*jno.np.sin(jno.np.pi*xb)`) and may appear
+in the operator and the boundary value simultaneously. Scope and refusals: steady linear, steady
+nonlinear, and linear transient; a value that is both parametric **and** t/τ-dependent
+(`u(top) - g*tau`) refuses loudly — drive a trainable ramp through a Neumann/body term instead.
+See `tests/test_fem_dirichlet_parameters.py` for the recovery oracles on all three paths.

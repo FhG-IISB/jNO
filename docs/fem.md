@@ -2135,8 +2135,14 @@ unaffected. Full detail is inline in the sections above.
 - **Reduced-order (`basis=`) solves** cover steady and **first-order transient** (linear and
   nonlinear). Second-order-in-time (`u_tt`), complex, and periodic-tied problems refuse, each with its
   own reason. Nonlinear reduces, but without hyper-reduction that is a memory win, not a speed one.
-- **No runtime Dirichlet parameters** — a trainable parameter may sit in the operator (stiffness) but
-  not in an essential/Dirichlet boundary *value*.
+- **Runtime Dirichlet parameters** work on the steady linear, steady nonlinear, and linear transient
+  paths: a trainable `jno.np.parameter` may sit in an essential value (`u(top) - g`, or scaling a
+  coordinate profile `u(top) - g*sin(pi*x)`), and the boundary value is recovered from data like any
+  other parameter — `∂b/∂g` flows through the symmetric elimination (linear), and `∂/∂g` through the
+  solve's / each step's `custom_root` (nonlinear / transient). NOT supported, refused loudly: a value
+  that is **both** parametric and t/τ-dependent (`u(top) - g*tau` — train the amplitude through a
+  Neumann/body term instead). A FIELD-sized optimizer-less parameter stays the nodal data-field value
+  (a neighbour's field in a DD solve), gathered per node.
 - **Affine parameter lowering expects a single, direct factor** — one trainable scalar per additive
   term (`nu * grad(u)·grad(phi)`), not nested or buried in a nonlinear expression.
 - **Enclosure radiation is a composition, not an auto-detected term** — it is 2D / axisymmetric and
