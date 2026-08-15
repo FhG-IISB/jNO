@@ -569,6 +569,7 @@ def assemble_fem_native(
     quad_degree: int,
     evolution: Optional[Dict[Any, Any]] = None,
     bounded: bool = False,
+    tv_dirichlet_external: bool = False,
 ) -> Tuple[Any, str]:
     """Assemble a Lagrange FEM system into ``(op, mode, offs)`` for :class:`FEM`.
 
@@ -887,7 +888,7 @@ def assemble_fem_native(
     # runtime args in ``_dirichlet_pairs_at`` so ``∂b/∂weights`` flows through the solve.
     from ..._fem import _bare as _bare_node
     from ..._fem import _essential_spec as _essential_spec_node
-    from ...trace import ModelWeights
+    from ...trace import ModelCall, ModelWeights
     from .parametric_helpers import _is_neural_coefficient, _neural_coefficient_name
 
     _dir_net_models: Dict[str, Any] = {}
@@ -895,6 +896,61 @@ def assemble_fem_native(
         _vn = _bare_node(_vnode) if _vnode is not None else None
         if _vn is not None and _is_neural_coefficient(_vn):
             _dir_net_models[_neural_coefficient_name(_vn)] = _vn.model
+    # A trainable ``jno.np.parameter`` in an ESSENTIAL value -- ``u(top) - g``, or ``u(top) -
+    # g*profile(x)``. Exactly the coord-params pattern above: it rides ``runtime_parameter_exprs``
+    # (crux discovers it, its value arrives in ``args``) but stays OUT of ``runtime_parameter_tags``
+    # -- it is not a term coefficient, and ``_runtime_vals`` must not pack it per cell. The rows are
+    # recorded so ``_dirichlet_pairs_at`` re-forms the lift from args (``∂b/∂g`` flows through the
+    # symmetric elimination, the same contract the net-valued branch documents) and
+    # ``_build_dirichlet_pairs`` skips them instead of freezing the stored value behind ``float(g)``.
+    #
+    # The one exclusion: an optimizer-less FIELD-sized parameter stays the nodal DATA-field value the
+    # branch in ``_build_dirichlet_pairs`` gathers per node (a neighbour's field in a DD solve). A
+    # SCALAR optimizer-less parameter is runtime-parametric here -- the old path crashed on it
+    # (IndexError gathering a length-1 value by node id) rather than meaning anything.
+    _dir_param_exprs: Dict[str, Any] = {}
+    _dir_param_rows: set = set()
+    for _i, (_fk, _rg, _comp, _val, _vnode) in enumerate(dirichlet_raw):
+        _vn = _bare_node(_vnode) if _vnode is not None else None
+        if _vn is None or _is_neural_coefficient(_vn):
+            continue
+        if (
+            isinstance(_vn, ModelCall)
+            and getattr(_vn.model, "_is_parameter", False)
+            and getattr(_vn.model, "_opt_fn", None) is None
+            and np.asarray(_vn.model.module.value).size > 1
+        ):
+            continue  # nodal data field -- the per-node gather branch owns it
+        _found: Dict[str, Any] = {}
+        _collect_runtime_parameter_exprs(_vnode, _found)
+        if _found:
+            from ..._fem import _is_temporal_value_node as _is_tv
+
+            if _is_tv(_vnode):
+                # `u(top) - g * tau`: the value is BOTH parametric and time/τ-dependent. The parametric
+                # branch would hold it constant in τ (silently un-ramping the load); the temporal branch
+                # would freeze the parameter at its stored value (silently un-training it). Neither is
+                # right, so refuse until the two held-value mechanisms compose.
+                raise NotImplementedError(
+                    f"jno.fem: the essential value on {_rg!r} is BOTH runtime-parametric "
+                    f"({sorted(_found)}) and time/τ-dependent. A trainable parameter in a t/τ-varying "
+                    "essential value is not supported yet -- train the amplitude through a Neumann/body "
+                    "term written as a function of τ, or fix one of the two."
+                )
+            _dir_param_exprs.update(_found)
+            _dir_param_rows.add(_i)
+    if _dir_param_exprs:
+        _param_and_neural_exprs = {**_param_and_neural_exprs, **_dir_param_exprs}
+
+    def _dir_static_args() -> Dict[str, Any]:
+        """Stored-value args for every args-dependent Dirichlet slot (net modules + parameter values) --
+        what the static placeholders and dof-layout probes evaluate at, in place of runtime args."""
+        return {n: m.module for n, m in _dir_net_models.items()} | {
+            n: jnp.asarray(nd.model.module.value) for n, nd in _dir_param_exprs.items()
+        }
+
+    #: any Dirichlet condition whose held value must be (re-)formed from runtime ``args``.
+    _dir_args_dependent = bool(_dir_net_models) or bool(_dir_param_rows)
     # A net-valued INITIAL condition ``u(initial) - net(x)`` (a trainable starting state, recovered from a
     # trajectory): its weights join the runtime slots the same way, and the initial state is (re-)formed
     # from the runtime args in ``_state0_at`` so ``∂traj/∂weights`` flows through the IC.
@@ -1473,7 +1529,8 @@ def assemble_fem_native(
         Done GLOBALLY, outside the per-face vmap, because the main nodes live on the other body's
         cells -- they are not in the secondary face's parent-cell DOF slice. A plain weighted gather, so
         ``jax.linearize`` (the default JFNK path) picks up the main coupling in the tangent exactly,
-        with no assembled Jacobian block needed.
+        with no assembled Jacobian block needed. (The ASSEMBLED tangent builds its own explicit
+        nonlocal blocks from these same tables -- see the gap emission in `_make_jacobian`.)
         """
         tb = _gap_tables[key]
         fidx, vt = tb["field"], vecs[tb["field"]]
@@ -1862,30 +1919,6 @@ def assemble_fem_native(
 
         return residual
 
-    def _gap_refuses_assembled_tangent(bterms):
-        """A contact gap is NON-LOCAL: it reads DOFs on the main body's cells, not the secondary face's
-        parent cell. The assembled path builds each element block by ``jacfwd`` w.r.t. that element's
-        own DOFs and emits columns ``cell_all_dofs[pcells]``, so it would silently drop the whole
-        secondary-main coupling -- a tangent that looks fine and just makes Newton crawl.
-
-        Emitting a second block with main columns is possible (``_emit`` takes arbitrary indices) but
-        costs another element-matrix buffer for every surface term, and the DEFAULT path never needs
-        it: contact is nonlinear, so ``newton_krylov`` takes matrix-free JVPs through
-        ``jax.linearize`` of the residual, which picks up the main coupling exactly. So the block is
-        not built at all, and this path refuses rather than being quietly wrong.
-
-        Raised on USE, not on construction -- ``_make_jacobian`` is called unconditionally at build
-        time even for problems that will only ever take the matrix-free route.
-        """
-        if _gap_tables and bterms:
-            raise NotImplementedError(
-                "jno.fem: a contact gap (u.gap) needs the matrix-free tangent -- its dependence on the "
-                "main body's DOFs cannot be expressed in this assembled per-element Jacobian, and "
-                "silently dropping it would degrade Newton with no error. Contact is nonlinear, so the "
-                "default fem.solve() already takes the matrix-free path; drop "
-                "`nonlinear=jno.solve.newton(direct=True)` if you set it."
-            )
-
     def _make_jacobian(terms, bterms=None):
         """Build the dense Jacobian ``J(u_flat) -> (total, total)`` by *per-element* forward-mode AD.
 
@@ -1907,6 +1940,66 @@ def assemble_fem_native(
         # static `nse` under jit, and inferring one requires concrete indices it does not have inside
         # the trace. This mirrors `fem_nonnodal._make_sparse_assembler`, which already hoists its
         # `_vol_idx` the same way. Order must match the append order in `jacobian` exactly.
+        def _gap_key_of(region):
+            """The (single) gap key whose SECONDARY face is this region, or ``None``."""
+            ks = [k for k in _gap_tables if _gap_tables[k]["secondary"] == region]
+            return ks[0] if ks else None
+
+        _gap_static_cache: Dict[Any, Any] = {}
+
+        def _gap_static(region, face_ids, btfi):
+            """Concrete index/weight geometry of a region's gap blocks — computed ONCE from the frozen
+            pairing tables and shared by the pattern hoist and the traced assembly, so the two cannot
+            drift. The three nonlocal blocks, flat index arrays in emission order:
+
+            * ``(s,m)``: secondary test rows x main columns (one column per (q, mortar-node, comp));
+            * ``(m,s)``: reaction rows (main dofs, one per (q, mortar-node, comp)) x parent-local cols;
+            * ``(m,m)``: reaction rows x main columns.
+            """
+            k = _gap_key_of(region)
+            cache_key = (region, int(btfi))
+            hit = _gap_static_cache.get(cache_key)
+            if hit is not None:
+                return hit
+            tb = _gap_tables[k]
+            fidx_m, vt = tb["field"], vecs[tb["field"]]
+            fids_np = np.asarray(face_ids, dtype=np.int64)
+            ids_f = np.asarray(tb["ids_full"])[fids_np]  # (n_face, n_q, K)
+            w_f = jnp.asarray(np.asarray(tb["w_full"])[fids_np])  # (n_face, n_q, K)
+            n_face, n_q, K = ids_f.shape
+            pc = np.asarray(parent_j)[fids_np]
+            rows_test = np.asarray(cdofs[btfi])[pc]  # (n_face, n_test)
+            n_test = rows_test.shape[1]
+            dof_m = (np.asarray(offs[fidx_m]) + ids_f[..., None] * vt + np.arange(vt)).astype(np.int64)
+            nqKv = n_q * K * vt
+            dof_m_flat = dof_m.reshape(n_face, nqKv)
+            cols_parent = np.asarray(cell_all_dofs)[pc]  # (n_face, n_local_all)
+            n_local = cols_parent.shape[1]
+            sh_sm = (n_face, n_test, n_q, K, vt)
+            rows_sm = np.broadcast_to(rows_test[:, :, None, None, None], sh_sm).reshape(-1)
+            cols_sm = np.broadcast_to(dof_m[:, None, :, :, :], sh_sm).reshape(-1)
+            sh_ms = (n_face, nqKv, n_local)
+            rows_ms = np.broadcast_to(dof_m_flat[:, :, None], sh_ms).reshape(-1)
+            cols_ms = np.broadcast_to(cols_parent[:, None, :], sh_ms).reshape(-1)
+            sh_mm = (n_face, nqKv, nqKv)
+            rows_mm = np.broadcast_to(dof_m_flat[:, :, None], sh_mm).reshape(-1)
+            cols_mm = np.broadcast_to(dof_m_flat[:, None, :], sh_mm).reshape(-1)
+            out = {
+                "rows_sm": jnp.asarray(rows_sm, dtype=jnp.int32),
+                "cols_sm": jnp.asarray(cols_sm, dtype=jnp.int32),
+                "rows_ms": jnp.asarray(rows_ms, dtype=jnp.int32),
+                "cols_ms": jnp.asarray(cols_ms, dtype=jnp.int32),
+                "rows_mm": jnp.asarray(rows_mm, dtype=jnp.int32),
+                "cols_mm": jnp.asarray(cols_mm, dtype=jnp.int32),
+                "w_f": w_f,
+                "n_q": n_q,
+                "K": K,
+                "vt": vt,
+                "key": k,
+            }
+            _gap_static_cache[cache_key] = out
+            return out
+
         _idx_rows, _idx_cols = [], []
         for _coeff_s, _tfi_s, _rn_s in typed_with_masks:
             _sh = (n_cells, int(cdofs[_tfi_s].shape[1]), int(cell_all_dofs.shape[1]))
@@ -1919,6 +2012,19 @@ def assemble_fem_native(
                 _sh = (int(_pc.shape[0]), int(cdofs[_btfi_s].shape[1]), int(cell_all_dofs.shape[1]))
                 _idx_rows.append(jnp.broadcast_to(cdofs[_btfi_s][_pc][:, :, None], _sh).reshape(-1))
                 _idx_cols.append(jnp.broadcast_to(_fcols[:, None, :], _sh).reshape(-1))
+                # The gap's nonlocal blocks, in the SAME append order the traced assembly emits
+                # them: (s,m) always when the region carries a gap; (m,s) and (m,m) when this term
+                # also drives the main-side reaction. The indices come from the frozen pairing
+                # tables, so the pattern stays static; inactive contact contributes zeros in DATA.
+                if _gap_key_of(_region_s) is not None:
+                    _gs = _gap_static(_region_s, _face_ids_s, _btfi_s)
+                    _idx_rows.append(_gs["rows_sm"])
+                    _idx_cols.append(_gs["cols_sm"])
+                    if _gaps_in(_bcoeff_s, _region_s):
+                        _idx_rows.append(_gs["rows_ms"])
+                        _idx_cols.append(_gs["cols_ms"])
+                        _idx_rows.append(_gs["rows_mm"])
+                        _idx_cols.append(_gs["cols_mm"])
         _blk_sizes = [int(r.shape[0]) for r in _idx_rows]  # per-term flat lengths, in append order
         _idx_static = (
             jnp.stack([jnp.concatenate(_idx_rows).astype(jnp.int32), jnp.concatenate(_idx_cols).astype(jnp.int32)], axis=1)
@@ -1931,7 +2037,6 @@ def assemble_fem_native(
             _idx_static, _plan = None, None  # fall back to the uncompressed (still correct) path
 
         def jacobian(u_flat, t=0.0, args=None):
-            _gap_refuses_assembled_tangent(bterms)  # non-local gap -> matrix-free tangent only
             # Assemble into COO triplets and build a BCOO -- never materialises the dense (total, total)
             # matrix (O(nnz), GPU-able at large N). Each per-element block is element-sized; duplicate
             # (i, j) triplets from neighbouring cells are summed by BCOO on matvec / todense, so the
@@ -1979,21 +2084,34 @@ def assemble_fem_native(
                 )
 
             normals_dyn = _surface_normals(pts_dyn)  # differentiable facet normals under coordinate motion
+            # Main-side values for every contact gap -- the residual's own gather, reused so the
+            # assembled tangent linearizes the SAME function the residual evaluates.
+            gap_um_j = {k: _gap_gather(u_flat, k) for k in _gap_tables}
             for region, face_ids, btyped in surface_work:
                 fids = jnp.asarray(face_ids, dtype=jnp.int32)
                 pcells = parent_j[fids]
                 lv = u_flat[cell_all_dofs[pcells]]  # (n_face, n_local_all)
                 fcols = cell_all_dofs[pcells]  # (n_face, n_local_all)
+                gslice = _gap_slices(region, fids, gap_um_j)  # {key: (g0, u_m)} or None
                 for bcoeff, btfi in btyped:
 
-                    def _kef(fi, la, _e=bcoeff, _t=btfi, _r=region, _p=pts_dyn, _n=normals_dyn):
-                        return jax.jacfwd(lambda v: _surf_elem_res(fi, v, _e, _t, _r, t, args, _p, _n))(la)
+                    def _kef(fi, la, gp=None, _e=bcoeff, _t=btfi, _r=region, _p=pts_dyn, _n=normals_dyn):
+                        # gaps PACKED: the local block then carries d(traction)/du_s THROUGH the gap,
+                        # exactly as `jax.linearize` of the residual would.
+                        return jax.jacfwd(lambda v: _surf_elem_res(fi, v, _e, _t, _r, t, args, _p, _n, gp))(la)
 
-                    Kef = _elem_map(  # (n_face, n_test_btfi, n_local_all)
-                        _kef,
-                        (fids, lv),
-                        _cell_chunk(int(fids.shape[0]), cdofs[btfi].shape[1], cell_all_dofs.shape[1]),
-                    )
+                    if gslice:
+                        Kef = _elem_map(
+                            _kef,
+                            (fids, lv, gslice),
+                            _cell_chunk(int(fids.shape[0]), cdofs[btfi].shape[1], cell_all_dofs.shape[1]),
+                        )
+                    else:
+                        Kef = _elem_map(  # (n_face, n_test_btfi, n_local_all)
+                            _kef,
+                            (fids, lv),
+                            _cell_chunk(int(fids.shape[0]), cdofs[btfi].shape[1], cell_all_dofs.shape[1]),
+                        )
                     _emit(
                         Kef.reshape(-1),
                         lambda _K=Kef, _t=btfi, _p=pcells: jnp.broadcast_to(cdofs[_t][_p][:, :, None], _K.shape).reshape(
@@ -2001,6 +2119,68 @@ def assemble_fem_native(
                         ),
                         lambda _K=Kef, _f=fcols: jnp.broadcast_to(_f[:, None, :], _K.shape).reshape(-1),
                     )
+
+                    if gslice:
+                        # ---- the gap's NONLOCAL blocks (same append order as the pattern hoist) ----
+                        gs = _gap_static(region, face_ids, btfi)
+                        n_q, vt, gk = gs["n_q"], gs["vt"], gs["key"]
+                        w_f = gs["w_f"]
+                        g0_sl, um_sl = gslice[gk]
+
+                        # (s,m): jacfwd of the SAME face residual w.r.t. the gathered main values,
+                        # chained through the frozen mortar weights to global main columns.
+                        def _kem(fi, la, g0f, umf, _e=bcoeff, _t=btfi, _r=region, _p=pts_dyn, _n=normals_dyn, _k=gk):
+                            return jax.jacfwd(
+                                lambda um: _surf_elem_res(fi, la, _e, _t, _r, t, args, _p, _n, {_k: (g0f, um)})
+                            )(umf)
+
+                        Kem = _elem_map(  # (n_face, n_test, n_q, vt)
+                            _kem,
+                            (fids, lv, g0_sl, um_sl),
+                            _cell_chunk(int(fids.shape[0]), cdofs[btfi].shape[1], n_q * vt),
+                        )
+                        d_sm = jnp.einsum("frqv,fqk->frqkv", Kem.reshape(Kem.shape[0], Kem.shape[1], n_q, vt), w_f)
+                        _emit(d_sm.reshape(-1), lambda _g=gs: _g["rows_sm"], lambda _g=gs: _g["cols_sm"])
+
+                        if _gaps_in(bcoeff, region):
+                            # Reaction-row tangent: tau (the per-QP weighted traction via the identity
+                            # test-table substitution -- the residual's own trick) linearized w.r.t.
+                            # the parent-local dofs (m,s) and the gathered main values (m,m), scattered
+                            # through the same -w weights the residual's reaction uses.
+                            def _tau(fi, la, g0f, umf, _e=bcoeff, _t=btfi, _r=region, _k=gk):
+                                out = _surf_elem_res(
+                                    fi,
+                                    la,
+                                    _e,
+                                    _t,
+                                    _r,
+                                    t,
+                                    args,
+                                    pts_dyn,
+                                    normals_dyn,
+                                    {_k: (g0f, umf)},
+                                    test_vals=jnp.eye(n_q, dtype=lv.dtype),
+                                )
+                                return jnp.asarray(out).reshape(n_q, vt)
+
+                            n_local_all = int(cell_all_dofs.shape[1])
+                            Dls = _elem_map(
+                                lambda fi, la, g0f, umf: jax.jacfwd(lambda v: _tau(fi, v, g0f, umf))(la),
+                                (fids, lv, g0_sl, um_sl),
+                                _cell_chunk(int(fids.shape[0]), n_q * vt, n_local_all),
+                            )
+                            Dum = _elem_map(
+                                lambda fi, la, g0f, umf: jax.jacfwd(lambda um: _tau(fi, la, g0f, um))(umf),
+                                (fids, lv, g0_sl, um_sl),
+                                _cell_chunk(int(fids.shape[0]), n_q * vt, n_q * vt),
+                            )
+                            n_face = int(fids.shape[0])
+                            # (m,s): K[dof(f,q,K,v), parent_local] -= w[f,q,K] * dtau[f,q,v,local]
+                            d_ms = -jnp.einsum("fqk,fqvl->fqkvl", w_f, Dls.reshape(n_face, n_q, vt, n_local_all))
+                            _emit(d_ms.reshape(-1), lambda _g=gs: _g["rows_ms"], lambda _g=gs: _g["cols_ms"])
+                            # (m,m): K[dof(q,K,v), dof(q2,K2,v2)] -= w[f,q,K] dtau[q,v,q2,v2] w[f,q2,K2]
+                            d_mm = -jnp.einsum("fqk,fqvpw,fpl->fqkvplw", w_f, Dum.reshape(n_face, n_q, vt, n_q, vt), w_f)
+                            _emit(d_mm.reshape(-1), lambda _g=gs: _g["rows_mm"], lambda _g=gs: _g["cols_mm"])
 
             if _plan is not None:
                 if _acc[0] is None:  # no terms -> empty operator
@@ -2182,10 +2362,12 @@ def assemble_fem_native(
 
         pairs: List[Tuple[int, float]] = []
         tv_stash: List[Tuple[Any, Any, Any]] = []  # (dofs, value_node, coords) for time-varying g(x,t)
-        for field_key, region, comp, value, value_node in dirichlet_raw:
+        for _row_i, (field_key, region, comp, value, value_node) in enumerate(dirichlet_raw):
             fidx = field_index.get(field_key)
             if fidx is None:
                 continue
+            if _row_i in _dir_param_rows:
+                continue  # args-dependent value: (re-)formed per args in _dirichlet_pairs_at, never frozen here
             # Time-varying Dirichlet g(x,t): no constant pair — stash (dofs, value_node, coords) so a
             # transient caller (e.g. the second-order augmented block) writes g(x_d, t) each step.
             if value_node is not None and _is_temporal_value_node(value_node):
@@ -2249,18 +2431,63 @@ def assemble_fem_native(
         domain._fem_native_dirichlet_tv = tv_stash
         return pairs
 
+    _static_dirichlet_cache: Dict[str, Any] = {}
+
     def _dirichlet_pairs_at(args):
         """Dirichlet ``(dof, value)`` pairs with the net-valued profiles evaluated from the runtime
         ``args`` (an unknown BC ``u(region) - net(x)``): the net is called on the region's boundary-node
         coordinates, so the value stays a differentiable JAX scalar and ``∂b/∂weights`` flows through the
         symmetric elimination. Non-net conditions reuse the concrete ``_build_dirichlet_pairs`` values."""
         a = args or {}
-        pairs = list(_build_dirichlet_pairs())  # concrete (non-net) conditions
-        for field_key, region, comp, value, value_node in dirichlet_raw:
+        # The concrete (non-net, non-parametric) pairs are ARG-INDEPENDENT, and rebuilding them here
+        # is not just wasted work: this runs inside the traced Newton residual (`_np_hold(args)`),
+        # where the host-side tag resolution in `_build_dirichlet_pairs` can meet traced state a
+        # contact assembly stashed (measured: TracerArrayConversionError from the tag location fn on
+        # a gap-carrying form). Built ONCE, on the first call -- which is always the eager dof-layout
+        # probe `_dirichlet_pairs_at(_dir_static_args())`, outside any trace.
+        if "pairs" not in _static_dirichlet_cache:
+            _static_dirichlet_cache["pairs"] = _build_dirichlet_pairs()
+        pairs = list(_static_dirichlet_cache["pairs"])
+        for _row_i, (field_key, region, comp, value, value_node) in enumerate(dirichlet_raw):
             fidx = field_index.get(field_key)
             if fidx is None:
                 continue
             _vn = _bare_node(value_node) if value_node is not None else None
+            if _row_i in _dir_param_rows:
+                # A trainable parameter in the value (`u(top) - g`, `u(top) - g*profile(x)`): evaluate
+                # the value NODE at the boundary nodes with the args-substituted parameter, so the held
+                # value stays a traced JAX scalar and ∂b/∂g (steady) / ∂step/∂g (transient) flows --
+                # the same contract as the net branch below. `_eval_value_node_at(params=...)` is the
+                # existing parametric-coefficient evaluator; no bespoke walker.
+                #
+                # The node LAYOUT is static per (field, region) and memoized from the first (eager)
+                # call: this body re-runs inside the traced Newton residual, where the host tag
+                # resolution behind `_boundary_node_ids` can meet traced state (measured on a
+                # gap-carrying form: TracerArrayConversionError out of the tag location fn).
+                from ..._fem import _eval_value_node_at as _eval_at
+
+                vt = vecs[fidx]
+                _lk = ("layout", fidx, region)
+                if _lk not in _static_dirichlet_cache:
+                    pts_all = np.asarray(pts_f_all[fidx])
+                    nid_list = list(_boundary_node_ids(fidx, region))
+                    _static_dirichlet_cache[_lk] = (
+                        nid_list,
+                        pts_all[np.asarray(nid_list, dtype=np.int64)] if nid_list else np.zeros((0, dim)),
+                    )
+                node_ids, pts = _static_dirichlet_cache[_lk]
+                raw = jnp.asarray(_eval_at(value_node, jnp.asarray(pts), params=a)).reshape(-1)
+                # Constant vs spatial profile: a constant returns the same shape for ANY batch (the
+                # static-path trick) -- one extra single-point evaluation decides, shapes are static.
+                one = jnp.asarray(_eval_at(value_node, jnp.asarray(pts[:1]), params=a)).reshape(-1)
+                if raw.shape == one.shape or not node_ids:
+                    gvals = jnp.broadcast_to(raw.reshape(-1)[:1], (len(node_ids),))
+                else:
+                    gvals = raw.reshape(len(node_ids), -1)[:, 0]
+                for i, nid in enumerate(node_ids):
+                    for c in range(vt) if comp is None else [int(comp)]:
+                        pairs.append((offs[fidx] + nid * vt + c, gvals[i]))
+                continue
             if _vn is None or not _is_neural_coefficient(_vn):
                 continue
             vt = vecs[fidx]
@@ -2472,19 +2699,19 @@ def assemble_fem_native(
                     "form is not wired yet (state0_fn threads only the linear stepper). Use a linear "
                     "transient form (a net IC threads there)."
                 )
-            if _dir_net_models and _nonlinear_mass:
+            if _dir_args_dependent and _nonlinear_mass:
                 raise NotImplementedError(
                     "jno.fem: a net-valued Dirichlet with a state-dependent (nonlinear) mass c(u)·u_t on a "
                     "transient form is not supported (the mass residual holds a static Dirichlet dof set). "
                     "Use a linear/parametric mass."
                 )
 
-            if _dir_net_models:
-                # net-valued Dirichlet u(∂Ω) - net(x): the held value is re-formed from the net weights each
+            if _dir_args_dependent:
+                # net- or parameter-valued Dirichlet: the held value is re-formed from the args each
                 # Newton residual (mirrors the nonlinear STEADY path ``res_p``); the dof set is static, only
-                # the held values ride the weights, and ``∂/∂weights`` flows through the step's custom_root.
+                # the held values ride the args, and ``∂/∂args`` flows through the step's custom_root.
                 _tnpd = jnp.asarray(
-                    [p[0] for p in _dirichlet_pairs_at({n: m.module for n, m in _dir_net_models.items()})],
+                    [p[0] for p in _dirichlet_pairs_at(_dir_static_args())],
                     dtype=jnp.int32,
                 )
 
@@ -2541,8 +2768,8 @@ def assemble_fem_native(
         # falls to the static branch, where A and M are built once with ``args=None`` and
         # ``_apply_coord_params`` short-circuits -- so ``block.step(..., args={coord: X})`` silently ignores
         # X and ``du/dX`` is exactly ZERO. That is a wrong gradient with no symptom, not a missing feature.
-        if runtime_parameter_tags or neural_param_names or _dir_net_models or _ic_net_models or _coord_specs:
-            if _dir_net_models:
+        if runtime_parameter_tags or neural_param_names or _dir_args_dependent or _ic_net_models or _coord_specs:
+            if _dir_args_dependent:
                 if getattr(domain, "_fem_native_dirichlet_tv", None):
                     raise NotImplementedError(
                         "jno.fem: a net-valued Dirichlet combined with a time-varying g(x, t) Dirichlet on a "
@@ -2551,7 +2778,7 @@ def assemble_fem_native(
                     )
                 # const + net Dirichlet dofs (static boundary-node layout); held values re-formed from args.
                 _dd = jnp.asarray(
-                    [p[0] for p in _dirichlet_pairs_at({n: m.module for n, m in _dir_net_models.items()})],
+                    [p[0] for p in _dirichlet_pairs_at(_dir_static_args())],
                     dtype=jnp.int32,
                 )
 
@@ -2568,8 +2795,8 @@ def assemble_fem_native(
                 A = spatial_jac(zeros, t, args)
                 return A if _d is None else bcoo_set_dirichlet_rows(A, _d)
 
-            if _dir_net_models:
-                c_bias = zeros  # every held value (const + net) rides the forcing
+            if _dir_args_dependent:
+                c_bias = zeros  # every held value (const + net + parameter) rides the forcing
 
                 def forcing_vector_fn(t, args=None, _mask=free_mask, _d=_dd):
                     f = _mask * (-spatial_res(zeros, t, args))
@@ -2700,7 +2927,7 @@ def assemble_fem_native(
     if (
         runtime_parameter_tags
         or neural_param_names
-        or _dir_net_models
+        or _dir_args_dependent
         or history_specs
         or surface_history_specs
         or _coord_specs
@@ -2711,13 +2938,13 @@ def assemble_fem_native(
             # ``t`` carries the pseudo-time (load) coordinate τ for the history march — the load written
             # as a function of τ in the weak form varies through it. Defaults to 0.0, so the ordinary
             # (non-marching) parametric/inverse call sites are unchanged.
-            if _dir_net_models:
-                # net-valued Dirichlet u(∂Ω) - net(x): the held value is a differentiable function of the
-                # net weights (delivered on args), so the row-replacement value is re-evaluated from args
-                # each residual call (mirrors the linear parametric path's ``_dirichlet_pairs_at``). The
-                # dof set is static (boundary-node layout); only the held values ride the weights.
+            if _dir_args_dependent:
+                # net- or parameter-valued Dirichlet: the held value is a differentiable function of the
+                # args (net weights or a trainable boundary value), so the row-replacement value is
+                # re-evaluated from args each residual call (mirrors the linear parametric path's
+                # ``_dirichlet_pairs_at``). The dof set is static; only the held values ride the args.
                 _npd = jnp.asarray(
-                    [p[0] for p in _dirichlet_pairs_at({n: m.module for n, m in _dir_net_models.items()})],
+                    [p[0] for p in _dirichlet_pairs_at(_dir_static_args())],
                     dtype=jnp.int32,
                 )
 
@@ -2805,17 +3032,20 @@ def assemble_fem_native(
         def _assemble_at(args):
             A = jacobian(zeros, 0.0, args)
             b = -residual(zeros, 0.0, args)
-            # a net-valued Dirichlet re-forms the lift from args each call; otherwise the static pairs.
-            pairs = _dirichlet_pairs_at(args) if _dir_net_models else dirichlet_pairs
+            # a net- or parameter-valued Dirichlet re-forms the lift from args each call; else static.
+            pairs = _dirichlet_pairs_at(args) if (_dir_net_models or _dir_param_rows) else dirichlet_pairs
             if pairs:
                 A, b = _apply_dirichlet_symmetric(A, b, pairs)
             return A, b
 
-        # Static placeholder for .A/.b: scalar params at 0, networks (coefficient + Dirichlet) at stored weights.
+        # Static placeholder for .A/.b: scalar params at 0, networks (coefficient + Dirichlet) at stored
+        # weights, Dirichlet-value parameters at their STORED value (like the nets: `fem.b` then reflects
+        # the initialized boundary value rather than an arbitrary zero condition).
         a0, b0 = _assemble_at(
             {n: 0.0 for n in runtime_parameter_tags}
             | {n: _neural_models[n].module for n in neural_param_names}
             | {n: m.module for n, m in _dir_net_models.items()}
+            | {n: jnp.asarray(nd.model.module.value) for n, nd in _dir_param_exprs.items()}
         )
         op = FemLinearSystem(
             a0,
@@ -2831,7 +3061,12 @@ def assemble_fem_native(
 
     # A τ/t-dependent essential value that no branch above threaded would be silently DROPPED here --
     # the constraint disappears and the solve returns a plausible-looking wrong answer. Fail instead.
-    if _tv_dirichlet:
+    # EXCEPT when the caller declared it consumes the tv stash itself (`tv_dirichlet_external=True`):
+    # the second-order u_tt block calls this assembler for the spatial operator and the Dirichlet
+    # stashes, then writes g(x_d, t) and the compatible ġ(x_d, t) onto its augmented [u, v] system per
+    # step -- a legitimate consumer this guard was firing on (found by the pre-push suite: two wave
+    # oracles that pass on origin/main NotImplementedError'd from the guard's own commit onward).
+    if _tv_dirichlet and not tv_dirichlet_external:
         raise NotImplementedError(
             "jno.fem: a time/τ-dependent essential value (e.g. `u(top) - delta*tau`) is threaded on the "
             "steady residual path -- the load-path march and the runtime-parametric solve -- and by the "

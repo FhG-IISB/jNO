@@ -424,17 +424,40 @@ For a bonded (tied) interface use the two-sided penalty `p = -c*g` instead of th
 and stiffening `c` converges to the tie: two bonded unit blocks squeezed by 0.02 reproduce the single-bar
 answer `uy(y=1) = -0.01` to 1.5e-05 at `c = 1e6`.
 
+**One-sided (separating, Signorini) contact works** with the `max(0, -c*g)` spelling above, and the
+earlier "the kink stalls Newton" note was re-measured and re-classified: the stall was a **float32
+residual floor** (~2e-5 on the reference stack), not active-set cycling — `jax.linearize` through
+`max` selects the active branch, which *is* the semismooth Jacobian, and under x64 the identical
+iteration meets `rtol=1e-8` at residual 4e-10, superlinearly. Practical guidance: set tolerances the
+precision can reach (`newton(line_search=True, rtol=1e-6, atol=1e-6)` in float32; anything tighter
+wants x64), press converges to the bonded answer like `1/c`, and release separates exactly — no
+adhesion, measured `max|u| < 1e-9` on the far body.
+
+To remove the penalty's `O(1/c)` penetration error, add the **augmented-Lagrangian** multiplier — a
+scalar *surface state* on the secondary face riding the existing `evolves` + `tau=` march machinery,
+no new API:
+
+```python
+lam, _ = d.fem_symbols(value_shape=())            # the multiplier, per face quadrature point
+p = jno.np.maximum(0.0, lam.i(-1) + c*(-g))       # AL pressure
+fem = jno.fem([..., p * inner(n, phi_s, 1), lam.evolves(p), *bcs])   # tau march = Uzawa updates
+```
+
+Measured on the reference stack at the *same* `c = 1e3`: penalty error 3.4e-3, AL error **1.1e-5**
+after 8 updates, falling monotonically. Differentiable through *closed* contact: `jax.grad` of a
+response w.r.t. a load or (parametric-Dirichlet) grip displacement runs through the driver's
+`custom_root` on the branch-selected operator and FD-checks; at contact *onset* the derivative is a
+subgradient (the `max` kink).
+
 > **Scope.** Small sliding — the pairing is frozen at build time, so a configuration that slides must be
 > rebuilt per load step. Differentiable in the DOF values but **not** in the mesh coordinates (the
 > projection weights are host-computed). Frictionless: no tangential traction, so a body held *only* by
 > contact is free to slide and its system is singular — constrain the tangential direction independently.
-> The gap is non-local (it reads DOFs on the other body's cells), so the tangent is matrix-free;
-> `newton(direct=True)` is refused. **One-sided contact does not yet converge to tight tolerances**: the
-> `max(0, ·)` kink is non-smooth and the residual stalls around 1e-2 with a line search, against a 1e-8
-> target. The bonded two-sided path is smooth and converges. Signorini contact is the same kind of
-> object as [`u.bounds(lo, hi)`](#inequalities--uboundslo-hi) — a complementarity condition rather than
-> a penalty — so that machinery is the natural route for it, but the reformulation has **not** been
-> done and the penalty path above is what exists today.
+> The **assembled tangent now carries the gap's nonlocal blocks** — `(s,m)` from `jacfwd` w.r.t. the
+> gathered main values chained through the frozen mortar weights, plus the reaction rows' `(m,s)` and
+> `(m,m)` — verified against the matrix-free JVP on random probes in both the active and separated
+> branches, so `newton(direct=True)` + `lu`/cuDSS works with contact (the pattern is static; inactive
+> contact contributes zeros in the data, which keeps the sparsity-keyed factorization caches valid).
 
 ---
 
@@ -1258,7 +1281,15 @@ preconditioner never changes the converged solution, only the speed, so specs ne
   solve). Iterative inner ⇒ flexible outer (`fgmres`).
 * `jno.precond.form([...terms], inner=…)` — **preconditioners as weak forms**: assemble an auxiliary
   operator from ordinary traced terms and invert it as `M⁻¹` (weighted mass matrices, shifted-Laplacian
-  Helmholtz twins, low-order proxies — written in the PDE's language).
+  Helmholtz twins, low-order proxies — written in the PDE's language). Pass a **callable**
+  `form(lambda sol: [...terms...])` for a **solution-dependent** auxiliary — a `(1/μ(u))`-weighted
+  Schur mass whose weight is computed from the current solution. It is re-assembled once per outer
+  solve from that solve's entry iterate (warm start / previous march step) — the **Picard-lagged
+  preconditioner** (Elman, Silvester & Wathen 2014, §9.2): the coefficient trails the solution by one
+  outer solve, which changes convergence *speed* only, never the answer. Eager by necessity — every
+  Newton loop is a `lax.while_loop`, so the per-step iterate is a tracer no host assembly can see; a
+  fully traced solve that never supplies a concrete iterate gets a loud `NotImplementedError`, not a
+  garbage preconditioner.
 * `jno.precond.block_diag((field, spec), …)` / `jno.precond.triangular((field, spec), …)` — per-field
   composition over `fem.blocks`. `triangular` is the standard saddle-point shape: last block solved
   first, substituted back through the assembled off-diagonal matvecs.
@@ -1268,6 +1299,16 @@ preconditioner never changes the converged solution, only the speed, so specs ne
   `jit`/`vmap`-native and exactly linear, so it preconditions `cg`/`minres` too. Mesh-independent
   convergence ⇒ *the* choice for large elliptic blocks. Inside traced/parametric solves, pre-build
   eagerly: `spec = jno.precond.amg(); spec.build(fem.A)`. Without pyamg, `amg` raises a clear install hint.
+* `jno.precond.jaxamg(symmetric=…)` — GPU AMG via NVIDIA **AmgX** as the `M⁻¹` application (setup and
+  apply both on the device). `symmetric=False` builds a second hierarchy on `Aᵀ` so the adjoint
+  (reverse-mode) solve of a non-symmetric operator is preconditioned too. Measured caveat: each AmgX
+  application carries ~11 ms of fixed handle overhead, so it pays only where the iteration savings
+  exceed it — for most problems prefer `precond.amg()` (whose V-cycle compiles into the solve) or
+  `linear=jno.solve.amg()` (ONE AmgX crossing per solve, with warm structure-keyed re-setup measured
+  ~10x cheaper on repeats). `benchmarks/amg_scaling.py` holds the numbers.
+* `.cached(refresh=…)` on any spec — reuse an expensive setup across solves: `False` frozen, `True`
+  rebuild on shape/sparsity change, an **int k** to rebuild every k-th materialization (the cadence
+  for a march whose operator values drift step by step), or a `ctx -> key` callable.
 
 The flagship pattern — Taylor–Hood **Stokes** by FGMRES with an inexact velocity block solve and the
 viscosity-weighted pressure-mass Schur approximation (Elman, Silvester & Wathen, 2014, §9.2):
@@ -1299,6 +1340,23 @@ its symmetry/definiteness); the converged solution is identical to full Newton's
 marker, `picard(damping=…)` is exactly damped Newton (`jno.solve.newton(damping=…)`). Caveat for inverse
 problems: implicit differentiation then also uses the lagged Jacobian — drop `lag` when exact parameter
 gradients matter more than per-step solvability.
+
+**What did the solver do? — `fem.stats`.** After any `fem.solve()`, `fem.stats` reports what happened
+without changing the solve's return: `mode`, `dofs`, `wall_s` (dispatch time — JAX is async; block on
+the result for compute time), the `linear`/`precond` slot reprs, `nonlinear` (driver, final residual
+norm against its bound, converged flag, and the step count where the driver runs its forward loop
+eagerly — `newton_direct` reports steps; the drivers whose loop lives inside `custom_root` report
+`None`), and `amgx_cache` occupancy when jaxamg served the solve. Populated on eager paths; a solve
+wrapped whole in `jit`/`vmap`/`grad` records the slots but no residuals — the same concrete-only
+self-disabling as the convergence guards.
+
+```python
+sol = fem.solve(nonlinear=jno.solve.newton(direct=True), linear=jno.solve.lu(backend="host"))
+fem.stats
+# {'mode': 'nonlinear', 'dofs': 44, 'wall_s': 0.31, 'linear': 'jno.solve.lu-host(...)',
+#  'precond': None, 'nonlinear': {'driver': 'newton_direct', 'residual': 1.6e-07,
+#                                 'bound': 1.7e-06, 'steps': 3, 'converged': True}}
+```
 
 **Alternate minimization — `jno.solve.staggered([u, d])`.** Some coupled energies are **non-convex in
 the fields jointly but convex in each separately**. A monolithic Newton then has no descent guarantee
@@ -2047,24 +2105,29 @@ solve slower, so compare **build + solve**, and remember jNO assembles *once* wh
 assembler pays again on every Newton iteration.
 
 Most of a cold build is **XLA compilation**, and the cost is fixed per problem *structure* rather than
-per DOF — a 15x larger mesh still compiles about the same number of programs. That makes it worth
-caching across processes, which is **opt-in**:
+per DOF — a 15x larger mesh still compiles about the same number of programs. Two caches attack it,
+both **on by default**:
 
-```python
-dire = jno.setup(__file__, compile_cache=True)     # or, per project, in .jno.toml:
-                                                   #   [jno]
-                                                   #   compile_cache = true
-```
+**Across processes** — the persistent XLA cache (`~/.cache/jno/xla`), enabled at `import jno`:
 
 | 3-D Poisson, 27,833 nodes | first build | repeat build |
 |---|---|---|
-| default (no cache) | 4.75 s | 2.48 s |
-| `compile_cache=True` | **2.22 s** | **1.51 s** |
+| no cache | 4.75 s | 2.48 s |
+| persistent cache (default) | **2.22 s** | **1.51 s** |
 
-**Off by default on purpose**, for two reasons: a library should not write to your disk uninvited, and
-the run that *populates* the cache is **slower** than having none at all — so a single cold run is a
-straight loss. Turn it on for anything you run more than once: a sweep, an optimisation loop, a test
-suite, or simply re-running a script after an edit.
+The very first run on a machine is *slower* (populating the cache costs more than not having one);
+it pays back from the second process onward, which is jNO's normal life — sweeps, optimisation
+loops, test suites, re-running a script after an edit. Opt out with `JNO_COMPILE_CACHE=0`,
+`jno.setup(__file__, compile_cache=False)`, or per project in `.jno.toml`: `[jno] compile_cache =
+false`.
+
+**Within a process** — rebuilding an *identical* problem (same mesh content, same terms) reuses the
+already-compiled assembly kernels outright, keyed on content rather than object identity, so a
+rebuild costs meshing plus host prep and **no XLA work at all** (measured: 1.94 s → 0.28 s on 3-D
+Poisson at 29k nodes). Anything that changes the operator — a different mesh, a different
+coefficient — recompiles exactly the kernels that bake it. Structure that a tokenizer cannot key by
+value simply never caches (a safe miss); the coverage is measurable, not guessed
+(`jno.utils.solver.fem_utils._ELEM_MAP_STATS`).
 
 ---
 
@@ -2095,8 +2158,14 @@ unaffected. Full detail is inline in the sections above.
 - **Reduced-order (`basis=`) solves** cover steady and **first-order transient** (linear and
   nonlinear). Second-order-in-time (`u_tt`), complex, and periodic-tied problems refuse, each with its
   own reason. Nonlinear reduces, but without hyper-reduction that is a memory win, not a speed one.
-- **No runtime Dirichlet parameters** — a trainable parameter may sit in the operator (stiffness) but
-  not in an essential/Dirichlet boundary *value*.
+- **Runtime Dirichlet parameters** work on the steady linear, steady nonlinear, and linear transient
+  paths: a trainable `jno.np.parameter` may sit in an essential value (`u(top) - g`, or scaling a
+  coordinate profile `u(top) - g*sin(pi*x)`), and the boundary value is recovered from data like any
+  other parameter — `∂b/∂g` flows through the symmetric elimination (linear), and `∂/∂g` through the
+  solve's / each step's `custom_root` (nonlinear / transient). NOT supported, refused loudly: a value
+  that is **both** parametric and t/τ-dependent (`u(top) - g*tau` — train the amplitude through a
+  Neumann/body term instead). A FIELD-sized optimizer-less parameter stays the nodal data-field value
+  (a neighbour's field in a DD solve), gathered per node.
 - **Affine parameter lowering expects a single, direct factor** — one trainable scalar per additive
   term (`nu * grad(u)·grad(phi)`), not nested or buried in a nonlinear expression.
 - **Enclosure radiation is a composition, not an auto-detected term** — it is 2D / axisymmetric and
