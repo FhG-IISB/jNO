@@ -31,6 +31,7 @@ __all__ = [
     "Variable",
     "TensorTag",
     "RegionMask",
+    "TagMask",
     "BinaryOp",
     "Tracker",
     "Model",
@@ -43,6 +44,10 @@ __all__ = [
     "Integral",
     "IntegralTime",
     "Jacobian",
+    "Diff",
+    "DiffSlot",
+    "BoundConstraint",
+    "bound_constraints",
     "NormalDerivative",
     "TemporalDerivative",
     "NetworkGradient",
@@ -830,6 +835,33 @@ class Placeholder:
         """
         return HistoryRef(self, offset)
 
+    def bounds(self, lo=None, hi=None) -> "BoundConstraint":
+        """Declare a **box constraint** ``lo <= self <= hi`` on this unknown.
+
+        A bound is part of the problem *statement* — the inequality sibling of a Dirichlet condition —
+        so it goes in the ``jno.fem([...])`` list beside the equations and ``fem.solve()`` still takes
+        nothing. It turns the solve into a **variational inequality**: instead of ``R(u) = 0``
+        everywhere, the solution satisfies the KKT conditions ``R = 0`` strictly inside the box,
+        ``R >= 0`` where ``u`` sits on ``lo`` and ``R <= 0`` where it sits on ``hi`` (the contact
+        reaction / multiplier). That is a *solve*, not a clip: clipping an unconstrained solution
+        satisfies the bound too, and puts the free boundary in the wrong place.
+
+        Pass ``None`` for either side to leave it unbounded::
+
+            dm.bounds(0.0, 1.0)          # a damage variable is a fraction
+            u.bounds(psi, None)          # an obstacle from below (one-sided)
+            dm.bounds(dm.i(-1), 1.0)     # bound-constrained irreversibility on a load-path march
+
+        ``lo``/``hi`` accept a number, a coordinate expression (evaluated at this field's DOF points,
+        like a Dirichlet value), or ``self.i(-1)`` — the previous load step's values on a
+        ``domain(tau=...)`` march. They may not depend on the *live* unknown; that would be a general
+        complementarity problem, not a box, and is rejected.
+
+        The residual must be written in the standard variational orientation ``a(u,v) - L(v)`` (the
+        gradient of an energy), which is what fixes the sign of the multiplier above. A form written
+        with the opposite sign states a different inequality — see ``docs/fem.md``."""
+        return BoundConstraint(self, lo, hi)
+
     def evolves(self, formula) -> "StateUpdate":
         """Declare a per-step **state update** for this (internal-state) field: at the current step it
         *becomes* ``formula`` — which typically reads its own past via ``self.i(-1)`` and the solved
@@ -1519,6 +1551,30 @@ class RegionMask(Placeholder):
 
     def __repr__(self):
         return f"RegionMask({self.region})"
+
+
+class TagMask(Placeholder):
+    """Per-**boundary-facet** indicator for a named tag — the surface mirror of :class:`RegionMask`,
+    multiplied into a surface term by ``jno.fem`` so a coefficient can vary across ONE boundary term.
+
+    A facet belongs to the tag iff the tag owns it, resolved by the assembler's own facet selection
+    (``fem_native._region_faces``) rather than by re-evaluating the tag predicate. That is deliberate:
+    it makes ``TagMask("wall")`` select *exactly* the facets a Dirichlet condition bound to ``"wall"``
+    pins, and it avoids re-running a tolerance-tight predicate under float32, where ``x > 1 - 1e-9``
+    rounds to ``x > 1.0`` and silently matches nothing (see ``domain.tag_node_mask``).
+
+    It is a leaf (no children) and carries no coordinates, so it composes as a plain scalar
+    coefficient: ``TagMask(tag) * surface_term``. Built by :meth:`jno.domain.by_tag`.
+
+    Surface terms only. In a **volume** term there is no facet to indicate, and the evaluator raises
+    rather than integrating over the whole boundary or silently contributing nothing.
+    """
+
+    def __init__(self, tag: str):
+        self.tag = str(tag)
+
+    def __repr__(self):
+        return f"TagMask({self.tag})"
 
 
 class BinaryOp(Placeholder):
@@ -3032,6 +3088,121 @@ class NormalDerivative(Placeholder):
         return f"NormalDerivative({self.target})"
 
 
+class _FieldComponentIndex:
+    """``field[i]`` is the i-th COMPONENT — the mixin that makes one spelling mean one thing.
+
+    :class:`Placeholder` indexes an array the ordinary way, i.e. the **leading** axis. That is right
+    for a plain tensor and wrong for a FEM field, whose leading axis at assembly is the quadrature
+    points (and, for a test function, the DOFs after it) — the component axis is **last**. The typed
+    views have always known this: ``VectorView[i]`` is :meth:`~views.VectorView.component`, built as
+    ``expr[..., i]``. So ``u.vector[0]`` and ``u(region)[0]`` selected a component while a bare
+    ``u[0]`` sliced quadrature points and blew up in the assembler with a raw broadcast error naming
+    no jNO concept.
+
+    Inserting the ellipsis here makes the raw spelling agree with the view. ``getitem_key`` then reads
+    ``(Ellipsis, i)`` exactly as the view's already did, so the consumers that recover a component
+    from it — the per-component Dirichlet spec and the component-gradient branch of the assembler —
+    are unaffected.
+    """
+
+    def __getitem__(self, key):
+        keys = key if isinstance(key, tuple) else (key,)
+        if any(k is Ellipsis for k in keys):
+            return Placeholder.__getitem__(self, key)  # explicit `u[..., i]`: already unambiguous
+        if not tuple(getattr(self, "value_shape", ()) or ()):
+            raise TypeError(
+                f"{type(self).__name__}[{key!r}]: this field is scalar (value_shape == ()), so it has no "
+                "components to index. For a derivative write `u.d(x)` (or `u.x` on a bound view); to index "
+                "a plain array, index the array rather than the field."
+            )
+        return Placeholder.__getitem__(self, (Ellipsis,) + keys)
+
+
+class DiffSlot(Placeholder):
+    """A leaf standing in for a value injected at evaluation time — the hole :class:`Diff` differentiates
+    through. Carries no children and no coordinates, so it composes as a plain value in any formula. Not
+    user-facing: it exists only inside the rewritten copy of a :class:`Diff` target."""
+
+    def __init__(self, key: str, value_shape=()):
+        self.key = str(key)
+        self.value_shape = tuple(value_shape)
+
+    def __repr__(self):
+        return f"DiffSlot({self.key})"
+
+
+class Diff(Placeholder):
+    """``∂(target)/∂(wrt)`` — a scalar trace expression differentiated w.r.t. another **expression**.
+
+    The constitutive counterpart of :class:`Jacobian`, which differentiates w.r.t. a spatial coordinate.
+    It is what lets a hyperelastic material be written as its stored energy: given ``psi(F)``, the 1st
+    Piola-Kirchhoff stress is ``P = diff(psi, F)`` rather than a hand-derived ``S = 2 dpsi/dC`` followed
+    by ``P = F S``. See :func:`jno.np.diff`.
+
+    ``wrt`` is matched **by identity** inside ``target`` — bind it to a variable and reuse that variable.
+    A freshly rebuilt expression is a different node, would match nothing, and would differentiate to a
+    silent zero, so the constructor rejects it here rather than at assembly.
+    """
+
+    _slot_counter = 0
+
+    def __init__(self, target: "Placeholder", wrt: "Placeholder"):
+        target = target._expr if hasattr(target, "_expr") else target
+        wrt = wrt._expr if hasattr(wrt, "_expr") else wrt
+        if not isinstance(wrt, Placeholder):
+            raise TypeError(f"jno.np.diff: `wrt` must be a trace expression, got {type(wrt).__name__}.")
+        if contains_integral(target):
+            raise ValueError(
+                "jno.np.diff: the differentiated expression contains an Integral. `diff` is POINTWISE — it "
+                "differentiates a value at each quadrature point — so a reduced (integrated) target would "
+                "silently give the derivative of the sum. Differentiate the integrand, then integrate."
+            )
+        Diff._slot_counter += 1
+        self._slot = DiffSlot(f"__diff_{Diff._slot_counter}__", getattr(wrt, "value_shape", ()))
+        rewritten = substitute(target, {wrt: self._slot})
+        if rewritten is target:
+            raise ValueError(
+                "jno.np.diff: `wrt` does not occur in the expression being differentiated, so the "
+                "derivative would be identically zero. `wrt` is matched by IDENTITY: bind it once "
+                "(`F = I + grad(u, X)`) and pass that same object, rather than rebuilding it inline."
+            )
+        del rewritten  # built only to validate; the evaluator rebuilds it from the CURRENT children,
+        # because `substitute` may later rewrite this node's own target/wrt and a cached copy would go stale.
+        self.target = target  # kept so trial/field/region detection walks the ORIGINAL expression
+        self.wrt = wrt
+        self.value_shape = tuple(getattr(wrt, "value_shape", ()))
+        _propagate_weak(self, target, wrt)
+
+    def rewritten(self):
+        """``target`` with ``wrt`` replaced by this node's value slot — rebuilt on demand."""
+        return substitute(self.target, {self.wrt: self._slot})
+
+    def __repr__(self):
+        return f"Diff({self.target}, wrt={self.wrt})"
+
+
+def contains_integral(expr) -> bool:
+    """True if ``expr`` contains an :class:`Integral` / :class:`IntegralTime` reduction anywhere."""
+    seen: set = set()
+
+    def walk(node) -> bool:
+        if not isinstance(node, Placeholder) or id(node) in seen:
+            return False
+        seen.add(id(node))
+        if isinstance(node, (Integral, IntegralTime)):
+            return True
+        for _kind, _attr, val in _iter_placeholder_children(node):
+            if isinstance(val, Placeholder):
+                if walk(val):
+                    return True
+            else:
+                if any(walk(c) for c in val if isinstance(c, Placeholder)):
+                    return True
+        return False
+
+    return walk(expr)
+
+
 class Integral(Placeholder):
     """Mesh-based integral reduction of an expression over its domain region.
 
@@ -3467,7 +3638,7 @@ class GaugePin:
         return f"GaugePin(field={getattr(self.field, 'name', '?')!r}, value={self.value!r})"
 
 
-class TrialFunction(Placeholder):
+class TrialFunction(_FieldComponentIndex, Placeholder):
     """
     Generic variational unknown symbol.
 
@@ -3797,7 +3968,7 @@ def _iter_placeholder_children(node):
     """Yield ``(kind, attr, value)`` for each Placeholder-bearing child of a trace node — the scalar
     child attributes (``target``/``left``/``right``/``expr``/``operation``) and the list attributes
     (``args``/``variables``/``options``). The single traversal shape used by all trace walks here."""
-    for attr in ("target", "left", "right", "expr", "operation"):
+    for attr in ("target", "wrt", "left", "right", "expr", "operation"):
         child = getattr(node, attr, None)
         if isinstance(child, Placeholder):
             yield "scalar", attr, child
@@ -3972,6 +4143,90 @@ class StateUpdate(Placeholder):
         return f"StateUpdate({getattr(self.target, 'name', 'state')})"
 
 
+class BoundConstraint(Placeholder):
+    """A **box constraint** on an unknown — ``u.bounds(lo, hi)``, produced by :meth:`Placeholder.bounds`.
+
+    Not a residual (it carries no test function) and not an equation: it states the feasible set the
+    solution must lie in. The FEM front-end pulls it out into its own bucket before the weak-form /
+    Dirichlet classification — like :class:`StateUpdate` — and the solve enforces it through the KKT
+    conditions of the resulting variational inequality.
+
+    ``lo``/``hi`` are kept raw (a number, a coordinate expression, or a :class:`HistoryRef`); resolving
+    them to DOF-space vectors needs the assembled field layout, so it happens at solve time. Either may
+    be ``None`` for a one-sided bound. Only ``target`` is walked as a child: ``lo``/``hi`` live in
+    DOF space, and walking them would let a ``self.i(-1)`` bound allocate a per-quadrature-point history
+    buffer it never reads."""
+
+    def __init__(self, base, lo=None, hi=None):
+        base = base._expr if hasattr(base, "_expr") else base  # unwrap a typed view
+        if lo is None and hi is None:
+            raise ValueError(
+                "jno.fem: `.bounds(lo, hi)` needs at least one side — pass a number or expression for "
+                "`lo`, `hi`, or both. `bounds(None, None)` constrains nothing."
+            )
+        if getattr(base, "field_key", None) is None:
+            raise TypeError(
+                "jno.fem: `.bounds(...)` applies to a field from `domain.fem_symbols()` (the unknown "
+                f"being solved for), not to {type(base).__name__}. A bound on a general expression is a "
+                "nonlinear complementarity problem, not a box constraint."
+            )
+
+        def _reads_live_unknown(node, seen=None):
+            """Does ``node`` reach a trial/test field other than through a ``.i(k)`` history read?"""
+            if not isinstance(node, Placeholder):
+                return False
+            seen = seen if seen is not None else set()
+            if id(node) in seen:
+                return False
+            seen.add(id(node))
+            if isinstance(node, HistoryRef):
+                return False  # a past value is data, not the live unknown
+            if isinstance(node, (TrialFunction, TestFunction)):
+                return True
+            for _kind, _attr, child in _iter_placeholder_children(node):
+                kids = [child] if isinstance(child, Placeholder) else list(child)
+                if any(_reads_live_unknown(k, seen) for k in kids):
+                    return True
+            return False
+
+        for side, val in (("lo", lo), ("hi", hi)):
+            if _reads_live_unknown(val):
+                raise ValueError(
+                    f"jno.fem: the `{side}` of `.bounds(...)` may not depend on the live unknown — that is a "
+                    "general complementarity problem, not a box. Use a number, a coordinate expression, or "
+                    "`self.i(-1)` (the previous load step)."
+                )
+        if isinstance(lo, (int, float)) and isinstance(hi, (int, float)) and float(lo) > float(hi):
+            raise ValueError(f"jno.fem: `.bounds(lo, hi)` has an empty box — lo={float(lo)} is above hi={float(hi)}.")
+        self.target = base
+        self.lo = lo
+        self.hi = hi
+        self.name = f"{getattr(base, 'name', 'u')}.bounds({lo}, {hi})"
+        self.value_shape = tuple(getattr(base, "value_shape", ()))
+        self.order = int(getattr(base, "order", 1))
+        self.space = str(getattr(base, "space", "Lagrange"))
+        self.field_key = getattr(base, "field_key", None)
+        self.op_id = _next_op_id()
+
+    def __repr__(self):
+        return f"BoundConstraint({getattr(self.target, 'name', 'u')}, lo={self.lo}, hi={self.hi})"
+
+
+def bound_constraints(terms):
+    """The top-level :class:`BoundConstraint` nodes in ``terms``, as ``{field_key: BoundConstraint}``.
+
+    One box per field (a later declaration wins). The FEM front-end uses this to pull ``u.bounds(...)``
+    out of the weak-form / Dirichlet classification and into its own bucket."""
+    if isinstance(terms, Placeholder):
+        terms = [terms]
+    out: dict = {}
+    for t in terms:
+        node = t._expr if hasattr(t, "_expr") else t
+        if isinstance(node, BoundConstraint):
+            out[node.field_key] = node
+    return out
+
+
 def history_variables(terms):
     """Scan trace ``terms`` (a term or list of terms) for :class:`HistoryRef` nodes and return
     ``{history_key: (base, depth)}`` — ``depth`` is how many PAST states of that base variable the load-step
@@ -4069,7 +4324,7 @@ def state_updates(terms):
     return out
 
 
-class TestFunction(Placeholder):
+class TestFunction(_FieldComponentIndex, Placeholder):
     """
     Generic variational test function.
 

@@ -236,3 +236,58 @@ def test_a_remeshed_domain_does_not_reuse_a_stale_plan():
     for s in sols:
         assert np.all(np.isfinite(s)) and np.max(s) > 0.0
     _plan_cache().clear()
+
+
+# --------------------------------------------------------------------------------------------------
+# `bcoo_identity_rows` — replace rows by identity from a TRACED boolean mask. The index-array helpers
+# beside it cannot serve a min-map's active set, which is a function of the current iterate.
+# --------------------------------------------------------------------------------------------------
+def _dense_identity_rows(A, mask):
+    """The oracle, written out: rows where `mask` holds become rows of the identity."""
+    out = np.array(A, dtype=float, copy=True)
+    out[mask, :] = 0.0
+    out[mask, mask] = 1.0
+    return out
+
+
+@pytest.mark.parametrize(
+    "mask",
+    [
+        [False, False, False, False],  # none active — must be an exact no-op
+        [True, True, True, True],  # ALL active — the result is the identity
+        [True, False, True, False],  # the ordinary mixed case
+        [False, False, False, True],  # only the last row
+    ],
+)
+def test_bcoo_identity_rows_matches_the_dense_oracle(mask):
+    from jax.experimental import sparse as jsparse
+
+    from jno.utils.solver.fem_utils import bcoo_identity_rows
+
+    rng = np.random.default_rng(0)
+    dense = rng.normal(size=(4, 4))
+    dense[1, 3] = 0.0  # a structural zero, so the pattern is not trivially full
+    A = jsparse.BCOO.fromdense(jnp.asarray(dense))
+    m = np.asarray(mask)
+    got = np.asarray(bcoo_identity_rows(A, jnp.asarray(m)).todense())
+    want = _dense_identity_rows(dense, m)
+    assert np.allclose(got, want), f"\ngot\n{got}\nwant\n{want}"
+
+
+def test_bcoo_identity_rows_keeps_a_static_shape_under_jit():
+    """The whole reason it takes a mask: the active set changes every iterate, so this runs inside a
+    traced Newton loop and may not produce a data-dependent nnz."""
+    from jax.experimental import sparse as jsparse
+
+    from jno.utils.solver.fem_utils import bcoo_identity_rows
+
+    A = jsparse.BCOO.fromdense(jnp.eye(3) * 2.0 + 1.0)
+
+    @jax.jit
+    def go(mask):
+        return bcoo_identity_rows(A, mask).todense()
+
+    a = np.asarray(go(jnp.asarray([True, False, False])))
+    b = np.asarray(go(jnp.asarray([False, True, True])))
+    assert np.allclose(a, _dense_identity_rows(np.asarray(A.todense()), np.array([True, False, False])))
+    assert np.allclose(b, _dense_identity_rows(np.asarray(A.todense()), np.array([False, True, True])))

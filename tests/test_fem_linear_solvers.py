@@ -15,6 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+import jno
 from jno.utils.solver.linear import jacobi, matrix_diagonal, sparse_lu_solve
 
 
@@ -312,3 +313,115 @@ def test_the_factorization_cache_is_bounded(count_factorizations):
     for s in range(_FACTOR_CACHE_MAX + 3):
         host_lu_solve(jsp.BCOO((A.data * (1.0 + s), A.indices), shape=A.shape), b)
     assert len(_FACTOR_CACHE) <= _FACTOR_CACHE_MAX
+
+
+# --------------------------------------------------------------------------------------------------
+# Symmetry detection for the sparse-DIRECT backends.
+#
+# cuDSS and PARDISO factor an exactly symmetric operator as LDLᵀ instead of a general LU — measured
+# 1.41x with 1.38x less peak device memory (cuDSS) and up to 1.9x (PARDISO). Symmetry was tested
+# BITWISE, which no vector or coupled FEM tangent passes: the element block contracts components in a
+# different order for (a,i),(b,j) than for (b,j),(a,i), so the two triangles differ by a fraction of
+# an ulp. Every such problem was therefore factored as a general LU.
+#
+# `_symmetrized_kind_and_values` averages the two triangles when they agree to within a few ulps. The
+# tests below pin both halves of that: it must fire on assembly round-off, and it must NEVER fire on a
+# genuinely non-symmetric operator.
+# --------------------------------------------------------------------------------------------------
+def _perm_and_kinds(rows, cols, vals):
+    from jno.utils.solver.linear import _cudss_matrix_kind, _cudss_sym_perms, _symmetrized_kind_and_values
+
+    order, orderT, pat = _cudss_sym_perms(np.asarray(rows), np.asarray(cols))
+    v = np.asarray(vals, dtype=float)
+    strict = _cudss_matrix_kind(v, order, orderT, pat)
+    kind, out = _symmetrized_kind_and_values(v, order, orderT, pat)
+    return strict, kind, out, (order, orderT)
+
+
+def _tridiag(n, off=-1.0, asym=0.0):
+    """A symmetric tridiagonal, optionally with one off-diagonal entry nudged to break symmetry."""
+    rows, cols, vals = [], [], []
+    for i in range(n):
+        rows.append(i), cols.append(i), vals.append(2.0)
+        if i + 1 < n:
+            rows += [i, i + 1]
+            cols += [i + 1, i]
+            vals += [off + asym, off]
+    return np.array(rows), np.array(cols), np.array(vals)
+
+
+def test_roundoff_asymmetry_is_treated_as_symmetric_and_averaged():
+    eps = float(np.finfo(np.float64).eps)
+    n = 40
+    rows, cols, vals = _tridiag(n, asym=8.0 * eps)  # ~4 ulps against |A| = 2
+    strict, kind, out, (order, orderT) = _perm_and_kinds(rows, cols, vals)
+    assert strict == "general", "the strict bitwise test must still reject this — else the test is vacuous"
+    assert kind == "symmetric", "a few-ulp asymmetry must be accepted as symmetric"
+    assert np.array_equal(out[order], out[orderT]), "the returned values must be BITWISE symmetric"
+    # The correction is bounded by the asymmetry it removes — it adds no error the assembly had not made.
+    assert np.abs(out - vals).max() <= 0.5 * np.abs(np.asarray(vals)[order] - np.asarray(vals)[orderT]).max() + 1e-300
+
+
+def test_a_genuinely_nonsymmetric_matrix_is_never_averaged():
+    rows, cols, vals = _tridiag(40, asym=0.5)  # a real asymmetry, not round-off
+    strict, kind, out, _ = _perm_and_kinds(rows, cols, vals)
+    assert strict == "general" and kind == "general", "a genuinely non-symmetric matrix must stay general"
+    assert np.array_equal(out, vals), "its values must be returned untouched"
+
+
+def test_the_gate_rejects_asymmetry_well_below_a_physically_meaningful_one():
+    """Measured on the real thing: a vector FEM tangent sits at ~0.25 ulps, while an advection term so
+    weak it is physically meaningless (coefficient 1e-12) already reaches ~191 ulps. The gate must sit
+    between those two populations, not on a continuum."""
+    eps = float(np.finfo(np.float64).eps)
+    _s, kind_lo, _o, _p = _perm_and_kinds(*_tridiag(40, asym=0.5 * eps))  # ~0.25 ulps: round-off
+    _s, kind_hi, _o, _p = _perm_and_kinds(*_tridiag(40, asym=400.0 * eps))  # ~200 ulps: genuine
+    assert kind_lo == "symmetric"
+    assert kind_hi == "general"
+
+
+def test_a_vector_fem_tangent_now_qualifies_as_symmetric():
+    """The case this exists for — a 3-D elasticity tangent, which no bitwise test accepts."""
+    nn = jno.np
+    inner, grad, symg, trace, ident = nn.inner, nn.grad, nn.sym, nn.trace, nn.identity
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.4).domain()
+    d.tag("bot", lambda x, y, z: z < 1e-6)
+    co, cb = d.variable("interior", split=True), d.variable("bot", split=True)
+    X, I3 = [co[0], co[1], co[2]], ident(3)
+    u, phi = d.fem_symbols(value_shape=(3,))
+    e = symg(grad(u, X))
+    sig = 80.0 * trace(e) * I3 + 120.0 * e + 200.0 * inner(e, e, 2) * e  # nonlinear -> residual path
+    zh = nn.asarray([0.0, 0.0, 1.0])
+    fem = jno.fem(
+        [inner(sig, symg(grad(phi, X)), 2) - 4.0 * inner(zh, phi, 1)] + [u(cb[0], cb[1], cb[2])[i] - 0.0 for i in range(3)]
+    )
+    J = fem._op.jacobian(jnp.asarray(fem.solve()))
+    strict, kind, _out, _p = _perm_and_kinds(np.asarray(J.indices[:, 0]), np.asarray(J.indices[:, 1]), np.asarray(J.data))
+    assert strict == "general", "if this ever becomes bitwise symmetric the change is moot — check why"
+    assert kind == "symmetric", "a vector FEM tangent must reach the LDLt path"
+
+
+def test_pardiso_agrees_with_the_iterative_default_on_a_symmetric_tangent():
+    """End to end: the symmetric factorization must give the same answer as the matrix-free default."""
+    pytest.importorskip("pypardiso")
+    from jno.utils.solver.linear import _pardiso_available
+
+    if not _pardiso_available():
+        pytest.skip("pypardiso present but without the private phase hooks this backend drives")
+    nn = jno.np
+    inner, grad, symg, trace, ident = nn.inner, nn.grad, nn.sym, nn.trace, nn.identity
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.45).domain()
+    d.tag("bot", lambda x, y, z: z < 1e-6)
+    co, cb = d.variable("interior", split=True), d.variable("bot", split=True)
+    X, I3 = [co[0], co[1], co[2]], ident(3)
+    u, phi = d.fem_symbols(value_shape=(3,))
+    e = symg(grad(u, X))
+    sig = 80.0 * trace(e) * I3 + 120.0 * e + 200.0 * inner(e, e, 2) * e
+    zh = nn.asarray([0.0, 0.0, 1.0])
+    fem = jno.fem(
+        [inner(sig, symg(grad(phi, X)), 2) - 4.0 * inner(zh, phi, 1)] + [u(cb[0], cb[1], cb[2])[i] - 0.0 for i in range(3)]
+    )
+    ref = np.asarray(fem.solve())
+    got = np.asarray(fem.solve(nonlinear=jno.solve.newton(direct=True), linear=jno.solve.lu(backend="pardiso")))
+    assert np.abs(ref).max() > 1e-6
+    assert np.abs(got - ref).max() / np.abs(ref).max() < 1e-8, "the LDLt factorization changed the answer"

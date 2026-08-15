@@ -148,6 +148,141 @@ in the `jno.fem([...])` list, and `jno.fem` classifies each by the region it is 
 for a spatially varying Dirichlet value). A zero Neumann flux is the natural default and needs
 no term.
 
+#### Per-tag surface coefficients — `d.by_tag({...})`
+
+A boundary term is normally written per tag, on that tag's coordinates. When the *same* condition
+applies over the whole boundary with only its coefficient changing, `by_tag` collapses it into one
+term — the surface mirror of `by_region`:
+
+```python
+d.tag("wall", lambda x, y: x < 1e-9)
+d.tag("lid",  lambda x, y: y > 1 - 1e-9)
+
+h = d.by_tag({"wall": 25.0, "lid": 5.0})          # per-tag film coefficient
+xb, yb, _ = d.variable("boundary", split=True)
+ub, vb = u.bind(x=xb, y=yb), v.bind(x=xb, y=yb)
+robin = h * (ub - T_inf) * vb                      # ONE term, both tags
+```
+
+It desugars to `sum_t TagMask(t) * values[t]`, and assembles the identical operator and load vector as
+the per-tag term loop. A facet belongs to a tag by the assembler's own facet selection — the same rule
+that decides which facets a Dirichlet condition on that tag pins — so the two can never disagree.
+Values may be anything a coefficient can be (scalars, expressions, trainable parameters, typed views),
+`default=` covers the facets no listed tag claims, and `d.attach("wall", h=25.0)` declares the value on
+the tag itself so the term reads `d.h * (ub - T_inf) * vb`.
+
+**Limits, all loud:** surface terms only — a `TagMask` in a *volume* term raises, as does `by_tag` on
+a non-nodal space (N1E / RT / Morley / Argyris) or in 1-D, where the per-facet mask is not threaded. A
+tag owning no boundary facet on the mesh raises rather than integrating over nothing. Facets that no
+listed tag claims contribute nothing unless `default=` is given — untagged boundary is deliberately
+natural (do-nothing) in jNO, so tags are not required to partition the boundary.
+
+### Inequalities — `u.bounds(lo, hi)`
+
+A **box constraint** is the inequality sibling of a Dirichlet condition, so it is a term too, and
+`fem.solve()` still takes nothing:
+
+```python
+jno.fem([
+    inner(grad(u, X), grad(phi, X), 1) + 1.0 * phi,   # -Δu = -1
+    u(*ends) - 0.0,
+    u.bounds(-c, None),                               # an obstacle from below (one side; None = free)
+])
+```
+
+This turns the solve into a **variational inequality**. Instead of `R(u) = 0` everywhere, the solution
+satisfies the KKT conditions
+
+| where | condition |
+|---|---|
+| `lo < u < hi` | `R = 0` (equilibrium) |
+| `u = lo` | `R ≥ 0` (the constraint pushes back) |
+| `u = hi` | `R ≤ 0` |
+
+which are exactly the zeros of the **min-map** `min(max(R, u - hi), u - lo)` — the natural residual of
+a box-constrained VI (Facchinei & Pang, *Finite-Dimensional Variational Inequalities and
+Complementarity Problems*, Springer 2003, §1.5). That function is semismooth rather than smooth, and
+Newton on it converges locally superlinearly (Qi & Sun, *A nonsmooth version of Newton's method*,
+Math. Programming **58**, 1993). No new solver is involved: `jax.linearize` differentiates through
+`min`/`max` by selecting the active branch, which *is* the semismooth Jacobian, so the existing
+Newton–Krylov and sparse-direct drivers apply unchanged — and `lax.custom_root` differentiates the
+result on the same operator.
+
+**A bound is solved, not clipped.** Clipping an unconstrained solution satisfies the bound just as
+exactly and gives the wrong answer, because it puts the *free boundary* in the wrong place. On the
+classic obstacle problem `-u'' = -1`, `u(0)=u(1)=0`, `u ≥ -c`, the membrane leaves the obstacle where
+it meets it **tangentially**, at `x = √(2c)`; a clip detaches where the unconstrained parabola
+**crosses** `-c`, at `x = (1-√(1-8c))/2`. At `c = 1/18` that is 0.333 versus 0.127.
+
+`lo`/`hi` accept a number, a coordinate expression (evaluated at that field's DOF points, like a
+Dirichlet value), or `u.i(-1)` — the previous load step on a `domain(tau=...)` march, which gives
+**bound-constrained irreversibility**: `u.bounds(u.i(-1), None)` lets a field ratchet up and never
+come back down. They may not depend on the live unknown; that is a general complementarity problem
+rather than a box, and is rejected.
+
+!!! warning "Sign convention"
+    The min-map takes the multiplier's sign from the residual's, so the weak form must be written in
+    the standard variational orientation `a(u,v) - L(v)` — the gradient of an energy, which is how
+    every form in these docs is written. Written with the opposite sign it states the *other*
+    inequality. This cannot be detected from the residual alone, so it is a convention, not a check.
+
+**Scope.** Bounds are wired on the steady residual path (real, 2D/3D native Lagrange, single-field or
+coupled), including inside a `tau=` load-path march; a transient or complex assembly is rejected with
+a clear error. One box per field. Note that a bound is not a cure for an ill-posed operator: in a
+phase-field form `dm.bounds(0, 1)` keeps the damage in range but does **not** remove the need for a
+floor on `(1-dm)²`, which at `dm = 1` would otherwise make the displacement block singular. And on a
+non-convex energy a monolithic Newton is not expected to converge whether or not a bound is present —
+see the staggered driver. Non-convergence raises on an eager solve; inside a march it cannot (the
+step runs under `lax.scan`), which is the same pre-existing limitation every marched Newton has.
+
+### Components and derivatives — `u[i]` vs `u.x`
+
+For a vector field the two are distinct spellings and each means one thing:
+
+| spelling | meaning |
+|---|---|
+| `u[i]`, `u[..., i]`, `u.vector[i]`, `u(region)[i]` | the **i-th component** |
+| `u.d(x)`, `u.x` on a bound view, `u.t` | the **derivative** |
+
+`u[i]` is the component *everywhere* — on a raw `fem_symbols` field exactly as on a typed view — and
+all four component spellings assemble the identical term. Indexing a **scalar** field raises: it has no
+components, and the message points at `u.d(x)`.
+
+(Historically a raw `u[0]` indexed the leading array axis, which at assembly is quadrature points, so
+it died inside the assembler with a broadcast error naming nothing — while `u(region)[0]` and
+`u.vector[0]`, built by the views as `u[..., 0]`, selected the component correctly.)
+
+### Reading the reaction off a constrained region — `fem.eval`
+
+The quantity conjugate to an essential condition is the **reaction**: force in mechanics, total heat
+flux through a Dirichlet wall, current in electrostatics, flow rate in Darcy. It is one operation, and
+it is arithmetic on a residual — but not on the residual any solve path keeps:
+
+```python
+fem = jno.fem([mech, u(*left)[0] - 0.0, u(*left)[1] - 0.0])
+u_h = fem.solve()
+R   = fem.eval(mech, u_h)                                  # free residual, one value per DOF
+Fx  = R[fem.region_dofs("left", component=0)].sum()        # reaction on the pinned face
+```
+
+`fem.eval(term, u)` assembles a weak term at a solution with **no essential elimination applied**, and
+`fem.region_dofs(region, field=…, component=…)` gives that region's global DOF indices.
+
+**Why this needs its own entry point.** Every solve path elimination-mutates the system it keeps: the
+linear route applies symmetric elimination (`fem.A`/`fem.b` have the constrained rows zeroed and a unit
+diagonal set), and Newton replaces those rows with `u[d] - g`. Both are right for solving, and both are
+**exactly zero** at the DOFs a reaction asks about — so reading it off `fem.A`, `fem.b` or
+`fem.residual` returns a plausible, silent zero rather than an error. (`fem.residual` also refuses
+outright on a linear problem, which is the commonest reaction case.)
+
+`term` is any weak term built from this domain's symbols and does not have to be one the FEM was built
+from, so a diagnostic form can be assembled against an existing solution. **Scope:** volume terms on
+the native Lagrange assembler. A term with no test function is a field readout rather than an assembly,
+and a surface term needs the front-end's per-region facet bucketing — both are refused by name.
+
+Verified by global balance, not by restating the assembly: the wall flux equals the integrated source,
+and the reaction equals the applied load.
+
 ### Tying two boundaries — `u(A) - u(B)`
 
 A term that names two boundary regions and carries no test function is a **tie**: it identifies the
@@ -296,7 +431,10 @@ answer `uy(y=1) = -0.01` to 1.5e-05 at `c = 1e6`.
 > The gap is non-local (it reads DOFs on the other body's cells), so the tangent is matrix-free;
 > `newton(direct=True)` is refused. **One-sided contact does not yet converge to tight tolerances**: the
 > `max(0, ·)` kink is non-smooth and the residual stalls around 1e-2 with a line search, against a 1e-8
-> target. The bonded two-sided path is smooth and converges.
+> target. The bonded two-sided path is smooth and converges. Signorini contact is the same kind of
+> object as [`u.bounds(lo, hi)`](#inequalities--uboundslo-hi) — a complementarity condition rather than
+> a penalty — so that machinery is the natural route for it, but the reformulation has **not** been
+> done and the penalty path above is what exists today.
 
 ---
 
@@ -1089,7 +1227,7 @@ Pick by structure:
 | SPD, batched/GPU-heavy | `chebyshev` | inner-product free (no reductions) — Golub & Varga 1961 |
 | indefinite, single solve | `lu` | sparse-direct; **no vmap rule** — use a Krylov solver inside batched solves |
 | cuSolver refuses it, or is slow | `lu(backend="host")` | factors on the HOST (SuperLU) and drives it from the device; same answer and same gradients (wrapped in `custom_linear_solve`, transpose via SuperLU `trans="T"`). Measured **faster** where cuSolver also works — Stokes 21,839 DOFs 0.27 s vs 1.67 s, H(curl) 17,072 complex DOFs 13.3 s vs 36.4 s — and it runs meshes cuSolver rejects (Stokes 26,908, H(curl) 26,154, both of which fail on GPU). Affordable because a direct solve factorises **once**: the operator crosses PCIe once, not per iteration. Read the win as *cuSolver's sparse LU is weak*, not *GPUs lose* — see the row below |
-| **shift-invert eigs, or a constant-operator transient** | `lu(backend="cudss")` | NVIDIA cuDSS — the **fastest** direct backend wherever it runs, because it separates the symbolic *plan* from the numeric *factorization* and jNO caches on the **sparsity**, so the plan survives a change of values. Against `backend="host"` on an RTX 3070 (fp64 at 1/64 rate — the *unfavourable* card): Stokes saddle factorization **3.4 ms vs 79.9 ms**, lap3d 50³ **576 ms vs 64,856 ms**, and **64.7× per Newton step** at n=64,000. Also factors the Stokes saddle cuSolver calls *singular*, with smaller residuals. Needs the optional stack (`nvmath-python`, `cudss`, `cupy`); raises a clear `ImportError` otherwise. Fill-in still governs 3-D (69×→218× nnz growth at lap3d 20³–40³), so it moves the ceiling and makes **device memory** the binding constraint — it is not a substitute for a preconditioner  Two things happen automatically: a **block right-hand side** `(n, k)` is solved in one call (measured **2.7× at k=4 to 5.4× at k=16** over the same factorization solved column by column — this is what the shift-invert eigensolver's subspace iteration needs every sweep), and an exactly symmetric operator is factored as **LDLᵀ instead of general LU** (1.41× faster, **1.38× less peak device memory** on lap3d 40³). Symmetry is tested *bitwise* and SPD is never inferred — a matrix symmetric only to ~1e-15 would otherwise be silently factored as `(A+Aᵀ)/2`, and a wrong SPD guess returns NaN. A singular operator **raises**: cuDSS signals it through neither an exception nor a NaN, returning a finite plausible vector instead |
+| **shift-invert eigs, or a constant-operator transient** | `lu(backend="cudss")` | NVIDIA cuDSS — the **fastest** direct backend wherever it runs, because it separates the symbolic *plan* from the numeric *factorization* and jNO caches on the **sparsity**, so the plan survives a change of values. Against `backend="host"` on an RTX 3070 (fp64 at 1/64 rate — the *unfavourable* card): Stokes saddle factorization **3.4 ms vs 79.9 ms**, lap3d 50³ **576 ms vs 64,856 ms**, and **64.7× per Newton step** at n=64,000. Also factors the Stokes saddle cuSolver calls *singular*, with smaller residuals. Needs the optional stack (`nvmath-python`, `cudss`, `cupy`); raises a clear `ImportError` otherwise. Fill-in still governs 3-D (69×→218× nnz growth at lap3d 20³–40³), so it moves the ceiling and makes **device memory** the binding constraint — it is not a substitute for a preconditioner  Two things happen automatically: a **block right-hand side** `(n, k)` is solved in one call (measured **2.7× at k=4 to 5.4× at k=16** over the same factorization solved column by column — this is what the shift-invert eigensolver's subspace iteration needs every sweep), and an exactly symmetric operator is factored as **LDLᵀ instead of general LU** (1.41× faster, **1.38× less peak device memory** on lap3d 40³). Symmetry is tested to within a few ulps rather than bitwise — an assembled FEM tangent for a symmetric form is symmetric only up to *assembly round-off* (a vector element block contracts components in a different order for `(a,i),(b,j)` than for `(b,j),(a,i)`, measured **0.25 ulps**), so a bitwise rule sent every vector and coupled problem down the general-LU branch. Within the gate the two triangles are **averaged**, a correction bounded by the asymmetry it removes and therefore no larger than the round-off already in the matrix; outside it nothing is touched. The margin is not a knife-edge: the weakest *genuine* asymmetry that can be constructed — an advection coefficient of 1e-12, meaningless beside the Laplacian — is already **191 ulps**. Measured end-to-end on a 3-D vector tangent, general → symmetric is **1.07–1.13×** at 3.4k–11.8k DOFs (growing with size) and **1.10–1.62×** on lap3d 20³–50³. The rest of the rule stands: symmetry is still tested and SPD is never inferred — a matrix symmetric only to ~1e-15 would otherwise be silently factored as `(A+Aᵀ)/2`, and a wrong SPD guess returns NaN. A singular operator **raises**: cuDSS signals it through neither an exception nor a NaN, returning a finite plausible vector instead |
 | **a Newton loop** (or no GPU / a factorization too big for device memory) | `lu(backend="pardiso")` | Intel MKL PARDISO, multithreaded CPU. **The fastest factorization of the four**, and like cuDSS it splits symbolic analysis from numeric factorization, so a Newton step reuses the analysis. On lap3d 50³ (n=125,000) against single-threaded SuperLU's 65,212 ms: factorization **298 ms**, Newton re-factorization **296 ms — 220×**, where cuDSS reaches 115×. Its adjoint is cheaper too — `Aᵀx = b` comes from the *same* factorization rather than a second one. An exactly symmetric operator uses LDLᵀ (1.9× on lap3d 50³, 13× on a saddle), which needs the upper triangle with an **explicit diagonal** — without that a saddle's constraint rows come back empty and PARDISO rejects the matrix. Like cuDSS it returns finite garbage on a singular operator, so jNO checks the perturbed-pivot count and **raises**. `pip install jax-numerical-operators[pardiso]`, x86-64 |
 | small systems / coarse blocks | `dense` | LAPACK, vmap-native |
 
@@ -1161,6 +1299,140 @@ its symmetry/definiteness); the converged solution is identical to full Newton's
 marker, `picard(damping=…)` is exactly damped Newton (`jno.solve.newton(damping=…)`). Caveat for inverse
 problems: implicit differentiation then also uses the lagged Jacobian — drop `lag` when exact parameter
 gradients matter more than per-step solvability.
+
+**Alternate minimization — `jno.solve.staggered([u, d])`.** Some coupled energies are **non-convex in
+the fields jointly but convex in each separately**. A monolithic Newton then has no descent guarantee
+and simply diverges; solving one field at a time turns the problem into a sequence of convex solves:
+
+```python
+sol = fem.solve(nonlinear=jno.solve.staggered([u, dm]))   # sweep u, then dm, until both converge
+```
+
+Variational phase-field fracture is the canonical case — `(1-d)²|∇u|²` is quartic in the pair, while
+`u` alone is a linear elasticity problem and `d` alone a linear elliptic one. Measured on the coupled
+damage form in `tests/test_fem_staggered.py`: `newton()` leaves with a residual around **1e+25** (it
+raises), and the staggered sweep converges to a genuine root of the *coupled* system. Fixed-stress Biot
+poroelasticity and thermo-mechanical staggering have the same shape.
+
+Algorithm: Bourdin, Francfort & Marigo, *Numerical experiments in revisited brittle fracture*, JMPS
+**48** (2000), §3 — as the staggered operator split with a history field, Miehe, Welschinger & Hofacker,
+IJNME **83** (2010).
+
+**`direct=True` factorizes each field's diagonal block** rather than solving it matrix-free, and pairs
+with a `linear=` slot:
+
+```python
+fem.solve(nonlinear=jno.solve.staggered([u, dm], direct=True), linear=jno.solve.lu(backend="pardiso"))
+```
+
+It exists because the matrix-free sub-solve **cannot be preconditioned**. A `precond=` spec materializes
+against an assembled operator, and a staggered sub-problem is a restriction *closure*
+(`x -> R(u with block set to x)[block]`) with no matrix, so an ill-conditioned block is solved by
+**unpreconditioned BiCGStab** — near-incompressible elasticity (ν → 0.5) being the usual victim. That
+was also why a direct `linear=` slot used to be refused against `staggered` outright: there was nothing
+to factorize.
+
+The extraction avoids a data-dependent `nnz` (which would break the static shapes a traced Newton
+needs): instead of slicing `J[b][:, b]` out, the *complement's* rows and columns are zeroed and given a
+unit diagonal, so the block is solved as `[[J_bb, 0], [0, I]]` against `[-r_b, 0]`. The padding is pure
+diagonal — no fill-in — so the factorization cost stays the block's. With `bounds`, the matrix handed to
+the factorization is the **min-map's** semismooth Jacobian (identity rows on the active set), which
+`jax.linearize` derives for free on the matrix-free path but an assembled tangent does not.
+
+Measured on a 3-D Yeoh phase-field march (576 DOFs, 8 load steps, CPU): **42.80 s → 10.78 s, 4.0×**, to
+the same answer. Two honest caveats: the **full** tangent is assembled to use one block of it (a
+sparsity-caching backend — `pardiso`/`cudss` — then pays only the numeric re-factorization per sweep),
+and on a well-conditioned problem the matrix-free default is cheaper. This is not a free upgrade and it
+is not the default. The load-path march threads the tangent too, which it previously never did: before
+this, a direct driver inside a `tau=` path silently fell back to the matrix-free inner solve.
+
+**`line_search=` globalizes each sub-solve's Newton steps**, and it is now on by default:
+
+| value | what it does |
+|---|---|
+| `"backtrack"` *(default)* | residual-norm Armijo, halving from `damping`. What this used to do under `line_search=True`. |
+| `True` | **exact** line search — bisect for the root of the directional derivative `R(x+λd)·d`, i.e. the minimizer of the energy along the Newton direction |
+| `False` | no line search; take `damping` |
+
+The default moved from `False` to `"backtrack"` because no line search is a genuine footgun on
+finite-strain forms: measured here, a 3-D Yeoh P2 march produced **NaN on load step 1** without one
+(the undamped step inverts an element, `det F ≤ 0`, and `J^(-2/3)` is NaN) and solved cleanly with one.
+
+`True` implements Heinzmann, Vicentini, Carrara et al., *Iterative convergence in phase-field brittle
+fracture computations: exact line search is all you need*, Computational Mechanics (2026),
+[arXiv:2511.23064](https://arxiv.org/abs/2511.23064), §3 Algorithm 2 — the same algorithm they
+contributed to PETSc as `SNESLineSearchBisection`. Their Props. 1–2 and Remark 4 chain into a
+convergence guarantee for the whole alternate-minimization scheme, provided each sub-problem is
+strictly convex and coercive (jNO's `bounds` min-map is semismooth, so that proof does not cover it —
+the same gap they note for reduced-space active sets).
+
+**It is not the default, because we have not measured it beating backtracking.** On the problems
+tested here — a 2-D SENT plate with and without a volumetric-deviatoric split, at several load levels —
+both need the same 21–22 staggered sweeps, and the exact search costs ~15% more wall time from the
+extra residual evaluations. Note the paper's own failure cases arise only where the *mechanical*
+sub-problem is non-linear (their §: the residual "reduces to an affine form in the absence of an energy
+decomposition"), at critical load steps reached along a path — a regime not reproduced here. Reach for
+`True` when a sub-solve stalls; the theory is on its side even where our measurements are neutral.
+
+**`over_relax=ω` accelerates the sweep itself.** Alternate minimization *is* a nonlinear block
+Gauss–Seidel iteration, so over-relaxation accelerates it exactly as it does the linear one — go `ω`
+times as far along each sub-step's own update direction, per block:
+
+```python
+fem.solve(nonlinear=jno.solve.staggered([u, dm], over_relax=1.4))
+```
+
+Algorithm: Farrell & Maurini, *Linear and nonlinear solvers for variational phase-field models of
+brittle fracture*, IJNME **109** (2017) 648–667, **Algorithm 2 (ORAM), §2.1**. `ω = 1` is plain
+alternate minimization. Kahan's classical bound gives `ω ∈ (0, 2)` as necessary for SOR to converge, and
+anything outside raises.
+
+**Whether it pays is problem-dependent, and there is no way to know in advance.** The paper is explicit —
+they "rely on the naïve strategy of numerical experimentation on coarser problems" and defer automatic
+selection to future work. Their own results split cleanly: Table I (a propagating crack, where AM
+converges slowly) gains **58–73% fewer iterations**; Table II (where AM already converges fast) gets
+**0% — over-relaxation hinders it**, going 37 → 111 → 185 → 326 → 747 iterations as ω runs 1.0 → 1.8.
+On a 2-D small-strain phase-field problem that drives damage to 1, ω = 1.4 was **1.95× faster**
+(3096 → 1587 ms, warm median of 3). So it defaults to 1, and a short ω sweep on a coarse version of the
+problem is the only way to know — the paper's own two tables disagree with each other.
+
+**ω cannot diverge.** The extrapolation is not taken on trust: the step retreats by bisection on
+`[1, ω]` until the trial point has a **finite** residual and is **feasible**, and `ω = 1` is the
+sub-solve's own converged answer, already evaluated and therefore admissible by construction. So the
+worst case is that the sweep degrades to plain alternate minimization. This matters most on
+finite-strain forms, where an unguarded step past a converged answer inverts an element (`det F ≤ 0`,
+so `J^(-2/3)` is NaN) — measured on the 3-D Yeoh SENT march, which NaN'd on load step 1 at *every* ω
+down to 1.1 before the guard and runs to completion with it.
+
+The test is finiteness and feasibility, **not** descent. Over-relaxation is deliberately not a descent
+method, so demanding a residual decrease would reject almost every ω > 1 and silently collapse the
+feature back to ω = 1 while appearing to keep it. Feasibility is the paper's own rule (§2.1 backs ω off
+by bisection on `[1, ω]` for the bound constraint); finiteness is the generalization.
+
+Over-relaxation also acts on the **free** DOFs only. Farrell & Maurini's `ũ` lives in the constrained
+space `C_ū`, where a prescribed DOF has `δ = 0`; jNO imposes essential conditions as residual rows, so
+without the mask the sub-solve's exact hit on the prescribed value gets extrapolated past — measured on
+one row with `g = 2`, ω = 1.7 gave 3.40 → 1.02 → 2.69, an oscillation decaying only as `|1−ω|ᵏ`, worst
+on a *ramped* condition where `g` moves every load step.
+
+Cost when ω ≠ 1: one extra full residual evaluation per block per sweep.
+
+Under `bounds`, over-relaxation steps *past* the sub-solve's answer — which is feasible by construction,
+while the extrapolation need not be — so the driver takes the box projector from the `bounds` wrapper and
+clips. That deviates from the paper, which backs the scalar `ω` off to the largest feasible value;
+clipping is componentwise, also feasible, and keeps more of the step.
+
+**The trade is the convergence rate, and it is not small.** Alternate minimization converges *linearly*
+where Newton is quadratic, so it can need hundreds of sweeps near a propagating crack — hence the
+`max_sweeps=200` default. It buys robustness, not speed: where Newton converges, Newton is the better
+choice (Farrell & Maurini, CMAME **312**, 2017, compare the two directly). Sweeping is Gauss-Seidel, so
+the **order matters**, and every field block must be listed — an unlisted field's equations would never
+be solved, which is rejected rather than skipped. Each field is solved alone; sweeping a *group* of
+fields together (a Stokes velocity/pressure pair inside one sweep) is not wired.
+
+Differentiable in the ordinary way: at convergence the full residual is zero, so the sweep is just a way
+of *finding* that root and `lax.custom_root` supplies the gradient from the full Jacobian — the
+alternating structure is absent from the derivative by construction.
 
 **Sparse-direct Newton — `jno.solve.newton(direct=True)`.** The default Newton solves each linear step
 **matrix-free** (BiCGStab on the JVP), which stalls on an **indefinite / ill-conditioned** tangent with no
@@ -1593,6 +1865,122 @@ auto-buffered from the solved `u` — no `.evolves`; an **internal** state read 
 **Scope:** small-strain, isotropic, linear-hardening; 3-D (2-D is plane strain). Kinematic / nonlinear
 hardening and contact are separate (not built).
 
+**A state can be shared by a coupled system.** The march is not single-field: history buffers are indexed
+by *cell*, never by field, and the readout gathers every field's cell DOFs at once — so a state written
+by one field and read by another is the same march. That is the phase-field / gradient-damage shape,
+where an irreversible history `H = max_τ ψ⁺(u)` couples a displacement field to a damage field:
+
+```python
+psi = 0.5 * inner(grad(u, X), grad(u, X), 1)                 # driving force, from the u field
+deg = (1 - dm)**2 + eta                                      # degradation, from the dm field
+jno.fem([
+    deg * inner(grad(u, X), grad(phi, X), 1) - load(tau)*phi,        # equilibrium      (test phi)
+    (gc/l)*dm*q + gc*l*inner(grad(dm, X), grad(q, X), 1)
+        - 2*(1 - dm)*Hs.i(-1)*q,                                     # damage evolution (test q)
+    Hs.evolves(maximum(Hs.i(-1), psi)),                              # irreversibility  (a named update)
+    u(*bc) - 0.0,
+]).solve()                                                           # nothing passed
+```
+
+The running `maximum` is what makes it irreversible: at zero load the damage is retained rather than
+healing. Note the block order is *first appearance in the term walk* — here `dm` precedes `u`, because the
+degradation factor is written first — so resolve a block with `fem.block_index(dm)`, never a hardcoded
+index.
+
+A form that is **linear in every unknown** but reads `.i(k)` marches too — the AT1 damage equation with a
+fully lagged driving force is exactly that shape. Each load step is a different linear system whose
+coefficients the buffers set, so it routes through the same residual operator as the nonlinear march
+(Newton converges in one step on a linear residual). You pay roughly one extra linear solve per step
+versus a pure linear assembly, in exchange for one march path rather than two.
+
+The coupled march is differentiable in a material parameter, exactly as the single-field one is: thread a
+`jno.np.parameter` into the form and `∂trajectory/∂θ` flows through the whole scan. The same holds for a
+coupled *steady* **nonlinear** form. What still refuses a runtime parameter is a coupled form that is
+**linear and carries no history**, because that one assembles as a matrix/rhs pair and the coupled linear
+assembly has no parametric route; anything on the residual path re-evaluates at the runtime args and is
+field-agnostic.
+
+Not carried, each rejected with a clear error: a real `u.t` transient (drive time through `tau` instead),
+a complex form, 1D, non-nodal (Argyris/Morley/edge) elements, VPINN, and periodic ties.
+
+**A step that did not converge is refused, not carried forward.** The march runs its per-step Newton
+inside a single `lax.scan`, and the driver's own convergence check needs a *concrete* residual — so
+inside the scan it disables itself, exactly where the signal matters most. A load path compounds the
+loss: a non-converged step becomes the next step's initial state *and* its history buffers, so one
+silent failure contaminates everything after it, and the trajectory still comes back finite and
+entirely plausible. Measured on a 3-D Yeoh phase-field march whose undamped Newton overshot into an
+inverted element (`J = det F ≤ 0`, so `J**(-2/3)` is NaN, which is absorbing): with the grip *pinned*
+to 0.4 the returned displacement read 0.70, with no error raised.
+
+So the per-step residual is carried out of the scan and tested where it is concrete, against the
+driver's **own** `rtol`/`atol` — the net can only catch what the driver would have caught eagerly, and
+never second-guesses a solve configured loosely. Under `bounds` it scores the **min-map**, not the bare
+residual: on an active constraint that residual is non-zero by construction (it *is* the multiplier),
+and scoring against it would read a correct answer as a divergence. The check costs two residual
+evaluations per step — measured at **2.4%** (30.30 s → 31.03 s) of an 8-step, 576-DOF Yeoh march. It is
+a no-op under `jax.grad` of a runtime-parametric march, where the norms are themselves traced; there,
+as everywhere else in jNO, the solver's iteration cap is all there is.
+
+The error names the fixes in order of what usually works: globalize the per-step solve
+(`jno.solve.newton(line_search=True)` / `staggered(line_search=True)`, or `damping<1`), take smaller
+steps (a finer `domain(tau=(...))` grid, or the adaptive path below), or raise `max_steps`. In the Yeoh
+case above, `line_search=True` alone recovers the exact answer — and note P1 solves the same form
+undamped: a higher-order element's full Newton step produces larger gradients at its extra quadrature
+points, so P2 is the more exposed one.
+
+**Adaptive load stepping — `fem.solve(tau=jno.solve.adaptive(limit=...))`.** A uniform load grid is
+wrong in both directions at once: it wastes steps while nothing happens and takes too-large ones through
+the event. On a path-dependent march that second failure is not merely coarse — a step can converge
+perfectly and skip the entire transition, leaving a valid sequence of equilibria with no resolved event
+between them, which is a *different* answer, not a coarser one.
+
+```python
+sol = fem.solve(tau=jno.solve.adaptive(limit=0.05))            # bound every DOF's per-step change
+sol = fem.solve(tau=jno.solve.adaptive(limit=[(dm, 0.05)]))    # per field — the usual case
+```
+
+The criterion is deliberately not the transient's. A rate-independent load path has **no local
+truncation error to estimate** — each step is an equilibrium, not an approximation to a trajectory — so
+the `rtol`/`atol` step-doubling estimate that sizes `time=` measures nothing here. `limit` bounds how
+much the solution may change in one step; a step is rejected (and cut by `shrink`) when the solve fails
+to converge *or* the change exceeds `limit`, and a comfortable step grows by `grow`.
+
+Mechanism: **pilot → freeze → replay**. March eagerly with rejection to discover the schedule, freeze
+it, replay it as a fixed-length differentiable scan. Rejection is exactly why the pilot must be
+separate: the transient marcher accepts every attempt on purpose, because a discarded state makes the
+per-step adjoint run at zero cotangent and returns a NaN gradient. The replay has nothing to reject.
+The schedule is piecewise constant in the parameters, so the gradient over a frozen one is the true
+derivative almost everywhere — the same contract `adapt=` makes for a frozen mesh sequence.
+
+The trajectory is resampled back onto the domain's declared `tau=` grid (as the transient resamples onto
+`save_ts`), so the returned shape does not depend on the steps taken and the resampling error is bounded
+by `limit` itself. `fem.tau_schedule` reports what the pilot chose.
+
+**A parametric form refuses to pilot, by design.** The pilot needs concrete values to accept or reject a
+step and a differentiable solve hands it tracers; piloting at the parameters' *stored* values would
+silently adapt to whatever they happen to be — 0.0 for a fresh `jno.np.parameter`, i.e. a load path that
+never happened. Discover the schedule forward, then replay it:
+
+```python
+fem.solve(tau=jno.solve.adaptive(limit=0.05))   # forward, at the values you want
+fem.solve(tau=fem.tau_schedule)                 # differentiable replay of that schedule
+```
+
+`tau=<array>` accepts any strictly increasing grid spanning the declared path, so it doubles as the
+"non-uniform grid I chose myself" spelling. Not composable with a per-load-step field
+(`freeze_path(frames)`), whose frames are indexed by the declared step count.
+
+Note what adaptivity does **not** fix. If the step is cut to the floor and the change still exceeds
+`limit`, that is an **unstable branch**, not a step that is merely too big: under load control a
+snap-back has no nearby equilibrium, so no refinement finds one. The error says so and points at
+displacement/arc-length control, which is a different instrument and is not built.
+
+Keep `dm` in range with [`dm.bounds(0, 1)`](#inequalities--uboundslo-hi), which composes with the march.
+Note that the bound does **not** replace the floor `eta` on the degradation: at `dm = 1` exactly,
+`(1-dm)²` makes the displacement block singular, so the floor is a well-posedness requirement in its own
+right. And a monolithic Newton is not expected to converge on this energy at all — drive it with
+[`jno.solve.staggered([u, dm])`](#choosing-the-solver--the-slot-api-jnosolve--jnoprecond).
+
 **Finite strain is also just a formula.** Tensor constants broadcast correctly (`jno.np.identity(n)` carries
 a leading batch axis), so `F = I + ∇u`, `E = ½(FᵀF − I)`, `S = λ tr(E) I + 2μ E` and the internal virtual
 work `∫ (F S):∇δu` are written directly — St. Venant-Kirchhoff in five lines, no module:
@@ -1606,6 +1994,36 @@ mech = inner(einsum("...ij,...jk->...ik", F, S), H(phi), 2)      # ∫ (F S):∇
 
 `jno.fem` routes the nonlinear form to Newton (exact 20%-stretch patch test; reduces to linear elasticity
 as strain → 0). Combine with the plastic return map for finite-strain plasticity — both are formulas.
+
+**A hyperelastic material IS its stored energy — `jno.np.diff(psi, F)`.** For anything past St. Venant-
+Kirchhoff, hand-deriving the stress is where the algebra errors live. `diff` differentiates a **scalar
+expression with respect to another expression** (the constitutive counterpart of `grad`, which
+differentiates w.r.t. a coordinate), so you write the energy from the paper and get the 1st
+Piola-Kirchhoff stress:
+
+```python
+det, trace, einsum, jac, I = jno.np.det, jno.np.trace, jno.np.einsum, jno.np.jacobian, jno.np.identity(3)
+F   = I + jac(u, X)                                     # bind it ONCE, then reuse
+I1b = det(F)**(-2/3) * trace(einsum("...ki,...kj->...ij", F, F))    # first isochoric invariant
+psi = C10*(I1b - 3) + C20*(I1b - 3)**2 + C30*(I1b - 3)**3           # Yeoh, 3rd order
+mech = inner(jno.np.diff(psi, F), jac(phi, X), 2)       # P = ∂psi/∂F, then ∫ P:∇δu
+```
+
+Measured: on a Yeoh solid this reproduces the hand-derived `S = 2 ∂psi/∂C`, `P = F S` residual
+**bit-for-bit**, and the Neo-Hookean `P = μ(F − F⁻ᵀ) + λ ln(J) F⁻ᵀ` to 1e-11. The consistent tangent
+`∂P/∂F` comes out of the assembler's own element differentiation — you never write it.
+
+Two scope limits, both fail-loud rather than silent:
+
+* **It is pointwise.** The derivative is taken independently at each quadrature point, which is what a
+  constitutive law is; an `Integral` inside the target is refused (differentiate the integrand, then
+  integrate).
+* **`wrt` is matched by identity.** Bind `F` to a variable and pass that same object. A rebuilt copy
+  (`diff(psi, I + jac(u, X))` written inline) is a different node, and rather than differentiate to a
+  silent zero it raises.
+
+Any energy-derived law works the same way — Mooney-Rivlin, Ogden, Gent, anisotropic tissue models — as
+does a chemical potential `mu = diff(f, c)` or an electro/magnetostrictive coupling.
 
 ---
 
@@ -1685,8 +2103,8 @@ unaffected. Full detail is inline in the sections above.
   needs a direct linear solve; you write the radiosity and couple it yourself.
 - **Plasticity is small-strain, isotropic, linear-hardening, whole-domain.** Deformation theory
   (monotonic / proportional) and the path-dependent flow-theory **`tau=` load-path march** both run
-  today; the march assembles on the real, steady, single-field native-Lagrange path only (not
-  transient / complex / multifield / non-nodal / periodic — each rejected with a clear error). The
+  today; the march assembles on the real, steady native-Lagrange path — **single-field or coupled**
+  (not transient / complex / 1D / non-nodal / periodic — each rejected with a clear error). The
   internal-state readout runs on every cell (sub-region-restricted plasticity is not wired). Kinematic /
   nonlinear (Voce) hardening and contact are separate formulas / machinery, not built.
 

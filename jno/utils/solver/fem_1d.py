@@ -63,6 +63,7 @@ from jax.flatten_util import ravel_pytree
 
 from .fem_utils import (
     _eval_integrand,
+    bcoo_eliminate_dirichlet,
     bcoo_set_dirichlet_rows,
     bcoo_set_unit_diag,
     bcoo_zero_rows,
@@ -685,37 +686,66 @@ def _apply_dirichlet_symmetric(A, b, dirichlet_pairs: List[Tuple[int, float]]):
     return A, b
 
 
-def _apply_dirichlet_rows(residual_free, dirichlet_pairs: List[Tuple[int, float]]):
-    """Wrap a free residual so Dirichlet rows read ``u[d] - g`` (row-replacement).
+def dirichlet_projection(dirichlet_pairs: List[Tuple[int, float]]):
+    """``(dofs, vals, project)`` for symmetric Dirichlet elimination on a residual path.
 
-    Used for the nonlinear residual: the tangent row becomes the identity and the
-    Newton step drives ``u[d] -> g``.
+    ``project(u)`` is ``P(u) = M·u + (I−M)·g`` — the projection onto the constraint set, with ``M``
+    the mask that is 0 on constrained DOFs. Evaluating the free residual at ``P(u)`` rather than at
+    ``u`` is what zeroes the constrained *columns* of the tangent; see
+    :func:`_apply_dirichlet_projected`."""
+    dofs = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32)
+    vals = jnp.asarray([p[1] for p in dirichlet_pairs])
+
+    def project(u_flat):
+        u_flat = jnp.asarray(u_flat)
+        return u_flat.at[dofs].set(vals.astype(u_flat.dtype))
+
+    return dofs, vals, project
+
+
+def _apply_dirichlet_projected(residual_free, dirichlet_pairs: List[Tuple[int, float]]):
+    """Wrap a free residual so the constrained system is eliminated **symmetrically**:
+
+        R(u) = M · R_free(P(u))  +  (I − M) · (u − g)
+
+    The constrained rows still read ``u[d] − g``, so the root is exactly the one row-replacement
+    finds. The difference is the *columns*: evaluating ``R_free`` at the projected point makes
+    ``∂R/∂u = M · J(P(u)) · M + (I − M)`` — **symmetric** whenever the free operator is, where plain
+    row replacement leaves the constrained columns populated and hands every direct backend a matrix
+    that fails its (deliberately bitwise) symmetry test, so an SPD problem is factored as a general
+    LU. It also puts ``cg``/``minres`` back in reach.
+
+    No requirement on the starting iterate: the projection *is* the lift that
+    :func:`_apply_dirichlet_symmetric` performs with ``b − A@e`` on the linear path, so an ``x0`` that
+    violates the boundary values is handled exactly. If anything the iteration is better conditioned —
+    ``R_free`` is now always sampled at a point that satisfies the BC.
 
     ``residual_free`` takes the state ALONE. That single-argument contract is deliberate: this helper
     is shared with the non-nodal and native assemblers, whose free residuals have *different* trailing
     signatures (``R(u, args)`` in one, ``R(u, t=0.0, args=None)`` in the other) — so a wrapper that
     forwarded a second positional would bind it to ``t`` in the native case and silently evaluate the
     form at the wrong time rather than fail. A caller that needs runtime args closes over them and
-    wraps per call, ``_apply_dirichlet_rows(lambda uu: free(uu, args), pins)(u)``, which is what the
-    parametric paths here and in ``fem_nonnodal`` do."""
+    wraps per call, ``_apply_dirichlet_projected(lambda uu: free(uu, args), pins)(u)``, which is what
+    the parametric paths here and in ``fem_nonnodal`` do."""
     if not dirichlet_pairs:
         return residual_free
-    dofs = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32)
-    vals = jnp.asarray([p[1] for p in dirichlet_pairs])
+    dofs, vals, project = dirichlet_projection(dirichlet_pairs)
 
     def residual(u_flat):
-        R = residual_free(u_flat)
+        u_flat = jnp.asarray(u_flat)
+        R = residual_free(project(u_flat))
         return R.at[dofs].set(u_flat[dofs] - vals.astype(u_flat.dtype))
 
     return residual
 
 
 def _sparse_dirichlet_jacobian(residual_obj, dirichlet_pairs: List[Tuple[int, float]]):
-    """``(u, args) -> BCOO``: the assembled tangent of the Dirichlet-row-replaced residual.
+    """``(u, args) -> BCOO``: the assembled tangent of the Dirichlet-eliminated residual.
 
-    The matrix-level companion of :func:`_apply_dirichlet_rows` — the free tangent comes from the
-    residual's own element scatter (``sparse_jacobian``), and each pinned row becomes an identity row,
-    which is exactly what differentiating ``u[d] - g`` gives.
+    The matrix-level companion of :func:`_apply_dirichlet_projected` — the free tangent comes from the
+    residual's own element scatter (``sparse_jacobian``), evaluated at the PROJECTED state, with the
+    pinned rows *and columns* eliminated. That is exactly what differentiating
+    ``M·R_free(P(u)) + (I−M)(u−g)`` gives, and it keeps the tangent symmetric when the form is.
 
     ``newton_direct`` documents its tangent as an **assembled BCOO**. 1-D handed it a global
     ``jax.jacfwd`` instead, which is ``O(N^2)`` on the one dimension where node counts are meant to be
@@ -723,11 +753,18 @@ def _sparse_dirichlet_jacobian(residual_obj, dirichlet_pairs: List[Tuple[int, fl
     ``BCOO.fromdense`` on a tracer, whose ``nse`` cannot be concrete, so every
     ``newton(direct=True)`` solve died with a ``ConcretizationTypeError``.
     """
-    dofs = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32) if dirichlet_pairs else None
+    if not dirichlet_pairs:
+
+        def jacobian_free(u, args=None):
+            return residual_obj.sparse_jacobian(jnp.asarray(u), args)
+
+        return jacobian_free
+    dofs, _vals, project = dirichlet_projection(dirichlet_pairs)
 
     def jacobian(u, args=None):
-        A = residual_obj.sparse_jacobian(jnp.asarray(u), args)
-        return A if dofs is None else bcoo_set_dirichlet_rows(A, dofs)
+        # At the PROJECTED state, to match where `_apply_dirichlet_projected` samples the free form.
+        A = residual_obj.sparse_jacobian(project(u), args)
+        return bcoo_eliminate_dirichlet(A, dofs)
 
     return jacobian
 
@@ -841,7 +878,7 @@ def assemble_fem_1d(
         # inside a `lax.while_loop`, where a dense tangent cannot be sparsified (see
         # :func:`_sparse_dirichlet_jacobian`).
         def res_p(u, args=None):
-            return _apply_dirichlet_rows(lambda uu: residual_free(uu, args), dirichlet_pairs)(jnp.asarray(u))
+            return _apply_dirichlet_projected(lambda uu: residual_free(uu, args), dirichlet_pairs)(jnp.asarray(u))
 
         op = FemResidualOperator(
             residual_fn=res_p,
@@ -1127,7 +1164,7 @@ def _assemble_1d_transient(
         # runtime args each step — so a parameter threads a nonlinear transient too (the mass stays
         # parameter-free, guarded above).
         def res_pt(u, t, args=None):
-            return _apply_dirichlet_rows(lambda uu: spatial_res(uu, args), dirichlet_pairs)(jnp.asarray(u))
+            return _apply_dirichlet_projected(lambda uu: spatial_res(uu, args), dirichlet_pairs)(jnp.asarray(u))
 
         dofs = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32) if dirichlet_pairs else None
         # the mass is a BCOO now, which has no `.at[]` — zero the constrained rows/cols sparsely
@@ -1575,12 +1612,12 @@ def assemble_fem_1d_multifield(
     )
 
     if any(_is_obviously_nonlinear_in_unknown(domain, t) for t in all_terms):
-        # `_apply_dirichlet_rows` keeps a single-argument contract on purpose (it is shared with
+        # `_apply_dirichlet_projected` keeps a single-argument contract on purpose (it is shared with
         # `fem_nonnodal` and `fem_native`, whose free residuals have different trailing signatures —
         # threading `args` through it would bind `args` to `t` in the native one and silently evaluate
         # the form at the wrong time). Parametric callers close over `args` and wrap per call.
         def res_p(u, args=None):
-            return _apply_dirichlet_rows(lambda uu: residual_free(uu, args), dirichlet_pairs)(jnp.asarray(u))
+            return _apply_dirichlet_projected(lambda uu: residual_free(uu, args), dirichlet_pairs)(jnp.asarray(u))
 
         op = FemResidualOperator(
             residual_fn=res_p,
@@ -1869,7 +1906,7 @@ def _assemble_1d_multifield_transient(
 
     all_terms = list(volume_terms) + [t for ts in boundary_terms.values() for t in ts]
     if any(_is_obviously_nonlinear_in_unknown(domain, t) for t in all_terms):
-        residual = _apply_dirichlet_rows(spatial_res, dirichlet_pairs)
+        residual = _apply_dirichlet_projected(spatial_res, dirichlet_pairs)
         dofs = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32) if dirichlet_pairs else None
         # the mass is a BCOO now, which has no `.at[]` — zero the constrained rows/cols sparsely
         # (mirrors the linear branch); a dense fallback keeps the old indexing path.

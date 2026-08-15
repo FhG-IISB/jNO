@@ -5,6 +5,9 @@ from typing import Any
 from ...trace import (
     Assembly,
     BinaryOp,
+    BoundConstraint,
+    Diff,
+    DiffSlot,
     FunctionCall,
     GroupedAssembly,
     Hessian,
@@ -89,6 +92,26 @@ def iter_children(node: Any):
         inner = getattr(node.target, "_expr", None)
         if isinstance(inner, Placeholder):
             yield inner
+        return
+
+    if isinstance(node, Diff):
+        # Both children matter: `target` carries the trial (a hyperelastic energy depends on u through
+        # `wrt`), and `wrt` is itself an expression in the trial. Yield both so trial/field detection and
+        # the nonlinearity classifier see straight through the derivative.
+        yield node.target
+        yield node.wrt
+        return
+
+    if isinstance(node, DiffSlot):
+        # Leaf: a value injected at evaluation time, wraps no traced sub-expression.
+        return
+
+    if isinstance(node, BoundConstraint):
+        # Only the bounded FIELD is a traced child, so a bound term still reports the unknown it
+        # constrains. `lo`/`hi` are deliberately NOT yielded: they are resolved in DOF space at solve
+        # time, and walking them would let a `u.i(-1)` bound be mistaken for a quadrature-point history
+        # read and allocate a buffer nothing consumes.
+        yield node.target
         return
 
     if isinstance(node, Tracker):

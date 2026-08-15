@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Tuple, cast
 from ...trace import (
     Assembly,
     BinaryOp,
+    Diff,
     FunctionCall,
     GroupedAssembly,
     Hessian,
@@ -598,6 +599,12 @@ def _is_obviously_nonlinear_in_unknown(domain, expr):
     # per-element tangent cannot express the gap's coupling to the main body at all. The dependence
     # is structural (a gap is by definition a function of the displacement), so mark it here.
     if isinstance(expr, Variable) and isinstance(getattr(expr, "tag", None), str) and expr.tag.startswith("gap_"):
+        return True
+
+    # `diff(psi, F)` is a derivative of the unknown's energy, so it is nonlinear in the unknown whenever
+    # `F` is (a hyperelastic P = dpsi/dF always is). Structural, like the gap above: the assembled-linear
+    # path would build a tangent at u=0 and be silently wrong for every stretch but zero.
+    if isinstance(expr, Diff) and _contains_unknown_symbol(domain, expr.wrt):
         return True
 
     if isinstance(expr, BinaryOp):
