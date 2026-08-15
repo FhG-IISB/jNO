@@ -2047,24 +2047,29 @@ solve slower, so compare **build + solve**, and remember jNO assembles *once* wh
 assembler pays again on every Newton iteration.
 
 Most of a cold build is **XLA compilation**, and the cost is fixed per problem *structure* rather than
-per DOF — a 15x larger mesh still compiles about the same number of programs. That makes it worth
-caching across processes, which is **opt-in**:
+per DOF — a 15x larger mesh still compiles about the same number of programs. Two caches attack it,
+both **on by default**:
 
-```python
-dire = jno.setup(__file__, compile_cache=True)     # or, per project, in .jno.toml:
-                                                   #   [jno]
-                                                   #   compile_cache = true
-```
+**Across processes** — the persistent XLA cache (`~/.cache/jno/xla`), enabled at `import jno`:
 
 | 3-D Poisson, 27,833 nodes | first build | repeat build |
 |---|---|---|
-| default (no cache) | 4.75 s | 2.48 s |
-| `compile_cache=True` | **2.22 s** | **1.51 s** |
+| no cache | 4.75 s | 2.48 s |
+| persistent cache (default) | **2.22 s** | **1.51 s** |
 
-**Off by default on purpose**, for two reasons: a library should not write to your disk uninvited, and
-the run that *populates* the cache is **slower** than having none at all — so a single cold run is a
-straight loss. Turn it on for anything you run more than once: a sweep, an optimisation loop, a test
-suite, or simply re-running a script after an edit.
+The very first run on a machine is *slower* (populating the cache costs more than not having one);
+it pays back from the second process onward, which is jNO's normal life — sweeps, optimisation
+loops, test suites, re-running a script after an edit. Opt out with `JNO_COMPILE_CACHE=0`,
+`jno.setup(__file__, compile_cache=False)`, or per project in `.jno.toml`: `[jno] compile_cache =
+false`.
+
+**Within a process** — rebuilding an *identical* problem (same mesh content, same terms) reuses the
+already-compiled assembly kernels outright, keyed on content rather than object identity, so a
+rebuild costs meshing plus host prep and **no XLA work at all** (measured: 1.94 s → 0.28 s on 3-D
+Poisson at 29k nodes). Anything that changes the operator — a different mesh, a different
+coefficient — recompiles exactly the kernels that bake it. Structure that a tokenizer cannot key by
+value simply never caches (a safe miss); the coverage is measurable, not guessed
+(`jno.utils.solver.fem_utils._ELEM_MAP_STATS`).
 
 ---
 
