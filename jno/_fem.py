@@ -1249,6 +1249,21 @@ class FEM:
             return None
         return [slice(int(off[i]), int(off[i + 1])) for i in range(len(off) - 1)]
 
+    @property
+    def stats(self) -> "dict | None":
+        """What the last :meth:`solve` did — observability without changing the solve's return.
+
+        ``None`` before any solve. Afterwards a dict with ``mode``, ``dofs``, ``wall_s`` (dispatch
+        time of the solve call — JAX is async; block on the result for compute time), the ``linear``
+        and ``precond`` slot reprs, ``nonlinear`` (driver name, final residual norm against its
+        bound, step count where the driver runs its loop eagerly — ``newton_direct`` reports steps,
+        the traced-loop drivers report ``None``), and ``amgx_cache`` (AmgX solver-cache occupancy)
+        when jaxamg served the solve. Populated on eager paths; a solve wrapped whole in
+        ``jit``/``vmap``/``grad`` records the slots but no residuals — the same concrete-only
+        self-disabling as the convergence guards.
+        """
+        return getattr(self, "_stats", None)
+
     def block_index(self, field) -> int:
         """Resolve a trial symbol (or plain index) to its position in :attr:`blocks` /
         :attr:`offsets` — the field order is first appearance in the ``jno.fem`` constraints."""
@@ -1452,11 +1467,41 @@ class FEM:
                 result._fem_ref = self
             return result
 
+        def _run_with_stats():
+            import sys as _sys
+            import time as _time
+
+            from .utils.solver.newton_krylov import LAST_NEWTON_STATS
+
+            LAST_NEWTON_STATS.clear()
+            t0 = _time.perf_counter()
+            result = _run()
+            self._stats = {
+                "mode": self._mode,
+                "dofs": self.dofs,
+                # Dispatch time of the solve CALL: JAX is async, so for a compiled eager solve this
+                # includes compute only if something blocked; block on the result for compute time.
+                "wall_s": _time.perf_counter() - t0,
+                "linear": repr(linear) if linear is not None else "default",
+                "precond": repr(precond) if precond is not None else None,
+                # Written by the drivers' eager convergence check; empty under jit/vmap/grad, where
+                # the check self-disables -- the same silence the guard itself has.
+                "nonlinear": dict(LAST_NEWTON_STATS) or None,
+            }
+            if "jaxamg" in _sys.modules:  # AmgX solver-cache summary, only if jaxamg is in play
+                try:
+                    info = _sys.modules["jaxamg"].get_solver_cache_info()
+                    gpu = info.get("single_gpu", {})
+                    self._stats["amgx_cache"] = {"size": gpu.get("size"), "capacity": gpu.get("capacity")}
+                except Exception:  # noqa: BLE001 -- observability must never fail a solve
+                    pass
+            return result
+
         if not profile:  # profile=True: run the (eager) solve inside a JAX Perfetto trace + print a summary
-            return _run()
+            return _run_with_stats()
         from .utils.profiling import profile_solve
 
-        return profile_solve(_run, label=f"fem profile · {self.dofs} DOFs · {self._mode}", warm=(adapt is None))
+        return profile_solve(_run_with_stats, label=f"fem profile · {self.dofs} DOFs · {self._mode}", warm=(adapt is None))
 
     #: relative residual of the FULL system above which a ``basis=`` solve is refused. Not a tuning
     #: knob: at this size the basis does not span the solution at all (a modelling error), rather than
