@@ -134,6 +134,45 @@ def test_parametric_rebuild_hits_and_solves_per_args():
     assert d["misses"] == 0 or d["content_hits"] > 0, f"parametric rebuild shared nothing: {d}"
 
 
+def test_multifield_rebuild_hits():
+    """Taylor-Hood Stokes with a pressure pin — the case that exposed two per-build counters leaking
+    into content keys (`field_key` dict keys, and `p.pin()`'s counter-suffixed tag name). A
+    PolygonDomain (shapely-built) also exercises the domain-token MRO walk."""
+    pytest.importorskip("shapely", reason="shapely required for the box domain")
+    from shapely.geometry import box
+
+    def build():
+        inner_, grad, trace = jno.np.inner, jno.np.grad, jno.np.trace
+        d = jno.domain(box(0.0, 0.0, 4.0, 1.0), mesh_size=0.35)
+        u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)
+        p, q = d.fem_symbols(names=("p", "q"), order=1)
+        xi, yi, _ = d.variable("interior", split=True)
+        xb, yb, _ = d.variable("boundary", split=True)
+        gu, gv = grad(u, [xi, yi]), grad(v, [xi, yi])
+        pp, qq = p.bind(x=xi, y=yi), q.bind(x=xi, y=yi)
+        fem = jno.fem(
+            [
+                1.0 * inner_(gu, gv, n_contract=2) - pp * trace(gv),
+                -qq * trace(gu),
+                u(xb, yb)[0] - yb * (1 - yb),
+                u(xb, yb)[1] - 0.0,
+                p.pin(),
+            ]
+        )
+        _ = np.asarray(fem.b)
+        return fem
+
+    f1 = build()
+    before = _snap()
+    f2 = build()
+    d = _delta(before)
+    assert d["misses"] == 0 and d["content_hits"] > 0, f"multifield rebuild recompiled: {d}"
+    s1 = np.asarray(f1.solve(linear=jno.solve.lu(backend="host")))
+    s2 = np.asarray(f2.solve(linear=jno.solve.lu(backend="host")))
+    # float32 direct solve on a saddle: independent builds measured ~1e-5 apart even pre-cache.
+    assert np.linalg.norm(s1 - s2) / np.linalg.norm(s1) < 1e-3
+
+
 def test_bail_is_observable_not_silent():
     """The tokenizer's coverage is MEASURED: whatever it cannot key lands in the bail tally, so a
     problem class that never caches is a visible number, not a mystery slowdown."""
