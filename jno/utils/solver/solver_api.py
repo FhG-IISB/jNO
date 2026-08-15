@@ -457,6 +457,21 @@ def materialize_precond(spec: Any, ctx: PrecondContext) -> Callable:
     )
 
 
+def _iter_specs(spec):
+    """Every spec in a (possibly nested) preconditioner tree, duck-typed: ``.spec`` is a wrapper
+    (``cached``), ``.pairs`` a block preconditioner's ``(field, spec)`` list. Used to reach hooks
+    like ``refresh_from`` wherever they sit -- a solution-dependent Schur form typically lives one
+    level down, inside ``triangular``'s pressure pair."""
+    if spec is None:
+        return
+    yield spec
+    inner = getattr(spec, "spec", None)
+    if inner is not None:
+        yield from _iter_specs(inner)
+    for pair in getattr(spec, "pairs", None) or ():
+        yield from _iter_specs(pair[1])
+
+
 def prepare_precond(spec: Any, fem: Any) -> None:
     """Run a spec's eager preparation (optional ``spec.prepare(fem)``) once, at compose time.
 
@@ -810,6 +825,17 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
             return solver(op, rhs, M=M)
 
     def _composed(residual_fn, u0, *, jacobian=None, project=None):
+        # Solution-dependent preconditioner refresh -- the Picard lag. Every Newton driver's loop is
+        # a ``lax.while_loop``, so the per-step iterate is a tracer no host assembly can see; the
+        # solve's ENTRY iterate (warm start / previous march step) is the one concrete solution a
+        # solution-dependent auxiliary form can be assembled from, and it is refreshed here, once
+        # per composed invocation. A fully traced caller passes a tracer and skips the refresh --
+        # the spec then raises its own loud error at materialization if it was never assembled.
+        if precond is not None and fem is not None and not isinstance(u0, jax.core.Tracer):
+            for s in _iter_specs(precond):
+                hook = getattr(s, "refresh_from", None)
+                if hook is not None:
+                    hook(u0, fem)
         return nonlinear(residual_fn, u0, linear_solve=inner, jacobian=jacobian, project=project)
 
     # A direct (assembled-Jacobian) Newton needs the step Jacobian threaded in; flag it so the caller

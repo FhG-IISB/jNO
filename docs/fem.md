@@ -1258,7 +1258,15 @@ preconditioner never changes the converged solution, only the speed, so specs ne
   solve). Iterative inner ⇒ flexible outer (`fgmres`).
 * `jno.precond.form([...terms], inner=…)` — **preconditioners as weak forms**: assemble an auxiliary
   operator from ordinary traced terms and invert it as `M⁻¹` (weighted mass matrices, shifted-Laplacian
-  Helmholtz twins, low-order proxies — written in the PDE's language).
+  Helmholtz twins, low-order proxies — written in the PDE's language). Pass a **callable**
+  `form(lambda sol: [...terms...])` for a **solution-dependent** auxiliary — a `(1/μ(u))`-weighted
+  Schur mass whose weight is computed from the current solution. It is re-assembled once per outer
+  solve from that solve's entry iterate (warm start / previous march step) — the **Picard-lagged
+  preconditioner** (Elman, Silvester & Wathen 2014, §9.2): the coefficient trails the solution by one
+  outer solve, which changes convergence *speed* only, never the answer. Eager by necessity — every
+  Newton loop is a `lax.while_loop`, so the per-step iterate is a tracer no host assembly can see; a
+  fully traced solve that never supplies a concrete iterate gets a loud `NotImplementedError`, not a
+  garbage preconditioner.
 * `jno.precond.block_diag((field, spec), …)` / `jno.precond.triangular((field, spec), …)` — per-field
   composition over `fem.blocks`. `triangular` is the standard saddle-point shape: last block solved
   first, substituted back through the assembled off-diagonal matvecs.
@@ -1268,6 +1276,16 @@ preconditioner never changes the converged solution, only the speed, so specs ne
   `jit`/`vmap`-native and exactly linear, so it preconditions `cg`/`minres` too. Mesh-independent
   convergence ⇒ *the* choice for large elliptic blocks. Inside traced/parametric solves, pre-build
   eagerly: `spec = jno.precond.amg(); spec.build(fem.A)`. Without pyamg, `amg` raises a clear install hint.
+* `jno.precond.jaxamg(symmetric=…)` — GPU AMG via NVIDIA **AmgX** as the `M⁻¹` application (setup and
+  apply both on the device). `symmetric=False` builds a second hierarchy on `Aᵀ` so the adjoint
+  (reverse-mode) solve of a non-symmetric operator is preconditioned too. Measured caveat: each AmgX
+  application carries ~11 ms of fixed handle overhead, so it pays only where the iteration savings
+  exceed it — for most problems prefer `precond.amg()` (whose V-cycle compiles into the solve) or
+  `linear=jno.solve.amg()` (ONE AmgX crossing per solve, with warm structure-keyed re-setup measured
+  ~10x cheaper on repeats). `benchmarks/amg_scaling.py` holds the numbers.
+* `.cached(refresh=…)` on any spec — reuse an expensive setup across solves: `False` frozen, `True`
+  rebuild on shape/sparsity change, an **int k** to rebuild every k-th materialization (the cadence
+  for a march whose operator values drift step by step), or a `ctx -> key` callable.
 
 The flagship pattern — Taylor–Hood **Stokes** by FGMRES with an inexact velocity block solve and the
 viscosity-weighted pressure-mass Schur approximation (Elman, Silvester & Wathen, 2014, §9.2):
@@ -1299,6 +1317,23 @@ its symmetry/definiteness); the converged solution is identical to full Newton's
 marker, `picard(damping=…)` is exactly damped Newton (`jno.solve.newton(damping=…)`). Caveat for inverse
 problems: implicit differentiation then also uses the lagged Jacobian — drop `lag` when exact parameter
 gradients matter more than per-step solvability.
+
+**What did the solver do? — `fem.stats`.** After any `fem.solve()`, `fem.stats` reports what happened
+without changing the solve's return: `mode`, `dofs`, `wall_s` (dispatch time — JAX is async; block on
+the result for compute time), the `linear`/`precond` slot reprs, `nonlinear` (driver, final residual
+norm against its bound, converged flag, and the step count where the driver runs its forward loop
+eagerly — `newton_direct` reports steps; the drivers whose loop lives inside `custom_root` report
+`None`), and `amgx_cache` occupancy when jaxamg served the solve. Populated on eager paths; a solve
+wrapped whole in `jit`/`vmap`/`grad` records the slots but no residuals — the same concrete-only
+self-disabling as the convergence guards.
+
+```python
+sol = fem.solve(nonlinear=jno.solve.newton(direct=True), linear=jno.solve.lu(backend="host"))
+fem.stats
+# {'mode': 'nonlinear', 'dofs': 44, 'wall_s': 0.31, 'linear': 'jno.solve.lu-host(...)',
+#  'precond': None, 'nonlinear': {'driver': 'newton_direct', 'residual': 1.6e-07,
+#                                 'bound': 1.7e-06, 'steps': 3, 'converged': True}}
+```
 
 **Alternate minimization — `jno.solve.staggered([u, d])`.** Some coupled energies are **non-convex in
 the fields jointly but convex in each separately**. A monolithic Newton then has no descent guarantee
