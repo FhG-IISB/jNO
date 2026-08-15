@@ -1528,7 +1528,8 @@ def assemble_fem_native(
         Done GLOBALLY, outside the per-face vmap, because the main nodes live on the other body's
         cells -- they are not in the secondary face's parent-cell DOF slice. A plain weighted gather, so
         ``jax.linearize`` (the default JFNK path) picks up the main coupling in the tangent exactly,
-        with no assembled Jacobian block needed.
+        with no assembled Jacobian block needed. (The ASSEMBLED tangent builds its own explicit
+        nonlocal blocks from these same tables -- see the gap emission in `_make_jacobian`.)
         """
         tb = _gap_tables[key]
         fidx, vt = tb["field"], vecs[tb["field"]]
@@ -1917,30 +1918,6 @@ def assemble_fem_native(
 
         return residual
 
-    def _gap_refuses_assembled_tangent(bterms):
-        """A contact gap is NON-LOCAL: it reads DOFs on the main body's cells, not the secondary face's
-        parent cell. The assembled path builds each element block by ``jacfwd`` w.r.t. that element's
-        own DOFs and emits columns ``cell_all_dofs[pcells]``, so it would silently drop the whole
-        secondary-main coupling -- a tangent that looks fine and just makes Newton crawl.
-
-        Emitting a second block with main columns is possible (``_emit`` takes arbitrary indices) but
-        costs another element-matrix buffer for every surface term, and the DEFAULT path never needs
-        it: contact is nonlinear, so ``newton_krylov`` takes matrix-free JVPs through
-        ``jax.linearize`` of the residual, which picks up the main coupling exactly. So the block is
-        not built at all, and this path refuses rather than being quietly wrong.
-
-        Raised on USE, not on construction -- ``_make_jacobian`` is called unconditionally at build
-        time even for problems that will only ever take the matrix-free route.
-        """
-        if _gap_tables and bterms:
-            raise NotImplementedError(
-                "jno.fem: a contact gap (u.gap) needs the matrix-free tangent -- its dependence on the "
-                "main body's DOFs cannot be expressed in this assembled per-element Jacobian, and "
-                "silently dropping it would degrade Newton with no error. Contact is nonlinear, so the "
-                "default fem.solve() already takes the matrix-free path; drop "
-                "`nonlinear=jno.solve.newton(direct=True)` if you set it."
-            )
-
     def _make_jacobian(terms, bterms=None):
         """Build the dense Jacobian ``J(u_flat) -> (total, total)`` by *per-element* forward-mode AD.
 
@@ -1962,6 +1939,66 @@ def assemble_fem_native(
         # static `nse` under jit, and inferring one requires concrete indices it does not have inside
         # the trace. This mirrors `fem_nonnodal._make_sparse_assembler`, which already hoists its
         # `_vol_idx` the same way. Order must match the append order in `jacobian` exactly.
+        def _gap_key_of(region):
+            """The (single) gap key whose SECONDARY face is this region, or ``None``."""
+            ks = [k for k in _gap_tables if _gap_tables[k]["secondary"] == region]
+            return ks[0] if ks else None
+
+        _gap_static_cache: Dict[Any, Any] = {}
+
+        def _gap_static(region, face_ids, btfi):
+            """Concrete index/weight geometry of a region's gap blocks — computed ONCE from the frozen
+            pairing tables and shared by the pattern hoist and the traced assembly, so the two cannot
+            drift. The three nonlocal blocks, flat index arrays in emission order:
+
+            * ``(s,m)``: secondary test rows x main columns (one column per (q, mortar-node, comp));
+            * ``(m,s)``: reaction rows (main dofs, one per (q, mortar-node, comp)) x parent-local cols;
+            * ``(m,m)``: reaction rows x main columns.
+            """
+            k = _gap_key_of(region)
+            cache_key = (region, int(btfi))
+            hit = _gap_static_cache.get(cache_key)
+            if hit is not None:
+                return hit
+            tb = _gap_tables[k]
+            fidx_m, vt = tb["field"], vecs[tb["field"]]
+            fids_np = np.asarray(face_ids, dtype=np.int64)
+            ids_f = np.asarray(tb["ids_full"])[fids_np]  # (n_face, n_q, K)
+            w_f = jnp.asarray(np.asarray(tb["w_full"])[fids_np])  # (n_face, n_q, K)
+            n_face, n_q, K = ids_f.shape
+            pc = np.asarray(parent_j)[fids_np]
+            rows_test = np.asarray(cdofs[btfi])[pc]  # (n_face, n_test)
+            n_test = rows_test.shape[1]
+            dof_m = (np.asarray(offs[fidx_m]) + ids_f[..., None] * vt + np.arange(vt)).astype(np.int64)
+            nqKv = n_q * K * vt
+            dof_m_flat = dof_m.reshape(n_face, nqKv)
+            cols_parent = np.asarray(cell_all_dofs)[pc]  # (n_face, n_local_all)
+            n_local = cols_parent.shape[1]
+            sh_sm = (n_face, n_test, n_q, K, vt)
+            rows_sm = np.broadcast_to(rows_test[:, :, None, None, None], sh_sm).reshape(-1)
+            cols_sm = np.broadcast_to(dof_m[:, None, :, :, :], sh_sm).reshape(-1)
+            sh_ms = (n_face, nqKv, n_local)
+            rows_ms = np.broadcast_to(dof_m_flat[:, :, None], sh_ms).reshape(-1)
+            cols_ms = np.broadcast_to(cols_parent[:, None, :], sh_ms).reshape(-1)
+            sh_mm = (n_face, nqKv, nqKv)
+            rows_mm = np.broadcast_to(dof_m_flat[:, :, None], sh_mm).reshape(-1)
+            cols_mm = np.broadcast_to(dof_m_flat[:, None, :], sh_mm).reshape(-1)
+            out = {
+                "rows_sm": jnp.asarray(rows_sm, dtype=jnp.int32),
+                "cols_sm": jnp.asarray(cols_sm, dtype=jnp.int32),
+                "rows_ms": jnp.asarray(rows_ms, dtype=jnp.int32),
+                "cols_ms": jnp.asarray(cols_ms, dtype=jnp.int32),
+                "rows_mm": jnp.asarray(rows_mm, dtype=jnp.int32),
+                "cols_mm": jnp.asarray(cols_mm, dtype=jnp.int32),
+                "w_f": w_f,
+                "n_q": n_q,
+                "K": K,
+                "vt": vt,
+                "key": k,
+            }
+            _gap_static_cache[cache_key] = out
+            return out
+
         _idx_rows, _idx_cols = [], []
         for _coeff_s, _tfi_s, _rn_s in typed_with_masks:
             _sh = (n_cells, int(cdofs[_tfi_s].shape[1]), int(cell_all_dofs.shape[1]))
@@ -1974,6 +2011,19 @@ def assemble_fem_native(
                 _sh = (int(_pc.shape[0]), int(cdofs[_btfi_s].shape[1]), int(cell_all_dofs.shape[1]))
                 _idx_rows.append(jnp.broadcast_to(cdofs[_btfi_s][_pc][:, :, None], _sh).reshape(-1))
                 _idx_cols.append(jnp.broadcast_to(_fcols[:, None, :], _sh).reshape(-1))
+                # The gap's nonlocal blocks, in the SAME append order the traced assembly emits
+                # them: (s,m) always when the region carries a gap; (m,s) and (m,m) when this term
+                # also drives the main-side reaction. The indices come from the frozen pairing
+                # tables, so the pattern stays static; inactive contact contributes zeros in DATA.
+                if _gap_key_of(_region_s) is not None:
+                    _gs = _gap_static(_region_s, _face_ids_s, _btfi_s)
+                    _idx_rows.append(_gs["rows_sm"])
+                    _idx_cols.append(_gs["cols_sm"])
+                    if _gaps_in(_bcoeff_s, _region_s):
+                        _idx_rows.append(_gs["rows_ms"])
+                        _idx_cols.append(_gs["cols_ms"])
+                        _idx_rows.append(_gs["rows_mm"])
+                        _idx_cols.append(_gs["cols_mm"])
         _blk_sizes = [int(r.shape[0]) for r in _idx_rows]  # per-term flat lengths, in append order
         _idx_static = (
             jnp.stack([jnp.concatenate(_idx_rows).astype(jnp.int32), jnp.concatenate(_idx_cols).astype(jnp.int32)], axis=1)
@@ -1986,7 +2036,6 @@ def assemble_fem_native(
             _idx_static, _plan = None, None  # fall back to the uncompressed (still correct) path
 
         def jacobian(u_flat, t=0.0, args=None):
-            _gap_refuses_assembled_tangent(bterms)  # non-local gap -> matrix-free tangent only
             # Assemble into COO triplets and build a BCOO -- never materialises the dense (total, total)
             # matrix (O(nnz), GPU-able at large N). Each per-element block is element-sized; duplicate
             # (i, j) triplets from neighbouring cells are summed by BCOO on matvec / todense, so the
@@ -2034,21 +2083,34 @@ def assemble_fem_native(
                 )
 
             normals_dyn = _surface_normals(pts_dyn)  # differentiable facet normals under coordinate motion
+            # Main-side values for every contact gap -- the residual's own gather, reused so the
+            # assembled tangent linearizes the SAME function the residual evaluates.
+            gap_um_j = {k: _gap_gather(u_flat, k) for k in _gap_tables}
             for region, face_ids, btyped in surface_work:
                 fids = jnp.asarray(face_ids, dtype=jnp.int32)
                 pcells = parent_j[fids]
                 lv = u_flat[cell_all_dofs[pcells]]  # (n_face, n_local_all)
                 fcols = cell_all_dofs[pcells]  # (n_face, n_local_all)
+                gslice = _gap_slices(region, fids, gap_um_j)  # {key: (g0, u_m)} or None
                 for bcoeff, btfi in btyped:
 
-                    def _kef(fi, la, _e=bcoeff, _t=btfi, _r=region, _p=pts_dyn, _n=normals_dyn):
-                        return jax.jacfwd(lambda v: _surf_elem_res(fi, v, _e, _t, _r, t, args, _p, _n))(la)
+                    def _kef(fi, la, gp=None, _e=bcoeff, _t=btfi, _r=region, _p=pts_dyn, _n=normals_dyn):
+                        # gaps PACKED: the local block then carries d(traction)/du_s THROUGH the gap,
+                        # exactly as `jax.linearize` of the residual would.
+                        return jax.jacfwd(lambda v: _surf_elem_res(fi, v, _e, _t, _r, t, args, _p, _n, gp))(la)
 
-                    Kef = _elem_map(  # (n_face, n_test_btfi, n_local_all)
-                        _kef,
-                        (fids, lv),
-                        _cell_chunk(int(fids.shape[0]), cdofs[btfi].shape[1], cell_all_dofs.shape[1]),
-                    )
+                    if gslice:
+                        Kef = _elem_map(
+                            _kef,
+                            (fids, lv, gslice),
+                            _cell_chunk(int(fids.shape[0]), cdofs[btfi].shape[1], cell_all_dofs.shape[1]),
+                        )
+                    else:
+                        Kef = _elem_map(  # (n_face, n_test_btfi, n_local_all)
+                            _kef,
+                            (fids, lv),
+                            _cell_chunk(int(fids.shape[0]), cdofs[btfi].shape[1], cell_all_dofs.shape[1]),
+                        )
                     _emit(
                         Kef.reshape(-1),
                         lambda _K=Kef, _t=btfi, _p=pcells: jnp.broadcast_to(cdofs[_t][_p][:, :, None], _K.shape).reshape(
@@ -2056,6 +2118,68 @@ def assemble_fem_native(
                         ),
                         lambda _K=Kef, _f=fcols: jnp.broadcast_to(_f[:, None, :], _K.shape).reshape(-1),
                     )
+
+                    if gslice:
+                        # ---- the gap's NONLOCAL blocks (same append order as the pattern hoist) ----
+                        gs = _gap_static(region, face_ids, btfi)
+                        n_q, vt, gk = gs["n_q"], gs["vt"], gs["key"]
+                        w_f = gs["w_f"]
+                        g0_sl, um_sl = gslice[gk]
+
+                        # (s,m): jacfwd of the SAME face residual w.r.t. the gathered main values,
+                        # chained through the frozen mortar weights to global main columns.
+                        def _kem(fi, la, g0f, umf, _e=bcoeff, _t=btfi, _r=region, _p=pts_dyn, _n=normals_dyn, _k=gk):
+                            return jax.jacfwd(
+                                lambda um: _surf_elem_res(fi, la, _e, _t, _r, t, args, _p, _n, {_k: (g0f, um)})
+                            )(umf)
+
+                        Kem = _elem_map(  # (n_face, n_test, n_q, vt)
+                            _kem,
+                            (fids, lv, g0_sl, um_sl),
+                            _cell_chunk(int(fids.shape[0]), cdofs[btfi].shape[1], n_q * vt),
+                        )
+                        d_sm = jnp.einsum("frqv,fqk->frqkv", Kem.reshape(Kem.shape[0], Kem.shape[1], n_q, vt), w_f)
+                        _emit(d_sm.reshape(-1), lambda _g=gs: _g["rows_sm"], lambda _g=gs: _g["cols_sm"])
+
+                        if _gaps_in(bcoeff, region):
+                            # Reaction-row tangent: tau (the per-QP weighted traction via the identity
+                            # test-table substitution -- the residual's own trick) linearized w.r.t.
+                            # the parent-local dofs (m,s) and the gathered main values (m,m), scattered
+                            # through the same -w weights the residual's reaction uses.
+                            def _tau(fi, la, g0f, umf, _e=bcoeff, _t=btfi, _r=region, _k=gk):
+                                out = _surf_elem_res(
+                                    fi,
+                                    la,
+                                    _e,
+                                    _t,
+                                    _r,
+                                    t,
+                                    args,
+                                    pts_dyn,
+                                    normals_dyn,
+                                    {_k: (g0f, umf)},
+                                    test_vals=jnp.eye(n_q, dtype=lv.dtype),
+                                )
+                                return jnp.asarray(out).reshape(n_q, vt)
+
+                            n_local_all = int(cell_all_dofs.shape[1])
+                            Dls = _elem_map(
+                                lambda fi, la, g0f, umf: jax.jacfwd(lambda v: _tau(fi, v, g0f, umf))(la),
+                                (fids, lv, g0_sl, um_sl),
+                                _cell_chunk(int(fids.shape[0]), n_q * vt, n_local_all),
+                            )
+                            Dum = _elem_map(
+                                lambda fi, la, g0f, umf: jax.jacfwd(lambda um: _tau(fi, la, g0f, um))(umf),
+                                (fids, lv, g0_sl, um_sl),
+                                _cell_chunk(int(fids.shape[0]), n_q * vt, n_q * vt),
+                            )
+                            n_face = int(fids.shape[0])
+                            # (m,s): K[dof(f,q,K,v), parent_local] -= w[f,q,K] * dtau[f,q,v,local]
+                            d_ms = -jnp.einsum("fqk,fqvl->fqkvl", w_f, Dls.reshape(n_face, n_q, vt, n_local_all))
+                            _emit(d_ms.reshape(-1), lambda _g=gs: _g["rows_ms"], lambda _g=gs: _g["cols_ms"])
+                            # (m,m): K[dof(q,K,v), dof(q2,K2,v2)] -= w[f,q,K] dtau[q,v,q2,v2] w[f,q2,K2]
+                            d_mm = -jnp.einsum("fqk,fqvpw,fpl->fqkvplw", w_f, Dum.reshape(n_face, n_q, vt, n_q, vt), w_f)
+                            _emit(d_mm.reshape(-1), lambda _g=gs: _g["rows_mm"], lambda _g=gs: _g["cols_mm"])
 
             if _plan is not None:
                 if _acc[0] is None:  # no terms -> empty operator

@@ -152,7 +152,8 @@ def test_a_penalty_on_the_gap_closes_the_interface_like_one_over_c():
     """The end-to-end gate, and the one that proves the gap is *live*: penalising it must drive the
     interface jump to zero like 1/c. That can only happen if the gap measures the real jump AND the
     tangent carries the main-side coupling — the matrix-free path picks the latter up through
-    `jax.linearize` of the residual, which is why no assembled Jacobian block is built."""
+    `jax.linearize` of the residual; the assembled path builds the explicit nonlocal blocks
+    (gated by `test_assembled_gap_tangent_matches_the_matrix_free_jvp`)."""
     free, _ = _vector_poisson(None)
     jumps = {c: _vector_poisson(c)[0] for c in (1e2, 1e3, 1e4, 1e5)}
 
@@ -163,9 +164,15 @@ def test_a_penalty_on_the_gap_closes_the_interface_like_one_over_c():
     assert jumps[1e5] < 1e-3 * free
 
 
-def test_the_assembled_tangent_refuses_a_gap():
-    """A gap is non-local, and the per-element Jacobian emits parent-cell columns only, so it would
-    silently drop the secondary–main coupling. It must refuse rather than return a degraded tangent."""
+def test_assembled_gap_tangent_matches_the_matrix_free_jvp():
+    """The assembled tangent now carries the gap's NONLOCAL blocks -- (s,m) from jacfwd w.r.t. the
+    gathered main values chained through the frozen mortar weights, and the reaction rows' (m,s) and
+    (m,m). The matrix-free JVP (jax.linearize of the residual) is exact by construction, so the two
+    must agree on random probe vectors, in both the ACTIVE (pressed) and INACTIVE (separated)
+    branches of a one-sided max(0,.) traction."""
+    import jax as _jax
+    import jax.numpy as jnp
+
     d = _two_body_domain()
     u, v = d.fem_symbols(value_shape=(3,))
     secondary, main = _sides(d)
@@ -177,16 +184,68 @@ def test_the_assembled_tangent_refuses_a_gap():
     g = u.gap(secondary, main, domain=d)
     terms = [
         jno.np.inner(gu, gv, n_contract=2) - 1.0 * v.bind(x=ci[0], y=ci[1], z=ci[2])[2],
-        g * jno.np.inner(n, v.bind(x=sb[0], y=sb[1], z=sb[2]), n_contract=1),
+        jno.np.maximum(0.0, -1e3 * g) * jno.np.inner(n, v.bind(x=sb[0], y=sb[1], z=sb[2]), n_contract=1),
     ]
     bb = d.variable("boundary", split=True)
     terms += [u(bb[0], bb[1], bb[2])[i] - 0.0 for i in range(3)]
     fem = jno.fem(terms, element_type="TET4")
-    with pytest.raises(NotImplementedError, match="matrix-free tangent"):
-        fem.jacobian(np.zeros(fem.n_dofs) if hasattr(fem, "n_dofs") else np.zeros(1))
+    op = fem.operator
+    ndofs = int(fem.dofs)
+    key = _jax.random.PRNGKey(0)
+
+    for state_scale, label in ((-1e-3, "active (pressed)"), (+1e-3, "inactive (separated)")):
+        # a z-displacement state that closes / opens the gap uniformly
+        u0 = jnp.zeros(ndofs).reshape(-1, 3).at[:, 2].set(state_scale).reshape(-1)
+        r = lambda w: jnp.asarray(op.residual(w)).reshape(-1)  # noqa: E731
+        J = op.jacobian(u0)
+        _r0, jvp = _jax.linearize(r, u0)
+        for i in range(3):
+            probe = _jax.random.normal(_jax.random.fold_in(key, i), (ndofs,))
+            a = np.asarray(J @ probe)
+            b = np.asarray(jvp(probe))
+            scale = max(np.abs(b).max(), 1e-8)
+            assert np.abs(a - b).max() < 5e-4 * scale, (
+                f"{label}: assembled J and matrix-free JVP disagree "
+                f"(max diff {np.abs(a - b).max():.3e} vs scale {scale:.3e})"
+            )
+
+
+def test_direct_newton_one_sided_matches_matrix_free():
+    """`newton(direct=True)` + host LU over a one-sided contact -- the path that refused before --
+    must land on the matrix-free answer."""
+    inner, sym, trace = jno.np.inner, jno.np.symgrad, jno.np.trace
+    d = _stacked_blocks()
+    sides = sorted(t for t in d.built_mesh.cell_sets if "|" in t)
+    secondary = next(t for t in sides if t.endswith(".cap"))
+    main = next(t for t in sides if t.endswith(".base"))
+    u, phi = d.fem_symbols(value_shape=(2,))
+    X = d.variable("interior", split=True)[:2]
+    eu, ep = sym(u, list(X)), sym(phi, list(X))
+    sv = d.variable(secondary, split=True)
+    n = d.variable(secondary, normals=True)
+    g = u.gap(secondary, main, domain=d)
+    xb, yb, _ = d.variable("bottom", split=True)
+    xt, yt, _ = d.variable("top", split=True)
+    terms = [
+        LAM_ * trace(eu) * trace(ep) + 2 * MU_ * inner(eu, ep, n_contract=2),
+        jno.np.maximum(0.0, -1e4 * g) * inner(n, phi.bind(x=sv[0], y=sv[1]), n_contract=1),
+        u(xb, yb)[0] - 0.0,
+        u(xb, yb)[1] - 0.0,
+        u(xt, yt)[0] - 0.0,
+        u(xt, yt)[1] - (-0.02),
+    ]
+    mf = np.asarray(jno.fem(terms).solve(nonlinear=jno.solve.newton(line_search=True, rtol=1e-6, atol=1e-6))).reshape(-1, 2)
+    dr = np.asarray(
+        jno.fem(terms).solve(
+            nonlinear=jno.solve.newton(direct=True, line_search=True, rtol=1e-6, atol=1e-6),
+            linear=jno.solve.lu(backend="host"),
+        )
+    ).reshape(-1, 2)
+    assert np.abs(mf - dr).max() < 5e-5, f"direct vs matrix-free one-sided contact: {np.abs(mf - dr).max():.2e}"
 
 
 # ---------------------------------------------------------------------------
+# The reaction on the main body# ---------------------------------------------------------------------------
 # The reaction on the main body -- Newton's third law across the interface.
 #
 # The interface traction is written on the secondary face only, so the main's share has to be added by
