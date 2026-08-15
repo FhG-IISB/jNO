@@ -5321,7 +5321,19 @@ def _assemble_second_order_time(
     # Dirichlet from the native assembler (it stashes them): constant (dof, value) pairs → the held
     # value rides the affine bias; time-varying entries (dofs, g(x,t) node, coords) → the displacement
     # rows carry u[d]=g(x_d,t) and the velocity rows the compatible v[d]=ġ(x_d,t), written per step.
-    assemble_fem_native(domain, stiff_raw, boundary_terms, dirichlet_raw, [], vec=_vec_asm, quad_degree=quad_degree)
+    assemble_fem_native(
+        domain,
+        stiff_raw,
+        boundary_terms,
+        dirichlet_raw,
+        [],
+        vec=_vec_asm,
+        quad_degree=quad_degree,
+        # This block consumes the time-varying Dirichlet stash ITSELF (u[d]=g(x_d,t), v[d]=ġ per
+        # step, just below) -- without the flag the assembler's fail-loud fallthrough guard fires on
+        # this legitimate consumer.
+        tv_dirichlet_external=True,
+    )
     pairs = list(getattr(domain, "_fem_native_dirichlet_pairs", []) or [])
     rows = jnp.asarray([p[0] for p in pairs], dtype=int) if pairs else jnp.zeros((0,), dtype=int)
     g = jnp.asarray([p[1] for p in pairs], dtype=dtype) if pairs else jnp.zeros((0,), dtype=dtype)
