@@ -3764,7 +3764,24 @@ def elem_map(fn, xs, chunk):
         return jax.jit(run)(*arrays)
 
     key, pins = fp
+
+    # Cache entries are ``(jit_fn, pins, baked)``: ``pins`` guard THIS call's ids against recycling,
+    # ``baked`` are the leaves of the build that COMPILED the function -- the arrays actually
+    # captured in its closure. The two differ exactly for content-hit ALIASES, and the distinction
+    # is what makes the donated-buffer check below possible.
+    def _baked_dead(entry):
+        return entry[2] is not entry[1] and any(
+            isinstance(_l, jax.Array) and _l.is_deleted() for _l in jax.tree_util.tree_leaves(entry[2])
+        )
+
     hit = _ELEM_MAP_CACHE.get(key)
+    if hit is not None and _baked_dead(hit):
+        # An id-keyed ALIAS whose original baked device buffers were DONATED and deleted since (a
+        # training loop's optimizer step donates the old parameter buffer). Executing the shared
+        # compilation reads a corpse: measured "Array has been deleted with shape=float64[1]" out of
+        # a kernel shared across tests. Recompile with this build's live leaves.
+        _ELEM_MAP_CACHE.pop(key, None)
+        hit = None
     if hit is None:
         # Identity miss. Before compiling, try the CONTENT key: a rebuild of an identical problem
         # bakes fresh objects with identical values, and identical values compile to the identical
@@ -3773,19 +3790,30 @@ def elem_map(fn, xs, chunk):
         # tokenizer cannot key by value) falls through to compile -- a miss is safe, a wrong hit
         # would be a wrong operator.
         ckey = _fn_content_key(fn, chunk)
+        chit = None
         if ckey is not None:
-            hit = _ELEM_MAP_CONTENT.get(ckey)
-        if hit is not None:
+            chit = _ELEM_MAP_CONTENT.get(ckey)
+            if chit is not None and any(
+                isinstance(_l, jax.Array) and _l.is_deleted() for _l in jax.tree_util.tree_leaves(chit[2])
+            ):
+                # Same corpse check for the content table (its entries keep the ORIGINAL build's
+                # leaves as ``baked``, which are exactly the compiled closure's buffers).
+                del _ELEM_MAP_CONTENT[ckey]
+                _ELEM_MAP_STATS["content_bail"]["<deleted-buffer>"] = (
+                    _ELEM_MAP_STATS["content_bail"].get("<deleted-buffer>", 0) + 1
+                )
+                chit = None
+        if chit is not None:
             _ELEM_MAP_STATS["content_hits"] += 1
             _ELEM_MAP_CONTENT.move_to_end(ckey)
             # Share the COMPILED program but pin THIS call's leaves: the id key contains this build's
             # object ids, and the entry's pins are what stop those ids from being recycled onto
-            # different objects after a GC -- the invariant the id fast path rests on. Pinning the
-            # old build's leaves instead would leave the new ids unguarded.
-            hit = (hit[0], pins)
+            # different objects after a GC. ``baked`` stays the ORIGINAL build's leaves -- the
+            # closure's actual buffers -- so the liveness checks above test the right arrays.
+            hit = (chit[0], pins, chit[2])
         else:
             _ELEM_MAP_STATS["misses"] += 1
-            hit = (jax.jit(run), pins)
+            hit = (jax.jit(run), pins, pins)
             if ckey is not None:
                 _ELEM_MAP_CONTENT[ckey] = hit
                 while len(_ELEM_MAP_CONTENT) > _ELEM_MAP_CONTENT_MAX:
