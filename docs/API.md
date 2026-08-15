@@ -42,6 +42,7 @@ sampling, and tensor tags.
         - tag
         - by_region
         - by_tag
+        - attached
         - line
         - rect
         - polygon

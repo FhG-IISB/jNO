@@ -82,6 +82,9 @@ class Shape:
     _size: Size = field(default=None, compare=False)
     _region_name: Optional[str] = field(default=None, compare=False)
     _mesh_order: int = field(default=1, compare=False)
+    # Attached material properties, ``{name: value}``. ``compare=False`` keeps the dataclass hashable
+    # (a dict is not) and keeps two geometrically identical shapes equal regardless of their materials.
+    _attach: Optional[dict] = field(default=None, compare=False)
 
     # ----- primitive constructors ------------------------------------------------
     @classmethod
@@ -174,7 +177,41 @@ class Shape:
 
         ``core.name("core") + clad.name("clad")`` builds a multi-material domain whose regions are
         ``core`` and ``clad``. Apply ``name`` last (a later transform drops the label)."""
-        return Shape(self._node, self.dim, self._size, str(name), self._mesh_order)
+        return Shape(self._node, self.dim, self._size, str(name), self._mesh_order, self._attach)
+
+    def attach(self, **props) -> "Shape":
+        """Attach material properties to this region: ``.attach(k=220.0, eps=0.794)``.
+
+        The realized domain exposes each attached name as a **per-region coefficient** ready to drop
+        into a weak form -- ``d.k`` is exactly ``d.by_region({"Kristall": 220.0, ...})`` assembled from
+        every region that attached a ``k``::
+
+            kri = Shape.polygon(v).name("Kristall").attach(k=220.0, eps=0.794)
+            gas = Shape.polygon(w).name("Gas").attach(k=0.186, eps=1.0)
+            d   = (kri + gas).domain()
+            heat = d.k * (T.x*s.x + T.y*s.y) - d.q * s
+
+        A value may be anything :meth:`domain.by_region` accepts -- a scalar, a symbolic expression,
+        or a traced/trainable array -- so an attached property can be fitted or differentiated
+        through. A plain **function** is also accepted and is called with the domain's spatial
+        coordinates when the property is read (``.attach(k=lambda r, z: 2.0 + 0.5*z)``); it has to be
+        deferred that way because a spatially varying coefficient is built from ``d.variable(...)``,
+        which does not exist yet while the geometry plan is being written.
+
+        Properties are declared, not typed: whether ``eps`` is a volume or a surface quantity is
+        decided by the term that consumes it, not here.
+
+        ``d.<name>`` raises if **any** region failed to attach that name, listing the ones that did
+        not: a forgotten material surfaces at first use rather than as a region that silently
+        conducts nothing. Repeated calls merge (last wins), so properties can be built up in stages.
+        Apply after :meth:`name` -- like ``name``, a later transform drops the attachment."""
+        merged = dict(self._attach or {})
+        merged.update(props)
+        return Shape(self._node, self.dim, self._size, self._region_name, self._mesh_order, merged)
+
+    def size(self, size: Size) -> "Shape":
+        """Alias for :meth:`sized` -- ``.size(h)`` reads better in a chain than ``.sized(h)``."""
+        return self.sized(size)
 
     def _region_items(self):
         """This shape as ``((name, shape), ...)`` region items — its own group, or a single named leaf."""
@@ -196,19 +233,25 @@ class Shape:
 
     # ----- boolean operators -----------------------------------------------------
     def __sub__(self, other: "Shape") -> "Shape":
-        return Shape(("cut", self, other), self.dim, self._size, None, max(self._mesh_order, other._mesh_order))
+        return Shape(
+            ("cut", self, other), self.dim, self._size, None, max(self._mesh_order, other._mesh_order), self._attach
+        )
 
     def __or__(self, other: "Shape") -> "Shape":
-        return Shape(("fuse", self, other), self.dim, self._size, None, max(self._mesh_order, other._mesh_order))
+        return Shape(
+            ("fuse", self, other), self.dim, self._size, None, max(self._mesh_order, other._mesh_order), self._attach
+        )
 
     def __and__(self, other: "Shape") -> "Shape":
-        return Shape(("inter", self, other), self.dim, self._size, None, max(self._mesh_order, other._mesh_order))
+        return Shape(
+            ("inter", self, other), self.dim, self._size, None, max(self._mesh_order, other._mesh_order), self._attach
+        )
 
     # ----- transforms ------------------------------------------------------------
     def extrude(self, height: float) -> "Shape":
         if self.dim != 2:
             raise ValueError("extrude requires a 2-D shape")
-        return Shape(("extrude", self, float(height)), 3, self._size, None, self._mesh_order)
+        return Shape(("extrude", self, float(height)), 3, self._size, None, self._mesh_order, self._attach)
 
     def revolve(self, axis_point, axis_dir, angle: float = 2.0 * math.pi) -> "Shape":
         """Sweep a 2-D shape around an axis by ``angle`` radians into a 3-D solid.
@@ -233,20 +276,20 @@ class Shape:
                 "revolve currently supports the x- or y-axis through the origin (axisymmetric); "
                 f"got axis_point={ap}, axis_dir={ad}."
             )
-        return Shape(("revolve", self, ap, ad, float(angle)), 3, self._size, None, self._mesh_order)
+        return Shape(("revolve", self, ap, ad, float(angle)), 3, self._size, None, self._mesh_order, self._attach)
 
     def translate(self, vector) -> "Shape":
         """Move the shape by ``vector`` (2- or 3-component). Boundary names are preserved."""
         v = tuple(float(c) for c in vector)
         if len(v) == 2:
             v = (v[0], v[1], 0.0)
-        return Shape(("translate", self, v), self.dim, self._size, None, self._mesh_order)
+        return Shape(("translate", self, v), self.dim, self._size, None, self._mesh_order, self._attach)
 
     def rotate(self, axis_point, axis_dir, angle: float) -> "Shape":
         """Rotate ``angle`` radians about the axis through ``axis_point`` along ``axis_dir``."""
         ap = tuple(float(c) for c in axis_point)
         ad = tuple(float(c) for c in axis_dir)
-        return Shape(("rotate", self, ap, ad, float(angle)), self.dim, self._size, None, self._mesh_order)
+        return Shape(("rotate", self, ap, ad, float(angle)), self.dim, self._size, None, self._mesh_order, self._attach)
 
     def sweep(self, path) -> "Shape":
         """Sweep this 2-D profile along an open :class:`~jno.geometry.path.Path` trajectory.
@@ -261,7 +304,7 @@ class Shape:
         h = path._as_extrude()
         if h is not None:
             return self.extrude(h)  # a straight vertical sweep IS an extrude -- reuse its rich naming
-        return Shape(("sweep", self, path), 3, self._size, None, self._mesh_order)
+        return Shape(("sweep", self, path), 3, self._size, None, self._mesh_order, self._attach)
 
     def array(self, n: int, step=None, about=None, angle: float = 2.0 * math.pi) -> "Shape":
         """``n`` fused copies of this shape: a **linear** array (``step=`` vector between copies)
@@ -289,15 +332,11 @@ class Shape:
         edges). The rounded blend faces are unnamed (they fall into ``boundary``); the flat
         faces keep their names.
         """
-        return Shape(("fillet", self, float(radius), where), self.dim, self._size, None, self._mesh_order)
+        return Shape(("fillet", self, float(radius), where), self.dim, self._size, None, self._mesh_order, self._attach)
 
     def sized(self, size: Size) -> "Shape":
         """Return a copy of this shape with its target mesh size set (scalar or ``f(x,y,z)``)."""
-        return Shape(self._node, self.dim, size, self._region_name, self._mesh_order)
-
-    def size(self, size: Size) -> "Shape":
-        """Alias for :meth:`sized` -- ``.size(h)`` reads better in a chain than ``.sized(h)``."""
-        return self.sized(size)
+        return Shape(self._node, self.dim, size, self._region_name, self._mesh_order, self._attach)
 
     def curved(self, order: int = 2) -> "Shape":
         """Return a copy meshed with **curved (isoparametric)** geometry of the given order.
@@ -315,7 +354,7 @@ class Shape:
         which is why this lives here beside :meth:`sized` rather than on the solve."""
         if int(order) not in (1, 2):
             raise ValueError(f"Shape.curved: only order 1 (straight) or 2 is supported, got {order!r}.")
-        return Shape(self._node, self.dim, self._size, self._region_name, int(order))
+        return Shape(self._node, self.dim, self._size, self._region_name, int(order), self._attach)
 
     # ----- introspection (pure; used by emit + selection) ------------------------
     def leaves(self, _inherit: Size = None) -> Tuple[Tuple[object, Size, int], ...]:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union, cast, overload
 
@@ -492,8 +493,26 @@ class domain(MeshIOMixin):
             # A Shape.regions() plan carries named sub-region shapes; remember them so jno.fem
             # per-region integration can restrict a term to a region's cells (centroid membership
             # via the region shape's ``contains`` — see ``_cell_region_mask``).
-            if getattr(constructor, "_node", (None,))[0] == "regions":
-                self._shape_regions = {name: sub for name, sub in constructor._node[1]}
+            #
+            # ``_region_items`` rather than the raw ``("regions", ...)`` node, because a SINGLE named
+            # shape is a region too -- it is spelled as a bare leaf, and gating on the node kind meant
+            # ``rect.name("a").attach(k=2.0).domain().k`` reported "no attribute 'k'": the attachment
+            # was collected from nowhere and dropped without a word. ``_region_items`` already returns
+            # ``((name, shape),)`` for that case, so both spellings share one path.
+            _region_name = getattr(constructor, "_region_name", None)
+            if getattr(constructor, "_node", (None,))[0] == "regions" or _region_name is not None:
+                items = tuple(constructor._region_items())
+                self._shape_regions = {name: sub for name, sub in items}
+                self._collect_region_attachments(items)
+            elif getattr(constructor, "_attach", None):
+                # The other half of the same hole: properties attached to a shape that was never
+                # named have no region to belong to, and would be silently discarded here.
+                raise ValueError(
+                    f"Shape.attach({', '.join(sorted(map(str, constructor._attach)))}): this shape has no "
+                    "region name, so the attached propert"
+                    f"{'ies have' if len(constructor._attach) > 1 else 'y has'} nothing to attach to. "
+                    "Name the region first -- `shape.name('steel').attach(...)`."
+                )
         else:
             raise ValueError("Must provide either geometry_func, mesh file, or NPZ tag file")
 
@@ -528,6 +547,9 @@ class domain(MeshIOMixin):
             for tag, pts in self._mesh_pool.items():
                 if pts.shape[-1] > self.dimension:
                     self._mesh_pool[tag] = pts[..., : self.dimension]
+
+        # Last, so every attribute this domain will ever set is already in place to be compared against.
+        self._check_attachment_clashes()
 
     def _init_empty_state(
         self,
@@ -1749,6 +1771,104 @@ class domain(MeshIOMixin):
         expr = _masked_sum(values, TagMask, default, what="by_tag", key="tag")
         get_logger().info(f"by_tag: per-tag surface coefficient over {len(values)} tag(s): {sorted(map(str, values))}")
         return expr
+
+    def _collect_region_attachments(self, items):
+        """Index ``Shape.attach(...)`` properties as ``{property: {region: value}}`` for ``__getattr__``."""
+        attached: dict = {}
+        kinds: dict = {}
+        for name, sub in items:
+            for prop, value in (getattr(sub, "_attach", None) or {}).items():
+                attached.setdefault(str(prop), {})[str(name)] = value
+                kinds[str(name)] = "volume"  # a Shape region is a body: always per-cell
+        self._region_attachments = attached
+        self._attachment_kind = kinds
+
+    def _check_attachment_clashes(self):
+        """Reject an attached name that collides with a real ``domain`` attribute, at build time.
+
+        It has to be build time, and it has to be the *end* of ``__init__``: ``__getattr__`` only runs
+        when normal lookup *fails*, so an attached ``mesh`` or ``tag`` would be silently shadowed by
+        the attribute of the same name -- the user would get a bound method where they asked for a
+        coefficient, with nothing raised anywhere. Checking both the class (methods, properties) and
+        the instance dict is what makes it catch ``mesh``, which is only ever set on the instance.
+        """
+        attached = self.__dict__.get("_region_attachments") or {}
+        clashes = sorted(p for p in attached if hasattr(type(self), p) or p in self.__dict__)
+        if clashes:
+            raise ValueError(
+                f"attach: {clashes} collide with existing jno.domain attributes and would be "
+                f"unreachable as `d.{clashes[0]}`. Rename the attached propert"
+                f"{'ies' if len(clashes) > 1 else 'y'}."
+            )
+
+    def __getattr__(self, name):
+        """Resolve ``d.<prop>`` for a property attached via :meth:`Shape.attach`.
+
+        Only reached when normal attribute lookup fails, so it can never shadow a real method; the
+        build-time check in ``_check_attachment_clashes`` covers the reverse direction.
+        """
+        # `self.__dict__` directly, never `getattr`/`self._x` -- during __init__ (and under copy /
+        # pickle, which build an instance without running it) any attribute miss lands here, and
+        # touching another missing attribute would recurse forever.
+        attached = self.__dict__.get("_region_attachments") or {}
+        if name in attached:
+            values = attached[name]
+            kinds = self.__dict__.get("_attachment_kind") or {}
+            declared = {kinds.get(t, "volume") for t in values}
+            if len(declared) > 1:
+                raise AttributeError(
+                    f"domain.{name}: declared on both a volume region and a boundary tag "
+                    f"({sorted(values)}), so it has no single meaning -- a coefficient is integrated "
+                    f"over cells or over facets, not both. Use d.by_region({{...}}) and "
+                    f"d.by_tag({{...}}) explicitly for the two halves."
+                )
+            resolved = {t: self._resolve_attached(v) for t, v in values.items()}
+            if declared == {"surface"}:
+                # No completeness rule on the boundary: tags are not a partition of it, and untagged
+                # boundary is deliberately natural (do-nothing) in jNO. Facets no tag claims simply
+                # contribute nothing to this coefficient -- documented, not silently patched.
+                return self.by_tag(resolved)
+            known = set(self.__dict__.get("_shape_regions") or {})
+            missing = sorted(known - set(values))
+            if missing:
+                raise AttributeError(
+                    f"domain.{name}: region(s) {missing} never attached a '{name}'. Every region must "
+                    f"declare it -- add .attach({name}=...) to each, or use "
+                    f"d.by_region({{...}}, default=...) explicitly if some regions genuinely have none."
+                )
+            return self.by_region(resolved)
+        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
+
+    def attached(self, name: str) -> dict:
+        """The raw ``{region: value}`` mapping for a property declared with :meth:`Shape.attach`.
+
+        ``d.<name>`` gives the per-region *coefficient*, ready for a weak form. This gives the values
+        themselves, for the consumers that need a mapping rather than an expression -- most notably
+        ``enclosure.emissivity({tag: eps})``, since enclosure element tags are region names::
+
+            eps = gap.emissivity(d.attached("eps"))
+
+        Unlike ``d.<name>`` this does not require every region to have declared the property: an
+        enclosure only spans some of them, and a mapping is allowed to be partial.
+        """
+        attached = self.__dict__.get("_region_attachments") or {}
+        if name not in attached:
+            raise KeyError(f"domain.attached: no region declared {name!r}. Declared properties: {sorted(attached)}.")
+        return dict(attached[name])
+
+    def _resolve_attached(self, value):
+        """A plain function attached as a property value is called here with this domain's spatial
+        variables, so ``.attach(k=lambda r, z: 2.0 + 0.5*z)`` becomes a symbolic coefficient.
+
+        It cannot be resolved at ``Shape.attach`` time: a spatially varying value has to be built from
+        ``d.variable(...)``, and the domain does not exist while the geometry plan is being written.
+        ``isroutine`` rather than ``callable`` on purpose -- symbolic expressions define ``__call__``
+        (that is how ``u(x, y)`` binds), so ``callable`` would try to invoke them as size functions.
+        """
+        if not inspect.isroutine(value):
+            return value
+        coords = self.variable("interior", split=True)
+        return value(*coords[: self.dimension])
 
     def _register_tag_boundary_region(self, name, where, region=None):
         """If any **boundary** facets satisfy ``where``, register a ``BoundaryRegion`` for ``name``
