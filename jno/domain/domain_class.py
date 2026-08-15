@@ -10,6 +10,7 @@ import numpy as np
 
 from ..trace import (
     RegionMask,
+    TagMask,
     TensorTag,
     TestFunction,
     TrialFunction,
@@ -30,6 +31,49 @@ def _scalar_float(value: Any) -> float:
     if arr.shape != ():
         raise TypeError(f"Expected scalar value, got shape {arr.shape}.")
     return float(arr.item())
+
+
+def _masked_sum(values, mask_cls, default, *, what: str, key: str):
+    """``sum_k mask_cls(k) * values[k]`` — the one desugaring behind ``by_region`` and ``by_tag``.
+
+    ``default`` (when nonzero) is added over the *complement* of the listed keys, so a cell/facet in no
+    listed region gets it. The two callers differ only in which mask leaf they emit and in what they
+    validate their keys against; the arithmetic, the empty-mapping check and the view guard are shared.
+    """
+    from ..trace.views import _VIEW_TYPES  # local: filled at the END of the views module
+
+    # A typed view survives the sum -- ``Placeholder.__mul__`` yields to views, so ``RegionMask * K``
+    # comes back a MatrixView and ``d.K @ grad(u)`` keeps working. That only holds while the values
+    # agree on ONE view class: mixing them silently returns whichever ``_rewrap`` ran last (measured:
+    # a MatrixView region plus a VectorView region yields a MatrixView, no error), and the assembler
+    # then contracts the wrong rank. Physics, not a crash -- so reject it here.
+    seen: Dict[Any, list] = {}
+    for k, v in values.items():
+        if isinstance(v, _VIEW_TYPES):
+            seen.setdefault(type(v), []).append(str(k))
+    if len(seen) > 1:
+        kinds = ", ".join(
+            f"{cls.__name__} for {sorted(ks)}" for cls, ks in sorted(seen.items(), key=lambda p: p[0].__name__)
+        )
+        raise ValueError(
+            f"domain.{what}: the values mix view types ({kinds}). Every {key} must present the same "
+            f"rank -- a coefficient cannot be a matrix on one {key} and a vector on another. Wrap the "
+            "odd one out so all values agree."
+        )
+
+    expr = None
+    for k, value in values.items():
+        term = mask_cls(str(k)) * value
+        expr = term if expr is None else expr + term
+    if expr is None:
+        raise ValueError(f"domain.{what}: the {{{key}: value}} mapping is empty.")
+    if default is not None and default != 0:
+        covered = None
+        for k in values:
+            m = mask_cls(str(k))
+            covered = m if covered is None else covered + m
+        expr = expr + default * (1.0 - covered)
+    return expr
 
 
 def _is_facet_predicate(where) -> bool:
@@ -1665,21 +1709,45 @@ class domain(MeshIOMixin):
                 f"domain.by_region: unknown region(s) {sorted(unknown)}; each key must be a geometry part, "
                 f"a Shape.regions sub-region, or a domain.tag predicate. Known regions: {sorted(valid)}."
             )
-        expr = None
-        for region, value in values.items():
-            term = RegionMask(str(region)) * value
-            expr = term if expr is None else expr + term
-        if expr is None:
-            raise ValueError("domain.by_region: the {region: value} mapping is empty.")
-        if default is not None and default != 0:
-            covered = None
-            for region in values:
-                m = RegionMask(str(region))
-                covered = m if covered is None else covered + m
-            expr = expr + default * (1.0 - covered)  # cells in no listed region get `default`
+        expr = _masked_sum(values, RegionMask, default, what="by_region", key="region")
         # NB: get_logger's first positional is a log *directory* -- get_logger(__name__) literally
         # creates a folder named `jno.domain.domain_class/` in the caller's cwd.
         get_logger().info(f"by_region: per-region coefficient over {len(values)} region(s): {sorted(map(str, values))}")
+        return expr
+
+    def by_tag(self, values, *, default=None):
+        """A **surface** coefficient whose value depends on which boundary tag a facet carries — the
+        mirror of :meth:`by_region`, for the boundary rather than the volume.
+
+        ``values`` is a ``{tag: value}`` mapping. The returned coefficient evaluates, on each boundary
+        facet, to the value of the tag owning it, so a mixed-boundary condition is **one** term over the
+        whole boundary instead of one term per tag::
+
+            d.tag("wall", lambda x, y: x < 1e-9)
+            d.tag("lid",  lambda x, y: y > 1 - 1e-9)
+            h = d.by_tag({"wall": 25.0, "lid": 5.0})       # per-tag film coefficient
+            xb, yb, _ = d.variable("boundary", split=True)
+            ub, vb = u.bind(x=xb, y=yb), v.bind(x=xb, y=yb)
+            robin = h * (ub - T_inf) * vb                   # one equation, both tags
+
+        A facet belongs to a tag by the assembler's own facet selection — the same rule that decides
+        which facets a Dirichlet condition on that tag pins — so the two can never disagree. As in
+        ``by_region``, a value can be any coefficient (scalar, symbolic expression, trainable
+        ``jno.np.parameter``, typed view), and ``default`` fills the facets in no listed tag.
+
+        Desugars to ``sum_t TagMask(t) * values[t]``. **Surface terms only**: used in a volume term, on
+        a non-nodal space, or in 1-D it raises rather than integrating over the wrong thing. A tag that
+        owns no boundary facet on this mesh raises at assembly rather than contributing silent zero.
+        """
+        valid = set(getattr(self, "_tag_predicates", {}) or {}) | set(getattr(self, "_boundary_regions", {}) or {})
+        unknown = [t for t in values if t not in valid]
+        if unknown:
+            raise ValueError(
+                f"domain.by_tag: unknown tag(s) {sorted(unknown)}; each key must be a boundary tag "
+                f"(``domain.tag(name, where)``). Known tags: {sorted(valid)}."
+            )
+        expr = _masked_sum(values, TagMask, default, what="by_tag", key="tag")
+        get_logger().info(f"by_tag: per-tag surface coefficient over {len(values)} tag(s): {sorted(map(str, values))}")
         return expr
 
     def _register_tag_boundary_region(self, name, where, region=None):

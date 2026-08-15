@@ -69,6 +69,7 @@ from .fem_utils import (
     _CHUNK_OVERRIDE,
     _cell_region_mask,
     _collect_region_mask_names,
+    _collect_tag_mask_names,
     _eval_integrand,
     _gather_temporal_tags,
     _infer_fields,
@@ -1060,6 +1061,41 @@ def assemble_fem_native(
         for _R in set(_surf_read_regions.values()):
             _surf_region_faces[_R] = _region_faces(_R)
 
+    # ---- per-tag facet masks: the surface twin of `region_mask_arrays` -----------------------------
+    # `domain.by_tag({tag: value})` desugars to `sum_t TagMask(t) * value`, which lets ONE boundary
+    # term carry a coefficient that varies across tags -- the surface mirror of `by_region`.
+    #
+    # The mask comes from `_region_faces`, the assembler's OWN facet selection, not from re-evaluating
+    # the tag predicate. Two reasons: a `TagMask("wall")` then covers exactly the facets a Dirichlet
+    # condition on "wall" pins (one selection rule, not a second one that can disagree), and no
+    # tolerance-tight predicate is re-run under float32, where `x > 1 - 1e-9` rounds to `x > 1.0` and
+    # matches nothing at all (`domain.tag_node_mask` moved the node path off JAX for exactly this).
+    #
+    # Indexed by the GLOBAL boundary-face id `fi`, which is what `_surf_elem_res` already receives, so
+    # no alignment against a per-region `fids` slice is needed.
+    _tag_mask_names: Tuple[str, ...] = tuple(
+        sorted(
+            {
+                t
+                for _terms in (boundary_terms or {}).values()
+                for bare in _terms
+                for _, sub in _split_additive_terms(domain, bare)
+                for t in _collect_tag_mask_names(_lower_statefield_to_trial(sub, {}))
+            }
+        )
+    )
+    _tag_mask_arrays: Dict[str, Any] = {}
+    for _t in _tag_mask_names:
+        _faces_t = np.asarray(_region_faces(_t), dtype=np.int64) if conn.n_bfaces > 0 else np.zeros(0, dtype=np.int64)
+        if _faces_t.size == 0:
+            raise ValueError(
+                f"domain.by_tag: tag {_t!r} owns no boundary facet on this mesh, so its term would "
+                f"integrate over nothing. Check the tag's predicate, or drop it from the mapping."
+            )
+        _m = np.zeros(int(conn.n_bfaces), dtype=np.float64)
+        _m[_faces_t] = 1.0
+        _tag_mask_arrays[_t] = jnp.asarray(_m, dtype=qw_shared.dtype)
+
     # ---- contact gaps: u.gap(secondary, main) -> per-face tables, built once, on the host -----------
     # For every secondary face this precomputes where its quadrature points land on the main surface:
     # the main nodes each point reads (`ids`), their shape weights (`w`), and the initial along-normal
@@ -1576,6 +1612,9 @@ def assemble_fem_native(
             "runtime_parameter_tags": runtime_parameter_tags,
             "region_mask_names": (),
             "volume_vars": _runtime_vals(c, t, args, local_all.dtype),
+            # This face's 0/1 value for every tag the boundary terms reference, so `TagMask` resolves
+            # to a scalar here exactly as `RegionMask` does per cell. `fi` is the global face id.
+            "tag_masks": {_t: _arr[fi] for _t, _arr in _tag_mask_arrays.items()},
             "trial_value_shape": fields[btfi]["value_shape"],
             "trial_vec": vecs[btfi],
         }

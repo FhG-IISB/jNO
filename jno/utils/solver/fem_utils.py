@@ -38,6 +38,7 @@ from ...trace import (
     OperationDef,
     RegionMask,
     StateField,
+    TagMask,
     TensorTag,
     TestFunction,
     Tracker,
@@ -568,6 +569,20 @@ def _collect_region_mask_names(node, out=None):
     return out
 
 
+def _collect_tag_mask_names(node, out=None):
+    """Sorted-unique tag names appearing as ``TagMask`` leaves in a lowered expression/IR.
+
+    The surface twin of :func:`_collect_region_mask_names`: the assembler uses it to build only the
+    per-facet masks a term actually references."""
+    if out is None:
+        out = set()
+    if isinstance(node, TagMask):
+        out.add(node.tag)
+    for child in iter_children(node) or ():
+        _collect_tag_mask_names(child, out)
+    return out
+
+
 def _cell_region_mask(domain, region):
     """``(num_cells,)`` 0/1 indicator: a mesh cell is in ``region`` iff its **centroid** is.
 
@@ -1010,6 +1025,7 @@ def _eval_integrand(domain, node, local):
             Constant,
             TensorTag,
             RegionMask,
+            TagMask,
             Variable,
             TestFunction,
             TrialFunction,
@@ -1051,6 +1067,21 @@ def _eval_integrand(domain, node, local):
                 f"reach this on such a form, the mask wiring for that specific path is missing — please report it."
             )
         return jnp.reshape(jnp.asarray(volume_vars[idx]), (-1,))[0]
+
+    if isinstance(node, TagMask):
+        # Per-facet tag indicator, already sliced to THIS boundary face by the surface kernel. Fail
+        # loud rather than defaulting to 1 (which would integrate the term over the whole boundary) or
+        # to 0 (which would drop it) -- both are silent physics errors. This is also what rejects a
+        # TagMask in a VOLUME term, where `tag_masks` is never populated because there is no facet.
+        tag_masks = local.get("tag_masks", None)
+        if not tag_masks or node.tag not in tag_masks:
+            raise NotImplementedError(
+                f"jno.fem per-tag surface integration: the per-facet mask for tag '{node.tag}' was not "
+                f"threaded into this assembly path. `domain.by_tag` builds a coefficient for a SURFACE "
+                f"term -- one bound to a boundary tag's coordinates. Using it in a volume term, on a "
+                f"non-nodal space, or in 1-D is not supported (see docs/fem.md)."
+            )
+        return jnp.asarray(tag_masks[node.tag])
 
     if isinstance(node, TensorTag):
         if node.tag not in local["domain_context"]:

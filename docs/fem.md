@@ -148,6 +148,35 @@ in the `jno.fem([...])` list, and `jno.fem` classifies each by the region it is 
 for a spatially varying Dirichlet value). A zero Neumann flux is the natural default and needs
 no term.
 
+#### Per-tag surface coefficients — `d.by_tag({...})`
+
+A boundary term is normally written per tag, on that tag's coordinates. When the *same* condition
+applies over the whole boundary with only its coefficient changing, `by_tag` collapses it into one
+term — the surface mirror of `by_region`:
+
+```python
+d.tag("wall", lambda x, y: x < 1e-9)
+d.tag("lid",  lambda x, y: y > 1 - 1e-9)
+
+h = d.by_tag({"wall": 25.0, "lid": 5.0})          # per-tag film coefficient
+xb, yb, _ = d.variable("boundary", split=True)
+ub, vb = u.bind(x=xb, y=yb), v.bind(x=xb, y=yb)
+robin = h * (ub - T_inf) * vb                      # ONE term, both tags
+```
+
+It desugars to `sum_t TagMask(t) * values[t]`, and assembles the identical operator and load vector as
+the per-tag term loop. A facet belongs to a tag by the assembler's own facet selection — the same rule
+that decides which facets a Dirichlet condition on that tag pins — so the two can never disagree.
+Values may be anything a coefficient can be (scalars, expressions, trainable parameters, typed views),
+`default=` covers the facets no listed tag claims, and `d.attach("wall", h=25.0)` declares the value on
+the tag itself so the term reads `d.h * (ub - T_inf) * vb`.
+
+**Limits, all loud:** surface terms only — a `TagMask` in a *volume* term raises, as does `by_tag` on
+a non-nodal space (N1E / RT / Morley / Argyris) or in 1-D, where the per-facet mask is not threaded. A
+tag owning no boundary facet on the mesh raises rather than integrating over nothing. Facets that no
+listed tag claims contribute nothing unless `default=` is given — untagged boundary is deliberately
+natural (do-nothing) in jNO, so tags are not required to partition the boundary.
+
 ### Inequalities — `u.bounds(lo, hi)`
 
 A **box constraint** is the inequality sibling of a Dirichlet condition, so it is a term too, and

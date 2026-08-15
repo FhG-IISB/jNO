@@ -239,6 +239,20 @@ def assemble_fem_nonnodal(
         for bare in _terms:
             _collect_runtime_parameter_exprs(bare, _rt_param_exprs)
     runtime_parameter_tags: Tuple[str, ...] = tuple(sorted(_rt_param_exprs))
+    # `domain.by_tag` is a per-FACET coefficient, threaded only by the nodal (fem_native) surface
+    # kernel. Reject it here explicitly rather than trusting that it happens to reach the evaluator:
+    # this path CLASSIFIES boundary terms by pattern (`_n1e_surface_mass_spec` and friends) and lifts
+    # the matched coefficient out, so an unevaluated TagMask inside one could be carried into a
+    # host-assembled surface mass and silently weight every facet alike.
+    from .fem_utils import _collect_tag_mask_names as _tag_names_nn
+
+    _bad_tags = sorted({t for _terms in (boundary_terms or {}).values() for bare in _terms for t in _tag_names_nn(bare)})
+    if _bad_tags:
+        raise NotImplementedError(
+            f"jno.fem: domain.by_tag({_bad_tags}) is not supported on a non-nodal space (N1E / RT / "
+            f"Morley / Argyris) -- its per-facet mask is threaded only by the nodal Lagrange surface "
+            f"kernel. Write one boundary term per tag instead, or use a Lagrange space."
+        )
     # Per-region volume integration: a `RegionMask` node restricts a term to one material's cells. The
     # evaluator reads its 0/1 per-cell value out of `volume_vars` at the slot AFTER the temporal and
     # runtime-parameter slots (layout [temporal..., runtime_param..., region_mask...]) and raises loudly

@@ -31,6 +31,7 @@ __all__ = [
     "Variable",
     "TensorTag",
     "RegionMask",
+    "TagMask",
     "BinaryOp",
     "Tracker",
     "Model",
@@ -1550,6 +1551,30 @@ class RegionMask(Placeholder):
 
     def __repr__(self):
         return f"RegionMask({self.region})"
+
+
+class TagMask(Placeholder):
+    """Per-**boundary-facet** indicator for a named tag — the surface mirror of :class:`RegionMask`,
+    multiplied into a surface term by ``jno.fem`` so a coefficient can vary across ONE boundary term.
+
+    A facet belongs to the tag iff the tag owns it, resolved by the assembler's own facet selection
+    (``fem_native._region_faces``) rather than by re-evaluating the tag predicate. That is deliberate:
+    it makes ``TagMask("wall")`` select *exactly* the facets a Dirichlet condition bound to ``"wall"``
+    pins, and it avoids re-running a tolerance-tight predicate under float32, where ``x > 1 - 1e-9``
+    rounds to ``x > 1.0`` and silently matches nothing (see ``domain.tag_node_mask``).
+
+    It is a leaf (no children) and carries no coordinates, so it composes as a plain scalar
+    coefficient: ``TagMask(tag) * surface_term``. Built by :meth:`jno.domain.by_tag`.
+
+    Surface terms only. In a **volume** term there is no facet to indicate, and the evaluator raises
+    rather than integrating over the whole boundary or silently contributing nothing.
+    """
+
+    def __init__(self, tag: str):
+        self.tag = str(tag)
+
+    def __repr__(self):
+        return f"TagMask({self.tag})"
 
 
 class BinaryOp(Placeholder):
