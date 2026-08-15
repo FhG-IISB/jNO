@@ -80,3 +80,33 @@ def test_vector_complex_mul_by_complex_scalar_broadcasts():
     # (cr + i·ci)(re + i·im) = (cr·re − ci·im) + i(cr·im + ci·re), broadcast c over the d components
     np.testing.assert_allclose(_eval(out.real.expr), cr * re - ci * im, atol=1e-9)
     np.testing.assert_allclose(_eval(out.imag.expr), cr * im + ci * re, atol=1e-9)
+
+
+def test_complex_vector_bind_is_reachable():
+    """``ComplexVectorView.bind`` existed but had no wrapper registered, so it raised ``KeyError``.
+
+    ``ComplexVectorView`` was the one view class defining ``partials``/``bind`` (views.py) while being
+    absent from ``_NAMED_PARTIALS_CLS_FOR``, so every call died in the dispatch table rather than
+    doing anything. Regression guard for that registration.
+    """
+    from jno.trace import Variable
+    from jno.trace.views import NamedComplexVectorViewWithPartials
+
+    from tests.conftest import MockDomain
+
+    d = MockDomain()
+    d.context["xy"] = jnp.zeros((10, 2))
+    x = Variable("xy", [0, 1], domain=d)
+    y = Variable("xy", [1, 2], domain=d)
+
+    # (N, d, 2): 3 points, 2 vector components, [re, im]
+    field = jnp.arange(12, dtype=jnp.float64).reshape(3, 2, 2)
+    E = _const(field).vector.complex
+    assert isinstance(E, ComplexVectorView)
+
+    bound = E.bind(x=x, y=y)
+    assert isinstance(bound, NamedComplexVectorViewWithPartials)
+    assert sorted(object.__getattribute__(bound, "_coord_vars").keys()) == ["x", "y"]
+
+    # Re-bind stays on the same class and merges (the C1 dispatch fix).
+    assert type(bound.bind(x=x)) is type(bound)

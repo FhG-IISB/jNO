@@ -132,6 +132,20 @@ Every view supports `.bind(**named_vars)` (alias `.partials(...)`) to attach the
 a field depends on, so attribute-style derivatives (`.x`, `.t`) work even when those coordinates are not
 the network's own inputs.
 
+**Re-binding.** `.bind(...)` may be called on an already-bound view: names merge, and a name given
+again wins. That is how you resolve the conflict `u.bind(x=x1) + v.bind(x=x2)` raises — arithmetic
+refuses to pick a side, so you say which one explicitly.
+
+```python
+u = net(f).scalar.bind(x=x)
+u = u.bind(y=y)          # keeps x, adds y
+u = u.bind(x=x_other)    # overrides x, keeps y
+```
+
+A re-bind returns the **same** view class it was called on, so a `.field` view keeps its
+finite-difference derivatives rather than silently reverting to automatic differentiation (which
+would be identically zero for an operator network that never takes `x` / `y` as inputs).
+
 ### Units & non-dimensionalization
 
 Annotate the **dimension** and characteristic **magnitude** of any leaf, and `jno.units` audits
