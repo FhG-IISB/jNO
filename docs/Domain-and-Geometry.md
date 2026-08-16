@@ -119,6 +119,30 @@ solid.sized(lambda x, y, z: 0.03 + 0.10 * y)    # graded: denser where the funct
 So "denser in a region" = give a small `size=` to the shape covering it, or a callable that is small
 there.
 
+### Cell shape — `.quad()`
+
+Meshes are simplicial by default (triangles, tetrahedra). `.quad()` asks gmsh to recombine them into
+**quadrilaterals**, which works on any 2-D geometry:
+
+```python
+d = Shape.disk(0, 0, 1, size=0.1).quad().domain()      # pure quads, curved boundary and all
+(plate.quad() - hole).sized(0.05)                       # survives the plan operators, like .sized()
+```
+
+Like `size=` and `.curved()`, this is a property of the shape rather than an argument to the solve.
+
+**3-D is structured-only.** gmsh cannot hexahedral-mesh general geometry — `Recombine3DAll` on a
+plain box returns tetrahedra — so `.quad()` refuses a 3-D shape. For a box of hexahedra use the
+structured constructor, which needs no mesher at all:
+
+```python
+d = jno.domain(constructor=jno.domain.equi_distant_box(nx=16, ny=16, nz=16, cell="hex"))
+d = jno.domain(constructor=jno.domain.equi_distant_rect(nx=40, ny=40, cell="quad"))
+```
+
+See the FEM guide's tensor-product section for what these support: volume terms and Dirichlet
+conditions work; surface integrals, `order > 1` and h-adaptivity refuse by name.
+
 ### Multi-material regions
 
 Name each material with `.name(...)` and combine with `+` to build a **multi-material** domain: the

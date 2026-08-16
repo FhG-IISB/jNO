@@ -634,6 +634,67 @@ Note also that a curved map makes the integrand rational, so **no quadrature rul
 The default degree is raised by 2 on curved cells and `jno.fem(quad_degree=...)` still overrides;
 measured on the study above, refining the rule moves the answer by less than 0.01 %.
 
+## Quadrilateral and hexahedral (tensor-product) cells
+
+jNO meshes simplices by default — triangles in 2-D, tetrahedra in 3-D. Tensor-product cells are
+available two ways, and which one you can use is decided by what a mesher can actually produce:
+
+```python
+# 2-D quadrilaterals on ARBITRARY geometry, via gmsh recombination
+d = jno.Shape.disk(0, 0, 1, size=0.1).quad().domain()
+
+# structured grids, no mesher involved — a rectangle of quads, a box of hexes
+d = jno.domain(constructor=jno.domain.equi_distant_rect(nx=40, ny=40, cell="quad"))
+d = jno.domain(constructor=jno.domain.equi_distant_box(nx=16, ny=16, nz=16, cell="hex"))
+```
+
+Nothing else in the term list changes — the weak form, the boundary conditions and the solve are
+written exactly as they are on a simplex mesh.
+
+**Why bother.** Linear triangles and tetrahedra are stiff: they lock in near-incompressible
+elasticity and are poor in bending, which is why mechanics codes are built on hexahedra. A
+quadrilateral grid is also the mesh the topology-optimisation literature is written on, and for
+layered geometry (a metasurface stack, a planar transformer, a PCB) a structured hex mesh is both
+better conditioned and far cheaper per node than tetrahedra.
+
+**Why 3-D is structured-only.** gmsh cannot hexahedral-mesh general geometry. Measured here,
+`Recombine3DAll` on a plain box returns **944 tetrahedra and zero hexahedra**; hexes come only from
+sweeping/extruding or transfinite meshing. `Shape.quad()` therefore refuses a 3-D shape by name
+rather than quietly handing back tetrahedra. 2-D recombination has no such limit — a disk
+recombines to pure quadrilaterals just as a rectangle does.
+
+**Accuracy.** Q1 recovers O(h²), measured on `-Δu = 2π²sin(πx)sin(πy)`:
+
+| mesh | rates per halving | note |
+|---|---|---|
+| structured quads | 1.87, 1.92, 1.96 | same error as the triangulation of the same grid, from half the cells |
+| structured hexes | 1.79, 1.86 | same error as the tetrahedralisation, from a sixth the cells |
+| recombined quads (`Shape.quad()`) | 1.83, 1.91 | ~5× the L2 error of triangles at equal node count on this smooth problem |
+
+That last row is worth reading honestly: **recombination is not a free accuracy win**. It leaves
+some poorly-shaped cells, and on smooth scalar Poisson the triangulation is more accurate per node.
+The tensor-product advantage is in bending and near-incompressibility, not here.
+
+The geometry map is formed **per quadrature point**, because a bilinear quad or trilinear hex has a
+Jacobian that varies within the cell even when the cell looks straight-sided — the same machinery
+`Shape.curved()` introduced. The quadrature degree is raised by 2 for the same reason it is on curved
+cells: the map makes the integrand rational, so no rule is exact.
+
+**Scope — what is not supported yet**, each refusing by name rather than approximating:
+
+| not supported on quad/hex | why |
+|---|---|
+| surface / boundary integrals (Neumann, Robin, flux, radiation) | the facet area element and normal are still formed once per facet, which is only right for a straight simplex facet; a hexahedron's face is bilinear and needs Nanson normals per quadrature point |
+| `order > 1` (Q2, Q3) | higher-order node promotion places nodes by **barycentric** weights, which only describe a simplex |
+| 4th-order forms (plates, phase-field) | the physical-Hessian push-forward assumes an affine cell — the same refusal curved simplices already carry |
+| h-adaptive remeshing (`adapt=`) | mmg is a simplex remesher; conforming quad/hex refinement is a different algorithm |
+| non-nodal families (N1E, RT, Argyris, Morley) | Argyris and Morley are *defined* on triangles; the quad analogues (RTCF/NCE, Bogner–Fox–Schmit) are different elements |
+| `Shape.quad().curved()` | a curved quadrilateral is a 9-node block the emitter does not produce |
+
+Dirichlet conditions and volume terms — including multi-field, coupled and transient problems —
+work. In practice that means a quad/hex mesh is ready for problems posed with essential boundary
+conditions, and a simplex mesh is still what you want for anything with a surface integral in it.
+
 ### Mesh resolution for wave problems
 
 Because N1E is **lowest order only** (`order=` is refused, above), the mesh is your *only* accuracy
