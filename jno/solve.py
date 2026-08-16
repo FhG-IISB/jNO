@@ -952,6 +952,7 @@ def remesh(
 
 def relocate(
     *,
+    objective: str = "equidistribution",
     method: str = "descent",
     max_iters: int = 8,
     lr: float = 3e-3,
@@ -972,6 +973,29 @@ def relocate(
     Tagging is **literal and per-axis**: ``xm.trainable()`` frees only the x column. That is the lever for
     boundary vertices — free an edge's *along-edge* axis and its nodes slide within the wall; leave the
     normal axis untagged and the domain shape is preserved exactly.
+
+    **Two objectives, and the choice is the problem's, not a preference.** ``objective=`` picks *what*
+    descent minimises:
+
+    - ``"equidistribution"`` (default) equidistributes an **arclength monitor** — it targets *resolution*,
+      and wins where a feature is under-resolved or moving.
+    - ``"energy"`` descends the **FE Dirichlet energy**. For a Ritz method
+      ``E_h - E_exact = 1/2 ||u - u_h||_E^2``, so on a steady problem the energy *is* the error norm and
+      descending it minimises the error directly.
+    - ``"huang"`` is Huang's equidistribution–alignment functional (see :class:`AdaptSpec`).
+
+    Neither dominates, measured on the two problem types the test suite pins:
+
+    ==========================  =========================  =========================
+    objective                   L-shape corner (fixed)     Allen–Cahn front (moving)
+    ==========================  =========================  =========================
+    ``"energy"``                **55 % error cut**         10.7x WORSE than uniform
+    ``"equidistribution"``      12 % worse                 **0.51x uniform**
+    ==========================  =========================  =========================
+
+    So: a **fixed singularity** wants ``"energy"``; an **under-resolved or moving front** wants the
+    default. The energy is also not scale-free — a vector field carries the energy of all its components,
+    so ``lr`` is problem-scaled — where the monitor functionals are.
 
     **Two methods.** ``"descent"`` (default) walks the vertices down the equidistribution defect of an
     arclength monitor, evaluated *through the differentiable solve*, with a backtracking ``det J`` line
@@ -1037,6 +1061,7 @@ def relocate(
 
     return AdaptSpec(
         relocate=True,
+        objective=objective,
         relocate_method=method,
         max_iters=max_iters,
         lr=lr,

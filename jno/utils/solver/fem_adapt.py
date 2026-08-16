@@ -2642,8 +2642,8 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
             return newton_krylov(lambda uu: op.residual(uu, vals), u0)
         return _march(vals)  # transient: time-averaged nodal state over the marched trajectory
 
-    if spec.objective not in ("equidistribution", "huang"):
-        raise ValueError(f"AdaptSpec.objective must be 'equidistribution' or 'huang'; got {spec.objective!r}.")
+    if spec.objective not in ("energy", "equidistribution", "huang"):
+        raise ValueError(f"AdaptSpec.objective must be 'energy', 'equidistribution' or 'huang'; got {spec.objective!r}.")
     if spec.relocate_method not in ("descent", "monge_ampere"):
         raise ValueError(f"AdaptSpec.relocate_method must be 'descent' or 'monge_ampere'; got {spec.relocate_method!r}.")
 
@@ -2655,17 +2655,17 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
         d_ = 0.0
         for i in range(len(bounds) - 1):
             bf = _vertex_values(u[bounds[i] : bounds[i + 1]], i)
-            if spec.objective == "huang":
+            if spec.objective == "energy":
+                d_ = d_ + _dirichlet_energy_jax(pts, bf, cells_j, dim)
+            elif spec.objective == "huang":
                 d_ = d_ + _huang_ea_jax(pts, pts0_j, bf, cells_j, dim)
             else:
                 d_ = d_ + _equidistribution_jax(pts, bf, cells_j, dim)
         return d_
 
     def _objective(vals):
-        """What relocation descends: the monitor's **equidistribution defect**, not the FE energy.
-
-        The energy is still computed and reported in ``adapt_history`` as a diagnostic — it is a useful
-        thing to watch, it just makes a bad objective (see :func:`_equidistribution_jax`)."""
+        """What relocation descends -- :attr:`AdaptSpec.objective`. The FE energy is *also* computed and
+        reported in ``adapt_history`` whichever objective is chosen, so the two are always comparable."""
         u = _solve_at(vals)
         pts = _scatter(vals)
         bounds = list(fem.offsets) if fem.offsets is not None else [0, int(u.shape[0])]
