@@ -703,10 +703,30 @@ onto one DOF, so the periodicity holds exactly rather than to a tolerance.
 | not supported on quad/hex | why |
 |---|---|
 | **non-matching** mortar ties across a hexahedral facet | interpolating *across* a quad facet needs shape functions the barycentric weights do not have. Matching (conforming) periodic ties on hexes DO work — see below |
-| **h-adaptive remeshing** (`adapt=`) | mmg adapts simplices, and the recovery estimator differentiates P1 shape functions (constant per cell, which a bilinear cell's are not). Conforming quad/hex refinement is a different algorithm — templates, or an octree with hanging nodes |
+| **h-adaptive remeshing** (`adapt=`) | the *estimator* works on both cells (below); the **mesher** does not — mmg adapts simplices by edge split/collapse/swap, and there is no mmg for quads or hexes. `remesh(max_iters=1)` on a quad mesh therefore solves and estimates; a second round refuses at the remesh, by name |
 | 4th-order forms (plates, phase-field) | the physical-Hessian push-forward assumes an affine cell — the same refusal curved simplices already carry |
 | non-nodal families (N1E, RT, Argyris, Morley) | Argyris and Morley are *defined* on triangles; the quad analogues (RTCF/NCE, Bogner–Fox–Schmit) are different elements |
 | `Shape.quad().curved()` | a curved quadrilateral is a 9-node block the emitter does not produce |
+
+The **recovery error estimator** runs on both cell families. On a simplex the P1 gradient is constant
+per cell, so inverting the edge matrix is the answer; on a bilinear cell the gradient varies, and the
+sample is taken at the cell **centroid** — the superconvergent (Barlow) point of a Q1 gradient, where
+it is `O(h²)` accurate against `O(h)` elsewhere, which is the property Zienkiewicz–Zhu recovery needs
+of its samples. Measured as the effectivity index `eta / true error` on `-Δu = f`:
+
+| n | quads | triangles |
+|---|---|---|
+| 8 | 1.301 | 1.018 |
+| 16 | 1.147 | 1.012 |
+| 32 | 1.069 | 1.006 |
+
+Both asymptotically exact. The indicator integrates the gradient gap over the cell with the element's
+own quadrature rather than sampling it at the centre: on a quad *both* the recovered field and `∇u_h`
+are superconvergent at the centre, so a centroid rule compares two good approximations and misses the
+error, and its effectivity **decayed** (0.81 → 0.53 → 0.35 over the same meshes) while looking
+healthy. That fix improved the simplex path too, from ~0.77 to ~1.006.
+
+Reference: Zienkiewicz & Zhu, IJNME **33** (1992) 1331–1364; Barlow, IJNME **10** (1976) 243–251.
 
 Volume terms, Dirichlet conditions and **surface terms all work on both cells** — Neumann, Robin
 and flux integrals included.

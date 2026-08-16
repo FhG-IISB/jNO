@@ -1004,18 +1004,61 @@ def zz_error_indicators(domain: Any, u_vertex: np.ndarray) -> tuple[np.ndarray, 
     u = np.asarray(u_vertex)
     comps = [u[:, c] for c in range(u.shape[1])] if (u.ndim == 2 and u.shape[1] > 1) else [u.reshape(-1)]
 
-    # elementwise gap, integrated over the cell (centroid rule: P1 g_cell is exact there and the centroid
-    # value of the P1-recovered field is the vertex mean), summed over the field's components. For a COMPLEX
-    # component the gap is complex and the energy-norm uses its modulus ``|g* - grad u_h|^2`` (exact for
-    # reals since ``|x|^2 == x^2``) -- so one indicator drives real, complex and vector fields alike.
+    # The gap ``|g* - grad u_h|^2`` INTEGRATED over each cell, summed over the field's components. For a
+    # COMPLEX component the gap is complex and the energy-norm uses its modulus (exact for reals since
+    # ``|x|^2 == x^2``), so one indicator drives real, complex and vector fields alike.
+    #
+    # This used to be a one-point centroid rule, which is exact on a simplex -- ``grad u_h`` is constant
+    # there -- and WRONG on a tensor-product cell in a way that hides itself. A Q1 gradient sampled at the
+    # cell centre is superconvergent, and so is the recovered field there, so the centroid gap compares two
+    # O(h^2)-accurate quantities and misses the O(h) variation of ``grad u_h`` across the rest of the cell.
+    # Measured on -Delta u = f with u = sin(pi x) sin(pi y): the estimate then fell at rate 2 while the true
+    # energy error fell at rate 1, so the effectivity index DECAYED (0.81 -> 0.53 -> 0.35 over n = 8, 16, 32)
+    # instead of holding. An indicator that shrinks faster than the error still runs, still returns
+    # plausible numbers, and marks the wrong cells.
     eta2 = None
     for uc in comps:
-        g_star, g_cell, area, cells = _recover_nodal_gradient(domain, uc)
-        g_star_centroid = g_star[cells].mean(axis=1)  # (n_cells, dim)
-        e = area * np.sum(np.abs(g_star_centroid - g_cell) ** 2, axis=1)  # (n_cells,), real
+        g_star, _g_cell, _area, _cells = _recover_nodal_gradient(domain, uc)
+        e = _integrated_gradient_gap(domain, np.asarray(uc).reshape(-1), g_star)
         eta2 = e if eta2 is None else eta2 + e
     eta = np.sqrt(np.maximum(eta2, 0.0))
     return eta, float(np.sqrt(eta2.sum()))
+
+
+def _integrated_gradient_gap(domain: Any, u_vertex: np.ndarray, g_star: np.ndarray) -> np.ndarray:
+    """``(n_cells,)`` of ``\\int_K |g* - grad u_h|^2``, by the cell's own quadrature.
+
+    The recovered field ``g*`` is interpolated with the same P1/Q1 basis the solution uses, and both it
+    and ``grad u_h`` are evaluated at every quadrature point rather than at the cell centre — which is
+    what makes this the Zienkiewicz–Zhu indicator on a tensor-product cell rather than on a simplex
+    only. See the note in :func:`zz_error_indicators` for what the centroid shortcut cost.
+
+    One code path for both cell families: nothing here is simplicial, and on a simplex the extra
+    quadrature points cost a little and change nothing, since ``grad u_h`` is constant and the rule is
+    exact for the resulting quadratic integrand.
+    """
+    from .fem_lagrange import lagrange_on
+    from .fem_native import _basix_ordered, mesh_cell_type
+
+    dim = int(domain.dimension)
+    cell_type = mesh_cell_type(domain, dim)
+    # Degree 3 is exact for the quadratic integrand a simplex produces and enough resolution across a
+    # bilinear cell, where the integrand is rational and no rule is exact.
+    spec = lagrange_on(cell_type, 1, quad_degree=3)
+    cells = _basix_ordered(np.asarray(domain.mesh.cells_dict[cell_type]), cell_type).astype(np.int64)
+
+    X = np.asarray(domain.mesh.points)[:, :dim].astype(np.float64)[cells]  # (C, A, dim)
+    N = np.asarray(spec.ref_values)[:, :, 0]  # (Q, A)
+    dN = np.asarray(spec.ref_grads)[:, :, 0, :]  # (Q, A, T)
+    w = np.asarray(spec.quad_weights)  # (Q,)
+
+    J = np.einsum("cai,qak->cqik", X, dN)  # (C, Q, dim, T)
+    detJ = np.abs(np.linalg.det(J))  # (C, Q)
+    gphys = np.einsum("qak,cqki->cqai", dN, np.linalg.inv(J))  # (C, Q, A, dim)
+
+    gh = np.einsum("cqai,ca->cqi", gphys, u_vertex[cells])  # grad u_h at each quadrature point
+    gs = np.einsum("qa,cai->cqi", N, np.asarray(g_star)[cells])  # the recovered field, same points
+    return np.einsum("cq,cq,q->c", np.sum(np.abs(gs - gh) ** 2, axis=2), detJ, w)
 
 
 def _require_simplex(domain, dim: int, what: str) -> None:
@@ -1062,6 +1105,69 @@ def _p1_element_gradients(domain: Any) -> tuple[np.ndarray, np.ndarray, np.ndarr
     return grad, measure, cells
 
 
+def _tensor_element_gradients(domain: Any, cell_type: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Q1 shape-function gradients at each cell's **centroid**, and the cell measures.
+
+    The simplex path opposite gets the gradient for free: a P1 gradient is constant over the cell, so
+    inverting the edge matrix *is* the answer. A bilinear (Q1) or trilinear cell has no such constant
+    — its gradient varies inside the element — so a sample point has to be chosen, and which one is
+    not a matter of taste.
+
+    **The centroid is the superconvergent (Barlow) point of a Q1 gradient**: there the derivative is
+    ``O(h^2)`` accurate against ``O(h)`` elsewhere in the cell, which is exactly the property
+    Zienkiewicz–Zhu patch recovery needs of its samples — averaging non-superconvergent samples
+    recovers nothing and yields an indicator that marks the wrong cells while still *looking* like it
+    works. (For Q2 the superconvergent set is the 2x2 Gauss points instead; this estimator reads
+    vertex values only, so Q1 is the relevant case whatever the solution's order.)
+
+    Reference: Zienkiewicz & Zhu, *The superconvergent patch recovery and a posteriori error
+    estimates. Part 1*, Int. J. Numer. Methods Eng. **33** (1992) 1331-1364; Barlow, *Optimal stress
+    locations in finite element models*, Int. J. Numer. Methods Eng. **10** (1976) 243-251.
+
+    Returns ``(grad, measure, cells)`` in the same shapes the simplex path returns, so
+    :func:`_recover_nodal_gradient` is identical for both. ``cells`` comes back in **basix** vertex
+    order, because that is the order the tabulated basis is written in — pairing VTK-ordered cells
+    with it evaluates a bow-tie whose Jacobian changes sign inside the cell.
+    """
+    from .fem_lagrange import _lagrange_basix, basix_cell, lagrange_on
+    from .fem_native import _basix_ordered
+
+    dim = int(domain.dimension)
+    cell, tdim = basix_cell(cell_type)
+    spec = lagrange_on(cell_type, 1)
+    cells = _basix_ordered(np.asarray(domain.mesh.cells_dict[cell_type]), cell_type).astype(np.int64)
+    X = np.asarray(domain.mesh.points)[:, :dim].astype(np.float64)[cells]  # (n_cells, n_local, dim)
+
+    # dN/dxi at the reference cell's centre. `spec.ref_grads` is tabulated on the element's own
+    # quadrature, so tabulate again at the single point we actually want to sample. basix's
+    # quadrilateral and hexahedron are the unit hypercube, so the centre is 0.5 along every axis.
+    dN_c = np.asarray(_lagrange_basix(cell, 1).tabulate(1, np.full((1, tdim), 0.5)))[1 : tdim + 1, 0, :, 0].T
+
+    J = np.einsum("cai,ak->cik", X, dN_c)  # (n_cells, dim, tdim): dx_i/dxi_k
+    grad = np.einsum("ak,cki->cai", dN_c, np.linalg.inv(J))  # dN_a/dx_i = sum_k dN_a/dxi_k * dxi_k/dx_i
+
+    # The measure is NOT |det J| times the reference volume: det J varies over a bilinear cell, so it
+    # has to be integrated. Exact for a parallelogram, and the right answer for a trapezoid too.
+    dN_q = np.asarray(spec.ref_grads)[:, :, 0, :]  # (n_quad, n_dof, tdim)
+    Jq = np.einsum("cai,qak->cqik", X, dN_q)  # (n_cells, n_quad, dim, tdim)
+    measure = np.einsum("cq,q->c", np.abs(np.linalg.det(Jq)), np.asarray(spec.quad_weights))
+    return grad, measure, cells
+
+
+def _element_gradients(domain: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Per-cell shape-function gradients and measures, whichever cell the mesh carries.
+
+    Dispatches on the mesh's own volume cell rather than on the dimension: a 3-D mesh is tetrahedral
+    or hexahedral, and only the mesh knows which.
+    """
+    from .fem_native import TENSOR_PRODUCT_CELLS, mesh_cell_type
+
+    cell_type = mesh_cell_type(domain, int(domain.dimension))
+    if cell_type in TENSOR_PRODUCT_CELLS:
+        return _tensor_element_gradients(domain, cell_type)
+    return _p1_element_gradients(domain)
+
+
 def _recover_nodal_gradient(domain: Any, field: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Patch-recovered (superconvergent) nodal gradient of a P1 ``field``.
 
@@ -1071,7 +1177,7 @@ def _recover_nodal_gradient(domain: Any, field: np.ndarray) -> tuple[np.ndarray,
     areas/volumes, and ``cells`` the ``(n_cells, n_local)`` connectivity.  Works for 2D triangle
     and 3D tetrahedron P1 meshes.
     """
-    sg, measure, cells = _p1_element_gradients(domain)  # geometric, exact for P1 simplices
+    sg, measure, cells = _element_gradients(domain)  # exact for P1 simplices, Barlow-sampled on Q1
     sg = np.asarray(sg)  # (n_cells, n_local, dim)
     cells = np.asarray(cells)
     n_cells, _, dim = sg.shape
@@ -1186,10 +1292,19 @@ def size_field_from_marks(domain: Any, marked_cells: np.ndarray, *, refine_facto
     The current local size at a vertex is its mean incident edge length; vertices
     touched by a marked cell get that divided by ``refine_factor``, so Mmg refines
     exactly the flagged region while leaving the rest near its current resolution.
+
+    Cell-generic: the all-pairs loop below needs only "how many vertices a cell has", so it works on
+    a quadrilateral or hexahedron unchanged. It does count a quad's two DIAGONALS among its "edges",
+    which biases the local size upward by a bounded factor -- acceptable in a heuristic whose output
+    is a target, not a measurement, but stated here rather than left to be rediscovered. Taking the
+    cells by dimension instead of by cell type was a bare ``KeyError: 'triangle'`` on a quad mesh,
+    raised one stage before the mesher that is the real limit.
     """
+    from .fem_native import mesh_cell_type
+
     dim = int(domain.dimension)
     pts = np.asarray(domain.mesh.points)[:, :dim]
-    tris = np.asarray(domain.mesh.cells_dict[_simplex_cell_key(dim)])
+    tris = np.asarray(domain.mesh.cells_dict[mesh_cell_type(domain, dim)])
     n_vert = pts.shape[0]
 
     # mean incident edge length per vertex
@@ -1252,16 +1367,18 @@ def _simplex_measure_divisor(dim: int) -> float:
     return {1: 1.0, 2: 2.0}.get(int(dim), 6.0)
 
 
-def _mesh_cells(domain: Any) -> tuple[np.ndarray, int]:
+def _mesh_cells(domain: Any, what: str = "this adaptive path") -> tuple[np.ndarray, int]:
     """The mesh's simplices, refusing by name when there are none.
 
-    The relocation driver is simplex-only for the same reason the refinement one is, and it reaches
-    here first. Without the guard the missing block surfaced as a bare ``KeyError: 'triangle'`` /
+    Without the guard the missing block surfaced as a bare ``KeyError: 'triangle'`` /
     ``KeyError: 'tetra'`` from the dict lookup below — a message that names neither the cell type the
     mesh actually carries nor what would have to exist to support it.
+
+    ``what`` names the caller, because this helper serves both drivers and a message that blamed the
+    wrong one would be worse than the ``KeyError``: it would send the reader to the wrong code.
     """
     dim = int(domain.dimension)
-    _require_simplex(domain, dim, "r-adaptivity (relocation)")
+    _require_simplex(domain, dim, what)
     return np.asarray(domain.mesh.cells_dict[_simplex_cell_key(dim)]).astype(np.int64), dim
 
 
@@ -1727,7 +1844,13 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
         eta, est = zz_error_indicators(d, u)
         n_dofs = int(np.asarray(d.mesh.points).shape[0])
         marked = None if spec.anisotropic else dorfler_mark(eta, spec.theta)
-        _rec_cells, _ = _mesh_cells(d)  # points/cells: for a refinement animation (connectivity changes each round)
+        # points/cells for a refinement animation (connectivity changes each round). Recorded with the
+        # mesh's OWN cells rather than through `_mesh_cells`, which requires simplices: recording a
+        # quad mesh needs no such thing, and going through it made the h path refuse HERE, one stage
+        # before the mesher that is the real limit -- with the relocation driver's name on the message.
+        from .fem_native import mesh_cell_type as _mct
+
+        _rec_cells = np.asarray(d.mesh.cells_dict[_mct(d, int(d.dimension))])
         history.append(
             {
                 "n_dofs": n_dofs,
@@ -2182,7 +2305,7 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
         raise NotImplementedError(f"AdaptSpec(relocate=True): unsupported problem mode {mode!r}.")
 
     dim = int(dom.dimension)
-    cells, _ = _mesh_cells(dom)
+    cells, _ = _mesh_cells(dom, "r-adaptivity (relocation)")
     cells_j = jnp.asarray(cells)
     pts0 = np.asarray(dom.mesh.points)[:, :dim].copy()
     pts0_j = jnp.asarray(pts0)
