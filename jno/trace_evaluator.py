@@ -115,7 +115,24 @@ def _uniform_grid_spec(domain, n_values: int):
     return shape, spacing
 
 
-def _spectral_second_moments(values_flat, shape, spacing, pairs, *, trace: bool):
+def _mirror_axis(u, axis: int):
+    """Even (mirror) extension along ``axis``: ``[u0..u_{N-1}, u_{N-2}..u_1]``, length ``2N-2``.
+
+    The result is periodic, so the ordinary FFT machinery applies unchanged -- which is why the
+    cosine sub-scheme needs no DCT/DST. (JAX implements only DCT-2 and has no DST at all, so the
+    transform-pair route would have meant hand-rolling one.)
+    """
+    n = u.shape[axis]
+    tail = jnp.flip(jnp.take(u, jnp.arange(1, n - 1), axis=axis), axis=axis)
+    return jnp.concatenate([u, tail], axis=axis)
+
+
+def _unmirror_axis(u, axis: int, n: int):
+    """Take the first ``n`` entries along ``axis`` — the original half of a mirrored array."""
+    return jnp.take(u, jnp.arange(n), axis=axis)
+
+
+def _spectral_second_moments(values_flat, shape, spacing, pairs, *, trace: bool, mirror: bool = False):
     """Second derivatives along grid axes, from **one** transform pair.
 
     ``pairs`` is the list of ``(a, b)`` axis pairs wanted. With ``trace=True`` the diagonal is summed
@@ -130,10 +147,15 @@ def _spectral_second_moments(values_flat, shape, spacing, pairs, *, trace: bool)
     u = jnp.asarray(values_flat).reshape(shape)
     axes = tuple(sorted({int(a) for pair in pairs for a in pair}))
 
-    sl = [slice(None)] * len(shape)
-    for a in axes:
-        sl[a] = slice(0, -1)
-    u = u[tuple(sl)]
+    orig_n = {a: u.shape[a] for a in axes}
+    if mirror:
+        for a in axes:
+            u = _mirror_axis(u, a)
+    else:
+        sl = [slice(None)] * len(shape)
+        for a in axes:
+            sl[a] = slice(0, -1)
+        u = u[tuple(sl)]
 
     def _k(a, *, odd: bool):
         n = u.shape[a]
@@ -146,7 +168,11 @@ def _spectral_second_moments(values_flat, shape, spacing, pairs, *, trace: bool)
 
     def _restore(arr):
         for a in axes:
-            arr = jnp.concatenate([arr, jnp.take(arr, jnp.array([0]), axis=a)], axis=a)
+            arr = (
+                _unmirror_axis(arr, a, orig_n[a])
+                if mirror
+                else jnp.concatenate([arr, jnp.take(arr, jnp.array([0]), axis=a)], axis=a)
+            )
         return arr
 
     if trace:
@@ -163,7 +189,7 @@ def _spectral_second_moments(values_flat, shape, spacing, pairs, *, trace: bool)
     return comps
 
 
-def _spectral_diff(values_flat, shape, spacing, axis: int, order: int):
+def _spectral_diff(values_flat, shape, spacing, axis: int, order: int, *, mirror: bool = False):
     """``d^order/dx_axis^order`` of a flat nodal field, via the FFT along that grid axis.
 
     Exact for a band-limited periodic field; on a non-periodic one the implied periodic extension
@@ -176,6 +202,21 @@ def _spectral_diff(values_flat, shape, spacing, axis: int, order: int):
     was_real = not jnp.iscomplexobj(values_flat)
     u = jnp.asarray(values_flat).reshape(shape)
     h = spacing[axis]
+
+    if mirror:
+        # Even extension: exact when the field's odd derivatives vanish at both ends (Neumann-like),
+        # which is a real but NARROWER class than "non-periodic" -- a field with u' != 0 at an end
+        # still has a kink in the extension and still rings, just far less (measured 44x on a ramp).
+        n_orig = u.shape[axis]
+        u = _mirror_axis(u, axis)
+        n = u.shape[axis]
+        k = 2.0 * jnp.pi * jnp.fft.fftfreq(n, d=h)
+        if order % 2 == 1 and n % 2 == 0:
+            k = k.at[n // 2].set(0.0)
+        mult = ((1j * k) ** order).reshape([n if a == axis else 1 for a in range(len(shape))])
+        out = jnp.fft.ifft(mult * jnp.fft.fft(u, axis=axis), axis=axis)
+        out = out.real if was_real else out
+        return _unmirror_axis(out, axis, n_orig).reshape(-1)
 
     # jNO's structured grids span the interval INCLUSIVE of both ends, so the last node along an
     # axis is the periodic image of the first: `Shape.rect(0,0,1,1, size=1/16)` gives 17 nodes for
@@ -1663,8 +1704,10 @@ class TraceEvaluator:
 
             g_shape, g_spacing = _uniform_grid_spec(domain, N_mesh)
 
+            _mirror = scheme.split(":", 1)[1].strip() == "cosine" if ":" in scheme else False
+
             def _spec_one_channel(u_1d, ax):
-                return _spectral_diff(u_1d, g_shape, g_spacing, ax, order=1)
+                return _spectral_diff(u_1d, g_shape, g_spacing, ax, order=1, mirror=_mirror)
 
             jac_components = []
             for _i, vi_dim in var_dims:
@@ -1905,11 +1948,13 @@ class TraceEvaluator:
 
             g_shape, g_spacing = _uniform_grid_spec(domain, N_mesh)
 
+            _mirror = scheme.split(":", 1)[1].strip() == "cosine" if ":" in scheme else False
+
             if compute_trace:
                 pairs = [(d, d) for d in dims]
 
                 def _lap_c(u_1d):
-                    return _spectral_second_moments(u_1d, g_shape, g_spacing, pairs, trace=True)
+                    return _spectral_second_moments(u_1d, g_shape, g_spacing, pairs, trace=True, mirror=_mirror)
 
                 lap_full = jax.vmap(_lap_c)(u_flat.T).T if (image_shape is not None and n_channels > 1) else _lap_c(u_flat)
                 if image_shape is not None:
@@ -1922,7 +1967,7 @@ class TraceEvaluator:
             pairs = [(vi_dim, vj_dim) for _i, vi_dim, _j, vj_dim in var_dims]
 
             def _hess_c(u_1d):
-                comps = _spectral_second_moments(u_1d, g_shape, g_spacing, pairs, trace=False)
+                comps = _spectral_second_moments(u_1d, g_shape, g_spacing, pairs, trace=False, mirror=_mirror)
                 return jnp.stack(comps, axis=-1).reshape(-1, n, n)
 
             if image_shape is not None and n_channels > 1:

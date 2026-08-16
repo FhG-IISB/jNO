@@ -216,3 +216,59 @@ class TestSecondDerivatives:
         analytic = -3 * (2 * np.pi) ** 2 * u
         got = np.asarray(_spectral_second_moments(u, shape, spacing, [(0, 0), (1, 1), (2, 2)], trace=True))
         assert np.abs(got - analytic).max() < 1e-8
+
+
+class TestCosineVariant:
+    """``spectral:cosine`` — an even (mirror) extension instead of assuming periodicity.
+
+    Exact for fields whose odd derivatives vanish at both ends (Neumann-like). That is a real but
+    **narrower** class than "non-periodic": a field with u' != 0 at an end still has a kink in the
+    mirrored extension and still rings, just far less. Both cases are pinned below so the scope is
+    a measurement rather than a claim.
+
+    Implemented by mirroring and reusing the periodic FFT, not by a DCT: JAX implements only DCT-2
+    and has no DST, and differentiating a cosine series yields a SINE series — so the transform-pair
+    route would have meant hand-rolling a DST.
+    """
+
+    def _line(self, n=32):
+        d = jno.Shape.rect(0, 0, 1, 1, size=1 / n).domain(structured=True)
+        shape, spacing = _uniform_grid_spec(d, d.mesh_connectivity["points"].shape[0])
+        P = np.asarray(d.mesh_connectivity["points"])[:, :2]
+        return shape, spacing, P
+
+    def test_exact_on_a_neumann_field_where_periodic_fails(self):
+        shape, spacing, P = self._line()
+        x = P[:, 0]
+        u, du = np.cos(np.pi * x), -np.pi * np.sin(np.pi * x)  # u'(0) = u'(1) = 0, but u(0) != u(1)
+        per = np.abs(np.asarray(_spectral_diff(u, shape, spacing, 0, 1)) - du).max()
+        cos = np.abs(np.asarray(_spectral_diff(u, shape, spacing, 0, 1, mirror=True)) - du).max()
+        assert cos < 1e-10, f"cosine should be exact here, got {cos:.2e}"
+        assert per > 1.0, "plain spectral should fail badly on a non-periodic field"
+
+    def test_laplacian_too(self):
+        from jno.trace_evaluator import _spectral_second_moments
+
+        shape, spacing, P = self._line()
+        u = np.cos(np.pi * P[:, 0])
+        got = np.asarray(_spectral_second_moments(u, shape, spacing, [(0, 0)], trace=True, mirror=True))
+        assert np.abs(got - (-(np.pi**2) * u)).max() < 1e-9
+
+    def test_a_field_that_is_neither_periodic_nor_neumann_is_better_but_not_exact(self):
+        """The honest scope limit: a ramp has u' != 0 at the ends, so the mirror has a kink."""
+        shape, spacing, P = self._line()
+        x = P[:, 0]
+        per = np.abs(np.asarray(_spectral_diff(x, shape, spacing, 0, 1)) - 1.0).max()
+        cos = np.abs(np.asarray(_spectral_diff(x, shape, spacing, 0, 1, mirror=True)) - 1.0).max()
+        assert cos < per / 10, f"cosine should still help a lot ({per:.2e} -> {cos:.2e})"
+        assert cos > 1e-3, "…but it is NOT exact here — if this ever passes, the scope note is stale"
+
+    def test_reachable_through_the_scheme_string(self):
+        from jno.utils.schemes import scheme_family
+
+        assert scheme_family("spectral:cosine") == "spectral"
+
+    def test_shape_is_preserved(self):
+        shape, spacing, P = self._line(n=8)
+        out = _spectral_diff(np.cos(np.pi * P[:, 0]), shape, spacing, 0, 1, mirror=True)
+        assert out.shape == (P.shape[0],)
