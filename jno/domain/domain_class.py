@@ -43,8 +43,11 @@ def _refuse_mixed_cells(mesh, dim: int) -> None:
     remeshing, adaptation -- and one of ``mesh_cell_type``'s callers wraps it in a bare ``except``
     that would swallow the refusal.
     """
-    cd = getattr(mesh, "cells_dict", None) or {}
-    present = [(n, len(cd[n])) for n in _VOLUME_BLOCKS_BY_DIM.get(int(dim), ()) if n in cd]
+    cd = {}
+    for name, arr in (getattr(mesh, "cells_dict", None) or {}).items():
+        cd.setdefault(_base_cell_type(name), 0)
+        cd[_base_cell_type(name)] += len(arr)
+    present = [(n, cd[n]) for n in _VOLUME_BLOCKS_BY_DIM.get(int(dim), ()) if n in cd]
     if len(present) < 2:
         return
     total = sum(c for _n, c in present)
@@ -108,9 +111,11 @@ def _derive_region_cell_sets(mesh, dim: int):
     Returns ``(mesh, added)`` — the mesh (possibly with a facet block appended) and the tag names
     created, for logging.
     """
-    from .mesh_utils import MeshUtils
+    from .mesh_utils import MeshUtils, p1_cells_dict
 
-    cd = getattr(mesh, "cells_dict", None) or {}
+    # A CURVED mesh stores `tetra10` / `triangle6`, whose first `dim+1` columns are the vertices;
+    # `p1_cells_dict` supplies that first-order view, so an order-2 file gets its regions too.
+    cd = p1_cells_dict(mesh) if getattr(mesh, "cells_dict", None) else {}
     cell_type = next((n for n in _VOLUME_BLOCKS_BY_DIM.get(int(dim), ()) if n in cd), None)
     if cell_type is None:
         return mesh, []  # no volume cells: a surface/shell mesh, refused with its own message
@@ -139,7 +144,7 @@ def _derive_region_cell_sets(mesh, dim: int):
     def _empty_per_block():
         return [np.array([], dtype=np.int64) for _ in blocks]
 
-    vol_blocks = [i for i, b in enumerate(blocks) if b.type == cell_type]
+    vol_blocks = [i for i, b in enumerate(blocks) if _base_cell_type(b.type) == cell_type]
     sets = {k: list(v) + [np.array([], dtype=np.int64)] * (len(blocks) - len(v)) for k, v in existing.items()}
     added = []
     if want_interior:

@@ -194,3 +194,28 @@ def test_a_tagless_3d_mesh_solves(tmp_path):
     assert len(np.atleast_1d(d.tag_indices["interior"])) == len(m.points)
     sol = _poisson(d)
     assert np.isfinite(sol).all() and sol.max() > 0
+
+
+def test_a_curved_mesh_still_loads_and_gains_regions(tmp_path):
+    """An order-2 file stores `tetra10`, not `tetra`. Checking for the first-order name alone made a
+    curved mesh look volume-less — it was refused as a shell, and got no derived regions."""
+    gmsh = pytest.importorskip("gmsh")
+    gmsh.initialize()
+    try:
+        gmsh.option.setNumber("General.Terminal", 0)
+        gmsh.option.setNumber("Mesh.MeshSizeMax", 0.4)
+        gmsh.option.setNumber("Mesh.MshFileVersion", 4.1)
+        gmsh.model.add("curved")
+        gmsh.model.occ.addSphere(0, 0, 0, 1)
+        gmsh.model.occ.synchronize()
+        gmsh.model.mesh.generate(3)
+        gmsh.model.mesh.setOrder(2)
+        p = str(tmp_path / "curved.msh")
+        gmsh.write(p)
+    finally:
+        gmsh.finalize()
+
+    d = jno.domain(p, compute_mesh_connectivity=False)
+    assert "tetra10" in {c.type for c in d.mesh.cells}, "the fixture is not actually order 2"
+    assert {"interior", "boundary"} <= set(d.avaiable_mesh_tags)
+    assert len(np.atleast_1d(d.tag_indices["interior"])) > len(np.atleast_1d(d.tag_indices["boundary"]))

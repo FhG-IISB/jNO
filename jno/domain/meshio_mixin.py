@@ -71,7 +71,11 @@ class MeshIOMixin(MeshUtils):
         ``zero-size array to reduction operation maximum`` — an internal error that says nothing
         about the file. Manifold (shell) FEM is a different discretisation, not a missing setting.
         """
-        cd = getattr(self.mesh, "cells_dict", None) or {}
+        from .mesh_utils import base_cell_type
+
+        # `base_cell_type` maps a CURVED block to its first-order name (tetra10 -> tetra). Without it
+        # an order-2 mesh looks volume-less and would be refused as a shell.
+        cd = {base_cell_type(n) for n in (getattr(self.mesh, "cells_dict", None) or {})}
         volume = {1: ("line",), 2: ("triangle", "quad"), 3: ("tetra", "hexahedron")}.get(int(self.dimension), ())
         if any(n in cd for n in volume):
             return
