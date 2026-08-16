@@ -450,11 +450,15 @@ def test_patch_test_on_a_recombined_disk():
     assert np.abs(sol - (1.0 + 2.0 * p[:, 0] + 3.0 * p[:, 1])).max() < 1e-10
 
 
-def test_shape_quad_refuses_3d_and_curved():
+def test_shape_quad_refuses_an_unstructured_3d_plan_and_a_curved_one():
     """gmsh cannot hex-mesh general 3-D geometry, and a curved quad needs a 9-node block neither the
-    emitter nor the element path has. Both refuse by name instead of silently meshing simplices."""
-    with pytest.raises(NotImplementedError, match="2-D only"):
-        jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5).quad()
+    emitter nor the element path has. Both refuse by name instead of silently meshing simplices.
+
+    The 3-D refusal fires at BUILD time, not inside ``.quad()``: a lattice can be hex-meshed, so the
+    answer depends on whether ``.structured()`` is anywhere in the plan, and requiring it to come
+    first would make the chain order-dependent."""
+    with pytest.raises(NotImplementedError, match=r"\.structured\(\)"):
+        jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5).quad().build()
     with pytest.raises(NotImplementedError, match="curved"):
         jno.Shape.rect(0, 0, 1, 1, size=0.5).quad().curved().build()
 
