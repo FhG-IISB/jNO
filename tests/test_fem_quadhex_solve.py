@@ -564,17 +564,38 @@ def test_bounds_and_periodic_ties_on_quads():
     assert np.isfinite(tied).all()
 
 
-def test_adaptivity_refuses_on_quads_by_name():
-    """mmg adapts simplices and the recovery estimator differentiates P1 shape functions; neither
-    generalises. This raised a bare `KeyError: 'triangle'` before, which named nothing."""
+def _quad_poisson():
     d = _quad_domain()
     u, v = d.fem_symbols()
     xi, yi, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
     ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
-    fem = jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0])
+    return d, jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0])
+
+
+def test_h_adaptivity_refuses_on_quads_by_name():
+    """mmg adapts simplices and the recovery estimator differentiates P1 shape functions; neither
+    generalises. This raised a bare `KeyError: 'triangle'` before, which named nothing."""
+    _, fem = _quad_poisson()
     with pytest.raises(NotImplementedError, match="simplicial mesh"):
         fem.solve(adapt=jno.solve.remesh(max_iters=1))
+
+
+def test_r_adaptivity_refuses_on_quads_by_name():
+    """The RELOCATION driver reached the mesh through its own helper and so bypassed the guard the
+    refinement driver had, dying in a raw dict lookup — `KeyError: 'triangle'` on a quad mesh,
+    `KeyError: 'tetra'` on a hex one, neither naming the cell type it actually found."""
+    d, _ = _quad_poisson()
+    xm, ym, _ = d.variable("mov", where=lambda x, y: (x > 1e-9) & (x < 1 - 1e-9), split=True)
+    xm.trainable(name="ix")
+    ym.trainable(name="iy")
+    u, v = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0])
+    with pytest.raises(NotImplementedError, match="r-adaptivity .relocation. needs a simplicial mesh"):
+        fem.solve(adapt=jno.solve.relocate(max_iters=2))
 
 
 # ------------------------------------------------------------------- facet tables by cell, not dim

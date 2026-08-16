@@ -1253,12 +1253,27 @@ def _simplex_measure_divisor(dim: int) -> float:
 
 
 def _mesh_cells(domain: Any) -> tuple[np.ndarray, int]:
+    """The mesh's simplices, refusing by name when there are none.
+
+    The relocation driver is simplex-only for the same reason the refinement one is, and it reaches
+    here first. Without the guard the missing block surfaced as a bare ``KeyError: 'triangle'`` /
+    ``KeyError: 'tetra'`` from the dict lookup below — a message that names neither the cell type the
+    mesh actually carries nor what would have to exist to support it.
+    """
     dim = int(domain.dimension)
+    _require_simplex(domain, dim, "r-adaptivity (relocation)")
     return np.asarray(domain.mesh.cells_dict[_simplex_cell_key(dim)]).astype(np.int64), dim
 
 
 def _signed_simplex_measures(points: np.ndarray, cells: np.ndarray, dim: int) -> np.ndarray:
-    """Signed area (2D) / volume (3D) of every simplex; the *sign* flips iff a cell inverts (tangles)."""
+    """Signed area (2D) / volume (3D) of every simplex; the *sign* flips iff a cell inverts (tangles).
+
+    Simplex-only, and not incidentally: the measure is ``det`` of the edge matrix, which needs exactly
+    ``dim + 1`` vertices. A quadrilateral or hexahedral cell has no such closed form — its validity
+    test is the sign of the isoparametric ``det J`` sampled over the cell, since a bilinear cell can
+    be locally inverted while its corner-to-corner determinant stays positive. Guarded upstream in
+    :func:`_mesh_cells`.
+    """
     v = np.asarray(points)[cells]  # (n_cells, dim+1, dim)
     edge = v[:, 1:, :] - v[:, :1, :]  # (n_cells, dim, dim): rows v_i - v_0
     return np.linalg.det(edge) / _simplex_measure_divisor(dim)
@@ -2866,6 +2881,10 @@ def _facet_outward_sign(dom: Any, facet_ids: np.ndarray, dim: int) -> np.ndarray
     facet_ids = np.asarray(facet_ids, dtype=np.int64)
     if facet_ids.size == 0:
         return np.zeros((0,), dtype=float)
+    # Simplex-only, like everything else on the relocation path; `_mesh_cells` has already refused a
+    # tensor-product mesh by name before any caller reaches here. Left as a literal rather than
+    # derived from the mesh so it cannot half-work: deriving it would make this function *look*
+    # cell-generic while the measures and gradients around it stayed barycentric.
     cell_type = "triangle" if dim == 2 else "tetrahedron"
     cells, _ = _mesh_cells(dom)
     conn = build_facet_connectivity(cells, cell_type)
