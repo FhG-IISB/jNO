@@ -25,6 +25,145 @@ from .mesh_utils import base_cell_type as _base_cell_type
 from .meshio_mixin import MeshIOMixin
 from .simplex_pool import SimplexPool
 
+#: The space-filling cell blocks of each dimension. A mesh is expected to carry exactly one.
+_VOLUME_BLOCKS_BY_DIM = {1: ("line",), 2: ("triangle", "quad"), 3: ("tetra", "hexahedron")}
+
+
+def _refuse_mixed_cells(mesh, dim: int) -> None:
+    """Refuse a mesh carrying more than one kind of volume cell.
+
+    jNO assembles on a single element family: one cell array, one element table, one quadrature
+    rule. A mesh mixing them is not merely unsupported -- it is *silently* unsupported, because the
+    assembler takes the first block it recognises and ignores the rest. Measured on real files from
+    gmsh's benchmark suite: a quarter-cylinder of 3381 tets and 1430 hexes assembles on 70 % of its
+    own domain, and a plate of 61763 tets, 2744 hexes and 924 pyramids on 94 %, with no error.
+
+    This lives in ``_apply_mesh`` rather than in the assembler's ``mesh_cell_type`` because every
+    mesh that becomes a domain passes through here -- loading a file, the native constructors,
+    remeshing, adaptation -- and one of ``mesh_cell_type``'s callers wraps it in a bare ``except``
+    that would swallow the refusal.
+    """
+    cd = getattr(mesh, "cells_dict", None) or {}
+    present = [(n, len(cd[n])) for n in _VOLUME_BLOCKS_BY_DIM.get(int(dim), ()) if n in cd]
+    if len(present) < 2:
+        return
+    total = sum(c for _n, c in present)
+    kept, dropped = present[0], present[1:]
+    raise NotImplementedError(
+        f"this {dim}-D mesh mixes cell types: {', '.join(f'{c} {n}' for n, c in present)}. jNO "
+        f"assembles on one element family, so it would use the {kept[1]} {kept[0]} cells and "
+        f"silently ignore {sum(c for _n, c in dropped)} of {total} "
+        f"({100 * sum(c for _n, c in dropped) / total:.0f} % of the domain). Re-mesh with a single "
+        "cell type -- for gmsh, that usually means turning recombination off, or on everywhere."
+    )
+
+
+#: The facet block a volume cell's boundary is written into, matching what the native constructors
+#: emit (``geometries.py`` / ``emit.py``): a triangle's facet is a 2-node line, a hexahedron's a
+#: 4-node quad.
+_FACET_BLOCK_FOR = {"line": "vertex", "triangle": "line", "quad": "line", "tetra": "triangle", "hexahedron": "quad"}
+
+
+def _boundary_shells(facets: np.ndarray) -> np.ndarray:
+    """Label each boundary facet by which connected shell it belongs to.
+
+    Two facets are joined when they share an EDGE (two nodes), not merely a corner — otherwise two
+    surfaces meeting at a single point would be fused. Returns ``(n_facets,)`` labels; a solid part
+    gives one shell, a body with an internal void gives two (measured: a box with a spherical
+    cavity gives 540 outer + 80 cavity facets), and disjoint bodies give one each.
+    """
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    if len(facets) == 0:
+        return np.zeros(0, dtype=np.int64)
+    nodes, inv = np.unique(facets, return_inverse=True)
+    inv = inv.reshape(facets.shape)
+    rows = np.repeat(np.arange(len(facets)), facets.shape[1])
+    inc = coo_matrix((np.ones(rows.size), (rows, inv.ravel())), shape=(len(facets), len(nodes)))
+    adj = (inc @ inc.T).tocoo()
+    adj.data = (adj.data >= 2).astype(np.int8)  # >= 2 shared nodes == a shared edge
+    _n, labels = connected_components(adj, directed=False)
+    return np.asarray(labels, dtype=np.int64)
+
+
+def _derive_region_cell_sets(mesh, dim: int):
+    """Give a loaded mesh the ``interior`` / ``boundary`` tags jNO's own constructors write.
+
+    A file built elsewhere carries gmsh *physical groups* under whatever names its author chose, or
+    nothing at all — so the two tags every weak form needs (``u(*d.variable("boundary"))``) simply do
+    not exist, and a perfectly good mesh loads into a domain you cannot write an equation against.
+
+    Rather than teach every consumer about a second kind of tag, this synthesises the same
+    ``cell_sets`` a native constructor would have written, before the existing tag machinery runs —
+    so a derived tag is structurally identical to a native one. Names already present in the file
+    are never overwritten: a mesh whose author defined ``boundary`` keeps their meaning of it.
+
+    The boundary is topological (facets belonging to exactly one cell), which is also the only
+    option for the many files that store no surface block at all. When it falls into more than one
+    connected shell, each is additionally exposed as ``boundary_0``, ``boundary_1``, … so an
+    internal cavity or a second body can be addressed on its own; a single-shell part gains no
+    numbered tags, since they would only be noise.
+
+    Returns ``(mesh, added)`` — the mesh (possibly with a facet block appended) and the tag names
+    created, for logging.
+    """
+    from .mesh_utils import MeshUtils
+
+    cd = getattr(mesh, "cells_dict", None) or {}
+    cell_type = next((n for n in _VOLUME_BLOCKS_BY_DIM.get(int(dim), ()) if n in cd), None)
+    if cell_type is None:
+        return mesh, []  # no volume cells: a surface/shell mesh, refused with its own message
+    existing = dict(getattr(mesh, "cell_sets", None) or {})
+    want_interior = "interior" not in existing
+    want_boundary = "boundary" not in existing
+    if not (want_interior or want_boundary):
+        return mesh, []
+
+    # `cells_dict` AGGREGATES same-type blocks, but `mesh.cells` keeps them split -- meshio emits one
+    # block per gmsh entity, and a real CAD file has many (a sensor model here has 97). The boundary
+    # is computed from the aggregate; the cell_sets must index each block separately.
+    cells = np.asarray(cd[cell_type], dtype=np.int64)
+    facets, _parent = MeshUtils._boundary_facets_unsorted(cells, cell_type)
+    facet_type = _FACET_BLOCK_FOR[cell_type]
+
+    blocks = list(mesh.cells)
+    # The derived boundary always gets its own block rather than borrowing one the file supplies:
+    # a file's surface blocks are its own named regions, generally a subset of the true boundary
+    # (many files store none at all), and conflating them would silently redefine what they mean.
+    facet_block = None
+    if want_boundary:
+        blocks.append(meshio.CellBlock(facet_type, facets))
+        facet_block = len(blocks) - 1
+
+    def _empty_per_block():
+        return [np.array([], dtype=np.int64) for _ in blocks]
+
+    vol_blocks = [i for i, b in enumerate(blocks) if b.type == cell_type]
+    sets = {k: list(v) + [np.array([], dtype=np.int64)] * (len(blocks) - len(v)) for k, v in existing.items()}
+    added = []
+    if want_interior:
+        s = _empty_per_block()
+        for i in vol_blocks:  # every block of the volume type, not just the first
+            s[i] = np.arange(len(blocks[i].data), dtype=np.int64)
+        sets["interior"] = s
+        added.append("interior")
+    if want_boundary:
+        s = _empty_per_block()
+        s[facet_block] = np.arange(len(blocks[facet_block].data), dtype=np.int64)
+        sets["boundary"] = s
+        added.append("boundary")
+        labels = _boundary_shells(np.asarray(blocks[facet_block].data))
+        n_shell = int(labels.max()) + 1 if labels.size else 0
+        if n_shell > 1:  # only worth naming when there IS more than one
+            for k in range(n_shell):
+                sk = _empty_per_block()
+                sk[facet_block] = np.flatnonzero(labels == k).astype(np.int64)
+                sets[f"boundary_{k}"] = sk
+                added.append(f"boundary_{k}")
+
+    return meshio.Mesh(points=mesh.points, cells=blocks, cell_sets=sets, field_data=mesh.field_data), added
+
 
 def _scalar_float(value: Any) -> float:
     """Convert a scalar-like Python/NumPy/JAX value to float for BC callbacks."""
@@ -2199,6 +2338,12 @@ class domain(MeshIOMixin):
         else:
             if not getattr(self, "_keep_orphan_nodes", False):
                 mesh = self._drop_orphan_nodes(mesh)
+            _refuse_mixed_cells(mesh, int(self.dimension))
+            # AFTER `_drop_orphan_nodes`, which renumbers nodes, and BEFORE the tag machinery, so a
+            # derived tag goes through exactly the same path as one the file defined.
+            mesh, _added = _derive_region_cell_sets(mesh, int(self.dimension))
+            if _added:
+                self.log.info(f"Derived mesh regions {_added} (not defined by the file)")
             self.mesh = mesh
             boundary_indices = self._extract_points_from_mesh(mesh)
             self._build_simplex_pools()

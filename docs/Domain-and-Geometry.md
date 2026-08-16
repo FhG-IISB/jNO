@@ -279,6 +279,29 @@ alongside the union `"a|b"`.
 d = jno.domain("part.msh")     # .msh / .vtk / .med … built anywhere (gmsh, CAD, …)
 ```
 
+`interior` and `boundary` are **derived automatically** when the file does not define them, so a
+mesh exported from anywhere is immediately usable — no physical groups required. The boundary is
+topological (facets belonging to exactly one cell), which is also the only option for the many
+files that store no surface block at all. Names the file *does* define always win: a physical group
+called `boundary` keeps its own meaning, and only the missing tag is derived.
+
+When the boundary falls into more than one connected shell, each is additionally exposed as
+`boundary_0`, `boundary_1`, … so an internal cavity or a second body can be addressed on its own; a
+single-shell part gains no numbered tags.
+
+Two kinds of file are refused rather than half-loaded, both by name:
+
+- **Mixed cell types** (a mesh with both tetrahedra and hexahedra, say). jNO assembles on one
+  element family, so it would otherwise take the first block it recognised and silently ignore the
+  rest — measured on a real gmsh benchmark as 70 % of the domain. The error reports the blocks and
+  how many cells would be lost.
+- **A surface (shell) mesh** — triangles in 3-D with no volume behind them, a routine CAD/STL
+  export. Solving on a manifold is a different discretisation, not a missing setting.
+
+Reader limits are reported as such rather than as jNO errors: an unsupported `.msh` version (only
+2.2 and 4.1 are read) and gmsh element types meshio does not implement both say so, and say what to
+re-export.
+
 **Point cloud** — coordinates you already have (no mesh, so no `.integrate()`/FD):
 
 ```python
