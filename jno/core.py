@@ -631,6 +631,22 @@ class core:
 
         return jax.tree_util.tree_map(shard_leaf, params)
 
+    def _shape_probe_context(self) -> Dict:
+        """The full context with lazy handles replaced by zeros of the same shape and dtype.
+
+        Shape logging and trace printing run `jax.eval_shape` over the WHOLE context, which a lazy
+        handle cannot satisfy -- it is not an array and `jnp.asarray` on it raises deep inside JAX.
+        Only the shapes matter to those callers, so a zero stand-in is exact for their purpose and
+        still never reads the source.
+        """
+        ctx = self.domain_data.context
+        if not any(_is_lazy_source(v) for v in ctx.values()):
+            return ctx
+        return {
+            k: (jnp.zeros(tuple(v.shape), dtype=getattr(v, "dtype", jnp.float32)) if _is_lazy_source(v) else v)
+            for k, v in ctx.items()
+        }
+
     def _host_batch(self, host_context: Dict, indices) -> Dict:
         """One mini-batch gathered on the host and moved to device — the single slice path.
 
@@ -4657,7 +4673,7 @@ class core:
         out_shape = jax.eval_shape(
             lambda: self.compiled_constraints_fn(
                 _models,
-                self.domain_data.context,
+                self._shape_probe_context(),
                 batchsize=batchsize,
                 key=test_rng,
                 min_consecutive=min_consecutive,
@@ -4683,7 +4699,7 @@ class core:
             parent_shape = jax.eval_shape(
                 lambda: parent_fn(
                     _models,
-                    self.domain_data.context,
+                    self._shape_probe_context(),
                     batchsize=batchsize,
                     key=test_rng,
                     min_consecutive=min_consecutive,
@@ -4704,7 +4720,7 @@ class core:
             out_shape = jax.eval_shape(
                 lambda: fn(
                     _models,
-                    self.domain_data.context,
+                    self._shape_probe_context(),
                     batchsize=batchsize,
                     key=test_rng,
                     min_consecutive=min_consecutive,
@@ -4722,7 +4738,7 @@ class core:
                 t_parent_shape = jax.eval_shape(
                     lambda: t_parent_fn(
                         _models,
-                        self.domain_data.context,
+                        self._shape_probe_context(),
                         batchsize=batchsize,
                         key=test_rng,
                         min_consecutive=min_consecutive,
