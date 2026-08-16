@@ -42,7 +42,11 @@ def _solve_poisson(cell, n):
     xb, yb, _ = d.variable("boundary", split=True)
     ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
     f = 2 * PI**2 * jno.np.sin(PI * xi) * jno.np.sin(PI * yi)
-    sol = np.asarray(jno.fem([ui.x * vi.x + ui.y * vi.y - f * vi, u(xb, yb) - 0.0]).solve()).reshape(-1)
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y - f * vi, u(xb, yb) - 0.0])
+    # A DIRECT solve on purpose: this file measures the ESTIMATOR, and the default Jacobi-BiCGStab makes
+    # the measurement depend on iterative convergence -- which under x64 state leaked from a neighbouring
+    # test file returned a NaN residual on the n=32 mesh. These systems are ~1k DOFs; LU is exact and free.
+    sol = np.asarray(fem.solve(linear=jno.solve.lu(backend="host"))).reshape(-1)
     return d, sol
 
 
