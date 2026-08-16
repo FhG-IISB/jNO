@@ -312,3 +312,30 @@ Writing the axis yourself still works and is left untouched.
     Only tensors of rank ≥ 4 whose leading dimension is `B` or `1` are touched — a parameter like
     `(B, 1, 1)` or a shared lookup table is left exactly as given. Multiply the domain by `B`
     **before** attaching, so the batch count is known.
+
+### Datasets larger than memory
+
+The same slot accepts a **lazy** source — anything exposing `.shape` and `__getitem__`. The handle is
+stored unread and sliced one batch at a time, so the dataset never has to fit:
+
+```python
+dom.variable("_f", h5py.File("well.h5")["forcing"])     # or zarr, tensorstore, np.memmap
+crux.solve(epochs=600, batchsize=32, offload_data=True)
+```
+
+No new dependency and no new argument — the contract is duck-typed, so jNO imports none of those
+libraries. `offload_data=True` is required, because the on-device path holds the whole array; asking
+for it with a lazy source raises and names the fix.
+
+!!! note "What a lazy source gives up"
+
+    Indices are **sorted** before each gather, since h5py and zarr only accept increasing fancy
+    indices. That reorders samples within a batch — invisible to a mean-reduced loss, but a run is
+    not bitwise identical to one recorded before this existed.
+
+    The `(B, T, ...)` time axis is **validated, not inserted**: rewriting the layout would mean
+    reading the source, which is the one thing it exists to avoid. Store it with the time axis, or
+    pass an eager array.
+
+    **Adaptive resampling cannot target a lazy tag** — it replaces the whole point set each round.
+    It raises rather than silently skipping.

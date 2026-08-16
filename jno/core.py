@@ -32,6 +32,7 @@ from .architectures.lora import (
     partial_lora_trainable_filter as _partial_lora_trainable_filter,
 )
 from .domain import DomainData, domain
+from .domain.domain_class import _is_lazy_source
 from .trace import (
     BinaryOp,
     Choice,
@@ -630,6 +631,29 @@ class core:
 
         return jax.tree_util.tree_map(shard_leaf, params)
 
+    def _host_batch(self, host_context: Dict, indices) -> Dict:
+        """One mini-batch gathered on the host and moved to device — the single slice path.
+
+        Indices are **sorted**: a lazy source (h5py, zarr) only accepts fancy indexing with strictly
+        increasing indices, and the on-device path already sorts (`trace_compiler.py`). Sorting
+        reorders samples *within* a batch, which a mean-reduced loss does not see, but it does make a
+        run non-bitwise-identical to one recorded before this existed.
+        """
+        idx = np.sort(np.asarray(indices))
+        n = int(idx.shape[0])
+        out = {}
+        for k, v in host_context.items():
+            if k == "__time__":
+                out[k] = v
+            elif int(v.shape[0]) == 1:
+                # A leading-dim-1 tag broadcasts across the batch. Read the single row from a lazy
+                # source first, so the broadcast happens on a materialized array.
+                row = np.asarray(v[0:1]) if _is_lazy_source(v) else v
+                out[k] = np.broadcast_to(row, (n,) + tuple(row.shape[1:]))
+            else:
+                out[k] = np.asarray(v[idx])
+        return self._shard_data(jax.device_put(out))
+
     def _shard_data(self, data: Dict) -> Dict:
         """Apply sharding to training data.
 
@@ -894,6 +918,14 @@ class core:
                     continue
                     # Standard behavior for everything else (preserves backward compatibility)
                 # Pin to CPU JAX array — GPU placement happens in solve()
+                # A lazy source (h5py / zarr / memmap) passes straight through UNREAD -- this
+                # `device_put` is the single point where a context entry would be materialized, and
+                # reading a lazy handle here would defeat the whole point of attaching one. It is
+                # sliced per batch instead, in `_host_batch`.
+                if _is_lazy_source(arr):
+                    context[tag] = arr
+                    continue
+
                 arr = jax.device_put(arr, _cpu_device())
 
                 if tag in metadata_tags:
@@ -2058,8 +2090,15 @@ class core:
 
         # ── 0. Validate offload_data ──
         if offload_data and (batchsize is None or batchsize >= self.domain.total_samples):
-            self.log.warning("offload_data requires batchsize < total_samples; ignoring offload_data for this run.")
-            offload_data = False
+            # A lazy source is the exception: streaming it is not a throughput choice but the only
+            # way to read it at all, so keep offloading on even at full batch.
+            if any(_is_lazy_source(v) for v in self.domain_data.context.values()):
+                batchsize = batchsize or self.domain.total_samples
+            else:
+                self.log.warning(
+                    "offload_data requires batchsize < total_samples; ignoring offload_data for this run."
+                )
+                offload_data = False
 
         self.log.info("Paramax auto-unwrap enabled: wrappers are unwrapped before each forward evaluation")
 
@@ -2774,13 +2813,22 @@ class core:
         if offload_data:
             # full_context holds CPU-pinned JAX arrays (prepare_domain_data never goes to GPU).
             # Convert to numpy so the host_context is plain numpy for per-batch streaming.
-            host_context = {k: np.asarray(v) for k, v in full_context.items()}
+            # Lazy handles stay handles -- np.asarray would read the whole dataset, which is the
+            # one thing attaching one is meant to avoid. `_host_batch` slices them per step.
+            host_context = {k: (v if _is_lazy_source(v) else np.asarray(v)) for k, v in full_context.items()}
             total_samples = _infer_total_samples(host_context)
             effective_batchsize = None  # data is already pre-sliced
             self.log.info(
                 f"Data offloading enabled: {total_samples} total samples, streaming batches of {batchsize} from host"
             )
         else:
+            _lazy = [k for k, v in full_context.items() if _is_lazy_source(v)]
+            if _lazy:
+                raise ValueError(
+                    f"Tag(s) {_lazy} were attached as lazy sources, but this run puts the whole dataset on "
+                    "device, which would read them in full. Pass solve(..., offload_data=True, batchsize=...) "
+                    "to stream them one batch at a time, or attach an eager array instead."
+                )
             # Replicate / shard full dataset on device.
             # _shard_data uses jax.device_put with NamedSharding which moves
             # CPU-pinned arrays to the target accelerator.
@@ -3815,6 +3863,14 @@ class core:
                                 self.log.warning(f"Resampling skipped for tag '{tag}': tag not found in context")
                                 continue
 
+                            if _is_lazy_source(tag_points):
+                                raise ValueError(
+                                    f"Adaptive resampling asked to rewrite tag '{tag}', which was attached as a "
+                                    f"lazy {type(tag_points).__name__}. Resampling replaces the whole point set "
+                                    "each round, which a streamed source cannot represent. Resample a different "
+                                    "tag, or attach this one eagerly."
+                                )
+
                             if not hasattr(tag_points, "ndim") or tag_points.ndim != 4:
                                 self.log.warning(
                                     f"Resampling skipped for tag '{tag}': expected 4-D point array (B, T, N, D), "
@@ -3931,15 +3987,7 @@ class core:
                         if host_context is None:
                             raise RuntimeError("offload_data=True but host_context is not available")
                         indices = rng_np.choice(total_samples, batchsize, replace=False)
-                        batch_np = {
-                            k: (
-                                v
-                                if k == "__time__"
-                                else (np.broadcast_to(v, (batchsize,) + v.shape[1:]) if v.shape[0] == 1 else v[indices])
-                            )
-                            for k, v in host_context.items()
-                        }
-                        context = self._shard_data(jax.device_put(batch_np))
+                        context = self._host_batch(host_context, indices)
                     else:
                         context = on_device_context
 
@@ -3990,15 +4038,7 @@ class core:
                             if host_context is None:
                                 raise RuntimeError("offload_data=True but host_context is not available")
                             indices = rng_np.choice(total_samples, batchsize, replace=False)
-                            batch_np = {
-                                k: (
-                                    v
-                                    if k == "__time__"
-                                    else (np.broadcast_to(v, (batchsize,) + v.shape[1:]) if v.shape[0] == 1 else v[indices])
-                                )
-                                for k, v in host_context.items()
-                            }
-                            micro_ctx = self._shard_data(jax.device_put(batch_np))
+                            micro_ctx = self._host_batch(host_context, indices)
                         else:
                             micro_ctx = on_device_context
 
@@ -4054,15 +4094,7 @@ class core:
                         if host_context is None:
                             raise RuntimeError("offload_data=True but host_context is not available")
                         indices = rng_np.choice(total_samples, batchsize, replace=False)
-                        batch_np = {
-                            k: (
-                                v
-                                if k == "__time__"
-                                else (np.broadcast_to(v, (batchsize,) + v.shape[1:]) if v.shape[0] == 1 else v[indices])
-                            )
-                            for k, v in host_context.items()
-                        }
-                        context = self._shard_data(jax.device_put(batch_np))
+                        context = self._host_batch(host_context, indices)
                     else:
                         context = on_device_context
 
