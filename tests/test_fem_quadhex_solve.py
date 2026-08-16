@@ -159,17 +159,38 @@ def test_the_distortion_is_real():
 # ------------------------------------------------------------------------------------- the refusals
 
 
-def test_a_surface_term_on_a_quad_mesh_refuses_by_name():
-    """Facet geometry is still per-facet, which is only right for a straight simplex facet. Before
-    the guard this surfaced as a raw broadcasting error between two basis sizes."""
-    d = jno.domain(constructor=Geometries.equi_distant_rect(nx=3, ny=3, cell="quad"), compute_mesh_connectivity=False)
+@pytest.mark.parametrize("region,exact", [("right", 1.0), ("bottom", 2.0), ("boundary", 6.0)])
+def test_surface_terms_on_quads_integrate_the_right_measure(region, exact):
+    """The load vector of ``1.0 * v(region)`` is ∫_region φ_i ds, so summing it gives the region's
+    MEASURE — the shape functions are a partition of unity. That tests the facet quadrature and the
+    facet area element directly, with no dependence on a sign convention or a solve.
+
+    A quad's facet is a straight edge: restricted to one edge the bilinear map is LINEAR, so the
+    tangent is constant and one normal per facet is exact. Only the tabulated basis and the cell
+    Jacobian had to become cell-aware.
+    """
+    ctor = Geometries.equi_distant_rect(x_range=(0.0, 2.0), y_range=(0.0, 1.0), nx=6, ny=6, cell="quad")
+    d = jno.domain(constructor=ctor, compute_mesh_connectivity=False)
     u, v = d.fem_symbols()
     xi, yi, _ = d.variable("interior", split=True)
-    xr, yr, _ = d.variable("right", split=True)
-    xl, yl, _ = d.variable("left", split=True)
+    c = d.variable(region, split=True)
     ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
-    with pytest.raises(NotImplementedError, match="boundary/surface term on a quad mesh"):
-        jno.fem([ui.x * vi.x + ui.y * vi.y, 1.0 * v(xr, yr), u(xl, yl) - 0.0]).solve()
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y, 1.0 * v(c[0], c[1])])
+    np.testing.assert_allclose(float(np.abs(np.asarray(fem.b)).sum()), exact, rtol=1e-10)
+
+
+def test_a_surface_term_on_a_hex_mesh_still_refuses():
+    """A hexahedron's facet is a bilinear SURFACE, not a straight edge: its normal and area element
+    vary across the facet and need Nanson's formula per quadrature point, where the assembler still
+    carries one frozen normal per facet. That is the remaining half of the facet work."""
+    ctor = Geometries.equi_distant_box(nx=2, ny=2, nz=2, cell="hex")
+    d = jno.domain(constructor=ctor, compute_mesh_connectivity=False)
+    u, v = d.fem_symbols()
+    xi, yi, zi, _ = d.variable("interior", split=True)
+    cr = d.variable("right", split=True)
+    ui, vi = u.bind(x=xi, y=yi, z=zi), v.bind(x=xi, y=yi, z=zi)
+    with pytest.raises(NotImplementedError, match="Nanson"):
+        jno.fem([ui.x * vi.x + ui.y * vi.y + ui.z * vi.z, 1.0 * v(cr[0], cr[1], cr[2])]).solve()
 
 
 def test_higher_order_on_a_quad_mesh_refuses_by_name():

@@ -367,18 +367,28 @@ def _refuse_tensor_product(cell_type: Any, what: str, because: str) -> None:
 
 
 def _refuse_tensor_product_surface(cell_type: Any) -> None:
-    """A surface/boundary integral needs facet geometry, which is the outstanding half of the work:
-    a hexahedron's facet is bilinear, so its area element and normal vary across the facet and must
-    be formed per quadrature point (Nanson), where the simplex path forms one of each per facet."""
-    return _refuse_tensor_product(
-        cell_type,
-        "a boundary/surface term",
-        "the facet geometry (area element and normal) is still formed once per facet, which is only "
-        "correct for a straight simplex facet.",
-    )
+    """Surface integrals: supported on quadrilaterals, still refused on hexahedra.
+
+    The split is geometric, not incidental. Restricted to one edge a bilinear map is LINEAR, so a
+    quadrilateral's facet is a straight segment with a constant tangent and a single normal -- the
+    facet machinery needs only the right basis and a Jacobian formed from the geometry basis. A
+    hexahedron's facet is a bilinear SURFACE: its normal and area element vary across the facet and
+    need Nanson's formula per quadrature point, and the frozen one-normal-per-facet orientation the
+    assembler carries has no per-point analogue yet.
+    """
+    if cell_type in ("hexahedron", "hex"):
+        return _refuse_tensor_product(
+            cell_type,
+            "a boundary/surface term",
+            "a hexahedron's facet is a bilinear surface, so its normal and area element vary across "
+            "the facet and need Nanson's formula per quadrature point, where the assembler still "
+            "carries one frozen normal per facet. (Quadrilaterals ARE supported: a quad's facet is a "
+            "straight edge.)",
+        )
+    return False
 
 
-def _build_face_tables(elem_degree: int, quad_degree: int, dim: int = 2):
+def _build_face_tables(elem_degree: int, quad_degree: int, dim: int = 2, cell_type: str = ""):
     """Pre-tabulate the parent-cell Lagrange basis at the quad points of each local facet.
 
     Dimension-generic: a 2D triangle's facets are its 3 edges (1-D Gauss quadrature); a 3D tet's
@@ -400,7 +410,22 @@ def _build_face_tables(elem_degree: int, quad_degree: int, dim: int = 2):
     import basix
     from basix import CellType
 
-    if dim == 2:
+    from .fem_facets import local_faces_in_basix_order
+
+    if cell_type in ("quad", "quadrilateral"):
+        # A quadrilateral's facet is a straight 2-node edge, exactly as a triangle's is: restricted
+        # to one edge the bilinear map is LINEAR in the edge parameter, so the edge stays straight
+        # and its tangent is constant. Only the reference cell, its vertices and the basis change.
+        cell = CellType.quadrilateral
+        ref_verts = np.asarray(basix.geometry(cell))
+        local_faces, _nfn = local_faces_in_basix_order(cell_type)
+        gp_1d, face_w = (np.asarray(x) for x in _line_quadrature(quad_degree))
+
+        def _facet_qp_tangs(nodes):
+            va, vb = ref_verts[nodes[0]], ref_verts[nodes[1]]
+            ref_qp = va[None, :] * (1.0 - gp_1d[:, None]) + vb[None, :] * gp_1d[:, None]
+            return ref_qp, np.stack([vb - va])
+    elif dim == 2:
         cell, ref_verts, local_faces = CellType.triangle, _REF_TRI_VERTS, _LOCAL_FACES_TRI
         gp_1d, face_w = (np.asarray(x) for x in _line_quadrature(quad_degree))
 
@@ -437,12 +462,28 @@ def _build_face_tables(elem_degree: int, quad_degree: int, dim: int = 2):
     )
 
 
+def _GSPEC(K):
+    """einsum spec pushing reference gradients forward by ``K = J⁻¹``, per cell or per quad point.
+
+    The surface twin of :func:`fem_lagrange.identity_pushforward`'s rank dispatch: a simplex facet
+    has one ``K`` for the whole cell, a tensor-product facet one per quadrature point.
+    """
+    return "qnd,qdD->qnD" if getattr(K, "ndim", 2) == 3 else "qnd,dD->qnD"
+
+
 def _facet_area_element(J, tangs):
     """Physical facet measure element from the reference tangents ``tangs`` (``dim-1, dim``) pushed
     forward by the cell Jacobian ``J`` (``dim, dim``): the edge length ``|J·t|`` in 2D, the face area
     ``|(J·t0) × (J·t1)|`` in 3D. Multiplying it by the reference-facet weights gives ``dS``."""
     if tangs.shape[0] == 0:  # 1-D: a "facet" is a point, whose measure is 1 (dS = 1, not a length)
         return jnp.asarray(1.0, dtype=J.dtype)
+    if J.ndim == 3:
+        # One Jacobian per facet quadrature point (a tensor-product cell): the measure follows it and
+        # becomes a (n_q,) array, which multiplies the reference weights exactly as the scalar does.
+        T = jnp.einsum("td,qDd->qtD", tangs, J)  # (n_q, dim-1, dim) physical tangents
+        return (
+            jnp.linalg.norm(T[:, 0], axis=-1) if T.shape[1] == 1 else jnp.linalg.norm(jnp.cross(T[:, 0], T[:, 1]), axis=-1)
+        )
     T = tangs @ J.T  # (dim-1, dim) physical tangents
     return jnp.linalg.norm(T[0]) if T.shape[0] == 1 else jnp.linalg.norm(jnp.cross(T[0], T[1]))
 
@@ -1116,7 +1157,7 @@ def assemble_fem_native(
     # the simplex facets for surface (Neumann/Robin) integration -- a triangle's 3 edges in 2D, a tet's
     # 4 triangular faces in 3D -- so they are skipped when there are no boundary terms.
     face_tables_per_field = (
-        [_build_face_tables(f["order"], quad_degree, dim) for f in fields]
+        [_build_face_tables(f["order"], quad_degree, dim, _cell_type) for f in fields]
         if (boundary_terms and not _refuse_tensor_product_surface(_cell_type))
         else [None] * len(fields)
     )
@@ -1735,6 +1776,26 @@ def assemble_fem_native(
                 )
             loc["domain_context"][_k] = _g0_f - (_jump * n_vec[None, :]).sum(axis=1)
 
+    def _facet_geometry(c, k, pts_src):
+        """``(J, K, xq)`` for facet ``k`` of cell ``c`` -- one per quadrature point when the cell's
+        map is not affine.
+
+        A simplex cell has a single Jacobian, formed from its edge vectors. A tensor-product cell
+        does not: its map is bi/trilinear, so J is evaluated the same way the volume path evaluates
+        it, by contracting the GEOMETRY basis gradients (tabulated here at the facet's quadrature
+        points) against the cell's vertices. The geometry connectivity is the assembly one, which is
+        in basix vertex order -- the same array the basis was tabulated against.
+        """
+        if _tensor_product:
+            gverts = pts_src[cells_f_j[_geom_field][c]]  # (n_geom, dim), basix order
+            _, fd_g, _, _, _ = face_tables_per_field[_geom_field]
+            Jq = jnp.einsum("ad,qan->qdn", gverts, fd_g[k])  # (n_q, dim, dim)
+            xq = face_tables_per_field[_geom_field][0][k] @ gverts  # (n_q, dim): x = sum_a N_a x_a
+            return Jq, jnp.linalg.inv(Jq), xq
+        verts = pts_src[cells_j[c]]
+        Jc = jnp.stack([verts[i + 1] - verts[0] for i in range(dim)], axis=1)  # (dim, dim)
+        return Jc, jnp.linalg.inv(Jc), None  # xq is formed by the caller from its own facet points
+
     def _surf_elem_res(
         fi, local_all, bcoeff, btfi, region, t=0.0, args=None, pts=None, normals=None, gaps=None, test_vals=None
     ):
@@ -1749,9 +1810,9 @@ def assemble_fem_native(
         k = lface_j[fi]
         n_vec = (normals_j if normals is None else normals)[fi]  # (dim,) outward unit normal
         cell_sols = _split_cell_local(local_all)
-        verts = (pts_j if pts is None else pts)[cells_j[c]]
-        J = jnp.stack([verts[i + 1] - verts[0] for i in range(dim)], axis=1)  # (dim, dim)
-        K = jnp.linalg.inv(J)
+        _pts_src = pts_j if pts is None else pts
+        verts = _pts_src[cells_j[c]]
+        J, K, _xq_tp = _facet_geometry(c, k, _pts_src)
 
         # All-field surface data (needed for coupled Robin terms).
         per_f = []
@@ -1760,7 +1821,7 @@ def assemble_fem_native(
             per_f.append(
                 {
                     "shape_vals": fp_i[k],
-                    "shape_grads": jnp.einsum("qnd,dD->qnD", fd_i[k], K),
+                    "shape_grads": jnp.einsum(_GSPEC(K), fd_i[k], K),
                     "cell_sol": cell_sols[i],
                     "space": "Lagrange",
                 }
@@ -1768,7 +1829,7 @@ def assemble_fem_native(
 
         _, _, fp_qp, fp_tangs, face_w = face_tables_per_field[btfi]
         jac_f = _facet_area_element(J, fp_tangs[k])  # physical edge length (2D) / face area (3D)
-        xq_f = verts[0] + fp_qp[k] @ J.T  # (n_q, dim)
+        xq_f = _xq_tp if _xq_tp is not None else verts[0] + fp_qp[k] @ J.T  # (n_q, dim)
         loc = {
             "physical_quad_points": xq_f,
             "fields": per_f,
@@ -1819,21 +1880,20 @@ def assemble_fem_native(
         n_vec = normals_j[fi]
         cell_sols = _split_cell_local(local_all)
         verts = pts_j[cells_j[c]]
-        J = jnp.stack([verts[i + 1] - verts[0] for i in range(dim)], axis=1)
-        Kmat = jnp.linalg.inv(J)
+        J, Kmat, _xq_tp = _facet_geometry(c, k, pts_j)
         per_f = []
         for i in range(len(fields)):
             fp_i, fd_i, _, _, _ = face_tables_per_field[i]
             per_f.append(
                 {
                     "shape_vals": fp_i[k],
-                    "shape_grads": jnp.einsum("qnd,dD->qnD", fd_i[k], Kmat),
+                    "shape_grads": jnp.einsum(_GSPEC(Kmat), fd_i[k], Kmat),
                     "cell_sol": cell_sols[i],
                     "space": "Lagrange",
                 }
             )
         _, _, fp_qp, _fp_tangs, _fw = face_tables_per_field[0]
-        xq_f = verts[0] + fp_qp[k] @ J.T
+        xq_f = _xq_tp if _xq_tp is not None else verts[0] + fp_qp[k] @ J.T
         loc = {
             "physical_quad_points": xq_f,
             "fields": per_f,

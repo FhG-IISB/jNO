@@ -194,6 +194,27 @@ def _face_table(cell_type: str):
     )
 
 
+def local_faces_in_basix_order(cell_type: str):
+    """``(local_faces, n_face_nodes)`` for the SAME facets as :func:`_face_table`, but with node ids
+    renumbered into basix's vertex order (and the trailing apex entry dropped).
+
+    Two numberings meet here. Mesh topology -- which facets exist, which cell owns each -- is done in
+    the mesh's own meshio/VTK order, because that is what a ``cells`` array holds. Anything that
+    tabulates a BASIS works in basix's reference cell instead. Facet ``k`` has to mean the same facet
+    on both sides, because ``build_facet_connectivity`` hands out a ``local_face`` index that is then
+    used to pick a row of the tabulated facet tables; deriving one table from the other by permuting
+    node ids keeps that correspondence by construction, where writing a second table by hand would
+    only keep it by luck.
+    """
+    import numpy as _np
+
+    from .fem_lagrange import vtk_to_basix_vertex_perm
+
+    local_faces, n_face_nodes = _face_table(cell_type)
+    inv = _np.argsort(vtk_to_basix_vertex_perm(cell_type))  # VTK index -> basix index
+    return tuple(tuple(int(inv[v]) for v in face[:n_face_nodes]) for face in local_faces), n_face_nodes
+
+
 def has_facet_apex(cell_type: str) -> bool:
     """Whether ``cell_type``'s facet table carries an opposite vertex to orient the facet outward.
 

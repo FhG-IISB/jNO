@@ -684,16 +684,16 @@ cells: the map makes the integrand rational, so no rule is exact.
 
 | not supported on quad/hex | why |
 |---|---|
-| surface / boundary integrals (Neumann, Robin, flux, radiation) | the facet area element and normal are still formed once per facet, which is only right for a straight simplex facet; a hexahedron's face is bilinear and needs Nanson normals per quadrature point |
+| surface / boundary integrals **on hexahedra** (they work on quads) | a hexahedron's facet is a bilinear *surface*, so its normal and area element vary across it and need Nanson's formula per quadrature point; a quad's facet is a straight edge, so one normal per facet is exact |
 | `order > 1` (Q2, Q3) | higher-order node promotion places nodes by **barycentric** weights, which only describe a simplex |
 | 4th-order forms (plates, phase-field) | the physical-Hessian push-forward assumes an affine cell — the same refusal curved simplices already carry |
 | h-adaptive remeshing (`adapt=`) | mmg is a simplex remesher; conforming quad/hex refinement is a different algorithm |
 | non-nodal families (N1E, RT, Argyris, Morley) | Argyris and Morley are *defined* on triangles; the quad analogues (RTCF/NCE, Bogner–Fox–Schmit) are different elements |
 | `Shape.quad().curved()` | a curved quadrilateral is a 9-node block the emitter does not produce |
 
-Dirichlet conditions and volume terms — including multi-field, coupled and transient problems —
-work. In practice that means a quad/hex mesh is ready for problems posed with essential boundary
-conditions, and a simplex mesh is still what you want for anything with a surface integral in it.
+Volume terms and Dirichlet conditions work on both cells, and **surface terms work on
+quadrilaterals** — Neumann, Robin and flux integrals included. In practice: a quad mesh is ready for
+most 2-D problems, and a hex mesh is ready for anything posed with essential boundary conditions.
 
 ### Mesh resolution for wave problems
 
