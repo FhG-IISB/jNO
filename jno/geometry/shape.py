@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import itertools
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, FrozenSet, Optional, Tuple, Union
 
 import numpy as np
@@ -75,7 +75,14 @@ class Selector:
 
 @dataclass(frozen=True)
 class Shape:
-    """An immutable geometry build-plan. Operators return new shapes."""
+    """An immutable geometry build-plan. Operators return new shapes.
+
+    **Derive with :func:`dataclasses.replace`, never by calling ``Shape(...)`` positionally.** Every
+    method here returns a copy with one or two fields changed, and a positional constructor has to
+    re-list every *other* field to carry it — so a field added later is silently dropped by whichever
+    derivation forgets it, and the plan quietly meshes as something the caller did not ask for. That
+    is not hypothetical: ``.quad().attach(k=1.0)`` used to erase the quadrilateral choice outright.
+    """
 
     _node: tuple
     dim: int
@@ -181,7 +188,7 @@ class Shape:
 
         ``core.name("core") + clad.name("clad")`` builds a multi-material domain whose regions are
         ``core`` and ``clad``. Apply ``name`` last (a later transform drops the label)."""
-        return Shape(self._node, self.dim, self._size, str(name), self._mesh_order, self._attach, self._cell)
+        return replace(self, _region_name=str(name))
 
     def attach(self, **props) -> "Shape":
         """Attach material properties to this region: ``.attach(k=220.0, eps=0.794)``.
@@ -211,7 +218,7 @@ class Shape:
         Apply after :meth:`name` -- like ``name``, a later transform drops the attachment."""
         merged = dict(self._attach or {})
         merged.update(props)
-        return Shape(self._node, self.dim, self._size, self._region_name, self._mesh_order, merged)
+        return replace(self, _attach=merged)
 
     def size(self, size: Size) -> "Shape":
         """Alias for :meth:`sized` -- ``.size(h)`` reads better in a chain than ``.sized(h)``."""
@@ -237,43 +244,25 @@ class Shape:
 
     # ----- boolean operators -----------------------------------------------------
     def __sub__(self, other: "Shape") -> "Shape":
-        return Shape(
-            ("cut", self, other),
-            self.dim,
-            self._size,
-            None,
-            max(self._mesh_order, other._mesh_order),
-            self._attach,
-            self._cell,
+        return replace(
+            self, _node=("cut", self, other), _region_name=None, _mesh_order=max(self._mesh_order, other._mesh_order)
         )
 
     def __or__(self, other: "Shape") -> "Shape":
-        return Shape(
-            ("fuse", self, other),
-            self.dim,
-            self._size,
-            None,
-            max(self._mesh_order, other._mesh_order),
-            self._attach,
-            self._cell,
+        return replace(
+            self, _node=("fuse", self, other), _region_name=None, _mesh_order=max(self._mesh_order, other._mesh_order)
         )
 
     def __and__(self, other: "Shape") -> "Shape":
-        return Shape(
-            ("inter", self, other),
-            self.dim,
-            self._size,
-            None,
-            max(self._mesh_order, other._mesh_order),
-            self._attach,
-            self._cell,
+        return replace(
+            self, _node=("inter", self, other), _region_name=None, _mesh_order=max(self._mesh_order, other._mesh_order)
         )
 
     # ----- transforms ------------------------------------------------------------
     def extrude(self, height: float) -> "Shape":
         if self.dim != 2:
             raise ValueError("extrude requires a 2-D shape")
-        return Shape(("extrude", self, float(height)), 3, self._size, None, self._mesh_order, self._attach, self._cell)
+        return replace(self, _node=("extrude", self, float(height)), dim=3, _region_name=None)
 
     def revolve(self, axis_point, axis_dir, angle: float = 2.0 * math.pi) -> "Shape":
         """Sweep a 2-D shape around an axis by ``angle`` radians into a 3-D solid.
@@ -298,24 +287,20 @@ class Shape:
                 "revolve currently supports the x- or y-axis through the origin (axisymmetric); "
                 f"got axis_point={ap}, axis_dir={ad}."
             )
-        return Shape(
-            ("revolve", self, ap, ad, float(angle)), 3, self._size, None, self._mesh_order, self._attach, self._cell
-        )
+        return replace(self, _node=("revolve", self, ap, ad, float(angle)), dim=3, _region_name=None)
 
     def translate(self, vector) -> "Shape":
         """Move the shape by ``vector`` (2- or 3-component). Boundary names are preserved."""
         v = tuple(float(c) for c in vector)
         if len(v) == 2:
             v = (v[0], v[1], 0.0)
-        return Shape(("translate", self, v), self.dim, self._size, None, self._mesh_order, self._attach, self._cell)
+        return replace(self, _node=("translate", self, v), _region_name=None)
 
     def rotate(self, axis_point, axis_dir, angle: float) -> "Shape":
         """Rotate ``angle`` radians about the axis through ``axis_point`` along ``axis_dir``."""
         ap = tuple(float(c) for c in axis_point)
         ad = tuple(float(c) for c in axis_dir)
-        return Shape(
-            ("rotate", self, ap, ad, float(angle)), self.dim, self._size, None, self._mesh_order, self._attach, self._cell
-        )
+        return replace(self, _node=("rotate", self, ap, ad, float(angle)), _region_name=None)
 
     def sweep(self, path) -> "Shape":
         """Sweep this 2-D profile along an open :class:`~jno.geometry.path.Path` trajectory.
@@ -330,7 +315,7 @@ class Shape:
         h = path._as_extrude()
         if h is not None:
             return self.extrude(h)  # a straight vertical sweep IS an extrude -- reuse its rich naming
-        return Shape(("sweep", self, path), 3, self._size, None, self._mesh_order, self._attach, self._cell)
+        return replace(self, _node=("sweep", self, path), dim=3, _region_name=None)
 
     def array(self, n: int, step=None, about=None, angle: float = 2.0 * math.pi) -> "Shape":
         """``n`` fused copies of this shape: a **linear** array (``step=`` vector between copies)
@@ -358,13 +343,11 @@ class Shape:
         edges). The rounded blend faces are unnamed (they fall into ``boundary``); the flat
         faces keep their names.
         """
-        return Shape(
-            ("fillet", self, float(radius), where), self.dim, self._size, None, self._mesh_order, self._attach, self._cell
-        )
+        return replace(self, _node=("fillet", self, float(radius), where), _region_name=None)
 
     def sized(self, size: Size) -> "Shape":
         """Return a copy of this shape with its target mesh size set (scalar or ``f(x,y,z)``)."""
-        return Shape(self._node, self.dim, size, self._region_name, self._mesh_order, self._attach, self._cell)
+        return replace(self, _size=size)
 
     def curved(self, order: int = 2) -> "Shape":
         """Return a copy meshed with **curved (isoparametric)** geometry of the given order.
@@ -382,7 +365,7 @@ class Shape:
         which is why this lives here beside :meth:`sized` rather than on the solve."""
         if int(order) not in (1, 2):
             raise ValueError(f"Shape.curved: only order 1 (straight) or 2 is supported, got {order!r}.")
-        return Shape(self._node, self.dim, self._size, self._region_name, int(order), self._attach, self._cell)
+        return replace(self, _mesh_order=int(order))
 
     def quad(self) -> "Shape":
         """Return a copy meshed with **quadrilaterals** instead of triangles (2-D only)::
@@ -409,7 +392,7 @@ class Shape:
                 "general 3-D geometry (recombination on a box returns tetrahedra), so a hex mesh has to "
                 "be swept or structured -- see jno.domain.equi_distant_box(cell='hex')."
             )
-        return Shape(self._node, self.dim, self._size, self._region_name, self._mesh_order, self._attach, "quad")
+        return replace(self, _cell="quad")
 
     def tri(self) -> "Shape":
         """Return a copy meshed with **simplices** — triangles in 2-D, tetrahedra in 3-D.
@@ -427,7 +410,7 @@ class Shape:
         around one element table and one cell array. Until that lands, a plan that asks for two
         different cells is refused rather than silently meshed with one of them.
         """
-        return Shape(self._node, self.dim, self._size, self._region_name, self._mesh_order, self._attach, "simplex")
+        return replace(self, _cell="simplex")
 
     def cell_choices(self) -> FrozenSet[str]:
         """Every explicit cell choice (:meth:`quad` / :meth:`tri`) anywhere in this build plan.

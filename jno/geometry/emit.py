@@ -542,6 +542,10 @@ def _build_once(shape, split_full, periodic=None, algorithm=None, threads=None, 
         ds = _apply_region_sizes(dim, shape) or _apply_size_fields(dim, leaves, labels, shape)
         if periodic:  # make named opposite faces conform (edge-element periodic ties need it)
             _apply_periodic(dim, labels, periodic)
+        # The cell choice comes from the tree walk, not from the top shape's own `_cell`. A regions
+        # group (`a.quad() + b.quad()`) is a fresh node that holds no cell of its own, so reading the
+        # top level meshed it as triangles -- 52 of them, measured, with no word about it -- while
+        # `cell_choices()` correctly reported {"quad"} two lines above. One derivation, one answer.
         _choices = shape.cell_choices() if hasattr(shape, "cell_choices") else frozenset()
         if len(_choices) > 1:
             raise NotImplementedError(
@@ -552,7 +556,8 @@ def _build_once(shape, split_full, periodic=None, algorithm=None, threads=None, 
                 "meshes today, mesh the regions independently with Shape.regions(..., conforming=False) "
                 "and tie them with u('a|b.a') - u('a|b.b')."
             )
-        if getattr(shape, "_cell", None) == "quad":
+        _cell = next(iter(_choices), None)
+        if _cell == "quad":
             # Mesh triangles, then RECOMBINE them into quadrilaterals. This is gmsh's only general
             # route to a quad mesh and it works on arbitrary 2-D geometry -- measured, a disk
             # recombines to 69 pure quads and a rectangle to 78, neither leaving any triangle behind.
@@ -573,9 +578,7 @@ def _build_once(shape, split_full, periodic=None, algorithm=None, threads=None, 
         is_regions = shape._node[0] == "regions"
         region_items = shape._node[1] if is_regions else None
         nonconforming = is_regions and len(shape._node) > 2 and not shape._node[2]
-        mesh = _to_meshio(
-            dim, labels, region_items, nonconforming=nonconforming, order=int(order), cell=getattr(shape, "_cell", None)
-        )
+        mesh = _to_meshio(dim, labels, region_items, nonconforming=nonconforming, order=int(order), cell=_cell)
         return mesh, dim, ds
     finally:
         gmsh.model.remove()
