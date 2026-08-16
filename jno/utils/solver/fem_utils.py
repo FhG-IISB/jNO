@@ -2400,6 +2400,13 @@ def _tri_dual_available(k: int) -> bool:
     The check is computed rather than hard-coded to the node count so it also guards any element type
     added later whose shape functions have a zero integral.
     """
+    if k not in (3, 6):
+        # This is an availability QUERY, so an unsupported facet is a False, not a raise. A
+        # quadrilateral facet (k = 4, a hexahedron's) has no triangular shape functions to integrate
+        # -- asking `_tri_shape` for them aborted the whole periodic build here, before the caller
+        # ever reached its node-to-node matching, which is what a conforming hex mesh needs and
+        # which does not involve a dual basis at all.
+        return False
     bary, w = _tri_quadrature(k // 3 + 2)
     d = np.abs(w @ _tri_shape(bary, k))
     return bool(d.min() > 1.0e-12 * float(d.max()))

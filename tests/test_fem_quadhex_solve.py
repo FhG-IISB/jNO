@@ -641,18 +641,69 @@ def test_hex_neumann_problem_matches_the_tet_mesh():
     np.testing.assert_allclose(s_hex[order_h], s_tet[order_t], rtol=1e-8, atol=1e-8)
 
 
-def test_a_periodic_tie_across_a_hex_facet_refuses_by_name():
-    """A hexahedron's facet is a quadrilateral, and the tie weights are barycentric (triangle) shape
-    functions. Reaching them would silently interpolate the facet from three of its four nodes —
-    exactly the fall-through the k>max_k guard exists to kill, one cell type short."""
-    d = _hex_domain()
+def _periodic_hex(dirs, n=4, cell="hex"):
+    """-Delta u + u = sin2pix sin2piy sin2piz, periodic in `dirs`. Exact u = f / (12 pi^2 + 1)."""
+    kw = {"cell": cell} if cell else {}
+    d = jno.domain(constructor=Geometries.equi_distant_box(nx=n, ny=n, nz=n, **kw), compute_mesh_connectivity=False)
     u, v = d.fem_symbols()
     xi, yi, zi, _ = d.variable("interior", split=True)
     ui, vi = u.bind(x=xi, y=yi, z=zi), v.bind(x=xi, y=yi, z=zi)
-    cl, cr = d.variable("left"), d.variable("right")
-    f = jno.np.sin(2 * PI * xi) * jno.np.sin(2 * PI * yi)
+    f = jno.np.sin(2 * PI * xi) * jno.np.sin(2 * PI * yi) * jno.np.sin(2 * PI * zi)
+    terms = [ui.x * vi.x + ui.y * vi.y + ui.z * vi.z + 1.0 * ui * vi - f * vi]
+    for axis, (lo, hi) in zip("xyz", (("left", "right"), ("bottom", "top"), ("front", "back"))):
+        if axis in dirs:
+            terms.append(u(*d.variable(lo)) - u(*d.variable(hi)))
+    sol = np.asarray(jno.fem(terms).solve()).ravel()
+    return sol, np.asarray(d._fem_native_dof_points)
+
+
+@pytest.mark.parametrize("dirs", ["x", "xy", "xyz"])
+def test_periodic_ties_on_a_hex_mesh(dirs):
+    """Whole-domain periodicity on hexahedra, in one, two and all three directions.
+
+    This used to refuse -- not because a hexahedron cannot support it (a structured hex mesh matches
+    its opposite faces node-for-node, needing no interpolation at all) but because the availability
+    CHECK for a mortar dual basis raised on a 4-node facet instead of answering False, aborting the
+    build before node matching was ever tried.
+
+    Periodicity is asserted as an identity, not a tolerance: matched nodes collapse onto one DOF, so
+    the two faces must agree EXACTLY.
+    """
+    sol, p = _periodic_hex(dirs)
+    for axis in range(3):
+        if "xyz"[axis] not in dirs:
+            continue
+        lo = np.where(np.abs(p[:, axis]) < 1e-12)[0]
+        assert len(lo), "no nodes found on the periodic face"
+        for i in lo:
+            q = p[i].copy()
+            q[axis] = 1.0
+            j = int(np.argmin(np.linalg.norm(p - q, axis=1)))
+            if np.linalg.norm(p[j] - q) < 1e-12:
+                assert sol[i] == sol[j], "a periodic pair does not share its value exactly"
+
+
+def test_periodic_hexes_solve_the_right_problem():
+    """Enforcing periodicity is not enough -- u = 0 is periodic too. Checked against the analytic
+    solution, and against the tetrahedral mesh of the same box."""
+    sol, p = _periodic_hex("xyz")
+    ex = np.sin(2 * PI * p[:, 0]) * np.sin(2 * PI * p[:, 1]) * np.sin(2 * PI * p[:, 2]) / (12 * PI**2 + 1)
+    err_hex = float(np.sqrt(np.mean((sol - ex) ** 2)))
+    sol_t, pt = _periodic_hex("xyz", cell=None)
+    ex_t = np.sin(2 * PI * pt[:, 0]) * np.sin(2 * PI * pt[:, 1]) * np.sin(2 * PI * pt[:, 2]) / (12 * PI**2 + 1)
+    err_tet = float(np.sqrt(np.mean((sol_t - ex_t) ** 2)))
+    assert err_hex < 5e-3 and err_hex < 3 * err_tet, f"hex {err_hex:.2e} vs tet {err_tet:.2e}"
+
+
+def test_a_nonmatching_hex_facet_tie_still_refuses():
+    """The genuinely unsupported case survives: interpolating ACROSS a quadrilateral facet needs
+    shape functions the barycentric weights do not have. Only the availability check changed."""
+    from jno.utils.solver.fem_utils import _tri_dual_available, _tri_shape
+
+    assert _tri_dual_available(3) is True  # a P1 triangle facet
+    assert _tri_dual_available(4) is False  # a hex's quad facet: unavailable, not an error
     with pytest.raises(NotImplementedError, match="HEXAHEDRAL facet"):
-        jno.fem([ui.x * vi.x + ui.y * vi.y + ui.z * vi.z + 1.0 * ui * vi - f * vi, u(*cl) - u(*cr)]).solve()
+        _tri_shape(np.zeros((1, 3)), 4)
 
 
 def test_taylor_hood_q2_q1_stokes_on_quads():

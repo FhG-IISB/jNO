@@ -697,11 +697,12 @@ the same grid, so an API mistake could not be mistaken for a limitation. Working
 hexes: steady linear, Neumann / surface terms, nonlinear (Newton), **vector fields (elasticity)**,
 coupled multifield including **Taylor-Hood Q2/Q1**, transient marches, runtime parameters differentiated with
 `jax.grad`, `u.bounds`, `by_region`, `by_tag`, eigensolves, `fem.eval` readout, and the direct
-solver slots. Periodic ties work on quads; on hexes they refuse (below).
+solver slots. **Whole-domain periodic BCs work on both**, in every direction — matched faces collapse
+onto one DOF, so the periodicity holds exactly rather than to a tolerance.
 
 | not supported on quad/hex | why |
 |---|---|
-| periodic / mortar **ties across a hexahedral facet** | the tie weights are barycentric (triangle) shape functions; a hex facet is a quadrilateral, so reaching them would interpolate it from three of its four nodes. Quad facets are 2- or 3-node edges and work |
+| **non-matching** mortar ties across a hexahedral facet | interpolating *across* a quad facet needs shape functions the barycentric weights do not have. Matching (conforming) periodic ties on hexes DO work — see below |
 | **h-adaptive remeshing** (`adapt=`) | mmg adapts simplices, and the recovery estimator differentiates P1 shape functions (constant per cell, which a bilinear cell's are not). Conforming quad/hex refinement is a different algorithm — templates, or an octree with hanging nodes |
 | 4th-order forms (plates, phase-field) | the physical-Hessian push-forward assumes an affine cell — the same refusal curved simplices already carry |
 | non-nodal families (N1E, RT, Argyris, Morley) | Argyris and Morley are *defined* on triangles; the quad analogues (RTCF/NCE, Bogner–Fox–Schmit) are different elements |
