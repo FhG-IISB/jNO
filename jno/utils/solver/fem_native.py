@@ -1271,16 +1271,18 @@ def assemble_fem_native(
     # ([0,+1]) -- so a traction meant for one body was applied to both, and the gap projected the
     # interface onto itself (`g0 == 0` identically). See `plans/contact-main-reaction.md`.
     #
-    # The mesh already knows the answer: `_tag_edges` / `_tag_triangles` carry each tag's facets by node
-    # id, per side (measured: 0 shared nodes between the two sides). Matching on facet identity is exact,
-    # so prefer it and keep the coordinate mask only for tags the mesh does not name that way.
+    # The mesh already knows the answer: `domain.tag_facets` carries each tag's facets by node id, per
+    # side (measured: 0 shared nodes between the two sides), whatever their vertex count -- picking the
+    # store by dimension instead returned nothing at all for a hexahedral mesh, whose boundary facets are
+    # quadrilaterals, and the term silently fell back to the all-nodes-in-region mask below. Matching on
+    # facet identity is exact, so prefer it and keep the mask only for tags the mesh does not name.
     _facet_lookup: Dict[frozenset, int] = {
         frozenset(int(conn.face_nodes[fi, j]) for j in range(conn.face_nodes.shape[1])): fi for fi in range(conn.n_bfaces)
     }
 
     def _region_faces(region: str) -> np.ndarray:
         """Boundary-face ids owned by ``region`` (``(n,) int32``, possibly empty)."""
-        _named = (getattr(domain, "_tag_edges" if dim == 2 else "_tag_triangles", {}) or {}).get(region)
+        _named = domain.tag_facets(region) if hasattr(domain, "tag_facets") else None
         if _named is not None and region != "boundary":
             # `"boundary"` keeps the mask: it is the catch-all, with its own interface-dropping semantics.
             _hit = [_facet_lookup[k] for f in np.asarray(_named) if (k := frozenset(int(x) for x in f)) in _facet_lookup]

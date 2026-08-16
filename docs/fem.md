@@ -711,6 +711,13 @@ onto one DOF, so the periodicity holds exactly rather than to a tolerance.
 Volume terms, Dirichlet conditions and **surface terms all work on both cells** — Neumann, Robin
 and flux integrals included.
 
+A *named subset* of a hexahedral boundary is resolved by facet identity, not by its nodes. The
+distinction is only visible when a tag omits a facet whose corners it keeps: a physical group naming
+8 of the 9 facets of a face shares every corner of the ninth with its neighbours, and the all-nodes
+mask puts that facet back. Measured as an applied load, that is `1.000` where the truth is `8/9`.
+The same applies to `region.contains(p)` — a point-in-region query anywhere between nodes — which
+tests the quadrilateral directly rather than a triangulation of it.
+
 Hexahedra took extra machinery to get there, and it is worth knowing why. A quadrilateral's facet is
 a straight edge (restricted to one edge a bilinear map is *linear*), so a single normal per facet is
 exact. A hexahedron's facet is a **bilinear surface**: its normal turns across the facet, and its

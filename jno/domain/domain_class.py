@@ -271,18 +271,29 @@ def _facet_normals(ents, dim, mesh=None):
     if dim == 2:
         t = ents[:, 1] - ents[:, 0]
         out = np.stack([t[:, 1], -t[:, 0]], axis=1)
+    elif ents.shape[1] == 4:
+        # A hexahedron's face is a quadrilateral and need not be planar, so no single edge pair gives
+        # its normal. The cross of the two DIAGONALS does, and is the rule the facet tables already
+        # use (`fem_facets.compute_face_normals`) -- keeping the two in step matters because the sign
+        # below is fixed by comparing against them.
+        out = np.cross(ents[:, 2] - ents[:, 0], ents[:, 3] - ents[:, 1])
     else:
         out = np.cross(ents[:, 1] - ents[:, 0], ents[:, 2] - ents[:, 0])
     out = out / (np.linalg.norm(out, axis=1, keepdims=True) + 1e-30)
 
-    cells = None
-    if mesh is not None:
-        key = "triangle" if dim == 2 else "tetra"
-        cells = getattr(mesh, "cells_dict", {}).get(key)
+    # The volume cell is not implied by the dimension: a 2-D mesh is triangles or quads, a 3-D one
+    # tets or hexes. Ask the mesh which it holds rather than assuming the simplex.
+    cells, cell_type = None, None
+    for key, name in {2: (("triangle", "triangle"), ("quad", "quad"))}.get(
+        int(dim), (("tetra", "tetrahedron"), ("hexahedron", "hexahedron"))
+    ):
+        cells = None if mesh is None else getattr(mesh, "cells_dict", {}).get(key)
+        if cells is not None and len(cells):
+            cell_type = name
+            break
     if cells is not None and len(cells):
         from ..utils.solver.fem_facets import build_facet_connectivity, compute_face_normals
 
-        cell_type = "triangle" if dim == 2 else "tetrahedron"
         conn = build_facet_connectivity(np.asarray(cells), cell_type)
         good = compute_face_normals(np.asarray(mesh.points), conn, np.asarray(cells), cell_type)
         # match each facet to its topological twin by centroid -- ``ents`` carries coordinates, not ids
@@ -1809,7 +1820,7 @@ class domain(MeshIOMixin):
         """
         full = self._boundary_regions.get("boundary")
         dim = self.dimension
-        ents = None if full is None else (full.edges if dim == 2 else full.triangles)
+        ents = None if full is None else full.facets
         if ents is None or len(ents) == 0:
             raise ValueError(f"tag({name!r}): a facet predicate f(x, n, name) needs a meshed boundary.")
         ents = np.asarray(ents)  # (E, k, dim) facet-vertex coordinates
@@ -1821,14 +1832,7 @@ class domain(MeshIOMixin):
             raise ValueError(f"tag({name!r}): the facet predicate f(x, n, name) selected no boundary facets.")
         sub, sub_n = ents[keep], nrm[keep]
         bpts = np.unique(sub.reshape(-1, sub.shape[-1])[:, :dim], axis=0)
-        self._boundary_regions[name] = BoundaryRegion(
-            tag=name,
-            dim=dim,
-            points=bpts,
-            edges=sub if dim == 2 else None,
-            triangles=sub if dim == 3 else None,
-            tol=full.tol,
-        )
+        self._boundary_regions[name] = BoundaryRegion.from_facets(name, dim, bpts, sub, tol=full.tol)
         # Time-dependent domains store pools as (n_time, n_pts, D) and `sample` indexes the SPATIAL axis
         # as `group_points[:, idx, :]`. Storing the bare (n_pts, D) here made `variable(name)` raise
         # "too many indices" on any time-dependent domain, so a facet predicate could name a boundary but
@@ -2124,15 +2128,13 @@ class domain(MeshIOMixin):
             if _bn is not None and len(np.asarray(_bn)) == len(_bp):
                 self.normals_by_tag[name] = np.asarray(_bn).reshape(len(_bp), -1)[_keep]
             return
-        attr = "edges" if dim == 2 else "triangles"
-        blocks = [getattr(full, attr)]
+        blocks = [full.facets]
         if region is not None:
-            blocks += [
-                getattr(r, attr)
-                for t, r in self._boundary_regions.items()
-                if "|" in t and getattr(r, attr) is not None and len(getattr(r, attr))
-            ]
+            blocks += [r.facets for t, r in self._boundary_regions.items() if "|" in t and r.facets is not None]
         blocks = [np.asarray(b) for b in blocks if b is not None and len(b)]
+        # Every block must be the same kind of facet to stack: they are, on the single-cell-type mesh
+        # jNO assembles on, but drop any that is not rather than raising out of numpy.
+        blocks = [b for b in blocks if b.shape[1:] == blocks[0].shape[1:]] if blocks else blocks
         ents = np.concatenate(blocks, axis=0) if blocks else None
         if ents is None or len(ents) == 0:
             return
@@ -2143,14 +2145,7 @@ class domain(MeshIOMixin):
             return
         sub = ents[keep]
         bpts = np.unique(sub.reshape(-1, sub.shape[-1])[:, :dim], axis=0)
-        self._boundary_regions[name] = BoundaryRegion(
-            tag=name,
-            dim=dim,
-            points=bpts,
-            edges=sub if dim == 2 else None,
-            triangles=sub if dim == 3 else None,
-            tol=full.tol,
-        )
+        self._boundary_regions[name] = BoundaryRegion.from_facets(name, dim, bpts, sub, tol=full.tol)
         # Per-point outward normals, exactly as the facet-predicate path stores them. Without this a
         # coordinate-tagged boundary had a region but NO entry in ``normals_by_tag``, so every reader
         # of that dict silently saw nothing for the tag — the mesh cell-set path was the only source,
@@ -2734,22 +2729,21 @@ class domain(MeshIOMixin):
                     elif self.dimension == 3 and len(tag_tris) > 0:
                         is_boundary_tag = True
                         entity_kind = "triangle"
+                    elif self.dimension == 3 and len(tag_quads) > 0:
+                        # A hexahedral mesh's boundary facet. Without this the tag fell through to the
+                        # normals fallback below and registered as `boundary_points`, so its region
+                        # carried no entities and `contains` degraded to a point-distance test.
+                        is_boundary_tag = True
+                        entity_kind = "quad"
                     elif name in self.normals_by_tag:
                         # fallback: still treat as a boundary-like tag if normals exist
                         is_boundary_tag = True
                         entity_kind = "boundary_points"
 
                     if is_boundary_tag:
-                        edge_coords = None
-                        tri_coords = None
 
-                        if len(tag_edges) > 0:
-                            edge_arr = np.asarray(tag_edges, dtype=int)
-                            edge_coords = points[edge_arr][:, :, : self.dimension]
-
-                        if len(tag_tris) > 0:
-                            tri_arr = np.asarray(tag_tris, dtype=int)
-                            tri_coords = points[tri_arr][:, :, : self.dimension]
+                        def _coords(facets):
+                            return points[np.asarray(facets, dtype=int)][:, :, : self.dimension] if len(facets) else None
 
                         # pred = self._boundary_predicates.get(name, None)
                         tol = self._estimate_boundary_tol(points[indices_list][:, : self.dimension])
@@ -2758,8 +2752,9 @@ class domain(MeshIOMixin):
                             tag=name,
                             dim=self.dimension,
                             points=points[indices_list][:, : self.dimension],
-                            edges=edge_coords,
-                            triangles=tri_coords,
+                            edges=_coords(tag_edges),
+                            triangles=_coords(tag_tris),
+                            quads=_coords(tag_quads),
                             tol=tol,
                         )
 

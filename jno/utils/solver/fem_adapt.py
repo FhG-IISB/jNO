@@ -2832,7 +2832,7 @@ def _tags_read(expr) -> list:
 
 
 def _tag_facet_vertex_ids(dom: Any, tag: str, dim: int) -> np.ndarray:
-    """The tag's boundary facets as MESH-VERTEX INDICES ``(E, dim)``.
+    """The tag's boundary facets as MESH-VERTEX INDICES ``(E, k)``, ``k`` its vertex count.
 
     ``BoundaryRegion`` stores facets as vertex *coordinates*; under a connectivity-preserving move the
     incidence never changes, so resolving it to indices once lets the normals be recomputed from moved
@@ -2840,7 +2840,7 @@ def _tag_facet_vertex_ids(dom: Any, tag: str, dim: int) -> np.ndarray:
     from scipy.spatial import cKDTree
 
     region = (getattr(dom, "_boundary_regions", None) or {}).get(tag)
-    ents = None if region is None else (region.edges if dim == 2 else region.triangles)
+    ents = None if region is None else region.facets
     if ents is None or len(ents) == 0:
         return np.zeros((0, dim), dtype=np.int64)
     ents = np.asarray(ents)[:, :, :dim]
