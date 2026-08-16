@@ -542,6 +542,16 @@ def _build_once(shape, split_full, periodic=None, algorithm=None, threads=None, 
         ds = _apply_region_sizes(dim, shape) or _apply_size_fields(dim, leaves, labels, shape)
         if periodic:  # make named opposite faces conform (edge-element periodic ties need it)
             _apply_periodic(dim, labels, periodic)
+        _choices = shape.cell_choices() if hasattr(shape, "cell_choices") else frozenset()
+        if len(_choices) > 1:
+            raise NotImplementedError(
+                f"this plan asks for more than one cell type ({', '.join(sorted(_choices))}). gmsh could "
+                "mesh it -- recombination is per-surface, and in 2-D the two regions conform along a "
+                "shared edge -- but jNO's assembler carries ONE element table and ONE cell array, so the "
+                "mesh would build and fail to assemble. Use a single cell type for now; to combine two "
+                "meshes today, mesh the regions independently with Shape.regions(..., conforming=False) "
+                "and tie them with u('a|b.a') - u('a|b.b')."
+            )
         if getattr(shape, "_cell", None) == "quad":
             # Mesh triangles, then RECOMBINE them into quadrilaterals. This is gmsh's only general
             # route to a quad mesh and it works on arbitrary 2-D geometry -- measured, a disk

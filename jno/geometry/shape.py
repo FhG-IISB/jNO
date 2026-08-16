@@ -411,6 +411,52 @@ class Shape:
             )
         return Shape(self._node, self.dim, self._size, self._region_name, self._mesh_order, self._attach, "quad")
 
+    def tri(self) -> "Shape":
+        """Return a copy meshed with **simplices** — triangles in 2-D, tetrahedra in 3-D.
+
+        Simplices are the default, so this is the explicit *opposite* of :meth:`quad`: it turns
+        recombination back off for a shape that inherited it from an enclosing plan::
+
+            plate.quad() - hole.tri()      # (once mixed-cell meshes land, see below)
+            (plate.quad()).tri()           # today: cancels the .quad()
+
+        A cell choice rides on the shape it describes, so each shape in a plan already carries its
+        own. What is not built yet is *honouring* two different choices in one mesh: gmsh can do it
+        (``setRecombine`` is per-surface, and a quad region and a triangle region meeting at a shared
+        edge conform node-for-node, since both have 2-node edges there), but jNO's assembler is built
+        around one element table and one cell array. Until that lands, a plan that asks for two
+        different cells is refused rather than silently meshed with one of them.
+        """
+        return Shape(self._node, self.dim, self._size, self._region_name, self._mesh_order, self._attach, "simplex")
+
+    def cell_choices(self) -> FrozenSet[str]:
+        """Every explicit cell choice (:meth:`quad` / :meth:`tri`) anywhere in this build plan.
+
+        More than one means a **mixed-cell** mesh was asked for. gmsh can produce one — recombination
+        is per-surface, and in 2-D a quad region and a triangle region sharing an edge conform
+        node-for-node because both have 2-node edges there — but jNO's assembler is built around a
+        single element table and a single cell array, so the mesh could be built and not assembled.
+        :func:`emit.build` refuses on that rather than quietly meshing everything one way.
+        """
+        seen: set = set()
+
+        def walk(shape):
+            if getattr(shape, "_cell", None) is not None:
+                seen.add(shape._cell)
+            node = shape._node
+            kind = node[0]
+            if kind in ("cut", "fuse", "inter"):
+                walk(node[1])
+                walk(node[2])
+            elif kind == "regions":
+                for _name, sub in node[1]:
+                    walk(sub)
+            elif kind in ("extrude", "revolve", "sweep", "fillet", "translate", "rotate"):
+                walk(node[1])
+
+        walk(self)
+        return frozenset(seen)
+
     # ----- introspection (pure; used by emit + selection) ------------------------
     def leaves(self, _inherit: Size = None) -> Tuple[Tuple[object, Size, int], ...]:
         """Flat ``(primitive, size, key)`` list of every primitive in the plan.

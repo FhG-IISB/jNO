@@ -306,3 +306,37 @@ def test_shape_quad_survives_the_other_modifiers():
     s = (jno.Shape.rect(0, 0, 2, 1, size=0.4).quad() - jno.Shape.disk(1.0, 0.5, 0.25)).sized(0.25)
     blocks = {c.type: len(c.data) for c in s.build()[0].cells}
     assert "triangle" not in blocks and blocks.get("quad", 0) > 0
+
+
+# ---------------------------------------------------------------------- the cell choice is per-shape
+
+
+def test_tri_is_the_explicit_opposite_of_quad():
+    """`.tri()` cancels a `.quad()` a shape inherited, and simplices remain the default."""
+    plain = {c.type for c in jno.Shape.rect(0, 0, 1, 1, size=0.4).build()[0].cells}
+    quad = {c.type for c in jno.Shape.rect(0, 0, 1, 1, size=0.4).quad().build()[0].cells}
+    back = {c.type for c in jno.Shape.rect(0, 0, 1, 1, size=0.4).quad().tri().build()[0].cells}
+    assert "triangle" in plain and "quad" not in plain
+    assert "quad" in quad and "triangle" not in quad
+    assert back == plain, ".tri() must undo .quad()"
+
+
+def test_a_mixed_cell_plan_refuses_rather_than_picking_one():
+    """Two different cell choices in one plan is a MIXED mesh. gmsh could build it — recombination
+    is per-surface and the regions conform along a shared edge in 2-D — but the assembler carries
+    one element table, so it would build and fail to assemble. Refuse at the mesher, and say what to
+    do instead (independent meshes + a mortar tie)."""
+    mixed = jno.Shape.regions(
+        left=jno.Shape.rect(0, 0, 1, 1, size=0.3).quad(),
+        right=jno.Shape.rect(1, 0, 2, 1, size=0.3).tri(),
+    )
+    assert mixed.cell_choices() == frozenset({"quad", "simplex"})
+    with pytest.raises(NotImplementedError, match="more than one cell type"):
+        mixed.build()
+
+
+def test_one_cell_choice_through_a_plan_is_not_mixed():
+    """A single choice, however deep in the plan, must still mesh."""
+    s = (jno.Shape.rect(0, 0, 2, 1, size=0.4).quad() - jno.Shape.disk(1.0, 0.5, 0.25)).sized(0.3)
+    assert s.cell_choices() == frozenset({"quad"})
+    assert "quad" in {c.type for c in s.build()[0].cells}
