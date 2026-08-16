@@ -191,3 +191,70 @@ class TestRunLevelDefault:
         from jno.utils.ad_mode import set_ad_mode
 
         set_ad_mode(prev_mode)
+
+
+class TestAFourthFamilyIsAdditive:
+    """The extension point, exercised: register a family without touching the evaluator.
+
+    This is what the registry is FOR. If adding a backend ever needs an edit to `_eval_jacobian` or
+    `_eval_hessian` again, this test is the one that should start failing.
+    """
+
+    FAMILY = "scaled_fd"
+
+    def setup_method(self):
+        import jno.trace_evaluator as te
+        from jno.utils.schemes import SCHEME_FAMILIES
+
+        # A family that differentiates stored VALUES on the mesh: scale the FD result by 10 so the
+        # plumbing is verifiable without inventing new numerics.
+        def _grad(mesh, scheme):
+            inner = te._fd_gradient(mesh, "finite_difference")
+            return lambda u_1d, axis: 10.0 * inner(u_1d, axis)
+
+        def _lap(mesh, scheme, dims):
+            inner = te._fd_laplacian(mesh, "finite_difference", dims)
+            return lambda u_1d: 10.0 * inner(u_1d)
+
+        SCHEME_FAMILIES[self.FAMILY] = "test-only: finite differences scaled by 10"
+        te._MESH_FIELD_FAMILIES[self.FAMILY] = te._MeshFieldBackend(_grad, _lap, None)
+
+    def teardown_method(self):
+        import jno.trace_evaluator as te
+        from jno.utils.schemes import SCHEME_FAMILIES
+
+        SCHEME_FAMILIES.pop(self.FAMILY, None)
+        te._MESH_FIELD_FAMILIES.pop(self.FAMILY, None)
+
+    def _frozen(self):
+        import numpy as np
+
+        import jno
+
+        d = jno.Shape.rect(0, 0, 1, 1, size=1 / 8).domain(structured=True)
+        x, y, _ = d.variable("interior")
+        P = np.asarray(d.mesh_connectivity["points"])[:, :2]
+        u, _v = d.fem_symbols()
+        return u.bind(x=x, y=y).freeze(np.sin(2 * np.pi * P[:, 0])), x, y
+
+    def test_the_new_family_is_reachable_and_used(self):
+        import numpy as np
+
+        f, x, _y = self._frozen()
+        base = np.asarray(f.d(x, scheme="finite_difference").eval()).reshape(-1)
+        scaled = np.asarray(f.d(x, scheme=self.FAMILY).eval()).reshape(-1)
+        np.testing.assert_allclose(scaled, 10.0 * base, rtol=1e-6)
+
+    def test_it_works_for_the_laplacian_too(self):
+        import numpy as np
+
+        f, x, y = self._frozen()
+        base = np.asarray(f.d2(x, scheme="finite_difference").eval()).reshape(-1)
+        scaled = np.asarray(f.d2(x, scheme=self.FAMILY).eval()).reshape(-1)
+        np.testing.assert_allclose(scaled, 10.0 * base, rtol=1e-6)
+
+    def test_and_it_is_gone_again_after_teardown(self):
+        """Registration is data, so unregistering restores the previous behaviour exactly."""
+        from jno.utils.schemes import scheme_family
+
+        assert scheme_family(self.FAMILY) == self.FAMILY  # registered right now
