@@ -60,6 +60,7 @@ from .differential_operators import DifferentialOperators
 from .integration_operators import IntegrationOperators
 from .utils import get_logger
 from .utils.ad_mode import ad_fn, parse_ad_scheme, parse_hessian_scheme
+from .utils.schemes import scheme_family
 
 
 class TraceEvaluator:
@@ -1016,7 +1017,7 @@ class TraceEvaluator:
         )
         u_full = jnp.asarray(self._dispatch(target, full_ctx)).reshape(-1)
 
-        sch = scheme if str(scheme).startswith("finite_difference") else "finite_difference"
+        sch = "finite_difference" if scheme_family(scheme) == "automatic_differentiation" else scheme
         _, grad_method, _ = DifferentialOperators.parse_fd_scheme(sch)
         if mesh_dim == 1:
             grads = [
@@ -1065,7 +1066,9 @@ class TraceEvaluator:
         scheme = expr.scheme
         # A FrozenField is known nodal values on a mesh — there is no analytic coordinate-function to
         # auto-differentiate, so its spatial gradient is the FD-over-mesh gradient of those values.
-        if isinstance(target, FrozenField) and not str(scheme).startswith("finite_difference"):
+        # Force FD only for AUTOMATIC differentiation, which is what is meaningless on stored nodal
+        # values. Any other family keeps its own backend.
+        if isinstance(target, FrozenField) and scheme_family(scheme) == "automatic_differentiation":
             scheme = "finite_difference"
         if isinstance(target, TestFunction):
             if ctx.active_region is None:
@@ -1408,7 +1411,11 @@ class TraceEvaluator:
         if points.ndim == 1:
             points = points[jnp.newaxis, :]
 
-        if scheme.startswith("finite_difference"):
+        # Resolving the family raises on an unknown one -- the `else` this chain never had. An
+        # unrecognised scheme used to fall off the end of the function and return None, surfacing
+        # much later as `TypeError: 'NoneType' object is not subscriptable`.
+        family = scheme_family(scheme)
+        if family == "finite_difference":
             domain = bound_var._domain
             if domain is None or domain.mesh_connectivity is None:
                 raise ValueError("FD scheme requires domain with mesh connectivity")
@@ -1490,7 +1497,7 @@ class TraceEvaluator:
             jac_full = jnp.stack(jac_components, axis=-1)
             return self._map_mesh_to_sampled(mesh_points, points, jac_full)
 
-        elif scheme.startswith("automatic_differentiation"):
+        elif family == "automatic_differentiation":
             evaluator_self = self
             _jac = ad_fn(parse_ad_scheme(scheme))
 
@@ -1585,7 +1592,8 @@ class TraceEvaluator:
         n = len(variables)
         var_dims = [(i, vi.dim[0], j, vj.dim[0]) for i, vi in enumerate(variables) for j, vj in enumerate(variables)]
 
-        if scheme.startswith("finite_difference"):
+        family = scheme_family(scheme)
+        if family == "finite_difference":
             domain = bound_var._domain
             if domain is None or domain.mesh_connectivity is None:
                 raise ValueError("FD scheme requires domain with mesh connectivity")
@@ -1688,7 +1696,7 @@ class TraceEvaluator:
                     return hess_full.reshape(*image_shape[:-1], n, n)
                 return self._map_mesh_to_sampled(mesh_points, points, hess_full)
 
-        elif scheme.startswith("automatic_differentiation"):
+        elif family == "automatic_differentiation":
             evaluator_self = self
             _outer_mode, _inner_mode = parse_hessian_scheme(scheme)
             _outer = ad_fn(_outer_mode)

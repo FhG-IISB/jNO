@@ -36,6 +36,8 @@ from __future__ import annotations
 
 import jax
 
+from .schemes import require_family
+
 _VALID_FIRST_ORDER = ("forward", "reverse")
 _VALID_HESSIAN = ("fwd-over-rev", "fwd-over-fwd", "rev-over-rev", "rev-over-fwd")
 
@@ -78,10 +80,11 @@ def parse_ad_scheme(scheme: str) -> str:
         "automatic_differentiation:forward"  → "forward"
         "automatic_differentiation:reverse"  → "reverse"
     """
-    if ":" not in scheme:
+    # Check the FAMILY, not just the suffix: this used to discard the family half, so any scheme
+    # without a colon -- including one belonging to another backend -- returned the AD default.
+    sub = require_family(scheme, "automatic_differentiation")
+    if not sub:
         return get_ad_mode()
-    _, sub = scheme.split(":", 1)
-    sub = sub.strip()
     if sub in _VALID_FIRST_ORDER:
         return sub
     raise ValueError(f"Unknown AD scheme suffix {sub!r}; expected one of {_VALID_FIRST_ORDER}.")
@@ -104,10 +107,9 @@ def parse_hessian_scheme(scheme: str) -> tuple[str, str]:
     First-order suffixes ``forward``/``reverse`` are accepted as shorthand for
     the matching same-mode composition (``forward`` → ``fwd-over-fwd``).
     """
-    if ":" not in scheme:
+    sub = require_family(scheme, "automatic_differentiation")
+    if not sub:
         return _hessian_to_outer_inner(get_hessian_mode())
-    _, sub = scheme.split(":", 1)
-    sub = sub.strip()
     if sub in _VALID_HESSIAN:
         return _hessian_to_outer_inner(sub)
     if sub in _VALID_FIRST_ORDER:
