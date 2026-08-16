@@ -682,14 +682,16 @@ cells: the map makes the integrand rational, so no rule is exact.
 
 **Scope — what is not supported yet**, each refusing by name rather than approximating:
 
-**Measured coverage.** Every row below was run on a quad mesh *and* on a triangle mesh of the same
-grid, so an API mistake could not be mistaken for a limitation. Working: steady linear, Neumann /
-surface terms, nonlinear (Newton), **vector fields (elasticity)**, coupled multifield at equal
-order, transient marches, runtime parameters differentiated with `jax.grad`, `u.bounds`,
-`by_region`, `by_tag`, periodic ties, eigensolves, `fem.eval` readout, and the direct solver slots.
+**Measured coverage.** Every row below was run on a tensor-product mesh *and* on the simplex mesh of
+the same grid, so an API mistake could not be mistaken for a limitation. Working on both quads and
+hexes: steady linear, Neumann / surface terms, nonlinear (Newton), **vector fields (elasticity)**,
+coupled multifield at equal order, transient marches, runtime parameters differentiated with
+`jax.grad`, `u.bounds`, `by_region`, `by_tag`, eigensolves, `fem.eval` readout, and the direct
+solver slots. Periodic ties work on quads; on hexes they refuse (below).
 
 | not supported on quad/hex | why |
 |---|---|
+| periodic / mortar **ties across a hexahedral facet** | the tie weights are barycentric (triangle) shape functions; a hex facet is a quadrilateral, so reaching them would interpolate it from three of its four nodes. Quad facets are 2- or 3-node edges and work |
 | **h-adaptive remeshing** (`adapt=`) | mmg adapts simplices, and the recovery estimator differentiates P1 shape functions (constant per cell, which a bilinear cell's are not). Conforming quad/hex refinement is a different algorithm — templates, or an octree with hanging nodes |
 | `order > 1` (Q2, Q3) | higher-order node promotion places nodes by **barycentric** weights, which only describe a simplex |
 | 4th-order forms (plates, phase-field) | the physical-Hessian push-forward assumes an affine cell — the same refusal curved simplices already carry |

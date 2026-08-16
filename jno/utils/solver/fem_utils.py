@@ -2271,6 +2271,15 @@ def _tri_shape(bary: np.ndarray, k: int) -> np.ndarray:
             ],
             axis=-1,
         )
+    if k == 4:
+        # A hexahedron's facet. It reaches here loudly rather than being interpolated as a triangle
+        # from three of its four nodes -- which is what the k < 6 branch above would otherwise do.
+        raise NotImplementedError(
+            "a periodic or mortar tie across a HEXAHEDRAL facet is not supported: the facet is a "
+            "quadrilateral, and these weights are barycentric (triangle) shape functions, which "
+            "would silently interpolate it from three of its four nodes. Tie across a simplicial "
+            "mesh, or make the two sides conforming so the nodes match one-to-one."
+        )
     raise ValueError(f"triangle facets carry 3 (P1) or 6 (P2) nodes, got {k}")
 
 

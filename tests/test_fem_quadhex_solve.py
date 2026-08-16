@@ -515,3 +515,53 @@ def test_boundary_facets_of_a_quad_mesh_use_the_quad_table():
     # and the simplex branch really is wrong here — the guard is load-bearing, not decorative
     wrong = _boundary_facets(pts, cells, 2, 1)
     assert not on_boundary[np.unique(wrong)].all()
+
+
+def _hex_domain(**kw):
+    return jno.domain(
+        constructor=Geometries.equi_distant_box(nx=3, ny=3, nz=3, cell="hex"), compute_mesh_connectivity=False, **kw
+    )
+
+
+def test_hex_neumann_problem_matches_the_tet_mesh():
+    """A flux BC on one face with the opposite face pinned — the solution is linear in x either way,
+    so the two cell types must agree to discretization error."""
+
+    def solve(cell):
+        kw = {"cell": cell} if cell else {}
+        d = jno.domain(constructor=Geometries.equi_distant_box(nx=3, ny=3, nz=3, **kw), compute_mesh_connectivity=False)
+        u, v = d.fem_symbols()
+        xi, yi, zi, _ = d.variable("interior", split=True)
+        cl, cr = d.variable("left", split=True), d.variable("right", split=True)
+        ui, vi = u.bind(x=xi, y=yi, z=zi), v.bind(x=xi, y=yi, z=zi)
+        fem = jno.fem(
+            [
+                ui.x * vi.x + ui.y * vi.y + ui.z * vi.z,
+                1.0 * v(cr[0], cr[1], cr[2]),
+                u(cl[0], cl[1], cl[2]) - 0.0,
+            ]
+        )
+        sol = np.asarray(fem.solve(linear=jno.solve.lu(backend="host"))).ravel()
+        return sol, np.asarray(d._fem_native_dof_points)
+
+    s_hex, p_hex = solve("hex")
+    s_tet, p_tet = solve(None)
+    # same structured nodes either way, so compare pointwise after matching coordinates
+    order_h = np.lexsort(p_hex.T)
+    order_t = np.lexsort(p_tet.T)
+    np.testing.assert_allclose(p_hex[order_h], p_tet[order_t], atol=1e-12)
+    np.testing.assert_allclose(s_hex[order_h], s_tet[order_t], rtol=1e-8, atol=1e-8)
+
+
+def test_a_periodic_tie_across_a_hex_facet_refuses_by_name():
+    """A hexahedron's facet is a quadrilateral, and the tie weights are barycentric (triangle) shape
+    functions. Reaching them would silently interpolate the facet from three of its four nodes —
+    exactly the fall-through the k>max_k guard exists to kill, one cell type short."""
+    d = _hex_domain()
+    u, v = d.fem_symbols()
+    xi, yi, zi, _ = d.variable("interior", split=True)
+    ui, vi = u.bind(x=xi, y=yi, z=zi), v.bind(x=xi, y=yi, z=zi)
+    cl, cr = d.variable("left"), d.variable("right")
+    f = jno.np.sin(2 * PI * xi) * jno.np.sin(2 * PI * yi)
+    with pytest.raises(NotImplementedError, match="HEXAHEDRAL facet"):
+        jno.fem([ui.x * vi.x + ui.y * vi.y + ui.z * vi.z + 1.0 * ui * vi - f * vi, u(*cl) - u(*cr)]).solve()
