@@ -1278,6 +1278,137 @@ def zz_error_indicators(domain: Any, u_vertex: np.ndarray) -> tuple[np.ndarray, 
     return eta, float(np.sqrt(eta2.sum()))
 
 
+def _integrate_nodal_per_cell(domain: Any, g_nodal: np.ndarray) -> np.ndarray:
+    r"""``(n_cells,)`` of ``\int_K g``, for a P1/Q1 nodal field ``g``, by the cell's own quadrature.
+
+    The companion of :func:`_integrated_gradient_gap` and cell-generic for the same reason: the basis is
+    tabulated for whatever cell the mesh carries, so triangles, tets, quadrilaterals and hexahedra all
+    go through it unchanged.
+    """
+    from .fem_lagrange import lagrange_on
+    from .fem_native import _basix_ordered, mesh_cell_type
+
+    dim = int(domain.dimension)
+    cell_type = mesh_cell_type(domain, dim)
+    spec = lagrange_on(cell_type, 1, quad_degree=3)
+    cells = _basix_ordered(np.asarray(domain.mesh.cells_dict[cell_type]), cell_type).astype(np.int64)
+    X = np.asarray(domain.mesh.points)[:, :dim].astype(np.float64)[cells]
+    N = np.asarray(spec.ref_values)[:, :, 0]  # (Q, A)
+    dN = np.asarray(spec.ref_grads)[:, :, 0, :]  # (Q, A, T)
+    detJ = np.abs(np.linalg.det(np.einsum("cai,qak->cqik", X, dN)))  # (C, Q)
+    gq = np.einsum("qa,ca->cq", N, np.asarray(g_nodal).reshape(-1)[cells])
+    return np.einsum("cq,cq,q->c", gq, detJ, np.asarray(spec.quad_weights))
+
+
+def _criterion_weak_terms(fem: Any, criterion: Any, field: int = 0):
+    """``(criterion_term, mass_term)`` -- the criterion as an assemblable **weak term**, plus the lumped
+    mass term that normalises it, both carrying the same test function.
+
+    A refinement criterion is a field, not an equation -- ``phi * (1 - phi)`` for a phase-field
+    interface, ``|grad u|`` for a shock -- so requiring the user to append ``* v`` would be noise. But
+    :meth:`FEM.eval` assembles weak terms and refuses anything without a test function, so one is
+    supplied here.
+
+    It has to be the FEM's **own** test symbol: a fresh ``domain.fem_symbols()`` creates a DIFFERENT
+    field, and the assembler then rejects the term for carrying a test field it does not know
+    ("each volume weak-form term must contain exactly one test field"). So the symbol is recovered by
+    walking this FEM's own terms, and ``field`` selects it on a multifield problem (the same index
+    :attr:`AdaptSpec.metric_field` uses elsewhere).
+
+    The region likewise comes from the criterion's own coordinates -- recovered through
+    ``_jno_region_tag``, because ``jno.fem`` retags coordinates to the quadrature pool
+    (``"fem_gauss"``) at build time and the raw tag no longer names a region.
+    """
+    from ...trace import Placeholder, TestFunction, Variable, _iter_placeholder_children
+    from .solver_helper import contains_node_type
+
+    node = getattr(criterion, "expr", criterion)
+
+    def _walk(root, want):
+        seen: set = set()
+        out: list = []
+
+        def visit(n):
+            if not isinstance(n, Placeholder) or id(n) in seen:
+                return
+            seen.add(id(n))
+            if isinstance(n, want):
+                out.append(n)
+            for kind, _attr, val in _iter_placeholder_children(n):
+                for c in val if kind == "list" else (val,):
+                    visit(c)
+
+        visit(root)
+        return out
+
+    tests: list = []
+    for t in list(getattr(fem, "_constraints", None) or []):
+        for tf in _walk(getattr(t, "expr", t), TestFunction):
+            if not any(tf.field_key == e.field_key for e in tests):
+                tests.append(tf)
+    if not tests:
+        raise ValueError(
+            "adapt(criterion=...): could not find this problem's test function, so the criterion cannot "
+            "be assembled. Pass a criterion that already carries the test function (`expr * v`)."
+        )
+    if not 0 <= int(field) < len(tests):
+        raise ValueError(f"adapt(criterion=...): metric_field={field} but this problem has {len(tests)} field(s).")
+
+    tags: list = []
+    for var in _walk(node, Variable):
+        tg = getattr(var, "tag", None)
+        if isinstance(tg, str) and (tg == "fem_gauss" or tg.startswith("gauss_")):
+            tg = getattr(var, "_jno_region_tag", tg)
+        if isinstance(tg, str) and tg not in tags:
+            tags.append(tg)
+    if not tags:
+        raise ValueError(
+            "adapt(criterion=...): the criterion carries no coordinates, so its region is undetermined. "
+            "Build it from `domain.variable(region, split=True)` coordinates, as a weak term is."
+        )
+    if len(tags) > 1:
+        raise ValueError(f"adapt(criterion=...): the criterion spans more than one region {tags}; use one.")
+
+    dim = int(fem.domain.dimension)
+    coords = fem.domain.variable(tags[0], split=True)
+    test_bound = tests[int(field)](*coords[:dim])
+    node = getattr(criterion, "expr", criterion)
+    # The MASS term is built from the same test function and coordinates rather than from the criterion,
+    # so that an already-weak criterion does not produce `1 + 0*(g*v)` -- a sum of a test-free and a
+    # test-carrying part, which the assembler rejects as "must contain exactly one test field".
+    crit_term = criterion if contains_node_type(node, TestFunction) else criterion * test_bound
+    mass_term = 1.0 * test_bound
+
+    # Point the coordinates at the quadrature pool, exactly as `jno.fem` does to a form's coordinates at
+    # build time. Without it a criterion built from FRESHLY fetched coordinates samples the mesh pool
+    # while assembly wants quadrature points, and the mismatch surfaces as a bare broadcasting error
+    # ("input type=float32[173484] and requested type=float32[948]") naming neither the criterion nor
+    # the coordinates. Idempotent on coordinates the form already retagged.
+    from jno._fem import _retag_coords_for_quadrature
+
+    for t in (crit_term, mass_term):
+        _retag_coords_for_quadrature(t, "volume", tags[0])
+    return crit_term, mass_term
+
+
+def _criterion_indicators(fem: Any, criterion: Any, u: np.ndarray, field: int = 0) -> tuple:
+    """Per-cell indicators from a traced criterion, in the shape :func:`zz_error_indicators` returns.
+
+    ``FEM.eval`` gives ``int g phi_i``; dividing by the lumped mass ``int phi_i`` turns that into a
+    nodal field whose scale is ``g`` rather than ``g x volume`` -- so a criterion and the mesh it is
+    measured on stay independent, and `theta` means the same thing across refinement rounds. The nodal
+    field is then integrated per cell, which is what the marking consumes.
+    """
+    weak, mass_term = _criterion_weak_terms(fem, criterion, field)
+    num = np.asarray(fem.eval(weak, u)).reshape(-1)
+    mass = np.asarray(fem.eval(mass_term, u)).reshape(-1)
+    n_vert = int(np.asarray(fem.domain.mesh.points).shape[0])
+    g = np.abs(num[:n_vert]) / np.maximum(np.abs(mass[:n_vert]), 1e-30)
+    g = np.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0)
+    eta = np.abs(_integrate_nodal_per_cell(fem.domain, g))
+    return eta, float(np.sqrt(np.sum(eta**2)))
+
+
 def _integrated_gradient_gap(domain: Any, u_vertex: np.ndarray, g_star: np.ndarray) -> np.ndarray:
     """``(n_cells,)`` of ``\\int_K |g* - grad u_h|^2``, by the cell's own quadrature.
 
@@ -1975,6 +2106,18 @@ class AdaptSpec:
     hmax: float | None = None
     every: int = 5
     metric_field: int = 0
+    criterion: Any = None
+    """Refine on a **traced expression** instead of the recovery error estimator.
+
+    Any jNO expression of the solution and the coordinates: ``jno.np.abs(ui.x)`` for a gradient
+    detector, ``phi * (1 - phi)`` for a phase-field interface, ``jno.np.abs(uy.x - ux.y)`` for 2-D
+    vorticity, ``d.by_region({...})`` to refine a material. It needs **no test function** -- one is
+    supplied internally (:func:`_criterion_weak_term`), because a criterion is a field, not an equation.
+
+    This is how refinement is specified in production AMR codes, which mark on physical quantities
+    rather than on an error estimate. Marking (``theta``), sizing (``refine_factor``) and the remesh
+    mechanism are unchanged, so a criterion composes with everything else on this spec.
+    """
     # --- r-adaptivity (mesh relocation) --------------------------------------------------------------
     relocate: bool = False
     """Switch ``FEM.solve(adapt=...)`` from h-refinement (add elements) to **r-adaptivity**: relocate the
@@ -2043,9 +2186,19 @@ def _solve_vertex_values(fem: Any, solve_fn: Any = None, *, allow_vector: bool =
     P1 **vector** field returns its node-major nodal values reshaped to ``(n_vertices, vec)`` (which the ZZ
     estimator sums over components); without it -- and for a higher-order vector field, whose vertex DOFs
     are not a simple prefix -- a vector problem is rejected (refine on a scalar readout instead)."""
+    return _vertex_view(np.asarray(fem.solve(solve_fn, **kwargs)).reshape(-1), fem, allow_vector=allow_vector)
+
+
+def _vertex_view(sol: np.ndarray, fem: Any, *, allow_vector: bool = False) -> np.ndarray:
+    """The vertex part of an already-computed solution vector.
+
+    Split out of :func:`_solve_vertex_values` so a caller that needs BOTH the full DOF vector and its
+    vertex view -- a traced criterion is assembled on the full vector, while the estimator wants the
+    vertex one -- gets them from a single solve instead of solving the problem twice per round.
+    """
     from jno._fem import _infer_vec  # local import: fem_adapt is loaded lazily by the domain
 
-    sol = np.asarray(fem.solve(solve_fn, **kwargs)).reshape(-1)
+    sol = np.asarray(sol).reshape(-1)
     n_vert = int(np.asarray(fem.domain.mesh.points).shape[0])
     vec = _infer_vec(fem._constraints) if getattr(fem, "_constraints", None) else 1
     if vec != 1:
@@ -2088,13 +2241,21 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
     prev_est = None
     n_converged = 0
     for it in range(spec.max_iters):
-        u = _solve_vertex_values(cur, solve_fn, allow_vector=True, **kwargs)
+        _full = np.asarray(cur.solve(solve_fn, **kwargs)).reshape(-1)
+        u = _vertex_view(_full, cur, allow_vector=True)
         if u.ndim == 2 and spec.anisotropic:  # vector field: the ZZ estimator sums components, but the
             raise NotImplementedError(  # anisotropic Hessian metric is scalar-only (a single Hessian field)
                 "anisotropic (Hessian-metric) adaptation is scalar-only; use isotropic ZZ "
                 "(AdaptSpec(anisotropic=False)) to refine a vector field."
             )
-        eta, est = zz_error_indicators(d, u)
+        if spec.criterion is not None:
+            # A user criterion REPLACES the recovery estimator: it says where to refine directly, which
+            # is how production AMR actually marks (a density gradient, an interface, vorticity) rather
+            # than by an error estimate. Everything downstream -- theta, refine_factor, the remesh
+            # mechanism -- is untouched, so it composes with all of them.
+            eta, est = _criterion_indicators(cur, spec.criterion, _full, int(spec.metric_field))
+        else:
+            eta, est = zz_error_indicators(d, u)
         n_dofs = int(np.asarray(d.mesh.points).shape[0])
         marked = None if spec.anisotropic else dorfler_mark(eta, spec.theta)
         # points/cells for a refinement animation (connectivity changes each round). Recorded with the

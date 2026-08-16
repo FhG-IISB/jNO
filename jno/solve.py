@@ -20,7 +20,7 @@ BiCGStab (steady linear) and Jacobian-free Newton-Krylov (nonlinear).
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import jax
 import jax.numpy as jnp
@@ -881,6 +881,7 @@ def lstsq(A, b, *, damp: float = 0.0, atol: float = 1e-6, btol: float = 1e-6, ma
 
 def remesh(
     *,
+    criterion: Any = None,
     anisotropic: bool = False,
     max_dofs: int | None = None,
     every: int = 5,
@@ -894,6 +895,26 @@ def remesh(
     eps: float | None = None,
 ) -> AdaptSpec:
     """**h-adaptivity** for ``fem.solve(adapt=...)``: change the mesh to follow the solution.
+
+    **``criterion=``** refines on a **traced expression** instead of the recovery error estimator --
+    which is how production AMR codes actually mark, on a physical quantity rather than an error
+    estimate. It carries **no test function**; a criterion is a field, not an equation::
+
+        ui = u.bind(x=xi, y=yi)
+
+        remesh(criterion=jno.np.sqrt(ui.x**2 + ui.y**2))   # gradient / shock detector
+        remesh(criterion=phi * (1.0 - phi))                # phase-field interface
+        remesh(criterion=jno.np.abs(uy.x - ux.y))          # 2-D vorticity, on a vector field
+        remesh(criterion=d.by_region({"weld": 1.0, "plate": 0.0}))   # refine one material
+
+    The expression is assembled against this problem's own test function, normalised by the lumped
+    mass to a nodal field, and integrated per cell; ``theta``, ``refine_factor`` and the remesh
+    mechanism are unchanged, so it composes with everything else here. On a multifield problem
+    ``metric_field`` selects which field's space it is assembled in. A term that already carries the
+    test function is accepted too.
+
+    Second derivatives in a criterion (a Löhner-style ``|D2u|/|Du|`` detector) need ``order >= 2``:
+    a P1 Hessian is identically zero, so at order 1 such a criterion evaluates to nothing.
 
     On a **steady** problem this is the refine loop — solve, estimate (Zienkiewicz–Zhu), mark
     (Dörfler ``theta``), refine by ``refine_factor``, repeat up to ``max_iters`` — growing the mesh
@@ -947,6 +968,7 @@ def remesh(
         hmax=hmax,
         every=every,
         metric_field=metric_field,
+        criterion=criterion,
     )
 
 

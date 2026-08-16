@@ -729,6 +729,30 @@ healthy. That fix improved the simplex path too, from ~0.77 to ~1.006.
 
 Reference: Zienkiewicz & Zhu, IJNME **33** (1992) 1331–1364; Barlow, IJNME **10** (1976) 243–251.
 
+**Refining on your own criterion.** `adapt=` marks on the Zienkiewicz–Zhu recovery estimator by
+default. Production AMR codes mark on *physical* quantities instead — a density gradient, an
+interface, vorticity — and `criterion=` takes any traced expression, with **no test function** (a
+criterion is a field, not an equation):
+
+```python
+ui = u.bind(x=xi, y=yi)
+
+remesh(criterion=jno.np.sqrt(ui.x**2 + ui.y**2))              # gradient / shock detector
+remesh(criterion=phi * (1.0 - phi))                            # phase-field interface
+remesh(criterion=jno.np.abs(uy.x - ux.y))                      # 2-D vorticity
+remesh(criterion=d.by_region({"weld": 1.0, "plate": 0.0}))     # refine one material
+```
+
+It is assembled against the problem's own test function, normalised by the lumped mass to a nodal
+field — so the scale is the criterion, not `criterion x cell volume`, and `theta` means the same thing
+on a coarse and a fine mesh — then integrated per cell and marked as usual. Everything else on the
+spec is unchanged, so a criterion composes with `theta`, `refine_factor`, `max_dofs` and the quad
+rebuild path below. Measured on a thin diagonal ridge: cells on the feature come out **1.85x** smaller
+than off it on triangles and **1.92x** on quads.
+
+A Löhner-style detector `|D²u|/|Du|` needs `order >= 2` — a P1 Hessian is identically zero, so at
+order 1 it would evaluate to nothing.
+
 **h-adaptivity on quadrilaterals** works, by a different mechanism than on simplices. mmg adapts
 triangles and tets by local edge split/collapse/swap and has no quad analogue — but a quad mesh in
 jNO *is* a triangulation gmsh recombined, and the size field driving it is already part of the
