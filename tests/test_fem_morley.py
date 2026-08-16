@@ -190,7 +190,7 @@ def test_morley_periodic_biharmonic_convergence():
     errs, hs = [], []
     with jax.default_device(jax.devices("cpu")[0]):
         for n in (12, 24):
-            d = jno.domain.equi_distant_rect(x_range=(0.0, 1.0), y_range=(0.0, 1.0), nx=n, ny=n)
+            d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=n).domain()
             xi, yi, _ = d.variable("interior", split=True)
             xl, yl, _ = d.variable("left", split=True)
             xr, yr, _ = d.variable("right", split=True)
@@ -241,7 +241,7 @@ def test_morley_periodic_multifield_decoupled_convergence():
     eps, eph, hs = [], [], []
     with jax.default_device(jax.devices("cpu")[0]):
         for n in (12, 24):
-            d = jno.domain.equi_distant_rect(x_range=(0.0, 1.0), y_range=(0.0, 1.0), nx=n, ny=n)
+            d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=n).domain()
             xi, yi, _ = d.variable("interior", split=True)
             xl, yl, _ = d.variable("left", split=True)
             xr, yr, _ = d.variable("right", split=True)
@@ -288,7 +288,7 @@ def test_morley_periodic_rejects_argyris_and_nonconforming():
     the C¹ **Argyris** element (extra per-vertex derivative DOFs whose periodic signs are not wired) raises a
     clear ``NotImplementedError`` at assembly rather than silently mis-tying."""
     sin = jno.np.sin
-    d = jno.domain.equi_distant_rect(x_range=(0.0, 1.0), y_range=(0.0, 1.0), nx=6, ny=6)
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=6).domain()
     xi, yi, _ = d.variable("interior", split=True)
     xl, yl, _ = d.variable("left", split=True)
     xr, yr, _ = d.variable("right", split=True)
@@ -321,7 +321,7 @@ def test_morley_periodic_rejects_a_bloch_phase():
     problem with ``ValueError: too many values to unpack (expected 4)`` — a plain-periodic tie included.
     The two convergence tests above are the regression for that; this one covers the phase itself."""
     sin = jno.np.sin
-    d = jno.domain.equi_distant_rect(x_range=(0.0, 1.0), y_range=(0.0, 1.0), nx=6, ny=6)
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=6).domain()
     xi, yi, _ = d.variable("interior", split=True)
     xl, yl, _ = d.variable("left", split=True)
     xr, yr, _ = d.variable("right", split=True)

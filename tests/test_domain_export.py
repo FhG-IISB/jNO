@@ -16,7 +16,7 @@ def _assert_nonempty(path: Path):
     "constructor",
     [
         jno.domain.line(mesh_size=0.2),
-        jno.domain.equi_distant_rect(nx=6, ny=6),
+        jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=6).domain(),
         jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.6),
     ],
 )
@@ -37,7 +37,7 @@ def test_export_vtk_msh(constructor, tmp_path):
     "constructor",
     [
         jno.domain.line(mesh_size=0.2),
-        jno.domain.equi_distant_rect(nx=6, ny=6),
+        jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=6).domain(),
         jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.6),
     ],
 )
@@ -51,10 +51,7 @@ def test_export_png_if_matplotlib_available(constructor, tmp_path):
 
 
 def test_export_dispatch_with_explicit_format(tmp_path):
-    dom = jno.domain(
-        constructor=jno.domain.equi_distant_rect(nx=4, ny=4),
-        compute_mesh_connectivity=True,
-    )
+    dom = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=4).domain(compute_mesh_connectivity=True)
 
     out = tmp_path / "mesh_any.ext"
     dom.export(str(out), fmt="vtk")
@@ -64,7 +61,7 @@ def test_export_dispatch_with_explicit_format(tmp_path):
 @pytest.mark.parametrize(
     "constructor",
     [
-        jno.domain.equi_distant_rect(nx=6, ny=6),
+        jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=6).domain(),
         jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.8),
     ],
 )

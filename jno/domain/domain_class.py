@@ -379,48 +379,6 @@ class domain(MeshIOMixin):
         )
 
     @classmethod
-    def equi_distant_rect(
-        cls,
-        x_range=(0, 1),
-        y_range=(0, 1),
-        nx=10,
-        ny=10,
-        *,
-        algorithm: int = 6,
-        time: Optional[Tuple[float, float, int]] = None,
-        compute_mesh_connectivity: bool = True,
-    ) -> "domain":
-        """Instantiate a structured rectangular triangulation."""
-        dom = cls._from_geometry(
-            Geometries.equi_distant_rect(x_range=x_range, y_range=y_range, nx=nx, ny=ny),
-            algorithm=algorithm,
-            time=time,
-            compute_mesh_connectivity=compute_mesh_connectivity,
-        )
-        dom._grid_shape = (nx + 1, ny + 1)
-        return dom
-
-    @classmethod
-    def poseidon(
-        cls,
-        nx: int = 128,
-        ny: int = 128,
-        *,
-        algorithm: int = 6,
-        time: Optional[Tuple[float, float, int]] = None,
-        compute_mesh_connectivity: bool = True,
-    ) -> "domain":
-        """Instantiate the structured Poseidon-style 2D grid."""
-        dom = cls._from_geometry(
-            Geometries.poseidon(nx=nx, ny=ny),
-            algorithm=algorithm,
-            time=time,
-            compute_mesh_connectivity=compute_mesh_connectivity,
-        )
-        dom._grid_shape = (nx, ny)
-        return dom
-
-    @classmethod
     def poly(
         cls,
         vertices,
@@ -489,12 +447,6 @@ class domain(MeshIOMixin):
         """Dispatch to PolygonDomain when constructor is a shapely geometry, vertex list, or dict."""
         if cls is domain and constructor is not None:
             if not isinstance(constructor, (str, domain)) and not callable(constructor):
-                if kwargs.get("structured"):
-                    raise ValueError(
-                        "jno.domain(..., structured=True) requires a jno.Shape.rect(...) geometry — a "
-                        "shapely/polygon/vertex constructor is not supported. Build the rectangle with "
-                        "jno.Shape.rect(x0, y0, x1, y1, size=h) (structured grids are v1-limited to that)."
-                    )
                 from .polygon_domain import PolygonDomain
 
                 _POLY_KWARGS = frozenset(
@@ -524,7 +476,6 @@ class domain(MeshIOMixin):
         tau: Optional[Tuple[float, float, int]] = None,
         compute_mesh_connectivity: Optional[bool] = None,
         keep_orphan_nodes: bool = False,
-        structured: bool = False,
         **_ignored_kwargs,
     ):
         """
@@ -540,13 +491,9 @@ class domain(MeshIOMixin):
                 rather than integrating a physical time derivative. Use for quasi-static load-stepping
                 (e.g. an elasto-plastic load→unload cycle). Pass ``time`` **or** ``tau``, not both.
             mesh_connectivity: Wether or not to compute the some hyperparameters about the mesh (needed for finite_difference methods)
-            structured: When ``True`` and the geometry is a single axis-aligned ``jno.Shape.rect(...)``,
-                build a **regular grid** (right-triangulation) sized from the shape's ``size=`` instead of
-                an unstructured gmsh mesh, and record a grid descriptor on ``mesh_connectivity["grid"]``.
-                ``jno.fdm`` then takes the assembly-free direct finite-difference stencils (the 5-point
-                Laplacian) on that grid rather than the cotangent operator — same answer, much cheaper.
-                v1 is 2-D axis-aligned rectangles only; a 3-D ``Shape.box(...)`` or a composite/CSG shape
-                raises (structured 3-D and cut-cell geometry are planned).
+
+        A geometry built with :meth:`jno.Shape.structured` is meshed as a regular lattice rather than
+        by gmsh, and records its grid descriptor on :attr:`grid` / ``mesh_connectivity["grid"]``.
         """
         # `tau=` is a pseudo-time (load-path) alias of `time=`: reuse the whole grid/coordinate/tiling
         # machinery, only flag it so the solve marches it as a history path instead of integrating u.t.
@@ -634,13 +581,6 @@ class domain(MeshIOMixin):
         # `.name("steel").attach(k=2.0).structured()` plan used to lose its material without a word.
         self._structured_grid = None
         _plan = constructor if hasattr(constructor, "_node") else None
-        if structured:
-            if _plan is None:
-                raise ValueError(
-                    "jno.domain(..., structured=True) requires a jno.Shape geometry — got "
-                    f"{type(constructor).__name__}. Prefer the shape spelling: Shape.rect(...).structured()."
-                )
-            _plan = _plan if _plan._structured is not None else _plan.structured()
         if _plan is not None and _plan._structured is not None:
             constructor, self._structured_grid = self._structured_grid_setup(_plan)
 

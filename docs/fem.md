@@ -645,8 +645,8 @@ d = jno.Shape.disk(0, 0, 1, size=0.1).quad().domain()
 u, v = d.fem_symbols(order=2)          # Q2 / Q3 work exactly as P2 / P3 do
 
 # structured grids, no mesher involved — a rectangle of quads, a box of hexes
-d = jno.domain(constructor=jno.domain.equi_distant_rect(nx=40, ny=40, cell="quad"))
-d = jno.domain(constructor=jno.domain.equi_distant_box(nx=16, ny=16, nz=16, cell="hex"))
+d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=40).quad().domain()
+d = jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0).structured(n=16).quad().domain()
 ```
 
 Nothing else in the term list changes — the weak form, the boundary conditions and the solve are

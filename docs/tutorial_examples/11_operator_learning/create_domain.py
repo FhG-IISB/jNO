@@ -64,10 +64,7 @@ def build_domain_from_arrays(forcing: np.ndarray, solution: np.ndarray, grid_siz
         raise ValueError(f"forcing and solution must have identical shapes, got {forcing.shape} and {solution.shape}")
 
     samples = int(forcing.shape[0])
-    base_domain = jno.domain(
-        constructor=jno.domain.poseidon(nx=grid_size, ny=grid_size),
-        compute_mesh_connectivity=True,
-    )
+    base_domain = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=grid_size - 1).domain(compute_mesh_connectivity=True)
     domain = samples * base_domain
     domain.variable("interior")
     domain.variable("_f", forcing[:, np.newaxis, np.newaxis, :, :, :])

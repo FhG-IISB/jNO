@@ -123,7 +123,7 @@ class _GMG(_Spec):
         if grid is None:
             raise ValueError(
                 "jno.precond.gmg() needs a structured grid — build the domain with "
-                "jno.domain(..., structured=True) (an axis-aligned Shape.rect / .box). This operator has "
+                "Shape.rect(...).structured() / Shape.box(...).structured(). This operator has "
                 "no grid descriptor, so there is no coarsening hierarchy to build."
             )
         from .utils.solver.geometric_mg import build_vcycle
@@ -234,8 +234,8 @@ def jacobi() -> _Jacobi:
 
 
 def gmg(*, n_pre: int = 2, n_post: int = 2, omega: float | None = None, min_size: int = 5) -> _GMG:
-    """Geometric-multigrid V-cycle preconditioner for a **structured grid** (``jno.domain(...,
-    structured=True)``).
+    """Geometric-multigrid V-cycle preconditioner for a **structured grid**
+    (``jno.Shape.rect(...).structured().domain()``).
 
     Builds a coarsen-by-2 grid hierarchy and applies one V-cycle as ``M⁻¹``: damped-Jacobi smoothing
     (``n_pre``/``n_post`` sweeps, ``omega`` damping — default the model-problem optimum ``2d/(2d+1)``),
