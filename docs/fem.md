@@ -691,15 +691,22 @@ order, transient marches, runtime parameters differentiated with `jax.grad`, `u.
 | not supported on quad/hex | why |
 |---|---|
 | **h-adaptive remeshing** (`adapt=`) | mmg adapts simplices, and the recovery estimator differentiates P1 shape functions (constant per cell, which a bilinear cell's are not). Conforming quad/hex refinement is a different algorithm — templates, or an octree with hanging nodes |
-| surface / boundary integrals **on hexahedra** (they work on quads) | a hexahedron's facet is a bilinear *surface*, so its normal and area element vary across it and need Nanson's formula per quadrature point; a quad's facet is a straight edge, so one normal per facet is exact |
 | `order > 1` (Q2, Q3) | higher-order node promotion places nodes by **barycentric** weights, which only describe a simplex |
 | 4th-order forms (plates, phase-field) | the physical-Hessian push-forward assumes an affine cell — the same refusal curved simplices already carry |
 | non-nodal families (N1E, RT, Argyris, Morley) | Argyris and Morley are *defined* on triangles; the quad analogues (RTCF/NCE, Bogner–Fox–Schmit) are different elements |
 | `Shape.quad().curved()` | a curved quadrilateral is a 9-node block the emitter does not produce |
 
-Volume terms and Dirichlet conditions work on both cells, and **surface terms work on
-quadrilaterals** — Neumann, Robin and flux integrals included. In practice: a quad mesh is ready for
-most 2-D problems, and a hex mesh is ready for anything posed with essential boundary conditions.
+Volume terms, Dirichlet conditions and **surface terms all work on both cells** — Neumann, Robin
+and flux integrals included.
+
+Hexahedra took extra machinery to get there, and it is worth knowing why. A quadrilateral's facet is
+a straight edge (restricted to one edge a bilinear map is *linear*), so a single normal per facet is
+exact. A hexahedron's facet is a **bilinear surface**: its normal turns across the facet, and its
+area element varies with it. Both are therefore formed at each quadrature point by Nanson's formula,
+from the same physical tangents the area element already needed. The check is the divergence
+theorem, `∮ x·n dS = 3·Vol`, which is sensitive to the normal's direction *and* orientation at every
+point: it holds to **machine precision (≈3e-16)** on deliberately warped meshes with non-planar
+faces, and a single per-facet normal cannot pass it there.
 
 ### Mesh resolution for wave problems
 

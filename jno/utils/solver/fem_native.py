@@ -349,6 +349,13 @@ def _region_node_ids_from_pts(domain, region: str, pts_all: np.ndarray) -> List[
 # ---------------------------------------------------------------------------
 
 
+#: A quadrilateral facet's nodes come out of the topology tables in PERIMETER-CYCLIC order
+#: (a, b, c, d around the face), while basix numbers a quadrilateral's vertices lexicographically
+#: ((0,0), (1,0), (0,1), (1,1)). This reindexes the former into the latter. Pairing cyclic corners
+#: with a basix quad basis without it yields a BOW-TIE whose Jacobian changes sign inside the face.
+_CYCLIC_TO_BASIX_QUAD = [0, 1, 3, 2]
+
+
 def _refuse_tensor_product(cell_type: Any, what: str, because: str) -> None:
     """Refuse a still-simplex-only path on a quad/hex mesh by NAME, not by shape error.
 
@@ -376,15 +383,6 @@ def _refuse_tensor_product_surface(cell_type: Any) -> None:
     need Nanson's formula per quadrature point, and the frozen one-normal-per-facet orientation the
     assembler carries has no per-point analogue yet.
     """
-    if cell_type in ("hexahedron", "hex"):
-        return _refuse_tensor_product(
-            cell_type,
-            "a boundary/surface term",
-            "a hexahedron's facet is a bilinear surface, so its normal and area element vary across "
-            "the facet and need Nanson's formula per quadrature point, where the assembler still "
-            "carries one frozen normal per facet. (Quadrilaterals ARE supported: a quad's facet is a "
-            "straight edge.)",
-        )
     return False
 
 
@@ -412,7 +410,27 @@ def _build_face_tables(elem_degree: int, quad_degree: int, dim: int = 2, cell_ty
 
     from .fem_facets import local_faces_in_basix_order
 
-    if cell_type in ("quad", "quadrilateral"):
+    if cell_type in ("hexahedron", "hex"):
+        # A hexahedron's facet is a QUADRILATERAL, so the facet rule is a quad rule and the facet is
+        # parameterised bilinearly. On the REFERENCE hex every face is a unit square (verified for
+        # all six), so its two tangents are constant -- all the variation that makes a hex face a
+        # curved surface enters later, through the per-quadrature-point cell Jacobian.
+        #
+        # `local_faces_in_basix_order` lists a face's nodes in PERIMETER-CYCLIC order, while a basix
+        # quadrilateral numbers its vertices lexicographically. `_CYCLIC_TO_BASIX_QUAD` reconciles
+        # the two; pairing them without it makes the face a bow-tie whose normal flips inside it.
+        cell = CellType.hexahedron
+        ref_verts = np.asarray(basix.geometry(cell))
+        local_faces, _nfn = local_faces_in_basix_order(cell_type)
+        qp_quad, face_w = (np.asarray(x) for x in basix.make_quadrature(CellType.quadrilateral, quad_degree))
+        _fq = _lagrange_basix(CellType.quadrilateral, 1)
+        _tabq = np.asarray(_fq.tabulate(1, qp_quad))  # (1+2, n_q, 4, 1)
+
+        def _facet_qp_tangs(nodes):
+            V = ref_verts[list(np.asarray(nodes)[_CYCLIC_TO_BASIX_QUAD])]  # (4, 3) basix quad order
+            ref_qp = _tabq[0, :, :, 0] @ V  # (n_q, 3): x(s,t) = sum_a N_a(s,t) v_a
+            return ref_qp, np.stack([V[1] - V[0], V[2] - V[0]])  # constant on a reference face
+    elif cell_type in ("quad", "quadrilateral"):
         # A quadrilateral's facet is a straight 2-node edge, exactly as a triangle's is: restricted
         # to one edge the bilinear map is LINEAR in the edge parameter, so the edge stays straight
         # and its tangent is constant. Only the reference cell, its vertices and the basis change.
@@ -445,8 +463,11 @@ def _build_face_tables(elem_degree: int, quad_degree: int, dim: int = 2, cell_ty
 
     elem = _lagrange_basix(cell, elem_degree)
     phi_list, dphi_list, qp_list, tang_list = [], [], [], []
+    # A facet's vertex count is a property of the CELL, not the dimension: `dim` is right for a
+    # simplex facet and for a quad edge, and takes three of a hexahedron's four face nodes.
+    _n_fv = _face_table(cell_type)[1] if cell_type else dim
     for entry in local_faces:
-        ref_qp, tangs = _facet_qp_tangs(entry[:dim])  # entry[:dim] = the facet's vertex local ids
+        ref_qp, tangs = _facet_qp_tangs(entry[:_n_fv])  # the facet's vertex local ids
         tab = elem.tabulate(1, ref_qp)  # (1 + dim, n_q, n_dof, 1)
         phi_list.append(tab[0, :, :, 0])  # (n_q, n_dof)
         dphi_list.append(np.stack([tab[1 + d, :, :, 0] for d in range(dim)], axis=-1))  # (n_q, n_dof, dim)
@@ -469,6 +490,26 @@ def _GSPEC(K):
     has one ``K`` for the whole cell, a tensor-product facet one per quadrature point.
     """
     return "qnd,qdD->qnD" if getattr(K, "ndim", 2) == 3 else "qnd,dD->qnD"
+
+
+def _facet_nanson_normal(J, tangs, sign):
+    """Unit outward normal at each facet quadrature point, by Nanson's formula.
+
+    The physical tangents ``T_i = J · t_i`` span the facet's tangent plane *at that point*, so their
+    cross product is the (unnormalised) normal there — which is exactly the quantity
+    :func:`_facet_area_element` already forms to take its magnitude. On a straight facet it is
+    constant and this reproduces the frozen per-facet normal; on a hexahedron's **bilinear** facet it
+    genuinely varies, which is the whole reason this exists.
+
+    ``sign`` is the frozen ±1 outward orientation of the facet. It stays a per-facet constant even
+    when the direction does not: the sign is a discrete choice tied to the facet's vertex ordering,
+    and a non-inverted facet's normal cannot swing into the opposite hemisphere within the facet.
+
+    Returns ``(n_q, dim)``. Nanson, *Messenger of Mathematics* 7 (1878) 182.
+    """
+    T = jnp.einsum("td,qDd->qtD", tangs, J) if J.ndim == 3 else (tangs @ J.T)[None, ...]
+    n = jnp.cross(T[:, 0], T[:, 1]) if T.shape[1] == 2 else jnp.stack([T[:, 0, 1], -T[:, 0, 0]], axis=-1)
+    return sign * n / (jnp.linalg.norm(n, axis=-1, keepdims=True) + 1e-300)
 
 
 def _facet_area_element(J, tangs):
@@ -782,6 +823,10 @@ def assemble_fem_native(
     # a box the map happens to be affine, but detecting that is an optimisation, not a correctness
     # condition, and it would have to hold for every cell in the mesh.)
     _tensor_product = _cell_type in TENSOR_PRODUCT_CELLS
+    # Whether a FACET of this cell is curved. A quadrilateral's edge is straight (a bilinear map
+    # restricted to an edge is linear), so only a hexahedron's bilinear face needs a normal that
+    # varies across it.
+    _curved_facet = _cell_type in ("hexahedron", "hex")
     _curved = {1: "line3", 2: "triangle6"}.get(dim, "tetra10") in domain.mesh.cells_dict
     _nonaffine = _curved or _tensor_product
     _geom_field = 0
@@ -1768,13 +1813,15 @@ def assemble_fem_native(
             # Explicit shape check: `jnp.einsum("d,qd->q", n, jump)` silently BROADCASTS a size-1
             # component axis, so a scalar field would contract to `sum(n) * jump` -- right only when the
             # normal happens to sum to 1, wrong on any tilted interface, and never an error.
-            if _jump.shape[1] != n_vec.shape[0]:
+            if _jump.shape[1] != n_vec.shape[-1]:
                 raise ValueError(
                     f"u.gap: the field has {_jump.shape[1]} component(s) but the interface normal has "
-                    f"{n_vec.shape[0]}. A normal gap needs a vector field with one component per "
+                    f"{n_vec.shape[-1]}. A normal gap needs a vector field with one component per "
                     "dimension -- use fem_symbols(value_shape=(dim,))."
                 )
-            loc["domain_context"][_k] = _g0_f - (_jump * n_vec[None, :]).sum(axis=1)
+            # `n_vec` is (dim,) on a straight facet and (n_q, dim) on a curved one; `atleast_2d`
+            # makes both broadcast against `_jump` (n_q, vec) without a shape branch.
+            loc["domain_context"][_k] = _g0_f - (_jump * jnp.atleast_2d(n_vec)).sum(axis=1)
 
     def _facet_geometry(c, k, pts_src):
         """``(J, K, xq)`` for facet ``k`` of cell ``c`` -- one per quadrature point when the cell's
@@ -1813,6 +1860,13 @@ def assemble_fem_native(
         _pts_src = pts_j if pts is None else pts
         verts = _pts_src[cells_j[c]]
         J, K, _xq_tp = _facet_geometry(c, k, _pts_src)
+        if _curved_facet:
+            # A hexahedron's facet is a bilinear SURFACE: its normal turns across the facet, so one
+            # frozen vector per facet is not enough. Nanson's formula gives it at each quadrature
+            # point from the same physical tangents the area element already forms. Straight facets
+            # (simplices, and a quad's edges) keep the per-facet vector -- it is exact there, and
+            # leaving its shape alone keeps every existing consumer untouched.
+            n_vec = _facet_nanson_normal(J, face_tables_per_field[btfi][3][k], _facet_sign_j[fi])
 
         # All-field surface data (needed for coupled Robin terms).
         per_f = []

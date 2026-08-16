@@ -179,18 +179,89 @@ def test_surface_terms_on_quads_integrate_the_right_measure(region, exact):
     np.testing.assert_allclose(float(np.abs(np.asarray(fem.b)).sum()), exact, rtol=1e-10)
 
 
-def test_a_surface_term_on_a_hex_mesh_still_refuses():
-    """A hexahedron's facet is a bilinear SURFACE, not a straight edge: its normal and area element
-    vary across the facet and need Nanson's formula per quadrature point, where the assembler still
-    carries one frozen normal per facet. That is the remaining half of the facet work."""
-    ctor = Geometries.equi_distant_box(nx=2, ny=2, nz=2, cell="hex")
+# ------------------------------------------------------------------ surface terms on hexahedra
+
+
+def _warped_hex_mesh(warp, n=3, seed=0):
+    """A structured hex mesh with every non-corner node displaced, so its faces are genuinely
+    non-planar. Returns ``(constructor, min_detJ)`` — the caller checks the mesh is not tangled."""
+    import basix
+    import meshio
+
+    from jno.utils.solver.fem_lagrange import vtk_to_basix_vertex_perm
+
+    m, _, ds = Geometries.equi_distant_box(nx=n, ny=n, nz=n, cell="hex")(None)
+    pts = np.asarray(m.points).copy()
+    if warp:
+        rng = np.random.default_rng(seed)
+        mv = ((pts > 1e-12) & (pts < 1 - 1e-12)).sum(axis=1) >= 1
+        pts[mv] += (warp / n) * rng.uniform(-1.0, 1.0, size=(int(mv.sum()), 3))
+    hx = basix.create_element(basix.ElementFamily.P, basix.CellType.hexahedron, 1)
+    qp, _ = basix.make_quadrature(basix.CellType.hexahedron, 6)
+    dN = np.stack([np.asarray(hx.tabulate(1, qp))[i][..., 0] for i in (1, 2, 3)], axis=-1)
+    cells = {c.type: np.asarray(c.data) for c in m.cells}["hexahedron"]
+    verts = pts[cells[:, vtk_to_basix_vertex_perm("hexahedron")]]
+    det = np.linalg.det(np.einsum("cad,qan->cqdn", verts, dN))
+    moved = meshio.Mesh(points=pts, cells=m.cells, cell_sets=m.cell_sets)
+    return (lambda geo: (moved, 3, ds)), float(det.min())
+
+
+@pytest.mark.parametrize("region,exact", [("right", 1.0), ("front", 1.0), ("boundary", 6.0)])
+def test_surface_terms_on_hexes_integrate_the_right_measure(region, exact):
+    """The area element, on its own. A unit boundary source's load vector sums to the region's AREA
+    (partition of unity) — no dependence on the normal's direction or on a sign convention."""
+    d = jno.domain(constructor=Geometries.equi_distant_box(nx=3, ny=3, nz=3, cell="hex"), compute_mesh_connectivity=False)
+    u, v = d.fem_symbols()
+    xi, yi, zi, _ = d.variable("interior", split=True)
+    c = d.variable(region, split=True)
+    ui, vi = u.bind(x=xi, y=yi, z=zi), v.bind(x=xi, y=yi, z=zi)
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y + ui.z * vi.z, 1.0 * v(c[0], c[1], c[2])])
+    np.testing.assert_allclose(float(np.abs(np.asarray(fem.b)).sum()), exact, rtol=1e-10)
+
+
+@pytest.mark.parametrize("warp", [0.0, 0.1, 0.2, 0.3])
+def test_divergence_theorem_on_warped_hexes(warp):
+    """THE test for the per-quadrature-point (Nanson) normal.
+
+    ``∮ x·n dS = 3·Vol`` is sensitive to the normal's direction AND its outward orientation at every
+    quadrature point — a sign flip on a single face breaks it. Both sides come from the assembler on
+    the same mesh, so the oracle and the quantity share one geometry: computing the volume any other
+    way (splitting each face into two triangles, say) describes a *different solid* once faces are
+    non-planar, and measured a 6 % gap that would swamp what is being tested.
+
+    A single frozen normal per facet cannot pass this on a warped mesh — that is exactly what the
+    refusal this replaces was protecting against.
+    """
+    ctor, min_det = _warped_hex_mesh(warp)
+    assert min_det > 0, "the test mesh is tangled; a tangled mesh has no well-defined volume"
     d = jno.domain(constructor=ctor, compute_mesh_connectivity=False)
     u, v = d.fem_symbols()
     xi, yi, zi, _ = d.variable("interior", split=True)
-    cr = d.variable("right", split=True)
     ui, vi = u.bind(x=xi, y=yi, z=zi), v.bind(x=xi, y=yi, z=zi)
-    with pytest.raises(NotImplementedError, match="Nanson"):
-        jno.fem([ui.x * vi.x + ui.y * vi.y + ui.z * vi.z, 1.0 * v(cr[0], cr[1], cr[2])]).solve()
+    lap = ui.x * vi.x + ui.y * vi.y + ui.z * vi.z
+    cb = d.variable("boundary", split=True)
+    nb = d.variable("boundary", normals=True, split=True)
+    vol = float(np.asarray(jno.fem([lap - 1.0 * vi], quad_degree=6).b).sum())
+    xn = cb[0] * nb[-3] + cb[1] * nb[-2] + cb[2] * nb[-1]
+    flux = float(np.asarray(jno.fem([lap, xn * v(cb[0], cb[1], cb[2])], quad_degree=6).b).sum())
+    np.testing.assert_allclose(abs(flux), 3.0 * vol, rtol=1e-10)
+
+
+def test_the_warped_hex_faces_are_really_non_planar():
+    """Guard on the test above: if the perturbation stopped producing non-planar faces, the
+    divergence-theorem test would pass with a single per-facet normal and prove nothing."""
+    from jno.domain.mesh_utils import MeshUtils
+
+    ctor, min_det = _warped_hex_mesh(0.3)
+    mesh, _, _ = ctor(None)
+    pts = np.asarray(mesh.points)
+    cells = {c.type: np.asarray(c.data) for c in mesh.cells}["hexahedron"]
+    fac, _ = MeshUtils._boundary_facets_unsorted(cells, "hexahedron")
+    V = pts[fac]
+    n = np.cross(V[:, 1] - V[:, 0], V[:, 2] - V[:, 0])
+    n /= np.linalg.norm(n, axis=1, keepdims=True)
+    warp = np.abs(np.einsum("ij,ij->i", V[:, 3] - V[:, 0], n))
+    assert min_det > 0 and warp.max() > 0.02, f"faces are nearly planar (max warp {warp.max():.3e})"
 
 
 def test_higher_order_on_a_quad_mesh_refuses_by_name():
