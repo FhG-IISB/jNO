@@ -54,7 +54,7 @@ from .fem_1d import (
     _region_node_ids,
     dirichlet_projection,
 )
-from .fem_facets import _LOCAL_FACES_TET, build_facet_connectivity, compute_face_normals
+from .fem_facets import _LOCAL_FACES_TET, _face_table, build_facet_connectivity, compute_face_normals
 from .fem_lagrange import (
     _lagrange_basix,
     identity_pushforward,
@@ -2458,7 +2458,13 @@ def assemble_fem_native(
         iface_keys = set().union(*(key(c) for c in clouds))
         node_keys = np.round(np.asarray(pts_all)[:, :dim] / max(tol, 1e-300)).astype(np.int64)
         on_iface = np.array([tuple(r) in iface_keys for r in node_keys], dtype=bool)
-        verts = np.asarray(bf)[:, :dim]
+        # How many leading columns are the facet's VERTICES depends on the cell, not the dimension:
+        # a simplex facet has `dim` of them, a quad edge 2 (= dim in 2-D, which is why this read
+        # correctly until now), and a hexahedron's facet FOUR against a dim of 3. Taking `[:, :dim]`
+        # there silently drops a corner, so a facet lying wholly on an interface could still test as
+        # partly outside it and stay pinned.
+        _n_fv = _face_table(cell_key)[1]
+        verts = np.asarray(bf)[:, :_n_fv]
         outer = np.asarray(bf)[~on_iface[verts].all(axis=1)]
         if outer.size == 0:  # every boundary facet is an interface -> nothing to pin; leave as-is
             return bnodes

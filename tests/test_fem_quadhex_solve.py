@@ -412,3 +412,35 @@ def test_adaptivity_refuses_on_quads_by_name():
     fem = jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0])
     with pytest.raises(NotImplementedError, match="simplicial mesh"):
         fem.solve(adapt=jno.solve.remesh(max_iters=1))
+
+
+# ------------------------------------------------------------------- facet tables by cell, not dim
+
+
+def test_boundary_facets_of_a_quad_mesh_use_the_quad_table():
+    """`_boundary_facets` picks its local-facet table from the CELL. Called without one, a quad mesh
+    took the triangle branch: on this 4x4 grid, whose true boundary is 16 edges over 16 nodes, that
+    returned 48 facets over 24 nodes — a quarter of them interior.
+
+    The periodic reduction was calling it that way. It went unnoticed because a structured
+    conforming mesh matches its periodic nodes by coordinate and never consults this table, so the
+    path was unexercised rather than proven harmless. This test consults it directly.
+    """
+    from jno._fem import _boundary_facets
+    from jno.utils.solver.fem_lagrange import vtk_to_basix_vertex_perm
+    from jno.utils.solver.fem_native import mesh_cell_type
+
+    d = jno.domain(constructor=Geometries.equi_distant_rect(nx=4, ny=4, cell="quad"), compute_mesh_connectivity=False)
+    pts = np.asarray(d.mesh.points)[:, :2]
+    cells = np.asarray(d.mesh.cells_dict["quad"])[:, vtk_to_basix_vertex_perm("quad")]
+    assert mesh_cell_type(d, 2) == "quad"
+
+    bf = _boundary_facets(pts, cells, 2, 1, "quad")
+    nodes = np.unique(bf)
+    on_boundary = ((np.abs(pts) < 1e-12) | (np.abs(pts - 1.0) < 1e-12)).any(axis=1)
+    assert len(bf) == 16 and len(nodes) == 16
+    assert on_boundary[nodes].all(), "an interior node was reported as a boundary facet node"
+
+    # and the simplex branch really is wrong here — the guard is load-bearing, not decorative
+    wrong = _boundary_facets(pts, cells, 2, 1)
+    assert not on_boundary[np.unique(wrong)].all()

@@ -2824,7 +2824,18 @@ def _build_periodic_reduction(domain: Any, ties: List[Any], points: Any, cells: 
                     "face it touches (an axis-aligned predicate like `lambda x, y: x < tol` includes corners)."
                 )
     dim = int(getattr(domain, "dimension", points.shape[1]) or points.shape[1])
-    bfacets = _boundary_facets(points, cells, dim, ele_order) if cells is not None else None
+    # The facet table depends on the CELL, not the dimension. Without this the quad/hex branch of
+    # `_boundary_facets` is never taken and a quadrilateral mesh is read with the triangle table:
+    # measured on a 4x4 quad grid whose true boundary is 16 edges over 16 nodes, that returned 48
+    # facets over 24 nodes, a quarter of which are interior. It went unnoticed because a structured
+    # conforming mesh matches its periodic nodes by COORDINATE and never consults this table.
+    try:
+        from .utils.solver.fem_native import mesh_cell_type
+
+        _ct = mesh_cell_type(domain, dim)
+    except Exception:  # noqa: BLE001 - a domain with no volume block (1-D flat-chain route)
+        _ct = None
+    bfacets = _boundary_facets(points, cells, dim, ele_order, _ct) if cells is not None else None
     bnodes = np.unique(bfacets) if bfacets is not None and bfacets.size else None
 
     pairs = [(main, secondary) for (main, secondary, *_ignore) in ties]
