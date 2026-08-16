@@ -703,7 +703,8 @@ onto one DOF, so the periodicity holds exactly rather than to a tolerance.
 | not supported on quad/hex | why |
 |---|---|
 | **non-matching** mortar ties across a hexahedral facet | interpolating *across* a quad facet needs shape functions the barycentric weights do not have. Matching (conforming) periodic ties on hexes DO work — see below |
-| **h-adaptive remeshing** (`adapt=`) | the *estimator* works on both cells (below); the **mesher** does not — mmg adapts simplices by edge split/collapse/swap, and there is no mmg for quads or hexes. `remesh(max_iters=1)` on a quad mesh therefore solves and estimates; a second round refuses at the remesh, by name |
+| **h-adaptive remeshing on HEXES** (`adapt=`) | not for want of plumbing: no general all-hex mesher exists (gmsh's `Recombine3DAll` on a plain box returns tetrahedra and no hexahedra), so there is nothing to remesh *to*. 3-D tensor-product adaptivity needs octree refinement with hanging-node constraints. **2-D quads DO adapt** — see below |
+| **r-adaptivity** (`relocate=`) on quad/hex | the monitor, the cell measures and the validity check are all barycentric; a bilinear cell's validity is the sign of the sampled `det J`, not one determinant |
 | 4th-order forms (plates, phase-field) | the physical-Hessian push-forward assumes an affine cell — the same refusal curved simplices already carry |
 | non-nodal families (N1E, RT, Argyris, Morley) | Argyris and Morley are *defined* on triangles; the quad analogues (RTCF/NCE, Bogner–Fox–Schmit) are different elements |
 | `Shape.quad().curved()` | a curved quadrilateral is a 9-node block the emitter does not produce |
@@ -727,6 +728,27 @@ error, and its effectivity **decayed** (0.81 → 0.53 → 0.35 over the same mes
 healthy. That fix improved the simplex path too, from ~0.77 to ~1.006.
 
 Reference: Zienkiewicz & Zhu, IJNME **33** (1992) 1331–1364; Barlow, IJNME **10** (1976) 243–251.
+
+**h-adaptivity on quadrilaterals** works, by a different mechanism than on simplices. mmg adapts
+triangles and tets by local edge split/collapse/swap and has no quad analogue — but a quad mesh in
+jNO *is* a triangulation gmsh recombined, and the size field driving it is already part of the
+`Shape` plan. So the remesh stage **rebuilds the plan** at the marked size field:
+
+```python
+d = jno.Shape.polygon(L_SHAPE, size=0.12).quad().domain()
+u = fem.solve(adapt=jno.solve.remesh(theta=0.6, max_iters=4))     # refines at the corner, stays all-quad
+```
+
+Measured on the L-shape's re-entrant corner, against uniform refinement at matched DOFs: adapting is
+**1.23×** more accurate on quads and **1.31×** on triangles (Ritz energy against a fine reference).
+The refined cells go where they should — mean cell size near the corner is 1.5× smaller than far
+from it, against 1.19× for the triangle control.
+
+Three things it is not. It is a **global** remesh, so the mesh does not nest and each round costs a
+full gmsh rebuild. It needs a **geometry to rebuild from**, so a quad mesh loaded from a `.msh` file
+refuses by name. And it cannot refine a **`.structured()`** plan, whose resolution is its cell counts
+rather than a size field — that would silently return the same mesh, so it refuses too. Recombination
+purity is checked on every round rather than assumed.
 
 Volume terms, Dirichlet conditions and **surface terms all work on both cells** — Neumann, Robin
 and flux integrals included.

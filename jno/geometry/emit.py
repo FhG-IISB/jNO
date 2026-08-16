@@ -235,7 +235,13 @@ def _apply_size_fields(dim: int, leaves, labels: Dict[int, Tuple[int, str]], sha
         fns = tuple(callables)
 
         def _size_cb(cdim, ctag, x, y, z, lc, _fns=fns):
-            return float(min([lc] + [float(f(x, y, z)) for f in _fns]))
+            # `np.asarray(...).reshape(-1)[0]` rather than `float(...)`: a size function that returns a
+            # 1-element ARRAY -- which any numpy-vectorised one does -- makes bare `float()` raise, and
+            # an exception inside gmsh's C callback surfaces as `lc = 0` ("Wrong mesh element size
+            # lc = 0"), naming neither the callback nor the shape it came from.
+            import numpy as _np
+
+            return float(min([lc] + [float(_np.asarray(f(x, y, z)).reshape(-1)[0]) for f in _fns]))
 
         gmsh.model.mesh.setSizeCallback(_size_cb)
 

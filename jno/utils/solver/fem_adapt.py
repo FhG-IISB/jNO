@@ -361,6 +361,120 @@ def _domain_from_arrays(template: Any, points: np.ndarray, elems: np.ndarray, bf
     return target
 
 
+def _apply_new_mesh(template: Any, new_mesh: Any, *, copy: bool):
+    """Put ``new_mesh`` on ``template`` (or a shallow copy), resetting everything keyed to the old one.
+
+    Factored out of :func:`_domain_from_arrays` so the mmg path and the rebuild path below cannot
+    drift apart in what they invalidate — a stale native-FEM cache or a surviving boundary region is
+    exactly the kind of thing that re-appears as a silently homogeneous problem after a remesh.
+    """
+    target = _shallow_copy(template) if copy else template
+    for attr in list(vars(target)):
+        if attr.startswith("_fem_native") or attr in ("_fem_assembly_cache", "_integral_weight_cache"):
+            delattr(target, attr)
+    _capture_geometric_boundary_tags(target)
+    if hasattr(target, "_reset_custom_tag_state"):
+        target._reset_custom_tag_state()
+    target._apply_mesh(new_mesh)
+    if getattr(target, "_is_time_dependent", False) and getattr(target, "time", None) is not None:
+        target._add_time_dimension(*target.time)
+    return target
+
+
+def _rebuild_to_size(domain: Any, vertex_size: np.ndarray, *, copy: bool = False):
+    """Remesh a **quadrilateral** domain by rebuilding its ``Shape`` plan at a new size field.
+
+    There is no mmg for quads: mmg adapts by edge split/collapse/swap, operations defined on
+    simplices. But a quadrilateral mesh in jNO is a triangle mesh that gmsh has recombined, and the
+    size field that drives the triangulation is already a first-class part of the plan — so the
+    adaptive step is "rebuild the same geometry at a finer size where it is marked", which needs no
+    new mesher. The plan is kept on ``domain._constructor_source``.
+
+    Measured: recombination survives exactly the grading this produces — 0 leftover triangles on a
+    uniform mesh, at 8x and 20x grading, on an L-shape graded into its re-entrant corner, and around a
+    locally refined hole. It is still checked on every rebuild rather than trusted, because a mixed
+    mesh would otherwise reach the assembler as a less clear refusal.
+
+    Unlike mmg this is a **global** remesh: the new mesh does not nest inside the old one and the
+    vertex count is not incremental. The solution transfer already handles unrelated meshes, so that
+    costs time, not correctness.
+    """
+    plan = getattr(domain, "_constructor_source", None)
+    if plan is None or not hasattr(plan, "sized"):
+        raise NotImplementedError(
+            "h-adaptive remeshing of a quadrilateral mesh rebuilds the geometry at a finer size field, "
+            "and this domain has no geometry to rebuild from (it was loaded from a mesh file, not "
+            "built from a jno.Shape). Adapt a Shape-built domain, or refine the file's mesh outside jNO."
+        )
+    if getattr(plan, "_structured", None) is not None:
+        raise NotImplementedError(
+            "h-adaptive remeshing cannot refine a Shape.structured() plan: a lattice's resolution is its "
+            "cell COUNTS, so rebuilding it against a marked size field returns the same mesh -- a silent "
+            "no-op. Drop .structured() to let gmsh mesh (and recombine) the geometry at a graded size, "
+            "or rebuild the lattice yourself at a larger n."
+        )
+    dim = int(domain.dimension)
+    pts = np.asarray(domain.mesh.points)[:, :dim]
+    size = np.asarray(vertex_size, dtype=float).reshape(-1)
+    if size.ndim != 1 or size.shape[0] != pts.shape[0]:
+        raise NotImplementedError(
+            "anisotropic (Hessian-metric) adaptation is not supported on a quadrilateral mesh: the "
+            "metric drives mmg's directional refinement, and the rebuild path can only ask gmsh for a "
+            "scalar target size. Use isotropic ZZ marking (AdaptSpec(anisotropic=False))."
+        )
+
+    from scipy.spatial import cKDTree
+
+    # The size field lives on the OLD mesh's vertices; gmsh asks for a size at arbitrary points, so
+    # carry it over by nearest-vertex lookup. Nearest rather than interpolated on purpose: the field
+    # is piecewise-constant-by-marking already, and interpolating would smear the refined region's
+    # edge outward by half an element.
+    tree = cKDTree(pts)
+
+    def _size_at(*coords):
+        q = np.stack([np.asarray(c, dtype=float).reshape(-1) for c in coords[:dim]], axis=1)
+        out = size[tree.query(q)[1]]
+        # gmsh's size callback hands over SCALARS and calls `float()` on the result, so return one --
+        # a 1-element array raises inside the C callback, where the exception becomes `lc = 0` and
+        # gmsh reports "Wrong mesh element size lc = 0" with nothing pointing back here.
+        return out if np.ndim(coords[0]) else float(out[0])
+
+    rebuilt = plan.sized(_size_at).domain(compute_mesh_connectivity=False)
+    blocks = {c.type: len(c.data) for c in rebuilt.mesh.cells}
+    if blocks.get("triangle"):
+        raise NotImplementedError(
+            f"the rebuilt mesh is mixed: gmsh recombination left {blocks['triangle']} triangles among "
+            f"{blocks.get('quad', 0)} quadrilaterals, and jNO assembles on one cell type. Coarsen the "
+            "refinement (a larger refine_factor) or adapt on a triangular mesh."
+        )
+    return _apply_new_mesh(domain, rebuilt.mesh, copy=copy)
+
+
+def _remesh_to_size(domain: Any, vertex_size, *, copy: bool = False, **mmg_kw):
+    """Remesh to a per-vertex target size, by whichever mechanism the mesh's cell supports.
+
+    Simplices go to mmg, which adapts them locally; quadrilaterals rebuild from the ``Shape`` plan
+    (:func:`_rebuild_to_size`). Everything else — a hexahedral mesh above all — refuses by name:
+    there is no general all-hex mesher, so metric-driven hex remeshing is not a thing to implement.
+    3-D tensor-product adaptivity needs octree refinement with hanging-node constraints instead.
+    """
+    from .fem_native import mesh_cell_type
+
+    dim = int(domain.dimension)
+    cell_type = mesh_cell_type(domain, dim)
+    if cell_type == "quad":
+        return _rebuild_to_size(domain, vertex_size, copy=copy)
+    if cell_type == "hexahedron":
+        raise NotImplementedError(
+            "h-adaptive remeshing is not supported on a hexahedral mesh, and not for want of plumbing: "
+            "no general all-hex mesher exists (gmsh's Recombine3DAll on a plain box returns tetrahedra "
+            "and no hexahedra), so there is nothing to remesh TO. 3-D tensor-product adaptivity needs "
+            "octree refinement with hanging-node constraints, which jNO does not have yet. Use a "
+            "tetrahedral mesh, or rebuild a structured grid at a finer n."
+        )
+    return remesh_with_mmg(domain, vertex_size, copy=copy, **mmg_kw)
+
+
 def _capture_geometric_boundary_tags(domain: Any) -> None:
     """Give every named boundary region a **mesh-independent predicate**, so it survives a remesh.
 
@@ -426,23 +540,162 @@ def _shallow_copy(domain: Any):
 # ---------------------------------------------------------------------------
 # Solution transfer -- piecewise-linear (barycentric) mesh-to-mesh interpolation
 # ---------------------------------------------------------------------------
+def _cells_in_basis_order(src_pts: np.ndarray, src_cells: np.ndarray, cell_idx: np.ndarray) -> np.ndarray:
+    """The chosen cells' vertex ids, ordered to match the weights :func:`_locate_in_cells` returns.
+
+    A stencil is a pair (ids, weights) and the two must be in the same order. Simplices are already
+    in it — meshio and basix agree there — but a quadrilateral's weights come from a basix-tabulated
+    basis while its connectivity is stored in VTK order, and the two disagree on vertices 2 and 3.
+    Pairing them unpermuted interpolates from the right cell with two of its corners swapped: wrong by
+    O(1), and it looks like a plausible field.
+
+    The vertex count alone does not identify the cell — 4 vertices is a quadrilateral in 2-D and a
+    tetrahedron in 3-D, and those need *different* permutations (one swaps, one is the identity) — so
+    the dimension is taken from ``src_pts``.
+    """
+    from .fem_native import _basix_ordered
+
+    family = _cell_family(src_pts.shape[1], np.asarray(src_cells).shape[1])
+    return _basix_ordered(np.asarray(src_cells), family)[cell_idx].astype(np.int64)
+
+
+def _cell_family(dim: int, n_local: int) -> str:
+    """The cell a ``(n_local,)`` connectivity row describes in ``dim`` dimensions.
+
+    Unambiguous, so point location can dispatch on the arrays alone without being handed a domain:
+    a 2-D cell has 3 vertices (triangle) or 4 (quadrilateral), a 3-D one 4 (tetrahedron) or 8
+    (hexahedron).
+    """
+    fam = {(1, 2): "interval", (2, 3): "triangle", (2, 4): "quadrilateral", (3, 4): "tetrahedron", (3, 8): "hexahedron"}
+    try:
+        return fam[(int(dim), int(n_local))]
+    except KeyError:
+        raise NotImplementedError(
+            f"point location: no cell with {n_local} vertices in {dim}-D. Expected "
+            f"{sorted(n for d, n in fam if d == int(dim))}."
+        ) from None
+
+
+def _invert_tensor_map(V: np.ndarray, x: np.ndarray, cell: str, *, iters: int = 12):
+    """Reference coordinates of ``x`` inside trilinear cells ``V``, by Newton on the isoparametric map.
+
+    A simplex map is affine, so its inverse is one linear solve — which is why the branch opposite is
+    exact and non-iterative. A quadrilateral or hexahedron maps ``x(xi) = sum_a N_a(xi) x_a`` with
+    ``N`` bi/trilinear, so the inverse has no closed form and is found by Newton from the cell centre:
+    ``xi <- xi - J^-1 (x(xi) - x)`` with ``J = sum_a x_a (dN_a/dxi)``.
+
+    ``V`` is ``(..., n_local, dim)`` in **basix** vertex order and ``x`` is ``(..., dim)``. Returns
+    ``(xi, N)`` — the reference coordinates ``(..., tdim)`` and the shape-function values there
+    ``(..., n_local)``, so a caller gets both the coordinates it needs for a higher-order tabulation
+    and the weights it needs for a Q1 stencil.
+
+    Newton converges quadratically on a convex cell and is started at the centre, so 12 iterations is
+    far more than needed for a mesh whose cells are not degenerate; it is a fixed count rather than a
+    tolerance loop so the whole batch stays vectorised.
+    """
+    from .fem_lagrange import _lagrange_basix, basix_cell
+
+    bcell, tdim = basix_cell(cell)
+    elem = _lagrange_basix(bcell, 1)
+
+    def tab(xi_flat):
+        t = np.asarray(elem.tabulate(1, xi_flat))  # (1 + tdim, Q, n_local, 1)
+        return t[0, :, :, 0], np.moveaxis(t[1 : tdim + 1, :, :, 0], 0, -1)  # N (Q,A), dN (Q,A,T)
+
+    shp = x.shape[:-1]
+    Vf = V.reshape(-1, V.shape[-2], V.shape[-1])
+    xf = x.reshape(-1, x.shape[-1])
+    xi = np.full((Vf.shape[0], tdim), 0.5)
+    for _ in range(iters):
+        N, dN = tab(xi)
+        J = np.einsum("cai,cak->cik", Vf, dN)  # (C, dim, tdim)
+        r = np.einsum("ca,cai->ci", N, Vf) - xf  # residual x(xi) - x
+        det = np.linalg.det(J)
+        Jsafe = np.where((np.abs(det) > 1e-300)[:, None, None], J, np.eye(tdim))
+        xi = xi - np.linalg.solve(Jsafe, r[..., None])[..., 0]
+        xi = np.clip(xi, -1.0, 2.0)  # keep a bad start from diverging out of the basis' useful range
+    N, _ = tab(xi)
+    return xi.reshape(*shp, tdim), N.reshape(*shp, Vf.shape[1])
+
+
+def _locate_in_tensor_cells(src_pts, src_cells, qpts, *, tol, k, cell):
+    """:func:`_locate_in_cells` for quadrilateral / hexahedral meshes — same returns, Newton inverse.
+
+    Cells are permuted into **basix** vertex order before the map is inverted, because the tabulated
+    basis is written in that order; feeding VTK order evaluates a bow-tie whose Jacobian changes sign
+    inside the cell, so the inverse would converge to a point in the wrong place rather than fail.
+    The returned ``cell_idx`` indexes the ORIGINAL ``src_cells``, and ``weights`` are the Q1 shape
+    values in basix order, matching ``ref``.
+    """
+    from scipy.spatial import cKDTree
+
+    from .fem_native import _basix_ordered
+
+    dim = src_pts.shape[1]
+    cells_b = _basix_ordered(np.asarray(src_cells), cell)
+    cell_verts = src_pts[cells_b]  # (C, A, dim)
+    kk = int(min(max(k, 1), len(src_cells)))
+    _, cand = cKDTree(cell_verts.mean(axis=1)).query(qpts, k=kk)
+    cand = np.asarray(cand).reshape(len(qpts), kk)
+
+    V = cell_verts[cand]  # (Q, kk, A, dim)
+    xi, N = _invert_tensor_map(V, np.broadcast_to(qpts[:, None, :], (len(qpts), kk, dim)), cell)
+
+    # inside the reference hypercube [0, 1]^tdim, which is basix's quad/hex
+    slack = np.minimum(np.stack([xi, 1.0 - xi], axis=0).min(axis=0), 0.0).sum(axis=-1)  # <= 0, 0 = inside
+    inside_cand = slack >= -tol
+    any_inside = inside_cand.any(axis=1)
+    choice = np.where(any_inside, np.argmax(inside_cand, axis=1), np.argmax(slack, axis=1))
+    q = np.arange(len(qpts))
+    chosen, inside = cand[q, choice], inside_cand[q, choice]
+
+    # Outside points are projected onto the nearest cell by clamping the reference coordinate, the
+    # tensor-product twin of clamping + renormalising barycentric weights on a simplex.
+    xi_c = np.clip(xi[q, choice], 0.0, 1.0)
+    weights = np.where(inside[:, None], N[q, choice], _tensor_shape_values(xi_c, cell))
+    ref = np.where(inside[:, None], xi[q, choice], xi_c)
+    return chosen.astype(np.int64), weights, ref, inside
+
+
+def _tensor_shape_values(xi: np.ndarray, cell: str) -> np.ndarray:
+    """Q1 shape-function values at reference coordinates ``xi`` ``(Q, tdim)`` -> ``(Q, n_local)``."""
+    from .fem_lagrange import _lagrange_basix, basix_cell
+
+    bcell, _ = basix_cell(cell)
+    return np.asarray(_lagrange_basix(bcell, 1).tabulate(0, np.asarray(xi, dtype=np.float64)))[0, :, :, 0]
+
+
 def _locate_in_cells(src_pts: np.ndarray, src_cells: np.ndarray, qpts: np.ndarray, *, tol: float, k: int):
-    """Locate each query point in a simplicial mesh; return the containing **cell index** and its
-    barycentric weights.
+    """Locate each query point in a mesh; return its containing **cell index**, stencil weights and
+    reference coordinates.
 
     Point location is a KD-tree candidate search over cell centroids (the containing cell is almost
     always among the nearest centroids; raise ``k`` for strongly anisotropic meshes) followed by an
-    exact barycentric inside-test. Returns ``(cell_idx, weights, inside)``: ``cell_idx`` ``(Q,)`` the
-    chosen simplex's index into ``src_cells``; ``weights`` ``(Q, D+1)`` its barycentric coordinates
-    ``[λ0, λ1, …]`` (``weights[:, 1:]`` are the point's **basix reference coordinates** in that cell,
-    since the reference simplex is ``v0=0, v_i=e_i``); ``inside`` ``(Q,)`` bool (``True`` = strictly
-    contained; ``False`` = fell outside every candidate and was projected onto the nearest simplex by
-    clamping + renormalising the weights, a bounded convex combination of that cell's vertices). Pure
-    host/NumPy — this is the shared point-location core behind :func:`_locate_barycentric` (P1
+    inside-test in the candidate's reference cell. Returns ``(cell_idx, weights, ref, inside)``:
+
+    - ``cell_idx`` ``(Q,)`` — the chosen cell's index into ``src_cells``;
+    - ``weights`` ``(Q, n_local)`` — the **P1/Q1 shape-function values** there, i.e. the linear
+      interpolation stencil over that cell's vertices;
+    - ``ref`` ``(Q, tdim)`` — the point's **basix reference coordinates** in that cell, for tabulating
+      a higher-order basis;
+    - ``inside`` ``(Q,)`` bool — ``True`` = strictly contained; ``False`` = fell outside every
+      candidate and was projected onto the nearest cell.
+
+    On a **simplex** the two coincide (``weights == [1 - sum(ref), ref]``), because the reference
+    simplex is ``v0 = 0, v_i = e_i`` and the map is affine, so its inverse is one linear solve. On a
+    **quadrilateral or hexahedron** the map is bi/trilinear and has no closed-form inverse, so they
+    are genuinely different objects and ``ref`` is found by Newton (:func:`_invert_tensor_map`) —
+    which is why this returns both rather than making the caller slice ``weights[:, 1:]``, a
+    coincidence of the simplex case that silently does not hold otherwise.
+
+    Pure host/NumPy — the shared point-location core behind :func:`_locate_barycentric` (P1
     interpolation) and :func:`_eval_fe_fields_at_points` (general P{k}/vector transfer)."""
     from scipy.spatial import cKDTree
 
     dim = src_pts.shape[1]
+    family = _cell_family(dim, np.asarray(src_cells).shape[1])
+    if family in ("quadrilateral", "hexahedron"):
+        return _locate_in_tensor_cells(src_pts, src_cells, qpts, tol=tol, k=k, cell=family)
     cell_verts = src_pts[src_cells]  # (C, D+1, D)
     kk = int(min(max(k, 1), len(src_cells)))
     _, cand = cKDTree(cell_verts.mean(axis=1)).query(qpts, k=kk)
@@ -468,15 +721,15 @@ def _locate_in_cells(src_pts: np.ndarray, src_cells: np.ndarray, qpts: np.ndarra
     proj = np.clip(chosen_lam, 0.0, None)  # nearest-simplex projection for the outside points
     proj = proj / np.clip(proj.sum(axis=1, keepdims=True), 1e-300, None)
     weights = np.where(inside[:, None], chosen_lam, proj)
-    return chosen.astype(np.int64), weights, inside
+    return chosen.astype(np.int64), weights, weights[:, 1:], inside
 
 
 def _locate_barycentric(src_pts: np.ndarray, src_cells: np.ndarray, qpts: np.ndarray, *, tol: float, k: int):
     """P1 stencil form of :func:`_locate_in_cells`: return ``(idx, weights, inside)`` where ``idx``
     ``(Q, D+1)`` are the chosen simplex's **source-vertex indices** (the P1 interpolation stencil).
     Unchanged public behaviour — the state-transfer / resample / moving-boundary callers use this."""
-    cell_idx, weights, inside = _locate_in_cells(src_pts, src_cells, qpts, tol=tol, k=k)
-    return src_cells[cell_idx].astype(np.int64), weights, inside
+    cell_idx, weights, _ref, inside = _locate_in_cells(src_pts, src_cells, qpts, tol=tol, k=k)
+    return _cells_in_basis_order(src_pts, src_cells, cell_idx), weights, inside
 
 
 def _one_ring_cells(cells: np.ndarray, n_vert: int) -> tuple[np.ndarray, np.ndarray]:
@@ -959,8 +1212,8 @@ def _eval_fe_fields_at_points(
     for i in range(len(off) - 1):
         vec_i = int(field_vecs[i])
         blk = state[off[i] : off[i + 1]].reshape(-1, vec_i)  # (n_nodes_i, vec_i)
-        cell_idx, weights, inside = _locate_in_cells(src_pts_p1, src_cells_p1, np.asarray(query_pts[i]), tol=tol, k=k)
-        phi = _tabulate_lagrange_at(dim, int(src_orders[i]), weights[:, 1:])  # (Q_i, n_dof_i) at ref coords
+        cell_idx, weights, ref, inside = _locate_in_cells(src_pts_p1, src_cells_p1, np.asarray(query_pts[i]), tol=tol, k=k)
+        phi = _tabulate_lagrange_at(dim, int(src_orders[i]), ref)  # (Q_i, n_dof_i) at ref coords
         cells_i = np.asarray(src_cells_f[i])[cell_idx]  # (Q_i, n_dof_i): the old DOF ids of the containing cell
         vals = jnp.einsum("qn,qnc->qc", jnp.asarray(phi, dtype=rdtype), blk[jnp.asarray(cells_i)])  # (Q_i, vec_i)
         if isinstance(fill, (int, float)) and bool((~inside).any()):
@@ -1891,10 +2144,10 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
             metric = hessian_metric(d, u, target_complexity=target, hmin=hmin, hmax=hmax)
             # a loose size gradation lets adjacent elements change size fast, which is what
             # permits the high aspect ratios that make anisotropic adaptation pay off
-            remesh_with_mmg(d, metric, copy=False, hmin=hmin, hmax=hmax, hgrad=3.0)
+            _remesh_to_size(d, metric, copy=False, hmin=hmin, hmax=hmax, hgrad=3.0)
         else:
             size = size_field_from_marks(d, marked, refine_factor=spec.refine_factor)
-            remesh_with_mmg(d, size, copy=False)  # mutate the domain in place
+            _remesh_to_size(d, size, copy=False)  # mutate the domain in place
         # Re-materialize custom coordinate-predicate tags on the refreshed mesh so that
         # surface-integral terms -- Neumann / Robin / absorbing boundary conditions -- re-derive on
         # the new boundary facets. (Dirichlet already re-resolves geometrically via its location

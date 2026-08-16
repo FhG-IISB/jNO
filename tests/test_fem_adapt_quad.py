@@ -199,17 +199,13 @@ def _quad_fem():
     return jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0])
 
 
-def test_h_adaptivity_refuses_at_the_MESHER_not_the_estimator():
-    """The estimator is no longer the blocker, so the refusal must come from the stage that really
-    cannot proceed — mmg, which adapts simplices by edge split/collapse/swap. Two rounds, because one
-    round never reaches a remesh. If this ever passes instead of raising, the loop is quietly turning
-    a quad mesh into a triangular one.
-
-    The two stages between them used to raise their own bare ``KeyError: 'triangle'`` first, so the
-    user was told nothing and told it by the wrong component.
-    """
-    with pytest.raises(NotImplementedError, match=r"h-adaptive remeshing \(mmg\)"):
-        _quad_fem().solve(adapt=jno.solve.remesh(max_iters=2))
+def test_a_structured_quad_plan_refuses_rather_than_silently_doing_nothing():
+    """A `.structured()` lattice's resolution is its cell COUNTS, not a size field — so rebuilding it
+    against a marked size field returns the very same mesh. That is a silent no-op: the loop runs,
+    reports rounds, and refines nothing. Refuse it and say which knob actually controls resolution."""
+    fem = _quad_fem()  # Shape.rect(...).structured(n=6).quad()
+    with pytest.raises(NotImplementedError, match="cell COUNTS"):
+        fem.solve(adapt=jno.solve.remesh(theta=0.6, max_iters=2))
 
 
 def test_a_single_round_estimates_a_quad_mesh_without_refusing():
@@ -221,3 +217,122 @@ def test_a_single_round_estimates_a_quad_mesh_without_refusing():
     assert len(fem.adapt_history) == 1
     assert fem.adapt_history[0]["estimate"] > 0.0
     assert {c.type for c in fem.domain.mesh.cells} == {"quad", "line"}  # untouched, as it must be
+
+
+# ------------------------------------------------------------------- the loop, on quadrilaterals
+
+L_SHAPE = [(0, 0), (1, 0), (1, 0.5), (0.5, 0.5), (0.5, 1), (0, 1)]
+
+
+def _l_shape(cell, size=0.12):
+    s = jno.Shape.polygon(L_SHAPE, size=size)
+    d = (s.quad() if cell == "tensor" else s).domain()
+    u, v = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    return d, jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0])
+
+
+def _ritz_energy(d, sol):
+    """``E = 1/2 int|grad u|^2 - int u`` by the element's OWN quadrature.
+
+    ``E_h`` decreases to ``E_exact`` from above and ``E_h - E_exact = 1/2 ||u - u_h||_E^2``, so it
+    ranks meshes without an exact solution. Not a centroid rule: the differences being ranked are
+    ~1e-5 against energies of ~1e-2, inside a midpoint rule's own error — measured, the coarse
+    version reversed this comparison and reported adaptivity as 0.70x WORSE than uniform.
+    """
+    spec = lagrange_on(mesh_cell_type(d, 2), 1, quad_degree=4)
+    cells = _basix_ordered(np.asarray(d.mesh.cells_dict[mesh_cell_type(d, 2)]), mesh_cell_type(d, 2))
+    X = np.asarray(d.mesh.points)[:, :2][cells]
+    N, dN = np.asarray(spec.ref_values)[:, :, 0], np.asarray(spec.ref_grads)[:, :, 0, :]
+    J = np.einsum("cai,qak->cqik", X, dN)
+    gh = np.einsum("qak,cqki,ca->cqi", dN, np.linalg.inv(J), sol[cells])
+    uh = np.einsum("qa,ca->cq", N, sol[cells])
+    return float(np.einsum("cq,cq,q->", 0.5 * np.sum(gh**2, axis=2) - uh, np.abs(np.linalg.det(J)), spec.quad_weights))
+
+
+@pytest.mark.slow
+def test_the_quad_loop_refines_and_stays_all_quad():
+    """The loop end to end. mmg cannot adapt a quad mesh, so the remesh stage rebuilds the `Shape`
+    plan at the marked size field — which means the result has to be checked for purity, not assumed:
+    a leftover triangle would be a mixed mesh the assembler refuses less clearly."""
+    d, fem = _l_shape("tensor")
+    n0 = len(d.mesh.points)
+    sol = np.asarray(fem.solve(adapt=jno.solve.remesh(theta=0.6, max_iters=3, refine_factor=1.6))).reshape(-1)
+    blocks = {c.type: len(c.data) for c in fem.domain.mesh.cells}
+    assert len(sol) > n0, "the loop did not add DOFs"
+    assert "triangle" not in blocks, f"the rebuilt mesh is mixed: {blocks}"
+    ests = [h["estimate"] for h in fem.adapt_history]
+    assert all(b < a for a, b in zip(ests, ests[1:])), f"the estimate did not fall monotonically: {ests}"
+
+
+@pytest.mark.slow
+def test_refinement_concentrates_at_the_re_entrant_corner():
+    """Where the DOFs go, not just how many. A globally-uniform 'refinement' would still pass the
+    test above."""
+    for cell in ("simplex", "tensor"):
+        pytest.importorskip("mmgpy") if cell == "simplex" else None
+        d, fem = _l_shape(cell)
+        fem.solve(adapt=jno.solve.remesh(theta=0.6, max_iters=3, refine_factor=1.6))
+        p = np.asarray(fem.domain.mesh.points)[:, :2]
+        _, meas, cells = _element_gradients(fem.domain)
+        h = np.sqrt(meas)
+        r = np.linalg.norm(p[cells].mean(axis=1) - [0.5, 0.5], axis=1)
+        assert h[r < 0.15].mean() < h[r > 0.4].mean(), f"{cell}: cells are not finer at the corner"
+
+
+@pytest.mark.slow
+def test_adaptivity_beats_uniform_refinement_at_matched_dofs():
+    """The measurement that decides whether any of this is worth running — and the one whose absence
+    let the r-adaptivity regression (#109) sit on main through three releases. Adapting must beat
+    simply making the mesh finer everywhere, at the same DOF count."""
+    dref, fref = _l_shape("tensor", size=0.022)
+    e_ref = _ritz_energy(dref, np.asarray(fref.solve()).reshape(-1))
+
+    d0, f0 = _l_shape("tensor")
+    sol = np.asarray(f0.solve(adapt=jno.solve.remesh(theta=0.6, max_iters=4, refine_factor=1.6))).reshape(-1)
+    err_adaptive = _ritz_energy(f0.domain, sol) - e_ref
+
+    best = None
+    for size in np.linspace(0.045, 0.10, 12):
+        du, fu = _l_shape("tensor", size=size)
+        n = len(du.mesh.points)
+        if best is None or abs(n - len(sol)) < abs(best[0] - len(sol)):
+            best = (n, _ritz_energy(du, np.asarray(fu.solve()).reshape(-1)) - e_ref)
+    n_uniform, err_uniform = best
+
+    assert abs(n_uniform - len(sol)) < 0.15 * len(sol), "the uniform comparison is not at matched DOFs"
+    assert err_adaptive > 0 and err_uniform > 0, "the Ritz energy must exceed the reference from above"
+    assert err_adaptive < err_uniform, (
+        f"adaptivity did not pay: {err_adaptive:.3e} at {len(sol)} dofs vs uniform {err_uniform:.3e} at {n_uniform}"
+    )
+
+
+def test_a_quad_mesh_with_no_geometry_refuses_by_name(tmp_path):
+    """The rebuild needs a plan to rebuild FROM. A mesh loaded from a file has none, and that is a
+    real case — it must refuse rather than fall through to the simplex path."""
+    meshio = pytest.importorskip("meshio")
+    d0 = _domain("tensor", 5)
+    path = str(tmp_path / "q.vtu")
+    meshio.write(path, meshio.Mesh(points=d0.mesh.points, cells=[("quad", d0.mesh.cells_dict["quad"])]))
+    d = jno.domain(path)
+    u, v = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0])
+    with pytest.raises(NotImplementedError, match="no geometry to rebuild from"):
+        fem.solve(adapt=jno.solve.remesh(theta=0.6, max_iters=2))
+
+
+def test_a_hex_mesh_refuses_with_the_real_reason():
+    """Not 'not implemented': no general all-hex mesher exists, so there is nothing to remesh TO."""
+    d = _domain("tensor", 3, dim=3)
+    u, v = d.fem_symbols()
+    ci = d.variable("interior", split=True)
+    cb = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=ci[0], y=ci[1], z=ci[2]), v.bind(x=ci[0], y=ci[1], z=ci[2])
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y + ui.z * vi.z - 1.0 * vi, u(*cb[:3]) - 0.0])
+    with pytest.raises(NotImplementedError, match="no general all-hex mesher exists"):
+        fem.solve(adapt=jno.solve.remesh(theta=0.6, max_iters=2))

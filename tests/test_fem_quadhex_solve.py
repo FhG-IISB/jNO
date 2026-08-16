@@ -573,15 +573,15 @@ def _quad_poisson():
     return d, jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0])
 
 
-def test_h_adaptivity_refuses_on_quads_at_the_mesher():
-    """mmg adapts simplices by edge split/collapse/swap, and there is no mmg for quads — so the
-    REMESH stage is the refusal, and it names itself.
+def test_h_adaptivity_on_a_quad_mesh_needs_a_geometry_to_rebuild_from():
+    """There is no mmg for quads, so the remesh stage rebuilds the `Shape` plan at the marked size
+    field instead — and this domain is built from a raw `Geometries` constructor, so it has no plan.
+    That is the honest refusal for it; a Shape-built quad mesh DOES adapt
+    (`tests/test_fem_adapt_quad.py`).
 
-    The estimator no longer refuses: it samples the Q1 gradient at the cell's Barlow point and works
-    on both cell families (`tests/test_fem_adapt_quad.py`). Two rounds, because a single round is
-    solve + estimate and never reaches a remesh."""
+    Two rounds, because a single round is solve + estimate and never reaches a remesh at all."""
     _, fem = _quad_poisson()
-    with pytest.raises(NotImplementedError, match=r"h-adaptive remeshing \(mmg\)"):
+    with pytest.raises(NotImplementedError, match="no geometry to rebuild from"):
         fem.solve(adapt=jno.solve.remesh(max_iters=2))
 
 
