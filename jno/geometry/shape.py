@@ -96,6 +96,10 @@ class Shape:
     # via gmsh recombination). Not part of equality for the same reason `_size` is not -- it
     # describes how to mesh the geometry, not what the geometry is.
     _cell: Optional[str] = field(default=None, compare=False)
+    # Regular-lattice request from :meth:`structured`. ``None`` means "mesh it with gmsh"; a tuple of
+    # per-axis CELL counts, or ``()`` for "derive them from ``size=``". Like ``_cell`` and ``_size``
+    # this describes how to mesh the geometry, not what the geometry is, so it is not part of equality.
+    _structured: Optional[tuple] = field(default=None, compare=False)
 
     # ----- primitive constructors ------------------------------------------------
     @classmethod
@@ -368,30 +372,26 @@ class Shape:
         return replace(self, _mesh_order=int(order))
 
     def quad(self) -> "Shape":
-        """Return a copy meshed with **quadrilaterals** instead of triangles (2-D only)::
+        """Return a copy meshed with **quadrilaterals** — or, on a structured 3-D plan, hexahedra::
 
-            d = jno.Shape.disk(0, 0, 1, size=0.1).quad().domain()
+            d = jno.Shape.disk(0, 0, 1, size=0.1).quad().domain()                  # quads
+            d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.1).structured().quad().domain()   # hexes
 
-        gmsh meshes triangles and then recombines them, which works on arbitrary 2-D geometry — a
+        In 2-D gmsh meshes triangles and then recombines them, which works on arbitrary geometry — a
         disk recombines to pure quads just as a rectangle does. Quadrilaterals cost fewer cells for
         the same nodes and are the element the topology-optimisation literature is written on; on
         bending-dominated elasticity they are markedly less stiff than linear triangles.
 
-        **3-D is deliberately absent.** gmsh cannot hex-mesh general geometry: measured here,
+        **In 3-D it needs** :meth:`structured`. gmsh cannot hex-mesh general geometry: measured here,
         ``Recombine3DAll`` on a plain box returns 944 tetrahedra and no hexahedra at all. Hexes come
-        only from sweeping or transfinite meshing, which needs a swept build plan rather than a flag
-        — until that exists, use :meth:`jno.domain.equi_distant_box(cell="hex")` for a structured
-        box, and expect a refusal here.
+        from a regular lattice (or, later, from sweeping/transfinite meshing on a swept build plan),
+        so an unstructured 3-D shape is refused and the message says to add ``.structured()``.
 
         Meshing is a property of the shape, which is why this lives beside :meth:`curved` and
         :meth:`sized` rather than on the solve.
         """
-        if int(self.dim) != 2:
-            raise NotImplementedError(
-                f"Shape.quad() is 2-D only; this shape is {self.dim}-D. gmsh cannot hexahedral-mesh "
-                "general 3-D geometry (recombination on a box returns tetrahedra), so a hex mesh has to "
-                "be swept or structured -- see jno.domain.equi_distant_box(cell='hex')."
-            )
+        # Checked at BUILD time, not here: `.structured()` and `.quad()` must compose in either order,
+        # and only the finished plan knows whether a 3-D quad request has a lattice under it.
         return replace(self, _cell="quad")
 
     def tri(self) -> "Shape":
@@ -411,6 +411,51 @@ class Shape:
         different cells is refused rather than silently meshed with one of them.
         """
         return replace(self, _cell="simplex")
+
+    def structured(self, n=None) -> "Shape":
+        """Return a copy meshed as a **regular lattice** instead of by gmsh::
+
+            jno.Shape.rect(0, 0, 1, 1, size=0.1).structured().domain()
+            jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.1).structured().quad().domain()   # hexes
+            jno.Shape.box(...).structured(n=(32, 16, 16)).domain()
+
+        Three things follow from a lattice that a gmsh mesh cannot give:
+
+        * **Hexahedra.** gmsh cannot hex-mesh general geometry, which is why :meth:`quad` refuses a
+          3-D shape — but a structured box is exactly the plan that *can* be hex-meshed, so
+          ``.structured().quad()`` is how a hex mesh is spelled.
+        * **A grid descriptor** on ``domain.grid``, which is what lets ``jno.fdm`` take its
+          assembly-free 5-/7-point stencils instead of the cotangent operator, and what a nodal field
+          reshapes against for operator-learning work.
+        * **Exactly matched opposite faces**, so whole-domain periodic ties collapse onto one DOF
+          rather than holding to a tolerance.
+
+        ``n`` counts **cells**, so a lattice has ``n + 1`` nodes per axis and ``domain.grid["shape"]``
+        is ``n + 1`` — consistent with the ``nx``/``ny``/``nz`` of every other grid in jNO. Pass a
+        scalar for every axis, a tuple per axis, or nothing at all to derive it from the shape's own
+        ``size=`` (``n = max(2, round(extent / h))``), which keeps one resolution concept.
+
+        Refuses by name -- a CSG plan, a non-rectangular primitive, a graded ``size=`` callable --
+        rather than falling back to gmsh: a caller who then reads ``domain.grid`` or expects hexes
+        would fail somewhere else instead, having silently solved on a different mesh.
+
+        Meshing is a property of the shape, which is why this lives beside :meth:`quad` and
+        :meth:`curved` rather than on the domain -- by the time a domain exists it holds a mesh and
+        everything derived from it, and a mesh loaded from a file has no geometry to rebuild from.
+        """
+        if n is None:
+            counts: tuple = ()
+        else:
+            axes = (n,) * int(self.dim) if isinstance(n, (int, np.integer)) else tuple(n)
+            if len(axes) != int(self.dim):
+                raise ValueError(
+                    f"Shape.structured(n={n!r}): expected {self.dim} cell counts for a {self.dim}-D "
+                    f"shape (or one scalar for all axes), got {len(axes)}."
+                )
+            counts = tuple(int(a) for a in axes)
+            if any(a < 1 for a in counts):
+                raise ValueError(f"Shape.structured(n={n!r}): every axis needs at least one cell.")
+        return replace(self, _structured=counts)
 
     def cell_choices(self) -> FrozenSet[str]:
         """Every explicit cell choice (:meth:`quad` / :meth:`tri`) anywhere in this build plan.

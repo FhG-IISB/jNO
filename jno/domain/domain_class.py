@@ -627,11 +627,22 @@ class domain(MeshIOMixin):
         # assembled operator). Off by default via keep_orphan_nodes=True. Applied in _apply_mesh.
         self._keep_orphan_nodes = keep_orphan_nodes
 
-        # Structured-grid request: replace the (Shape) constructor with a regular right-triangulation
-        # over the rectangle, and remember the grid descriptor to stamp on mesh_connectivity below.
+        # A `Shape.structured()` plan is meshed as a regular lattice instead of by gmsh: swap in the
+        # lattice constructor and remember the grid descriptor to stamp on mesh_connectivity below.
+        # `_plan` keeps the ORIGINAL shape, because the region-name/attachment collection further down
+        # reads it off the constructor -- and the swapped-in closure carries neither, so a
+        # `.name("steel").attach(k=2.0).structured()` plan used to lose its material without a word.
         self._structured_grid = None
+        _plan = constructor if hasattr(constructor, "_node") else None
         if structured:
-            constructor, self._structured_grid = self._structured_grid_setup(constructor)
+            if _plan is None:
+                raise ValueError(
+                    "jno.domain(..., structured=True) requires a jno.Shape geometry — got "
+                    f"{type(constructor).__name__}. Prefer the shape spelling: Shape.rect(...).structured()."
+                )
+            _plan = _plan if _plan._structured is not None else _plan.structured()
+        if _plan is not None and _plan._structured is not None:
+            constructor, self._structured_grid = self._structured_grid_setup(_plan)
 
         # Generate or load mesh / npz point cloud tags
         if isinstance(constructor, str):
@@ -654,18 +665,22 @@ class domain(MeshIOMixin):
             # ``rect.name("a").attach(k=2.0).domain().k`` reported "no attribute 'k'": the attachment
             # was collected from nowhere and dropped without a word. ``_region_items`` already returns
             # ``((name, shape),)`` for that case, so both spellings share one path.
-            _region_name = getattr(constructor, "_region_name", None)
-            if getattr(constructor, "_node", (None,))[0] == "regions" or _region_name is not None:
-                items = tuple(constructor._region_items())
+            #
+            # Read from `_plan` (the shape as written) rather than `constructor`, which a structured
+            # plan has already replaced with its lattice closure.
+            _shape = _plan if _plan is not None else constructor
+            _region_name = getattr(_shape, "_region_name", None)
+            if getattr(_shape, "_node", (None,))[0] == "regions" or _region_name is not None:
+                items = tuple(_shape._region_items())
                 self._shape_regions = {name: sub for name, sub in items}
                 self._collect_region_attachments(items)
-            elif getattr(constructor, "_attach", None):
+            elif getattr(_shape, "_attach", None):
                 # The other half of the same hole: properties attached to a shape that was never
                 # named have no region to belong to, and would be silently discarded here.
                 raise ValueError(
-                    f"Shape.attach({', '.join(sorted(map(str, constructor._attach)))}): this shape has no "
+                    f"Shape.attach({', '.join(sorted(map(str, _shape._attach)))}): this shape has no "
                     "region name, so the attached propert"
-                    f"{'ies have' if len(constructor._attach) > 1 else 'y has'} nothing to attach to. "
+                    f"{'ies have' if len(_shape._attach) > 1 else 'y has'} nothing to attach to. "
                     "Name the region first -- `shape.name('steel').attach(...)`."
                 )
         else:
@@ -1126,6 +1141,22 @@ class domain(MeshIOMixin):
         for sd in self._sub_domains:
             mcs.append(sd["mesh_connectivity"])
         return mcs
+
+    @property
+    def grid(self):
+        """The regular-lattice descriptor of a :meth:`jno.Shape.structured` domain, else ``None``.
+
+        ``{"shape": (Nx, Ny[, Nz]), "spacing": (hx, hy[, hz]), "origin": (x0, y0[, z0])}`` with
+        ``shape`` in **nodes** (one more per axis than the cell count passed to ``structured(n=...)``).
+        Nodes are stored in C order — ``idx = ((i·Ny + j)·Nz + k)`` — so a nodal field reshapes
+        straight to ``grid["shape"]``::
+
+            d = jno.Shape.rect(0, 0, 1, 1).structured(n=63).domain()
+            u.reshape(d.grid["shape"])          # (64, 64)
+
+        This is also the key ``jno.fdm`` reads to take its assembly-free stencil path.
+        """
+        return dict(self._structured_grid) if getattr(self, "_structured_grid", None) else None
 
     def _estimate_boundary_tol(self, pts: np.ndarray) -> float:
         pts = np.asarray(pts)
@@ -2194,67 +2225,115 @@ class domain(MeshIOMixin):
 
     # Generators
     def _structured_grid_setup(self, shape):
-        """Validate a ``structured=True`` request and prepare the regular-grid constructor.
+        """Resolve a :meth:`jno.Shape.structured` plan into a lattice constructor.
 
-        Returns ``(constructor, grid_meta)`` where ``constructor(geo) -> (meshio.Mesh, dim, ds)`` builds a
-        regular grid over the rectangle (2-D right-triangulation, :meth:`Geometries.equi_distant_rect`) or
-        box (3-D Kuhn tets, :meth:`Geometries.equi_distant_box`) — boundary tags come for free — and
-        ``grid_meta`` is the ``{"shape": (Nx, Ny[, Nz]), "spacing": (hx, hy[, hz]), "origin": (...)}``
-        descriptor stamped onto ``mesh_connectivity["grid"]``, the key ``jno.fdm``'s FD kernels read to
-        take the assembly-free 5-/7-point-stencil path (node order ``idx = ((i·Ny + j)·Nz + k)``). Fails
-        loud: v1 supports only a single axis-aligned ``jno.Shape.rect(...)`` / ``.box(...)`` with a uniform
-        (scalar) size."""
+        Returns ``(constructor, grid_meta)`` where ``constructor(geo) -> (meshio.Mesh, dim, ds)`` builds
+        the regular grid over the rectangle (:meth:`Geometries.equi_distant_rect`) or box
+        (:meth:`Geometries.equi_distant_box`) — the ``left/right/bottom/top[/front/back]`` +
+        ``boundary`` + ``interior`` cell sets come with it — and ``grid_meta`` is the
+        ``{"shape": (Nx, Ny[, Nz]), "spacing": (hx, hy[, hz]), "origin": (...)}`` descriptor stamped
+        onto ``mesh_connectivity["grid"]`` and exposed as :attr:`domain.grid`. That is the key
+        ``jno.fdm``'s kernels read to take the assembly-free 5-/7-point-stencil path (node order
+        ``idx = ((i·Ny + j)·Nz + k)``).
+
+        The cell comes from the plan's own :meth:`jno.Shape.quad` choice: a lattice is the one 3-D plan
+        that CAN be hex-meshed, so ``.structured().quad()`` is how a hexahedral mesh is spelled.
+
+        Refuses by name rather than falling back to gmsh — a caller who then reads ``domain.grid`` or
+        expects hexes would otherwise fail somewhere else, having silently solved on another mesh.
+        """
         from ..geometry.primitives import Box, Rect
-        from ..geometry.shape import Shape
 
-        if not isinstance(shape, Shape):
-            raise ValueError(
-                "jno.domain(..., structured=True) requires a jno.Shape.rect(...) / .box(...) geometry — got "
-                f"{type(shape).__name__}. Structured grids are v1-limited to an axis-aligned rectangle/box."
-            )
         node = getattr(shape, "_node", None)
         prim = node[1] if (isinstance(node, tuple) and node and node[0] == "leaf") else None
         if not isinstance(prim, (Rect, Box)):
-            raise NotImplementedError(
-                "jno.domain(..., structured=True) currently supports only a single axis-aligned "
-                "jno.Shape.rect(...) (2-D) or jno.Shape.box(...) (3-D). A composite/CSG shape is not yet "
-                "supported (cut-cell geometry is planned) — use an unstructured mesh (structured=False)."
+            _what = (
+                f"a {type(prim).__name__.lower()}"
+                if prim is not None
+                else ("no plan at all" if node is None else f"a {node[0]!r} plan")
             )
-        size = getattr(shape, "_size", None)
-        if callable(size):
             raise NotImplementedError(
-                "jno.domain(..., structured=True) needs a uniform scalar size — a spatially varying "
-                "size=<callable> (graded mesh) is not supported on a structured grid."
+                f"Shape.structured() needs a single axis-aligned rect/box; this is {_what}. Mesh it "
+                "unstructured (drop .structured()), or decompose it into mapped blocks. Cut-cell and "
+                "transfinite/swept structured meshing are planned."
             )
-        h = float(size) if isinstance(size, (int, float)) and size > 0 else 0.1
-        if not (isinstance(size, (int, float)) and size > 0):
-            self.log.info(f"structured=True: no scalar size on the Shape; defaulting to grid spacing h={h}.")
+        if int(getattr(shape, "_mesh_order", 1)) > 1:
+            raise NotImplementedError(
+                "Shape.structured().curved() is not supported: a curved lattice cell is a 9-/27-node "
+                "block the lattice builder does not emit. Use .curved() on an unstructured plan, or "
+                "raise the BASIS order instead (jno.fem(..., order=2) on a straight mesh)."
+            )
+        cells = shape.cell_choices()
+        if len(cells) > 1:
+            raise NotImplementedError(
+                f"Shape.structured(): this plan asks for more than one cell type ({', '.join(sorted(cells))})."
+            )
+        tensor = "quad" in cells
 
-        def _axis(lo, hi):  # (lo, hi, n_cells); >= 2 cells so the 3-point edge stencil is defined
+        size = getattr(shape, "_size", None)
+        counts = tuple(getattr(shape, "_structured", ()) or ())
+        if not counts:
+            if callable(size):
+                raise NotImplementedError(
+                    "Shape.structured() derives its cell counts from the shape's size=, and a spatially "
+                    "varying size=<callable> (a graded mesh) has no single count. Pass explicit counts "
+                    "-- .structured(n=32) or .structured(n=(32, 16)) -- or drop .structured()."
+                )
+            h = float(size) if isinstance(size, (int, float)) and size > 0 else 0.1
+            if not (isinstance(size, (int, float)) and size > 0):
+                self.log.info(f"Shape.structured(): no scalar size= on the shape; defaulting to spacing h={h}.")
+        else:
+            h = None
+
+        def _axis(lo, hi, i):
+            """``(lo, hi, n_cells)``; >= 2 cells so the 3-point edge stencil is defined."""
             a, b = sorted((float(lo), float(hi)))
-            return a, b, max(2, int(round((b - a) / h)))
+            n = counts[i] if counts else int(round((b - a) / h))
+            return a, b, max(2, int(n))
 
         if isinstance(prim, Rect):
-            x_lo, x_hi, nx = _axis(prim.x0, prim.x1)
-            y_lo, y_hi, ny = _axis(prim.y0, prim.y1)
-            constructor = Geometries.equi_distant_rect(x_range=(x_lo, x_hi), y_range=(y_lo, y_hi), nx=nx, ny=ny)
+            x_lo, x_hi, nx = _axis(prim.x0, prim.x1, 0)
+            y_lo, y_hi, ny = _axis(prim.y0, prim.y1, 1)
+            constructor = Geometries.equi_distant_rect(
+                x_range=(x_lo, x_hi), y_range=(y_lo, y_hi), nx=nx, ny=ny, cell="quad" if tensor else "triangle"
+            )
             grid_meta = {
                 "shape": (nx + 1, ny + 1),
                 "spacing": ((x_hi - x_lo) / nx, (y_hi - y_lo) / ny),
                 "origin": (x_lo, y_lo),
             }
         else:  # Box (3-D)
-            x_lo, x_hi, nx = _axis(prim.x0, prim.x1)
-            y_lo, y_hi, ny = _axis(prim.y0, prim.y1)
-            z_lo, z_hi, nz = _axis(prim.z0, prim.z1)
+            x_lo, x_hi, nx = _axis(prim.x0, prim.x1, 0)
+            y_lo, y_hi, ny = _axis(prim.y0, prim.y1, 1)
+            z_lo, z_hi, nz = _axis(prim.z0, prim.z1, 2)
             constructor = Geometries.equi_distant_box(
-                x_range=(x_lo, x_hi), y_range=(y_lo, y_hi), z_range=(z_lo, z_hi), nx=nx, ny=ny, nz=nz
+                x_range=(x_lo, x_hi),
+                y_range=(y_lo, y_hi),
+                z_range=(z_lo, z_hi),
+                nx=nx,
+                ny=ny,
+                nz=nz,
+                cell="hex" if tensor else "tetra",
             )
             grid_meta = {
                 "shape": (nx + 1, ny + 1, nz + 1),
                 "spacing": ((x_hi - x_lo) / nx, (y_hi - y_lo) / ny, (z_hi - z_lo) / nz),
                 "origin": (x_lo, y_lo, z_lo),
             }
+
+        # A named single-region plan (`rect.name("steel").attach(k=2.0)`) gets its region as a mesh tag
+        # on the gmsh path, and the lattice builders know nothing about region names -- so without this
+        # `d.k` resolved but `d.variable("steel")` did not. The plan is one primitive, so the region IS
+        # the whole interior.
+        region = getattr(shape, "_region_name", None)
+        if region is not None:
+            _inner = constructor
+
+            def constructor(geo, _inner=_inner, _name=str(region)):  # noqa: F811
+                mesh, dim, ds = _inner(geo)
+                mesh.cell_sets[_name] = [np.asarray(b, dtype=np.int64) for b in mesh.cell_sets["interior"]]
+                return mesh, dim, ds
+
         return constructor, grid_meta
 
     def _generate_mesh(self, geometry_func: Callable, algorithm: int):

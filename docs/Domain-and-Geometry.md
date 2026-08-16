@@ -55,6 +55,7 @@ a - b     # cut         a | b     # fuse         a & b     # intersect
 | `.translate(v)` · `.rotate(axis_point, axis_dir, angle)` | place/orient (names are preserved) |
 | `.fillet(radius, where=None)` | round edges; `where=f(x,y,z)` selects them by midpoint |
 | `.sized(size)` | set the target mesh size (scalar or `f(x,y,z)`) |
+| `.structured(n=None)` | mesh an axis-aligned rect/box as a regular lattice (see below) |
 
 `extrude` is a special case of `sweep`; `revolve` is a distinct rotation. Mesh size lives on the
 **shape** it describes, not on `jno.domain`.
@@ -131,14 +132,44 @@ d = Shape.disk(0, 0, 1, size=0.1).quad().domain()      # pure quads, curved boun
 
 Like `size=` and `.curved()`, this is a property of the shape rather than an argument to the solve.
 
-**3-D is structured-only.** gmsh cannot hexahedral-mesh general geometry — `Recombine3DAll` on a
-plain box returns tetrahedra — so `.quad()` refuses a 3-D shape. For a box of hexahedra use the
-structured constructor, which needs no mesher at all:
+**3-D needs `.structured()`.** gmsh cannot hexahedral-mesh general geometry — `Recombine3DAll` on a
+plain box returns 944 tetrahedra and no hexahedra — so hexes come from a regular lattice:
 
 ```python
-d = jno.domain(constructor=jno.domain.equi_distant_box(nx=16, ny=16, nz=16, cell="hex"))
-d = jno.domain(constructor=jno.domain.equi_distant_rect(nx=40, ny=40, cell="quad"))
+d = Shape.box(0, 0, 0, 1, 1, 1).structured(n=16).quad().domain()    # 4096 hexahedra
+d = Shape.rect(0, 0, 1, 1).structured(n=40).quad().domain()          # 1600 quadrilaterals
 ```
+
+`.quad()` and `.structured()` compose in either order.
+
+### Regular lattices — `.structured()`
+
+`.structured()` meshes an axis-aligned `rect`/`box` as a regular grid instead of calling gmsh. Three
+things follow that a gmsh mesh cannot give:
+
+* **hexahedra**, as above — the lattice is the one 3-D plan that can be hex-meshed;
+* **a grid descriptor** on `domain.grid`, which is what lets `jno.fdm` take its assembly-free 5-/7-point
+  stencils instead of the cotangent operator, and what a nodal field reshapes against;
+* **exactly matched opposite faces**, so a whole-domain periodic tie collapses onto one DOF rather
+  than holding to a tolerance.
+
+```python
+d = Shape.rect(0, 0, 1, 1, size=0.1).structured().domain()   # counts from size=: 10x10 cells
+d = Shape.box(...).structured(n=(32, 16, 16)).domain()       # explicit, per axis
+
+d.grid          # {"shape": (Nx, Ny[, Nz]), "spacing": (...), "origin": (...)}
+u.reshape(d.grid["shape"])                                    # nodes are C-ordered
+```
+
+`n` counts **cells**, so a lattice has `n + 1` nodes per axis and `d.grid["shape"]` is `n + 1` —
+consistent with the `nx`/`ny`/`nz` of every other grid in jNO. A 128×128 *pixel* grid for a
+foundation model is therefore `.structured(n=127)`. Omit `n` to derive it from the shape's `size=`.
+
+A plan that cannot be a lattice — a CSG cut, a disk, a graded `size=` callable, `.curved()` — is
+**refused by name** rather than quietly meshed with gmsh, since the caller who then reads `d.grid` or
+expects hexes would otherwise fail somewhere else. The named faces (`left`/`right`/`bottom`/`top`,
+plus `front`/`back` in 3-D), `boundary`, `interior`, and any `.name()`/`.attach()` region come with
+the lattice as usual.
 
 See the FEM guide's tensor-product section for what these support: volume terms and Dirichlet
 conditions work; surface integrals, `order > 1` and h-adaptivity refuse by name.

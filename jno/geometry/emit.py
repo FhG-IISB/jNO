@@ -557,6 +557,15 @@ def _build_once(shape, split_full, periodic=None, algorithm=None, threads=None, 
                 "and tie them with u('a|b.a') - u('a|b.b')."
             )
         _cell = next(iter(_choices), None)
+        if _cell == "quad" and dim == 3:
+            # Checked here rather than in `Shape.quad()` so that `.quad()` and `.structured()` compose
+            # in either order -- only the finished plan knows whether a lattice sits under the request.
+            # A structured plan never reaches this function at all; it is meshed by `Geometries`.
+            raise NotImplementedError(
+                "Shape.quad() on a 3-D shape needs a regular lattice: gmsh cannot hexahedral-mesh "
+                "general geometry (Recombine3DAll on a plain box returns 944 tetrahedra and no "
+                "hexahedra). Add .structured() -- `Shape.box(...).structured().quad()`."
+            )
         if _cell == "quad":
             # Mesh triangles, then RECOMBINE them into quadrilaterals. This is gmsh's only general
             # route to a quad mesh and it works on arbitrary 2-D geometry -- measured, a disk
