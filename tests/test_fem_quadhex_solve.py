@@ -224,3 +224,64 @@ def test_a_high_aspect_ratio_mesh_still_converges():
     pts = np.asarray(d._fem_native_dof_points)
     exact = 2.0 + 0.001 * pts[:, 0] + 3.0 * pts[:, 1]
     assert np.abs(sol - exact).max() < 1e-8
+
+
+# ------------------------------------------------------------------- Shape.quad() (recombination)
+
+
+def test_shape_quad_recombines_arbitrary_geometry():
+    """gmsh meshes triangles and recombines them, which is not restricted to boxes: a DISK comes
+    back as pure quadrilaterals, with no triangle left behind."""
+    for shape in (jno.Shape.rect(0, 0, 1, 1, size=0.25), jno.Shape.disk(0, 0, 1, size=0.3)):
+        blocks = {c.type: len(c.data) for c in shape.quad().build()[0].cells}
+        assert "triangle" not in blocks, f"recombination left triangles: {blocks}"
+        assert blocks.get("quad", 0) > 0
+        assert blocks.get("line", 0) > 0  # a quad's facet is still a 2-node edge
+
+
+def test_shape_quad_solves_and_converges():
+    def err(h):
+        d = jno.Shape.rect(0, 0, 1, 1, size=h).quad().domain()
+        u, v = d.fem_symbols()
+        xi, yi, _ = d.variable("interior", split=True)
+        xb, yb, _ = d.variable("boundary", split=True)
+        ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+        f = 2 * PI**2 * jno.np.sin(PI * xi) * jno.np.sin(PI * yi)
+        sol = np.asarray(jno.fem([ui.x * vi.x + ui.y * vi.y - f * vi, u(xb, yb) - 0.0]).solve()).ravel()
+        p = np.asarray(d._fem_native_dof_points)
+        return float(np.sqrt(np.mean((sol - np.sin(PI * p[:, 0]) * np.sin(PI * p[:, 1])) ** 2)))
+
+    errs = [err(h) for h in (0.2, 0.1, 0.05)]
+    rates = _rates(errs)
+    assert all(r > 1.6 for r in rates), f"recombined-quad rates {rates}"
+
+
+def test_patch_test_on_a_recombined_disk():
+    """The strongest geometric case available: unstructured quads on a curved boundary, where cell
+    shapes are irregular by construction. A linear field is still reproduced to machine precision."""
+    d = jno.Shape.disk(0, 0, 1, size=0.15).quad().domain()
+    u, v = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y, u(xb, yb) - (1.0 + 2.0 * xb + 3.0 * yb)])
+    sol = np.asarray(fem.solve(linear=jno.solve.lu(backend="host"))).ravel()
+    p = np.asarray(d._fem_native_dof_points)
+    assert np.abs(sol - (1.0 + 2.0 * p[:, 0] + 3.0 * p[:, 1])).max() < 1e-10
+
+
+def test_shape_quad_refuses_3d_and_curved():
+    """gmsh cannot hex-mesh general 3-D geometry, and a curved quad needs a 9-node block neither the
+    emitter nor the element path has. Both refuse by name instead of silently meshing simplices."""
+    with pytest.raises(NotImplementedError, match="2-D only"):
+        jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5).quad()
+    with pytest.raises(NotImplementedError, match="curved"):
+        jno.Shape.rect(0, 0, 1, 1, size=0.5).quad().curved().build()
+
+
+def test_shape_quad_survives_the_other_modifiers():
+    """`quad()` is a meshing property like `sized()`, so it must propagate through the plan
+    operators rather than being dropped by the next transformation."""
+    s = (jno.Shape.rect(0, 0, 2, 1, size=0.4).quad() - jno.Shape.disk(1.0, 0.5, 0.25)).sized(0.25)
+    blocks = {c.type: len(c.data) for c in s.build()[0].cells}
+    assert "triangle" not in blocks and blocks.get("quad", 0) > 0
