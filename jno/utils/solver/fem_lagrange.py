@@ -193,6 +193,108 @@ def lagrange_tet(degree: int, quad_degree: Optional[int] = None) -> ElementSpec:
     )
 
 
+#: meshio/VTK cell name -> (basix CellType name, topological dimension).
+_BASIX_CELL = {
+    "line": ("interval", 1),
+    "interval": ("interval", 1),
+    "triangle": ("triangle", 2),
+    "tetra": ("tetrahedron", 3),
+    "tetrahedron": ("tetrahedron", 3),
+    "quad": ("quadrilateral", 2),
+    "quadrilateral": ("quadrilateral", 2),
+    "hexahedron": ("hexahedron", 3),
+    "hex": ("hexahedron", 3),
+}
+
+
+def basix_cell(cell_type: str):
+    """The basix ``CellType`` for a meshio cell name, and its topological dimension."""
+    from basix import CellType
+
+    entry = _BASIX_CELL.get(cell_type)
+    if entry is None:
+        raise NotImplementedError(
+            f"cell type {cell_type!r} has no basix element in jNO (line / triangle / tetra / quad / hexahedron)."
+        )
+    name, tdim = entry
+    return getattr(CellType, name), tdim
+
+
+def lagrange_on(cell_type: str, degree: int, quad_degree: Optional[int] = None) -> ElementSpec:
+    """Lagrange Q/P{degree} ``ElementSpec`` on any supported cell, tabulated via basix.
+
+    The generic form of :func:`lagrange_interval` / :func:`lagrange_triangle` / :func:`lagrange_tet`
+    -- those three differed only in the cell they named and how many derivative blocks they stacked,
+    which is ``tdim``. Writing it once is what lets a quadrilateral or hexahedron join without a
+    fourth and fifth near-copy, and it keeps one guarantee that matters: the mesh node generator
+    (:func:`lagrange_interp_points`) and the basis tabulation go through the same builder, so their
+    DOF order cannot drift apart.
+
+    **Quadrature degree on a tensor-product cell.** The ``2*degree + 1`` default is chosen to be
+    exact for an affine simplex, where ``detJ`` is constant. A bilinear quad or trilinear hex has a
+    non-constant Jacobian, so ``1/detJ`` makes the integrand rational and no polynomial rule is
+    exact -- the same situation curved cells are already in, and the caller raises the degree for
+    them. The default is kept here so the two paths stay comparable, and the bump lives with the
+    caller that knows the geometry.
+    """
+    import basix
+
+    if degree < 1:
+        raise ValueError(f"lagrange_on: degree must be >= 1; got {degree}.")
+    cell, tdim = basix_cell(cell_type)
+    qd = quad_degree if quad_degree is not None else 2 * degree + 1
+    elem = _lagrange_basix(cell, degree)
+    qp, qw = basix.make_quadrature(cell, qd)
+    tab = elem.tabulate(2, qp)  # (n_blocks, n_quad, n_dof, 1): values, 1st and 2nd ref derivatives
+    return ElementSpec(
+        family=f"Lagrange-P{degree}-{basix.CellType(cell).name}",
+        n_dof=int(elem.dim),
+        value_size=1,
+        quad_points=np.asarray(qp),
+        quad_weights=np.asarray(qw),
+        ref_values=np.asarray(tab[0]),  # (n_quad, n_dof, 1)
+        ref_div=None,
+        ref_grads=np.stack([np.asarray(tab[i]) for i in range(1, tdim + 1)], axis=-1),
+        local_edges=tuple(tuple(e) for e in basix.topology(cell)[1]) if tdim > 1 else ((0, 1),),
+        ref_hess=_ref_hessian_from_tab(tab, tdim),
+    )
+
+
+def vtk_to_basix_vertex_perm(cell_type: str) -> np.ndarray:
+    """Permutation taking a cell's meshio/VTK vertex order to basix's, as basix-index -> VTK-index.
+
+    The two libraries number a reference cell differently, and only for the tensor-product cells:
+    an interval, triangle and tetrahedron have the same vertex order in both, but VTK walks a
+    quadrilateral's vertices **around its perimeter** (0,0), (1,0), (1,1), (0,1) while basix orders
+    them **lexicographically** (0,0), (1,0), (0,1), (1,1) -- so VTK's nodes 2 and 3 are basix's 3
+    and 2. On a hexahedron the same disagreement applies to both of its faces.
+
+    Feeding a VTK-ordered cell to a basix-tabulated basis without this permutation does not fail
+    loudly: it silently evaluates the basis with two corners swapped, which for a quad is a
+    self-intersecting (bow-tie) map with a Jacobian that changes sign inside the cell.
+
+    Derived from the reference geometries rather than written out, so it cannot drift if either
+    library renumbers.
+    """
+    import basix
+
+    cell, tdim = basix_cell(cell_type)
+    ref = np.asarray(basix.geometry(cell))  # (n_vertices, tdim), basix order
+    if cell_type in ("quad", "quadrilateral"):
+        vtk = np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]])
+    elif cell_type in ("hexahedron", "hex"):
+        base = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
+        vtk = np.array([b + [z] for z in (0.0, 1.0) for b in base])
+    else:
+        return np.arange(len(ref), dtype=np.int64)  # simplices already agree
+    # basix DOF b sits at ref[b]; find which VTK slot holds that same corner.
+    matches = np.all(np.isclose(vtk[None, :, :], ref[:, None, :], atol=1e-12), axis=-1)
+    perm = np.argmax(matches, axis=1)
+    if not matches.any(axis=1).all() or len(set(perm.tolist())) != len(ref):
+        raise RuntimeError(f"could not match basix and VTK vertices for {cell_type!r}")
+    return perm.astype(np.int64)
+
+
 def identity_pushforward(
     ref_values: jnp.ndarray,
     ref_grads: jnp.ndarray,
