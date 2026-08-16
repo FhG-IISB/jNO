@@ -272,3 +272,29 @@ class TestCosineVariant:
         shape, spacing, P = self._line(n=8)
         out = _spectral_diff(np.cos(np.pi * P[:, 0]), shape, spacing, 0, 1, mirror=True)
         assert out.shape == (P.shape[0],)
+
+
+def test_finite_difference_also_reaches_a_stored_field():
+    """Guards a claim that was overstated once: only AD is broken on a dataset-fed operator.
+
+    `finite_difference` evaluates the target on the mesh and stencils the VALUES, so it never needed
+    a path from x either — a physics residual on a stored input was writable before the spectral
+    backend existed. Spectral's contribution there is accuracy, not capability, and this pins the
+    distinction so the docs cannot drift back to the stronger claim.
+    """
+    _, shape, spacing, P = _grid(n=16)
+    d = jno.Shape.rect(0, 0, 1, 1, size=1 / 16).domain(structured=True)
+    x, y = P[:, 0], P[:, 1]
+    u = np.sin(2 * np.pi * x) * np.cos(4 * np.pi * y)
+    ux = 2 * np.pi * np.cos(2 * np.pi * x) * np.cos(4 * np.pi * y)
+
+    fd = np.asarray(
+        D.compute_fd_gradient_2d_simple(
+            u, P, np.asarray(d.mesh_connectivity["triangles"]), 0, grid=d.mesh_connectivity["grid"]
+        )
+    )
+    spec = np.asarray(_spectral_diff(u, shape, spacing, 0, 1))
+
+    fd_err, spec_err = np.abs(fd - ux).max(), np.abs(spec - ux).max()
+    assert fd_err < 1.0, "finite differences must give a REAL derivative here, not zero"
+    assert spec_err < fd_err / 1e6, "…and spectral must be far more accurate on a periodic field"

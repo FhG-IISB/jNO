@@ -76,9 +76,11 @@ grid, same field, same grid:
 | `"finite_difference"` | `1.60e-01` | `5.24e+01` |
 
 It also reaches where automatic differentiation **cannot**. An operator fed a *stored* field has no
-path from `x` to its output, so `u.laplacian(x, y)` under AD is identically `0.0` and a physics
-residual on it is silently satisfied by any network. The FFT works on the values along the grid
-axis instead, which is what makes a PINO residual possible:
+path from `x` to its output, so `u.laplacian(x, y)` under AD is identically `0.0` — and a physics
+residual built on it is silently satisfied by any network at all. Both `"finite_difference"` and
+`"spectral"` work on the field's *values* instead and give a real derivative there; spectral is the
+accurate one when the field is periodic and band-limited, which is the regime an FNO already
+assumes. So the choice for a PINO residual is between those two, and AD is simply wrong:
 
 ```python
 jno.setup(__file__, diff_type="spectral")
