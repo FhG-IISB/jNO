@@ -203,6 +203,44 @@ J_sg    = u.grad(u_net).stop_gradient      # treat the current Jacobian as a con
 ntk_reg = (J_sg @ J_sg.T - target_K).mse
 ```
 
+### Stochastic terms — `jno.noise`
+
+Noise nodes are ordinary trace expressions that draw a **fresh realisation every training step**,
+derived from the solver's step key, so a run is reproducible from the global seed with no key
+management. Under `crux.eval()` (no key) they evaluate to zeros, so post-training evaluation stays
+deterministic.
+
+```python
+u_noisy = net(x) - (u_obs + jno.noise.gaussian(std=0.01))   # (N, 1) — noisy observations
+uv      = net(x, y) + jno.noise.gaussian(std=0.01, ndim=2)  # (N, 2) — vector noise
+xj      = net(x + jno.noise.uniform(low=-1e-3, high=1e-3))  # jittered input coordinate
+```
+
+`gaussian`, `uniform` and `laplace` are **pointwise** — each point draws independently. `grf` is
+not: it is a **spatially correlated** Gaussian random field, so it is an input *function* rather
+than a perturbation. That is what makes operator learning possible with no dataset at all — a fresh
+in-distribution input every step:
+
+```python
+f = jno.noise.grf(x, y, length_scale=0.1)        # Matern-3/2 by default
+u = net(f).scalar.bind(x=x, y=y)
+crux = jno.core([(u.laplacian(x, y) + f).mse])
+```
+
+Built by spectral representation (Shinozuka & Deodatis 1991; Rahimi & Recht 2007), with the Matern
+spectral density from Rasmussen & Williams §4.2. Knobs: `length_scale`, `variance`, `kernel`
+(`"matern"` / `"rbf"`), `nu`, `modes`, `ndim`.
+
+!!! note "An approximate GP sample, and it costs memory"
+
+    Exact only as `modes → ∞`; the covariance error is `O(M^{-1/2})`, so the default `modes=256`
+    is ~6%. Exact circulant embedding needs a regular grid, whereas the evaluator sees a flat point
+    cloud — hence the spectral method. Cost is `O(B × N × M)` inside the batch vmap, so raise
+    `modes` knowingly.
+
+    Like every noise node, one realisation is shared across the timesteps of a single window
+    (the step key is not split per timestep), and it does vary across batch samples.
+
 ### Parameter Jacobian & the Neural Tangent Kernel
 
 `u.grad(net)` is `.grad` in its **parameter** overload: passed a single `Model` (rather than
