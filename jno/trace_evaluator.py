@@ -63,6 +63,98 @@ from .utils.ad_mode import ad_fn, parse_ad_scheme, parse_hessian_scheme
 from .utils.schemes import scheme_family
 
 
+def _uniform_grid_spec(domain, n_values: int):
+    """``(shape, spacing)`` of the uniform grid a nodal field of length ``n_values`` lives on.
+
+    Prefers the descriptor ``jno.domain(..., structured=True)`` stamps onto
+    ``mesh_connectivity["grid"]``. Otherwise derives the spacing from ``_grid_shape`` and the mesh
+    points, which the generators lay out in C order (``idx = i*Ny + j``), so a nodal field reshapes
+    cleanly. Raises rather than guessing -- a spectral derivative on a non-uniform grid is silently
+    wrong, not merely inaccurate.
+    """
+    if domain is None:
+        raise ValueError("scheme='spectral' needs a domain with a uniform grid; this expression has none.")
+
+    grid = (getattr(domain, "mesh_connectivity", None) or {}).get("grid")
+    if grid is not None:
+        shape, spacing = tuple(int(s) for s in grid["shape"]), tuple(float(h) for h in grid["spacing"])
+    else:
+        shape = getattr(domain, "_grid_shape", None)
+        if not shape:
+            raise ValueError(
+                "scheme='spectral' requires a uniform grid, and this domain has none. Build it with "
+                "jno.domain(..., structured=True) (which records the spacing), or use "
+                "scheme='finite_difference' on an unstructured mesh."
+            )
+        shape = tuple(int(s) for s in shape)
+        pts = np.asarray(domain.mesh_connectivity["points"])[:, : len(shape)]
+        if pts.shape[0] != int(np.prod(shape)):
+            raise ValueError(
+                f"scheme='spectral': the mesh has {pts.shape[0]} points but the grid is {shape} "
+                f"({int(np.prod(shape))} nodes), so the field does not reshape onto it."
+            )
+        grid_pts = pts.reshape(*shape, len(shape))
+        spacing = []
+        for ax in range(len(shape)):
+            if shape[ax] < 2:
+                spacing.append(1.0)
+                continue
+            step = np.diff(np.take(grid_pts[..., ax], indices=range(shape[ax]), axis=ax).reshape(shape[ax], -1)[:, 0])
+            if not np.allclose(step, step[0], rtol=1e-6, atol=1e-12):
+                raise ValueError(
+                    f"scheme='spectral': axis {ax} of this grid is not uniformly spaced "
+                    f"(min {step.min():.3e}, max {step.max():.3e}). FFT differentiation assumes uniform spacing."
+                )
+            spacing.append(float(step[0]))
+        spacing = tuple(spacing)
+
+    if int(np.prod(shape)) != int(n_values):
+        raise ValueError(
+            f"scheme='spectral': the field has {n_values} values but the grid {shape} has {int(np.prod(shape))} nodes."
+        )
+    return shape, spacing
+
+
+def _spectral_diff(values_flat, shape, spacing, axis: int, order: int):
+    """``d^order/dx_axis^order`` of a flat nodal field, via the FFT along that grid axis.
+
+    Exact for a band-limited periodic field; on a non-periodic one the implied periodic extension
+    has a jump and the result rings (Gibbs). Periodicity is the caller's claim -- it is not read
+    from the domain, because the only per-axis periodic flag jNO records is a residue of whether a
+    periodic FDM problem happened to be built earlier in the process.
+
+    Trefethen, *Spectral Methods in MATLAB* (SIAM 2000), ch. 3.
+    """
+    was_real = not jnp.iscomplexobj(values_flat)
+    u = jnp.asarray(values_flat).reshape(shape)
+    h = spacing[axis]
+
+    # jNO's structured grids span the interval INCLUSIVE of both ends, so the last node along an
+    # axis is the periodic image of the first: `Shape.rect(0,0,1,1, size=1/16)` gives 17 nodes for
+    # 16 intervals. The FFT wants exactly one period with no duplicate, so drop that node, transform
+    # over the remaining n, and put it back afterwards. The finite-difference periodic stencils do
+    # the same thing (`differential_operators.py`, `uu = moveaxis(U, dim, 0)[:-1]`). Without this
+    # the transform assumes a period of (n+1)*h and every derivative is wrong -- measurably worse
+    # than a 2nd-order stencil, which is how it was caught.
+    u = jnp.moveaxis(u, axis, 0)[:-1]
+    u = jnp.moveaxis(u, 0, axis)
+    n = u.shape[axis]
+
+    k = 2.0 * jnp.pi * jnp.fft.fftfreq(n, d=h)
+    if order % 2 == 1 and n % 2 == 0:
+        # The Nyquist mode has no well-defined odd derivative (it is its own alias); the standard
+        # convention drops it rather than letting an arbitrary sign through.
+        k = k.at[n // 2].set(0.0)
+    mult = (1j * k) ** order
+    mult = mult.reshape([n if a == axis else 1 for a in range(len(shape))])
+
+    out = jnp.fft.ifft(mult * jnp.fft.fft(u, axis=axis), axis=axis)
+    out = out.real if was_real else out
+    # Re-attach the duplicated endpoint so the result lines up with the mesh's node ordering.
+    first = jnp.take(out, jnp.array([0]), axis=axis)
+    return jnp.concatenate([out, first], axis=axis).reshape(-1)
+
+
 class TraceEvaluator:
     """Evaluates traced expressions - designed for JIT compilation.
 
@@ -1496,6 +1588,50 @@ class TraceEvaluator:
                 return result[:, jnp.newaxis] if result.ndim == 1 else result
             jac_full = jnp.stack(jac_components, axis=-1)
             return self._map_mesh_to_sampled(mesh_points, points, jac_full)
+
+        elif family == "spectral":
+            # Structurally the finite-difference path: same mesh evaluation, same image-shape
+            # handling, same channel vmap, same remap out. Only the per-channel KERNEL differs --
+            # an FFT along the grid axis instead of a stencil over the triangulation.
+            domain = bound_var._domain
+            if domain is None or getattr(domain, "mesh_connectivity", None) is None:
+                raise ValueError("scheme='spectral' requires a domain with mesh connectivity.")
+            mesh_points = jnp.array(domain.mesh_connectivity["points"])
+            N_mesh = mesh_points.shape[0]
+            u_full = self._target_on_mesh(target, tag, mesh_points, ctx)
+
+            u_squeezed = u_full.squeeze(-1) if (u_full.ndim > 1 and u_full.shape[-1] == 1) else u_full
+            image_shape = None
+            n_channels = 1
+            if u_squeezed.ndim > 1 and u_squeezed.size == N_mesh:
+                image_shape, u_flat = u_full.shape, u_squeezed.reshape(N_mesh)
+            elif u_full.ndim > 2 and int(np.prod(u_full.shape[:-1])) == N_mesh:
+                image_shape, n_channels = u_full.shape, u_full.shape[-1]
+                u_flat = u_full.reshape(N_mesh, n_channels)
+            else:
+                u_flat = u_squeezed if u_squeezed.ndim == 1 else u_squeezed.ravel()
+
+            g_shape, g_spacing = _uniform_grid_spec(domain, N_mesh)
+
+            def _spec_one_channel(u_1d, ax):
+                return _spectral_diff(u_1d, g_shape, g_spacing, ax, order=1)
+
+            jac_components = []
+            for _i, vi_dim in var_dims:
+                if image_shape is not None and n_channels > 1:
+                    comp = jax.vmap(lambda u_c, _a=vi_dim: _spec_one_channel(u_c, _a))(u_flat.T).T
+                else:
+                    comp = _spec_one_channel(u_flat, vi_dim)
+                jac_components.append(comp)
+
+            if image_shape is not None:
+                if n_vars == 1:
+                    return jac_components[0].reshape(image_shape)
+                return jnp.stack(jac_components, axis=-1).reshape(*image_shape[:-1], n_vars)
+            if n_vars == 1:
+                result = self._map_mesh_to_sampled(mesh_points, points, jac_components[0])
+                return result[:, jnp.newaxis] if result.ndim == 1 else result
+            return self._map_mesh_to_sampled(mesh_points, points, jnp.stack(jac_components, axis=-1))
 
         elif family == "automatic_differentiation":
             evaluator_self = self

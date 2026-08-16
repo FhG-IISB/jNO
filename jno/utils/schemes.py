@@ -26,6 +26,7 @@ from __future__ import annotations
 SCHEME_FAMILIES: dict[str, str] = {
     "automatic_differentiation": "exact derivatives of the traced function (jacfwd / jacrev)",
     "finite_difference": "stencils over the mesh or structured grid",
+    "spectral": "FFT differentiation on a uniform grid (assumes periodicity)",
 }
 
 

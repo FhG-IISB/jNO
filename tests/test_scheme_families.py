@@ -40,11 +40,17 @@ class TestSchemeFamily:
 
     def test_unknown_family_raises_and_lists_the_known_ones(self):
         with pytest.raises(ValueError, match="Unknown differentiation scheme family"):
-            scheme_family("spectral")
+            scheme_family("wavelet")
         with pytest.raises(ValueError) as e:
-            scheme_family("spectral:fft")
+            scheme_family("wavelet:db4")
         for known in SCHEME_FAMILIES:
             assert known in str(e.value), f"the error should name {known!r}"
+
+    def test_a_registered_family_resolves(self):
+        """Guards the other direction: once a backend registers, its family must stop raising.
+        These tests use a never-registered name precisely so they do not go stale again."""
+        assert scheme_family("spectral") == "spectral"
+        assert "spectral" in SCHEME_FAMILIES
 
     def test_a_typo_raises_rather_than_being_treated_as_finite_difference(self):
         with pytest.raises(ValueError, match="Unknown differentiation scheme family"):
@@ -68,19 +74,19 @@ class TestParsersNoLongerReinterpret:
 
     def test_parse_ad_scheme_refuses_a_foreign_family(self):
         with pytest.raises(ValueError, match="Unknown differentiation scheme family"):
-            parse_ad_scheme("spectral")  # used to return the global AD default
+            parse_ad_scheme("wavelet")  # used to return the global AD default
         with pytest.raises(ValueError, match="wrong backend"):
             parse_ad_scheme("finite_difference")
 
     def test_parse_hessian_scheme_refuses_a_foreign_family(self):
         with pytest.raises(ValueError, match="Unknown differentiation scheme family"):
-            parse_hessian_scheme("spectral")
+            parse_hessian_scheme("wavelet")
 
     def test_parse_fd_scheme_refuses_a_foreign_family(self):
         with pytest.raises(ValueError, match="Unknown differentiation scheme family"):
-            D.parse_fd_scheme("spectral")  # used to return the FD defaults
+            D.parse_fd_scheme("wavelet")  # used to return the FD defaults
         with pytest.raises(ValueError, match="Unknown differentiation scheme family"):
-            D.parse_fd_scheme("spectral:fft")  # used to hand "fft" to the FD kernel as method=
+            D.parse_fd_scheme("wavelet:db4")  # used to hand "fft" to the FD kernel as method=
 
     def test_the_valid_strings_are_unchanged(self):
         assert D.parse_fd_scheme("finite_difference") == ("finite_difference", "area_weighted", "gradient_of_gradient")
@@ -107,14 +113,14 @@ class TestEvaluatorDispatchFailsLoud:
 
         u, x, _ = self._u_and_x()
         with pytest.raises(ValueError, match="Unknown differentiation scheme family"):
-            TraceEvaluator({}).evaluate(u.d(x, scheme="spectral"), {"xy": jnp.ones((6, 2))}, {}, key=None)
+            TraceEvaluator({}).evaluate(u.d(x, scheme="wavelet"), {"xy": jnp.ones((6, 2))}, {}, key=None)
 
     def test_unknown_scheme_on_a_second_derivative_raises(self):
         from jno.trace_evaluator import TraceEvaluator
 
         u, x, y = self._u_and_x()
         with pytest.raises(ValueError, match="Unknown differentiation scheme family"):
-            TraceEvaluator({}).evaluate(u.laplacian(x, y, scheme="spectral"), {"xy": jnp.ones((6, 2))}, {}, key=None)
+            TraceEvaluator({}).evaluate(u.laplacian(x, y, scheme="wavelet"), {"xy": jnp.ones((6, 2))}, {}, key=None)
 
     def test_the_old_failure_mode_is_gone(self):
         """It used to return None and die later as a TypeError about subscripting None."""
@@ -123,5 +129,5 @@ class TestEvaluatorDispatchFailsLoud:
         u, x, _ = self._u_and_x()
         with pytest.raises(ValueError):  # specifically NOT TypeError
             TraceEvaluator({}).evaluate(
-                (u.d(x, scheme="spectral") + 1.0), {"xy": jnp.ones((6, 2))}, {}, key=jax.random.PRNGKey(0)
+                (u.d(x, scheme="wavelet") + 1.0), {"xy": jnp.ones((6, 2))}, {}, key=jax.random.PRNGKey(0)
             )
