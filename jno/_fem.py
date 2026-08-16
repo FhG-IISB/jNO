@@ -2621,15 +2621,24 @@ def _periodic_tie_spec(constraint: Any, domain: Any) -> Optional[Tuple[str, str,
     return (main_tag, secondary_tag, None, _field_key_of(constraint), phase)
 
 
-def _ref_interior_facet_dofs(ref_pts: np.ndarray, fv: np.ndarray, dim: int, tol: float = 1e-9) -> List[int]:
+def _ref_interior_facet_dofs(
+    ref_pts: np.ndarray, fv: np.ndarray, dim: int, tol: float = 1e-9, ncorner_override: int = 0
+) -> List[int]:
     """Local DOF ids on the facet spanned by reference vertices ``fv`` (beyond the facet's own vertices),
     **ordered** to match the periodic interpolation convention: the interior nodes of each facet edge in
     cyclic order (each edge's nodes sorted by position), then the face-interior nodes (3D). For P1/P2 this
     reproduces the legacy facet layout exactly -- 2D ``[.. , mid_ab]``, 3D ``[.. , mid_ab, mid_bc, mid_ca]``
     -- which ``_periodic_facet_weights`` relies on; higher orders extend it (per-edge nodes by position)."""
-    ncorner = dim + 1  # element vertex DOFs are 0..dim (basix lists vertices first)
+    # Element vertex DOFs come first (a basix guarantee on every cell), but HOW MANY depends on the
+    # cell: dim+1 for a simplex, 2^dim for a tensor-product cell. Taking dim+1 on a quadrilateral
+    # would treat its fourth corner as a higher-order candidate and match it onto an edge.
+    ncorner = int(ncorner_override) if ncorner_override else dim + 1
     cand = list(range(ncorner, len(ref_pts)))
-    edges = [(fv[0], fv[1])] if dim == 2 else [(fv[0], fv[1]), (fv[1], fv[2]), (fv[2], fv[0])]
+    # The facet's own edges, walked cyclically. A 2-D facet is a single edge; a 3-D facet is a
+    # triangle (3 edges) or -- on a hexahedron -- a QUADRILATERAL (4). `fv` arrives in perimeter
+    # order, so the cycle is simply consecutive pairs.
+    nfv = len(fv)
+    edges = [(fv[0], fv[1])] if dim == 2 else [(fv[i], fv[(i + 1) % nfv]) for i in range(nfv)]
     ordered: List[int] = []
     used: set = set()
     for a, b in edges:
@@ -2645,15 +2654,29 @@ def _ref_interior_facet_dofs(ref_pts: np.ndarray, fv: np.ndarray, dim: int, tol:
         for _t, d in sorted(on_edge):
             ordered.append(d)
             used.add(d)
-    if dim == 3:  # face-interior nodes: on the facet plane, strictly inside the triangle, not on an edge
-        a, b, c = fv
-        M = np.stack([b - a, c - a], axis=1)  # (3, 2)
+    if dim == 3:  # face-interior nodes: on the facet plane, strictly inside it, not on one of its edges
+        a = fv[0]
+        # Two in-plane directions. For a triangle they are its two edges from `a`; for a quadrilateral
+        # facet (perimeter order a, b, c, d) they are the two edges a->b and a->d, and the containment
+        # test is the unit SQUARE rather than `s + t <= 1` -- a triangle test would reject half the
+        # face, dropping its interior node.
+        if nfv == 3:
+            M = np.stack([fv[1] - a, fv[2] - a], axis=1)  # (3, 2)
+
+            def _inside(s, t):
+                return min(s, t, 1.0 - s - t) >= -tol
+        else:
+            M = np.stack([fv[1] - a, fv[-1] - a], axis=1)
+
+            def _inside(s, t):
+                return min(s, t, 1.0 - s, 1.0 - t) >= -tol
+
         for d in cand:
             if d in used:
                 continue
             st, *_ = np.linalg.lstsq(M, ref_pts[d] - a, rcond=None)
             s, t = float(st[0]), float(st[1])
-            if float(np.linalg.norm((a + M @ st) - ref_pts[d])) < tol and min(s, t, 1.0 - s - t) >= -tol:
+            if float(np.linalg.norm((a + M @ st) - ref_pts[d])) < tol and _inside(s, t):
                 ordered.append(d)
     return ordered
 
@@ -2713,13 +2736,23 @@ def _boundary_facets(points: Any, cells: Any, dim: int, order: int, cell_type: A
         return allf[bidx]
     from .utils.solver.fem_lagrange import lagrange_interp_points
 
-    ref_pts = np.asarray(lagrange_interp_points(dim, order))
-    ref_verts = (
-        np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
-        if dim == 2
-        else np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
-    )
-    facet_dofs = [list(c) + _ref_interior_facet_dofs(ref_pts, ref_verts[list(c)], dim) for c in combos]
+    ref_pts = np.asarray(lagrange_interp_points(dim, order, cell_type))
+    if cell_type in ("quad", "quadrilateral", "hexahedron", "hex"):
+        import basix as _basix
+
+        from .utils.solver.fem_lagrange import basix_cell
+
+        ref_verts = np.asarray(_basix.geometry(basix_cell(cell_type)[0]))
+    else:
+        ref_verts = (
+            np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+            if dim == 2
+            else np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+        )
+    _nc = len(ref_verts)
+    facet_dofs = [
+        list(c) + _ref_interior_facet_dofs(ref_pts, ref_verts[list(c)], dim, ncorner_override=_nc) for c in combos
+    ]
     # One gather over all boundary facets rather than a Python row per facet. Every facet of a
     # simplex carries the same DOF count, so the table is rectangular; the loop stays as the
     # fallback in case a reference element ever breaks that.

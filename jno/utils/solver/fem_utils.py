@@ -1976,8 +1976,12 @@ def _promote_to_quadratic(points, cells_p1, edge_local):
     return pts, cells_p2
 
 
-def _promote_to_degree(points, cells_p1, ref_pts):
-    """Promote a linear simplex mesh to a degree-``k`` Lagrange node mesh (P1 -> P{k}, any ``k``).
+def _promote_to_degree(points, cells_p1, ref_pts, cell_type=None):
+    """Promote a linear mesh to a degree-``k`` Lagrange node mesh (P1 -> P{k} / Q1 -> Q{k}, any ``k``).
+
+    ``cell_type`` names the cell for a tensor-product mesh (``"quad"`` / ``"hexahedron"``), whose
+    nodes are placed with its degree-1 basis; omitted, the cell is a simplex and the placement is
+    barycentric. A tensor-product cell's ``cells_p1`` must be in basix vertex order.
 
     ``ref_pts`` are the element's reference interpolation points in **basix DOF order** (shape
     ``(n_dof, tdim)``; the first ``ncorner`` are the cell vertices). Each cell's nodes are the affine
@@ -1995,11 +1999,24 @@ def _promote_to_degree(points, cells_p1, ref_pts):
     ref_pts = np.asarray(ref_pts, dtype=float)
     ncell, ncorner = cells_p1.shape
     ndof = ref_pts.shape[0]
-    # barycentric weights of each reference point: l0 = 1 - sum(xi), l_i = xi_i
-    bary = np.empty((ndof, ncorner), dtype=float)
-    bary[:, 0] = 1.0 - ref_pts.sum(axis=1)
-    bary[:, 1:] = ref_pts
-    phys = np.einsum("dc,ncg->ndg", bary, points[cells_p1])  # (ncell, ndof, gdim) physical node coords
+    if cell_type in ("quad", "quadrilateral", "hexahedron", "hex"):
+        # The general form: x(xi) = sum_a N_a(xi) x_a, tabulating the cell's DEGREE-1 (geometry)
+        # basis at the reference points. The barycentric block below is this same operation
+        # specialised to a simplex, where the P1 basis is [1 - sum(xi), xi]. It is kept rather than
+        # replaced because the two differ by one ulp (1.1e-16, measured), and a simplex mesh should
+        # not shift at the last bit for a change that is about quadrilaterals.
+        #
+        # `cells_p1` must be in BASIX vertex order here, since that is the order the tabulated basis
+        # is written in -- pairing it with meshio/VTK order makes the cell a bow-tie.
+        from .fem_lagrange import _lagrange_basix, basix_cell
+
+        weights = np.asarray(_lagrange_basix(basix_cell(cell_type)[0], 1).tabulate(0, ref_pts))[0, :, :, 0]
+    else:
+        # barycentric weights of each reference point: l0 = 1 - sum(xi), l_i = xi_i
+        weights = np.empty((ndof, ncorner), dtype=float)
+        weights[:, 0] = 1.0 - ref_pts.sum(axis=1)
+        weights[:, 1:] = ref_pts
+    phys = np.einsum("dc,ncg->ndg", weights, points[cells_p1])  # (ncell, ndof, gdim) physical node coords
     # scale-aware coordinate hash: coincident nodes differ only by FP roundoff (<< tol); distinct nodes
     # are separated by ~mesh spacing (>> tol).
     extent = float(np.max(points.max(axis=0) - points.min(axis=0))) if points.shape[0] else 1.0

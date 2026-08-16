@@ -642,6 +642,7 @@ available two ways, and which one you can use is decided by what a mesher can ac
 ```python
 # 2-D quadrilaterals on ARBITRARY geometry, via gmsh recombination
 d = jno.Shape.disk(0, 0, 1, size=0.1).quad().domain()
+u, v = d.fem_symbols(order=2)          # Q2 / Q3 work exactly as P2 / P3 do
 
 # structured grids, no mesher involved — a rectangle of quads, a box of hexes
 d = jno.domain(constructor=jno.domain.equi_distant_rect(nx=40, ny=40, cell="quad"))
@@ -667,9 +668,18 @@ recombines to pure quadrilaterals just as a rectangle does.
 
 | mesh | rates per halving | note |
 |---|---|---|
-| structured quads | 1.87, 1.92, 1.96 | same error as the triangulation of the same grid, from half the cells |
-| structured hexes | 1.79, 1.86 | same error as the tetrahedralisation, from a sixth the cells |
-| recombined quads (`Shape.quad()`) | 1.83, 1.91 | ~5× the L2 error of triangles at equal node count on this smooth problem |
+| structured quads, Q1 | 1.87, 1.92, 1.96 | same error as the triangulation of the same grid, from half the cells |
+| structured hexes, Q1 | 1.79, 1.86 | same error as the tetrahedralisation, from a sixth the cells |
+| recombined quads (`Shape.quad()`), Q1 | 1.83, 1.91 | ~5× the L2 error of triangles at equal node count on this smooth problem |
+| structured quads, **Q2** | 3.94, 3.96 | ~8× *lower* error than P2 triangles at the same node count |
+| structured quads, **Q3** | 3.87, 3.95 | ~5× lower than P3 triangles at the same node count |
+| structured hexes, **Q2** | 4.27, 4.29 | ~10× lower than P2 tetrahedra at the same node count |
+
+**Order is the lever, not cell shape.** At Q1 the two cell types are indistinguishable; raising the
+order is what moves the rate. A Q{k} quad mesh and a P{k} triangulation of the same grid have
+*exactly* the same node count, so those comparisons are DOF-for-DOF rather than favourable. (The
+rates are nodal RMS on structured meshes, where nodal superconvergence is expected — read them as a
+comparison between cells, not as the theoretical O(h^{k+1}).)
 
 That last row is worth reading honestly: **recombination is not a free accuracy win**. It leaves
 some poorly-shaped cells, and on smooth scalar Poisson the triangulation is more accurate per node.
@@ -693,7 +703,6 @@ solver slots. Periodic ties work on quads; on hexes they refuse (below).
 |---|---|
 | periodic / mortar **ties across a hexahedral facet** | the tie weights are barycentric (triangle) shape functions; a hex facet is a quadrilateral, so reaching them would interpolate it from three of its four nodes. Quad facets are 2- or 3-node edges and work |
 | **h-adaptive remeshing** (`adapt=`) | mmg adapts simplices, and the recovery estimator differentiates P1 shape functions (constant per cell, which a bilinear cell's are not). Conforming quad/hex refinement is a different algorithm — templates, or an octree with hanging nodes |
-| `order > 1` (Q2, Q3) | higher-order node promotion places nodes by **barycentric** weights, which only describe a simplex |
 | 4th-order forms (plates, phase-field) | the physical-Hessian push-forward assumes an affine cell — the same refusal curved simplices already carry |
 | non-nodal families (N1E, RT, Argyris, Morley) | Argyris and Morley are *defined* on triangles; the quad analogues (RTCF/NCE, Bogner–Fox–Schmit) are different elements |
 | `Shape.quad().curved()` | a curved quadrilateral is a 9-node block the emitter does not produce |

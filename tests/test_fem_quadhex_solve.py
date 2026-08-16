@@ -264,15 +264,103 @@ def test_the_warped_hex_faces_are_really_non_planar():
     assert min_det > 0 and warp.max() > 0.02, f"faces are nearly planar (max warp {warp.max():.3e})"
 
 
-def test_higher_order_on_a_quad_mesh_refuses_by_name():
-    """P2+ node promotion places nodes by barycentric weights, which only describe a simplex."""
-    d = jno.domain(constructor=Geometries.equi_distant_rect(nx=3, ny=3, cell="quad"), compute_mesh_connectivity=False)
-    with pytest.raises(NotImplementedError, match="BARYCENTRIC"):
+# -------------------------------------------------------------------------- higher order (Q2 / Q3)
+
+
+def _poisson_order(n, order, cell):
+    """MMS Poisson at a given element order; returns (nodal RMS error, dof count)."""
+    kw = {"cell": cell} if cell else {}
+    d = jno.domain(constructor=Geometries.equi_distant_rect(nx=n, ny=n, **kw), compute_mesh_connectivity=False)
+    u, v = d.fem_symbols(order=order)
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    f = 2 * PI**2 * jno.np.sin(PI * xi) * jno.np.sin(PI * yi)
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y - f * vi, u(xb, yb) - 0.0])
+    sol = np.asarray(fem.solve(linear=jno.solve.lu(backend="host"))).ravel()
+    p = np.asarray(d._fem_native_dof_points)
+    return float(np.sqrt(np.mean((sol - np.sin(PI * p[:, 0]) * np.sin(PI * p[:, 1])) ** 2))), len(p)
+
+
+@pytest.mark.parametrize("order", [2, 3])
+def test_higher_order_quads_converge_faster_than_q1(order):
+    """Element ORDER is the lever that raises the convergence rate — cell shape is not (measured:
+    Q1 and P1 agree to within 1 % at every aspect ratio). Q1's rate on this problem is ~1.9, so a
+    working Q2/Q3 must clearly exceed it."""
+    errs = [_poisson_order(n, order, "quad")[0] for n in (4, 8, 16)]
+    rates = [float(np.log2(errs[i] / errs[i + 1])) for i in range(len(errs) - 1)]
+    assert all(r > 2.8 for r in rates), f"Q{order} rates {rates} — no better than Q1"
+    assert errs[-1] < 1e-5
+
+
+@pytest.mark.parametrize("order", [2, 3])
+def test_higher_order_quads_match_the_simplex_dof_for_dof(order):
+    """A Q{k} quad mesh and a P{k} triangulation of the same grid have the SAME node count, so this
+    is a fair comparison rather than a favourable one. Reported as an inequality that would still
+    pass if the quads were merely competitive, not just when they win."""
+    e_quad, n_quad = _poisson_order(16, order, "quad")
+    e_tri, n_tri = _poisson_order(16, order, None)
+    assert n_quad == n_tri, f"the comparison is not DOF-for-DOF: {n_quad} vs {n_tri}"
+    assert e_quad <= e_tri, f"Q{order} ({e_quad:.2e}) worse than P{order} ({e_tri:.2e}) at equal dofs"
+
+
+def test_q2_hexes_converge():
+    """The promotion is cell-generic, so hexes get Q2 from the same change."""
+
+    def err(n):
+        d = jno.domain(
+            constructor=Geometries.equi_distant_box(nx=n, ny=n, nz=n, cell="hex"), compute_mesh_connectivity=False
+        )
         u, v = d.fem_symbols(order=2)
-        xi, yi, _ = d.variable("interior", split=True)
-        xb, yb, _ = d.variable("boundary", split=True)
-        ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
-        jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0]).solve()
+        xi, yi, zi, _ = d.variable("interior", split=True)
+        xb, yb, zb, _ = d.variable("boundary", split=True)
+        ui, vi = u.bind(x=xi, y=yi, z=zi), v.bind(x=xi, y=yi, z=zi)
+        f = 3 * PI**2 * jno.np.sin(PI * xi) * jno.np.sin(PI * yi) * jno.np.sin(PI * zi)
+        fem = jno.fem([ui.x * vi.x + ui.y * vi.y + ui.z * vi.z - f * vi, u(xb, yb, zb) - 0.0])
+        sol = np.asarray(fem.solve(linear=jno.solve.lu(backend="host"))).ravel()
+        p = np.asarray(d._fem_native_dof_points)
+        ex = np.sin(PI * p[:, 0]) * np.sin(PI * p[:, 1]) * np.sin(PI * p[:, 2])
+        return float(np.sqrt(np.mean((sol - ex) ** 2)))
+
+    e2, e4 = err(2), err(4)
+    assert float(np.log2(e2 / e4)) > 2.8 and e4 < 1e-3
+
+
+def test_the_promoted_quad_mesh_has_the_interior_node():
+    """A P2 triangle has NO cell-interior node; a Q2 quad has one and a Q3 quad four. They are the
+    genuinely new topological case, and the coordinate dedup must neither merge nor duplicate them.
+    The node COUNT is the direct check: a Q{k} mesh of an n x n grid has exactly (k*n + 1)^2 nodes.
+    """
+    from jno.utils.solver.fem_native import _get_mesh
+
+    n = 4
+    d = jno.domain(constructor=Geometries.equi_distant_rect(nx=n, ny=n, cell="quad"), compute_mesh_connectivity=False)
+    for order, per_cell in ((2, 9), (3, 16)):
+        pts_p1, cells_p1, pts_f, cells_f = _get_mesh(d, 2, order)
+        assert cells_f.shape == (n * n, per_cell)
+        assert len(pts_f) == (order * n + 1) ** 2, "the dedup merged or duplicated nodes"
+        # exactly one node of each cell lies strictly inside it (Q2); four for Q3
+        v = pts_f[cells_f]
+        lo, hi = v.min(axis=1), v.max(axis=1)
+        strictly_inside = ((v > lo[:, None, :] + 1e-12) & (v < hi[:, None, :] - 1e-12)).all(axis=2)
+        assert strictly_inside.sum(axis=1).min() == (order - 1) ** 2
+
+
+@pytest.mark.parametrize("order", [1, 2, 3])
+def test_surface_terms_still_exact_at_higher_order(order):
+    """The facet tables tabulate the PARENT basis at the facet quadrature points, so they should be
+    degree-generic — a Q2 quad's edge carries three of its nine DOFs automatically. Checked by the
+    boundary measure, which is exact regardless of order."""
+    d = jno.domain(
+        constructor=Geometries.equi_distant_rect(x_range=(0.0, 2.0), nx=4, ny=4, cell="quad"),
+        compute_mesh_connectivity=False,
+    )
+    u, v = d.fem_symbols(order=order)
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y, 1.0 * v(xb, yb)])
+    np.testing.assert_allclose(float(np.abs(np.asarray(fem.b)).sum()), 6.0, rtol=1e-10)
 
 
 # ---------------------------------------------------------------------------------------- extremes

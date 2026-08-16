@@ -72,14 +72,22 @@ def _ref_hessian_from_tab(tab: np.ndarray, dim: int) -> np.ndarray:
     return H
 
 
-def lagrange_interp_points(dim: int, degree: int) -> np.ndarray:
-    """Reference interpolation points of the degree-``k`` Lagrange simplex, in basix DOF order
-    (vertices, then per-edge, per-face, interior nodes). :func:`fem_utils._promote_to_degree` maps these
-    through each cell's affine geometry to place the global P{k} mesh nodes; the order matches the basis
-    tabulated by :func:`lagrange_triangle` / :func:`lagrange_tet` (same builder)."""
+def lagrange_interp_points(dim: int, degree: int, cell_type: Optional[str] = None) -> np.ndarray:
+    """Reference interpolation points of the degree-``k`` Lagrange element, in basix DOF order
+    (vertices first, then per-edge, per-face, interior nodes).
+
+    :func:`fem_utils._promote_to_degree` maps these through each cell's geometry to place the global
+    P{k} / Q{k} mesh nodes, and the order matches the basis tabulated by :func:`lagrange_on` — the
+    same builder, which is what keeps the node positions and the DOF numbering from drifting apart.
+
+    ``cell_type`` names the cell; without it the dimension picks the simplex, which is what every
+    caller predating tensor-product cells means. Note a tensor-product cell has interpolation points
+    a simplex does not: a Q2 quadrilateral carries a cell-INTERIOR node (and a Q2 hexahedron a
+    face-interior one too), where a P2 triangle has none.
+    """
     from basix import CellType
 
-    cell = CellType.triangle if dim == 2 else CellType.tetrahedron
+    cell = basix_cell(cell_type)[0] if cell_type else (CellType.triangle if dim == 2 else CellType.tetrahedron)
     return np.asarray(_lagrange_basix(cell, degree).points)
 
 

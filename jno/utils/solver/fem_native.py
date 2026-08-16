@@ -193,6 +193,28 @@ def _basix_ordered(cells: np.ndarray, cell_type: str) -> np.ndarray:
     return cells if np.array_equal(perm, np.arange(len(perm))) else np.asarray(cells)[:, perm]
 
 
+def _refuse_nonconforming_promotion(domain, order: int) -> None:
+    """Refuse order > 1 on a ``Shape.regions(..., conforming=False)`` domain.
+
+    `_promote_to_degree` dedups synthesised nodes by physical COORDINATE, which is the right
+    conformity test for one body and the wrong one for two: a non-conforming interface is coincident
+    *on purpose*, so every higher-order node the promotion adds there is merged across the two bodies
+    and welds them. Measured on a two-body bar: 37 nodes referenced by BOTH bodies, all at the
+    interface. Harmless for a tie (it wanted continuity anyway) and wrong for contact, where those
+    DOFs can then never separate -- silent either way. See plans/p2-promotion-entity-keys.md for the
+    fix (key on the topological entity instead); refused until then. Shared by the simplex and
+    tensor-product promotion paths, since the dedup they run is the same one.
+    """
+    if any(_is_nonconforming_side(t) for t in (getattr(domain, "_interface_registry", {}) or {})):
+        raise NotImplementedError(
+            f"order-{order} elements on a Shape.regions(..., conforming=False) domain: the higher-order "
+            "node promotion deduplicates by coordinate, so it would silently WELD the two bodies at "
+            "every interface node it adds -- which a contact gap could then never open. Use order-1 "
+            "elements for a non-conforming interface, or Shape.curved() (which reads gmsh's nodes "
+            "instead of synthesising them, and is unaffected)."
+        )
+
+
 def _get_mesh(domain, dim: int, order: int):
     """P1 base mesh + optionally promoted P{order} mesh, both as NumPy arrays.
 
@@ -209,14 +231,17 @@ def _get_mesh(domain, dim: int, order: int):
     if cell_type in TENSOR_PRODUCT_CELLS:
         cells_p1 = np.asarray(domain.mesh.cells_dict[cell_type], dtype=np.int64)
         pts_all = np.asarray(domain.mesh.points)[:, :dim]
-        if order != 1:
-            raise NotImplementedError(
-                f"order-{order} Lagrange on a {cell_type} mesh: the higher-order node promotion places "
-                "nodes with BARYCENTRIC weights, which only describe a simplex. A tensor-product cell "
-                "needs its own geometry basis there. Use order=1 on this mesh, or a simplicial mesh "
-                f"(drop cell='{'quad' if dim == 2 else 'hex'}') for order > 1."
-            )
-        return pts_all, cells_p1, pts_all, _basix_ordered(cells_p1, cell_type)
+        cells_b = _basix_ordered(cells_p1, cell_type)  # the order a tabulated basis is written in
+        if order == 1:
+            return pts_all, cells_p1, pts_all, cells_b
+        _refuse_nonconforming_promotion(domain, order)
+        pts_f, cells_f = _promote_to_degree(pts_all, cells_b, lagrange_interp_points(dim, order, cell_type), cell_type)
+        # Both arrays share one id space, as on the curved path: `_promote_to_degree` keeps the
+        # original vertices at ids 0..nv-1, so the P1 connectivity still indexes `pts_f` correctly.
+        # That matters because the geometry gather reads the ASSEMBLY connectivity against `pts_p1`
+        # on a non-affine cell -- returning the vertex-only array here would index a Q{k}-wide
+        # connectivity into it.
+        return pts_f, cells_p1, pts_f, cells_f
     # meshio names the simplex cell block "triangle" (2D) / "tetra" (3D) -- distinct from the basix
     # CellType name "tetrahedron" the facet machinery uses.
     meshio_key = {1: "line", 2: "triangle"}.get(dim, "tetra")
@@ -254,14 +279,7 @@ def _get_mesh(domain, dim: int, order: int):
     # interface. Harmless for a tie (it wanted continuity anyway) but wrong for contact, where those
     # DOFs can then never separate -- and silent either way. See plans/p2-promotion-entity-keys.md for
     # the fix (key on the topological entity instead); refused until then.
-    if any(_is_nonconforming_side(t) for t in (getattr(domain, "_interface_registry", {}) or {})):
-        raise NotImplementedError(
-            f"P{order} elements on a Shape.regions(..., conforming=False) domain: the higher-order node "
-            "promotion deduplicates by coordinate, so it would silently WELD the two bodies at every "
-            "interface node it adds -- which a contact gap could then never open. Use order-1 elements "
-            "for a non-conforming interface, or Shape.curved() (which reads gmsh's nodes instead of "
-            "synthesising them, and is unaffected)."
-        )
+    _refuse_nonconforming_promotion(domain, order)
     if dim not in (1, 2, 3):
         raise NotImplementedError(f"Dimension {dim} not supported by native assembler.")
     # P{order} node mesh: place the element's reference interpolation points (basix DOF order) on each
