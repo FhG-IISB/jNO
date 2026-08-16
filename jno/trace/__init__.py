@@ -4668,6 +4668,26 @@ def cse(expr: Placeholder) -> Placeholder:
 # =============================================================================
 
 
+def _FUSABLE_SCHEME(scheme) -> bool:
+    """Whether two per-axis second derivatives under ``scheme`` may fold into one Laplacian node.
+
+    **Automatic differentiation**: yes -- one trace-Hessian evaluates the network once instead of
+    once per coordinate.
+
+    **Spectral**: yes, and it is where the fold matters most -- a fused Laplacian is a single
+    multiply by ``-(kx^2 + ky^2)`` off ONE forward transform, against a transform pair per axis
+    otherwise. It also keeps the documented house spelling (`u.xx + u.yy`) on the fast path rather
+    than making `u.laplacian(x, y)` the only efficient way to write it.
+
+    **Finite difference**: no, deliberately. ``:cotangent`` returns the WHOLE Laplacian for any
+    requested dimension, so folding two such nodes would double it.
+
+    Mixing families cannot happen regardless: the grouping key in :func:`fuse_laplacian` includes
+    the scheme string, so terms with different schemes never land in the same group.
+    """
+    return str(scheme).startswith(("automatic_differentiation", "spectral"))
+
+
 def _second_derivative_atom(node):
     """Recognise a sum of squared partials ``Σᵢ ∂²T/∂xᵢ²``, else return ``None``.
 
@@ -4691,7 +4711,7 @@ def _second_derivative_atom(node):
     # u.d2(v), or a Laplacian this pass (or the user) already built.
     if isinstance(node, Hessian) and node.trace:
         scheme = node.scheme
-        if not str(scheme).startswith("automatic_differentiation"):
+        if not _FUSABLE_SCHEME(scheme):
             return None
         return node.target, list(node.variables), scheme
 
@@ -4703,7 +4723,7 @@ def _second_derivative_atom(node):
         if node.scheme != inner.scheme:
             return None  # mixed AD modes between the two levels — leave alone
         scheme = node.scheme
-        if not str(scheme).startswith("automatic_differentiation"):
+        if not _FUSABLE_SCHEME(scheme):
             return None
         outer_var, inner_var = node.variables[0], inner.variables[0]
         if _coord_key(outer_var) is None or _coord_key(outer_var) != _coord_key(inner_var):

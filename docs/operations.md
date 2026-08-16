@@ -56,8 +56,61 @@ Vector-calculus helpers live on `jnn`: `jnn.jacobian`, `jnn.divergence`, `jnn.cu
 | `"finite_difference"` | ✅ | ✅ | Area-weighted; general unstructured meshes |
 | `"finite_difference:lsq"` / `:uniform` / `:inverse_distance"` | ✅ | ✅ | Least-squares / uniform / distance-weighted |
 | `"finite_difference:cotangent"` | — | ✅ | Cotangent Laplacian; **2D only** |
+| `"spectral"` | ✅ | ✅ | FFT along the grid axes; **uniform grid**, assumes periodicity |
+| `"spectral:cosine"` | ✅ | ✅ | Even extension instead — for fields with `u' = 0` at both ends |
 
-Set a project-wide default with `jno.setup(__file__, diff_type="forward", hessian_type="fwd-over-fwd")`.
+Set a project-wide default with `jno.setup(__file__, diff_type="spectral")` — `diff_type` takes
+either a whole scheme or an AD sub-mode (`"forward"` / `"reverse"`, its original meaning). A
+per-call `scheme=` always overrides it, which is how one term keeps finite differences while the
+run is spectral.
+
+#### Spectral differentiation
+
+On a uniform grid the derivative is a multiply in Fourier space, which is **exact** for a
+band-limited field rather than merely high order. Measured against the analytic result on a 17×17
+grid, same field, same grid:
+
+| | `d u/dx` | `∇²u` |
+|---|---|---|
+| `"spectral"` | `1.11e-14` | `9.10e-13` |
+| `"finite_difference"` | `1.60e-01` | `5.24e+01` |
+
+It also reaches where automatic differentiation **cannot**. An operator fed a *stored* field has no
+path from `x` to its output, so `u.laplacian(x, y)` under AD is identically `0.0` and a physics
+residual on it is silently satisfied by any network. The FFT works on the values along the grid
+axis instead, which is what makes a PINO residual possible:
+
+```python
+jno.setup(__file__, diff_type="spectral")
+
+d = jno.Shape.rect(0, 0, 1, 1, size=1/24).domain(structured=True)
+x, y, _ = d.variable("interior")
+d.variable("_f", forcing)
+_f = d.variable("_f")
+
+u   = net(_f).scalar.bind(x=x, y=y)
+res = u.xx + u.yy + _f                      # −∇²u = f, from physics alone
+crux = jno.core([res.mse])
+```
+
+The full Hessian is exactly symmetric (`|H_xy − H_yx| = 0`), because the multiplier `−k_a k_b` is
+symmetric in `(a, b)` — the two components are the same computation. A Laplacian takes one forward
+transform for all its terms, halving the transforms against separate per-axis second derivatives.
+
+!!! warning "Periodicity is your claim, and the grid must be uniform"
+
+    `"spectral"` assumes the field is periodic along every differentiated axis. On a non-periodic
+    field the implied extension has a jump and the derivative rings (Gibbs) — plausible-looking
+    numbers that are simply wrong. jNO does **not** check this: the only per-axis periodic flag it
+    records is a residue of whether a periodic FDM problem happened to be built earlier in the
+    process, so it is not a statement about your geometry.
+
+    `"spectral:cosine"` mirrors the field instead, and is exact when the **odd derivatives vanish at
+    both ends** (Neumann-like). That is narrower than "non-periodic": a ramp has `u' ≠ 0` at the
+    ends, so its mirrored extension has a kink and still rings — better by ~44×, but still `O(1)`.
+
+    Both need a **uniform** grid: `jno.Shape.rect(...).domain(structured=True)`, or any domain
+    carrying `_grid_shape`. Non-uniform spacing and unstructured meshes raise rather than guess.
 
 **Spell the Laplacian however reads best.** `u.xx + u.yy`, `u.d2(x) + u.d2(y)` and
 `u.laplacian(x, y)` describe the same operator, and `jno.core` compiles all three to the same
