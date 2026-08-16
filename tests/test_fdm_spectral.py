@@ -71,3 +71,73 @@ def test_an_explicit_ad_scheme_on_a_nodal_unknown_still_fails_loudly():
     It raises rather than returning zeros — unchanged by the scheme registry work."""
     with pytest.raises(Exception):
         _dirichlet_poisson(scheme="automatic_differentiation")
+
+
+class TestPeriodicProblem:
+    """Where spectral actually belongs — and the practical recipe: one scheme per DIRECTION.
+
+    MMS `-Δu = 5π² sin(2πx) sin(πy)`, periodic in x via the tie `u(left) - u(right)`, Dirichlet in y.
+    The x-direction is exactly the band-limited periodic case the FFT is exact on; the y-direction is
+    Dirichlet, where it rings. Choosing per term beats choosing one scheme for the whole residual.
+    """
+
+    def _run(self, sx=None, sy=None, size=0.08):
+        d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain(structured=True)
+        p = np.asarray(d.mesh_connectivity["points"])[:, :2]
+        x, y, _ = d.variable("interior", split=True)
+        xl, yl, _ = d.variable("left", split=True)
+        xr, yr, _ = d.variable("right", split=True)
+        xb, yb, _ = d.variable("bottom", split=True)
+        xt, yt, _ = d.variable("top", split=True)
+        u = d.unknown()
+        ui = u.bind(x=x, y=y)
+        f = 5 * np.pi**2 * jnn.sin(2 * np.pi * x) * jnn.sin(np.pi * y)
+        kx = {} if sx is None else {"scheme": sx}
+        ky = {} if sy is None else {"scheme": sy}
+        sol = np.asarray(
+            jno.fdm(
+                [
+                    -ui.d2(x, **kx) - ui.d2(y, **ky) - f,
+                    u(xl, yl) - u(xr, yr),
+                    u(xb, yb) - 0.0,
+                    u(xt, yt) - 0.0,
+                ]
+            ).solve()
+        ).reshape(-1)
+        exact = np.sin(2 * np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+        return float(np.linalg.norm(sol - exact) / np.linalg.norm(exact))
+
+    def test_spectral_in_the_periodic_direction_wins(self):
+        """The headline: spectral on x (periodic) + FD on y (Dirichlet) beats FD everywhere."""
+        all_fd = self._run()
+        mixed = self._run(sx="spectral", sy=None)
+        assert mixed < all_fd / 5, f"expected a clear win: all-FD {all_fd:.2e} vs mixed {mixed:.2e}"
+
+    def test_spectral_everywhere_is_worse_than_mixing(self):
+        """Applying it to the Dirichlet direction too gives back more than it gains."""
+        assert self._run(sx="spectral", sy="spectral") > self._run(sx="spectral", sy=None)
+
+    def test_the_periodic_tie_still_holds(self):
+        """Spectral must not break the wrap-around constraint the tie imposes."""
+        d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.08).domain(structured=True)
+        x, y, _ = d.variable("interior", split=True)
+        xl, yl, _ = d.variable("left", split=True)
+        xr, yr, _ = d.variable("right", split=True)
+        xb, yb, _ = d.variable("bottom", split=True)
+        xt, yt, _ = d.variable("top", split=True)
+        u = d.unknown()
+        ui = u.bind(x=x, y=y)
+        f = 5 * np.pi**2 * jnn.sin(2 * np.pi * x) * jnn.sin(np.pi * y)
+        sol = np.asarray(
+            jno.fdm(
+                [
+                    -ui.d2(x, scheme="spectral") - ui.d2(y) - f,
+                    u(xl, yl) - u(xr, yr),
+                    u(xb, yb) - 0.0,
+                    u(xt, yt) - 0.0,
+                ]
+            ).solve()
+        ).reshape(-1)
+        sx_n, sy_n = d.mesh_connectivity["grid"]["shape"]
+        grid = sol.reshape(sx_n, sy_n)
+        assert float(np.max(np.abs(grid[0, :] - grid[-1, :]))) < 1e-9

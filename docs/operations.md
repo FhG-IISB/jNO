@@ -112,6 +112,25 @@ transform for all its terms, halving the transforms against separate per-axis se
     Both need a **uniform** grid: `jno.Shape.rect(...).domain(structured=True)`, or any domain
     carrying `_grid_shape`. Non-uniform spacing and unstructured meshes raise rather than guess.
 
+**Choose the scheme per direction.** `jno.fdm` gets the spectral backend with no wiring, but it is
+not a blanket upgrade — a residual usually has different boundary behaviour along different axes.
+On `−∇²u = 5π² sin(2πx) sin(πy)`, periodic in `x` and Dirichlet in `y`:
+
+```python
+res = -ui.d2(x, scheme="spectral") - ui.d2(y) - f     # exact basis in x, stencil in y
+```
+
+| | rel-L2 |
+|---|---|
+| finite differences in both | `1.96e-02` |
+| spectral in both | `2.83e-02` |
+| **spectral in `x`, finite differences in `y`** | **`1.14e-03`** |
+
+Spectral applied to the Dirichlet direction gives back more than it gains, because `u′ ≠ 0` at those
+ends. Applied only where the geometry is genuinely periodic it is 17× better than the stencil
+everywhere. (For a Dirichlet direction the natural basis is a *sine* transform; JAX provides only
+DCT-2 and no DST, so that variant does not exist.)
+
 **Spell the Laplacian however reads best.** `u.xx + u.yy`, `u.d2(x) + u.d2(y)` and
 `u.laplacian(x, y)` describe the same operator, and `jno.core` compiles all three to the same
 single node: a trace pass folds a sum of squared partials over distinct coordinates into one
