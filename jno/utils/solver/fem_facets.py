@@ -46,6 +46,30 @@ _LOCAL_FACES_TET: Tuple[Tuple[int, int, int, int], ...] = (
     (0, 1, 2, 3),  # face 3: opposite vertex 3
 )
 
+# ---------------------------------------------------------------------------------------------
+# Tensor-product cells. These carry NO trailing apex entry: a simplex facet has exactly one
+# opposite vertex, and that is what orients it outward, but a quad edge or a hex face has none.
+# Facets of these cells are oriented away from the owning cell's CENTROID instead -- exact for a
+# convex cell, which every cell of a structured or recombined mesh is.
+#
+# Vertex numbering is meshio/VTK, which is what a mesh's `cells` array holds: quad is
+# 0(0,0) 1(1,0) 2(1,1) 3(0,1); hex is that bottom face followed by the matching top face. basix
+# numbers its reference cells lexicographically instead, so anything that tabulates a BASIS must
+# permute first -- these tables are topology, not basis.
+
+# (edge_node_a, edge_node_b) for each of the 4 quadrilateral edges, counterclockwise.
+_LOCAL_FACES_QUAD: Tuple[Tuple[int, int], ...] = ((0, 1), (1, 2), (2, 3), (3, 0))
+
+# The 4 nodes of each of the 6 hexahedron faces, each traversed consistently around its own plane.
+_LOCAL_FACES_HEX: Tuple[Tuple[int, int, int, int], ...] = (
+    (0, 3, 2, 1),  # z = 0
+    (4, 5, 6, 7),  # z = 1
+    (0, 1, 5, 4),  # y = 0
+    (1, 2, 6, 5),  # x = 1
+    (2, 3, 7, 6),  # y = 1
+    (3, 0, 4, 7),  # x = 0
+)
+
 
 class FacetConnectivity(NamedTuple):
     """Boundary facet connectivity for a P1 simplex mesh.
@@ -149,16 +173,36 @@ def boundary_face_set(cells: np.ndarray, cell_type: str = "triangle") -> np.ndar
 
 
 def _face_table(cell_type: str):
-    """``(local_faces, n_face_nodes)`` for a simplex cell type, under either naming."""
+    """``(local_faces, n_face_nodes)`` for a cell type, under either naming.
+
+    Simplex tables carry the facet's opposite vertex as a trailing entry; tensor-product tables do
+    not (there is no single opposite vertex) -- ask :func:`has_facet_apex` before reading one.
+    """
     if cell_type in ("interval", "line"):
         return _LOCAL_FACES_INT, 1
     if cell_type in ("triangle", "tri"):
         return _LOCAL_FACES_TRI, 2
     if cell_type in ("tetrahedron", "tetra", "tet"):
         return _LOCAL_FACES_TET, 3
+    if cell_type in ("quad", "quadrilateral"):
+        return _LOCAL_FACES_QUAD, 2
+    if cell_type in ("hexahedron", "hex"):
+        return _LOCAL_FACES_HEX, 4
     raise NotImplementedError(
-        f"build_facet_connectivity: cell_type {cell_type!r} not supported (interval / triangle / tetrahedron only)."
+        f"build_facet_connectivity: cell_type {cell_type!r} not supported "
+        "(interval / triangle / tetrahedron / quadrilateral / hexahedron only)."
     )
+
+
+def has_facet_apex(cell_type: str) -> bool:
+    """Whether ``cell_type``'s facet table carries an opposite vertex to orient the facet outward.
+
+    True for simplices, False for tensor-product cells. A caller that needs an outward direction
+    uses the apex when this is True and the owning cell's centroid when it is False; the centroid
+    is exact for any convex cell and agrees with the apex on simplices, so it is a fallback in
+    coverage only, not in accuracy.
+    """
+    return cell_type not in ("quad", "quadrilateral", "hexahedron", "hex")
 
 
 def build_facet_connectivity(cells: np.ndarray, cell_type: str = "triangle") -> FacetConnectivity:

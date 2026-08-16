@@ -581,6 +581,14 @@ class domain(MeshIOMixin):
         self._interface_registry: Dict[str, Dict[str, Any]] = {}
         self._tag_edges: Dict[str, np.ndarray] = {}
         self._tag_triangles: Dict[str, np.ndarray] = {}
+        # A tag's facets, by node count: 2 -> _tag_edges, 3 -> _tag_triangles, 4 -> _tag_quads
+        # (the boundary face of a hexahedron). Read them through `tag_facets`, which picks the
+        # store the mesh actually filled instead of guessing it from the dimension.
+        # 4-node cells: a quadrilateral. In 2-D that is a VOLUME cell (the mesh itself);
+        # in 3-D it is a hexahedron's boundary face.
+        self._tag_quads: Dict[str, np.ndarray] = {}
+        # Node-count -> store, in the order a facet lookup should try them.
+        self._tag_facet_stores = ("_tag_edges", "_tag_triangles", "_tag_quads")
         self._boundary_regions: Dict[str, BoundaryRegion] = {}
         # User-defined predicate regions from domain.tag(name, where): name -> spatial predicate.
         # Consulted by _make_tag_location_fn (FEM boundary location-fn, auto-restricted to the
@@ -2277,8 +2285,30 @@ class domain(MeshIOMixin):
         self.log.info(f"Re-meshed periodic (conforming) for face pairs {sorted(tuple(sorted(p)) for p in pairs)}")
         return True
 
+    def tag_facets(self, name: str):
+        """A tag's boundary facets as ``(n_facets, n_nodes_per_facet)`` node ids, or ``None``.
+
+        The facets of a tag live in one of three stores according to how many nodes they have:
+        2 (an edge), 3 (a triangular face), or 4 (a hexahedron's quadrilateral face). Which one
+        depends on the *cell* the mesh is built from, not on the dimension — a 3-D mesh has
+        triangular faces if it is tetrahedral and quadrilateral ones if it is hexahedral — so
+        callers ask here instead of picking a store by dimension, which is what silently returned
+        nothing for a hexahedral mesh.
+        """
+        for store in getattr(self, "_tag_facet_stores", ("_tag_edges", "_tag_triangles", "_tag_quads")):
+            facets = (getattr(self, store, {}) or {}).get(name)
+            if facets is not None and len(facets):
+                return np.asarray(facets)
+        return None
+
     def _build_simplex_pools(self) -> None:
         """Populate ``self._simplex_pools`` from ``_tag_edges`` / ``_tag_triangles``.
+
+        (Tags whose facets are quadrilaterals — a hexahedral mesh's boundary — get no pool: the
+        pools are barycentric, and sampling a quad needs a bilinear map. They are refused where
+        they are used rather than silently sampled as if they were triangles.)
+
+        See also :meth:`tag_facets`, which returns a tag's facets whatever their node count.
 
         Runs after ``_extract_points_from_mesh`` so the per-tag cell-membership
         tables are filled in.  For each mesh tag we materialise a
@@ -2361,6 +2391,7 @@ class domain(MeshIOMixin):
         self.tag_indices = {}
         self._tag_edges = {}
         self._tag_triangles = {}
+        self._tag_quads = {}
         self._boundary_regions = {}
 
         if self.dimension > 1:
@@ -2406,13 +2437,18 @@ class domain(MeshIOMixin):
                 tag_point_blocks: List[np.ndarray] = []
                 tag_edge_blocks: List[np.ndarray] = []
                 tag_tri_blocks: List[np.ndarray] = []
+                tag_quad_blocks: List[np.ndarray] = []  # a hexahedron's boundary face
                 # A tag backed by volume cells (block 0 = the spatial-fill element for this
                 # dimension) is a region/interior, never a boundary — so it must not pick up PCA
                 # "boundary" normals (that would mislabel an interior sub-region as a boundary tag).
                 # Boundary tags live in the facet block (block 1); point clouds (block 0 = vertex)
                 # are not volume-filling, so they still get PCA normals.
-                _vol_elem = {1: "line", 2: "triangle", 3: "tetra"}.get(self.dimension)
-                block0_is_volume = bool(mesh.cells) and _base_cell_type(mesh.cells[0].type) == _vol_elem
+                # A dimension has more than one space-filling cell: 2-D is a triangle OR a quad,
+                # 3-D a tet OR a hexahedron. Testing against a single simplex name made every cell
+                # of a tensor-product mesh look like a facet, so its volume region was never
+                # recognised as one.
+                _vol_elems = {1: ("line",), 2: ("triangle", "quad"), 3: ("tetra", "hexahedron")}.get(self.dimension, ())
+                block0_is_volume = bool(mesh.cells) and _base_cell_type(mesh.cells[0].type) in _vol_elems
                 has_volume_cells = False
 
                 if isinstance(cell_data, dict):
@@ -2428,7 +2464,7 @@ class domain(MeshIOMixin):
                                     if len(sel):  # vertex data contains the point index
                                         tag_point_blocks.append(sel.reshape(len(sel), -1)[:, 0])
                         else:
-                            if block0_is_volume and _base_cell_type(cell_type) == _vol_elem and len(indices) > 0:
+                            if block0_is_volume and _base_cell_type(cell_type) in _vol_elems and len(indices) > 0:
                                 has_volume_cells = True
                             for b_idx, cell_block in enumerate(mesh.cells):
                                 if cell_block.type == cell_type:
@@ -2443,6 +2479,8 @@ class domain(MeshIOMixin):
                                             tag_edge_blocks.append(sel[:, :2])
                                         elif _bt == "triangle":
                                             tag_tri_blocks.append(sel[:, :3])
+                                        elif _bt == "quad":
+                                            tag_quad_blocks.append(sel[:, :4])
                 else:
                     # Handle list-style cell_data. meshio cell-set indices
                     # can be either block-local (manually written `.inp`
@@ -2478,12 +2516,17 @@ class domain(MeshIOMixin):
                                         tag_edge_blocks.append(sel[:, :2])
                                     elif _bt == "triangle":
                                         tag_tri_blocks.append(sel[:, :3])
+                                    elif _bt == "quad":
+                                        tag_quad_blocks.append(sel[:, :4])
 
                 tag_edges = np.concatenate(tag_edge_blocks, axis=0) if tag_edge_blocks else np.zeros((0, 2), int)
                 tag_tris = np.concatenate(tag_tri_blocks, axis=0) if tag_tri_blocks else np.zeros((0, 3), int)
+                tag_quads = np.concatenate(tag_quad_blocks, axis=0) if tag_quad_blocks else np.zeros((0, 4), int)
                 # np.unique both de-duplicates and sorts, which is what `sorted(set(...))` did
                 tag_points = np.unique(np.concatenate(tag_point_blocks)) if tag_point_blocks else np.zeros(0, int)
 
+                if len(tag_quads):
+                    self._tag_quads[name] = np.asarray(tag_quads, dtype=int)
                 if len(tag_tris):
                     self._tag_triangles[name] = np.asarray(tag_tris, dtype=int)
                 if len(tag_edges):
