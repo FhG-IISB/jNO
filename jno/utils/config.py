@@ -180,6 +180,14 @@ def apply_ad_mode_defaults(diff_type: str | None = None, hessian_type: str | Non
 
     cfg = get_config().get("jno", {})
     diff = diff_type if diff_type is not None else cfg.get("diff_type")
+    # `diff_type` names EITHER an AD sub-mode ("forward"/"reverse", the historical meaning) or a
+    # whole scheme ("spectral", "finite_difference:cotangent"). The latter sets the run default for
+    # every unqualified derivative; the former keeps its original meaning.
+    if diff is not None and diff not in ("forward", "reverse"):
+        from .schemes import set_default_scheme
+
+        set_default_scheme(diff)
+        diff = None
     hess = hessian_type if hessian_type is not None else cfg.get("hessian_type")
     if diff is not None:
         _ad_mode.set_ad_mode(diff)

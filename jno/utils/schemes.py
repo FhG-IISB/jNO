@@ -60,3 +60,33 @@ def require_family(scheme: str, expected: str) -> str:
             "The scheme was routed to the wrong backend."
         )
     return scheme.split(":", 1)[1].strip() if ":" in scheme else ""
+
+# ── the run-level default ───────────────────────────────────────────────────────────────────────
+# The BARE family string ``"automatic_differentiation"`` already meant "use whatever is configured"
+# for the AD sub-mode (`parse_ad_scheme` returns `get_ad_mode()` when there is no suffix). This
+# extends the same meaning one level up, to the family -- so `jno.setup(diff_type="spectral")` makes
+# every unqualified derivative in the run spectral, and nothing at ~40 call sites has to change.
+#
+# To pin a family explicitly, give it a submethod (`"automatic_differentiation:reverse"`), which is
+# already how the sub-mode is pinned.
+_DEFAULT_SCHEME: str = "automatic_differentiation"
+
+
+def set_default_scheme(scheme: str) -> None:
+    """Set the run-level default differentiation scheme (``jno.setup(diff_type=...)``)."""
+    global _DEFAULT_SCHEME
+    scheme_family(scheme)  # validate, and fail loud on a typo
+    _DEFAULT_SCHEME = scheme
+
+
+def get_default_scheme() -> str:
+    """The run-level default differentiation scheme."""
+    return _DEFAULT_SCHEME
+
+
+def resolve_scheme(scheme: str) -> str:
+    """``scheme`` with a bare ``"automatic_differentiation"`` replaced by the configured default.
+
+    Anything carrying a submethod is an explicit request and passes through untouched.
+    """
+    return _DEFAULT_SCHEME if scheme == "automatic_differentiation" else scheme

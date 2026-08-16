@@ -131,3 +131,63 @@ class TestEvaluatorDispatchFailsLoud:
             TraceEvaluator({}).evaluate(
                 (u.d(x, scheme="wavelet") + 1.0), {"xy": jnp.ones((6, 2))}, {}, key=jax.random.PRNGKey(0)
             )
+
+
+class TestRunLevelDefault:
+    """`jno.setup(diff_type=...)` declares the scheme once, for the whole run.
+
+    A BARE `"automatic_differentiation"` already meant "use what is configured" for the AD sub-mode;
+    this is the same meaning one level up, at the family. So the ~40 call sites that default to that
+    string need no change, and a scheme carrying a submethod stays an explicit request.
+    """
+
+    def setup_method(self):
+        from jno.utils.schemes import get_default_scheme
+
+        self._prev = get_default_scheme()
+
+    def teardown_method(self):
+        from jno.utils.schemes import set_default_scheme
+
+        set_default_scheme(self._prev)
+
+    def test_default_is_automatic_differentiation(self):
+        from jno.utils.schemes import get_default_scheme, resolve_scheme
+
+        assert get_default_scheme() == "automatic_differentiation"
+        assert resolve_scheme("automatic_differentiation") == "automatic_differentiation"
+
+    def test_setting_a_family_redirects_the_bare_string(self):
+        from jno.utils.schemes import resolve_scheme, set_default_scheme
+
+        set_default_scheme("spectral")
+        assert resolve_scheme("automatic_differentiation") == "spectral"
+
+    def test_an_explicit_request_is_never_overridden(self):
+        from jno.utils.schemes import resolve_scheme, set_default_scheme
+
+        set_default_scheme("spectral")
+        for explicit in ("automatic_differentiation:reverse", "finite_difference", "finite_difference:cotangent"):
+            assert resolve_scheme(explicit) == explicit
+
+    def test_a_bad_default_fails_at_declaration_not_at_use(self):
+        from jno.utils.schemes import set_default_scheme
+
+        with pytest.raises(ValueError, match="Unknown differentiation scheme family"):
+            set_default_scheme("wavelet")
+
+    def test_setup_accepts_a_scheme_and_an_ad_submode(self):
+        import jno.utils.config as cfg
+        from jno.utils.ad_mode import get_ad_mode
+        from jno.utils.schemes import get_default_scheme
+
+        cfg.apply_ad_mode_defaults(diff_type="spectral")
+        assert get_default_scheme() == "spectral"
+
+        prev_mode = get_ad_mode()
+        cfg.apply_ad_mode_defaults(diff_type="forward")  # the historical meaning still works
+        assert get_ad_mode() == "forward"
+        assert get_default_scheme() == "spectral", "an AD sub-mode must not clobber the family default"
+        from jno.utils.ad_mode import set_ad_mode
+
+        set_ad_mode(prev_mode)

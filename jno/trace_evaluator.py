@@ -60,7 +60,7 @@ from .differential_operators import DifferentialOperators
 from .integration_operators import IntegrationOperators
 from .utils import get_logger
 from .utils.ad_mode import ad_fn, parse_ad_scheme, parse_hessian_scheme
-from .utils.schemes import scheme_family
+from .utils.schemes import resolve_scheme, scheme_family
 
 
 def _uniform_grid_spec(domain, n_values: int):
@@ -1203,7 +1203,9 @@ class TraceEvaluator:
         """
         target = expr.target
         variables = expr.variables
-        scheme = expr.scheme
+        # A bare 'automatic_differentiation' means 'whatever the run configured'
+        # (jno.setup(diff_type=...)); an explicit family:submethod passes through.
+        scheme = resolve_scheme(expr.scheme)
         # A FrozenField is known nodal values on a mesh — there is no analytic coordinate-function to
         # auto-differentiate, so its spatial gradient is the FD-over-mesh gradient of those values.
         # Force FD only for AUTOMATIC differentiation, which is what is meaningless on stored nodal
@@ -1757,7 +1759,9 @@ class TraceEvaluator:
         """
         target = expr.target
         variables = expr.variables
-        scheme = expr.scheme
+        # A bare 'automatic_differentiation' means 'whatever the run configured'
+        # (jno.setup(diff_type=...)); an explicit family:submethod passes through.
+        scheme = resolve_scheme(expr.scheme)
         compute_trace = getattr(expr, "trace", False)
 
         first_var = variables[0]
