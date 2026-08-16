@@ -695,7 +695,7 @@ cells: the map makes the integrand rational, so no rule is exact.
 **Measured coverage.** Every row below was run on a tensor-product mesh *and* on the simplex mesh of
 the same grid, so an API mistake could not be mistaken for a limitation. Working on both quads and
 hexes: steady linear, Neumann / surface terms, nonlinear (Newton), **vector fields (elasticity)**,
-coupled multifield at equal order, transient marches, runtime parameters differentiated with
+coupled multifield including **Taylor-Hood Q2/Q1**, transient marches, runtime parameters differentiated with
 `jax.grad`, `u.bounds`, `by_region`, `by_tag`, eigensolves, `fem.eval` readout, and the direct
 solver slots. Periodic ties work on quads; on hexes they refuse (below).
 

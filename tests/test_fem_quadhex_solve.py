@@ -653,3 +653,43 @@ def test_a_periodic_tie_across_a_hex_facet_refuses_by_name():
     f = jno.np.sin(2 * PI * xi) * jno.np.sin(2 * PI * yi)
     with pytest.raises(NotImplementedError, match="HEXAHEDRAL facet"):
         jno.fem([ui.x * vi.x + ui.y * vi.y + ui.z * vi.z + 1.0 * ui * vi - f * vi, u(*cl) - u(*cr)]).solve()
+
+
+def test_taylor_hood_q2_q1_stokes_on_quads():
+    """Mixed element ORDERS on one quad mesh — Q2 velocity over Q1 pressure.
+
+    This works for the reason the promotion was written: it keeps the original vertices at ids
+    0..nv-1, so a degree-1 field on a degree-k mesh is exactly the leading vertex block. That held
+    for P2/P1 on simplices and carries over unchanged, because basix puts vertices first on a
+    quadrilateral too. Checked against the triangulation of the same grid, which has the same
+    number of DOFs.
+    """
+    inner_, grad, trace = jno.np.inner, jno.np.grad, jno.np.trace
+
+    def stokes(cell):
+        kw = {"cell": cell} if cell else {}
+        d = jno.domain(
+            constructor=Geometries.equi_distant_rect(x_range=(0.0, 4.0), y_range=(0.0, 1.0), nx=12, ny=4, **kw),
+            compute_mesh_connectivity=False,
+        )
+        u, w = d.fem_symbols(value_shape=(2,), names=("u", "w"), order=2)
+        p, q = d.fem_symbols(names=("p", "q"), order=1)
+        xi, yi, _ = d.variable("interior", split=True)
+        xb, yb, _ = d.variable("boundary", split=True)
+        gu, gw = grad(u, [xi, yi]), grad(w, [xi, yi])
+        pp, qq = p.bind(x=xi, y=yi), q.bind(x=xi, y=yi)
+        fem = jno.fem(
+            [
+                1.0 * inner_(gu, gw, n_contract=2) - pp * trace(gw),
+                -qq * trace(gu),
+                u(xb, yb)[0] - yb * (1 - yb),
+                u(xb, yb)[1] - 0.0,
+                p.pin(),
+            ]
+        )
+        return np.asarray(fem.solve(linear=jno.solve.lu(backend="host")))
+
+    s_quad, s_tri = stokes("quad"), stokes(None)
+    assert s_quad.size == s_tri.size, "the mixed-order spaces differ in size between the two cells"
+    assert np.isfinite(s_quad).all()
+    np.testing.assert_allclose(np.abs(s_quad).max(), np.abs(s_tri).max(), rtol=1e-6)
