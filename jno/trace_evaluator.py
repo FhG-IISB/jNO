@@ -115,6 +115,54 @@ def _uniform_grid_spec(domain, n_values: int):
     return shape, spacing
 
 
+def _spectral_second_moments(values_flat, shape, spacing, pairs, *, trace: bool):
+    """Second derivatives along grid axes, from **one** transform pair.
+
+    ``pairs`` is the list of ``(a, b)`` axis pairs wanted. With ``trace=True`` the diagonal is summed
+    into the Laplacian, which is a single multiply by ``-(kx^2 + ky^2 + ...)`` -- the reason a
+    spectral Laplacian is cheap where a stencil needs a pass per axis and automatic differentiation
+    needs a full Hessian per point.
+
+    Same endpoint convention as :func:`_spectral_diff`: the duplicated periodic node is dropped on
+    every transformed axis and re-attached afterwards.
+    """
+    was_real = not jnp.iscomplexobj(values_flat)
+    u = jnp.asarray(values_flat).reshape(shape)
+    axes = tuple(sorted({int(a) for pair in pairs for a in pair}))
+
+    sl = [slice(None)] * len(shape)
+    for a in axes:
+        sl[a] = slice(0, -1)
+    u = u[tuple(sl)]
+
+    def _k(a, *, odd: bool):
+        n = u.shape[a]
+        k = 2.0 * jnp.pi * jnp.fft.fftfreq(n, d=spacing[a])
+        if odd and n % 2 == 0:
+            k = k.at[n // 2].set(0.0)  # Nyquist has no well-defined odd derivative
+        return k.reshape([n if i == a else 1 for i in range(len(shape))])
+
+    uh = jnp.fft.fftn(u, axes=axes)
+
+    def _restore(arr):
+        for a in axes:
+            arr = jnp.concatenate([arr, jnp.take(arr, jnp.array([0]), axis=a)], axis=a)
+        return arr
+
+    if trace:
+        mult = sum(-(_k(a, odd=False) ** 2) for a, _ in pairs)
+        out = jnp.fft.ifftn(mult * uh, axes=axes)
+        out = out.real if was_real else out
+        return _restore(out).reshape(-1)
+
+    comps = []
+    for a, b in pairs:
+        mult = -(_k(a, odd=False) ** 2) if a == b else -(_k(a, odd=True) * _k(b, odd=True))
+        o = jnp.fft.ifftn(mult * uh, axes=axes)
+        comps.append(_restore(o.real if was_real else o).reshape(-1))
+    return comps
+
+
 def _spectral_diff(values_flat, shape, spacing, axis: int, order: int):
     """``d^order/dx_axis^order`` of a flat nodal field, via the FFT along that grid axis.
 
@@ -1831,6 +1879,57 @@ class TraceEvaluator:
                         return hess_full.reshape(*image_shape[:-1], n_channels, n, n)
                     return hess_full.reshape(*image_shape[:-1], n, n)
                 return self._map_mesh_to_sampled(mesh_points, points, hess_full)
+
+        elif family == "spectral":
+            domain = bound_var._domain
+            if domain is None or getattr(domain, "mesh_connectivity", None) is None:
+                raise ValueError("scheme='spectral' requires a domain with mesh connectivity.")
+            mesh_points = jnp.array(domain.mesh_connectivity["points"])
+            N_mesh = mesh_points.shape[0]
+            u_full = self._target_on_mesh(target, tag, mesh_points, ctx)
+
+            u_squeezed = u_full.squeeze(-1) if (u_full.ndim > 1 and u_full.shape[-1] == 1) else u_full
+            image_shape = None
+            n_channels = 1
+            if u_squeezed.ndim > 1 and u_squeezed.size == N_mesh:
+                image_shape, u_flat = u_full.shape, u_squeezed.reshape(N_mesh)
+            elif u_full.ndim > 2 and int(np.prod(u_full.shape[:-1])) == N_mesh:
+                image_shape, n_channels = u_full.shape, u_full.shape[-1]
+                u_flat = u_full.reshape(N_mesh, n_channels)
+            else:
+                u_flat = u_squeezed if u_squeezed.ndim == 1 else u_squeezed.ravel()
+
+            g_shape, g_spacing = _uniform_grid_spec(domain, N_mesh)
+
+            if compute_trace:
+                pairs = [(d, d) for d in dims]
+
+                def _lap_c(u_1d):
+                    return _spectral_second_moments(u_1d, g_shape, g_spacing, pairs, trace=True)
+
+                lap_full = jax.vmap(_lap_c)(u_flat.T).T if (image_shape is not None and n_channels > 1) else _lap_c(u_flat)
+                if image_shape is not None:
+                    return lap_full.reshape(image_shape)
+                if points is not None:
+                    result = self._map_mesh_to_sampled(mesh_points, points, lap_full)
+                    return result[:, jnp.newaxis] if result.ndim == 1 else result
+                return lap_full[:, jnp.newaxis] if lap_full.ndim == 1 else lap_full
+
+            pairs = [(vi_dim, vj_dim) for _i, vi_dim, _j, vj_dim in var_dims]
+
+            def _hess_c(u_1d):
+                comps = _spectral_second_moments(u_1d, g_shape, g_spacing, pairs, trace=False)
+                return jnp.stack(comps, axis=-1).reshape(-1, n, n)
+
+            if image_shape is not None and n_channels > 1:
+                hess_full = jnp.moveaxis(jax.vmap(_hess_c)(u_flat.T), 0, 1)
+            else:
+                hess_full = _hess_c(u_flat)
+            if image_shape is not None:
+                if n_channels > 1:
+                    return hess_full.reshape(*image_shape[:-1], n_channels, n, n)
+                return hess_full.reshape(*image_shape[:-1], n, n)
+            return self._map_mesh_to_sampled(mesh_points, points, hess_full)
 
         elif family == "automatic_differentiation":
             evaluator_self = self

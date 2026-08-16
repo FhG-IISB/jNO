@@ -136,3 +136,83 @@ class TestDocumentedLimitation:
         u = x  # ramp: the periodic extension has a jump at the seam
         err = np.abs(np.asarray(_spectral_diff(u, shape, spacing, 0, 1)) - 1.0)
         assert err.max() > 1.0, "a non-periodic field should ring — if it does not, this test is stale"
+
+
+class TestSecondDerivatives:
+    def _field(self, n=16):
+        _, shape, spacing, P = _grid(n=n)
+        x, y = P[:, 0], P[:, 1]
+        u = np.sin(2 * np.pi * x) * np.cos(4 * np.pi * y)
+        return shape, spacing, P, u
+
+    def test_laplacian_is_exact(self):
+        from jno.trace_evaluator import _spectral_second_moments
+
+        shape, spacing, _, u = self._field()
+        analytic = -((2 * np.pi) ** 2 + (4 * np.pi) ** 2) * u
+        got = np.asarray(_spectral_second_moments(u, shape, spacing, [(0, 0), (1, 1)], trace=True))
+        assert np.abs(got - analytic).max() < 1e-9
+
+    def test_laplacian_beats_finite_differences_by_orders(self):
+        from jno.trace_evaluator import _spectral_second_moments
+
+        d, shape, spacing, P = _grid()
+        x, y = P[:, 0], P[:, 1]
+        u = np.sin(2 * np.pi * x) * np.cos(4 * np.pi * y)
+        analytic = -((2 * np.pi) ** 2 + (4 * np.pi) ** 2) * u
+        spec = np.abs(np.asarray(_spectral_second_moments(u, shape, spacing, [(0, 0), (1, 1)], trace=True)) - analytic).max()
+        fd = np.abs(
+            np.asarray(
+                D.compute_fd_laplacian_2d_simple(
+                    u, P, np.asarray(d.mesh_connectivity["triangles"]), (0, 1), grid=d.mesh_connectivity["grid"]
+                )
+            )
+            - analytic
+        ).max()
+        assert spec < fd / 1e6, f"spectral {spec:.2e} vs FD {fd:.2e}"
+
+    def test_mixed_partial_is_exact(self):
+        from jno.trace_evaluator import _spectral_second_moments
+
+        shape, spacing, P, u = self._field()
+        x, y = P[:, 0], P[:, 1]
+        uxy = -8 * np.pi**2 * np.cos(2 * np.pi * x) * np.sin(4 * np.pi * y)
+        comps = _spectral_second_moments(u, shape, spacing, [(0, 0), (0, 1), (1, 0), (1, 1)], trace=False)
+        assert np.abs(np.asarray(comps[1]) - uxy).max() < 1e-9
+
+    def test_hessian_is_exactly_symmetric(self):
+        """The multiplier -k_a k_b is symmetric in (a, b), so this is structural, not approximate."""
+        from jno.trace_evaluator import _spectral_second_moments
+
+        shape, spacing, _, u = self._field()
+        c = _spectral_second_moments(u, shape, spacing, [(0, 0), (0, 1), (1, 0), (1, 1)], trace=False)
+        np.testing.assert_array_equal(np.asarray(c[1]), np.asarray(c[2]))
+
+    def test_fusing_the_laplacian_halves_the_transform_count(self):
+        """The cost argument, measured on the jaxpr rather than asserted.
+
+        `fftn` over d axes lowers to d transforms each way, so this is a 2x saving in 2-D, not the
+        literal "one pair" the design sketch claimed.
+        """
+        from jno.trace_evaluator import _spectral_diff, _spectral_second_moments
+
+        _, shape, spacing, P = _grid(n=8)
+        u = P[:, 0]
+
+        def count(f):
+            return str(jax.make_jaxpr(f)(u)).count("fft")
+
+        fused = count(lambda z: _spectral_second_moments(z, shape, spacing, [(0, 0), (1, 1)], trace=True))
+        apart = count(lambda z: _spectral_diff(z, shape, spacing, 0, 2) + _spectral_diff(z, shape, spacing, 1, 2))
+        assert fused * 2 == apart, f"fused {fused}, separate {apart}"
+
+    def test_three_dimensional_laplacian(self):
+        from jno.trace_evaluator import _spectral_second_moments, _uniform_grid_spec
+
+        d = jno.domain(jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=1 / 6), structured=True)
+        shape, spacing = _uniform_grid_spec(d, d.mesh_connectivity["points"].shape[0])
+        P = np.asarray(d.mesh_connectivity["points"])[:, :3]
+        u = np.sin(2 * np.pi * P[:, 0]) * np.sin(2 * np.pi * P[:, 1]) * np.sin(2 * np.pi * P[:, 2])
+        analytic = -3 * (2 * np.pi) ** 2 * u
+        got = np.asarray(_spectral_second_moments(u, shape, spacing, [(0, 0), (1, 1), (2, 2)], trace=True))
+        assert np.abs(got - analytic).max() < 1e-8
