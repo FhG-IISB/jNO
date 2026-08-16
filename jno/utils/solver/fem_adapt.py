@@ -181,6 +181,7 @@ def remesh_with_mmg(
         return _remesh_line_1d(domain, vertex_size, hmin=hmin, hmax=hmax, hgrad=hgrad, copy=copy)
     if dim not in (2, 3):
         raise NotImplementedError(f"remesh_with_mmg supports 1D line and 2D/3D simplicial meshes; got dimension {dim}.")
+    _require_simplex(domain, dim, "h-adaptive remeshing (mmg)")
 
     import mmgpy  # lazy: optional dependency, only needed for adaptive refinement
 
@@ -1017,6 +1018,26 @@ def zz_error_indicators(domain: Any, u_vertex: np.ndarray) -> tuple[np.ndarray, 
     return eta, float(np.sqrt(eta2.sum()))
 
 
+def _require_simplex(domain, dim: int, what: str) -> None:
+    """Refuse a simplex-only adaptive path on a quad/hex mesh, by NAME.
+
+    Both halves of adaptivity are barycentric at heart: the recovery estimator differentiates P1
+    shape functions (constant per cell, which a bilinear cell's are not), and mmg adapts triangles
+    and tetrahedra. Neither generalises by setting a flag -- conforming quad/hex refinement is a
+    different algorithm (templates, or an octree with hanging nodes, a concept jNO has nowhere).
+    Without this the mesh's missing simplex block surfaced as a bare ``KeyError: 'triangle'``.
+    """
+    cd = domain.mesh.cells_dict
+    if _simplex_cell_key(dim) in cd:
+        return
+    present = sorted(k for k in cd if k not in ("vertex", "line"))
+    raise NotImplementedError(
+        f"{what} needs a simplicial mesh; this {dim}-D mesh carries {present} cells. Conforming "
+        "quad/hex refinement is a different algorithm, not a setting -- adapt on a simplicial mesh, "
+        "or refine a structured grid by rebuilding it at a finer nx/ny."
+    )
+
+
 def _p1_element_gradients(domain: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Constant P1 shape-function gradients per simplex, computed geometrically.
 
@@ -1027,6 +1048,7 @@ def _p1_element_gradients(domain: Any) -> tuple[np.ndarray, np.ndarray, np.ndarr
     and 3D without the native FEM context.
     """
     dim = int(domain.dimension)
+    _require_simplex(domain, dim, "the recovery error estimator")
     pts = np.asarray(domain.mesh.points)[:, :dim].astype(np.float64)
     cells = np.asarray(domain.mesh.cells_dict[_simplex_cell_key(dim)])
     v = pts[cells]  # (n_cells, dim+1, dim)

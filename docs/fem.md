@@ -682,12 +682,18 @@ cells: the map makes the integrand rational, so no rule is exact.
 
 **Scope — what is not supported yet**, each refusing by name rather than approximating:
 
+**Measured coverage.** Every row below was run on a quad mesh *and* on a triangle mesh of the same
+grid, so an API mistake could not be mistaken for a limitation. Working: steady linear, Neumann /
+surface terms, nonlinear (Newton), **vector fields (elasticity)**, coupled multifield at equal
+order, transient marches, runtime parameters differentiated with `jax.grad`, `u.bounds`,
+`by_region`, `by_tag`, periodic ties, eigensolves, `fem.eval` readout, and the direct solver slots.
+
 | not supported on quad/hex | why |
 |---|---|
+| **h-adaptive remeshing** (`adapt=`) | mmg adapts simplices, and the recovery estimator differentiates P1 shape functions (constant per cell, which a bilinear cell's are not). Conforming quad/hex refinement is a different algorithm — templates, or an octree with hanging nodes |
 | surface / boundary integrals **on hexahedra** (they work on quads) | a hexahedron's facet is a bilinear *surface*, so its normal and area element vary across it and need Nanson's formula per quadrature point; a quad's facet is a straight edge, so one normal per facet is exact |
 | `order > 1` (Q2, Q3) | higher-order node promotion places nodes by **barycentric** weights, which only describe a simplex |
 | 4th-order forms (plates, phase-field) | the physical-Hessian push-forward assumes an affine cell — the same refusal curved simplices already carry |
-| h-adaptive remeshing (`adapt=`) | mmg is a simplex remesher; conforming quad/hex refinement is a different algorithm |
 | non-nodal families (N1E, RT, Argyris, Morley) | Argyris and Morley are *defined* on triangles; the quad analogues (RTCF/NCE, Bogner–Fox–Schmit) are different elements |
 | `Shape.quad().curved()` | a curved quadrilateral is a 9-node block the emitter does not produce |
 

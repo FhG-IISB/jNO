@@ -340,3 +340,75 @@ def test_one_cell_choice_through_a_plan_is_not_mixed():
     s = (jno.Shape.rect(0, 0, 2, 1, size=0.4).quad() - jno.Shape.disk(1.0, 0.5, 0.25)).sized(0.3)
     assert s.cell_choices() == frozenset({"quad"})
     assert "quad" in {c.type for c in s.build()[0].cells}
+
+
+# ------------------------------------------------------------------------ the measured feature set
+
+
+def _quad_domain(**kw):
+    return jno.domain(
+        constructor=Geometries.equi_distant_rect(nx=6, ny=6, cell="quad"), compute_mesh_connectivity=False, **kw
+    )
+
+
+def test_nonlinear_newton_on_quads():
+    d = _quad_domain()
+    u, v = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    sol = np.asarray(jno.fem([(1.0 + ui * ui) * (ui.x * vi.x + ui.y * vi.y) - 1.0 * vi, u(xb, yb) - 0.0]).solve())
+    assert np.isfinite(sol).all() and sol.max() > 0
+
+
+def test_vector_elasticity_on_quads():
+    """Mechanics is the reason tensor-product cells exist, so a vector field is the load-bearing case."""
+    d = _quad_domain()
+    u, v = d.fem_symbols(value_shape=(2,))
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    eu, ev = jno.np.symgrad(u, [xi, yi]), jno.np.symgrad(v, [xi, yi])
+    frm = 2.0 * jno.np.inner(eu, ev, n_contract=2) + 1.0 * jno.np.trace(eu) * jno.np.trace(ev)
+    sol = np.asarray(jno.fem([frm - 1.0 * v.bind(x=xi, y=yi)[1], u(xb, yb)[0] - 0.0, u(xb, yb)[1] - 0.0]).solve())
+    assert np.isfinite(sol).all() and np.abs(sol).max() > 0
+
+
+def test_transient_march_on_quads():
+    d = _quad_domain(time=(0.0, 0.2, 4))
+    u, v = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ci = d.variable("initial")
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+    traj = np.asarray(jno.fem([ui.t * vi + ui.x * vi.x + ui.y * vi.y, u(xb, yb) - 0.0, u(*ci) - 1.0]).solve().eval())
+    assert traj.shape[0] == 4 and np.isfinite(traj).all()
+
+
+def test_bounds_and_periodic_ties_on_quads():
+    d = _quad_domain()
+    u, v = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    capped = np.asarray(jno.fem([ui.x * vi.x + ui.y * vi.y - 5.0 * vi, u(xb, yb) - 0.0, u.bounds(None, 0.05)]).solve())
+    assert capped.max() <= 0.05 + 1e-8, "u.bounds did not hold on a quad mesh"
+
+    cl, cr, cb, ct = (d.variable(t) for t in ("left", "right", "bottom", "top"))
+    f = jno.np.sin(2 * PI * xi) * jno.np.sin(2 * PI * yi)
+    tied = np.asarray(
+        jno.fem([ui.x * vi.x + ui.y * vi.y + 1.0 * ui * vi - f * vi, u(*cl) - u(*cr), u(*cb) - u(*ct)]).solve()
+    )
+    assert np.isfinite(tied).all()
+
+
+def test_adaptivity_refuses_on_quads_by_name():
+    """mmg adapts simplices and the recovery estimator differentiates P1 shape functions; neither
+    generalises. This raised a bare `KeyError: 'triangle'` before, which named nothing."""
+    d = _quad_domain()
+    u, v = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0])
+    with pytest.raises(NotImplementedError, match="simplicial mesh"):
+        fem.solve(adapt=jno.solve.remesh(max_iters=1))
