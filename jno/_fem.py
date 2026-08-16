@@ -2658,7 +2658,7 @@ def _ref_interior_facet_dofs(ref_pts: np.ndarray, fv: np.ndarray, dim: int, tol:
     return ordered
 
 
-def _boundary_facets(points: Any, cells: Any, dim: int, order: int) -> Optional[np.ndarray]:
+def _boundary_facets(points: Any, cells: Any, dim: int, order: int, cell_type: Any = None) -> Optional[np.ndarray]:
     """Boundary facets of the **assembly** mesh as global node-id rows, including higher-order nodes.
 
     A facet is a cell edge (2D) / triangular face (3D) of the vertex sub-connectivity (the first
@@ -2674,16 +2674,29 @@ def _boundary_facets(points: Any, cells: Any, dim: int, order: int) -> Optional[
     if cells.ndim != 2 or cells.shape[0] == 0:
         return None
     n_cells = cells.shape[0]
-    verts = cells[:, : dim + 1]
-    # A facet of a `dim`-simplex has `dim` vertices: in 1D that is a single endpoint, so the combos
-    # are the two 1-vertex sub-sets of an interval. (Higher-order facet nodes below are then vacuous —
-    # a point carries none — which the `order < 2` early return already handles for P1 and the
-    # reference-point search handles correctly for P{k}.)
-    combos = (
-        [(0,), (1,)]
-        if dim == 1
-        else ([(0, 1), (1, 2), (2, 0)] if dim == 2 else [(0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3)])
-    )
+    if cell_type in ("quad", "quadrilateral", "hexahedron", "hex"):
+        # A tensor-product cell has 2^dim vertices, not dim+1, and its facets are not sub-simplices.
+        # `cells` here is the ASSEMBLY connectivity, which is in basix vertex order for these cells,
+        # so the facet table has to be basix's too -- taking `cells[:, :dim+1]` and triangle combos
+        # silently built facets from three of a quad's four corners.
+        import basix as _basix
+
+        from .utils.solver.fem_lagrange import basix_cell
+
+        _cell, _tdim = basix_cell(cell_type)
+        combos = [tuple(f) for f in _basix.topology(_cell)[_tdim - 1]]
+        verts = cells
+    else:
+        verts = cells[:, : dim + 1]
+        # A facet of a `dim`-simplex has `dim` vertices: in 1D that is a single endpoint, so the combos
+        # are the two 1-vertex sub-sets of an interval. (Higher-order facet nodes below are then vacuous —
+        # a point carries none — which the `order < 2` early return already handles for P1 and the
+        # reference-point search handles correctly for P{k}.)
+        combos = (
+            [(0,), (1,)]
+            if dim == 1
+            else ([(0, 1), (1, 2), (2, 0)] if dim == 2 else [(0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3)])
+        )
     allf = np.concatenate([verts[:, list(c)] for c in combos], axis=0)  # combo-major: row = combo*n_cells + cell
     # Same packed-int64 key the assembler's facet table uses, for the same reason -- and from the
     # same helper, so the two cannot drift again. See :func:`fem_facets.pack_face_keys`.

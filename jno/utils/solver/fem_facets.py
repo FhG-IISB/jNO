@@ -259,27 +259,25 @@ def compute_face_normals(
     """
     points = np.asarray(points, dtype=float)
     cells = np.asarray(cells)
-    if cell_type in ("interval", "line"):
-        local_faces = _LOCAL_FACES_INT
-        n_face_nodes, dim = 1, 1
-    elif cell_type == "triangle":
-        local_faces = _LOCAL_FACES_TRI
-        n_face_nodes, dim = 2, 2
-    elif cell_type == "tetrahedron":
-        local_faces = _LOCAL_FACES_TET
-        n_face_nodes, dim = 3, 3
-    else:
-        raise NotImplementedError(f"compute_face_normals: cell_type {cell_type!r} not supported.")
+    local_faces, n_face_nodes = _face_table(cell_type)
+    dim = {"interval": 1, "line": 1, "triangle": 2, "quad": 2, "quadrilateral": 2}.get(cell_type, 3)
 
     if conn.n_bfaces == 0:
         return np.zeros((0, dim), dtype=float)
 
-    # (n_bfaces, n_face_nodes + 1): the parent cell's local node ids for this face, apex last
     entry = np.asarray(local_faces, dtype=np.int64)[np.asarray(conn.local_face)]
     parent = cells[np.asarray(conn.parent_cell)]  # (n_bfaces, n_verts_per_cell)
     face_ids = np.take_along_axis(parent, entry[:, :n_face_nodes], axis=1)
     verts = points[face_ids, :dim]  # (n_bfaces, n_face_nodes, dim)
-    opp = points[np.take_along_axis(parent, entry[:, n_face_nodes : n_face_nodes + 1], axis=1)[:, 0], :dim]
+
+    # The reference point the facet is oriented AWAY from. A simplex facet has an opposite vertex,
+    # which is exact for any geometry including a concave boundary; a tensor-product facet has none,
+    # so the owning cell's centroid stands in -- exact for a convex cell, and identical to the apex
+    # wherever both exist.
+    if has_facet_apex(cell_type):
+        opp = points[np.take_along_axis(parent, entry[:, n_face_nodes : n_face_nodes + 1], axis=1)[:, 0], :dim]
+    else:
+        opp = points[parent, :dim].mean(axis=1)
 
     if dim == 1:  # 1-D: a facet is a point, so there is no tangent to rotate — the unit candidate is
         # +1 and the shared away-from-the-apex flip below picks the outward sign
@@ -287,7 +285,9 @@ def compute_face_normals(
     elif dim == 2:  # 2-D: edge → rotate tangent 90° clockwise
         t = verts[:, 1] - verts[:, 0]
         n = np.stack([t[:, 1], -t[:, 0]], axis=1)
-    else:  # 3-D: face → cross product of two edges
+    elif n_face_nodes == 4:  # 3-D quadrilateral face: the cross product of its DIAGONALS
+        n = np.cross(verts[:, 2] - verts[:, 0], verts[:, 3] - verts[:, 1])
+    else:  # 3-D triangle: cross product of two edges
         n = np.cross(verts[:, 1] - verts[:, 0], verts[:, 2] - verts[:, 0])
 
     mid = verts.mean(axis=1)
