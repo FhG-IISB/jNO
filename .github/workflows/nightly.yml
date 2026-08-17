@@ -10,6 +10,13 @@ name: Nightly (full suite)
 # `workflow_dispatch` is there for when that wait is not acceptable -- run it by hand before a
 # release or after a risky merge.
 #
+# It skips itself when main has not moved since the last attempt -- re-running an identical tree
+# tells you nothing you did not already know, and this suite is ~2 h of runner time. The check
+# compares HEAD against the last completed run's head SHA rather than asking "were there commits in
+# the last 24 h": if a scheduled run is ever dropped (GitHub does drop them under load), a time
+# window silently skips the commits that landed during the gap, whereas a SHA comparison still sees
+# them. `workflow_dispatch` always runs, so a manual trigger is never skipped.
+#
 # Coverage is uploaded from HERE and not from a PR, because a filtered PR run only executes part of
 # the suite and would report every unexercised file as freshly uncovered.
 
@@ -22,8 +29,41 @@ concurrency:
   group: nightly-${{ github.ref }}
   cancel-in-progress: false   # never cancel a full run; a partial one proves nothing
 
+permissions:
+  contents: read
+  actions: read   # to read the previous run's head SHA
+
 jobs:
+  # ---------------------------------------------------------------- has anything changed?
+  guard:
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "manual dispatch -> running"; echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          head="$(git rev-parse HEAD)"
+          # The last COMPLETED attempt, whatever its conclusion: if main has not moved since a run
+          # that already failed, re-running it just reproduces a failure that is already reported.
+          prev="$(gh run list --workflow=nightly.yml --branch=main --status=completed \
+                    --limit=1 --json headSha --jq '.[0].headSha // ""' 2>/dev/null || echo "")"
+          echo "head=$head"; echo "prev=${prev:-<none>}"
+          if [ -z "$prev" ] || [ "$prev" != "$head" ]; then
+            echo "main moved (or no previous run) -> running"; echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "main unchanged since the last attempt -> skipping"; echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
   full:
+    needs: guard
+    if: needs.guard.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 240
     steps:
