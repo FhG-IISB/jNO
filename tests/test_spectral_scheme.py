@@ -160,7 +160,9 @@ class TestSecondDerivatives:
         x, y = P[:, 0], P[:, 1]
         u = np.sin(2 * np.pi * x) * np.cos(4 * np.pi * y)
         analytic = -((2 * np.pi) ** 2 + (4 * np.pi) ** 2) * u
-        spec = np.abs(np.asarray(_spectral_second_moments(u, shape, spacing, [(0, 0), (1, 1)], trace=True)) - analytic).max()
+        spec = np.abs(
+            np.asarray(_spectral_second_moments(u, shape, spacing, [(0, 0), (1, 1)], trace=True)) - analytic
+        ).max()
         fd = np.abs(
             np.asarray(
                 D.compute_fd_laplacian_2d_simple(

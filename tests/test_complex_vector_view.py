@@ -91,7 +91,6 @@ def test_complex_vector_bind_is_reachable():
     """
     from jno.trace import Variable
     from jno.trace.views import NamedComplexVectorViewWithPartials
-
     from tests.conftest import MockDomain
 
     d = MockDomain()

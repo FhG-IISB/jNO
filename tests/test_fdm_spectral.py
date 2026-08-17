@@ -10,11 +10,11 @@ periodicity warning showing up in a real solve, pinned so it is a number rather 
 """
 
 import jax
+import jno.numpy as jnn
 import numpy as np
 import pytest
 
 import jno
-import jno.numpy as jnn
 
 
 @pytest.fixture(autouse=True)

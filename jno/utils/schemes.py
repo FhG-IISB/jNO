@@ -61,6 +61,7 @@ def require_family(scheme: str, expected: str) -> str:
         )
     return scheme.split(":", 1)[1].strip() if ":" in scheme else ""
 
+
 # ── the run-level default ───────────────────────────────────────────────────────────────────────
 # The BARE family string ``"automatic_differentiation"`` already meant "use whatever is configured"
 # for the AD sub-mode (`parse_ad_scheme` returns `get_ad_mode()` when there is no suffix). This

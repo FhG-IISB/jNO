@@ -12,7 +12,6 @@ Both are marked slow: they train.
 """
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest

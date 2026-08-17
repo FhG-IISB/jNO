@@ -2111,9 +2111,7 @@ class core:
             if any(_is_lazy_source(v) for v in self.domain_data.context.values()):
                 batchsize = batchsize or self.domain.total_samples
             else:
-                self.log.warning(
-                    "offload_data requires batchsize < total_samples; ignoring offload_data for this run."
-                )
+                self.log.warning("offload_data requires batchsize < total_samples; ignoring offload_data for this run.")
                 offload_data = False
 
         self.log.info("Paramax auto-unwrap enabled: wrappers are unwrapped before each forward evaluation")
