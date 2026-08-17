@@ -30,6 +30,7 @@ if TYPE_CHECKING:  # runtime import stays lazy inside remesh()/relocate()
     from .utils.solver.fem_adapt import AdaptSpec
 
 from .utils.solver.solver_api import (
+    ContinuationSpec,
     LinearOperator,
     LinearSolver,
     NonlinearSolver,
@@ -38,6 +39,7 @@ from .utils.solver.solver_api import (
 )
 
 __all__ = [
+    "continuation",
     "LinearOperator",
     "LinearSolver",
     "NonlinearSolver",
@@ -530,6 +532,37 @@ def picard(
         ls_max=ls_max,
         ls_c=ls_c,
     )
+
+
+def continuation(keep: str = "last", **params: Any) -> ContinuationSpec:
+    """**Parameter continuation** for ``fem.solve(continuation=...)``: march runtime parameters across
+    a value sequence, warm-starting each solve from the previous one::
+
+        cap = jno.np.parameter((1,), name="cap")
+        fem = jno.fem([... cap ...])                      # built ONCE
+        u = fem.solve(continuation=jno.solve.continuation(cap=np.geomspace(G / 2000, G, 8)))
+
+    One driver, three names for one mechanism: a **frequency or material sweep** in EM, **load
+    stepping** in mechanics, **homotopy** in numerics -- reaching a parameter value the cold solve
+    cannot. Sequences given together are marched **zipped**, not as a grid, so two coefficients can
+    ramp in step.
+
+    ``keep="last"`` returns the final solution (homotopy); ``keep="all"`` returns the whole family,
+    ``(n_values, n_dofs)`` -- a sweep.
+
+    **Why this instead of a Python loop that rebuilds the form.** The form is traced and compiled once
+    and the parameter arrives as a runtime argument, so an 8-step ramp is 8 solves, not 8 rebuilds
+    and 8 XLA compilations. That is the difference between a continuation being a tool and being the
+    dominant cost of a run.
+
+    Fixed (unswept) parameter values are passed as ordinary keywords to ``fem.solve`` alongside this
+    spec; naming one in both places raises rather than silently picking a winner.
+
+    Scope, refused by name elsewhere: **steady** problems (linear or nonlinear), real or
+    fused-complex. A transient sweep is a plain loop over ``fem.solve()`` -- there is no warm start to
+    carry between independent trajectories, so this driver would add nothing.
+    """
+    return ContinuationSpec(params=dict(params), keep=keep)
 
 
 def staggered(

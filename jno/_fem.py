@@ -1296,6 +1296,7 @@ class FEM:
         solve_fn=None,
         *,
         adapt=None,
+        continuation=None,
         x0=None,
         nonlinear=None,
         linear=None,
@@ -1451,6 +1452,7 @@ class FEM:
                 result = self._solve_dispatch(
                     solve_fn,
                     adapt=adapt,
+                    continuation=continuation,
                     x0=x0,
                     nonlinear=nonlinear,
                     linear=linear,
@@ -1635,9 +1637,18 @@ class FEM:
         time=None,
         tau=None,
         shard=None,
+        continuation=None,
         **kwargs,
     ):
         """Mode dispatch for :meth:`solve` — returns the solution array or a differentiable trace node."""
+        if continuation is not None:
+            # Parameter continuation owns the sequence of solves, so it is dispatched before the mode
+            # branches: each step is an ordinary steady solve, warm-started from the last.
+            from .utils.solver.solver_api import run_continuation
+
+            return run_continuation(
+                self, continuation, nonlinear=nonlinear, linear=linear, precond=precond, x0=x0, kwargs=kwargs
+            )
         has_slots = (
             (x0 is not None)
             or (nonlinear is not None)
