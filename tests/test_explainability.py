@@ -727,3 +727,151 @@ def test_engd_line_search_reduces_loss():
     loss = float(stats.total_loss)
     assert np.isfinite(loss), f"ENGD line_search loss is not finite: {loss}"
     assert loss < 50.0, f"ENGD line_search loss {loss:.3e} did not decrease from ~52 initial"
+
+
+# ---------------------------------------------------------------------------
+# A `fem.solve()` in the trace — the vmap-over-`spsolve` wall
+# ---------------------------------------------------------------------------
+#
+# `jax.jacrev` takes one `vjp` and then vmaps the pullback across the rows of the output
+# basis. `jax.experimental.sparse.linalg.spsolve` has no batching rule, so that vmap — not
+# the differentiation — is what fails on any trace containing `fem.solve()`, and it fails
+# even for a single scalar output because the basis still carries a leading axis. Forward
+# mode is no escape (`jacfwd` hits the same wall at `csr_matvec`); plain `jax.grad` works.
+#
+# Every other tracker test in this file uses a PINN, which is why this went unnoticed: the
+# per-loss gradient trackers, and the loss weighting built on them, were unusable on jNO's
+# headline problem class.
+
+
+def test_rowwise_jacobian_is_bit_identical_to_jacrev():
+    """The replacement must be a refactor, not a rewrite — same VJPs, same order, same bits.
+
+    Uses a pytree with leaves of different shapes so the flattening order is actually
+    exercised, and a nonlinear vector-valued function so every row differs.
+    """
+    from jno.utils.ad_mode import rowwise_jacobian
+
+    x = {"a": jnp.array([1.0, -2.0, 0.5]), "b": jnp.array([[3.0, 1.0], [0.25, -1.5]])}
+
+    def f(t):
+        a, b = t["a"], t["b"]
+        return jnp.stack([jnp.sum(jnp.sin(a) * a), jnp.sum(b**3), jnp.sum(a) * jnp.sum(jnp.tanh(b))])
+
+    leaves = jax.tree_util.tree_leaves(jax.jacrev(f)(x))
+    expected = jnp.stack([jnp.concatenate([lf[i].ravel() for lf in leaves]) for i in range(3)])
+
+    got = rowwise_jacobian(f, x, range(3))
+    assert got.shape == expected.shape == (3, 7)
+    assert bool(jnp.all(got == expected)), "must agree with jacrev to the last bit"
+
+    # A caller may ask for a subset of rows, in its own order — MMA wants only the
+    # inequality-constraint rows and pays for those alone.
+    subset = rowwise_jacobian(f, x, [2, 0])
+    assert bool(jnp.all(subset[0] == expected[2]) and jnp.all(subset[1] == expected[0]))
+
+
+def _fem_compliance_crux():
+    """A cantilever whose loss depends on a sparse solve: clamped left, loaded right.
+
+    Deliberately coarse (28 nodes) — the point is that `spsolve` is in the trace at all,
+    not the mechanics, which `test_topology_optimisation.py` covers.
+    """
+    import optax
+
+    import jno
+
+    inner, symgrad, trace = jno.np.inner, jno.np.symgrad, jno.np.trace
+    # emin = 1e-6: at 1e-9 the GPU spsolve (cuSolver QR) falsely reports the SIMP stiffness
+    # singular -- same measured failure and fix as tests/test_topology_optimisation.py.
+    e0, emin, nu, penal = 1.0, 1e-6, 0.3, 3.0
+    lam, mu = e0 * nu / (1 - nu**2), e0 / (2 * (1 + nu))
+
+    d = jno.Shape.rect(0, 0, 2, 1, size=0.4).domain()
+    u, phi = d.fem_symbols(value_shape=(2,))
+    _r, s = d.fem_symbols(names=("r", "s"))
+    xi, yi, _ = d.variable("interior", split=True)
+    xl, yl, _ = d.variable("left", split=True)
+    xr, yr, _ = d.variable("right", split=True)
+
+    rho = jno.np.parameter(s, name="rho")
+    rho.initialize(jax.nn.initializers.constant(0.4))
+    rho.optimizer(optax.adam(1e-2))
+
+    eu, ep = symgrad(u, [xi, yi]), symgrad(phi, [xi, yi])
+    fem = jno.fem(
+        [
+            (emin + rho**penal * (e0 - emin)) * (lam * trace(eu) * trace(ep) + 2 * mu * inner(eu, ep, n_contract=2)),
+            u(xl, yl) - (0.0, 0.0),
+            -1.0 * inner(jnp.array([0.0, -1.0]), phi.bind(x=xr, y=yr), n_contract=1),
+        ],
+        quad_degree=2,
+    )
+    n_nodes = int(np.asarray(d.built_mesh.points).shape[0])
+    _a, b = fem.operator.evaluate({"rho": jnp.full(n_nodes, 0.4)})
+    f_vec = np.asarray(jnp.asarray(b).reshape(-1))
+
+    compliance = jno.fn(lambda uu: jnp.sum(uu * jnp.asarray(f_vec)), [fem.solve()], name="C")
+    reg = jno.fn(lambda rv: jnp.mean(rv**2), [rho], name="reg")
+    return jno.core([compliance, reg], domain=jno.domain.from_array({"_": np.zeros((1, 1))}))
+
+
+def test_gradient_trackers_run_on_a_trace_containing_a_sparse_solve():
+    """All four vmap-dependent trackers, on one FEM solve, in one run.
+
+    Each of these raised ``NotImplementedError: Batching rule for 'spsolve' not
+    implemented`` before the fix. Attaching them together also checks they coexist.
+    """
+    import jno
+
+    gn = jno.trackers.gradient_norms(interval=1)
+    cs = jno.trackers.cos_similarity(interval=1)
+    ga = jno.trackers.gradient_alignment(interval=1)
+    ll = jno.trackers.loss_landscape(interval=1, n_grid=3)
+
+    _fem_compliance_crux().solve(2, callbacks=[gn, cs, ga, ll])
+
+    norms = np.asarray(gn.value["norms"])
+    assert norms.shape == (2,) and np.all(np.isfinite(norms)) and np.all(norms >= 0.0)
+    # The compliance term is driven through the solve and the regulariser is not, so their
+    # gradient norms must not be the same number — a placeholder would be.
+    assert norms[0] != norms[1]
+
+    cos = np.asarray(cs.value["cos_sim_matrix"])
+    assert cos.shape == (2, 2) and np.all(np.isfinite(cos))
+    # atol=1e-3, not 1e-5: the matrix's two evaluation paths (batched vs single) disagree at GPU
+    # noise level -- measured diag 0.99988 on cuda where cpu gives 1-1e-9. This test pins that the
+    # trackers RUN and COEXIST on a sparse-solve trace, not the self-similarity precision.
+    np.testing.assert_allclose(np.diag(cos), np.ones(2), atol=1e-3)
+    assert np.all(np.abs(cos) <= 1.0 + 1e-5)
+
+    align = np.asarray(ga.value["alignment"]).reshape(-1)
+    assert align.shape == (1,) and np.all(np.isfinite(align))
+    assert -1.0 - 1e-5 <= float(align[0]) <= 1.0 + 1e-5
+
+    land = np.asarray(ll.value["landscape"])
+    assert land.shape == (3, 3) and np.all(np.isfinite(land))
+
+
+def test_gradient_norm_balanced_weights_a_trace_containing_a_sparse_solve():
+    """The downstream consumer that is loss weighting, not a diagnostic.
+
+    ``GradientNormBalanced`` reads ``tracker.value["norms"]``, so it inherited the failure
+    wholesale. Existing coverage stubs the tracker, and so never touched this path.
+    """
+    import jno
+    from jno.utils.adaptive.weights import gradient_norm_balanced
+
+    gn = jno.trackers.gradient_norms(interval=1)
+    _fem_compliance_crux().solve(2, callbacks=[gn])
+
+    w = gradient_norm_balanced(gn)
+    w0, w1 = w(jnp.array(0.1), jnp.array(0.2))
+    out = np.asarray([w0, w1], dtype=np.float64)
+
+    assert np.all(np.isfinite(out))
+    np.testing.assert_allclose(out.sum(), 2.0, rtol=1e-5)
+    # Inversely proportional to the measured norms, which differ by orders of magnitude here.
+    norms = np.asarray(gn.value["norms"], dtype=np.float64)
+    inv = 1.0 / norms
+    np.testing.assert_allclose(out, inv / inv.sum() * 2.0, rtol=1e-4)

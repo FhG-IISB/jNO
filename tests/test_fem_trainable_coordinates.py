@@ -235,3 +235,45 @@ def test_transient_coordinate_gradient_matches_fd():
 
     fd = (bumped(h) - bumped(-h)) / (2 * h)
     assert fd == pytest.approx(float(g["ix"][0]), rel=1e-4), f"FD {fd:.6e} vs AD {float(g['ix'][0]):.6e}"
+
+
+def test_a_volume_tag_is_promotable_without_a_where_predicate():
+    """``domain.variable("interior").trainable()`` — the r-adaptivity API's own example.
+
+    On a gmsh / ``jno.Shape`` domain ``"interior"`` is a VOLUME tag: it lives in ``tag_indices``
+    and never in ``_boundary_regions``, and it carries no location function, so both the predicate
+    route and the assembler's region resolver had nothing to say about it and this raised
+    ``region 'interior' has no location function``. A ``where=`` predicate was the only way in.
+
+    A volume tag names every vertex of that volume, the boundary ones included — that is what the
+    tag means, and it is what the mesh-motion driver wants. Pass ``where=`` for a strict subset.
+    """
+    d = jno.Shape.rect(0.0, 0.0, 2.0, 1.0, size=0.4).domain()
+    n_nodes = int(np.asarray(d.mesh.points).shape[0])
+
+    xi, yi, _ = d.variable("interior", split=True)
+    xi.trainable(name="ix")
+    yi.trainable(name="iy")
+
+    specs = d._trainable_coords
+    assert len(specs) == 2 and [s["axis"] for s in specs] == [0, 1]
+    assert set(specs[0]["ids"].tolist()) == set(range(n_nodes)), "a volume tag covers every vertex"
+
+
+def test_a_named_boundary_still_resolves_through_the_existing_route():
+    """The tag fallback must not shadow the resolver: a boundary tag has a location function, and
+    that answer — not the mesh tag's node list — stays authoritative."""
+    from jno.utils.solver.fem_native import _region_node_ids_from_pts
+
+    d = jno.Shape.rect(0.0, 0.0, 2.0, 1.0, size=0.4).domain()
+    pts = np.asarray(d.mesh.points)
+    expected = sorted(int(i) for i in _region_node_ids_from_pts(d, "left", pts))
+
+    d.variable("left", split=True)[0].trainable(name="bx")
+    assert sorted(int(i) for i in d._trainable_coords[0]["ids"]) == expected
+
+
+def test_an_unknown_tag_still_fails_loud():
+    d = jno.Shape.rect(0.0, 0.0, 2.0, 1.0, size=0.4).domain()
+    with pytest.raises(ValueError):
+        d.variable("no_such_region", split=True)[0].trainable(name="q")

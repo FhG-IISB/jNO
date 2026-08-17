@@ -7,6 +7,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from jno.utils.ad_mode import rowwise_jacobian
+
 
 def make_residual_stats_fn(
     compiled_constraints_fn,
@@ -395,20 +397,16 @@ def make_per_loss_grad_fn(
         else:
             selected, held_fixed = trainable, None
 
-        # jacrev → pytree matching `selected`; array leaves gain shape (N, *leaf_shape).
-        # Equinox sentinels at frozen/non-selected positions are empty pytrees,
-        # so jax.tree_util.tree_leaves skips them — only gradient arrays appear.
-        per_grads = jax.jacrev(lambda s: _eval_losses(s, held_fixed, context, step_rng))(selected)
-
-        leaves = jax.tree_util.tree_leaves(per_grads)  # list of (N, *leaf_shape) arrays
-
-        # Build G: (N, P_mask) by slicing row i from each leaf.
-        # Python loop over range(N) is unrolled at trace time.
-        G_rows = []
-        for i in range(n_constraints):
-            g_i = jnp.concatenate([leaf[i].ravel() for leaf in leaves])
-            G_rows.append(g_i)
-        G = jnp.stack(G_rows)  # (N, P_mask)
+        # (N, P_mask), one row per loss term. NOT `jax.jacrev`: it vmaps its pullback across
+        # the output basis, and a trace containing `fem.solve()` bottoms out in `spsolve`,
+        # which has no batching rule — see `rowwise_jacobian` for the full story. Equinox
+        # sentinels at frozen/non-selected positions are empty pytrees, so `tree_leaves` skips
+        # them and only gradient arrays reach the concatenation.
+        G = rowwise_jacobian(
+            lambda s: _eval_losses(s, held_fixed, context, step_rng),
+            selected,
+            range(n_constraints),
+        )
 
         norms = jnp.linalg.norm(G, axis=1)  # (N,)
         G_hat = G / (norms[:, None] + 1e-12)
@@ -493,9 +491,14 @@ def make_landscape_fn(
             losses = jnp.stack([jnp.mean(r) for r in residuals])
             return jnp.mean(losses)
 
-        # lax.map over outer axis → peak memory = n_grid × model (not n_grid² × model)
+        # `lax.map` on BOTH axes. The outer one was already sequential to keep peak memory at
+        # n_grid × model rather than n_grid² × model; the inner one used to be a `vmap`, which
+        # batched the whole constraint evaluation — and a constraint containing `fem.solve()`
+        # bottoms out in `spsolve`, which has no batching rule, so the landscape was
+        # unavailable on any FEM problem. Sequential costs n_grid² evaluations instead of
+        # n_grid batched groups for the same FLOPs, and works on every trace.
         return jax.lax.map(
-            lambda alpha: jax.vmap(lambda beta: eval_at(alpha, beta))(betas),
+            lambda alpha: jax.lax.map(lambda beta: eval_at(alpha, beta), betas),
             alphas,
         )
 

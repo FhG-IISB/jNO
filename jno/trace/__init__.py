@@ -34,6 +34,7 @@ __all__ = [
     "TagMask",
     "BinaryOp",
     "Tracker",
+    "Constraint",
     "Model",
     "TunableModule",
     "TunableModuleCall",
@@ -598,6 +599,84 @@ class Placeholder:
     @property
     def mae(self) -> FunctionCall:
         return FunctionCall(lambda x: jnp.squeeze(jnp.mean(jnp.abs(x))), [self], "mae", True)
+
+    def pnorm(self, p: float = 50.0, *, normalize: bool = False) -> FunctionCall:
+        """``(Σ xᵢ^p)^(1/p)`` — a smooth, differentiable stand-in for the maximum.
+
+        The standard aggregation for a constraint that must hold at *every* element: imposing it
+        pointwise would add one inequality per element, so the p-norm collapses them into one at
+        the cost of a slight, predictable violation near the bound. Larger ``p`` is a tighter
+        approximation and a more nonlinear one; ``p = 50`` is the usual compromise.
+
+        Written for quantities already normalised so the bound is ``1`` (``g.pnorm(50) <= 1``),
+        which is what keeps the aggregation numerically sane across constraints of different
+        magnitudes. Negative entries are not meaningful here — normalise first.
+
+        Args:
+            p: The exponent.
+            normalize: Scale the result by ``max(x) / pnorm(x)``, held constant under
+                differentiation, so the constraint's **value** is the true maximum while its
+                **gradient** stays the p-norm's smooth one. Without this the aggregation
+                overshoots with the element count -- ``N`` entries all at ``r`` give
+                ``N^(1/p) · r``, which for 840 angles at ``p = 50`` is already a 14 % inflation,
+                enough to report a satisfied constraint as violated from the first iteration and
+                stall the optimiser on it. This is the normalisation of Le et al., *Struct.
+                Multidisc. Optim.* **41**(4), 2010, 605-620, as adopted by Jung, Yun & Kim,
+                *Computers & Structures* **331** (2026) 108403, eq. (29)-(30) -- there with an
+                extra ``α``-damped lag over iterations, which is dropped here so the value stays a
+                pure function of the design.
+        """
+
+        def fn(x, _p=float(p), _n=bool(normalize)):
+            v = jnp.abs(x)
+            agg = jnp.squeeze(jnp.sum(v**_p) ** (1.0 / _p))
+            if not _n:
+                return agg
+            return jax.lax.stop_gradient(jnp.max(v) / (agg + 1e-30)) * agg
+
+        return FunctionCall(fn, [self], f"pnorm{p:g}" + ("n" if normalize else ""), True)
+
+    def log_barrier(self, bound: float, *, tau: float = 1e-3) -> "FunctionCall":
+        """``-b log(b - x)`` — a logarithmic barrier keeping ``x`` below ``bound``.
+
+        The interior-point penalty for a one-sided constraint: it is finite and smooth for
+        ``x < b`` and diverges as ``x`` approaches ``b``, so a descent method cannot step across.
+        Used for the perimeter target of Jung, Yun & Kim, *Computers & Structures* **331** (2026)
+        108403, eq. (39)-(40), where the objective is ``C - beta R`` with ``R = P* log(P* - P)``.
+
+        Above ``b - tau*|b|`` it continues as the second-order Taylor extension of the log, matching
+        value and slope, so it **keeps a gradient everywhere**. That is the whole point of this
+        existing rather than being written inline: the obvious safeguard,
+        ``log(maximum(b - x, eps))``, is a trap. It stops the NaN, but it also makes the penalty
+        *constant* once the bound is crossed, so its gradient is exactly zero and the constraint it
+        was guarding silently switches off. Measured: a perimeter target of 350 ended at 992 with
+        no sign that anything had gone wrong, because nothing ever pushed back.
+
+        A design that starts feasible never reaches the extension. It exists so that one that does
+        -- through an overshooting step, or a bound tightened mid-run -- is pushed back rather than
+        set free.
+
+        Args:
+            bound: The upper bound ``b``. ``x`` is kept strictly below it.
+            tau: Switch point as a fraction of ``|b|``. Smaller follows the true log further and
+                gives a stiffer extension.
+        """
+        b = float(bound)
+        t = float(tau) * abs(b)
+        if t <= 0.0:
+            raise ValueError(f"log_barrier: tau must be positive, got {tau!r}.")
+
+        def fn(x, _b=b, _t=t):
+            switch = _b - _t
+            # Clamped inside the log so the UNTAKEN branch is finite too -- jnp.where propagates
+            # NaN gradients from a branch it does not select.
+            gap = jnp.maximum(_b - x, _t)
+            inside = -_b * jnp.log(gap)
+            dx = x - switch
+            outside = -_b * jnp.log(_t) + (_b / _t) * dx + 0.5 * (_b / _t**2) * dx**2
+            return jnp.squeeze(jnp.where(x <= switch, inside, outside))
+
+        return FunctionCall(fn, [self], f"log_barrier{b:g}", True)
 
     @property
     def T(self) -> FunctionCall:
@@ -1497,9 +1576,26 @@ class Variable(Placeholder):
     def _region_vertex_ids(dom, tag, pts):
         """Mesh-vertex ids of region ``tag`` for coordinate trainability -- interior OR boundary.
 
-        A ``where=`` predicate is applied to **all** nodes (not intersected with the domain boundary
-        as the Dirichlet location fn is), so an interior region selects its interior vertices. Falls back
-        to the assembler's region resolver for polygon / named-boundary tags."""
+        Three routes, in order:
+
+        1. A ``where=`` predicate, applied to **all** nodes (not intersected with the domain boundary
+           as the Dirichlet location fn is), so an interior region selects its interior vertices.
+        2. The assembler's region resolver -- polygon tags (``domain.region(name, polygon)``) and
+           named boundaries with a location function.
+        3. The mesh's own tag, ``domain.tag_indices[tag]``.
+
+        Route 3 is what makes the built-in ``"interior"`` work. On a gmsh / ``jno.Shape`` domain it is
+        a **volume** tag: it lives in ``tag_indices`` and never in ``_boundary_regions``, and it has no
+        location function, so routes 1 and 2 both have nothing to say about it and this used to raise --
+        even though ``domain.variable("interior").trainable()`` is the r-adaptivity API's own example.
+
+        A volume tag names **every** vertex of that volume, the ones on its boundary included (gmsh's
+        surface tag does; ``Sampled 28 points for 'interior'`` on a 28-node rect is all of them). That is
+        the literal reading of "this region's vertices" and is what the mesh-motion driver wants, but it
+        does mean the domain outline is free to move. Pass a ``where=`` predicate instead to promote a
+        strict subset -- which is also what a topology optimisation wants, since the nodes carrying a
+        boundary condition or a load must stay put.
+        """
         import numpy as _np
 
         preds = getattr(dom, "_tag_predicates", {}) or {}
@@ -1514,7 +1610,16 @@ class Variable(Placeholder):
 
         from ..utils.solver.fem_native import _region_node_ids_from_pts
 
-        return list(_region_node_ids_from_pts(dom, tag, pts))
+        try:
+            return list(_region_node_ids_from_pts(dom, tag, pts))
+        except ValueError:
+            # No polygon and no location function. The resolver stays authoritative -- it is tried
+            # first and its answer is never overridden -- so this branch changes nothing that already
+            # worked; it only fills the case that used to be a dead end.
+            ids = _np.asarray((getattr(dom, "tag_indices", None) or {}).get(tag, ()), dtype=int).reshape(-1)
+            if ids.size:
+                return list(ids)
+            raise
 
 
 class TensorTag(Placeholder):
@@ -1605,6 +1710,37 @@ class Tracker(Placeholder):
 
     def __repr__(self):
         return f"Tracker({self.expr!r}, interval={self.interval})"
+
+
+class Constraint(Placeholder):
+    """Wraps an expression that is an **inequality constraint**, not a loss to minimise.
+
+    ``jno.core`` evaluates it exactly like a constraint entry -- same compiled function, same
+    differentiation -- so its value and gradient are available to a constrained optimiser. What it
+    does *not* do is enter the loss the optimiser descends. That distinction is the whole point:
+    summing a constraint into the objective makes it a soft penalty, which double-counts against an
+    optimiser (MMA, OC, SQP) that already handles it in the dual.
+
+    ``sense`` is ``"le"`` (``expr <= bound``) or ``"ge"``; the stored residual is normalised to the
+    ``g <= 0`` convention either way, so a consumer never has to branch on the sense.
+
+    Contrast with :class:`Tracker`, which is also kept out of the loss but is evaluated by a
+    *separate* function on an interval, is not differentiated, and is invisible to the optimiser.
+    """
+
+    def __init__(self, expr: Placeholder, bound: float = 0.0, sense: str = "le"):
+        if sense not in ("le", "ge"):
+            raise ValueError(f"Constraint: sense must be 'le' or 'ge', got {sense!r}.")
+        self.expr = expr
+        self.bound = bound
+        self.sense = sense
+        # g <= 0 when feasible, whichever way the user wrote it.
+        self.residual = (expr - bound) if sense == "le" else (bound - expr)
+        self.op_id = _next_op_id()
+
+    def __repr__(self):
+        op = "<=" if self.sense == "le" else ">="
+        return f"Constraint({self.expr!r} {op} {self.bound})"
 
 
 class Model(Placeholder):
@@ -2667,6 +2803,88 @@ class ModelCall(Placeholder):
         return self.scalar.partials(**named_vars)
 
     bind = partials
+
+    def patch(self) -> "FunctionCall":
+        """Physical density from the design density — the patch filter, eq. (17)-(19), as a node.
+
+        Sugar for ``jno.fn(domain.patch_filter(), [self])``; see
+        :meth:`~jno.domain.Domain.patch_filter` for what the filter does and why the **physics**
+        route is ``rho.constrain(d.patch_filter())`` rather than this node. Use this one for the
+        constraints, the reporting and ``crux.eval`` — anywhere outside the weak form.
+
+        Returns:
+            A ``(n_cells,)`` node, differentiable in the design density.
+        """
+        dom = getattr(self.model, "_fem_field_domain", None)
+        if getattr(self.model, "_fem_field", None) != "cell" or dom is None:
+            raise TypeError(
+                "ModelCall.patch(): the patch filter needs a P0 (per-element) design density -- "
+                '`jno.np.parameter(<symbol>)` on a symbol made with `space="P0"`. It maps one '
+                "value per element to one physical value per element; a nodal field has no "
+                "element to be the patch's reference."
+            )
+        import jno as _jno
+
+        return _jno.fn(dom.patch_filter(), [self], name="patch")
+
+    def perimeter(self, zeta: float = 0.1) -> "FunctionCall":
+        """Smoothed structural perimeter of a P0 density — eq. (38), as a scalar node.
+
+        Jung, Yun & Kim, *Computers & Structures* **331** (2026) 108403, Sec. 3.5, after Haber,
+        Jog & Bendsoe, *Struct. Optim.* **11**, 1996, 1-12:
+
+            P = sum_k  l_k * ( sqrt( (1 + 2 zeta) <rho>_k^2 + zeta^2 ) - zeta )
+
+        over the **interior** edges, with ``<rho>_k`` the density jump across edge ``k`` and
+        ``l_k`` its length. The bracket is a smoothed ``|<rho>|``: it is exactly 0 for no jump and
+        exactly 1 for a full one, so ``P`` measures the total length of the material boundary while
+        staying differentiable where a bare absolute value would not be.
+
+        This is the **feature-scale** lever, and the one constraint here that is about
+        manufacturability rather than mesh validity. A design fragmented into many thin members has
+        a large perimeter for the same volume; bounding it forces fewer, thicker members. Used as a
+        logarithmic barrier against a target ``P*`` (eq. 39-40)::
+
+            P = rho.perimeter(zeta=0.1)
+            penalty = jno.fn(lambda p: -P_star * jnp.log(P_star - p), [P], name="R")
+            jno.core([C, beta * penalty, jno.le(...)], domain=d)
+
+        The barrier diverges as ``P`` approaches ``P*`` from below, so the design can never cross
+        it; ``beta`` is decayed geometrically (eq. 41) to tighten it as the run proceeds.
+
+        Evaluated on whatever this parameter currently *is* — under
+        ``rho.constrain(d.patch_filter())`` that is the physical density, which is the field whose
+        boundary one actually wants to measure. Differentiable in the density **and** in the mesh,
+        since the edge lengths come from the moving vertices.
+
+        Args:
+            zeta: Smoothing parameter; the paper uses 0.1. Smaller is a sharper approximation to
+                ``|<rho>|`` and a worse-conditioned one.
+        """
+        dom = getattr(self.model, "_fem_field_domain", None)
+        if getattr(self.model, "_fem_field", None) != "cell" or dom is None:
+            raise TypeError(
+                "ModelCall.perimeter(): needs a P0 (per-element) density -- the jump is taken "
+                "ACROSS an edge, between the two elements meeting there, so a nodal field (which "
+                "is continuous and jumps nowhere) has no perimeter to measure."
+            )
+        import jno as _jno
+
+        edges = dom.interior_edges()
+        ecells = jnp.asarray(edges["cells"], dtype=jnp.int32)
+        enodes = jnp.asarray(edges["nodes"], dtype=jnp.int32)
+        args, rebuild = dom._moving_points()
+        z = float(zeta)
+
+        def _perimeter(rv, *coord_vals):
+            r = jnp.asarray(rv).reshape(-1)
+            pts = rebuild(*coord_vals)
+            length = jnp.linalg.norm(pts[enodes[:, 0]] - pts[enodes[:, 1]], axis=-1)
+            jump = r[ecells[:, 0]] - r[ecells[:, 1]]
+            smooth = jnp.sqrt((1.0 + 2.0 * z) * jump**2 + z * z) - z
+            return jnp.sum(length * smooth)
+
+        return _jno.fn(_perimeter, [self, *args], name="perimeter")
 
     def __call__(self, *coords, **named):
         """For a **nodal-field unknown** (``domain.unknown()``), ``u(xb, yb)`` is sugar for

@@ -81,6 +81,11 @@ class Callback:
             context: Domain context (current batch).
             rng: Current JAX PRNG key (Python-side; not consumed here).
             epoch (int): Current outer epoch (Python integer, 0-indexed).
+            total_loss: The scalar loss at this step, as descended.
+            individual_losses: Per-entry values, one per ``jno.core`` constraint entry --
+                **including** any ``jno.le``/``jno.ge`` inequality constraints, which are
+                evaluated with everything else but held out of ``total_loss``. A constrained
+                optimiser reads its ``g_j`` here rather than recomputing them.
 
         Returns:
             Modified ``grads`` dict, or ``None`` to leave unchanged.
