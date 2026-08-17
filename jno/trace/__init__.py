@@ -3704,7 +3704,7 @@ class OperationDef(Placeholder):
                 if id(node) not in seen_ids:
                     seen_ids.add(id(node))
                     vars_found.append(node)
-            elif isinstance(node, (ModelCall, Flow)):
+            elif isinstance(node, (ModelCall, Flow, Noise)):
                 for arg in node.args:
                     if isinstance(arg, Placeholder):
                         visit(arg)
@@ -4221,21 +4221,36 @@ class Noise(Placeholder):
     ``jax.random.fold_in``, so it is fully reproducible when the global seed
     is fixed (via :func:`jno.setup` or ``.jno.toml``).
 
+    With ``like=`` the draw instead takes the shape of another traced expression, resolved at
+    evaluation time rather than written down — so it follows ``batchsize``, ``points=`` and time
+    windows automatically, where a shape spelled out in the script would silently go stale.
+
     Parameters
     ----------
     distribution : str
         ``'gaussian'``, ``'uniform'``, or ``'laplace'``.
+    like : Placeholder or None
+        Shape reference. Mutually exclusive with ``ndim``.
     **params
         Distribution-specific kwargs: ``std``, ``low``, ``high``, ``ndim``.
     """
 
-    def __init__(self, distribution: str, **params):
+    def __init__(self, distribution: str, like=None, **params):
         self.distribution = distribution
         self.params = params
+        self.like = like
         self._noise_id = _next_op_id()
+
+    @property
+    def args(self):
+        """The shape reference, for the tree walkers — it may carry Variables whose tags must be
+        collected even when the reference appears nowhere else in the term list."""
+        return [self.like] if self.like is not None else []
 
     def __repr__(self):
         params_str = ", ".join(f"{k}={v}" for k, v in self.params.items())
+        if self.like is not None:
+            params_str += f", like={self.like}"
         return f"Noise({self.distribution}, {params_str})"
 
 
@@ -6276,7 +6291,7 @@ def collect_operations(expr: Placeholder) -> List[OperationDef]:
             visit(node.operation.expr)
             for arg in node.args:
                 visit(arg)
-        elif isinstance(node, (ModelCall, Flow)):
+        elif isinstance(node, (ModelCall, Flow, Noise)):
             for arg in node.args:
                 if isinstance(arg, Placeholder):
                     visit(arg)
@@ -6351,7 +6366,7 @@ def collect_tags(expr: Placeholder) -> set:
             for arg in node.args:
                 if isinstance(arg, Placeholder):
                     visit(arg)
-        elif isinstance(node, (ModelCall, Flow)):
+        elif isinstance(node, (ModelCall, Flow, Noise)):
             for arg in node.args:
                 if isinstance(arg, Placeholder):
                     visit(arg)

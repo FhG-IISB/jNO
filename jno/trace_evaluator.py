@@ -1542,8 +1542,14 @@ class TraceEvaluator:
             if n is None:
                 n = 1
 
-        ndim = int(expr.params.get("ndim", 1))
-        shape = (n, ndim)
+        if getattr(expr, "like", None) is not None:
+            # Shape borrowed from another expression, resolved HERE rather than written down, so it
+            # tracks batchsize / points= / time windows. Only the reference's shape is used; XLA drops
+            # the value as dead code, so `like=<a whole network call>` costs nothing at runtime.
+            shape = jnp.shape(self._dispatch(expr.like, ctx))
+        else:
+            ndim = int(expr.params.get("ndim", 1))
+            shape = (n, ndim)
 
         if ctx.key is None:
             return jnp.zeros(shape)
