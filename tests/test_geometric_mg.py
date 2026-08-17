@@ -23,7 +23,7 @@ def _poisson(size, dim=2):
         if dim == 2
         else jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=size)
     )
-    d = jno.domain(shp, structured=True)
+    d = jno.domain(shp.structured())
     grid = d.mesh_connectivity["grid"]
     shape, spacing = grid["shape"], grid["spacing"]
     p = np.asarray(d.mesh_connectivity["points"])[:, :dim]

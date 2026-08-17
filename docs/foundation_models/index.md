@@ -49,8 +49,10 @@ For constructor signatures, hyperparameters, and pretrained checkpoints see the 
 
 ## Structured-grid domains
 
-For Poseidon-style structured 2D workflows, use the matching domain constructor:
+For Poseidon-style structured 2D workflows, build the grid on the unit square. `n` counts **cells**,
+so a 128x128 *pixel* grid — the resolution these models expect — is `n=127`:
 
 ```python
-domain = jno.domain.poseidon(nx=128, ny=128)
+domain = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=127).domain()
+domain.grid["shape"]     # (128, 128) — nodes; a nodal field reshapes straight to it
 ```

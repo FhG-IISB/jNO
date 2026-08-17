@@ -58,19 +58,6 @@ def test_line_domain_exposes_named_endpoints():
             "line",
             {"x_range", "mesh_size", "algorithm", "time", "compute_mesh_connectivity"},
         ),
-        (
-            "equi_distant_rect",
-            {
-                "x_range",
-                "y_range",
-                "nx",
-                "ny",
-                "algorithm",
-                "time",
-                "compute_mesh_connectivity",
-            },
-        ),
-        ("poseidon", {"nx", "ny", "algorithm", "time", "compute_mesh_connectivity"}),
     ],
 )
 def test_geometry_shortcuts_expose_explicit_signatures(shape_name, expected_parameters):
@@ -243,10 +230,7 @@ class TestEquiDistantRect2DStationary:
 
     @pytest.fixture(scope="class")
     def dom(self):
-        return jno.domain(
-            constructor=jno.domain.equi_distant_rect(nx=5, ny=5),
-            compute_mesh_connectivity=True,
-        )
+        return jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=5).domain(compute_mesh_connectivity=True)
 
     def test_no_exception_on_creation(self, dom):
         assert dom is not None

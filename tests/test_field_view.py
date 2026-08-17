@@ -61,7 +61,7 @@ class TestFieldViewNodeConstruction:
 
     @pytest.fixture
     def setup(self):
-        domain = jno.domain.equi_distant_rect(nx=3, ny=3, time=(0.0, 1.0, 4))
+        domain = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=3).domain(time=(0.0, 1.0, 4))
         a = np.zeros((1, 4, 4, 4, 1), dtype=np.float32)
         a_var = domain.variable("a", a)
         x_var, y_var, t_var = domain.variable("interior")
@@ -137,7 +137,7 @@ class TestTemporalTargetCollection:
 
     @pytest.fixture
     def fv(self):
-        domain = jno.domain.equi_distant_rect(nx=3, ny=3, time=(0.0, 1.0, 4))
+        domain = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=3).domain(time=(0.0, 1.0, 4))
         a = np.zeros((1, 4, 4, 4, 1), dtype=np.float32)
         a_var = domain.variable("a", a)
         x_var, _, t_var = domain.variable("interior")
@@ -171,7 +171,7 @@ class TestTemporalTargetCollection:
 
 class TestCoordinateValidation:
     def _setup(self):
-        domain = jno.domain.equi_distant_rect(nx=3, ny=3)
+        domain = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=3).domain()
         a = np.zeros((1, 4, 4, 1), dtype=np.float32)
         a_var = domain.variable("a", a)
         x_var, y_var, _ = domain.variable("interior")
@@ -225,7 +225,7 @@ def _make_spatial_setup(field_values: np.ndarray):
     H, W = field.shape[:2]
     if field.ndim == 2:
         field = field[..., None]
-    domain = jno.domain.equi_distant_rect(nx=H - 1, ny=W - 1)
+    domain = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=(H - 1, W - 1)).domain()
     a_var = domain.variable("a", field[None])  # add batch dim
     x_var, y_var, _ = domain.variable("interior")
     mesh_pts = jnp.asarray(domain.mesh_connectivity["points"])
@@ -303,7 +303,7 @@ def _make_spatiotemporal_setup(field_values: np.ndarray, t_vals: np.ndarray):
     if field.ndim == 3:
         field = field[..., None]
     t0, t1 = float(t_vals[0]), float(t_vals[-1])
-    domain = jno.domain.equi_distant_rect(nx=H - 1, ny=W - 1, time=(t0, t1, T))
+    domain = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=(H - 1, W - 1)).domain(time=(t0, t1, T))
     field_b = field[None]  # (1, T, H, W, C)
     a_var = domain.variable("a", field_b)
     x_var, y_var, t_var = domain.variable("interior")
@@ -471,8 +471,13 @@ class TestArithmeticPreservation:
         u = a_var.field.bind(x=x_var, y=y_var)
         val_u = np.squeeze(_eval_direct(u.xx.expr, ctx))
         val_shifted = np.squeeze(_eval_direct((u + 5.0).xx.expr, ctx))
-        # FD of (u + constant) should equal FD of u; tolerate float32 rounding
-        np.testing.assert_allclose(val_u, val_shifted, atol=1e-4)
+        # Both must be the TRUE second derivative, 2, and not merely agree with each other. The domain
+        # here is a `.structured()` lattice, so the FD path is the direct stencil; on the unstructured
+        # mesh this used to be built on, both spellings were off by 1.33 AT THE BOUNDARY and the test
+        # passed anyway, because it only compared them to one another.
+        np.testing.assert_allclose(val_u, 2.0, atol=5e-4)
+        np.testing.assert_allclose(val_shifted, 2.0, atol=5e-4)
+        np.testing.assert_allclose(val_u, val_shifted, atol=5e-4)
 
 
 # ---------------------------------------------------------------------------
@@ -509,7 +514,7 @@ class TestNonSquareDomain:
         ys = np.linspace(0.0, 1.0, W, dtype=np.float32)
         xx, yy = np.meshgrid(xs, ys, indexing="ij")
         field = (yy**2)[..., None]  # (H, W, 1); ∂²/∂y² = 2
-        domain = jno.domain.equi_distant_rect(nx=H - 1, ny=W - 1)
+        domain = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=(H - 1, W - 1)).domain()
         a_var = domain.variable("a", field[None])
         x_var, y_var, _ = domain.variable("interior")
         mesh_pts = jnp.asarray(domain.mesh_connectivity["points"])
@@ -593,7 +598,7 @@ class TestMinConsecutiveGuard:
 class TestHigherOrderChainNodes:
     @pytest.fixture
     def fv_xt(self):
-        domain = jno.domain.equi_distant_rect(nx=3, ny=3, time=(0.0, 1.0, 4))
+        domain = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=3).domain(time=(0.0, 1.0, 4))
         a = np.zeros((1, 4, 4, 4, 1), dtype=np.float32)
         a_var = domain.variable("a", a)
         x_var, y_var, t_var = domain.variable("interior")

@@ -72,10 +72,13 @@ _FACES = {
 def make_periodic_domain():
     """Structured (periodic-compatible) rectangular domain on [0,1]^2, with each face named via
     ``domain.tag`` -- required for multi-direction periodicity so the shared corners are recovered."""
-    dom = jno.domain(
-        constructor=jno.domain.equi_distant_rect(x_range=(0.0, 1.0), y_range=(0.0, 1.0), nx=N_GRID, ny=N_GRID),
-        time=(0.0, T_END, N_TIME),
-        compute_mesh_connectivity=False,
+    dom = (
+        jno.Shape.rect(0.0, 0.0, 1.0, 1.0)
+        .structured(n=N_GRID)
+        .domain(
+            time=(0.0, T_END, N_TIME),
+            compute_mesh_connectivity=False,
+        )
     )
     for nm, pred in _FACES.items():
         dom.tag(nm, pred)

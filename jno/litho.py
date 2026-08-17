@@ -197,10 +197,13 @@ def _peb_develop(img, period, r):
     n, (k1, k2, k3, k4, k5) = r.n, r.k
     d_a, d_b = r.rho_a**2 / (2.0 * r.t_peb), r.rho_b**2 / (2.0 * r.t_peb)
 
-    dom = jno.domain(
-        constructor=jno.domain.equi_distant_rect(x_range=(0.0, Px), y_range=(0.0, Py), nx=n, ny=n),
-        time=(0.0, r.t_peb, r.steps),
-        compute_mesh_connectivity=False,
+    dom = (
+        jno.Shape.rect(0.0, 0.0, Px, Py)
+        .structured(n=n)
+        .domain(
+            time=(0.0, r.t_peb, r.steps),
+            compute_mesh_connectivity=False,
+        )
     )
     ex, ey = 1e-6 * Px, 1e-6 * Py
     for nm, pred in {

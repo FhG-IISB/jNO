@@ -23,6 +23,7 @@ _MODEL_SEQ = itertools.count()
 
 # gmsh element type ids
 _TRI = 2
+_QUAD = 3  # 4-node quadrilateral (gmsh element type), from recombining two triangles
 _TET = 4
 _LINE = 1
 _POINT = 15  # 1-node point element (the boundary block of a 1-D domain)
@@ -234,7 +235,13 @@ def _apply_size_fields(dim: int, leaves, labels: Dict[int, Tuple[int, str]], sha
         fns = tuple(callables)
 
         def _size_cb(cdim, ctag, x, y, z, lc, _fns=fns):
-            return float(min([lc] + [float(f(x, y, z)) for f in _fns]))
+            # `np.asarray(...).reshape(-1)[0]` rather than `float(...)`: a size function that returns a
+            # 1-element ARRAY -- which any numpy-vectorised one does -- makes bare `float()` raise, and
+            # an exception inside gmsh's C callback surfaces as `lc = 0` ("Wrong mesh element size
+            # lc = 0"), naming neither the callback nor the shape it came from.
+            import numpy as _np
+
+            return float(min([lc] + [float(_np.asarray(f(x, y, z)).reshape(-1)[0]) for f in _fns]))
 
         gmsh.model.mesh.setSizeCallback(_size_cb)
 
@@ -289,7 +296,12 @@ _TRI6, _TET10, _LINE3 = 9, 11, 8
 
 
 def _to_meshio(
-    dim: int, labels: Dict[int, Tuple[int, str]], region_items=None, nonconforming: bool = False, order: int = 1
+    dim: int,
+    labels: Dict[int, Tuple[int, str]],
+    region_items=None,
+    nonconforming: bool = False,
+    order: int = 1,
+    cell=None,
 ):
     """Assemble the generated gmsh mesh into a ``meshio.Mesh`` with named ``cell_sets``.
 
@@ -324,7 +336,17 @@ def _to_meshio(
         vtype, npv, vblock = (_TET10, 10, "tetra10") if curved else (_TET, 4, "tetra")
         btype, npb, bblock = (_TRI6, 6, "triangle6") if curved else (_TRI, 3, "triangle")
     else:
-        vtype, npv, vblock = (_TRI6, 6, "triangle6") if curved else (_TRI, 3, "triangle")
+        if cell == "quad":
+            # Recombined 2-D: the volume block is quadrilaterals; the boundary is still 2-node edges,
+            # because a quad's facet is a straight edge exactly as a triangle's is.
+            if curved:
+                raise NotImplementedError(
+                    "Shape.quad().curved() is not supported: curved (isoparametric) geometry is order-2 "
+                    "simplices only, and a curved quadrilateral needs its own 9-node block."
+                )
+            vtype, npv, vblock = _QUAD, 4, "quad"
+        else:
+            vtype, npv, vblock = (_TRI6, 6, "triangle6") if curved else (_TRI, 3, "triangle")
         btype, npb, bblock = (_LINE3, 3, "line3") if curved else (_LINE, 2, "line")
 
     _vtags, vnodes = gmsh.model.mesh.getElementsByType(vtype)
@@ -526,6 +548,38 @@ def _build_once(shape, split_full, periodic=None, algorithm=None, threads=None, 
         ds = _apply_region_sizes(dim, shape) or _apply_size_fields(dim, leaves, labels, shape)
         if periodic:  # make named opposite faces conform (edge-element periodic ties need it)
             _apply_periodic(dim, labels, periodic)
+        # The cell choice comes from the tree walk, not from the top shape's own `_cell`. A regions
+        # group (`a.quad() + b.quad()`) is a fresh node that holds no cell of its own, so reading the
+        # top level meshed it as triangles -- 52 of them, measured, with no word about it -- while
+        # `cell_choices()` correctly reported {"quad"} two lines above. One derivation, one answer.
+        _choices = shape.cell_choices() if hasattr(shape, "cell_choices") else frozenset()
+        if len(_choices) > 1:
+            raise NotImplementedError(
+                f"this plan asks for more than one cell type ({', '.join(sorted(_choices))}). gmsh could "
+                "mesh it -- recombination is per-surface, and in 2-D the two regions conform along a "
+                "shared edge -- but jNO's assembler carries ONE element table and ONE cell array, so the "
+                "mesh would build and fail to assemble. Use a single cell type for now; to combine two "
+                "meshes today, mesh the regions independently with Shape.regions(..., conforming=False) "
+                "and tie them with u('a|b.a') - u('a|b.b')."
+            )
+        _cell = next(iter(_choices), None)
+        if _cell == "quad" and dim == 3:
+            # Checked here rather than in `Shape.quad()` so that `.quad()` and `.structured()` compose
+            # in either order -- only the finished plan knows whether a lattice sits under the request.
+            # A structured plan never reaches this function at all; it is meshed by `Geometries`.
+            raise NotImplementedError(
+                "Shape.quad() on a 3-D shape needs a regular lattice: gmsh cannot hexahedral-mesh "
+                "general geometry (Recombine3DAll on a plain box returns 944 tetrahedra and no "
+                "hexahedra). Add .structured() -- `Shape.box(...).structured().quad()`."
+            )
+        if _cell == "quad":
+            # Mesh triangles, then RECOMBINE them into quadrilaterals. This is gmsh's only general
+            # route to a quad mesh and it works on arbitrary 2-D geometry -- measured, a disk
+            # recombines to 69 pure quads and a rectangle to 78, neither leaving any triangle behind.
+            # (The 3-D analogue does not exist: `Recombine3DAll` on a plain box returns 944 tets and
+            # no hexes, which is why `Shape.quad()` refuses a 3-D shape rather than quietly meshing
+            # it with tetrahedra.)
+            gmsh.option.setNumber("Mesh.RecombineAll", 1)
         gmsh.model.mesh.generate(dim)
         if int(order) > 1:
             # CURVED (isoparametric) geometry. Without this the mesh is straight-sided and jNO
@@ -539,7 +593,7 @@ def _build_once(shape, split_full, periodic=None, algorithm=None, threads=None, 
         is_regions = shape._node[0] == "regions"
         region_items = shape._node[1] if is_regions else None
         nonconforming = is_regions and len(shape._node) > 2 and not shape._node[2]
-        mesh = _to_meshio(dim, labels, region_items, nonconforming=nonconforming, order=int(order))
+        mesh = _to_meshio(dim, labels, region_items, nonconforming=nonconforming, order=int(order), cell=_cell)
         return mesh, dim, ds
     finally:
         gmsh.model.remove()

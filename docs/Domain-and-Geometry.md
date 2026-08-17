@@ -55,6 +55,7 @@ a - b     # cut         a | b     # fuse         a & b     # intersect
 | `.translate(v)` · `.rotate(axis_point, axis_dir, angle)` | place/orient (names are preserved) |
 | `.fillet(radius, where=None)` | round edges; `where=f(x,y,z)` selects them by midpoint |
 | `.sized(size)` | set the target mesh size (scalar or `f(x,y,z)`) |
+| `.structured(n=None)` | mesh an axis-aligned rect/box as a regular lattice (see below) |
 
 `extrude` is a special case of `sweep`; `revolve` is a distinct rotation. Mesh size lives on the
 **shape** it describes, not on `jno.domain`.
@@ -118,6 +119,60 @@ solid.sized(lambda x, y, z: 0.03 + 0.10 * y)    # graded: denser where the funct
 
 So "denser in a region" = give a small `size=` to the shape covering it, or a callable that is small
 there.
+
+### Cell shape — `.quad()`
+
+Meshes are simplicial by default (triangles, tetrahedra). `.quad()` asks gmsh to recombine them into
+**quadrilaterals**, which works on any 2-D geometry:
+
+```python
+d = Shape.disk(0, 0, 1, size=0.1).quad().domain()      # pure quads, curved boundary and all
+(plate.quad() - hole).sized(0.05)                       # survives the plan operators, like .sized()
+```
+
+Like `size=` and `.curved()`, this is a property of the shape rather than an argument to the solve.
+
+**3-D needs `.structured()`.** gmsh cannot hexahedral-mesh general geometry — `Recombine3DAll` on a
+plain box returns 944 tetrahedra and no hexahedra — so hexes come from a regular lattice:
+
+```python
+d = Shape.box(0, 0, 0, 1, 1, 1).structured(n=16).quad().domain()    # 4096 hexahedra
+d = Shape.rect(0, 0, 1, 1).structured(n=40).quad().domain()          # 1600 quadrilaterals
+```
+
+`.quad()` and `.structured()` compose in either order.
+
+### Regular lattices — `.structured()`
+
+`.structured()` meshes an axis-aligned `rect`/`box` as a regular grid instead of calling gmsh. Three
+things follow that a gmsh mesh cannot give:
+
+* **hexahedra**, as above — the lattice is the one 3-D plan that can be hex-meshed;
+* **a grid descriptor** on `domain.grid`, which is what lets `jno.fdm` take its assembly-free 5-/7-point
+  stencils instead of the cotangent operator, and what a nodal field reshapes against;
+* **exactly matched opposite faces**, so a whole-domain periodic tie collapses onto one DOF rather
+  than holding to a tolerance.
+
+```python
+d = Shape.rect(0, 0, 1, 1, size=0.1).structured().domain()   # counts from size=: 10x10 cells
+d = Shape.box(...).structured(n=(32, 16, 16)).domain()       # explicit, per axis
+
+d.grid          # {"shape": (Nx, Ny[, Nz]), "spacing": (...), "origin": (...)}
+u.reshape(d.grid["shape"])                                    # nodes are C-ordered
+```
+
+`n` counts **cells**, so a lattice has `n + 1` nodes per axis and `d.grid["shape"]` is `n + 1` —
+consistent with the `nx`/`ny`/`nz` of every other grid in jNO. A 128×128 *pixel* grid for a
+foundation model is therefore `.structured(n=127)`. Omit `n` to derive it from the shape's `size=`.
+
+A plan that cannot be a lattice — a CSG cut, a disk, a graded `size=` callable, `.curved()` — is
+**refused by name** rather than quietly meshed with gmsh, since the caller who then reads `d.grid` or
+expects hexes would otherwise fail somewhere else. The named faces (`left`/`right`/`bottom`/`top`,
+plus `front`/`back` in 3-D), `boundary`, `interior`, and any `.name()`/`.attach()` region come with
+the lattice as usual.
+
+See the FEM guide's tensor-product section for what these support: volume terms and Dirichlet
+conditions work; surface integrals, `order > 1` and h-adaptivity refuse by name.
 
 ### Multi-material regions
 
@@ -254,6 +309,29 @@ alongside the union `"a|b"`.
 ```python
 d = jno.domain("part.msh")     # .msh / .vtk / .med … built anywhere (gmsh, CAD, …)
 ```
+
+`interior` and `boundary` are **derived automatically** when the file does not define them, so a
+mesh exported from anywhere is immediately usable — no physical groups required. The boundary is
+topological (facets belonging to exactly one cell), which is also the only option for the many
+files that store no surface block at all. Names the file *does* define always win: a physical group
+called `boundary` keeps its own meaning, and only the missing tag is derived.
+
+When the boundary falls into more than one connected shell, each is additionally exposed as
+`boundary_0`, `boundary_1`, … so an internal cavity or a second body can be addressed on its own; a
+single-shell part gains no numbered tags.
+
+Two kinds of file are refused rather than half-loaded, both by name:
+
+- **Mixed cell types** (a mesh with both tetrahedra and hexahedra, say). jNO assembles on one
+  element family, so it would otherwise take the first block it recognised and silently ignore the
+  rest — measured on a real gmsh benchmark as 70 % of the domain. The error reports the blocks and
+  how many cells would be lost.
+- **A surface (shell) mesh** — triangles in 3-D with no volume behind them, a routine CAD/STL
+  export. Solving on a manifold is a different discretisation, not a missing setting.
+
+Reader limits are reported as such rather than as jNO errors: an unsupported `.msh` version (only
+2.2 and 4.1 are read) and gmsh element types meshio does not implement both say so, and say what to
+re-export.
 
 **Point cloud** — coordinates you already have (no mesh, so no `.integrate()`/FD):
 

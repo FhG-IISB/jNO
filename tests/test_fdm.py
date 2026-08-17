@@ -508,7 +508,7 @@ def test_periodic_poisson():
     Dirichlet u=0 in y ⇒ u = sin(2πx)sin(πy). The tie holds to machine precision."""
     import jno.jnp_ops as jnn
 
-    d = jno.domain(jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.08), structured=True)
+    d = jno.domain(jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.08).structured())
     p = _nodes(d)
     x, y, _ = d.variable("interior", split=True)
     xl, yl, _ = d.variable("left", split=True)

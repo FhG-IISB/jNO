@@ -25,9 +25,12 @@ def _x64():
 
 def _heat(nonlinear=False):
     """Transient heat on the unit square, IC sin(pi x) sin(pi y), homogeneous Dirichlet."""
-    dom = jno.domain(
-        constructor=jno.domain.equi_distant_rect(x_range=(0.0, 1.0), y_range=(0.0, 1.0), nx=12, ny=12),
-        time=(0.0, 0.02, 11),
+    dom = (
+        jno.Shape.rect(0.0, 0.0, 1.0, 1.0)
+        .structured(n=12)
+        .domain(
+            time=(0.0, 0.02, 11),
+        )
     )
     dom.tag("bnd", lambda x, y: (x < 1e-6) | (x > 1 - 1e-6) | (y < 1e-6) | (y > 1 - 1e-6))
     u, phi = dom.fem_symbols()
@@ -94,10 +97,13 @@ def test_block_step_periodic_reduced_space(_x64):
     import jno.jnp_ops as jnn
 
     n = 12
-    dom = jno.domain(
-        constructor=jno.domain.equi_distant_rect(x_range=(0.0, 1.0), y_range=(0.0, 1.0), nx=n, ny=n),
-        time=(0.0, 0.02, 11),
-        compute_mesh_connectivity=False,
+    dom = (
+        jno.Shape.rect(0.0, 0.0, 1.0, 1.0)
+        .structured(n=n)
+        .domain(
+            time=(0.0, 0.02, 11),
+            compute_mesh_connectivity=False,
+        )
     )
     for nm, pred in {
         "left": lambda x, y: x < 1e-6,

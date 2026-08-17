@@ -234,7 +234,7 @@ class DifferentialOperators:
                        ``"inverse_distance"``, ``"least_squares"``.
             grid:      Optional structured-grid descriptor
                        ``{"shape": (Nx, Ny), "spacing": (hx, hy), ...}`` (from
-                       ``jno.domain(..., structured=True)``, node order
+                       ``jno.Shape.rect(...).structured().domain()``, node order
                        ``idx(i, j) = i·Ny + j``). When given, the triangulation
                        is bypassed and the derivative is the direct central
                        finite difference on the regular grid (2nd-order
@@ -386,7 +386,7 @@ class DifferentialOperators:
                        or ``"lsq_of_gradient"``.
             grid:      Optional structured-grid descriptor
                        ``{"shape": (Nx, Ny), "spacing": (hx, hy), ...}`` (from
-                       ``jno.domain(..., structured=True)``). When given, ``Δu``
+                       ``jno.Shape.rect(...).structured().domain()``). When given, ``Δu``
                        is the direct 5-point finite-difference stencil
                        ``Σ_d (u₊ − 2u + u₋)/h_d²`` on the regular grid — the fast
                        path ``jno.fdm`` takes on a structured mesh; the
@@ -521,7 +521,7 @@ class DifferentialOperators:
             triangles: Triangle connectivity, shape ``(M, 3)``.
             var_dims:  List of ``(i, vi_dim, j, vj_dim)`` tuples.
             grid:      Optional structured-grid descriptor (from
-                       ``jno.domain(..., structured=True)``). When given, the
+                       ``jno.Shape.rect(...).structured().domain()``). When given, the
                        second derivatives are the direct grid stencils
                        (``∂²/∂x²``, ``∂²/∂y²`` central; the mixed ``∂²/∂x∂y`` a
                        nested central difference) instead of the triangulation

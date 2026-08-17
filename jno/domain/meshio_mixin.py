@@ -28,13 +28,66 @@ class MeshIOMixin(MeshUtils):
         if not Path(mesh_file).exists():
             raise FileNotFoundError(f"Mesh file not found: {mesh_file}")
 
-        self.mesh = meshio.read(mesh_file)
+        try:
+            self.mesh = meshio.read(mesh_file)
+        except KeyError as exc:  # an element type meshio does not know
+            # gmsh writes numeric element type ids; meshio raises a bare `KeyError: 140` naming
+            # neither the file nor the element, which reads as a jNO bug when the file is fine and
+            # the reader simply has not implemented that element. 140 is a "trihedron", emitted by
+            # quad-tri transition meshing.
+            known = {140: "trihedron (a quad-tri transition element)", 15: "point"}
+            tid = exc.args[0] if exc.args else "?"
+            hint = known.get(int(tid), "an element type meshio does not implement") if str(tid).isdigit() else ""
+            raise NotImplementedError(
+                f"{mesh_file}: the mesh reader does not support gmsh element type {tid}"
+                f"{f' -- {hint}' if hint else ''}. The FILE is valid; meshio cannot represent that "
+                "element. Re-mesh without it (for gmsh, transition elements come from mixed "
+                "quad/tri meshing) or convert the file with gmsh first."
+            ) from exc
+        except Exception as exc:
+            msg = str(exc)
+            if "mesh format" in msg.lower():
+                # meshio reads MSH 2.2 and 4.1 only; gmsh will happily write 3, and older tools
+                # still emit it.
+                raise NotImplementedError(
+                    f"{mesh_file}: unsupported .msh format version -- the reader accepts 2.2 and "
+                    f"4.1. Re-export from gmsh with `-format msh41` (or `msh22`). ({msg})"
+                ) from exc
+            raise
 
         points = self.mesh.points  # type: ignore[attr-defined]
         if points.shape[1] == 3 and np.allclose(points[:, 2], 0):
             self.dimension = 2
         else:
             self.dimension = points.shape[1]
+        self._refuse_volumeless_mesh(mesh_file)
+
+    def _refuse_volumeless_mesh(self, mesh_file: str) -> None:
+        """Refuse a mesh with no space-filling cells for its dimension — a surface/shell mesh.
+
+        A file of triangles whose z-coordinates vary is a *surface* embedded in 3-D, not a solid:
+        CAD and STL pipelines export these routinely. jNO infers dimension 3, finds no tetrahedra,
+        and the boundary machinery then reduces over an empty set, which surfaced as numpy's
+        ``zero-size array to reduction operation maximum`` — an internal error that says nothing
+        about the file. Manifold (shell) FEM is a different discretisation, not a missing setting.
+        """
+        from .mesh_utils import base_cell_type
+
+        # `base_cell_type` maps a CURVED block to its first-order name (tetra10 -> tetra). Without it
+        # an order-2 mesh looks volume-less and would be refused as a shell.
+        cd = {base_cell_type(n) for n in (getattr(self.mesh, "cells_dict", None) or {})}
+        volume = {1: ("line",), 2: ("triangle", "quad"), 3: ("tetra", "hexahedron")}.get(int(self.dimension), ())
+        if any(n in cd for n in volume):
+            return
+        present = sorted(n for n in cd if n not in ("vertex", "point"))
+        raise NotImplementedError(
+            f"{mesh_file}: this is a {self.dimension}-D mesh with no volume cells -- it carries "
+            f"{present or 'no'} cells, none of which fill space in {self.dimension}-D. It is a "
+            "SURFACE (shell) mesh, and solving on a manifold is a different discretisation jNO does "
+            "not implement. If it is meant to be a solid, mesh its interior (in gmsh: build a volume "
+            "from the surface and mesh in 3-D); if it is meant to be flat, drop the z-coordinate so "
+            "it loads as a 2-D domain."
+        )
 
     def _write_meshio_safely(self, save_path: str, file_format: Optional[str] = None):
         """Write mesh with meshio, falling back to a cell_set-free copy if needed."""

@@ -72,14 +72,22 @@ def _ref_hessian_from_tab(tab: np.ndarray, dim: int) -> np.ndarray:
     return H
 
 
-def lagrange_interp_points(dim: int, degree: int) -> np.ndarray:
-    """Reference interpolation points of the degree-``k`` Lagrange simplex, in basix DOF order
-    (vertices, then per-edge, per-face, interior nodes). :func:`fem_utils._promote_to_degree` maps these
-    through each cell's affine geometry to place the global P{k} mesh nodes; the order matches the basis
-    tabulated by :func:`lagrange_triangle` / :func:`lagrange_tet` (same builder)."""
+def lagrange_interp_points(dim: int, degree: int, cell_type: Optional[str] = None) -> np.ndarray:
+    """Reference interpolation points of the degree-``k`` Lagrange element, in basix DOF order
+    (vertices first, then per-edge, per-face, interior nodes).
+
+    :func:`fem_utils._promote_to_degree` maps these through each cell's geometry to place the global
+    P{k} / Q{k} mesh nodes, and the order matches the basis tabulated by :func:`lagrange_on` — the
+    same builder, which is what keeps the node positions and the DOF numbering from drifting apart.
+
+    ``cell_type`` names the cell; without it the dimension picks the simplex, which is what every
+    caller predating tensor-product cells means. Note a tensor-product cell has interpolation points
+    a simplex does not: a Q2 quadrilateral carries a cell-INTERIOR node (and a Q2 hexahedron a
+    face-interior one too), where a P2 triangle has none.
+    """
     from basix import CellType
 
-    cell = CellType.triangle if dim == 2 else CellType.tetrahedron
+    cell = basix_cell(cell_type)[0] if cell_type else (CellType.triangle if dim == 2 else CellType.tetrahedron)
     return np.asarray(_lagrange_basix(cell, degree).points)
 
 
@@ -191,6 +199,150 @@ def lagrange_tet(degree: int, quad_degree: Optional[int] = None) -> ElementSpec:
         local_edges=BASIX_TET_EDGES,
         ref_hess=_ref_hessian_from_tab(tab, 3),  # (n_quad, n_dof, 1, 3, 3) for 4th-order weak forms
     )
+
+
+#: meshio/VTK cell name -> (basix CellType name, topological dimension).
+_BASIX_CELL = {
+    "line": ("interval", 1),
+    "interval": ("interval", 1),
+    "triangle": ("triangle", 2),
+    "tetra": ("tetrahedron", 3),
+    "tetrahedron": ("tetrahedron", 3),
+    "quad": ("quadrilateral", 2),
+    "quadrilateral": ("quadrilateral", 2),
+    "hexahedron": ("hexahedron", 3),
+    "hex": ("hexahedron", 3),
+}
+
+
+def basix_cell(cell_type: str):
+    """The basix ``CellType`` for a meshio cell name, and its topological dimension."""
+    from basix import CellType
+
+    entry = _BASIX_CELL.get(cell_type)
+    if entry is None:
+        raise NotImplementedError(
+            f"cell type {cell_type!r} has no basix element in jNO (line / triangle / tetra / quad / hexahedron)."
+        )
+    name, tdim = entry
+    return getattr(CellType, name), tdim
+
+
+def lagrange_on(cell_type: str, degree: int, quad_degree: Optional[int] = None) -> ElementSpec:
+    """Lagrange Q/P{degree} ``ElementSpec`` on any supported cell, tabulated via basix.
+
+    The generic form of :func:`lagrange_interval` / :func:`lagrange_triangle` / :func:`lagrange_tet`
+    -- those three differed only in the cell they named and how many derivative blocks they stacked,
+    which is ``tdim``. Writing it once is what lets a quadrilateral or hexahedron join without a
+    fourth and fifth near-copy, and it keeps one guarantee that matters: the mesh node generator
+    (:func:`lagrange_interp_points`) and the basis tabulation go through the same builder, so their
+    DOF order cannot drift apart.
+
+    **Quadrature degree on a tensor-product cell.** The ``2*degree + 1`` default is chosen to be
+    exact for an affine simplex, where ``detJ`` is constant. A bilinear quad or trilinear hex has a
+    non-constant Jacobian, so ``1/detJ`` makes the integrand rational and no polynomial rule is
+    exact -- the same situation curved cells are already in, and the caller raises the degree for
+    them. The default is kept here so the two paths stay comparable, and the bump lives with the
+    caller that knows the geometry.
+    """
+    import basix
+
+    if degree < 1:
+        raise ValueError(f"lagrange_on: degree must be >= 1; got {degree}.")
+    cell, tdim = basix_cell(cell_type)
+    qd = quad_degree if quad_degree is not None else 2 * degree + 1
+    elem = _lagrange_basix(cell, degree)
+    qp, qw = basix.make_quadrature(cell, qd)
+    tab = elem.tabulate(2, qp)  # (n_blocks, n_quad, n_dof, 1): values, 1st and 2nd ref derivatives
+    return ElementSpec(
+        family=f"Lagrange-P{degree}-{basix.CellType(cell).name}",
+        n_dof=int(elem.dim),
+        value_size=1,
+        quad_points=np.asarray(qp),
+        quad_weights=np.asarray(qw),
+        ref_values=np.asarray(tab[0]),  # (n_quad, n_dof, 1)
+        ref_div=None,
+        ref_grads=np.stack([np.asarray(tab[i]) for i in range(1, tdim + 1)], axis=-1),
+        local_edges=tuple(tuple(e) for e in basix.topology(cell)[1]) if tdim > 1 else ((0, 1),),
+        ref_hess=_ref_hessian_from_tab(tab, tdim),
+    )
+
+
+def _invert_tensor_map(V: np.ndarray, x: np.ndarray, cell: str, *, iters: int = 12):
+    """Reference coordinates of ``x`` inside trilinear cells ``V``, by Newton on the isoparametric map.
+
+    A simplex map is affine, so its inverse is one linear solve — which is why the branch opposite is
+    exact and non-iterative. A quadrilateral or hexahedron maps ``x(xi) = sum_a N_a(xi) x_a`` with
+    ``N`` bi/trilinear, so the inverse has no closed form and is found by Newton from the cell centre:
+    ``xi <- xi - J^-1 (x(xi) - x)`` with ``J = sum_a x_a (dN_a/dxi)``.
+
+    ``V`` is ``(..., n_local, dim)`` in **basix** vertex order and ``x`` is ``(..., dim)``. Returns
+    ``(xi, N)`` — the reference coordinates ``(..., tdim)`` and the shape-function values there
+    ``(..., n_local)``, so a caller gets both the coordinates it needs for a higher-order tabulation
+    and the weights it needs for a Q1 stencil.
+
+    Newton converges quadratically on a convex cell and is started at the centre, so 12 iterations is
+    far more than needed for a mesh whose cells are not degenerate; it is a fixed count rather than a
+    tolerance loop so the whole batch stays vectorised.
+    """
+    from .fem_lagrange import _lagrange_basix, basix_cell
+
+    bcell, tdim = basix_cell(cell)
+    elem = _lagrange_basix(bcell, 1)
+
+    def tab(xi_flat):
+        t = np.asarray(elem.tabulate(1, xi_flat))  # (1 + tdim, Q, n_local, 1)
+        return t[0, :, :, 0], np.moveaxis(t[1 : tdim + 1, :, :, 0], 0, -1)  # N (Q,A), dN (Q,A,T)
+
+    shp = x.shape[:-1]
+    Vf = V.reshape(-1, V.shape[-2], V.shape[-1])
+    xf = x.reshape(-1, x.shape[-1])
+    xi = np.full((Vf.shape[0], tdim), 0.5)
+    for _ in range(iters):
+        N, dN = tab(xi)
+        J = np.einsum("cai,cak->cik", Vf, dN)  # (C, dim, tdim)
+        r = np.einsum("ca,cai->ci", N, Vf) - xf  # residual x(xi) - x
+        det = np.linalg.det(J)
+        Jsafe = np.where((np.abs(det) > 1e-300)[:, None, None], J, np.eye(tdim))
+        xi = xi - np.linalg.solve(Jsafe, r[..., None])[..., 0]
+        xi = np.clip(xi, -1.0, 2.0)  # keep a bad start from diverging out of the basis' useful range
+    N, _ = tab(xi)
+    return xi.reshape(*shp, tdim), N.reshape(*shp, Vf.shape[1])
+
+
+def vtk_to_basix_vertex_perm(cell_type: str) -> np.ndarray:
+    """Permutation taking a cell's meshio/VTK vertex order to basix's, as basix-index -> VTK-index.
+
+    The two libraries number a reference cell differently, and only for the tensor-product cells:
+    an interval, triangle and tetrahedron have the same vertex order in both, but VTK walks a
+    quadrilateral's vertices **around its perimeter** (0,0), (1,0), (1,1), (0,1) while basix orders
+    them **lexicographically** (0,0), (1,0), (0,1), (1,1) -- so VTK's nodes 2 and 3 are basix's 3
+    and 2. On a hexahedron the same disagreement applies to both of its faces.
+
+    Feeding a VTK-ordered cell to a basix-tabulated basis without this permutation does not fail
+    loudly: it silently evaluates the basis with two corners swapped, which for a quad is a
+    self-intersecting (bow-tie) map with a Jacobian that changes sign inside the cell.
+
+    Derived from the reference geometries rather than written out, so it cannot drift if either
+    library renumbers.
+    """
+    import basix
+
+    cell, tdim = basix_cell(cell_type)
+    ref = np.asarray(basix.geometry(cell))  # (n_vertices, tdim), basix order
+    if cell_type in ("quad", "quadrilateral"):
+        vtk = np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]])
+    elif cell_type in ("hexahedron", "hex"):
+        base = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
+        vtk = np.array([b + [z] for z in (0.0, 1.0) for b in base])
+    else:
+        return np.arange(len(ref), dtype=np.int64)  # simplices already agree
+    # basix DOF b sits at ref[b]; find which VTK slot holds that same corner.
+    matches = np.all(np.isclose(vtk[None, :, :], ref[:, None, :], atol=1e-12), axis=-1)
+    perm = np.argmax(matches, axis=1)
+    if not matches.any(axis=1).all() or len(set(perm.tolist())) != len(ref):
+        raise RuntimeError(f"could not match basix and VTK vertices for {cell_type!r}")
+    return perm.astype(np.int64)
 
 
 def identity_pushforward(
