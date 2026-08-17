@@ -703,7 +703,7 @@ onto one DOF, so the periodicity holds exactly rather than to a tolerance.
 | not supported on quad/hex | why |
 |---|---|
 | **integrated (mortar)** ties across a hexahedral facet | the mortar rows clip triangles and have no quadrilateral analogue. The **collocated** coupling does support it, and is what a hex tie uses — see below |
-| **h-adaptive remeshing on HEXES** (`adapt=`) | not for want of plumbing: no general all-hex mesher exists (gmsh's `Recombine3DAll` on a plain box returns tetrahedra and no hexahedra), so there is nothing to remesh *to*. 3-D tensor-product adaptivity needs octree refinement with hanging-node constraints — built for **2-D quads** (see below), not yet for hexes |
+| **h-adaptive re*meshing* on HEXES** (`adapt=`) | not for want of plumbing: no general all-hex mesher exists (gmsh's `Recombine3DAll` on a plain box returns tetrahedra and no hexahedra), so there is nothing to remesh *to*. Hexes adapt by **local refinement with hanging nodes** instead — `refine_domain`, see below |
 | **r-adaptivity** (`relocate=`) on quad/hex | the monitor, the cell measures and the validity check are all barycentric; a bilinear cell's validity is the sign of the sampled `det J`, not one determinant |
 | 4th-order forms (plates, phase-field) | the physical-Hessian push-forward assumes an affine cell — the same refusal curved simplices already carry |
 | non-nodal families (N1E, RT, Argyris, Morley) | Argyris and Morley are *defined* on triangles; the quad analogues (RTCF/NCE, Bogner–Fox–Schmit) are different elements |
@@ -788,7 +788,7 @@ at 4.1e-04 in float32 and would hide a constraint error of that size.
 The *integrated* (mortar) coupling still refuses on a quad facet: its rows clip triangles. Collocated
 weights are linearly complete and are what a hex tie — and a hanging node — actually needs.
 
-### Local refinement with hanging nodes (quadrilaterals)
+### Local refinement with hanging nodes (quadrilaterals and hexahedra)
 
 `adapt=jno.solve.remesh()` refines a quad mesh by rebuilding its `Shape` plan at a finer size field,
 which is global and needs a geometry to rebuild from. Splitting marked cells into four needs neither —
@@ -831,11 +831,47 @@ Two things in jNO assumed conformity and had to change with it, both silent when
   half-edges are *different* edges), and the duplicate splits the mesh along the interface while the
   area, the winding and the 2:1 balance all still check out.
 
-**Limitations, measured.** Quadrilaterals only — hexahedra need the octree bookkeeping and face-centre
-constraints (a hex face hangs on its centre and covers four sub-faces), which are not built. A hanging
-node **on a tied or periodic interface** is refused by name: that composes two prolongations and their
-order changes the answer. Not yet exposed as an `adapt=` slot — `refine_domain` is called directly, so
-the marking is the caller's.
+#### Hexahedra
+
+The same call refines a hex mesh, splitting each marked cell into 8. This is the **only** h-adaptivity
+a hex mesh has, for the reason in the scope table above: there is no all-hex mesher to remesh to.
+
+```python
+d = jno.Shape.box(0, 0, 0, 1, 1, 1).structured(n=4).quad().domain()   # .quad() on a 3-D lattice = hexes
+d = refine_domain(d, marked_cell_ids)
+```
+
+3-D adds a **second kind of constrained node**. A 2:1 face interface leaves the coarse face's four edge
+midpoints hanging on 2 parents each *and* its centre hanging on all 4 corners at ¼ each — 18 constrained
+nodes around a single refined interior hex (12 + 6). A hex face's map is bilinear, but its centre is the
+parameter point (½, ½) where the Q1 weights are exactly ¼ however the face is warped, so no Newton
+inversion is needed here (unlike the general non-matching tie above).
+
+On `-Δu = 1` over the unit cube against a uniform 16³ reference:
+
+| mesh | nodes | error |
+|---|---|---|
+| uniform 4³ | 125 | 6.0e-03 |
+| uniform 8³ | 729 | 1.1e-03 |
+| 4³ + 2 rounds into the centre | 1277 | **2.7e-04** |
+
+A quarter of the uniform mesh's error for 1.75× its nodes. The constraints are satisfied exactly (the
+DOFs are eliminated), and no hanging node acquires a hanging parent across the rounds.
+
+The subtlety 3-D adds is in the **boundary**: a refined face on the domain surface splits into four
+sub-faces that are still boundary, and whose corners include genuinely hanging edge midpoints (their
+edges are shared with unrefined neighbours). Only a node with as many parents as the facet has vertices
+— a face *centre* — proves a facet was covered. Treating every hanging node as proof of interiority
+deleted 9 faces of the cube's own surface: 96 where the answer is 105.
+
+**Limitations, measured.** A hanging node **on a tied or periodic interface** is refused by name: that
+composes two prolongations and their order changes the answer. Geometry is preserved exactly only for
+affine cells — a warped hexahedron's faces are non-planar, so a 0.06 warp on a 0.25 cell moves the total
+volume by 3.9e-04, shrinking as the mesh refines (the usual O(h²) straight-edge geometry error); the
+constraint weights stay exact regardless. Not yet exposed as an `adapt=` slot — `refine_domain` is
+called directly, so the marking is the caller's. The split is a Python loop over marked cells (27
+lattice points each in 3-D), which is fine for the cell counts adaptivity produces and is not tuned for
+refining a whole large mesh at once.
 
 Volume terms, Dirichlet conditions and **surface terms all work on both cells** — Neumann, Robin
 and flux integrals included.

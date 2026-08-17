@@ -4015,7 +4015,11 @@ def _fem_impl(
                     "away from the tied faces, or tie a conforming mesh."
                 )
             _hp = hanging_prolongation(
-                np.asarray(fem_obj.points), np.asarray(getattr(domain, "_fem_hanging_cells")), vec=vec or 1
+                np.asarray(fem_obj.points),
+                np.asarray(getattr(domain, "_fem_hanging_cells")),
+                vec=vec or 1,
+                hang=_hanging,
+                cell_type=getattr(domain, "_fem_hanging_cell_type", "quad"),
             )
             # Reduce the OPERATOR, not just record P: `reduce_op_periodic` is what turns the assembled
             # block into P^T A P. Setting `_periodic` alone leaves the raw non-conforming system in

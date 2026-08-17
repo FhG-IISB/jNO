@@ -4,11 +4,13 @@ The mesh half of hanging-node adaptivity: split marked cells into four, keep nei
 refinement level, and report which nodes ended up constrained. The constraint *weights* are proven
 separately (``tests/test_fem_hex_tie.py``); this file is about the mesh.
 
-**Not yet wired into `fem.solve`.** Assembling on the refined mesh needs one thing this does not
-provide: a boundary. jNO derives the boundary topologically -- a facet belonging to one cell -- and
-that rule is false on a non-conforming mesh, where a coarse cell's full edge and each of its
-neighbour's two half-edges all belong to exactly one cell. Measured below: 12 of 32 "boundary" edges
-are actually the 2:1 interface. So the pieces here are tested on their own until that is resolved.
+The solve itself is exercised in ``tests/test_fem_hanging_nodes.py``, and the 3-D case -- where the
+same interface also hangs on face CENTRES -- in ``tests/test_fem_refine_hexes.py``.
+
+The boundary gets its own section below, because the topological rule jNO derives it from ("a facet
+belonging to one cell") is false on the mesh this produces: a coarse cell's full edge and each of its
+neighbour's two half-edges all belong to exactly one cell. Measured below, 12 of 32 "boundary" edges
+are actually the 2:1 interface, and handing those to the solve pins the interface as Dirichlet.
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ import pytest
 
 from jno.domain.geometries import Geometries
 from jno.utils.solver.fem_facets import _boundary_faces, _face_table
-from jno.utils.solver.fem_refine import balance_marks, hanging_nodes, refine_quads
+from jno.utils.solver.fem_refine import balance_marks, boundary_facets, hanging_nodes, refine_quads
 
 
 def _grid(n=4):
@@ -135,16 +137,17 @@ def test_balance_marks_grows_the_marked_set_rather_than_the_caller_s():
     assert not any(n in hanging_nodes(p2, q2) for w in hanging_nodes(p2, q2).values() for n, _ in w)
 
 
-# ------------------------------------------------------- why this is not wired into the solve yet
+# --------------------------------------------------------------------------------- the boundary
 
 
 def test_the_topological_boundary_rule_fails_on_a_non_conforming_mesh():
-    """The blocker, pinned so it is not rediscovered.
+    """Pinned so it is not rediscovered, and because it is the rule the whole codebase is built on.
 
     jNO derives the boundary as "facets belonging to exactly one cell". On a 2:1 interface the coarse
     cell's full edge belongs to one cell, and so does each of the neighbour's two half-edges — so the
     interface is indistinguishable from the true perimeter by that rule alone. Assembling on such a
     mesh therefore pins the interface as a Dirichlet boundary, which is silent and wrong.
+    `boundary_facets` is the answer, asserted below.
     """
     pts, quads = _grid()
     lf, nfn = _face_table("quad")
@@ -168,3 +171,26 @@ def test_the_topological_boundary_rule_fails_on_a_non_conforming_mesh():
     )
     assert (~on_perimeter).sum() > 0, "the interface must be what makes this rule fail"
     assert (~on_perimeter).sum() == len(bf) - on_perimeter.sum() == 12
+
+
+def test_boundary_facets_returns_the_true_perimeter_instead():
+    """The replacement rule: a facet occurring once is still interior when the mesh COVERS it, and the
+    hanging nodes say exactly where that happens. 20 edges rather than 32, every one on the perimeter,
+    and a total length of exactly 4 — the unit square's."""
+    pts, quads = _grid()
+    assert len(boundary_facets(pts, quads)) == 16, "a conforming grid must be unaffected"
+
+    p1, q1 = refine_quads(pts, quads, _mark_near(pts, quads, (0.15, 0.15), 0.3))
+    be = boundary_facets(p1, q1)
+    assert len(be) == 20
+    on = [
+        np.all(
+            np.isclose(p1[e][:, 0], 0)
+            | np.isclose(p1[e][:, 0], 1)
+            | np.isclose(p1[e][:, 1], 0)
+            | np.isclose(p1[e][:, 1], 1)
+        )
+        for e in be
+    ]
+    assert all(on), "an interface edge survived into the boundary"
+    assert np.linalg.norm(p1[be[:, 0]] - p1[be[:, 1]], axis=1).sum() == pytest.approx(4.0, rel=1e-12)
