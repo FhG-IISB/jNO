@@ -56,3 +56,6 @@ benchmarks/
 .coverage
 coverage.xml
 _tutorials_archive/
+
+# gmsh scratch views written by size-field / background-mesh calls
+*.pos
