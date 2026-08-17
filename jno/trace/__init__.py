@@ -4787,6 +4787,14 @@ def cse(expr: Placeholder) -> Placeholder:
                 tuple((k, id(v)) for k, v in sorted(node.boundary_value_exprs.items())),
                 node.num_total_nodes,
             )
+        # Anything NOT listed above is keyed by IDENTITY, so it is merely never shared. Falling off
+        # the end into an implicit `None` made every unrecognised type share one key — `Noise`,
+        # `Integral`, `TemporalDerivative`, `StateField`, … all collapsed onto whichever the walk
+        # reached first, across types as readily as within one. That is a wrong *number*, silently:
+        # `gaussian(std=1) - gaussian(std=1000)` and `u.integrate() - v.integrate()` both came out
+        # identically zero. Sharing is an optimisation; not sharing an unknown node costs a
+        # re-evaluation, merging two costs correctness — so identity is the only safe default.
+        return (type(node).__name__, id(node))
 
     def _visit(node):
         """Post-order walk: canonicalise children first, then self."""
