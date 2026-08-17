@@ -4025,6 +4025,24 @@ def _fem_impl(
                     "interface composes two prolongations, and their order changes the answer. Refine "
                     "away from the tied faces, or tie a conforming mesh."
                 )
+            # The constraints are derived on the P1 VERTEX mesh -- a hanging node is an edge midpoint or
+            # a face centre of it -- so they only describe the whole space when the DOFs are those
+            # vertices. A P2 space adds edge and interior DOFs, and the ones on a coarse facet need that
+            # facet's QUADRATIC weights, which this does not build: the extra DOFs would simply stay
+            # free, leaving the interface discontinuous while every count still looked right. Measured
+            # before this guard, on -Lap u = 1 with the middle four cells refined: order 2 gave a centre
+            # value off by 9.1e-03, against 1.4e-03 for order 1 on the same mesh and 2.0e-05 for order 2
+            # on the mesh it was refined FROM -- i.e. refining made it worse, silently.
+            _n_vert = int(np.asarray(domain.mesh.points).shape[0])
+            if int(np.asarray(fem_obj.points).shape[0]) != _n_vert:
+                raise NotImplementedError(
+                    "jno.fem: local (hanging-node) refinement is wired for order-1 elements. This form "
+                    f"assembles {int(np.asarray(fem_obj.points).shape[0])} DOFs on a {_n_vert}-vertex mesh, "
+                    "so it carries DOFs that are not mesh vertices, and a hanging node's constraint is "
+                    "written in terms of vertices only -- the extra DOFs on a coarse facet would be left "
+                    "free and the solution discontinuous across the interface. Use order=1 on a refined "
+                    "mesh, or refine uniformly (which stays conforming, so no constraint is needed)."
+                )
             _hp = hanging_prolongation(
                 np.asarray(fem_obj.points),
                 np.asarray(getattr(domain, "_fem_hanging_cells")),

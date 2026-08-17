@@ -290,3 +290,44 @@ def test_a_vector_field_is_constrained_component_by_component(x64):
     for node, parents in d._fem_hanging_nodes.items():
         for c in range(2):
             assert s[node, c] == pytest.approx(sum(w * s[i, c] for i, w in parents), abs=1e-12)
+
+
+def test_a_higher_order_space_is_refused_rather_than_left_unconstrained(x64):
+    """The silent one, guarded.
+
+    Hanging constraints are derived on the P1 VERTEX mesh: a hanging node is an edge midpoint or a face
+    centre of it. A P2 space adds DOFs that are not vertices, and the ones lying on a coarse facet need
+    that facet's QUADRATIC weights -- which this does not build, so they would stay free and leave the
+    interface discontinuous while every count still looked right.
+
+    Measured before the guard, on -Lap u = 1 with the middle four cells refined: order 2 came back with a
+    centre value off by 9.07e-03, against 1.39e-03 for order 1 on the same mesh, and 1.98e-05 for order 2
+    on the mesh it was refined FROM. Refining made it 458x worse, with no error.
+    """
+    d = _grid(4)
+    p = np.asarray(d.mesh.points)[:, :2]
+    q = np.asarray(d.mesh.cells_dict["quad"])
+    d = refine_domain(d, np.where(np.linalg.norm(p[q].mean(axis=1) - 0.5, axis=1) < 0.3)[0])
+
+    u, v = d.fem_symbols(order=2)
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    with pytest.raises(NotImplementedError, match="order-1 elements"):
+        jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0]).solve(linear=jno.solve.lu(backend="host"))
+
+
+def test_order_2_still_works_on_a_uniformly_refined_mesh(x64):
+    """The guard must not over-reach: refining EVERY cell stays conforming, so there are no hanging
+    nodes and a P2 space is perfectly fine on the result."""
+    d = refine_domain(_grid(4), np.arange(16))
+    assert d._fem_hanging_nodes == {}
+    u, v = d.fem_symbols(order=2)
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0])
+    sol = np.asarray(fem.solve(linear=jno.solve.lu(backend="host"))).reshape(-1)
+    pts = np.asarray(fem.points)[:, :2]
+    centre = float(sol[int(np.argmin(np.linalg.norm(pts - 0.5, axis=1)))])
+    assert abs(centre - POISSON_CENTRE) < 1e-4, f"P2 on a uniformly refined mesh should be accurate, got {centre}"
