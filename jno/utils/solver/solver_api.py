@@ -962,6 +962,17 @@ class ContinuationSpec:
     keep: str = "last"
 
 
+def _reduced_size(periodic):
+    """Width of the reduced space. The key differs by builder -- a single-field reduction carries
+    ``n_red``, a multifield one only the block offsets -- so it is read in that order rather than
+    assumed, which is how this first showed up as a bare ``KeyError: 'n_red'``."""
+    if "n_red" in periodic:
+        return int(periodic["n_red"])
+    if periodic.get("off_red") is not None:
+        return int(periodic["off_red"][-1])
+    return int(periodic["P"].shape[1])
+
+
 def run_continuation(fem, spec, *, nonlinear=None, linear=None, precond=None, x0=None, kwargs=None):
     """Drive ``fem.solve(continuation=...)``: solve the steady problem at each parameter value in turn,
     warm-starting from the previous solution.
@@ -993,8 +1004,18 @@ def run_continuation(fem, spec, *, nonlinear=None, linear=None, precond=None, x0
             f"{mode!r}. Sweep a transient by looping over fem.solve() yourself -- a warm start has no "
             "meaning across independent trajectories."
         )
-    if getattr(fem, "_periodic", None) is not None:
-        raise NotImplementedError("fem.solve(continuation=...) with periodic ties is not supported yet.")
+    # A REDUCED system (a periodic/mortar tie, or a slip elimination -- they share this format) is
+    # solved on the constraint manifold: u = P u~. This driver talks to `op` directly rather than
+    # through FEM.solve, so it has to apply that reduction itself, exactly as `_fem._reduced` does --
+    # residual reduced by Pᵀ, iterate carried in the REDUCED space, prolonged on the way out. It used
+    # to refuse instead, which is why a slip-constrained problem could not be continued at all.
+    periodic = getattr(fem, "_periodic", None)
+    if periodic is not None and mode != "nonlinear":
+        raise NotImplementedError(
+            "fem.solve(continuation=...) on a reduced system (a periodic tie or a slip condition) "
+            "supports the NONLINEAR path; this problem is steady-linear. The linear path assembles "
+            "A and b directly, and reducing those is PᵀAP / Pᵀb -- wire it there if you need it."
+        )
     if spec.keep not in ("last", "all"):
         raise ValueError(f"continuation keep={spec.keep!r}: expected 'last' or 'all'.")
     if not spec.params:
@@ -1048,7 +1069,7 @@ def run_continuation(fem, spec, *, nonlinear=None, linear=None, precond=None, x0
 
     if mode == "nonlinear":
         nl = compose_nonlinear_solve_fn(nonlinear, linear, precond, fem)
-        prev = jnp.zeros((int(op.size),))
+        prev = jnp.zeros((_reduced_size(periodic) if periodic is not None else int(op.size),))
     else:
         nl = None
         A0, b0 = op.evaluate({**fixed, **{k: _step_value(s, 0) for k, s in seqs.items()}})
@@ -1065,7 +1086,18 @@ def run_continuation(fem, spec, *, nonlinear=None, linear=None, precond=None, x0
         at = ", ".join(f"{name}={np.asarray(s[k])!r}" for name, s in seqs.items())
         try:
             if mode == "nonlinear":
-                u = nl(lambda uu, _v=vals: op.residual(uu, _v), prev)
+                if periodic is None:
+                    u = nl(lambda uu, _v=vals: op.residual(uu, _v), prev)
+                else:
+                    from .fem_utils import prolong_periodic, reduce_vector_periodic
+
+                    u_red = nl(
+                        lambda ur, _v=vals: reduce_vector_periodic(
+                            periodic, jnp.asarray(op.residual(prolong_periodic(periodic, ur), _v)).reshape(-1)
+                        ),
+                        prev,
+                    )
+                    prev_red, u = u_red, prolong_periodic(periodic, u_red)
             else:
                 A, b = op.evaluate(vals)
                 b = jnp.asarray(b).reshape(-1)
@@ -1091,7 +1123,9 @@ def run_continuation(fem, spec, *, nonlinear=None, linear=None, precond=None, x0
                 f"fem.solve(continuation=...): step {k + 1}/{n_steps} at {at} produced a non-finite "
                 "solution (a singular or diverging system). Refine the value sequence around this point."
             )
-        prev = u
+        prev = prev_red if periodic is not None and mode == "nonlinear" else u
         if spec.keep == "all":
             outs.append(_fin(u))
-    return jnp.stack(outs) if spec.keep == "all" else _fin(prev)
+    if spec.keep == "all":
+        return jnp.stack(outs)
+    return _fin(u)  # `prev` may be the REDUCED iterate; `u` is always the full-space solution
