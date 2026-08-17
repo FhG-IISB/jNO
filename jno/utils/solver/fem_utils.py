@@ -2289,13 +2289,15 @@ def _tri_shape(bary: np.ndarray, k: int) -> np.ndarray:
             axis=-1,
         )
     if k == 4:
-        # A hexahedron's facet. It reaches here loudly rather than being interpolated as a triangle
-        # from three of its four nodes -- which is what the k < 6 branch above would otherwise do.
+        # A hexahedron's facet reaches here only on the INTEGRATED (mortar) path, which clips triangles
+        # and has no quadrilateral analogue yet. The COLLOCATED path does support it -- bilinear weights
+        # from the inverse of the facet's own map, see `_periodic_facet_weights` -- so a non-matching tie
+        # across a hex facet works; it is the mortar coupling specifically that does not.
         raise NotImplementedError(
-            "a periodic or mortar tie across a HEXAHEDRAL facet is not supported: the facet is a "
-            "quadrilateral, and these weights are barycentric (triangle) shape functions, which "
-            "would silently interpolate it from three of its four nodes. Tie across a simplicial "
-            "mesh, or make the two sides conforming so the nodes match one-to-one."
+            "an INTEGRATED (mortar) tie across a HEXAHEDRAL facet is not supported: the mortar rows clip "
+            "triangles, and these weights are barycentric, which would interpolate a quadrilateral facet "
+            "from three of its four nodes. The collocated coupling handles it and is what a hex tie uses; "
+            "reaching this means the mortar path was selected for a quad facet, which is a bug."
         )
     raise ValueError(f"triangle facets carry 3 (P1) or 6 (P2) nodes, got {k}")
 
@@ -2794,12 +2796,12 @@ def _periodic_facet_weights(
     # as if its node at 1/3 were the midpoint and its node at 2/3 did not exist. Weights still summed
     # to 1, so a constant transferred and nothing complained -- but a LINEAR field came out wrong by
     # 0.25-0.33 on a field of range 2. Refuse instead.
-    _max_k = 3 if tq.shape[0] == 1 else 6
-    if k > _max_k:
+    _allowed = (2, 3) if tq.shape[0] == 1 else (3, 4, 6)  # edges | triangle P1, QUAD Q1, triangle P2
+    if k not in _allowed:
         raise NotImplementedError(
-            f"A non-matching periodic/tied interface supports P1 and P2 facets; this one has {k}-node "
-            f"facets (P{k - 1} edge / higher-order face). Use a conforming mesh for the tie, or drop to "
-            "order 2 -- interpolating it with the P2 formulas would silently misplace the extra nodes."
+            f"A non-matching periodic/tied interface supports {'P1/P2 edges' if tq.shape[0] == 1 else 'P1/P2 triangles and Q1 quadrilaterals'}; "
+            f"this one has {k}-node facets. Use a conforming mesh for the tie, or drop the element order -- "
+            "interpolating it with the formulas below would silently misplace the extra nodes."
         )
 
     if tq.shape[0] == 1:  # 2D: locate the main edge spanning the secondary's in-interface coord
@@ -2822,6 +2824,24 @@ def _periodic_facet_weights(
             return [(a, 1.0 - xi), (b, xi)]
         m = int(facet_node_ids[idx, 2])  # P2 edge (a, b, mid): quadratic Lagrange at xi = 0, 1, 0.5
         return [(a, 2.0 * (xi - 0.5) * (xi - 1.0)), (b, 2.0 * xi * (xi - 0.5)), (m, -4.0 * xi * (xi - 1.0))]
+
+    if tq.shape[0] == 2 and k == 4:  # 3D: a QUADRILATERAL facet (a hexahedron's face)
+        # A triangle's map is affine, so its inverse is the closed-form barycentric solve below. A
+        # quadrilateral's is BILINEAR and has no closed-form inverse, so the reference coordinates come
+        # from Newton (:func:`fem_lagrange._invert_tensor_map`, the same inverse the quad solution
+        # transfer uses). Reaching the branch below instead would interpolate the facet from three of
+        # its four nodes -- silently, and wrong by O(1) on anything but a linear field.
+        from .fem_lagrange import _invert_tensor_map
+
+        V = loc[facet_node_ids]  # (F, 4, 2) facet corners in the interface frame, VTK cyclic order
+        perm = [0, 1, 3, 2]  # VTK walks the perimeter; basix orders lexicographically
+        xi, N = _invert_tensor_map(V[:, perm], np.broadcast_to(tq[None, :], (V.shape[0], 2)), "quadrilateral")
+        # the containing facet (0 <= xi <= 1 on both axes); else the least-violating one, mirroring
+        # the barycentric branch's handling of a shared edge or rounding at a face end
+        viol = (np.maximum(0.0, -xi) + np.maximum(0.0, xi - 1.0)).sum(axis=1)
+        idx = int(np.argmin(viol))
+        ids = facet_node_ids[idx][perm]
+        return [(int(i), float(wt)) for i, wt in zip(ids, N[idx])]
 
     if tq.shape[0] == 2:  # 3D: locate the main triangle containing the secondary, barycentric weights
         pa = loc[facet_node_ids[:, 0]]

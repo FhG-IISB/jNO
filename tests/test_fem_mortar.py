@@ -730,7 +730,11 @@ def test_a_higher_order_facet_is_refused_not_mis_interpolated():
     formulas for anything larger. A P3 edge was therefore interpolated as if its node at 1/3 were the
     midpoint, with the node at 2/3 ignored entirely. The weights still summed to 1, so a constant
     transferred and nothing complained -- but a LINEAR field came out wrong by 0.25-0.33 on a field of
-    range 2. Refusing is the only honest answer while P3 facet shape functions do not exist here."""
+    range 2. Refusing is the only honest answer while P3 facet shape functions do not exist here.
+
+    The 4-node case here is a 2-D EDGE, which stays refused. In 3-D a 4-node facet is a
+    QUADRILATERAL and is now supported (`tests/test_fem_hex_tie.py`); the arity check is per
+    dimension for exactly that reason."""
     loc = np.array([[0.0], [1.0], [1 / 3], [2 / 3]])
     for k, ok in ((2, True), (3, True), (4, False)):
         ids = np.arange(k).reshape(1, k)
@@ -738,11 +742,11 @@ def test_a_higher_order_facet_is_refused_not_mis_interpolated():
             w = _periodic_facet_weights(np.array([0.5]), ids, loc)
             assert abs(sum(float(x) for _, x in w) - 1.0) < 1e-12
         else:
-            with pytest.raises(NotImplementedError, match="supports P1 and P2 facets"):
+            with pytest.raises(NotImplementedError, match="non-matching periodic/tied interface"):
                 _periodic_facet_weights(np.array([0.5]), ids, loc)
 
     tri_loc = np.zeros((10, 2))
-    with pytest.raises(NotImplementedError, match="supports P1 and P2 facets"):
+    with pytest.raises(NotImplementedError, match="non-matching periodic/tied interface"):
         _periodic_facet_weights(np.array([0.3, 0.3]), np.arange(10).reshape(1, 10), tri_loc)
 
 

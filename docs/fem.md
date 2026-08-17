@@ -702,7 +702,7 @@ onto one DOF, so the periodicity holds exactly rather than to a tolerance.
 
 | not supported on quad/hex | why |
 |---|---|
-| **non-matching** mortar ties across a hexahedral facet | interpolating *across* a quad facet needs shape functions the barycentric weights do not have. Matching (conforming) periodic ties on hexes DO work — see below |
+| **integrated (mortar)** ties across a hexahedral facet | the mortar rows clip triangles and have no quadrilateral analogue. The **collocated** coupling does support it, and is what a hex tie uses — see below |
 | **h-adaptive remeshing on HEXES** (`adapt=`) | not for want of plumbing: no general all-hex mesher exists (gmsh's `Recombine3DAll` on a plain box returns tetrahedra and no hexahedra), so there is nothing to remesh *to*. 3-D tensor-product adaptivity needs octree refinement with hanging-node constraints. **2-D quads DO adapt** — see below |
 | **r-adaptivity** (`relocate=`) on quad/hex | the monitor, the cell measures and the validity check are all barycentric; a bilinear cell's validity is the sign of the sampled `det J`, not one determinant |
 | 4th-order forms (plates, phase-field) | the physical-Hessian push-forward assumes an affine cell — the same refusal curved simplices already carry |
@@ -773,6 +773,20 @@ full gmsh rebuild. It needs a **geometry to rebuild from**, so a quad mesh loade
 refuses by name. And it cannot refine a **`.structured()`** plan, whose resolution is its cell counts
 rather than a size field — that would silently return the same mesh, so it refuses too. Recombination
 purity is checked on every round rather than assumed.
+
+**Tying two hexahedral domains** across a non-matching interface works. A tie constrains each
+secondary node to a weighted combination of the main face's nodes, and those weights were barycentric
+(triangle) shape functions — which a hexahedron's *quadrilateral* facet has none of, so the tie
+refused rather than interpolate a quad from three of its four nodes.
+
+A quad facet's map is **bilinear** and has no closed-form inverse, so its reference coordinates come
+from a Newton inversion (`fem_lagrange._invert_tensor_map`, the same inverse the quad solution
+transfer uses). Measured on two hex blocks meeting at different resolutions (16 facets against 9), the
+**linear patch test passes to 5.6e-16** — solved directly, because the default iterative solver stops
+at 4.1e-04 in float32 and would hide a constraint error of that size.
+
+The *integrated* (mortar) coupling still refuses on a quad facet: its rows clip triangles. Collocated
+weights are linearly complete and are what a hex tie — and, later, a hanging node — actually needs.
 
 Volume terms, Dirichlet conditions and **surface terms all work on both cells** — Neumann, Robin
 and flux integrals included.

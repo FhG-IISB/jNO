@@ -268,6 +268,48 @@ def lagrange_on(cell_type: str, degree: int, quad_degree: Optional[int] = None) 
     )
 
 
+def _invert_tensor_map(V: np.ndarray, x: np.ndarray, cell: str, *, iters: int = 12):
+    """Reference coordinates of ``x`` inside trilinear cells ``V``, by Newton on the isoparametric map.
+
+    A simplex map is affine, so its inverse is one linear solve — which is why the branch opposite is
+    exact and non-iterative. A quadrilateral or hexahedron maps ``x(xi) = sum_a N_a(xi) x_a`` with
+    ``N`` bi/trilinear, so the inverse has no closed form and is found by Newton from the cell centre:
+    ``xi <- xi - J^-1 (x(xi) - x)`` with ``J = sum_a x_a (dN_a/dxi)``.
+
+    ``V`` is ``(..., n_local, dim)`` in **basix** vertex order and ``x`` is ``(..., dim)``. Returns
+    ``(xi, N)`` — the reference coordinates ``(..., tdim)`` and the shape-function values there
+    ``(..., n_local)``, so a caller gets both the coordinates it needs for a higher-order tabulation
+    and the weights it needs for a Q1 stencil.
+
+    Newton converges quadratically on a convex cell and is started at the centre, so 12 iterations is
+    far more than needed for a mesh whose cells are not degenerate; it is a fixed count rather than a
+    tolerance loop so the whole batch stays vectorised.
+    """
+    from .fem_lagrange import _lagrange_basix, basix_cell
+
+    bcell, tdim = basix_cell(cell)
+    elem = _lagrange_basix(bcell, 1)
+
+    def tab(xi_flat):
+        t = np.asarray(elem.tabulate(1, xi_flat))  # (1 + tdim, Q, n_local, 1)
+        return t[0, :, :, 0], np.moveaxis(t[1 : tdim + 1, :, :, 0], 0, -1)  # N (Q,A), dN (Q,A,T)
+
+    shp = x.shape[:-1]
+    Vf = V.reshape(-1, V.shape[-2], V.shape[-1])
+    xf = x.reshape(-1, x.shape[-1])
+    xi = np.full((Vf.shape[0], tdim), 0.5)
+    for _ in range(iters):
+        N, dN = tab(xi)
+        J = np.einsum("cai,cak->cik", Vf, dN)  # (C, dim, tdim)
+        r = np.einsum("ca,cai->ci", N, Vf) - xf  # residual x(xi) - x
+        det = np.linalg.det(J)
+        Jsafe = np.where((np.abs(det) > 1e-300)[:, None, None], J, np.eye(tdim))
+        xi = xi - np.linalg.solve(Jsafe, r[..., None])[..., 0]
+        xi = np.clip(xi, -1.0, 2.0)  # keep a bad start from diverging out of the basis' useful range
+    N, _ = tab(xi)
+    return xi.reshape(*shp, tdim), N.reshape(*shp, Vf.shape[1])
+
+
 def vtk_to_basix_vertex_perm(cell_type: str) -> np.ndarray:
     """Permutation taking a cell's meshio/VTK vertex order to basix's, as basix-index -> VTK-index.
 
