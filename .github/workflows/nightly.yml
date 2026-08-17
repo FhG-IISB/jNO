@@ -1,9 +1,14 @@
 name: Nightly (full suite)
 
 # The complete 232-file suite, unfiltered. This is what makes the PR-side path filtering in ci.yml
-# safe: if a filter is scoped too narrowly, the miss surfaces here within a day and on every push to
-# main, rather than never. Do not add path filters to this workflow -- running everything is its
-# entire purpose.
+# safe: if a filter is scoped too narrowly, the miss surfaces here within a day rather than never.
+# Do not add path filters to this workflow -- running everything is its entire purpose.
+#
+# Scheduled only, deliberately NOT on push to main. The suite takes ~2 h, and anything arriving via
+# PR has already run its filtered subset, so a per-push run would mostly re-execute what just
+# passed. The trade is that a mis-scoped filter is caught within a day instead of within minutes;
+# `workflow_dispatch` is there for when that wait is not acceptable -- run it by hand before a
+# release or after a risky merge.
 #
 # Coverage is uploaded from HERE and not from a PR, because a filtered PR run only executes part of
 # the suite and would report every unexercised file as freshly uncovered.
@@ -11,8 +16,6 @@ name: Nightly (full suite)
 on:
   schedule:
     - cron: "0 3 * * *"   # 03:00 UTC daily
-  push:
-    branches: ["main"]
   workflow_dispatch:
 
 concurrency:

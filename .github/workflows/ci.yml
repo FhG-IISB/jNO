@@ -1,8 +1,9 @@
 name: CI
 
-# PR gate: fast and targeted. The full 232-file suite lives in nightly.yml, which also runs on
-# every push to main -- so a mis-scoped filter here costs at most one day of latency and can never
-# reach a release, while a PR that only touches one area stops paying for the other areas.
+# PR gate: fast and targeted. The full 232-file suite lives in nightly.yml (scheduled, plus
+# workflow_dispatch) -- so a mis-scoped filter here costs at most a day of latency, while a PR that
+# only touches one area stops paying for the other areas. Run the nightly by hand before a release
+# if that day of latency matters.
 #
 # Runtimes that motivated the split: the all-in-one suite took 1h41m-2h07m per PR and was being
 # cancelled. 119 of the 232 test files are test_fem_*, so a non-FEM change was paying for the FEM
