@@ -1976,8 +1976,12 @@ def _promote_to_quadratic(points, cells_p1, edge_local):
     return pts, cells_p2
 
 
-def _promote_to_degree(points, cells_p1, ref_pts):
-    """Promote a linear simplex mesh to a degree-``k`` Lagrange node mesh (P1 -> P{k}, any ``k``).
+def _promote_to_degree(points, cells_p1, ref_pts, cell_type=None):
+    """Promote a linear mesh to a degree-``k`` Lagrange node mesh (P1 -> P{k} / Q1 -> Q{k}, any ``k``).
+
+    ``cell_type`` names the cell for a tensor-product mesh (``"quad"`` / ``"hexahedron"``), whose
+    nodes are placed with its degree-1 basis; omitted, the cell is a simplex and the placement is
+    barycentric. A tensor-product cell's ``cells_p1`` must be in basix vertex order.
 
     ``ref_pts`` are the element's reference interpolation points in **basix DOF order** (shape
     ``(n_dof, tdim)``; the first ``ncorner`` are the cell vertices). Each cell's nodes are the affine
@@ -1995,11 +1999,24 @@ def _promote_to_degree(points, cells_p1, ref_pts):
     ref_pts = np.asarray(ref_pts, dtype=float)
     ncell, ncorner = cells_p1.shape
     ndof = ref_pts.shape[0]
-    # barycentric weights of each reference point: l0 = 1 - sum(xi), l_i = xi_i
-    bary = np.empty((ndof, ncorner), dtype=float)
-    bary[:, 0] = 1.0 - ref_pts.sum(axis=1)
-    bary[:, 1:] = ref_pts
-    phys = np.einsum("dc,ncg->ndg", bary, points[cells_p1])  # (ncell, ndof, gdim) physical node coords
+    if cell_type in ("quad", "quadrilateral", "hexahedron", "hex"):
+        # The general form: x(xi) = sum_a N_a(xi) x_a, tabulating the cell's DEGREE-1 (geometry)
+        # basis at the reference points. The barycentric block below is this same operation
+        # specialised to a simplex, where the P1 basis is [1 - sum(xi), xi]. It is kept rather than
+        # replaced because the two differ by one ulp (1.1e-16, measured), and a simplex mesh should
+        # not shift at the last bit for a change that is about quadrilaterals.
+        #
+        # `cells_p1` must be in BASIX vertex order here, since that is the order the tabulated basis
+        # is written in -- pairing it with meshio/VTK order makes the cell a bow-tie.
+        from .fem_lagrange import _lagrange_basix, basix_cell
+
+        weights = np.asarray(_lagrange_basix(basix_cell(cell_type)[0], 1).tabulate(0, ref_pts))[0, :, :, 0]
+    else:
+        # barycentric weights of each reference point: l0 = 1 - sum(xi), l_i = xi_i
+        weights = np.empty((ndof, ncorner), dtype=float)
+        weights[:, 0] = 1.0 - ref_pts.sum(axis=1)
+        weights[:, 1:] = ref_pts
+    phys = np.einsum("dc,ncg->ndg", weights, points[cells_p1])  # (ncell, ndof, gdim) physical node coords
     # scale-aware coordinate hash: coincident nodes differ only by FP roundoff (<< tol); distinct nodes
     # are separated by ~mesh spacing (>> tol).
     extent = float(np.max(points.max(axis=0) - points.min(axis=0))) if points.shape[0] else 1.0
@@ -2271,6 +2288,17 @@ def _tri_shape(bary: np.ndarray, k: int) -> np.ndarray:
             ],
             axis=-1,
         )
+    if k == 4:
+        # A hexahedron's facet reaches here only on the INTEGRATED (mortar) path, which clips triangles
+        # and has no quadrilateral analogue yet. The COLLOCATED path does support it -- bilinear weights
+        # from the inverse of the facet's own map, see `_periodic_facet_weights` -- so a non-matching tie
+        # across a hex facet works; it is the mortar coupling specifically that does not.
+        raise NotImplementedError(
+            "an INTEGRATED (mortar) tie across a HEXAHEDRAL facet is not supported: the mortar rows clip "
+            "triangles, and these weights are barycentric, which would interpolate a quadrilateral facet "
+            "from three of its four nodes. The collocated coupling handles it and is what a hex tie uses; "
+            "reaching this means the mortar path was selected for a quad facet, which is a bug."
+        )
     raise ValueError(f"triangle facets carry 3 (P1) or 6 (P2) nodes, got {k}")
 
 
@@ -2374,6 +2402,13 @@ def _tri_dual_available(k: int) -> bool:
     The check is computed rather than hard-coded to the node count so it also guards any element type
     added later whose shape functions have a zero integral.
     """
+    if k not in (3, 6):
+        # This is an availability QUERY, so an unsupported facet is a False, not a raise. A
+        # quadrilateral facet (k = 4, a hexahedron's) has no triangular shape functions to integrate
+        # -- asking `_tri_shape` for them aborted the whole periodic build here, before the caller
+        # ever reached its node-to-node matching, which is what a conforming hex mesh needs and
+        # which does not involve a dual basis at all.
+        return False
     bary, w = _tri_quadrature(k // 3 + 2)
     d = np.abs(w @ _tri_shape(bary, k))
     return bool(d.min() > 1.0e-12 * float(d.max()))
@@ -2761,12 +2796,12 @@ def _periodic_facet_weights(
     # as if its node at 1/3 were the midpoint and its node at 2/3 did not exist. Weights still summed
     # to 1, so a constant transferred and nothing complained -- but a LINEAR field came out wrong by
     # 0.25-0.33 on a field of range 2. Refuse instead.
-    _max_k = 3 if tq.shape[0] == 1 else 6
-    if k > _max_k:
+    _allowed = (2, 3) if tq.shape[0] == 1 else (3, 4, 6)  # edges | triangle P1, QUAD Q1, triangle P2
+    if k not in _allowed:
         raise NotImplementedError(
-            f"A non-matching periodic/tied interface supports P1 and P2 facets; this one has {k}-node "
-            f"facets (P{k - 1} edge / higher-order face). Use a conforming mesh for the tie, or drop to "
-            "order 2 -- interpolating it with the P2 formulas would silently misplace the extra nodes."
+            f"A non-matching periodic/tied interface supports {'P1/P2 edges' if tq.shape[0] == 1 else 'P1/P2 triangles and Q1 quadrilaterals'}; "
+            f"this one has {k}-node facets. Use a conforming mesh for the tie, or drop the element order -- "
+            "interpolating it with the formulas below would silently misplace the extra nodes."
         )
 
     if tq.shape[0] == 1:  # 2D: locate the main edge spanning the secondary's in-interface coord
@@ -2789,6 +2824,24 @@ def _periodic_facet_weights(
             return [(a, 1.0 - xi), (b, xi)]
         m = int(facet_node_ids[idx, 2])  # P2 edge (a, b, mid): quadratic Lagrange at xi = 0, 1, 0.5
         return [(a, 2.0 * (xi - 0.5) * (xi - 1.0)), (b, 2.0 * xi * (xi - 0.5)), (m, -4.0 * xi * (xi - 1.0))]
+
+    if tq.shape[0] == 2 and k == 4:  # 3D: a QUADRILATERAL facet (a hexahedron's face)
+        # A triangle's map is affine, so its inverse is the closed-form barycentric solve below. A
+        # quadrilateral's is BILINEAR and has no closed-form inverse, so the reference coordinates come
+        # from Newton (:func:`fem_lagrange._invert_tensor_map`, the same inverse the quad solution
+        # transfer uses). Reaching the branch below instead would interpolate the facet from three of
+        # its four nodes -- silently, and wrong by O(1) on anything but a linear field.
+        from .fem_lagrange import _invert_tensor_map
+
+        V = loc[facet_node_ids]  # (F, 4, 2) facet corners in the interface frame, VTK cyclic order
+        perm = [0, 1, 3, 2]  # VTK walks the perimeter; basix orders lexicographically
+        xi, N = _invert_tensor_map(V[:, perm], np.broadcast_to(tq[None, :], (V.shape[0], 2)), "quadrilateral")
+        # the containing facet (0 <= xi <= 1 on both axes); else the least-violating one, mirroring
+        # the barycentric branch's handling of a shared edge or rounding at a face end
+        viol = (np.maximum(0.0, -xi) + np.maximum(0.0, xi - 1.0)).sum(axis=1)
+        idx = int(np.argmin(viol))
+        ids = facet_node_ids[idx][perm]
+        return [(int(i), float(wt)) for i, wt in zip(ids, N[idx])]
 
     if tq.shape[0] == 2:  # 3D: locate the main triangle containing the secondary, barycentric weights
         pa = loc[facet_node_ids[:, 0]]
@@ -3008,6 +3061,50 @@ def build_periodic_prolongation(
                 )
             secondary_interp[int(sid)] = [(int(m), complex(ph) * wt) for (m, wt) in w]
 
+    return prolongation_from_ties(
+        n_nodes,
+        secondary_to_main,
+        secondary_interp,
+        vec=vec,
+        secondary_phase=secondary_phase,
+        is_bloch=is_bloch,
+        coupling=(
+            "conforming"
+            if not (n_mortar or n_collocated)
+            else "mortar"
+            if not n_collocated
+            else "collocated"
+            if not n_mortar
+            else "mixed"
+        ),
+    )
+
+
+def prolongation_from_ties(
+    n_nodes: int,
+    secondary_to_main: Dict[int, int],
+    secondary_interp: Dict[int, List[Tuple[int, complex]]],
+    *,
+    vec: int = 1,
+    secondary_phase: Dict[int, complex] | None = None,
+    is_bloch: bool = False,
+    coupling: str = "conforming",
+) -> Dict[str, object]:
+    """Turn ``constrained node -> weights on other nodes`` into the prolongation ``P``.
+
+    The half of :func:`build_periodic_prolongation` that is about the *constraint*, with nothing in it
+    about periodicity: transitively resolve every constrained node to free ones, then assemble the
+    sparse ``P``. Split out because a periodic tie, a non-matching (mortar/collocated) interface and a
+    **hanging node** are the same relation ``u_constrained = sum_i w_i u_free`` and differ only in where
+    the weights come from -- so they share one elimination, one ``B(P)`` fusion and one solve path
+    rather than growing a second constraint mechanism beside the first.
+
+    ``secondary_to_main`` are exact one-to-one ties (weight 1, or the Bloch phase from
+    ``secondary_phase``); ``secondary_interp`` are weighted ones. Returns the dict documented on
+    :func:`build_periodic_prolongation`, with ``coupling`` passed through by the caller, which is the
+    only part that knows how the weights were obtained.
+    """
+    secondary_phase = secondary_phase or {}
     secondary_set = set(secondary_to_main) | set(secondary_interp)
 
     # Each secondary is a linear combination of other nodes (exact: one main, weight 1; interpolated:
@@ -3088,18 +3185,10 @@ def build_periodic_prolongation(
         # Bloch/quasi-periodic: P is complex, so the reduction is Hermitian (P^H A P) and the reduced
         # complex system can't be split into independent real/imag legs.
         "is_bloch": bool(is_bloch),
-        # How the NON-matching secondarys were tied: "conforming" (there were none), "mortar" (integrated,
-        # passes the patch test), "collocated" (node-to-segment; no secondary facets to integrate over) or
-        # "mixed". Reported rather than inferred, so a caller never has to guess which it got.
-        "coupling": (
-            "conforming"
-            if not (n_mortar or n_collocated)
-            else "mortar"
-            if not n_collocated
-            else "collocated"
-            if not n_mortar
-            else "mixed"
-        ),
+        # How the constrained nodes were tied: "conforming" (exact node-to-node), "mortar" (integrated,
+        # passes the patch test), "collocated" (node-to-segment; no secondary facets to integrate over),
+        # "mixed", or "hanging". Reported rather than inferred, so a caller never has to guess.
+        "coupling": coupling,
     }
 
 

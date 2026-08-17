@@ -1696,6 +1696,17 @@ class FEM:
                 )
             from .utils.solver.fem_adapt import run_adaptive_solve, run_adaptive_transient
 
+            if getattr(adapt, "split", False) and self._mode == "transient":
+                # The transient driver carries state across each remesh by basis-aware transfer into a
+                # FREE nodal space; a refined mesh's hanging DOFs are not free, so the transferred state
+                # would violate the constraint the very first step after a split.
+                raise NotImplementedError(
+                    "jno.solve.refine() is wired on the steady adaptive loop; this problem is transient. "
+                    "The transient driver transfers the state across each mesh change, and that transfer "
+                    "does not yet apply the hanging-node constraint, so the carried state would break it "
+                    "on the first step. Use jno.solve.remesh() on a simplex mesh for transient "
+                    "h-adaptivity, or refine once up front and march on the fixed refined mesh."
+                )
             if self._mode == "transient":
                 # Adapt the mesh AS the problem marches: remesh every `adapt.every` steps and carry the
                 # state across (basis-aware transfer), tracking a moving feature. A fused COMPLEX
@@ -2621,15 +2632,24 @@ def _periodic_tie_spec(constraint: Any, domain: Any) -> Optional[Tuple[str, str,
     return (main_tag, secondary_tag, None, _field_key_of(constraint), phase)
 
 
-def _ref_interior_facet_dofs(ref_pts: np.ndarray, fv: np.ndarray, dim: int, tol: float = 1e-9) -> List[int]:
+def _ref_interior_facet_dofs(
+    ref_pts: np.ndarray, fv: np.ndarray, dim: int, tol: float = 1e-9, ncorner_override: int = 0
+) -> List[int]:
     """Local DOF ids on the facet spanned by reference vertices ``fv`` (beyond the facet's own vertices),
     **ordered** to match the periodic interpolation convention: the interior nodes of each facet edge in
     cyclic order (each edge's nodes sorted by position), then the face-interior nodes (3D). For P1/P2 this
     reproduces the legacy facet layout exactly -- 2D ``[.. , mid_ab]``, 3D ``[.. , mid_ab, mid_bc, mid_ca]``
     -- which ``_periodic_facet_weights`` relies on; higher orders extend it (per-edge nodes by position)."""
-    ncorner = dim + 1  # element vertex DOFs are 0..dim (basix lists vertices first)
+    # Element vertex DOFs come first (a basix guarantee on every cell), but HOW MANY depends on the
+    # cell: dim+1 for a simplex, 2^dim for a tensor-product cell. Taking dim+1 on a quadrilateral
+    # would treat its fourth corner as a higher-order candidate and match it onto an edge.
+    ncorner = int(ncorner_override) if ncorner_override else dim + 1
     cand = list(range(ncorner, len(ref_pts)))
-    edges = [(fv[0], fv[1])] if dim == 2 else [(fv[0], fv[1]), (fv[1], fv[2]), (fv[2], fv[0])]
+    # The facet's own edges, walked cyclically. A 2-D facet is a single edge; a 3-D facet is a
+    # triangle (3 edges) or -- on a hexahedron -- a QUADRILATERAL (4). `fv` arrives in perimeter
+    # order, so the cycle is simply consecutive pairs.
+    nfv = len(fv)
+    edges = [(fv[0], fv[1])] if dim == 2 else [(fv[i], fv[(i + 1) % nfv]) for i in range(nfv)]
     ordered: List[int] = []
     used: set = set()
     for a, b in edges:
@@ -2645,20 +2665,34 @@ def _ref_interior_facet_dofs(ref_pts: np.ndarray, fv: np.ndarray, dim: int, tol:
         for _t, d in sorted(on_edge):
             ordered.append(d)
             used.add(d)
-    if dim == 3:  # face-interior nodes: on the facet plane, strictly inside the triangle, not on an edge
-        a, b, c = fv
-        M = np.stack([b - a, c - a], axis=1)  # (3, 2)
+    if dim == 3:  # face-interior nodes: on the facet plane, strictly inside it, not on one of its edges
+        a = fv[0]
+        # Two in-plane directions. For a triangle they are its two edges from `a`; for a quadrilateral
+        # facet (perimeter order a, b, c, d) they are the two edges a->b and a->d, and the containment
+        # test is the unit SQUARE rather than `s + t <= 1` -- a triangle test would reject half the
+        # face, dropping its interior node.
+        if nfv == 3:
+            M = np.stack([fv[1] - a, fv[2] - a], axis=1)  # (3, 2)
+
+            def _inside(s, t):
+                return min(s, t, 1.0 - s - t) >= -tol
+        else:
+            M = np.stack([fv[1] - a, fv[-1] - a], axis=1)
+
+            def _inside(s, t):
+                return min(s, t, 1.0 - s, 1.0 - t) >= -tol
+
         for d in cand:
             if d in used:
                 continue
             st, *_ = np.linalg.lstsq(M, ref_pts[d] - a, rcond=None)
             s, t = float(st[0]), float(st[1])
-            if float(np.linalg.norm((a + M @ st) - ref_pts[d])) < tol and min(s, t, 1.0 - s - t) >= -tol:
+            if float(np.linalg.norm((a + M @ st) - ref_pts[d])) < tol and _inside(s, t):
                 ordered.append(d)
     return ordered
 
 
-def _boundary_facets(points: Any, cells: Any, dim: int, order: int) -> Optional[np.ndarray]:
+def _boundary_facets(points: Any, cells: Any, dim: int, order: int, cell_type: Any = None) -> Optional[np.ndarray]:
     """Boundary facets of the **assembly** mesh as global node-id rows, including higher-order nodes.
 
     A facet is a cell edge (2D) / triangular face (3D) of the vertex sub-connectivity (the first
@@ -2674,16 +2708,29 @@ def _boundary_facets(points: Any, cells: Any, dim: int, order: int) -> Optional[
     if cells.ndim != 2 or cells.shape[0] == 0:
         return None
     n_cells = cells.shape[0]
-    verts = cells[:, : dim + 1]
-    # A facet of a `dim`-simplex has `dim` vertices: in 1D that is a single endpoint, so the combos
-    # are the two 1-vertex sub-sets of an interval. (Higher-order facet nodes below are then vacuous —
-    # a point carries none — which the `order < 2` early return already handles for P1 and the
-    # reference-point search handles correctly for P{k}.)
-    combos = (
-        [(0,), (1,)]
-        if dim == 1
-        else ([(0, 1), (1, 2), (2, 0)] if dim == 2 else [(0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3)])
-    )
+    if cell_type in ("quad", "quadrilateral", "hexahedron", "hex"):
+        # A tensor-product cell has 2^dim vertices, not dim+1, and its facets are not sub-simplices.
+        # `cells` here is the ASSEMBLY connectivity, which is in basix vertex order for these cells,
+        # so the facet table has to be basix's too -- taking `cells[:, :dim+1]` and triangle combos
+        # silently built facets from three of a quad's four corners.
+        import basix as _basix
+
+        from .utils.solver.fem_lagrange import basix_cell
+
+        _cell, _tdim = basix_cell(cell_type)
+        combos = [tuple(f) for f in _basix.topology(_cell)[_tdim - 1]]
+        verts = cells
+    else:
+        verts = cells[:, : dim + 1]
+        # A facet of a `dim`-simplex has `dim` vertices: in 1D that is a single endpoint, so the combos
+        # are the two 1-vertex sub-sets of an interval. (Higher-order facet nodes below are then vacuous —
+        # a point carries none — which the `order < 2` early return already handles for P1 and the
+        # reference-point search handles correctly for P{k}.)
+        combos = (
+            [(0,), (1,)]
+            if dim == 1
+            else ([(0, 1), (1, 2), (2, 0)] if dim == 2 else [(0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3)])
+        )
     allf = np.concatenate([verts[:, list(c)] for c in combos], axis=0)  # combo-major: row = combo*n_cells + cell
     # Same packed-int64 key the assembler's facet table uses, for the same reason -- and from the
     # same helper, so the two cannot drift again. See :func:`fem_facets.pack_face_keys`.
@@ -2700,13 +2747,23 @@ def _boundary_facets(points: Any, cells: Any, dim: int, order: int) -> Optional[
         return allf[bidx]
     from .utils.solver.fem_lagrange import lagrange_interp_points
 
-    ref_pts = np.asarray(lagrange_interp_points(dim, order))
-    ref_verts = (
-        np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
-        if dim == 2
-        else np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
-    )
-    facet_dofs = [list(c) + _ref_interior_facet_dofs(ref_pts, ref_verts[list(c)], dim) for c in combos]
+    ref_pts = np.asarray(lagrange_interp_points(dim, order, cell_type))
+    if cell_type in ("quad", "quadrilateral", "hexahedron", "hex"):
+        import basix as _basix
+
+        from .utils.solver.fem_lagrange import basix_cell
+
+        ref_verts = np.asarray(_basix.geometry(basix_cell(cell_type)[0]))
+    else:
+        ref_verts = (
+            np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+            if dim == 2
+            else np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+        )
+    _nc = len(ref_verts)
+    facet_dofs = [
+        list(c) + _ref_interior_facet_dofs(ref_pts, ref_verts[list(c)], dim, ncorner_override=_nc) for c in combos
+    ]
     # One gather over all boundary facets rather than a Python row per facet. Every facet of a
     # simplex carries the same DOF count, so the table is rectangular; the loop stays as the
     # fallback in case a reference element ever breaks that.
@@ -2811,7 +2868,18 @@ def _build_periodic_reduction(domain: Any, ties: List[Any], points: Any, cells: 
                     "face it touches (an axis-aligned predicate like `lambda x, y: x < tol` includes corners)."
                 )
     dim = int(getattr(domain, "dimension", points.shape[1]) or points.shape[1])
-    bfacets = _boundary_facets(points, cells, dim, ele_order) if cells is not None else None
+    # The facet table depends on the CELL, not the dimension. Without this the quad/hex branch of
+    # `_boundary_facets` is never taken and a quadrilateral mesh is read with the triangle table:
+    # measured on a 4x4 quad grid whose true boundary is 16 edges over 16 nodes, that returned 48
+    # facets over 24 nodes, a quarter of which are interior. It went unnoticed because a structured
+    # conforming mesh matches its periodic nodes by COORDINATE and never consults this table.
+    try:
+        from .utils.solver.fem_native import mesh_cell_type
+
+        _ct = mesh_cell_type(domain, dim)
+    except Exception:  # noqa: BLE001 - a domain with no volume block (1-D flat-chain route)
+        _ct = None
+    bfacets = _boundary_facets(points, cells, dim, ele_order, _ct) if cells is not None else None
     bnodes = np.unique(bfacets) if bfacets is not None and bfacets.size else None
 
     pairs = [(main, secondary) for (main, secondary, *_ignore) in ties]
@@ -2951,6 +3019,70 @@ def _build_periodic_reduction_nonnodal(domain: Any, ties: List[Any], offsets: An
         blocks.append({"P": red["P"], "kept": red["kept_nodes"], "vec": 1, "is_selection": red["is_selection"]})
         off_full.append(off_full[-1] + red["n_full"])
         off_red.append(off_red[-1] + red["n_red"])
+    return {"blocks": blocks, "off_full": off_full, "off_red": off_red, "n_full": off_full[-1], "n_red": off_red[-1]}
+
+
+def _hanging_constraints(domain: Any, points: Any, cells: Any, order: int) -> dict:
+    """The hanging constraints for ONE field, in that field's own DOF space.
+
+    Built here rather than taken from ``domain._fem_hanging_nodes`` because the constraint set depends
+    on the element ORDER, which is only known once the form is assembled: the stashed set is the P1
+    vertex answer, used for the mesh's boundary derivation. At order 2 the *set itself* differs, not
+    only the weights -- see :func:`~jno.utils.solver.fem_refine.hanging_dofs`.
+    """
+    from .utils.solver.fem_refine import hanging_dofs
+
+    cell_type = getattr(domain, "_fem_hanging_cell_type", "quad")
+    order = int(order or 1)
+    if order > 1 and cell_type != "quad":
+        raise NotImplementedError(
+            f"jno.fem: local (hanging-node) refinement supports order {order} on quadrilaterals, but this "
+            "mesh is hexahedral. A hex's 2:1 interface also constrains DOFs lying on a FACE, which needs "
+            "that face's order-2 (9-node) basis rather than the edge basis this builds. Use order=1 on a "
+            "refined hex mesh, or refine uniformly (which stays conforming, so no constraint is needed)."
+        )
+    return hanging_dofs(
+        np.asarray(points),
+        np.asarray(cells),
+        np.asarray(domain.mesh.points)[:, : int(domain.dimension)],
+        np.asarray(getattr(domain, "_fem_hanging_cells")),
+        cell_type,
+        order,
+    )
+
+
+def _build_hanging_reduction_multifield(domain: Any, hang: dict, cells: Any, cell_type: str, offsets: Any) -> dict:
+    """Hanging-node reduction for a coupled (multi-field) problem: one block per field.
+
+    The same block structure :func:`_build_periodic_reduction_multifield` returns, and consumed by the
+    same helpers -- a coupled system reduces block-wise (``P_i^T A[i,j] P_j``) with no block-diagonal P
+    materialised. Every field lives on the one mesh, so they share the constraint SET; what differs is
+    the component count per field, so each gets its own P built at its own ``vec``.
+
+    A **complex** form arrives here too: jNO carries a complex field as two coupled real fields, so it
+    is a two-field problem by the time the reduction is built, and the real and imaginary blocks are
+    each constrained identically -- which is what the constraint means for a complex field.
+    """
+    from .utils.solver.fem_refine import hanging_prolongation
+
+    offs = [int(o) for o in offsets]
+    n_fields = len(offs) - 1
+    sizes = [offs[i + 1] - offs[i] for i in range(n_fields)]
+    pts_all = getattr(domain, "_fem_native_dof_points_all", None) or [np.asarray(domain.mesh.points)] * n_fields
+    cells_all = getattr(domain, "_fem_native_assembly_cells_all", None) or [cells] * n_fields
+    orders = getattr(domain, "_fem_native_field_orders", None) or [1] * n_fields
+
+    blocks, off_full, off_red = [], [0], [0]
+    for i in range(n_fields):
+        pts_i = np.asarray(pts_all[i])
+        vec_i = max(1, sizes[i] // int(pts_i.shape[0]))
+        hang_i = _hanging_constraints(domain, pts_i, cells_all[i], int(orders[i]))
+        red_i = hanging_prolongation(pts_i, cells, vec=vec_i, hang=hang_i, cell_type=cell_type)
+        blocks.append(
+            {"P": red_i["P"], "kept": red_i["kept_nodes"], "vec": red_i["vec"], "is_selection": red_i["is_selection"]}
+        )
+        off_full.append(off_full[-1] + int(red_i["P"].shape[0]))
+        off_red.append(off_red[-1] + int(red_i["P"].shape[1]))
     return {"blocks": blocks, "off_full": off_full, "off_red": off_red, "n_full": off_full[-1], "n_red": off_red[-1]}
 
 
@@ -3944,6 +4076,52 @@ def _fem_impl(
             # FemResidualOperator. The periodic reduction below then wraps the *coupled* residual through
             # the nonlinear Pᵀr(P·) solve path, so a periodic tie + Coupling compose with no extra branch.
             fem_obj = _wrap_couplings(domain, fem_obj, couplings)
+        _hanging = getattr(domain, "_fem_hanging_nodes", None)
+        if _hanging:
+            # A locally refined mesh: the hanging nodes are constrained to the coarse edge they sit on,
+            # which is the same elimination a periodic tie performs -- so it rides the SAME `_periodic`
+            # reduction and reaches `reduce_matrix_periodic` / `B(P)` with no branch of its own.
+            from .utils.solver.fem_refine import hanging_prolongation
+
+            if periodic_ties:
+                raise NotImplementedError(
+                    "jno.fem: a locally refined (hanging-node) mesh combined with a periodic or tied "
+                    "interface composes two prolongations, and their order changes the answer. Refine "
+                    "away from the tied faces, or tie a conforming mesh."
+                )
+            _cells_h = np.asarray(getattr(domain, "_fem_hanging_cells"))
+            _ct_h = getattr(domain, "_fem_hanging_cell_type", "quad")
+            # the assembled connectivity and element order for THIS form -- the constraint set depends on
+            # the order, so it cannot be taken from the domain's stashed (P1) answer
+            _prob_h = getattr(fem_obj, "problem", None)
+            if _prob_h is not None:
+                _cells_a, _order_a = _assembly_cells(_prob_h)
+            else:
+                _cells_a = getattr(domain, "_fem_native_assembly_cells", None)
+                _order_a = int(getattr(domain, "_fem_native_assembly_order", 1))
+            if multifield:
+                # One block per field, exactly as the periodic reduction does. Every field lives on the
+                # same mesh, so they share the constraint SET, but each has its own component count --
+                # so each needs its own P and the blocks are concatenated. Handing a single field's P to
+                # a coupled system reached JAX as a bare shape error ("contracting dimensions ... (41,)
+                # and (82,)") naming neither the fields nor the refinement.
+                _hp = _build_hanging_reduction_multifield(domain, _hanging, _cells_h, _ct_h, fem_obj.offsets)
+            else:
+                _pts_h = np.asarray(fem_obj.points)
+                _hp = hanging_prolongation(
+                    _pts_h,
+                    _cells_h,
+                    vec=vec or 1,
+                    hang=_hanging_constraints(domain, _pts_h, _cells_a, _order_a),
+                    cell_type=_ct_h,
+                )
+            # Reduce the OPERATOR, not just record P: `reduce_op_periodic` is what turns the assembled
+            # block into P^T A P. Setting `_periodic` alone leaves the raw non-conforming system in
+            # place, and it still solves -- measured, -Lap u = 1 on a 4x4 grid with four cells refined
+            # returned a centre value of 0.0194 against 0.0737, with the constraint reported as built.
+            fem_obj._op = reduce_op_periodic(fem_obj._op, fem_obj._mode, _hp)
+            fem_obj._periodic = _hp
+            return _fuse_complex_steady(fem_obj)
         if not periodic_ties:
             return _fuse_complex_steady(fem_obj)
         # Single-field transient was already reduced by the dedicated native branch -> reuse its P.

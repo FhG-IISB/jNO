@@ -84,10 +84,13 @@ def test_block_reduction_sparse_bcoo_matches_dense(_x64):
 
 
 def _periodic_domain(n):
-    dom = jno.domain(
-        constructor=jno.domain.equi_distant_rect(x_range=(0.0, 1.0), y_range=(0.0, 1.0), nx=n, ny=n),
-        time=(0.0, 0.02, 11),
-        compute_mesh_connectivity=False,
+    dom = (
+        jno.Shape.rect(0.0, 0.0, 1.0, 1.0)
+        .structured(n=n)
+        .domain(
+            time=(0.0, 0.02, 11),
+            compute_mesh_connectivity=False,
+        )
     )
     for nm, pred in {
         "left": lambda x, y: x < 1e-6,

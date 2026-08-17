@@ -126,11 +126,16 @@ pts_h, tris_h = np.asarray(d_h.mesh.points)[:, :2], np.asarray(d_h.mesh.cells_di
 E_h = float(dirichlet_energy(jnp.asarray(pts_h), jnp.asarray(sol_h), jnp.asarray(tris_h)))
 n_h = len(sol_h)
 
-# (2) r-adaptivity — RELOCATE a fixed node set: the SAME `adapt=` slot with `relocate=True`. The interior
+# (2) r-adaptivity — RELOCATE a fixed node set: the SAME `adapt=` slot with `relocate=True`.
+#     `objective="energy"` descends the FE Dirichlet energy, which is what this tutorial MEASURES:
+#     for a Ritz method E_h - E_exact = 1/2||u - u_h||_E^2, so minimising the energy at fixed DOFs
+#     IS minimising the energy-norm error. That is the right objective for a fixed singularity like
+#     this corner. The default (`"equidistribution"`) instead equidistributes an arclength monitor,
+#     which wins on a moving or under-resolved FRONT and loses here -- see docs/fem.md. The interior
 #     vertices were tagged `.trainable()` in build(); the driver moves them (no new DOFs) and returns the solve.
 d_r, fem_r = build(0.12, movable=True)
 pts_r0 = np.asarray(d_r.mesh.points)[:, :2].copy()  # coarse start, for the animation
-sol_r = np.asarray(fem_r.solve(adapt=jno.solve.relocate(max_iters=60, lr=3e-3))).reshape(-1)
+sol_r = np.asarray(fem_r.solve(adapt=jno.solve.relocate(objective="energy", max_iters=60, lr=3e-3))).reshape(-1)
 pts_r, tris_r = np.asarray(d_r.mesh.points)[:, :2], np.asarray(d_r.mesh.cells_dict["triangle"])
 E_r = float(dirichlet_energy(jnp.asarray(pts_r), jnp.asarray(sol_r), jnp.asarray(tris_r)))
 

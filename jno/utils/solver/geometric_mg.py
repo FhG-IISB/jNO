@@ -1,6 +1,6 @@
 """Geometric multigrid (GMG) V-cycle for a **structured grid** — a matrix-free, differentiable
 preconditioner for the constant-coefficient Poisson/Helmholtz-type operators ``jno.fdm`` produces on a
-regular grid (see :func:`jno.domain(..., structured=True)`).
+regular grid (see :func:`jno.Shape.rect(...).structured().domain()`).
 
 The V-cycle approximates ``A⁻¹`` for ``A = -Δ`` with homogeneous Dirichlet on the interior:
 

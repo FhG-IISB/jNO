@@ -1,4 +1,4 @@
-"""``jno.fdm`` on a **structured grid** — ``jno.domain(Shape.rect(...), structured=True)``.
+"""``jno.fdm`` on a **structured grid** — ``jno.domain(Shape.rect(...).structured())``.
 
 A structured request builds a regular right-triangulation and records a grid descriptor on
 ``mesh_connectivity["grid"]``; ``jno.fdm`` then takes the assembly-free direct finite-difference
@@ -27,11 +27,11 @@ def _nodes(d):
 
 
 def _structured(x0=0.0, y0=0.0, x1=1.0, y1=1.0, size=0.1, **kw):
-    return jno.domain(jno.Shape.rect(x0, y0, x1, y1, size=size), structured=True, **kw)
+    return jno.domain(jno.Shape.rect(x0, y0, x1, y1, size=size).structured(), **kw)
 
 
 def _structured_box(x0=0.0, y0=0.0, z0=0.0, x1=1.0, y1=1.0, z1=1.0, size=0.2, **kw):
-    return jno.domain(jno.Shape.box(x0, y0, z0, x1, y1, z1, size=size), structured=True, **kw)
+    return jno.domain(jno.Shape.box(x0, y0, z0, x1, y1, z1, size=size).structured(), **kw)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -42,7 +42,7 @@ def _structured_box(x0=0.0, y0=0.0, z0=0.0, x1=1.0, y1=1.0, z1=1.0, size=0.2, **
 def test_grid_descriptor_present_and_correct():
     d = _structured(0.0, 0.0, 1.0, 1.0, size=0.1)
     grid = d.mesh_connectivity.get("grid")
-    assert grid is not None, "structured=True must stamp mesh_connectivity['grid']"
+    assert grid is not None, "a .structured() plan must stamp mesh_connectivity['grid']"
     assert grid["shape"] == (11, 11)
     assert np.allclose(grid["spacing"], (0.1, 0.1))
     assert np.allclose(grid["origin"], (0.0, 0.0))
@@ -258,12 +258,12 @@ def test_structured_transient_heat():
 
 def test_structured_constraint_list_transient():
     """fem-style transient authoring on a structured grid: ui.t = ν Δu, IC as a constraint, t_span from
-    domain.time. Composes structured=True *with* time= directly. The march's backward-Euler operator
+    domain.time. Composes .structured() *with* time= directly. The march's backward-Euler operator
     (I − dt·ν·Δ) is diagonally dominant, so it is robust with the default inner solve (no GMRES needed)."""
     import jno.jnp_ops as jnn
 
     nu, T = 0.05, 0.3
-    d = jno.domain(jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1), structured=True, time=(0.0, T, 100))
+    d = jno.domain(jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1).structured(), time=(0.0, T, 100))
     assert d.mesh_connectivity.get("grid") is not None
     p = _nodes(d)
     x, y, t = d.variable("interior", split=True)
@@ -291,7 +291,7 @@ def test_transient_time_schemes():
     nu, T = 0.05, 0.3
 
     def run(time):
-        d = jno.domain(jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1), structured=True, time=(0.0, T, 50))
+        d = jno.domain(jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1).structured(), time=(0.0, T, 50))
         p = _nodes(d)
         x, y, t = d.variable("interior", split=True)
         xb, yb, _ = d.variable("boundary", split=True)
@@ -410,28 +410,30 @@ def test_structured_3d_constraint_list_solve():
 
 def test_structured_rejects_disk():
     with pytest.raises((ValueError, NotImplementedError)):
-        jno.domain(jno.Shape.disk(0.0, 0.0, 1.0, size=0.1), structured=True)
+        jno.domain(jno.Shape.disk(0.0, 0.0, 1.0, size=0.1).structured())
 
 
 def test_structured_rejects_3d_composite():
     """A plain box is now supported (3-D); a composite/CSG 3-D shape still raises — cut-cell is planned."""
     shape = jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=0.2) - jno.Shape.sphere(0.5, 0.5, 0.5, 0.2)
     with pytest.raises((ValueError, NotImplementedError)):
-        jno.domain(shape, structured=True)
+        jno.domain(shape.structured())
 
 
 def test_structured_rejects_composite():
     shape = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1) - jno.Shape.disk(0.5, 0.5, 0.2)
     with pytest.raises((ValueError, NotImplementedError)):
-        jno.domain(shape, structured=True)
+        jno.domain(shape.structured())
 
 
 def test_structured_rejects_callable_size():
     shape = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=lambda x, y: 0.1)
     with pytest.raises(NotImplementedError):
-        jno.domain(shape, structured=True)
+        jno.domain(shape.structured())
 
 
-def test_structured_rejects_non_shape():
-    with pytest.raises(ValueError):
-        jno.domain(box(0.0, 0.0, 1.0, 1.0), structured=True)
+def test_a_non_shape_geometry_cannot_ask_for_a_lattice():
+    """A shapely polygon has no build plan to turn into a lattice, and now cannot ask: `.structured()`
+    is a `Shape` method, so the request is unspellable rather than refused at runtime."""
+    assert not hasattr(box(0.0, 0.0, 1.0, 1.0), "structured")
+    assert jno.domain(box(0.0, 0.0, 1.0, 1.0)).grid is None  # still meshes, just unstructured

@@ -213,6 +213,11 @@ def test_relocate_beats_a_uniform_mesh_on_an_underresolved_front():
     mesh under-resolves it and there is something for relocation to win. Measured ratios (relocated/uniform
     final rel-L2) across the sharpness sweep: 4.99 at eps=0.15 (front ~8 cells -- already over-resolved,
     nothing to redistribute), 0.96 at eps=0.06, 0.51 at eps=0.03.
+
+    Energy descent was not deleted for this, only dethroned: it remains ``objective="energy"`` and is the
+    right choice on a *fixed singularity*, where it IS the error norm. The two are pinned against each
+    other in ``test_the_two_objectives_each_win_on_their_own_problem`` below -- removing the option
+    outright is what left the L-shape tutorial asserting a property no reachable setting delivered (#109).
     """
     T, NSTEP, SIZE, EPS = 2.0, 24, 0.06, 0.03
 
@@ -612,3 +617,85 @@ def test_relocation_improves_element_quality_at_any_order_and_shape(order, shape
 
     assert after > 0.0, f"P{order} shape={shape}: relocation tangled the mesh (min detJ {after:.3e})"
     assert after >= 0.9 * before, f"P{order} shape={shape}: element quality fell, {before:.3e} -> {after:.3e}"
+
+
+# ------------------------------------------------------- the objective is a CHOICE, and both directions matter
+
+L_SHAPE_R = [(0, 0), (1, 0), (1, 0.5), (0.5, 0.5), (0.5, 1), (0, 1)]
+
+
+def _corner_problem(movable, size=0.12):
+    """Poisson on an L-shape: a FIXED singularity at the re-entrant corner, nothing moving."""
+    d = jno.Shape.polygon(L_SHAPE_R, size=size).domain()
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    if movable:
+        eps = 1e-9
+        xm, ym, _ = d.variable("mov", where=lambda x, y: (x > eps) & (x < 1 - eps) & (y > eps) & (y < 1 - eps), split=True)
+        xm.trainable(name="ix")
+        ym.trainable(name="iy")
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    return d, jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0])
+
+
+def _dirichlet_energy_of(d, sol):
+    import jax.numpy as jnp
+
+    from jno.utils.solver.fem_adapt import _dirichlet_energy_jax
+
+    pts = jnp.asarray(np.asarray(d.mesh.points)[:, :2])
+    cells = jnp.asarray(np.asarray(d.mesh.cells_dict["triangle"]))
+    return float(_dirichlet_energy_jax(pts, jnp.asarray(np.asarray(sol).reshape(-1)), cells, 2))
+
+
+def test_energy_descent_cuts_the_error_at_fixed_dofs_on_a_fixed_singularity():
+    """The measurement that lived only in a tutorial, which is how issue #109 survived three releases.
+
+    Relocation must improve the ANSWER at a fixed node count. For a Ritz method
+    ``E_h - E_exact = 1/2 ||u - u_h||_E^2``, so the Dirichlet energy against a fine reference IS the
+    energy-norm error, and `objective="energy"` descends exactly it. Measured: 4.459e-03 -> 1.991e-03,
+    a 55% cut at +0 DOFs, where the default monitor objective gives -12% on this problem.
+    """
+    d_ref, fem_ref = _corner_problem(False, size=0.03)
+    e_ref = _dirichlet_energy_of(d_ref, fem_ref.solve())
+
+    d0, fem0 = _corner_problem(False)
+    err0 = _dirichlet_energy_of(d0, fem0.solve()) - e_ref
+
+    d, fem = _corner_problem(True)
+    n0 = len(d.mesh.points)
+    sol = fem.solve(adapt=jno.solve.relocate(objective="energy", max_iters=60, lr=3e-3))
+    err = _dirichlet_energy_of(fem.domain, sol) - e_ref
+
+    assert len(fem.domain.mesh.points) == n0, "r-adaptivity must not change the node count"
+    assert err < 0.75 * err0, f"energy descent did not cut the error at fixed DOFs: {err:.3e} vs {err0:.3e}"
+
+
+def test_the_two_objectives_each_win_on_their_own_problem():
+    """Neither objective dominates, which is why both exist and why the default is a judgement call.
+
+    On a FIXED singularity the energy is the error norm and descending it wins. On an UNDER-RESOLVED
+    FRONT the energy can be lowered by under-resolving the layer -- measured at 10.7x worse than uniform
+    when it was the default, which is what motivated the switch. The monitor targets resolution instead.
+    Pinning both directions means neither can be silently dropped again.
+    """
+    d_ref, fem_ref = _corner_problem(False, size=0.03)
+    e_ref = _dirichlet_energy_of(d_ref, fem_ref.solve())
+    out = {}
+    for obj in ("energy", "equidistribution"):
+        d, fem = _corner_problem(True)
+        sol = fem.solve(adapt=jno.solve.relocate(objective=obj, max_iters=60, lr=3e-3))
+        out[obj] = _dirichlet_energy_of(fem.domain, sol) - e_ref
+    assert out["energy"] < out["equidistribution"], f"on a fixed singularity the energy objective must win: {out}"
+
+
+def test_the_objective_is_reachable_from_the_public_slot_and_validated():
+    """`AdaptSpec.objective` existed with two values while `jno.solve.relocate()` exposed no way to set
+    it -- a documented knob unreachable from the front door, which is half of why #109 was hard to
+    diagnose."""
+    assert jno.solve.relocate(objective="energy").objective == "energy"
+    assert jno.solve.relocate().objective == "equidistribution"  # unchanged default
+    d, fem = _corner_problem(True)
+    with pytest.raises(ValueError, match="must be 'energy', 'equidistribution' or 'huang'"):
+        fem.solve(adapt=jno.solve.relocate(objective="nonsense", max_iters=1))

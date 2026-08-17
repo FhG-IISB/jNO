@@ -447,3 +447,45 @@ def test_curve_domain_named_endpoints():
     assert np.allclose(np.asarray(d._mesh_pool["left"]).reshape(-1), [2.0])
     assert np.allclose(np.asarray(d._mesh_pool["right"]).reshape(-1), [5.0])
     assert np.allclose(np.sort(np.asarray(d._mesh_pool["boundary"]).reshape(-1)), [2.0, 5.0])
+
+
+# ------------------------------------------------- a derivation must carry every field it did not set
+
+
+def _cells(shape):
+    return {c.type: len(c.data) for c in shape.domain(compute_mesh_connectivity=False).mesh.cells}
+
+
+@pytest.mark.parametrize(
+    "derive",
+    [
+        pytest.param(lambda s: s.attach(k=1.0).name("a"), id="attach+name"),
+        pytest.param(lambda s: s.sized(0.4), id="sized"),
+        pytest.param(lambda s: s.translate((1.0, 0.0)), id="translate"),
+        pytest.param(lambda s: s.rotate((0, 0, 0), (0, 0, 1), 0.3), id="rotate"),
+        pytest.param(lambda s: s - Shape.disk(0.5, 0.5, 0.2), id="cut"),
+    ],
+)
+def test_a_derivation_carries_the_cell_choice(derive):
+    """Every ``Shape`` method returns a copy with one field changed, and a positional constructor has
+    to re-list every other field to carry it. ``attach`` did not re-list ``_cell``, so
+    ``.quad().attach(k=1.0)`` erased the quadrilateral choice outright -- ``cell_choices()`` came back
+    EMPTY and the plan meshed as triangles with no word about it. Hence ``dataclasses.replace``."""
+    derived = derive(Shape.rect(0, 0, 1, 1, size=0.4).quad())
+    assert derived._cell == "quad"
+    assert derived.cell_choices() == frozenset({"quad"})
+
+
+def test_a_regions_group_meshes_with_its_members_cell():
+    """The other half: a regions group is a fresh node carrying no cell of its own, so reading the
+    TOP shape's ``_cell`` meshed ``a.quad() + b.quad()`` as 52 triangles while ``cell_choices()``
+    already answered {"quad"}. The emitter asks the tree walk, which is the single derivation."""
+    group = Shape.rect(0, 0, 1, 1, size=0.4).quad().name("a") + Shape.rect(1, 0, 2, 1, size=0.4).quad().name("b")
+    assert group.cell_choices() == frozenset({"quad"})
+    cells = _cells(group)
+    assert cells.get("quad", 0) > 0 and "triangle" not in cells, cells
+
+
+def test_the_cell_choice_still_reaches_the_mesh_through_a_chain():
+    """End to end, since the field being carried is only worth anything if the mesher sees it."""
+    assert "triangle" not in _cells(Shape.rect(0, 0, 1, 1, size=0.4).quad().attach(k=1.0).name("a"))

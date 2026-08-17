@@ -17,10 +17,13 @@ def ctx():
     """Small 2D+time domain with two fields; x64 set per-test (FEM assembly is float64)."""
     prev = jax.config.jax_enable_x64
     jax.config.update("jax_enable_x64", True)
-    dom = jno.domain(
-        constructor=jno.domain.equi_distant_rect(x_range=(0.0, 1.0), y_range=(0.0, 1.0), nx=8, ny=8),
-        time=(0.0, 1.0, 3),
-        compute_mesh_connectivity=False,
+    dom = (
+        jno.Shape.rect(0.0, 0.0, 1.0, 1.0)
+        .structured(n=8)
+        .domain(
+            time=(0.0, 1.0, 3),
+            compute_mesh_connectivity=False,
+        )
     )
     u, v = dom.fem_symbols()
     A, qA = dom.fem_symbols(names=("A", "qA"))
@@ -116,10 +119,13 @@ def test_term_kinds_accessor_breaks_down_a_transient_pde():
     prev = jax.config.jax_enable_x64
     jax.config.update("jax_enable_x64", True)
     try:
-        dom = jno.domain(
-            constructor=jno.domain.equi_distant_rect(x_range=(0.0, 1.0), y_range=(0.0, 1.0), nx=8, ny=8),
-            time=(0.0, 0.1, 3),
-            compute_mesh_connectivity=False,
+        dom = (
+            jno.Shape.rect(0.0, 0.0, 1.0, 1.0)
+            .structured(n=8)
+            .domain(
+                time=(0.0, 0.1, 3),
+                compute_mesh_connectivity=False,
+            )
         )
         dom.tag("bnd", lambda x, y: (x < 1e-6) | (x > 1 - 1e-6) | (y < 1e-6) | (y > 1 - 1e-6))
         u, v = dom.fem_symbols()

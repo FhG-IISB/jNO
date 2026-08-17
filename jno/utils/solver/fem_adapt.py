@@ -181,6 +181,7 @@ def remesh_with_mmg(
         return _remesh_line_1d(domain, vertex_size, hmin=hmin, hmax=hmax, hgrad=hgrad, copy=copy)
     if dim not in (2, 3):
         raise NotImplementedError(f"remesh_with_mmg supports 1D line and 2D/3D simplicial meshes; got dimension {dim}.")
+    _require_simplex(domain, dim, "h-adaptive remeshing (mmg)")
 
     import mmgpy  # lazy: optional dependency, only needed for adaptive refinement
 
@@ -360,6 +361,120 @@ def _domain_from_arrays(template: Any, points: np.ndarray, elems: np.ndarray, bf
     return target
 
 
+def _apply_new_mesh(template: Any, new_mesh: Any, *, copy: bool):
+    """Put ``new_mesh`` on ``template`` (or a shallow copy), resetting everything keyed to the old one.
+
+    Factored out of :func:`_domain_from_arrays` so the mmg path and the rebuild path below cannot
+    drift apart in what they invalidate — a stale native-FEM cache or a surviving boundary region is
+    exactly the kind of thing that re-appears as a silently homogeneous problem after a remesh.
+    """
+    target = _shallow_copy(template) if copy else template
+    for attr in list(vars(target)):
+        if attr.startswith("_fem_native") or attr in ("_fem_assembly_cache", "_integral_weight_cache"):
+            delattr(target, attr)
+    _capture_geometric_boundary_tags(target)
+    if hasattr(target, "_reset_custom_tag_state"):
+        target._reset_custom_tag_state()
+    target._apply_mesh(new_mesh)
+    if getattr(target, "_is_time_dependent", False) and getattr(target, "time", None) is not None:
+        target._add_time_dimension(*target.time)
+    return target
+
+
+def _rebuild_to_size(domain: Any, vertex_size: np.ndarray, *, copy: bool = False):
+    """Remesh a **quadrilateral** domain by rebuilding its ``Shape`` plan at a new size field.
+
+    There is no mmg for quads: mmg adapts by edge split/collapse/swap, operations defined on
+    simplices. But a quadrilateral mesh in jNO is a triangle mesh that gmsh has recombined, and the
+    size field that drives the triangulation is already a first-class part of the plan — so the
+    adaptive step is "rebuild the same geometry at a finer size where it is marked", which needs no
+    new mesher. The plan is kept on ``domain._constructor_source``.
+
+    Measured: recombination survives exactly the grading this produces — 0 leftover triangles on a
+    uniform mesh, at 8x and 20x grading, on an L-shape graded into its re-entrant corner, and around a
+    locally refined hole. It is still checked on every rebuild rather than trusted, because a mixed
+    mesh would otherwise reach the assembler as a less clear refusal.
+
+    Unlike mmg this is a **global** remesh: the new mesh does not nest inside the old one and the
+    vertex count is not incremental. The solution transfer already handles unrelated meshes, so that
+    costs time, not correctness.
+    """
+    plan = getattr(domain, "_constructor_source", None)
+    if plan is None or not hasattr(plan, "sized"):
+        raise NotImplementedError(
+            "h-adaptive remeshing of a quadrilateral mesh rebuilds the geometry at a finer size field, "
+            "and this domain has no geometry to rebuild from (it was loaded from a mesh file, not "
+            "built from a jno.Shape). Adapt a Shape-built domain, or refine the file's mesh outside jNO."
+        )
+    if getattr(plan, "_structured", None) is not None:
+        raise NotImplementedError(
+            "h-adaptive remeshing cannot refine a Shape.structured() plan: a lattice's resolution is its "
+            "cell COUNTS, so rebuilding it against a marked size field returns the same mesh -- a silent "
+            "no-op. Drop .structured() to let gmsh mesh (and recombine) the geometry at a graded size, "
+            "or rebuild the lattice yourself at a larger n."
+        )
+    dim = int(domain.dimension)
+    pts = np.asarray(domain.mesh.points)[:, :dim]
+    size = np.asarray(vertex_size, dtype=float).reshape(-1)
+    if size.ndim != 1 or size.shape[0] != pts.shape[0]:
+        raise NotImplementedError(
+            "anisotropic (Hessian-metric) adaptation is not supported on a quadrilateral mesh: the "
+            "metric drives mmg's directional refinement, and the rebuild path can only ask gmsh for a "
+            "scalar target size. Use isotropic ZZ marking (AdaptSpec(anisotropic=False))."
+        )
+
+    from scipy.spatial import cKDTree
+
+    # The size field lives on the OLD mesh's vertices; gmsh asks for a size at arbitrary points, so
+    # carry it over by nearest-vertex lookup. Nearest rather than interpolated on purpose: the field
+    # is piecewise-constant-by-marking already, and interpolating would smear the refined region's
+    # edge outward by half an element.
+    tree = cKDTree(pts)
+
+    def _size_at(*coords):
+        q = np.stack([np.asarray(c, dtype=float).reshape(-1) for c in coords[:dim]], axis=1)
+        out = size[tree.query(q)[1]]
+        # gmsh's size callback hands over SCALARS and calls `float()` on the result, so return one --
+        # a 1-element array raises inside the C callback, where the exception becomes `lc = 0` and
+        # gmsh reports "Wrong mesh element size lc = 0" with nothing pointing back here.
+        return out if np.ndim(coords[0]) else float(out[0])
+
+    rebuilt = plan.sized(_size_at).domain(compute_mesh_connectivity=False)
+    blocks = {c.type: len(c.data) for c in rebuilt.mesh.cells}
+    if blocks.get("triangle"):
+        raise NotImplementedError(
+            f"the rebuilt mesh is mixed: gmsh recombination left {blocks['triangle']} triangles among "
+            f"{blocks.get('quad', 0)} quadrilaterals, and jNO assembles on one cell type. Coarsen the "
+            "refinement (a larger refine_factor) or adapt on a triangular mesh."
+        )
+    return _apply_new_mesh(domain, rebuilt.mesh, copy=copy)
+
+
+def _remesh_to_size(domain: Any, vertex_size, *, copy: bool = False, **mmg_kw):
+    """Remesh to a per-vertex target size, by whichever mechanism the mesh's cell supports.
+
+    Simplices go to mmg, which adapts them locally; quadrilaterals rebuild from the ``Shape`` plan
+    (:func:`_rebuild_to_size`). Everything else — a hexahedral mesh above all — refuses by name:
+    there is no general all-hex mesher, so metric-driven hex remeshing is not a thing to implement.
+    3-D tensor-product adaptivity needs octree refinement with hanging-node constraints instead.
+    """
+    from .fem_native import mesh_cell_type
+
+    dim = int(domain.dimension)
+    cell_type = mesh_cell_type(domain, dim)
+    if cell_type == "quad":
+        return _rebuild_to_size(domain, vertex_size, copy=copy)
+    if cell_type == "hexahedron":
+        raise NotImplementedError(
+            "h-adaptive remeshing is not supported on a hexahedral mesh, and not for want of plumbing: "
+            "no general all-hex mesher exists (gmsh's Recombine3DAll on a plain box returns tetrahedra "
+            "and no hexahedra), so there is nothing to remesh TO. 3-D tensor-product adaptivity needs "
+            "octree refinement with hanging-node constraints, which jNO does not have yet. Use a "
+            "tetrahedral mesh, or rebuild a structured grid at a finer n."
+        )
+    return remesh_with_mmg(domain, vertex_size, copy=copy, **mmg_kw)
+
+
 def _capture_geometric_boundary_tags(domain: Any) -> None:
     """Give every named boundary region a **mesh-independent predicate**, so it survives a remesh.
 
@@ -425,23 +540,121 @@ def _shallow_copy(domain: Any):
 # ---------------------------------------------------------------------------
 # Solution transfer -- piecewise-linear (barycentric) mesh-to-mesh interpolation
 # ---------------------------------------------------------------------------
+def _cells_in_basis_order(src_pts: np.ndarray, src_cells: np.ndarray, cell_idx: np.ndarray) -> np.ndarray:
+    """The chosen cells' vertex ids, ordered to match the weights :func:`_locate_in_cells` returns.
+
+    A stencil is a pair (ids, weights) and the two must be in the same order. Simplices are already
+    in it — meshio and basix agree there — but a quadrilateral's weights come from a basix-tabulated
+    basis while its connectivity is stored in VTK order, and the two disagree on vertices 2 and 3.
+    Pairing them unpermuted interpolates from the right cell with two of its corners swapped: wrong by
+    O(1), and it looks like a plausible field.
+
+    The vertex count alone does not identify the cell — 4 vertices is a quadrilateral in 2-D and a
+    tetrahedron in 3-D, and those need *different* permutations (one swaps, one is the identity) — so
+    the dimension is taken from ``src_pts``.
+    """
+    from .fem_native import _basix_ordered
+
+    family = _cell_family(src_pts.shape[1], np.asarray(src_cells).shape[1])
+    return _basix_ordered(np.asarray(src_cells), family)[cell_idx].astype(np.int64)
+
+
+def _cell_family(dim: int, n_local: int) -> str:
+    """The cell a ``(n_local,)`` connectivity row describes in ``dim`` dimensions.
+
+    Unambiguous, so point location can dispatch on the arrays alone without being handed a domain:
+    a 2-D cell has 3 vertices (triangle) or 4 (quadrilateral), a 3-D one 4 (tetrahedron) or 8
+    (hexahedron).
+    """
+    fam = {(1, 2): "interval", (2, 3): "triangle", (2, 4): "quadrilateral", (3, 4): "tetrahedron", (3, 8): "hexahedron"}
+    try:
+        return fam[(int(dim), int(n_local))]
+    except KeyError:
+        raise NotImplementedError(
+            f"point location: no cell with {n_local} vertices in {dim}-D. Expected "
+            f"{sorted(n for d, n in fam if d == int(dim))}."
+        ) from None
+
+
+def _locate_in_tensor_cells(src_pts, src_cells, qpts, *, tol, k, cell):
+    """:func:`_locate_in_cells` for quadrilateral / hexahedral meshes — same returns, Newton inverse.
+
+    Cells are permuted into **basix** vertex order before the map is inverted, because the tabulated
+    basis is written in that order; feeding VTK order evaluates a bow-tie whose Jacobian changes sign
+    inside the cell, so the inverse would converge to a point in the wrong place rather than fail.
+    The returned ``cell_idx`` indexes the ORIGINAL ``src_cells``, and ``weights`` are the Q1 shape
+    values in basix order, matching ``ref``.
+    """
+    from scipy.spatial import cKDTree
+
+    from .fem_lagrange import _invert_tensor_map
+    from .fem_native import _basix_ordered
+
+    dim = src_pts.shape[1]
+    cells_b = _basix_ordered(np.asarray(src_cells), cell)
+    cell_verts = src_pts[cells_b]  # (C, A, dim)
+    kk = int(min(max(k, 1), len(src_cells)))
+    _, cand = cKDTree(cell_verts.mean(axis=1)).query(qpts, k=kk)
+    cand = np.asarray(cand).reshape(len(qpts), kk)
+
+    V = cell_verts[cand]  # (Q, kk, A, dim)
+    xi, N = _invert_tensor_map(V, np.broadcast_to(qpts[:, None, :], (len(qpts), kk, dim)), cell)
+
+    # inside the reference hypercube [0, 1]^tdim, which is basix's quad/hex
+    slack = np.minimum(np.stack([xi, 1.0 - xi], axis=0).min(axis=0), 0.0).sum(axis=-1)  # <= 0, 0 = inside
+    inside_cand = slack >= -tol
+    any_inside = inside_cand.any(axis=1)
+    choice = np.where(any_inside, np.argmax(inside_cand, axis=1), np.argmax(slack, axis=1))
+    q = np.arange(len(qpts))
+    chosen, inside = cand[q, choice], inside_cand[q, choice]
+
+    # Outside points are projected onto the nearest cell by clamping the reference coordinate, the
+    # tensor-product twin of clamping + renormalising barycentric weights on a simplex.
+    xi_c = np.clip(xi[q, choice], 0.0, 1.0)
+    weights = np.where(inside[:, None], N[q, choice], _tensor_shape_values(xi_c, cell))
+    ref = np.where(inside[:, None], xi[q, choice], xi_c)
+    return chosen.astype(np.int64), weights, ref, inside
+
+
+def _tensor_shape_values(xi: np.ndarray, cell: str) -> np.ndarray:
+    """Q1 shape-function values at reference coordinates ``xi`` ``(Q, tdim)`` -> ``(Q, n_local)``."""
+    from .fem_lagrange import _lagrange_basix, basix_cell
+
+    bcell, _ = basix_cell(cell)
+    return np.asarray(_lagrange_basix(bcell, 1).tabulate(0, np.asarray(xi, dtype=np.float64)))[0, :, :, 0]
+
+
 def _locate_in_cells(src_pts: np.ndarray, src_cells: np.ndarray, qpts: np.ndarray, *, tol: float, k: int):
-    """Locate each query point in a simplicial mesh; return the containing **cell index** and its
-    barycentric weights.
+    """Locate each query point in a mesh; return its containing **cell index**, stencil weights and
+    reference coordinates.
 
     Point location is a KD-tree candidate search over cell centroids (the containing cell is almost
     always among the nearest centroids; raise ``k`` for strongly anisotropic meshes) followed by an
-    exact barycentric inside-test. Returns ``(cell_idx, weights, inside)``: ``cell_idx`` ``(Q,)`` the
-    chosen simplex's index into ``src_cells``; ``weights`` ``(Q, D+1)`` its barycentric coordinates
-    ``[λ0, λ1, …]`` (``weights[:, 1:]`` are the point's **basix reference coordinates** in that cell,
-    since the reference simplex is ``v0=0, v_i=e_i``); ``inside`` ``(Q,)`` bool (``True`` = strictly
-    contained; ``False`` = fell outside every candidate and was projected onto the nearest simplex by
-    clamping + renormalising the weights, a bounded convex combination of that cell's vertices). Pure
-    host/NumPy — this is the shared point-location core behind :func:`_locate_barycentric` (P1
+    inside-test in the candidate's reference cell. Returns ``(cell_idx, weights, ref, inside)``:
+
+    - ``cell_idx`` ``(Q,)`` — the chosen cell's index into ``src_cells``;
+    - ``weights`` ``(Q, n_local)`` — the **P1/Q1 shape-function values** there, i.e. the linear
+      interpolation stencil over that cell's vertices;
+    - ``ref`` ``(Q, tdim)`` — the point's **basix reference coordinates** in that cell, for tabulating
+      a higher-order basis;
+    - ``inside`` ``(Q,)`` bool — ``True`` = strictly contained; ``False`` = fell outside every
+      candidate and was projected onto the nearest cell.
+
+    On a **simplex** the two coincide (``weights == [1 - sum(ref), ref]``), because the reference
+    simplex is ``v0 = 0, v_i = e_i`` and the map is affine, so its inverse is one linear solve. On a
+    **quadrilateral or hexahedron** the map is bi/trilinear and has no closed-form inverse, so they
+    are genuinely different objects and ``ref`` is found by Newton (:func:`_invert_tensor_map`) —
+    which is why this returns both rather than making the caller slice ``weights[:, 1:]``, a
+    coincidence of the simplex case that silently does not hold otherwise.
+
+    Pure host/NumPy — the shared point-location core behind :func:`_locate_barycentric` (P1
     interpolation) and :func:`_eval_fe_fields_at_points` (general P{k}/vector transfer)."""
     from scipy.spatial import cKDTree
 
     dim = src_pts.shape[1]
+    family = _cell_family(dim, np.asarray(src_cells).shape[1])
+    if family in ("quadrilateral", "hexahedron"):
+        return _locate_in_tensor_cells(src_pts, src_cells, qpts, tol=tol, k=k, cell=family)
     cell_verts = src_pts[src_cells]  # (C, D+1, D)
     kk = int(min(max(k, 1), len(src_cells)))
     _, cand = cKDTree(cell_verts.mean(axis=1)).query(qpts, k=kk)
@@ -467,15 +680,15 @@ def _locate_in_cells(src_pts: np.ndarray, src_cells: np.ndarray, qpts: np.ndarra
     proj = np.clip(chosen_lam, 0.0, None)  # nearest-simplex projection for the outside points
     proj = proj / np.clip(proj.sum(axis=1, keepdims=True), 1e-300, None)
     weights = np.where(inside[:, None], chosen_lam, proj)
-    return chosen.astype(np.int64), weights, inside
+    return chosen.astype(np.int64), weights, weights[:, 1:], inside
 
 
 def _locate_barycentric(src_pts: np.ndarray, src_cells: np.ndarray, qpts: np.ndarray, *, tol: float, k: int):
     """P1 stencil form of :func:`_locate_in_cells`: return ``(idx, weights, inside)`` where ``idx``
     ``(Q, D+1)`` are the chosen simplex's **source-vertex indices** (the P1 interpolation stencil).
     Unchanged public behaviour — the state-transfer / resample / moving-boundary callers use this."""
-    cell_idx, weights, inside = _locate_in_cells(src_pts, src_cells, qpts, tol=tol, k=k)
-    return src_cells[cell_idx].astype(np.int64), weights, inside
+    cell_idx, weights, _ref, inside = _locate_in_cells(src_pts, src_cells, qpts, tol=tol, k=k)
+    return _cells_in_basis_order(src_pts, src_cells, cell_idx), weights, inside
 
 
 def _one_ring_cells(cells: np.ndarray, n_vert: int) -> tuple[np.ndarray, np.ndarray]:
@@ -958,8 +1171,8 @@ def _eval_fe_fields_at_points(
     for i in range(len(off) - 1):
         vec_i = int(field_vecs[i])
         blk = state[off[i] : off[i + 1]].reshape(-1, vec_i)  # (n_nodes_i, vec_i)
-        cell_idx, weights, inside = _locate_in_cells(src_pts_p1, src_cells_p1, np.asarray(query_pts[i]), tol=tol, k=k)
-        phi = _tabulate_lagrange_at(dim, int(src_orders[i]), weights[:, 1:])  # (Q_i, n_dof_i) at ref coords
+        cell_idx, weights, ref, inside = _locate_in_cells(src_pts_p1, src_cells_p1, np.asarray(query_pts[i]), tol=tol, k=k)
+        phi = _tabulate_lagrange_at(dim, int(src_orders[i]), ref)  # (Q_i, n_dof_i) at ref coords
         cells_i = np.asarray(src_cells_f[i])[cell_idx]  # (Q_i, n_dof_i): the old DOF ids of the containing cell
         vals = jnp.einsum("qn,qnc->qc", jnp.asarray(phi, dtype=rdtype), blk[jnp.asarray(cells_i)])  # (Q_i, vec_i)
         if isinstance(fill, (int, float)) and bool((~inside).any()):
@@ -1003,18 +1216,242 @@ def zz_error_indicators(domain: Any, u_vertex: np.ndarray) -> tuple[np.ndarray, 
     u = np.asarray(u_vertex)
     comps = [u[:, c] for c in range(u.shape[1])] if (u.ndim == 2 and u.shape[1] > 1) else [u.reshape(-1)]
 
-    # elementwise gap, integrated over the cell (centroid rule: P1 g_cell is exact there and the centroid
-    # value of the P1-recovered field is the vertex mean), summed over the field's components. For a COMPLEX
-    # component the gap is complex and the energy-norm uses its modulus ``|g* - grad u_h|^2`` (exact for
-    # reals since ``|x|^2 == x^2``) -- so one indicator drives real, complex and vector fields alike.
+    # The gap ``|g* - grad u_h|^2`` INTEGRATED over each cell, summed over the field's components. For a
+    # COMPLEX component the gap is complex and the energy-norm uses its modulus (exact for reals since
+    # ``|x|^2 == x^2``), so one indicator drives real, complex and vector fields alike.
+    #
+    # This used to be a one-point centroid rule, which is exact on a simplex -- ``grad u_h`` is constant
+    # there -- and WRONG on a tensor-product cell in a way that hides itself. A Q1 gradient sampled at the
+    # cell centre is superconvergent, and so is the recovered field there, so the centroid gap compares two
+    # O(h^2)-accurate quantities and misses the O(h) variation of ``grad u_h`` across the rest of the cell.
+    # Measured on -Delta u = f with u = sin(pi x) sin(pi y): the estimate then fell at rate 2 while the true
+    # energy error fell at rate 1, so the effectivity index DECAYED (0.81 -> 0.53 -> 0.35 over n = 8, 16, 32)
+    # instead of holding. An indicator that shrinks faster than the error still runs, still returns
+    # plausible numbers, and marks the wrong cells.
     eta2 = None
     for uc in comps:
-        g_star, g_cell, area, cells = _recover_nodal_gradient(domain, uc)
-        g_star_centroid = g_star[cells].mean(axis=1)  # (n_cells, dim)
-        e = area * np.sum(np.abs(g_star_centroid - g_cell) ** 2, axis=1)  # (n_cells,), real
+        g_star, _g_cell, _area, _cells = _recover_nodal_gradient(domain, uc)
+        e = _integrated_gradient_gap(domain, np.asarray(uc).reshape(-1), g_star)
         eta2 = e if eta2 is None else eta2 + e
     eta = np.sqrt(np.maximum(eta2, 0.0))
     return eta, float(np.sqrt(eta2.sum()))
+
+
+def _integrate_nodal_per_cell(domain: Any, g_nodal: np.ndarray) -> np.ndarray:
+    r"""``(n_cells,)`` of ``\int_K g``, for a P1/Q1 nodal field ``g``, by the cell's own quadrature.
+
+    The companion of :func:`_integrated_gradient_gap` and cell-generic for the same reason: the basis is
+    tabulated for whatever cell the mesh carries, so triangles, tets, quadrilaterals and hexahedra all
+    go through it unchanged.
+    """
+    from .fem_lagrange import lagrange_on
+    from .fem_native import _basix_ordered, mesh_cell_type
+
+    dim = int(domain.dimension)
+    cell_type = mesh_cell_type(domain, dim)
+    spec = lagrange_on(cell_type, 1, quad_degree=3)
+    cells = _basix_ordered(np.asarray(domain.mesh.cells_dict[cell_type]), cell_type).astype(np.int64)
+    X = np.asarray(domain.mesh.points)[:, :dim].astype(np.float64)[cells]
+    N = np.asarray(spec.ref_values)[:, :, 0]  # (Q, A)
+    dN = np.asarray(spec.ref_grads)[:, :, 0, :]  # (Q, A, T)
+    detJ = np.abs(np.linalg.det(np.einsum("cai,qak->cqik", X, dN)))  # (C, Q)
+    gq = np.einsum("qa,ca->cq", N, np.asarray(g_nodal).reshape(-1)[cells])
+    return np.einsum("cq,cq,q->c", gq, detJ, np.asarray(spec.quad_weights))
+
+
+def _criterion_weak_terms(fem: Any, criterion: Any, field: int = 0):
+    """``(criterion_term, mass_term)`` -- the criterion as an assemblable **weak term**, plus the lumped
+    mass term that normalises it, both carrying the same test function.
+
+    A refinement criterion is a field, not an equation -- ``phi * (1 - phi)`` for a phase-field
+    interface, ``|grad u|`` for a shock -- so requiring the user to append ``* v`` would be noise. But
+    :meth:`FEM.eval` assembles weak terms and refuses anything without a test function, so one is
+    supplied here.
+
+    It has to be the FEM's **own** test symbol: a fresh ``domain.fem_symbols()`` creates a DIFFERENT
+    field, and the assembler then rejects the term for carrying a test field it does not know
+    ("each volume weak-form term must contain exactly one test field"). So the symbol is recovered by
+    walking this FEM's own terms, and ``field`` selects it on a multifield problem (the same index
+    :attr:`AdaptSpec.metric_field` uses elsewhere).
+
+    The region likewise comes from the criterion's own coordinates -- recovered through
+    ``_jno_region_tag``, because ``jno.fem`` retags coordinates to the quadrature pool
+    (``"fem_gauss"``) at build time and the raw tag no longer names a region.
+    """
+    from ...trace import Placeholder, TestFunction, Variable, _iter_placeholder_children
+    from .solver_helper import contains_node_type
+
+    node = getattr(criterion, "expr", criterion)
+
+    def _walk(root, want):
+        seen: set = set()
+        out: list = []
+
+        def visit(n):
+            if not isinstance(n, Placeholder) or id(n) in seen:
+                return
+            seen.add(id(n))
+            if isinstance(n, want):
+                out.append(n)
+            for kind, _attr, val in _iter_placeholder_children(n):
+                for c in val if kind == "list" else (val,):
+                    visit(c)
+
+        visit(root)
+        return out
+
+    tests: list = []
+    for t in list(getattr(fem, "_constraints", None) or []):
+        for tf in _walk(getattr(t, "expr", t), TestFunction):
+            if not any(tf.field_key == e.field_key for e in tests):
+                tests.append(tf)
+    if not tests:
+        raise ValueError(
+            "adapt(criterion=...): could not find this problem's test function, so the criterion cannot "
+            "be assembled. Pass a criterion that already carries the test function (`expr * v`)."
+        )
+    if not 0 <= int(field) < len(tests):
+        raise ValueError(f"adapt(criterion=...): metric_field={field} but this problem has {len(tests)} field(s).")
+
+    def _region_tags(root) -> list:
+        found: list = []
+        for var in _walk(root, Variable):
+            tg = getattr(var, "tag", None)
+            if isinstance(tg, str) and (tg == "fem_gauss" or tg.startswith("gauss_")):
+                tg = getattr(var, "_jno_region_tag", tg)  # the recovery `_region_and_support` does
+            if isinstance(tg, str) and tg not in found:
+                found.append(tg)
+        return found
+
+    tags = _region_tags(node)
+    if not tags:
+        # A criterion can legitimately carry no coordinates of its own: `ui * (1 - ui)` -- a phase-field
+        # interface indicator -- references only the bound trial function, and a plain bound field does
+        # not expose its coordinates the way a derivative (`ui.x`) does. Fall back to the region the
+        # FORM integrates over, which is the only region a volume criterion could mean anyway.
+        for t in list(getattr(fem, "_constraints", None) or []):
+            tags = _region_tags(getattr(t, "expr", t))
+            if tags:
+                break
+    if not tags:
+        raise ValueError(
+            "adapt(criterion=...): neither the criterion nor this problem's terms carry coordinates, so "
+            "the region to integrate over is undetermined. Build the criterion from "
+            "`domain.variable(region, split=True)` coordinates, as a weak term is."
+        )
+    if len(tags) > 1:
+        raise ValueError(f"adapt(criterion=...): the criterion spans more than one region {tags}; use one.")
+
+    dim = int(fem.domain.dimension)
+    # Bind the test function to the coordinate OBJECTS already in play, not to freshly fetched ones.
+    # A criterion referencing a bound field (`ui * (1 - ui)`) carries the form's retagged coordinates
+    # inside it, and mixing those with fresh ones raises "coord binding conflict for 'x': cannot combine
+    # two named views that map 'x' to different Variables". Ordered by `dim[0]`, the axis index.
+    seen_axis: dict = {}
+    for root in [node] + [getattr(t, "expr", t) for t in list(getattr(fem, "_constraints", None) or [])]:
+        for var in _walk(root, Variable):
+            if getattr(var, "axis", None) != "spatial":
+                continue
+            ax = int(getattr(var, "dim", [0])[0])
+            seen_axis.setdefault(ax, var)
+        if len(seen_axis) >= dim:
+            break
+    if len(seen_axis) >= dim:
+        coords = [seen_axis[a] for a in sorted(seen_axis)][:dim]
+    else:  # nothing carries coordinates (a criterion of pure constants): fall back to the region's own
+        coords = list(fem.domain.variable(tags[0], split=True))[:dim]
+    test_bound = tests[int(field)](*coords)
+    node = getattr(criterion, "expr", criterion)
+    # The MASS term is built from the same test function and coordinates rather than from the criterion,
+    # so that an already-weak criterion does not produce `1 + 0*(g*v)` -- a sum of a test-free and a
+    # test-carrying part, which the assembler rejects as "must contain exactly one test field".
+    crit_term = criterion if contains_node_type(node, TestFunction) else criterion * test_bound
+    mass_term = 1.0 * test_bound
+
+    # Point the coordinates at the quadrature pool, exactly as `jno.fem` does to a form's coordinates at
+    # build time. Without it a criterion built from FRESHLY fetched coordinates samples the mesh pool
+    # while assembly wants quadrature points, and the mismatch surfaces as a bare broadcasting error
+    # ("input type=float32[173484] and requested type=float32[948]") naming neither the criterion nor
+    # the coordinates. Idempotent on coordinates the form already retagged.
+    from jno._fem import _retag_coords_for_quadrature
+
+    for t in (crit_term, mass_term):
+        _retag_coords_for_quadrature(t, "volume", tags[0])
+    return crit_term, mass_term
+
+
+def _criterion_indicators(fem: Any, criterion: Any, u: np.ndarray, field: int = 0) -> tuple:
+    """Per-cell indicators from a traced criterion, in the shape :func:`zz_error_indicators` returns.
+
+    ``FEM.eval`` gives ``int g phi_i``; dividing by the lumped mass ``int phi_i`` turns that into a
+    nodal field whose scale is ``g`` rather than ``g x volume`` -- so a criterion and the mesh it is
+    measured on stay independent, and `theta` means the same thing across refinement rounds. The nodal
+    field is then integrated per cell, which is what the marking consumes.
+    """
+    weak, mass_term = _criterion_weak_terms(fem, criterion, field)
+    num = np.asarray(fem.eval(weak, u)).reshape(-1)
+    mass = np.asarray(fem.eval(mass_term, u)).reshape(-1)
+    n_vert = int(np.asarray(fem.domain.mesh.points).shape[0])
+    g = np.abs(num[:n_vert]) / np.maximum(np.abs(mass[:n_vert]), 1e-30)
+    g = np.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0)
+    eta = np.abs(_integrate_nodal_per_cell(fem.domain, g))
+    return eta, float(np.sqrt(np.sum(eta**2)))
+
+
+def _integrated_gradient_gap(domain: Any, u_vertex: np.ndarray, g_star: np.ndarray) -> np.ndarray:
+    """``(n_cells,)`` of ``\\int_K |g* - grad u_h|^2``, by the cell's own quadrature.
+
+    The recovered field ``g*`` is interpolated with the same P1/Q1 basis the solution uses, and both it
+    and ``grad u_h`` are evaluated at every quadrature point rather than at the cell centre — which is
+    what makes this the Zienkiewicz–Zhu indicator on a tensor-product cell rather than on a simplex
+    only. See the note in :func:`zz_error_indicators` for what the centroid shortcut cost.
+
+    One code path for both cell families: nothing here is simplicial, and on a simplex the extra
+    quadrature points cost a little and change nothing, since ``grad u_h`` is constant and the rule is
+    exact for the resulting quadratic integrand.
+    """
+    from .fem_lagrange import lagrange_on
+    from .fem_native import _basix_ordered, mesh_cell_type
+
+    dim = int(domain.dimension)
+    cell_type = mesh_cell_type(domain, dim)
+    # Degree 3 is exact for the quadratic integrand a simplex produces and enough resolution across a
+    # bilinear cell, where the integrand is rational and no rule is exact.
+    spec = lagrange_on(cell_type, 1, quad_degree=3)
+    cells = _basix_ordered(np.asarray(domain.mesh.cells_dict[cell_type]), cell_type).astype(np.int64)
+
+    X = np.asarray(domain.mesh.points)[:, :dim].astype(np.float64)[cells]  # (C, A, dim)
+    N = np.asarray(spec.ref_values)[:, :, 0]  # (Q, A)
+    dN = np.asarray(spec.ref_grads)[:, :, 0, :]  # (Q, A, T)
+    w = np.asarray(spec.quad_weights)  # (Q,)
+
+    J = np.einsum("cai,qak->cqik", X, dN)  # (C, Q, dim, T)
+    detJ = np.abs(np.linalg.det(J))  # (C, Q)
+    gphys = np.einsum("qak,cqki->cqai", dN, np.linalg.inv(J))  # (C, Q, A, dim)
+
+    gh = np.einsum("cqai,ca->cqi", gphys, u_vertex[cells])  # grad u_h at each quadrature point
+    gs = np.einsum("qa,cai->cqi", N, np.asarray(g_star)[cells])  # the recovered field, same points
+    return np.einsum("cq,cq,q->c", np.sum(np.abs(gs - gh) ** 2, axis=2), detJ, w)
+
+
+def _require_simplex(domain, dim: int, what: str) -> None:
+    """Refuse a simplex-only adaptive path on a quad/hex mesh, by NAME.
+
+    Both halves of adaptivity are barycentric at heart: the recovery estimator differentiates P1
+    shape functions (constant per cell, which a bilinear cell's are not), and mmg adapts triangles
+    and tetrahedra. Neither generalises by setting a flag -- conforming quad/hex refinement is a
+    different algorithm (templates, or an octree with hanging nodes, a concept jNO has nowhere).
+    Without this the mesh's missing simplex block surfaced as a bare ``KeyError: 'triangle'``.
+    """
+    cd = domain.mesh.cells_dict
+    if _simplex_cell_key(dim) in cd:
+        return
+    present = sorted(k for k in cd if k not in ("vertex", "line"))
+    raise NotImplementedError(
+        f"{what} needs a simplicial mesh; this {dim}-D mesh carries {present} cells. Conforming "
+        "quad/hex refinement is a different algorithm, not a setting -- adapt on a simplicial mesh, "
+        "or refine a structured grid by rebuilding it at a finer nx/ny."
+    )
 
 
 def _p1_element_gradients(domain: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -1027,6 +1464,7 @@ def _p1_element_gradients(domain: Any) -> tuple[np.ndarray, np.ndarray, np.ndarr
     and 3D without the native FEM context.
     """
     dim = int(domain.dimension)
+    _require_simplex(domain, dim, "the recovery error estimator")
     pts = np.asarray(domain.mesh.points)[:, :dim].astype(np.float64)
     cells = np.asarray(domain.mesh.cells_dict[_simplex_cell_key(dim)])
     v = pts[cells]  # (n_cells, dim+1, dim)
@@ -1040,6 +1478,69 @@ def _p1_element_gradients(domain: Any) -> tuple[np.ndarray, np.ndarray, np.ndarr
     return grad, measure, cells
 
 
+def _tensor_element_gradients(domain: Any, cell_type: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Q1 shape-function gradients at each cell's **centroid**, and the cell measures.
+
+    The simplex path opposite gets the gradient for free: a P1 gradient is constant over the cell, so
+    inverting the edge matrix *is* the answer. A bilinear (Q1) or trilinear cell has no such constant
+    — its gradient varies inside the element — so a sample point has to be chosen, and which one is
+    not a matter of taste.
+
+    **The centroid is the superconvergent (Barlow) point of a Q1 gradient**: there the derivative is
+    ``O(h^2)`` accurate against ``O(h)`` elsewhere in the cell, which is exactly the property
+    Zienkiewicz–Zhu patch recovery needs of its samples — averaging non-superconvergent samples
+    recovers nothing and yields an indicator that marks the wrong cells while still *looking* like it
+    works. (For Q2 the superconvergent set is the 2x2 Gauss points instead; this estimator reads
+    vertex values only, so Q1 is the relevant case whatever the solution's order.)
+
+    Reference: Zienkiewicz & Zhu, *The superconvergent patch recovery and a posteriori error
+    estimates. Part 1*, Int. J. Numer. Methods Eng. **33** (1992) 1331-1364; Barlow, *Optimal stress
+    locations in finite element models*, Int. J. Numer. Methods Eng. **10** (1976) 243-251.
+
+    Returns ``(grad, measure, cells)`` in the same shapes the simplex path returns, so
+    :func:`_recover_nodal_gradient` is identical for both. ``cells`` comes back in **basix** vertex
+    order, because that is the order the tabulated basis is written in — pairing VTK-ordered cells
+    with it evaluates a bow-tie whose Jacobian changes sign inside the cell.
+    """
+    from .fem_lagrange import _lagrange_basix, basix_cell, lagrange_on
+    from .fem_native import _basix_ordered
+
+    dim = int(domain.dimension)
+    cell, tdim = basix_cell(cell_type)
+    spec = lagrange_on(cell_type, 1)
+    cells = _basix_ordered(np.asarray(domain.mesh.cells_dict[cell_type]), cell_type).astype(np.int64)
+    X = np.asarray(domain.mesh.points)[:, :dim].astype(np.float64)[cells]  # (n_cells, n_local, dim)
+
+    # dN/dxi at the reference cell's centre. `spec.ref_grads` is tabulated on the element's own
+    # quadrature, so tabulate again at the single point we actually want to sample. basix's
+    # quadrilateral and hexahedron are the unit hypercube, so the centre is 0.5 along every axis.
+    dN_c = np.asarray(_lagrange_basix(cell, 1).tabulate(1, np.full((1, tdim), 0.5)))[1 : tdim + 1, 0, :, 0].T
+
+    J = np.einsum("cai,ak->cik", X, dN_c)  # (n_cells, dim, tdim): dx_i/dxi_k
+    grad = np.einsum("ak,cki->cai", dN_c, np.linalg.inv(J))  # dN_a/dx_i = sum_k dN_a/dxi_k * dxi_k/dx_i
+
+    # The measure is NOT |det J| times the reference volume: det J varies over a bilinear cell, so it
+    # has to be integrated. Exact for a parallelogram, and the right answer for a trapezoid too.
+    dN_q = np.asarray(spec.ref_grads)[:, :, 0, :]  # (n_quad, n_dof, tdim)
+    Jq = np.einsum("cai,qak->cqik", X, dN_q)  # (n_cells, n_quad, dim, tdim)
+    measure = np.einsum("cq,q->c", np.abs(np.linalg.det(Jq)), np.asarray(spec.quad_weights))
+    return grad, measure, cells
+
+
+def _element_gradients(domain: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Per-cell shape-function gradients and measures, whichever cell the mesh carries.
+
+    Dispatches on the mesh's own volume cell rather than on the dimension: a 3-D mesh is tetrahedral
+    or hexahedral, and only the mesh knows which.
+    """
+    from .fem_native import TENSOR_PRODUCT_CELLS, mesh_cell_type
+
+    cell_type = mesh_cell_type(domain, int(domain.dimension))
+    if cell_type in TENSOR_PRODUCT_CELLS:
+        return _tensor_element_gradients(domain, cell_type)
+    return _p1_element_gradients(domain)
+
+
 def _recover_nodal_gradient(domain: Any, field: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Patch-recovered (superconvergent) nodal gradient of a P1 ``field``.
 
@@ -1049,7 +1550,7 @@ def _recover_nodal_gradient(domain: Any, field: np.ndarray) -> tuple[np.ndarray,
     areas/volumes, and ``cells`` the ``(n_cells, n_local)`` connectivity.  Works for 2D triangle
     and 3D tetrahedron P1 meshes.
     """
-    sg, measure, cells = _p1_element_gradients(domain)  # geometric, exact for P1 simplices
+    sg, measure, cells = _element_gradients(domain)  # exact for P1 simplices, Barlow-sampled on Q1
     sg = np.asarray(sg)  # (n_cells, n_local, dim)
     cells = np.asarray(cells)
     n_cells, _, dim = sg.shape
@@ -1164,10 +1665,19 @@ def size_field_from_marks(domain: Any, marked_cells: np.ndarray, *, refine_facto
     The current local size at a vertex is its mean incident edge length; vertices
     touched by a marked cell get that divided by ``refine_factor``, so Mmg refines
     exactly the flagged region while leaving the rest near its current resolution.
+
+    Cell-generic: the all-pairs loop below needs only "how many vertices a cell has", so it works on
+    a quadrilateral or hexahedron unchanged. It does count a quad's two DIAGONALS among its "edges",
+    which biases the local size upward by a bounded factor -- acceptable in a heuristic whose output
+    is a target, not a measurement, but stated here rather than left to be rediscovered. Taking the
+    cells by dimension instead of by cell type was a bare ``KeyError: 'triangle'`` on a quad mesh,
+    raised one stage before the mesher that is the real limit.
     """
+    from .fem_native import mesh_cell_type
+
     dim = int(domain.dimension)
     pts = np.asarray(domain.mesh.points)[:, :dim]
-    tris = np.asarray(domain.mesh.cells_dict[_simplex_cell_key(dim)])
+    tris = np.asarray(domain.mesh.cells_dict[mesh_cell_type(domain, dim)])
     n_vert = pts.shape[0]
 
     # mean incident edge length per vertex
@@ -1230,13 +1740,30 @@ def _simplex_measure_divisor(dim: int) -> float:
     return {1: 1.0, 2: 2.0}.get(int(dim), 6.0)
 
 
-def _mesh_cells(domain: Any) -> tuple[np.ndarray, int]:
+def _mesh_cells(domain: Any, what: str = "this adaptive path") -> tuple[np.ndarray, int]:
+    """The mesh's simplices, refusing by name when there are none.
+
+    Without the guard the missing block surfaced as a bare ``KeyError: 'triangle'`` /
+    ``KeyError: 'tetra'`` from the dict lookup below — a message that names neither the cell type the
+    mesh actually carries nor what would have to exist to support it.
+
+    ``what`` names the caller, because this helper serves both drivers and a message that blamed the
+    wrong one would be worse than the ``KeyError``: it would send the reader to the wrong code.
+    """
     dim = int(domain.dimension)
+    _require_simplex(domain, dim, what)
     return np.asarray(domain.mesh.cells_dict[_simplex_cell_key(dim)]).astype(np.int64), dim
 
 
 def _signed_simplex_measures(points: np.ndarray, cells: np.ndarray, dim: int) -> np.ndarray:
-    """Signed area (2D) / volume (3D) of every simplex; the *sign* flips iff a cell inverts (tangles)."""
+    """Signed area (2D) / volume (3D) of every simplex; the *sign* flips iff a cell inverts (tangles).
+
+    Simplex-only, and not incidentally: the measure is ``det`` of the edge matrix, which needs exactly
+    ``dim + 1`` vertices. A quadrilateral or hexahedral cell has no such closed form — its validity
+    test is the sign of the isoparametric ``det J`` sampled over the cell, since a bilinear cell can
+    be locally inverted while its corner-to-corner determinant stays positive. Guarded upstream in
+    :func:`_mesh_cells`.
+    """
     v = np.asarray(points)[cells]  # (n_cells, dim+1, dim)
     edge = v[:, 1:, :] - v[:, :1, :]  # (n_cells, dim, dim): rows v_i - v_0
     return np.linalg.det(edge) / _simplex_measure_divisor(dim)
@@ -1568,6 +2095,34 @@ class AdaptSpec:
     hmax: float | None = None
     every: int = 5
     metric_field: int = 0
+    criterion: Any = None
+    """Refine on a **traced expression** instead of the recovery error estimator.
+
+    Any jNO expression of the solution and the coordinates: ``jno.np.abs(ui.x)`` for a gradient
+    detector, ``phi * (1 - phi)`` for a phase-field interface, ``jno.np.abs(uy.x - ux.y)`` for 2-D
+    vorticity, ``d.by_region({...})`` to refine a material. It needs **no test function** -- one is
+    supplied internally (:func:`_criterion_weak_term`), because a criterion is a field, not an equation.
+
+    This is how refinement is specified in production AMR codes, which mark on physical quantities
+    rather than on an error estimate. Marking (``theta``), sizing (``refine_factor``) and the remesh
+    mechanism are unchanged, so a criterion composes with everything else on this spec.
+    """
+    split: bool = False
+    """Switch the h-adaptive loop from **remeshing** to **local refinement with hanging nodes**: split
+    each marked cell into 4 (a quadrilateral) or 8 (a hexahedron) rather than rebuilding the mesh at a
+    finer size field. What :func:`jno.solve.refine` sets.
+
+    A different algorithm, not a setting on the same one. Remeshing re-runs the mesher, so it needs a
+    geometry to rebuild from and produces a mesh that does not nest inside the old one; splitting needs
+    neither, works on a mesh loaded from a file, and keeps every existing node and its value. For
+    **hexahedra it is the only option** -- no general all-hex mesher exists, so there is nothing to
+    remesh to.
+
+    The price is that the mesh stops being conforming, and the nodes left hanging on a coarse facet are
+    constrained to it (:mod:`jno.utils.solver.fem_refine`). ``theta``, ``criterion``, ``max_iters``,
+    ``max_dofs``, ``tol`` and ``eps`` all mean exactly what they do for remeshing; ``refine_factor``
+    does not apply, because a split halves the cell by construction.
+    """
     # --- r-adaptivity (mesh relocation) --------------------------------------------------------------
     relocate: bool = False
     """Switch ``FEM.solve(adapt=...)`` from h-refinement (add elements) to **r-adaptivity**: relocate the
@@ -1636,9 +2191,19 @@ def _solve_vertex_values(fem: Any, solve_fn: Any = None, *, allow_vector: bool =
     P1 **vector** field returns its node-major nodal values reshaped to ``(n_vertices, vec)`` (which the ZZ
     estimator sums over components); without it -- and for a higher-order vector field, whose vertex DOFs
     are not a simple prefix -- a vector problem is rejected (refine on a scalar readout instead)."""
+    return _vertex_view(np.asarray(fem.solve(solve_fn, **kwargs)).reshape(-1), fem, allow_vector=allow_vector)
+
+
+def _vertex_view(sol: np.ndarray, fem: Any, *, allow_vector: bool = False) -> np.ndarray:
+    """The vertex part of an already-computed solution vector.
+
+    Split out of :func:`_solve_vertex_values` so a caller that needs BOTH the full DOF vector and its
+    vertex view -- a traced criterion is assembled on the full vector, while the estimator wants the
+    vertex one -- gets them from a single solve instead of solving the problem twice per round.
+    """
     from jno._fem import _infer_vec  # local import: fem_adapt is loaded lazily by the domain
 
-    sol = np.asarray(fem.solve(solve_fn, **kwargs)).reshape(-1)
+    sol = np.asarray(sol).reshape(-1)
     n_vert = int(np.asarray(fem.domain.mesh.points).shape[0])
     vec = _infer_vec(fem._constraints) if getattr(fem, "_constraints", None) else 1
     if vec != 1:
@@ -1671,6 +2236,12 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
 
     if fem._constraints is None:
         raise ValueError("FEM.solve(adapt=...) requires a FEM built by jno.fem(...) (its constraint list is retained).")
+    if spec.split and spec.anisotropic:
+        raise NotImplementedError(
+            "jno.solve.refine() splits cells isotropically -- a quadrilateral into 4, a hexahedron into 8 "
+            "-- so there is no direction for an anisotropic metric to stretch them along. Use "
+            "jno.solve.remesh(anisotropic=True) on a simplex mesh for directional adaptation."
+        )
 
     d = fem.domain
     cons = fem._constraints
@@ -1681,16 +2252,30 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
     prev_est = None
     n_converged = 0
     for it in range(spec.max_iters):
-        u = _solve_vertex_values(cur, solve_fn, allow_vector=True, **kwargs)
+        _full = np.asarray(cur.solve(solve_fn, **kwargs)).reshape(-1)
+        u = _vertex_view(_full, cur, allow_vector=True)
         if u.ndim == 2 and spec.anisotropic:  # vector field: the ZZ estimator sums components, but the
             raise NotImplementedError(  # anisotropic Hessian metric is scalar-only (a single Hessian field)
                 "anisotropic (Hessian-metric) adaptation is scalar-only; use isotropic ZZ "
                 "(AdaptSpec(anisotropic=False)) to refine a vector field."
             )
-        eta, est = zz_error_indicators(d, u)
+        if spec.criterion is not None:
+            # A user criterion REPLACES the recovery estimator: it says where to refine directly, which
+            # is how production AMR actually marks (a density gradient, an interface, vorticity) rather
+            # than by an error estimate. Everything downstream -- theta, refine_factor, the remesh
+            # mechanism -- is untouched, so it composes with all of them.
+            eta, est = _criterion_indicators(cur, spec.criterion, _full, int(spec.metric_field))
+        else:
+            eta, est = zz_error_indicators(d, u)
         n_dofs = int(np.asarray(d.mesh.points).shape[0])
         marked = None if spec.anisotropic else dorfler_mark(eta, spec.theta)
-        _rec_cells, _ = _mesh_cells(d)  # points/cells: for a refinement animation (connectivity changes each round)
+        # points/cells for a refinement animation (connectivity changes each round). Recorded with the
+        # mesh's OWN cells rather than through `_mesh_cells`, which requires simplices: recording a
+        # quad mesh needs no such thing, and going through it made the h path refuse HERE, one stage
+        # before the mesher that is the real limit -- with the relocation driver's name on the message.
+        from .fem_native import mesh_cell_type as _mct
+
+        _rec_cells = np.asarray(d.mesh.cells_dict[_mct(d, int(d.dimension))])
         history.append(
             {
                 "n_dofs": n_dofs,
@@ -1714,7 +2299,14 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
         if last or below_tol or over_budget or plateaued or nothing_marked:
             break
 
-        if spec.anisotropic:
+        if spec.split:
+            # Local refinement: split the marked cells and constrain the hanging nodes. No mesher, so
+            # this is the branch a hexahedral mesh takes (there is nothing to remesh it to) and the one
+            # that works on a mesh with no `Shape` plan behind it.
+            from .fem_refine import refine_domain
+
+            refine_domain(d, marked, copy=False)
+        elif spec.anisotropic:
             if np.iscomplexobj(u):
                 raise NotImplementedError(
                     "anisotropic (Hessian-metric) adaptation is real-only; use isotropic ZZ "
@@ -1731,10 +2323,10 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
             metric = hessian_metric(d, u, target_complexity=target, hmin=hmin, hmax=hmax)
             # a loose size gradation lets adjacent elements change size fast, which is what
             # permits the high aspect ratios that make anisotropic adaptation pay off
-            remesh_with_mmg(d, metric, copy=False, hmin=hmin, hmax=hmax, hgrad=3.0)
+            _remesh_to_size(d, metric, copy=False, hmin=hmin, hmax=hmax, hgrad=3.0)
         else:
             size = size_field_from_marks(d, marked, refine_factor=spec.refine_factor)
-            remesh_with_mmg(d, size, copy=False)  # mutate the domain in place
+            _remesh_to_size(d, size, copy=False)  # mutate the domain in place
         # Re-materialize custom coordinate-predicate tags on the refreshed mesh so that
         # surface-integral terms -- Neumann / Robin / absorbing boundary conditions -- re-derive on
         # the new boundary facets. (Dirichlet already re-resolves geometrically via its location
@@ -2145,7 +2737,7 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
         raise NotImplementedError(f"AdaptSpec(relocate=True): unsupported problem mode {mode!r}.")
 
     dim = int(dom.dimension)
-    cells, _ = _mesh_cells(dom)
+    cells, _ = _mesh_cells(dom, "r-adaptivity (relocation)")
     cells_j = jnp.asarray(cells)
     pts0 = np.asarray(dom.mesh.points)[:, :dim].copy()
     pts0_j = jnp.asarray(pts0)
@@ -2229,8 +2821,8 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
             return newton_krylov(lambda uu: op.residual(uu, vals), u0)
         return _march(vals)  # transient: time-averaged nodal state over the marched trajectory
 
-    if spec.objective not in ("equidistribution", "huang"):
-        raise ValueError(f"AdaptSpec.objective must be 'equidistribution' or 'huang'; got {spec.objective!r}.")
+    if spec.objective not in ("energy", "equidistribution", "huang"):
+        raise ValueError(f"AdaptSpec.objective must be 'energy', 'equidistribution' or 'huang'; got {spec.objective!r}.")
     if spec.relocate_method not in ("descent", "monge_ampere"):
         raise ValueError(f"AdaptSpec.relocate_method must be 'descent' or 'monge_ampere'; got {spec.relocate_method!r}.")
 
@@ -2242,17 +2834,17 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
         d_ = 0.0
         for i in range(len(bounds) - 1):
             bf = _vertex_values(u[bounds[i] : bounds[i + 1]], i)
-            if spec.objective == "huang":
+            if spec.objective == "energy":
+                d_ = d_ + _dirichlet_energy_jax(pts, bf, cells_j, dim)
+            elif spec.objective == "huang":
                 d_ = d_ + _huang_ea_jax(pts, pts0_j, bf, cells_j, dim)
             else:
                 d_ = d_ + _equidistribution_jax(pts, bf, cells_j, dim)
         return d_
 
     def _objective(vals):
-        """What relocation descends: the monitor's **equidistribution defect**, not the FE energy.
-
-        The energy is still computed and reported in ``adapt_history`` as a diagnostic — it is a useful
-        thing to watch, it just makes a bad objective (see :func:`_equidistribution_jax`)."""
+        """What relocation descends -- :attr:`AdaptSpec.objective`. The FE energy is *also* computed and
+        reported in ``adapt_history`` whichever objective is chosen, so the two are always comparable."""
         u = _solve_at(vals)
         pts = _scatter(vals)
         bounds = list(fem.offsets) if fem.offsets is not None else [0, int(u.shape[0])]
@@ -2810,7 +3402,7 @@ def _tags_read(expr) -> list:
 
 
 def _tag_facet_vertex_ids(dom: Any, tag: str, dim: int) -> np.ndarray:
-    """The tag's boundary facets as MESH-VERTEX INDICES ``(E, dim)``.
+    """The tag's boundary facets as MESH-VERTEX INDICES ``(E, k)``, ``k`` its vertex count.
 
     ``BoundaryRegion`` stores facets as vertex *coordinates*; under a connectivity-preserving move the
     incidence never changes, so resolving it to indices once lets the normals be recomputed from moved
@@ -2818,7 +3410,7 @@ def _tag_facet_vertex_ids(dom: Any, tag: str, dim: int) -> np.ndarray:
     from scipy.spatial import cKDTree
 
     region = (getattr(dom, "_boundary_regions", None) or {}).get(tag)
-    ents = None if region is None else (region.edges if dim == 2 else region.triangles)
+    ents = None if region is None else region.facets
     if ents is None or len(ents) == 0:
         return np.zeros((0, dim), dtype=np.int64)
     ents = np.asarray(ents)[:, :, :dim]
@@ -2844,6 +3436,10 @@ def _facet_outward_sign(dom: Any, facet_ids: np.ndarray, dim: int) -> np.ndarray
     facet_ids = np.asarray(facet_ids, dtype=np.int64)
     if facet_ids.size == 0:
         return np.zeros((0,), dtype=float)
+    # Simplex-only, like everything else on the relocation path; `_mesh_cells` has already refused a
+    # tensor-product mesh by name before any caller reaches here. Left as a literal rather than
+    # derived from the mesh so it cannot half-work: deriving it would make this function *look*
+    # cell-generic while the measures and gradients around it stayed barycentric.
     cell_type = "triangle" if dim == 2 else "tetrahedron"
     cells, _ = _mesh_cells(dom)
     conn = build_facet_connectivity(cells, cell_type)

@@ -54,7 +54,7 @@ from .fem_1d import (
     _region_node_ids,
     dirichlet_projection,
 )
-from .fem_facets import _LOCAL_FACES_TET, build_facet_connectivity, compute_face_normals
+from .fem_facets import _LOCAL_FACES_TET, _face_table, build_facet_connectivity, compute_face_normals
 from .fem_lagrange import (
     _lagrange_basix,
     identity_pushforward,
@@ -154,6 +154,67 @@ def _is_nonconforming_side(tag: str) -> bool:
     return bool(dot) and "|" in head and tail in head.split("|")
 
 
+#: meshio volume-block name per dimension, simplex first. A mesh has exactly one of these.
+_VOLUME_BLOCKS = {1: ("line",), 2: ("triangle", "quad"), 3: ("tetra", "hexahedron")}
+
+#: The cells whose reference map is NOT affine, so the Jacobian must be formed per quadrature point.
+TENSOR_PRODUCT_CELLS = ("quad", "hexahedron")
+
+
+def mesh_cell_type(domain, dim: int) -> str:
+    """The meshio name of ``domain``'s volume cell: ``"triangle"``/``"quad"``, ``"tetra"``/``"hexahedron"``.
+
+    The assembler used to derive this from the dimension alone, which is exactly the assumption a
+    tensor-product mesh breaks. Curved blocks report their first-order base name, as everywhere else.
+    """
+    cd = domain.mesh.cells_dict
+    for name in _VOLUME_BLOCKS.get(int(dim), ()):
+        if name in cd:
+            return name
+    curved = {1: "line3", 2: "triangle6"}.get(int(dim), "tetra10")
+    if curved in cd:
+        return _VOLUME_BLOCKS[int(dim)][0]
+    raise NotImplementedError(
+        f"no supported volume cell block for a {dim}-D mesh; expected one of {_VOLUME_BLOCKS.get(int(dim), ())}, "
+        f"found {sorted(cd)}."
+    )
+
+
+def _basix_ordered(cells: np.ndarray, cell_type: str) -> np.ndarray:
+    """``cells`` with each cell's vertices reordered from meshio/VTK order into basix's.
+
+    A no-op for simplices (the two libraries agree); a real permutation for a quad or hex, where
+    skipping it silently evaluates the basis on a bow-tie. Topology (facets, region masks, normals)
+    keeps the mesh's own order -- only the arrays that meet a tabulated BASIS are permuted.
+    """
+    from .fem_lagrange import vtk_to_basix_vertex_perm
+
+    perm = vtk_to_basix_vertex_perm(cell_type)
+    return cells if np.array_equal(perm, np.arange(len(perm))) else np.asarray(cells)[:, perm]
+
+
+def _refuse_nonconforming_promotion(domain, order: int) -> None:
+    """Refuse order > 1 on a ``Shape.regions(..., conforming=False)`` domain.
+
+    `_promote_to_degree` dedups synthesised nodes by physical COORDINATE, which is the right
+    conformity test for one body and the wrong one for two: a non-conforming interface is coincident
+    *on purpose*, so every higher-order node the promotion adds there is merged across the two bodies
+    and welds them. Measured on a two-body bar: 37 nodes referenced by BOTH bodies, all at the
+    interface. Harmless for a tie (it wanted continuity anyway) and wrong for contact, where those
+    DOFs can then never separate -- silent either way. See plans/p2-promotion-entity-keys.md for the
+    fix (key on the topological entity instead); refused until then. Shared by the simplex and
+    tensor-product promotion paths, since the dedup they run is the same one.
+    """
+    if any(_is_nonconforming_side(t) for t in (getattr(domain, "_interface_registry", {}) or {})):
+        raise NotImplementedError(
+            f"order-{order} elements on a Shape.regions(..., conforming=False) domain: the higher-order "
+            "node promotion deduplicates by coordinate, so it would silently WELD the two bodies at "
+            "every interface node it adds -- which a contact gap could then never open. Use order-1 "
+            "elements for a non-conforming interface, or Shape.curved() (which reads gmsh's nodes "
+            "instead of synthesising them, and is unaffected)."
+        )
+
+
 def _get_mesh(domain, dim: int, order: int):
     """P1 base mesh + optionally promoted P{order} mesh, both as NumPy arrays.
 
@@ -161,7 +222,26 @@ def _get_mesh(domain, dim: int, order: int):
 
     * ``pts_p1, cells_p1`` — the original P1 mesh (used for region masks and facets).
     * ``pts_f, cells_f`` — same as P1 when ``order=1``; promoted P2 when ``order=2``.
+
+    ``cells_p1`` stays in the mesh's own (meshio/VTK) vertex order because the topology machinery
+    is written against it; ``cells_f`` is what the tabulated basis sees and is therefore in basix
+    order. The two differ only for quadrilaterals and hexahedra.
     """
+    cell_type = mesh_cell_type(domain, dim)
+    if cell_type in TENSOR_PRODUCT_CELLS:
+        cells_p1 = np.asarray(domain.mesh.cells_dict[cell_type], dtype=np.int64)
+        pts_all = np.asarray(domain.mesh.points)[:, :dim]
+        cells_b = _basix_ordered(cells_p1, cell_type)  # the order a tabulated basis is written in
+        if order == 1:
+            return pts_all, cells_p1, pts_all, cells_b
+        _refuse_nonconforming_promotion(domain, order)
+        pts_f, cells_f = _promote_to_degree(pts_all, cells_b, lagrange_interp_points(dim, order, cell_type), cell_type)
+        # Both arrays share one id space, as on the curved path: `_promote_to_degree` keeps the
+        # original vertices at ids 0..nv-1, so the P1 connectivity still indexes `pts_f` correctly.
+        # That matters because the geometry gather reads the ASSEMBLY connectivity against `pts_p1`
+        # on a non-affine cell -- returning the vertex-only array here would index a Q{k}-wide
+        # connectivity into it.
+        return pts_f, cells_p1, pts_f, cells_f
     # meshio names the simplex cell block "triangle" (2D) / "tetra" (3D) -- distinct from the basix
     # CellType name "tetrahedron" the facet machinery uses.
     meshio_key = {1: "line", 2: "triangle"}.get(dim, "tetra")
@@ -199,14 +279,7 @@ def _get_mesh(domain, dim: int, order: int):
     # interface. Harmless for a tie (it wanted continuity anyway) but wrong for contact, where those
     # DOFs can then never separate -- and silent either way. See plans/p2-promotion-entity-keys.md for
     # the fix (key on the topological entity instead); refused until then.
-    if any(_is_nonconforming_side(t) for t in (getattr(domain, "_interface_registry", {}) or {})):
-        raise NotImplementedError(
-            f"P{order} elements on a Shape.regions(..., conforming=False) domain: the higher-order node "
-            "promotion deduplicates by coordinate, so it would silently WELD the two bodies at every "
-            "interface node it adds -- which a contact gap could then never open. Use order-1 elements "
-            "for a non-conforming interface, or Shape.curved() (which reads gmsh's nodes instead of "
-            "synthesising them, and is unaffected)."
-        )
+    _refuse_nonconforming_promotion(domain, order)
     if dim not in (1, 2, 3):
         raise NotImplementedError(f"Dimension {dim} not supported by native assembler.")
     # P{order} node mesh: place the element's reference interpolation points (basix DOF order) on each
@@ -215,11 +288,17 @@ def _get_mesh(domain, dim: int, order: int):
     return pts_p1, cells_p1, pts_f, cells_f
 
 
-def _lagrange_simplex(dim: int, degree: int, quad_degree: Any = None):
-    """The Lagrange ``ElementSpec`` for the ``dim``-simplex: interval / triangle / tetrahedron.
+def _lagrange_simplex(dim: int, degree: int, quad_degree: Any = None, cell_type: Any = None):
+    """The Lagrange ``ElementSpec`` for a cell: interval / triangle / tetrahedron / quad / hexahedron.
 
     One dispatcher, because the assembler and the VPINN context builder both need it and a second
-    per-site conditional is how a dimension gets silently left out."""
+    per-site conditional is how a dimension gets silently left out. ``cell_type`` names the cell
+    directly; without it the dimension picks the simplex, which is what every existing caller means.
+    """
+    if cell_type is not None:
+        from .fem_lagrange import lagrange_on
+
+        return lagrange_on(cell_type, degree, quad_degree)
     builder = {1: lagrange_interval, 2: lagrange_triangle}.get(int(dim), lagrange_tet)
     return builder(degree, quad_degree)
 
@@ -288,7 +367,44 @@ def _region_node_ids_from_pts(domain, region: str, pts_all: np.ndarray) -> List[
 # ---------------------------------------------------------------------------
 
 
-def _build_face_tables(elem_degree: int, quad_degree: int, dim: int = 2):
+#: A quadrilateral facet's nodes come out of the topology tables in PERIMETER-CYCLIC order
+#: (a, b, c, d around the face), while basix numbers a quadrilateral's vertices lexicographically
+#: ((0,0), (1,0), (0,1), (1,1)). This reindexes the former into the latter. Pairing cyclic corners
+#: with a basix quad basis without it yields a BOW-TIE whose Jacobian changes sign inside the face.
+_CYCLIC_TO_BASIX_QUAD = [0, 1, 3, 2]
+
+
+def _refuse_tensor_product(cell_type: Any, what: str, because: str) -> None:
+    """Refuse a still-simplex-only path on a quad/hex mesh by NAME, not by shape error.
+
+    These paths compute cell or facet geometry with simplex formulae (one Jacobian per cell from
+    ``verts[i+1] - verts[0]``, one normal and area element per facet). Handed a tensor-product cell
+    they do not produce a wrong answer -- they produce a bare broadcasting error between two basis
+    sizes, which says nothing about what is missing. Returns ``False`` when it does not refuse, so
+    it can be used inline in a conditional.
+    """
+    if cell_type in TENSOR_PRODUCT_CELLS:
+        raise NotImplementedError(
+            f"{what} on a {cell_type} mesh is not supported yet: {because} Volume terms and Dirichlet "
+            "conditions do work on quad/hex meshes -- use those, or a simplicial mesh for this problem."
+        )
+    return False
+
+
+def _refuse_tensor_product_surface(cell_type: Any) -> None:
+    """Surface integrals: supported on quadrilaterals, still refused on hexahedra.
+
+    The split is geometric, not incidental. Restricted to one edge a bilinear map is LINEAR, so a
+    quadrilateral's facet is a straight segment with a constant tangent and a single normal -- the
+    facet machinery needs only the right basis and a Jacobian formed from the geometry basis. A
+    hexahedron's facet is a bilinear SURFACE: its normal and area element vary across the facet and
+    need Nanson's formula per quadrature point, and the frozen one-normal-per-facet orientation the
+    assembler carries has no per-point analogue yet.
+    """
+    return False
+
+
+def _build_face_tables(elem_degree: int, quad_degree: int, dim: int = 2, cell_type: str = ""):
     """Pre-tabulate the parent-cell Lagrange basis at the quad points of each local facet.
 
     Dimension-generic: a 2D triangle's facets are its 3 edges (1-D Gauss quadrature); a 3D tet's
@@ -310,7 +426,42 @@ def _build_face_tables(elem_degree: int, quad_degree: int, dim: int = 2):
     import basix
     from basix import CellType
 
-    if dim == 2:
+    from .fem_facets import local_faces_in_basix_order
+
+    if cell_type in ("hexahedron", "hex"):
+        # A hexahedron's facet is a QUADRILATERAL, so the facet rule is a quad rule and the facet is
+        # parameterised bilinearly. On the REFERENCE hex every face is a unit square (verified for
+        # all six), so its two tangents are constant -- all the variation that makes a hex face a
+        # curved surface enters later, through the per-quadrature-point cell Jacobian.
+        #
+        # `local_faces_in_basix_order` lists a face's nodes in PERIMETER-CYCLIC order, while a basix
+        # quadrilateral numbers its vertices lexicographically. `_CYCLIC_TO_BASIX_QUAD` reconciles
+        # the two; pairing them without it makes the face a bow-tie whose normal flips inside it.
+        cell = CellType.hexahedron
+        ref_verts = np.asarray(basix.geometry(cell))
+        local_faces, _nfn = local_faces_in_basix_order(cell_type)
+        qp_quad, face_w = (np.asarray(x) for x in basix.make_quadrature(CellType.quadrilateral, quad_degree))
+        _fq = _lagrange_basix(CellType.quadrilateral, 1)
+        _tabq = np.asarray(_fq.tabulate(1, qp_quad))  # (1+2, n_q, 4, 1)
+
+        def _facet_qp_tangs(nodes):
+            V = ref_verts[list(np.asarray(nodes)[_CYCLIC_TO_BASIX_QUAD])]  # (4, 3) basix quad order
+            ref_qp = _tabq[0, :, :, 0] @ V  # (n_q, 3): x(s,t) = sum_a N_a(s,t) v_a
+            return ref_qp, np.stack([V[1] - V[0], V[2] - V[0]])  # constant on a reference face
+    elif cell_type in ("quad", "quadrilateral"):
+        # A quadrilateral's facet is a straight 2-node edge, exactly as a triangle's is: restricted
+        # to one edge the bilinear map is LINEAR in the edge parameter, so the edge stays straight
+        # and its tangent is constant. Only the reference cell, its vertices and the basis change.
+        cell = CellType.quadrilateral
+        ref_verts = np.asarray(basix.geometry(cell))
+        local_faces, _nfn = local_faces_in_basix_order(cell_type)
+        gp_1d, face_w = (np.asarray(x) for x in _line_quadrature(quad_degree))
+
+        def _facet_qp_tangs(nodes):
+            va, vb = ref_verts[nodes[0]], ref_verts[nodes[1]]
+            ref_qp = va[None, :] * (1.0 - gp_1d[:, None]) + vb[None, :] * gp_1d[:, None]
+            return ref_qp, np.stack([vb - va])
+    elif dim == 2:
         cell, ref_verts, local_faces = CellType.triangle, _REF_TRI_VERTS, _LOCAL_FACES_TRI
         gp_1d, face_w = (np.asarray(x) for x in _line_quadrature(quad_degree))
 
@@ -330,8 +481,11 @@ def _build_face_tables(elem_degree: int, quad_degree: int, dim: int = 2):
 
     elem = _lagrange_basix(cell, elem_degree)
     phi_list, dphi_list, qp_list, tang_list = [], [], [], []
+    # A facet's vertex count is a property of the CELL, not the dimension: `dim` is right for a
+    # simplex facet and for a quad edge, and takes three of a hexahedron's four face nodes.
+    _n_fv = _face_table(cell_type)[1] if cell_type else dim
     for entry in local_faces:
-        ref_qp, tangs = _facet_qp_tangs(entry[:dim])  # entry[:dim] = the facet's vertex local ids
+        ref_qp, tangs = _facet_qp_tangs(entry[:_n_fv])  # the facet's vertex local ids
         tab = elem.tabulate(1, ref_qp)  # (1 + dim, n_q, n_dof, 1)
         phi_list.append(tab[0, :, :, 0])  # (n_q, n_dof)
         dphi_list.append(np.stack([tab[1 + d, :, :, 0] for d in range(dim)], axis=-1))  # (n_q, n_dof, dim)
@@ -347,12 +501,48 @@ def _build_face_tables(elem_degree: int, quad_degree: int, dim: int = 2):
     )
 
 
+def _GSPEC(K):
+    """einsum spec pushing reference gradients forward by ``K = J⁻¹``, per cell or per quad point.
+
+    The surface twin of :func:`fem_lagrange.identity_pushforward`'s rank dispatch: a simplex facet
+    has one ``K`` for the whole cell, a tensor-product facet one per quadrature point.
+    """
+    return "qnd,qdD->qnD" if getattr(K, "ndim", 2) == 3 else "qnd,dD->qnD"
+
+
+def _facet_nanson_normal(J, tangs, sign):
+    """Unit outward normal at each facet quadrature point, by Nanson's formula.
+
+    The physical tangents ``T_i = J · t_i`` span the facet's tangent plane *at that point*, so their
+    cross product is the (unnormalised) normal there — which is exactly the quantity
+    :func:`_facet_area_element` already forms to take its magnitude. On a straight facet it is
+    constant and this reproduces the frozen per-facet normal; on a hexahedron's **bilinear** facet it
+    genuinely varies, which is the whole reason this exists.
+
+    ``sign`` is the frozen ±1 outward orientation of the facet. It stays a per-facet constant even
+    when the direction does not: the sign is a discrete choice tied to the facet's vertex ordering,
+    and a non-inverted facet's normal cannot swing into the opposite hemisphere within the facet.
+
+    Returns ``(n_q, dim)``. Nanson, *Messenger of Mathematics* 7 (1878) 182.
+    """
+    T = jnp.einsum("td,qDd->qtD", tangs, J) if J.ndim == 3 else (tangs @ J.T)[None, ...]
+    n = jnp.cross(T[:, 0], T[:, 1]) if T.shape[1] == 2 else jnp.stack([T[:, 0, 1], -T[:, 0, 0]], axis=-1)
+    return sign * n / (jnp.linalg.norm(n, axis=-1, keepdims=True) + 1e-300)
+
+
 def _facet_area_element(J, tangs):
     """Physical facet measure element from the reference tangents ``tangs`` (``dim-1, dim``) pushed
     forward by the cell Jacobian ``J`` (``dim, dim``): the edge length ``|J·t|`` in 2D, the face area
     ``|(J·t0) × (J·t1)|`` in 3D. Multiplying it by the reference-facet weights gives ``dS``."""
     if tangs.shape[0] == 0:  # 1-D: a "facet" is a point, whose measure is 1 (dS = 1, not a length)
         return jnp.asarray(1.0, dtype=J.dtype)
+    if J.ndim == 3:
+        # One Jacobian per facet quadrature point (a tensor-product cell): the measure follows it and
+        # becomes a (n_q,) array, which multiplies the reference weights exactly as the scalar does.
+        T = jnp.einsum("td,qDd->qtD", tangs, J)  # (n_q, dim-1, dim) physical tangents
+        return (
+            jnp.linalg.norm(T[:, 0], axis=-1) if T.shape[1] == 1 else jnp.linalg.norm(jnp.cross(T[:, 0], T[:, 1]), axis=-1)
+        )
     T = tangs @ J.T  # (dim-1, dim) physical tangents
     return jnp.linalg.norm(T[0]) if T.shape[0] == 1 else jnp.linalg.norm(jnp.cross(T[0], T[1]))
 
@@ -397,6 +587,12 @@ def build_native_fem_context(domain, *, element_type, quad_degree, vec=1, neuman
     order = 2 if element_type in ("TRI6", "TET10") else (int(element_type.split("-P")[1]) if "-P" in element_type else 1)
     quad_degree = max(quad_degree, 2 * order)
 
+    _refuse_tensor_product(
+        mesh_cell_type(domain, dim),
+        "the VPINN / grouped-weak-form context",
+        "this second assembler forms ONE Jacobian per cell from `verts[i+1] - verts[0]`, a simplex "
+        "formula, where a bilinear cell needs one per quadrature point.",
+    )
     pts_p1, cells_p1, pts_f, cells_f = _get_mesh(domain, dim, order)
     spec = _lagrange_simplex(dim, order, quad_degree)
     ref_vals = jnp.asarray(spec.ref_values)  # (n_q, n_dof, 1)
@@ -586,7 +782,11 @@ def assemble_fem_native(
     dim = int(domain.dimension)
     if dim not in (2, 3):
         raise NotImplementedError(f"assemble_fem_native: only dim=2 and dim=3 are supported; got dim={dim}.")
-    cell_key = "triangle" if dim == 2 else "tetrahedron"
+    # The facet machinery's name for this cell. Derived from the MESH, not the dimension: a 2-D mesh
+    # is triangles or quads, a 3-D one tets or hexes, and naming the simplex regardless was what fed
+    # a triangle's 3-entry facet table to a quadrilateral's 4 local faces.
+    _cell_type = mesh_cell_type(domain, dim)
+    cell_key = {"triangle": "triangle", "tetra": "tetrahedron"}.get(_cell_type, _cell_type)
 
     ctx = dict(getattr(domain, "context", {}) or {})
     ctx.pop("cell_size", None)  # `dom.cell_size` placeholder; the real per-cell h is packed per volume element below
@@ -635,7 +835,18 @@ def assemble_fem_native(
     # CURVED (isoparametric) geometry: the reference->physical map is the order-2 nodal map, so its
     # Jacobian VARIES over the cell and must be formed per quadrature point. `_get_mesh` already
     # refused an order mismatch, so every field here is order 2 and any of them serves as the geometry.
+    # A TENSOR-PRODUCT cell is in the same position for a different reason: a bilinear quad or
+    # trilinear hex has a Jacobian that varies over the cell even when the cell is "straight-sided",
+    # so it takes the same per-quadrature-point branch that curving introduced. (For a rectangle or
+    # a box the map happens to be affine, but detecting that is an optimisation, not a correctness
+    # condition, and it would have to hold for every cell in the mesh.)
+    _tensor_product = _cell_type in TENSOR_PRODUCT_CELLS
+    # Whether a FACET of this cell is curved. A quadrilateral's edge is straight (a bilinear map
+    # restricted to an edge is linear), so only a hexahedron's bilinear face needs a normal that
+    # varies across it.
+    _curved_facet = _cell_type in ("hexahedron", "hex")
     _curved = {1: "line3", 2: "triangle6"}.get(dim, "tetra10") in domain.mesh.cells_dict
+    _nonaffine = _curved or _tensor_product
     _geom_field = 0
     n_nodes_f = [d[2].shape[0] for d in mesh_data]  # number of DOF nodes per field
     vecs = [int(f["vec"]) for f in fields]
@@ -677,8 +888,8 @@ def assemble_fem_native(
     # extra degrees by default, with `jno.fem(quad_degree=...)` still overriding. Measured on the disk
     # rate study this changes the answer by <0.01% (7.6721e-06 -> 7.6719e-06 at degree 8), so it is
     # insurance against a form whose coefficients vary more sharply, not a fix for anything observed.
-    _qd = (quad_degree + 2) if _curved else quad_degree
-    specs = [_lagrange_simplex(dim, f["order"], _qd) for f in fields]
+    _qd = (quad_degree + 2) if _nonaffine else quad_degree
+    specs = [_lagrange_simplex(dim, f["order"], _qd, cell_type=_cell_type) for f in fields]
     # All specs share the same simplex quadrature rule (basix is deterministic)
     qp_shared = jnp.asarray(specs[0].quad_points)  # (n_quad, dim)
     qw_shared = jnp.asarray(specs[0].quad_weights)  # (n_quad,)
@@ -1015,7 +1226,9 @@ def assemble_fem_native(
     # the simplex facets for surface (Neumann/Robin) integration -- a triangle's 3 edges in 2D, a tet's
     # 4 triangular faces in 3D -- so they are skipped when there are no boundary terms.
     face_tables_per_field = (
-        [_build_face_tables(f["order"], quad_degree, dim) for f in fields] if boundary_terms else [None] * len(fields)
+        [_build_face_tables(f["order"], quad_degree, dim, _cell_type) for f in fields]
+        if (boundary_terms and not _refuse_tensor_product_surface(_cell_type))
+        else [None] * len(fields)
     )
     # face_tables_per_field[i] = (face_phi, face_dphi_ref, face_ref_qp, face_ref_tangs, face_w);
     # shapes: (n_faces, n_q, n_dof_i), (..., dim), (n_faces, n_q, dim), (n_faces, dim-1, dim), (n_q,)
@@ -1064,16 +1277,18 @@ def assemble_fem_native(
     # ([0,+1]) -- so a traction meant for one body was applied to both, and the gap projected the
     # interface onto itself (`g0 == 0` identically). See `plans/contact-main-reaction.md`.
     #
-    # The mesh already knows the answer: `_tag_edges` / `_tag_triangles` carry each tag's facets by node
-    # id, per side (measured: 0 shared nodes between the two sides). Matching on facet identity is exact,
-    # so prefer it and keep the coordinate mask only for tags the mesh does not name that way.
+    # The mesh already knows the answer: `domain.tag_facets` carries each tag's facets by node id, per
+    # side (measured: 0 shared nodes between the two sides), whatever their vertex count -- picking the
+    # store by dimension instead returned nothing at all for a hexahedral mesh, whose boundary facets are
+    # quadrilaterals, and the term silently fell back to the all-nodes-in-region mask below. Matching on
+    # facet identity is exact, so prefer it and keep the mask only for tags the mesh does not name.
     _facet_lookup: Dict[frozenset, int] = {
         frozenset(int(conn.face_nodes[fi, j]) for j in range(conn.face_nodes.shape[1])): fi for fi in range(conn.n_bfaces)
     }
 
     def _region_faces(region: str) -> np.ndarray:
         """Boundary-face ids owned by ``region`` (``(n,) int32``, possibly empty)."""
-        _named = (getattr(domain, "_tag_edges" if dim == 2 else "_tag_triangles", {}) or {}).get(region)
+        _named = domain.tag_facets(region) if hasattr(domain, "tag_facets") else None
         if _named is not None and region != "boundary":
             # `"boundary"` keeps the mask: it is the catch-all, with its own interface-dropping semantics.
             _hit = [_facet_lookup[k] for f in np.asarray(_named) if (k := frozenset(int(x) for x in f)) in _facet_lookup]
@@ -1252,10 +1467,12 @@ def assemble_fem_native(
         an element-sized (not global) input — keeping the AD intermediate O(n_local), not
         O(n_dofs). ``pts`` is the (possibly coordinate-parameter-scattered) P1 geometry points;
         it defaults to the static mesh and is overridden per-eval when coordinates are trainable."""
-        if _curved:
-            # x(ξ) = Σ_a x_a N_a(ξ) over the order-2 geometry nodes, so J_dn(ξ) = Σ_a x_a[d] ∂N_a/∂ξ_n
-            # is a function of ξ. Everything downstream that was one number per cell -- detJ, the
-            # measure, the push-forward's J⁻¹ -- becomes one per quadrature point.
+        if _nonaffine:
+            # x(ξ) = Σ_a x_a N_a(ξ) over the geometry nodes, so J_dn(ξ) = Σ_a x_a[d] ∂N_a/∂ξ_n is a
+            # function of ξ. Everything downstream that was one number per cell -- detJ, the
+            # measure, the push-forward's J⁻¹ -- becomes one per quadrature point. This branch is
+            # the general isoparametric map: it serves an order-2 curved simplex and a
+            # bilinear/trilinear tensor-product cell without knowing which it has.
             gverts = pts[cells_f_j[_geom_field][c]]  # (n_geom, dim)
             J = jnp.einsum("ad,qan->qdn", gverts, ref_grads_all[_geom_field][..., 0, :])  # (n_q, dim, dim)
             detJ = jnp.linalg.det(J)  # (n_q,)
@@ -1632,13 +1849,35 @@ def assemble_fem_native(
             # Explicit shape check: `jnp.einsum("d,qd->q", n, jump)` silently BROADCASTS a size-1
             # component axis, so a scalar field would contract to `sum(n) * jump` -- right only when the
             # normal happens to sum to 1, wrong on any tilted interface, and never an error.
-            if _jump.shape[1] != n_vec.shape[0]:
+            if _jump.shape[1] != n_vec.shape[-1]:
                 raise ValueError(
                     f"u.gap: the field has {_jump.shape[1]} component(s) but the interface normal has "
-                    f"{n_vec.shape[0]}. A normal gap needs a vector field with one component per "
+                    f"{n_vec.shape[-1]}. A normal gap needs a vector field with one component per "
                     "dimension -- use fem_symbols(value_shape=(dim,))."
                 )
-            loc["domain_context"][_k] = _g0_f - (_jump * n_vec[None, :]).sum(axis=1)
+            # `n_vec` is (dim,) on a straight facet and (n_q, dim) on a curved one; `atleast_2d`
+            # makes both broadcast against `_jump` (n_q, vec) without a shape branch.
+            loc["domain_context"][_k] = _g0_f - (_jump * jnp.atleast_2d(n_vec)).sum(axis=1)
+
+    def _facet_geometry(c, k, pts_src):
+        """``(J, K, xq)`` for facet ``k`` of cell ``c`` -- one per quadrature point when the cell's
+        map is not affine.
+
+        A simplex cell has a single Jacobian, formed from its edge vectors. A tensor-product cell
+        does not: its map is bi/trilinear, so J is evaluated the same way the volume path evaluates
+        it, by contracting the GEOMETRY basis gradients (tabulated here at the facet's quadrature
+        points) against the cell's vertices. The geometry connectivity is the assembly one, which is
+        in basix vertex order -- the same array the basis was tabulated against.
+        """
+        if _tensor_product:
+            gverts = pts_src[cells_f_j[_geom_field][c]]  # (n_geom, dim), basix order
+            _, fd_g, _, _, _ = face_tables_per_field[_geom_field]
+            Jq = jnp.einsum("ad,qan->qdn", gverts, fd_g[k])  # (n_q, dim, dim)
+            xq = face_tables_per_field[_geom_field][0][k] @ gverts  # (n_q, dim): x = sum_a N_a x_a
+            return Jq, jnp.linalg.inv(Jq), xq
+        verts = pts_src[cells_j[c]]
+        Jc = jnp.stack([verts[i + 1] - verts[0] for i in range(dim)], axis=1)  # (dim, dim)
+        return Jc, jnp.linalg.inv(Jc), None  # xq is formed by the caller from its own facet points
 
     def _surf_elem_res(
         fi, local_all, bcoeff, btfi, region, t=0.0, args=None, pts=None, normals=None, gaps=None, test_vals=None
@@ -1654,9 +1893,16 @@ def assemble_fem_native(
         k = lface_j[fi]
         n_vec = (normals_j if normals is None else normals)[fi]  # (dim,) outward unit normal
         cell_sols = _split_cell_local(local_all)
-        verts = (pts_j if pts is None else pts)[cells_j[c]]
-        J = jnp.stack([verts[i + 1] - verts[0] for i in range(dim)], axis=1)  # (dim, dim)
-        K = jnp.linalg.inv(J)
+        _pts_src = pts_j if pts is None else pts
+        verts = _pts_src[cells_j[c]]
+        J, K, _xq_tp = _facet_geometry(c, k, _pts_src)
+        if _curved_facet:
+            # A hexahedron's facet is a bilinear SURFACE: its normal turns across the facet, so one
+            # frozen vector per facet is not enough. Nanson's formula gives it at each quadrature
+            # point from the same physical tangents the area element already forms. Straight facets
+            # (simplices, and a quad's edges) keep the per-facet vector -- it is exact there, and
+            # leaving its shape alone keeps every existing consumer untouched.
+            n_vec = _facet_nanson_normal(J, face_tables_per_field[btfi][3][k], _facet_sign_j[fi])
 
         # All-field surface data (needed for coupled Robin terms).
         per_f = []
@@ -1665,7 +1911,7 @@ def assemble_fem_native(
             per_f.append(
                 {
                     "shape_vals": fp_i[k],
-                    "shape_grads": jnp.einsum("qnd,dD->qnD", fd_i[k], K),
+                    "shape_grads": jnp.einsum(_GSPEC(K), fd_i[k], K),
                     "cell_sol": cell_sols[i],
                     "space": "Lagrange",
                 }
@@ -1673,7 +1919,7 @@ def assemble_fem_native(
 
         _, _, fp_qp, fp_tangs, face_w = face_tables_per_field[btfi]
         jac_f = _facet_area_element(J, fp_tangs[k])  # physical edge length (2D) / face area (3D)
-        xq_f = verts[0] + fp_qp[k] @ J.T  # (n_q, dim)
+        xq_f = _xq_tp if _xq_tp is not None else verts[0] + fp_qp[k] @ J.T  # (n_q, dim)
         loc = {
             "physical_quad_points": xq_f,
             "fields": per_f,
@@ -1724,21 +1970,20 @@ def assemble_fem_native(
         n_vec = normals_j[fi]
         cell_sols = _split_cell_local(local_all)
         verts = pts_j[cells_j[c]]
-        J = jnp.stack([verts[i + 1] - verts[0] for i in range(dim)], axis=1)
-        Kmat = jnp.linalg.inv(J)
+        J, Kmat, _xq_tp = _facet_geometry(c, k, pts_j)
         per_f = []
         for i in range(len(fields)):
             fp_i, fd_i, _, _, _ = face_tables_per_field[i]
             per_f.append(
                 {
                     "shape_vals": fp_i[k],
-                    "shape_grads": jnp.einsum("qnd,dD->qnD", fd_i[k], Kmat),
+                    "shape_grads": jnp.einsum(_GSPEC(Kmat), fd_i[k], Kmat),
                     "cell_sol": cell_sols[i],
                     "space": "Lagrange",
                 }
             )
         _, _, fp_qp, _fp_tangs, _fw = face_tables_per_field[0]
-        xq_f = verts[0] + fp_qp[k] @ J.T
+        xq_f = _xq_tp if _xq_tp is not None else verts[0] + fp_qp[k] @ J.T
         loc = {
             "physical_quad_points": xq_f,
             "fields": per_f,
@@ -2303,7 +2548,13 @@ def assemble_fem_native(
         iface_keys = set().union(*(key(c) for c in clouds))
         node_keys = np.round(np.asarray(pts_all)[:, :dim] / max(tol, 1e-300)).astype(np.int64)
         on_iface = np.array([tuple(r) in iface_keys for r in node_keys], dtype=bool)
-        verts = np.asarray(bf)[:, :dim]
+        # How many leading columns are the facet's VERTICES depends on the cell, not the dimension:
+        # a simplex facet has `dim` of them, a quad edge 2 (= dim in 2-D, which is why this read
+        # correctly until now), and a hexahedron's facet FOUR against a dim of 3. Taking `[:, :dim]`
+        # there silently drops a corner, so a facet lying wholly on an interface could still test as
+        # partly outside it and stay pinned.
+        _n_fv = _face_table(cell_key)[1]
+        verts = np.asarray(bf)[:, :_n_fv]
         outer = np.asarray(bf)[~on_iface[verts].all(axis=1)]
         if outer.size == 0:  # every boundary facet is an interface -> nothing to pin; leave as-is
             return bnodes
@@ -2331,9 +2582,21 @@ def assemble_fem_native(
         ptags = getattr(domain, "_polygon_tags", {})
         if region in (getattr(domain, "_source_regions", {}) or {}) and ptags.get(region, (None,))[0] == "interior":
             return list(_region_node_ids_from_pts(domain, region, pts_all))
-        bf = _boundary_facets(pts_all, np.asarray(cells_f_all[fidx]), dim, fields[fidx]["order"])
+        bf = _boundary_facets(pts_all, np.asarray(cells_f_all[fidx]), dim, fields[fidx]["order"], _cell_type)
         if bf is None:
             return list(_region_node_ids_from_pts(domain, region, pts_all))
+        # A locally refined (hanging-node) mesh is NON-CONFORMING, and "belongs to exactly one cell" is
+        # false on it: across a 2:1 interface the coarse edge and both half-edges each belong to one
+        # cell. Left in, they make the interface a boundary -- and since the aggregate "boundary" is
+        # what a Dirichlet condition resolves through, the interface gets PINNED. Measured on a 4x4 grid
+        # with four cells refined: 32 identity rows where 16 are the perimeter, and -Lap u = 1 came back
+        # with a centre value of 0.0194 against 0.0737, with no error anywhere.
+        _hang = getattr(domain, "_fem_hanging_nodes", None)
+        if _hang:
+            from .fem_refine import drop_covered_facets
+
+            # n_v from the DIMENSION, not from the column count: an order-3 edge also has 4 columns
+            bf = drop_covered_facets(np.asarray(bf), _hang, n_v=2 if dim == 2 else 4)
         bnodes = np.unique(np.asarray(bf).reshape(-1))
         if region == "boundary":
             bnodes = _drop_interface_only_nodes(np.asarray(bf), bnodes, pts_all)

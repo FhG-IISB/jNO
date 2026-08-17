@@ -74,11 +74,11 @@ Laplace–Beltrami operator on tetrahedra; see [3-D tetrahedral meshes](#3-d-tet
 ## Structured grid (fast stencils)
 
 For an axis-aligned **rectangle** or **box**, build a **regular grid** instead of an unstructured mesh by
-passing `structured=True`:
+asking the shape for a regular lattice with `.structured()`:
 
 ```python
-d = jno.domain(jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.02), structured=True)           # 2-D
-d = jno.domain(jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=0.05), structured=True)   # 3-D
+d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.02).structured().domain()           # 2-D
+d = jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=0.05).structured().domain()   # 3-D
 ```
 
 This meshes the rectangle as a uniform right-triangulation — or, in 3-D, the box as a Kuhn
@@ -93,7 +93,7 @@ answer* as the unstructured `cotangent` operator, only cheaper.
 
 The full `jno.fdm([-ui.d2(x) - ui.d2(y) - f, u(bnd) - g]).solve()` works unchanged and stays
 differentiable — no authoring change from the unstructured case. **Transient** composes too:
-`structured=True` together with `time=(t0, t1, n)` and a `ui.t` term marches by method of lines as usual
+`.structured()` together with `time=(t0, t1, n)` and a `ui.t` term marches by method of lines as usual
 (its backward-Euler operator is diagonally dominant, so it stays on the default inner solve). **Periodic**
 boundaries and **complex** fields are *not* supported — they are absent from `jno.fdm` in general (see
 [Scope](#scope-and-limitations)), not just on a structured grid; a regular grid is the natural home for
@@ -323,7 +323,7 @@ domain-decomposition solve (`jno.dd.couple([(problem, region)])`) resolves to a 
 the analytic, shapely-free [`Shape.contains`](Domain-and-Geometry.md) — in 2-D **and** 3-D.
 
 An axis-aligned 2-D rectangle or 3-D box can use a fast [structured grid](#structured-grid-fast-stencils)
-(`structured=True`) with direct finite-difference stencils in place of the unstructured mesh.
+(`.structured()`) with direct finite-difference stencils in place of the unstructured mesh.
 
 A periodic tie `u(left) - u(right)` (opposite faces) wraps that axis on a
 [structured grid](#structured-grid-fast-stencils).

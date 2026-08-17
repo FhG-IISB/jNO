@@ -46,6 +46,30 @@ _LOCAL_FACES_TET: Tuple[Tuple[int, int, int, int], ...] = (
     (0, 1, 2, 3),  # face 3: opposite vertex 3
 )
 
+# ---------------------------------------------------------------------------------------------
+# Tensor-product cells. These carry NO trailing apex entry: a simplex facet has exactly one
+# opposite vertex, and that is what orients it outward, but a quad edge or a hex face has none.
+# Facets of these cells are oriented away from the owning cell's CENTROID instead -- exact for a
+# convex cell, which every cell of a structured or recombined mesh is.
+#
+# Vertex numbering is meshio/VTK, which is what a mesh's `cells` array holds: quad is
+# 0(0,0) 1(1,0) 2(1,1) 3(0,1); hex is that bottom face followed by the matching top face. basix
+# numbers its reference cells lexicographically instead, so anything that tabulates a BASIS must
+# permute first -- these tables are topology, not basis.
+
+# (edge_node_a, edge_node_b) for each of the 4 quadrilateral edges, counterclockwise.
+_LOCAL_FACES_QUAD: Tuple[Tuple[int, int], ...] = ((0, 1), (1, 2), (2, 3), (3, 0))
+
+# The 4 nodes of each of the 6 hexahedron faces, each traversed consistently around its own plane.
+_LOCAL_FACES_HEX: Tuple[Tuple[int, int, int, int], ...] = (
+    (0, 3, 2, 1),  # z = 0
+    (4, 5, 6, 7),  # z = 1
+    (0, 1, 5, 4),  # y = 0
+    (1, 2, 6, 5),  # x = 1
+    (2, 3, 7, 6),  # y = 1
+    (3, 0, 4, 7),  # x = 0
+)
+
 
 class FacetConnectivity(NamedTuple):
     """Boundary facet connectivity for a P1 simplex mesh.
@@ -149,16 +173,57 @@ def boundary_face_set(cells: np.ndarray, cell_type: str = "triangle") -> np.ndar
 
 
 def _face_table(cell_type: str):
-    """``(local_faces, n_face_nodes)`` for a simplex cell type, under either naming."""
+    """``(local_faces, n_face_nodes)`` for a cell type, under either naming.
+
+    Simplex tables carry the facet's opposite vertex as a trailing entry; tensor-product tables do
+    not (there is no single opposite vertex) -- ask :func:`has_facet_apex` before reading one.
+    """
     if cell_type in ("interval", "line"):
         return _LOCAL_FACES_INT, 1
     if cell_type in ("triangle", "tri"):
         return _LOCAL_FACES_TRI, 2
     if cell_type in ("tetrahedron", "tetra", "tet"):
         return _LOCAL_FACES_TET, 3
+    if cell_type in ("quad", "quadrilateral"):
+        return _LOCAL_FACES_QUAD, 2
+    if cell_type in ("hexahedron", "hex"):
+        return _LOCAL_FACES_HEX, 4
     raise NotImplementedError(
-        f"build_facet_connectivity: cell_type {cell_type!r} not supported (interval / triangle / tetrahedron only)."
+        f"build_facet_connectivity: cell_type {cell_type!r} not supported "
+        "(interval / triangle / tetrahedron / quadrilateral / hexahedron only)."
     )
+
+
+def local_faces_in_basix_order(cell_type: str):
+    """``(local_faces, n_face_nodes)`` for the SAME facets as :func:`_face_table`, but with node ids
+    renumbered into basix's vertex order (and the trailing apex entry dropped).
+
+    Two numberings meet here. Mesh topology -- which facets exist, which cell owns each -- is done in
+    the mesh's own meshio/VTK order, because that is what a ``cells`` array holds. Anything that
+    tabulates a BASIS works in basix's reference cell instead. Facet ``k`` has to mean the same facet
+    on both sides, because ``build_facet_connectivity`` hands out a ``local_face`` index that is then
+    used to pick a row of the tabulated facet tables; deriving one table from the other by permuting
+    node ids keeps that correspondence by construction, where writing a second table by hand would
+    only keep it by luck.
+    """
+    import numpy as _np
+
+    from .fem_lagrange import vtk_to_basix_vertex_perm
+
+    local_faces, n_face_nodes = _face_table(cell_type)
+    inv = _np.argsort(vtk_to_basix_vertex_perm(cell_type))  # VTK index -> basix index
+    return tuple(tuple(int(inv[v]) for v in face[:n_face_nodes]) for face in local_faces), n_face_nodes
+
+
+def has_facet_apex(cell_type: str) -> bool:
+    """Whether ``cell_type``'s facet table carries an opposite vertex to orient the facet outward.
+
+    True for simplices, False for tensor-product cells. A caller that needs an outward direction
+    uses the apex when this is True and the owning cell's centroid when it is False; the centroid
+    is exact for any convex cell and agrees with the apex on simplices, so it is a fallback in
+    coverage only, not in accuracy.
+    """
+    return cell_type not in ("quad", "quadrilateral", "hexahedron", "hex")
 
 
 def build_facet_connectivity(cells: np.ndarray, cell_type: str = "triangle") -> FacetConnectivity:
@@ -215,27 +280,25 @@ def compute_face_normals(
     """
     points = np.asarray(points, dtype=float)
     cells = np.asarray(cells)
-    if cell_type in ("interval", "line"):
-        local_faces = _LOCAL_FACES_INT
-        n_face_nodes, dim = 1, 1
-    elif cell_type == "triangle":
-        local_faces = _LOCAL_FACES_TRI
-        n_face_nodes, dim = 2, 2
-    elif cell_type == "tetrahedron":
-        local_faces = _LOCAL_FACES_TET
-        n_face_nodes, dim = 3, 3
-    else:
-        raise NotImplementedError(f"compute_face_normals: cell_type {cell_type!r} not supported.")
+    local_faces, n_face_nodes = _face_table(cell_type)
+    dim = {"interval": 1, "line": 1, "triangle": 2, "quad": 2, "quadrilateral": 2}.get(cell_type, 3)
 
     if conn.n_bfaces == 0:
         return np.zeros((0, dim), dtype=float)
 
-    # (n_bfaces, n_face_nodes + 1): the parent cell's local node ids for this face, apex last
     entry = np.asarray(local_faces, dtype=np.int64)[np.asarray(conn.local_face)]
     parent = cells[np.asarray(conn.parent_cell)]  # (n_bfaces, n_verts_per_cell)
     face_ids = np.take_along_axis(parent, entry[:, :n_face_nodes], axis=1)
     verts = points[face_ids, :dim]  # (n_bfaces, n_face_nodes, dim)
-    opp = points[np.take_along_axis(parent, entry[:, n_face_nodes : n_face_nodes + 1], axis=1)[:, 0], :dim]
+
+    # The reference point the facet is oriented AWAY from. A simplex facet has an opposite vertex,
+    # which is exact for any geometry including a concave boundary; a tensor-product facet has none,
+    # so the owning cell's centroid stands in -- exact for a convex cell, and identical to the apex
+    # wherever both exist.
+    if has_facet_apex(cell_type):
+        opp = points[np.take_along_axis(parent, entry[:, n_face_nodes : n_face_nodes + 1], axis=1)[:, 0], :dim]
+    else:
+        opp = points[parent, :dim].mean(axis=1)
 
     if dim == 1:  # 1-D: a facet is a point, so there is no tangent to rotate — the unit candidate is
         # +1 and the shared away-from-the-apex flip below picks the outward sign
@@ -243,7 +306,9 @@ def compute_face_normals(
     elif dim == 2:  # 2-D: edge → rotate tangent 90° clockwise
         t = verts[:, 1] - verts[:, 0]
         n = np.stack([t[:, 1], -t[:, 0]], axis=1)
-    else:  # 3-D: face → cross product of two edges
+    elif n_face_nodes == 4:  # 3-D quadrilateral face: the cross product of its DIAGONALS
+        n = np.cross(verts[:, 2] - verts[:, 0], verts[:, 3] - verts[:, 1])
+    else:  # 3-D triangle: cross product of two edges
         n = np.cross(verts[:, 1] - verts[:, 0], verts[:, 2] - verts[:, 0])
 
     mid = verts.mean(axis=1)

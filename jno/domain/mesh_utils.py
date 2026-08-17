@@ -101,6 +101,32 @@ def refuse_curved(mesh, what: str):
         )
 
 
+#: meshio cell type -> the plural key its connectivity is stored under in a `mesh_connectivity`.
+_MC_CELL_KEY = {
+    "line": "lines",
+    "triangle": "triangles",
+    "tetra": "tetrahedra",
+    "quad": "quads",
+    "hexahedron": "hexahedra",
+}
+
+
+def mc_cells(mesh_connectivity):
+    """``(cells, cell_type)`` from a ``mesh_connectivity``, whatever cell it was built on.
+
+    The stored key depends on the cell (``"triangles"`` vs ``"quads"``), so reading it by
+    guessing from ``dimension`` is exactly the assumption quad/hex meshes break. Older
+    connectivities predate the ``cell_type`` entry and are inferred from the keys present.
+    """
+    ct = mesh_connectivity.get("cell_type")
+    if ct is None:  # pre-cell_type connectivity: infer from whichever block is present
+        for name, key in _MC_CELL_KEY.items():
+            if key in mesh_connectivity:
+                ct = name
+                break
+    return np.asarray(mesh_connectivity[_MC_CELL_KEY[ct]]), ct
+
+
 def p1_cells_dict(mesh):
     """``mesh.cells_dict`` with the P1 blocks filled in from any curved ones.
 
@@ -139,22 +165,37 @@ class MeshUtils:
 
             elements = cells_dict["line"]
             element_type = "lines"
+            cell_type = "line"
 
         elif dimension == 2:
-            if "triangle" not in cells_dict:
-                raise ValueError("2D finite difference support requires triangular meshes")
-
-            elements = cells_dict["triangle"]
-            element_type = "triangles"
-
-            area, grad_phi = MeshUtils.precompute_p1_triangle_geometry(points, elements)
+            if "triangle" in cells_dict:
+                elements = cells_dict["triangle"]
+                element_type = "triangles"
+                cell_type = "triangle"
+                area, grad_phi = MeshUtils.precompute_p1_triangle_geometry(points, elements)
+            elif "quad" in cells_dict:
+                # A quadrilateral mesh carries nodal measures and boundary topology exactly as a
+                # triangular one does. What it cannot carry is `p1_grad_phi`: that is the
+                # CONSTANT-per-cell P1 gradient the finite-difference stencils are built on, and a
+                # bilinear quad's gradient is not constant. Consumers that need it raise by name
+                # rather than reading a key that quietly is not there.
+                elements = cells_dict["quad"]
+                element_type = "quads"
+                cell_type = "quad"
+            else:
+                raise ValueError("2D mesh connectivity requires triangular or quadrilateral meshes")
 
         elif dimension == 3:
-            if "tetra" not in cells_dict:
-                raise ValueError("3D finite difference support requires tetrahedral meshes")
-
-            elements = cells_dict["tetra"]
-            element_type = "tetrahedra"
+            if "tetra" in cells_dict:
+                elements = cells_dict["tetra"]
+                element_type = "tetrahedra"
+                cell_type = "tetra"
+            elif "hexahedron" in cells_dict:
+                elements = cells_dict["hexahedron"]
+                element_type = "hexahedra"
+                cell_type = "hexahedron"
+            else:
+                raise ValueError("3D mesh connectivity requires tetrahedral or hexahedral meshes")
 
         else:
             raise ValueError(f"Finite difference not supported for dimension {dimension}")
@@ -166,10 +207,13 @@ class MeshUtils:
                 element_type: elements,
                 "n_points": n_points,
                 "dimension": dimension,
+                # The cell topology behind `element_type`. Read it rather than inferring the key
+                # from `dimension`: 2-D is now "triangles" OR "quads", 3-D "tetrahedra" OR "hexahedra".
+                "cell_type": cell_type,
             }
         )
 
-        if dimension == 2:
+        if cell_type == "triangle":
             mesh_connectivity["p1_area"] = np.array(area)
             mesh_connectivity["p1_grad_phi"] = np.array(grad_phi)
 
@@ -252,23 +296,31 @@ class MeshUtils:
             per_node = np.repeat(measure / nodes.shape[1], nodes.shape[1])
             return np.bincount(nodes.ravel(), weights=per_node, minlength=n_points)
 
+        cells, cell_type = mc_cells(mesh_connectivity)
+
         if dimension == 1:
             # Boundary = endpoints, ds = half of adjacent line element
-            segments = np.asarray(mesh_connectivity["lines"])
-            lengths = np.linalg.norm(points[segments[:, 1]] - points[segments[:, 0]], axis=-1)
-            ds = scatter(segments, lengths)
+            lengths = np.linalg.norm(points[cells[:, 1]] - points[cells[:, 0]], axis=-1)
+            ds = scatter(cells, lengths)
 
         elif dimension == 2:
-            # Boundary = edges that appear once in the triangulation
-            edges = MeshUtils._get_boundary_elements(np.asarray(mesh_connectivity["triangles"]), "triangle")
+            # Boundary = edges that appear once in the mesh. A quad's facet is a straight 2-node
+            # edge exactly as a triangle's is, so the measure below is unchanged.
+            edges = MeshUtils._get_boundary_elements(cells, cell_type)
             lengths = np.linalg.norm(points[edges[:, 1]] - points[edges[:, 0]], axis=-1)
             ds = scatter(edges, lengths)
 
         elif dimension == 3:
-            # Boundary = faces that appear once in the tetrahedralization
-            faces = MeshUtils._get_boundary_elements(np.asarray(mesh_connectivity["tetrahedra"]), "tetra")
-            p0, p1, p2 = points[faces[:, 0]], points[faces[:, 1]], points[faces[:, 2]]
-            areas = 0.5 * np.linalg.norm(np.cross(p1 - p0, p2 - p0), axis=-1)
+            # Boundary = faces that appear once. Tets give triangles, hexes give quadrilaterals —
+            # and a quad face's area needs its cyclic order, so it comes from the unsorted path.
+            if cell_type == "hexahedron":
+                faces, _ = MeshUtils._boundary_facets_unsorted(cells, cell_type)
+                q0, q1, q2, q3 = (points[faces[:, i]] for i in range(4))
+                areas = 0.5 * np.linalg.norm(np.cross(q2 - q0, q3 - q1), axis=-1)
+            else:
+                faces = MeshUtils._get_boundary_elements(cells, cell_type)
+                p0, p1, p2 = points[faces[:, 0]], points[faces[:, 1]], points[faces[:, 2]]
+                areas = 0.5 * np.linalg.norm(np.cross(p1 - p0, p2 - p0), axis=-1)
             ds = scatter(faces, areas)
 
         else:
@@ -293,27 +345,35 @@ class MeshUtils:
         Called once during mesh preprocessing and stored as
         ``mesh_connectivity["nodal_volumes"]``.
         """
-        dimension = mesh_connectivity["dimension"]
+        # Dispatch on the CELL, not the dimension: 2-D is a triangle or a quad, 3-D a tet or a hex.
         points = mesh_connectivity["points"]
         n_points = mesh_connectivity["n_points"]
 
-        if dimension == 1:
-            cells = np.asarray(mesh_connectivity["lines"])
+        cells, cell_type = mc_cells(mesh_connectivity)
+
+        if cell_type == "line":
             measure = np.linalg.norm(points[cells[:, 1]] - points[cells[:, 0]], axis=-1)
 
-        elif dimension == 2:
-            cells = np.asarray(mesh_connectivity["triangles"])
+        elif cell_type == "triangle":
             a, b, c = points[cells[:, 0]], points[cells[:, 1]], points[cells[:, 2]]
             ba, ca = b - a, c - a
             measure = 0.5 * np.abs(ba[:, 0] * ca[:, 1] - ba[:, 1] * ca[:, 0])
 
-        elif dimension == 3:
-            cells = np.asarray(mesh_connectivity["tetrahedra"])
+        elif cell_type == "quad":
+            # Shoelace over the 4 vertices — exact for any planar quad, convex or not, and it does
+            # not assume the cell is a parallelogram (a general quad's area is not base times height).
+            x, y = points[cells][..., 0], points[cells][..., 1]
+            measure = 0.5 * np.abs(np.sum(x * np.roll(y, -1, axis=1) - np.roll(x, -1, axis=1) * y, axis=1))
+
+        elif cell_type == "tetra":
             a, b, c, d = (points[cells[:, i]] for i in range(4))
             measure = np.abs(np.einsum("ij,ij->i", b - a, np.cross(c - a, d - a))) / 6.0
 
+        elif cell_type == "hexahedron":
+            measure = np.abs(MeshUtils._hex_signed_volumes(points, cells))
+
         else:
-            raise ValueError(f"Unsupported dimension: {dimension}")
+            raise ValueError(f"Unsupported cell type: {cell_type!r}")
 
         # each of an element's nodes takes an equal share of its measure
         n_local = cells.shape[1]
@@ -330,6 +390,14 @@ class MeshUtils:
         if "tetra" in cd:
             bfaces, bapex = MeshUtils._boundary_faces_with_apex(cd["tetra"])
             return MeshUtils._compute_normals_from_boundary_faces(points, bfaces, apex_points=points[bapex])
+        if "hexahedron" in cd:
+            # A hex face has no opposite vertex; the owning cell's centroid orients it instead.
+            bfaces, bcent = MeshUtils._boundary_facets_with_centroid(points, cd["hexahedron"], "hexahedron")
+            return MeshUtils._compute_normals_from_boundary_faces(points, bfaces, apex_points=bcent)
+        if "quad" in cd:
+            bedges, bcent = MeshUtils._boundary_facets_with_centroid(points, cd["quad"], "quad")
+            if len(bedges):
+                return MeshUtils._compute_edge_normals_2d(points, bedges, bcent)
         if "triangle" in cd:
             # 2-D gets the SAME apex orientation 3-D has had: a boundary edge belongs to exactly one
             # triangle, so "outward" is "away from that triangle's opposite vertex" -- exact for any
@@ -418,6 +486,61 @@ class MeshUtils:
         return flat[sel], cells[parent_cell, apex_local[local_face]]
 
     @staticmethod
+    def _hex_signed_volumes(points, cells):
+        """Signed volume of each hexahedron, by the divergence theorem over its 6 faces.
+
+        ``∫_V dV = (1/3) ∮_∂V x·n dA``, evaluated by splitting every quadrilateral face into two
+        triangles. Exact for a trilinear hex whose faces are planar (a structured or swept mesh);
+        for a warped face the two-triangle split is the same approximation the face normals use, so
+        the two stay consistent. Signed rather than absolute so a caller can also use it to detect
+        an inverted cell.
+        """
+        from ..utils.solver.fem_facets import _LOCAL_FACES_HEX
+
+        v = np.asarray(points, dtype=np.float64)[np.asarray(cells, dtype=np.int64)]  # (n, 8, 3)
+        vol = np.zeros(len(v))
+        for a, b, c, d in _LOCAL_FACES_HEX:
+            for t in ((a, b, c), (a, c, d)):
+                p0, p1, p2 = v[:, t[0]], v[:, t[1]], v[:, t[2]]
+                vol += np.einsum("ij,ij->i", p0, np.cross(p1 - p0, p2 - p0)) / 6.0
+        return vol
+
+    @staticmethod
+    def _boundary_facets_with_centroid(points, cells, cell_type):
+        """Boundary facets of a tensor-product mesh, each with its owning cell's centroid.
+
+        The tensor-product twin of :meth:`_boundary_faces_with_apex` / :meth:`_boundary_edges_with_apex`.
+        Those orient a facet outward using the owning cell's *opposite vertex*, which a quad edge or
+        a hex face does not have -- there is no single vertex off the facet. The cell centroid plays
+        the same role and is exact for a convex cell (every cell of a structured or recombined mesh),
+        so the two agree wherever both are defined.
+
+        Returns ``(facet_nodes, centroid_points)``, matching the ``apex_points`` contract of the
+        normal builders: one *coordinate* per facet to point away from.
+        """
+        cells = np.asarray(cells, dtype=np.int64)
+        facets, parent_cell = MeshUtils._boundary_facets_unsorted(cells, cell_type)
+        centroids = np.asarray(points, dtype=np.float64)[cells[parent_cell]].mean(axis=1)
+        return facets, centroids
+
+    @staticmethod
+    def _boundary_facets_unsorted(cells, cell_type):
+        """``(facet_nodes, parent_cell)`` for the boundary facets, in LOCAL-TABLE node order.
+
+        The companion of :meth:`_get_boundary_elements`, which returns the same facets with each
+        row *sorted* into a canonical key. Sorting is what makes "occurs once" cheap to test, and it
+        is harmless for a triangle (any permutation spans the same triangle) -- but it destroys a
+        quadrilateral's cyclic order, and a quad's area and normal both depend on which pair of
+        vertices is its diagonal. Anything geometric about a 4-node facet must come through here.
+        """
+        from ..utils.solver.fem_facets import _boundary_faces, _face_table
+
+        cells = np.asarray(cells, dtype=np.int64)
+        local_faces, n_face_nodes = _face_table(cell_type)
+        flat, sel, n_local = _boundary_faces(cells, local_faces, n_face_nodes)
+        return flat[sel], sel // n_local
+
+    @staticmethod
     def _compute_normals_from_boundary_faces(points, boundary_faces, apex_points=None):
         """Compute robust 3D boundary vertex normals from boundary triangle faces.
 
@@ -444,18 +567,27 @@ class MeshUtils:
         centroid = np.mean(pts, axis=0)
         eps = 1e-20
 
-        p0, p1, p2 = pts[faces[:, 0]], pts[faces[:, 1]], pts[faces[:, 2]]
-        # Unnormalized normal magnitude is 2*face_area.
-        n = np.cross(p1 - p0, p2 - p0)
-        fc = (p0 + p1 + p2) / 3.0
+        if faces.shape[1] == 4:
+            # A quadrilateral face (hexahedral mesh): the cross product of the DIAGONALS is the
+            # right generalization -- for a planar quad its magnitude is 2*area, exactly as the
+            # triangle formula below, and it uses all four nodes so a slight non-planarity averages
+            # rather than picking whichever three nodes came first.
+            q0, q1, q2, q3 = (pts[faces[:, i]] for i in range(4))
+            n = np.cross(q2 - q0, q3 - q1)
+            fc = (q0 + q1 + q2 + q3) / 4.0
+        else:
+            p0, p1, p2 = pts[faces[:, 0]], pts[faces[:, 1]], pts[faces[:, 2]]
+            # Unnormalized normal magnitude is 2*face_area.
+            n = np.cross(p1 - p0, p2 - p0)
+            fc = (p0 + p1 + p2) / 3.0
         # Outward = away from the owning element's apex (exact); else away from centroid.
         ref = centroid[None, :] if apex is None else apex
         n = np.where((np.einsum("ij,ij->i", n, fc - ref) < 0.0)[:, None], -n, n)
         # a degenerate face contributes nothing, exactly as the loop's `continue` did
         n = np.where((np.linalg.norm(n, axis=1) >= eps)[:, None], n, 0.0)
 
-        # faces.ravel() is face-major (f0's 3 nodes, then f1's...), which is what repeat(n, 3) pairs with
-        flat, contrib = faces.ravel(), np.repeat(n, 3, axis=0)
+        # faces.ravel() is face-major (f0's nodes, then f1's...), which is what the repeat pairs with
+        flat, contrib = faces.ravel(), np.repeat(n, faces.shape[1], axis=0)
         vnorm = np.stack([np.bincount(flat, weights=contrib[:, c], minlength=len(pts)) for c in range(3)], axis=1)
 
         boundary_indices = np.unique(faces.ravel())

@@ -74,9 +74,27 @@ def test_boundary_closes_on_a_real_mesh(cell_type):
     assert conn.parent_cell.max() < len(cells)
 
 
+def test_tensor_product_cells_are_supported():
+    """Quadrilaterals and hexahedra go through the same sort+unique as the simplices.
+
+    This assertion used to be the opposite one -- ``"hexahedron"`` was in the refusal list. The
+    boundary detection itself never needed changing (a facet is on the boundary if its sorted node
+    ids occur once, whatever the cell), only the local-facet table it is handed.
+    """
+    quad = np.array([[0, 1, 4, 3], [1, 2, 5, 4]], dtype=int)  # two quads sharing edge (1, 4)
+    conn = build_facet_connectivity(quad, "quadrilateral")
+    assert conn.n_bfaces == 6 and conn.face_nodes.shape[1] == 2  # 8 edges - 2 shared
+    assert {tuple(sorted(f)) for f in conn.face_nodes.tolist()}.isdisjoint({(1, 4)})
+
+    hexa = np.array([[0, 1, 2, 3, 4, 5, 6, 7]], dtype=int)  # a single hexahedron
+    conn = build_facet_connectivity(hexa, "hexahedron")
+    assert conn.n_bfaces == 6 and conn.face_nodes.shape[1] == 4
+
+
 def test_unsupported_cell_type_is_refused():
+    """A cell with no facet table still refuses by name rather than guessing one."""
     with pytest.raises(NotImplementedError, match="cell_type"):
-        build_facet_connectivity(np.zeros((1, 8), dtype=int), "hexahedron")
+        build_facet_connectivity(np.zeros((1, 6), dtype=int), "prism")
 
 
 # --------------------------------------------------------------------------------------------

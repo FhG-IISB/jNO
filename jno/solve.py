@@ -20,7 +20,7 @@ BiCGStab (steady linear) and Jacobian-free Newton-Krylov (nonlinear).
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import jax
 import jax.numpy as jnp
@@ -64,6 +64,7 @@ __all__ = [
     "exponential",
     "adaptive",
     "remesh",
+    "refine",
     "relocate",
 ]
 
@@ -881,6 +882,7 @@ def lstsq(A, b, *, damp: float = 0.0, atol: float = 1e-6, btol: float = 1e-6, ma
 
 def remesh(
     *,
+    criterion: Any = None,
     anisotropic: bool = False,
     max_dofs: int | None = None,
     every: int = 5,
@@ -894,6 +896,26 @@ def remesh(
     eps: float | None = None,
 ) -> AdaptSpec:
     """**h-adaptivity** for ``fem.solve(adapt=...)``: change the mesh to follow the solution.
+
+    **``criterion=``** refines on a **traced expression** instead of the recovery error estimator --
+    which is how production AMR codes actually mark, on a physical quantity rather than an error
+    estimate. It carries **no test function**; a criterion is a field, not an equation::
+
+        ui = u.bind(x=xi, y=yi)
+
+        remesh(criterion=jno.np.sqrt(ui.x**2 + ui.y**2))   # gradient / shock detector
+        remesh(criterion=phi * (1.0 - phi))                # phase-field interface
+        remesh(criterion=jno.np.abs(uy.x - ux.y))          # 2-D vorticity, on a vector field
+        remesh(criterion=d.by_region({"weld": 1.0, "plate": 0.0}))   # refine one material
+
+    The expression is assembled against this problem's own test function, normalised by the lumped
+    mass to a nodal field, and integrated per cell; ``theta``, ``refine_factor`` and the remesh
+    mechanism are unchanged, so it composes with everything else here. On a multifield problem
+    ``metric_field`` selects which field's space it is assembled in. A term that already carries the
+    test function is accepted too.
+
+    Second derivatives in a criterion (a Löhner-style ``|D2u|/|Du|`` detector) need ``order >= 2``:
+    a P1 Hessian is identically zero, so at order 1 such a criterion evaluates to nothing.
 
     On a **steady** problem this is the refine loop — solve, estimate (Zienkiewicz–Zhu), mark
     (Dörfler ``theta``), refine by ``refine_factor``, repeat up to ``max_iters`` — growing the mesh
@@ -947,11 +969,76 @@ def remesh(
         hmax=hmax,
         every=every,
         metric_field=metric_field,
+        criterion=criterion,
+    )
+
+
+def refine(
+    *,
+    criterion: Any = None,
+    theta: float = 0.5,
+    max_iters: int = 8,
+    max_dofs: int | None = None,
+    tol: float | None = None,
+    eps: float | None = None,
+    metric_field: int = 0,
+) -> AdaptSpec:
+    """**h-adaptivity by local refinement** for ``fem.solve(adapt=...)``: split the marked cells.
+
+    Beside :func:`remesh` rather than a flag on it, because it is a different algorithm. ``remesh``
+    rebuilds the mesh at a finer size field, so it needs a geometry to rebuild from and returns a mesh
+    that does not nest inside the old one. ``refine`` splits each marked cell into 4 (a quadrilateral)
+    or 8 (a hexahedron): local, needs no mesher, works on a mesh loaded from a file, and every existing
+    node survives with its value::
+
+        d = jno.Shape.rect(0, 0, 1, 1).quad().structured(n=8).domain()
+        u = fem.solve(adapt=jno.solve.refine(theta=0.4, max_iters=4))
+
+        d = jno.Shape.box(0, 0, 0, 1, 1, 1).structured(n=4).quad().domain()   # hexes
+        u = fem.solve(adapt=jno.solve.refine(criterion=jno.np.abs(ui.x)))     # composes with a criterion
+
+    **For hexahedra this is the only h-adaptivity there is.** No general all-hex mesher exists -- gmsh's
+    ``Recombine3DAll`` on a plain box returns tetrahedra and no hexahedra -- so ``remesh`` has nothing
+    to remesh *to* and refuses by name.
+
+    The price is that the mesh stops being conforming: a split cell's edge midpoint is not a vertex of
+    its unrefined neighbour, so its value is not free. Such **hanging nodes** are constrained to the
+    coarse facet they lie on, ``u = sum_i w_i u_parent_i`` -- the same relation a periodic tie and a
+    mortar coupling impose, and carried by the same prolongation. Neighbours are kept within one
+    refinement level (a 2:1 balance), so no constrained node ever has a constrained parent.
+
+    ``theta`` (Dörfler marking), ``criterion``, ``max_iters``, ``max_dofs``, ``tol`` and ``eps`` mean
+    exactly what they do on :func:`remesh`. There is no ``refine_factor``: a split halves the cell by
+    construction. There is no ``anisotropic``: the split is isotropic, so there is no direction to
+    stretch along -- that needs a simplex mesh and ``remesh(anisotropic=True)``.
+
+    **Limitations, measured.** Quadrilateral and hexahedral meshes only; a simplex mesh refuses by name
+    and should use :func:`remesh`, whose mmg path is local already. A hanging node landing on a tied or
+    periodic interface is refused rather than composed. Steady problems only -- the transient driver
+    transfers state across a remesh, and that path does not yet carry a constraint set. Geometry is
+    exact for affine cells; a warped hexahedron's faces are non-planar, so refining it moves the volume
+    by an O(h^2) amount (measured: 3.9e-04 for a 0.06 warp on a 0.25 cell).
+
+    Returns:
+        AdaptSpec: The adaptation spec to pass as ``fem.solve(adapt=...)``.
+    """
+    from .utils.solver.fem_adapt import AdaptSpec
+
+    return AdaptSpec(
+        split=True,
+        criterion=criterion,
+        theta=theta,
+        max_iters=max_iters,
+        max_dofs=max_dofs,
+        tol=tol,
+        eps=eps,
+        metric_field=metric_field,
     )
 
 
 def relocate(
     *,
+    objective: str = "equidistribution",
     method: str = "descent",
     max_iters: int = 8,
     lr: float = 3e-3,
@@ -972,6 +1059,29 @@ def relocate(
     Tagging is **literal and per-axis**: ``xm.trainable()`` frees only the x column. That is the lever for
     boundary vertices — free an edge's *along-edge* axis and its nodes slide within the wall; leave the
     normal axis untagged and the domain shape is preserved exactly.
+
+    **Two objectives, and the choice is the problem's, not a preference.** ``objective=`` picks *what*
+    descent minimises:
+
+    - ``"equidistribution"`` (default) equidistributes an **arclength monitor** — it targets *resolution*,
+      and wins where a feature is under-resolved or moving.
+    - ``"energy"`` descends the **FE Dirichlet energy**. For a Ritz method
+      ``E_h - E_exact = 1/2 ||u - u_h||_E^2``, so on a steady problem the energy *is* the error norm and
+      descending it minimises the error directly.
+    - ``"huang"`` is Huang's equidistribution–alignment functional (see :class:`AdaptSpec`).
+
+    Neither dominates, measured on the two problem types the test suite pins:
+
+    ==========================  =========================  =========================
+    objective                   L-shape corner (fixed)     Allen–Cahn front (moving)
+    ==========================  =========================  =========================
+    ``"energy"``                **55 % error cut**         10.7x WORSE than uniform
+    ``"equidistribution"``      12 % worse                 **0.51x uniform**
+    ==========================  =========================  =========================
+
+    So: a **fixed singularity** wants ``"energy"``; an **under-resolved or moving front** wants the
+    default. The energy is also not scale-free — a vector field carries the energy of all its components,
+    so ``lr`` is problem-scaled — where the monitor functionals are.
 
     **Two methods.** ``"descent"`` (default) walks the vertices down the equidistribution defect of an
     arclength monitor, evaluated *through the differentiable solve*, with a backtracking ``det J`` line
@@ -1037,6 +1147,7 @@ def relocate(
 
     return AdaptSpec(
         relocate=True,
+        objective=objective,
         relocate_method=method,
         max_iters=max_iters,
         lr=lr,
