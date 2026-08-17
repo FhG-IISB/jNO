@@ -60,7 +60,7 @@ def _stokes(mesh_size=0.3):
 # solution-dependent precond.form — the Picard-lagged Schur weight
 # --------------------------------------------------------------------------------------
 def test_solution_dependent_form_solves_and_matches():
-    """The pikimam spelling: a form whose coefficient is computed FROM the solution. It refreshes
+    """A form whose coefficient is computed FROM the solution. It refreshes
     from the outer iterate and the preconditioned solve must land on the plain solve's answer —
     a preconditioner changes speed, never the solution."""
     fem, ui, vi = _nonlinear_diffusion()
@@ -134,7 +134,7 @@ def test_diagonal_sub_block_is_assembled_sparse():
 
 
 def test_stokes_triangular_with_amg_velocity_block():
-    """The full pikimam-shaped recipe on a saddle system: triangular fieldsplit, multigrid on the
+    """The full rigid-plastic-flow recipe on a saddle system: triangular fieldsplit, multigrid on the
     velocity sub-block, weighted pressure mass as the Schur approximation."""
     pytest.importorskip("pyamg", reason="pyamg required for the hybrid AMG spec")
     fem, u, p, pp, qq, mu = _stokes()

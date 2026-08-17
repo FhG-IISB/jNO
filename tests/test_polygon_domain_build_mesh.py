@@ -398,7 +398,7 @@ def test_build_mesh_interface_is_conforming_across_internal_interface():
 
     Furnace-faithful setup: a ``wall`` slab whose left edge x=2 is a single
     segment (2,0)-(2,3); a ``block`` touching that edge over z in [1,2]; and
-    ``Air`` built as the scene-box minus everything (as cg_furnace does). Air's
+    ``Air`` built as the scene-box minus everything. Air's
     boundary along x=2 is then split into (2,0)-(2,1) and (2,2)-(2,3) with
     vertices (2,1)/(2,2) that the wall's single edge lacks. Those vertices sit
     on an *internal* interface, so ``_collect_source_edge_endpoints`` (which

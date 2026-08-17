@@ -655,7 +655,7 @@ written exactly as they are on a simplex mesh.
 **Why bother.** Linear triangles and tetrahedra are stiff: they lock in near-incompressible
 elasticity and are poor in bending, which is why mechanics codes are built on hexahedra. A
 quadrilateral grid is also the mesh the topology-optimisation literature is written on, and for
-layered geometry (a metasurface stack, a planar transformer, a PCB) a structured hex mesh is both
+layered geometry (a thin-film stack, a wound magnetic component, a PCB) a structured hex mesh is both
 better conditioned and far cheaper per node than tetrahedra.
 
 **Why 3-D is structured-only.** gmsh cannot hexahedral-mesh general geometry. Measured here,
