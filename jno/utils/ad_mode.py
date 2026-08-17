@@ -34,6 +34,8 @@ current global default. Defaults match historical behaviour: first-order
 
 from __future__ import annotations
 
+from typing import Any, Callable, Sequence
+
 import jax
 
 from .schemes import require_family
@@ -138,7 +140,7 @@ def ad_fn(mode: str):
     raise ValueError(f"Invalid AD mode {mode!r}.")
 
 
-def rowwise_jacobian(f, x, rows):
+def rowwise_jacobian(f: Callable[[Any], Any], x: Any, rows: Sequence[int]) -> jax.Array:
     """``(len(rows), P)`` reverse-mode Jacobian of ``f: x -> (N,)``, with no ``vmap``.
 
     ``jax.jacrev`` takes one ``vjp`` and then **vmaps the pullback** across the rows of the
