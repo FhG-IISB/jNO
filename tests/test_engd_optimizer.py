@@ -256,7 +256,9 @@ def test_engd_optimizer_custom_reduction_unwrapped_via_reduces_axis():
     # property our code relies on — not _name).
     for loss in losses:
         assert isinstance(loss, FunctionCall), "expected FunctionCall loss"
-        assert loss.reduces_axis, "expected reduces_axis to be truthy"
+        # `.reduces`, not `bool(reduces_axis)`: reduces_axis doubles as the axis VALUE, so a
+        # falsy-but-real axis (`axis=0`) would fail a plain truth test. See FunctionCall.reduces.
+        assert loss.reduces, "expected the loss to register as a reduction"
 
     net.optimizer(engd())
     crux = jno.core(losses)

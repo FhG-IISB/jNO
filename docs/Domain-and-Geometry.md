@@ -285,3 +285,57 @@ domain by an integer `B` (`B * jno.domain(...)`, or `B * shape.domain()`) to rep
 operator-learning samples. `shape.domain(**kwargs)` forwards the *domain* arguments (`time=`, `sample=`,
 `name=`, …) — but not a constructor or `mesh_size`, since size lives on the shape — so a full domain is
 one line. `d.plot("domain.png")` renders the mesh, regions, and normals.
+
+### Attaching a tensor
+
+Pass an array instead of a sampling spec to attach it as a **tensor tag** — the operator-learning
+pattern, where each batch sample carries its own field:
+
+```python
+dom = 256 * jno.domain(constructor=jno.domain.poseidon(nx=64, ny=64))
+dom.variable("_f", forcing)          # (256, 64, 64, 1) — the shape you actually have
+```
+
+Context tensors are laid out `(B, T, ...)`. On a **steady** domain the time axis is `1` by
+definition, so it is inserted for you: attach `(B, H, W, C)` and it is stored as `(B, 1, H, W, C)`.
+Writing the axis yourself still works and is left untouched.
+
+!!! warning "This is load-bearing, not cosmetic"
+
+    Without a time axis the compiler reads the first grid axis *as* the timestep count and hands
+    the expression a single slice — an `(4, 8, 5, 1)` attach used to arrive as `(5, 1)`, with the
+    rest of the field discarded and no error raised.
+
+    On a **time-dependent** domain axis 1 is genuinely ambiguous (is it `T`, or a grid axis?), so a
+    mismatch raises instead: pass `T` entries, or `1` to share one field across all steps.
+
+    Only tensors of rank ≥ 4 whose leading dimension is `B` or `1` are touched — a parameter like
+    `(B, 1, 1)` or a shared lookup table is left exactly as given. Multiply the domain by `B`
+    **before** attaching, so the batch count is known.
+
+### Datasets larger than memory
+
+The same slot accepts a **lazy** source — anything exposing `.shape` and `__getitem__`. The handle is
+stored unread and sliced one batch at a time, so the dataset never has to fit:
+
+```python
+dom.variable("_f", h5py.File("well.h5")["forcing"])     # or zarr, tensorstore, np.memmap
+crux.solve(epochs=600, batchsize=32, offload_data=True)
+```
+
+No new dependency and no new argument — the contract is duck-typed, so jNO imports none of those
+libraries. `offload_data=True` is required, because the on-device path holds the whole array; asking
+for it with a lazy source raises and names the fix.
+
+!!! note "What a lazy source gives up"
+
+    Indices are **sorted** before each gather, since h5py and zarr only accept increasing fancy
+    indices. That reorders samples within a batch — invisible to a mean-reduced loss, but a run is
+    not bitwise identical to one recorded before this existed.
+
+    The `(B, T, ...)` time axis is **validated, not inserted**: rewriting the layout would mean
+    reading the source, which is the one thing it exists to avoid. Store it with the time axis, or
+    pass an eager array.
+
+    **Adaptive resampling cannot target a lazy tag** — it replaces the whole point set each round.
+    It raises rather than silently skipping.

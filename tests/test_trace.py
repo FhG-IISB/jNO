@@ -802,3 +802,55 @@ class TestStopGradient:
         result = x.stop_gradient.stop_gradient
         assert isinstance(result, FunctionCall)
         assert result._name == "stop_gradient"
+
+
+class TestFunctionCallReduces:
+    """``FunctionCall.reduces`` vs the raw ``reduces_axis`` value.
+
+    ``reduces_axis`` doubles as the axis value, so ``axis=0`` is falsy while being a perfectly real
+    reduction. Every consumer used to test truthiness, so a reduction over axis 0 kept the weak-form
+    mark it should have stopped and was never unwrapped to reach the vector residual.
+    """
+
+    def test_axis_zero_is_a_reduction(self):
+        import jno
+
+        x = make_var("x")
+        assert FunctionCall(lambda a: a.sum(0), [x], "sum", 0).reduces
+        assert jno.np.mean(x, axis=0).reduces
+        assert jno.np.sum(x, axis=(0, 1)).reduces
+        assert jno.np.norm(x, axis=0).reduces
+
+    def test_truthiness_of_the_raw_field_is_the_bug(self):
+        """Pins WHY ``.reduces`` exists — delete it and this is what breaks."""
+        import jno
+
+        r = jno.np.mean(make_var("x"), axis=0)
+        assert not r.reduces_axis, "axis=0 is falsy — this is the trap"
+        assert r.reduces, "...but it IS a reduction"
+
+    def test_negative_and_method_form_axes_still_reduce(self):
+        import jno
+
+        x = make_var("x")
+        assert jno.np.mean(x, axis=-1).reduces  # -1 was already truthy
+        assert x.mse.reduces  # the method forms pass a literal True
+        assert x.mean.reduces
+
+    def test_no_axis_stays_ambiguous_and_does_not_reduce(self):
+        """``None`` is deliberately NOT a reduction: a full reduction and the public escape hatch
+        ``jno.fn(f, args)`` both pass it. A documented limitation, pinned so it stays a decision."""
+        import jno
+
+        x = make_var("x")
+        assert not jno.np.sum(x).reduces
+        assert not jno.fn(lambda a: a * 2, [x]).reduces
+
+    def test_axis_zero_reduction_stops_weak_propagation(self):
+        """The consequence in the FEM path: a reduction must not carry the weak-form mark upward."""
+        import jno
+
+        weak = jno.np.test("phi") * 2.0
+        assert getattr(weak, "_is_weak_expr", False), "the test-function product should be weak"
+        assert not getattr(jno.np.mean(weak, axis=0), "_is_weak_expr", False)
+        assert not getattr(weak.mse, "_is_weak_expr", False)  # unchanged behaviour

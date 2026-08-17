@@ -669,16 +669,104 @@ def sqrtm(x) -> FunctionCall:
 # ============================================================================
 
 
+def _grid_shape_of(domain):
+    """A domain's structured-grid extent as a tuple, or ``None`` when it has no grid."""
+    gs = getattr(domain, "_grid_shape", None)
+    if gs is None:
+        sg = getattr(domain, "_structured_grid", None)
+        gs = sg.get("shape") if isinstance(sg, dict) else None
+    return tuple(int(s) for s in gs) if gs else None
+
+
+def _axis_extent(var: Variable) -> int:
+    """How many points ``var`` spans along its own axis.
+
+    A ``Variable`` does not carry this: ``.size`` is its *component* span (the ``[lo, hi]`` slice
+    into ``context[tag]``), not a point count. So it comes from the owning domain — the time axis
+    from ``context["__time__"]``, a spatial axis from the structured grid, indexed by the
+    coordinate's own component index ``dim[0]`` (x=0, y=1, z=2).
+    """
+    dom = getattr(var, "_domain", None)
+    if dom is None:
+        raise ValueError(f"axis={var!r}: this Variable has no owning domain, so its extent is unknown.")
+
+    if getattr(var, "axis", "spatial") == "temporal":
+        t = getattr(dom, "context", {}).get("__time__")
+        if t is None or not hasattr(t, "shape"):
+            raise ValueError(f"axis={var!r}: the domain is not time-dependent, so there is no time axis to reduce.")
+        return int(t.shape[0])
+
+    gs = _grid_shape_of(dom)
+    if gs is None:
+        raise ValueError(
+            f"axis={var!r}: tag {getattr(var, 'tag', '?')!r} has no structured grid, so its points live on a "
+            "single flat axis and no coordinate names one of them. `axis=<Variable>` is defined only on a "
+            "structured-grid domain (jno.domain.poseidon / equi_distant_rect / a structured mesh). "
+            "Reduce the whole point axis with axis=None."
+        )
+    k = int(var.dim[0])
+    if k >= len(gs):
+        raise ValueError(f"axis={var!r}: component index {k} is out of range for grid {gs}.")
+    return gs[k]
+
+
+def _resolve_axis(shape, var: Variable) -> int:
+    """The integer axis of ``shape`` that ``var`` names.
+
+    Matches the coordinate's extent against the array's axes. When several axes share that extent —
+    the *common* case, since grids are usually square — the whole grid block is located instead and
+    the coordinate indexed within it. Genuinely ambiguous layouts raise rather than guess.
+    """
+    shape = tuple(int(s) for s in shape)
+    extent = _axis_extent(var)
+    cand = [i for i, s in enumerate(shape) if s == extent]
+
+    if len(cand) == 1:
+        return cand[0]
+    if not cand:
+        raise ValueError(
+            f"axis={var!r}: no axis of an array with shape {shape} has extent {extent}. Either the "
+            "expression is not defined on that coordinate's grid, or its layout was transposed."
+        )
+
+    gs = _grid_shape_of(getattr(var, "_domain", None))
+    offs = []
+    if gs and len(gs) <= len(shape):
+        offs = [o for o in range(len(shape) - len(gs) + 1) if shape[o : o + len(gs)] == gs]
+    if len(offs) == 1:
+        return offs[0] + int(var.dim[0])
+
+    raise ValueError(
+        f"axis={var!r} is ambiguous on an array with shape {shape}: axes {cand} all have extent "
+        f"{extent}, and the grid block {gs} matches at offsets {offs or 'nowhere'}. Reduce with an "
+        "explicit integer axis instead."
+    )
+
+
+def _resolve_axes(shape, axis):
+    """Turn any ``Variable`` in ``axis`` into an integer axis of ``shape``; ints pass through."""
+    if axis is None:
+        return None
+    if isinstance(axis, (tuple, list)):
+        out = tuple(_resolve_axis(shape, a) if isinstance(_u(a), Variable) else int(a) for a in axis)
+        if len(set(out)) != len(out):
+            raise ValueError(f"axis={axis!r}: resolves to duplicate axes {out} of shape {tuple(shape)}.")
+        return out
+    return _resolve_axis(shape, _u(axis)) if isinstance(_u(axis), Variable) else axis
+
+
 def _reduction(jnp_fn, name):
     """Create a reduction wrapper for Placeholder args (auto-unwraps typed views)."""
 
     def wrapper(x, axis=None, keepdims=False):
-        return FunctionCall(
-            lambda a: jnp_fn(a, axis=axis, keepdims=keepdims),
-            [_u(x)],
-            name=name,
-            reduces_axis=axis,
-        )
+        # `axis` may be a coordinate Variable (or a tuple containing them). It is resolved to an
+        # integer HERE, inside the closure, because that is the first point where the array — and
+        # therefore its shape — actually exists; a trace expression carries no shape. `reduces_axis`
+        # keeps the UNRESOLVED value: it is what the user wrote.
+        def _fn(a, _axis=axis, _keepdims=keepdims):
+            return jnp_fn(a, axis=_resolve_axes(a.shape, _axis), keepdims=_keepdims)
+
+        return FunctionCall(_fn, [_u(x)], name=name, reduces_axis=axis)
 
     wrapper.__name__ = name
     wrapper.__doc__ = jnp_fn.__doc__
@@ -696,13 +784,12 @@ prod = _reduction(jnp.prod, "prod")
 
 
 def norm(x, ord=None, axis=None, keepdims=False) -> FunctionCall:
-    """Vector/matrix norm."""
-    return FunctionCall(
-        lambda a: jnp.linalg.norm(a, ord=ord, axis=axis, keepdims=keepdims),
-        [_u(x)],
-        name="norm",
-        reduces_axis=axis,
-    )
+    """Vector/matrix norm. ``axis`` also accepts a coordinate ``Variable`` (see :func:`mean`)."""
+
+    def _fn(a, _axis=axis):
+        return jnp.linalg.norm(a, ord=ord, axis=_resolve_axes(a.shape, _axis), keepdims=keepdims)
+
+    return FunctionCall(_fn, [_u(x)], name="norm", reduces_axis=axis)
 
 
 # ============================================================================

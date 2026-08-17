@@ -239,6 +239,15 @@ def _coords_dispatch(view_self, args: tuple, named_vars: dict, *, positional_fac
     if named_vars and args:
         raise TypeError("coords() expects either kwargs (name=Variable) or positional names, not both")
     if named_vars:
+        # Re-bind: ``view_self`` already carries bindings (it is a Named<View>WithPartials, or a
+        # FieldViewWithPartials). Stay on its OWN class and merge, new wins -- which is exactly what
+        # ``_rewrap``'s conflict message tells the user ``.bind(...)`` is for. Resolving through
+        # ``_base_view`` instead would send a FieldViewWithPartials to NamedScalarViewWithPartials and
+        # silently swap its FD-only derivatives for AD ones, which are identically zero for an operator
+        # network that never takes x/y as inputs -- a wrong answer, not an error.
+        existing = getattr(view_self, "_coord_vars", None)
+        if existing is not None:
+            return type(view_self)(view_self._expr, {**existing, **named_vars})
         cls = _NAMED_PARTIALS_CLS_FOR[type(view_self)]
         return cls(view_self._expr, named_vars)
     if args:
@@ -2193,6 +2202,7 @@ def _make_named_with_partials_cls(view_cls):
 NamedScalarViewWithPartials = _make_named_with_partials_cls(ScalarView)
 NamedVectorViewWithPartials = _make_named_with_partials_cls(VectorView)
 NamedComplexViewWithPartials = _make_named_with_partials_cls(ComplexView)
+NamedComplexVectorViewWithPartials = _make_named_with_partials_cls(ComplexVectorView)
 NamedMatrixViewWithPartials = _make_named_with_partials_cls(MatrixView)
 NamedVoigtViewWithPartials = _make_named_with_partials_cls(VoigtView)
 
@@ -2206,6 +2216,7 @@ _NAMED_PARTIALS_CLS_FOR = {
     ScalarView: NamedScalarViewWithPartials,
     VectorView: NamedVectorViewWithPartials,
     ComplexView: NamedComplexViewWithPartials,
+    ComplexVectorView: NamedComplexVectorViewWithPartials,
     MatrixView: NamedMatrixViewWithPartials,
     VoigtView: NamedVoigtViewWithPartials,
 }
@@ -2222,6 +2233,7 @@ __all__ = [
     "NamedScalarViewWithPartials",
     "NamedVectorViewWithPartials",
     "NamedComplexViewWithPartials",
+    "NamedComplexVectorViewWithPartials",
     "NamedMatrixViewWithPartials",
     "NamedVoigtViewWithPartials",
     "FieldView",

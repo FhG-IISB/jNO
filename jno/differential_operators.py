@@ -998,13 +998,18 @@ class DifferentialOperators:
         Returns:
             Tuple ``(main_scheme, grad_method, lap_method)``.
         """
-        if ":" not in scheme:
-            if scheme == "automatic_differentiation":
-                return "automatic_differentiation", None, None
-            return "finite_difference", "area_weighted", "gradient_of_gradient"
+        from .utils.schemes import scheme_family
 
-        main, sub = scheme.split(":", 1)
-        sub = sub.strip()
+        # Resolve the FAMILY first. This used to default ANY unrecognised family to the
+        # finite-difference settings, and to hand an unknown `family:sub` straight to the FD
+        # kernel as `method=sub` -- both silent.
+        main = scheme_family(scheme)
+        if main == "automatic_differentiation" and ":" not in scheme:
+            return "automatic_differentiation", None, None
+        if ":" not in scheme:
+            return main, "area_weighted", "gradient_of_gradient"
+
+        sub = scheme.split(":", 1)[1].strip()
 
         if sub == "cotangent":
             return main, "area_weighted", "cotangent"
