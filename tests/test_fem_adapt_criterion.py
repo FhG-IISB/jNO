@@ -131,13 +131,31 @@ def test_the_criterion_replaces_the_estimator_rather_than_blending_with_it():
 # --------------------------------------------------------------------------------------- refusals
 
 
-def test_a_criterion_with_no_coordinates_is_refused():
-    """Without coordinates its region is undetermined, and guessing would silently integrate it over
-    the wrong part of the mesh."""
-    _d, fem, _ui, _vi, _xi, _yi = _ridge_problem()
+def test_a_criterion_carrying_no_coordinates_falls_back_to_the_form_s_region():
+    """A criterion can legitimately carry no coordinates of its own.
+
+    ``ui * (1 - ui)`` -- the phase-field interface indicator, one of the criteria this feature exists
+    for -- references only the bound trial function, and a plain bound field does not expose its
+    coordinates the way a derivative (``ui.x``) does. Refusing it was a false refusal on a perfectly
+    good criterion, so the region falls back to the one the FORM integrates over, which is the only
+    region a volume criterion could mean.
+    """
+    _d, fem, ui, _vi, _xi, _yi = _ridge_problem()
     sol = np.asarray(fem.solve()).reshape(-1)
-    with pytest.raises(ValueError, match="carries no coordinates"):
-        _criterion_indicators(fem, jno.np.abs(1.0), sol)
+    eta, est = _criterion_indicators(fem, ui * (1.0 - ui), sol)
+    assert np.isfinite(eta).all() and est > 0.0
+    # and a criterion of pure constants still resolves, rather than raising
+    assert np.isfinite(_criterion_indicators(fem, jno.np.abs(1.0), sol)[0]).all()
+
+
+def test_a_bound_field_criterion_binds_to_the_form_s_own_coordinates():
+    """The test function must bind to the coordinate OBJECTS already in play. Mixing the form's
+    retagged coordinates (inside `ui`) with freshly fetched ones raised "coord binding conflict for
+    'x': cannot combine two named views that map 'x' to different Variables"."""
+    _d, fem, ui, _vi, _xi, _yi = _ridge_problem()
+    sol = np.asarray(fem.solve()).reshape(-1)
+    eta, _ = _criterion_indicators(fem, ui * (1.0 - ui), sol)
+    assert eta.shape[0] == len(np.asarray(fem.domain.mesh.cells_dict["triangle"]))
 
 
 def test_an_out_of_range_metric_field_is_refused():

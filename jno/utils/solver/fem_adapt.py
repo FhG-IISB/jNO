@@ -1354,24 +1354,54 @@ def _criterion_weak_terms(fem: Any, criterion: Any, field: int = 0):
     if not 0 <= int(field) < len(tests):
         raise ValueError(f"adapt(criterion=...): metric_field={field} but this problem has {len(tests)} field(s).")
 
-    tags: list = []
-    for var in _walk(node, Variable):
-        tg = getattr(var, "tag", None)
-        if isinstance(tg, str) and (tg == "fem_gauss" or tg.startswith("gauss_")):
-            tg = getattr(var, "_jno_region_tag", tg)
-        if isinstance(tg, str) and tg not in tags:
-            tags.append(tg)
+    def _region_tags(root) -> list:
+        found: list = []
+        for var in _walk(root, Variable):
+            tg = getattr(var, "tag", None)
+            if isinstance(tg, str) and (tg == "fem_gauss" or tg.startswith("gauss_")):
+                tg = getattr(var, "_jno_region_tag", tg)  # the recovery `_region_and_support` does
+            if isinstance(tg, str) and tg not in found:
+                found.append(tg)
+        return found
+
+    tags = _region_tags(node)
+    if not tags:
+        # A criterion can legitimately carry no coordinates of its own: `ui * (1 - ui)` -- a phase-field
+        # interface indicator -- references only the bound trial function, and a plain bound field does
+        # not expose its coordinates the way a derivative (`ui.x`) does. Fall back to the region the
+        # FORM integrates over, which is the only region a volume criterion could mean anyway.
+        for t in list(getattr(fem, "_constraints", None) or []):
+            tags = _region_tags(getattr(t, "expr", t))
+            if tags:
+                break
     if not tags:
         raise ValueError(
-            "adapt(criterion=...): the criterion carries no coordinates, so its region is undetermined. "
-            "Build it from `domain.variable(region, split=True)` coordinates, as a weak term is."
+            "adapt(criterion=...): neither the criterion nor this problem's terms carry coordinates, so "
+            "the region to integrate over is undetermined. Build the criterion from "
+            "`domain.variable(region, split=True)` coordinates, as a weak term is."
         )
     if len(tags) > 1:
         raise ValueError(f"adapt(criterion=...): the criterion spans more than one region {tags}; use one.")
 
     dim = int(fem.domain.dimension)
-    coords = fem.domain.variable(tags[0], split=True)
-    test_bound = tests[int(field)](*coords[:dim])
+    # Bind the test function to the coordinate OBJECTS already in play, not to freshly fetched ones.
+    # A criterion referencing a bound field (`ui * (1 - ui)`) carries the form's retagged coordinates
+    # inside it, and mixing those with fresh ones raises "coord binding conflict for 'x': cannot combine
+    # two named views that map 'x' to different Variables". Ordered by `dim[0]`, the axis index.
+    seen_axis: dict = {}
+    for root in [node] + [getattr(t, "expr", t) for t in list(getattr(fem, "_constraints", None) or [])]:
+        for var in _walk(root, Variable):
+            if getattr(var, "axis", None) != "spatial":
+                continue
+            ax = int(getattr(var, "dim", [0])[0])
+            seen_axis.setdefault(ax, var)
+        if len(seen_axis) >= dim:
+            break
+    if len(seen_axis) >= dim:
+        coords = [seen_axis[a] for a in sorted(seen_axis)][:dim]
+    else:  # nothing carries coordinates (a criterion of pure constants): fall back to the region's own
+        coords = list(fem.domain.variable(tags[0], split=True))[:dim]
+    test_bound = tests[int(field)](*coords)
     node = getattr(criterion, "expr", criterion)
     # The MASS term is built from the same test function and coordinates rather than from the criterion,
     # so that an already-weak criterion does not produce `1 + 0*(g*v)` -- a sum of a test-free and a
