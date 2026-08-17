@@ -30,8 +30,7 @@ import jno  # noqa: E402
 inner, symgrad, trace = jno.np.inner, jno.np.symgrad, jno.np.trace
 
 p = argparse.ArgumentParser()
-BASE = ""
-p.add_argument("--design", default=BASE + "fine_perim_deform_p0_patch_cont.npz")
+p.add_argument("--design", required=True, help="path to the .npz design field to re-analyse")
 p.add_argument("--h-fine", type=float, default=0.5, help="reanalysis mesh size")
 p.add_argument("--threshold", type=float, default=0.5)
 args = p.parse_args()
