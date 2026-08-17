@@ -306,8 +306,16 @@ def test_singular_operator_raises_instead_of_returning_finite_garbage():
     """The real thing: cuDSS would return a finite wrong answer here."""
     idx = jnp.asarray(np.stack([np.arange(4), np.arange(4)], axis=1))
     A = jsp.BCOO((jnp.asarray([1.0, 2.0, 0.0, 4.0]), idx), shape=(4, 4))
+    # `.block_until_ready()` is the assertion, not decoration. The guard raises from inside a
+    # `pure_callback`; on an async backend (GPU) the call returns before the callback has run, so
+    # without forcing the result the error surfaces at some later, unrelated synchronisation and
+    # `pytest.raises` sees nothing. Measured: this test passes on CPU and fails on GPU without it.
+    #
+    # The fix belongs HERE, not in the solver. Making the solve synchronous would break its
+    # documented jit-compatibility (no concrete array to block on under trace) and would add a
+    # device sync to every solve on the hot path, which is exactly what the offload design avoids.
     with pytest.raises(RuntimeError, match="SINGULAR"):
-        cudss_lu_solve(A, jnp.ones(4))
+        cudss_lu_solve(A, jnp.ones(4)).block_until_ready()
 
 
 # --------------------------------------------------------------------------------------
@@ -601,5 +609,13 @@ def test_pardiso_gradients_match_finite_differences():
 def test_pardiso_singular_operator_raises():
     idx = jnp.asarray(np.stack([np.arange(4), np.arange(4)], axis=1))
     A = jsp.BCOO((jnp.asarray([1.0, 2.0, 0.0, 4.0]), idx), shape=(4, 4))
+    # `.block_until_ready()` is the assertion, not decoration. The guard raises from inside a
+    # `pure_callback`; on an async backend (GPU) the call returns before the callback has run, so
+    # without forcing the result the error surfaces at some later, unrelated synchronisation and
+    # `pytest.raises` sees nothing. Measured: this test passes on CPU and fails on GPU without it.
+    #
+    # The fix belongs HERE, not in the solver. Making the solve synchronous would break its
+    # documented jit-compatibility (no concrete array to block on under trace) and would add a
+    # device sync to every solve on the hot path, which is exactly what the offload design avoids.
     with pytest.raises((RuntimeError, ValueError)):
-        pardiso_lu_solve(A, jnp.ones(4))
+        pardiso_lu_solve(A, jnp.ones(4)).block_until_ready()

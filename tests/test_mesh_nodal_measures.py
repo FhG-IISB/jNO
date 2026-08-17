@@ -91,12 +91,25 @@ def test_every_node_carries_volume(square):
     assert np.all(vols > 0.0)  # every node belongs to at least one element
 
 
-def test_unsupported_dimension_is_rejected(square):
-    bogus = dict(square, dimension=4)
+def test_the_two_measures_dispatch_on_different_things(square):
+    """``ds`` selects by DIMENSION, ``volumes`` by CELL -- and they no longer agree.
+
+    They used to share one dimension guard. ``compute_nodal_volumes`` now dispatches on the cell
+    (2-D is a triangle or a quad, 3-D a tet or a hex, so the dimension alone does not pick the
+    formula) and stopped reading ``dimension`` entirely, which is what quad/hex meshes need.
+
+    Both halves are asserted because both can regress in opposite directions: ``ds`` could lose its
+    guard, and ``volumes`` could have a dimension check re-added -- which would silently reject the
+    very connectivities the cell dispatch was introduced for. Its refusal for a genuinely unknown
+    cell is raised earlier, by ``mc_cells``, so the ``Unsupported cell type`` branch below it is not
+    reachable from here and is deliberately not asserted.
+    """
     with pytest.raises(ValueError, match="Unsupported dimension"):
-        MeshUtils.compute_nodal_volumes(bogus)
-    with pytest.raises(ValueError, match="Unsupported dimension"):
-        MeshUtils.compute_nodal_ds(bogus)
+        MeshUtils.compute_nodal_ds(dict(square, dimension=4))
+
+    vols = MeshUtils.compute_nodal_volumes(dict(square, dimension=4))  # nonsense dimension: ignored
+    assert np.all(vols >= 0.0)
+    assert np.isclose(vols.sum(), 1.0, rtol=1e-6)  # the fixture is the unit square
 
 
 # --------------------------------------------------------------------------------------------
