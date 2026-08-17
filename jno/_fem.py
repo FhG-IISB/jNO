@@ -3022,6 +3022,70 @@ def _build_periodic_reduction_nonnodal(domain: Any, ties: List[Any], offsets: An
     return {"blocks": blocks, "off_full": off_full, "off_red": off_red, "n_full": off_full[-1], "n_red": off_red[-1]}
 
 
+def _hanging_constraints(domain: Any, points: Any, cells: Any, order: int) -> dict:
+    """The hanging constraints for ONE field, in that field's own DOF space.
+
+    Built here rather than taken from ``domain._fem_hanging_nodes`` because the constraint set depends
+    on the element ORDER, which is only known once the form is assembled: the stashed set is the P1
+    vertex answer, used for the mesh's boundary derivation. At order 2 the *set itself* differs, not
+    only the weights -- see :func:`~jno.utils.solver.fem_refine.hanging_dofs`.
+    """
+    from .utils.solver.fem_refine import hanging_dofs
+
+    cell_type = getattr(domain, "_fem_hanging_cell_type", "quad")
+    order = int(order or 1)
+    if order > 1 and cell_type != "quad":
+        raise NotImplementedError(
+            f"jno.fem: local (hanging-node) refinement supports order {order} on quadrilaterals, but this "
+            "mesh is hexahedral. A hex's 2:1 interface also constrains DOFs lying on a FACE, which needs "
+            "that face's order-2 (9-node) basis rather than the edge basis this builds. Use order=1 on a "
+            "refined hex mesh, or refine uniformly (which stays conforming, so no constraint is needed)."
+        )
+    return hanging_dofs(
+        np.asarray(points),
+        np.asarray(cells),
+        np.asarray(domain.mesh.points)[:, : int(domain.dimension)],
+        np.asarray(getattr(domain, "_fem_hanging_cells")),
+        cell_type,
+        order,
+    )
+
+
+def _build_hanging_reduction_multifield(domain: Any, hang: dict, cells: Any, cell_type: str, offsets: Any) -> dict:
+    """Hanging-node reduction for a coupled (multi-field) problem: one block per field.
+
+    The same block structure :func:`_build_periodic_reduction_multifield` returns, and consumed by the
+    same helpers -- a coupled system reduces block-wise (``P_i^T A[i,j] P_j``) with no block-diagonal P
+    materialised. Every field lives on the one mesh, so they share the constraint SET; what differs is
+    the component count per field, so each gets its own P built at its own ``vec``.
+
+    A **complex** form arrives here too: jNO carries a complex field as two coupled real fields, so it
+    is a two-field problem by the time the reduction is built, and the real and imaginary blocks are
+    each constrained identically -- which is what the constraint means for a complex field.
+    """
+    from .utils.solver.fem_refine import hanging_prolongation
+
+    offs = [int(o) for o in offsets]
+    n_fields = len(offs) - 1
+    sizes = [offs[i + 1] - offs[i] for i in range(n_fields)]
+    pts_all = getattr(domain, "_fem_native_dof_points_all", None) or [np.asarray(domain.mesh.points)] * n_fields
+    cells_all = getattr(domain, "_fem_native_assembly_cells_all", None) or [cells] * n_fields
+    orders = getattr(domain, "_fem_native_field_orders", None) or [1] * n_fields
+
+    blocks, off_full, off_red = [], [0], [0]
+    for i in range(n_fields):
+        pts_i = np.asarray(pts_all[i])
+        vec_i = max(1, sizes[i] // int(pts_i.shape[0]))
+        hang_i = _hanging_constraints(domain, pts_i, cells_all[i], int(orders[i]))
+        red_i = hanging_prolongation(pts_i, cells, vec=vec_i, hang=hang_i, cell_type=cell_type)
+        blocks.append(
+            {"P": red_i["P"], "kept": red_i["kept_nodes"], "vec": red_i["vec"], "is_selection": red_i["is_selection"]}
+        )
+        off_full.append(off_full[-1] + int(red_i["P"].shape[0]))
+        off_red.append(off_red[-1] + int(red_i["P"].shape[1]))
+    return {"blocks": blocks, "off_full": off_full, "off_red": off_red, "n_full": off_full[-1], "n_red": off_red[-1]}
+
+
 def _build_periodic_reduction_multifield(
     domain: Any, ties: List[Any], points: Any, cells: Any, ele_order: int, offsets: Any
 ) -> dict:
@@ -4025,31 +4089,32 @@ def _fem_impl(
                     "interface composes two prolongations, and their order changes the answer. Refine "
                     "away from the tied faces, or tie a conforming mesh."
                 )
-            # The constraints are derived on the P1 VERTEX mesh -- a hanging node is an edge midpoint or
-            # a face centre of it -- so they only describe the whole space when the DOFs are those
-            # vertices. A P2 space adds edge and interior DOFs, and the ones on a coarse facet need that
-            # facet's QUADRATIC weights, which this does not build: the extra DOFs would simply stay
-            # free, leaving the interface discontinuous while every count still looked right. Measured
-            # before this guard, on -Lap u = 1 with the middle four cells refined: order 2 gave a centre
-            # value off by 9.1e-03, against 1.4e-03 for order 1 on the same mesh and 2.0e-05 for order 2
-            # on the mesh it was refined FROM -- i.e. refining made it worse, silently.
-            _n_vert = int(np.asarray(domain.mesh.points).shape[0])
-            if int(np.asarray(fem_obj.points).shape[0]) != _n_vert:
-                raise NotImplementedError(
-                    "jno.fem: local (hanging-node) refinement is wired for order-1 elements. This form "
-                    f"assembles {int(np.asarray(fem_obj.points).shape[0])} DOFs on a {_n_vert}-vertex mesh, "
-                    "so it carries DOFs that are not mesh vertices, and a hanging node's constraint is "
-                    "written in terms of vertices only -- the extra DOFs on a coarse facet would be left "
-                    "free and the solution discontinuous across the interface. Use order=1 on a refined "
-                    "mesh, or refine uniformly (which stays conforming, so no constraint is needed)."
+            _cells_h = np.asarray(getattr(domain, "_fem_hanging_cells"))
+            _ct_h = getattr(domain, "_fem_hanging_cell_type", "quad")
+            # the assembled connectivity and element order for THIS form -- the constraint set depends on
+            # the order, so it cannot be taken from the domain's stashed (P1) answer
+            _prob_h = getattr(fem_obj, "problem", None)
+            if _prob_h is not None:
+                _cells_a, _order_a = _assembly_cells(_prob_h)
+            else:
+                _cells_a = getattr(domain, "_fem_native_assembly_cells", None)
+                _order_a = int(getattr(domain, "_fem_native_assembly_order", 1))
+            if multifield:
+                # One block per field, exactly as the periodic reduction does. Every field lives on the
+                # same mesh, so they share the constraint SET, but each has its own component count --
+                # so each needs its own P and the blocks are concatenated. Handing a single field's P to
+                # a coupled system reached JAX as a bare shape error ("contracting dimensions ... (41,)
+                # and (82,)") naming neither the fields nor the refinement.
+                _hp = _build_hanging_reduction_multifield(domain, _hanging, _cells_h, _ct_h, fem_obj.offsets)
+            else:
+                _pts_h = np.asarray(fem_obj.points)
+                _hp = hanging_prolongation(
+                    _pts_h,
+                    _cells_h,
+                    vec=vec or 1,
+                    hang=_hanging_constraints(domain, _pts_h, _cells_a, _order_a),
+                    cell_type=_ct_h,
                 )
-            _hp = hanging_prolongation(
-                np.asarray(fem_obj.points),
-                np.asarray(getattr(domain, "_fem_hanging_cells")),
-                vec=vec or 1,
-                hang=_hanging,
-                cell_type=getattr(domain, "_fem_hanging_cell_type", "quad"),
-            )
             # Reduce the OPERATOR, not just record P: `reduce_op_periodic` is what turns the assembled
             # block into P^T A P. Setting `_periodic` alone leaves the raw non-conforming system in
             # place, and it still solves -- measured, -Lap u = 1 on a 4x4 grid with four cells refined

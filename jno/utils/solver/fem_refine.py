@@ -156,6 +156,90 @@ def hanging_nodes(points: np.ndarray, quads: np.ndarray, cell_type: str = "quad"
     return out
 
 
+def _lagrange_weights(ts, t: float) -> np.ndarray:
+    """The 1-D Lagrange basis through parameters ``ts``, evaluated at ``t``. Exact at any order."""
+    ts = np.asarray(ts, dtype=float)
+    w = np.ones(ts.shape[0], dtype=float)
+    for i in range(ts.shape[0]):
+        for j in range(ts.shape[0]):
+            if i != j:
+                w[i] *= (t - ts[j]) / (ts[i] - ts[j])
+    return w
+
+
+def hanging_dofs(
+    dof_points: np.ndarray,
+    assembly_cells: np.ndarray,
+    mesh_points: np.ndarray,
+    mesh_cells: np.ndarray,
+    cell_type: str = "quad",
+    order: int = 1,
+) -> Dict[int, List[Tuple[int, float]]]:
+    """Hanging constraints in **DOF** space, for a Lagrange space of any ``order``.
+
+    :func:`hanging_nodes` answers the same question for the P1 vertex mesh; this generalises it to the
+    space actually being assembled, which is what the constraint has to describe. The rule is the same
+    one, read at the right resolution: a cell spans a facet, so any DOF lying on that facet which is not
+    one of the cell's own is not free, and its value is the cell's own basis on that facet evaluated
+    where it sits.
+
+    On an edge that means: the cell's own DOFs sit at parameters ``k/order``, a 2:1 neighbour's sit at
+    ``k/(2*order)``, and the ones in between are constrained by the Lagrange basis through the cell's.
+    At order 1 that is the familiar midpoint tied to the two ends at 1/2 each; at order 2 the ends and
+    the cell's OWN midpoint carry the neighbour's quarter points at ``(0.375, -0.125, 0.75)`` and
+    ``(-0.125, 0.375, 0.75)``. The negative weights are real -- a quadratic through three points is not
+    a convex combination -- and a scheme that assumed positivity would be wrong here.
+
+    Order 2 changes *which* DOFs hang, not just their weights, which is why treating the P1 answer as
+    the P2 one is wrong in both directions. jNO shares one DOF per coordinate, so the fine side's vertex
+    at the coarse edge's midpoint **is** that edge's own order-2 DOF: free, not hanging. Constraining it
+    (and leaving the real hanging DOFs at the quarter points free) put the order-2 answer 458x further
+    from the truth than order 1 on the same mesh.
+    """
+    dof_points = np.asarray(dof_points, dtype=float)
+    mesh_points = np.asarray(mesh_points, dtype=float)
+    mesh_cells = np.asarray(mesh_cells, dtype=np.int64)
+    assembly_cells = np.asarray(assembly_cells, dtype=np.int64)
+    edges, faces = _cell_tables(cell_type)
+    order = int(order)
+    lut, q = _node_lookup(dof_points)
+
+    def _at(pos):
+        return lut.get(tuple(np.round(pos / q).astype(np.int64)))
+
+    out: Dict[int, List[Tuple[int, float]]] = {}
+    for c, cell in enumerate(mesh_cells):
+        own = set(int(x) for x in assembly_cells[c])
+        for a_loc, b_loc in edges:
+            A, B = mesh_points[cell[a_loc]], mesh_points[cell[b_loc]]
+            ts: List[float] = []
+            ids: List[int] = []
+            for k in range(order + 1):  # this cell's own DOFs along the edge
+                nid = _at(A + (k / order) * (B - A))
+                if nid is None or nid not in own:
+                    ids = []
+                    break
+                ts.append(k / order)
+                ids.append(int(nid))
+            if not ids:
+                continue
+            for k in range(1, 2 * order):  # a 2:1 neighbour's DOFs on the same edge
+                t = k / (2 * order)
+                if any(abs(t - tt) < 1e-12 for tt in ts):
+                    continue  # a parameter this cell already owns: shared, hence free
+                nid = _at(A + t * (B - A))
+                if nid is None or int(nid) in own:
+                    continue
+                w = _lagrange_weights(ts, t)
+                out[int(nid)] = [(ids[i], float(w[i])) for i in range(len(ids))]
+        for face in faces:  # 3-D face centres (order 1; higher order is refused by the caller)
+            fids = [int(cell[j]) for j in face]
+            nid = _at(mesh_points[fids].mean(axis=0))
+            if nid is not None and int(nid) not in own:
+                out[int(nid)] = [(i, 0.25) for i in fids]
+    return out
+
+
 def refine_domain(domain, marked, *, copy: bool = False):
     """Refine a quadrilateral or hexahedral domain's marked cells in place, keeping its geometry exactly.
 

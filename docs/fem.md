@@ -875,16 +875,28 @@ Through the slot, on the same 3-D problem: 125 → 216 nodes over three rounds w
 falling `5.2e-03 → 4.3e-03 → 3.6e-03`, and both hanging kinds present throughout with nothing chained.
 Before this, a hexahedral mesh had **no** h-adaptive path at all.
 
-**Limitations, measured.** A hanging node **on a tied or periodic interface** is refused by name: that
-composes two prolongations and their order changes the answer. **Steady problems only** — the transient
-driver carries state across each mesh change, and that transfer does not yet apply the hanging
-constraint, so it would be violated on the first step after a split; it refuses rather than drift.
-Simplex meshes refuse by name and should use `remesh`, whose mmg path is local already. Geometry is
-preserved exactly only for affine cells — a warped hexahedron's faces are non-planar, so a 0.06 warp on
-a 0.25 cell moves the total volume by 3.9e-04, shrinking as the mesh refines (the usual O(h²)
-straight-edge geometry error); the constraint weights stay exact regardless. The split is a Python loop
-over marked cells (27 lattice points each in 3-D), which suits the cell counts adaptivity produces and
-is not tuned for refining a whole large mesh at once.
+**What it composes with, measured.** Scalar and vector fields (`value_shape=(d,)`, constrained
+component by component), **coupled multifield** and **complex** problems (one prolongation block per
+field — a complex field is two coupled real fields, and both halves are constrained), 2-D and 3-D, and
+**order 2** on quadrilaterals. Order 2 needs the coarse edge's *quadratic* basis, and it changes which
+DOFs hang, not just their weights: jNO shares one DOF per coordinate, so the fine vertex at a coarse
+edge's midpoint **is** that edge's own order-2 DOF — free, not hanging — while the DOFs that do hang sit
+at the quarter points with weights `(0.375, −0.125, 0.75)`. Those negative weights are real; a quadratic
+through three points is not a convex combination. On `-Δu = 1`, refining at order 2 gives `1.16e-05`
+against `1.98e-05` for order 2 on the mesh it was refined from.
+
+**Limitations, measured.** Order 2 on **hexahedra** is refused: a hex's 2:1 interface also constrains
+DOFs lying on a *face*, needing that face's 9-node basis rather than the edge basis. A hanging node **on
+a tied or periodic interface** is refused — that composes two prolongations and their order changes the
+answer; it is reachable in 3-D only (along a 2-D boundary an edge belongs to one cell, so refining it
+makes its midpoint a real vertex and nothing hangs there). **Steady problems only** — the transient
+driver carries state across each mesh change, and that transfer does not apply the hanging constraint,
+so it would be violated on the first step after a split. Simplex meshes refuse by name and should use
+`remesh`. Geometry is preserved exactly only for affine cells — a warped hexahedron's faces are
+non-planar, so a 0.06 warp on a 0.25 cell moves the total volume by 3.9e-04, shrinking as the mesh
+refines (the usual O(h²) straight-edge error); the constraint weights stay exact regardless. The split
+is a Python loop over marked cells (27 lattice points each in 3-D), which suits the cell counts
+adaptivity produces and is not tuned for refining a whole large mesh at once.
 
 Volume terms, Dirichlet conditions and **surface terms all work on both cells** — Neumann, Robin
 and flux integrals included.

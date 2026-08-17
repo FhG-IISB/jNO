@@ -24,7 +24,7 @@ import pytest
 
 import jno
 from jno.utils.solver import fem_refine
-from jno.utils.solver.fem_refine import hanging_nodes, hanging_prolongation, refine_domain
+from jno.utils.solver.fem_refine import hanging_dofs, hanging_nodes, hanging_prolongation, refine_domain
 
 # -Lap u = 1 on the unit square, u = 0 on the boundary: the centre value of the classic series
 # solution, u(1/2,1/2) = (32/pi^3) sum_{k odd} (-1)^((k-1)/2) / (k^3 cosh(k pi / 2)).
@@ -50,6 +50,22 @@ def _mark_near(dom, centre, radius):
     p = np.asarray(dom.mesh.points)[:, :2]
     q = np.asarray(dom.mesh.cells_dict["quad"])
     return np.where(np.linalg.norm(p[q].mean(axis=1) - np.asarray(centre), axis=1) < radius)[0]
+
+
+def _refined_centre(n=4, radius=0.3):
+    d = _grid(n)
+    p = np.asarray(d.mesh.points)[:, :2]
+    q = np.asarray(d.mesh.cells_dict["quad"])
+    return refine_domain(d, np.where(np.linalg.norm(p[q].mean(axis=1) - 0.5, axis=1) < radius)[0])
+
+
+def _poisson_order(dom, order):
+    u, v = dom.fem_symbols(order=order)
+    xi, yi, _ = dom.variable("interior", split=True)
+    xb, yb, _ = dom.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0])
+    return np.asarray(fem.solve(linear=jno.solve.lu(backend="host"))).reshape(-1)
 
 
 def _poisson(dom, f=1.0):
@@ -292,33 +308,62 @@ def test_a_vector_field_is_constrained_component_by_component(x64):
             assert s[node, c] == pytest.approx(sum(w * s[i, c] for i, w in parents), abs=1e-12)
 
 
-def test_a_higher_order_space_is_refused_rather_than_left_unconstrained(x64):
-    """The silent one, guarded.
+def test_order_2_is_constrained_correctly_and_beats_the_mesh_it_refined(x64):
+    """Order 2 on a locally refined mesh, which needs the coarse edge's QUADRATIC basis.
 
-    Hanging constraints are derived on the P1 VERTEX mesh: a hanging node is an edge midpoint or a face
-    centre of it. A P2 space adds DOFs that are not vertices, and the ones lying on a coarse facet need
-    that facet's QUADRATIC weights -- which this does not build, so they would stay free and leave the
-    interface discontinuous while every count still looked right.
+    Order changes *which* DOFs hang, not only their weights, and getting that backwards is what made
+    this wrong in both directions. jNO shares one DOF per coordinate, so the fine side's vertex at the
+    coarse edge's midpoint IS that edge's own order-2 DOF -- free, not hanging -- while the DOFs that do
+    hang sit at the quarter points and were left unconstrained. Measured with the P1 answer reused at
+    order 2: centre off by 9.07e-03, i.e. 458x worse than order 1 on the same mesh.
 
-    Measured before the guard, on -Lap u = 1 with the middle four cells refined: order 2 came back with a
-    centre value off by 9.07e-03, against 1.39e-03 for order 1 on the same mesh, and 1.98e-05 for order 2
-    on the mesh it was refined FROM. Refining made it 458x worse, with no error.
+    With the constraints built in the field's own DOF space: 1.16e-05, which also beats order 2 on the
+    coarse mesh it was refined from (1.98e-05) -- the point of refining at all.
     """
-    d = _grid(4)
-    p = np.asarray(d.mesh.points)[:, :2]
-    q = np.asarray(d.mesh.cells_dict["quad"])
-    d = refine_domain(d, np.where(np.linalg.norm(p[q].mean(axis=1) - 0.5, axis=1) < 0.3)[0])
+    coarse_err = abs(_centre(_grid(4), _poisson_order(_grid(4), 2)) - POISSON_CENTRE)
 
+    d = _refined_centre()
+    sol = _poisson_order(d, 2)
+    pts = np.asarray(d._fem_native_dof_points)[:, :2]
+    got = float(sol[int(np.argmin(np.linalg.norm(pts - 0.5, axis=1)))])
+    assert abs(got - POISSON_CENTRE) < coarse_err, (
+        f"refining at order 2 did not beat the coarse mesh ({abs(got - POISSON_CENTRE):.2e} vs {coarse_err:.2e})"
+    )
+
+    hd = hanging_dofs(
+        pts,
+        np.asarray(d._fem_native_assembly_cells),
+        np.asarray(d.mesh.points)[:, :2],
+        np.asarray(d._fem_hanging_cells),
+        "quad",
+        2,
+    )
+    assert len(hd) > len(d._fem_hanging_nodes), "order 2 must constrain MORE DOFs than the vertex answer"
+    assert {len(p) for p in hd.values()} == {3}, "an order-2 edge constraint has 3 parents"
+    # the quadratic weights are not a convex combination -- a scheme assuming positivity would be wrong
+    assert min(w for par in hd.values() for _, w in par) < 0.0
+    for k, parents in hd.items():
+        assert sum(w for _, w in parents) == pytest.approx(1.0, abs=1e-12)
+        assert sol[k] == pytest.approx(sum(w * sol[i] for i, w in parents), abs=1e-10)
+
+
+def test_order_2_on_a_refined_HEX_mesh_is_refused_by_name(x64):
+    """A hex's 2:1 interface also constrains DOFs lying on a FACE, which needs that face's order-2
+    (9-node) basis rather than the edge basis. Refused rather than left partly constrained."""
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1).structured(n=2).quad().domain(compute_mesh_connectivity=False)
+    d = refine_domain(d, [0])
     u, v = d.fem_symbols(order=2)
-    xi, yi, _ = d.variable("interior", split=True)
-    xb, yb, _ = d.variable("boundary", split=True)
-    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
-    with pytest.raises(NotImplementedError, match="order-1 elements"):
-        jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0]).solve(linear=jno.solve.lu(backend="host"))
+    xi, yi, zi = d.variable("interior", split=True)[:3]
+    xb, yb, zb = d.variable("boundary", split=True)[:3]
+    ui, vi = u.bind(x=xi, y=yi, z=zi), v.bind(x=xi, y=yi, z=zi)
+    with pytest.raises(NotImplementedError, match="hexahedral"):
+        jno.fem([ui.x * vi.x + ui.y * vi.y + ui.z * vi.z - 1.0 * vi, u(xb, yb, zb) - 0.0]).solve(
+            linear=jno.solve.lu(backend="host")
+        )
 
 
 def test_order_2_still_works_on_a_uniformly_refined_mesh(x64):
-    """The guard must not over-reach: refining EVERY cell stays conforming, so there are no hanging
+    """Refining EVERY cell stays conforming, so there are no hanging
     nodes and a P2 space is perfectly fine on the result."""
     d = refine_domain(_grid(4), np.arange(16))
     assert d._fem_hanging_nodes == {}
@@ -331,3 +376,89 @@ def test_order_2_still_works_on_a_uniformly_refined_mesh(x64):
     pts = np.asarray(fem.points)[:, :2]
     centre = float(sol[int(np.argmin(np.linalg.norm(pts - 0.5, axis=1)))])
     assert abs(centre - POISSON_CENTRE) < 1e-4, f"P2 on a uniformly refined mesh should be accurate, got {centre}"
+
+
+# --------------------------------------------------------------- the field types that share a mesh
+
+
+def _field_major(sol, n, k):
+    """Coupled blocks are concatenated per FIELD; a vector field is node-major. Reading one as the
+    other silently reports a violated constraint on a correct solution — which is how this was first
+    misdiagnosed."""
+    return np.asarray(sol).reshape(-1).reshape(k, n).T
+
+
+def test_a_coupled_two_field_problem_constrains_both_fields(x64):
+    """A coupled system reduces block-wise, so it needs one P per FIELD. Handing it a single field's P
+    reached JAX as a bare shape error -- "contracting dimensions ... (41,) and (82,)" -- naming neither
+    the fields nor the refinement."""
+    d = _refined_centre()
+    n = len(np.asarray(d.mesh.points))
+    T, q = d.fem_symbols(names=("T", "q"))
+    c, p = d.fem_symbols(names=("c", "p"))
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    Ti, qi = T.bind(x=xi, y=yi), q.bind(x=xi, y=yi)
+    ci, pi = c.bind(x=xi, y=yi), p.bind(x=xi, y=yi)
+    fem = jno.fem(
+        [
+            Ti.x * qi.x + Ti.y * qi.y - ci * qi,  # T driven by c
+            ci.x * pi.x + ci.y * pi.y - 1.0 * pi,
+            T(xb, yb) - 0.0,
+            c(xb, yb) - 0.0,
+        ]
+    )
+    sol = np.asarray(fem.solve(linear=jno.solve.lu(backend="host"))).reshape(-1)
+    assert sol.size == 2 * n
+    s = _field_major(sol, n, 2)
+    assert np.abs(s).max() > 1e-6, "both fields are zero; the test would pass vacuously"
+    for node, parents in d._fem_hanging_nodes.items():
+        for f in range(2):
+            assert s[node, f] == pytest.approx(sum(w * s[i, f] for i, w in parents), abs=1e-12)
+
+
+def test_a_complex_field_constrains_both_its_real_and_imaginary_parts(x64):
+    """jNO carries a complex field as two coupled real fields, so it arrives at the reduction as a
+    two-field problem and rides the same per-field blocks. Both halves must satisfy the constraint,
+    which is what the relation means for a complex field."""
+    d = _refined_centre()
+    n = len(np.asarray(d.mesh.points))
+    u, w = d.fem_symbols(complex=True)
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, wi = u.bind(x=xi, y=yi), w.bind(x=xi, y=yi)
+    weak = ui.x * wi.x + ui.y * wi.y - 4.0 * ui * wi - (1.0 + 0.5j) * wi
+    fem = jno.fem([weak.real, u.real(xb, yb) - 0.0, u.imag(xb, yb) - 0.0])
+    sol = np.asarray(fem.solve(linear=jno.solve.lu(backend="host"))).reshape(-1)
+    assert sol.size == 2 * n
+    s = _field_major(sol, n, 2)
+    # a genuinely complex source: neither half may be trivial, or half the assertion is vacuous
+    assert np.abs(s[:, 0]).max() > 1e-6 and np.abs(s[:, 1]).max() > 1e-6
+    for node, parents in d._fem_hanging_nodes.items():
+        for part in range(2):
+            assert s[node, part] == pytest.approx(sum(w * s[i, part] for i, w in parents), abs=1e-12)
+
+
+def test_a_3d_vector_field_is_constrained_on_a_refined_hex_mesh(x64):
+    """vec = 3 on hexes: the Kronecker expansion again, in the dimension where both hanging kinds
+    (edge midpoints and face centres) occur at once."""
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1).structured(n=4).quad().domain(compute_mesh_connectivity=False)
+    p = np.asarray(d.mesh.points)[:, :3]
+    h = np.asarray(d.mesh.cells_dict["hexahedron"])
+    d = refine_domain(d, np.where(np.linalg.norm(p[h].mean(axis=1) - 0.5, axis=1) < 0.3)[0])
+    n = len(np.asarray(d.mesh.points))
+
+    u, v = d.fem_symbols(value_shape=(3,))
+    cs = d.variable("interior", split=True)[:3]
+    bs = d.variable("boundary", split=True)[:3]
+    gu, gv = jno.np.grad(u, list(cs)), jno.np.grad(v, list(cs))
+    vv = v.bind(x=cs[0], y=cs[1], z=cs[2])
+    fem = jno.fem([jno.np.inner(gu, gv, n_contract=2) - 1.0 * vv[2], u(*bs) - 0.0])
+    sol = np.asarray(fem.solve(linear=jno.solve.lu(backend="host"))).reshape(-1)
+    assert sol.size == 3 * n
+    s = sol.reshape(n, 3)  # vector fields are node-major
+    assert np.abs(s).max() > 1e-6
+    assert {len(par) for par in d._fem_hanging_nodes.values()} == {2, 4}
+    for node, parents in d._fem_hanging_nodes.items():
+        for comp in range(3):
+            assert s[node, comp] == pytest.approx(sum(w * s[i, comp] for i, w in parents), abs=1e-12)
