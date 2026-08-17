@@ -2632,6 +2632,45 @@ def _periodic_tie_spec(constraint: Any, domain: Any) -> Optional[Tuple[str, str,
     return (main_tag, secondary_tag, None, _field_key_of(constraint), phase)
 
 
+@functools.lru_cache(maxsize=None)
+def _facet_perimeter_order(nfv: int) -> Tuple[int, ...]:
+    """Local vertex indices putting a facet's vertices in PERIMETER (cyclic) order.
+
+    A triangular facet is already cyclic under basix's ordering, so this is the identity for it.
+    A **quadrilateral** facet is not: basix lists a hexahedron face's vertices in TENSOR order --
+    ``(0,0), (1,0), (0,1), (1,1)`` -- so walking consecutive pairs as a cycle gives
+    ``[edge, DIAGONAL, edge, DIAGONAL]`` on every one of the six faces.
+
+    Consuming that as a perimeter had two consequences, both silent: the edge walk in
+    :func:`_ref_interior_facet_dofs` covered only two of the four real edges, dropping the
+    edge-interior DOFs of the other two from the facet table; and the face-interior test took
+    ``fv[-1] - fv[0]`` -- a diagonal -- as its second in-plane basis vector. Since
+    ``_boundary_node_ids`` resolves an essential condition through that table, the dropped DOFs were
+    simply never constrained: measured at **2 of 98** boundary DOFs on an order-2 hex cube (n=2), 3
+    of 218 at n=3, always on one edge, with tetrahedra unaffected. It only surfaced when the
+    prescribed value varied normal to the two faces meeting at that edge (``g = x`` failed,
+    ``g = z``/``x*y``/const passed), which made the order-2 space look as though it reproduced
+    quadratics but not linears.
+
+    Derived from basix's own quadrilateral edge list rather than hardcoded, so it follows the
+    convention instead of restating it.
+    """
+    if nfv != 4:
+        return tuple(range(nfv))
+    import basix as _basix
+
+    from .utils.solver.fem_lagrange import basix_cell
+
+    adj: dict = {i: [] for i in range(nfv)}
+    for a, b in _basix.topology(basix_cell("quadrilateral")[0])[1]:  # the quad's REAL edges
+        adj[int(a)].append(int(b))
+        adj[int(b)].append(int(a))
+    walk = [0, adj[0][0]]
+    while len(walk) < nfv:  # follow the edge cycle, never stepping back the way we came
+        walk.append(next(v for v in adj[walk[-1]] if v != walk[-2]))
+    return tuple(walk)
+
+
 def _ref_interior_facet_dofs(
     ref_pts: np.ndarray, fv: np.ndarray, dim: int, tol: float = 1e-9, ncorner_override: int = 0
 ) -> List[int]:
@@ -2646,10 +2685,13 @@ def _ref_interior_facet_dofs(
     ncorner = int(ncorner_override) if ncorner_override else dim + 1
     cand = list(range(ncorner, len(ref_pts)))
     # The facet's own edges, walked cyclically. A 2-D facet is a single edge; a 3-D facet is a
-    # triangle (3 edges) or -- on a hexahedron -- a QUADRILATERAL (4). `fv` arrives in perimeter
-    # order, so the cycle is simply consecutive pairs.
+    # triangle (3 edges) or -- on a hexahedron -- a QUADRILATERAL (4). `fv` does NOT arrive in
+    # perimeter order for the quadrilateral (basix gives tensor order), so reorder it first; for a
+    # triangle `_facet_perimeter_order` is the identity and this is a no-op. See that function for
+    # what walking the tensor order as a cycle silently cost.
     nfv = len(fv)
-    edges = [(fv[0], fv[1])] if dim == 2 else [(fv[i], fv[(i + 1) % nfv]) for i in range(nfv)]
+    fvp = fv[list(_facet_perimeter_order(nfv))]
+    edges = [(fv[0], fv[1])] if dim == 2 else [(fvp[i], fvp[(i + 1) % nfv]) for i in range(nfv)]
     ordered: List[int] = []
     used: set = set()
     for a, b in edges:
@@ -2666,18 +2708,19 @@ def _ref_interior_facet_dofs(
             ordered.append(d)
             used.add(d)
     if dim == 3:  # face-interior nodes: on the facet plane, strictly inside it, not on one of its edges
-        a = fv[0]
+        a = fvp[0]
         # Two in-plane directions. For a triangle they are its two edges from `a`; for a quadrilateral
         # facet (perimeter order a, b, c, d) they are the two edges a->b and a->d, and the containment
         # test is the unit SQUARE rather than `s + t <= 1` -- a triangle test would reject half the
-        # face, dropping its interior node.
+        # face, dropping its interior node. Both read from the PERIMETER order: under basix's tensor
+        # order `fv[-1] - a` is the face DIAGONAL, not an in-plane edge direction at all.
         if nfv == 3:
-            M = np.stack([fv[1] - a, fv[2] - a], axis=1)  # (3, 2)
+            M = np.stack([fvp[1] - a, fvp[2] - a], axis=1)  # (3, 2)
 
             def _inside(s, t):
                 return min(s, t, 1.0 - s - t) >= -tol
         else:
-            M = np.stack([fv[1] - a, fv[-1] - a], axis=1)
+            M = np.stack([fvp[1] - a, fvp[-1] - a], axis=1)
 
             def _inside(s, t):
                 return min(s, t, 1.0 - s, 1.0 - t) >= -tol
