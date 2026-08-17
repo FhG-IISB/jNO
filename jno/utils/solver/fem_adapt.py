@@ -2107,6 +2107,22 @@ class AdaptSpec:
     rather than on an error estimate. Marking (``theta``), sizing (``refine_factor``) and the remesh
     mechanism are unchanged, so a criterion composes with everything else on this spec.
     """
+    split: bool = False
+    """Switch the h-adaptive loop from **remeshing** to **local refinement with hanging nodes**: split
+    each marked cell into 4 (a quadrilateral) or 8 (a hexahedron) rather than rebuilding the mesh at a
+    finer size field. What :func:`jno.solve.refine` sets.
+
+    A different algorithm, not a setting on the same one. Remeshing re-runs the mesher, so it needs a
+    geometry to rebuild from and produces a mesh that does not nest inside the old one; splitting needs
+    neither, works on a mesh loaded from a file, and keeps every existing node and its value. For
+    **hexahedra it is the only option** -- no general all-hex mesher exists, so there is nothing to
+    remesh to.
+
+    The price is that the mesh stops being conforming, and the nodes left hanging on a coarse facet are
+    constrained to it (:mod:`jno.utils.solver.fem_refine`). ``theta``, ``criterion``, ``max_iters``,
+    ``max_dofs``, ``tol`` and ``eps`` all mean exactly what they do for remeshing; ``refine_factor``
+    does not apply, because a split halves the cell by construction.
+    """
     # --- r-adaptivity (mesh relocation) --------------------------------------------------------------
     relocate: bool = False
     """Switch ``FEM.solve(adapt=...)`` from h-refinement (add elements) to **r-adaptivity**: relocate the
@@ -2220,6 +2236,12 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
 
     if fem._constraints is None:
         raise ValueError("FEM.solve(adapt=...) requires a FEM built by jno.fem(...) (its constraint list is retained).")
+    if spec.split and spec.anisotropic:
+        raise NotImplementedError(
+            "jno.solve.refine() splits cells isotropically -- a quadrilateral into 4, a hexahedron into 8 "
+            "-- so there is no direction for an anisotropic metric to stretch them along. Use "
+            "jno.solve.remesh(anisotropic=True) on a simplex mesh for directional adaptation."
+        )
 
     d = fem.domain
     cons = fem._constraints
@@ -2277,7 +2299,14 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
         if last or below_tol or over_budget or plateaued or nothing_marked:
             break
 
-        if spec.anisotropic:
+        if spec.split:
+            # Local refinement: split the marked cells and constrain the hanging nodes. No mesher, so
+            # this is the branch a hexahedral mesh takes (there is nothing to remesh it to) and the one
+            # that works on a mesh with no `Shape` plan behind it.
+            from .fem_refine import refine_domain
+
+            refine_domain(d, marked, copy=False)
+        elif spec.anisotropic:
             if np.iscomplexobj(u):
                 raise NotImplementedError(
                     "anisotropic (Hessian-metric) adaptation is real-only; use isotropic ZZ "

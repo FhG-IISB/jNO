@@ -1696,6 +1696,17 @@ class FEM:
                 )
             from .utils.solver.fem_adapt import run_adaptive_solve, run_adaptive_transient
 
+            if getattr(adapt, "split", False) and self._mode == "transient":
+                # The transient driver carries state across each remesh by basis-aware transfer into a
+                # FREE nodal space; a refined mesh's hanging DOFs are not free, so the transferred state
+                # would violate the constraint the very first step after a split.
+                raise NotImplementedError(
+                    "jno.solve.refine() is wired on the steady adaptive loop; this problem is transient. "
+                    "The transient driver transfers the state across each mesh change, and that transfer "
+                    "does not yet apply the hanging-node constraint, so the carried state would break it "
+                    "on the first step. Use jno.solve.remesh() on a simplex mesh for transient "
+                    "h-adaptivity, or refine once up front and march on the fixed refined mesh."
+                )
             if self._mode == "transient":
                 # Adapt the mesh AS the problem marches: remesh every `adapt.every` steps and carry the
                 # state across (basis-aware transfer), tracking a moving feature. A fused COMPLEX

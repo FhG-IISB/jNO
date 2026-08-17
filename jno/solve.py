@@ -64,6 +64,7 @@ __all__ = [
     "exponential",
     "adaptive",
     "remesh",
+    "refine",
     "relocate",
 ]
 
@@ -969,6 +970,69 @@ def remesh(
         every=every,
         metric_field=metric_field,
         criterion=criterion,
+    )
+
+
+def refine(
+    *,
+    criterion: Any = None,
+    theta: float = 0.5,
+    max_iters: int = 8,
+    max_dofs: int | None = None,
+    tol: float | None = None,
+    eps: float | None = None,
+    metric_field: int = 0,
+) -> AdaptSpec:
+    """**h-adaptivity by local refinement** for ``fem.solve(adapt=...)``: split the marked cells.
+
+    Beside :func:`remesh` rather than a flag on it, because it is a different algorithm. ``remesh``
+    rebuilds the mesh at a finer size field, so it needs a geometry to rebuild from and returns a mesh
+    that does not nest inside the old one. ``refine`` splits each marked cell into 4 (a quadrilateral)
+    or 8 (a hexahedron): local, needs no mesher, works on a mesh loaded from a file, and every existing
+    node survives with its value::
+
+        d = jno.Shape.rect(0, 0, 1, 1).quad().structured(n=8).domain()
+        u = fem.solve(adapt=jno.solve.refine(theta=0.4, max_iters=4))
+
+        d = jno.Shape.box(0, 0, 0, 1, 1, 1).structured(n=4).quad().domain()   # hexes
+        u = fem.solve(adapt=jno.solve.refine(criterion=jno.np.abs(ui.x)))     # composes with a criterion
+
+    **For hexahedra this is the only h-adaptivity there is.** No general all-hex mesher exists -- gmsh's
+    ``Recombine3DAll`` on a plain box returns tetrahedra and no hexahedra -- so ``remesh`` has nothing
+    to remesh *to* and refuses by name.
+
+    The price is that the mesh stops being conforming: a split cell's edge midpoint is not a vertex of
+    its unrefined neighbour, so its value is not free. Such **hanging nodes** are constrained to the
+    coarse facet they lie on, ``u = sum_i w_i u_parent_i`` -- the same relation a periodic tie and a
+    mortar coupling impose, and carried by the same prolongation. Neighbours are kept within one
+    refinement level (a 2:1 balance), so no constrained node ever has a constrained parent.
+
+    ``theta`` (Dörfler marking), ``criterion``, ``max_iters``, ``max_dofs``, ``tol`` and ``eps`` mean
+    exactly what they do on :func:`remesh`. There is no ``refine_factor``: a split halves the cell by
+    construction. There is no ``anisotropic``: the split is isotropic, so there is no direction to
+    stretch along -- that needs a simplex mesh and ``remesh(anisotropic=True)``.
+
+    **Limitations, measured.** Quadrilateral and hexahedral meshes only; a simplex mesh refuses by name
+    and should use :func:`remesh`, whose mmg path is local already. A hanging node landing on a tied or
+    periodic interface is refused rather than composed. Steady problems only -- the transient driver
+    transfers state across a remesh, and that path does not yet carry a constraint set. Geometry is
+    exact for affine cells; a warped hexahedron's faces are non-planar, so refining it moves the volume
+    by an O(h^2) amount (measured: 3.9e-04 for a 0.06 warp on a 0.25 cell).
+
+    Returns:
+        AdaptSpec: The adaptation spec to pass as ``fem.solve(adapt=...)``.
+    """
+    from .utils.solver.fem_adapt import AdaptSpec
+
+    return AdaptSpec(
+        split=True,
+        criterion=criterion,
+        theta=theta,
+        max_iters=max_iters,
+        max_dofs=max_dofs,
+        tol=tol,
+        eps=eps,
+        metric_field=metric_field,
     )
 
 

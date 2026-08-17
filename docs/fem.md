@@ -799,14 +799,20 @@ The price is conformity: a split cell's edge midpoint is not a vertex of its unr
 that node's value is not free. It is a **hanging node**, constrained to the coarse edge it lies on:
 
 ```python
-from jno.utils.solver.fem_refine import refine_domain
-
-d = jno.Shape.rect(0, 0, 1, 1).quad().structured(n=4).domain()
-d = refine_domain(d, marked_cell_ids)     # split, 2:1 balance, detect the hanging nodes
-u, v = d.fem_symbols()
-...
-fem.solve()                                # the constraint is applied automatically
+u = fem.solve(adapt=jno.solve.refine(theta=0.4, max_iters=4))       # ZZ-driven, like remesh()
+u = fem.solve(adapt=jno.solve.refine(criterion=jno.np.abs(ui.x)))   # or on a traced criterion
 ```
+
+`refine` sits beside `remesh` rather than being a flag on it, because it is a different algorithm:
+`remesh` re-runs the mesher at a finer size field (needs a geometry to rebuild from, and the new mesh
+does not nest inside the old), while `refine` splits marked cells (local, keeps every node and its
+value, works on a mesh loaded from a file). Marking is shared — `theta`, `criterion`, `max_iters`,
+`max_dofs`, `tol`, `eps` all mean the same thing. There is no `refine_factor` (a split halves the cell
+by construction) and no `anisotropic` (a split is isotropic, so there is no direction to stretch along;
+that needs a simplex mesh).
+
+To refine a specific set of cells outside the loop, call `refine_domain(domain, cell_ids)` from
+`jno.utils.solver.fem_refine` — the loop is a marking strategy on top of it.
 
 `u_hanging = Σᵢ wᵢ u_parentᵢ` is the same relation a periodic tie and a mortar coupling impose, so it
 rides the **same prolongation** (`prolongation_from_ties`) and reaches `reduce_matrix_periodic` and the
@@ -838,7 +844,8 @@ a hex mesh has, for the reason in the scope table above: there is no all-hex mes
 
 ```python
 d = jno.Shape.box(0, 0, 0, 1, 1, 1).structured(n=4).quad().domain()   # .quad() on a 3-D lattice = hexes
-d = refine_domain(d, marked_cell_ids)
+...
+u = fem.solve(adapt=jno.solve.refine(theta=0.4, max_iters=3))         # the same slot, in 3-D
 ```
 
 3-D adds a **second kind of constrained node**. A 2:1 face interface leaves the coarse face's four edge
@@ -864,14 +871,20 @@ edges are shared with unrefined neighbours). Only a node with as many parents as
 — a face *centre* — proves a facet was covered. Treating every hanging node as proof of interiority
 deleted 9 faces of the cube's own surface: 96 where the answer is 105.
 
+Through the slot, on the same 3-D problem: 125 → 216 nodes over three rounds with the ZZ estimate
+falling `5.2e-03 → 4.3e-03 → 3.6e-03`, and both hanging kinds present throughout with nothing chained.
+Before this, a hexahedral mesh had **no** h-adaptive path at all.
+
 **Limitations, measured.** A hanging node **on a tied or periodic interface** is refused by name: that
-composes two prolongations and their order changes the answer. Geometry is preserved exactly only for
-affine cells — a warped hexahedron's faces are non-planar, so a 0.06 warp on a 0.25 cell moves the total
-volume by 3.9e-04, shrinking as the mesh refines (the usual O(h²) straight-edge geometry error); the
-constraint weights stay exact regardless. Not yet exposed as an `adapt=` slot — `refine_domain` is
-called directly, so the marking is the caller's. The split is a Python loop over marked cells (27
-lattice points each in 3-D), which is fine for the cell counts adaptivity produces and is not tuned for
-refining a whole large mesh at once.
+composes two prolongations and their order changes the answer. **Steady problems only** — the transient
+driver carries state across each mesh change, and that transfer does not yet apply the hanging
+constraint, so it would be violated on the first step after a split; it refuses rather than drift.
+Simplex meshes refuse by name and should use `remesh`, whose mmg path is local already. Geometry is
+preserved exactly only for affine cells — a warped hexahedron's faces are non-planar, so a 0.06 warp on
+a 0.25 cell moves the total volume by 3.9e-04, shrinking as the mesh refines (the usual O(h²)
+straight-edge geometry error); the constraint weights stay exact regardless. The split is a Python loop
+over marked cells (27 lattice points each in 3-D), which suits the cell counts adaptivity produces and
+is not tuned for refining a whole large mesh at once.
 
 Volume terms, Dirichlet conditions and **surface terms all work on both cells** — Neumann, Robin
 and flux integrals included.
