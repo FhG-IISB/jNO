@@ -56,8 +56,82 @@ Vector-calculus helpers live on `jnn`: `jnn.jacobian`, `jnn.divergence`, `jnn.cu
 | `"finite_difference"` | ✅ | ✅ | Area-weighted; general unstructured meshes |
 | `"finite_difference:lsq"` / `:uniform` / `:inverse_distance"` | ✅ | ✅ | Least-squares / uniform / distance-weighted |
 | `"finite_difference:cotangent"` | — | ✅ | Cotangent Laplacian; **2D only** |
+| `"spectral"` | ✅ | ✅ | FFT along the grid axes; **uniform grid**, assumes periodicity |
+| `"spectral:cosine"` | ✅ | ✅ | Even extension instead — for fields with `u' = 0` at both ends |
 
-Set a project-wide default with `jno.setup(__file__, diff_type="forward", hessian_type="fwd-over-fwd")`.
+Set a project-wide default with `jno.setup(__file__, diff_type="spectral")` — `diff_type` takes
+either a whole scheme or an AD sub-mode (`"forward"` / `"reverse"`, its original meaning). A
+per-call `scheme=` always overrides it, which is how one term keeps finite differences while the
+run is spectral.
+
+#### Spectral differentiation
+
+On a uniform grid the derivative is a multiply in Fourier space, which is **exact** for a
+band-limited field rather than merely high order. Measured against the analytic result on a 17×17
+grid, same field, same grid:
+
+| | `d u/dx` | `∇²u` |
+|---|---|---|
+| `"spectral"` | `1.11e-14` | `9.10e-13` |
+| `"finite_difference"` | `1.60e-01` | `5.24e+01` |
+
+It also reaches where automatic differentiation **cannot**. An operator fed a *stored* field has no
+path from `x` to its output, so `u.laplacian(x, y)` under AD is identically `0.0` — and a physics
+residual built on it is silently satisfied by any network at all. Both `"finite_difference"` and
+`"spectral"` work on the field's *values* instead and give a real derivative there; spectral is the
+accurate one when the field is periodic and band-limited, which is the regime an FNO already
+assumes. So the choice for a PINO residual is between those two, and AD is simply wrong:
+
+```python
+jno.setup(__file__, diff_type="spectral")
+
+d = jno.Shape.rect(0, 0, 1, 1, size=1/24).domain(structured=True)
+x, y, _ = d.variable("interior")
+d.variable("_f", forcing)
+_f = d.variable("_f")
+
+u   = net(_f).scalar.bind(x=x, y=y)
+res = u.xx + u.yy + _f                      # −∇²u = f, from physics alone
+crux = jno.core([res.mse])
+```
+
+The full Hessian is exactly symmetric (`|H_xy − H_yx| = 0`), because the multiplier `−k_a k_b` is
+symmetric in `(a, b)` — the two components are the same computation. A Laplacian takes one forward
+transform for all its terms, halving the transforms against separate per-axis second derivatives.
+
+!!! warning "Periodicity is your claim, and the grid must be uniform"
+
+    `"spectral"` assumes the field is periodic along every differentiated axis. On a non-periodic
+    field the implied extension has a jump and the derivative rings (Gibbs) — plausible-looking
+    numbers that are simply wrong. jNO does **not** check this: the only per-axis periodic flag it
+    records is a residue of whether a periodic FDM problem happened to be built earlier in the
+    process, so it is not a statement about your geometry.
+
+    `"spectral:cosine"` mirrors the field instead, and is exact when the **odd derivatives vanish at
+    both ends** (Neumann-like). That is narrower than "non-periodic": a ramp has `u' ≠ 0` at the
+    ends, so its mirrored extension has a kink and still rings — better by ~44×, but still `O(1)`.
+
+    Both need a **uniform** grid: `jno.Shape.rect(...).domain(structured=True)`, or any domain
+    carrying `_grid_shape`. Non-uniform spacing and unstructured meshes raise rather than guess.
+
+**Choose the scheme per direction.** `jno.fdm` gets the spectral backend with no wiring, but it is
+not a blanket upgrade — a residual usually has different boundary behaviour along different axes.
+On `−∇²u = 5π² sin(2πx) sin(πy)`, periodic in `x` and Dirichlet in `y`:
+
+```python
+res = -ui.d2(x, scheme="spectral") - ui.d2(y) - f     # exact basis in x, stencil in y
+```
+
+| | rel-L2 |
+|---|---|
+| finite differences in both | `1.96e-02` |
+| spectral in both | `2.83e-02` |
+| **spectral in `x`, finite differences in `y`** | **`1.14e-03`** |
+
+Spectral applied to the Dirichlet direction gives back more than it gains, because `u′ ≠ 0` at those
+ends. Applied only where the geometry is genuinely periodic it is 17× better than the stencil
+everywhere. (For a Dirichlet direction the natural basis is a *sine* transform; JAX provides only
+DCT-2 and no DST, so that variant does not exist.)
 
 **Spell the Laplacian however reads best.** `u.xx + u.yy`, `u.d2(x) + u.d2(y)` and
 `u.laplacian(x, y)` describe the same operator, and `jno.core` compiles all three to the same
@@ -132,6 +206,20 @@ Every view supports `.bind(**named_vars)` (alias `.partials(...)`) to attach the
 a field depends on, so attribute-style derivatives (`.x`, `.t`) work even when those coordinates are not
 the network's own inputs.
 
+**Re-binding.** `.bind(...)` may be called on an already-bound view: names merge, and a name given
+again wins. That is how you resolve the conflict `u.bind(x=x1) + v.bind(x=x2)` raises — arithmetic
+refuses to pick a side, so you say which one explicitly.
+
+```python
+u = net(f).scalar.bind(x=x)
+u = u.bind(y=y)          # keeps x, adds y
+u = u.bind(x=x_other)    # overrides x, keeps y
+```
+
+A re-bind returns the **same** view class it was called on, so a `.field` view keeps its
+finite-difference derivatives rather than silently reverting to automatic differentiation (which
+would be identically zero for an operator network that never takes `x` / `y` as inputs).
+
 ### Units & non-dimensionalization
 
 Annotate the **dimension** and characteristic **magnitude** of any leaf, and `jno.units` audits
@@ -188,6 +276,44 @@ or turn an expensive quantity into a constant regulariser:
 J_sg    = u.grad(u_net).stop_gradient      # treat the current Jacobian as a constant
 ntk_reg = (J_sg @ J_sg.T - target_K).mse
 ```
+
+### Stochastic terms — `jno.noise`
+
+Noise nodes are ordinary trace expressions that draw a **fresh realisation every training step**,
+derived from the solver's step key, so a run is reproducible from the global seed with no key
+management. Under `crux.eval()` (no key) they evaluate to zeros, so post-training evaluation stays
+deterministic.
+
+```python
+u_noisy = net(x) - (u_obs + jno.noise.gaussian(std=0.01))   # (N, 1) — noisy observations
+uv      = net(x, y) + jno.noise.gaussian(std=0.01, ndim=2)  # (N, 2) — vector noise
+xj      = net(x + jno.noise.uniform(low=-1e-3, high=1e-3))  # jittered input coordinate
+```
+
+`gaussian`, `uniform` and `laplace` are **pointwise** — each point draws independently. `grf` is
+not: it is a **spatially correlated** Gaussian random field, so it is an input *function* rather
+than a perturbation. That is what makes operator learning possible with no dataset at all — a fresh
+in-distribution input every step:
+
+```python
+f = jno.noise.grf(x, y, length_scale=0.1)        # Matern-3/2 by default
+u = net(f).scalar.bind(x=x, y=y)
+crux = jno.core([(u.laplacian(x, y) + f).mse])
+```
+
+Built by spectral representation (Shinozuka & Deodatis 1991; Rahimi & Recht 2007), with the Matern
+spectral density from Rasmussen & Williams §4.2. Knobs: `length_scale`, `variance`, `kernel`
+(`"matern"` / `"rbf"`), `nu`, `modes`, `ndim`.
+
+!!! note "An approximate GP sample, and it costs memory"
+
+    Exact only as `modes → ∞`; the covariance error is `O(M^{-1/2})`, so the default `modes=256`
+    is ~6%. Exact circulant embedding needs a regular grid, whereas the evaluator sees a flat point
+    cloud — hence the spectral method. Cost is `O(B × N × M)` inside the batch vmap, so raise
+    `modes` knowingly.
+
+    Like every noise node, one realisation is shared across the timesteps of a single window
+    (the step key is not split per timestep), and it does vary across batch samples.
 
 ### Parameter Jacobian & the Neural Tangent Kernel
 

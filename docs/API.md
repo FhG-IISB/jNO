@@ -157,6 +157,8 @@ Every differential operator (`.d`, `.diff`, `.d2`, `.dd`, `.laplacian`,
 | `"automatic_differentiation:rev-over-rev"` | second-order `jacrev(jacrev(f))` |
 | `"automatic_differentiation:rev-over-fwd"` | second-order `jacrev(jacfwd(f))` |
 | `"finite_difference"` | central-difference stencils on mesh (with `:lsq` / `:uniform` / `:inverse_distance` / `:cotangent` sub-schemes) |
+| `"spectral"` | FFT along the grid axes — exact for band-limited periodic fields; **uniform grid only** |
+| `"spectral:cosine"` | even (mirror) extension — for fields with vanishing odd derivatives at both ends |
 
 Forward-mode is typically cheaper when the input dim (≤ 3 spatial dims for
 PINNs) is ≤ the output dim; reverse-mode is cheaper for scalar losses with
@@ -170,6 +172,11 @@ hessian_type = "fwd-over-rev"   # default for second-order operators
 
 or per script via `jno.setup(__file__, diff_type="forward")`. Per-call
 `scheme=` always overrides the default.
+
+`diff_type` accepts a **whole scheme** as well as an AD sub-mode, so
+`jno.setup(__file__, diff_type="spectral")` makes every unqualified derivative in the run spectral
+— see [Operations → Spectral differentiation](operations.md#spectral-differentiation) for the
+accuracy numbers and the periodicity caveat.
 
 ::: jno.differential_operators.DifferentialOperators
 

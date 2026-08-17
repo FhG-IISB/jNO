@@ -351,3 +351,51 @@ def test_non_fusable_sum_keeps_its_separate_nodes():
     """The guard cases must keep every node they were written with."""
     assert _compiled_derivative_nodes(lambda u, x, y: u.xx - u.yy) == (4, 0)
     assert _compiled_derivative_nodes(lambda u, x, y: u.d2(x) - u.d2(y)) == (0, 2)
+
+
+class TestSpectralFusion:
+    """A spectral Laplacian folds too — and it is where the fold matters most.
+
+    Fused, `u.xx + u.yy` is one multiply by -(kx^2 + ky^2) off ONE forward transform. Unfused it is
+    a transform pair per axis. It also keeps the documented house spelling on the fast path, rather
+    than making `u.laplacian(x, y)` the only efficient way to write a Laplacian.
+    """
+
+    def test_spectral_fuses(self):
+        d, (x, y, _), _ = _coords()
+        u = _field(d)
+        fused = _fuse(u.d2(x, scheme="spectral") + u.d2(y, scheme="spectral"))
+        assert _as_laplacian(fused) is not None
+
+    def test_the_fused_node_keeps_the_spectral_scheme(self):
+        d, (x, y, _), _ = _coords()
+        u = _field(d)
+        lap = _as_laplacian(_fuse(u.d2(x, scheme="spectral") + u.d2(y, scheme="spectral")))
+        assert str(lap.scheme).startswith("spectral")
+
+    def test_the_cosine_submethod_survives_the_fold(self):
+        d, (x, y, _), _ = _coords()
+        u = _field(d)
+        lap = _as_laplacian(_fuse(u.d2(x, scheme="spectral:cosine") + u.d2(y, scheme="spectral:cosine")))
+        assert lap is not None and lap.scheme == "spectral:cosine"
+
+    def test_spectral_never_fuses_with_another_family(self):
+        """The grouping key includes the scheme, so a mixed pair cannot fold — asserted, not assumed."""
+        d, (x, y, _), _ = _coords()
+        u = _field(d)
+        for other in ("automatic_differentiation", "finite_difference"):
+            mixed = _fuse(u.d2(x, scheme="spectral") + u.d2(y, scheme=other))
+            assert _as_laplacian(mixed) is None, f"spectral must not fuse with {other}"
+
+    def test_mismatched_spectral_submethods_do_not_fuse(self):
+        d, (x, y, _), _ = _coords()
+        u = _field(d)
+        mixed = _fuse(u.d2(x, scheme="spectral") + u.d2(y, scheme="spectral:cosine"))
+        assert _as_laplacian(mixed) is None
+
+    def test_finite_difference_still_refuses(self):
+        """Unchanged: :cotangent returns the whole Laplacian, so folding two would double it."""
+        d, (x, y, _), _ = _coords()
+        u = _field(d)
+        for scheme in ("finite_difference", "finite_difference:cotangent"):
+            assert _as_laplacian(_fuse(u.d2(x, scheme=scheme) + u.d2(y, scheme=scheme))) is None

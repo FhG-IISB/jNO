@@ -26,6 +26,19 @@ from .meshio_mixin import MeshIOMixin
 from .simplex_pool import SimplexPool
 
 
+def _is_lazy_source(obj: Any) -> bool:
+    """Whether ``obj`` is an array-like jNO can slice **without reading it whole**.
+
+    Duck-typed on purpose -- ``.shape`` plus ``__getitem__`` is the whole contract, so h5py, zarr,
+    tensorstore and ``np.memmap`` all qualify and none of them is imported here. An eager
+    ``np.ndarray`` / ``jnp.ndarray`` satisfies it too, so callers must test those first: they are
+    cheaper handled eagerly and some downstream paths rely on their concreteness.
+    """
+    if isinstance(obj, (np.ndarray, jnp.ndarray, tuple, list, str, bytes)):
+        return False
+    return hasattr(obj, "shape") and hasattr(type(obj), "__getitem__")
+
+
 def _scalar_float(value: Any) -> float:
     """Convert a scalar-like Python/NumPy/JAX value to float for BC callbacks."""
     arr = np.asarray(value)
@@ -785,6 +798,77 @@ class domain(MeshIOMixin):
     def __mul__(self, n: int) -> "domain":
         """Batch the domain n times: domain * 2 samples 2x independently."""
         return self.__rmul__(n)
+
+    def _check_lazy_tensor_layout(self, tag, handle):
+        """The lazy counterpart of :meth:`_normalize_tensor_time_axis` — *validate*, never rewrite.
+
+        The eager path inserts the missing ``(B, T, ...)`` time axis for you. A lazy handle cannot be
+        rewritten without reading it, which is the one thing it exists to avoid, so the same layout
+        rule is enforced as an error instead: store the array with its time axis, or pass it eagerly.
+        Refusing here is what keeps the silent-data-loss guarantee the eager path gives — the
+        alternative is that ``H`` is read as the timestep count and most of the field is dropped.
+        """
+        shape = tuple(int(s) for s in handle.shape)
+        b = self._effective_batch_count()
+        if len(shape) < 4 or shape[0] not in (b, 1):
+            return  # not routed as a spatial tensor; nothing to check (see _normalize_tensor_time_axis)
+
+        n_t = 1
+        if getattr(self, "_is_time_dependent", False):
+            t_ctx = self.context.get("__time__")
+            n_t = int(t_ctx.shape[0]) if t_ctx is not None and hasattr(t_ctx, "shape") else 1
+        if shape[1] in (n_t, 1):
+            return
+
+        raise ValueError(
+            f"domain.variable({tag!r}, <lazy {type(handle).__name__}>): the source has shape {shape}, whose "
+            f"axis 1 is {shape[1]}, but context tensors are (B, T, ...) and this domain has {n_t} timestep(s), "
+            f"so axis 1 must be {n_t} or 1. An eager array is reshaped for you; a lazy source is not, because "
+            f"that would read it. Store it with the time axis (shape {(shape[0], n_t) + shape[1:]}), or pass "
+            f"an eager array."
+        )
+
+    def _normalize_tensor_time_axis(self, tag, tensor):
+        """Give a grid-valued tensor tag the time axis the layout requires, or refuse.
+
+        Context tensors are ``(B, T, ...)``. The compiler peels ``B`` with a vmap and then
+        ``scan_over_time`` infers the time extent as ``max(v.shape[0])`` over every remaining value
+        with ``ndim >= 3`` -- so a tensor attached as ``(B, H, W, C)``, the shape a user actually
+        has, gets ``H`` read as the number of timesteps. One "timestep" then reaches the expression
+        and the rest of the field is **silently discarded**: measured, a ``(4, 8, 5, 1)`` attach
+        arrives at the evaluator as ``(5, 1)``.
+
+        Nothing about that is discoverable -- the docstring above documents the *leading* dimension
+        conventions and says nothing about axis 1 -- so it is normalized here, where the batch
+        count, the time extent and the array are all still in hand.
+
+        Only tensors the compiler routes as **spatial** (``shape[0] in (B, 1)``) are touched; a
+        "shared" tag is never vmapped and so never reaches the time inference. Tensors of rank < 4
+        are left alone for the same reason: after the batch axis is peeled they fall below the
+        ``ndim >= 3`` test, so a parameter like ``(B, 1, 1)`` is untouched.
+        """
+        b = self._effective_batch_count()
+        if tensor.ndim < 4 or tensor.shape[0] not in (b, 1):
+            return tensor
+
+        n_t = 1
+        if getattr(self, "_is_time_dependent", False):
+            t_ctx = self.context.get("__time__")
+            n_t = int(t_ctx.shape[0]) if t_ctx is not None and hasattr(t_ctx, "shape") else 1
+
+        if tensor.shape[1] in (n_t, 1):
+            return tensor  # already carries a time axis (or a broadcast one)
+
+        if getattr(self, "_is_time_dependent", False):
+            raise ValueError(
+                f"domain.variable({tag!r}, ...): the array has shape {tuple(tensor.shape)}, whose axis 1 is "
+                f"{tensor.shape[1]}, but this domain has {n_t} timesteps. Context tensors are (B, T, ...), so "
+                f"axis 1 must be {n_t} (one entry per step) or 1 (shared across steps). Insert the time axis "
+                f"explicitly -- arr[:, None, ...] to share one field across all steps."
+            )
+
+        # Steady domain: T is 1 by definition, so there is exactly one thing axis 1 can be.
+        return tensor[:, None, ...]
 
     def _effective_batch_count(self) -> int:
         """Infer the current batch size from metadata and existing batched context."""
@@ -3082,7 +3166,19 @@ class domain(MeshIOMixin):
 
         # Optional sampling / tensor-tag attachment
         if sample is not None:
-            if isinstance(sample, jnp.ndarray) or isinstance(sample, np.ndarray):
+            if _is_lazy_source(sample):
+                # A LAZY source: anything array-like that jNO can slice without reading -- an
+                # h5py.Dataset, a zarr.Array, an np.memmap. Stored as the handle itself, never
+                # materialized here, so the dataset may exceed memory. It is read one batch at a
+                # time by `core.solve(offload_data=True)`, which is the only path that can stream
+                # it; the on-device path has to hold the whole array and refuses (see core.solve).
+                if point_data:
+                    self.context[tag] = sample
+                else:
+                    self._check_lazy_tensor_layout(tag, sample)
+                    self.context[tag] = sample
+                    self._param_tags.add(tag)
+            elif isinstance(sample, jnp.ndarray) or isinstance(sample, np.ndarray):
                 # Attach as tensor tag (parameter field) or point data.
                 # Three shape conventions for tensor tags are documented above
                 # and routed in jno/trace_compiler.py at attach time; we do
@@ -3093,8 +3189,15 @@ class domain(MeshIOMixin):
                     tensor = jnp.asarray(sample)
                     if tensor.ndim < 1:
                         tensor = tensor.reshape(1, 1)
-                    self.context[tag] = tensor
+                    self.context[tag] = self._normalize_tensor_time_axis(tag, tensor)
                     self._param_tags.add(tag)
+            elif not isinstance(sample, tuple):
+                raise TypeError(
+                    f"domain.variable({tag!r}, sample=...): expected a sampling spec `(n, sampler)`, an array, "
+                    f"or a lazy array-like exposing BOTH `.shape` and `__getitem__` (h5py.Dataset, zarr.Array, "
+                    f"np.memmap). Got {type(sample).__name__}"
+                    + (" -- it has `.shape` but is not indexable." if hasattr(sample, "shape") else ".")
+                )
 
         # ------------------------------------------------------------------
         # Clean API for initial condition:

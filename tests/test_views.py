@@ -1486,3 +1486,54 @@ def test_vector_div_curl_need_coords_or_bind():
         u.vector.div()
     with pytest.raises(TypeError, match="coordinate Variables"):
         u.vector.curl()
+
+
+class TestRebind:
+    """``.bind(...)`` on an ALREADY-bound view.
+
+    ``_coords_dispatch`` used to look the wrapper up by exact ``type(view_self)``, so a second
+    ``.bind`` raised ``KeyError`` -- while ``_rewrap``'s own conflict message tells the user to
+    "Re-bind the result explicitly with ``.bind(...)`` to resolve". The advice crashed.
+    """
+
+    def test_rebind_adds_a_name(self):
+        """``u.bind(x=x).bind(y=y)`` keeps x and gains y."""
+        d, x, y = _domain_xy()
+        u = (x * y).scalar.bind(x=x)
+        v = u.bind(y=y)
+        assert sorted(object.__getattribute__(v, "_coord_vars").keys()) == ["x", "y"]
+        ctx = {"xy": jnp.array([[0.5, 0.7]])}
+        np.testing.assert_allclose(_eval(v.x.expr, ctx), [[0.7]], atol=1e-6)  # d(xy)/dx = y
+        np.testing.assert_allclose(_eval(v.y.expr, ctx), [[0.5]], atol=1e-6)  # d(xy)/dy = x
+
+    def test_rebind_resolves_a_conflict(self):
+        """The documented use: re-binding overrides a name rather than raising."""
+        d, x, y = _domain_xy()
+        x_alt = Variable("xy", [0, 1], domain=d)
+        u = (x * y).scalar.bind(x=x, y=y)
+        v = u.bind(x=x_alt)
+        assert object.__getattribute__(v, "_coord_vars")["x"] is x_alt
+        assert object.__getattribute__(v, "_coord_vars")["y"] is y
+
+    def test_rebind_preserves_the_concrete_wrapper_class(self):
+        """Re-bind must NOT fall back to the base view's wrapper.
+
+        ``FieldViewWithPartials`` sets ``_base_view = ScalarView``; resolving through that would hand
+        a re-bound field view AD derivatives instead of its FD-only ones. For an operator network that
+        never takes x/y as inputs those AD partials are identically zero -- a wrong answer, not a crash.
+        """
+        d, x, y = _domain_xy()
+        u = (x * y).scalar.bind(x=x)
+        assert type(u.bind(y=y)) is type(u)
+
+    def test_rebind_is_idempotent_on_the_same_binding(self):
+        d, x, y = _domain_xy()
+        u = (x * y).scalar.bind(x=x, y=y)
+        v = u.bind(x=x, y=y)
+        assert object.__getattribute__(v, "_coord_vars") == object.__getattribute__(u, "_coord_vars")
+
+    def test_rebind_with_no_names_still_raises(self):
+        d, x, y = _domain_xy()
+        u = (x * y).scalar.bind(x=x)
+        with pytest.raises(TypeError, match="requires at least one argument"):
+            u.bind()

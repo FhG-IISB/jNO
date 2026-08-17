@@ -567,6 +567,9 @@ class Placeholder:
 
     @property
     def shape(self) -> FunctionCall:
+        # The trailing ``True`` is the ``reduces_axis`` slot. ``shape`` and ``T`` below are NOT
+        # reductions, but they are marked as such on purpose: it is what stops them propagating the
+        # weak-form mark to their operand. Left as-is deliberately -- see ``FunctionCall.reduces``.
         return FunctionCall(lambda x: jnp.ones(x.shape, dtype="bool"), [self], "shape", True)
 
     @property
@@ -1125,8 +1128,26 @@ class FunctionCall(Placeholder):
         self.reduces_axis = reduces_axis
         self.kwargs = kwargs
         weak_children = [a for a in self.args if isinstance(a, Placeholder)]
-        if not self.reduces_axis:
+        if not self.reduces:
             _propagate_weak(self, *weak_children)
+
+    @property
+    def reduces(self) -> bool:
+        """Whether this call reduces an axis — ask this, never ``bool(reduces_axis)``.
+
+        ``reduces_axis`` doubles as the axis *value*, so a falsy-but-real axis reads as "not a
+        reduction" under a plain truth test: ``jno.np.mean(x, axis=0)`` stores ``0``, and every
+        consumer that tested truthiness therefore treated it as an ordinary call — it kept the
+        weak-form mark it should have stopped, and neither the ENGD Gram builder nor
+        ``_strip_reduction_inner`` would unwrap it to reach the vector residual.
+
+        ``None`` deliberately stays "not a reduction", because it is genuinely ambiguous: a
+        full reduction (``jno.np.sum(x)``, no axis) and the public escape hatch
+        (``jno.fn(f, args)``, whose ``reduces_axis`` default is ``None``) both pass it. Telling
+        those apart needs a distinct sentinel and a change to ``jno.fn``'s signature; until then
+        a full reduction is not registered as one. Pass an explicit axis if you need it to be.
+        """
+        return self.reduces_axis is not None
 
     def __repr__(self):
         name = self._name or getattr(self.fn, "__name__", str(self.fn))
@@ -4865,6 +4886,26 @@ def cse(expr: Placeholder) -> Placeholder:
 # =============================================================================
 
 
+def _FUSABLE_SCHEME(scheme) -> bool:
+    """Whether two per-axis second derivatives under ``scheme`` may fold into one Laplacian node.
+
+    **Automatic differentiation**: yes -- one trace-Hessian evaluates the network once instead of
+    once per coordinate.
+
+    **Spectral**: yes, and it is where the fold matters most -- a fused Laplacian is a single
+    multiply by ``-(kx^2 + ky^2)`` off ONE forward transform, against a transform pair per axis
+    otherwise. It also keeps the documented house spelling (`u.xx + u.yy`) on the fast path rather
+    than making `u.laplacian(x, y)` the only efficient way to write it.
+
+    **Finite difference**: no, deliberately. ``:cotangent`` returns the WHOLE Laplacian for any
+    requested dimension, so folding two such nodes would double it.
+
+    Mixing families cannot happen regardless: the grouping key in :func:`fuse_laplacian` includes
+    the scheme string, so terms with different schemes never land in the same group.
+    """
+    return str(scheme).startswith(("automatic_differentiation", "spectral"))
+
+
 def _second_derivative_atom(node):
     """Recognise a sum of squared partials ``Σᵢ ∂²T/∂xᵢ²``, else return ``None``.
 
@@ -4888,7 +4929,7 @@ def _second_derivative_atom(node):
     # u.d2(v), or a Laplacian this pass (or the user) already built.
     if isinstance(node, Hessian) and node.trace:
         scheme = node.scheme
-        if not str(scheme).startswith("automatic_differentiation"):
+        if not _FUSABLE_SCHEME(scheme):
             return None
         return node.target, list(node.variables), scheme
 
@@ -4900,7 +4941,7 @@ def _second_derivative_atom(node):
         if node.scheme != inner.scheme:
             return None  # mixed AD modes between the two levels — leave alone
         scheme = node.scheme
-        if not str(scheme).startswith("automatic_differentiation"):
+        if not _FUSABLE_SCHEME(scheme):
             return None
         outer_var, inner_var = node.variables[0], inner.variables[0]
         if _coord_key(outer_var) is None or _coord_key(outer_var) != _coord_key(inner_var):

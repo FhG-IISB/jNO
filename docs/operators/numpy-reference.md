@@ -74,6 +74,41 @@ jnn.norm(x, ord=None, axis=None)
 
 All support `axis=` and `keepdims=` keyword arguments.
 
+### Reducing over a named axis
+
+`axis=` also accepts a **coordinate `Variable`** — the same object `domain.variable(...)` returns —
+instead of an integer index into the `(B, T, N, D)` context layout:
+
+```python
+x, y, _ = dom.variable("interior")
+err = jnn.mean((net(_f) - _u) ** 2, axis=(x, y))   # reduce the grid, keep the sample axis
+```
+
+The axis is resolved from the coordinate's own extent when the array exists, so it is
+order-independent (`axis=(y, x)` gives the same reduction) and never depends on argument position.
+Where several axes share that extent — a square grid, which is the common case — the whole grid
+block is located and the coordinate indexed within it.
+
+!!! warning "Requires a structured grid, and fails loud when ambiguous"
+
+    Defined only on a domain with a grid (`jno.domain.poseidon`, `equi_distant_rect`, or a
+    structured mesh). On an unstructured domain the points live on one flat axis that no coordinate
+    names — reduce it with `axis=None`.
+
+    A layout where the grid block occurs more than once (e.g. shape `(128, 128, 128)` on a
+    `128×128` grid) raises, naming both candidate axes and both block offsets, rather than guessing.
+    A transposed layout on a *square* grid cannot be detected — reshape it instead.
+
+!!! note "Reductions with no `axis=` are not registered as reductions"
+
+    Passing an explicit axis (`jnn.mean(r, axis=0)`) marks the node as a reduction, which is what
+    lets the ENGD Gram builder and residual-based resampling unwrap it to reach the **vector**
+    residual underneath. Omitting the axis (`jnn.mean(r)`) does not: a bare `axis=None` is
+    indistinguishable from the `jno.fn(f, args)` escape hatch, which uses the same default.
+
+    Only matters if you write a custom loss with a functional reduction. The `.mse` / `.mae`
+    properties always register correctly, so the common path is unaffected.
+
 ---
 
 ## Reduction Properties on Placeholders

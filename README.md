@@ -192,6 +192,43 @@ jno.save(crux, f"{dir}/model.pkl")
 
 </details>
 
+<details>
+<summary><strong>PINO — an FNO trained on the PDE residual, with no labelled solutions</strong> (click to expand)</summary>
+
+```python
+import jno
+import jax
+import optax
+import foundax
+
+# `diff_type` declares the differentiation for the whole run. Spectral differentiates the operator's
+# OUTPUT along its own grid axes, so the residual needs no autodiff path from x — which is what makes
+# a physics loss writable on a field-to-field operator.
+dir = jno.setup("./runs/pino", diff_type="spectral")
+
+# Solve −Δu = f on the periodic unit square, for a whole DISTRIBUTION of forcings f at once.
+N = 64
+dom = 256 * jno.Shape.rect(0, 0, 1, 1, size=1 / N).domain(structured=True)
+x, y, _ = dom.variable("interior", split=True)
+
+# The input function: a fresh Gaussian random field per batch — an operator dataset without a dataset.
+# (Swap in your own: `f = dom.variable("_f", forcing)` with forcing shaped (samples, H, W, 1),
+#  eagerly or as a lazy h5py/zarr handle that streams per batch.)
+f = jno.noise.grf(x, y, length_scale=0.2)
+
+grid = (N + 1, N + 1)              # `size=1/N` spans the interval inclusive of both endpoints
+net = jno.nn(foundax.fno2d(in_features=1, hidden_channels=32, n_modes=16, d_model=grid))
+net.optimizer(optax.adam(1e-3))
+
+u = net(f).bind(x=x, y=y)          # the operator's output, bound to the grid coordinates
+pde = u.xx + u.yy + f              # Δu + f = 0 — the two partials fuse into ONE transform pair
+
+crux = jno.core(constraints=[pde.mse], domain=dom)
+crux.solve(epochs=20_000, batchsize=8).plot(f"{dir}/training.png")
+```
+
+</details>
+
 ## Citation
 
 If you use jNO in academic work, please cite:

@@ -45,6 +45,7 @@ from .trace.views import (
     ComplexPair,
     ComplexView,
     MatrixView,
+    NamedComplexVectorViewWithPartials,
     NamedComplexViewWithPartials,
     NamedMatrixView,
     NamedMatrixViewWithPartials,
@@ -212,6 +213,7 @@ __all__ = [
     "NamedScalarViewWithPartials",
     "NamedVectorViewWithPartials",
     "NamedComplexViewWithPartials",
+    "NamedComplexVectorViewWithPartials",
     "NamedMatrixViewWithPartials",
     "NamedVoigtViewWithPartials",
 ]

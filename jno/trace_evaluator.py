@@ -2,7 +2,7 @@
 
 import functools
 import inspect
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, NamedTuple, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -60,6 +60,309 @@ from .differential_operators import DifferentialOperators
 from .integration_operators import IntegrationOperators
 from .utils import get_logger
 from .utils.ad_mode import ad_fn, parse_ad_scheme, parse_hessian_scheme
+from .utils.schemes import resolve_scheme, scheme_family
+
+
+def _uniform_grid_spec(domain, n_values: int):
+    """``(shape, spacing)`` of the uniform grid a nodal field of length ``n_values`` lives on.
+
+    Prefers the descriptor ``jno.domain(..., structured=True)`` stamps onto
+    ``mesh_connectivity["grid"]``. Otherwise derives the spacing from ``_grid_shape`` and the mesh
+    points, which the generators lay out in C order (``idx = i*Ny + j``), so a nodal field reshapes
+    cleanly. Raises rather than guessing -- a spectral derivative on a non-uniform grid is silently
+    wrong, not merely inaccurate.
+    """
+    if domain is None:
+        raise ValueError("scheme='spectral' needs a domain with a uniform grid; this expression has none.")
+
+    grid = (getattr(domain, "mesh_connectivity", None) or {}).get("grid")
+    if grid is not None:
+        shape, spacing = tuple(int(s) for s in grid["shape"]), tuple(float(h) for h in grid["spacing"])
+    else:
+        shape = getattr(domain, "_grid_shape", None)
+        if not shape:
+            raise ValueError(
+                "scheme='spectral' requires a uniform grid, and this domain has none. Build it with "
+                "jno.domain(..., structured=True) (which records the spacing), or use "
+                "scheme='finite_difference' on an unstructured mesh."
+            )
+        shape = tuple(int(s) for s in shape)
+        pts = np.asarray(domain.mesh_connectivity["points"])[:, : len(shape)]
+        if pts.shape[0] != int(np.prod(shape)):
+            raise ValueError(
+                f"scheme='spectral': the mesh has {pts.shape[0]} points but the grid is {shape} "
+                f"({int(np.prod(shape))} nodes), so the field does not reshape onto it."
+            )
+        grid_pts = pts.reshape(*shape, len(shape))
+        spacing = []
+        for ax in range(len(shape)):
+            if shape[ax] < 2:
+                spacing.append(1.0)
+                continue
+            step = np.diff(np.take(grid_pts[..., ax], indices=range(shape[ax]), axis=ax).reshape(shape[ax], -1)[:, 0])
+            if not np.allclose(step, step[0], rtol=1e-6, atol=1e-12):
+                raise ValueError(
+                    f"scheme='spectral': axis {ax} of this grid is not uniformly spaced "
+                    f"(min {step.min():.3e}, max {step.max():.3e}). FFT differentiation assumes uniform spacing."
+                )
+            spacing.append(float(step[0]))
+        spacing = tuple(spacing)
+
+    if int(np.prod(shape)) != int(n_values):
+        raise ValueError(
+            f"scheme='spectral': the field has {n_values} values but the grid {shape} has {int(np.prod(shape))} nodes."
+        )
+    return shape, spacing
+
+
+def _mirror_axis(u, axis: int):
+    """Even (mirror) extension along ``axis``: ``[u0..u_{N-1}, u_{N-2}..u_1]``, length ``2N-2``.
+
+    The result is periodic, so the ordinary FFT machinery applies unchanged -- which is why the
+    cosine sub-scheme needs no DCT/DST. (JAX implements only DCT-2 and has no DST at all, so the
+    transform-pair route would have meant hand-rolling one.)
+    """
+    n = u.shape[axis]
+    tail = jnp.flip(jnp.take(u, jnp.arange(1, n - 1), axis=axis), axis=axis)
+    return jnp.concatenate([u, tail], axis=axis)
+
+
+def _unmirror_axis(u, axis: int, n: int):
+    """Take the first ``n`` entries along ``axis`` — the original half of a mirrored array."""
+    return jnp.take(u, jnp.arange(n), axis=axis)
+
+
+def _spectral_second_moments(values_flat, shape, spacing, pairs, *, trace: bool, mirror: bool = False):
+    """Second derivatives along grid axes, from **one** transform pair.
+
+    ``pairs`` is the list of ``(a, b)`` axis pairs wanted. With ``trace=True`` the diagonal is summed
+    into the Laplacian, which is a single multiply by ``-(kx^2 + ky^2 + ...)`` -- the reason a
+    spectral Laplacian is cheap where a stencil needs a pass per axis and automatic differentiation
+    needs a full Hessian per point.
+
+    Same endpoint convention as :func:`_spectral_diff`: the duplicated periodic node is dropped on
+    every transformed axis and re-attached afterwards.
+    """
+    was_real = not jnp.iscomplexobj(values_flat)
+    u = jnp.asarray(values_flat).reshape(shape)
+    axes = tuple(sorted({int(a) for pair in pairs for a in pair}))
+
+    orig_n = {a: u.shape[a] for a in axes}
+    if mirror:
+        for a in axes:
+            u = _mirror_axis(u, a)
+    else:
+        sl = [slice(None)] * len(shape)
+        for a in axes:
+            sl[a] = slice(0, -1)
+        u = u[tuple(sl)]
+
+    def _k(a, *, odd: bool):
+        n = u.shape[a]
+        k = 2.0 * jnp.pi * jnp.fft.fftfreq(n, d=spacing[a])
+        if odd and n % 2 == 0:
+            k = k.at[n // 2].set(0.0)  # Nyquist has no well-defined odd derivative
+        return k.reshape([n if i == a else 1 for i in range(len(shape))])
+
+    uh = jnp.fft.fftn(u, axes=axes)
+
+    def _restore(arr):
+        for a in axes:
+            arr = (
+                _unmirror_axis(arr, a, orig_n[a])
+                if mirror
+                else jnp.concatenate([arr, jnp.take(arr, jnp.array([0]), axis=a)], axis=a)
+            )
+        return arr
+
+    if trace:
+        mult = sum(-(_k(a, odd=False) ** 2) for a, _ in pairs)
+        out = jnp.fft.ifftn(mult * uh, axes=axes)
+        out = out.real if was_real else out
+        return _restore(out).reshape(-1)
+
+    comps = []
+    for a, b in pairs:
+        mult = -(_k(a, odd=False) ** 2) if a == b else -(_k(a, odd=True) * _k(b, odd=True))
+        o = jnp.fft.ifftn(mult * uh, axes=axes)
+        comps.append(_restore(o.real if was_real else o).reshape(-1))
+    return comps
+
+
+def _spectral_diff(values_flat, shape, spacing, axis: int, order: int, *, mirror: bool = False):
+    """``d^order/dx_axis^order`` of a flat nodal field, via the FFT along that grid axis.
+
+    Exact for a band-limited periodic field; on a non-periodic one the implied periodic extension
+    has a jump and the result rings (Gibbs). Periodicity is the caller's claim -- it is not read
+    from the domain, because the only per-axis periodic flag jNO records is a residue of whether a
+    periodic FDM problem happened to be built earlier in the process.
+
+    Trefethen, *Spectral Methods in MATLAB* (SIAM 2000), ch. 3.
+    """
+    was_real = not jnp.iscomplexobj(values_flat)
+    u = jnp.asarray(values_flat).reshape(shape)
+    h = spacing[axis]
+
+    if mirror:
+        # Even extension: exact when the field's odd derivatives vanish at both ends (Neumann-like),
+        # which is a real but NARROWER class than "non-periodic" -- a field with u' != 0 at an end
+        # still has a kink in the extension and still rings, just far less (measured 44x on a ramp).
+        n_orig = u.shape[axis]
+        u = _mirror_axis(u, axis)
+        n = u.shape[axis]
+        k = 2.0 * jnp.pi * jnp.fft.fftfreq(n, d=h)
+        if order % 2 == 1 and n % 2 == 0:
+            k = k.at[n // 2].set(0.0)
+        mult = ((1j * k) ** order).reshape([n if a == axis else 1 for a in range(len(shape))])
+        out = jnp.fft.ifft(mult * jnp.fft.fft(u, axis=axis), axis=axis)
+        out = out.real if was_real else out
+        return _unmirror_axis(out, axis, n_orig).reshape(-1)
+
+    # jNO's structured grids span the interval INCLUSIVE of both ends, so the last node along an
+    # axis is the periodic image of the first: `Shape.rect(0,0,1,1, size=1/16)` gives 17 nodes for
+    # 16 intervals. The FFT wants exactly one period with no duplicate, so drop that node, transform
+    # over the remaining n, and put it back afterwards. The finite-difference periodic stencils do
+    # the same thing (`differential_operators.py`, `uu = moveaxis(U, dim, 0)[:-1]`). Without this
+    # the transform assumes a period of (n+1)*h and every derivative is wrong -- measurably worse
+    # than a 2nd-order stencil, which is how it was caught.
+    u = jnp.moveaxis(u, axis, 0)[:-1]
+    u = jnp.moveaxis(u, 0, axis)
+    n = u.shape[axis]
+
+    k = 2.0 * jnp.pi * jnp.fft.fftfreq(n, d=h)
+    if order % 2 == 1 and n % 2 == 0:
+        # The Nyquist mode has no well-defined odd derivative (it is its own alias); the standard
+        # convention drops it rather than letting an arbitrary sign through.
+        k = k.at[n // 2].set(0.0)
+    mult = (1j * k) ** order
+    mult = mult.reshape([n if a == axis else 1 for a in range(len(shape))])
+
+    out = jnp.fft.ifft(mult * jnp.fft.fft(u, axis=axis), axis=axis)
+    out = out.real if was_real else out
+    # Re-attach the duplicated endpoint so the result lines up with the mesh's node ordering.
+    first = jnp.take(out, jnp.array([0]), axis=axis)
+    return jnp.concatenate([out, first], axis=axis).reshape(-1)
+
+
+class _MeshCtx(NamedTuple):
+    """What a mesh-field kernel needs from the domain: the nodes, the count, and the domain itself."""
+
+    points: Any
+    n: int
+    domain: Any
+    dim: int
+
+
+class _MeshFieldBackend(NamedTuple):
+    """A family that differentiates stored values on the mesh.
+
+    Each entry builds a per-channel kernel from ``(mesh, scheme)``. Adding a family is adding an
+    entry here plus its kernels -- ``_eval_jacobian`` / ``_eval_hessian`` do not change.
+
+    ``gradient(mesh, scheme) -> f(u_flat, axis) -> (N,)``
+    ``laplacian(mesh, scheme, dims) -> f(u_flat) -> (N,)``
+    ``hessian(mesh, scheme, var_dims) -> f(u_flat) -> (N, n, n)``
+    """
+
+    gradient: Any
+    laplacian: Any
+    hessian: Any
+
+
+def _fd_gradient(mesh, scheme):
+    _, grad_method, _ = DifferentialOperators.parse_fd_scheme(scheme)
+    mc = mesh.domain.mesh_connectivity
+    cells = {1: "lines", 2: "triangles", 3: "tetrahedra"}[mesh.dim]
+    fn = {
+        1: DifferentialOperators.compute_fd_gradient_1d_simple,
+        2: DifferentialOperators.compute_fd_gradient_2d_simple,
+        3: DifferentialOperators.compute_fd_gradient_3d_simple,
+    }[mesh.dim]
+
+    def _k(u_1d, axis):
+        if mesh.dim == 1:
+            return fn(u_1d, mesh.points, mc[cells], method=grad_method, grid=mc.get("grid"))
+        return fn(u_1d, mesh.points, mc[cells], axis, method=grad_method, grid=mc.get("grid"))
+
+    return _k
+
+
+def _spectral_gradient(mesh, scheme):
+    g_shape, g_spacing = _uniform_grid_spec(mesh.domain, mesh.n)
+    mirror = scheme.split(":", 1)[1].strip() == "cosine" if ":" in scheme else False
+
+    def _k(u_1d, axis):
+        return _spectral_diff(u_1d, g_shape, g_spacing, axis, order=1, mirror=mirror)
+
+    return _k
+
+
+def _fd_laplacian(mesh, scheme, dims):
+    _, _, lap_method = DifferentialOperators.parse_fd_scheme(scheme)
+    mc = mesh.domain.mesh_connectivity
+    cells = {1: "lines", 2: "triangles", 3: "tetrahedra"}[mesh.dim]
+    fn = {
+        1: DifferentialOperators.compute_fd_laplacian_1d_simple,
+        2: DifferentialOperators.compute_fd_laplacian_2d_simple,
+        3: DifferentialOperators.compute_fd_laplacian_3d_simple,
+    }[mesh.dim]
+
+    def _k(u_1d):
+        if mesh.dim == 1:
+            return fn(u_1d, mesh.points, mc[cells], grid=mc.get("grid"))
+        return fn(u_1d, mesh.points, mc[cells], dims, method=lap_method, grid=mc.get("grid"))
+
+    return _k
+
+
+def _fd_hessian(mesh, scheme, var_dims):
+    mc = mesh.domain.mesh_connectivity
+    cells = {1: "lines", 2: "triangles", 3: "tetrahedra"}[mesh.dim]
+    fn = {
+        1: DifferentialOperators.compute_fd_hessian_1d_simple,
+        2: DifferentialOperators.compute_fd_hessian_2d_simple,
+        3: DifferentialOperators.compute_fd_hessian_3d_simple,
+    }[mesh.dim]
+
+    def _k(u_1d):
+        if mesh.dim == 1:
+            return fn(u_1d, mesh.points, mc[cells])
+        return fn(u_1d, mesh.points, mc[cells], var_dims, grid=mc.get("grid"))
+
+    return _k
+
+
+def _spectral_laplacian(mesh, scheme, dims):
+    g_shape, g_spacing = _uniform_grid_spec(mesh.domain, mesh.n)
+    mirror = scheme.split(":", 1)[1].strip() == "cosine" if ":" in scheme else False
+    pairs = [(int(d), int(d)) for d in dims]
+
+    def _k(u_1d):
+        return _spectral_second_moments(u_1d, g_shape, g_spacing, pairs, trace=True, mirror=mirror)
+
+    return _k
+
+
+def _spectral_hessian(mesh, scheme, var_dims):
+    g_shape, g_spacing = _uniform_grid_spec(mesh.domain, mesh.n)
+    mirror = scheme.split(":", 1)[1].strip() == "cosine" if ":" in scheme else False
+    pairs = [(vi, vj) for _i, vi, _j, vj in var_dims]
+    n = int(np.sqrt(len(var_dims)))
+
+    def _k(u_1d):
+        comps = _spectral_second_moments(u_1d, g_shape, g_spacing, pairs, trace=False, mirror=mirror)
+        return jnp.stack(comps, axis=-1).reshape(-1, n, n)
+
+    return _k
+
+
+#: Families that differentiate stored values on the mesh. A new one is an entry here plus its
+#: kernels; neither `_eval_jacobian` nor `_eval_hessian` changes. (Automatic differentiation is
+#: deliberately absent -- it differentiates a FUNCTION per point and never touches the mesh.)
+_MESH_FIELD_FAMILIES: Dict[str, "_MeshFieldBackend"] = {
+    "finite_difference": _MeshFieldBackend(_fd_gradient, _fd_laplacian, _fd_hessian),
+    "spectral": _MeshFieldBackend(_spectral_gradient, _spectral_laplacian, _spectral_hessian),
+}
 
 
 class TraceEvaluator:
@@ -399,6 +702,40 @@ class TraceEvaluator:
                     local[k] = v
 
         return local
+
+    def _mesh_field_values(self, target, tag, bound_var, ctx, family):
+        """Evaluate ``target`` on the mesh and flatten it for a per-channel kernel.
+
+        Returns ``(mesh, u_flat, image_shape, n_channels)``. Operator-learning models return
+        image-shaped tensors whose spatial axes flatten to the node count; the original shape is
+        remembered so it can be restored, and a multi-channel output is vmapped over its channel
+        axis by the caller. The ``ndim > 2`` gate keeps a plain ``(N, 1)`` per-point scalar from
+        being reinterpreted as an image.
+        """
+        domain = getattr(bound_var, "_domain", None)
+        if domain is None or getattr(domain, "mesh_connectivity", None) is None:
+            raise ValueError(f"scheme={family!r} requires a domain with mesh connectivity.")
+        mesh_points = jnp.array(domain.mesh_connectivity["points"])
+        mesh = _MeshCtx(mesh_points, int(mesh_points.shape[0]), domain, int(domain.mesh_connectivity["dimension"]))
+
+        u_full = self._target_on_mesh(target, tag, mesh_points, ctx)
+        u_squeezed = u_full.squeeze(-1) if (u_full.ndim > 1 and u_full.shape[-1] == 1) else u_full
+        if u_squeezed.ndim > 1 and u_squeezed.size == mesh.n:
+            return mesh, u_squeezed.reshape(mesh.n), u_full.shape, 1
+        if u_full.ndim > 2 and int(np.prod(u_full.shape[:-1])) == mesh.n:
+            return mesh, u_full.reshape(mesh.n, u_full.shape[-1]), u_full.shape, u_full.shape[-1]
+        return mesh, (u_squeezed if u_squeezed.ndim == 1 else u_squeezed.ravel()), None, 1
+
+    def _finish_mesh_jacobian(self, comps, image_shape, n_vars, mesh_points, points):
+        """Shape a mesh-field gradient back to the caller's convention."""
+        if image_shape is not None:
+            if n_vars == 1:
+                return comps[0].reshape(image_shape)
+            return jnp.stack(comps, axis=-1).reshape(*image_shape[:-1], n_vars)
+        if n_vars == 1:
+            result = self._map_mesh_to_sampled(mesh_points, points, comps[0])
+            return result[:, jnp.newaxis] if result.ndim == 1 else result
+        return self._map_mesh_to_sampled(mesh_points, points, jnp.stack(comps, axis=-1))
 
     def _target_on_mesh(self, target, tag, mesh_points, ctx):
         """Evaluate ``target`` with the spatial tag ``tag`` bound to the whole mesh point set.
@@ -1034,7 +1371,7 @@ class TraceEvaluator:
         )
         u_full = jnp.asarray(self._dispatch(target, full_ctx)).reshape(-1)
 
-        sch = scheme if str(scheme).startswith("finite_difference") else "finite_difference"
+        sch = "finite_difference" if scheme_family(scheme) == "automatic_differentiation" else scheme
         _, grad_method, _ = DifferentialOperators.parse_fd_scheme(sch)
         if mesh_dim == 1:
             grads = [
@@ -1080,10 +1417,14 @@ class TraceEvaluator:
         """
         target = expr.target
         variables = expr.variables
-        scheme = expr.scheme
+        # A bare 'automatic_differentiation' means 'whatever the run configured'
+        # (jno.setup(diff_type=...)); an explicit family:submethod passes through.
+        scheme = resolve_scheme(expr.scheme)
         # A FrozenField is known nodal values on a mesh — there is no analytic coordinate-function to
         # auto-differentiate, so its spatial gradient is the FD-over-mesh gradient of those values.
-        if isinstance(target, FrozenField) and not str(scheme).startswith("finite_difference"):
+        # Force FD only for AUTOMATIC differentiation, which is what is meaningless on stored nodal
+        # values. Any other family keeps its own backend.
+        if isinstance(target, FrozenField) and scheme_family(scheme) == "automatic_differentiation":
             scheme = "finite_difference"
         if isinstance(target, TestFunction):
             if ctx.active_region is None:
@@ -1426,89 +1767,25 @@ class TraceEvaluator:
         if points.ndim == 1:
             points = points[jnp.newaxis, :]
 
-        if scheme.startswith("finite_difference"):
-            domain = bound_var._domain
-            if domain is None or domain.mesh_connectivity is None:
-                raise ValueError("FD scheme requires domain with mesh connectivity")
-            mesh_points = jnp.array(domain.mesh_connectivity["points"])
-            mesh_dim = domain.mesh_connectivity["dimension"]
-
-            u_full = self._target_on_mesh(target, tag, mesh_points, ctx)
-            N_mesh = mesh_points.shape[0]
-
-            # FD operators expect flat 1-D (N,) values.  Operator-learning
-            # models (Poseidon, FNO, …) return image-shaped tensors whose
-            # spatial axes flatten to N_mesh.  Auto-flatten them and remember
-            # the original shape so we can restore it afterwards.  Multi-
-            # channel outputs (C > 1) are handled by vmapping the stencil
-            # over the channel axis.  The multi-channel branch is gated on
-            # ``ndim > 2`` so plain ``(N_points, 1)`` per-point scalars do
-            # not get reinterpreted as an image.
-            u_squeezed = u_full.squeeze(-1) if (u_full.ndim > 1 and u_full.shape[-1] == 1) else u_full
-            image_shape = None
-            n_channels = 1
-            if u_squeezed.ndim > 1 and u_squeezed.size == N_mesh:
-                # Image-shaped, single channel: (H, W, 1) or (H, W).
-                image_shape = u_full.shape
-                u_full_flat = u_squeezed.reshape(N_mesh)
-            elif u_full.ndim > 2 and int(np.prod(u_full.shape[:-1])) == N_mesh:
-                # Image-shaped, multi-channel: (H, W, C) with C > 1.
-                image_shape = u_full.shape
-                n_channels = u_full.shape[-1]
-                u_full_flat = u_full.reshape(N_mesh, n_channels)
-            else:
-                u_full_flat = u_squeezed if u_squeezed.ndim == 1 else u_squeezed.ravel()
-
-            _, grad_method, _lap_method = DifferentialOperators.parse_fd_scheme(scheme)
-
-            def _grad_one_channel(u_1d, vi_dim):
-                if mesh_dim == 1:
-                    return DifferentialOperators.compute_fd_gradient_1d_simple(
-                        u_1d,
-                        mesh_points,
-                        domain.mesh_connectivity["lines"],
-                        method=grad_method,
-                    )
-                if mesh_dim == 2:
-                    return DifferentialOperators.compute_fd_gradient_2d_simple(
-                        u_1d,
-                        mesh_points,
-                        domain.mesh_connectivity["triangles"],
-                        vi_dim,
-                        method=grad_method,
-                        grid=domain.mesh_connectivity.get("grid"),  # structured-grid fast path
-                    )
-                return DifferentialOperators.compute_fd_gradient_3d_simple(
-                    u_1d,
-                    mesh_points,
-                    domain.mesh_connectivity["tetrahedra"],
-                    vi_dim,
-                    method=grad_method,
-                    grid=domain.mesh_connectivity.get("grid"),  # structured-grid fast path
-                )
-
-            jac_components = []
-            for _i, vi_dim in var_dims:
-                if image_shape is not None and n_channels > 1:
-                    # (N_mesh, C) → per-channel FD → (C, N_mesh) → (N_mesh, C)
-                    grad_full = jax.vmap(lambda u_c, _vd=vi_dim: _grad_one_channel(u_c, _vd))(u_full_flat.T).T
-                else:
-                    grad_full = _grad_one_channel(u_full_flat, vi_dim)
-                jac_components.append(grad_full)
-
-            if image_shape is not None:
-                # Return in the same image shape as the model output
-                if n_vars == 1:
-                    return jac_components[0].reshape(image_shape)
-                return jnp.stack(jac_components, axis=-1).reshape(*image_shape[:-1], n_vars)
-
-            if n_vars == 1:
-                result = self._map_mesh_to_sampled(mesh_points, points, jac_components[0])
-                return result[:, jnp.newaxis] if result.ndim == 1 else result
-            jac_full = jnp.stack(jac_components, axis=-1)
-            return self._map_mesh_to_sampled(mesh_points, points, jac_full)
-
-        elif scheme.startswith("automatic_differentiation"):
+        # Resolving the family raises on an unknown one -- the `else` this chain never had. An
+        # unrecognised scheme used to fall off the end of the function and return None, surfacing
+        # much later as `TypeError: 'NoneType' object is not subscriptable`.
+        family = scheme_family(scheme)
+        if family in _MESH_FIELD_FAMILIES:
+            # Every family that differentiates STORED VALUES on the mesh shares this shape: evaluate
+            # the target on the mesh, flatten an operator's image-shaped output, differentiate each
+            # channel, put the shape back. Only the per-channel kernel differs, so that is the only
+            # thing a new family supplies -- see `_MESH_FIELD_FAMILIES`.
+            mesh, u_flat, image_shape, n_channels = self._mesh_field_values(target, tag, bound_var, ctx, family)
+            kernel = _MESH_FIELD_FAMILIES[family].gradient(mesh, scheme)
+            comps = [
+                jax.vmap(lambda u_c, _a=vi_dim: kernel(u_c, _a))(u_flat.T).T
+                if (image_shape is not None and n_channels > 1)
+                else kernel(u_flat, vi_dim)
+                for _i, vi_dim in var_dims
+            ]
+            return self._finish_mesh_jacobian(comps, image_shape, n_vars, mesh.points, points)
+        elif family == "automatic_differentiation":
             evaluator_self = self
             _jac = ad_fn(parse_ad_scheme(scheme))
 
@@ -1584,7 +1861,9 @@ class TraceEvaluator:
         """
         target = expr.target
         variables = expr.variables
-        scheme = expr.scheme
+        # A bare 'automatic_differentiation' means 'whatever the run configured'
+        # (jno.setup(diff_type=...)); an explicit family:submethod passes through.
+        scheme = resolve_scheme(expr.scheme)
         compute_trace = getattr(expr, "trace", False)
 
         first_var = variables[0]
@@ -1603,110 +1882,30 @@ class TraceEvaluator:
         n = len(variables)
         var_dims = [(i, vi.dim[0], j, vj.dim[0]) for i, vi in enumerate(variables) for j, vj in enumerate(variables)]
 
-        if scheme.startswith("finite_difference"):
-            domain = bound_var._domain
-            if domain is None or domain.mesh_connectivity is None:
-                raise ValueError("FD scheme requires domain with mesh connectivity")
-            mesh_points = jnp.array(domain.mesh_connectivity["points"])
-            mesh_dim = domain.mesh_connectivity["dimension"]
-
-            u_full = self._target_on_mesh(target, tag, mesh_points, ctx)
-            N_mesh = mesh_points.shape[0]
-
-            # Auto-flatten image-shaped model outputs and handle multi-channel.
-            # See the Jacobian FD path for the same logic.
-            u_squeezed = u_full.squeeze(-1) if (u_full.ndim > 1 and u_full.shape[-1] == 1) else u_full
-            image_shape = None
-            n_channels = 1
-            if u_squeezed.ndim > 1 and u_squeezed.size == N_mesh:
-                image_shape = u_full.shape
-                u_full_flat = u_squeezed.reshape(N_mesh)
-            elif u_full.ndim > 2 and int(np.prod(u_full.shape[:-1])) == N_mesh:
-                image_shape = u_full.shape
-                n_channels = u_full.shape[-1]
-                u_full_flat = u_full.reshape(N_mesh, n_channels)
-            else:
-                u_full_flat = u_squeezed if u_squeezed.ndim == 1 else u_squeezed.ravel()
-
-            _main, _grad_method, lap_method = DifferentialOperators.parse_fd_scheme(scheme)
-
-            def _lap_one_channel(u_1d):
-                if mesh_dim == 1:
-                    return DifferentialOperators.compute_fd_laplacian_1d_simple(
-                        u_1d,
-                        mesh_points,
-                        domain.mesh_connectivity["lines"],
-                        method=lap_method,
-                    )
-                if mesh_dim == 2:
-                    return DifferentialOperators.compute_fd_laplacian_2d_simple(
-                        u_1d,
-                        mesh_points,
-                        domain.mesh_connectivity["triangles"],
-                        dims,
-                        method=lap_method,
-                        grid=domain.mesh_connectivity.get("grid"),  # structured-grid fast path
-                    )
-                return DifferentialOperators.compute_fd_laplacian_3d_simple(
-                    u_1d,
-                    mesh_points,
-                    domain.mesh_connectivity["tetrahedra"],
-                    dims,
-                    method=lap_method,
-                    grid=domain.mesh_connectivity.get("grid"),  # structured-grid fast path
-                )
-
-            def _hess_one_channel(u_1d):
-                if mesh_dim == 1:
-                    return DifferentialOperators.compute_fd_hessian_1d_simple(
-                        u_1d, mesh_points, domain.mesh_connectivity["lines"]
-                    )
-                if mesh_dim == 2:
-                    return DifferentialOperators.compute_fd_hessian_2d_simple(
-                        u_1d,
-                        mesh_points,
-                        domain.mesh_connectivity["triangles"],
-                        var_dims,
-                        grid=domain.mesh_connectivity.get("grid"),  # structured-grid fast path
-                    )
-                return DifferentialOperators.compute_fd_hessian_3d_simple(
-                    u_1d,
-                    mesh_points,
-                    domain.mesh_connectivity["tetrahedra"],
-                    var_dims,
-                    grid=domain.mesh_connectivity.get("grid"),  # structured-grid fast path
-                )
+        family = scheme_family(scheme)
+        if family in _MESH_FIELD_FAMILIES:
+            backend = _MESH_FIELD_FAMILIES[family]
+            mesh, u_flat, image_shape, n_channels = self._mesh_field_values(target, tag, bound_var, ctx, family)
+            multi = image_shape is not None and n_channels > 1
 
             if compute_trace:
-                # Laplacian: sum of second derivatives on diagonal
-                if image_shape is not None and n_channels > 1:
-                    lap_full = jax.vmap(_lap_one_channel)(u_full_flat.T).T  # (N_mesh, C)
-                else:
-                    lap_full = _lap_one_channel(u_full_flat)
-
+                lap = backend.laplacian(mesh, scheme, dims)
+                lap_full = jax.vmap(lap)(u_flat.T).T if multi else lap(u_flat)
                 if image_shape is not None:
                     return lap_full.reshape(image_shape)
-
                 if points is not None:
-                    result = self._map_mesh_to_sampled(mesh_points, points, lap_full)
+                    result = self._map_mesh_to_sampled(mesh.points, points, lap_full)
                     return result[:, jnp.newaxis] if result.ndim == 1 else result
                 return lap_full[:, jnp.newaxis] if lap_full.ndim == 1 else lap_full
-            else:
-                # Full Hessian matrix
-                if image_shape is not None and n_channels > 1:
-                    # Per-channel: (N_mesh, C) → (C, N_mesh, n, n) → (N_mesh, C, n, n)
-                    hess_per_c = jax.vmap(_hess_one_channel)(u_full_flat.T)
-                    hess_full = jnp.moveaxis(hess_per_c, 0, 1)
-                else:
-                    hess_full = _hess_one_channel(u_full_flat)
 
-                if image_shape is not None:
-                    if n_channels > 1:
-                        return hess_full.reshape(*image_shape[:-1], n_channels, n, n)
-                    return hess_full.reshape(*image_shape[:-1], n, n)
-                return self._map_mesh_to_sampled(mesh_points, points, hess_full)
-
-        elif scheme.startswith("automatic_differentiation"):
+            hess = backend.hessian(mesh, scheme, var_dims)
+            hess_full = jnp.moveaxis(jax.vmap(hess)(u_flat.T), 0, 1) if multi else hess(u_flat)
+            if image_shape is not None:
+                if n_channels > 1:
+                    return hess_full.reshape(*image_shape[:-1], n_channels, n, n)
+                return hess_full.reshape(*image_shape[:-1], n, n)
+            return self._map_mesh_to_sampled(mesh.points, points, hess_full)
+        elif family == "automatic_differentiation":
             evaluator_self = self
             _outer_mode, _inner_mode = parse_hessian_scheme(scheme)
             _outer = ad_fn(_outer_mode)
