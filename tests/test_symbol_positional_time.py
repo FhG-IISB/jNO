@@ -69,8 +69,13 @@ def test_third_positional_coord_still_binds_z_in_3d():
 
     Note `dom.variable` appends a temporal var even on a steady domain, so 3D yields
     (x, y, z, t): the splat must bind x/y/z and drop t.
+
+    size=0.35, not coarser: the `max() > 0` assertion needs interior (unconstrained) nodes to
+    exist, and the HXT mesher (da09701) tiles a unit box at size 0.5 with boundary nodes ONLY —
+    every dof Dirichlet-pinned, u ≡ 0 the correct answer, and the assertion vacuously broken.
+    At 0.35 the mesh has 3 interior nodes (measured).
     """
-    d = jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=0.5).domain()
+    d = jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=0.35).domain()
     u, phi = d.fem_symbols()
     xi, yi, zi, _ = d.variable("interior", split=True)
     cb = d.variable("boundary", split=True)  # (x, y, z, t)

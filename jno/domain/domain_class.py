@@ -2692,6 +2692,330 @@ class domain(MeshIOMixin):
             self.context["cell_size"] = np.ones((1, 1), dtype=default_np_float_dtype())
         return Variable(tag="cell_size", dim=[0, 1], domain=self, axis="spatial")
 
+    # ------------------------------------------------------------------
+    # Per-cell mesh geometry as trace nodes (differentiable in the mesh)
+    # ------------------------------------------------------------------
+    def _cells_p1(self):
+        """``(n_cells, dim+1)`` vertex ids of the P1 simplices."""
+        mesh = self.built_mesh
+        key = "triangle" if self.dimension == 2 else ("tetra" if self.dimension == 3 else "line")
+        cells = getattr(mesh, "cells_dict", {}).get(key)
+        if cells is None:
+            raise ValueError(f"domain: no {key!r} cells on this mesh — cell geometry is unavailable.")
+        return np.asarray(cells, dtype=np.int64)
+
+    def _moving_points(self):
+        """``(arg_exprs, rebuild)`` for the mesh coordinates *as the optimiser currently has them*.
+
+        ``rebuild(*vals)`` returns the ``(n_points, dim)`` array with every ``.trainable()``
+        coordinate scattered in. Passing ``arg_exprs`` as the traced arguments of a
+        :func:`jno.fn` node is what makes a geometric quantity differentiable w.r.t. the mesh:
+        the node depends on the coordinate parameters, so ``∂g/∂X`` flows without anyone writing
+        a shape derivative. With no trainable coordinates the mesh is fixed and ``arg_exprs`` is
+        empty, which is still valid — the quantity is then simply a constant.
+        """
+        dim = int(self.dimension)
+        pts0 = jnp.asarray(np.asarray(self.mesh.points)[:, :dim])
+        specs = list(getattr(self, "_trainable_coords", None) or [])
+        meta = [(jnp.asarray(s["ids"], dtype=jnp.int32), int(s["axis"])) for s in specs]
+
+        def rebuild(*vals):
+            pts = pts0
+            for (ids, axis), v in zip(meta, vals):
+                pts = pts.at[ids, axis].set(jnp.asarray(v).reshape(-1))
+            return pts
+
+        return [s["expr"] for s in specs], rebuild
+
+    def cell_volume(self):
+        """Per-cell volume (area in 2-D) as a ``(n_cells,)`` node, differentiable in the mesh.
+
+        ``|det J| / d!`` from the cell's own vertices, so it tracks ``.trainable()`` coordinates.
+        The handle for an element-size constraint in shape or topology optimisation::
+
+            g = (d.cell_volume() / ((2 - rho) * v_max)).pnorm(50)
+            jno.core([compliance, jno.le(g, 1.0)])
+        """
+        import jno as _jno
+
+        dim = int(self.dimension)
+        cells = jnp.asarray(self._cells_p1(), dtype=jnp.int32)
+        args, rebuild = self._moving_points()
+        fact = {1: 1.0, 2: 2.0, 3: 6.0}[dim]  # d! — the simplex volume factor
+
+        def _vol(*vals):
+            v = rebuild(*vals)[cells]  # (n_cells, dim+1, dim)
+            jac = jnp.stack([v[:, i + 1] - v[:, 0] for i in range(dim)], axis=-1)
+            return jnp.abs(jnp.linalg.det(jac)) / fact
+
+        return _jno.fn(_vol, args, name="cell_volume")
+
+    def cell_angles(self, eps: float = 1e-12):
+        """Per-cell interior angles in radians, ``(n_cells, 3)``, differentiable in the mesh. **2-D.**
+
+        The angle at each vertex from the inverse cosine of its two incident edge vectors. This is
+        the quantity a mesh-quality constraint is written on — a lower bound on the minimum angle
+        prevents the element tangling that free nodal movement otherwise causes::
+
+            g = ((2 * jno.np.pi - d.cell_angles()) / (2 * jno.np.pi - theta_min)).pnorm(50)
+            jno.core([compliance, jno.le(g, 1.0)])
+
+        Bounding the minimum angle bounds the maximum implicitly, since the three sum to ``π``.
+        ``eps`` guards the denominator; it does not otherwise shift the angles.
+        """
+        import jno as _jno
+
+        if int(self.dimension) != 2:
+            raise NotImplementedError(f"domain.cell_angles(): triangles only (2-D); this domain is {self.dimension}-D.")
+        cells = jnp.asarray(self._cells_p1(), dtype=jnp.int32)
+        args, rebuild = self._moving_points()
+
+        def _ang(*vals):
+            v = rebuild(*vals)[cells]  # (n_cells, 3, 2)
+            out = []
+            for i in range(3):
+                a = v[:, (i + 1) % 3] - v[:, i]
+                b = v[:, (i + 2) % 3] - v[:, i]
+                cos = jnp.sum(a * b, axis=-1) / (jnp.linalg.norm(a, axis=-1) * jnp.linalg.norm(b, axis=-1) + eps)
+                out.append(jnp.arccos(jnp.clip(cos, -1.0, 1.0)))
+            return jnp.stack(out, axis=-1)  # (n_cells, 3)
+
+        return _jno.fn(_ang, args, name="cell_angles")
+
+    def measure(self):
+        """Total volume (area in 2-D) of the domain, as a node differentiable in the mesh.
+
+        The denominator of a volume fraction. A node rather than a cached float because the mesh
+        deforms: anything summed over element measures has to track the moving geometry.
+        """
+        return self.cell_volume().sum
+
+    def transfer_cell_field(self, values, target, *, outside=0.0, points=None):
+        """Carry a per-element field onto another mesh, by centroid containment.
+
+        The transfer a **reanalysis** needs: an optimisation whose mesh coordinates are design
+        variables can lower its objective either by improving the structure or by distorting
+        elements until they under-integrate strain energy, and it cannot tell those apart. The
+        only way to find out is to put the converged density on a fresh, undistorted mesh and
+        re-solve. Measured once on a design reporting ``C = 77.97``: the same field on a clean
+        mesh gave ``205.24``, a 163 % over-report, from a picture that looked entirely correct.
+
+        Each target element takes the value of whichever source element contains its centroid,
+        which is exact for a piecewise-constant field up to the target's own resolution -- so
+        refine the target well past the source.
+
+        Args:
+            values: ``(n_cells,)`` field on THIS domain's elements.
+            target: The domain to transfer onto.
+            outside: Value for target centroids that fall outside this mesh (disjoint domains).
+            points: Optional ``(n_points, dim)`` node positions to use for THIS mesh instead of
+                its own — pass the *deformed* coordinates when the source mesh has moved under
+                ``.trainable()``, since the domain still holds the positions it was built with.
+
+        Returns:
+            ``(target_n_cells,)`` numpy array.
+
+        References:
+            Jung, Yun & Kim, *Computers & Structures* **331** (2026) 108403, Fig. 7c-d, where the
+            gap is +17.6 % for conventional elements and -0.5 % with the enriched formulation.
+        """
+        if int(self.dimension) != 2:
+            raise NotImplementedError(
+                f"domain.transfer_cell_field(): 2-D triangles only; this domain is {self.dimension}-D."
+            )
+        src_cells = self._cells_p1()
+        src_pts = np.asarray(self.mesh.points)[:, :2] if points is None else np.asarray(points)[:, :2]
+        vals = np.asarray(values).reshape(-1)
+        if vals.size != src_cells.shape[0]:
+            raise ValueError(
+                f"domain.transfer_cell_field(): values has {vals.size} entries but this mesh has "
+                f"{src_cells.shape[0]} cells."
+            )
+        tgt_cells = target._cells_p1()
+        tgt_centroids = np.asarray(target.mesh.points)[:, :2][tgt_cells].mean(axis=1)
+
+        from jno.utils.solver.fem_adapt import _locate_in_cells
+
+        owner, _, inside = _locate_in_cells(src_pts, src_cells, tgt_centroids, tol=1e-9, k=32)
+        return np.where(inside, vals[owner], float(outside))
+
+    def interior_edges(self):
+        """Interior facets — the edges shared by exactly two triangles.
+
+        Returns a dict of host-side numpy arrays:
+            ``cells`` ``(n_edges, 2)`` int — the two triangles meeting at each edge.
+            ``nodes`` ``(n_edges, 2)`` int — the edge's two endpoints, for its length.
+
+        Boundary edges are excluded: they carry no density jump, since there is no element on the
+        far side. This is the traversal a perimeter functional needs (Haber, Jog & Bendsoe,
+        *Struct. Optim.* **11**, 1996, 1-12).
+        """
+        cells = self._cells_p1()
+        if int(self.dimension) != 2 or cells.shape[1] != 3:
+            raise NotImplementedError(
+                f"domain.interior_edges(): triangles in 2-D only; got {cells.shape[1]}-node cells in {self.dimension}-D."
+            )
+        seen: dict = {}
+        for k, tri in enumerate(cells):
+            for a, b in ((0, 1), (1, 2), (2, 0)):
+                key = (int(min(tri[a], tri[b])), int(max(tri[a], tri[b])))
+                seen.setdefault(key, []).append(k)
+        keys = [e for e, ks in seen.items() if len(ks) == 2]
+        return {
+            "cells": np.asarray([seen[e] for e in keys], dtype=np.int64),
+            "nodes": np.asarray(keys, dtype=np.int64),
+        }
+
+    def patch_filter(self):
+        """The patch filter of eq. (17)-(19) as a pure ``(n_cells,) -> (n_cells,)`` callable.
+
+        Jung, Yun & Kim, *Computers & Structures* **331** (2026) 108403, Sec. 2.3.2. It maps the
+        design density to the **physical** density, and it is a manufacturability operator rather
+        than a smoothing one: it drives to zero exactly those elements whose surroundings make the
+        layout unbuildable, and leaves every other element untouched.
+
+        Around each vertex of element ``k`` the elements form a patch, walked counterclockwise
+        (:meth:`patch_topology`). For that patch,
+
+            f_k = [ prod_{i=2}^{N-2} { 1 - r_i (1 - mean(r_1..r_{i-1})) (1 - mean(r_{i+1}..r_{N-1})) }
+                    * { 1 - r_k (1 - (r_1 + r_{N-1}) / 2) } ] ^ (1 / (N - 2))
+
+        with ``r_1 ... r_{N-1}`` the other elements in order. The product detects a **one-node
+        connection** -- a dense element joined to the rest of the structure through this vertex
+        alone -- and the final factor a **single dense element** in an otherwise void patch, which
+        puts a sharp corner on the boundary. Both drive ``f_k`` to zero; a sound patch leaves it at
+        one. The physical density is ``rho_bar_k = rho_k (f^I + f^J + f^K) / P_k`` over the
+        element's three vertices, ``P_k`` counting only the patches with at least three elements
+        (eq. 19). With SIMP downstream a suppressed element's stiffness vanishes, so the
+        configuration removes itself.
+
+        **Boundary patches drop the final factor** (Fig. 2d): one-node connections are still
+        suppressed there, but a single dense element on the domain boundary is *preserved*, since
+        it costs little smoothness and helps keep a natural boundary profile. The paper states this
+        rule in prose without an equation, so the placement is our reading; the value stays 1 when
+        nothing is detected either way, so both branches remain on one scale.
+
+        Two ways to use it, and a design needs both::
+
+            rho.constrain(d.patch_filter())   # the PHYSICS sees rho_bar (paramax reparameterises
+                                              # before every forward pass; MMA still steps in rho)
+            rho_bar = rho.patch()             # the same map as a trace node, for constraints,
+                                              # reporting and `crux.eval`
+
+        The filter is non-local -- an element's physical density depends on its whole
+        neighbourhood -- so it cannot be written inside the weak form, where the kernel sees one
+        element at a time. That is why the physics route is a reparameterisation.
+        """
+        topo = self.patch_topology()
+        others = jnp.asarray(topo["others"], dtype=jnp.int32)  # (K, 3, M) with -1 padding
+        n_int = jnp.asarray(topo["size"], dtype=jnp.int32)  # (K, 3)
+        interior = jnp.asarray(~topo["boundary"])  # (K, 3)
+        m = others.shape[-1]
+        pos = jnp.arange(m, dtype=jnp.int32)[None, None, :]  # array index p; r_{p+1} of the paper
+
+        def _patch(rv):
+            r = jnp.asarray(rv).reshape(-1)
+            n = n_int  # (K, 3) patch size N
+            vals = jnp.where(others >= 0, r[jnp.maximum(others, 0)], 0.0)  # (K, 3, M)
+            live = (pos < (n - 1)[..., None]).astype(vals.dtype)  # entries 1..N-1 are real
+            vals = vals * live
+            csum = jnp.cumsum(vals, axis=-1)  # csum[p] = sum_{j<=p+1} r_j
+            total = jnp.sum(vals, axis=-1, keepdims=True)
+
+            # Factor i of the product, at array index p = i - 1, live for 1 <= p <= N-3.
+            denom_pre = jnp.maximum(pos, 1).astype(vals.dtype)  # i - 1
+            pre = jnp.concatenate([jnp.zeros_like(csum[..., :1]), csum[..., :-1]], -1) / denom_pre
+            denom_suf = jnp.maximum((n - 2)[..., None] - pos, 1).astype(vals.dtype)  # N - i - 1
+            suf = (total - csum) / denom_suf
+            term = 1.0 - vals * (1.0 - pre) * (1.0 - suf)
+            active = ((pos >= 1) & (pos <= (n - 3)[..., None])).astype(vals.dtype)
+            prod = jnp.prod(jnp.where(active > 0, term, 1.0), axis=-1)  # (K, 3)
+
+            # The final factor: k itself dense between two void neighbours in the patch.
+            r_first = vals[..., 0]
+            r_last = jnp.take_along_axis(vals, jnp.clip(n - 2, 0, m - 1)[..., None], axis=-1)[..., 0]
+            rk = r[:, None]
+            last = 1.0 - rk * (1.0 - 0.5 * (r_first + r_last))
+            last = jnp.where(interior, last, 1.0)  # preserved on the boundary (Fig. 2d)
+
+            valid = n >= 3
+            expo = 1.0 / jnp.maximum(n.astype(vals.dtype) - 2.0, 1.0)
+            f = jnp.where(valid, jnp.clip(prod * last, 0.0, None) ** expo, 0.0)
+            p_k = jnp.sum(valid.astype(f.dtype), axis=-1)  # (K,)
+            # P_k = 0 means no patch around this element reaches three elements; there is nothing
+            # to judge it by, so it passes through unchanged rather than becoming 0/0.
+            return r * jnp.where(p_k > 0, jnp.sum(f, axis=-1) / jnp.maximum(p_k, 1.0), 1.0)
+
+        return _patch
+
+    def patch_topology(self):
+        """Node→element patches, ordered counterclockwise — the connectivity eq. (17)-(19) needs.
+
+        For every triangle ``k`` and every one of its three vertices, returns the OTHER elements of
+        that vertex's patch in counterclockwise order starting from the one adjacent to ``k``. This
+        is what makes the patch formula of Jung, Yun & Kim, *Computers & Structures* **331** (2026)
+        108403 evaluable: its indices ``rho_{k,1} ... rho_{k,N-1}`` are an angular walk around the
+        node, and ``rho_{k,1}`` / ``rho_{k,N-1}`` — the first and last — are precisely the two
+        elements sharing an edge with ``k``.
+
+        Returns a dict of numpy arrays, all host-side and computed once:
+            ``others``   ``(n_cells, 3, Nmax-1)`` int — the ordered other-element ids, ``-1`` padded.
+            ``size``     ``(n_cells, 3)`` int — ``N^I``, the patch's element count.
+            ``boundary`` ``(n_cells, 3)`` bool — whether that vertex lies on the domain boundary.
+
+        The **ordering is taken once, from the current mesh**. Connectivity is fixed under
+        ``.trainable()`` coordinates (relocation, not remeshing), so the patches themselves never
+        change; only a distortion large enough to reorder the angular fan would invalidate the walk,
+        which the geometric constraints of eq. (24)-(28) exist to prevent.
+        """
+        cells = self._cells_p1()
+        pts = np.asarray(self.mesh.points)[:, : int(self.dimension)]
+        if int(self.dimension) != 2 or cells.shape[1] != 3:
+            raise NotImplementedError(
+                f"domain.patch_topology(): triangles in 2-D only; got {cells.shape[1]}-node cells "
+                f"in {self.dimension}-D. The patch formulation is 2-D (paper, Sec. 2.3.2)."
+            )
+        n_cells = cells.shape[0]
+        centroids = pts[cells].mean(axis=1)
+
+        incident: List[List[int]] = [[] for _ in range(pts.shape[0])]
+        for k, tri in enumerate(cells):
+            for n in tri:
+                incident[int(n)].append(k)
+
+        # A vertex is on the domain boundary iff one of its incident edges is used by one cell only.
+        edge_count: dict = {}
+        for tri in cells:
+            for a, b in ((0, 1), (1, 2), (2, 0)):
+                e = (int(min(tri[a], tri[b])), int(max(tri[a], tri[b])))
+                edge_count[e] = edge_count.get(e, 0) + 1
+        on_boundary = np.zeros(pts.shape[0], dtype=bool)
+        for (a, b), c in edge_count.items():
+            if c == 1:
+                on_boundary[a] = on_boundary[b] = True
+
+        ccw = {}
+        for n, ks in enumerate(incident):
+            if not ks:
+                continue
+            rel = centroids[ks] - pts[n]
+            ang = np.arctan2(rel[:, 1], rel[:, 0])
+            ccw[n] = [ks[i] for i in np.argsort(ang)]
+
+        n_max = max((len(v) for v in ccw.values()), default=1)
+        others = np.full((n_cells, 3, max(n_max - 1, 1)), -1, dtype=np.int64)
+        size = np.zeros((n_cells, 3), dtype=np.int64)
+        boundary = np.zeros((n_cells, 3), dtype=bool)
+        for k, tri in enumerate(cells):
+            for v, n in enumerate(tri):
+                ring = ccw[int(n)]
+                q = ring.index(k)
+                rest = ring[q + 1 :] + ring[:q]  # counterclockwise, starting adjacent to k
+                others[k, v, : len(rest)] = rest
+                size[k, v] = len(ring)
+                boundary[k, v] = bool(on_boundary[int(n)])
+        return {"others": others, "size": size, "boundary": boundary}
+
     def variable(
         self,
         tag: str,

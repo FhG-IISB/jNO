@@ -134,3 +134,43 @@ def ad_fn(mode: str):
     if mode == "reverse":
         return jax.jacrev
     raise ValueError(f"Invalid AD mode {mode!r}.")
+
+
+def rowwise_jacobian(f, x, rows):
+    """``(len(rows), P)`` reverse-mode Jacobian of ``f: x -> (N,)``, with no ``vmap``.
+
+    ``jax.jacrev`` takes one ``vjp`` and then **vmaps the pullback** across the rows of the
+    identity basis. That vmap is the problem, not the differentiation: a differentiable FEM
+    solve bottoms out in ``jax.experimental.sparse.linalg.spsolve``, which has no batching
+    rule, so ``jacrev`` raises ``NotImplementedError: Batching rule for 'spsolve' not
+    implemented`` on any trace containing ``fem.solve()`` -- even when the output is a single
+    scalar, because the basis still carries a leading axis. Forward mode is no escape either
+    (``jacfwd`` hits the same wall at ``csr_matvec``); plain ``jax.grad`` is what works.
+
+    This does what ``jacrev`` does minus the vmap: ONE ``jax.vjp``, so the forward pass and
+    its residuals are computed once and shared, followed by one pullback per requested row.
+    The rows are unrolled at trace time.
+
+    ``rows`` is an explicit sequence of output indices, so a caller that needs only some rows
+    -- MMA needs the inequality-constraint rows and not the objective -- pays for those only.
+
+    Args:
+        f: Callable from the pytree ``x`` to a 1-D array of length ``N``.
+        x: The pytree to differentiate with respect to.
+        rows: Output indices to build rows for, in the returned order.
+
+    Returns:
+        ``(len(rows), P)`` array, where ``P`` is the total size of the array leaves of ``x``
+        flattened in ``jax.tree_util.tree_leaves`` order -- the same layout ``jacrev``
+        produces once its per-leaf blocks are raveled and concatenated.
+    """
+    import jax.numpy as jnp
+
+    rows = list(rows)
+    y, pullback = jax.vjp(f, x)
+    out = []
+    for i in rows:
+        (grad_tree,) = pullback(jnp.zeros(y.shape, y.dtype).at[i].set(1.0))
+        leaves = jax.tree_util.tree_leaves(grad_tree)
+        out.append(jnp.concatenate([leaf.ravel() for leaf in leaves]))
+    return jnp.stack(out)

@@ -22,6 +22,7 @@ from .noise import noise
 from .rcwa import Rcwa, RcwaError, rcwa
 from .trace import (
     Assembly,
+    Constraint,
     FemLinearSystem,
     FemResidualOperator,
     GroupedAssembly,
@@ -113,9 +114,36 @@ class ScheduleWrapper:
 
 schedule = ScheduleWrapper()
 
+
+def le(expr, bound=0.0):
+    """An inequality constraint ``expr <= bound``, as an entry in the ``jno.core`` list.
+
+    It is evaluated and differentiated exactly like any other entry -- so its value and gradient
+    reach a constrained optimiser -- but it is **not summed into the loss**. Adding a constraint to
+    the objective makes it a soft penalty, which double-counts against an optimiser that already
+    handles it in the dual (MMA, OC, SQP)::
+
+        jno.core([compliance,                       # minimised
+                  jno.le(volume / v_star, 1.0),     # constraint, handed to the optimiser
+                  1e-3 * reg.mean])                 # a genuine penalty, summed
+
+    With no constrained optimiser attached this raises at ``solve()`` rather than silently
+    ignoring the constraint.
+    """
+    return Constraint(expr, bound, "le")
+
+
+def ge(expr, bound=0.0):
+    """An inequality constraint ``expr >= bound``. See :func:`le`."""
+    return Constraint(expr, bound, "ge")
+
+
 __all__ = [
     "schedule",
     "core",
+    "le",
+    "ge",
+    "Constraint",
     "sampler",
     "domain",
     "Shape",

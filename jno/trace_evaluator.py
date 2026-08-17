@@ -850,7 +850,10 @@ class TraceEvaluator:
 
         # ── Scalar target (e.g. loss.mse) → gradient vector (P,) ───────────
         if len(logical_shape) == 0:
-            grad_pytree = jax.jacrev(forward_fn)(trainable)
+            # `jax.grad`, not `jax.jacrev`: for a scalar output the two agree exactly, but
+            # jacrev still vmaps its pullback over a length-1 basis, and a target containing
+            # `fem.solve()` bottoms out in `spsolve`, which has no batching rule.
+            grad_pytree = jax.grad(forward_fn)(trainable)
             leaves = jax.tree_util.tree_leaves(grad_pytree)
             cols = [leaf.reshape(-1) for leaf in leaves]
             return jnp.concatenate(cols, axis=-1)  # (P,)
@@ -865,7 +868,22 @@ class TraceEvaluator:
         # JVP passes via vmap internally, giving XLA a single compact program.
         # jacrev would create N separate VJP traces — catastrophic for large N
         # or when forward_fn includes high-order spatial derivatives (Laplacian).
-        jac_pytree = jax.jacfwd(forward_fn)(trainable)
+        try:
+            jac_pytree = jax.jacfwd(forward_fn)(trainable)
+        except NotImplementedError as exc:
+            if "atching rule" not in str(exc):
+                raise
+            # Forward mode vmaps P tangents through the target, and a sparse solve has no
+            # batching rule for either `spsolve` or `csr_matvec`. Reverse mode would work but
+            # costs one pass per OUTPUT point, which for a per-point network Jacobian is the
+            # N-way blow-up jacfwd is chosen here to avoid — so refuse rather than silently
+            # trade a crash for an unusable runtime.
+            raise NotImplementedError(
+                f"NetworkGradient: the target has {N} output points and contains a sparse "
+                "solve, which has no batching rule — neither forward mode (used here) nor "
+                "jax.jacrev can vmap through it. Reduce the target to a scalar (e.g. "
+                "`expr.mean().grad(net)`), which takes a single reverse pass."
+            ) from exc
 
         # Flatten all param leaves into a single (N, D, P) array, then squeeze D=1
         leaves = jax.tree_util.tree_leaves(jac_pytree)
