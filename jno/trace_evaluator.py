@@ -15,6 +15,7 @@ from .trace import (
     BinaryOp,
     Choice,
     Constant,
+    Flow,
     FrozenField,
     FunctionCall,
     GroupedAssembly,
@@ -613,7 +614,7 @@ class TraceEvaluator:
             for arg in node.args:
                 if isinstance(arg, Placeholder):
                     self._trace_visit(arg, ctx, depth + 1, lines, seen)
-        elif isinstance(node, ModelCall):
+        elif isinstance(node, (ModelCall, Flow)):
             for arg in node.args:
                 if isinstance(arg, Placeholder):
                     self._trace_visit(arg, ctx, depth + 1, lines, seen)
@@ -727,6 +728,7 @@ class TraceEvaluator:
         (BinaryOp, "_eval_binary_op"),
         (OperationCall, "_eval_operation_call"),
         (ModelCall, "_eval_flax_module_call"),
+        (Flow, "_eval_flow"),
         (ModelWeights, "_eval_model_weights"),
         (TunableModule, "_eval_tunable_module"),
         (TunableModuleCall, "_eval_tunable_module_call"),
@@ -1231,7 +1233,19 @@ class TraceEvaluator:
                 arg_values.append(jnp.asarray(arg))
                 arg_sources.append(False)
 
-        flax_mod = expr.model
+        return self._apply_model(expr.model, arg_values, arg_sources, ctx)
+
+    def _apply_model(self, flax_mod, arg_values, arg_sources, ctx):
+        """Apply a wrapped :class:`~jno.trace.Model` to already-evaluated argument VALUES.
+
+        Split out of :meth:`_eval_flax_module_call` so that every path which runs a model shares one
+        implementation: the ordinary ``ModelCall`` and the ODE march behind :class:`~jno.trace.Flow`.
+        Calling the Equinox module directly instead would bypass ``Model.freeze`` / ``.lora`` /
+        ``.dtype`` -- invisible in the output, wrong in the gradient.
+
+        ``arg_sources`` flags which arguments are *spatial* (per-point coordinates), which is what
+        decides whether a bare ``(N,)`` gets the trailing channel axis.
+        """
         model = self.params.get(flax_mod.layer_id)
 
         if model is None:
@@ -1242,6 +1256,11 @@ class TraceEvaluator:
 
             No cross-argument broadcasting — that is the network's job.
             """
+            # A non-array argument is a pytree state from an ODE march (``Model.flow``): the network
+            # takes it whole, so there is no channel axis to fix up. Pass it through untouched rather
+            # than letting ``jnp.asarray`` flatten a dict into an object array.
+            if not (hasattr(val, "ndim") or isinstance(val, (int, float, complex, list, tuple))):
+                return val
             val = jnp.asarray(val)
             if is_spatial:
                 if val.ndim == 0:
@@ -1268,6 +1287,10 @@ class TraceEvaluator:
             return "mlp" in mod_name or "mlp" in cls_name
 
         def _broadcast_pointwise_args(args):
+            # A pytree argument (a marched ODE state) has no single leading shape to broadcast against;
+            # leave the whole call alone and let the network handle its own structure.
+            if any(not hasattr(a, "ndim") for a in args):
+                return list(args)
             arrs = [jnp.asarray(a) for a in args]
 
             if len(arrs) <= 1:
@@ -1341,10 +1364,30 @@ class TraceEvaluator:
         # coordinate nature, so it keeps its declared shape -- ``parameter((N,))`` evaluates to (N,), not a
         # spurious (N, 1) (needed for building a geometry functional from coordinate parameters).
         _bare_parameter = getattr(flax_mod, "_is_parameter", False) and getattr(flax_mod, "_fem_field", None) is None
-        if result.ndim == 1 and result.shape[0] > 1 and not _bare_parameter:
+        # `hasattr(ndim)`: a velocity field marched by ``Model.flow`` may return a pytree, which has
+        # no channel axis to repair.
+        if hasattr(result, "ndim") and result.ndim == 1 and result.shape[0] > 1 and not _bare_parameter:
             result = result[:, jnp.newaxis]
 
         return result
+
+    def _eval_flow(self, expr, ctx):
+        """March a :class:`~jno.trace.Flow` — the velocity network integrated as ``dx/dt = v(x, t)``.
+
+        Shares :meth:`_apply_model` with the ordinary ``ModelCall`` and :func:`~jno.trace.march_velocity`
+        with the eager ``Model.flow`` path, so a march inside a constraint and one run after training
+        are the same computation.
+        """
+        from .trace import march_velocity
+
+        x0 = self._dispatch(expr.x0, ctx) if isinstance(expr.x0, Placeholder) else expr.x0
+        cond = [self._dispatch(c, ctx) if isinstance(c, Placeholder) else c for c in expr.cond]
+        n_args = 2 + len(cond)
+
+        def apply(state, t):
+            return self._apply_model(expr.model, [state, t, *cond], [False] * n_args, ctx)
+
+        return march_velocity(apply, x0, expr.ts, expr.save)
 
     def _eval_tunable_module(self, expr, ctx):
         if expr._current_instance is None:

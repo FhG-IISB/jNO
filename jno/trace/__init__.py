@@ -63,6 +63,7 @@ __all__ = [
     "TestFunction",
     "Assembly",
     "GroupedAssembly",
+    "Flow",
     "TrialFunction",
     "FemLinearSystem",
     "FemResidualOperator",
@@ -2370,6 +2371,58 @@ class Model(Placeholder):
 
         return self
 
+    def flow(self, x0, *cond, time, save=False):
+        r"""March this network as an ODE **velocity field**: :math:`dx/dt = v(x, t, \ldots)`.
+
+        The network is called as ``v(x, t, *cond)`` -- state first, time second -- and must return the
+        same pytree structure as the state.
+
+        Args:
+            x0: Initial state. Any **pytree** of arrays; the trailing axis is the feature axis, so a
+                scalar field over ``N`` points is ``(N, 1)``, not ``(N,)``. Pass it explicitly rather
+                than drawing it inside: it is the thing an inverse problem optimises.
+            *cond: Extra arguments forwarded to the network unchanged every step -- a class label, a
+                physics parameter, a coefficient field.
+            time: The grid POINTS, as an array/sequence (the primary form) or a ``(t0, t1, n)``
+                triple. Step sizes are the consecutive differences, so a non-uniform schedule needs
+                no extra argument and a **decreasing** grid marches backwards, mapping data to its
+                latent. ``n`` counts points, matching ``domain(time=...)``, and must be a Python int
+                -- it is the scan length.
+            save: Return the whole trajectory (leading axis ``len(time)``) instead of the endpoint.
+
+        Returns:
+            The final state, or a :class:`Flow` node when *x0* or any *cond* is symbolic -- in which
+            case the march composes into a ``jno.core([...])`` term list::
+
+                x  = v.flow(x0_array, time=ts)                        # sample after training
+                xg = v.flow(jno.noise.gaussian(ndim=2), time=ts)      # inside a constraint
+
+        Limitations:
+            Heun's method, fixed step, explicit -- no adaptive control and no error estimate, so the
+            step count is the accuracy knob. No log-density: that needs the divergence of ``v`` with
+            respect to the state, which :func:`jno.np.divergence` (defined over coordinate
+            ``Variable``\ s) does not provide. Dropout must be off; the march passes no PRNG key.
+            Reverse mode stores every step, so a march inside a training loss costs its step count in
+            both compute and activation memory -- ``core.solve(checkpoint_gradients=True)`` trades
+            ~30 % compute back for the memory.
+        """
+        ts = resolve_flow_times(time)
+        if any(isinstance(a, Placeholder) for a in (x0, *cond)):
+            return Flow(self, x0, cond, ts, save)
+
+        # Concrete initial state: run it now. Routed through the evaluator rather than calling the
+        # Equinox module directly so that freeze / lora / dtype apply exactly as they do in training.
+        from ..trace_evaluator import TraceEvaluator
+
+        evaluator = TraceEvaluator({self.layer_id: self.params})
+        ctx = TraceEvaluator._EvalCtx(context={}, var_bindings={}, key=None)
+        n_args = 2 + len(cond)
+
+        def apply(state, t):
+            return evaluator._apply_model(self, [state, t, *cond], [False] * n_args, ctx)
+
+        return march_velocity(apply, x0, ts, save)
+
     # ── finetuning helpers ───────────────────────────────────
 
     def freeze(self):
@@ -3476,6 +3529,99 @@ class ModelCall(Placeholder):
         return self
 
 
+def resolve_flow_times(time):
+    """Normalise the ``time=`` argument of :meth:`Model.flow` to the grid POINTS.
+
+    An array (or any sequence) is the primary form and is taken as the grid itself, so a non-uniform
+    schedule needs no extra argument, and a *decreasing* grid marches the ODE backwards -- which is
+    how the same trained velocity encodes data back to its latent. A ``(t0, t1, n)`` triple is sugar
+    for ``linspace(t0, t1, n)``; ``n`` counts grid POINTS, matching ``domain(time=(t0, t1, n))``, so
+    the number of steps is ``n - 1``.
+    """
+    if isinstance(time, tuple) and len(time) == 3 and isinstance(time[2], int):
+        t0, t1, n = time
+        if int(n) < 2:
+            raise ValueError(f"time=(t0, t1, n): n counts grid POINTS and must be >= 2 (n - 1 steps), got n={n}.")
+        return jnp.linspace(float(t0), float(t1), int(n))
+
+    ts = jnp.asarray(time, dtype=jnp.result_type(float))
+    if ts.ndim != 1 or ts.shape[0] < 2:
+        raise ValueError(
+            f"time= must be a 1-D sequence of at least 2 grid points, or a (t0, t1, n) triple; got shape {tuple(ts.shape)}."
+        )
+    return ts
+
+
+def march_velocity(apply, x0, ts, save=False):
+    """March ``dx/dt = apply(x, t)`` over the grid points *ts*, returning the endpoint (or the path).
+
+    Heun's method (explicit trapezoid): second order, two evaluations per step, and no state beyond
+    ``x`` -- see Butcher, *Numerical Methods for Ordinary Differential Equations* (2nd ed., 2016),
+    §2.3. Fixed-step and explicit: there is no adaptive control and no error estimate, so the step
+    count in *ts* is the accuracy knob.
+
+    The step sizes are the consecutive differences of *ts*, so a non-uniform grid and a decreasing
+    one both work with no flag. The state is any **pytree**; ``apply`` must return the same structure,
+    which is checked at trace time. Written as one :func:`jax.lax.scan`, so the whole march is
+    reverse-mode differentiable in ``x0``, in the weights ``apply`` closes over, and in *ts*.
+    """
+    ts = jnp.asarray(ts)
+
+    def step(x, i):
+        t0, t1 = ts[i], ts[i + 1]
+        dt = t1 - t0
+        k1 = apply(x, t0)
+        if jax.tree_util.tree_structure(k1) != jax.tree_util.tree_structure(x):
+            raise ValueError(
+                f"the velocity must return the same pytree structure as the state it is handed: "
+                f"state is {jax.tree_util.tree_structure(x)}, velocity returned "
+                f"{jax.tree_util.tree_structure(k1)}."
+            )
+        predictor = jax.tree_util.tree_map(lambda a, b: a + dt * b, x, k1)
+        k2 = apply(predictor, t1)
+        nxt = jax.tree_util.tree_map(lambda a, b, c: a + 0.5 * dt * (b + c), x, k1, k2)
+        return nxt, (nxt if save else None)
+
+    x_end, path = jax.lax.scan(step, x0, jnp.arange(ts.shape[0] - 1))
+    if not save:
+        return x_end
+    # Prepend the initial state so the trajectory lines up with `ts` one-for-one.
+    return jax.tree_util.tree_map(lambda a, b: jnp.concatenate([a[None], b], axis=0), x0, path)
+
+
+class Flow(Placeholder):
+    """A network marched as an ODE velocity field — ``dx/dt = v(x, t, *cond)``.
+
+    Produced by :meth:`Model.flow` when its initial state is *symbolic*, so the march composes into a
+    ``jno.core([...])`` term list rather than only running after training. That is what makes a
+    constraint on **generated** samples expressible (a PDE residual on what the model produces) and
+    what lets a gradient reach an optimisable latent through the whole march.
+
+    Handed a concrete array instead, :meth:`Model.flow` runs the march eagerly and returns the array;
+    this node is never built. Both routes share :func:`march_velocity` and the evaluator's
+    ``_apply_model``, so ``freeze`` / ``lora`` / ``dtype`` apply identically either way.
+
+    ``args`` exposes the children so the attribute-driven tree walkers reach them without a per-type
+    branch.
+    """
+
+    def __init__(self, model, x0, cond, ts, save=False):
+        self.model = model
+        self.x0 = x0
+        self.cond = list(cond)
+        self.ts = ts
+        self.save = bool(save)
+        self.op_id = _next_op_id()
+
+    @property
+    def args(self):
+        return [self.x0, *self.cond]
+
+    def __repr__(self):
+        cond = "".join(f", {c}" for c in self.cond)
+        return f"flow({self.model}, {self.x0}{cond}, steps={int(jnp.asarray(self.ts).shape[0]) - 1})"
+
+
 class TunableModule(Placeholder):
     """
     Wraps a Flax module CLASS + ArchSpace.
@@ -3558,7 +3704,7 @@ class OperationDef(Placeholder):
                 if id(node) not in seen_ids:
                     seen_ids.add(id(node))
                     vars_found.append(node)
-            elif isinstance(node, ModelCall):
+            elif isinstance(node, (ModelCall, Flow)):
                 for arg in node.args:
                     if isinstance(arg, Placeholder):
                         visit(arg)
@@ -3591,7 +3737,7 @@ class OperationDef(Placeholder):
         def visit(node):
             if isinstance(node, Model):
                 return True
-            elif isinstance(node, ModelCall):
+            elif isinstance(node, (ModelCall, Flow)):
                 return True  # ModelCall contains a trainable Model
             elif isinstance(node, BinaryOp):
                 return visit(node.left) or visit(node.right)
@@ -5753,6 +5899,13 @@ def cse(expr: Placeholder) -> Placeholder:
                 new_node = ModelCall(node.model, new_args)
                 new_node.op_id = node.op_id
                 node = new_node
+        elif isinstance(node, Flow):
+            new_x0 = _visit(node.x0) if isinstance(node.x0, Placeholder) else node.x0
+            new_cond = [_visit(c) if isinstance(c, Placeholder) else c for c in node.cond]
+            if new_x0 is not node.x0 or any(n is not o for n, o in zip(new_cond, node.cond)):
+                new_node = Flow(node.model, new_x0, new_cond, node.ts, node.save)
+                new_node.op_id = node.op_id
+                node = new_node
         elif isinstance(node, OperationDef):
             new_expr = _visit(node.expr)
             if new_expr is not node.expr:
@@ -6123,7 +6276,7 @@ def collect_operations(expr: Placeholder) -> List[OperationDef]:
             visit(node.operation.expr)
             for arg in node.args:
                 visit(arg)
-        elif isinstance(node, ModelCall):
+        elif isinstance(node, (ModelCall, Flow)):
             for arg in node.args:
                 if isinstance(arg, Placeholder):
                     visit(arg)
@@ -6198,7 +6351,7 @@ def collect_tags(expr: Placeholder) -> set:
             for arg in node.args:
                 if isinstance(arg, Placeholder):
                     visit(arg)
-        elif isinstance(node, ModelCall):
+        elif isinstance(node, (ModelCall, Flow)):
             for arg in node.args:
                 if isinstance(arg, Placeholder):
                     visit(arg)
@@ -6313,8 +6466,8 @@ def dump_tree(expr, indent: int = 0, seen: set = None) -> str:
                     _visit(arg, depth + 1)
                 else:
                     lines.append(f"{p}  {arg}")
-        elif isinstance(node, ModelCall):
-            lines.append(f"{p}ModelCall({_node_label(node.model)})")
+        elif isinstance(node, (ModelCall, Flow)):
+            lines.append(f"{p}{type(node).__name__}({_node_label(node.model)})")
             for arg in node.args:
                 if isinstance(arg, Placeholder):
                     _visit(arg, depth + 1)

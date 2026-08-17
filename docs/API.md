@@ -112,6 +112,42 @@ optimisers, masks, LoRA, freezing, and so on.
         - constrain
         - initialize
         - tune
+        - flow
+
+### Marching a network as an ODE — `Model.flow`
+
+`v.flow(x0, time=...)` integrates the network as a **velocity field**, `dx/dt = v(x, t, *cond)`.
+The network is called state-first, time-second.
+
+```python
+x  = v.flow(x0_array, time=ts)                     # concrete start -> the marched array
+xg = v.flow(jno.noise.gaussian(ndim=2), time=ts)   # symbolic start -> a node for jno.core([...])
+```
+
+`time=` takes the grid **points**: an array is the primary form, so a non-uniform schedule needs no
+extra argument and a *decreasing* grid marches backwards, mapping a sample back to its latent. A
+`(t0, t1, n)` triple is sugar for `linspace`, with `n` counting points exactly as in
+`domain(time=...)`. The state is any pytree, so a multi-field generative model marches in one call.
+
+Because the symbolic form is an ordinary trace node, a constraint on *generated* samples is just
+another term, and an optimisable latent gets a gradient through the whole march:
+
+```python
+# a physics residual on what the model generates
+xg = v.flow(jno.noise.gaussian(ndim=D), time=(0.0, 1.0, 17))
+crux = jno.core([(v((1 - t) * x0 + t * x1, t) - (x1 - x0)).mse, lam * residual(xg).mse])
+
+# recover the latent behind an observation — v.freeze(), z trainable
+z = jno.np.parameter((n, D))
+crux = jno.core([(observe(v.flow(z, time=ts)) - y_obs).mse])
+```
+
+**Limitations.** Heun's method, fixed step, explicit — no adaptive control and no error estimate, so
+the step count is the accuracy knob. No log-density: that needs the divergence of `v` with respect
+to the *state*, which `jno.np.divergence` (defined over coordinate `Variable`s) does not provide.
+Dropout must be off, since the march passes no PRNG key. Reverse mode stores every step, so a march
+inside a training loss costs its step count in both compute and activation memory —
+`core.solve(checkpoint_gradients=True)` trades roughly 30 % compute back for the memory.
 
 ---
 

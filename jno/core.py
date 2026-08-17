@@ -37,6 +37,7 @@ from .trace import (
     BinaryOp,
     Choice,
     Constraint,
+    Flow,
     FunctionCall,
     Hessian,
     IntegralTime,
@@ -79,8 +80,8 @@ def _expression_involves_model(expr: "Placeholder", lid: int) -> bool:
         if nid in seen:
             return False
         seen.add(nid)
-        if isinstance(node, ModelCall):
-            return node.model.layer_id == lid
+        if isinstance(node, (ModelCall, Flow)):
+            return node.model.layer_id == lid or any(visit(a) for a in node.args if isinstance(a, Placeholder))
         if isinstance(node, BinaryOp):
             return visit(node.left) or visit(node.right)
         if isinstance(node, FunctionCall):
@@ -423,7 +424,7 @@ def _reachable_models(exprs) -> Dict[int, Any]:
         # stop_gradient boundary — everything inside is frozen, skip
         if isinstance(node, FunctionCall) and node.fn is jax.lax.stop_gradient:
             return
-        if isinstance(node, ModelCall):
+        if isinstance(node, (ModelCall, Flow)):
             active[node.model.layer_id] = node.model
             for arg in node.args:
                 if isinstance(arg, Placeholder):

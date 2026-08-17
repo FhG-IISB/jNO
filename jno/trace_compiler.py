@@ -31,6 +31,7 @@ from .trace import (
     Assembly,
     BinaryOp,
     Choice,
+    Flow,
     FunctionCall,
     GroupedAssembly,
     Hessian,
@@ -419,7 +420,7 @@ class TraceCompiler:
                         seen.add(flax_mod.layer_id)
                         layers.append((flax_mod, node.args))
 
-            elif isinstance(node, ModelCall):
+            elif isinstance(node, (ModelCall, Flow)):
                 # Visit args first (dependency order)
                 for arg in node.args:
                     if isinstance(arg, Placeholder):
