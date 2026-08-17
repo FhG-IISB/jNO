@@ -1,0 +1,44 @@
+name: Nightly (full suite)
+
+# The complete 232-file suite, unfiltered. This is what makes the PR-side path filtering in ci.yml
+# safe: if a filter is scoped too narrowly, the miss surfaces here within a day and on every push to
+# main, rather than never. Do not add path filters to this workflow -- running everything is its
+# entire purpose.
+#
+# Coverage is uploaded from HERE and not from a PR, because a filtered PR run only executes part of
+# the suite and would report every unexercised file as freshly uncovered.
+
+on:
+  schedule:
+    - cron: "0 3 * * *"   # 03:00 UTC daily
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: false   # never cancel a full run; a partial one proves nothing
+
+jobs:
+  full:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          cache: true
+
+      # One process per test FILE. The all-in-one run accumulates JAX device buffers and coverage
+      # state across the suite and gets OOM-killed part-way through on a hosted runner.
+      - name: Full test suite
+        run: pixi run ci-test-cov
+
+      - name: Upload coverage to Codecov
+        if: '!cancelled()'
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage.xml
+          flags: nightly
+          fail_ci_if_error: false

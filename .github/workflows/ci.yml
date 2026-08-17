@@ -1,60 +1,145 @@
 name: CI
 
+# PR gate: fast and targeted. The full 232-file suite lives in nightly.yml, which also runs on
+# every push to main -- so a mis-scoped filter here costs at most one day of latency and can never
+# reach a release, while a PR that only touches one area stops paying for the other areas.
+#
+# Runtimes that motivated the split: the all-in-one suite took 1h41m-2h07m per PR and was being
+# cancelled. 119 of the 232 test files are test_fem_*, so a non-FEM change was paying for the FEM
+# suite and vice versa.
+
 on:
   pull_request:
     branches: ["main"]
 
-jobs:
-  ci:
-    runs-on: ubuntu-latest
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
+jobs:
+  # ---------------------------------------------------------------- what changed
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      shared: ${{ steps.f.outputs.shared }}
+      fem: ${{ steps.f.outputs.fem }}
+      geometry: ${{ steps.f.outputs.geometry }}
+      rcwa: ${{ steps.f.outputs.rcwa }}
+      fdm: ${{ steps.f.outputs.fdm }}
+      core: ${{ steps.f.outputs.core }}
     steps:
       - uses: actions/checkout@v4
-
-      # Detect whether anything under jno/ (or test inputs / lockfile /
-      # this workflow itself) changed in the PR or push.  Docs-only and
-      # GitHub-template-only changes skip the test suite below — fmt +
-      # lint still run on every PR.
-      - name: Detect code changes
-        id: changes
-        uses: dorny/paths-filter@v3
+      - uses: dorny/paths-filter@v3
+        id: f
         with:
           filters: |
-            code:
-              - 'jno/**'
-              - 'tests/**'
+            shared:
+              - 'jno/trace/**'
+              - 'jno/np/**'
+              - 'jno/np.py'
+              - 'jno/__init__.py'
+              - 'jno/utils/ad_mode.py'
+              - 'jno/utils/schemes.py'
               - 'pyproject.toml'
               - 'pixi.lock'
               - 'pytest.ini'
               - '.github/workflows/ci.yml'
+              - '.github/ci_test_per_file.sh'
+            fem:
+              - 'jno/_fem.py'
+              - 'jno/fem*'
+              - 'jno/utils/solver/**'
+              - 'jno/precond.py'
+              - 'jno/solve.py'
+              - 'tests/test_fem_*'
+            geometry:
+              - 'jno/domain/**'
+              - 'jno/geometry/**'
+              - 'tests/test_domain_*'
+              - 'tests/test_shape_*'
+              - 'tests/test_polygon_*'
+              - 'tests/test_mesh_*'
+            rcwa:
+              - 'jno/rcwa**'
+              - 'jno/litho*'
+              - 'tests/test_rcwa_*'
+            fdm:
+              - 'jno/fdm.py'
+              - 'tests/test_fdm_*'
+            core:
+              - 'jno/**'
+              - 'tests/**'
 
-      - name: Set up pixi
-        uses: prefix-dev/setup-pixi@v0.8.1
+  # ---------------------------------------------------------------- always
+  style:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          cache: true
+      - run: pixi run ci-fmt
+      - run: pixi run ci-lint
+
+  # ---------------------------------------------------------------- targeted suites
+  #
+  # `shared` forces every group: a change under jno/trace, jno/np or the build files can break any
+  # area, and guessing which would be exactly the mis-scoping this design is trying to avoid.
+  test:
+    needs: changes
+    if: >-
+      needs.changes.outputs.shared == 'true' || needs.changes.outputs.fem == 'true' ||
+      needs.changes.outputs.geometry == 'true' || needs.changes.outputs.rcwa == 'true' ||
+      needs.changes.outputs.fdm == 'true' || needs.changes.outputs.core == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [fem, geometry, rcwa, fdm, core]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Should this group run?
+        id: want
+        run: |
+          shared='${{ needs.changes.outputs.shared }}'
+          case '${{ matrix.group }}' in
+            fem)      hit='${{ needs.changes.outputs.fem }}' ;;
+            geometry) hit='${{ needs.changes.outputs.geometry }}' ;;
+            rcwa)     hit='${{ needs.changes.outputs.rcwa }}' ;;
+            fdm)      hit='${{ needs.changes.outputs.fdm }}' ;;
+            core)     hit='${{ needs.changes.outputs.core }}' ;;
+          esac
+          if [ "$shared" = 'true' ] || [ "$hit" = 'true' ]; then echo "run=true" >> "$GITHUB_OUTPUT"
+          else echo "run=false" >> "$GITHUB_OUTPUT"; fi
+
+      - uses: prefix-dev/setup-pixi@v0.8.1
+        if: steps.want.outputs.run == 'true'
         with:
           cache: true
 
-      - name: Check formatting
-        run: pixi run ci-fmt
+      - name: Select this group's files
+        if: steps.want.outputs.run == 'true'
+        id: files
+        run: |
+          # `core` is the COMPLEMENT of the named groups, computed rather than listed, so a new
+          # test file is covered by default instead of silently belonging to nothing.
+          named() { find tests -maxdepth 1 \( -name 'test_fem_*.py' -o -name 'test_domain_*.py' \
+                      -o -name 'test_shape_*.py' -o -name 'test_polygon_*.py' \
+                      -o -name 'test_mesh_*.py' -o -name 'test_rcwa_*.py' \
+                      -o -name 'test_fdm_*.py' \) -printf '%p\n' | sort; }
+          case '${{ matrix.group }}' in
+            fem)      find tests -maxdepth 1 -name 'test_fem_*.py' -printf '%p\n' | sort > files.txt ;;
+            geometry) find tests -maxdepth 1 \( -name 'test_domain_*.py' -o -name 'test_shape_*.py' \
+                        -o -name 'test_polygon_*.py' -o -name 'test_mesh_*.py' \) -printf '%p\n' | sort > files.txt ;;
+            rcwa)     find tests -maxdepth 1 -name 'test_rcwa_*.py' -printf '%p\n' | sort > files.txt ;;
+            fdm)      find tests -maxdepth 1 -name 'test_fdm_*.py' -printf '%p\n' | sort > files.txt ;;
+            core)     find tests -maxdepth 1 -name 'test_*.py' -printf '%p\n' | sort > all.txt
+                      named > named.txt; comm -23 all.txt named.txt > files.txt ;;
+          esac
+          echo "count=$(wc -l < files.txt)" >> "$GITHUB_OUTPUT"
+          echo "--- ${{ matrix.group }}: $(wc -l < files.txt) file(s)"; cat files.txt
 
-      - name: Lint
-        run: pixi run ci-lint
-
-      - name: Test (with coverage)
-        if: steps.changes.outputs.code == 'true'
-        run: pixi run ci-test-cov
-
-      # Public-repo upload works without a token (codecov-action uses OIDC).
-      # For private repos, set the CODECOV_TOKEN secret and uncomment the
-      # `token:` line. Codecov must be enabled for the repo on codecov.io
-      # before the first upload will be visible.
-      # Runs only when the test step ran — and even if those tests
-      # failed (so red coverage reports stay visible) — but skips when
-      # the job was cancelled or when no code paths changed.
-      - name: Upload coverage to Codecov
-        if: steps.changes.outputs.code == 'true' && !cancelled()
-        uses: codecov/codecov-action@v4
-        with:
-          files: ./coverage.xml
-          flags: unittests
-          fail_ci_if_error: false
-          # token: ${{ secrets.CODECOV_TOKEN }}
+      - name: Test ${{ matrix.group }}
+        if: steps.want.outputs.run == 'true' && steps.files.outputs.count != '0'
+        run: pixi run -- bash .github/ci_test_per_file.sh $(cat files.txt)
