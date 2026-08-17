@@ -224,3 +224,69 @@ def test_local_refinement_of_a_non_quadrilateral_mesh_is_refused_by_name():
     d = jno.Shape.rect(0, 0, 1, 1, size=0.4).domain(compute_mesh_connectivity=False)
     with pytest.raises(NotImplementedError, match="quadrilateral"):
         refine_domain(d, [0])
+
+
+# ------------------------------------------------------- what a refined mesh must not quietly lose
+
+
+def test_a_named_boundary_region_survives_the_split(x64):
+    """A Neumann term bound to a named region must still find its facets after refining.
+
+    The refined mesh is built carrying only ``interior`` and ``boundary`` cell sets, so ``left`` /
+    ``right`` / any ``.tag()`` region has to be re-derived from its spatial predicate -- otherwise a
+    flux term silently integrates over nothing, or a Dirichlet condition fails by name. The adaptive
+    driver already re-tags after a remesh; measured before `refine_domain` did the same, a direct call
+    raised "Tag 'left' is not in the mesh pool or context".
+
+    ``-Lap u = 0`` with ``u = 0`` on ``left`` and a unit flux on ``right``: refining must not change the
+    answer, since the coarse mesh already resolves it.
+    """
+
+    def solve_flux(dom):
+        u, v = dom.fem_symbols()
+        xi, yi, _ = dom.variable("interior", split=True)
+        xl, yl, _ = dom.variable("left", split=True)
+        xr, yr, _ = dom.variable("right", split=True)
+        ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+        fem = jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * v.bind(x=xr, y=yr), u(xl, yl) - 0.0])
+        return np.asarray(fem.solve(linear=jno.solve.lu(backend="host"))).ravel()
+
+    base = solve_flux(_grid(4))
+    assert base.max() > 0.1, "the baseline flux term must do something, or this test proves nothing"
+
+    d = _grid(4)
+    p = np.asarray(d.mesh.points)[:, :2]
+    q = np.asarray(d.mesh.cells_dict["quad"])
+    refined = solve_flux(refine_domain(d, np.where(p[q].mean(axis=1)[:, 0] > 0.7)[0]))
+    assert refined.max() == pytest.approx(base.max(), rel=1e-6), (
+        f"the flux term changed across the split ({base.max():.6f} -> {refined.max():.6f}); "
+        "a value of 0 means it lost its facets"
+    )
+
+
+def test_a_vector_field_is_constrained_component_by_component(x64):
+    """``vec > 1``: the prolongation is the Kronecker expansion of the node map, so every component of a
+    hanging node must satisfy the same relation. A P built on nodes but applied to a component-major
+    layout would tie the wrong entries and fail here."""
+    d = _grid(4)
+    p = np.asarray(d.mesh.points)[:, :2]
+    q = np.asarray(d.mesh.cells_dict["quad"])
+    d = refine_domain(d, np.where(np.linalg.norm(p[q].mean(axis=1) - 0.5, axis=1) < 0.3)[0])
+    n = len(np.asarray(d.mesh.points))
+
+    u, v = d.fem_symbols(value_shape=(2,))
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    a, t = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    lam, mu = 1.0, 1.0
+    exx, eyy, exy = a[0].x, a[1].y, 0.5 * (a[0].y + a[1].x)
+    tr = exx + eyy
+    sxx, syy, sxy = lam * tr + 2 * mu * exx, lam * tr + 2 * mu * eyy, 2 * mu * exy
+    fem = jno.fem([sxx * t[0].x + sxy * t[0].y + sxy * t[1].x + syy * t[1].y - 1.0 * t[1], u(xb, yb) - 0.0])
+    sol = np.asarray(fem.solve(linear=jno.solve.lu(backend="host")))
+    assert sol.size == 2 * n
+    s = sol.reshape(n, 2)
+    assert np.abs(s).max() > 1e-6, "the body load did nothing; the test would pass vacuously"
+    for node, parents in d._fem_hanging_nodes.items():
+        for c in range(2):
+            assert s[node, c] == pytest.approx(sum(w * s[i, c] for i, w in parents), abs=1e-12)

@@ -209,6 +209,14 @@ def refine_domain(domain, marked, *, copy: bool = False):
         },
     )
     target = _apply_new_mesh(domain, mesh, copy=copy)
+    # Re-materialise the named boundary regions on the new mesh. `_apply_new_mesh` gives each one a
+    # spatial predicate (`_capture_geometric_boundary_tags`) but does not re-derive the regions, and the
+    # mesh built above carries only `interior` / `boundary` -- so without this a `left` / `right` / any
+    # `.tag()` region is simply gone, and a Dirichlet or Neumann term bound to one fails by name on the
+    # refined mesh. The adaptive driver already does this after a remesh; doing it here as well makes a
+    # direct `refine_domain` call behave the same as one through `adapt=jno.solve.refine(...)`.
+    for _name, _pred in list(getattr(target, "_tag_predicates", {}).items()):
+        target.tag(_name, _pred)
     target._fem_hanging_nodes = hang
     target._fem_hanging_cells = new_cells
     target._fem_hanging_cell_type = cell_type
