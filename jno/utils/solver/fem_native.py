@@ -2569,6 +2569,17 @@ def assemble_fem_native(
         bf = _boundary_facets(pts_all, np.asarray(cells_f_all[fidx]), dim, fields[fidx]["order"], _cell_type)
         if bf is None:
             return list(_region_node_ids_from_pts(domain, region, pts_all))
+        # A locally refined (hanging-node) mesh is NON-CONFORMING, and "belongs to exactly one cell" is
+        # false on it: across a 2:1 interface the coarse edge and both half-edges each belong to one
+        # cell. Left in, they make the interface a boundary -- and since the aggregate "boundary" is
+        # what a Dirichlet condition resolves through, the interface gets PINNED. Measured on a 4x4 grid
+        # with four cells refined: 32 identity rows where 16 are the perimeter, and -Lap u = 1 came back
+        # with a centre value of 0.0194 against 0.0737, with no error anywhere.
+        _hang = getattr(domain, "_fem_hanging_nodes", None)
+        if _hang:
+            from .fem_refine import drop_covered_facets
+
+            bf = drop_covered_facets(np.asarray(bf), _hang)
         bnodes = np.unique(np.asarray(bf).reshape(-1))
         if region == "boundary":
             bnodes = _drop_interface_only_nodes(np.asarray(bf), bnodes, pts_all)

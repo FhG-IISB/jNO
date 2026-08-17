@@ -4001,6 +4001,29 @@ def _fem_impl(
             # FemResidualOperator. The periodic reduction below then wraps the *coupled* residual through
             # the nonlinear Pᵀr(P·) solve path, so a periodic tie + Coupling compose with no extra branch.
             fem_obj = _wrap_couplings(domain, fem_obj, couplings)
+        _hanging = getattr(domain, "_fem_hanging_nodes", None)
+        if _hanging:
+            # A locally refined mesh: the hanging nodes are constrained to the coarse edge they sit on,
+            # which is the same elimination a periodic tie performs -- so it rides the SAME `_periodic`
+            # reduction and reaches `reduce_matrix_periodic` / `B(P)` with no branch of its own.
+            from .utils.solver.fem_refine import hanging_prolongation
+
+            if periodic_ties:
+                raise NotImplementedError(
+                    "jno.fem: a locally refined (hanging-node) mesh combined with a periodic or tied "
+                    "interface composes two prolongations, and their order changes the answer. Refine "
+                    "away from the tied faces, or tie a conforming mesh."
+                )
+            _hp = hanging_prolongation(
+                np.asarray(fem_obj.points), np.asarray(getattr(domain, "_fem_hanging_cells")), vec=vec or 1
+            )
+            # Reduce the OPERATOR, not just record P: `reduce_op_periodic` is what turns the assembled
+            # block into P^T A P. Setting `_periodic` alone leaves the raw non-conforming system in
+            # place, and it still solves -- measured, -Lap u = 1 on a 4x4 grid with four cells refined
+            # returned a centre value of 0.0194 against 0.0737, with the constraint reported as built.
+            fem_obj._op = reduce_op_periodic(fem_obj._op, fem_obj._mode, _hp)
+            fem_obj._periodic = _hp
+            return _fuse_complex_steady(fem_obj)
         if not periodic_ties:
             return _fuse_complex_steady(fem_obj)
         # Single-field transient was already reduced by the dedicated native branch -> reuse its P.

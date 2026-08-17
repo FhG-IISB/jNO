@@ -703,7 +703,7 @@ onto one DOF, so the periodicity holds exactly rather than to a tolerance.
 | not supported on quad/hex | why |
 |---|---|
 | **integrated (mortar)** ties across a hexahedral facet | the mortar rows clip triangles and have no quadrilateral analogue. The **collocated** coupling does support it, and is what a hex tie uses — see below |
-| **h-adaptive remeshing on HEXES** (`adapt=`) | not for want of plumbing: no general all-hex mesher exists (gmsh's `Recombine3DAll` on a plain box returns tetrahedra and no hexahedra), so there is nothing to remesh *to*. 3-D tensor-product adaptivity needs octree refinement with hanging-node constraints. **2-D quads DO adapt** — see below |
+| **h-adaptive remeshing on HEXES** (`adapt=`) | not for want of plumbing: no general all-hex mesher exists (gmsh's `Recombine3DAll` on a plain box returns tetrahedra and no hexahedra), so there is nothing to remesh *to*. 3-D tensor-product adaptivity needs octree refinement with hanging-node constraints — built for **2-D quads** (see below), not yet for hexes |
 | **r-adaptivity** (`relocate=`) on quad/hex | the monitor, the cell measures and the validity check are all barycentric; a bilinear cell's validity is the sign of the sampled `det J`, not one determinant |
 | 4th-order forms (plates, phase-field) | the physical-Hessian push-forward assumes an affine cell — the same refusal curved simplices already carry |
 | non-nodal families (N1E, RT, Argyris, Morley) | Argyris and Morley are *defined* on triangles; the quad analogues (RTCF/NCE, Bogner–Fox–Schmit) are different elements |
@@ -786,7 +786,56 @@ transfer uses). Measured on two hex blocks meeting at different resolutions (16 
 at 4.1e-04 in float32 and would hide a constraint error of that size.
 
 The *integrated* (mortar) coupling still refuses on a quad facet: its rows clip triangles. Collocated
-weights are linearly complete and are what a hex tie — and, later, a hanging node — actually needs.
+weights are linearly complete and are what a hex tie — and a hanging node — actually needs.
+
+### Local refinement with hanging nodes (quadrilaterals)
+
+`adapt=jno.solve.remesh()` refines a quad mesh by rebuilding its `Shape` plan at a finer size field,
+which is global and needs a geometry to rebuild from. Splitting marked cells into four needs neither —
+it works on a mesh loaded from a file, every old node survives, and it is the mechanism 3-D hexes will
+use, since no all-hex mesher exists to remesh *to*.
+
+The price is conformity: a split cell's edge midpoint is not a vertex of its unrefined neighbour, so
+that node's value is not free. It is a **hanging node**, constrained to the coarse edge it lies on:
+
+```python
+from jno.utils.solver.fem_refine import refine_domain
+
+d = jno.Shape.rect(0, 0, 1, 1).quad().structured(n=4).domain()
+d = refine_domain(d, marked_cell_ids)     # split, 2:1 balance, detect the hanging nodes
+u, v = d.fem_symbols()
+...
+fem.solve()                                # the constraint is applied automatically
+```
+
+`u_hanging = Σᵢ wᵢ u_parentᵢ` is the same relation a periodic tie and a mortar coupling impose, so it
+rides the **same prolongation** (`prolongation_from_ties`) and reaches `reduce_matrix_periodic` and the
+`B(P)` block fusion with no path of its own — the reason this is a constraint *layer* and not a second
+constraint mechanism. deal.II, MFEM and p4est all take this route.
+
+On `-Δu = 1` over the unit square (exact centre `0.073671`, Timoshenko & Woinowsky-Krieger, *Theory of
+Plates and Shells*, 2nd ed. 1959, Art. 30), refining the middle four cells of a 4×4 grid gives
+`0.075063` against `0.077679` for that grid and `0.074598` for a uniform 8×8. Four rounds into the
+centre converge monotonically to `3.3e-05`. Dropping *only* the constraint on the same mesh gives
+`0.090093` — **11.9× worse, and worse than the coarse grid it was refined from**: without the tie the
+refinement is not merely wasted but harmful.
+
+Two things in jNO assumed conformity and had to change with it, both silent when wrong:
+
+- **The boundary.** jNO derives it topologically — a facet belonging to exactly one cell — and across
+  a 2:1 interface the coarse edge and both half-edges each belong to one cell. Left alone, the
+  interface reads as boundary and a Dirichlet condition pins it *in the middle of the domain*:
+  measured, 32 identity rows on a mesh whose perimeter is 16 nodes, and a centre value of `0.0194`.
+- **Refining an already-refined mesh** must reuse the hanging node at an edge midpoint rather than make
+  a second node there. Edge topology cannot see it (once non-conforming, the coarse edge and the two
+  half-edges are *different* edges), and the duplicate splits the mesh along the interface while the
+  area, the winding and the 2:1 balance all still check out.
+
+**Limitations, measured.** Quadrilaterals only — hexahedra need the octree bookkeeping and face-centre
+constraints (a hex face hangs on its centre and covers four sub-faces), which are not built. A hanging
+node **on a tied or periodic interface** is refused by name: that composes two prolongations and their
+order changes the answer. Not yet exposed as an `adapt=` slot — `refine_domain` is called directly, so
+the marking is the caller's.
 
 Volume terms, Dirichlet conditions and **surface terms all work on both cells** — Neumann, Robin
 and flux integrals included.

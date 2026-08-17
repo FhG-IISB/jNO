@@ -79,6 +79,175 @@ def hanging_nodes(points: np.ndarray, quads: np.ndarray) -> Dict[int, List[Tuple
     return out
 
 
+def refine_domain(domain, marked, *, copy: bool = False):
+    """Refine a quadrilateral domain's marked cells in place, keeping its geometry exactly.
+
+    The counterpart to :func:`~jno.utils.solver.fem_adapt._rebuild_to_size`, and the reason this exists:
+    that path re-runs gmsh on the ``Shape`` plan, so it needs a geometry to rebuild from and produces a
+    mesh that does not nest inside the old one. Splitting cells needs neither -- it works on a mesh
+    loaded from a file, and the old mesh's nodes all survive with their values.
+
+    The boundary is supplied explicitly, from :func:`boundary_edges` rather than from the topological
+    "belongs to one cell" rule, which is false on the non-conforming mesh this produces; see there.
+    Named boundary sub-regions re-derive from their predicates exactly as they do after a remesh
+    (``_capture_geometric_boundary_tags``), and the refinement preserves the boundary geometry, so the
+    new perimeter nodes lie on the same curves.
+
+    The hanging nodes are stashed on the domain, where ``jno.fem`` picks them up and turns them into the
+    constraint prolongation.
+    """
+    import meshio
+
+    from .fem_adapt import _apply_new_mesh
+    from .fem_native import mesh_cell_type
+
+    dim = int(domain.dimension)
+    if mesh_cell_type(domain, dim) != "quad":
+        raise NotImplementedError(
+            "local (hanging-node) refinement is written for quadrilateral meshes. A simplex mesh adapts "
+            "through mmg (`jno.solve.remesh()`), which is local already; hexahedra need the octree "
+            "bookkeeping and the face-centre constraints, which are not built yet."
+        )
+    pts = np.asarray(domain.mesh.points)[:, :dim]
+    quads = np.asarray(domain.mesh.cells_dict["quad"])
+
+    new_pts, new_quads = refine_quads(pts, quads, marked)
+    hang = hanging_nodes(new_pts, new_quads)
+    bedges = boundary_edges(new_pts, new_quads, hang)
+
+    pts3 = np.zeros((len(new_pts), 3), dtype=np.float64)
+    pts3[:, :dim] = new_pts
+    empty = np.asarray([], dtype=np.int64)
+    mesh = meshio.Mesh(
+        pts3,
+        [("quad", new_quads), ("line", bedges)],
+        cell_sets={
+            "interior": [np.arange(len(new_quads), dtype=np.int64), empty],
+            "boundary": [empty, np.arange(len(bedges), dtype=np.int64)],
+        },
+    )
+    target = _apply_new_mesh(domain, mesh, copy=copy)
+    target._fem_hanging_nodes = hang
+    target._fem_hanging_cells = new_quads
+    return target
+
+
+def hanging_prolongation(
+    points: np.ndarray,
+    quads: np.ndarray,
+    *,
+    vec: int = 1,
+    hang: Dict | None = None,
+    tied_nodes=None,
+) -> Dict[str, object]:
+    """The hanging-node constraints as a prolongation ``P``, in the form the solve already consumes.
+
+    A hanging node is constrained to the coarse edge it lies on, ``u_h = sum_i w_i u_parent_i`` -- the
+    same relation a periodic tie and a mortar coupling impose. So this hands the pairs to
+    :func:`~jno.utils.solver.fem_utils.prolongation_from_ties`, the shared elimination, and inherits
+    ``reduce_matrix_periodic`` / ``prolong_periodic`` and the ``B(P)`` block fusion unchanged. Building
+    a second constraint mechanism beside that one is how the two drift apart.
+
+    ``tied_nodes`` are nodes already constrained by a periodic or tied interface. A hanging node among
+    them would compose two prolongations, and the ORDER of that composition is a decision this does not
+    make -- so it is refused by name rather than left to half-work.
+    """
+    from .fem_utils import prolongation_from_ties
+
+    pts = np.asarray(points, dtype=float)
+    hang = hanging_nodes(pts, quads) if hang is None else hang
+
+    if tied_nodes is not None:
+        clash = sorted(set(int(n) for n in np.asarray(tied_nodes).reshape(-1)) & set(hang))
+        if clash:
+            raise NotImplementedError(
+                f"{len(clash)} hanging node(s) lie on a tied or periodic interface (e.g. node {clash[0]} at "
+                f"{tuple(np.round(pts[clash[0]], 6))}). That composes two prolongations -- the hanging "
+                "constraint eliminates the node onto its coarse edge, the tie eliminates it onto the other "
+                "interface -- and which comes first changes the answer, so jNO refuses rather than picking "
+                "one. Keep the refined region off the tied interface, or refine both sides to match."
+            )
+
+    return prolongation_from_ties(
+        len(pts),
+        {},
+        {int(n): [(int(p), float(w)) for p, w in ws] for n, ws in hang.items()},
+        vec=vec,
+        coupling="hanging",
+    )
+
+
+def boundary_edges(points: np.ndarray, quads: np.ndarray, hang: Dict | None = None) -> np.ndarray:
+    """The true perimeter of a possibly **non-conforming** quad mesh, as ``(n_edges, 2)`` node pairs.
+
+    jNO derives the boundary topologically -- a facet belonging to exactly one cell -- and that rule is
+    *false* here. Across a 2:1 interface the coarse cell's full edge ``(a, b)`` belongs to one cell, and
+    so does each of the neighbour's half-edges ``(a, m)`` and ``(m, b)``: three edges, each occurring
+    once, none of them on the perimeter. Measured on a 4x4 grid with one refined corner, that rule
+    returns 32 edges of which only 20 are real -- and the other 12, being handed to the solve as
+    ``boundary``, get pinned as Dirichlet. That is silent: the first end-to-end hanging solve came back
+    with the interior pinned to zero, with nothing naming the interface.
+
+    The correct rule is *coverage*, not multiplicity: a once-occurring edge is interior when the rest of
+    the mesh covers it. With a 2:1 balance in force the hanging nodes say exactly where that happens, so
+    the three edges above are recognised by their relationship to a hanging node ``m`` and dropped --
+    both the coarse edge that ``m`` splits and the two half-edges that split it.
+
+    Quadrilaterals only. A hexahedral face additionally hangs on a face CENTRE and covers four
+    sub-faces, which is the same argument with more bookkeeping and is not written yet.
+    """
+    pts = np.asarray(points, dtype=float)
+    quads = np.asarray(quads, dtype=np.int64)
+    hang = hanging_nodes(pts, quads) if hang is None else hang
+
+    counts: Dict[Tuple[int, int], int] = {}
+    for cell in quads:
+        for a_loc, b_loc in QUAD_EDGES:
+            a, b = int(cell[a_loc]), int(cell[b_loc])
+            k = (a, b) if a < b else (b, a)
+            counts[k] = counts.get(k, 0) + 1
+
+    once = np.array([list(k) for k, n in counts.items() if n == 1], dtype=np.int64).reshape(-1, 2)
+    return drop_covered_facets(once, hang)
+
+
+def covered_facet_keys(hang: Dict) -> set:
+    """The facets a 2:1 interface makes interior, as sorted node-pair keys.
+
+    Three per hanging node ``m``: the coarse edge ``(a, b)`` that ``m`` splits, and the two half-edges
+    ``(a, m)`` and ``(m, b)`` that split it. Each belongs to exactly one cell, so each looks like a
+    boundary facet, and none of them is one.
+    """
+    out = set()
+    for m, parents in hang.items():
+        (a, _), (b, _) = parents
+        for i, j in ((a, b), (a, int(m)), (int(m), b)):
+            out.add((i, j) if i < j else (j, i))
+    return out
+
+
+def drop_covered_facets(facets: np.ndarray, hang: Dict) -> np.ndarray:
+    """Remove the 2:1-interface facets from a topologically-derived boundary facet array.
+
+    The topological rule -- "a facet belonging to exactly one cell" -- is what every boundary consumer
+    in jNO is built on, and it is false on a non-conforming mesh. Rather than change that rule
+    everywhere, this subtracts the facets a hanging node proves are covered, so a caller that already
+    has ``bf`` gets the true boundary by filtering rather than by re-deriving it.
+
+    Reads the first two columns, which are the vertices of an edge facet under both P1 and P2 (the
+    higher-order nodes follow), and returns the rows unchanged.
+    """
+    facets = np.asarray(facets, dtype=np.int64)
+    if not hang or facets.size == 0:
+        return facets
+    covered = covered_facet_keys(hang)
+    keep = np.array(
+        [(min(int(r[0]), int(r[1])), max(int(r[0]), int(r[1]))) not in covered for r in facets],
+        dtype=bool,
+    )
+    return facets[keep]
+
+
 def balance_marks(points: np.ndarray, quads: np.ndarray, marked) -> np.ndarray:
     """Grow ``marked`` until refining it leaves no cell edge spanning more than one finer neighbour.
 
@@ -156,13 +325,26 @@ def refine_quads(points: np.ndarray, quads: np.ndarray, marked):
     need[ce[marked].ravel()] = True
     eids = np.where(need)[0]
     mid_of_edge = np.full(topo.n_edges, -1, dtype=np.int64)
-    mid_of_edge[eids] = len(points) + np.arange(len(eids))
-    new_pts = [points, points[ev[eids]].mean(axis=1)]
+
+    # An edge's midpoint may ALREADY be a node: it is the hanging node a previous round left there, and
+    # refining this cell is exactly what makes it a regular one. Edge topology cannot see that -- once
+    # the mesh is non-conforming the coarse edge and its neighbour's half-edges are different edges, so
+    # the shared-by-edge-id rule stops sharing -- and creating a second node at the same coordinate
+    # splits the mesh in two along the interface. Silent: the area, the winding and the 2:1 balance all
+    # still check out. Measured before this lookup, refining the same region four times drove the
+    # -Lap u = 1 centre value from 0.0751 (right) to 0.0180 against a reference 0.0737.
+    lut, q = _node_lookup(points)
+    mids = points[ev[eids]].mean(axis=1)
+    existing = np.array([lut.get(tuple(k), -1) for k in np.round(mids / q).astype(np.int64)], dtype=np.int64)
+    fresh = existing < 0
+    mid_of_edge[eids[~fresh]] = existing[~fresh]
+    mid_of_edge[eids[fresh]] = len(points) + np.arange(int(fresh.sum()))
+    new_pts = [points, mids[fresh]]
 
     # one centre per marked cell
     m_cells = np.where(marked)[0]
     centre_of = np.full(len(quads), -1, dtype=np.int64)
-    centre_of[m_cells] = len(points) + len(eids) + np.arange(len(m_cells))
+    centre_of[m_cells] = len(points) + int(fresh.sum()) + np.arange(len(m_cells))
     new_pts.append(points[quads[m_cells]].mean(axis=1))
     pts_out = np.vstack(new_pts)
 

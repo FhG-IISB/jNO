@@ -3061,6 +3061,50 @@ def build_periodic_prolongation(
                 )
             secondary_interp[int(sid)] = [(int(m), complex(ph) * wt) for (m, wt) in w]
 
+    return prolongation_from_ties(
+        n_nodes,
+        secondary_to_main,
+        secondary_interp,
+        vec=vec,
+        secondary_phase=secondary_phase,
+        is_bloch=is_bloch,
+        coupling=(
+            "conforming"
+            if not (n_mortar or n_collocated)
+            else "mortar"
+            if not n_collocated
+            else "collocated"
+            if not n_mortar
+            else "mixed"
+        ),
+    )
+
+
+def prolongation_from_ties(
+    n_nodes: int,
+    secondary_to_main: Dict[int, int],
+    secondary_interp: Dict[int, List[Tuple[int, complex]]],
+    *,
+    vec: int = 1,
+    secondary_phase: Dict[int, complex] | None = None,
+    is_bloch: bool = False,
+    coupling: str = "conforming",
+) -> Dict[str, object]:
+    """Turn ``constrained node -> weights on other nodes`` into the prolongation ``P``.
+
+    The half of :func:`build_periodic_prolongation` that is about the *constraint*, with nothing in it
+    about periodicity: transitively resolve every constrained node to free ones, then assemble the
+    sparse ``P``. Split out because a periodic tie, a non-matching (mortar/collocated) interface and a
+    **hanging node** are the same relation ``u_constrained = sum_i w_i u_free`` and differ only in where
+    the weights come from -- so they share one elimination, one ``B(P)`` fusion and one solve path
+    rather than growing a second constraint mechanism beside the first.
+
+    ``secondary_to_main`` are exact one-to-one ties (weight 1, or the Bloch phase from
+    ``secondary_phase``); ``secondary_interp`` are weighted ones. Returns the dict documented on
+    :func:`build_periodic_prolongation`, with ``coupling`` passed through by the caller, which is the
+    only part that knows how the weights were obtained.
+    """
+    secondary_phase = secondary_phase or {}
     secondary_set = set(secondary_to_main) | set(secondary_interp)
 
     # Each secondary is a linear combination of other nodes (exact: one main, weight 1; interpolated:
@@ -3141,18 +3185,10 @@ def build_periodic_prolongation(
         # Bloch/quasi-periodic: P is complex, so the reduction is Hermitian (P^H A P) and the reduced
         # complex system can't be split into independent real/imag legs.
         "is_bloch": bool(is_bloch),
-        # How the NON-matching secondarys were tied: "conforming" (there were none), "mortar" (integrated,
-        # passes the patch test), "collocated" (node-to-segment; no secondary facets to integrate over) or
-        # "mixed". Reported rather than inferred, so a caller never has to guess which it got.
-        "coupling": (
-            "conforming"
-            if not (n_mortar or n_collocated)
-            else "mortar"
-            if not n_collocated
-            else "collocated"
-            if not n_mortar
-            else "mixed"
-        ),
+        # How the constrained nodes were tied: "conforming" (exact node-to-node), "mortar" (integrated,
+        # passes the patch test), "collocated" (node-to-segment; no secondary facets to integrate over),
+        # "mixed", or "hanging". Reported rather than inferred, so a caller never has to guess.
+        "coupling": coupling,
     }
 
 
