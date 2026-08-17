@@ -2579,7 +2579,8 @@ def assemble_fem_native(
         if _hang:
             from .fem_refine import drop_covered_facets
 
-            bf = drop_covered_facets(np.asarray(bf), _hang)
+            # n_v from the DIMENSION, not from the column count: an order-3 edge also has 4 columns
+            bf = drop_covered_facets(np.asarray(bf), _hang, n_v=2 if dim == 2 else 4)
         bnodes = np.unique(np.asarray(bf).reshape(-1))
         if region == "boundary":
             bnodes = _drop_interface_only_nodes(np.asarray(bf), bnodes, pts_all)

@@ -462,3 +462,53 @@ def test_a_3d_vector_field_is_constrained_on_a_refined_hex_mesh(x64):
     for node, parents in d._fem_hanging_nodes.items():
         for comp in range(3):
             assert s[node, comp] == pytest.approx(sum(w * s[i, comp] for i, w in parents), abs=1e-12)
+
+
+def test_order_3_is_constrained_correctly(x64):
+    """Order 3, and the reason it is worth having a test of its own rather than trusting the order-2 one.
+
+    The constraint machinery is order-general (a cell's own edge DOFs at k/order, a 2:1 neighbour's at
+    k/(2*order), Lagrange through the former), and at order 3 it built the right 24 constraints with a
+    passing patch test -- yet the solve was wrong by 5.53e-02. The cause was elsewhere and dimensional: a
+    2-D edge facet at order 3 has FOUR columns (2 vertices + 2 on-edge nodes), and the covering filter
+    identified facets by column count, reading it as a 3-D quadrilateral FACE. It then dropped nothing,
+    the 2:1 interface was handed to the solve as boundary, and a Dirichlet condition pinned it mid-domain
+    -- the same 0.018-vs-0.074 signature as the original blocker. Orders 1 and 2 were unaffected only
+    because their column counts fell on the right side of the guess.
+    """
+    coarse_err = abs(_centre(_grid(4), _poisson_order(_grid(4), 3)) - POISSON_CENTRE)
+    d = _refined_centre()
+    sol = _poisson_order(d, 3)
+    pts = np.asarray(d._fem_native_dof_points)[:, :2]
+    got = float(sol[int(np.argmin(np.linalg.norm(pts - 0.5, axis=1)))])
+    assert abs(got - POISSON_CENTRE) < 1e-5, f"order 3 on a refined mesh is off by {abs(got - POISSON_CENTRE):.2e}"
+    assert abs(got - POISSON_CENTRE) < coarse_err
+
+    hd = hanging_dofs(
+        pts,
+        np.asarray(d._fem_native_assembly_cells),
+        np.asarray(d.mesh.points)[:, :2],
+        np.asarray(d._fem_hanging_cells),
+        "quad",
+        3,
+    )
+    assert {len(p) for p in hd.values()} == {4}, "an order-3 edge constraint has 4 parents"
+    for k, parents in hd.items():
+        assert sum(w for _, w in parents) == pytest.approx(1.0, abs=1e-12)
+        assert sol[k] == pytest.approx(sum(w * sol[i] for i, w in parents), abs=1e-10)
+
+
+def test_the_covering_filter_is_told_the_facet_kind_not_left_to_guess():
+    """A 2-D edge and a 3-D quadrilateral face can both arrive with 4 columns, so the number of columns
+    does not identify the facet — the mesh's DIMENSION does. Pinned directly, because the failure it
+    caused was three steps away from its cause."""
+    from jno.utils.solver.fem_refine import drop_covered_facets
+
+    # one hanging node with 2 parents (an edge midpoint): edge (0,1) is covered, and so is any edge
+    # touching node 9
+    hang = {9: [(0, 0.5), (1, 0.5)]}
+    order3_edges = np.array([[0, 1, 5, 6], [2, 3, 7, 8]], dtype=np.int64)  # 4 columns, but EDGES
+    kept = drop_covered_facets(order3_edges, hang, n_v=2)
+    assert len(kept) == 1 and kept[0][0] == 2, "the covered order-3 edge was not dropped"
+    # read as a 4-vertex face, the same rows are not recognised at all
+    assert len(drop_covered_facets(order3_edges, hang, n_v=4)) == 2

@@ -391,7 +391,7 @@ def boundary_facets(points: np.ndarray, quads: np.ndarray, hang: Dict | None = N
             first.setdefault(k, ids)
 
     once = np.array([first[k] for k, n in counts.items() if n == 1], dtype=np.int64).reshape(-1, len(local[0]))
-    return drop_covered_facets(once, hang)
+    return drop_covered_facets(once, hang, n_v=len(local[0]))
 
 
 def covered_facet_keys(hang: Dict, n_v: int = 2) -> set:
@@ -404,7 +404,7 @@ def covered_facet_keys(hang: Dict, n_v: int = 2) -> set:
     return {tuple(sorted(int(p) for p, _ in parents)) for parents in hang.values() if len(parents) == n_v}
 
 
-def drop_covered_facets(facets: np.ndarray, hang: Dict) -> np.ndarray:
+def drop_covered_facets(facets: np.ndarray, hang: Dict, n_v: int | None = None) -> np.ndarray:
     """Remove the 2:1-interface facets from a topologically-derived boundary facet array.
 
     The topological rule -- "a facet belonging to exactly one cell" -- is what every boundary consumer
@@ -427,7 +427,14 @@ def drop_covered_facets(facets: np.ndarray, hang: Dict) -> np.ndarray:
     facets = np.asarray(facets, dtype=np.int64)
     if not hang or facets.size == 0:
         return facets
-    n_v = 2 if facets.shape[1] < 4 else 4  # edge vs quad face; P2 trailing nodes are not part of the key
+    if n_v is None:
+        # Only a fallback. The column count does NOT identify the facet: an order-3 edge in 2-D also has
+        # 4 columns (2 vertices + 2 on-edge nodes) and reading it as a quadrilateral face builds the
+        # wrong key, drops nothing, and hands the 2:1 interface to the solve as boundary -- which pins it
+        # as Dirichlet. Measured when it did: -Lap u = 1 came back at 0.0184 against 0.0737, only at
+        # order 3, while orders 1 and 2 were unaffected because their column counts happened to fall on
+        # the right side of the guess. Callers pass `n_v` from the mesh DIMENSION, which is what decides.
+        n_v = 2 if facets.shape[1] < 4 else 4
     centres = {int(n) for n, parents in hang.items() if len(parents) == n_v}
     coarse = covered_facet_keys(hang, n_v)
     keep = np.array(

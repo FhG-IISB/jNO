@@ -878,14 +878,19 @@ Before this, a hexahedral mesh had **no** h-adaptive path at all.
 **What it composes with, measured.** Scalar and vector fields (`value_shape=(d,)`, constrained
 component by component), **coupled multifield** and **complex** problems (one prolongation block per
 field — a complex field is two coupled real fields, and both halves are constrained), 2-D and 3-D, and
-**order 2** on quadrilaterals. Order 2 needs the coarse edge's *quadratic* basis, and it changes which
-DOFs hang, not just their weights: jNO shares one DOF per coordinate, so the fine vertex at a coarse
+**any Lagrange order** on quadrilaterals (verified to order 3). Higher order needs the coarse edge's
+higher-degree basis, and it changes which DOFs hang, not just their weights: jNO shares one DOF per coordinate, so the fine vertex at a coarse
 edge's midpoint **is** that edge's own order-2 DOF — free, not hanging — while the DOFs that do hang sit
 at the quarter points with weights `(0.375, −0.125, 0.75)`. Those negative weights are real; a quadratic
 through three points is not a convex combination. On `-Δu = 1`, refining at order 2 gives `1.16e-05`
 against `1.98e-05` for order 2 on the mesh it was refined from.
 
-**Limitations, measured.** Order 2 on **hexahedra** is refused: a hex's 2:1 interface also constrains
+**Element families.** Lagrange only. Simplex-only families — the C¹ spaces (Argyris, Morley, Hermite)
+and the H(div)/H(curl) ones (RT, N1curl) — are unreachable here rather than refused: they are defined on
+triangles in jNO, and a triangular mesh cannot be locally refined at all (see below), so the combination
+cannot arise. Asking for one on a quadrilateral mesh fails the same way with or without refinement.
+
+**Limitations, measured.** Order 2 and above on **hexahedra** is refused: a hex's 2:1 interface also constrains
 DOFs lying on a *face*, needing that face's 9-node basis rather than the edge basis. A hanging node **on
 a tied or periodic interface** is refused — that composes two prolongations and their order changes the
 answer; it is reachable in 3-D only (along a 2-D boundary an edge belongs to one cell, so refining it
