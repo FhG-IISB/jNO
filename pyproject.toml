@@ -7,7 +7,7 @@ name = "jax-numerical-operators"
 version = "0.3.0"
 description = "Differentiable numerical methods in JAX (FEM, FDM, spectral) with scientific machine learning"
 readme = "README.md"
-requires-python = ">=3.11, <3.14"
+requires-python = ">=3.11, <3.15"
 authors = [{ name = "Leon Armbruster", email = "leon.armbruster@iisb.fraunhofer.de" }]
 license = "EPL-2.0"
 classifiers = [
@@ -19,6 +19,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Scientific/Engineering :: Mathematics",
     "Topic :: Scientific/Engineering :: Physics",
