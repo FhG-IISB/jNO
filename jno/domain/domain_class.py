@@ -3193,6 +3193,8 @@ class domain(MeshIOMixin):
 
         from jno.utils.solver.fem_adapt import _locate_in_cells
 
+        # 4-tuple: `_locate_in_cells` grew a reference-coordinate return with the quad/hex elements
+        # (271363d3), after this call site was written against the 3-tuple.
         owner, _w, _ref, inside = _locate_in_cells(src_pts, src_cells, tgt_centroids, tol=1e-9, k=32)
         return np.where(inside, vals[owner], float(outside))
 
