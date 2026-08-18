@@ -1278,8 +1278,12 @@ def _criterion_weak_terms(fem: Any, criterion: Any, field: int = 0):
     ``_jno_region_tag``, because ``jno.fem`` retags coordinates to the quadrature pool
     (``"fem_gauss"``) at build time and the raw tag no longer names a region.
     """
+    from jno._fem import _retag_coords_for_quadrature
+
     from ...trace import Placeholder, TestFunction, Variable, _iter_placeholder_children
     from .solver_helper import contains_node_type
+
+    _retag_coords_for_quadrature_early = _retag_coords_for_quadrature
 
     node = getattr(criterion, "expr", criterion)
 
@@ -1313,12 +1317,20 @@ def _criterion_weak_terms(fem: Any, criterion: Any, field: int = 0):
     if not 0 <= int(field) < len(tests):
         raise ValueError(f"adapt(criterion=...): metric_field={field} but this problem has {len(tests)} field(s).")
 
+    _bregions = getattr(fem.domain, "_boundary_regions", {}) or {}
+
     def _region_tags(root) -> list:
         found: list = []
         for var in _walk(root, Variable):
             tg = getattr(var, "tag", None)
             if isinstance(tg, str) and (tg == "fem_gauss" or tg.startswith("gauss_")):
                 tg = getattr(var, "_jno_region_tag", tg)  # the recovery `_region_and_support` does
+            # An outward-normal Variable `n_<region>` belongs to ITS region rather than naming a second
+            # one -- the same rule `_region_and_support` applies. Without it a surface objective that
+            # uses the normal (`(u.n)^2`, the free-surface case) resolves to `['top', 'n_top']` and is
+            # rejected as spanning two regions.
+            if isinstance(tg, str) and tg.startswith("n_") and tg[2:] in _bregions:
+                tg = tg[2:]
             if isinstance(tg, str) and tg not in found:
                 found.append(tg)
         return found
@@ -1343,29 +1355,92 @@ def _criterion_weak_terms(fem: Any, criterion: Any, field: int = 0):
         raise ValueError(f"adapt(criterion=...): the criterion spans more than one region {tags}; use one.")
 
     dim = int(fem.domain.dimension)
+
     # Bind the test function to the coordinate OBJECTS already in play, not to freshly fetched ones.
     # A criterion referencing a bound field (`ui * (1 - ui)`) carries the form's retagged coordinates
     # inside it, and mixing those with fresh ones raises "coord binding conflict for 'x': cannot combine
     # two named views that map 'x' to different Variables". Ordered by `dim[0]`, the axis index.
+    def _var_region(var) -> str:
+        """The region a coordinate Variable belongs to, after the quadrature retag."""
+        tg = getattr(var, "tag", None)
+        if isinstance(tg, str) and (tg == "fem_gauss" or tg.startswith("gauss_")):
+            # `_jno_region_tag` is the recorded original; when it is absent the region is still
+            # recoverable from the pool name itself (`gauss_<region>`).
+            tg = getattr(var, "_jno_region_tag", None) or (tg[6:] if tg.startswith("gauss_") else tg)
+        return tg if isinstance(tg, str) else ""
+
     seen_axis: dict = {}
+    # Coordinates must come from the region resolved above, and ONLY from it. Taking whatever spatial
+    # Variables the walk happens to reach mixes regions -- axis 0 from the form's interior coordinates,
+    # axis 1 from the criterion's own -- and binding the test function to that mixture raises "coord
+    # binding conflict for 'x'". Outward normals (`n_<region>`) and the element-size symbol are spatial
+    # but are not quadrature coordinates, so they are skipped here exactly as
+    # `_retag_coords_for_quadrature` skips them.
     for root in [node] + [getattr(t, "expr", t) for t in list(getattr(fem, "_constraints", None) or [])]:
         for var in _walk(root, Variable):
-            if getattr(var, "axis", None) != "spatial":
+            if getattr(var, "axis", None) != "spatial" or _var_region(var) != tags[0]:
                 continue
-            ax = int(getattr(var, "dim", [0])[0])
-            seen_axis.setdefault(ax, var)
+            _tg = getattr(var, "tag", None)
+            if isinstance(_tg, str) and (_tg == "cell_size" or _tg.startswith(("n_", "gap_"))):
+                continue
+            seen_axis.setdefault(int(getattr(var, "dim", [0])[0]), var)
         if len(seen_axis) >= dim:
             break
+    if len(seen_axis) < dim:
+        # A BOUND view absorbs its coordinates: `u.bind(x=xs, y=ys)` stores them in the view's
+        # `_coord_vars` rather than leaving them in the expression tree, so the walk above finds none
+        # (a free-surface objective typically exposes only the normals). They must be recovered rather
+        # than re-fetched: `domain.variable(...)` mints NEW Variable objects every call, and combining
+        # one of those with the criterion's own raises "coord binding conflict" even when both carry
+        # the same tag -- the check is on identity, not on the name.
+        for n in _walk(node, Placeholder):
+            for val in list(getattr(n, "__dict__", {}).values()):
+                cv = getattr(val, "_coord_vars", None)
+                if not isinstance(cv, dict):
+                    continue
+                for var in cv.values():
+                    if isinstance(var, Variable) and _var_region(var) == tags[0]:
+                        seen_axis.setdefault(int(getattr(var, "dim", [0])[0]), var)
+            if len(seen_axis) >= dim:
+                break
     if len(seen_axis) >= dim:
         coords = [seen_axis[a] for a in sorted(seen_axis)][:dim]
     else:  # nothing carries coordinates (a criterion of pure constants): fall back to the region's own
         coords = list(fem.domain.variable(tags[0], split=True))[:dim]
     test_bound = tests[int(field)](*coords)
+    # Retag the TEST function's coordinates before combining it with the criterion, not after. When the
+    # criterion exposes no free coordinates of its own -- a bound view absorbs them, which is what
+    # `u.bind(x=..., y=...)` does -- `coords` are freshly fetched from the domain and still carry the
+    # raw region tag, while the criterion's own were retagged to the quadrature pool at build time.
+    # Multiplying the two then raises "coord binding conflict for 'x'" between `top` and `gauss_top`:
+    # the same region under two names. Retagging first puts both on the pool. Mutates the coordinate
+    # Variables in place, so it fixes `test_bound` itself, and is idempotent on already-retagged ones.
+    _support = "boundary" if str(tags[0]) in (getattr(fem.domain, "_boundary_regions", {}) or {}) else "volume"
+    _retag_coords_for_quadrature_early(test_bound, _support, tags[0])
     node = getattr(criterion, "expr", criterion)
     # The MASS term is built from the same test function and coordinates rather than from the criterion,
     # so that an already-weak criterion does not produce `1 + 0*(g*v)` -- a sum of a test-free and a
     # test-carrying part, which the assembler rejects as "must contain exactly one test field".
-    crit_term = criterion if contains_node_type(node, TestFunction) else criterion * test_bound
+    if contains_node_type(node, TestFunction):
+        crit_term = criterion  # already a weak term: do not bind a second test function onto it
+    else:
+        try:
+            crit_term = criterion * test_bound
+        except ValueError as e:
+            if "coord binding conflict" not in str(e):
+                raise
+            # The auto-bound test function and the criterion reached the same region through DIFFERENT
+            # coordinate objects, and the binder compares identity rather than tag. Reachable when the
+            # criterion is built from a bound view (`u.bind(x=xs, y=ys)`), which absorbs its coordinates
+            # so they cannot be recovered from the expression. The user already holds a test function
+            # bound to those very coordinates, so say so instead of surfacing a trace-level error.
+            raise ValueError(
+                "adapt(criterion=/objective=): could not bind this problem's test function to region "
+                f"{tags[0]!r}, because the expression reaches it through coordinates that a bound view "
+                "has absorbed. Carry the test function yourself -- multiply by the one you already bound "
+                "to that region, e.g. `objective=<expr> * v_r[0]` where `v_r = v.bind(x=xr, y=yr)`. "
+                f"Original error: {e}"
+            ) from e
     mass_term = 1.0 * test_bound
 
     # Point the coordinates at the quadrature pool, exactly as `jno.fem` does to a form's coordinates at
@@ -1373,10 +1448,12 @@ def _criterion_weak_terms(fem: Any, criterion: Any, field: int = 0):
     # while assembly wants quadrature points, and the mismatch surfaces as a bare broadcasting error
     # ("input type=float32[173484] and requested type=float32[948]") naming neither the criterion nor
     # the coordinates. Idempotent on coordinates the form already retagged.
-    from jno._fem import _retag_coords_for_quadrature
-
+    # A criterion on a BOUNDARY region integrates over facets, and the quadrature pool it must bind to
+    # is that region's own (`gauss_<tag>`), not the volume pool -- retagging a surface term as "volume"
+    # points it at the wrong points and the mismatch surfaces as a bare broadcasting error. The support
+    # is decided by whether the single region resolved above is a tagged boundary region.
     for t in (crit_term, mass_term):
-        _retag_coords_for_quadrature(t, "volume", tags[0])
+        _retag_coords_for_quadrature(t, _support, tags[0])
     return crit_term, mass_term
 
 
@@ -2159,12 +2236,20 @@ class AdaptSpec:
     against descent's 3.951e-02 (uniform 1.096e-01), min element quality 0.160 against 0.503. See
     :func:`jno.solve.relocate` for the full table and the ``relax_step`` control that recovers part of it.
     (This docstring previously claimed the opposite of all of that.)"""
-    objective: str = "equidistribution"
-    """Relocation only, **internal / not yet exposed** by :func:`jno.solve.relocate`: which mesh functional
+    objective: Any = "equidistribution"
+    """Relocation only: which mesh functional
     to descend. ``"equidistribution"`` (default) is :func:`_equidistribution_jax`, the scale-free
     equidistribution defect of an arclength monitor; ``"huang"`` is :func:`_huang_ea_jax`, Huang's
-    equidistribution+alignment functional with the same (isotropic) monitor. Present so the two can be
-    measured against each other on the same problem before either is given a public spelling."""
+    equidistribution+alignment functional with the same (isotropic) monitor; ``"energy"`` is the FE
+    Dirichlet energy.
+
+    It may instead be a **weak-form expression**, assembled exactly as ``criterion=`` is (same test
+    symbol and region recovery) and summed to a scalar. The three strings are mesh-QUALITY functionals
+    -- they read the solution only through a monitor -- so they cannot express a goal that names the
+    physics. An expression can: ``inner(u, n) ** 2`` on a boundary region relocates that wall until the
+    flow through it vanishes, which is a free surface. Volume and boundary regions both assemble; the
+    facet normals move with the vertices, so ``n`` in such an expression is the normal of the CURRENT
+    mesh rather than the one it started on."""
 
 
 # Consecutive rounds that must satisfy ``eps`` before the loop stops on convergence.
@@ -2822,8 +2907,36 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
             return newton_krylov(lambda uu: op.residual(uu, vals), u0)
         return _march(vals)  # transient: time-averaged nodal state over the marched trajectory
 
-    if spec.objective not in ("energy", "equidistribution", "huang"):
-        raise ValueError(f"AdaptSpec.objective must be 'energy', 'equidistribution' or 'huang'; got {spec.objective!r}.")
+    # A TRACED objective: any weak-form expression, assembled like a `criterion=` and summed to the
+    # scalar the descent already minimises. The three strings are mesh-quality functionals written in
+    # terms of a monitor; an expression says what the MESH IS FOR instead -- e.g. a free surface found
+    # by minimising the through-flow it should not carry.
+    _obj_expr = None if isinstance(spec.objective, str) else spec.objective
+    if _obj_expr is None and spec.objective not in ("energy", "equidistribution", "huang"):
+        raise ValueError(
+            f"AdaptSpec.objective must be 'energy', 'equidistribution', 'huang', or a weak-form "
+            f"expression; got {spec.objective!r}."
+        )
+    if _obj_expr is not None:
+        # The objective is a SCALAR, so it needs a scalar test function to be a weak term: multiplying a
+        # scalar by a vector field's test function gives one entry per component, which assembles to a
+        # different length than the scalar it came from and fails as a bare broadcasting error. On a
+        # multifield problem (a velocity/pressure saddle -- the case this feature is for) the pressure
+        # test is scalar, so pick the first scalar-valued field rather than making the caller know to.
+        _fidx = int(getattr(spec, "metric_field", 0) or 0)
+        if _vecs is not None and _fidx < len(_vecs) and _vecs[_fidx] > 1:
+            _scalar_fields = [i for i, vc in enumerate(_vecs) if vc == 1]
+            if not _scalar_fields:
+                raise NotImplementedError(
+                    "adapt(relocate=..., objective=<expression>): every field of this problem is "
+                    f"vector-valued (components per field: {list(_vecs)}), so there is no scalar test "
+                    "function to assemble a scalar objective against. Add a scalar field, or use one of "
+                    "the string objectives."
+                )
+            _fidx = _scalar_fields[0]
+        # Assembled ONCE, outside the descent: `_criterion_weak_terms` walks the form to recover the
+        # test symbol and the region, which is Python-level work that must not repeat per iteration.
+        _obj_weak, _ = _criterion_weak_terms(fem, _obj_expr, _fidx)
     if spec.relocate_method not in ("descent", "monge_ampere"):
         raise ValueError(f"AdaptSpec.relocate_method must be 'descent' or 'monge_ampere'; got {spec.relocate_method!r}.")
 
@@ -2849,7 +2962,16 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
         u = _solve_at(vals)
         pts = _scatter(vals)
         bounds = list(fem.offsets) if fem.offsets is not None else [0, int(u.shape[0])]
-        return _block_defect(u, pts, bounds), _block_energy(u, pts, bounds)
+        if _obj_expr is not None:
+            # `fem.eval` gives the term tested against every basis function, `int g phi_i`. Summing over
+            # i is `int g (sum_i phi_i)` = `int g` exactly, because a Lagrange basis is a partition of
+            # unity -- so this is the integral of the objective, not a mesh-dependent proxy for it.
+            # `args=vals` is what makes it differentiable in the vertex positions: the assembly rebuilds
+            # its geometry (and its facet normals) from those coordinates.
+            obj = jnp.sum(jnp.asarray(fem.eval(_obj_weak, u, args=vals)))
+        else:
+            obj = _block_defect(u, pts, bounds)
+        return obj, _block_energy(u, pts, bounds)
 
     val_grad = jax.jit(jax.value_and_grad(lambda arrs: _objective(dict(zip(names, arrs))), has_aux=True))
 
