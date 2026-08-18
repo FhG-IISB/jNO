@@ -697,7 +697,7 @@ def test_the_objective_is_reachable_from_the_public_slot_and_validated():
     assert jno.solve.relocate(objective="energy").objective == "energy"
     assert jno.solve.relocate().objective == "equidistribution"  # unchanged default
     d, fem = _corner_problem(True)
-    with pytest.raises(ValueError, match="must be 'energy', 'equidistribution' or 'huang'"):
+    with pytest.raises(ValueError, match="must be 'energy', 'equidistribution', 'huang', or a weak-form"):
         fem.solve(adapt=jno.solve.relocate(objective="nonsense", max_iters=1))
 
 

@@ -2296,7 +2296,8 @@ class FEM:
                 "(Argyris/Morley/edge) elements, 1-D, and the VPINN path."
             )
         terms = list(term) if isinstance(term, (list, tuple)) else [term]
-        bares = []
+        bares: list = []
+        b_bares: dict = {}
         for t in terms:
             bare = getattr(t, "expr", t)
             if not contains_node_type(bare, TestFunction):
@@ -2307,14 +2308,21 @@ class FEM:
                     "which is a different operation and is not wired yet."
                 )
             support, region = _region_and_support(t, self.domain)
-            if support != "volume":
+            # Surface terms are bucketed per region and handed to the factory's own `bterms` channel --
+            # the same one the front-end fills at build time. This used to refuse outright, on the
+            # reading that the bucketing was unavailable here; it is not, it just was not passed. So a
+            # SURFACE readout (a Robin/impedance flux, a traction on a tagged wall) assembles like any
+            # other, and the facet normals it integrates against move with the mesh coordinates.
+            if support != "volume" and not getattr(self, "_has_facet_tables", False):
                 raise NotImplementedError(
-                    f"fem.eval: this term lives on boundary region {region!r}. Only volume terms are "
-                    "assembled here; a surface term needs the per-region facet bucketing the front-end "
-                    "does at build time. Pass the volume terms and add the known applied load yourself."
+                    f"fem.eval: this term lives on boundary region {region!r}, but this problem's facet "
+                    "quadrature tables were never built -- they are tabulated at BUILD time, and only "
+                    "when the form itself carries at least one surface term. Include the surface term "
+                    "in the jno.fem([...]) term list (a Neumann/Robin flux, a slip condition), or read "
+                    "the quantity as a volume term."
                 )
-            bares.append(bare)
-        return _as_flat(factory(bares)(jnp.asarray(u).reshape(-1), 0.0, args))
+            (bares.append(bare) if support == "volume" else b_bares.setdefault(region, []).append(bare))
+        return _as_flat(factory(bares, b_bares or None)(jnp.asarray(u).reshape(-1), 0.0, args))
 
     def region_dofs(self, region, *, field=0, component=None):
         """Global DOF indices of a tagged region — the companion to :meth:`eval`.
@@ -4304,6 +4312,7 @@ def _fem_impl(
         fem_obj._trial_field_keys = _field_keys(_orig_constraints)
         # Free (pre-Dirichlet) residual factory behind FEM.eval — same capture-now reason as above.
         fem_obj._term_residual_factory = getattr(domain, "_fem_native_term_residual", None)
+        fem_obj._has_facet_tables = bool(getattr(domain, "_fem_native_has_facet_tables", False))
         fem_obj._block_value_shapes = list(getattr(domain, "_fem_native_field_shapes", None) or ())
         # Same snapshot treatment for the DOF coordinates behind .points / .field_points — an
         # auxiliary assembly (jno.precond.form) would otherwise clobber them mid-solve.

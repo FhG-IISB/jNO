@@ -1071,7 +1071,7 @@ def refine(
 
 def relocate(
     *,
-    objective: str = "equidistribution",
+    objective: Any = "equidistribution",
     method: str = "descent",
     max_iters: int = 8,
     lr: float = 3e-3,
@@ -1102,6 +1102,32 @@ def relocate(
       ``E_h - E_exact = 1/2 ||u - u_h||_E^2``, so on a steady problem the energy *is* the error norm and
       descending it minimises the error directly.
     - ``"huang"`` is Huang's equidistribution–alignment functional (see :class:`AdaptSpec`).
+
+    **Or a weak-form expression**, when the mesh has a job the three functionals cannot state. They are
+    mesh-*quality* measures: they see the solution only through a monitor, so they can ask for
+    resolution but not for a physical condition. An expression is assembled exactly as ``criterion=``
+    is and summed to a scalar, over a **volume or a boundary** region::
+
+        xs, ys, ns = domain.variable("side", normals=True, split=True)
+        ys.trainable()                                   # the wall may move along y only
+        us = u.bind(x=xs, y=ys)
+        fem.solve(adapt=jno.solve.relocate(objective=jno.np.inner(us, ns) ** 2))
+
+    That is a **free surface**: the wall is moved until the flow through it vanishes. The facet normals
+    are rebuilt from the moving vertices, so ``n`` is the current mesh's normal, not the initial one.
+    The gradient runs through the solve, as it does for the strings — matched to central differences at
+    7.5e-09 on a Stokes channel whose no-slip bottom couples the flow to the wall's position, where the
+    through-flow falls 11.4x over 60 rounds (12.5x at 120: this is a descent, not a root-find).
+
+    Two things to know. The objective is a **scalar**, so it needs a scalar test function: on a
+    velocity/pressure saddle the pressure test is picked automatically. And when the expression reaches
+    its region only through a **bound view** (``u.bind(x=xr, y=yr)``, which absorbs its coordinates),
+    the test function cannot be auto-bound — carry it yourself, ``objective=<expr> * v_r[0]``. That
+    case raises with this instruction rather than a trace-level binding error.
+
+    The region's facet quadrature tables are built only when the **form** carries a surface term, so a
+    surface objective needs the boundary term to be in the ``jno.fem([...])`` list (a traction-free
+    wall, ``0.0 * v_r[0]``, is enough).
 
     Neither dominates, measured on the two problem types the test suite pins:
 
