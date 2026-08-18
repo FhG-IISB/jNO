@@ -1590,7 +1590,10 @@ class Variable(Placeholder):
         if registry is None:
             registry = []
             dom._trainable_coords = registry
-        registry.append({"ids": ids, "axis": axis_idx, "expr": param, "name": pname})
+        # `tag` as well as `ids`: a vertex INDEX is meaningless the moment a remesh changes the node
+        # set, while the region it came from still names the same piece of boundary, so an adaptive
+        # march can re-derive which vertices are movable instead of losing them.
+        registry.append({"ids": ids, "axis": axis_idx, "expr": param, "name": pname, "tag": self.tag})
         return param
 
     @staticmethod

@@ -1210,6 +1210,54 @@ Three things to know:
 * A surface objective needs the **form** to carry a surface term, because the facet quadrature tables
   are tabulated at build time only then. A traction-free wall (`0.0 * vs[0]`) in the term list is enough.
 
+**A mesh condition, as an inequality.** `criterion=` also takes a `jno.le` / `jno.ge` constraint, and
+then it is its own trigger — there is no cadence or threshold argument, because the condition already
+says both *where* and *whether*:
+
+```python
+fem.solve(adapt=jno.solve.remesh(criterion=lambda d: jno.le(d.cell_aspect(), 2.0), max_iters=6))
+```
+
+Every cell whose margin is positive is marked — all of them, not a Dörfler fraction — and the march
+stops when none is. Measured on a deliberately stretched mesh: worst aspect `2.87 → 1.57` in one
+round, `0` marked on the next. `theta` is refused with a constraint (there is no bulk fraction to
+choose), and a bare comparison (`q > 2.0`) is refused too: it records which cells are bad but not by
+how much, so marking would take a fraction of them and quietly leave the rest.
+
+Two things to know. **Set a threshold the mesher can actually reach** — an unstructured 2-D mesh
+bottoms out around `1.2`–`1.5`, and a constraint below that never settles, so the march refines until
+it runs out of rounds. And pass a **callable** for a geometry criterion: a geometry node captures the
+cell table when it is constructed, so a single node keeps answering for the mesh it was born on and is
+refused by name once the topology changes.
+
+**When moving nodes is not enough: `relocate(...).remesh(...)`.** Relocation moves a *fixed* node set,
+so once the mesh has to stretch further than its elements allow it can do nothing — `quality_floor` is
+a line search that rejects the step, and rejecting a step never adds a node. Chain an h-step onto it
+and say what "too far" means:
+
+```python
+fem.solve(adapt=jno.solve.relocate(objective=through, max_iters=200)
+                         .remesh(criterion=lambda d: jno.le(d.cell_aspect(), 2.0), max_iters=4))
+```
+
+The condition is checked **inside the relocation line search**, on each candidate step, so an
+inadmissible mesh is never accepted — the march honours the bound exactly rather than reporting a
+breach after the fact. When no admissible step exists, relocation has run out of room and the cells
+*blocking* it are refined; the movable vertices are then re-derived from the **region** each was tagged
+on, since indices do not survive a remesh. Measured on a Poisson peak, bound `1.7`: `44 → 80` vertices
+over 3 remeshes, final worst aspect exactly `1.700`, objective still falling `8.4e-02 → 2.0e-02`.
+
+The nested spec's `max_iters` caps how many remeshes the march may spend and `max_dofs` caps the size.
+If the budget runs out while the mesh still breaks the condition, that is **raised**, not returned
+quietly — refining does not repair every shape, and a bound below what the mesher can deliver would
+otherwise refine without end (measured, before this: `44 → … → 15709` vertices and an out-of-memory
+failure inside the solver).
+
+Scope: the interleaved criterion must be a **mesh-geometry condition** (`cell_aspect`, `cell_volume`,
+`cell_angles`), because it is evaluated on the moving vertices with no solve, and the bound must sit
+directly on one node so it can be evaluated once per round rather than re-traced. A solution criterion
+belongs on a standalone `jno.solve.remesh(...)`.
+
 **Mesh quality as a term you can write.** `domain.cell_aspect()` is the longest edge over the inradius,
 scaled so a **regular** simplex reads exactly `1.0` and a stretched one reads more — per cell, 2-D and
 3-D, and differentiable in the vertex positions (checked against central differences at `2.7e-10`).

@@ -950,6 +950,28 @@ def remesh(
     Second derivatives in a criterion (a Löhner-style ``|D2u|/|Du|`` detector) need ``order >= 2``:
     a P1 Hessian is identically zero, so at order 1 such a criterion evaluates to nothing.
 
+    **A criterion may instead be a per-CELL geometry quantity** -- ``d.cell_aspect()``,
+    ``d.cell_volume()``, or anything built from them. It carries no trial or test function, which is
+    how it is told apart, and it is evaluated rather than assembled. It must be one value per cell;
+    reduce a multi-component one yourself (``jno.np.min(d.cell_angles(), axis=1)``).
+
+    **A criterion may be a CONDITION rather than a ranking** -- ``jno.le(expr, bound)`` /
+    ``jno.ge(...)``. Then its signed margin marks every cell that breaks it (not a ``theta`` fraction,
+    and ``theta`` is refused), and the march stops when none does. This is what lets a mesh condition
+    be its own trigger, with no cadence or threshold argument::
+
+        remesh(criterion=lambda d: jno.le(d.cell_aspect(), 2.0))   # keep every element decent
+
+    Measured on a deliberately stretched mesh: worst aspect 2.87 -> 1.57 in one round, 0 marked on the
+    next. Set a bound the mesher can reach -- an unstructured 2-D mesh bottoms out near 1.2-1.5, and a
+    tighter bound never settles. A bare comparison (``q > 2.0``) is refused: it says which cells are
+    bad but not by how much, so marking would take a fraction of them and leave the rest.
+
+    **Pass a callable** (``criterion=lambda d: ...``) for a geometry criterion. A geometry node
+    captures the cell table when it is constructed, so a single node keeps answering for the mesh it
+    was built on; once refinement changes the topology it is refused by name rather than read as a
+    shape mistake.
+
     On a **steady** problem this is the refine loop — solve, estimate (Zienkiewicz–Zhu), mark
     (Dörfler ``theta``), refine by ``refine_factor``, repeat up to ``max_iters`` — growing the mesh
     toward convergence. On a **transient** problem it remeshes every ``every`` steps at a *constant*
