@@ -1331,6 +1331,11 @@ def _criterion_weak_terms(fem: Any, criterion: Any, field: int = 0):
             # rejected as spanning two regions.
             if isinstance(tg, str) and tg.startswith("n_") and tg[2:] in _bregions:
                 tg = tg[2:]
+            # `cell_size` (and a contact gap) are spatial Variables that name no region -- they are
+            # geometry symbols from the domain context. Counting them made a criterion using
+            # `dom.cell_size` resolve to a region literally called 'cell_size'.
+            if isinstance(tg, str) and (tg == "cell_size" or tg.startswith("gap_")):
+                continue
             if isinstance(tg, str) and tg not in found:
                 found.append(tg)
         return found
@@ -1469,7 +1474,14 @@ def _criterion_indicators(fem: Any, criterion: Any, u: np.ndarray, field: int = 
     num = np.asarray(fem.eval(weak, u)).reshape(-1)
     mass = np.asarray(fem.eval(mass_term, u)).reshape(-1)
     n_vert = int(np.asarray(fem.domain.mesh.points).shape[0])
-    g = np.abs(num[:n_vert]) / np.maximum(np.abs(mass[:n_vert]), 1e-30)
+    # The criterion is tested against FIELD `field`, so its contributions land on THAT block's DOFs.
+    # Reading the first `n_vert` entries assumes the tested field starts at 0 -- true only for field 0.
+    # With `metric_field=1` this read the untouched velocity rows: every indicator came back exactly
+    # zero, nothing was marked, and the driver reported a clean run having refined nothing.
+    _off = list(fem.offsets) if getattr(fem, "offsets", None) is not None else [0]
+    _b = int(_off[field]) if field < len(_off) else 0
+    num, mass = num[_b : _b + n_vert], mass[_b : _b + n_vert]
+    g = np.abs(num) / np.maximum(np.abs(mass), 1e-30)
     g = np.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0)
     eta = np.abs(_integrate_nodal_per_cell(fem.domain, g))
     return eta, float(np.sqrt(np.sum(eta**2)))
@@ -2338,8 +2350,12 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
     n_converged = 0
     for it in range(spec.max_iters):
         _full = np.asarray(cur.solve(solve_fn, **kwargs)).reshape(-1)
-        u = _vertex_view(_full, cur, allow_vector=True)
-        if u.ndim == 2 and spec.anisotropic:  # vector field: the ZZ estimator sums components, but the
+        # LAZY: a user `criterion=` replaces the recovery estimator entirely and reads the FULL vector,
+        # so it needs no vertex view. Taking one unconditionally refused every multifield problem here
+        # -- `_vertex_view` assumes a single trial function -- on a value that branch never uses.
+        _needs_view = spec.criterion is None or spec.anisotropic
+        u = _vertex_view(_full, cur, allow_vector=True) if _needs_view else None
+        if u is not None and u.ndim == 2 and spec.anisotropic:  # vector field: the ZZ estimator sums components, but the
             raise NotImplementedError(  # anisotropic Hessian metric is scalar-only (a single Hessian field)
                 "anisotropic (Hessian-metric) adaptation is scalar-only; use isotropic ZZ "
                 "(AdaptSpec(anisotropic=False)) to refine a vector field."
