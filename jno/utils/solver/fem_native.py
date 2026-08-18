@@ -3179,6 +3179,11 @@ def assemble_fem_native(
     # the linear system, row replacement for Newton -- which zeroes exactly the rows a reaction/flux
     # readout needs. Snapshotted onto the FEM in `_finalize`, like the field keys and DOF points.
     domain._fem_native_term_residual = _make_residual
+    # Whether the FACET tables exist. They are tabulated only when the FORM carries a surface term
+    # (see `face_tables_per_field`), so a later `fem.eval` of a surface term on a problem with no
+    # boundary terms has nothing to integrate against -- it must say so rather than fail deep inside
+    # the element kernel on `NoneType` unpacking.
+    domain._fem_native_has_facet_tables = bool(boundary_terms)
     jacobian = _make_jacobian(volume_terms, boundary_terms)
     nonlinear = any(_is_obviously_nonlinear_in_unknown(domain, t) for t in all_terms)
     # A form that is LINEAR in the unknown but READS step history is still a march: every load step is a

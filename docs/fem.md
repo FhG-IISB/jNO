@@ -1173,6 +1173,43 @@ time-averaged objective), periodic, and complex** problems, scalar or vector —
 solution block, so a complex field's real and imaginary parts both contribute. Only complex-*transient* is
 not wired yet.
 
+### A mesh objective that names the physics — `objective=<expression>`
+
+The three built-in objectives (`"equidistribution"`, `"energy"`, `"huang"`) are mesh-*quality* measures:
+they read the solution only through a monitor, so they can ask for resolution but cannot state a goal
+about the physics. `objective=` also accepts a **weak-form expression**, assembled exactly as
+`criterion=` is and summed to a scalar, over a **volume or a boundary** region:
+
+```python
+xs, ys, nx, ny = domain.variable("side", normals=True, split=True)
+ys.trainable()                                   # the wall may move along y only
+us, vs = u.bind(x=xs, y=ys), v.bind(x=xs, y=ys)
+fem.solve(adapt=jno.solve.relocate(objective=(us[0]*nx + us[1]*ny)**2 * vs[0]))
+```
+
+That is a **free surface**: the wall moves until the flow through it vanishes. The facet normals are
+rebuilt from the moving vertices, so `n` is the *current* mesh's normal. The gradient runs through the
+solve — matched to central differences at `7.5e-09` — and the through-flow falls `11.4x` over 60 rounds
+(`12.5x` at 120, so this is a descent, not a root-find).
+
+The benchmark deserves a word, because the obvious version of it measures nothing. In a channel with a
+**symmetry** bottom, uniform flow `u = (1,0)`, `p = 0` satisfies every equation and boundary condition
+for *any* shape of the traction-free top: measured, the solution stayed uniform to `2.3e-14` and moved
+by `9.8e-14` when the wall was displaced by `0.1`. The objective is then purely geometric — it exercises
+the normals and the facet measure but never the solve. A **no-slip** bottom couples them (`max|du| =
+7.2e-02` for the same displacement), and only then is `d(objective)/d(vertex)` a statement about the
+physics rather than about the mesh.
+
+Three things to know:
+
+* The objective is a **scalar**, so it needs a scalar test function; on a velocity/pressure saddle the
+  pressure test is chosen automatically.
+* When the expression reaches its region only through a **bound view** — `u.bind(x=xs, y=ys)` absorbs
+  its coordinates — the test function cannot be auto-bound. Carry it yourself, as above
+  (`* vs[0]`). That case raises with this instruction rather than a trace-level binding error.
+* A surface objective needs the **form** to carry a surface term, because the facet quadrature tables
+  are tabulated at build time only then. A traction-free wall (`0.0 * vs[0]`) in the term list is enough.
+
 Tagging is **literal and per-axis**: `xm.trainable()` frees only the x column. On a boundary that is the
 lever for sliding — free an edge's along-edge axis and its nodes redistribute *within* the wall, leave the
 normal axis untagged and the domain shape is preserved exactly.
