@@ -178,6 +178,22 @@ flux = (u_b.d(x_b) * nx + u_b.d(y_b) * ny).integrate()    # ∮ ∂u/∂n ds
 An `Integral` is an ordinary scalar node — differentiable and `jax.jit`-compatible, so it drops
 straight into a loss (`(u.integrate() - target).square()`) or a tracker.
 
+**Over a FEM basis** — pass the `jno.fem(...)` object and the expression is integrated over its
+elements, at its solution, instead of at collocation points:
+
+```python
+C = inner(sig(u, rho), eps(u)).integrate(fem)      # ∫ σ(u):ε(u) dΩ  — the compliance
+V = rho.integrate(fem) / (VOLFRAC * d.measure())   # the volume fraction
+jno.core([C, jno.le(V, 1.0)], domain=d).solve(400)
+```
+
+The `fem` is named because it is the one thing the expression cannot supply: a trial symbol carries
+its basis (`order`, `space`, `_domain`), but not the solution values, the assembly quadrature, or
+which system to differentiate through. `quadrature=` does not apply here — a FEM functional inherits
+the rule its operator was assembled with, which is what makes `∫ σ(u):ε(u) dΩ` equal `uᵀKu` exactly.
+Every functional over one `fem` shares a single solve. See `fem.eval` in [fem.md](fem.md) for the
+eager form and the scope limits.
+
 ### Reductions, math & comparisons
 
 Reductions are properties returning a squeezed scalar node; the loss helpers are the ones you reach for

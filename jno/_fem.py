@@ -2465,6 +2465,62 @@ class FEM:
         quadrature error nothing would report."""
         return jnp.asarray(self._functional_fn(terms, bares)(jnp.asarray(u).reshape(-1), 0.0, args)).reshape(())
 
+    def _integral_node(self, expr):
+        """``expr.integrate(fem)`` — the traced form of the scalar :meth:`eval` returns eagerly.
+
+        This is the objective/constraint entry point: the returned node is a scalar, so it drops straight
+        into ``jno.core([...])`` as a loss or inside ``jno.le(...)`` as a constraint, and it is
+        differentiable in the design parameters and the mesh coordinates through the solve it depends on.
+
+        Built as a plain ``FunctionCall`` over ``[solution, *runtime parameters]`` rather than as an
+        ``Integral`` node, and deliberately. An ``Integral`` whose target holds a trial symbol is marked
+        weak by its own constructor, and ``jno.core`` then hands anything so marked to the VPINN
+        assembler, which has no test function to work with here; the trial symbol also has no evaluator
+        handler of its own. Assembling through the FEM kernel instead keeps the expression where it
+        already means something, and the node's arguments state the real data dependencies -- which is
+        what makes the gradient right.
+        """
+        from .trace import FunctionCall
+        from .utils.solver.parametric_helpers import _collect_runtime_parameter_exprs
+
+        bare = getattr(expr, "expr", expr)
+        op = getattr(self, "operator", None)
+        declared = dict(getattr(op, "runtime_parameter_exprs", None) or {})
+
+        # A parameter the FORM never declared has no slot in the assembled kernel's per-cell pack, so it
+        # would read a placeholder rather than its value. Name it instead of integrating a silent zero.
+        used: dict = {}
+        _collect_runtime_parameter_exprs(bare, used)
+        undeclared = [n for n in used if n not in declared]
+        if undeclared:
+            raise ValueError(
+                f"expr.integrate(fem): the integrand uses parameter(s) {sorted(undeclared)} that the weak "
+                "form does not, so the assembler has no slot for them and they would not reach the "
+                "kernel. Use a parameter the form declares, or fold it in outside the integral."
+            )
+
+        fn = self._functional_fn([expr], [bare])  # host side: classify the measure, retag, build once
+        names = list(declared)
+        params = [declared[n] for n in names]
+        sol = self._functional_solution()
+
+        def _run(u, *vals):
+            return jnp.asarray(fn(jnp.asarray(u).reshape(-1), 0.0, dict(zip(names, vals)))).reshape(())
+
+        return FunctionCall(_run, [sol, *params], name="fem_integral")
+
+    def _functional_solution(self):
+        """The one solve every functional over this system shares.
+
+        Memoised on purpose: ``solve()`` builds a NEW node on each call and CSE keys unrecognised nodes by
+        identity, so an objective and three constraints written as four integrals would otherwise solve
+        the same system four times per step."""
+        sol = getattr(self, "_functional_sol", None)
+        if sol is None:
+            sol = self.solve()
+            self._functional_sol = sol
+        return sol
+
     def _functional_fn(self, terms, bares):
         """Classify each test-free entry onto its measure and return ``f(u_flat, t, args) -> ()``.
 

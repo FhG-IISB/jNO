@@ -272,3 +272,97 @@ def test_a_mixed_list_of_weak_terms_and_integrands_is_refused():
     _d, fem, _u, phi, X, sol = _poisson()
     with pytest.raises(ValueError, match="same kind"):
         fem.eval([X[0] * phi, X[0]], sol)
+
+
+# ---------------------------------------------------------------- the traced form: .integrate(fem)
+
+
+def _design(size=0.4, w=6.0, h=3.0, volfrac=0.4):
+    """A SIMP cantilever whose objective and constraint are written as integrals, nothing else."""
+    import optax  # noqa: F401  -- imported for parity with the tutorial's optimiser wiring
+
+    inner, sym, tr = jno.np.inner, jno.np.symgrad, jno.np.trace
+    ddot = lambda a, b: inner(a, b, n_contract=2)  # noqa: E731
+    emin, penal, nu, e0, tol, span = 1e-6, 3.0, 0.3, 1.0, 1e-6 * w, 1.0
+    lam, mu = e0 * nu / (1 - nu**2), e0 / (2 * (1 + nu))
+    d = jno.Shape.rect(0.0, 0.0, w, h, size=size).domain()
+    xi, yi, _ = d.variable("interior", split=True)
+    xl, yl, _ = d.variable("left", split=True)
+    xt, yt, _ = d.variable("tip", where=lambda x, y: (x > w - tol) & (y < span + tol), split=True)
+    u, phi = d.fem_symbols(value_shape=(2,))
+    _r, s = d.fem_symbols(space="P0", names=("r", "s"))
+    rho = jno.np.parameter(s, name="rho")
+    rho.dtype(jnp.float64)
+    rho.initialize(jax.nn.initializers.constant(volfrac))
+    rho.optimizer(jno.optimizers.mma(move=0.2, lower=1e-3, upper=1.0))
+    eu, ep = sym(u, [xi, yi]), sym(phi, [xi, yi])
+    a = lambda p, q: lam * tr(p) * tr(q) + 2 * mu * ddot(p, q)  # noqa: E731
+    stiffness = lambda r: emin + r**penal * (e0 - emin)  # noqa: E731  -- SIMP
+    fem = jno.fem(
+        [
+            stiffness(rho) * a(eu, ep),
+            u(xl, yl) - (0.0, 0.0),
+            -1.0 * inner(jnp.array([0.0, -1.0 / span]), phi.bind(x=xt, y=yt), 1),
+        ],
+        quad_degree=2,
+    )
+    compliance = (stiffness(rho) * a(eu, eu)).integrate(fem)
+    volume = rho.integrate(fem) / (volfrac * w * h)
+    return d, fem, rho, compliance, volume, stiffness(rho) * a(eu, eu)
+
+
+def test_the_traced_integral_agrees_with_the_eager_one():
+    """``expr.integrate(fem)`` and ``fem.eval(expr, u)`` are the same integral by two routes: one
+    inside the trace at the optimiser's current design, one assembled directly."""
+    d, fem, _rho, compliance, _volume, energy = _design()
+    crux = jno.core([compliance], domain=jno.domain.from_array({"_": np.zeros((1, 1))}))
+    traced = float(np.asarray(crux.eval([compliance])).reshape(-1)[0])
+
+    args = {"rho": jnp.full(np.asarray(d._cells_p1()).shape[0], 0.4)}
+    eager = float(np.asarray(fem.eval(energy, _solve_at(fem, args), args=args)))
+    # 1e-6, not round-off: the two routes take DIFFERENT linear solves — the traced one jNO's default
+    # (Krylov, rtol 1e-8), the eager reference a direct factorisation — and compliance is quadratic in
+    # u, so the solver tolerance shows up here. Measured gap 4.5e-8 relative. The integral itself is
+    # exact against its own oracles above.
+    assert abs(traced - eager) / abs(eager) < 1e-6, f"traced {traced:.10f} vs eager {eager:.10f}"
+
+
+def test_every_functional_over_one_system_shares_a_single_solve():
+    """``solve()`` builds a new node per call and CSE keys unrecognised nodes by identity, so an
+    objective plus three constraints would otherwise solve the same system four times a step."""
+    _d, fem, _rho, _c, _v, _e = _design()
+    assert fem._functional_solution() is fem._functional_solution()
+
+
+def test_it_drives_a_constrained_design_through_jno_core():
+    """The whole point: objective and constraint are integrals, MMA does the rest, and the
+    sensitivities come from AD. Compliance must fall a long way and the volume must stay at budget."""
+    _d, _fem, rho, compliance, volume, _e = _design()
+    crux = jno.core([compliance, jno.le(volume, 1.0)], domain=jno.domain.from_array({"_": np.zeros((1, 1))}))
+    before = float(np.asarray(crux.eval([compliance])).reshape(-1)[0])
+    crux.solve(30)
+    after = float(np.asarray(crux.eval([compliance])).reshape(-1)[0])
+    vol = float(np.asarray(crux.eval([volume])).reshape(-1)[0])
+    design = np.asarray(crux.eval([rho])).reshape(-1)
+
+    assert after < 0.5 * before, f"compliance {before:.3f} -> {after:.3f}; the design barely moved"
+    assert vol < 1.02, f"volume fraction {vol:.4f} of budget — the constraint is not holding"
+    assert design.min() >= 1e-3 - 1e-12 and design.max() <= 1.0 + 1e-12, "MMA left the box"
+    assert design.max() - design.min() > 0.5, "the design stayed uniform — no topology emerged"
+
+
+def test_an_integrand_using_a_parameter_the_form_never_declared_is_refused():
+    """Such a parameter has no slot in the assembled kernel's per-cell pack, so it would silently
+    read a placeholder instead of its value."""
+    _d, fem, _rho, _c, _v, _e = _design()
+    stray = jno.np.parameter((1,), name="not_in_the_form")
+    with pytest.raises(ValueError, match="does not"):
+        stray.integrate(fem)
+
+
+def test_the_collocation_integral_is_untouched():
+    """``.integrate()`` with no FEM is the Deep-Ritz/collocation route and must not have moved."""
+    d = jno.Shape.rect(0.0, 0.0, 2.0, 1.0, size=0.2).domain()
+    xi, yi, _ = d.variable("interior", split=True)
+    assert abs(float(np.asarray((0.0 * xi + 1.0).integrate().eval(d)).reshape(-1)[0]) - 2.0) < 1e-12
+    assert abs(float(np.asarray((xi * yi).integrate(quadrature="gauss").eval(d)).reshape(-1)[0]) - 1.0) < 1e-10

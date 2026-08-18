@@ -1053,7 +1053,30 @@ class Placeholder:
         Chain with spatial integration for space-time integrals::
 
             space_time_integral = u_net(x, t).integrate().integrate(t)
+
+        **FEM integral** (``var=fem`` — a ``jno.fem(...)`` object):
+        Integrates an expression built from that FEM's own symbols over its basis, at its
+        solution, returning a differentiable scalar. This is the FEM twin of the collocation
+        integral above: where Deep Ritz integrates a network's energy density at the mesh
+        quadrature points, this integrates a *solved field's*::
+
+            C = inner(sig(u, rho), eps(u)).integrate(fem)      # compliance, an energy integral
+            V = rho.integrate(fem) / (VOLFRAC * d.measure())   # the volume fraction
+            jno.core([C, jno.le(V, 1.0)], domain=d).solve(400)
+
+        The ``fem`` is named because it is the one thing the expression cannot supply. The BASIS
+        is inferred -- a trial symbol carries its ``order``, ``space`` and ``_domain`` -- but the
+        solution values, the assembly quadrature degree and the system to differentiate through
+        are not on the symbol, and a domain may carry more than one ``jno.fem``.
+
+        ``quadrature=`` does not apply: a FEM functional inherits the rule its operator was
+        assembled with, which is what makes ``∫ σ(u):ε(u) dΩ`` equal ``uᵀKu`` exactly. Every
+        functional over one ``fem`` shares a single solve. See :meth:`jno.fem.eval` for the eager
+        form and for the scope limits (whole volume and tagged boundary regions, steady
+        native-Lagrange problems).
         """
+        if var is not None and hasattr(var, "_integral_node"):
+            return var._integral_node(self)
         if var is not None and getattr(var, "axis", None) == "temporal":
             return IntegralTime(self, time_var=var)
         return Integral(self, integration_var=var, quadrature=quadrature)
