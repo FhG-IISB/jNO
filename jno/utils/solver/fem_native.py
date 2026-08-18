@@ -3130,6 +3130,52 @@ def assemble_fem_native(
         # ``u(initial) - net(x)`` from the runtime weights; ``None`` (no IC net) is byte-identical to the
         # old eager build. When an IC net is present the closure also rides the block as ``state0_fn`` so
         # ``∂traj/∂weights`` flows through the initial state. ---
+        def _cover_state0(s0, fidx, comp, u0_node, params):
+            """Interpolate the IC INTO THE ENRICHED SPACE rather than onto the node values alone.
+
+            A cover node carries its value ``u_i`` AND coefficients ``a_i`` multiplying
+            ``(x - x_i)/s_i``, and the element's own identity -- the one its patch test asserts -- is
+            ``a_i = 1/2 grad g(x_i) * s_i``. The plain nodal path below writes ``g(x_i)`` into every
+            slot of the node, which hands the cover coefficients a function value where a scaled
+            GRADIENT belongs. That is not a small inconsistency: measured on the heat benchmark it
+            starts the march at L2 1.9e-01 where this interpolation reaches 5.2e-03, and worse than
+            simply leaving the covers at zero (8.5e-02). It is unrecoverable rather than merely
+            inaccurate, because the enriched DOFs are stiff -- the generalized spectrum splits into 2
+            value-dominated modes (lambda 2.0-5.0) and 55 cover-dominated ones (up to 184.6), so
+            backward Euler damps the bad start by 1/(1 + dt*lambda) and annihilates it in a single
+            step (measured: the cover coefficients collapse to 0.17 of their initial size while the
+            values correctly go to 0.8516 against an exact 0.8624).
+
+            The gradient comes from a JVP, not a symbolic derivative: the IC value is evaluated
+            POINTWISE, so a tangent moving every node along ``e_k`` returns ``dg/dx_k`` at every node
+            in one pass -- and it keeps the initial state differentiable in a net-valued IC's weights,
+            which is the contract ``state0_fn`` exists to honour.
+            """
+            blk, vv = _cblk[fidx], int(vecs[fidx])
+            xr = jnp.asarray(pts_f_real[fidx])[:, :dim]
+            n_real = int(xr.shape[0])
+
+            def _at(P):
+                return jnp.reshape(jnp.asarray(_eval_value_node_at(u0_node, P, params=params)), (-1,))
+
+            def _as_nodal(v):
+                if v.size == 1:
+                    return jnp.full((n_real, vv), v.reshape(-1)[0])
+                if v.size == vv:
+                    return jnp.broadcast_to(v.reshape(1, vv), (n_real, vv))
+                return v.reshape(n_real, vv)
+
+            scale = jnp.asarray(_cover_scale_j).reshape(-1)[:n_real, None]
+            slots = [_as_nodal(_at(xr))]
+            for k in range(dim):
+                tangent = jnp.zeros_like(xr).at[:, k].set(1.0)
+                slots.append(0.5 * _as_nodal(jax.jvp(_at, (xr,), (tangent,))[1]) * scale)
+            block = jnp.stack(slots, axis=1)  # (n_real, blk, vv) -- node-major, slot, component
+            if comp is None:
+                return s0.at[offs[fidx] : offs[fidx + 1]].set(block.reshape(-1))
+            idx = offs[fidx] + (jnp.arange(n_real)[:, None] * blk + jnp.arange(blk)[None, :]) * vv + int(comp)
+            return s0.at[idx.reshape(-1)].set(block[:, :, int(comp)].reshape(-1))
+
         def _state0_at(params=None):
             s0 = zeros
             for ic in ic_residuals:
@@ -3137,6 +3183,10 @@ def assemble_fem_native(
                 fidx = field_index.get(_field_key_of(ic))
                 if fidx is None:
                     raise ValueError("jno.fem (native): IC does not match any known trial field.")
+                if _cover[fidx]:
+                    # An enriched field's slots are not all values -- see `_cover_state0`.
+                    s0 = _cover_state0(s0, fidx, comp, u0_node, params)
+                    continue
                 pts_ic = pts_f_all[fidx]  # (n_nodes_f[fidx], 2)
                 nn, vv = n_nodes_f[fidx], vecs[fidx]
                 raw = jnp.reshape(jnp.asarray(_eval_value_node_at(u0_node, jnp.asarray(pts_ic), params=params)), (-1,))

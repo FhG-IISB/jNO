@@ -1022,6 +1022,20 @@ optimisation needs. One caveat, stated because it is invisible otherwise: the no
 is computed on the host at build time (like the facet orientation signs) and does **not** track moving
 coordinates. That is a conditioning drift, not a wrong gradient.
 
+**It marches in time**, and the initial condition is the part that had to be got right. A cover node
+carries its value *and* the coefficients of `(x − x_i)/s_i`, so an IC interpolated onto "the nodes"
+must fill the latter with `a_i = ½∇g(x_i)·s_i` — writing `g(x_i)` into every slot of the node hands
+the cover coefficients a function value where a scaled gradient belongs. That is not a mild
+inconsistency: the enriched DOFs are stiff (the generalized spectrum splits into a handful of
+value-dominated modes at `λ ≈ 2–5` and dozens of cover-dominated ones reaching `λ ≈ 185`), so a
+θ-stepper damps the bad start by `1/(1+Δt·λ)` and annihilates it in a single step rather than
+relaxing it — measured, the cover coefficients collapsed to 0.17 of their initial size while the node
+values correctly reached 0.86. With the enriched interpolation in place they decay together, and on
+the analytic heat benchmark at a converged time step the enriched space is **49.8× more accurate than
+P1 in L2** at the same mesh. Note the corollary for benchmarking: at a *coarse* `Δt`, P1 can look
+better than it is through cancellation between its temporal and spatial errors — refine `Δt` before
+comparing spaces.
+
 **The null space is structural, and it is gauged.** Since `Σ_i h_i (x − x_i) ≡ 0`, the coefficients
 `a_i = S·x_i + c` with `S` skew are the zero *function* — `dim(dim+1)/2` modes per component,
 mesh-independent. Whatever the boundary pins leave alive is removed exactly like a pressure gauge: one
