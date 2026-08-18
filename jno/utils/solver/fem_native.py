@@ -1286,8 +1286,32 @@ def assemble_fem_native(
         frozenset(int(conn.face_nodes[fi, j]) for j in range(conn.face_nodes.shape[1])): fi for fi in range(conn.n_bfaces)
     }
 
+    _region_faces_cache: Dict[str, np.ndarray] = {}
+
     def _region_faces(region: str) -> np.ndarray:
-        """Boundary-face ids owned by ``region`` (``(n,) int32``, possibly empty)."""
+        """Boundary-face ids owned by ``region`` (``(n,) int32``, possibly empty).
+
+        Memoized for this assembly. The selection is a property of the MESH, not of any solution, so
+        recomputing it can only ever return the same answer -- but *when* it is computed matters: the
+        resolution walks `tag_node_mask`, which intersects the tag with the catch-all "boundary"
+        region under `jax.vmap`. Run once at build time that is concrete; run again from inside a
+        traced objective -- which is what happens, because `FEM.eval` builds a fresh term list on each
+        call and so never hits `_preprocess_terms`'s own memo -- it produces a traced mask, and
+        converting one raises `TracerArrayConversionError`. That is what stopped a SURFACE objective
+        (a free surface, `(u.n)^2` on a moving wall) from surviving the rebuild after a remesh: the
+        region resolved cleanly twice, then a third time under trace. Caching here removes the third.
+
+        The cache lives in this assembly's closure, so a rebuilt problem starts with an empty one and
+        fills it from its own build -- it cannot serve a stale mesh's facets.
+        """
+        _hit_cached = _region_faces_cache.get(region)
+        if _hit_cached is not None:
+            return _hit_cached
+        out = _region_faces_uncached(region)
+        _region_faces_cache[region] = out
+        return out
+
+    def _region_faces_uncached(region: str) -> np.ndarray:
         _named = domain.tag_facets(region) if hasattr(domain, "tag_facets") else None
         if _named is not None and region != "boundary":
             # `"boundary"` keeps the mask: it is the catch-all, with its own interface-dropping semantics.
