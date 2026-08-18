@@ -530,3 +530,100 @@ def test_the_coordinate_gradient_through_a_cover_solve_matches_finite_difference
     assert rel["cover"] < 1e3 * rel["Lagrange"], (
         f"the enrichment degraded the coordinate gradient: cover {rel['cover']:.2e} vs P1 {rel['Lagrange']:.2e}"
     )
+
+
+# ---------------------------------------------------------------- the enriched space in TIME
+
+
+def _heat_cover(space, size=0.12, kappa=0.1, t_end=0.3, nt=21):
+    """u_t = kappa lap u, mode-(1,1) IC, homogeneous Dirichlet -- the analytic decay benchmark."""
+    import jax.numpy as jnp
+
+    import jno
+
+    d = jno.Shape.rect(0, 0, 1, 1, size=size).domain(time=(0.0, t_end, nt))
+    u, phi = d.fem_symbols(space=space)
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi0, yi0, _ = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi)
+    ic = u(xi0, yi0) - jno.fn(lambda x, y: jnp.sin(np.pi * x) * jnp.sin(np.pi * y), [xi0, yi0])
+    fem = jno.fem([ui.t * vi + kappa * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, ic])
+    res = fem.solve()
+    return d, np.asarray(res.fn() if hasattr(res, "fn") else res)
+
+
+def test_a_transient_initial_condition_fills_the_cover_coefficients():
+    """The IC must be interpolated into the ENRICHED space, not onto the node values alone.
+
+    A cover node carries ``u_i`` and ``a_i``; the element's identity is ``a_i = 1/2 grad g(x_i) s_i``.
+    Writing ``g(x_i)`` into every slot -- which is what a nodal interpolation does if it does not know
+    about the enrichment -- gives the cover coefficients a function VALUE where a scaled GRADIENT
+    belongs. The oracle here is that identity, to machine precision, so this cannot pass by accident.
+    """
+    d, traj = _heat_cover("cover")
+    pts = np.asarray(d.mesh.points)[:, :2]
+    cells = np.asarray(d.mesh.cells_dict["triangle"])
+    blk, s = cover_block(2), nodal_scale(pts, cells)
+    s0 = np.asarray(traj[0]).reshape(-1)
+
+    want_val = np.sin(np.pi * pts[:, 0]) * np.sin(np.pi * pts[:, 1])
+    want_ax = 0.5 * (np.pi * np.cos(np.pi * pts[:, 0]) * np.sin(np.pi * pts[:, 1])) * s
+    want_ay = 0.5 * (np.pi * np.sin(np.pi * pts[:, 0]) * np.cos(np.pi * pts[:, 1])) * s
+    assert np.abs(s0[0::blk] - want_val).max() < 1e-12, "nodal values wrong"
+    assert np.abs(s0[1::blk] - want_ax).max() < 1e-12, f"a_x off by {np.abs(s0[1::blk] - want_ax).max():.2e}"
+    assert np.abs(s0[2::blk] - want_ay).max() < 1e-12, f"a_y off by {np.abs(s0[2::blk] - want_ay).max():.2e}"
+
+
+def test_the_enrichment_is_marched_not_annihilated():
+    """The cover coefficients must DECAY WITH THE SOLUTION, not be damped away in the first step.
+
+    Enriched DOFs are stiff -- the generalized spectrum puts them at lambda up to ~185 against the
+    physical mode's 2.0 -- so backward Euler damps them by 1/(1+dt*lambda). That is correct for a
+    consistent state and fatal for an inconsistent one: with the IC written into the cover slots as a
+    value, the coefficients collapsed to 0.17 of their initial size in ONE step while the node values
+    correctly went to 0.86, and the march never recovered. Both parts of the state carry the same
+    physical decay, so they must fall together; that is the invariant asserted here."""
+    d, traj = _heat_cover("cover")
+    blk = cover_block(2)
+    vals, cov = traj[:, 0::blk], np.concatenate([traj[:, 1::blk], traj[:, 2::blk]], axis=1)
+    r_val = np.linalg.norm(vals[-1]) / np.linalg.norm(vals[0])
+    r_cov = np.linalg.norm(cov[-1]) / np.linalg.norm(cov[0])
+    exact = np.exp(-2 * 0.1 * np.pi**2 * 0.3)
+    assert abs(r_cov - r_val) < 0.05 * r_val, f"covers decayed {r_cov:.4f} vs values {r_val:.4f}"
+    assert abs(r_cov - exact) < 0.05 * exact, f"covers decayed {r_cov:.4f} against the exact {exact:.4f}"
+
+
+def test_a_transient_cover_solve_beats_p1_between_the_nodes():
+    """The end of the chain -- measured BETWEEN nodes, which is the only place it can be seen.
+
+    A cover's coefficients are the local gradient: they change ``u_h`` between nodes and barely move
+    the nodal values, so a comparison AT the nodes is blind to the enrichment (and P1's nodal values
+    are superconvergent besides, so it flatters P1). Edge midpoints need no quadrature machinery: the
+    P1 hats there are exactly 1/2 for the edge's two nodes and 0 for every other, so
+
+        u_h(m) = 1/2 [u_i + (m-x_i).a_i/s_i] + 1/2 [u_j + (m-x_j).a_j/s_j]
+
+    is exact for the cover field and reduces to the average for P1."""
+    exact_at = lambda q: np.exp(-2 * 0.1 * np.pi**2 * 0.3) * np.sin(np.pi * q[:, 0]) * np.sin(np.pi * q[:, 1])  # noqa: E731
+    errs = {}
+    for space in ("Lagrange", "cover"):
+        d, traj = _heat_cover(space)
+        pts = np.asarray(d.mesh.points)[:, :2]
+        cells = np.asarray(d.mesh.cells_dict["triangle"])
+        e = np.unique(np.sort(np.concatenate([cells[:, [0, 1]], cells[:, [1, 2]], cells[:, [2, 0]]]), axis=1), axis=0)
+        mid = 0.5 * (pts[e[:, 0]] + pts[e[:, 1]])
+        w = np.asarray(traj[-1]).reshape(-1)
+        if space == "cover":
+            blk, s = cover_block(2), nodal_scale(pts, cells)
+            val, ax, ay = w[0::blk], w[1::blk], w[2::blk]
+            got = 0.0
+            for k in (0, 1):
+                i = e[:, k]
+                rel = (mid - pts[i]) / s[i, None]
+                got = got + 0.5 * (val[i] + rel[:, 0] * ax[i] + rel[:, 1] * ay[i])
+        else:
+            got = 0.5 * (w[e[:, 0]] + w[e[:, 1]])
+        ex = exact_at(mid)
+        errs[space] = float(np.linalg.norm(got - ex) / np.linalg.norm(ex))
+    assert errs["cover"] < 0.5 * errs["Lagrange"], f"cover {errs['cover']:.3e} vs P1 {errs['Lagrange']:.3e}"
