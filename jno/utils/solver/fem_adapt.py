@@ -2334,6 +2334,7 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
         # homogeneous problem after the first remesh.)
         for _name, _pred in list(getattr(d, "_tag_predicates", {}).items()):
             d.tag(_name, _pred)
+        d.__dict__.pop("_gauge_pin_coords", None)  # same reason as the relocation driver above
         cur = jno.fem(cons, **kw)  # re-assemble the same problem on the refined mesh
 
     # rebind the caller's FEM to the final adapted state so fem.points / A / b match ``u``
@@ -2966,6 +2967,12 @@ def _finish_relocate(fem, dom, coord_specs, arrs, pts0, n_verts, dim, cells, his
     dom._trainable_coords = []  # relocation consumed the tags; the moved vertices are now the geometry
     for _name, _pred in list(getattr(dom, "_tag_predicates", {}).items()):
         dom.tag(_name, _pred)
+    # Drop the cached p.pin() gauge nodes so `_lower_gauge_pin` re-creates the single-vertex pin region
+    # on the MOVED mesh. `move_mesh` resets the custom-tag state, and the pin's point-region is minted
+    # by the front end rather than held in `_tag_predicates`, so nothing above re-derives it: the
+    # rebuilt form then carried a trial-without-test term whose region no longer existed and `jno.fem`
+    # refused it as a whole-domain volume. The transient driver already does this; this path did not.
+    dom.__dict__.pop("_gauge_pin_coords", None)
     cur = jno.fem(fem._constraints, **fem._fem_kwargs)
     u_final = np.asarray(cur.solve(solve_fn, **kwargs)).reshape(-1)
     fem.__dict__.update(cur.__dict__)
