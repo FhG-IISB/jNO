@@ -699,3 +699,52 @@ def test_the_objective_is_reachable_from_the_public_slot_and_validated():
     d, fem = _corner_problem(True)
     with pytest.raises(ValueError, match="must be 'energy', 'equidistribution' or 'huang'"):
         fem.solve(adapt=jno.solve.relocate(objective="nonsense", max_iters=1))
+
+
+def _stokes_with_a_pressure_gauge(size=0.5):
+    """Taylor-Hood Stokes in a channel, with `p.pin()` fixing the pressure gauge, and its top wall
+    vertices free to slide vertically."""
+    d = jno.Shape.rect(0.0, 0.0, 3.0, 1.0, size=size).domain()
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)
+    p, q = d.fem_symbols(names=("p", "q"), order=1)
+    x, y, _ = d.variable("interior", split=True)
+    cin = d.variable("inlet", where=lambda X, Y: X < 1e-9, split=True)
+    cbot = d.variable("bottom", where=lambda X, Y: Y < 1e-9, split=True)
+    cmov = d.variable("tmov", where=lambda X, Y: (Y > 1.0 - 1e-9) & (X > 1e-9), split=True)
+    cmov[1].trainable(name="ty")
+    eu, ev = jno.np.symgrad(u, [x, y]), jno.np.symgrad(v, [x, y])
+    dd = lambda a, b: jno.np.inner(a, b, n_contract=2)  # noqa: E731
+    pp, qq = p.bind(x=x, y=y), q.bind(x=x, y=y)
+    fem = jno.fem(
+        [
+            2.0 * dd(eu, ev) - pp * jno.np.trace(ev),
+            -qq * jno.np.trace(eu),
+            u(cin[0], cin[1])[0] - 1.0,
+            u(cin[0], cin[1])[1] - 0.0,
+            u(cbot[0], cbot[1])[0] - 0.0,
+            u(cbot[0], cbot[1])[1] - 0.0,
+            p.pin(),
+        ],
+        quad_degree=3,
+    )
+    return d, fem
+
+
+def test_relocate_survives_a_pressure_gauge_pin():
+    """r-adaptivity on a Taylor-Hood saddle -- which is to say, on any incompressible flow.
+
+    `move_mesh` resets the custom-tag state, and `p.pin()`'s single-vertex region is minted by the
+    front end rather than held in `_tag_predicates`, so nothing re-derived it after the move: the
+    rebuilt form carried a trial-without-test term whose region no longer existed and `jno.fem`
+    refused it as a whole-domain volume. Relocate was therefore unusable on every problem carrying a
+    pressure (or all-Neumann) gauge -- it raised rather than returning a wrong answer, but it raised
+    from the mesh rebuild with nothing pointing at the pin.
+    """
+    d, fem = _stokes_with_a_pressure_gauge()
+    p0 = np.asarray(d.mesh.points)[:, :2].copy()
+    u = np.asarray(fem.solve(adapt=jno.solve.relocate(max_iters=6, lr=3e-3)))
+    assert fem.adapt_history, "no relocation rounds ran"
+    assert np.isfinite(u).all() and u.size > 0, "the re-solve on the moved mesh gave no solution"
+    p1 = np.asarray(fem.domain.mesh.points)[:, :2]
+    assert np.abs(p1 - p0).max() > 0.0, "no vertex moved"
+    assert _min_detj(p1, np.asarray(fem.domain.mesh.cells_dict["triangle"])) > 0.0, "mesh tangled"
