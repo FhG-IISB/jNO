@@ -1649,6 +1649,17 @@ class FEM:
             return run_continuation(
                 self, continuation, nonlinear=nonlinear, linear=linear, precond=precond, x0=x0, kwargs=kwargs
             )
+        # Runtime PARAMETER VALUES given as keywords: `fem.solve(cap=3.5)`. A parametric problem
+        # otherwise resolves its parameters only through a `crux` evaluation, which leaves no way to say
+        # "solve at this value" -- and the workaround, rebuilding `jno.fem` per value, re-assembles and
+        # re-compiles the whole problem to change one number. The operator already accepts the values
+        # (it builds `args` from them and threads the assembled tangent, so a sparse-direct Newton and a
+        # reduced system both keep working); what was missing was a way in. `continuation=` above owns
+        # them on its own path, so this only applies here.
+        _param_names = set(getattr(self._op, "runtime_parameter_exprs", None) or {})
+        _values = {k: kwargs.pop(k) for k in list(kwargs) if k in _param_names}
+        if _values:
+            kwargs["values"] = _values
         has_slots = (
             (x0 is not None)
             or (nonlinear is not None)
@@ -1921,8 +1932,15 @@ class FEM:
 
             # Propagate the flag so the operator hands `_reduced` the full tangent to reduce.
             _reduced.wants_jacobian = bool(getattr(user_fn, "wants_jacobian", False))
+            # Carry the composed solver's value-identity through the reduction wrapper, so a cached
+            # compiled solve is still recognised as the same solver on a constrained problem.
+            _k = getattr(user_fn, "cache_key", None)
+            if _k is not None:
+                _reduced.cache_key = ("reduced", _k)
 
             _out = self._op.solve(solve_fn=_reduced, **kwargs)
+            if kwargs.get("values"):
+                self._record_values_verdict(_out, kwargs, nonlinear)  # see that method: jit hides the guard
             # A SLIP reduction returns the array, matching the non-reduced steady-nonlinear branch below:
             # it is a boundary condition, not a training construct, and leaving it lazy meant
             # `np.asarray(fem.solve(...))` silently produced a 0-d OBJECT array that only blew up later
@@ -1943,7 +1961,40 @@ class FEM:
             # Re/Im legs were fused into one block. (A *real* transient stays lazy; that asymmetry predates
             # the fusion and is a separate call to make, not something a refactor should change silently.)
             return self._op.solve(solve_fn, **kwargs).fn()
-        return self._op.solve(solve_fn, **kwargs)
+        out = self._op.solve(solve_fn, **kwargs)
+        if kwargs.get("values") and self._mode == "nonlinear":
+            self._record_values_verdict(out, kwargs, nonlinear)
+        return out
+
+    def _record_values_verdict(self, out, kwargs, nonlinear):
+        """Judge a ``fem.solve(param=value)`` solve and write it to :attr:`stats`.
+
+        That solve is jitted -- which is how it avoids re-staging for every value -- and the driver's
+        own convergence check self-disables under a trace, so without this it returns with NO verdict
+        and ``fem.stats`` keeps whatever an earlier eager solve left behind. The judgement is made on
+        the residual the solver actually worked on: the REDUCED one on a reduced system, because the
+        full residual of a constrained problem keeps the constraint's reaction, which is physical and
+        stays O(1) however well converged the solve is.
+        """
+        from .utils.solver.solver_api import record_nonlinear_verdict
+
+        op, per, vals = self._op, self._periodic, kwargs["values"]
+        u = jnp.asarray(out).reshape(-1)
+        zero = jnp.zeros((int(op.size),), dtype=jnp.result_type(float))
+        u0 = jnp.asarray(kwargs.get("u0", zero)).reshape(-1)
+        if per is None:
+            res_at = lambda uu: op.residual(uu, vals)  # noqa: E731
+        else:
+            from .utils.solver.fem_utils import prolong_periodic, reduce_vector_periodic, restrict_state_periodic
+
+            def res_at(ur, _p=per, _o=op, _v=vals):
+                full = _o.residual(prolong_periodic(_p, ur), _v)
+                return reduce_vector_periodic(_p, jnp.asarray(full).reshape(-1))
+
+            u = restrict_state_periodic(per, u)
+            if u0.shape[0] != u.shape[0]:
+                u0 = restrict_state_periodic(per, u0)
+        record_nonlinear_verdict(res_at, u, u0, nonlinear, getattr(nonlinear, "name", None) or "newton")
 
     def _compose_slots(self, solve_fn, *, x0, nonlinear, linear, precond, time=None, shard=None, kwargs):
         """Compose the solver slots into the mode-appropriate ``solve_fn`` (see :meth:`solve`)."""
