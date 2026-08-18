@@ -283,6 +283,44 @@ and a surface term needs the front-end's per-region facet bucketing — both are
 Verified by global balance, not by restating the assembly: the wall flux equals the integrated source,
 and the reaction equals the applied load.
 
+### Integrating a quantity — `fem.eval` on a test-free expression
+
+The same entry point, given an expression with **no** test function, returns the scalar
+`∫ F dΩ` (or `∮ F ds`) instead of a per-DOF vector. The expression decides which: a weak term
+assembles, an integrand integrates.
+
+```python
+C    = fem.eval(sig(u, rho) @ eps(u), sol, args=design)   # compliance, an energy integral
+V    = fem.eval(rho, sol, args=design)                    # the material volume
+out  = fem.eval(inner(u.bind(x=xo, y=yo), e), sol)        # a mechanism's output displacement
+```
+
+This is the *objective* half of a design problem, and it is why it exists: every one of compliance, a
+volume fraction, a stress p-norm and a mechanism output is one integral, where each previously needed
+its own hand-written reduction over the DOF vector.
+
+**It integrates on the quadrature the operator was assembled with**, not a rule of its own. That is
+what makes the identity below exact rather than exact-to-within-a-quadrature-error that nothing
+reports:
+
+```python
+fem.eval(a(u, u), sol) == sol @ fem.eval(a(u, phi), sol)     # ∫ σ(u):ε(u) dΩ  ==  uᵀKu
+```
+
+The region comes from the coordinate Variables in the expression, exactly as it does for a weak term,
+so a boundary integrand is spelled by binding the field to that region's coordinates. A term naming
+two regions is refused — an integral has one measure.
+
+Differentiable in all three of its arguments: the solution, the runtime parameters (a P0 density
+included), and the **mesh coordinates** — `∂/∂X` flows through `|det J|` and through the facet area
+element, which is what a deformable-mesh design problem needs.
+
+Scope, and it is narrower than the weak path: the whole volume and tagged boundary regions only (a
+sub-region-restricted functional raises), and steady native-Lagrange problems only — transient,
+complex, 1-D, non-nodal elements and the VPINN path never publish the assembler this rides on, and
+say so. Where it is unavailable the equivalent is `sum(fem.eval(F * phi, sol))`: a Lagrange basis is a
+partition of unity, so summing the weak term `F·φ` over every DOF is the same integral.
+
 ### Tying two boundaries — `u(A) - u(B)`
 
 A term that names two boundary regions and carries no test function is a **tie**: it identifies the

@@ -106,7 +106,10 @@ def test_the_eliminated_system_would_have_returned_zero():
     assert np.abs(live).max() > 1e-3  # eval gives the real reaction
 
 
-def test_eval_refuses_an_expression_with_no_test_function():
+def test_eval_integrates_an_expression_with_no_test_function():
+    """A test-free expression is not an assembly — it is an integrand, and ``eval`` reduces it to the
+    scalar ``∫ F dΩ`` rather than to one value per DOF. Pinned here because this file used to assert
+    the opposite (that it was refused); the integral's own oracles live in test_fem_functional.py."""
     grad, inner = jno.np.grad, jno.np.inner
     d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain()
     d.tag("walls", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
@@ -115,8 +118,12 @@ def test_eval_refuses_an_expression_with_no_test_function():
     u, phi = d.fem_symbols()
     fem = jno.fem([inner(grad(u, X), grad(phi, X), 1) - phi, u(*cw) - 0.0])
     sol = fem.solve()
-    with pytest.raises(ValueError, match="must contain the test function"):
-        fem.eval(u * u, sol)  # a field readout, not an assembly
+
+    weak = np.asarray(fem.eval(u * u * phi, sol))  # the SAME integrand, carrying a test function
+    integral = np.asarray(fem.eval(u * u, sol))
+    assert weak.shape == (fem.dofs,), "a weak term still assembles to one value per DOF"
+    assert integral.shape == (), f"an integrand reduces to a scalar, got shape {integral.shape}"
+    assert abs(float(integral) - float(weak.sum())) < 1e-10  # partition of unity: Σ_a φ_a ≡ 1
 
 
 def test_region_dofs_names_an_unknown_region():

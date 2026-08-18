@@ -1297,10 +1297,16 @@ def assemble_fem_native(
 
     # Per-field facet tables (one set per distinct element order). These tabulate the parent basis on
     # the simplex facets for surface (Neumann/Robin) integration -- a triangle's 3 edges in 2D, a tet's
-    # 4 triangular faces in 3D -- so they are skipped when there are no boundary terms.
+    # 4 triangular faces in 3D.
+    #
+    # Built whenever the cell type supports a facet rule, not only when the FORM carries a boundary term:
+    # a boundary FUNCTIONAL (`fem.eval` on a test-free expression, e.g. a mechanism's output displacement
+    # ∮ u·e ds) asks for a facet the equations never integrated over, and gating on `boundary_terms` left
+    # it unpackable-None. These are REFERENCE-space tables -- shape (n_faces, n_q, n_dof) per element
+    # order -- so the cost is independent of the mesh size and paid once at build.
     face_tables_per_field = (
         [_build_face_tables(f["order"], quad_degree, dim, _cell_type) for f in fields]
-        if (boundary_terms and not _refuse_tensor_product_surface(_cell_type))
+        if not _refuse_tensor_product_surface(_cell_type)
         else [None] * len(fields)
     )
     # face_tables_per_field[i] = (face_phi, face_dphi_ref, face_ref_qp, face_ref_tangs, face_w);
@@ -1794,16 +1800,20 @@ def assemble_fem_native(
         _add_loadpath_fields(loc, c, args)  # per-step load-path field slices -> loc["frozen_fields"]
         return _integrate_term(domain, coeff, loc, qw_shared * meas)
 
-    def _vol_elem_readout(c, local_all, formula, t=0.0, args=None):
-        """Per-quadrature-point VALUE of an evolution formula on cell ``c`` -> ``(n_quad, *value_shape)``.
+    def _vol_readout_loc(c, local_all, t=0.0, args=None, pts=None, rnames=()):
+        """The per-cell ``loc`` a TEST-FREE volume expression is evaluated in, plus the geometric measure
+        ``meas`` at the quadrature points.
 
-        Same field / parameter / frozen / history ``loc`` as :func:`_vol_elem_res` (so the formula reads
-        the solved unknown through ``ε(u)`` and the previous state through ``ep.i(-1)``), but the formula
-        carries NO test function, so it is *evaluated* at the quad points (``_eval_integrand``) rather than
-        integrated. This is the internal-state update the load-step march applies after each solve.
-        Reverse-mode differentiable in ``local_all`` (the solved DOFs) and the history buffers."""
+        Shared by the two things that consume a test-free formula: the state readout, which *evaluates* it
+        per quadrature point, and the functional, which *integrates* it. Everything up to that final
+        reduction is identical -- and identical to :func:`_vol_elem_res` bar the test field -- so one
+        builder is what stops the three drifting apart.
+
+        ``pts`` is the coordinate-parameter-scattered geometry (``None`` -> static mesh); pass it and
+        ``∂/∂X`` flows through ``|det J|``. ``rnames`` are the region masks restricting a sub-domain
+        integral, exactly as in :func:`_vol_elem_res`."""
         cell_sols = _split_cell_local(local_all)
-        per, xq, meas = _cell_fields(c, cell_sols)
+        per, xq, meas = _cell_fields(c, cell_sols, pts_j if pts is None else pts)
         h_qp = jnp.broadcast_to(
             jnp.reshape(meas ** (1.0 / dim), (-1, 1)), (qw_shared.shape[0], 1)
         )  # meas: scalar (affine) or per-qp (curved)
@@ -1816,8 +1826,9 @@ def assemble_fem_native(
             "domain_context": {**ctx, "cell_size": h_qp},
             "temporal_tags": temporal_tags,
             "runtime_parameter_tags": runtime_parameter_tags,
-            "region_mask_names": (),
-            "volume_vars": _runtime_vals(c, t, args, local_all.dtype),
+            "region_mask_names": rnames,
+            "volume_vars": _runtime_vals(c, t, args, local_all.dtype)
+            + tuple(region_mask_arrays[_region_mask_index[r]][c] for r in rnames),
             "trial_value_shape": fields[0]["value_shape"],
             "trial_vec": vecs[0],
         }
@@ -1833,7 +1844,26 @@ def assemble_fem_native(
             if hbuf:
                 loc["qp_history"] = {k: hbuf[k][c] for k in history_specs if k in hbuf}
         _add_loadpath_fields(loc, c, args)  # per-step load-path field slices -> loc["frozen_fields"]
+        return loc, meas
+
+    def _vol_elem_readout(c, local_all, formula, t=0.0, args=None):
+        """Per-quadrature-point VALUE of an evolution formula on cell ``c`` -> ``(n_quad, *value_shape)``.
+
+        The formula carries NO test function, so it is *evaluated* at the quad points rather than
+        integrated -- this is the internal-state update the load-step march applies after each solve.
+        Reverse-mode differentiable in ``local_all`` (the solved DOFs) and the history buffers."""
+        loc, _meas = _vol_readout_loc(c, local_all, t, args)
         return _eval_integrand(domain, formula, loc)
+
+    def _vol_elem_functional(c, local_all, formula, rnames=(), t=0.0, args=None, pts=None):
+        """``∫_K F dΩ`` over cell ``c`` -> ``(1,)``, for a test-free ``formula``.
+
+        The same integration the residual performs, minus the test function: with no test index the
+        integrand is one value per quadrature point, so ``_integrate_term`` contracts it against
+        ``w · |det J|`` to a single number per cell rather than an element block. Differentiable in the
+        solved DOFs, in the runtime parameters, and -- once ``pts`` is threaded -- in the mesh."""
+        loc, meas = _vol_readout_loc(c, local_all, t, args, pts, rnames)
+        return _integrate_term(domain, formula, loc, qw_shared * meas)
 
     def state_readout(u_flat, t=0.0, args=None):
         """Advance every buffered state one load step: evaluate each key's readout formula at the
@@ -2063,18 +2093,25 @@ def assemble_fem_native(
                 loc["qp_history"] = {k: sbuf[k][fi] for k in surface_history_specs if k in sbuf}
         return _integrate_term(domain, bcoeff, loc, face_w * jac_f)
 
-    def _surf_elem_readout(fi, local_all, formula, region, t=0.0, args=None, gaps=None):
-        """Per-quad-point VALUE of a surface evolution formula on boundary face ``fi`` -> (n_q, *shape).
+    def _surf_readout_loc(fi, local_all, region, t=0.0, args=None, pts=None, normals=None, gaps=None):
+        """The per-face ``loc`` a TEST-FREE surface expression is evaluated in, plus the facet quadrature
+        weights ``w · |dS|``.
 
-        The surface analogue of :func:`_vol_elem_readout`: the same surface ``loc`` as ``_surf_elem_res``
-        (fields, outward normal, per-face surface history), but the formula carries no test function, so it
-        is *evaluated* (``_eval_integrand``), not integrated -- the advance for a surface state (a slip)."""
+        The surface twin of :func:`_vol_readout_loc`, and the same ``loc`` :func:`_surf_elem_res` builds bar
+        the test field: fields restricted to the facet, the outward normal, per-face surface history.
+        ``pts`` / ``normals`` are the coordinate-parameter-scattered geometry (``None`` -> static mesh), so a
+        functional over a moving boundary differentiates in the mesh."""
         c = parent_j[fi]
         k = lface_j[fi]
-        n_vec = normals_j[fi]
+        n_vec = (normals_j if normals is None else normals)[fi]
         cell_sols = _split_cell_local(local_all)
-        verts = pts_j[cells_j[c]]
-        J, Kmat, _xq_tp = _facet_geometry(c, k, pts_j)
+        _pts_src = pts_j if pts is None else pts
+        verts = _pts_src[cells_j[c]]
+        J, Kmat, _xq_tp = _facet_geometry(c, k, _pts_src)
+        if _curved_facet:
+            # Matches _surf_elem_res: a bilinear facet's normal turns across it, so the frozen per-facet
+            # vector is wrong there. Straight facets keep it, where it is exact.
+            n_vec = _facet_nanson_normal(J, face_tables_per_field[0][3][k], _facet_sign_j[fi])
         per_f = []
         for i in range(len(fields)):
             fp_i, fd_i, _, _, _ = face_tables_per_field[i]
@@ -2086,7 +2123,8 @@ def assemble_fem_native(
                     "space": "Lagrange",
                 }
             )
-        _, _, fp_qp, _fp_tangs, _fw = face_tables_per_field[0]
+        _, _, fp_qp, fp_tangs, face_w = face_tables_per_field[0]
+        jac_f = _facet_area_element(J, fp_tangs[k])  # physical edge length (2D) / face area (3D)
         xq_f = _xq_tp if _xq_tp is not None else verts[0] + fp_qp[k] @ J.T
         loc = {
             "physical_quad_points": xq_f,
@@ -2114,7 +2152,23 @@ def assemble_fem_native(
             sbuf = args.get("__surface_history__") if isinstance(args, dict) else None
             if sbuf:
                 loc["qp_history"] = {kk: sbuf[kk][fi] for kk in surface_history_specs if kk in sbuf}
+        return loc, face_w * jac_f
+
+    def _surf_elem_readout(fi, local_all, formula, region, t=0.0, args=None, gaps=None):
+        """Per-quad-point VALUE of a surface evolution formula on boundary face ``fi`` -> (n_q, *shape).
+
+        The formula carries no test function, so it is *evaluated*, not integrated -- the advance for a
+        surface state (a slip)."""
+        loc, _w = _surf_readout_loc(fi, local_all, region, t, args, gaps=gaps)
         return _eval_integrand(domain, formula, loc)
+
+    def _surf_elem_functional(fi, local_all, formula, region, t=0.0, args=None, pts=None, normals=None, gaps=None):
+        """``∫_F F ds`` over boundary face ``fi`` -> ``(1,)``, for a test-free ``formula``.
+
+        The surface twin of :func:`_vol_elem_functional`: the facet integration ``_surf_elem_res`` performs,
+        contracted against ``w · |dS|`` to one number per face instead of an element block."""
+        loc, w = _surf_readout_loc(fi, local_all, region, t, args, pts, normals, gaps)
+        return _integrate_term(domain, formula, loc, w)
 
     def surface_state_readout(u_flat, t=0.0, args=None):
         """Advance each SURFACE state one load step: evaluate its evolves formula on its region's faces.
@@ -2283,6 +2337,58 @@ def assemble_fem_native(
             return R
 
         return residual
+
+    def _make_functional(terms, bterms=None):
+        """Build the scalar functional ``F(u_flat, t, args) -> ()`` of TEST-FREE expressions.
+
+        This is the reduction a weak term does not have. A term carrying a test function integrates to one
+        value per test DOF and scatters into a residual vector; an expression *without* one is an energy or
+        stress density, so each element contributes a single number ``∫_K F dΩ`` and the answer is their
+        sum. ``terms`` are volume integrands and ``bterms`` a ``{region: [exprs]}`` dict of surface ones --
+        the same two buckets :func:`_make_residual` takes, so the region resolution upstream is shared.
+
+        It integrates on the SAME quadrature the operator was assembled with, which is what makes
+        ``∫ σ(u):ε(u) dΩ`` equal ``u·(Ku)`` exactly rather than to within a quadrature error nothing
+        reports. Differentiable in ``u_flat``, in the runtime parameters, and in the mesh -- ``pts_dyn`` is
+        threaded so ``∂/∂X`` flows through ``|det J|`` and through the facet area element."""
+
+        def functional(u_flat, t=0.0, args=None):
+            local_all = u_flat[cell_all_dofs]  # (n_cell, n_local_all)
+            pts_dyn = _apply_coord_params(pts_j, args)  # trainable coords -> differentiable geometry
+            out = jnp.zeros((), dtype=u_flat.dtype)
+
+            for expr in terms or ():
+                # n_test = 1 in the chunk estimate: there is no element block here, only one number per
+                # cell, so a test-DOF's worth of cost is the honest proxy (as in `state_readout`).
+                per_cell = _elem_map(
+                    lambda c, la, _e=expr: _vol_elem_functional(c, la, _e, (), t, args, pts_dyn),
+                    (jnp.arange(n_cells), local_all),
+                    _cell_chunk(n_cells, 1, cell_all_dofs.shape[1]),
+                )
+                out = out + jnp.sum(per_cell)
+
+            if bterms:
+                normals_dyn = _surface_normals(pts_dyn)  # differentiable facet normals under coord motion
+                gap_um = {k: _gap_gather(u_flat, k) for k in _gap_tables}
+                for region, exprs in bterms.items():
+                    face_ids = _region_faces(region)
+                    if len(face_ids) == 0:
+                        continue
+                    fids = jnp.asarray(face_ids, dtype=jnp.int32)
+                    lv = u_flat[cell_all_dofs[parent_j[fids]]]  # (n_face, n_local_all)
+                    gslice = _gap_slices(region, fids, gap_um)  # {key: (g0, u_m)} for THIS region's faces
+                    for expr in exprs:
+                        per_face = _elem_map(
+                            lambda fi, la, gp, _e=expr, _r=region: _surf_elem_functional(
+                                fi, la, _e, _r, t, args, pts_dyn, normals_dyn, gp
+                            ),
+                            (fids, lv, gslice),
+                            _cell_chunk(int(fids.shape[0]), 1, cell_all_dofs.shape[1]),
+                        )
+                        out = out + jnp.sum(per_face)
+            return out
+
+        return functional
 
     def _make_jacobian(terms, bterms=None):
         """Build the dense Jacobian ``J(u_flat) -> (total, total)`` by *per-element* forward-mode AD.
@@ -3487,11 +3593,14 @@ def assemble_fem_native(
     # the linear system, row replacement for Newton -- which zeroes exactly the rows a reaction/flux
     # readout needs. Snapshotted onto the FEM in `_finalize`, like the field keys and DOF points.
     domain._fem_native_term_residual = _make_residual
-    # Whether the FACET tables exist. They are tabulated only when the FORM carries a surface term
-    # (see `face_tables_per_field`), so a later `fem.eval` of a surface term on a problem with no
-    # boundary terms has nothing to integrate against -- it must say so rather than fail deep inside
-    # the element kernel on `NoneType` unpacking.
-    domain._fem_native_has_facet_tables = bool(boundary_terms)
+    # The functional factory behind a test-free `fem.eval` / `expr.integrate(fem)`.
+    domain._fem_native_term_functional = _make_functional
+    # Whether the FACET tables exist, so a later `fem.eval` of a surface term says so rather than
+    # failing deep inside the element kernel on `NoneType` unpacking. This tracks
+    # `face_tables_per_field`, which is built for every cell type that HAS a facet rule -- NOT only
+    # when the form carries a boundary term. Gating this on `bool(boundary_terms)` (as it was when
+    # the tables were built that way) would now refuse a surface readout the tables can serve.
+    domain._fem_native_has_facet_tables = face_tables_per_field[0] is not None
     jacobian = _make_jacobian(volume_terms, boundary_terms)
     nonlinear = any(_is_obviously_nonlinear_in_unknown(domain, t) for t in all_terms)
     # A form that is LINEAR in the unknown but READS step history is still a march: every load step is a
