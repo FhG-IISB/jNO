@@ -991,9 +991,19 @@ def run_continuation(fem, spec, *, nonlinear=None, linear=None, precond=None, x0
     step); ``x0=`` seeds the *first* step. A **direct** linear solve ignores warm starts by nature --
     the sweep still buys the family collection and per-step failure localization.
 
-    Every step is checked finite on the host (this driver is eager, like ``adapt=``): a step that
-    diverges or hits a singular operator raises naming the parameter values and the step index, instead
-    of returning NaN from three steps later. Returns concrete arrays -- ``(n_dofs,)`` for
+    **The march is staged once.** The per-step solve is a single ``jax.jit`` taking the parameter
+    values as a *traced* argument, so an N-value ramp costs one compilation and N executions rather
+    than N compilations -- which is the whole reason to prefer this over a Python loop that rebuilds
+    the form. jit keys on shape and dtype, not value, so no enumeration of the sweep is involved: one
+    executable serves any value, including ones chosen adaptively. **Nonlinear only** -- the linear
+    branch re-assembles ``A, b`` per value and still stages per step.
+
+    Every step is checked finite on the host (the *loop* stays eager; only the step is traced): a step
+    that diverges or hits a singular operator raises naming the parameter values and the step index,
+    instead of returning NaN from three steps later. The nonlinear driver's own stalled-solve guard
+    goes blind inside that jit -- it needs a concrete residual -- so the equivalent check is made out
+    here against the tolerances the ``nonlinear=`` spec carries, and ``fem.stats`` reports the rung
+    that was actually last solved. Returns concrete arrays -- ``(n_dofs,)`` for
     ``keep="last"``, ``(n_values, n_dofs)`` for ``keep="all"`` -- complex-valued when the problem is.
     """
     kwargs = dict(kwargs or {})
@@ -1070,6 +1080,39 @@ def run_continuation(fem, spec, *, nonlinear=None, linear=None, precond=None, x0
     if mode == "nonlinear":
         nl = compose_nonlinear_solve_fn(nonlinear, linear, precond, fem)
         prev = jnp.zeros((_reduced_size(periodic) if periodic is not None else int(op.size),))
+
+        # ONE staging for the whole march. Nothing on the steady nonlinear path is jitted, and
+        # `lax.while_loop`/`custom_root`/`linearize` stage their bodies on every Python call -- so
+        # without this the form is re-traced at every rung (MEASURED: 6 traces per step, and a
+        # hoisted stable closure does not help, because there is no jit cache to hit). The parameter
+        # values enter as a TRACED argument, so every rung shares one executable: jit keys on shape
+        # and dtype, not value, and each rung passes the same shapes. The warm start rides along as
+        # the second argument.
+        if periodic is None:
+
+            def _residual_at(vals, uu):
+                return jnp.asarray(op.residual(uu, vals)).reshape(-1)
+
+        else:
+            from .fem_utils import prolong_periodic, reduce_vector_periodic
+
+            def _residual_at(vals, ur):
+                # reduced system: solve on the constraint manifold, u = P u~
+                full = op.residual(prolong_periodic(periodic, ur), vals)
+                return reduce_vector_periodic(periodic, jnp.asarray(full).reshape(-1))
+
+        _step = jax.jit(lambda vals, u_prev: nl(lambda uu: _residual_at(vals, uu), u_prev))
+
+        # `_convergence_check` inside the driver self-disables under jit (it needs a concrete
+        # residual), so the stalled-solve guard it provides would be lost -- and `fem.stats` would
+        # keep a stale entry. Re-checked here instead, eagerly, against the tolerances the spec
+        # carries for precisely this case. One extra residual evaluation per rung, against a Newton
+        # solve: negligible.
+        from .newton_krylov import LAST_NEWTON_STATS
+
+        _traits = getattr(nonlinear, "traits", None) or {}
+        _rtol, _atol = float(_traits.get("rtol", 1e-8)), float(_traits.get("atol", 1e-8))
+        _who = f"continuation/{getattr(nonlinear, 'name', None) or 'newton'}"
     else:
         nl = None
         A0, b0 = op.evaluate({**fixed, **{k: _step_value(s, 0) for k, s in seqs.items()}})
@@ -1086,18 +1129,21 @@ def run_continuation(fem, spec, *, nonlinear=None, linear=None, precond=None, x0
         at = ", ".join(f"{name}={np.asarray(s[k])!r}" for name, s in seqs.items())
         try:
             if mode == "nonlinear":
+                step = _step(vals, prev)
+                # The in-driver guard is blind under jit; judge this rung's solve out here, where the
+                # residual is concrete, and record it so `fem.stats` describes the step just taken.
+                # Verdict is computed inside the try (it forces the sync) but RAISED below, next to
+                # the finiteness check, so a stalled rung reports as itself rather than being
+                # re-wrapped as the surrounding "failed to converge".
+                _r_end = float(jnp.linalg.norm(_residual_at(vals, step)))
+                _bound = _atol + _rtol * float(jnp.linalg.norm(_residual_at(vals, prev)))
+                _stalled = not (bool(np.isfinite(_r_end)) and _r_end <= _bound)
+                LAST_NEWTON_STATS.clear()
+                LAST_NEWTON_STATS.update(driver=_who, residual=_r_end, bound=_bound, steps=None, converged=not _stalled)
                 if periodic is None:
-                    u = nl(lambda uu, _v=vals: op.residual(uu, _v), prev)
+                    u = step
                 else:
-                    from .fem_utils import prolong_periodic, reduce_vector_periodic
-
-                    u_red = nl(
-                        lambda ur, _v=vals: reduce_vector_periodic(
-                            periodic, jnp.asarray(op.residual(prolong_periodic(periodic, ur), _v)).reshape(-1)
-                        ),
-                        prev,
-                    )
-                    prev_red, u = u_red, prolong_periodic(periodic, u_red)
+                    prev_red, u = step, prolong_periodic(periodic, step)
             else:
                 A, b = op.evaluate(vals)
                 b = jnp.asarray(b).reshape(-1)
@@ -1118,6 +1164,14 @@ def run_continuation(fem, spec, *, nonlinear=None, linear=None, precond=None, x0
                 f"Refine the value sequence around this point, or pass "
                 f"nonlinear=jno.solve.newton(line_search=True). Original error: {e}"
             ) from e
+        if mode == "nonlinear" and _stalled:
+            raise RuntimeError(
+                f"fem.solve(continuation=...): step {k + 1}/{n_steps} at {at} did not converge: "
+                f"residual norm {_r_end:.3e} against the tolerance atol + rtol*||r(x0)|| = "
+                f"{_bound:.3e}. The rung's iterate is NOT a root -- the march would carry it into "
+                "every later step as a warm start. Refine the value sequence around this point, "
+                "raise max_steps, or pass nonlinear=jno.solve.newton(line_search=True)."
+            )
         if not bool(np.isfinite(u_host).all()):
             raise RuntimeError(
                 f"fem.solve(continuation=...): step {k + 1}/{n_steps} at {at} produced a non-finite "
