@@ -5526,7 +5526,7 @@ packages:
   - iree-base-compiler ; extra == 'iree'
   - iree-base-runtime ; extra == 'iree'
   - fmmax ; extra == 'rcwa'
-  requires_python: '>=3.11,<3.14'
+  requires_python: '>=3.11,<3.15'
 - pypi: https://files.pythonhosted.org/packages/0e/a7/83b321492fe7e5d0af07f484ec0100bb6ca561aa64cad1d34fc58a015d0f/blackjax-1.5-py3-none-any.whl
   name: blackjax
   version: '1.5'
