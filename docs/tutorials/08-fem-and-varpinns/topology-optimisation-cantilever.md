@@ -170,9 +170,14 @@ and JAX build they ran on:
 **Compliance and volume fraction are stable** to a fraction of a percent — they are what the problem
 actually pins down. **The perimeter and the reanalysis gap are not**: they span $504$–$587$ and
 $+5.4$–$+13.6\%$. Runs B and C are the *same source code*, so this is not the rewrite; it is the
-problem. It is non-convex, and it contains *discrete* events — the SIMP continuation fires when a
-convergence window closes — so a change at the last bit of a floating-point operation moves which
-iteration it fires at, and the design settles in a different local optimum.
+problem. It is non-convex, and MMA's asymptote update is *history-dependent with a branch in it* — a
+variable that just reversed direction has its asymptotes pulled in, one moving steadily has them
+pushed out — so a change in the last bit of a floating-point operation flips that test for some
+variable, and the trajectories separate from there into different local optima.
+
+(It is **not** the SIMP continuation, which would be the obvious suspect. Measured on this
+configuration: `penal` stays at $3.0$ and the continuation fires **zero** times in 400 iterations —
+see the note below.)
 
 The practical consequence: quote the over-report as "order $+10\%$" and not to three figures, and
 treat a single run's perimeter as one sample rather than a measurement. ($C = f\cdot u$ and
