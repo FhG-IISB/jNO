@@ -843,6 +843,13 @@ def assemble_fem_native(
                     f"{fields[_i]['order']}. The cover supplies the extra order, not `order=`."
                 )
     _cblk = [cover_block(dim) if c else 1 for c in _cover]
+    # Selective enrichment: a boolean over the REAL mesh nodes saying which carry covers, stashed on
+    # the domain by `jno.solve.enrich(...)` between adaptive rounds. The slots exist either way (the
+    # padded layout is uniform); an unenriched node simply has its cover DOFs pinned to zero, which
+    # is the same mechanism a Dirichlet condition uses and costs the solve nothing after elimination.
+    # None means "every node", the plain `space="cover"` case.
+    _cover_mask = getattr(domain, "_fem_enriched_nodes", None)
+    _cover_mask = np.asarray(_cover_mask, dtype=bool).reshape(-1) if (_cover_mask is not None and any(_cover)) else None
 
     # -------------------------------------------------------------------------
     # Per-field mesh data
@@ -2874,6 +2881,7 @@ def assemble_fem_native(
         # second-order block, the velocity ġ) per step.
         domain._fem_native_dirichlet_pairs = pairs
         domain._fem_native_dirichlet_tv = tv_stash
+        _mask_cover_pins(pairs)
         _gauge_cover_modes(pairs)
         return pairs
 
@@ -2890,6 +2898,34 @@ def assemble_fem_native(
 
     _cover_gauge_pins: List[Any] = []
     _cover_gauge_done = [False]
+
+    def _mask_cover_pins(pairs):
+        """Pin every cover DOF of a node the enrichment mask excludes.
+
+        This is what makes ``p`` vary across the mesh. It needs no constraint equations and no
+        interface bookkeeping: because enrichment rides the partition of unity, an enriched node
+        beside an unenriched one already blends correctly, so switching a node off is just fixing
+        its coefficients at zero. That is the whole reason interpolation covers are the cheap route
+        to variable ``p`` -- a hierarchical basis would need the edge modes reconciled."""
+        if _cover_mask is None:
+            return
+        for fidx, is_cov in enumerate(_cover):
+            if not is_cov:
+                continue
+            n_real = int(np.asarray(pts_f_real[fidx]).shape[0])
+            if _cover_mask.size != n_real:
+                raise ValueError(
+                    f"the enrichment mask has {_cover_mask.size} entries but field {fidx} has {n_real} "
+                    f"nodes. The mask is one flag per MESH NODE (domain._fem_enriched_nodes, written by "
+                    "jno.solve.enrich); a mismatch means it was built against a different mesh."
+                )
+            blk, vt = _cblk[fidx], int(vecs[fidx])
+            off = set(int(i) for i in np.flatnonzero(~_cover_mask))
+            for r in off:
+                for m in range(1, blk):
+                    base = offs[fidx] + (r * blk + m) * vt
+                    for c in range(vt):
+                        pairs.append((base + c, 0.0))
 
     def _gauge_cover_modes(pairs):
         """Remove the enrichment's exact null modes that the boundary conditions leave alive.

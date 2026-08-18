@@ -482,3 +482,51 @@ def test_an_inhomogeneous_dirichlet_trace_is_only_piecewise_linear():
     val, vpts = _values(fem, d, _dense_solve(fem))
     err = float(np.abs(val - (vpts[:, 0] ** 2 - vpts[:, 1] ** 2)).max())
     assert err > 1e-6, "the quadratic IS now recovered — the Dirichlet limitation is fixed, update the docs"
+
+
+def test_the_coordinate_gradient_through_a_cover_solve_matches_finite_differences():
+    """The combination the element exists for: enrichment ON a mesh whose nodes are design variables.
+
+    P2 buys the same span with edge midpoints, which are not mesh vertices and so are not what
+    ``.trainable()`` moves; a cover's DOFs ride the P1 nodes. That only pays if the gradient survives
+    the enrichment, so it is measured against central differences — with a **P1 control in the same
+    harness**, because "1e-9" means nothing without knowing what the FD step itself costs.
+
+    Scope, since it is invisible otherwise: the nodal length scale ``s_i`` is a host constant fixed at
+    build (like the facet orientation signs) and does not track moving coordinates. That is a
+    conditioning drift under large motion, not a wrong gradient — the value differentiated here is the
+    one the assembler actually uses.
+    """
+    import jax.numpy as jnp
+
+    import jno
+
+    rel = {}
+    for space in ("Lagrange", "cover"):
+        d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain()
+        mv, _, _ = d.variable("mv", where=lambda x, y: (x > 0.2) & (x < 0.8) & (y > 0.2) & (y < 0.8), split=True)
+        mv.trainable(name="cx")
+        op = d._trainable_coords[0]
+        ids, axis, name = op["ids"], op["axis"], op["name"]
+        u, phi = d.fem_symbols(space=space)
+        xi, yi, _ = d.variable("interior", split=True)
+        xb, yb, _ = d.variable("boundary", split=True)
+        ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+        fem = jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0])
+        X0 = jnp.asarray(np.asarray(d.mesh.points)[ids, axis])
+
+        def obj(X, fem=fem, name=name):
+            a, b = fem.operator.evaluate({name: X})
+            s = jnp.linalg.solve(jnp.asarray(a.todense()), jnp.asarray(b).reshape(-1))
+            return 0.5 * jnp.sum(s * s)
+
+        g_ad = np.asarray(jax.grad(obj)(X0))
+        eps = 1e-6
+        g_fd = np.array([float(obj(X0.at[i].add(eps)) - obj(X0.at[i].add(-eps))) / (2 * eps) for i in range(X0.size)])
+        assert np.linalg.norm(g_ad) > 1e-8, f"{space}: the coordinate gradient is zero"
+        rel[space] = float(np.linalg.norm(g_ad - g_fd) / np.linalg.norm(g_fd))
+
+    assert rel["cover"] < 1e-6, f"cover ∂J/∂X vs FD: {rel['cover']:.2e}"
+    assert rel["cover"] < 1e3 * rel["Lagrange"], (
+        f"the enrichment degraded the coordinate gradient: cover {rel['cover']:.2e} vs P1 {rel['Lagrange']:.2e}"
+    )

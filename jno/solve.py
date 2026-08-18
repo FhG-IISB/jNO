@@ -66,6 +66,7 @@ __all__ = [
     "exponential",
     "adaptive",
     "remesh",
+    "enrich",
     "refine",
     "relocate",
 ]
@@ -1262,6 +1263,66 @@ def relocate(
         quality_floor=quality_floor,
         ma_relax=relax,
         ma_dt=relax_step,
+    )
+
+
+def enrich(
+    *,
+    criterion=None,
+    theta: float = 0.5,
+    max_iters: int = 8,
+    max_dofs: int | None = None,
+    tol: float | None = None,
+    eps: float | None = None,
+    metric_field: int = 0,
+):
+    """**p-adaptivity** for ``fem.solve(adapt=...)``: raise the polynomial order where it is needed,
+    leaving the mesh alone.
+
+    The fourth adaptivity beside :func:`remesh` (rebuild finer), :func:`refine` (split cells) and
+    :func:`relocate` (move nodes). This one changes neither the points nor the connectivity: it
+    switches **interpolation covers** on at the marked nodes, so the field gains coefficients where
+    the solution needs them and stays P1 elsewhere. Requires a field declared ``space="cover"``::
+
+        u, phi = d.fem_symbols(space="cover")
+        fem = jno.fem([...])
+        fem.solve(adapt=jno.solve.enrich(criterion=jno.np.sqrt(ui.x**2 + ui.y**2)))
+
+    Why this is the cheap route to variable ``p``: enrichment rides the partition of unity, so an
+    enriched node next to an unenriched one blends automatically. There are no constraint equations
+    at an order interface and no edge-mode bookkeeping, which is what a hierarchical p-basis needs.
+    Compose with :func:`refine` across successive solves for **hp** — h where the solution is rough,
+    p where it is smooth.
+
+    Args:
+        criterion: A **traced expression** marking where to enrich, exactly as in :func:`remesh` --
+            a field, carrying no test function (``jno.np.sqrt(ui.x**2 + ui.y**2)``, ``phi*(1-phi)``,
+            ``d.by_region({...})``). Omitted, the Zienkiewicz–Zhu recovery estimator is used,
+            spread from cells to their nodes.
+        theta: Dörfler bulk-marking fraction, over NODES rather than cells: the fewest nodes whose
+            indicator reaches ``theta`` of the total are enriched each round.
+        max_iters: Maximum enrich-solve rounds.
+        max_dofs: Stop once the system reaches this many ACTIVE DOFs. Active, not total: the padded
+            layout gives every node its cover slots and an unenriched node simply has them pinned, so
+            the total never changes and only the free count tracks the enrichment.
+        tol: Stop once the global indicator falls below this.
+        eps: Stop when the indicator plateaus for two consecutive rounds.
+        metric_field: Which field of a coupled problem drives the marking.
+
+    Scope: simplices only, first-order covers, and the enriched field must be ``space="cover"``.
+    ``fem.adapt_history`` records ``n_enriched`` per round beside the usual ``n_dofs``/``estimate``.
+    """
+    from .utils.solver.fem_adapt import AdaptSpec
+
+    return AdaptSpec(
+        enrich=True,
+        criterion=criterion,
+        theta=theta,
+        max_iters=max_iters,
+        max_dofs=max_dofs,
+        tol=tol,
+        eps=eps,
+        metric_field=metric_field,
     )
 
 

@@ -1943,6 +1943,21 @@ class FEM:
                     "For a fixed graded mesh instead, put the refinement in the geometry: "
                     "`Shape.box(...).sized(lambda x, y, z: fine if <in band> else coarse)`."
                 )
+            if getattr(adapt, "enrich", False):
+                # p-adaptivity: raise the local order by switching interpolation covers on at the marked
+                # NODES. The mesh -- points, cells, connectivity -- is untouched, so the DOF *nodes* are
+                # the same every round and only the coefficient count per node changes.
+                if self._mode == "transient":
+                    raise NotImplementedError(
+                        "jno.solve.enrich() is wired on the steady adaptive loop; this problem is "
+                        "transient. Enriching mid-march changes the DOF layout under the stepper, and the "
+                        "state transfer that carries a solution across a mesh change is written for a "
+                        "change of MESH, not of space. Enrich on a steady solve, or march on a fixed "
+                        "uniformly-enriched space (space='cover' with no adapt=)."
+                    )
+                from .utils.solver.fem_adapt import run_adaptive_enrich
+
+                return run_adaptive_enrich(self, adapt, solve_fn=solve_fn, **kwargs)
             if getattr(adapt, "relocate", False):
                 # r-adaptivity: relocate the .trainable() vertices (fixed connectivity), not h-refinement.
                 from .utils.solver.fem_adapt import run_adaptive_relocate
