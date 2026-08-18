@@ -126,3 +126,65 @@ def test_plain_relocate_is_unchanged():
     d, fem = _peak()
     out = np.asarray(fem.solve(adapt=jno.solve.relocate(objective="equidistribution", max_iters=6, lr=6e-3)))
     assert np.isfinite(out).all() and fem.adapt_history
+
+
+def _free_surface_channel(size=0.34):
+    """Stokes channel with a traction-free top whose vertices may slide vertically -- the free-surface
+    problem, whose objective is a SURFACE integral and so exercises the region resolution."""
+    d = jno.Shape.rect(0.0, 0.0, 3.0, 1.0, size=size).domain()
+    p = np.asarray(d.mesh.points)
+    p[:, 1] = p[:, 1] * (1.0 - 0.22 * p[:, 0] / 3.0 * p[:, 1])  # a deliberately wrong wall
+    d.mesh.points = p
+    wall = lambda X, Y: Y > 1.0 - 0.22 * X / 3.0 - 1e-9  # noqa: E731
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)
+    pr, q = d.fem_symbols(names=("p", "q"), order=1)
+    x, y, _ = d.variable("interior", split=True)
+    cin = d.variable("inlet", where=lambda X, Y: X < 1e-9, split=True)
+    cbot = d.variable("bottom", where=lambda X, Y: Y < 1e-9, split=True)
+    ct = d.variable("top", where=wall, normals=True, split=True)
+    cmov = d.variable("tmov", where=lambda X, Y: wall(X, Y) & (X > 1e-9), split=True)
+    cmov[1].trainable(name="ty")
+    eu, ev = jno.np.symgrad(u, [x, y]), jno.np.symgrad(v, [x, y])
+    dd = lambda a, b: jno.np.inner(a, b, n_contract=2)  # noqa: E731
+    pp, qq = pr.bind(x=x, y=y), q.bind(x=x, y=y)
+    vt, ut = v.bind(x=ct[0], y=ct[1]), u.bind(x=ct[0], y=ct[1])
+    nx, ny = ct[-2], ct[-1]
+    fem = jno.fem(
+        [
+            2.0 * dd(eu, ev) - pp * jno.np.trace(ev),
+            -qq * jno.np.trace(eu),
+            0.0 * vt[0],
+            u(cin[0], cin[1])[0] - 1.0,
+            u(cin[0], cin[1])[1] - 0.0,
+            u(cbot[0], cbot[1])[0] - 0.0,
+            u(cbot[0], cbot[1])[1] - 0.0,
+            pr.pin(),
+        ],
+        quad_degree=3,
+    )
+    return d, fem, (ut[0] * nx + ut[1] * ny) ** 2 * vt[0]
+
+
+def test_a_surface_objective_survives_the_remesh():
+    """A free surface AND a mesh condition, together -- the case the two features exist for.
+
+    The objective is a surface integral, so its region has to be resolved to boundary facets. That
+    resolution walks `tag_node_mask`, which intersects the tag with the catch-all "boundary" region
+    under `jax.vmap`; run from inside the traced objective it yields a traced mask, and converting one
+    raises. It used to resolve cleanly twice (50 points, then 62 eagerly after the remesh) and fail the
+    third time, inside the trace -- `FEM.eval` builds a fresh term list per call, so it never hit the
+    assembler's own memo. The facet selection is a property of the mesh, so it is now memoized per
+    assembly and the traced path finds it already computed.
+    """
+    d, fem, flux = _free_surface_channel()
+    n0 = int(np.asarray(d.mesh.points).shape[0])
+    fem.solve(
+        adapt=jno.solve.relocate(objective=flux, max_iters=60, lr=3e-2).remesh(
+            criterion=lambda dm: jno.le(dm.cell_aspect(), 1.9), max_iters=4
+        )
+    )
+    n1 = int(np.asarray(fem.domain.mesh.points).shape[0])
+    assert n1 > n0, f"no remesh happened, so this pins nothing: {n0} -> {n1}"
+    objs = [e["objective"] for e in fem.adapt_history]
+    assert min(objs) < objs[0] / 2.0, f"through-flow was not reduced: {objs[0]:.3e} -> {min(objs):.3e}"
+    assert _aspect(fem.domain).max() <= 1.9 + 1e-9

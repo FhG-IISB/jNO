@@ -3045,13 +3045,29 @@ def _mesh_margin_now(fem: Any, criterion: Any) -> np.ndarray:
         dom._trainable_coords = saved_tc
 
 
-def _reregister_trainable(dom: Any, coord_specs: list) -> None:
+def _boundary_vertices(dom: Any) -> set:
+    """Vertex ids on the mesh's topological boundary."""
+    mask = dom.tag_node_mask("boundary", np.asarray(dom.mesh.points))
+    return set() if mask is None else {int(i) for i in np.flatnonzero(np.asarray(mask))}
+
+
+def _reregister_trainable(dom: Any, coord_specs: list, on_boundary: dict | None = None) -> None:
     """Re-derive the movable vertices on a mesh whose node set has just changed.
 
     Vertex indices do not survive a remesh; the region they came from does. Each spec records its
     `tag`, so the same region is re-resolved against the new mesh and re-tagged `.trainable()`.
+
+    ``on_boundary`` names the specs whose vertices were ALL on the boundary before the remesh, and
+    those are held to the boundary afterwards. Without it a moving wall quietly recruits the interior:
+    a region predicate is positional (`y > f(x)` for the wall's ORIGINAL line), so once relocation has
+    carried the wall above it, every interior vertex the remesh creates in the space between also
+    satisfies it. MEASURED on a free surface that rose from y=1.0 to y=1.47: the movable set went
+    9 -> 17 -> 32 -> 53 vertices, of which 7, 18 and 34 were interior. They are not free to move --
+    moving them degrades elements, so the line search shrinks the step for everyone -- and per-round
+    motion fell 19x then 42x. The wall stops advancing while appearing to still be relocating.
     """
     dom._trainable_coords = []
+    bnd = _boundary_vertices(dom) if on_boundary else set()
     for sp in coord_specs:
         tag = sp.get("tag")
         if not isinstance(tag, str):
@@ -3062,6 +3078,17 @@ def _reregister_trainable(dom: Any, coord_specs: list) -> None:
             )
         parts = list(dom.variable(tag, split=True))
         parts[int(sp["axis"])].trainable(name=sp["name"])
+        if on_boundary and on_boundary.get(sp["name"]):
+            fresh = dom._trainable_coords[-1]
+            keep = np.asarray([i for i in np.asarray(fresh["ids"], int) if int(i) in bnd], dtype=int)
+            if keep.size == 0:
+                raise RuntimeError(
+                    f"relocate(...).remesh(...): region {tag!r} named only boundary vertices before the "
+                    "remesh and names none after it, so there is nothing left to move. Its predicate no "
+                    "longer describes the surface -- write one that tracks it, or drive the surface from "
+                    "the outer loop."
+                )
+            fresh["ids"] = keep
 
 
 def _remesh_between_rounds(fem: Any, rspec: Any, coord_specs: list, margin: np.ndarray) -> bool:
@@ -3078,6 +3105,10 @@ def _remesh_between_rounds(fem: Any, rspec: Any, coord_specs: list, margin: np.n
     marked = np.flatnonzero(np.asarray(margin) > 0.0).astype(np.int64)
     if marked.size == 0:
         return False
+    # Which movable sets were purely boundary BEFORE the mesher runs -- afterwards the old mesh, and
+    # with it the only evidence of what the tag used to mean, is gone.
+    _bnd_before = _boundary_vertices(dom)
+    _on_boundary = {str(sp["name"]): all(int(i) in _bnd_before for i in np.asarray(sp["ids"], int)) for sp in coord_specs}
     if rspec.split:
         from .fem_refine import refine_domain
 
@@ -3087,7 +3118,15 @@ def _remesh_between_rounds(fem: Any, rspec: Any, coord_specs: list, margin: np.n
     for _name, _pred in list(getattr(dom, "_tag_predicates", {}).items()):
         dom.tag(_name, _pred)
     dom.__dict__.pop("_gauge_pin_coords", None)  # same reason as every other rebuild in this file
-    _reregister_trainable(dom, coord_specs)
+    # A SURFACE objective does not survive this rebuild yet. Its region resolves fine twice -- once on
+    # the old mesh and once eagerly on the new one (measured: 50 then 62 points, both concrete) -- and
+    # then a THIRD time from inside the traced objective, where `tag_node_mask` intersects with the
+    # catch-all "boundary" region through `jax.vmap` and converts the result to numpy, which a traced
+    # mask cannot do. A volume objective is unaffected. Clearing the trainable registry before the
+    # mesher, and re-sampling every region and its normals eagerly here, were both tried and neither
+    # helps: the third resolution happens regardless, because `fem.eval` builds a fresh term list on
+    # every call and so never hits the assembler's memo.
+    _reregister_trainable(dom, coord_specs, _on_boundary)
     cur = jno.fem(fem._constraints, **fem._fem_kwargs)
     fem.__dict__.update(cur.__dict__)
     return True
@@ -3370,6 +3409,18 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
         msq = [0.9 * m + 0.1 * gi**2 for m, gi in zip(msq, g)]
         stepdir = [gi / jnp.sqrt(m + 1e-8) for gi, m in zip(g, msq)]
         a = spec.lr
+        # What a tight bound costs, MEASURED, so it is not a surprise: the step is full (0 halvings)
+        # while the mesh has room, collapses to 21-24 halvings as it reaches the bound -- which is what
+        # triggers the remesh -- and comes back at only 1-3 halvings afterwards, because a remesh MEETS
+        # the target rather than beating it and so leaves almost no room. Per-round vertex motion is
+        # then ~20x smaller than in the first segment, while the gradient is unchanged (4.7e-01 ->
+        # 4.1e-01): the descent still wants to move, it is simply not allowed to.
+        #
+        # Relaxing this to "never worse than the mesh already is" was tried, to let a marginal mesh
+        # keep stepping. It changed the motion by nothing at all -- after a remesh the mesh is
+        # genuinely admissible, so the relaxed rule IS this rule -- and it cost the guarantee, since
+        # the march could then end on a mesh that breaks the condition. Reverted. The fix worth having
+        # is slack in the remesh target, not a weaker step test.
         for _ in range(25):  # backtracking line search: shrink the step until no element inverts
             cand = [ai - a * si for ai, si in zip(arrs, stepdir)]
             if _min_detj(_moved(cand)) > floor and (_margin_of is None or float(_margin_of(cand).max()) <= 0.0):
@@ -3397,7 +3448,14 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
         arrs = cand
         # ``objective`` is what is descended (the equidistribution defect); ``energy`` is kept as a
         # diagnostic. ``points``: the moved vertices, so a relocation run can be animated.
-        history.append({"step": it, "objective": float(obj), "energy": float(e), "points": _moved(arrs)})
+        _entry = {"step": it, "objective": float(obj), "energy": float(e), "points": _moved(arrs)}
+        if _rspec is not None:
+            # Record the connectivity too, but only when a remesh can change it: without one the cells
+            # are fixed and one array describes the whole march, while with one the `points` of two
+            # rounds need not even share a length. The h-driver records cells for the same reason -- a
+            # picture of the march needs the mesh each round actually had.
+            _entry["cells"] = np.asarray(cells).copy()
+        history.append(_entry)
 
     u_out = _finish_relocate(fem, dom, coord_specs, arrs, pts0, n_verts, dim, cells, history, solve_fn, kwargs)
     if _rspec is None or _breach_after is None:
