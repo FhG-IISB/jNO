@@ -1210,6 +1210,14 @@ Three things to know:
 * A surface objective needs the **form** to carry a surface term, because the facet quadrature tables
   are tabulated at build time only then. A traction-free wall (`0.0 * vs[0]`) in the term list is enough.
 
+**Mesh quality as a term you can write.** `domain.cell_aspect()` is the longest edge over the inradius,
+scaled so a **regular** simplex reads exactly `1.0` and a stretched one reads more — per cell, 2-D and
+3-D, and differentiable in the vertex positions (checked against central differences at `2.7e-10`).
+It is the companion to `domain.cell_size`, which is `|det J|^(1/dim)` — an isotropic *size* that cannot
+see stretch at all, since a sliver and a regular element of the same area share it. `domain.cell_angles()`
+also measures distortion but is 2-D only. Reference: Shewchuk, *What Is a Good Linear Finite Element?*
+(2002), §2.
+
 Tagging is **literal and per-axis**: `xm.trainable()` frees only the x column. On a boundary that is the
 lever for sliding — free an edge's along-edge axis and its nodes redistribute *within* the wall, leave the
 normal axis untagged and the domain shape is preserved exactly.
