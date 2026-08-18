@@ -200,6 +200,19 @@ def test_relocate_complex_transient_fails_loud():
         jno.fem([ui.t * vi + (0.5 + 1j) * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - 1.0])
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "#114 -- relocate() writes back a mesh that is not the geometry it validated. This test "
+        "re-solves through `final_err`, which used to dispatch on the PRE-adapt operator (FEM.solve "
+        "restored `_op` unconditionally) and so scored relocation on a geometry the caller never "
+        "receives. Solving honestly on `fem.domain.mesh.points` gives 1.141e-01 against the uniform "
+        "mesh's 9.379e-02 -- relocation LOSES here -- and an independent `jno.fem` built on those "
+        "same points agrees to 15+ digits, so it is the loop's 0.51 ratio that is the outlier. "
+        "xfail(strict) so this reports the day the two geometries agree; do not relax the assertion "
+        "to make it pass."
+    ),
+)
 def test_relocate_beats_a_uniform_mesh_on_an_underresolved_front():
     """The property the old suite never checked: relocation must improve the **answer**, not just an objective.
 

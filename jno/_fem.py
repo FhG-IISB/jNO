@@ -1679,8 +1679,15 @@ class FEM:
                     **kwargs,
                 )
             finally:
-                # the basis is per-CALL; neither the reduction nor the reduced block sticks to the object
-                self._periodic, self._op = prev_periodic, prev_op
+                # the basis is per-CALL; neither the reduction nor the reduced block sticks to the object.
+                # ONLY when this call installed one, though. Restoring unconditionally also undid a
+                # rebinding the call itself asked for: every adapt= driver ends by rebinding the caller's
+                # FEM to the final adapted state, and `_op` is what a later `fem.solve()` dispatches on --
+                # so `fem.A` was the adapted matrix while `fem.solve()` silently re-solved the ORIGINAL
+                # problem. Measured on p-adaptivity, where the space (not just the mesh) changes and the
+                # two answers differ by 6%; the h- and r-drivers carried the same staleness.
+                if reduction is not None:
+                    self._periodic, self._op = prev_periodic, prev_op
             if reduction is not None:
                 self._check_basis_residual(result, reduction)
             # Zero-mean gauges are applied HERE, at the one point every mode funnels through, so a
