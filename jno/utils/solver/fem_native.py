@@ -54,6 +54,8 @@ from .fem_1d import (
     _region_node_ids,
     dirichlet_projection,
 )
+from .fem_cover import COVER_ORDER as COVER_DEGREE
+from .fem_cover import cover_block, cover_null_modes, expand_cover, nodal_scale
 from .fem_facets import _LOCAL_FACES_TET, _face_table, build_facet_connectivity, compute_face_normals
 from .fem_lagrange import (
     _lagrange_basix,
@@ -816,17 +818,61 @@ def assemble_fem_native(
 
     for f in fields:
         sp = f.get("space", "Lagrange")
-        if sp not in ("Lagrange", ""):
+        if sp not in ("Lagrange", "", "cover"):
             raise NotImplementedError(
-                f"assemble_fem_native: only Lagrange fields are supported; got space={sp!r}. "
+                f"assemble_fem_native: only Lagrange and cover fields are supported; got space={sp!r}. "
                 "Use assemble_fem_nonnodal for RT/N1E/P0 fields."
             )
+
+    # Interpolation-cover enrichment (space="cover"): each node carries its value plus `M` cover
+    # coefficients, so the field's DOF nodes are the mesh nodes REPEATED (1+M) times. That keeps the
+    # global map `offs + node*vec + comp` and the rectangular `cells_f` intact -- every formula below
+    # is unchanged -- at the cost of allocating the slots everywhere (docs/fem.md, Known limitations).
+    # Scope limits are raised here rather than discovered downstream.
+    _cover = [str(f.get("space", "") or "").lower() == "cover" for f in fields]
+    if any(_cover):
+        if dim not in (2, 3):
+            raise NotImplementedError(
+                f"space='cover': interpolation covers are implemented on 2-D triangles and 3-D "
+                f"tetrahedra; this domain is {dim}-D."
+            )
+        for _i, _is in enumerate(_cover):
+            if _is and int(fields[_i]["order"]) != 1:
+                raise NotImplementedError(
+                    f"space='cover' is built on the P1 hats and takes order=1; got order="
+                    f"{fields[_i]['order']}. The cover supplies the extra order, not `order=`."
+                )
+    _cblk = [cover_block(dim) if c else 1 for c in _cover]
 
     # -------------------------------------------------------------------------
     # Per-field mesh data
     # -------------------------------------------------------------------------
 
     mesh_data = [_get_mesh(domain, dim, f["order"]) for f in fields]
+
+    def _pad_for_cover(md, blk):
+        """A cover field's DOF nodes are the mesh nodes repeated ``blk = 1+M`` times.
+
+        Node ``i`` owns synthetic nodes ``i*blk + m``: ``m = 0`` is the ordinary value, ``m >= 1``
+        the cover coefficients. The ordering matches :func:`expand_cover`'s node-major tables, which
+        is what makes the local ravel and the global ``cdofs`` agree."""
+        if blk == 1:
+            return md
+        p1c, c1c, pf, cf = md
+        pf_a, cf_a = np.asarray(pf), np.asarray(cf)
+        pf2 = np.repeat(pf_a, blk, axis=0)
+        cf2 = (cf_a[:, :, None] * blk + np.arange(blk)[None, None, :]).reshape(cf_a.shape[0], -1)
+        return (p1c, c1c, pf2, cf2)
+
+    # The padded arrays are a DOF layout, not a mesh: a cover field's connectivity has (1+M) columns
+    # per vertex and its point array repeats coordinates, so anything TOPOLOGICAL (boundary facets)
+    # or coordinate-based (region predicates) must run on the unpadded pair and map the answer back.
+    # Keeping both is the whole cost of the padded layout; forgetting to is a silently wrong answer,
+    # which is exactly what a boundary-facet walk over 9-column "cells" produces.
+    mesh_data_real = mesh_data
+    mesh_data = [_pad_for_cover(md, _cblk[i]) for i, md in enumerate(mesh_data)]
+    pts_f_real = [np.asarray(md[2]) for md in mesh_data_real]  # unpadded: real DOF nodes per field
+    cells_f_real = [np.asarray(md[3]) for md in mesh_data_real]  # unpadded: a genuine simplex mesh
     pts_p1 = mesh_data[0][0]  # (n_pts_p1, dim)    — P1 node coordinates (shared)
     cells_p1 = mesh_data[0][1]  # (n_cells, dim+1)  — P1 simplex connectivity (shared)
 
@@ -841,6 +887,11 @@ def assemble_fem_native(
     # a box the map happens to be affine, but detecting that is an optimisation, not a correctness
     # condition, and it would have to hold for every cell in the mesh.)
     _tensor_product = _cell_type in TENSOR_PRODUCT_CELLS
+    if any(_cover) and _tensor_product:
+        raise NotImplementedError(
+            "space='cover': simplices only. A quadrilateral/hexahedral cell has a non-constant "
+            "Jacobian, and the cover's gradient term assumes the affine map."
+        )
     # Whether a FACET of this cell is curved. A quadrilateral's edge is straight (a bilinear map
     # restricted to an edge is linear), so only a hexahedron's bilinear face needs a normal that
     # varies across it.
@@ -857,6 +908,11 @@ def assemble_fem_native(
         offs.append(offs[-1] + n_nodes_f[i] * vecs[i])
     total = offs[-1]
 
+    # Per-node cover length scale (host, constant): makes the enrichment columns O(1) instead of
+    # O(h) relative to the nodal ones, so an enrichment coefficient reads as a directional
+    # derivative rather than one times a mesh size.
+    _cover_scale_j = jnp.asarray(nodal_scale(pts_p1, cells_p1)) if any(_cover) else None
+
     # Tell region-mask machinery which mesh to classify against
     domain._fem_assembly_points = pts_p1
     domain._fem_assembly_cells = cells_p1
@@ -872,7 +928,7 @@ def assemble_fem_native(
     # reduction`` reads the assembly mesh's cells to extract boundary facets); ``_finalize`` reads
     # these. The full per-field lists back the heterogeneous-order coupled periodic reduction
     # (Taylor-Hood: per-field P_i from each field's own cells/order, matched to its ties by field_key).
-    domain._fem_native_assembly_cells = np.asarray(cells_f_all[0])
+    domain._fem_native_assembly_cells = np.asarray(cells_f_real[0])
     domain._fem_native_assembly_order = int(fields[0]["order"])
     domain._fem_native_assembly_cells_all = [np.asarray(cf) for cf in cells_f_all]
     domain._fem_native_field_orders = [int(f["order"]) for f in fields]
@@ -889,6 +945,12 @@ def assemble_fem_native(
     # rate study this changes the answer by <0.01% (7.6721e-06 -> 7.6719e-06 at degree 8), so it is
     # insurance against a form whose coefficients vary more sharply, not a fix for anything observed.
     _qd = (quad_degree + 2) if _nonaffine else quad_degree
+    if any(_cover):
+        # A cover basis function is h_i * (x - x_i): degree 2, not 1. The entry-side floor
+        # (`_fem.py`, max(quad_degree, 2*order)) sees only `order`, which stays 1 here, so the bump
+        # has to happen where the enrichment is known. Without it the mass matrix silently
+        # under-integrates and only a convergence study would notice.
+        _qd = max(_qd, 2 * (1 + COVER_DEGREE))
     specs = [_lagrange_simplex(dim, f["order"], _qd, cell_type=_cell_type) for f in fields]
     # All specs share the same simplex quadrature rule (basix is deterministic)
     qp_shared = jnp.asarray(specs[0].quad_points)  # (n_quad, dim)
@@ -1442,7 +1504,7 @@ def assemble_fem_native(
             # Physical quadrature points of each secondary face, formed exactly as `_surf_elem_res` does.
             _fp_qp = np.asarray(face_tables_per_field[_fidx][2])  # (n_faces_local, n_q, dim)
             _pc, _lk = np.asarray(conn.parent_cell)[_sf], np.asarray(conn.local_face)[_sf]
-            _verts = np.asarray(pts_f_all[_fidx])[np.asarray(cells_f_all[_fidx])[_pc][:, : dim + 1]]
+            _verts = pts_f_real[_fidx][cells_f_real[_fidx][_pc][:, : dim + 1]]
             _J = np.stack([_verts[:, i + 1] - _verts[:, 0] for i in range(dim)], axis=-1)  # (n_s, dim, dim)
             _xq = _verts[:, 0][:, None, :] + np.einsum("fqd,fDd->fqD", _fp_qp[_lk], _J)
             _nrm = np.broadcast_to(np.asarray(normals_np)[_sf][:, None, :], _xq.shape)
@@ -1511,6 +1573,13 @@ def assemble_fem_native(
         per = []
         for i in range(len(fields)):
             phi, dphi = identity_pushforward(ref_vals_all[i], ref_grads_all[i], J, detJ)
+            if _cblk[i] > 1:
+                # Enrich in PHYSICAL coordinates -- h_i(ξ)(ξ - ξ_i) would be discontinuous across a
+                # shared face, because the two cells disagree about ξ. Tagged "Lagrange" below so
+                # the shared integrand evaluator serves the wider tables unchanged, exactly as the
+                # M(cell)-transform families do.
+                _cn = cells_j[c]
+                phi, dphi = expand_cover(phi, dphi, xq, pts[_cn], _cover_scale_j[_cn])
             fd = _CellFieldData(
                 {"shape_vals": phi, "shape_grads": dphi, "cell_sol": cell_sols[i], "space": "Lagrange"},
                 # Deferred: only a 4th-order weak form ever reads this. See _CellFieldData.
@@ -2585,7 +2654,66 @@ def assemble_fem_native(
         return np.intersect1d(bnodes, np.unique(outer.reshape(-1)))
 
     def _boundary_node_ids(fidx: int, region: str) -> List[int]:
-        """Robust boundary-DOF-node ids of ``region`` for field ``fidx``.
+        """Boundary DOF-node ids of ``region`` for field ``fidx``, in the padded layout.
+
+        Resolution runs on the field's REAL mesh (see ``mesh_data_real``) because the padded
+        connectivity is not a mesh and a facet walk over it is meaningless; each real node found is
+        then expanded to the ``1+M`` slots it owns. A Dirichlet condition therefore reaches the
+        value and its covers alike -- which is what :func:`_cover_g` then tells apart, giving the
+        covers zero rather than ``g``."""
+        real = _boundary_node_ids_real(fidx, region)
+        blk = _cblk[fidx]
+        if blk == 1:
+            return real
+        # On a straight boundary facet through node i, (x - x_i) is TANGENTIAL, so only the
+        # tangential cover components enter the trace: pinning them keeps u = g; the NORMAL
+        # component is the ∂u/∂n freedom and pinning it too is what capped the L2 rate at P1's
+        # (measured: 1.86 with everything pinned, 3.02 when the pin is harmless). A cover slot m is
+        # freed only when e_m is orthogonal to EVERY region tangent at the node -- an oblique facet
+        # therefore frees nothing, which over-constrains but never violates the condition.
+        tang = _region_tangent_dirs(fidx, region, real)
+        out = []
+        for r in real:
+            out.append(int(r) * blk)  # the value slot, always
+            ts = tang.get(int(r))
+            for m in range(1, blk):
+                e = np.zeros(dim)
+                e[m - 1] = 1.0
+                if ts is None or ts.size == 0 or float(np.abs(ts @ e).max()) > 1e-9:
+                    out.append(int(r) * blk + m)
+        return out
+
+    def _region_tangent_dirs(fidx: int, region: str, real_ids) -> dict:
+        """Unit tangent directions of ``region``'s boundary facets, per real node.
+
+        Facets are taken from the UNPADDED mesh and restricted to those lying wholly in the region's
+        node set. A node with no incident region facet (an interior point pin) gets no tangents, so
+        all of its covers stay free -- a point constraint constrains the value, nothing else."""
+        from ..._fem import _boundary_facets
+
+        node_set = set(int(r) for r in real_ids)
+        out: dict = {}
+        bf = _boundary_facets(pts_f_real[fidx], cells_f_real[fidx], dim, fields[fidx]["order"], _cell_type)
+        if bf is None:
+            return out
+        pts_r = pts_f_real[fidx]
+        for facet in np.asarray(bf):
+            vs = [int(v) for v in facet[:dim]]  # 2-D edge: 2 vertices; 3-D triangle: first 3
+            if dim == 3:
+                vs = [int(v) for v in facet[:3]]
+            if not all(v in node_set for v in vs):
+                continue
+            edges = [pts_r[vs[a]] - pts_r[vs[0]] for a in range(1, len(vs))]
+            for v in vs:
+                acc = out.setdefault(v, [])
+                for e in edges:
+                    n = float(np.linalg.norm(e))
+                    if n > 0:
+                        acc.append(e / n)
+        return {k: np.asarray(v) for k, v in out.items()}
+
+    def _boundary_node_ids_real(fidx: int, region: str) -> List[int]:
+        """Robust boundary-DOF-node ids of ``region`` for field ``fidx``, on the UNPADDED mesh.
 
         Boundary nodes are taken from the assembly mesh's boundary FACETS (a node on a boundary
         facet -- P2 edge-midpoints attached by coordinate), not a geometric containment test: the
@@ -2599,14 +2727,14 @@ def assemble_fem_native(
         """
         from ..._fem import _boundary_facets
 
-        pts_all = np.asarray(pts_f_all[fidx])
+        pts_all = pts_f_real[fidx]
         # A named interior SUB-REGION (`domain.region(name, poly)`) pins its WHOLE node set (interior +
         # boundary), by point-in-polygon — not just its boundary nodes (which is empty for an interior
         # region and would silently drop the pin). This is the subdomain / domain-decomposition pin.
         ptags = getattr(domain, "_polygon_tags", {})
         if region in (getattr(domain, "_source_regions", {}) or {}) and ptags.get(region, (None,))[0] == "interior":
             return list(_region_node_ids_from_pts(domain, region, pts_all))
-        bf = _boundary_facets(pts_all, np.asarray(cells_f_all[fidx]), dim, fields[fidx]["order"], _cell_type)
+        bf = _boundary_facets(pts_all, cells_f_real[fidx], dim, fields[fidx]["order"], _cell_type)
         if bf is None:
             return list(_region_node_ids_from_pts(domain, region, pts_all))
         # A locally refined (hanging-node) mesh is NON-CONFORMING, and "belongs to exactly one cell" is
@@ -2725,14 +2853,76 @@ def assemble_fem_native(
             comps_range = range(vt) if comp is None else [int(comp)]
             for nid, g in zip(nids, gs):
                 for c in comps_range:
-                    pairs.append((offs[fidx] + nid * vt + c, float(g)))
+                    pairs.append((offs[fidx] + nid * vt + c, _cover_g(fidx, nid, g)))
         # Expose the (dof, value) pairs for callers that compose their own system from native blocks
         # (e.g. the second-order-in-time augmented [u, v] block applies them to the 2N system itself).
         # The time-varying entries ride a companion stash: the caller writes g(x_d, t) (and, for a
         # second-order block, the velocity ġ) per step.
         domain._fem_native_dirichlet_pairs = pairs
         domain._fem_native_dirichlet_tv = tv_stash
+        _gauge_cover_modes(pairs)
         return pairs
+
+    def _cover_g(fidx, nid, g):
+        """The Dirichlet value for one padded DOF slot.
+
+        A Dirichlet condition fixes the field VALUE. On a cover field the same mesh node also owns
+        its cover coefficients, and those must go to **zero**, not to ``g`` -- otherwise the trace on
+        the boundary is ``g + (x - x_i)·g/s`` rather than ``g``. The padded layout repeats each
+        node's coordinates, so the region lookup finds every slot; this is where they are told
+        apart, by their position within the node's block."""
+        blk = _cblk[fidx]
+        return float(g) if blk == 1 or (int(nid) % blk) == 0 else 0.0
+
+    _cover_gauge_pins: List[Any] = []
+    _cover_gauge_done = [False]
+
+    def _gauge_cover_modes(pairs):
+        """Remove the enrichment's exact null modes that the boundary conditions leave alive.
+
+        The cover basis satisfies ``Σ h_i (x - x_i) ≡ 0``, so ``a_i = S·x_i + c`` (``S`` skew) is
+        the zero FUNCTION -- ``dim(dim+1)/2`` modes per component. A mode dies when any pinned DOF
+        carries a nonzero component of it; whatever survives makes the system singular without
+        changing the field at all. So the fix is a GAUGE, exactly like a pressure pin: for each
+        surviving mode, pin one more cover DOF (chosen by Gaussian pivoting so the set is
+        independent) to zero. Every member of the solution family ``x* + Σ α_k v_k`` is the same
+        physical field, and the gauge merely selects one -- measured and asserted in the tests, not
+        assumed. The pins are recorded once and appended to every later pair collection."""
+        if _cover_gauge_done[0]:
+            pairs.extend(_cover_gauge_pins)
+            return
+        _cover_gauge_done[0] = True
+        pinned = np.asarray(sorted({int(i) for i, _ in pairs}), dtype=np.int64)
+        for fidx, is_cov in enumerate(_cover):
+            if not is_cov:
+                continue
+            modes = cover_null_modes(pts_f_real[fidx], dim, n_comp=int(vecs[fidx])).astype(float)
+            lo, hi = offs[fidx], offs[fidx + 1]
+            loc_pin = pinned[(pinned >= lo) & (pinned < hi)] - lo
+            # survivors: modes invisible to every existing pin
+            alive = modes[np.abs(modes[:, loc_pin]).max(axis=1) < 1e-12] if loc_pin.size else modes
+            if alive.shape[0] == 0:
+                continue
+            forbidden = set(int(x) for x in loc_pin)
+            work = alive.copy()
+            for _k in range(work.shape[0]):
+                row = work[_k]
+                cand = np.abs(row)
+                if forbidden:
+                    cand = cand.copy()
+                    cand[list(forbidden)] = 0.0
+                j = int(np.argmax(cand))
+                if cand[j] < 1e-12:
+                    raise ValueError(
+                        "space='cover': could not complete the null-space gauge -- a surviving zero "
+                        "mode has no free cover DOF left to pin. This should be unreachable; please "
+                        "report the mesh and boundary conditions."
+                    )
+                _cover_gauge_pins.append((int(lo + j), 0.0))
+                forbidden.add(j)
+                for _l in range(_k + 1, work.shape[0]):  # eliminate so later picks stay independent
+                    work[_l] = work[_l] - (work[_l][j] / row[j]) * row
+        pairs.extend(_cover_gauge_pins)
 
     _static_dirichlet_cache: Dict[str, Any] = {}
 
@@ -2789,7 +2979,7 @@ def assemble_fem_native(
                     gvals = raw.reshape(len(node_ids), -1)[:, 0]
                 for i, nid in enumerate(node_ids):
                     for c in range(vt) if comp is None else [int(comp)]:
-                        pairs.append((offs[fidx] + nid * vt + c, gvals[i]))
+                        pairs.append((offs[fidx] + nid * vt + c, _cover_g(fidx, nid, gvals[i])))
                 continue
             if _vn is None or not _is_neural_coefficient(_vn):
                 continue
@@ -2802,7 +2992,7 @@ def assemble_fem_native(
             gvals = jnp.asarray(module(*[coords[:, i : i + 1] for i in range(n_in)])).reshape(-1)
             for i, nid in enumerate(node_ids):
                 for c in range(vt) if comp is None else [int(comp)]:
-                    pairs.append((offs[fidx] + nid * vt + c, gvals[i]))
+                    pairs.append((offs[fidx] + nid * vt + c, _cover_g(fidx, nid, gvals[i])))
         return pairs
 
     def _build_dirichlet_tv_entries():
@@ -2838,7 +3028,7 @@ def assemble_fem_native(
                 else:
                     g = float(value)
                 for c in comps_range:
-                    const_pairs.append((offs[fidx] + nid * vt + c, g))
+                    const_pairs.append((offs[fidx] + nid * vt + c, _cover_g(fidx, nid, g)))
         return const_pairs, tv_entries
 
     # -------------------------------------------------------------------------
