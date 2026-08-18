@@ -55,15 +55,6 @@ def test_continuation_is_a_public_slot():
     assert jno.solve.continuation(keep="all", k=[0.0, 1.0]).keep == "all"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="MEASURED: 48 traces for 8 values -- 6 per step, i.e. the form is re-staged at every "
-    "step. `run_continuation` passes the parameter values through a FRESH closure per step "
-    "(`lambda uu, _v=vals: op.residual(uu, _v)`), so every step is a new callable and jit's cache "
-    "misses. The values must instead reach the solver as a TRACED ARGUMENT, which is a change to "
-    "the `nonlinear=` solver contract, not to this driver. Kept strict and failing because the "
-    "no-recompile property is the entire reason to prefer this slot over a Python loop.",
-)
 def test_the_form_is_traced_ONCE_across_the_whole_march():
     """The point of the slot. A loop that rebuilds gives the same answer and pays N compilations."""
     fem = _nonlinear_diffusion()
@@ -84,8 +75,9 @@ def test_the_form_is_traced_ONCE_across_the_whole_march():
         op.residual = real_residual
 
     assert traces["n"] > 0, "the residual was never traced — the counter is not wired to the solve"
-    # One trace for the Newton body (plus at most a couple for its tangent/line-search staging), NOT
-    # one per step: 8 values must not cost 8 stagings.
+    # The Newton body stages a handful of times (loop body, tangent, line search) but ONCE for the
+    # whole march, not once per rung: 8 values must not cost 8 stagings. Before the step was jitted
+    # this measured 48.
     assert traces["n"] < 8, f"the form was re-traced per step ({traces['n']} traces for 8 values)"
 
 
@@ -187,3 +179,32 @@ def test_a_direct_newton_on_a_reduced_system_refuses_by_name():
             continuation=jno.solve.continuation(visc=[0.0, 1.0]),
             nonlinear=jno.solve.newton(direct=True),
         )
+
+
+def test_a_stalled_rung_raises_naming_the_rung():
+    """The guard the jit would otherwise take away.
+
+    The per-step solve is staged once and run under ``jax.jit``, and the Newton driver's own
+    stalled-solve check self-disables inside a trace (it needs a concrete residual). Without an
+    eager replacement, a rung that leaves on its step cap would return its last iterate silently --
+    and the march would then carry that non-root into every later rung as the warm start, so one
+    quiet stall corrupts the whole family rather than one entry.
+    """
+    fem = _nonlinear_diffusion()
+    with pytest.raises(RuntimeError, match=r"step \d+/8 at k=.*did not converge"):
+        fem.solve(
+            continuation=jno.solve.continuation(k=np.linspace(0.0, 2.0, 8)),
+            nonlinear=jno.solve.newton(max_steps=1, rtol=1e-14, atol=1e-14),
+        )
+
+
+def test_stats_describe_the_last_rung_not_a_stale_entry():
+    """``LAST_NEWTON_STATS`` is written by the in-driver check, which is blind under the jit -- so it
+    would otherwise keep whatever a previous *eager* solve left behind, and `fem.stats` would report
+    a number that has nothing to do with the march."""
+    fem = _nonlinear_diffusion()
+    fem.solve(continuation=jno.solve.continuation(k=np.linspace(0.0, 2.0, 5)))
+    st = fem.stats["nonlinear"]
+    assert st["driver"] == "continuation/newton", st
+    assert st["converged"] is True
+    assert st["residual"] <= st["bound"], st
