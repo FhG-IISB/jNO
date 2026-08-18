@@ -1601,6 +1601,33 @@ default (no external dependency): the linear default is a sparse-direct factoris
 alternative; the nonlinear default is a matrix-free Newton-Krylov, and the transient default
 backward-Euler over those. All are implicit-diff, so `crux.solve` recovers parameters through them.
 
+### Solving *at* a value — `fem.solve(k=...)`
+
+A parameter is not always an unknown to recover; often it is a knob you sweep. Give it a value and the
+solve happens **now**, returning the array rather than a node for `crux`:
+
+```python
+cap = jno.np.parameter((1,), name="cap")
+fem = jno.fem([...])                                # built ONCE
+x = None
+for v in np.geomspace(G / 2000.0, G, 8):            # a continuation, as a plain Python loop
+    x = fem.solve(cap=v, x0=x, nonlinear=jno.solve.newton(direct=True))
+```
+
+The alternative — rebuilding `jno.fem` per value — re-meshes, re-assembles and re-compiles the whole
+problem to change one number. Measured on an 8-value sweep: **6.20 s rebuilding, 0.55 s this way**.
+The solve is staged **once** (6 tracings for 8 values, not 48) because the value arrives as a runtime
+argument and jit keys on shape, not on value; `x0=` warm-starts across the sweep without re-staging.
+
+It composes with everything the ordinary solve does, including `newton(direct=True)` on a **reduced**
+(slip / periodic) system — the case `fem.solve(continuation=...)` still cannot serve, since that driver
+hands its solver no assembled tangent. `fem.stats` reports the verdict as usual: the jit hides the
+driver's own convergence check, so the judgement is remade outside it, on the *reduced* residual where
+there is one.
+
+Give **every** parameter a value or none: a partly-supplied problem is refused by name, and with none
+supplied `fem.solve()` is the trace node it always was, for `crux` to resolve.
+
 ### Choosing the solver — the slot API (`jno.solve` / `jno.precond`)
 
 Between "accept the default" and "write a full `solve_fn`" sits the **slot API**: the solver

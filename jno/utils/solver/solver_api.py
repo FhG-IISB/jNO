@@ -850,6 +850,11 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
     _traits = getattr(nonlinear, "traits", None) or {}
     if "rtol" in _traits and "atol" in _traits:
         _composed.tolerances = (float(_traits["rtol"]), float(_traits["atol"]))
+    # A stable identity for the composed solver, by VALUE rather than by object. `fem.solve` composes a
+    # fresh one on every call, so anything caching a compiled solve against `id(solve_fn)` would miss
+    # every time and re-stage -- which is exactly what happened, and cost the parametric solve its whole
+    # advantage. The specs' reprs describe the solver completely, which is what "the same solver" means.
+    _composed.cache_key = ("nl", repr(nonlinear), repr(linear), repr(precond))
     return _composed
 
 
@@ -971,6 +976,32 @@ def _reduced_size(periodic):
     if periodic.get("off_red") is not None:
         return int(periodic["off_red"][-1])
     return int(periodic["P"].shape[1])
+
+
+def record_nonlinear_verdict(residual_at, u, u0, nonlinear, who: str) -> tuple:
+    """Judge a nonlinear solve OUTSIDE the trace, and record it for ``fem.stats``.
+
+    The drivers' own ``_convergence_check`` needs a concrete residual, so it self-disables under jit --
+    and a solve that is jitted precisely to avoid re-staging is then the case with no verdict at all,
+    leaving ``fem.stats`` holding whatever an earlier eager solve left behind. This makes the same
+    judgement here, against the tolerances the ``nonlinear=`` spec carries for exactly this reason, and
+    returns ``(residual, bound, converged)``.
+
+    ``residual_at`` must be the residual the SOLVER worked on: on a reduced system that is the reduced
+    one, ``Pᵀr``. The full residual of a constrained problem keeps the constraint's reaction, which is
+    physical and stays O(1) however well converged the solve is, so a verdict read off it never sees
+    success.
+    """
+    from .newton_krylov import LAST_NEWTON_STATS
+
+    traits = getattr(nonlinear, "traits", None) or {}
+    rtol, atol = float(traits.get("rtol", 1e-8)), float(traits.get("atol", 1e-8))
+    r_end = float(jnp.linalg.norm(jnp.asarray(residual_at(u)).reshape(-1)))
+    bound = atol + rtol * float(jnp.linalg.norm(jnp.asarray(residual_at(u0)).reshape(-1)))
+    ok = bool(np.isfinite(r_end)) and r_end <= bound
+    LAST_NEWTON_STATS.clear()
+    LAST_NEWTON_STATS.update(driver=who, residual=r_end, bound=bound, steps=None, converged=ok)
+    return r_end, bound, ok
 
 
 def run_continuation(fem, spec, *, nonlinear=None, linear=None, precond=None, x0=None, kwargs=None):
@@ -1108,10 +1139,6 @@ def run_continuation(fem, spec, *, nonlinear=None, linear=None, precond=None, x0
         # keep a stale entry. Re-checked here instead, eagerly, against the tolerances the spec
         # carries for precisely this case. One extra residual evaluation per rung, against a Newton
         # solve: negligible.
-        from .newton_krylov import LAST_NEWTON_STATS
-
-        _traits = getattr(nonlinear, "traits", None) or {}
-        _rtol, _atol = float(_traits.get("rtol", 1e-8)), float(_traits.get("atol", 1e-8))
         _who = f"continuation/{getattr(nonlinear, 'name', None) or 'newton'}"
     else:
         nl = None
@@ -1135,11 +1162,10 @@ def run_continuation(fem, spec, *, nonlinear=None, linear=None, precond=None, x0
                 # Verdict is computed inside the try (it forces the sync) but RAISED below, next to
                 # the finiteness check, so a stalled rung reports as itself rather than being
                 # re-wrapped as the surrounding "failed to converge".
-                _r_end = float(jnp.linalg.norm(_residual_at(vals, step)))
-                _bound = _atol + _rtol * float(jnp.linalg.norm(_residual_at(vals, prev)))
-                _stalled = not (bool(np.isfinite(_r_end)) and _r_end <= _bound)
-                LAST_NEWTON_STATS.clear()
-                LAST_NEWTON_STATS.update(driver=_who, residual=_r_end, bound=_bound, steps=None, converged=not _stalled)
+                _r_end, _bound, _conv = record_nonlinear_verdict(
+                    lambda uu: _residual_at(vals, uu), step, prev, nonlinear, _who
+                )
+                _stalled = not _conv
                 if periodic is None:
                     u = step
                 else:
