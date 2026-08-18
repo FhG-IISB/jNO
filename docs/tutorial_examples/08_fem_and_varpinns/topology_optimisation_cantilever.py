@@ -96,32 +96,42 @@ patch = d.patch_filter()  # eq. (17)-(19)
 rho.constrain(lambda r: jnp.where(pmask, 1.0, patch(r)))  # physics sees the PHYSICAL density
 
 # --- the elasticity problem -------------------------------------------------------------------
-eu, ep = symgrad(u, [xi, yi]), symgrad(phi, [xi, yi])
+# Bind the notation once so the weak form and the objective below read like the equations, and so
+# they demonstrably share one bilinear form rather than being two hand-typed copies of it.
+eps = lambda w: symgrad(w, [xi, yi])  # noqa: E731
+a = lambda p, q: LAM * trace(p) * trace(q) + 2 * MU * inner(p, q, n_contract=2)  # noqa: E731  sigma(p):q
+E = lambda r: EMIN + r**penal_p * (E0 - EMIN)  # noqa: E731  -- SIMP: E(rho) = Emin + rho^p (E0 - Emin)
+
 fem = jno.fem(
     [
-        (EMIN + rho**penal_p * (E0 - EMIN))  # SIMP: E(rho) = Emin + rho^p (E0 - Emin)
-        * (LAM * trace(eu) * trace(ep) + 2 * MU * inner(eu, ep, n_contract=2)),
+        E(rho) * a(eps(u), eps(phi)),
         u(xl, yl) - (0.0, 0.0),  # clamped root
         -1.0 * inner(jnp.array([0.0, -1.0 / SPAN]), phi.bind(x=xt, y=yt), n_contract=1),
     ],
     quad_degree=2,
 )
 
-# The load vector does not depend on the design, so evaluate it once and read compliance as f.u.
-coord0 = {sp["name"]: jnp.asarray(pts0[ids, int(sp["axis"])]) for sp in d._trainable_coords}
-_A, b = fem.operator.evaluate({"rho": jnp.full(cells.shape[0], VOLFRAC), "penal": jnp.asarray([PENAL]), **coord0})
-f_vec = np.asarray(jnp.asarray(b).reshape(-1))
-
-compliance = jno.fn(lambda uu: jnp.sum(uu * jnp.asarray(f_vec)), [fem.solve()], name="C")
+# --- the objective and the constraints, as the integrals they are ------------------------------
+# Compliance is the strain energy C = a(u,u) = ∫ sigma(u):eps(u) dOmega -- the SAME form the weak
+# statement above is built from, integrated at the solution. `.integrate(fem)` inherits the
+# quadrature the operator was assembled with, so this equals f.u exactly rather than to within a
+# quadrature error; naming the `fem` supplies what the expression cannot (which solution, which
+# system to differentiate through), and every functional over one `fem` shares a single solve.
 cellv, angles = d.cell_volume(), d.cell_angles()  # differentiable in the nodal coordinates
-volume = jno.fn(lambda rv, vv: jnp.sum(jnp.asarray(rv).reshape(-1) * vv) / (VOLFRAC * jnp.sum(vv)), [rho, cellv], name="V")
-g_ang = jno.fn(lambda th: ((2 * jnp.pi - th) / (2 * jnp.pi - THETA_MIN)).reshape(-1), [angles], name="g1").pnorm(
+# A P0 parameter evaluates to (n_cells, 1) while `cell_volume()` is (n_cells,), so pairing them
+# without this flatten broadcasts to an (n_cells, n_cells) OUTER PRODUCT whose sum is n_cells times
+# too large -- silently, since it is a valid shape. Flatten once, here.
+rho_e = rho.reshape(-1)
+compliance = (E(rho) * a(eps(u), eps(u))).integrate(fem).name("C")
+# The volume needs no quadrature: rho is piecewise constant, so ∫rho dOmega is exactly sum(rho_k |K|)
+# and `cell_volume()` is already a node differentiable in the moving mesh. Routing it through the FEM
+# functional would run a full element map to compute a weighted sum -- same answer, far more work.
+volume = ((rho_e * cellv).sum / (VOLFRAC * cellv.sum)).name("V")
+g_ang = (((2 * jnp.pi - angles) / (2 * jnp.pi - THETA_MIN)).reshape(-1).name("g1")).pnorm(
     PNORM, normalize=True
 )  # eq. (24): no interior angle below theta_min
-g_vmx = jno.fn(lambda rv, vv: vv / ((2.0 - jnp.asarray(rv).reshape(-1)) * V0MAX), [rho, cellv], name="g2").pnorm(
-    PNORM, normalize=True
-)  # eq. (26): no element grows past V0max
-g_vmn = jno.fn(lambda vv: (2 * V0MAX - vv) / (2 * V0MAX - V0MIN), [cellv], name="g3").pnorm(
+g_vmx = ((cellv / ((2.0 - rho_e) * V0MAX)).name("g2")).pnorm(PNORM, normalize=True)  # eq. (26): no element grows past V0max
+g_vmn = (((2 * V0MAX - cellv) / (2 * V0MAX - V0MIN)).name("g3")).pnorm(
     PNORM, normalize=True
 )  # eq. (28): none collapses below V0min
 
@@ -148,7 +158,7 @@ terms = [compliance]
 # keeps drifting, so a convergence test on the total would never fire.
 callbacks = [jno.optimizers.simp_continuation(penal_p, rho, physical=patch, every=25, watch=0)]
 if PSTAR > 0:
-    terms.append(jno.fn(lambda rr, bb: bb[0] * rr, [perim.log_barrier(PSTAR), beta_p], name="R"))
+    terms.append((beta_p[0] * perim.log_barrier(PSTAR)).name("R"))
     callbacks.append(jno.optimizers.geometric_decay(beta_p, GAMMA, start=BETA, minimum=BETA_MIN))
 terms += [jno.le(volume, 1.0), jno.le(g_ang, 1.0), jno.le(g_vmx, 1.0), jno.le(g_vmn, 1.0)]
 
@@ -201,6 +211,7 @@ C_ref = solve_C(fem_ref.operator, {"rho2": jnp.asarray(np.asarray(rho_ref).resha
 # Whatever gap THAT shows is pure discretisation, and only the excess above it is attributable to
 # the moved nodes. (A first-order correction: compliance error does not factorise exactly.)
 n_c, n_f = cells.shape[0], d_ref._cells_p1().shape[0]
+coord0 = {sp["name"]: jnp.asarray(pts0[ids, int(sp["axis"])]) for sp in d._trainable_coords}  # UNdeformed
 C_u_coarse = solve_C(fem.operator, {"rho": jnp.full(n_c, VOLFRAC), "penal": jnp.asarray([PENAL]), **coord0})
 C_u_fine = solve_C(fem_ref.operator, {"rho2": jnp.full(n_f, VOLFRAC)})
 discretisation = C_u_fine / C_u_coarse  # the coarse mesh's intrinsic over-stiffness
