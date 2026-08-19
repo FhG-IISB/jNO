@@ -844,7 +844,15 @@ def _field_data(local, node):
     if fields is None:
         return local["shape_vals"], local.get("shape_grads"), local.get("cell_sol")
     key = getattr(node, "field_key", getattr(node, "op_id", None))
-    fd = fields[local["field_index"][key]]
+    idx = local["field_index"].get(key)
+    if idx is None:
+        # A COEFFICIENT-ONLY field: a FrozenField on the P1 vertex space that is not among this
+        # problem's solved unknowns (an N1E form whose source was computed elsewhere). It has no
+        # entry in the field table, so fall back to the top-level P1 shape data the assembler
+        # supplies for field coefficients. `cell_sol` is None — a frozen field carries its own
+        # values via ``local["frozen_fields"]``, never the live state.
+        return local["shape_vals"], local.get("shape_grads"), None
+    fd = fields[idx]
     return fd["shape_vals"], fd["shape_grads"], fd["cell_sol"]
 
 
@@ -871,7 +879,9 @@ def _field_hess(local, node):
     if fields is None:
         return local.get("shape_hess")
     key = getattr(node, "field_key", getattr(node, "op_id", None))
-    return fields[local["field_index"][key]].get("shape_hess")
+    idx = local["field_index"].get(key)
+    # Coefficient-only field: no field-table entry, and P1 tabulates no second derivative anyway.
+    return None if idx is None else fields[idx].get("shape_hess")
 
 
 def _field_space(local, node):
@@ -885,7 +895,11 @@ def _field_space(local, node):
     if fields is None:
         return local.get("space", "Lagrange")
     key = getattr(node, "field_key", getattr(node, "op_id", None))
-    return fields[local["field_index"][key]].get("space", "Lagrange")
+    idx = local["field_index"].get(key)
+    # A COEFFICIENT-ONLY field (a FrozenField on the P1 vertex space, not among this problem's
+    # solved unknowns) has no field-table entry. It IS nodal Lagrange — which is also the default,
+    # so the value branches downstream take the same path they would for any P1 coefficient.
+    return "Lagrange" if idx is None else fields[idx].get("space", "Lagrange")
 
 
 def _eval_frozen_coefficient(domain, model, local):

@@ -322,6 +322,49 @@ def assemble_fem_nonnodal(
     n_verts = int(pts.shape[0])
     cells_j = jnp.asarray(cells, dtype=jnp.int32)
 
+    # --- frozen (known) fields: `ui.bind(...).freeze(values)` used as a COEFFICIENT ------------------
+    # Mirrors the native path (fem_native `_collect_frozen_fields` / `_frozen_gathered`), with one
+    # difference: there, a frozen field is a pinned copy of a field that is already among the solved
+    # unknowns, so it gathers on `cells_f_j[field_index[key]]`. Here the trial is N1E (edge DOFs) and a
+    # frozen coefficient lives on the P1 VERTEX space instead — the same space the P1 field parameters
+    # already use — so it gathers on `cells_j` and is interpolated with `p1_shape_vals`. That is what
+    # lets a computed source (e.g. J_s from an electrokinetic pre-solve) enter an H(curl) form.
+    def _collect_frozen_fields(terms):
+        from ...trace import FrozenField
+        from .solver_helper import iter_children
+
+        found: dict = {}
+        seen: set = set()
+        stack = list(terms)
+        while stack:
+            n = stack.pop()
+            if id(n) in seen:
+                continue
+            seen.add(id(n))
+            if isinstance(n, FrozenField):
+                found[n.frozen_id] = n
+                continue
+            stack.extend(iter_children(n))
+        return found
+
+    _frozen_nodes = _collect_frozen_fields(
+        list(volume_terms) + [e for exprs in (boundary_terms or {}).values() for e in exprs]
+    )
+    # Per-cell nodal slice, a compile-time constant (no args threading, no jacfwd tangent).
+    # scalar (n_nodes,) -> (n_cell, n_local, 1); VECTOR (n_nodes, vec) -> (n_cell, n_local, vec).
+    _frozen_gathered: dict = {}
+    for _fid, _fnode in _frozen_nodes.items():
+        _fvals = jnp.asarray(_fnode.values)
+        if _fvals.shape[0] != n_verts:
+            raise ValueError(
+                f"jno.fem (non-nodal): a frozen field coefficient must carry one value per MESH VERTEX "
+                f"({n_verts}); got {_fvals.shape[0]}. On an N1E form the frozen field is a P1 coefficient, "
+                "not a copy of the (edge-DOF) unknown."
+            )
+        _frozen_gathered[_fid] = (
+            _fvals[cells_j].reshape(n_cells, cells_j.shape[1], 1) if _fvals.ndim == 1 else _fvals[cells_j]
+        )
+
     # --- edge families (RT/N1E): contravariant/covariant Piola over a shared edge topology (one
     # ``edge_ref`` dispatch serves both -- same edge DOFs/topology, family-specific push-forward) ---
     edge_ref = {}  # family -> (ref_values, ref_diffop, ref_grads, piola_fn, piola_grad_fn)
@@ -383,7 +426,7 @@ def assemble_fem_nonnodal(
     # from its mesh-vertex values per cell (3 barycentric on a triangle, 4 on a tetrahedron), independent of
     # the trial element's own basis. The kernel contraction ``shape_vals . cell_nodal`` is vertex-count
     # agnostic, so only this reference-basis table is dimension-specific.
-    if _field_param_names:
+    if _field_param_names or _frozen_gathered:
         _bary0 = 1.0 - qp[:, 0] - qp[:, 1] - (qp[:, 2] if dim == 3 else 0.0)
         p1_shape_vals = jnp.stack([_bary0, qp[:, 0], qp[:, 1]] + ([qp[:, 2]] if dim == 3 else []), axis=1)
     else:
@@ -612,8 +655,12 @@ def assemble_fem_nonnodal(
                         "region_mask_names": _rn,
                         "volume_vars": vol_vars + _cell_masks(c, _rn),
                     }
-                    if _field_param_names:  # P1 basis to interpolate a field parameter (top-level, param-only key)
+                    if (
+                        _field_param_names or _frozen_gathered
+                    ):  # P1 basis to interpolate a field parameter (top-level, param-only key)
                         local["shape_vals"] = p1_shape_vals
+                    if _frozen_gathered:  # known-field (ui.freeze) per-cell nodal slices for this cell
+                        local["frozen_fields"] = {fid: g[c] for fid, g in _frozen_gathered.items()}
                     if _nt is not None:  # trainable nets ride args (crux weights); frozen/placeholder -> stored
                         local["neural_coefficients"] = _nt
                     return _integrate_term(domain, e, local, qw * meas)  # (ndof of the test field,)
@@ -851,8 +898,12 @@ def assemble_fem_nonnodal(
                     "region_mask_names": rnames,
                     "volume_vars": vol_vars + _cell_masks(c, rnames),
                 }
-                if _field_param_names:  # P1 basis to interpolate a field parameter (top-level, param-only key)
+                if (
+                    _field_param_names or _frozen_gathered
+                ):  # P1 basis to interpolate a field parameter (top-level, param-only key)
                     local["shape_vals"] = p1_shape_vals
+                if _frozen_gathered:  # known-field (ui.freeze) per-cell nodal slices for this cell
+                    local["frozen_fields"] = {fid: g[c] for fid, g in _frozen_gathered.items()}
                 if _nt is not None:  # trainable nets ride args (crux weights); frozen/placeholder -> stored
                     local["neural_coefficients"] = _nt
                 return _integrate_term(domain, coeff, local, qw * meas)
