@@ -261,6 +261,48 @@ def _symmetrized_kind_and_values(values, order, orderT, pat):
     return "symmetric", sym
 
 
+def _cudss_refine(solver, Ag, bg, x, b, cp):
+    """Fixed-precision iterative refinement against the TRUE matrix. Returns ``(x, rel_residual)``.
+
+    Wilkinson's classical scheme (Rounding Errors in Algebraic Processes, 1963, ch. 3; also Higham,
+    Accuracy and Stability of Numerical Algorithms, 2nd ed., ch. 12): the residual ``r = b - A x`` is
+    formed with the matrix actually asked for, the correction solves against the (possibly
+    pivot-perturbed) factorization, and each step contracts the error by ~||A - LU||/||A||. This is
+    exactly what the cuDSS documentation prescribes after pivot replacement: the perturbed
+    factorization is a fine preconditioner one or two steps away from the unperturbed answer.
+
+    Stops early the moment the residual fails to contract -- on a genuinely singular operator the
+    correction lives in the null space and iterating further is pure waste -- so the caller can
+    distinguish "recovered" from "unrecoverable" by the returned residual alone. ``bg`` is the
+    solver's bound operand buffer; it is left holding the LAST residual pushed through it, so callers
+    needing the original rhs must rebind afterwards. ``b`` may alias ``bg`` (the check-time probe
+    does): the right-hand side is copied before the buffer is first overwritten.
+    """
+    denom = float(cp.linalg.norm(b))
+    denom = denom if denom > 0.0 else 1.0
+    rel = float(cp.linalg.norm(Ag @ x - b) / denom)
+    b0 = None  # the rhs is only copied if refinement actually runs; the probe path stays SpMV-only
+    # The budget is a backstop, not the decision-maker -- the non-contraction break below is what
+    # separates recoverable from singular. Measured on a 64k Taylor-Hood saddle with 16 replaced
+    # pivots: still contracting at 3 steps (8.7e-6 -> 1.7e-6), through the gate by 8.
+    for _ in range(8):
+        if rel <= 1e-10:
+            break
+        if b0 is None:
+            b0 = b.copy()
+        bg[...] = b0 - Ag @ x
+        solver.reset_operands(b=bg)
+        x = x + solver.solve()
+        new = float(cp.linalg.norm(Ag @ x - b0) / denom)
+        if new >= rel:
+            rel = new
+            break  # not contracting: the factorization is not a usable preconditioner here
+        rel = new
+    if b0 is not None:
+        bg[...] = b0
+    return x, rel
+
+
 def _cudss_check_factorization(solver, Ag, bg, cp, shape):
     """Raise if cuDSS silently factored a singular operator.
 
@@ -276,24 +318,31 @@ def _cudss_check_factorization(solver, Ag, bg, cp, shape):
 
     The residual is only computed WHEN ``npivots`` fires, so the common path pays a host-side
     attribute read and no SpMV. A perturbed pivot that still yields a good answer passes.
+
+    Returns ``False`` for a clean factorization, ``True`` for a perturbed one whose answer is
+    recoverable -- the solve path must then run :func:`_cudss_refine` on every solve, because the
+    factorization is of a perturbed matrix and each raw solve carries an O(gate) error -- and raises
+    only when even refinement cannot reach the gate (a genuinely unconstrained mode).
     """
     try:
         npivots = int(solver.factorization_info.npivots)
     except Exception:  # an older cuDSS that does not expose it -- do not fail the solve over this
-        return
+        return False
     if npivots == 0:
-        return
+        return False
     x = solver.solve()
-    denom = cp.linalg.norm(bg)
-    rel = float(cp.linalg.norm(Ag @ x - bg) / cp.where(denom > 0, denom, 1.0))
+    x, rel = _cudss_refine(solver, Ag, bg, x, bg, cp)
+    solver.reset_operands(b=bg)  # leave the operand bound to the caller's rhs buffer
     if rel > 1e-6:
         raise RuntimeError(
             f"cuDSS factorized a SINGULAR operator ({shape[0]}x{shape[1]}): it replaced {npivots} "
-            f"pivot(s) and the solution has relative residual {rel:.2e}. cuDSS reports this through "
-            f"neither an exception nor a NaN, so jNO checks it -- the returned vector would have been "
-            f"finite and wrong. Check for an unconstrained mode (a pure-Neumann problem with no gauge "
-            f"term, a floating region, or a saddle system whose constraint block has an empty row)."
+            f"pivot(s) and iterative refinement left the solution at relative residual {rel:.2e}. "
+            f"cuDSS reports this through neither an exception nor a NaN, so jNO checks it -- the "
+            f"returned vector would have been finite and wrong. Check for an unconstrained mode (a "
+            f"pure-Neumann problem with no gauge term, a floating region, or a saddle system whose "
+            f"constraint block has an empty row)."
         )
+    return True
 
 
 def _cudss_host_solve(data, indices, rhs, shape, transpose):
@@ -366,7 +415,7 @@ def _cudss_host_solve(data, indices, rhs, shape, transpose):
         solver.plan()
         solver.factorize()
         try:
-            _cudss_check_factorization(solver, Ag, bg, cp, shape)
+            perturbed = _cudss_check_factorization(solver, Ag, bg, cp, shape)
         except Exception:
             solver.free()  # never cached, so nothing else will ever free it
             raise
@@ -374,6 +423,7 @@ def _cudss_host_solve(data, indices, rhs, shape, transpose):
             "solver": solver,
             "Ag": Ag,
             "bg": bg,
+            "perturbed": perturbed,
             "dhash": dhash,
             "rows": rows,
             "cols": cols,
@@ -396,12 +446,20 @@ def _cudss_host_solve(data, indices, rhs, shape, transpose):
             csr.sum_duplicates()
             entry["Ag"].data[:] = cp.asarray(csr.data)
             entry["solver"].factorize()
-            _cudss_check_factorization(entry["solver"], entry["Ag"], entry["bg"], cp, shape)
+            entry["perturbed"] = _cudss_check_factorization(entry["solver"], entry["Ag"], entry["bg"], cp, shape)
             entry["dhash"] = dhash
 
     entry["bg"][...] = _to_device_rhs(rhs)
     entry["solver"].reset_operands(b=entry["bg"])
-    out = cp.asnumpy(entry["solver"].solve())
+    x = entry["solver"].solve()
+    if entry["perturbed"]:
+        # The factorization is of a PERTURBED matrix (see _cudss_check_factorization), so every raw
+        # solve against it carries an O(1e-6) relative error -- fine for a probe, not for a Newton
+        # step that jNO's own guards will hold to a much tighter residual. Refinement makes each
+        # answer exact-to-1e-10 at the cost of one SpMV per step, only on flagged factorizations.
+        x, _ = _cudss_refine(entry["solver"], entry["Ag"], entry["bg"], x, entry["bg"], cp)
+        entry["solver"].reset_operands(b=entry["bg"])
+    out = cp.asnumpy(x)
     return _np.asarray(out.reshape(rhs.shape), dtype=rhs.dtype)
 
 
@@ -430,6 +488,14 @@ def cudss_lu_solve(A, b):
     as ``SYMMETRIC`` (LDL^T) rather than general LU, measured 1.41x faster with 1.38x less peak device
     memory on lap3d 40^3. Symmetry is tested bitwise and SPD is never inferred -- see
     ``_cudss_matrix_kind`` for why both of those are deliberate.
+
+    A **replaced pivot** does not immediately mean failure: cuDSS perturbs a pivot it cannot use and
+    factorizes the perturbed matrix, so jNO runs fixed-precision **iterative refinement** against the
+    true matrix (Wilkinson 1963, ch. 3; the remedy cuDSS's own documentation prescribes) -- a
+    zero-leading-pivot but nonsingular operator is thereby solved exactly rather than refused, and
+    every subsequent solve against a flagged factorization is refined to ~1e-10 relative residual at
+    the cost of one SpMV per step. Only an operator refinement cannot recover (the residual stops
+    contracting: a genuinely unconstrained mode) raises.
 
     Requires the optional stack (``nvmath-python``, ``cudss``, ``cupy``) and a GPU; raises a clear
     ``ImportError`` otherwise. Limitations inherited from ``pure_callback``: no ``vmap`` batching
