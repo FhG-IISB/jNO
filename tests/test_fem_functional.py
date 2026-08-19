@@ -283,7 +283,13 @@ def _design(size=0.4, w=6.0, h=3.0, volfrac=0.4):
 
     inner, sym, tr = jno.np.inner, jno.np.symgrad, jno.np.trace
     ddot = lambda a, b: inner(a, b, n_contract=2)  # noqa: E731
-    emin, penal, nu, e0, tol, span = 1e-6, 3.0, 0.3, 1.0, 1e-6 * w, 1.0
+    # emin = 1e-4, not the tutorial's 1e-6. At a 1e6 SIMP contrast cuSolver calls the assembled
+    # stiffness singular inside `jit_grad_fn` and the design loop dies on GPU while passing on CPU
+    # -- the same failure 9e525fb3 recorded when it raised EMIN from 1e-9. What is under test here
+    # is the FUNCTIONAL plumbing (objective and constraint as integrals, sensitivities from AD), for
+    # which the contrast is incidental; the assertions below still require compliance to halve, the
+    # volume constraint to bind and a non-uniform topology to emerge.
+    emin, penal, nu, e0, tol, span = 1e-4, 3.0, 0.3, 1.0, 1e-6 * w, 1.0
     lam, mu = e0 * nu / (1 - nu**2), e0 / (2 * (1 + nu))
     d = jno.Shape.rect(0.0, 0.0, w, h, size=size).domain()
     xi, yi, _ = d.variable("interior", split=True)
@@ -347,7 +353,14 @@ def test_it_drives_a_constrained_design_through_jno_core():
 
     assert after < 0.5 * before, f"compliance {before:.3f} -> {after:.3f}; the design barely moved"
     assert vol < 1.02, f"volume fraction {vol:.4f} of budget — the constraint is not holding"
-    assert design.min() >= 1e-3 - 1e-12 and design.max() <= 1.0 + 1e-12, "MMA left the box"
+    # MMA reaches its bounds through the DUAL subproblem rather than a hard clamp, so it approaches
+    # them asymptotically: the upper bound is measured at 1.0 + 1.16e-10 here, reproducibly and
+    # bit-identically on CPU and GPU. A 1e-12 slack asserted a clamp the method does not perform;
+    # 1e-8 is still two orders below any real escape (a broken box gives 1e-2 or worse, and the
+    # spread assertion below would fail too).
+    assert design.min() >= 1e-3 - 1e-8 and design.max() <= 1.0 + 1e-8, (
+        f"MMA left the box: [{design.min():.12f}, {design.max():.12f}]"
+    )
     assert design.max() - design.min() > 0.5, "the design stayed uniform — no topology emerged"
 
 
