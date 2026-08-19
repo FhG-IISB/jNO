@@ -11,6 +11,8 @@ import jax
 import numpy as np
 import pytest
 
+pytest.importorskip("mmgpy", reason="mmgpy required for adaptive remeshing")
+
 import jno
 
 meshio = pytest.importorskip("meshio")

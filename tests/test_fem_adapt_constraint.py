@@ -15,6 +15,7 @@ import pytest
 import jno
 
 meshio = pytest.importorskip("meshio")
+pytest.importorskip("mmgpy", reason="mmgpy required for adaptive remeshing")
 
 
 @pytest.fixture(autouse=True)

@@ -18,6 +18,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+pytest.importorskip("mmgpy", reason="mmgpy required for adaptive remeshing")
+
 import jno
 from jno.utils.solver.fem_adapt import _criterion_indicators, _element_gradients, zz_error_indicators
 
