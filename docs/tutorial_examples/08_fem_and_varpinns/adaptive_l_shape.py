@@ -127,6 +127,23 @@ def _near(pts, centre, radius):
     return np.hypot(pts[:, 0] - centre[0], pts[:, 1] - centre[1]) < radius
 
 
+def _min_angle(pts, cells):
+    """Smallest angle in the mesh, in degrees -- the quality number relocation can quietly destroy."""
+    v = pts[cells]
+    a = np.linalg.norm(v[:, 1] - v[:, 0], axis=1)
+    b = np.linalg.norm(v[:, 2] - v[:, 1], axis=1)
+    c = np.linalg.norm(v[:, 0] - v[:, 2], axis=1)
+    cos = np.stack(
+        [
+            (b * b + c * c - a * a) / (2 * b * c),
+            (a * a + c * c - b * b) / (2 * a * c),
+            (a * a + b * b - c * c) / (2 * a * b),
+        ],
+        axis=1,
+    )
+    return float(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))).min())
+
+
 # --- the reference, and the common coarse start ----------------------------------------------------------
 # The reference must OUT-RESOLVE everything measured against it. A P1 reference is not good enough for
 # this comparison: an enriched run beats a P1 reference of several times the DOF count outright, which
@@ -145,10 +162,18 @@ fem_h.solve(solve_fn, adapt=jno.solve.remesh(theta=0.6, max_iters=4, refine_fact
 E_h, n_h = energy(fem_h, stiff_h, solve_fn(fem_h.A, fem_h.b)), active_dofs(d_h, fem_h)
 pts_h, tris_h = np.asarray(d_h.mesh.points)[:, :2], np.asarray(d_h.mesh.cells_dict["triangle"])
 
-# (2) r -- RELOCATE a fixed node set, down the FE energy through the differentiable solve.
+# (2) r -- RELOCATE a fixed node set, down a mesh functional, through the differentiable solve.
+#     NOT `objective="energy"` here, and the reason is this problem's source term. The Ritz functional
+#     is J(v) = 1/2 a(v,v) - (f,v); with no load J = E and descending the energy descends the error,
+#     which is what the classic L-shape wants. With a load, J_h = -E_h at the discrete solution, so
+#     minimising the error means MAXIMISING E -- and descending it walks away from the solution while
+#     flattening elements, which is the cheapest way to lower the integral of |grad u|^2. Measured
+#     here: E fell 0.12252 -> 0.10788 exactly as asked, the true error rose 3.6x, and the smallest
+#     angle in the mesh collapsed from 40.8 degrees to 3.2. The default (arclength equidistribution)
+#     targets resolution instead and keeps the mesh sane.
 d_r, fem_r, stiff_r = build(H, movable=True)
 pts_r0 = np.asarray(d_r.mesh.points)[:, :2].copy()  # coarse start, for the animation
-sol_r = np.asarray(fem_r.solve(solve_fn, adapt=jno.solve.relocate(objective="energy", max_iters=50, lr=3e-3))).reshape(-1)
+sol_r = np.asarray(fem_r.solve(solve_fn, adapt=jno.solve.relocate(max_iters=30, lr=5e-4))).reshape(-1)
 E_r, n_r = energy(fem_r, stiff_r, sol_r), active_dofs(d_r, fem_r)
 pts_r, tris_r = np.asarray(d_r.mesh.points)[:, :2], np.asarray(d_r.mesh.cells_dict["triangle"])
 
@@ -177,7 +202,7 @@ err = lambda E: E_REF - E  # noqa: E731  -- energy rises toward the truth; see t
 print(f"ONE problem, one mesh, one reference.   E_ref = {E_REF:.6f}   (cover, {active_dofs(d_ref, fem_ref)} dofs)")
 print(f"  coarse start   : {err(E0):.3e}   ({n0} dofs)")
 print(f"  h-adaptivity   : {err(E_h):.3e}   ({n_h} dofs)   {err(E0) / err(E_h):5.1f}x lower")
-print(f"  r-adaptivity   : {err(E_r):.3e}   ({n_r} dofs, +0)   {err(E0) / err(E_r):5.1f}x   <- worse; see jNO#114")
+print(f"  r-adaptivity   : {err(E_r):.3e}   ({n_r} dofs, +0)   {err(E0) / err(E_r):5.1f}x   <- not r's regime here")
 print(f"  p-adaptivity   : {err(E_p):.3e}   ({n_p} dofs, {mask_p.mean():.0%} enriched)   {err(E0) / err(E_p):5.1f}x lower")
 print(
     f"  h then p       : {err(E_hp):.3e}   ({n_hp} dofs, {mask_hp.mean():.0%} enriched)   {err(E0) / err(E_hp):5.1f}x lower"
@@ -205,6 +230,12 @@ assert err(E_p) < err(E_h), "p should beat h per DOF on this smooth-source probl
 assert err(E_hp) < err(E_p), "h then p should beat either alone"
 assert 0.0 < mask_p.mean() < 1.0, "the p run enriched everything or nothing -- nothing was chosen"
 assert _min_detj(pts_r, tris_r) > 0, "r-adaptivity must not tangle the mesh"
+# Not tangling is a low bar -- `objective="energy"` on this source-driven problem passed it while
+# flattening the smallest angle from 40.8 degrees to 3.2 (it lowers the integral of |grad u|^2 by
+# squashing elements). Assert the mesh stays USABLE, not merely non-inverted.
+_ang0, _ang_r = _min_angle(pts0, tris0), _min_angle(pts_r, tris_r)
+print(f"\nmesh quality (smallest angle):  start {_ang0:.1f} deg  ->  after relocation {_ang_r:.1f} deg")
+assert _ang_r > 0.6 * _ang0, f"relocation wrecked the mesh: {_ang0:.1f} deg -> {_ang_r:.1f} deg"
 # --8<-- [end:code]
 
 # --- figure ----------------------------------------------------------------------------------------------

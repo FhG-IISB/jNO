@@ -32,18 +32,27 @@ one error-versus-DOF axis.](/jNO/assets/adaptive_l_shape.png)
 |---|---|---|---|
 | coarse start | 5.725e-03 | 144 | |
 | **h** | 6.727e-04 | 561 | 8.5× lower |
-| **r** | 2.037e-02 | 144 (+0) | **worse than the start** |
+| **r** | 9.147e-03 | 144 (+0) | **worse than the start** |
 | **p** | 2.147e-04 | 313 (50 % enriched) | 26.7× lower |
 | **h then p** | **5.773e-05** | 739 (70 %) | **99.2× lower** |
 
 p reaches **3.1× lower error than h with 56 % of the DOFs**, and composing the two beats either alone.
 
-!!! warning "The r row is worse than the start, and the tutorial says so"
-    What is *not* established is why: `relocate()` is known to write back a mesh that differs from the
-    geometry its own loop validated ([FhG-IISB/jNO#114](https://github.com/FhG-IISB/jNO/issues/114)), so
-    this row may be measuring that defect rather than the method. Read it as **unresolved**. On the
-    classic L-shape benchmark — Dirichlet data equal to the exact singular mode, where all the error is
-    the corner — the same call cuts the energy error by 55 % at fixed DOFs.
+!!! warning "The r row is worse than the start, and the objective is why"
+    Relocation descends a *mesh functional*, and which one is valid depends on the problem. The Ritz
+    functional is $J(v)=\tfrac12 a(v,v)-(f,v)$, and it is $J$ that satisfies
+    $J_h-J_\text{exact}=\tfrac12\|u-u_h\|_E^2$. With **no** source, $J=E$ — so `objective="energy"`
+    descends the error, and on the classic singular-mode L-shape it cuts that error by 55 % at fixed
+    DOFs. **This** problem has a source, so $J_h=-E_h$ at the discrete solution: minimising the error
+    means *maximising* $E$, and descending it walks away from the solution while flattening elements,
+    which is the cheapest way to lower $\int|\nabla u|^2$. Measured: $E$ duly fell 0.12252 → 0.10788,
+    the true error rose 3.6×, and the mesh's smallest angle collapsed **40.8° → 3.2°**.
+
+    The tutorial therefore uses the default (arclength equidistribution), which targets resolution and
+    keeps the mesh sane — smallest angle 40.8° → 31.8°. It still does not *help* here: the error rises
+    monotonically from the very first iteration at every step size tested, so this problem is simply
+    not r's regime. An assert now fails if relocation ever costs more than 40 % of the smallest angle,
+    because "not tangled" is far too low a bar to catch this.
 
 ## Where each method spent its DOFs
 
