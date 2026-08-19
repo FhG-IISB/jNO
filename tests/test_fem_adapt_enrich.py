@@ -25,6 +25,23 @@ from jno.utils.solver.fem_cover import cover_block
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 
+
+@pytest.fixture(autouse=True)
+def _x64():
+    """These oracles are exact identities (a mask reproducing a solve to machine precision), so they
+    need float64 to mean anything -- 1e-9 is below float32 eps. The file used to inherit x64 from
+    whichever sibling ran first in the same process, which is not a contract: under CI's one-process-
+    per-file runner it ran in float32 and the identity test failed at 1.8e-07."""
+    import jax
+
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
+
 BLK = cover_block(2)  # 3 in 2-D: the value slot plus the two cover coefficients
 
 
@@ -34,6 +51,11 @@ def _dense(a, b):
     import jax.numpy as jnp
 
     return jnp.linalg.solve(jnp.asarray(a.todense() if hasattr(a, "todense") else a), jnp.asarray(b).reshape(-1))
+
+
+def _grad_crit(ui):
+    """The criterion the docs recommend: gradient magnitude, measured best per DOF of anything tried."""
+    return jno.np.sqrt(ui.x**2 + ui.y**2 + 1e-30)
 
 
 def _poisson(space="cover", size=0.25, rhs=None):
@@ -48,7 +70,9 @@ def _poisson(space="cover", size=0.25, rhs=None):
     body = inner(grad(u, X), grad(phi, X), 1)
     if rhs is not None:
         body = body - rhs(X) * phi
-    return d, jno.fem([body, u(cw[0], cw[1]) - 0.0]), X, co
+    fem = jno.fem([body, u(cw[0], cw[1]) - 0.0])
+    fem._probe_trial = u.bind(x=co[0], y=co[1])  # for building a criterion in the tests
+    return d, fem, X, co
 
 
 def _sin_rhs(X):
@@ -72,7 +96,7 @@ def test_an_unenriched_node_has_its_cover_coefficients_pinned_to_exactly_zero():
     """The definition of selective ``p``. Not "small": pinned — an unenriched node contributes the
     plain P1 hat and nothing else, which is what makes the blend across an order interface free."""
     d, fem, _X, _co = _poisson(rhs=_sin_rhs)
-    fem.solve(_dense, adapt=jno.solve.enrich(criterion=None, theta=0.3, max_iters=2))
+    fem.solve(_dense, adapt=jno.solve.enrich(criterion=_grad_crit(fem._probe_trial), theta=0.3, max_iters=2))
 
     mask = np.asarray(d._fem_enriched_nodes, dtype=bool)
     assert 0 < mask.sum() < mask.size, f"nothing to compare: {mask.sum()} of {mask.size} nodes enriched"
@@ -100,7 +124,9 @@ def test_the_returned_field_is_the_nodal_values_not_the_interleaved_block():
     convention that holds for P2 would hand back a mixture. Checked against the exact solution: a
     wrong slice is not merely inaccurate, it is not a solution field at all."""
     d, fem, _X, _co = _poisson(rhs=_sin_rhs)
-    u = np.asarray(fem.solve(_dense, adapt=jno.solve.enrich(theta=0.9, max_iters=2))).reshape(-1)
+    u = np.asarray(
+        fem.solve(_dense, adapt=jno.solve.enrich(criterion=_grad_crit(fem._probe_trial), theta=0.9, max_iters=2))
+    ).reshape(-1)
     assert u.size == np.asarray(d.mesh.points).shape[0], f"got {u.size} values for {len(d.mesh.points)} nodes"
 
     full = np.asarray(fem.solve(_dense)).reshape(-1)
@@ -127,10 +153,11 @@ def test_a_criterion_enriches_where_it_peaks_and_leaves_the_rest_p1():
     assert f_on > 2.0 * max(f_off, 1e-9), f"enrichment is not on the ridge (on {f_on:.2f}, off {f_off:.2f})"
 
 
-def test_the_recovery_estimator_drives_it_when_no_criterion_is_given():
-    """``criterion=None`` falls back to ZZ recovery, spread from cells to their nodes. The oracle is
-    a solution with a corner singularity on an L-shape: the estimator must enrich the re-entrant
-    corner, which is where the gradient actually misbehaves."""
+def test_a_gradient_criterion_finds_the_reentrant_corner():
+    """A gradient criterion on an L-shape must enrich the re-entrant corner -- where the gradient
+    actually misbehaves. This replaces a test of the ZZ fallback, which no longer exists: recovery
+    from the vertex values cannot see the cover coefficients, so it was removed rather than left as a
+    default that reports a number anti-correlated with the error."""
     grad, inner = jno.np.grad, jno.np.inner
     s = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.14) - jno.Shape.rect(0.5, 0.5, 1.0, 1.0, size=0.14)
     d = s.domain()
@@ -139,7 +166,7 @@ def test_the_recovery_estimator_drives_it_when_no_criterion_is_given():
     X = [co[0], co[1]]
     u, phi = d.fem_symbols(space="cover")
     fem = jno.fem([inner(grad(u, X), grad(phi, X), 1) - 1.0 * phi, u(cw[0], cw[1]) - 0.0])
-    fem.solve(_dense, adapt=jno.solve.enrich(theta=0.4, max_iters=3))
+    fem.solve(_dense, adapt=jno.solve.enrich(criterion=_grad_crit(u.bind(x=X[0], y=X[1])), theta=0.4, max_iters=3))
 
     mask = np.asarray(d._fem_enriched_nodes, dtype=bool)
     p = np.asarray(d.mesh.points)[:, :2]
@@ -158,7 +185,7 @@ def test_selective_enrichment_buys_accuracy_over_p1_at_a_fraction_of_the_full_co
     for tag in ("p1", "partial", "full"):
         d, fem, _X, _co = _poisson(space="Lagrange" if tag == "p1" else "cover", size=0.2, rhs=_sin_rhs)
         if tag == "partial":
-            u = fem.solve(_dense, adapt=jno.solve.enrich(theta=0.3, max_iters=3))
+            u = fem.solve(_dense, adapt=jno.solve.enrich(criterion=_grad_crit(fem._probe_trial), theta=0.3, max_iters=3))
             dofs[tag] = fem.adapt_history[-1]["n_dofs"]
             frac = float(np.asarray(d._fem_enriched_nodes).mean())
         else:
@@ -182,7 +209,9 @@ def test_the_caller_is_left_on_the_adapted_space_not_the_one_it_built():
     which here is EVERY node enriched. Same field, two different answers, nothing to say which.
     """
     d, fem, _X, _co = _poisson(size=0.2, rhs=_sin_rhs)
-    u = np.asarray(fem.solve(_dense, adapt=jno.solve.enrich(theta=0.4, max_iters=3))).reshape(-1)
+    u = np.asarray(
+        fem.solve(_dense, adapt=jno.solve.enrich(criterion=_grad_crit(fem._probe_trial), theta=0.4, max_iters=3))
+    ).reshape(-1)
     mask = np.asarray(d._fem_enriched_nodes, dtype=bool)
     assert 0 < mask.sum() < mask.size, "the run enriched everything or nothing — nothing to distinguish"
 
@@ -202,7 +231,7 @@ def test_the_history_records_the_enrichment_growing_round_by_round():
     """``adapt_history`` is the run's audit trail: ``n_enriched`` and the ACTIVE DOF count must both
     increase, since the padded total is constant and would hide the whole effect."""
     d, fem, _X, _co = _poisson(size=0.2, rhs=_sin_rhs)
-    fem.solve(_dense, adapt=jno.solve.enrich(theta=0.3, max_iters=4))
+    fem.solve(_dense, adapt=jno.solve.enrich(criterion=_grad_crit(fem._probe_trial), theta=0.3, max_iters=4))
     h = fem.adapt_history
 
     assert len(h) >= 3, f"only {len(h)} rounds recorded"
@@ -218,7 +247,9 @@ def test_the_dof_budget_stops_the_loop():
     """``max_dofs`` is a budget, and a budget that is only advisory is worse than none."""
     d, fem, _X, _co = _poisson(size=0.2, rhs=_sin_rhs)
     n_p1 = int(np.asarray(d.mesh.points).shape[0])
-    fem.solve(_dense, adapt=jno.solve.enrich(theta=0.5, max_iters=8, max_dofs=n_p1 + 10))
+    fem.solve(
+        _dense, adapt=jno.solve.enrich(criterion=_grad_crit(fem._probe_trial), theta=0.5, max_iters=8, max_dofs=n_p1 + 10)
+    )
     h = fem.adapt_history
 
     assert len(h) < 8, f"max_dofs never fired: {len(h)} rounds"
@@ -226,10 +257,29 @@ def test_the_dof_budget_stops_the_loop():
     assert all(r["n_dofs"] < n_p1 + 10 for r in h[:-1]), "the budget was passed before the last round"
 
 
-def test_a_tolerance_stops_the_loop_early():
-    d, fem, _X, _co = _poisson(size=0.2, rhs=_sin_rhs)
-    fem.solve(_dense, adapt=jno.solve.enrich(theta=0.3, max_iters=6, tol=1e30))
-    assert len(fem.adapt_history) == 1, "an unreachably loose tol must stop after the first estimate"
+@pytest.mark.parametrize("knob", ["tol", "eps"])
+def test_a_stopping_rule_with_nothing_to_compare_against_is_refused(knob):
+    """Neither knob has a meaning here, and a plausible-looking stop is worse than none.
+
+    `estimate` is the norm of whatever drives the marking, and a criterion is a FIELD MAGNITUDE, not
+    an error: measured on a plate problem the criterion norm ROSE 4.2967e+01 -> 4.3068e+01 over eight
+    rounds while the true L2 error fell by a factor of three. `eps` reads that as a plateau and stops
+    a converging loop; `tol` compares against a number unrelated to accuracy. Bound the run with
+    `max_iters`/`max_dofs` instead."""
+    _d, fem, _X, _co = _poisson(size=0.25, rhs=_sin_rhs)
+    with pytest.raises(NotImplementedError, match="nothing to compare against"):
+        fem.solve(_dense, adapt=jno.solve.enrich(criterion=_grad_crit(fem._probe_trial), max_iters=3, **{knob: 1e-3}))
+
+
+def test_a_criterion_is_required():
+    """No default estimator, by choice. ZZ recovery -- the obvious one -- reconstructs its gradient
+    from the VERTEX VALUES, so it is blind to the cover coefficients enrichment adds and reports a
+    number anti-correlated with the error (it rose 1.3353e-01 -> 1.3377e-01 while the true L2 fell
+    4.692e-03 -> 2.677e-03). Guessing a criterion instead -- gradient of which field, reduced how? --
+    would be a modelling choice made on the caller's behalf, so the loop asks."""
+    _d, fem, _X, _co = _poisson(size=0.25, rhs=_sin_rhs)
+    with pytest.raises(TypeError, match="criterion"):
+        jno.solve.enrich(theta=0.5, max_iters=3)
 
 
 # ------------------------------------------------------------------ it refuses what it cannot do
@@ -240,7 +290,7 @@ def test_a_field_without_covers_is_refused_by_name():
     p-adaptive run is exactly the plausible-wrong-answer this codebase refuses to produce."""
     _d, fem, _X, _co = _poisson(space="Lagrange", rhs=_sin_rhs)
     with pytest.raises(ValueError, match="space='cover'"):
-        fem.solve(_dense, adapt=jno.solve.enrich(max_iters=1))
+        fem.solve(_dense, adapt=jno.solve.enrich(criterion=_grad_crit(fem._probe_trial), max_iters=1))
 
 
 def test_a_transient_problem_is_refused_by_name():
@@ -256,7 +306,7 @@ def test_a_transient_problem_is_refused_by_name():
         [ui.t * vi + 0.1 * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(xi0, yi0) - 1.0],
     )
     with pytest.raises(NotImplementedError, match="steady adaptive loop"):
-        fem.solve(adapt=jno.solve.enrich(max_iters=1))
+        fem.solve(adapt=jno.solve.enrich(criterion=_grad_crit(ui), max_iters=1))
 
 
 def test_a_mask_built_on_a_different_mesh_is_refused():

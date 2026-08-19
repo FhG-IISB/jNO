@@ -1050,14 +1050,21 @@ the geometry:
 
 ```python
 u, phi = d.fem_symbols(space="cover")
+ui = u.bind(x=xi, y=yi)
 fem = jno.fem([...])
-u = fem.solve(adapt=jno.solve.enrich(theta=0.4, max_iters=4))              # ZZ-driven
-u = fem.solve(adapt=jno.solve.enrich(criterion=jno.np.abs(ui.x), theta=0.5))  # or your own field
+u = fem.solve(solve_fn, adapt=jno.solve.enrich(
+    criterion=jno.np.sqrt(ui.x**2 + ui.y**2), theta=0.5, max_iters=6))
 ```
 
-`theta`, `criterion`, `max_iters`, `max_dofs`, `tol` and `eps` mean what they do for `remesh` — a
-criterion is the same traced, test-function-free field, and `metric_field` picks which field of a
-coupled problem drives the marking. `start=` pre-enriches a fraction before the first solve (default
+`theta`, `criterion`, `max_iters` and `max_dofs` mean what they do for `remesh` — a criterion is the
+same traced, test-function-free field, and `metric_field` picks which field of a coupled problem
+drives the marking. **A `criterion` is required and `tol`/`eps` are refused**, both for the same reason: nothing
+available here is an error estimate. A recovery estimator reconstructs its gradient from the *vertex
+values*, so it is blind to the cover coefficients enrichment adds — measured, it ROSE from 1.3353e-01
+to 1.3377e-01 across eight rounds while the true L2 error fell 4.692e-03 → 2.677e-03. A hierarchical
+residual is honest (it vanishes where enrichment is already on) but marked no better and left a sharp
+spike untouched. A hand-written `sqrt(ui.x**2 + ui.y**2)` beat both by ~2× per DOF — so the loop asks
+for the criterion rather than guessing one, and bounds itself with `max_iters`/`max_dofs`. `start=` pre-enriches a fraction before the first solve (default
 0, i.e. begin at plain P1).
 
 Three things follow from changing the space instead of the mesh, and each shows up in the API:
