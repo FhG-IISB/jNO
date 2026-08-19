@@ -79,6 +79,34 @@ not a detail: a plain `log(max(P* - P, eps))` is **constant** above the bound, s
 is exactly zero and the barrier silently stops doing anything — the failure mode is a satisfied-looking
 run whose perimeter sits far above target.
 
+### The patch filter has a size limit, and it is lower than it looks
+
+Eq. (18) is a **geometric mean** over $N-2$ factors, and a mean dilutes a single outlier by $1/N$.
+So the criterion's discriminating power is set by how many elements meet at the vertex. Measured on
+the shipped kernel (`tests/test_patch_filter_scaling.py`), with $f_\text{solid}=1$ throughout:
+
+| $N$ | lone dense element | one-node connection | uniform grey | hinge / solid |
+|---|---|---|---|---|
+| 5 (3-D edge fan, $6T/E$) | 0.100 | 0.013 | 0.831 | 0.01 |
+| **6** (2-D vertex, $3T/V$) | **0.178** | **0.038** | **0.842** | **0.04** |
+| 8 | 0.316 | 0.112 | 0.853 | 0.11 |
+| 12 | 0.501 | 0.755 | 0.862 | 0.76 |
+| 27 (3-D vertex, $4T/V$) | 0.758 | 0.845 | 0.870 | 0.85 |
+
+At the size a 2-D triangulation actually produces ($N\approx6$) the filter separates a defect from
+a grey patch by a factor of $4.7$, which is what makes it work. **By $N=12$ three-quarters of that
+is gone**, and a valence-12 vertex is not exotic on an unstructured mesh — so on a badly graded 2-D
+mesh the filter quietly weakens where the patches are largest. At $N\approx27$, the size of a
+tetrahedral **vertex** patch, a hinge sits within $3\%$ of uniform grey and nothing downstream can
+act on it; SIMP cannot finish the job either, since $0.758^3 = 0.44$ of solid against $0.006$ for
+the $0.178$ of a six-element patch.
+
+This is a property of *any* mean — a density-weighted geometric mean with exponent $1/\sum\rho$
+behaves the same — so it is not recoverable by reweighting. The practical consequences: a 3-D
+**vertex** criterion needs an order statistic rather than eq. (18), while a 3-D **edge fan**
+($6T/E\approx5.2$) sits in the regime where the formula is at its *strongest* — it discriminates a
+hinge three times more sharply than the 2-D vertex patch it was designed for — and so transfers
+verbatim. This is the extension Jung, Yun & Kim leave open in their §2.3.2.
 ## The objective is an integral
 
 Compliance is the strain energy `C = a(u,u) = ∫ σ(u):ε(u) dΩ`, and it is written as exactly that —
