@@ -1655,11 +1655,15 @@ class FEM:
         # re-compiles the whole problem to change one number. The operator already accepts the values
         # (it builds `args` from them and threads the assembled tangent, so a sparse-direct Newton and a
         # reduced system both keep working); what was missing was a way in. `continuation=` above owns
-        # them on its own path, so this only applies here.
+        # them on its own path, so this only applies here -- and the MOVING-MESH driver below owns its
+        # runtime parameters the same way (it threads them into the march and validates its kwargs
+        # strictly), so a geometry problem keeps them raw: packing them into `values` here handed that
+        # driver a key it rightly refuses, and `fem.solve(kap=...)` on a moving mesh raised.
         _param_names = set(getattr(self._op, "runtime_parameter_exprs", None) or {})
-        _values = {k: kwargs.pop(k) for k in list(kwargs) if k in _param_names}
-        if _values:
-            kwargs["values"] = _values
+        if not getattr(self, "_geometry", None):
+            _values = {k: kwargs.pop(k) for k in list(kwargs) if k in _param_names}
+            if _values:
+                kwargs["values"] = _values
         has_slots = (
             (x0 is not None)
             or (nonlinear is not None)
