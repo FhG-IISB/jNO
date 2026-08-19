@@ -54,7 +54,7 @@ def _x64():
 
 
 def _ring_topology(n: int) -> dict:
-    """One interior vertex patch of exactly ``n`` elements, in :meth:`patch_topology`'s layout.
+    """One interior vertex patch of exactly ``n`` elements, in :meth:`_patch_topology`'s layout.
 
     ``others[k]`` is the ring rotated to start at the element adjacent to ``k`` and excluding ``k``
     -- the same counterclockwise walk the real builder emits (``ring[q+1:] + ring[:q]``). ``size``
@@ -78,7 +78,7 @@ def _f_at(n: int, design) -> float:
     the criterion itself.
     """
     d = jno.Shape.rect(0, 0, 2, 1, size=1.0).domain()  # tiny; its own topology is replaced below
-    d.patch_topology = lambda: _ring_topology(n)
+    d._patch_topology = lambda: _ring_topology(n)
     r = np.asarray(design(n), dtype=float)
     assert r.shape == (n,), f"the probe must supply one density per patch element, got {r.shape}"
     return float(np.asarray(d.patch_filter()(r))[0] / max(r[0], 1e-300))
@@ -198,7 +198,7 @@ class TestTheHarnessIsFaithful:
         machine precision -- which is what pins the substitution.
         """
         d = jno.Shape.rect(0, 0, 2, 1, size=0.2).domain()
-        topo = d.patch_topology()
+        topo = d._patch_topology()
         n_cells = int(d._cells_p1().shape[0])
         k = int(np.where(~topo["boundary"].any(axis=1))[0][0])  # all three patches interior
 
@@ -217,5 +217,5 @@ class TestTheHarnessIsFaithful:
         """Why the topology has to be synthesised at all -- and why N=27 is a 3-D-only regime."""
         biggest = 0
         for size in (0.5, 0.25, 0.12):
-            biggest = max(biggest, int(jno.Shape.rect(0, 0, 2, 1, size=size).domain().patch_topology()["size"].max()))
+            biggest = max(biggest, int(jno.Shape.rect(0, 0, 2, 1, size=size).domain()._patch_topology()["size"].max()))
         assert biggest < 15, f"a 2-D triangulation reached a patch of {biggest}; the framing needs revisiting"
