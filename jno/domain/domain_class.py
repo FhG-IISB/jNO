@@ -3302,7 +3302,7 @@ class domain(MeshIOMixin):
             owner[miss], inside[miss] = o_m, in_m
         return np.where(inside, vals[owner], float(outside))
 
-    def interior_facets(self):
+    def _interior_facets(self):
         """Interior facets — those shared by exactly two cells. Edges in 2-D, triangles in 3-D.
 
         Returns a dict of host-side numpy arrays:
@@ -3326,7 +3326,7 @@ class domain(MeshIOMixin):
         cell_key = {2: "triangle", 3: "tetrahedron"}.get(dim)
         if cell_key is None or cells.shape[1] != dim + 1:
             raise NotImplementedError(
-                f"domain.interior_facets(): simplices in 2-D or 3-D; got {cells.shape[1]}-node cells in {dim}-D."
+                f"domain._interior_facets(): simplices in 2-D or 3-D; got {cells.shape[1]}-node cells in {dim}-D."
             )
         local_faces, n_face_nodes = _face_table(cell_key)
         lf = np.asarray([f[:n_face_nodes] for f in local_faces], dtype=np.int64)  # (n_local, n_fn)
@@ -3359,7 +3359,7 @@ class domain(MeshIOMixin):
         layout unbuildable, and leaves every other element untouched.
 
         Around each vertex of element ``k`` the elements form a patch, walked counterclockwise
-        (:meth:`patch_topology`). For that patch,
+        (:meth:`_patch_topology`). For that patch,
 
             f_k = [ prod_{i=2}^{N-2} { 1 - r_i (1 - mean(r_1..r_{i-1})) (1 - mean(r_{i+1}..r_{N-1})) }
                     * { 1 - r_k (1 - (r_1 + r_{N-1}) / 2) } ] ^ (1 / (N - 2))
@@ -3390,7 +3390,7 @@ class domain(MeshIOMixin):
         neighbourhood -- so it cannot be written inside the weak form, where the kernel sees one
         element at a time. That is why the physics route is a reparameterisation.
         """
-        topo = self.patch_topology()
+        topo = self._patch_topology()
         others = jnp.asarray(topo["others"], dtype=jnp.int32)  # (K, 3, M) with -1 padding
         n_int = jnp.asarray(topo["size"], dtype=jnp.int32)  # (K, 3)
         interior = jnp.asarray(~topo["boundary"])  # (K, 3)
@@ -3432,7 +3432,7 @@ class domain(MeshIOMixin):
 
         return _patch
 
-    def patch_topology(self):
+    def _patch_topology(self):
         """Node→element patches, ordered counterclockwise — the connectivity eq. (17)-(19) needs.
 
         For every triangle ``k`` and every one of its three vertices, returns the OTHER elements of
@@ -3456,7 +3456,7 @@ class domain(MeshIOMixin):
         pts = np.asarray(self.mesh.points)[:, : int(self.dimension)]
         if int(self.dimension) != 2 or cells.shape[1] != 3:
             raise NotImplementedError(
-                f"domain.patch_topology(): triangles in 2-D only; got {cells.shape[1]}-node cells "
+                f"domain._patch_topology(): triangles in 2-D only; got {cells.shape[1]}-node cells "
                 f"in {self.dimension}-D. The patch formulation is 2-D (paper, Sec. 2.3.2)."
             )
         n_cells = cells.shape[0]

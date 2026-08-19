@@ -304,7 +304,7 @@ class TestPatchFilter:
 
     def test_the_vectorised_filter_matches_the_literal_formula(self):
         d = jno.Shape.rect(0, 0, 2, 1, size=0.25).domain()
-        topo = d.patch_topology()
+        topo = d._patch_topology()
         n_cells = int(d._cells_p1().shape[0])
         assert topo["size"].max() >= 5, "the mesh must contain patches big enough to exercise eq. (18)"
         assert topo["boundary"].any() and (~topo["boundary"]).any(), "both branches must be covered"
@@ -355,7 +355,7 @@ class TestPatchFilter:
         is under 1 % of solid, which is why the paper also raises ``penal`` as it converges.
         """
         d = jno.Shape.rect(0, 0, 2, 1, size=0.2).domain()
-        topo = d.patch_topology()
+        topo = d._patch_topology()
         n_cells = int(d._cells_p1().shape[0])
         # Pick an element all of whose patches are interior, so no vertex takes the boundary rule.
         k = int(np.where(~topo["boundary"].any(axis=1))[0][0])
@@ -491,7 +491,7 @@ class TestPerimeter:
 
 
 class TestInteriorFacets:
-    """``interior_facets`` — edges in 2-D, triangles in 3-D, each shared by exactly two cells."""
+    """``_interior_facets`` — edges in 2-D, triangles in 3-D, each shared by exactly two cells."""
 
     @pytest.mark.parametrize(
         "shape, n_face_nodes",
@@ -500,7 +500,7 @@ class TestInteriorFacets:
     )
     def test_every_facet_is_shared_by_exactly_two_distinct_cells(self, shape, n_face_nodes):
         d = shape.domain()
-        f = d.interior_facets()
+        f = d._interior_facets()
         cells = np.asarray(d._cells_p1())
         assert f["nodes"].shape[1] == n_face_nodes
         assert f["cells"].shape == (f["nodes"].shape[0], 2)
@@ -523,7 +523,7 @@ class TestInteriorFacets:
         ):
             d = shape.domain()
             cells = np.asarray(d._cells_p1())
-            n_interior = d.interior_facets()["nodes"].shape[0]
+            n_interior = d._interior_facets()["nodes"].shape[0]
             n_boundary = int(build_facet_connectivity(cells, key).n_bfaces)
             # Each cell has n_local facets; an interior one is counted twice, a boundary one once.
             assert 2 * n_interior + n_boundary == n_local * cells.shape[0], (
@@ -536,7 +536,7 @@ class TestInteriorFacets:
         d = jno.domain(constructor=jno.domain.line(mesh_size=0.2))
         assert d.dimension == 1
         with pytest.raises(NotImplementedError, match="simplices in 2-D or 3-D"):
-            d.interior_facets()
+            d._interior_facets()
 
 
 class TestCrossMeshTransfer:

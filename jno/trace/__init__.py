@@ -2921,7 +2921,7 @@ class ModelCall(Placeholder):
             )
         import jno as _jno
 
-        facets = dom.interior_facets()
+        facets = dom._interior_facets()
         ecells = jnp.asarray(facets["cells"], dtype=jnp.int32)
         enodes = jnp.asarray(facets["nodes"], dtype=jnp.int32)
         args, rebuild = dom._moving_points()
