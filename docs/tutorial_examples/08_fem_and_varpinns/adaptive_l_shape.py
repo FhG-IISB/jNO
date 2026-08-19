@@ -187,10 +187,11 @@ mask_p = np.asarray(d_p._fem_enriched_nodes, dtype=bool)
 pts_p = np.asarray(d_p.mesh.points)[:, :2]
 
 # (4) hp -- the two composed across successive solves: refine the mesh, then enrich on it.
-#     NOTE a rough edge: `enrich` always starts from plain P1, so calling it on a field that was already
-#     uniformly `space="cover"` REMOVES enrichment before adding it back selectively -- the active DOF
-#     count goes DOWN at that call. That is the loop's design (there is no "start from what is there"),
-#     but it makes h-then-p read oddly unless you know it.
+#     NOTE a FRESH `enrich` starts from plain P1, so calling it on a field that was already uniformly
+#     `space="cover"` -- as this one is, since h ran on it first -- REMOVES enrichment before adding it
+#     back selectively, and the active DOF count goes DOWN at that call. A fresh cover field carries no
+#     mask, and a loop that began fully enriched would have nothing left to select; enrich called a
+#     SECOND time does resume from the mask it left.
 d_hp, fem_hp, stiff_hp = build(H, space="cover")
 fem_hp.solve(solve_fn, adapt=jno.solve.remesh(theta=0.6, max_iters=3, refine_factor=1.7))
 n_hp_after_h = active_dofs(d_hp, fem_hp)
