@@ -148,11 +148,14 @@ def test_an_unknown_parameter_name_is_refused_by_name():
         fem.solve(continuation=jno.solve.continuation(not_a_parameter=[0.0, 1.0]))
 
 
-def test_a_direct_newton_on_a_reduced_system_refuses_by_name():
-    """The driver hands the solver a residual and no assembled tangent, so the sparse-direct Newton
-    has nothing to factorize. It refuses clearly rather than solving something else -- but this is a
-    real limitation: `fem.solve` itself supports `newton(direct=True)` on a reduced system (it
-    reduces the tangent, PᵀJP), and this driver does not yet do the same."""
+def test_a_direct_newton_marches_a_reduced_system():
+    """A sparse-direct Newton must work UNDER a continuation, on a constraint-reduced system.
+
+    This is the pairing a stiff homotopy actually wants: reach a parameter value the cold solve
+    cannot, on a saddle where the matrix-free Newton has no preconditioner to converge with. The
+    march used to hand its driver a residual closure and nothing else -- no assembled tangent to
+    factorize -- so it refused outright. It now threads the tangent the way the steady path always
+    did, reduced by the same prolongation as the residual (PᵀJP)."""
     from jno.domain.geometries import Geometries
 
     mesh, _, _ = Geometries.equi_distant_box(nx=2, ny=2, nz=2)(None)
@@ -174,11 +177,17 @@ def test_a_direct_newton_on_a_reduced_system_refuses_by_name():
             p_.pin(),
         ]
     )
-    with pytest.raises(ValueError, match="ASSEMBLED Jacobian"):
-        fem.solve(
-            continuation=jno.solve.continuation(visc=[0.0, 1.0]),
-            nonlinear=jno.solve.newton(direct=True),
-        )
+    out = fem.solve(
+        continuation=jno.solve.continuation(visc=[0.0, 1.0]),
+        nonlinear=jno.solve.newton(direct=True),
+    )
+    out = np.asarray(out).reshape(-1)
+    assert out.shape[0] == int(fem.dofs)
+    assert np.all(np.isfinite(out))
+    # Solving is not the claim -- solving the RIGHT problem is. The march's last rung is visc=1.0, so
+    # the returned state must be a root of the residual THERE.
+    r = np.asarray(fem.residual(out, visc=1.0) if _residual_takes_values(fem) else fem.residual(out))
+    assert np.linalg.norm(r) < 1e-6 * max(1.0, np.linalg.norm(out))
 
 
 def test_a_stalled_rung_raises_naming_the_rung():
@@ -208,3 +217,14 @@ def test_stats_describe_the_last_rung_not_a_stale_entry():
     assert st["driver"] == "continuation/newton", st
     assert st["converged"] is True
     assert st["residual"] <= st["bound"], st
+
+
+def _residual_takes_values(fem):
+    """`fem.residual` accepts parameter values only on a parametric problem."""
+    import inspect
+
+    try:
+        inspect.signature(fem.residual).bind(np.zeros(int(fem.dofs)), visc=1.0)
+        return True
+    except TypeError:
+        return False
