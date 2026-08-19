@@ -119,8 +119,18 @@ E   = lambda r: EMIN + r**penal_p * (E0 - EMIN)
 
 fem        = jno.fem([E(rho) * a(eps(u), eps(phi)), ...])
 compliance = (E(rho) * a(eps(u), eps(u))).integrate(fem)
-volume     = (rho * cellv).sum / (VOLFRAC * cellv.sum)     # NOT an .integrate(fem) — see below
+rho_e      = rho.reshape(-1)                                 # (n_cells, 1) -> (n_cells,); see below
+volume     = (rho_e * cellv).sum / (VOLFRAC * cellv.sum)     # NOT an .integrate(fem) — see below
 ```
+
+!!! warning "`reshape(-1)` is load-bearing, and omitting it fails silently"
+    A P0 parameter evaluates to `(n_cells, 1)` while `cell_volume()` is `(n_cells,)`, so
+    `rho * cellv` broadcasts to an `(n_cells, n_cells)` **outer product** whose `.sum` is
+    `n_cells` times too large. Nothing raises — it is a valid shape. The volume constraint then
+    reads as satisfied at a design carrying almost no material, and compliance climbs instead of
+    falling. Measured on a 128-cell 2-D problem: the constraint reported `1.0000` while the design
+    it accepted had a volume fraction of `0.0078`, and compliance ran to `4.5e4` against the `18.6`
+    the flattened form reaches on the same 12 iterations.
 
 `.integrate(fem)` inherits the quadrature the operator was assembled with, so this equals `f·u`
 exactly rather than to within a quadrature error nothing reports. The `fem` is named because it is
