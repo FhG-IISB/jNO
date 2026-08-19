@@ -3451,8 +3451,7 @@ class domain(MeshIOMixin):
             return self._edge_fan_topology(cells)
         if dim != 2 or cells.shape[1] != 3:
             raise NotImplementedError(
-                f"domain._patch_topology(): simplices in 2-D or 3-D; got {cells.shape[1]}-node cells "
-                f"in {dim}-D."
+                f"domain._patch_topology(): simplices in 2-D or 3-D; got {cells.shape[1]}-node cells in {dim}-D."
             )
         pts = np.asarray(self.mesh.points)[:, :dim]
         n_cells = cells.shape[0]

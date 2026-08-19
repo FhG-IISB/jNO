@@ -174,10 +174,22 @@ Measured on the 3-D cantilever, per design iteration, against the default:
 
 The margin grows with the mesh because the two scale differently on this operator — the default's
 SuperLU costs $O(n^{1.9})$ against PARDISO's $O(n^{1.55})$ — so it is worth most exactly where it is
-needed. In a 30-minute budget that is the difference between **~275 iterations at 14k elements and
-~650 at 65k**. Two reasons the headroom is there: the stiffness is symmetric positive definite (to
+needed. Two reasons the headroom is there: the stiffness is symmetric positive definite (to
 $5.6\times10^{-17}$) while the default throws a general LU at it, and the default re-runs its
 symbolic analysis every call.
+
+!!! warning "`backend="pardiso"` is not usable with the patch filter yet"
+    Those timings are measured on **plain SIMP with a volume constraint** — no
+    `rho.constrain(d.patch_filter())`. With the patch filter in place the PARDISO backend aborts the
+    process with a glibc `double free or corruption`, at every mesh size tried. Controlled A/B, with
+    no CUDA device visible: pardiso alone works, the filter alone works under the default backend,
+    the *pair* dies. It is not the GPU, not MKL threading, not `pure_callback` concurrency, not the
+    adjoint/transpose path, and not cache eviction — each was checked and ruled out; the cause is
+    still open.
+
+    So on a **design** run today the default backend is the one that works, and the speed-up above
+    is available only to problems that do not reparameterise their density. That is what bounds a
+    30-minute run to roughly **14k elements at ~350 iterations** rather than 65k.
 
 An **iterative** solver is not the answer here, which is worth stating because it is the usual
 advice at this size: smoothed-aggregation AMG with elasticity's near-nullspace converges fine
