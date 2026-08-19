@@ -781,14 +781,17 @@ class Shape:
         return tuple(float(v) for v in lo), tuple(float(v) for v in hi)
 
     def is_analytic(self) -> bool:
-        """Whether membership and extent are available in closed form (no gmsh needed)."""
+        """Whether this plan can be sampled with no gmsh at all.
+
+        All three of extent, membership and a boundary sampler have to be closed-form: a shape that
+        knows where it is but cannot produce a point on its own surface is no use to a PINN, which
+        needs boundary collocation as much as interior. A plan that fails any of them keeps the
+        eager meshing path rather than being half-served.
+        """
         try:
             _node_bounds(self._node)
-        except NotImplementedError:
-            return False
-        probe = np.zeros((1, 3))
-        try:
-            _node_contains(self._node, probe, 0.0)
+            _node_contains(self._node, np.zeros((1, 3)), 0.0)
+            _node_boundary_pieces(self._node)
         except NotImplementedError:
             return False
         return True

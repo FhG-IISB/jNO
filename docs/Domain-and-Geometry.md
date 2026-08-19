@@ -348,6 +348,52 @@ For 2-D/3-D geometry build the shape with `Shape` — `Shape.rect(...).domain()`
 
 ---
 
+## Mesh-free sampling — what a PINN actually needs
+
+`shape.domain()` does **not** mesh. A `Shape` knows its own extent, its own membership test and its
+own boundary in closed form, so collocation points are drawn from the geometry directly:
+
+```python
+d = jno.Shape.box(0, 0, 0, 1, 1, 1).domain()          # no gmsh, in 1-D, 2-D or 3-D
+x, y, z, t = d.variable("interior", sample=(20_000, None), split=True)
+```
+
+Two things differ from sampling a mesh. `20_000` means twenty thousand — there is no node set to be
+clipped to — and every draw is **fresh**, so an adaptive strategy explores the region instead of
+reshuffling one fixed cloud. Tagging is unchanged, and works on the boundary as well as the interior:
+
+```python
+d.tag("hot",   lambda x, y, z: (x-.5)**2 + (y-.5)**2 + (z-.5)**2 < .04)   # a lump of interior
+d.tag("inlet", lambda x, y, z: x < 1e-9)                                  # a face
+bx, by, bz, t, nx, ny, nz = d.variable("inlet", sample=(500, None), normals=True, split=True)
+```
+
+Which of the two a predicate means is *measured* — jNO draws from both and sees which one it accepts
+— because a boundary predicate applied to an interior draw matches nothing and would look like an
+empty region. Boundary points land on the analytic surface, so a disk's samples lie on the circle to
+machine precision with exactly radial normals, not on a chord with a per-facet normal. The
+primitives' auto-names (`left`, `arc`, `surface`, …) are available before any mesh exists.
+
+!!! note "When a mesh does get built"
+    Some things are defined *on* a mesh, not on the geometry: `jno.fem` and `fem_symbols()`,
+    `.integrate()`, the finite-difference schemes, `.points` / `normals_by_tag` / `tag_indices`, and
+    a facet predicate `f(x, n, names)`. Reading any of them builds the mesh once, and says so:
+
+    ```
+    INFO: _fem.__init__ needs a mesh; this domain was mesh-free — building it now.
+    ```
+
+    Nothing you write has to change; a tag declared while mesh-free gains its mesh-derived half at
+    that point.
+
+!!! warning "Plans that stay eager"
+    A plan is mesh-free only if its extent, its membership **and** its boundary are all closed-form.
+    These are not, and mesh at construction as before rather than being half-served: `sweep` and
+    `fillet` (no analytic membership — `fillet` removes material near edges, so recursing to the
+    child would answer for the un-filleted solid); `revolve` (membership yes, analytic boundary
+    sampler not yet); `.name(...)` / `Shape.regions(...)` (region and interface tags are the
+    mesher's conforming sub-bodies); and `.structured()` (already a lattice).
+
 ## Sampling, time, and batching
 
 ```python
@@ -355,6 +401,10 @@ x, y, z, t = d.variable("interior")                        # all interior mesh n
 x, y, z, t = d.variable("interior", sample=(500, None))    # 500 sampled points
 xb, yb, zb, tb, nx, ny, nz = d.variable("top", normals=True, split=True)   # boundary + outward normals
 ```
+
+On a **mesh-free** domain the first line means something different: with no count there is no node
+set to hand back, so it is one point redrawn every step (the convention `jno.domain.poly` already
+uses). Pass an explicit `sample=(n, None)` when you want a fixed number.
 
 `variable` always returns a trailing time coordinate `t` (a constant for steady domains), so a 3-D
 domain unpacks as `(x, y, z, t)`. Time-dependent domains take `time=(t0, t1, n)`; `variable("initial")`
