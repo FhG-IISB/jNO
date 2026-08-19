@@ -62,10 +62,16 @@ class TestClosedForms:
         assert np.allclose(np.degrees(ang[0]), 60.0, atol=1e-6)
         assert vol[0] == pytest.approx(np.sqrt(3) / 4, abs=1e-10)
 
-    def test_cell_angles_is_two_dimensional_only(self):
+    def test_cell_angles_gives_dihedrals_on_a_tetrahedral_mesh(self):
+        """One name, both dimensions: 3 interior angles per triangle, 6 dihedrals per tet.
+
+        The dispatch is on the dimension rather than on an argument, so a mesh-quality constraint is
+        the same expression in 2-D and 3-D — which is the whole reason this is not a second method.
+        """
         d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.6).domain()
-        with pytest.raises(NotImplementedError, match="triangles only"):
-            d.cell_angles()
+        ang = np.asarray(d.cell_angles().eval())
+        assert ang.shape == (d._cells_p1().shape[0], 6)
+        assert ang.min() > 0.0 and ang.max() < PI
 
 
 class TestPnorm:
@@ -292,7 +298,7 @@ class TestLogBarrier:
 
 
 class TestDihedralAngles:
-    """``cell_dihedrals`` — the 3-D mesh-quality quantity, and the reason it is not ``cell_angles``.
+    """``cell_angles`` — the 3-D mesh-quality quantity, and the reason it is not ``cell_angles``.
 
     Jung, Yun & Kim, *Computers & Structures* **331** (2026) 108403, Sec. 2.3.3. Their eq. (21)/(24)
     bounds a triangle's minimum interior angle; on a tetrahedron the same job needs the dihedral,
@@ -317,7 +323,7 @@ class TestDihedralAngles:
     def test_a_regular_tetrahedron_is_arccos_one_third(self, tmp_path):
         """The exact oracle: every dihedral of a regular tet is ``arccos(1/3)`` = 70.5288 degrees."""
         r = self._one_tet(tmp_path, [(1, 1, 1), (1, -1, -1), (-1, 1, -1), (-1, -1, 1)])
-        ang = np.asarray(r.cell_dihedrals().eval())
+        ang = np.asarray(r.cell_angles().eval())
         assert ang.shape == (1, 6), "a tet has six edges, so six dihedrals"
         np.testing.assert_allclose(ang[0], np.arccos(1.0 / 3.0), atol=1e-12)
 
@@ -328,7 +334,7 @@ class TestDihedralAngles:
         and a minimum-angle bound alone permits a cap.
         """
         d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
-        s = np.asarray(d.cell_dihedrals().eval()).sum(axis=1) / PI
+        s = np.asarray(d.cell_angles().eval()).sum(axis=1) / PI
         assert s.min() > 2.0 and s.max() < 3.0, f"sums must lie in (2pi, 3pi), got [{s.min()}, {s.max()}]"
         assert s.max() - s.min() > 0.02, (
             f"the sum must genuinely VARY or the 2-D argument would carry over after all; "
@@ -344,7 +350,7 @@ class TestDihedralAngles:
         """
         eps = 1e-3
         sliver = self._one_tet(tmp_path, [(0, 0, 0), (1, 0, 0), (0, 1, 0), (1, 1, eps)])
-        ang = np.degrees(np.asarray(sliver.cell_dihedrals().eval())[0])
+        ang = np.degrees(np.asarray(sliver.cell_angles().eval())[0])
         assert ang.min() < 1.0, f"a sliver's smallest dihedral must collapse, got {ang.min():.3f} deg"
         assert ang.max() > 179.0, f"and its largest must approach 180, got {ang.max():.3f} deg"
 
@@ -368,7 +374,7 @@ class TestDihedralAngles:
         dihedrals stay away from 0 and pi. ``cell_aspect`` is what sees it.
         """
         needle = self._one_tet(tmp_path, [(0, 0, 0), (0.02, 0, 0), (0.01, 0.017, 0), (0.01, 0.006, 3.0)])
-        ang = np.degrees(np.asarray(needle.cell_dihedrals().eval())[0])
+        ang = np.degrees(np.asarray(needle.cell_angles().eval())[0])
         assert ang.min() > 5.0 and ang.max() < 175.0, f"a needle's dihedrals stay moderate, got {ang}"
         assert float(np.asarray(needle.cell_aspect().eval())[0]) > 20.0, (
             "but cell_aspect must flag it, or neither measure covers the needle"
@@ -407,17 +413,19 @@ class TestDihedralAngles:
         fd = float((worst(X0.at[i].add(h)) - worst(X0.at[i].add(-h))) / (2 * h))
         assert g[i] == pytest.approx(fd, rel=1e-5)
 
-    def test_it_is_three_dimensional_only(self):
-        d = jno.Shape.rect(0, 0, 2, 1, size=0.5).domain()
-        with pytest.raises(NotImplementedError, match="tetrahedra only"):
-            d.cell_dihedrals()
+    def test_a_one_dimensional_domain_is_refused(self):
+        """An interval has no angle to measure; 2-D and 3-D are the whole supported range."""
+        d = jno.domain(constructor=jno.domain.line(mesh_size=0.2))
+        assert d.dimension == 1
+        with pytest.raises(NotImplementedError, match="simplices in 2-D or 3-D"):
+            d.cell_angles()
 
     def test_the_constraint_form_is_expressible_and_feasible(self):
         """The paper's eq. (24) shape, written on dihedrals: a sound mesh must satisfy g <= 1."""
         d = jno.Shape.box(0, 0, 0, 2, 1, 1, size=0.4).domain()
         theta_min = np.radians(10.0)
-        g = ((PI - d.cell_dihedrals()) / (PI - theta_min)).pnorm(50, normalize=True)
+        g = ((PI - d.cell_angles()) / (PI - theta_min)).pnorm(50, normalize=True)
         val = float(np.asarray(g.eval()))
-        worst = float(np.asarray(d.cell_dihedrals().eval()).min())
+        worst = float(np.asarray(d.cell_angles().eval()).min())
         assert val < 1.02, f"g = {val} on a mesh whose smallest dihedral is {np.degrees(worst):.2f} deg"
         assert np.degrees(worst) > 5.0
