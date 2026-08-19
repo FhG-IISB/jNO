@@ -3229,31 +3229,52 @@ class domain(MeshIOMixin):
             owner[miss], inside[miss] = o_m, in_m
         return np.where(inside, vals[owner], float(outside))
 
-    def interior_edges(self):
-        """Interior facets — the edges shared by exactly two triangles.
+    def interior_facets(self):
+        """Interior facets — those shared by exactly two cells. Edges in 2-D, triangles in 3-D.
 
         Returns a dict of host-side numpy arrays:
-            ``cells`` ``(n_edges, 2)`` int — the two triangles meeting at each edge.
-            ``nodes`` ``(n_edges, 2)`` int — the edge's two endpoints, for its length.
+            ``cells`` ``(n_facets, 2)`` int — the two cells meeting at each facet.
+            ``nodes`` ``(n_facets, n_face_nodes)`` int — the facet's corner nodes, for its measure
+            (2 in 2-D, giving a length; 3 in 3-D, giving a triangle area).
 
-        Boundary edges are excluded: they carry no density jump, since there is no element on the
+        Boundary facets are excluded: they carry no density jump, since there is no element on the
         far side. This is the traversal a perimeter functional needs (Haber, Jog & Bendsoe,
-        *Struct. Optim.* **11**, 1996, 1-12).
+        *Struct. Optim.* **11**, 1996, 1-12) — in 3-D the same functional measures the material
+        boundary's AREA rather than a length, which is what its target has to be given in.
+
+        Named for the facet rather than the edge because that is the dimension-generic word, and the
+        one :mod:`jno.utils.solver.fem_facets` already uses; the local-face tables come from there
+        (:func:`_face_table`) rather than being written out again per cell type.
         """
-        cells = self._cells_p1()
-        if int(self.dimension) != 2 or cells.shape[1] != 3:
+        from jno.utils.solver.fem_facets import _face_table
+
+        cells = np.asarray(self._cells_p1(), dtype=np.int64)
+        dim = int(self.dimension)
+        cell_key = {2: "triangle", 3: "tetrahedron"}.get(dim)
+        if cell_key is None or cells.shape[1] != dim + 1:
             raise NotImplementedError(
-                f"domain.interior_edges(): triangles in 2-D only; got {cells.shape[1]}-node cells in {self.dimension}-D."
+                f"domain.interior_facets(): simplices in 2-D or 3-D; got {cells.shape[1]}-node cells in {dim}-D."
             )
-        seen: dict = {}
-        for k, tri in enumerate(cells):
-            for a, b in ((0, 1), (1, 2), (2, 0)):
-                key = (int(min(tri[a], tri[b])), int(max(tri[a], tri[b])))
-                seen.setdefault(key, []).append(k)
-        keys = [e for e, ks in seen.items() if len(ks) == 2]
+        local_faces, n_face_nodes = _face_table(cell_key)
+        lf = np.asarray([f[:n_face_nodes] for f in local_faces], dtype=np.int64)  # (n_local, n_fn)
+        n_cells, n_local = cells.shape[0], lf.shape[0]
+
+        # Canonical key per (cell, local facet): the sorted corner ids, so the two cells sharing a
+        # facet produce the same row whatever order they list it in.
+        keys = np.sort(cells[:, lf], axis=-1).reshape(n_cells * n_local, n_face_nodes)
+        uniq, inverse, counts = np.unique(keys, axis=0, return_inverse=True, return_counts=True)
+        inverse = np.asarray(inverse).ravel()
+
+        # The two owners of each shared facet: order the slots by facet id, then a facet used twice
+        # occupies two adjacent positions. A stable sort keeps that pair in cell order.
+        slot_cell = np.repeat(np.arange(n_cells, dtype=np.int64), n_local)
+        order = np.argsort(inverse, kind="stable")
+        cell_sorted = slot_cell[order]
+        starts = np.searchsorted(inverse[order], np.arange(len(uniq), dtype=np.int64))
+        shared = np.where(counts == 2)[0]
         return {
-            "cells": np.asarray([seen[e] for e in keys], dtype=np.int64),
-            "nodes": np.asarray(keys, dtype=np.int64),
+            "cells": np.stack([cell_sorted[starts[shared]], cell_sorted[starts[shared] + 1]], axis=1),
+            "nodes": uniq[shared],
         }
 
     def patch_filter(self):

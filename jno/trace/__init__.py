@@ -2882,10 +2882,14 @@ class ModelCall(Placeholder):
 
             P = sum_k  l_k * ( sqrt( (1 + 2 zeta) <rho>_k^2 + zeta^2 ) - zeta )
 
-        over the **interior** edges, with ``<rho>_k`` the density jump across edge ``k`` and
-        ``l_k`` its length. The bracket is a smoothed ``|<rho>|``: it is exactly 0 for no jump and
-        exactly 1 for a full one, so ``P`` measures the total length of the material boundary while
+        over the **interior facets**, with ``<rho>_k`` the density jump across facet ``k`` and
+        ``l_k`` its measure. The bracket is a smoothed ``|<rho>|``: it is exactly 0 for no jump and
+        exactly 1 for a full one, so ``P`` measures the total extent of the material boundary while
         staying differentiable where a bare absolute value would not be.
+
+        **In 3-D this is an AREA.** The facets are triangles rather than edges and ``l_k`` is their
+        area, so ``P`` has units of length squared and a target ``P*`` has to be given in them; the
+        formula, the smoothing and the barrier are otherwise unchanged.
 
         This is the **feature-scale** lever, and the one constraint here that is about
         manufacturability rather than mesh validity. A design fragmented into many thin members has
@@ -2902,7 +2906,7 @@ class ModelCall(Placeholder):
         Evaluated on whatever this parameter currently *is* — under
         ``rho.constrain(d.patch_filter())`` that is the physical density, which is the field whose
         boundary one actually wants to measure. Differentiable in the density **and** in the mesh,
-        since the edge lengths come from the moving vertices.
+        since the facet measures come from the moving vertices.
 
         Args:
             zeta: Smoothing parameter; the paper uses 0.1. Smaller is a sharper approximation to
@@ -2917,19 +2921,28 @@ class ModelCall(Placeholder):
             )
         import jno as _jno
 
-        edges = dom.interior_edges()
-        ecells = jnp.asarray(edges["cells"], dtype=jnp.int32)
-        enodes = jnp.asarray(edges["nodes"], dtype=jnp.int32)
+        facets = dom.interior_facets()
+        ecells = jnp.asarray(facets["cells"], dtype=jnp.int32)
+        enodes = jnp.asarray(facets["nodes"], dtype=jnp.int32)
         args, rebuild = dom._moving_points()
         z = float(zeta)
+        n_fn = int(enodes.shape[1])  # 2 = edge (2-D), 3 = triangle (3-D)
 
         def _perimeter(rv, *coord_vals):
             r = jnp.asarray(rv).reshape(-1)
             pts = rebuild(*coord_vals)
-            length = jnp.linalg.norm(pts[enodes[:, 0]] - pts[enodes[:, 1]], axis=-1)
+            # The facet's MEASURE: a length across an edge in 2-D, a triangle's area in 3-D. Both
+            # are read off the moving coordinates, so P stays differentiable in the mesh as well as
+            # in the density.
+            if n_fn == 2:
+                measure = jnp.linalg.norm(pts[enodes[:, 0]] - pts[enodes[:, 1]], axis=-1)
+            else:
+                e1 = pts[enodes[:, 1]] - pts[enodes[:, 0]]
+                e2 = pts[enodes[:, 2]] - pts[enodes[:, 0]]
+                measure = 0.5 * jnp.linalg.norm(jnp.cross(e1, e2), axis=-1)
             jump = r[ecells[:, 0]] - r[ecells[:, 1]]
             smooth = jnp.sqrt((1.0 + 2.0 * z) * jump**2 + z * z) - z
-            return jnp.sum(length * smooth)
+            return jnp.sum(measure * smooth)
 
         return _jno.fn(_perimeter, [self, *args], name="perimeter")
 

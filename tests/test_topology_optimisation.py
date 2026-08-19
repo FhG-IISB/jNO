@@ -439,6 +439,105 @@ class TestPerimeter:
         with pytest.raises(TypeError, match="P0"):
             jno.np.parameter(s, name="rho_nodal_p").perimeter()
 
+    # --- tetrahedra. In 3-D the interior facets are triangles, so the same functional measures the
+    # --- material boundary's AREA; the formula, the smoothing and the barrier are unchanged.
+
+    @staticmethod
+    def _setup_3d(size=0.5, lx=4.0, ly=2.0, lz=4.0):
+        d = jno.Shape.box(0, 0, 0, lx, ly, lz, size=size).domain()
+        _r, s = d.fem_symbols(space="P0", names=("r", "s"))
+        rho = jno.np.parameter(s, name="rho_perim_3d")
+        cells = np.asarray(d._cells_p1())
+        centroids = np.asarray(d.mesh.points)[:, :3][cells].mean(axis=1)
+        return d, rho.perimeter(zeta=0.1).fn, cells.shape[0], centroids
+
+    def test_a_uniform_density_has_no_perimeter_on_tets(self):
+        _d, p, n_cells, _c = self._setup_3d()
+        for value in (0.0, 0.4, 1.0):
+            assert float(p(jnp.full(n_cells, value))) == pytest.approx(0.0, abs=1e-12)
+
+    def test_a_slab_measures_its_own_interface_area(self):
+        """A slab spanning the full x-y extent has two interfaces of area ``lx * ly``, so the flat
+        answer is ``2 * 4 * 2 = 16``.
+
+        The measured value is ~1.6x that, and **the mesh-independence is the assertion**, not the
+        band. A triangulated interface stepping between tets is genuinely larger than the plane it
+        approximates -- the 3-D version of a 2-D bar measuring above 120 -- and it does not converge
+        to the flat area under refinement, it converges to a constant multiple of it. What WOULD
+        move with the mesh is a miscount: including boundary facets, or double-counting shared ones,
+        makes P scale with the facet count. Measured 1.60 / 1.64 / 1.51 / 1.62 at h = 0.8 / 0.5 /
+        0.35 / 0.25, across a 22x range in tet count (410 -> 9035), so the ratio is pinned and the
+        count is not.
+        """
+        ratios = []
+        for h in (0.8, 0.35):
+            _d, p, _n, centroids = self._setup_3d(size=h)
+            slab = np.where(np.abs(centroids[:, 2] - 2.0) < 1.0, 1.0, 0.0)
+            assert 0.1 < slab.mean() < 0.9, "the slab must be a real subset for this to measure anything"
+            ratios.append(float(p(jnp.asarray(slab))) / 16.0)
+        assert all(1.2 < r < 2.2 for r in ratios), f"a full-width slab should measure ~1.6 x 16, got {ratios}"
+        assert abs(ratios[0] - ratios[1]) < 0.35, (
+            f"the interface area must not track the mesh: {ratios[0]:.3f} vs {ratios[1]:.3f} at a "
+            "8.5x change in tet count — a facet miscount is what would scale"
+        )
+
+    def test_a_fragmented_layout_costs_more_area_than_a_compact_one_on_tets(self):
+        _d, p, n_cells, centroids = self._setup_3d()
+        rng = np.random.default_rng(0)
+        slab = np.where(np.abs(centroids[:, 2] - 2.0) < 1.0, 1.0, 0.0)
+        scattered = np.zeros(n_cells)
+        scattered[rng.choice(n_cells, int(slab.sum()), replace=False)] = 1.0
+        assert float(p(jnp.asarray(scattered))) > 3.0 * float(p(jnp.asarray(slab)))
+
+
+class TestInteriorFacets:
+    """``interior_facets`` — edges in 2-D, triangles in 3-D, each shared by exactly two cells."""
+
+    @pytest.mark.parametrize(
+        "shape, n_face_nodes",
+        [(jno.Shape.rect(0, 0, 2, 1, size=0.4), 2), (jno.Shape.box(0, 0, 0, 2, 1, 1, size=0.5), 3)],
+        ids=["triangles", "tets"],
+    )
+    def test_every_facet_is_shared_by_exactly_two_distinct_cells(self, shape, n_face_nodes):
+        d = shape.domain()
+        f = d.interior_facets()
+        cells = np.asarray(d._cells_p1())
+        assert f["nodes"].shape[1] == n_face_nodes
+        assert f["cells"].shape == (f["nodes"].shape[0], 2)
+        assert f["nodes"].shape[0] > 0, "a mesh this size has interior facets"
+        assert (f["cells"][:, 0] != f["cells"][:, 1]).all(), "a facet cannot be shared with itself"
+        # Every listed facet's nodes must actually belong to BOTH of its cells — the property that
+        # would break first if the owner pairing were mis-assembled by the sort.
+        for side in (0, 1):
+            owner_nodes = cells[f["cells"][:, side]]
+            assert np.all([np.isin(f["nodes"][i], owner_nodes[i]).all() for i in range(len(f["nodes"]))])
+
+    def test_boundary_facets_are_excluded(self):
+        """Counted against the boundary connectivity jNO already builds, so the two agree on what a
+        boundary facet is rather than this test defining it a second time."""
+        from jno.utils.solver.fem_facets import build_facet_connectivity
+
+        for shape, key, n_local in (
+            (jno.Shape.rect(0, 0, 2, 1, size=0.4), "triangle", 3),
+            (jno.Shape.box(0, 0, 0, 2, 1, 1, size=0.5), "tetrahedron", 4),
+        ):
+            d = shape.domain()
+            cells = np.asarray(d._cells_p1())
+            n_interior = d.interior_facets()["nodes"].shape[0]
+            n_boundary = int(build_facet_connectivity(cells, key).n_bfaces)
+            # Each cell has n_local facets; an interior one is counted twice, a boundary one once.
+            assert 2 * n_interior + n_boundary == n_local * cells.shape[0], (
+                f"{key}: {n_interior} interior + {n_boundary} boundary does not tile "
+                f"{n_local * cells.shape[0]} cell-facet slots"
+            )
+
+    def test_a_one_dimensional_domain_is_refused(self):
+        """An interval's facets are its vertices, which carry no measure for a perimeter to sum."""
+        d = jno.domain(constructor=jno.domain.line(mesh_size=0.2))
+        assert d.dimension == 1
+        with pytest.raises(NotImplementedError, match="simplices in 2-D or 3-D"):
+            d.interior_facets()
+
 
 class TestCrossMeshTransfer:
     """``transfer_cell_field`` — the machinery a reanalysis needs.
