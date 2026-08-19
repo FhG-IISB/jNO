@@ -2465,7 +2465,7 @@ class FEM:
         quadrature error nothing would report."""
         return jnp.asarray(self._functional_fn(terms, bares)(jnp.asarray(u).reshape(-1), 0.0, args)).reshape(())
 
-    def _integral_node(self, expr):
+    def _integral_node(self, expr, solver=None):
         """``expr.integrate(fem)`` — the traced form of the scalar :meth:`eval` returns eagerly.
 
         This is the objective/constraint entry point: the returned node is a scalar, so it drops straight
@@ -2502,23 +2502,39 @@ class FEM:
         fn = self._functional_fn([expr], [bare])  # host side: classify the measure, retag, build once
         names = list(declared)
         params = [declared[n] for n in names]
-        sol = self._functional_solution()
+        sol = self._functional_solution(solver)
 
         def _run(u, *vals):
             return jnp.asarray(fn(jnp.asarray(u).reshape(-1), 0.0, dict(zip(names, vals)))).reshape(())
 
         return FunctionCall(_run, [sol, *params], name="fem_integral")
 
-    def _functional_solution(self):
+    def _functional_solution(self, solver=None):
         """The one solve every functional over this system shares.
 
         Memoised on purpose: ``solve()`` builds a NEW node on each call and CSE keys unrecognised nodes by
         identity, so an objective and three constraints written as four integrals would otherwise solve
-        the same system four times per step."""
+        the same system four times per step.
+
+        ``solver`` is the slot spec from ``expr.integrate(fem, solver=...)``. Because the solve is
+        SHARED, the choice belongs to the system rather than to any one integral -- so the first
+        functional fixes it and a later, different one is refused rather than silently ignored, which
+        is what would otherwise happen to a constraint that asked for a backend the objective had
+        already settled.
+        """
         sol = getattr(self, "_functional_sol", None)
-        if sol is None:
-            sol = self.solve()
-            self._functional_sol = sol
+        if sol is not None:
+            prev = getattr(self, "_functional_solver", None)
+            if solver is not None and prev is not solver:
+                raise ValueError(
+                    "expr.integrate(fem, solver=...): every functional over one `fem` shares a single "
+                    f"solve, and this one is already {'set to another spec' if prev is not None else 'using the default solver'}"
+                    ". Pass the same solver to the first integral over this system (or to none of "
+                    "them), rather than per-integral."
+                )
+            return sol
+        self._functional_solver = solver
+        self._functional_sol = sol = self.solve() if solver is None else self.solve(solver)
         return sol
 
     def _functional_fn(self, terms, bares):

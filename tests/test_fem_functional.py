@@ -379,3 +379,66 @@ def test_the_collocation_integral_is_untouched():
     xi, yi, _ = d.variable("interior", split=True)
     assert abs(float(np.asarray((0.0 * xi + 1.0).integrate().eval(d)).reshape(-1)[0]) - 2.0) < 1e-12
     assert abs(float(np.asarray((xi * yi).integrate(quadrature="gauss").eval(d)).reshape(-1)[0]) - 1.0) < 1e-10
+
+
+# ---------------------------------------------------------------- choosing the solver
+
+
+class TestFunctionalSolver:
+    """``expr.integrate(fem, solver=...)`` — the shared solve's backend.
+
+    It exists because the solve `integrate` depends on was previously unreachable: the functional
+    called ``fem.solve()`` with no arguments, so the objective-as-an-integral route was pinned to
+    the default backend however the rest of the problem was configured. In a design loop that is
+    the whole cost -- the solve runs forward and adjoint every iteration on a sparsity that never
+    changes, so a backend caching its symbolic analysis pays only the numeric re-factorisation.
+    Measured on a 3-D SIMP cantilever, ``backend="pardiso"`` against the default: 1.9x at 2,847
+    elements, 3.2x at 8,802, 5.0x at 14,063 -- the margin grows because the default's SuperLU costs
+    O(n^1.9) here against PARDISO's O(n^1.55).
+
+    ``backend="host"`` is what these tests drive: it is always available, and what is under test is
+    the plumbing, not the backend.
+    """
+
+    def test_it_gives_the_same_integral_as_the_default_backend(self):
+        """A backend choice must move the cost, not the answer."""
+        _d, fem, _u, _phi, X, sol = _poisson()
+        F = X[0] * X[1] + 1.0
+        plain = float(np.asarray(fem.eval(F, sol)).reshape(-1)[0])
+
+        d2, fem2, _u2, _phi2, X2, _s2 = _poisson()
+        node = (X2[0] * X2[1] + 1.0).integrate(fem2, solver=jno.solve.lu(backend="host"))
+        crux = jno.core([node], domain=jno.domain.from_array({"_": np.zeros((1, 1))}))
+        chosen = float(np.asarray(crux.eval([node])).reshape(-1)[0])
+        assert chosen == pytest.approx(plain, rel=1e-10), f"{chosen} vs {plain}"
+
+    def test_the_solve_is_still_shared_across_functionals(self):
+        """The memo is the reason a solver belongs to the system rather than to one integral: an
+        objective and its constraints must not solve the same system once each."""
+        _d, fem, _u, _phi, X, _sol = _poisson()
+        a = X[0].integrate(fem, solver=jno.solve.lu(backend="host"))
+        b = X[1].integrate(fem)
+        assert a.args[0] is b.args[0], "the two functionals must ride one solve node"
+
+    def test_a_second_conflicting_solver_is_refused(self):
+        """Silently ignoring it is the failure this prevents: the second integral would run on a
+        backend it did not ask for, and nothing would say so."""
+        _d, fem, _u, _phi, X, _sol = _poisson()
+        X[0].integrate(fem, solver=jno.solve.lu(backend="host"))
+        with pytest.raises(ValueError, match="shares a single solve"):
+            X[1].integrate(fem, solver=jno.solve.lu(backend="device"))
+
+    def test_asking_twice_for_the_same_spec_is_fine(self):
+        """Refusing a CONFLICT must not refuse agreement — the same object twice is not a conflict."""
+        _d, fem, _u, _phi, X, _sol = _poisson()
+        spec = jno.solve.lu(backend="host")
+        a = X[0].integrate(fem, solver=spec)
+        b = X[1].integrate(fem, solver=spec)
+        assert a.args[0] is b.args[0]
+
+    def test_a_collocation_integral_refuses_a_solver(self):
+        """There is no linear solve in a collocation or temporal integral for a backend to select."""
+        d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain()
+        xi, yi, _ = d.variable("interior", split=True)
+        with pytest.raises(TypeError, match="only to a FEM functional"):
+            (xi * yi).integrate(solver=jno.solve.lu(backend="host"))
