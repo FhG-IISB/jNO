@@ -152,6 +152,39 @@ own reduction over the DOF vector. As integrals, a stress constraint
 (`((sigma_vm/SIG_Y)**p).integrate(fem)`), a compliant mechanism's output displacement, and multiple
 load cases are all the same one construct.
 
+### Pick the solver — in 3-D it is most of the run
+
+`integrate(fem, solver=...)` selects the backend for the solve every functional over that `fem`
+shares. It is the single biggest lever on a design loop, because the solve runs once forward and
+once adjoint per iteration on a **sparsity that never changes** — relocation moves nodes, not
+connectivity — so a backend that caches its symbolic analysis pays only the numeric
+re-factorisation:
+
+```python
+C = (E(rho) * a(eps(u), eps(u))).integrate(fem, solver=jno.solve.lu(backend="pardiso"))
+```
+
+Measured on the 3-D cantilever, per design iteration, against the default:
+
+| tetrahedra | default | `backend="pardiso"` | speed-up |
+|---|---|---|---|
+| 2,847 | 620 ms | 335 ms | 1.9x |
+| 8,802 | 2,115 ms | 665 ms | 3.2x |
+| 14,063 | 4,014 ms | 810 ms | **5.0x** |
+
+The margin grows with the mesh because the two scale differently on this operator — the default's
+SuperLU costs $O(n^{1.9})$ against PARDISO's $O(n^{1.55})$ — so it is worth most exactly where it is
+needed. In a 30-minute budget that is the difference between **~275 iterations at 14k elements and
+~650 at 65k**. Two reasons the headroom is there: the stiffness is symmetric positive definite (to
+$5.6\times10^{-17}$) while the default throws a general LU at it, and the default re-runs its
+symbolic analysis every call.
+
+An **iterative** solver is not the answer here, which is worth stating because it is the usual
+advice at this size: smoothed-aggregation AMG with elasticity's near-nullspace converges fine
+(residual $10^{-11}$) but needs 103–145 CG iterations against the $10^3$ SIMP contrast, landing at
+244–1250 ms — an order of magnitude worse than the direct factorisation. Contrast is what makes a
+SIMP system hard for a multigrid hierarchy, and it is exactly what topology optimisation creates.
+
 ## Every sensitivity is automatic
 
 The paper hand-derives $\partial C/\partial\rho$ and $\partial C/\partial d_{x_i} = -\sum_{j\in
