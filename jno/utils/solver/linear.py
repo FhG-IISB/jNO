@@ -13,6 +13,7 @@ Users always remain free to extract ``fem.operator`` and pass their own ``solve_
 
 from __future__ import annotations
 
+import warnings
 from collections import OrderedDict
 from typing import Any
 
@@ -261,8 +262,29 @@ def _symmetrized_kind_and_values(values, order, orderT, pat):
     return "symmetric", sym
 
 
-def _cudss_refine(solver, Ag, bg, x, b, cp):
-    """Fixed-precision iterative refinement against the TRUE matrix. Returns ``(x, rel_residual)``.
+# A perturbed factorization raises two separate questions and they need separate numbers.
+#
+# _SINGULAR_REL answers "is this operator rank deficient?". A genuinely unconstrained mode leaves the
+# residual at O(1) after refinement -- measured 1.0 for cuDSS and 0.5 for PARDISO on rank-deficient
+# matrices -- because the correction lives in the null space and never reduces it. Anything above this
+# is rank deficiency; anything far below it is arithmetic.
+#
+# _REFINE_TARGET is the accuracy refinement aims for, and _CLEAN_REL the level below which a recovered
+# factorization is considered clean. Falling between _CLEAN_REL and _SINGULAR_REL is REPORTED, not
+# fatal: the callers here are a Newton step and a Krylov preconditioner, and an inexact linear solve
+# makes those take another iteration rather than return a wrong answer -- each has its own convergence
+# test on the quantity that actually matters. The old code used a single 1e-6 for both questions, so a
+# 165k saddle whose refinement landed at 1.4e-6 -- four orders clear of the singular signature, and a
+# perfectly usable inexact-Newton step -- was rejected as SINGULAR.
+_SINGULAR_REL = 1e-4
+_CLEAN_REL = 1e-8
+_REFINE_TARGET = 1e-10
+_REFINE_MAX = 50  # a backstop; the contraction test below is what decides
+_warned_perturbed = False
+
+
+def _cudss_refine(solver, Ag, bg, x, b, cp, _max_steps=None):
+    """Fixed-precision iterative refinement against the TRUE matrix. Returns ``(x, rel, stalled)``.
 
     Wilkinson's classical scheme (Rounding Errors in Algebraic Processes, 1963, ch. 3; also Higham,
     Accuracy and Stability of Numerical Algorithms, 2nd ed., ch. 12): the residual ``r = b - A x`` is
@@ -272,8 +294,10 @@ def _cudss_refine(solver, Ag, bg, x, b, cp):
     factorization is a fine preconditioner one or two steps away from the unperturbed answer.
 
     Stops early the moment the residual fails to contract -- on a genuinely singular operator the
-    correction lives in the null space and iterating further is pure waste -- so the caller can
-    distinguish "recovered" from "unrecoverable" by the returned residual alone. ``bg`` is the
+    correction lives in the null space and iterating further is pure waste. That is reported as
+    ``stalled``: it separates "this operator has a null space" from "the step budget ran out while
+    still converging", which the residual alone cannot say and which the caller must not confuse.
+    ``bg`` is the
     solver's bound operand buffer; it is left holding the LAST residual pushed through it, so callers
     needing the original rhs must rebind afterwards. ``b`` may alias ``bg`` (the check-time probe
     does): the right-hand side is copied before the buffer is first overwritten.
@@ -282,11 +306,14 @@ def _cudss_refine(solver, Ag, bg, x, b, cp):
     denom = denom if denom > 0.0 else 1.0
     rel = float(cp.linalg.norm(Ag @ x - b) / denom)
     b0 = None  # the rhs is only copied if refinement actually runs; the probe path stays SpMV-only
+    stalled = False
     # The budget is a backstop, not the decision-maker -- the non-contraction break below is what
     # separates recoverable from singular. Measured on a 64k Taylor-Hood saddle with 16 replaced
-    # pivots: still contracting at 3 steps (8.7e-6 -> 1.7e-6), through the gate by 8.
-    for _ in range(8):
-        if rel <= 1e-10:
+    # pivots: still contracting at 3 steps (8.7e-6 -> 1.7e-6), through the gate by 8. It was set to 8,
+    # which made it the decision-maker on a larger, worse-scaled operator: a 165k saddle with 434
+    # replaced pivots was still contracting when the loop ran out and was then reported as singular.
+    for _ in range(_REFINE_MAX if _max_steps is None else _max_steps):
+        if rel <= _REFINE_TARGET:
             break
         if b0 is None:
             b0 = b.copy()
@@ -296,11 +323,12 @@ def _cudss_refine(solver, Ag, bg, x, b, cp):
         new = float(cp.linalg.norm(Ag @ x - b0) / denom)
         if new >= rel:
             rel = new
-            break  # not contracting: the factorization is not a usable preconditioner here
+            stalled = True  # not contracting: the factorization is not a usable preconditioner here
+            break
         rel = new
     if b0 is not None:
         bg[...] = b0
-    return x, rel
+    return x, rel, stalled
 
 
 def _cudss_check_factorization(solver, Ag, bg, cp, shape):
@@ -321,9 +349,12 @@ def _cudss_check_factorization(solver, Ag, bg, cp, shape):
 
     Returns ``False`` for a clean factorization, ``True`` for a perturbed one whose answer is
     recoverable -- the solve path must then run :func:`_cudss_refine` on every solve, because the
-    factorization is of a perturbed matrix and each raw solve carries an O(gate) error -- and raises
-    only when even refinement cannot reach the gate (a genuinely unconstrained mode).
+    factorization is of a perturbed matrix and each raw solve carries an O(rel) error -- and raises
+    only for a residual in the SINGULAR regime (:data:`_SINGULAR_REL`), which is what an unconstrained
+    mode leaves behind. A residual between :data:`_CLEAN_REL` and that is reported once and accepted:
+    it is a badly scaled operator, not a rank-deficient one.
     """
+    global _warned_perturbed
     try:
         npivots = int(solver.factorization_info.npivots)
     except Exception:  # an older cuDSS that does not expose it -- do not fail the solve over this
@@ -331,16 +362,33 @@ def _cudss_check_factorization(solver, Ag, bg, cp, shape):
     if npivots == 0:
         return False
     x = solver.solve()
-    x, rel = _cudss_refine(solver, Ag, bg, x, bg, cp)
+    x, rel, stalled = _cudss_refine(solver, Ag, bg, x, bg, cp)
     solver.reset_operands(b=bg)  # leave the operand bound to the caller's rhs buffer
-    if rel > 1e-6:
+    if rel > _SINGULAR_REL:
+        why = (
+            "refinement STALLED -- the correction stopped reducing the residual, which is exactly what "
+            "an unconstrained mode looks like"
+            if stalled
+            else f"refinement was still converging after {_REFINE_MAX} steps and could not get there"
+        )
         raise RuntimeError(
             f"cuDSS factorized a SINGULAR operator ({shape[0]}x{shape[1]}): it replaced {npivots} "
-            f"pivot(s) and iterative refinement left the solution at relative residual {rel:.2e}. "
-            f"cuDSS reports this through neither an exception nor a NaN, so jNO checks it -- the "
-            f"returned vector would have been finite and wrong. Check for an unconstrained mode (a "
-            f"pure-Neumann problem with no gauge term, a floating region, or a saddle system whose "
-            f"constraint block has an empty row)."
+            f"pivot(s) and {why}, leaving relative residual {rel:.2e}. cuDSS reports this through "
+            f"neither an exception nor a NaN, so jNO checks it -- the returned vector would have been "
+            f"finite and wrong. Check for an unconstrained mode (a pure-Neumann problem with no gauge "
+            f"term, a floating region, or a saddle system whose constraint block has an empty row)."
+        )
+    if rel > _CLEAN_REL and not _warned_perturbed:
+        _warned_perturbed = True
+        warnings.warn(
+            f"cuDSS replaced {npivots} pivot(s) on a {shape[0]}x{shape[1]} operator and iterative "
+            f"refinement settled at relative residual {rel:.2e}, short of {_CLEAN_REL:.0e}. The "
+            f"operator is badly scaled rather than singular, so every solve against this "
+            f"factorization is refined and the answer is good to that residual -- an inexact step for "
+            f"a Newton or Krylov caller, which its own convergence test still has to pass. Rescaling "
+            f"the worst-conditioned block (a stiff penalty term is the usual source) removes it.",
+            RuntimeWarning,
+            stacklevel=2,
         )
     return True
 
@@ -454,10 +502,10 @@ def _cudss_host_solve(data, indices, rhs, shape, transpose):
     x = entry["solver"].solve()
     if entry["perturbed"]:
         # The factorization is of a PERTURBED matrix (see _cudss_check_factorization), so every raw
-        # solve against it carries an O(1e-6) relative error -- fine for a probe, not for a Newton
+        # solve against it carries the relative error the check measured -- fine for a probe, not for a Newton
         # step that jNO's own guards will hold to a much tighter residual. Refinement makes each
         # answer exact-to-1e-10 at the cost of one SpMV per step, only on flagged factorizations.
-        x, _ = _cudss_refine(entry["solver"], entry["Ag"], entry["bg"], x, entry["bg"], cp)
+        x, _, _ = _cudss_refine(entry["solver"], entry["Ag"], entry["bg"], x, entry["bg"], cp)
         entry["solver"].reset_operands(b=entry["bg"])
     out = cp.asnumpy(x)
     return _np.asarray(out.reshape(rhs.shape), dtype=rhs.dtype)
@@ -699,7 +747,7 @@ def _pardiso_check_factorization(solver, A, b, np, shape):
     x = solver._call_pardiso(A, b)
     denom = np.linalg.norm(b)
     rel = float(np.linalg.norm(A @ x - b) / (denom if denom > 0 else 1.0))
-    if rel > 1e-6:
+    if rel > _SINGULAR_REL:  # the same singularity test as cuDSS; see _SINGULAR_REL
         raise RuntimeError(
             f"MKL PARDISO factorized a SINGULAR operator ({shape[0]}x{shape[1]}): it perturbed "
             f"{perturbed} pivot(s) and the solution has relative residual {rel:.2e}. PARDISO reports "

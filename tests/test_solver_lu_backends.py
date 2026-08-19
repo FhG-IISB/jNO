@@ -337,15 +337,17 @@ def test_guard_recovers_a_perturbed_pivot_by_iterative_refinement():
     b = np.ones(4)
     solver = _PerturbedFactorization(Minv, b)
     assert _cudss_check_factorization(solver, A, b, np, (4, 4)) is True
-    x, rel = _refine_via(solver, A, b)
-    assert rel < 1e-9 and np.allclose(x, [1.0, 0.5, 1 / 3.0, 0.25], atol=1e-8)
+    x, rel, stalled = _refine_via(solver, A, b)
+    assert not stalled and rel < 1e-9 and np.allclose(x, [1.0, 0.5, 1 / 3.0, 0.25], atol=1e-8)
 
 
-def _refine_via(solver, A, b):
+def _refine_via(solver, A, b, max_steps=None):
+    """Returns ``(x, rel, stalled)`` -- `stalled` says the residual stopped contracting, which is a
+    null space, as opposed to the step budget simply running out."""
     from jno.utils.solver.linear import _cudss_refine
 
     solver.reset_operands(b=b)
-    return _cudss_refine(solver, A, b.copy(), solver.solve(), b, np)
+    return _cudss_refine(solver, A, b.copy(), solver.solve(), b, np, max_steps)
 
 
 def test_refinement_stops_early_when_the_residual_does_not_contract():
@@ -354,7 +356,8 @@ def test_refinement_stops_early_when_the_residual_does_not_contract():
     A = np.diag([1.0, 2.0, 0.0, 4.0])  # truly rank-deficient
     Minv = np.diag([1.0, 1 / 2.0, 1e12, 1 / 4.0])  # what a replaced zero pivot looks like
     b = np.ones(4)
-    _x, rel = _refine_via(_PerturbedFactorization(Minv, b), A, b)
+    _x, rel, stalled = _refine_via(_PerturbedFactorization(Minv, b), A, b)
+    assert stalled  # THE signature of a null space: the correction stopped reducing the residual
     assert rel > 1e-6  # unrecoverable, and reported as such for the caller to raise on
 
 
@@ -688,3 +691,75 @@ def test_pardiso_singular_operator_raises():
     # device sync to every solve on the hot path, which is exactly what the offload design avoids.
     with pytest.raises((RuntimeError, ValueError)):
         pardiso_lu_solve(A, jnp.ones(4)).block_until_ready()
+
+
+# ---------------------------------------------------------------------------------------------
+# One threshold used to answer two different questions, and an 8-step budget used to end the loop
+# without saying so. A 165k Taylor-Hood saddle whose refinement reached 1.4e-6 -- four orders clear
+# of the O(1) residual a real null space leaves, and a perfectly usable inexact-Newton step -- was
+# reported as a SINGULAR operator. These drive the decision with numpy in place of cupy.
+# ---------------------------------------------------------------------------------------------
+
+_SLOW = (np.diag([1.0, 2.0, 3.0, 4.0]), np.diag([1.0, 1 / 2.0, 1 / (3.0 * 1.4), 1 / 4.0]))
+"""A true matrix and a factorization with ONE badly replaced pivot: refinement contracts by ~0.29 a
+step, so it needs ~17 steps to reach 1e-10 and cannot get there in 8."""
+
+
+def _gate(A, Minv, b):
+    from jno.utils.solver.linear import _cudss_check_factorization
+
+    return _cudss_check_factorization(_PerturbedFactorization(Minv, b), np.asarray(A), np.asarray(b), np, A.shape)
+
+
+def test_a_replaced_pivot_on_a_singular_operator_still_raises():
+    """The failure the gate exists for. Refinement cannot help: the correction is in the null space."""
+    A = np.diag([1.0, 2.0, 0.0, 4.0])
+    Minv = np.diag([1.0, 1 / 2.0, 1e12, 1 / 4.0])
+    with pytest.raises(RuntimeError, match="SINGULAR"):
+        _gate(A, Minv, np.ones(4))
+
+
+def test_the_singular_error_names_the_stall_as_the_reason():
+    """ "Stalled" and "budget spent" call for different fixes, so the message must not conflate them."""
+    A = np.diag([1.0, 2.0, 0.0, 4.0])
+    Minv = np.diag([1.0, 1 / 2.0, 1e12, 1 / 4.0])
+    with pytest.raises(RuntimeError, match="STALLED"):
+        _gate(A, Minv, np.ones(4))
+
+
+def test_refinement_slower_than_the_old_budget_is_not_called_singular():
+    """The regression itself: still converging when the loop ended, which is not a null space."""
+    A, Minv = _SLOW
+    b = np.ones(4)
+    _x, rel8, stalled8 = _refine_via(_PerturbedFactorization(Minv, b), A, b, max_steps=8)
+    assert not stalled8, "the budget ended this, not a null space -- the distinction under test"
+    assert rel8 > 1e-6, "if 8 steps sufficed, this no longer reproduces the reported failure"
+    assert _gate(A, Minv, b) is True  # accepted, and flagged so every solve is refined
+
+
+def test_the_recovered_answer_solves_the_true_matrix():
+    """Accepting it is only defensible if the refined answer is right."""
+    A, Minv = _SLOW
+    b = np.ones(4)
+    x, rel, stalled = _refine_via(_PerturbedFactorization(Minv, b), A, b)
+    assert not stalled and rel <= 1e-10
+    np.testing.assert_allclose(x, np.linalg.solve(A, b), rtol=1e-9)
+
+
+def test_a_usable_but_unclean_residual_is_reported_not_raised(monkeypatch):
+    """Between clean and singular: say so once and let the caller's own convergence test decide.
+    Held at the OLD budget of 8, this lands at ~6e-6, the scale a large saddle reports."""
+    import jno.utils.solver.linear as L
+
+    monkeypatch.setattr(L, "_REFINE_MAX", 8)
+    monkeypatch.setattr(L, "_warned_perturbed", False)
+    A, Minv = _SLOW
+    with pytest.warns(RuntimeWarning, match="badly scaled rather than singular"):
+        assert _gate(A, Minv, np.ones(4)) is True
+
+
+def test_the_gate_sits_orders_clear_of_both_signatures_it_separates():
+    from jno.utils.solver.linear import _CLEAN_REL, _SINGULAR_REL
+
+    assert _SINGULAR_REL / _CLEAN_REL >= 1e3  # a wide usable band between the two questions
+    assert 1.0 / _SINGULAR_REL >= 1e3  # and far below the O(1) a real null space leaves
