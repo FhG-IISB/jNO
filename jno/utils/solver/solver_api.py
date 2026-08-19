@@ -996,6 +996,24 @@ def record_nonlinear_verdict(residual_at, u, u0, nonlinear, who: str) -> tuple:
 
     traits = getattr(nonlinear, "traits", None) or {}
     rtol, atol = float(traits.get("rtol", 1e-8)), float(traits.get("atol", 1e-8))
+    if any(isinstance(v, jax.core.Tracer) for v in (u, u0)):
+        # The CALLER is tracing (jit/grad/vmap over the solve). The verdict needs a concrete residual,
+        # so it cannot be made here -- the same trade, and the same guard, as the driver's own check in
+        # `newton_krylov`. Recording nothing would leave `fem.stats` holding an earlier eager solve's
+        # verdict, which is worse than none, so the verdict is cleared and says why. Without this the
+        # `float()` below raises a ConcretizationTypeError and a differentiable parametric solve --
+        # `jax.grad` of `fem.solve(param=value)`, the whole point of fitting a coefficient through the
+        # solve -- is impossible.
+        LAST_NEWTON_STATS.clear()
+        LAST_NEWTON_STATS.update(
+            driver=who,
+            residual=None,
+            bound=None,
+            steps=None,
+            converged=None,
+            note="no verdict: the solve was traced (jit/grad/vmap); the solver's iteration cap is all there is",
+        )
+        return None, None, None
     r_end = float(jnp.linalg.norm(jnp.asarray(residual_at(u)).reshape(-1)))
     bound = atol + rtol * float(jnp.linalg.norm(jnp.asarray(residual_at(u0)).reshape(-1)))
     ok = bool(np.isfinite(r_end)) and r_end <= bound
@@ -1165,7 +1183,8 @@ def run_continuation(fem, spec, *, nonlinear=None, linear=None, precond=None, x0
                 _r_end, _bound, _conv = record_nonlinear_verdict(
                     lambda uu: _residual_at(vals, uu), step, prev, nonlinear, _who
                 )
-                _stalled = not _conv
+                # `None` means the rung was TRACED, so no verdict could be made -- that is not a stall.
+                _stalled = _conv is False
                 if periodic is None:
                     u = step
                 else:
