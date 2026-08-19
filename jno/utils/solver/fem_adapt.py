@@ -1414,7 +1414,6 @@ def _criterion_weak_terms(fem: Any, criterion: Any, field: int = 0):
         coords = [seen_axis[a] for a in sorted(seen_axis)][:dim]
     else:  # nothing carries coordinates (a criterion of pure constants): fall back to the region's own
         coords = list(fem.domain.variable(tags[0], split=True))[:dim]
-    test_bound = tests[int(field)](*coords)
     # A VECTOR field's test function must be reduced to ONE COMPONENT before the criterion is hung on
     # it. The assembler only ever meets a vector test componentwise -- every form writes `t[0].x`,
     # `t[1]`, never a bare `t` -- so `criterion * t` hands it a vector-valued integrand and it dies
@@ -1424,8 +1423,7 @@ def _criterion_weak_terms(fem: Any, criterion: Any, field: int = 0):
     # carried by the SAME scalar nodal basis, so `int g phi_i / int phi_i` on component 0 is the exact
     # scalar nodal projection of `g`, and `_criterion_nodal`'s per-node norm then reads it back
     # untouched (the other components are structurally zero in both the numerator and the mass).
-    if _field_vec(fem, int(field))[1] > 1:
-        test_bound = test_bound[0]
+    test_bound = tests[int(field)](*coords)
     # Retag the TEST function's coordinates before combining it with the criterion, not after. When the
     # criterion exposes no free coordinates of its own -- a bound view absorbs them, which is what
     # `u.bind(x=..., y=...)` does -- `coords` are freshly fetched from the domain and still carry the
@@ -1460,6 +1458,27 @@ def _criterion_weak_terms(fem: Any, criterion: Any, field: int = 0):
                 f"Original error: {e}"
             ) from e
     mass_term = 1.0 * test_bound
+
+    # A VECTOR field's test function has to be reduced to ONE COMPONENT: the assembler only ever meets
+    # a vector test componentwise -- every form writes `t[0].x`, `t[1]`, never a bare `t` -- so a
+    # vector-valued integrand dies in the quadrature reduction with a bare shape mismatch of exactly
+    # `vec` ("input type=float64[2208] and requested type=float64[1104]"), naming nothing useful.
+    #
+    # The reduction is taken on the PRODUCT rather than on the test function, and the order is the
+    # whole trick: indexing a bound view copies its coordinate Variables, and the binder compares
+    # identity rather than tag, so reducing first makes the multiply raise "coord binding conflict for
+    # 'x'" between two Variables that both read `gauss_top`. Multiplying first keeps every coordinate
+    # object shared, and `(g * t)[0]` is the same expression as `g * t[0]` either way.
+    #
+    # Component 0 is not a choice of direction: each component of a vector Lagrange field rides the
+    # SAME scalar nodal basis, so `int g phi_i / int phi_i` on component 0 is the exact scalar nodal
+    # projection of `g`, and `_criterion_nodal`'s per-node norm reads it back untouched (the other
+    # components are structurally zero in both the numerator and the mass). A criterion that CARRIES
+    # its own test function is left alone -- the user chose that spelling, components included.
+    if _field_vec(fem, int(field))[1] > 1:
+        mass_term = mass_term[0]
+        if not contains_node_type(node, TestFunction):
+            crit_term = crit_term[0]
 
     # Point the coordinates at the quadrature pool, exactly as `jno.fem` does to a form's coordinates at
     # build time. Without it a criterion built from FRESHLY fetched coordinates samples the mesh pool
