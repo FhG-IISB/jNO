@@ -2407,8 +2407,10 @@ class AdaptSpec:
     where to add DOFs, not where to split. ``refine_factor`` does not apply. Compose with
     :attr:`split` in successive ``fem.solve`` calls for hp.
 
-    The loop always starts from plain P1. There is deliberately no "enrich this fraction up front"
-    knob: which nodes that would pick is a question about the mesh's node ORDER, not about the
+    A FRESH loop starts from plain P1 -- an unmasked ``space="cover"`` field is enriched everywhere,
+    and a loop that begins maximal has nothing left to select. A SECOND call resumes from the mask the
+    first one left, so two budgeted runs compose. There is deliberately no "enrich this fraction up
+    front" knob: which nodes that would pick is a question about the mesh's node ORDER, not about the
     solution, and a starting space chosen by node index is not a choice anyone can defend. The first
     round costs one P1 solve, which is what an h-adaptive loop pays too."""
 

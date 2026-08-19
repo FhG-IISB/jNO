@@ -102,10 +102,12 @@ $r^{2/3}\notin H^2$, and a higher-order space buys its rate from smoothness the 
 - **`n_dofs` in a p-run's history is the ACTIVE count.** The padded layout gives every node its cover
   slots whether or not it is enriched, so the total never changes; an unenriched node has its slots
   pinned, and `max_dofs` budgets against the free count.
-- **`enrich` always starts from plain P1.** Calling it on a field that is already uniformly
+- **A fresh `enrich` starts from plain P1.** Calling it on a field that is already uniformly
   `space="cover"` therefore *removes* enrichment before adding it back selectively — the active DOF
-  count goes **down** at that call (912 → 739 in the h-then-p run above). That is the loop's design,
-  but it makes composition read oddly unless you know it.
+  count goes **down** at that call (912 → 739 in the h-then-p run above). A fresh cover field carries
+  no mask, and a loop that began fully enriched would have nothing left to select. Calling `enrich` a
+  **second** time is the other case: it resumes from the mask the first call left, so two budgeted
+  runs compose instead of the second undoing the first.
 - **Two API frictions worth knowing.** `adapt=` does not take the `linear=` slot on a steady problem, so
   a non-default linear solver is passed positionally as `solve_fn`; and an `adapt=` driver returns the
   *vertex view*, which for a cover field is only the value slots — re-solve on the final space (the loop
