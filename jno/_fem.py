@@ -1674,12 +1674,24 @@ class FEM:
         )
         if getattr(self, "_geometry", None):
             # A geometry term (`coord.d(t) - velocity`) states that the mesh moves. Its driver owns the
-            # march, so it cannot share the call with anything else that also owns it.
-            if adapt is not None or has_slots:
+            # MARCH -- so anything else that owns a march cannot share the call. The per-STEP solver
+            # slots are a different thing entirely: they configure the implicit solve inside one step,
+            # which the march does not own, and the transient adaptive driver already composes them for
+            # exactly that reason. Refusing them here left a moving-mesh problem on the matrix-free
+            # default, with no way to reach a sparse-direct Newton -- which is the only thing that
+            # converges on a saddle step.
+            _march_owners = (
+                ("adapt", adapt),
+                ("time", time),
+                ("tau", tau),
+                ("x0", x0),
+            )
+            _clash = [n for n, val in _march_owners if val is not None]
+            if _clash:
                 raise NotImplementedError(
-                    "jno.fem: a geometry term (`coord.d(t) - velocity`) does not compose with adapt= or "
-                    "the solver slots (x0/nonlinear/linear/precond/time) yet — the mesh-motion driver owns the "
-                    "march and re-assembles each step. Solve with the geometry term alone (default θ-stepper)."
+                    f"jno.fem: a geometry term (`coord.d(t) - velocity`) does not compose with "
+                    f"{'/'.join(_clash)}= — the mesh-motion driver owns the march and re-assembles each "
+                    "step. The per-step solver slots (nonlinear=/linear=/precond=) DO compose."
                 )
             if self._mode != "transient":
                 raise NotImplementedError(
@@ -1689,7 +1701,7 @@ class FEM:
                 )
             from .utils.solver.fem_adapt import run_mesh_motion
 
-            return run_mesh_motion(self, solve_fn=solve_fn, **kwargs)
+            return run_mesh_motion(self, solve_fn=solve_fn, nonlinear=nonlinear, linear=linear, precond=precond, **kwargs)
         if adapt is not None:
             # A load-path march is dispatched BELOW this branch, so an `adapt=` on a form carrying step
             # history used to return here with a single STEADY solve -- shape (n_dofs,) where the caller

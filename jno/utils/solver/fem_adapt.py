@@ -4347,7 +4347,9 @@ def _geometry_velocity(spec: dict, dom: Any, state: Any) -> np.ndarray:
     return v[perm]
 
 
-def run_mesh_motion(fem: Any, *, solve_fn: Any = None, **kwargs: Any) -> "AdaptiveTrajectory":
+def run_mesh_motion(
+    fem: Any, *, solve_fn: Any = None, nonlinear: Any = None, linear: Any = None, precond: Any = None, **kwargs: Any
+) -> "AdaptiveTrajectory":
     """March a transient problem whose ``jno.fem([...])`` list contains **geometry terms** — the mesh moves
     as those terms say, the physics marches on the moved mesh, and the state is carried across each move.
 
@@ -4395,8 +4397,9 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, **kwargs: Any) -> "Adapti
       across a coupled system (a Taylor–Hood pair moves as one), in 2D or 3D, linear or **nonlinear** (the
       block's Newton branch). All of those are covered by tests. Complex, periodic, a non-nodal family
       (RT / Nédélec / Hermite / Argyris / Morley) and a custom ``solve_fn`` each raise. Note the nonlinear
-      branch does not take ``_step_solve``: ``SemidiscreteTimeBlock.step`` threads ``linear_solve`` only
-      through the linear path, so a nonlinear march runs ``newton_krylov`` at its own defaults.
+      branch takes the composed ``nonlinear=``/``linear=``/``precond=`` slots instead of ``_step_solve``
+      (``SemidiscreteTimeBlock.step`` threads ``linear_solve`` only through the linear path), so a
+      nonlinear march reaches a sparse-direct Newton rather than ``newton_krylov`` at its own defaults.
     - **Needs ``jax_enable_x64``** and raises without it — see the guard below for the measurement.
     - **Every frame on the block's own time grid.** There is no ``save_ts=``: it used to be accepted here
       and silently ignored (a request for 3 frames returned the grid's 4), and it evaded the
@@ -4591,7 +4594,21 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, **kwargs: Any) -> "Adapti
     # every step was burning its whole GMRES budget, the same jit measured 1.0x and looked worthless. A
     # microbenchmark here once claimed 574x for it, which was wrong in the other direction -- it timed the
     # jitted step without `block_until_ready`, measuring how long it took to QUEUE the step, not to run it.
-    _jstep = jax.jit(lambda u_, t_, a_: block.step(u_, t_, dt, args=a_, theta=theta, linear_solve=_step_solve))
+    # The per-step slots, composed once: `nonlin_s` drives the implicit solve inside a step (and a
+    # sparse-direct Newton assembles the backward-Euler step tangent itself -- `step` handles that),
+    # `lin_s` replaces the built-in theta-step solve. With no slots given both are None and the march
+    # keeps its previous behaviour exactly: `_step_solve` on the linear path, `newton_krylov` defaults
+    # on the nonlinear one.
+    lin_s = nonlin_s = None
+    if nonlinear is not None or linear is not None or precond is not None:
+        from .solver_api import compose_transient_step_solvers
+
+        lin_s, nonlin_s = compose_transient_step_solvers(nonlinear, linear, precond, fem, block)
+    _lin = lin_s if lin_s is not None else _step_solve
+
+    _jstep = jax.jit(
+        lambda u_, t_, a_: block.step(u_, t_, dt, args=a_, theta=theta, linear_solve=_lin, nonlinear_solve=nonlin_s)
+    )
 
     # Connectivity is PRESERVED by construction here (move_mesh never retriangulates), so every frame can
     # share one cell array instead of copying it. A frame-per-copy costs n_steps x n_cells x (dim+1) x 8 B
@@ -4709,7 +4726,15 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, **kwargs: Any) -> "Adapti
         # 3) step on the moved mesh. The operator and the mass are re-formed from the moved vertices HERE,
         #    inside the step, through `args` -- `_apply_coord_params` scatters them into the P1 geometry
         #    before the element Jacobian, so J, detJ, JxW, physical gradients and the facet normals follow.
-        u_n = block.step(u_t, t0c.astype(u_c.dtype), dt, args=_coord_args(X_n), theta=theta, linear_solve=_step_solve)
+        u_n = block.step(
+            u_t,
+            t0c.astype(u_c.dtype),
+            dt,
+            args=_coord_args(X_n),
+            theta=theta,
+            linear_solve=_lin,
+            nonlinear_solve=nonlin_s,
+        )
         bad = (bad[0] | tangled, bad[1] | jnp.any(esc_cell))
         return (u_n, X_n, bad), (u_n, X_n)
 
