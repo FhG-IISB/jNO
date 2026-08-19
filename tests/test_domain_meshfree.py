@@ -35,8 +35,10 @@ def _meshless(d):
         (lambda: (jno.Shape.rect(0.0, 0.0, 1.0, 1.0) - jno.Shape.disk(0.5, 0.5, 0.25)).domain(), 2),
         (lambda: (jno.Shape.box(0, 0, 0, 1, 1, 1) - jno.Shape.sphere(0.5, 0.5, 0.5, 0.3)).domain(), 3),
         (lambda: jno.Shape.disk(0.0, 0.0, 1.0).extrude(2.0).domain(), 3),
+        (lambda: jno.Shape.rect(1, 0, 2, 1).revolve((0, 0, 0), (0, 1, 0), 2 * math.pi).domain(), 3),
+        (lambda: jno.Shape.rect(1, 0, 2, 1).revolve((0, 0, 0), (0, 1, 0), math.pi).domain(), 3),
     ],
-    ids=["1d-line", "2d-rect", "3d-box", "2d-csg", "3d-csg", "extrude"],
+    ids=["1d-line", "2d-rect", "3d-box", "2d-csg", "3d-csg", "extrude", "revolve", "revolve-half"],
 )
 def test_a_shape_domain_starts_without_a_mesh(make, dim):
     d = make()
@@ -135,13 +137,34 @@ def test_points_land_inside_the_shape_they_name():
     assert (pts >= -1e-12).all() and (pts <= 1 + 1e-12).all()
 
 
-def test_no_count_gives_one_resampled_point():
-    """The convention the lazy polygon path already sets: with no count there is no node set to
-    return, so it is one point redrawn every step rather than an invented resolution."""
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).domain()
+def test_no_count_without_a_declared_size_refuses_rather_than_guessing():
+    """`variable(tag)` with no count could mean collocation points or the node set, and which is
+    right depends on what the caller does *afterwards*. With no `size=` there is no declared
+    resolution to fall back on, so it refuses and names both ways out — guessing would be silent,
+    since finite differences over one collocation point return a number, just the wrong one."""
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).domain()  # no size=
+    with pytest.raises(ValueError, match="no mesh size was declared"):
+        d.variable("interior", split=True)
+
+    d.variable("interior", sample=(500, None), split=True)  # the explicit way out
+    assert np.asarray(d.context["interior"]).shape == (1, 1, 500, 2)
+    assert _meshless(d)
+
+
+def test_a_declared_size_makes_the_no_count_form_mean_that_mesh_s_nodes():
+    """`size=` IS the declaration of a resolution: asking for a mesh of that density and then for
+    'the interior' unambiguously means its nodes. That is what a convergence study over `size`
+    rests on, so it keeps working — and an explicit count still opts out to mesh-free."""
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.2).domain()
+    assert _meshless(d), "declaring a size still does not mesh until the nodes are asked for"
     d.variable("interior", split=True)
-    assert np.asarray(d.context["interior"]).shape == (1, 1, 1, 2)
-    assert "interior" in getattr(d, "_resampling_strategies", {})
+    assert not _meshless(d)
+    assert np.asarray(d.context["interior"]).shape[2] == len(d._mesh_pool["interior"])
+
+    sized = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.2).domain()
+    sized.variable("interior", sample=(9_000, None), split=True)  # a count still wins
+    assert np.asarray(sized.context["interior"]).shape == (1, 1, 9_000, 2)
+    assert _meshless(sized)
 
 
 def test_resampling_candidates_are_generated_not_reshuffled():
@@ -236,14 +259,12 @@ def test_a_time_dependent_shape_domain_carries_the_time_axis():
     [
         (lambda: jno.Shape.rect(0, 0, 1, 1, size=0.3).extrude(1.0).fillet(0.05).domain(),
          "fillet removes material near edges, so no closed-form membership"),
-        (lambda: jno.Shape.rect(1, 0, 2, 1, size=0.3).revolve((0, 0, 0), (0, 1, 0), 2 * math.pi).domain(),
-         "revolve has membership but no analytic boundary sampler yet"),
         (lambda: jno.Shape.rect(0, 0, 1, 1, size=0.3).name("core").domain(),
          "a named region's tags are the mesher's conforming sub-bodies"),
         (lambda: jno.Shape.rect(0, 0, 1, 1, size=0.3).structured().domain(),
          "a structured plan is a lattice, not a Shape, by the time it is built"),
     ],
-    ids=["fillet", "revolve", "named-region", "structured"],
+    ids=["fillet", "named-region", "structured"],
 )
 def test_a_plan_that_cannot_be_served_analytically_still_meshes(make, why):
     """Each of these keeps the eager path *by name*, rather than being half-served mesh-free.

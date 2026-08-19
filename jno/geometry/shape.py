@@ -253,6 +253,92 @@ class _ExtrudedSurface:
         return pts, nrm
 
 
+class _RevolvedSurface:
+    """The boundary of ``revolve(profile, axis, angle)``: the swept wall plus, for a partial sweep,
+    the two flat end caps.
+
+    A profile boundary point at meridian ``(p, h)`` sweeps a circle of radius ``p``, so the swept
+    area element is ``angle * p * dl`` (Pappus) -- points must therefore be drawn from the profile
+    boundary weighted by their **radius**, not uniformly by arclength, or the inner rim of a ring is
+    over-sampled relative to the outer. That weighting is done by rejection against the largest
+    radius, which keeps every accepted point exactly on the analytic surface.
+    """
+
+    _PILOT = 4096
+
+    def __init__(self, profile, axis_point, axis_dir, angle):
+        self._profile, self._angle = profile, float(angle)
+        self._axis_point, self._axis_dir = axis_point, axis_dir
+        _ax, ay, _az = axis_dir
+        at_origin = all(abs(c) < 1e-9 for c in axis_point)
+        if not at_origin or not (abs(ay) > 1e-9 or abs(_ax) > 1e-9):
+            raise NotImplementedError(
+                f"revolve sampling supports the x- or y-axis through the origin; got "
+                f"axis_point={axis_point}, axis_dir={axis_dir}."
+            )
+        self._y_axis = abs(ay) > 1e-9
+        self._radius_col = 0 if self._y_axis else 1  # which meridian coord is the radius
+        rng = np.random.default_rng(0)  # fixed: these are area estimates, they must not wobble
+        edge, _n = profile.sample_boundary(self._PILOT, rng)
+        self._r_max = float(np.max(np.abs(edge[:, self._radius_col]))) or 1.0
+        perimeter = _node_boundary_measure(profile._node)
+        self._lateral = abs(self._angle) * float(np.mean(np.abs(edge[:, self._radius_col]))) * perimeter
+        self._partial = abs(abs(self._angle) - 2.0 * math.pi) > 1e-9
+        self._cap = _ExtrudedSurface(profile, 1.0)._area if self._partial else 0.0
+
+    def boundary_measure(self):
+        return self._lateral + 2.0 * self._cap
+
+    def _to_world(self, meridian, s):
+        """Lift meridian coords ``(p, h)`` at azimuth ``s`` back to 3-D, matching `_revolve_coords`."""
+        p, h = meridian[:, 0], meridian[:, 1]
+        if self._y_axis:  # profile x is the radius, profile y the height
+            return np.stack([p * np.cos(s), h, -p * np.sin(s)], axis=1)
+        return np.stack([p, h * np.cos(s), h * np.sin(s)], axis=1)  # profile y is the radius
+
+    def sample_boundary(self, n, rng):
+        w = np.array([self._lateral, self._cap, self._cap], dtype=float)
+        f = rng.choice(3, size=n, p=w / w.sum())
+        pts = np.zeros((n, 3))
+        nrm = np.zeros((n, 3))
+        sel = f == 0
+        if sel.any():
+            k = int(sel.sum())
+            got_p, got_n = [], []
+            have = 0
+            while have < k:
+                cand, cand_n = self._profile.sample_boundary(max(4 * (k - have), 256), rng)
+                # radius-weighted acceptance: Pappus says area goes as the swept radius
+                keep = rng.uniform(0.0, 1.0, size=len(cand)) < np.abs(cand[:, self._radius_col]) / self._r_max
+                if keep.any():
+                    got_p.append(cand[keep])
+                    got_n.append(cand_n[keep])
+                    have += int(keep.sum())
+            m_pts = np.concatenate(got_p)[:k]
+            m_nrm = np.concatenate(got_n)[:k]
+            s = rng.uniform(0.0, self._angle, size=k)
+            pts[sel] = self._to_world(m_pts, s)
+            nrm[sel] = self._to_world(m_nrm, s) if not self._y_axis else np.stack(
+                [m_nrm[:, 0] * np.cos(s), m_nrm[:, 1], -m_nrm[:, 0] * np.sin(s)], axis=1
+            )
+        for cap, s_cap, sign in ((1, 0.0, -1.0), (2, self._angle, 1.0)):
+            sub = f == cap
+            if not sub.any():
+                continue
+            k = int(sub.sum())
+            face = self._profile.sample_interior(k, rng)
+            s = np.full(k, s_cap)
+            pts[sub] = self._to_world(face, s)
+            # the cap's normal is the azimuthal direction at that end
+            axis = np.array([0.0, 1.0, 0.0]) if self._y_axis else np.array([1.0, 0.0, 0.0])
+            radial = pts[sub] - axis * (pts[sub] @ axis)[:, None]
+            tangential = np.cross(axis, radial)
+            norms = np.linalg.norm(tangential, axis=1, keepdims=True)
+            nrm[sub] = sign * tangential / np.maximum(norms, 1e-300)
+        lens = np.linalg.norm(nrm, axis=1, keepdims=True)
+        return pts, nrm / np.maximum(lens, 1e-300)
+
+
 def _node_boundary_measure(node):
     """Total analytic boundary measure (perimeter in 2-D, surface area in 3-D) of the raw pieces."""
     return float(sum(m for _piece, m in _node_boundary_pieces(node)))
@@ -285,6 +371,9 @@ def _node_boundary_pieces(node):
         return [(_Moved(p, rotate=rot), m) for p, m in _node_boundary_pieces(node[1]._node)]
     if kind == "extrude":
         surf = _ExtrudedSurface(node[1], node[2])
+        return [(surf, surf.boundary_measure())]
+    if kind == "revolve":
+        surf = _RevolvedSurface(node[1], node[2], node[3], node[4])
         return [(surf, surf.boundary_measure())]
     raise NotImplementedError(
         f"no analytic boundary sampler for a {kind!r} node; sample it through the boundary "

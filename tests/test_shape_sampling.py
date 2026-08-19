@@ -176,9 +176,13 @@ def test_a_vanishing_shape_raises_instead_of_returning_short():
         Shape.rect(0.0, 0.0, 2.0, 1.0).translate((5.0, 7.0, 0.0)),
         Shape.rect(0.0, 0.0, 2.0, 1.0).rotate((0.0, 0.0, 0.0), (0.0, 0.0, 1.0), math.pi / 6),
         Shape.disk(0.0, 0.0, 1.0).extrude(3.0),
+        # a ring swept about +y, and the half sweep whose flat end caps must also come out outward
+        Shape.rect(1.0, 0.0, 2.0, 1.0).revolve((0.0, 0.0, 0.0), (0.0, 1.0, 0.0), 2 * math.pi),
+        Shape.rect(1.0, 0.0, 2.0, 1.0).revolve((0.0, 0.0, 0.0), (0.0, 1.0, 0.0), math.pi),
+        Shape.rect(0.0, 0.0, 3.0, 1.0).revolve((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), 2 * math.pi),
     ],
     ids=["rect", "disk", "box", "sphere", "cylinder", "rect-disk", "box-sphere",
-         "translate", "rotate", "disk-extrude"],
+         "translate", "rotate", "disk-extrude", "revolve", "revolve-half", "revolve-x"],
 )
 def test_boundary_points_are_on_the_surface_with_outward_unit_normals(shape):
     """Stepping a hair along +n must leave the shape and along -n must stay inside — which is a

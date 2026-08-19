@@ -390,9 +390,12 @@ primitives' auto-names (`left`, `arc`, `surface`, …) are available before any 
     A plan is mesh-free only if its extent, its membership **and** its boundary are all closed-form.
     These are not, and mesh at construction as before rather than being half-served: `sweep` and
     `fillet` (no analytic membership — `fillet` removes material near edges, so recursing to the
-    child would answer for the un-filleted solid); `revolve` (membership yes, analytic boundary
-    sampler not yet); `.name(...)` / `Shape.regions(...)` (region and interface tags are the
-    mesher's conforming sub-bodies); and `.structured()` (already a lattice).
+    child would answer for the un-filleted solid); `.name(...)` / `Shape.regions(...)` (region and
+    interface tags are the mesher's conforming sub-bodies); and `.structured()` (already a lattice).
+
+    `translate`, `rotate`, `extrude` and `revolve` **are** covered — the query point is mapped into
+    the child's frame, and a revolved boundary is drawn from the profile weighted by its swept
+    radius (Pappus), so the inner rim of a ring is not over-sampled relative to the outer.
 
 ## Sampling, time, and batching
 
@@ -402,9 +405,26 @@ x, y, z, t = d.variable("interior", sample=(500, None))    # 500 sampled points
 xb, yb, zb, tb, nx, ny, nz = d.variable("top", normals=True, split=True)   # boundary + outward normals
 ```
 
-On a **mesh-free** domain the first line means something different: with no count there is no node
-set to hand back, so it is one point redrawn every step (the convention `jno.domain.poly` already
-uses). Pass an explicit `sample=(n, None)` when you want a fixed number.
+The first line — no count — is read from whether you declared a resolution. **`size=` is that
+declaration:** asking for a mesh of a given density and then for "the interior" unambiguously means
+its nodes, so it builds that mesh and hands them back, exactly as before. A convergence study that
+varies `size` therefore keeps working unchanged.
+
+With **no** `size=` there is no declared resolution and no node set, and "no count" could equally
+mean collocation points or nodes — which depends on what you do afterwards. Neither is chosen for
+you:
+
+```
+ValueError: domain.variable('interior'): this domain is mesh-free and no mesh size was declared,
+so the tag has no node set to hand back and no natural point count. Say which you want:
+  - continuous collocation points:  variable('interior', sample=(n, None))
+  - a mesh's nodes:                 give the shape a size, e.g. Shape.rect(..., size=0.05),
+                                    or read d.mesh first
+```
+
+Guessing would be silent rather than wrong-looking: finite differences over a single collocation
+point return a number, it is just not the one you asked for. An explicit `sample=(n, None)` always
+means mesh-free, `size=` or not.
 
 `variable` always returns a trailing time coordinate `t` (a constant for steady domains), so a 3-D
 domain unpacks as `(x, y, z, t)`. Time-dependent domains take `time=(t0, t1, n)`; `variable("initial")`

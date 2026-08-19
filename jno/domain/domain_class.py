@@ -1296,6 +1296,23 @@ class domain(MeshIOMixin):
     def tag_indices(self, value):
         self.__dict__["_tag_indices"] = value
 
+    @property
+    def mesh_connectivity(self):
+        """Cells, nodal measures and boundary indices — the mesh, in the form the numerics read.
+
+        `jno.fdm`, the integration operators and every ``.integrate()`` path go through this rather
+        than through `.mesh`, so it has to be a mesh request in its own right. Handing back the
+        ``None`` a mesh-free domain holds turned into ``'NoneType' object is not subscriptable`` deep
+        inside a finite-difference helper, which says nothing about the actual cause.
+        """
+        if self.__dict__.get("_mesh_connectivity") is None and self._needs_mesh_now():
+            self._build_deferred_mesh()
+        return self.__dict__.get("_mesh_connectivity")
+
+    @mesh_connectivity.setter
+    def mesh_connectivity(self, value):
+        self.__dict__["_mesh_connectivity"] = value
+
     def _build_deferred_mesh(self):
         """Run the meshing :attr:`mesh` deferred, once, and report what triggered it."""
         plan = self.__dict__.pop("_lazy_plan", None)  # popped first: _apply_mesh reads .mesh back
@@ -2474,6 +2491,21 @@ class domain(MeshIOMixin):
             # 1024 copies of them is not a point cloud, it is a broadcasting hazard.
             pts, _keep = np.unique(pts, axis=0, return_index=True)
             self._mesh_pool[name] = pts
+            if kind == "boundary":
+                # so `boundary_tags()` lists the faces that exist, rather than only the ones a
+                # predicate happened to name. The facet arrays stay empty until there is a mesh.
+                self._boundary_regions.setdefault(
+                    name, BoundaryRegion(tag=name, dim=dim, points=pts, tol=1e-8)
+                )
+                self._boundary_registry.setdefault(
+                    name,
+                    {
+                        "tag": name,
+                        "entity_kind": "point",
+                        "point_indices": np.arange(len(pts), dtype=int),
+                        "points": pts,
+                    },
+                )
             # Deliberately NOT `normals_by_tag`. That dict is mesh-derived everywhere else, and the
             # deferred build replaces it wholesale -- so filling it here creates arrays that go stale
             # the moment anything asks for a mesh, and a caller holding both across that boundary
@@ -2901,6 +2933,8 @@ class domain(MeshIOMixin):
         callers ask here instead of picking a store by dimension, which is what silently returned
         nothing for a hexahedral mesh.
         """
+        if self._needs_mesh_now():
+            self._build_deferred_mesh()  # facets are node ids into a mesh; the geometry has none
         for store in getattr(self, "_tag_facet_stores", ("_tag_edges", "_tag_triangles", "_tag_quads")):
             facets = (getattr(self, store, {}) or {}).get(name)
             if facets is not None and len(facets):
@@ -3790,15 +3824,25 @@ class domain(MeshIOMixin):
 
         if self._is_geometry_tag(sample_tag) and isinstance(sample, tuple) and len(sample) > 0:
             if sample[0] is None:
-                # No count, and no node set to fall back on. Follow the convention the lazy polygon
-                # path already sets: one point, redrawn every step. Over training that visits the
-                # whole region, and it is the only reading of "no count" that does not invent a
-                # resolution the user never asked for.
-                from ..utils.adaptive.resampling import RandomResampling
-
-                sample = (1, sample[1] if len(sample) > 1 else None)
-                if resampling_strategy is None:
-                    resampling_strategy = RandomResampling(resample_every=1, resample_fraction=1.0)
+                # "No count" on a mesh-free domain could mean collocation points or the node set,
+                # and which is right depends on what the caller does *later* -- so it is settled by
+                # whether a resolution was ever declared. `size=` is that declaration: asking for a
+                # mesh of a given density and then for "the interior" unambiguously means its nodes,
+                # and that is what a convergence study over `size` is built on. With no `size=` there
+                # is no declared resolution and nothing to hand back, so it refuses rather than
+                # inventing one -- guessing there would be silent, since finite differences over a
+                # single collocation point return a number, just not the one that was asked for.
+                if getattr(self.__dict__.get("_lazy_plan"), "_size", None) is None:
+                    raise ValueError(
+                        f"domain.variable({tag!r}): this domain is mesh-free and no mesh size was "
+                        f"declared, so the tag has no node set to hand back and no natural point "
+                        f"count. Say which you want:\n"
+                        f"  - continuous collocation points:  variable({tag!r}, sample=(n, None))\n"
+                        f"  - a mesh's nodes:                 give the shape a size, e.g. "
+                        f"Shape.rect(..., size=0.05), or read d.mesh first\n"
+                        f"Mesh-free sampling is opt-in precisely so that neither is chosen for you."
+                    )
+                self._build_deferred_mesh()  # a declared resolution: hand back that mesh's nodes
 
         if (
             (sample_tag in self._mesh_pool.keys() or self._is_geometry_tag(sample_tag))
