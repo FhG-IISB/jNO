@@ -316,3 +316,58 @@ def test_a_mask_built_on_a_different_mesh_is_refused():
     d._fem_enriched_nodes = np.ones(len(d.mesh.points) + 3, dtype=bool)
     with pytest.raises(ValueError, match="enrichment mask"):
         jno.fem(fem._constraints, **fem._fem_kwargs).solve(_dense)
+
+
+# ------------------------------------------------------------------ 3-D, which was plumbed but unrun
+
+
+def _poisson_3d(space, size=0.26):
+    """``-Lap u = 3 pi^2 sin(pi x) sin(pi y) sin(pi z)`` on the unit cube, ``u = 0`` on every face.
+
+    The manufactured solution vanishes on all six faces, so the homogeneous condition is EXACT and a
+    cover field's inhomogeneous-trace limitation stays out of the measurement."""
+    grad, inner = jno.np.grad, jno.np.inner
+    d = jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=size).domain()
+    tol = 1e-9
+    d.tag("walls", lambda *c: np.logical_or.reduce([(x < tol) | (x > 1 - tol) for x in c]))
+    co, cw = d.variable("interior", split=True), d.variable("walls", split=True)
+    X = [co[0], co[1], co[2]]
+    u, phi = d.fem_symbols(space=space)
+    sin = jno.np.sin
+    f = 3 * np.pi**2 * sin(np.pi * X[0]) * sin(np.pi * X[1]) * sin(np.pi * X[2])
+    stiff = inner(grad(u, X), grad(phi, X), 1)
+    fem = jno.fem([stiff - f * phi, u(cw[0], cw[1], cw[2]) - 0.0])
+    return d, fem, stiff, u.bind(x=X[0], y=X[1], z=X[2])
+
+
+def _energy(fem, stiff, sol):
+    """``1/2 integral |grad u_h|^2`` off the assembled form -- the SAME number for P1 and for an
+    enriched space, which a nodal or geometric measure would not be."""
+    return 0.5 * float(np.dot(np.asarray(sol).reshape(-1), np.asarray(fem.eval(stiff, sol)).reshape(-1)))
+
+
+def test_enrichment_helps_in_3d_too():
+    """3-D was plumbed -- ``cover_block(3)`` is 4 DOFs a node, and the mask strides by it -- but no
+    test ran an assembled 3-D solve, let alone the loop. "It ran" is not evidence: the transient path
+    marched happily while destroying its own initial condition.
+
+    With a source and homogeneous data the Galerkin solution minimises ``J = 1/2 a(v,v) - (f,v)`` and
+    ``J_h = -E_h``, so the energy RISES toward the truth: more energy is a better answer, and that is
+    the oracle. P1, full enrichment and a p-adaptive run are ordered by it."""
+    d1, fem1, st1, _ui = _poisson_3d("Lagrange")
+    e_p1 = _energy(fem1, st1, _dense(fem1.A, fem1.b))
+
+    d2, fem2, st2, _ = _poisson_3d("cover")
+    e_full = _energy(fem2, st2, _dense(fem2.A, fem2.b))
+
+    d3, fem3, st3, ui3 = _poisson_3d("cover")
+    crit = jno.np.sqrt(ui3.x**2 + ui3.y**2 + ui3.z**2 + 1e-30)
+    fem3.solve(_dense, adapt=jno.solve.enrich(criterion=crit, theta=0.5, max_iters=3))
+    e_adapt = _energy(fem3, st3, _dense(fem3.A, fem3.b))
+    frac = float(np.asarray(d3._fem_enriched_nodes).mean())
+
+    assert cover_block(3) == 4, "a 3-D cover node carries its value plus three cover coefficients"
+    assert e_full > e_p1, f"enrichment must add energy in 3-D: full {e_full:.6f} vs P1 {e_p1:.6f}"
+    assert e_adapt > e_p1, f"the p-adaptive run must beat P1: {e_adapt:.6f} vs {e_p1:.6f}"
+    assert e_adapt <= e_full + 1e-12, "a partial enrichment cannot beat enriching everything"
+    assert 0.0 < frac < 1.0, f"nothing was chosen in 3-D (enriched {frac:.0%})"
