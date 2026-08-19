@@ -491,6 +491,14 @@ class domain(MeshIOMixin):
         keep_orphan_nodes: bool = False,
         **_ignored_kwargs,
     ):
+        if "structured" in _ignored_kwargs:
+            raise ValueError(
+                "jno.domain(..., structured=True) was replaced by Shape.structured() and is no longer "
+                "read. It was being swallowed by **_ignored_kwargs, so the domain came back WITHOUT a "
+                "grid descriptor and the failure surfaced far away (scheme='spectral' refusing a "
+                "domain the caller believed was structured). Spell it "
+                "jno.Shape.rect(0, 0, 1, 1, size=h).structured().domain() instead."
+            )
         """
         Initialize the domain.
 
@@ -3127,7 +3135,7 @@ class domain(MeshIOMixin):
 
         from jno.utils.solver.fem_adapt import _locate_in_cells
 
-        owner, _, inside = _locate_in_cells(src_pts, src_cells, tgt_centroids, tol=1e-9, k=32)
+        owner, _w, _ref, inside = _locate_in_cells(src_pts, src_cells, tgt_centroids, tol=1e-9, k=32)
         return np.where(inside, vals[owner], float(outside))
 
     def interior_edges(self):

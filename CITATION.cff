@@ -1,7 +1,7 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it."
 title: "jNO: A JAX Library for Differentiable Numerical Methods and Scientific Machine Learning"
-version: "0.3.0"
+version: "0.3.1"
 date-released: 2026-08-11
 license: EPL-2.0
 repository-code: "https://github.com/FhG-IISB/jno"

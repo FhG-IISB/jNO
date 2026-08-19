@@ -53,6 +53,8 @@ def _size_on_and_off_ridge(dom, halfwidth=0.10):
 def test_a_coordinate_criterion_refines_where_it_peaks(cell):
     """The headline. A criterion peaked on the ridge must put the small cells there — and the ridge is
     NOT where the ZZ estimator would refine, since the solution of this problem is smooth."""
+    if cell == "simplex":  # the tensor path rebuilds its Shape plan; only the simplex one calls mmg
+        pytest.importorskip("mmgpy", reason="mmgpy required for adaptive remeshing")
     d, fem, _ui, _vi, xi, yi = _ridge_problem(cell)
     crit = jno.np.exp(-(((xi + yi - 1.0) / 0.06) ** 2))
     fem.solve(adapt=jno.solve.remesh(criterion=crit, theta=0.4, max_iters=3, refine_factor=2.0))
@@ -101,6 +103,7 @@ def test_a_constant_criterion_marks_by_cell_size_alone():
     """The degenerate case, worth pinning: with `criterion=1` the indicator is the cell volume, so
     Dorfler marks the biggest cells and the loop performs uniform-ish refinement rather than doing
     something undefined."""
+    pytest.importorskip("mmgpy", reason="mmgpy required for adaptive remeshing")
     _d, fem, _ui, _vi, xi, _yi = _ridge_problem()
     n0 = len(fem.domain.mesh.points)
     fem.solve(adapt=jno.solve.remesh(criterion=1.0 + 0.0 * xi, theta=0.6, max_iters=2))
