@@ -2076,9 +2076,7 @@ class domain(MeshIOMixin):
                     "boundary", None, where, self._REFERENCE_BOUNDARY, np.random.default_rng(0), False
                 )
                 self._mesh_pool[name] = _pts
-                self._boundary_regions[name] = BoundaryRegion(
-                    tag=name, dim=int(self.dimension), points=_pts, tol=1e-8
-                )
+                self._boundary_regions[name] = BoundaryRegion(tag=name, dim=int(self.dimension), points=_pts, tol=1e-8)
                 self._boundary_registry[name] = {
                     "tag": name,
                     "entity_kind": "point",
@@ -2494,9 +2492,7 @@ class domain(MeshIOMixin):
             if kind == "boundary":
                 # so `boundary_tags()` lists the faces that exist, rather than only the ones a
                 # predicate happened to name. The facet arrays stay empty until there is a mesh.
-                self._boundary_regions.setdefault(
-                    name, BoundaryRegion(tag=name, dim=dim, points=pts, tol=1e-8)
-                )
+                self._boundary_regions.setdefault(name, BoundaryRegion(tag=name, dim=dim, points=pts, tol=1e-8))
                 self._boundary_registry.setdefault(
                     name,
                     {
@@ -2556,8 +2552,7 @@ class domain(MeshIOMixin):
             keep = np.ones(len(pts), dtype=bool)
             if name is not None:  # an auto-named slice of the boundary
                 keep &= np.array(
-                    [(_classify(plan._node, float(p[0]), float(p[1]), float(p[2])) or (None, None))[1] == name
-                     for p in pts]
+                    [(_classify(plan._node, float(p[0]), float(p[1]), float(p[2])) or (None, None))[1] == name for p in pts]
                 )
             if predicate is not None:
                 keep &= np.asarray(predicate(*[pts[:, i] for i in range(dim)])).reshape(-1).astype(bool)
@@ -2585,8 +2580,9 @@ class domain(MeshIOMixin):
         want_normals = bool(normals) and kind == "boundary"
         if normals and kind != "boundary":
             raise ValueError(f"normals are only available on a boundary tag, and '{source_tag}' is interior.")
-        per_batch = [self._draw_geometry_points(kind, name, predicate, n_samples, rng, want_normals)
-                     for _ in range(batch_count)]
+        per_batch = [
+            self._draw_geometry_points(kind, name, predicate, n_samples, rng, want_normals) for _ in range(batch_count)
+        ]
         spatial = np.stack([p for p, _n in per_batch], axis=0)  # (B, N, D) — independent per batch row
         n_time = 1
         if self._is_time_dependent and self.time is not None:
@@ -4810,9 +4806,7 @@ class domain(MeshIOMixin):
                 while tag in self.context and tag not in self._param_tags:
                     tag = og_tag + f"_{ii}"
                     ii += 1
-                self._sample_geometry_tag(
-                    tag, source_tag, n_samples, normals, batch_count, _apply_time_value_to_sampled
-                )
+                self._sample_geometry_tag(tag, source_tag, n_samples, normals, batch_count, _apply_time_value_to_sampled)
                 idx = None
                 if self._verbose:
                     self.log.info(f"Sampled {n_samples} points for '{tag}' from the geometry (no mesh)")

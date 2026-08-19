@@ -62,7 +62,12 @@ def test_auto_named_boundaries_exist_before_any_mesh():
     """The names come from the same classifier the mesher uses — applied to analytic boundary
     points instead of gmsh entities — so a CSG cut introduces its own name too."""
     assert set(jno.Shape.rect(0, 0, 2, 1).domain()._geometry_tags) >= {
-        "interior", "boundary", "left", "right", "top", "bottom",
+        "interior",
+        "boundary",
+        "left",
+        "right",
+        "top",
+        "bottom",
     }
     holed = (jno.Shape.rect(0, 0, 1, 1) - jno.Shape.disk(0.5, 0.5, 0.25)).domain()
     assert "arc" in holed._geometry_tags, "the cut introduced a circular edge; it should be nameable"
@@ -257,12 +262,18 @@ def test_a_time_dependent_shape_domain_carries_the_time_axis():
 @pytest.mark.parametrize(
     "make, why",
     [
-        (lambda: jno.Shape.rect(0, 0, 1, 1, size=0.3).extrude(1.0).fillet(0.05).domain(),
-         "fillet removes material near edges, so no closed-form membership"),
-        (lambda: jno.Shape.rect(0, 0, 1, 1, size=0.3).name("core").domain(),
-         "a named region's tags are the mesher's conforming sub-bodies"),
-        (lambda: jno.Shape.rect(0, 0, 1, 1, size=0.3).structured().domain(),
-         "a structured plan is a lattice, not a Shape, by the time it is built"),
+        (
+            lambda: jno.Shape.rect(0, 0, 1, 1, size=0.3).extrude(1.0).fillet(0.05).domain(),
+            "fillet removes material near edges, so no closed-form membership",
+        ),
+        (
+            lambda: jno.Shape.rect(0, 0, 1, 1, size=0.3).name("core").domain(),
+            "a named region's tags are the mesher's conforming sub-bodies",
+        ),
+        (
+            lambda: jno.Shape.rect(0, 0, 1, 1, size=0.3).structured().domain(),
+            "a structured plan is a lattice, not a Shape, by the time it is built",
+        ),
     ],
     ids=["fillet", "named-region", "structured"],
 )

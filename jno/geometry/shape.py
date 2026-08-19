@@ -55,8 +55,7 @@ def _revolve_coords(pts, axis_point, axis_dir):
     if at_origin and abs(ax) > 1e-9 and abs(ay) < 1e-9 and abs(az) < 1e-9:  # x-axis
         return np.stack([X, np.hypot(Y, Z)], axis=1), np.mod(np.arctan2(Z, Y), 2.0 * math.pi)
     raise NotImplementedError(
-        f"revolve currently supports the x- or y-axis through the origin; got "
-        f"axis_point={axis_point}, axis_dir={axis_dir}."
+        f"revolve currently supports the x- or y-axis through the origin; got axis_point={axis_point}, axis_dir={axis_dir}."
     )
 
 
@@ -318,8 +317,10 @@ class _RevolvedSurface:
             m_nrm = np.concatenate(got_n)[:k]
             s = rng.uniform(0.0, self._angle, size=k)
             pts[sel] = self._to_world(m_pts, s)
-            nrm[sel] = self._to_world(m_nrm, s) if not self._y_axis else np.stack(
-                [m_nrm[:, 0] * np.cos(s), m_nrm[:, 1], -m_nrm[:, 0] * np.sin(s)], axis=1
+            nrm[sel] = (
+                self._to_world(m_nrm, s)
+                if not self._y_axis
+                else np.stack([m_nrm[:, 0] * np.cos(s), m_nrm[:, 1], -m_nrm[:, 0] * np.sin(s)], axis=1)
             )
         for cap, s_cap, sign in ((1, 0.0, -1.0), (2, self._angle, 1.0)):
             sub = f == cap
@@ -949,8 +950,8 @@ class Shape:
         weights = np.array([m for _prim, m in pieces], dtype=float)
         if not len(pieces) or weights.sum() <= 0.0:
             raise NotImplementedError(
-                f"no analytic boundary is available for this plan; its boundary comes from the "
-                f"tessellation instead (Shape.tessellate)."
+                "no analytic boundary is available for this plan; its boundary comes from the "
+                "tessellation instead (Shape.tessellate)."
             )
         lo, hi = (np.asarray(v, dtype=float) for v in self.bounds())
         eps = 1e-9 * max(float(np.max(hi - lo)), 1.0)
@@ -974,9 +975,7 @@ class Shape:
                 have += int(on_surface.sum())
             if have >= n:
                 return np.concatenate(p_out)[:n], np.concatenate(n_out)[:n]
-        raise RuntimeError(
-            f"sample_boundary drew {max_rounds} rounds without reaching {n} points (got {have})."
-        )
+        raise RuntimeError(f"sample_boundary drew {max_rounds} rounds without reaching {n} points (got {have}).")
 
     # ----- boundary selection ----------------------------------------------------
     def edge(self, name: str) -> Selector:

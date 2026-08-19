@@ -92,8 +92,17 @@ def test_bounds_refuse_by_name_without_a_closed_form():
         Shape.rect(1.0, 0.0, 2.0, 1.0, size=0.25).revolve((0.0, 0.0, 0.0), (0.0, 1.0, 0.0), math.pi),
     ],
     ids=[
-        "rect", "rect-disk", "box", "box-sphere", "cylinder", "translate",
-        "rotate", "extrude", "disk-extrude", "revolve-full", "revolve-half",
+        "rect",
+        "rect-disk",
+        "box",
+        "box-sphere",
+        "cylinder",
+        "translate",
+        "rotate",
+        "extrude",
+        "disk-extrude",
+        "revolve-full",
+        "revolve-half",
     ],
 )
 def test_contains_accepts_every_node_of_the_mesh_it_describes(shape):
@@ -181,8 +190,21 @@ def test_a_vanishing_shape_raises_instead_of_returning_short():
         Shape.rect(1.0, 0.0, 2.0, 1.0).revolve((0.0, 0.0, 0.0), (0.0, 1.0, 0.0), math.pi),
         Shape.rect(0.0, 0.0, 3.0, 1.0).revolve((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), 2 * math.pi),
     ],
-    ids=["rect", "disk", "box", "sphere", "cylinder", "rect-disk", "box-sphere",
-         "translate", "rotate", "disk-extrude", "revolve", "revolve-half", "revolve-x"],
+    ids=[
+        "rect",
+        "disk",
+        "box",
+        "sphere",
+        "cylinder",
+        "rect-disk",
+        "box-sphere",
+        "translate",
+        "rotate",
+        "disk-extrude",
+        "revolve",
+        "revolve-half",
+        "revolve-x",
+    ],
 )
 def test_boundary_points_are_on_the_surface_with_outward_unit_normals(shape):
     """Stepping a hair along +n must leave the shape and along -n must stay inside — which is a
