@@ -1276,7 +1276,7 @@ def relocate(
 
 def enrich(
     *,
-    criterion=None,
+    criterion,
     theta: float = 0.5,
     max_iters: int = 8,
     max_dofs: int | None = None,
@@ -1302,19 +1302,63 @@ def enrich(
     Compose with :func:`refine` across successive solves for **hp** — h where the solution is rough,
     p where it is smooth.
 
+    **A criterion is required, and that is a deliberate refusal to guess.** Two built-in estimators
+    were measured against a hand-written one and both lost::
+
+        driver                       L2 x DOFs (lower is better)
+        Zienkiewicz-Zhu recovery         2.74      and ANTI-CORRELATED with the error: it rose
+                                                   1.3353e-01 -> 1.3377e-01 over eight rounds while
+                                                   the true L2 fell 4.692e-03 -> 2.677e-03
+        hierarchical residual            2.67      honest (it vanishes where enrichment is already
+                                                   on, by Galerkin orthogonality) but no better at
+                                                   marking, and it left a sharp spike untouched
+        criterion=sqrt(ui.x**2+ui.y**2)  1.37
+
+    ZZ recovers its gradient from the VERTEX VALUES, and enrichment lives in the cover coefficients,
+    so it cannot see the space it is estimating. Rather than pick a heuristic on the caller's behalf
+    -- gradient of which field, reduced how, for a coupled system? -- this asks for the one thing
+    only the caller knows.
+
+    Example -- a gradient-magnitude criterion, the general-purpose choice::
+
+        d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.02).domain()
+        d.tag("walls", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
+        co, cw = d.variable("interior", split=True), d.variable("walls", split=True)
+
+        u, phi = d.fem_symbols(space="cover")          # the enriched space p-adaptivity needs
+        ui, vi = u.bind(x=co[0], y=co[1]), phi.bind(x=co[0], y=co[1])
+        fem = jno.fem([ui.x * vi.x + ui.y * vi.y - f * vi, u(cw[0], cw[1]) - 0.0])
+
+        fem.solve(
+            solve_fn,                                   # adapt= does not take linear=; pass it here
+            adapt=jno.solve.enrich(
+                criterion=jno.np.sqrt(ui.x**2 + ui.y**2),
+                theta=0.5,
+                max_iters=6,
+            ),
+        )
+
+    Note ``ui.xx`` is NOT available: the assembler takes gradients of a trial function only, so the
+    curvature that would be the textbook p-indicator cannot be written. A first-derivative criterion
+    is the practical stand-in.
+
     Args:
-        criterion: A **traced expression** marking where to enrich, exactly as in :func:`remesh` --
-            a field, carrying no test function (``jno.np.sqrt(ui.x**2 + ui.y**2)``, ``phi*(1-phi)``,
-            ``d.by_region({...})``). Omitted, the Zienkiewicz–Zhu recovery estimator is used,
-            spread from cells to their nodes.
+        criterion: **Required.** A traced expression marking where to enrich, exactly as in
+            :func:`remesh` -- a field, carrying no test function
+            (``jno.np.sqrt(ui.x**2 + ui.y**2)``, ``phi*(1-phi)``, ``d.by_region({...})``).
         theta: Dörfler bulk-marking fraction, over NODES rather than cells: the fewest nodes whose
             indicator reaches ``theta`` of the total are enriched each round.
         max_iters: Maximum enrich-solve rounds.
         max_dofs: Stop once the system reaches this many ACTIVE DOFs. Active, not total: the padded
             layout gives every node its cover slots and an unenriched node simply has them pinned, so
             the total never changes and only the free count tracks the enrichment.
-        tol: Stop once the global indicator falls below this.
-        eps: Stop when the indicator plateaus for two consecutive rounds.
+        tol: Stop once the global indicator falls below this. **Requires an explicit ``criterion``** --
+            with the built-in estimator this is refused by name, because the Zienkiewicz-Zhu recovery
+            is computed from the vertex values and so cannot see the cover coefficients enrichment
+            adds: the estimate reads the same number every round while the true error falls.
+        eps: Stop when the indicator plateaus for two consecutive rounds. Same requirement, and the
+            same reason with a sharper edge -- against a frozen estimate the relative change is
+            exactly 0.0, so this would declare a plateau on a loop that is still converging.
         metric_field: Which field of a coupled problem drives the marking.
 
     Scope: simplices only, first-order covers, and the enriched field must be ``space="cover"``.

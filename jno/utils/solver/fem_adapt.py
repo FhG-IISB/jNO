@@ -2732,6 +2732,35 @@ def run_adaptive_enrich(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kw
             "none to switch. Declare it as d.fem_symbols(space='cover')."
         )
 
+    # `tol` and `eps` both read the global estimate, and with the DEFAULT estimator that number cannot
+    # move: the ZZ recovery is built from the vertex values (`zz_error_indicators` takes `u_vertex` and
+    # differentiates the P1 basis), so it never sees a cover coefficient -- and cover coefficients are
+    # what enrichment adds. Measured on the heat-plate problem: the estimate reads 1.1965e+00 in EVERY
+    # round, bit-identical, while the true L2 error falls 1.948e-02 -> 8.480e-04 across six rounds.
+    #
+    # A frozen estimate does not make these knobs merely useless, it makes them wrong in opposite
+    # directions: `tol` can never be crossed that was not already crossed at round 0, and `eps` sees a
+    # relative change of exactly 0.0 every round, so it declares a plateau after `_EPS_PATIENCE` rounds
+    # and stops a loop that is still converging. Refuse them rather than let either happen quietly. A
+    # user `criterion=` is a different matter -- it is whatever the caller wrote, and it is their
+    # business whether it moves -- so this guard is scoped to the built-in estimator.
+    if spec.criterion is None:
+        raise ValueError(
+            "jno.solve.enrich(criterion=...) is required. The recovery estimator that would be the "
+            "obvious default is blind here -- it reconstructs a gradient from the VERTEX VALUES, and "
+            "enrichment lives in the cover coefficients -- so it reports a number anti-correlated "
+            "with the error. See jno.solve.enrich for the measurements and a worked criterion."
+        )
+    if spec.tol is not None or spec.eps is not None:
+        raise NotImplementedError(
+            "jno.solve.enrich(tol=/eps=) has nothing to compare against. `estimate` is the norm of "
+            "whatever drives the marking, and a criterion is a FIELD MAGNITUDE, not an error: measured "
+            "on a plate problem it rose 4.2967e+01 -> 4.3068e+01 across eight rounds while the true L2 "
+            "error fell by a factor of three. `eps` would read that as a plateau and stop a converging "
+            "loop; `tol` would compare against a number with no relation to accuracy. Bound the run "
+            "with `max_iters`/`max_dofs` instead."
+        )
+
     mask = np.zeros(n_vert, dtype=bool)  # round 0 is a plain P1 solve; see AdaptSpec.enrich
     d._fem_enriched_nodes = mask.copy()
     history: list[dict] = []
@@ -2744,15 +2773,7 @@ def run_adaptive_enrich(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kw
         u = _vertex_view(_full, cur, allow_vector=True)
         fld = int(spec.metric_field)
         stride = max(1, int(np.asarray(cur.field_points[fld]).shape[0]) // max(n_vert, 1))
-        if spec.criterion is not None:
-            g = _criterion_nodal(cur, spec.criterion, _full, fld, stride=stride)
-        else:
-            # No criterion: fall back to the recovery estimator, spread from cells to their nodes so
-            # the marking is nodal like everything else here.
-            eta_c, _e = zz_error_indicators(d, u)
-            cells, _dim = _mesh_cells(d, "jno.solve.enrich(...)")
-            g = np.zeros(n_vert)
-            np.maximum.at(g, cells.reshape(-1), np.repeat(eta_c, cells.shape[1]))
+        g = _criterion_nodal(cur, spec.criterion, _full, fld, stride=stride)
         g = np.asarray(g).reshape(-1)[:n_vert]
         est = float(np.sqrt(np.sum(g**2)))
         # The padded layout is UNIFORM -- every node owns cover slots whether or not it is enriched --

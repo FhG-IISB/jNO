@@ -2894,7 +2894,11 @@ def assemble_fem_native(
         node's coordinates, so the region lookup finds every slot; this is where they are told
         apart, by their position within the node's block."""
         blk = _cblk[fidx]
-        return float(g) if blk == 1 or (int(nid) % blk) == 0 else 0.0
+        # NOT float(g): a net-valued condition (`u(top) - net(x)`) arrives as a traced JAX scalar, and
+        # casting it raises ConcretizationTypeError -- which took down every `test_dirichlet_net_*`
+        # case, plain Lagrange included, since blk == 1 came through here too. Pass the value along
+        # and let the pair carry whatever it is; only the COVER slots need forcing, and to zero.
+        return g if blk == 1 or (int(nid) % blk) == 0 else 0.0
 
     _cover_gauge_pins: List[Any] = []
     _cover_gauge_done = [False]
