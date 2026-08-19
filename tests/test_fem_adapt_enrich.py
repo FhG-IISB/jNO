@@ -355,7 +355,15 @@ def test_a_resumed_run_reuses_the_caller_s_operator_without_changing_the_answer(
     """The opening rebuild is skipped when the caller's FEM already carries this exact mask, which is
     what a resumed run always hands it. A rebuild is the loop's dominant cost, so the saving is real --
     but only if it is a saving and not a shortcut, so the reused run is checked against one forced to
-    rebuild: same enrichment, same field, to the last bit."""
+    rebuild: same enrichment, same field.
+
+    The **enrichment mask** is compared exactly -- it is integer data and any difference there is a
+    real defect. The **field** is compared to 1e-12 rather than bit-exactly, because bit-exactness is
+    not available to assert on: the assembly's scatter-add is non-deterministic at the last bit on
+    GPU, and this test measured 1.1e-16, 2.2e-16 and 3.3e-16 on three consecutive runs of identical
+    code (it passes bit-exactly on CPU, which is what makes the source unambiguous). The tolerance is
+    still four orders tighter than any real shortcut: a stale operator or a wrong mask moves the
+    field by 1e-3 or more, not by an ULP."""
 
     def run(force_rebuild):
         d, fem, _X, _co = _poisson(size=0.25, rhs=_sin_rhs)
@@ -375,7 +383,13 @@ def test_a_resumed_run_reuses_the_caller_s_operator_without_changing_the_answer(
     n_rebuilt, mask_rebuilt, u_rebuilt = run(force_rebuild=True)
     assert n_rebuilt == n_reused + 1 == 2, f"expected one build saved, got {n_reused} vs {n_rebuilt}"
     assert np.array_equal(mask_reused, mask_rebuilt), "reuse changed which nodes were enriched"
-    assert np.array_equal(u_reused, u_rebuilt), f"reuse changed the field by {np.abs(u_reused - u_rebuilt).max():.3e}"
+    np.testing.assert_allclose(
+        u_reused,
+        u_rebuilt,
+        rtol=0.0,
+        atol=1e-12,
+        err_msg=f"reuse changed the field by {np.abs(u_reused - u_rebuilt).max():.3e}",
+    )
 
 
 # ------------------------------------------------------------------ it refuses what it cannot do
