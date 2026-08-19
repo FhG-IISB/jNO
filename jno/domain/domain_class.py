@@ -3172,16 +3172,25 @@ class domain(MeshIOMixin):
         Returns:
             ``(target_n_cells,)`` numpy array.
 
+        Triangles in 2-D and tetrahedra in 3-D. The point location underneath
+        (:func:`fem_adapt._locate_in_cells`) is dimension-generic on a simplex -- ``dim + 1``
+        vertices and one ``dim x dim`` solve for the barycentric coordinates -- so the tetrahedral
+        case is the same code, not a second implementation.
+
         References:
             Jung, Yun & Kim, *Computers & Structures* **331** (2026) 108403, Fig. 7c-d, where the
             gap is +17.6 % for conventional elements and -0.5 % with the enriched formulation.
         """
-        if int(self.dimension) != 2:
-            raise NotImplementedError(
-                f"domain.transfer_cell_field(): 2-D triangles only; this domain is {self.dimension}-D."
+        dim = int(self.dimension)
+        if dim not in (2, 3):
+            raise NotImplementedError(f"domain.transfer_cell_field(): simplices in 2-D or 3-D; this domain is {dim}-D.")
+        if int(target.dimension) != dim:
+            raise ValueError(
+                f"domain.transfer_cell_field(): the target is {int(target.dimension)}-D but this domain is "
+                f"{dim}-D; a per-element field cannot cross dimensions."
             )
         src_cells = self._cells_p1()
-        src_pts = np.asarray(self.mesh.points)[:, :2] if points is None else np.asarray(points)[:, :2]
+        src_pts = np.asarray(self.mesh.points)[:, :dim] if points is None else np.asarray(points)[:, :dim]
         vals = np.asarray(values).reshape(-1)
         if vals.size != src_cells.shape[0]:
             raise ValueError(
@@ -3189,13 +3198,35 @@ class domain(MeshIOMixin):
                 f"{src_cells.shape[0]} cells."
             )
         tgt_cells = target._cells_p1()
-        tgt_centroids = np.asarray(target.mesh.points)[:, :2][tgt_cells].mean(axis=1)
+        tgt_centroids = np.asarray(target.mesh.points)[:, :dim][tgt_cells].mean(axis=1)
 
         from jno.utils.solver.fem_adapt import _locate_in_cells
 
         # 4-tuple: `_locate_in_cells` grew a reference-coordinate return with the quad/hex elements
         # (271363d3), after this call site was written against the 3-tuple.
-        owner, _w, _ref, inside = _locate_in_cells(src_pts, src_cells, tgt_centroids, tol=1e-9, k=32)
+        #
+        # `k` is how many nearest CENTROIDS are tested for containment, and 32 is calibrated on
+        # triangles. It is not enough on tetrahedra: a tet is pointier than a triangle, so its
+        # centroid sits further from parts of the cell, and the containing tet can rank well down
+        # the centroid ordering. Measured on a 138-tet box against its own refinement, one target
+        # centroid of 767 -- at (1.545, 0.996, 1.015), the middle of the mesh, not a boundary case
+        # -- had its true tet at rank exactly 32, so a k=32 search missed it by one and the point
+        # was silently reported outside the mesh and given `outside`.
+        #
+        # So escalate, and only on the points that missed: the common path stays at k=32, and a
+        # handful of stragglers get a wider search rather than every query paying for one (the
+        # candidate solve is (Q, k, dim, dim), so a blanket k=128 would quadruple its memory).
+        # Genuinely exterior points -- disjoint domains, which `outside=` exists for -- never
+        # resolve, hence the cap: past it they are accepted as outside, which is the right answer
+        # for them and a bounded cost for everyone.
+        k, k_max = 32, min(512, int(src_cells.shape[0]))
+        owner, _w, _ref, inside = _locate_in_cells(src_pts, src_cells, tgt_centroids, tol=1e-9, k=k)
+        owner, inside = np.asarray(owner).copy(), np.asarray(inside).copy()
+        while not inside.all() and k < k_max:
+            k = min(k * 4, k_max)
+            miss = ~inside
+            o_m, _w_m, _r_m, in_m = _locate_in_cells(src_pts, src_cells, tgt_centroids[miss], tol=1e-9, k=k)
+            owner[miss], inside[miss] = o_m, in_m
         return np.where(inside, vals[owner], float(outside))
 
     def interior_edges(self):

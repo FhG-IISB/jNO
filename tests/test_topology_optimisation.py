@@ -500,6 +500,79 @@ class TestCrossMeshTransfer:
         with pytest.raises(ValueError, match="entries but this mesh has"):
             coarse.transfer_cell_field(np.ones(3), fine)
 
+    # --- tetrahedra. The reanalysis is what keeps a deformable-mesh run honest, so it has to
+    # --- exist in 3-D before a 3-D design does; `_locate_in_cells` is already dimension-generic
+    # --- on a simplex, so these pin that the wrapper agrees rather than that a new algorithm works.
+
+    def test_a_constant_field_survives_transfer_on_tets(self):
+        """Also the regression test for the candidate-search width, which is why the sizes are exact.
+
+        Both meshes tile the same box, so EVERY target centroid lies in some source tet and a
+        constant must come back constant -- any element taking ``outside`` is a point location that
+        missed. On this configuration one of 767 did: the target centroid at (1.545, 0.996, 1.015)
+        had its containing tet at rank exactly 32 in the centroid ordering, and the k=32 search
+        looks at ranks 0-31. A tet is pointier than a triangle, so its centroid sits further from
+        parts of it and the ranking is looser than the 2-D default assumes.
+        """
+        coarse = jno.Shape.box(0, 0, 0, 4, 2, 2, size=1.0).domain()
+        fine = jno.Shape.box(0, 0, 0, 4, 2, 2, size=0.5).domain()
+        n_c, n_f = int(coarse._cells_p1().shape[0]), int(fine._cells_p1().shape[0])
+        assert coarse._cells_p1().shape[1] == 4, "this must be a tetrahedral mesh"
+        assert n_f > 2 * n_c, f"the target must be genuinely finer ({n_c} -> {n_f})"
+        out = coarse.transfer_cell_field(np.full(n_c, 0.7), fine)
+        assert out.shape == (n_f,)
+        np.testing.assert_allclose(out, 0.7, atol=1e-12)
+
+    def test_a_slab_lands_in_the_right_place_on_tets(self):
+        """A slab transfers to a slab: the geometry has to survive, not merely the values.
+
+        The margins are one source cell wide on purpose. The slab is defined by which SOURCE
+        centroid falls inside it, so its real boundary is a staircase of amplitude ``h_src``; a
+        target centroid closer than that to the nominal interface can legitimately land in a source
+        cell on the other side. Asserting inside a tighter band would be asserting that the coarse
+        mesh resolves the plane exactly, which it does not.
+        """
+        h = 0.5
+        coarse = jno.Shape.box(0, 0, 0, 4, 2, 6, size=h).domain()
+        fine = jno.Shape.box(0, 0, 0, 4, 2, 6, size=h / 2).domain()
+        c_cen = np.asarray(coarse.mesh.points)[:, :3][coarse._cells_p1()].mean(axis=1)
+        slab = np.where(np.abs(c_cen[:, 2] - 3.0) < 1.5, 1.0, 0.0)
+        assert 0.1 < slab.mean() < 0.9, "the slab must be a real subset for this to test anything"
+
+        out = coarse.transfer_cell_field(slab, fine)
+        f_cen = np.asarray(fine.mesh.points)[:, :3][fine._cells_p1()].mean(axis=1)
+        deep_in = np.abs(f_cen[:, 2] - 3.0) < 1.5 - 1.5 * h
+        deep_out = np.abs(f_cen[:, 2] - 3.0) > 1.5 + 1.5 * h
+        assert deep_in.any() and deep_out.any(), "both bands must be populated or this asserts nothing"
+        assert out[deep_in].min() == 1.0, "material vanished inside the slab"
+        assert out[deep_out].max() == 0.0, "material appeared outside it"
+        assert out.mean() == pytest.approx(slab.mean(), abs=0.05)
+
+    def test_deformed_source_coordinates_are_honoured_on_tets(self):
+        """The 3-D half of the reanalysis contract: a mesh moved by `.trainable()` must be read on
+        its DEFORMED coordinates, or the density is sampled off the geometry it was never on."""
+        coarse = jno.Shape.box(0, 0, 0, 4, 2, 2, size=0.8).domain()
+        fine = jno.Shape.box(0, 0, 0, 4, 2, 2, size=0.4).domain()
+        pts = np.asarray(coarse.mesh.points)[:, :3]
+        slab = np.where(np.abs(pts[coarse._cells_p1()].mean(axis=1)[:, 2] - 1.0) < 0.4, 1.0, 0.0)
+
+        shifted = pts.copy()
+        interior = (pts[:, 2] > 1e-9) & (pts[:, 2] < 2.0 - 1e-9)
+        shifted[interior, 2] += 0.3
+
+        same = coarse.transfer_cell_field(slab, fine)
+        moved = coarse.transfer_cell_field(slab, fine, points=shifted)
+        assert not np.allclose(same, moved), "moving the source nodes must move the field"
+        assert moved.sum() == pytest.approx(same.sum(), rel=0.30)
+
+    def test_a_target_of_a_different_dimension_is_refused(self):
+        """Both meshes carry `(n_cells,)` fields, so a dimension mismatch would otherwise reach the
+        point locator as a shape error from three frames down."""
+        box = jno.Shape.box(0, 0, 0, 2, 2, 2, size=1.0).domain()
+        rect = jno.Shape.rect(0, 0, 2, 2, size=1.0).domain()
+        with pytest.raises(ValueError, match="cannot cross dimensions"):
+            box.transfer_cell_field(np.ones(int(box._cells_p1().shape[0])), rect)
+
 
 class TestFacetTractionTotal:
     """A traction band must apply the resultant it was asked for, at every mesh size.
