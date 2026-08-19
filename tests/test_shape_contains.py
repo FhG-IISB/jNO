@@ -1,7 +1,9 @@
 """``jno.Shape.contains`` — analytic, shapely-free point-in-region membership (2-D & 3-D).
 
 The point-containment predicate that resolves a geometric ``domain.region(name, shape)`` to a mesh-node
-subset. CSG only (leaf + cut/fuse/inter); non-analytic transforms raise."""
+subset, and the membership test the mesh-free PINN sampler rejects against. Covers CSG (leaf +
+cut/fuse/inter/regions) and the transforms whose inverse is closed-form (translate/rotate/extrude/
+revolve); ``sweep`` and ``fillet`` have none and refuse by name."""
 
 import numpy as np
 import pytest
@@ -68,7 +70,36 @@ def test_difference_matches_shapely():
     assert np.array_equal(ours, theirs)
 
 
-def test_non_csg_transform_raises():
-    solid = Shape.rect(0.0, 0.0, 1.0, 1.0).extrude(1.0)  # a swept solid — no analytic membership
-    with pytest.raises(NotImplementedError, match="closed-form"):
+def test_rigid_and_sweep_transforms_are_analytic():
+    """translate/rotate/extrude/revolve map the query point into the child's frame, so membership
+    stays closed-form; each is checked against the geometry it is supposed to describe."""
+    box = Shape.rect(0.0, 0.0, 1.0, 1.0).extrude(2.0)  # the unit square swept to height 2
+    pts = np.array([[0.5, 0.5, 1.0], [0.5, 0.5, 2.5], [1.5, 0.5, 1.0], [0.5, 0.5, 0.0]])
+    assert list(box.contains(pts)) == [True, False, False, True]  # the z=0 cap is inclusive
+
+    moved = Shape.rect(0.0, 0.0, 1.0, 1.0).translate((5.0, 0.0, 0.0))
+    assert list(moved.contains(np.array([[5.5, 0.5], [0.5, 0.5]]))) == [True, False]
+
+    turned = Shape.rect(0.0, 0.0, 2.0, 1.0).rotate((0.0, 0.0, 0.0), (0.0, 0.0, 1.0), np.pi / 2)
+    assert list(turned.contains(np.array([[-0.5, 1.0], [1.0, 0.5]]))) == [True, False]
+
+    # the profile x in [1, 2] swept a full turn about +y is the ring 1 <= sqrt(x^2+z^2) <= 2
+    ring = Shape.rect(1.0, 0.0, 2.0, 1.0).revolve((0.0, 0.0, 0.0), (0.0, 1.0, 0.0), 2 * np.pi)
+    pts = np.array([[1.5, 0.5, 0.0], [0.0, 0.5, 1.5], [0.5, 0.5, 0.0], [1.5, 1.5, 0.0]])
+    assert list(ring.contains(pts)) == [True, True, False, False]
+
+
+def test_sweep_and_fillet_refuse_by_name():
+    """The two plans with genuinely no closed form say so, and name the way out."""
+    solid = Shape.rect(0.0, 0.0, 1.0, 1.0).extrude(1.0).fillet(0.1)
+    with pytest.raises(NotImplementedError, match="tessellation"):
         solid.contains(np.zeros((1, 3)))
+
+
+def test_cut_keeps_its_own_cut_surface():
+    """``A - B`` retains the surface it was cut along — that is where a mesh puts nodes, so
+    testing the subtrahend inclusively would drop every node on a hole's boundary."""
+    holed = Shape.rect(0.0, 0.0, 1.0, 1.0) - Shape.disk(0.5, 0.5, 0.25)
+    on_hole = np.array([[0.75, 0.5], [0.5, 0.75], [0.25, 0.5]])  # exactly at radius 0.25
+    assert holed.contains(on_hole).all()
+    assert not holed.contains(np.array([[0.5, 0.5]])).any()  # the hole's middle is still out

@@ -22,16 +22,59 @@ from typing import Callable, FrozenSet, Optional, Tuple, Union
 
 import numpy as np
 
-from .primitives import Box, Cylinder, Disk, Polygon, Rect, Sphere
+from .primitives import Box, Cylinder, Disk, Polygon, Rect, Sphere, _to3
+
+# Nodes with no closed-form point membership. `sweep` follows an arbitrary path and `fillet`
+# *removes* material near edges, so recursing to the child would silently answer for the
+# un-filleted solid — a superset, i.e. a wrong-but-plausible mask. Both defer to a boundary
+# tessellation instead (see ``Shape.tessellate``).
+_NO_ANALYTIC_MEMBERSHIP = ("sweep", "fillet")
+
+
+def _rotate_points(pts, axis_point, axis_dir, angle):
+    """Rodrigues rotation of ``(N, 3)`` points about the axis — the vectorised twin of
+    :func:`jno.geometry.naming._rotate_point`, which does the same for one point."""
+    p = np.asarray(axis_point, dtype=float)
+    u = np.asarray(axis_dir, dtype=float)
+    u = u / (np.linalg.norm(u) or 1.0)
+    v = pts - p
+    c, s = math.cos(angle), math.sin(angle)
+    return p + v * c + np.cross(u, v) * s + u * ((v @ u) * (1.0 - c))[:, None]
+
+
+def _revolve_coords(pts, axis_point, axis_dir):
+    """``(meridian_xy, azimuth)`` for revolved points: the 2-D profile coords each point came
+    from, and how far round the sweep it sits. Mirrors :func:`naming._revolve_profile_coords`
+    (same x-/y-axis-through-the-origin restriction) and adds the azimuth a partial sweep needs."""
+    X, Y, Z = pts[:, 0], pts[:, 1], pts[:, 2]
+    ax, ay, az = axis_dir
+    at_origin = all(abs(c) < 1e-9 for c in axis_point)
+    if at_origin and abs(ay) > 1e-9 and abs(ax) < 1e-9 and abs(az) < 1e-9:  # y-axis
+        # rotating the profile (z=0, x>0) by s sends it to (X cos s, Y, -X sin s)
+        return np.stack([np.hypot(X, Z), Y], axis=1), np.mod(np.arctan2(-Z, X), 2.0 * math.pi)
+    if at_origin and abs(ax) > 1e-9 and abs(ay) < 1e-9 and abs(az) < 1e-9:  # x-axis
+        return np.stack([X, np.hypot(Y, Z)], axis=1), np.mod(np.arctan2(Z, Y), 2.0 * math.pi)
+    raise NotImplementedError(
+        f"revolve currently supports the x- or y-axis through the origin; got "
+        f"axis_point={axis_point}, axis_dir={axis_dir}."
+    )
 
 
 def _node_contains(node, pts, tol):
-    """Analytic point membership over the CSG tree — leaves + cut/fuse/inter, no gmsh."""
+    """Analytic point membership over the CSG tree — leaves, booleans and rigid/sweep transforms.
+
+    Transforms are handled by mapping the *query point* into the child's own frame and recursing,
+    which is the same strategy :func:`jno.geometry.naming._classify` uses for boundary naming.
+    No gmsh.
+    """
     kind = node[0]
     if kind == "leaf":
         return np.asarray(node[1].contains(pts, tol), dtype=bool)
     if kind == "cut":
-        return _node_contains(node[1]._node, pts, tol) & ~_node_contains(node[2]._node, pts, tol)
+        # The subtrahend is tested EXCLUSIVELY (-tol): `A - B` keeps the cut surface itself, which
+        # is where gmsh puts nodes. Testing B inclusively rejected every node on a hole's boundary
+        # -- 8% of an annulus mesh, 14% of a box with a spherical void, measured.
+        return _node_contains(node[1]._node, pts, tol) & ~_node_contains(node[2]._node, pts, -tol)
     if kind == "fuse":
         return _node_contains(node[1]._node, pts, tol) | _node_contains(node[2]._node, pts, tol)
     if kind == "inter":
@@ -41,11 +84,211 @@ def _node_contains(node, pts, tol):
         for _name, sub in node[1]:
             mask |= _node_contains(sub._node, pts, tol)
         return mask
+    if kind == "translate":
+        return _node_contains(node[1]._node, _to3(pts) - np.asarray(node[2], dtype=float), tol)
+    if kind == "rotate":
+        local = _rotate_points(_to3(pts), node[2], node[3], -node[4])  # undo the rotation
+        return _node_contains(node[1]._node, local, tol)
+    if kind == "extrude":
+        p = _to3(pts)
+        height = float(node[2])
+        lo, hi = min(0.0, height), max(0.0, height)
+        within = (p[:, 2] >= lo - tol) & (p[:, 2] <= hi + tol)
+        base = p.copy()
+        base[:, 2] = 0.0  # the height is consumed here; the base lives in its own z=0 plane
+        return within & _node_contains(node[1]._node, base, tol)
+    if kind == "revolve":
+        axis_point, axis_dir, angle = node[2], node[3], node[4]
+        meridian, azimuth = _revolve_coords(_to3(pts), axis_point, axis_dir)
+        swept = np.ones(len(pts), dtype=bool)
+        if abs(angle - 2.0 * math.pi) > 1e-9:  # a partial sweep only fills part of the turn
+            span = abs(angle)
+            atol = tol
+            swept = (azimuth <= span + atol) | (azimuth >= 2.0 * math.pi - atol)
+        return swept & _node_contains(node[1]._node, meridian, tol)
     raise NotImplementedError(
-        f"Shape.contains supports the analytic CSG subset — primitive leaves combined by "
-        f"'-'/'|'/'&' (cut/fuse/inter); a {kind!r} solid (extrude/revolve/sweep/fillet/translate/"
-        f"rotate) has no closed-form point membership. Tag that region another way, or add its "
-        f"inverse transform here."
+        f"Shape.contains has no closed-form point membership for a {kind!r} node. Supported "
+        f"analytically: primitive leaves, '-'/'|'/'&' (cut/fuse/inter), regions, translate, "
+        f"rotate, extrude and revolve. A {kind!r} shape is sampled through its boundary "
+        f"tessellation instead — call Shape.sample_interior/sample_boundary rather than "
+        f"Shape.contains, or tag that region another way."
+    )
+
+
+def _node_bounds(node):
+    """Axis-aligned bounding box ``(lo, hi)`` of the CSG tree as two 3-vectors, no gmsh.
+
+    Every case returns a **superset** of the true extent, never a subset: that is what lets it
+    serve as the proposal box for rejection sampling. ``cut`` keeps the left operand's box (the
+    difference can only shrink) and ``rotate``/``revolve`` bound the swept envelope rather than
+    tracking it exactly.
+    """
+    kind = node[0]
+    if kind == "leaf":
+        lo, hi = node[1].bounds()
+        return np.asarray(lo, dtype=float), np.asarray(hi, dtype=float)
+    if kind == "cut":
+        return _node_bounds(node[1]._node)  # A - B is contained in A
+    if kind in ("fuse", "inter"):
+        alo, ahi = _node_bounds(node[1]._node)
+        blo, bhi = _node_bounds(node[2]._node)
+        if kind == "fuse":
+            return np.minimum(alo, blo), np.maximum(ahi, bhi)
+        return np.maximum(alo, blo), np.minimum(ahi, bhi)
+    if kind == "regions":
+        boxes = [_node_bounds(sub._node) for _name, sub in node[1]]
+        return (
+            np.min(np.stack([b[0] for b in boxes]), axis=0),
+            np.max(np.stack([b[1] for b in boxes]), axis=0),
+        )
+    if kind == "translate":
+        lo, hi = _node_bounds(node[1]._node)
+        d = np.asarray(node[2], dtype=float)
+        return lo + d, hi + d
+    if kind == "rotate":
+        lo, hi = _node_bounds(node[1]._node)
+        corners = np.array([[x, y, z] for x in (lo[0], hi[0]) for y in (lo[1], hi[1]) for z in (lo[2], hi[2])])
+        moved = _rotate_points(corners, node[2], node[3], node[4])
+        return moved.min(axis=0), moved.max(axis=0)
+    if kind == "extrude":
+        lo, hi = _node_bounds(node[1]._node)
+        height = float(node[2])
+        lo, hi = lo.copy(), hi.copy()
+        lo[2], hi[2] = min(0.0, height), max(0.0, height)
+        return lo, hi
+    if kind == "revolve":
+        lo, hi = _node_bounds(node[1]._node)  # the profile, in its own (x, y) meridian plane
+        axis_point, axis_dir = node[2], node[3]
+        _ax, ay, _az = axis_dir
+        at_origin = all(abs(c) < 1e-9 for c in axis_point)
+        if at_origin and abs(ay) > 1e-9:  # y-axis: profile x is the radius, profile y the height
+            r = max(abs(lo[0]), abs(hi[0]))
+            return np.array([-r, lo[1], -r]), np.array([r, hi[1], r])
+        # x-axis: profile x runs along the axis, profile y is the radius
+        r = max(abs(lo[1]), abs(hi[1]))
+        return np.array([lo[0], -r, -r]), np.array([hi[0], r, r])
+    raise NotImplementedError(
+        f"Shape.bounds has no closed-form bounding box for a {kind!r} node; its extent comes "
+        f"from the boundary tessellation instead (Shape.tessellate)."
+    )
+
+
+def _rotate_dirs(vecs, axis_dir, angle):
+    """Rodrigues rotation of direction vectors — like :func:`_rotate_points` with no origin shift,
+    so a normal rotates with its surface instead of being dragged by the axis offset."""
+    return _rotate_points(vecs, (0.0, 0.0, 0.0), axis_dir, angle)
+
+
+class _Moved:
+    """A boundary source wrapped in a rigid transform: draws from ``inner`` and maps the points
+    (and normals) into the parent frame, so a translated/rotated leaf still samples exactly."""
+
+    def __init__(self, inner, translate=None, rotate=None):
+        self._inner, self._translate, self._rotate = inner, translate, rotate
+
+    def boundary_measure(self):
+        return self._inner.boundary_measure()  # rigid motions preserve length and area
+
+    def sample_boundary(self, n, rng):
+        pts, nrm = self._inner.sample_boundary(n, rng)
+        if self._rotate is not None:
+            axis_point, axis_dir, angle = self._rotate
+            pts = _rotate_points(pts, axis_point, axis_dir, angle)
+            nrm = _rotate_dirs(nrm, axis_dir, angle)
+        if self._translate is not None:
+            pts = pts + np.asarray(self._translate, dtype=float)
+        return pts, nrm
+
+
+class _ExtrudedSurface:
+    """The boundary of ``extrude(base, height)``: the swept lateral wall plus the two flat caps.
+
+    The lateral wall is the base's own boundary carried to a uniform height (its 2-D outward normal
+    is already the 3-D one); each cap is the base's *interior* at a fixed z with normal -/+ z. The
+    cap-versus-wall split is weighted by the base area, which is estimated by Monte Carlo -- the
+    only inexact step here, and it affects how the draws are *shared* between wall and cap, never
+    where an individual point lands.
+    """
+
+    _AREA_SAMPLES = 20_000
+
+    def __init__(self, base, height):
+        self._base, self._h = base, float(height)
+        lo, hi = (np.asarray(v, dtype=float) for v in base.bounds())
+        span = hi - lo
+        box = float(np.prod(span[span > 0.0])) if np.any(span > 0.0) else 0.0
+        rng = np.random.default_rng(0)  # fixed: an area estimate must not wobble between calls
+        free = span > 0.0
+        cand = np.tile(lo, (self._AREA_SAMPLES, 1))
+        cand[:, free] += rng.uniform(0.0, 1.0, size=(self._AREA_SAMPLES, int(free.sum()))) * span[free]
+        self._area = box * float(np.mean(_node_contains(base._node, cand, 0.0)))
+        self._perimeter = _node_boundary_measure(base._node)
+
+    def boundary_measure(self):
+        return self._perimeter * abs(self._h) + 2.0 * self._area
+
+    def sample_boundary(self, n, rng):
+        lateral = self._perimeter * abs(self._h)
+        w = np.array([lateral, self._area, self._area], dtype=float)
+        f = rng.choice(3, size=n, p=w / w.sum())
+        pts = np.zeros((n, 3))
+        nrm = np.zeros((n, 3))
+        lo, hi = min(0.0, self._h), max(0.0, self._h)
+        sel = f == 0
+        if sel.any():
+            k = int(sel.sum())
+            wall, wall_n = self._base.sample_boundary(k, rng)
+            wall = wall.copy()
+            wall[:, 2] = rng.uniform(lo, hi, size=k)
+            pts[sel], nrm[sel] = wall, wall_n
+        for cap, z, sign in ((1, lo, -1.0), (2, hi, 1.0)):
+            sel = f == cap
+            if sel.any():
+                k = int(sel.sum())
+                face = self._base.sample_interior(k, rng)
+                face = face.copy()
+                face[:, 2] = z
+                pts[sel] = face
+                nrm[sel] = np.array([0.0, 0.0, sign])
+        return pts, nrm
+
+
+def _node_boundary_measure(node):
+    """Total analytic boundary measure (perimeter in 2-D, surface area in 3-D) of the raw pieces."""
+    return float(sum(m for _piece, m in _node_boundary_pieces(node)))
+
+
+def _node_boundary_pieces(node):
+    """``[(source, measure)]`` whose ``sample_boundary(n, rng)`` draws in **world** coordinates.
+
+    These are *candidate* surfaces — a leaf contributes its whole boundary even where a later
+    boolean cut it away. :meth:`Shape.sample_boundary` trims them with an exact membership probe,
+    so this only has to enumerate and weight, never to resolve the booleans itself.
+    """
+    kind = node[0]
+    if kind == "leaf":
+        prim = node[1]
+        if not hasattr(prim, "sample_boundary"):
+            raise NotImplementedError(f"{type(prim).__name__} has no analytic boundary sampler.")
+        return [(prim, prim.boundary_measure())]
+    if kind in ("cut", "fuse", "inter"):
+        return _node_boundary_pieces(node[1]._node) + _node_boundary_pieces(node[2]._node)
+    if kind == "regions":
+        out = []
+        for _name, sub in node[1]:
+            out += _node_boundary_pieces(sub._node)
+        return out
+    if kind == "translate":
+        return [(_Moved(p, translate=node[2]), m) for p, m in _node_boundary_pieces(node[1]._node)]
+    if kind == "rotate":
+        rot = (node[2], node[3], node[4])
+        return [(_Moved(p, rotate=rot), m) for p, m in _node_boundary_pieces(node[1]._node)]
+    if kind == "extrude":
+        surf = _ExtrudedSurface(node[1], node[2])
+        return [(surf, surf.boundary_measure())]
+    raise NotImplementedError(
+        f"no analytic boundary sampler for a {kind!r} node; sample it through the boundary "
+        f"tessellation instead (Shape.tessellate)."
     )
 
 
@@ -519,11 +762,129 @@ class Shape:
         (cut), ``|`` (fuse), ``&`` (inter) — so it needs no gmsh and works in 2-D and 3-D alike. This is
         the shapely-free point-in-region test that resolves a geometric ``domain.region(name, shape)`` to
         a mesh-node subset for a subdomain / domain-decomposition solve. Inclusive within ``tol`` (the
-        analogue of shapely's ``buffer(1e-9)``), so nodes exactly on a face count as inside. A shape
-        carrying a non-CSG transform (``extrude``/``revolve``/``sweep``/``fillet``/``translate``/
-        ``rotate``) has no closed-form membership and raises :class:`NotImplementedError`."""
+        analogue of shapely's ``buffer(1e-9)``), so nodes exactly on a face count as inside.
+        ``translate``/``rotate``/``extrude``/``revolve`` are handled by mapping the query point into
+        the child's frame; ``sweep`` and ``fillet`` have no closed form and raise
+        :class:`NotImplementedError` (sample those through :meth:`sample_interior`, which falls back
+        to the boundary tessellation)."""
         pts = np.asarray(points, dtype=float)
         return _node_contains(self._node, pts, float(tol))
+
+    def bounds(self):
+        """Axis-aligned bounding box as ``(lo, hi)``, two 3-vectors — no gmsh.
+
+        Always a **superset** of the true extent, which is what makes it a valid proposal box for
+        the rejection sampler in :meth:`sample_interior`. Raises for a ``sweep``/``fillet`` plan,
+        whose extent is only known from its tessellation.
+        """
+        lo, hi = _node_bounds(self._node)
+        return tuple(float(v) for v in lo), tuple(float(v) for v in hi)
+
+    def is_analytic(self) -> bool:
+        """Whether membership and extent are available in closed form (no gmsh needed)."""
+        try:
+            _node_bounds(self._node)
+        except NotImplementedError:
+            return False
+        probe = np.zeros((1, 3))
+        try:
+            _node_contains(self._node, probe, 0.0)
+        except NotImplementedError:
+            return False
+        return True
+
+    def sample_interior(self, n: int, rng=None, tol: float = 0.0, max_rounds: int = 10_000):
+        """``(n, 3)`` points drawn uniformly from the interior — the mesh-free collocation draw.
+
+        Rejection sampling in the analytic bounding box, so points are *continuous*: they are not
+        drawn from any fixed node set and two calls give different points. A 1-D shape has no
+        volume to reject into and is parametrised along its arclength instead (see
+        :meth:`jno.geometry.primitives.Curve.sample_interior`).
+
+        Falls back to the boundary tessellation for a ``sweep``/``fillet`` plan; that path logs
+        what it did rather than pretending it stayed analytic.
+        """
+        rng = np.random.default_rng() if rng is None else rng
+        n = int(n)
+        if n <= 0:
+            return np.zeros((0, 3))
+        if self.dim == 1:
+            leaves = [prim for prim, _size, _key in self.leaves()]
+            if len(leaves) != 1 or not hasattr(leaves[0], "sample_interior"):
+                raise NotImplementedError(
+                    f"a 1-D shape is sampled along its own arclength, which needs exactly one "
+                    f"curve primitive; this plan has {len(leaves)}. Build it with jno.Path(...)."
+                )
+            return leaves[0].sample_interior(n, rng)
+        lo, hi = (np.asarray(v, dtype=float) for v in self.bounds())
+        span = hi - lo
+        free = span > 0.0  # a 2-D shape is flat in z: propose only in the axes that have extent
+        out = []
+        have = 0
+        for _ in range(max_rounds):
+            batch = max(4 * (n - have), 256)
+            cand = np.tile(lo, (batch, 1))
+            cand[:, free] += rng.uniform(0.0, 1.0, size=(batch, int(free.sum()))) * span[free]
+            keep = cand[_node_contains(self._node, cand, tol)]
+            if len(keep):
+                out.append(keep)
+                have += len(keep)
+            if have >= n:
+                return np.concatenate(out, axis=0)[:n]
+        raise RuntimeError(
+            f"sample_interior drew {max_rounds} rounds without reaching {n} points (got {have}). "
+            f"The shape occupies a vanishing fraction of its bounding box {self.bounds()}, or it "
+            f"is empty."
+        )
+
+    def sample_boundary(self, n: int, rng=None, max_rounds: int = 10_000):
+        """``(points (n,3), normals (n,3))`` uniform by measure on the boundary, normals outward.
+
+        Points land **exactly** on the analytic boundary — on the true circle, not on a chord — and
+        the normal is the closed-form one, so a disk's normal is exactly radial rather than
+        piecewise-constant per facet.
+
+        Candidates come from each primitive's own boundary, weighted by measure; a candidate
+        survives only if the shape actually changes across it (``contains`` differs a hair either
+        side), which is what trims the parts of a leaf's boundary that a boolean cut away and what
+        orients the normal outward — no winding convention is assumed.
+        """
+        rng = np.random.default_rng() if rng is None else rng
+        n = int(n)
+        if n <= 0:
+            return np.zeros((0, 3)), np.zeros((0, 3))
+        pieces = _node_boundary_pieces(self._node)
+        weights = np.array([m for _prim, m in pieces], dtype=float)
+        if not len(pieces) or weights.sum() <= 0.0:
+            raise NotImplementedError(
+                f"no analytic boundary is available for this plan; its boundary comes from the "
+                f"tessellation instead (Shape.tessellate)."
+            )
+        lo, hi = (np.asarray(v, dtype=float) for v in self.bounds())
+        eps = 1e-9 * max(float(np.max(hi - lo)), 1.0)
+        p_out, n_out, have = [], [], 0
+        for _ in range(max_rounds):
+            batch = max(4 * (n - have), 256)
+            idx = rng.choice(len(pieces), size=batch, p=weights / weights.sum())
+            pts = np.zeros((batch, 3))
+            nrm = np.zeros((batch, 3))
+            for i, (prim, _m) in enumerate(pieces):
+                sel = idx == i
+                if sel.any():
+                    pts[sel], nrm[sel] = prim.sample_boundary(int(sel.sum()), rng)
+            inside_pos = _node_contains(self._node, pts + eps * nrm, 0.0)
+            inside_neg = _node_contains(self._node, pts - eps * nrm, 0.0)
+            on_surface = inside_pos ^ inside_neg  # the shape changes across a real boundary point
+            flip = np.where(inside_pos & on_surface, -1.0, 1.0)[:, None]
+            if on_surface.any():
+                p_out.append(pts[on_surface])
+                n_out.append((nrm * flip)[on_surface])
+                have += int(on_surface.sum())
+            if have >= n:
+                return np.concatenate(p_out)[:n], np.concatenate(n_out)[:n]
+        raise RuntimeError(
+            f"sample_boundary drew {max_rounds} rounds without reaching {n} points (got {have})."
+        )
 
     # ----- boundary selection ----------------------------------------------------
     def edge(self, name: str) -> Selector:
