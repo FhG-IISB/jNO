@@ -235,7 +235,7 @@ def test_the_history_records_the_enrichment_growing_round_by_round():
     h = fem.adapt_history
 
     assert len(h) >= 3, f"only {len(h)} rounds recorded"
-    assert h[0]["n_enriched"] == 0, "the loop must start at plain P1"
+    assert h[0]["n_enriched"] == 0, "a FRESH run must start at plain P1"
     enr = [r["n_enriched"] for r in h]
     act = [r["n_dofs"] for r in h]
     assert enr == sorted(enr) and enr[-1] > enr[0], f"enrichment did not grow: {enr}"
@@ -280,6 +280,26 @@ def test_a_criterion_is_required():
     _d, fem, _X, _co = _poisson(size=0.25, rhs=_sin_rhs)
     with pytest.raises(TypeError, match="criterion"):
         jno.solve.enrich(theta=0.5, max_iters=3)
+
+
+def test_a_second_run_resumes_instead_of_starting_over():
+    """Budgeted runs compose: `enrich` twice must continue, not throw the first run's covers away.
+
+    The mask is the loop's state and it lives on the domain, so resuming is just reading it. Without
+    this a second call restarts from P1 -- which is how h-then-p on an already-`space="cover"` field
+    ended up REMOVING enrichment before adding it back, dropping the active DOF count at that call."""
+    d, fem, _X, _co = _poisson(size=0.2, rhs=_sin_rhs)
+    crit = _grad_crit(fem._probe_trial)
+    fem.solve(_dense, adapt=jno.solve.enrich(criterion=crit, theta=0.4, max_iters=2))
+    first = int(np.asarray(d._fem_enriched_nodes).sum())
+    assert first > 0
+
+    fem.solve(_dense, adapt=jno.solve.enrich(criterion=crit, theta=0.4, max_iters=2))
+    second = int(np.asarray(d._fem_enriched_nodes).sum())
+    assert fem.adapt_history[0]["n_enriched"] == first, (
+        f"the second run restarted from {fem.adapt_history[0]['n_enriched']} instead of resuming {first}"
+    )
+    assert second > first, f"resuming must still add nodes: {first} -> {second}"
 
 
 # ------------------------------------------------------------------ it refuses what it cannot do

@@ -1332,9 +1332,20 @@ def enrich(
         eps: Stop when the indicator plateaus for two consecutive rounds. Same requirement, and the
             same reason with a sharper edge -- against a frozen estimate the relative change is
             exactly 0.0, so this would declare a plateau on a loop that is still converging.
-        metric_field: Which field of a coupled problem drives the marking.
+        metric_field: Which field of a coupled problem drives the marking. Note a **coupled form
+            carrying a cover field is refused by `jno.fem` itself**, before this is reached -- covers
+            do not compose with the coupled multi-field assembly, and the refusal misattributes the
+            reason. A single enriched field, linear or nonlinear, is the supported shape.
+
+    Calling this twice **resumes**: the mask is state on the domain, so a second run continues from
+    the first instead of discarding it, and two budgeted calls land where one run to the larger budget
+    would. A fresh run starts from plain P1 -- an unmasked ``space="cover"`` field is already enriched
+    everywhere, and a loop that begins maximal has nothing left to select.
 
     Scope: simplices only, first-order covers, and the enriched field must be ``space="cover"``.
+    Scalar fields in 2-D and 3-D are tested; a VECTOR criterion is not supported, and that limit is
+    shared with :func:`remesh` rather than special here -- both die in the criterion assembly with a
+    broadcast mismatch of exactly ``vec``.
     ``fem.adapt_history`` records ``n_enriched`` per round beside the usual ``n_dofs``/``estimate``.
     """
     from .utils.solver.fem_adapt import AdaptSpec

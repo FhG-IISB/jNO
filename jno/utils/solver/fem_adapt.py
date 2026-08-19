@@ -2761,7 +2761,15 @@ def run_adaptive_enrich(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kw
             "with `max_iters`/`max_dofs` instead."
         )
 
-    mask = np.zeros(n_vert, dtype=bool)  # round 0 is a plain P1 solve; see AdaptSpec.enrich
+    # RESUME from whatever enrichment the domain already carries. A second `enrich` call continues
+    # where the first stopped instead of throwing its covers away, which is what makes budgeted runs
+    # composable -- `enrich(max_dofs=A)` then `enrich(max_dofs=B)` lands where one run to B would.
+    # An absent mask means a FRESH run, and that starts from plain P1 by design: a `space="cover"`
+    # field with no mask is already enriched everywhere, and a loop that begins maximal has nothing
+    # left to select. That asymmetry is the honest one -- resume a selection, do not resume a space.
+    _prev = getattr(d, "_fem_enriched_nodes", None)
+    _prev = np.asarray(_prev, dtype=bool).reshape(-1) if _prev is not None else None
+    mask = _prev.copy() if (_prev is not None and _prev.size == n_vert) else np.zeros(n_vert, dtype=bool)
     d._fem_enriched_nodes = mask.copy()
     history: list[dict] = []
     cur = jno.fem(cons, **kw)
