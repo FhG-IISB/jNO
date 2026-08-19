@@ -289,3 +289,135 @@ class TestLogBarrier:
         d = jno.Shape.rect(0.0, 0.0, 2.0, 1.0, size=0.4).domain()
         with pytest.raises(ValueError, match="tau must be positive"):
             d.cell_volume().sum.log_barrier(10.0, tau=0.0)
+
+
+class TestDihedralAngles:
+    """``cell_dihedrals`` — the 3-D mesh-quality quantity, and the reason it is not ``cell_angles``.
+
+    Jung, Yun & Kim, *Computers & Structures* **331** (2026) 108403, Sec. 2.3.3. Their eq. (21)/(24)
+    bounds a triangle's minimum interior angle; on a tetrahedron the same job needs the dihedral,
+    and needs BOTH bounds stated, for the reasons pinned below.
+    """
+
+    @staticmethod
+    def _one_tet(tmp_path, verts):
+        """A domain holding exactly one tetrahedron with the given vertices.
+
+        Written as ``.inp`` rather than ``.vtk``: VTK stores points big-endian, and meshio hands
+        them back as ``>f8``, which JAX refuses outright ("Error interpreting argument ... as a JAX
+        value"). Abaqus ``.inp`` is ASCII, so it round-trips native dtype -- and is what
+        ``test_domain_load_mesh.py`` already uses.
+        """
+        import meshio
+
+        path = str(tmp_path / "tet.inp")
+        meshio.write(path, meshio.Mesh(np.asarray(verts, dtype=float), [("tetra", np.array([[0, 1, 2, 3]]))]))
+        return jno.domain(constructor=path, compute_mesh_connectivity=False)
+
+    def test_a_regular_tetrahedron_is_arccos_one_third(self, tmp_path):
+        """The exact oracle: every dihedral of a regular tet is ``arccos(1/3)`` = 70.5288 degrees."""
+        r = self._one_tet(tmp_path, [(1, 1, 1), (1, -1, -1), (-1, 1, -1), (-1, -1, 1)])
+        ang = np.asarray(r.cell_dihedrals().eval())
+        assert ang.shape == (1, 6), "a tet has six edges, so six dihedrals"
+        np.testing.assert_allclose(ang[0], np.arccos(1.0 / 3.0), atol=1e-12)
+
+    def test_the_six_dihedrals_do_not_sum_to_a_constant(self, tmp_path):
+        """**The reason both bounds must be stated.** A triangle's three angles sum to pi, so in 2-D
+        bounding the minimum bounds the maximum. Six dihedrals sum to a *variable* quantity strictly
+        inside ``(2 pi, 3 pi)`` — 2.35 pi for the regular tet — so that argument does not carry over
+        and a minimum-angle bound alone permits a cap.
+        """
+        d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
+        s = np.asarray(d.cell_dihedrals().eval()).sum(axis=1) / PI
+        assert s.min() > 2.0 and s.max() < 3.0, f"sums must lie in (2pi, 3pi), got [{s.min()}, {s.max()}]"
+        assert s.max() - s.min() > 0.02, (
+            f"the sum must genuinely VARY or the 2-D argument would carry over after all; "
+            f"spread is only {s.max() - s.min():.4f} pi"
+        )
+        reg = np.degrees(np.arccos(1.0 / 3.0)) * 6 / 180.0
+        assert s.min() < reg < s.max(), "the regular tet's 2.35 pi should sit inside the observed range"
+
+    def test_a_sliver_is_caught_by_the_dihedral_and_missed_by_the_aspect_free_face_angles(self, tmp_path):
+        """A sliver — four nearly coplanar vertices — is the degeneracy that destroys interpolation
+        accuracy (Babuska & Aziz 1976), and it is invisible to face angles: they stay near 45-90
+        degrees while the dihedrals collapse towards 0 and pi.
+        """
+        eps = 1e-3
+        sliver = self._one_tet(tmp_path, [(0, 0, 0), (1, 0, 0), (0, 1, 0), (1, 1, eps)])
+        ang = np.degrees(np.asarray(sliver.cell_dihedrals().eval())[0])
+        assert ang.min() < 1.0, f"a sliver's smallest dihedral must collapse, got {ang.min():.3f} deg"
+        assert ang.max() > 179.0, f"and its largest must approach 180, got {ang.max():.3f} deg"
+
+        # The face angles of the SAME cell stay moderate -- which is what makes the dihedral the
+        # guard that catches this and the reason cell_angles' 2-D quantity is not enough.
+        v = np.asarray(sliver.mesh.points)[np.asarray(sliver._cells_p1())[0]]
+        face_angles = []
+        for f in ((0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3)):
+            for k in range(3):
+                a = v[f[(k + 1) % 3]] - v[f[k]]
+                b = v[f[(k + 2) % 3]] - v[f[k]]
+                face_angles.append(np.degrees(np.arccos(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))))
+        assert min(face_angles) > 20.0, (
+            f"this sliver's face angles should stay moderate (min {min(face_angles):.1f} deg); if they "
+            "do not, the configuration is not isolating what the test claims"
+        )
+
+    def test_a_needle_keeps_moderate_dihedrals(self, tmp_path):
+        """The converse, and why the dihedral is not the ONLY guard: a needle — a small base with a
+        distant apex — is badly conditioned but satisfies the maximum-angle condition, so its
+        dihedrals stay away from 0 and pi. ``cell_aspect`` is what sees it.
+        """
+        needle = self._one_tet(tmp_path, [(0, 0, 0), (0.02, 0, 0), (0.01, 0.017, 0), (0.01, 0.006, 3.0)])
+        ang = np.degrees(np.asarray(needle.cell_dihedrals().eval())[0])
+        assert ang.min() > 5.0 and ang.max() < 175.0, f"a needle's dihedrals stay moderate, got {ang}"
+        assert float(np.asarray(needle.cell_aspect().eval())[0]) > 20.0, (
+            "but cell_aspect must flag it, or neither measure covers the needle"
+        )
+
+    def test_the_gradient_matches_finite_differences(self):
+        """Differentiable in the vertex positions, or it cannot constrain a mesh an optimiser moves."""
+        d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
+        xm, ym, zm, _ = d.variable("mv3", where=lambda *c: np.ones_like(np.asarray(c[0]), dtype=bool), split=True)
+        xm.trainable(name="mx3"), ym.trainable(name="my3"), zm.trainable(name="mz3")
+        args, rebuild = d._moving_points()
+        cells = jnp.asarray(d._cells_p1(), dtype=jnp.int32)
+        pts = np.asarray(d.mesh.points)[:, :3]
+        X0, Y0, Z0 = (jnp.asarray(pts[:, i]) for i in range(3))
+
+        def worst(X):
+            v = rebuild(X, Y0, Z0)[cells]
+            n = []
+            for k in range(4):
+                keep = [i for i in range(4) if i != k]
+                nk = jnp.cross(v[:, keep[1]] - v[:, keep[0]], v[:, keep[2]] - v[:, keep[0]])
+                nk = nk / (jnp.linalg.norm(nk, axis=-1, keepdims=True) + 1e-12)
+                s = jnp.sign(jnp.sum(nk * (v[:, k] - v[:, keep[0]]), axis=-1, keepdims=True))
+                n.append(nk * jnp.where(s == 0.0, 1.0, s))
+            out = []
+            for i, j in ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)):
+                a, b = [k for k in range(4) if k not in (i, j)]
+                out.append(np.pi - jnp.arccos(jnp.clip(jnp.sum(n[a] * n[b], axis=-1), -1.0, 1.0)))
+            return jnp.sum(jnp.stack(out, axis=-1) ** -4)  # a smooth proxy for "the smallest"
+
+        g = np.asarray(jax.grad(worst)(X0))
+        assert np.all(np.isfinite(g)), "the dihedral formula must not produce NaN gradients"
+        i = int(np.argmax(np.abs(g)))
+        assert abs(g[i]) > 1e-9, "no node has a non-zero derivative; the test would be vacuous"
+        h = 1e-7
+        fd = float((worst(X0.at[i].add(h)) - worst(X0.at[i].add(-h))) / (2 * h))
+        assert g[i] == pytest.approx(fd, rel=1e-5)
+
+    def test_it_is_three_dimensional_only(self):
+        d = jno.Shape.rect(0, 0, 2, 1, size=0.5).domain()
+        with pytest.raises(NotImplementedError, match="tetrahedra only"):
+            d.cell_dihedrals()
+
+    def test_the_constraint_form_is_expressible_and_feasible(self):
+        """The paper's eq. (24) shape, written on dihedrals: a sound mesh must satisfy g <= 1."""
+        d = jno.Shape.box(0, 0, 0, 2, 1, 1, size=0.4).domain()
+        theta_min = np.radians(10.0)
+        g = ((PI - d.cell_dihedrals()) / (PI - theta_min)).pnorm(50, normalize=True)
+        val = float(np.asarray(g.eval()))
+        worst = float(np.asarray(d.cell_dihedrals().eval()).min())
+        assert val < 1.02, f"g = {val} on a mesh whose smallest dihedral is {np.degrees(worst):.2f} deg"
+        assert np.degrees(worst) > 5.0

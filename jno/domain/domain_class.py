@@ -3139,6 +3139,79 @@ class domain(MeshIOMixin):
 
         return _jno.fn(_asp, args, name="cell_aspect")
 
+    def cell_dihedrals(self, eps: float = 1e-12):
+        """Per-tetrahedron **dihedral angles** in radians, ``(n_cells, 6)``, differentiable. **3-D.**
+
+        The angle across each of the tet's six edges, from the inward face normals of the two faces
+        meeting there. This is the 3-D analogue of :meth:`cell_angles`, and a mesh-quality
+        constraint on a moving tetrahedral mesh needs it because the 2-D argument does not carry
+        over in either direction::
+
+            g = ((jno.np.pi - d.cell_dihedrals()) / (jno.np.pi - theta_min)).pnorm(50, normalize=True)
+            jno.core([compliance, jno.le(g, 1.0)])
+
+        **Why both bounds must be stated.** In 2-D a lower bound on the minimum angle induces an
+        upper bound, because a triangle's three angles sum to ``pi``. A tet's six dihedrals sum to a
+        *variable* quantity in ``(2 pi, 3 pi)`` -- about ``2.35 pi`` for the regular tet -- so
+        bounding the minimum says nothing about the maximum, and a **cap** (two faces folding flat
+        onto each other) satisfies a minimum-angle bound while being degenerate.
+
+        **Why this and not only :meth:`cell_aspect`.** The two catch different degeneracies. A
+        *needle* -- a small base with a distant apex -- has small face angles but its dihedrals all
+        stay moderate; a *sliver* -- four nearly coplanar vertices -- has face angles near 45-90
+        degrees and only its dihedrals collapse to ``0`` and ``pi``. The distinction matters because
+        of Babuska & Aziz (*SIAM J. Numer. Anal.* **13** (1976) 214-226): a needle still satisfies
+        the maximum-angle condition, so it costs conditioning (a solver problem), while a sliver and
+        a cap violate it and destroy interpolation accuracy directly. A reanalysis-based method is
+        making a claim about accuracy, so the dihedral is the guard that protects the claim.
+        ``cell_aspect`` is a single scale-invariant scalar and is the cheaper first line;
+        this is the one to add when the design is being judged on re-solved fidelity.
+
+        ``eps`` guards the normal-normalisation denominator on a collapsed face; it does not
+        otherwise shift the angles. Reference: Jung, Yun & Kim, *Computers & Structures* **331**
+        (2026) 108403, Sec. 2.3.3, whose eq. (21)/(24) this generalises off the triangle.
+        """
+        import itertools
+
+        import jno as _jno
+
+        dim = int(self.dimension)
+        if dim != 3:
+            raise NotImplementedError(
+                f"domain.cell_dihedrals(): tetrahedra only (3-D); this domain is {dim}-D. In 2-D the "
+                "corresponding quantity is domain.cell_angles()."
+            )
+        cells = jnp.asarray(self._cells_p1(), dtype=jnp.int32)
+        args, rebuild = self._moving_points()
+        # Edge (i, j) is shared by the two faces that omit the OTHER two vertices, so each edge maps
+        # to the pair of opposite vertices naming those faces. Same six-edge order as BASIX_TET_EDGES
+        # is not required here -- nothing indexes these against an element table -- but listing them
+        # by combination keeps the column meaning stated rather than implied.
+        edges = list(itertools.combinations(range(4), 2))
+
+        def _face_normal(v, k):
+            """Inward normal of the face opposite vertex ``k``, normalised."""
+            keep = [i for i in range(4) if i != k]
+            n = jnp.cross(v[:, keep[1]] - v[:, keep[0]], v[:, keep[2]] - v[:, keep[0]])
+            n = n / (jnp.linalg.norm(n, axis=-1, keepdims=True) + eps)
+            # Orient inward: towards the omitted vertex, which is on the interior side.
+            s = jnp.sign(jnp.sum(n * (v[:, k] - v[:, keep[0]]), axis=-1, keepdims=True))
+            return n * jnp.where(s == 0.0, 1.0, s)
+
+        def _dih(*vals):
+            v = rebuild(*vals)[cells]  # (n_cells, 4, 3)
+            nrm = [_face_normal(v, k) for k in range(4)]
+            out = []
+            for i, j in edges:
+                # The faces meeting at edge (i, j) are the two that omit the other two vertices.
+                a, b = [k for k in range(4) if k not in (i, j)]
+                cos = jnp.sum(nrm[a] * nrm[b], axis=-1)
+                # With both normals inward the dihedral is pi minus their angle.
+                out.append(np.pi - jnp.arccos(jnp.clip(cos, -1.0, 1.0)))
+            return jnp.stack(out, axis=-1)  # (n_cells, 6)
+
+        return _jno.fn(_dih, args, name="cell_dihedrals")
+
     def measure(self):
         """Total volume (area in 2-D) of the domain, as a node differentiable in the mesh.
 
