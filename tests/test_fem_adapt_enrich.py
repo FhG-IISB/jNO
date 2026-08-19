@@ -351,6 +351,33 @@ def test_a_vector_field_enriches_and_pins_every_component():
     assert fem.adapt_history[-1]["n_dofs"] > fem.adapt_history[0]["n_dofs"]
 
 
+def test_a_resumed_run_reuses_the_caller_s_operator_without_changing_the_answer(monkeypatch):
+    """The opening rebuild is skipped when the caller's FEM already carries this exact mask, which is
+    what a resumed run always hands it. A rebuild is the loop's dominant cost, so the saving is real --
+    but only if it is a saving and not a shortcut, so the reused run is checked against one forced to
+    rebuild: same enrichment, same field, to the last bit."""
+
+    def run(force_rebuild):
+        d, fem, _X, _co = _poisson(size=0.25, rhs=_sin_rhs)
+        crit = _grad_crit(fem._probe_trial)
+        spec = lambda: jno.solve.enrich(criterion=crit, theta=0.4, max_iters=2)  # noqa: E731
+        fem.solve(_dense, adapt=spec())
+        if force_rebuild:
+            d._fem_cover_mask_built = None  # the stamp is what proves reuse is safe; drop it
+        calls = []
+        real = jno.fem
+        monkeypatch.setattr(jno, "fem", lambda *a, **k: (calls.append(1), real(*a, **k))[1])
+        out = np.asarray(fem.solve(_dense, adapt=spec())).reshape(-1)
+        monkeypatch.undo()
+        return len(calls), np.asarray(d._fem_enriched_nodes, dtype=bool), out
+
+    n_reused, mask_reused, u_reused = run(force_rebuild=False)
+    n_rebuilt, mask_rebuilt, u_rebuilt = run(force_rebuild=True)
+    assert n_rebuilt == n_reused + 1 == 2, f"expected one build saved, got {n_reused} vs {n_rebuilt}"
+    assert np.array_equal(mask_reused, mask_rebuilt), "reuse changed which nodes were enriched"
+    assert np.array_equal(u_reused, u_rebuilt), f"reuse changed the field by {np.abs(u_reused - u_rebuilt).max():.3e}"
+
+
 # ------------------------------------------------------------------ it refuses what it cannot do
 
 

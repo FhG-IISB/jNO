@@ -2791,7 +2791,23 @@ def run_adaptive_enrich(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kw
     mask = _prev.copy() if (_prev is not None and _prev.size == n_vert) else np.zeros(n_vert, dtype=bool)
     d._fem_enriched_nodes = mask.copy()
     history: list[dict] = []
-    cur = jno.fem(cons, **kw)
+    # Skip the opening rebuild when the caller's FEM was already assembled against THIS mask -- which
+    # is precisely the resumed run, since the mask it resumes from is the one the caller last built
+    # with. Proven by the stamp the assembler leaves, not inferred from the mask sitting on the domain
+    # (a caller may write that attribute between builds, and then the stale operator would be wrong).
+    #
+    # A round's rebuild is the loop's dominant cost and it is NOT amortised by JAX's compile cache:
+    # `compress_eager` drops explicit zeros, so the operator's nnz depends on WHICH DOFs the mask pins,
+    # every round presents new shapes, and XLA lowers the assembly afresh (~10 lowerings a round).
+    # Measured on 2-D Poisson, 640-6106 vertices, the rebuild is a flat 60-65% of wall regardless of
+    # size. Keeping the zeros makes nnz mask-independent and the recompiles vanish -- and is a LOSS at
+    # scale: at 18k padded DOFs the operator doubles (2.7 -> 5.8 MiB) and the extra matvec work costs
+    # more than the compiles saved (solves 0.79 -> 1.34 s, total 2.26 -> 2.61 s). So the cost stands
+    # deliberately; removing it needs the pins applied as a projector in the matvec rather than by
+    # elimination, which is a different design and not a tuning knob.
+    _built = getattr(d, "_fem_cover_mask_built", None)
+    reused = _built is not None and np.asarray(_built).shape == mask.shape and np.array_equal(_built, mask)
+    cur = fem if reused else jno.fem(cons, **kw)
     u = None
     prev_est, n_converged = None, 0
 
@@ -2849,8 +2865,9 @@ def run_adaptive_enrich(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kw
     # with every node enriched -- are exactly such keys when `cur` never materialised its own. The
     # measured symptom: `fem.solve()` after the loop re-solved the FULLY enriched system while the
     # returned field was the adapted one, an inconsistency with nothing to indicate it.
-    fem.__dict__.clear()
-    fem.__dict__.update(cur.__dict__)
+    if cur is not fem:  # `clear()` on the shared dict would wipe the state it is about to copy back
+        fem.__dict__.clear()
+        fem.__dict__.update(cur.__dict__)
     fem.adapt_history = history
     return u
 

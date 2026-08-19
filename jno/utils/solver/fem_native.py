@@ -850,6 +850,10 @@ def assemble_fem_native(
     # None means "every node", the plain `space="cover"` case.
     _cover_mask = getattr(domain, "_fem_enriched_nodes", None)
     _cover_mask = np.asarray(_cover_mask, dtype=bool).reshape(-1) if (_cover_mask is not None and any(_cover)) else None
+    # Record WHICH mask this build baked in, so a caller can tell whether an existing FEM already
+    # matches the space it wants and skip re-assembling. `jno.solve.enrich` resumes from the mask it
+    # finds, so its first round is exactly the case where the answer is yes.
+    domain._fem_cover_mask_built = None if _cover_mask is None else _cover_mask.copy()
 
     # -------------------------------------------------------------------------
     # Per-field mesh data
