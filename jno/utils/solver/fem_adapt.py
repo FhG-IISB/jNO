@@ -1415,6 +1415,17 @@ def _criterion_weak_terms(fem: Any, criterion: Any, field: int = 0):
     else:  # nothing carries coordinates (a criterion of pure constants): fall back to the region's own
         coords = list(fem.domain.variable(tags[0], split=True))[:dim]
     test_bound = tests[int(field)](*coords)
+    # A VECTOR field's test function must be reduced to ONE COMPONENT before the criterion is hung on
+    # it. The assembler only ever meets a vector test componentwise -- every form writes `t[0].x`,
+    # `t[1]`, never a bare `t` -- so `criterion * t` hands it a vector-valued integrand and it dies
+    # deep in the quadrature reduction with a bare shape mismatch of exactly `vec`
+    # ("input type=float64[2208] and requested type=float64[1104]"), naming neither the criterion nor
+    # the field. Component 0 is not a choice of direction: each component of a vector Lagrange field is
+    # carried by the SAME scalar nodal basis, so `int g phi_i / int phi_i` on component 0 is the exact
+    # scalar nodal projection of `g`, and `_criterion_nodal`'s per-node norm then reads it back
+    # untouched (the other components are structurally zero in both the numerator and the mass).
+    if _field_vec(fem, int(field))[1] > 1:
+        test_bound = test_bound[0]
     # Retag the TEST function's coordinates before combining it with the criterion, not after. When the
     # criterion exposes no free coordinates of its own -- a bound view absorbs them, which is what
     # `u.bind(x=..., y=...)` does -- `coords` are freshly fetched from the domain and still carry the
@@ -1580,6 +1591,15 @@ def _criterion_percell(fem: Any, node: Any) -> np.ndarray:
     return vals
 
 
+def _field_vec(fem: Any, field: int = 0) -> tuple:
+    """``(n_nodes, vec)`` for one field: how many mesh nodes it has, and components per node."""
+    offs = list(getattr(fem, "offsets", None) or [0, int(getattr(fem, "dofs", 0))])
+    lo, hi = int(offs[field]), int(offs[field + 1])
+    pts = getattr(fem, "field_points", None)
+    n_nodes = int(np.asarray(pts[field]).shape[0]) if pts is not None else max(hi - lo, 1)
+    return n_nodes, max(1, (hi - lo) // max(n_nodes, 1))
+
+
 def _criterion_nodal(fem: Any, criterion: Any, u: np.ndarray, field: int = 0, stride: int = 1) -> np.ndarray:
     """A field criterion as a nodal array scaled like ``g`` itself, not like ``g x volume``.
 
@@ -1600,8 +1620,7 @@ def _criterion_nodal(fem: Any, criterion: Any, u: np.ndarray, field: int = 0, st
     # it mixes components together and stops at node n_vert/vec.
     offs = list(getattr(fem, "offsets", None) or [0, num.size])
     lo, hi = int(offs[field]), int(offs[field + 1])
-    n_nodes = int(np.asarray(fem.field_points[field]).shape[0])
-    vec = max(1, (hi - lo) // max(n_nodes, 1))
+    n_nodes, vec = _field_vec(fem, field)
     a = np.linalg.norm(num[lo:hi].reshape(n_nodes, vec), axis=1)
     b = np.linalg.norm(mass[lo:hi].reshape(n_nodes, vec), axis=1)
     g = np.nan_to_num(a / np.maximum(b, 1e-30), nan=0.0, posinf=0.0, neginf=0.0)

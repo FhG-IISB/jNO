@@ -1343,9 +1343,8 @@ def enrich(
     everywhere, and a loop that begins maximal has nothing left to select.
 
     Scope: simplices only, first-order covers, and the enriched field must be ``space="cover"``.
-    Scalar fields in 2-D and 3-D are tested; a VECTOR criterion is not supported, and that limit is
-    shared with :func:`remesh` rather than special here -- both die in the criterion assembly with a
-    broadcast mismatch of exactly ``vec``.
+    Scalar and VECTOR fields are both supported, in 2-D and 3-D; a vector field gets ``vec`` cover
+    slots per node and every component of an unenriched node is pinned.
     ``fem.adapt_history`` records ``n_enriched`` per round beside the usual ``n_dofs``/``estimate``.
     """
     from .utils.solver.fem_adapt import AdaptSpec

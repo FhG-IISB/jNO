@@ -302,6 +302,55 @@ def test_a_second_run_resumes_instead_of_starting_over():
     assert second > first, f"resuming must still add nodes: {first} -> {second}"
 
 
+def test_a_vector_field_enriches_and_pins_every_component():
+    """Covers on a VECTOR field. The layout is `(node*blk + slot)*vec + comp`, so an unenriched node
+    has `vec` pins per cover slot, not one -- pinning by node index alone would leave every component
+    but the first free, and the null space would come back with it."""
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.16).domain()
+    tol = 1e-9
+    d.tag("walls", lambda *c: np.logical_or.reduce([(x < tol) | (x > 1 - tol) for x in c]))
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("walls", split=True)
+    u, v = d.fem_symbols(value_shape=(2,), space="cover")
+    a, t = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    exx, eyy, exy = a[0].x, a[1].y, 0.5 * (a[0].y + a[1].x)
+    tr = exx + eyy
+    sxx, syy, sxy = tr + 2 * exx, tr + 2 * eyy, 2 * exy
+    f = jno.np.exp(-40.0 * ((xi - 0.3) ** 2 + (yi - 0.7) ** 2))
+    fem = jno.fem([sxx * t[0].x + sxy * t[0].y + sxy * t[1].x + syy * t[1].y - f * t[1], u(xb, yb) - 0.0])
+    crit = jno.np.sqrt(a[0].x ** 2 + a[0].y ** 2 + a[1].x ** 2 + a[1].y ** 2 + 1e-30)
+    fem.solve(_dense, adapt=jno.solve.enrich(criterion=crit, theta=0.4, max_iters=2))
+
+    mask = np.asarray(d._fem_enriched_nodes, dtype=bool)
+    assert 0 < mask.sum() < mask.size, f"nothing to compare: {mask.sum()} of {mask.size} enriched"
+    vec = 2
+    pinned = {int(i) for i, _ in d._fem_native_dirichlet_pairs}
+    for n in np.flatnonzero(~mask):
+        want = {(n * BLK + slot) * vec + c for slot in range(1, BLK) for c in range(vec)}
+        assert want <= pinned, f"node {n} is unenriched but {sorted(want - pinned)} are free"
+    # An ENRICHED node keeps its covers free -- except along a Dirichlet wall, where the TANGENTIAL
+    # one is not free to begin with: `u = 0` all along that wall fixes the tangential derivative, and
+    # that is the mechanism making a cover field's trace the P1 interpolant of the data. The slot for
+    # axis k is therefore pinned exactly when the node sits on a wall whose normal is some OTHER axis.
+    pts = np.asarray(d.mesh.points)[:, :2]
+    checked_wall = checked_interior = 0
+    for n in np.flatnonzero(mask):
+        on = [bool(abs(pts[n, k]) < 1e-9 or abs(pts[n, k] - 1.0) < 1e-9) for k in range(2)]
+        checked_wall += any(on)
+        checked_interior += not any(on)
+        for k in range(2):
+            want_pinned = any(on[j] for j in range(2) if j != k)
+            got = {(n * BLK + 1 + k) * vec + c for c in range(vec)} & pinned
+            assert bool(got) == want_pinned and len(got) in (0, vec), (
+                f"node {n} at {pts[n]}: cover slot for axis {k} is "
+                f"{'pinned' if got else 'free'}, expected {'pinned' if want_pinned else 'free'}"
+            )
+    assert checked_wall and checked_interior, (
+        f"only one kind of enriched node was reached (wall {checked_wall}, interior {checked_interior})"
+    )
+    assert fem.adapt_history[-1]["n_dofs"] > fem.adapt_history[0]["n_dofs"]
+
+
 # ------------------------------------------------------------------ it refuses what it cannot do
 
 
