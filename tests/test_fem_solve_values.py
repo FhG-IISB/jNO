@@ -9,6 +9,7 @@ compile-dominated cost of any continuation written as a Python loop.
 from __future__ import annotations
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -153,3 +154,32 @@ def test_with_no_values_the_solve_is_still_a_trace_node():
 
     out = _diffusion().solve()
     assert isinstance(out, Placeholder), f"expected a trace node, got {type(out).__name__}"
+
+
+def test_a_parametric_solve_is_differentiable_in_its_parameter():
+    """`fem.solve(k=value)` must survive `jax.grad`.
+
+    The verdict this path records for `fem.stats` needs a CONCRETE residual, and it used to take one
+    unconditionally -- so differentiating a parametric solve raised ConcretizationTypeError deep in the
+    reporting, not the solving. That closes off fitting a coefficient by backprop through the solve,
+    which is the entire point of having runtime parameters. Under a trace the verdict is skipped (and
+    says so in `stats`), exactly as the in-driver check already does.
+    """
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.34).domain()
+    u, v = d.fem_symbols()
+    x, y, _t = d.variable("interior", split=True)
+    ui, vi = u.bind(x=x, y=y), v.bind(x=x, y=y)
+    xb, yb, _tb = d.variable("boundary", split=True)
+    k = jno.np.parameter((1,), name="k")
+    # NONLINEAR on purpose: the verdict this guards is recorded only on the nonlinear path (a linear
+    # parametric solve returns a trace node for `crux` and never reaches it).
+    fem = jno.fem([(1.0 + k + ui * ui) * (ui.x * vi.x + ui.y * vi.y) - 1.0 * vi, u(xb, yb) - 0.0])
+
+    def J(kv):
+        return jnp.sum(jnp.asarray(fem.solve(k=kv)) ** 2)
+
+    g = float(jax.grad(J)(0.5))
+    h = 1e-4
+    fd = (float(J(0.5 + h)) - float(J(0.5 - h))) / (2.0 * h)
+    assert np.isfinite(g)
+    assert abs(g - fd) <= 1e-5 * max(abs(fd), 1.0)
