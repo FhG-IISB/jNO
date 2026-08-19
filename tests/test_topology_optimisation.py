@@ -723,3 +723,135 @@ class TestFacetTractionTotal:
         coarse, fine = self._resultant(2.0, pad=0.0), self._resultant(1.0, pad=0.0)
         assert coarse == pytest.approx(0.0, abs=1e-9), f"h == span should lose the only facet, got {coarse:.6f}"
         assert fine == pytest.approx(-0.5, abs=1e-9), f"expected (span-h)/span, got {fine:.6f}"
+
+
+class TestPatchFilterOnTets:
+    """The patch criterion on tetrahedra — eq. (17)-(19) walked over EDGE fans.
+
+    Around an interior edge a tet has exactly two faces containing both endpoints, so the fan's
+    dual graph is 2-regular and the walk eq. (18) needs exists without any angular sort. The vertex
+    patch, which is what 2-D uses, has a 3-regular dual in 3-D and no total order at all -- and at
+    ``4T/V ~ 27`` elements the criterion has no contrast left anyway
+    (``tests/test_patch_filter_scaling.py``). The edge fan is ``6T/E ~ 5.2``, the regime where the
+    formula is sharpest, so it transfers verbatim: the same kernel, a different index map.
+    """
+
+    @staticmethod
+    def _box(size=0.5):
+        d = jno.Shape.box(0, 0, 0, 3, 2, 2, size=size).domain()
+        return d, np.asarray(d._cells_p1()), d._patch_topology()
+
+    def test_a_tet_belongs_to_six_edge_fans(self):
+        d, cells, topo = self._box()
+        assert cells.shape[1] == 4, "this must be a tetrahedral mesh"
+        assert topo["others"].shape[:2] == (cells.shape[0], 6)
+        assert topo["size"].shape == topo["boundary"].shape == (cells.shape[0], 6)
+
+    def test_the_fan_is_the_size_the_element_count_predicts(self):
+        """``6T/E`` with ``T ~ 6.8V`` and ``E ~ 7.8V`` puts an interior fan near 5.2 elements — the
+        same regime as the paper's 2-D vertex patch, which is why nothing needs recalibrating."""
+        _d, _cells, topo = self._box()
+        interior = topo["size"][~topo["boundary"]]
+        assert interior.size > 0, "the mesh must contain interior edges"
+        assert 4.0 < interior.mean() < 7.0, f"interior fans average {interior.mean():.2f} elements"
+
+    def test_every_member_of_a_fan_actually_contains_the_edge(self):
+        """The defining property: a fan is the elements around ONE edge, so every member must carry
+        both of its endpoints. A mis-keyed fan would still produce plausible-looking arrays."""
+        _d, cells, topo = self._box()
+        others, size = topo["others"], topo["size"]
+        for k in range(0, cells.shape[0], 7):  # stride: the property is per-slot, not statistical
+            for slot, (i, j) in enumerate(((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3))):
+                n = int(size[k, slot])
+                if n < 2:
+                    continue
+                edge = {int(cells[k][i]), int(cells[k][j])}
+                for nb in others[k, slot, : n - 1]:
+                    assert edge <= set(cells[int(nb)]), f"cell {nb} is in edge {edge}'s fan but omits it"
+
+    def test_an_interior_fan_starts_and_ends_on_a_face_neighbour(self):
+        """``rho_{k,1}`` and ``rho_{k,N-1}`` are the two elements sharing a FACET with ``k`` -- that
+        is what eq. (18)'s first and last terms mean, and it holds only if the walk is ordered.
+
+        Interior fans only. A boundary fan is an open chain, so its wrap-around pair is not a face
+        neighbour -- which is exactly the case ``boundary=True`` marks for the Fig. 2c-d rule, and
+        the shipped 2-D builder behaves the same way.
+        """
+        _d, cells, topo = self._box()
+        others, size, bnd = topo["others"], topo["size"], topo["boundary"]
+        checked = 0
+        for k in range(cells.shape[0]):
+            for slot in range(6):
+                n = int(size[k, slot])
+                if n < 2 or bnd[k, slot]:
+                    continue
+                for nb in (others[k, slot, 0], others[k, slot, n - 2]):
+                    assert len(set(cells[k]) & set(cells[int(nb)])) == 3, (
+                        f"cell {k}'s fan neighbour {nb} shares only "
+                        f"{len(set(cells[k]) & set(cells[int(nb)]))} vertices, so not a face"
+                    )
+                    checked += 1
+        assert checked > 500, f"only {checked} interior fan ends checked; the test would be weak"
+
+    def test_no_element_appears_in_its_own_fan(self):
+        _d, cells, topo = self._box()
+        assert not (topo["others"] == np.arange(cells.shape[0])[:, None, None]).any()
+
+    def test_the_size_counts_the_reference_element_too(self):
+        """``N`` includes ``k``; ``others`` does not. eq. (18)'s exponent is ``1/(N-2)``, so an
+        off-by-one here changes every value the filter produces."""
+        _d, _cells, topo = self._box()
+        listed = (topo["others"] >= 0).sum(axis=-1)
+        assert np.array_equal(topo["size"], listed + 1)
+
+    def test_the_vectorised_filter_matches_the_literal_formula_on_tets(self):
+        """The same eq. (18) transcription the 2-D tests use, driven over edge fans."""
+        d, cells, topo = self._box(size=0.7)
+        n_cells = cells.shape[0]
+        filt = d.patch_filter()
+        rng = np.random.default_rng(0)
+        for r in (np.full(n_cells, 0.4), rng.uniform(0.0, 1.0, n_cells), (rng.random(n_cells) > 0.6).astype(float)):
+            expected = np.empty_like(r)
+            for k in range(n_cells):
+                fs = []
+                for slot in range(6):
+                    n = int(topo["size"][k, slot])
+                    if n < 3:
+                        continue
+                    fs.append(
+                        _f_patch_reference(
+                            float(r[k]),
+                            [float(r[j]) for j in topo["others"][k, slot, : n - 1]],
+                            bool(topo["boundary"][k, slot]),
+                        )
+                    )
+                expected[k] = r[k] * (sum(fs) / len(fs) if fs else 1.0)
+            np.testing.assert_allclose(np.asarray(filt(jnp.asarray(r))), expected, atol=1e-7)
+
+    def test_a_full_density_field_passes_through_untouched_on_tets(self):
+        """rho = 1 everywhere has no bad configuration, so the filter must be the identity -- the
+        sharpest single check that the fan walk and the -1 padding are right, since any mis-indexed
+        neighbour reads a padded zero and pulls the product below one."""
+        d, cells, _topo = self._box()
+        out = np.asarray(d.patch_filter()(jnp.ones(cells.shape[0], dtype=jnp.float64)))
+        np.testing.assert_allclose(out, 1.0, atol=1e-12)
+
+    def test_it_suppresses_an_isolated_element_on_a_real_tet_mesh(self):
+        """The behaviour the filter exists for, in 3-D: one dense tet in a void field is
+        unbuildable and must be knocked down far enough that SIMP finishes it off."""
+        d, cells, topo = self._box()
+        k = int(np.where(~topo["boundary"].any(axis=1))[0][0])  # all six fans interior
+        r = np.full(cells.shape[0], 1e-3)
+        r[k] = 1.0
+        out = np.asarray(d.patch_filter()(jnp.asarray(r)))
+        assert out[k] < 0.35, f"an isolated dense tet barely moved: rho_bar = {out[k]:.4f}"
+        assert out[k] ** PENAL < 0.01, "and its SIMP stiffness must be under 1 % of solid"
+
+    def test_the_node_and_the_filter_agree_on_tets(self):
+        d, cells, _topo = self._box(size=0.7)
+        _r, s = d.fem_symbols(space="P0", names=("r", "s"))
+        rho = jno.np.parameter(s, name="rho_patch_3d")
+        r = jnp.asarray(np.random.default_rng(2).uniform(0, 1, cells.shape[0]))
+        np.testing.assert_allclose(np.asarray(rho.patch().fn(r)), np.asarray(d.patch_filter()(r)), atol=0.0)
+        g = jax.grad(lambda z: jnp.sum(d.patch_filter()(z)))(r)
+        assert np.all(np.isfinite(np.asarray(g))) and np.any(np.asarray(g) != 0.0)

@@ -3409,33 +3409,52 @@ class domain(MeshIOMixin):
 
         return _patch
 
-    def _patch_topology(self):
-        """Node→element patches, ordered counterclockwise — the connectivity eq. (17)-(19) needs.
+    # Local edges of a tetrahedron as vertex-index pairs. Only the six pairs matter here (a fan is
+    # keyed by the edge's two GLOBAL vertices, not by a local slot), so this is written out rather
+    # than taken from BASIX_TET_EDGES -- nothing indexes these against an element table.
+    _TET_EDGES = ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3))
 
-        For every triangle ``k`` and every one of its three vertices, returns the OTHER elements of
-        that vertex's patch in counterclockwise order starting from the one adjacent to ``k``. This
-        is what makes the patch formula of Jung, Yun & Kim, *Computers & Structures* **331** (2026)
-        108403 evaluable: its indices ``rho_{k,1} ... rho_{k,N-1}`` are an angular walk around the
-        node, and ``rho_{k,1}`` / ``rho_{k,N-1}`` — the first and last — are precisely the two
-        elements sharing an edge with ``k``.
+    def _patch_topology(self):
+        """The element patches eq. (17)-(19) walks — vertex fans in 2-D, edge fans in 3-D.
+
+        Jung, Yun & Kim, *Computers & Structures* **331** (2026) 108403. The formula's indices
+        ``rho_{k,1} ... rho_{k,N-1}`` are a walk around a patch, with ``rho_{k,1}`` and
+        ``rho_{k,N-1}`` the two elements sharing a facet with ``k``, so the patch has to come back
+        as an ORDER, not a set.
 
         Returns a dict of numpy arrays, all host-side and computed once:
-            ``others``   ``(n_cells, 3, Nmax-1)`` int — the ordered other-element ids, ``-1`` padded.
-            ``size``     ``(n_cells, 3)`` int — ``N^I``, the patch's element count.
-            ``boundary`` ``(n_cells, 3)`` bool — whether that vertex lies on the domain boundary.
+            ``others``   ``(n_cells, P, Nmax-1)`` int — the ordered other-element ids, ``-1`` padded.
+            ``size``     ``(n_cells, P)`` int — ``N``, the patch's element count, including ``k``.
+            ``boundary`` ``(n_cells, P)`` bool — whether that patch is open (touches the boundary).
+
+        ``P`` is the number of patches an element belongs to: **3 vertices** of a triangle, or the
+        **6 edges** of a tetrahedron.
+
+        **Why edges and not vertices in 3-D.** Around an interior edge, a tet's four faces contain
+        both endpoints in exactly two cases, so the fan's dual graph is 2-regular — a cycle — and
+        eq. (18) transfers verbatim with ``N^I -> N^edge``. Around an interior *vertex* the dual is
+        3-regular and there is no total order to walk at all, and the patch is far larger:
+        ``4T/V ~ 27`` against ``6T/E ~ 5.2`` for the edge fan on a Delaunay tetrahedral mesh. That
+        size is the real obstacle rather than the ordering — eq. (18) is a geometric mean, so its
+        contrast collapses as the patch grows, measured in ``tests/test_patch_filter_scaling.py``
+        as a hinge scoring 0.04 of solid at ``N=6`` but 0.85 at ``N=27``. The edge fan lands at
+        ``N ~ 5``, where the criterion is at its sharpest.
 
         The **ordering is taken once, from the current mesh**. Connectivity is fixed under
         ``.trainable()`` coordinates (relocation, not remeshing), so the patches themselves never
-        change; only a distortion large enough to reorder the angular fan would invalidate the walk,
-        which the geometric constraints of eq. (24)-(28) exist to prevent.
+        change; only a distortion large enough to reorder the fan would invalidate the walk, which
+        the geometric constraints of eq. (24)-(28) exist to prevent.
         """
         cells = self._cells_p1()
-        pts = np.asarray(self.mesh.points)[:, : int(self.dimension)]
-        if int(self.dimension) != 2 or cells.shape[1] != 3:
+        dim = int(self.dimension)
+        if dim == 3 and cells.shape[1] == 4:
+            return self._edge_fan_topology(cells)
+        if dim != 2 or cells.shape[1] != 3:
             raise NotImplementedError(
-                f"domain._patch_topology(): triangles in 2-D only; got {cells.shape[1]}-node cells "
-                f"in {self.dimension}-D. The patch formulation is 2-D (paper, Sec. 2.3.2)."
+                f"domain._patch_topology(): simplices in 2-D or 3-D; got {cells.shape[1]}-node cells "
+                f"in {dim}-D."
             )
+        pts = np.asarray(self.mesh.points)[:, :dim]
         n_cells = cells.shape[0]
         centroids = pts[cells].mean(axis=1)
 
@@ -3475,6 +3494,78 @@ class domain(MeshIOMixin):
                 others[k, v, : len(rest)] = rest
                 size[k, v] = len(ring)
                 boundary[k, v] = bool(on_boundary[int(n)])
+        return {"others": others, "size": size, "boundary": boundary}
+
+    def _edge_fan_topology(self, cells):
+        """The 3-D half of :meth:`_patch_topology`: the tetrahedra around each edge, in fan order.
+
+        For a tet ``(a,b,c,d)`` containing edge ``(a,b)``, only faces ``(a,b,c)`` and ``(a,b,d)``
+        contain both endpoints, so each tet in the fan has exactly two neighbours and the fan is a
+        **cycle** — the property that makes eq. (18)'s walk well defined without any angular sort.
+        Two tets are adjacent in it when they share a face through the edge, which is exactly when
+        their *far* vertices (the two that are not ``a`` or ``b``) overlap. That is the whole
+        traversal: no geometry is read, only connectivity, which is why the fan is valid for any
+        node positions the optimiser reaches.
+
+        A **boundary** edge is an open chain rather than a cycle — its end tets have one neighbour —
+        and is flagged so :meth:`patch_filter` applies the Fig. 2c-d boundary rule.
+        """
+        n_cells = cells.shape[0]
+        edges: dict = {}
+        for k in range(n_cells):
+            t = cells[k]
+            for slot, (i, j) in enumerate(self._TET_EDGES):
+                a, b = int(t[i]), int(t[j])
+                edges.setdefault((min(a, b), max(a, b)), []).append((k, slot))
+
+        rings: dict = {}
+        n_max = 1
+        for (a, b), members in edges.items():
+            ks = [k for k, _ in members]
+            # The two vertices of each tet that are NOT on the edge; sharing one means sharing the
+            # face through the edge, i.e. being neighbours in the fan.
+            far = [tuple(int(v) for v in cells[k] if int(v) not in (a, b)) for k in ks]
+            by_vertex: dict = {}
+            for idx, pair in enumerate(far):
+                for v in pair:
+                    by_vertex.setdefault(v, []).append(idx)
+            adj: List[List[int]] = [[] for _ in ks]
+            for lst in by_vertex.values():
+                if len(lst) == 2:  # an interior face: exactly two tets meet across it
+                    adj[lst[0]].append(lst[1])
+                    adj[lst[1]].append(lst[0])
+            closed = all(len(nb) == 2 for nb in adj)
+            if closed and len(ks) > 2:
+                # 2-regularity is the structural claim this rests on; a violation means a
+                # non-manifold mesh or a mis-extracted patch, and would silently give eq. (18) a
+                # walk that revisits an element.
+                assert sum(len(nb) for nb in adj) == 2 * len(ks), f"edge ({a},{b}) fan is not a cycle"
+            start = 0 if closed else next(i for i in range(len(ks)) if len(adj[i]) < 2)
+            order, seen, cur = [start], {start}, start
+            while len(order) < len(ks):
+                nxt = next((j for j in adj[cur] if j not in seen), None)
+                if nxt is None:  # a fan split by a non-manifold edge; keep what was reachable
+                    break
+                order.append(nxt)
+                seen.add(nxt)
+                cur = nxt
+            rings[(a, b)] = ([ks[i] for i in order], closed)
+            n_max = max(n_max, len(order))
+
+        n_slots = len(self._TET_EDGES)
+        others = np.full((n_cells, n_slots, max(n_max - 1, 1)), -1, dtype=np.int64)
+        size = np.zeros((n_cells, n_slots), dtype=np.int64)
+        boundary = np.zeros((n_cells, n_slots), dtype=bool)
+        for (a, b), members in edges.items():
+            ring, closed = rings[(a, b)]
+            for k, slot in members:
+                if k not in ring:  # dropped by a broken traversal above
+                    continue
+                q = ring.index(k)
+                rest = ring[q + 1 :] + ring[:q]  # fan order, starting adjacent to k
+                others[k, slot, : len(rest)] = rest
+                size[k, slot] = len(ring)
+                boundary[k, slot] = not closed
         return {"others": others, "size": size, "boundary": boundary}
 
     def variable(
