@@ -15,6 +15,7 @@ that returns numbers and refines uniformly would pass any smoke test and be wort
 
 from __future__ import annotations
 
+import jax
 import numpy as np
 import pytest
 
@@ -29,6 +30,24 @@ from jno.utils.solver.fem_adapt import (
 )
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
+
+
+@pytest.fixture(autouse=True)
+def _x64():
+    """Two tests here assert the vector and scalar projections agree EXACTLY (rtol=1e-10).
+
+    That is a real claim -- every component of a vector Lagrange field rides the same scalar nodal
+    basis, so the projection cannot depend on the field's width -- but it is only assertable in
+    float64: float32 carries eps = 1.2e-7, and the same two checks measure 5.96e-08 and 1 ULP above
+    1.0 there. Without this the file passes only when some earlier test in the session happens to
+    have left x64 on, and fails whenever it is run alone.
+    """
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
 
 
 def _ridge_problem(cell="simplex", size=0.09):
