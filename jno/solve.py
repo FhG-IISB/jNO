@@ -1148,8 +1148,16 @@ def relocate(
 
     - ``"equidistribution"`` (default) equidistributes an **arclength monitor** — it targets *resolution*,
       and wins where a feature is under-resolved or moving.
-    - ``"energy"`` descends the **FE Dirichlet energy**. For a Ritz method
-      ``E_h - E_exact = 1/2 ||u - u_h||_E^2``, so on a steady problem the energy *is* the error norm and
+    - ``"energy"`` descends the **FE Dirichlet energy**, and it is the error norm **only on a
+      SOURCE-FREE problem**. The Ritz functional is ``J(v) = 1/2 a(v,v) - (f,v)``, and it is ``J`` that
+      satisfies ``J_h - J_exact = 1/2 ||u - u_h||_E^2``. With no body load ``J = E``, so descending the
+      energy descends the error -- that is the L-shape column below. Add a source and ``J_h = -E_h`` at
+      the discrete solution, so minimising the error means **maximising** ``E``: descending it walks
+      away from the solution, and squashing elements is the cheapest way to lower ``∫|∇u|²``. Measured
+      on an L-shape driven by a compact bump: the optimiser duly cut ``E`` from 0.12252 to 0.10788
+      while the true error ROSE 3.6x and the mesh's smallest angle collapsed 40.8° -> 3.2°. Until this
+      is fixed, use the default on any problem carrying a source or reaction term. For a Ritz method
+      ``E_h - E_exact = 1/2 ||u - u_h||_E^2`` (source-free), so there the energy *is* the error norm and
       descending it minimises the error directly.
     - ``"huang"`` is Huang's equidistribution–alignment functional (see :class:`AdaptSpec`).
 
