@@ -1150,7 +1150,34 @@ def run_continuation(fem, spec, *, nonlinear=None, linear=None, precond=None, x0
                 full = op.residual(prolong_periodic(periodic, ur), vals)
                 return reduce_vector_periodic(periodic, jnp.asarray(full).reshape(-1))
 
-        _step = jax.jit(lambda vals, u_prev: nl(lambda uu: _residual_at(vals, uu), u_prev))
+        # A sparse-direct Newton (`newton(direct=True)`, or any direct `linear=` slot, which selects it)
+        # flags `wants_jacobian` and factorizes the ASSEMBLED tangent. The march used to hand its driver a
+        # residual closure and nothing else, and a closure has no tangent to give -- so a direct Newton
+        # under a continuation REFUSED outright, which is exactly the pairing a stiff homotopy wants:
+        # reach a parameter value the cold solve cannot, on a saddle where the matrix-free Newton has no
+        # preconditioner. The steady path already threads the tangent this way (`FemResidualOperator`),
+        # and the load-path march was fixed to match; this is the third caller. On a REDUCED system the
+        # tangent is reduced with the same prolongation as the residual, P^T J P.
+        _jac_at = None
+        if getattr(nl, "wants_jacobian", False) and getattr(op, "jacobian", None) is not None:
+            if periodic is None:
+
+                def _jac_at(vals, uu):
+                    return op.jacobian(uu, vals)
+
+            else:
+                from .fem_utils import reduce_matrix_periodic
+
+                def _jac_at(vals, ur):
+                    full = op.jacobian(prolong_periodic(periodic, ur), vals)
+                    return reduce_matrix_periodic(periodic, full)
+
+        if _jac_at is None:
+            _step = jax.jit(lambda vals, u_prev: nl(lambda uu: _residual_at(vals, uu), u_prev))
+        else:
+            _step = jax.jit(
+                lambda vals, u_prev: nl(lambda uu: _residual_at(vals, uu), u_prev, jacobian=lambda uu: _jac_at(vals, uu))
+            )
 
         # `_convergence_check` inside the driver self-disables under jit (it needs a concrete
         # residual), so the stalled-solve guard it provides would be lost -- and `fem.stats` would
