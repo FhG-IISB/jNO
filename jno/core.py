@@ -123,6 +123,24 @@ def _auto_gram_terms(constraints, fm) -> list:
     return gram_terms
 
 
+def _optimizer_states_match(a, b) -> bool:
+    """Whether two optax states have the same tree, leaf shapes and dtypes.
+
+    The test for "this is the same optimizer over the same parameters", and so for whether a state
+    carried over from a previous :meth:`core.solve` can be reused instead of re-initialised.
+    """
+    leaves_a, def_a = jax.tree_util.tree_flatten(a)
+    leaves_b, def_b = jax.tree_util.tree_flatten(b)
+    if def_a != def_b:
+        return False
+    for x, y in zip(leaves_a, leaves_b):
+        if getattr(x, "shape", None) != getattr(y, "shape", None):
+            return False
+        if getattr(x, "dtype", None) != getattr(y, "dtype", None):
+            return False
+    return True
+
+
 def _cpu_device():
     """Return a CPU JAX device.
 
@@ -531,6 +549,9 @@ class core:
         super().__init__()
 
         self._total_epochs = 0
+        # optax states from the last solve(). A second solve() CONTINUES the first, so these are
+        # carried over rather than re-initialised -- see the note where they are used.
+        self._opt_states: Optional[Dict[str, Any]] = None
         seed = int(get_seed())
         self.seed = seed
         self.rng = jax.random.PRNGKey(seed)
@@ -2835,6 +2856,21 @@ class core:
                 state = jno_bayesian.init_state(bayesian_handles[k], trainable[lid], _bay_init_key)
             else:
                 state = per_model_opts[k].init(trainable[lid])
+                # A second solve() CONTINUES the first. optax carries its own step count inside
+                # this state, so re-initialising it silently restarts every optax SCHEDULE --
+                # warmup, decay, join_schedules -- and a training loop that calls solve() in
+                # chunks (to checkpoint, to diagnose, to move a curriculum on) never leaves the
+                # first few steps of its schedule. Nothing warns; the run simply trains at the
+                # wrong rate. jNO's own LearningRateSchedule is already immune, because it reads
+                # the persistent ``self._total_epochs`` (see ``base_epoch``).
+                #
+                # Reuse is conditional on the freshly built state having the same tree, shapes and
+                # dtypes, which is exactly the condition for it to be the same optimizer over the
+                # same parameters; change either and the fresh state is used. To ask for a genuine
+                # restart, build a new ``jno.core`` -- states live on the instance.
+                _prev = (self._opt_states or {}).get(k)
+                if _prev is not None and _optimizer_states_match(_prev, state):
+                    state = _prev
             # Copy every array leaf so that aliased buffers (e.g. from
             # L-BFGS zero-initialised history arrays that share the same
             # underlying allocation) become distinct.  Without this,
@@ -4676,6 +4712,8 @@ class core:
                 wandb_log_model(self)
 
         self._total_epochs += epochs
+        # Hand the optimizer states to the next solve() so schedules continue across the call.
+        self._opt_states = opt_states
 
         # --- callbacks: on_training_end ---
         if callbacks:
