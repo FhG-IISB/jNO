@@ -253,3 +253,89 @@ def test_rt_normal_flux_still_routes_to_the_edge_dof_path():
     # doubling g must double the pinned boundary DOFs; a dropped constraint would leave them identical
     assert not np.allclose(sols[0], sols[1]), "the u·n = g constraint was not applied on RT"
     np.testing.assert_allclose(sols[1], 2.0 * sols[0], rtol=1e-10, atol=1e-12)
+
+
+def _curved_channel_top(zcut, nx=12, ny=3, nz=6, L=2.0, H=1.0, W=1.0, A=0.35):
+    """A curved surface tagged on only ONE side of a plane it continues across.
+
+    The top of a structured box is bent into ``y = h(x)`` — curved along ``x``, **constant along
+    ``z``** — and then tagged only for ``z < zcut``. That is the geometry of a half-model cut on a
+    symmetry plane: the surface itself does not stop at the cut, only the region does, so the facet
+    patch around a node on the cut is one-sided while the exact normal there is unchanged.
+
+    Returns the recovered normals, their positions, and the exact surface normal at each.
+    """
+    from jno._fem import _region_node_normals
+
+    h = lambda x: H - 0.5 * A * (1.0 - np.cos(2.0 * np.pi * x / L))  # noqa: E731
+    dh = lambda x: -A * (np.pi / L) * np.sin(2.0 * np.pi * x / L)  # noqa: E731
+
+    d = jno.Shape.box(0.0, 0.0, 0.0, L, H, W, size=0.3).structured(n=(nx, ny, nz)).domain()
+    P = np.asarray(d.mesh.points).copy()
+    P[:, 1] *= h(P[:, 0]) / H  # bend the top; the lattice topology is untouched
+    d.mesh.points = P
+    d.tag("top", lambda x, y, z: (y > h(x) - 1e-9) & (z < zcut + 1e-9))
+
+    u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), order=2)
+    ci, ct = d.variable("interior", split=True), d.variable("top", normals=True, split=True)
+    X = list(ci[:3])
+    eps, dot2 = lambda w: jno.np.symgrad(w, X), lambda a, b: jno.np.inner(a, b, n_contract=2)  # noqa: E731
+    ut = u.bind(x=ct[0], y=ct[1], z=ct[2])
+    fem = jno.fem([dot2(eps(u), eps(v)), ct[-3] * ut[0] + ct[-2] * ut[1] + ct[-1] * ut[2] - 0.0])
+
+    pts = np.asarray((getattr(d, "_fem_native_dof_points_all", None) or [fem.points])[0])
+    got = _region_node_normals(d, pts, np.asarray(d._fem_native_assembly_cells), 2, "top")
+    ids = np.array(sorted(got))
+    N, Q = np.stack([got[i] for i in ids]), pts[ids]
+    keep = np.linalg.norm(N, axis=1) > 0  # P2 midsides carry the flux; vertices carry a direction
+    N, Q = N[keep] / np.linalg.norm(N[keep], axis=1, keepdims=True), Q[keep]
+    s = dh(Q[:, 0])
+    exact = np.stack([-s, np.ones_like(s), np.zeros_like(s)], 1)
+    return N, Q, exact / np.linalg.norm(exact, axis=1, keepdims=True)
+
+
+def test_a_truncated_region_does_not_tilt_the_normal_it_recovers():
+    """Cutting a region on a plane the surface passes straight through must not move the normal.
+
+    A node on the cut sees only the facets on one side of it. Weighting those by **area** is
+    triangulation-dependent: on a lattice each quad splits along one diagonal, so a node touches one
+    facet on its left and two on its right in the row above and the reverse below. In the interior
+    the imbalance cancels between the two rows; on the cut only one row survives and the average
+    tilts, systematically and in-plane, by a fixed fraction of the local slope. Weighting by the
+    angle each facet subtends at the node is triangulation-independent (Thürmer & Wüthrich,
+    *J. Graphics Tools* **3**(1), 1998, §3) and does cancel — 180°/180° in the interior, 90°/90° on
+    the cut, at any aspect ratio.
+
+    The oracle is exact and needs no reference solution: ``h`` does not depend on ``z``, so two nodes
+    at the same ``x`` must be given the *same* normal whether or not one of them sits on the cut.
+    Facet-geometry error is common to both and cancels in the comparison, which is what lets this
+    resolve a bias four times smaller than the O(h) error it hides under.
+    """
+    zcut = 0.5
+    N, Q, exact = _curved_channel_top(zcut)
+    on_cut = Q[:, 2] > zcut - 1e-6
+    assert on_cut.any() and (~on_cut).any(), "the tag did not truncate the surface"
+
+    xr, yr = np.round(Q[:, 0], 9), np.round(Q[:, 1], 9)
+    drift = []
+    for i in np.where(on_cut)[0]:
+        twin = np.where((~on_cut) & (xr == xr[i]) & (yr == yr[i]))[0]
+        if len(twin):  # the nearest node of the same (x, y), away from the cut
+            k = twin[np.argmin(np.abs(Q[twin, 2] - Q[i, 2]))]
+            drift.append(np.degrees(np.arccos(np.clip(abs(float(N[i] @ N[k])), -1.0, 1.0))))
+    drift = np.asarray(drift)
+    assert len(drift) >= 10, f"only {len(drift)} cut nodes had an interior twin"
+
+    # area weighting gives 0.63 deg mean / 2.68 deg max here, above the 0.15 deg the facet geometry
+    # itself is worth; the bound is set between the two so it cannot pass on a wash.
+    assert drift.mean() < 0.15, f"normals tilt on the cut: mean drift {drift.mean():.4f} deg"
+    assert drift.max() < 0.50, f"normals tilt on the cut: max drift {drift.max():.4f} deg"
+
+    # the surface is straight along z, so the recovered normal must have no z-component at all
+    assert np.abs(N[:, 2]).max() < 1e-12, "a z-invariant surface produced an out-of-plane normal"
+
+    # and the whole patch must still track the true surface to the facet error, cut or not
+    ang = np.degrees(np.arccos(np.clip(np.abs((N * exact).sum(1)), -1.0, 1.0)))
+    assert ang[on_cut].mean() < 1.35 * ang[~on_cut].mean(), (
+        f"cut nodes are worse than interior ones: {ang[on_cut].mean():.4f} vs {ang[~on_cut].mean():.4f} deg"
+    )

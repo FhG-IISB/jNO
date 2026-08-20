@@ -3214,8 +3214,15 @@ def _region_node_normals(domain: Any, points: Any, cells: Any, order: int, regio
 
     P2 caveat: a vertex shape function integrates to **zero** over a straight triangular facet
     (``∫λ(2λ-1) = 0``), so P2 vertices are genuinely flux-neutral and get ``N_i = 0``. They still need a
-    direction to eliminate against, so they fall back to the area-weighted facet average; the flux
-    identity is unaffected because their weight in it is zero.
+    direction to eliminate against, so they fall back to a facet average; the flux identity is
+    unaffected because their weight in it is zero.
+
+    That average is weighted by the angle each facet subtends **at the node**, not by facet area
+    (Thürmer & Wüthrich, *J. Graphics Tools* **3**(1), 1998, §3). Area weighting depends on how the
+    surface happens to be triangulated, and where a region stops on a plane the surface continues
+    across -- a symmetry cut -- the dependence stops cancelling and biases the direction in-plane by a
+    fixed fraction of the local slope. Angle weighting is triangulation-independent, so the cut costs
+    nothing. In 1-D and 2-D an interior angle is not defined and the area weight is used as before.
     """
     from .utils.solver.fem_facets import build_facet_connectivity, compute_face_normals
 
@@ -3240,7 +3247,8 @@ def _region_node_normals(domain: Any, points: Any, cells: Any, order: int, regio
     oriented = {frozenset(int(v) for v in row): fn[k] for k, row in enumerate(np.asarray(conn.face_nodes))}
 
     mass = {}  # node -> Σ_f n_f ∫_f φ_i   (the flux-exact vector)
-    area = {}  # node -> Σ_f A_f n_f       (fallback direction for flux-neutral nodes)
+    area = {}  # node -> Σ_f A_f n_f       (last-resort direction for flux-neutral nodes)
+    angw = {}  # node -> Σ_f θ_f n_f       (angle-weighted: triangulation-INDEPENDENT, see below)
     for row in facets:
         verts = [int(v) for v in row[:dim]]
         if not all(in_region[v] for v in verts):
@@ -3269,6 +3277,17 @@ def _region_node_normals(domain: Any, points: Any, cells: Any, order: int, regio
             mass[v] = mass.get(v, 0.0) + wv * n_f
         for v in verts + extra:
             area[v] = area.get(v, 0.0) + A * n_f
+        if dim == 3:
+            # The angle each facet subtends AT the corner. Area weighting is triangulation-dependent;
+            # angle weighting is not (Thürmer & Wüthrich, *J. Graphics Tools* 3(1), 1998, §3).
+            for a in range(3):
+                e1 = P[(a + 1) % 3] - P[a]
+                e2 = P[(a + 2) % 3] - P[a]
+                l1, l2 = float(np.linalg.norm(e1)), float(np.linalg.norm(e2))
+                if l1 <= 0.0 or l2 <= 0.0:
+                    continue
+                th = float(np.arccos(float(np.clip(float(np.dot(e1, e2)) / (l1 * l2), -1.0, 1.0))))
+                angw[verts[a]] = angw.get(verts[a], 0.0) + th * n_f
 
     out: Dict[int, np.ndarray] = {}
     for v, N in mass.items():
@@ -3276,7 +3295,20 @@ def _region_node_normals(domain: Any, points: Any, cells: Any, order: int, regio
         if nrm > 1e-30:
             out[v] = np.asarray(N, dtype=float) / nrm
             continue
-        fb = area.get(v)  # flux-neutral node (P2 vertex): direction only
+        # Flux-neutral node (a P2 vertex): it still needs a DIRECTION to eliminate against, and here
+        # -- unlike the P1 case, where the area weight IS the flux-exact one -- that direction is free,
+        # so it should be the best available estimate rather than the cheapest. Why the angle weight
+        # is that estimate, in one concrete case: with a uniform Kuhn diagonal a vertex touches one
+        # triangle of the quad on one side and two on the other, so the areas never balance around it.
+        # The row above and the row below carry opposite imbalances and cancel -- until the patch is
+        # one-sided, where the estimate collapses from a (1/2, 1/2) blend of the two neighbouring chord
+        # normals to (1/3, 2/3). On a curved contact surface cut on its symmetry plane that tilted the
+        # vertex normal by a constant 2.4e-3 in n_x/n_y, and the elimination wrote it straight into the
+        # velocity it defines there. The subtended angles sum to 90 + 90 on that same one-sided patch,
+        # exactly as they sum to 180 + 180 in the interior.
+        fb = angw.get(v)
+        if fb is None or float(np.linalg.norm(fb)) <= 1e-30:
+            fb = area.get(v)  # 1-D/2-D facets, where an interior angle is not defined
         if fb is None or float(np.linalg.norm(fb)) <= 1e-30:
             continue
         out[v] = np.asarray(fb, dtype=float) / float(np.linalg.norm(fb))
