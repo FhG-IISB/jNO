@@ -3434,6 +3434,41 @@ class domain(MeshIOMixin):
             "nodes": uniq[shared],
         }
 
+    def _facet_ridges(self):
+        """:meth:`_interior_facets`, grouped by the **ridge** each facet borders.
+
+        A ridge is the facet's own facet — a *point* in 2-D, an *edge* in 3-D — so two interior
+        facets sharing a ridge are neighbours on the material boundary, and the angle between them
+        is that boundary's discrete curvature. This is the traversal a bending functional needs,
+        the way :meth:`_interior_facets` alone is the traversal a perimeter needs.
+
+        Returns :meth:`_interior_facets`' ``cells`` and ``nodes``, plus:
+            ``facet_ridge`` ``(n_facets, n_local_ridges)`` int — which ridge each of the facet's
+                sides belongs to. 2 per facet in 2-D (its endpoints), 3 in 3-D (its edges).
+            ``ridge_nodes`` ``(n_ridges, n_ridge_nodes)`` int — the ridge's own corners: 1 in 2-D,
+                2 in 3-D. Its measure follows — a point counts 1, an edge contributes its length.
+
+        **A ridge collects every incident interior facet, not two.** In 3-D a mesh edge is shared
+        by a whole fan of tetrahedra, hence by a fan of faces — 6 on average, not 2 — so there is
+        no such thing as "the" neighbour across it. Which of them the material boundary actually
+        runs through is a property of the *density*, not of the mesh, and so cannot be decided
+        here; a functional over this table has to weight the pairs by their density jump and let
+        the ones that carry no boundary contribute nothing. Grouping rather than pairing is what
+        leaves that open.
+        """
+        facets = self._interior_facets()
+        nodes = facets["nodes"]  # (F, n_face_nodes)
+        # The facet's own facets. An edge's ridges are its two endpoints; a triangle's are its
+        # three edges. Both are "drop one corner", which is why the tables are one line each.
+        local = np.array([[0], [1]] if nodes.shape[1] == 2 else [[0, 1], [1, 2], [0, 2]], dtype=np.int64)
+        keys = np.sort(nodes[:, local], axis=-1).reshape(-1, local.shape[1])
+        uniq, inverse = np.unique(keys, axis=0, return_inverse=True)
+        return {
+            **facets,
+            "facet_ridge": np.asarray(inverse).reshape(nodes.shape[0], local.shape[0]),
+            "ridge_nodes": uniq,
+        }
+
     def patch_filter(self):
         """The patch filter of eq. (17)-(19) as a pure ``(n_cells,) -> (n_cells,)`` callable.
 

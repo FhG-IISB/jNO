@@ -2969,6 +2969,146 @@ class ModelCall(Placeholder):
 
         return _jno.fn(_perimeter, [self, *args], name="perimeter")
 
+    def curvature(self, zeta: float = 0.1) -> "FunctionCall":
+        """Discrete bending energy of the material boundary — the **local** smoothness handle.
+
+        :meth:`perimeter` bounds the boundary's total extent, which is a *global* budget: a design
+        can meet it exactly and still be locally serrated, by paying for spikes here with flatness
+        elsewhere. Measured on a converged 3-D bracket, the angle between adjacent surface facets
+        had a median of 33.8 degrees and a 99th percentile of 88.9 with the perimeter barrier
+        active and satisfied. Nothing in eq. (38) sees that, because nothing in it compares one
+        piece of boundary with the next. This does::
+
+            S = sum_r  w_r  sum_{i<j}  a_i a_j ( 1 - v_i . v_j )
+
+        The outer sum runs over the **ridges** — a mesh vertex in 2-D, a mesh edge in 3-D — and the
+        inner over pairs of interior facets meeting there (:meth:`~jno.domain.Domain._facet_ridges`),
+        with ``w_r`` the ridge's measure (1 for a point, its length for an edge). For a facet with
+        density jump ``D`` and unit normal ``n``,
+
+            a = sqrt( (1 + 2z) D^2 + z^2 ) - z          how much boundary the facet carries
+            v = n D sqrt(1 + z^2) / sqrt( D^2 + z^2 )   which way it faces, |v| <= 1
+
+        ``a`` is eq. (38)'s own bracket, reused unchanged. In the sharp limit on a black-and-white
+        design each term is ``|D_i| |D_j| (1 - cos t_ij)`` for ``t_ij`` the angle between the two
+        facets: **zero unless both facets carry boundary, and then growing with the angle between
+        them.** That is the discrete bending energy of a triangle mesh (Grinspun, Hirani, Desbrun &
+        Schroeder, *Discrete Shells*, SCA 2003, Sec. 3) — the discrete counterpart of the Willmore
+        energy ``int H^2`` (Willmore, *An. Sti. Univ. Iasi* **11B**, 1965, 493-496) — with the
+        density jump selecting which facets are boundary at all. Four properties make it usable as
+        written rather than as a hand-tuned surrogate:
+
+        * **Orientation-free.** ``n``'s sign depends on which of the two cells is listed first;
+          ``D``'s does too, so ``v`` does not. No consistent global orientation of the boundary is
+          needed, which is what would otherwise fail the moment the design is not yet a clean
+          two-sided surface.
+        * **Non-negative**, since ``|v_i . v_j| <= 1``. A bending energy that can pay for a fold
+          here with a flat patch there would be worse than none.
+        * **Exactly zero on a flat boundary, and on no boundary at all.** ``a`` vanishes exactly at
+          ``D = 0`` and ``v`` reaches unit length exactly at ``|D| = 1``, so a coplanar full-jump
+          pair costs 0 and a pair involving a facet in the bulk costs 0 — for any ``z``, with no
+          floor to subtract off. Both matter: without the first this measures a perimeter rather
+          than a curvature, and without the second it charges every boundary facet for its
+          interior neighbours, which is the same thing again.
+        * **Differentiable in the density and in the mesh**, since the normals and the ridge
+          measures are read off the moving vertices. Under a deformable mesh this is the term that
+          gives node migration a reason to *align* the boundary rather than merely shorten it.
+
+        **A geometrically flat interface still costs something on an unstructured mesh**, because
+        its facets zig-zag between tetrahedra rather than lying in the plane they approximate —
+        the same reason the perimeter of a straight bar measures above its length. The floor is a
+        property of the mesh, not of the design, and it is what node migration can work off.
+
+        A ridge in 3-D is shared by a fan of faces, not by two, and every pair in the fan is
+        summed. The cost is not: the double sum collapses to an ``O(N)`` scatter through
+        ``2 sum_{i<j} x_i x_j = (sum_i x_i)^2 - sum_i x_i^2``, so this is a handful of segment sums
+        over the interior facets and never materialises a pair.
+
+        Used as a penalty on the objective, which is how a bending energy is normally weighted::
+
+            S = rho.curvature(zeta=0.1)
+            jno.core([C, jno.fn(lambda s, w: w * s, [S, weight]), jno.le(V, 1.0)], domain=d)
+
+        or, if a hard ceiling is wanted, through ``.log_barrier(S_star)`` exactly as eq. (39)-(40)
+        does for the perimeter. Prefer the penalty: it is one more row in the objective, whereas a
+        barrier is one more constraint for MMA to trade against the volume.
+
+        Args:
+            zeta: Jump smoothing, shared with :meth:`perimeter` and used for the same reason.
+                Smaller is a sharper approximation to ``|D|`` and a worse-conditioned one.
+        """
+        dom = getattr(self.model, "_fem_field_domain", None)
+        if getattr(self.model, "_fem_field", None) != "cell" or dom is None:
+            raise TypeError(
+                "ModelCall.curvature(): needs a P0 (per-element) density -- the boundary it bends "
+                "is the interface BETWEEN two elements, located by the jump across it, so a nodal "
+                "field (which is continuous and jumps nowhere) has no boundary to measure."
+            )
+        import jno as _jno
+
+        topo = dom._facet_ridges()
+        ecells = jnp.asarray(topo["cells"], dtype=jnp.int32)  # (F, 2)
+        enodes = jnp.asarray(topo["nodes"], dtype=jnp.int32)  # (F, 2 or 3)
+        fridge = jnp.asarray(topo["facet_ridge"], dtype=jnp.int32)  # (F, 2 or 3)
+        rnodes = jnp.asarray(topo["ridge_nodes"], dtype=jnp.int32)  # (R, 1 or 2)
+        cells = jnp.asarray(dom._cells_topo()[0], dtype=jnp.int32)
+        args, rebuild = dom._moving_points()
+        z = float(zeta)
+        n_fn, n_ridges, n_local = int(enodes.shape[1]), int(rnodes.shape[0]), int(fridge.shape[1])
+        seg = fridge.reshape(-1)
+
+        def _curvature(rv, *coord_vals):
+            r = jnp.asarray(rv).reshape(-1)
+            pts = rebuild(*coord_vals)
+
+            # The facet's unit normal: perpendicular to its edge in 2-D, to its plane in 3-D.
+            if n_fn == 2:
+                e = pts[enodes[:, 1]] - pts[enodes[:, 0]]
+                raw = jnp.stack([-e[:, 1], e[:, 0]], axis=-1)
+            else:
+                e1 = pts[enodes[:, 1]] - pts[enodes[:, 0]]
+                e2 = pts[enodes[:, 2]] - pts[enodes[:, 0]]
+                raw = jnp.cross(e1, e2)
+            nhat = raw / (jnp.linalg.norm(raw, axis=-1, keepdims=True) + 1e-30)
+
+            # Point it from the first cell to the second, so that `g = jump * nhat` is the same
+            # vector whichever way the pair happens to be listed. The flip is where an element
+            # would have to inverted, which eq. (26)-(28)'s volume bounds exist to prevent.
+            cen = jnp.mean(pts[cells], axis=1)
+            away = cen[ecells[:, 1]] - cen[ecells[:, 0]]
+            side = jnp.where(jnp.sum(nhat * away, axis=-1) >= 0.0, 1.0, -1.0)
+            nhat = nhat * side[:, None]
+
+            jump = r[ecells[:, 0]] - r[ecells[:, 1]]  # (F,)
+            # How much boundary this facet carries: eq. (38)'s own bracket, exactly 0 at no jump
+            # and exactly 1 at a full one -- so a facet in the interior of the material, or in the
+            # interior of the void, contributes nothing to any pair it takes part in.
+            amp = jnp.sqrt((1.0 + 2.0 * z) * jump * jump + z * z) - z  # (F,)
+            # Which way it faces, as a vector of length <= 1 that reaches 1 exactly at a full jump.
+            # Carrying the jump's SIGN is what makes the pair term orientation-free.
+            unit = jump * jnp.sqrt(1.0 + z * z) / jnp.sqrt(jump * jump + z * z)  # (F,) in [-1, 1]
+            q = (amp * unit)[:, None] * nhat  # (F, dim)
+
+            # Every facet is counted once per ridge it borders; the pair sums then come from the
+            # totals alone, never from an (i, j) list.
+            def ssum(v):
+                tail = v.shape[1:]  # () for a scalar per facet, (dim,) for a vector
+                wide = jnp.broadcast_to(v[:, None], (v.shape[0], n_local, *tail))
+                return jax.ops.segment_sum(wide.reshape(-1, *tail), seg, num_segments=n_ridges)
+
+            s_a, s_a2 = ssum(amp), ssum(amp * amp)
+            s_q, s_q2 = ssum(q), ssum(jnp.sum(q * q, axis=-1))
+            pairs = 0.5 * ((s_a * s_a - s_a2) - (jnp.sum(s_q * s_q, axis=-1) - s_q2))
+
+            measure = (
+                jnp.ones(n_ridges, dtype=pairs.dtype)
+                if rnodes.shape[1] == 1
+                else jnp.linalg.norm(pts[rnodes[:, 1]] - pts[rnodes[:, 0]], axis=-1)
+            )
+            return jnp.sum(measure * pairs)
+
+        return _jno.fn(_curvature, [self, *args], name="curvature")
+
     def __call__(self, *coords, **named):
         """For a **nodal-field unknown** (``domain.unknown()``), ``u(xb, yb)`` is sugar for
         ``u.bind(x=xb, y=yb)`` — the region-restricted form used to write fem-identical BCs / IC

@@ -490,6 +490,224 @@ class TestPerimeter:
         assert float(p(jnp.asarray(scattered))) > 3.0 * float(p(jnp.asarray(slab)))
 
 
+class TestCurvature:
+    """Discrete bending energy of the material boundary — the LOCAL smoothness handle.
+
+    ``perimeter()`` is a global budget: a design can meet it exactly and still be locally serrated,
+    paying for a spike here with flatness elsewhere. Measured on a converged 3-D bracket with the
+    perimeter barrier active and satisfied, the angle between adjacent surface facets had a median
+    of 33.8 degrees and a 99th percentile of 88.9 — a boundary nobody would machine, scoring as
+    well on eq. (38) as a smooth one. What is pinned here is the term that does see it: the
+    discrete bending energy of Grinspun, Hirani, Desbrun & Schroeder, *Discrete Shells*, SCA 2003,
+    Sec. 3, with the density jump selecting which facets are boundary at all.
+
+    A structured quadrilateral grid carries most of these, because on one the answers are exact
+    integers rather than mesh artefacts — a right angle is a right angle, so ``1 - cos t`` is
+    exactly 1, and the assertions can be equalities.
+    """
+
+    @staticmethod
+    def _grid(n=8, size=1.0):
+        d = jno.Shape.rect(0, 0, n, n, size=size).structured().domain(cell="quad")
+        _r, s = d.fem_symbols(space="P0", names=("r", "s"))
+        rho = jno.np.parameter(s, name=f"rho_curv_{n}_{size}")
+        cells = np.asarray(d._cells_topo()[0])
+        cen = np.asarray(d.mesh.points)[:, :2][cells].mean(axis=1)
+        return d, rho.curvature(zeta=0.1).fn, rho.perimeter(zeta=0.1).fn, cen
+
+    def test_a_uniform_density_has_no_boundary_to_bend(self):
+        """Not "small": exactly zero, for any density and any zeta, because eq. (38)'s bracket is
+        exactly zero at no jump and it multiplies every pair."""
+        _d, s, _p, cen = self._grid()
+        for value in (0.0, 0.37, 1.0):
+            assert float(s(jnp.full(cen.shape[0], value))) == 0.0
+
+    def test_a_straight_interface_costs_exactly_nothing(self):
+        """The floor has to be exact, or the term is a perimeter in disguise.
+
+        On a structured grid a horizontal interface is genuinely collinear, so there is no mesh
+        zig-zag to hide behind: S must be 0 while P measures the interface's full length of 8.
+        """
+        _d, s, p, cen = self._grid()
+        flat = np.where(cen[:, 1] > 4.0, 1.0, 0.0)
+        assert float(p(jnp.asarray(flat))) == pytest.approx(8.0, abs=1e-9), "the interface must be there at all"
+        assert float(s(jnp.asarray(flat))) == pytest.approx(0.0, abs=1e-12)
+
+    def test_a_right_angle_costs_exactly_one(self):
+        """``|D_i| |D_j| (1 - cos t)`` at a full jump and ``t = 90`` degrees is exactly 1, so the
+        energy counts corners. An L-shape turns once; a notch cut into a straight interface turns
+        four times."""
+        _d, s, _p, cen = self._grid()
+        corner = np.where((cen[:, 1] > 4.0) | (cen[:, 0] > 6.0), 1.0, 0.0)
+        assert float(s(jnp.asarray(corner))) == pytest.approx(1.0, abs=1e-9)
+        notch = np.where(cen[:, 1] > 4.0, 1.0, 0.0)
+        notch[(np.abs(cen[:, 0] - 4.0) < 1.0) & (np.abs(cen[:, 1] - 4.5) < 0.6)] = 0.0
+        assert float(s(jnp.asarray(notch))) == pytest.approx(4.0, abs=1e-9)
+
+    def test_it_separates_designs_the_perimeter_cannot_tell_apart(self):
+        """**The test that justifies the term existing.**
+
+        Under a monotone staircase boundary the perimeter telescopes: one horizontal unit per
+        column plus a total rise of ``h_first - h_last``, whatever route the staircase takes
+        between them. So these three designs have the same material volume AND the same perimeter
+        to every decimal place, and differ only in how many times the boundary turns. Measured
+        P = 14.0000 for all three; S = 2, 10, 12 against corner counts of 2, 10, 12.
+        """
+        n = 8
+        _d, s, p, cen = self._grid(n=n)
+        col = np.clip(cen[:, 0].astype(int), 0, n - 1)
+        designs = {
+            "one big step": [7, 7, 7, 7, 1, 1, 1, 1],
+            "five small ones": [7, 7, 6, 5, 3, 2, 1, 1],
+            "a staircase": [7, 6, 5, 4, 4, 3, 2, 1],
+        }
+        got = {}
+        for name, h in designs.items():
+            v = jnp.asarray((cen[:, 1] < np.asarray(h)[col]).astype(float))
+            got[name] = (float(p(v)), float(s(v)), float(np.asarray(v).sum()), 2 * int(np.count_nonzero(np.diff(h))))
+
+        vols = {round(g[2], 9) for g in got.values()}
+        perims = {round(g[0], 9) for g in got.values()}
+        assert len(vols) == 1, f"the designs must hold volume fixed for this to mean anything: {got}"
+        assert len(perims) == 1, f"the whole construction is that P is identical: {got}"
+        for name, (_pp, ss, _vv, turns) in got.items():
+            assert ss == pytest.approx(float(turns), abs=1e-9), f"{name}: S={ss} against {turns} right angles"
+        assert got["a staircase"][1] > 5.0 * got["one big step"][1], (
+            "at identical perimeter the turn-heavy design must cost several times more bending, "
+            f"got {got['a staircase'][1]} vs {got['one big step'][1]}"
+        )
+
+    def test_the_aggregate_equals_a_literal_pair_enumeration(self):
+        """The double sum over facet pairs is evaluated as ``2 sum_{i<j} x_i x_j = (sum x)^2 - sum
+        x^2`` so it never materialises a pair — an O(N) scatter where the fan around a 3-D edge
+        would otherwise be O(N^2). The identity is exact, so this is an equality.
+
+        Written out separately rather than through a shared helper, for the reason
+        ``test_the_vectorised_filter_matches_the_formula`` gives: a shared one would let a single
+        bug hide in both sides.
+        """
+        z = 0.1
+        d = jno.Shape.box(0, 0, 0, 2, 1, 2, size=0.5).domain()
+        _r, sym = d.fem_symbols(space="P0", names=("r", "s"))
+        fast = jno.np.parameter(sym, name="rho_pairs").curvature(zeta=z).fn
+        topo = d._facet_ridges()
+        pts = np.asarray(d.mesh.points)[:, :3]
+        cells = np.asarray(d._cells_p1())
+        cen = pts[cells].mean(axis=1)
+        nodes, owners, fr, rn = topo["nodes"], topo["cells"], topo["facet_ridge"], topo["ridge_nodes"]
+
+        raw = np.cross(pts[nodes[:, 1]] - pts[nodes[:, 0]], pts[nodes[:, 2]] - pts[nodes[:, 0]])
+        nrm = raw / np.linalg.norm(raw, axis=-1, keepdims=True)
+        nrm *= np.where(np.sum(nrm * (cen[owners[:, 1]] - cen[owners[:, 0]]), -1) >= 0.0, 1.0, -1.0)[:, None]
+        by_ridge: dict = {}
+        for f, row in enumerate(fr):
+            for r in row:
+                by_ridge.setdefault(int(r), []).append(f)
+
+        rng = np.random.default_rng(3)
+        for rv in (rng.random(cells.shape[0]), (rng.random(cells.shape[0]) > 0.5).astype(float)):
+            jump = rv[owners[:, 0]] - rv[owners[:, 1]]
+            amp = np.sqrt((1 + 2 * z) * jump**2 + z * z) - z
+            vec = nrm * (jump * np.sqrt(1 + z * z) / np.sqrt(jump**2 + z * z))[:, None]
+            want = 0.0
+            for r, fs in by_ridge.items():
+                w = float(np.linalg.norm(pts[rn[r, 1]] - pts[rn[r, 0]]))
+                for i in range(len(fs)):
+                    for j in range(i + 1, len(fs)):
+                        want += w * amp[fs[i]] * amp[fs[j]] * (1.0 - float(vec[fs[i]] @ vec[fs[j]]))
+            assert want > 1.0, "a random design must have real bending in it, or this compares 0 to 0"
+            assert float(fast(jnp.asarray(rv))) == pytest.approx(want, rel=1e-6)
+
+    def test_it_is_never_negative_even_on_the_grayest_designs(self):
+        """A bending energy that could dip below zero would be *exploitable*: the optimiser would
+        manufacture folds to pay for compliance. Non-negativity is structural — ``|v_i . v_j| <= 1``
+        with ``|v| <= 1`` — and gray is where a formulation that merely looks non-negative on
+        black-and-white designs would give itself away, since that is where the smoothed magnitude
+        and the true one disagree most."""
+        d = jno.Shape.box(0, 0, 0, 2, 1, 2, size=0.6).domain()
+        _r, sym = d.fem_symbols(space="P0", names=("r", "s"))
+        s = jno.np.parameter(sym, name="rho_nonneg").curvature(zeta=0.1).fn
+        n = np.asarray(d._cells_p1()).shape[0]
+        rng = np.random.default_rng(11)
+        for _ in range(8):
+            assert float(s(jnp.asarray(rng.random(n)))) >= 0.0
+        for value in (0.5, 0.5 + 1e-9):  # the exact half-jump, where a sign error would surface
+            checker = np.where(np.arange(n) % 2 == 0, value, 1.0 - value)
+            assert float(s(jnp.asarray(checker))) >= 0.0
+
+    def test_a_folded_interface_costs_more_than_a_flat_one_on_tets(self):
+        """In 3-D the discrimination is real but milder than on a grid, and the honest number is
+        the *ratio between the two functionals*: a square corrugation at fixed volume raises P by
+        1.59x and S by 1.90x, and scrambling the same material raises P by 14.6x and S by 48.2x.
+        So bending is roughly 1.2x sharper on a fold and 3.3x sharper on noise — worth a term, and
+        not a replacement for the perimeter.
+        """
+        d = jno.Shape.box(0, 0, 0, 4, 2, 4, size=0.5).domain()
+        _r, sym = d.fem_symbols(space="P0", names=("r", "s"))
+        rho = jno.np.parameter(sym, name="rho_fold")
+        s, p = rho.curvature(zeta=0.1).fn, rho.perimeter(zeta=0.1).fn
+        cells = np.asarray(d._cells_p1())
+        cen = np.asarray(d.mesh.points)[:, :3][cells].mean(axis=1)
+
+        flat = np.where(cen[:, 2] > 2.0, 1.0, 0.0)
+        fold = np.where(cen[:, 2] > 2.0 + 0.5 * np.where((cen[:, 0] // 1.0) % 2 < 0.5, 1.0, -1.0), 1.0, 0.0)
+        assert abs(fold.mean() - flat.mean()) < 0.02, "the corrugation must not change the volume"
+        s_ratio = float(s(jnp.asarray(fold))) / float(s(jnp.asarray(flat)))
+        p_ratio = float(p(jnp.asarray(fold))) / float(p(jnp.asarray(flat)))
+        assert s_ratio > p_ratio > 1.0, f"folding must cost bending faster than perimeter: {s_ratio=} {p_ratio=}"
+
+    def test_the_flat_floor_does_not_track_the_mesh(self):
+        """A geometrically flat interface still costs something on an unstructured mesh, because
+        its facets zig-zag between tetrahedra — the 3-D counterpart of a straight bar measuring
+        above its length. **That floor must be a property of the mesh's shape, not of its size**,
+        or the term would grow under refinement and its weight would have to be re-tuned per mesh.
+        Measured 50.7 at h=0.5 and 52.4 at h=0.35, across a 2.6x change in tet count; what would
+        scale is a facet miscount or a double-counted ridge.
+        """
+        floors = []
+        for h in (0.5, 0.35):
+            d = jno.Shape.box(0, 0, 0, 4, 2, 4, size=h).domain()
+            _r, sym = d.fem_symbols(space="P0", names=("r", "s"))
+            s = jno.np.parameter(sym, name=f"rho_floor_{h}").curvature(zeta=0.1).fn
+            cells = np.asarray(d._cells_p1())
+            cen = np.asarray(d.mesh.points)[:, :3][cells].mean(axis=1)
+            floors.append(float(s(jnp.asarray(np.where(cen[:, 2] > 2.0, 1.0, 0.0)))))
+        assert all(f > 1.0 for f in floors), "an unstructured interface is not coplanar; the floor is real"
+        assert abs(floors[0] - floors[1]) < 0.25 * max(floors), f"the floor tracked the mesh: {floors}"
+
+    def test_it_is_differentiable_in_the_mesh_and_points_downhill(self):
+        """Under a deformable mesh this is the term that gives node migration a reason to ALIGN the
+        boundary rather than merely shorten it, so the mesh gradient is not an incidental extra —
+        it is half the point. Only the nodes near the boundary may feel it."""
+        d = jno.Shape.rect(0, 0, 8, 4, size=0.6).domain()
+        xs, ys, _ = d.variable("mv", where=lambda x, y: (x > 0.1) & (x < 7.9), split=True)
+        for c, name in ((xs, "curv_cx"), (ys, "curv_cy")):
+            c.trainable(name=name)
+        _r, sym = d.fem_symbols(space="P0", names=("r", "s"))
+        node = jno.np.parameter(sym, name="rho_move").curvature(zeta=0.1)
+        cells = np.asarray(d._cells_p1())
+        cen = np.asarray(d.mesh.points)[:, :2][cells].mean(axis=1)
+        bar = jnp.asarray(np.where(np.abs(cen[:, 1] - 2.0) < 0.9, 1.0, 0.0))
+        coords = [jnp.asarray(np.asarray(d.mesh.points)[np.asarray(sp["ids"]), sp["axis"]]) for sp in d._trainable_coords]
+        assert len(coords) == 2, "both in-plane coordinates must be design variables here"
+
+        value = float(node.fn(bar, *coords))
+        gx = jax.grad(lambda c0: node.fn(bar, c0, coords[1]))(coords[0])
+        gy = jax.grad(lambda c1: node.fn(bar, coords[0], c1))(coords[1])
+        assert np.all(np.isfinite(np.asarray(gx))) and np.all(np.isfinite(np.asarray(gy)))
+        moving = int(np.count_nonzero(np.asarray(gx)) + np.count_nonzero(np.asarray(gy)))
+        assert 0 < moving < gx.size + gy.size, f"only the boundary's own nodes should feel it, got {moving}"
+        assert float(node.fn(bar, coords[0] - 1e-2 * gx, coords[1] - 1e-2 * gy)) < value, (
+            "a step down the mesh gradient must lower the bending — a sign error would raise it"
+        )
+
+    def test_a_nodal_density_is_refused(self):
+        d = jno.Shape.rect(0, 0, 2, 1, size=0.4).domain()
+        _r, s = d.fem_symbols(names=("r", "s"))
+        with pytest.raises(TypeError, match="P0"):
+            jno.np.parameter(s, name="rho_nodal_c").curvature()
+
+
 class TestInteriorFacets:
     """``_interior_facets`` — edges in 2-D, triangles in 3-D, each shared by exactly two cells."""
 
@@ -537,6 +755,51 @@ class TestInteriorFacets:
         assert d.dimension == 1
         with pytest.raises(NotImplementedError, match="triangles, quadrilaterals or tetrahedra"):
             d._interior_facets()
+
+    # --- ridges: the facets OF the interior facets, which is what a bending functional walks ---
+
+    @pytest.mark.parametrize(
+        "shape, n_local, n_ridge_nodes",
+        [(jno.Shape.rect(0, 0, 2, 1, size=0.4), 2, 1), (jno.Shape.box(0, 0, 0, 2, 1, 1, size=0.5), 3, 2)],
+        ids=["triangles", "tets"],
+    )
+    def test_every_facet_reports_its_own_facets(self, shape, n_local, n_ridge_nodes):
+        """An interior edge has two endpoints; an interior triangle has three edges. Both tables
+        must index into a ridge list whose entries really are shared sub-facets of those facets."""
+        d = shape.domain()
+        t = d._facet_ridges()
+        n_facets = t["nodes"].shape[0]
+        assert t["facet_ridge"].shape == (n_facets, n_local)
+        assert t["ridge_nodes"].shape[1] == n_ridge_nodes
+        assert t["facet_ridge"].min() >= 0 and t["facet_ridge"].max() < t["ridge_nodes"].shape[0]
+        # A facet's own corners must contain every node of each ridge it claims.
+        for f in range(0, n_facets, max(n_facets // 40, 1)):
+            for r in t["facet_ridge"][f]:
+                assert np.isin(t["ridge_nodes"][r], t["nodes"][f]).all()
+        # No facet may list the same ridge twice, or a pair sum would count it against itself.
+        assert all(len(set(row.tolist())) == n_local for row in t["facet_ridge"])
+
+    def test_a_three_dimensional_ridge_is_shared_by_a_fan_not_by_two_facets(self):
+        """The reason the bending term weights *pairs* rather than picking "the" neighbour: around
+        a mesh edge in 3-D the interior faces form a fan, and which of them the material boundary
+        runs through is a property of the density, not of the mesh. Measured ~6 on a tet mesh
+        against exactly 2 for the 2-D case, where a ridge is a point on a boundary curve.
+        """
+        d3 = jno.Shape.box(0, 0, 0, 2, 1, 1, size=0.4).domain()
+        t3 = d3._facet_ridges()
+        counts = np.bincount(t3["facet_ridge"].reshape(-1), minlength=t3["ridge_nodes"].shape[0])
+        assert counts.max() > 2, "a tet mesh edge carries a fan of faces, not a pair"
+        assert 3.0 < counts.mean() < 9.0, f"an interior edge fan averages ~6 faces, got {counts.mean():.2f}"
+
+    def test_the_ridge_table_is_consistent_with_the_facet_table(self):
+        """``_facet_ridges`` must extend ``_interior_facets`` rather than recompute it — a second
+        traversal that disagreed about which facets are interior would silently bend the wrong
+        boundary."""
+        for shape in (jno.Shape.rect(0, 0, 2, 1, size=0.4), jno.Shape.box(0, 0, 0, 2, 1, 1, size=0.5)):
+            d = shape.domain()
+            base, ext = d._interior_facets(), d._facet_ridges()
+            assert np.array_equal(base["cells"], ext["cells"])
+            assert np.array_equal(base["nodes"], ext["nodes"])
 
 
 class TestCrossMeshTransfer:
