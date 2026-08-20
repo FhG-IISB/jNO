@@ -14,9 +14,41 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
 # many dtype-sensitive tests (bayesian/blackjax, pdeformer/equinox, the dtype defaults). FEM tests
 # that genuinely need float64 opt in per-test via their local ``_x64`` autouse fixture.
 
+import warnings
+
 import jax
 import jax.numpy as jnp
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _restore_x64():
+    """Put ``jax_enable_x64`` back the way the test found it.
+
+    The flag is process-wide, and it decides the float width of every subsequent computation. A test
+    that flips it and does not put it back silently changes the precision of every test that runs
+    after it, in whatever order pytest happened to pick -- so the failure reproduces only in
+    company, never alone, and lands on a file that did nothing wrong.
+
+    Measured before this fixture existed::
+
+        pytest tests/test_fdm.py                          ->  41 passed
+        pytest tests/test_node_eval.py tests/test_fdm.py  ->  16 failed, 33 passed
+
+    One unrelated 8-test file in front, and `newton_krylov` in test_fdm stops converging, because
+    its solves dropped to float32. Restoring per test makes the suite order-independent; the warning
+    keeps the offending test named rather than quietly healed.
+    """
+    prev = jax.config.jax_enable_x64
+    yield
+    if jax.config.jax_enable_x64 != prev:
+        jax.config.update("jax_enable_x64", prev)
+        warnings.warn(
+            f"this test left jax_enable_x64 as {not prev} instead of {prev}; it has been restored, "
+            "but set the flag through a save/restore fixture rather than in the test body",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
 
 @pytest.fixture(autouse=True)
