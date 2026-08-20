@@ -123,6 +123,20 @@ def _auto_gram_terms(constraints, fm) -> list:
     return gram_terms
 
 
+def _tree_signature(tree):
+    """``(treedef, ((shape, dtype), ...))`` — what a traced argument looks like to ``jax.jit``.
+
+    Two arguments with the same signature produce the same jaxpr, which is exactly the condition
+    under which a compiled program may be reused. Values are deliberately absent: they are what
+    changes between solves.
+    """
+    leaves, treedef = jax.tree_util.tree_flatten(tree)
+    return (
+        str(treedef),
+        tuple((getattr(x, "shape", None), str(getattr(x, "dtype", type(x).__name__))) for x in leaves),
+    )
+
+
 def _optimizer_states_match(a, b) -> bool:
     """Whether two optax states have the same tree, leaf shapes and dtypes.
 
@@ -1136,6 +1150,31 @@ class core:
             return results
 
         return track_fn
+
+    def _step_program_key(self, trainable, opt_states, context, per_model_opts, settings):
+        """A hashable description of the step program, or ``None`` if it cannot be described.
+
+        ``None`` means "do not reuse": a signature that cannot be built must never compare equal to
+        one that can, or a changed configuration would silently run the previous executable.
+
+        Optimizers enter by ``(layer id, type name)``. That catches a swapped optimizer but not a
+        changed learning rate on the same one, which is the standard ``jax.jit`` closure-staleness
+        contract -- states live on the core, so a genuinely fresh run means a fresh core.
+        """
+        try:
+            opts = tuple(sorted((str(k), type(v).__name__) for k, v in dict(per_model_opts).items()))
+            return (
+                _tree_signature(trainable),
+                _tree_signature(opt_states),
+                _tree_signature(context),
+                opts,
+                tuple(settings),
+                id(self.compiled_constraints_fn),
+            )
+        except Exception as exc:  # noqa: BLE001 — an undescribable configuration simply does not cache
+            if os.environ.get("JNO_DEBUG_STEP_KEY") == "1":
+                self.log.info(f"step program key unavailable ({type(exc).__name__}: {exc}); not caching")
+            return None
 
     def make_step_fn(
         self,
@@ -3347,12 +3386,56 @@ class core:
                 replicated,  # individual_losses  (→ prev_losses next step)
                 _bay_info_template,  # bayesian_info dict
             )
-            jit_step = jax.jit(
-                step_fn,
-                in_shardings=in_shardings,
-                out_shardings=out_shardings,
-                donate_argnums=(0, 1, 2),
+            # REUSE the jitted step across solve() calls. `jax.jit` keys its trace and compilation
+            # cache on the wrapped function OBJECT, and `make_step_fn` returns a fresh closure every
+            # solve, so a second solve() re-traced, re-lowered and re-compiled a program it already
+            # had. Measured at 19,462 tets: ~8.7 s per call, of which 3.6 s was XLA compiling
+            # `grad_fn` and the rest tracing and lowering -- so 250 iterations in chunks of 10 spent
+            # about a third of the run rebuilding the same executable 25 times.
+            #
+            # The key below is what makes reuse safe: it carries the tree structure, shapes and
+            # dtypes of every input, plus the solve-time settings that change the program. Anything
+            # it does not cover forces a rebuild by being absent from the cache, EXCEPT a caller who
+            # swaps an optimizer's hyper-parameters on a live core without changing its type -- the
+            # ordinary `jax.jit` staleness contract, and the reason optimizer identity is in the key
+            # as coarsely as it can be described.
+            _step_key = self._step_program_key(
+                trainable,
+                opt_states,
+                trace_context,
+                per_model_opts,
+                (
+                    effective_batchsize,
+                    inner_steps,
+                    accumulation_steps,
+                    bool(checkpoint_gradients),
+                    min_consecutive,
+                    int(self.n_constraints),
+                    bool(bayesian_handles),
+                ),
             )
+            _cache = getattr(self, "_jit_program_cache", None)
+            if _cache is None or _cache.get("__key__") != _step_key or _step_key is None:
+                _cache = {"__key__": _step_key}
+                self._jit_program_cache = _cache
+            _cached_step = ("hit", _cache["step"]) if "step" in _cache else None
+            if os.environ.get("JNO_DEBUG_STEP_KEY") == "1" and _cached_step is not None:
+                _names = ("trainable", "opt_states", "context", "optimizers", "settings", "constraints_fn")
+                for _n, _a, _b in zip(_names, _cached_step[0], _step_key or ()):
+                    if _a != _b:
+                        self.log.info(f"step key differs in {_n}:\n  was {_a}\n  now {_b}")
+            if _cached_step is not None:
+                jit_step = _cached_step[1]
+                self.log.info("Reusing the compiled step function from the previous solve()")
+            else:
+                jit_step = jax.jit(
+                    step_fn,
+                    in_shardings=in_shardings,
+                    out_shardings=out_shardings,
+                    donate_argnums=(0, 1, 2),
+                )
+                if _step_key is not None:
+                    _cache["step"] = jit_step
 
             # JIT-compile gradient accumulation functions when enabled.
             if _use_accumulation:
@@ -3396,7 +3479,7 @@ class core:
                 _ctx_sharding = jax.tree_util.tree_map(_leaf_sharding, trace_context)
                 _opt_sharding = jax.tree_util.tree_map(_leaf_sharding, opt_states)
 
-                jit_hook_grad = jax.jit(
+                jit_hook_grad = _cache.get("hook_grad") or jax.jit(
                     _hook_grad_fn,
                     in_shardings=(
                         _trainable_sharding,
@@ -3410,7 +3493,7 @@ class core:
                         replicated,  # individual_losses
                     ),
                 )
-                jit_hook_apply = jax.jit(
+                jit_hook_apply = _cache.get("hook_apply") or jax.jit(
                     _hook_apply_fn,
                     in_shardings=(
                         _trainable_sharding,
@@ -3425,6 +3508,8 @@ class core:
                     ),
                     donate_argnums=(2,),  # donate grads buffer
                 )
+                if _step_key is not None:
+                    _cache["hook_grad"], _cache["hook_apply"] = jit_hook_grad, jit_hook_apply
 
             if has_trackers:
                 jit_track = jax.jit(track_fn)
