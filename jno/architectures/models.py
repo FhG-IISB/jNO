@@ -103,7 +103,9 @@ def parameter(shape: tuple, *, key: jax.Array | None = None, name: str | None = 
             # `sym.order` does NOT distinguish it -- a P0 symbol reports order 1 -- so the space
             # is the discriminator, and without this branch a P0 symbol silently produced a
             # node-sized parameter.
-            shape = (int(sym._domain._cells_p1().shape[0]),)
+            # `_cells_topo`, not `_cells_p1`: a P0 design lives on the mesh's volume cells whatever
+            # their shape, and a quadrilateral or hexahedral mesh has no simplex block to count.
+            shape = (int(sym._domain._cells_topo()[0].shape[0]),)
             fem_field = "cell"
         else:
             if int(getattr(sym, "order", 1)) != 1:

@@ -535,7 +535,7 @@ class TestInteriorFacets:
         """An interval's facets are its vertices, which carry no measure for a perimeter to sum."""
         d = jno.domain(constructor=jno.domain.line(mesh_size=0.2))
         assert d.dimension == 1
-        with pytest.raises(NotImplementedError, match="simplices in 2-D or 3-D"):
+        with pytest.raises(NotImplementedError, match="triangles, quadrilaterals or tetrahedra"):
             d._interior_facets()
 
 
