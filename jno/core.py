@@ -515,6 +515,7 @@ class core:
             self._dd_subdomains, self._dd_interfaces = _detected
             self.domain = self._dd_subdomains[0].domain
             self.models = {}
+            self._module_refs = {}
             return
 
         # An empty-constraint core is eval-only (no training); its domain is
@@ -1777,9 +1778,19 @@ class core:
 
             # === Apply sharding to model arrays ===
             self.models = self._shard_params(self.models)
+
+            # The core keeps its OWN copy of every model from here on: `self.models` is what
+            # training updates and what eval reads, and `_shard_params` already returns fresh
+            # trees, so the objects hanging off the expression (`param.model.module`) are no
+            # longer the ones being evaluated. Remember which module object each layer carried
+            # when the core last read it -- `solve()` refreshes this at its write-back -- so a
+            # swap the core has NOT seen can be caught instead of silently ignored (see
+            # `_check_modules_unchanged`).
+            self._module_refs = {lid: layer.module for lid, layer in self._collect_flax_modules().items()}
         else:
             self.domain_data = None
             self.models = {}
+            self._module_refs = {}
 
         # === Compile constraints and trackers ===
         self.compiled_trackers = []
@@ -4539,6 +4550,9 @@ class core:
             # Update every Model to point at the trained model.
             for lid, fm in flax_mods.items():
                 fm.module = trained_models[lid]
+            # ...and that sync IS the core reading the module again, so it is not a swap behind
+            # the core's back -- record it, or every eval after a solve would be refused.
+            self._module_refs.update({lid: fm.module for lid, fm in flax_mods.items()})
 
             # ── 9c. Flush Bayesian sample buffers (Pattern D + E aware) ──
             #
@@ -4782,6 +4796,41 @@ class core:
     def _unwrapped_models(self):
         """Models with all paramax wrappers resolved — safe for inference / shape queries."""
         return _paramax.unwrap(self.models)
+
+    def _check_modules_unchanged(self):
+        """Refuse to evaluate against a module that was replaced after this core last read it.
+
+        ``jno.core(...)`` reads ``layer.module`` once, through ``build_single_layer_params``, and
+        keeps its own copy — ``solve()`` writes that copy and syncs it back onto the module, so
+        the two agree until someone swaps the module themselves. The eager idiom
+
+            g.model.module = eqx.tree_at(lambda m: m.value, g.model.module, jnp.asarray(vals))
+
+        is such a swap. A bare ``jno.fem([...]).solve()`` honours it, because it reads the module
+        at solve time; a core does not, and the sweep it is meant to drive read the same number at
+        every value.
+
+        Reading the module live *here* is not the fix, because it would only patch ``eval``:
+        ``self.models`` — what training starts from and what every other read uses — would still
+        hold the old value, so eval and solve would disagree about the same parameter. It would
+        also skip the build the module goes through on the way in (pretrained weights, a callable
+        initializer, an ``_initialize_mask``, a dtype cast, sharding)."""
+        stale = []
+        refs = getattr(self, "_module_refs", {})
+        for lid, layer in self._collect_flax_modules().items():
+            if lid not in refs:
+                continue
+            if layer.module is not refs[lid]:
+                stale.append(getattr(layer, "name", None) or f"layer {lid}")
+        if not stale:
+            return
+        raise RuntimeError(
+            f"crux.eval: {', '.join(map(str, stale))} was given a new module after this core was built, "
+            "and the core evaluates its own copy — the new value would be ignored and you would read the "
+            "value at construction. Set the value BEFORE `jno.core(...)` (build one core per value to "
+            "sweep), or drive the sweep through the eager `jno.fem([...]).solve()` / `jno.fdm([...]).solve()` "
+            "path, which reads the module at solve time."
+        )
 
     def _log_constraint_shapes(self, batchsize, min_consecutive: Optional[int] = 1):
         """Log the output shape of each constraint by doing a test evaluation.
@@ -5173,6 +5222,8 @@ class core:
 
         if samples not in ("auto", "chain", "point"):
             raise ValueError(f"crux.eval(samples=...) expects 'auto' | 'chain' | 'point', got {samples!r}.")
+
+        self._check_modules_unchanged()
 
         domain_data = self.domain_data if domain is None else self.prepare_domain_data(domain)
         _models = eqx.tree_inference(self._unwrapped_models)
