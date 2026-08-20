@@ -420,6 +420,25 @@ class _BlockDiag(_Spec):
     def __init__(self, pairs):
         self.pairs = pairs
 
+    @property
+    def complex_native(self):
+        """A block composition is complex-native iff any child is (i.e. contains AMS).
+
+        Without this, ``triangular((u, ams()), (p, amg()))`` on a complex A-V system silently fell
+        through to the fused real-equivalent 2n block, where two things break at once:
+        ``fem.blocks`` describes the n-sized COMPLEX layout, so every slice covered the wrong half
+        of the operator — and AMS was applied to the skew-dominated 2n block its own docs say it
+        diverges on (measured symptom: fgmres returned x ~ 0, relative residual exactly 1.0).
+        Declaring it routes the composition through ``_solve_complex_block``: the outer Krylov runs
+        on the sparse COMPLEX operator ``A_r + i·A_i``, whose n-layout the block slices are correct
+        for; ``ctx.sub(i)`` hands each child its assembled complex diagonal sub-block (AMS is
+        complex-native by design; pyamg builds complex hierarchies natively, see ``_AMG.complex_ok``).
+        Note ``_AMS.prepare``'s auto-freeze intentionally no-ops here — ``_fem_concrete_operator``
+        returns the full MIXED operator, whose size does not match G, so the eager build raises and
+        is swallowed; AMS then assembles from the correctly-sized sub-block at materialize time.
+        """
+        return any(getattr(spec, "complex_native", False) for _f, spec in self.pairs)
+
     def prepare(self, fem):
         _prepare_pairs(self.pairs, fem)
 
@@ -447,6 +466,13 @@ class _BlockDiag(_Spec):
 class _Triangular(_Spec):
     def __init__(self, pairs):
         self.pairs = pairs
+
+    @property
+    def complex_native(self):
+        """See ``_BlockDiag.complex_native`` — identical reasoning; the triangular sweep additionally
+        applies the off-diagonal couplings ``ctx.sub(i, j)``, which on this path are matvecs through
+        the complex operator and therefore also correctly sized."""
+        return any(getattr(spec, "complex_native", False) for _f, spec in self.pairs)
 
     def prepare(self, fem):
         _prepare_pairs(self.pairs, fem)

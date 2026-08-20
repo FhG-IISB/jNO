@@ -164,7 +164,7 @@ def assemble_fem_nonnodal(
                 field_index[f["field_key"]] = len(fields)
                 fields.append(f)
     spaces = [f["space"] for f in fields]
-    if any(s not in ("RT", "N1E", "P0", "Hermite", "Argyris", "Morley") for s in spaces):
+    if any(s not in ("RT", "N1E", "P0", "Hermite", "Argyris", "Morley", "Lagrange") for s in spaces):
         raise NotImplementedError(
             f"jno.fem (non-nodal): supported element spaces are RT, N1E, P0, Hermite, Argyris and Morley; got {spaces}."
         )
@@ -214,12 +214,33 @@ def assemble_fem_nonnodal(
         )
     if has_hermite and has_argyris:
         raise NotImplementedError("jno.fem (non-nodal): mixing Hermite and Argyris fields is not supported.")
-    if dirichlet_raw and not has_vertex:
-        raise NotImplementedError(
-            "jno.fem (non-nodal): nodal Dirichlet is not applicable to RT/N1E; the essential BC is the "
-            "edge trace (u·n for RT, u×n for N1E) -- write it as `dot(u(region), n_region) - g`. "
-            "(A Hermite field DOES take a nodal value Dirichlet u(region) - g.)"
-        )
+    # A nodal Dirichlet pins VERTEX-VALUE DOFs, so its applicability is a property of the FIELD it
+    # targets, not of the problem: in the mixed A-V pair (N1E x Lagrange) the Dirichlet legitimately
+    # constrains the Lagrange potential V (terminal voltage) while the N1E field A takes its essential
+    # BC as the edge trace. The old check was GLOBAL ("an edge field exists somewhere, therefore
+    # reject every nodal Dirichlet"), which made V = g on a terminal unreachable. Resolve each
+    # constraint's target field and judge per space instead.
+    for _fk, _dregion, _comp, _dval, _dvnode in dirichlet_raw:
+        _fi = field_index.get(_fk)
+        if _fi is None:
+            raise ValueError(
+                f"jno.fem (non-nodal): a Dirichlet condition on region {_dregion!r} targets a field "
+                f"that appears in no volume term (known fields: {list(field_index)}). An essential "
+                "condition must constrain one of the solved unknowns -- is the field's trial missing "
+                "from the weak form?"
+            )
+        if spaces[_fi] in ("RT", "N1E"):
+            raise NotImplementedError(
+                "jno.fem (non-nodal): nodal Dirichlet is not applicable to RT/N1E; the essential BC is the "
+                "edge trace (u·n for RT, u×n for N1E) -- write it as `dot(u(region), n_region) - g`. "
+                "(A vertex-valued field -- Lagrange / Hermite / Argyris / Morley -- DOES take a nodal "
+                "value Dirichlet u(region) - g.)"
+            )
+        if spaces[_fi] == "P0":
+            raise NotImplementedError(
+                "jno.fem (non-nodal): a P0 (cell-DOF) field carries no vertex values, so a nodal "
+                "Dirichlet u(region) - g does not apply to it; constrain it weakly instead."
+            )
 
     # --- runtime parameters (inverse problems): collect the parameter name->expr map so the assembler can
     # return a *parametric* FemLinearSystem / FemResidualOperator / time block whose operator is re-assembled
@@ -310,11 +331,12 @@ def assemble_fem_nonnodal(
     # topology are dimension-agnostic; the vertex families (Hermite/Argyris/Morley) and RT are 2D-only, so
     # in 3D only Nédélec (N1E, edge/H(curl)) is wired -- everything else raises rather than silently mis-map.
     dim = 3 if "tetra" in domain.mesh.cells_dict else 2
-    if dim == 3 and any(s != "N1E" for s in spaces):
+    if dim == 3 and any(s not in ("N1E", "Lagrange") for s in spaces):
         raise NotImplementedError(
-            "jno.fem (non-nodal): on a 3D (tetrahedral) mesh only the Nédélec `N1E` element is supported "
-            f"(H(curl), for Maxwell / curl-curl); got spaces {spaces}. RT / P0 / Hermite / Argyris / Morley "
-            "are 2D-triangle only."
+            "jno.fem (non-nodal): on a 3D (tetrahedral) mesh only Nédélec `N1E` and nodal `Lagrange` "
+            f"are supported; got spaces {spaces}. N1E x Lagrange is the A-V (magnetic vector potential "
+            "+ electric scalar potential) pair: V carries the terminal condition on a cut conductor, "
+            "which A alone cannot express. RT / P0 / Hermite / Argyris / Morley are 2D-triangle only."
         )
     pts = jnp.asarray(np.asarray(domain.mesh.points))[:, :dim]
     cells = np.asarray(domain.mesh.cells_dict["tetra" if dim == 3 else "triangle"], dtype=np.int64)
@@ -426,7 +448,7 @@ def assemble_fem_nonnodal(
     # from its mesh-vertex values per cell (3 barycentric on a triangle, 4 on a tetrahedron), independent of
     # the trial element's own basis. The kernel contraction ``shape_vals . cell_nodal`` is vertex-count
     # agnostic, so only this reference-basis table is dimension-specific.
-    if _field_param_names or _frozen_gathered:
+    if _field_param_names or _frozen_gathered or "Lagrange" in spaces:
         _bary0 = 1.0 - qp[:, 0] - qp[:, 1] - (qp[:, 2] if dim == 3 else 0.0)
         p1_shape_vals = jnp.stack([_bary0, qp[:, 0], qp[:, 1]] + ([qp[:, 2]] if dim == 3 else []), axis=1)
     else:
@@ -515,6 +537,8 @@ def assemble_fem_nonnodal(
             return 6 * n_verts + n_edges
         if s == "Morley":
             return n_verts + n_edges
+        if s == "Lagrange":
+            return n_verts
         return n_edges if s in ("RT", "N1E") else n_cells
 
     ndof = [_field_ndof(s) for s in spaces]
@@ -532,6 +556,8 @@ def assemble_fem_nonnodal(
             return offs[i] + morley_cdofs  # (n_cells, 6)
         if spaces[i] in ("RT", "N1E"):
             return offs[i] + ce  # (n_cells, 3)
+        if spaces[i] == "Lagrange":
+            return offs[i] + cells_j  # (n_cells, dim+1)
         return offs[i] + jnp.arange(n_cells)[:, None]  # (n_cells, 1) P0
 
     cdofs = [_field_cdofs(i) for i in range(len(fields))]
@@ -549,6 +575,23 @@ def assemble_fem_nonnodal(
         detJ = jnp.linalg.det(J)
         per = []
         for i, s in enumerate(spaces):
+            if s == "Lagrange":
+                # P1 on a simplex: barycentric values (already tabulated as `p1_shape_vals` for the
+                # field-parameter path) and CONSTANT gradients, J^-T @ ref. Tagged "Lagrange" for the
+                # same reason Hermite is — the shared evaluator reads value / .x from scalar shape data.
+                # `cell_sol` takes the [:, None] SCALAR convention Hermite/Argyris/Morley use (vec = 1
+                # as an explicit column); only the vector families (RT/N1E) pass it flat.
+                g_ref = jnp.concatenate([-jnp.ones((1, dim)), jnp.eye(dim)], axis=0)  # (dim+1, dim)
+                g = g_ref @ jnp.linalg.inv(J)  # (dim+1, dim)
+                per.append(
+                    {
+                        "shape_vals": p1_shape_vals,  # (n_quad, dim+1)
+                        "shape_grads": jnp.broadcast_to(g, (n_quad, dim + 1, dim)),
+                        "cell_sol": cell_sols[i][:, None],
+                        "space": "Lagrange",
+                    }
+                )
+                continue
             if s == "Hermite":  # C0 vertex value+derivative DOFs via the M(cell) DOF-transform
                 rv, rg, rh = hermite_ref
                 phi, grad, hess = hermite_pushforward(rv, rg, rh, J, detJ, None)
@@ -787,6 +830,19 @@ def assemble_fem_nonnodal(
     _rot_as_dir = [(fk, region, None, None, vn) for (fk, region, vn) in rotation_bcs]
     if has_hermite and dirichlet_raw:  # Hermite value-Dirichlet: pin boundary-vertex value DOFs to g
         pins = pins + _hermite_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, np.asarray(pts), offs)
+    if ("Lagrange" in spaces) and dirichlet_raw:  # Lagrange value-Dirichlet: pin the region's vertex DOFs to g
+        pins = pins + _lagrange_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, np.asarray(pts), offs)
+    extra = getattr(domain, "_extra_dof_pins", None)
+    if extra:  # caller-supplied (dof, value) pins — e.g. a tree-cotree gauge + air-V restriction,
+        _bad = [d_ for d_, _v in extra if not (0 <= int(d_) < total)]
+        if _bad:
+            raise ValueError(
+                f"jno.fem (non-nodal): domain._extra_dof_pins contains {len(_bad)} DOF indices "
+                f"outside [0, {total}) (first: {_bad[0]}) — the pin list was built against a "
+                "different mesh or DOF layout. Rebuild it for this domain; refusing to pin "
+                "arbitrary DOFs silently."
+            )
+        pins = pins + [(int(d_), float(v_)) for d_, v_ in extra]  # applied identically to BOTH complex legs
     if has_argyris and dirichlet_raw:  # deflection: pin the boundary value + tangential trace, free the normal
         pins = pins + _argyris_dirichlet_pins(
             dirichlet_raw, domain, field_index, spaces, np.asarray(pts), offs, top, n_verts, kind="value"
@@ -1788,6 +1844,60 @@ def _plate_moment_load(b, mn_node, fidx, region_nodes, space, domain, top, pts_n
             gdofs = np.concatenate([cells[c], n_verts + ce[c]])
         np.add.at(b, np.asarray(int(base) + gdofs, dtype=np.intp), contrib)
     return jnp.asarray(b)
+
+
+def _lagrange_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np, offs):
+    """Value-Dirichlet ``(dof, value)`` pins for a P1 Lagrange field on the non-nodal path: one DOF per
+    mesh vertex, so ``u = g`` on a region pins DOF ``offs[fidx] + v`` to ``g(vertex v)`` for every vertex
+    the region's location predicate selects. This is the scalar-potential half of the A-V (N1E x Lagrange)
+    pair -- V = g on a terminal face -- and the exact analogue of :func:`_hermite_dirichlet_pins` with a
+    1-DOF-per-vertex layout (Hermite's value DOF sits at ``3*v``; Lagrange's IS ``v``).
+
+    Unlike the Hermite loop, ``g`` is evaluated in ONE :func:`_eval_value_node_at` call over the whole
+    region (a terminal face of a production mesh has thousands of vertices; a per-vertex TraceEvaluator
+    round-trip is minutes of pure Python). Every degenerate case raises rather than degrades: an empty
+    region (a predicate that matched nothing -- the float32-tolerance trap), a complex ``g`` (the
+    complex non-nodal split assembles two REAL legs whose fused Dirichlet rows solve to ``u_r = g,
+    u_i = 0``, correct only for real ``g``), and a value/vertex-count mismatch.
+    """
+    from ..._fem import _eval_value_node_at
+    from .fem_1d import _region_node_ids
+
+    pins = []
+    for fk, region, _comp, _value, value_node in dirichlet_raw:
+        fidx = field_index.get(fk)
+        if fidx is None or spaces[fidx] != "Lagrange":
+            continue
+        vs = np.asarray(_region_node_ids(domain, region), dtype=np.int64)
+        if vs.size == 0:
+            raise ValueError(
+                f"jno.fem (non-nodal): the Dirichlet region {region!r} on the Lagrange field matched "
+                "NO mesh vertex -- the essential condition would be silently dropped. Check the region "
+                "name / tag predicate (and its tolerance: a predicate finer than float32 eps needs the "
+                "float64 tag path, see domain.tag_node_mask)."
+            )
+        g = np.asarray(_eval_value_node_at(value_node, jnp.asarray(pts_np[vs])))
+        if np.iscomplexobj(g):
+            if np.abs(g.imag).max() > 0.0:
+                raise NotImplementedError(
+                    "jno.fem (non-nodal): a COMPLEX Dirichlet value on the Lagrange field is not wired -- "
+                    "the complex split assembles two real legs sharing one real pin value, whose fused "
+                    "rows enforce u_re = g, u_im = 0. Drive with a real terminal value (phase-reference "
+                    "the source) or split the constraint yourself."
+                )
+            g = g.real
+        g = g.reshape(-1)
+        if g.shape[0] == 1 and vs.size > 1:  # a constant value node evaluates once; broadcast it
+            g = np.full(vs.size, float(g[0]))
+        if g.shape[0] != vs.size:
+            raise ValueError(
+                f"jno.fem (non-nodal): the Dirichlet value on region {region!r} evaluated to "
+                f"{g.shape[0]} values for {vs.size} region vertices -- the value expression must be "
+                "scalar per point (bind the boundary coordinate variables, not a vector expression)."
+            )
+        base = int(offs[fidx])
+        pins.extend((base + int(v), float(gv)) for v, gv in zip(vs, g))
+    return pins
 
 
 def _hermite_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np, offs):

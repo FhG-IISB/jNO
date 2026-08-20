@@ -99,7 +99,9 @@ def build_hierarchy(
         A_l = jsp.BCOO.from_scipy_sparse(lvl.A.tocoo())
         P = jsp.BCOO.from_scipy_sparse(lvl.P.tocoo())
         R = jsp.BCOO.from_scipy_sparse(lvl.R.tocoo())
-        lmax = float(safety * power_iteration_bound(lambda v: A_l @ v, A_l.shape[0], iters=bound_iters))
+        lmax = float(
+            safety * power_iteration_bound(lambda v: A_l @ v, A_l.shape[0], dtype=A_l.data.dtype, iters=bound_iters)
+        )
         levels.append({"A": A_l, "P": P, "R": R, "lmin": lmin_ratio * lmax, "lmax": lmax, "degree": smoother_degree})
     A_c = np.asarray(ml.levels[-1].A.todense())
     levels.append({"Ainv": jnp.asarray(np.linalg.pinv(A_c))})  # pinv: robust to a gauge null space
