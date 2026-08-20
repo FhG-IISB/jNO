@@ -11,9 +11,12 @@ import jno
 
 @pytest.fixture(autouse=True)
 def _x64():
+    prev = jax.config.jax_enable_x64
     jax.config.update("jax_enable_x64", True)
-    yield
-    jax.config.update("jax_enable_x64", False)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
 
 
 def _heat(coef, size=0.4, steps=3):
