@@ -318,7 +318,24 @@ class MMACallback(_Callback):
         # Jacobian of a constraint that depends on `fem.solve()` cannot be taken that way at all.
         # Only the `jno.le` rows are asked for; the objective's gradient already arrives through
         # `grads`.
-        rows = list(self._ineq)
+        # Prefer the unit holding ONLY the inequality rows when core compiled one: the pullbacks then
+        # never walk the objective's tape, which for a PDE-constrained problem carries a sparse
+        # factorisation no `jno.le` row here depends on. Correct either way -- a Jacobian over a
+        # function computing exactly these rows IS these rows -- so this is purely a cost choice, and
+        # it falls back cleanly for any caller that does not supply the second unit.
+        ineq_fn = kw.get("compiled_inequality_fn")
+
+        def _ineq_losses(sub, rest, context, rng):
+            trainable = {**rest, **sub}
+            full = _paramax.unwrap(eqx.combine(trainable, frozen, static))
+            residuals = compiled_fn_ineq(full, context, batchsize=batchsize, key=rng, min_consecutive=min_consecutive)
+            return jnp.stack([jnp.mean(r) for r in residuals])
+
+        if ineq_fn is not None and self._ineq:
+            compiled_fn_ineq = ineq_fn
+            losses_fn, rows = _ineq_losses, list(range(len(self._ineq)))
+        else:
+            losses_fn, rows = _losses, list(self._ineq)
 
         def jac(trainable, context, rng):
             sub = {lid: trainable[lid] for lid in lids}
@@ -330,7 +347,7 @@ class MMACallback(_Callback):
             # `self._blocks` order. A list preserves that order, so the Jacobian's columns line up
             # with `x`, `df0`, `xmin` and `xmax`.
             parts = [sub[lid] for lid in lids]
-            return rowwise_jacobian(lambda ps: _losses(dict(zip(lids, ps)), rest, context, rng), parts, rows)
+            return rowwise_jacobian(lambda ps: losses_fn(dict(zip(lids, ps)), rest, context, rng), parts, rows)
 
         self._jac_fn = jax.jit(jac)
 
