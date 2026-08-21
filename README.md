@@ -6,9 +6,6 @@
     <a href="https://fhg-iisb.github.io/jNO/">
         <img src="https://img.shields.io/badge/docs-GitHub%20Pages-0aa?style=for-the-badge" alt="Dev Docs"/>
     </a>
-    <a href="https://github.com/FhG-IISB/jno/actions/workflows/ci.yml">
-        <img src="https://img.shields.io/github/actions/workflow/status/FhG-IISB/jno/ci.yml?branch=main&style=for-the-badge&label=tests" alt="Tests"/>
-    </a>
     <a href="https://codecov.io/gh/FhG-IISB/jno">
         <img src="https://img.shields.io/codecov/c/github/FhG-IISB/jno/main?style=for-the-badge&label=coverage" alt="Coverage"/>
     </a>
