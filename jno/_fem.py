@@ -397,6 +397,56 @@ def _lower_gauge_pin(pin: GaugePin) -> Any:
     return field(*spatial) - pin.value
 
 
+def _saddle_block_names(fem_obj: "FEM", domain: Any, volume_terms: List[Any]) -> List[str]:
+    """Names of the field blocks with no diagonal entry -- the structural mark of a saddle system.
+
+    A field whose own test function never meets its own trial function contributes no ``(i, i)``
+    block, so the assembled operator has a zero diagonal there. That is exactly the Taylor-Hood
+    pressure, the Lagrange multiplier of a constraint, and the algebraic field of a mixed DAE -- and
+    it is the case a diagonal (Jacobi) preconditioner cannot touch, because there is nothing on the
+    diagonal to scale.
+
+    Read from the TERMS, not from an assembled matrix: the structure is the same in every mode, so a
+    nonlinear or transient problem is diagnosed as readily as a linear one, at build time and with no
+    tangent to assemble.
+    """
+    from .utils.solver.fem_utils import _infer_fields, _test_field_keys
+    from .utils.solver.weak_form import _split_additive_terms
+
+    keys = list(getattr(fem_obj, "_block_field_keys", None) or getattr(fem_obj, "_trial_field_keys", None) or ())
+    if len(keys) < 2:
+        return []  # a single-field problem has no block structure to be a saddle in
+    occupied = set()
+    for bare in volume_terms:
+        try:
+            subs = _split_additive_terms(domain, bare)
+        except Exception:  # noqa: BLE001 - a term shape the splitter declines is simply not evidence
+            continue
+        for _sign, sub in subs:
+            test_keys = _test_field_keys(sub)
+            if len(test_keys) != 1:
+                continue
+            tk = next(iter(test_keys))
+            try:
+                fields, _ = _infer_fields(sub)
+            except Exception:  # noqa: BLE001
+                continue
+            for f in fields:
+                occupied.add((tk, f.get("field_key")))
+    # field_key -> the name the user gave the symbol, so the warning can say "p" rather than "block 1"
+    names = {}
+    for c in getattr(fem_obj, "_constraints", ()) or ():
+        for n in _walk(_bare(c)):
+            if isinstance(n, TrialFunction):
+                names.setdefault(getattr(n, "field_key", None), getattr(n, "name", None))
+    out = []
+    for i, k in enumerate(keys):
+        if (k, k) in occupied:
+            continue
+        out.append(names.get(k) or f"block {i}")
+    return out
+
+
 def _build_mean_gauge_ops(fem_obj: "FEM", fields: List[Any]) -> tuple:
     """``[(mask, load, sum(load)), ...]`` for the fields gauged by ``p.pin(mean=True)``.
 
@@ -1204,6 +1254,7 @@ class FEM:
         self.problem = getattr(domain, "_fem_problem", None)
         self._periodic = None  # periodic-tie reduction (prolongation P), attached by fem()
         self._mean_gauges = ()  # zero-mean gauges (`p.pin(mean=True)`), resolved by fem() at build
+        self._saddle_blocks = ()  # field blocks with no diagonal entry, detected by fem() at build
         self._complex_n = None  # half-size n when _op is a fused complex real-equivalent 2n system
         # The unfused (re, im) legs. KNOWN CONSUMERS — check all of them before changing this or the
         # fused layout, since a stale reader does not crash (see the `operator` docstring: the fused
@@ -1343,6 +1394,38 @@ class FEM:
         if fk not in keys:
             raise KeyError(f"FEM.block_index: trial field {getattr(field, 'name', fk)!r} is not part of this system.")
         return keys.index(fk)
+
+    def _warn_if_saddle_solved_by_the_default(self, solve_fn, linear, precond):
+        """Say so when the matrix-free default is about to be pointed at a saddle system.
+
+        The default is Jacobi-preconditioned BiCGStab, and a saddle block has a ZERO diagonal -- the
+        preconditioner is the identity exactly where the system is hardest, so the iteration stalls
+        or stops early. It does not always fail loudly: the convergence guard accepts any relative
+        residual under 1e-4, which on a Taylor-Hood system can still be a pressure with no correct
+        digits, and the guard steps aside entirely under jit/vmap/grad.
+
+        Warn rather than refuse, on purpose: a 2-D saddle of moderate size does solve acceptably this
+        way, and refusing would break working code. Only when no solver was chosen -- passing
+        `linear=` or `precond=` means the choice was made deliberately and needs no advice.
+        """
+        blocks = getattr(self, "_saddle_blocks", ())
+        if not blocks or solve_fn is not None or linear is not None or precond is not None:
+            return
+        if getattr(self, "_saddle_warned", False):
+            return
+        self._saddle_warned = True
+        which = ", ".join(str(b) for b in blocks)
+        warnings.warn(
+            f"jno.fem: {which} has no diagonal block, so this is a saddle-point system, and "
+            "fem.solve() is about to use its matrix-free default (Jacobi-preconditioned BiCGStab). "
+            "A diagonal preconditioner cannot help where the diagonal is zero: the solve may return "
+            "a field whose pressure has no correct digits while reporting success, and the residual "
+            "guard it would trip is skipped under jit/vmap/grad. Pass a solver that suits the "
+            "structure -- linear=jno.solve.lu() for a direct factorization, or "
+            "precond=jno.precond.triangular((u, jno.precond.amg()), (p, jno.precond.form([...]))) "
+            "for a block/Schur preconditioner that scales.",
+            stacklevel=3,
+        )
 
     def _gauge_project(self, u):
         """Apply any zero-mean gauge (``p.pin(mean=True)``) to a solved field.
@@ -1535,6 +1618,7 @@ class FEM:
                 else:
                     self._periodic = reduction
             try:
+                self._warn_if_saddle_solved_by_the_default(solve_fn, linear, precond)
                 result = self._solve_dispatch(
                     solve_fn,
                     adapt=adapt,
@@ -4293,6 +4377,10 @@ def _fem_impl(
         out = _finalize_core(fem_obj)
         if _mean_gauge_fields:
             out._mean_gauges = _build_mean_gauge_ops(out, _mean_gauge_fields)
+        # Structural, so it is known here for every mode -- and being known at BUILD time is what
+        # lets the warning fire even when the solve is later wrapped in jit, where the residual
+        # guard cannot.
+        out._saddle_blocks = tuple(_saddle_block_names(out, domain, volume_terms))
         return out
 
     volume_terms: List[Any] = []

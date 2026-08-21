@@ -1542,6 +1542,15 @@ Pick by structure:
 | **a Newton loop** (or no GPU / a factorization too big for device memory) | `lu(backend="pardiso")` | Intel MKL PARDISO, multithreaded CPU. **The fastest factorization of the four**, and like cuDSS it splits symbolic analysis from numeric factorization, so a Newton step reuses the analysis. On lap3d 50³ (n=125,000) against single-threaded SuperLU's 65,212 ms: factorization **298 ms**, Newton re-factorization **296 ms — 220×**, where cuDSS reaches 115×. Its adjoint is cheaper too — `Aᵀx = b` comes from the *same* factorization rather than a second one. An exactly symmetric operator uses LDLᵀ (1.9× on lap3d 50³, 13× on a saddle), which needs the upper triangle with an **explicit diagonal** — without that a saddle's constraint rows come back empty and PARDISO rejects the matrix. Like cuDSS it returns finite garbage on a singular operator, so jNO checks the perturbed-pivot count and **raises**. `pip install jax-numerical-operators[pardiso]`, x86-64 |
 | small systems / coarse blocks | `dense` | LAPACK, vmap-native |
 
+> **jNO tells you when this applies.** `jno.fem` detects a saddle system structurally at build time —
+> a field whose own test function never meets its own trial function contributes no diagonal block —
+> and `fem.solve()` warns, naming the field, when it is about to use the matrix-free default on one.
+> It warns rather than refuses: a 2-D saddle of moderate size does solve acceptably that way. Passing
+> `linear=` or `precond=` silences it, since that is the deliberate choice it asks for. The detection
+> is structural, so it holds in every mode with no tangent to assemble, and it fires under
+> `jit`/`vmap`/`grad` — which matters, because the runtime residual guard needs a concrete residual
+> and steps aside on a tracer, leaving a transformed solve otherwise unguarded.
+
 > **Choosing between `cudss` and `pardiso`: pick by the phase your problem repeats.** A Newton loop re-*factorizes* every iteration, so PARDISO wins (220× vs 115× over SuperLU). A shift-invert eigensolve or a constant-operator transient re-*solves* against one factorization, and there cuDSS is ~11× faster per solve (3.5 ms vs 40 ms at lap3d 50³) and takes a whole block of right-hand sides at once. There is deliberately no `auto`: which wins depends on hardware jNO cannot inspect. Install both with `pip install jax-numerical-operators[fem]`.
 
 **Preconditioner specs** (declarative — materialized against the assembled operator at solve time; a
