@@ -2163,6 +2163,37 @@ trajectory`. Build your own (e.g. diffrax) from the block's `block.M` / `block.A
   > transient trajectory, or a lazy solve node — and is plain arithmetic, so it survives `jit`/`grad`.
 * **1D and 3D** — a 1D interval or a 3D `cube`/extruded `gmsh` volume use the identical API with
   one fewer / one more coordinate (`ui.z`, `u(xb, yb, zb) - g`).
+
+#### What the fluid path is verified to do — and what it is not
+
+Scope first, since it is not obvious from the API: jNO's FEM fluid path is **laminar incompressible**
+flow and nothing else. There is no turbulence model (no RANS, no LES), no compressible or Euler path,
+no free surface / VOF / level set, and no fluid–structure interaction. Nothing about `jno.fem` stops
+you writing those terms; nothing in the library implements or verifies them.
+
+Within that scope, measured rather than asserted:
+
+| | verified by |
+|---|---|
+| 2-D steady Stokes, Taylor–Hood P2/P1 | exact fields recovered to ~1e-13 with a direct solver |
+| 2-D steady Navier–Stokes | Kovasznay (closed form) in the convergence matrix: velocity `O(h³)`, pressure `O(h²)` |
+| 2-D transient Navier–Stokes | lid-driven cavity at Re = 200, backward Euler + Newton |
+| **3-D Stokes, Taylor–Hood P2/P1 tets** | fitted order 3.12 velocity / 2.29 pressure against theory 3 / 2 |
+| coupled (Boussinesq) | its own convergence row, three fields |
+| **an external benchmark** | DFG 2D-1 cylinder at Re = 20 — `c_D` to **0.02 %** of the published value |
+| natural (do-nothing) outflow | carried by that same benchmark |
+| forces on a body | reaction-based drag/lift via `fem.eval` + `region_dofs` |
+
+Two ceilings worth knowing before you plan a run:
+
+* **Direct-solver fill-in in 3-D.** Measured on one GPU, a 3-D Stokes solve is trivial to ~10k DOF
+  (0.60 s at 9.1k) and then turns over sharply — 4.02 s at 18.5k, i.e. roughly `O(N^2.7)`. That puts
+  the practical ceiling for `lu()` around 30–60k DOF; past it use the block/Schur preconditioners in
+  `jno.precond` (verified in 3-D), or `lu(backend="pardiso"/"cudss")`.
+* **No stabilisation.** There is no SUPG/GLS/grad-div term in the library, so convection-dominated
+  flow is unaddressed. The cavity tutorial sits at Re = 200; the practical ceiling for unstabilised
+  P2/P1 is somewhere in the low hundreds and has not been measured. `dom.cell_size` gives you the
+  element size `h` if you want to write a stabilised form yourself.
 * **Higher-order Lagrange** — `order=k` gives degree-`k` elements (P2, P3, P4, … on triangles and tets);
   read the solution at `fem.points`. The geometry stays affine-P1 (straight-sided), so on a *curved*
   boundary the geometric error caps the observed order regardless of `k` — measure high-order convergence
