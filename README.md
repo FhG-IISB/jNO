@@ -6,9 +6,6 @@
     <a href="https://fhg-iisb.github.io/jNO/">
         <img src="https://img.shields.io/badge/docs-GitHub%20Pages-0aa?style=for-the-badge" alt="Dev Docs"/>
     </a>
-    <a href="https://codecov.io/gh/FhG-IISB/jno">
-        <img src="https://img.shields.io/codecov/c/github/FhG-IISB/jno/main?style=for-the-badge&label=coverage" alt="Coverage"/>
-    </a>
     <a href="LICENSE">
         <img src="https://img.shields.io/badge/license-EPL--2.0-2ea44f?style=for-the-badge" alt="License"/>
     </a>
