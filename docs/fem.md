@@ -2179,6 +2179,7 @@ Within that scope, measured rather than asserted:
 | 2-D steady Navier–Stokes | Kovasznay (closed form) in the convergence matrix: velocity `O(h³)`, pressure `O(h²)` |
 | 2-D transient Navier–Stokes | lid-driven cavity at Re = 200, backward Euler + Newton |
 | **3-D Stokes, Taylor–Hood P2/P1 tets** | fitted order 3.12 velocity / 2.29 pressure against theory 3 / 2 |
+| **3-D Navier–Stokes** (convective term) | fitted order 3.13 / 2.37 at `ν = 0.05`, cell Péclet ≈ 4 |
 | coupled (Boussinesq) | its own convergence row, three fields |
 | **an external benchmark** | DFG 2D-1 cylinder at Re = 20 — `c_D` to **0.02 %** of the published value |
 | natural (do-nothing) outflow | carried by that same benchmark |

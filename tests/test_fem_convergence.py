@@ -634,6 +634,86 @@ def study_stokes_3d():
     ]
 
 
+def study_navier_stokes_3d():
+    # 3-D Taylor-Hood P2/P1 Navier-Stokes -- Stokes plus the convective term, which was untested in
+    # three dimensions. Same manufactured fields as study_stokes_3d, with (u.grad)u derived exactly:
+    #   u = (sin y, sin z, sin x)  ->  (u.grad)u = (sin z cos y, sin x cos z, sin y cos x)
+    # The convective term is written on the UNKNOWN, so the Jacobian comes from autodiff. nu = 0.05
+    # puts the cell Peclet number near 4 on the finest mesh -- convection genuinely present, and no
+    # stabilisation anywhere, which is why the order is worth measuring rather than assuming.
+    nu = 0.05
+    C = float((1.0 - np.cos(1.0)) ** 3)
+    uex = (lambda co: sin(co[1]), lambda co: sin(co[2]), lambda co: sin(co[0]))
+    pex = lambda co: sin(co[0]) * sin(co[1]) * sin(co[2]) - C  # noqa: E731
+
+    def solve(ms):
+        d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=ms).domain()
+        u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), order=2)
+        p, q = d.fem_symbols(names=("p", "q"), order=1)
+        xi, yi, zi = d.variable("interior", split=True)[:3]
+        xb, yb, zb = d.variable("boundary", split=True)[:3]
+        gu, gv = grad(u, [xi, yi, zi]), grad(v, [xi, yi, zi])
+        ub, vv = u.bind(x=xi, y=yi, z=zi), v.bind(x=xi, y=yi, z=zi)
+        pp, qq = p.bind(x=xi, y=yi, z=zi), q.bind(x=xi, y=yi, z=zi)
+        ue = (sin(yi), sin(zi), sin(xi))
+        ce = (sin(zi) * cos(yi), sin(xi) * cos(zi), sin(yi) * cos(xi))
+        gp = (
+            cos(xi) * sin(yi) * sin(zi),
+            sin(xi) * cos(yi) * sin(zi),
+            sin(xi) * sin(yi) * cos(zi),
+        )
+        f = sum((ce[k] + nu * ue[k] + gp[k]) * vv[k] for k in range(3))
+        conv = inner(gu, ub, n_contract=1)
+        fem = jno.fem(
+            [
+                inner(conv, vv, n_contract=1) + nu * inner(gu, gv, n_contract=2) - pp * trace(gv) - f,
+                -qq * trace(gu),
+                u(xb, yb, zb)[0] - sin(yb),
+                u(xb, yb, zb)[1] - sin(zb),
+                u(xb, yb, zb)[2] - sin(xb),
+                p.pin(mean=True),
+            ]
+        )
+        assert not fem.is_linear
+        sol = np.asarray(fem.solve(linear=jno.solve.lu(backend="host")))
+        off = fem.offsets
+        return (
+            _true_l2(d, 2, sol[off[0] : off[1]], uex, dim=3),
+            _true_l2(d, 1, sol[off[1] :], pex, dim=3),
+        )
+
+    sizes = [0.34, 0.28, 0.22, 0.18]
+    res = [solve(h) for h in sizes]
+    return [
+        Row(
+            "Navier-Stokes 3D",
+            "3D",
+            "nonlinear",
+            "Dirichlet",
+            "vector",
+            "P2/P1",
+            "vel-L2",
+            sizes,
+            [r[0] for r in res],
+            3,
+            "fluid",
+        ),
+        Row(
+            "Navier-Stokes 3D",
+            "3D",
+            "nonlinear",
+            "pressure",
+            "scalar",
+            "P2/P1",
+            "p-L2",
+            sizes,
+            [r[1] for r in res],
+            2,
+            "fluid",
+        ),
+    ]
+
+
 def study_complex_helmholtz():
     # -Delta u - c u = f, c = 1 + 0.5i, manufactured u_r = sin sin, u_i = sin2pix sin piy (Re != Im).
     # complex=True -> coupled real system; L2 on |e| = sqrt(|e_r|^2 + |e_i|^2).
@@ -909,6 +989,13 @@ def test_stokes_3d():
     rows = study_stokes_3d()
     _assert_row(rows[0], 2.2, 3.6)  # velocity L2 (O(h^3), pre-asymptotic high on coarse tets)
     _assert_row(rows[1], 1.3, 2.6)  # pressure L2 (O(h^2)) -- needs the zero-mean gauge to exist at all
+
+
+@pytest.mark.slow
+def test_navier_stokes_3d():
+    rows = study_navier_stokes_3d()
+    _assert_row(rows[0], 2.2, 3.6)  # velocity L2 (O(h^3)); measured fitted 3.13
+    _assert_row(rows[1], 1.5, 2.8)  # pressure L2 (O(h^2)); measured fitted 2.37
 
 
 @pytest.mark.slow
