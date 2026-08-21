@@ -120,6 +120,19 @@ def _bind(sym, co, dim):
     return sym.bind(x=co[0], y=co[1], z=co[2])
 
 
+def _quad_form(M, uh) -> float:
+    """``uh^T M uh`` without ever densifying ``M``.
+
+    The mass matrix is assembled sparse (BCOO); densifying it was what capped this measurement, not
+    the solve. A 3-D vector P2 block is 4,305 dofs at h=0.22 -> a 148 MB dense matrix, and ~1.5 GB by
+    h=0.15, so the ERROR METRIC ran out of memory long before the solver did. One sparse matvec gives
+    the identical number.
+    """
+    if hasattr(M, "todense") or hasattr(M, "__matmul__"):
+        return float(np.asarray(uh @ (M @ jnp.asarray(uh))).reshape(()) if hasattr(M, "indices") else uh @ (M @ uh))
+    return float(uh @ np.asarray(M) @ uh)
+
+
 def _true_l2(d, order, uh, gfuns, dim=2, quad=6):
     """True ``||u_h - u||_L2`` via the mass identity (no interpolant -> genuine O(h^{p+1}) rate).
 
@@ -138,13 +151,13 @@ def _true_l2(d, order, uh, gfuns, dim=2, quad=6):
     if scalar:
         g = gfuns(co)
         femM = jno.fem([ui * vi - g * vi], quad_degree=quad)
-        M, b = _dense(femM.A), np.asarray(femM.b).reshape(-1)
+        M, b = femM.A, np.asarray(femM.b).reshape(-1)
         C = float(np.sum(np.asarray(jno.fem([ui * vi - (g * g) * vi], quad_degree=quad).b)))
     else:
         gs = [gf(co) for gf in gfuns]
         gv = jno.np.vector(*gs)
         femM = jno.fem([inner(ui, vi, n_contract=1) - inner(gv, vi, n_contract=1)], quad_degree=quad)
-        M, b = _dense(femM.A), np.asarray(femM.b).reshape(-1)
+        M, b = femM.A, np.asarray(femM.b).reshape(-1)
         gmag2 = gs[0] * gs[0]
         for gk in gs[1:]:
             gmag2 = gmag2 + gk * gk
@@ -152,7 +165,7 @@ def _true_l2(d, order, uh, gfuns, dim=2, quad=6):
         usi, wsi = _bind(us, co, dim), _bind(ws, co, dim)
         C = float(np.sum(np.asarray(jno.fem([usi * wsi - gmag2 * wsi], quad_degree=quad).b)))
     uh = np.asarray(uh).reshape(-1)
-    return float(np.sqrt(max(uh @ M @ uh - 2.0 * uh @ b + C, 0.0)))
+    return float(np.sqrt(max(_quad_form(M, uh) - 2.0 * uh @ b + C, 0.0)))
 
 
 def _mass_stiffness(d, order=1):
@@ -565,6 +578,62 @@ def study_kovasznay():
     ]
 
 
+def study_stokes_3d():
+    # 3-D Taylor-Hood P2/P1 Stokes on tets. Velocity L2 O(h^3), pressure L2 O(h^2).
+    #   u = (sin y, sin z, sin x)   -> div u == 0 IDENTICALLY (each component is independent of its
+    #                                  own coordinate), and Delta u = -u
+    #   p = sin x sin y sin z - C,  C = (1 - cos 1)^3  -> int p dx == 0 over the unit cube
+    #   f = -mu Delta u + grad p = mu u + grad p       (the constant shifts no force)
+    # The pressure is gauged by its INTEGRAL, not by a node: a point pin leaves a constant that does
+    # not shrink with h, and this row does not converge at all under one (measured order
+    # 6.16 / -0.89 / 4.38, the error rising at h=0.22). Subtracting C puts the exact solution in the
+    # same gauge as the discrete one, so the two are directly comparable.
+    mu = 1.0
+    C = float((1.0 - np.cos(1.0)) ** 3)
+    uex = (lambda co: sin(co[1]), lambda co: sin(co[2]), lambda co: sin(co[0]))
+    pex = lambda co: sin(co[0]) * sin(co[1]) * sin(co[2]) - C  # noqa: E731
+
+    def solve(ms):
+        d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=ms).domain()
+        u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), order=2)
+        p, q = d.fem_symbols(names=("p", "q"), order=1)
+        xi, yi, zi = d.variable("interior", split=True)[:3]
+        xb, yb, zb = d.variable("boundary", split=True)[:3]
+        gu, gv = grad(u, [xi, yi, zi]), grad(v, [xi, yi, zi])
+        pp, qq = p.bind(x=xi, y=yi, z=zi), q.bind(x=xi, y=yi, z=zi)
+        vv = v.bind(x=xi, y=yi, z=zi)
+        ue = (sin(yi), sin(zi), sin(xi))
+        gp = (
+            cos(xi) * sin(yi) * sin(zi),
+            sin(xi) * cos(yi) * sin(zi),
+            sin(xi) * sin(yi) * cos(zi),
+        )
+        f = (mu * ue[0] + gp[0]) * vv[0] + (mu * ue[1] + gp[1]) * vv[1] + (mu * ue[2] + gp[2]) * vv[2]
+        fem = jno.fem(
+            [
+                mu * inner(gu, gv, n_contract=2) - pp * trace(gv) - f,
+                -qq * trace(gu),
+                u(xb, yb, zb)[0] - sin(yb),
+                u(xb, yb, zb)[1] - sin(zb),
+                u(xb, yb, zb)[2] - sin(xb),
+                p.pin(mean=True),
+            ]
+        )
+        sol = np.asarray(fem.solve(linear=jno.solve.lu(backend="host")))
+        off = fem.offsets
+        return (
+            _true_l2(d, 2, sol[off[0] : off[1]], uex, dim=3),
+            _true_l2(d, 1, sol[off[1] :], pex, dim=3),
+        )
+
+    sizes = [0.34, 0.28, 0.22, 0.18]  # coarser tets are strongly pre-asymptotic on a unit cube
+    res = [solve(h) for h in sizes]
+    return [
+        Row("Stokes 3D", "3D", "linear", "Dirichlet", "vector", "P2/P1", "vel-L2", sizes, [r[0] for r in res], 3, "fluid"),
+        Row("Stokes 3D", "3D", "linear", "pressure", "scalar", "P2/P1", "p-L2", sizes, [r[1] for r in res], 2, "fluid"),
+    ]
+
+
 def study_complex_helmholtz():
     # -Delta u - c u = f, c = 1 + 0.5i, manufactured u_r = sin sin, u_i = sin2pix sin piy (Re != Im).
     # complex=True -> coupled real system; L2 on |e| = sqrt(|e_r|^2 + |e_i|^2).
@@ -833,6 +902,13 @@ def test_kovasznay():
     rows = study_kovasznay()
     _assert_row(rows[0], 2.3, 3.6)  # velocity L2 (O(h^3), pre-asymptotic high)
     _assert_row(rows[1], 1.5, 2.6)  # pressure L2 (O(h^2))
+
+
+@pytest.mark.slow
+def test_stokes_3d():
+    rows = study_stokes_3d()
+    _assert_row(rows[0], 2.2, 3.6)  # velocity L2 (O(h^3), pre-asymptotic high on coarse tets)
+    _assert_row(rows[1], 1.3, 2.6)  # pressure L2 (O(h^2)) -- needs the zero-mean gauge to exist at all
 
 
 @pytest.mark.slow
