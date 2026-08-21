@@ -2139,6 +2139,19 @@ trajectory`. Build your own (e.g. diffrax) from the block's `block.M` / `block.A
   one continuity term; an inf-sup-stable Taylor–Hood pair is `order=2` velocity + `order=1`
   pressure. Pure-Dirichlet velocity leaves the pressure defined only up to a constant; gauge-fix
   that null space by adding `p.pin()` to the constraint list (`p.pin(value)` sets the gauge).
+
+  > **Which gauge, and when it matters.** `p.pin(value)` fixes one vertex's *discrete* value to a
+  > *continuous* one. That is fine whenever only the pressure **gradient** is used, and wrong as soon
+  > as the **level** is read, because the constant it leaves behind does not shrink with the mesh.
+  > Measured on a manufactured 3-D Stokes solution (P2/P1 tets, direct solver), the pressure `L2`
+  > error under refinement is `3.57e-2 → 1.08e-2 → 1.34e-2 → 5.56e-3` — it *rises* at `h = 0.22`, and
+  > the observed order is `6.16 / -0.89 / 4.38`, i.e. no order at all. `p.pin(mean=True)` gauges to
+  > `∫p dx = 0` instead and the same problem gives `8.13e-3 → 4.50e-3 → 2.66e-3 → 1.88e-3`, order
+  > `3.05 / 2.17 / 1.75` against the theoretical `O(h²)`. The velocity is identical either way — the
+  > field was always right up to that constant (Bochev & Lehoucq, *SIAM Review* 47(1), 2005, §3).
+  > A **natural (do-nothing) outflow** fixes the level on its own, so a channel with an outflow wants
+  > no pin at all. The normalisation applies wherever a solution is returned — steady vector,
+  > transient trajectory, or a lazy solve node — and is plain arithmetic, so it survives `jit`/`grad`.
 * **1D and 3D** — a 1D interval or a 3D `cube`/extruded `gmsh` volume use the identical API with
   one fewer / one more coordinate (`ui.z`, `u(xb, yb, zb) - g`).
 * **Higher-order Lagrange** — `order=k` gives degree-`k` elements (P2, P3, P4, … on triangles and tets);
