@@ -12,6 +12,7 @@ Responsibilities:
 - normalize Dirichlet data and prepare residual/Jacobian runtime objects.
 """
 import hashlib as _hashlib
+import os
 from collections import OrderedDict
 from functools import partial
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -3571,6 +3572,22 @@ _CHUNK_MIN_CELLS = 8192  # saturation floor; see above -- not derivable, so kept
 _CHUNK_FALLBACK_BYTES = 8 << 20  # CPU / unknown device: no saturation pressure, just bound memory
 
 
+def _device_saturates() -> bool:
+    """Is there an accelerator whose cores must be kept fed?
+
+    The saturation floor exists to stop a device running dry, and it pays for that by deliberately
+    overrunning the memory cap. That trade only makes sense where the device exists: a CPU backend
+    has no saturation pressure (the reason `_CHUNK_FALLBACK_BYTES` is a separate, memory-only
+    budget), so the floor there is a heuristic imported from hardware that is not present.
+
+    Keyed on the same `bytes_limit` probe the budget uses, so the two cannot disagree about which
+    backend they are on."""
+    try:
+        return bool(jax.local_devices()[0].memory_stats().get("bytes_limit"))
+    except Exception:  # noqa: BLE001 -- CPU backends expose no memory stats
+        return False
+
+
 def chunk_budget_bytes():
     """Bytes one element chunk may occupy, taken from the device rather than tuned to one."""
     try:
@@ -3578,7 +3595,16 @@ def chunk_budget_bytes():
     except Exception:  # noqa: BLE001 -- CPU backends expose no memory stats
         limit = None
     if not limit:
-        return _CHUNK_FALLBACK_BYTES
+        # No device: spend the same FRACTION of host RAM the accelerator path spends of device RAM,
+        # rather than a flat 8 MiB. The flat number is not conservative, it is arbitrary -- on a 62 GB
+        # host it buys 9 cells of a 48-DOF element, which is why the saturation floor was silently
+        # papering over it. The fraction lands on ~105 cells there, next to the 128 that measured
+        # best on this problem, and scales with the machine like the device branch does.
+        try:
+            total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        except (AttributeError, ValueError, OSError):  # non-POSIX or the names are absent
+            total = 0
+        return max(_CHUNK_FALLBACK_BYTES, int(total * _CHUNK_MEMORY_FRACTION))
     return max(_CHUNK_FALLBACK_BYTES // 2, int(limit * _CHUNK_MEMORY_FRACTION))
 
 
@@ -3617,7 +3643,20 @@ def cell_chunk(n_items: int, n_test: int, n_local: int, setting=None):
         return None if n_items <= setting else _balanced_chunk(n_items, int(setting))
     per = max(1, int(n_test) * int(n_local) * int(n_local) * 8)
     chunk = max(1, chunk_budget_bytes() // per)
-    chunk = max(chunk, _CHUNK_MIN_CELLS)  # never starve the device to honour the byte cap
+    if _device_saturates():
+        # Only where there are cores to starve. The floor buys back a measured ~2x on an accelerator
+        # and is worth overrunning the byte cap for -- but a CPU backend has no saturation pressure,
+        # which is exactly why `_CHUNK_FALLBACK_BYTES` exists, and applying the floor there enforces a
+        # GPU heuristic against a machine that cannot benefit from it.
+        #
+        # It inverts, too: the floor counts CELLS while the resource is BYTES, so it bites hardest on
+        # a high-DOF element (per-cell cost is n_test * n_local**2) and, because chunking is skipped
+        # when the mesh is smaller than the chunk, it disappears entirely on SMALL meshes -- the
+        # opposite of where anyone looks. Measured on 4,082 tets of an enriched 48-DOF element with
+        # trainable coordinates: an 8 MiB budget, a floor that disabled chunking outright, and a
+        # 36.2 GB peak. Honouring the byte cap on CPU brings it to 13.4 GB for ~6 % more runtime,
+        # with iteration 0 identical to every printed digit.
+        chunk = max(chunk, _CHUNK_MIN_CELLS)
     if n_items <= chunk:
         return None  # one chunk anyway -- skip the scan overhead entirely
     return _balanced_chunk(n_items, chunk)
