@@ -41,6 +41,19 @@ fem = jno.fem([ui.t*vi + D*(ui.x*vi.x + ui.y*vi.y) + react - f*vi, ...])
 | vector / tensor | `inner(a, b, n_contract=)`, `dot cross outer trace sym`; vector `.norm() .dot() .cross()` |
 | matrix / Voigt / complex | `MatrixView` (`.det .inv .eigvals .sym`), `VoigtView` (`.von_mises .deviatoric .invariants`), `ComplexView` (`.real .imag .conj`) |
 
+Ordinary Python arithmetic over components composes too, so a vector source can be written either
+way — `inner` when the whole vector is to hand, a plain sum when the components are:
+
+```python
+f_dot_v = jno.np.inner(f, vi, n_contract=1)          # f is a vector expression
+f_dot_v = sum(f[k] * vi[k] for k in range(3))        # components, built one at a time
+```
+
+Both assemble to the same operator (to assembly round-off — the products reduce in a different
+order). The builtin `sum()` seeds with a literal `0`; that zero belongs to no equation block and is
+dropped. Every *other* additive piece of a form must carry exactly one test field, since the test
+field is what selects the block: a source term is `-f * vi`, never `-f`.
+
 ## Integrals (local **and** non-local)
 
 ```python

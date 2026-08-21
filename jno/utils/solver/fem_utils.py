@@ -491,12 +491,12 @@ def _infer_fields(expr) -> Tuple[List[Dict[str, Any]], Dict[Any, int]]:
     return fields, dict(seen)
 
 
-def _test_field_index(expr, field_index: Dict[Any, int]) -> Optional[int]:
-    """Index of the single test field in an additive weak term (or ``None``).
+def _test_field_keys(expr) -> set:
+    """The distinct test-field keys an additive weak term mentions.
 
-    Each additive term must contain exactly one test field (it determines the
-    equation/row block); a term with zero or several distinct test fields is
-    ambiguous and the caller errors."""
+    Split out of :func:`_test_field_index` so a caller that has to *report* the ambiguity can say
+    which one it hit -- no test field reads very differently from several, and the fix differs too.
+    """
     keys = set()
 
     def walk(node):
@@ -509,9 +509,43 @@ def _test_field_index(expr, field_index: Dict[Any, int]) -> Optional[int]:
             walk(child)
 
     walk(expr)
+    return keys
+
+
+def _test_field_index(expr, field_index: Dict[Any, int]) -> Optional[int]:
+    """Index of the single test field in an additive weak term (or ``None``).
+
+    Each additive term must contain exactly one test field (it determines the
+    equation/row block); a term with zero or several distinct test fields is
+    ambiguous and the caller errors."""
+    keys = _test_field_keys(expr)
     if len(keys) != 1:
         return None
     return field_index.get(next(iter(keys)))
+
+
+def _is_structural_zero(node) -> bool:
+    """Is this additive sub-term identically zero by construction?
+
+    The builtin ``sum()`` seeds its accumulation with the integer ``0``, so the most natural
+    spelling of a vector source term -- ``sum(f[k] * v[k] for k in range(dim))`` -- reaches the
+    classifier carrying a literal-zero sub-term alongside the real ones. Zero belongs to no
+    equation block and changes no residual, so it is dropped rather than refused; refusing it
+    rejects the spelling users reach for first and blames the absent test function for it.
+
+    Deliberately narrow. Only a **concrete** literal zero counts, or a product with one. A value
+    that is not known at build time (a tracer, a runtime parameter) is never structural even if it
+    happens to be zero during a solve: that is a real term whose coefficient vanishes, and
+    discarding it would drop physics rather than punctuation.
+    """
+    if isinstance(node, Literal):
+        value = node.value
+        if isinstance(value, jax.core.Tracer):
+            return False
+        return bool(np.all(np.asarray(value) == 0))
+    if isinstance(node, BinaryOp) and node.op == "*":
+        return _is_structural_zero(node.left) or _is_structural_zero(node.right)
+    return False
 
 
 def _expand_product_terms(node, sign: float = 1.0):
