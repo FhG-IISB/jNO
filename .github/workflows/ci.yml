@@ -52,21 +52,21 @@ jobs:
               - 'jno/utils/solver/**'
               - 'jno/precond.py'
               - 'jno/solve.py'
-              - 'tests/test_fem_*'
+              - 'tests/test_fem*'
             geometry:
               - 'jno/domain/**'
               - 'jno/geometry/**'
-              - 'tests/test_domain_*'
-              - 'tests/test_shape_*'
-              - 'tests/test_polygon_*'
-              - 'tests/test_mesh_*'
+              - 'tests/test_domain*'
+              - 'tests/test_shape*'
+              - 'tests/test_polygon*'
+              - 'tests/test_mesh*'
             rcwa:
               - 'jno/rcwa**'
               - 'jno/litho*'
-              - 'tests/test_rcwa_*'
+              - 'tests/test_rcwa*'
             fdm:
               - 'jno/fdm.py'
-              - 'tests/test_fdm_*'
+              - 'tests/test_fdm*'
             core:
               - 'jno/**'
               - 'tests/**'
@@ -125,16 +125,21 @@ jobs:
         run: |
           # `core` is the COMPLEMENT of the named groups, computed rather than listed, so a new
           # test file is covered by default instead of silently belonging to nothing.
-          named() { find tests -maxdepth 1 \( -name 'test_fem_*.py' -o -name 'test_domain_*.py' \
-                      -o -name 'test_shape_*.py' -o -name 'test_polygon_*.py' \
-                      -o -name 'test_mesh_*.py' -o -name 'test_rcwa_*.py' \
-                      -o -name 'test_fdm_*.py' \) -printf '%p\n' | sort; }
+          #
+          # The stems deliberately do NOT require a trailing underscore. With `test_fdm_*.py` the
+          # group's own headline file, `tests/test_fdm.py`, matched nothing and fell into `core` --
+          # so a change to `jno/fdm.py` ran the two satellite files and not the main one, and every
+          # unrelated PR paid its 3m14s. Same for `tests/test_rcwa.py`.
+          named() { find tests -maxdepth 1 \( -name 'test_fem*.py' -o -name 'test_domain*.py' \
+                      -o -name 'test_shape*.py' -o -name 'test_polygon*.py' \
+                      -o -name 'test_mesh*.py' -o -name 'test_rcwa*.py' \
+                      -o -name 'test_fdm*.py' \) -printf '%p\n' | sort; }
           case '${{ matrix.group }}' in
-            fem)      find tests -maxdepth 1 -name 'test_fem_*.py' -printf '%p\n' | sort > files.txt ;;
-            geometry) find tests -maxdepth 1 \( -name 'test_domain_*.py' -o -name 'test_shape_*.py' \
-                        -o -name 'test_polygon_*.py' -o -name 'test_mesh_*.py' \) -printf '%p\n' | sort > files.txt ;;
-            rcwa)     find tests -maxdepth 1 -name 'test_rcwa_*.py' -printf '%p\n' | sort > files.txt ;;
-            fdm)      find tests -maxdepth 1 -name 'test_fdm_*.py' -printf '%p\n' | sort > files.txt ;;
+            fem)      find tests -maxdepth 1 -name 'test_fem*.py' -printf '%p\n' | sort > files.txt ;;
+            geometry) find tests -maxdepth 1 \( -name 'test_domain*.py' -o -name 'test_shape*.py' \
+                        -o -name 'test_polygon*.py' -o -name 'test_mesh*.py' \) -printf '%p\n' | sort > files.txt ;;
+            rcwa)     find tests -maxdepth 1 -name 'test_rcwa*.py' -printf '%p\n' | sort > files.txt ;;
+            fdm)      find tests -maxdepth 1 -name 'test_fdm*.py' -printf '%p\n' | sort > files.txt ;;
             core)     find tests -maxdepth 1 -name 'test_*.py' -printf '%p\n' | sort > all.txt
                       named > named.txt; comm -23 all.txt named.txt > files.txt ;;
           esac

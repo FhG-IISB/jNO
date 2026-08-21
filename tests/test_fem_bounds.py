@@ -393,3 +393,64 @@ def test_bounds_needs_at_least_one_side():
     u, _phi = d.fem_symbols()
     with pytest.raises(ValueError, match="lo|hi|at least"):
         u.bounds(None, None)
+
+
+def test_a_coordinate_bound_on_a_vector_field_binds_per_node():
+    """The bound expression is a scalar function of the coordinates; the field it bounds has ``dim``
+    values per node. That cell of the matrix — coordinate expression x VECTOR field — is what the
+    single-value-per-node broadcast exists for, and it decides which node each value lands on: the DOF
+    vector is node-major (``[u0x, u0y, u1x, u1y, ...]``), so the bound repeats per node, and reading it
+    the other way round scrambles the floor across the mesh.
+
+    Compressed plate, floor ``psi(y) = -0.06 + 0.05 y`` — chosen to cut into the *unbounded* answer, so
+    a bound that were dropped would show up as a violation rather than as a vacuous pass."""
+    sym, trace, inner = jno.np.symgrad, jno.np.trace, jno.np.inner
+    lam, mu = 1.0, 1.0
+
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.15).domain()
+    co = d.variable("interior", split=True)
+    X = [co[0], co[1]]
+    u, phi = d.fem_symbols(value_shape=(2,))
+    eu, ep = sym(u, X), sym(phi, X)
+    xt, yt, _ = d.variable("top", split=True)
+    elastic = lam * trace(eu) * trace(ep) + 2 * mu * inner(eu, ep, n_contract=2)
+    grip = [u(xt, yt)[0] - 0.0, u(xt, yt)[1] - (-0.1)]
+    psi = lambda y: -0.06 + 0.05 * y  # noqa: E731 — the floor, once, as it is written below
+
+    fem_free = jno.fem([elastic] + grip)
+    free = np.asarray(fem_free.solve())
+    pts = np.asarray(fem_free.field_points[0])
+    lo = psi(pts[:, 1])[:, None]
+
+    assert (free.reshape(-1, 2) - lo).min() < -1e-3, "the floor does not cut the free answer — vacuous"
+
+    fem = jno.fem([elastic] + grip + [u.bounds(psi(X[1]), None)])
+    sol = np.asarray(fem.solve(nonlinear=jno.solve.newton(line_search=True, rtol=1e-8, atol=1e-8))).reshape(-1, 2)
+
+    assert np.all(np.isfinite(sol)), "the vector bound diverged"
+    slack = sol - lo
+    assert slack.min() > -1e-9, f"the floor was violated by {-slack.min():.3e}"
+    assert (slack < 1e-9).sum() > 0, "no DOF reached the floor — the bound never activated"
+    # ...and it is THIS node's floor, not some other node's: the component-major reading is infeasible.
+    assert (sol.reshape(2, -1).T - lo).min() < -1e-6, "node-major and component-major agree — no layout signal"
+
+
+def test_a_coordinate_bound_must_be_one_value_per_node():
+    """A bound expression that does not reduce to one value per DOF node is refused by name, rather
+    than broadcast into a shape that happens to fit."""
+    grad, inner = _aliases()
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain()
+    co = d.variable("interior", split=True)
+    X = [co[0], co[1]]
+    u, phi = d.fem_symbols(value_shape=(2,))
+    xt, yt, _ = d.variable("top", split=True)
+    fem = jno.fem(
+        [
+            inner(grad(u, X), grad(phi, X), 2),
+            u(xt, yt)[0] - 0.0,
+            u(xt, yt)[1] - (-0.1),
+            u.bounds(jno.np.stack([X[0], X[1]], axis=-1), None),
+        ]
+    )
+    with pytest.raises(ValueError, match="scalar function of the coordinates"):
+        fem.solve()
