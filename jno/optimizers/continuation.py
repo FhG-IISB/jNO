@@ -47,7 +47,7 @@ class SIMPContinuation(_Callback):
         maximum: float = 8.0,
         tol: float = 1e-4,
         window: int = 3,
-        mnd_tol: float = 1e-2,
+        mnd_tol: float = 1e-4,
         physical=None,
         watch: Optional[int] = None,
         every: int = 1,
@@ -151,7 +151,7 @@ def simp_continuation(
     maximum: float = 8.0,
     tol: float = 1e-4,
     window: int = 3,
-    mnd_tol: float = 1e-2,
+    mnd_tol: float = 1e-4,
     physical=None,
     watch: Optional[int] = None,
     every: int = 1,
@@ -172,7 +172,12 @@ def simp_continuation(
         maximum: Ceiling, so a design that never binarises cannot run the exponent away.
         tol: Relative-change tolerance for "the objective has converged" (the paper's 1e-4).
         window: How many consecutive intervals must all be below ``tol`` (the paper's three).
-        mnd_tol: Grey-level target. Above this, the exponent keeps rising (the paper's 1e-2).
+        mnd_tol: Grey-level target. Above this, the exponent keeps rising. **1e-4**, which is
+            what the paper states in Sec. 3.1 -- 'if the gray level indicator M_nd remains
+            larger than 10^-4, the penalization factor is increased by one until the criterion
+            on M_nd is satisfied'. This default was 1e-2, attributed to the paper in the same
+            breath; a design at M_nd = 1e-2 still carries visible intermediate-density members,
+            which is the difference between their Fig. 4d and Fig. 4e.
         physical: Optional map from the design density to the physical one, e.g.
             ``d.patch_filter()``. Pass it whenever the density is reparameterised with
             ``constrain(...)``: the hook sees the partitioned trainable half, where the paramax
