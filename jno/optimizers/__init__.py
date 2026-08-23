@@ -31,7 +31,14 @@ building your own optax chains.
 this package and re-export it below.
 """
 
-from .continuation import GeometricDecay, SIMPContinuation, geometric_decay, simp_continuation
+from .continuation import (
+    GeometricDecay,
+    HeavisideContinuation,
+    SIMPContinuation,
+    geometric_decay,
+    heaviside_continuation,
+    simp_continuation,
+)
 from .engd import ENGDOptimizer, engd
 from .md_decouple import MDOptimizer, md, md_decouple
 from .mma import MMACallback, MMAOptimizer, mma
@@ -46,6 +53,8 @@ __all__ = [
     "SIMPContinuation",
     "geometric_decay",
     "GeometricDecay",
+    "heaviside_continuation",
+    "HeavisideContinuation",
     "MMAOptimizer",
     "ssbroyden",
     "ssbfgs",
