@@ -2042,10 +2042,23 @@ def assemble_fem_native(
         per_f = []
         for i in range(len(fields)):
             fp_i, fd_i, _, _, _ = face_tables_per_field[i]
+            _phi_i = fp_i[k]
+            _dphi_i = jnp.einsum(_GSPEC(K), fd_i[k], K)
+            if _cblk[i] > 1:
+                # The SAME enrichment the volume path applies in `_cell_fields`, on the facet's own
+                # quadrature points. Without it a surface term emits `n_local` test rows while the
+                # assembler's static pattern has already allocated `n_local * blk` of them, and the
+                # mismatch surfaces far away as a broadcast error inside the Jacobian's scatter.
+                # A traction is the common case, so `space="cover"` was unusable with any applied
+                # load -- volume terms and Dirichlet conditions alone happened to avoid it.
+                _cn = cells_j[c]
+                _, _, _qp_i, _, _ = face_tables_per_field[i]
+                _xq_i = _xq_tp if _xq_tp is not None else verts[0] + _qp_i[k] @ J.T
+                _phi_i, _dphi_i = expand_cover(_phi_i, _dphi_i, _xq_i, _pts_src[_cn], _cover_scale_j[_cn])
             per_f.append(
                 {
-                    "shape_vals": fp_i[k],
-                    "shape_grads": jnp.einsum(_GSPEC(K), fd_i[k], K),
+                    "shape_vals": _phi_i,
+                    "shape_grads": _dphi_i,
                     "cell_sol": cell_sols[i],
                     "space": "Lagrange",
                 }
