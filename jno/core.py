@@ -485,7 +485,18 @@ def _bay_key(lid: int, group_idx: int = 0) -> str:
 
 
 def _extract_user_name(orig_expr) -> str | None:
-    """Return the user-supplied ``.name()`` label from a constraint/tracker expression, or None."""
+    """Return the user-supplied ``.name()`` label from a constraint/tracker expression, or None.
+
+    A ``jno.le``/``jno.ge`` wrapper is unwrapped first. ``jno.le(g_ang.name("g_ang"), 1.0)`` is the
+    natural way to write a named bound, and without this the label is lost and every diagnostic can
+    only say "inequality row 2" -- which is exactly the row a feasibility report most needs to name.
+    """
+    from .trace import Constraint as _Constraint
+
+    if isinstance(orig_expr, _Constraint):
+        inner = _extract_user_name(getattr(orig_expr, "expr", None))
+        if inner:
+            return inner
     name = getattr(orig_expr, "_user_name", None)
     if name:
         return name

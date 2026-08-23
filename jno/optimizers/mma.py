@@ -290,6 +290,7 @@ class MMACallback(_Callback):
         self._jac_fn = None
         self._unravel = None
         self._n_constraints = 0
+        self._names: list = []
 
     # -- hooks -------------------------------------------------------------
     def on_solve_begin(self, **kw):
@@ -302,6 +303,9 @@ class MMACallback(_Callback):
         from jno.utils.ad_mode import rowwise_jacobian
 
         compiled_fn = kw["compiled_constraints_fn"]
+        # Names, so the feasibility report below can say `g_ang` rather than "row 2". A row the user
+        # never named stays None and is reported by index.
+        self._names = list(kw.get("constraint_names") or [])
         frozen, static = kw["frozen"], kw["static"]
         batchsize, min_consecutive = kw["batchsize"], kw["min_consecutive"]
         self._n_constraints = int(kw["n_constraints"])
@@ -351,6 +355,51 @@ class MMACallback(_Callback):
 
         self._jac_fn = jax.jit(jac)
 
+    def _report_initial_feasibility(self, g, dg):
+        """Say where every ``jno.le`` row starts, and refuse one no step can ever satisfy.
+
+        MMA is told the constraints and left to find a feasible point, so a row that is violated at
+        the initial design and CANNOT be moved looks, from the outside, exactly like a hard problem:
+        the run proceeds, the objective wanders, and the diagnosis is a wall-clock away. Measured on
+        a 3-D bracket whose element-quality constraints were left in the term list with the mesh
+        pinned -- `g_vmx` starts at 1.734 and no design variable touches it -- the solve spent all
+        250 iterations in feasibility restoration and returned a compliance of 1.65e3 against the
+        4.07 the same problem gives when they are dropped.
+
+        The values and the Jacobian are already in hand on this step, so both the report and the
+        refusal are free.
+
+        The refusal is narrow ON PURPOSE: a row is only impossible if it is violated *and* its
+        gradient vanishes w.r.t. every design variable. A row that merely starts violated is
+        ordinary -- that is what MMA is for -- and a row whose gradient is zero but which starts
+        satisfied is harmless. Note this cannot catch a constraint that depends on the density but
+        not the mesh (`g_vmx` does, through the element volumes), which is why the report exists
+        alongside it rather than being replaced by it.
+        """
+        from jno.utils.logger import get_logger
+
+        _log = get_logger()
+        for i, gi in enumerate(np.asarray(g).reshape(-1)):
+            nm = self._names[self._ineq[i]] if i < len(self._ineq) and self._ineq[i] < len(self._names) else None
+            label = repr(nm) if nm else f"inequality row {i}"
+            slack = float(gi)
+            row = np.asarray(dg[i]).reshape(-1) if dg.size else np.zeros(0)
+            dead = row.size == 0 or not np.any(np.abs(row) > 0.0)
+            if slack > 0.0 and dead:
+                raise ValueError(
+                    f"jno.optimizers.mma: constraint {label} is violated at the initial design "
+                    f"(g = {slack:+.4g}) and its gradient is identically zero w.r.t. every design "
+                    f"variable, so no step can satisfy it and the solve would spend its whole "
+                    f"budget in feasibility restoration. Either drop it from the term list -- an "
+                    f"element-quality bound is a constant of a fixed mesh, so pinning the "
+                    f"coordinates makes it one -- or make the variables it depends on trainable."
+                )
+            _log.info(
+                f"  {label}: g = {slack:+.4g} at the initial design "
+                f"({'violated' if slack > 0 else 'satisfied'}"
+                f"{', and immovable' if dead else ''})"
+            )
+
     def on_before_update(self, *, grads, trainable, context, rng, epoch, **kw):
         import jax
         from jax.flatten_util import ravel_pytree
@@ -395,6 +444,9 @@ class MMACallback(_Callback):
             dg = np.asarray(self._jac_fn(trainable, context, rng), dtype=np.float64)
         else:
             g, dg = np.zeros(0), np.zeros((0, x.size))
+
+        if self._k == 0 and self._ineq:
+            self._report_initial_feasibility(g, dg)
 
         spec = _BlendedSpec(self._blocks, [p.size for p in x_parts], k=self._k)
         x_new, self._low, self._upp = mma_subproblem(
