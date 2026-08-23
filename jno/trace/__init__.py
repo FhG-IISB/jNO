@@ -603,6 +603,62 @@ class Placeholder:
     def mae(self) -> FunctionCall:
         return FunctionCall(lambda x: jnp.squeeze(jnp.mean(jnp.abs(x))), [self], "mae", True)
 
+    def project(self, beta, eta: float = 0.5) -> "FunctionCall":
+        """Smoothed-Heaviside projection — Wang, Lazarov & Sigmund eq. (1), as a node.
+
+        Lives on every node rather than only on a density, because the map is POINTWISE: it needs no
+        mesh, no neighbourhood and no cell-field provenance, so ``rho.patch().project(beta)`` has to
+        work and there is nothing to check that would make it not.
+
+        *Struct. Multidisc. Optim.* **43**(6), 2011, 767-784::
+
+            rho_hat = (tanh(beta*eta) + tanh(beta*(rho - eta)))
+                      / (tanh(beta*eta) + tanh(beta*(1 - eta)))
+
+        Pushes density away from ``eta`` and towards 0 or 1, so the design goes black-and-white
+        instead of paying for grey. ``beta`` sets how hard; ``eta`` is the threshold that stays put.
+
+        **A node, not a ``constrain()`` transform, and that is the point.** The filter is a callable
+        because it is NON-LOCAL -- an element's filtered density depends on its whole neighbourhood,
+        so it cannot be written inside the weak form. Projection is POINTWISE, so it can be, and it
+        must be: a ``constrain()`` transform lives in the static half of the partition, which makes
+        any ``beta`` it reads a trace-time constant. Mutating that constant to ramp the sharpness --
+        the obvious way to write continuation -- changes nothing the step-program key can see, so the
+        gradient keeps being taken at the ORIGINAL beta while ``crux.eval`` reports the new one.
+        Measured: a ramp written that way moved the design at ``beta = 1`` for its whole run while
+        logging a rising beta and a falling grey-level indicator. Passing ``beta`` as a parameter
+        NODE here makes it a traced argument, and the schedule then actually reaches the physics.
+
+        So the composition rule is: **non-local maps reparameterise, pointwise maps compose.**
+
+            rho.patch().project(beta)      # filter in constrain(), projection in the form
+
+        :func:`jno.optimizers.heaviside_continuation` ramps ``beta``.
+
+        No floor is applied and none is offered. ``E(r) = EMIN + r**p * (E0 - EMIN)`` is already
+        regular at ``r = 0``, so clipping the result buys no conditioning -- what it does buy is a
+        floor under the physical density and therefore under ``M_nd = 4*mean(r(1-r))``, which is the
+        quantity a continuation schedule watches to decide it is done. The void stiffness belongs in
+        ``EMIN``, once.
+
+        Args:
+            beta: Sharpness. A scalar ``jno.np.parameter`` node (schedulable, and traced) or a plain
+                float (fixed). ``beta -> 0`` is the identity; large ``beta`` approaches a step.
+            eta: Threshold, the fixed point of the map. Defaults to 0.5.
+
+        Returns:
+            A node of the same shape as ``self``, differentiable in the density and in ``beta``.
+        """
+        import jno as _jno
+
+        if not 0.0 < float(eta) < 1.0:
+            raise ValueError(
+                f"ModelCall.project(): eta must be strictly between 0 and 1, got {eta!r}. It is the "
+                "threshold the projection pushes away from, and the map is only monotone onto "
+                "[0, 1] for an interior threshold."
+            )
+        return _jno.fn(lambda r, b: _heaviside_project(r, b, float(eta)), [self, beta], name="project")
+
     def pnorm(self, p: float = 50.0, *, normalize: bool = False) -> FunctionCall:
         """``(Σ xᵢ^p)^(1/p)`` — a smooth, differentiable stand-in for the maximum.
 
@@ -2828,6 +2884,33 @@ class Model(Placeholder):
             target_backend=target_backend,
             optimization_level=optimization_level,
         )
+
+
+def _heaviside_project(rho, beta, eta: float = 0.5):
+    """The smoothed-Heaviside map itself, on plain arrays.
+
+    Wang, Lazarov & Sigmund, *Struct. Multidisc. Optim.* **43**(6), 2011, 767-784, eq. (1). Kept as a
+    free function so :meth:`ModelCall.project` and any caller that needs the map OUTSIDE the trace --
+    a continuation schedule measuring the grey-level indicator, say -- apply the same arithmetic
+    rather than two transcriptions of it.
+
+    The denominator is what makes the map onto ``[0, 1]`` exactly: it is the numerator evaluated at
+    ``rho = 1``, so ``H(0) = 0`` and ``H(1) = 1`` for every ``beta``, and the volume constraint keeps
+    its units. ``eta`` is the fixed point, ``H(eta) = eta``.
+
+    ``beta -> 0`` degenerates: numerator and denominator both vanish and the ratio is 0/0. jNO does
+    not special-case it, because a schedule that reaches zero sharpness is a schedule with a bug, and
+    silently returning the identity would hide it. Start at 1.
+    """
+    import jax.numpy as jnp
+
+    tb = jnp.tanh(beta * eta)
+    return (tb + jnp.tanh(beta * (rho - eta))) / (tb + jnp.tanh(beta * (1.0 - eta)))
+
+
+def heaviside(rho, beta, eta: float = 0.5):
+    """Smoothed-Heaviside projection on arrays -- the free-function form of :meth:`ModelCall.project`."""
+    return _heaviside_project(rho, beta, eta)
 
 
 class ModelCall(Placeholder):
