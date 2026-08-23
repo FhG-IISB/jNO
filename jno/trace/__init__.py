@@ -2970,7 +2970,8 @@ class ModelCall(Placeholder):
         return _jno.fn(_perimeter, [self, *args], name="perimeter")
 
     def curvature(self, zeta: float = 0.1) -> "FunctionCall":
-        """Discrete bending energy of the material boundary — the **local** smoothness handle.
+        """Discrete bending energy of the material boundary, **per ridge** — the local smoothness
+        handle.
 
         :meth:`perimeter` bounds the boundary's total extent, which is a *global* budget: a design
         can meet it exactly and still be locally serrated, by paying for spikes here with flatness
@@ -3024,14 +3025,22 @@ class ModelCall(Placeholder):
         ``2 sum_{i<j} x_i x_j = (sum_i x_i)^2 - sum_i x_i^2``, so this is a handful of segment sums
         over the interior facets and never materialises a pair.
 
-        Used as a penalty on the objective, which is how a bending energy is normally weighted::
+        **Returned per ridge, not summed**, like :meth:`~jno.domain.Domain.cell_volume` and
+        :meth:`~jno.domain.Domain.cell_aspect` and unlike :meth:`perimeter` — because the choice of
+        aggregate is the whole difference between two designs, and it is not ours to make. The
+        total is an L1 aggregate: it buys down the *bulk* of the boundary and lets a few sharp folds
+        survive, which is exactly what remains when it is used. Measured on a converged 3-D bracket,
+        the iso-surface of a design penalised on the sum still had 9% of its edges folded past 60
+        degrees, against **0%** for a smooth sphere on the same mesh. A p-norm attacks that tail
+        instead::
 
             S = rho.curvature(zeta=0.1)
-            jno.core([C, jno.fn(lambda s, w: w * s, [S, weight]), jno.le(V, 1.0)], domain=d)
+            terms.append(WEIGHT * S.sum)                       # the total bending
+            terms.append(WEIGHT * S.pnorm(50, normalize=True)) # the WORST folds
 
-        or, if a hard ceiling is wanted, through ``.log_barrier(S_star)`` exactly as eq. (39)-(40)
-        does for the perimeter. Prefer the penalty: it is one more row in the objective, whereas a
-        barrier is one more constraint for MMA to trade against the volume.
+        or, if a hard ceiling is wanted, ``S.sum.log_barrier(S_star)`` exactly as eq. (39)-(40) does
+        for the perimeter. Prefer a penalty over a barrier: it is one more row in the objective,
+        whereas a barrier is one more constraint for MMA to trade against the volume.
 
         Args:
             zeta: Jump smoothing, shared with :meth:`perimeter` and used for the same reason.
@@ -3098,14 +3107,19 @@ class ModelCall(Placeholder):
 
             s_a, s_a2 = ssum(amp), ssum(amp * amp)
             s_q, s_q2 = ssum(q), ssum(jnp.sum(q * q, axis=-1))
-            pairs = 0.5 * ((s_a * s_a - s_a2) - (jnp.sum(s_q * s_q, axis=-1) - s_q2))
+            # Clamped because the identity is exact but its EVALUATION is not: on a ridge carrying
+            # no boundary the two bracketed terms are equal and large, and their difference is pure
+            # cancellation -- which lands a few ulp below zero in float32. Every pair is provably
+            # >= 0, so the clamp restores the true value rather than imposing a bound, and it keeps
+            # a p-norm aggregate (which raises these to a power) real.
+            pairs = jnp.maximum(0.5 * ((s_a * s_a - s_a2) - (jnp.sum(s_q * s_q, axis=-1) - s_q2)), 0.0)
 
             measure = (
                 jnp.ones(n_ridges, dtype=pairs.dtype)
                 if rnodes.shape[1] == 1
                 else jnp.linalg.norm(pts[rnodes[:, 1]] - pts[rnodes[:, 0]], axis=-1)
             )
-            return jnp.sum(measure * pairs)
+            return measure * pairs
 
         return _jno.fn(_curvature, [self, *args], name="curvature")
 

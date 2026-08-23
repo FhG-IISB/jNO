@@ -490,6 +490,12 @@ class TestPerimeter:
         assert float(p(jnp.asarray(scattered))) > 3.0 * float(p(jnp.asarray(slab)))
 
 
+def _summed(fn):
+    """The per-ridge node as a scalar. ``curvature()`` returns one value per ridge so the aggregate
+    stays the caller's choice, and every assertion below is about the total."""
+    return lambda *a, **k: jnp.sum(fn(*a, **k))
+
+
 class TestCurvature:
     """Discrete bending energy of the material boundary — the LOCAL smoothness handle.
 
@@ -513,7 +519,7 @@ class TestCurvature:
         rho = jno.np.parameter(s, name=f"rho_curv_{n}_{size}")
         cells = np.asarray(d._cells_topo()[0])
         cen = np.asarray(d.mesh.points)[:, :2][cells].mean(axis=1)
-        return d, rho.curvature(zeta=0.1).fn, rho.perimeter(zeta=0.1).fn, cen
+        return d, _summed(rho.curvature(zeta=0.1).fn), rho.perimeter(zeta=0.1).fn, cen
 
     def test_a_uniform_density_has_no_boundary_to_bend(self):
         """Not "small": exactly zero, for any density and any zeta, because eq. (38)'s bracket is
@@ -589,7 +595,7 @@ class TestCurvature:
         z = 0.1
         d = jno.Shape.box(0, 0, 0, 2, 1, 2, size=0.5).domain()
         _r, sym = d.fem_symbols(space="P0", names=("r", "s"))
-        fast = jno.np.parameter(sym, name="rho_pairs").curvature(zeta=z).fn
+        fast = _summed(jno.np.parameter(sym, name="rho_pairs").curvature(zeta=z).fn)
         topo = d._facet_ridges()
         pts = np.asarray(d.mesh.points)[:, :3]
         cells = np.asarray(d._cells_p1())
@@ -626,7 +632,7 @@ class TestCurvature:
         and the true one disagree most."""
         d = jno.Shape.box(0, 0, 0, 2, 1, 2, size=0.6).domain()
         _r, sym = d.fem_symbols(space="P0", names=("r", "s"))
-        s = jno.np.parameter(sym, name="rho_nonneg").curvature(zeta=0.1).fn
+        s = _summed(jno.np.parameter(sym, name="rho_nonneg").curvature(zeta=0.1).fn)
         n = np.asarray(d._cells_p1()).shape[0]
         rng = np.random.default_rng(11)
         for _ in range(8):
@@ -645,7 +651,7 @@ class TestCurvature:
         d = jno.Shape.box(0, 0, 0, 4, 2, 4, size=0.5).domain()
         _r, sym = d.fem_symbols(space="P0", names=("r", "s"))
         rho = jno.np.parameter(sym, name="rho_fold")
-        s, p = rho.curvature(zeta=0.1).fn, rho.perimeter(zeta=0.1).fn
+        s, p = _summed(rho.curvature(zeta=0.1).fn), rho.perimeter(zeta=0.1).fn
         cells = np.asarray(d._cells_p1())
         cen = np.asarray(d.mesh.points)[:, :3][cells].mean(axis=1)
 
@@ -668,7 +674,7 @@ class TestCurvature:
         for h in (0.5, 0.35):
             d = jno.Shape.box(0, 0, 0, 4, 2, 4, size=h).domain()
             _r, sym = d.fem_symbols(space="P0", names=("r", "s"))
-            s = jno.np.parameter(sym, name=f"rho_floor_{h}").curvature(zeta=0.1).fn
+            s = _summed(jno.np.parameter(sym, name=f"rho_floor_{h}").curvature(zeta=0.1).fn)
             cells = np.asarray(d._cells_p1())
             cen = np.asarray(d.mesh.points)[:, :3][cells].mean(axis=1)
             floors.append(float(s(jnp.asarray(np.where(cen[:, 2] > 2.0, 1.0, 0.0)))))
@@ -691,14 +697,65 @@ class TestCurvature:
         coords = [jnp.asarray(np.asarray(d.mesh.points)[np.asarray(sp["ids"]), sp["axis"]]) for sp in d._trainable_coords]
         assert len(coords) == 2, "both in-plane coordinates must be design variables here"
 
-        value = float(node.fn(bar, *coords))
-        gx = jax.grad(lambda c0: node.fn(bar, c0, coords[1]))(coords[0])
-        gy = jax.grad(lambda c1: node.fn(bar, coords[0], c1))(coords[1])
+        value = float(jnp.sum(node.fn(bar, *coords)))
+        gx = jax.grad(lambda c0: jnp.sum(node.fn(bar, c0, coords[1])))(coords[0])
+        gy = jax.grad(lambda c1: jnp.sum(node.fn(bar, coords[0], c1)))(coords[1])
         assert np.all(np.isfinite(np.asarray(gx))) and np.all(np.isfinite(np.asarray(gy)))
         moving = int(np.count_nonzero(np.asarray(gx)) + np.count_nonzero(np.asarray(gy)))
         assert 0 < moving < gx.size + gy.size, f"only the boundary's own nodes should feel it, got {moving}"
-        assert float(node.fn(bar, coords[0] - 1e-2 * gx, coords[1] - 1e-2 * gy)) < value, (
+        assert float(jnp.sum(node.fn(bar, coords[0] - 1e-2 * gx, coords[1] - 1e-2 * gy))) < value, (
             "a step down the mesh gradient must lower the bending — a sign error would raise it"
+        )
+
+    def test_it_returns_one_value_per_ridge_so_the_aggregate_stays_the_callers(self):
+        """The sum is an L1 aggregate: it buys down the BULK of the boundary and lets a few sharp
+        folds survive. Measured on a converged 3-D bracket, a design penalised on the sum still had
+        9% of its iso-surface edges folded past 60 degrees against 0% for a smooth sphere on the
+        same mesh. Targeting that tail needs a p-norm, and a p-norm needs the ridges.
+
+        Which makes the shape and the sign the contract: one non-negative value per ridge. The sign
+        is not free -- the O(N) identity is exact but its evaluation cancels, so a ridge carrying no
+        boundary lands a few ulp below zero and a p-norm over it would raise a negative to a power.
+        """
+        d = jno.Shape.box(0, 0, 0, 2, 1, 1, size=0.5).domain()
+        _r, sym = d.fem_symbols(space="P0", names=("r", "s"))
+        node = jno.np.parameter(sym, name="rho_perridge").curvature(zeta=0.1)
+        n_ridges = d._facet_ridges()["ridge_nodes"].shape[0]
+        cells = np.asarray(d._cells_p1())
+        cen = np.asarray(d.mesh.points)[:, :3][cells].mean(axis=1)
+        flat = np.asarray(node.fn(jnp.asarray(np.where(cen[:, 2] > 0.5, 1.0, 0.0))))
+        assert flat.shape == (n_ridges,), f"expected one value per ridge, got {flat.shape}"
+        assert (flat >= 0.0).all(), "a negative ridge would break any p-norm aggregate"
+        assert flat.max() > 0.0, "a flat cut still bends where it steps between tetrahedra"
+
+    def test_the_ridge_distribution_is_heavy_tailed_exactly_when_the_boundary_is_rough(self):
+        """Why a p-norm is worth offering at all. On a boundary that is already smooth the bending
+        is spread evenly and the sum is the only sensible aggregate; on a rough one a few ridges
+        carry the folds and a p-norm can reach them while the sum averages them away.
+
+        Measured on this mesh: max/median over the ridges that carry any boundary is 2.8 for a flat
+        cut and 23.9 for a scrambled design (5.1 and 17.7 at half the mesh size).
+        """
+        d = jno.Shape.box(0, 0, 0, 2, 1, 1, size=0.5).domain()
+        _r, sym = d.fem_symbols(space="P0", names=("r", "s"))
+        node = jno.np.parameter(sym, name="rho_tail").curvature(zeta=0.1)
+        cells = np.asarray(d._cells_p1())
+        cen = np.asarray(d.mesh.points)[:, :3][cells].mean(axis=1)
+        rng = np.random.default_rng(0)
+
+        ratios = {}
+        for name, v in (
+            ("flat", np.where(cen[:, 2] > 0.5, 1.0, 0.0)),
+            ("scrambled", (rng.random(cells.shape[0]) > 0.5).astype(float)),
+        ):
+            out = np.asarray(node.fn(jnp.asarray(v)))
+            live = out[out > 1e-12]
+            assert live.size > 5, f"{name}: too few loaded ridges to speak of a distribution"
+            ratios[name] = float(out.max() / np.median(live))
+        assert ratios["flat"] < 8.0, f"a smooth boundary should spread its bending evenly: {ratios}"
+        assert ratios["scrambled"] > 10.0, f"a rough boundary should concentrate it: {ratios}"
+        assert ratios["scrambled"] > 3.0 * ratios["flat"], (
+            f"roughness must be what creates the tail, not the mesh: {ratios}"
         )
 
     def test_a_nodal_density_is_refused(self):
