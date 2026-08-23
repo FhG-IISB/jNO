@@ -8505,7 +8505,6 @@ def _assemble_multifield(
     the native assembler, which allocates each state's per-quadrature-point buffer and builds the
     readout — both indexed by cell, so the coupled case needs nothing extra here. The march is the
     *pseudo-time* path, so it is rejected below for a real (``u.t``) transient and for a complex form."""
-    from .trace import history_variables as _history_variables
     from .utils.solver.fem_utils import _infer_fields
     from .utils.solver.parametric_helpers import _contains_runtime_parameter
     from .utils.solver.weak_form import (
@@ -8520,14 +8519,6 @@ def _assemble_multifield(
     weak_bares = volume_terms + [e for exprs in boundary_terms.values() for e in exprs]
     is_transient = bool(ic_residuals) or any(_contains_temporal_derivative(b) for b in weak_bares)
     evolution = dict(evolution or {})
-    # Does this form carry step history? Scanned exactly as the assembler scans it — the weak terms plus
-    # every evolution formula, since a state can be read only inside its own update.
-    _carries_history = bool(_history_variables(weak_bares + [su.formula for su in evolution.values()]))
-    # Will this form assemble as a RESIDUAL operator rather than a matrix/rhs pair? Either trigger does
-    # it: a nonlinearity in the unknown, or step history. That is the question the runtime-parameter gate
-    # below actually needs answered — a residual operator re-evaluates at the runtime args and is
-    # entirely field-agnostic, while the coupled linear assembly has no parametric route.
-    _residual_path = _carries_history or any(_is_obviously_nonlinear_in_unknown(domain, b) for b in weak_bares)
 
     domain._fem_quad_degree = quad_degree
     domain._variational_initialized = True
@@ -8591,15 +8582,13 @@ def _assemble_multifield(
         getattr(domain, "dimension", None) in (2, 3)
         and all(str(f.get("space", "Lagrange")) == "Lagrange" for f in fields)
         and not _is_complex_form(domain, ir)
-        # A runtime parameter is excluded because the coupled *linear* assembly has no parametric route --
-        # not because the parameter itself is a problem. A form on the RESIDUAL path never takes that
-        # route: it assembles as a ``FemResidualOperator`` that re-evaluates at the runtime ``args`` each
-        # call, which is entirely field-agnostic (the coupled *transient* branch below already allows a
-        # parameter for exactly this reason). So gate on WHICH BRANCH the form will take. This is what
-        # makes a coupled load-path march — and a coupled nonlinear inverse problem, the shape a
-        # staggered solve identifies material parameters with — differentiable in a material parameter,
-        # as the single-field paths already were.
-        and (not any(_contains_runtime_parameter(b) for b in weak_bares) or _residual_path)
+        # A runtime parameter needs no gate here. Whichever branch the form takes, the assembler
+        # re-evaluates at the runtime ``args``: the RESIDUAL path through a ``FemResidualOperator``,
+        # and the LINEAR path through a ``FemLinearSystem`` whose ``operator_fn``/``rhs_fn`` close
+        # over ``_assemble_at(args)`` (fem_native). Both are built from the same residual/jacobian
+        # closures and are entirely field-agnostic, so the coupled case was never the obstacle --
+        # this gate was. It excluded a parametric coupled LINEAR form on the stated grounds that the
+        # coupled linear assembly had no parametric route; it has one, and had one.
     )
 
     # Coupled transient (multi-field + time): block M + block spatial operator A. Native handles
@@ -8621,8 +8610,8 @@ def _assemble_multifield(
         # *parametric* coupled transient -- e.g. trainable rate constants recovered through the
         # differentiable solve in an inverse problem -- assembles natively too. It needs the same
         # 2D/3D-Lagrange-real gate as the non-parametric case, just WITHOUT the runtime-parameter
-        # exclusion baked into ``_native_ok``. (A nodal FIELD parameter ``k(x)`` in a multi-field form
-        # is still rejected -- by ``assemble_fem_native`` itself, with a clear single-field-only error.)
+        # exclusion baked into ``_native_ok``. A nodal FIELD parameter ``k(x)`` interpolates on its own P1
+        # space whatever field's terms mention it.
         _native_transient_ok = (
             getattr(domain, "dimension", None) in (2, 3)
             and all(str(f.get("space", "Lagrange")) == "Lagrange" for f in fields)
@@ -8645,6 +8634,21 @@ def _assemble_multifield(
             f"(got dimension={getattr(domain, 'dimension', None)}, "
             f"spaces={sorted({str(f.get('space', 'Lagrange')) for f in fields})}, "
             f"complex={_is_complex_form(domain, ir)})."
+        )
+
+    # A runtime parameter in an ESSENTIAL VALUE on a coupled form. The native Dirichlet path looks the
+    # parameter's nodal array up with the CONSTRAINED field's node ids. In a single-field problem those
+    # index the same space, so it is correct there; in a coupled one the design field (say P1) and the
+    # constrained field (say P2 velocity) do not share a numbering, so the lookup either raises an
+    # IndexError from inside assembly or -- when the two node counts happen to coincide -- silently
+    # reads the wrong nodes and imposes a plausible wrong boundary value. Refuse by name instead.
+    if len(fields) > 1 and any(_contains_runtime_parameter(vnode) for *_rest, vnode in dirichlet_raw if vnode is not None):
+        raise NotImplementedError(
+            "jno.fem: a runtime/trainable parameter in an ESSENTIAL VALUE is not supported on a coupled "
+            "(multi-field) form -- the boundary lookup indexes the parameter's nodal array with the "
+            "constrained field's node ids, and the two fields do not share a numbering, so the imposed "
+            "value would be read from the wrong nodes. A parameter in the OPERATOR or the LOAD of a "
+            "coupled form is supported; recover a boundary parameter on a single-field form instead."
         )
 
     if _native_ok:
@@ -8671,14 +8675,6 @@ def _assemble_multifield(
     # through the ± block structure — coupled Helmholtz systems in their natural spelling. ----
     _cx_coupled = _is_complex_form(domain, ir)
     _par_coupled = any(_contains_runtime_parameter(b) for b in weak_bares)
-    _par_names = sorted(
-        {
-            str(getattr(n.model, "_parameter_name", None) or "a trainable network")
-            for b in weak_bares
-            for n in _walk(b)
-            if type(n).__name__ == "ModelCall"
-        }
-    )
     if evolution and _cx_coupled:
         raise NotImplementedError(
             "jno.fem: `state.evolves(...)` cannot combine with a complex coupled form — complex forms "
@@ -8703,17 +8699,27 @@ def _assemble_multifield(
         )
         return FEM(domain=domain, op=(op_r, op_i), classification=classification, mode="complex", offsets=offs)
 
-    # A coupled steady form `_native_ok` excluded -- a runtime parameter on the coupled LINEAR assembly,
-    # which has no parametric route. The native coupled assembler covers linear and nonlinear real forms
-    # (incl. complex=True), the linear complex split above, and a parametric form that carries step
-    # history (which assembles as a residual operator, not a matrix pair); reject the rest explicitly
-    # rather than mis-assemble.
+    # A coupled steady form the native assembler cannot take. It covers linear and nonlinear real forms
+    # (incl. complex=True), the linear complex split above, forms carrying step history, and -- since
+    # the gate above stopped excluding them -- parametric forms on either the residual or the
+    # parametric-linear route. Reject the rest explicitly rather than mis-assemble.
+    #
+    # The reason is read off `_native_ok`'s own conditions rather than asserted. The previous message
+    # blamed a missing parametric route on the coupled linear assembly; that route existed the whole
+    # time, so the message sent people to work around a limitation they did not have.
+    _why = []
+    if getattr(domain, "dimension", None) not in (2, 3):
+        _why.append(f"the domain is {getattr(domain, 'dimension', None)}-D (native covers 2-D and 3-D)")
+    _spaces = sorted({str(f.get("space", "Lagrange")) for f in fields} - {"Lagrange"})
+    if _spaces:
+        _why.append(f"a coupled form on non-Lagrange space(s): {', '.join(_spaces)}")
+    if _is_complex_form(domain, ir):
+        _why.append("a complex form that the real-equivalent split above did not take")
     raise NotImplementedError(
-        "jno.fem: this coupled (multi-field) steady form is not supported natively -- it has a runtime "
-        f"parameter ({', '.join(_par_names) or 'unnamed'}) and is linear with no step history, so it would take the coupled "
-        "linear assembly, which has no parametric route. Recover the parameter on a single-field "
-        "reduced form, on a coupled NONLINEAR form or a load-path march (`domain(tau=...)` + `.i(k)`) "
-        "-- both assemble as a residual operator -- or through a coupled first-order transient."
+        "jno.fem: this coupled (multi-field) steady form is not supported natively -- "
+        + ("; ".join(_why) if _why else "the native assembler declined it")
+        + ". Recover the parameter on a single-field reduced form, on a coupled NONLINEAR form or a "
+        "load-path march (`domain(tau=...)` + `.i(k)`), or through a coupled first-order transient."
     )
 
 
@@ -8926,14 +8932,16 @@ def _assemble_second_order_time(
             "recover the parameter through the operator or load instead."
         )
     if multifield and has_param:
-        # The parametric branch re-forms M₂/C/K per step through the STEADY assembly of each group,
-        # and the parametric coupled steady assembly does not exist — letting it run would surface a
-        # confusing "coupled steady form" error from inside a u_tt build.
+        # The parametric branch re-forms M₂/C/K per step through the STEADY assembly of each group.
+        # That assembly IS parametric now — a coupled linear form takes the FemLinearSystem route — but
+        # the u_tt block does not thread the runtime args through its per-step re-forming, so the
+        # parameter would freeze at its initial value without saying so. Refuse until that is wired.
         raise NotImplementedError(
             "jno.fem: runtime/trainable parameters on a COUPLED second-order-in-time form are not "
-            "supported yet — the parametric coupled steady assembly underneath is not wired. A "
-            "single-field parametric u_tt works, and a coupled FIRST-order parametric transient works "
-            "(write each second-order field with an explicit velocity field)."
+            "supported yet — the u_tt block re-forms M₂/C/K per step without threading the runtime "
+            "args, so the parameter would silently freeze at its initial value. A single-field "
+            "parametric u_tt works, and a coupled FIRST-order parametric transient works (write each "
+            "second-order field with an explicit velocity field)."
         )
 
     # Wave / elastodynamics frequencies of soft modes are not resolvable in float32 (silent error).
