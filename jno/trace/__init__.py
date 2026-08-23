@@ -603,6 +603,236 @@ class Placeholder:
     def mae(self) -> FunctionCall:
         return FunctionCall(lambda x: jnp.squeeze(jnp.mean(jnp.abs(x))), [self], "mae", True)
 
+    def patch(self) -> "FunctionCall":
+        """Physical density from the design density — the patch filter, eq. (17)-(19), as a node.
+
+        Sugar for ``jno.fn(domain.patch_filter(), [self])``; see
+        :meth:`~jno.domain.Domain.patch_filter` for what the filter does and why the **physics**
+        route is ``rho.constrain(d.patch_filter())`` rather than this node. Use this one for the
+        constraints, the reporting and ``crux.eval`` — anywhere outside the weak form.
+
+        Returns:
+            A ``(n_cells,)`` node, differentiable in the design density.
+        """
+        dom = _cell_density_domain(self, "patch")
+        import jno as _jno
+
+        return _as_cell_density(_jno.fn(dom.patch_filter(), [self], name="patch"), dom)
+
+    def perimeter(self, zeta: float = 0.1) -> "FunctionCall":
+        """Smoothed structural perimeter of a P0 density — eq. (38), as a scalar node.
+
+        Jung, Yun & Kim, *Computers & Structures* **331** (2026) 108403, Sec. 3.5, after Haber,
+        Jog & Bendsoe, *Struct. Optim.* **11**, 1996, 1-12:
+
+            P = sum_k  l_k * ( sqrt( (1 + 2 zeta) <rho>_k^2 + zeta^2 ) - zeta )
+
+        over the **interior facets**, with ``<rho>_k`` the density jump across facet ``k`` and
+        ``l_k`` its measure. The bracket is a smoothed ``|<rho>|``: it is exactly 0 for no jump and
+        exactly 1 for a full one, so ``P`` measures the total extent of the material boundary while
+        staying differentiable where a bare absolute value would not be.
+
+        **In 3-D this is an AREA.** The facets are triangles rather than edges and ``l_k`` is their
+        area, so ``P`` has units of length squared and a target ``P*`` has to be given in them; the
+        formula, the smoothing and the barrier are otherwise unchanged.
+
+        This is the **feature-scale** lever, and the one constraint here that is about
+        manufacturability rather than mesh validity. A design fragmented into many thin members has
+        a large perimeter for the same volume; bounding it forces fewer, thicker members. Used as a
+        logarithmic barrier against a target ``P*`` (eq. 39-40)::
+
+            P = rho.perimeter(zeta=0.1)
+            penalty = jno.fn(lambda p: -P_star * jnp.log(P_star - p), [P], name="R")
+            jno.core([C, beta * penalty, jno.le(...)], domain=d)
+
+        The barrier diverges as ``P`` approaches ``P*`` from below, so the design can never cross
+        it; ``beta`` is decayed geometrically (eq. 41) to tighten it as the run proceeds.
+
+        Evaluated on whatever this parameter currently *is* — under
+        ``rho.constrain(d.patch_filter())`` that is the physical density, which is the field whose
+        boundary one actually wants to measure. Differentiable in the density **and** in the mesh,
+        since the facet measures come from the moving vertices.
+
+        Args:
+            zeta: Smoothing parameter; the paper uses 0.1. Smaller is a sharper approximation to
+                ``|<rho>|`` and a worse-conditioned one.
+        """
+        dom = _cell_density_domain(self, "perimeter")
+        import jno as _jno
+
+        facets = dom._interior_facets()
+        ecells = jnp.asarray(facets["cells"], dtype=jnp.int32)
+        enodes = jnp.asarray(facets["nodes"], dtype=jnp.int32)
+        args, rebuild = dom._moving_points()
+        z = float(zeta)
+        n_fn = int(enodes.shape[1])  # 2 = edge (2-D), 3 = triangle (3-D)
+
+        def _perimeter(rv, *coord_vals):
+            r = jnp.asarray(rv).reshape(-1)
+            pts = rebuild(*coord_vals)
+            # The facet's MEASURE: a length across an edge in 2-D, a triangle's area in 3-D. Both
+            # are read off the moving coordinates, so P stays differentiable in the mesh as well as
+            # in the density.
+            if n_fn == 2:
+                measure = jnp.linalg.norm(pts[enodes[:, 0]] - pts[enodes[:, 1]], axis=-1)
+            else:
+                e1 = pts[enodes[:, 1]] - pts[enodes[:, 0]]
+                e2 = pts[enodes[:, 2]] - pts[enodes[:, 0]]
+                measure = 0.5 * jnp.linalg.norm(jnp.cross(e1, e2), axis=-1)
+            jump = r[ecells[:, 0]] - r[ecells[:, 1]]
+            smooth = jnp.sqrt((1.0 + 2.0 * z) * jump**2 + z * z) - z
+            return jnp.sum(measure * smooth)
+
+        return _jno.fn(_perimeter, [self, *args], name="perimeter")
+
+    def curvature(self, zeta: float = 0.1) -> "FunctionCall":
+        """Discrete bending energy of the material boundary, **per ridge** — the local smoothness
+        handle.
+
+        :meth:`perimeter` bounds the boundary's total extent, which is a *global* budget: a design
+        can meet it exactly and still be locally serrated, by paying for spikes here with flatness
+        elsewhere. Measured on a converged 3-D bracket, the angle between adjacent surface facets
+        had a median of 33.8 degrees and a 99th percentile of 88.9 with the perimeter barrier
+        active and satisfied. Nothing in eq. (38) sees that, because nothing in it compares one
+        piece of boundary with the next. This does::
+
+            S = sum_r  w_r  sum_{i<j}  a_i a_j ( 1 - v_i . v_j )
+
+        The outer sum runs over the **ridges** — a mesh vertex in 2-D, a mesh edge in 3-D — and the
+        inner over pairs of interior facets meeting there (:meth:`~jno.domain.Domain._facet_ridges`),
+        with ``w_r`` the ridge's measure (1 for a point, its length for an edge). For a facet with
+        density jump ``D`` and unit normal ``n``,
+
+            a = sqrt( (1 + 2z) D^2 + z^2 ) - z          how much boundary the facet carries
+            v = n D sqrt(1 + z^2) / sqrt( D^2 + z^2 )   which way it faces, |v| <= 1
+
+        ``a`` is eq. (38)'s own bracket, reused unchanged. In the sharp limit on a black-and-white
+        design each term is ``|D_i| |D_j| (1 - cos t_ij)`` for ``t_ij`` the angle between the two
+        facets: **zero unless both facets carry boundary, and then growing with the angle between
+        them.** That is the discrete bending energy of a triangle mesh (Grinspun, Hirani, Desbrun &
+        Schroeder, *Discrete Shells*, SCA 2003, Sec. 3) — the discrete counterpart of the Willmore
+        energy ``int H^2`` (Willmore, *An. Sti. Univ. Iasi* **11B**, 1965, 493-496) — with the
+        density jump selecting which facets are boundary at all. Four properties make it usable as
+        written rather than as a hand-tuned surrogate:
+
+        * **Orientation-free.** ``n``'s sign depends on which of the two cells is listed first;
+          ``D``'s does too, so ``v`` does not. No consistent global orientation of the boundary is
+          needed, which is what would otherwise fail the moment the design is not yet a clean
+          two-sided surface.
+        * **Non-negative**, since ``|v_i . v_j| <= 1``. A bending energy that can pay for a fold
+          here with a flat patch there would be worse than none.
+        * **Exactly zero on a flat boundary, and on no boundary at all.** ``a`` vanishes exactly at
+          ``D = 0`` and ``v`` reaches unit length exactly at ``|D| = 1``, so a coplanar full-jump
+          pair costs 0 and a pair involving a facet in the bulk costs 0 — for any ``z``, with no
+          floor to subtract off. Both matter: without the first this measures a perimeter rather
+          than a curvature, and without the second it charges every boundary facet for its
+          interior neighbours, which is the same thing again.
+        * **Differentiable in the density and in the mesh**, since the normals and the ridge
+          measures are read off the moving vertices. Under a deformable mesh this is the term that
+          gives node migration a reason to *align* the boundary rather than merely shorten it.
+
+        **A geometrically flat interface still costs something on an unstructured mesh**, because
+        its facets zig-zag between tetrahedra rather than lying in the plane they approximate —
+        the same reason the perimeter of a straight bar measures above its length. The floor is a
+        property of the mesh, not of the design, and it is what node migration can work off.
+
+        A ridge in 3-D is shared by a fan of faces, not by two, and every pair in the fan is
+        summed. The cost is not: the double sum collapses to an ``O(N)`` scatter through
+        ``2 sum_{i<j} x_i x_j = (sum_i x_i)^2 - sum_i x_i^2``, so this is a handful of segment sums
+        over the interior facets and never materialises a pair.
+
+        **Returned per ridge, not summed**, like :meth:`~jno.domain.Domain.cell_volume` and
+        :meth:`~jno.domain.Domain.cell_aspect` and unlike :meth:`perimeter` — because the choice of
+        aggregate is the whole difference between two designs, and it is not ours to make. The
+        total is an L1 aggregate: it buys down the *bulk* of the boundary and lets a few sharp folds
+        survive, which is exactly what remains when it is used. Measured on a converged 3-D bracket,
+        the iso-surface of a design penalised on the sum still had 9% of its edges folded past 60
+        degrees, against **0%** for a smooth sphere on the same mesh. A p-norm attacks that tail
+        instead::
+
+            S = rho.curvature(zeta=0.1)
+            terms.append(WEIGHT * S.sum)                       # the total bending
+            terms.append(WEIGHT * S.pnorm(50, normalize=True)) # the WORST folds
+
+        or, if a hard ceiling is wanted, ``S.sum.log_barrier(S_star)`` exactly as eq. (39)-(40) does
+        for the perimeter. Prefer a penalty over a barrier: it is one more row in the objective,
+        whereas a barrier is one more constraint for MMA to trade against the volume.
+
+        Args:
+            zeta: Jump smoothing, shared with :meth:`perimeter` and used for the same reason.
+                Smaller is a sharper approximation to ``|D|`` and a worse-conditioned one.
+        """
+        dom = _cell_density_domain(self, "curvature")
+        import jno as _jno
+
+        topo = dom._facet_ridges()
+        ecells = jnp.asarray(topo["cells"], dtype=jnp.int32)  # (F, 2)
+        enodes = jnp.asarray(topo["nodes"], dtype=jnp.int32)  # (F, 2 or 3)
+        fridge = jnp.asarray(topo["facet_ridge"], dtype=jnp.int32)  # (F, 2 or 3)
+        rnodes = jnp.asarray(topo["ridge_nodes"], dtype=jnp.int32)  # (R, 1 or 2)
+        cells = jnp.asarray(dom._cells_topo()[0], dtype=jnp.int32)
+        args, rebuild = dom._moving_points()
+        z = float(zeta)
+        n_fn, n_ridges, n_local = int(enodes.shape[1]), int(rnodes.shape[0]), int(fridge.shape[1])
+        seg = fridge.reshape(-1)
+
+        def _curvature(rv, *coord_vals):
+            r = jnp.asarray(rv).reshape(-1)
+            pts = rebuild(*coord_vals)
+
+            # The facet's unit normal: perpendicular to its edge in 2-D, to its plane in 3-D.
+            if n_fn == 2:
+                e = pts[enodes[:, 1]] - pts[enodes[:, 0]]
+                raw = jnp.stack([-e[:, 1], e[:, 0]], axis=-1)
+            else:
+                e1 = pts[enodes[:, 1]] - pts[enodes[:, 0]]
+                e2 = pts[enodes[:, 2]] - pts[enodes[:, 0]]
+                raw = jnp.cross(e1, e2)
+            nhat = raw / (jnp.linalg.norm(raw, axis=-1, keepdims=True) + 1e-30)
+
+            # Point it from the first cell to the second, so that `g = jump * nhat` is the same
+            # vector whichever way the pair happens to be listed. The flip is where an element
+            # would have to inverted, which eq. (26)-(28)'s volume bounds exist to prevent.
+            cen = jnp.mean(pts[cells], axis=1)
+            away = cen[ecells[:, 1]] - cen[ecells[:, 0]]
+            side = jnp.where(jnp.sum(nhat * away, axis=-1) >= 0.0, 1.0, -1.0)
+            nhat = nhat * side[:, None]
+
+            jump = r[ecells[:, 0]] - r[ecells[:, 1]]  # (F,)
+            # How much boundary this facet carries: eq. (38)'s own bracket, exactly 0 at no jump
+            # and exactly 1 at a full one -- so a facet in the interior of the material, or in the
+            # interior of the void, contributes nothing to any pair it takes part in.
+            amp = jnp.sqrt((1.0 + 2.0 * z) * jump * jump + z * z) - z  # (F,)
+            # Which way it faces, as a vector of length <= 1 that reaches 1 exactly at a full jump.
+            # Carrying the jump's SIGN is what makes the pair term orientation-free.
+            unit = jump * jnp.sqrt(1.0 + z * z) / jnp.sqrt(jump * jump + z * z)  # (F,) in [-1, 1]
+            q = (amp * unit)[:, None] * nhat  # (F, dim)
+
+            # Every facet is counted once per ridge it borders; the pair sums then come from the
+            # totals alone, never from an (i, j) list.
+            def ssum(v):
+                tail = v.shape[1:]  # () for a scalar per facet, (dim,) for a vector
+                wide = jnp.broadcast_to(v[:, None], (v.shape[0], n_local, *tail))
+                return jax.ops.segment_sum(wide.reshape(-1, *tail), seg, num_segments=n_ridges)
+
+            s_a, s_a2 = ssum(amp), ssum(amp * amp)
+            s_q, s_q2 = ssum(q), ssum(jnp.sum(q * q, axis=-1))
+            # Clamped because the identity is exact but its EVALUATION is not: on a ridge carrying
+            # no boundary the two bracketed terms are equal and large, and their difference is pure
+            # cancellation -- which lands a few ulp below zero in float32. Every pair is provably
+            # >= 0, so the clamp restores the true value rather than imposing a bound, and it keeps
+            # a p-norm aggregate (which raises these to a power) real.
+            pairs = jnp.maximum(0.5 * ((s_a * s_a - s_a2) - (jnp.sum(s_q * s_q, axis=-1) - s_q2)), 0.0)
+
+            measure = (
+                jnp.ones(n_ridges, dtype=pairs.dtype)
+                if rnodes.shape[1] == 1
+                else jnp.linalg.norm(pts[rnodes[:, 1]] - pts[rnodes[:, 0]], axis=-1)
+            )
+            return measure * pairs
+
+        return _jno.fn(_curvature, [self, *args], name="curvature")
+
     def project(self, beta, eta: float = 0.5) -> "FunctionCall":
         """Smoothed-Heaviside projection — Wang, Lazarov & Sigmund eq. (1), as a node.
 
@@ -657,7 +887,11 @@ class Placeholder:
                 "threshold the projection pushes away from, and the map is only monotone onto "
                 "[0, 1] for an interior threshold."
             )
-        return _jno.fn(lambda r, b: _heaviside_project(r, b, float(eta)), [self, beta], name="project")
+        out = _jno.fn(lambda r, b: _heaviside_project(r, b, float(eta)), [self, beta], name="project")
+        # Pointwise, so no domain is REQUIRED -- but a projected density is still a density, and
+        # `rho.patch().project(b).perimeter()` has to keep working.
+        dom = getattr(self, "_fem_field_domain", None) or getattr(getattr(self, "model", None), "_fem_field_domain", None)
+        return _as_cell_density(out, dom) if dom is not None else out
 
     def pnorm(self, p: float = 50.0, *, normalize: bool = False) -> FunctionCall:
         """``(Σ xᵢ^p)^(1/p)`` — a smooth, differentiable stand-in for the maximum.
@@ -2886,6 +3120,35 @@ class Model(Placeholder):
         )
 
 
+def _cell_density_domain(node, method: str):
+    """The domain a P0 density node belongs to, or a refusal naming what was wrong.
+
+    Reads the provenance from the node itself first and from its model second, so a node BUILT from
+    a density carries the same answer the density does. Without that, `rho.patch()` returns a
+    `FunctionCall` and every non-local method downstream of it -- perimeter, curvature -- refuses a
+    field that is perfectly well defined, and the caller is pushed back into writing the composition
+    by hand.
+
+    One helper rather than the three copies of this guard that existed, so the wording and the
+    lookup cannot drift apart.
+    """
+    dom = getattr(node, "_fem_field_domain", None) or getattr(getattr(node, "model", None), "_fem_field_domain", None)
+    kind = getattr(node, "_fem_field", None) or getattr(getattr(node, "model", None), "_fem_field", None)
+    if kind != "cell" or dom is None:
+        raise TypeError(
+            f"ModelCall.{method}(): needs a P0 (per-element) density -- "
+            '`jno.np.parameter(<symbol>)` on a symbol made with `space="P0"`, or a node built from '
+            "one. A nodal field is continuous and has no element to be the reference."
+        )
+    return dom
+
+
+def _as_cell_density(out, dom):
+    """Stamp cell-field provenance onto a derived node, so the chain keeps working."""
+    out._fem_field, out._fem_field_domain = "cell", dom
+    return out
+
+
 def _heaviside_project(rho, beta, eta: float = 0.5):
     """The smoothed-Heaviside map itself, on plain arrays.
 
@@ -2956,255 +3219,6 @@ class ModelCall(Placeholder):
         return self.scalar.partials(**named_vars)
 
     bind = partials
-
-    def patch(self) -> "FunctionCall":
-        """Physical density from the design density — the patch filter, eq. (17)-(19), as a node.
-
-        Sugar for ``jno.fn(domain.patch_filter(), [self])``; see
-        :meth:`~jno.domain.Domain.patch_filter` for what the filter does and why the **physics**
-        route is ``rho.constrain(d.patch_filter())`` rather than this node. Use this one for the
-        constraints, the reporting and ``crux.eval`` — anywhere outside the weak form.
-
-        Returns:
-            A ``(n_cells,)`` node, differentiable in the design density.
-        """
-        dom = getattr(self.model, "_fem_field_domain", None)
-        if getattr(self.model, "_fem_field", None) != "cell" or dom is None:
-            raise TypeError(
-                "ModelCall.patch(): the patch filter needs a P0 (per-element) design density -- "
-                '`jno.np.parameter(<symbol>)` on a symbol made with `space="P0"`. It maps one '
-                "value per element to one physical value per element; a nodal field has no "
-                "element to be the patch's reference."
-            )
-        import jno as _jno
-
-        return _jno.fn(dom.patch_filter(), [self], name="patch")
-
-    def perimeter(self, zeta: float = 0.1) -> "FunctionCall":
-        """Smoothed structural perimeter of a P0 density — eq. (38), as a scalar node.
-
-        Jung, Yun & Kim, *Computers & Structures* **331** (2026) 108403, Sec. 3.5, after Haber,
-        Jog & Bendsoe, *Struct. Optim.* **11**, 1996, 1-12:
-
-            P = sum_k  l_k * ( sqrt( (1 + 2 zeta) <rho>_k^2 + zeta^2 ) - zeta )
-
-        over the **interior facets**, with ``<rho>_k`` the density jump across facet ``k`` and
-        ``l_k`` its measure. The bracket is a smoothed ``|<rho>|``: it is exactly 0 for no jump and
-        exactly 1 for a full one, so ``P`` measures the total extent of the material boundary while
-        staying differentiable where a bare absolute value would not be.
-
-        **In 3-D this is an AREA.** The facets are triangles rather than edges and ``l_k`` is their
-        area, so ``P`` has units of length squared and a target ``P*`` has to be given in them; the
-        formula, the smoothing and the barrier are otherwise unchanged.
-
-        This is the **feature-scale** lever, and the one constraint here that is about
-        manufacturability rather than mesh validity. A design fragmented into many thin members has
-        a large perimeter for the same volume; bounding it forces fewer, thicker members. Used as a
-        logarithmic barrier against a target ``P*`` (eq. 39-40)::
-
-            P = rho.perimeter(zeta=0.1)
-            penalty = jno.fn(lambda p: -P_star * jnp.log(P_star - p), [P], name="R")
-            jno.core([C, beta * penalty, jno.le(...)], domain=d)
-
-        The barrier diverges as ``P`` approaches ``P*`` from below, so the design can never cross
-        it; ``beta`` is decayed geometrically (eq. 41) to tighten it as the run proceeds.
-
-        Evaluated on whatever this parameter currently *is* — under
-        ``rho.constrain(d.patch_filter())`` that is the physical density, which is the field whose
-        boundary one actually wants to measure. Differentiable in the density **and** in the mesh,
-        since the facet measures come from the moving vertices.
-
-        Args:
-            zeta: Smoothing parameter; the paper uses 0.1. Smaller is a sharper approximation to
-                ``|<rho>|`` and a worse-conditioned one.
-        """
-        dom = getattr(self.model, "_fem_field_domain", None)
-        if getattr(self.model, "_fem_field", None) != "cell" or dom is None:
-            raise TypeError(
-                "ModelCall.perimeter(): needs a P0 (per-element) density -- the jump is taken "
-                "ACROSS an edge, between the two elements meeting there, so a nodal field (which "
-                "is continuous and jumps nowhere) has no perimeter to measure."
-            )
-        import jno as _jno
-
-        facets = dom._interior_facets()
-        ecells = jnp.asarray(facets["cells"], dtype=jnp.int32)
-        enodes = jnp.asarray(facets["nodes"], dtype=jnp.int32)
-        args, rebuild = dom._moving_points()
-        z = float(zeta)
-        n_fn = int(enodes.shape[1])  # 2 = edge (2-D), 3 = triangle (3-D)
-
-        def _perimeter(rv, *coord_vals):
-            r = jnp.asarray(rv).reshape(-1)
-            pts = rebuild(*coord_vals)
-            # The facet's MEASURE: a length across an edge in 2-D, a triangle's area in 3-D. Both
-            # are read off the moving coordinates, so P stays differentiable in the mesh as well as
-            # in the density.
-            if n_fn == 2:
-                measure = jnp.linalg.norm(pts[enodes[:, 0]] - pts[enodes[:, 1]], axis=-1)
-            else:
-                e1 = pts[enodes[:, 1]] - pts[enodes[:, 0]]
-                e2 = pts[enodes[:, 2]] - pts[enodes[:, 0]]
-                measure = 0.5 * jnp.linalg.norm(jnp.cross(e1, e2), axis=-1)
-            jump = r[ecells[:, 0]] - r[ecells[:, 1]]
-            smooth = jnp.sqrt((1.0 + 2.0 * z) * jump**2 + z * z) - z
-            return jnp.sum(measure * smooth)
-
-        return _jno.fn(_perimeter, [self, *args], name="perimeter")
-
-    def curvature(self, zeta: float = 0.1) -> "FunctionCall":
-        """Discrete bending energy of the material boundary, **per ridge** — the local smoothness
-        handle.
-
-        :meth:`perimeter` bounds the boundary's total extent, which is a *global* budget: a design
-        can meet it exactly and still be locally serrated, by paying for spikes here with flatness
-        elsewhere. Measured on a converged 3-D bracket, the angle between adjacent surface facets
-        had a median of 33.8 degrees and a 99th percentile of 88.9 with the perimeter barrier
-        active and satisfied. Nothing in eq. (38) sees that, because nothing in it compares one
-        piece of boundary with the next. This does::
-
-            S = sum_r  w_r  sum_{i<j}  a_i a_j ( 1 - v_i . v_j )
-
-        The outer sum runs over the **ridges** — a mesh vertex in 2-D, a mesh edge in 3-D — and the
-        inner over pairs of interior facets meeting there (:meth:`~jno.domain.Domain._facet_ridges`),
-        with ``w_r`` the ridge's measure (1 for a point, its length for an edge). For a facet with
-        density jump ``D`` and unit normal ``n``,
-
-            a = sqrt( (1 + 2z) D^2 + z^2 ) - z          how much boundary the facet carries
-            v = n D sqrt(1 + z^2) / sqrt( D^2 + z^2 )   which way it faces, |v| <= 1
-
-        ``a`` is eq. (38)'s own bracket, reused unchanged. In the sharp limit on a black-and-white
-        design each term is ``|D_i| |D_j| (1 - cos t_ij)`` for ``t_ij`` the angle between the two
-        facets: **zero unless both facets carry boundary, and then growing with the angle between
-        them.** That is the discrete bending energy of a triangle mesh (Grinspun, Hirani, Desbrun &
-        Schroeder, *Discrete Shells*, SCA 2003, Sec. 3) — the discrete counterpart of the Willmore
-        energy ``int H^2`` (Willmore, *An. Sti. Univ. Iasi* **11B**, 1965, 493-496) — with the
-        density jump selecting which facets are boundary at all. Four properties make it usable as
-        written rather than as a hand-tuned surrogate:
-
-        * **Orientation-free.** ``n``'s sign depends on which of the two cells is listed first;
-          ``D``'s does too, so ``v`` does not. No consistent global orientation of the boundary is
-          needed, which is what would otherwise fail the moment the design is not yet a clean
-          two-sided surface.
-        * **Non-negative**, since ``|v_i . v_j| <= 1``. A bending energy that can pay for a fold
-          here with a flat patch there would be worse than none.
-        * **Exactly zero on a flat boundary, and on no boundary at all.** ``a`` vanishes exactly at
-          ``D = 0`` and ``v`` reaches unit length exactly at ``|D| = 1``, so a coplanar full-jump
-          pair costs 0 and a pair involving a facet in the bulk costs 0 — for any ``z``, with no
-          floor to subtract off. Both matter: without the first this measures a perimeter rather
-          than a curvature, and without the second it charges every boundary facet for its
-          interior neighbours, which is the same thing again.
-        * **Differentiable in the density and in the mesh**, since the normals and the ridge
-          measures are read off the moving vertices. Under a deformable mesh this is the term that
-          gives node migration a reason to *align* the boundary rather than merely shorten it.
-
-        **A geometrically flat interface still costs something on an unstructured mesh**, because
-        its facets zig-zag between tetrahedra rather than lying in the plane they approximate —
-        the same reason the perimeter of a straight bar measures above its length. The floor is a
-        property of the mesh, not of the design, and it is what node migration can work off.
-
-        A ridge in 3-D is shared by a fan of faces, not by two, and every pair in the fan is
-        summed. The cost is not: the double sum collapses to an ``O(N)`` scatter through
-        ``2 sum_{i<j} x_i x_j = (sum_i x_i)^2 - sum_i x_i^2``, so this is a handful of segment sums
-        over the interior facets and never materialises a pair.
-
-        **Returned per ridge, not summed**, like :meth:`~jno.domain.Domain.cell_volume` and
-        :meth:`~jno.domain.Domain.cell_aspect` and unlike :meth:`perimeter` — because the choice of
-        aggregate is the whole difference between two designs, and it is not ours to make. The
-        total is an L1 aggregate: it buys down the *bulk* of the boundary and lets a few sharp folds
-        survive, which is exactly what remains when it is used. Measured on a converged 3-D bracket,
-        the iso-surface of a design penalised on the sum still had 9% of its edges folded past 60
-        degrees, against **0%** for a smooth sphere on the same mesh. A p-norm attacks that tail
-        instead::
-
-            S = rho.curvature(zeta=0.1)
-            terms.append(WEIGHT * S.sum)                       # the total bending
-            terms.append(WEIGHT * S.pnorm(50, normalize=True)) # the WORST folds
-
-        or, if a hard ceiling is wanted, ``S.sum.log_barrier(S_star)`` exactly as eq. (39)-(40) does
-        for the perimeter. Prefer a penalty over a barrier: it is one more row in the objective,
-        whereas a barrier is one more constraint for MMA to trade against the volume.
-
-        Args:
-            zeta: Jump smoothing, shared with :meth:`perimeter` and used for the same reason.
-                Smaller is a sharper approximation to ``|D|`` and a worse-conditioned one.
-        """
-        dom = getattr(self.model, "_fem_field_domain", None)
-        if getattr(self.model, "_fem_field", None) != "cell" or dom is None:
-            raise TypeError(
-                "ModelCall.curvature(): needs a P0 (per-element) density -- the boundary it bends "
-                "is the interface BETWEEN two elements, located by the jump across it, so a nodal "
-                "field (which is continuous and jumps nowhere) has no boundary to measure."
-            )
-        import jno as _jno
-
-        topo = dom._facet_ridges()
-        ecells = jnp.asarray(topo["cells"], dtype=jnp.int32)  # (F, 2)
-        enodes = jnp.asarray(topo["nodes"], dtype=jnp.int32)  # (F, 2 or 3)
-        fridge = jnp.asarray(topo["facet_ridge"], dtype=jnp.int32)  # (F, 2 or 3)
-        rnodes = jnp.asarray(topo["ridge_nodes"], dtype=jnp.int32)  # (R, 1 or 2)
-        cells = jnp.asarray(dom._cells_topo()[0], dtype=jnp.int32)
-        args, rebuild = dom._moving_points()
-        z = float(zeta)
-        n_fn, n_ridges, n_local = int(enodes.shape[1]), int(rnodes.shape[0]), int(fridge.shape[1])
-        seg = fridge.reshape(-1)
-
-        def _curvature(rv, *coord_vals):
-            r = jnp.asarray(rv).reshape(-1)
-            pts = rebuild(*coord_vals)
-
-            # The facet's unit normal: perpendicular to its edge in 2-D, to its plane in 3-D.
-            if n_fn == 2:
-                e = pts[enodes[:, 1]] - pts[enodes[:, 0]]
-                raw = jnp.stack([-e[:, 1], e[:, 0]], axis=-1)
-            else:
-                e1 = pts[enodes[:, 1]] - pts[enodes[:, 0]]
-                e2 = pts[enodes[:, 2]] - pts[enodes[:, 0]]
-                raw = jnp.cross(e1, e2)
-            nhat = raw / (jnp.linalg.norm(raw, axis=-1, keepdims=True) + 1e-30)
-
-            # Point it from the first cell to the second, so that `g = jump * nhat` is the same
-            # vector whichever way the pair happens to be listed. The flip is where an element
-            # would have to inverted, which eq. (26)-(28)'s volume bounds exist to prevent.
-            cen = jnp.mean(pts[cells], axis=1)
-            away = cen[ecells[:, 1]] - cen[ecells[:, 0]]
-            side = jnp.where(jnp.sum(nhat * away, axis=-1) >= 0.0, 1.0, -1.0)
-            nhat = nhat * side[:, None]
-
-            jump = r[ecells[:, 0]] - r[ecells[:, 1]]  # (F,)
-            # How much boundary this facet carries: eq. (38)'s own bracket, exactly 0 at no jump
-            # and exactly 1 at a full one -- so a facet in the interior of the material, or in the
-            # interior of the void, contributes nothing to any pair it takes part in.
-            amp = jnp.sqrt((1.0 + 2.0 * z) * jump * jump + z * z) - z  # (F,)
-            # Which way it faces, as a vector of length <= 1 that reaches 1 exactly at a full jump.
-            # Carrying the jump's SIGN is what makes the pair term orientation-free.
-            unit = jump * jnp.sqrt(1.0 + z * z) / jnp.sqrt(jump * jump + z * z)  # (F,) in [-1, 1]
-            q = (amp * unit)[:, None] * nhat  # (F, dim)
-
-            # Every facet is counted once per ridge it borders; the pair sums then come from the
-            # totals alone, never from an (i, j) list.
-            def ssum(v):
-                tail = v.shape[1:]  # () for a scalar per facet, (dim,) for a vector
-                wide = jnp.broadcast_to(v[:, None], (v.shape[0], n_local, *tail))
-                return jax.ops.segment_sum(wide.reshape(-1, *tail), seg, num_segments=n_ridges)
-
-            s_a, s_a2 = ssum(amp), ssum(amp * amp)
-            s_q, s_q2 = ssum(q), ssum(jnp.sum(q * q, axis=-1))
-            # Clamped because the identity is exact but its EVALUATION is not: on a ridge carrying
-            # no boundary the two bracketed terms are equal and large, and their difference is pure
-            # cancellation -- which lands a few ulp below zero in float32. Every pair is provably
-            # >= 0, so the clamp restores the true value rather than imposing a bound, and it keeps
-            # a p-norm aggregate (which raises these to a power) real.
-            pairs = jnp.maximum(0.5 * ((s_a * s_a - s_a2) - (jnp.sum(s_q * s_q, axis=-1) - s_q2)), 0.0)
-
-            measure = (
-                jnp.ones(n_ridges, dtype=pairs.dtype)
-                if rnodes.shape[1] == 1
-                else jnp.linalg.norm(pts[rnodes[:, 1]] - pts[rnodes[:, 0]], axis=-1)
-            )
-            return measure * pairs
-
-        return _jno.fn(_curvature, [self, *args], name="curvature")
 
     def __call__(self, *coords, **named):
         """For a **nodal-field unknown** (``domain.unknown()``), ``u(xb, yb)`` is sugar for
