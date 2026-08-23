@@ -137,6 +137,58 @@ def _tree_signature(tree):
     )
 
 
+def _reparam_scalar_constants(models):
+    """Scalar constants captured in the closures of every ``paramax.Parameterize`` transform.
+
+    A reparameterization lives in the STATIC half of the partition, so a Python value its transform
+    closes over is a trace-time constant. Mutating that value between ``solve()`` calls -- the
+    idiom every continuation schedule reaches for, ``beta = [1.0]`` and then ``beta[0] = 2.0`` --
+    changes what the program should compute while changing nothing ``_step_program_key`` can see:
+    not the tree, not a shape, not a dtype. The cached executable is reused and the gradient is
+    taken at the OLD value, while ``crux.eval`` recompiles and reports the new one.
+
+    Measured on a one-parameter core with ``constrain(lambda r: box[0] * r)`` and ``sgd(1.0)``:
+    mutating ``box`` from 1 to 10 and re-solving moved the stored parameter 1.5 -> 0.5, which is
+    exactly the step the stale ``box = 1`` program prescribes, while the reported physical value
+    read 5.0. Right-looking numbers, wrong optimisation, and nothing raised.
+
+    Only SCALARS are read, and that limit is the point rather than an oversight: an array in one of
+    these namespaces is usually a baked table (the patch filter's neighbour lists are megabytes of
+    them), and hashing those every step would cost more than the recompile this cache exists to
+    avoid. So a mutated numpy array, and a mutated attribute on an object, both still slip through --
+    the trace-time-constant contract holds, and this narrows it to the case that bites in practice.
+
+    Reading referenced globals is deliberately over-broad: a module-level scalar the transform never
+    meant to depend on still enters the key, so mutating it costs a recompile it did not need. That
+    is a wasted compile, not a wrong answer, and it is the right side to err on.
+    """
+    def _scalars(v, out):
+        if isinstance(v, (bool, int, float)):
+            out.append(float(v))
+        elif isinstance(v, (list, tuple)) and 0 < len(v) <= 8 and all(isinstance(e, (bool, int, float)) for e in v):
+            out.extend(float(e) for e in v)
+
+    out: list = []
+    for leaf in jax.tree_util.tree_leaves(models, is_leaf=lambda x: isinstance(x, _paramax.Parameterize)):
+        if not isinstance(leaf, _paramax.Parameterize):
+            continue
+        fn = leaf.fn
+        # BOTH capture routes, because which one a schedule uses is an accident of where it was
+        # written. `def physical(r)` at module scope reads `beta` as a GLOBAL (empty `__closure__`);
+        # the same function nested inside a builder reads it as a free variable. Reading only
+        # closures misses every script in this repo, all of which declare the cell at module level.
+        for cell in getattr(fn, "__closure__", None) or ():
+            try:
+                _scalars(cell.cell_contents, out)
+            except ValueError:  # an empty cell -- the closure is still being built
+                continue
+        g = getattr(fn, "__globals__", None) or {}
+        code = getattr(fn, "__code__", None)
+        for name in getattr(code, "co_names", ()) or ():
+            if name in g:
+                _scalars(g[name], out)
+    return tuple(out)
+
 def _optimizer_states_match(a, b) -> bool:
     """Whether two optax states have the same tree, leaf shapes and dtypes.
 
@@ -1160,6 +1212,10 @@ class core:
         Optimizers enter by ``(layer id, type name)``. That catches a swapped optimizer but not a
         changed learning rate on the same one, which is the standard ``jax.jit`` closure-staleness
         contract -- states live on the core, so a genuinely fresh run means a fresh core.
+
+        The one place that contract had to be narrowed is a ``constrain()`` transform's own closure:
+        see :func:`_reparam_scalar_constants`. A continuation schedule mutates a scalar there between
+        solves, and nothing else in this key moves when it does.
         """
         try:
             opts = tuple(sorted((str(k), type(v).__name__) for k, v in dict(per_model_opts).items()))
@@ -1170,6 +1226,7 @@ class core:
                 opts,
                 tuple(settings),
                 id(self.compiled_constraints_fn),
+                _reparam_scalar_constants(self.models),
             )
         except Exception as exc:  # noqa: BLE001 — an undescribable configuration simply does not cache
             if os.environ.get("JNO_DEBUG_STEP_KEY") == "1":
