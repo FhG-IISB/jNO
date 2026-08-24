@@ -397,8 +397,11 @@ def _lower_gauge_pin(pin: GaugePin) -> Any:
     return field(*spatial) - pin.value
 
 
-def _saddle_block_names(fem_obj: "FEM", domain: Any, volume_terms: List[Any]) -> List[str]:
-    """Names of the field blocks with no diagonal entry -- the structural mark of a saddle system.
+def _saddle_block_positions(fem_obj: "FEM", domain: Any, volume_terms: List[Any]) -> List[tuple]:
+    """``(index, name)`` of the field blocks with no diagonal entry -- the structural mark of a saddle system.
+
+    The NAME is what a diagnostic says out loud ("p has no diagonal block"); the INDEX is what a
+    preconditioner needs, because it has to address the block in ``fem.blocks`` order.
 
     A field whose own test function never meets its own trial function contributes no ``(i, i)``
     block, so the assembled operator has a zero diagonal there. That is exactly the Taylor-Hood
@@ -443,7 +446,7 @@ def _saddle_block_names(fem_obj: "FEM", domain: Any, volume_terms: List[Any]) ->
     for i, k in enumerate(keys):
         if (k, k) in occupied:
             continue
-        out.append(names.get(k) or f"block {i}")
+        out.append((i, names.get(k) or f"block {i}"))
     return out
 
 
@@ -1255,6 +1258,7 @@ class FEM:
         self._periodic = None  # periodic-tie reduction (prolongation P), attached by fem()
         self._mean_gauges = ()  # zero-mean gauges (`p.pin(mean=True)`), resolved by fem() at build
         self._saddle_blocks = ()  # field blocks with no diagonal entry, detected by fem() at build
+        self._saddle_block_indices = ()  # the same blocks by position in `blocks`
         self._complex_n = None  # half-size n when _op is a fused complex real-equivalent 2n system
         # The unfused (re, im) legs. KNOWN CONSUMERS — check all of them before changing this or the
         # fused layout, since a stale reader does not crash (see the `operator` docstring: the fused
@@ -4757,7 +4761,9 @@ def _fem_impl(
         # Structural, so it is known here for every mode -- and being known at BUILD time is what
         # lets the warning fire even when the solve is later wrapped in jit, where the residual
         # guard cannot.
-        out._saddle_blocks = tuple(_saddle_block_names(out, domain, volume_terms))
+        _saddle_pos = _saddle_block_positions(out, domain, volume_terms)
+        out._saddle_blocks = tuple(nm for _i, nm in _saddle_pos)
+        out._saddle_block_indices = tuple(i for i, _nm in _saddle_pos)
         return out
 
     volume_terms: List[Any] = []

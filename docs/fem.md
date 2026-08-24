@@ -1710,6 +1710,22 @@ preconditioner never changes the converged solution, only the speed, so specs ne
 * `jno.precond.block_diag((field, spec), …)` / `jno.precond.triangular((field, spec), …)` — per-field
   composition over `fem.blocks`. `triangular` is the standard saddle-point shape: last block solved
   first, substituted back through the assembled off-diagonal matvecs.
+* `jno.precond.saddle(mass_weight=…)` — that standard shape as **one call**, for the common case.
+  It finds the constraint block *structurally* (the field with no diagonal entry — the same detection
+  behind the saddle-system warning), puts `amg()` on the momentum block and a weighted pressure
+  **mass** matrix on the constraint block, and assembles that mass on the domain's own P1 space, so
+  no symbols are passed and it reads identically in 2-D and 3-D. `mass_weight` is explicit and never
+  inferred (`1/μ` for Stokes): digging `μ` out of an arbitrary weak form is fragile, and a variable
+  viscosity would silently take the wrong weight — which costs iterations without ever failing. A
+  wrong weight changes convergence *speed* only, never the answer. Pair with `jno.solve.fgmres`;
+  `minres` does not apply (block-upper-triangular is nonsymmetric). Needs `pyamg`, and refuses by
+  name on a non-saddle system or a constraint field that is not P1 — for anything outside that,
+  compose `triangular` yourself. **Pure-Stokes approximation:** a strong reaction term (Brinkman /
+  Darcy drag, or the `1/dt` mass of a small implicit step) makes the Schur complement stop looking
+  like a mass matrix, and the mesh-robustness degrades — measured on a 2-D Brinkman channel at
+  `μ=1`, preconditioned GMRES went 73 → 76 → 140 → 452 iterations as `α` went `0 → 1e2 → 1e3 → 1e4`.
+  That regime wants the Cahouet–Chabard mass-*plus*-Laplacian approximation (Cahouet & Chabard,
+  *IJNMF* **8**, 869–895, 1988), which `saddle()` does not build.
 * `jno.precond.amg(cycles=…)` — **hybrid algebraic multigrid**: setup once on the host via the *optional*
   `pyamg` (Vaněk, Mandel & Brezina, *Computing* 56, 1996; PyAMG — Bell et al., *JOSS* 8(87), 2023),
   applied as a pure-JAX V-cycle with Chebyshev smoothing (Adams et al., *JCP* 188, 2003). The apply is
@@ -1739,6 +1755,19 @@ sol = fem.solve(
     ),
 )
 ```
+
+…and the same recipe when the defaults suit — multigrid on the momentum block, exact pressure mass:
+
+```python
+sol = fem.solve(linear=jno.solve.fgmres(tol=1e-10, restart=150),
+                precond=jno.precond.saddle(mass_weight=1.0/mu))
+```
+
+Give FGMRES enough `restart`: the default `restart=30` **stagnates** on a 3-D Taylor–Hood block
+preconditioner and does so quietly — it still returns, just slower and less accurate. Measured at
+4302 dofs, `tol=1e-10`: `restart=30` → 2.30 s for 3.3e-6; `restart=150` → 0.49 s for 3.3e-9. On
+3-D Stokes this is what makes the recipe overtake a direct factorisation — measured crossover at
+~15k dofs, and 3.4× faster (23.2 s → 6.9 s) at 41k, where LU's fill-in also costs more memory.
 
 **Picard / lagged coefficients — `jno.lag`.** When a solution-dependent coefficient's Newton tangent
 destroys the linearized system's structure (the classic case: a shear-thinning viscosity `μ_eff(u)` in
