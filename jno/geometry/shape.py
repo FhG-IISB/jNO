@@ -1076,6 +1076,16 @@ class Shape:
         try:
             return _node_contains(self._node, pts, float(tol))
         except NotImplementedError:
+            if _xp(points) is jnp:
+                # The fallback meshes the boundary and tests against facets, which is numpy-only.
+                # Letting it run under a trace surfaced as TracerArrayConversionError from inside the
+                # tessellation -- an error that names neither the shape nor the way out.
+                raise NotImplementedError(
+                    f"Shape.contains: a {self._node[0]!r} plan has no closed-form membership, so it "
+                    f"falls back to the boundary tessellation, which is host-side and cannot be "
+                    f"traced. Evaluate it eagerly (pass a numpy array), or build the shape without "
+                    f"sweep/fillet if it has to run inside jit."
+                ) from None
             # No closed form (sweep/fillet): ask the boundary tessellation instead. `tol` has no
             # meaning there -- membership is the polyhedron's, exact to its own facets.
             return self.tessellate().contains(pts)

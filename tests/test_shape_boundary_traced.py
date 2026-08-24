@@ -99,3 +99,13 @@ def test_unfilled_is_reported_not_hidden():
 def test_extrude_says_where_to_go_instead_of_failing_obscurely():
     with pytest.raises(NotImplementedError, match="host-side"):
         sample_on_boundary(S.rect(0, 0, 1, 1).extrude(0.5), jax.random.PRNGKey(0), 16)
+
+
+def test_a_plan_with_no_closed_form_names_the_way_out():
+    """fillet/sweep fall back to the boundary tessellation, which is numpy. Under a trace that
+    surfaced as TracerArrayConversionError from inside the tessellation -- an error naming neither
+    the shape nor the fix."""
+    fillet = S.box(0, 0, 0, 1, 1, 1).fillet(0.18)
+    with pytest.raises(NotImplementedError, match="cannot be traced"):
+        jax.jit(fillet.contains)(jnp.zeros((4, 3)))
+    assert bool(np.asarray(fillet.contains(np.array([[0.5, 0.5, 0.5]])), dtype=bool)[0]), "eager still works"
