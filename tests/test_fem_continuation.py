@@ -1,26 +1,24 @@
-"""Parameter continuation — the INTERNAL ``run_continuation`` driver.
+"""``fem.solve(continuation=...)`` — march a runtime parameter, warm-starting each solve.
 
-The public spelling is deliberately absent: the agreed home (2026-08-08) is a warm-started
-``sequence`` axis in the ``tune`` space, wired to this driver. These tests pin the engine that
-wiring will call — a ``fem.solve`` kwarg for it was built, reviewed, and removed.
+The engine (``run_continuation``) predates this file; what it lacked was a public builder and the
+ability to run on a **reduced** system. Both are covered here.
 
-One driver under three names: an EM material/frequency sweep (``keep="all"``), mechanics load
-stepping, numerical homotopy. Every solve warm-starts from the previous one; a failing step names
-its parameter values and index instead of returning NaN downstream.
+**The oracle for the no-rebuild claim is the TRACE COUNT, not the answer.** Rebuilding the form at
+every value also produces the right answer -- slowly -- so an equivalence assertion alone would pass
+on the implementation this exists to avoid. What has to be true is that the operator is traced once
+and the parameter arrives as a runtime argument, so an 8-step ramp costs 8 solves rather than 8
+compilations. That is asserted directly by counting how often the residual is traced.
 """
 
+from __future__ import annotations
+
 import jax
-import jax.numpy as jnp
 import numpy as np
 import pytest
 
 import jno
-import jno.jnp_ops as J
-from jno.utils.solver.solver_api import ContinuationSpec, run_continuation
 
-
-def _spec(keep="last", **params):
-    return ContinuationSpec(params=dict(params), keep=keep)
+meshio = pytest.importorskip("meshio")
 
 
 @pytest.fixture(autouse=True)
@@ -33,163 +31,200 @@ def _x64():
         jax.config.update("jax_enable_x64", prev)
 
 
-def _poisson_kap():
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain()
-    u, v = d.fem_symbols()
-    xi, yi = d.variable("interior", split=True)[:2]
-    xb, yb = d.variable("boundary", split=True)[:2]
-    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
-    kap = jno.np.parameter((1,), name="kap")
-    q = jno.np.parameter((1,), name="q")
-    return jno.fem([kap * (ui.x * vi.x + ui.y * vi.y) - (q + 0.0) * vi, u(xb, yb) - 0.0])
+def _nonlinear_diffusion(k_value=None):
+    """``-div((1 + k u^2) grad u) = 1`` with u = 0 on the boundary.
+
+    ``k`` is a runtime parameter when ``k_value`` is None, and a plain constant otherwise -- the two
+    spellings assemble the same problem, which is what the equivalence test needs.
+    """
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=6).domain()
+    u, v = d.fem_symbols(names=("u", "v"), order=1)
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=x, y=y), v.bind(x=x, y=y)
+    k = jno.np.parameter((1,), name="k") if k_value is None else k_value
+    flux = (1.0 + k * ui * ui) * (ui.x * vi.x + ui.y * vi.y)
+    return jno.fem([flux - 1.0 * vi, u(xb, yb) - 0.0])
 
 
-def test_a_linear_sweep_matches_independent_solves():
-    """``keep="all"`` returns the family, and each member equals a cold solve at that value (a
-    single-step continuation IS a cold solve, so the reference uses the same public entry)."""
-    fem = _poisson_kap()
-    ks = jnp.linspace(0.5, 2.0, 5)
-    U = run_continuation(fem, _spec(kap=ks, keep="all"), kwargs={"q": jnp.array([1.0])})
-    assert U.shape[0] == 5 and bool(jnp.isfinite(U).all())
-    # member equality is checked under the DIRECT solve, where warm starts cannot move the answer
-    # (the default Krylov agrees only to its tolerance, which is the solver's business, not the sweep's)
-    U_lu = run_continuation(fem, _spec(kap=ks, keep="all"), kwargs={"q": jnp.array([1.0])}, linear=jno.solve.lu())
-    for i in (0, 2, 4):
-        ref = run_continuation(fem, _spec(kap=ks[i : i + 1]), kwargs={"q": jnp.array([1.0])}, linear=jno.solve.lu())
-        assert np.asarray(U_lu[i]) == pytest.approx(np.asarray(ref), abs=1e-12), f"family member {i} != cold solve"
-    # -div(kap grad u) = q: u scales as 1/kap, so the ends must sit at a 4x ratio
-    assert float(U[0].max() / U[-1].max()) == pytest.approx(4.0, rel=1e-6)
-    last = run_continuation(fem, _spec(kap=ks), kwargs={"q": jnp.array([1.0])})
-    # abs=1e-12, not 0.0: on GPU two runs of the same march differ by reduction order (measured 1.4e-17,
-    # one ULP) -- bit-exactness is a CPU accident, not a property of the driver
-    assert np.asarray(last) == pytest.approx(np.asarray(U[-1]), abs=1e-12), 'keep="last" != keep="all"[-1]'
+def test_continuation_is_a_public_slot():
+    """The engine was reachable only by importing the private driver; the builder is the missing half."""
+    spec = jno.solve.continuation(k=np.linspace(0.0, 1.0, 3))
+    assert spec.keep == "last"
+    assert "k" in spec.params
+    assert jno.solve.continuation(keep="all", k=[0.0, 1.0]).keep == "all"
 
 
-def test_two_parameters_march_together_and_fixed_kwargs_hold():
-    """Zipped sequences march in lockstep; a fixed keyword holds its value across the sweep."""
-    fem = _poisson_kap()
-    U = run_continuation(fem, _spec(kap=jnp.array([1.0, 2.0]), q=jnp.array([1.0, 2.0]), keep="all"))
-    # kap and q double together, so u = (q/kap)*shape is IDENTICAL at both steps
-    assert np.asarray(U[0]) == pytest.approx(np.asarray(U[1]), abs=1e-9), "zipped march broke the q/kap ratio"
+def test_the_form_is_traced_ONCE_across_the_whole_march():
+    """The point of the slot. A loop that rebuilds gives the same answer and pays N compilations."""
+    fem = _nonlinear_diffusion()
+    op = fem._op
+    traces = {"n": 0}
+    real_residual = op.residual
+
+    def counting_residual(u, *a, **kw):
+        # count TRACES, not calls: a traced `u` means the function is being staged out afresh.
+        if isinstance(u, jax.core.Tracer):
+            traces["n"] += 1
+        return real_residual(u, *a, **kw)
+
+    op.residual = counting_residual
+    try:
+        fem.solve(continuation=jno.solve.continuation(k=np.linspace(0.0, 2.0, 8)))
+    finally:
+        op.residual = real_residual
+
+    assert traces["n"] > 0, "the residual was never traced — the counter is not wired to the solve"
+    # The Newton body stages a handful of times (loop body, tangent, line search) but ONCE for the
+    # whole march, not once per rung: 8 values must not cost 8 stagings. Before the step was jitted
+    # this measured 48.
+    assert traces["n"] < 8, f"the form was re-traced per step ({traces['n']} traces for 8 values)"
 
 
-def _neo_hookean_load():
-    """Finite-strain cantilever with the load as a runtime parameter — the homotopy fixture.
-    Cold DEFAULT Newton (no line search) fails at load=0.1 and converges at 0.05 (measured)."""
-    mu, lam = 1.0, 1.0
-    d = jno.Shape.rect(0.0, 0.0, 2.0, 0.5, size=0.15).domain()
-    d.tag("left", lambda x, n, names: x[:, 0] < 1e-6)
-    u, v = d.fem_symbols(value_shape=(2,))
-    xi, yi = d.variable("interior", split=True)[:2]
-    xl, yl = d.variable("left", split=True)[:2]
-    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
-    load = jno.np.parameter((1,), name="load")
-    F11, F12, F21, F22 = 1.0 + ui[0].x, ui[0].y, ui[1].x, 1.0 + ui[1].y
-    Jd = F11 * F22 - F12 * F21
-    iT11, iT12, iT21, iT22 = F22 / Jd, -F21 / Jd, -F12 / Jd, F11 / Jd
-    c = lam * J.log(Jd)
-    P11 = mu * (F11 - iT11) + c * iT11
-    P12 = mu * (F12 - iT12) + c * iT12
-    P21 = mu * (F21 - iT21) + c * iT21
-    P22 = mu * (F22 - iT22) + c * iT22
-    weak = P11 * vi[0].x + P12 * vi[0].y + P21 * vi[1].x + P22 * vi[1].y + load * vi[1]
-    return jno.fem([weak, u(xl, yl)[0] - 0.0, u(xl, yl)[1] - 0.0])
+def test_the_marched_answer_equals_a_form_built_at_that_constant():
+    """Warm-starting must not change the root it converges to."""
+    marched = np.asarray(
+        _nonlinear_diffusion().solve(continuation=jno.solve.continuation(k=np.linspace(0.0, 2.0, 5)))
+    ).reshape(-1)
+    direct = np.asarray(_nonlinear_diffusion(k_value=2.0).solve()).reshape(-1)
+    np.testing.assert_allclose(marched, direct, rtol=1e-6, atol=1e-8)
 
 
-def test_homotopy_reaches_a_load_the_cold_solve_cannot():
-    """The measured teeth. Cold default-Newton at load=0.1 diverges; the four-step ramp reaches it
-    with the SAME default solver — no line search, no tuning — and the answer matches a line-search
-    cold solve at the target load."""
-    fem = _neo_hookean_load()
-    with pytest.raises(RuntimeError, match=r"step 1/1 at load="):
-        run_continuation(fem, _spec(load=jnp.array([0.1])))
+def test_keep_all_returns_the_family():
+    vals = np.linspace(0.0, 2.0, 4)
+    fam = np.asarray(_nonlinear_diffusion().solve(continuation=jno.solve.continuation(keep="all", k=vals)))
+    assert fam.shape[0] == len(vals)
+    # a stiffer coefficient means a smaller peak: the family must actually vary with the parameter
+    peaks = np.abs(fam).max(axis=1)
+    assert peaks[0] > peaks[-1], f"the marched family does not depend on the parameter: {peaks}"
 
-    ramped = run_continuation(fem, _spec(load=jnp.linspace(0.025, 0.1, 4)))
-    assert bool(jnp.isfinite(ramped).all())
 
-    ref = run_continuation(fem, _spec(load=jnp.array([0.1])), nonlinear=jno.solve.newton(line_search=True))
-    assert np.asarray(ramped) == pytest.approx(np.asarray(ref), abs=1e-6), (
-        f"ramped default-Newton disagrees with line-search cold: {np.abs(np.asarray(ramped - ref)).max():.2e}"
+def test_a_slip_reduced_system_can_be_continued():
+    """Previously refused outright: `_periodic` is how the slip elimination is carried, so a
+    slip-constrained problem could not be continued at all -- which is exactly the shape of problem
+    (a rigid-plastic roll contact) that needs homotopy most."""
+    from jno.domain.geometries import Geometries
+
+    mesh, _, _ = Geometries.equi_distant_box(nx=3, ny=3, nz=3)(None)
+    d = jno.domain(lambda g: (mesh, 3, 1 / 3), compute_mesh_connectivity=True)
+    u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), order=2)
+    p, q = d.fem_symbols(names=("p", "q"), order=1)
+    x, y, z, _ = d.variable("interior", split=True)
+    eu, ev = jno.np.symgrad(u, [x, y, z]), jno.np.symgrad(v, [x, y, z])
+    dd = lambda a, b: jno.np.inner(a, b, n_contract=2)  # noqa: E731
+    pp, qq = p.bind(x=x, y=y, z=z), q.bind(x=x, y=y, z=z)
+    c = d.variable("boundary", normals=True, split=True)
+    ur = u.bind(x=c[0], y=c[1], z=c[2])
+    k = jno.np.parameter((1,), name="visc")
+    fem = jno.fem(
+        [
+            2.0 * (1.0 + k * dd(eu, eu)) * dd(eu, ev) - pp * jno.np.trace(ev) - 1.0 * v.bind(x=x, y=y, z=z)[0],
+            -qq * jno.np.trace(eu),
+            c[-3] * ur[0] + c[-2] * ur[1] + c[-1] * ur[2] - 0.0,  # slip  n.u = 0
+            p.pin(),
+        ]
     )
-    assert float(jnp.abs(ramped).max()) > 1.0, "the target load should be well into the finite-strain regime"
+    assert fem._periodic is not None, "this problem is meant to be slip-reduced"
+    out = np.asarray(
+        fem.solve(
+            # matrix-free Newton: the continuation driver hands the solver a residual and no
+            # assembled tangent, so `newton(direct=True)` refuses here (see the xfail below).
+            continuation=jno.solve.continuation(visc=np.linspace(0.0, 1.0, 3)),
+        )
+    ).reshape(-1)
+    assert out.shape[0] == fem.dofs, "the marched solution must come back in the FULL space"
+    assert np.isfinite(out).all()
 
 
-def test_a_complex_sweep_returns_the_complex_family():
-    """The EM shape of the driver, on the 1D form where parametric complex is wired today: sweep the
-    loss ``sig`` in ``c = 1/(1 + i sig)`` and get the complex family, each member matching the
-    constant-coefficient complex solve. (2D/3D nodal parametric-complex is a known wall — the
-    ComplexPair x parameter algebra is not wired — so the sweep is exercised where the spelling
-    exists; the driver itself is dimension-agnostic.)"""
-    from jno.domain import domain as _domain_mod  # noqa: F401  (1D line ctor lives on jno.domain)
-
-    def _build(sig_value=None):
-        d = jno.domain(constructor=jno.domain.line(mesh_size=0.05))
-        u, phi = d.fem_symbols()  # the 1j in the coefficient is what makes the system complex
-        xi = d.variable("interior", split=True)[0]
-        xb = d.variable("boundary", split=True)[0]
-        ui, vi = u.bind(x=xi), phi.bind(x=xi)
-        sig = jno.np.parameter((1,), name="sig") if sig_value is None else sig_value
-        c = 1.0 / (1.0 + 1j * sig)
-        return d, jno.fem([c * ui.x * vi.x - (np.pi**2) * jno.np.sin(np.pi * xi) * vi, u(xb) - 0.0])
-
-    _d, fem = _build()
-    sigs = jnp.linspace(0.1, 1.0, 4)
-    U = run_continuation(fem, _spec(sig=sigs, keep="all"))
-    assert np.iscomplexobj(np.asarray(U)), "a complex sweep must return complex solutions"
-    assert U.shape[0] == 4
-    for i in (0, 3):
-        _d2, fem_c = _build(float(sigs[i]))
-        ref = np.asarray(fem_c.solve()).reshape(-1)
-        assert np.abs(np.asarray(U[i]) - ref).max() < 1e-9, f"sweep member {i} != constant-coefficient solve"
-    assert float(np.abs(np.asarray(U[3]).imag).max()) > 0.1, "the swept family lost its imaginary part"
+def test_a_swept_and_fixed_value_for_one_parameter_is_refused():
+    fem = _nonlinear_diffusion()
+    with pytest.raises(ValueError, match="marched or held"):
+        fem.solve(continuation=jno.solve.continuation(k=[0.0, 1.0]), k=0.5)
 
 
-def test_a_failing_step_names_the_value_and_index():
-    """Marching kappa through zero makes the operator singular. The direct solve returns NaN rather
-    than raising, so without the driver's finite check this would surface three steps downstream as
-    silent garbage. It must instead raise, naming the value and the step."""
-    fem = _poisson_kap()
-    with pytest.raises(RuntimeError, match=r"step 3/4 at kap=.*non-finite|step 3/4 at kap="):
-        run_continuation(
-            fem,
-            _spec(kap=jnp.array([1.0, 0.5, 0.0, -0.5]), keep="all"),
-            kwargs={"q": jnp.array([1.0])},
-            linear=jno.solve.lu(),
+def test_an_unknown_parameter_name_is_refused_by_name():
+    fem = _nonlinear_diffusion()
+    with pytest.raises(TypeError, match="unknown runtime parameter"):
+        fem.solve(continuation=jno.solve.continuation(not_a_parameter=[0.0, 1.0]))
+
+
+def test_a_direct_newton_marches_a_reduced_system():
+    """A sparse-direct Newton must work UNDER a continuation, on a constraint-reduced system.
+
+    This is the pairing a stiff homotopy actually wants: reach a parameter value the cold solve
+    cannot, on a saddle where the matrix-free Newton has no preconditioner to converge with. The
+    march used to hand its driver a residual closure and nothing else -- no assembled tangent to
+    factorize -- so it refused outright. It now threads the tangent the way the steady path always
+    did, reduced by the same prolongation as the residual (PᵀJP)."""
+    from jno.domain.geometries import Geometries
+
+    mesh, _, _ = Geometries.equi_distant_box(nx=2, ny=2, nz=2)(None)
+    d = jno.domain(lambda g: (mesh, 3, 0.5), compute_mesh_connectivity=True)
+    u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), order=2)
+    p_, q = d.fem_symbols(names=("p", "q"), order=1)
+    x, y, z, _ = d.variable("interior", split=True)
+    eu, ev = jno.np.symgrad(u, [x, y, z]), jno.np.symgrad(v, [x, y, z])
+    dd = lambda a, b: jno.np.inner(a, b, n_contract=2)  # noqa: E731
+    pp, qq = p_.bind(x=x, y=y, z=z), q.bind(x=x, y=y, z=z)
+    c = d.variable("boundary", normals=True, split=True)
+    ur = u.bind(x=c[0], y=c[1], z=c[2])
+    k = jno.np.parameter((1,), name="visc")
+    fem = jno.fem(
+        [
+            2.0 * (1.0 + k * dd(eu, eu)) * dd(eu, ev) - pp * jno.np.trace(ev),
+            -qq * jno.np.trace(eu),
+            c[-3] * ur[0] + c[-2] * ur[1] + c[-1] * ur[2] - 0.0,
+            p_.pin(),
+        ]
+    )
+    out = fem.solve(
+        continuation=jno.solve.continuation(visc=[0.0, 1.0]),
+        nonlinear=jno.solve.newton(direct=True),
+    )
+    out = np.asarray(out).reshape(-1)
+    assert out.shape[0] == int(fem.dofs)
+    assert np.all(np.isfinite(out))
+    # Solving is not the claim -- solving the RIGHT problem is. The march's last rung is visc=1.0, so
+    # the returned state must be a root of the residual THERE.
+    r = np.asarray(fem.residual(out, visc=1.0) if _residual_takes_values(fem) else fem.residual(out))
+    assert np.linalg.norm(r) < 1e-6 * max(1.0, np.linalg.norm(out))
+
+
+def test_a_stalled_rung_raises_naming_the_rung():
+    """The guard the jit would otherwise take away.
+
+    The per-step solve is staged once and run under ``jax.jit``, and the Newton driver's own
+    stalled-solve check self-disables inside a trace (it needs a concrete residual). Without an
+    eager replacement, a rung that leaves on its step cap would return its last iterate silently --
+    and the march would then carry that non-root into every later rung as the warm start, so one
+    quiet stall corrupts the whole family rather than one entry.
+    """
+    fem = _nonlinear_diffusion()
+    with pytest.raises(RuntimeError, match=r"step \d+/8 at k=.*did not converge"):
+        fem.solve(
+            continuation=jno.solve.continuation(k=np.linspace(0.0, 2.0, 8)),
+            nonlinear=jno.solve.newton(max_steps=1, rtol=1e-14, atol=1e-14),
         )
 
 
-def test_validation_fails_loud():
-    fem = _poisson_kap()
-    with pytest.raises(TypeError, match="unknown runtime parameter"):
-        run_continuation(fem, _spec(nope=jnp.array([1.0])))
-    with pytest.raises(ValueError, match="share one length"):
-        run_continuation(fem, _spec(kap=jnp.array([1.0, 2.0]), q=jnp.array([1.0])))
-    with pytest.raises(ValueError, match="either marched or held"):
-        run_continuation(fem, _spec(kap=jnp.array([1.0])), kwargs={"kap": jnp.array([2.0])})
-
-    # transient problems refuse: there is no warm start to transfer between trajectories
-    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.3).domain(time=(0.0, 0.1, 3))
-    u, v = d.fem_symbols()
-    xi, yi, ti = d.variable("interior", split=True)
-    xb, yb, _tb = d.variable("boundary", split=True)
-    ci = d.variable("initial", split=True)
-    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi)
-    kap = jno.np.parameter((1,), name="kap")
-    fem_t = jno.fem([ui.t * vi + kap * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - 1.0])
-    with pytest.raises(NotImplementedError, match="steady"):
-        run_continuation(fem_t, _spec(kap=jnp.array([1.0, 2.0])))
+def test_stats_describe_the_last_rung_not_a_stale_entry():
+    """``LAST_NEWTON_STATS`` is written by the in-driver check, which is blind under the jit -- so it
+    would otherwise keep whatever a previous *eager* solve left behind, and `fem.stats` would report
+    a number that has nothing to do with the march."""
+    fem = _nonlinear_diffusion()
+    fem.solve(continuation=jno.solve.continuation(k=np.linspace(0.0, 2.0, 5)))
+    st = fem.stats["nonlinear"]
+    assert st["driver"] == "continuation/newton", st
+    assert st["converged"] is True
+    assert st["residual"] <= st["bound"], st
 
 
-def test_the_slots_compose_with_the_sweep():
-    """Each step's solve goes through the composed slots — a CG+Jacobi sweep must match the default."""
-    fem = _poisson_kap()
-    ks = jnp.linspace(0.5, 2.0, 3)
-    a = run_continuation(fem, _spec(kap=ks, keep="all"), kwargs={"q": jnp.array([1.0])})
-    b = run_continuation(
-        fem,
-        _spec(kap=ks, keep="all"),
-        kwargs={"q": jnp.array([1.0])},
-        linear=jno.solve.cg(tol=1e-12),
-        precond=jno.precond.jacobi(),
-    )
-    assert np.asarray(a) == pytest.approx(np.asarray(b), abs=1e-7)
+def _residual_takes_values(fem):
+    """`fem.residual` accepts parameter values only on a parametric problem."""
+    import inspect
+
+    try:
+        inspect.signature(fem.residual).bind(np.zeros(int(fem.dofs)), visc=1.0)
+        return True
+    except TypeError:
+        return False

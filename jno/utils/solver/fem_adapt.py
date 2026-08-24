@@ -33,6 +33,8 @@ from typing import Any
 
 import numpy as np
 
+from ...trace import Constraint
+
 
 def _boundary_edges_from_triangles(tris: np.ndarray) -> np.ndarray:
     """Return the ``(n_boundary, 2)`` boundary edges of a triangle mesh.
@@ -1278,8 +1280,12 @@ def _criterion_weak_terms(fem: Any, criterion: Any, field: int = 0):
     ``_jno_region_tag``, because ``jno.fem`` retags coordinates to the quadrature pool
     (``"fem_gauss"``) at build time and the raw tag no longer names a region.
     """
+    from jno._fem import _retag_coords_for_quadrature
+
     from ...trace import Placeholder, TestFunction, Variable, _iter_placeholder_children
     from .solver_helper import contains_node_type
+
+    _retag_coords_for_quadrature_early = _retag_coords_for_quadrature
 
     node = getattr(criterion, "expr", criterion)
 
@@ -1313,12 +1319,25 @@ def _criterion_weak_terms(fem: Any, criterion: Any, field: int = 0):
     if not 0 <= int(field) < len(tests):
         raise ValueError(f"adapt(criterion=...): metric_field={field} but this problem has {len(tests)} field(s).")
 
+    _bregions = getattr(fem.domain, "_boundary_regions", {}) or {}
+
     def _region_tags(root) -> list:
         found: list = []
         for var in _walk(root, Variable):
             tg = getattr(var, "tag", None)
             if isinstance(tg, str) and (tg == "fem_gauss" or tg.startswith("gauss_")):
                 tg = getattr(var, "_jno_region_tag", tg)  # the recovery `_region_and_support` does
+            # An outward-normal Variable `n_<region>` belongs to ITS region rather than naming a second
+            # one -- the same rule `_region_and_support` applies. Without it a surface objective that
+            # uses the normal (`(u.n)^2`, the free-surface case) resolves to `['top', 'n_top']` and is
+            # rejected as spanning two regions.
+            if isinstance(tg, str) and tg.startswith("n_") and tg[2:] in _bregions:
+                tg = tg[2:]
+            # `cell_size` (and a contact gap) are spatial Variables that name no region -- they are
+            # geometry symbols from the domain context. Counting them made a criterion using
+            # `dom.cell_size` resolve to a region literally called 'cell_size'.
+            if isinstance(tg, str) and (tg == "cell_size" or tg.startswith("gap_")):
+                continue
             if isinstance(tg, str) and tg not in found:
                 found.append(tg)
         return found
@@ -1343,29 +1362,92 @@ def _criterion_weak_terms(fem: Any, criterion: Any, field: int = 0):
         raise ValueError(f"adapt(criterion=...): the criterion spans more than one region {tags}; use one.")
 
     dim = int(fem.domain.dimension)
+
     # Bind the test function to the coordinate OBJECTS already in play, not to freshly fetched ones.
     # A criterion referencing a bound field (`ui * (1 - ui)`) carries the form's retagged coordinates
     # inside it, and mixing those with fresh ones raises "coord binding conflict for 'x': cannot combine
     # two named views that map 'x' to different Variables". Ordered by `dim[0]`, the axis index.
+    def _var_region(var) -> str:
+        """The region a coordinate Variable belongs to, after the quadrature retag."""
+        tg = getattr(var, "tag", None)
+        if isinstance(tg, str) and (tg == "fem_gauss" or tg.startswith("gauss_")):
+            # `_jno_region_tag` is the recorded original; when it is absent the region is still
+            # recoverable from the pool name itself (`gauss_<region>`).
+            tg = getattr(var, "_jno_region_tag", None) or (tg[6:] if tg.startswith("gauss_") else tg)
+        return tg if isinstance(tg, str) else ""
+
     seen_axis: dict = {}
+    # Coordinates must come from the region resolved above, and ONLY from it. Taking whatever spatial
+    # Variables the walk happens to reach mixes regions -- axis 0 from the form's interior coordinates,
+    # axis 1 from the criterion's own -- and binding the test function to that mixture raises "coord
+    # binding conflict for 'x'". Outward normals (`n_<region>`) and the element-size symbol are spatial
+    # but are not quadrature coordinates, so they are skipped here exactly as
+    # `_retag_coords_for_quadrature` skips them.
     for root in [node] + [getattr(t, "expr", t) for t in list(getattr(fem, "_constraints", None) or [])]:
         for var in _walk(root, Variable):
-            if getattr(var, "axis", None) != "spatial":
+            if getattr(var, "axis", None) != "spatial" or _var_region(var) != tags[0]:
                 continue
-            ax = int(getattr(var, "dim", [0])[0])
-            seen_axis.setdefault(ax, var)
+            _tg = getattr(var, "tag", None)
+            if isinstance(_tg, str) and (_tg == "cell_size" or _tg.startswith(("n_", "gap_"))):
+                continue
+            seen_axis.setdefault(int(getattr(var, "dim", [0])[0]), var)
         if len(seen_axis) >= dim:
             break
+    if len(seen_axis) < dim:
+        # A BOUND view absorbs its coordinates: `u.bind(x=xs, y=ys)` stores them in the view's
+        # `_coord_vars` rather than leaving them in the expression tree, so the walk above finds none
+        # (a free-surface objective typically exposes only the normals). They must be recovered rather
+        # than re-fetched: `domain.variable(...)` mints NEW Variable objects every call, and combining
+        # one of those with the criterion's own raises "coord binding conflict" even when both carry
+        # the same tag -- the check is on identity, not on the name.
+        for n in _walk(node, Placeholder):
+            for val in list(getattr(n, "__dict__", {}).values()):
+                cv = getattr(val, "_coord_vars", None)
+                if not isinstance(cv, dict):
+                    continue
+                for var in cv.values():
+                    if isinstance(var, Variable) and _var_region(var) == tags[0]:
+                        seen_axis.setdefault(int(getattr(var, "dim", [0])[0]), var)
+            if len(seen_axis) >= dim:
+                break
     if len(seen_axis) >= dim:
         coords = [seen_axis[a] for a in sorted(seen_axis)][:dim]
     else:  # nothing carries coordinates (a criterion of pure constants): fall back to the region's own
         coords = list(fem.domain.variable(tags[0], split=True))[:dim]
     test_bound = tests[int(field)](*coords)
+    # Retag the TEST function's coordinates before combining it with the criterion, not after. When the
+    # criterion exposes no free coordinates of its own -- a bound view absorbs them, which is what
+    # `u.bind(x=..., y=...)` does -- `coords` are freshly fetched from the domain and still carry the
+    # raw region tag, while the criterion's own were retagged to the quadrature pool at build time.
+    # Multiplying the two then raises "coord binding conflict for 'x'" between `top` and `gauss_top`:
+    # the same region under two names. Retagging first puts both on the pool. Mutates the coordinate
+    # Variables in place, so it fixes `test_bound` itself, and is idempotent on already-retagged ones.
+    _support = "boundary" if str(tags[0]) in (getattr(fem.domain, "_boundary_regions", {}) or {}) else "volume"
+    _retag_coords_for_quadrature_early(test_bound, _support, tags[0])
     node = getattr(criterion, "expr", criterion)
     # The MASS term is built from the same test function and coordinates rather than from the criterion,
     # so that an already-weak criterion does not produce `1 + 0*(g*v)` -- a sum of a test-free and a
     # test-carrying part, which the assembler rejects as "must contain exactly one test field".
-    crit_term = criterion if contains_node_type(node, TestFunction) else criterion * test_bound
+    if contains_node_type(node, TestFunction):
+        crit_term = criterion  # already a weak term: do not bind a second test function onto it
+    else:
+        try:
+            crit_term = criterion * test_bound
+        except ValueError as e:
+            if "coord binding conflict" not in str(e):
+                raise
+            # The auto-bound test function and the criterion reached the same region through DIFFERENT
+            # coordinate objects, and the binder compares identity rather than tag. Reachable when the
+            # criterion is built from a bound view (`u.bind(x=xs, y=ys)`), which absorbs its coordinates
+            # so they cannot be recovered from the expression. The user already holds a test function
+            # bound to those very coordinates, so say so instead of surfacing a trace-level error.
+            raise ValueError(
+                "adapt(criterion=/objective=): could not bind this problem's test function to region "
+                f"{tags[0]!r}, because the expression reaches it through coordinates that a bound view "
+                "has absorbed. Carry the test function yourself -- multiply by the one you already bound "
+                "to that region, e.g. `objective=<expr> * v_r[0]` where `v_r = v.bind(x=xr, y=yr)`. "
+                f"Original error: {e}"
+            ) from e
     mass_term = 1.0 * test_bound
 
     # Point the coordinates at the quadrature pool, exactly as `jno.fem` does to a form's coordinates at
@@ -1373,11 +1455,166 @@ def _criterion_weak_terms(fem: Any, criterion: Any, field: int = 0):
     # while assembly wants quadrature points, and the mismatch surfaces as a bare broadcasting error
     # ("input type=float32[173484] and requested type=float32[948]") naming neither the criterion nor
     # the coordinates. Idempotent on coordinates the form already retagged.
-    from jno._fem import _retag_coords_for_quadrature
-
+    # A criterion on a BOUNDARY region integrates over facets, and the quadrature pool it must bind to
+    # is that region's own (`gauss_<tag>`), not the volume pool -- retagging a surface term as "volume"
+    # points it at the wrong points and the mismatch surfaces as a bare broadcasting error. The support
+    # is decided by whether the single region resolved above is a tagged boundary region.
     for t in (crit_term, mass_term):
-        _retag_coords_for_quadrature(t, "volume", tags[0])
+        _retag_coords_for_quadrature(t, _support, tags[0])
     return crit_term, mass_term
+
+
+def _resolve_criterion(criterion: Any, dom: Any) -> Any:
+    """A criterion may be given as ``f(domain) -> criterion``, rebuilt against the CURRENT mesh.
+
+    A geometry node (``cell_aspect()``) captures the cell table when it is constructed, so a single
+    node cannot survive refinement -- it keeps answering for the mesh it was born on. A field criterion
+    has no such problem (its symbols re-resolve at assembly), so the callable form is only *needed* for
+    geometry, but it is accepted for both so one spelling covers every case.
+    """
+    # `callable()` alone is not the test: a trace node IS callable -- that is how a symbol is bound to
+    # coordinates -- so calling one here handed it the DOMAIN as a coordinate and the assembler then
+    # refused a weak form containing a `domain` node. Only a genuine Python callable that is not part
+    # of the expression language is a criterion FACTORY.
+    from ...trace import Placeholder
+
+    out = criterion(dom) if callable(criterion) and not isinstance(criterion, Placeholder) else criterion
+    _refuse_comparison_criterion(out)
+    return out
+
+
+def _refuse_comparison_criterion(criterion: Any) -> None:
+    """A bare comparison (``q > 6.0``) is a valid trace node, and the wrong thing to mark on.
+
+    It records WHICH cells are bad and not by how much, so marking would rank a set of equal
+    ``True``s and Dörfler would take a *fraction* of the cells that break the condition -- quietly
+    leaving the rest. Caught structurally rather than by evaluating, because the comparison node fails
+    to evaluate for an unrelated reason first and the error would name neither the criterion nor this.
+    """
+    import jax.numpy as _jnp
+
+    fn = getattr(getattr(criterion, "expr", criterion), "fn", None)
+    if fn in (_jnp.greater, _jnp.less, _jnp.greater_equal, _jnp.less_equal, _jnp.equal, _jnp.not_equal):
+        raise ValueError(
+            "adapt(criterion=...): this criterion is a comparison, so it evaluates to booleans -- it "
+            "says WHICH cells are bad but not by how much, and marking would then take a Dorfler "
+            "fraction of them rather than all of them. Write it as a constraint instead: "
+            "`jno.le(q, 6.0)` / `jno.ge(q, 6.0)`, whose signed margin says both."
+        )
+
+
+#: Per-cell mesh-geometry nodes (``domain.cell_*``). A criterion built from one of these is already
+#: one value per cell and is EVALUATED; anything else is a field and is ASSEMBLED. Recognised by name
+#: rather than by "carries no trial function", which was the first rule here and was wrong: a field
+#: criterion need not reference the solution at all (`d.by_region({...})`, a coordinate expression, a
+#: constant), and every one of those was misrouted into the geometry path and died evaluating a weak
+#: form standalone.
+_PER_CELL_NODES = ("cell_volume", "cell_angles", "cell_aspect")
+
+
+def _criterion_is_geometric(criterion: Any) -> bool:
+    """Is this criterion built from a per-CELL geometry node rather than being a field?
+
+    Searched through the whole expression, not just its root, so a reduction or a rescaling of one
+    (``1.0 / jno.np.min(d.cell_angles(), axis=1)``) is still recognised as per-cell.
+    """
+    from ...trace import Placeholder, _iter_placeholder_children
+
+    seen: set = set()
+
+    def visit(n) -> bool:
+        if not isinstance(n, Placeholder) or id(n) in seen:
+            return False
+        seen.add(id(n))
+        if getattr(n, "_name", None) in _PER_CELL_NODES:
+            return True
+        return any(
+            visit(c) for kind, _attr, val in _iter_placeholder_children(n) for c in (val if kind == "list" else (val,))
+        )
+
+    return visit(getattr(criterion, "expr", criterion))
+
+
+def _criterion_percell(fem: Any, node: Any) -> np.ndarray:
+    """A geometry criterion's value per cell, ``(n_cells,)``.
+
+    ``domain=`` is passed to BOTH the build and the evaluation on purpose: ``Crux.eval`` re-prepares
+    the domain data when given one and reuses its cached copy when not, so a bare ``core.eval([expr])``
+    answers on the mesh the core was built on rather than the mesh now (measured elsewhere in this
+    file as 0.5 where the moved mesh gives 0.75). In an adaptive march that is always the wrong mesh.
+    """
+    from .fem_native import mesh_cell_type
+
+    dom = fem.domain
+    dim = int(dom.dimension)
+    n_cells = int(np.asarray(dom.mesh.cells_dict[mesh_cell_type(dom, dim)]).shape[0])
+    # `node.eval()` rather than a `jno.core(...).eval(...)`: a geometry node reads the mesh through
+    # the vertices it captured, so there is no domain to sample and building a core for it warns
+    # ("No domain Variable found in the constraints") on every single check. Same values (checked),
+    # same cost, no per-round noise.
+    vals = np.asarray(node.eval())
+    if vals.dtype == bool:
+        raise ValueError(
+            "adapt(criterion=...): this criterion evaluates to booleans. A comparison (`q > 6.0`) "
+            "records WHICH cells are bad but not by how much, and marking would then pick a Dorfler "
+            "FRACTION of them rather than all of them. Write the condition as a constraint instead -- "
+            "`jno.le(q, 6.0)` / `jno.ge(...)` -- whose signed margin says both."
+        )
+    vals = np.atleast_1d(vals)
+    vals = vals.reshape(-1) if vals.ndim > 1 and vals.shape[0] == 1 else vals
+    if vals.ndim > 1:
+        raise ValueError(
+            f"adapt(criterion=...): a geometry criterion must be one value per cell, {(n_cells,)}; this "
+            f"one is {vals.shape}. A per-cell quantity with several components (`cell_angles()` is "
+            "(n_cells, 3)) has to be reduced by you -- `jno.np.min(..., axis=1)` -- rather than by a "
+            "guess here about which reduction was meant."
+        )
+    if vals.shape[0] != n_cells:
+        raise ValueError(
+            f"adapt(criterion=...): this geometry criterion answers for {vals.shape[0]} cells but the "
+            f"mesh now has {n_cells}. It was built on an EARLIER mesh: a geometry node captures the "
+            "cell table when it is constructed, so it goes stale the moment refinement changes the "
+            "topology. Pass a callable instead -- `criterion=lambda d: jno.le(d.cell_aspect(), 6.0)` -- "
+            "and it is rebuilt against the current mesh each round."
+        )
+    return vals
+
+
+def _criterion_nodal(fem: Any, criterion: Any, u: np.ndarray, field: int = 0) -> np.ndarray:
+    """A field criterion as a nodal array scaled like ``g`` itself, not like ``g x volume``."""
+    weak, mass_term = _criterion_weak_terms(fem, criterion, field)
+    num = np.asarray(fem.eval(weak, u)).reshape(-1)
+    mass = np.asarray(fem.eval(mass_term, u)).reshape(-1)
+    n_vert = int(np.asarray(fem.domain.mesh.points).shape[0])
+    # The criterion is tested against FIELD `field`, so its contributions land on THAT block's DOFs.
+    # Reading the first `n_vert` entries assumes the tested field starts at 0 -- true only for field 0.
+    # With `metric_field=1` this read the untouched velocity rows: every indicator came back exactly
+    # zero, nothing was marked, and the driver reported a clean run having refined nothing.
+    _off = list(fem.offsets) if getattr(fem, "offsets", None) is not None else [0]
+    _b = int(_off[field]) if field < len(_off) else 0
+    num, mass = num[_b : _b + n_vert], mass[_b : _b + n_vert]
+    g = np.abs(num) / np.maximum(np.abs(mass), 1e-30)
+    return np.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _criterion_margin(fem: Any, constraint: Any, u: np.ndarray, field: int = 0) -> np.ndarray:
+    """Per-cell **violation margin** of a ``jno.le``/``jno.ge`` criterion: ``> 0`` is a breach.
+
+    ``Constraint`` normalises its residual to the ``g <= 0`` convention whichever sense it was written
+    in, so nothing here branches on ``le`` vs ``ge``.
+
+    A field constraint is reduced over each cell by its **maximum**, not by integration. A threshold is
+    a pointwise statement -- "no element may be worse than this" -- and integrating it would let a
+    large well-behaved cell breach merely by being large.
+    """
+    residual = constraint.residual
+    if _criterion_is_geometric(residual):
+        return _criterion_percell(fem, residual)
+    from .fem_native import mesh_cell_type
+
+    dom = fem.domain
+    cells = np.asarray(dom.mesh.cells_dict[mesh_cell_type(dom, int(dom.dimension))])
+    return _criterion_nodal(fem, residual, u, field)[cells].max(axis=1)
 
 
 def _criterion_indicators(fem: Any, criterion: Any, u: np.ndarray, field: int = 0) -> tuple:
@@ -1388,12 +1625,12 @@ def _criterion_indicators(fem: Any, criterion: Any, u: np.ndarray, field: int = 
     measured on stay independent, and `theta` means the same thing across refinement rounds. The nodal
     field is then integrated per cell, which is what the marking consumes.
     """
-    weak, mass_term = _criterion_weak_terms(fem, criterion, field)
-    num = np.asarray(fem.eval(weak, u)).reshape(-1)
-    mass = np.asarray(fem.eval(mass_term, u)).reshape(-1)
-    n_vert = int(np.asarray(fem.domain.mesh.points).shape[0])
-    g = np.abs(num[:n_vert]) / np.maximum(np.abs(mass[:n_vert]), 1e-30)
-    g = np.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0)
+    if _criterion_is_geometric(criterion):
+        # A geometry criterion is ALREADY per cell -- there is nothing to assemble and no lumped mass
+        # to divide by. Marking then ranks cells by their own distortion.
+        eta = np.abs(_criterion_percell(fem, criterion))
+        return eta, float(np.sqrt(np.sum(eta**2)))
+    g = _criterion_nodal(fem, criterion, u, field)
     eta = np.abs(_integrate_nodal_per_cell(fem.domain, g))
     return eta, float(np.sqrt(np.sum(eta**2)))
 
@@ -2145,6 +2382,8 @@ class AdaptSpec:
     """``relocate_method="monge_ampere"`` only: the relaxation pseudo-step ``Δt`` of eq. (3.7). Larger
     converges faster and can overshoot; the nonlinearity is carried entirely by this outer relaxation."""
     relocate_method: str = "descent"
+    remesh_spec: Any = None
+    """Set by :meth:`remesh`: an h-adaptive spec to interleave into a relocation march."""
     """Relocation only: *how* the mesh is moved. ``"descent"`` — the default here and the default
     :func:`jno.solve.relocate` builds — walks the vertices down :attr:`objective` with a mesh-validity
     line search. ``"monge_ampere"`` instead solves a Monge-Ampère equation for a mesh potential ``φ`` and
@@ -2159,12 +2398,44 @@ class AdaptSpec:
     against descent's 3.951e-02 (uniform 1.096e-01), min element quality 0.160 against 0.503. See
     :func:`jno.solve.relocate` for the full table and the ``relax_step`` control that recovers part of it.
     (This docstring previously claimed the opposite of all of that.)"""
-    objective: str = "equidistribution"
-    """Relocation only, **internal / not yet exposed** by :func:`jno.solve.relocate`: which mesh functional
+
+    def remesh(self, **kwargs: Any) -> "AdaptSpec":
+        """Interleave h-adaptivity into this relocation march -- ``relocate(...).remesh(criterion=...)``.
+
+        Relocation moves a FIXED node set, so when the mesh has to stretch further than its elements
+        allow there is nothing it can do: ``quality_floor`` is a line search that rejects the step, and
+        rejecting a step never adds a node. This says what "too far" means, in the same traced language
+        the objective is written in, and remeshes when it happens::
+
+            fem.solve(adapt=jno.solve.relocate(objective=through, max_iters=200)
+                                     .remesh(criterion=lambda d: jno.le(d.cell_aspect(), 2.0)))
+
+        The criterion is checked after every descent round and must be a **mesh-geometry** condition
+        (it is evaluated on the moved vertices, with no solve). Takes the same arguments as
+        :func:`jno.solve.remesh`.
+        """
+        import copy as _copy
+
+        from ...solve import remesh as _remesh_builder
+
+        out = _copy.copy(self)
+        out.remesh_spec = _remesh_builder(**kwargs)
+        return out
+
+    objective: Any = "equidistribution"
+    """Relocation only: which mesh functional
     to descend. ``"equidistribution"`` (default) is :func:`_equidistribution_jax`, the scale-free
     equidistribution defect of an arclength monitor; ``"huang"`` is :func:`_huang_ea_jax`, Huang's
-    equidistribution+alignment functional with the same (isotropic) monitor. Present so the two can be
-    measured against each other on the same problem before either is given a public spelling."""
+    equidistribution+alignment functional with the same (isotropic) monitor; ``"energy"`` is the FE
+    Dirichlet energy.
+
+    It may instead be a **weak-form expression**, assembled exactly as ``criterion=`` is (same test
+    symbol and region recovery) and summed to a scalar. The three strings are mesh-QUALITY functionals
+    -- they read the solution only through a monitor -- so they cannot express a goal that names the
+    physics. An expression can: ``inner(u, n) ** 2`` on a boundary region relocates that wall until the
+    flow through it vanishes, which is a free surface. Volume and boundary regions both assemble; the
+    facet normals move with the vertices, so ``n`` in such an expression is the normal of the CURRENT
+    mesh rather than the one it started on."""
 
 
 # Consecutive rounds that must satisfy ``eps`` before the loop stops on convergence.
@@ -2247,28 +2518,51 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
     cons = fem._constraints
     kw = fem._fem_kwargs
     history: list[dict] = []
+    if isinstance(_resolve_criterion(spec.criterion, d), Constraint) and float(spec.theta) != 0.5:
+        raise ValueError(
+            f"adapt(criterion=jno.le(...)/jno.ge(...), theta={spec.theta}): a constraint marks every cell "
+            "that breaks it, so there is no bulk fraction to choose and `theta` would do nothing. Drop "
+            "`theta`, or pass a plain expression if you want Dorfler marking."
+        )
     cur = fem
     u = None
     prev_est = None
     n_converged = 0
     for it in range(spec.max_iters):
         _full = np.asarray(cur.solve(solve_fn, **kwargs)).reshape(-1)
-        u = _vertex_view(_full, cur, allow_vector=True)
-        if u.ndim == 2 and spec.anisotropic:  # vector field: the ZZ estimator sums components, but the
+        # LAZY: a user `criterion=` replaces the recovery estimator entirely and reads the FULL vector,
+        # so it needs no vertex view. Taking one unconditionally refused every multifield problem here
+        # -- `_vertex_view` assumes a single trial function -- on a value that branch never uses.
+        _needs_view = spec.criterion is None or spec.anisotropic
+        u = _vertex_view(_full, cur, allow_vector=True) if _needs_view else None
+        if u is not None and u.ndim == 2 and spec.anisotropic:  # vector field: the ZZ estimator sums components, but the
             raise NotImplementedError(  # anisotropic Hessian metric is scalar-only (a single Hessian field)
                 "anisotropic (Hessian-metric) adaptation is scalar-only; use isotropic ZZ "
                 "(AdaptSpec(anisotropic=False)) to refine a vector field."
             )
-        if spec.criterion is not None:
+        _crit = _resolve_criterion(spec.criterion, d)
+        _is_constraint = isinstance(_crit, Constraint)
+        if _is_constraint:
+            # A CONSTRAINT criterion (`jno.le(d.cell_aspect(), 6.0)`) states a condition, not a ranking:
+            # its signed margin is positive exactly on the cells that break it. Those are marked --
+            # all of them, not a fraction -- and `nothing_marked` below then means "the condition holds
+            # everywhere", which is the natural stopping rule and the reason no cadence argument exists.
+            _margin = _criterion_margin(cur, _crit, _full, int(spec.metric_field))
+            eta = np.maximum(_margin, 0.0)
+            est = float(_margin.max()) if _margin.size else 0.0
+        elif _crit is not None:
             # A user criterion REPLACES the recovery estimator: it says where to refine directly, which
             # is how production AMR actually marks (a density gradient, an interface, vorticity) rather
             # than by an error estimate. Everything downstream -- theta, refine_factor, the remesh
             # mechanism -- is untouched, so it composes with all of them.
-            eta, est = _criterion_indicators(cur, spec.criterion, _full, int(spec.metric_field))
+            eta, est = _criterion_indicators(cur, _crit, _full, int(spec.metric_field))
         else:
             eta, est = zz_error_indicators(d, u)
         n_dofs = int(np.asarray(d.mesh.points).shape[0])
-        marked = None if spec.anisotropic else dorfler_mark(eta, spec.theta)
+        if _is_constraint:
+            marked = None if spec.anisotropic else np.flatnonzero(_margin > 0.0).astype(np.int64)
+        else:
+            marked = None if spec.anisotropic else dorfler_mark(eta, spec.theta)
         # points/cells for a refinement animation (connectivity changes each round). Recorded with the
         # mesh's OWN cells rather than through `_mesh_cells`, which requires simplices: recording a
         # quad mesh needs no such thing, and going through it made the h path refuse HERE, one stage
@@ -2334,6 +2628,7 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
         # homogeneous problem after the first remesh.)
         for _name, _pred in list(getattr(d, "_tag_predicates", {}).items()):
             d.tag(_name, _pred)
+        d.__dict__.pop("_gauge_pin_coords", None)  # same reason as the relocation driver above
         cur = jno.fem(cons, **kw)  # re-assemble the same problem on the refined mesh
 
     # rebind the caller's FEM to the final adapted state so fem.points / A / b match ``u``
@@ -2686,6 +2981,157 @@ def _transient_march_fn(block):
     return march
 
 
+def _mesh_margin_fn(fem: Any, criterion: Any):
+    """Build ONCE a ``(arrs) -> per-cell margin`` for the interleaved mesh condition.
+
+    Built once and called every round, rather than rebuilt per round, because rebuilding is not free:
+    a geometry node captures the vertices when it is constructed, so re-creating it each round re-traces
+    and re-compiles, and 40 rounds of that exhausted the GPU outright (``cuSolver allocation failed``
+    from the objective's own solve, on a march that is fine without the check).
+
+    The trick that makes one build enough is that the node's closure already takes the trainable
+    coordinates as its arguments -- the same ``arrs`` the descent is stepping -- so calling it with the
+    current values asks about the current mesh without touching the domain at all.
+    """
+    crit = _resolve_criterion(criterion, fem.domain)
+    if not isinstance(crit, Constraint):
+        raise ValueError(
+            "relocate(...).remesh(criterion=...): the interleaved criterion must be a CONDITION -- "
+            "`jno.le(d.cell_aspect(), 2.0)` / `jno.ge(...)`. A plain expression is a ranking, and a "
+            "ranking cannot say whether the mesh is bad enough to stop and remesh, only which cells "
+            "are worst. Pass a constraint, or use `fem.solve(adapt=jno.solve.remesh(...))` on its own."
+        )
+    if not _criterion_is_geometric(crit.residual):
+        raise ValueError(
+            "relocate(...).remesh(criterion=...): the interleaved criterion must be a MESH-GEOMETRY "
+            "condition (`cell_aspect`, `cell_volume`, `cell_angles`). It is checked after every descent "
+            "round, on the moved vertices and with no solve, so a criterion reading the solution has "
+            "nothing to read. Put a solution criterion on a standalone jno.solve.remesh(...) instead."
+        )
+    fn = getattr(crit.expr, "fn", None)
+    if fn is None:
+        raise NotImplementedError(
+            "relocate(...).remesh(criterion=...): the bound must be placed directly on a geometry node "
+            "-- `jno.le(d.cell_aspect(), 2.0)` -- so it can be evaluated once per round from the moving "
+            f"coordinates. This criterion wraps a composite expression ({type(crit.expr).__name__}), "
+            "which would have to be re-traced every round; reduce it to a single node, or drive it from "
+            "a standalone jno.solve.remesh(...)."
+        )
+    bound, sense = float(crit.bound), crit.sense
+
+    def margin(arrs):
+        v = np.asarray(fn(*arrs)).reshape(-1)
+        return (v - bound) if sense == "le" else (bound - v)
+
+    return margin
+
+
+def _mesh_margin_now(fem: Any, criterion: Any) -> np.ndarray:
+    """The margin on the mesh AS IT STANDS -- used once the motion has been applied.
+
+    The trainable registry is put aside while the criterion is built and read. With it in place the
+    geometry node depends on the coordinate PARAMETERS, and evaluating it then refuses ("the graph
+    contains trainable parameter(s), whose trained weights live in the core") -- which is right, and
+    beside the point here: the vertices are already where they belong, so the question is about the
+    mesh itself and not about any design variable over it.
+    """
+    dom = fem.domain
+    saved_tc = list(getattr(dom, "_trainable_coords", None) or [])
+    dom._trainable_coords = []
+    try:
+        crit = _resolve_criterion(criterion, dom)
+        return _criterion_percell(fem, crit.residual)
+    finally:
+        dom._trainable_coords = saved_tc
+
+
+def _boundary_vertices(dom: Any) -> set:
+    """Vertex ids on the mesh's topological boundary."""
+    mask = dom.tag_node_mask("boundary", np.asarray(dom.mesh.points))
+    return set() if mask is None else {int(i) for i in np.flatnonzero(np.asarray(mask))}
+
+
+def _reregister_trainable(dom: Any, coord_specs: list, on_boundary: dict | None = None) -> None:
+    """Re-derive the movable vertices on a mesh whose node set has just changed.
+
+    Vertex indices do not survive a remesh; the region they came from does. Each spec records its
+    `tag`, so the same region is re-resolved against the new mesh and re-tagged `.trainable()`.
+
+    ``on_boundary`` names the specs whose vertices were ALL on the boundary before the remesh, and
+    those are held to the boundary afterwards. Without it a moving wall quietly recruits the interior:
+    a region predicate is positional (`y > f(x)` for the wall's ORIGINAL line), so once relocation has
+    carried the wall above it, every interior vertex the remesh creates in the space between also
+    satisfies it. MEASURED on a free surface that rose from y=1.0 to y=1.47: the movable set went
+    9 -> 17 -> 32 -> 53 vertices, of which 7, 18 and 34 were interior. They are not free to move --
+    moving them degrades elements, so the line search shrinks the step for everyone -- and per-round
+    motion fell 19x then 42x. The wall stops advancing while appearing to still be relocating.
+    """
+    dom._trainable_coords = []
+    bnd = _boundary_vertices(dom) if on_boundary else set()
+    for sp in coord_specs:
+        tag = sp.get("tag")
+        if not isinstance(tag, str):
+            raise NotImplementedError(
+                "relocate(...).remesh(...): a trainable coordinate was registered without the region it "
+                "came from, so it cannot be re-derived after a remesh (vertex indices do not survive "
+                "one). Re-tag it with `domain.variable(<region>, split=True)[axis].trainable()`."
+            )
+        parts = list(dom.variable(tag, split=True))
+        parts[int(sp["axis"])].trainable(name=sp["name"])
+        if on_boundary and on_boundary.get(sp["name"]):
+            fresh = dom._trainable_coords[-1]
+            keep = np.asarray([i for i in np.asarray(fresh["ids"], int) if int(i) in bnd], dtype=int)
+            if keep.size == 0:
+                raise RuntimeError(
+                    f"relocate(...).remesh(...): region {tag!r} named only boundary vertices before the "
+                    "remesh and names none after it, so there is nothing left to move. Its predicate no "
+                    "longer describes the surface -- write one that tracks it, or drive the surface from "
+                    "the outer loop."
+                )
+            fresh["ids"] = keep
+
+
+def _remesh_between_rounds(fem: Any, rspec: Any, coord_specs: list, margin: np.ndarray) -> bool:
+    """Refine the cells breaking the criterion, then put the problem back together on the new mesh.
+
+    Returns False when nothing breaks it (there is then nothing to do). Mirrors what the steady
+    h-driver does after a refinement -- re-tag the predicates, drop the gauge-pin cache -- plus the
+    part only a relocation march needs: the movable vertices have to be re-derived, because the ones
+    it was moving no longer exist.
+    """
+    import jno
+
+    dom = fem.domain
+    marked = np.flatnonzero(np.asarray(margin) > 0.0).astype(np.int64)
+    if marked.size == 0:
+        return False
+    # Which movable sets were purely boundary BEFORE the mesher runs -- afterwards the old mesh, and
+    # with it the only evidence of what the tag used to mean, is gone.
+    _bnd_before = _boundary_vertices(dom)
+    _on_boundary = {str(sp["name"]): all(int(i) in _bnd_before for i in np.asarray(sp["ids"], int)) for sp in coord_specs}
+    if rspec.split:
+        from .fem_refine import refine_domain
+
+        refine_domain(dom, marked, copy=False)
+    else:
+        _remesh_to_size(dom, size_field_from_marks(dom, marked, refine_factor=rspec.refine_factor), copy=False)
+    for _name, _pred in list(getattr(dom, "_tag_predicates", {}).items()):
+        dom.tag(_name, _pred)
+    dom.__dict__.pop("_gauge_pin_coords", None)  # same reason as every other rebuild in this file
+    # A SURFACE objective does not survive this rebuild yet. Its region resolves fine twice -- once on
+    # the old mesh and once eagerly on the new one (measured: 50 then 62 points, both concrete) -- and
+    # then a THIRD time from inside the traced objective, where `tag_node_mask` intersects with the
+    # catch-all "boundary" region through `jax.vmap` and converts the result to numpy, which a traced
+    # mask cannot do. A volume objective is unaffected. Clearing the trainable registry before the
+    # mesher, and re-sampling every region and its normals eagerly here, were both tried and neither
+    # helps: the third resolution happens regardless, because `fem.eval` builds a fresh term list on
+    # every call and so never hits the assembler's memo.
+    _reregister_trainable(dom, coord_specs, _on_boundary)
+    cur = jno.fem(fem._constraints, **fem._fem_kwargs)
+    fem.__dict__.update(cur.__dict__)
+    return True
+
+
 def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwargs: Any) -> np.ndarray:
     """Drive ``FEM.solve(adapt=AdaptSpec(relocate=True, ...))`` -- **r-adaptivity** (mesh relocation).
 
@@ -2821,8 +3267,36 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
             return newton_krylov(lambda uu: op.residual(uu, vals), u0)
         return _march(vals)  # transient: time-averaged nodal state over the marched trajectory
 
-    if spec.objective not in ("energy", "equidistribution", "huang"):
-        raise ValueError(f"AdaptSpec.objective must be 'energy', 'equidistribution' or 'huang'; got {spec.objective!r}.")
+    # A TRACED objective: any weak-form expression, assembled like a `criterion=` and summed to the
+    # scalar the descent already minimises. The three strings are mesh-quality functionals written in
+    # terms of a monitor; an expression says what the MESH IS FOR instead -- e.g. a free surface found
+    # by minimising the through-flow it should not carry.
+    _obj_expr = None if isinstance(spec.objective, str) else spec.objective
+    if _obj_expr is None and spec.objective not in ("energy", "equidistribution", "huang"):
+        raise ValueError(
+            f"AdaptSpec.objective must be 'energy', 'equidistribution', 'huang', or a weak-form "
+            f"expression; got {spec.objective!r}."
+        )
+    if _obj_expr is not None:
+        # The objective is a SCALAR, so it needs a scalar test function to be a weak term: multiplying a
+        # scalar by a vector field's test function gives one entry per component, which assembles to a
+        # different length than the scalar it came from and fails as a bare broadcasting error. On a
+        # multifield problem (a velocity/pressure saddle -- the case this feature is for) the pressure
+        # test is scalar, so pick the first scalar-valued field rather than making the caller know to.
+        _fidx = int(getattr(spec, "metric_field", 0) or 0)
+        if _vecs is not None and _fidx < len(_vecs) and _vecs[_fidx] > 1:
+            _scalar_fields = [i for i, vc in enumerate(_vecs) if vc == 1]
+            if not _scalar_fields:
+                raise NotImplementedError(
+                    "adapt(relocate=..., objective=<expression>): every field of this problem is "
+                    f"vector-valued (components per field: {list(_vecs)}), so there is no scalar test "
+                    "function to assemble a scalar objective against. Add a scalar field, or use one of "
+                    "the string objectives."
+                )
+            _fidx = _scalar_fields[0]
+        # Assembled ONCE, outside the descent: `_criterion_weak_terms` walks the form to recover the
+        # test symbol and the region, which is Python-level work that must not repeat per iteration.
+        _obj_weak, _ = _criterion_weak_terms(fem, _obj_expr, _fidx)
     if spec.relocate_method not in ("descent", "monge_ampere"):
         raise ValueError(f"AdaptSpec.relocate_method must be 'descent' or 'monge_ampere'; got {spec.relocate_method!r}.")
 
@@ -2848,7 +3322,16 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
         u = _solve_at(vals)
         pts = _scatter(vals)
         bounds = list(fem.offsets) if fem.offsets is not None else [0, int(u.shape[0])]
-        return _block_defect(u, pts, bounds), _block_energy(u, pts, bounds)
+        if _obj_expr is not None:
+            # `fem.eval` gives the term tested against every basis function, `int g phi_i`. Summing over
+            # i is `int g (sum_i phi_i)` = `int g` exactly, because a Lagrange basis is a partition of
+            # unity -- so this is the integral of the objective, not a mesh-dependent proxy for it.
+            # `args=vals` is what makes it differentiable in the vertex positions: the assembly rebuilds
+            # its geometry (and its facet normals) from those coordinates.
+            obj = jnp.sum(jnp.asarray(fem.eval(_obj_weak, u, args=vals)))
+        else:
+            obj = _block_defect(u, pts, bounds)
+        return obj, _block_energy(u, pts, bounds)
 
     val_grad = jax.jit(jax.value_and_grad(lambda arrs: _objective(dict(zip(names, arrs))), has_aux=True))
 
@@ -2916,25 +3399,108 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
         arrs = [jnp.asarray(history[best]["points"][sp["ids"], sp["axis"]]) for sp in coord_specs]
         return _finish_relocate(fem, dom, coord_specs, arrs, pts0, n_verts, dim, cells, history, solve_fn, kwargs)
 
+    _rspec = getattr(spec, "remesh_spec", None)
+    _margin_of = _mesh_margin_fn(fem, _rspec.criterion) if _rspec is not None else None
+    _breach_after = None  # the round on which relocation could no longer honour the condition
+    _blocking = None  # per-cell margin of the step that could not be taken -- the cells to refine
     msq = [jnp.zeros_like(a) for a in arrs]  # RMSProp running average (near-feature gradients dwarf the rest)
     for it in range(spec.max_iters):
         (obj, e), g = val_grad(arrs)
         msq = [0.9 * m + 0.1 * gi**2 for m, gi in zip(msq, g)]
         stepdir = [gi / jnp.sqrt(m + 1e-8) for gi, m in zip(g, msq)]
         a = spec.lr
+        # What a tight bound costs, MEASURED, so it is not a surprise: the step is full (0 halvings)
+        # while the mesh has room, collapses to 21-24 halvings as it reaches the bound -- which is what
+        # triggers the remesh -- and comes back at only 1-3 halvings afterwards, because a remesh MEETS
+        # the target rather than beating it and so leaves almost no room. Per-round vertex motion is
+        # then ~20x smaller than in the first segment, while the gradient is unchanged (4.7e-01 ->
+        # 4.1e-01): the descent still wants to move, it is simply not allowed to.
+        #
+        # Relaxing this to "never worse than the mesh already is" was tried, to let a marginal mesh
+        # keep stepping. It changed the motion by nothing at all -- after a remesh the mesh is
+        # genuinely admissible, so the relaxed rule IS this rule -- and it cost the guarantee, since
+        # the march could then end on a mesh that breaks the condition. Reverted. The fix worth having
+        # is slack in the remesh target, not a weaker step test.
         for _ in range(25):  # backtracking line search: shrink the step until no element inverts
             cand = [ai - a * si for ai, si in zip(arrs, stepdir)]
-            if _min_detj(_moved(cand)) > floor:
+            if _min_detj(_moved(cand)) > floor and (_margin_of is None or float(_margin_of(cand).max()) <= 0.0):
                 break
             a *= 0.5
         else:
-            break  # at the mesh-quality limit -- no admissible step
+            # No admissible step. Without a mesh condition that means the relocation has reached the
+            # validity limit and stops. WITH one it means relocation can no longer honour the condition
+            # by moving nodes alone -- which is precisely when more nodes are the answer, so it becomes
+            # the remesh trigger.
+            #
+            # The condition is tested INSIDE the line search rather than after the round for a measured
+            # reason: one accepted step can carry the mesh far past the bound in a single move, and a
+            # check that runs afterwards only reports the damage. Breach margins over a march grew
+            # +0.019 -> +0.555 -> +1.070 -> +3.375 that way, on a bound of 1.7. Vetting the candidate
+            # keeps every accepted mesh admissible instead.
+            if _rspec is not None:
+                _breach_after = it
+                # Mark the cells that BLOCK the step, not the ones violating: the line search keeps the
+                # accepted mesh admissible, so at the moment relocation gets stuck nothing violates yet
+                # and marking on the current mesh finds nothing at all. The binding set is the cells
+                # that would break under the smallest step still tried -- those are what more nodes fix.
+                _blocking = _margin_of(cand)
+            break
         arrs = cand
         # ``objective`` is what is descended (the equidistribution defect); ``energy`` is kept as a
         # diagnostic. ``points``: the moved vertices, so a relocation run can be animated.
-        history.append({"step": it, "objective": float(obj), "energy": float(e), "points": _moved(arrs)})
+        _entry = {"step": it, "objective": float(obj), "energy": float(e), "points": _moved(arrs)}
+        if _rspec is not None:
+            # Record the connectivity too, but only when a remesh can change it: without one the cells
+            # are fixed and one array describes the whole march, while with one the `points` of two
+            # rounds need not even share a length. The h-driver records cells for the same reason -- a
+            # picture of the march needs the mesh each round actually had.
+            _entry["cells"] = np.asarray(cells).copy()
+        history.append(_entry)
 
-    return _finish_relocate(fem, dom, coord_specs, arrs, pts0, n_verts, dim, cells, history, solve_fn, kwargs)
+    u_out = _finish_relocate(fem, dom, coord_specs, arrs, pts0, n_verts, dim, cells, history, solve_fn, kwargs)
+    if _rspec is None or _breach_after is None:
+        return u_out
+    # The descent stopped because the mesh needs more nodes, not because it converged. Refine the cells
+    # that broke the condition and resume with the rounds that are left: `_finish_relocate` has already
+    # applied the motion and rebuilt the problem, so the mesh handed to the remesh is the moved one.
+    _remaining = int(spec.max_iters) - int(_breach_after)
+    _prev_history = list(getattr(fem, "adapt_history", []) or [])
+
+    # Budget and size cap, both from the nested spec. An unreachable bound would otherwise refine
+    # without end: MEASURED, before the line search enforced the condition, 44 -> 61 -> 110 -> 243 ->
+    # 503 -> 1161 -> 2911 -> 7104 -> 15709 vertices, finishing as an out-of-memory failure inside the
+    # solver rather than as anything naming the cause.
+    def _give_up(why: str):
+        """Stop remeshing -- but never hand back a mesh that breaks the condition without saying so."""
+        _left = float(np.max(_mesh_margin_now(fem, _rspec.criterion)))
+        if _left > 0.0:
+            raise RuntimeError(
+                f"relocate(...).remesh(criterion=...): {why}, and the mesh still breaks the condition "
+                f"by {_left:.3e}. Relocation keeps every step admissible, so this is a mesh the "
+                "refinement could not repair: raise the bound (an unstructured 2-D mesh bottoms out "
+                "near cell_aspect 1.2-1.5), or give it more room with remesh(max_iters=/max_dofs=)."
+            )
+        return u_out
+
+    if int(_rspec.max_iters) <= 0 or _blocking is None:
+        return _give_up("the remesh budget is spent")
+    if _rspec.max_dofs is not None and int(np.asarray(fem.domain.mesh.points).shape[0]) >= int(_rspec.max_dofs):
+        return _give_up("max_dofs is reached")
+    if _remaining <= 0:
+        return _give_up("the relocation rounds are spent")
+    if not _remesh_between_rounds(fem, _rspec, coord_specs, _blocking):
+        return _give_up("no cell could be marked")
+    import copy as _copy
+
+    _sub = _copy.copy(spec)
+    _sub.max_iters = _remaining
+    # One remesh spent. Without this the recursion may remesh once per remaining descent round.
+    _sub.remesh_spec = _copy.copy(_rspec)
+    _sub.remesh_spec.max_iters = int(_rspec.max_iters) - 1
+    out = run_adaptive_relocate(fem, _sub, solve_fn=solve_fn, **kwargs)
+    # One march, one history: the rounds before the remesh belong to it as much as the ones after.
+    fem.adapt_history = _prev_history + list(getattr(fem, "adapt_history", []) or [])
+    return out
 
 
 def _finish_relocate(fem, dom, coord_specs, arrs, pts0, n_verts, dim, cells, history, solve_fn, kwargs):
@@ -2966,6 +3532,12 @@ def _finish_relocate(fem, dom, coord_specs, arrs, pts0, n_verts, dim, cells, his
     dom._trainable_coords = []  # relocation consumed the tags; the moved vertices are now the geometry
     for _name, _pred in list(getattr(dom, "_tag_predicates", {}).items()):
         dom.tag(_name, _pred)
+    # Drop the cached p.pin() gauge nodes so `_lower_gauge_pin` re-creates the single-vertex pin region
+    # on the MOVED mesh. `move_mesh` resets the custom-tag state, and the pin's point-region is minted
+    # by the front end rather than held in `_tag_predicates`, so nothing above re-derives it: the
+    # rebuilt form then carried a trial-without-test term whose region no longer existed and `jno.fem`
+    # refused it as a whole-domain volume. The transient driver already does this; this path did not.
+    dom.__dict__.pop("_gauge_pin_coords", None)
     cur = jno.fem(fem._constraints, **fem._fem_kwargs)
     u_final = np.asarray(cur.solve(solve_fn, **kwargs)).reshape(-1)
     fem.__dict__.update(cur.__dict__)
@@ -3775,7 +4347,9 @@ def _geometry_velocity(spec: dict, dom: Any, state: Any) -> np.ndarray:
     return v[perm]
 
 
-def run_mesh_motion(fem: Any, *, solve_fn: Any = None, **kwargs: Any) -> "AdaptiveTrajectory":
+def run_mesh_motion(
+    fem: Any, *, solve_fn: Any = None, nonlinear: Any = None, linear: Any = None, precond: Any = None, **kwargs: Any
+) -> "AdaptiveTrajectory":
     """March a transient problem whose ``jno.fem([...])`` list contains **geometry terms** — the mesh moves
     as those terms say, the physics marches on the moved mesh, and the state is carried across each move.
 
@@ -3823,8 +4397,9 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, **kwargs: Any) -> "Adapti
       across a coupled system (a Taylor–Hood pair moves as one), in 2D or 3D, linear or **nonlinear** (the
       block's Newton branch). All of those are covered by tests. Complex, periodic, a non-nodal family
       (RT / Nédélec / Hermite / Argyris / Morley) and a custom ``solve_fn`` each raise. Note the nonlinear
-      branch does not take ``_step_solve``: ``SemidiscreteTimeBlock.step`` threads ``linear_solve`` only
-      through the linear path, so a nonlinear march runs ``newton_krylov`` at its own defaults.
+      branch takes the composed ``nonlinear=``/``linear=``/``precond=`` slots instead of ``_step_solve``
+      (``SemidiscreteTimeBlock.step`` threads ``linear_solve`` only through the linear path), so a
+      nonlinear march reaches a sparse-direct Newton rather than ``newton_krylov`` at its own defaults.
     - **Needs ``jax_enable_x64``** and raises without it — see the guard below for the measurement.
     - **Every frame on the block's own time grid.** There is no ``save_ts=``: it used to be accepted here
       and silently ignored (a request for 3 frames returned the grid's 4), and it evaded the
@@ -4019,7 +4594,21 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, **kwargs: Any) -> "Adapti
     # every step was burning its whole GMRES budget, the same jit measured 1.0x and looked worthless. A
     # microbenchmark here once claimed 574x for it, which was wrong in the other direction -- it timed the
     # jitted step without `block_until_ready`, measuring how long it took to QUEUE the step, not to run it.
-    _jstep = jax.jit(lambda u_, t_, a_: block.step(u_, t_, dt, args=a_, theta=theta, linear_solve=_step_solve))
+    # The per-step slots, composed once: `nonlin_s` drives the implicit solve inside a step (and a
+    # sparse-direct Newton assembles the backward-Euler step tangent itself -- `step` handles that),
+    # `lin_s` replaces the built-in theta-step solve. With no slots given both are None and the march
+    # keeps its previous behaviour exactly: `_step_solve` on the linear path, `newton_krylov` defaults
+    # on the nonlinear one.
+    lin_s = nonlin_s = None
+    if nonlinear is not None or linear is not None or precond is not None:
+        from .solver_api import compose_transient_step_solvers
+
+        lin_s, nonlin_s = compose_transient_step_solvers(nonlinear, linear, precond, fem, block)
+    _lin = lin_s if lin_s is not None else _step_solve
+
+    _jstep = jax.jit(
+        lambda u_, t_, a_: block.step(u_, t_, dt, args=a_, theta=theta, linear_solve=_lin, nonlinear_solve=nonlin_s)
+    )
 
     # Connectivity is PRESERVED by construction here (move_mesh never retriangulates), so every frame can
     # share one cell array instead of copying it. A frame-per-copy costs n_steps x n_cells x (dim+1) x 8 B
@@ -4137,7 +4726,15 @@ def run_mesh_motion(fem: Any, *, solve_fn: Any = None, **kwargs: Any) -> "Adapti
         # 3) step on the moved mesh. The operator and the mass are re-formed from the moved vertices HERE,
         #    inside the step, through `args` -- `_apply_coord_params` scatters them into the P1 geometry
         #    before the element Jacobian, so J, detJ, JxW, physical gradients and the facet normals follow.
-        u_n = block.step(u_t, t0c.astype(u_c.dtype), dt, args=_coord_args(X_n), theta=theta, linear_solve=_step_solve)
+        u_n = block.step(
+            u_t,
+            t0c.astype(u_c.dtype),
+            dt,
+            args=_coord_args(X_n),
+            theta=theta,
+            linear_solve=_lin,
+            nonlinear_solve=nonlin_s,
+        )
         bad = (bad[0] | tangled, bad[1] | jnp.any(esc_cell))
         return (u_n, X_n, bad), (u_n, X_n)
 

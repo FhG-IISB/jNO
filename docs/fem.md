@@ -1173,6 +1173,99 @@ time-averaged objective), periodic, and complex** problems, scalar or vector —
 solution block, so a complex field's real and imaginary parts both contribute. Only complex-*transient* is
 not wired yet.
 
+### A mesh objective that names the physics — `objective=<expression>`
+
+The three built-in objectives (`"equidistribution"`, `"energy"`, `"huang"`) are mesh-*quality* measures:
+they read the solution only through a monitor, so they can ask for resolution but cannot state a goal
+about the physics. `objective=` also accepts a **weak-form expression**, assembled exactly as
+`criterion=` is and summed to a scalar, over a **volume or a boundary** region:
+
+```python
+xs, ys, nx, ny = domain.variable("side", normals=True, split=True)
+ys.trainable()                                   # the wall may move along y only
+us, vs = u.bind(x=xs, y=ys), v.bind(x=xs, y=ys)
+fem.solve(adapt=jno.solve.relocate(objective=(us[0]*nx + us[1]*ny)**2 * vs[0]))
+```
+
+That is a **free surface**: the wall moves until the flow through it vanishes. The facet normals are
+rebuilt from the moving vertices, so `n` is the *current* mesh's normal. The gradient runs through the
+solve — matched to central differences at `7.5e-09` — and the through-flow falls `11.4x` over 60 rounds
+(`12.5x` at 120, so this is a descent, not a root-find).
+
+The benchmark deserves a word, because the obvious version of it measures nothing. In a channel with a
+**symmetry** bottom, uniform flow `u = (1,0)`, `p = 0` satisfies every equation and boundary condition
+for *any* shape of the traction-free top: measured, the solution stayed uniform to `2.3e-14` and moved
+by `9.8e-14` when the wall was displaced by `0.1`. The objective is then purely geometric — it exercises
+the normals and the facet measure but never the solve. A **no-slip** bottom couples them (`max|du| =
+7.2e-02` for the same displacement), and only then is `d(objective)/d(vertex)` a statement about the
+physics rather than about the mesh.
+
+Three things to know:
+
+* The objective is a **scalar**, so it needs a scalar test function; on a velocity/pressure saddle the
+  pressure test is chosen automatically.
+* When the expression reaches its region only through a **bound view** — `u.bind(x=xs, y=ys)` absorbs
+  its coordinates — the test function cannot be auto-bound. Carry it yourself, as above
+  (`* vs[0]`). That case raises with this instruction rather than a trace-level binding error.
+* A surface objective needs the **form** to carry a surface term, because the facet quadrature tables
+  are tabulated at build time only then. A traction-free wall (`0.0 * vs[0]`) in the term list is enough.
+
+**A mesh condition, as an inequality.** `criterion=` also takes a `jno.le` / `jno.ge` constraint, and
+then it is its own trigger — there is no cadence or threshold argument, because the condition already
+says both *where* and *whether*:
+
+```python
+fem.solve(adapt=jno.solve.remesh(criterion=lambda d: jno.le(d.cell_aspect(), 2.0), max_iters=6))
+```
+
+Every cell whose margin is positive is marked — all of them, not a Dörfler fraction — and the march
+stops when none is. Measured on a deliberately stretched mesh: worst aspect `2.87 → 1.57` in one
+round, `0` marked on the next. `theta` is refused with a constraint (there is no bulk fraction to
+choose), and a bare comparison (`q > 2.0`) is refused too: it records which cells are bad but not by
+how much, so marking would take a fraction of them and quietly leave the rest.
+
+Two things to know. **Set a threshold the mesher can actually reach** — an unstructured 2-D mesh
+bottoms out around `1.2`–`1.5`, and a constraint below that never settles, so the march refines until
+it runs out of rounds. And pass a **callable** for a geometry criterion: a geometry node captures the
+cell table when it is constructed, so a single node keeps answering for the mesh it was born on and is
+refused by name once the topology changes.
+
+**When moving nodes is not enough: `relocate(...).remesh(...)`.** Relocation moves a *fixed* node set,
+so once the mesh has to stretch further than its elements allow it can do nothing — `quality_floor` is
+a line search that rejects the step, and rejecting a step never adds a node. Chain an h-step onto it
+and say what "too far" means:
+
+```python
+fem.solve(adapt=jno.solve.relocate(objective=through, max_iters=200)
+                         .remesh(criterion=lambda d: jno.le(d.cell_aspect(), 2.0), max_iters=4))
+```
+
+The condition is checked **inside the relocation line search**, on each candidate step, so an
+inadmissible mesh is never accepted — the march honours the bound exactly rather than reporting a
+breach after the fact. When no admissible step exists, relocation has run out of room and the cells
+*blocking* it are refined; the movable vertices are then re-derived from the **region** each was tagged
+on, since indices do not survive a remesh. Measured on a Poisson peak, bound `1.7`: `44 → 80` vertices
+over 3 remeshes, final worst aspect exactly `1.700`, objective still falling `8.4e-02 → 2.0e-02`.
+
+The nested spec's `max_iters` caps how many remeshes the march may spend and `max_dofs` caps the size.
+If the budget runs out while the mesh still breaks the condition, that is **raised**, not returned
+quietly — refining does not repair every shape, and a bound below what the mesher can deliver would
+otherwise refine without end (measured, before this: `44 → … → 15709` vertices and an out-of-memory
+failure inside the solver).
+
+Scope: the interleaved criterion must be a **mesh-geometry condition** (`cell_aspect`, `cell_volume`,
+`cell_angles`), because it is evaluated on the moving vertices with no solve, and the bound must sit
+directly on one node so it can be evaluated once per round rather than re-traced. A solution criterion
+belongs on a standalone `jno.solve.remesh(...)`.
+
+**Mesh quality as a term you can write.** `domain.cell_aspect()` is the longest edge over the inradius,
+scaled so a **regular** simplex reads exactly `1.0` and a stretched one reads more — per cell, 2-D and
+3-D, and differentiable in the vertex positions (checked against central differences at `2.7e-10`).
+It is the companion to `domain.cell_size`, which is `|det J|^(1/dim)` — an isotropic *size* that cannot
+see stretch at all, since a sliver and a regular element of the same area share it. `domain.cell_angles()`
+also measures distortion but is 2-D only. Reference: Shewchuk, *What Is a Good Linear Finite Element?*
+(2002), §2.
+
 Tagging is **literal and per-axis**: `xm.trainable()` frees only the x column. On a boundary that is the
 lever for sliding — free an edge's along-edge axis and its nodes redistribute *within* the wall, leave the
 normal axis untagged and the domain shape is preserved exactly.
@@ -1508,6 +1601,33 @@ default (no external dependency): the linear default is a sparse-direct factoris
 alternative; the nonlinear default is a matrix-free Newton-Krylov, and the transient default
 backward-Euler over those. All are implicit-diff, so `crux.solve` recovers parameters through them.
 
+### Solving *at* a value — `fem.solve(k=...)`
+
+A parameter is not always an unknown to recover; often it is a knob you sweep. Give it a value and the
+solve happens **now**, returning the array rather than a node for `crux`:
+
+```python
+cap = jno.np.parameter((1,), name="cap")
+fem = jno.fem([...])                                # built ONCE
+x = None
+for v in np.geomspace(G / 2000.0, G, 8):            # a continuation, as a plain Python loop
+    x = fem.solve(cap=v, x0=x, nonlinear=jno.solve.newton(direct=True))
+```
+
+The alternative — rebuilding `jno.fem` per value — re-meshes, re-assembles and re-compiles the whole
+problem to change one number. Measured on an 8-value sweep: **6.20 s rebuilding, 0.55 s this way**.
+The solve is staged **once** (6 tracings for 8 values, not 48) because the value arrives as a runtime
+argument and jit keys on shape, not on value; `x0=` warm-starts across the sweep without re-staging.
+
+It composes with everything the ordinary solve does, including `newton(direct=True)` on a **reduced**
+(slip / periodic) system — the case `fem.solve(continuation=...)` still cannot serve, since that driver
+hands its solver no assembled tangent. `fem.stats` reports the verdict as usual: the jit hides the
+driver's own convergence check, so the judgement is remade outside it, on the *reduced* residual where
+there is one.
+
+Give **every** parameter a value or none: a partly-supplied problem is refused by name, and with none
+supplied `fem.solve()` is the trace node it always was, for `crux` to resolve.
+
 ### Choosing the solver — the slot API (`jno.solve` / `jno.precond`)
 
 Between "accept the default" and "write a full `solve_fn`" sits the **slot API**: the solver
@@ -1538,7 +1658,7 @@ Pick by structure:
 | SPD, batched/GPU-heavy | `chebyshev` | inner-product free (no reductions) — Golub & Varga 1961 |
 | indefinite, single solve | `lu` | sparse-direct; **no vmap rule** — use a Krylov solver inside batched solves |
 | cuSolver refuses it, or is slow | `lu(backend="host")` | factors on the HOST (SuperLU) and drives it from the device; same answer and same gradients (wrapped in `custom_linear_solve`, transpose via SuperLU `trans="T"`). Measured **faster** where cuSolver also works — Stokes 21,839 DOFs 0.27 s vs 1.67 s, H(curl) 17,072 complex DOFs 13.3 s vs 36.4 s — and it runs meshes cuSolver rejects (Stokes 26,908, H(curl) 26,154, both of which fail on GPU). Affordable because a direct solve factorises **once**: the operator crosses PCIe once, not per iteration. Read the win as *cuSolver's sparse LU is weak*, not *GPUs lose* — see the row below |
-| **shift-invert eigs, or a constant-operator transient** | `lu(backend="cudss")` | NVIDIA cuDSS — the **fastest** direct backend wherever it runs, because it separates the symbolic *plan* from the numeric *factorization* and jNO caches on the **sparsity**, so the plan survives a change of values. Against `backend="host"` on an RTX 3070 (fp64 at 1/64 rate — the *unfavourable* card): Stokes saddle factorization **3.4 ms vs 79.9 ms**, lap3d 50³ **576 ms vs 64,856 ms**, and **64.7× per Newton step** at n=64,000. Also factors the Stokes saddle cuSolver calls *singular*, with smaller residuals. Needs the optional stack (`nvmath-python`, `cudss`, `cupy`); raises a clear `ImportError` otherwise. Fill-in still governs 3-D (69×→218× nnz growth at lap3d 20³–40³), so it moves the ceiling and makes **device memory** the binding constraint — it is not a substitute for a preconditioner  Two things happen automatically: a **block right-hand side** `(n, k)` is solved in one call (measured **2.7× at k=4 to 5.4× at k=16** over the same factorization solved column by column — this is what the shift-invert eigensolver's subspace iteration needs every sweep), and an exactly symmetric operator is factored as **LDLᵀ instead of general LU** (1.41× faster, **1.38× less peak device memory** on lap3d 40³). Symmetry is tested to within a few ulps rather than bitwise — an assembled FEM tangent for a symmetric form is symmetric only up to *assembly round-off* (a vector element block contracts components in a different order for `(a,i),(b,j)` than for `(b,j),(a,i)`, measured **0.25 ulps**), so a bitwise rule sent every vector and coupled problem down the general-LU branch. Within the gate the two triangles are **averaged**, a correction bounded by the asymmetry it removes and therefore no larger than the round-off already in the matrix; outside it nothing is touched. The margin is not a knife-edge: the weakest *genuine* asymmetry that can be constructed — an advection coefficient of 1e-12, meaningless beside the Laplacian — is already **191 ulps**. Measured end-to-end on a 3-D vector tangent, general → symmetric is **1.07–1.13×** at 3.4k–11.8k DOFs (growing with size) and **1.10–1.62×** on lap3d 20³–50³. The rest of the rule stands: symmetry is still tested and SPD is never inferred — a matrix symmetric only to ~1e-15 would otherwise be silently factored as `(A+Aᵀ)/2`, and a wrong SPD guess returns NaN. A singular operator **raises**: cuDSS signals it through neither an exception nor a NaN, returning a finite plausible vector instead |
+| **shift-invert eigs, or a constant-operator transient** | `lu(backend="cudss")` | NVIDIA cuDSS — the **fastest** direct backend wherever it runs, because it separates the symbolic *plan* from the numeric *factorization* and jNO caches on the **sparsity**, so the plan survives a change of values. Against `backend="host"` on an RTX 3070 (fp64 at 1/64 rate — the *unfavourable* card): Stokes saddle factorization **3.4 ms vs 79.9 ms**, lap3d 50³ **576 ms vs 64,856 ms**, and **64.7× per Newton step** at n=64,000. Also factors the Stokes saddle cuSolver calls *singular*, with smaller residuals. Needs the optional stack (`nvmath-python`, `cudss`, `cupy`); raises a clear `ImportError` otherwise. Fill-in still governs 3-D (69×→218× nnz growth at lap3d 20³–40³), so it moves the ceiling and makes **device memory** the binding constraint — it is not a substitute for a preconditioner  Two things happen automatically: a **block right-hand side** `(n, k)` is solved in one call (measured **2.7× at k=4 to 5.4× at k=16** over the same factorization solved column by column — this is what the shift-invert eigensolver's subspace iteration needs every sweep), and an exactly symmetric operator is factored as **LDLᵀ instead of general LU** (1.41× faster, **1.38× less peak device memory** on lap3d 40³). Symmetry is tested to within a few ulps rather than bitwise — an assembled FEM tangent for a symmetric form is symmetric only up to *assembly round-off* (a vector element block contracts components in a different order for `(a,i),(b,j)` than for `(b,j),(a,i)`, measured **0.25 ulps**), so a bitwise rule sent every vector and coupled problem down the general-LU branch. Within the gate the two triangles are **averaged**, a correction bounded by the asymmetry it removes and therefore no larger than the round-off already in the matrix; outside it nothing is touched. The margin is not a knife-edge: the weakest *genuine* asymmetry that can be constructed — an advection coefficient of 1e-12, meaningless beside the Laplacian — is already **191 ulps**. Measured end-to-end on a 3-D vector tangent, general → symmetric is **1.07–1.13×** at 3.4k–11.8k DOFs (growing with size) and **1.10–1.62×** on lap3d 20³–50³. The rest of the rule stands: symmetry is still tested and SPD is never inferred — a matrix symmetric only to ~1e-15 would otherwise be silently factored as `(A+Aᵀ)/2`, and a wrong SPD guess returns NaN. A **replaced pivot** is first given iterative refinement against the true matrix (Wilkinson 1963 — the remedy cuDSS's own docs prescribe), so a zero-pivot-but-nonsingular operator or a marginally conditioned saddle is *solved* (refined to ~1e-10 per solve, one SpMV per step) rather than refused; a genuinely singular operator — one whose refinement residual will not contract — still **raises**: cuDSS signals it through neither an exception nor a NaN, returning a finite plausible vector instead |
 | **a Newton loop** (or no GPU / a factorization too big for device memory) | `lu(backend="pardiso")` | Intel MKL PARDISO, multithreaded CPU. **The fastest factorization of the four**, and like cuDSS it splits symbolic analysis from numeric factorization, so a Newton step reuses the analysis. On lap3d 50³ (n=125,000) against single-threaded SuperLU's 65,212 ms: factorization **298 ms**, Newton re-factorization **296 ms — 220×**, where cuDSS reaches 115×. Its adjoint is cheaper too — `Aᵀx = b` comes from the *same* factorization rather than a second one. An exactly symmetric operator uses LDLᵀ (1.9× on lap3d 50³, 13× on a saddle), which needs the upper triangle with an **explicit diagonal** — without that a saddle's constraint rows come back empty and PARDISO rejects the matrix. Like cuDSS it returns finite garbage on a singular operator, so jNO checks the perturbed-pivot count and **raises**. `pip install jax-numerical-operators[pardiso]`, x86-64 |
 | small systems / coarse blocks | `dense` | LAPACK, vmap-native |
 

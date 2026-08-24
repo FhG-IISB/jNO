@@ -1590,7 +1590,10 @@ class Variable(Placeholder):
         if registry is None:
             registry = []
             dom._trainable_coords = registry
-        registry.append({"ids": ids, "axis": axis_idx, "expr": param, "name": pname})
+        # `tag` as well as `ids`: a vertex INDEX is meaningless the moment a remesh changes the node
+        # set, while the region it came from still names the same piece of boundary, so an adaptive
+        # march can re-derive which vertices are movable instead of losing them.
+        registry.append({"ids": ids, "axis": axis_idx, "expr": param, "name": pname, "tag": self.tag})
         return param
 
     @staticmethod
@@ -3746,8 +3749,15 @@ class FemResidualOperator:
             -self.residual(u, args),
         )
 
-    def solve(self, solve_fn=None, *, u0=None):
+    def solve(self, solve_fn=None, *, u0=None, values=None):
         """Differentiable nonlinear forward solve of ``R(u, θ) = 0`` as a trace node.
+
+        ``values`` supplies the runtime parameters ``θ`` directly -- ``fem.solve(cap=3.5)`` -- and the
+        solve is then performed **eagerly** and returns the array, instead of returning a node for
+        ``crux`` to evaluate later. That is the difference between marching a parameter and rebuilding
+        the problem for each value of it: the operator is assembled once and the number is an argument.
+        Everything else is unchanged, including the assembled tangent handed to a sparse-direct Newton,
+        so a reduced (slip/periodic) system keeps its ``PᵀJP``.
 
         Returns a :class:`FunctionCall` field. When evaluated (e.g. inside
         ``crux.solve``), runtime parameters ``θ`` are resolved to their current
@@ -3781,6 +3791,10 @@ class FemResidualOperator:
 
                 return newton_krylov(residual_fn, y0)
 
+            # The default solver is one fixed function, so it gets one fixed identity -- built fresh
+            # per call, it would otherwise defeat the compiled-solve cache below on every call.
+            solve_fn.cache_key = ("default_jfnk",)
+
         names = list(self.runtime_parameter_exprs)
         params = [self.runtime_parameter_exprs[n] for n in names]
 
@@ -3794,7 +3808,46 @@ class FemResidualOperator:
                 return solve_fn(residual_fn, u0, jacobian=lambda u: self.jacobian(u, args))
             return solve_fn(residual_fn, u0)
 
-        return FunctionCall(_solve, params, name="fem_solve")
+        if values is None:
+            return FunctionCall(_solve, params, name="fem_solve")
+        # Eager: the caller named the parameters, so there is nothing left for `crux` to resolve.
+        unknown = sorted(set(values) - set(names))
+        if unknown:
+            raise TypeError(
+                f"fem.solve(): unknown runtime parameter(s) {unknown!r}. This problem exposes {sorted(names)!r}."
+            )
+        missing = sorted(set(names) - set(values))
+        if missing:
+            raise ValueError(
+                f"fem.solve(): this problem is parametric in {sorted(names)!r} and no value was given "
+                f"for {missing!r}. Give every parameter a value to solve here and now, or give none and "
+                "let `crux` resolve them (the solve is then a trace node, not an array)."
+            )
+        # JITTED and cached, with the values and the initial guess as TRACED arguments. Without the
+        # jit, every call re-stages the solver -- `lax.while_loop` / `custom_root` / `linearize` trace
+        # their bodies on each Python call -- so an 8-value sweep cost 48 tracings and the whole point,
+        # not rebuilding the problem to change a number, was half lost: MEASURED 6.20 s rebuilding per
+        # value, 4.58 s eager here, 0.85 s jitted (6 tracings, and a sparse-direct Newton keeps working
+        # under it). jit keys on shape and dtype rather than value, so one executable serves the sweep.
+        vals_t = tuple(jnp.asarray(values[n]) for n in names)
+        u0_t = jnp.asarray(u0)
+        # By the solver's VALUE identity where it has one: `fem.solve` builds a fresh composed solver
+        # per call, so `id()` alone never matched and every call re-compiled.
+        _sk = getattr(solve_fn, "cache_key", None) or id(solve_fn)
+        key = (_sk, u0_t.shape, u0_t.dtype, tuple((v.shape, v.dtype) for v in vals_t))
+        cache = self.__dict__.setdefault("_eager_solve_cache", {})
+        fn = cache.get(key)
+        if fn is None:
+
+            def _run(u0_arg, *value_args):
+                args = dict(zip(names, value_args))
+                rf = lambda u: self.residual(u, args)  # noqa: E731
+                if getattr(solve_fn, "wants_jacobian", False) and self.jacobian is not None:
+                    return solve_fn(rf, u0_arg, jacobian=lambda u: self.jacobian(u, args))
+                return solve_fn(rf, u0_arg)
+
+            fn = cache[key] = jax.jit(_run)
+        return fn(u0_t, *vals_t)
 
     def __repr__(self):
         return (

@@ -1451,3 +1451,50 @@ def test_a_moving_march_converges_in_space_and_higher_order_pays():
     for order in (1, 2):
         assert errs[(order, 0.1)] < errs[(order, 0.2)], f"P{order} did not converge in h: {errs}"
     assert errs[(2, 0.1)] < errs[(1, 0.1)], f"P2 is not more accurate than P1 at the same mesh: {errs}"
+
+
+def _heat_nonlinear(d, *geometry):
+    """A NONLINEAR heat problem plus geometry terms: the conductivity depends on the solution, so the
+    per-step solve is a Newton rather than a theta-step."""
+    u, v = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _tb = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi)
+    return jno.fem(
+        [
+            ui.t * vi + (0.05 + 0.02 * ui * ui) * (ui.x * vi.x + ui.y * vi.y),
+            u(xb, yb) - 0.0,
+            u(ci[0], ci[1]) - 1.0,
+            *geometry,
+        ]
+    )
+
+
+def test_the_per_step_solver_slots_reach_a_moving_mesh():
+    """`nonlinear=`/`linear=`/`precond=` configure the solve INSIDE one step; the march does not own
+    that. They used to be refused wholesale, which left a moving-mesh problem on the matrix-free
+    default with no way to reach a sparse-direct Newton -- the only thing that converges on a saddle
+    step. Same march, same answer, different per-step driver."""
+    d = _dom()
+    _xb, yb, tb = d.variable("boundary", split=True)
+
+    base = _heat_nonlinear(d, yb.d(tb) - 0.1).solve()
+    direct = _heat_nonlinear(d, yb.d(tb) - 0.1).solve(nonlinear=jno.solve.newton(direct=True))
+
+    a = np.asarray(base.states[-1]).reshape(-1)
+    b = np.asarray(direct.states[-1]).reshape(-1)
+    assert a.shape == b.shape and np.all(np.isfinite(b))
+    assert b == pytest.approx(a, rel=1e-6, abs=1e-8), "the per-step driver changed the answer"
+    # ...and the mesh really did march, so this is not two identical no-ops being compared.
+    p0, p1 = direct.meshes[0][0], direct.meshes[-1][0]
+    assert not np.allclose(p0[:, 1], p1[:, 1]), "the mesh never moved"
+
+
+def test_a_march_owning_argument_is_still_refused_on_a_moving_mesh():
+    """Relaxing the guard for the per-step slots must not let anything that owns a MARCH through."""
+    d = _dom()
+    _xb, yb, tb = d.variable("boundary", split=True)
+    for kw in ({"adapt": jno.solve.remesh()}, {"time": jno.solve.theta(0.5)}):
+        with pytest.raises(NotImplementedError, match="does not compose"):
+            _heat(d, yb.d(tb) - 0.1).solve(**kw)

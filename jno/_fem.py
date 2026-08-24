@@ -30,7 +30,7 @@ import functools
 import inspect
 import warnings
 from functools import partial
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -1296,6 +1296,7 @@ class FEM:
         solve_fn=None,
         *,
         adapt=None,
+        continuation=None,
         x0=None,
         nonlinear=None,
         linear=None,
@@ -1451,6 +1452,7 @@ class FEM:
                 result = self._solve_dispatch(
                     solve_fn,
                     adapt=adapt,
+                    continuation=continuation,
                     x0=x0,
                     nonlinear=nonlinear,
                     linear=linear,
@@ -1635,9 +1637,33 @@ class FEM:
         time=None,
         tau=None,
         shard=None,
+        continuation=None,
         **kwargs,
     ):
         """Mode dispatch for :meth:`solve` — returns the solution array or a differentiable trace node."""
+        if continuation is not None:
+            # Parameter continuation owns the sequence of solves, so it is dispatched before the mode
+            # branches: each step is an ordinary steady solve, warm-started from the last.
+            from .utils.solver.solver_api import run_continuation
+
+            return run_continuation(
+                self, continuation, nonlinear=nonlinear, linear=linear, precond=precond, x0=x0, kwargs=kwargs
+            )
+        # Runtime PARAMETER VALUES given as keywords: `fem.solve(cap=3.5)`. A parametric problem
+        # otherwise resolves its parameters only through a `crux` evaluation, which leaves no way to say
+        # "solve at this value" -- and the workaround, rebuilding `jno.fem` per value, re-assembles and
+        # re-compiles the whole problem to change one number. The operator already accepts the values
+        # (it builds `args` from them and threads the assembled tangent, so a sparse-direct Newton and a
+        # reduced system both keep working); what was missing was a way in. `continuation=` above owns
+        # them on its own path, so this only applies here -- and the MOVING-MESH driver below owns its
+        # runtime parameters the same way (it threads them into the march and validates its kwargs
+        # strictly), so a geometry problem keeps them raw: packing them into `values` here handed that
+        # driver a key it rightly refuses, and `fem.solve(kap=...)` on a moving mesh raised.
+        _param_names = set(getattr(self._op, "runtime_parameter_exprs", None) or {})
+        if not getattr(self, "_geometry", None):
+            _values = {k: kwargs.pop(k) for k in list(kwargs) if k in _param_names}
+            if _values:
+                kwargs["values"] = _values
         has_slots = (
             (x0 is not None)
             or (nonlinear is not None)
@@ -1648,12 +1674,24 @@ class FEM:
         )
         if getattr(self, "_geometry", None):
             # A geometry term (`coord.d(t) - velocity`) states that the mesh moves. Its driver owns the
-            # march, so it cannot share the call with anything else that also owns it.
-            if adapt is not None or has_slots:
+            # MARCH -- so anything else that owns a march cannot share the call. The per-STEP solver
+            # slots are a different thing entirely: they configure the implicit solve inside one step,
+            # which the march does not own, and the transient adaptive driver already composes them for
+            # exactly that reason. Refusing them here left a moving-mesh problem on the matrix-free
+            # default, with no way to reach a sparse-direct Newton -- which is the only thing that
+            # converges on a saddle step.
+            _march_owners = (
+                ("adapt", adapt),
+                ("time", time),
+                ("tau", tau),
+                ("x0", x0),
+            )
+            _clash = [n for n, val in _march_owners if val is not None]
+            if _clash:
                 raise NotImplementedError(
-                    "jno.fem: a geometry term (`coord.d(t) - velocity`) does not compose with adapt= or "
-                    "the solver slots (x0/nonlinear/linear/precond/time) yet — the mesh-motion driver owns the "
-                    "march and re-assembles each step. Solve with the geometry term alone (default θ-stepper)."
+                    f"jno.fem: a geometry term (`coord.d(t) - velocity`) does not compose with "
+                    f"{'/'.join(_clash)}= — the mesh-motion driver owns the march and re-assembles each "
+                    "step. The per-step solver slots (nonlinear=/linear=/precond=) DO compose."
                 )
             if self._mode != "transient":
                 raise NotImplementedError(
@@ -1663,7 +1701,7 @@ class FEM:
                 )
             from .utils.solver.fem_adapt import run_mesh_motion
 
-            return run_mesh_motion(self, solve_fn=solve_fn, **kwargs)
+            return run_mesh_motion(self, solve_fn=solve_fn, nonlinear=nonlinear, linear=linear, precond=precond, **kwargs)
         if adapt is not None:
             # A load-path march is dispatched BELOW this branch, so an `adapt=` on a form carrying step
             # history used to return here with a single STEADY solve -- shape (n_dofs,) where the caller
@@ -1877,24 +1915,57 @@ class FEM:
             periodic = self._periodic
             user_fn = solve_fn
 
-            def _reduced(residual_fn, y0):
-                def _base(rf, y):
+            def _reduced(residual_fn, y0, jacobian=None):
+                def _base(rf, y, jac=None):
                     if user_fn is not None:
+                        # A sparse-direct Newton asks for the ASSEMBLED tangent; hand it the REDUCED one,
+                        # PᵀJP, so it factorizes the same operator it is solving. Without this the driver
+                        # saw `jacobian=None` and refused — a reduced system could only ever be solved
+                        # matrix-free, which is exactly the regime where the direct path is needed.
+                        if jac is not None and getattr(user_fn, "wants_jacobian", False):
+                            return user_fn(rf, y, jacobian=jac)
                         return user_fn(rf, y)
                     # Matrix-free Newton-Krylov default (no optimistix); implicit-diff preserved.
                     from .utils.solver.newton_krylov import newton_krylov
 
                     return newton_krylov(rf, y)
 
+                red_jac = None
+                if jacobian is not None:
+                    from .utils.solver.fem_utils import reduce_matrix_periodic
+
+                    def red_jac(ur):  # noqa: F811  -- PᵀJP at the prolonged iterate
+                        return reduce_matrix_periodic(periodic, jacobian(prolong_periodic(periodic, ur)))
+
                 ur = _base(
                     lambda ur: reduce_vector_periodic(
                         periodic, jnp.asarray(residual_fn(prolong_periodic(periodic, ur))).reshape(-1)
                     ),
                     restrict_state_periodic(periodic, y0),
+                    red_jac,
                 )
                 return prolong_periodic(periodic, ur)
 
-            return self._op.solve(solve_fn=_reduced, **kwargs)
+            # Propagate the flag so the operator hands `_reduced` the full tangent to reduce.
+            _reduced.wants_jacobian = bool(getattr(user_fn, "wants_jacobian", False))
+            # Carry the composed solver's value-identity through the reduction wrapper, so a cached
+            # compiled solve is still recognised as the same solver on a constrained problem.
+            _k = getattr(user_fn, "cache_key", None)
+            if _k is not None:
+                _reduced.cache_key = ("reduced", _k)
+
+            _out = self._op.solve(solve_fn=_reduced, **kwargs)
+            if kwargs.get("values"):
+                self._record_values_verdict(_out, kwargs, nonlinear)  # see that method: jit hides the guard
+            # A SLIP reduction returns the array, matching the non-reduced steady-nonlinear branch below:
+            # it is a boundary condition, not a training construct, and leaving it lazy meant
+            # `np.asarray(fem.solve(...))` silently produced a 0-d OBJECT array that only blew up later
+            # inside the next residual call. A PERIODIC tie deliberately stays lazy — its `FunctionCall`
+            # is what flows into `crux` for an inverse problem, and evaluating it here breaks that
+            # (measured: test_periodic_nonlinear_reaction_diffusion).
+            if periodic.get("coupling") == "slip" and not getattr(self._op, "is_parametric", False):
+                return _out.fn()
+            return _out
         if self._mode == "nonlinear" and not getattr(self._op, "is_parametric", False):
             # Non-parametric steady nonlinear: return the numeric solution eagerly (mirrors the linear
             # branch above). `fem.solve()` builds a FunctionCall trace node so a trainable parameter can
@@ -1906,7 +1977,40 @@ class FEM:
             # Re/Im legs were fused into one block. (A *real* transient stays lazy; that asymmetry predates
             # the fusion and is a separate call to make, not something a refactor should change silently.)
             return self._op.solve(solve_fn, **kwargs).fn()
-        return self._op.solve(solve_fn, **kwargs)
+        out = self._op.solve(solve_fn, **kwargs)
+        if kwargs.get("values") and self._mode == "nonlinear":
+            self._record_values_verdict(out, kwargs, nonlinear)
+        return out
+
+    def _record_values_verdict(self, out, kwargs, nonlinear):
+        """Judge a ``fem.solve(param=value)`` solve and write it to :attr:`stats`.
+
+        That solve is jitted -- which is how it avoids re-staging for every value -- and the driver's
+        own convergence check self-disables under a trace, so without this it returns with NO verdict
+        and ``fem.stats`` keeps whatever an earlier eager solve left behind. The judgement is made on
+        the residual the solver actually worked on: the REDUCED one on a reduced system, because the
+        full residual of a constrained problem keeps the constraint's reaction, which is physical and
+        stays O(1) however well converged the solve is.
+        """
+        from .utils.solver.solver_api import record_nonlinear_verdict
+
+        op, per, vals = self._op, self._periodic, kwargs["values"]
+        u = jnp.asarray(out).reshape(-1)
+        zero = jnp.zeros((int(op.size),), dtype=jnp.result_type(float))
+        u0 = jnp.asarray(kwargs.get("u0", zero)).reshape(-1)
+        if per is None:
+            res_at = lambda uu: op.residual(uu, vals)  # noqa: E731
+        else:
+            from .utils.solver.fem_utils import prolong_periodic, reduce_vector_periodic, restrict_state_periodic
+
+            def res_at(ur, _p=per, _o=op, _v=vals):
+                full = _o.residual(prolong_periodic(_p, ur), _v)
+                return reduce_vector_periodic(_p, jnp.asarray(full).reshape(-1))
+
+            u = restrict_state_periodic(per, u)
+            if u0.shape[0] != u.shape[0]:
+                u0 = restrict_state_periodic(per, u0)
+        record_nonlinear_verdict(res_at, u, u0, nonlinear, getattr(nonlinear, "name", None) or "newton")
 
     def _compose_slots(self, solve_fn, *, x0, nonlinear, linear, precond, time=None, shard=None, kwargs):
         """Compose the solver slots into the mode-appropriate ``solve_fn`` (see :meth:`solve`)."""
@@ -2259,7 +2363,8 @@ class FEM:
                 "(Argyris/Morley/edge) elements, 1-D, and the VPINN path."
             )
         terms = list(term) if isinstance(term, (list, tuple)) else [term]
-        bares = []
+        bares: list = []
+        b_bares: dict = {}
         for t in terms:
             bare = getattr(t, "expr", t)
             if not contains_node_type(bare, TestFunction):
@@ -2270,14 +2375,21 @@ class FEM:
                     "which is a different operation and is not wired yet."
                 )
             support, region = _region_and_support(t, self.domain)
-            if support != "volume":
+            # Surface terms are bucketed per region and handed to the factory's own `bterms` channel --
+            # the same one the front-end fills at build time. This used to refuse outright, on the
+            # reading that the bucketing was unavailable here; it is not, it just was not passed. So a
+            # SURFACE readout (a Robin/impedance flux, a traction on a tagged wall) assembles like any
+            # other, and the facet normals it integrates against move with the mesh coordinates.
+            if support != "volume" and not getattr(self, "_has_facet_tables", False):
                 raise NotImplementedError(
-                    f"fem.eval: this term lives on boundary region {region!r}. Only volume terms are "
-                    "assembled here; a surface term needs the per-region facet bucketing the front-end "
-                    "does at build time. Pass the volume terms and add the known applied load yourself."
+                    f"fem.eval: this term lives on boundary region {region!r}, but this problem's facet "
+                    "quadrature tables were never built -- they are tabulated at BUILD time, and only "
+                    "when the form itself carries at least one surface term. Include the surface term "
+                    "in the jno.fem([...]) term list (a Neumann/Robin flux, a slip condition), or read "
+                    "the quantity as a volume term."
                 )
-            bares.append(bare)
-        return _as_flat(factory(bares)(jnp.asarray(u).reshape(-1), 0.0, args))
+            (bares.append(bare) if support == "volume" else b_bares.setdefault(region, []).append(bare))
+        return _as_flat(factory(bares, b_bares or None)(jnp.asarray(u).reshape(-1), 0.0, args))
 
     def region_dofs(self, region, *, field=0, component=None):
         """Global DOF indices of a tagged region — the companion to :meth:`eval`.
@@ -3084,6 +3196,247 @@ def _build_hanging_reduction_multifield(domain: Any, hang: dict, cells: Any, cel
         off_full.append(off_full[-1] + int(red_i["P"].shape[0]))
         off_red.append(off_red[-1] + int(red_i["P"].shape[1]))
     return {"blocks": blocks, "off_full": off_full, "off_red": off_red, "n_full": off_full[-1], "n_red": off_red[-1]}
+
+
+def _region_node_normals(domain: Any, points: Any, cells: Any, order: int, region: str) -> Dict[int, np.ndarray]:
+    """Per-node outward normal on ``region``, as the **mass-consistent** vector ``N_i = ∫_Γ φ_i n ds``.
+
+    Why not the geometric average of the incident facet normals: for a slip condition the quantity that
+    must vanish is the *discrete flux* ``∫_Γ u_h·n_h ds``, and expanding ``u_h`` in the nodal basis makes
+    that exactly ``Σ_i u_i · N_i``. Eliminating against ``N_i`` therefore drives the net flux through the
+    surface to **machine zero at any mesh size and element order**, whereas an unweighted average leaves
+    an O(h) leak — which on a straight-facet boundary is the same order as the error being removed, so
+    the choice is the difference between fixing the leak and merely relocating it. (Engelman, Sani &
+    Gresho, *Int. J. Numer. Methods Fluids* **2** (1982) 225-238, §3.)
+
+    The direction is still only as good as the straight-facet geometry (O(h) pointwise); it is the
+    *integral* that becomes exact. Both are reported by the caller's diagnostics rather than conflated.
+
+    P2 caveat: a vertex shape function integrates to **zero** over a straight triangular facet
+    (``∫λ(2λ-1) = 0``), so P2 vertices are genuinely flux-neutral and get ``N_i = 0``. They still need a
+    direction to eliminate against, so they fall back to a facet average; the flux identity is
+    unaffected because their weight in it is zero.
+
+    That average is weighted by the angle each facet subtends **at the node**, not by facet area
+    (Thürmer & Wüthrich, *J. Graphics Tools* **3**(1), 1998, §3). Area weighting depends on how the
+    surface happens to be triangulated, and where a region stops on a plane the surface continues
+    across -- a symmetry cut -- the dependence stops cancelling and biases the direction in-plane by a
+    fixed fraction of the local slope. Angle weighting is triangulation-independent, so the cut costs
+    nothing. In 1-D and 2-D an interior angle is not defined and the area weight is used as before.
+    """
+    from .utils.solver.fem_facets import build_facet_connectivity, compute_face_normals
+
+    points = np.asarray(points, dtype=float)
+    cells = np.asarray(cells)
+    dim = int(points.shape[1])
+    facets = _boundary_facets(points, cells, dim, int(order))
+    if facets is None or facets.size == 0:
+        return {}
+    bnodes = np.unique(facets)
+    sel = _face_nodes(domain, points, bnodes, region)
+    if sel is None or len(sel) == 0:
+        return {}
+    in_region = np.zeros(int(points.shape[0]), dtype=bool)
+    in_region[np.asarray(sel, dtype=int)] = True
+
+    # Outward orientation comes from the topology (a boundary facet belongs to exactly one cell, so
+    # "outward" is "away from that cell's opposite vertex") -- the same source the assembler uses.
+    ctype = "tetrahedron" if dim == 3 else "triangle"  # compute_face_normals spells it out in full
+    conn = build_facet_connectivity(cells, ctype)
+    fn = np.asarray(compute_face_normals(points, conn, cells, ctype))
+    oriented = {frozenset(int(v) for v in row): fn[k] for k, row in enumerate(np.asarray(conn.face_nodes))}
+
+    mass = {}  # node -> Σ_f n_f ∫_f φ_i   (the flux-exact vector)
+    area = {}  # node -> Σ_f A_f n_f       (last-resort direction for flux-neutral nodes)
+    angw = {}  # node -> Σ_f θ_f n_f       (angle-weighted: triangulation-INDEPENDENT, see below)
+    for row in facets:
+        verts = [int(v) for v in row[:dim]]
+        if not all(in_region[v] for v in verts):
+            continue
+        n_f = oriented.get(frozenset(verts))
+        if n_f is None:
+            continue
+        P = points[verts]
+        A = (
+            0.5 * float(np.linalg.norm(np.cross(P[1] - P[0], P[2] - P[0])))
+            if dim == 3
+            else float(np.linalg.norm(P[1] - P[0]))
+        )
+        if A <= 0.0:
+            continue
+        extra = [int(v) for v in row[dim:]]
+        if int(order) == 1:
+            w = {v: A / len(verts) for v in verts}
+        elif dim == 3:  # P2 triangle facet: ∫φ_vertex = 0, ∫φ_midside = A/3
+            w = {v: 0.0 for v in verts}
+            w.update({v: A / 3.0 for v in extra})
+        else:  # P2 line facet: ∫φ_end = L/6, ∫φ_mid = 2L/3
+            w = {v: A / 6.0 for v in verts}
+            w.update({v: 2.0 * A / 3.0 for v in extra})
+        for v, wv in w.items():
+            mass[v] = mass.get(v, 0.0) + wv * n_f
+        for v in verts + extra:
+            area[v] = area.get(v, 0.0) + A * n_f
+        if dim == 3:
+            # The angle each facet subtends AT the corner. Area weighting is triangulation-dependent;
+            # angle weighting is not (Thürmer & Wüthrich, *J. Graphics Tools* 3(1), 1998, §3).
+            for a in range(3):
+                e1 = P[(a + 1) % 3] - P[a]
+                e2 = P[(a + 2) % 3] - P[a]
+                l1, l2 = float(np.linalg.norm(e1)), float(np.linalg.norm(e2))
+                if l1 <= 0.0 or l2 <= 0.0:
+                    continue
+                th = float(np.arccos(float(np.clip(float(np.dot(e1, e2)) / (l1 * l2), -1.0, 1.0))))
+                angw[verts[a]] = angw.get(verts[a], 0.0) + th * n_f
+
+    out: Dict[int, np.ndarray] = {}
+    for v, N in mass.items():
+        nrm = float(np.linalg.norm(N))
+        if nrm > 1e-30:
+            out[v] = np.asarray(N, dtype=float) / nrm
+            continue
+        # Flux-neutral node (a P2 vertex): it still needs a DIRECTION to eliminate against, and here
+        # -- unlike the P1 case, where the area weight IS the flux-exact one -- that direction is free,
+        # so it should be the best available estimate rather than the cheapest. Why the angle weight
+        # is that estimate, in one concrete case: with a uniform Kuhn diagonal a vertex touches one
+        # triangle of the quad on one side and two on the other, so the areas never balance around it.
+        # The row above and the row below carry opposite imbalances and cancel -- until the patch is
+        # one-sided, where the estimate collapses from a (1/2, 1/2) blend of the two neighbouring chord
+        # normals to (1/3, 2/3). On a curved contact surface cut on its symmetry plane that tilted the
+        # vertex normal by a constant 2.4e-3 in n_x/n_y, and the elimination wrote it straight into the
+        # velocity it defines there. The subtended angles sum to 90 + 90 on that same one-sided patch,
+        # exactly as they sum to 180 + 180 in the interior.
+        fb = angw.get(v)
+        if fb is None or float(np.linalg.norm(fb)) <= 1e-30:
+            fb = area.get(v)  # 1-D/2-D facets, where an interior angle is not defined
+        if fb is None or float(np.linalg.norm(fb)) <= 1e-30:
+            continue
+        out[v] = np.asarray(fb, dtype=float) / float(np.linalg.norm(fb))
+    return out
+
+
+def _build_slip_reduction(domain: Any, slip_bcs: List[Any], fem_obj: Any, cells: Any, ele_order: int) -> dict:
+    """Exact elimination of the slip conditions ``n·u = 0`` -> a prolongation in the periodic format.
+
+    Each condition removes one velocity component per constrained node (partial-pivoted, see
+    :func:`~jno.utils.solver.fem_utils.build_slip_prolongation`); every other field passes through as an
+    identity block. Reusing the periodic reduction's dict shape means the reduce / solve / prolong /
+    restrict path needs no new branch — ``fem.solve`` sees a reduced system exactly as it does for a tie.
+    """
+    from jax.experimental import sparse as jsparse
+
+    from .utils.solver.fem_utils import build_slip_prolongation
+
+    offsets = np.asarray(fem_obj.offsets, dtype=np.int64)
+    n_fields = max(int(offsets.size) - 1, 1)
+    pts_all = getattr(domain, "_fem_native_dof_points_all", None) or [fem_obj.points]
+    cells_all = getattr(domain, "_fem_native_assembly_cells_all", None) or [cells]
+    orders = getattr(domain, "_fem_native_field_orders", None) or [int(ele_order)]
+    keys = list(getattr(domain, "_fem_native_field_keys", None) or [None])
+
+    by_field: Dict[int, List[str]] = {}
+    for spec in slip_bcs:
+        fk, region, value_node = spec[0], spec[1], spec[2]
+        # Only a literal zero right-hand side is admissible (see the raise below). Anything that is not
+        # a plain constant is treated as non-zero -- conservative on purpose: silently accepting a
+        # symbolic `g` would impose `n·u = 0` while the user wrote something else.
+        if value_node is None:
+            is_zero = True
+        else:
+            raw = getattr(value_node, "value", value_node)  # a constant right-hand side is a Literal
+            try:
+                is_zero = float(np.max(np.abs(np.asarray(raw, dtype=float)))) <= 1e-14
+            except Exception:
+                is_zero = False
+        if not is_zero:
+            raise NotImplementedError(
+                f"jno.fem: an inhomogeneous slip condition `n·u = g` (g != 0) on region {region!r} is not "
+                "supported. The exact elimination carries `u = P u~`, which can only represent the "
+                "homogeneous constraint manifold; a non-zero g needs an affine offset. Impose it weakly "
+                "instead: `c*(n·u - g)*(n·v)`."
+            )
+        idx = keys.index(fk) if fk in keys else 0
+        by_field.setdefault(int(idx), []).append(str(region))
+
+    blocks, off_full, off_red = [], [0], [0]
+    for i in range(n_fields):
+        n_i = int(offsets[i + 1] - offsets[i]) if offsets.size > 1 else int(fem_obj.dofs)
+        if i not in by_field:
+            P = jsparse.BCOO(
+                (
+                    jnp.ones(n_i, dtype=jnp.float64),
+                    jnp.asarray(np.stack([np.arange(n_i), np.arange(n_i)], axis=1)),
+                ),
+                shape=(n_i, n_i),
+            )
+            blocks.append({"P": P, "kept": np.arange(n_i, dtype=np.int64), "vec": 1, "is_selection": True})
+            off_full.append(off_full[-1] + n_i)
+            off_red.append(off_red[-1] + n_i)
+            continue
+
+        pts_i = np.asarray(pts_all[min(i, len(pts_all) - 1)])
+        cells_i = np.asarray(cells_all[min(i, len(cells_all) - 1)])
+        order_i = int(orders[min(i, len(orders) - 1)])
+        n_pts = int(pts_i.shape[0])
+        vec_i = max(n_i // max(n_pts, 1), 1)
+        if vec_i < 2:
+            raise NotImplementedError(
+                "jno.fem: a slip condition `n·u = 0` is a linear functional of a VECTOR field's "
+                f"components, but field {keys[i]!r} has {vec_i} component per node. Write `u(region) - g`."
+            )
+        merged: Dict[int, List[np.ndarray]] = {}
+        for region in by_field[i]:
+            got = _region_node_normals(domain, pts_i, cells_i, order_i, region)
+            if not got:
+                raise ValueError(
+                    f"jno.fem: the slip region {region!r} matched no boundary facets on the assembly mesh, "
+                    "so there is nothing to constrain. Check the region name and that it tags a boundary."
+                )
+            for node, nrm in got.items():
+                merged.setdefault(int(node), []).append(np.asarray(nrm, dtype=float)[:vec_i])
+        nodes = sorted(merged)
+        node_dofs = np.asarray([[n * vec_i + c for c in range(vec_i)] for n in nodes], dtype=np.int64)
+        coeff_blocks = [np.stack(merged[n], axis=0) for n in nodes]
+        pro = build_slip_prolongation(n_i, node_dofs, coeff_blocks)
+        from .utils.logger import get_logger
+
+        get_logger().info(
+            f"jno.fem: slip `n·u = 0` on {'+'.join(by_field[i])} -> {len(nodes)} node(s), "
+            f"{n_i - int(pro['n_red'])} DOF(s) eliminated exactly."
+        )
+        blocks.append({"P": pro["P"], "kept": pro["kept_nodes"], "vec": 1, "is_selection": False})
+        off_full.append(off_full[-1] + n_i)
+        off_red.append(off_red[-1] + int(pro["n_red"]))
+
+    if len(blocks) == 1:
+        b = blocks[0]
+        return {
+            "P": b["P"],
+            "P_node": b["P"],
+            "kept_nodes": b["kept"],
+            "n_full": int(off_full[-1]),
+            "n_red": int(off_red[-1]),
+            "vec": 1,
+            "is_selection": False,
+            "is_bloch": False,
+            "coupling": "slip",
+        }
+    from .utils.solver.fem_utils import _blockdiag_bcoo
+
+    off_full_a = np.asarray(off_full, dtype=np.int64)
+    off_red_a = np.asarray(off_red, dtype=np.int64)
+    return {
+        "blocks": blocks,
+        "off_full": off_full_a,
+        "off_red": off_red_a,
+        # Built once, HERE, while the block prolongations are still concrete. The reduction runs inside
+        # the traced Newton body, where rebuilding it would yield non-concrete indices and quietly drop
+        # PᵀJP onto the dense path -- which is fatal at 3-D sizes and shows up only as a much later
+        # ConcretizationTypeError in the sparse LU.
+        "P_blockdiag": _blockdiag_bcoo([b["P"] for b in blocks], off_full_a, off_red_a),
+        "is_bloch": False,
+        "coupling": "slip",
+    }
 
 
 def _build_periodic_reduction_multifield(
@@ -3908,9 +4261,19 @@ def _fem_impl(
     # Essential normal-flux BCs `u·n - g` (H(div) RT) pin boundary-edge DOFs at assembly; like periodic
     # ties they must be separated before classification (the Cartesian Dirichlet parser would reject them).
     flux_bcs: List[Any] = []
+    slip_bcs: List[Any] = []
     _core: List[Any] = []
     for c in constraints:
         spec = _normal_flux_spec(c, domain) or _tangential_bc_spec(c, domain)  # RT u·n / N1E u×n (incl. 3-D PEC)
+        if spec is not None and not (_trial_spaces([c]) - {"Lagrange"}):
+            # Same spelling, different mechanism per family. `flux_bcs` is consumed ONLY by
+            # `assemble_fem_nonnodal` (the RT/N1curl edge-DOF path); a nodal field has no edge DOF to
+            # pin, and until this branch existed such a constraint was claimed by the spec and then
+            # dropped on the floor — the boundary was left unconstrained and the solve returned a
+            # plausible wrong answer. On a nodal Lagrange field it is instead a slip / no-penetration
+            # condition, imposed EXACTLY by eliminating one component per constrained node.
+            slip_bcs.append(spec)
+            continue
         (flux_bcs.append(spec) if spec is not None else _core.append(c))
     constraints = _core
 
@@ -4048,6 +4411,7 @@ def _fem_impl(
         fem_obj._trial_field_keys = _field_keys(_orig_constraints)
         # Free (pre-Dirichlet) residual factory behind FEM.eval — same capture-now reason as above.
         fem_obj._term_residual_factory = getattr(domain, "_fem_native_term_residual", None)
+        fem_obj._has_facet_tables = bool(getattr(domain, "_fem_native_has_facet_tables", False))
         fem_obj._block_value_shapes = list(getattr(domain, "_fem_native_field_shapes", None) or ())
         # Same snapshot treatment for the DOF coordinates behind .points / .field_points — an
         # auxiliary assembly (jno.precond.form) would otherwise clobber them mid-solve.
@@ -4083,11 +4447,13 @@ def _fem_impl(
             # reduction and reaches `reduce_matrix_periodic` / `B(P)` with no branch of its own.
             from .utils.solver.fem_refine import hanging_prolongation
 
-            if periodic_ties:
+            if periodic_ties or slip_bcs:
+                _other = "a periodic or tied interface" if periodic_ties else "a slip condition `n·u = 0`"
                 raise NotImplementedError(
-                    "jno.fem: a locally refined (hanging-node) mesh combined with a periodic or tied "
-                    "interface composes two prolongations, and their order changes the answer. Refine "
-                    "away from the tied faces, or tie a conforming mesh."
+                    f"jno.fem: a locally refined (hanging-node) mesh combined with {_other} composes two "
+                    "prolongations, and their order changes the answer. Refine away from those faces, or "
+                    "use a conforming mesh. (Refused rather than ignored: this branch returns, so the "
+                    "second condition would otherwise be dropped in silence.)"
                 )
             _cells_h = np.asarray(getattr(domain, "_fem_hanging_cells"))
             _ct_h = getattr(domain, "_fem_hanging_cell_type", "quad")
@@ -4122,8 +4488,15 @@ def _fem_impl(
             fem_obj._op = reduce_op_periodic(fem_obj._op, fem_obj._mode, _hp)
             fem_obj._periodic = _hp
             return _fuse_complex_steady(fem_obj)
-        if not periodic_ties:
+        if not periodic_ties and not slip_bcs:
             return _fuse_complex_steady(fem_obj)
+        if slip_bcs and periodic_ties:
+            raise NotImplementedError(
+                "jno.fem: a slip condition `n·u = 0` together with a periodic tie is not supported. Both "
+                "reduce the system by a prolongation, and composing the two (P_tie · P_slip) is not "
+                "implemented — a node on both a tied face and a slip wall would be eliminated twice. "
+                "Impose one of them weakly instead: `c*(n·u)*(n·v)`."
+            )
         # Single-field transient was already reduced by the dedicated native branch -> reuse its P.
         if periodic_holder:
             fem_obj._periodic = periodic_holder[0]
@@ -4139,7 +4512,11 @@ def _fem_impl(
             cells = getattr(domain, "_fem_native_assembly_cells", None)
             ele_order = int(getattr(domain, "_fem_native_assembly_order", 1))
         _nonnodal_topo = getattr(domain, "_fem_nonnodal_topology", None)
-        if _nonnodal_topo is not None and _nonnodal_topo.get("family") == "N1E":
+        if slip_bcs:
+            # Exact slip elimination. Built in the periodic dict shape so the whole reduce / solve /
+            # prolong / restrict path below is reused with no new branch.
+            periodic = _build_slip_reduction(domain, slip_bcs, fem_obj, cells, ele_order)
+        elif _nonnodal_topo is not None and _nonnodal_topo.get("family") == "N1E":
             # Nédélec N1E (H(curl) edge): DOF-level edge prolongation (Floquet/Bloch, with orientation sign)
             periodic = _build_periodic_reduction_n1e(domain, periodic_ties, fem_obj.offsets)
         elif _nonnodal_topo is not None:
@@ -4276,6 +4653,13 @@ def _fem_impl(
                 classification.append(f"dirichlet@{region}[{_COMPONENT_NAMES[comp]}]")
         else:
             raise ValueError("jno.fem: a residual contains neither the trial nor the test function.")
+
+    # Slip conditions were peeled off before this loop, so they carry no entry yet. APPEND them (never
+    # insert): `classification` is zipped positionally against `_constraints` elsewhere, and the peeled
+    # terms are absent from that list — trailing entries stay clear of the pairing while still making
+    # the condition visible in `fem.classification`, which is how a user confirms it was recognised at
+    # all (the failure this whole feature exists to prevent was a condition that showed up nowhere).
+    classification.extend(f"slip@{spec[1]}" for spec in slip_bcs)
 
     if is_vpinn and multifield:
         raise NotImplementedError("jno.fem VPINN (network trial) is currently single-field only.")
