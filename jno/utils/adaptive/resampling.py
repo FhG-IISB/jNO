@@ -25,6 +25,26 @@ def _get_candidate_pool(
     return None
 
 
+def _require_pool(pool, tag: str, strategy: str):
+    """Fail loudly when a strategy has nothing to resample from. **Currently unused.**
+
+    With no pool, CR3, R3 and RandomResampling return the caller's own points: the caller asked for
+    resampling, gets a silent no-op, and the run looks healthy while the collocation points never
+    move. That is an odd fit for a codebase whose first rule is never fail silently -- but it is a
+    DELIBERATE contract, asserted by
+    ``test_resampling.py::test_random_resampling_without_candidates_returns_input``, so switching it
+    is a behaviour change for callers to decide on rather than one to make in passing. This is the
+    error it would raise. RAD is unaffected either way: it perturbs its high-residual points instead.
+    """
+    if pool is None:
+        raise ValueError(
+            f"{strategy}.resample(tag={tag!r}): no candidate pool to draw from, so there is nothing "
+            f"to resample and the points would be returned unchanged. Either pass candidates=<(M, D) "
+            f"array>, or use a domain whose tag has a pool (domain.draw_candidates({tag!r}))."
+        )
+    return pool
+
+
 def _retain_and_refill(
     points: jnp.ndarray,
     score: jnp.ndarray,
@@ -133,6 +153,13 @@ class ResamplingStrategy(ABC):
                 ``domain.draw_candidates(tag)``.  When provided, strategies
                 draw new points from this array; when None the strategy calls
                 ``domain.draw_candidates`` itself.
+
+                **Under ``jax.jit``, pass this explicitly.** Leaving it None still traces --
+                ``draw_candidates`` runs on the host at trace time -- but the pool it returns is
+                then a compile-time constant, so every later call reselects from that one frozen
+                cloud. Measured: 25 600 draws from a jitted strategy with candidates=None yielded
+                2559 distinct points against a pool of 2560. Selection still varies with the key,
+                which is what makes it easy to miss.
 
         Returns:
             New points (N, D)
@@ -289,7 +316,7 @@ class CR3(ResamplingStrategy):
         F = residuals * gate_values
 
         pool = _get_candidate_pool(candidates, domain, tag)
-        if pool is None:
+        if pool is None:  # same no-op contract as RandomResampling; see _require_pool's note
             return points
 
         result = _retain_and_refill(
@@ -660,7 +687,7 @@ class R3(ResamplingStrategy):
             threshold = jnp.mean(residuals)
 
         pool = _get_candidate_pool(candidates, domain, tag)
-        if pool is None:
+        if pool is None:  # same no-op contract as RandomResampling; see _require_pool's note
             return points
 
         return _retain_and_refill(

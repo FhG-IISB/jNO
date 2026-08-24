@@ -92,3 +92,28 @@ def test_cr3_next_gamma_is_pure_and_traceable():
     assert jnp.isfinite(g)
     assert strat.gamma == before, "next_gamma must not mutate the strategy"
     assert float(g) >= before, "gamma advances forward"
+
+
+def test_no_pool_is_a_silent_no_op_for_the_ranking_strategies():
+    """Documents the current contract rather than endorsing it.
+
+    With no pool these hand back the caller's own points, so a run that asked for resampling gets
+    none and looks healthy. It is deliberate -- test_resampling.py asserts it for RandomResampling --
+    and this pins CR3 and R3 to the same behaviour so the three cannot drift apart silently.
+    """
+    points, residuals, _, key = _inputs()
+    for name in ("random", "r3", "cr3"):
+        out = STRATEGIES[name]().resample(
+            points, residuals, None, "interior", 0, key, candidates=None
+        )
+        assert jnp.array_equal(out, points), f"{name} changed its no-pool behaviour"
+
+
+def test_rad_keeps_its_pool_free_fallback():
+    """RAD perturbs its high-residual points when there is no pool, so it must NOT raise."""
+    points, residuals, _, key = _inputs()
+    out = jno.sampler.rad(resample_fraction=0.3).resample(
+        points, residuals, None, "interior", 0, key, candidates=None
+    )
+    assert out.shape == points.shape
+    assert not jnp.array_equal(out, points), "RAD fallback should still move points"
