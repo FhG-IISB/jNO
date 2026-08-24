@@ -110,6 +110,118 @@ def sample_inside(contains_fn, lo, hi, key, n: int, *, batch: int = 0, max_round
     return buf, cursor
 
 
+def _rodrigues(axis_dir, angle):
+    """3x3 rotation matrix about ``axis_dir`` by ``angle`` (static, so plain numpy)."""
+    u = np.asarray(axis_dir, dtype=float)
+    u = u / (np.linalg.norm(u) or 1.0)
+    K = np.array([[0, -u[2], u[1]], [u[2], 0, -u[0]], [-u[1], u[0], 0]], dtype=float)
+    return np.eye(3) + math.sin(angle) * K + (1 - math.cos(angle)) * (K @ K)
+
+
+def _leaf_surfaces(node, A=None, b=None):
+    """Every primitive leaf as ``(prim, A, b, measure)``, world = ``A @ local + b``.
+
+    Boolean nodes contribute BOTH operands: a cut's own cut surface is part of the result's boundary
+    just as much as what is left of the outer shape, and which parts of each survive is decided later
+    by the two-sided membership test rather than by boolean algebra here.
+    """
+    A = np.eye(3) if A is None else A
+    b = np.zeros(3) if b is None else b
+    kind = node[0]
+    if kind == "leaf":
+        return [(node[1], A, b, float(node[1].boundary_measure()))]
+    if kind in ("cut", "fuse", "inter"):
+        return _leaf_surfaces(node[1]._node, A, b) + _leaf_surfaces(node[2]._node, A, b)
+    if kind == "regions":
+        return [lf for _n, sub in node[1] for lf in _leaf_surfaces(sub._node, A, b)]
+    if kind == "translate":
+        return _leaf_surfaces(node[1]._node, A, b + np.asarray(node[2], dtype=float))
+    if kind == "rotate":
+        R = _rodrigues(node[3], node[4])
+        ap = np.asarray(node[2], dtype=float)
+        return _leaf_surfaces(node[1]._node, R @ A, R @ (b - ap) + ap)
+    raise NotImplementedError(
+        f"sample_on_boundary has no traceable surface for a {kind!r} plan. extrude/revolve/sweep/"
+        f"fillet boundaries are available host-side through Shape.sample_boundary."
+    )
+
+
+def sample_on_boundary(shape, key, n: int, *, eps: float = 1e-6, batch: int = 0, max_rounds: int = 8):
+    """Draw ``n`` points on a shape's boundary with outward normals, inside ``jax.jit``.
+
+    The interior is a rejection problem and the boundary is not: it has measure zero, so no proposal
+    drawn from a volume ever lands on it. Points come from the primitives' own surfaces instead --
+    a circle by angle, a box face by area, a polygon edge by length -- which is exact by construction
+    rather than accurate to a mesh size.
+
+    Which of those proposals survive is decided WITHOUT deriving the CSG boundary algebra. A point
+    lies on the composite's boundary exactly when its two sides disagree: ``contains(p + eps*d)``
+    XOR ``contains(p - eps*d)``. A cut disk's arc that ended up inside a fused rectangle has both
+    sides inside and is dropped; a rectangle edge that was cut away has both sides outside and is
+    dropped too. The same test gives the ORIENTATION for free -- outward is whichever side is not
+    inside -- so a primitive never needs to know its own winding, and a subtracted operand's normal
+    comes out flipped without a special case.
+
+    ``eps`` is the probe distance for that test. It must be smaller than the thinnest feature, or two
+    genuinely distinct surfaces are read as one.
+
+    Returns ``(points (n, 3), normals (n, 3), n_filled)``, with the same fixed-buffer compaction and
+    the same ``n_filled < n`` reporting as :func:`sample_inside`.
+    """
+    from .primitives import SURFACE_SAMPLERS
+
+    leaves = _leaf_surfaces(shape._node)
+    total = sum(m for _, _, _, m in leaves) or 1.0
+    # The buffer fills in batch order, so a leaf whose share alone exceeds the free space takes
+    # every slot and the ones after it never appear: at batch = 4n, `rect - disk` drew 4000/4000
+    # points on the rectangle and none on the cut arc. Shuffling the batch fixes it and costs more
+    # than everything else combined -- a 400k permutation measured 144 ms against 0.4 ms for the
+    # membership tests. Sizing the batch to n instead means every leaf's share is at most its own
+    # proportion of the buffer, so ordering cannot starve anyone and no shuffle is needed.
+    batch = int(batch) or max(n, 128)
+    plan = []
+    for prim, A, b, m in leaves:
+        name = type(prim).__name__
+        if name not in SURFACE_SAMPLERS:
+            raise NotImplementedError(
+                f"sample_on_boundary has no traceable surface sampler for {name}; "
+                f"available: {sorted(SURFACE_SAMPLERS)}."
+            )
+        share = max(1, int(round(batch * m / total)))
+        plan.append((SURFACE_SAMPLERS[name], prim, jnp.asarray(A), jnp.asarray(b), share))
+    b_total = sum(share for *_, share in plan)
+
+    def round_(carry, _):
+        key_, buf, nbuf, cursor = carry
+
+        def draw(operand):
+            key_, buf, nbuf, cursor = operand
+            key_, *subs = jax.random.split(key_, len(plan) + 1)
+            pts, dirs = [], []
+            for (fn, prim, A, b, share), sk in zip(plan, subs):
+                q, d = fn(prim, sk, share)
+                pts.append(q @ A.T + b)
+                dirs.append(d @ A.T)
+            p = jnp.concatenate(pts, axis=0)
+            d = jnp.concatenate(dirs, axis=0)
+            d = d / jnp.maximum(jnp.linalg.norm(d, axis=1, keepdims=True), 1e-30)
+            dim = shape.dim if isinstance(getattr(shape, "dim", None), int) else p.shape[1]
+            plus = jnp.asarray(shape.contains(p[:, :dim] + eps * d[:, :dim]), dtype=bool)
+            minus = jnp.asarray(shape.contains(p[:, :dim] - eps * d[:, :dim]), dtype=bool)
+            on = plus ^ minus                       # exactly one side inside -> a real boundary point
+            nrm = jnp.where(plus[:, None], -d, d)   # outward is the side that is NOT inside
+            rank = jnp.cumsum(on) - 1
+            idx = jnp.where(on, cursor + rank, n)
+            return (key_, buf.at[idx].set(p, mode="drop"), nbuf.at[idx].set(nrm, mode="drop"),
+                    jnp.minimum(cursor + jnp.sum(on), n))
+
+        return jax.lax.cond(cursor >= n, lambda o: o, draw, (key_, buf, nbuf, cursor)), None
+
+    init = (key, jnp.zeros((n, 3)), jnp.zeros((n, 3)), jnp.asarray(0))
+    (_, buf, nbuf, cursor), _ = jax.lax.scan(round_, init, None, length=max_rounds)
+    return buf, nbuf, cursor
+
+
 def _xp(pts):
     """The array module to evaluate membership with: ``jnp`` under a JAX trace, else ``numpy``.
 

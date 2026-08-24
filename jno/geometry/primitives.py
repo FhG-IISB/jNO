@@ -25,6 +25,7 @@ import math
 from dataclasses import dataclass
 from typing import ClassVar, Optional, Tuple
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -827,3 +828,88 @@ class Contour:
         if np.mean(self.contains(pts + eps * nrm, tol=0.0)) > 0.5:  # pointing in -> flip the loop
             nrm = -nrm
         return pts, nrm
+
+# --- traceable surface sampling -------------------------------------------------------------
+# Each returns (points (n, 3), directions (n, 3)) with the direction UNIT and perpendicular to the
+# surface but of ARBITRARY SIGN: the composite orients it afterwards by asking which side is inside,
+# which also means a primitive need not know its own winding.
+
+
+def _cat(key, weights, n):
+    """``n`` draws from a categorical over ``weights`` (a static list)."""
+    logits = jnp.log(jnp.asarray(weights, dtype=float))
+    return jax.random.categorical(key, logits, shape=(n,))
+
+
+def _pad3(xy):
+    return jnp.concatenate([xy, jnp.zeros((xy.shape[0], 3 - xy.shape[1]))], axis=1)
+
+
+def rect_surface(prim, key, n):
+    """Perimeter of an axis-aligned rectangle: an edge by length, then uniform along it."""
+    k1, k2 = jax.random.split(key)
+    w, h = prim.x1 - prim.x0, prim.y1 - prim.y0
+    e = _cat(k1, [h, h, w, w], n)                       # left, right, bottom, top
+    u = jax.random.uniform(k2, (n,))
+    x = jnp.where(e == 0, prim.x0, jnp.where(e == 1, prim.x1, prim.x0 + u * w))
+    y = jnp.where(e <= 1, prim.y0 + u * h, jnp.where(e == 2, prim.y0, prim.y1))
+    d = jnp.where((e <= 1)[:, None], jnp.array([1.0, 0.0]), jnp.array([0.0, 1.0]))
+    return _pad3(jnp.stack([x, y], axis=1)), _pad3(d)
+
+
+def disk_surface(prim, key, n):
+    """The circle: uniform in angle, direction radial."""
+    th = jax.random.uniform(key, (n,), minval=0.0, maxval=2.0 * math.pi)
+    d = jnp.stack([jnp.cos(th), jnp.sin(th)], axis=1)
+    c = jnp.array([prim.cx, prim.cy])
+    return _pad3(c + prim.r * d), _pad3(d)
+
+
+def box_surface(prim, key, n):
+    """Six faces, chosen by area, then uniform on the face."""
+    k1, k2 = jax.random.split(key)
+    # the face areas are STATIC (they come off the primitive, not off a traced array): computing
+    # them through jnp made the categorical weights tracers and the draw unjittable.
+    dx, dy, dz = prim.x1 - prim.x0, prim.y1 - prim.y0, prim.z1 - prim.z0
+    lo = jnp.array([prim.x0, prim.y0, prim.z0])
+    hi = jnp.array([prim.x1, prim.y1, prim.z1])
+    areas = [dy * dz, dy * dz, dx * dz, dx * dz, dx * dy, dx * dy]
+    f = _cat(k1, areas, n)
+    u = jax.random.uniform(k2, (n, 3))
+    p = lo + u * (hi - lo)
+    axis = f // 2                                        # 0:x 1:y 2:z
+    at_hi = (f % 2) == 1
+    onehot = jnp.stack([axis == 0, axis == 1, axis == 2], axis=1)
+    pinned = jnp.where(at_hi[:, None], hi, lo)
+    return jnp.where(onehot, pinned, p), onehot.astype(float)
+
+
+def sphere_surface(prim, key, n):
+    """Uniform on the sphere: a normalised gaussian, direction radial."""
+    v = jax.random.normal(key, (n, 3))
+    d = v / jnp.linalg.norm(v, axis=1, keepdims=True)
+    return jnp.array([prim.cx, prim.cy, prim.cz]) + prim.r * d, d
+
+
+def polygon_surface(prim, key, n):
+    """The perimeter: an edge by length, then uniform along it. Direction is the edge perpendicular."""
+    v = jnp.asarray(prim.points, dtype=float)
+    a, b = v, jnp.roll(v, -1, axis=0)
+    seg = b - a
+    lens = jnp.linalg.norm(seg, axis=1)
+    k1, k2 = jax.random.split(key)
+    e = jax.random.categorical(k1, jnp.log(lens), shape=(n,))
+    u = jax.random.uniform(k2, (n, 1))
+    pts = a[e] + u * seg[e]
+    t = seg[e] / lens[e][:, None]
+    d = jnp.stack([t[:, 1], -t[:, 0]], axis=1)
+    return _pad3(pts), _pad3(d)
+
+
+SURFACE_SAMPLERS = {
+    "Rect": rect_surface,
+    "Disk": disk_surface,
+    "Box": box_surface,
+    "Sphere": sphere_surface,
+    "Polygon": polygon_surface,
+}
