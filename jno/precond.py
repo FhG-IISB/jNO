@@ -40,6 +40,7 @@ __all__ = [
     "inner",
     "block_diag",
     "triangular",
+    "saddle",
     "amg",
     "jaxamg",
     "cached",
@@ -517,6 +518,141 @@ def triangular(*pairs) -> _Triangular:
     *Finite Elements and Fast Iterative Solvers*, 2nd ed., OUP 2014, §9.2). With inexact
     (iterative) block solves the outer Krylov must be flexible: ``jno.solve.fgmres()``."""
     return _Triangular(list(pairs))
+
+
+class _Saddle(_Spec):
+    """Spec for the standard saddle-point recipe; see :func:`saddle`.
+
+    Resolution is deferred to ``prepare``/``materialize`` because the blocks are a property of the
+    OWNING system, not of the spec: which block is the constraint is read from the FEM's structural
+    saddle detection, so the same ``saddle()`` object composes onto any saddle system.
+    """
+
+    def __init__(self, mass_weight):
+        self.mass_weight = float(mass_weight)
+        self._resolved = None
+
+    def _compose(self, fem):
+        """The ``triangular`` composition this spec stands for, built once against ``fem``."""
+        if self._resolved is not None:
+            return self._resolved
+        if fem is None:
+            raise TypeError(
+                "jno.precond.saddle() needs the owning FEM to find the constraint block "
+                "(use it via fem.solve(precond=...))."
+            )
+        idx = tuple(getattr(fem, "_saddle_block_indices", ()) or ())
+        blocks = fem.blocks
+        if not idx:
+            raise ValueError(
+                "jno.precond.saddle(): this system has no saddle block -- every field has a diagonal "
+                "block, so there is no zero-diagonal constraint for a pressure-mass Schur approximation "
+                "to stand in for. Use a preconditioner for the structure you do have "
+                "(jno.precond.amg(), jno.precond.jacobi()), or compose the blocks yourself with "
+                "jno.precond.triangular((field, spec), ...)."
+            )
+        # The Schur approximation assembled here is the P1 mass matrix on the domain's scalar space,
+        # so it only stands for a constraint field discretised on THAT space (Taylor-Hood pressure).
+        # A multiplier on any other space would silently get a matrix of the wrong size -- refuse by
+        # name instead, and say which block and what the sizes were.
+        n_p1 = int(getattr(fem.domain, "mesh").points.shape[0])
+        names = tuple(getattr(fem, "_saddle_blocks", ()) or ())
+        for j, i in enumerate(idx):
+            size = int(blocks[i].stop - blocks[i].start)
+            if size != n_p1:
+                who = names[j] if j < len(names) else f"block {i}"
+                raise NotImplementedError(
+                    f"jno.precond.saddle(): the constraint block {who!r} has {size} dofs but the "
+                    f"domain's P1 space has {n_p1} -- the weighted pressure MASS matrix this builds is "
+                    "a P1 Gram matrix, so it is only the right Schur approximation for a constraint "
+                    "field of P1 (Taylor-Hood pressure). Compose the right auxiliary explicitly: "
+                    "jno.precond.triangular((u, jno.precond.amg()), (p, jno.precond.form([...])))."
+                )
+        from . import solve as _s
+        from ._fem import _fe_symbols_bound
+
+        ui, vi, _axes = _fe_symbols_bound(fem.domain)
+        w = self.mass_weight
+        # The mass block is inverted EXACTLY, on the host, in float64. That is what keeps the whole
+        # preconditioner a fixed linear operator -- an inexact inner solve would make it vary between
+        # applications, which a non-flexible Krylov method (gmres) is not allowed to see.
+        mass = form([w * ui * vi], inner=_s.lu(backend="host"))
+        pairs = []
+        for i in range(len(blocks)):
+            pairs.append((i, mass if i in idx else amg()))
+        self._resolved = _Triangular(pairs)
+        return self._resolved
+
+    def prepare(self, fem):
+        self._compose(fem).prepare(fem)
+
+    def materialize(self, ctx: PrecondContext):
+        return self._compose(ctx.fem).materialize(ctx)
+
+    def __repr__(self):
+        return f"jno.precond.saddle(mass_weight={self.mass_weight})"
+
+
+def saddle(*, mass_weight: float = 1.0) -> _Saddle:
+    """The standard **saddle-point** preconditioner, as one call.
+
+    Composes the classical Stokes recipe over the system's own block structure -- algebraic multigrid
+    on the momentum block, a weighted pressure **mass** matrix as the Schur-complement approximation,
+    assembled block-upper-triangularly (Elman, Silvester & Wathen, *Finite Elements and Fast Iterative
+    Solvers*, 2nd ed., OUP 2014, section 9.2)::
+
+        fem.solve(linear=jno.solve.fgmres(tol=1e-10, restart=150),
+                  precond=jno.precond.saddle(mass_weight=1.0 / mu))
+
+    which is the one-line form of::
+
+        jno.precond.triangular((u, jno.precond.amg()), (p, jno.precond.form([(1 / mu) * pi * qi])))
+
+    The constraint block is found structurally -- the field whose test function never meets its own
+    trial function, so the operator has no diagonal there -- which is exactly the block a diagonal
+    (Jacobi) preconditioner cannot touch, and the reason ``fem.solve()``'s matrix-free default warns
+    on a saddle system. No symbols are passed: the pressure mass is assembled on the domain's own P1
+    space, so this reads the same on 2-D and 3-D Taylor-Hood.
+
+    ``mass_weight`` scales that mass matrix and is **explicit, never inferred**. The pressure-mass
+    Schur approximation wants ``1/mu``; recovering ``mu`` from an arbitrary weak form is fragile, and
+    a variable or solution-dependent viscosity would silently take the wrong weight and cost
+    iterations without ever failing. The default ``1.0`` is right for ``mu = 1``; pass the reciprocal
+    viscosity otherwise. A wrong weight changes convergence SPEED only, never the answer.
+
+    Give ``fgmres`` enough restart. Its default ``restart=30`` **stagnates** on a 3-D Taylor-Hood
+    block preconditioner, and the failure is quiet -- it still returns, just slower and less
+    accurate. Measured at 4302 dofs, ``tol=1e-10``: ``restart=30`` took 2.30 s to reach 3.3e-06,
+    ``restart=150`` took 0.49 s to reach 3.3e-09 -- 4.7x faster for a thousand times the accuracy,
+    because restarting discards the Krylov subspace the preconditioner just earned. Larger systems
+    want a larger restart still.
+
+    Pair it with ``jno.solve.fgmres`` -- the pairing the block preconditioners are verified against.
+    ``jno.solve.minres`` does not apply: block-upper-triangular is nonsymmetric by construction and
+    MINRES's short recurrence assumes symmetry, so it stalls (loudly, on the residual guard, rather
+    than returning a plausible wrong field); use :func:`block_diag` if a symmetric preconditioner is
+    required. The non-flexible ``jno.solve.gmres`` is admissible in principle -- the mass block is
+    inverted exactly, so this is a fixed linear operator -- but breaks down in the default float32
+    build, exactly as the explicit :func:`triangular` composition does; prefer ``fgmres``.
+
+    **This is the pure-Stokes approximation, and it degrades on a reaction-dominated system.** The
+    pressure mass stands in for the Schur complement of ``-mu*Lap(u) + grad(p)``; add a strong
+    reaction term (a Brinkman/Darcy drag ``alpha*u``, as porous-medium flow and fluid topology
+    optimisation both do, or the ``1/dt`` mass of a small implicit time step) and the Schur
+    complement stops looking like a mass matrix. Measured on a 2-D Brinkman channel at ``mu = 1``,
+    preconditioned GMRES took 73 iterations at ``alpha = 0``, 76 at ``1e2``, 140 at ``1e3`` and 452
+    at ``1e4`` -- it still converges, but the mesh-robustness the recipe exists for is gone. That
+    regime wants the Cahouet-Chabard approximation, a pressure mass PLUS a pressure Laplacian
+    (``S^-1 ~ mu*M_p^-1 + alpha*L_p^-1``; Cahouet & Chabard, *Int. J. Numer. Methods Fluids* **8**,
+    869-895, 1988), which this does not build.
+
+    Scope: needs ``pyamg`` for the momentum block (a clear ``ImportError`` otherwise), and the
+    constraint field must be P1 -- both refuse by name rather than mis-solving. For anything else
+    (a different momentum solver, an inexact inner solve on a very large pressure block, more than
+    one constraint field on mixed spaces) compose :func:`triangular` directly; this is a shorthand
+    for the common case, not a replacement for it.
+    """
+    return _Saddle(mass_weight)
 
 
 class _AMG(_Spec):

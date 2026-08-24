@@ -229,7 +229,7 @@ class TestAFourthFamilyIsAdditive:
     def _frozen(self):
         import numpy as np
 
-        d = jno.Shape.rect(0, 0, 1, 1, size=1 / 8).domain(structured=True)
+        d = jno.Shape.rect(0, 0, 1, 1, size=1 / 8).structured().domain()
         x, y, _ = d.variable("interior")
         P = np.asarray(d.mesh_connectivity["points"])[:, :2]
         u, _v = d.fem_symbols()

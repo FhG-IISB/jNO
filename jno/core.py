@@ -123,6 +123,24 @@ def _auto_gram_terms(constraints, fm) -> list:
     return gram_terms
 
 
+def _optimizer_states_match(a, b) -> bool:
+    """Whether two optax states have the same tree, leaf shapes and dtypes.
+
+    The test for "this is the same optimizer over the same parameters", and so for whether a state
+    carried over from a previous :meth:`core.solve` can be reused instead of re-initialised.
+    """
+    leaves_a, def_a = jax.tree_util.tree_flatten(a)
+    leaves_b, def_b = jax.tree_util.tree_flatten(b)
+    if def_a != def_b:
+        return False
+    for x, y in zip(leaves_a, leaves_b):
+        if getattr(x, "shape", None) != getattr(y, "shape", None):
+            return False
+        if getattr(x, "dtype", None) != getattr(y, "dtype", None):
+            return False
+    return True
+
+
 def _cpu_device():
     """Return a CPU JAX device.
 
@@ -497,6 +515,7 @@ class core:
             self._dd_subdomains, self._dd_interfaces = _detected
             self.domain = self._dd_subdomains[0].domain
             self.models = {}
+            self._module_refs = {}
             return
 
         # An empty-constraint core is eval-only (no training); its domain is
@@ -531,6 +550,9 @@ class core:
         super().__init__()
 
         self._total_epochs = 0
+        # optax states from the last solve(). A second solve() CONTINUES the first, so these are
+        # carried over rather than re-initialised -- see the note where they are used.
+        self._opt_states: Optional[Dict[str, Any]] = None
         seed = int(get_seed())
         self.seed = seed
         self.rng = jax.random.PRNGKey(seed)
@@ -1756,9 +1778,19 @@ class core:
 
             # === Apply sharding to model arrays ===
             self.models = self._shard_params(self.models)
+
+            # The core keeps its OWN copy of every model from here on: `self.models` is what
+            # training updates and what eval reads, and `_shard_params` already returns fresh
+            # trees, so the objects hanging off the expression (`param.model.module`) are no
+            # longer the ones being evaluated. Remember which module object each layer carried
+            # when the core last read it -- `solve()` refreshes this at its write-back -- so a
+            # swap the core has NOT seen can be caught instead of silently ignored (see
+            # `_check_modules_unchanged`).
+            self._module_refs = {lid: layer.module for lid, layer in self._collect_flax_modules().items()}
         else:
             self.domain_data = None
             self.models = {}
+            self._module_refs = {}
 
         # === Compile constraints and trackers ===
         self.compiled_trackers = []
@@ -2835,6 +2867,21 @@ class core:
                 state = jno_bayesian.init_state(bayesian_handles[k], trainable[lid], _bay_init_key)
             else:
                 state = per_model_opts[k].init(trainable[lid])
+                # A second solve() CONTINUES the first. optax carries its own step count inside
+                # this state, so re-initialising it silently restarts every optax SCHEDULE --
+                # warmup, decay, join_schedules -- and a training loop that calls solve() in
+                # chunks (to checkpoint, to diagnose, to move a curriculum on) never leaves the
+                # first few steps of its schedule. Nothing warns; the run simply trains at the
+                # wrong rate. jNO's own LearningRateSchedule is already immune, because it reads
+                # the persistent ``self._total_epochs`` (see ``base_epoch``).
+                #
+                # Reuse is conditional on the freshly built state having the same tree, shapes and
+                # dtypes, which is exactly the condition for it to be the same optimizer over the
+                # same parameters; change either and the fresh state is used. To ask for a genuine
+                # restart, build a new ``jno.core`` -- states live on the instance.
+                _prev = (self._opt_states or {}).get(k)
+                if _prev is not None and _optimizer_states_match(_prev, state):
+                    state = _prev
             # Copy every array leaf so that aliased buffers (e.g. from
             # L-BFGS zero-initialised history arrays that share the same
             # underlying allocation) become distinct.  Without this,
@@ -4515,6 +4562,9 @@ class core:
             # Update every Model to point at the trained model.
             for lid, fm in flax_mods.items():
                 fm.module = trained_models[lid]
+            # ...and that sync IS the core reading the module again, so it is not a swap behind
+            # the core's back -- record it, or every eval after a solve would be refused.
+            self._module_refs.update({lid: fm.module for lid, fm in flax_mods.items()})
 
             # ── 9c. Flush Bayesian sample buffers (Pattern D + E aware) ──
             #
@@ -4688,6 +4738,8 @@ class core:
                 wandb_log_model(self)
 
         self._total_epochs += epochs
+        # Hand the optimizer states to the next solve() so schedules continue across the call.
+        self._opt_states = opt_states
 
         # --- callbacks: on_training_end ---
         if callbacks:
@@ -4756,6 +4808,41 @@ class core:
     def _unwrapped_models(self):
         """Models with all paramax wrappers resolved — safe for inference / shape queries."""
         return _paramax.unwrap(self.models)
+
+    def _check_modules_unchanged(self):
+        """Refuse to evaluate against a module that was replaced after this core last read it.
+
+        ``jno.core(...)`` reads ``layer.module`` once, through ``build_single_layer_params``, and
+        keeps its own copy — ``solve()`` writes that copy and syncs it back onto the module, so
+        the two agree until someone swaps the module themselves. The eager idiom
+
+            g.model.module = eqx.tree_at(lambda m: m.value, g.model.module, jnp.asarray(vals))
+
+        is such a swap. A bare ``jno.fem([...]).solve()`` honours it, because it reads the module
+        at solve time; a core does not, and the sweep it is meant to drive read the same number at
+        every value.
+
+        Reading the module live *here* is not the fix, because it would only patch ``eval``:
+        ``self.models`` — what training starts from and what every other read uses — would still
+        hold the old value, so eval and solve would disagree about the same parameter. It would
+        also skip the build the module goes through on the way in (pretrained weights, a callable
+        initializer, an ``_initialize_mask``, a dtype cast, sharding)."""
+        stale = []
+        refs = getattr(self, "_module_refs", {})
+        for lid, layer in self._collect_flax_modules().items():
+            if lid not in refs:
+                continue
+            if layer.module is not refs[lid]:
+                stale.append(getattr(layer, "name", None) or f"layer {lid}")
+        if not stale:
+            return
+        raise RuntimeError(
+            f"crux.eval: {', '.join(map(str, stale))} was given a new module after this core was built, "
+            "and the core evaluates its own copy — the new value would be ignored and you would read the "
+            "value at construction. Set the value BEFORE `jno.core(...)` (build one core per value to "
+            "sweep), or drive the sweep through the eager `jno.fem([...]).solve()` / `jno.fdm([...]).solve()` "
+            "path, which reads the module at solve time."
+        )
 
     def _log_constraint_shapes(self, batchsize, min_consecutive: Optional[int] = 1):
         """Log the output shape of each constraint by doing a test evaluation.
@@ -5147,6 +5234,8 @@ class core:
 
         if samples not in ("auto", "chain", "point"):
             raise ValueError(f"crux.eval(samples=...) expects 'auto' | 'chain' | 'point', got {samples!r}.")
+
+        self._check_modules_unchanged()
 
         domain_data = self.domain_data if domain is None else self.prepare_domain_data(domain)
         _models = eqx.tree_inference(self._unwrapped_models)

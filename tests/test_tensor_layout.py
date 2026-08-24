@@ -16,7 +16,7 @@ B, H, W, C = 4, 8, 5, 1  # H != W so a mix-up is visible
 
 
 def _steady(nx=H, ny=W, batch=B):
-    d = jno.domain(constructor=jno.domain.poseidon(nx=nx, ny=ny), compute_mesh_connectivity=True)
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=(nx - 1, ny - 1)).domain(compute_mesh_connectivity=True)
     dom = batch * d
     dom.variable("interior")
     return dom
@@ -83,10 +83,13 @@ class TestLeftAlone:
 
 class TestTimeDependent:
     def _dom(self, n_t=3):
-        d = jno.domain(
-            constructor=jno.domain.poseidon(nx=H, ny=W),
-            compute_mesh_connectivity=True,
-            time=(0.0, 1.0, n_t),
+        d = (
+            jno.Shape.rect(0.0, 0.0, 1.0, 1.0)
+            .structured(n=(H - 1, W - 1))
+            .domain(
+                compute_mesh_connectivity=True,
+                time=(0.0, 1.0, n_t),
+            )
         )
         dom = B * d
         dom.variable("interior")

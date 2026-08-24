@@ -515,6 +515,14 @@ class domain(MeshIOMixin):
         keep_orphan_nodes: bool = False,
         **_ignored_kwargs,
     ):
+        if "structured" in _ignored_kwargs:
+            raise ValueError(
+                "jno.domain(..., structured=True) was replaced by Shape.structured() and is no longer "
+                "read. It was being swallowed by **_ignored_kwargs, so the domain came back WITHOUT a "
+                "grid descriptor and the failure surfaced far away (scheme='spectral' refusing a "
+                "domain the caller believed was structured). Spell it "
+                "jno.Shape.rect(0, 0, 1, 1, size=h).structured().domain() instead."
+            )
         """
         Initialize the domain.
 
@@ -3473,6 +3481,64 @@ class domain(MeshIOMixin):
 
         return _jno.fn(_ang, args, name="cell_angles")
 
+    def cell_aspect(self, eps: float = 1e-30):
+        """Per-cell **aspect ratio** as a ``(n_cells,)`` node, differentiable in the mesh. 2-D and 3-D.
+
+        The longest edge over the inradius, scaled so a **regular** simplex is exactly ``1.0`` and a
+        stretched one is larger (a sliver diverges). This is the quantity a mesh-quality condition is
+        written on, and unlike :meth:`cell_angles` it is dimension-generic, so the same expression
+        works on triangles and tetrahedra::
+
+            fem.solve(adapt=jno.solve.relocate(objective=...)
+                                     .remesh(criterion=jno.le(d.cell_aspect(), 6.0)))
+
+        Differentiable in the vertex positions like its neighbours here (checked against central
+        differences at 2.7e-10), which is what a constrained optimiser needs. It is **not** usable as
+        ``relocate(objective=...)`` yet: that path assembles a weak term, and a per-cell node is not
+        one -- it fails on the runtime coordinate parameters rather than being refused, so the shape
+        of the fix is a per-cell objective path, not a message.
+
+        Contrast :meth:`cell_size`, which is ``|det J|^(1/dim)`` -- an isotropic SIZE. It cannot see
+        stretch at all: a sliver and a regular element of the same area share it.
+
+        ``eps`` guards the inradius denominator on a collapsed element; it does not otherwise shift
+        the ratio. Reference: Shewchuk, *What Is a Good Linear Finite Element? Interpolation,
+        Conditioning, Anisotropy, and Quality Measures* (2002), §2 -- the length/inradius family.
+        """
+        import itertools
+
+        import jno as _jno
+
+        dim = int(self.dimension)
+        if dim not in (2, 3):
+            raise NotImplementedError(f"domain.cell_aspect(): simplices in 2-D or 3-D; this domain is {dim}-D.")
+        cells = jnp.asarray(self._cells_p1(), dtype=jnp.int32)
+        args, rebuild = self._moving_points()
+        fact = {2: 2.0, 3: 6.0}[dim]  # d!
+        fac_fact = {2: 1.0, 3: 2.0}[dim]  # (d-1)!
+        # longest-edge / inradius for a REGULAR simplex, so the measure reads 1.0 there: 2*sqrt(3) on
+        # a triangle, 2*sqrt(6) on a tetrahedron.
+        norm = {2: 2.0 * np.sqrt(3.0), 3: 2.0 * np.sqrt(6.0)}[dim]
+        pairs = list(itertools.combinations(range(dim + 1), 2))
+
+        def _asp(*vals):
+            v = rebuild(*vals)[cells]  # (n_cells, dim+1, dim)
+            longest = jnp.max(jnp.stack([jnp.linalg.norm(v[:, j] - v[:, i], axis=-1) for i, j in pairs], axis=-1), axis=-1)
+            jac = jnp.stack([v[:, i + 1] - v[:, 0] for i in range(dim)], axis=-1)
+            vol = jnp.abs(jnp.linalg.det(jac)) / fact
+            # Facet measures by the Gram determinant, which is the one formula that covers both
+            # dimensions: a triangle's facet is an edge (length) and a tet's is a triangle (area).
+            surf = 0.0
+            for k in range(dim + 1):
+                keep = [i for i in range(dim + 1) if i != k]
+                e = jnp.stack([v[:, keep[i + 1]] - v[:, keep[0]] for i in range(dim - 1)], axis=-1)
+                gram = jnp.einsum("cij,cik->cjk", e, e)
+                surf = surf + jnp.sqrt(jnp.clip(jnp.linalg.det(gram), 0.0, None)) / fac_fact
+            inradius = dim * vol / (surf + eps)  # r = d V / S for a d-simplex
+            return longest / (norm * inradius + eps)
+
+        return _jno.fn(_asp, args, name="cell_aspect")
+
     def measure(self):
         """Total volume (area in 2-D) of the domain, as a node differentiable in the mesh.
 
@@ -3527,7 +3593,7 @@ class domain(MeshIOMixin):
 
         from jno.utils.solver.fem_adapt import _locate_in_cells
 
-        owner, _, inside = _locate_in_cells(src_pts, src_cells, tgt_centroids, tol=1e-9, k=32)
+        owner, _w, _ref, inside = _locate_in_cells(src_pts, src_cells, tgt_centroids, tol=1e-9, k=32)
         return np.where(inside, vals[owner], float(outside))
 
     def interior_edges(self):
