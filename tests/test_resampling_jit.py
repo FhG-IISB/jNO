@@ -10,11 +10,11 @@ and which is refilled is discrete and has no gradient -- argsort and a threshold
 functions. The POSITIONS do: d(result)/d(points) and d(result)/d(pool) both flow, which is what an
 inverse problem that moves the sampling geometry needs.
 """
+
 import functools
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 import pytest
 
 import jno
@@ -76,10 +76,10 @@ def test_ranking_retains_the_highest_residual_points():
     """The rewrite must keep R3's meaning: high residual survives, low residual is replaced."""
     strat = jno.sampler.r3(min_keep_frac=0.25, max_keep_frac=0.75)
     points, _, pool, key = _inputs()
-    residuals = jnp.linspace(0.0, 1.0, N)          # point i has residual i/N
+    residuals = jnp.linspace(0.0, 1.0, N)  # point i has residual i/N
     out = strat.resample(points, residuals, None, "interior", 0, key, candidates=pool)
     kept = jnp.array([jnp.any(jnp.all(jnp.isclose(out, p), axis=1)) for p in points])
-    top_half = kept[N // 2:].sum()
+    top_half = kept[N // 2 :].sum()
     bottom_half = kept[: N // 2].sum()
     assert top_half > bottom_half, f"kept {bottom_half} low-residual vs {top_half} high-residual"
 
@@ -103,17 +103,13 @@ def test_no_pool_is_a_silent_no_op_for_the_ranking_strategies():
     """
     points, residuals, _, key = _inputs()
     for name in ("random", "r3", "cr3"):
-        out = STRATEGIES[name]().resample(
-            points, residuals, None, "interior", 0, key, candidates=None
-        )
+        out = STRATEGIES[name]().resample(points, residuals, None, "interior", 0, key, candidates=None)
         assert jnp.array_equal(out, points), f"{name} changed its no-pool behaviour"
 
 
 def test_rad_keeps_its_pool_free_fallback():
     """RAD perturbs its high-residual points when there is no pool, so it must NOT raise."""
     points, residuals, _, key = _inputs()
-    out = jno.sampler.rad(resample_fraction=0.3).resample(
-        points, residuals, None, "interior", 0, key, candidates=None
-    )
+    out = jno.sampler.rad(resample_fraction=0.3).resample(points, residuals, None, "interior", 0, key, candidates=None)
     assert out.shape == points.shape
     assert not jnp.array_equal(out, points), "RAD fallback should still move points"

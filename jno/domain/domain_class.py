@@ -2841,7 +2841,15 @@ class domain(MeshIOMixin):
         ``compute_mesh_connectivity`` is set) builds ``mesh_connectivity``.
         Shared by the mesh-backed ``domain.__init__`` path and by
         ``PolygonDomain.build_mesh``.
+
+        Attaching a mesh RETIRES a pending deferred plan: the caller has supplied the mesh the plan
+        would have produced, so leaving the plan in place would let the next read of ``.mesh`` build
+        over the top of it and hand back the generated mesh instead of the attached one. The
+        deferred build pops the plan itself before it calls here (it is mid-build, and re-entering
+        would recurse); this covers every other caller, which is the path a test or a user takes
+        when it swaps a mesh in by hand.
         """
+        self.__dict__.pop("_lazy_plan", None)
         if mesh is None:
             boundary_indices = np.asarray([], dtype=np.int64)
         else:

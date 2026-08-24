@@ -95,8 +95,15 @@ def test_quad_and_structured_compose_in_either_order():
 
 
 def test_an_unstructured_3d_quad_is_refused_and_names_the_fix():
+    """The refusal fires when the mesh is BUILT, which a deferred domain postpones to first use.
+
+    ``.domain()`` no longer meshes on the spot, so the refusal surfaces on the first access to
+    ``.mesh`` rather than out of the constructor. Asserted through ``_blocks`` -- the same accessor
+    every other test in this file goes through -- so the timing this pins is the one a caller
+    actually meets.
+    """
     with pytest.raises(NotImplementedError, match=r"\.structured\(\)"):
-        _dom(Shape.box(0, 0, 0, 1, 1, 1, size=0.5).quad())
+        _blocks(_dom(Shape.box(0, 0, 0, 1, 1, 1, size=0.5).quad()))
 
 
 def test_a_structured_hex_domain_solves():

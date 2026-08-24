@@ -304,3 +304,31 @@ def test_a_curved_boundary_samples_exactly_on_the_curve():
     r = np.linalg.norm(pts - np.array([1.0, 2.0]), axis=1)
     assert np.allclose(r, 0.5, atol=1e-12)
     assert math.isclose(float(r.std()), 0.0, abs_tol=1e-12)
+
+
+def test_an_attached_mesh_is_not_overwritten_by_the_pending_plan():
+    """Attaching a mesh retires the deferred plan, instead of the plan later building over it.
+
+    The failure this pins is silent, which is why it is worth a test of its own: ``_apply_mesh``
+    wrote ``_mesh`` but left ``_lazy_plan`` in place, so the *next* read of ``.mesh`` saw a pending
+    plan, ran the mesher, and handed back the generated mesh -- the caller's mesh gone, with no
+    error anywhere. Anything computed afterwards was computed on a different mesh than the one that
+    was supplied.
+    """
+    meshio = pytest.importorskip("meshio")
+
+    pts = np.array([[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]])
+    cells = np.array([[0, 1, 2]])
+    d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain()
+    assert _meshless(d), "a Shape domain starts mesh-free -- otherwise this proves nothing"
+
+    d._apply_mesh(
+        meshio.Mesh(
+            np.c_[pts, np.zeros(len(pts))],
+            [("triangle", cells)],
+            cell_sets={"interior": [np.arange(1)], "boundary": [np.array([], dtype=np.int64)]},
+        )
+    )
+    # Reading `.mesh` is exactly what used to trigger the overwrite.
+    assert len(d.mesh.points) == 3, f"the attached mesh was replaced: {len(d.mesh.points)} points"
+    np.testing.assert_allclose(np.asarray(d.mesh.points)[:, :2], pts)

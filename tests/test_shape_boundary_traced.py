@@ -7,6 +7,7 @@ angle, a box face by area, a polygon edge by length -- and which of them survive
 That same test orients the normal, so a primitive never needs to know its own winding and a
 subtracted operand's normal comes out flipped with no special case.
 """
+
 import functools
 
 import jax
@@ -91,7 +92,7 @@ def test_every_call_is_a_fresh_draw(name):
 
 def test_unfilled_is_reported_not_hidden():
     """A boundary that is almost entirely swallowed still reports what it managed."""
-    swallowed = S.disk(0, 0, 1) | S.disk(0, 0, 3)      # the inner circle is interior to the union
+    swallowed = S.disk(0, 0, 1) | S.disk(0, 0, 3)  # the inner circle is interior to the union
     _, _, filled = _draw(swallowed, n=400, max_rounds=1, batch=64)
     assert filled < 400
 

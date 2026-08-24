@@ -72,7 +72,7 @@ def _retain_and_refill(
     every returned point with respect to the points and the candidate pool it was gathered from.
     """
     n = points.shape[0]
-    order = jnp.argsort(score)[::-1]                    # descending: best score first
+    order = jnp.argsort(score)[::-1]  # descending: best score first
     ranked = points[order]
     rank = jnp.arange(n)
     above = score[order] >= threshold
@@ -699,7 +699,6 @@ class R3(ResamplingStrategy):
             n_min=int(self.min_keep_frac * n_points),
             n_max=int(self.max_keep_frac * n_points),
         )
-        return result
 
 
 """RAD: Residual-based Adaptive Distribution resampling."""

@@ -5,6 +5,7 @@ candidates=None reselects from one baked-in cloud forever (25 600 draws yielded 
 points against a pool of 2560). `sample_inside` keeps only the answer -- rejection runs as a
 while_loop over a fixed buffer -- so nothing is retained between calls and nothing is stale.
 """
+
 import functools
 
 import jax
@@ -76,7 +77,7 @@ def test_memory_does_not_grow_with_rejection():
     that those rounds cost TIME and not MEMORY: the buffer is reused, so the working set is the same
     as for a shape that fills on the first round.
     """
-    thin = S.rect(0, 0, 1, 1) & S.rect(0.49, 0, 0.51, 1)     # 2% of its bounding box
+    thin = S.rect(0, 0, 1, 1) & S.rect(0.49, 0, 0.51, 1)  # 2% of its bounding box
     lo, hi = np.array([0.0, 0.0]), np.array([1.0, 1.0])
     n, batch = 512, 1024
     f = jax.jit(functools.partial(sample_inside, thin.contains, n=n, batch=batch, max_rounds=40))
@@ -89,7 +90,7 @@ def test_memory_does_not_grow_with_rejection():
 
 def test_unfilled_is_reported_not_hidden():
     """An impossible region must report how many it managed, not silently hand back zeros."""
-    empty = S.disk(0.5, 0.5, 0.05) & S.disk(5.0, 5.0, 0.05)   # disjoint -> empty
+    empty = S.disk(0.5, 0.5, 0.05) & S.disk(5.0, 5.0, 0.05)  # disjoint -> empty
     lo, hi = np.array([0.0, 0.0]), np.array([6.0, 6.0])
     _, filled = jax.jit(functools.partial(sample_inside, empty.contains, n=100, max_rounds=4))(
         lo, hi, jax.random.PRNGKey(0)

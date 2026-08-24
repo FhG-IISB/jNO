@@ -184,12 +184,10 @@ def sample_on_boundary(shape, key, n: int, *, eps: float = 1e-6, batch: int = 0,
         name = type(prim).__name__
         if name not in SURFACE_SAMPLERS:
             raise NotImplementedError(
-                f"sample_on_boundary has no traceable surface sampler for {name}; "
-                f"available: {sorted(SURFACE_SAMPLERS)}."
+                f"sample_on_boundary has no traceable surface sampler for {name}; available: {sorted(SURFACE_SAMPLERS)}."
             )
         share = max(1, int(round(batch * m / total)))
         plan.append((SURFACE_SAMPLERS[name], prim, jnp.asarray(A), jnp.asarray(b), share))
-    b_total = sum(share for *_, share in plan)
 
     def round_(carry, _):
         key_, buf, nbuf, cursor = carry
@@ -208,12 +206,16 @@ def sample_on_boundary(shape, key, n: int, *, eps: float = 1e-6, batch: int = 0,
             dim = shape.dim if isinstance(getattr(shape, "dim", None), int) else p.shape[1]
             plus = jnp.asarray(shape.contains(p[:, :dim] + eps * d[:, :dim]), dtype=bool)
             minus = jnp.asarray(shape.contains(p[:, :dim] - eps * d[:, :dim]), dtype=bool)
-            on = plus ^ minus                       # exactly one side inside -> a real boundary point
-            nrm = jnp.where(plus[:, None], -d, d)   # outward is the side that is NOT inside
+            on = plus ^ minus  # exactly one side inside -> a real boundary point
+            nrm = jnp.where(plus[:, None], -d, d)  # outward is the side that is NOT inside
             rank = jnp.cumsum(on) - 1
             idx = jnp.where(on, cursor + rank, n)
-            return (key_, buf.at[idx].set(p, mode="drop"), nbuf.at[idx].set(nrm, mode="drop"),
-                    jnp.minimum(cursor + jnp.sum(on), n))
+            return (
+                key_,
+                buf.at[idx].set(p, mode="drop"),
+                nbuf.at[idx].set(nrm, mode="drop"),
+                jnp.minimum(cursor + jnp.sum(on), n),
+            )
 
         return jax.lax.cond(cursor >= n, lambda o: o, draw, (key_, buf, nbuf, cursor)), None
 

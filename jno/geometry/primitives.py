@@ -829,6 +829,7 @@ class Contour:
             nrm = -nrm
         return pts, nrm
 
+
 # --- traceable surface sampling -------------------------------------------------------------
 # Each returns (points (n, 3), directions (n, 3)) with the direction UNIT and perpendicular to the
 # surface but of ARBITRARY SIGN: the composite orients it afterwards by asking which side is inside,
@@ -849,7 +850,7 @@ def rect_surface(prim, key, n):
     """Perimeter of an axis-aligned rectangle: an edge by length, then uniform along it."""
     k1, k2 = jax.random.split(key)
     w, h = prim.x1 - prim.x0, prim.y1 - prim.y0
-    e = _cat(k1, [h, h, w, w], n)                       # left, right, bottom, top
+    e = _cat(k1, [h, h, w, w], n)  # left, right, bottom, top
     u = jax.random.uniform(k2, (n,))
     x = jnp.where(e == 0, prim.x0, jnp.where(e == 1, prim.x1, prim.x0 + u * w))
     y = jnp.where(e <= 1, prim.y0 + u * h, jnp.where(e == 2, prim.y0, prim.y1))
@@ -877,7 +878,7 @@ def box_surface(prim, key, n):
     f = _cat(k1, areas, n)
     u = jax.random.uniform(k2, (n, 3))
     p = lo + u * (hi - lo)
-    axis = f // 2                                        # 0:x 1:y 2:z
+    axis = f // 2  # 0:x 1:y 2:z
     at_hi = (f % 2) == 1
     onehot = jnp.stack([axis == 0, axis == 1, axis == 2], axis=1)
     pinned = jnp.where(at_hi[:, None], hi, lo)
