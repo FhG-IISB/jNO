@@ -25,6 +25,7 @@ import math
 from dataclasses import dataclass
 from typing import ClassVar, Optional, Tuple
 
+import jax.numpy as jnp
 import numpy as np
 
 # How close a boundary point must be to an analytic curve/surface to lie "on" it.
@@ -33,7 +34,19 @@ TOL = 1e-6
 
 def _to3(a):
     """Right-pad an ``(N, k)`` array (k <= 3) with zeros to ``(N, 3)`` — the ambient frame everything
-    analytic works in, so a 2-D primitive and a 3-D one compose under the same transforms."""
+    analytic works in, so a 2-D primitive and a 3-D one compose under the same transforms.
+
+    Traced inputs stay traced: this sits under every transform in ``_node_contains``, so forcing
+    numpy here made ``translate``/``rotate``/``extrude``/``revolve`` untraceable however traceable
+    their leaves were.
+    """
+    import jax as _jax
+
+    if isinstance(a, (_jax.core.Tracer, _jax.Array)):
+        a = a[None, :] if a.ndim == 1 else a
+        if a.shape[1] >= 3:
+            return a[:, :3]
+        return jnp.pad(a, ((0, 0), (0, 3 - a.shape[1])))
     a = np.asarray(a, dtype=float)
     if a.ndim == 1:
         a = a[None, :]
@@ -242,10 +255,13 @@ class Polygon:
     def contains(self, pts, tol: float = TOL):
         """Boolean mask (N,) — inside test by the even-odd crossing rule (ray-cast). Edge-exact points
         are ambiguous (the crossing rule is exclusive on edges); ``tol`` is unused here."""
+        import jax as _jax
+
+        xp = jnp if isinstance(pts, (_jax.core.Tracer, _jax.Array)) else np
         x, y = pts[:, 0], pts[:, 1]
         verts = self.points
         n = len(verts)
-        inside = np.zeros(x.shape, dtype=bool)
+        inside = xp.zeros(x.shape, dtype=bool)
         j = n - 1
         for i in range(n):
             xi, yi = verts[i]
