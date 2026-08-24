@@ -3918,16 +3918,25 @@ class GaugePin:
     (nearest the mesh min-corner) -- the same essential path the explicit ``p(xpn, ypn) - value``
     form takes -- so assembly is unchanged. The location is intentionally not user-specified;
     any single DOF removes the null space.
+
+    ``mean=True`` picks a *different gauge*: the field is normalised after the solve so that
+    ``int p dx == 0``. The node pin still runs (it is what makes the system non-singular); only the
+    constant it leaves behind is replaced. This matters because a point pin forces one vertex's
+    discrete value to a continuous value it has no reason to equal, and the resulting constant does
+    not shrink with the mesh -- in 3-D that is enough to stop the pressure converging at all, while
+    the field itself is correct up to that constant (Bochev & Lehoucq, *SIAM Review* 47(1), 2005).
     """
 
-    __slots__ = ("field", "value")
+    __slots__ = ("field", "value", "mean")
 
-    def __init__(self, field, value=0.0):
+    def __init__(self, field, value=0.0, mean=False):
         self.field = field
         self.value = value
+        self.mean = bool(mean)
 
     def __repr__(self):
-        return f"GaugePin(field={getattr(self.field, 'name', '?')!r}, value={self.value!r})"
+        extra = ", mean=True" if self.mean else ""
+        return f"GaugePin(field={getattr(self.field, 'name', '?')!r}, value={self.value!r}{extra})"
 
 
 class TrialFunction(_FieldComponentIndex, Placeholder):
@@ -4063,7 +4072,7 @@ class TrialFunction(_FieldComponentIndex, Placeholder):
             dom.context[key] = _np.zeros((1, 1))
         return Variable(tag=key, dim=[0, 1], domain=dom, axis="spatial")
 
-    def pin(self, value=0.0):
+    def pin(self, value=0.0, mean=False):
         """Gauge-fix this field's constant null space by pinning one arbitrary DOF to ``value``.
 
         For an incompressible pressure or a pure-Neumann scalar, whose solution is defined only
@@ -4074,15 +4083,31 @@ class TrialFunction(_FieldComponentIndex, Placeholder):
 
         ``jno.fem`` pins a deterministic vertex (nearest the mesh min-corner), so the gauge is
         reproducible; the location is intentionally not user-specified -- any single DOF removes
-        the null space. See :class:`GaugePin`.
+        the null space.
+
+        ``mean=True`` swaps the gauge for the **zero-mean** one, ``int p dx == 0``::
+
+            fem = jno.fem([momentum, -q * div(u), p.pin(mean=True), *wall_bcs])
+
+        Reach for it whenever the *level* of the field is read, not just its gradient -- a point
+        pin leaves a constant that does not shrink under refinement, which is enough to stop a 3-D
+        pressure converging. It is exact, not an approximation: with the velocity fully Dirichlet
+        the constant is a genuine null vector, so shifting it changes no other field. An outflow
+        (natural) boundary fixes the level on its own and wants no pin at all. See :class:`GaugePin`.
         """
+        if mean and value != 0.0:
+            raise ValueError(
+                f"jno.fem: pin(value={value!r}, mean=True) asks for two different gauges at once -- a "
+                "node fixed to a value AND a zero integral. Pick one: pin(value) sets the level at one "
+                "vertex, pin(mean=True) sets the integral over the domain."
+            )
         if self.num_components != 1:
             raise ValueError(
                 "jno.fem: pin() gauge-fixes a *scalar* field's constant null space, but "
                 f"{self.name!r} has value_shape {self.value_shape}. Pin a scalar field "
                 "(e.g. the pressure); a fully Dirichlet vector field has no null space to fix."
             )
-        return GaugePin(self, value)
+        return GaugePin(self, value, mean)
 
     def __call__(self, *coords, **named):
         """Evaluate this field symbol on the region carried by ``coords``.

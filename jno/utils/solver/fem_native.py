@@ -2073,16 +2073,20 @@ def assemble_fem_native(
         ``c·(u_r·w_r − u_i·w_i)``) is distributed over its sums into single-test sub-terms, so one
         complex form lowers onto the coupled blocks."""
         from ...trace import BinaryOp, Literal
-        from .fem_utils import _expand_product_terms
+        from .fem_utils import _expand_product_terms, _is_structural_zero, _test_field_keys
 
         tfi = _test_field_index(coeff, field_index)
         if tfi is not None:
             return [(coeff, tfi)]
+        if _is_structural_zero(coeff):
+            return []  # the `0` that builtin sum() seeds with: no block owns it, nothing to assemble
         expanded = _expand_product_terms(coeff)
         if len(expanded) > 1:
             split: List[Tuple[Any, int]] = []
             for s, sub in expanded:
                 sub_signed = sub if s >= 0 else BinaryOp("*", Literal(-1.0), sub)
+                if _is_structural_zero(sub_signed):
+                    continue
                 sfi = _test_field_index(sub_signed, field_index)
                 if sfi is None:
                     split = None
@@ -2090,9 +2094,19 @@ def assemble_fem_native(
                 split.append((sub_signed, sfi))
             if split is not None:
                 return split
+        # Say which of the two ambiguities this is: they have different fixes, and the old message
+        # asserted "exactly one" even when the sub-term carried none.
+        n_test = len(_test_field_keys(coeff))
+        if n_test == 0:
+            raise ValueError(
+                f"jno.fem (native): a {where} weak-form sub-term carries no test field, so there is no "
+                f"equation block to assemble it into -- {coeff!r}. Every additive piece of a weak form "
+                "pairs with a test function: a source term is `-f * v`, not `-f`."
+            )
         raise ValueError(
-            f"jno.fem (native): each {where} weak-form term must contain exactly one test field "
-            "(it determines the equation block)."
+            f"jno.fem (native): a {where} weak-form sub-term welds {n_test} test fields and could not be "
+            f"distributed into single-test pieces -- {coeff!r}. Each additive term must carry exactly one "
+            "test field (it determines the equation block)."
         )
 
     _preprocess_cache: Dict[Tuple[int, int], Tuple[Any, Any]] = {}

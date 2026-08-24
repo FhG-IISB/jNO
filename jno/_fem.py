@@ -397,6 +397,108 @@ def _lower_gauge_pin(pin: GaugePin) -> Any:
     return field(*spatial) - pin.value
 
 
+def _saddle_block_names(fem_obj: "FEM", domain: Any, volume_terms: List[Any]) -> List[str]:
+    """Names of the field blocks with no diagonal entry -- the structural mark of a saddle system.
+
+    A field whose own test function never meets its own trial function contributes no ``(i, i)``
+    block, so the assembled operator has a zero diagonal there. That is exactly the Taylor-Hood
+    pressure, the Lagrange multiplier of a constraint, and the algebraic field of a mixed DAE -- and
+    it is the case a diagonal (Jacobi) preconditioner cannot touch, because there is nothing on the
+    diagonal to scale.
+
+    Read from the TERMS, not from an assembled matrix: the structure is the same in every mode, so a
+    nonlinear or transient problem is diagnosed as readily as a linear one, at build time and with no
+    tangent to assemble.
+    """
+    from .utils.solver.fem_utils import _infer_fields, _test_field_keys
+    from .utils.solver.weak_form import _split_additive_terms
+
+    keys = list(getattr(fem_obj, "_block_field_keys", None) or getattr(fem_obj, "_trial_field_keys", None) or ())
+    if len(keys) < 2:
+        return []  # a single-field problem has no block structure to be a saddle in
+    occupied = set()
+    for bare in volume_terms:
+        try:
+            subs = _split_additive_terms(domain, bare)
+        except Exception:  # noqa: BLE001 - a term shape the splitter declines is simply not evidence
+            continue
+        for _sign, sub in subs:
+            test_keys = _test_field_keys(sub)
+            if len(test_keys) != 1:
+                continue
+            tk = next(iter(test_keys))
+            try:
+                fields, _ = _infer_fields(sub)
+            except Exception:  # noqa: BLE001
+                continue
+            for f in fields:
+                occupied.add((tk, f.get("field_key")))
+    # field_key -> the name the user gave the symbol, so the warning can say "p" rather than "block 1"
+    names = {}
+    for c in getattr(fem_obj, "_constraints", ()) or ():
+        for n in _walk(_bare(c)):
+            if isinstance(n, TrialFunction):
+                names.setdefault(getattr(n, "field_key", None), getattr(n, "name", None))
+    out = []
+    for i, k in enumerate(keys):
+        if (k, k) in occupied:
+            continue
+        out.append(names.get(k) or f"block {i}")
+    return out
+
+
+def _build_mean_gauge_ops(fem_obj: "FEM", fields: List[Any]) -> tuple:
+    """``[(mask, load, sum(load)), ...]`` for the fields gauged by ``p.pin(mean=True)``.
+
+    ``load`` is ``L_i = int phi_i dx`` for the gauged field, padded with zeros into the global DOF
+    layout; it is assembled through the public entry on the same domain and element order, which is
+    what makes its node ordering match the solution block. Built once, at ``jno.fem`` time -- never
+    inside a solve, where an auxiliary assembly would clobber the domain's native-assembly
+    attributes mid-flight.
+    """
+    offsets = getattr(fem_obj, "offsets", None)
+    if offsets is None:
+        names = ", ".join(str(getattr(f, "name", "?")) for f in fields)
+        raise NotImplementedError(
+            f"jno.fem: pin(mean=True) on {names} needs the per-field block layout, and this problem "
+            "was assembled without one (fem.offsets is None). Use pin() with a node value here, or "
+            "report the form -- the zero-mean gauge is wired on every path that reports blocks."
+        )
+    offsets = [int(o) for o in np.asarray(offsets).reshape(-1)]
+    n_dofs = int(offsets[-1])
+    domain = fem_obj.domain
+    dim = int(getattr(domain, "dimension", 2))
+    axes = ("x", "y", "z")[:dim]
+    ops = []
+    for field in fields:
+        blk = fem_obj.block_index(field)
+        start, stop = offsets[blk], offsets[blk + 1]
+        order = int(getattr(field, "order", 1) or 1)
+        key = getattr(field, "field_key", blk)
+        a, b = domain.fem_symbols(order=order, names=(f"_gauge{key}_a", f"_gauge{key}_b"))
+        co = domain.variable("interior", split=True)
+        bind = {ax: co[i] for i, ax in enumerate(axes)}
+        ai, bi = a.bind(**bind), b.bind(**bind)
+        load_local = np.asarray(fem([ai * bi - 1.0 * bi]).b).reshape(-1)
+        if load_local.size != stop - start:
+            raise RuntimeError(
+                f"jno.fem: pin(mean=True) on {getattr(field, 'name', '?')!r} assembled a {load_local.size}-entry "
+                f"volume load for a {stop - start}-dof block; the gauge would weight the wrong nodes."
+            )
+        total = float(load_local.sum())
+        if not np.isfinite(total) or abs(total) <= 0.0:
+            raise RuntimeError(
+                f"jno.fem: pin(mean=True) on {getattr(field, 'name', '?')!r} measured a domain volume of "
+                f"{total!r}; the zero-mean gauge divides by it."
+            )
+        load = np.zeros(n_dofs)
+        load[start:stop] = load_local
+        mask = np.zeros(n_dofs)
+        mask[start:stop] = 1.0
+        ops.append((jnp.asarray(mask), jnp.asarray(load), total))
+    return tuple(ops)
+
+
 def _infer_vec(constraints: List[Any]) -> int:
     """Infer the vector size from the trial's ``value_shape`` across the constraints.
 
@@ -1151,6 +1253,8 @@ class FEM:
         self.mesh = getattr(domain, "mesh", None)
         self.problem = getattr(domain, "_fem_problem", None)
         self._periodic = None  # periodic-tie reduction (prolongation P), attached by fem()
+        self._mean_gauges = ()  # zero-mean gauges (`p.pin(mean=True)`), resolved by fem() at build
+        self._saddle_blocks = ()  # field blocks with no diagonal entry, detected by fem() at build
         self._complex_n = None  # half-size n when _op is a fused complex real-equivalent 2n system
         # The unfused (re, im) legs. KNOWN CONSUMERS — check all of them before changing this or the
         # fused layout, since a stale reader does not crash (see the `operator` docstring: the fused
@@ -1290,6 +1394,72 @@ class FEM:
         if fk not in keys:
             raise KeyError(f"FEM.block_index: trial field {getattr(field, 'name', fk)!r} is not part of this system.")
         return keys.index(fk)
+
+    def _warn_if_saddle_solved_by_the_default(self, solve_fn, linear, precond):
+        """Say so when the matrix-free default is about to be pointed at a saddle system.
+
+        The default is Jacobi-preconditioned BiCGStab, and a saddle block has a ZERO diagonal -- the
+        preconditioner is the identity exactly where the system is hardest, so the iteration stalls
+        or stops early. It does not always fail loudly: the convergence guard accepts any relative
+        residual under 1e-4, which on a Taylor-Hood system can still be a pressure with no correct
+        digits, and the guard steps aside entirely under jit/vmap/grad.
+
+        Warn rather than refuse, on purpose: a 2-D saddle of moderate size does solve acceptably this
+        way, and refusing would break working code. Only when no solver was chosen -- passing
+        `linear=` or `precond=` means the choice was made deliberately and needs no advice.
+        """
+        blocks = getattr(self, "_saddle_blocks", ())
+        if not blocks or solve_fn is not None or linear is not None or precond is not None:
+            return
+        if getattr(self, "_saddle_warned", False):
+            return
+        self._saddle_warned = True
+        which = ", ".join(str(b) for b in blocks)
+        warnings.warn(
+            f"jno.fem: {which} has no diagonal block, so this is a saddle-point system, and "
+            "fem.solve() is about to use its matrix-free default (Jacobi-preconditioned BiCGStab). "
+            "A diagonal preconditioner cannot help where the diagonal is zero: the solve may return "
+            "a field whose pressure has no correct digits while reporting success, and the residual "
+            "guard it would trip is skipped under jit/vmap/grad. Pass a solver that suits the "
+            "structure -- linear=jno.solve.lu() for a direct factorization, or "
+            "precond=jno.precond.triangular((u, jno.precond.amg()), (p, jno.precond.form([...]))) "
+            "for a block/Schur preconditioner that scales.",
+            stacklevel=3,
+        )
+
+    def _gauge_project(self, u):
+        """Apply any zero-mean gauge (``p.pin(mean=True)``) to a solved field.
+
+        One expression serves every solve path because it needs no indexing and no reassembly: the
+        correction is ``mask * (L . u) / sum(L)``, with ``mask`` selecting the gauged field's block
+        and ``L_i = int phi_i dx`` that field's load of 1. ``inner(..., keepdims=True)`` contracts
+        the DOF axis and keeps it, so a steady vector ``(n_dofs,)`` and a transient trajectory
+        ``(n_steps, n_dofs)`` broadcast identically -- and since the operands are ordinary
+        trace/array values, the same line applies to a concrete solution and to a lazy solve node,
+        under ``jit`` / ``vmap`` / ``grad`` included.
+
+        The mask is exactly zero outside the gauged block, so no other field can move: this shifts
+        the pressure, never the velocity.
+        """
+        ops = getattr(self, "_mean_gauges", ())
+        if not ops:
+            return u
+        # `jno.np.inner` builds a TRACE node even when handed concrete arrays, so it is right for a
+        # lazy solve node and wrong for a solved array -- it would turn a returned field back into an
+        # unevaluated graph. Same contraction either way, spelled for the value at hand.
+        if isinstance(u, Placeholder):
+            from .jnp_ops import inner as _inner
+
+            def _weighted(load, w):
+                return _inner(load, w, n_contract=1, keepdims=True)
+        else:
+
+            def _weighted(load, w):
+                return jnp.sum(jnp.asarray(load) * jnp.asarray(w), axis=-1, keepdims=True)
+
+        for mask, load, total in ops:
+            u = u - mask * (_weighted(load, u) / total)
+        return u
 
     def solve(
         self,
@@ -1449,6 +1619,7 @@ class FEM:
                 else:
                     self._periodic = reduction
             try:
+                self._warn_if_saddle_solved_by_the_default(solve_fn, linear, precond)
                 result = self._solve_dispatch(
                     solve_fn,
                     adapt=adapt,
@@ -1467,6 +1638,10 @@ class FEM:
                 self._periodic, self._op = prev_periodic, prev_op
             if reduction is not None:
                 self._check_basis_residual(result, reduction)
+            # Zero-mean gauges are applied HERE, at the one point every mode funnels through, so a
+            # steady array, a transient trajectory node and an adaptive result are all normalised by
+            # the same line -- rather than each driver having to remember to do it.
+            result = self._gauge_project(result)
             if isinstance(result, Placeholder):
                 # Tag the solve node with its domain so jno.core can infer the domain straight from the graph
                 # (a data-misfit inverse `jno.core([(fem.solve() - u_obs).mse])` needs no explicit `domain=`).
@@ -4198,8 +4373,12 @@ def _fem_impl(
     # Dirichlet `p(node) - value` *before* domain discovery and classification: a GaugePin is a
     # bare marker, not a walkable expression, so it must not reach `_discover_domain` (which walks
     # coordinate Variables) or the `_region_and_support` classifier.
+    _mean_gauge_fields: List[Any] = []
     if any(isinstance(c, GaugePin) for c in constraints):
         pins = [c for c in constraints if isinstance(c, GaugePin)]
+        # `mean=True` keeps the node pin (it is what makes the system non-singular) and additionally
+        # re-levels the field after the solve; only the constant the pin leaves behind is replaced.
+        _mean_gauge_fields = [pin.field for pin in pins if getattr(pin, "mean", False)]
         constraints = [c for c in constraints if not isinstance(c, GaugePin)] + [_lower_gauge_pin(p) for p in pins]
 
     # Nonlocal coupling terms (radiation, integral/non-reflecting BCs, ...) are not local weak forms and
@@ -4396,7 +4575,7 @@ def _fem_impl(
     # This holder carries that P so `_finalize` reuses it rather than rebuilding.
     periodic_holder: List[Any] = []
 
-    def _finalize(fem_obj: "FEM") -> "FEM":
+    def _finalize_core(fem_obj: "FEM") -> "FEM":
         """Attach the periodic reduction (if any): linear & nonlinear via ``FEM.solve``, transient via
         the time route's existing context-driven reduction. Single-field, vector, and coupled
         multi-field are all reduced block-wise (P_i^T M[i,j] P_j); complex / runtime-parametric remain out."""
@@ -4563,6 +4742,23 @@ def _fem_impl(
         fem_obj._op = reduce_op_periodic(fem_obj._op, fem_obj._mode, periodic)
         fem_obj._periodic = periodic
         return _fuse_complex_steady(fem_obj)
+
+    def _finalize(fem_obj: "FEM") -> "FEM":
+        """``_finalize_core`` plus the zero-mean gauges, attached last on purpose.
+
+        Building a gauge assembles an auxiliary volume load through the public entry, and that
+        overwrites the domain's ``_fem_native_*`` attributes -- which the periodic / hanging-node
+        branches of ``_finalize_core`` still read. Running strictly after it keeps those reads on
+        the values they were assembled with.
+        """
+        out = _finalize_core(fem_obj)
+        if _mean_gauge_fields:
+            out._mean_gauges = _build_mean_gauge_ops(out, _mean_gauge_fields)
+        # Structural, so it is known here for every mode -- and being known at BUILD time is what
+        # lets the warning fire even when the solve is later wrapped in jit, where the residual
+        # guard cannot.
+        out._saddle_blocks = tuple(_saddle_block_names(out, domain, volume_terms))
+        return out
 
     volume_terms: List[Any] = []
     boundary_terms: dict[str, List[Any]] = {}
@@ -5272,6 +5468,13 @@ def _fem_impl(
         # The time block is already reduced and carries P (transient solve() uses the block directly);
         # expose the reduction on the FEM too, mirroring the steady periodic path (P / n_red / n_full).
         fem_obj._periodic = periodic
+        # This path returns without `_finalize`, so the gauge is attached here too -- a requested
+        # zero-mean gauge must never be silently dropped on one route.
+        if _mean_gauge_fields:
+            fem_obj._constraints = _orig_constraints
+            fem_obj._block_field_keys = list(getattr(domain, "_fem_native_field_keys", None) or ())
+            fem_obj._trial_field_keys = _field_keys(_orig_constraints)
+            fem_obj._mean_gauges = _build_mean_gauge_ops(fem_obj, _mean_gauge_fields)
         return fem_obj
 
     # ---- VPINN (network-trial) on a 2D Lagrange mesh: the only single-field path that reaches here.

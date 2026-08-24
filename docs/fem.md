@@ -1662,6 +1662,15 @@ Pick by structure:
 | **a Newton loop** (or no GPU / a factorization too big for device memory) | `lu(backend="pardiso")` | Intel MKL PARDISO, multithreaded CPU. **The fastest factorization of the four**, and like cuDSS it splits symbolic analysis from numeric factorization, so a Newton step reuses the analysis. On lap3d 50³ (n=125,000) against single-threaded SuperLU's 65,212 ms: factorization **298 ms**, Newton re-factorization **296 ms — 220×**, where cuDSS reaches 115×. Its adjoint is cheaper too — `Aᵀx = b` comes from the *same* factorization rather than a second one. An exactly symmetric operator uses LDLᵀ (1.9× on lap3d 50³, 13× on a saddle), which needs the upper triangle with an **explicit diagonal** — without that a saddle's constraint rows come back empty and PARDISO rejects the matrix. Like cuDSS it returns finite garbage on a singular operator, so jNO checks the perturbed-pivot count and **raises**. `pip install jax-numerical-operators[pardiso]`, x86-64 |
 | small systems / coarse blocks | `dense` | LAPACK, vmap-native |
 
+> **jNO tells you when this applies.** `jno.fem` detects a saddle system structurally at build time —
+> a field whose own test function never meets its own trial function contributes no diagonal block —
+> and `fem.solve()` warns, naming the field, when it is about to use the matrix-free default on one.
+> It warns rather than refuses: a 2-D saddle of moderate size does solve acceptably that way. Passing
+> `linear=` or `precond=` silences it, since that is the deliberate choice it asks for. The detection
+> is structural, so it holds in every mode with no tangent to assemble, and it fires under
+> `jit`/`vmap`/`grad` — which matters, because the runtime residual guard needs a concrete residual
+> and steps aside on a tracer, leaving a transformed solve otherwise unguarded.
+
 > **Choosing between `cudss` and `pardiso`: pick by the phase your problem repeats.** A Newton loop re-*factorizes* every iteration, so PARDISO wins (220× vs 115× over SuperLU). A shift-invert eigensolve or a constant-operator transient re-*solves* against one factorization, and there cuDSS is ~11× faster per solve (3.5 ms vs 40 ms at lap3d 50³) and takes a whole block of right-hand sides at once. There is deliberately no `auto`: which wins depends on hardware jNO cannot inspect. Install both with `pip install jax-numerical-operators[fem]`.
 
 **Preconditioner specs** (declarative — materialized against the assembled operator at solve time; a
@@ -2259,8 +2268,53 @@ trajectory`. Build your own (e.g. diffrax) from the block's `block.M` / `block.A
   one continuity term; an inf-sup-stable Taylor–Hood pair is `order=2` velocity + `order=1`
   pressure. Pure-Dirichlet velocity leaves the pressure defined only up to a constant; gauge-fix
   that null space by adding `p.pin()` to the constraint list (`p.pin(value)` sets the gauge).
+
+  > **Which gauge, and when it matters.** `p.pin(value)` fixes one vertex's *discrete* value to a
+  > *continuous* one. That is fine whenever only the pressure **gradient** is used, and wrong as soon
+  > as the **level** is read, because the constant it leaves behind does not shrink with the mesh.
+  > Measured on a manufactured 3-D Stokes solution (P2/P1 tets, direct solver), the pressure `L2`
+  > error under refinement is `3.57e-2 → 1.08e-2 → 1.34e-2 → 5.56e-3` — it *rises* at `h = 0.22`, and
+  > the observed order is `6.16 / -0.89 / 4.38`, i.e. no order at all. `p.pin(mean=True)` gauges to
+  > `∫p dx = 0` instead and the same problem gives `8.13e-3 → 4.50e-3 → 2.66e-3 → 1.88e-3`, order
+  > `3.05 / 2.17 / 1.75` against the theoretical `O(h²)`. The velocity is identical either way — the
+  > field was always right up to that constant (Bochev & Lehoucq, *SIAM Review* 47(1), 2005, §3).
+  > A **natural (do-nothing) outflow** fixes the level on its own, so a channel with an outflow wants
+  > no pin at all. The normalisation applies wherever a solution is returned — steady vector,
+  > transient trajectory, or a lazy solve node — and is plain arithmetic, so it survives `jit`/`grad`.
 * **1D and 3D** — a 1D interval or a 3D `cube`/extruded `gmsh` volume use the identical API with
   one fewer / one more coordinate (`ui.z`, `u(xb, yb, zb) - g`).
+
+#### What the fluid path is verified to do — and what it is not
+
+Scope first, since it is not obvious from the API: jNO's FEM fluid path is **laminar incompressible**
+flow and nothing else. There is no turbulence model (no RANS, no LES), no compressible or Euler path,
+no free surface / VOF / level set, and no fluid–structure interaction. Nothing about `jno.fem` stops
+you writing those terms; nothing in the library implements or verifies them.
+
+Within that scope, measured rather than asserted:
+
+| | verified by |
+|---|---|
+| 2-D steady Stokes, Taylor–Hood P2/P1 | exact fields recovered to ~1e-13 with a direct solver |
+| 2-D steady Navier–Stokes | Kovasznay (closed form) in the convergence matrix: velocity `O(h³)`, pressure `O(h²)` |
+| 2-D transient Navier–Stokes | lid-driven cavity at Re = 200, backward Euler + Newton |
+| **3-D Stokes, Taylor–Hood P2/P1 tets** | fitted order 3.12 velocity / 2.29 pressure against theory 3 / 2 |
+| **3-D Navier–Stokes** (convective term) | fitted order 3.13 / 2.37 at `ν = 0.05`, cell Péclet ≈ 4 |
+| coupled (Boussinesq) | its own convergence row, three fields |
+| **an external benchmark** | DFG 2D-1 cylinder at Re = 20 — `c_D` to **0.02 %** of the published value |
+| natural (do-nothing) outflow | carried by that same benchmark |
+| forces on a body | reaction-based drag/lift via `fem.eval` + `region_dofs` |
+
+Two ceilings worth knowing before you plan a run:
+
+* **Direct-solver fill-in in 3-D.** Measured on one GPU, a 3-D Stokes solve is trivial to ~10k DOF
+  (0.60 s at 9.1k) and then turns over sharply — 4.02 s at 18.5k, i.e. roughly `O(N^2.7)`. That puts
+  the practical ceiling for `lu()` around 30–60k DOF; past it use the block/Schur preconditioners in
+  `jno.precond` (verified in 3-D), or `lu(backend="pardiso"/"cudss")`.
+* **No stabilisation.** There is no SUPG/GLS/grad-div term in the library, so convection-dominated
+  flow is unaddressed. The cavity tutorial sits at Re = 200; the practical ceiling for unstabilised
+  P2/P1 is somewhere in the low hundreds and has not been measured. `dom.cell_size` gives you the
+  element size `h` if you want to write a stabilised form yourself.
 * **Higher-order Lagrange** — `order=k` gives degree-`k` elements (P2, P3, P4, … on triangles and tets);
   read the solution at `fem.points`. The geometry stays affine-P1 (straight-sided), so on a *curved*
   boundary the geometric error caps the observed order regardless of `k` — measure high-order convergence
