@@ -18,7 +18,21 @@ import pytest
 import jno
 from jno.geometry.shape import sample_on_boundary
 
-jax.config.update("jax_enable_x64", True)
+
+@pytest.fixture(autouse=True)
+def _x64():
+    """x64 for this module's tests only, restored after.
+
+    At module scope this ran at IMPORT, so it leaked into every other file in the same pytest
+    process and could not be undone; `tests/test_x64_isolation.py` guards against exactly that.
+    """
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
 
 S = jno.Shape
 SHAPES = {
