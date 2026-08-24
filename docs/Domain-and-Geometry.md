@@ -386,16 +386,39 @@ primitives' auto-names (`left`, `arc`, `surface`, …) are available before any 
     Nothing you write has to change; a tag declared while mesh-free gains its mesh-derived half at
     that point.
 
-!!! warning "Plans that stay eager"
-    A plan is mesh-free only if its extent, its membership **and** its boundary are all closed-form.
-    These are not, and mesh at construction as before rather than being half-served: `sweep` and
-    `fillet` (no analytic membership — `fillet` removes material near edges, so recursing to the
-    child would answer for the un-filleted solid); `.name(...)` / `Shape.regions(...)` (region and
-    interface tags are the mesher's conforming sub-bodies); and `.structured()` (already a lattice).
+!!! note "Shapes with no closed form — the boundary tessellation"
+    `fillet` has no analytic membership: it *removes* material near edges, so recursing to the child
+    would answer for the un-filleted solid — a wrong-but-plausible mask. It is served by meshing the
+    **boundary only** — the perimeter in 2-D, the surface in 3-D — which `Shape.tessellate()` does
+    once and caches. No volume fill runs, and `contains`, `sample_interior` and `sample_boundary`
+    fall back to it automatically. The domain says which path it took:
 
-    `translate`, `rotate`, `extrude` and `revolve` **are** covered — the query point is mapped into
-    the child's frame, and a revolved boundary is drawn from the profile weighted by its swept
-    radius (Pappus), so the inner rim of a ring is not over-sampled relative to the outer.
+    ```
+    INFO: Mesh-free domain from fillet plan (dim 3); tags [...] sample from a 372-facet boundary
+    tessellation.
+    ```
+
+    **What this costs.** A facet is straight, so on a *curved* boundary the normal is piecewise
+    constant and O(h) wrong — 7.5° median on a unit sphere at `h=0.5`, 2.2° at `h=0.15`, halving
+    with `h`. Tighten it with `.size(h)`. At a *crease* the facet normal is exact, because a facet
+    lies wholly on one face. Membership is the polyhedron's rather than the true solid's; the two
+    differ by the sagitta, O(h²).
+
+    **`sweep` is not served this way.** A sweep along a straight line is rewritten as an `extrude`
+    and stays fully analytic, so it never needed the tessellation. A sweep along an **arc** is
+    refused by name: gmsh returns that surface with its seam unsewn, and refining makes it worse —
+    measured across `h` = 0.5 → 0.08 the number of edges bounding a single facet runs 7, 7, 7, 10,
+    13, 16, 24. Without a closed surface there is no inside to test for, so that one meshes eagerly
+    through `.build()`, and the domain logs why rather than doing it silently.
+
+!!! warning "Plans that stay eager"
+    `.name(...)` / `Shape.regions(...)` (region and interface tags are the mesher's conforming
+    sub-bodies) and `.structured()` (already a lattice) mesh at construction as before, rather than
+    being half-served.
+
+    `translate`, `rotate`, `extrude` and `revolve` are covered analytically — the query point is
+    mapped into the child's frame, and a revolved boundary is drawn from the profile weighted by its
+    swept radius (Pappus), so the inner rim of a ring is not over-sampled relative to the outer.
 
 ## Sampling, time, and batching
 

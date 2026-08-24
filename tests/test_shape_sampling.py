@@ -66,11 +66,17 @@ def test_bounds_bound_the_shape_under_csg_and_transforms():
         assert (pts >= lo - 1e-9).all() and (pts <= hi + 1e-9).all()
 
 
-def test_bounds_refuse_by_name_without_a_closed_form():
-    solid = Shape.rect(0.0, 0.0, 1.0, 1.0).extrude(1.0).fillet(0.05)
+def test_bounds_come_from_the_tessellation_without_a_closed_form():
+    """A filleted solid has no closed-form extent, so its bounds are its boundary mesh's.
+
+    Rounding the edges of the unit cube removes material only near them, so the extent is unchanged
+    -- which is what makes this a check on the answer and not just on the plumbing.
+    """
+    solid = Shape.rect(0.0, 0.0, 1.0, 1.0).extrude(1.0).fillet(0.05).size(0.2)
     assert not solid.is_analytic()
-    with pytest.raises(NotImplementedError, match="tessellation"):
-        solid.bounds()
+    lo, hi = solid.bounds()
+    assert np.allclose(lo, (0.0, 0.0, 0.0), atol=1e-9)
+    assert np.allclose(hi, (1.0, 1.0, 1.0), atol=1e-9)
 
 
 # --------------------------------------------------------------------------- membership

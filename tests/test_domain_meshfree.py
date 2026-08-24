@@ -263,10 +263,6 @@ def test_a_time_dependent_shape_domain_carries_the_time_axis():
     "make, why",
     [
         (
-            lambda: jno.Shape.rect(0, 0, 1, 1, size=0.3).extrude(1.0).fillet(0.05).domain(),
-            "fillet removes material near edges, so no closed-form membership",
-        ),
-        (
             lambda: jno.Shape.rect(0, 0, 1, 1, size=0.3).name("core").domain(),
             "a named region's tags are the mesher's conforming sub-bodies",
         ),
@@ -275,12 +271,14 @@ def test_a_time_dependent_shape_domain_carries_the_time_axis():
             "a structured plan is a lattice, not a Shape, by the time it is built",
         ),
     ],
-    ids=["fillet", "named-region", "structured"],
+    ids=["named-region", "structured"],
 )
-def test_a_plan_that_cannot_be_served_analytically_still_meshes(make, why):
+def test_a_plan_that_cannot_be_served_still_meshes(make, why):
     """Each of these keeps the eager path *by name*, rather than being half-served mesh-free.
-    Membership alone is not enough — a PINN needs boundary points too, so `is_analytic` requires a
-    boundary sampler as well as bounds and containment."""
+
+    A plan with no closed form is no longer on this list: ``sweep``/``fillet`` are served by a
+    boundary tessellation instead (see ``test_shape_tessellation.py``). What remains is the work no
+    amount of point sampling reconstructs -- conforming sub-bodies, and lattice structure."""
     assert not _meshless(make()), why
 
 

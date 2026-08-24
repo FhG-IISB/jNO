@@ -640,14 +640,18 @@ class domain(MeshIOMixin):
             # `interface_<a>_<b>` tags are the mesher's conforming sub-bodies and shared facets,
             # which no amount of point sampling reconstructs. Supporting those mesh-free is a
             # separate piece of work, not something to half-do here.
+            from ..geometry.shape import _can_sample_meshfree
+
             _defer = (
                 _plan is not None
                 and _plan._structured is None
                 and getattr(_plan, "_region_name", None) is None
                 and _plan._node[0] != "regions"
                 and hasattr(_plan, "is_analytic")
-                and _plan.is_analytic()
             )
+            _why_eager = None
+            if _defer:
+                _defer, _why_eager = _can_sample_meshfree(_plan)
             if _defer:
                 self._lazy_plan = _plan
                 self.dimension = int(_plan.dim)
@@ -656,11 +660,19 @@ class domain(MeshIOMixin):
                 if self._is_time_dependent and time is not None:
                     self._time_points = np.linspace(time[0], time[1], time[2])
                     self._geometry_tags["initial"] = self._geometry_tags["interior"]
+                if _plan.is_analytic():
+                    _how = "analytically"
+                else:
+                    # Honest about the one concession: this plan has no closed form, so gmsh ran
+                    # once on the SURFACE. No volume mesh, but not "no mesher" either.
+                    _how = f"from a {len(_plan.tessellate().facets)}-facet boundary tessellation"
                 self.log.info(
                     f"Mesh-free domain from {_plan._node[0]} plan (dim {self.dimension}); "
-                    f"tags {sorted(self._geometry_tags)} sample from the geometry."
+                    f"tags {sorted(self._geometry_tags)} sample {_how}."
                 )
             else:
+                if _why_eager is not None:
+                    self.log.info(f"This plan cannot be sampled mesh-free ({_why_eager}); meshing it.")
                 self._generate_mesh(constructor, algorithm)
                 self.log.info(f"Loaded mesh from {constructor}")  # type: ignore[attr-defined]
             # A Shape.regions() plan carries named sub-region shapes; remember them so jno.fem

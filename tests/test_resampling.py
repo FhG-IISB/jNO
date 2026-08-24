@@ -708,3 +708,57 @@ def test_temporal_derivative_with_mixed_spatial_tag_counts():
 
     stats = solver.solve(epochs=2)
     assert jnp.isfinite(stats.training_logs[-1]["total_loss"][-1])
+
+
+# --------------------------------------------------------------------------- normals survive a resample
+
+
+@pytest.mark.parametrize(
+    "strategy",
+    [sampler.rad(1, 0.5, 0), sampler.rard(1, 0.5, 0, 2.0), sampler.r3(1, start_epoch=0), sampler.random(1, 1.0, 0)],
+    ids=["rad", "rard", "r3", "random"],
+)
+def test_a_resampled_boundary_point_keeps_its_own_normal(strategy):
+    """Resampling a boundary tag must not corrupt the normals that travel with the points.
+
+    A strategy returns a MIX -- points freshly drawn from the candidate pool, and points RETAINED
+    from the previous set -- so recovering the normals by looking every point up in the pool alone
+    is only correct while the pool is frozen. A mesh-free domain redraws its pool every event, so a
+    retained point is in it by accident at best and otherwise snaps to whichever pool point is
+    nearest: measured 3e-3 on this circular hole before the union lookup, and a full 90 degrees
+    across an edge of a box, where the nearest sample sits on the adjoining face.
+
+    The oracle is the closed-form normal of the hole, which points at its centre.
+    """
+    d = (jno.Shape.rect(0.0, 0.0, 1.0, 1.0) - jno.Shape.disk(0.5, 0.5, 0.2)).domain()
+    d.variable("arc", sample=(400, None), normals=True, split=True)
+    pts = np.asarray(d.context["arc"])[0, 0]
+    nrm = np.asarray(d.context["n_arc"])[0, 0]
+
+    for epoch in range(4):
+        pool, pool_n = (np.asarray(a) for a in d.draw_candidates("arc"))
+        moved = np.asarray(
+            strategy.resample(
+                jnp.asarray(pts),
+                jnp.asarray(np.where(pts[:, 1] > 0.5, 1.0, 1e-3)),  # residual high on the upper half
+                d,
+                "arc",
+                epoch,
+                jax.random.PRNGKey(epoch),
+                candidates=pool,
+            )
+        )
+        # exactly what core.solve() does to carry the normals across
+        ref_p = np.concatenate([pts, pool], axis=0)
+        ref_n = np.concatenate([nrm, pool_n], axis=0)
+        nearest = np.argmin(((moved[:, None, :] - ref_p[None]) ** 2).sum(-1), axis=-1)
+        pts, nrm = moved, ref_n[nearest]
+        strategy.update_epoch(epoch)
+
+    radius = np.hypot(pts[:, 0] - 0.5, pts[:, 1] - 0.5)
+    exact = np.stack([(0.5 - pts[:, 0]) / radius, (0.5 - pts[:, 1]) / radius], axis=1)
+    # The context is float32 (jNO enables x64 for FEM, not for a PINN's sampling), so "exact" here
+    # means to single precision. That still separates the two outcomes by two orders of magnitude:
+    # the union lookup lands at ~1e-7, looking the points up in the redrawn pool alone gave 3e-3.
+    assert np.abs(radius - 0.2).max() < 1e-6, "resampled points must stay on the hole"
+    assert np.abs(nrm - exact).max() < 1e-5, "each point must keep the normal belonging to IT"

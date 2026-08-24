@@ -89,11 +89,25 @@ def test_rigid_and_sweep_transforms_are_analytic():
     assert list(ring.contains(pts)) == [True, True, False, False]
 
 
-def test_sweep_and_fillet_refuse_by_name():
-    """The two plans with genuinely no closed form say so, and name the way out."""
-    solid = Shape.rect(0.0, 0.0, 1.0, 1.0).extrude(1.0).fillet(0.1)
-    with pytest.raises(NotImplementedError, match="tessellation"):
-        solid.contains(np.zeros((1, 3)))
+def test_fillet_membership_comes_from_the_tessellation():
+    """The plans with genuinely no closed form are answered by their boundary mesh instead.
+
+    The oracle is what the fillet actually did: rounding the vertical edges of the unit cube with
+    radius 0.1 removes the material at the corner, keeps the centre, and leaves the middle of a face
+    untouched. A membership test that merely recursed to the un-filleted solid would say the corner
+    is still there.
+    """
+    solid = Shape.rect(0.0, 0.0, 1.0, 1.0).extrude(1.0).fillet(0.1).size(0.15)
+    assert not solid.is_analytic()
+    pts = np.array(
+        [
+            [0.5, 0.5, 0.5],  # centre — kept
+            [0.5, 0.5, 0.99],  # middle of a face — kept
+            [0.01, 0.01, 0.5],  # inside a rounded vertical edge — REMOVED by the fillet
+            [1.5, 0.5, 0.5],  # outside the cube entirely
+        ]
+    )
+    assert list(solid.contains(pts)) == [True, True, False, False]
 
 
 def test_cut_keeps_its_own_cut_surface():
