@@ -63,3 +63,9 @@ the stress over the surface, because the reaction is exactly conjugate to the co
 - **The drag is a confined-sphere drag.** At 3.36× the unbounded Stokes-law value $6\pi\mu R U$,
   it reflects a duct only twice the sphere diameter across. That ratio is a sanity band, not a
   benchmark match — the wall correction at 50 % blockage is large.
+
+## Full script
+
+```python
+--8<-- "tutorial_examples/08_fem_and_varpinns/stokes_3d_duct_sphere.py:code"
+```

@@ -76,3 +76,9 @@ energy plateaus at the true minimum within a few hundred epochs and stays there.
 - **Quadrature matters for energy losses.** A fixed nodal rule can be aliased by an expressive
   integrand; `quadrature="gauss"` samples inside each element and resists it. If a loss dips below
   the analytic energy while the error grows, that is the quadrature being exploited.
+
+## Full script
+
+```python
+--8<-- "tutorial_examples/08_fem_and_varpinns/deep_ritz_poisson_2d.py:code"
+```

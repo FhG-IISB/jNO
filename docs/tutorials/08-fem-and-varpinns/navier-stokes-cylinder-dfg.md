@@ -63,3 +63,9 @@ piece of work.
 $\Delta p$ carries a smaller version of the same caveat: it is read at the nearest **pressure node**
 to each probe point, so part of its error is the node offset rather than the solution — 0.00 % on
 meshes that happen to land a node on the point, 0.3–0.7 % otherwise.
+
+## Full script
+
+```python
+--8<-- "tutorial_examples/08_fem_and_varpinns/navier_stokes_cylinder_dfg.py:code"
+```

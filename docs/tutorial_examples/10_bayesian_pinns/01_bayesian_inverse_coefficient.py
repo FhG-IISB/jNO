@@ -1,3 +1,4 @@
+# --8<-- [start:code]
 """01 — Bayesian inverse PINN: recover a PDE coefficient with calibrated UQ.
 
 Governing physics (steady reaction-diffusion on the unit line, u(0)=u(1)=0):
@@ -114,3 +115,4 @@ assert rel_k < 0.08, f"posterior-mean k off by {rel_k:.2%}"
 assert rhat < 1.1, f"chains not mixed: R-hat = {rhat:.4f}"
 assert ess > 100, f"effective sample size too low: {ess:.0f}"
 assert truth_in_ci, f"truth {K_TRUE} outside 90% CI [{k_lo:.4f}, {k_hi:.4f}]"
+# --8<-- [end:code]
