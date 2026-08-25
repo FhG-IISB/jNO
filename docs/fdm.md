@@ -47,10 +47,24 @@ views therefore default to **finite differences**:
 | `ui.d2(x)`       | `∂²u/∂x²` by finite differences                               |
 | `ui.d2(x) + ui.d2(y)` | the FD Laplacian, one direction at a time               |
 
-!!! warning "Do not split the whole-Laplacian stencils"
-    `"finite_difference:cotangent"` and `"finite_difference:lsq"` compute the **whole** Laplacian
-    `Δu` in one shot. Writing `ui.d2(x, scheme="finite_difference:cotangent") + ui.d2(y, …)` therefore
-    **doubles** it. Use the default per-direction stencil for `.d2(x) + .d2(y)`.
+!!! danger "`:cotangent` is a whole-Laplacian stencil — and `.d2` now refuses it"
+    `"finite_difference:cotangent"` computes the **whole** Laplacian `Δu` for any dimension you ask
+    for, so `ui.d2(x, scheme=…) + ui.d2(y, scheme=…)` used to **double** it — silently. The solve
+    converged to half the true answer (relative error 0.494 → 0.498 → 0.499 under refinement, never
+    converging, never raising).
+
+    `.d2` and `.dd` now **raise** on that sub-scheme. Write the Laplacian as one term instead, which
+    takes every coordinate at once and so cannot be double-counted:
+
+    ```python
+    lap = ui.laplacian(x, y, scheme="finite_difference:cotangent")   # ✅ one term, cannot double
+    lap = ui.d2(x, scheme="finite_difference:cotangent") + ui.d2(y, …)   # ❌ raises
+    ```
+
+    `"finite_difference:lsq"` is **not** affected — it is a genuine per-direction stencil, so
+    `.d2(x, scheme=":lsq") + .d2(y, scheme=":lsq")` is correct and equals
+    `.laplacian(x, y, scheme=":lsq")` (both 1.978e-02 on the study below; the single `.d2(x, ":lsq")`
+    alone is 1.046, as a per-axis derivative should be).
 
 ### Choosing the stencil
 
@@ -64,6 +78,16 @@ The built-in stencils (parsed from the scheme string) are:
 | `"finite_difference:cotangent"`        | area-weighted        | cotangent (whole-Δ)      |
 | `"finite_difference:uniform"`          | uniform              | gradient-of-gradient     |
 | `"finite_difference:inverse_distance"` | inverse-distance     | gradient-of-gradient     |
+
+!!! measured "How much the cotangent stencil buys — unit square, −Δu = f, float64"
+    | mesh `h` | `.laplacian(x, y, scheme=":cotangent")` | `.d2(x) + .d2(y)` (default) |
+    |---|---|---|
+    | 0.10 | **1.164e-02** | 4.942e-02 |
+    | 0.06 | **4.058e-03** | 1.674e-02 |
+    | 0.035 | **1.417e-03** | 5.780e-03 |
+
+    A stable ~4× at every resolution — the same convergence *rate*, a better constant. Worth the one
+    extra word on the term whenever the mesh is unstructured.
 
 The `cotangent` Laplacian is the most accurate and is symmetric; the gradient methods trade accuracy
 for locality. The scheme stays on the operator it describes — `ui.d2(x, scheme=…)` — so different
