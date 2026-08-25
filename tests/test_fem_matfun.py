@@ -64,23 +64,21 @@ def test_krylov_breakdown_raises_instead_of_returning_nan():
     assert np.isfinite(float(jax.grad(lambda c: jno.solve.logdet(c * S, samples=32, order=8))(1.0)))
 
 
-def test_applyfun_krylov_overrun_is_still_only_partly_caught():
-    """Records exactly how far the finiteness guard gets on ``applyfun`` -- which is NOT all the way.
+def test_applyfun_is_order_independent_past_the_krylov_dimension():
+    """``order`` is an upper BOUND on the Krylov dimension, not an exact request.
 
-    Same collapsed spectrum as above. ``applyfun`` degrades through three regimes as ``order`` passes
-    the Krylov dimension, and only the last is caught:
+    Same collapsed spectrum as the test above (mesh 0.25 pins 16 of 30 rows, leaving 15 distinct
+    eigenvalues). Running past that dimension used to degrade catastrophically and silently — the
+    sub-diagonal does not collapse to zero as a textbook happy breakdown would, it EXPLODES (0.27 →
+    2.2 → ... → 184.7) because the residual is pure round-off and normalising it gives basis vectors
+    of noise, whose Ritz values leave the spectrum entirely (measured [-244, +254] against a true
+    [0.99, 5.44]). Before the nested-convergence rule:
 
-        order <= 20   correct           (rel 1e-14 against a dense expm)
-        order == 25   2.50e+37          FINITE, wrong by 35 orders -- NOT caught
-        order == 29   9.05e+75          FINITE, wrong by 74 orders -- NOT caught
-        order == 30   entries ~1e+300   the norm overflows to inf; caught only if an entry is inf
+        order 15  rel 3.35e-15        order 25  rel 5.11e+35
+        order 20  rel 1.44e-10        order 29  rel 1.85e+74
 
-    A finiteness test cannot see a finite-but-absurd Krylov approximation. The real fix is to detect
-    the Lanczos breakdown itself (beta ~ 0) and truncate to the invariant subspace, where the answer is
-    EXACT -- which means computing f(T) from matfree's tridiagonal rather than using its
-    ``funm_lanczos_sym`` composition. Not done; this test exists so the gap is recorded rather than
-    rediscovered. Saad, *SIAM J. Numer. Anal.* 29(1), 1992, section 4 gives the standard error
-    estimate for Krylov f(A)v approximations."""
+    Every order must now land on the same answer. Note order 20: this is not only a fix for the
+    catastrophic end, it is more accurate wherever round-off has begun to contaminate the basis."""
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.25)
     u, v = d.fem_symbols()
     xi, yi, _ = d.variable("interior", split=True)
@@ -90,14 +88,68 @@ def test_applyfun_krylov_overrun_is_still_only_partly_caught():
     S = jnp.asarray(np.asarray(A.todense()))
     n = S.shape[0]
     ones = jnp.ones(n)
-    ref = np.linalg.norm(np.asarray(jax.scipy.linalg.expm(S)) @ np.ones(n))
+    ref = np.asarray(jax.scipy.linalg.expm(S)) @ np.ones(n)
 
-    good = np.asarray(jno.solve.applyfun(S, ones, fun=jnp.exp, order=15))
-    assert abs(np.linalg.norm(good) - ref) / ref < 1e-8, "inside the Krylov dimension it is exact"
+    for order in (8, 15, 20, 25, 29, 30):
+        got = np.asarray(jno.solve.applyfun(S, ones, fun=jnp.exp, order=order))
+        rel = np.linalg.norm(got - ref) / np.linalg.norm(ref)
+        # order=8 is genuinely below the Krylov dimension, so it is approximate but not broken
+        assert rel < (1e-5 if order == 8 else 1e-12), f"order={order} gave rel {rel:.2e}"
 
-    bad = np.asarray(jno.solve.applyfun(S, ones, fun=jnp.exp, order=25))
-    assert np.all(np.isfinite(bad)), "the point: it is FINITE, so the guard cannot see it"
-    assert np.max(np.abs(bad)) > 1e30, "and absurd -- 35 orders past the true answer"
+
+def test_applyfun_arnoldi_path_and_expmv_agree_with_a_dense_expm():
+    """The non-symmetric paths, which carry a scaling trap.
+
+    ``matfree``'s two decompositions disagree on the fourth return value: ``tridiag_sym`` gives
+    ``||v||`` and ``hessenberg`` gives ``1/||v||``. Using it directly scales the Arnoldi answer by
+    ``||v||²`` — measured 1.634 against a true 49.020 on this operator, exactly a factor n. Both
+    build ``Q[0] = v/||v||``, so the norm is taken from ``v`` itself and this pins that it is."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.25)
+    u, v = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    A, _ = jno.fem([ui * vi + ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0]).operator
+    S = jnp.asarray(np.asarray(A.todense()))
+    n = S.shape[0]
+    ones = jnp.ones(n)
+    ref = np.asarray(jax.scipy.linalg.expm(S)) @ np.ones(n)
+
+    from jno.utils.solver.matfun import expmv
+
+    for order, tol in ((10, 1e-6), (20, 1e-10), (29, 1e-10)):
+        # order=10 is genuinely below this operator's Krylov dimension (15 distinct eigenvalues), so
+        # it is approximate; the point is that 20 and 29 -- past it -- are not WRONG.
+        arn = np.asarray(jno.solve.applyfun(S, ones, fun=jnp.exp, order=order, symmetric=False))
+        pade = np.asarray(expmv(S, ones, order=order))
+        assert np.linalg.norm(arn - ref) / np.linalg.norm(ref) < tol, f"arnoldi order={order}"
+        assert np.linalg.norm(pade - ref) / np.linalg.norm(ref) < tol, f"expmv order={order}"
+
+
+def test_applyfun_stays_differentiable_where_it_used_to_blow_up():
+    """The rule must not cost differentiability — an exponential integrator is differentiated through.
+
+    A discarded rung's ``f`` can legitimately overflow (``exp`` of a Ritz value at +254), so the
+    rungs are zeroed when non-finite: a rung that cannot be selected must not poison the gradient of
+    the one that is. Checked at orders that used to return 1e+35 and 1e+74."""
+    n = 40
+    rng = np.random.default_rng(7)
+    ev = np.concatenate([np.linspace(1.0, 4.0, 12), np.repeat(1.0, n - 12)])  # Krylov dimension 12
+    Q0, _ = np.linalg.qr(rng.standard_normal((n, n)))
+    S = jnp.asarray(Q0 @ np.diag(ev) @ Q0.T)
+    vec = jnp.asarray(rng.standard_normal(n))
+
+    def total(c, order):
+        return jnp.sum(jno.solve.applyfun(c * S, vec, fun=lambda z: jnp.exp(-0.05 * z), order=order))
+
+    for order in (10, 25, 35):
+        g = float(jax.grad(total)(1.0, order))
+        eps = 1e-6
+        fd = (float(total(1.0 + eps, order)) - float(total(1.0 - eps, order))) / (2 * eps)
+        assert np.isfinite(g), f"order={order} gradient is not finite"
+        assert abs(g - fd) / (abs(fd) + 1e-30) < 1e-5, f"order={order}: AD {g} vs FD {fd}"
+
+    assert np.isfinite(float(jax.jit(lambda c: total(c, 25))(1.0))), "and it must survive jit"
 
 
 def _spd_fem():

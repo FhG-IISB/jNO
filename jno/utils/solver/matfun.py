@@ -155,10 +155,98 @@ def _dense_funm_eig(fun):
     return dense_funm
 
 
+def _krylov_funm(mv, v, *, dense_funm, decomposition, order: int):
+    """``f(A)·v`` from a Krylov decomposition, stopping at the order that has actually **converged**.
+
+    ``order`` is an upper bound on the Krylov dimension, not an exact request — the standard Krylov
+    semantics, and the same meaning ``maxiter`` has for every iterative solver in jNO. That change is
+    the fix: run past the dimension the problem supports and the iteration does not gracefully
+    saturate, it degrades, silently and catastrophically.
+
+    Measured on a 30-DOF FEM operator whose Dirichlet pinning leaves only 15 distinct eigenvalues
+    (``exp(A)·1``, true norm 49.02): the sub-diagonal does not collapse to zero as a textbook "happy
+    breakdown" would — it EXPLODES, 0.27 → 2.2 → 4.5 → ... → 184.7, because once the Krylov space is
+    exhausted the residual is pure round-off and normalising it yields basis vectors of noise. The
+    Ritz values then leave the operator's spectrum entirely (``[-244, +254]`` against a true
+    ``[0.99, 5.44]``) and ``f`` is evaluated far outside its intended range:
+
+        order   as computed before      with this rule
+           15   rel 3.35e-15            rel 3.26e-15   (k=14)
+           20   rel 1.44e-10            rel 3.26e-15   (k=14)
+           25   rel 5.11e+35            rel 3.17e-15   (k=14)
+           29   rel 1.85e+74            rel 3.17e-15   (k=14)
+
+    Note the order-20 row: this is not only a fix for the catastrophic cases, it is *more accurate*
+    wherever round-off has begun to contaminate the basis.
+
+    The rule is the standard a-posteriori one for Krylov ``f(A)v`` — Y. Saad, "Analysis of some Krylov
+    subspace approximations to the matrix exponential operator", *SIAM J. Numer. Anal.* **29**(1),
+    1992, section 4: accept the first order whose approximation agrees with its predecessor. Two
+    things make it nearly free here:
+
+    * every nested approximation comes from the **same** decomposition, so the ladder costs small
+      dense ``eigh``/``eig`` calls and **no extra matvecs**;
+    * ``Q`` has orthonormal rows, so ``‖y_k − y_{k−1}‖`` in the ``n``-dimensional space equals
+      ``‖c_k − c_{k−1}‖`` in the ``k``-dimensional one. The whole test runs in the small space and
+      never forms an ``n``-vector, so memory is ``O(order²)`` rather than ``O(order·n)``.
+
+    Measured overhead against the raw ``matfree`` composition it replaces: **0.17 ms at n=513
+    (1.24x) and 0.41 ms at n=8355 (1.03x)** — a small constant, because the matvecs dominate as they
+    do in any real problem. COMPILE time is where the ladder is not free: one ``lax.cond`` per rung
+    grows the jaxpr linearly in ``order``, measured 0.29 s at order=10 to 0.79 s at order=40 against
+    a flat ~0.14 s. Under a second either way, and paid once.
+
+    Rungs past the converged one are never EVALUATED, not merely discarded -- see the ``lax.cond``
+    below for why zeroing them is not enough to keep the gradient finite.
+    """
+    # The fourth item's convention DIFFERS between the two decompositions -- `tridiag_sym` returns
+    # ||v|| and `hessenberg` returns 1/||v||, which silently scales the Arnoldi answer by ||v||^2
+    # (measured: 1.634 against a true 49.020 on a 30-DOF operator, exactly a factor n). Both build
+    # Q[0] = v/||v||, so taking the norm here is convention-independent and right for either.
+    Q, H, _residual, _norm = decomposition(mv, v)
+    norm = jnp.linalg.norm(v)
+    m = H.shape[0]
+    rtol = 100 * jnp.finfo(H.dtype).eps
+    rows, converged, prev, done = [], [], None, jnp.asarray(False)
+    for k in range(1, m + 1):
+        # Each rung sits behind a `lax.cond` on "nothing has converged yet". Once a rung converges the
+        # later ones are never EVALUATED -- which is what keeps the gradient clean, not merely the
+        # forward value. Zeroing a bad rung with `where` is not enough: the reverse pass still
+        # differentiates the discarded branch and 0 * inf is NaN, and `fun` legitimately overflows on
+        # a broken rung (`exp` of a Ritz value at +254). Measured before this: a correct forward with
+        # a NaN gradient at order=25. `lax.cond` flows cotangents through the taken branch only.
+        #
+        # A broken rung can only appear AFTER convergence, never before: at a genuine breakdown the
+        # Krylov space is invariant and the approximation is exact there, so consecutive rungs agree
+        # and the test fires at or before the last faithful order.
+        c_k = jax.lax.cond(
+            done,
+            lambda: jnp.zeros((k,), H.dtype),
+            lambda k=k: jnp.asarray(dense_funm(H[:k, :k])[:, 0], H.dtype),  # f(H_k) e_1
+        )
+        finite = jnp.all(jnp.isfinite(c_k))
+        padded = jnp.zeros((m,), H.dtype).at[:k].set(c_k)
+        scale = jnp.linalg.norm(padded)
+        ok = (
+            jnp.asarray(False)
+            if prev is None
+            else (~done) & finite & (scale > 0) & (jnp.linalg.norm(padded - prev) <= rtol * scale)
+        )
+        rows.append(padded)
+        converged.append(ok)
+        prev, done = padded, done | ok
+    C, OK = jnp.stack(rows), jnp.stack(converged)
+    # No rung converged: fall back to the full order and let `_finite` speak if it degenerated.
+    k_star = jnp.where(jnp.any(OK), jnp.argmax(OK), m - 1)
+    return norm * (C[k_star] @ Q)
+
+
 def applyfun(A, v, *, fun, order: int = 30, symmetric: bool = True):
     """``f(A)·v``, matrix-free via a Krylov (Lanczos/Arnoldi) approximation — e.g.
     ``fun=lambda z: jnp.exp(-dt*z)`` is one exact exponential-integrator step ``exp(-dt·A)·v``.
-    Deterministic (no probes); ``order`` sets the Krylov subspace size. Both paths are **differentiable**
+    Deterministic (no probes); ``order`` **bounds** the Krylov subspace size — the iteration stops at
+    the order that has converged (:func:`_krylov_funm`), so raising it can only help. Both paths are
+    **differentiable**
     and **GPU-capable**.
 
     ``symmetric=True`` (default) uses **Lanczos** (short recurrence, cheap) and assumes ``A = Aᵀ`` (the common
@@ -171,10 +259,11 @@ def applyfun(A, v, *, fun, order: int = 30, symmetric: bool = True):
 
     mv, _n, _dtype = _operator(A)
     if symmetric:
-        f = funm.funm_lanczos_sym(funm.dense_funm_sym_eigh(fun), decomp.tridiag_sym(order))
+        dense, decomposition = funm.dense_funm_sym_eigh(fun), decomp.tridiag_sym(order)
     else:  # non-symmetric: Arnoldi Hessenberg + eig f(H) — GPU-capable, differentiable (Daleckii–Krein JVP)
-        f = funm.funm_arnoldi(_dense_funm_eig(fun), decomp.hessenberg(order, reortho="full"))
-    return _finite(f(mv, jnp.asarray(v)), "applyfun", order, _n)
+        dense, decomposition = _dense_funm_eig(fun), decomp.hessenberg(order, reortho="full")
+    out = _krylov_funm(mv, jnp.asarray(v), dense_funm=dense, decomposition=decomposition, order=order)
+    return _finite(out, "applyfun", order, _n)
 
 
 def expmv(A, v, *, order: int = 30):
@@ -188,8 +277,14 @@ def expmv(A, v, *, order: int = 30):
     from matfree import decomp, funm
 
     mv, _n, _dtype = _operator(A)
-    f = funm.funm_arnoldi(funm.dense_funm_pade_exp(), decomp.hessenberg(order, reortho="full"))
-    return _finite(f(mv, jnp.asarray(v)), "expmv", order, _n)
+    out = _krylov_funm(
+        mv,
+        jnp.asarray(v),
+        dense_funm=funm.dense_funm_pade_exp(),
+        decomposition=decomp.hessenberg(order, reortho="full"),
+        order=order,
+    )
+    return _finite(out, "expmv", order, _n)
 
 
 def diagonal(A, *, fun=None, samples: int = 32, order: int = 25, key=None):

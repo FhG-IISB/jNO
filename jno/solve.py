@@ -880,7 +880,9 @@ def trace(A, *, fun=None, samples: int = 32, order: int = 25, key=None):
 
 def applyfun(A, v, *, fun, order: int = 30, symmetric: bool = True):
     """Matrix-free ``f(A)·v`` — e.g. one exact exponential-integrator step ``exp(-dt·A)·v`` with
-    ``fun=lambda z: jnp.exp(-dt*z)``. ``symmetric=True`` (default, Lanczos) assumes ``A = Aᵀ``;
+    ``fun=lambda z: jnp.exp(-dt*z)``. ``order`` **bounds** the Krylov dimension rather than fixing it:
+    the iteration stops at the order that has actually converged, so raising it can only help (unlike
+    the stochastic estimators above, where ``order`` is a real request). ``symmetric=True`` (default, Lanczos) assumes ``A = Aᵀ``;
     ``symmetric=False`` (Arnoldi + an eigendecomposition of the Hessenberg with an analytic Daleckii–Krein
     derivative) handles a **non-symmetric** ``A`` (advection–diffusion). Both are **differentiable and
     GPU-capable** — the non-symmetric path for any **holomorphic** ``fun`` on a **diagonalizable** ``A``.

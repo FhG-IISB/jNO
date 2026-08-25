@@ -243,10 +243,31 @@ jno.solve.applyfun(A, u0, fun=lambda z: jnp.exp(-dt * z))  # exp(-dt·A)·u₀  
     cause. The operator above is fine (198 rows, 151 distinct); a coarse mesh with a large boundary
     fraction is not. Lower `order`, or apply the estimator to the free-DOF operator.
 
-    `applyfun` is the one to watch: past the Krylov dimension it degrades through a **finite but
-    absurd** regime that no finiteness check can catch — 2.50e+37 at `order=25`, 9.05e+75 at
-    `order=29`, against a true answer of 49.02. If a result looks wrong there, halve `order` and
-    compare before trusting it.
+    `applyfun` is **not** affected: its `order` is an upper bound, and it stops at the order that has
+    actually converged (see below). The stochastic three have no such ladder, so `order` is a real
+    request there.
+
+!!! measured "`applyfun` picks its own order"
+    `order` is an upper **bound** on the Krylov dimension, not an exact request — the same meaning
+    `maxiter` has for every iterative solver here. Running past the dimension a problem supports used
+    to degrade catastrophically and silently, because the Lanczos sub-diagonal does not collapse to
+    zero as a textbook "happy breakdown" would; it **explodes** (0.27 → 2.2 → … → 184.7), the
+    residual being pure round-off whose normalisation gives basis vectors of noise. On the 30-DOF
+    operator above, `exp(A)·1` against a true 49.02:
+
+    | `order` | before | now |
+    |---|---|---|
+    | 15 | 3.35e-15 | 3.26e-15 |
+    | 20 | 1.44e-10 | **3.26e-15** |
+    | 25 | **5.11e+35** | **3.17e-15** |
+    | 29 | **1.85e+74** | **3.17e-15** |
+
+    Note order 20 — this is not only a fix for the catastrophic end, it is *more accurate* wherever
+    round-off has begun to contaminate the basis. The rule is the standard a-posteriori one (Saad,
+    *SIAM J. Numer. Anal.* **29**(1), 1992, §4): accept the first order whose approximation agrees
+    with its predecessor. Every nested approximation comes from the **same** decomposition, so it
+    costs small dense eigendecompositions and **no extra matvecs** — measured overhead 0.17 ms at
+    n=513 and 0.41 ms at n=8355.
 
 ### Eigenproblems at scale
 
