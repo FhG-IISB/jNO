@@ -20,6 +20,7 @@ BiCGStab (steady linear) and Jacobian-free Newton-Krylov (nonlinear).
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any, Optional
 
 import jax
@@ -153,7 +154,19 @@ def lu(*, backend: str = "device", host: bool | None = None) -> LinearSolver:
         if op.bcoo is not None:
             return solve(op.bcoo, b)
         # a dense operator gets the dense direct solve — BCOO.fromdense would need a concrete
-        # nse, which does not exist under jit/vmap tracing
+        # nse, which does not exist under jit/vmap tracing. SAY SO when that silently drops a
+        # backend the caller asked for by name: the answer is the same, but `backend="pardiso"`
+        # is chosen for speed, and getting LAPACK instead without a word is the kind of silent
+        # substitution that makes a benchmark meaningless. (The sparse path above raises a clear
+        # ImportError when the backend's stack is absent; this branch never reaches it.)
+        if backend not in ("device", "host"):
+            logging.getLogger("jno").info(
+                "jno.solve.lu(backend=%r): the operator is dense, so the backend is not used — a dense "
+                "operator cannot be handed to a sparse factorization without a concrete nse. Falling back "
+                "to jnp.linalg.solve (same answer, LAPACK not %s).",
+                backend,
+                backend,
+            )
         return jnp.linalg.solve(op.dense(), b)
 
     # No `key`, so the composer leaves this on the eager path. What compiling the composed solve buys
