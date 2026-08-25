@@ -230,11 +230,35 @@ def bicgstab(matvec, b, *, tol=1e-10, maxit=2000):
     return x
 
 
+def _gated(solve, who: str, side: str):
+    """Wrap a ``(mv, rhs) -> x`` solve so its result is residual-checked before it is returned.
+
+    ``custom_linear_solve`` calls ``solve`` with ``A`` and ``transpose_solve`` with ``A^T``, so
+    wrapping the two SEPARATELY (rather than counting calls on one shared wrapper) is what makes the
+    side label exact -- the same routine serves both, and a Newton march calls the forward one many
+    times. The transpose is the case that matters: nothing checked it before, BiCGStab can break down
+    on ``A^T`` while converging on ``A`` -- measured 5.5e+26 against 2.9e-05 on one 2-D Poisson
+    operator -- and the last iterate then came back as a perfectly plausible gradient."""
+    from .solver_api import residual_gate
+
+    return lambda mv, rhs: residual_gate(mv, rhs, solve(mv, rhs), who, side=side)
+
+
+def _gated_direct(J, rhs, solve, who: str, side: str):
+    """:func:`_gated` for an ASSEMBLED tangent: check ``J x = rhs`` with the matrix in hand."""
+    from .solver_api import residual_gate
+
+    return residual_gate(lambda v: J @ v, rhs, solve(J, rhs), who, side=side)
+
+
 def _linsolve(matvec, b, *, tol, maxit):
     """Transposable black-box linear solve: BiCGStab forward, BiCGStab on ``J^T`` for the
     reverse rule (via ``custom_linear_solve``) -- so it never differentiates the loop."""
     solve = lambda mv, rhs: bicgstab(mv, rhs, tol=tol, maxit=maxit)
-    return jax.lax.custom_linear_solve(matvec, b, solve, transpose_solve=solve)
+    who = "the newton_krylov inner BiCGStab"
+    return jax.lax.custom_linear_solve(
+        matvec, b, _gated(solve, who, "forward"), transpose_solve=_gated(solve, who, "transpose")
+    )
 
 
 def newton_krylov(
@@ -290,8 +314,10 @@ def newton_krylov(
     if linear_solve is None:
         inner = lambda mv, rhs: _linsolve(mv, rhs, tol=inner_tol, maxit=inner_maxit)
     else:
-        _slot = linear_solve
-        inner = lambda mv, rhs: jax.lax.custom_linear_solve(mv, rhs, _slot, transpose_solve=_slot)
+        _who = "the newton_krylov inner linear_solve slot"
+        _fwd = _gated(linear_solve, _who, "forward")
+        _rev = _gated(linear_solve, _who, "transpose")
+        inner = lambda mv, rhs: jax.lax.custom_linear_solve(mv, rhs, _fwd, transpose_solve=_rev)
 
     def _backtrack(f, u, delta, rn):
         """First ``alpha`` in ``damping * 0.5^i`` meeting residual-norm Armijo; else the last (tiny)."""
@@ -396,8 +422,11 @@ def newton_direct(
 
     def _tangent(g, y):  # solve J_root x = y (and Jᵀ on the reverse pass) DIRECTLY at the converged root
         J = jacobian_fn(root)
-        fwd = lambda _mv, rhs: linear_solve(J, rhs)  # noqa: E731
-        tsp = lambda _mv, rhs: linear_solve(J.T, rhs)  # noqa: E731
+        # Gated on both sides like the Krylov tangents: a direct solve fails differently (a singular
+        # or near-singular tangent, not a step cap) but fails just as quietly, and the transpose is
+        # the half no caller ever inspects.
+        fwd = lambda _mv, rhs: _gated_direct(J, rhs, linear_solve, "the newton_direct tangent", "forward")  # noqa: E731
+        tsp = lambda _mv, rhs: _gated_direct(J.T, rhs, linear_solve, "the newton_direct tangent", "transpose")  # noqa: E731
         return jax.lax.custom_linear_solve(g, y, fwd, transpose_solve=tsp)
 
     return jax.lax.custom_root(f0, root, lambda _f, _x0: root, _tangent)
@@ -544,8 +573,10 @@ def staggered_newton(
     elif linear_solve is None:
         inner = lambda mv, rhs: _linsolve(mv, rhs, tol=inner_tol, maxit=inner_maxit)  # noqa: E731
     else:
-        _slot = linear_solve
-        inner = lambda mv, rhs: jax.lax.custom_linear_solve(mv, rhs, _slot, transpose_solve=_slot)  # noqa: E731
+        _who = "the staggered_newton inner linear_solve slot"
+        _fwd = _gated(linear_solve, _who, "forward")
+        _rev = _gated(linear_solve, _who, "transpose")
+        inner = lambda mv, rhs: jax.lax.custom_linear_solve(mv, rhs, _fwd, transpose_solve=_rev)  # noqa: E731
 
     def _block_step(u_full, b, comp):
         """The sparse-direct Newton step for one block: freeze the complement to the identity, solve."""
@@ -662,8 +693,8 @@ def staggered_newton(
 
         def _tangent(g, y):
             J = jacobian(root_val)
-            fwd = lambda _mv, rhs: _dsolve(J, rhs)  # noqa: E731
-            tsp = lambda _mv, rhs: _dsolve(J.T, rhs)  # noqa: E731
+            fwd = lambda _mv, rhs: _gated_direct(J, rhs, _dsolve, "the staggered_newton tangent", "forward")  # noqa: E731
+            tsp = lambda _mv, rhs: _gated_direct(J.T, rhs, _dsolve, "the staggered_newton tangent", "transpose")  # noqa: E731
             return jax.lax.custom_linear_solve(g, y, fwd, transpose_solve=tsp)
 
         root = jax.lax.custom_root(f0, root_val, lambda _f, _x0: root_val, _tangent)

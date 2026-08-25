@@ -450,8 +450,8 @@ the result for compute time), the `linear`/`precond` slot reprs, `nonlinear` (dr
 norm against its bound, converged flag, and the step count where the driver runs its forward loop
 eagerly — `newton_direct` reports steps; the drivers whose loop lives inside `custom_root` report
 `None`), and `amgx_cache` occupancy when jaxamg served the solve. Populated on eager paths; a solve
-wrapped whole in `jit`/`vmap`/`grad` records the slots but no residuals — the same concrete-only
-self-disabling as the convergence guards.
+wrapped whole in `jit`/`vmap`/`grad` records the slots but no residuals — reporting needs a concrete
+value. The *convergence check* below is not so limited: it fires under a transform too.
 
 ```python
 sol = fem.solve(nonlinear=jno.solve.newton(direct=True), linear=jno.solve.lu(backend="host"))
@@ -460,6 +460,41 @@ fem.stats
 #  'precond': None, 'nonlinear': {'driver': 'newton_direct', 'residual': 1.6e-07,
 #                                 'bound': 1.7e-06, 'steps': 3, 'converged': True}}
 ```
+
+### A solve that did not converge raises — including the adjoint
+
+Every linear solve is residual-checked against its own operator before it returns, and **so is its
+transpose**. That matters because a Krylov iteration leaving on its step cap returns the last iterate
+with no signal at all, so a broken solve is otherwise indistinguishable from a good one:
+
+```python
+jax.grad(loss)(theta)
+# RuntimeError: jno.solve.fgmres did not solve the system: relative residual 2.8e-02 against a
+# 1e-04 gate. This is the ADJOINT (transpose) solve, not the forward one -- the solution itself is
+# fine and only the GRADIENT is affected. A Krylov method can break down on A^T where it converges
+# on A, so reach for a transposable-robust inner solver (jno.solve.gmres(), jno.solve.lu()) or a
+# preconditioner rather than loosening the tolerance.
+```
+
+!!! measured "Why the adjoint gets its own check"
+    The adjoint is the half nothing used to check. `lax.custom_linear_solve`'s `transpose_solve` had
+    no convergence test, and the eager test on the forward solve is a no-op under tracers — so the
+    guard was off precisely when gradients were being taken.
+
+    Measured on a 2-D strong-form Poisson operator: BiCGStab converged on `A` (relative residual
+    2.9e-05) and **diverged to 5.5e+26 on `A`ᵀ** for the same problem. The last iterate came back as
+    a gradient wrong by twenty orders of magnitude, and nothing anywhere raised.
+
+    Cost is one extra matvec per solve. The host round-trip that reports the failure sits in the
+    failing branch, so a converged solve never pays for it: 0.32 ms against 0.24 ms per call on a
+    small dense GMRES, and no measurable difference on the reverse pass.
+
+!!! note "A preconditioner is exempt — it is inexact on purpose"
+    `jno.precond.inner(jno.solve.cg(tol=1e-2, maxiter=30))` asks for two digits deliberately; that
+    is the whole reason the outer solver must be flexible (`jno.solve.fgmres()`). The gate is a
+    property of the **call**, not of the solver spec: the same `cg()` is checked as an outer solve
+    and unchecked as a preconditioner application. The convergence contract belongs to the outer
+    solve, and that one is still gated.
 
 ### Where the time went — `fem.solve(profile=True)`
 

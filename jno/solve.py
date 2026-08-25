@@ -35,7 +35,6 @@ from .utils.solver.solver_api import (
     LinearSolver,
     NonlinearSolver,
     PrecondApplier,
-    _maybe_residual_check,
 )
 
 __all__ = [
@@ -191,10 +190,16 @@ def dense() -> LinearSolver:
 
 
 def _krylov(name: str, tol: float, atol: float, maxiter: Optional[int], **fixed):
+    # Routed through `_firewalled` for the same reason the raw solvers are: `jax.scipy.sparse.linalg`
+    # wraps itself in `custom_linear_solve`, so its transpose solve is JAX's -- out of reach, and
+    # unchecked. Taking the firewall ourselves makes the adjoint an explicit call we can gate, and
+    # lets a non-symmetric preconditioner be transposed for it (see `_firewalled`). The extra
+    # `custom_linear_solve` costs nothing: the outer one intercepts differentiation, so the inner is
+    # never transposed.
     def _fn(op: LinearOperator, b, *, M, x0):
         method = getattr(jax.scipy.sparse.linalg, name)
-        x, _info = method(op.mv, b, x0=x0, tol=tol, atol=atol, maxiter=maxiter, M=M, **fixed)
-        return _maybe_residual_check(op, b, x, name)
+        raw = lambda mv, rhs, M, x0: method(mv, rhs, x0=x0, tol=tol, atol=atol, maxiter=maxiter, M=M, **fixed)[0]
+        return _firewalled(raw, op, b, M=M, x0=x0, symmetric=(name == "cg"), name=name)
 
     # `key` must name every argument that changes the iteration -- see LinearSolver. `fixed` is
     # per-method extra configuration (GMRES's restart), so it goes in sorted rather than by position.
@@ -232,7 +237,9 @@ def _firewalled(raw, op: LinearOperator, b, *, M, x0, symmetric: bool, name: str
     on ``A^T`` (on ``A`` itself when ``symmetric``), reusing ``M`` (legitimate: a preconditioner
     only affects convergence speed, never the converged solution).
     """
-    fwd = lambda _mv, rhs: raw(op.mv, rhs, M=M, x0=x0)
+    from .utils.solver.solver_api import residual_gate
+
+    fwd = lambda _mv, rhs: residual_gate(op.mv, rhs, raw(op.mv, rhs, M=M, x0=x0), f"jno.solve.{name}", side="forward")
     if symmetric:
         rev = fwd
     else:
@@ -244,9 +251,14 @@ def _firewalled(raw, op: LinearOperator, b, *, M, x0, symmetric: bool, name: str
         # step). jno.precond appliers carry a structural transpose (PrecondApplier.T); a bare
         # callable preconditioner has none, so we fall back to reusing M (correct, maybe slow).
         M_T = M.T if isinstance(M, PrecondApplier) else M
-        rev = lambda _mv, rhs: raw(op.T.mv, rhs, M=M_T, x0=None)
-    x = jax.lax.custom_linear_solve(op.mv, b, fwd, transpose_solve=rev, symmetric=symmetric)
-    return _maybe_residual_check(op, b, x, name)
+        # The adjoint every gradient flows through, and until now the one solve here with no
+        # convergence check of any kind: the check this replaced saw only the forward `x`, and was a
+        # no-op under tracers besides. A Krylov iteration that leaves on its step cap returns its last
+        # iterate silently, so a broken adjoint arrived as a perfectly plausible gradient.
+        rev = lambda _mv, rhs: residual_gate(
+            op.T.mv, rhs, raw(op.T.mv, rhs, M=M_T, x0=None), f"jno.solve.{name}", side="transpose"
+        )
+    return jax.lax.custom_linear_solve(op.mv, b, fwd, transpose_solve=rev, symmetric=symmetric)
 
 
 def fgmres(*, tol: float = 1e-8, restart: int = 30, maxiter: int = 1000) -> LinearSolver:

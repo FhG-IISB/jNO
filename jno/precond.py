@@ -319,7 +319,7 @@ class _Form(_Spec):
         solver = self.inner
         # M^{-T} v ~ (Â^{-1})^T v = (Â^T)^{-1} v: run the same inner solver on the transposed
         # auxiliary operator (for a symmetric Â -- e.g. a mass matrix -- op.T behaves like op).
-        return PrecondApplier(lambda v: solver(op, v), lambda v: solver(op.T, v))
+        return PrecondApplier(lambda v: _as_precond(solver, op, v), lambda v: _as_precond(solver, op.T, v))
 
     def __repr__(self):
         what = "<solution-dependent>" if self._terms_fn is not None else f"<{len(self.terms)} terms>"
@@ -362,10 +362,24 @@ class _InnerSolve(_Spec):
         solver, op = self.solver, ctx.A
         # transpose applier solves the transposed (sub-)operator, so a non-symmetric block gets a
         # correctly-preconditioned adjoint solve (else reverse-mode stalls -- see PrecondApplier).
-        return PrecondApplier(lambda v: solver(op, v), lambda v: solver(op.T, v))
+        return PrecondApplier(lambda v: _as_precond(solver, op, v), lambda v: _as_precond(solver, op.T, v))
 
     def __repr__(self):
         return f"jno.precond.inner({self.solver})"
+
+
+def _as_precond(solver, op, v):
+    """Apply a ``jno.solve`` solver as ``M^{-1} v``, with the convergence gate suspended.
+
+    A preconditioner is inexact BY DESIGN -- ``inner(jno.solve.cg(tol=1e-2, maxiter=30))`` asks for
+    two digits deliberately, which is exactly why the outer Krylov must be flexible. Holding such a
+    call to the solver gate's 1e-4 would turn a correct configuration into an error; the contract
+    belongs to the outer solve, which IS gated.
+    """
+    from .utils.solver.solver_api import gate_suspended
+
+    with gate_suspended():
+        return solver(op, v)
 
 
 def inner(solver) -> _InnerSolve:
