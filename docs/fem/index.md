@@ -33,6 +33,8 @@ u_h = fem.solve()          # matrix-free default; slots pick anything else (see 
 
 ---
 
+---
+
 ## Domain, symbols, and derivatives
 
 * **Domain** — any jNO domain works (a `jno.Shape`, `jno.domain.cube`, a CSG/`gmsh` constructor).
@@ -283,7 +285,7 @@ parameters on a coupled form, a trainable Dirichlet value, and `g(x, t)` on a no
 | [Boundary conditions](boundary-conditions.md) | Dirichlet, Neumann, Robin, periodic, inequalities — all as residual terms |
 | [Element families](elements.md) | H(div) / H(curl) / C¹ non-nodal elements; quadrilateral and hexahedral cells |
 | [Geometry, regions & moving meshes](geometry.md) | Curved cells, trainable coordinates, r-adaptivity, per-region integration, axisymmetry, enclosure radiation |
-| [Differentiable solve & inverse](inverse.md) | Sharding, reduced-order bases, field parameters, neural coefficients |
+| [Differentiable solve & inverse](inverse.md) | Solving at a value, sharding, reduced-order bases, field parameters, neural coefficients |
 | [Vector, coupled & nonlinear](formulations.md) | Multifield problems and elasto-plasticity as a trace formula |
 | [Limits & build time](limitations.md) | Known limitations and what compilation costs |
 

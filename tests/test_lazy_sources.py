@@ -149,13 +149,13 @@ class TestRefusals:
     def test_missing_time_axis_raises_instead_of_being_rewritten(self):
         """The eager path inserts the (B, T, ...) time axis; a lazy source cannot be rewritten
         without reading it, so the same layout rule is enforced as an error."""
-        d = B * jno.domain(constructor=jno.domain.poseidon(nx=6, ny=5), compute_mesh_connectivity=True)
+        d = B * jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=(5, 4)).domain(compute_mesh_connectivity=True)
         d.variable("interior")
         with pytest.raises(ValueError, match="time axis"):
             d.variable("_f", Counting(_arr(B, 6, 5, 1)))
 
     def test_correct_layout_is_accepted(self):
-        d = B * jno.domain(constructor=jno.domain.poseidon(nx=6, ny=5), compute_mesh_connectivity=True)
+        d = B * jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=(5, 4)).domain(compute_mesh_connectivity=True)
         d.variable("interior")
         d.variable("_f", Counting(_arr(B, 1, 6, 5, 1)))
         assert d.context["_f"].shape == (B, 1, 6, 5, 1)

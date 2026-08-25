@@ -11,6 +11,8 @@ Maxwell / eddy-current** examples, and a **variational PINN** (a neural trial in
 
 ---
 
+---
+
 ## Build time: what to expect, and the one knob
 
 `jno.fem([...])` **fully assembles** the operator — it returns concrete matrix values, which is why
@@ -43,6 +45,8 @@ Poisson at 29k nodes). Anything that changes the operator — a different mesh, 
 coefficient — recompiles exactly the kernels that bake it. Structure that a tokenizer cannot key by
 value simply never caches (a safe miss); the coverage is measurable, not guessed
 (`jno.utils.solver.fem_utils._ELEM_MAP_STATS`).
+
+---
 
 ---
 

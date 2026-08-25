@@ -86,7 +86,7 @@ class TestExtremes:
         assert float(np.var(d)) == pytest.approx(1.0, rel=0.15)
 
     def test_rbf_kernel_and_two_dimensions(self):
-        dom = jno.domain(constructor=jno.domain.poseidon(nx=8, ny=8))
+        dom = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=(7, 7)).domain()
         x, y, _ = dom.variable("interior")
         pts = jnp.asarray(np.asarray(dom.context["interior"]).reshape(-1, 2))
         node = jno.noise.grf(x, y, kernel="rbf", length_scale=0.3)

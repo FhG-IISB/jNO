@@ -1,5 +1,6 @@
 # Boundary conditions are residual terms
 
+There is no separate `jno.dirichlet(...)`/`neumann(...)` call — every condition is just a term
 in the `jno.fem([...])` list, and `jno.fem` classifies each by the region it is bound to (see
 `fem.classification`).
 

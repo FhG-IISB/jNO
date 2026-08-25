@@ -13,7 +13,7 @@ _FIELD_BY_ARITY = {2: "edges", 3: "triangles", 4: "quads"}
 # Slack on the dimensionless edge-side test for a quad, and on the barycentric one for a triangle.
 # The quad slack is the looser of the two because its test runs on quantities of order h^2 rather
 # than on barycentric coordinates of order 1.
-_SLACK_TRI = 1e-8
+_SLACK_TRI = 1e-6  # relative, and above float32 eps (~1.2e-7); see the barycentric test in `contains`
 _SLACK_QUAD = 1e-6
 
 
@@ -136,7 +136,23 @@ class BoundaryRegion:
             w = (d00 * d21 - d01 * d20) / denom
             u = 1.0 - v - w
 
-            inside = (u >= -_SLACK_TRI) & (v >= -_SLACK_TRI) & (w >= -_SLACK_TRI)
+            # The slack has to SCALE, exactly as it does for a quad facet above -- there the test
+            # quantity is an area and the slack is a fraction of the facet's own area. Here the
+            # barycentrics are ratios, so what the slack must track is the CANCELLATION that produced
+            # them: `v` is a difference of two products divided by `denom` (~ (2*area)^2), and it loses
+            # digits when those products are large and the triangle is small or thin. Scaling by their
+            # magnitude is that condition number.
+            #
+            # The absolute 1e-8 this replaces could not work in the default float32 at all: it sits
+            # BELOW float32 eps (~1.2e-7), so a point exactly on a shared edge -- where the barycentric
+            # is a zero reached by cancelling two numbers of order 1/2 -- fell outside a slack that was
+            # numerically indistinguishable from zero. Measured: 12 of 324 facet edge midpoints on a
+            # tetrahedral box reported outside, on a test that has failed since it was written.
+            cancel_v = (jnp.abs(d11 * d20) + jnp.abs(d01 * d21)) / denom
+            cancel_w = (jnp.abs(d00 * d21) + jnp.abs(d01 * d20)) / denom
+            slack_v = _SLACK_TRI * jnp.maximum(cancel_v, 1.0)
+            slack_w = _SLACK_TRI * jnp.maximum(cancel_w, 1.0)
+            inside = (u >= -(slack_v + slack_w)) & (v >= -slack_v) & (w >= -slack_w)
             return jnp.any((plane_dist <= self.tol) & inside)
 
         # fallback only if no explicit entities are available

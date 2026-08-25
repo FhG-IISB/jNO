@@ -21,7 +21,17 @@ from shapely.geometry import Point, box  # noqa: E402
 
 import jno  # noqa: E402
 
-jax.config.update("jax_enable_x64", True)
+
+@pytest.fixture(autouse=True)
+def _x64():
+    """These tests run in float64. The session default is x64-off (see tests/conftest.py), and this
+    flag is process-wide -- save/restore keeps it from leaking to whatever module runs next."""
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
 
 
 def _region_mask(points, geometry):

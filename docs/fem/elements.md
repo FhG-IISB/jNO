@@ -1,27 +1,5 @@
 # Element families
 
-The family is one argument on `fem_symbols` — everything downstream (assembly, BCs,
-`fem.solve()`) is unchanged:
-
-```python
-d = jno.Shape.rect(0, 0, 1, 1, size=0.1).domain()
-
-u, v = d.fem_symbols()                          # P1 Lagrange, the default
-u, v = d.fem_symbols(order=2)                   # P2; order=3, … for higher
-u, v = d.fem_symbols(value_shape=(2,))          # a vector unknown (elasticity, flow)
-
-u, v = d.fem_symbols(space="RT")                # H(div) Raviart–Thomas
-u, v = d.fem_symbols(space="N1E")               # H(curl) Nédélec edge ("N1curl" also works)
-u, v = d.fem_symbols(space="Morley")            # C¹ biharmonic, 6 DOF — plates
-u, v = d.fem_symbols(space="Argyris")           # C¹ conforming quintic
-u, v = d.fem_symbols(space="Hermite")           # C⁰ value + gradient
-```
-
-Each non-nodal family has **one intrinsic order** set by the element definition, so
-`order=` is a nodal-Lagrange knob only — passing it alongside `space="N1E"` raises rather
-than silently handing back the same space (see below).
-
-
 ## Non-nodal element families: H(div) and H(curl)
 
 > **⚠️ Experimental.** Validated on 2-D triangular meshes at lowest order (RT₀ / N1E₀); the API may

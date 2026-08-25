@@ -4,39 +4,6 @@
 `fdm.solve(...)` and it replaces the default without changing a single term of the
 weak form. The same slot objects work for both front doors.
 
-The **mode** is fixed when `jno.fem(...)` is built, by scanning the term list: a `u.t`
-derivative makes it transient, a nonlinear term makes it nonlinear, otherwise it is linear.
-The slot you may pass follows from that mode — `nonlinear=` on a linear problem raises
-rather than being ignored.
-
-```python
-# --- linear term list -------------------------------------------------------
-fem = jno.fem(terms)
-
-fem.solve()                                        # default: Jacobi-BiCGStab, matrix-free
-fem.solve(linear=jno.solve.lu())                   # sparse-direct LU
-fem.solve(linear=jno.solve.cg(tol=1e-10),          # SPD: CG + a preconditioner
-          precond=jno.precond.jacobi())
-fem.solve(linear=jno.solve.gmres(restart=50))      # non-symmetric
-fem.solve(linear=jno.solve.minres())               # symmetric indefinite (saddle points)
-fem.solve(linear=jno.solve.amg())                  # GPU algebraic multigrid  ([amg] extra)
-
-# --- nonlinear term list ----------------------------------------------------
-fem.solve()                                        # default: Jacobian-free Newton–Krylov
-fem.solve(nonlinear=jno.solve.newton(direct=True)) # sparse-LU tangent per Newton step
-fem.solve(nonlinear=jno.solve.picard())            # fixed-point instead of Newton
-
-# --- transient term list (a `u.t` term + domain(time=...)) ------------------
-fem.solve()                                        # default: θ-method, θ=1 backward Euler
-fem.solve(time=jno.solve.theta(0.5))               # Crank–Nicolson
-fem.solve(time=jno.solve.adaptive())               # step-doubling adaptive step size
-```
-
-The linear slots differ in cost and conditioning, not in answer: on the 2-D Poisson problem
-used throughout this page, `lu`, `cg`+`jacobi`, `gmres` and `minres` all agree with the
-matrix-free default to a relative difference below `1e-6`. The rest of this page is how to
-choose between them.
-
 Between "accept the default" and "write a full `solve_fn`" sits the **slot API**: the solver
 factorises into four orthogonal slots, each a configured **callable** (never a string) from the
 `jno.solve` / `jno.precond` namespaces — or your own with the same contract. Every `None` keeps
@@ -65,9 +32,18 @@ Pick by structure:
 | SPD, batched/GPU-heavy | `chebyshev` | inner-product free (no reductions) — Golub & Varga 1961 |
 | indefinite, single solve | `lu` | sparse-direct; **no vmap rule** — use a Krylov solver inside batched solves |
 | cuSolver refuses it, or is slow | `lu(backend="host")` | factors on the HOST (SuperLU) and drives it from the device; same answer and same gradients (wrapped in `custom_linear_solve`, transpose via SuperLU `trans="T"`). Measured **faster** where cuSolver also works — Stokes 21,839 DOFs 0.27 s vs 1.67 s, H(curl) 17,072 complex DOFs 13.3 s vs 36.4 s — and it runs meshes cuSolver rejects (Stokes 26,908, H(curl) 26,154, both of which fail on GPU). Affordable because a direct solve factorises **once**: the operator crosses PCIe once, not per iteration. Read the win as *cuSolver's sparse LU is weak*, not *GPUs lose* — see the row below |
-| **shift-invert eigs, or a constant-operator transient** | `lu(backend="cudss")` | NVIDIA cuDSS — the **fastest** direct backend wherever it runs, because it separates the symbolic *plan* from the numeric *factorization* and jNO caches on the **sparsity**, so the plan survives a change of values. Against `backend="host"` on an RTX 3070 (fp64 at 1/64 rate — the *unfavourable* card): Stokes saddle factorization **3.4 ms vs 79.9 ms**, lap3d 50³ **576 ms vs 64,856 ms**, and **64.7× per Newton step** at n=64,000. Also factors the Stokes saddle cuSolver calls *singular*, with smaller residuals. Needs the optional stack (`nvmath-python`, `cudss`, `cupy`); raises a clear `ImportError` otherwise. Fill-in still governs 3-D (69×→218× nnz growth at lap3d 20³–40³), so it moves the ceiling and makes **device memory** the binding constraint — it is not a substitute for a preconditioner  Two things happen automatically: a **block right-hand side** `(n, k)` is solved in one call (measured **2.7× at k=4 to 5.4× at k=16** over the same factorization solved column by column — this is what the shift-invert eigensolver's subspace iteration needs every sweep), and an exactly symmetric operator is factored as **LDLᵀ instead of general LU** (1.41× faster, **1.38× less peak device memory** on lap3d 40³). Symmetry is tested to within a few ulps rather than bitwise — an assembled FEM tangent for a symmetric form is symmetric only up to *assembly round-off* (a vector element block contracts components in a different order for `(a,i),(b,j)` than for `(b,j),(a,i)`, measured **0.25 ulps**), so a bitwise rule sent every vector and coupled problem down the general-LU branch. Within the gate the two triangles are **averaged**, a correction bounded by the asymmetry it removes and therefore no larger than the round-off already in the matrix; outside it nothing is touched. The margin is not a knife-edge: the weakest *genuine* asymmetry that can be constructed — an advection coefficient of 1e-12, meaningless beside the Laplacian — is already **191 ulps**. Measured end-to-end on a 3-D vector tangent, general → symmetric is **1.07–1.13×** at 3.4k–11.8k DOFs (growing with size) and **1.10–1.62×** on lap3d 20³–50³. The rest of the rule stands: symmetry is still tested and SPD is never inferred — a matrix symmetric only to ~1e-15 would otherwise be silently factored as `(A+Aᵀ)/2`, and a wrong SPD guess returns NaN. A singular operator **raises**: cuDSS signals it through neither an exception nor a NaN, returning a finite plausible vector instead |
+| **shift-invert eigs, or a constant-operator transient** | `lu(backend="cudss")` | NVIDIA cuDSS — the **fastest** direct backend wherever it runs, because it separates the symbolic *plan* from the numeric *factorization* and jNO caches on the **sparsity**, so the plan survives a change of values. Against `backend="host"` on an RTX 3070 (fp64 at 1/64 rate — the *unfavourable* card): Stokes saddle factorization **3.4 ms vs 79.9 ms**, lap3d 50³ **576 ms vs 64,856 ms**, and **64.7× per Newton step** at n=64,000. Also factors the Stokes saddle cuSolver calls *singular*, with smaller residuals. Needs the optional stack (`nvmath-python`, `cudss`, `cupy`); raises a clear `ImportError` otherwise. Fill-in still governs 3-D (69×→218× nnz growth at lap3d 20³–40³), so it moves the ceiling and makes **device memory** the binding constraint — it is not a substitute for a preconditioner  Two things happen automatically: a **block right-hand side** `(n, k)` is solved in one call (measured **2.7× at k=4 to 5.4× at k=16** over the same factorization solved column by column — this is what the shift-invert eigensolver's subspace iteration needs every sweep), and an exactly symmetric operator is factored as **LDLᵀ instead of general LU** (1.41× faster, **1.38× less peak device memory** on lap3d 40³). Symmetry is tested to within a few ulps rather than bitwise — an assembled FEM tangent for a symmetric form is symmetric only up to *assembly round-off* (a vector element block contracts components in a different order for `(a,i),(b,j)` than for `(b,j),(a,i)`, measured **0.25 ulps**), so a bitwise rule sent every vector and coupled problem down the general-LU branch. Within the gate the two triangles are **averaged**, a correction bounded by the asymmetry it removes and therefore no larger than the round-off already in the matrix; outside it nothing is touched. The margin is not a knife-edge: the weakest *genuine* asymmetry that can be constructed — an advection coefficient of 1e-12, meaningless beside the Laplacian — is already **191 ulps**. Measured end-to-end on a 3-D vector tangent, general → symmetric is **1.07–1.13×** at 3.4k–11.8k DOFs (growing with size) and **1.10–1.62×** on lap3d 20³–50³. The rest of the rule stands: symmetry is still tested and SPD is never inferred — a matrix symmetric only to ~1e-15 would otherwise be silently factored as `(A+Aᵀ)/2`, and a wrong SPD guess returns NaN. A **replaced pivot** is first given iterative refinement against the true matrix (Wilkinson 1963 — the remedy cuDSS's own docs prescribe), so a zero-pivot-but-nonsingular operator or a marginally conditioned saddle is *solved* (refined to ~1e-10 per solve, one SpMV per step) rather than refused; a genuinely singular operator — one whose refinement residual will not contract — still **raises**: cuDSS signals it through neither an exception nor a NaN, returning a finite plausible vector instead |
 | **a Newton loop** (or no GPU / a factorization too big for device memory) | `lu(backend="pardiso")` | Intel MKL PARDISO, multithreaded CPU. **The fastest factorization of the four**, and like cuDSS it splits symbolic analysis from numeric factorization, so a Newton step reuses the analysis. On lap3d 50³ (n=125,000) against single-threaded SuperLU's 65,212 ms: factorization **298 ms**, Newton re-factorization **296 ms — 220×**, where cuDSS reaches 115×. Its adjoint is cheaper too — `Aᵀx = b` comes from the *same* factorization rather than a second one. An exactly symmetric operator uses LDLᵀ (1.9× on lap3d 50³, 13× on a saddle), which needs the upper triangle with an **explicit diagonal** — without that a saddle's constraint rows come back empty and PARDISO rejects the matrix. Like cuDSS it returns finite garbage on a singular operator, so jNO checks the perturbed-pivot count and **raises**. `pip install jax-numerical-operators[pardiso]`, x86-64 |
 | small systems / coarse blocks | `dense` | LAPACK, vmap-native |
+
+> **jNO tells you when this applies.** `jno.fem` detects a saddle system structurally at build time —
+> a field whose own test function never meets its own trial function contributes no diagonal block —
+> and `fem.solve()` warns, naming the field, when it is about to use the matrix-free default on one.
+> It warns rather than refuses: a 2-D saddle of moderate size does solve acceptably that way. Passing
+> `linear=` or `precond=` silences it, since that is the deliberate choice it asks for. The detection
+> is structural, so it holds in every mode with no tangent to assemble, and it fires under
+> `jit`/`vmap`/`grad` — which matters, because the runtime residual guard needs a concrete residual
+> and steps aside on a tracer, leaving a transformed solve otherwise unguarded.
 
 > **Choosing between `cudss` and `pardiso`: pick by the phase your problem repeats.** A Newton loop re-*factorizes* every iteration, so PARDISO wins (220× vs 115× over SuperLU). A shift-invert eigensolve or a constant-operator transient re-*solves* against one factorization, and there cuDSS is ~11× faster per solve (3.5 ms vs 40 ms at lap3d 50³) and takes a whole block of right-hand sides at once. There is deliberately no `auto`: which wins depends on hardware jNO cannot inspect. Install both with `pip install jax-numerical-operators[fem]`.
 
@@ -108,6 +84,34 @@ preconditioner never changes the converged solution, only the speed, so specs ne
 * `jno.precond.block_diag((field, spec), …)` / `jno.precond.triangular((field, spec), …)` — per-field
   composition over `fem.blocks`. `triangular` is the standard saddle-point shape: last block solved
   first, substituted back through the assembled off-diagonal matvecs.
+* `jno.precond.saddle(mass_weight=…, laplace_weight=…)` — that standard shape as **one call**, for the common case.
+  It finds the constraint block *structurally* (the field with no diagonal entry — the same detection
+  behind the saddle-system warning), puts `amg()` on the momentum block and a weighted pressure
+  **mass** matrix on the constraint block, and assembles that mass on the domain's own P1 space, so
+  no symbols are passed and it reads identically in 2-D and 3-D. `mass_weight` is explicit and never
+  inferred (`1/μ` for Stokes): digging `μ` out of an arbitrary weak form is fragile, and a variable
+  viscosity would silently take the wrong weight — which costs iterations without ever failing. A
+  wrong weight changes convergence *speed* only, never the answer. Pair with `jno.solve.fgmres`;
+  `minres` does not apply (block-upper-triangular is nonsymmetric). Needs `pyamg`, and refuses by
+  name on a non-saddle system or a constraint field that is not P1 — for anything outside that,
+  compose `triangular` yourself. **The mass matrix alone is the pure-Stokes approximation:** a strong
+  reaction term (Brinkman / Darcy drag, or the `1/dt` mass of a small implicit step) makes the Schur
+  complement stop looking like a mass matrix, and the mesh-robustness degrades. `laplace_weight`
+  switches to the **Cahouet–Chabard** approximation, a pressure mass *plus* a pressure Laplacian,
+  `S⁻¹ ≈ μ·M_p⁻¹ + α·L_p⁻¹` (Cahouet & Chabard, *IJNMF* **8**, 869–895, 1988, §3). Both weights are
+  the **reciprocal of the coefficient the term stands for**, so `mass_weight=1/μ` and
+  `laplace_weight=1/α`. Measured through this spec on a 2-D Brinkman channel (`μ=1`, `mesh_size=0.12`,
+  preconditioned GMRES to 1e-8, `restart=200`): `α = 0 / 1e2 / 1e3 / 1e4` → **83 / 135 / 503 / 2312**
+  with the mass alone, **83 / 60 / 76 / 74** with Cahouet–Chabard. The point is the *flatness*, not the
+  31× at `α=1e4` — the count stops tracking `α`. The same collapse appears with the momentum block
+  inverted exactly instead of by AMG (31 / 63 / 134 / 189 → 31 / 26 / 25 / 24), which is how you can
+  tell it is the Schur approximation doing the work and not the multigrid. At `α=0` the two are the
+  same preconditioner — that column is one number measured twice — so leave `laplace_weight` at its
+  `None` default on pure Stokes and the Laplacian is never assembled. The pressure Laplacian is pure-Neumann
+  and therefore **singular** — and a sparse LU of it factors happily and then applies nonsense, so the
+  auxiliary carries its own gauge pin and the applier projects the constant out on both sides. It is
+  derived for a *constant* `α`; a spatially varying drag (topology optimisation's `α(ρ)`) takes a
+  representative scalar and degrades gracefully rather than failing.
 * `jno.precond.amg(cycles=…)` — **hybrid algebraic multigrid**: setup once on the host via the *optional*
   `pyamg` (Vaněk, Mandel & Brezina, *Computing* 56, 1996; PyAMG — Bell et al., *JOSS* 8(87), 2023),
   applied as a pure-JAX V-cycle with Chebyshev smoothing (Adams et al., *JCP* 188, 2003). The apply is
@@ -136,6 +140,28 @@ sol = fem.solve(
         (p, jno.precond.form([(1.0/mu) * pp * qq], inner=jno.solve.dense())),  # Ŝ ≈ μ⁻¹ M_p
     ),
 )
+```
+
+…and the same recipe when the defaults suit — multigrid on the momentum block, exact pressure mass:
+
+```python
+sol = fem.solve(linear=jno.solve.fgmres(tol=1e-10, restart=150),
+                precond=jno.precond.saddle(mass_weight=1.0/mu))
+```
+
+Give FGMRES enough `restart`: the default `restart=30` **stagnates** on a 3-D Taylor–Hood block
+preconditioner and does so quietly — it still returns, just slower and less accurate. Measured at
+4302 dofs, `tol=1e-10`: `restart=30` → 2.30 s for 3.3e-6; `restart=150` → 0.49 s for 3.3e-9. On
+3-D Stokes this is what makes the recipe overtake a direct factorisation — measured crossover at
+~15k dofs, and 3.4–3.9× faster (23.2 s → 5.9–6.9 s over repeat runs) at 41k, where LU's fill-in also
+costs more memory. `benchmarks/saddle_scaling.py` runs that sweep.
+
+On a **reaction-dominated** system — Brinkman/Darcy drag, or a small implicit time step — add the
+Laplacian leg, and the iteration count stops tracking the reaction coefficient:
+
+```python
+sol = fem.solve(linear=jno.solve.fgmres(tol=1e-10, restart=150),
+                precond=jno.precond.saddle(mass_weight=1.0/mu, laplace_weight=1.0/alpha))
 ```
 
 **Picard / lagged coefficients — `jno.lag`.** When a solution-dependent coefficient's Newton tangent

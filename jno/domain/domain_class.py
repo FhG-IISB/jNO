@@ -29,6 +29,30 @@ from .simplex_pool import SimplexPool
 _VOLUME_BLOCKS_BY_DIM = {1: ("line",), 2: ("triangle", "quad"), 3: ("tetra", "hexahedron")}
 
 
+def _mesh_request_origin() -> str:
+    """Name whoever just asked a mesh-free domain for its mesh, for the one-line build notice.
+
+    A deferred build is invisible otherwise -- the caller writes ``jno.fem(...)`` and a mesher runs
+    somewhere below it -- so the notice has to say which call crossed the line. Walks out of this
+    package to the first frame that is not domain plumbing.
+    """
+    import inspect
+    import os
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        frame = inspect.currentframe()
+        while frame is not None:
+            path = frame.f_code.co_filename
+            if os.path.dirname(os.path.abspath(path)) != here:
+                module = os.path.splitext(os.path.basename(path))[0].lstrip("_")
+                return f"{module}.{frame.f_code.co_name}"
+            frame = frame.f_back
+    except Exception:  # noqa: BLE001 - a diagnostic must never be the thing that fails
+        pass
+    return "something"
+
+
 def _refuse_mixed_cells(mesh, dim: int) -> None:
     """Refuse a mesh carrying more than one kind of volume cell.
 
@@ -491,6 +515,14 @@ class domain(MeshIOMixin):
         keep_orphan_nodes: bool = False,
         **_ignored_kwargs,
     ):
+        if "structured" in _ignored_kwargs:
+            raise ValueError(
+                "jno.domain(..., structured=True) was replaced by Shape.structured() and is no longer "
+                "read. It was being swallowed by **_ignored_kwargs, so the domain came back WITHOUT a "
+                "grid descriptor and the failure surfaced far away (scheme='spectral' refusing a "
+                "domain the caller believed was structured). Spell it "
+                "jno.Shape.rect(0, 0, 1, 1, size=h).structured().domain() instead."
+            )
         """
         Initialize the domain.
 
@@ -607,8 +639,50 @@ class domain(MeshIOMixin):
                 self._load_mesh(constructor)
                 self.log.info(f"Loaded mesh from {constructor}")  # type: ignore[attr-defined]
         elif callable(constructor):
-            self._generate_mesh(constructor, algorithm)
-            self.log.info(f"Loaded mesh from {constructor}")  # type: ignore[attr-defined]
+            # A `jno.Shape` whose membership and extent are closed-form does NOT get meshed here.
+            # It can be tagged and sampled from the geometry, which is everything a PINN needs, and
+            # the mesh is built only if something later actually reads `.mesh` (see that property).
+            # A structured plan is excluded: it has already been swapped for its lattice closure,
+            # which is not a Shape and carries no analytic membership.
+            # A NAMED or multi-region plan also stays eager: its `interior_<name>` and
+            # `interface_<a>_<b>` tags are the mesher's conforming sub-bodies and shared facets,
+            # which no amount of point sampling reconstructs. Supporting those mesh-free is a
+            # separate piece of work, not something to half-do here.
+            from ..geometry.shape import _can_sample_meshfree
+
+            _defer = (
+                _plan is not None
+                and _plan._structured is None
+                and getattr(_plan, "_region_name", None) is None
+                and _plan._node[0] != "regions"
+                and hasattr(_plan, "is_analytic")
+            )
+            _why_eager = None
+            if _defer:
+                _defer, _why_eager = _can_sample_meshfree(_plan)
+            if _defer:
+                self._lazy_plan = _plan
+                self.dimension = int(_plan.dim)
+                self.ds = _plan._size
+                self._register_geometry_tags(_plan)
+                if self._is_time_dependent and time is not None:
+                    self._time_points = np.linspace(time[0], time[1], time[2])
+                    self._geometry_tags["initial"] = self._geometry_tags["interior"]
+                if _plan.is_analytic():
+                    _how = "analytically"
+                else:
+                    # Honest about the one concession: this plan has no closed form, so gmsh ran
+                    # once on the SURFACE. No volume mesh, but not "no mesher" either.
+                    _how = f"from a {len(_plan.tessellate().facets)}-facet boundary tessellation"
+                self.log.info(
+                    f"Mesh-free domain from {_plan._node[0]} plan (dim {self.dimension}); "
+                    f"tags {sorted(self._geometry_tags)} sample {_how}."
+                )
+            else:
+                if _why_eager is not None:
+                    self.log.info(f"This plan cannot be sampled mesh-free ({_why_eager}); meshing it.")
+                self._generate_mesh(constructor, algorithm)
+                self.log.info(f"Loaded mesh from {constructor}")  # type: ignore[attr-defined]
             # A Shape.regions() plan carries named sub-region shapes; remember them so jno.fem
             # per-region integration can restrict a term to a region's cells (centroid membership
             # via the region shape's ``contains`` — see ``_cell_region_mask``).
@@ -639,7 +713,9 @@ class domain(MeshIOMixin):
         else:
             raise ValueError("Must provide either geometry_func, mesh file, or NPZ tag file")
 
-        self._apply_mesh(self.mesh)
+        # `__dict__` rather than `.mesh`: reading the property would build the very mesh we deferred.
+        if self.__dict__.get("_lazy_plan") is None:
+            self._apply_mesh(self.__dict__.get("_mesh"))
 
         # Stamp the structured-grid descriptor so jno.fdm takes the direct-stencil fast path. Kept on
         # both mesh_connectivity (where the FD kernels read it) and as _grid_shape (existing convention).
@@ -755,7 +831,10 @@ class domain(MeshIOMixin):
         self.reference_solutions: List[Callable] = []
         self.sample_dict: List = []
 
-        # Meshio mesh
+        # Meshio mesh. `_lazy_plan` holds the Shape a deferred build would mesh; while it is set,
+        # `.mesh` is a promise rather than an absence (see the `mesh` property).
+        self._lazy_plan = None
+        self._algorithm = algorithm
         self.mesh = None
 
     def _load_npz_tags(self, npz_file: str):
@@ -1029,8 +1108,32 @@ class domain(MeshIOMixin):
         of their node sets.  Time-dependent pools (T, N, D) are reduced to
         their spatial slice (N, D) since spatial coordinates are shared across
         timesteps.
+
+        On a mesh-free domain the candidates are **generated fresh** from the geometry instead, so
+        an adaptive strategy explores the whole region rather than reshuffling one frozen cloud.
+        That matters most for the no-count default, which is a resampling strategy: drawing it from
+        the reference pool would have made "redrawn every step" mean "redrawn from the same 4096
+        points every step".
         """
+        import re as _re
+
         import numpy as _np
+
+        # `sample` dedups repeat draws into `interior_0`, `interior_1`, ...; strip that back to the
+        # tag the geometry actually knows.
+        base = tag if self._is_geometry_tag(tag) else _re.sub(r"_\d+$", "", tag)
+        if self._is_geometry_tag(base):
+            kind, name = self._geometry_tags[base]
+            current = self.context.get(tag)
+            n_now = int(_np.asarray(current).shape[2]) if current is not None else 100
+            return self._draw_geometry_points(
+                kind,
+                name,
+                self._tag_predicates.get(base),
+                max(10 * n_now, 1000),
+                _np.random.default_rng(),
+                kind == "boundary",
+            )
 
         if tag not in self._mesh_pool:
             return None, None
@@ -1143,6 +1246,114 @@ class domain(MeshIOMixin):
         return self
 
     # FEM/ variational interface
+
+    @property
+    def mesh(self):
+        """The meshio mesh, or ``None`` if this domain has none and never will.
+
+        A domain built from an analytic :class:`jno.Shape` plan starts **mesh-free**: it can be
+        tagged and sampled from the geometry itself, which is all a PINN needs, and gmsh is never
+        run. Reading this property is what *asks* for a mesh, so the first read builds it and says
+        so in one ``INFO`` line naming what asked. Code inside ``jno.domain`` that only wants to
+        know whether a mesh already exists reads ``self._mesh`` instead, so tagging and sampling
+        never trigger a build by accident.
+        """
+        if self.__dict__.get("_mesh") is None and self.__dict__.get("_lazy_plan") is not None:
+            self._build_deferred_mesh()
+        return self.__dict__.get("_mesh")
+
+    @mesh.setter
+    def mesh(self, value):
+        self.__dict__["_mesh"] = value
+
+    def _needs_mesh_now(self) -> bool:
+        """True when a mesh-derived attribute is being read and the mesh is still deferred.
+
+        The guard matters because the build itself writes these attributes: without it, populating
+        `normals_by_tag` inside `_apply_mesh` would re-enter the build that is already running.
+        """
+        return self.__dict__.get("_lazy_plan") is not None and not self.__dict__.get("_building_mesh", False)
+
+    @property
+    def points(self):
+        """The mesh's node coordinates. Asking for them is asking for a mesh, so a mesh-free
+        domain builds one here rather than reporting that it has no attribute."""
+        if "_points" not in self.__dict__ and self._needs_mesh_now():
+            self._build_deferred_mesh()
+        if "_points" not in self.__dict__:
+            raise AttributeError("'domain' object has no attribute 'points'")
+        return self.__dict__["_points"]
+
+    @points.setter
+    def points(self, value):
+        self.__dict__["_points"] = value
+
+    @property
+    def normals_by_tag(self):
+        """Per-tag outward normals at the mesh nodes.
+
+        Mesh-derived throughout jNO, so reading it is a mesh request: returning the empty dict a
+        mesh-free domain happens to hold would make every consumer see "this tag has no normals"
+        and carry on. Mesh-free *sampling* does not come through here -- `variable(normals=True)`
+        computes its normals analytically, per draw, in `_draw_geometry_points`.
+        """
+        if self._needs_mesh_now():
+            self._build_deferred_mesh()
+        return self.__dict__.setdefault("_normals_by_tag", {})
+
+    @normals_by_tag.setter
+    def normals_by_tag(self, value):
+        self.__dict__["_normals_by_tag"] = value
+
+    @property
+    def tag_indices(self):
+        """Mesh-node indices per tag — mesh-derived, so reading it asks for the mesh."""
+        if self._needs_mesh_now():
+            self._build_deferred_mesh()
+        return self.__dict__.setdefault("_tag_indices", {})
+
+    @tag_indices.setter
+    def tag_indices(self, value):
+        self.__dict__["_tag_indices"] = value
+
+    @property
+    def mesh_connectivity(self):
+        """Cells, nodal measures and boundary indices — the mesh, in the form the numerics read.
+
+        `jno.fdm`, the integration operators and every ``.integrate()`` path go through this rather
+        than through `.mesh`, so it has to be a mesh request in its own right. Handing back the
+        ``None`` a mesh-free domain holds turned into ``'NoneType' object is not subscriptable`` deep
+        inside a finite-difference helper, which says nothing about the actual cause.
+        """
+        if self.__dict__.get("_mesh_connectivity") is None and self._needs_mesh_now():
+            self._build_deferred_mesh()
+        return self.__dict__.get("_mesh_connectivity")
+
+    @mesh_connectivity.setter
+    def mesh_connectivity(self, value):
+        self.__dict__["_mesh_connectivity"] = value
+
+    def _build_deferred_mesh(self):
+        """Run the meshing :attr:`mesh` deferred, once, and report what triggered it."""
+        plan = self.__dict__.pop("_lazy_plan", None)  # popped first: _apply_mesh reads .mesh back
+        if plan is None:
+            return
+        self.__dict__["_building_mesh"] = True
+        try:
+            self.log.info(f"{_mesh_request_origin()} needs a mesh; this domain was mesh-free — building it now.")
+            self._generate_mesh(plan, getattr(self, "_algorithm", 6))
+            self._apply_mesh(self.__dict__.get("_mesh"))
+        finally:
+            self.__dict__["_building_mesh"] = False
+        # Tags declared while mesh-free carry only their predicate; the mesh-derived half (node
+        # pool, boundary region, normals) has had nothing to be derived from until now. Replay them,
+        # or a `u(tag) - g` essential condition on such a tag would be read as a whole-domain
+        # residual -- silently, since the boundary region simply would not be there.
+        for name, where in list(self._tag_predicates.items()):
+            self._materialize_tag_pool(name, where)
+            self._register_tag_boundary_region(name, where, getattr(self, "_tag_regions", {}).get(name))
+        if self._is_time_dependent and self.time is not None:
+            self._add_time_dimension(self.time[0], self.time[1], self.time[2])
 
     @property
     def built_mesh(self) -> "meshio.Mesh":
@@ -1445,6 +1656,12 @@ class domain(MeshIOMixin):
         3D vector elasticity:
             u, v = domain.fem_symbols(value_shape=(3,))
         """
+        # Asking for variational symbols IS asking for a finite-element space, and that space is
+        # defined on a mesh. Build it here, at the point the intent is unambiguous, rather than
+        # letting a mesh-free `variable(tag)` hand back a one-point Monte-Carlo draw that `jno.fem`
+        # then cannot resolve to a boundary region.
+        if self.__dict__.get("_lazy_plan") is not None:
+            _ = self.mesh
         trial_name, test_name = names
         if complex:
             # A complex field is carried as TWO real fields (re, im) — the FEM-friendly
@@ -1861,6 +2078,31 @@ class domain(MeshIOMixin):
         geom = getattr(self, "_active_geometry", None)
         if poly_tags is not None and geom is not None and name not in poly_tags:
             poly_tags[name] = ("interior", geom)
+        # The same idea for an analytic Shape plan, in any dimension: the predicate is the region,
+        # and it is applied to a fresh draw each step. Whether it carves the interior or a slice of
+        # the boundary is measured (see `_classify_predicate_region`) rather than assumed, because a
+        # boundary predicate applied to an interior draw matches nothing and would look like an
+        # empty region.
+        if self.__dict__.get("_lazy_plan") is not None and name not in self._geometry_tags:
+            _kind = self._classify_predicate_region(where)
+            self._geometry_tags[name] = (_kind, None)
+            if _kind == "boundary":
+                # A boundary tag has to be a boundary *region* too, not just a samplable name:
+                # `jno.fem` reads `_boundary_regions` to tell an essential condition on a face from
+                # a residual over the whole domain. Built from the analytic boundary, so declaring
+                # one still costs no mesh; the facet arrays stay empty until there is a mesh to
+                # take them from.
+                _pts, _ = self._draw_geometry_points(
+                    "boundary", None, where, self._REFERENCE_BOUNDARY, np.random.default_rng(0), False
+                )
+                self._mesh_pool[name] = _pts
+                self._boundary_regions[name] = BoundaryRegion(tag=name, dim=int(self.dimension), points=_pts, tol=1e-8)
+                self._boundary_registry[name] = {
+                    "tag": name,
+                    "entity_kind": "point",
+                    "point_indices": np.arange(len(_pts), dtype=int),
+                    "points": _pts,
+                }
         if name not in self.avaiable_mesh_tags:
             self.avaiable_mesh_tags.append(name)
         return self
@@ -1873,6 +2115,12 @@ class domain(MeshIOMixin):
         ``BoundaryRegion`` + sampling pool + per-tag normals, so ``variable(name, normals=True)``
         and a ``jno.fem`` BC bound to ``name`` work. Needs a meshed boundary.
         """
+        if self.__dict__.get("_lazy_plan") is not None:
+            # A facet predicate reads facet centroids and their outward normals -- it is a statement
+            # about the discretisation, not about the geometry, so this is one of the few tags that
+            # genuinely needs the mesh. Ask for it (announced) rather than refusing on a domain that
+            # could have had one.
+            _ = self.mesh
         full = self._boundary_regions.get("boundary")
         dim = self.dimension
         ents = None if full is None else full.facets
@@ -2209,6 +2457,164 @@ class domain(MeshIOMixin):
             sub, _facet_normals(sub, dim, getattr(self, "mesh", None)), bpts, dim
         )
 
+    # ----- mesh-free geometry sampling -------------------------------------------------------
+    #
+    # A domain built from an analytic `jno.Shape` draws its collocation points from the geometry
+    # instead of from mesh nodes. The tag vocabulary is identical -- `interior`, `boundary`, the
+    # primitives' auto-names, and anything `tag(name, where)` adds -- so nothing above this layer
+    # has to know which source it got. What changes is that the points are continuous: there is no
+    # node set to be confined to, and every draw is fresh.
+
+    _GEOMETRY_PILOT = 2048  #: boundary draws used to discover auto-names and to classify a predicate
+
+    def _register_geometry_tags(self, plan):
+        """Discover the tag vocabulary of a mesh-free plan, without meshing it.
+
+        The auto-names are found the same way the mesher finds them -- by classifying points on the
+        boundary with :func:`jno.geometry.naming._classify` -- except the points come from the
+        analytic boundary rather than from gmsh entities. So ``left``/``right``/``arc``/``front``
+        exist, and are samplable, before any mesh does.
+        """
+        from ..geometry.naming import _classify
+
+        self._geometry_tags = {"interior": ("interior", None), "boundary": ("boundary", None)}
+        pts, _nrm = plan.sample_boundary(self._GEOMETRY_PILOT, np.random.default_rng(0))
+        for p in pts:
+            label = _classify(plan._node, float(p[0]), float(p[1]), float(p[2]))
+            if label is not None and label[1] not in self._geometry_tags:
+                self._geometry_tags[label[1]] = ("boundary", label[1])
+        for name in self._geometry_tags:
+            if name not in self.avaiable_mesh_tags:
+                self.avaiable_mesh_tags.append(name)
+        self._populate_reference_pool()
+
+    def _populate_reference_pool(self):
+        """Give ``_mesh_pool`` a reference point cloud per tag.
+
+        This is **not** the collocation set -- `variable`/`sample` bypass the pool entirely and draw
+        fresh from the geometry every call. It exists because a mesh-free domain still has readers
+        that legitimately need *some* finite cloud to work against: `distance_function`'s KD-tree,
+        `summary`, `plot`, and the pool-shape reporting. Leaving it empty made those degrade
+        silently rather than loudly, which is the failure mode this codebase least wants.
+        """
+        rng = np.random.default_rng(0)  # fixed: a reference cloud must not wobble between reads
+        dim = int(self.dimension)
+        for name, (kind, sub) in self._geometry_tags.items():
+            n = self._REFERENCE_INTERIOR if kind == "interior" else self._REFERENCE_BOUNDARY
+            try:
+                pts, nrm = self._draw_geometry_points(kind, sub, None, n, rng, kind == "boundary")
+            except RuntimeError:
+                continue  # a region that cannot be drawn has no reference cloud; it still samples
+            # Deduplicate: a 1-D domain's boundary is exactly two points, and a reference cloud of
+            # 1024 copies of them is not a point cloud, it is a broadcasting hazard.
+            pts, _keep = np.unique(pts, axis=0, return_index=True)
+            self._mesh_pool[name] = pts
+            if kind == "boundary":
+                # so `boundary_tags()` lists the faces that exist, rather than only the ones a
+                # predicate happened to name. The facet arrays stay empty until there is a mesh.
+                self._boundary_regions.setdefault(name, BoundaryRegion(tag=name, dim=dim, points=pts, tol=1e-8))
+                self._boundary_registry.setdefault(
+                    name,
+                    {
+                        "tag": name,
+                        "entity_kind": "point",
+                        "point_indices": np.arange(len(pts), dtype=int),
+                        "points": pts,
+                    },
+                )
+            # Deliberately NOT `normals_by_tag`. That dict is mesh-derived everywhere else, and the
+            # deferred build replaces it wholesale -- so filling it here creates arrays that go stale
+            # the moment anything asks for a mesh, and a caller holding both across that boundary
+            # gets a reference cloud's normals against the mesh's node indices. Mesh-free normals
+            # are computed per draw in `_draw_geometry_points`, which cannot go stale.
+
+    _REFERENCE_INTERIOR = 4096  #: reference-cloud size for an interior tag (not the collocation count)
+    _REFERENCE_BOUNDARY = 1024  #: reference-cloud size for a boundary tag
+
+    def _is_geometry_tag(self, tag: str) -> bool:
+        return self.__dict__.get("_mesh") is None and tag in self.__dict__.get("_geometry_tags", {})
+
+    def _classify_predicate_region(self, where):
+        """Is ``where`` selecting a slice of the boundary, or a lump of the interior?
+
+        Decided by measurement, not by inspecting the lambda: draw from both and see which one it
+        actually accepts. A boundary predicate (``x < 1e-6``) matches boundary points and almost no
+        interior ones; an interior predicate (a disc) matches interior points. Getting this wrong is
+        what makes a boundary tag silently unsamplable, so it is settled here rather than left to
+        an empty rejection loop to discover.
+        """
+        plan, dim = self._lazy_plan, int(self.dimension)
+        rng = np.random.default_rng(0)
+        inner = plan.sample_interior(self._GEOMETRY_PILOT, rng)
+        edge, _nrm = plan.sample_boundary(self._GEOMETRY_PILOT, rng)
+        hit_in = float(np.mean(np.asarray(where(*[inner[:, i] for i in range(dim)])).reshape(-1)))
+        hit_on = float(np.mean(np.asarray(where(*[edge[:, i] for i in range(dim)])).reshape(-1)))
+        # a region with volume is picked up by the interior draw; a zero-measure slice of the
+        # boundary is not, however much of the boundary it covers
+        return "boundary" if (hit_on > 10.0 * max(hit_in, 1e-4)) else "interior"
+
+    def _draw_geometry_points(self, kind, name, predicate, n, rng, want_normals):
+        """``(points, normals_or_None)`` for one geometry tag: draw, filter, repeat until ``n``.
+
+        Filtering after the draw is what keeps a named or predicate-restricted region uniform --
+        the survivors of a uniform draw over the whole boundary are uniform over the part kept.
+        """
+        from ..geometry.naming import _classify
+
+        plan, dim = self._lazy_plan, int(self.dimension)
+        pts_out, nrm_out, have = [], [], 0
+        for _ in range(10_000):
+            batch = max(4 * (n - have), 256)
+            if kind == "interior":
+                pts, nrm = plan.sample_interior(batch, rng), None
+            else:
+                pts, nrm = plan.sample_boundary(batch, rng)
+            keep = np.ones(len(pts), dtype=bool)
+            if name is not None:  # an auto-named slice of the boundary
+                keep &= np.array(
+                    [(_classify(plan._node, float(p[0]), float(p[1]), float(p[2])) or (None, None))[1] == name for p in pts]
+                )
+            if predicate is not None:
+                keep &= np.asarray(predicate(*[pts[:, i] for i in range(dim)])).reshape(-1).astype(bool)
+            if keep.any():
+                pts_out.append(pts[keep])
+                if nrm is not None:
+                    nrm_out.append(nrm[keep])
+                have += int(keep.sum())
+            if have >= n:
+                pts = np.concatenate(pts_out)[:n]
+                nrm = np.concatenate(nrm_out)[:n] if (want_normals and nrm_out) else None
+                return pts[:, :dim], (None if nrm is None else nrm[:, :dim])
+        raise RuntimeError(
+            f"could not draw {n} points for '{name or kind}' (got {have}). The region the tag "
+            f"names appears to be empty on this geometry."
+        )
+
+    def _sample_geometry_tag(self, tag, source_tag, n_samples, normals, batch_count, apply_time_value):
+        """Fill ``context[tag]`` from the geometry, in the ``(B, T, N, D)`` layout ``sample`` uses."""
+        kind, name = self._geometry_tags[source_tag]
+        predicate = self._tag_predicates.get(source_tag)
+        if name is not None or kind == "boundary":
+            kind = "boundary"
+        rng = np.random.default_rng()
+        want_normals = bool(normals) and kind == "boundary"
+        if normals and kind != "boundary":
+            raise ValueError(f"normals are only available on a boundary tag, and '{source_tag}' is interior.")
+        per_batch = [
+            self._draw_geometry_points(kind, name, predicate, n_samples, rng, want_normals) for _ in range(batch_count)
+        ]
+        spatial = np.stack([p for p, _n in per_batch], axis=0)  # (B, N, D) — independent per batch row
+        n_time = 1
+        if self._is_time_dependent and self.time is not None:
+            n_time = int(np.asarray(getattr(self, "_time_points", [0.0])).shape[0])
+        arr = np.broadcast_to(spatial[:, None, :, :], (batch_count, n_time, spatial.shape[1], spatial.shape[2]))
+        self.context[tag] = apply_time_value(tag, arr.copy())
+        if want_normals and per_batch[0][1] is not None:
+            nrm = np.stack([n for _p, n in per_batch], axis=0)
+            self.context[f"n_{tag}"] = np.broadcast_to(
+                nrm[:, None, :, :], (batch_count, int(np.asarray(self.context[tag]).shape[1]), *nrm.shape[1:])
+            ).copy()
+
     def _materialize_tag_pool(self, name, where):
         """Populate ``_mesh_pool[name]`` with the spatial points (interior + boundary) satisfying
         ``where`` -- so ``variable(name)`` can sample it. Spatial coords only; on a time-dependent
@@ -2435,7 +2841,15 @@ class domain(MeshIOMixin):
         ``compute_mesh_connectivity`` is set) builds ``mesh_connectivity``.
         Shared by the mesh-backed ``domain.__init__`` path and by
         ``PolygonDomain.build_mesh``.
+
+        Attaching a mesh RETIRES a pending deferred plan: the caller has supplied the mesh the plan
+        would have produced, so leaving the plan in place would let the next read of ``.mesh`` build
+        over the top of it and hand back the generated mesh instead of the attached one. The
+        deferred build pops the plan itself before it calls here (it is mid-build, and re-entering
+        would recurse); this covers every other caller, which is the path a test or a user takes
+        when it swaps a mesh in by hand.
         """
+        self.__dict__.pop("_lazy_plan", None)
         if mesh is None:
             boundary_indices = np.asarray([], dtype=np.int64)
         else:
@@ -2543,6 +2957,8 @@ class domain(MeshIOMixin):
         callers ask here instead of picking a store by dimension, which is what silently returned
         nothing for a hexahedral mesh.
         """
+        if self._needs_mesh_now():
+            self._build_deferred_mesh()  # facets are node ids into a mesh; the geometry has none
         for store in getattr(self, "_tag_facet_stores", ("_tag_edges", "_tag_triangles", "_tag_quads")):
             facets = (getattr(self, store, {}) or {}).get(name)
             if facets is not None and len(facets):
@@ -3073,6 +3489,64 @@ class domain(MeshIOMixin):
 
         return _jno.fn(_ang, args, name="cell_angles")
 
+    def cell_aspect(self, eps: float = 1e-30):
+        """Per-cell **aspect ratio** as a ``(n_cells,)`` node, differentiable in the mesh. 2-D and 3-D.
+
+        The longest edge over the inradius, scaled so a **regular** simplex is exactly ``1.0`` and a
+        stretched one is larger (a sliver diverges). This is the quantity a mesh-quality condition is
+        written on, and unlike :meth:`cell_angles` it is dimension-generic, so the same expression
+        works on triangles and tetrahedra::
+
+            fem.solve(adapt=jno.solve.relocate(objective=...)
+                                     .remesh(criterion=jno.le(d.cell_aspect(), 6.0)))
+
+        Differentiable in the vertex positions like its neighbours here (checked against central
+        differences at 2.7e-10), which is what a constrained optimiser needs. It is **not** usable as
+        ``relocate(objective=...)`` yet: that path assembles a weak term, and a per-cell node is not
+        one -- it fails on the runtime coordinate parameters rather than being refused, so the shape
+        of the fix is a per-cell objective path, not a message.
+
+        Contrast :meth:`cell_size`, which is ``|det J|^(1/dim)`` -- an isotropic SIZE. It cannot see
+        stretch at all: a sliver and a regular element of the same area share it.
+
+        ``eps`` guards the inradius denominator on a collapsed element; it does not otherwise shift
+        the ratio. Reference: Shewchuk, *What Is a Good Linear Finite Element? Interpolation,
+        Conditioning, Anisotropy, and Quality Measures* (2002), §2 -- the length/inradius family.
+        """
+        import itertools
+
+        import jno as _jno
+
+        dim = int(self.dimension)
+        if dim not in (2, 3):
+            raise NotImplementedError(f"domain.cell_aspect(): simplices in 2-D or 3-D; this domain is {dim}-D.")
+        cells = jnp.asarray(self._cells_p1(), dtype=jnp.int32)
+        args, rebuild = self._moving_points()
+        fact = {2: 2.0, 3: 6.0}[dim]  # d!
+        fac_fact = {2: 1.0, 3: 2.0}[dim]  # (d-1)!
+        # longest-edge / inradius for a REGULAR simplex, so the measure reads 1.0 there: 2*sqrt(3) on
+        # a triangle, 2*sqrt(6) on a tetrahedron.
+        norm = {2: 2.0 * np.sqrt(3.0), 3: 2.0 * np.sqrt(6.0)}[dim]
+        pairs = list(itertools.combinations(range(dim + 1), 2))
+
+        def _asp(*vals):
+            v = rebuild(*vals)[cells]  # (n_cells, dim+1, dim)
+            longest = jnp.max(jnp.stack([jnp.linalg.norm(v[:, j] - v[:, i], axis=-1) for i, j in pairs], axis=-1), axis=-1)
+            jac = jnp.stack([v[:, i + 1] - v[:, 0] for i in range(dim)], axis=-1)
+            vol = jnp.abs(jnp.linalg.det(jac)) / fact
+            # Facet measures by the Gram determinant, which is the one formula that covers both
+            # dimensions: a triangle's facet is an edge (length) and a tet's is a triangle (area).
+            surf = 0.0
+            for k in range(dim + 1):
+                keep = [i for i in range(dim + 1) if i != k]
+                e = jnp.stack([v[:, keep[i + 1]] - v[:, keep[0]] for i in range(dim - 1)], axis=-1)
+                gram = jnp.einsum("cij,cik->cjk", e, e)
+                surf = surf + jnp.sqrt(jnp.clip(jnp.linalg.det(gram), 0.0, None)) / fac_fact
+            inradius = dim * vol / (surf + eps)  # r = d V / S for a d-simplex
+            return longest / (norm * inradius + eps)
+
+        return _jno.fn(_asp, args, name="cell_aspect")
+
     def measure(self):
         """Total volume (area in 2-D) of the domain, as a node differentiable in the mesh.
 
@@ -3127,7 +3601,7 @@ class domain(MeshIOMixin):
 
         from jno.utils.solver.fem_adapt import _locate_in_cells
 
-        owner, _, inside = _locate_in_cells(src_pts, src_cells, tgt_centroids, tol=1e-9, k=32)
+        owner, _w, _ref, inside = _locate_in_cells(src_pts, src_cells, tgt_centroids, tol=1e-9, k=32)
         return np.where(inside, vals[owner], float(outside))
 
     def interior_edges(self):
@@ -3430,8 +3904,30 @@ class domain(MeshIOMixin):
 
         sample_tag = source_tag
 
+        if self._is_geometry_tag(sample_tag) and isinstance(sample, tuple) and len(sample) > 0:
+            if sample[0] is None:
+                # "No count" on a mesh-free domain could mean collocation points or the node set,
+                # and which is right depends on what the caller does *later* -- so it is settled by
+                # whether a resolution was ever declared. `size=` is that declaration: asking for a
+                # mesh of a given density and then for "the interior" unambiguously means its nodes,
+                # and that is what a convergence study over `size` is built on. With no `size=` there
+                # is no declared resolution and nothing to hand back, so it refuses rather than
+                # inventing one -- guessing there would be silent, since finite differences over a
+                # single collocation point return a number, just not the one that was asked for.
+                if getattr(self.__dict__.get("_lazy_plan"), "_size", None) is None:
+                    raise ValueError(
+                        f"domain.variable({tag!r}): this domain is mesh-free and no mesh size was "
+                        f"declared, so the tag has no node set to hand back and no natural point "
+                        f"count. Say which you want:\n"
+                        f"  - continuous collocation points:  variable({tag!r}, sample=(n, None))\n"
+                        f"  - a mesh's nodes:                 give the shape a size, e.g. "
+                        f"Shape.rect(..., size=0.05), or read d.mesh first\n"
+                        f"Mesh-free sampling is opt-in precisely so that neither is chosen for you."
+                    )
+                self._build_deferred_mesh()  # a declared resolution: hand back that mesh's nodes
+
         if (
-            sample_tag in self._mesh_pool.keys()
+            (sample_tag in self._mesh_pool.keys() or self._is_geometry_tag(sample_tag))
             and isinstance(sample, tuple)
             and len(sample) > 0
             and isinstance(sample[0], (int, type(None)))
@@ -4388,6 +4884,19 @@ class domain(MeshIOMixin):
             if tag == "initial" and self._is_time_dependent and self.time is not None:
                 if "initial" not in self._mesh_pool and "interior" in self._mesh_pool:
                     source_tag = "interior"
+
+            if self._is_geometry_tag(source_tag):
+                # Mesh-free: draw from the Shape itself. No node pool, so no cap on `n_samples`
+                # and no two draws alike.
+                ii, og_tag = 0, tag
+                while tag in self.context and tag not in self._param_tags:
+                    tag = og_tag + f"_{ii}"
+                    ii += 1
+                self._sample_geometry_tag(tag, source_tag, n_samples, normals, batch_count, _apply_time_value_to_sampled)
+                idx = None
+                if self._verbose:
+                    self.log.info(f"Sampled {n_samples} points for '{tag}' from the geometry (no mesh)")
+                continue
 
             if source_tag not in self._mesh_pool:
                 available = list(self._mesh_pool.keys())

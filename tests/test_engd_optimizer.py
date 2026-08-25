@@ -8,10 +8,24 @@ import equinox as eqx
 import jax
 import numpy as _np
 import optax
+import pytest
 
 import jno
 from jno.optimizers import ENGDOptimizer, engd
 from jno.optimizers.engd import ENGDOptimizer as _ENGDOptimizerDirect
+
+
+@pytest.fixture(autouse=True)
+def _x64():
+    """ENGD's Gram solve needs float64. The session default is x64-off (see tests/conftest.py), and
+    the flag is process-wide -- save/restore keeps it from leaking to whatever module runs next."""
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
 
 # ---------------------------------------------------------------------------
 # Inline Poisson2D fixture (jno.baseline lives on a separate branch)
@@ -118,9 +132,6 @@ def test_engd_repr():
 
 def test_engd_optimizer_auto_detect_smoke():
     """net.optimizer(engd()) resolves gram_terms automatically during solve."""
-    import jax
-
-    jax.config.update("jax_enable_x64", True)
 
     net, losses, _, eval_error = _build_poisson2d(seed=0)
     net.optimizer(engd())  # no optax.sgd, no gram_terms
@@ -139,9 +150,6 @@ def test_engd_optimizer_auto_detect_smoke():
 
 def test_engd_optimizer_explicit_gram_terms():
     """Explicit gram_terms= bypasses auto-detection and is forwarded."""
-    import jax
-
-    jax.config.update("jax_enable_x64", True)
 
     net, losses, gram_terms, eval_error = _build_poisson2d(seed=0)
     net.optimizer(engd(gram_terms=gram_terms))
@@ -159,9 +167,6 @@ def test_engd_optimizer_explicit_gram_terms():
 
 def test_engd_optimizer_convergence():
     """jno.optimizers.engd() must reach rel-L² < 1e-3 in 200 epochs (=callbacks form)."""
-    import jax
-
-    jax.config.update("jax_enable_x64", True)
 
     net, losses, _, eval_error = _build_poisson2d(seed=0)
     net.optimizer(engd(line_search=True))
@@ -182,9 +187,6 @@ def test_engd_optimizer_orphan_model_is_ignored():
     """A model with ENGDOptimizer that isn't in any constraint is not detected
     (it never appears in all_ops), so no error is raised and no ENGDCallback
     is injected.  The primary model still trains normally."""
-    import jax
-
-    jax.config.update("jax_enable_x64", True)
 
     import foundax
 
@@ -216,9 +218,6 @@ def test_engd_optimizer_orphan_model_is_ignored():
 
 def test_engd_optimizer_idempotent_solve():
     """fm._opt_fn stays an ENGDOptimizer across multiple solve() calls."""
-    import jax
-
-    jax.config.update("jax_enable_x64", True)
 
     net, losses, _, eval_error = _build_poisson2d(seed=0)
     net.optimizer(engd(gram_interval=2))
@@ -244,11 +243,8 @@ def test_engd_optimizer_custom_reduction_unwrapped_via_reduces_axis():
     """Auto-detect strips reduction wrappers via FunctionCall.reduces_axis,
     not by name — so a custom reduction function still gets unwrapped
     correctly and the raw residual is passed to .grad()."""
-    import jax
 
     from jno.trace import FunctionCall
-
-    jax.config.update("jax_enable_x64", True)
 
     net, losses, _, eval_error = _build_poisson2d(seed=0)
 
@@ -273,7 +269,6 @@ def test_engd_optimizer_custom_reduction_unwrapped_via_reduces_axis():
 
 def test_engd_optimizer_in_compare():
     """engd() dict style works end-to-end when run against Adam."""
-    jax.config.update("jax_enable_x64", True)
 
     results = {}
     for name, opt in [("Adam", optax.adam(1e-3)), ("ENGD-new", engd(line_search=True))]:

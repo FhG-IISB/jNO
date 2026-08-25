@@ -510,6 +510,25 @@ Backs `model.bayesian(...)` / `model.vi(...)`; see [Bayesian Sampling](training/
 
 ---
 
+## Adaptive resampling (`jno.sampler`)
+
+Residual-adaptive collocation strategies — see [Adaptive Resampling](adaptive/resampling.md).
+
+::: jno.utils.adaptive.resampling
+    options:
+      members:
+        - sampler
+        - ResamplingStrategy
+        - RAD
+        - RARD
+        - CR3
+        - R3
+        - PINNFluence
+        - HA
+        - RandomResampling
+
+---
+
 ## Parameter-efficient fine-tuning (`jno.lora`)
 
 Attached with `.lora(...)` on a wrapped model — see [LoRA](model-controls/lora.md).

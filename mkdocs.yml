@@ -173,6 +173,8 @@ nav:
       - Helmholtz + PML (complex): tutorials/08-fem-and-varpinns/helmholtz-pml-2d.md
       - Linear Elasticity (Cantilever): tutorials/08-fem-and-varpinns/linear-elasticity-cantilever.md
       - Navier-Stokes Lid-Driven Cavity: tutorials/08-fem-and-varpinns/navier-stokes-cavity-2d.md
+      - "Navier-Stokes Cylinder (DFG 2D-1)": tutorials/08-fem-and-varpinns/navier-stokes-cylinder-dfg.md
+      - "Stokes 3D (Duct Past a Sphere)": tutorials/08-fem-and-varpinns/stokes-3d-duct-sphere.md
       - "Rayleigh–Bénard (heat + flow)": tutorials/08-fem-and-varpinns/rayleigh-benard-2d.md
       - "Brittle Fracture (4th-order phase-field, coupled)": tutorials/08-fem-and-varpinns/phase-field-fracture-2d.md
       - "Phase-Field Fracture SENT (the whole study as a term list)": tutorials/08-fem-and-varpinns/phase-field-fracture-sent.md

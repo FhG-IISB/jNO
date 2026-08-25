@@ -29,7 +29,7 @@ def _x64():
 
 def _dirichlet_poisson(scheme=None, size=0.05):
     """-Δu = f with u = sin(πx)sin(πy), zero on the boundary."""
-    d = jno.Shape.rect(0, 0, 1, 1, size=size).domain(structured=True)
+    d = jno.Shape.rect(0, 0, 1, 1).structured(n=round(1.0 / size)).domain()
     x, y, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
     p = np.asarray(d.mesh_connectivity["points"])[:, :2]
@@ -82,7 +82,7 @@ class TestPeriodicProblem:
     """
 
     def _run(self, sx=None, sy=None, size=0.08):
-        d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=size).domain(structured=True)
+        d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=round(1.0 / size)).domain()
         p = np.asarray(d.mesh_connectivity["points"])[:, :2]
         x, y, _ = d.variable("interior", split=True)
         xl, yl, _ = d.variable("left", split=True)
@@ -119,7 +119,7 @@ class TestPeriodicProblem:
 
     def test_the_periodic_tie_still_holds(self):
         """Spectral must not break the wrap-around constraint the tie imposes."""
-        d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.08).domain(structured=True)
+        d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=round(1.0 / 0.08)).domain()
         x, y, _ = d.variable("interior", split=True)
         xl, yl, _ = d.variable("left", split=True)
         xr, yr, _ = d.variable("right", split=True)

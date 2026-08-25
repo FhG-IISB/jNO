@@ -88,6 +88,99 @@ time-averaged objective), periodic, and complex** problems, scalar or vector —
 solution block, so a complex field's real and imaginary parts both contribute. Only complex-*transient* is
 not wired yet.
 
+### A mesh objective that names the physics — `objective=<expression>`
+
+The three built-in objectives (`"equidistribution"`, `"energy"`, `"huang"`) are mesh-*quality* measures:
+they read the solution only through a monitor, so they can ask for resolution but cannot state a goal
+about the physics. `objective=` also accepts a **weak-form expression**, assembled exactly as
+`criterion=` is and summed to a scalar, over a **volume or a boundary** region:
+
+```python
+xs, ys, nx, ny = domain.variable("side", normals=True, split=True)
+ys.trainable()                                   # the wall may move along y only
+us, vs = u.bind(x=xs, y=ys), v.bind(x=xs, y=ys)
+fem.solve(adapt=jno.solve.relocate(objective=(us[0]*nx + us[1]*ny)**2 * vs[0]))
+```
+
+That is a **free surface**: the wall moves until the flow through it vanishes. The facet normals are
+rebuilt from the moving vertices, so `n` is the *current* mesh's normal. The gradient runs through the
+solve — matched to central differences at `7.5e-09` — and the through-flow falls `11.4x` over 60 rounds
+(`12.5x` at 120, so this is a descent, not a root-find).
+
+The benchmark deserves a word, because the obvious version of it measures nothing. In a channel with a
+**symmetry** bottom, uniform flow `u = (1,0)`, `p = 0` satisfies every equation and boundary condition
+for *any* shape of the traction-free top: measured, the solution stayed uniform to `2.3e-14` and moved
+by `9.8e-14` when the wall was displaced by `0.1`. The objective is then purely geometric — it exercises
+the normals and the facet measure but never the solve. A **no-slip** bottom couples them (`max|du| =
+7.2e-02` for the same displacement), and only then is `d(objective)/d(vertex)` a statement about the
+physics rather than about the mesh.
+
+Three things to know:
+
+* The objective is a **scalar**, so it needs a scalar test function; on a velocity/pressure saddle the
+  pressure test is chosen automatically.
+* When the expression reaches its region only through a **bound view** — `u.bind(x=xs, y=ys)` absorbs
+  its coordinates — the test function cannot be auto-bound. Carry it yourself, as above
+  (`* vs[0]`). That case raises with this instruction rather than a trace-level binding error.
+* A surface objective needs the **form** to carry a surface term, because the facet quadrature tables
+  are tabulated at build time only then. A traction-free wall (`0.0 * vs[0]`) in the term list is enough.
+
+**A mesh condition, as an inequality.** `criterion=` also takes a `jno.le` / `jno.ge` constraint, and
+then it is its own trigger — there is no cadence or threshold argument, because the condition already
+says both *where* and *whether*:
+
+```python
+fem.solve(adapt=jno.solve.remesh(criterion=lambda d: jno.le(d.cell_aspect(), 2.0), max_iters=6))
+```
+
+Every cell whose margin is positive is marked — all of them, not a Dörfler fraction — and the march
+stops when none is. Measured on a deliberately stretched mesh: worst aspect `2.87 → 1.57` in one
+round, `0` marked on the next. `theta` is refused with a constraint (there is no bulk fraction to
+choose), and a bare comparison (`q > 2.0`) is refused too: it records which cells are bad but not by
+how much, so marking would take a fraction of them and quietly leave the rest.
+
+Two things to know. **Set a threshold the mesher can actually reach** — an unstructured 2-D mesh
+bottoms out around `1.2`–`1.5`, and a constraint below that never settles, so the march refines until
+it runs out of rounds. And pass a **callable** for a geometry criterion: a geometry node captures the
+cell table when it is constructed, so a single node keeps answering for the mesh it was born on and is
+refused by name once the topology changes.
+
+**When moving nodes is not enough: `relocate(...).remesh(...)`.** Relocation moves a *fixed* node set,
+so once the mesh has to stretch further than its elements allow it can do nothing — `quality_floor` is
+a line search that rejects the step, and rejecting a step never adds a node. Chain an h-step onto it
+and say what "too far" means:
+
+```python
+fem.solve(adapt=jno.solve.relocate(objective=through, max_iters=200)
+                         .remesh(criterion=lambda d: jno.le(d.cell_aspect(), 2.0), max_iters=4))
+```
+
+The condition is checked **inside the relocation line search**, on each candidate step, so an
+inadmissible mesh is never accepted — the march honours the bound exactly rather than reporting a
+breach after the fact. When no admissible step exists, relocation has run out of room and the cells
+*blocking* it are refined; the movable vertices are then re-derived from the **region** each was tagged
+on, since indices do not survive a remesh. Measured on a Poisson peak, bound `1.7`: `44 → 80` vertices
+over 3 remeshes, final worst aspect exactly `1.700`, objective still falling `8.4e-02 → 2.0e-02`.
+
+The nested spec's `max_iters` caps how many remeshes the march may spend and `max_dofs` caps the size.
+If the budget runs out while the mesh still breaks the condition, that is **raised**, not returned
+quietly — refining does not repair every shape, and a bound below what the mesher can deliver would
+otherwise refine without end (measured, before this: `44 → … → 15709` vertices and an out-of-memory
+failure inside the solver).
+
+Scope: the interleaved criterion must be a **mesh-geometry condition** (`cell_aspect`, `cell_volume`,
+`cell_angles`), because it is evaluated on the moving vertices with no solve, and the bound must sit
+directly on one node so it can be evaluated once per round rather than re-traced. A solution criterion
+belongs on a standalone `jno.solve.remesh(...)`.
+
+**Mesh quality as a term you can write.** `domain.cell_aspect()` is the longest edge over the inradius,
+scaled so a **regular** simplex reads exactly `1.0` and a stretched one reads more — per cell, 2-D and
+3-D, and differentiable in the vertex positions (checked against central differences at `2.7e-10`).
+It is the companion to `domain.cell_size`, which is `|det J|^(1/dim)` — an isotropic *size* that cannot
+see stretch at all, since a sliver and a regular element of the same area share it. `domain.cell_angles()`
+also measures distortion but is 2-D only. Reference: Shewchuk, *What Is a Good Linear Finite Element?*
+(2002), §2.
+
 Tagging is **literal and per-axis**: `xm.trainable()` frees only the x column. On a boundary that is the
 lever for sliding — free an edge's along-edge axis and its nodes redistribute *within* the wall, leave the
 normal axis untagged and the domain shape is preserved exactly.
