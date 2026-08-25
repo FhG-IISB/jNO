@@ -204,8 +204,6 @@ control is under-relaxation — `relax_step=0.02` recovers quality to 0.318 and 
 
 ---
 
----
-
 ## A moving mesh is a term
 
 A moving mesh is not a solve argument. Put `coord.d(t) - velocity` in the `jno.fem([...])` list — a residual
@@ -277,8 +275,6 @@ across.
 
 ---
 
----
-
 ## Per-region (sub-domain) integration
 
 A weak term integrates over the **region of the coordinates it is written on** — exactly the rule that
@@ -330,8 +326,6 @@ no listed region. It desugars to `sum_r RegionMask(r)·value_r`, inheriting the 
 
 > Not yet wired: second-order-in-time (`u_tt`) sub-region terms (fail loud). 3-D sub-regions are
 > defined by a predicate `where(x, y, z)`.
-
----
 
 ---
 
@@ -392,8 +386,6 @@ answer is wrong by exactly that factor with no error raised, so bind `dV` once a
 > **Enclosure radiation.** `domain.enclosure(tags, axisymmetric=True)` gives ring areas `2πr̄·L` and a
 > `gap.load(q)` that is **per full revolution** (W, not W/m). The weak form you add it to must carry
 > the same `2πr`, or the two sides differ by exactly that factor. jNO cannot check this for you.
-
----
 
 ---
 

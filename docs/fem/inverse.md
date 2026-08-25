@@ -25,8 +25,6 @@ component** with scalar functions (a single function returning a tuple hits a ke
 
 ---
 
----
-
 `fem.solve()` is the **differentiable forward solve as a trace node** — the entry point for
 inverse problems. Put a `jno.np.parameter` in the weak form, compare `fem.solve()` to data, and
 train the parameter through `crux.solve`. The gradient flows through the solve back to the

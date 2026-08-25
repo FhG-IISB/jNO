@@ -74,8 +74,6 @@ Two ceilings worth knowing before you plan a run:
 
 ---
 
----
-
 ## Elasto-plasticity — a trace formula, not a module
 
 Plasticity is not a module in jNO; it is a **formula** in the term list (the FEM contract). The J2 (von

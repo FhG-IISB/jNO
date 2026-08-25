@@ -33,8 +33,6 @@ u_h = fem.solve()          # matrix-free default; slots pick anything else (see 
 
 ---
 
----
-
 ## Domain, symbols, and derivatives
 
 * **Domain** — any jNO domain works (a `jno.Shape`, `jno.domain.cube`, a CSG/`gmsh` constructor).
@@ -129,8 +127,6 @@ u_h = fem.solve()          # matrix-free default; slots pick anything else (see 
   > biharmonic element — the **C¹ Argyris** element (`space="Argyris"`) or the cheaper **non-conforming
   > Morley** element (`space="Morley"`, full-Hessian form `∫D²u:D²v`) — or the mixed (Ciarlet–Raviart)
   > method (two coupled C⁰ fields with `w = Δu`; see `tests/test_fem_hessian.py`).
-
----
 
 ---
 
@@ -273,8 +269,6 @@ residual) and a driven boundary `g(x, t)` all apply to the coupled case exactly 
 field. *Scope: nodal Lagrange, 2D/3D (1D has its own narrower path). Fail-loud: a coupled field
 with no `u_tt` term (write a first-order field as an explicit first-order system), runtime
 parameters on a coupled form, a trainable Dirichlet value, and `g(x, t)` on a nonlinear form.*
-
----
 
 ---
 
