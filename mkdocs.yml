@@ -126,6 +126,7 @@ nav:
     - Finite Element Method:
       - fem/index.md
       - Boundary conditions: fem/boundary-conditions.md
+      - One-dimensional problems: fem/one-dimensional.md
       - Element families: fem/elements.md
       - Geometry, regions & moving meshes: fem/geometry.md
       - Differentiable solve & inverse: fem/inverse.md
