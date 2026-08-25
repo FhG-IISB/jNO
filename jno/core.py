@@ -3207,20 +3207,19 @@ class core:
                 _single = step_fn
 
                 def step_fn(trainable, opt_states, rng, context, start_epoch, prev_losses):
-                    def body(i, carry):
-                        tr, opt, rn, ep, _total, _indv = carry
-                        tr, opt, rn, ep_next, total, indv = _single(tr, opt, rn, context, ep, _indv)
-                        return tr, opt, rn, ep_next, total, indv
+                    # The first step runs OUTSIDE the loop, and that is not an optimisation -- it is
+                    # how the carry gets its structure. `_single` returns SEVEN values, the last being
+                    # `bayesian_info`, a dict whose pytree cannot be built blind here. Unpacking six
+                    # (as this did) made `inner_steps > 1` raise "too many values to unpack (expected
+                    # 6)" on every call, so the argument could not run at all; seeding the carry from
+                    # a real step keeps it correct whatever that dict contains.
+                    carry = _single(trainable, opt_states, rng, context, start_epoch, prev_losses)
 
-                    init = (
-                        trainable,
-                        opt_states,
-                        rng,
-                        start_epoch,
-                        jnp.zeros(()),
-                        prev_losses,
-                    )
-                    return jax.lax.fori_loop(0, _K, body, init)
+                    def body(_i, c):
+                        tr, opt, rn, ep, _total, indv, _bayesian = c
+                        return _single(tr, opt, rn, context, ep, indv)
+
+                    return jax.lax.fori_loop(0, _K - 1, body, carry)  # _K >= 2 in this branch
 
         # ── 7b. Build gradient accumulation functions (if needed) ──
         _use_accumulation = accumulation_steps > 1

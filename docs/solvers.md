@@ -502,6 +502,20 @@ tells the two apart, and guessing wrong would apply a preconditioner you did not
 need eager preparation (`form`, which assembles an auxiliary operator) require `fem.solve(precond=...)`
 — a direct call has no owning FEM.
 
+`solve_fn=` is the level below that: instead of a *slot*, you take the assembled system and return
+the answer. jNO does nothing to it — no firewall, no convergence gate — so it is the escape hatch for
+a solver that fits none of the shapes above:
+
+```python
+u = fem.solve(solve_fn=lambda A, b: jnp.linalg.solve(A.todense(), b))   # dense LAPACK
+# max|u - default| = 2.9e-10 on a 142-DOF Poisson operator
+```
+
+`A` arrives **exactly as assembled** — a BCOO, not a densified copy. That is deliberate: densifying is
+`O(n²)` on an `O(nnz)` operator (20.5 GiB against 9.4 MiB at n=51,843), so it would make bringing a
+sparse solver pointless at the sizes where you would want one. Call `.todense()` yourself if that is
+what you need, as above.
+
 If your callable is pure JAX it inherits `jit`/`vmap`/AD automatically. On the matrix-free **nonlinear**
 path the `precond` spec is materialized *per Newton/Picard linearization* against the JVP operator — so
 `form`, `inner(...)`, `chebyshev`, a pre-built `amg`, and their `block_diag`/`triangular` compositions

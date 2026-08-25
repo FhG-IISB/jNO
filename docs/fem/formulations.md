@@ -36,6 +36,33 @@
 * **1D and 3D** — a 1D interval or a 3D `cube`/extruded `gmsh` volume use the identical API with
   one fewer / one more coordinate (`ui.z`, `u(xb, yb, zb) - g`).
 
+### Reading a multifield solution back
+
+A coupled solve returns **one flat vector**, so the `fem` object carries the handles that say which
+part is which. They are the same handles the block preconditioners key on:
+
+```python
+st = jno.fem([mu * inner(gu, gv, n_contract=2) - pp * trace(gv),   # momentum
+              -qq * trace(gu),                                     # continuity
+              u(xb, yb)[0] - u_profile(yb), u(xb, yb)[1] - 0.0, p.pin()])
+
+st.dofs           # 850          — total, both fields
+st.blocks         # [slice(0, 746), slice(746, 850)]   — per-field slices into the flat vector
+st.offsets        # [0, 746, 850]                       — the same thing as boundaries
+st.block_index(u) # 0            — resolve a SYMBOL to its block, never hardcode the position
+st.block_index(p) # 1
+st.field_points   # [(373, 2), (104, 2)]  — each field's own node coordinates (P2 velocity, P1 pressure)
+st.is_complex     # False        — also is_linear, is_transient
+
+sol = st.solve()
+velocity = sol[st.blocks[st.block_index(u)]]
+```
+
+!!! warning "Resolve the block by symbol, not by position"
+    Field order follows the order the terms were written, which is not always the order you think —
+    on a phase-field system the degradation factor is written first. `block_index(sym)` is the only
+    spelling that cannot silently pick the wrong field.
+
 ### What the fluid path is verified to do — and what it is not
 
 Scope first, since it is not obvious from the API: jNO's FEM fluid path is **laminar incompressible**

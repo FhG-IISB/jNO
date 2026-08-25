@@ -10,6 +10,7 @@ solve()/compile().
 import foundax
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 import pytest
 
@@ -365,6 +366,39 @@ class TestSubsteps:
 # ---------------------------------------------------------------------------
 # Non-scalar tracker + reduce= callable
 # ---------------------------------------------------------------------------
+
+
+class TestInnerSteps:
+    """``inner_steps`` fuses N gradient steps into one ``fori_loop`` to amortise Python dispatch.
+
+    The suite had exactly one test touching it, and that test asserted it is REFUSED alongside
+    ``substeps`` -- so the guard fired before the code ever ran, and the argument was broken outright:
+    the fused wrapper unpacked six values from a step function that returns seven (the seventh being
+    ``bayesian_info``), raising "too many values to unpack (expected 6)" on every call.
+    """
+
+    @staticmethod
+    def _crux(seed=0):
+        d = _stationary_1d_domain(mesh_size=0.05)
+        x, *_ = d.variable("interior", split=True)
+        xb, *_ = d.variable("boundary", split=True)
+        net = _tiny_net(key_seed=seed)
+        net.optimizer(optax.adam(1e-3))
+        u = net(x)
+        return jno.core([(u.dd(x) + jnn.sin(np.pi * x)).mse, (net(xb) - 0.0).mse], domain=d)
+
+    def test_inner_steps_runs_and_matches_the_unfused_loop(self):
+        """Fusing must be a dispatch change, not a numerical one."""
+        plain = self._crux().solve(200)
+        fused = self._crux().solve(200, inner_steps=10)
+        a, b = float(plain.total_loss), float(fused.total_loss)
+        assert np.isfinite(a) and np.isfinite(b)
+        assert abs(a - b) / a < 1e-4, f"fused {b:.6e} vs unfused {a:.6e}"
+
+    def test_inner_steps_of_one_is_the_default_path(self):
+        """The wrapper must not engage at all for the default, which is the only value ever exercised."""
+        stats = self._crux().solve(50, inner_steps=1)
+        assert np.isfinite(float(stats.total_loss))
 
 
 class TestTrackerNonScalar:
