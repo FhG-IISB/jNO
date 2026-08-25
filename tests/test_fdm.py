@@ -666,10 +666,63 @@ def test_laplacian_3d_cotangent_beats_grad_of_grad():
     assert cot < 0.4 * gog, f"cotangent ({cot:.3e}) should be << gradient_of_gradient ({gog:.3e})"
 
 
+def test_laplacian_on_nodal_field_defaults_to_finite_differences():
+    """`.laplacian` on a nodal unknown must take the SAME finite-difference default `.d`/`.d2`/`.dd`
+    already take. It used to fall through to Placeholder.laplacian (AD default), and the AD Hessian
+    branch has no points to differentiate at, so it died with an opaque AttributeError."""
+    import jno.jnp_ops as jnn
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.06)
+    p = _nodes(d)
+    exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    f = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+    lap = np.asarray(jno.fdm([-ui.laplacian(x, y) - f, u(xb, yb) - 0.0]).solve()).reshape(-1)
+    split = np.asarray(jno.fdm([-ui.d2(x) - ui.d2(y) - f, u(xb, yb) - 0.0]).solve()).reshape(-1)
+    assert np.allclose(lap, split), "laplacian(x, y) must equal d2(x) + d2(y) on a nodal field"
+    assert float(np.linalg.norm(lap - exact) / np.linalg.norm(exact)) < 3e-2
+
+
+@pytest.mark.parametrize("method", ["d2", "dd"])
+def test_whole_laplacian_subscheme_rejected_on_per_axis_derivative(method):
+    """`finite_difference:cotangent` returns the WHOLE Laplacian for any requested dimension, so
+    `d2(x, ...) + d2(y, ...)` silently computed 2∇²u and converged to half the right answer. Per-axis
+    second derivatives now refuse the sub-scheme and point at `.laplacian`."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2)
+    x, y, _ = d.variable("interior", split=True)
+    ui = d.unknown().bind(x=x, y=y)
+    with pytest.raises(ValueError, match="WHOLE Laplacian|laplacian"):
+        getattr(ui, method)(x, scheme="finite_difference:cotangent")
+
+
+def test_whole_laplacian_subscheme_allowed_on_laplacian():
+    """The same sub-scheme is legitimate on `.laplacian`, which takes every coordinate at once so it
+    cannot be double-counted — and it is markedly more accurate than the nested-stencil default."""
+    import jno.jnp_ops as jnn
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.06)
+    p = _nodes(d)
+    exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    f = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+    rel = lambda sol: float(np.linalg.norm(np.asarray(sol).reshape(-1) - exact) / np.linalg.norm(exact))
+    cot = rel(jno.fdm([-ui.laplacian(x, y, scheme="finite_difference:cotangent") - f, u(xb, yb) - 0.0]).solve())
+    nested = rel(jno.fdm([-ui.d2(x) - ui.d2(y) - f, u(xb, yb) - 0.0]).solve())
+    assert cot < nested / 3, f"cotangent should be several times better: {cot:.3e} vs {nested:.3e}"
+
+
 def test_constraint_list_cotangent_3d():
-    """The constraint-list path reaches the 3-D cotangent stencil too — a SINGLE whole-Laplacian term
-    `ui.d2(x, scheme="finite_difference:cotangent")` (NOT the split −d2(x)−d2(y)−d2(z), which stays
-    per-direction gradient-of-gradient), exactly as in 2-D. It matches the function-form accuracy."""
+    """The constraint-list path reaches the 3-D cotangent stencil too, written as the whole Laplacian
+    `ui.laplacian(x, y, z, scheme="finite_difference:cotangent")`. The cotangent sub-scheme returns
+    ∇²u for every requested dimension, so it must be ONE term — the split −d2(x)−d2(y)−d2(z) would
+    triple it, which is why `d2`/`dd` now reject this sub-scheme outright. Matches function-form
+    accuracy."""
     import jno.jnp_ops as jnn
 
     d = _cube(0.14)
@@ -680,7 +733,7 @@ def test_constraint_list_cotangent_3d():
     u = d.unknown()
     ui = u.bind(x=x, y=y, z=z)
     f = 3 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y) * jnn.sin(np.pi * z)
-    sol = jno.fdm([-ui.d2(x, scheme="finite_difference:cotangent") - f, u(xb, yb, zb) - 0.0]).solve()
+    sol = jno.fdm([-ui.laplacian(x, y, z, scheme="finite_difference:cotangent") - f, u(xb, yb, zb) - 0.0]).solve()
     err = float(np.linalg.norm(np.asarray(sol).reshape(-1) - exact) / np.linalg.norm(exact))
     # ~0.064 at h=0.14 — the function-form cotangent value, and far below the per-direction
     # gradient_of_gradient (~0.27), proving the whole-Laplacian cotangent stencil took effect.
