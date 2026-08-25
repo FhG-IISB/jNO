@@ -359,9 +359,10 @@ uh, vh = jno.fdm([
 ]).solve()                              # returns (2, N): uh = row 0, vh = row 1
 ```
 
-Coupled fields are v1-limited to steady + Dirichlet (transient / flux on coupled fields are planned). A geometric sub-region for a subdomain /
-domain-decomposition solve (`jno.dd.couple([(problem, region)])`) resolves to a mesh-node subset via
-the analytic, shapely-free [`Shape.contains`](Domain-and-Geometry.md) — in 2-D **and** 3-D.
+Coupled fields are v1-limited to steady + Dirichlet (transient / flux on coupled fields are planned). A
+`jno.fdm` problem can also be **one subdomain of a larger solve** — coupled to a FEM or PINN region by
+overlapping Schwarz or Dirichlet–Neumann, and differentiable through the converged fixed point. See
+[Domain decomposition](domain-decomposition.md).
 
 An axis-aligned 2-D rectangle or 3-D box can use a fast [structured grid](#structured-grid-fast-stencils)
 (`.structured()`) with direct finite-difference stencils in place of the unstructured mesh.

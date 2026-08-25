@@ -138,6 +138,7 @@ nav:
     - Finite Difference Method: fdm.md
     - Rigorous Coupled-Wave Analysis: rcwa.md
     - Solvers & preconditioners: solvers.md
+    - Domain decomposition: domain-decomposition.md
     - Inverse Problems: inverse-problems.md
   - Machine learning:
     - Overview: training/index.md
