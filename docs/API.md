@@ -189,7 +189,7 @@ accuracy numbers and the periodicity caveat.
 ## Solvers and preconditioners
 
 `jno.solve` and `jno.precond` are the slots that `fem.solve(linear=…, nonlinear=…,
-precond=…, time=…)` composes (see the [FEM guide](fem.md)). The families:
+precond=…, time=…)` composes (see the [FEM guide](fem/index.md)). The families:
 
 | Kind | `jno.solve` |
 | --- | --- |
@@ -390,3 +390,142 @@ authors of custom operators.
 ::: jno.trace.Integral
 
 ::: jno.trace.Noise
+
+---
+
+## Numerical-method front doors
+
+Each takes a **term list** and returns an object carrying the assembled problem. The narrative
+guides are [FEM](fem/index.md), [FDM](fdm.md) and [RCWA](rcwa.md); this is the signature-level
+reference.
+
+### `jno.fem`
+
+::: jno._fem.fem
+
+### The `FEM` object
+
+::: jno._fem.FEM
+    options:
+      members:
+        - solve
+        - eigs
+        - eval
+        - residual
+        - jacobian
+        - operator
+        - offsets
+        - blocks
+        - block_index
+        - region_dofs
+        - points
+        - field_points
+        - dofs
+        - stats
+        - is_linear
+        - is_transient
+        - is_complex
+
+### `jno.fdm`
+
+::: jno.fdm.fdm
+
+### `jno.rcwa`
+
+::: jno.rcwa.rcwa
+
+::: jno.rcwa.Rcwa
+    options:
+      members:
+        - solve
+        - spec
+
+::: jno.rcwa.RcwaSpec
+
+#### The RCWA solution
+
+Returned by `rcwa(...).solve()`. Every readout is a differentiable JAX array, so a transmission or
+per-order objective can be optimised straight through the modal solve.
+
+::: jno.rcwa._Sol
+    options:
+      heading_level: 5
+      members:
+        - efficiency
+        - order
+        - jones
+        - field
+        - field3d
+        - aerial
+
+::: jno.rcwa.RcwaError
+
+---
+
+## Geometry
+
+::: jno.geometry.shape.Shape
+
+::: jno.geometry.path.Path
+
+---
+
+## Optimizers (`jno.optimizers`)
+
+Optax-compatible transformations. Anything optax exposes works too — these are the additions jNO
+needs for PDE-constrained and topology-optimisation work.
+
+::: jno.optimizers
+
+---
+
+## Bayesian inference (`jno.bayesian`)
+
+Backs `model.bayesian(...)` / `model.vi(...)`; see [Bayesian Sampling](training/bayesian.md).
+
+::: jno.bayesian
+    options:
+      members:
+        - rhat
+        - ess
+        - priors
+        - default_gaussian_prior
+        - laplace
+        - pathfinder
+        - LaplaceInitializer
+        - PathfinderInitializer
+        - SVGDInitializer
+
+---
+
+## Noise nodes (`jno.noise`)
+
+::: jno.noise._NoiseNamespace
+    options:
+      members:
+        - gaussian
+        - uniform
+        - laplace
+        - grf
+
+---
+
+## Parameter-efficient fine-tuning (`jno.lora`)
+
+Attached with `.lora(...)` on a wrapped model — see [LoRA](model-controls/lora.md).
+
+::: jno.lora
+
+---
+
+## Training trackers (`jno.trackers`)
+
+Diagnostics attachable as callbacks — see [Explainability](training/explainability.md).
+
+::: jno.trackers
+
+---
+
+## Deployment (`jno.iree`)
+
+::: jno.utils.iree.IREEModel
