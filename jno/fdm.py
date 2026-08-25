@@ -60,7 +60,6 @@ automatic, no authoring change. Composite/CSG and cut-cell geometry are planned.
 
 from __future__ import annotations
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -80,12 +79,15 @@ def _fd_operator_noise(residual_fn, u0) -> float:
     **immune to nonlinearity of the residual itself** (verified: ``u -> u**3`` measures 1.2e-16).
     Three JVPs, negligible beside a Newton solve.
 
-    Why this matters here: on an unstructured mesh a second derivative defaults to
-    ``gradient_of_gradient`` — a *nested* least-squares/area-weighted gradient — and nesting amplifies
-    roundoff. Measured on a 2-D Poisson residual (mesh 0.06, x64): **5.3e-08** relative, against
-    **1.8e-16** for the ``cotangent`` Laplacian stencil on the same mesh, i.e. nine orders worse. The
-    absolute floor is that figure times the residual scale, which is exactly where Newton was
-    observed to stall (~7e-05 here). Asking for a tighter gate cannot succeed.
+    History, because the docstring used to claim the opposite: the **5.3e-08** floor this was built
+    for was not the discretization at all. ``jno.np.parameter`` hardcoded ``float32``, so the strong-
+    form residual rounded its unknown to single precision on every evaluation
+    (``_pde_residual_fn`` casts the DOF vector to the unknown module's dtype). Both stencils measured
+    ~6e-08 through the trace while both measured ~2e-16 called directly — the gap was the cast, not
+    the nesting. With the dtype following ``jax_enable_x64`` every stencil measured here sits at
+    machine precision (cotangent 1.7e-16, nested ``d2(x)+d2(y)`` 2.1e-16, ``:lsq`` 3.2e-16 on mesh
+    0.08), so :func:`_fd_newton_tolerances` returns the driver's own defaults. The probe stays as a
+    measured safety valve for an operator that genuinely is noisy.
     """
     import jax
 
@@ -112,22 +114,22 @@ def _fd_newton_tolerances(residual_fn, u0, *, safety: float = 1000.0) -> dict:
     """Newton tolerances for the FD residual: never tighter than the driver's own defaults, and never
     below the operator's measured precision floor (:func:`_fd_operator_noise`).
 
-    The strong-form FD operators jNO builds on an unstructured mesh are **noisy by construction** (a
-    nested gradient-of-gradient second derivative), so the stock ``atol=rtol=1e-8`` gate is
-    unreachable for them — Newton then burns its whole step budget and the convergence guard reports
-    a genuine non-convergence. That guard is right; the *request* was wrong. Scaling the gate to the
-    measured floor makes the solve ask for what its own discretization can actually deliver.
+    The floor this was written for turned out to be a ``float32`` leak, now fixed at its source (see
+    :func:`_fd_operator_noise`), and **every stencil measured since sits at machine precision** — so
+    on the problems in the test suite this returns ``{}`` and Newton keeps its own ``1e-8`` gate. It
+    stays because the rule is sound where a floor is real: an operator that cannot reach ``1e-8``
+    makes Newton burn its whole step budget, and the convergence guard then reports a genuine
+    non-convergence. The guard is right; the *request* was wrong.
 
     This does **not** paper over a bad solve: the floor is measured per problem, the gate is only ever
-    *loosened*, and an operator with no noise (the ``cotangent`` stencil, a structured grid) keeps the
-    full 1e-8. For a genuinely accurate Laplacian, author it as ``scheme="finite_difference:cotangent"``
-    — exact to machine precision on the same mesh — rather than as nested ``u.d2(x) + u.d2(y)``.
+    *loosened*, and an operator with no noise keeps the full 1e-8.
 
     ``safety`` is 1000 rather than 1: the probe measures the floor of a **single** operator
     evaluation, while Newton's achievable residual is that noise amplified through the inner Krylov
-    solve and the outer iteration. Measured on the failing suite, one evaluation's floor sat 3-30x
-    below where Newton actually stalled, so three orders of margin covers the chain without being
-    open-ended — and the gate is still *derived from a measurement of this problem*, not a constant.
+    solve and the outer iteration. Measured back when a floor existed, one evaluation's floor sat
+    3-30x below where Newton actually stalled, so three orders of margin covers the chain without
+    being open-ended — and the gate is still *derived from a measurement of this problem*, not a
+    constant.
     """
     noise = _fd_operator_noise(residual_fn, u0)
     if noise <= 0.0:
@@ -140,48 +142,6 @@ def _fd_newton_tolerances(residual_fn, u0, *, safety: float = 1000.0) -> dict:
     if not np.isfinite(floor) or floor <= 1e-8:
         return {}
     return {"atol": floor, "rtol": 1e-8}
-
-
-def _uses_whole_laplacian_scheme(constraints) -> bool:
-    """True if any constraint carries a ``:cotangent`` second-derivative node.
-
-    Its adjoint is currently wrong (see :meth:`_TraceFDM.solve`), so the solve refuses to be
-    differentiated when one is present rather than returning a plausible, badly wrong gradient.
-    """
-    seen, stack = set(), list(constraints)
-    while stack:
-        n = stack.pop()
-        if id(n) in seen:
-            continue
-        seen.add(id(n))
-        if "cotangent" in str(getattr(n, "scheme", "") or ""):
-            return True
-        for attr in ("left", "right", "target", "operand", "expr", "node", "base"):
-            child = getattr(n, attr, None)
-            if child is not None and not isinstance(child, (str, bytes, int, float)):
-                stack.append(child)
-        for attr in ("args", "children", "operands", "variables", "nodes"):
-            seq = getattr(n, attr, None)
-            if isinstance(seq, (list, tuple)):
-                stack.extend(c for c in seq if not isinstance(c, (str, bytes, int, float)))
-    return False
-
-
-def _block_bad_adjoint(sol, why: str):
-    """Return ``sol`` unchanged forward; raise if anything tries to differentiate it."""
-
-    @jax.custom_vjp
-    def _gate(v):
-        return v
-
-    def _fwd(v):
-        return v, None
-
-    def _bwd(_res, _g):
-        raise NotImplementedError(why)
-
-    _gate.defvjp(_fwd, _bwd)
-    return _gate(sol)
 
 
 def _structured_linear_solve(domain):
@@ -954,21 +914,6 @@ class _TraceFDM:
         driver = nonlinear or _solve.newton(**_fd_newton_tolerances(residual_with_bc, u0))
         sol = driver(residual_with_bc, u0, linear_solve=_structured_linear_solve(self.domain) if single else None)
         out = sol if single else sol.reshape(self._nf, N)  # coupled: (nf, N), one row per field
-        if _uses_whole_laplacian_scheme(self._constraints):
-            # The FORWARD solve with `:cotangent` is the accurate one (it matches the historical
-            # function form bit-for-bit). Its ADJOINT is not: measured on -Δu = s·f, d(Σu)/ds came
-            # back -1.9e22 against an exact +8.2e01, and the loss gradient +9.2e10 against +0.226
-            # from both finite differences and the closed form. It is not the inner Krylov solver —
-            # forcing GMRES reproduces the same number — and the operator's own gradient is exact,
-            # so the fault is in how this node linearises inside the solve. Until that is fixed the
-            # solve refuses to be differentiated rather than handing back a plausible wrong number.
-            out = _block_bad_adjoint(
-                out,
-                "jno.fdm: a solve whose residual uses scheme='finite_difference:cotangent' cannot be "
-                "differentiated — its adjoint is currently wrong by ~20 orders of magnitude (the forward "
-                "solve is correct and unaffected). For gradients use the default per-axis stencil "
-                "(u.d2(x) + u.d2(y)) or ':lsq', both of which match finite differences to 1e-4.",
-            )
         return out
 
     def pinned_solver(self, node_ids, *, nonlinear=None):

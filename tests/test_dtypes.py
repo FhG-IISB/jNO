@@ -117,6 +117,23 @@ def test_x64_lr_scheduler_callback_is_f64():
 # ---------------------------------------------------------------------------
 
 
+def test_x64_parameter_and_unknown_are_f64():
+    """``jno.np.parameter`` hardcoded ``float32``, and it is the storage behind BOTH a trainable
+    coefficient and ``domain.unknown()``. ``jno.fdm._pde_residual_fn`` injects the DOF vector into
+    that module and casts it to the module's dtype, so under x64 every strong-form residual
+    evaluation silently rounded the unknown to single precision -- a NON-LINEAR operator (6e-08
+    relative), which capped the forward Krylov solve near 1e-05 and broke the adjoint solve outright
+    (a measured gradient wrong by twenty orders). Data precision is JAX's ``jax_enable_x64``; jNO's
+    only precision knob is the per-model ``.dtype()``."""
+    with x64_enabled():
+        assert np.asarray(jno.np.parameter((3,)).model.module.value).dtype == np.float64
+        dom = _line_domain()
+        assert np.asarray(dom.unknown().model.module.value).dtype == np.float64
+
+    # ...and it must still follow JAX the other way, rather than pinning float64 of its own accord.
+    assert np.asarray(jno.np.parameter((3,)).model.module.value).dtype == np.float32
+
+
 def test_x64_no_float32_leak_in_context():
     with x64_enabled():
         dom = _line_domain()

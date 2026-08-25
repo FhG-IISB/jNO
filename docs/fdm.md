@@ -61,20 +61,27 @@ views therefore default to **finite differences**:
     lap = ui.d2(x, scheme="finite_difference:cotangent") + ui.d2(y, …)   # ❌ raises
     ```
 
-!!! danger "`:cotangent` solves cannot be differentiated"
-    The `:cotangent` **forward** solve is the accurate one — but its **adjoint is wrong**, by about
-    twenty orders of magnitude. Measured on `−Δu = s·f`, `d(Σu)/ds` came back `-1.9e22` against an
-    exact `+8.2e01`; a loss gradient came back `+9.2e10` against `+0.226` from both finite differences
-    and the closed form. It is not the inner Krylov solver (forcing GMRES reproduces the same number)
-    and the operator's own gradient is exact — the fault is in how the node linearises inside the solve.
-
-    Until that is fixed, differentiating such a solve **raises**. For inverse problems use the default
-    per-axis stencil or `:lsq`; both match finite differences to better than 1e-6.
-
     `"finite_difference:lsq"` is **not** affected — it is a genuine per-direction stencil, so
     `.d2(x, scheme=":lsq") + .d2(y, scheme=":lsq")` is correct and equals
     `.laplacian(x, y, scheme=":lsq")` (both 1.978e-02 on the study below; the single `.d2(x, ":lsq")`
     alone is 1.046, as a per-axis derivative should be).
+
+!!! measured "Every stencil's adjoint is exact"
+    A strong-form solve is differentiable through whichever stencil you author. Measured on
+    `−Δu = s·f` over the unit square (mesh 0.08, x64), where `u` is linear in `s` so `d(Σu)/ds`
+    has a closed form:
+
+    | stencil | `d(Σu)/ds` (AD) | closed form |
+    |---|---|---|
+    | `.laplacian(x, y, ":cotangent")` | +8.171969e+01 | +8.171969e+01 |
+    | `.d2(x) + .d2(y)` (default) | +8.336520e+01 | +8.336520e+01 |
+    | `.laplacian(x, y, ":lsq")` | +8.334671e+01 | +8.334671e+01 |
+
+    This needed a fix: `jno.np.parameter` hardcoded `float32`, and `jno.fdm` casts the DOF vector to
+    the unknown's dtype on every residual evaluation — so under x64 the operator silently rounded to
+    single precision. That made it *non-linear* at the 6e-08 level, which capped the forward solve
+    near 1e-05 and broke the adjoint Krylov solve outright (a gradient wrong by twenty orders). The
+    dtype now follows `jax_enable_x64`, and every stencil above is linear to 2e-16.
 
 ### Choosing the stencil
 

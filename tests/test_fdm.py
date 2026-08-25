@@ -733,48 +733,69 @@ def test_whole_laplacian_subscheme_allowed_on_laplacian():
     assert cot < nested / 3, f"cotangent should be several times better: {cot:.3e} vs {nested:.3e}"
 
 
-def test_cotangent_solve_refuses_to_be_differentiated():
-    """The `:cotangent` FORWARD solve is the accurate one, but its adjoint is currently wrong by ~20
-    orders (measured: d(Σu)/ds = -1.9e22 against an exact +8.2e01; the loss gradient +9.2e10 against
-    +0.226 from both finite differences and the closed form). It is not the inner Krylov solver —
-    forcing GMRES gives the same number — and the operator's own gradient is exact. Until the
-    linearisation is fixed the solve must RAISE rather than return a plausible wrong gradient."""
+def test_every_stencil_adjoint_matches_the_closed_form():
+    """The oracle the old test lacked: an adjoint must be RIGHT, not merely finite and positive.
+
+    `u` is linear in the source scale `s`, so `d(Σu)/ds == Σu(s=1)` exactly, for every stencil. Mesh
+    0.08 is the one that used to fail: `jno.np.parameter` hardcoded `float32` and `_pde_residual_fn`
+    casts the DOF vector to the unknown's dtype, so under x64 the residual rounded to single
+    precision on every evaluation. That is a NON-LINEAR operator (measured 6e-08 relative), which
+    capped the forward Krylov solve near 1e-05 while its recursive residual claimed 1e-10, and broke
+    the adjoint BiCGStab outright: `d(Σu)/ds` came back -1.887e+22 against an exact +8.172e+01. The
+    coarser 0.12 mesh happened to survive it, which is why this pins the mesh."""
     import jno.jnp_ops as jnn
 
-    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.12)
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.08)
     x, y, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
     u = d.unknown()
     ui = u.bind(x=x, y=y)
     f = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
 
-    def total(scale):
-        sol = jno.fdm([-ui.laplacian(x, y, scheme=_COT) - scale * f, u(xb, yb) - 0.0]).solve()
-        return jnp.sum(jnp.asarray(sol).reshape(-1))
-
-    assert np.isfinite(float(total(1.0))), "the forward solve must still work"
-    with pytest.raises(NotImplementedError, match="cotangent"):
-        jax.grad(total)(1.5)
-
-
-def test_default_and_lsq_adjoints_match_finite_differences():
-    """The paths that ARE differentiable must be right, not merely finite — this is the assertion the
-    old function-form test lacked, which let a garbage-but-positive gradient pass for so long."""
-    import jno.jnp_ops as jnn
-
-    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.12)
-    x, y, _ = d.variable("interior", split=True)
-    xb, yb, _ = d.variable("boundary", split=True)
-    u = d.unknown()
-    ui = u.bind(x=x, y=y)
-    f = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
-
-    for lap in (ui.d2(x) + ui.d2(y), ui.laplacian(x, y, scheme="finite_difference:lsq")):
+    for lap in (
+        ui.laplacian(x, y, scheme=_COT),
+        ui.d2(x) + ui.d2(y),
+        ui.laplacian(x, y, scheme="finite_difference:lsq"),
+    ):
         total = lambda s, lap=lap: jnp.sum(  # noqa: E731
             jnp.asarray(jno.fdm([-lap - s * f, u(xb, yb) - 0.0]).solve()).reshape(-1)
         )
-        exact = float(total(1.0))  # u is linear in s, so d(Σu)/ds == Σu(s=1)
+        exact = float(total(1.0))
         assert abs(float(jax.grad(total)(1.5)) - exact) / abs(exact) < 1e-6
+
+
+def test_strong_form_residual_is_exactly_linear():
+    """The property whose violation caused the above, asserted directly and cheaply.
+
+    `-Δu - f` with Dirichlet rows is affine in the DOF vector, so `F(a+b) - F(a) - F(b) + F(0)` is
+    zero in exact arithmetic. A float32 round trip inside the evaluation is not a small error here:
+    ROUNDING IS NON-LINEAR, so it showed up as a 6e-08 defect and drove the Krylov solvers off. The
+    raw operators (`jno.fdm.laplacian`) were always clean — only the traced path was not, which is
+    why this measures the residual `jno.fdm` actually hands to Newton."""
+    import jno.jnp_ops as jnn
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.08)
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    f = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+
+    for lap in (
+        ui.laplacian(x, y, scheme=_COT),
+        ui.d2(x) + ui.d2(y),
+        ui.laplacian(x, y, scheme="finite_difference:lsq"),
+        ui.d(x) + ui.d(y),  # first derivatives share the same evaluation path
+    ):
+        sysobj = jno.fdm([-lap - f, u(xb, yb) - 0.0])
+        residual = sysobj._pde_residual_fn()
+        n = sysobj._Ntot
+        a = jax.random.normal(jax.random.PRNGKey(0), (n,))
+        b = jax.random.normal(jax.random.PRNGKey(1), (n,))
+        ev = lambda v: jnp.asarray(residual(v)).reshape(-1)  # noqa: E731
+        defect = ev(a + b) - ev(a) - ev(b) + ev(jnp.zeros((n,)))
+        rel = float(jnp.linalg.norm(defect) / jnp.linalg.norm(ev(a)))
+        assert rel < 1e-14, f"the strong-form residual must be affine in the DOFs; defect {rel:.2e}"
 
 
 def test_constraint_list_cotangent_3d():
@@ -933,29 +954,33 @@ def test_flux_dirichlet_shared_edge_precedence_3d():
 # --------------------------------------------------------------------------------------------------
 
 
-def test_fd_operator_noise_separates_exact_from_nested_stencils():
-    """The measurement the tolerance rule is built on. A strong-form second derivative defaults to
-    ``gradient_of_gradient`` — a NESTED gradient — and nesting amplifies roundoff, so the operator
-    carries a precision floor no solver can go below. The cotangent Laplacian on the same mesh does
-    not. Newton then stalled at ~||r||*noise and the convergence guard (correctly) raised; the fix is
-    to ask for what the discretization can actually deliver, not to loosen the guard."""
-    from jno.fdm import _fd_operator_noise, laplacian
+def test_every_strong_form_stencil_is_exact_under_x64():
+    """This test used to assert the OPPOSITE — that the nested `gradient_of_gradient` second
+    derivative carries a 5e-08 precision floor "by construction", nine orders worse than the
+    cotangent stencil. That was wrong, and it pinned a bug as a feature: the floor was
+    `jno.np.parameter`'s hardcoded `float32`, which `_pde_residual_fn` casts the unknown to on every
+    evaluation. Called directly, BOTH stencils always measured ~2e-16; only the traced path was
+    noisy, and both were equally noisy there. With the dtype following `jax_enable_x64` every
+    stencil is exact, so `_fd_newton_tolerances` leaves Newton's own 1e-8 gate alone."""
+    from jno.fdm import _fd_newton_tolerances, _fd_operator_noise, laplacian
 
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.06)
     n = int(np.asarray(d.mesh.points).shape[0])
-    u = jnp.asarray(np.random.default_rng(0).normal(size=n))
+    probe = jnp.asarray(np.random.default_rng(0).normal(size=n))
 
-    exact = _fd_operator_noise(lambda z: laplacian(z, d, method="cotangent"), u)
-    assert exact < 1e-14, f"the cotangent stencil must be exact, measured {exact:.2e}"
+    assert _fd_operator_noise(lambda z: laplacian(z, d, method="cotangent"), probe) < 1e-14
+    assert _fd_operator_noise(lambda z: laplacian(z, d, method="gradient_of_gradient"), probe) < 1e-14
 
     x, y, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
     uu = d.unknown()
     ui = uu.bind(x=x, y=y)
-    prob = jno.fdm([-ui.d2(x) - ui.d2(y) - 1.0, uu(xb, yb) - 0.0])
-    nested = _fd_operator_noise(prob._pde_residual_fn(), u)
-    assert nested > 1e-10, f"the nested gradient_of_gradient stencil is noisy; measured {nested:.2e}"
-    assert nested > 1e4 * max(exact, 1e-17), "the two stencils must differ by orders, not a little"
+    for lap in (ui.d2(x) + ui.d2(y), ui.laplacian(x, y, scheme=_COT)):
+        prob = jno.fdm([-lap - 1.0, uu(xb, yb) - 0.0])
+        rf = prob._pde_residual_fn()
+        noise = _fd_operator_noise(rf, jnp.zeros(prob._Ntot))
+        assert noise < 1e-14, f"the traced residual must be exact under x64; measured {noise:.2e}"
+        assert _fd_newton_tolerances(rf, jnp.zeros(prob._Ntot)) == {}, "an exact operator keeps 1e-8"
 
 
 def test_fd_operator_noise_is_immune_to_nonlinearity_and_to_tracing():
