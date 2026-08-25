@@ -441,6 +441,39 @@ def test_the_gate_fires_from_inside_a_trace_and_never_spuriously():
         jax.jit(lambda rhs: starved(op, rhs))(_b(24, seed=7))
 
 
+def test_the_fem_default_solve_gates_its_own_adjoint():
+    """The most-used differentiable path in the library, and the one the slot fix did not reach.
+
+    ``fem.solve()`` with no slots runs a matrix-free Jacobi-BiCGStab, and calling
+    ``jax.scipy.sparse.linalg.bicgstab`` straight means JAX supplies the implicit-diff rule -- so the
+    ``A^T`` solve it runs was out of reach. Not hypothetical: ``jax.grad`` through a plain
+    ``fem.solve()`` on an assembled operator lands there with ``A`` traced, where the eager
+    ``_residual_check`` is a no-op by construction."""
+    pytest.importorskip("shapely", reason="shapely required for the box domain")
+    from shapely.geometry import box
+
+    from jno._fem import _solve_linear_matrix_free
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.15)
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+
+    def total(k):
+        fem = jno.fem([k * (ui.x * vi.x + ui.y * vi.y) - 1.0 * vi, u(xb, yb) - 0.0])
+        return jnp.sum(jnp.asarray(fem.solve()).reshape(-1))
+
+    value = float(total(2.0))  # u scales as 1/k, so d(Sum u)/dk == -Sum u / k exactly
+    assert abs(float(jax.grad(total)(2.0)) + value / 2.0) / (value / 2.0) < 1e-6
+
+    A, b = jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0]).operator
+    with pytest.raises(RuntimeError, match="did not solve the system"):
+        _solve_linear_matrix_free(A, b, maxiter=2)  # forward
+    with pytest.raises(RuntimeError, match="did not solve the system"):
+        jax.grad(lambda s: jnp.sum(_solve_linear_matrix_free(A, s * b, maxiter=2)))(1.0)  # adjoint
+
+
 def test_a_preconditioner_application_is_not_gated():
     """A preconditioner is inexact BY DESIGN. ``jno.precond.inner(jno.solve.cg(tol=1e-2, maxiter=30))``
     asks for two digits deliberately -- that is precisely why the outer Krylov has to be flexible --

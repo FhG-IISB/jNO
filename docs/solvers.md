@@ -464,7 +464,7 @@ fem.stats
 ### A solve that did not converge raises — including the adjoint
 
 Every linear solve is residual-checked against its own operator before it returns, and **so is its
-transpose**. That matters because a Krylov iteration leaving on its step cap returns the last iterate
+transpose** — the plain `fem.solve()` default included. That matters because a Krylov iteration leaving on its step cap returns the last iterate
 with no signal at all, so a broken solve is otherwise indistinguishable from a good one:
 
 ```python
@@ -487,7 +487,9 @@ jax.grad(loss)(theta)
 
     Cost is one extra matvec per solve. The host round-trip that reports the failure sits in the
     failing branch, so a converged solve never pays for it: 0.32 ms against 0.24 ms per call on a
-    small dense GMRES, and no measurable difference on the reverse pass.
+    small dense GMRES, and no measurable difference on the reverse pass. The `fem.solve()` default
+    got *faster* — 1.90 ms against 2.73 ms at 1441 DOFs — because checking from inside the trace
+    replaced an eager check that cost its own matvec plus a host sync.
 
 !!! note "A preconditioner is exempt — it is inexact on purpose"
     `jno.precond.inner(jno.solve.cg(tol=1e-2, maxiter=30))` asks for two digits deliberately; that

@@ -143,20 +143,54 @@ def _solve_linear_matrix_free(A, b, *, tol=1e-8, maxiter=20_000, shard=None):
         def _bicgstab(mv, rhs, M, x0):
             return jax.scipy.sparse.linalg.bicgstab(mv, rhs, x0=x0, tol=tol, atol=0.0, maxiter=maxiter, M=M)[0]
 
+        # NOT firewalled, unlike the single-device path below: `sharded_solve` owns the placement of
+        # both the operator and the iteration, and wrapping it in our own `custom_linear_solve` would
+        # mean deciding how the TRANSPOSED operator shards -- untested here, and a wrong sharding is
+        # worse than an unchecked one. So this branch keeps the eager-only guard, which means a
+        # multi-device solve differentiated under a trace still has an unchecked adjoint.
         u = sharded_solve(A, b, _bicgstab, devices, precond_fn=jacobi_from_diagonal)
         return _residual_check(A, b, u, "Jacobi-preconditioned BiCGStab (sharded)")
 
-    # COMPILED iteration, EAGER guard. `jax.scipy.sparse.linalg.bicgstab` was called from eager
-    # Python, so every one of its hundreds of iterations paid dispatch: measured 102.9 ms against
-    # 6.4 ms for the identical computation under `jit` at n=13861 -- a 16x tax on every default solve,
-    # and the reason the solve time barely moved between n=4641 and n=51843 (it was dispatch-bound,
-    # not compute-bound).
+    # COMPILED iteration, and the guard now compiles WITH it. `jax.scipy.sparse.linalg.bicgstab`
+    # was originally called from eager Python, so every one of its hundreds of iterations paid
+    # dispatch: measured 102.9 ms against 6.4 ms for the identical computation under `jit` at
+    # n=13861 -- a 16x tax on every default solve, and the reason the solve time barely moved
+    # between n=4641 and n=51843 (it was dispatch-bound, not compute-bound).
     #
-    # The guard stays OUTSIDE the jit deliberately. `_residual_check` needs a concrete residual, so
-    # wrapping the whole function would make it step aside and silently give up "raise rather than
-    # return garbage" in exchange for the speed. Split this way there is nothing to trade.
-    u = _bicgstab_jacobi(A, b, float(tol), int(maxiter))
-    return _residual_check(A, b, u, "Jacobi-preconditioned BiCGStab")
+    # That used to force a trade: `_residual_check` needs a CONCRETE residual, so it had to sit
+    # outside the jit, which left the transpose solve (inside) unguarded. `residual_gate` removes
+    # the trade by checking from inside the trace, so the whole thing -- iteration, firewall and
+    # both convergence checks -- is one compiled program. Measured faster than the split shape it
+    # replaces (1.90 ms against 2.73 ms at n=1441), because the eager check's own matvec and host
+    # sync go away.
+    return _firewalled_bicgstab(A, b, float(tol), int(maxiter))
+
+
+@partial(jax.jit, static_argnums=(2, 3))
+def _firewalled_bicgstab(A, b, tol: float, maxiter: int):
+    """The default solve inside our OWN ``custom_linear_solve``, so its adjoint is ours to check.
+
+    Called straight, ``jax.scipy.sparse.linalg.bicgstab`` supplies its own implicit-diff rule, and the
+    ``A^T`` solve that rule runs is out of reach -- unchecked, and unreachable by the eager
+    ``_residual_check`` above, which no-ops under a tracer anyway. That is not a hypothetical path:
+    ``jax.grad`` through a plain ``fem.solve()`` on an assembled operator lands here with ``A``
+    traced. Taking the firewall ourselves makes both directions explicit calls that
+    :func:`jno.utils.solver.solver_api.residual_gate` can gate -- which matters because a Krylov
+    method can break down on ``A^T`` while converging on ``A``, and the last iterate then comes back
+    as a plausible gradient.
+
+    ``_bicgstab_jacobi`` stays jitted and is called from inside the firewall's traced callbacks, so
+    the compiled-iteration win it exists for (16x at n=13861) is untouched. The transposed operator
+    keeps the same Jacobi preconditioner: ``diag(A^T) == diag(A)``.
+    """
+    from .utils.solver.solver_api import residual_gate
+
+    who = "fem.solve default (Jacobi-preconditioned BiCGStab)"
+    AT = A.T
+    mv, mvT = (lambda v: A @ v), (lambda v: AT @ v)
+    fwd = lambda _mv, rhs: residual_gate(mv, rhs, _bicgstab_jacobi(A, rhs, tol, maxiter), who, side="forward")
+    rev = lambda _mv, rhs: residual_gate(mvT, rhs, _bicgstab_jacobi(AT, rhs, tol, maxiter), who, side="transpose")
+    return jax.lax.custom_linear_solve(mv, b, fwd, transpose_solve=rev)
 
 
 def lag(expr: Any) -> Any:
