@@ -2,7 +2,7 @@
 
 `jno.rcwa` is an **optional** solver for **periodic, layered** electromagnetic structures — the
 canonical case being an extruded metasurface unit cell (a patterned dielectric slab between two
-semi-infinite ambients). Unlike [`jno.fem`](fem.md), which discretises the whole volume, RCWA is
+semi-infinite ambients). Unlike [`jno.fem`](fem/index.md), which discretises the whole volume, RCWA is
 *semi-analytic in the propagation direction*: each layer is expanded in a truncated in-plane Fourier
 basis, solved by an eigenmode decomposition, and the layers are stitched with a scattering matrix. For
 a periodic slab that is far cheaper than a full 3-D complex-Helmholtz solve.
@@ -17,7 +17,7 @@ pip install jax-numerical-operators[rcwa]      # or:  pixi run -e rcwa ...
 
 ## The front door — infer the problem from a jNO constraint list
 
-Hand `jno.rcwa` the **same constraint list you would give [`jno.fem`](fem.md)** (or an already-built
+Hand `jno.rcwa` the **same constraint list you would give [`jno.fem`](fem/index.md)** (or an already-built
 `FEM`). Nothing else is required — it reads everything out of the traced problem:
 
 ```python

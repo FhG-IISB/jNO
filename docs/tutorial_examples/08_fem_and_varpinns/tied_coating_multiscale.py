@@ -26,7 +26,7 @@ geometry, fragmenting the two bodies into one mesh gives:
 i.e. it under-resolves the layer you care about *and* over-refines the bulk you do not. Meshing each
 body independently and gluing them with a tie ``u(A) - u(B)`` gets both right. The two interface
 surfaces then carry different node layouts, so ``jno.fem`` couples them with a **mortar** (integrated)
-constraint rather than node-to-node matching -- see ``docs/fem.md``, "Tying two boundaries".
+constraint rather than node-to-node matching -- see ``docs/fem/boundary-conditions.md``, "Tying two boundaries".
 
 Verified against the exact series-resistance solution above, at the interface and at the top surface.
 """

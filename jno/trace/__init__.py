@@ -941,7 +941,7 @@ class Placeholder:
 
         The residual must be written in the standard variational orientation ``a(u,v) - L(v)`` (the
         gradient of an energy), which is what fixes the sign of the multiplier above. A form written
-        with the opposite sign states a different inequality — see ``docs/fem.md``."""
+        with the opposite sign states a different inequality — see ``docs/fem/boundary-conditions.md``."""
         return BoundConstraint(self, lo, hi)
 
     def evolves(self, formula) -> "StateUpdate":

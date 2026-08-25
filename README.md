@@ -39,24 +39,40 @@ optimization, and a neural-network coefficient are one composition away from a
 forward solve — no glue code, no finite differences, no leaving JAX.
 
 > [!NOTE]
-> Research-level repository under active development. The public API is stabilising but may change between minor versions. Parts of the numerical-methods stack are marked *experimental* below — the scope and known limitations are stated on each docs page.
+> Research-level repository under active development. The public API is stabilising but may change between minor versions. Parts of the numerical-methods stack are marked *experimental* in the feature matrix below — the scope and known limitations are stated on each docs page.
 
 ## What you can do with jNO
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/overview-dark.svg">
+    <img src="assets/overview-light.svg" width="100%"
+         alt="jNO overview: the five-stage workflow from geometry to result, and the modules of the two pillars"/>
+  </picture>
+</p>
+
+Five stages, four front doors, one graph. Every module named above is public API;
+the matrix below is the same map with a maturity label and a docs link per feature.
+
+<details>
+<summary><strong>Feature matrix</strong> — maturity and per-feature docs links (click to expand)</summary>
+
+<br>
 
 ### Pillar 1 — Differentiable numerical methods
 
 | Capability | Maturity | Notes |
 |------------|----------|-------|
 | **FEM, nodal** — `jno.fem` | [stable](https://fhg-iisb.github.io/jNO/fem/) | Lagrange P1 / P2 / P3+, **2-D & 3-D**; steady (linear + Newton), transient (θ-method), **second-order-in-time** (wave / elastodynamics), complex, periodic, coupled multifield |
-| **FEM, non-nodal** — H(div) / H(curl) / C¹ | [experimental](https://fhg-iisb.github.io/jNO/fem/#non-nodal-element-families-hdiv-and-hcurl) | **Raviart–Thomas** (H(div)) and **Nédélec edge** (H(curl) — Maxwell, eddy currents) elements; **C¹ Hermite / Argyris / Morley** (plates, biharmonic) |
+| **FEM, non-nodal** — H(div) / H(curl) / C¹ | [experimental](https://fhg-iisb.github.io/jNO/fem/elements/) | **Raviart–Thomas** (H(div)) and **Nédélec edge** (H(curl) — Maxwell, eddy currents) elements; **C¹ Hermite / Argyris / Morley** (plates, biharmonic) |
 | **FDM** — `jno.fdm` | [stable](https://fhg-iisb.github.io/jNO/fdm/) | Strong-form collocation from a term list; **structured grids + geometric multigrid**; unstructured meshes; periodic, coupled, flux BCs; 2-D & 3-D |
 | **Spectral / RCWA** — `jno.rcwa` | [stable](https://fhg-iisb.github.io/jNO/rcwa/) | Vector-Maxwell RCWA, anisotropic media, Jones / polarization readout |
-| **Linear & nonlinear solvers** — `jno.solve` / `jno.precond` | [stable](https://fhg-iisb.github.io/jNO/) | Sparse-direct LU, Jacobi-BiCGStab, GMRES, CG, MINRES, Chebyshev, geometric multigrid, optional GPU **AMG** — matrix-free and differentiable |
-| **Generalized eigenproblems** — `fem.eigs` | [beta](https://fhg-iisb.github.io/jNO/) | `K x = λ M x`, differentiable, M-orthonormal |
-| **Time integration** | [stable](https://fhg-iisb.github.io/jNO/) | θ-method (backward-Euler / Crank–Nicolson), exponential integrators, adaptive step size |
-| **Adaptive meshing** — `jno.solve.remesh` / `relocate`, and `coord.d(t) - v` as a term | [beta](https://fhg-iisb.github.io/jNO/) | Hessian-metric remeshing (AFEM), r-adaptivity, moving meshes stated in the term list |
+| **Linear & nonlinear solvers** — `jno.solve` / `jno.precond` | [stable](https://fhg-iisb.github.io/jNO/solvers/) | Sparse-direct LU, Jacobi-BiCGStab, GMRES, CG, MINRES, Chebyshev, geometric multigrid, optional GPU **AMG** — matrix-free and differentiable |
+| **Generalized eigenproblems** — `fem.eigs` | [beta](https://fhg-iisb.github.io/jNO/API/#solvers-and-preconditioners) | `K x = λ M x`, differentiable, M-orthonormal |
+| **Time integration** | [stable](https://fhg-iisb.github.io/jNO/fdm/) | θ-method (backward-Euler / Crank–Nicolson), exponential integrators, adaptive step size |
+| **Adaptive meshing** — `jno.solve.remesh` / `relocate`, and `coord.d(t) - v` as a term | [beta](https://fhg-iisb.github.io/jNO/fem/geometry/) | Hessian-metric remeshing (AFEM), r-adaptivity, moving meshes stated in the term list |
 | **Differentiable inverse / PDE-constrained** | [stable](https://fhg-iisb.github.io/jNO/tutorials/05-coupled-and-inverse/inverse-parameter/) | Recover a scalar, a field `k(x)`, the geometry, or a **neural coefficient** through any solve — the gradient flows through the whole march |
-| **Geometry** — `jno.Shape` / `jno.Path` | [stable](https://fhg-iisb.github.io/jNO/) | CSG via gmsh-OCC; conforming multi-material regions |
+| **Geometry** — `jno.Shape` / `jno.Path` | [stable](https://fhg-iisb.github.io/jNO/Domain-and-Geometry/) | CSG via gmsh-OCC; conforming multi-material regions |
 
 ### Pillar 2 — Scientific machine learning
 
@@ -75,7 +91,9 @@ forward solve — no glue code, no finite differences, no leaving JAX.
 | W&B logging + Orbax checkpointing | [stable](https://fhg-iisb.github.io/jNO/tutorials/09-wandb/wandb-integration/) | |
 | IREE / MLIR compiled inference for deployment | [stable](https://fhg-iisb.github.io/jNO/model-controls/iree/) | |
 
-**One tracing language bridges the two.** A weak form, a strong-form stencil, a PDE residual for a network, and a supervised loss all lower to the same differentiable, `jit`-compiled graph — so a classical solve, a PINN, and an inverse problem *compose* rather than living in separate stacks. 29 worked tutorials span elliptic, parabolic, hyperbolic, coupled, inverse, integral, stochastic, FEM / variational, Bayesian, and operator-learning problems — browse the [tutorials index](https://fhg-iisb.github.io/jNO/#tutorials).
+</details>
+
+**One tracing language bridges the two.** A weak form, a strong-form stencil, a PDE residual for a network, and a supervised loss are all the same kind of object here — so a classical solve, a PINN, and an inverse problem *compose* rather than living in separate stacks. 33 worked tutorials span elliptic, parabolic, hyperbolic, coupled, inverse, integral, stochastic, FEM / variational, Bayesian, and operator-learning problems — browse the [tutorials index](https://fhg-iisb.github.io/jNO/#tutorials).
 
 ## Install
 

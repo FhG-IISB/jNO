@@ -1,0 +1,143 @@
+# Limits, build time, and worked examples
+
+## Worked examples
+
+The [FEM tutorials](../tutorials/08-fem-and-varpinns/poisson-2d-fem.md) cover every pattern above:
+Poisson, mixed Dirichlet/Robin reaction–diffusion, a nonlinear Allen–Cahn interface, mixed-BC
+Helmholtz, a linear-elastic cantilever, Stokes channel flow, transient heat, two inverse problems (a
+hidden diffusivity field and a transient rate), two **second-order-in-time** wave examples (a vibrating
+membrane and a vector-elastodynamics cantilever), the non-nodal **H(div) mixed Poisson** and **H(curl)
+Maxwell / eddy-current** examples, and a **variational PINN** (a neural trial in the same weak form).
+
+---
+
+## Build time: what to expect, and the one knob
+
+`jno.fem([...])` **fully assembles** the operator — it returns concrete matrix values, which is why
+`fem.solve()` is then only the linear solve (measured **7 ms** on 3-D Poisson at 27,833 nodes). Some
+libraries instead defer assembly into their solve; that makes their "build" look faster and their
+solve slower, so compare **build + solve**, and remember jNO assembles *once* while a per-solve
+assembler pays again on every Newton iteration.
+
+Most of a cold build is **XLA compilation**, and the cost is fixed per problem *structure* rather than
+per DOF — a 15x larger mesh still compiles about the same number of programs. Two caches attack it,
+both **on by default**:
+
+**Across processes** — the persistent XLA cache (`~/.cache/jno/xla`), enabled at `import jno`:
+
+| 3-D Poisson, 27,833 nodes | first build | repeat build |
+|---|---|---|
+| no cache | 4.75 s | 2.48 s |
+| persistent cache (default) | **2.22 s** | **1.51 s** |
+
+The very first run on a machine is *slower* (populating the cache costs more than not having one);
+it pays back from the second process onward, which is jNO's normal life — sweeps, optimisation
+loops, test suites, re-running a script after an edit. Opt out with `JNO_COMPILE_CACHE=0`,
+`jno.setup(__file__, compile_cache=False)`, or per project in `.jno.toml`: `[jno] compile_cache =
+false`.
+
+**Within a process** — rebuilding an *identical* problem (same mesh content, same terms) reuses the
+already-compiled assembly kernels outright, keyed on content rather than object identity, so a
+rebuild costs meshing plus host prep and **no XLA work at all** (measured: 1.94 s → 0.28 s on 3-D
+Poisson at 29k nodes). Anything that changes the operator — a different mesh, a different
+coefficient — recompiles exactly the kernels that bake it. Structure that a tokenizer cannot key by
+value simply never caches (a safe miss); the coverage is measurable, not guessed
+(`jno.utils.solver.fem_utils._ELEM_MAP_STATS`).
+
+---
+
+## Known limitations
+
+Almost every boundary below is an explicit, fail-loud `NotImplementedError`. **Two are not, and say so
+in place**: affine (straight-edge) geometry on a curved boundary, and the `2πr` measure on an
+axisymmetric *vector* form — both are cases the assembler cannot distinguish from a legitimate choice,
+so they are stated where you make that choice rather than enforced. These apply when you **assemble a
+weak form** or solve a **transient problem through the time route** — the residual-PINN path is
+unaffected. Full detail is inline in the sections above.
+
+- **Transient mass terms must be parameter-free** — put affine trainable parameters on the stiffness /
+  residual, not on `u_t * phi`.
+- **Second-order in time (`u_tt`) is scoped** to nodal Lagrange, 1D/2D/3D, scalar or vector. A
+  **nonlinear spatial** operator (sine-Gordon, cubic Klein–Gordon, large-deformation elastodynamics)
+  *is* supported — Newton on the augmented `[u; v]` block — but the **temporal** side must stay linear:
+  a state-dependent mass or damping `c(u)·u_tt` is refused, since `M2`/`C` are extracted by
+  differentiating at `u=0` and would otherwise be frozen there. A **coupled** 2D/3D system flows
+  through the *same* assembler as a single field, so damping, the nonlinear path and a driven
+  boundary `g(x,t)` compose with coupling; what a coupled form still refuses: a field with **no**
+  `u_tt` term (its velocity rows would be singular), **runtime parameters** (the parametric coupled
+  steady assembly underneath is not wired), and periodic ties. Time-varying Dirichlet is refused on
+  nonlinear forms. A **complex coefficient** on any `u_tt` form is refused by name — it used to be
+  silently cast to real (write the problem first-order in time; the complex transient is supported).
+  A coupled 1D system carries `u_tt` on narrower terms (linear, undamped): the augmented state is
+  `[u_all; v_all]`, so `fem.offsets` lists the displacement blocks then the velocity blocks.
+- **Reduced-order (`basis=`) solves** cover steady and **first-order transient** (linear and
+  nonlinear). Second-order-in-time (`u_tt`), complex, and periodic-tied problems refuse, each with its
+  own reason. Nonlinear reduces, but without hyper-reduction that is a memory win, not a speed one.
+- **Runtime Dirichlet parameters** work on the steady linear, steady nonlinear, and linear transient
+  paths: a trainable `jno.np.parameter` may sit in an essential value (`u(top) - g`, or scaling a
+  coordinate profile `u(top) - g*sin(pi*x)`), and the boundary value is recovered from data like any
+  other parameter — `∂b/∂g` flows through the symmetric elimination (linear), and `∂/∂g` through the
+  solve's / each step's `custom_root` (nonlinear / transient). NOT supported, refused loudly: a value
+  that is **both** parametric and t/τ-dependent (`u(top) - g*tau` — train the amplitude through a
+  Neumann/body term instead). A FIELD-sized optimizer-less parameter stays the nodal data-field value
+  (a neighbour's field in a DD solve), gathered per node.
+- **Affine parameter lowering expects a single, direct factor** — one trainable scalar per additive
+  term (`nu * grad(u)·grad(phi)`), not nested or buried in a nonlinear expression.
+- **Enclosure radiation is a composition, not an auto-detected term** — it is 2D / axisymmetric and
+  needs a direct linear solve; you write the radiosity and couple it yourself.
+- **Plasticity is small-strain, isotropic, linear-hardening, whole-domain.** Deformation theory
+  (monotonic / proportional) and the path-dependent flow-theory **`tau=` load-path march** both run
+  today; the march assembles on the real, steady native-Lagrange path — **single-field or coupled**
+  (not transient / complex / 1D / non-nodal / periodic — each rejected with a clear error). The
+  internal-state readout runs on every cell (sub-region-restricted plasticity is not wired). Kinematic /
+  nonlinear (Voce) hardening and contact are separate formulas / machinery, not built.
+
+- **Geometry is affine (straight-edge) at every order** — there is no isoparametric mapping, so on a
+  **curved boundary** the domain itself is approximated to O(h²) and that error caps every element
+  order above it. This one is *not* fail-loud: the solve is silently suboptimal. Measured on the unit
+  disk (`-Δu = 4`, `u|∂Ω = 0`, exact `u* = 1 − r²`), L2 rates under refinement:
+
+  | order | expected | measured | error at `h = 0.05` |
+  |---|---|---|---|
+  | P1 | 2 | **2.00** | 1.14e-03 (1 536 dofs) |
+  | P2 | 3 | **2.02** | 7.46e-04 (6 015 dofs) |
+  | P3 | 4 | **2.01** | 7.40e-04 (13 438 dofs) |
+
+  P3 buys *nothing* over P2 on a curved domain — 13 438 dofs for the same answer — and both are barely
+  ahead of P1. The cap comes from imposing the boundary condition at straight-edge nodes that sit on the
+  chord, O(h²) inside the true arc. On a **polygonal** domain the advertised rates hold exactly (the
+  suite measures P2/P3 there). Until an isoparametric mapping exists, prefer `h`-refinement (or the
+  adaptive loop) over `order ≥ 2` near curved boundaries.
+- **Element order on a non-nodal family is refused, not applied** — RT/N1E/P0/Hermite/Argyris/Morley
+  each have one intrinsic order. `space="N1E", order=2` used to return the same lowest-order space
+  silently; it now raises. The mesh is the only accuracy knob on an H(curl)/H(div) problem — see
+  *Mesh resolution for wave problems* for what a given points-per-wavelength buys, measured.
+- **`jno.solve.eigs` / `FEM.eigs` route on the operator's actual symmetry.** A symmetric pencil takes
+  the symmetric reductions (real spectrum, differentiable). A genuinely non-self-adjoint operator is
+  routed to **ARPACK/Arnoldi** (Lehoucq & Sorensen 1996) and returns the **complex** spectrum it
+  actually has — the case that matters for stability problems (resistive MHD growth rates, drift
+  waves, anything with a mean flow), where the sign of the growth rate *is* the physics. Neither path
+  ever returns the spectrum of `½(K+Kᵀ)` as though it were the answer. The routing probe is a
+  randomized bilinear test and is concrete-only, so **under `jit` the symmetric path is assumed**.
+  Limits of the non-symmetric path, which are real: **the eigenvalues are differentiable in reverse
+  mode** — `dλ = wᴴ(dA − λ dB)v / (wᴴBv)` for a simple eigenvalue (Wilkinson 1965 ch. 2), with the left
+  eigenvector obtained by inverse iteration on `(A − λᵢB)ᴴ`, verified against finite differences to
+  1e-09 — but the **eigenvectors are not**, and differentiating through them yields **NaN** rather than
+  the silent zero a plain callback would give. A **defective** eigenvalue has no derivative at all (its
+  perturbation series runs in `√ε`) and is detected via the eigenvalue condition number, giving NaN
+  instead of the enormous finite number the formula would otherwise produce. Because that guard is a
+  `custom_vjp`, **forward mode (`jax.jvp`/`jacfwd`) is unavailable here** — use `jax.grad`/`jacrev`. It
+  accepts `linear=jno.solve.lu(backend="pardiso"/"cudss"/"host")` to drive ARPACK's shift-invert
+  factorization — those kernels are plain numpy functions, so ARPACK can call them from host code —
+  but refuses `backend="device"` (a JAX primitive), the Krylov solvers, and `precond=` rather than
+  ignoring them. **`linear=` is opt-in because it is not always a win:** ARPACK applies the inverse
+  ~50–70 times, so it trades one fast factorization against per-application overhead — measured with
+  PARDISO, **0.72× at n=3,000** (slower) but **10.05× at n=20,000** (21.6 s vs 217 s). Finally it needs
+  `k < n-1`, smaller pencils taking an exact dense `scipy.linalg.eig`. Order with `which="LR"`/`"SR"` (real part — the growth rate) or
+  target an interior region with `sigma=`.
+- **Axisymmetric `(r, z)` VECTOR forms are your responsibility, and this one is *not* fail-loud** —
+  the `2πr` measure is exact for scalars and wrong for vectors (elasticity hoop strain; and for vector
+  Maxwell the cylindrical curl's own `1/r` terms plus the meridional/azimuthal decoupling). jNO ships
+  no axisymmetric H(curl)/H(div) element, and multiplying by `r` is arithmetic the assembler cannot
+  distinguish from a legitimate radial coefficient, so nothing raises. Use a full 3-D mesh for vector
+  Maxwell, or write the cylindrical operator out yourself. See *Axisymmetric (bodies of revolution)*.

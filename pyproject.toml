@@ -235,3 +235,6 @@ plotly = ">=6.9.0,<7"
 # symmetric (LDLᵀ) branch is otherwise untestable locally.
 [tool.pixi.feature.fem.pypi-dependencies]
 pypardiso = ">=0.4.4"
+
+[tool.pixi.feature.rcwa.dependencies]
+matplotlib = ">=3.11.0,<4"

@@ -269,7 +269,7 @@ def test_nedelec_tet_field_parameter_kx_matches_analytic_and_differentiates():
 
 @pytest.mark.slow
 def test_nedelec_cavity_resolution_guidance_holds():
-    """Pins the *documented* mesh-resolution guidance for wave problems (docs/fem.md, "Mesh resolution
+    """Pins the *documented* mesh-resolution guidance for wave problems (docs/fem/elements.md, "Mesh resolution
     for wave problems"), since N1E is lowest-order-only and the mesh is the sole accuracy knob.
 
     Deliberately NOT a tight convergence-rate assertion: gmsh meshes at different ``h`` are unstructured

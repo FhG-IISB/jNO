@@ -52,6 +52,49 @@ Two patterns avoid the moving-target problem:
   substep 0 trains the surrogate, substep 1 runs one NUTS proposal with the
   surrogate `stop_gradient`-ed.
 
+**Train, then freeze, in full.** The whole pattern is two `jno.core` calls with a
+`freeze()` between them — the first fits the surrogate, the second samples the
+coefficient against the now-fixed forward map:
+
+```python
+import jax, jax.numpy as jnp, numpy as np, optax, blackjax, foundax, jno
+
+π, LAMBDA, K_TRUE = jnp.pi, 0.1, 2.0
+
+d = jno.Path(0.0, 0.0).line_to(1.0, 0.0).curve(size=0.05).domain()
+x, _ = d.variable("interior")
+x_np = np.asarray(d.context["interior"]).reshape(-1, 1)
+u_obs = jnp.asarray(np.sin(π * x_np) + 0.02 * np.random.default_rng(0).normal(size=x_np.shape))
+f_known = (LAMBDA * π**2 + K_TRUE) * jno.np.sin(π * x)     # a known physical input
+
+# ── phase 1: fit the surrogate to the noisy data ─────────────────────────────
+u_net = jno.nn(foundax.mlp(1, output_dim=1, hidden_dims=32, num_layers=3,
+                           key=jax.random.PRNGKey(0)))
+u_net.optimizer(optax.adam(2e-3))
+u = u_net(x) * x * (1 - x)                        # hard u(0) = u(1) = 0
+jno.core([(u - u_obs).mse]).solve(1500)
+
+# ── phase 2: freeze it, then sample k against the now-FIXED forward map ──────
+u_net.freeze()          # ⇒ fixed-target posterior ⇒ window adaptation is well-defined
+k = jno.np.parameter((1,), name="k").initialize(jax.nn.initializers.constant(1.0))
+k.bayesian(blackjax.nuts, step_size=1e-2, warmup=150, keep=300,
+           num_chains=4,        # 4 chains ⇒ a meaningful R-hat
+           init_jitter=0.5)     # over-disperse the starts so R-hat stays conservative
+
+uf = u_net(x) * x * (1 - x)
+residual = (-LAMBDA * uf.dd(x) + k * uf - f_known) / 0.05   # −λu″ + k u − f = 0
+jno.core([residual.mse]).solve(450)
+
+# ── read the chain ──────────────────────────────────────────────────────────
+ch = k.posterior_samples                            # (num_chains, keep, 1)
+lo, hi = jnp.quantile(ch.reshape(-1), jnp.array([0.05, 0.95]))
+print(jnp.mean(ch), lo, hi, jno.bayesian.rhat(ch))
+```
+
+Run as written this gives `k = 2.028`, a 90 % CI of `[1.943, 2.112]` covering the truth
+`2.0`, and R-hat `1.004`. [Tutorial 01](./bayesian-inverse-coefficient.md) is the same
+pattern with a longer fit and a longer chain, plus the calibration diagnostics.
+
 ## How to read the chain output
 
 For every Bayesian model the chain is on `model.posterior_samples`

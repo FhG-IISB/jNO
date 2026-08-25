@@ -1,6 +1,6 @@
 # Finite Difference Method
 
-`jno.fdm` is the **strong-form sibling** of [`jno.fem`](fem.md). You write the PDE and its boundary
+`jno.fdm` is the **strong-form sibling** of [`jno.fem`](fem/index.md). You write the PDE and its boundary
 and initial conditions as the *same* kind of constraint list — but instead of a weak form with test
 functions and quadrature, the **strong residual** is collocated at the mesh nodes with
 finite-difference stencils. There is no test function, no mass matrix, and no quadrature, so it is

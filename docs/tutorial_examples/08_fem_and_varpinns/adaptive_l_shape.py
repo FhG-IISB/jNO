@@ -131,7 +131,7 @@ n_h = len(sol_h)
 #     for a Ritz method E_h - E_exact = 1/2||u - u_h||_E^2, so minimising the energy at fixed DOFs
 #     IS minimising the energy-norm error. That is the right objective for a fixed singularity like
 #     this corner. The default (`"equidistribution"`) instead equidistributes an arclength monitor,
-#     which wins on a moving or under-resolved FRONT and loses here -- see docs/fem.md. The interior
+#     which wins on a moving or under-resolved FRONT and loses here -- see docs/fem/geometry.md. The interior
 #     vertices were tagged `.trainable()` in build(); the driver moves them (no new DOFs) and returns the solve.
 d_r, fem_r = build(0.12, movable=True)
 pts_r0 = np.asarray(d_r.mesh.points)[:, :2].copy()  # coarse start, for the animation

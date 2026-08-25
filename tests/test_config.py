@@ -188,7 +188,7 @@ def test_setup_turns_the_compile_cache_on_by_default(tmp_path, monkeypatch, _res
     jNO's normal life is the repeated run, so the persistent cache is ON unless opted out —
     `JNO_COMPILE_CACHE=0`, `[jno] compile_cache = false`, or `setup(compile_cache=False)`. This test
     used to pin the opposite ('must not write to a user's disk unless asked'); the populate-cost
-    caveat it guarded is now documented in `enable_compile_cache` and docs/fem.md instead."""
+    caveat it guarded is now documented in `enable_compile_cache` and docs/fem/limitations.md instead."""
     import jax
 
     import jno

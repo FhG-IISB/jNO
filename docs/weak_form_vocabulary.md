@@ -90,4 +90,4 @@ conditionals, non-local integrals, the geometry symbols, and the full tensor cal
 
 `fem.term_kinds` (provisional) classifies each PDE term — `is_local` (pointwise reaction/mass) vs.
 global (neighbour-coupling diffusion/advection), its temporal order, trial/test gradient channel,
-and linearity — the basis for operator-splitting routing. See [`fem.md`](fem.md).
+and linearity — the basis for operator-splitting routing. See [`fem.md`](fem/index.md).

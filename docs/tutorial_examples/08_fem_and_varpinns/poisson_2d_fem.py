@@ -9,7 +9,7 @@ A pure finite-element solve: write the weak form as a list of residual terms (vo
 and solve with ``fem.solve()``. The default is a matrix-free Jacobi-preconditioned BiCGStab on
 the sparse operator (never densifies); the solver slots choose anything else, e.g. CG for this
 SPD system: ``fem.solve(linear=jno.solve.cg(), precond=jno.precond.jacobi())`` -- see
-``docs/fem.md`` "Choosing the solver".
+``docs/solvers.md``.
 """
 
 import jax.numpy as jnp

@@ -1250,7 +1250,7 @@ class FEM:
         """Per-field DOF ``slice``s into the flat solution (``None`` without block structure).
 
         The structural handle block preconditioners build on: ``jno.precond.block_diag`` /
-        ``triangular`` resolve their field arguments to these slices (see ``docs/fem.md``)."""
+        ``triangular`` resolve their field arguments to these slices (see ``docs/solvers.md``)."""
         off = self.offsets
         if off is None:
             return None

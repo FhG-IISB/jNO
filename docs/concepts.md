@@ -28,13 +28,52 @@ graph**, so they compose freely and differentiate uniformly:
   `jno.nn(...)` model, optimizer, and controls apply.
 - **FEM** — the weak form is a list of residual terms handed to `jno.fem([...])`, which assembles the
   operator and exposes a **differentiable** `fem.solve()` node you can drop straight into the graph.
-- **FDM** — the same derivative operators evaluate on the mesh via a finite-difference **scheme**
-  (`u.d(x, scheme="finite_difference")`) instead of autodiff.
+- **FDM** — `jno.fdm([...])` takes the **strong** form: the same term list with no test function,
+  collocated at the nodes. (Inside a PINN residual you can also switch a single derivative to a
+  finite-difference **scheme** with `u.d(x, scheme="finite_difference")`.)
 
 Because they are all nodes of one kind, you can mix them in a single `jno.core(...)` — a PINN residual, a
 FEM solve, and a data term together — and **inverse problems fall out for free**: put a trainable
 `jno.np.parameter` (or a whole network) anywhere in the graph, compare to data, and the gradient flows
 back through the derivatives, the solve, and the network in one differentiable pass.
+
+## Composition, concretely
+
+`fem.solve()` is a *node*, not a terminus — so it can sit inside a loss. Here a diffusivity is
+recovered by differentiating straight through the FEM solve. Note there is no adjoint to derive
+and no finite differences: the same `jno.core` that trains a network trains this.
+
+```python
+import jax.numpy as jnp
+import optax
+import jno
+
+d = jno.Shape.rect(0, 0, 1, 1, size=0.2).domain()
+xi, yi, _ = d.variable("interior", split=True)
+xb, yb, _ = d.variable("boundary", split=True)
+u, v = d.fem_symbols()
+ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+
+# Name the bilinear and linear forms once, then write the weak form as it reads on paper.
+a = lambda k, w, z: k * (w.x * z.x + w.y * z.y)      # ∫ k ∇u·∇v
+L = lambda z: 1.0 * z                                 # ∫ f v
+const = lambda c: (lambda *a, **kw: jnp.array([c]))
+
+# Synthetic observations from the true coefficient.
+k_true = jno.np.parameter((1,)).initialize(const(2.5)).freeze()
+u_obs = jnp.asarray(jno.fem([a(k_true, ui, vi) - L(vi), u(xb, yb) - 0.0]).solve())
+
+# The unknown coefficient — a trainable parameter sitting inside the weak form.
+k = jno.np.parameter((1,), name="k").initialize(const(1.0))
+k.optimizer(optax.adam(5e-2))
+
+fem  = jno.fem([a(k, ui, vi) - L(vi), u(xb, yb) - 0.0])
+crux = jno.core([(fem.solve() - u_obs).mse], domain=d)   # the solve IS the forward model
+crux.solve(400)                                          # k → 2.4999 (truth 2.5)
+```
+
+Swap `k` for a spatially varying field, for the mesh coordinates, or for `jno.nn(net)` and
+nothing else about the structure changes.
 
 ## The core vocabulary
 

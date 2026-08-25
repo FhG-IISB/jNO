@@ -85,7 +85,7 @@ crux = jno.core([pde.mse, reg.mean])
 ## Inverse problems through a FEM forward (`fem.solve`)
 
 When the forward model is a finite-element solve rather than a neural network, use
-`fem.solve()` as the differentiable forward (see [Finite Element Method](fem.md)). Put a
+`fem.solve()` as the differentiable forward (see [Finite Element Method](fem/index.md)). Put a
 `jno.np.parameter` in the weak form, compare the solve to data, and train through
 `crux.solve` — the gradient flows through the assembled solve to the parameter.
 

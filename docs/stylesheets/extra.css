@@ -34,11 +34,11 @@
 }
 
 .md-typeset table:not([class]) th {
-  background: color-mix(in srgb, var(--jno-brand-2) 22%, white);
+  background: color-mix(in srgb, var(--jno-brand-2) 22%, var(--md-default-bg-color));
 }
 
 .md-typeset table:not([class]) tr:hover {
-  background: color-mix(in srgb, var(--jno-brand-3) 55%, white);
+  background: color-mix(in srgb, var(--jno-brand-3) 55%, var(--md-default-bg-color));
 }
 
 .md-typeset table:not([class]) td code,
@@ -80,4 +80,13 @@
     width: 100%;
     text-align: center;
   }
+}
+
+/* Dark scheme: the brand tints are mixed against the page background above, but
+   the two light-tuned brand hues need to step back so text keeps its contrast. */
+[data-md-color-scheme="slate"] {
+  --jno-brand-1: #14b8a6;
+  --jno-brand-2: #0f766e;
+  --jno-brand-3: #7c3d0a;
+  --jno-text-soft: #9bb3ba;
 }
