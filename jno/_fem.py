@@ -4309,7 +4309,6 @@ def fem(
     constraints: Any,
     *,
     quad_degree: int = 2,
-    vec: Optional[int] = None,
     chunk: Any = None,
     _dd_overlap: bool = False,
 ) -> FEM:
@@ -4329,7 +4328,6 @@ def fem(
         out = _fem_impl(
             constraints,
             quad_degree=quad_degree,
-            vec=vec,
             _dd_overlap=_dd_overlap,
         )
         if chunk is not None and not _fn._CHUNK_CONSUMED[0]:
@@ -4349,7 +4347,6 @@ def _fem_impl(
     constraints: Any,
     *,
     quad_degree: int = 2,
-    vec: Optional[int] = None,
     _dd_overlap: bool = False,
 ) -> FEM:
     """Assemble a flat list of traced residuals into an :class:`FEM`.
@@ -4362,9 +4359,6 @@ def _fem_impl(
     quad_degree:
         Quadrature degree (forwarded to the quadrature setup). The element type is
         derived from the domain's dimension and the trial's ``order``.
-    vec:
-        Vector size of the unknown. ``None`` (default) infers it from the trial's
-        ``value_shape`` (scalar → 1, ``(2,)`` → 2, …); pass an int to override.
     chunk:
         Cells per chunk in the element assembly loop. ``None`` (the default) sizes it from the
         device — see below; ``False`` runs one ``vmap`` over every cell (the old behaviour); a
@@ -4403,7 +4397,7 @@ def _fem_impl(
     # remeshed in place -- the constraints reference the domain (not a mesh snapshot),
     # so re-tracing them picks up the refined mesh automatically.
     _orig_constraints = list(constraints)
-    _orig_fem_kwargs = {"quad_degree": quad_degree, "vec": vec}
+    _orig_fem_kwargs = {"quad_degree": quad_degree}
 
     # Gauge pins (`p.pin()`) remove a field's constant null space. Lower each to a single-node
     # Dirichlet `p(node) - value` *before* domain discovery and classification: a GaugePin is a
@@ -4588,8 +4582,10 @@ def _fem_impl(
                 )
 
     multifield = len(_field_keys(constraints)) > 1
-    if vec is None and not multifield:
-        vec = _infer_vec(constraints)  # single-field only (coupled fields carry per-field vec)
+    # Single field only -- a coupled form carries a per-field vec, resolved from each field's own
+    # value_shape downstream. There is no override: the trial's `value_shape` IS the vector size, the
+    # same way the domain's dimension and the trial's order fix the element type.
+    vec = None if multifield else _infer_vec(constraints)
 
     # Evolution terms ride the real, steady, native-Lagrange path — single field or coupled. The history
     # buffers are indexed by CELL, never by field, and the state readout gathers the concatenation of every
