@@ -118,7 +118,7 @@ The classical supports are just *which* of a node's two dofs are pinned:
 The slope condition rides the same `u.dn` essential-rotation channel the 2-D C¹ plate families use,
 so a beam and a plate are clamped by the same notation.
 
-!!! tip "Nodally exact for a uniform load"
+!!! measured "Nodally exact for a uniform load"
     To machine precision: a cantilever gives `qL⁴/8` at the tip and `qL³/6` for the tip slope;
     simply supported gives `5qL⁴/384` at mid-span; clamped-clamped `qL⁴/384`.
 

@@ -72,7 +72,7 @@ There is no closed-form field here, but four statements are exact and are assert
 | Mirror symmetry $T(+1)=T(-1)$ at normal incidence | $\approx 2\times10^{-8}$ |
 | Completeness: propagating orders sum to $T$ | $10^{-6}$ |
 
-!!! warning "The $\pm1$ symmetry floor does not improve with `orders`"
+!!! measured "The $\pm1$ symmetry floor does not improve with `orders`"
     $\lvert T(+1)-T(-1)\rvert$ measures $2.09\times10^{-8}$ at `orders=40` and $1.93\times10^{-8}$ at
     `orders=80` — it is **not** Fourier truncation. The $\pm1$ pair is degenerate at normal incidence
     and the modal eigensolve splits it at its own floor. Energy conservation, computed from the same

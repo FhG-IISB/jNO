@@ -76,7 +76,7 @@ path is unaffected.
     The internal-state readout runs on every cell; sub-region-restricted plasticity is not wired.
     Kinematic / nonlinear (Voce) hardening and contact are separate formulas / machinery, not built.
 
-??? danger "Curved boundaries: P3 buys nothing over P2 — measured"
+??? measured "Curved boundaries: P3 buys nothing over P2"
     There is no isoparametric mapping, so on a curved boundary the domain itself is approximated to
     O(h²) and that error caps every element order above it. Measured on the unit disk
     (`-Δu = 4`, `u|∂Ω = 0`, exact `u* = 1 − r²`), L2 rates under refinement:
@@ -102,7 +102,7 @@ path is unaffected.
     problems*](elements.md#mesh-resolution-for-wave-problems) for what a given points-per-wavelength
     buys, measured.
 
-??? note "`eigs` routing, differentiability, and when `linear=` pays"
+??? warning "`eigs` routing, differentiability, and when `linear=` pays"
     `jno.solve.eigs` / `FEM.eigs` route on the operator's **actual symmetry**. A symmetric pencil
     takes the symmetric reductions (real spectrum, differentiable). A genuinely non-self-adjoint
     operator goes to **ARPACK/Arnoldi** (Lehoucq & Sorensen 1996) and returns the **complex**
@@ -138,7 +138,7 @@ path is unaffected.
     It needs `k < n-1`; smaller pencils take an exact dense `scipy.linalg.eig`. Order with
     `which="LR"` / `"SR"` (real part — the growth rate) or target an interior region with `sigma=`.
 
-??? danger "Axisymmetric vector forms are your responsibility"
+??? warning "Axisymmetric vector forms are your responsibility"
     The `2πr` measure is exact for scalars and wrong for vectors — elasticity hoop strain, and for
     vector Maxwell the cylindrical curl's own `1/r` terms plus the meridional/azimuthal decoupling.
     jNO ships no axisymmetric H(curl)/H(div) element, and multiplying by `r` is arithmetic the
@@ -166,10 +166,11 @@ it, **both on by default**.
 
 Enabled at `import jno`, stored in `~/.cache/jno/xla`.
 
-| 3-D Poisson, 27,833 nodes | first build | repeat build |
-|---|---|---|
-| no cache | 4.75 s | 2.48 s |
-| persistent cache (default) | **2.22 s** | **1.51 s** |
+!!! measured "3-D Poisson, 27,833 nodes"
+    | | first build | repeat build |
+    |---|---|---|
+    | no cache | 4.75 s | 2.48 s |
+    | persistent cache (default) | **2.22 s** | **1.51 s** |
 
 The very first run on a machine is *slower* — populating the cache costs more than not having one.
 It pays back from the second process onward, which is jNO's normal life: sweeps, optimisation loops,

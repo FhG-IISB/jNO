@@ -90,3 +90,55 @@
   --jno-brand-3: #7c3d0a;
   --jno-text-soft: #9bb3ba;
 }
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   Callout palette — two project-specific admonition types on top of Material's.
+
+   `measured`  a benchmarked number. This library's docs live or die on measured
+               claims, so they get their own lane instead of being buried in prose.
+   `fun-fact`  a tangent worth knowing but safe to skip.
+
+   Both work open (`!!! measured`) and collapsed (`??? measured "..."`).
+   ───────────────────────────────────────────────────────────────────────────── */
+
+:root {
+  --md-admonition-icon--measured: url('data:image/svg+xml;charset=utf-8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M16,11.78L20.24,4.45L21.97,5.45L16.74,14.5L10.23,10.75L5.46,19H22V21H2V3H4V17.54L9.5,8L16,11.78Z"/></svg>');
+  --md-admonition-icon--fun-fact: url('data:image/svg+xml;charset=utf-8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12,1L9,9L1,12L9,15L12,23L15,15L23,12L15,9L12,1Z"/></svg>');
+  --jno-measured: #475569;   /* graphite: a measurement is a neutral fact, not advice */
+  --jno-funfact: #7c5cd0;
+}
+
+[data-md-color-scheme="slate"] {
+  --jno-measured: #94a3b8;
+  --jno-funfact: #b9a5f5;
+}
+
+.md-typeset .admonition.measured,
+.md-typeset details.measured {
+  border-color: var(--jno-measured);
+}
+.md-typeset .measured > .admonition-title,
+.md-typeset .measured > summary {
+  background-color: color-mix(in srgb, var(--jno-measured) 12%, transparent);
+}
+.md-typeset .measured > .admonition-title::before,
+.md-typeset .measured > summary::before {
+  background-color: var(--jno-measured);
+  -webkit-mask-image: var(--md-admonition-icon--measured);
+  mask-image: var(--md-admonition-icon--measured);
+}
+
+.md-typeset .admonition.fun-fact,
+.md-typeset details.fun-fact {
+  border-color: var(--jno-funfact);
+}
+.md-typeset .fun-fact > .admonition-title,
+.md-typeset .fun-fact > summary {
+  background-color: color-mix(in srgb, var(--jno-funfact) 12%, transparent);
+}
+.md-typeset .fun-fact > .admonition-title::before,
+.md-typeset .fun-fact > summary::before {
+  background-color: var(--jno-funfact);
+  -webkit-mask-image: var(--md-admonition-icon--fun-fact);
+  mask-image: var(--md-admonition-icon--fun-fact);
+}
