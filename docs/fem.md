@@ -1710,7 +1710,7 @@ preconditioner never changes the converged solution, only the speed, so specs ne
 * `jno.precond.block_diag((field, spec), …)` / `jno.precond.triangular((field, spec), …)` — per-field
   composition over `fem.blocks`. `triangular` is the standard saddle-point shape: last block solved
   first, substituted back through the assembled off-diagonal matvecs.
-* `jno.precond.saddle(mass_weight=…)` — that standard shape as **one call**, for the common case.
+* `jno.precond.saddle(mass_weight=…, laplace_weight=…)` — that standard shape as **one call**, for the common case.
   It finds the constraint block *structurally* (the field with no diagonal entry — the same detection
   behind the saddle-system warning), puts `amg()` on the momentum block and a weighted pressure
   **mass** matrix on the constraint block, and assembles that mass on the domain's own P1 space, so
@@ -1720,12 +1720,24 @@ preconditioner never changes the converged solution, only the speed, so specs ne
   wrong weight changes convergence *speed* only, never the answer. Pair with `jno.solve.fgmres`;
   `minres` does not apply (block-upper-triangular is nonsymmetric). Needs `pyamg`, and refuses by
   name on a non-saddle system or a constraint field that is not P1 — for anything outside that,
-  compose `triangular` yourself. **Pure-Stokes approximation:** a strong reaction term (Brinkman /
-  Darcy drag, or the `1/dt` mass of a small implicit step) makes the Schur complement stop looking
-  like a mass matrix, and the mesh-robustness degrades — measured on a 2-D Brinkman channel at
-  `μ=1`, preconditioned GMRES went 73 → 76 → 140 → 452 iterations as `α` went `0 → 1e2 → 1e3 → 1e4`.
-  That regime wants the Cahouet–Chabard mass-*plus*-Laplacian approximation (Cahouet & Chabard,
-  *IJNMF* **8**, 869–895, 1988), which `saddle()` does not build.
+  compose `triangular` yourself. **The mass matrix alone is the pure-Stokes approximation:** a strong
+  reaction term (Brinkman / Darcy drag, or the `1/dt` mass of a small implicit step) makes the Schur
+  complement stop looking like a mass matrix, and the mesh-robustness degrades. `laplace_weight`
+  switches to the **Cahouet–Chabard** approximation, a pressure mass *plus* a pressure Laplacian,
+  `S⁻¹ ≈ μ·M_p⁻¹ + α·L_p⁻¹` (Cahouet & Chabard, *IJNMF* **8**, 869–895, 1988, §3). Both weights are
+  the **reciprocal of the coefficient the term stands for**, so `mass_weight=1/μ` and
+  `laplace_weight=1/α`. Measured through this spec on a 2-D Brinkman channel (`μ=1`, `mesh_size=0.12`,
+  preconditioned GMRES to 1e-8, `restart=200`): `α = 0 / 1e2 / 1e3 / 1e4` → **83 / 135 / 503 / 2312**
+  with the mass alone, **83 / 60 / 76 / 74** with Cahouet–Chabard. The point is the *flatness*, not the
+  31× at `α=1e4` — the count stops tracking `α`. The same collapse appears with the momentum block
+  inverted exactly instead of by AMG (31 / 63 / 134 / 189 → 31 / 26 / 25 / 24), which is how you can
+  tell it is the Schur approximation doing the work and not the multigrid. At `α=0` the two are the
+  same preconditioner — that column is one number measured twice — so leave `laplace_weight` at its
+  `None` default on pure Stokes and the Laplacian is never assembled. The pressure Laplacian is pure-Neumann
+  and therefore **singular** — and a sparse LU of it factors happily and then applies nonsense, so the
+  auxiliary carries its own gauge pin and the applier projects the constant out on both sides. It is
+  derived for a *constant* `α`; a spatially varying drag (topology optimisation's `α(ρ)`) takes a
+  representative scalar and degrades gracefully rather than failing.
 * `jno.precond.amg(cycles=…)` — **hybrid algebraic multigrid**: setup once on the host via the *optional*
   `pyamg` (Vaněk, Mandel & Brezina, *Computing* 56, 1996; PyAMG — Bell et al., *JOSS* 8(87), 2023),
   applied as a pure-JAX V-cycle with Chebyshev smoothing (Adams et al., *JCP* 188, 2003). The apply is
@@ -1767,7 +1779,16 @@ Give FGMRES enough `restart`: the default `restart=30` **stagnates** on a 3-D Ta
 preconditioner and does so quietly — it still returns, just slower and less accurate. Measured at
 4302 dofs, `tol=1e-10`: `restart=30` → 2.30 s for 3.3e-6; `restart=150` → 0.49 s for 3.3e-9. On
 3-D Stokes this is what makes the recipe overtake a direct factorisation — measured crossover at
-~15k dofs, and 3.4× faster (23.2 s → 6.9 s) at 41k, where LU's fill-in also costs more memory.
+~15k dofs, and 3.4–3.9× faster (23.2 s → 5.9–6.9 s over repeat runs) at 41k, where LU's fill-in also
+costs more memory. `benchmarks/saddle_scaling.py` runs that sweep.
+
+On a **reaction-dominated** system — Brinkman/Darcy drag, or a small implicit time step — add the
+Laplacian leg, and the iteration count stops tracking the reaction coefficient:
+
+```python
+sol = fem.solve(linear=jno.solve.fgmres(tol=1e-10, restart=150),
+                precond=jno.precond.saddle(mass_weight=1.0/mu, laplace_weight=1.0/alpha))
+```
 
 **Picard / lagged coefficients — `jno.lag`.** When a solution-dependent coefficient's Newton tangent
 destroys the linearized system's structure (the classic case: a shear-thinning viscosity `μ_eff(u)` in
