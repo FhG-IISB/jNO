@@ -5101,8 +5101,10 @@ def _fem_impl(
                 )
             # Both legs share one Dirichlet row set, which imposes `Re u = g, Im u = 0` — right for a
             # real g, inexpressible for a complex one (see `complex_dirichlet_regions`). 2D/3D takes
-            # the same shared-row route but reaches it by casting g to float, so it *silently* drops
-            # Im(g); refuse instead. A complex essential value is the one thing 1D says no to here.
+            # the same shared-row route and refuses it the same way (verified: both raise on
+            # `u(xb, yb) - (0.5+0.25j)`); this comment used to say 2D/3D silently dropped Im(g),
+            # which is no longer true. The restriction is on the essential VALUE only — the operator
+            # and the source stay complex, and the solution has an imaginary part everywhere.
             if _cx_dbc := complex_dirichlet_regions(domain, dirichlet_values):
                 raise NotImplementedError(
                     f"jno.fem: a COMPLEX essential value on region(s) {sorted(set(_cx_dbc))} of a 1D complex "

@@ -95,6 +95,46 @@ changes the converged solution, only the speed, so specs need no gradient path.
 | `jno.precond.jaxamg(symmetric=…)` | GPU AMG via NVIDIA AmgX — setup and apply both on device | large systems on a GPU; needs the optional stack |
 | `.cached(refresh=…)` | reuse an expensive setup across solves | Newton loops and transients, where the operator barely changes between solves |
 
+Every one of them is passed the same way — `fem.solve(precond=…)`, alongside whichever `linear=`
+solver it is accelerating. Nothing else about the problem changes:
+
+```python
+fem = jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0])   # 379 DOFs, SPD
+
+fem.solve(linear=jno.solve.cg(tol=1e-10), precond=jno.precond.jacobi())
+fem.solve(linear=jno.solve.cg(tol=1e-10), precond=jno.precond.chebyshev(degree=4))
+fem.solve(linear=jno.solve.cg(tol=1e-10), precond=jno.precond.nystrom(rank=20))
+fem.solve(linear=jno.solve.cg(tol=1e-10), precond=jno.precond.amg(cycles=1))
+
+# an ITERATIVE preconditioner needs a flexible outer solver — plain gmres assumes a fixed M
+fem.solve(linear=jno.solve.fgmres(tol=1e-10),
+          precond=jno.precond.inner(jno.solve.cg(tol=1e-2, maxiter=30)))
+
+# reuse an expensive setup across a Newton loop or a march
+fem.solve(linear=jno.solve.cg(tol=1e-10), precond=jno.precond.amg(cycles=1).cached())
+```
+
+!!! measured "All six agree — the preconditioner is a speed choice, never an answer"
+    Solved on the same 379-DOF Poisson operator, every spec above lands within **3.5e-10** of the
+    unpreconditioned reference (`max|u − u_ref|`). That is the contract: a preconditioner changes the
+    iteration count, never the converged solution — which is also why these specs need no gradient
+    path of their own.
+
+    A **preconditioner's own inner solve is exempt from the convergence gate** — `inner(cg(tol=1e-2,
+    maxiter=30))` asks for two digits deliberately. See
+    [the gate](#a-solve-that-did-not-converge-raises-including-the-adjoint).
+
+For a multifield system, compose per field over `fem.blocks`. The key is the **trial symbol**, not a
+name — the same `u`/`p` you wrote the weak form with:
+
+```python
+fem.solve(linear=jno.solve.fgmres(tol=1e-10, restart=40),
+          precond=jno.precond.block_diag(
+              (u, jno.precond.inner(jno.solve.cg(tol=1e-2, maxiter=60))),   # velocity block
+              (p, jno.precond.form([(1.0 / mu) * pp * qq], inner=jno.solve.dense())),  # pressure
+          ))
+```
+
 ??? note "`jno.precond.chebyshev(degree=…)`"
     fixed-degree Chebyshev **polynomial** preconditioner: matvecs and
     AXPYs only, the GPU-era substitute for Gauss-Seidel/ILU smoothing, and a fixed *linear* map so it

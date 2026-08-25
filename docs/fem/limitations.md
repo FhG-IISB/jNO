@@ -19,7 +19,7 @@ path is unaffected.
 
 | Area | The limit | How it fails |
 |---|---|---|
-| Transient mass | must be parameter-free — put affine trainable parameters on the stiffness / residual, not on `u_t * phi` | raises |
+| Transient mass, non-nodal | a **trainable network** coefficient on `u_t * phi` — the mass block is assembled once. A scalar parameter, a coordinate function, or a net on a *nodal* form are all fine | raises |
 | Second order in time | nodal Lagrange only, 1-D/2-D/3-D, scalar or vector; the **temporal** side must stay linear | raises |
 | Reduced-order `basis=` | steady + first-order transient only | raises |
 | Runtime Dirichlet parameters | steady linear, steady nonlinear, linear transient | raises |
@@ -53,6 +53,27 @@ path is unaffected.
 
     A coupled 1-D system carries `u_tt` on narrower terms (linear, undamped): the augmented state is
     `[u_all; v_all]`, so `fem.offsets` lists the displacement blocks then the velocity blocks.
+
+??? note "A trainable net on a non-nodal transient mass — measured boundary"
+    The mass block of a non-nodal transient form is assembled **once**, so a coefficient that trains
+    cannot enter it. The limit is narrower than it sounds — this is the whole map, measured:
+
+    | element | `c` in `c * ui.t * vi` | |
+    |---|---|---|
+    | P1 nodal | constant, `jno.np.parameter`, `1 + xi`, **trainable net** | all solve |
+    | Hermite / non-nodal | constant, `jno.np.parameter`, `1 + xi` | all solve |
+    | Hermite / non-nodal | **trainable net** | raises |
+
+    ```python
+    u, phi = d.fem_symbols(space="Hermite")
+    rho = 1.0 + jno.nn(net)(xi, yi)                      # trainable, spatially varying
+    jno.fem([rho * ui.t * vi + (ui.x * vi.x + ui.y * vi.y), ...])
+    # NotImplementedError: jno.fem (non-nodal): a trainable neural coefficient on the mass (u_t)
+    # term is not supported -- the mass block is assembled once. Use it on spatial terms, or
+    # .freeze() the network.
+
+    jno.fem([ui.t * vi + rho * (ui.x * vi.x + ui.y * vi.y), ...])   # instead: on the stiffness
+    ```
 
 ??? note "Reduced-order solves — what `basis=` covers"
     Steady and **first-order transient**, linear and nonlinear. Second-order-in-time (`u_tt`),
@@ -103,10 +124,42 @@ path is unaffected.
 
 ??? note "Element order on a non-nodal family — refused, not applied"
     RT / N1E / P0 / Hermite / Argyris / Morley each have one intrinsic order. `space="N1E", order=2`
-    used to return the same lowest-order space silently; it now raises. The mesh is the only accuracy
-    knob on an H(curl)/H(div) problem — see [*Mesh resolution for wave
+    used to return the same lowest-order space silently; it now raises. Note **where** it raises:
+    `fem_symbols` accepts the argument, and `jno.fem([...])` is what refuses — the order is not
+    checked until an element is actually built.
+
+    ```python
+    u, v = d.fem_symbols(space="N1E", value_shape=(2,), order=2)   # accepted
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    jno.fem([inner(ui, vi) - inner(e_x, vi)])                       # <- raises here
+    # NotImplementedError: jno.fem: order=2 is not selectable on the N1E element — its order is
+    # intrinsic to the family (lowest order (N1E0)) and jNO builds only that one. Drop order= (the
+    # default) to get it.
+
+    u, v = d.fem_symbols(space="N1E", value_shape=(2,))             # instead: take the family's order
+    ```
+
+    The mesh is the only accuracy knob on an H(curl)/H(div) problem — see [*Mesh resolution for wave
     problems*](elements.md#mesh-resolution-for-wave-problems) for what a given points-per-wavelength
     buys, measured.
+
+??? note "A complex essential value — refused in 1-D, 2-D and 3-D"
+    A complex form is solved as two coupled real legs that **share one Dirichlet row set**. That set
+    can impose `Re u = g` with `Im u = 0`, but not a prescribed `Im u`, so a complex `g` is refused
+    rather than silently truncated:
+
+    ```python
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y - k**2 * (1 + 0.1j) * ui * vi - 1.0 * vi,
+                   u(xb, yb) - (0.5 + 0.25j)])
+    # NotImplementedError: jno.fem: a COMPLEX essential value on region 'boundary' is not supported
+    # — a complex form's Re/Im legs share one Dirichlet row set ...
+
+    fem = jno.fem([..., u(xb, yb) - 0.5])       # instead: a REAL essential value
+    ```
+
+    The restriction is on the *boundary value*, not on the problem: the operator and the source stay
+    fully complex, and the solution has an imaginary part everywhere (measured `max|Im u| = 2.6e-02`
+    on the 2-D Helmholtz above with `g = 0.5`). Carry the complex part there.
 
 ??? warning "`eigs` routing, differentiability, and when `linear=` pays"
     `jno.solve.eigs` / `FEM.eigs` route on the operator's **actual symmetry**. A symmetric pencil
