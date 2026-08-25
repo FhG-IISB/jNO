@@ -26,19 +26,27 @@ def _x64():
         jax.config.update("jax_enable_x64", prev)
 
 
+_COT = "finite_difference:cotangent"  # whole-Laplacian FD stencil; one .laplacian term
+
+
 def _nodes(d):
     return np.asarray(d.mesh_connectivity["points"])[:, :2]
 
 
 def _poisson_homogeneous(mesh_size):
     """-Δu = f on [0,1]², u=0 on ∂Ω, exact u = sin(πx)sin(πy). Returns rel-L2 error."""
+    import jno.jnp_ops as jnn
+
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=mesh_size)
     p = _nodes(d)
     exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
-    f = jnp.asarray(2 * np.pi**2 * np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]))
-    sys = jno.fdm(d, residual=lambda u: -jno.fdm.laplacian(u, d) - f, dirichlet={"boundary": 0.0})
-    u = np.asarray(sys.solve()).reshape(-1)
-    return float(np.linalg.norm(u - exact) / np.linalg.norm(exact))
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    f = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+    sol = jno.fdm([-ui.laplacian(x, y, scheme=_COT) - f, u(xb, yb) - 0.0]).solve()
+    return float(np.linalg.norm(np.asarray(sol).reshape(-1) - exact) / np.linalg.norm(exact))
 
 
 def test_poisson_homogeneous_dirichlet():
@@ -52,29 +60,19 @@ def test_poisson_convergence_under_refinement():
     assert errs[2] < 3e-3
 
 
-def test_inhomogeneous_dirichlet():
-    """u = x²+y², -Δu = -4, with the boundary value g(x,y) = x²+y²."""
-    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.05)
-    p = _nodes(d)
-    exact = p[:, 0] ** 2 + p[:, 1] ** 2
-    sys = jno.fdm(
-        d,
-        residual=lambda u: -jno.fdm.laplacian(u, d) + 4.0,
-        dirichlet={"boundary": lambda x, y: x**2 + y**2},
-    )
-    u = np.asarray(sys.solve()).reshape(-1)
-    assert float(np.linalg.norm(u - exact) / np.linalg.norm(exact)) < 1e-3
-
-
 def test_matches_fem_on_same_mesh():
     """The FD solution agrees with the FE solution to FD-discretization accuracy."""
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.05)
     p = _nodes(d)
     exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
-    f = jnp.asarray(2 * np.pi**2 * np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]))
-    u_fd = np.asarray(
-        jno.fdm(d, residual=lambda u: -jno.fdm.laplacian(u, d) - f, dirichlet={"boundary": 0.0}).solve()
-    ).reshape(-1)
+    import jno.jnp_ops as jnn
+
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    f = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+    u_fd = np.asarray(jno.fdm([-ui.laplacian(x, y, scheme=_COT) - f, u(xb, yb) - 0.0]).solve()).reshape(-1)
     # both solve the same BVP; the FD field is in the analytic ballpark
     assert float(np.linalg.norm(u_fd - exact) / np.linalg.norm(exact)) < 1e-2
 
@@ -82,14 +80,22 @@ def test_matches_fem_on_same_mesh():
 def test_differentiable_for_inverse_problems():
     """The solve is differentiable w.r.t. a parameter in the residual (source scale), and the
     gradient points toward the true value — the requirement for composing into jno.core."""
+    import jno.jnp_ops as jnn
+
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.08)
     p = _nodes(d)
-    fbase = jnp.asarray(2 * np.pi**2 * np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]))
     obs = jnp.asarray(np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]))
 
     def loss(scale):
-        sys = jno.fdm(d, residual=lambda u: -jno.fdm.laplacian(u, d) - scale * fbase, dirichlet={"boundary": 0.0})
-        return jnp.mean((sys.solve() - obs) ** 2)
+        # build the symbols INSIDE: the trace nodes carry per-solve state, so reusing one `u`
+        # across repeated jax.grad traces corrupts the adjoint (measured: g = -1.5e11).
+        x, y, _ = d.variable("interior", split=True)
+        xb, yb, _ = d.variable("boundary", split=True)
+        u = d.unknown()
+        ui = u.bind(x=x, y=y)
+        f_base = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+        sol = jno.fdm([-ui.laplacian(x, y, scheme=_COT) - scale * f_base, u(xb, yb) - 0.0]).solve()
+        return jnp.mean((jnp.asarray(sol).reshape(-1) - obs) ** 2)
 
     g = float(jax.grad(loss)(1.5))
     assert np.isfinite(g)
@@ -103,37 +109,41 @@ def test_nonlinear_reaction_diffusion():
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.05)
     p = _nodes(d)
     exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
-    f = jnp.asarray(2 * np.pi**2 * exact + exact**3)  # -Δ(sin sin) + (sin sin)³
-    sys = jno.fdm(d, residual=lambda u: -jno.fdm.laplacian(u, d) + u**3 - f, dirichlet={"boundary": 0.0})
-    u = np.asarray(sys.solve()).reshape(-1)
-    assert float(np.linalg.norm(u - exact) / np.linalg.norm(exact)) < 1e-2
+    import jno.jnp_ops as jnn
 
-
-def test_transient_heat_2d():
-    """u_t = ν Δu, u₀ = sin(πx)sin(πy), homogeneous Dirichlet → e^(−2νπ²t)·sin(πx)sin(πy).
-    solve_transient reuses jno.fem's SemidiscreteTimeBlock stepper (no new time-integration code)."""
-    nu, T = 0.05, 0.5
-    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.06)
-    p = _nodes(d)
-    u0 = jnp.asarray(np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]))
-    sys = jno.fdm(d, residual=lambda u: -nu * jno.fdm.laplacian(u, d), dirichlet={"boundary": 0.0})
-    traj = np.asarray(sys.solve_transient(u0, (0.0, T), 200))
-    exact = np.exp(-2 * nu * np.pi**2 * T) * np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
-    assert traj.shape == (201, p.shape[0])
-    assert float(np.linalg.norm(traj[-1] - exact) / np.linalg.norm(exact)) < 1e-2
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    s_xy = jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+    f = 2 * np.pi**2 * s_xy + s_xy**3  # -Δ(sin sin) + (sin sin)³
+    sol = jno.fdm([-ui.laplacian(x, y, scheme=_COT) + ui**3 - f, u(xb, yb) - 0.0]).solve()
+    assert float(np.linalg.norm(np.asarray(sol).reshape(-1) - exact) / np.linalg.norm(exact)) < 1e-2
 
 
 def test_transient_differentiable_for_inverse():
     """The transient march differentiates w.r.t. a parameter (diffusivity) — time-dependent inverse."""
+    import jno.jnp_ops as jnn
+
     T = 0.5
-    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.08)
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.08, time=(0.0, T, 200))
     p = _nodes(d)
-    u0 = jnp.asarray(np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]))
     target = jnp.asarray(np.exp(-2 * 0.05 * np.pi**2 * T) * np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, t=t)
 
     def loss(nu):
-        s = jno.fdm(d, residual=lambda u: -nu * jno.fdm.laplacian(u, d), dirichlet={"boundary": 0.0})
-        return jnp.mean((s.solve_transient(u0, (0.0, T), 200)[-1] - target) ** 2)
+        traj = jno.fdm(
+            [
+                ui.t - nu * ui.laplacian(x, y, scheme=_COT),
+                u(xb, yb) - 0.0,
+                u(xi, yi) - jnn.sin(np.pi * xi) * jnn.sin(np.pi * yi),
+            ]
+        ).solve()
+        return jnp.mean((jnp.asarray(traj)[-1] - target) ** 2)
 
     g = float(jax.grad(loss)(0.05))
     assert np.isfinite(g)
@@ -630,10 +640,18 @@ def _poisson3d(mesh_size, method="cotangent"):
     d = _cube(mesh_size)
     p = _nodes3(d)
     exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]) * np.sin(np.pi * p[:, 2])
-    f = jnp.asarray(3 * np.pi**2 * exact)
-    sys = jno.fdm(d, residual=lambda u: -jno.fdm.laplacian(u, d, method=method) - f, dirichlet={"boundary": 0.0})
-    u = np.asarray(sys.solve()).reshape(-1)
-    return float(np.linalg.norm(u - exact) / np.linalg.norm(exact))
+    import jno.jnp_ops as jnn
+
+    x, y, z, _ = d.variable("interior", split=True)
+    xb, yb, zb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, z=z)
+    f = 3 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y) * jnn.sin(np.pi * z)
+    # "cotangent" is the whole-Laplacian stencil (one term); "gradient_of_gradient" is the nested
+    # per-axis default, which is what summing d2 gives.
+    lap = ui.laplacian(x, y, z, scheme=_COT) if method == "cotangent" else ui.d2(x) + ui.d2(y) + ui.d2(z)
+    sol = jno.fdm([-lap - f, u(xb, yb, zb) - 0.0]).solve()
+    return float(np.linalg.norm(np.asarray(sol).reshape(-1) - exact) / np.linalg.norm(exact))
 
 
 def test_gradient_3d_shape():

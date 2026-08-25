@@ -15,7 +15,7 @@ exactly like ``jno.fem.solve()``.
 Two front-ends: a **fem-style constraint list** (preferred) — ``jno.fdm([residual, u(xb, yb) - g,
 u(xi, yi) - u0])`` authored with ``u = domain.unknown()`` exactly as ``jno.fem([...])``, where the
 initial condition is *found from the constraints* (never a config flag) and ``t_span``/step-count are
-inferred from ``domain.time`` — and a low-level **function form** (:class:`FDMSystem`).
+inferred from ``domain.time``.
 
 Scope: scalar fields — or a **coupled system** of several ``domain.unknown()`` fields (steady + Dirichlet;
 one PDE equation per unknown, equation *k* driving unknown *k*, ``.solve()`` returning ``(nf, N)``) — on a
@@ -222,98 +222,6 @@ def gradient(u, domain, method: str = "area_weighted"):
     gx = _D.compute_fd_gradient_2d_simple(u, pts, cells, 0, method=method, grid=grid)
     gy = _D.compute_fd_gradient_2d_simple(u, pts, cells, 1, method=method, grid=grid)
     return jnp.stack([gx, gy], axis=1)
-
-
-class FDMSystem:
-    """A finite-difference discretization built from a strong-form residual + Dirichlet BCs.
-
-    ``residual(u_dofs) -> R_at_nodes`` must be a differentiable function of the nodal DOF vector, zero
-    at the PDE solution (e.g. ``lambda u: -jno.fdm.laplacian(u, d) - f``). ``dirichlet`` maps a
-    boundary-region tag to a value (scalar, or a coordinate function ``g(x, y)``). For a time-dependent
-    domain (``time=(t0, t1, n)``), ``.solve(u0)`` marches in time from the initial state ``u0`` — the
-    IC is explicit data to the march, never a constructor config flag."""
-
-    def __init__(self, domain, residual, dirichlet=None):
-        self.domain = domain
-        self.residual = residual
-        self.dirichlet = dict(dirichlet or {})
-        self._N = int(np.asarray(domain.mesh_connectivity["points"]).shape[0])
-
-    @property
-    def points(self):
-        """DOF (mesh-node) coordinates, shape ``(N, dim)``."""
-        pts, _ = _mesh(self.domain)
-        return pts
-
-    def _region_nodes(self, tag):
-        reg = getattr(self.domain, "_boundary_registry", {}).get(tag)
-        if reg is not None and "point_indices" in reg and len(reg["point_indices"]) > 0:
-            return np.asarray(reg["point_indices"], dtype=int)
-        return np.asarray(self.domain.mesh_connectivity["boundary_indices"], dtype=int)  # whole boundary
-
-    def _dirichlet_mask_values(self):
-        pts = np.asarray(self.points)
-        mask = np.zeros(self._N, dtype=bool)
-        vals = np.zeros(self._N)
-        for tag, g in self.dirichlet.items():
-            idx = self._region_nodes(tag)
-            mask[idx] = True
-            vals[idx] = g(*[pts[idx, k] for k in range(pts.shape[1])]) if callable(g) else float(g)
-        return jnp.asarray(mask), jnp.asarray(vals)
-
-    def solve(self, nonlinear=None, x0=None):
-        """Solve the steady system, reusing the SAME ``jno.solve`` Newton–Krylov + implicit-``custom_root``
-        machinery ``jno.fem`` uses (linear and nonlinear uniformly; a linear residual converges in one
-        step; fully matrix-free). Dirichlet is folded into the residual (boundary rows become ``u - g``).
-        Gradients to parameters in ``residual`` flow through ``custom_root``, so ``jno.fdm`` composes
-        into ``jno.core`` for inverse problems.
-
-        Transient problems march with :meth:`solve_transient`; the fem-style constraint-list authoring
-        (``u(initial) - u0`` as a constraint) is the planned high-level path (see ``plans/fdm-solver.md``).
-        """
-        bmask, bvals = self._dirichlet_mask_values()
-
-        def residual_with_bc(u):
-            return jnp.where(bmask, u - bvals, self.residual(u))  # Dirichlet rows: u - g
-
-        driver = nonlinear or _solve.newton()
-        u0 = jnp.zeros(self._N) if x0 is None else jnp.asarray(x0)
-        return driver(residual_with_bc, u0, linear_solve=_structured_linear_solve(self.domain))
-
-    def solve_transient(self, u0, t_span, nsteps, *, save_ts=None, time=None):
-        """Method-of-lines march (when you don't drive time through ``domain.time``). See :meth:`solve`;
-        ``dt = (t1 - t0) / nsteps``. ``time=`` picks the scheme (``jno.solve.theta`` / ``adaptive`` /
-        ``exponential``); the default (``None``) is backward Euler."""
-        t0, t1 = float(t_span[0]), float(t_span[1])
-        return self._march(jnp.asarray(u0), t0, t1, (t1 - t0) / int(nsteps), save_ts, time=time)
-
-    def _march(self, u0, t0, t1, dt, save_ts, *, time=None):
-        """Method-of-lines transient of ``u̇ = 𝒩(u) = -residual(u)`` (the SAME residual serves steady
-        and transient). Reuses jNO's solver-agnostic :class:`SemidiscreteTimeBlock` + backward-Euler
-        ``lax.scan`` integrator — no new time-stepping code, and ``custom_root`` differentiable.
-        Collocation gives ``M = I`` (leaner than FEM); Dirichlet nodes carry a zero mass row so they
-        stay pinned at ``g``. Autonomous residuals only in v1 (no explicit ``t`` / time-varying source)."""
-        import jax.experimental.sparse as jsparse
-
-        from .utils.solver.backend_blocks import SemidiscreteTimeBlock, _block_time_grid
-
-        bmask, bvals = self._dirichlet_mask_values()
-        diag = jnp.stack([jnp.arange(self._N), jnp.arange(self._N)], axis=1)
-        M = jsparse.BCOO((jnp.where(bmask, 0.0, 1.0), diag), shape=(self._N, self._N))  # 0 mass on Dirichlet rows
-
-        def residual(wn, t, args):  # M u̇ + residual = 0  →  interior u̇ = -R = 𝒩;  boundary wn = g
-            return jnp.where(bmask, wn - bvals, self.residual(wn))
-
-        block = SemidiscreteTimeBlock(
-            mass=lambda t, args: M, residual=residual, state0=jnp.asarray(u0), t0=float(t0), t1=float(t1), dt=float(dt)
-        )
-        ts = _block_time_grid(block) if save_ts is None else jnp.asarray(save_ts)
-        return _integrate_transient(block, ts, time)
-
-
-# ============================================================================
-# Trace-based constraint-list front-end — authored like jno.fem, with u = domain.unknown()
-# ============================================================================
 
 
 def _unwrap(node):
@@ -1124,18 +1032,25 @@ class _TraceFDM:
         return _integrate_transient(block, ts, time)
 
 
-def fdm(constraints_or_domain, residual=None, dirichlet=None):
+def fdm(constraints):
     """Finite-difference PDE solver — the strong-form sibling of :func:`jno.fem`.
 
-    **Constraint-list form** (fem-style, preferred): ``jno.fdm([residual, u(xb, yb) - g])`` authored with
-    ``u = domain.unknown()`` and strong-form derivatives (``u.d2(x, scheme=...)``). Constraints are
-    classified by region (interior → PDE residual, boundary → Dirichlet).
+    The problem is a **constraint list**, exactly as in ``jno.fem``: ``jno.fdm([residual, u(xb, yb) - g])``
+    authored with ``u = domain.unknown()`` and strong-form derivatives. Constraints are classified by
+    region — interior terms are the PDE residual, boundary terms are Dirichlet conditions — and a
+    ``u.t`` term makes it transient, taking its grid from ``domain.time``.
 
-    **Function form** (low-level): ``jno.fdm(domain, residual=lambda u: ..., dirichlet={region: g})`` —
-    a plain differentiable residual over the nodal DOF vector; see :class:`FDMSystem`."""
-    if isinstance(constraints_or_domain, (list, tuple)):
-        return _TraceFDM(list(constraints_or_domain))
-    return FDMSystem(constraints_or_domain, residual, dirichlet)
+    For the accurate whole-Laplacian stencil write ONE term,
+    ``u.laplacian(x, y, scheme="finite_difference:cotangent")``; per-axis ``d2`` refuses that
+    sub-scheme, because summing one per axis would multiply the Laplacian by the dimension."""
+    if not isinstance(constraints, (list, tuple)):
+        raise TypeError(
+            "jno.fdm expects a constraint LIST, e.g. jno.fdm([-u.laplacian(x, y) - f, u(xb, yb) - 0.0]) "
+            f"with u = domain.unknown(); got {type(constraints).__name__}. The old function form "
+            "jno.fdm(domain, residual=..., dirichlet=...) has been removed — write the residual and the "
+            "boundary condition as terms instead."
+        )
+    return _TraceFDM(list(constraints))
 
 
 fdm.laplacian = laplacian  # convenience: jno.fdm.laplacian(u, domain)
