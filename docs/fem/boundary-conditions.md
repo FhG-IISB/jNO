@@ -317,14 +317,15 @@ response w.r.t. a load or (parametric-Dirichlet) grip displacement runs through 
 `custom_root` on the branch-selected operator and FD-checks; at contact *onset* the derivative is a
 subgradient (the `max` kink).
 
-> **Scope.** Small sliding — the pairing is frozen at build time, so a configuration that slides must be
-> rebuilt per load step. Differentiable in the DOF values but **not** in the mesh coordinates (the
-> projection weights are host-computed). Frictionless: no tangential traction, so a body held *only* by
-> contact is free to slide and its system is singular — constrain the tangential direction independently.
-> The **assembled tangent now carries the gap's nonlocal blocks** — `(s,m)` from `jacfwd` w.r.t. the
-> gathered main values chained through the frozen mortar weights, plus the reaction rows' `(m,s)` and
-> `(m,m)` — verified against the matrix-free JVP on random probes in both the active and separated
-> branches, so `newton(direct=True)` + `lu`/cuDSS works with contact (the pattern is static; inactive
-> contact contributes zeros in the data, which keeps the sparsity-keyed factorization caches valid).
+!!! warning "Scope — small sliding"
+    Small sliding — the pairing is frozen at build time, so a configuration that slides must be
+    rebuilt per load step. Differentiable in the DOF values but **not** in the mesh coordinates (the
+    projection weights are host-computed). Frictionless: no tangential traction, so a body held *only* by
+    contact is free to slide and its system is singular — constrain the tangential direction independently.
+    The **assembled tangent now carries the gap's nonlocal blocks** — `(s,m)` from `jacfwd` w.r.t. the
+    gathered main values chained through the frozen mortar weights, plus the reaction rows' `(m,s)` and
+    `(m,m)` — verified against the matrix-free JVP on random probes in both the active and separated
+    branches, so `newton(direct=True)` + `lu`/cuDSS works with contact (the pattern is static; inactive
+    contact contributes zeros in the data, which keeps the sparsity-keyed factorization caches valid).
 
 ---

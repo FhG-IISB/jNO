@@ -251,10 +251,11 @@ The assembled block is a standard transient block, so `fem.M` / `fem.state0` and
 to split it — displacement is `y[:N]`, velocity `y[N:]`. Add a damping term `c * ui.t * vi` for a
 damped wave.
 
-> **Integrate with `fem.solve()` — or step with θ=½ yourself.** The energy-conserving trapezoidal
-> rule lives inside `fem.solve()`. **Do not** hand-roll backward Euler `(M + dt·A) w = M·w` off a
-> second-order block — it spuriously **damps** the wave. If you integrate manually, use the trapezoidal
-> step `(M + ½·dt·A) w_next = (M − ½·dt·A) w + dt·c`.
+!!! danger "Do not hand-roll backward Euler on a second-order block"
+    The energy-conserving trapezoidal
+    rule lives inside `fem.solve()`. **Do not** hand-roll backward Euler `(M + dt·A) w = M·w` off a
+    second-order block — it spuriously **damps** the wave. If you integrate manually, use the trapezoidal
+    step `(M + ½·dt·A) w_next = (M − ½·dt·A) w + dt·c`.
 
 A **vector** field works too (`value_shape=(2,)`/`(3,)`) — that is elastodynamics,
 `ρ u_tt = ∇·σ(u)` (see the vibrating-cantilever tutorial). A **coupled system** where every field
