@@ -12,8 +12,11 @@ energy-conserving trapezoidal rule (θ=½; backward Euler would bleed the vibrat
 
 To prove the *dynamics* (not just that the integrator is conservative -- the trapezoidal rule
 conserves a quadratic invariant of any linear block, even a wrong one) we do a small **modal
-analysis**: the assembled mass/stiffness give a generalized eigenproblem  K φ = ω² M φ  whose lowest
-mode (ω₁, φ₁) is the fundamental bending shape. Released from that mode at rest, the exact solution is
+analysis**: the stiffness and mass bilinear forms give a generalized eigenproblem  K φ = ω² M φ
+whose lowest mode (ω₁, φ₁) is the fundamental bending shape. That eigenproblem is stated the same way
+the weak form is -- a term list plus ``mass=`` -- and solved by ``fem.eigs``, which eliminates the
+clamped DOFs itself and returns M-orthonormal modes with **differentiable** eigenvalues (so ω₁ can be
+an objective: mode-tuning, or inverting for a stiffness that hits a target frequency). Released from that mode at rest, the exact solution is
 u(t) = φ₁ cos(ω₁ t), so the tip traces a clean cosine -- a direct check that the augmented [u, v]
 block reproduces M ü + K u = 0 at the right frequency. As a bonus the modal frequency matches
 Euler-Bernoulli beam theory  ω₁ ≈ (1.875/L)² √(E I / ρ A)  (Timoshenko & Goodier, *Theory of
@@ -31,7 +34,6 @@ jax.config.update("jax_enable_x64", True)  # soft bending mode: not resolvable i
 
 import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
-import scipy.linalg as sla  # noqa: E402
 from shapely.geometry import box  # noqa: E402
 
 import jno  # noqa: E402
@@ -66,16 +68,21 @@ M, A = np.asarray(dense(fem.M)), np.asarray(dense(fem.operator.A))
 N = fem.offsets[1]  # state y = [u; v]; displacement = first N (node-major interleaved [n0x, n0y, ...])
 M_uu, K_uu = M[:N, :N], A[N:, :N]  # mass and stiffness blocks of the augmented system
 
-# --- modal analysis: fundamental vibration mode of the assembled operators (free dofs only) ---
+# --- modal analysis: K φ = ω² M φ, stated as a bilinear form and solved by ``fem.eigs`` ---
+# ``eigs`` wants a steady, source-less form, so state the stiffness on its own -- the same
+# λ tr(ε)tr(ε') + 2μ ε:ε' as above, minus the ρ u_tt term -- on the same symbols and the same
+# clamped root. The essential BC is eliminated by the solver, so φ₁ already satisfies it.
+uxy, vxy = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)  # the same P2 space, read without t
+K = jno.fem([lam * trace(eu) * trace(ep) + 2.0 * mu * inner(eu, ep, n_contract=2), u(xl, yl) - (0.0, 0.0)])
+lam1, X1 = K.eigs(mass=[rho * inner(uxy, vxy, n_contract=1)], k=1)  # λ = ω², M-orthonormal φ
+omega1 = float(jnp.sqrt(jnp.asarray(lam1).reshape(-1)[0]))
+phi1 = np.asarray(X1)[:, 0]
+phi1 = phi1 / np.max(np.abs(phi1))  # unit max displacement (a mode's amplitude is arbitrary)
+
 pts = np.asarray(fem.points)
 root = pts[:, 0] < 1e-9
 clamped = np.sort(np.concatenate([np.where(root)[0] * 2, np.where(root)[0] * 2 + 1]))
-free = np.setdiff1d(np.arange(N), clamped)
-evals, evecs = sla.eigh(K_uu[np.ix_(free, free)], M_uu[np.ix_(free, free)])  # K φ = ω² M φ
-omega1 = float(np.sqrt(evals[0]))
-phi1 = np.zeros(N)
-phi1[free] = evecs[:, 0]
-phi1 /= np.max(np.abs(phi1))  # unit max displacement (a mode's amplitude is arbitrary)
+assert phi1.size == N and np.max(np.abs(phi1[clamped])) < 1e-12  # same layout, BC eliminated
 
 # --- release from the fundamental mode at rest and march with the trapezoidal (θ=½) rule ---
 dt = float(fem.dt)
