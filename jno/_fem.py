@@ -583,7 +583,7 @@ def _element_for(dimension: int, order: int) -> str:
         return f"{ {1: 'INT', 2: 'TRI'}.get(int(dimension), 'TET') }-P{int(order)}"
     raise ValueError(
         f"jno.fem: no built-in element for dimension {dimension}, order {order} "
-        "(supported: 1D/2D/3D simplex at order >= 1; pass element_type=... to override)."
+        "(supported: 1D/2D/3D simplex at order >= 1)."
     )
 
 
@@ -4275,7 +4275,6 @@ def fem(
     constraints: Any,
     *,
     quad_degree: int = 2,
-    element_type: Optional[str] = None,
     vec: Optional[int] = None,
     chunk: Any = None,
     _dd_overlap: bool = False,
@@ -4296,7 +4295,6 @@ def fem(
         out = _fem_impl(
             constraints,
             quad_degree=quad_degree,
-            element_type=element_type,
             vec=vec,
             _dd_overlap=_dd_overlap,
         )
@@ -4317,7 +4315,6 @@ def _fem_impl(
     constraints: Any,
     *,
     quad_degree: int = 2,
-    element_type: Optional[str] = None,
     vec: Optional[int] = None,
     _dd_overlap: bool = False,
 ) -> FEM:
@@ -4328,8 +4325,9 @@ def _fem_impl(
     constraints:
         A residual expression or list of them. Weak terms (containing the test
         function) and essential conditions (``u(region) - g``) are auto-classified.
-    quad_degree, element_type:
-        FEM discretisation options (forwarded to the quadrature setup).
+    quad_degree:
+        Quadrature degree (forwarded to the quadrature setup). The element type is
+        derived from the domain's dimension and the trial's ``order``.
     vec:
         Vector size of the unknown. ``None`` (default) infers it from the trial's
         ``value_shape`` (scalar → 1, ``(2,)`` → 2, …); pass an int to override.
@@ -4371,7 +4369,7 @@ def _fem_impl(
     # remeshed in place -- the constraints reference the domain (not a mesh snapshot),
     # so re-tracing them picks up the refined mesh automatically.
     _orig_constraints = list(constraints)
-    _orig_fem_kwargs = {"quad_degree": quad_degree, "element_type": element_type, "vec": vec}
+    _orig_fem_kwargs = {"quad_degree": quad_degree, "vec": vec}
 
     # Gauge pins (`p.pin()`) remove a field's constant null space. Lower each to a single-node
     # Dirichlet `p(node) - value` *before* domain discovery and classification: a GaugePin is a
@@ -5154,8 +5152,7 @@ def _fem_impl(
 
     # ---- single field: element defaults to the field order (P1->TRI3/TET4,
     # P2->TRI6/TET10); a higher-order field bumps the quadrature for exactness. ----
-    if element_type is None:
-        element_type = _element_for(domain.dimension, order)
+    element_type = _element_for(domain.dimension, order)
     quad_degree = max(quad_degree, 2 * order)  # factory uses 2*degree+1; bump to the field's order
 
     # ---- build IR with explicit regions, then detect transient vs steady. This is done so the
