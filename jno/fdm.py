@@ -60,6 +60,7 @@ automatic, no authoring change. Composite/CSG and cut-cell geometry are planned.
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -139,6 +140,48 @@ def _fd_newton_tolerances(residual_fn, u0, *, safety: float = 1000.0) -> dict:
     if not np.isfinite(floor) or floor <= 1e-8:
         return {}
     return {"atol": floor, "rtol": 1e-8}
+
+
+def _uses_whole_laplacian_scheme(constraints) -> bool:
+    """True if any constraint carries a ``:cotangent`` second-derivative node.
+
+    Its adjoint is currently wrong (see :meth:`_TraceFDM.solve`), so the solve refuses to be
+    differentiated when one is present rather than returning a plausible, badly wrong gradient.
+    """
+    seen, stack = set(), list(constraints)
+    while stack:
+        n = stack.pop()
+        if id(n) in seen:
+            continue
+        seen.add(id(n))
+        if "cotangent" in str(getattr(n, "scheme", "") or ""):
+            return True
+        for attr in ("left", "right", "target", "operand", "expr", "node", "base"):
+            child = getattr(n, attr, None)
+            if child is not None and not isinstance(child, (str, bytes, int, float)):
+                stack.append(child)
+        for attr in ("args", "children", "operands", "variables", "nodes"):
+            seq = getattr(n, attr, None)
+            if isinstance(seq, (list, tuple)):
+                stack.extend(c for c in seq if not isinstance(c, (str, bytes, int, float)))
+    return False
+
+
+def _block_bad_adjoint(sol, why: str):
+    """Return ``sol`` unchanged forward; raise if anything tries to differentiate it."""
+
+    @jax.custom_vjp
+    def _gate(v):
+        return v
+
+    def _fwd(v):
+        return v, None
+
+    def _bwd(_res, _g):
+        raise NotImplementedError(why)
+
+    _gate.defvjp(_fwd, _bwd)
+    return _gate(sol)
 
 
 def _structured_linear_solve(domain):
@@ -910,7 +953,23 @@ class _TraceFDM:
         u0 = jnp.zeros(self._Ntot) if x0 is None else jnp.asarray(x0).reshape(-1)
         driver = nonlinear or _solve.newton(**_fd_newton_tolerances(residual_with_bc, u0))
         sol = driver(residual_with_bc, u0, linear_solve=_structured_linear_solve(self.domain) if single else None)
-        return sol if single else sol.reshape(self._nf, N)  # coupled: (nf, N), one row per field
+        out = sol if single else sol.reshape(self._nf, N)  # coupled: (nf, N), one row per field
+        if _uses_whole_laplacian_scheme(self._constraints):
+            # The FORWARD solve with `:cotangent` is the accurate one (it matches the historical
+            # function form bit-for-bit). Its ADJOINT is not: measured on -Δu = s·f, d(Σu)/ds came
+            # back -1.9e22 against an exact +8.2e01, and the loss gradient +9.2e10 against +0.226
+            # from both finite differences and the closed form. It is not the inner Krylov solver —
+            # forcing GMRES reproduces the same number — and the operator's own gradient is exact,
+            # so the fault is in how this node linearises inside the solve. Until that is fixed the
+            # solve refuses to be differentiated rather than handing back a plausible wrong number.
+            out = _block_bad_adjoint(
+                out,
+                "jno.fdm: a solve whose residual uses scheme='finite_difference:cotangent' cannot be "
+                "differentiated — its adjoint is currently wrong by ~20 orders of magnitude (the forward "
+                "solve is correct and unaffected). For gradients use the default per-axis stencil "
+                "(u.d2(x) + u.d2(y)) or ':lsq', both of which match finite differences to 1e-4.",
+            )
+        return out
 
     def pinned_solver(self, node_ids, *, nonlinear=None):
         """A **reusable** ``f(values) -> field`` that solves the subdomain with ``node_ids`` pinned to

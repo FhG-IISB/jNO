@@ -87,14 +87,12 @@ def test_differentiable_for_inverse_problems():
     obs = jnp.asarray(np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]))
 
     def loss(scale):
-        # build the symbols INSIDE: the trace nodes carry per-solve state, so reusing one `u`
-        # across repeated jax.grad traces corrupts the adjoint (measured: g = -1.5e11).
         x, y, _ = d.variable("interior", split=True)
         xb, yb, _ = d.variable("boundary", split=True)
         u = d.unknown()
         ui = u.bind(x=x, y=y)
         f_base = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
-        sol = jno.fdm([-ui.laplacian(x, y, scheme=_COT) - scale * f_base, u(xb, yb) - 0.0]).solve()
+        sol = jno.fdm([-ui.d2(x) - ui.d2(y) - scale * f_base, u(xb, yb) - 0.0]).solve()
         return jnp.mean((jnp.asarray(sol).reshape(-1) - obs) ** 2)
 
     g = float(jax.grad(loss)(1.5))
@@ -138,7 +136,7 @@ def test_transient_differentiable_for_inverse():
     def loss(nu):
         traj = jno.fdm(
             [
-                ui.t - nu * ui.laplacian(x, y, scheme=_COT),
+                ui.t - nu * (ui.d2(x) + ui.d2(y)),
                 u(xb, yb) - 0.0,
                 u(xi, yi) - jnn.sin(np.pi * xi) * jnn.sin(np.pi * yi),
             ]
@@ -733,6 +731,50 @@ def test_whole_laplacian_subscheme_allowed_on_laplacian():
     cot = rel(jno.fdm([-ui.laplacian(x, y, scheme="finite_difference:cotangent") - f, u(xb, yb) - 0.0]).solve())
     nested = rel(jno.fdm([-ui.d2(x) - ui.d2(y) - f, u(xb, yb) - 0.0]).solve())
     assert cot < nested / 3, f"cotangent should be several times better: {cot:.3e} vs {nested:.3e}"
+
+
+def test_cotangent_solve_refuses_to_be_differentiated():
+    """The `:cotangent` FORWARD solve is the accurate one, but its adjoint is currently wrong by ~20
+    orders (measured: d(Σu)/ds = -1.9e22 against an exact +8.2e01; the loss gradient +9.2e10 against
+    +0.226 from both finite differences and the closed form). It is not the inner Krylov solver —
+    forcing GMRES gives the same number — and the operator's own gradient is exact. Until the
+    linearisation is fixed the solve must RAISE rather than return a plausible wrong gradient."""
+    import jno.jnp_ops as jnn
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.12)
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    f = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+
+    def total(scale):
+        sol = jno.fdm([-ui.laplacian(x, y, scheme=_COT) - scale * f, u(xb, yb) - 0.0]).solve()
+        return jnp.sum(jnp.asarray(sol).reshape(-1))
+
+    assert np.isfinite(float(total(1.0))), "the forward solve must still work"
+    with pytest.raises(NotImplementedError, match="cotangent"):
+        jax.grad(total)(1.5)
+
+
+def test_default_and_lsq_adjoints_match_finite_differences():
+    """The paths that ARE differentiable must be right, not merely finite — this is the assertion the
+    old function-form test lacked, which let a garbage-but-positive gradient pass for so long."""
+    import jno.jnp_ops as jnn
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.12)
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    f = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+
+    for lap in (ui.d2(x) + ui.d2(y), ui.laplacian(x, y, scheme="finite_difference:lsq")):
+        total = lambda s, lap=lap: jnp.sum(  # noqa: E731
+            jnp.asarray(jno.fdm([-lap - s * f, u(xb, yb) - 0.0]).solve()).reshape(-1)
+        )
+        exact = float(total(1.0))  # u is linear in s, so d(Σu)/ds == Σu(s=1)
+        assert abs(float(jax.grad(total)(1.5)) - exact) / abs(exact) < 1e-6
 
 
 def test_constraint_list_cotangent_3d():
