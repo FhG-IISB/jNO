@@ -43,6 +43,44 @@ def _key(key):
     return jax.random.PRNGKey(0) if key is None else key
 
 
+def _raise_krylov_breakdown(who: str, order: int, n: int):
+    """Host side of :func:`_finite`. Raises; never returns a value."""
+    raise FloatingPointError(
+        f"jno.solve.{who}: the Krylov iteration broke down and the result is not finite "
+        f"(order={order}, n={n}). Lanczos/Arnoldi can only build a subspace as large as the number of "
+        "DISTINCT eigenvalues the probe sees, and a jNO FEM operator has far fewer than it has rows: "
+        "every Dirichlet-pinned DOF contributes an identity row, so eigenvalue 1.0 carries a "
+        "multiplicity equal to the pinned count. Measured on a 2-D Poisson operator at mesh 0.25 -- "
+        "n=30, 16 pinned rows, only 15 distinct eigenvalues -- the default order overran that and this "
+        f"returned NaN. Lower order= below the distinct-eigenvalue count (order={max(2, n // 4)} is a "
+        "safe start), or apply the estimator to the FREE-DOF operator rather than the pinned one."
+    )
+
+
+def _finite(out, who: str, order: int, n: int):
+    """Refuse a Krylov breakdown instead of returning ``NaN``/``inf`` dressed as an estimate.
+
+    ``matfree`` runs its Lanczos/Arnoldi for the full requested ``order`` with no breakdown test, so
+    once the Krylov space is exhausted the recurrence normalises by ~0 and the answer degenerates --
+    silently, in the middle of an otherwise ordinary call. Checked under a trace as well as eagerly,
+    by the same ``lax.cond``-guarded host callback the solver convergence gate uses
+    (:func:`jno.utils.solver.solver_api.residual_gate`), because these estimators are meant to be
+    differentiated and a check that steps aside under ``grad`` guards nothing.
+    """
+    arr = jnp.asarray(out)
+    ok = jnp.all(jnp.isfinite(arr))
+    if not isinstance(ok, jax.core.Tracer):
+        if not bool(ok):
+            _raise_krylov_breakdown(who, order, n)
+        return out
+    jax.lax.cond(
+        ok,
+        lambda: None,
+        lambda: jax.debug.callback(_raise_krylov_breakdown, who, order, n),
+    )
+    return out
+
+
 def logdet(A, *, samples: int = 32, order: int = 25, key=None):
     """Differentiable stochastic estimate of ``log det A`` for a symmetric positive-definite ``A``
     (stochastic Lanczos quadrature). ``samples`` probe vectors, ``order`` Lanczos steps."""
@@ -54,7 +92,7 @@ def logdet(A, *, samples: int = 32, order: int = 25, key=None):
     estimate = stochtrace.estimator_monte_carlo(
         integrand, sampler=stochtrace.sampler_normal(jnp.zeros(n, dtype), num=samples)
     )
-    return estimate(mv, _key(key))
+    return _finite(estimate(mv, _key(key)), "logdet", order, n)
 
 
 def trace(A, *, fun=None, samples: int = 32, order: int = 25, key=None):
@@ -72,7 +110,7 @@ def trace(A, *, fun=None, samples: int = 32, order: int = 25, key=None):
     estimate = stochtrace.estimator_monte_carlo(
         integrand, sampler=stochtrace.sampler_normal(jnp.zeros(n, dtype), num=samples)
     )
-    return estimate(mv, _key(key))
+    return _finite(estimate(mv, _key(key)), "trace", order, n)
 
 
 def _dense_funm_eig(fun):
@@ -136,7 +174,7 @@ def applyfun(A, v, *, fun, order: int = 30, symmetric: bool = True):
         f = funm.funm_lanczos_sym(funm.dense_funm_sym_eigh(fun), decomp.tridiag_sym(order))
     else:  # non-symmetric: Arnoldi Hessenberg + eig f(H) — GPU-capable, differentiable (Daleckii–Krein JVP)
         f = funm.funm_arnoldi(_dense_funm_eig(fun), decomp.hessenberg(order, reortho="full"))
-    return f(mv, jnp.asarray(v))
+    return _finite(f(mv, jnp.asarray(v)), "applyfun", order, _n)
 
 
 def expmv(A, v, *, order: int = 30):
@@ -151,7 +189,7 @@ def expmv(A, v, *, order: int = 30):
 
     mv, _n, _dtype = _operator(A)
     f = funm.funm_arnoldi(funm.dense_funm_pade_exp(), decomp.hessenberg(order, reortho="full"))
-    return f(mv, jnp.asarray(v))
+    return _finite(f(mv, jnp.asarray(v)), "expmv", order, _n)
 
 
 def diagonal(A, *, fun=None, samples: int = 32, order: int = 25, key=None):
@@ -177,7 +215,7 @@ def diagonal(A, *, fun=None, samples: int = 32, order: int = 25, key=None):
         stochtrace.monte_carlo_diagonal(),
         sampler=stochtrace.sampler_normal(jnp.zeros(n, dtype), num=samples),
     )
-    return estimate(matvec, _key(key))
+    return _finite(estimate(matvec, _key(key)), "diagonal", order, n)
 
 
 def svd(A, *, k: int = 6, depth: int | None = None, v0=None):

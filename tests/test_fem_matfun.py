@@ -33,6 +33,73 @@ def _x64():
         jax.config.update("jax_enable_x64", prev)
 
 
+def test_krylov_breakdown_raises_instead_of_returning_nan():
+    """The failure the suite's own fixture never saw, because it uses no Dirichlet term and a fine mesh.
+
+    Lanczos can only build a subspace as large as the number of DISTINCT eigenvalues, and a pinned jNO
+    FEM operator has far fewer than it has rows: every Dirichlet DOF is an identity row, so eigenvalue
+    1.0 carries the pinned count as its multiplicity. Measured at mesh 0.25 -- n=30, 16 pinned rows,
+    15 distinct eigenvalues -- the DEFAULT ``order=25`` overran that and ``logdet`` returned NaN while
+    ``applyfun`` returned inf. Both must raise, and must do so under a trace too: these estimators
+    exist to be differentiated, so an eager-only check would guard nothing."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.25)
+    u, v = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    A, _ = jno.fem([ui * vi + ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0]).operator
+    S = jnp.asarray(np.asarray(A.todense()))
+    n = S.shape[0]
+    ev = np.linalg.eigvalsh(np.asarray(S))
+    assert len(np.unique(np.round(ev, 9))) < n, "the premise: pinning collapses the distinct spectrum"
+
+    with pytest.raises(FloatingPointError, match="Krylov"):
+        jno.solve.logdet(S, samples=8)  # default order=25 -> NaN before the guard
+    with pytest.raises(Exception, match="Krylov"):
+        jax.grad(lambda c: jno.solve.logdet(c * S, samples=8))(1.0)  # and under a trace
+
+    # below the Krylov dimension it works, and stays differentiable
+    exact = float(np.linalg.slogdet(np.asarray(S))[1])
+    assert abs(float(jno.solve.logdet(S, samples=64, order=8)) - exact) / abs(exact) < 0.25
+    assert np.isfinite(float(jax.grad(lambda c: jno.solve.logdet(c * S, samples=32, order=8))(1.0)))
+
+
+def test_applyfun_krylov_overrun_is_still_only_partly_caught():
+    """Records exactly how far the finiteness guard gets on ``applyfun`` -- which is NOT all the way.
+
+    Same collapsed spectrum as above. ``applyfun`` degrades through three regimes as ``order`` passes
+    the Krylov dimension, and only the last is caught:
+
+        order <= 20   correct           (rel 1e-14 against a dense expm)
+        order == 25   2.50e+37          FINITE, wrong by 35 orders -- NOT caught
+        order == 29   9.05e+75          FINITE, wrong by 74 orders -- NOT caught
+        order == 30   entries ~1e+300   the norm overflows to inf; caught only if an entry is inf
+
+    A finiteness test cannot see a finite-but-absurd Krylov approximation. The real fix is to detect
+    the Lanczos breakdown itself (beta ~ 0) and truncate to the invariant subspace, where the answer is
+    EXACT -- which means computing f(T) from matfree's tridiagonal rather than using its
+    ``funm_lanczos_sym`` composition. Not done; this test exists so the gap is recorded rather than
+    rediscovered. Saad, *SIAM J. Numer. Anal.* 29(1), 1992, section 4 gives the standard error
+    estimate for Krylov f(A)v approximations."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.25)
+    u, v = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    A, _ = jno.fem([ui * vi + ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0]).operator
+    S = jnp.asarray(np.asarray(A.todense()))
+    n = S.shape[0]
+    ones = jnp.ones(n)
+    ref = np.linalg.norm(np.asarray(jax.scipy.linalg.expm(S)) @ np.ones(n))
+
+    good = np.asarray(jno.solve.applyfun(S, ones, fun=jnp.exp, order=15))
+    assert abs(np.linalg.norm(good) - ref) / ref < 1e-8, "inside the Krylov dimension it is exact"
+
+    bad = np.asarray(jno.solve.applyfun(S, ones, fun=jnp.exp, order=25))
+    assert np.all(np.isfinite(bad)), "the point: it is FINITE, so the guard cannot see it"
+    assert np.max(np.abs(bad)) > 1e30, "and absurd -- 35 orders past the true answer"
+
+
 def _spd_fem():
     """An SPD FEM operator (mass + stiffness) and its dense form."""
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.09)
