@@ -9,8 +9,10 @@ path is unaffected.
 !!! danger "Two limits are silent — every other one raises"
     The assembler cannot distinguish these from a legitimate modelling choice, so nothing stops you.
 
-    - **Affine geometry on a curved boundary** — the domain is approximated to O(h²), which caps
-      every element order above it. The solve is simply suboptimal.
+    - **Affine geometry on a curved boundary** — by **default** the mesh is straight-sided, so the
+      domain is approximated to O(h²), which caps every element order above it. The solve is simply
+      suboptimal. `Shape.curved()` fixes it (order 2, simplices) — see
+      [Curved geometry](geometry.md#curved-isoparametric-geometry-shapecurved).
     - **The `2πr` measure on an axisymmetric *vector* form** — exact for scalars, wrong for vectors.
 
     Both are detailed below, and stated again at the point where you make the choice.
@@ -26,7 +28,7 @@ path is unaffected.
 | Plasticity | small-strain, isotropic, linear-hardening, whole-domain | raises |
 | Element order on RT / N1E / P0 / Hermite / Argyris / Morley | each family has one intrinsic order | raises |
 | `eigs` on a non-symmetric pencil | eigenvalues differentiate, **eigenvectors do not** | NaN, not a silent zero |
-| **Curved-boundary geometry** | affine (straight-edge) at every order | **silent** |
+| **Curved-boundary geometry** | straight-sided **by default**; `Shape.curved()` is the fix | **silent** |
 | **Axisymmetric vector forms** | the `2πr` measure is wrong for vectors | **silent** |
 
 ### The detail
@@ -77,8 +79,8 @@ path is unaffected.
     Kinematic / nonlinear (Voce) hardening and contact are separate formulas / machinery, not built.
 
 ??? measured "Curved boundaries: P3 buys nothing over P2"
-    There is no isoparametric mapping, so on a curved boundary the domain itself is approximated to
-    O(h²) and that error caps every element order above it. Measured on the unit disk
+    With the **default straight-sided** mesh the domain itself is approximated to O(h²), and that
+    error caps every element order above it. Measured on the unit disk
     (`-Δu = 4`, `u|∂Ω = 0`, exact `u* = 1 − r²`), L2 rates under refinement:
 
     | order | expected | measured | error at `h = 0.05` |
@@ -92,8 +94,12 @@ path is unaffected.
     O(h²) inside the true arc.
 
     On a **polygonal** domain the advertised rates hold exactly (the suite measures P2/P3 there).
-    Until an isoparametric mapping exists, prefer `h`-refinement (or the adaptive loop) over
-    `order ≥ 2` near curved boundaries.
+
+    The fix on a curved one is `Shape.curved()`, which places the midside nodes on the true surface
+    and recovers P2's own third order — **570× more accurate** at the finest resolution in the same
+    study. It is order 2 and simplices only, and non-nodal families keep affine geometry, so where it
+    does not apply the advice above still stands: prefer `h`-refinement (or the adaptive loop) over
+    `order ≥ 2`. See [Curved geometry](geometry.md#curved-isoparametric-geometry-shapecurved).
 
 ??? note "Element order on a non-nodal family — refused, not applied"
     RT / N1E / P0 / Hermite / Argyris / Morley each have one intrinsic order. `space="N1E", order=2`

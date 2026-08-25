@@ -13,17 +13,18 @@ d = jno.Shape.disk(0, 0, 1, size=0.1).curved().domain()
 u, v = d.fem_symbols(order=2)          # the basis order must MATCH the geometry order
 ```
 
-Measured on `-Δu = 1` on the unit disk (exact `u = (1−r²)/4`), RMS nodal error:
+!!! measured "Unit disk, `-Δu = 1`, exact `u = (1−r²)/4` — RMS nodal error"
+    Measured on `-Δu = 1` on the unit disk (exact `u = (1−r²)/4`), RMS nodal error:
 
-| mesh size | straight-sided | curved |
-|---|---|---|
-| 0.4 | 6.73e-03 | 7.63e-05 |
-| 0.2 | 1.66e-03 | 7.67e-06 |
-| 0.1 | 4.23e-04 | 7.36e-07 |
-| **rate per halving** | **≈4× (O(h²))** | **≈10× (O(h³))** |
+    | mesh size | straight-sided | curved |
+    |---|---|---|
+    | 0.4 | 6.73e-03 | 7.63e-05 |
+    | 0.2 | 1.66e-03 | 7.67e-06 |
+    | 0.1 | 4.23e-04 | 7.36e-07 |
+    | **rate per halving** | **≈4× (O(h²))** | **≈10× (O(h³))** |
 
-Straight-sided is capped at second order by the geometry; curved recovers P2's own third order, and is
-**570× more accurate** at the finest resolution.
+    Straight-sided is capped at second order by the geometry; curved recovers P2's own third order, and is
+    **570× more accurate** at the finest resolution.
 
 **Scope — what this does not cover.** Order 2 and simplices only. An **order mismatch is refused**:
 isoparametric means geometry order == basis order, and a curved mesh under a P1 basis puts the midside
@@ -60,14 +61,15 @@ Xx = xi.trainable()                                # ONLY the x-positions of the
 #   differentiating a solve now yields the shape derivative ∂(solve)/∂X
 ```
 
-The spelling is **literal, per component** (`x.trainable()` moves only x; call it per axis for full
-motion — which also gives constrained relocation for free, e.g. promote only the tangential component on a
-slip plane). Under the hood the coordinate parameter scatters into the assembly's P1 geometry *before* the
-element Jacobian is formed, so `J`, `JxW`, the physical gradients, the quadrature-point coordinates **and
-the boundary-facet normals** all become differentiable in the node positions. Scope: nodal-Lagrange volume
-+ Neumann/Robin terms, 2D triangle / 3D tet, steady. The mesh **connectivity is fixed** — this is
-*relocation*, not remeshing (h-remeshing stays the non-differentiable outer AFEM loop); it is differentiable
-on valid meshes, with element inversion (tangling) the boundary of that regime.
+!!! warning "`.trainable()` is per component — call it on every axis you want to move"
+    The spelling is **literal, per component** (`x.trainable()` moves only x; call it per axis for full
+    motion — which also gives constrained relocation for free, e.g. promote only the tangential component on a
+    slip plane). Under the hood the coordinate parameter scatters into the assembly's P1 geometry *before* the
+    element Jacobian is formed, so `J`, `JxW`, the physical gradients, the quadrature-point coordinates **and
+    the boundary-facet normals** all become differentiable in the node positions. Scope: nodal-Lagrange volume
+    + Neumann/Robin terms, 2D triangle / 3D tet, steady. The mesh **connectivity is fixed** — this is
+    *relocation*, not remeshing (h-remeshing stays the non-differentiable outer AFEM loop); it is differentiable
+    on valid meshes, with element inversion (tangling) the boundary of that regime.
 
 **r-adaptivity in one call.** Tagging coordinates `.trainable()` and driving the relocation yourself is the
 low-level path; the packaged form reuses the **same `adapt=` slot** as h-refinement:
@@ -78,15 +80,16 @@ xm.trainable(); ym.trainable()                              # BEFORE jno.fem(...
 u = fem.solve(adapt=jno.solve.relocate(max_iters=60))
 ```
 
-`jno.solve.relocate()` descends the **equidistribution defect** of an arclength monitor through the
-differentiable solve, with a **backtracking `det J` line search** — so the fixed node set concentrates at
-solution features and the mesh never tangles (the validity constraint lives in the step control; a stock
-optimiser or an energy barrier alone cannot guarantee it on a stiff problem — see `run_adaptive_relocate`).
-It mutates the domain to the relocated mesh, returns the solution there, and **raises** if no coordinate was
-tagged. Works across **linear, nonlinear (Newton), transient (relocates for the whole trajectory via a
-time-averaged objective), periodic, and complex** problems, scalar or vector — the objective sums over every
-solution block, so a complex field's real and imaginary parts both contribute. Only complex-*transient* is
-not wired yet.
+??? note "How the descent works"
+    `jno.solve.relocate()` descends the **equidistribution defect** of an arclength monitor through the
+    differentiable solve, with a **backtracking `det J` line search** — so the fixed node set concentrates at
+    solution features and the mesh never tangles (the validity constraint lives in the step control; a stock
+    optimiser or an energy barrier alone cannot guarantee it on a stiff problem — see `run_adaptive_relocate`).
+    It mutates the domain to the relocated mesh, returns the solution there, and **raises** if no coordinate was
+    tagged. Works across **linear, nonlinear (Newton), transient (relocates for the whole trajectory via a
+    time-averaged objective), periodic, and complex** problems, scalar or vector — the objective sums over every
+    solution block, so a complex field's real and imaginary parts both contribute. Only complex-*transient* is
+    not wired yet.
 
 ### A mesh objective that names the physics — `objective=<expression>`
 
@@ -107,13 +110,14 @@ rebuilt from the moving vertices, so `n` is the *current* mesh's normal. The gra
 solve — matched to central differences at `7.5e-09` — and the through-flow falls `11.4x` over 60 rounds
 (`12.5x` at 120, so this is a descent, not a root-find).
 
-The benchmark deserves a word, because the obvious version of it measures nothing. In a channel with a
-**symmetry** bottom, uniform flow `u = (1,0)`, `p = 0` satisfies every equation and boundary condition
-for *any* shape of the traction-free top: measured, the solution stayed uniform to `2.3e-14` and moved
-by `9.8e-14` when the wall was displaced by `0.1`. The objective is then purely geometric — it exercises
-the normals and the facet measure but never the solve. A **no-slip** bottom couples them (`max|du| =
-7.2e-02` for the same displacement), and only then is `d(objective)/d(vertex)` a statement about the
-physics rather than about the mesh.
+??? measured "Why the obvious benchmark measures nothing"
+    The benchmark deserves a word, because the obvious version of it measures nothing. In a channel with a
+    **symmetry** bottom, uniform flow `u = (1,0)`, `p = 0` satisfies every equation and boundary condition
+    for *any* shape of the traction-free top: measured, the solution stayed uniform to `2.3e-14` and moved
+    by `9.8e-14` when the wall was displaced by `0.1`. The objective is then purely geometric — it exercises
+    the normals and the facet measure but never the solve. A **no-slip** bottom couples them (`max|du| =
+    7.2e-02` for the same displacement), and only then is `d(objective)/d(vertex)` a statement about the
+    physics rather than about the mesh.
 
 Three things to know:
 
@@ -155,12 +159,13 @@ fem.solve(adapt=jno.solve.relocate(objective=through, max_iters=200)
                          .remesh(criterion=lambda d: jno.le(d.cell_aspect(), 2.0), max_iters=4))
 ```
 
-The condition is checked **inside the relocation line search**, on each candidate step, so an
-inadmissible mesh is never accepted — the march honours the bound exactly rather than reporting a
-breach after the fact. When no admissible step exists, relocation has run out of room and the cells
-*blocking* it are refined; the movable vertices are then re-derived from the **region** each was tagged
-on, since indices do not survive a remesh. Measured on a Poisson peak, bound `1.7`: `44 → 80` vertices
-over 3 remeshes, final worst aspect exactly `1.700`, objective still falling `8.4e-02 → 2.0e-02`.
+??? note "Where the quality floor is enforced"
+    The condition is checked **inside the relocation line search**, on each candidate step, so an
+    inadmissible mesh is never accepted — the march honours the bound exactly rather than reporting a
+    breach after the fact. When no admissible step exists, relocation has run out of room and the cells
+    *blocking* it are refined; the movable vertices are then re-derived from the **region** each was tagged
+    on, since indices do not survive a remesh. Measured on a Poisson peak, bound `1.7`: `44 → 80` vertices
+    over 3 remeshes, final worst aspect exactly `1.700`, objective still falling `8.4e-02 → 2.0e-02`.
 
 The nested spec's `max_iters` caps how many remeshes the march may spend and `max_dofs` caps the size.
 If the budget runs out while the mesh still breaks the condition, that is **raised**, not returned
@@ -185,12 +190,13 @@ Tagging is **literal and per-axis**: `xm.trainable()` frees only the x column. O
 lever for sliding — free an edge's along-edge axis and its nodes redistribute *within* the wall, leave the
 normal axis untagged and the domain shape is preserved exactly.
 
-`method="monge_ampere"` swaps the descent for a Monge–Ampère mesh solve, `m·det(I + H(φ)) = θ` with
-`x = ξ + ∇φ` (McRae, Cotter & Budd, SIAM J. Sci. Comput. **40**(2) 2018, arXiv:1612.08077 §3.1). The
-displacement is a gradient, so the *whole* map cannot fold and no line search is needed, and it converges in
-3–6 rounds against descent's 30. It is **not** the default, because on the Allen–Cahn front the suite
-measures (`h=0.06`, `eps=0.03`, error on a common fine grid so the metric does not depend on where each mesh
-puts its nodes) it loses on the answer:
+??? note "`method="monge_ampere"` — the alternative"
+    `method="monge_ampere"` swaps the descent for a Monge–Ampère mesh solve, `m·det(I + H(φ)) = θ` with
+    `x = ξ + ∇φ` (McRae, Cotter & Budd, SIAM J. Sci. Comput. **40**(2) 2018, arXiv:1612.08077 §3.1). The
+    displacement is a gradient, so the *whole* map cannot fold and no line search is needed, and it converges in
+    3–6 rounds against descent's 30. It is **not** the default, because on the Allen–Cahn front the suite
+    measures (`h=0.06`, `eps=0.03`, error on a common fine grid so the metric does not depend on where each mesh
+    puts its nodes) it loses on the answer:
 
 | mesh | rel-L2 | vs uniform | min element quality |
 |---|---|---|---|
@@ -219,13 +225,14 @@ fem = jno.fem([ui.t * vi + kappa * (ui.x * vi.x + ui.y * vi.y),   # the physics
 traj = fem.solve()                                                # one frame per moved mesh
 ```
 
-It is recognised **structurally**, by containing `d(spatial coordinate)/d(temporal variable)`, so there is no
-new spelling: `Variable.d` and the term list already exist. Nothing about it is boundary-specific — an
-interior region, a boundary and a `where=` predicate all resolve the same way — and tagging is **per-axis**,
-so a term on `yb` alone moves the y column and holds x exactly. The velocity is ordinary traced math, so an
-interface law may read the solved field (a Stefan front `-(k/L)·∇T·n`), the coordinates, the outward normals,
-the time, or a `jno.np.parameter` that then becomes a design variable. The march is differentiable in all of
-them, and in where the mesh started.
+??? note "How a moving-mesh term is recognised"
+    It is recognised **structurally**, by containing `d(spatial coordinate)/d(temporal variable)`, so there is no
+    new spelling: `Variable.d` and the term list already exist. Nothing about it is boundary-specific — an
+    interior region, a boundary and a `where=` predicate all resolve the same way — and tagging is **per-axis**,
+    so a term on `yb` alone moves the y column and holds x exactly. The velocity is ordinary traced math, so an
+    interface law may read the solved field (a Stefan front `-(k/L)·∇T·n`), the coordinates, the outward normals,
+    the time, or a `jno.np.parameter` that then becomes a design variable. The march is differentiable in all of
+    them, and in where the mesh started.
 
 Each step: evaluate every geometry term's velocity, scatter it into the vertices and axes those terms name,
 extend harmonically over everything they do not, move, re-assemble on the moved vertices, and carry the state
@@ -245,33 +252,35 @@ across.
   rates of +1.4 then −0.4 as they cancel and separate again. That reads as a scheme that stops converging,
   and is only a contaminated measurement.
 
-  The term list *reads* like a coupled equation and this is not one: an implicit mesh would need the
-  coordinates as unknowns in the monolithic system and the ALE convective term.
-* **The state transfer is a conservative L2 projection** onto the moved mesh, and it is still diffusive. On a
-  rigid translation carrying a marginally-resolved bump the peak falls ~9 % (the pointwise re-interpolation
-  this replaced fell ~33 %, and got *worse* as `dt` shrank). Conservation is algebraic — `Σφ = 1` — so the
-  residual is quadrature error on an integrand with kinks: ~2e-4 relative against the pointwise route's
-  3e-3 to 9e-3. Removing the diffusion entirely means not transferring at all (Lagrangian DOFs plus an ALE
-  `-w·∇u` term), which is a different semidiscretisation.
-* **Requires `jax_enable_x64`.** The transfer locates quadrature points in the previous mesh, and in float32
-  that carries ~4e-4 — enough for a mesh that never moves to drift 1.5e-3 over a march (2.6e-10 with x64).
-* **Backward Euler only**: `θ` comes from the block, and `time=jno.solve.theta(...)` is a solver slot, which
-  a geometry term does not compose with.
-* **Connectivity-preserving**: a move that would invert an element raises. Remesh-on-tangle is the next
-  extension.
-* A Dirichlet BC on the moving surface must be tied to a whole-boundary or held tag, not to a spatial
-  sub-predicate — a predicate does not follow the motion.
-* **Any nodal-Lagrange field(s), real, non-periodic**, 2D or 3D — scalar or vector, P1 or higher, and
-  *mixed orders* across a coupled system (a Taylor–Hood pair moves as one). **Nonlinear** problems work
-  too. Complex, periodic, a non-nodal family (RT / Nédélec / Hermite / Argyris / Morley), a custom
-  `solve_fn` and `save_ts=` each raise.
+  ??? note "Why the mesh motion is explicit, not an implicit coupled equation"
+    The term list *reads* like a coupled equation and this is not one: an implicit mesh would need the
+      coordinates as unknowns in the monolithic system and the ALE convective term.
+    * **The state transfer is a conservative L2 projection** onto the moved mesh, and it is still diffusive. On a
+      rigid translation carrying a marginally-resolved bump the peak falls ~9 % (the pointwise re-interpolation
+      this replaced fell ~33 %, and got *worse* as `dt` shrank). Conservation is algebraic — `Σφ = 1` — so the
+      residual is quadrature error on an integrand with kinks: ~2e-4 relative against the pointwise route's
+      3e-3 to 9e-3. Removing the diffusion entirely means not transferring at all (Lagrangian DOFs plus an ALE
+      `-w·∇u` term), which is a different semidiscretisation.
+    * **Requires `jax_enable_x64`.** The transfer locates quadrature points in the previous mesh, and in float32
+      that carries ~4e-4 — enough for a mesh that never moves to drift 1.5e-3 over a march (2.6e-10 with x64).
+    * **Backward Euler only**: `θ` comes from the block, and `time=jno.solve.theta(...)` is a solver slot, which
+      a geometry term does not compose with.
+    * **Connectivity-preserving**: a move that would invert an element raises. Remesh-on-tangle is the next
+      extension.
+    * A Dirichlet BC on the moving surface must be tied to a whole-boundary or held tag, not to a spatial
+      sub-predicate — a predicate does not follow the motion.
+    * **Any nodal-Lagrange field(s), real, non-periodic**, 2D or 3D — scalar or vector, P1 or higher, and
+      *mixed orders* across a coupled system (a Taylor–Hood pair moves as one). **Nonlinear** problems work
+      too. Complex, periodic, a non-nodal family (RT / Nédélec / Hermite / Argyris / Morley), a custom
+      `solve_fn` and `save_ts=` each raise.
 
-  Higher order costs almost nothing structurally, for two reasons worth knowing: the mesh geometry is
-  **P1 whatever the field order** — a moved simplex stays straight-sided — so the quadrature map and the
-  point location are shared by every field; and a topology-preserving move leaves the P{k} **connectivity
-  unchanged**, so the seed assembly's tables stay valid for the whole march and the moved DOF
-  *coordinates* are never needed at all. The quadrature degree follows the order (`2k`), because the mass
-  `∫φᵢφⱼ` must be integrated exactly or the solve is not a projection.
+  ??? note "Why higher order costs almost nothing here"
+    Higher order costs almost nothing structurally, for two reasons worth knowing: the mesh geometry is
+      **P1 whatever the field order** — a moved simplex stays straight-sided — so the quadrature map and the
+      point location are shared by every field; and a topology-preserving move leaves the P{k} **connectivity
+      unchanged**, so the seed assembly's tables stay valid for the whole march and the moved DOF
+      *coordinates* are never needed at all. The quadrature degree follows the order (`2k`), because the mass
+      `∫φᵢφⱼ` must be integrated exactly or the solve is not a projection.
 
 ---
 
@@ -363,29 +372,32 @@ T = fem.solve()      # logarithmic in r, and Q = 2πk ΔT/ln(b/a) comes out righ
 Every term needs it — volume terms, source terms and Neumann/Robin terms alike. Miss one and the
 answer is wrong by exactly that factor with no error raised, so bind `dV` once at the top and reuse it.
 
-> **Vector fields need more than the measure.** Axisymmetric elasticity carries a hoop strain
-> `ε_θθ = u_r/r`, and divergence picks up `u_r/r`. Neither can be produced by weighting the Cartesian
-> form by anything — they are extra terms you must write out. This is precisely why jNO does not offer
-> to apply the weighting automatically: it would be exact for scalars and quietly wrong for vectors.
+!!! danger "Vector fields need more than the measure"
+    Axisymmetric elasticity carries a hoop strain
+    `ε_θθ = u_r/r`, and divergence picks up `u_r/r`. Neither can be produced by weighting the Cartesian
+    form by anything — they are extra terms you must write out. This is precisely why jNO does not offer
+    to apply the weighting automatically: it would be exact for scalars and quietly wrong for vectors.
 
-> **⚠️ This applies to vector EM too, and there is no guard.** An axisymmetric `(r, z)` **vector
-> Maxwell / eddy-current** form — the natural geometry for a coil, a solenoid, a tokamak vessel — is
-> *not* the Cartesian curl-curl weighted by `2πr`. In cylindrical coordinates the curl of a vector
-> field picks up its own `1/r` terms — `(∇×E)_z = (1/r)∂(rE_θ)/∂r` — and for an axisymmetric (`m=0`)
-> problem the meridional (`E_r, E_z`) and azimuthal (`E_θ`) components **decouple into two different
-> operators** that must each be written out. The azimuthal one reduces to a *scalar* equation (in
-> `E_θ`, or in `rA_θ` for the vector-potential/eddy-current form), not a component of the Cartesian
-> form, and it needs care on the axis where `1/r` is singular. Weighting an
-> `"N1E"` form by `2πr` therefore produces a **silently wrong** answer, not an approximate one.
-> Nothing raises: multiplying by `r` is ordinary arithmetic, and the assembler cannot tell it apart
-> from a legitimate radial coefficient — so this limit is stated here, where you choose the geometry,
-> rather than enforced at assembly. Use a **full 3-D** mesh for vector Maxwell (3-D N1E is wired and
-> validated), or derive and write the cylindrical operator yourself as an ordinary scalar/coupled
-> form. jNO ships no axisymmetric H(curl)/H(div) element and no meridional/azimuthal split.
+!!! danger "This applies to vector EM too, and there is no guard"
+    An axisymmetric `(r, z)` **vector
+    Maxwell / eddy-current** form — the natural geometry for a coil, a solenoid, a tokamak vessel — is
+    *not* the Cartesian curl-curl weighted by `2πr`. In cylindrical coordinates the curl of a vector
+    field picks up its own `1/r` terms — `(∇×E)_z = (1/r)∂(rE_θ)/∂r` — and for an axisymmetric (`m=0`)
+    problem the meridional (`E_r, E_z`) and azimuthal (`E_θ`) components **decouple into two different
+    operators** that must each be written out. The azimuthal one reduces to a *scalar* equation (in
+    `E_θ`, or in `rA_θ` for the vector-potential/eddy-current form), not a component of the Cartesian
+    form, and it needs care on the axis where `1/r` is singular. Weighting an
+    `"N1E"` form by `2πr` therefore produces a **silently wrong** answer, not an approximate one.
+    Nothing raises: multiplying by `r` is ordinary arithmetic, and the assembler cannot tell it apart
+    from a legitimate radial coefficient — so this limit is stated here, where you choose the geometry,
+    rather than enforced at assembly. Use a **full 3-D** mesh for vector Maxwell (3-D N1E is wired and
+    validated), or derive and write the cylindrical operator yourself as an ordinary scalar/coupled
+    form. jNO ships no axisymmetric H(curl)/H(div) element and no meridional/azimuthal split.
 
-> **Enclosure radiation.** `domain.enclosure(tags, axisymmetric=True)` gives ring areas `2πr̄·L` and a
-> `gap.load(q)` that is **per full revolution** (W, not W/m). The weak form you add it to must carry
-> the same `2πr`, or the two sides differ by exactly that factor. jNO cannot check this for you.
+!!! warning "Enclosure radiation carries the same factor"
+    `domain.enclosure(tags, axisymmetric=True)` gives ring areas `2πr̄·L` and a
+    `gap.load(q)` that is **per full revolution** (W, not W/m). The weak form you add it to must carry
+    the same `2πr`, or the two sides differ by exactly that factor. jNO cannot check this for you.
 
 ---
 
@@ -407,30 +419,33 @@ eps = gap.emissivity({"inner_gap": 0.8, "outer_gap": 0.6})         # per-element
 rho = 1.0 - eps
 ```
 
-`F` is computed purely from geometry (occlusion + orientation) by **double-area Gauss quadrature** of
-the diffuse kernel — so a *concave* surface keeps its self-view. Tags only group elements (for
-per-surface emissivity); they never block exchange. The enclosure **inherits** `axisymmetric` from the
-domain (see below), so its ring areas and the FEM measure cannot disagree; passing a contradicting value
-raises. By default the boundary normals point *out of* the mesh (radiation across an un-meshed gap); for
-an **oven/furnace cavity** where the meshed fluid is inside, pass `inward=True` so the facing walls see
-one another (see the *Oven* tutorial); for a meshed *medium* between solids use `medium_tags`.
+??? note "How the view factors are computed"
+    `F` is computed purely from geometry (occlusion + orientation) by **double-area Gauss quadrature** of
+    the diffuse kernel — so a *concave* surface keeps its self-view. Tags only group elements (for
+    per-surface emissivity); they never block exchange. The enclosure **inherits** `axisymmetric` from the
+    domain (see below), so its ring areas and the FEM measure cannot disagree; passing a contradicting value
+    raises. By default the boundary normals point *out of* the mesh (radiation across an un-meshed gap); for
+    an **oven/furnace cavity** where the meshed fluid is inside, pass `inward=True` so the facing walls see
+    one another (see the *Oven* tutorial); for a meshed *medium* between solids use `medium_tags`.
 
-> **What blocks a ray (interface mode).** Every meshed region that is *not* listed in `medium_tags`
-> is opaque — including a solid that carries no radiating surface of its own. The occluder set is
-> resolved once from the region list, not inferred from element tags, and is shared by the visibility
-> test and the near-field refinement: a solid with no radiating surface still blocks, and a chord
-> through it is never counted as visible.
+??? note "What blocks a ray — interface mode"
+    Every meshed region that is *not* listed in `medium_tags`
+    is opaque — including a solid that carries no radiating surface of its own. The occluder set is
+    resolved once from the region list, not inferred from element tags, and is shared by the visibility
+    test and the near-field refinement: a solid with no radiating surface still blocks, and a chord
+    through it is never counted as visible.
 
-> **Axisymmetric near field.** The ring kernel's azimuthal integrand peaks at `φ = 0` with width `d/r`,
-> so a uniform `n_phi` rule overshoots every near-touching pair (two surfaces meeting in a wedge, and
-> every element's own ring self-view) by roughly `dφ/(d/r)`. A graded azimuthal rule fixes it and
-> restores closure to ~1e-3, but it needs an occluder model to test its refined chords against, so it
-> runs when one is available: **`medium_tags=...`** (interface mode — the solid polygons), or
-> **`occlude=False`** (you asserting nothing blocks any ray, e.g. a convex cavity). Plain boundary mode
-> with occlusion on keeps the uniform rule plus the `r_min` floor and a closure error around 1e-1, and
-> logs a warning saying so. Its occlusion is also a *meridian-only* test reused at every azimuth, which
-> is wrong for a general solid of revolution — interface mode checks the true 3-D chord per azimuth.
-> Always call `gap.check()`.
+??? note "Axisymmetric near field, and when the graded rule runs"
+    The ring kernel's azimuthal integrand peaks at `φ = 0` with width `d/r`,
+    so a uniform `n_phi` rule overshoots every near-touching pair (two surfaces meeting in a wedge, and
+    every element's own ring self-view) by roughly `dφ/(d/r)`. A graded azimuthal rule fixes it and
+    restores closure to ~1e-3, but it needs an occluder model to test its refined chords against, so it
+    runs when one is available: **`medium_tags=...`** (interface mode — the solid polygons), or
+    **`occlude=False`** (you asserting nothing blocks any ray, e.g. a convex cavity). Plain boundary mode
+    with occlusion on keeps the uniform rule plus the `r_min` floor and a closure error around 1e-1, and
+    logs a warning saying so. Its occlusion is also a *meridian-only* test reused at every azimuth, which
+    is wrong for a general solid of revolution — interface mode checks the true 3-D chord per azimuth.
+    Always call `gap.check()`.
 
 Write the **full grey-body radiosity** (reflections included) and couple it to the conduction FEM by
 adding the net flux as a consistent surface load to the residual:
