@@ -2,41 +2,52 @@
 
 ## Non-nodal element families: H(div) and H(curl)
 
-> **⚠️ Experimental.** Validated on 2-D triangular meshes at lowest order (RT₀ / N1E₀); the API may
-> still change. Steady-linear, steady-nonlinear (Newton), and transient `M u̇ + A u = c` (including the
-> mixed/saddle DAE, e.g. transient Darcy) all work, as does the differentiable `fem.solve()` inverse
-> (a **scalar** or spatially-varying **P1 field** `k(x)` in a *volume* term, steady and transient). Every
-> edge/cell (RT/N1E/P0) operator — the steady `A`, and the transient **mass `M` and spatial `A`** (also when
-> re-assembled per step for a parametric march) — is assembled **sparsely, one element at a time** (a `BCOO`,
-> mirroring the native Lagrange assembler), never a dense global `jacfwd`; the mixed-DAE initial state is
-> projected by a matrix-free CG on the (SPD) field mass block. So a 3-D N1E **eddy-current / time-domain
-> Maxwell** transient scales instead of hitting the `O(n_dof²)` dense-assembly wall past ~10⁴ edges.
->
-> **3-D Nédélec (H(curl)) is supported** on a **tetrahedral** mesh: the first-kind `"N1E"` element
-> assembles the H(curl) **mass and curl-curl** forms (`inner(u, v) + inner(u.vector.curl(x,y,z),
-> v.vector.curl(x,y,z))`) — the correct edge discretisation for **Maxwell / eddy currents** (nodal
-> Lagrange gives spurious modes). The covariant push-forward `Φ_phys = J^{-T} Φ_ref` is dimension-agnostic
-> and the curl is taken from the physical gradient. The essential **PEC wall** `n×E = 0` is supported,
-> written `u.vector.cross(d.variable(region, normals=True))` (facet-based; it pins every boundary-face edge
-> DOF of the region). On a tet mesh **only N1E is wired** — RT / P0 / Hermite / Argyris / Morley remain
-> 2-D-triangle only and raise. On a **line** mesh `"Hermite"` selects the 1D cubic beam element
-> (see above); the other families raise.
->
-> **Each of these families has ONE intrinsic order** — RT₀ / N1E₀ lowest, P0 constant, Morley quadratic,
-> Hermite cubic, Argyris quintic — set by the element definition, not chosen. `order=` is a nodal-Lagrange
-> knob and **is refused** here rather than ignored: `space="N1E", order=2` used to hand back the same
-> lowest-order space silently (an identical operator), which is the worst failure shape for a wave problem
-> — you pay for accuracy, get first-order convergence, and only find out from a convergence study that
-> stalls. Refine the mesh instead (see *Mesh resolution for wave problems* below), or use a nodal Lagrange
-> field, where `order=` does apply.
->
-> **Not yet:** the rest of the zoo in 3-D (RT / C¹ / plate are 2-D only); the *inhomogeneous* `n×E = g` on
-> N1E; higher order; other families (BDM, second-kind Nédélec, Bell); quad / non-triangular meshes; a
-> runtime parameter **or trainable neural coefficient** in a **host-assembled** RT-pressure / plate
-> boundary term (the N1E tangential-trace impedance / incident **surface** BC *is* differentiable in a
-> boundary-term parameter *and* a learned `net(x)` coefficient); the
-> constraint-consistent algebraic initial state at `t0` in the saddle-DAE transient (only the reported `t0`
-> algebraic value is affected).
+!!! warning "Experimental — the validated scope"
+    Validated on 2-D triangular meshes at lowest order (RT₀ / N1E₀); the API may
+    still change. Steady-linear, steady-nonlinear (Newton), and transient `M u̇ + A u = c` (including the
+    mixed/saddle DAE, e.g. transient Darcy) all work, as does the differentiable `fem.solve()` inverse
+    (a **scalar** or spatially-varying **P1 field** `k(x)` in a *volume* term, steady and transient). Every
+    edge/cell (RT/N1E/P0) operator — the steady `A`, and the transient **mass `M` and spatial `A`** (also when
+    re-assembled per step for a parametric march) — is assembled **sparsely, one element at a time** (a `BCOO`,
+    mirroring the native Lagrange assembler), never a dense global `jacfwd`; the mixed-DAE initial state is
+    projected by a matrix-free CG on the (SPD) field mass block. So a 3-D N1E **eddy-current / time-domain
+    Maxwell** transient scales instead of hitting the `O(n_dof²)` dense-assembly wall past ~10⁴ edges.
+
+
+### 3-D Nédélec on tetrahedra
+
+**3-D Nédélec (H(curl)) is supported** on a **tetrahedral** mesh: the first-kind `"N1E"` element
+assembles the H(curl) **mass and curl-curl** forms (`inner(u, v) + inner(u.vector.curl(x,y,z),
+v.vector.curl(x,y,z))`) — the correct edge discretisation for **Maxwell / eddy currents** (nodal
+Lagrange gives spurious modes). The covariant push-forward `Φ_phys = J^{-T} Φ_ref` is dimension-agnostic
+and the curl is taken from the physical gradient. The essential **PEC wall** `n×E = 0` is supported,
+written `u.vector.cross(d.variable(region, normals=True))` (facet-based; it pins every boundary-face edge
+DOF of the region). On a tet mesh **only N1E is wired** — RT / P0 / Hermite / Argyris / Morley remain
+2-D-triangle only and raise. On a **line** mesh `"Hermite"` selects the 1D cubic beam element
+(see above); the other families raise.
+
+
+!!! warning "One intrinsic order per family — `order=` is refused"
+    RT₀ / N1E₀ lowest, P0 constant, Morley quadratic,
+    Hermite cubic, Argyris quintic — set by the element definition, not chosen. `order=` is a nodal-Lagrange
+    knob and **is refused** here rather than ignored: `space="N1E", order=2` used to hand back the same
+    lowest-order space silently (an identical operator), which is the worst failure shape for a wave problem
+    — you pay for accuracy, get first-order convergence, and only find out from a convergence study that
+    stalls. Refine the mesh instead (see *Mesh resolution for wave problems* below), or use a nodal Lagrange
+    field, where `order=` does apply.
+
+    The guard fires at **assembly** (`jno.fem(...)`), not at `fem_symbols`, which accepts
+    the argument — so check the error by building the form, not by creating the symbols.
+
+
+!!! note "Not yet wired"
+    the rest of the zoo in 3-D (RT / C¹ / plate are 2-D only); the *inhomogeneous* `n×E = g` on
+    N1E; higher order; other families (BDM, second-kind Nédélec, Bell); quad / non-triangular meshes; a
+    runtime parameter **or trainable neural coefficient** in a **host-assembled** RT-pressure / plate
+    boundary term (the N1E tangential-trace impedance / incident **surface** BC *is* differentiable in a
+    boundary-term parameter *and* a learned `net(x)` coefficient); the
+    constraint-consistent algebraic initial state at `t0` in the saddle-DAE transient (only the reported `t0`
+    algebraic value is affected).
 
 Beyond nodal Lagrange (P1/P2), `jno.fem` assembles **edge-DOF** families on 2-D triangles — for
 problems whose natural space is *not* H¹. Pick one with the `space=` knob on `fem_symbols`:
@@ -51,64 +62,74 @@ problems whose natural space is *not* H¹. Pick one with the `space=` knob on `f
 | `"Argyris"` | **C¹** quintic (TUBA-6) | value + `∇u` + `D²u` at vertices, `∂u/∂n` at edge midpoints | conforming **biharmonic** / plate / Cahn–Hilliard |
 | `"Morley"` | **non-conforming** quadratic (6 DOF) | value at vertices, `∂u/∂n` at edge midpoints | **cheap biharmonic** / plate — scales to fine meshes |
 
-> **Hermite** is the first element with a per-cell **DOF-mixing** transform `M(cell)` (global derivative
-> DOFs are the physical gradient `∇u` at the vertices). It is **C⁰** (not C¹), so it is *not* a conforming
-> biharmonic element — it de-risks the `M(cell)` machinery the **C¹ Argyris** element reuses. A
-> value-Dirichlet `u(region) - g` pins boundary-vertex value DOFs (derivatives free); composes with the
-> steady / transient / nonlinear paths (`tests/test_fem_hermite.py`).
+### Hermite — C⁰ value + gradient
 
-> **These families assemble sparsely.** Their *linear* operator is built element-by-element like every
-> other family, so peak memory grows as `n^1.0` and is set by the operator rather than by an
-> intermediate. Argyris reaches **22,511 DOFs** on an 8 GB card; Morley and Hermite go further still.
->
-> The solve stays **sparse-direct** for these families. Going sparse would otherwise have handed 4th-order
-> biharmonic operators to the Jacobi-preconditioned BiCGStab that serves real elliptic systems, where it
-> does not converge — a solver change disguised as a storage change. Their **second-order-in-time** path
-> is still dense, as it is for every non-nodal family.
+**Hermite** is the first element with a per-cell **DOF-mixing** transform `M(cell)` (global derivative
+DOFs are the physical gradient `∇u` at the vertices). It is **C⁰** (not C¹), so it is *not* a conforming
+biharmonic element — it de-risks the `M(cell)` machinery the **C¹ Argyris** element reuses. A
+value-Dirichlet `u(region) - g` pins boundary-vertex value DOFs (derivatives free); composes with the
+steady / transient / nonlinear paths (`tests/test_fem_hermite.py`).
 
-> **Argyris** is the **C¹-conforming** quintic triangle (21 DOF) — the element for **4th-order PDEs**.
-> Across a shared edge both `u` and `∂u/∂n` are continuous, so `∫Δu·Δv` is a *convergent* biharmonic
-> discretisation (the conformity caveat above does not apply). The reference dual basis is mapped to each
-> physical cell by the affine-equivalence DOF-transform `M(cell)` (Kirby, *SMAI J. Comput. Math.* 4, 2018;
-> element: Argyris–Fried–Scharpf 1968); its **globally-oriented edge-normal DOF** is what makes it C¹ on an
-> *unstructured* mesh. Essential BCs are the two plate traces — `u(region) - g` (deflection) and
-> `u.dn(region) - h` (rotation `∂u/∂n`); the boundary curvature `∂²u/∂n²` is always left **free**. These are
-> wired for **axis-aligned boundary edges** only; a non-axis-aligned edge is **rejected with a clear error**
-> (use Morley there). Composes with steady / transient / nonlinear `fem.solve()` and **inverse** (scalar or
-> P1-field `k(x)`, steady and transient — `tests/test_fem_argyris.py`, `tests/test_fem_inverse.py`).
+### How the non-nodal families assemble
 
-> **Morley** is the **cheapest** biharmonic element (6 DOF, quadratic). It is **non-conforming** — yet
-> passes the patch test and converges (energy `O(h)`, L² `O(h²)`). It reuses Argyris's `M(cell)` transform
-> and globally-oriented edge-normal DOF but with ~3.5× fewer DOF, so it is **much cheaper per node**
-> and scales to finer meshes. **Modelling subtlety:** because it is non-conforming,
-> the biharmonic form must be the **full-Hessian inner product** `inner(hessian(u), hessian(v))` (`∫D²u:D²v`),
-> *not* `∫Δu·Δv` — the Laplacian form is singular for Morley (`xy` has `Δu = 0` but `D²u ≠ 0`, a spurious
-> kernel). Its two plate traces `u(region) - g` and `u.dn(region) - h` work on **any** boundary orientation.
-> **Periodic ties** compose too — `u(top) - u(bottom)` ties the vertex-value *and* the edge-normal-derivative
-> DOFs across a matched (conforming) boundary pair, so a y-periodic biharmonic solve recovers a manufactured
-> `sin(πx)sin(2πy)` at the optimal L² rate (`tests/test_fem_morley.py::test_morley_periodic_biharmonic_convergence`);
-> the reduction requires **conforming** periodic boundaries (matching vertices/edges) and is Morley-only for now —
-> the other C¹ families (Argyris, Hermite) raise a clear `NotImplementedError`
-> (Morley, *Aeronautical Quarterly* **19**, 1968; `tests/test_fem_morley.py`).
+**These families assemble sparsely.** Their *linear* operator is built element-by-element like every
+other family, so peak memory grows as `n^1.0` and is set by the operator rather than by an
+intermediate. Argyris reaches **22,511 DOFs** on an 8 GB card; Morley and Hermite go further still.
 
-> **Plate boundary conditions.** For a 4th-order (plate/biharmonic) field the boundary trace has two
-> essential parts to pin independently — the **deflection** `u(region) - g` and the **rotation**
-> `u.dn(region) - h` — plus two conjugate **natural** parts (bending moment `M_n`, effective shear `V_n`)
-> that emerge on any trace you *don't* pin. The classical BCs compose from these:
->
-> | BC | Physics | How to write it (on a region) |
-> |----|---------|-------------------------------|
-> | **Clamped** | `w=0`, `∂w/∂n=0` | `u(reg)-g`, `u.dn(reg)-0` |
-> | **Simply-supported** | `w=0`, `M_n=0` | `u(reg)-g` |
-> | **Guided / sliding** | `∂w/∂n=0`, `V_n=0` | `u.dn(reg)-h` |
-> | **Free** | `M_n=0`, `V_n=0` | *(write neither — natural)* |
->
-> A free edge gets the natural `M_n=V_n=0` from the ν-weighted plate energy
-> `(1-ν)·inner(hessian(u),hessian(v)) + ν·laplacian(u)·laplacian(v)` (validated against Timoshenko's
-> square-plate coefficients). A *nonzero* prescribed edge moment is the boundary load `M_n * phi.dn(region)`
-> (`∮_region M_n ∂φ/∂n ds`), built from each cell's geometry so it applies on **any** edge orientation
-> (though on Argyris the *essential* pin is still axis-aligned-only). The conjugate **shear** load `V_n` is
-> not yet wired.
+The solve stays **sparse-direct** for these families. Going sparse would otherwise have handed 4th-order
+biharmonic operators to the Jacobi-preconditioned BiCGStab that serves real elliptic systems, where it
+does not converge — a solver change disguised as a storage change. Their **second-order-in-time** path
+is still dense, as it is for every non-nodal family.
+
+### Argyris — C¹-conforming quintic
+
+**Argyris** is the **C¹-conforming** quintic triangle (21 DOF) — the element for **4th-order PDEs**.
+Across a shared edge both `u` and `∂u/∂n` are continuous, so `∫Δu·Δv` is a *convergent* biharmonic
+discretisation (the conformity caveat above does not apply). The reference dual basis is mapped to each
+physical cell by the affine-equivalence DOF-transform `M(cell)` (Kirby, *SMAI J. Comput. Math.* 4, 2018;
+element: Argyris–Fried–Scharpf 1968); its **globally-oriented edge-normal DOF** is what makes it C¹ on an
+*unstructured* mesh. Essential BCs are the two plate traces — `u(region) - g` (deflection) and
+`u.dn(region) - h` (rotation `∂u/∂n`); the boundary curvature `∂²u/∂n²` is always left **free**. These are
+wired for **axis-aligned boundary edges** only; a non-axis-aligned edge is **rejected with a clear error**
+(use Morley there). Composes with steady / transient / nonlinear `fem.solve()` and **inverse** (scalar or
+P1-field `k(x)`, steady and transient — `tests/test_fem_argyris.py`, `tests/test_fem_inverse.py`).
+
+### Morley — the cheapest biharmonic element
+
+**Morley** is the **cheapest** biharmonic element (6 DOF, quadratic). It is **non-conforming** — yet
+passes the patch test and converges (energy `O(h)`, L² `O(h²)`). It reuses Argyris's `M(cell)` transform
+and globally-oriented edge-normal DOF but with ~3.5× fewer DOF, so it is **much cheaper per node**
+and scales to finer meshes. **Modelling subtlety:** because it is non-conforming,
+the biharmonic form must be the **full-Hessian inner product** `inner(hessian(u), hessian(v))` (`∫D²u:D²v`),
+*not* `∫Δu·Δv` — the Laplacian form is singular for Morley (`xy` has `Δu = 0` but `D²u ≠ 0`, a spurious
+kernel). Its two plate traces `u(region) - g` and `u.dn(region) - h` work on **any** boundary orientation.
+**Periodic ties** compose too — `u(top) - u(bottom)` ties the vertex-value *and* the edge-normal-derivative
+DOFs across a matched (conforming) boundary pair, so a y-periodic biharmonic solve recovers a manufactured
+`sin(πx)sin(2πy)` at the optimal L² rate (`tests/test_fem_morley.py::test_morley_periodic_biharmonic_convergence`);
+the reduction requires **conforming** periodic boundaries (matching vertices/edges) and is Morley-only for now —
+the other C¹ families (Argyris, Hermite) raise a clear `NotImplementedError`
+(Morley, *Aeronautical Quarterly* **19**, 1968; `tests/test_fem_morley.py`).
+
+### Plate boundary conditions
+
+**Plate boundary conditions.** For a 4th-order (plate/biharmonic) field the boundary trace has two
+essential parts to pin independently — the **deflection** `u(region) - g` and the **rotation**
+`u.dn(region) - h` — plus two conjugate **natural** parts (bending moment `M_n`, effective shear `V_n`)
+that emerge on any trace you *don't* pin. The classical BCs compose from these:
+
+| BC | Physics | How to write it (on a region) |
+|----|---------|-------------------------------|
+| **Clamped** | `w=0`, `∂w/∂n=0` | `u(reg)-g`, `u.dn(reg)-0` |
+| **Simply-supported** | `w=0`, `M_n=0` | `u(reg)-g` |
+| **Guided / sliding** | `∂w/∂n=0`, `V_n=0` | `u.dn(reg)-h` |
+| **Free** | `M_n=0`, `V_n=0` | *(write neither — natural)* |
+
+A free edge gets the natural `M_n=V_n=0` from the ν-weighted plate energy
+`(1-ν)·inner(hessian(u),hessian(v)) + ν·laplacian(u)·laplacian(v)` (validated against Timoshenko's
+square-plate coefficients). A *nonzero* prescribed edge moment is the boundary load `M_n * phi.dn(region)`
+(`∮_region M_n ∂φ/∂n ds`), built from each cell's geometry so it applies on **any** edge orientation
+(though on Argyris the *essential* pin is still axis-aligned-only). The conjugate **shear** load `V_n` is
+not yet wired.
 
 ```python
 u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="RT")   # H(div) flux
@@ -246,12 +267,13 @@ remesh(criterion=jno.np.abs(uy.x - ux.y))                      # 2-D vorticity
 remesh(criterion=d.by_region({"weld": 1.0, "plate": 0.0}))     # refine one material
 ```
 
-It is assembled against the problem's own test function, normalised by the lumped mass to a nodal
-field — so the scale is the criterion, not `criterion x cell volume`, and `theta` means the same thing
-on a coarse and a fine mesh — then integrated per cell and marked as usual. Everything else on the
-spec is unchanged, so a criterion composes with `theta`, `refine_factor`, `max_dofs` and the quad
-rebuild path below. Measured on a thin diagonal ridge: cells on the feature come out **1.85x** smaller
-than off it on triangles and **1.92x** on quads.
+??? note "How the residual estimator is formed"
+    It is assembled against the problem's own test function, normalised by the lumped mass to a nodal
+    field — so the scale is the criterion, not `criterion x cell volume`, and `theta` means the same thing
+    on a coarse and a fine mesh — then integrated per cell and marked as usual. Everything else on the
+    spec is unchanged, so a criterion composes with `theta`, `refine_factor`, `max_dofs` and the quad
+    rebuild path below. Measured on a thin diagonal ridge: cells on the feature come out **1.85x** smaller
+    than off it on triangles and **1.92x** on quads.
 
 A Löhner-style detector `|D²u|/|Du|` needs `order >= 2` — a P1 Hessian is identically zero, so at
 order 1 it would evaluate to nothing.
@@ -306,13 +328,14 @@ u = fem.solve(adapt=jno.solve.refine(theta=0.4, max_iters=4))       # ZZ-driven,
 u = fem.solve(adapt=jno.solve.refine(criterion=jno.np.abs(ui.x)))   # or on a traced criterion
 ```
 
-`refine` sits beside `remesh` rather than being a flag on it, because it is a different algorithm:
-`remesh` re-runs the mesher at a finer size field (needs a geometry to rebuild from, and the new mesh
-does not nest inside the old), while `refine` splits marked cells (local, keeps every node and its
-value, works on a mesh loaded from a file). Marking is shared — `theta`, `criterion`, `max_iters`,
-`max_dofs`, `tol`, `eps` all mean the same thing. There is no `refine_factor` (a split halves the cell
-by construction) and no `anisotropic` (a split is isotropic, so there is no direction to stretch along;
-that needs a simplex mesh).
+??? note "Why `refine` is separate from `remesh`"
+    `refine` sits beside `remesh` rather than being a flag on it, because it is a different algorithm:
+    `remesh` re-runs the mesher at a finer size field (needs a geometry to rebuild from, and the new mesh
+    does not nest inside the old), while `refine` splits marked cells (local, keeps every node and its
+    value, works on a mesh loaded from a file). Marking is shared — `theta`, `criterion`, `max_iters`,
+    `max_dofs`, `tol`, `eps` all mean the same thing. There is no `refine_factor` (a split halves the cell
+    by construction) and no `anisotropic` (a split is isotropic, so there is no direction to stretch along;
+    that needs a simplex mesh).
 
 To refine a specific set of cells outside the loop, call `refine_domain(domain, cell_ids)` from
 `jno.utils.solver.fem_refine` — the loop is a marking strategy on top of it.
@@ -409,21 +432,23 @@ adaptivity produces and is not tuned for refining a whole large mesh at once.
 Volume terms, Dirichlet conditions and **surface terms all work on both cells** — Neumann, Robin
 and flux integrals included.
 
-A *named subset* of a hexahedral boundary is resolved by facet identity, not by its nodes. The
-distinction is only visible when a tag omits a facet whose corners it keeps: a physical group naming
-8 of the 9 facets of a face shares every corner of the ninth with its neighbours, and the all-nodes
-mask puts that facet back. Measured as an applied load, that is `1.000` where the truth is `8/9`.
-The same applies to `region.contains(p)` — a point-in-region query anywhere between nodes — which
-tests the quadrilateral directly rather than a triangulation of it.
+??? note "How a named subset of a hex boundary is resolved"
+    A *named subset* of a hexahedral boundary is resolved by facet identity, not by its nodes. The
+    distinction is only visible when a tag omits a facet whose corners it keeps: a physical group naming
+    8 of the 9 facets of a face shares every corner of the ninth with its neighbours, and the all-nodes
+    mask puts that facet back. Measured as an applied load, that is `1.000` where the truth is `8/9`.
+    The same applies to `region.contains(p)` — a point-in-region query anywhere between nodes — which
+    tests the quadrilateral directly rather than a triangulation of it.
 
-Hexahedra took extra machinery to get there, and it is worth knowing why. A quadrilateral's facet is
-a straight edge (restricted to one edge a bilinear map is *linear*), so a single normal per facet is
-exact. A hexahedron's facet is a **bilinear surface**: its normal turns across the facet, and its
-area element varies with it. Both are therefore formed at each quadrature point by Nanson's formula,
-from the same physical tangents the area element already needed. The check is the divergence
-theorem, `∮ x·n dS = 3·Vol`, which is sensitive to the normal's direction *and* orientation at every
-point: it holds to **machine precision (≈3e-16)** on deliberately warped meshes with non-planar
-faces, and a single per-facet normal cannot pass it there.
+??? note "What hexahedra needed that quadrilaterals did not"
+    Hexahedra took extra machinery to get there, and it is worth knowing why. A quadrilateral's facet is
+    a straight edge (restricted to one edge a bilinear map is *linear*), so a single normal per facet is
+    exact. A hexahedron's facet is a **bilinear surface**: its normal turns across the facet, and its
+    area element varies with it. Both are therefore formed at each quadrature point by Nanson's formula,
+    from the same physical tangents the area element already needed. The check is the divergence
+    theorem, `∮ x·n dS = 3·Vol`, which is sensitive to the normal's direction *and* orientation at every
+    point: it holds to **machine precision (≈3e-16)** on deliberately warped meshes with non-planar
+    faces, and a single per-facet normal cannot pass it there.
 
 ### Mesh resolution for wave problems
 
