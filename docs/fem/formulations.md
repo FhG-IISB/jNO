@@ -36,7 +36,7 @@
 * **1D and 3D** — a 1D interval or a 3D `cube`/extruded `gmsh` volume use the identical API with
   one fewer / one more coordinate (`ui.z`, `u(xb, yb, zb) - g`).
 
-#### What the fluid path is verified to do — and what it is not
+### What the fluid path is verified to do — and what it is not
 
 Scope first, since it is not obvious from the API: jNO's FEM fluid path is **laminar incompressible**
 flow and nothing else. There is no turbulence model (no RANS, no LES), no compressible or Euler path,
@@ -99,7 +99,9 @@ elastoplastic tangent for free (AD of the formula). The solve is differentiable 
 `E`) as a `jno.np.parameter` to recover it from an observed deformation (material-identification inverse
 problem). This is Hencky deformation theory (virgin every solve): exact for monotonic proportional loading.
 
-**Flow theory** (path-dependent; unloading leaves a permanent set) is the *identical* formula reading the
+### Flow theory — the path-dependent march
+
+(path-dependent; unloading leaves a permanent set) is the *identical* formula reading the
 previous step's per-quadrature-point state with the step-history index `.i(k)`: `ee = eps(u) - ep.i(-1)`
 and `sy -> sy + H*al.i(-1)`, with `ep, al` declared like any field via `fem_symbols`. How each state
 *advances* is a **named update term** in the same list — `state.evolves(<formula>)`, an update, not an
@@ -125,17 +127,19 @@ traj = jno.fem([
 ]).solve()                                                   # (n_steps, n_dofs) load-path trajectory
 ```
 
-`.i(-k)` **reads** history, `.evolves` **writes** it. The build infers the keep-depth from the
-most-negative index and threads a zeroed per-quadrature-point buffer through the march's `lax.scan` carry
-(one compiled residual, reused every step; frozen-constant in the tangent → the consistent return-map
-tangent). The whole march rides `custom_root`, so it stays differentiable end-to-end: thread `sy` as a
-`jno.np.parameter` and `∂(unloaded state)/∂sy` flows through the entire load path (a material-
-identification inverse). A **primary-unknown** history (`u.i(-1)`/`u.i(-2)`, e.g. a BDF2 time scheme) is
-auto-buffered from the solved `u` — no `.evolves`; an **internal** state read at `.i(-1)` with no
-`.evolves` on a `tau=` domain is a build error (never a silently frozen buffer = deformation theory).
+??? note "How the build infers the history depth"
+    `.i(-k)` **reads** history, `.evolves` **writes** it. The build infers the keep-depth from the
+    most-negative index and threads a zeroed per-quadrature-point buffer through the march's `lax.scan` carry
+    (one compiled residual, reused every step; frozen-constant in the tangent → the consistent return-map
+    tangent). The whole march rides `custom_root`, so it stays differentiable end-to-end: thread `sy` as a
+    `jno.np.parameter` and `∂(unloaded state)/∂sy` flows through the entire load path (a material-
+    identification inverse). A **primary-unknown** history (`u.i(-1)`/`u.i(-2)`, e.g. a BDF2 time scheme) is
+    auto-buffered from the solved `u` — no `.evolves`; an **internal** state read at `.i(-1)` with no
+    `.evolves` on a `tau=` domain is a build error (never a silently frozen buffer = deformation theory).
 
-**Scope:** small-strain, isotropic, linear-hardening; 3-D (2-D is plane strain). Kinematic / nonlinear
-hardening and contact are separate (not built).
+!!! warning "Scope"
+    small-strain, isotropic, linear-hardening; 3-D (2-D is plane strain). Kinematic / nonlinear
+    hardening and contact are separate (not built).
 
 **A state can be shared by a coupled system.** The march is not single-field: history buffers are indexed
 by *cell*, never by field, and the readout gathers every field's cell DOFs at once — so a state written
@@ -175,23 +179,25 @@ field-agnostic.
 Not carried, each rejected with a clear error: a real `u.t` transient (drive time through `tau` instead),
 a complex form, 1D, non-nodal (Argyris/Morley/edge) elements, VPINN, and periodic ties.
 
-**A step that did not converge is refused, not carried forward.** The march runs its per-step Newton
-inside a single `lax.scan`, and the driver's own convergence check needs a *concrete* residual — so
-inside the scan it disables itself, exactly where the signal matters most. A load path compounds the
-loss: a non-converged step becomes the next step's initial state *and* its history buffers, so one
-silent failure contaminates everything after it, and the trajectory still comes back finite and
-entirely plausible. Measured on a 3-D Yeoh phase-field march whose undamped Newton overshot into an
-inverted element (`J = det F ≤ 0`, so `J**(-2/3)` is NaN, which is absorbing): with the grip *pinned*
-to 0.4 the returned displacement read 0.70, with no error raised.
+!!! danger "A step that did not converge is refused, not carried forward"
+    The march runs its per-step Newton
+    inside a single `lax.scan`, and the driver's own convergence check needs a *concrete* residual — so
+    inside the scan it disables itself, exactly where the signal matters most. A load path compounds the
+    loss: a non-converged step becomes the next step's initial state *and* its history buffers, so one
+    silent failure contaminates everything after it, and the trajectory still comes back finite and
+    entirely plausible. Measured on a 3-D Yeoh phase-field march whose undamped Newton overshot into an
+    inverted element (`J = det F ≤ 0`, so `J**(-2/3)` is NaN, which is absorbing): with the grip *pinned*
+    to 0.4 the returned displacement read 0.70, with no error raised.
 
-So the per-step residual is carried out of the scan and tested where it is concrete, against the
-driver's **own** `rtol`/`atol` — the net can only catch what the driver would have caught eagerly, and
-never second-guesses a solve configured loosely. Under `bounds` it scores the **min-map**, not the bare
-residual: on an active constraint that residual is non-zero by construction (it *is* the multiplier),
-and scoring against it would read a correct answer as a divergence. The check costs two residual
-evaluations per step — measured at **2.4%** (30.30 s → 31.03 s) of an 8-step, 576-DOF Yeoh march. It is
-a no-op under `jax.grad` of a runtime-parametric march, where the norms are themselves traced; there,
-as everywhere else in jNO, the solver's iteration cap is all there is.
+??? note "How a failed step is detected out of the scan"
+    So the per-step residual is carried out of the scan and tested where it is concrete, against the
+    driver's **own** `rtol`/`atol` — the net can only catch what the driver would have caught eagerly, and
+    never second-guesses a solve configured loosely. Under `bounds` it scores the **min-map**, not the bare
+    residual: on an active constraint that residual is non-zero by construction (it *is* the multiplier),
+    and scoring against it would read a correct answer as a divergence. The check costs two residual
+    evaluations per step — measured at **2.4%** (30.30 s → 31.03 s) of an 8-step, 576-DOF Yeoh march. It is
+    a no-op under `jax.grad` of a runtime-parametric march, where the norms are themselves traced; there,
+    as everywhere else in jNO, the solver's iteration cap is all there is.
 
 The error names the fixes in order of what usually works: globalize the per-step solve
 (`jno.solve.newton(line_search=True)` / `staggered(line_search=True)`, or `damping<1`), take smaller
@@ -200,7 +206,9 @@ case above, `line_search=True` alone recovers the exact answer — and note P1 s
 undamped: a higher-order element's full Newton step produces larger gradients at its extra quadrature
 points, so P2 is the more exposed one.
 
-**Adaptive load stepping — `fem.solve(tau=jno.solve.adaptive(limit=...))`.** A uniform load grid is
+### Adaptive load stepping
+
+A uniform load grid is
 wrong in both directions at once: it wastes steps while nothing happens and takes too-large ones through
 the event. On a path-dependent march that second failure is not merely coarse — a step can converge
 perfectly and skip the entire transition, leaving a valid sequence of equilibria with no resolved event
@@ -217,21 +225,23 @@ the `rtol`/`atol` step-doubling estimate that sizes `time=` measures nothing her
 much the solution may change in one step; a step is rejected (and cut by `shrink`) when the solve fails
 to converge *or* the change exceeds `limit`, and a comfortable step grows by `grow`.
 
-Mechanism: **pilot → freeze → replay**. March eagerly with rejection to discover the schedule, freeze
-it, replay it as a fixed-length differentiable scan. Rejection is exactly why the pilot must be
-separate: the transient marcher accepts every attempt on purpose, because a discarded state makes the
-per-step adjoint run at zero cotangent and returns a NaN gradient. The replay has nothing to reject.
-The schedule is piecewise constant in the parameters, so the gradient over a frozen one is the true
-derivative almost everywhere — the same contract `adapt=` makes for a frozen mesh sequence.
+??? note "Mechanism — pilot, freeze, replay"
+    Mechanism: **pilot → freeze → replay**. March eagerly with rejection to discover the schedule, freeze
+    it, replay it as a fixed-length differentiable scan. Rejection is exactly why the pilot must be
+    separate: the transient marcher accepts every attempt on purpose, because a discarded state makes the
+    per-step adjoint run at zero cotangent and returns a NaN gradient. The replay has nothing to reject.
+    The schedule is piecewise constant in the parameters, so the gradient over a frozen one is the true
+    derivative almost everywhere — the same contract `adapt=` makes for a frozen mesh sequence.
 
 The trajectory is resampled back onto the domain's declared `tau=` grid (as the transient resamples onto
 `save_ts`), so the returned shape does not depend on the steps taken and the resampling error is bounded
 by `limit` itself. `fem.tau_schedule` reports what the pilot chose.
 
-**A parametric form refuses to pilot, by design.** The pilot needs concrete values to accept or reject a
-step and a differentiable solve hands it tracers; piloting at the parameters' *stored* values would
-silently adapt to whatever they happen to be — 0.0 for a fresh `jno.np.parameter`, i.e. a load path that
-never happened. Discover the schedule forward, then replay it:
+!!! warning "A parametric form refuses to pilot, by design"
+    The pilot needs concrete values to accept or reject a
+    step and a differentiable solve hands it tracers; piloting at the parameters' *stored* values would
+    silently adapt to whatever they happen to be — 0.0 for a fresh `jno.np.parameter`, i.e. a load path that
+    never happened. Discover the schedule forward, then replay it:
 
 ```python
 fem.solve(tau=jno.solve.adaptive(limit=0.05))   # forward, at the values you want
@@ -253,7 +263,9 @@ Note that the bound does **not** replace the floor `eta` on the degradation: at 
 right. And a monolithic Newton is not expected to converge on this energy at all — drive it with
 [`jno.solve.staggered([u, dm])`](../solvers.md).
 
-**Finite strain is also just a formula.** Tensor constants broadcast correctly (`jno.np.identity(n)` carries
+### Finite strain
+
+Tensor constants broadcast correctly (`jno.np.identity(n)` carries
 a leading batch axis), so `F = I + ∇u`, `E = ½(FᵀF − I)`, `S = λ tr(E) I + 2μ E` and the internal virtual
 work `∫ (F S):∇δu` are written directly — St. Venant-Kirchhoff in five lines, no module:
 
@@ -267,7 +279,9 @@ mech = inner(einsum("...ij,...jk->...ik", F, S), H(phi), 2)      # ∫ (F S):∇
 `jno.fem` routes the nonlinear form to Newton (exact 20%-stretch patch test; reduces to linear elasticity
 as strain → 0). Combine with the plastic return map for finite-strain plasticity — both are formulas.
 
-**A hyperelastic material IS its stored energy — `jno.np.diff(psi, F)`.** For anything past St. Venant-
+### Hyperelasticity — the energy is the input
+
+For anything past St. Venant-
 Kirchhoff, hand-deriving the stress is where the algebra errors live. `diff` differentiates a **scalar
 expression with respect to another expression** (the constitutive counterpart of `grad`, which
 differentiates w.r.t. a coordinate), so you write the energy from the paper and get the 1st
