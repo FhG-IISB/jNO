@@ -202,6 +202,52 @@ precond=…, time=…)` composes (see the [FEM guide](fem/index.md)). The famili
 | **Matrix functions** (stochastic Lanczos, matrix-free) | `logdet`, `trace`, `applyfun` (`f(A)·v`), `diagonal` |
 | **Time integration** | `theta` (θ-method), `exponential` (exponential integrator), `adaptive` (step-doubling adaptive step size) |
 
+### Matrix functions — what `Ax = b` cannot express
+
+`logdet`, `trace`, `applyfun` and `diagonal` touch the operator only through its matvec, so they scale
+where a factorization cannot, and they are differentiable. They answer questions a linear solve
+cannot: the Bayesian **log-evidence** of a FEM precision, an **effective-degrees-of-freedom** count, a
+per-DOF **uncertainty map**, and one exact **exponential-integrator step**.
+
+```python
+A, _ = jno.fem([ui * vi + ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0]).operator
+
+jno.solve.logdet(A, samples=64)                          # log det A          — log-evidence
+jno.solve.trace(A, fun=lambda z: 1 / z, samples=64)      # tr(A⁻¹)            — effective DOFs
+jno.solve.diagonal(A, fun=lambda z: 1 / z, samples=256)  # diag(A⁻¹) as a FIELD, plottable on the mesh
+jno.solve.applyfun(A, u0, fun=lambda z: jnp.exp(-dt * z))  # exp(-dt·A)·u₀    — one exact step
+```
+
+!!! measured "Accuracy on a 198-DOF FEM precision operator (cond 45)"
+    | quantity | estimate | exact | rel |
+    |---|---|---|---|
+    | `logdet` (samples=64) | 168.99 | 167.22 | 1.1e-02 |
+    | `trace(1/z)` (samples=64) | 119.65 | 118.20 | 1.2e-02 |
+    | `diagonal(1/z)` (samples=256) | — | — | 1.1e-01 (L2 over the field) |
+    | `applyfun` exp step | — | — | **1.1e-15** |
+
+    The first three are **stochastic** — Hutchinson probes plus Lanczos quadrature — so a percent or
+    so is the expected accuracy, not a defect: variance falls with `samples`, bias with `order`.
+    `applyfun` is **deterministic** (a Krylov approximation, no probes) and essentially exact.
+
+    Differentiating works through the estimator: `d(log det cA)/dc` came back **152.198** against the
+    closed form `n/c = 152.308`.
+
+!!! danger "`order` must stay below the Krylov dimension — and a pinned FEM operator's is small"
+    Lanczos can only build a subspace as large as the number of **distinct** eigenvalues the probe
+    sees. A jNO FEM operator has far fewer than it has rows: every Dirichlet-pinned DOF is an identity
+    row, so eigenvalue 1.0 carries the pinned count as its multiplicity.
+
+    Measured on 2-D Poisson at mesh 0.25 — n=30, 16 pinned rows, only **15 distinct** eigenvalues —
+    the default `order=25` overran that and `logdet` returned `NaN`. It now raises instead, naming the
+    cause. The operator above is fine (198 rows, 151 distinct); a coarse mesh with a large boundary
+    fraction is not. Lower `order`, or apply the estimator to the free-DOF operator.
+
+    `applyfun` is the one to watch: past the Krylov dimension it degrades through a **finite but
+    absurd** regime that no finiteness check can catch — 2.50e+37 at `order=25`, 9.05e+75 at
+    `order=29`, against a true answer of 49.02. If a result looks wrong there, halve `order` and
+    compare before trusting it.
+
 ### Eigenproblems at scale
 
 `jno.solve.eigs` / `FEM.eigs` have three paths, chosen by the arguments. With none of the iterative

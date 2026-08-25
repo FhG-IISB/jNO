@@ -494,9 +494,25 @@ Tsol = fem.solve(u0=T_guess)                                   # conduction + ra
 A jitted residual / callable *object* isn't a plain function — wrap it as `jno.Coupling(fn)`, which is
 also how you reach the options below:
 
-- **Trainable coupling parameters.** A coupling is opaque to the trace walk — declare its parameters so
-  they thread through the solve and `crux` recovers them: `jno.Coupling(fn, params=[eps])`, with the
-  residual taking the `{name: value}` dict, `fn(u, p)`.
+- **Trainable coupling parameters.** A coupling is opaque to the trace walk — a `jno.np.parameter`
+  inside it is never found, so declare it. The residual then takes a second argument, the
+  `{name: value}` dict:
+
+    ```python
+    eps = jno.np.parameter((1,), name="eps")           # emissivity, calibrated from data
+    eps.initialize(jax.nn.initializers.constant(0.8))
+
+    def radiation(w, p):                                # p -> {"eps": value}
+        e = p["eps"].reshape(())
+        J = jnp.linalg.solve(eye - (1.0 - e) * F, e * SIGMA * gap.field(w) ** 4)
+        return gap.load(s_row * J - F @ J)
+
+    fem = jno.fem([conduction, jno.Coupling(radiation, params=[eps]), u(xc, yc) - T_COOL])
+    ```
+
+    The gradient reaches `eps` *through* the radiosity solve, so `jno.core` recovers it from
+    temperature observations like any other parameter (checked against finite differences to 3% in
+    `tests/test_fem_enclosure_radiation.py`).
 - **Multifield.** `jno.Coupling(fn, field_key=T_key)` acts on one field's DOF block (e.g. radiation on
   `T` in a heat+flow / thermo-mechanical solve).
 - **Transient.** The coupling enters each implicit step, so enclosure radiation over a heating cycle

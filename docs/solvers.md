@@ -49,6 +49,25 @@ Pick by structure:
     and steps aside on a tracer, leaving a transformed solve otherwise unguarded.
 
 
+### Two that are not `Ax = b` on a square, definite operator
+
+`minres` and `lstsq` cover the cases the table's other rows cannot, and both take a
+`jno.solve.LinearOperator` (or a BCOO, or a dense array) directly — no FEM required:
+
+```python
+op = jno.solve.LinearOperator(K)          # K symmetric but INDEFINITE — cg cannot be used
+x  = jno.solve.minres(tol=1e-12)(op, b)   # rel-resid 7.3e-13
+
+xl = jno.solve.lstsq(A, b, atol=1e-12, btol=1e-12)   # A RECTANGULAR (80 x 30), min ‖Ax − b‖
+xd = jno.solve.lstsq(A, b, damp=0.5)                 # + Tikhonov damp²‖x‖² — ill-posed inverses
+```
+
+!!! measured "Checked against dense oracles"
+    `minres` on a spectrum straddling zero (eigenvalues in `[-3, -0.5] ∪ [0.5, 3]`) reaches a
+    **7.3e-13** relative residual, where `cg` has no convergence theory at all. `lstsq` matches
+    `numpy.linalg.lstsq` to **7.5e-13**, and with `damp=0.5` matches the Tikhonov normal equations
+    `(AᵀA + damp²I)x = Aᵀb` to **5.1e-12**.
+
 ### Direct backends
 
 Four `lu` backends, and the choice is not obvious — the fastest one depends on **which phase your
@@ -112,6 +131,11 @@ fem.solve(linear=jno.solve.fgmres(tol=1e-10),
 
 # reuse an expensive setup across a Newton loop or a march
 fem.solve(linear=jno.solve.cg(tol=1e-10), precond=jno.precond.amg(cycles=1).cached())
+
+# three more with the same shape, each needing something the others do not:
+jno.precond.gmg(n_pre=2, n_post=2)      # geometric MG — needs a STRUCTURED grid
+jno.precond.jaxamg(symmetric=True)      # GPU AMG (AmgX) — needs the [amg] extra and a CUDA device
+jno.precond.ams()                       # H(curl) auxiliary-space MG — for N1E edge elements
 ```
 
 !!! measured "All six agree — the preconditioner is a speed choice, never an answer"
