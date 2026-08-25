@@ -179,6 +179,7 @@ nav:
       - Navier-Stokes Lid-Driven Cavity: tutorials/08-fem-and-varpinns/navier-stokes-cavity-2d.md
       - "Navier-Stokes Cylinder (DFG 2D-1)": tutorials/08-fem-and-varpinns/navier-stokes-cylinder-dfg.md
       - "Stokes 3D (Duct Past a Sphere)": tutorials/08-fem-and-varpinns/stokes-3d-duct-sphere.md
+      - "Thermal Barrier Coating (tied, two meshes)": tutorials/08-fem-and-varpinns/tied-coating-multiscale.md
       - "Rayleigh–Bénard (heat + flow)": tutorials/08-fem-and-varpinns/rayleigh-benard-2d.md
       - "Brittle Fracture (4th-order phase-field, coupled)": tutorials/08-fem-and-varpinns/phase-field-fracture-2d.md
       - "Phase-Field Fracture SENT (the whole study as a term list)": tutorials/08-fem-and-varpinns/phase-field-fracture-sent.md

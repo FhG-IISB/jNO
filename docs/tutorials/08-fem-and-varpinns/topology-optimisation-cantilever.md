@@ -103,6 +103,23 @@ distortion at all (uniform density on both meshes). Here that control shows only
 reference mesh is genuinely converged and the excess is attributable to the moved nodes. Skipping this
 control is how a load-application bug or a plain refinement effect gets reported as a method result.
 
+??? note "The reanalysis script that produces the numbers below"
+    Kept separate from the optimisation run because it is a *check on* the result, not part of
+    producing it. It is a **CLI tool**, not a runnable example — it takes the converged design and
+    re-solves it on a clean mesh:
+
+    ```bash
+    python reanalysis.py --design <design>.npz [--h-fine 0.5] [--threshold 0.5]
+    ```
+
+    !!! warning "The optimisation script above does not currently write that `.npz`"
+        So the two do not connect out of the box: you have to save `rho_f` yourself at the end of the
+        run before this script can consume it. The numbers in the table below were produced that way.
+
+    ```python
+    --8<-- "tutorial_examples/08_fem_and_varpinns/reanalysis.py:code"
+    ```
+
 ## Result
 
 ![Top: the optimised physical density on the deformed mesh, a cantilever truss with thick well-defined members. Middle: the optimised mesh with interior nodes coloured by how far they moved, showing movement concentrated along the structural members. Bottom left: bar chart of compliance on its own mesh, the value expected on a clean mesh after correcting for discretisation, and the value actually measured. Bottom right: histogram of element densities, strongly bimodal at 0 and 1.](/jNO/assets/topology_optimisation_cantilever.png)
