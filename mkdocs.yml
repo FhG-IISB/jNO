@@ -85,6 +85,9 @@ markdown_extensions:
   - pymdownx.inlinehilite
   - pymdownx.snippets:
       base_path: docs
+      # Without this a mistyped section name renders an EMPTY code block and --strict
+      # still passes, so a broken transclusion is invisible. Verified: it does.
+      check_paths: true
   - pymdownx.tabbed:
       alternate_style: true
   - pymdownx.arithmatex:

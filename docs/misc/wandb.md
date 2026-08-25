@@ -102,10 +102,35 @@ All three are no-ops when `get_wandb_run()` returns `None`.
 
 ---
 
-## Full example
+## A full run, end to end
 
-A runnable script that combines all four explainability callbacks, checkpointing, and W&B logging is available in the tutorial examples:
+The `09_wandb` tutorial script this section used to embed was removed in #84, so the example is
+inline here — and, unlike an embed, verified to run:
 
 ```python
---8<-- "tutorial_examples/09_wandb/wandb_integration.py"
+import jax, optax, foundax, jno
+from jno.utils.config import get_wandb_run, wandb_log, wandb_log_model
+
+run = jno.setup(__file__, wandb=True)          # False (default) disables; a dict is passed to wandb.init
+
+dom = jno.Shape.rect(0, 0, 1, 1, size=0.05).domain()
+x, y, _ = dom.variable("interior")
+
+net = jno.nn(foundax.mlp(2, hidden_dims=64, num_layers=4, key=jax.random.PRNGKey(0)))
+net.optimizer(optax.adam(1e-3))
+
+u = net(jno.np.concat([x, y], axis=-1)) * x * (1 - x) * y * (1 - y)
+crux  = jno.core([(u.dd(x) + u.dd(y) + 1.0).mse])
+stats = crux.solve(20_000)                     # returns a `statistics` object
+
+wandb_log({"final_loss": float(stats.total_loss)}, step=20_000)
+wandb_log_model(net.module, name="best_model")
+jno.save(crux, f"{run}/model.pkl")
+jno.wandb_finish()
 ```
+
+!!! warning "`wandb=True` creates a real run on your account"
+    It picks up whatever credentials `wandb login` has stored and syncs to wandb.ai. Leave it at the
+    default `False` — or export `WANDB_MODE=disabled` — when you are only testing that a script runs.
+    With no active run, `wandb_log`, `wandb_log_model` and `wandb_alert` are all no-ops, so the same
+    script works either way.
