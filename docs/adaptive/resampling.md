@@ -189,6 +189,34 @@ The solver applies configured strategies automatically during `solve()`.
 
 ---
 
+## Tracing: jit and gradients
+
+Every strategy's `resample()` is `jax.jit`-compilable and differentiable, given the candidate pool as
+an array (`candidates=`; `domain.draw_candidates` itself is host-side and cannot be traced):
+
+```python
+jitted = jax.jit(functools.partial(strat.resample, domain=None, tag="interior", epoch=0))
+new_pts = jitted(points, residuals, rng_key=key, candidates=pool)
+
+g_points, g_pool = jax.grad(loss, argnums=(0, 1))(points, pool)   # both flow
+```
+
+**What carries a gradient, and what does not.** The *positions* do: every returned point is a gather
+from either the current points or the pool, so `d(result)/d(points)` and `d(result)/d(pool)` are
+real. The *selection* does not — which slot keeps its point and which is refilled is decided by
+`argsort` and a threshold comparison, both step functions with zero derivative almost everywhere.
+Differentiating "which point was chosen" would need a relaxation (Gumbel-softmax or a soft weighting)
+and is not implemented.
+
+Measured on 4 000 points against a 20 000-point pool (CPU), jit against the same call eager:
+`random` 1.35×, `r3` 1.70×, `cr3` 1.95×, `rad` 3.28×.
+
+!!! note "CR3's gamma stays host-side"
+    CR3 adapts a causal-gate parameter `gamma` between resamples. Advancing it inside a traced call
+    would capture a tracer in the strategy object, so `resample()` uses the current value and
+    [`next_gamma`][] is the pure form the training loop advances with. Everything else about CR3
+    traces.
+
 ## Tips
 
 - **Start epoch**: Always delay resampling (`start_epoch > 0`) to let the network form a rough global solution first. Resampling too early can disrupt initial training.

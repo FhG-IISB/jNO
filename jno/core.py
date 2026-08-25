@@ -4096,12 +4096,24 @@ class core:
                             if normal_tag in full_context and candidates_pts is not None and candidates_nrms is not None:
                                 cand_pts_j = jnp.array(candidates_pts)  # (N_pool, D)
                                 cand_nrm_j = jnp.array(candidates_nrms)  # (N_pool, D)
+                                prev_nrm_bn = jnp.array(full_context[normal_tag])[:, 0]  # (B, N, D)
                                 new_nrm_batches = []
                                 for b in range(n_batch):
-                                    # Each new point is an exact row from the pool → argmin recovers its index.
-                                    diffs = new_points_bn[b, :, None, :] - cand_pts_j[None, :, :]
+                                    # A strategy returns a MIX: points freshly drawn from the pool, and
+                                    # points RETAINED from the previous set. Look both up together, so every
+                                    # returned point has an exact match and keeps its own normal.
+                                    #
+                                    # Searching the pool alone is only correct when the pool is frozen (a
+                                    # meshed domain, where the retained points are nodes and so are in it).
+                                    # A mesh-free domain redraws the pool every event, so a retained point is
+                                    # in it only by accident and would snap to whichever pool point is
+                                    # nearest -- measured 3e-3 on a circular hole, and a full 90° across an
+                                    # edge of a box, where the nearest sample sits on the adjoining face.
+                                    ref_pts = jnp.concatenate([points_bn[b], cand_pts_j], axis=0)
+                                    ref_nrm = jnp.concatenate([prev_nrm_bn[b], cand_nrm_j], axis=0)
+                                    diffs = new_points_bn[b, :, None, :] - ref_pts[None, :, :]
                                     nearest = jnp.argmin(jnp.sum(diffs**2, axis=-1), axis=-1)
-                                    new_nrm_batches.append(cand_nrm_j[nearest])
+                                    new_nrm_batches.append(ref_nrm[nearest])
                                 new_nrms_bn = jnp.stack(new_nrm_batches, axis=0)  # (B, N, D)
                                 full_context[normal_tag] = jnp.tile(new_nrms_bn[:, None, :, :], (1, T, 1, 1))
                                 self.domain.context[normal_tag] = np.asarray(full_context[normal_tag])

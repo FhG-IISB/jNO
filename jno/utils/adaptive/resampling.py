@@ -25,6 +25,62 @@ def _get_candidate_pool(
     return None
 
 
+def _require_pool(pool, tag: str, strategy: str):
+    """Fail loudly when a strategy has nothing to resample from. **Currently unused.**
+
+    With no pool, CR3, R3 and RandomResampling return the caller's own points: the caller asked for
+    resampling, gets a silent no-op, and the run looks healthy while the collocation points never
+    move. That is an odd fit for a codebase whose first rule is never fail silently -- but it is a
+    DELIBERATE contract, asserted by
+    ``test_resampling.py::test_random_resampling_without_candidates_returns_input``, so switching it
+    is a behaviour change for callers to decide on rather than one to make in passing. This is the
+    error it would raise. RAD is unaffected either way: it perturbs its high-residual points instead.
+    """
+    if pool is None:
+        raise ValueError(
+            f"{strategy}.resample(tag={tag!r}): no candidate pool to draw from, so there is nothing "
+            f"to resample and the points would be returned unchanged. Either pass candidates=<(M, D) "
+            f"array>, or use a domain whose tag has a pool (domain.draw_candidates({tag!r}))."
+        )
+    return pool
+
+
+def _retain_and_refill(
+    points: jnp.ndarray,
+    score: jnp.ndarray,
+    pool: jnp.ndarray,
+    rng_key: jnp.ndarray,
+    *,
+    threshold: jnp.ndarray,
+    n_min: int,
+    n_max: int,
+) -> jnp.ndarray:
+    """Keep the highest-scoring points, refill every other slot from ``pool``.
+
+    This is the traceable form of "keep where score >= threshold, clamped to [n_min, n_max]".
+    The obvious spelling, ``points[score >= threshold]``, has an output shape that depends on the
+    VALUES of ``score``, so it cannot be jitted and cannot be differentiated -- and the follow-up
+    ``int(jnp.sum(mask))`` forces a tracer to a Python int, which is the actual error.
+
+    Ranking makes the shape static instead: slot *i* holds either the *i*-th highest-scoring current
+    point or a fresh candidate, chosen by :func:`jnp.where`. Both branches are gathers, so gradients
+    flow to ``points`` AND to ``pool``. ``n_min``/``n_max`` are counts derived from ``points.shape``,
+    which is static under trace, so the clamp costs nothing.
+
+    The selection itself (which slot keeps and which refills) is discrete and carries no gradient --
+    ``argsort`` and the comparison are step functions. What is differentiable is the *position* of
+    every returned point with respect to the points and the candidate pool it was gathered from.
+    """
+    n = points.shape[0]
+    order = jnp.argsort(score)[::-1]  # descending: best score first
+    ranked = points[order]
+    rank = jnp.arange(n)
+    above = score[order] >= threshold
+    keep = (rank < n_min) | (above & (rank < n_max))
+    fresh = pool[jax.random.choice(rng_key, pool.shape[0], shape=(n,), replace=True)]
+    return jnp.where(keep[:, None], ranked, fresh)
+
+
 class ResamplingStrategy(ABC):
     """Base class for collocation point resampling strategies.
 
@@ -97,6 +153,13 @@ class ResamplingStrategy(ABC):
                 ``domain.draw_candidates(tag)``.  When provided, strategies
                 draw new points from this array; when None the strategy calls
                 ``domain.draw_candidates`` itself.
+
+                **Under ``jax.jit``, pass this explicitly.** Leaving it None still traces --
+                ``draw_candidates`` runs on the host at trace time -- but the pool it returns is
+                then a compile-time constant, so every later call reselects from that one frozen
+                cloud. Measured: 25 600 draws from a jitted strategy with candidates=None yielded
+                2559 distinct points against a pool of 2560. Selection still varies with the key,
+                which is what makes it easy to miss.
 
         Returns:
             New points (N, D)
@@ -188,20 +251,22 @@ class CR3(ResamplingStrategy):
         g = 0.5 * (1.0 - jnp.tanh(self.alpha * (t_norm - self.gamma)))
         return jnp.clip(g, 0.0, 1.0)
 
+    def next_gamma(self, residuals: jnp.ndarray, gate_values: jnp.ndarray):
+        """The gamma this strategy would advance to, as a pure function of its inputs.
+
+        Kept separate from :meth:`resample` because gamma is state carried BETWEEN resamples: doing
+        the update inside a traced call would either capture a tracer in ``self`` or be dropped.
+        Returns a JAX scalar; the caller decides when to make it concrete.
+        """
+        Lg = jnp.mean(residuals**2 * gate_values)
+        step = self.eta_g * jnp.minimum(jnp.exp(-self.epsilon * Lg), self.delta_max)
+        return jnp.clip(self.gamma + step, -1.0, 2.0)
+
     def _update_gamma(self, residuals: jnp.ndarray, gate_values: jnp.ndarray):
-        """Update gamma based on gated loss."""
+        """Advance gamma in place. Eager only -- see :meth:`next_gamma`."""
         if len(residuals) == 0:
             return
-
-        # Gated loss
-        Lg = float(jnp.mean(residuals**2 * gate_values))
-
-        # Update step
-        step = self.eta_g * jnp.minimum(jnp.exp(-self.epsilon * Lg), self.delta_max)
-        self.gamma = float(self.gamma + step)
-
-        # Clip to reasonable bounds
-        self.gamma = float(jnp.clip(self.gamma, -1.0, 2.0))
+        self.gamma = float(self.next_gamma(residuals, gate_values))
         self.gamma_history.append(self.gamma)
 
     def resample(
@@ -250,52 +315,28 @@ class CR3(ResamplingStrategy):
         # Compute gated score
         F = residuals * gate_values
 
-        # Threshold selection
-        threshold = jnp.mean(F)
-        keep_mask = F > threshold
-        n_keep = int(jnp.sum(keep_mask))
-
-        # Apply min/max constraints
-        n_min = max(1, int(self.min_keep_frac * n_points))
-        n_max = min(n_points - 1, int(self.max_keep_frac * n_points))
-
-        if n_keep < n_min:
-            # Keep top n_min by gated score
-            top_indices = jnp.argsort(F)[-n_min:]
-            keep_mask = jnp.zeros(n_points, dtype=bool)
-            keep_mask = keep_mask.at[top_indices].set(True)
-            n_keep = n_min
-        elif n_keep > n_max:
-            # Keep only top n_max
-            keep_indices = jnp.where(keep_mask)[0]
-            top_indices = keep_indices[jnp.argsort(F[keep_indices])[-n_max:]]
-            keep_mask = jnp.zeros(n_points, dtype=bool)
-            keep_mask = keep_mask.at[top_indices].set(True)
-            n_keep = n_max
-
-        # Retain selected points
-        retained_points = points[keep_mask]
-        n_new = n_points - len(retained_points)
-
-        # Fill with random samples
         pool = _get_candidate_pool(candidates, domain, tag)
-        if n_new > 0 and pool is not None:
-            new_indices = jax.random.choice(rng_key, pool.shape[0], shape=(n_new,), replace=True)
-            new_points = pool[new_indices]
-            result = jnp.concatenate([retained_points, new_points], axis=0)
-        else:
-            result = retained_points
+        if pool is None:  # same no-op contract as RandomResampling; see _require_pool's note
+            return points
 
-        # Update gamma for next iteration
-        self._update_gamma(residuals, gate_values)
+        result = _retain_and_refill(
+            points,
+            F,
+            pool,
+            rng_key,
+            threshold=jnp.mean(F),
+            n_min=max(1, int(self.min_keep_frac * n_points)),
+            n_max=min(n_points - 1, int(self.max_keep_frac * n_points)),
+        )
 
-        # Ensure correct size
-        if len(result) < n_points:
-            extra_indices = jax.random.choice(rng_key, len(result), shape=(n_points - len(result),), replace=True)
-            extra_points = result[extra_indices]
-            result = jnp.concatenate([result, extra_points], axis=0)
+        # gamma is per-call adaptive state, so advancing it here would either capture a tracer or
+        # be silently skipped under jit. `next_gamma` is the pure form; the training loop advances
+        # it between resamples, where the values are concrete.
+        if not isinstance(jnp.asarray(F), jax.core.Tracer):
+            self.gamma = float(self.next_gamma(residuals, gate_values))
+            self.gamma_history.append(self.gamma)
 
-        return result[:n_points]
+        return result
 
 
 """HA: Hybrid Adaptive resampling strategy.
@@ -641,52 +682,23 @@ class R3(ResamplingStrategy):
         elif self.threshold_mode == "median":
             threshold = jnp.median(residuals)
         elif isinstance(self.threshold_mode, (int, float)):
-            threshold = float(self.threshold_mode)
+            threshold = jnp.asarray(self.threshold_mode, dtype=residuals.dtype)
         else:
             threshold = jnp.mean(residuals)
 
-        # Find points to keep (above threshold)
-        keep_mask = residuals >= threshold
-        n_keep = int(jnp.sum(keep_mask))
-
-        # Apply min/max constraints
-        n_min = int(self.min_keep_frac * n_points)
-        n_max = int(self.max_keep_frac * n_points)
-
-        if n_keep < n_min:
-            # Keep more points based on sorted residuals
-            top_indices = jnp.argsort(residuals)[-n_min:]
-            keep_mask = jnp.zeros(n_points, dtype=bool)
-            keep_mask = keep_mask.at[top_indices].set(True)
-            n_keep = n_min
-        elif n_keep > n_max:
-            # Keep fewer points based on sorted residuals
-            top_indices = jnp.argsort(residuals)[-n_max:]
-            keep_mask = jnp.zeros(n_points, dtype=bool)
-            keep_mask = keep_mask.at[top_indices].set(True)
-            n_keep = n_max
-
-        kept_points = points[keep_mask]
-        n_new = n_points - len(kept_points)
-
-        # Sample new points from candidates
         pool = _get_candidate_pool(candidates, domain, tag)
-        if n_new > 0 and pool is not None:
-            new_indices = jax.random.choice(rng_key, pool.shape[0], shape=(n_new,), replace=True)
-            new_points = pool[new_indices]
-            result = jnp.concatenate([kept_points, new_points], axis=0)
-        else:
-            result = kept_points
+        if pool is None:  # same no-op contract as RandomResampling; see _require_pool's note
+            return points
 
-        # Ensure correct size
-        if len(result) < n_points:
-            extra_indices = jax.random.choice(rng_key, len(result), shape=(n_points - len(result),), replace=True)
-            extra_points = result[extra_indices]
-            result = jnp.concatenate([result, extra_points], axis=0)
-        elif len(result) > n_points:
-            result = result[:n_points]
-
-        return result
+        return _retain_and_refill(
+            points,
+            residuals,
+            pool,
+            rng_key,
+            threshold=threshold,
+            n_min=int(self.min_keep_frac * n_points),
+            n_max=int(self.max_keep_frac * n_points),
+        )
 
 
 """RAD: Residual-based Adaptive Distribution resampling."""
