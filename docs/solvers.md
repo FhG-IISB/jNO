@@ -461,6 +461,25 @@ fem.stats
 #                                 'bound': 1.7e-06, 'steps': 3, 'converged': True}}
 ```
 
+### Where the time went — `fem.solve(profile=True)`
+
+`fem.stats` says *what* the solver did; `profile=True` says *how long* and *where*. It runs the solve
+inside a JAX Perfetto trace, prints the DOF count and wall time, and writes the trace to
+`./jno_traces` for `chrome://tracing` or [ui.perfetto.dev](https://ui.perfetto.dev):
+
+```python
+u = fem.solve(profile=True)
+# [fem profile · 75 DOFs · linear]  wall 82.8 ms  ·  Perfetto trace → ./jno_traces
+```
+
+The same flag exists on `jno.core(...).solve(profile=True)` (see
+[Evaluation](training/evaluation.md)) and on `jno.rcwa(...).solve(profile=True)`.
+
+!!! warning "Profile a *concrete* solve"
+    It runs **eagerly**, at the current parameter values. A parametric solve returns a deferred trace
+    node with no numeric work to time, so there is nothing to profile — and `./jno_traces` is not in
+    the repo's `.gitignore`, so the trace directory will show up as untracked.
+
 ## Transient problems
  The slots configure the *per-step* solves of the default theta-method integrator:
 `linear`/`precond` see the step operator `M + θ·dt·A` — when it is time-independent the step matrix is

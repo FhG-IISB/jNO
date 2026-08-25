@@ -243,7 +243,8 @@ u_phys = rescaler.to_physical(u_hat)       # map a dimensionless solution back: 
 (`πᵢ = Sᵢ / S_ref`), not on a ratio between two separate losses. Today only coordinates and the network
 output are annotatable through the public API; a bare material coefficient has no public `.unit` hook
 yet. See the
-[Gradient Conflict tutorial](tutorials/07-analysis/gradient-conflict.md) for a worked example.
+[Gradient Conflict tutorial](tutorials/07-analysis/gradient-conflict.md) for a worked example, and
+[API → `jno.units`](API.md#units-non-dimensionalization) for the signatures.
 
 ### Custom functions
 

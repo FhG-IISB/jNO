@@ -510,6 +510,27 @@ Backs `model.bayesian(...)` / `model.vi(...)`; see [Bayesian Sampling](training/
 
 ---
 
+## Units & non-dimensionalization (`jno.units`)
+
+Annotate the dimension and characteristic magnitude of a leaf with `.unit(...)` / `.scale(...)`, then
+audit consistency, extract the dimensionless groups (Fourier, Péclet, …) of a residual, and rewrite
+it to a well-scaled `O(1)` form. Worked usage: [Operations → Units &
+non-dimensionalization](operations.md#units-non-dimensionalization).
+
+::: jno.trace.units
+    options:
+      members:
+        - check
+        - infer
+        - nondimensionalize
+        - rescale
+        - Unit
+        - Rescaler
+        - NondimReport
+        - UnitLogger
+
+---
+
 ## Adaptive resampling (`jno.sampler`)
 
 Residual-adaptive collocation strategies — see [Adaptive Resampling](adaptive/resampling.md).
