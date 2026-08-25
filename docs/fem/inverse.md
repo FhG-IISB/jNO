@@ -64,6 +64,31 @@ problem to change one number. Measured on an 8-value sweep: **6.20 s rebuilding,
 The solve is staged **once** (6 tracings for 8 values, not 48) because the value arrives as a runtime
 argument and jit keys on shape, not on value; `x0=` warm-starts across the sweep without re-staging.
 
+!!! tip "`continuation=` does the same march for you, and returns the family"
+    The loop above is the manual form. `jno.solve.continuation` is the driver: it marches the values,
+    warm-starts each solve from the previous one, and can hand back either the endpoint or the whole
+    sweep.
+
+    ```python
+    k   = jno.np.parameter((1,), name="k")
+    fem = jno.fem([k * (ui.x * vi.x + ui.y * vi.y) - 1.0 * vi, u(xb, yb) - 0.0])   # built ONCE
+    vals = np.geomspace(1.0, 100.0, 6)
+
+    u_end    = fem.solve(continuation=jno.solve.continuation(k=vals))          # (75,)   the endpoint
+    u_family = fem.solve(continuation=jno.solve.continuation("all", k=vals))   # (6, 75) the whole sweep
+    ```
+
+    Sequences given together march **zipped**, not as a grid, so two coefficients ramp in step. One
+    driver, three names: a frequency or material **sweep** in EM, **load stepping** in mechanics,
+    **homotopy** in numerics — reaching a value the cold solve cannot.
+
+    Checked on the linear Poisson above, where `u` scales as `1/k`: `max(u)·k` across the six-step
+    family is `0.072561` at every step, constant to six digits.
+
+    It is **steady only** (linear or nonlinear, real or fused-complex), and it cannot serve a reduced
+    slip/periodic system — that driver hands its solver no assembled tangent, which is exactly what
+    `newton(direct=True)` needs there. Use the manual loop for those.
+
 It composes with everything the ordinary solve does, including `newton(direct=True)` on a **reduced**
 (slip / periodic) system — the case `fem.solve(continuation=...)` still cannot serve, since that driver
 hands its solver no assembled tangent. `fem.stats` reports the verdict as usual: the jit hides the

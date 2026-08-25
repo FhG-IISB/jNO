@@ -72,7 +72,7 @@ the matrix below is the same map with a maturity label and a docs link per featu
 
 | Capability | Maturity | Notes |
 |------------|----------|-------|
-| Forward PINNs (residual minimisation) | [stable](https://fhg-iisb.github.io/jNO/tutorials/01-basics/poisson-1d/) | Hard or soft BC enforcement |
+| Forward PINNs (residual minimisation) | [stable](https://fhg-iisb.github.io/jNO/tutorials/01-basics/laplace-1d/) | Hard or soft BC enforcement |
 | Variational PINNs (weak-form losses) | [stable](https://fhg-iisb.github.io/jNO/tutorials/08-fem-and-varpinns/poisson-2d-fem/) | Network trial functions against the FEM weak form |
 | Operator learning (DeepONet, FNO, U-Net, PROSE via [foundax](https://github.com/FhG-IISB/foundax)) | [stable](https://fhg-iisb.github.io/jNO/tutorials/11-operator-learning/) | PDE-residual or data-driven |
 | Adaptive resampling (RAD, RARD, CR3, R3, pinnfluence) | [stable](https://fhg-iisb.github.io/jNO/adaptive/resampling/) | |
@@ -82,7 +82,7 @@ the matrix below is the same map with a maturity label and a docs link per featu
 | Training explainability (gradient conflict, NTK, Hessian, loss landscape, input sensitivity) | [stable](https://fhg-iisb.github.io/jNO/tutorials/07-analysis/gradient-conflict/) | |
 | Foundation-model integration ([foundax](https://github.com/FhG-IISB/foundax) MLPs, transformers, DeepONet, FNO, PROSE) | [stable](https://fhg-iisb.github.io/jNO/foundation_models/) | Wrap any Equinox module via `jno.nn(...)` |
 | Hybrid data + model parallelism | [stable](https://fhg-iisb.github.io/jNO/training/parallelism/) | `jno.core(..., mesh=(batch, model))` |
-| W&B logging + Orbax checkpointing | [stable](https://fhg-iisb.github.io/jNO/tutorials/09-wandb/wandb-integration/) | |
+| W&B logging + Orbax checkpointing | [stable](https://fhg-iisb.github.io/jNO/misc/wandb/) | |
 | IREE / MLIR compiled inference for deployment | [stable](https://fhg-iisb.github.io/jNO/model-controls/iree/) | |
 
 </details>

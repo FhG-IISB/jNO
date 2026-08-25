@@ -157,7 +157,7 @@ net = jno.nn(foundax.mlp(1, hidden_dims=32, num_layers=3, key=jax.random.PRNGKey
 net.bayesian(blackjax.sgld, step_size=1e-5, warmup=2000, keep=1000)
 
 u    = net(x)
-u_xx = jno.diff(u, x, order=2)
+u_xx = u.dd(x)                                    # second derivative of the network trial
 pde  = u_xx + (π ** 2) * jno.np.sin(π * x)        # u'' = -π² sin(πx)
 bc   = net(xb) - 0.0
 

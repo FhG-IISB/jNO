@@ -174,3 +174,14 @@ Build locally:
 docker build -t jno:latest .
 docker run --rm --gpus all jno:latest
 ```
+
+!!! note "What the image contains"
+    The **core** install plus a CUDA-capable JAX — the image's pixi environment carries
+    `jax-cuda12-plugin[with-cuda]`, so `--gpus all` needs only the host driver and the NVIDIA
+    Container Toolkit, no CUDA base image.
+
+    It does **not** carry the optional extras: no `mmgpy` (adaptive remeshing), no `pypardiso` /
+    `nvmath` (accelerated direct solvers), no `fmmax` (anisotropic RCWA), no `iree`. Run the
+    [verification snippet](#check-what-you-actually-got) inside the container if you are unsure what
+    you have. Tags are published per release (`{{version}}` and `latest`), so `latest` tracks the most
+    recent **release**, not `main`.

@@ -162,7 +162,7 @@ print(state["metadata"])      # {"epoch": 2000, "total_loss": ..., "timestamp": 
 To resume training from a restored checkpoint, reload the solver and re-attach the restored parameters:
 
 ```python
-crux = jno.core.load("runs/crux.pkl")
+crux = jno.load("runs/crux.pkl")
 crux.set_optimizer(optax.adam(1e-4))
 crux.solve(5000)
 ```

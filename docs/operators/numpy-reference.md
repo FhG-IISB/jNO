@@ -91,7 +91,7 @@ block is located and the coordinate indexed within it.
 
 !!! warning "Requires a structured grid, and fails loud when ambiguous"
 
-    Defined only on a domain with a grid (`jno.domain.poseidon`, `equi_distant_rect`, or a
+    Defined only on a domain with a grid (`Geometries.poseidon`, `Geometries.equi_distant_rect`, or a
     structured mesh). On an unstructured domain the points live on one flat axis that no coordinate
     names — reduce it with `axis=None`.
 
