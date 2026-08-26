@@ -163,6 +163,17 @@ def assemble_fem_nonnodal(
             if f["field_key"] not in field_index:
                 field_index[f["field_key"]] = len(fields)
                 fields.append(f)
+    # Block layout in ASSEMBLY (= offsets) order, for ``FEM.block_index``. ``_finalize`` snapshots
+    # this attribute; without it a non-nodal problem falls back to the CONSTRAINT-WALK order, which
+    # is a different order. Measured on a mixed N1E x Lagrange form: the assembler laid the blocks
+    # out as [u (n_edges), p (n_verts)] but the walk reported [p, u], so ``block_index(u)`` returned
+    # 1 and ``jno.precond.triangular((u, ams()), (p, amg()))`` handed AMS the scalar block. AMS
+    # forms G^T A G with G sized (n_edges, n_verts), so it raised a shape mismatch and the whole
+    # triangular(AMS, AMG) path was unreachable on any mixed non-nodal system. Where the two orders
+    # happen to agree it worked by luck; where the block SIZES also agree it would have been a
+    # silently wrong preconditioner rather than a shape error.
+    domain._fem_native_field_keys = [f["field_key"] for f in fields]
+
     spaces = [f["space"] for f in fields]
     if any(s not in ("RT", "N1E", "P0", "Hermite", "Argyris", "Morley", "Lagrange") for s in spaces):
         raise NotImplementedError(
