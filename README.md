@@ -123,6 +123,104 @@ u_fdm = jno.fdm([-wi.d2(xi) - wi.d2(yi) - 1.0,           # −Δu = 1
 </details>
 
 <details>
+<summary><strong>Inverse — recover a coefficient by differentiating through the solve</strong> (click to expand)</summary>
+
+```python
+import jax.numpy as jnp
+import optax
+import jno
+
+d = jno.Shape.rect(0, 0, 1, 1, size=0.2).domain()
+xi, yi, _ = d.variable("interior", split=True)
+xb, yb, _ = d.variable("boundary", split=True)
+u, v = d.fem_symbols()
+ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+
+# Name the bilinear and linear forms once, then write the weak form as it reads on paper.
+a = lambda k, w, z: k * (w.x * z.x + w.y * z.y)      # ∫ k ∇u·∇v
+L = lambda z: 1.0 * z                                 # ∫ f v
+const = lambda c: (lambda *a, **kw: jnp.array([c]))
+
+# Synthetic observations from the true coefficient.
+k_true = jno.np.parameter((1,)).initialize(const(2.5)).freeze()
+u_obs = jnp.asarray(jno.fem([a(k_true, ui, vi) - L(vi), u(xb, yb) - 0.0]).solve())
+
+# The unknown coefficient — a trainable parameter sitting inside the weak form.
+k = jno.np.parameter((1,), name="k").initialize(const(1.0))
+k.optimizer(optax.adam(5e-2))
+
+fem  = jno.fem([a(k, ui, vi) - L(vi), u(xb, yb) - 0.0])
+crux = jno.core([(fem.solve() - u_obs).mse], domain=d)   # the solve IS the forward model
+crux.solve(400)                                          # k → 2.4999  (truth 2.5)
+```
+
+No adjoint derived, no finite differences, no second implementation of the physics — the gradient
+flows back through the assembly and the linear solve. Swap `k` for a spatially varying field, for the
+mesh coordinates, or for `jno.nn(net)` and nothing about the structure changes.
+
+</details>
+
+<details>
+<summary><strong>Coupled multiphysics — Rayleigh–Bénard convection in one term list</strong> (click to expand)</summary>
+
+```python
+import jax
+jax.config.update("jax_enable_x64", True)          # the assembler builds in float64
+
+import numpy as np
+import jno
+
+Pr, Ra = 1.0, 1.0e4                                 # Ra >> Ra_c ≈ 1708 → vigorous convection
+Lx, Ly, dt, nsteps = 2.0, 1.0, 0.009, 26
+
+d = jno.Shape.rect(0, 0, Lx, Ly, size=0.11).domain(time=(0.0, nsteps * dt, nsteps + 1))
+u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)   # P2 velocity  ┐ inf-sup
+p, q = d.fem_symbols(names=("p", "q"), order=1)                     # P1 pressure  ┘ stable pair
+T, s = d.fem_symbols(names=("T", "sT"), order=1)                    # P1 temperature
+xi, yi, ti = d.variable("interior", split=True)
+xb, yb, _  = d.variable("boundary", split=True)
+ci = d.variable("initial", split=True)
+ub, vb = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+pb, qb = p.bind(x=xi, y=yi, t=ti), q.bind(x=xi, y=yi, t=ti)
+Tb, sb = T.bind(x=xi, y=yi, t=ti), s.bind(x=xi, y=yi, t=ti)
+
+ux, uy, vx, vy = ub[0], ub[1], vb[0], vb[1]
+uxx, uxy, uyx, uyy = ub.x[0], ub.y[0], ub.x[1], ub.y[1]             # grad-then-index: ∂uᵢ/∂xⱼ
+vxx, vxy, vyx, vyy = vb.x[0], vb.y[0], vb.x[1], vb.y[1]
+
+momentum = ((ub.t[0] * vx + ub.t[1] * vy)                           # ∂u/∂t
+            + ((ux * uxx + uy * uxy) * vx + (ux * uyx + uy * uyy) * vy)   # (u·∇)u  — nonlinear
+            + Pr * (uxx * vxx + uxy * vxy + uyx * vyx + uyy * vyy)  # Pr ∇u : ∇v
+            - pb * (vxx + vyy)                                      # −p ∇·v
+            - Pr * Ra * Tb * vy)                                    # buoyancy:  T → momentum
+continuity = qb * (uxx + uyy)                                       # ∇·u = 0
+energy = Tb.t * sb + (ux * Tb.x + uy * Tb.y) * sb + (Tb.x * sb.x + Tb.y * sb.y)   # u → T
+
+Tcond = 1.0 - ci[1] / Ly                                            # hot floor, cold lid
+T0 = Tcond + 0.05 * jno.np.sin(2 * np.pi * ci[0] / Lx) * jno.np.sin(np.pi * ci[1] / Ly)
+
+fem = jno.fem([momentum, continuity, energy,
+               u(xb, yb) - 0.0,                     # no-slip walls
+               T(xb, yb) - (1.0 - yb / Ly),         # conductive profile held on the walls
+               p.pin(),                             # gauge-fix the pressure null space
+               u(*ci) - 0.0, T(*ci) - T0])          # start at rest, seeded
+
+assert fem.is_transient and not fem.is_linear       # both DETECTED from the terms, not configured
+
+sol  = fem.solve(linear=jno.solve.lu())             # a saddle system: name a direct solver
+traj = np.asarray(jno.core([sol.mse]).eval([sol]))  # (27, 2398) — one row per step
+uu, pp, TT = (traj[:, a:b] for a, b in zip(fem.offsets[:-1], fem.offsets[1:]))
+# T range 0.000..1.000   peak |u| 27.7   — started at rest, ended in counter-rotating rolls
+```
+
+Three fields, coupled **both ways**: buoyancy `Pr·Ra·T` drives the momentum balance, and `u·∇T`
+carries the flow back into the energy balance — a product of two *different* unknowns, so the system
+is nonlinear. Nothing above selects a mode: `fem.solve()` reads `u.t` and the nonlinearity off the
+term list and marches backward-Euler with Newton per step.
+
+</details>
+
+<details>
 <summary><strong>RCWA — a periodic metasurface, from the same constraint list</strong> (click to expand)</summary>
 
 ```python
@@ -163,40 +261,7 @@ sol.order(+1, 0)        # a chosen diffraction order
 </details>
 
 <details>
-<summary><strong>Operator learning — a DeepONet trained on a PDE residual</strong> (click to expand)</summary>
-
-```python
-import jno
-import jax
-import optax
-import foundax
-
-dir = jno.setup("./runs/test")
-
-# Domain: `500 *` batches 500 random-coefficient samples of the same geometry
-dom = 500 * jno.Shape.rect(0, 0, 2, 1, size=0.05).domain()
-x, y, _ = dom.variable("interior")
-xb, yb, _ = dom.variable("boundary")
-k = dom.variable("k", jax.random.uniform(jax.random.PRNGKey(0), shape=(500, 1, 1), minval=0.5, maxval=1.5))
-
-# Network + optimizer
-fx = foundax.deeponet(n_sensors=1, coord_dim=2, basis_functions=32, hidden_dim=128, activation=jax.numpy.tanh)
-net = jno.nn(fx)
-net.optimizer(optax.adam(optax.schedules.cosine_decay_schedule(1e-3, 20_000, alpha=1e-5)))
-
-# Hard BC enforcement via an output transform; the PDE residual is the loss
-u = net(k, jno.np.concat([x, y], axis=-1)) * x * (2 - x) * y * (1 - y)
-pde = k * (u.dd(x) + u.dd(y)) + 1.0
-
-crux = jno.core(constraints=[pde.mse], domain=dom)
-crux.solve(epochs=20_000, batchsize=32).plot(f"{dir}/training.png")
-jno.save(crux, f"{dir}/model.pkl")
-```
-
-</details>
-
-<details>
-<summary><strong>PINO — an FNO trained on the PDE residual, with no labelled solutions</strong> (click to expand)</summary>
+<summary><strong>Operator learning — an FNO trained on the PDE residual, with no labelled solutions</strong> (click to expand)</summary>
 
 ```python
 import jno
