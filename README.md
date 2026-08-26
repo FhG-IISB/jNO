@@ -25,11 +25,10 @@ numerical methods**. Classical solvers — finite elements, finite differences,
 and spectral (RCWA) — and scientific machine learning — PINNs, neural operators,
 Bayesian inference — are two pillars on **one substrate**: you write the math
 (a weak form, a strong-form stencil, a PDE residual, a data loss), and it lowers
-to a single GPU-ready, end-to-end reverse-mode-differentiable, `jit`-compiled graph.
+to a single GPU-ready, end-to-end differentiable, `jit`-compiled graph.
 
-Because every solve is differentiable, the things that are usually separate
-frameworks are the *same tool* here: an inverse problem, a PDE-constrained
-optimization, and a neural-network coefficient are one composition away from a
+Because every solve is differentiable, an inverse problem, a PDE-constrained
+optimization and a neural-network coefficient are one composition away from a
 forward solve — no glue code, no finite differences, no leaving JAX.
 
 > [!NOTE]
@@ -45,49 +44,41 @@ forward solve — no glue code, no finite differences, no leaving JAX.
   </picture>
 </p>
 
-Five stages, four front doors, one graph. Every module named above is public API;
-the matrix below is the same map with a maturity label and a docs link per feature.
+Five stages, four front doors, one graph. Every module named above is public API; the matrix
+below is the same map, with a maturity label and a docs page per feature.
 
 <details>
-<summary><strong>Feature matrix</strong> — maturity and per-feature docs links (click to expand)</summary>
+<summary><strong>Feature matrix</strong> — maturity and per-feature docs (click to expand)</summary>
 
 <br>
 
-### Pillar 1 — Differentiable numerical methods
+**Pillar 1 — differentiable numerical methods.** Every entry is matrix-free, GPU-ready and
+differentiable end to end.
 
-| Capability | Maturity | Notes |
-|------------|----------|-------|
-| **FEM, nodal** — `jno.fem` | [stable](https://fhg-iisb.github.io/jNO/fem/) | Lagrange P1 / P2 / P3+, **2-D & 3-D**; steady (linear + Newton), transient (θ-method), **second-order-in-time** (wave / elastodynamics), complex, periodic, coupled multifield |
-| **FEM, non-nodal** — H(div) / H(curl) / C¹ | [experimental](https://fhg-iisb.github.io/jNO/fem/elements/) | **Raviart–Thomas** (H(div)) and **Nédélec edge** (H(curl) — Maxwell, eddy currents) elements; **C¹ Hermite / Argyris / Morley** (plates, biharmonic) |
-| **FDM** — `jno.fdm` | [stable](https://fhg-iisb.github.io/jNO/fdm/) | Strong-form collocation from a term list; **structured grids + geometric multigrid**; unstructured meshes; periodic, coupled, flux BCs; 2-D & 3-D |
-| **Spectral / RCWA** — `jno.rcwa` | [stable](https://fhg-iisb.github.io/jNO/rcwa/) | Vector-Maxwell RCWA, anisotropic media, Jones / polarization readout |
-| **Linear & nonlinear solvers** — `jno.solve` / `jno.precond` | [stable](https://fhg-iisb.github.io/jNO/solvers/) | Sparse-direct LU, Jacobi-BiCGStab, GMRES, CG, MINRES, Chebyshev, geometric multigrid, optional GPU **AMG** — matrix-free and differentiable |
-| **Generalized eigenproblems** — `fem.eigs` | [beta](https://fhg-iisb.github.io/jNO/API/#solvers-and-preconditioners) | `K x = λ M x`, differentiable, M-orthonormal |
-| **Time integration** | [stable](https://fhg-iisb.github.io/jNO/fdm/) | θ-method (backward-Euler / Crank–Nicolson), exponential integrators, adaptive step size |
-| **Adaptive meshing** — `jno.solve.remesh` / `relocate`, and `coord.d(t) - v` as a term | [beta](https://fhg-iisb.github.io/jNO/fem/geometry/) | Hessian-metric remeshing (AFEM), r-adaptivity, moving meshes stated in the term list |
-| **Differentiable inverse / PDE-constrained** | [stable](https://fhg-iisb.github.io/jNO/tutorials/05-coupled-and-inverse/inverse-parameter/) | Recover a scalar, a field `k(x)`, the geometry, or a **neural coefficient** through any solve — the gradient flows through the whole march |
-| **Geometry** — `jno.Shape` / `jno.Path` | [stable](https://fhg-iisb.github.io/jNO/Domain-and-Geometry/) | CSG via gmsh-OCC; conforming multi-material regions |
+| | | |
+|---|---|---|
+| [**FEM**](https://fhg-iisb.github.io/jNO/fem/) · stable | [Elements](https://fhg-iisb.github.io/jNO/fem/elements/) · H(div)/H(curl)/C¹ experimental | [**FDM**](https://fhg-iisb.github.io/jNO/fdm/) · stable |
+| [**RCWA**](https://fhg-iisb.github.io/jNO/rcwa/) · stable | [Solvers & preconditioners](https://fhg-iisb.github.io/jNO/solvers/) · stable | [Eigenproblems](https://fhg-iisb.github.io/jNO/API/#solvers-and-preconditioners) · beta |
+| [Time integration](https://fhg-iisb.github.io/jNO/fdm/) · stable | [Adaptive meshing](https://fhg-iisb.github.io/jNO/fem/geometry/) · beta | [Domain decomposition](https://fhg-iisb.github.io/jNO/domain-decomposition/) · beta |
+| [Geometry — `jno.Shape`](https://fhg-iisb.github.io/jNO/Domain-and-Geometry/) · stable | [Inverse & PDE-constrained](https://fhg-iisb.github.io/jNO/inverse-problems/) · stable | [Limits & build time](https://fhg-iisb.github.io/jNO/fem/limitations/) |
 
-### Pillar 2 — Scientific machine learning
+**Pillar 2 — scientific machine learning.** All stable, and all composable with any solve above.
 
-| Capability | Maturity | Notes |
-|------------|----------|-------|
-| Forward PINNs (residual minimisation) | [stable](https://fhg-iisb.github.io/jNO/tutorials/01-basics/laplace-1d/) | Hard or soft BC enforcement |
-| Variational PINNs (weak-form losses) | [stable](https://fhg-iisb.github.io/jNO/tutorials/08-fem-and-varpinns/poisson-2d-fem/) | Network trial functions against the FEM weak form |
-| Operator learning (DeepONet, FNO, U-Net, PROSE via [foundax](https://github.com/FhG-IISB/foundax)) | [stable](https://fhg-iisb.github.io/jNO/tutorials/11-operator-learning/) | PDE-residual or data-driven |
-| Adaptive resampling (RAD, RARD, CR3, R3, pinnfluence) | [stable](https://fhg-iisb.github.io/jNO/adaptive/resampling/) | |
-| Stochastic PDEs & noise nodes (gaussian / uniform / laplace) | [stable](https://fhg-iisb.github.io/jNO/tutorials/07-stochastic/fokker-planck-2d/) | Fokker–Planck, stochastic forcing |
-| Bayesian PINNs (NUTS, HMC, MALA, SGLD, SGHMC, VI) | [stable](https://fhg-iisb.github.io/jNO/tutorials/10-bayesian-pinns/) | `model.bayesian(kernel_factory)` mirrors `.optimizer()` — per-parameter, mixed freely |
-| Parameter-efficient fine-tuning (LoRA, DoRA, rsLoRA, PiSSA, VeRA, LoKr, OFT, IA3) | [stable](https://fhg-iisb.github.io/jNO/model-controls/lora/) | Chain `.lora(...)` on any wrapped model |
-| Training explainability (gradient conflict, NTK, Hessian, loss landscape, input sensitivity) | [stable](https://fhg-iisb.github.io/jNO/tutorials/07-analysis/gradient-conflict/) | |
-| Foundation-model integration ([foundax](https://github.com/FhG-IISB/foundax) MLPs, transformers, DeepONet, FNO, PROSE) | [stable](https://fhg-iisb.github.io/jNO/foundation_models/) | Wrap any Equinox module via `jno.nn(...)` |
-| Hybrid data + model parallelism | [stable](https://fhg-iisb.github.io/jNO/training/parallelism/) | `jno.core(..., mesh=(batch, model))` |
-| W&B logging + Orbax checkpointing | [stable](https://fhg-iisb.github.io/jNO/misc/wandb/) | |
-| IREE / MLIR compiled inference for deployment | [stable](https://fhg-iisb.github.io/jNO/model-controls/iree/) | |
+| | | |
+|---|---|---|
+| [Forward PINNs](https://fhg-iisb.github.io/jNO/tutorials/01-basics/laplace-1d/) | [Variational PINNs](https://fhg-iisb.github.io/jNO/tutorials/08-fem-and-varpinns/poisson-2d-fem/) | [Operator learning](https://fhg-iisb.github.io/jNO/tutorials/11-operator-learning/) |
+| [Bayesian PINNs](https://fhg-iisb.github.io/jNO/tutorials/10-bayesian-pinns/) | [Stochastic PDEs](https://fhg-iisb.github.io/jNO/tutorials/07-stochastic/fokker-planck-2d/) | [Adaptive resampling](https://fhg-iisb.github.io/jNO/adaptive/resampling/) |
+| [LoRA & PEFT](https://fhg-iisb.github.io/jNO/model-controls/lora/) | [Explainability](https://fhg-iisb.github.io/jNO/tutorials/07-analysis/gradient-conflict/) | [Foundation models](https://fhg-iisb.github.io/jNO/foundation_models/) |
+| [Parallelism](https://fhg-iisb.github.io/jNO/training/parallelism/) | [W&B + checkpointing](https://fhg-iisb.github.io/jNO/misc/wandb/) | [IREE deployment](https://fhg-iisb.github.io/jNO/model-controls/iree/) |
+
+Architectures come from [foundax](https://github.com/FhG-IISB/foundax) — MLPs, transformers,
+DeepONet, FNO, PROSE — wrapped with `jno.nn(...)`.
 
 </details>
 
-**One tracing language bridges the two.** A weak form, a strong-form stencil, a PDE residual for a network, and a supervised loss are all the same kind of object here — so a classical solve, a PINN, and an inverse problem *compose* rather than living in separate stacks. 33 worked tutorials span elliptic, parabolic, hyperbolic, coupled, inverse, integral, stochastic, FEM / variational, Bayesian, and operator-learning problems — browse the [tutorials index](https://fhg-iisb.github.io/jNO/#tutorials).
+**35 worked tutorials** span elliptic, parabolic, hyperbolic, coupled, inverse, integral, stochastic,
+FEM / variational, Bayesian and operator-learning problems — browse the
+[tutorials index](https://fhg-iisb.github.io/jNO/#tutorials).
 
 ## Install
 
