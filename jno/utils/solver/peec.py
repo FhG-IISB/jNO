@@ -342,6 +342,7 @@ def solve_network(
     mu0=4e-7 * np.pi,
     matrix_free=None,
     tol=1e-8,
+    restart=16,
 ):
     """Solve the PEEC circuit for a network whose terminals are node SETS.
 
@@ -367,6 +368,9 @@ def solve_network(
         mu0: permeability of the surrounding medium.
 
     Args (continued):
+        restart: Krylov subspace size. 16 is where the FORWARD solve is cheapest; differentiating
+            needs far more (see the note in the jvp rule) and is refused below ``_DIFF_RESTART``
+            rather than allowed to return a wrong gradient.
         tol: relative residual the iterative path is driven to. Measured on 6,806 bars, the impedance
             is identical to nine digits from 1e-4 to 1e-11, while the time is not — 2.83 s, 1.77 s,
             2.88 s, 17.79 s — so the default sits where the curve is flat rather than at the tightest
@@ -574,16 +578,23 @@ def solve_network(
 
         @_precond.defjvp
         def _precond_jvp(primals, tangents):
-            # The preconditioner is linear, so this rule is exact -- but the SOLVE around it is not
-            # differentiating correctly, and a rule here would let a wrong gradient through quietly.
-            # Measured against the dense path, which is exact: -2.80e-14 where the answer is
-            # -1.41e-12, and at DC -3.09e-09 where the answer is -8.19e-05. Refuse instead.
-            raise NotImplementedError(
-                "jno.peec: the matrix-free path is not differentiable yet — its gradient is WRONG, not "
-                "merely unsupported, so it is refused rather than returned. Differentiate the dense "
-                "path instead (matrix_free=False), which is checked against finite differences to 1e-8; "
-                "it forms the operator, so it is limited to a network small enough to fit."
-            )
+            # The preconditioner is linear, so this rule is exact. The danger is elsewhere: the TANGENT
+            # system needs a far larger Krylov subspace than the primal one, and jax's gmres returns an
+            # unconverged answer without saying so. Measured on a 156-bar network where the answer is
+            # -1.412010e-12: restart 16 gives -2.80e-14, restart 64 gives -4.03e-14, restart 200 gives
+            # -1.412010e-12 exactly. The primal converges in two cycles at restart 16 either way, so
+            # nothing about the forward solve reveals it.
+            if int(restart) < _DIFF_RESTART:
+                raise NotImplementedError(
+                    f"jno.peec: differentiating the matrix-free path at restart={int(restart)} returns a "
+                    f"WRONG gradient, not merely an imprecise one — the tangent system is far harder than "
+                    f"the primal and jax's gmres does not report failing on it. Pass restart="
+                    f"{_DIFF_RESTART} or more (about 10x the forward cost), or differentiate the dense "
+                    "path (matrix_free=False), which is exact. The value needed is problem-dependent: "
+                    f"{_DIFF_RESTART} was measured on one network, so check a gradient against a finite "
+                    "difference before trusting a new one."
+                )
+            return _precond(primals[0]), _precond(tangents[0])
 
         # ONE compilation, reused across frequencies. The operators that depend on geometry alone --
         # the transformed lattice generator, the incidence -- are closed over; everything that moves
@@ -594,7 +605,7 @@ def solve_network(
         # Keyed by the network's IDENTITY, and the network is kept alive in the entry: an id alone is
         # reusable after a garbage collection, and a stale hit would silently run the previous
         # geometry's closures. The entry is checked against `fil` before it is trusted.
-        key = (id(fil), ne, nn, float(tol))
+        key = (id(fil), ne, nn, float(tol), int(restart))
         entry = _KRYLOV_CACHE.get(key)
         cached = entry[1] if (entry is not None and entry[0] is fil) else None
 
@@ -626,7 +637,7 @@ def solve_network(
                     # is needed. Per swept point at 6,806 bars: restart 30 -> 0.342 s, 16 -> 0.308 s,
                     # 10 -> 0.308 s, 6 -> 0.386 s, 4 -> 0.754 s, all to the same impedance. Below ten
                     # the cycles outnumber what they save.
-                    restart=min(16, ne + nn),
+                    restart=min(int(restart), ne + nn),
                     maxiter=400,
                 )[0]
 
@@ -1084,6 +1095,7 @@ def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3):
     return apply
 
 
+_DIFF_RESTART = 200  # the smallest restart measured to give an exact gradient; see _precond_jvp
 _KRYLOV_CACHE = {}  # one compiled Krylov solve per (network, size, tolerance), reused across frequencies
 _LU_HOLDER = {}  # the current host factorisation, so the callback closure does not change identity
 
