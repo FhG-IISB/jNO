@@ -1830,6 +1830,24 @@ class domain(MeshIOMixin):
         """Advanced helper for explicit FEM-only authoring."""
         return TrialFunction(name=name, value_shape=value_shape, order=order)
 
+    def peec_symbols(self, names=("i", "v")):
+        """The two terminal symbols a partial-element circuit is written on: ``(i, v)``.
+
+        ``v`` is a terminal POTENTIAL and ``i`` a terminal CURRENT, and a port is one relation on one
+        of them::
+
+            i, v = d.peec_symbols()
+            p, n = d.variable("DC+", split=True)[:3], d.variable("DC-", split=True)[:3]
+            emag = jno.peec([v(*p) - v(*n) - 1.0, i(*n) - 0.0], freq=1e6)
+
+        They are ordinary trial functions -- the asymmetry is in what each MEANS to
+        :func:`jno.peec`, not in the objects -- so the constraint reads like the circuit relation it
+        is, and the region binding carries which terminal it applies to.
+        """
+        if len(names) != 2:
+            raise ValueError(f"domain.peec_symbols: expected two names, (current, potential); got {names!r}.")
+        return self.trial_function(name=names[0]), self.trial_function(name=names[1])
+
     def unknown(self, value_shape=(), name="u"):
         """The discrete **unknown solution field** on this domain's mesh — a *valued* P1 nodal field
         for strong-form / collocation methods (``jno.fdm``, …), the counterpart to the *symbolic*

@@ -19,6 +19,7 @@ from .fdm import fdm
 from .geometry import Path, Shape
 from .integration_operators import IntegrationOperators
 from .noise import noise
+from .peec import peec
 from .rcwa import Rcwa, RcwaError, rcwa
 from .trace import (
     Assembly,
@@ -147,6 +148,7 @@ __all__ = [
     "Constraint",
     "sampler",
     "domain",
+    "peec",
     "Shape",
     "Path",
     "do",
