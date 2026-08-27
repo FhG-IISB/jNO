@@ -358,10 +358,20 @@ class Line:
         membership test is what assigns material to the cells.
 
         Collinear runs are merged first (:meth:`_simplified`), because two collinear cylinders
-        overlap with coincident lateral surfaces, which a boolean kernel handles badly. A thin curved
-        solid embedded in a COARSE host still fails to mesh whatever the construction -- that is a
-        property of the host's size, and a plain ``Shape.cylinder`` fails identically. See
-        ``tests/test_shape_line.py::test_a_coarse_host_cannot_mesh_around_a_thin_inclusion``.
+        overlap with coincident lateral surfaces, which a boolean kernel handles badly.
+
+        A thin solid embedded in a COARSE host fails to mesh whatever the construction -- that is a
+        property of the host's size, and a plain ``Shape.cylinder`` fails identically. Measured on a
+        wire of radius ``r`` bridging two boxes, the host size has to be within about ``2.5 r``:
+
+            host 10 r  fails      host 5 r  fails      host 2.5 r  meshes      host 1.25 r  meshes
+
+        That is finer than the mitred construction needed (which reached ``5 r``), and it is the price
+        of the build agreeing with :meth:`contains`. A sphere sits TANGENT to the tube, which is the
+        contact a boolean kernel likes least; a mitre crosses at an angle and meshes more easily, but
+        describes a different solid. See
+        ``tests/test_shape_line.py::test_a_coarse_host_cannot_mesh_around_a_thin_inclusion`` and
+        ``::test_the_built_solid_and_the_membership_test_agree_at_a_bend``.
         """
         P = self._simplified()
         seg = P[1:] - P[:-1]

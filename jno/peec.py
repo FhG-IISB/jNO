@@ -58,7 +58,8 @@ class PEECSolution:
     ``Z``/``R``/``L`` describe the source port; with an array ``freq`` each is an array over it.
     """
 
-    def __init__(self, freq, cur, part, terms, port, res):
+    def __init__(self, freq, cur, part, terms, port, res, vol=None, owner=None, names=()):
+        self._vol, self._owner, self._names = vol, owner, tuple(names)
         self.freq = freq
         self.i = cur  # (n_filament,) or (n_freq, n_filament) complex
         self.partial = part  # (n_filament, n_filament) partial inductances, henry
@@ -96,6 +97,33 @@ class PEECSolution:
         cur = jnp.atleast_2d(self.i)
         out = jnp.einsum("k,fk->f", self._R, jnp.abs(cur) ** 2)
         return out if jnp.ndim(self._port) else out[0]
+
+    def dissipation(self):
+        """``{region: W/m^3}`` — the ohmic loss of each conductor, per unit of its own volume.
+
+        Shaped for :meth:`jno.domain.by_region`, which is how a per-region quantity enters a weak
+        form, so the thermal side reads::
+
+            q = d.by_region(emag.dissipation(), default=0.0)
+            heat = d.k * grad(T) . grad(s) - q * s
+
+        Volumetric rather than total because that is what a source term is. The volume is the
+        DISCRETISATION's -- the summed filament volumes -- so it is consistent with the currents that
+        produced the loss rather than with the analytic solid, which a faceted mesh would not match.
+        """
+        if self._owner is None:
+            raise ValueError("jno.peec: this solution carries no per-conductor breakdown.")
+        cur = jnp.atleast_2d(self.i)
+        pw = jnp.einsum("k,fk->fk", self._R, jnp.abs(cur) ** 2)
+        out = {}
+        for k, name in enumerate(self._names):
+            m = jnp.asarray(self._owner == k)
+            v = float(jnp.sum(jnp.where(m, self._vol, 0.0)))
+            if v <= 0.0:
+                continue
+            q = jnp.sum(jnp.where(m[None, :], pw, 0.0), axis=1) / v
+            out[name] = q[0] if jnp.ndim(self._port) == 0 else q
+        return out
 
     def current(self, terminal):
         """Net current injected at ``terminal``, amp."""
@@ -153,6 +181,7 @@ class PEEC:
         except KeyError:  # nothing declared it at all, which is the same story as declaring it patchily
             sig = {}
         lines, line_sig, solids = [], [], []
+        line_names, solid_names = [], []
         for n, sh in conductors.items():
             if n not in sig:
                 raise ValueError(f"jno.peec: conductor {n!r} has no conductivity. Give it one: .attach(sigma=...).")
@@ -161,8 +190,10 @@ class PEEC:
             if kind == "Line":
                 lines.append(sh)
                 line_sig.append(float(sig[n]))
+                line_names.append(n)
             elif kind == "Box":
                 solids.append((sh, float(sig[n])))
+                solid_names.append(n)
             else:
                 raise NotImplementedError(_shape_msg(n, kind))
 
@@ -181,11 +212,12 @@ class PEEC:
             per = fb.lattice.get("sigma")
             parts.append((fb, per if per is not None else np.asarray(sgs)[np.asarray(fb.part)]))
             owners.append(shs)
-        return (*_weld(parts, owners), terms)
+        # part index -> region name, in the order _weld renumbers them: lines, then solids
+        return (*_weld(parts, owners), terms, line_names + solid_names)
 
     def solve(self):
         """Solve at every frequency and return a :class:`PEECSolution`."""
-        fil, sigma, terms = self._discretise()  # sigma already spread onto the filaments by provenance
+        fil, sigma, terms, part_names = self._discretise()  # sigma spread onto the filaments by provenance
         nodes = {t: terminal_nodes(fil, sh) for t, sh in terms.items()}
 
         cur, port, drive, inject = [], [], [], []
@@ -219,6 +251,9 @@ class PEEC:
             },
             port[0] if self._scalar_freq else port,
             res,
+            vol=jnp.asarray(fil.area) * jnp.asarray(fil.length),
+            owner=np.asarray(fil.part),
+            names=part_names,
         )
         drive = jnp.stack([jnp.asarray(x) for x in drive])
         sol._port_current = drive[0] if self._scalar_freq else drive
