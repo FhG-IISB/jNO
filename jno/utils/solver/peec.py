@@ -537,36 +537,59 @@ def solve_network(
         cdtype = jnp.result_type(jnp.complex64) if not jax.config.jax_enable_x64 else jnp.complex128
         shape_out = jax.ShapeDtypeStruct((nn,), cdtype)
 
+        _LU_HOLDER["lu"] = lu  # the callback reads the CURRENT factorisation, so its identity is stable
+
         def _host_solve(r):
             return lu.solve(np.asarray(r)).astype(cdtype)
 
-        def M_apply(x):
-            cur, phi = x[:ne], x[ne:]
-            return jnp.concatenate([Rc * cur + (1j * w) * lp_apply(cur) - Acj @ phi, Cj @ x])
+        # ONE compilation, reused across frequencies. The operators that depend on geometry alone --
+        # the transformed lattice generator, the incidence -- are closed over; everything that moves
+        # with frequency is passed in as a traced argument, and the host factorisation is reached
+        # through a holder so the callback's identity is stable too. Without this every solve
+        # recompiles, and at these sizes the compilation costs about what the fusion saves, so a
+        # frequency sweep paid it once per point.
+        # Keyed by the network's IDENTITY, and the network is kept alive in the entry: an id alone is
+        # reusable after a garbage collection, and a stale hit would silently run the previous
+        # geometry's closures. The entry is checked against `fil` before it is trusted.
+        key = (id(fil), ne, nn, float(tol))
+        entry = _KRYLOV_CACHE.get(key)
+        cached = entry[1] if (entry is not None and entry[0] is fil) else None
 
-        def P_inv(r):
+        def M_apply(x, w_, zd, Rc_):
+            cur, phi = x[:ne], x[ne:]
+            return jnp.concatenate([Rc_ * cur + (1j * w_) * lp_apply(cur) - Acj @ phi, Cj @ x])
+
+        def P_inv(r, zd):
             ri, rp = r[:ne], r[ne:]
-            rhs_p = rp - CIj @ (ri / zdiag)
-            dphi = jax.pure_callback(_host_solve, shape_out, rhs_p)
-            return jnp.concatenate([(ri + Acj @ dphi) / zdiag, dphi])
+            dphi = jax.pure_callback(_holder_solve, shape_out, rp - CIj @ (ri / zd))
+            return jnp.concatenate([(ri + Acj @ dphi) / zd, dphi])
+
+        if cached is None:
+
+            @jax.jit
+            def _run(rhs, w_, zd, Rc_):
+                return jax.scipy.sparse.linalg.gmres(
+                    lambda v: M_apply(v, w_, zd, Rc_),
+                    rhs,
+                    M=lambda v: P_inv(v, zd),
+                    tol=float(tol),
+                    atol=0.0,
+                    restart=min(30, ne + nn),
+                    maxiter=400,
+                )[0]
+
+            if len(_KRYLOV_CACHE) > 8:  # bounded: this holds compiled code and a reference to a network
+                _KRYLOV_CACHE.pop(next(iter(_KRYLOV_CACHE)))
+            _KRYLOV_CACHE[key] = (fil, _run)
+        else:
+            _run = cached
 
         # A SHORT restart. With the block preconditioner this system converges in a handful of steps,
         # and jax builds the whole Krylov basis whether or not it is needed: measured at 6,806 bars,
         # restart 200 took 10.07 s, restart 60 took 2.88 s, restart 20 took 2.14 s — all returning the
         # same impedance to seven digits. The basis was the cost, not the convergence.
-        # JIT the whole Krylov solve, not just the operator. The lattice apply is a dozen small ops
-        # per direction (pad, rfftn, multiply, irfftn, slice); dispatched one at a time they cost far
-        # more than the transform itself. Measured at 6,806 bars: the apply alone runs at 15.6 ms
-        # op-by-op, while a COMPLETE Krylov step inside jit — that same apply plus the sparse matvecs,
-        # the preconditioner and the orthogonalisation — is 2.56 ms.
-        @jax.jit
-        def _run(rhs):
-            return jax.scipy.sparse.linalg.gmres(
-                M_apply, rhs, M=P_inv, tol=float(tol), atol=0.0, restart=min(30, ne + nn), maxiter=400
-            )[0]
-
-        x = _run(b)
-        resid = jnp.linalg.norm(M_apply(x) - b) / jnp.maximum(jnp.linalg.norm(b), 1e-300)
+        x = _run(b, jnp.asarray(w), zdiag, Rc)
+        resid = jnp.linalg.norm(M_apply(x, w, zdiag, Rc) - b) / jnp.maximum(jnp.linalg.norm(b), 1e-300)
         if not bool(resid < max(1e2 * float(tol), 1e-9)):
             raise ValueError(
                 f"jno.peec: the matrix-free solve did not converge (relative residual {float(resid):.2e}). "
@@ -1008,6 +1031,21 @@ def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3):
         return jnp.concatenate(out)
 
     return apply
+
+
+_KRYLOV_CACHE = {}  # one compiled Krylov solve per (network, size, tolerance), reused across frequencies
+_LU_HOLDER = {}  # the current host factorisation, so the callback closure does not change identity
+
+
+def _holder_solve(r):
+    """Apply the CURRENT Schur factorisation.
+
+    Indirection through a holder keeps this function's identity fixed, which is what lets one compiled
+    solve serve a whole frequency sweep. The holder is set immediately before the solve that reads it,
+    so sequential solves are safe; two solves running CONCURRENTLY in one process would not be, and
+    nothing here is reentrant.
+    """
+    return _LU_HOLDER["lu"].solve(np.asarray(r)).astype(r.dtype)
 
 
 def _bcoo(val, row, col, shape):
