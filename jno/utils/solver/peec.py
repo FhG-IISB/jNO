@@ -576,7 +576,13 @@ def bar_filaments(shape, size: float = None, quad: int = 3):
 
     Args:
         shape: a ``Shape`` whose plan is a single ``Box`` leaf.
-        size: target cell pitch. Defaults to the shape's own ``size=``.
+        size: cell pitch — one number, or one per axis. Defaults to the shape's own ``size=``.
+
+            A per-axis pitch is what makes a real conductor affordable. A power-module trace is
+            0.57 mm thick on a 96.9 mm plate, so an isotropic grid fine enough to resolve the skin
+            depth through the thickness spends the same resolution across the width, where nothing
+            varies: 33.6 million bars against 137 thousand for ``(1.0, 1.0, 0.065)`` at the same
+            through-thickness resolution.
         quad: Gauss points along each bar.
 
     Returns:
@@ -585,8 +591,9 @@ def bar_filaments(shape, size: float = None, quad: int = 3):
     The cell count per axis is ``max(1, round(extent / size))``, so the pitch is the extent divided
     by a whole number rather than ``size`` exactly -- a lattice has to close on the box.
     """
-    h = float(size if size is not None else (shape._size if shape._size is not None else 0.0))
-    if h <= 0:
+    h = size if size is not None else shape._size
+    h = np.broadcast_to(np.asarray(h, dtype=float).reshape(-1), (3,)) if h is not None else np.zeros(3)
+    if np.any(h <= 0):
         raise ValueError(
             "peec.bar_filaments: no cell pitch. Pass size=, or give the Shape a size= when you build "
             "it — a lattice count cannot be guessed from the geometry alone."
@@ -614,7 +621,8 @@ def bar_filaments(shape, size: float = None, quad: int = 3):
     keep = np.asarray(shape.contains(centres)).reshape(-1)
     if not keep.any():
         raise ValueError(
-            f"peec.bar_filaments: a pitch of {h} put no cell centre inside this conductor. Use a smaller "
+            f"peec.bar_filaments: a pitch of {tuple(h)} put no cell centre inside this conductor. Use a "
+            "smaller "
             "size=; a cell has to fit within the geometry for the lattice to see it at all."
         )
     nid = np.full(int(np.prod(n)), -1)
