@@ -351,18 +351,16 @@ class Line:
         return np.asarray(keep)
 
     def build(self, occ):
-        """A cylinder per segment, MITRED at each joint rather than capped with a sphere.
+        """A cylinder per segment, with a SPHERE at each interior joint.
 
-        Extending each cylinder past the joint by ``r tan(theta/2)`` fills the outer notch of the
-        bend exactly, and the pieces then cross at a real angle. A joint sphere of radius ``r`` would
-        instead sit TANGENT to a tube of radius ``r`` -- touching along a circle rather than crossing
-        -- which is the contact a boolean kernel handles worst. Collinear runs are merged first
-        (:meth:`_simplified`) because two collinear cylinders overlap with coincident lateral
-        surfaces, which is worse still.
+        That is exactly the solid :meth:`contains` describes -- every point within ``r`` of the
+        polyline -- and the two must agree, because the build is what gets meshed while the
+        membership test is what assigns material to the cells.
 
-        Both are hygiene rather than a fix for any observed failure: a thin curved solid embedded in
-        a COARSE host is what actually fails to mesh, and that is a property of the host's size, not
-        of this construction -- a plain ``Shape.cylinder`` fails identically. See
+        Collinear runs are merged first (:meth:`_simplified`), because two collinear cylinders
+        overlap with coincident lateral surfaces, which a boolean kernel handles badly. A thin curved
+        solid embedded in a COARSE host still fails to mesh whatever the construction -- that is a
+        property of the host's size, and a plain ``Shape.cylinder`` fails identically. See
         ``tests/test_shape_line.py::test_a_coarse_host_cannot_mesh_around_a_thin_inclusion``.
         """
         P = self._simplified()
@@ -371,17 +369,15 @@ class Line:
         if not np.any(L > TOL):
             raise ValueError("Shape.line: every segment is shorter than the tolerance; nothing to build.")
         u = seg / np.maximum(L, 1e-300)[:, None]
-        # miter at each interior joint; clamped so a hairpin cannot produce a runaway stub
-        ext = np.zeros((len(seg), 2))
-        for j in range(1, len(P) - 1):
-            c = float(np.clip(np.dot(u[j - 1], u[j]), -1.0, 1.0))
-            m = min(self.r * math.tan(0.5 * math.acos(c)), 2.0 * self.r)
-            ext[j - 1, 1] = ext[j, 0] = m
-        parts = []
-        for k in range(len(seg)):
-            a = P[k] - u[k] * ext[k, 0]
-            length = L[k] + ext[k, 0] + ext[k, 1]
-            parts.append((3, occ.addCylinder(*a, *(u[k] * length), self.r)))
+        parts = [(3, occ.addCylinder(*P[k], *(u[k] * L[k]), self.r)) for k in range(len(seg))]
+        # A SPHERE at each interior joint, which is the solid `contains` describes. Mitring the
+        # cylinders instead fills the outer notch of a bend, and that notch reaches r/cos(theta/2)
+        # from the vertex -- outside `distance <= r`. The two then disagree about a thin wedge above
+        # every convex bend, and a cell whose centroid lands in it belongs to no region at all: on a
+        # bond wire arcing over two traces, 17 cells of 7,423 were claimed by nothing, took no
+        # material, and sat at 0 K in the thermal solve while the mesh around them was perfectly
+        # connected. A build and a membership test for the same primitive have to agree.
+        parts += [(3, occ.addSphere(*P[j], self.r)) for j in range(1, len(P) - 1)]
         if len(parts) == 1:
             return parts[0]
         # One fuse of everything, not a pairwise chain: chaining leaves an internal seam face per
