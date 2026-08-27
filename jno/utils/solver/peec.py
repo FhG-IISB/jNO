@@ -538,19 +538,52 @@ def solve_network(
         # single FFT apply of 3.7 ms). The factorisation is host-side and eager -- a preconditioner
         # only has to accelerate, so nothing differentiable passes through it; the gradient comes from
         # the outer custom_linear_solve.
-        Asp = Asp0
-        Dinv = sp.diags(1.0 / np.asarray(zdiag))
-        S = (CI @ Dinv @ Asp.T.tocsr() + Cp).tocsc()
-        lu = spla.splu(S)
         # The dtype follows jax_enable_x64 rather than being pinned: hardcoding complex128 here made
         # the callback disagree with everything around it the moment x64 was off.
         cdtype = jnp.result_type(jnp.complex64) if not jax.config.jax_enable_x64 else jnp.complex128
         shape_out = jax.ShapeDtypeStruct((nn,), cdtype)
+        AspT = Asp0.T.tocsr()
 
-        _LU_HOLDER["lu"] = lu  # the callback reads the CURRENT factorisation, so its identity is stable
+        def _factorise(zd):
+            """Build and stash the Schur factorisation from the CURRENT diagonal.
 
-        def _host_solve(r):
-            return lu.solve(np.asarray(r)).astype(cdtype)
+            Through a callback rather than inline, because ``zdiag`` depends on the conductivity and
+            is therefore a TRACER under ``jax.grad`` -- building scipy matrices from it directly threw
+            TracerArrayConversionError, which made the fast path the only non-differentiable one in
+            the library. Nothing differentiable passes through here: a preconditioner only has to
+            accelerate, and the gradient comes from the outer ``custom_linear_solve``.
+            """
+            _LU_HOLDER["lu"] = spla.splu((CI @ sp.diags(1.0 / np.asarray(zd)) @ AspT + Cp).tocsc())
+            return np.zeros((), dtype=np.float64)
+
+        # Both callbacks need a derivative rule, because jax refuses to differentiate a pure_callback
+        # and the adjoint of the solve applies the preconditioner too. Neither rule is an
+        # approximation: the token is a constant, so its tangent is zero; the preconditioner is a
+        # LINEAR operator, so its tangent is itself applied to the tangent.
+        @jax.custom_jvp
+        def _token(zd):
+            return jax.pure_callback(_factorise, jax.ShapeDtypeStruct((), jnp.float64), zd)
+
+        @_token.defjvp
+        def _token_jvp(primals, tangents):
+            return _token(*primals), jnp.zeros(())  # a constant token; the refusal is on _precond
+
+        @jax.custom_jvp
+        def _precond(r):
+            return jax.pure_callback(_holder_solve, shape_out, r)
+
+        @_precond.defjvp
+        def _precond_jvp(primals, tangents):
+            # The preconditioner is linear, so this rule is exact -- but the SOLVE around it is not
+            # differentiating correctly, and a rule here would let a wrong gradient through quietly.
+            # Measured against the dense path, which is exact: -2.80e-14 where the answer is
+            # -1.41e-12, and at DC -3.09e-09 where the answer is -8.19e-05. Refuse instead.
+            raise NotImplementedError(
+                "jno.peec: the matrix-free path is not differentiable yet — its gradient is WRONG, not "
+                "merely unsupported, so it is refused rather than returned. Differentiate the dense "
+                "path instead (matrix_free=False), which is checked against finite differences to 1e-8; "
+                "it forms the operator, so it is limited to a network small enough to fit."
+            )
 
         # ONE compilation, reused across frequencies. The operators that depend on geometry alone --
         # the transformed lattice generator, the incidence -- are closed over; everything that moves
@@ -571,13 +604,16 @@ def solve_network(
 
         def P_inv(r, zd):
             ri, rp = r[:ne], r[ne:]
-            dphi = jax.pure_callback(_holder_solve, shape_out, rp - CIj @ (ri / zd))
+            dphi = _precond(rp - CIj @ (ri / zd))
             return jnp.concatenate([(ri + Acj @ dphi) / zd, dphi])
 
         if cached is None:
 
             @jax.jit
             def _run(rhs, w_, zd, Rc_):
+                # sequenced through the right-hand side so the factorisation is built before the
+                # solve that reads it, rather than relying on callback ordering
+                rhs = rhs + _token(zd).astype(rhs.dtype)
                 return jax.scipy.sparse.linalg.gmres(
                     lambda v: M_apply(v, w_, zd, Rc_),
                     rhs,
