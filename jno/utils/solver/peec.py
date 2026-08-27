@@ -25,7 +25,7 @@ import numpy as np
 
 from .kernel import wire_self
 
-__all__ = ["Filaments", "line_filaments", "network_impedance"]
+__all__ = ["Filaments", "line_filaments", "network_impedance", "port_spec", "terminal_nodes"]
 
 
 class Filaments(NamedTuple):
@@ -206,3 +206,101 @@ def network_impedance(fil: Filaments, sigma, port, omega: float = 0.0, mu0: floa
     x = jnp.linalg.solve(M, rhs)
     cur = x[:ne]
     return 1.0 / (A[ia] @ cur), cur
+
+
+# ----------------------------------------------------------------------------------------------
+# Reading a constraint list into ports
+# ----------------------------------------------------------------------------------------------
+
+
+def _trial_names(expr, out=None):
+    """Every trial-function name appearing in ``expr`` — which field a constraint is written on."""
+    from jno.trace import TrialFunction
+
+    out = set() if out is None else out
+    inner = object.__getattribute__(expr, "_expr") if hasattr(type(expr), "_expr") else getattr(expr, "_expr", None)
+    if inner is not None and inner is not expr:  # a bound view wraps the node it was built from
+        _trial_names(inner, out)
+    if isinstance(expr, TrialFunction):
+        out.add(str(getattr(expr, "name", "?")))
+    for a in getattr(expr, "args", None) or []:
+        _trial_names(a, out)
+    for side in ("left", "right"):
+        sub = getattr(expr, side, None)
+        if sub is not None:
+            _trial_names(sub, out)
+    return out
+
+
+def port_spec(constraints, current="i", potential="v"):
+    """Read a PEEC constraint list into ``(sources, currents, grounds)``.
+
+    Three forms, and only three::
+
+        v(A) - v(B) - g     a source of g volts from terminal A to terminal B
+        v(A) - g            terminal A held at g volts (g = 0 is the ground / reference)
+        i(A) - g            terminal A carries g amps (g = 0 is an open terminal)
+
+    A relation across TWO regions only means something on the potential, so ``i(A) - i(B)`` is
+    refused rather than guessed at.
+
+    Pure: it reads names and constants off the trace and touches no geometry, so what a terminal
+    NAME resolves to is the caller's business.
+    """
+    from jno._fem import _bare, _scalar_const
+    from jno.trace.views import _tag_of_coord_vars
+
+    sources, currents, grounds = [], [], []
+    for c in constraints:
+        names = _trial_names(c)
+        if len(names) != 1:
+            raise ValueError(
+                f"jno.peec: a constraint must be written on exactly one of {potential!r} (a terminal "
+                f"potential) or {current!r} (a terminal current); this one names {sorted(names) or 'neither'}. "
+                "Split it into one constraint per field."
+            )
+        field = names.pop()
+        if field not in (current, potential):
+            raise ValueError(
+                f"jno.peec: unknown field {field!r}. The symbols from peec_symbols() are "
+                f"{current!r} (terminal current) and {potential!r} (terminal potential)."
+            )
+        bare = _bare(c)
+        g = _scalar_const(bare.right) if getattr(bare, "op", None) == "-" else None
+        tie = getattr(c, "_periodic_tie", None)
+        if tie is not None:
+            if field != potential:
+                raise ValueError(
+                    f"jno.peec: `{field}(A) - {field}(B)` is not a port. A relation between two terminals is a "
+                    f"voltage source, so write it on {potential!r}: `{potential}(A) - {potential}(B) - volts`."
+                )
+            sources.append((tie[0], tie[1], complex(g if g is not None else 0.0)))
+            continue
+        cv = getattr(c, "_coord_vars", None)
+        tag = _tag_of_coord_vars(cv) if cv else None
+        if not isinstance(tag, str):
+            raise ValueError(
+                "jno.peec: a constraint must be bound to a named terminal — bind the region first, as in "
+                "`p = e.variable('DC+', split=True)[:3]` and then `v(*p) - 0.0`."
+            )
+        (grounds if field == potential else currents).append((tag, complex(g if g is not None else 0.0)))
+    return sources, currents, grounds
+
+
+def terminal_nodes(fil: Filaments, where):
+    """Indices of the network nodes lying inside ``where`` — a terminal is a REGION, not a point.
+
+    ``where`` is anything with a ``.contains(points)`` (a :class:`jno.Shape`) or a callable taking
+    ``(N, 3)`` and returning a boolean mask. A real pad has many filament ends on it, and they are
+    held at one potential by :func:`solve_network`.
+    """
+    pts = np.asarray(fil.nodes)
+    hit = where.contains(pts) if hasattr(where, "contains") else where(pts)
+    idx = np.flatnonzero(np.asarray(hit).reshape(-1))
+    if idx.size == 0:
+        raise ValueError(
+            "peec.terminal_nodes: no network node lies in that terminal. A terminal must contain at "
+            "least one filament END — a region that only crosses a filament's middle has nothing to "
+            "connect to; split the polyline so a vertex lands there."
+        )
+    return idx
