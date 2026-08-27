@@ -90,8 +90,8 @@ def test_lines_that_meet_share_a_node():
         jno.Shape.line([(0.01, 0, 0), (0.01, 0.01, 0)], r=1e-4),
     ]
     f = line_filaments(tee, size=0.01)
-    assert np.asarray(f.incidence).shape == (4, 3)  # 3 free ends + the junction, not 6 endpoints
-    assert int((np.abs(np.asarray(f.incidence)).sum(1) == 3).sum()) == 1
+    assert f.incidence.shape == (4, 3)  # 3 free ends + the junction, not 6 endpoints
+    assert int((np.abs(f.incidence).sum(1) == 3).sum()) == 1
 
 
 def test_a_closed_loop_has_no_port():

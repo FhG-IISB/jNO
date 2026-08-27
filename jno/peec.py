@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 import numpy as np
+import scipy.sparse as sparse
 
 from .utils.solver.peec import (
     Filaments,
@@ -175,8 +176,10 @@ class PEEC:
             # so a shared grid is what keeps the whole trace layer a single FFT: on the example module
             # that is ten coplanar traces of equal thickness, which is the case it fits exactly.
             shs = [sh for sh, _ in solids]
-            fb = bar_filaments(shs)
-            parts.append((fb, np.asarray([sg for _, sg in solids])[np.asarray(fb.part)]))
+            sgs = [sg for _, sg in solids]
+            fb = bar_filaments(shs, sigma=sgs)
+            per = fb.lattice.get("sigma")
+            parts.append((fb, per if per is not None else np.asarray(sgs)[np.asarray(fb.part)]))
             owners.append(shs)
         return (*_weld(parts, owners), terms)
 
@@ -255,12 +258,7 @@ def _weld(parts, owners):
     if len(parts) == 1:
         return parts[0]
     fils = [f for f, _ in parts]
-    incs = [np.asarray(f.incidence) for f in fils]
-    inc = np.zeros((sum(a.shape[0] for a in incs), sum(a.shape[1] for a in incs)))
-    r = c = 0
-    for a in incs:
-        inc[r : r + a.shape[0], c : c + a.shape[1]] = a
-        r, c = r + a.shape[0], c + a.shape[1]
+    inc = sparse.block_diag([f.incidence for f in fils], format="csr")
     shift = lambda key: _renumber([np.asarray(getattr(f, key)) for f in fils])
     cat = lambda key: jnp.concatenate([jnp.asarray(getattr(f, key)) for f in fils])
     nodes = np.concatenate([np.asarray(f.nodes) for f in fils])
@@ -271,7 +269,7 @@ def _weld(parts, owners):
         cat("mom"),
         cat("self_g"),
         shift("group"),
-        jnp.asarray(inc),
+        inc,
         cat("length"),
         cat("area"),
         jnp.asarray(nodes),
@@ -311,9 +309,9 @@ def _join_contacts(inc, nodes, bounds, owners):
                     root[ra] = rb
     lab = np.array([find(a) for a in range(len(nodes))])
     keep, inverse = np.unique(lab, return_inverse=True)
-    merged = np.zeros((len(keep), inc.shape[1]))
-    np.add.at(merged, inverse, inc)
-    return merged, nodes[keep]
+    # merging rows is a left-multiply by the (kept x all) membership matrix, which keeps it sparse
+    pick = sparse.coo_matrix((np.ones(len(nodes)), (inverse, np.arange(len(nodes)))), shape=(len(keep), len(nodes))).tocsr()
+    return (pick @ inc).tocsr(), nodes[keep]
 
 
 def _spans(fils):
