@@ -187,12 +187,15 @@ class PEEC:
                 raise ValueError(f"jno.peec: conductor {n!r} has no conductivity. Give it one: .attach(sigma=...).")
             node = getattr(sh, "_node", None)
             kind = type(node[1]).__name__ if (isinstance(node, tuple) and node and node[0] == "leaf") else None
+            # NOT coerced to float: a conductivity may be a traced value, which is what closes the
+            # electro-thermal loop — sigma(T) falls as the conductor heats, and copper is about 31 %
+            # more resistive at 100 C than at 20 C.
             if kind == "Line":
                 lines.append(sh)
-                line_sig.append(float(sig[n]))
+                line_sig.append(sig[n])
                 line_names.append(n)
             elif kind == "Box":
-                solids.append((sh, float(sig[n])))
+                solids.append((sh, sig[n]))
                 solid_names.append(n)
             else:
                 raise NotImplementedError(_shape_msg(n, kind))
@@ -200,7 +203,7 @@ class PEEC:
         parts, owners = [], []  # (Filaments, per-filament sigma) and the shapes they came from
         if lines:
             fl = line_filaments(lines)
-            parts.append((fl, np.asarray(line_sig)[np.asarray(fl.part)]))
+            parts.append((fl, jnp.asarray(jnp.stack([jnp.asarray(x) for x in line_sig]))[np.asarray(fl.part)]))
             owners.append(lines)
         if solids:
             # ONE grid for every solid. Separate lattices couple through a block that is not Toeplitz,
@@ -210,7 +213,7 @@ class PEEC:
             sgs = [sg for _, sg in solids]
             fb = bar_filaments(shs, sigma=sgs)
             per = fb.lattice.get("sigma")
-            parts.append((fb, per if per is not None else np.asarray(sgs)[np.asarray(fb.part)]))
+            parts.append((fb, per if per is not None else jnp.stack([jnp.asarray(x) for x in sgs])[np.asarray(fb.part)]))
             owners.append(shs)
         # part index -> region name, in the order _weld renumbers them: lines, then solids
         return (*_weld(parts, owners), terms, line_names + solid_names)
