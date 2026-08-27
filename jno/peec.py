@@ -187,6 +187,8 @@ class PEEC:
                 raise ValueError(f"jno.peec: conductor {n!r} has no conductivity. Give it one: .attach(sigma=...).")
             node = getattr(sh, "_node", None)
             kind = type(node[1]).__name__ if (isinstance(node, tuple) and node and node[0] == "leaf") else None
+            if kind != "Line" and not getattr(sh, "is_analytic", lambda: False)():
+                raise NotImplementedError(_shape_msg(n, kind))
             # NOT coerced to float: a conductivity may be a traced value, which is what closes the
             # electro-thermal loop — sigma(T) falls as the conductor heats, and copper is about 31 %
             # more resistive at 100 C than at 20 C.
@@ -194,11 +196,12 @@ class PEEC:
                 lines.append(sh)
                 line_sig.append(sig[n])
                 line_names.append(n)
-            elif kind == "Box":
+            else:
+                # ANY closed-form solid, not just a box: the lattice covers its bounding box and a
+                # mask says which cells are metal, so a cylinder, a sphere, a union or a CSG
+                # difference all voxelise the same way and all stay one Toeplitz block.
                 solids.append((sh, sig[n]))
                 solid_names.append(n)
-            else:
-                raise NotImplementedError(_shape_msg(n, kind))
 
         parts, owners = [], []  # (Filaments, per-filament sigma) and the shapes they came from
         if lines:
@@ -276,9 +279,10 @@ class _from_predicate:
 
 def _shape_msg(name, kind):
     return (
-        f"jno.peec: conductor {name!r} is a {kind or 'CSG'} plan, and only two discretisations exist: a "
-        "Shape.line becomes filaments along its centreline, a Shape.box becomes a lattice of bars. Build "
-        "the conductor from those, or ask for the shape you need."
+        f"jno.peec: conductor {name!r} ({kind or 'a CSG'} plan) has no closed-form membership, and the "
+        "lattice is built by asking which cells lie inside it. Everything analytic works — a box, a "
+        "cylinder, a sphere, a union, a difference — as does Shape.line, which keeps its exact "
+        "cross-section instead of being voxelised. A swept or filleted solid does not."
     )
 
 
