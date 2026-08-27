@@ -175,3 +175,64 @@ def test_mutual_inductance_of_two_coaxial_loops():
         k = np.sqrt(k2)
         exact = mu0 * R * ((2 / k - k) * ellip.ellipk(k2) - (2 / k) * ellip.ellipe(k2))
         assert abs(got / exact - 1) < 2e-4, f"d={d}: {got * 1e9:.5f} nH vs {exact * 1e9:.5f} nH"
+
+
+def test_group_none_equals_an_explicit_identity_labelling():
+    """``group=None`` must be exactly ``group=arange(n)`` — the diagonal IS the same-element test.
+
+    Pins the unification: there is one exclusion rule, not a diagonal branch plus a group branch.
+    """
+    pos = jax.random.uniform(jax.random.PRNGKey(11), (23, 3)) * 4.0
+    mom = jax.random.normal(jax.random.PRNGKey(12), (23, 3))
+    sg = jnp.full((23,), 0.7)
+    a = float(pair_quadratic(pos, mom, INV_R, sg, chunk=8))
+    b = float(pair_quadratic(pos, mom, INV_R, sg, group=np.arange(23), chunk=8))
+    assert abs(a / b - 1) < 1e-13
+
+
+def test_subpoint_quadrature_converges_on_a_straight_wire():
+    """Partial inductances of N collinear elements must sum to the wire's closed-form self inductance.
+
+        L = (mu0 l / 2pi) [ln(2l/a) - 3/4]
+
+    Collinear neighbours are the worst case for a one-point mutual — they sit close relative to
+    their own length — so this is the tightest available check on the near-field treatment. Measured
+    at N = 32: 7.8 % low with one point per element, 2.5 % at two Gauss points, 0.2 % at eight.
+    """
+    from jno.utils.solver.kernel import wire_self
+
+    mu0, L, A, N = 4e-7 * np.pi, 0.050, 2.5e-4, 32
+    exact = (mu0 * L / (2 * np.pi)) * (np.log(2 * L / A) - 0.75)
+    seg = L / N
+    zc = (np.arange(N) + 0.5) * seg
+    sg = jnp.asarray(np.full(N, float(wire_self(jnp.asarray(seg), A))))
+
+    def total(nq):
+        gx, gw = np.polynomial.legendre.leggauss(nq)
+        z = (zc[:, None] + 0.5 * seg * gx[None, :]).ravel()
+        w = np.tile(gw / 2.0, N)
+        pos = jnp.asarray(np.stack([np.zeros_like(z), np.zeros_like(z), z], -1))
+        mom = jnp.asarray(np.stack([np.zeros_like(z), np.zeros_like(z), seg * w], -1))
+        q = pair_quadratic(pos, mom, INV_R, sg, group=np.repeat(np.arange(N), nq), chunk=64)
+        return float(q) * mu0 / (4 * np.pi)
+
+    err = [abs(total(q) / exact - 1) for q in (1, 2, 3, 5, 8)]
+    assert err[0] > 0.05, f"a one-point mutual should be several percent low, got {err[0]:.4f}"
+    assert all(b < a for a, b in zip(err, err[1:])), f"not monotone in quadrature order: {err}"
+    assert err[-1] < 5e-3, f"eight Gauss points should be well under 1%, got {err[-1]:.4f}"
+
+
+def test_single_element_reproduces_its_own_self_term():
+    """With one element and no mutuals, the quadratic form IS the closed-form self inductance."""
+    from jno.utils.solver.kernel import bar_self, wire_self
+
+    mu0, L, A = 4e-7 * np.pi, 0.040, 2.0e-4
+    pos = jnp.zeros((1, 3))
+    mom = jnp.zeros((1, 3)).at[0, 2].set(L)
+    got = float(pair_quadratic(pos, mom, INV_R, jnp.asarray([wire_self(L, A)]))) * mu0 / (4 * np.pi)
+    assert abs(got / ((mu0 * L / (2 * np.pi)) * (np.log(2 * L / A) - 0.75)) - 1) < 1e-12
+
+    w, t = 1.0e-3, 3.0e-4
+    got = float(pair_quadratic(pos, mom, INV_R, jnp.asarray([bar_self(L, w, t)]))) * mu0 / (4 * np.pi)
+    ref = (mu0 * L / (2 * np.pi)) * (np.log(2 * L / (w + t)) + 0.5 + 0.2235 * (w + t) / L)
+    assert abs(got / ref - 1) < 1e-12

@@ -40,7 +40,7 @@ from typing import Callable, Sequence
 import jax
 import jax.numpy as jnp
 
-__all__ = ["pair_quadratic", "lattice_kernel", "lattice_operator", "sphere_self"]
+__all__ = ["pair_quadratic", "lattice_kernel", "lattice_operator", "sphere_self", "bar_self", "wire_self"]
 
 
 def sphere_self(volume):
@@ -55,14 +55,38 @@ def sphere_self(volume):
     return 6.0 / (5.0 * R)
 
 
-def pair_quadratic(pos, mom, g: Callable, self_g, chunk: int = 128):
+def bar_self(length, width, thickness):
+    """Self term of a straight rectangular bar (Ruehli, *IBM J. Res. Dev.* 16:470, 1972, eq. 12).
+
+    ``Lp = (mu0 l/2pi)[ln(2l/(w+t)) + 0.5 + 0.2235 (w+t)/l]``, converted to the ``g_aa`` this module
+    wants by ``Lp = (mu0/4pi) l^2 g_aa``. Valid for ``l >> w, t``.
+    """
+    s = width + thickness
+    return 2.0 * (jnp.log(2.0 * length / s) + 0.5 + 0.2235 * s / length) / length
+
+
+def wire_self(length, radius):
+    """Self term of a straight round wire, ``Lp = (mu0 l/2pi)[ln(2l/a) - 3/4]``, including the
+    internal inductance of a uniform current. Valid for ``l >> a``."""
+    return 2.0 * (jnp.log(2.0 * length / radius) - 0.75) / length
+
+
+def pair_quadratic(pos, mom, g: Callable, self_g, group=None, chunk: int = 128):
     """``Σ_a Σ_b (mom_a · mom_b) g(|r_a − r_b|)`` over arbitrary element positions.
 
     Args:
         pos: ``(N, 3)`` element positions.
         mom: ``(N,)`` scalar or ``(N, d)`` vector density per element (for PEEC, ``J · volume``).
         g: the kernel, a callable of scalar distance.
-        self_g: ``(N,)`` diagonal values ``g_aa``. Required — see the module docstring.
+        self_g: diagonal values ``g_aa`` — per ROW when ``group`` is None, per GROUP otherwise.
+            Required; see the module docstring.
+        group: optional ``(N,)`` integer element label. Rows sharing a label are one element made of
+            several quadrature points: pairs *inside* an element are excluded and replaced by that
+            element's analytic self term, while pairs in *different* elements see the true sub-point
+            distances. That is the standard near/far split, and it is how near-field accuracy is
+            bought — a single point per element is 7.8 % low on collinear neighbours, falling to
+            2.5 % at two Gauss points and 0.2 % at eight. ``None`` means one point per element,
+            where the group test degenerates to the diagonal.
         chunk: rows per scan step. Bounds peak memory at ``chunk × N``; the reverse pass
             rematerialises rather than storing, so this also bounds the gradient's memory.
 
@@ -84,9 +108,19 @@ def pair_quadratic(pos, mom, g: Callable, self_g, chunk: int = 128):
         mom = mom[:, None]
     n = pos.shape[0]
     npad = -(-n // chunk) * chunk
+    if group is None:
+        grp_np = None
+        gsel = jnp.arange(n)
+    else:
+        import numpy as _np
+
+        grp_np = _np.asarray(group)
+        gsel = jnp.asarray(grp_np)
 
     P = jnp.zeros((npad, pos.shape[1]), pos.dtype).at[:n].set(pos)
     M = jnp.zeros((npad, mom.shape[1]), mom.dtype).at[:n].set(mom)
+    # Pads take label -1 so pad-pad is excluded by the same test; pad-real is caught by `real`.
+    G = jnp.full((npad,), -1).at[:n].set(gsel)
     n2 = (P * P).sum(1)
     rows = jnp.arange(chunk)
     cols = jnp.arange(npad)
@@ -99,7 +133,7 @@ def pair_quadratic(pos, mom, g: Callable, self_g, chunk: int = 128):
         # Excluded entries: the diagonal, and anything touching a pad row or column. Identified by
         # INDEX -- the distance identity cancels to ~3e-6 on the diagonal at large coordinates, so
         # no epsilon on `r` can find it reliably.
-        excl = (idx[:, None] == cols[None, :]) | (~real)[None, :] | (~real[idx])[:, None]
+        excl = (G[idx][:, None] == G[None, :]) | (~real)[None, :] | (~real[idx])[:, None]
         # Substitute BEFORE the sqrt. Masking afterwards would still differentiate the excluded
         # branch, and d(sqrt)/dx is infinite at 0, so `where` returns 0 * inf = NaN in reverse mode.
         r = jnp.sqrt(jnp.where(excl, 1.0, r2))
@@ -113,7 +147,13 @@ def pair_quadratic(pos, mom, g: Callable, self_g, chunk: int = 128):
         jnp.zeros((), jnp.result_type(mom.dtype, pos.dtype)),
         (starts, P.reshape(-1, chunk, pos.shape[1]), M.reshape(-1, chunk, mom.shape[1])),
     )
-    return acc + jnp.sum((mom * mom).sum(1) * jnp.asarray(self_g))
+    if grp_np is None:
+        return acc + jnp.sum((mom * mom).sum(1) * jnp.asarray(self_g))
+    # One element's moment is the sum over its quadrature points, so the self term acts on that
+    # total rather than on each point -- otherwise the element's own extent is counted twice.
+    ne = int(grp_np.max()) + 1
+    Me = jax.ops.segment_sum(mom, jnp.asarray(grp_np), num_segments=ne)
+    return acc + jnp.sum((Me * Me).sum(1) * jnp.asarray(self_g))
 
 
 def lattice_kernel(n: Sequence[int], h: Sequence[float], g: Callable, self_g):
