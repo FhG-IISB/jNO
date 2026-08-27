@@ -996,39 +996,35 @@ def _sub_slice(fil, lo, hi):
     return jnp.asarray(np.flatnonzero(m)), jnp.asarray(grp[m] - lo), int(hi - lo)
 
 
-def cross_apply(pos_a, mom_a, grp_a, na, pos_b, mom_b, grp_b, nb, g, scale=1.0, chunk=4096):
-    """``x -> Lp_ab @ x`` and its transpose, without forming the rectangular block.
+def cross_block(pos_a, mom_a, grp_a, na, pos_b, mom_b, grp_b, nb, g, scale=1.0, chunk=2048):
+    """The ELEMENT-level coupling ``Lp_ab``, built once — ``(na, nb)``, dense.
 
     Two conductors on different discretisations couple through a block that is neither Toeplitz nor
-    square, so neither the FFT nor a lattice trick applies to it. It does not need them: one side is
-    small (a bond wire is a few hundred filaments against a trace's hundred thousand), so the block is
-    thin and evaluating it per apply costs less than storing it.
+    square, so neither the FFT nor a lattice trick applies to it. It also does not need them, because
+    it is THIN: one side is a bond wire of a few hundred filaments against a trace of a hundred
+    thousand bars, so the block is small even when the lattice is not.
+
+    Built once rather than evaluated per apply. Recomputing it inside the Krylov loop is what a
+    matrix-free method is supposed to avoid, and here it was catastrophic: a 6,806-bar lattice solved
+    in 0.213 s, and adding a SINGLE 19-filament wire took it to 33.4 s — 157x for 0.3 % more elements
+    — because every application rebuilt a (57 x 20,418) kernel evaluation twice, inside a graph XLA
+    then had to compile. As a stored block it is 1 MB and a matvec.
+
+    The sub-point double sum is contracted into elements here, so the returned block is indexed by
+    element and an apply is one dense matvec.
     """
     pa, ma = jnp.asarray(pos_a), jnp.asarray(mom_a)
     pb, mb = jnp.asarray(pos_b), jnp.asarray(mom_b)
     ga, gb = jnp.asarray(grp_a), jnp.asarray(grp_b)
-
-    def forward(x):  # (nb,) -> (na,)
-        xb = jnp.asarray(x)[gb]  # spread the element current onto its sub-points
-        out = jnp.zeros(pa.shape[0], xb.dtype)
-        for lo in range(0, pa.shape[0], chunk):
-            hi = min(lo + chunk, pa.shape[0])
-            d = pa[lo:hi, None, :] - pb[None, :, :]
-            r = jnp.sqrt(jnp.clip((d * d).sum(-1), 1e-300))
-            out = out.at[lo:hi].set(((ma[lo:hi] @ mb.T) * g(r)) @ xb)
-        return scale * jax.ops.segment_sum(out, ga, num_segments=na)
-
-    def transpose(y):  # (na,) -> (nb,)
-        ya = jnp.asarray(y)[ga]
-        out = jnp.zeros(pb.shape[0], ya.dtype)
-        for lo in range(0, pa.shape[0], chunk):
-            hi = min(lo + chunk, pa.shape[0])
-            d = pa[lo:hi, None, :] - pb[None, :, :]
-            r = jnp.sqrt(jnp.clip((d * d).sum(-1), 1e-300))
-            out = out + ((ma[lo:hi] @ mb.T) * g(r)).T @ ya[lo:hi]
-        return scale * jax.ops.segment_sum(out, gb, num_segments=nb)
-
-    return forward, transpose
+    rows = []
+    for lo in range(0, pa.shape[0], chunk):
+        hi = min(lo + chunk, pa.shape[0])
+        d = pa[lo:hi, None, :] - pb[None, :, :]
+        r = jnp.sqrt(jnp.clip((d * d).sum(-1), 1e-300))
+        sub = (ma[lo:hi] @ mb.T) * g(r)  # (chunk, n_b_subpoints)
+        rows.append(jax.ops.segment_sum(sub.T, gb, num_segments=nb).T)  # contract b into elements
+    blk = jnp.concatenate(rows, axis=0)
+    return scale * jax.ops.segment_sum(blk, ga, num_segments=na)  # then a
 
 
 def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3):
@@ -1072,7 +1068,7 @@ def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3):
         for j, (loj, hij, rj, gj, cj) in enumerate(sel):
             if j <= i:
                 continue
-            cross[(i, j)] = cross_apply(
+            cross[(i, j)] = cross_block(
                 jnp.asarray(fil.pos)[ri],
                 jnp.asarray(fil.mom)[ri],
                 gi,
@@ -1088,9 +1084,9 @@ def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3):
     def apply(cur):
         cur = jnp.asarray(cur)
         out = [d(cur[lo:hi]) for d, (lo, hi, *_r) in zip(diag, sel)]
-        for (i, j), (fwd, tr) in cross.items():
-            out[i] = out[i] + fwd(cur[sel[j][0] : sel[j][1]])
-            out[j] = out[j] + tr(cur[sel[i][0] : sel[i][1]])
+        for (i, j), K in cross.items():
+            out[i] = out[i] + K @ cur[sel[j][0] : sel[j][1]]
+            out[j] = out[j] + K.T @ cur[sel[i][0] : sel[i][1]]
         return jnp.concatenate(out)
 
     return apply
