@@ -21,6 +21,7 @@ from __future__ import annotations
 from typing import NamedTuple
 
 import jax
+import jax.experimental.sparse as jsparse
 import jax.numpy as jnp
 import numpy as np
 
@@ -438,68 +439,94 @@ def solve_network(
                 "add `v(REF) - 0.0`."
             )
 
-    free = jnp.asarray(np.array([n for n in range(nn) if n not in owner], dtype=int))
-    rows, rhs = [], []
-    if not free_form:
-        rows.append(jnp.concatenate([Z, -A.T.astype(complex)], axis=1))
-    rhs.append(jnp.zeros(ne, dtype=complex))
-    if free.size:  # current balance away from the terminals
-        rows.append(jnp.concatenate([A[free].astype(complex), jnp.zeros((free.size, nn), dtype=complex)], axis=1))
-        rhs.append(jnp.zeros(free.size, dtype=complex))
+    free = np.array([n for n in range(nn) if n not in owner], dtype=int)
+    # The constraint block is assembled as TRIPLETS, not rows. It is current balance plus a handful of
+    # port conditions, so it carries a few entries per row against ne + nn columns: on a 12k-bar
+    # lattice the incidence alone is 24,548 nonzeros in 61,271,808 slots -- 0.04 % -- and holding that
+    # densely costs 1.4 GB and an 86-million-op matvec per Krylov step, next to a 3.7 ms FFT apply.
+    An = np.asarray(A)
+    rr, cc, vv, rhs = [], [], [], [np.zeros(ne, dtype=complex)]
+    r0 = 0
+    for n in free:  # current balance away from the terminals
+        k = np.flatnonzero(An[n])
+        rr.append(np.full(k.size, r0))
+        cc.append(k)
+        vv.append(An[n, k])
+        r0 += 1
+        rhs.append(np.zeros(1, dtype=complex))
     for t in names:  # a terminal is equipotential: tie its nodes to its first
         ids = idx[t]
-        if ids.size > 1:
-            tie = jnp.zeros((ids.size - 1, ne + nn), dtype=complex)
-            for k, n in enumerate(ids[1:].tolist()):
-                tie = tie.at[k, ne + n].set(1.0).at[k, ne + int(ids[0])].set(-1.0)
-            rows.append(tie)
-            rhs.append(jnp.zeros(ids.size - 1, dtype=complex))
+        for n in ids[1:].tolist():
+            rr.append(np.array([r0, r0]))
+            cc.append(np.array([ne + n, ne + int(ids[0])]))
+            vv.append(np.array([1.0, -1.0]))
+            r0 += 1
+            rhs.append(np.zeros(1, dtype=complex))
     for t in names:  # and one row for the terminal itself
-        r = jnp.zeros(ne + nn, dtype=complex)
         kind, *rest = row[t][1] if t in row else ("open", t, 0.0 + 0j)
         if kind == "source":
-            a, b, g = rest
-            r = r.at[ne + int(idx[a][0])].set(1.0).at[ne + int(idx[b][0])].set(-1.0)
-            rhs.append(jnp.asarray(g, dtype=complex))
+            a, b_, g = rest
+            rr.append(np.array([r0, r0]))
+            cc.append(np.array([ne + int(idx[a][0]), ne + int(idx[b_][0])]))
+            vv.append(np.array([1.0, -1.0]))
         elif kind == "ground":
             _t, g = rest
-            r = r.at[ne + int(idx[t][0])].set(1.0)
-            rhs.append(jnp.asarray(g, dtype=complex))
+            rr.append(np.array([r0]))
+            cc.append(np.array([ne + int(idx[t][0])]))
+            vv.append(np.array([1.0]))
         else:  # a fixed injected current, or an open terminal (which is zero injected current)
             _t, g = rest
-            r = r.at[:ne].set(A[idx[t]].sum(0).astype(complex))
-            rhs.append(jnp.asarray(g, dtype=complex))
-        rows.append(r[None, :])
-    b = jnp.concatenate([jnp.atleast_1d(x) for x in rhs])
+            col = An[idx[t]].sum(0)
+            k = np.flatnonzero(col)
+            rr.append(np.full(k.size, r0))
+            cc.append(k)
+            vv.append(col[k])
+        rhs.append(np.atleast_1d(np.asarray(g, dtype=complex)))
+        r0 += 1
+    if r0 != nn:
+        raise ValueError(f"jno.peec: built {r0} constraint rows, expected {nn}; this is a bug.")
+    crow, ccol, cval = np.concatenate(rr), np.concatenate(cc), np.concatenate(vv).astype(complex)
+    b = jnp.asarray(np.concatenate(rhs))
     _refuse_disconnected(np.asarray(A), idx, sources, grounds, currents)
 
     if free_form:
-        C = jnp.concatenate(rows, axis=0)  # the constraint block: KCL, terminal ties, port rows
-        if C.shape != (nn, ne + nn):
-            raise ValueError(f"jno.peec: constraint block is {C.shape}, expected {(nn, ne + nn)}; this is a bug.")
-        CI, Cp = C[:, :ne], C[:, ne:]
-        Ac = A.T.astype(complex)
+        import scipy.sparse as sp
+        import scipy.sparse.linalg as spla
+
         w = float(omega)
         Rc = R.astype(complex)
         zdiag = Rc + (1j * w) * jnp.asarray(_lattice_diag(fil, mu0))
 
+        C = sp.coo_matrix((cval, (crow, ccol)), shape=(nn, ne + nn)).tocsr()
+        CI, Cp = C[:, :ne], C[:, ne:]
+        Cj = _bcoo(cval, crow, ccol, (nn, ne + nn))
+        el = ccol < ne  # the current columns of the constraint block, for the preconditioner
+        CIj = _bcoo(cval[el], crow[el], ccol[el], (nn, ne))
+        Ac = A.T.astype(complex)
+
+        # The Schur complement of the diagonal of Z. Sparse throughout: CI is current balance, A is
+        # the incidence, and their product is graph-Laplacian shaped, so forming and factoring it
+        # costs a fraction of the dense route (measured on 12k bars: 6.5 s + 21.1 s dense, against a
+        # single FFT apply of 3.7 ms). The factorisation is host-side and eager -- a preconditioner
+        # only has to accelerate, so nothing differentiable passes through it; the gradient comes from
+        # the outer custom_linear_solve.
+        Asp = sp.coo_matrix((An[An != 0], np.nonzero(An)), shape=(nn, ne)).tocsr()
+        Dinv = sp.diags(1.0 / np.asarray(zdiag))
+        S = (CI @ Dinv @ Asp.T.tocsr() + Cp).tocsc()
+        lu = spla.splu(S)
+        shape_out = jax.ShapeDtypeStruct((nn,), jnp.complex128)
+
+        def _host_solve(r):
+            return lu.solve(np.asarray(r)).astype(np.complex128)
+
         def M_apply(x):
             cur, phi = x[:ne], x[ne:]
-            return jnp.concatenate([Rc * cur + (1j * w) * lp_apply(cur) - Ac @ phi, C @ x])
-
-        # A block preconditioner, because row scaling is not enough. [[Z, -A'], [C_I, C_phi]] is a
-        # saddle point whose conditioning comes from the coupling rather than the physics -- measured
-        # at 2.8e+16 where Z alone is 1.9e+03 -- and GMRES on the scaled rows stalls past a few hundred
-        # bars. Replacing Z by its diagonal makes the block factorisation exact and cheap: the Schur
-        # complement S = C_I D^-1 A' + C_phi is formed and factored ONCE, and it is a NODE-sized matrix,
-        # so the element count stays matrix-free. A nested Krylov solve would be the textbook
-        # alternative and jax refuses it: custom_linear_solve cannot appear inside another's operator.
-        S = CI @ (Ac / zdiag[:, None]) + Cp
-        lu = jax.scipy.linalg.lu_factor(S)
+            return jnp.concatenate([Rc * cur + (1j * w) * lp_apply(cur) - Ac @ phi, Cj @ x])
 
         def P_inv(r):
             ri, rp = r[:ne], r[ne:]
-            dphi = jax.scipy.linalg.lu_solve(lu, rp - CI @ (ri / zdiag))
+            rhs_p = rp - CIj @ (ri / zdiag)
+            dphi = jax.pure_callback(_host_solve, shape_out, rhs_p)
             return jnp.concatenate([(ri + Ac @ dphi) / zdiag, dphi])
 
         x, _ = jax.scipy.sparse.linalg.gmres(
@@ -513,9 +540,9 @@ def solve_network(
                 "matrix_free=False for a network small enough to form."
             )
     else:
-        M = jnp.concatenate(rows, axis=0)
-        if M.shape[0] != M.shape[1]:
-            raise ValueError(f"jno.peec: built a {M.shape[0]}x{M.shape[1]} system; this is a bug, please report it.")
+        top = jnp.concatenate([Z, -A.T.astype(complex)], axis=1)
+        bot = jnp.zeros((nn, ne + nn), dtype=complex).at[crow, ccol].add(jnp.asarray(cval))
+        M = jnp.concatenate([top, bot], axis=0)
         x = jnp.linalg.solve(M, b)
     if not bool(jnp.all(jnp.isfinite(x))):
         raise ValueError(
@@ -564,7 +591,7 @@ def _refuse_disconnected(A, idx, sources, grounds, currents):
             )
 
 
-def bar_filaments(shape, size: float = None, quad: int = 3):
+def bar_filaments(shape, size=None, quad: int = 3, sigma=None):
     """Discretise a box conductor into a regular lattice of rectangular bars.
 
     A solid does not have a centreline, so a line's discretisation does not apply. The volume is cut
@@ -594,6 +621,8 @@ def bar_filaments(shape, size: float = None, quad: int = 3):
             varies: 33.6 million bars against 137 thousand for ``(1.0, 1.0, 0.065)`` at the same
             through-thickness resolution.
         quad: Gauss points along each bar.
+        sigma: conductivity per conductor. Needed only when conductors touch: a bar straddling two of
+            them has half its length in each, so its conductivity is their series (harmonic) mean.
 
     Returns:
         :class:`Filaments`, with ``lattice`` describing the grid the FFT path needs.
@@ -695,15 +724,25 @@ def bar_filaments(shape, size: float = None, quad: int = 3):
     area = np.concatenate(area)
     axis = np.concatenate(axis)
     owner = np.concatenate(owner)
-    if not np.all(owner[:, 0] == owner[:, 1]):
-        bad = int(np.flatnonzero(owner[:, 0] != owner[:, 1])[0])
-        raise NotImplementedError(
-            f"peec.bar_filaments: a bar joins cells of conductors {owner[bad, 0]} and {owner[bad, 1]}, so "
-            "it spans a material interface and has no single conductivity. Give the two the same "
-            "material, or leave a cell of clearance between them."
-        )
     part = owner[:, 0]
     nb = len(ln)
+    # A bar may straddle two conductors -- a shorting strap touching two plates is the normal case,
+    # not an error. Its two halves are in SERIES, so the bar's conductivity is the harmonic mean; for
+    # one material that degenerates to the material, and only a genuine mismatch changes anything.
+    bar_sigma = None
+    if sigma is not None:
+        sg = np.asarray(sigma, dtype=float)
+        if sg.size != len(shapes):
+            raise ValueError(f"peec.bar_filaments: {sg.size} conductivities for {len(shapes)} conductors.")
+        s0, s1 = sg[owner[:, 0]], sg[owner[:, 1]]
+        bar_sigma = 2.0 * s0 * s1 / (s0 + s1)
+    elif not np.all(owner[:, 0] == owner[:, 1]):
+        bad = int(np.flatnonzero(owner[:, 0] != owner[:, 1])[0])
+        raise ValueError(
+            f"peec.bar_filaments: a bar joins cells of conductors {owner[bad, 0]} and {owner[bad, 1]}, so "
+            "its conductivity depends on both. Pass sigma= (one per conductor) and it is resolved as the "
+            "series combination."
+        )
 
     gx, gw = np.polynomial.legendre.leggauss(int(quad))
     pos = (cen[:, None, :] + 0.5 * ln[:, None, None] * gx[None, :, None] * tan[:, None, :]).reshape(-1, 3)
@@ -730,7 +769,13 @@ def bar_filaments(shape, size: float = None, quad: int = 3):
         jnp.asarray(area),
         jnp.asarray(nodes),
         part,
-        {"n": tuple(int(v) for v in n), "d": tuple(float(v) for v in d), "axis": axis, "masks": masks},
+        {
+            "n": tuple(int(v) for v in n),
+            "d": tuple(float(v) for v in d),
+            "axis": axis,
+            "masks": masks,
+            "sigma": bar_sigma,
+        },
     )
 
 
@@ -929,3 +974,8 @@ def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3):
         return jnp.concatenate(out)
 
     return apply
+
+
+def _bcoo(val, row, col, shape):
+    """A BCOO from COO triplets, for a matvec inside a traced body."""
+    return jsparse.BCOO((jnp.asarray(val), jnp.stack([jnp.asarray(row), jnp.asarray(col)], axis=1)), shape=shape)
