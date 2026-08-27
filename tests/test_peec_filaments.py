@@ -36,8 +36,8 @@ def _x64():
 
 
 def _inductance(shape, size, quad, chunk=256):
-    pos, mom, self_g, group = line_filaments(shape, size=size, quad=quad)
-    q = pair_quadratic(pos, mom, INV_R, self_g, group=group, chunk=chunk)
+    f = line_filaments(shape, size=size, quad=quad)
+    q = pair_quadratic(f.pos, f.mom, INV_R, f.self_g, group=f.group, chunk=chunk)
     return float(q) * MU0 / (4 * np.pi)
 
 
@@ -86,8 +86,8 @@ def test_refining_the_polyline_does_not_fix_the_near_field():
 def test_filament_lengths_sum_to_the_polyline_length():
     pts = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 2.0, 0.0), (1.0, 2.0, 0.5)]
     wire = jno.Shape.line(pts, r=0.01)
-    _, mom, self_g, group = line_filaments(wire, size=0.17, quad=2)
-    per = jax.ops.segment_sum(jnp.asarray(mom), jnp.asarray(group), num_segments=len(self_g))
+    f = line_filaments(wire, size=0.17, quad=2)
+    per = jax.ops.segment_sum(jnp.asarray(f.mom), jnp.asarray(f.group), num_segments=len(f.self_g))
     total = float(jnp.linalg.norm(per, axis=1).sum())
     exact = float(np.linalg.norm(np.diff(np.asarray(pts), axis=0), axis=1).sum())
     assert abs(total / exact - 1) < 1e-12
@@ -96,8 +96,8 @@ def test_filament_lengths_sum_to_the_polyline_length():
 def test_a_vertex_is_always_a_filament_boundary():
     """A bend must not fall inside a straight element, even when ``size`` exceeds a whole leg."""
     pts = [(0.0, 0.0, 0.0), (0.3, 0.0, 0.0), (0.3, 0.9, 0.0)]
-    _, mom, self_g, group = line_filaments(jno.Shape.line(pts, r=0.01), size=5.0, quad=1)
-    per = np.asarray(jax.ops.segment_sum(jnp.asarray(mom), jnp.asarray(group), num_segments=len(self_g)))
+    f = line_filaments(jno.Shape.line(pts, r=0.01), size=5.0, quad=1)
+    per = np.asarray(jax.ops.segment_sum(jnp.asarray(f.mom), jnp.asarray(f.group), num_segments=len(f.self_g)))
     tang = per / np.linalg.norm(per, axis=1)[:, None]
     ok = [
         (np.abs(t - np.array([1.0, 0, 0])).max() < 1e-12) or (np.abs(t - np.array([0, 1.0, 0])).max() < 1e-12) for t in tang
