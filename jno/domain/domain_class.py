@@ -387,6 +387,58 @@ def _facet_current_names(boundary_regions, mid):
     return names
 
 
+def _regions_of(plan):
+    """The ``(name, Shape)`` pairs of a multi-region plan; empty for any other plan."""
+    node = getattr(plan, "_node", None)
+    return tuple(node[1]) if (isinstance(node, tuple) and node and node[0] == "regions") else ()
+
+
+def _declared_size(plan):
+    """The plan's declared mesh resolution, or ``None`` if it has none.
+
+    A multi-region plan carries no size of its own — the sizes sit on its REGIONS — so asking the
+    combined plan reports ``None`` even when every region declared one. Reading only the outer value
+    would tell a domain it has no declared resolution when it plainly does.
+    """
+    own = getattr(plan, "_size", None)
+    if own is not None:
+        return own
+    sizes = [sh._size for _n, sh in _regions_of(plan) if getattr(sh, "_size", None) is not None]
+    return min(sizes) if sizes else None
+
+
+def _is_interface_tag(name, plan):
+    """True for ``"A|B"`` where A and B are both regions of ``plan`` — the mesher's shared facet."""
+    if not isinstance(name, str) or "|" not in name:
+        return False
+    known = {n for n, _ in _regions_of(plan)}
+    return bool(known) and all(part in known for part in name.split("|"))
+
+
+def _region_predicate(sub, earlier):
+    """A region's membership as a coordinate predicate, in the ``(x, y, ...)`` form tags are called with.
+
+    ``Shape.regions`` lets regions OVERLAP and resolves them by declaration order -- a point belongs
+    to the FIRST region containing it, which is how the mesh itself is labelled (``emit._to_meshio``)
+    and how ``fem_utils._cell_region_mask`` reads them back. So membership is "inside me, and inside
+    none declared before me": geometric containment alone is not belonging, and using it would stop
+    the region masks being a partition. ``by_region`` sums ``mask * value``, so a background region
+    declared last -- one that encloses everything -- would have its coefficient added on top of every
+    other region's, silently and physically rather than as an error.
+    """
+
+    def where(*coords):
+        pts = np.stack(np.broadcast_arrays(*[np.asarray(c) for c in coords]), axis=-1).reshape(-1, len(coords))
+        if pts.shape[1] < 3:  # a 2-D plan lives at z = 0
+            pts = np.concatenate([pts, np.zeros((len(pts), 3 - pts.shape[1]))], axis=1)
+        m = np.asarray(sub.contains(pts)).reshape(-1).astype(bool)
+        for prior in earlier:
+            m &= ~np.asarray(prior.contains(pts)).reshape(-1).astype(bool)
+        return m
+
+    return where
+
+
 class domain(MeshIOMixin):
     """
     Mesh-based domain class for defining computational domains and sampling collocation points.
@@ -672,17 +724,23 @@ class domain(MeshIOMixin):
             # the mesh is built only if something later actually reads `.mesh` (see that property).
             # A structured plan is excluded: it has already been swapped for its lattice closure,
             # which is not a Shape and carries no analytic membership.
-            # A NAMED or multi-region plan also stays eager: its `interior_<name>` and
-            # `interface_<a>_<b>` tags are the mesher's conforming sub-bodies and shared facets,
-            # which no amount of point sampling reconstructs. Supporting those mesh-free is a
-            # separate piece of work, not something to half-do here.
+            # A NAMED plan stays eager. A MULTI-REGION plan defers when every region is analytic:
+            # each region tag is then a closed-form membership test (`A` = points inside A's shape),
+            # which is exactly the predicate machinery `tag(name, where)` already uses. Its INTERFACE
+            # tags (`A|B`) are a different matter -- a shared conforming facet is the mesher's, and no
+            # amount of point sampling reconstructs it -- so reading one builds the mesh (see
+            # `variable`). Interiors served analytically, interfaces served by the mesher, nothing
+            # served halfway.
             from ..geometry.shape import _can_sample_meshfree
 
             _defer = (
                 _plan is not None
                 and _plan._structured is None
                 and getattr(_plan, "_region_name", None) is None
-                and _plan._node[0] != "regions"
+                and (
+                    _plan._node[0] != "regions"
+                    or all(getattr(sh, "is_analytic", lambda: False)() for _n, sh in _plan._node[1])
+                )
                 and hasattr(_plan, "is_analytic")
             )
             _why_eager = None
@@ -691,7 +749,7 @@ class domain(MeshIOMixin):
             if _defer:
                 self._lazy_plan = _plan
                 self.dimension = int(_plan.dim)
-                self.ds = _plan._size
+                self.ds = _declared_size(_plan)
                 self._register_geometry_tags(_plan)
                 if self._is_time_dependent and time is not None:
                     self._time_points = np.linspace(time[0], time[1], time[2])
@@ -1473,6 +1531,11 @@ class domain(MeshIOMixin):
         Nothing detects this today, and the wrong choice produces a plausible number rather than an
         error -- so pass the finer region first.
         """
+        # An interface is the mesher's shared conforming facet, so asking for one is asking for the
+        # mesh — the same contract `.mesh` and `.points` keep. A deferred multi-region domain serves
+        # its region INTERIORS analytically, but it cannot name their interfaces until they exist.
+        if self._needs_mesh_now():
+            self._build_deferred_mesh()
         registry = getattr(self, "_interface_registry", {}) or {}
         if not regions:
             return sorted(registry)
@@ -2511,6 +2574,13 @@ class domain(MeshIOMixin):
             label = _classify(plan._node, float(p[0]), float(p[1]), float(p[2]))
             if label is not None and label[1] not in self._geometry_tags:
                 self._geometry_tags[label[1]] = ("boundary", label[1])
+        # A multi-region plan's regions are interior tags, named exactly as the mesher names them
+        # (the region's own name), so a script reads the same whether or not a mesh was ever built.
+        _seen = []
+        for rname, sub in _regions_of(plan):
+            self._geometry_tags[rname] = ("interior", None)
+            self._tag_predicates[rname] = _region_predicate(sub, tuple(_seen))
+            _seen.append(sub)
         for name in self._geometry_tags:
             if name not in self.avaiable_mesh_tags:
                 self.avaiable_mesh_tags.append(name)
@@ -3933,6 +4003,13 @@ class domain(MeshIOMixin):
 
         sample_tag = source_tag
 
+        # An INTERFACE tag (`A|B`) is the mesher's shared conforming facet between two regions. No
+        # amount of point sampling reconstructs it, so naming one on a deferred domain IS a request
+        # for the mesh -- served rather than refused, and only for a tag whose two halves are both
+        # known regions, so a typo still gets the "unknown tag" message instead of a surprise build.
+        if self.__dict__.get("_lazy_plan") is not None and _is_interface_tag(sample_tag, self._lazy_plan):
+            self._build_deferred_mesh()
+
         if self._is_geometry_tag(sample_tag) and isinstance(sample, tuple) and len(sample) > 0:
             if sample[0] is None:
                 # "No count" on a mesh-free domain could mean collocation points or the node set,
@@ -3943,7 +4020,7 @@ class domain(MeshIOMixin):
                 # is no declared resolution and nothing to hand back, so it refuses rather than
                 # inventing one -- guessing there would be silent, since finite differences over a
                 # single collocation point return a number, just not the one that was asked for.
-                if getattr(self.__dict__.get("_lazy_plan"), "_size", None) is None:
+                if _declared_size(self.__dict__.get("_lazy_plan")) is None:
                     raise ValueError(
                         f"domain.variable({tag!r}): this domain is mesh-free and no mesh size was "
                         f"declared, so the tag has no node set to hand back and no natural point "
