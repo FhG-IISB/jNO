@@ -116,15 +116,29 @@ class PEEC:
     def _discretise(self):
         regions = dict(getattr(self.domain, "_shape_regions", {}) or {})
         named = {t for s in self.sources for t in s[:2]} | {t for t, _ in self.currents} | {t for t, _ in self.grounds}
-        missing = sorted(named - set(regions))
-        if missing:
-            raise ValueError(f"jno.peec: constraints name {missing}, which are not regions of this domain.")
-        # A region named by a port is a TERMINAL; everything else is a conductor to discretise.
+        preds = dict(getattr(self.domain, "_tag_predicates", {}) or {})
+        # A terminal is a named SUBSET of a conductor, so `domain.tag` is its natural spelling: a tag
+        # carries no material semantics and no declaration-order priority, so a pad may sit wholly
+        # inside the conductor it marks. A region works too — the lookup reads its shape directly,
+        # deliberately bypassing the first-declared-wins rule that applies to MATERIALS — but then the
+        # pad must be declared before the conductor, or that rule subtracts it to nothing.
+        terms = {}
+        for t in sorted(named):
+            if t in regions:
+                terms[t] = regions[t]
+            elif t in preds:
+                terms[t] = _from_predicate(preds[t])
+            else:
+                raise ValueError(
+                    f"jno.peec: {t!r} is neither a region nor a tag of this domain. Mark the terminal "
+                    f"first — `d.tag({t!r}, <predicate>)` — then write the port on it. Known regions "
+                    f"{sorted(regions)}, known tags {sorted(preds)}."
+                )
         conductors = {n: sh for n, sh in regions.items() if n not in named}
         if not conductors:
             raise ValueError(
                 "jno.peec: every region is named by a port, so there is no conductor left to carry current. "
-                "A terminal is a pad ON a conductor, declared as its own region."
+                "A terminal marks part of a conductor; it is not a conductor of its own."
             )
         try:
             sig = self.domain.attached("sigma")
@@ -140,7 +154,7 @@ class PEEC:
             shapes.append(sh)
             sigmas.append(float(sig[n]))
         fil = line_filaments(shapes)
-        return fil, np.asarray(sigmas)[np.asarray(fil.part)], {n: regions[n] for n in named}
+        return fil, np.asarray(sigmas)[np.asarray(fil.part)], terms
 
     def solve(self):
         """Solve at every frequency and return a :class:`PEECSolution`."""
@@ -182,6 +196,17 @@ class PEEC:
         drive = jnp.stack([jnp.asarray(x) for x in drive])
         sol._port_current = drive[0] if self._scalar_freq else drive
         return sol
+
+
+class _from_predicate:
+    """A ``domain.tag`` predicate, wearing the ``.contains(points)`` face :func:`terminal_nodes` reads."""
+
+    def __init__(self, pred):
+        self._pred = pred
+
+    def contains(self, pts):
+        pts = np.asarray(pts)
+        return np.asarray(self._pred(*[pts[:, i] for i in range(pts.shape[1])])).reshape(-1)
 
 
 def _solid_msg(name):
