@@ -23,9 +23,17 @@ from typing import NamedTuple
 import jax.numpy as jnp
 import numpy as np
 
-from .kernel import wire_self
+from .kernel import bar_self, wire_self
 
-__all__ = ["Filaments", "line_filaments", "network_impedance", "port_spec", "terminal_nodes"]
+__all__ = [
+    "Filaments",
+    "line_filaments",
+    "bar_filaments",
+    "network_impedance",
+    "port_spec",
+    "terminal_nodes",
+    "solve_network",
+]
 
 
 class Filaments(NamedTuple):
@@ -42,9 +50,10 @@ class Filaments(NamedTuple):
     group: object  # (N*quad,) filament label for each sub-point
     incidence: object  # (n_node, N) +1 where a filament leaves a node, -1 where it enters
     length: object  # (N,)
-    radius: object  # (N,)    filament radius
+    area: object  # (N,)    conducting cross-section, which is all the solve needs of the shape
     nodes: object  # (n_node, 3) node positions, which is how a port is addressed
     part: object  # (N,)    index of the shape each filament came from, so per-conductor data can be spread
+    lattice: object = None  # grid description when the elements sit on one, which is what the FFT path needs
 
 
 def _leaf(shape, what):
@@ -125,6 +134,7 @@ def line_filaments(shape, size: float = None, quad: int = 3):
     mom = (tan[:, None, :] * (ln[:, None] * gw[None, :] * 0.5)[:, :, None]).reshape(-1, 3)
     group = np.repeat(np.arange(n), int(quad))
     self_g = np.asarray(wire_self(jnp.asarray(ln), jnp.asarray(rad)))
+    area = np.pi * rad**2
 
     # nodes = filament endpoints snapped to a grid far below the element size
     tol = 1e-9 * float(ln.min())
@@ -144,9 +154,10 @@ def line_filaments(shape, size: float = None, quad: int = 3):
         group,
         jnp.asarray(np.asarray(rows)),
         jnp.asarray(ln),
-        jnp.asarray(rad),
+        jnp.asarray(area),
         jnp.asarray(np.asarray(xyz)),
         np.asarray(part, dtype=int),
+        None,
     )
 
 
@@ -184,7 +195,7 @@ def network_impedance(fil: Filaments, sigma, port, omega: float = 0.0, mu0: floa
     A = jnp.asarray(fil.incidence)
     nn, ne = A.shape
     sig = jnp.broadcast_to(jnp.asarray(sigma, dtype=float), (ne,))
-    R = jnp.asarray(fil.length) / (sig * jnp.pi * jnp.asarray(fil.radius) ** 2)
+    R = jnp.asarray(fil.length) / (sig * jnp.asarray(fil.area))
     Lp = pair_matrix(fil.pos, fil.mom, lambda r: 1.0 / r, fil.self_g, group=fil.group) * (mu0 / (4.0 * jnp.pi))
     Z = jnp.diag(R.astype(complex)) + 1j * omega * Lp
 
@@ -346,7 +357,7 @@ def solve_network(fil: Filaments, sigma, terminals, sources, grounds=(), current
     A = jnp.asarray(fil.incidence)
     nn, ne = A.shape
     sig = jnp.broadcast_to(jnp.asarray(sigma, dtype=float), (ne,))
-    R = jnp.asarray(fil.length) / (sig * jnp.pi * jnp.asarray(fil.radius) ** 2)
+    R = jnp.asarray(fil.length) / (sig * jnp.asarray(fil.area))
     Lp = pair_matrix(fil.pos, fil.mom, lambda r: 1.0 / r, fil.self_g, group=fil.group) * (mu0 / (4.0 * jnp.pi))
     Z = jnp.diag(R.astype(complex)) + 1j * float(omega) * Lp
 
@@ -434,7 +445,162 @@ def solve_network(fil: Filaments, sigma, terminals, sources, grounds=(), current
     if M.shape[0] != M.shape[1]:
         raise ValueError(f"jno.peec: built a {M.shape[0]}x{M.shape[1]} system; this is a bug, please report it.")
 
+    _refuse_disconnected(np.asarray(A), idx, sources, grounds, currents)
     x = jnp.linalg.solve(M, b)
+    if not bool(jnp.all(jnp.isfinite(x))):
+        raise ValueError(
+            "jno.peec: the circuit equations are singular — the solve returned non-finite currents. "
+            "The usual cause is a part of the network that no port reaches, or a conductor with no "
+            "path back to the reference."
+        )
     cur, phi = x[:ne], x[ne:]
     inj = {t: A[idx[t]].sum(0) @ cur for t in names}
     return cur, phi, inj
+
+
+def _refuse_disconnected(A, idx, sources, grounds, currents):
+    """A port pair with no metal between them is a modelling error, not an infinite impedance.
+
+    ``jnp.linalg.solve`` on a singular system returns ``inf``/``nan`` without complaining, and an
+    infinite resistance reads like a physical answer. Two conductors that were meant to touch but do
+    not is the common way to get here, so the check names the terminals rather than the matrix.
+    """
+    nn, ne = A.shape
+    root = np.arange(nn)
+
+    def find(a):
+        while root[a] != a:
+            root[a] = root[root[a]]
+            a = root[a]
+        return a
+
+    for k in range(ne):  # a filament joins the nodes it touches
+        touch = np.flatnonzero(A[:, k] != 0.0)
+        for n in touch[1:]:
+            ra, rb = find(int(touch[0])), find(int(n))
+            if ra != rb:
+                root[ra] = rb
+    for ids in idx.values():  # a terminal is one electrical point
+        for n in ids[1:]:
+            ra, rb = find(int(ids[0])), find(int(n))
+            if ra != rb:
+                root[ra] = rb
+    for a, b, _g in sources:
+        if find(int(idx[a][0])) != find(int(idx[b][0])):
+            raise ValueError(
+                f"jno.peec: no conducting path between terminals {a!r} and {b!r}, so no current can "
+                "flow and the impedance is not finite. Conductors are joined where the geometry says "
+                "the metal touches — check that the parts meant to be in contact actually overlap."
+            )
+
+
+def bar_filaments(shape, size: float = None, quad: int = 3):
+    """Discretise a box conductor into a regular lattice of rectangular bars.
+
+    A solid does not have a centreline, so a line's discretisation does not apply. The volume is cut
+    into a regular grid of cells; the NODES are cell centres and the ELEMENTS are the bars joining
+    adjacent centres, one family per axis. That is the standard volume partial-element mesh (Ruehli,
+    IBM J. Res. Dev. 16(5), 1972, sec. IV), and each bar takes its self term from
+    :func:`~jno.utils.solver.kernel.bar_self`.
+
+    Two properties of this lattice matter beyond expressing the solid:
+
+    * a bar's current runs along ONE axis, and ``mom_i . mom_j`` vanishes between perpendicular
+      bars, so the partial-inductance operator is block diagonal by direction;
+    * within a direction the bars sit on a regular grid and the kernel depends only on separation,
+      so each block is block-Toeplitz -- which is what
+      :func:`~jno.utils.solver.kernel.lattice_operator` applies by FFT.
+
+    Args:
+        shape: a ``Shape`` whose plan is a single ``Box`` leaf.
+        size: target cell pitch. Defaults to the shape's own ``size=``.
+        quad: Gauss points along each bar.
+
+    Returns:
+        :class:`Filaments`, with ``lattice`` describing the grid the FFT path needs.
+
+    The cell count per axis is ``max(1, round(extent / size))``, so the pitch is the extent divided
+    by a whole number rather than ``size`` exactly -- a lattice has to close on the box.
+    """
+    prim = _leaf(shape, "Box")
+    h = float(size if size is not None else (shape._size if shape._size is not None else 0.0))
+    if h <= 0:
+        raise ValueError(
+            "peec.bar_filaments: no cell pitch. Pass size=, or give the Shape a size= when you build "
+            "it — a lattice count cannot be guessed from the geometry alone."
+        )
+    lo = np.array([prim.x0, prim.y0, prim.z0], dtype=float)
+    hi = np.array([prim.x1, prim.y1, prim.z1], dtype=float)
+    ext = hi - lo
+    n = np.maximum(1, np.round(ext / h).astype(int))
+    d = ext / n  # cell pitch per axis, closing exactly on the box
+    if not np.all(np.isfinite(d)) or np.any(d <= 0):
+        raise ValueError(f"peec.bar_filaments: the box has a zero or non-finite extent {tuple(ext)}.")
+    if int(n.max()) < 2:
+        raise ValueError(
+            f"peec.bar_filaments: a pitch of {h} puts one cell across every axis of this box, so no bar "
+            "joins two cells and no current can flow. Use a smaller size=."
+        )
+
+    # nodes at cell centres, indexed (i, j, k) -> i*ny*nz + j*nz + k
+    ijk = np.stack(np.meshgrid(*[np.arange(v) for v in n], indexing="ij"), axis=-1).reshape(-1, 3)
+    nodes = lo + (ijk + 0.5) * d
+    nid = np.arange(len(nodes)).reshape(tuple(n))
+
+    cen, tan, ln, area, ends, axis = [], [], [], [], [], []
+    for ax in range(3):
+        if n[ax] < 2:
+            continue
+        a = tuple(slice(0, v - 1) if i == ax else slice(None) for i, v in enumerate(n))
+        b = tuple(slice(1, v) if i == ax else slice(None) for i, v in enumerate(n))
+        na, nb = nid[a].reshape(-1), nid[b].reshape(-1)
+        pa, pb = nodes[na], nodes[nb]
+        k = len(na)
+        u = np.zeros((k, 3))
+        u[:, ax] = 1.0
+        w, t = [d[i] for i in range(3) if i != ax]
+        cen.append(0.5 * (pa + pb))
+        tan.append(u)
+        ln.append(np.full(k, d[ax]))
+        area.append(np.full(k, w * t))
+        ends.append((pa, pb))
+        axis.append(np.full(k, ax))
+    if not cen:
+        raise ValueError("peec.bar_filaments: the lattice has no bar in any direction.")
+
+    cen = np.concatenate(cen)
+    tan = np.concatenate(tan)
+    ln = np.concatenate(ln)
+    area = np.concatenate(area)
+    axis = np.concatenate(axis)
+    nb = len(ln)
+
+    gx, gw = np.polynomial.legendre.leggauss(int(quad))
+    pos = (cen[:, None, :] + 0.5 * ln[:, None, None] * gx[None, :, None] * tan[:, None, :]).reshape(-1, 3)
+    mom = (tan[:, None, :] * (ln[:, None] * gw[None, :] * 0.5)[:, :, None]).reshape(-1, 3)
+    group = np.repeat(np.arange(nb), int(quad))
+    wt = np.stack([np.array([d[i] for i in range(3) if i != ax]) for ax in axis])
+    self_g = np.asarray(bar_self(jnp.asarray(ln), jnp.asarray(wt[:, 0]), jnp.asarray(wt[:, 1])))
+
+    inc = np.zeros((len(nodes), nb))
+    off = 0
+    for (pa, pb), ax in zip(ends, sorted(set(axis.tolist()))):
+        k = len(pa)
+        a = tuple(slice(0, v - 1) if i == ax else slice(None) for i, v in enumerate(n))
+        b = tuple(slice(1, v) if i == ax else slice(None) for i, v in enumerate(n))
+        inc[nid[a].reshape(-1), np.arange(off, off + k)] = 1.0
+        inc[nid[b].reshape(-1), np.arange(off, off + k)] = -1.0
+        off += k
+
+    return Filaments(
+        jnp.asarray(pos),
+        jnp.asarray(mom),
+        jnp.asarray(self_g),
+        group,
+        jnp.asarray(inc),
+        jnp.asarray(ln),
+        jnp.asarray(area),
+        jnp.asarray(nodes),
+        np.zeros(nb, dtype=int),
+        {"n": tuple(int(v) for v in n), "d": tuple(float(v) for v in d), "axis": axis},
+    )
