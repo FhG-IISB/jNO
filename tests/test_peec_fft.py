@@ -169,7 +169,7 @@ def test_a_welded_network_keeps_each_block_structure():
     _i, v = d.peec_symbols()
     at = lambda t: d.variable(t, split=True, sample=(4, None))[:3]
     pe = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e6)
-    fil, _sigma, _terms = pe._discretise()
+    fil, _sigma, _terms, _names = pe._discretise()
     kinds = [lat is not None for _lo, _hi, lat in fil.lattice["welded"]]
     assert kinds == [False, True]  # the wire's filaments dense, the trace's bars a lattice
 
@@ -179,7 +179,7 @@ def test_the_stitched_apply_is_the_dense_operator():
     d = _trace_and_wire()
     _i, v = d.peec_symbols()
     at = lambda t: d.variable(t, split=True, sample=(4, None))[:3]
-    fil, _s, _t = jno.peec([v(*at("A")) - v(*at("B")) - 1.0])._discretise()
+    fil, _s, _t, _n = jno.peec([v(*at("A")) - v(*at("B")) - 1.0])._discretise()
     k = np.asarray(pair_matrix(fil.pos, fil.mom, INV_R, fil.self_g, group=fil.group))
     x = np.random.default_rng(2).normal(size=k.shape[0])
     got = np.asarray(welded_apply(fil, INV_R)(x))
@@ -191,7 +191,7 @@ def test_the_stitched_solve_agrees_with_the_dense_one():
     _i, v = d.peec_symbols()
     at = lambda t: d.variable(t, split=True, sample=(4, None))[:3]
     pe = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e6)
-    fil, sigma, terms = pe._discretise()
+    fil, sigma, terms, _names = pe._discretise()
     nodes = {t: terminal_nodes(fil, sh) for t, sh in terms.items()}
     got = {}
     for mf in (False, True):
