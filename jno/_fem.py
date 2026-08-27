@@ -586,6 +586,28 @@ def _region_and_support(constraint: Any, domain: Any) -> Tuple[str, str]:
     tag_preds = getattr(domain, "_tag_predicates", {}) or {}
     shape_regions = getattr(domain, "_shape_regions", {}) or {}
 
+    _VOL_CELLS = {"tetra", "tetra10", "hexahedron", "wedge", "pyramid", "triangle", "triangle6", "quad"}
+
+    def _volume_cell_regions():
+        """Names in the mesh's ``cell_sets`` that select TOP-DIMENSIONAL cells (a gmsh physical
+        volume in 3-D / surface in 2-D), i.e. the ones a *volume* term could plausibly mean."""
+        _m = getattr(domain, "mesh", None)
+        _cs = getattr(_m, "cell_sets", None) or {}
+        if not _cs:
+            return set()
+        _dim = int(getattr(domain, "dimension", 3))
+        _want = {"tetra", "tetra10", "hexahedron", "wedge", "pyramid"} if _dim == 3 else {"triangle", "triangle6", "quad"}
+        _blocks = list(getattr(_m, "cells", None) or [])
+        _out = set()
+        for _nm, _entries in _cs.items():
+            for _bi, _arr in enumerate(_entries or []):
+                if _arr is None or len(_arr) == 0 or _bi >= len(_blocks):
+                    continue
+                if _blocks[_bi].type in _want:
+                    _out.add(_nm)
+                    break
+        return _out
+
     def _subregion_id(t: str):
         # `from_regions` registers a geometry part's interior under the tag ``interior_<name>`` (see
         # PolygonDomain._register_interior_tag) while the part itself is keyed *bare* in
@@ -628,6 +650,16 @@ def _region_and_support(constraint: Any, domain: Any) -> Tuple[str, str]:
             f"jno.fem: a residual spans multiple regions {sorted(tags)}; each residual must live on a single region."
         )
     if boundary_tags:
+        # A gmsh physical VOLUME also registers a node set, so it can land in `_boundary_regions` and
+        # be read as a (face-less) surface term -- which assembles to exactly nothing. Measured: a
+        # term on `core` produced b = 0 with no warning. Catch it here as well as in the volume
+        # branch below; the two misreadings differ but both are silent.
+        _volnames = _volume_cell_regions()
+        _bad = sorted(t for t in boundary_tags if t in _volnames and t != "boundary")
+        if _bad:
+            raise ValueError(
+                _REGION_VOLUME_MSG.format(names=_bad, how="read as a surface term, assembling to exactly zero")
+            )
         return "boundary", next(iter(boundary_tags))
 
     subregions = {r for r in (_subregion_id(t) for t in interiorish) if r is not None}
@@ -638,7 +670,29 @@ def _region_and_support(constraint: Any, domain: Any) -> Tuple[str, str]:
         )
     if subregions:
         return "volume", next(iter(subregions))
+
+    # A named cell region read from a mesh file (a gmsh physical VOLUME) resolves as a coordinate
+    # view -- `d.variable("core")` returns exactly that region's points -- but it has no
+    # `_subregion_id`, because that only knows shapely parts and tag predicates. It would therefore
+    # fall through to whole-domain "volume" below and integrate over the ENTIRE mesh: silently, and
+    # wrong by whatever fraction of the mesh the region is not (measured on a 4-material mesh:
+    # a term on `air` integrated to the full 69,694 mm^3 instead of the air's 66,445, and one on
+    # `core` produced 0). Refuse rather than return a plausible wrong number.
+    _named = sorted(t for t in interiorish if t != "interior" and t in _volume_cell_regions())
+    if _named:
+        raise ValueError(_REGION_VOLUME_MSG.format(names=_named, how="integrated over the WHOLE mesh"))
     return "volume", "volume"
+
+
+_REGION_VOLUME_MSG = (
+    "jno.fem: volume term on mesh cell region(s) {names}. Restricting a VOLUME term to a named cell "
+    "region is not implemented -- the term is instead {how}, with no warning.\n"
+    "  Put the per-region material or source in the COEFFICIENT rather than the quadrature domain:\n"
+    '      p0, _ = d.fem_symbols(names=("m", "mt"), space="P0")   # one value per cell\n'
+    '      k = jno.np.parameter(p0, name="k")                       # supply per-cell values\n'
+    "  A shapely sub-region or a d.tag(...) predicate also restricts correctly.\n"
+    "  (d.variable(<region>) DOES restrict a SURFACE term; only the volume path is missing.)"
+)
 
 
 def _retag_coords_for_quadrature(constraint: Any, support: str, region_id: str) -> None:
