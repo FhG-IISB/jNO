@@ -200,3 +200,50 @@ def test_the_stitched_solve_agrees_with_the_dense_one():
         got[mf] = (complex(1.0 / inj["A"]), np.asarray(cur))
     assert abs(got[True][0] - got[False][0]) / abs(got[False][0]) < 1e-12
     assert np.linalg.norm(got[True][1] - got[False][1]) / np.linalg.norm(got[False][1]) < 1e-9
+
+
+def test_one_compiled_solve_is_reused_without_leaking_between_networks():
+    """The Krylov solve is compiled once per network and reused across frequencies.
+
+    That reuse is keyed on the network's identity, and an id alone is recyclable after a garbage
+    collection — a stale hit would silently run the previous geometry's closures, giving a plausible
+    impedance for the wrong conductor. So the entry holds the network and is checked against it.
+    """
+
+    def run(box):
+        f = bar_filaments(box, size=(0.002, 0.002, 0.001))
+        p = np.asarray(f.nodes)
+        a = terminal_nodes(f, lambda q: q[:, 0] < p[:, 0].min() + 1e-9)
+        b = terminal_nodes(f, lambda q: q[:, 0] > p[:, 0].max() - 1e-9)
+        _c, _phi, inj = solve_network(
+            f, SIGCU, {"A": a, "B": b}, [("A", "B", 1.0 + 0j)], omega=2 * np.pi * 1e6, matrix_free=True
+        )
+        return complex(1.0 / inj["A"])
+
+    small = jno.Shape.box(0, 0, 0, 0.040, 0.004, 0.002)
+    large = jno.Shape.box(0, 0, 0, 0.060, 0.006, 0.002)
+    first = run(small)
+    other = run(large)
+    again = run(small)
+    assert abs(again - first) / abs(first) < 1e-12  # the same network gives the same answer...
+    assert abs(other - first) / abs(first) > 1e-3  # ...and a different one does not borrow it
+
+
+def test_a_frequency_sweep_reuses_the_compilation():
+    """Reuse is the point: without it every frequency recompiles, and at these sizes the compilation
+    costs about what the fusion saves."""
+    from jno.utils.solver.peec import _KRYLOV_CACHE
+
+    f = bar_filaments(jno.Shape.box(0, 0, 0, 0.040, 0.004, 0.002), size=(0.002, 0.002, 0.001))
+    p = np.asarray(f.nodes)
+    a = terminal_nodes(f, lambda q: q[:, 0] < p[:, 0].min() + 1e-9)
+    b = terminal_nodes(f, lambda q: q[:, 0] > p[:, 0].max() - 1e-9)
+    before = len(_KRYLOV_CACHE)
+    zs = []
+    for hz in (1e5, 1e6, 1e7):
+        _c, _phi, inj = solve_network(
+            f, SIGCU, {"A": a, "B": b}, [("A", "B", 1.0 + 0j)], omega=2 * np.pi * hz, matrix_free=True
+        )
+        zs.append(complex(1.0 / inj["A"]))
+    assert len(_KRYLOV_CACHE) - before == 1  # three frequencies, one compilation
+    assert abs(zs[2].imag) > abs(zs[0].imag)  # and they are genuinely different frequencies
