@@ -59,7 +59,11 @@ def test_pair_diagonal_survives_far_from_origin(shift):
     self_g = sphere_self(jnp.full((60,), 1e-3))
     got = float(pair_quadratic(pos, mom, INV_R, self_g, chunk=16))
     ref = _dense_quadratic(pos, mom, self_g)
-    assert abs(got / ref - 1) < 1e-12, f"shift={shift}: {got:.12e} vs {ref:.12e}"
+    # 1e-10, not 1e-12: the reference sums in numpy and the operator sums on the accelerator, and a
+    # GPU reassociates a 3600-term reduction differently (~4e-12 relative here). The defect this
+    # guards is nothing like that size — a surviving 3e-6 diagonal puts a 1/r term of ~3e5 into a
+    # total of ~4e3, i.e. off by a factor of 70 — so the bound is still twelve orders inside it.
+    assert abs(got / ref - 1) < 1e-10, f"shift={shift}: {got:.12e} vs {ref:.12e}"
 
 
 def test_pair_scalar_density_and_chunking_are_invariant():
