@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from jno.utils.solver.kernel import lattice_operator, pair_quadratic, sphere_self
+from jno.utils.solver.kernel import lattice_operator, pair_matrix, pair_quadratic, sphere_self
 
 INV_R = lambda r: 1.0 / r  # noqa: E731
 
@@ -236,3 +236,34 @@ def test_single_element_reproduces_its_own_self_term():
     got = float(pair_quadratic(pos, mom, INV_R, jnp.asarray([bar_self(L, w, t)]))) * mu0 / (4 * np.pi)
     ref = (mu0 * L / (2 * np.pi)) * (np.log(2 * L / (w + t)) + 0.5 + 0.2235 * (w + t) / L)
     assert abs(got / ref - 1) < 1e-12
+
+
+def test_pair_matrix_contracts_to_the_quadratic_form_under_any_current():
+    """The matrix and the scalar path are separate implementations; x'Kx must reconcile them."""
+    rng = np.random.default_rng(11)
+    pos = jnp.asarray(rng.normal(size=(24, 3)))
+    mom = jnp.asarray(rng.normal(size=(24, 3)))
+    grp = jnp.asarray(np.repeat(np.arange(6), 4))
+    sg = jnp.asarray(rng.uniform(0.5, 2.0, size=6))
+    k = pair_matrix(pos, mom, INV_R, sg, group=grp)
+
+    x = rng.normal(size=6)
+    scaled = mom * jnp.asarray(x)[grp][:, None]
+    # the self term is quadratic in the element moment, so it scales with x too
+    q = float(pair_quadratic(pos, scaled, INV_R, sg, group=grp, chunk=5))
+    assert abs(float(x @ np.asarray(k) @ x) / q - 1) < 1e-12
+    assert np.allclose(np.asarray(k), np.asarray(k).T)
+
+
+def test_pair_matrix_puts_the_self_term_on_the_diagonal():
+    pos = jnp.asarray([[0.0, 0.0, 0.0], [5.0, 0.0, 0.0]])
+    mom = jnp.asarray([[2.0, 0.0, 0.0], [3.0, 0.0, 0.0]])
+    sg = jnp.asarray([0.7, 0.25])
+    k = np.asarray(pair_matrix(pos, mom, INV_R, sg))
+    assert np.allclose(np.diag(k), [0.7 * 4.0, 0.25 * 9.0])
+    assert abs(k[0, 1] - 6.0 / 5.0) < 1e-13  # (m0 . m1) / r
+
+
+def test_pair_matrix_requires_a_self_term():
+    with pytest.raises(ValueError, match="self_g is required"):
+        pair_matrix(jnp.zeros((3, 3)), jnp.ones((3, 3)), INV_R, None)
