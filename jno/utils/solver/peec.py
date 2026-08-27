@@ -532,10 +532,13 @@ def solve_network(
         Dinv = sp.diags(1.0 / np.asarray(zdiag))
         S = (CI @ Dinv @ Asp.T.tocsr() + Cp).tocsc()
         lu = spla.splu(S)
-        shape_out = jax.ShapeDtypeStruct((nn,), jnp.complex128)
+        # The dtype follows jax_enable_x64 rather than being pinned: hardcoding complex128 here made
+        # the callback disagree with everything around it the moment x64 was off.
+        cdtype = jnp.result_type(jnp.complex64) if not jax.config.jax_enable_x64 else jnp.complex128
+        shape_out = jax.ShapeDtypeStruct((nn,), cdtype)
 
         def _host_solve(r):
-            return lu.solve(np.asarray(r)).astype(np.complex128)
+            return lu.solve(np.asarray(r)).astype(cdtype)
 
         def M_apply(x):
             cur, phi = x[:ne], x[ne:]
