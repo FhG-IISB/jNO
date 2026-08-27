@@ -20,6 +20,7 @@ from .geometry import Path, Shape, shape
 from .info import info
 from .integration_operators import IntegrationOperators
 from .noise import noise
+from .peec import peec
 from .rcwa import Rcwa, RcwaError, rcwa
 from .stencils import fd
 from .trace import (
@@ -155,6 +156,7 @@ __all__ = [
     "info",
     "shape",
     "Shape",  # deprecated alias of `shape`
+    "peec",
     "Path",
     "do",
     "fem",
