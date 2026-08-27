@@ -40,7 +40,15 @@ from typing import Callable, Sequence
 import jax
 import jax.numpy as jnp
 
-__all__ = ["pair_quadratic", "lattice_kernel", "lattice_operator", "sphere_self", "bar_self", "wire_self"]
+__all__ = [
+    "pair_quadratic",
+    "pair_matrix",
+    "lattice_kernel",
+    "lattice_operator",
+    "sphere_self",
+    "bar_self",
+    "wire_self",
+]
 
 
 def sphere_self(volume):
@@ -197,3 +205,38 @@ def lattice_operator(n: Sequence[int], h: Sequence[float], g: Callable, self_g):
         return y[tuple(slice(0, v) for v in n)]
 
     return apply
+
+
+def pair_matrix(pos, mom, g: Callable, self_g, group=None):
+    """The element-by-element operator itself, ``K_ab``, rather than the scalar ``x'Kx``.
+
+    :func:`pair_quadratic` contracts the whole double sum; a circuit solve needs the matrix, and so
+    does any per-element readout -- which segment to widen is PEEC's one genuine advantage over a
+    field method, and it lives in the off-diagonal.
+
+    Dense and O(N_element^2) in memory, deliberately: this is the small-network path. Beyond a few
+    thousand elements use :func:`pair_quadratic` for energies and :func:`lattice_operator` for
+    applies, neither of which forms the matrix.
+    """
+    if self_g is None:
+        raise ValueError("pair_matrix: self_g is required, for the same reason pair_quadratic requires it.")
+    pos = jnp.asarray(pos)
+    mom = jnp.asarray(mom)
+    if mom.ndim == 1:
+        mom = mom[:, None]
+    n = pos.shape[0]
+    grp = jnp.arange(n) if group is None else jnp.asarray(group)
+    ne = int(jnp.max(grp)) + 1
+
+    d = pos[:, None, :] - pos[None, :, :]
+    r = jnp.sqrt(jnp.clip((d * d).sum(-1), 0.0))
+    same = grp[:, None] == grp[None, :]
+    # substitute before the kernel, then zero the contribution: g may be singular at 0, and masking
+    # afterwards would still differentiate the dead branch (0 * inf = NaN in reverse mode).
+    kk = jnp.where(same, 0.0, g(jnp.where(same, 1.0, r)))
+    sub = (mom @ mom.T) * kk
+    # contract sub-points into their elements
+    blk = jax.ops.segment_sum(sub, grp, num_segments=ne)
+    blk = jax.ops.segment_sum(blk.T, grp, num_segments=ne).T
+    Me = jax.ops.segment_sum(mom, grp, num_segments=ne)
+    return blk + jnp.diag((Me * Me).sum(1) * jnp.asarray(self_g))
