@@ -263,22 +263,20 @@ def test_a_time_dependent_shape_domain_carries_the_time_axis():
     "make, why",
     [
         (
-            lambda: jno.Shape.rect(0, 0, 1, 1, size=0.3).name("core").domain(),
-            "a named region's tags are the mesher's conforming sub-bodies",
-        ),
-        (
             lambda: jno.Shape.rect(0, 0, 1, 1, size=0.3).structured().domain(),
             "a structured plan is a lattice, not a Shape, by the time it is built",
         ),
     ],
-    ids=["named-region", "structured"],
+    ids=["structured"],
 )
 def test_a_plan_that_cannot_be_served_still_meshes(make, why):
     """Each of these keeps the eager path *by name*, rather than being half-served mesh-free.
 
     A plan with no closed form is no longer on this list: ``sweep``/``fillet`` are served by a
-    boundary tessellation instead (see ``test_shape_tessellation.py``). What remains is the work no
-    amount of point sampling reconstructs -- conforming sub-bodies, and lattice structure."""
+    boundary tessellation instead (see ``test_shape_tessellation.py``). Nor is a NAMED plan -- one
+    name is one sub-body, with no interface for the mesher to resolve, so it defers like any other
+    analytic shape (see ``test_domain_regions_meshfree.py``). What remains is lattice structure,
+    which is not a Shape by the time the domain sees it."""
     assert not _meshless(make()), why
 
 

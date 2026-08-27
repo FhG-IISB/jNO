@@ -724,7 +724,7 @@ class domain(MeshIOMixin):
             # the mesh is built only if something later actually reads `.mesh` (see that property).
             # A structured plan is excluded: it has already been swapped for its lattice closure,
             # which is not a Shape and carries no analytic membership.
-            # A NAMED plan stays eager. A MULTI-REGION plan defers when every region is analytic:
+            # A MULTI-REGION plan defers when every region is analytic:
             # each region tag is then a closed-form membership test (`A` = points inside A's shape),
             # which is exactly the predicate machinery `tag(name, where)` already uses. Its INTERFACE
             # tags (`A|B`) are a different matter -- a shared conforming facet is the mesher's, and no
@@ -733,10 +733,12 @@ class domain(MeshIOMixin):
             # served halfway.
             from ..geometry.shape import _can_sample_meshfree
 
+            # A SINGLY named plan defers too: one name is one sub-body, there is no interface for the
+            # mesher to resolve, and its `_shape_regions` entry is recorded either way — so meshing at
+            # construction bought nothing. Its tag vocabulary is unchanged, deferred or not.
             _defer = (
                 _plan is not None
                 and _plan._structured is None
-                and getattr(_plan, "_region_name", None) is None
                 and (
                     _plan._node[0] != "regions"
                     or all(getattr(sh, "is_analytic", lambda: False)() for _n, sh in _plan._node[1])
