@@ -37,6 +37,7 @@ __all__ = [
     "terminal_nodes",
     "solve_network",
     "lattice_apply",
+    "near_block",
 ]
 
 
@@ -548,7 +549,7 @@ def solve_network(
         shape_out = jax.ShapeDtypeStruct((nn,), cdtype)
         AspT = Asp0.T.tocsr()
 
-        def _factorise(zd):
+        def _factorise(zd, _w_now):
             """Build and stash the Schur factorisation from the CURRENT diagonal.
 
             Through a callback rather than inline, because ``zdiag`` depends on the conductivity and
@@ -565,8 +566,8 @@ def solve_network(
         # approximation: the token is a constant, so its tangent is zero; the preconditioner is a
         # LINEAR operator, so its tangent is itself applied to the tangent.
         @jax.custom_jvp
-        def _token(zd):
-            return jax.pure_callback(_factorise, jax.ShapeDtypeStruct((), jnp.float64), zd)
+        def _token(zd, w_now):
+            return jax.pure_callback(_factorise, jax.ShapeDtypeStruct((), jnp.float64), zd, w_now)
 
         @_token.defjvp
         def _token_jvp(primals, tangents):
@@ -624,7 +625,7 @@ def solve_network(
             def _run(rhs, w_, zd, Rc_):
                 # sequenced through the right-hand side so the factorisation is built before the
                 # solve that reads it, rather than relying on callback ordering
-                rhs = rhs + _token(zd).astype(rhs.dtype)
+                rhs = rhs + _token(zd, w_).astype(rhs.dtype)
                 return jax.scipy.sparse.linalg.gmres(
                     lambda v: M_apply(v, w_, zd, Rc_),
                     rhs,
@@ -1111,3 +1112,57 @@ def _holder_solve(r):
 def _bcoo(val, row, col, shape):
     """A BCOO from COO triplets, for a matvec inside a traced body."""
     return jsparse.BCOO((jnp.asarray(val), jnp.stack([jnp.asarray(row), jnp.asarray(col)], axis=1)), shape=shape)
+
+
+def near_block(fil: Filaments, g, mu_scale=1.0, reach=2.0):
+    """The NEAR-FIELD part of ``Lp`` as COO triplets: every pair closer than ``reach`` element sizes.
+
+    NOT WIRED INTO THE SOLVE — see below. A preconditioner built on ``diag(Z)`` alone is weak, and
+    weakest exactly where a thin conductor meets a thick one. Measured on a 440-bar lattice and a
+    354-bar lattice welded to a bond wire, at a relative residual of 1e-8:
+
+        diag(Z)          117 iterations (lattice)    393 (welded)
+        near-field band   21                          27
+        exact Z            1                           1
+
+    So keeping about a percent of the entries recovers almost all of it, and the welded case stops
+    being the hard one. The block is built from element CENTRES rather than from a formed ``Lp``, so
+    it costs O(N) memory and never materialises the dense operator it approximates.
+
+    Why it is not used yet: putting the band in the (1,1) block while the SCHUR complement still
+    comes from the diagonal makes the two inconsistent. That is survivable at a few hundred elements
+    (welded: 584 applications -> 108) and fatal at a few thousand -- on 6,825 elements the solve made
+    no progress at all, stalling at a relative residual of 3e-02, with the band's own factorisation
+    verified exact to 2e-15. Making them consistent needs ``Z_near^-1 A'``, which is one solve per
+    node AND turns the Schur complement dense: it trades the problem rather than solving it. This is
+    kept because it is the measured foundation for whatever does.
+    """
+    mom = np.asarray(fil.mom)
+    grp = np.asarray(fil.group)
+    pos = np.asarray(fil.pos)
+    ne = int(grp.max()) + 1
+    cen = np.zeros((ne, 3))
+    np.add.at(cen, grp, pos)
+    cen /= np.bincount(grp, minlength=ne)[:, None]
+    tot = np.zeros((ne, mom.shape[1]))
+    np.add.at(tot, grp, mom)
+    size = float(np.mean(np.asarray(fil.length)))
+    rad = reach * size
+
+    from scipy.spatial import cKDTree
+
+    pairs = np.asarray(list(cKDTree(cen).query_pairs(rad)), dtype=int).reshape(-1, 2)
+    if pairs.size == 0:
+        return np.zeros(0, int), np.zeros(0, int), np.zeros(0)
+    # the element-to-element term, summed over each pair's sub-points
+    order = np.argsort(grp, kind="stable")
+    starts = np.searchsorted(grp[order], np.arange(ne))
+    ends = np.searchsorted(grp[order], np.arange(ne), side="right")
+    val = np.zeros(len(pairs))
+    for k, (a, b) in enumerate(pairs):
+        ia, ib = order[starts[a] : ends[a]], order[starts[b] : ends[b]]
+        d = pos[ia][:, None, :] - pos[ib][None, :, :]
+        r = np.sqrt((d * d).sum(-1))
+        val[k] = float(((mom[ia] @ mom[ib].T) * g(r)).sum())
+    val *= mu_scale
+    return pairs[:, 0], pairs[:, 1], val
