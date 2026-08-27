@@ -305,6 +305,154 @@ class Polygon:
 
 
 @dataclass(frozen=True)
+class Line:
+    """Tube of radius ``r`` swept along a polyline — a 1-D conductor that is also a solid.
+
+    Written for integral-equation methods, where a bond wire, a filament or a vortex line is the
+    natural element and meshing it is beside the point. But it is a genuine solid, so a mesher can
+    consume it too: one primitive, two consumers.
+
+    The reason it is a primitive rather than ``disk.sweep(path)`` is :meth:`contains`. A swept solid
+    has no closed-form membership (``_NO_ANALYTIC_MEMBERSHIP``), so it cannot be a named region
+    carrying its own ``size=`` — per-region mesh sizing needs a containment test and dies without
+    one. A tube's membership is exactly "distance to the polyline <= r", which is closed form.
+
+    Built as overlapping capsules — a cylinder per segment plus a sphere at each interior joint — so
+    the union is smooth at the corners rather than leaving a wedge notch on the outside of a bend.
+
+    Faces: lateral ``side``, and the two end caps ``start`` / ``end``.
+    """
+
+    points: Tuple[Tuple[float, float, float], ...]
+    r: float
+    dim: ClassVar[int] = 3
+
+    def _pts(self):
+        return np.asarray(self.points, dtype=float).reshape(-1, 3)
+
+    def _simplified(self):
+        """Drop points that lie on the straight line through their neighbours.
+
+        Two collinear cylinders overlap with COINCIDENT lateral surfaces, which is the one case a
+        boolean kernel handles worst. Merging the run first means every joint has a real angle and
+        the pieces always cross transversally.
+        """
+        P = self._pts()
+        keep = [P[0]]
+        for q, nxt in zip(P[1:-1], P[2:]):
+            u = q - keep[-1]
+            v = nxt - q
+            nu, nv = np.linalg.norm(u), np.linalg.norm(v)
+            if nu <= TOL or nv <= TOL:
+                continue
+            if float(np.dot(u / nu, v / nv)) < 1.0 - 1e-9:  # a genuine bend
+                keep.append(q)
+        keep.append(P[-1])
+        return np.asarray(keep)
+
+    def build(self, occ):
+        """A cylinder per segment, MITRED at each joint rather than capped with a sphere.
+
+        Extending each cylinder past the joint by ``r tan(theta/2)`` fills the outer notch of the
+        bend exactly, and the pieces then cross at a real angle. A joint sphere of radius ``r`` would
+        instead sit TANGENT to a tube of radius ``r`` -- touching along a circle rather than crossing
+        -- which is the contact a boolean kernel handles worst. Collinear runs are merged first
+        (:meth:`_simplified`) because two collinear cylinders overlap with coincident lateral
+        surfaces, which is worse still.
+
+        Both are hygiene rather than a fix for any observed failure: a thin curved solid embedded in
+        a COARSE host is what actually fails to mesh, and that is a property of the host's size, not
+        of this construction -- a plain ``Shape.cylinder`` fails identically. See
+        ``tests/test_shape_line.py::test_a_coarse_host_cannot_mesh_around_a_thin_inclusion``.
+        """
+        P = self._simplified()
+        seg = P[1:] - P[:-1]
+        L = np.linalg.norm(seg, axis=1)
+        if not np.any(L > TOL):
+            raise ValueError("Shape.line: every segment is shorter than the tolerance; nothing to build.")
+        u = seg / np.maximum(L, 1e-300)[:, None]
+        # miter at each interior joint; clamped so a hairpin cannot produce a runaway stub
+        ext = np.zeros((len(seg), 2))
+        for j in range(1, len(P) - 1):
+            c = float(np.clip(np.dot(u[j - 1], u[j]), -1.0, 1.0))
+            m = min(self.r * math.tan(0.5 * math.acos(c)), 2.0 * self.r)
+            ext[j - 1, 1] = ext[j, 0] = m
+        parts = []
+        for k in range(len(seg)):
+            a = P[k] - u[k] * ext[k, 0]
+            length = L[k] + ext[k, 0] + ext[k, 1]
+            parts.append((3, occ.addCylinder(*a, *(u[k] * length), self.r)))
+        if len(parts) == 1:
+            return parts[0]
+        # One fuse of everything, not a pairwise chain: chaining leaves an internal seam face per
+        # step for a later `fragment` to trip over.
+        out = occ.fuse([parts[0]], parts[1:])[0]
+        return out[0] if isinstance(out, list) else out
+
+    def _distance(self, pts):
+        """Distance from each point to the polyline (segment-wise, exact)."""
+        P = self._pts()
+        x = np.asarray(pts)[:, :3]
+        a, b = P[:-1], P[1:]
+        d = b - a
+        L2 = np.maximum((d * d).sum(1), 1e-300)
+        w = x[:, None, :] - a[None, :, :]
+        t = np.clip((w * d[None, :, :]).sum(2) / L2[None, :], 0.0, 1.0)
+        proj = a[None, :, :] + t[:, :, None] * d[None, :, :]
+        return np.linalg.norm(x[:, None, :] - proj, axis=2).min(1)
+
+    def classify(self, x: float, y: float, z: float, tol: float = TOL) -> Optional[str]:
+        P = self._pts()
+        q = np.array([x, y, z], dtype=float)
+        for name, end, nxt in (("start", P[0], P[1]), ("end", P[-1], P[-2])):
+            u = end - nxt
+            u = u / max(float(np.linalg.norm(u)), 1e-300)
+            t = float((q - end) @ u)
+            if abs(t) < tol and float(np.linalg.norm((q - end) - t * u)) < self.r + tol:
+                return name
+        if abs(float(self._distance(q[None, :])[0]) - self.r) < tol:
+            return "side"
+        return None
+
+    def contains(self, pts, tol: float = TOL):
+        """Boolean mask ``(N,)`` — within ``r`` of the polyline. Closed form, which is the point."""
+        return self._distance(pts) <= self.r + tol
+
+    def bounds(self):
+        P = self._pts()
+        return tuple(P.min(0) - self.r), tuple(P.max(0) + self.r)
+
+    def boundary_measure(self) -> float:
+        """Lateral area plus the two caps. The capsule joints overlap, so this is an upper bound and
+        is used only to weight boundary sampling."""
+        P = self._pts()
+        L = float(np.linalg.norm(P[1:] - P[:-1], axis=1).sum())
+        return 2.0 * math.pi * self.r * L + 2.0 * math.pi * self.r**2
+
+    def sample_boundary(self, n: int, rng):
+        """``(points, normals)`` on the lateral surface, weighted by segment length.
+
+        The caps are omitted: for a tube long against its radius they are a vanishing share of the
+        area, and the joints already overlap, so a uniform lateral sample is the honest one.
+        """
+        P = self._pts()
+        a, b = P[:-1], P[1:]
+        seg = b - a
+        L = np.linalg.norm(seg, axis=1)
+        which = rng.choice(len(L), size=n, p=L / L.sum())
+        t = rng.random(n)[:, None]
+        u = seg[which] / L[which][:, None]
+        seed = np.zeros((n, 3))
+        seed[np.arange(n), np.argmin(np.abs(u), axis=1)] = 1.0
+        e1 = np.cross(u, seed)
+        e1 /= np.linalg.norm(e1, axis=1)[:, None]
+        e2 = np.cross(u, e1)
+        th = rng.random(n)[:, None] * 2.0 * math.pi
+        nrm = np.cos(th) * e1 + np.sin(th) * e2  # radial: the outward normal of a tube
+        return a[which] + t * seg[which] + self.r * nrm, nrm
+
+
+@dataclass(frozen=True)
 class Cylinder:
     """Right circular cylinder: base centre ``(x,y,z)``, axis vector ``(dx,dy,dz)``, radius ``r``.
 
