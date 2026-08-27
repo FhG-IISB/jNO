@@ -44,6 +44,7 @@ class Filaments(NamedTuple):
     length: object  # (N,)
     radius: object  # (N,)    filament radius
     nodes: object  # (n_node, 3) node positions, which is how a port is addressed
+    part: object  # (N,)    index of the shape each filament came from, so per-conductor data can be spread
 
 
 def _leaf(shape, what):
@@ -85,8 +86,8 @@ def line_filaments(shape, size: float = None, quad: int = 3):
     a filament boundary — a bend must not fall inside a straight element.
     """
     shapes = list(shape) if isinstance(shape, (list, tuple)) else [shape]
-    starts, tangs, lens, ends, radii = [], [], [], [], []
-    for sh in shapes:
+    starts, tangs, lens, ends, radii, part = [], [], [], [], [], []
+    for si, sh in enumerate(shapes):
         prim = _leaf(sh, "Line")
         h = float(size if size is not None else (sh._size if sh._size is not None else 0.0))
         if h <= 0:
@@ -108,6 +109,7 @@ def line_filaments(shape, size: float = None, quad: int = 3):
                 lens.append(step)
                 ends.append((a + u * (step * j), a + u * (step * (j + 1))))
                 radii.append(prim.r)
+                part.append(si)
     if not starts:
         raise ValueError("peec.line_filaments: the polyline has no segment longer than zero.")
 
@@ -144,6 +146,7 @@ def line_filaments(shape, size: float = None, quad: int = 3):
         jnp.asarray(ln),
         jnp.asarray(rad),
         jnp.asarray(np.asarray(xyz)),
+        np.asarray(part, dtype=int),
     )
 
 
@@ -304,3 +307,134 @@ def terminal_nodes(fil: Filaments, where):
             "connect to; split the polyline so a vertex lands there."
         )
     return idx
+
+
+def solve_network(fil: Filaments, sigma, terminals, sources, grounds=(), currents=(), omega=0.0, mu0=4e-7 * np.pi):
+    """Solve the PEEC circuit for a network whose terminals are node SETS.
+
+    The general form of :func:`network_impedance`: a terminal is a pad carrying many filament ends,
+    held at one potential, and a problem may have several of them. The equations are Ruehli's
+    (IEEE Trans. MTT 22(3), 1974, sec. III)::
+
+        Z I - A' phi = 0                       Z = diag(R) + j w Lp,  A = incidence
+        phi_n = phi_T      for n in T          a terminal is equipotential
+        (A I)_n = 0                            at every node outside a terminal
+
+    and one row per terminal, from the ports: a source fixes ``phi_A - phi_B``, a ground fixes
+    ``phi_T``, a current fixes the net current injected there, and a terminal named by nothing at
+    all is open -- which is what ``(A I)_T = 0`` already says, so writing ``i(T) - 0`` is a way to
+    say out loud what omitting it would mean anyway.
+
+    Args:
+        fil: the network.
+        sigma: conductivity, scalar or per filament.
+        terminals: ``{name: node indices}``, from :func:`terminal_nodes`.
+        sources/grounds/currents: as returned by :func:`port_spec`.
+        omega: angular frequency, rad/s.
+        mu0: permeability of the surrounding medium.
+
+    Returns:
+        ``(cur, phi, inj)`` — filament currents, node potentials, and ``{terminal: injected current}``.
+
+    A source breaks current balance at BOTH its terminals, so each one needs a row: the source
+    supplies the first, and the second needs a ground. With exactly one source and no ground given,
+    its negative side is grounded -- a gauge choice that moves no current and changes no impedance.
+    With more than one, the reference is ambiguous and is asked for rather than picked.
+    """
+    from .kernel import pair_matrix
+
+    A = jnp.asarray(fil.incidence)
+    nn, ne = A.shape
+    sig = jnp.broadcast_to(jnp.asarray(sigma, dtype=float), (ne,))
+    R = jnp.asarray(fil.length) / (sig * jnp.pi * jnp.asarray(fil.radius) ** 2)
+    Lp = pair_matrix(fil.pos, fil.mom, lambda r: 1.0 / r, fil.self_g, group=fil.group) * (mu0 / (4.0 * jnp.pi))
+    Z = jnp.diag(R.astype(complex)) + 1j * float(omega) * Lp
+
+    names = list(terminals)
+    idx = {t: np.asarray(terminals[t], dtype=int) for t in names}
+    for t, ids in idx.items():
+        if ids.size == 0:
+            raise ValueError(f"jno.peec: terminal {t!r} contains no network node.")
+    owner = {}
+    for t, ids in idx.items():
+        for n in ids.tolist():
+            if n in owner:
+                raise ValueError(
+                    f"jno.peec: node {n} is in both terminal {owner[n]!r} and {t!r}. Terminals must not "
+                    "overlap -- two pads holding the same conductor end at different potentials has no "
+                    "meaning."
+                )
+            owner[n] = t
+
+    # one row per terminal; a source claims its positive side, everything else claims itself
+    row = {}
+
+    def claim(t, what):
+        if t not in idx:
+            raise ValueError(f"jno.peec: {what[0]} names terminal {t!r}, which is not a terminal here. Known: {names}.")
+        if t in row:
+            raise ValueError(
+                f"jno.peec: terminal {t!r} is constrained twice ({row[t][0]} and {what[0]}). Each terminal "
+                "takes one condition."
+            )
+        row[t] = what
+
+    for a, b, g in sources:
+        claim(a, ("a source", ("source", a, b, g)))
+    for t, g in grounds:
+        claim(t, ("a fixed potential", ("ground", t, g)))
+    for t, g in currents:
+        claim(t, ("a fixed current", ("current", t, g)))
+
+    # a source breaks current balance at its negative side too, so that side needs a row of its own
+    floating = [b for _a, b, _g in sources if b not in row]
+    if floating:
+        if len(sources) == 1:
+            claim(floating[0], ("the implied reference", ("ground", floating[0], 0.0 + 0j)))
+        else:
+            raise ValueError(
+                f"jno.peec: {len(sources)} sources and no reference for {floating}. With one source the "
+                "negative side is grounded for you; with several the reference is ambiguous, so name it: "
+                "add `v(REF) - 0.0`."
+            )
+
+    free = jnp.asarray(np.array([n for n in range(nn) if n not in owner], dtype=int))
+    rows, rhs = [], []
+    rows.append(jnp.concatenate([Z, -A.T.astype(complex)], axis=1))
+    rhs.append(jnp.zeros(ne, dtype=complex))
+    if free.size:  # current balance away from the terminals
+        rows.append(jnp.concatenate([A[free].astype(complex), jnp.zeros((free.size, nn), dtype=complex)], axis=1))
+        rhs.append(jnp.zeros(free.size, dtype=complex))
+    for t in names:  # a terminal is equipotential: tie its nodes to its first
+        ids = idx[t]
+        if ids.size > 1:
+            tie = jnp.zeros((ids.size - 1, ne + nn), dtype=complex)
+            for k, n in enumerate(ids[1:].tolist()):
+                tie = tie.at[k, ne + n].set(1.0).at[k, ne + int(ids[0])].set(-1.0)
+            rows.append(tie)
+            rhs.append(jnp.zeros(ids.size - 1, dtype=complex))
+    for t in names:  # and one row for the terminal itself
+        r = jnp.zeros(ne + nn, dtype=complex)
+        kind, *rest = row[t][1] if t in row else ("open", t, 0.0 + 0j)
+        if kind == "source":
+            a, b, g = rest
+            r = r.at[ne + int(idx[a][0])].set(1.0).at[ne + int(idx[b][0])].set(-1.0)
+            rhs.append(jnp.asarray(g, dtype=complex))
+        elif kind == "ground":
+            _t, g = rest
+            r = r.at[ne + int(idx[t][0])].set(1.0)
+            rhs.append(jnp.asarray(g, dtype=complex))
+        else:  # a fixed injected current, or an open terminal (which is zero injected current)
+            _t, g = rest
+            r = r.at[:ne].set(A[idx[t]].sum(0).astype(complex))
+            rhs.append(jnp.asarray(g, dtype=complex))
+        rows.append(r[None, :])
+    M = jnp.concatenate(rows, axis=0)
+    b = jnp.concatenate([jnp.atleast_1d(x) for x in rhs])
+    if M.shape[0] != M.shape[1]:
+        raise ValueError(f"jno.peec: built a {M.shape[0]}x{M.shape[1]} system; this is a bug, please report it.")
+
+    x = jnp.linalg.solve(M, b)
+    cur, phi = x[:ne], x[ne:]
+    inj = {t: A[idx[t]].sum(0) @ cur for t in names}
+    return cur, phi, inj
