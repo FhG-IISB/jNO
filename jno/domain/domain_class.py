@@ -404,7 +404,11 @@ def _declared_size(plan):
     if own is not None:
         return own
     sizes = [sh._size for _n, sh in _regions_of(plan) if getattr(sh, "_size", None) is not None]
-    return min(sizes) if sizes else None
+    if not sizes:
+        return None
+    # A size may be per-axis (a tuple), so regions cannot be compared directly; the finest scalar
+    # component is what "is there a declared resolution, and how fine" means here.
+    return min(sizes, key=lambda v: min(np.atleast_1d(np.asarray(v, dtype=float))))
 
 
 def _is_interface_tag(name, plan):

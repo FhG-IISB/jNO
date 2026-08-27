@@ -170,10 +170,14 @@ class PEEC:
             fl = line_filaments(lines)
             parts.append((fl, np.asarray(line_sig)[np.asarray(fl.part)]))
             owners.append(lines)
-        for sh, sg in solids:
-            fb = bar_filaments(sh)
-            parts.append((fb, np.full(len(np.asarray(fb.length)), sg)))
-            owners.append([sh])
+        if solids:
+            # ONE grid for every solid. Separate lattices couple through a block that is not Toeplitz,
+            # so a shared grid is what keeps the whole trace layer a single FFT: on the example module
+            # that is ten coplanar traces of equal thickness, which is the case it fits exactly.
+            shs = [sh for sh, _ in solids]
+            fb = bar_filaments(shs)
+            parts.append((fb, np.asarray([sg for _, sg in solids])[np.asarray(fb.part)]))
+            owners.append(shs)
         return (*_weld(parts, owners), terms)
 
     def solve(self):
@@ -272,7 +276,10 @@ def _weld(parts, owners):
         cat("area"),
         jnp.asarray(nodes),
         shift("part"),
-        None,  # a welded network is no longer one lattice; the FFT path takes a single lattice
+        # Each block keeps whatever structure it had — a lattice stays a lattice — and the blocks
+        # couple through a cross term. That is what lets a trace layer stay an FFT while the bond
+        # wires landing on it stay exact.
+        {"welded": _spans(fils)},
     )
     return welded, np.concatenate([np.asarray(g) for _f, g in parts])
 
@@ -307,6 +314,16 @@ def _join_contacts(inc, nodes, bounds, owners):
     merged = np.zeros((len(keep), inc.shape[1]))
     np.add.at(merged, inverse, inc)
     return merged, nodes[keep]
+
+
+def _spans(fils):
+    """``(lo, hi, lattice)`` per welded block, in element numbering."""
+    out, off = [], 0
+    for f in fils:
+        k = len(np.asarray(f.length))
+        out.append((off, off + k, getattr(f, "lattice", None)))
+        off += k
+    return out
 
 
 def _renumber(blocks):
