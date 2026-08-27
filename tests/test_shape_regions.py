@@ -161,6 +161,10 @@ def test_interface_3d_box_sphere():
         .sized(0.12)
         .domain()
     )
+    # via the public accessor, as the other interface tests do: an interface is the mesher's shared
+    # facet, so naming one is what asks a deferred domain to build. Reaching into the raw tag list
+    # instead would only pin WHEN the mesh happens to exist.
+    assert d.interface_tags() == ["core|shell"]
     assert "core|shell" in d.avaiable_mesh_tags
     assert d._mesh_pool["core|shell"].shape[0] > 0
 
