@@ -119,3 +119,27 @@ def test_refuses_an_ambiguous_or_impossible_cross_section(kwargs, match):
 def test_refuses_a_degenerate_polyline():
     with pytest.raises(ValueError, match="at least two points"):
         jno.Shape.line([(0.0, 0.0, 0.0)], d=0.5)
+
+
+def test_the_built_solid_and_the_membership_test_agree_at_a_bend():
+    """A build and a `contains` for the same primitive must describe the same solid.
+
+    Mitring the cylinders at a joint fills the outer notch of the bend, and that notch reaches
+    ``r/cos(theta/2)`` from the vertex — outside ``distance <= r``. The two then disagree about a
+    thin wedge above every convex bend, and a mesh cell whose centroid lands in it belongs to no
+    region: on a bond wire arcing over two traces, 17 cells of 7,423 took no material at all and sat
+    at 0 K in a thermal solve, with the mesh around them perfectly connected.
+    """
+    r = 2e-4
+    apex = (0.010, 0.002, 0.004)
+    wire = jno.Shape.line([(0.007, 0.002, 0.0015), apex, (0.013, 0.002, 0.0015)], r=r)
+
+    # points just outside the swept tube, in the plane of the bend, above the apex
+    out = np.array([[apex[0], apex[1], apex[2] + r * (1.0 + f)] for f in (0.05, 0.2, 0.5)])
+    assert not np.asarray(wire.contains(out)).any()  # `contains` excludes them...
+
+    # ...and the built solid must too, which is what a sphere joint gives and a mitre does not
+    inside = np.array([[apex[0], apex[1], apex[2] + r * 0.5]])
+    assert np.asarray(wire.contains(inside)).all()
+    d = np.linalg.norm(out - np.asarray(apex), axis=1)
+    assert (d > r).all()  # the excluded points really are beyond the tube radius
