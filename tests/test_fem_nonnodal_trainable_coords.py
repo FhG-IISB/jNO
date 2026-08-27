@@ -35,15 +35,12 @@ def _x64():
 def _curl_curl(size=0.5, trainable_axis=None):
     """A gauged curl-curl system on a cube with a constant source.
 
-    The tree gauge (a spanning tree of the edge graph pinned to zero) is what makes the operator
-    non-singular, so a direct solve applies and the objective below is well defined. With
-    ``trainable_axis`` set, that axis of every mesh vertex becomes a design variable.
+    A small mass term makes the operator non-singular, so a direct solve applies and the objective
+    below is well defined. With ``trainable_axis`` set, that axis of every mesh vertex becomes a
+    design variable.
     """
-    from jno.utils.solver.fem_topology import BASIX_TET_EDGES, build_edge_topology
-
     d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=size).domain()
     pts = np.asarray(d.mesh.points)
-    cells = np.asarray(d.mesh.cells_dict["tetra"])
     u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
     ci = d.variable("interior", split=True)
     x, y, z = ci[0], ci[1], ci[2]
@@ -52,28 +49,14 @@ def _curl_curl(size=0.5, trainable_axis=None):
     if trainable_axis is not None:
         param = ci[trainable_axis].trainable(name="X")
 
-    top = build_edge_topology(cells, BASIX_TET_EDGES)
-    n_edges, n_verts = int(top.n_edges), len(pts)
-    ev = np.asarray(top.edge_vertices)
-    parent = np.arange(n_verts)
-
-    def find(a):
-        while parent[a] != a:
-            parent[a] = parent[parent[a]]
-            a = parent[a]
-        return a
-
-    tree = []
-    for e in range(n_edges):
-        ra, rb = find(int(ev[e, 0])), find(int(ev[e, 1]))
-        if ra != rb:
-            parent[ra] = rb
-            tree.append(e)
-    d._extra_dof_pins = [(int(e), 0.0) for e in tree]
-
+    # A mass term, NOT a tree gauge, is what makes curl-curl non-singular here. The tree-pinning
+    # route goes through `domain._extra_dof_pins`, which not every jNO carries -- and where it is
+    # absent the pins are silently ignored, leaving the test to solve a singular system and call it
+    # a pass. A mass term is part of the form itself, so it cannot be quietly dropped.
     fem = jno.fem(
         [
             inner(u.vector.curl(x, y, z), v.vector.curl(x, y, z))
+            + 1e-3 * inner(u.bind(x=x, y=y, z=z), v.bind(x=x, y=y, z=z))
             - inner(vec(1.0 + 0.0 * x, 0.0 * x, 0.0 * x), v.bind(x=x, y=y, z=z)),
             u.vector.cross(d.variable("boundary", normals=True)),
         ]
