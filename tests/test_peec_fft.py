@@ -252,28 +252,37 @@ def test_a_frequency_sweep_reuses_the_compilation():
     assert abs(zs[2].imag) > abs(zs[0].imag)  # and they are genuinely different frequencies
 
 
-def test_the_dense_path_is_differentiable_and_the_matrix_free_one_refuses():
-    """A wrong gradient is worse than a missing one, so the fast path refuses to give one.
+def test_the_matrix_free_gradient_needs_a_bigger_krylov_subspace_and_says_so():
+    """The TANGENT system is far harder than the primal, and jax's gmres does not report failing on it.
 
-    Measured against the dense path, which agrees with finite differences to 1e-8: the matrix-free
-    gradient came out at -2.80e-14 where the answer is -1.41e-12, and at DC -3.09e-09 where the answer
-    is -8.19e-05. Until that is understood it is refused rather than returned.
+    Measured on this network, where the answer is -1.412010e-12: restart 16 returns -2.80e-14, restart
+    64 returns -4.03e-14, restart 200 returns it exactly. The forward solve converges in two cycles at
+    restart 16 throughout, so nothing about it reveals the problem — which is why the small restart is
+    refused for differentiation rather than allowed to return a plausible wrong number.
     """
     f = bar_filaments(jno.Shape.box(0, 0, 0, 0.040, 0.004, 0.002), size=(0.002, 0.002, 0.001))
     p = np.asarray(f.nodes)
     a = terminal_nodes(f, lambda q: q[:, 0] < p[:, 0].min() + 1e-9)
     b = terminal_nodes(f, lambda q: q[:, 0] > p[:, 0].max() - 1e-9)
 
-    def port_r(sig, mf):
+    def port_r(sig, mf, restart=16):
         _c, _phi, inj = solve_network(
-            f, sig, {"A": a, "B": b}, [("A", "B", 1.0 + 0j)], omega=2 * np.pi * 1e6, matrix_free=mf
+            f,
+            sig,
+            {"A": a, "B": b},
+            [("A", "B", 1.0 + 0j)],
+            omega=2 * np.pi * 1e6,
+            matrix_free=mf,
+            restart=restart,
         )
         return jnp.real(1.0 / inj["A"])
 
-    g = float(jax.grad(lambda s: port_r(s, False))(SIGCU))
     fd = float((port_r(SIGCU * 1.0001, False) - port_r(SIGCU * 0.9999, False)) / (0.0002 * SIGCU))
-    assert abs(g / fd - 1) < 1e-6
-    assert g < 0  # more conductive, less resistive
+    assert abs(float(jax.grad(lambda s: port_r(s, False))(SIGCU)) / fd - 1) < 1e-6  # dense is exact
 
-    with pytest.raises(NotImplementedError, match="not differentiable yet"):
-        jax.grad(lambda s: port_r(s, True))(SIGCU)
+    with pytest.raises(NotImplementedError, match="WRONG gradient"):
+        jax.grad(lambda s: port_r(s, True, 16))(SIGCU)
+
+    g = float(jax.grad(lambda s: port_r(s, True, 200))(SIGCU))
+    assert abs(g / fd - 1) < 1e-6  # and with the subspace it needs, it is exact too
+    assert g < 0  # more conductive, less resistive
