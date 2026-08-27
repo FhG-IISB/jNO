@@ -11,6 +11,7 @@ result against the dense one built by ``pair_matrix``.
 """
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -247,3 +248,30 @@ def test_a_frequency_sweep_reuses_the_compilation():
         zs.append(complex(1.0 / inj["A"]))
     assert len(_KRYLOV_CACHE) - before == 1  # three frequencies, one compilation
     assert abs(zs[2].imag) > abs(zs[0].imag)  # and they are genuinely different frequencies
+
+
+def test_the_dense_path_is_differentiable_and_the_matrix_free_one_refuses():
+    """A wrong gradient is worse than a missing one, so the fast path refuses to give one.
+
+    Measured against the dense path, which agrees with finite differences to 1e-8: the matrix-free
+    gradient came out at -2.80e-14 where the answer is -1.41e-12, and at DC -3.09e-09 where the answer
+    is -8.19e-05. Until that is understood it is refused rather than returned.
+    """
+    f = bar_filaments(jno.Shape.box(0, 0, 0, 0.040, 0.004, 0.002), size=(0.002, 0.002, 0.001))
+    p = np.asarray(f.nodes)
+    a = terminal_nodes(f, lambda q: q[:, 0] < p[:, 0].min() + 1e-9)
+    b = terminal_nodes(f, lambda q: q[:, 0] > p[:, 0].max() - 1e-9)
+
+    def port_r(sig, mf):
+        _c, _phi, inj = solve_network(
+            f, sig, {"A": a, "B": b}, [("A", "B", 1.0 + 0j)], omega=2 * np.pi * 1e6, matrix_free=mf
+        )
+        return jnp.real(1.0 / inj["A"])
+
+    g = float(jax.grad(lambda s: port_r(s, False))(SIGCU))
+    fd = float((port_r(SIGCU * 1.0001, False) - port_r(SIGCU * 0.9999, False)) / (0.0002 * SIGCU))
+    assert abs(g / fd - 1) < 1e-6
+    assert g < 0  # more conductive, less resistive
+
+    with pytest.raises(NotImplementedError, match="not differentiable yet"):
+        jax.grad(lambda s: port_r(s, True))(SIGCU)
