@@ -1993,6 +1993,12 @@ class FieldViewWithPartials(ScalarView):
                         )
                     merged[name] = var
                 cv = merged
+        if tie_tags is None:
+            # An operation on a stamped tie keeps the stamp: `u(A) - u(B) - g` discards the tie's
+            # own view at the OUTER subtraction, and the region tags survive nowhere else. Whether
+            # the offset form means anything is the reading solver's call -- jno.fem still refuses
+            # it, loudly, because _tie_phase does not recognise the outer `-`.
+            tie_tags = getattr(self, "_periodic_tie", None) or getattr(other, "_periodic_tie", None)
         new = FieldViewWithPartials.__new__(FieldViewWithPartials)
         ScalarView.__init__(new, new_expr)
         object.__setattr__(new, "_coord_vars", cv)
@@ -2195,6 +2201,10 @@ def _make_named_with_partials_cls(view_cls):
                             )
                         merged[name] = var
                     cv = merged
+            if tie_tags is None:
+                # see the note in FieldViewWithPartials._rewrap: an operation on a stamped tie keeps
+                # the stamp, because the outer op discards the tie's own view.
+                tie_tags = getattr(self, "_periodic_tie", None) or getattr(other, "_periodic_tie", None)
             res = type(self)(new_expr, cv)
             if tie_tags is not None:
                 object.__setattr__(res, "_periodic_tie", tie_tags)
