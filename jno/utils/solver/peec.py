@@ -24,6 +24,7 @@ import jax
 import jax.experimental.sparse as jsparse
 import jax.numpy as jnp
 import numpy as np
+import scipy.sparse as sp
 
 from .kernel import bar_self, wire_self
 
@@ -45,13 +46,18 @@ class Filaments(NamedTuple):
     ``pos``/``mom``/``self_g``/``group`` go straight to :func:`~jno.utils.solver.kernel.pair_quadratic`.
     ``incidence`` and ``length`` are what a network solve needs on top: which nodes each filament
     joins, and how long it is.
+
+    The incidence is a ``scipy.sparse`` matrix, and it has to be: a filament touches two nodes, so
+    the array is two nonzeros per column, and holding it densely is what the size of a real problem
+    goes into. On the example power module -- 137,350 bars over 55,000 nodes -- dense is 60 GB and
+    sparse is a few MB.
     """
 
     pos: object  # (N*quad, 3) sub-point positions
     mom: object  # (N*quad, 3) tangent * length * Gauss weight
     self_g: object  # (N,)      per-filament self term
     group: object  # (N*quad,) filament label for each sub-point
-    incidence: object  # (n_node, N) +1 where a filament leaves a node, -1 where it enters
+    incidence: object  # (n_node, N) SPARSE: +1 where a filament leaves a node, -1 where it enters
     length: object  # (N,)
     area: object  # (N,)    conducting cross-section, which is all the solve needs of the shape
     nodes: object  # (n_node, 3) node positions, which is how a port is addressed
@@ -141,21 +147,22 @@ def line_filaments(shape, size: float = None, quad: int = 3):
 
     # nodes = filament endpoints snapped to a grid far below the element size
     tol = 1e-9 * float(ln.min())
-    key, rows, xyz = {}, [], []
+    key, xyz, ir, ic, iv = {}, [], [], [], []
     for k, (a, b) in enumerate(ends):
         for pt, sign in ((a, +1.0), (b, -1.0)):
             t = tuple(np.round(np.asarray(pt) / tol).astype(np.int64).tolist())
             if t not in key:
-                key[t] = len(rows)
-                rows.append(np.zeros(n))
+                key[t] = len(xyz)
                 xyz.append(np.asarray(pt, dtype=float))
-            rows[key[t]][k] += sign
+            ir.append(key[t])
+            ic.append(k)
+            iv.append(sign)
     return Filaments(
         jnp.asarray(pos),
         jnp.asarray(mom),
         jnp.asarray(self_g),
         group,
-        jnp.asarray(np.asarray(rows)),
+        sp.coo_matrix((iv, (ir, ic)), shape=(len(xyz), n)).tocsr(),
         jnp.asarray(ln),
         jnp.asarray(area),
         jnp.asarray(np.asarray(xyz)),
@@ -195,7 +202,8 @@ def network_impedance(fil: Filaments, sigma, port, omega: float = 0.0, mu0: floa
     """
     from .kernel import pair_matrix
 
-    A = jnp.asarray(fil.incidence)
+    # this path forms the dense operator anyway, so densifying the incidence changes nothing
+    A = jnp.asarray(fil.incidence.toarray())
     nn, ne = A.shape
     sig = jnp.broadcast_to(jnp.asarray(sigma, dtype=float), (ne,))
     R = jnp.asarray(fil.length) / (sig * jnp.asarray(fil.area))
@@ -378,8 +386,8 @@ def solve_network(
     """
     from .kernel import pair_matrix
 
-    A = jnp.asarray(fil.incidence)
-    nn, ne = A.shape
+    Asp0 = fil.incidence.tocsr()
+    nn, ne = Asp0.shape
     sig = jnp.broadcast_to(jnp.asarray(sigma, dtype=float), (ne,))
     R = jnp.asarray(fil.length) / (sig * jnp.asarray(fil.area))
     lat = getattr(fil, "lattice", None)
@@ -457,14 +465,17 @@ def solve_network(
     # port conditions, so it carries a few entries per row against ne + nn columns: on a 12k-bar
     # lattice the incidence alone is 24,548 nonzeros in 61,271,808 slots -- 0.04 % -- and holding that
     # densely costs 1.4 GB and an 86-million-op matvec per Krylov step, next to a 3.7 ms FFT apply.
-    An = np.asarray(A)
+    ar, ac_ = Asp0.nonzero()
+    aval = np.asarray(Asp0[ar, ac_]).reshape(-1)
+    rows_of = lambda n: Asp0.indices[Asp0.indptr[n] : Asp0.indptr[n + 1]]
+    vals_of = lambda n: Asp0.data[Asp0.indptr[n] : Asp0.indptr[n + 1]]
     rr, cc, vv, rhs = [], [], [], [np.zeros(ne, dtype=complex)]
     r0 = 0
     for n in free:  # current balance away from the terminals
-        k = np.flatnonzero(An[n])
+        k, v = rows_of(n), vals_of(n)
         rr.append(np.full(k.size, r0))
         cc.append(k)
-        vv.append(An[n, k])
+        vv.append(v)
         r0 += 1
         rhs.append(np.zeros(1, dtype=complex))
     for t in names:  # a terminal is equipotential: tie its nodes to its first
@@ -489,7 +500,7 @@ def solve_network(
             vv.append(np.array([1.0]))
         else:  # a fixed injected current, or an open terminal (which is zero injected current)
             _t, g = rest
-            col = An[idx[t]].sum(0)
+            col = np.asarray(Asp0[idx[t]].sum(0)).reshape(-1)
             k = np.flatnonzero(col)
             rr.append(np.full(k.size, r0))
             cc.append(k)
@@ -500,7 +511,7 @@ def solve_network(
         raise ValueError(f"jno.peec: built {r0} constraint rows, expected {nn}; this is a bug.")
     crow, ccol, cval = np.concatenate(rr), np.concatenate(cc), np.concatenate(vv).astype(complex)
     b = jnp.asarray(np.concatenate(rhs))
-    _refuse_disconnected(np.asarray(A), idx, sources, grounds, currents)
+    _refuse_disconnected(Asp0, idx, sources, grounds, currents)
 
     if free_form:
         import scipy.sparse as sp
@@ -519,8 +530,7 @@ def solve_network(
         # ends. Left dense it is an ne x nn complex matrix hit twice per Krylov step: at 6,806 bars
         # that is 303 MB and about 55 ms a step, against a 5.9 ms FFT apply, so it was ten times the
         # operator it was helping to apply.
-        ar, ac_ = np.nonzero(An)
-        Acj = _bcoo(An[ar, ac_].astype(complex), ac_, ar, (ne, nn))
+        Acj = _bcoo(aval.astype(complex), ac_, ar, (ne, nn))
 
         # The Schur complement of the diagonal of Z. Sparse throughout: CI is current balance, A is
         # the incidence, and their product is graph-Laplacian shaped, so forming and factoring it
@@ -528,7 +538,7 @@ def solve_network(
         # single FFT apply of 3.7 ms). The factorisation is host-side and eager -- a preconditioner
         # only has to accelerate, so nothing differentiable passes through it; the gradient comes from
         # the outer custom_linear_solve.
-        Asp = sp.coo_matrix((An[ar, ac_], (ar, ac_)), shape=(nn, ne)).tocsr()
+        Asp = Asp0
         Dinv = sp.diags(1.0 / np.asarray(zdiag))
         S = (CI @ Dinv @ Asp.T.tocsr() + Cp).tocsc()
         lu = spla.splu(S)
@@ -599,7 +609,7 @@ def solve_network(
                 "matrix_free=False for a network small enough to form."
             )
     else:
-        top = jnp.concatenate([Z, -A.T.astype(complex)], axis=1)
+        top = jnp.concatenate([Z, -jnp.asarray(Asp0.toarray()).T.astype(complex)], axis=1)
         bot = jnp.zeros((nn, ne + nn), dtype=complex).at[crow, ccol].add(jnp.asarray(cval))
         M = jnp.concatenate([top, bot], axis=0)
         x = jnp.linalg.solve(M, b)
@@ -610,7 +620,7 @@ def solve_network(
             "path back to the reference."
         )
     cur, phi = x[:ne], x[ne:]
-    inj = {t: A[idx[t]].sum(0) @ cur for t in names}
+    inj = {t: jnp.asarray(np.asarray(Asp0[idx[t]].sum(0)).reshape(-1), dtype=complex) @ cur for t in names}
     return cur, phi, inj
 
 
@@ -622,6 +632,7 @@ def _refuse_disconnected(A, idx, sources, grounds, currents):
     not is the common way to get here, so the check names the terminals rather than the matrix.
     """
     nn, ne = A.shape
+    Ac = A.tocsc()
     root = np.arange(nn)
 
     def find(a):
@@ -631,7 +642,7 @@ def _refuse_disconnected(A, idx, sources, grounds, currents):
         return a
 
     for k in range(ne):  # a filament joins the nodes it touches
-        touch = np.flatnonzero(A[:, k] != 0.0)
+        touch = Ac.indices[Ac.indptr[k] : Ac.indptr[k + 1]]
         for n in touch[1:]:
             ra, rb = find(int(touch[0])), find(int(n))
             if ra != rb:
@@ -810,20 +821,22 @@ def bar_filaments(shape, size=None, quad: int = 3, sigma=None):
     wt = np.stack([np.array([d[i] for i in range(3) if i != ax]) for ax in axis])
     self_g = np.asarray(bar_self(jnp.asarray(ln), jnp.asarray(wt[:, 0]), jnp.asarray(wt[:, 1])))
 
-    inc = np.zeros((len(nodes), nb))
-    off = 0
+    ir, ic, iv, off = [], [], [], 0
     for na, nb_ in ends:
         k = len(na)
-        inc[na, np.arange(off, off + k)] = 1.0
-        inc[nb_, np.arange(off, off + k)] = -1.0
+        cols = np.arange(off, off + k)
+        ir += [na, nb_]
+        ic += [cols, cols]
+        iv += [np.ones(k), -np.ones(k)]
         off += k
+    inc = sp.coo_matrix((np.concatenate(iv), (np.concatenate(ir), np.concatenate(ic))), shape=(len(nodes), nb)).tocsr()
 
     return Filaments(
         jnp.asarray(pos),
         jnp.asarray(mom),
         jnp.asarray(self_g),
         group,
-        jnp.asarray(inc),
+        inc,
         jnp.asarray(ln),
         jnp.asarray(area),
         jnp.asarray(nodes),
