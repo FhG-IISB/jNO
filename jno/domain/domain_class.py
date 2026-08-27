@@ -53,6 +53,34 @@ def _mesh_request_origin() -> str:
     return "something"
 
 
+def _refuse_empty_mesh(mesh, dim: int) -> None:
+    """Refuse a mesh with no nodes — the mesher failed and returned nothing.
+
+    gmsh can fail (``HXT 3D mesh failed``, ``a segment and a facet intersect``) and still hand back
+    a well-formed but EMPTY mesh: zero points, and cell blocks present with zero rows. Nothing
+    downstream notices, so ``.domain()`` returns an object that behaves like a domain until some
+    much later reduction over an empty set fails somewhere unrelated. The gmsh error has scrolled
+    past by then, and the traceback points nowhere near the geometry that caused it.
+
+    One known trigger, measured: a thin CURVED solid inside a host whose cells are larger than the
+    inclusion's DIAMETER. Refining the inclusion does not help; refining the host does. For a 0.75 mm
+    tube in a box, host size 1.6 gives zero tetrahedra while 0.8 gives ~9.7k
+    (``tests/test_shape_line.py::test_a_coarse_host_cannot_mesh_around_a_thin_inclusion``).
+    """
+    n = 0 if getattr(mesh, "points", None) is None else len(mesh.points)
+    if n:
+        return
+    blocks = sorted((getattr(mesh, "cells_dict", None) or {}))
+    raise RuntimeError(
+        f"the mesher returned an EMPTY {dim}-D mesh: no nodes, and cell blocks {blocks or 'none'} "
+        "with no rows. This means meshing failed -- look for a gmsh error above (commonly "
+        "'HXT 3D mesh failed' or 'a segment and a facet intersect'). The usual cause is a thin or "
+        "curved feature inside a region whose target size is too coarse to wrap around it: refine "
+        "the SURROUNDING region (refining the small feature does not help), or give the small "
+        "feature more clearance."
+    )
+
+
 def _refuse_mixed_cells(mesh, dim: int) -> None:
     """Refuse a mesh carrying more than one kind of volume cell.
 
@@ -2853,6 +2881,7 @@ class domain(MeshIOMixin):
         if mesh is None:
             boundary_indices = np.asarray([], dtype=np.int64)
         else:
+            _refuse_empty_mesh(mesh, int(self.dimension))
             if not getattr(self, "_keep_orphan_nodes", False):
                 mesh = self._drop_orphan_nodes(mesh)
             _refuse_mixed_cells(mesh, int(self.dimension))

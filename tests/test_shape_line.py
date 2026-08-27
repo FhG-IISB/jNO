@@ -65,15 +65,16 @@ def test_a_coarse_host_cannot_mesh_around_a_thin_inclusion():
     ``Shape.cylinder`` behaves identically, so this pins the host-size dependence rather than
     blaming the primitive -- and it is why the test above sizes its host at 0.8.
 
-    Measured for a 0.75 mm tube: host 1.6 -> 0 tets, host 0.8 -> ~9.7k, host 0.4 -> ~32k.
+    Measured for a 0.75 mm tube: host 1.6 -> fails, host 0.8 -> ~9.7k tets, host 0.4 -> ~32k.
+
+    It must RAISE, not return an empty domain: gmsh hands back zero points with the cell blocks
+    present but empty, and without a guard that object behaves like a domain until some later
+    reduction over an empty set fails far from the geometry that caused it.
     """
     wire = jno.Shape.line(PTS, d=0.75, size=0.30).name("wire")
     coarse = (jno.Shape.box(-2, -2, -2, 2, 12, 4, size=1.6) - wire).name("air")
-    n = len(np.asarray((wire + coarse).domain()._cells_p1()))
-    assert n == 0, (
-        "a coarse host now meshes around a thin inclusion -- if the mesher improved, relax the "
-        "host size in test_line_can_be_a_named_region_with_its_own_size and delete this test"
-    )
+    with pytest.raises(RuntimeError, match="EMPTY 3-D mesh"):
+        (wire + coarse).domain().points
 
 
 def test_meshes_to_roughly_the_analytic_volume():
