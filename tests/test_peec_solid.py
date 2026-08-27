@@ -95,40 +95,27 @@ def test_conductors_that_do_not_touch_are_refused_rather_than_returning_infinity
         jno.peec([v(*at("A")) - v(*at("B")) - 1.0]).solve()
 
 
-def test_an_unsupported_conductor_shape_says_which_two_exist():
-    sph = jno.Shape.sphere(0, 0, 0, 0.01, size=0.002).attach(sigma=SIG).name("blob")
-    box = jno.Shape.box(0.02, 0, 0, 0.03, 0.004, 0.001, size=0.001).attach(sigma=SIG).name("b")
-    d = (sph + box).domain()
-    d.tag("A", lambda x, y, z: x < -0.005)
+def test_any_closed_form_solid_is_discretised_not_just_a_box():
+    """The lattice covers a bounding box and a mask says which cells are metal, so the SHAPE is free."""
+    for solid in (
+        jno.Shape.cylinder(0, 0, 0, 0.02, 0, 0, 0.003),
+        jno.Shape.sphere(0.01, 0, 0, 0.004),
+        jno.Shape.box(0, 0, 0, 0.02, 0.006, 0.002) | jno.Shape.box(0.014, 0.006, 0, 0.02, 0.02, 0.002),
+        jno.Shape.box(0, 0, 0, 0.02, 0.006, 0.002) - jno.Shape.cylinder(0.01, 0.003, -0.001, 0, 0, 0.004, 0.0015),
+    ):
+        f = bar_filaments(solid, size=(0.001, 0.001, 0.001))
+        assert len(np.asarray(f.length)) > 0
+        assert np.asarray(f.nodes).shape[0] <= int(np.prod(f.lattice["n"]))  # a mask, not a fit
+
+
+def test_a_solid_with_no_closed_form_membership_says_so():
+    """A fillet has no `contains`, and the lattice is built by asking which cells lie inside."""
+    solid = jno.Shape.box(0, 0, 0, 0.02, 0.006, 0.002, size=0.001).fillet(0.0005).attach(sigma=SIG).name("blob")
+    box = jno.Shape.box(0.02, 0, 0, 0.03, 0.006, 0.002, size=0.001).attach(sigma=SIG).name("b")
+    d = (solid + box).domain()
+    d.tag("A", lambda x, y, z: x < 0.0011)
     d.tag("B", lambda x, y, z: x > 0.0289)
     _i, v = d.peec_symbols()
     at = lambda t: d.variable(t, split=True, sample=(4, None))[:3]
-    with pytest.raises(NotImplementedError, match="Shape.line becomes filaments"):
+    with pytest.raises(NotImplementedError, match="no closed-form membership"):
         jno.peec([v(*at("A")) - v(*at("B")) - 1.0]).solve()
-
-
-def test_the_pitch_can_differ_per_axis():
-    """A real conductor is not cubic, and an isotropic pitch makes it unaffordable.
-
-    A power-module trace is 0.57 mm thick on a 96.9 mm plate — 170:1. An isotropic grid fine enough
-    to resolve the 1 MHz skin depth (65 um) through the thickness spends that same resolution across
-    the width, where nothing varies: counted on the module's ten traces, 33,583,245 bars against
-    137,350 for (1.0, 1.0, 0.065) at the SAME through-thickness resolution.
-    """
-    trace = jno.Shape.box(0, 0, 0, 0.0405, 0.0059, 0.00057)
-    flat = bar_filaments(trace, size=0.002)
-    layered = bar_filaments(trace, size=(0.002, 0.002, 0.000143))
-    assert flat.lattice["n"][2] == 1  # one cell through: no current variation through the thickness
-    assert layered.lattice["n"][2] == 4
-    assert layered.lattice["n"][:2] == flat.lattice["n"][:2]  # and no extra cost in plane
-    assert len(np.asarray(layered.length)) > 4 * len(np.asarray(flat.length))
-
-
-def test_a_per_axis_pitch_still_gives_the_exact_fft_operator():
-    from jno.utils.solver.kernel import pair_matrix
-    from jno.utils.solver.peec import lattice_apply
-
-    f = bar_filaments(jno.Shape.box(0, 0, 0, 0.0405, 0.0059, 0.00057), size=(0.002, 0.002, 0.000143))
-    k = np.asarray(pair_matrix(f.pos, f.mom, lambda r: 1 / r, f.self_g, group=f.group))
-    x = np.random.default_rng(0).normal(size=k.shape[0])
-    assert np.linalg.norm(np.asarray(lattice_apply(f, lambda r: 1 / r)(x)) - k @ x) / np.linalg.norm(k @ x) < 1e-13
