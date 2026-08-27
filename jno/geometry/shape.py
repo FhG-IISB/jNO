@@ -24,7 +24,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from .primitives import Box, Cylinder, Disk, Polygon, Rect, Sphere, _to3
+from .primitives import Box, Cylinder, Disk, Line, Polygon, Rect, Sphere, _to3
 
 # Nodes with no closed-form point membership. `sweep` follows an arbitrary path and `fillet`
 # *removes* material near edges, so recursing to the child would silently answer for the
@@ -676,6 +676,41 @@ class Shape:
     ) -> "Shape":
         """Right cylinder: base centre ``(x,y,z)``, axis vector ``(dx,dy,dz)``, radius ``r``."""
         return cls(("leaf", Cylinder(x, y, z, dx, dy, dz, r), next(_LEAF_KEYS)), 3, size)
+
+    @classmethod
+    def line(cls, points, d: float = None, *, r: float = None, size: Size = None) -> "Shape":
+        """Tube of diameter ``d`` (or radius ``r``) swept along a polyline of 3-D ``points``.
+
+        A 1-D conductor -- a bond wire, a filament, a vortex line -- that is nevertheless a solid, so
+        it meshes like anything else while an integral method can read its centreline and never mesh
+        it at all::
+
+            jno.Shape.line([(0, 0, 0), (0, 5, 2), (0, 10, 0)], d=0.375, size=0.2)
+
+        It exists as a primitive rather than as ``disk.sweep(path)`` because a swept solid has no
+        closed-form membership, so it cannot be a named region carrying its own ``size=`` -- per-region
+        mesh sizing needs a containment test. A tube's membership is "distance to the polyline <= r",
+        which is exact.
+
+        Built as overlapping capsules (a cylinder per segment, a sphere at each interior joint), so a
+        bend is smooth rather than notched on its outer side.
+        """
+        if (d is None) == (r is None):
+            raise ValueError("Shape.line: pass exactly one of d= (diameter) or r= (radius).")
+        rad = float(r) if r is not None else 0.5 * float(d)
+        if rad <= 0:
+            raise ValueError(f"Shape.line: radius must be positive, got {rad}.")
+
+        def _p3(q):
+            v = [float(c) for c in q]
+            if not 2 <= len(v) <= 3:
+                raise ValueError(f"Shape.line: each point needs 2 or 3 coordinates, got {len(v)}.")
+            return tuple(v + [0.0] * (3 - len(v)))
+
+        pts = tuple(_p3(q) for q in points)
+        if len(pts) < 2:
+            raise ValueError(f"Shape.line: needs at least two points, got {len(pts)}.")
+        return cls(("leaf", Line(pts, rad), next(_LEAF_KEYS)), 3, size)
 
     @classmethod
     def sphere(cls, cx: float, cy: float, cz: float, r: float, size: Size = None) -> "Shape":
