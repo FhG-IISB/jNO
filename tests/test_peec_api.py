@@ -133,3 +133,57 @@ def test_the_readouts_describe_one_port():
 def test_an_empty_constraint_list_is_refused():
     with pytest.raises(ValueError, match="carries no current"):
         jno.peec([])
+
+
+def _two_paths():
+    direct = jno.Shape.line([(0, 0, 0), (0.05, 0, 0)], r=1.5e-4, size=0.004).attach(sigma=SIG).name("direct")
+    detour = (
+        jno.Shape.line([(0, 0, 0), (0, -0.04, 0), (0.05, -0.04, 0), (0.05, 0, 0)], r=6e-4, size=0.004)
+        .attach(sigma=SIG)
+        .name("detour")
+    )
+    return direct, detour
+
+
+def test_a_terminal_can_be_a_tag_and_then_declaration_order_stops_mattering():
+    """A terminal is a named SUBSET of a conductor, not a material, so it belongs in a tag.
+
+    Regions resolve by declaration order because a cell belongs to ONE material. A pad does not: it
+    sits wholly inside the conductor it marks. Written as a region and declared second, the priority
+    rule subtracts it to nothing — this same geometry raised "the region the tag names appears to be
+    empty". As a tag there is no priority and no ordering rule to remember.
+    """
+    direct, detour = _two_paths()
+    d = (direct + detour).domain()  # conductors FIRST — the order that broke the region spelling
+    d.tag("P", lambda x, y, z: (x**2 + y**2 + z**2) < 3e-4**2)
+    d.tag("N", lambda x, y, z: ((x - 0.05) ** 2 + y**2 + z**2) < 3e-4**2)
+    _i, v, at = ports(d)
+    sol = jno.peec([v(*at("P")) - v(*at("N")) - 1.0], freq=np.array([0.0, 1e8])).solve()
+    assert float(np.asarray(sol.L)[0]) > 1.9 * float(np.asarray(sol.L)[1]) > 0
+    assert d.__dict__.get("_mesh") is None
+
+
+def test_the_two_terminal_spellings_agree():
+    """A pad written as a region (declared first) and as a tag must give the same circuit."""
+    direct, detour = _two_paths()
+    pads = jno.Shape.sphere(0, 0, 0, 3e-4).name("P") + jno.Shape.sphere(0.05, 0, 0, 3e-4).name("N")
+
+    as_region = (pads + direct + detour).domain()
+    _i, v, at = ports(as_region)
+    z_region = jno.peec([v(*at("P")) - v(*at("N")) - 1.0], freq=1e6).solve().Z
+
+    as_tag = (direct + detour).domain()
+    as_tag.tag("P", lambda x, y, z: (x**2 + y**2 + z**2) < 3e-4**2)
+    as_tag.tag("N", lambda x, y, z: ((x - 0.05) ** 2 + y**2 + z**2) < 3e-4**2)
+    _i, v, at = ports(as_tag)
+    z_tag = jno.peec([v(*at("P")) - v(*at("N")) - 1.0], freq=1e6).solve().Z
+
+    assert abs(complex(z_region) - complex(z_tag)) / abs(complex(z_tag)) < 1e-12
+
+
+def test_a_terminal_that_names_no_region_or_tag_says_how_to_declare_one():
+    """`side` is an auto boundary name: it binds, but it marks no part of any conductor."""
+    _wire, d = one_wire()
+    _i, v, at = ports(d)
+    with pytest.raises(ValueError, match="neither a region nor a tag"):
+        jno.peec([v(*at("A")) - v(*at("side")) - 1.0]).solve()
