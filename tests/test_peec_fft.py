@@ -235,18 +235,20 @@ def test_a_frequency_sweep_reuses_the_compilation():
     costs about what the fusion saves."""
     from jno.utils.solver.peec import _KRYLOV_CACHE
 
+    # the cache is module-level and bounded, so other tests both fill and evict it; this test is
+    # about how many entries THIS network adds, so it starts from a known state
+    _KRYLOV_CACHE.clear()
     f = bar_filaments(jno.Shape.box(0, 0, 0, 0.040, 0.004, 0.002), size=(0.002, 0.002, 0.001))
     p = np.asarray(f.nodes)
     a = terminal_nodes(f, lambda q: q[:, 0] < p[:, 0].min() + 1e-9)
     b = terminal_nodes(f, lambda q: q[:, 0] > p[:, 0].max() - 1e-9)
-    before = len(_KRYLOV_CACHE)
     zs = []
     for hz in (1e5, 1e6, 1e7):
         _c, _phi, inj = solve_network(
             f, SIGCU, {"A": a, "B": b}, [("A", "B", 1.0 + 0j)], omega=2 * np.pi * hz, matrix_free=True
         )
         zs.append(complex(1.0 / inj["A"]))
-    assert len(_KRYLOV_CACHE) - before == 1  # three frequencies, one compilation
+    assert len(_KRYLOV_CACHE) == 1  # three frequencies, one compilation
     assert abs(zs[2].imag) > abs(zs[0].imag)  # and they are genuinely different frequencies
 
 
