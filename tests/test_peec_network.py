@@ -54,7 +54,7 @@ def test_parallel_branches_split_by_conductance_at_dc():
     r_of = lambda r: ell / (SIG * np.pi * r**2)
     assert abs(complex(z).real / (1 / (1 / r_of(r1) + 1 / r_of(r2))) - 1) < 1e-12
 
-    thick = np.asarray(f.radius) > 3e-4
+    thick = np.asarray(f.area) > np.pi * 3e-4**2
     i1, i2 = abs(np.asarray(cur)[thick][0]), abs(np.asarray(cur)[~thick][0])
     assert abs(i1 / (i1 + i2) - r1**2 / (r1**2 + r2**2)) < 1e-12  # conductance ~ area
 
@@ -64,7 +64,7 @@ def test_current_abandons_the_low_resistance_path_for_the_low_inductance_one():
     direct = jno.Shape.line([(0, 0, 0), (0.05, 0, 0)], r=1.5e-4)  # short, thin  -> high R, low L
     detour = jno.Shape.line([(0, 0, 0), (0, -0.04, 0), (0.05, -0.04, 0), (0.05, 0, 0)], r=6e-4)
     f = line_filaments([direct, detour], size=0.004)
-    thin = np.asarray(f.radius) < 3e-4
+    thin = np.asarray(f.area) < np.pi * 3e-4**2
     share = lambda c: abs(np.asarray(c)[thin][0]) / (abs(np.asarray(c)[thin][0]) + abs(np.asarray(c)[~thin][0]))
 
     ell = np.asarray(f.length)

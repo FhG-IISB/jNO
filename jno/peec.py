@@ -25,7 +25,14 @@ from __future__ import annotations
 import jax.numpy as jnp
 import numpy as np
 
-from .utils.solver.peec import line_filaments, port_spec, solve_network, terminal_nodes
+from .utils.solver.peec import (
+    Filaments,
+    bar_filaments,
+    line_filaments,
+    port_spec,
+    solve_network,
+    terminal_nodes,
+)
 
 __all__ = ["peec"]
 
@@ -144,17 +151,30 @@ class PEEC:
             sig = self.domain.attached("sigma")
         except KeyError:  # nothing declared it at all, which is the same story as declaring it patchily
             sig = {}
-        shapes, sigmas = [], []
+        lines, line_sig, solids = [], [], []
         for n, sh in conductors.items():
-            node = getattr(sh, "_node", None)
-            if not (isinstance(node, tuple) and node and node[0] == "leaf" and type(node[1]).__name__ == "Line"):
-                raise NotImplementedError(_solid_msg(n))
             if n not in sig:
                 raise ValueError(f"jno.peec: conductor {n!r} has no conductivity. Give it one: .attach(sigma=...).")
-            shapes.append(sh)
-            sigmas.append(float(sig[n]))
-        fil = line_filaments(shapes)
-        return fil, np.asarray(sigmas)[np.asarray(fil.part)], terms
+            node = getattr(sh, "_node", None)
+            kind = type(node[1]).__name__ if (isinstance(node, tuple) and node and node[0] == "leaf") else None
+            if kind == "Line":
+                lines.append(sh)
+                line_sig.append(float(sig[n]))
+            elif kind == "Box":
+                solids.append((sh, float(sig[n])))
+            else:
+                raise NotImplementedError(_shape_msg(n, kind))
+
+        parts, owners = [], []  # (Filaments, per-filament sigma) and the shapes they came from
+        if lines:
+            fl = line_filaments(lines)
+            parts.append((fl, np.asarray(line_sig)[np.asarray(fl.part)]))
+            owners.append(lines)
+        for sh, sg in solids:
+            fb = bar_filaments(sh)
+            parts.append((fb, np.full(len(np.asarray(fb.length)), sg)))
+            owners.append([sh])
+        return (*_weld(parts, owners), terms)
 
     def solve(self):
         """Solve at every frequency and return a :class:`PEECSolution`."""
@@ -174,7 +194,7 @@ class PEEC:
         from .utils.solver.kernel import pair_matrix
 
         part = pair_matrix(fil.pos, fil.mom, lambda r: 1.0 / r, fil.self_g, group=fil.group) * (MU0 / (4 * jnp.pi))
-        res = jnp.asarray(fil.length) / (jnp.asarray(sigma) * jnp.pi * jnp.asarray(fil.radius) ** 2)
+        res = jnp.asarray(fil.length) / (jnp.asarray(sigma) * jnp.asarray(fil.area))
 
         cur = jnp.stack(cur)
         port = jnp.stack([jnp.asarray(p) for p in port])
@@ -209,13 +229,93 @@ class _from_predicate:
         return np.asarray(self._pred(*[pts[:, i] for i in range(pts.shape[1])])).reshape(-1)
 
 
-def _solid_msg(name):
+def _shape_msg(name, kind):
     return (
-        f"jno.peec: region {name!r} is not a Shape.line, and only line conductors are discretised into "
-        "filaments today. A solid needs a bar lattice (the kernel has bar_self and an FFT operator for "
-        "it, but nothing builds one yet). Model the conductor as a polyline tube, or wait for the "
-        "lattice path."
+        f"jno.peec: conductor {name!r} is a {kind or 'CSG'} plan, and only two discretisations exist: a "
+        "Shape.line becomes filaments along its centreline, a Shape.box becomes a lattice of bars. Build "
+        "the conductor from those, or ask for the shape you need."
     )
+
+
+def _weld(parts, owners):
+    """One network from several discretisations, JOINED where the conductors are in contact.
+
+    Each conductor is discretised on its own, so its node numbering is local: welding renumbers and
+    stacks the incidences block-diagonally. That alone leaves the parts electrically separate, and a
+    bond wire landing on a trace would carry no current -- so nodes are then tied where the geometry
+    says the metal touches: a node lying INSIDE another conductor joins that conductor's nearest node.
+
+    Contact is read from the geometry, never invented. Two conductors that merely pass close by stay
+    separate, which is what a clearance is for.
+    """
+    if len(parts) == 1:
+        return parts[0]
+    fils = [f for f, _ in parts]
+    incs = [np.asarray(f.incidence) for f in fils]
+    inc = np.zeros((sum(a.shape[0] for a in incs), sum(a.shape[1] for a in incs)))
+    r = c = 0
+    for a in incs:
+        inc[r : r + a.shape[0], c : c + a.shape[1]] = a
+        r, c = r + a.shape[0], c + a.shape[1]
+    shift = lambda key: _renumber([np.asarray(getattr(f, key)) for f in fils])
+    cat = lambda key: jnp.concatenate([jnp.asarray(getattr(f, key)) for f in fils])
+    nodes = np.concatenate([np.asarray(f.nodes) for f in fils])
+    bounds = np.cumsum([0] + [len(np.asarray(f.nodes)) for f in fils])
+    inc, nodes = _join_contacts(inc, nodes, bounds, owners)
+    welded = Filaments(
+        cat("pos"),
+        cat("mom"),
+        cat("self_g"),
+        shift("group"),
+        jnp.asarray(inc),
+        cat("length"),
+        cat("area"),
+        jnp.asarray(nodes),
+        shift("part"),
+        None,  # a welded network is no longer one lattice; the FFT path takes a single lattice
+    )
+    return welded, np.concatenate([np.asarray(g) for _f, g in parts])
+
+
+def _join_contacts(inc, nodes, bounds, owners):
+    """Tie nodes that lie inside another conductor to that conductor's nearest node."""
+    root = np.arange(len(nodes))
+
+    def find(a):
+        while root[a] != a:
+            root[a] = root[root[a]]
+            a = root[a]
+        return a
+
+    for i in range(len(bounds) - 1):
+        mine = np.arange(bounds[i], bounds[i + 1])
+        for j in range(len(bounds) - 1):
+            if i == j:
+                continue
+            theirs = np.arange(bounds[j], bounds[j + 1])
+            inside = np.zeros(len(mine), dtype=bool)
+            for sh in owners[j]:
+                inside |= np.asarray(sh.contains(nodes[mine])).reshape(-1)
+            for k in np.flatnonzero(inside):
+                a = mine[k]
+                near = theirs[int(np.argmin(((nodes[theirs] - nodes[a]) ** 2).sum(1)))]
+                ra, rb = find(a), find(near)
+                if ra != rb:
+                    root[ra] = rb
+    lab = np.array([find(a) for a in range(len(nodes))])
+    keep, inverse = np.unique(lab, return_inverse=True)
+    merged = np.zeros((len(keep), inc.shape[1]))
+    np.add.at(merged, inverse, inc)
+    return merged, nodes[keep]
+
+
+def _renumber(blocks):
+    """Concatenate integer label blocks, offsetting each so labels stay unique across them."""
+    out, off = [], 0
+    for b in blocks:
+        out.append(b + off)
+        off += int(b.max()) + 1
+    return np.concatenate(out)
 
 
 def peec(constraints, *, freq=0.0):
