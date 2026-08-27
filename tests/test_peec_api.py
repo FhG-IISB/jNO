@@ -66,7 +66,7 @@ def test_joule_is_the_ohmic_loss_of_the_solved_currents():
     _i, v, at = ports(d)
     sol = jno.peec([v(*at("A")) - v(*at("B")) - 1.0]).solve()
     f = line_filaments(wire)
-    r = np.asarray(f.length) / (SIG * np.pi * np.asarray(f.radius) ** 2)
+    r = np.asarray(f.length) / (SIG * np.asarray(f.area))
     assert abs(float(sol.joule) / float((r * np.abs(np.asarray(sol.i)) ** 2).sum()) - 1) < 1e-12
     # and at DC one series path dissipates exactly V*I: the port sees the same watts the filaments do
     assert abs(float(sol.joule) / abs(complex(sol.current("A"))) - 1) < 1e-9
@@ -104,15 +104,6 @@ def test_current_leaves_the_low_resistance_path_at_high_frequency():
     # saturating by 1 MHz. The bounds sit inside those with room, so they pin the effect, not the digits.
     assert ldc > 1.9 * lhf > 0  # current moves to the lower-INDUCTANCE path, so the loop inductance falls
     assert rhf > 3.0 * rdc  # and that path is the thin, resistive one
-
-
-def test_a_solid_conductor_says_so_rather_than_guessing():
-    solid = jno.Shape.box(0, 0, 0, 0.01, 0.01, 0.05, size=0.005).attach(sigma=SIG).name("bar")
-    pads = jno.Shape.sphere(0, 0, 0, 1e-3).name("A") + jno.Shape.sphere(0, 0, 0.05, 1e-3).name("B")
-    d = (solid + pads).domain()
-    _i, v, at = ports(d)
-    with pytest.raises(NotImplementedError, match="only line conductors"):
-        jno.peec([v(*at("A")) - v(*at("B")) - 1.0]).solve()
 
 
 def test_a_conductor_without_a_conductivity_is_named():
