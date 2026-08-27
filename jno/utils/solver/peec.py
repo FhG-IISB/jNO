@@ -574,7 +574,13 @@ def solve_network(
                     M=lambda v: P_inv(v, zd),
                     tol=float(tol),
                     atol=0.0,
-                    restart=min(30, ne + nn),
+                    # A SHORT restart. The block preconditioner is strong — measured against an EXACT
+                    # Z^-1 preconditioner, which converges in one iteration, diag(Z) takes two — so the
+                    # solve needs a couple of cycles and jax builds the whole basis whether or not it
+                    # is needed. Per swept point at 6,806 bars: restart 30 -> 0.342 s, 16 -> 0.308 s,
+                    # 10 -> 0.308 s, 6 -> 0.386 s, 4 -> 0.754 s, all to the same impedance. Below ten
+                    # the cycles outnumber what they save.
+                    restart=min(16, ne + nn),
                     maxiter=400,
                 )[0]
 
@@ -584,10 +590,6 @@ def solve_network(
         else:
             _run = cached
 
-        # A SHORT restart. With the block preconditioner this system converges in a handful of steps,
-        # and jax builds the whole Krylov basis whether or not it is needed: measured at 6,806 bars,
-        # restart 200 took 10.07 s, restart 60 took 2.88 s, restart 20 took 2.14 s — all returning the
-        # same impedance to seven digits. The basis was the cost, not the convergence.
         x = _run(b, jnp.asarray(w), zdiag, Rc)
         resid = jnp.linalg.norm(M_apply(x, w, zdiag, Rc) - b) / jnp.maximum(jnp.linalg.norm(b), 1e-300)
         if not bool(resid < max(1e2 * float(tol), 1e-9)):
