@@ -515,7 +515,12 @@ def solve_network(
         Cj = _bcoo(cval, crow, ccol, (nn, ne + nn))
         el = ccol < ne  # the current columns of the constraint block, for the preconditioner
         CIj = _bcoo(cval[el], crow[el], ccol[el], (nn, ne))
-        Ac = A.T.astype(complex)
+        # The incidence transpose is sparse too — two entries per column, since a filament has two
+        # ends. Left dense it is an ne x nn complex matrix hit twice per Krylov step: at 6,806 bars
+        # that is 303 MB and about 55 ms a step, against a 5.9 ms FFT apply, so it was ten times the
+        # operator it was helping to apply.
+        ar, ac_ = np.nonzero(An)
+        Acj = _bcoo(An[ar, ac_].astype(complex), ac_, ar, (ne, nn))
 
         # The Schur complement of the diagonal of Z. Sparse throughout: CI is current balance, A is
         # the incidence, and their product is graph-Laplacian shaped, so forming and factoring it
@@ -523,7 +528,7 @@ def solve_network(
         # single FFT apply of 3.7 ms). The factorisation is host-side and eager -- a preconditioner
         # only has to accelerate, so nothing differentiable passes through it; the gradient comes from
         # the outer custom_linear_solve.
-        Asp = sp.coo_matrix((An[An != 0], np.nonzero(An)), shape=(nn, ne)).tocsr()
+        Asp = sp.coo_matrix((An[ar, ac_], (ar, ac_)), shape=(nn, ne)).tocsr()
         Dinv = sp.diags(1.0 / np.asarray(zdiag))
         S = (CI @ Dinv @ Asp.T.tocsr() + Cp).tocsc()
         lu = spla.splu(S)
@@ -534,13 +539,13 @@ def solve_network(
 
         def M_apply(x):
             cur, phi = x[:ne], x[ne:]
-            return jnp.concatenate([Rc * cur + (1j * w) * lp_apply(cur) - Ac @ phi, Cj @ x])
+            return jnp.concatenate([Rc * cur + (1j * w) * lp_apply(cur) - Acj @ phi, Cj @ x])
 
         def P_inv(r):
             ri, rp = r[:ne], r[ne:]
             rhs_p = rp - CIj @ (ri / zdiag)
             dphi = jax.pure_callback(_host_solve, shape_out, rhs_p)
-            return jnp.concatenate([(ri + Ac @ dphi) / zdiag, dphi])
+            return jnp.concatenate([(ri + Acj @ dphi) / zdiag, dphi])
 
         # A SHORT restart. With the block preconditioner this system converges in a handful of steps,
         # and jax builds the whole Krylov basis whether or not it is needed: measured at 6,806 bars,
