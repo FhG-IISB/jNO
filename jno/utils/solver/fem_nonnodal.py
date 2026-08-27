@@ -338,6 +338,18 @@ def assemble_fem_nonnodal(
     neural_param_names, _neural_models = _neural.param_names, _neural.models
     _param_and_neural_exprs = neural_operator_exprs(_rt_param_exprs, _neural)
 
+    # Trainable mesh coordinates (`domain.variable(region).trainable()`) -- the shape-derivative
+    # handle. They are scattered into the geometry points before the cell Jacobian is formed, so
+    # d(solve)/dX flows through the ordinary assembly. They ride `runtime_parameter_exprs` (so crux
+    # discovers them and their value arrives in `args`) but stay OUT of `runtime_parameter_tags`:
+    # they are not term coefficients, and `rt_scalar` must not pack them. Collected after
+    # `runtime_parameter_tags` is frozen above, which keeps that separation automatic.
+    _coord_specs: List[Tuple[Any, int, str]] = []
+    for _cspec in getattr(domain, "_trainable_coords", None) or []:
+        _cname = str(_cspec["name"])
+        _param_and_neural_exprs = {**_param_and_neural_exprs, _cname: _cspec["expr"]}
+        _coord_specs.append((jnp.asarray(_cspec["ids"], dtype=jnp.int32), int(_cspec["axis"]), _cname))
+
     # Simplex dimension from the mesh: 2D triangle vs 3D tetrahedron. The edge (RT/N1E) push-forward and
     # topology are dimension-agnostic; the vertex families (Hermite/Argyris/Morley) and RT are 2D-only, so
     # in 3D only Nédélec (N1E, edge/H(curl)) is wired -- everything else raises rather than silently mis-map.
@@ -350,6 +362,22 @@ def assemble_fem_nonnodal(
             "which A alone cannot express. RT / P0 / Hermite / Argyris / Morley are 2D-triangle only."
         )
     pts = jnp.asarray(np.asarray(domain.mesh.points))[:, :dim]
+
+    def _apply_coord_params(p, args):
+        """Scatter trainable coordinate parameters into the geometry points.
+
+        A no-op without them. With them, the returned points are TRACED, so the cell Jacobian, detJ
+        and the quadrature coordinates downstream all become differentiable in the node positions --
+        which is the whole shape derivative. The static `pts` above is still what every DOF-locating
+        helper (Dirichlet pins, surface bucketing) uses: those pick *which* DOFs, not *where*, and
+        must stay concrete."""
+        if not _coord_specs or args is None:
+            return p
+        for _ids, _axis, _name in _coord_specs:
+            if _name in args:
+                p = p.at[_ids, _axis].set(jnp.asarray(args[_name], dtype=p.dtype).reshape(-1))
+        return p
+
     cells = np.asarray(domain.mesh.cells_dict["tetra" if dim == 3 else "triangle"], dtype=np.int64)
     n_cells = int(cells.shape[0])
     n_verts = int(pts.shape[0])
@@ -580,8 +608,21 @@ def assemble_fem_nonnodal(
         tangent."""
         return [u_blocks[i][cdofs[i][c] - offs[i]] for i in range(len(fields))]
 
-    def _cell_fields(c, cell_sols):
-        verts = pts[cells_j[c]]
+    def _cell_fields(c, cell_sols, pts_dyn=None):
+        # `pts_dyn` is the coordinate-parameter-scattered geometry; it defaults to the static mesh.
+        # Defaulting is REFUSED when coordinates are trainable rather than silently falling back --
+        # a static fallback there returns a shape derivative of exactly zero, which looks like a
+        # converged design instead of a missing feature.
+        if pts_dyn is None:
+            if _coord_specs:
+                raise NotImplementedError(
+                    "jno.fem (non-nodal): trainable mesh coordinates are threaded through the steady "
+                    "linear assembly only. This residual / transient / nonlinear path still reads the "
+                    "static mesh, so d(solve)/dX would come back as exactly zero. Use a steady linear "
+                    "form, or extend the threading to this path."
+                )
+            pts_dyn = pts
+        verts = pts_dyn[cells_j[c]]
         J = jnp.stack([verts[k] - verts[0] for k in range(1, dim + 1)], axis=1)  # (dim, dim): 2x2 tri / 3x3 tet
         detJ = jnp.linalg.det(J)
         per = []
@@ -689,10 +730,14 @@ def assemble_fem_nonnodal(
             field_vals = {name: jnp.asarray(_a.get(name, _zero_field), dtype=u_flat.dtype) for name in _field_param_names}
             R = jnp.zeros(total, dtype=u_flat.dtype)
             _nt = neural_local_table(_neural, args)  # once per call, not per (term × cell) inside `_cell`
+            # Scatter trainable coordinates once per residual evaluation, not per (term x cell).
+            # The steady linear operator is built FROM this residual (jacfwd -> A, -residual(0) -> b),
+            # so without this the shape derivative is lost before `assemble` is ever reached.
+            _pts_r = _apply_coord_params(pts, _a)
             for coeff, tfi, rnames in typed:
 
-                def _cell(c, e=coeff, _sc=rt_scalar, _fv=field_vals, _rn=rnames):
-                    per, xq, meas = _cell_fields(c, _cell_local_sols(c, u_blocks))
+                def _cell(c, e=coeff, _sc=rt_scalar, _fv=field_vals, _rn=rnames, _p=_pts_r):
+                    per, xq, meas = _cell_fields(c, _cell_local_sols(c, u_blocks), _p)
                     vol_vars = tuple(
                         (_fv[name][cells_j[c]] if name in _field_param_names else _sc[name])  # field: 3 vertex values
                         for name in runtime_parameter_tags
@@ -944,11 +989,12 @@ def assemble_fem_nonnodal(
                 name: jnp.asarray(_a.get(name, _asm_zero_field), dtype=zeros.dtype) for name in _field_param_names
             }
             _nt = neural_local_table(_neural, args)
+            _pts_dyn = _apply_coord_params(pts, _a)  # traced iff coordinates are trainable
 
             def _elem_res(c, la, coeff, tfi, rnames):
                 """This cell's element residual (n_test of field ``tfi``,) from its local dof vector ``la``."""
                 cell_sols = [la[_field_splits[i] : _field_splits[i + 1]] for i in range(len(fields))]
-                per, xq, meas = _cell_fields(c, cell_sols)
+                per, xq, meas = _cell_fields(c, cell_sols, _pts_dyn)
                 vol_vars = tuple(
                     (field_vals[name][cells_j[c]] if name in _field_param_names else rt_scalar[name])
                     for name in runtime_parameter_tags
@@ -1378,7 +1424,12 @@ def assemble_fem_nonnodal(
     # --- steady linear parametric (inverse): re-assemble A(args), b(args) each call, kept differentiable in
     #     the parameter (mirrors the native path); the Dirichlet pins are RE-APPLIED per args. Returns a
     #     FemLinearSystem so `fem.solve()` gives a differentiable trace node crux can optimise. ---
-    if runtime_parameter_tags or neural_param_names:
+    # `_coord_specs` belongs in this gate for the same reason it does in the native assembler: a
+    # trainable mesh coordinate makes the operator parameter-dependent even though it is not a term
+    # COEFFICIENT, so it never appears in `runtime_parameter_tags`. Without it here the assembler
+    # returns a static (A, b) and the shape derivative is silently zero -- which reads as a
+    # converged design rather than a missing feature.
+    if runtime_parameter_tags or neural_param_names or _coord_specs:
         from ...trace import FemLinearSystem
 
         def _assemble_at(args):
@@ -1395,6 +1446,9 @@ def assemble_fem_nonnodal(
         # a neural coefficient rides its stored module)
         _ph = {n: (jnp.zeros((n_verts,)) if n in _field_param_names else 0.0) for n in runtime_parameter_tags}
         _ph.update({n: _neural_models[n].module for n in neural_param_names})
+        # a coordinate parameter's placeholder is the CURRENT node positions, not zeros: `.A` / `.b`
+        # must describe the mesh as it stands, and zeros would collapse those vertices onto the origin.
+        _ph.update({_nm: pts[_ids, _ax] for _ids, _ax, _nm in _coord_specs})
         a0, b0 = _assemble_at(_ph)
         return (
             FemLinearSystem(
