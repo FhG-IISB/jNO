@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from typing import NamedTuple
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -33,6 +34,7 @@ __all__ = [
     "port_spec",
     "terminal_nodes",
     "solve_network",
+    "lattice_apply",
 ]
 
 
@@ -320,7 +322,9 @@ def terminal_nodes(fil: Filaments, where):
     return idx
 
 
-def solve_network(fil: Filaments, sigma, terminals, sources, grounds=(), currents=(), omega=0.0, mu0=4e-7 * np.pi):
+def solve_network(
+    fil: Filaments, sigma, terminals, sources, grounds=(), currents=(), omega=0.0, mu0=4e-7 * np.pi, matrix_free=None
+):
     """Solve the PEEC circuit for a network whose terminals are node SETS.
 
     The general form of :func:`network_impedance`: a terminal is a pad carrying many filament ends,
@@ -344,6 +348,12 @@ def solve_network(fil: Filaments, sigma, terminals, sources, grounds=(), current
         omega: angular frequency, rad/s.
         mu0: permeability of the surrounding medium.
 
+    Args (continued):
+        matrix_free: ``None`` decides by structure — a bar lattice is applied by FFT and solved by
+            GMRES, anything else forms the dense operator and factors it. ``True``/``False`` force
+            one. The dense path costs O(N^2) memory and O(N^3) time, so it is the small-network path;
+            the lattice path costs O(N) and O(N log N) per apply.
+
     Returns:
         ``(cur, phi, inj)`` — filament currents, node potentials, and ``{terminal: injected current}``.
 
@@ -358,8 +368,20 @@ def solve_network(fil: Filaments, sigma, terminals, sources, grounds=(), current
     nn, ne = A.shape
     sig = jnp.broadcast_to(jnp.asarray(sigma, dtype=float), (ne,))
     R = jnp.asarray(fil.length) / (sig * jnp.asarray(fil.area))
-    Lp = pair_matrix(fil.pos, fil.mom, lambda r: 1.0 / r, fil.self_g, group=fil.group) * (mu0 / (4.0 * jnp.pi))
-    Z = jnp.diag(R.astype(complex)) + 1j * float(omega) * Lp
+    on_lattice = getattr(fil, "lattice", None) is not None
+    free_form = on_lattice if matrix_free is None else bool(matrix_free)
+    if free_form and not on_lattice:
+        raise ValueError(
+            "peec.solve_network: matrix_free=True needs a bar lattice, and these filaments are not on "
+            "one. Only a lattice is block-Toeplitz; a polyline's filaments are not, and welding several "
+            "conductors breaks the structure even where each part had it."
+        )
+    if free_form:
+        lp_apply = lattice_apply(fil, lambda r: 1.0 / r, mu_scale=mu0 / (4.0 * jnp.pi))
+        Z = None
+    else:
+        Lp = pair_matrix(fil.pos, fil.mom, lambda r: 1.0 / r, fil.self_g, group=fil.group) * (mu0 / (4.0 * jnp.pi))
+        Z = jnp.diag(R.astype(complex)) + 1j * float(omega) * Lp
 
     names = list(terminals)
     idx = {t: np.asarray(terminals[t], dtype=int) for t in names}
@@ -411,7 +433,8 @@ def solve_network(fil: Filaments, sigma, terminals, sources, grounds=(), current
 
     free = jnp.asarray(np.array([n for n in range(nn) if n not in owner], dtype=int))
     rows, rhs = [], []
-    rows.append(jnp.concatenate([Z, -A.T.astype(complex)], axis=1))
+    if not free_form:
+        rows.append(jnp.concatenate([Z, -A.T.astype(complex)], axis=1))
     rhs.append(jnp.zeros(ne, dtype=complex))
     if free.size:  # current balance away from the terminals
         rows.append(jnp.concatenate([A[free].astype(complex), jnp.zeros((free.size, nn), dtype=complex)], axis=1))
@@ -440,13 +463,53 @@ def solve_network(fil: Filaments, sigma, terminals, sources, grounds=(), current
             r = r.at[:ne].set(A[idx[t]].sum(0).astype(complex))
             rhs.append(jnp.asarray(g, dtype=complex))
         rows.append(r[None, :])
-    M = jnp.concatenate(rows, axis=0)
     b = jnp.concatenate([jnp.atleast_1d(x) for x in rhs])
-    if M.shape[0] != M.shape[1]:
-        raise ValueError(f"jno.peec: built a {M.shape[0]}x{M.shape[1]} system; this is a bug, please report it.")
-
     _refuse_disconnected(np.asarray(A), idx, sources, grounds, currents)
-    x = jnp.linalg.solve(M, b)
+
+    if free_form:
+        C = jnp.concatenate(rows, axis=0)  # the constraint block: KCL, terminal ties, port rows
+        if C.shape != (nn, ne + nn):
+            raise ValueError(f"jno.peec: constraint block is {C.shape}, expected {(nn, ne + nn)}; this is a bug.")
+        CI, Cp = C[:, :ne], C[:, ne:]
+        Ac = A.T.astype(complex)
+        w = float(omega)
+        Rc = R.astype(complex)
+        zdiag = Rc + (1j * w) * jnp.asarray(_lattice_diag(fil, mu0))
+
+        def M_apply(x):
+            cur, phi = x[:ne], x[ne:]
+            return jnp.concatenate([Rc * cur + (1j * w) * lp_apply(cur) - Ac @ phi, C @ x])
+
+        # A block preconditioner, because row scaling is not enough. [[Z, -A'], [C_I, C_phi]] is a
+        # saddle point whose conditioning comes from the coupling rather than the physics -- measured
+        # at 2.8e+16 where Z alone is 1.9e+03 -- and GMRES on the scaled rows stalls past a few hundred
+        # bars. Replacing Z by its diagonal makes the block factorisation exact and cheap: the Schur
+        # complement S = C_I D^-1 A' + C_phi is formed and factored ONCE, and it is a NODE-sized matrix,
+        # so the element count stays matrix-free. A nested Krylov solve would be the textbook
+        # alternative and jax refuses it: custom_linear_solve cannot appear inside another's operator.
+        S = CI @ (Ac / zdiag[:, None]) + Cp
+        lu = jax.scipy.linalg.lu_factor(S)
+
+        def P_inv(r):
+            ri, rp = r[:ne], r[ne:]
+            dphi = jax.scipy.linalg.lu_solve(lu, rp - CI @ (ri / zdiag))
+            return jnp.concatenate([(ri + Ac @ dphi) / zdiag, dphi])
+
+        x, _ = jax.scipy.sparse.linalg.gmres(
+            M_apply, b, M=P_inv, tol=1e-11, atol=0.0, restart=min(200, ne + nn), maxiter=50
+        )
+        resid = jnp.linalg.norm(M_apply(x) - b) / jnp.maximum(jnp.linalg.norm(b), 1e-300)
+        if not bool(resid < 1e-6):
+            raise ValueError(
+                f"jno.peec: the matrix-free solve did not converge (relative residual {float(resid):.2e}). "
+                "Report it rather than trusting the numbers; the dense path is available as "
+                "matrix_free=False for a network small enough to form."
+            )
+    else:
+        M = jnp.concatenate(rows, axis=0)
+        if M.shape[0] != M.shape[1]:
+            raise ValueError(f"jno.peec: built a {M.shape[0]}x{M.shape[1]} system; this is a bug, please report it.")
+        x = jnp.linalg.solve(M, b)
     if not bool(jnp.all(jnp.isfinite(x))):
         raise ValueError(
             "jno.peec: the circuit equations are singular — the solve returned non-finite currents. "
@@ -522,16 +585,17 @@ def bar_filaments(shape, size: float = None, quad: int = 3):
     The cell count per axis is ``max(1, round(extent / size))``, so the pitch is the extent divided
     by a whole number rather than ``size`` exactly -- a lattice has to close on the box.
     """
-    prim = _leaf(shape, "Box")
     h = float(size if size is not None else (shape._size if shape._size is not None else 0.0))
     if h <= 0:
         raise ValueError(
             "peec.bar_filaments: no cell pitch. Pass size=, or give the Shape a size= when you build "
             "it — a lattice count cannot be guessed from the geometry alone."
         )
-    lo = np.array([prim.x0, prim.y0, prim.z0], dtype=float)
-    hi = np.array([prim.x1, prim.y1, prim.z1], dtype=float)
+    bnd = np.asarray(shape.bounds(), dtype=float).reshape(2, -1)
+    lo, hi = np.zeros(3), np.zeros(3)
+    lo[: bnd.shape[1]], hi[: bnd.shape[1]] = bnd[0], bnd[1]
     ext = hi - lo
+    ext = np.where(ext > 0, ext, h)  # a flat axis is one cell thick
     n = np.maximum(1, np.round(ext / h).astype(int))
     d = ext / n  # cell pitch per axis, closing exactly on the box
     if not np.all(np.isfinite(d)) or np.any(d <= 0):
@@ -542,18 +606,34 @@ def bar_filaments(shape, size: float = None, quad: int = 3):
             "joins two cells and no current can flow. Use a smaller size=."
         )
 
-    # nodes at cell centres, indexed (i, j, k) -> i*ny*nz + j*nz + k
+    # A regular grid over the BOUNDING BOX, then a mask: the grid deliberately ignores the shape, so
+    # an L-shaped trace or a slot is a pattern of absent cells rather than a distorted mesh. That is
+    # what keeps the operator translation-invariant, and therefore what keeps the FFT applicable.
     ijk = np.stack(np.meshgrid(*[np.arange(v) for v in n], indexing="ij"), axis=-1).reshape(-1, 3)
-    nodes = lo + (ijk + 0.5) * d
-    nid = np.arange(len(nodes)).reshape(tuple(n))
+    centres = lo + (ijk + 0.5) * d
+    keep = np.asarray(shape.contains(centres)).reshape(-1)
+    if not keep.any():
+        raise ValueError(
+            f"peec.bar_filaments: a pitch of {h} put no cell centre inside this conductor. Use a smaller "
+            "size=; a cell has to fit within the geometry for the lattice to see it at all."
+        )
+    nid = np.full(int(np.prod(n)), -1)
+    nid[np.flatnonzero(keep)] = np.arange(int(keep.sum()))
+    nid = nid.reshape(tuple(n))
+    nodes = centres[keep]
 
-    cen, tan, ln, area, ends, axis = [], [], [], [], [], []
+    cen, tan, ln, area, ends, axis, masks = [], [], [], [], [], [], {}
     for ax in range(3):
         if n[ax] < 2:
             continue
         a = tuple(slice(0, v - 1) if i == ax else slice(None) for i, v in enumerate(n))
         b = tuple(slice(1, v) if i == ax else slice(None) for i, v in enumerate(n))
-        na, nb = nid[a].reshape(-1), nid[b].reshape(-1)
+        ia, ib = nid[a], nid[b]
+        live = (ia >= 0) & (ib >= 0)  # a bar exists only where BOTH cells are metal
+        if not live.any():
+            continue
+        masks[ax] = live
+        na, nb = ia[live].reshape(-1), ib[live].reshape(-1)
         pa, pb = nodes[na], nodes[nb]
         k = len(na)
         u = np.zeros((k, 3))
@@ -563,10 +643,12 @@ def bar_filaments(shape, size: float = None, quad: int = 3):
         tan.append(u)
         ln.append(np.full(k, d[ax]))
         area.append(np.full(k, w * t))
-        ends.append((pa, pb))
+        ends.append((na, nb))
         axis.append(np.full(k, ax))
     if not cen:
-        raise ValueError("peec.bar_filaments: the lattice has no bar in any direction.")
+        raise ValueError(
+            "peec.bar_filaments: no bar joins two cells of this conductor, so no current can flow. Use a smaller size=."
+        )
 
     cen = np.concatenate(cen)
     tan = np.concatenate(tan)
@@ -584,12 +666,10 @@ def bar_filaments(shape, size: float = None, quad: int = 3):
 
     inc = np.zeros((len(nodes), nb))
     off = 0
-    for (pa, pb), ax in zip(ends, sorted(set(axis.tolist()))):
-        k = len(pa)
-        a = tuple(slice(0, v - 1) if i == ax else slice(None) for i, v in enumerate(n))
-        b = tuple(slice(1, v) if i == ax else slice(None) for i, v in enumerate(n))
-        inc[nid[a].reshape(-1), np.arange(off, off + k)] = 1.0
-        inc[nid[b].reshape(-1), np.arange(off, off + k)] = -1.0
+    for na, nb_ in ends:
+        k = len(na)
+        inc[na, np.arange(off, off + k)] = 1.0
+        inc[nb_, np.arange(off, off + k)] = -1.0
         off += k
 
     return Filaments(
@@ -602,5 +682,95 @@ def bar_filaments(shape, size: float = None, quad: int = 3):
         jnp.asarray(area),
         jnp.asarray(nodes),
         np.zeros(nb, dtype=int),
-        {"n": tuple(int(v) for v in n), "d": tuple(float(v) for v in d), "axis": axis},
+        {"n": tuple(int(v) for v in n), "d": tuple(float(v) for v in d), "axis": axis, "masks": masks},
     )
+
+
+def lattice_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3):
+    """``apply(cur) -> Lp @ cur`` for a bar lattice, by FFT, without forming ``Lp``.
+
+    Two facts about a bar lattice make this exact rather than approximate:
+
+    * a bar's current runs along one axis, and ``mom_i . mom_j`` vanishes between perpendicular
+      bars, so ``Lp`` is block diagonal by direction and each family can be applied on its own;
+    * within a family the bars sit on a regular grid and the kernel depends only on their
+      separation, so the block is block-Toeplitz — :func:`~jno.utils.solver.kernel.lattice_operator`
+      applies it in ``O(N log N)`` and ``O(N)`` memory instead of ``O(N^2)`` of both.
+
+    The sub-point quadrature goes into the generator (every bar of a family carries the same offsets,
+    so the double sum still depends only on the separation), which is what makes this agree with
+    :func:`~jno.utils.solver.kernel.pair_matrix` to round-off rather than to a one-point rule.
+
+    Args:
+        fil: filaments carrying a ``lattice`` description, from :func:`bar_filaments`.
+        g: the kernel, a function of distance.
+        mu_scale: a constant multiplying the result (``mu0 / 4 pi`` for partial inductance).
+        quad: sub-points per bar; must match the discretisation's own.
+    """
+    from .kernel import lattice_operator
+
+    lat = getattr(fil, "lattice", None)
+    if lat is None:
+        raise ValueError(
+            "peec.lattice_apply: these filaments do not sit on a lattice. Only a bar lattice from "
+            "bar_filaments is block-Toeplitz; a polyline's filaments are not, and welding several "
+            "conductors together breaks the structure even when each part had it."
+        )
+    n, d, axis = lat["n"], lat["d"], np.asarray(lat["axis"])
+    ln = np.asarray(fil.length)
+    gx, gw = np.polynomial.legendre.leggauss(int(quad))
+
+    masks = lat.get("masks") or {}
+    ops, slices, shapes, where = [], [], [], []
+    start = 0
+    for ax in sorted(set(axis.tolist())):
+        k = int((axis == ax).sum())
+        shape = tuple(v - 1 if i == ax else v for i, v in enumerate(n))
+        length = float(ln[axis == ax][0])
+        sub = np.zeros((int(quad), 3))
+        sub[:, ax] = 0.5 * length * gx
+        w = length * gw * 0.5
+        sg = float(np.asarray(fil.self_g)[axis == ax][0])
+        ops.append(lattice_operator(shape, d, g, sg, sub=sub, w=w))
+        slices.append(slice(start, start + k))
+        shapes.append(shape)
+        m = masks.get(ax)
+        where.append(None if m is None else jnp.asarray(np.flatnonzero(np.asarray(m).reshape(-1))))
+        start += k
+    if start != len(ln):
+        raise ValueError(f"peec.lattice_apply: the families cover {start} of {len(ln)} bars; this is a bug.")
+
+    def real_apply(cur):
+        out = []
+        for op, sl, sh, idx in zip(ops, slices, shapes, where):
+            x = cur[sl]
+            if idx is None:
+                out.append(op(x.reshape(sh)).reshape(-1))
+            else:
+                # Absent cells carry no current, so scatter into the FULL family grid, apply, and read
+                # back only the live slots. Masking this way is what lets a hole or an L-shape keep the
+                # translation invariance the FFT needs — the grid stays full, the current does not.
+                # unique/sorted are true by construction (flatnonzero), and saying so is what makes the
+                # scatter transposable — reverse mode refuses an unproven one.
+                full = jnp.zeros(int(np.prod(sh)), x.dtype).at[idx].set(x, unique_indices=True, indices_are_sorted=True)
+                out.append(op(full.reshape(sh)).reshape(-1)[idx])
+        return jnp.concatenate(out)
+
+    def apply(cur):
+        cur = jnp.asarray(cur)
+        # Lp is real, and the circulant embedding uses rfftn, which will not take a complex array.
+        # A complex current is therefore applied through its parts: Lp(a + ib) = Lp a + i Lp b.
+        if jnp.iscomplexobj(cur):
+            return mu_scale * (real_apply(jnp.real(cur)) + 1j * real_apply(jnp.imag(cur)))
+        return mu_scale * real_apply(cur)
+
+    return apply
+
+
+def _lattice_diag(fil: Filaments, mu0: float):
+    """``Lp_aa`` for every bar — the diagonal a Jacobi preconditioner needs, without forming ``Lp``."""
+    mom = np.asarray(fil.mom)
+    grp = np.asarray(fil.group)
+    tot = np.zeros((int(grp.max()) + 1, mom.shape[1]))
+    np.add.at(tot, grp, mom)
+    return np.asarray(fil.self_g) * (tot * tot).sum(1) * (mu0 / (4.0 * np.pi))
