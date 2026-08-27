@@ -848,7 +848,8 @@ def bar_filaments(shape, size=None, quad: int = 3, sigma=None):
     # one material that degenerates to the material, and only a genuine mismatch changes anything.
     bar_sigma = None
     if sigma is not None:
-        sg = np.asarray(sigma, dtype=float)
+        # jnp, not numpy: a conductivity may be traced (sigma(T) in an electro-thermal loop)
+        sg = jnp.stack([jnp.asarray(v) for v in sigma]) if isinstance(sigma, (list, tuple)) else jnp.asarray(sigma)
         if sg.size != len(shapes):
             raise ValueError(f"peec.bar_filaments: {sg.size} conductivities for {len(shapes)} conductors.")
         s0, s1 = sg[owner[:, 0]], sg[owner[:, 1]]

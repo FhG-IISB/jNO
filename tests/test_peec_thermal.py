@@ -85,3 +85,61 @@ def test_a_solution_without_a_breakdown_says_so():
     sol._owner = None
     with pytest.raises(ValueError, match="no per-conductor breakdown"):
         sol.dissipation()
+
+
+def _sigma_of(T, sig0=SIG, t0=293.15, alpha=0.00393):
+    """Copper: resistivity rises about linearly, so conductivity falls."""
+    return sig0 / (1.0 + alpha * (T - t0))
+
+
+def _solve_at(sig):
+    """One pass of the loop: EM at the given conductivities, then the thermal solve it drives."""
+    tr = lambda x0, x1, nm: jno.Shape.box(x0, 0, 0.001, x1, 0.004, 0.0015, size=HOST).attach(sigma=sig[nm], k=K_CU).name(nm)
+    wire = (
+        jno.Shape.line([(0.007, 0.002, 0.0015), (0.010, 0.002, 0.004), (0.013, 0.002, 0.0015)], r=RAD, size=HOST)
+        .attach(sigma=sig["W"], k=K_CU)
+        .name("W")
+    )
+    d = (tr(0, 0.008, "A") + tr(0.012, 0.020, "B") + wire).domain()
+    d.tag("P", lambda x, y, z: x < 0.0011)
+    d.tag("N", lambda x, y, z: x > 0.0189)
+    emag = solved(d)
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        _ = d.mesh
+    T, phi = d.fem_symbols()
+    xi, yi, zi = d.variable("interior", split=True)[:3]
+    Ti, si = T.bind(x=xi, y=yi, z=zi), phi.bind(x=xi, y=yi, z=zi)
+    xn, yn, zn = d.variable("N", split=True)[:3]
+    g2 = lambda u, w: u.x * w.x + u.y * w.y + u.z * w.z
+    Q = d.by_region({k: float(x) for k, x in emag.dissipation().items()}, default=0.0)
+    fem = jno.fem([d.k * g2(Ti, si) - Q * si, T(xn, yn, zn) - 300.0])
+    Th = np.asarray(fem.solve()).reshape(-1)
+    pts = np.asarray(fem.points)
+    tmean = {}
+    for nm, sh in dict(d._shape_regions).items():
+        m = np.asarray(sh.contains(pts)).reshape(-1)
+        tmean[nm] = float(Th[m].mean()) if m.any() else float(Th.mean())
+    return emag, Th, tmean
+
+
+def test_a_conductivity_may_be_temperature_dependent_and_the_loop_closes():
+    """sigma(T) is what makes the coupling two-way, and it is not a small correction.
+
+    Current heats the conductor, the conductor's conductivity falls, its resistance rises, and it
+    heats harder. Measured here over a 29 K rise: R and the losses both rise 9.4 %, and the fixed
+    point is reached in a handful of passes. On a module running at 100 C-plus the correction is
+    several times larger — copper is about 31 % more resistive at 100 C than at 20 C.
+    """
+    sig = {n: SIG for n in ("A", "B", "W")}
+    cold, _th, tmean = _solve_at(sig)
+    r_cold = float(cold.R)
+
+    hist = [r_cold]
+    for _ in range(5):
+        sig = {n: float(_sigma_of(tmean[n])) for n in sig}
+        emag, _th, tmean = _solve_at(sig)
+        hist.append(float(emag.R))
+
+    assert all(s < SIG for s in sig.values())  # every conductor ran hot, so every sigma fell
+    assert hist[-1] > 1.05 * r_cold  # and the resistance rose meaningfully for it
+    assert abs(hist[-1] / hist[-2] - 1) < 1e-3  # the fixed point is reached, not merely approached
