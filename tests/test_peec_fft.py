@@ -1,5 +1,10 @@
 """The FFT path: the same operator as the dense one, applied without forming it.
 
+The dense-vs-matrix-free comparisons pass an explicit tight ``tol``: they are checking that the two
+paths are the same OPERATOR, and the default tolerance is set where the time curve is flat rather
+than where the residual is smallest, so it would otherwise bound the agreement rather than the
+operator doing so.
+
 A bar lattice is block-Toeplitz within each current direction, so the partial-inductance apply is an
 FFT. That is only worth having if it is the SAME operator, so every case here checks the matrix-free
 result against the dense one built by ``pair_matrix``.
@@ -79,7 +84,7 @@ def test_the_matrix_free_solve_agrees_with_the_dense_one(pitch):
     got = {}
     for mf in (False, True):
         cur, _phi, inj = solve_network(
-            f, SIG, {"A": a, "B": b}, [("A", "B", 1.0 + 0j)], omega=2 * np.pi * 1e6, matrix_free=mf
+            f, SIG, {"A": a, "B": b}, [("A", "B", 1.0 + 0j)], omega=2 * np.pi * 1e6, matrix_free=mf, tol=1e-12
         )
         got[mf] = (complex(1.0 / inj["A"]), np.asarray(cur))
     assert abs(got[True][0] - got[False][0]) / abs(got[False][0]) < 1e-11
@@ -139,11 +144,23 @@ def test_several_solids_share_one_grid():
     assert np.linalg.norm(np.asarray(lattice_apply(f, INV_R)(x)) - k @ x) / np.linalg.norm(k @ x) < 1e-13
 
 
-def test_a_bar_spanning_two_materials_is_refused():
+def test_a_bar_straddling_two_conductors_takes_them_in_series():
+    """Touching conductors are normal — a strap shorting two plates is the usual case, not an error.
+
+    Half the bar lies in each, so its conductivity is the series (harmonic) mean: for one material
+    that degenerates to the material, and only a genuine mismatch changes anything.
+    """
     a = jno.Shape.box(0, 0, 0, 0.010, 0.006, 0.001)
-    b = jno.Shape.box(0.010, 0, 0, 0.020, 0.006, 0.001)  # touching, so a bar would straddle them
-    with pytest.raises(NotImplementedError, match="spans a material interface"):
-        bar_filaments([a, b], size=(0.002, 0.002, 0.001))
+    b = jno.Shape.box(0.010, 0, 0, 0.020, 0.006, 0.001)  # touching, so a bar straddles them
+    with pytest.raises(ValueError, match="its conductivity depends on both"):
+        bar_filaments([a, b], size=(0.002, 0.002, 0.001))  # ambiguous without conductivities
+
+    f = bar_filaments([a, b], size=(0.002, 0.002, 0.001), sigma=[SIGCU, SIGCU / 3])
+    per = np.asarray(f.lattice["sigma"])
+    assert np.isclose(per.max(), SIGCU) and np.isclose(per.min(), SIGCU / 3)
+    straddling = per[(per != SIGCU) & (per != SIGCU / 3)]
+    assert len(straddling) > 0
+    assert np.allclose(straddling, 2 * SIGCU * (SIGCU / 3) / (SIGCU + SIGCU / 3))
 
 
 def test_a_welded_network_keeps_each_block_structure():
@@ -178,7 +195,7 @@ def test_the_stitched_solve_agrees_with_the_dense_one():
     got = {}
     for mf in (False, True):
         cur, _phi, inj = solve_network(
-            fil, sigma, nodes, pe.sources, pe.grounds, pe.currents, omega=2 * np.pi * 1e6, matrix_free=mf
+            fil, sigma, nodes, pe.sources, pe.grounds, pe.currents, omega=2 * np.pi * 1e6, matrix_free=mf, tol=1e-12
         )
         got[mf] = (complex(1.0 / inj["A"]), np.asarray(cur))
     assert abs(got[True][0] - got[False][0]) / abs(got[False][0]) < 1e-12
