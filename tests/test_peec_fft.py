@@ -11,7 +11,14 @@ import pytest
 
 import jno
 from jno.utils.solver.kernel import pair_matrix
-from jno.utils.solver.peec import bar_filaments, lattice_apply, line_filaments, solve_network, terminal_nodes
+from jno.utils.solver.peec import (
+    bar_filaments,
+    lattice_apply,
+    line_filaments,
+    solve_network,
+    terminal_nodes,
+    welded_apply,
+)
 
 jax.config.update("jax_enable_x64", True)
 
@@ -84,7 +91,7 @@ def test_filaments_off_a_lattice_refuse_the_fft():
     f = line_filaments(jno.Shape.line([(0, 0, 0), (0, 0, 0.05)], r=5e-4, size=0.005))
     with pytest.raises(ValueError, match="do not sit on a lattice"):
         lattice_apply(f, INV_R)
-    with pytest.raises(ValueError, match="matrix_free=True needs a bar lattice"):
+    with pytest.raises(ValueError, match="needs a lattice somewhere in the network"):
         solve_network(f, SIG, {"A": np.array([0]), "B": np.array([1])}, [("A", "B", 1.0 + 0j)], matrix_free=True)
 
 
@@ -102,3 +109,77 @@ def test_mutual_inductance_is_what_makes_the_ac_solution_differ_from_dc():
     assert np.count_nonzero(lp - np.diag(np.diag(lp))) > 0  # there ARE mutual terms
     off = np.abs(lp - np.diag(np.diag(lp))).sum()
     assert off > np.abs(np.diag(lp)).sum()  # and they dominate: this is not a diagonal model
+
+
+SIGCU = 5.8e7
+
+
+def _trace_and_wire():
+    trace = jno.Shape.box(0, 0, 0, 0.02, 0.004, 0.001, size=(0.001, 0.001, 0.0005)).attach(sigma=SIGCU).name("trace")
+    wire = (
+        jno.Shape.line([(0.019, 0.002, 0.00075), (0.019, 0.002, 0.006), (0.030, 0.002, 0.00075)], r=1.9e-4, size=0.001)
+        .attach(sigma=SIGCU)
+        .name("wire")
+    )
+    d = (trace + wire).domain()
+    d.tag("A", lambda x, y, z: x < 0.0011)
+    d.tag("B", lambda x, y, z: (x > 0.0295) & (z < 0.0011))
+    return d
+
+
+def test_several_solids_share_one_grid():
+    """Separate lattices couple through a block that is not Toeplitz; one grid stays a single FFT."""
+    a = jno.Shape.box(0, 0, 0, 0.020, 0.006, 0.001)
+    b = jno.Shape.box(0.024, 0, 0, 0.044, 0.006, 0.001)
+    f = bar_filaments([a, b], size=(0.002, 0.002, 0.001))
+    assert set(np.unique(np.asarray(f.part)).tolist()) == {0, 1}  # two conductors...
+    assert np.asarray(f.nodes).shape[0] < int(np.prod(f.lattice["n"]))  # ...with the gap masked out
+    k = np.asarray(pair_matrix(f.pos, f.mom, INV_R, f.self_g, group=f.group))
+    x = np.random.default_rng(0).normal(size=k.shape[0])
+    assert np.linalg.norm(np.asarray(lattice_apply(f, INV_R)(x)) - k @ x) / np.linalg.norm(k @ x) < 1e-13
+
+
+def test_a_bar_spanning_two_materials_is_refused():
+    a = jno.Shape.box(0, 0, 0, 0.010, 0.006, 0.001)
+    b = jno.Shape.box(0.010, 0, 0, 0.020, 0.006, 0.001)  # touching, so a bar would straddle them
+    with pytest.raises(NotImplementedError, match="spans a material interface"):
+        bar_filaments([a, b], size=(0.002, 0.002, 0.001))
+
+
+def test_a_welded_network_keeps_each_block_structure():
+    d = _trace_and_wire()
+    _i, v = d.peec_symbols()
+    at = lambda t: d.variable(t, split=True, sample=(4, None))[:3]
+    pe = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e6)
+    fil, _sigma, _terms = pe._discretise()
+    kinds = [lat is not None for _lo, _hi, lat in fil.lattice["welded"]]
+    assert kinds == [False, True]  # the wire's filaments dense, the trace's bars a lattice
+
+
+def test_the_stitched_apply_is_the_dense_operator():
+    """The cross block is neither Toeplitz nor square, so it is evaluated rather than stored."""
+    d = _trace_and_wire()
+    _i, v = d.peec_symbols()
+    at = lambda t: d.variable(t, split=True, sample=(4, None))[:3]
+    fil, _s, _t = jno.peec([v(*at("A")) - v(*at("B")) - 1.0])._discretise()
+    k = np.asarray(pair_matrix(fil.pos, fil.mom, INV_R, fil.self_g, group=fil.group))
+    x = np.random.default_rng(2).normal(size=k.shape[0])
+    got = np.asarray(welded_apply(fil, INV_R)(x))
+    assert np.linalg.norm(got - k @ x) / np.linalg.norm(k @ x) < 1e-13
+
+
+def test_the_stitched_solve_agrees_with_the_dense_one():
+    d = _trace_and_wire()
+    _i, v = d.peec_symbols()
+    at = lambda t: d.variable(t, split=True, sample=(4, None))[:3]
+    pe = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e6)
+    fil, sigma, terms = pe._discretise()
+    nodes = {t: terminal_nodes(fil, sh) for t, sh in terms.items()}
+    got = {}
+    for mf in (False, True):
+        cur, _phi, inj = solve_network(
+            fil, sigma, nodes, pe.sources, pe.grounds, pe.currents, omega=2 * np.pi * 1e6, matrix_free=mf
+        )
+        got[mf] = (complex(1.0 / inj["A"]), np.asarray(cur))
+    assert abs(got[True][0] - got[False][0]) / abs(got[False][0]) < 1e-12
+    assert np.linalg.norm(got[True][1] - got[False][1]) / np.linalg.norm(got[False][1]) < 1e-9

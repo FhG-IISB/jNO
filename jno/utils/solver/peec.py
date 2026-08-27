@@ -368,16 +368,23 @@ def solve_network(
     nn, ne = A.shape
     sig = jnp.broadcast_to(jnp.asarray(sigma, dtype=float), (ne,))
     R = jnp.asarray(fil.length) / (sig * jnp.asarray(fil.area))
-    on_lattice = getattr(fil, "lattice", None) is not None
-    free_form = on_lattice if matrix_free is None else bool(matrix_free)
-    if free_form and not on_lattice:
+    lat = getattr(fil, "lattice", None)
+    welded = isinstance(lat, dict) and "welded" in lat
+    has_lattice = lat is not None and (not welded or any(b[2] is not None for b in lat["welded"]))
+    free_form = has_lattice if matrix_free is None else bool(matrix_free)
+    if free_form and lat is None:
         raise ValueError(
-            "peec.solve_network: matrix_free=True needs a bar lattice, and these filaments are not on "
-            "one. Only a lattice is block-Toeplitz; a polyline's filaments are not, and welding several "
-            "conductors breaks the structure even where each part had it."
+            "peec.solve_network: matrix_free=True needs a lattice somewhere in the network, and these "
+            "filaments have none. A polyline's filaments are not Toeplitz, so there is no structure to "
+            "exploit and the dense path is the honest one."
         )
     if free_form:
-        lp_apply = lattice_apply(fil, lambda r: 1.0 / r, mu_scale=mu0 / (4.0 * jnp.pi))
+        scale = mu0 / (4.0 * jnp.pi)
+        lp_apply = (
+            welded_apply(fil, lambda r: 1.0 / r, mu_scale=scale)
+            if welded
+            else lattice_apply(fil, lambda r: 1.0 / r, mu_scale=scale)
+        )
         Z = None
     else:
         Lp = pair_matrix(fil.pos, fil.mom, lambda r: 1.0 / r, fil.self_g, group=fil.group) * (mu0 / (4.0 * jnp.pi))
@@ -575,7 +582,10 @@ def bar_filaments(shape, size: float = None, quad: int = 3):
       :func:`~jno.utils.solver.kernel.lattice_operator` applies by FFT.
 
     Args:
-        shape: a ``Shape`` whose plan is a single ``Box`` leaf.
+        shape: a solid ``Shape``, or a SEQUENCE of them. A sequence shares ONE grid, which is the
+            whole point: separate lattices couple through a block that is not Toeplitz, so several
+            conductors on one grid stay a single FFT while several grids do not. Coplanar traces of
+            equal thickness are exactly the case this is for.
         size: cell pitch — one number, or one per axis. Defaults to the shape's own ``size=``.
 
             A per-axis pitch is what makes a real conductor affordable. A power-module trace is
@@ -591,16 +601,30 @@ def bar_filaments(shape, size: float = None, quad: int = 3):
     The cell count per axis is ``max(1, round(extent / size))``, so the pitch is the extent divided
     by a whole number rather than ``size`` exactly -- a lattice has to close on the box.
     """
-    h = size if size is not None else shape._size
+    shapes = list(shape) if isinstance(shape, (list, tuple)) else [shape]
+    declared = [sh._size for sh in shapes if sh._size is not None]
+    # several conductors share one grid, so they share one pitch: the finest asked for, per axis.
+    h = (
+        size
+        if size is not None
+        else (
+            np.min([np.broadcast_to(np.asarray(v, float).reshape(-1), (3,)) for v in declared], axis=0)
+            if declared
+            else None
+        )
+    )
     h = np.broadcast_to(np.asarray(h, dtype=float).reshape(-1), (3,)) if h is not None else np.zeros(3)
     if np.any(h <= 0):
         raise ValueError(
             "peec.bar_filaments: no cell pitch. Pass size=, or give the Shape a size= when you build "
             "it — a lattice count cannot be guessed from the geometry alone."
         )
-    bnd = np.asarray(shape.bounds(), dtype=float).reshape(2, -1)
-    lo, hi = np.zeros(3), np.zeros(3)
-    lo[: bnd.shape[1]], hi[: bnd.shape[1]] = bnd[0], bnd[1]
+    lo, hi = np.full(3, np.inf), np.full(3, -np.inf)
+    for sh in shapes:
+        bnd = np.asarray(sh.bounds(), dtype=float).reshape(2, -1)
+        b0, b1 = np.zeros(3), np.zeros(3)
+        b0[: bnd.shape[1]], b1[: bnd.shape[1]] = bnd[0], bnd[1]
+        lo, hi = np.minimum(lo, b0), np.maximum(hi, b1)
     ext = hi - lo
     ext = np.where(ext > 0, ext, h)  # a flat axis is one cell thick
     n = np.maximum(1, np.round(ext / h).astype(int))
@@ -618,7 +642,12 @@ def bar_filaments(shape, size: float = None, quad: int = 3):
     # what keeps the operator translation-invariant, and therefore what keeps the FFT applicable.
     ijk = np.stack(np.meshgrid(*[np.arange(v) for v in n], indexing="ij"), axis=-1).reshape(-1, 3)
     centres = lo + (ijk + 0.5) * d
-    keep = np.asarray(shape.contains(centres)).reshape(-1)
+    # which conductor owns each cell: the first one containing it, matching how Shape.regions resolves
+    own = np.full(len(centres), -1, dtype=int)
+    for si, sh in enumerate(shapes):
+        inside = np.asarray(sh.contains(centres)).reshape(-1)
+        own = np.where((own < 0) & inside, si, own)
+    keep = own >= 0
     if not keep.any():
         raise ValueError(
             f"peec.bar_filaments: a pitch of {tuple(h)} put no cell centre inside this conductor. Use a "
@@ -629,8 +658,9 @@ def bar_filaments(shape, size: float = None, quad: int = 3):
     nid[np.flatnonzero(keep)] = np.arange(int(keep.sum()))
     nid = nid.reshape(tuple(n))
     nodes = centres[keep]
+    cell_part = own[keep]
 
-    cen, tan, ln, area, ends, axis, masks = [], [], [], [], [], [], {}
+    cen, tan, ln, area, ends, axis, owner, masks = [], [], [], [], [], [], [], {}
     for ax in range(3):
         if n[ax] < 2:
             continue
@@ -653,6 +683,7 @@ def bar_filaments(shape, size: float = None, quad: int = 3):
         area.append(np.full(k, w * t))
         ends.append((na, nb))
         axis.append(np.full(k, ax))
+        owner.append(np.stack([cell_part[na], cell_part[nb]], axis=1))
     if not cen:
         raise ValueError(
             "peec.bar_filaments: no bar joins two cells of this conductor, so no current can flow. Use a smaller size=."
@@ -663,6 +694,15 @@ def bar_filaments(shape, size: float = None, quad: int = 3):
     ln = np.concatenate(ln)
     area = np.concatenate(area)
     axis = np.concatenate(axis)
+    owner = np.concatenate(owner)
+    if not np.all(owner[:, 0] == owner[:, 1]):
+        bad = int(np.flatnonzero(owner[:, 0] != owner[:, 1])[0])
+        raise NotImplementedError(
+            f"peec.bar_filaments: a bar joins cells of conductors {owner[bad, 0]} and {owner[bad, 1]}, so "
+            "it spans a material interface and has no single conductivity. Give the two the same "
+            "material, or leave a cell of clearance between them."
+        )
+    part = owner[:, 0]
     nb = len(ln)
 
     gx, gw = np.polynomial.legendre.leggauss(int(quad))
@@ -689,7 +729,7 @@ def bar_filaments(shape, size: float = None, quad: int = 3):
         jnp.asarray(ln),
         jnp.asarray(area),
         jnp.asarray(nodes),
-        np.zeros(nb, dtype=int),
+        part,
         {"n": tuple(int(v) for v in n), "d": tuple(float(v) for v in d), "axis": axis, "masks": masks},
     )
 
@@ -782,3 +822,110 @@ def _lattice_diag(fil: Filaments, mu0: float):
     tot = np.zeros((int(grp.max()) + 1, mom.shape[1]))
     np.add.at(tot, grp, mom)
     return np.asarray(fil.self_g) * (tot * tot).sum(1) * (mu0 / (4.0 * np.pi))
+
+
+def _sub_slice(fil, lo, hi):
+    """The sub-point rows of ``fil`` belonging to elements ``[lo, hi)``, and their local group labels."""
+    grp = np.asarray(fil.group)
+    m = (grp >= lo) & (grp < hi)
+    return jnp.asarray(np.flatnonzero(m)), jnp.asarray(grp[m] - lo), int(hi - lo)
+
+
+def cross_apply(pos_a, mom_a, grp_a, na, pos_b, mom_b, grp_b, nb, g, scale=1.0, chunk=4096):
+    """``x -> Lp_ab @ x`` and its transpose, without forming the rectangular block.
+
+    Two conductors on different discretisations couple through a block that is neither Toeplitz nor
+    square, so neither the FFT nor a lattice trick applies to it. It does not need them: one side is
+    small (a bond wire is a few hundred filaments against a trace's hundred thousand), so the block is
+    thin and evaluating it per apply costs less than storing it.
+    """
+    pa, ma = jnp.asarray(pos_a), jnp.asarray(mom_a)
+    pb, mb = jnp.asarray(pos_b), jnp.asarray(mom_b)
+    ga, gb = jnp.asarray(grp_a), jnp.asarray(grp_b)
+
+    def forward(x):  # (nb,) -> (na,)
+        xb = jnp.asarray(x)[gb]  # spread the element current onto its sub-points
+        out = jnp.zeros(pa.shape[0], xb.dtype)
+        for lo in range(0, pa.shape[0], chunk):
+            hi = min(lo + chunk, pa.shape[0])
+            d = pa[lo:hi, None, :] - pb[None, :, :]
+            r = jnp.sqrt(jnp.clip((d * d).sum(-1), 1e-300))
+            out = out.at[lo:hi].set(((ma[lo:hi] @ mb.T) * g(r)) @ xb)
+        return scale * jax.ops.segment_sum(out, ga, num_segments=na)
+
+    def transpose(y):  # (na,) -> (nb,)
+        ya = jnp.asarray(y)[ga]
+        out = jnp.zeros(pb.shape[0], ya.dtype)
+        for lo in range(0, pa.shape[0], chunk):
+            hi = min(lo + chunk, pa.shape[0])
+            d = pa[lo:hi, None, :] - pb[None, :, :]
+            r = jnp.sqrt(jnp.clip((d * d).sum(-1), 1e-300))
+            out = out + ((ma[lo:hi] @ mb.T) * g(r)).T @ ya[lo:hi]
+        return scale * jax.ops.segment_sum(out, gb, num_segments=nb)
+
+    return forward, transpose
+
+
+def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3):
+    """``apply(cur) -> Lp @ cur`` for a network of several discretisations, still without forming Lp.
+
+    Each block keeps whatever structure it has -- a lattice by FFT, a set of filaments densely -- and
+    the blocks couple through :func:`cross_apply`. So a trace layer of a hundred thousand bars stays
+    O(N) while the bond wires landing on it stay exact.
+    """
+    from .kernel import pair_matrix
+
+    blocks = getattr(fil, "lattice", None)
+    if not (isinstance(blocks, dict) and "welded" in blocks):
+        raise ValueError("peec.welded_apply: these filaments are not a welded network.")
+    spans = blocks["welded"]
+
+    diag, sel = [], []
+    for lo, hi, lat in spans:
+        rows, gl, cnt = _sub_slice(fil, lo, hi)
+        sub = Filaments(
+            jnp.asarray(fil.pos)[rows],
+            jnp.asarray(fil.mom)[rows],
+            jnp.asarray(fil.self_g)[lo:hi],
+            np.asarray(gl),
+            None,
+            jnp.asarray(fil.length)[lo:hi],
+            jnp.asarray(fil.area)[lo:hi],
+            None,
+            None,
+            lat,
+        )
+        if lat is None:
+            k = pair_matrix(sub.pos, sub.mom, g, sub.self_g, group=sub.group) * mu_scale
+            diag.append(lambda x, k=k: k @ x)
+        else:
+            diag.append(lattice_apply(sub, g, mu_scale=mu_scale, quad=quad))
+        sel.append((lo, hi, rows, gl, cnt))
+
+    cross = {}
+    for i, (loi, hii, ri, gi, ci) in enumerate(sel):
+        for j, (loj, hij, rj, gj, cj) in enumerate(sel):
+            if j <= i:
+                continue
+            cross[(i, j)] = cross_apply(
+                jnp.asarray(fil.pos)[ri],
+                jnp.asarray(fil.mom)[ri],
+                gi,
+                ci,
+                jnp.asarray(fil.pos)[rj],
+                jnp.asarray(fil.mom)[rj],
+                gj,
+                cj,
+                g,
+                scale=mu_scale,
+            )
+
+    def apply(cur):
+        cur = jnp.asarray(cur)
+        out = [d(cur[lo:hi]) for d, (lo, hi, *_r) in zip(diag, sel)]
+        for (i, j), (fwd, tr) in cross.items():
+            out[i] = out[i] + fwd(cur[sel[j][0] : sel[j][1]])
+            out[j] = out[j] + tr(cur[sel[i][0] : sel[i][1]])
+        return jnp.concatenate(out)
+
+    return apply
