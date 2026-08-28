@@ -1198,7 +1198,14 @@ class _AMS(_Spec):
         # per apply. A one-shot solver re-runs its own setup each iteration; to amortize a jaxamg
         # hierarchy across the Krylov loop it needs a setup-once handle (a jaxamg AmgX setup/solve split) —
         # wire that here once exposed. ``csr`` is unused on this path.
-        return lambda op, csr: lambda rhs: aux(op, rhs)
+        #
+        # Through :func:`_as_precond`, so the convergence gate stands down exactly as it does for
+        # :func:`inner`. An auxiliary solve IS a preconditioner application: ``aux=jno.solve.cg(tol=1e-3)``
+        # asks for three digits on purpose and is driven by a flexible outer solver for that reason. A
+        # Krylov aux also has a floor of its own here -- cg stalls at ~6e-4 on the curl-curl auxiliary
+        # whether it is asked for 1e-3 or 1e-6 (see the ``_AMG`` branch above) -- so gating it at 1e-4
+        # refused a configuration the library documents and tests as correct.
+        return lambda op, csr: lambda rhs: _as_precond(aux, op, rhs)
 
     def materialize(self, ctx: PrecondContext):
         f = self._frozen if self._frozen is not None else self._assemble_aux(ctx)  # frozen (built) or eager
