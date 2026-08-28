@@ -139,3 +139,44 @@ def test_block_composition_inherits_complex_native():
     assert bd.complex_native, "block_diag(ams, amg) must be complex-native"
     plain = jno.precond.block_diag(("u", jno.precond.amg()), ("p", jno.precond.amg()))
     assert not plain.complex_native, "without a complex-native child there is nothing to inherit"
+
+
+def _curl_curl(pins=None, size=0.6):
+    """Curl-curl + mass on N1E, optionally with caller-supplied ``(dof, value)`` pins."""
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=size).domain()
+    u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
+    ci = d.variable("interior", split=True)
+    x, y, z = ci[0], ci[1], ci[2]
+    A_, V_ = u.bind(x=x, y=y, z=z), v.bind(x=x, y=y, z=z)
+    cA, cV = u.vector.curl(x, y, z), v.vector.curl(x, y, z)
+    if pins is not None:
+        d._extra_dof_pins = pins
+    return d, jno.fem(
+        [
+            inner(cA, cV) + inner(A_, V_) - inner(vec(1.0 + 0.0 * x, 0.0 * x, 0.0 * x), V_),
+            u.vector.cross(d.variable("boundary", normals=True)),
+        ]
+    )
+
+
+def test_extra_dof_pins_are_applied():
+    """``domain._extra_dof_pins`` is how a caller imposes a gauge the DSL cannot express -- a
+    tree-cotree spanning tree, an air-region restriction. The unpinned values are asserted nonzero
+    first, so this cannot pass by pinning DOFs that were already at the target."""
+    _d, free = _curl_curl()
+    s0 = np.asarray(jno.np.asarray(free.solve())).reshape(-1)
+    assert abs(s0[3]) > 1e-6 and abs(s0[7]) > 1e-6, "unpinned DOFs are already ~0; pick different ones"
+
+    _d, pinned = _curl_curl(pins=[(3, 0.0), (7, 0.5)])
+    s1 = np.asarray(jno.np.asarray(pinned.solve())).reshape(-1)
+    assert abs(s1[3] - 0.0) < 1e-12
+    assert abs(s1[7] - 0.5) < 1e-12
+
+
+def test_out_of_range_extra_dof_pins_raise():
+    """A pin list built against a different mesh or DOF layout would otherwise pin arbitrary DOFs
+    and return a plausible field, so the range check must fail loudly instead."""
+    _d, fem = _curl_curl()
+    ndof = int(np.asarray(jno.np.asarray(fem.b)).size)
+    with pytest.raises(ValueError, match="outside"):
+        _curl_curl(pins=[(ndof + 50, 0.0)])
