@@ -661,7 +661,9 @@ def _is_obviously_nonlinear_in_unknown(domain, expr):
             "getitem",
             "concat",
             "stack",
-            "symgrad",
+            "sym",  # 0.5*(A + A^T) -- linear in A, and `symgrad(u, coords)` IS `sym(grad(u))` fused,
+            "antisym",  # so leaving these out made the same elasticity form linear one way and
+            "symgrad",  # nonlinear the other, paying a Newton solve for an assembled linear system
             "trace",
             "einsum",
             "real",

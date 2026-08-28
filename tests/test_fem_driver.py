@@ -259,3 +259,59 @@ def test_transient_accessor_guards():
     _, steady = _poisson_fem(mesh_size=0.3)
     with pytest.raises(AttributeError):
         _ = steady.M  # transient-only accessor
+
+
+def _elasticity_fem(eps_of, mesh_size=0.15):
+    """Plane-strain elasticity, clamped on the left, under gravity -- built through whichever
+    spelling of the symmetric gradient ``eps_of`` uses."""
+    inner, trace = jno.np.inner, jno.np.trace
+    lam = mu = 1.0
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=mesh_size)
+    xi, yi, _ = d.variable("interior", split=True)
+    xL, yL, _ = d.variable("left", split=True)
+    u, phi = d.fem_symbols(value_shape=(2,))
+    eu, ep = eps_of(u, [xi, yi]), eps_of(phi, [xi, yi])
+    weak = (
+        lam * trace(eu) * trace(ep)
+        + 2.0 * mu * inner(eu, ep, n_contract=2)
+        - inner((0.0, -1.0), phi, n_contract=1)
+    )
+    return jno.fem([weak, u(xL, yL) - (0.0, 0.0)])
+
+
+def test_sym_of_grad_is_linear_like_the_fused_symgrad():
+    """``sym(grad(u))`` and ``symgrad(u, coords)`` are the same tensor, so they must classify the
+    same way. They did not: ``sym`` was missing from the linear-wrapper set the unknown-dependence
+    heuristic consults, so the second spelling of an ordinary linear elasticity was routed to
+    ``fem_residual`` and paid a Newton solve for an assembled linear system.
+
+    ``sym(A) = 0.5*(A + A^T)`` is linear in ``A`` -- and ``symgrad`` IS this composition fused, so
+    the two agreeing is the oracle: same mode, and the same solution to the last bit."""
+    symgrad, sym, grad = jno.np.symgrad, jno.np.sym, jno.np.grad
+
+    fused = _elasticity_fem(lambda w, c: symgrad(w, c))
+    composed = _elasticity_fem(lambda w, c: sym(grad(w, c)))
+
+    assert fused.is_linear, "symgrad elasticity is linear (the case that already worked)"
+    assert composed.is_linear, "sym(grad(u)) is the same tensor, so it is linear too"
+
+    x_fused = np.asarray(fused.solve()).reshape(-1)
+    x_composed = np.asarray(composed.solve()).reshape(-1)
+    assert np.linalg.norm(x_fused) > 1e-6  # not the trivial all-zero solution
+    assert np.allclose(x_fused, x_composed, rtol=1e-10, atol=1e-12)
+
+
+def test_antisym_is_linear_in_the_unknown():
+    """``antisym(A) = 0.5*(A - A^T)`` is the sibling of ``sym`` and just as linear; it was missing
+    from the same set. The rotation term below is linear, so the form must assemble."""
+    inner, antisym, grad = jno.np.inner, jno.np.antisym, jno.np.grad
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2)
+    xi, yi, _ = d.variable("interior", split=True)
+    xL, yL, _ = d.variable("left", split=True)
+    u, phi = d.fem_symbols(value_shape=(2,))
+    wu, wp = antisym(grad(u, [xi, yi])), antisym(grad(phi, [xi, yi]))
+    weak = inner(wu, wp, n_contract=2) + inner(grad(u, [xi, yi]), grad(phi, [xi, yi]), n_contract=2) - inner(
+        (0.0, -1.0), phi, n_contract=1
+    )
+    fem = jno.fem([weak, u(xL, yL) - (0.0, 0.0)])
+    assert fem.is_linear
