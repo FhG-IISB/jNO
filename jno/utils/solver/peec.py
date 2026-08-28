@@ -1203,15 +1203,23 @@ def near_block(fil: Filaments, g, mu_scale=1.0, reach=2.0):
     pairs = np.asarray(list(cKDTree(cen).query_pairs(rad)), dtype=int).reshape(-1, 2)
     if pairs.size == 0:
         return np.zeros(0, int), np.zeros(0, int), np.zeros(0)
-    # the element-to-element term, summed over each pair's sub-points
+    # The element-to-element term, summed over each pair's sub-points — vectorised over pairs, not
+    # looped. Every element carries the same number of sub-points, so the whole thing is one einsum;
+    # as a python loop over 154,000 pairs it cost 1.1 s at 6,800 elements and 2.1 s at 12,300, paid
+    # again at every frequency of a sweep.
     order = np.argsort(grp, kind="stable")
-    starts = np.searchsorted(grp[order], np.arange(ne))
-    ends = np.searchsorted(grp[order], np.arange(ne), side="right")
-    val = np.zeros(len(pairs))
-    for k, (a, b) in enumerate(pairs):
-        ia, ib = order[starts[a] : ends[a]], order[starts[b] : ends[b]]
-        d = pos[ia][:, None, :] - pos[ib][None, :, :]
-        r = np.sqrt((d * d).sum(-1))
-        val[k] = float(((mom[ia] @ mom[ib].T) * g(r)).sum())
-    val *= mu_scale
+    counts = np.bincount(grp, minlength=ne)
+    if counts.min() != counts.max():
+        raise ValueError(
+            "peec.near_block: elements carry different numbers of sub-points, which the vectorised "
+            "quadrature assumes. Discretise the whole network at one `quad`."
+        )
+    q = int(counts[0])
+    P3 = pos[order].reshape(ne, q, 3)
+    M3 = mom[order].reshape(ne, q, 3)
+    pa, pb = P3[pairs[:, 0]], P3[pairs[:, 1]]
+    ma, mb = M3[pairs[:, 0]], M3[pairs[:, 1]]
+    d = pa[:, :, None, :] - pb[:, None, :, :]
+    r = np.sqrt((d * d).sum(-1))
+    val = mu_scale * (np.einsum("pik,pjk->pij", ma, mb) * g(r)).sum((1, 2))
     return pairs[:, 0], pairs[:, 1], val
