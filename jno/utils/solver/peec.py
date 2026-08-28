@@ -502,6 +502,20 @@ def port_spec(constraints, current="i", potential="v"):
     return sources, currents, grounds, devices
 
 
+def _host_z(z):
+    """A concrete stand-in for a device impedance, for the preconditioner only.
+
+    Under ``jax.grad`` a traced Z still has a concrete primal; inside a jaxpr trace it has none, and
+    an electro-thermal fixed point traces everything. The preconditioner only has to accelerate, so
+    it falls back to an IDEAL device -- ``Z = 0``, a short across the terminals. The operator always
+    carries the exact value; only the convergence rate is affected, and the residual check guards it.
+    """
+    try:
+        return complex(np.asarray(jax.lax.stop_gradient(jnp.asarray(z))))
+    except (jax.errors.TracerArrayConversionError, jax.errors.ConcretizationTypeError, TypeError, ValueError):
+        return 0.0 + 0j
+
+
 def _device_impedance(node, current, potential):
     """The ``Z`` in ``Z * i(A)`` -- either factor order, and a bare ``i(A)`` is one ohm."""
     from jno._fem import _scalar_const
@@ -582,6 +596,7 @@ def solve_network(
     grounds=(),
     currents=(),
     devices=(),
+    device_host=None,
     omega=0.0,
     mu0=4e-7 * np.pi,
     matrix_free=None,
@@ -708,9 +723,15 @@ def solve_network(
     # positive one, and current continuity through it at the other. Grounding the far side -- what a
     # source does -- would be wrong here: a device's terminal potential is set by the rest of the
     # network, not chosen.
+    # `zh` is the same impedance for the PRECONDITIONER, which is built on the host. When Z is
+    # traced -- an electro-thermal loop re-impressing R_ds(on) -- it has no value inside the trace,
+    # so the DECLARED one stands in: a preconditioner only has to accelerate, and the nominal design
+    # point is a good approximation of a value that moves a few percent with temperature.
     for a, b_, z in devices:
-        claim(a, ("a device", ("device", a, b_, z)))
-        claim(b_, ("the same device's return", ("devret", a, b_, z)))
+        zh = (device_host or {}).get(a)
+        zh = _host_z(z) if zh is None else complex(zh)
+        claim(a, ("a device", ("device", a, b_, z, zh)))
+        claim(b_, ("the same device's return", ("devret", a, b_, z, zh)))
 
     # a source breaks current balance at its negative side too, so that side needs a row of its own
     floating = [b for _a, b, _g in sources if b not in row]
@@ -733,13 +754,16 @@ def solve_network(
     aval = np.asarray(Asp0[ar, ac_]).reshape(-1)
     rows_of = lambda n: Asp0.indices[Asp0.indptr[n] : Asp0.indptr[n + 1]]
     vals_of = lambda n: Asp0.data[Asp0.indptr[n] : Asp0.indptr[n + 1]]
-    rr, cc, vv, rhs = [], [], [], [np.zeros(ne, dtype=complex)]
+    # `vv` carries the exact values (a device impedance may be TRACED); `vv_h` is the host copy the
+    # near-field preconditioner is built from, which must stay concrete.
+    rr, cc, vv, vv_h, rhs = [], [], [], [], [np.zeros(ne, dtype=complex)]
     r0 = 0
     for n in free:  # current balance away from the terminals
         k, v = rows_of(n), vals_of(n)
         rr.append(np.full(k.size, r0))
         cc.append(k)
         vv.append(v)
+        vv_h.append(v)
         r0 += 1
         rhs.append(np.zeros(1, dtype=complex))
     for t in names:  # a terminal is equipotential: tie its nodes to its first
@@ -748,6 +772,7 @@ def solve_network(
             rr.append(np.array([r0, r0]))
             cc.append(np.array([ne + n, ne + int(ids[0])]))
             vv.append(np.array([1.0, -1.0]))
+            vv_h.append(np.array([1.0, -1.0]))
             r0 += 1
             rhs.append(np.zeros(1, dtype=complex))
     for t in names:  # and one row for the terminal itself
@@ -757,8 +782,9 @@ def solve_network(
             rr.append(np.array([r0, r0]))
             cc.append(np.array([ne + int(idx[a][0]), ne + int(idx[b_][0])]))
             vv.append(np.array([1.0, -1.0]))
+            vv_h.append(np.array([1.0, -1.0]))
         elif kind == "device":  # phi_A - phi_B = Z I_dev,  I_dev = -(A I)_A
-            a, b_, z = rest
+            a, b_, z, zh = rest
             g = 0.0 + 0j
             # (A I)_T is the current injected INTO the metal at T, which is why a source's + terminal
             # reads positive. A device is the other way round: it DRAWS its current out of the metal,
@@ -769,20 +795,33 @@ def solve_network(
             k = np.flatnonzero(col)
             rr.append(np.concatenate([np.array([r0, r0]), np.full(k.size, r0)]))
             cc.append(np.concatenate([np.array([ne + int(idx[a][0]), ne + int(idx[b_][0])]), k]))
-            vv.append(np.concatenate([np.array([1.0, -1.0], dtype=complex), complex(z) * col[k]]))
+            # jnp, not numpy: Z may be TRACED. A device whose impedance depends on the solved state
+            # is the whole electro-thermal feedback -- R_ds(on) rises with the junction it heats.
+            vv.append(
+                jnp.concatenate(
+                    [jnp.array([1.0, -1.0], dtype=complex), jnp.asarray(z, dtype=complex) * jnp.asarray(col[k])]
+                )
+            )
+            # The preconditioner's copy. A traced Z has no value inside a jaxpr trace, and the
+            # preconditioner only has to accelerate -- so it falls back to an IDEAL device, Z = 0,
+            # a short across the terminals. Convergence may suffer; the residual check still guards
+            # the answer, and the OPERATOR above carries the exact traced value either way.
+            vv_h.append(np.concatenate([np.array([1.0, -1.0], dtype=complex), zh * col[k]]))
         elif kind == "devret":  # (A I)_A + (A I)_B = 0 -- what goes in comes out
-            a, b_, _z = rest
+            a, b_, _z, _zh = rest
             g = 0.0 + 0j
             col = np.asarray(Asp0[np.concatenate([idx[a], idx[b_]])].sum(0)).reshape(-1)
             k = np.flatnonzero(col)
             rr.append(np.full(k.size, r0))
             cc.append(k)
             vv.append(col[k])
+            vv_h.append(col[k])
         elif kind == "ground":
             _t, g = rest
             rr.append(np.array([r0]))
             cc.append(np.array([ne + int(idx[t][0])]))
             vv.append(np.array([1.0]))
+            vv_h.append(np.array([1.0]))
         else:  # a fixed injected current, or an open terminal (which is zero injected current)
             _t, g = rest
             col = np.asarray(Asp0[idx[t]].sum(0)).reshape(-1)
@@ -790,11 +829,17 @@ def solve_network(
             rr.append(np.full(k.size, r0))
             cc.append(k)
             vv.append(col[k])
+            vv_h.append(col[k])
         rhs.append(np.atleast_1d(np.asarray(g, dtype=complex)))
         r0 += 1
     if r0 != nn:
         raise ValueError(f"jno.peec: built {r0} constraint rows, expected {nn}; this is a bug.")
-    crow, ccol, cval = np.concatenate(rr), np.concatenate(cc), np.concatenate(vv).astype(complex)
+    crow, ccol = np.concatenate(rr), np.concatenate(cc)
+    cval_h = np.concatenate(vv_h).astype(complex)
+    # The sparsity STRUCTURE is never traced, but a VALUE may be: a device impedance that depends on
+    # the solved state is what an electro-thermal fixed point re-impresses every pass (a SiC die's
+    # R_ds(on) rises ~0.5 %/K). So the values go through jnp and only the pattern stays numpy.
+    cval = jnp.concatenate([jnp.asarray(v, dtype=complex).reshape(-1) for v in vv])
     b = jnp.asarray(np.concatenate(rhs))
     _refuse_disconnected(Asp0, idx, sources, grounds, currents, devices)
 
@@ -806,7 +851,10 @@ def solve_network(
         Rc = R.astype(complex)
         zdiag = Rc + (1j * w) * jnp.asarray(_lattice_diag(fil, mu0))
 
-        C = sp.coo_matrix((cval, (crow, ccol)), shape=(nn, ne + nn)).tocsr()
+        # The preconditioner is built on the host from concrete numbers -- it only has to accelerate,
+        # and no gradient runs through it. Under jax.grad a traced value still has a concrete primal;
+        # inside a jit it has none, and that is worth saying plainly rather than failing in scipy.
+        C = sp.coo_matrix((cval_h, (crow, ccol)), shape=(nn, ne + nn)).tocsr()
         CI, Cp = C[:, :ne], C[:, ne:]
         Cj = _bcoo(cval, crow, ccol, (nn, ne + nn))
         # The incidence transpose is sparse too — two entries per column, since a filament has two
@@ -866,8 +914,15 @@ def solve_network(
         # missed the cache every time -- and appeared the moment `.build()` made the identity stable.
         # Skipping it under a trace costs nothing: XLA caches the compiled executable, so the reuse
         # this was written for (an eager sweep over frequencies) is the only case it was ever paying.
+        # ...and keyed on the CONSTRAINT VALUES too, because the compiled closure captures the
+        # constraint matrix. A device impedance lives in there, so re-solving the same network with a
+        # different Z -- exactly what an electro-thermal loop does every pass -- returned the FIRST
+        # call's operator. It showed up as a solve that would not converge (7.5e-02) rather than as a
+        # wrong answer, but only because the residual check was there to catch it. Like the trace
+        # guard below, this was invisible while every call rediscretised and a fresh network missed
+        # the cache anyway.
         traced = isinstance(jnp.zeros(()), jax.core.Tracer)
-        key = (id(fil), ne, nn, float(tol), int(restart))
+        key = (id(fil), ne, nn, float(tol), int(restart), hash(cval_h.tobytes()))
         entry = None if traced else _KRYLOV_CACHE.get(key)
         cached = entry[1] if (entry is not None and entry[0] is fil) else None
 

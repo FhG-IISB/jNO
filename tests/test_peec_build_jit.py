@@ -214,3 +214,64 @@ def test_building_once_beats_rediscretising(monkeypatch):
     for _ in range(3):
         network().solve()
     assert len(calls) == 3  # the un-built path still pays it every time
+
+
+def device_network(rdev=5e-3):
+    """Two collinear wires with a gap: nothing conducts across it but the device."""
+    ell, rad, gap = 0.05, 5e-4, 0.004
+    lo = jno.Shape.line([(0, 0, 0), (0, 0, ell)], r=rad, size=ell / 10).attach(sigma=SIG).name("lo")
+    hi = jno.Shape.line([(0, 0, ell + gap), (0, 0, 2 * ell + gap)], r=rad, size=ell / 10).attach(sigma=SIG).name("hi")
+    pads = (
+        jno.Shape.sphere(0, 0, 0.0, 2 * rad).name("A")
+        + jno.Shape.sphere(0, 0, ell, 2 * rad).name("M")
+        + jno.Shape.sphere(0, 0, ell + gap, 2 * rad).name("N")
+        + jno.Shape.sphere(0, 0, 2 * ell + gap, 2 * rad).name("B")
+    )
+    d = (lo + hi + pads).domain()
+    i, v = d.peec_symbols()
+    at = lambda t: d.variable(t, split=True, sample=(4, None))[:3]  # noqa: E731
+    return jno.peec([v(*at("A")) - v(*at("B")) - 1.0, v(*at("M")) - v(*at("N")) - rdev * i(*at("M"))], freq=0.0)
+
+
+# --- a device impedance that depends on the solved state -------------------------------------------
+
+
+def test_a_device_impedance_can_be_overridden_at_solve():
+    """A SiC die's R_ds(on) rises ~0.5 %/K, so an electro-thermal loop re-impresses it every pass.
+
+    It cannot be a constant in the constraint list, and rebuilding the network per pass throws away
+    the discretisation. So it is handed in at solve, exactly like `sigma`.
+    """
+    built = device_network().build()
+    ref = complex(built.solve().Z)
+    assert complex(built.solve(devices={}).Z) == ref  # an empty override changes nothing
+    for spelling in (5e-3, jnp.asarray(5e-3), complex(5e-3)):  # scalar, array, complex all land
+        assert complex(built.solve(devices={"M": spelling}).Z) == pytest.approx(ref, rel=1e-12)
+
+
+def test_a_bigger_device_impedance_shows_up_at_the_port():
+    """Series: the device's own resistance adds to the loop, so the port must see it."""
+    built = device_network().build()
+    lo = jnp.real(built.solve(devices={"M": 1e-3}).Z)
+    hi = jnp.real(built.solve(devices={"M": 50e-3}).Z)
+    assert float(hi - lo) == pytest.approx(49e-3, rel=1e-6)  # exactly the difference, nothing else
+
+
+def test_re_solving_with_a_different_device_value_is_not_the_cached_operator():
+    """Regression: the compiled Krylov solve captures the CONSTRAINT MATRIX, and a device impedance
+    lives in it. Keyed only on the network, a second solve at a different Z reused the first call's
+    operator -- surfacing as a solve that would not converge rather than as a wrong number, and only
+    because the residual check was there. Invisible until `.build()` made the network identity stable.
+    """
+    built = device_network().build()
+    a = float(jnp.real(built.solve(devices={"M": 1e-3}).Z))
+    b = float(jnp.real(built.solve(devices={"M": 50e-3}).Z))
+    c = float(jnp.real(built.solve(devices={"M": 1e-3}).Z))  # back again: must not be b's operator
+    assert a == pytest.approx(c, rel=1e-12)
+    assert b - a == pytest.approx(49e-3, rel=1e-6)
+
+
+def test_an_unknown_device_terminal_is_refused():
+    built = device_network().build()
+    with pytest.raises(ValueError, match="names no device of this network"):
+        built.solve(devices={"A": 1e-3})
