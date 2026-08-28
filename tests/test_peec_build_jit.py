@@ -138,6 +138,36 @@ def test_the_eager_cache_still_serves_a_frequency_sweep():
     assert len(_KRYLOV_CACHE) >= 1
 
 
+def test_the_dissipation_readout_jits():
+    """The electro-thermal handoff has to cross into a jit, or no coupled objective can be built.
+
+    `dissipation()` decided which elements a conductor owns by summing their volumes in jnp and
+    reading the total back with `float()`. That is a STRUCTURAL question -- it is answered by the
+    provenance array, on the host -- and asking it in jnp made the whole readout unjittable, which
+    put `jno.core` out of reach for anything thermal.
+    """
+    built = network().build()
+    f = lambda s: built.solve(sigma={"plate": SIG * s}).dissipation()["plate"]  # noqa: E731
+    r = float(f(1.0))
+    assert r > 0
+    assert float(jax.jit(f)(1.0)) == pytest.approx(r, rel=1e-12)
+    # An exact oracle, and one worth stating because the sign is the opposite of the intuition that
+    # "more conductive dissipates less". The drive is a VOLTAGE: at DC, R goes as 1/s while the
+    # current it drives goes as s, so the loss I^2 R goes as s exactly -- d(loss)/ds is +loss at
+    # s = 1. (At 1 MHz the same readout falls with s instead: the loop is inductance-limited, the
+    # current no longer follows sigma, and the surface resistance goes as 1/sqrt(sigma).)
+    for g in (float(jax.grad(f)(1.0)), float(jax.jit(jax.grad(f))(1.0))):
+        assert g == pytest.approx(r, rel=1e-9)
+
+
+def test_dissipation_still_reconciles_with_the_total():
+    """The host-side ownership must select the same elements the jnp mask did: sum(q_r V_r) = joule."""
+    sol = wire_network().build().solve()
+    q, vol, own = sol.dissipation(), np.asarray(sol._vol), np.asarray(sol._owner)
+    total = sum(float(jnp.real(v)) * vol[own == k].sum() for k, (_n, v) in enumerate(q.items()))
+    assert total == pytest.approx(float(sol.joule), rel=1e-10)
+
+
 # --- the conductivity override --------------------------------------------------------------------
 
 
