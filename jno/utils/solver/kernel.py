@@ -252,11 +252,16 @@ def pair_matrix(pos, mom, g: Callable, self_g, group=None):
     ne = int(jnp.max(grp)) + 1
 
     d = pos[:, None, :] - pos[None, :, :]
-    r = jnp.sqrt(jnp.clip((d * d).sum(-1), 0.0))
     same = grp[:, None] == grp[None, :]
-    # substitute before the kernel, then zero the contribution: g may be singular at 0, and masking
-    # afterwards would still differentiate the dead branch (0 * inf = NaN in reverse mode).
-    kk = jnp.where(same, 0.0, g(jnp.where(same, 1.0, r)))
+    # Substitute BEFORE the sqrt, not just before the kernel. A same-element pair sits at zero
+    # separation, d(sqrt)/dx is infinite there, and `where` afterwards differentiates the dead branch
+    # anyway -- so the masked-out entries poisoned the whole gradient with NaN while the VALUE was
+    # perfectly correct. Differentiating w.r.t. the positions themselves is what exposed it; nothing
+    # about the forward operator ever showed it. Same guard as pair_quadratic already carries.
+    r = jnp.sqrt(jnp.where(same, 1.0, (d * d).sum(-1)))
+    # Zero the CONTRIBUTION rather than sending r to infinity: g(inf) -> 0 happens to hold for 1/r,
+    # but a caller-supplied kernel carries no such promise.
+    kk = jnp.where(same, 0.0, g(r))
     sub = (mom @ mom.T) * kk
     # contract sub-points into their elements
     blk = jax.ops.segment_sum(sub, grp, num_segments=ne)
