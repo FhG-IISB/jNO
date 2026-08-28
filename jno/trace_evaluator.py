@@ -974,6 +974,17 @@ class TraceEvaluator:
                 arg_sources.append(False)
 
         flax_mod = expr.model
+
+        # `.derives(expr)`: the value is COMPUTED from the rest of the state, not stored. Dispatched
+        # here, where the parameter would have been read -- once per solve, on the whole field --
+        # so the per-cell / per-node threading downstream sees an ordinary parameter value.
+        _derived = getattr(flax_mod, "_derived_expr", None)
+        if _derived is not None:
+            out = jnp.asarray(self._dispatch(_derived, ctx))
+            if out.ndim == 1 and out.shape[0] > 1 and getattr(flax_mod, "_fem_field", None) is not None:
+                out = out[:, jnp.newaxis]  # the channel axis a field parameter carries; see below
+            return out
+
         model = self.params.get(flax_mod.layer_id)
 
         if model is None:

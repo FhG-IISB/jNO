@@ -365,6 +365,13 @@ class TraceCompiler:
                     if isinstance(arg, Placeholder):
                         visit(arg)
                 flax_mod = node.model
+                # `.derives(expr)`: this parameter's value IS `expr`, so everything the expression
+                # references is a dependency of it -- and has to be visited FIRST, since it is read
+                # to produce this one's value. Without this the referenced models are never
+                # collected and the solve fails with "No model for Model <id>" at evaluation.
+                _derived = getattr(flax_mod, "_derived_expr", None)
+                if isinstance(_derived, Placeholder):
+                    visit(_derived)
                 if flax_mod.layer_id not in seen:
                     seen.add(flax_mod.layer_id)
                     layers.append((flax_mod, node.args))

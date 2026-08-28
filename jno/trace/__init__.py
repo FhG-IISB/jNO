@@ -2034,6 +2034,39 @@ class Model(Placeholder):
         self._trainable_param_mask = None
         return self
 
+    def derives(self, expr):
+        """Take this parameter's value from ``expr`` each solve instead of training it.
+
+        A coupled problem has coefficients that are neither constants nor unknowns: they are
+        *computed* from the rest of the state. The ohmic loss driving a thermal solve is the
+        canonical one -- it is whatever the electromagnetic solve just produced, and re-deriving it
+        is the coupling::
+
+            q = jno.np.parameter(qs, name="q").derives(jno.fn(cell_loss, [rho]))
+            fem = jno.fem([d.k * grad(T) . grad(s) - q * s, T(sink) - 300.0])
+
+        ``expr`` is a trace EXPRESSION, not a value and not a callable: a graph description, so
+        nothing is captured and nothing is stored. It is dispatched wherever the parameter would
+        have been read, which is once per solve at the whole-field level -- never inside the element
+        kernel -- so it may return the parameter's full array and the usual per-cell/per-node
+        threading applies to the result unchanged.
+
+        That is what makes the coupling jittable. A value handed over by mutation (``.update(...)``)
+        would have to be a tracer to carry a gradient, and a tracer stored on a python object
+        belongs to the trace that made it -- reusing one later raises ``UnexpectedTracerError``,
+        far from the cause. An expression has no such problem, and it also keeps the coupling part
+        of the problem statement rather than an ordering of calls.
+
+        A derived parameter is **not trained**: it carries no design freedom of its own, so it takes
+        no optimizer and needs no bounds. It stays a *runtime* parameter rather than a frozen
+        coefficient, because its value still changes every solve.
+        """
+        self._derived_expr = expr
+        self._frozen = True  # not a design variable: its value is computed, never searched
+        self._trainable_param_mask = None
+        self._mask_scope_pending = False
+        return self
+
     def constrain(self, transform: Callable) -> "Model":
         """Apply a paramax reparameterization to trainable parameter leaves.
 
@@ -2931,6 +2964,11 @@ class ModelCall(Placeholder):
 
     def freeze(self):
         self.model.freeze()
+        return self
+
+    def derives(self, expr):
+        """Take this parameter's value from ``expr`` each solve — see :meth:`Model.derives`."""
+        self.model.derives(expr)
         return self
 
     def unfreeze(self):
