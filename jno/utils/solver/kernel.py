@@ -265,7 +265,7 @@ def pair_matrix(pos, mom, g: Callable, self_g, group=None):
     return blk + jnp.diag((Me * Me).sum(1) * jnp.asarray(self_g))
 
 
-def internal_impedance(length, area, skin, round_, omega, sigma, mu0=4e-7 * jnp.pi):
+def internal_impedance(length, area, skin, round_, omega, sigma, mu0=4e-7 * jnp.pi, span=1):
     """Per-element internal impedance, replacing the DC resistance with a shape-aware surface one.
 
     An element's own resistance is not ``rho l / A`` once its transverse size approaches the skin
@@ -288,6 +288,23 @@ def internal_impedance(length, area, skin, round_, omega, sigma, mu0=4e-7 * jnp.
     A SHAPE-AWARE coefficient rather than a flat Leontovich one because the difference is not small:
     on a bond wire the plane-surface approximation is 12.5 % out where the cylindrical form is 0.02 %
     at any ``a / delta``.
+
+    ``span`` -- THE CONDITION THIS FORM DEPENDS ON. Both closed forms describe a conductor whose
+    surfaces are free, so an element may take one only when it IS the whole conductor across its
+    thickness. Stack two elements through a thickness and each still counts the shared interface as
+    an exposed surface, so the pair conducts about twice as well as the single element it replaced.
+    Measured on a 40 x 4 x 2 mm bar at 1 MHz, splitting only the thickness:
+
+        cells through thickness      1        2        4
+        R, if every element takes    1239     620      8717     uOhm
+        the surface form             x1.00    x0.50    x7.03
+
+    ``span`` is the number of elements across the thickness, so ``span == 1`` is the case the forms
+    describe. Anywhere else the element takes ``rho l / A`` instead. That is not a fallback but
+    the right model for a subdivided conductor: the elements then resolve the current distribution
+    themselves, which is what makes them worth having, and the surface impedance exists precisely to
+    avoid needing them. The default is ``True`` because a lone conductor asked about on its own is
+    the whole of itself; a lattice passes its own per-element flag.
     """
     length = jnp.asarray(length)
     area = jnp.asarray(area)
@@ -315,6 +332,7 @@ def internal_impedance(length, area, skin, round_, omega, sigma, mu0=4e-7 * jnp.
     )
 
     z = jnp.where(jnp.asarray(round_), z_round, z_slab)
+    z = jnp.where(jnp.asarray(span) == 1, z, dc.astype(z.dtype))  # subdivided: no free surface to speak of
     return jnp.where(dead, dc.astype(z.dtype), z)
 
 

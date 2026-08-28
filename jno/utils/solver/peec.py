@@ -18,6 +18,7 @@ points around a 375 µm bond wire the mesh keeps only ~88 % of the true area, wh
 
 from __future__ import annotations
 
+import logging
 from typing import NamedTuple
 
 import jax
@@ -65,6 +66,7 @@ class Filaments(NamedTuple):
     part: object  # (N,)    index of the shape each filament came from, so per-conductor data can be spread
     skin: object  # (N,)    transverse size the skin effect acts over: a wire's radius, a bar's thickness
     round_: object  # (N,) bool: a round section takes the cylindrical internal impedance, a bar the slab one
+    span: object  # (N,) int: elements across the conductor's THICKNESS here; 1 = this element is all of it
     lattice: object = None  # grid description when the elements sit on one, which is what the FFT path needs
 
 
@@ -172,6 +174,7 @@ def line_filaments(shape, size: float = None, quad: int = 3):
         np.asarray(part, dtype=int),
         jnp.asarray(rad),
         np.ones(n, dtype=bool),
+        np.ones(n, dtype=int),  # a wire element carries the whole cross-section, always
         None,
     )
 
@@ -211,7 +214,8 @@ def network_impedance(fil: Filaments, sigma, port, omega: float = 0.0, mu0: floa
     A = jnp.asarray(fil.incidence.toarray())
     nn, ne = A.shape
     sig = jnp.broadcast_to(jnp.asarray(sigma, dtype=float), (ne,))
-    R = internal_impedance(fil.length, fil.area, fil.skin, fil.round_, omega, sig, mu0)
+    _check_unresolved_thickness(fil, sig, omega, mu0)
+    R = internal_impedance(fil.length, fil.area, fil.skin, fil.round_, omega, sig, mu0, fil.span)
     Lp = pair_matrix(fil.pos, fil.mom, lambda r: 1.0 / r, fil.self_g, group=fil.group) * (mu0 / (4.0 * jnp.pi))
     Z = jnp.diag(R.astype(complex)) + 1j * omega * Lp
 
@@ -466,7 +470,8 @@ def solve_network(
     # The element's own impedance is a shape-aware SURFACE one, not rho*l/A. It reduces to the DC
     # value below the skin depth, so nothing changes at low frequency; above it, the current retreats
     # to the surface and a conductor no longer has to be split across its section to say so.
-    R = internal_impedance(fil.length, fil.area, fil.skin, fil.round_, omega, sig, mu0)
+    _check_unresolved_thickness(fil, sig, omega, mu0)
+    R = internal_impedance(fil.length, fil.area, fil.skin, fil.round_, omega, sig, mu0, fil.span)
     lat = getattr(fil, "lattice", None)
     welded = isinstance(lat, dict) and "welded" in lat
     has_lattice = lat is not None and (not welded or any(b[2] is not None for b in lat["welded"]))
@@ -802,6 +807,59 @@ def solve_network(
     return cur, phi, inj
 
 
+def _check_unresolved_thickness(fil, sigma, omega, mu0):
+    """Flag a conductor split across its thickness by cells too coarse to resolve the skin depth.
+
+    Such a discretisation satisfies NEITHER model. The surface impedance needs the element to be the
+    whole thickness, so a split conductor cannot use it (see :func:`internal_impedance`); and the
+    field solve only shows the skin effect if the cells resolve it, which coarse ones do not. What
+    comes out is the DC resistance wearing a high-frequency label -- on a 40 x 4 x 2 mm bar at
+    1 MHz, 82 uOhm against the 1239 uOhm the one-cell model gives.
+
+    Loud either way, but only fatal when it is the MODEL rather than a detail of it. Real geometry
+    has local thick spots -- a terminal post standing on a trace is a 1.57 mm column of metal where
+    the trace it sits on is 0.57 mm -- and refusing a whole package because 180 elements of 10,994
+    are one would make ordinary models unsolvable while barely moving the port impedance. So a
+    minority warns and a majority raises; the inductance, which does not depend on this at all, is
+    the common reason to want the minority case anyway.
+    """
+    w = float(omega)
+    if w == 0.0:
+        return  # at DC every element is rho l / A and the thickness does not matter
+    span = np.asarray(fil.span)
+    sub = span > 1
+    if not sub.any():
+        return
+    sig = np.broadcast_to(np.asarray(jax.lax.stop_gradient(jnp.asarray(sigma)), dtype=float), span.shape)
+    delta = np.sqrt(2.0 / (w * mu0 * np.maximum(sig, 1e-300)))
+    thick = np.asarray(fil.skin)
+    cell = thick / np.maximum(span, 1)
+    # Two conditions, and both are needed. The cells must be too coarse to resolve the distribution
+    # (a cell wider than half a skin depth), AND the skin effect must actually be worth something at
+    # this thickness -- below about two skin depths the surface impedance IS the DC value, so a
+    # subdivided conductor loses nothing and there is nothing to say.
+    bad = sub & (cell > 0.5 * delta) & (thick > 2.0 * delta)
+    if not bad.any():
+        return
+    k = int(np.flatnonzero(bad)[0])
+    n = int(bad.sum())
+    msg = (
+        f"jno.peec: {n} of {bad.size} elements sit in a conductor that is {int(span[k])} elements "
+        f"thick where each is {float(cell[k]) * 1e3:.4g} mm, against a skin depth of "
+        f"{float(delta[k]) * 1e3:.4g} mm at {w / (2 * np.pi):.4g} Hz -- {float(thick[k]) / float(delta[k]):.1f} "
+        "skin depths through it. Neither model applies there: an element may only take the surface "
+        "impedance when it IS the whole thickness, and cells this coarse cannot resolve the current "
+        "distribution either, so those elements fall back to the DC resistance. Use ONE cell through "
+        "the thickness -- the surface impedance is exact there at any frequency -- or at least "
+        f"{float(cell[k]) / (0.5 * float(delta[k])):.0f}x finer so two cells fit in a skin depth."
+    )
+    if n * 2 > bad.size:
+        raise ValueError(msg + " Most of this model is in that state, so it is refused rather than returned.")
+    logging.getLogger(__name__).warning(
+        "%s The resistance is understated by that much of the model; the inductance is unaffected.", msg
+    )
+
+
 def _refuse_disconnected(A, idx, sources, grounds, currents, devices=()):
     """A port pair with no metal between them is a modelling error, not an infinite impedance.
 
@@ -841,6 +899,25 @@ def _refuse_disconnected(A, idx, sources, grounds, currents, devices=()):
                 "flow and the impedance is not finite. Conductors are joined where the geometry says "
                 "the metal touches — check that the parts meant to be in contact actually overlap."
             )
+
+
+def _occupied_runs(occ, ax):
+    """Length of the contiguous occupied run containing each cell, along ``ax``.
+
+    How many cells the conductor is DIVIDED INTO through a given direction, which is what decides
+    whether an element may take a surface impedance -- see :func:`internal_impedance`.
+    """
+    o = np.moveaxis(np.asarray(occ), ax, -1)
+    fwd, bwd = np.zeros(o.shape, int), np.zeros(o.shape, int)
+    acc = np.zeros(o.shape[:-1], int)
+    for k in range(o.shape[-1]):
+        acc = np.where(o[..., k], acc + 1, 0)
+        fwd[..., k] = acc
+    acc = np.zeros(o.shape[:-1], int)
+    for k in range(o.shape[-1] - 1, -1, -1):
+        acc = np.where(o[..., k], acc + 1, 0)
+        bwd[..., k] = acc
+    return np.moveaxis(np.where(o, fwd + bwd - 1, 0), -1, ax)
 
 
 def bar_filaments(shape, size=None, quad: int = 3, sigma=None):
@@ -941,7 +1018,15 @@ def bar_filaments(shape, size=None, quad: int = 3, sigma=None):
     nodes = centres[keep]
     cell_part = own[keep]
 
+    # How thick the CONDUCTOR is across each direction, and into how many cells that is divided.
+    # The thickness is the smaller transverse EXTENT, not the smaller pitch: a 0.57 mm trace on a
+    # 0.5 mm in-plane grid is thin in z and wide in y, and picking by pitch would call the 0.5 mm
+    # width the thickness and hand the skin formula the wrong dimension.
+    occ = nid >= 0
+    runs = [_occupied_runs(occ, t) for t in range(3)]
+
     cen, tan, ln, area, ends, axis, owner, masks = [], [], [], [], [], [], [], {}
+    skin, span = [], []
     for ax in range(3):
         if n[ax] < 2:
             continue
@@ -958,6 +1043,12 @@ def bar_filaments(shape, size=None, quad: int = 3, sigma=None):
         u = np.zeros((k, 3))
         u[:, ax] = 1.0
         w, t = [d[i] for i in range(3) if i != ax]
+        t0, t1 = [i for i in range(3) if i != ax]
+        r0, r1 = runs[t0][a][live].reshape(-1), runs[t1][a][live].reshape(-1)
+        e0, e1 = r0 * d[t0], r1 * d[t1]
+        thin = e0 <= e1
+        skin.append(np.where(thin, e0, e1))  # the conductor's THICKNESS, not the cell pitch
+        span.append(np.where(thin, r0, r1))  # 1 means this element is the whole thickness
         cen.append(0.5 * (pa + pb))
         tan.append(u)
         ln.append(np.full(k, d[ax]))
@@ -971,6 +1062,8 @@ def bar_filaments(shape, size=None, quad: int = 3, sigma=None):
         )
 
     cen = np.concatenate(cen)
+    skin = np.concatenate(skin)
+    span = np.concatenate(span)
     tan = np.concatenate(tan)
     ln = np.concatenate(ln)
     area = np.concatenate(area)
@@ -1024,8 +1117,9 @@ def bar_filaments(shape, size=None, quad: int = 3, sigma=None):
         jnp.asarray(area),
         jnp.asarray(nodes),
         part,
-        jnp.asarray(np.stack([np.array([d[i] for i in range(3) if i != ax]) for ax in axis]).min(1)),
+        jnp.asarray(skin),
         np.zeros(nb, dtype=bool),
+        span,
         {
             "n": tuple(int(v) for v in n),
             "d": tuple(float(v) for v in d),
@@ -1193,6 +1287,7 @@ def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3):
             None,
             jnp.asarray(fil.skin)[lo:hi],
             np.asarray(fil.round_)[lo:hi],
+            np.asarray(fil.span)[lo:hi],
             lat,
         )
         if lat is None:
