@@ -27,7 +27,7 @@ def sym():
 
 def test_the_three_port_forms(sym):
     i, v, at = sym
-    src, cur, gnd = port_spec(
+    src, cur, gnd, _dev = port_spec(
         [
             v(*at("P")) - v(*at("N")) - 12.0,  # a 12 V source across the pair
             i(*at("AC")) - 0.0,  # open terminal
@@ -41,14 +41,14 @@ def test_the_three_port_forms(sym):
 
 def test_a_current_source_is_a_nonzero_terminal_current(sym):
     i, v, at = sym
-    _, cur, _ = port_spec([i(*at("P")) - 250.0])
+    _, cur, _, _ = port_spec([i(*at("P")) - 250.0])
     assert cur == [("P", 250.0 + 0j)]
 
 
 def test_a_bare_terminal_potential_reads_as_ground(sym):
     """`v(A)` with no offset is `v(A) - 0`: the reference node."""
     i, v, at = sym
-    _, _, gnd = port_spec([v(*at("N"))])
+    _, _, gnd, _ = port_spec([v(*at("N"))])
     assert gnd == [("N", 0.0 + 0j)]
 
 
@@ -59,10 +59,11 @@ def test_a_relation_between_two_terminals_is_refused_on_the_current(sym):
         port_spec([i(*at("P")) - i(*at("N"))])
 
 
-def test_a_constraint_mixing_both_fields_is_refused(sym):
+def test_a_constraint_mixing_both_fields_must_be_a_whole_device(sym):
+    """Naming both fields reads as a device, so it needs the two terminals a device sits between."""
     i, v, at = sym
-    with pytest.raises(ValueError, match="exactly one of"):
-        port_spec([v(*at("P")) - i(*at("P"))])
+    with pytest.raises(ValueError, match="to itself is a short"):
+        port_spec([v(*at("P")) - i(*at("P"))])  # one terminal only: not a device, not anything
 
 
 def test_an_unknown_field_is_named_in_the_error(sym):

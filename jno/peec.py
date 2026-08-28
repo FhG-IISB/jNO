@@ -12,8 +12,15 @@ cross-section, and the operator is Ruehli's Neumann double integral over their p
         i(*ac) - 0.0,                # the load terminal is open
     ], freq=1e6)
 
-Three constraint forms and only three -- a source ``v(A) - v(B) - g``, a fixed potential
-``v(A) - g``, a fixed current ``i(A) - g`` -- which is the whole vocabulary of a port.
+Four constraint forms and only four -- a source ``v(A) - v(B) - g``, a fixed potential ``v(A) - g``,
+a fixed current ``i(A) - g``, and a two-terminal device ``v(A) - v(B) - Z*i(A)``. The first three are
+the whole vocabulary of a port; the fourth is Ohm's law, and it is what puts a COMPONENT in the
+network without meshing it as metal::
+
+    v(*m_d) - v(*m_s) - 5e-3 * i(*m_d),      # a MOSFET's on-resistance
+
+A device parameter belongs in the circuit, not in the geometry: voxelise a 0.18 mm die on a 0.285 mm
+grid and its resistance follows the grid, which is both wrong and the reason the grid had to be fine.
 
 **Scope, up front.** Conductors are :meth:`jno.Shape.line` tubes today; a solid is not yet
 discretised and says so. The solve is dense, so it is the small-network path. And each filament
@@ -142,7 +149,7 @@ class PEEC:
         self.freq = np.atleast_1d(np.asarray(freq, dtype=float))
         self._scalar_freq = np.ndim(freq) == 0
         self.domain = _domain_of(self.constraints)
-        self.sources, self.currents, self.grounds = port_spec(self.constraints)
+        self.sources, self.currents, self.grounds, self.devices = port_spec(self.constraints)
         if len(self.sources) != 1:
             raise ValueError(
                 f"jno.peec: {len(self.sources)} sources; the impedance readouts describe ONE port. Write "
@@ -151,7 +158,12 @@ class PEEC:
 
     def _discretise(self):
         regions = dict(getattr(self.domain, "_shape_regions", {}) or {})
-        named = {t for s in self.sources for t in s[:2]} | {t for t, _ in self.currents} | {t for t, _ in self.grounds}
+        named = (
+            {t for s in self.sources for t in s[:2]}
+            | {t for t, _ in self.currents}
+            | {t for t, _ in self.grounds}
+            | {t for dv in self.devices for t in dv[:2]}  # a device's ends are terminals, not conductors
+        )
         preds = dict(getattr(self.domain, "_tag_predicates", {}) or {})
         # A terminal is a named SUBSET of a conductor, so `domain.tag` is its natural spelling: a tag
         # carries no material semantics and no declaration-order priority, so a pad may sit wholly
@@ -229,7 +241,14 @@ class PEEC:
         cur, port, drive, inject = [], [], [], []
         for f in self.freq:
             c, _phi, inj = solve_network(
-                fil, sigma, nodes, self.sources, self.grounds, self.currents, omega=2 * np.pi * float(f)
+                fil,
+                sigma,
+                nodes,
+                self.sources,
+                self.grounds,
+                self.currents,
+                self.devices,
+                omega=2 * np.pi * float(f),
             )
             cur.append(c)
             inject.append(inj)
