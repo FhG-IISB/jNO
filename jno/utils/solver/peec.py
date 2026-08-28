@@ -83,7 +83,7 @@ def _leaf(shape, what):
     return prim
 
 
-def line_filaments(shape, size: float = None, quad: int = 3, points=None):
+def line_filaments(shape, size: float = None, quad: int = 3, points=None, radii=None):
     """Discretise :meth:`jno.Shape.line` conductors into filaments, with Gauss sub-points.
 
     Args:
@@ -94,6 +94,11 @@ def line_filaments(shape, size: float = None, quad: int = 3, points=None):
         quad: Gauss points per filament. One point is 7.8 % low against a closed form on the worst
             case (collinear neighbours); 2 gives 2.5 %, 3 gives 1.2 %, 8 gives 0.21 %. Three is the
             default because it is where the curve flattens against its cost.
+        radii: optional replacement wire radius, one scalar per shape, which may be TRACED. A bond
+            wire's gauge is a design variable in its own right -- a thicker wire lowers both the
+            resistance and the self inductance -- and the realistic problem is distributing a fixed
+            total cross-section (the assembly's cost) over the wires that need it. It enters the
+            area, the self term and the skin depth, all of which were already jax.
         points: optional replacement polyline vertices, one ``(n_i, 3)`` array per shape, which may
             be TRACED. Everything geometric is then computed from them in jax, so a gradient flows
             back to the vertices -- the r-adaptivity contract, where the topology is fixed and only
@@ -122,11 +127,13 @@ def line_filaments(shape, size: float = None, quad: int = 3, points=None):
     shapes = list(shape) if isinstance(shape, (list, tuple)) else [shape]
     if points is not None and len(points) != len(shapes):
         raise ValueError(f"peec.line_filaments: {len(points)} point arrays for {len(shapes)} shapes.")
+    if radii is not None and len(radii) != len(shapes):
+        raise ValueError(f"peec.line_filaments: {len(radii)} radii for {len(shapes)} shapes.")
 
     # ---- host pass: the STRUCTURE, read off the shapes' own vertices --------------------------
     # Which segment each filament belongs to and where along it, so the geometry can be rebuilt from
     # any vertices later; and the node numbering, which a moving vertex must not change.
-    verts, base, ia, ib, jj, kk, radii, part = [], 0, [], [], [], [], [], []
+    verts, base, ia, ib, jj, kk, radii_h, part = [], 0, [], [], [], [], [], []
     ends = []
     for si, sh in enumerate(shapes):
         prim = _leaf(sh, "Line")
@@ -149,7 +156,7 @@ def line_filaments(shape, size: float = None, quad: int = 3, points=None):
                 ib.append(base + e + 1)
                 jj.append(j)
                 kk.append(k)
-                radii.append(prim.r)
+                radii_h.append(prim.r)
                 part.append(si)
                 ends.append((a + u * (step * j), a + u * (step * (j + 1))))
         base += len(P)
@@ -158,7 +165,9 @@ def line_filaments(shape, size: float = None, quad: int = 3, points=None):
 
     ia, ib = np.asarray(ia, dtype=int), np.asarray(ib, dtype=int)
     jj, kk = np.asarray(jj, dtype=float), np.asarray(kk, dtype=float)
-    rad = np.asarray(radii)
+    # per FILAMENT, from the per-shape value; traced when the caller supplies one
+    _which = np.asarray(part, dtype=int)
+    rad = jnp.stack([jnp.asarray(v) for v in radii])[_which] if radii is not None else np.asarray(radii_h)
     n = len(ia)
 
     # nodes = filament endpoints snapped to a grid far below the element size
@@ -881,7 +890,9 @@ def _check_unresolved_thickness(fil, sigma, omega, mu0):
         return
     sig = np.broadcast_to(np.asarray(jax.lax.stop_gradient(jnp.asarray(sigma)), dtype=float), span.shape)
     delta = np.sqrt(2.0 / (w * mu0 * np.maximum(sig, 1e-300)))
-    thick = np.asarray(fil.skin)
+    # non-differentiably: a traced wire GAUGE reaches here once radius is a design variable,
+    # and this guard only decides whether to complain -- no gradient runs through it
+    thick = np.asarray(jax.lax.stop_gradient(jnp.asarray(fil.skin)))
     cell = thick / np.maximum(span, 1)
     # Two conditions, and both are needed. The cells must be too coarse to resolve the distribution
     # (a cell wider than half a skin depth), AND the skin effect must actually be worth something at

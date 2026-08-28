@@ -180,3 +180,41 @@ def test_only_the_wire_block_moves():
     moved = jnp.concatenate([FIL.length[:NBAR], line_filaments(SH, points=[jnp.asarray(ARC2).at[1, 2].add(2e-3)]).length])
     assert np.allclose(np.asarray(moved[:NBAR]), ref, rtol=0, atol=0)  # bit-identical, not merely close
     assert not np.allclose(np.asarray(moved[NBAR:]), np.asarray(FIL.length[NBAR:]))  # the wire did move
+
+
+def test_wire_radius_is_a_design_variable():
+    """A bond wire's GAUGE is a design variable, and a differentiable one.
+
+    It enters the conducting area, the self term and the skin depth -- all of which were already
+    jax -- so only the plumbing was missing. It matters because the realistic bond-wire question is
+    not "thicker is better" (it is, trivially) but "given a fixed total cross-section, which wires
+    should carry it": a wire that carries no power current is spending copper for nothing.
+    """
+    P = jnp.asarray(ARC, dtype=float)
+    ref = line_filaments(_shape(), points=[P])
+
+    same = line_filaments(_shape(), points=[P], radii=[RW])
+    assert np.allclose(np.asarray(same.area), np.asarray(ref.area), rtol=0, atol=1e-18)
+    assert np.allclose(np.asarray(same.self_g), np.asarray(ref.self_g), rtol=0, atol=1e-18)
+
+    thick = line_filaments(_shape(), points=[P], radii=[2.0 * RW])
+    assert np.allclose(np.asarray(thick.area), 4.0 * np.asarray(ref.area))  # area goes as r^2
+
+    def loss(r):
+        f = line_filaments(_shape(), points=[P], radii=[r])
+        _c, _p, inj = solve_network(
+            f, SIG, TERM, [("A", "B", 1.0 + 0j)], (), (), (), omega=2 * np.pi * 1e7, matrix_free=False
+        )
+        return jnp.imag(1.0 / inj["A"]) / (2 * np.pi * 1e7)
+
+    g = float(jax.grad(loss)(RW))
+    h = 1e-8
+    fd = (float(loss(RW + h)) - float(loss(RW - h))) / (2 * h)
+    assert np.isfinite(g)
+    assert abs(g / fd - 1) < 1e-5
+    assert g < 0  # a thicker wire has less self inductance
+
+
+def test_the_wrong_number_of_radii_is_refused():
+    with pytest.raises(ValueError, match="radii for"):
+        line_filaments([_shape(), _shape()], radii=[RW])
