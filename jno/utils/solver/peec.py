@@ -26,7 +26,7 @@ import jax.numpy as jnp
 import numpy as np
 import scipy.sparse as sp
 
-from .kernel import bar_self, wire_self
+from .kernel import bar_self, internal_impedance, wire_self
 
 __all__ = [
     "Filaments",
@@ -63,6 +63,8 @@ class Filaments(NamedTuple):
     area: object  # (N,)    conducting cross-section, which is all the solve needs of the shape
     nodes: object  # (n_node, 3) node positions, which is how a port is addressed
     part: object  # (N,)    index of the shape each filament came from, so per-conductor data can be spread
+    skin: object  # (N,)    transverse size the skin effect acts over: a wire's radius, a bar's thickness
+    round_: object  # (N,) bool: a round section takes the cylindrical internal impedance, a bar the slab one
     lattice: object = None  # grid description when the elements sit on one, which is what the FFT path needs
 
 
@@ -168,6 +170,8 @@ def line_filaments(shape, size: float = None, quad: int = 3):
         jnp.asarray(area),
         jnp.asarray(np.asarray(xyz)),
         np.asarray(part, dtype=int),
+        jnp.asarray(rad),
+        np.ones(n, dtype=bool),
         None,
     )
 
@@ -207,7 +211,7 @@ def network_impedance(fil: Filaments, sigma, port, omega: float = 0.0, mu0: floa
     A = jnp.asarray(fil.incidence.toarray())
     nn, ne = A.shape
     sig = jnp.broadcast_to(jnp.asarray(sigma, dtype=float), (ne,))
-    R = jnp.asarray(fil.length) / (sig * jnp.asarray(fil.area))
+    R = internal_impedance(fil.length, fil.area, fil.skin, fil.round_, omega, sig, mu0)
     Lp = pair_matrix(fil.pos, fil.mom, lambda r: 1.0 / r, fil.self_g, group=fil.group) * (mu0 / (4.0 * jnp.pi))
     Z = jnp.diag(R.astype(complex)) + 1j * omega * Lp
 
@@ -394,7 +398,10 @@ def solve_network(
     Asp0 = fil.incidence.tocsr()
     nn, ne = Asp0.shape
     sig = jnp.broadcast_to(jnp.asarray(sigma, dtype=float), (ne,))
-    R = jnp.asarray(fil.length) / (sig * jnp.asarray(fil.area))
+    # The element's own impedance is a shape-aware SURFACE one, not rho*l/A. It reduces to the DC
+    # value below the skin depth, so nothing changes at low frequency; above it, the current retreats
+    # to the surface and a conductor no longer has to be split across its section to say so.
+    R = internal_impedance(fil.length, fil.area, fil.skin, fil.round_, omega, sig, mu0)
     lat = getattr(fil, "lattice", None)
     welded = isinstance(lat, dict) and "welded" in lat
     has_lattice = lat is not None and (not welded or any(b[2] is not None for b in lat["welded"]))
@@ -920,6 +927,8 @@ def bar_filaments(shape, size=None, quad: int = 3, sigma=None):
         jnp.asarray(area),
         jnp.asarray(nodes),
         part,
+        jnp.asarray(np.stack([np.array([d[i] for i in range(3) if i != ax]) for ax in axis]).min(1)),
+        np.zeros(nb, dtype=bool),
         {
             "n": tuple(int(v) for v in n),
             "d": tuple(float(v) for v in d),
@@ -1085,6 +1094,8 @@ def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3):
             jnp.asarray(fil.area)[lo:hi],
             None,
             None,
+            jnp.asarray(fil.skin)[lo:hi],
+            np.asarray(fil.round_)[lo:hi],
             lat,
         )
         if lat is None:

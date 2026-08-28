@@ -236,10 +236,12 @@ class PEEC:
             a, _b, g = self.sources[0]
             drive.append(inj[a])
             port.append(g / inj[a])
-        from .utils.solver.kernel import pair_matrix
+        from .utils.solver.kernel import internal_impedance, pair_matrix
 
         part = pair_matrix(fil.pos, fil.mom, lambda r: 1.0 / r, fil.self_g, group=fil.group) * (MU0 / (4 * jnp.pi))
-        res = jnp.asarray(fil.length) / (jnp.asarray(sigma) * jnp.asarray(fil.area))
+        # the SURFACE resistance, so the Joule readout matches the solve rather than a DC restatement
+        w = 2 * np.pi * float(self.freq[0])
+        res = jnp.real(internal_impedance(fil.length, fil.area, fil.skin, fil.round_, w, sigma, MU0))
 
         cur = jnp.stack(cur)
         port = jnp.stack([jnp.asarray(p) for p in port])
@@ -316,6 +318,8 @@ def _weld(parts, owners):
         cat("area"),
         jnp.asarray(nodes),
         shift("part"),
+        cat("skin"),
+        np.concatenate([np.asarray(f.round_) for f in fils]),
         # Each block keeps whatever structure it had — a lattice stays a lattice — and the blocks
         # couple through a cross term. That is what lets a trace layer stay an FFT while the bond
         # wires landing on it stay exact.
