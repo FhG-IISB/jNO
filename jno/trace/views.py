@@ -2138,7 +2138,7 @@ class FieldViewWithPartials(ScalarView):
         cv = object.__getattribute__(self, "_coord_vars")
         sc = object.__getattribute__(self, "_spatial_coords")
         other_cv = getattr(other, "_coord_vars", None) if other is not None else None
-        tie_tags = None
+        tie_tags = extra = None
         if other_cv:
             conflict = any(name in cv and cv[name] is not var for name, var in other_cv.items())
             if conflict and _is_periodic_tie_combination(
@@ -2146,7 +2146,15 @@ class FieldViewWithPartials(ScalarView):
             ):
                 # jno.fdm periodic tie `u(A) - u(B)`: the BinaryOp discards the per-side views, so stash
                 # the two region tags here (the only place they survive) for the classifier to read.
-                tie_tags = (_tag_of_coord_vars(cv), _tag_of_coord_vars(other_cv))
+                prior = getattr(self, "_periodic_tie", None)
+                if prior is not None:
+                    # An ALREADY-tied view meeting a third region does not re-tie: `v(A) - v(B) - Z*i(C)`
+                    # used to come out stamped ('A', 'C'), quietly losing B and describing a pair the
+                    # user never wrote. Keep the original pair and record the newcomer separately, so a
+                    # reader can tell a two-terminal form from a three-terminal one instead of guessing.
+                    tie_tags, extra = prior, _tag_of_coord_vars(other_cv)
+                else:
+                    tie_tags = (_tag_of_coord_vars(cv), _tag_of_coord_vars(other_cv))
             else:
                 merged = dict(cv)
                 for name, var in other_cv.items():
@@ -2172,6 +2180,9 @@ class FieldViewWithPartials(ScalarView):
         _with_scheme(new, getattr(self, "_bind_scheme", None))  # `.bind(..., scheme=...)` survives arithmetic
         if tie_tags is not None:
             object.__setattr__(new, "_periodic_tie", tie_tags)
+        extra = extra or getattr(self, "_tie_extra", None) or getattr(other, "_tie_extra", None)
+        if extra is not None:
+            object.__setattr__(new, "_tie_extra", extra)
         return new
 
     # ------------------------------------------------------------------
@@ -2355,7 +2366,7 @@ def _make_named_with_partials_cls(view_cls):
             """
             cv = object.__getattribute__(self, "_coord_vars")
             other_cv = getattr(other, "_coord_vars", None) if other is not None else None
-            tie_tags = None
+            tie_tags = extra = None
             if other_cv:
                 conflict = any(name in cv and cv[name] is not var for name, var in other_cv.items())
                 if conflict and _is_periodic_tie_combination(
@@ -2364,7 +2375,11 @@ def _make_named_with_partials_cls(view_cls):
                     # FEM periodic tie `u(A) - u(B)`: a constraint we never differentiate, so the
                     # `.x`-ambiguity guard does not apply. The BinaryOp discards the per-side views, so
                     # stash the two region tags here (the only place they survive) for jno.fem to read.
-                    tie_tags = (_tag_of_coord_vars(cv), _tag_of_coord_vars(other_cv))
+                    prior = getattr(self, "_periodic_tie", None)
+                    if prior is not None:  # see the note in FieldViewWithPartials._rewrap
+                        tie_tags, extra = prior, _tag_of_coord_vars(other_cv)
+                    else:
+                        tie_tags = (_tag_of_coord_vars(cv), _tag_of_coord_vars(other_cv))
                 else:
                     merged = dict(cv)
                     for name, var in other_cv.items():
@@ -2384,6 +2399,9 @@ def _make_named_with_partials_cls(view_cls):
             res = _with_scheme(type(self)(new_expr, cv), getattr(self, "_bind_scheme", None))
             if tie_tags is not None:
                 object.__setattr__(res, "_periodic_tie", tie_tags)
+            extra = extra or getattr(self, "_tie_extra", None) or getattr(other, "_tie_extra", None)
+            if extra is not None:
+                object.__setattr__(res, "_tie_extra", extra)
             return res
 
         def __getattr__(self, key: str):
