@@ -177,7 +177,10 @@ def assemble_fem_nonnodal(
     spaces = [f["space"] for f in fields]
     if any(s not in ("RT", "N1E", "P0", "Hermite", "Argyris", "Morley", "Lagrange") for s in spaces):
         raise NotImplementedError(
-            f"jno.fem (non-nodal): supported element spaces are RT, N1E, P0, Hermite, Argyris and Morley; got {spaces}."
+            f"jno.fem (non-nodal): supported element spaces are RT, N1E, P0, Hermite, Argyris, Morley "
+            f"and Lagrange; got {spaces}. (Lagrange is admitted so a nodal scalar can be MIXED with a "
+            f"non-nodal field -- the A-V pair is N1E x Lagrange. A Lagrange-only form belongs on the "
+            f"native nodal assembler, which this path never sees.)"
         )
     # ``order=`` is a nodal-Lagrange knob. Every family here has an order INTRINSIC to the element
     # definition, and it is never plumbed to the factories (`degree=1` is hard-coded at the call
