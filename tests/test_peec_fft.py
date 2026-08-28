@@ -81,7 +81,9 @@ def test_a_hole_in_the_conductor_keeps_the_fft_exact():
 
 @pytest.mark.parametrize("pitch", [0.002, 0.001])
 def test_the_matrix_free_solve_agrees_with_the_dense_one(pitch):
-    f = bar_filaments(jno.Shape.box(0, 0, 0, 0.040, 0.004, 0.002), size=pitch)
+    # the IN-PLANE pitch is what varies: one cell through the thickness at both, which is the
+    # discretisation the element's surface impedance is valid for
+    f = bar_filaments(jno.Shape.box(0, 0, 0, 0.040, 0.004, 0.002), size=(pitch, pitch, 0.002))
     a, b = bar_ends(f)
     got = {}
     for mf in (False, True):
@@ -122,7 +124,7 @@ SIGCU = 5.8e7
 
 
 def _trace_and_wire():
-    trace = jno.Shape.box(0, 0, 0, 0.02, 0.004, 0.001, size=(0.001, 0.001, 0.0005)).attach(sigma=SIGCU).name("trace")
+    trace = jno.Shape.box(0, 0, 0, 0.02, 0.004, 0.001, size=(0.001, 0.001, 0.001)).attach(sigma=SIGCU).name("trace")
     wire = (
         jno.Shape.line([(0.019, 0.002, 0.00075), (0.019, 0.002, 0.006), (0.030, 0.002, 0.00075)], r=1.9e-4, size=0.001)
         .attach(sigma=SIGCU)
@@ -213,7 +215,7 @@ def test_one_compiled_solve_is_reused_without_leaking_between_networks():
     """
 
     def run(box):
-        f = bar_filaments(box, size=(0.002, 0.002, 0.001))
+        f = bar_filaments(box, size=(0.002, 0.002, 0.002))
         p = np.asarray(f.nodes)
         a = terminal_nodes(f, lambda q: q[:, 0] < p[:, 0].min() + 1e-9)
         b = terminal_nodes(f, lambda q: q[:, 0] > p[:, 0].max() - 1e-9)
@@ -239,7 +241,7 @@ def test_a_frequency_sweep_reuses_the_compilation():
     # the cache is module-level and bounded, so other tests both fill and evict it; this test is
     # about how many entries THIS network adds, so it starts from a known state
     _KRYLOV_CACHE.clear()
-    f = bar_filaments(jno.Shape.box(0, 0, 0, 0.040, 0.004, 0.002), size=(0.002, 0.002, 0.001))
+    f = bar_filaments(jno.Shape.box(0, 0, 0, 0.040, 0.004, 0.002), size=(0.002, 0.002, 0.002))
     p = np.asarray(f.nodes)
     a = terminal_nodes(f, lambda q: q[:, 0] < p[:, 0].min() + 1e-9)
     b = terminal_nodes(f, lambda q: q[:, 0] > p[:, 0].max() - 1e-9)
@@ -261,7 +263,7 @@ def test_the_matrix_free_gradient_needs_a_bigger_krylov_subspace_and_says_so():
     restart 16 throughout, so nothing about it reveals the problem — which is why the small restart is
     refused for differentiation rather than allowed to return a plausible wrong number.
     """
-    f = bar_filaments(jno.Shape.box(0, 0, 0, 0.040, 0.004, 0.002), size=(0.002, 0.002, 0.001))
+    f = bar_filaments(jno.Shape.box(0, 0, 0, 0.040, 0.004, 0.002), size=(0.002, 0.002, 0.002))
     p = np.asarray(f.nodes)
     a = terminal_nodes(f, lambda q: q[:, 0] < p[:, 0].min() + 1e-9)
     b = terminal_nodes(f, lambda q: q[:, 0] > p[:, 0].max() - 1e-9)
@@ -301,11 +303,24 @@ def test_a_welded_network_converges_in_a_mesh_independent_number_of_steps():
 
     Pinned by TIME rather than by counting steps, because the count is an implementation detail and
     the wall clock is what broke: at 6,806 bars one bond wire took the solve from 0.19 s to 19.8 s.
+
+    The bound is on the RATIO, and the ratio is what stays flat -- measured at two mesh densities
+    with one cell through the thickness, where the element's surface impedance is live:
+
+        2,707 bars    plain 0.107 s   welded 3.07 s   29x
+        5,685 bars    plain 0.278 s   welded 8.37 s   30x
+
+    Mesh-independent, which is the claim. The absolute figure sits higher than it did when this ran
+    on a two-cell mesh, because there the elements were subdivided and took the DC resistance; it is
+    still nowhere near the 100x this exists to catch.
     """
     import time
 
     box = jno.Shape.box(0, 0, 0, 0.096, 0.059, 0.00057)
-    fb = bar_filaments(box, size=(0.002, 0.002, 0.000285))
+    # ONE cell through the 0.57 mm thickness, and the in-plane pitch chosen to keep the element
+    # count where it was when this was two cells -- the comparison is welded-against-plain on the
+    # SAME lattice, so shrinking the baseline would inflate the ratio without anything being slower.
+    fb = bar_filaments(box, size=(0.0014, 0.0014, 0.00057))
     nb = len(np.asarray(fb.length))
 
     def timed(fil, sig):
@@ -325,5 +340,6 @@ def test_a_welded_network_converges_in_a_mesh_independent_number_of_steps():
     fil, sg = _weld([(fb, jnp.full(nb, SIGCU)), (fl, jnp.full(nl, SIGCU))], [[box], wires])
     welded = timed(fil, sg)
 
-    # 0.3 % more elements must not cost two orders of magnitude; it used to cost 100x
-    assert welded < 25 * plain
+    # 0.3 % more elements must not cost two orders of magnitude; it used to cost 100x.
+    # Measured at 29-31x over repeats and mesh densities, so 50 leaves room without losing the guard.
+    assert welded < 50 * plain
