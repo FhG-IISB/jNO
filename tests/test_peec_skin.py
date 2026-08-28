@@ -80,3 +80,96 @@ def test_the_impedance_is_differentiable_through_the_surface_form():
         assert np.isfinite(g)
         assert abs(g / fd - 1) < 1e-5
         assert g < 0  # more conductive, less resistive
+
+
+# --------------------------------------------------------------------------------------------
+# The condition the surface impedance depends on: the element must BE the whole thickness.
+# --------------------------------------------------------------------------------------------
+
+
+def _bar(n, hz_pitch=None):
+    """A 40 x 4 x 2 mm bar cut into ``n`` cells through its 2 mm thickness."""
+    t = 0.002
+    return bar_filaments(jno.Shape.box(0, 0, 0, 0.040, 0.004, t), size=(0.002, 0.004, hz_pitch or t / n))
+
+
+def _port(f, hz):
+    p = np.asarray(f.nodes)
+    a = terminal_nodes(f, lambda q: q[:, 0] < p[:, 0].min() + 1e-9)
+    b = terminal_nodes(f, lambda q: q[:, 0] > p[:, 0].max() - 1e-9)
+    _c, _phi, inj = solve_network(f, SIG, {"A": a, "B": b}, [("A", "B", 1.0 + 0j)], omega=2 * np.pi * hz, matrix_free=False)
+    return complex(1.0 / inj["A"]).real
+
+
+def test_the_thickness_is_measured_by_extent_not_by_pitch():
+    """A 0.57 mm trace on a 0.5 mm in-plane grid is thin in z and wide in y.
+
+    Picking the thinner PITCH would call the 0.5 mm cell width the thickness and hand the skin
+    formula the wrong dimension entirely.
+    """
+    f = bar_filaments(jno.Shape.box(0, 0, 0, 0.040, 0.020, 0.00057), size=(0.0005, 0.0005, 0.00057))
+    assert np.allclose(np.asarray(f.skin), 0.00057)  # the thickness, not the 0.5 mm pitch
+    assert np.all(np.asarray(f.span) == 1)
+
+
+def test_one_cell_spans_the_conductor_and_more_than_one_does_not():
+    assert np.all(np.asarray(_bar(1).span) == 1)
+    sp = np.asarray(_bar(2).span)
+    ax = np.asarray(_bar(2).lattice["axis"])
+    assert np.all(sp[ax != 2] == 2)  # in-plane bars: the conductor is two elements thick
+    assert np.all(sp[ax == 2] == 1)  # the z bars are thin across y instead, and span that
+
+
+def test_a_subdivided_element_takes_the_dc_resistance():
+    """The free-surface forms do not hold once the interface between two cells is not a surface."""
+    ell, area = 0.01, 1e-6
+    w = 2 * np.pi * 1e7
+    dc = ell / (SIG * area)
+    z1 = complex(internal_impedance(ell, area, np.sqrt(area), False, w, SIG, span=1))
+    z2 = complex(internal_impedance(ell, area, np.sqrt(area), False, w, SIG, span=2))
+    assert z1.real > 3 * dc  # deep in the skin regime, the surface form is far above DC
+    assert abs(z2.real / dc - 1) < 1e-12 and z2.imag == 0.0  # subdivided: exactly rho l / A
+
+
+def test_stacking_elements_no_longer_doubles_the_conductance():
+    """The defect this guards. Every element taking the surface form gave EXACTLY half the R.
+
+    Measured before the fix, on this bar at 1 MHz and 10 MHz: 1 cell 1239 / 3919 uOhm, 2 cells
+    620 / 1959 -- a factor of 0.500 both times, because each half-thickness cell counted the
+    interface it shares with the other as a free surface.
+    """
+    assert abs(_port(_bar(1), 1e6) / 1239.25e-6 - 1) < 0.01  # the one-cell model is unchanged
+    with pytest.raises(ValueError, match="Neither model applies"):
+        _port(_bar(2), 1e6)
+
+
+def test_the_unresolvable_middle_is_refused_not_returned():
+    """Subdivided AND too coarse satisfies neither model, so it raises rather than reporting DC."""
+    with pytest.raises(ValueError, match="elements thick where each is"):
+        _port(_bar(2), 1e6)
+    with pytest.raises(ValueError, match="skin depths through it"):
+        _port(_bar(4), 1e6)
+
+
+def test_a_thin_conductor_may_still_be_subdivided():
+    """Below a couple of skin depths there is nothing to lose, so a split conductor is fine."""
+    assert _port(_bar(2), 1e2) > 0  # 2 mm against a 6.6 mm skin depth: no refusal
+    assert _port(_bar(4), 1e2) > 0
+
+
+def test_dc_never_refuses():
+    """At zero frequency every element is rho l / A and the thickness does not enter."""
+    for n in (1, 2, 4):
+        assert abs(_port(_bar(n), 0.0) / _port(_bar(1), 0.0) - 1) < 0.02
+
+
+def test_the_two_valid_models_agree_with_each_other():
+    """The real check: one element with a surface impedance, against many that resolve the depth.
+
+    Different mechanisms entirely -- a closed form on one element, versus a current distribution the
+    solve finds for itself -- so agreeing to a few percent is evidence both are right.
+    """
+    hz = 1e4  # skin depth 0.661 mm, so 0.0625 mm cells resolve it and 2 mm does not
+    surface = _port(_bar(1), hz)
+    resolved = _port(_bar(32), hz)
+    assert abs(surface / resolved - 1) < 0.05
