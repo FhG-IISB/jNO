@@ -529,42 +529,83 @@ def solve_network(
         C = sp.coo_matrix((cval, (crow, ccol)), shape=(nn, ne + nn)).tocsr()
         CI, Cp = C[:, :ne], C[:, ne:]
         Cj = _bcoo(cval, crow, ccol, (nn, ne + nn))
-        el = ccol < ne  # the current columns of the constraint block, for the preconditioner
-        CIj = _bcoo(cval[el], crow[el], ccol[el], (nn, ne))
         # The incidence transpose is sparse too — two entries per column, since a filament has two
         # ends. Left dense it is an ne x nn complex matrix hit twice per Krylov step: at 6,806 bars
         # that is 303 MB and about 55 ms a step, against a 5.9 ms FFT apply, so it was ten times the
         # operator it was helping to apply.
         Acj = _bcoo(aval.astype(complex), ac_, ar, (ne, nn))
 
-        # The Schur complement of the diagonal of Z. Sparse throughout: CI is current balance, A is
-        # the incidence, and their product is graph-Laplacian shaped, so forming and factoring it
-        # costs a fraction of the dense route (measured on 12k bars: 6.5 s + 21.1 s dense, against a
-        # single FFT apply of 3.7 ms). The factorisation is host-side and eager -- a preconditioner
-        # only has to accelerate, so nothing differentiable passes through it; the gradient comes from
-        # the outer custom_linear_solve.
-        # The dtype follows jax_enable_x64 rather than being pinned: hardcoding complex128 here made
-        # the callback disagree with everything around it the moment x64 was off.
-        cdtype = jnp.result_type(jnp.complex64) if not jax.config.jax_enable_x64 else jnp.complex128
-        shape_out = jax.ShapeDtypeStruct((nn,), cdtype)
-        AspT = Asp0.T.tocsr()
+        # The preconditioner is a sparse LU of the WHOLE block system, with Z replaced by its NEAR
+        # FIELD -- the diagonal plus every pair within a couple of element sizes. Not a Schur
+        # complement of the diagonal, which is what this used to be:
+        #
+        #     welded network, elements    354    1002    1552
+        #     diag(Z) Schur, iterations   106     865    3441
+        #     Z_near whole-system LU       11      16      30
+        #
+        # A diagonal Z leaves the spectrum spread enough that the port excitation of a welded network
+        # -- which excites far more eigenmodes than a plain lattice's, see near_block -- costs a
+        # high-degree residual polynomial. The near field compresses it until that stops mattering.
+        #
+        # The whole system stays sparse (about 30 nonzeros a row) and so does its factorisation (60 to
+        # 120), so this is one sparse LU rather than a dense Schur complement, and it replaces both
+        # halves of the old preconditioner.
+        # A WELDED network gets the near field; a plain lattice does not. Measured, iterations to a
+        # 1e-8 relative residual:
+        #
+        #     welded elements          354   1002   1552        lattice, 1584 elements
+        #     diag(Z) Schur            106    865   3441        converges
+        #     Z_near whole-system LU    11     16     30        does NOT converge
+        #
+        # Each suits its own case and neither suits both, so the choice is made by structure rather
+        # than by picking a winner. Why a welded network needs it at all is recorded on near_block:
+        # its port excitation spreads over far more eigenmodes, and only a compressed spectrum makes
+        # the residual polynomial cheap enough.
+        nr, nc, nv = (
+            near_block(fil, lambda r: 1.0 / r, mu_scale=mu0 / (4.0 * jnp.pi))
+            if welded
+            else (np.zeros(0, int), np.zeros(0, int), np.zeros(0))
+        )
+        AT = Asp0.T.tocsr()
+        # the dtype follows jax_enable_x64 rather than being pinned
+        cdtype = jnp.complex128 if jax.config.jax_enable_x64 else jnp.complex64
+        shape_out = jax.ShapeDtypeStruct(((ne + nn) if welded else nn,), cdtype)
+        el = ccol < ne
+        CIj = _bcoo(cval[el], crow[el], ccol[el], (nn, ne))
 
-        def _factorise(zd, _w_now):
-            """Build and stash the Schur factorisation from the CURRENT diagonal.
+        # Keyed by the network's IDENTITY, and the network is kept alive in the entry: an id alone is
+        # reusable after a garbage collection, and a stale hit would silently run the previous
+        # geometry's closures.
+        key = (id(fil), ne, nn, float(tol), int(restart))
+        entry = _KRYLOV_CACHE.get(key)
+        cached = entry[1] if (entry is not None and entry[0] is fil) else None
 
-            Through a callback rather than inline, because ``zdiag`` depends on the conductivity and
-            is therefore a TRACER under ``jax.grad`` -- building scipy matrices from it directly threw
-            TracerArrayConversionError, which made the fast path the only non-differentiable one in
-            the library. Nothing differentiable passes through here: a preconditioner only has to
-            accelerate, and the gradient comes from the outer ``custom_linear_solve``.
+        def _factorise(zd, w_now):
+            """Build and stash the preconditioner's factorisation for the CURRENT frequency.
+
+            Through a callback rather than inline, because ``zd`` depends on the conductivity and is
+            therefore a TRACER under ``jax.grad``. Nothing differentiable passes through here: a
+            preconditioner only has to accelerate, and the gradient comes from the outer
+            ``custom_linear_solve``. The frequency is an ARGUMENT because one compiled solve serves a
+            whole sweep, so a value closed over here would be the first point's for every later one.
             """
-            _LU_HOLDER["lu"] = spla.splu((CI @ sp.diags(1.0 / np.asarray(zd)) @ AspT + Cp).tocsc())
+            zdn = np.asarray(zd)
+            if nv.size:  # the near field, for a welded network
+                off = (1j * float(w_now)) * nv
+                zblk = sp.coo_matrix(
+                    (
+                        np.concatenate([zdn, off, off]),
+                        (np.concatenate([np.arange(ne), nr, nc]), np.concatenate([np.arange(ne), nc, nr])),
+                    ),
+                    shape=(ne, ne),
+                ).tocsr()
+                _LU_HOLDER["lu"] = spla.splu(sp.bmat([[zblk, -AT], [CI, Cp]], format="csc"))
+                _LU_HOLDER["kind"] = "whole"
+            else:  # a plain lattice: the Schur complement of the diagonal, which is what suits it
+                _LU_HOLDER["lu"] = spla.splu((CI @ sp.diags(1.0 / zdn) @ AT + Cp).tocsc())
+                _LU_HOLDER["kind"] = "schur"
             return np.zeros((), dtype=np.float64)
 
-        # Both callbacks need a derivative rule, because jax refuses to differentiate a pure_callback
-        # and the adjoint of the solve applies the preconditioner too. Neither rule is an
-        # approximation: the token is a constant, so its tangent is zero; the preconditioner is a
-        # LINEAR operator, so its tangent is itself applied to the tangent.
         @jax.custom_jvp
         def _token(zd, w_now):
             return jax.pure_callback(_factorise, jax.ShapeDtypeStruct((), jnp.float64), zd, w_now)
@@ -597,25 +638,14 @@ def solve_network(
                 )
             return _precond(primals[0]), _precond(tangents[0])
 
-        # ONE compilation, reused across frequencies. The operators that depend on geometry alone --
-        # the transformed lattice generator, the incidence -- are closed over; everything that moves
-        # with frequency is passed in as a traced argument, and the host factorisation is reached
-        # through a holder so the callback's identity is stable too. Without this every solve
-        # recompiles, and at these sizes the compilation costs about what the fusion saves, so a
-        # frequency sweep paid it once per point.
-        # Keyed by the network's IDENTITY, and the network is kept alive in the entry: an id alone is
-        # reusable after a garbage collection, and a stale hit would silently run the previous
-        # geometry's closures. The entry is checked against `fil` before it is trusted.
-        key = (id(fil), ne, nn, float(tol), int(restart))
-        entry = _KRYLOV_CACHE.get(key)
-        cached = entry[1] if (entry is not None and entry[0] is fil) else None
-
         def M_apply(x, w_, zd, Rc_):
             cur, phi = x[:ne], x[ne:]
             return jnp.concatenate([Rc_ * cur + (1j * w_) * lp_apply(cur) - Acj @ phi, Cj @ x])
 
         def P_inv(r, zd):
-            ri, rp = r[:ne], r[ne:]
+            if welded:
+                return _precond(r)  # one factorisation of the whole block system
+            ri, rp = r[:ne], r[ne:]  # the Schur split, for a plain lattice
             dphi = _precond(rp - CIj @ (ri / zd))
             return jnp.concatenate([(ri + Acj @ dphi) / zd, dphi])
 
