@@ -502,18 +502,24 @@ def port_spec(constraints, current="i", potential="v"):
     return sources, currents, grounds, devices
 
 
-def _host_z(z):
+def _host_z(z, fallback=None):
     """A concrete stand-in for a device impedance, for the preconditioner only.
 
-    Under ``jax.grad`` a traced Z still has a concrete primal; inside a jaxpr trace it has none, and
-    an electro-thermal fixed point traces everything. The preconditioner only has to accelerate, so
-    it falls back to an IDEAL device -- ``Z = 0``, a short across the terminals. The operator always
-    carries the exact value; only the convergence rate is affected, and the residual check guards it.
+    The LIVE value first, always: it is what the operator carries, and the preconditioner should
+    match it whenever it can be read. Only when it cannot -- a traced Z inside a jaxpr trace, which
+    an electro-thermal fixed point produces -- does the DECLARED value stand in, and failing that an
+    ideal device (``Z = 0``).
+
+    Getting that precedence backwards is not harmless. Preferring the declared value even when the
+    live one was readable left the preconditioner at the nominal design point while the operator
+    moved with temperature, and the near-field preconditioner is doing heavy lifting here (11-30
+    Krylov iterations against 3441 without it), so a few percent of drift stopped the solve
+    converging at all: 1.9e-02 at a 10 K rise, 9.3e-02 at 50 K.
     """
     try:
         return complex(np.asarray(jax.lax.stop_gradient(jnp.asarray(z))))
     except (jax.errors.TracerArrayConversionError, jax.errors.ConcretizationTypeError, TypeError, ValueError):
-        return 0.0 + 0j
+        return 0.0 + 0j if fallback is None else complex(fallback)
 
 
 def _device_impedance(node, current, potential):
@@ -728,8 +734,7 @@ def solve_network(
     # so the DECLARED one stands in: a preconditioner only has to accelerate, and the nominal design
     # point is a good approximation of a value that moves a few percent with temperature.
     for a, b_, z in devices:
-        zh = (device_host or {}).get(a)
-        zh = _host_z(z) if zh is None else complex(zh)
+        zh = _host_z(z, fallback=(device_host or {}).get(a))
         claim(a, ("a device", ("device", a, b_, z, zh)))
         claim(b_, ("the same device's return", ("devret", a, b_, z, zh)))
 
@@ -921,7 +926,14 @@ def solve_network(
         # wrong answer, but only because the residual check was there to catch it. Like the trace
         # guard below, this was invisible while every call rediscretised and a fresh network missed
         # the cache anyway.
-        traced = isinstance(jnp.zeros(()), jax.core.Tracer)
+        # "Are we inside ANY transform?" -- and a bare `jnp.zeros(())` probe answers only half of it.
+        # Under jit everything stages, so the probe is a tracer and the guard fires. Under jax.grad
+        # nothing stages except what DEPENDS on the differentiated input, so the probe stays concrete
+        # while `R` (from a traced conductivity) and `cval` (from a traced device impedance) do not.
+        # Caching then stored a closure holding LinearizeTracers, and the next eager call reusing it
+        # raised UnexpectedTracerError far from here. So the values the closure can capture are what
+        # gets checked, not a probe.
+        traced = any(isinstance(x, jax.core.Tracer) for x in (jnp.zeros(()), cval, R, fil.pos, fil.length, fil.area))
         key = (id(fil), ne, nn, float(tol), int(restart), hash(cval_h.tobytes()))
         entry = None if traced else _KRYLOV_CACHE.get(key)
         cached = entry[1] if (entry is not None and entry[0] is fil) else None
