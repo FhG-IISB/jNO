@@ -4471,6 +4471,7 @@ def _expr_digest(node, seen=None):
     ``layer_id``) -- they differ across rebuilds without changing the compiled program, and any node
     whose counter DOES key runtime lookups (``FrozenField``'s gather table, ``ModelCall``) is not on
     the allow-list at all."""
+    from ...trace import Placeholder as _Ph
     from ...trace import RegionMask as _RM
     from ...trace import TagMask as _TM
 
@@ -4520,9 +4521,35 @@ def _expr_digest(node, seen=None):
     elif isinstance(node, FunctionCall):
         fn_tok = _callable_token(node.fn, seen)
         kw = _val(tuple(sorted((node.kwargs or {}).items()))) if getattr(node, "kwargs", None) else ()
-        if fn_tok is None or kw is None:
+        # POSITIONAL arguments that are not themselves nodes -- a constant traction vector, a
+        # material coefficient -- never reach `iter_children`, which yields only `Placeholder`
+        # children. Without them the head carried the callee and the kwargs but nothing of the
+        # VALUES the call was made with, so `inner([0,3,0], phi)` and `inner([0,7,0], phi)` produced
+        # the SAME digest. The content table then handed the second build the first build's
+        # compiled program, and a traction of 3 assembled as 7 -- silently, with no error, on any
+        # rebuild that reused a region name on an unchanged mesh.
+        #
+        # Node args stay a positional MARKER rather than a digest: they are already covered by the
+        # child walk below, and the marker keeps their position, so a call cannot alias another that
+        # merely permutes nodes and constants. A value `_val` cannot key returns None and bails the
+        # whole closure -- a miss costs a recompile, a wrong hit is a wrong operator.
+        pos = []
+        for _a in getattr(node, "args", None) or ():
+            if isinstance(_a, _Ph):
+                pos.append(("#child",))
+            else:
+                _v = _val(_a)
+                if _v is None:
+                    pos = None
+                    break
+                pos.append(_v)
+        if fn_tok is None or kw is None or pos is None:
             fn_tok = None
-        head = None if fn_tok is None else ("call", node._name, fn_tok, getattr(node, "reduces_axis", None), kw)
+        head = (
+            None
+            if fn_tok is None
+            else ("call", node._name, fn_tok, getattr(node, "reduces_axis", None), kw, tuple(pos))
+        )
     else:
         head = None
     if head is None:
