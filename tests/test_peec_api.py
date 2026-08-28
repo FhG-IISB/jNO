@@ -80,7 +80,9 @@ def test_a_frequency_array_sweeps():
     sol = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=fs).solve()
     assert np.asarray(sol.Z).shape == (3,)
     assert np.asarray(sol.L).shape == (3,)
-    assert np.allclose(np.asarray(sol.R), np.asarray(sol.R)[0])  # one path: R is frequency-flat
+    # R is NOT frequency-flat: the element impedance is a surface one, so the current retreats
+    # towards the surface as the frequency rises and the resistance climbs with it
+    assert np.asarray(sol.R)[2] > 1.5 * np.asarray(sol.R)[0]
     assert np.asarray(sol.Z).imag[2] > np.asarray(sol.Z).imag[1] > 0  # wL grows with f
 
 
