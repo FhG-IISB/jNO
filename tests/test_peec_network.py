@@ -29,12 +29,23 @@ def partials(f):
 
 @pytest.mark.parametrize("freq", [0.0, 1e6])
 def test_a_series_chain_is_exactly_R_plus_jwL(freq):
+    """The topology forces one current, so Z is the element impedance plus the loop inductance.
+
+    The element impedance is the SURFACE one, which is the DC value at zero frequency and larger
+    above it -- the current retreats towards the surface, and that is the whole reason a conductor
+    need not be split across its section.
+    """
+    from jno.utils.solver.kernel import internal_impedance
+
     ell, a = 0.050, 5e-4
     f = line_filaments(jno.Shape.line([(0, 0, 0), (0, 0, ell)], r=a), size=ell / 10, quad=3)
     w = 2 * np.pi * freq
     z, _ = network_impedance(f, SIG, ((0, 0, 0), (0, 0, ell)), omega=w)
-    ref = ell / (SIG * np.pi * a**2) + 1j * w * partials(f).sum()
+    zint = complex(np.sum(np.asarray(internal_impedance(f.length, f.area, f.skin, f.round_, w, SIG))))
+    ref = zint + 1j * w * partials(f).sum()
     assert abs(complex(z) - ref) / abs(ref) < 1e-12
+    if freq == 0.0:
+        assert abs(zint.real / (ell / (SIG * np.pi * a**2)) - 1) < 1e-12  # and at DC it IS rho l / A
 
 
 def test_a_series_chain_carries_one_current():
