@@ -833,6 +833,24 @@ def _prefix_align(a, b):
     return a, b
 
 
+def _coefficient_only_or_raise(local, node, key):
+    """A missing ``field_index`` entry is legitimate for exactly ONE node kind: a :class:`FrozenField`
+    used as a coefficient, whose values ride ``local["frozen_fields"]`` rather than the field table.
+
+    For any other node a missing key is a BUG -- a trial/test function that never made it into the
+    field table -- and falling back to the top-level P1 shape data would answer with a silently wrong
+    basis instead of failing. Raise there, exactly as ``field_index[key]`` used to.
+    """
+    if isinstance(node, FrozenField):
+        return
+    raise KeyError(
+        f"jno.fem: field key {key!r} ({type(node).__name__}) is not in this problem's field table "
+        f"{list(local.get('field_index') or {})}. Only a frozen COEFFICIENT field may be absent from "
+        "it; a trial or test function must be present, so this is an assembler bug rather than a "
+        "usage error -- refusing to fall back to the P1 shape data and answer with the wrong basis."
+    )
+
+
 def _field_data(local, node):
     """``(shape_vals, shape_grads, cell_sol)`` for ``node``'s field.
 
@@ -851,6 +869,7 @@ def _field_data(local, node):
         # entry in the field table, so fall back to the top-level P1 shape data the assembler
         # supplies for field coefficients. `cell_sol` is None — a frozen field carries its own
         # values via ``local["frozen_fields"]``, never the live state.
+        _coefficient_only_or_raise(local, node, key)
         return local["shape_vals"], local.get("shape_grads"), None
     fd = fields[idx]
     return fd["shape_vals"], fd["shape_grads"], fd["cell_sol"]
@@ -881,7 +900,10 @@ def _field_hess(local, node):
     key = getattr(node, "field_key", getattr(node, "op_id", None))
     idx = local["field_index"].get(key)
     # Coefficient-only field: no field-table entry, and P1 tabulates no second derivative anyway.
-    return None if idx is None else fields[idx].get("shape_hess")
+    if idx is None:
+        _coefficient_only_or_raise(local, node, key)
+        return None
+    return fields[idx].get("shape_hess")
 
 
 def _field_space(local, node):
@@ -899,7 +921,10 @@ def _field_space(local, node):
     # A COEFFICIENT-ONLY field (a FrozenField on the P1 vertex space, not among this problem's
     # solved unknowns) has no field-table entry. It IS nodal Lagrange — which is also the default,
     # so the value branches downstream take the same path they would for any P1 coefficient.
-    return "Lagrange" if idx is None else fields[idx].get("space", "Lagrange")
+    if idx is None:
+        _coefficient_only_or_raise(local, node, key)
+        return "Lagrange"
+    return fields[idx].get("space", "Lagrange")
 
 
 def _eval_frozen_coefficient(domain, model, local):
