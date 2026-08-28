@@ -173,3 +173,34 @@ def test_the_two_valid_models_agree_with_each_other():
     surface = _port(_bar(1), hz)
     resolved = _port(_bar(32), hz)
     assert abs(surface / resolved - 1) < 0.05
+
+
+def test_a_run_breaks_where_the_MATERIAL_changes():
+    """A die on a trace is 2 cells of metal but ONE cell of each conductor.
+
+    The surface impedance asks whether an element spans its own conductor, and the skin effect does
+    not run across a junction between different materials -- so the run that counts elements through
+    a thickness has to break there. It did not, and that refused a perfectly good model: a die
+    projected onto a slab above its pad read as a 2-cell-thick conductor and the solve was rejected.
+
+    Stacked pieces of the SAME material stay one run, which matters just as much: a terminal post
+    standing on a trace really is one column of copper, and that case is a genuine warning.
+    """
+    lo = jno.Shape.box(0, 0, 0, 0.020, 0.008, 0.001)
+    hi = jno.Shape.box(0, 0, 0.001, 0.020, 0.008, 0.002)
+    grid = dict(size=(0.002, 0.002, 0.001))
+
+    same = bar_filaments([lo, hi], sigma=[SIG, SIG], **grid)
+    diff = bar_filaments([lo, hi], sigma=[SIG, 5.0e3], **grid)
+    ax_s, ax_d = np.asarray(same.lattice["axis"]), np.asarray(diff.lattice["axis"])
+    # in-plane bars are the ones whose thin direction is the stack
+    assert set(np.asarray(same.span)[ax_s != 2].tolist()) == {2}  # one conductor, two cells thick
+    assert set(np.asarray(diff.span)[ax_d != 2].tolist()) == {1}  # two conductors, one cell each
+
+
+def test_the_material_break_does_not_silence_the_stacked_copper_warning():
+    """The post-on-a-trace case must still be caught: same metal, so still one conductor."""
+    trace = jno.Shape.box(0, 0, 0, 0.040, 0.010, 0.00057)
+    post = jno.Shape.box(0.018, 0.003, 0.00057, 0.022, 0.007, 0.00157)
+    f = bar_filaments([trace, post], size=(0.002, 0.002, 0.00057), sigma=[SIG, SIG])
+    assert (np.asarray(f.span) > 1).any()  # the column under the post is more than one element

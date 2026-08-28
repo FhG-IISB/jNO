@@ -950,23 +950,32 @@ def _refuse_disconnected(A, idx, sources, grounds, currents, devices=()):
             )
 
 
-def _occupied_runs(occ, ax):
-    """Length of the contiguous occupied run containing each cell, along ``ax``.
+def _occupied_runs(lab, ax):
+    """Length of the contiguous SAME-MATERIAL run containing each cell, along ``ax``.
 
-    How many cells the conductor is DIVIDED INTO through a given direction, which is what decides
-    whether an element may take a surface impedance -- see :func:`internal_impedance`.
+    How many cells one conductor is divided into through a given direction, which decides whether an
+    element may take a surface impedance (see :func:`internal_impedance`). Cells carry a material
+    label and ``-1`` where there is no metal; a run breaks at a change of material as well as at a
+    void. It has to: a die sitting on a trace is 2 cells of METAL but 1 cell of each conductor, and
+    the skin effect does not run across the junction between them. Two stacked copper shapes, on the
+    other hand, share a label and stay one run -- a terminal post on a trace really is 1.57 mm of
+    continuous copper.
     """
-    o = np.moveaxis(np.asarray(occ), ax, -1)
+    o = np.moveaxis(np.asarray(lab), ax, -1)
+    live = o >= 0
+    same = np.zeros(o.shape, bool)
+    same[..., 1:] = live[..., 1:] & live[..., :-1] & (o[..., 1:] == o[..., :-1])
     fwd, bwd = np.zeros(o.shape, int), np.zeros(o.shape, int)
     acc = np.zeros(o.shape[:-1], int)
     for k in range(o.shape[-1]):
-        acc = np.where(o[..., k], acc + 1, 0)
+        acc = np.where(live[..., k], np.where(same[..., k], acc + 1, 1), 0)
         fwd[..., k] = acc
     acc = np.zeros(o.shape[:-1], int)
     for k in range(o.shape[-1] - 1, -1, -1):
-        acc = np.where(o[..., k], acc + 1, 0)
+        nxt = same[..., k + 1] if k + 1 < o.shape[-1] else np.zeros(o.shape[:-1], bool)
+        acc = np.where(live[..., k], np.where(nxt, acc + 1, 1), 0)
         bwd[..., k] = acc
-    return np.moveaxis(np.where(o, fwd + bwd - 1, 0), -1, ax)
+    return np.moveaxis(np.where(live, fwd + bwd - 1, 0), -1, ax)
 
 
 def bar_filaments(shape, size=None, quad: int = 3, sigma=None):
@@ -1071,8 +1080,19 @@ def bar_filaments(shape, size=None, quad: int = 3, sigma=None):
     # The thickness is the smaller transverse EXTENT, not the smaller pitch: a 0.57 mm trace on a
     # 0.5 mm in-plane grid is thin in z and wide in y, and picking by pitch would call the 0.5 mm
     # width the thickness and hand the skin formula the wrong dimension.
-    occ = nid >= 0
-    runs = [_occupied_runs(occ, t) for t in range(3)]
+    # A cell's MATERIAL label: shapes declared with the same conductivity are one conductor, so two
+    # stacked copper pieces stay a single run while a die on a trace does not. Falls back to the
+    # shape index when the conductivities are not concrete (a traced sigma in an inverse problem).
+    mat = np.asarray(own)
+    if sigma is not None:
+        try:
+            sv = np.asarray([float(np.asarray(v)) for v in (sigma if isinstance(sigma, (list, tuple)) else [sigma])])
+            if sv.size == len(shapes):
+                mat = np.unique(sv, return_inverse=True)[1][np.maximum(own, 0)]
+        except (TypeError, ValueError):
+            pass
+    lab = np.where(own < 0, -1, mat).reshape(tuple(n))
+    runs = [_occupied_runs(lab, t) for t in range(3)]
 
     cen, tan, ln, area, ends, axis, owner, masks = [], [], [], [], [], [], [], {}
     skin, span = [], []
