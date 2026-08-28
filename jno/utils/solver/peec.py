@@ -691,7 +691,16 @@ def solve_network(
         Z = jnp.diag(R.astype(complex)) + 1j * float(omega) * Lp
 
     names = list(terminals)
-    idx = {t: np.asarray(terminals[t], dtype=int) for t in names}
+    # A terminal is `{name: idx}`, or `{name: (idx, weights)}` to make it a prescribed current
+    # DISTRIBUTION rather than a short -- which is what lets its position be differentiated.
+    wts = {t: v[1] for t, v in terminals.items() if isinstance(v, tuple)}
+    idx = {t: np.asarray(v[0] if isinstance(v, tuple) else v, dtype=int) for t, v in terminals.items()}
+    for t, w in wts.items():
+        if np.shape(w)[0] != idx[t].size:
+            raise ValueError(
+                f"jno.peec: terminal {t!r} was given {np.shape(w)[0]} weights for {idx[t].size} nodes. "
+                "A weighted terminal needs one weight per node of its support."
+            )
     for t, ids in idx.items():
         if ids.size == 0:
             raise ValueError(f"jno.peec: terminal {t!r} contains no network node.")
@@ -751,10 +760,31 @@ def solve_network(
             )
 
     free = np.array([n for n in range(nn) if n not in owner], dtype=int)
+
     # The constraint block is assembled as TRIPLETS, not rows. It is current balance plus a handful of
     # port conditions, so it carries a few entries per row against ne + nn columns: on a 12k-bar
     # lattice the incidence alone is 24,548 nonzeros in 61,271,808 slots -- 0.04 % -- and holding that
     # densely costs 1.4 GB and an 86-million-op matvec per Krylov step, next to a 3.7 ms FFT apply.
+    def _pot(t, sign):
+        """(cols, values, host values) for a terminal's potential in a port row.
+
+        Unweighted it is the first node's -- the others are shorted to it, so any of them would do.
+        Weighted it is the WEIGHTED AVERAGE over the pad, which is what a terminal that is not a
+        short actually sees.
+        """
+        ids = idx[t]
+        w = wts.get(t)
+        if w is None:
+            c = np.array([ne + int(ids[0])])
+            return c, jnp.array([sign], dtype=complex), np.array([sign], dtype=complex)
+        n = len(ids)
+        wa = jnp.asarray(w).reshape(-1)
+        return (
+            ne + ids,
+            sign * wa.astype(complex),
+            sign * np.array([_host_z(wa[j], fallback=1.0 / n) for j in range(n)]),
+        )
+
     ar, ac_ = Asp0.nonzero()
     aval = np.asarray(Asp0[ar, ac_]).reshape(-1)
     rows_of = lambda n: Asp0.indices[Asp0.indptr[n] : Asp0.indptr[n + 1]]
@@ -771,23 +801,69 @@ def solve_network(
         vv_h.append(v)
         r0 += 1
         rhs.append(np.zeros(1, dtype=complex))
-    for t in names:  # a terminal is equipotential: tie its nodes to its first
+    for t in names:
         ids = idx[t]
-        for n in ids[1:].tolist():
-            rr.append(np.array([r0, r0]))
-            cc.append(np.array([ne + n, ne + int(ids[0])]))
-            vv.append(np.array([1.0, -1.0]))
-            vv_h.append(np.array([1.0, -1.0]))
-            r0 += 1
-            rhs.append(np.zeros(1, dtype=complex))
+        w = wts.get(t)
+        if w is None:
+            # A terminal is equipotential: tie its nodes to its first. A real pad is a short, and a
+            # short is what this is -- but it is also why a pad cannot MOVE: which nodes are in the
+            # set is a step function of position, so the answer is piecewise constant in it
+            # (measured: 0.000 A for a quarter-millimetre slide, then a 6.5 A jump).
+            for n in ids[1:].tolist():
+                rr.append(np.array([r0, r0]))
+                cc.append(np.array([ne + n, ne + int(ids[0])]))
+                vv.append(np.array([1.0, -1.0]))
+                vv_h.append(np.array([1.0, -1.0]))
+                r0 += 1
+                rhs.append(np.zeros(1, dtype=complex))
+        else:
+            # Weighted: the pad is NOT shorted. Instead the terminal's current enters each node in
+            # proportion to its weight -- `w_1 (A I)_i = w_i (A I)_1` for every other node i -- and
+            # the port sees the weighted-average potential (see `_pot`). Same row count, same
+            # unknowns: the k-1 tie rows become k-1 ratio rows.
+            #
+            # That is what makes a terminal's POSITION differentiable. The node set is a frozen
+            # superset covering the travel; the weights are smooth in the position and carry the
+            # gradient, which is the same structure-frozen/values-traced split as everywhere else.
+            wa = jnp.asarray(w).reshape(-1)
+            nw = len(ids)
+            hw = np.array([_host_z(wa[j], fallback=1.0 / nw) for j in range(nw)])
+            # Anchor on the LARGEST weight, not the first node. A placement weight is a bump, so on a
+            # support wide enough to travel across the far end's weight underflows -- exp(-36) at one
+            # end of an 11 mm support -- and every ratio row written against it degenerates to the
+            # same statement, leaving the block rank deficient. The rows span the same constraint
+            # whichever node anchors them ("the injection is parallel to w"), so this changes the
+            # conditioning and nothing else.
+            r_i = int(np.argmax(np.abs(hw)))
+            n0 = int(ids[r_i])
+            k1, v1 = rows_of(n0), vals_of(n0)
+            h0 = hw[r_i]
+            for j in [q for q in range(nw) if q != r_i]:
+                kj, vj = rows_of(int(ids[j])), vals_of(int(ids[j]))
+                hj = hw[j]
+                # Each ratio row is HOMOGENEOUS, so its scale is free -- and it has to be taken. A
+                # smooth placement weight is a bump: over a support wide enough to travel across,
+                # its values span ten-plus decades, and rows scaled by them left the constraint
+                # block so badly conditioned that the Krylov solve stalled at 1.7e-03. Dividing by
+                # the larger of the two weights puts every row at O(1) and changes nothing else.
+                sc = jnp.maximum(jnp.abs(wa[r_i]), jnp.abs(wa[j]))
+                sc_h = max(abs(h0), abs(hj)) or 1.0
+                rr.append(np.full(k1.size + kj.size, r0))
+                cc.append(np.concatenate([kj, k1]))
+                vv.append(jnp.concatenate([(wa[r_i] / sc) * jnp.asarray(vj), -(wa[j] / sc) * jnp.asarray(v1)]))
+                vv_h.append(np.concatenate([(h0 / sc_h) * vj, -(hj / sc_h) * v1]))
+                r0 += 1
+                rhs.append(np.zeros(1, dtype=complex))
     for t in names:  # and one row for the terminal itself
         kind, *rest = row[t][1] if t in row else ("open", t, 0.0 + 0j)
         if kind == "source":
             a, b_, g = rest
-            rr.append(np.array([r0, r0]))
-            cc.append(np.array([ne + int(idx[a][0]), ne + int(idx[b_][0])]))
-            vv.append(np.array([1.0, -1.0]))
-            vv_h.append(np.array([1.0, -1.0]))
+            ca, va, ha = _pot(a, 1.0)
+            cb, vb, hb = _pot(b_, -1.0)
+            rr.append(np.full(ca.size + cb.size, r0))
+            cc.append(np.concatenate([ca, cb]))
+            vv.append(jnp.concatenate([va, vb]))
+            vv_h.append(np.concatenate([ha, hb]))
         elif kind == "device":  # phi_A - phi_B = Z I_dev,  I_dev = -(A I)_A
             a, b_, z, zh = rest
             g = 0.0 + 0j
@@ -798,20 +874,18 @@ def solve_network(
             # caught: 2 R_wire - R_dev instead of 2 R_wire + R_dev.
             col = np.asarray(Asp0[idx[a]].sum(0)).reshape(-1)
             k = np.flatnonzero(col)
-            rr.append(np.concatenate([np.array([r0, r0]), np.full(k.size, r0)]))
-            cc.append(np.concatenate([np.array([ne + int(idx[a][0]), ne + int(idx[b_][0])]), k]))
+            ca, va, ha = _pot(a, 1.0)
+            cb, vb, hb = _pot(b_, -1.0)
+            rr.append(np.full(ca.size + cb.size + k.size, r0))
+            cc.append(np.concatenate([ca, cb, k]))
             # jnp, not numpy: Z may be TRACED. A device whose impedance depends on the solved state
             # is the whole electro-thermal feedback -- R_ds(on) rises with the junction it heats.
-            vv.append(
-                jnp.concatenate(
-                    [jnp.array([1.0, -1.0], dtype=complex), jnp.asarray(z, dtype=complex) * jnp.asarray(col[k])]
-                )
-            )
+            vv.append(jnp.concatenate([va, vb, jnp.asarray(z, dtype=complex) * jnp.asarray(col[k])]))
             # The preconditioner's copy. A traced Z has no value inside a jaxpr trace, and the
             # preconditioner only has to accelerate -- so it falls back to an IDEAL device, Z = 0,
             # a short across the terminals. Convergence may suffer; the residual check still guards
             # the answer, and the OPERATOR above carries the exact traced value either way.
-            vv_h.append(np.concatenate([np.array([1.0, -1.0], dtype=complex), zh * col[k]]))
+            vv_h.append(np.concatenate([ha, hb, zh * col[k]]))
         elif kind == "devret":  # (A I)_A + (A I)_B = 0 -- what goes in comes out
             a, b_, _z, _zh = rest
             g = 0.0 + 0j
@@ -823,10 +897,11 @@ def solve_network(
             vv_h.append(col[k])
         elif kind == "ground":
             _t, g = rest
-            rr.append(np.array([r0]))
-            cc.append(np.array([ne + int(idx[t][0])]))
-            vv.append(np.array([1.0]))
-            vv_h.append(np.array([1.0]))
+            ct, vt, ht = _pot(t, 1.0)
+            rr.append(np.full(ct.size, r0))
+            cc.append(ct)
+            vv.append(vt)
+            vv_h.append(ht)
         else:  # a fixed injected current, or an open terminal (which is zero injected current)
             _t, g = rest
             col = np.asarray(Asp0[idx[t]].sum(0)).reshape(-1)
