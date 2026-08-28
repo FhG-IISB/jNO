@@ -18,6 +18,8 @@ points around a 375 µm bond wire the mesh keeps only ~88 % of the true area, wh
 
 from __future__ import annotations
 
+import functools
+import inspect
 import logging
 from typing import NamedTuple
 
@@ -39,6 +41,8 @@ __all__ = [
     "solve_network",
     "lattice_apply",
     "near_block",
+    "element_centres",
+    "resolve_sigma",
 ]
 
 
@@ -81,6 +85,99 @@ def _leaf(shape, what):
             "Shape.line (a tube along a polyline), or discretise a solid as a lattice instead."
         )
     return prim
+
+
+def element_centres(fil: "Filaments") -> jnp.ndarray:
+    """Each element's midpoint, ``(n_elements, 3)``.
+
+    Read back from the quadrature points rather than stored alongside them: Gauss-Legendre abscissae
+    are symmetric about their interval, so their unweighted mean IS the midpoint -- exactly, not
+    approximately, for the straight elements both discretisations produce. Doing it this way keeps
+    the result differentiable and correct when the positions are themselves traced.
+    """
+    ne = fil.incidence.shape[1]
+    grp = jnp.asarray(fil.group)
+    cnt = jax.ops.segment_sum(jnp.ones(grp.shape[0]), grp, ne)
+    return jax.ops.segment_sum(fil.pos, grp, ne) / cnt[:, None]
+
+
+def _is_field(value) -> bool:
+    """Whether an attached value is a FUNCTION of position rather than a value.
+
+    ``isroutine`` for the same reason :meth:`jno.Domain._resolve_attached` uses it -- a symbolic
+    expression defines ``__call__`` (that is how ``u(x, y)`` binds), so a bare ``callable`` test
+    would try to invoke one as a field. ``functools.partial`` is admitted on top because it is the
+    one ordinary way a field arrives already carrying its parameters.
+    """
+    return inspect.isroutine(value) or isinstance(value, functools.partial)
+
+
+def _field_arity(fn) -> int:
+    """How many coordinates ``fn`` wants: ``f(x)``, ``f(x, y)`` or ``f(x, y, z)``.
+
+    A planar density is the common case -- a trace is thin, and its material varies across the board
+    but not through the 0.57 mm thickness -- so ``lambda x, y: ...`` has to mean what it says rather
+    than being an arity error. Anything variadic or un-introspectable gets all three.
+    """
+    try:
+        ps = list(inspect.signature(fn).parameters.values())
+    except (TypeError, ValueError):
+        return 3
+    if any(p.kind is p.VAR_POSITIONAL for p in ps):
+        return 3
+    n = sum(p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) and p.default is p.empty for p in ps)
+    return 3 if n == 0 or n > 3 else n
+
+
+def resolve_sigma(value, xyz, what: str):
+    """Resolve one conductor's attached conductivity onto ``len(xyz)`` positions.
+
+    A conductivity is a design variable as often as it is a material constant, and it arrives in
+    three spellings, all of which land here as one vector:
+
+    * a **scalar** (a tracer is fine) -- one conductivity for the whole conductor, which is a
+      material, ``sigma(T)`` in an electro-thermal loop, or a single scaling knob;
+    * a **callable of position** -- ``f(x, y, z)``, ``f(x, y)`` or ``f(x)``, evaluated at each
+      element. This is the resolution-independent spelling: it says nothing about the pitch, so the
+      same design survives a change of ``size=``, which a per-element vector cannot;
+    * a **vector**, already one value per element, for a design variable that IS the discretisation.
+
+    Positions are host coordinates and the returned values may be traced, which is the split that
+    matters: the geometry is structural, the material on it is what a gradient flows back to.
+
+    Args:
+        value: the attached conductivity, in any of the three forms above.
+        xyz: ``(n, 3)`` positions -- cell centres for a lattice, element midpoints for a line.
+        what: the conductor's name, for the error messages.
+
+    Returns:
+        A ``(n,)`` array of conductivities.
+    """
+    n = int(np.shape(xyz)[0])
+    if _is_field(value):
+        k = _field_arity(value)
+        out = jnp.asarray(value(*[jnp.asarray(xyz)[:, i] for i in range(k)]))
+        if out.ndim == 0:
+            return jnp.broadcast_to(out, (n,))
+        if out.shape != (n,):
+            raise ValueError(
+                f"peec: the conductivity attached to {what} is a function of position, so it has to "
+                f"return one value per element -- {n} of them, or a scalar. It returned shape "
+                f"{tuple(out.shape)}. It is called with whole coordinate ARRAYS, not one point at a "
+                "time, so write it in terms that broadcast (jno.np / jnp), not a Python scalar branch."
+            )
+        return out
+    arr = jnp.asarray(value)
+    if arr.ndim == 0:
+        return jnp.broadcast_to(arr, (n,))
+    if arr.shape != (n,):
+        raise ValueError(
+            f"peec: {arr.size} conductivities were attached to {what}, which discretises into {n} "
+            "elements. Give one value per element, a single scalar, or -- better for a design "
+            "variable -- a callable of position, `sigma=lambda x, y, z: ...`, which does not depend "
+            "on the pitch and so survives a change of size=."
+        )
+    return arr
 
 
 def line_filaments(shape, size: float = None, quad: int = 3, points=None, radii=None):
@@ -1019,8 +1116,17 @@ def bar_filaments(shape, size=None, quad: int = 3, sigma=None):
             varies: 33.6 million bars against 137 thousand for ``(1.0, 1.0, 0.065)`` at the same
             through-thickness resolution.
         quad: Gauss points along each bar.
-        sigma: conductivity per conductor. Needed only when conductors touch: a bar straddling two of
-            them has half its length in each, so its conductivity is their series (harmonic) mean.
+        sigma: conductivity, one entry per conductor. Needed whenever conductors touch: a bar
+            straddling two of them has half its length in each, so its conductivity is their series
+            (harmonic) mean.
+
+            An entry is a scalar, a **callable of position**, or a vector carrying one value per
+            CELL of that conductor -- see :func:`resolve_sigma`. The last two make the material a
+            design variable at cell resolution, which is what a density (SIMP) topology optimisation
+            is. The lattice does not move with it: a cell whose conductivity goes to zero is still a
+            cell, still joined by bars, and still counted as metal by the thickness runs behind the
+            skin term. That is the ordinary fixed-mesh treatment and it is why a converged density
+            has to be read back out as a shape rather than assumed to be one.
 
     Returns:
         :class:`Filaments`, with ``lattice`` describing the grid the FFT path needs.
@@ -1093,7 +1199,8 @@ def bar_filaments(shape, size=None, quad: int = 3, sigma=None):
     # width the thickness and hand the skin formula the wrong dimension.
     # A cell's MATERIAL label: shapes declared with the same conductivity are one conductor, so two
     # stacked copper pieces stay a single run while a die on a trace does not. Falls back to the
-    # shape index when the conductivities are not concrete (a traced sigma in an inverse problem).
+    # shape index when the conductivities are not concrete -- a traced sigma in an inverse problem,
+    # or a field, which varies WITHIN a conductor and so cannot label one.
     mat = np.asarray(own)
     if sigma is not None:
         try:
@@ -1150,17 +1257,33 @@ def bar_filaments(shape, size=None, quad: int = 3, sigma=None):
     axis = np.concatenate(axis)
     owner = np.concatenate(owner)
     part = owner[:, 0]
+    end_a = np.concatenate([ea for ea, _ in ends])
+    end_b = np.concatenate([eb for _, eb in ends])
     nb = len(ln)
-    # A bar may straddle two conductors -- a shorting strap touching two plates is the normal case,
-    # not an error. Its two halves are in SERIES, so the bar's conductivity is the harmonic mean; for
-    # one material that degenerates to the material, and only a genuine mismatch changes anything.
+    # A bar joins two CELLS, and its two halves are in SERIES, so its conductivity is their harmonic
+    # mean. That rule was written for a bar straddling two conductors -- a shorting strap touching
+    # two plates is the normal case, not an error -- and it is the same rule a per-cell conductivity
+    # needs, so both resolve here: the conductivity is fixed to the CELLS, and the bars read it.
+    # For one conductivity per conductor this degenerates to exactly the old per-conductor form.
     bar_sigma = None
     if sigma is not None:
-        # jnp, not numpy: a conductivity may be traced (sigma(T) in an electro-thermal loop)
-        sg = jnp.stack([jnp.asarray(v) for v in sigma]) if isinstance(sigma, (list, tuple)) else jnp.asarray(sigma)
-        if sg.size != len(shapes):
-            raise ValueError(f"peec.bar_filaments: {sg.size} conductivities for {len(shapes)} conductors.")
-        s0, s1 = sg[owner[:, 0]], sg[owner[:, 1]]
+        vals = list(sigma) if isinstance(sigma, (list, tuple)) else [sigma]
+        if len(vals) != len(shapes):
+            raise ValueError(f"peec.bar_filaments: {len(vals)} conductivities for {len(shapes)} conductors.")
+        # Resolved per conductor over ITS OWN cells, then scattered back: a field is evaluated where
+        # its conductor actually is, and a per-cell vector is that conductor's cell count, not the
+        # whole grid's -- the grid spans every conductor sharing it, which is not a design variable.
+        chunks, order = [], []
+        for si, v in enumerate(vals):
+            sel = np.flatnonzero(cell_part == si)
+            order.append(sel)
+            nm = getattr(shapes[si], "_region_name", None)
+            chunks.append(resolve_sigma(v, nodes[sel], f"conductor {nm!r}" if nm else f"conductor #{si}"))
+        order = np.concatenate(order) if order else np.zeros(0, dtype=int)
+        inv = np.empty(len(nodes), dtype=int)
+        inv[order] = np.arange(len(order))
+        cell_sigma = jnp.concatenate([jnp.asarray(c) for c in chunks])[inv]
+        s0, s1 = cell_sigma[end_a], cell_sigma[end_b]
         bar_sigma = 2.0 * s0 * s1 / (s0 + s1)
     elif not np.all(owner[:, 0] == owner[:, 1]):
         bad = int(np.flatnonzero(owner[:, 0] != owner[:, 1])[0])

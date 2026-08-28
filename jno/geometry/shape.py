@@ -798,6 +798,12 @@ class Shape:
         deferred that way because a spatially varying coefficient is built from ``d.variable(...)``,
         which does not exist yet while the geometry plan is being written.
 
+        A function is *resolved by whoever reads the property*, which is why the same spelling serves
+        two very different consumers: a weak form binds it symbolically, while ``jno.peec`` evaluates
+        it numerically at each element it discretises the region into
+        (``.attach(sigma=lambda x, y: SIG*rho(x, y))`` is a density field). Either way the arity is
+        positional -- the first coordinates, not the ones the parameters are named after.
+
         Properties are declared, not typed: whether ``eps`` is a volume or a surface quantity is
         decided by the term that consumes it, not here.
 

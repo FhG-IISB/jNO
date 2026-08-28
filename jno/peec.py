@@ -22,9 +22,32 @@ network without meshing it as metal::
 A device parameter belongs in the circuit, not in the geometry: voxelise a 0.18 mm die on a 0.285 mm
 grid and its resistance follows the grid, which is both wrong and the reason the grid had to be fine.
 
-**Scope, up front.** Conductors are :meth:`jno.Shape.line` tubes today; a solid is not yet
-discretised and says so. The solve is dense, so it is the small-network path. And each filament
-carries ONE current, so skin effect WITHIN a conductor is not represented -- see ``freq``.
+The material is the other half of the input, and it is a **design variable as often as it is a
+constant**. ``.attach(sigma=...)`` takes three spellings, and a gradient flows back through all
+three::
+
+    .attach(sigma=5.8e7)                             # a material
+    .attach(sigma=lambda x, y, z: SIG * rho(x, y))   # a FIELD: the density is the design
+    .attach(sigma=SIG * rho)                         # one value per element
+
+A callable is evaluated at each element -- cell centres for a solid's lattice, midpoints for a wire
+-- and its arity is positional, exactly as an attached FEM coefficient's is, so ``lambda x, y`` is a
+planar field. That is the usual one: a trace is thin, and its material varies across the board
+rather than through the 0.57 mm of it. Reach for the callable over the vector, because it says
+nothing about the pitch and so survives a change of ``size=``, which a per-element vector cannot.
+
+A field is what makes a density (SIMP) topology optimisation expressible here. What it does NOT do
+is move the geometry: the lattice is fixed, so a cell whose conductivity goes to zero is still a
+cell, still joined by bars, and still counted as metal by the thickness runs behind the skin term.
+That is the ordinary fixed-mesh treatment, and it is why a converged density has to be read back out
+as a shape rather than assumed to be one.
+
+**Scope, up front.** A conductor is either a :meth:`jno.Shape.line` tube or a closed-form solid,
+which voxelises onto a lattice shared with every other solid on it. A network containing a lattice
+is applied matrix-free -- that block by FFT -- and solved by GMRES; a network of wires alone has no
+such structure, forms the dense operator, and is therefore the small-network path. Each filament
+carries ONE current and its self-term is the DC geometric mean distance, so the skin effect WITHIN a
+filament is not represented -- see ``freq``.
 """
 
 from __future__ import annotations
@@ -36,8 +59,10 @@ import scipy.sparse as sparse
 from .utils.solver.peec import (
     Filaments,
     bar_filaments,
+    element_centres,
     line_filaments,
     port_spec,
+    resolve_sigma,
     solve_network,
     terminal_nodes,
 )
@@ -218,7 +243,17 @@ class PEEC:
         parts, owners = [], []  # (Filaments, per-filament sigma) and the shapes they came from
         if lines:
             fl = line_filaments(lines)
-            parts.append((fl, jnp.asarray(jnp.stack([jnp.asarray(x) for x in line_sig]))[np.asarray(fl.part)]))
+            # Each conductor's conductivity is resolved over ITS OWN filaments, so a field sees the
+            # midpoints of the wire it belongs to and a per-element vector is that wire's own count.
+            cen, fpart = element_centres(fl), np.asarray(fl.part)
+            chunks, order = [], []
+            for i, v in enumerate(line_sig):
+                sel = np.flatnonzero(fpart == i)
+                order.append(sel)
+                chunks.append(resolve_sigma(v, cen[sel], f"conductor {line_names[i]!r}"))
+            inv = np.empty(len(fpart), dtype=int)
+            inv[np.concatenate(order)] = np.arange(len(fpart))
+            parts.append((fl, jnp.concatenate([jnp.asarray(c) for c in chunks])[inv]))
             owners.append(lines)
         if solids:
             # ONE grid for every solid. Separate lattices couple through a block that is not Toeplitz,
