@@ -1644,10 +1644,27 @@ def assemble_fem_native(
                 # P0 -> this cell's single value. Width 1, so the kernel takes its scalar branch and
                 # broadcasts it over the quad points -- which is what a per-element constant is.
                 pv.append(jnp.reshape(flat[c], (1,)))
-            else:
+            elif name in _field_param_names:
                 # Nodal field parameter -> this cell's local nodal values on its field's mesh (field 0
                 # for a single-field problem; the resolved field for a coupled one).
-                pv.append(flat[cells_f_j[_field_param_field_idx][c]] if name in _field_param_names else flat[:1])
+                pv.append(flat[cells_f_j[_field_param_field_idx][c]])
+            else:
+                # A parameter that is on NO FE space is a scalar, broadcast over the cell. An array
+                # here has no cell-to-value map, so `flat[:1]` would spread its FIRST entry over the
+                # whole mesh -- silently, and the answer stays plausible: measured 361.19 K against
+                # the 355.72 K the same 2789 values give when declared on P0. Refuse it instead.
+                # (Shapes are static under trace, so this branch is decided at trace time.)
+                if flat.shape[0] > 1:
+                    raise ValueError(
+                        f"jno.fem: the weak form uses parameter {name!r}, which carries "
+                        f"{flat.shape[0]} values but is bound to no FE space, so nothing says which "
+                        "value belongs to which element -- only the first would be used, for every "
+                        "element. Declare it on a space instead: "
+                        "`jno.np.parameter(d.fem_symbols(space='P0')[1])` for one value per ELEMENT "
+                        "(the design variable of a density topology optimisation), or "
+                        "`jno.np.parameter(u)` for one per NODE. A genuine scalar keeps shape (1,)."
+                    )
+                pv.append(flat[:1])
         return tv + tuple(pv)
 
     # -------------------------------------------------------------------------
