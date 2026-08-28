@@ -83,7 +83,7 @@ def _leaf(shape, what):
     return prim
 
 
-def line_filaments(shape, size: float = None, quad: int = 3):
+def line_filaments(shape, size: float = None, quad: int = 3, points=None):
     """Discretise :meth:`jno.Shape.line` conductors into filaments, with Gauss sub-points.
 
     Args:
@@ -94,6 +94,17 @@ def line_filaments(shape, size: float = None, quad: int = 3):
         quad: Gauss points per filament. One point is 7.8 % low against a closed form on the worst
             case (collinear neighbours); 2 gives 2.5 %, 3 gives 1.2 %, 8 gives 0.21 %. Three is the
             default because it is where the curve flattens against its cost.
+        points: optional replacement polyline vertices, one ``(n_i, 3)`` array per shape, which may
+            be TRACED. Everything geometric is then computed from them in jax, so a gradient flows
+            back to the vertices -- the r-adaptivity contract, where the topology is fixed and only
+            the positions move. What stays fixed is decided from the shape's OWN vertices: how many
+            filaments a segment is cut into, and which endpoints are the same node. Move a vertex far
+            enough to change either and the answer is for the topology you started with, silently --
+            so use this to refine a routing, not to redesign one.
+
+            ``nodes`` is then traced too, so :func:`terminal_nodes` -- which reads coordinates --
+            must be called ONCE on the reference geometry and its indices reused. Which nodes a pad
+            owns is structural, like the numbering it indexes into.
 
     Returns:
         :class:`Filaments`.
@@ -106,71 +117,93 @@ def line_filaments(shape, size: float = None, quad: int = 3):
     are meant to stay apart.
 
     Each polyline is subdivided so that no filament exceeds ``size``, and each original vertex stays
-    a filament boundary — a bend must not fall inside a straight element.
+    a filament boundary -- a bend must not fall inside a straight element.
     """
     shapes = list(shape) if isinstance(shape, (list, tuple)) else [shape]
-    starts, tangs, lens, ends, radii, part = [], [], [], [], [], []
+    if points is not None and len(points) != len(shapes):
+        raise ValueError(f"peec.line_filaments: {len(points)} point arrays for {len(shapes)} shapes.")
+
+    # ---- host pass: the STRUCTURE, read off the shapes' own vertices --------------------------
+    # Which segment each filament belongs to and where along it, so the geometry can be rebuilt from
+    # any vertices later; and the node numbering, which a moving vertex must not change.
+    verts, base, ia, ib, jj, kk, radii, part = [], 0, [], [], [], [], [], []
+    ends = []
     for si, sh in enumerate(shapes):
         prim = _leaf(sh, "Line")
         h = float(size if size is not None else (sh._size if sh._size is not None else 0.0))
         if h <= 0:
             raise ValueError(
                 "peec.line_filaments: no filament length. Pass size=, or give the Shape a size= when "
-                "you build it — a filament count cannot be guessed from the geometry alone."
+                "you build it -- a filament count cannot be guessed from the geometry alone."
             )
         P = np.asarray(prim.points, dtype=float).reshape(-1, 3)
-        for a, d in zip(P[:-1], P[1:] - P[:-1]):
+        verts.append(P)
+        for e, (a, d) in enumerate(zip(P[:-1], P[1:] - P[:-1])):
             ln0 = float(np.linalg.norm(d))
             if ln0 <= 0.0:
                 continue
-            k = max(1, int(np.ceil(ln0 / h)))  # vertices stay filament boundaries: subdivide within a segment
-            u = d / ln0
-            step = ln0 / k
+            k = max(1, int(np.ceil(ln0 / h)))  # vertices stay filament boundaries: subdivide within
+            u, step = d / ln0, ln0 / k
             for j in range(k):
-                starts.append(a + u * (step * (j + 0.5)))
-                tangs.append(u)
-                lens.append(step)
-                ends.append((a + u * (step * j), a + u * (step * (j + 1))))
+                ia.append(base + e)
+                ib.append(base + e + 1)
+                jj.append(j)
+                kk.append(k)
                 radii.append(prim.r)
                 part.append(si)
-    if not starts:
+                ends.append((a + u * (step * j), a + u * (step * (j + 1))))
+        base += len(P)
+    if not ends:
         raise ValueError("peec.line_filaments: the polyline has no segment longer than zero.")
 
-    cen = np.asarray(starts)
-    tan = np.asarray(tangs)
-    ln = np.asarray(lens)
+    ia, ib = np.asarray(ia, dtype=int), np.asarray(ib, dtype=int)
+    jj, kk = np.asarray(jj, dtype=float), np.asarray(kk, dtype=float)
     rad = np.asarray(radii)
-    n = len(ln)
-
-    gx, gw = np.polynomial.legendre.leggauss(int(quad))
-    # sub-points along each filament, and moments that sum to `tangent * length` per filament
-    pos = (cen[:, None, :] + 0.5 * ln[:, None, None] * gx[None, :, None] * tan[:, None, :]).reshape(-1, 3)
-    mom = (tan[:, None, :] * (ln[:, None] * gw[None, :] * 0.5)[:, :, None]).reshape(-1, 3)
-    group = np.repeat(np.arange(n), int(quad))
-    self_g = np.asarray(wire_self(jnp.asarray(ln), jnp.asarray(rad)))
-    area = np.pi * rad**2
+    n = len(ia)
 
     # nodes = filament endpoints snapped to a grid far below the element size
-    tol = 1e-9 * float(ln.min())
-    key, xyz, ir, ic, iv = {}, [], [], [], []
+    tol = 1e-9 * float(min(np.linalg.norm(b - a) for a, b in ends))
+    key, node_of, ir, ic, iv = {}, [], [], [], []
     for k, (a, b) in enumerate(ends):
-        for pt, sign in ((a, +1.0), (b, -1.0)):
+        for pt, sign, off in ((a, +1.0, 0.0), (b, -1.0, 1.0)):
             t = tuple(np.round(np.asarray(pt) / tol).astype(np.int64).tolist())
             if t not in key:
-                key[t] = len(xyz)
-                xyz.append(np.asarray(pt, dtype=float))
+                key[t] = len(node_of)
+                node_of.append((k, off))  # one filament and which end of it defines this node
             ir.append(key[t])
             ic.append(k)
             iv.append(sign)
+    nfil = np.asarray([f for f, _ in node_of], dtype=int)
+    noff = np.asarray([o for _, o in node_of], dtype=float)
+
+    # ---- jax pass: every GEOMETRIC quantity, from vertices that may be traced -----------------
+    PTS = jnp.concatenate([jnp.asarray(v, dtype=float) for v in (points if points is not None else verts)])
+    a3, b3 = PTS[ia], PTS[ib]
+    d3 = b3 - a3
+    seg = jnp.sqrt(jnp.sum(d3 * d3, axis=1))
+    u3 = d3 / seg[:, None]
+    ln = seg / kk
+    cen = a3 + u3 * (ln * (jj + 0.5))[:, None]
+    nodes = PTS[ia[nfil]] + u3[nfil] * (ln[nfil] * (jj[nfil] + noff))[:, None]
+
+    gx, gw = np.polynomial.legendre.leggauss(int(quad))
+    gx, gw = jnp.asarray(gx), jnp.asarray(gw)
+    # sub-points along each filament, and moments that sum to `tangent * length` per filament
+    pos = (cen[:, None, :] + 0.5 * ln[:, None, None] * gx[None, :, None] * u3[:, None, :]).reshape(-1, 3)
+    mom = (u3[:, None, :] * (ln[:, None] * gw[None, :] * 0.5)[:, :, None]).reshape(-1, 3)
+    group = np.repeat(np.arange(n), int(quad))
+    self_g = wire_self(ln, jnp.asarray(rad))
+    area = jnp.pi * jnp.asarray(rad) ** 2
+
     return Filaments(
-        jnp.asarray(pos),
-        jnp.asarray(mom),
-        jnp.asarray(self_g),
+        pos,
+        mom,
+        self_g,
         group,
-        sp.coo_matrix((iv, (ir, ic)), shape=(len(xyz), n)).tocsr(),
-        jnp.asarray(ln),
-        jnp.asarray(area),
-        jnp.asarray(np.asarray(xyz)),
+        sp.coo_matrix((iv, (ir, ic)), shape=(len(node_of), n)).tocsr(),
+        ln,
+        area,
+        nodes,
         np.asarray(part, dtype=int),
         jnp.asarray(rad),
         np.ones(n, dtype=bool),
