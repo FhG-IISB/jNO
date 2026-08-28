@@ -255,40 +255,61 @@ def test_a_frequency_sweep_reuses_the_compilation():
     assert abs(zs[2].imag) > abs(zs[0].imag)  # and they are genuinely different frequencies
 
 
-def test_the_matrix_free_gradient_needs_a_bigger_krylov_subspace_and_says_so():
-    """The TANGENT system is far harder than the primal, and jax's gmres does not report failing on it.
+def test_the_matrix_free_gradient_is_exact_at_the_default_restart():
+    """The ADJOINT gets P^T, not P, and that is what makes it converge like the primal.
 
-    Measured on this network, where the answer is -1.412010e-12: restart 16 returns -2.80e-14, restart
-    64 returns -4.03e-14, restart 200 returns it exactly. The forward solve converges in two cycles at
-    restart 16 throughout, so nothing about it reveals the problem — which is why the small restart is
-    refused for differentiation rather than allowed to return a plausible wrong number.
+    jax's own gmres wraps itself in a custom_linear_solve that solves the transposed system with the
+    FORWARD preconditioner -- which is not a preconditioner for that system at all. The tangent
+    therefore looked far harder than the primal, and nothing reported it, because jax's gmres does
+    not raise on failing to converge. Measured before the fix, differentiating w.r.t. a conductivity
+    scale on a lattice of this family:
+
+        elements    28        136       592
+        cost        4.0x      10.5x     310x        of the forward solve
+        vs FD       7e-09     6e-08     1.1         <- wrong SIGN, not merely imprecise
+
+    and after, with the adjoint preconditioned by P^T at the SAME restart of 16:
+
+        cost        4.2x      4.0x      2.5x
+        vs FD       5e-09     5e-08     1e-08
+
+    The 592-element case is the one that matters: it is where the old path was silently wrong.
     """
-    f = bar_filaments(jno.Shape.box(0, 0, 0, 0.040, 0.004, 0.002), size=(0.002, 0.002, 0.002))
+    f = bar_filaments(jno.Shape.box(0, 0, 0, 0.040, 0.008, 0.002), size=(0.001, 0.001, 0.002))
     p = np.asarray(f.nodes)
-    a = terminal_nodes(f, lambda q: q[:, 0] < p[:, 0].min() + 1e-9)
-    b = terminal_nodes(f, lambda q: q[:, 0] > p[:, 0].max() - 1e-9)
+    assert len(np.asarray(f.length)) > 500  # big enough that the old path returned the wrong sign
+    term = {
+        "A": terminal_nodes(f, lambda q: q[:, 0] < p[:, 0].min() + 1e-9),
+        "B": terminal_nodes(f, lambda q: q[:, 0] > p[:, 0].max() - 1e-9),
+    }
 
-    def port_r(sig, mf, restart=16):
-        _c, _phi, inj = solve_network(
-            f,
-            sig,
-            {"A": a, "B": b},
-            [("A", "B", 1.0 + 0j)],
-            omega=2 * np.pi * 1e6,
-            matrix_free=mf,
-            restart=restart,
-        )
+    def port_r(scale, mf):
+        _c, _phi, inj = solve_network(f, SIGCU * scale, term, [("A", "B", 1.0 + 0j)], omega=2 * np.pi * 1e6, matrix_free=mf)
         return jnp.real(1.0 / inj["A"])
 
-    fd = float((port_r(SIGCU * 1.0001, False) - port_r(SIGCU * 0.9999, False)) / (0.0002 * SIGCU))
-    assert abs(float(jax.grad(lambda s: port_r(s, False))(SIGCU)) / fd - 1) < 1e-6  # dense is exact
+    h = 1e-4
+    fd = (float(port_r(1.0 + h, True)) - float(port_r(1.0 - h, True))) / (2 * h)
+    g = float(jax.grad(lambda s: port_r(s, True))(1.0))
+    assert fd < 0  # more conductive, less resistive -- so a sign error is visible
+    assert abs(g / fd - 1) < 1e-6
 
-    with pytest.raises(NotImplementedError, match="WRONG gradient"):
-        jax.grad(lambda s: port_r(s, True, 16))(SIGCU)
 
-    g = float(jax.grad(lambda s: port_r(s, True, 200))(SIGCU))
-    assert abs(g / fd - 1) < 1e-6  # and with the subspace it needs, it is exact too
-    assert g < 0  # more conductive, less resistive
+def test_the_dense_and_matrix_free_gradients_agree():
+    """The dense path is exact by construction, so it is the oracle for the iterative one."""
+    f = bar_filaments(jno.Shape.box(0, 0, 0, 0.040, 0.008, 0.002), size=(0.002, 0.002, 0.002))
+    p = np.asarray(f.nodes)
+    term = {
+        "A": terminal_nodes(f, lambda q: q[:, 0] < p[:, 0].min() + 1e-9),
+        "B": terminal_nodes(f, lambda q: q[:, 0] > p[:, 0].max() - 1e-9),
+    }
+
+    def port_r(scale, mf):
+        _c, _phi, inj = solve_network(f, SIGCU * scale, term, [("A", "B", 1.0 + 0j)], omega=2 * np.pi * 1e6, matrix_free=mf)
+        return jnp.real(1.0 / inj["A"])
+
+    dense = float(jax.grad(lambda s: port_r(s, False))(1.0))
+    free = float(jax.grad(lambda s: port_r(s, True))(1.0))
+    assert abs(free / dense - 1) < 1e-6
 
 
 def test_a_welded_network_converges_in_a_mesh_independent_number_of_steps():
