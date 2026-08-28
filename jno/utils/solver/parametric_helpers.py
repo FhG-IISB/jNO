@@ -50,7 +50,13 @@ def _is_frozen_parameter(node) -> bool:
     (trainable) unknown: the integrand evaluator resolves it as a coordinate function / constant at
     the quadrature points (see ``fem_utils._eval_frozen_coefficient``), so the system assembles
     non-parametrically. Excluded from runtime-parameter detection/collection below."""
-    return _is_runtime_scalar_parameter(node) and bool(getattr(getattr(node, "model", None), "_frozen", False))
+    model = getattr(node, "model", None)
+    if getattr(model, "_derived_expr", None) is not None:
+        # `.derives(...)` also marks the parameter untrained, but it is NOT a known coefficient:
+        # its value is recomputed every solve, so it must keep the runtime-parameter threading
+        # (and with it the per-cell / per-node gather) rather than being baked in at assembly.
+        return False
+    return _is_runtime_scalar_parameter(node) and bool(getattr(model, "_frozen", False))
 
 
 def _contains_runtime_parameter(node) -> bool:
