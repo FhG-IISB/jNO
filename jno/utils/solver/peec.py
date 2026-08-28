@@ -1175,6 +1175,11 @@ def bar_filaments(shape, size=None, quad: int = 3, sigma=None):
             "axis": axis,
             "masks": masks,
             "sigma": bar_sigma,
+            # The FFT generator needs one length and one self term PER AXIS FAMILY, and on a lattice
+            # both are constants of the grid. They used to be sampled out of the per-element arrays,
+            # which quietly required those to be concrete -- so splicing a traced block into a welded
+            # network (a moving bond wire on a fixed trace layer) failed inside the lattice half.
+            "self": {int(ax): float(np.asarray(self_g)[axis == ax][0]) for ax in sorted(set(axis.tolist()))},
         },
     )
 
@@ -1210,7 +1215,6 @@ def lattice_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3):
             "conductors together breaks the structure even when each part had it."
         )
     n, d, axis = lat["n"], lat["d"], np.asarray(lat["axis"])
-    ln = np.asarray(fil.length)
     gx, gw = np.polynomial.legendre.leggauss(int(quad))
 
     masks = lat.get("masks") or {}
@@ -1219,19 +1223,19 @@ def lattice_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3):
     for ax in sorted(set(axis.tolist())):
         k = int((axis == ax).sum())
         shape = tuple(v - 1 if i == ax else v for i, v in enumerate(n))
-        length = float(ln[axis == ax][0])
+        length = float(d[ax])  # a lattice element IS the pitch; see the note on lattice["self"]
         sub = np.zeros((int(quad), 3))
         sub[:, ax] = 0.5 * length * gx
         w = length * gw * 0.5
-        sg = float(np.asarray(fil.self_g)[axis == ax][0])
+        sg = float(lat["self"][int(ax)])
         ops.append(lattice_operator(shape, d, g, sg, sub=sub, w=w))
         slices.append(slice(start, start + k))
         shapes.append(shape)
         m = masks.get(ax)
         where.append(None if m is None else jnp.asarray(np.flatnonzero(np.asarray(m).reshape(-1))))
         start += k
-    if start != len(ln):
-        raise ValueError(f"peec.lattice_apply: the families cover {start} of {len(ln)} bars; this is a bug.")
+    if start != len(axis):
+        raise ValueError(f"peec.lattice_apply: the families cover {start} of {len(axis)} bars; this is a bug.")
 
     def real_apply(cur):
         out = []
@@ -1261,12 +1265,16 @@ def lattice_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3):
 
 
 def _lattice_diag(fil: Filaments, mu0: float):
-    """``Lp_aa`` for every bar — the diagonal a Jacobi preconditioner needs, without forming ``Lp``."""
-    mom = np.asarray(fil.mom)
+    """``Lp_aa`` for every bar -- the diagonal a Jacobi preconditioner needs, without forming ``Lp``.
+
+    In jax rather than numpy so a TRACED geometry survives it: a moving bond wire welded to a fixed
+    trace layer makes the moments tracers, and this sits on the path to the preconditioner. The
+    values are only ever consumed by a host callback, which sees them concrete at run time.
+    """
     grp = np.asarray(fil.group)
-    tot = np.zeros((int(grp.max()) + 1, mom.shape[1]))
-    np.add.at(tot, grp, mom)
-    return np.asarray(fil.self_g) * (tot * tot).sum(1) * (mu0 / (4.0 * np.pi))
+    mom = jnp.asarray(fil.mom)
+    tot = jax.ops.segment_sum(mom, jnp.asarray(grp), num_segments=int(grp.max()) + 1)
+    return jnp.asarray(fil.self_g) * (tot * tot).sum(1) * (mu0 / (4.0 * jnp.pi))
 
 
 def _sub_slice(fil, lo, hi):
@@ -1447,16 +1455,21 @@ def near_block(fil: Filaments, g, mu_scale=1.0, reach=2.0):
     node AND turns the Schur complement dense: it trades the problem rather than solving it. This is
     kept because it is the measured foundation for whatever does.
     """
-    mom = np.asarray(fil.mom)
+    # Read the geometry NON-differentiably. A preconditioner only has to accelerate, so it is built
+    # from wherever the geometry currently is and no gradient runs through it -- which is what lets a
+    # moving conductor (a bond wire being routed) reach this at all. Under `jax.grad` the primal is
+    # concrete, so this is the current configuration and not a stale one.
+    cut = lambda a: np.asarray(jax.lax.stop_gradient(jnp.asarray(a)))
+    mom = cut(fil.mom)
     grp = np.asarray(fil.group)
-    pos = np.asarray(fil.pos)
+    pos = cut(fil.pos)
     ne = int(grp.max()) + 1
     cen = np.zeros((ne, 3))
     np.add.at(cen, grp, pos)
     cen /= np.bincount(grp, minlength=ne)[:, None]
     tot = np.zeros((ne, mom.shape[1]))
     np.add.at(tot, grp, mom)
-    size = float(np.mean(np.asarray(fil.length)))
+    size = float(np.mean(cut(fil.length)))
     rad = reach * size
 
     from scipy.spatial import cKDTree
