@@ -365,7 +365,7 @@ class BuiltPEEC:
         # tracers under a gradient -- so it is resolved once here, on the reference geometry.
         self.nodes = {t: terminal_nodes(fil, sh) for t, sh in terms.items()}
 
-    def solve(self, sigma=None):
+    def solve(self, sigma=None, devices=None):
         """Solve at every frequency and return a :class:`PEECSolution`.
 
         Args:
@@ -374,9 +374,29 @@ class BuiltPEEC:
                 vector per element. This is where a traced design variable enters a jitted loop:
                 the shape captured at build time cannot close over a tracer that does not exist
                 yet, so the value is handed in at solve instead.
+            devices: optional ``{terminal: Z}`` overriding a two-terminal device's impedance, keyed
+                by the terminal its constraint was written on. The same story as ``sigma`` and for
+                the same reason: a device value that DEPENDS on the solved state cannot be a
+                constant in the constraint list. A SiC die's on-resistance rises about 0.5 %/K, so
+                an electro-thermal fixed point has to re-impress it every pass -- and it is the
+                dominant feedback, since the dies carry most of the loss and only theirs runs away.
         """
         fil, nodes, terms = self.fil, self.nodes, self.terminals
         sigma = self._resolve(sigma)
+        dev = self.devices
+        if devices:
+            at = {d[0]: i for i, d in enumerate(dev)}
+            dev = list(dev)
+            for name, z in devices.items():
+                if name not in at:
+                    raise ValueError(
+                        f"jno.peec: devices={{{name!r}: ...}} names no device of this network. A device is "
+                        f"keyed by the terminal its constraint was written on -- `v(A) - v(B) - Z*i(A)` is "
+                        f"keyed 'A'. This network's devices are {sorted(at)}."
+                    )
+                a, b, _z = dev[at[name]]
+                dev[at[name]] = (a, b, z)
+            dev = tuple(dev)
 
         cur, port, drive, inject = [], [], [], []
         for f in self.freq:
@@ -387,7 +407,9 @@ class BuiltPEEC:
                 self.sources,
                 self.grounds,
                 self.currents,
-                self.devices,
+                dev,
+                # the DECLARED impedances, always concrete, for the host-built preconditioner
+                device_host={d[0]: d[2] for d in self.devices},
                 omega=2 * np.pi * float(f),
             )
             cur.append(c)
