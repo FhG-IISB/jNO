@@ -298,7 +298,7 @@ def line_filaments(shape, size: float = None, quad: int = 3, points=None, radii=
     pos = (cen[:, None, :] + 0.5 * ln[:, None, None] * gx[None, :, None] * u3[:, None, :]).reshape(-1, 3)
     mom = (u3[:, None, :] * (ln[:, None] * gw[None, :] * 0.5)[:, :, None]).reshape(-1, 3)
     group = np.repeat(np.arange(n), int(quad))
-    self_g = wire_self(ln, jnp.asarray(rad))
+    self_g = wire_self(ln, rad if isinstance(rad, jax.core.Tracer) else np.asarray(rad))
     area = jnp.pi * jnp.asarray(rad) ** 2
 
     return Filaments(
@@ -538,6 +538,40 @@ def terminal_nodes(fil: Filaments, where):
             "connect to; split the polyline so a vertex lands there."
         )
     return idx
+
+
+def _converged(resid, limit):
+    if not (resid < limit):
+        raise ValueError(
+            f"jno.peec: the matrix-free solve did not converge (relative residual {resid:.2e}). "
+            "Report it rather than trusting the numbers; the dense path is available as "
+            "matrix_free=False for a network small enough to form."
+        )
+
+
+def _finite(ok):
+    if not ok:
+        raise ValueError(
+            "jno.peec: the circuit equations are singular — the solve returned non-finite currents. "
+            "The usual cause is a part of the network that no port reaches, or a conductor with no "
+            "path back to the reference."
+        )
+
+
+def _check(value, fn, *args):
+    """Run a correctness guard on ``value``, eagerly OR under ``jit``.
+
+    The house pattern elsewhere is to SKIP a concrete-only guard when the value is a tracer, which
+    silently disarms it exactly when a long unattended optimisation is running. This solver is one
+    that can diverge quietly -- a transpose solve reaching 1e+26 while the forward converged is a
+    thing that has actually happened here -- so the guard is routed through ``jax.debug.callback``
+    instead. That fires on the HOST with the runtime value, so it survives ``jit`` and still raises;
+    the cost is one sync point per solve, which against a Krylov solve is nothing.
+    """
+    if isinstance(value, jax.core.Tracer):
+        jax.debug.callback(lambda v, *a: fn(np.asarray(v).item() if np.ndim(v) == 0 else v, *a), value, *args)
+    else:
+        fn(np.asarray(value).item() if np.ndim(value) == 0 else value, *args)
 
 
 def solve_network(
@@ -825,8 +859,16 @@ def solve_network(
         # Keyed by the network's IDENTITY, and the network is kept alive in the entry: an id alone is
         # reusable after a garbage collection, and a stale hit would silently run the previous
         # geometry's closures.
+        #
+        # And NOT reused across traces. A closure built inside a jit is only valid inside that jit:
+        # even a bare `jnp.zeros(())` made there binds to the trace, so a later hit raises
+        # UnexpectedTracerError. That never fired while every call rediscretised -- a fresh `fil`
+        # missed the cache every time -- and appeared the moment `.build()` made the identity stable.
+        # Skipping it under a trace costs nothing: XLA caches the compiled executable, so the reuse
+        # this was written for (an eager sweep over frequencies) is the only case it was ever paying.
+        traced = isinstance(jnp.zeros(()), jax.core.Tracer)
         key = (id(fil), ne, nn, float(tol), int(restart))
-        entry = _KRYLOV_CACHE.get(key)
+        entry = None if traced else _KRYLOV_CACHE.get(key)
         cached = entry[1] if (entry is not None and entry[0] is fil) else None
 
         def _factorise(zd, w_now):
@@ -932,31 +974,22 @@ def solve_network(
                     _gm(lambda v: P_inv_T(v, zd)),
                 )
 
-            if len(_KRYLOV_CACHE) > 8:  # bounded: this holds compiled code and a reference to a network
-                _KRYLOV_CACHE.pop(next(iter(_KRYLOV_CACHE)))
-            _KRYLOV_CACHE[key] = (fil, _run)
+            if not traced:
+                if len(_KRYLOV_CACHE) > 8:  # bounded: holds compiled code and a reference to a network
+                    _KRYLOV_CACHE.pop(next(iter(_KRYLOV_CACHE)))
+                _KRYLOV_CACHE[key] = (fil, _run)
         else:
             _run = cached
 
         x = _run(b, jnp.asarray(w), zdiag, Rc)
         resid = jnp.linalg.norm(M_apply(x, w, zdiag, Rc) - b) / jnp.maximum(jnp.linalg.norm(b), 1e-300)
-        if not bool(resid < max(1e2 * float(tol), 1e-9)):
-            raise ValueError(
-                f"jno.peec: the matrix-free solve did not converge (relative residual {float(resid):.2e}). "
-                "Report it rather than trusting the numbers; the dense path is available as "
-                "matrix_free=False for a network small enough to form."
-            )
+        _check(resid, _converged, max(1e2 * float(tol), 1e-9))
     else:
         top = jnp.concatenate([Z, -jnp.asarray(Asp0.toarray()).T.astype(complex)], axis=1)
         bot = jnp.zeros((nn, ne + nn), dtype=complex).at[crow, ccol].add(jnp.asarray(cval))
         M = jnp.concatenate([top, bot], axis=0)
         x = jnp.linalg.solve(M, b)
-    if not bool(jnp.all(jnp.isfinite(x))):
-        raise ValueError(
-            "jno.peec: the circuit equations are singular — the solve returned non-finite currents. "
-            "The usual cause is a part of the network that no port reaches, or a conductor with no "
-            "path back to the reference."
-        )
+    _check(jnp.all(jnp.isfinite(x)), _finite)
     cur, phi = x[:ne], x[ne:]
     inj = {t: jnp.asarray(np.asarray(Asp0[idx[t]].sum(0)).reshape(-1), dtype=complex) @ cur for t in names}
     return cur, phi, inj
@@ -1265,27 +1298,31 @@ def bar_filaments(shape, size=None, quad: int = 3, sigma=None):
     # two plates is the normal case, not an error -- and it is the same rule a per-cell conductivity
     # needs, so both resolve here: the conductivity is fixed to the CELLS, and the bars read it.
     # For one conductivity per conductor this degenerates to exactly the old per-conductor form.
-    bar_sigma = None
-    if sigma is not None:
-        vals = list(sigma) if isinstance(sigma, (list, tuple)) else [sigma]
+    # Resolved per conductor over ITS OWN cells, then scattered back: a field is evaluated where its
+    # conductor actually is, and a per-cell vector is that conductor's cell count, not the whole
+    # grid's -- the grid spans every conductor sharing it, which is not a design variable.
+    #
+    # Kept as a CLOSURE over the concrete pieces rather than a value, so the conductivity can be
+    # re-resolved later without redoing any of the host work above. That is what lets `.build()`
+    # freeze the discretisation once and still take a traced conductivity on every solve.
+    _sel = [np.flatnonzero(cell_part == si) for si in range(len(shapes))]
+    _inv = np.empty(len(nodes), dtype=int)
+    _inv[np.concatenate(_sel) if _sel else np.zeros(0, dtype=int)] = np.arange(len(nodes))
+    _names = [getattr(sh, "_region_name", None) or f"#{i}" for i, sh in enumerate(shapes)]
+
+    def resolve(values):
+        """One conductivity per conductor -> one per bar. Safe to call under a trace."""
+        vals = list(values) if isinstance(values, (list, tuple)) else [values]
         if len(vals) != len(shapes):
             raise ValueError(f"peec.bar_filaments: {len(vals)} conductivities for {len(shapes)} conductors.")
-        # Resolved per conductor over ITS OWN cells, then scattered back: a field is evaluated where
-        # its conductor actually is, and a per-cell vector is that conductor's cell count, not the
-        # whole grid's -- the grid spans every conductor sharing it, which is not a design variable.
-        chunks, order = [], []
-        for si, v in enumerate(vals):
-            sel = np.flatnonzero(cell_part == si)
-            order.append(sel)
-            nm = getattr(shapes[si], "_region_name", None)
-            chunks.append(resolve_sigma(v, nodes[sel], f"conductor {nm!r}" if nm else f"conductor #{si}"))
-        order = np.concatenate(order) if order else np.zeros(0, dtype=int)
-        inv = np.empty(len(nodes), dtype=int)
-        inv[order] = np.arange(len(order))
-        cell_sigma = jnp.concatenate([jnp.asarray(c) for c in chunks])[inv]
+        cell_sigma = jnp.concatenate(
+            [jnp.asarray(resolve_sigma(v, nodes[sl], f"conductor {nm!r}")) for v, sl, nm in zip(vals, _sel, _names)]
+        )[_inv]
         s0, s1 = cell_sigma[end_a], cell_sigma[end_b]
-        bar_sigma = 2.0 * s0 * s1 / (s0 + s1)
-    elif not np.all(owner[:, 0] == owner[:, 1]):
+        return 2.0 * s0 * s1 / (s0 + s1)
+
+    bar_sigma = resolve(sigma) if sigma is not None else None
+    if sigma is None and not np.all(owner[:, 0] == owner[:, 1]):
         bad = int(np.flatnonzero(owner[:, 0] != owner[:, 1])[0])
         raise ValueError(
             f"peec.bar_filaments: a bar joins cells of conductors {owner[bad, 0]} and {owner[bad, 1]}, so "
@@ -1298,7 +1335,7 @@ def bar_filaments(shape, size=None, quad: int = 3, sigma=None):
     mom = (tan[:, None, :] * (ln[:, None] * gw[None, :] * 0.5)[:, :, None]).reshape(-1, 3)
     group = np.repeat(np.arange(nb), int(quad))
     wt = np.stack([np.array([d[i] for i in range(3) if i != ax]) for ax in axis])
-    self_g = np.asarray(bar_self(jnp.asarray(ln), jnp.asarray(wt[:, 0]), jnp.asarray(wt[:, 1])))
+    self_g = bar_self(ln, wt[:, 0], wt[:, 1])  # numpy in, numpy out: a host constant of the grid
 
     ir, ic, iv, off = [], [], [], 0
     for na, nb_ in ends:
@@ -1329,6 +1366,9 @@ def bar_filaments(shape, size=None, quad: int = 3, sigma=None):
             "axis": axis,
             "masks": masks,
             "sigma": bar_sigma,
+            # The conductivity RESOLVER, not just the value it produced: `.build()` keeps it and
+            # calls it again per solve, so a design variable never re-runs the host discretisation.
+            "resolve": resolve,
             # The FFT generator needs one length and one self term PER AXIS FAMILY, and on a lattice
             # both are constants of the grid. They used to be sampled out of the per-element arrays,
             # which quietly required those to be concrete -- so splicing a traced block into a welded
@@ -1432,10 +1472,15 @@ def _lattice_diag(fil: Filaments, mu0: float):
 
 
 def _sub_slice(fil, lo, hi):
-    """The sub-point rows of ``fil`` belonging to elements ``[lo, hi)``, and their local group labels."""
+    """The sub-point rows of ``fil`` belonging to elements ``[lo, hi)``, and their local group labels.
+
+    Both stay NUMPY. They are structural -- which sub-points belong to which element -- and routing
+    them through jnp made them trace-bound, so the caller's `np.asarray` on the labels raised inside
+    a jit. Indexing a jnp array with a numpy index array works exactly the same.
+    """
     grp = np.asarray(fil.group)
     m = (grp >= lo) & (grp < hi)
-    return jnp.asarray(np.flatnonzero(m)), jnp.asarray(grp[m] - lo), int(hi - lo)
+    return np.flatnonzero(m), grp[m] - lo, int(hi - lo)
 
 
 def cross_block(pos_a, mom_a, grp_a, na, pos_b, mom_b, grp_b, nb, g, scale=1.0, chunk=2048):
@@ -1490,7 +1535,7 @@ def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3):
             jnp.asarray(fil.pos)[rows],
             jnp.asarray(fil.mom)[rows],
             jnp.asarray(fil.self_g)[lo:hi],
-            np.asarray(gl),
+            gl,
             None,
             jnp.asarray(fil.length)[lo:hi],
             jnp.asarray(fil.area)[lo:hi],
@@ -1609,11 +1654,31 @@ def near_block(fil: Filaments, g, mu_scale=1.0, reach=2.0):
     node AND turns the Schur complement dense: it trades the problem rather than solving it. This is
     kept because it is the measured foundation for whatever does.
     """
+
     # Read the geometry NON-differentiably. A preconditioner only has to accelerate, so it is built
     # from wherever the geometry currently is and no gradient runs through it -- which is what lets a
     # moving conductor (a bond wire being routed) reach this at all. Under `jax.grad` the primal is
     # concrete, so this is the current configuration and not a stale one.
-    cut = lambda a: np.asarray(jax.lax.stop_gradient(jnp.asarray(a)))
+    def cut(a):
+        """One geometric array, on the host.
+
+        Not routed through ``jnp`` first: inside a jit even a concrete array re-wrapped that way
+        becomes trace-bound, and reading it back raises -- while the geometry of a BUILT network is
+        already concrete and can simply be read. The ``stop_gradient`` path stays for the case it
+        was written for, a traced geometry under ``jax.grad``, where the primal is still concrete.
+        """
+        if not isinstance(a, jax.core.Tracer):
+            return np.asarray(a)
+        try:
+            return np.asarray(jax.lax.stop_gradient(a))
+        except jax.errors.TracerArrayConversionError as e:
+            raise ValueError(
+                "peec: the near-field preconditioner is built on the host from concrete geometry, "
+                "and a geometry that is traced INSIDE a jit has no value to read. Freeze it with "
+                "`jno.peec(...).build()` and vary the conductivity instead, or drop the jit -- "
+                "under jax.grad alone the primal geometry is still concrete."
+            ) from e
+
     mom = cut(fil.mom)
     grp = np.asarray(fil.group)
     pos = cut(fil.pos)

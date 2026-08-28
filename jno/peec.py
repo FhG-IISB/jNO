@@ -42,12 +42,27 @@ cell, still joined by bars, and still counted as metal by the thickness runs beh
 That is the ordinary fixed-mesh treatment, and it is why a converged density has to be read back out
 as a shape rather than assumed to be one.
 
+A design loop wants the geometry decided ONCE. Everything structural -- which cells are metal,
+which nodes a pad owns, which filaments weld to which -- is host work on concrete geometry, and
+``solve()`` redoes all of it every call, which is why it differentiates but does not jit.
+:meth:`peec.build` is that pass done once::
+
+    emag = jno.peec([v(*a) - v(*b) - 1.0], freq=1e6).build()      # host, once
+    loss = jax.jit(lambda rho: emag.solve(sigma={"trace": f(rho)}).L)
+
+What comes back solves in pure jax, so it jits and composes into ``jno.core`` through ``jno.fn``
+exactly as ``fem.solve()`` does -- which is what puts a PEEC objective behind ``.optimizer()``,
+``jno.optimizers.mma`` and ``jno.le``. Measured on a 1,540-bar plate: **42x** on the value and 23x
+on the gradient, because the host pass, not the solve, was the cost. The same split as
+:meth:`jno.precond.ams.build` and :class:`jno.trace.FemLinearSystem`.
+
 **Scope, up front.** A conductor is either a :meth:`jno.Shape.line` tube or a closed-form solid,
 which voxelises onto a lattice shared with every other solid on it. A network containing a lattice
 is applied matrix-free -- that block by FFT -- and solved by GMRES; a network of wires alone has no
 such structure, forms the dense operator, and is therefore the small-network path. Each filament
 carries ONE current and its self-term is the DC geometric mean distance, so the skin effect WITHIN a
-filament is not represented -- see ``freq``.
+filament is not represented -- see ``freq``. A built network freezes its GEOMETRY: a design variable
+may change a conductivity, never a shape, so build again for a new one.
 """
 
 from __future__ import annotations
@@ -240,20 +255,23 @@ class PEEC:
                 solids.append((sh, sig[n]))
                 solid_names.append(n)
 
-        parts, owners = [], []  # (Filaments, per-filament sigma) and the shapes they came from
+        parts, owners, blocks = [], [], []  # (Filaments, sigma), the shapes, and (names, resolver)
         if lines:
             fl = line_filaments(lines)
             # Each conductor's conductivity is resolved over ITS OWN filaments, so a field sees the
             # midpoints of the wire it belongs to and a per-element vector is that wire's own count.
             cen, fpart = element_centres(fl), np.asarray(fl.part)
-            chunks, order = [], []
-            for i, v in enumerate(line_sig):
-                sel = np.flatnonzero(fpart == i)
-                order.append(sel)
-                chunks.append(resolve_sigma(v, cen[sel], f"conductor {line_names[i]!r}"))
+            sel = [np.flatnonzero(fpart == i) for i in range(len(lines))]
             inv = np.empty(len(fpart), dtype=int)
-            inv[np.concatenate(order)] = np.arange(len(fpart))
-            parts.append((fl, jnp.concatenate([jnp.asarray(c) for c in chunks])[inv]))
+            inv[np.concatenate(sel)] = np.arange(len(fpart))
+
+            def line_resolve(vals, _s=sel, _i=inv, _c=cen, _n=tuple(line_names)):
+                return jnp.concatenate(
+                    [jnp.asarray(resolve_sigma(v, _c[q], f"conductor {nm!r}")) for v, q, nm in zip(vals, _s, _n)]
+                )[_i]
+
+            blocks.append((tuple(line_names), line_resolve))
+            parts.append((fl, line_resolve(line_sig)))
             owners.append(lines)
         if solids:
             # ONE grid for every solid. Separate lattices couple through a block that is not Toeplitz,
@@ -262,16 +280,99 @@ class PEEC:
             shs = [sh for sh, _ in solids]
             sgs = [sg for _, sg in solids]
             fb = bar_filaments(shs, sigma=sgs)
-            per = fb.lattice.get("sigma")
-            parts.append((fb, per if per is not None else jnp.stack([jnp.asarray(x) for x in sgs])[np.asarray(fb.part)]))
+            blocks.append((tuple(solid_names), fb.lattice["resolve"]))
+            parts.append((fb, fb.lattice["sigma"]))
             owners.append(shs)
+
+        attached = dict(zip(line_names, line_sig))
+        attached.update({n: sg for n, (_sh, sg) in zip(solid_names, solids)})
+
+        def resolve_all(overrides=None):
+            """Per-filament conductivity in _weld's concatenation order. Safe to call under a trace.
+
+            Every piece it closes over is concrete geometry, so calling it again costs nothing but
+            the arithmetic -- which is what makes a design iteration cheap and a solve jittable.
+            """
+            vals = dict(attached)
+            for n, v in (overrides or {}).items():
+                if n not in vals:
+                    raise ValueError(
+                        f"jno.peec: sigma={{{n!r}: ...}} names no conductor of this network. Its "
+                        f"conductors are {sorted(vals)}. A terminal is not a conductor."
+                    )
+                vals[n] = v
+            return jnp.concatenate([jnp.asarray(fn([vals[n] for n in names])) for names, fn in blocks])
+
         # part index -> region name, in the order _weld renumbers them: lines, then solids
-        return (*_weld(parts, owners), terms, line_names + solid_names)
+        fil, _sigma0 = _weld(parts, owners)
+        return fil, terms, line_names + solid_names, resolve_all
+
+    def build(self) -> "BuiltPEEC":
+        """Freeze the discretisation and return the jittable :class:`BuiltPEEC`.
+
+        Everything structural -- which cells are metal, which nodes a pad owns, which filaments weld
+        to which -- is decided on the HOST from concrete geometry, and none of it can run under a
+        trace. ``.solve()`` does that work every call, so it is differentiable but not jittable, and
+        it redoes the same host pass on every design iteration.
+
+        ``build()`` is that pass, done once. What comes back solves in pure jax, so it jits, and its
+        conductivity is still free to be traced -- which is the split
+        :meth:`jno.precond.ams.build` and :class:`jno.trace.FemLinearSystem` already use::
+
+            emag = jno.peec([v(*a) - v(*b) - 1.0], freq=1e6).build()   # host, once
+            jax.jit(lambda s: emag.solve(sigma={"trace": s}).L)(sig)   # traced, every iteration
+
+        **Scope, up front.** The geometry is frozen, so a design variable may change a conductivity
+        but not a shape: move a conductor, change a pitch or re-route a wire and the answer is for
+        the geometry you built, silently. Build again for a new one. The thickness runs behind the
+        skin term are frozen with it, so overriding a conductivity does not re-label which cells
+        count as one material.
+        """
+        return BuiltPEEC(self, *self._discretise())
 
     def solve(self):
-        """Solve at every frequency and return a :class:`PEECSolution`."""
-        fil, sigma, terms, part_names = self._discretise()  # sigma spread onto the filaments by provenance
-        nodes = {t: terminal_nodes(fil, sh) for t, sh in terms.items()}
+        """Solve at every frequency and return a :class:`PEECSolution`.
+
+        Discretises and solves in one call. For a design loop use :meth:`build` instead and solve
+        the result -- same answer, the host pass done once, and jittable.
+        """
+        return self.build().solve()
+
+
+class BuiltPEEC:
+    """A PEEC network with its discretisation frozen: the jittable, differentiable half.
+
+    Comes from :meth:`peec.build`. Holds the filaments, the terminal node sets and the conductivity
+    resolvers -- all of it concrete -- so :meth:`solve` touches nothing but jax and can be put
+    inside ``jax.jit``, ``jax.grad``, or a ``jno.fn`` term driven by ``jno.core``.
+    """
+
+    def __init__(self, spec, fil, terms, part_names, resolve):
+        self.fil, self.terminals, self.part_names = fil, tuple(terms), tuple(part_names)
+        self.freq, self._scalar_freq = spec.freq, spec._scalar_freq
+        self.sources, self.currents, self.grounds, self.devices = (
+            spec.sources,
+            spec.currents,
+            spec.grounds,
+            spec.devices,
+        )
+        self._resolve = resolve
+        # Which nodes each pad owns is STRUCTURAL -- `terminal_nodes` reads coordinates, which are
+        # tracers under a gradient -- so it is resolved once here, on the reference geometry.
+        self.nodes = {t: terminal_nodes(fil, sh) for t, sh in terms.items()}
+
+    def solve(self, sigma=None):
+        """Solve at every frequency and return a :class:`PEECSolution`.
+
+        Args:
+            sigma: optional ``{conductor: value}`` overriding what the geometry declared, in any
+                spelling ``.attach(sigma=...)`` takes -- a scalar, a callable of position, or a
+                vector per element. This is where a traced design variable enters a jitted loop:
+                the shape captured at build time cannot close over a tracer that does not exist
+                yet, so the value is handed in at solve instead.
+        """
+        fil, nodes, terms = self.fil, self.nodes, self.terminals
+        sigma = self._resolve(sigma)
 
         cur, port, drive, inject = [], [], [], []
         for f in self.freq:
@@ -315,7 +416,7 @@ class PEEC:
             res,
             vol=jnp.asarray(fil.area) * jnp.asarray(fil.length),
             owner=np.asarray(fil.part),
-            names=part_names,
+            names=self.part_names,
         )
         drive = jnp.stack([jnp.asarray(x) for x in drive])
         sol._port_current = drive[0] if self._scalar_freq else drive
@@ -380,7 +481,9 @@ def _weld(parts, owners):
         # wires landing on it stay exact.
         {"welded": _spans(fils)},
     )
-    return welded, np.concatenate([np.asarray(g) for _f, g in parts])
+    # jnp, not numpy: a per-filament conductivity may be TRACED -- a density field, or sigma(T) --
+    # and a welded network is exactly where that matters, since a real module is traces AND wires.
+    return welded, jnp.concatenate([jnp.asarray(g) for _f, g in parts])
 
 
 def _join_contacts(inc, nodes, bounds, owners):

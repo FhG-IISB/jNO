@@ -39,6 +39,7 @@ from typing import Callable, Sequence
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 __all__ = [
     "pair_quadratic",
@@ -64,20 +65,33 @@ def sphere_self(volume):
     return 6.0 / (5.0 * R)
 
 
+def _xp(*vals):
+    """``numpy`` when every input is concrete, ``jax.numpy`` when any is traced.
+
+    A self term is a closed form in the element's own dimensions, so it follows whatever those are:
+    a fixed lattice keeps it a HOST constant -- which is what lets the discretisation run inside
+    ``jax.jit``, where a ``jnp`` result would be staged into the jaxpr and could no longer be read
+    back as a float -- while a traced radius (a bond wire's gauge as a design variable) keeps it in
+    ``jax`` so the gradient reaches it.
+    """
+    return jnp if any(isinstance(v, jax.core.Tracer) for v in vals) else np
+
+
 def bar_self(length, width, thickness):
     """Self term of a straight rectangular bar (Ruehli, *IBM J. Res. Dev.* 16:470, 1972, eq. 12).
 
     ``Lp = (mu0 l/2pi)[ln(2l/(w+t)) + 0.5 + 0.2235 (w+t)/l]``, converted to the ``g_aa`` this module
     wants by ``Lp = (mu0/4pi) l^2 g_aa``. Valid for ``l >> w, t``.
     """
+    xp = _xp(length, width, thickness)
     s = width + thickness
-    return 2.0 * (jnp.log(2.0 * length / s) + 0.5 + 0.2235 * s / length) / length
+    return 2.0 * (xp.log(2.0 * length / s) + 0.5 + 0.2235 * s / length) / length
 
 
 def wire_self(length, radius):
     """Self term of a straight round wire, ``Lp = (mu0 l/2pi)[ln(2l/a) - 3/4]``, including the
     internal inductance of a uniform current. Valid for ``l >> a``."""
-    return 2.0 * (jnp.log(2.0 * length / radius) - 0.75) / length
+    return 2.0 * (_xp(length, radius).log(2.0 * length / radius) - 0.75) / length
 
 
 def pair_quadratic(pos, mom, g: Callable, self_g, group=None, chunk: int = 128):
@@ -249,7 +263,10 @@ def pair_matrix(pos, mom, g: Callable, self_g, group=None):
         mom = mom[:, None]
     n = pos.shape[0]
     grp = jnp.arange(n) if group is None else jnp.asarray(group)
-    ne = int(jnp.max(grp)) + 1
+    # `ne` is STRUCTURAL -- how many elements the sub-points group into -- so it is read from the
+    # host array, never back out of jnp. Inside a jit even a constant stages into the jaxpr, and
+    # `int()` on the result raises; going through numpy is what keeps this callable under jit.
+    ne = n if group is None else int(np.asarray(group).max()) + 1
 
     d = pos[:, None, :] - pos[None, :, :]
     same = grp[:, None] == grp[None, :]
