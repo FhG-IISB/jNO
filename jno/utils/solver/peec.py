@@ -442,9 +442,11 @@ def solve_network(
         mu0: permeability of the surrounding medium.
 
     Args (continued):
-        restart: Krylov subspace size. 16 is where the FORWARD solve is cheapest; differentiating
-            needs far more (see the note in the jvp rule) and is refused below ``_DIFF_RESTART``
-            rather than allowed to return a wrong gradient.
+        restart: Krylov subspace size. 16 is where the solve is cheapest, and the ADJOINT uses the
+            same value -- it is preconditioned by ``P^T`` rather than by ``P``, so it converges like
+            the primal. It did not always: with the forward preconditioner on the transposed
+            operator the tangent system looked intractable, and at 592 elements the gradient came
+            back with the wrong SIGN after 310x the forward cost. It is now 2.5x and exact.
         tol: relative residual the iterative path is driven to. Measured on 6,806 bars, the impedance
             is identical to nine digits from 1e-4 to 1e-11, while the time is not — 2.83 s, 1.77 s,
             2.88 s, 17.79 s — so the default sits where the curve is flat rather than at the tightest
@@ -677,6 +679,9 @@ def solve_network(
         shape_out = jax.ShapeDtypeStruct(((ne + nn) if welded else nn,), cdtype)
         el = ccol < ne
         CIj = _bcoo(cval[el], crow[el], ccol[el], (nn, ne))
+        # the same two blocks the other way round, for the transposed preconditioner
+        CIjT = _bcoo(cval[el], ccol[el], crow[el], (ne, nn))
+        Aj = _bcoo(aval.astype(complex), ar, ac_, (nn, ne))
 
         # Keyed by the network's IDENTITY, and the network is kept alive in the entry: an id alone is
         # reusable after a garbage collection, and a stale hit would silently run the previous
@@ -719,29 +724,11 @@ def solve_network(
         def _token_jvp(primals, tangents):
             return _token(*primals), jnp.zeros(())  # a constant token; the refusal is on _precond
 
-        @jax.custom_jvp
         def _precond(r):
             return jax.pure_callback(_holder_solve, shape_out, r)
 
-        @_precond.defjvp
-        def _precond_jvp(primals, tangents):
-            # The preconditioner is linear, so this rule is exact. The danger is elsewhere: the TANGENT
-            # system needs a far larger Krylov subspace than the primal one, and jax's gmres returns an
-            # unconverged answer without saying so. Measured on a 156-bar network where the answer is
-            # -1.412010e-12: restart 16 gives -2.80e-14, restart 64 gives -4.03e-14, restart 200 gives
-            # -1.412010e-12 exactly. The primal converges in two cycles at restart 16 either way, so
-            # nothing about the forward solve reveals it.
-            if int(restart) < _DIFF_RESTART:
-                raise NotImplementedError(
-                    f"jno.peec: differentiating the matrix-free path at restart={int(restart)} returns a "
-                    f"WRONG gradient, not merely an imprecise one — the tangent system is far harder than "
-                    f"the primal and jax's gmres does not report failing on it. Pass restart="
-                    f"{_DIFF_RESTART} or more (about 10x the forward cost), or differentiate the dense "
-                    "path (matrix_free=False), which is exact. The value needed is problem-dependent: "
-                    f"{_DIFF_RESTART} was measured on one network, so check a gradient against a finite "
-                    "difference before trusting a new one."
-                )
-            return _precond(primals[0]), _precond(tangents[0])
+        def _precond_t(r):
+            return jax.pure_callback(_holder_solve_t, shape_out, r)
 
         def M_apply(x, w_, zd, Rc_):
             cur, phi = x[:ne], x[ne:]
@@ -754,6 +741,33 @@ def solve_network(
             dphi = _precond(rp - CIj @ (ri / zd))
             return jnp.concatenate([(ri + Acj @ dphi) / zd, dphi])
 
+        def P_inv_T(r, zd):
+            """``P^-T``, written out rather than obtained by transposing ``P_inv`` automatically.
+
+            The host factorisation is a callback, which jax cannot transpose on its own, so the block
+            algebra is done here: with ``D = diag(zd)``, ``P_inv`` is
+
+                [[D^-1 - D^-1 A^T S^-1 C_I D^-1,  D^-1 A^T S^-1],
+                 [        -S^-1 C_I D^-1       ,      S^-1     ]]
+
+            and this is its transpose, with ``S^-T`` supplied by the same factorisation applied the
+            other way round.
+            """
+            if welded:
+                return _precond_t(r)
+            ri, rp = r[:ne], r[ne:]
+            u = _precond_t(Aj @ (ri / zd) + rp)
+            return jnp.concatenate([(ri - CIjT @ u) / zd, u])
+
+        # A SHORT restart. The block preconditioner is strong -- measured against an EXACT Z^-1
+        # preconditioner, which converges in one iteration, diag(Z) takes two -- so the solve needs a
+        # couple of cycles and jax builds the whole basis whether or not it is needed. Per swept point
+        # at 6,806 bars: restart 30 -> 0.342 s, 16 -> 0.308 s, 10 -> 0.308 s, 6 -> 0.386 s,
+        # 4 -> 0.754 s, all to the same impedance. Below ten the cycles outnumber what they save. The
+        # ADJOINT uses the same value, which it could not before: it was the wrong preconditioner that
+        # made the tangent system hard, not the subspace size.
+        _RS = min(int(restart), ne + nn)
+
         if cached is None:
 
             @jax.jit
@@ -761,21 +775,23 @@ def solve_network(
                 # sequenced through the right-hand side so the factorisation is built before the
                 # solve that reads it, rather than relying on callback ordering
                 rhs = rhs + _token(zd, w_).astype(rhs.dtype)
-                return jax.scipy.sparse.linalg.gmres(
+
+                # OUR OWN custom_linear_solve, rather than the one inside jax's gmres. That one
+                # solves the adjoint with the FORWARD preconditioner, which is not a preconditioner
+                # for the transposed operator at all -- so the tangent system looked far harder than
+                # the primal and the gradient came back wrong without any of it being reported. Here
+                # the adjoint gets P^T, and converges like the primal does.
+                def _gm(P):
+                    return lambda op, r: jax.scipy.sparse.linalg.gmres(
+                        op, r, M=P, tol=float(tol), atol=0.0, restart=_RS, maxiter=400
+                    )[0]
+
+                return jax.lax.custom_linear_solve(
                     lambda v: M_apply(v, w_, zd, Rc_),
                     rhs,
-                    M=lambda v: P_inv(v, zd),
-                    tol=float(tol),
-                    atol=0.0,
-                    # A SHORT restart. The block preconditioner is strong — measured against an EXACT
-                    # Z^-1 preconditioner, which converges in one iteration, diag(Z) takes two — so the
-                    # solve needs a couple of cycles and jax builds the whole basis whether or not it
-                    # is needed. Per swept point at 6,806 bars: restart 30 -> 0.342 s, 16 -> 0.308 s,
-                    # 10 -> 0.308 s, 6 -> 0.386 s, 4 -> 0.754 s, all to the same impedance. Below ten
-                    # the cycles outnumber what they save.
-                    restart=min(int(restart), ne + nn),
-                    maxiter=400,
-                )[0]
+                    _gm(lambda v: P_inv(v, zd)),
+                    _gm(lambda v: P_inv_T(v, zd)),
+                )
 
             if len(_KRYLOV_CACHE) > 8:  # bounded: this holds compiled code and a reference to a network
                 _KRYLOV_CACHE.pop(next(iter(_KRYLOV_CACHE)))
@@ -1326,7 +1342,6 @@ def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3):
     return apply
 
 
-_DIFF_RESTART = 200  # the smallest restart measured to give an exact gradient; see _precond_jvp
 _KRYLOV_CACHE = {}  # one compiled Krylov solve per (network, size, tolerance), reused across frequencies
 _LU_HOLDER = {}  # the current host factorisation, so the callback closure does not change identity
 
@@ -1340,6 +1355,16 @@ def _holder_solve(r):
     nothing here is reentrant.
     """
     return _LU_HOLDER["lu"].solve(np.asarray(r)).astype(r.dtype)
+
+
+def _holder_solve_t(r):
+    """Apply the TRANSPOSE of the current factorisation, for the tangent system.
+
+    The adjoint solves ``M^T y = c``, and a preconditioner for ``M`` is not one for ``M^T`` -- it is
+    ``P^T`` that is. Reusing ``P`` there is what made the tangent system look intractable. The plain
+    transpose, not the conjugate one, because that is the convention jax's linear transpose uses.
+    """
+    return _LU_HOLDER["lu"].solve(np.asarray(r), trans="T").astype(r.dtype)
 
 
 def _bcoo(val, row, col, shape):
