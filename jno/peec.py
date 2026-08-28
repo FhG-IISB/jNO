@@ -365,7 +365,7 @@ class BuiltPEEC:
         # tracers under a gradient -- so it is resolved once here, on the reference geometry.
         self.nodes = {t: terminal_nodes(fil, sh) for t, sh in terms.items()}
 
-    def solve(self, sigma=None, devices=None):
+    def solve(self, sigma=None, devices=None, weights=None):
         """Solve at every frequency and return a :class:`PEECSolution`.
 
         Args:
@@ -380,8 +380,26 @@ class BuiltPEEC:
                 constant in the constraint list. A SiC die's on-resistance rises about 0.5 %/K, so
                 an electro-thermal fixed point has to re-impress it every pass -- and it is the
                 dominant feedback, since the dies carry most of the loss and only theirs runs away.
+            weights: optional ``{terminal: w}`` making a terminal a prescribed current DISTRIBUTION
+                over its nodes instead of a short across them -- one weight per node of its support.
+
+                This is what makes a terminal's POSITION a design variable. Unweighted, a pad is an
+                equipotential node SET, and which nodes are in the set is a step function of where
+                the pad is: sliding a die a quarter of a millimetre changes the answer by nothing at
+                all, and then by 8 % when a node crosses the boundary. Weighted, the support is a
+                frozen superset covering the travel and the weights are smooth in the position, so
+                the gradient exists -- the same structure-frozen, values-traced split as ``sigma``.
         """
         fil, nodes, terms = self.fil, self.nodes, self.terminals
+        if weights:
+            nodes = dict(nodes)
+            for name, w in weights.items():
+                if name not in nodes:
+                    raise ValueError(
+                        f"jno.peec: weights={{{name!r}: ...}} names no terminal of this network. "
+                        f"Its terminals are {sorted(nodes)}."
+                    )
+                nodes[name] = (np.asarray(nodes[name]), w)
         sigma = self._resolve(sigma)
         dev = self.devices
         if devices:
