@@ -157,18 +157,22 @@ class PEECSolution:
         Volumetric rather than total because that is what a source term is. The volume is the
         DISCRETISATION's -- the summed filament volumes -- so it is consistent with the currents that
         produced the loss rather than with the analytic solid, which a faceted mesh would not match.
+
+        Which elements a conductor owns is STRUCTURAL and is read from ``_owner`` on the host; only
+        the loss and the volume are jnp. That is what makes this callable inside a jit, and so what
+        lets a thermal objective built on it be driven by ``jno.core``.
         """
         if self._owner is None:
             raise ValueError("jno.peec: this solution carries no per-conductor breakdown.")
         cur = jnp.atleast_2d(self.i)
         pw = jnp.einsum("k,fk->fk", self._R, jnp.abs(cur) ** 2)
+        own, vol = np.asarray(self._owner), jnp.asarray(self._vol)
         out = {}
         for k, name in enumerate(self._names):
-            m = jnp.asarray(self._owner == k)
-            v = float(jnp.sum(jnp.where(m, self._vol, 0.0)))
-            if v <= 0.0:
+            sel = np.flatnonzero(own == k)
+            if sel.size == 0:  # a conductor the discretisation gave no elements owns no loss
                 continue
-            q = jnp.sum(jnp.where(m[None, :], pw, 0.0), axis=1) / v
+            q = jnp.sum(pw[:, sel], axis=1) / jnp.sum(vol[sel])
             out[name] = q[0] if jnp.ndim(self._port) == 0 else q
         return out
 
