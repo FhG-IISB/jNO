@@ -275,3 +275,38 @@ def test_an_unknown_device_terminal_is_refused():
     built = device_network().build()
     with pytest.raises(ValueError, match="names no device of this network"):
         built.solve(devices={"A": 1e-3})
+
+
+def test_a_gradient_does_not_poison_the_cache_for_later_calls():
+    """Regression: the compiled-solve cache must not keep a closure built under ANY transform.
+
+    The first guard probed a bare `jnp.zeros(())`, which answers only half the question. Under jit
+    everything stages and the probe is a tracer, so the guard fired. Under `jax.grad` nothing stages
+    except what DEPENDS on the differentiated input -- the probe stays concrete while the element
+    impedance does not -- so the guard missed, a closure holding LinearizeTracers was cached, and the
+    next EAGER call reusing it raised UnexpectedTracerError from somewhere else entirely.
+
+    Worse than the crash: when it did not crash it returned a stale operator, and the gradient came
+    back 14 % wrong while still looking perfectly reasonable.
+    """
+    built = device_network().build()
+    f = lambda z: jnp.real(built.solve(devices={"M": z}).Z)  # noqa: E731
+    before = float(f(5e-3))
+    g = float(jax.grad(f)(5e-3))
+    after = float(f(5e-3))  # the same eager call, AFTER a gradient has run through the same network
+    assert after == pytest.approx(before, rel=1e-12)
+    # a series device: dR_port/dZ is exactly 1, which is an oracle rather than a re-run
+    assert g == pytest.approx(1.0, rel=1e-6)
+
+
+def test_the_cache_still_serves_repeated_identical_solves():
+    """The guard must not disable the cache where it earns its keep: same network, same values."""
+    from jno.utils.solver.peec import _KRYLOV_CACHE
+
+    built = wire_network().build()
+    _KRYLOV_CACHE.clear()
+    a = complex(built.solve().Z)
+    n_after_first = len(_KRYLOV_CACHE)
+    b = complex(built.solve().Z)
+    assert a == b
+    assert n_after_first >= 1 and len(_KRYLOV_CACHE) == n_after_first  # hit, not a second entry
