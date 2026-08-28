@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 
 import jno
+from jno.peec import _weld
 from jno.utils.solver.kernel import pair_matrix
 from jno.utils.solver.peec import (
     bar_filaments,
@@ -286,3 +287,43 @@ def test_the_matrix_free_gradient_needs_a_bigger_krylov_subspace_and_says_so():
     g = float(jax.grad(lambda s: port_r(s, True, 200))(SIGCU))
     assert abs(g / fd - 1) < 1e-6  # and with the subspace it needs, it is exact too
     assert g < 0  # more conductive, less resistive
+
+
+def test_a_welded_network_converges_in_a_mesh_independent_number_of_steps():
+    """The stitching fix: a welded network used to get harder with every refinement.
+
+    Its port excitation spreads over far more of the operator's eigenmodes than a plain lattice's
+    (see near_block), and a diagonal-Z preconditioner leaves the spectrum spread enough that GMRES
+    needs a high-degree residual polynomial. Krylov steps to 1e-8, over a refinement:
+
+        diag(Z) Schur   69,  86, 137, 290     growing with N
+        near-field LU   18,  18,  18,  18     flat
+
+    Pinned by TIME rather than by counting steps, because the count is an implementation detail and
+    the wall clock is what broke: at 6,806 bars one bond wire took the solve from 0.19 s to 19.8 s.
+    """
+    import time
+
+    box = jno.Shape.box(0, 0, 0, 0.096, 0.059, 0.00057)
+    fb = bar_filaments(box, size=(0.002, 0.002, 0.000285))
+    nb = len(np.asarray(fb.length))
+
+    def timed(fil, sig):
+        p = np.asarray(fil.nodes)
+        a = terminal_nodes(fil, lambda q: q[:, 0] < p[:, 0].min() + 1e-9)
+        b = terminal_nodes(fil, lambda q: q[:, 0] > p[:, 0].max() - 1e-9)
+        args = (fil, sig, {"A": a, "B": b}, [("A", "B", 1.0 + 0j)])
+        solve_network(*args, omega=2 * np.pi * 1e6, matrix_free=True)[0].block_until_ready()
+        t = time.perf_counter()
+        solve_network(*args, omega=2 * np.pi * 2e6, matrix_free=True)[0].block_until_ready()
+        return time.perf_counter() - t
+
+    plain = timed(fb, jnp.full(nb, SIGCU))
+    wires = [jno.Shape.line([(0.01, 0.02, 0.0003), (0.01, 0.02, 0.004), (0.02, 0.03, 0.0003)], r=1.9e-4, size=0.001)]
+    fl = line_filaments(wires)
+    nl = len(np.asarray(fl.length))
+    fil, sg = _weld([(fb, jnp.full(nb, SIGCU)), (fl, jnp.full(nl, SIGCU))], [[box], wires])
+    welded = timed(fil, sg)
+
+    # 0.3 % more elements must not cost two orders of magnitude; it used to cost 100x
+    assert welded < 25 * plain
