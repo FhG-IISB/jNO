@@ -1129,6 +1129,25 @@ def near_block(fil: Filaments, g, mu_scale=1.0, reach=2.0):
     being the hard one. The block is built from element CENTRES rather than from a formed ``Lp``, so
     it costs O(N) memory and never materialises the dense operator it approximates.
 
+    What makes a welded network hard is NOT a property of its operator. Measured against a plain
+    lattice and against two plates joined by a narrow neck on ONE lattice (same bottleneck topology,
+    which converges just as fast as no bottleneck at all):
+
+        eigenvalues, cond(P^-1 M), field of values, departure from normality, eigenvector
+        conditioning -- all equal to within a few percent, several of them BETTER for the welded case
+
+    and with a RANDOM right-hand side all three take a similar number of iterations (87, 76, 70).
+    The difference is entirely in how the PORT excitation projects onto the operator's eigenmodes:
+
+        directions carrying 90 % of b:   68 (lattice)   91 (neck)   142 (welded)
+        iterations to 1e-8:              15             15           58
+
+    Forcing every ampere through a six-filament wire excites a far richer set of modes than spreading
+    it across a plate, and GMRES then needs a higher-degree polynomial to annihilate them. That is
+    why no amount of improving the OPERATOR's conditioning helped, and why a band that compresses the
+    whole spectrum does: it makes the residual polynomial cheap enough that the richness stops
+    mattering.
+
     Why it is not used yet: putting the band in the (1,1) block while the SCHUR complement still
     comes from the diagonal makes the two inconsistent. That is survivable at a few hundred elements
     (welded: 584 applications -> 108) and fatal at a few thousand -- on 6,825 elements the solve made
