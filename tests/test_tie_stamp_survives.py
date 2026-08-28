@@ -70,3 +70,36 @@ def test_fem_still_refuses_an_offset_tie_loudly(dom):
     laplace = ui.x * vi.x + ui.y * vi.y - vi
     with pytest.raises(ValueError, match=r"must be `u\(A\) - u\(B\)`"):
         jno.fem([laplace, u(xa, ya) - u(xb, yb) - 1.0])
+
+
+def test_a_third_region_does_not_re_tie_the_pair(dom):
+    """A stamped tie meeting a THIRD region keeps its own pair and records the newcomer separately.
+
+    `u(A) - u(B) - u(C)` used to come out stamped ('A', 'C'): the outer combination overwrote the
+    stamp with a pair the user never wrote, quietly losing B. A reader had no way to tell that from
+    a genuine two-region tie, which is how `jno.peec` came to need it -- a device constraint
+    `v(A) - v(B) - Z*i(C)` is a controlled source, and it can only be refused if C is visible.
+    """
+    u, a, b = _sides(dom)
+    c = dom.variable("C", split=True)[:2]
+    e = u(*a) - u(*b) - u(*c)
+    assert getattr(e, "_periodic_tie", None) == ("A", "B")
+    assert getattr(e, "_tie_extra", None) == "C"
+
+
+def test_the_newcomer_is_recorded_even_when_it_is_one_of_the_pair(dom):
+    """Re-binding a terminal makes new Variables, so the SAME region reads as a newcomer too.
+
+    That is what lets a reader tell `Z*i(A)` from `Z*i(B)`: both keep the ('A', 'B') pair, and only
+    the extra says which end the current was taken at.
+    """
+    u, a, b = _sides(dom)
+    a2 = dom.variable("A", split=True)[:2]  # the same region, a fresh binding
+    assert getattr(u(*a) - u(*b) - u(*a2), "_tie_extra", None) == "A"
+    assert getattr(u(*a) - u(*b) - u(*b), "_tie_extra", None) == "B"
+
+
+def test_a_plain_tie_records_no_newcomer(dom):
+    u, a, b = _sides(dom)
+    assert getattr(u(*a) - u(*b), "_tie_extra", None) is None
+    assert getattr(u(*a) - u(*b) - 1.0, "_tie_extra", None) is None
