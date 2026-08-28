@@ -263,13 +263,20 @@ def _trial_names(expr, out=None):
 
 
 def port_spec(constraints, current="i", potential="v"):
-    """Read a PEEC constraint list into ``(sources, currents, grounds)``.
+    """Read a PEEC constraint list into ``(sources, currents, grounds, devices)``.
 
-    Three forms, and only three::
+    Four forms, and only four::
 
-        v(A) - v(B) - g     a source of g volts from terminal A to terminal B
-        v(A) - g            terminal A held at g volts (g = 0 is the ground / reference)
-        i(A) - g            terminal A carries g amps (g = 0 is an open terminal)
+        v(A) - v(B) - g        a source of g volts from terminal A to terminal B
+        v(A) - g               terminal A held at g volts (g = 0 is the ground / reference)
+        i(A) - g               terminal A carries g amps (g = 0 is an open terminal)
+        v(A) - v(B) - Z*i(A)   a two-terminal DEVICE of impedance Z between A and B
+
+    The last is Ohm's law, and it is written as one. It is how a component enters the network
+    WITHOUT being a lump of metal: a MOSFET's on-resistance is a device parameter, so voxelising the
+    die makes the answer follow the grid instead -- a 0.18 mm die on a 0.285 mm grid is 1.6x too
+    resistive before the current-crowding error on top. A device carries no partial inductance and
+    no coupling to anything, because it is a circuit element and not a piece of geometry.
 
     A relation across TWO regions only means something on the potential, so ``i(A) - i(B)`` is
     refused rather than guessed at.
@@ -280,9 +287,44 @@ def port_spec(constraints, current="i", potential="v"):
     from jno._fem import _bare, _scalar_const
     from jno.trace.views import _tag_of_coord_vars
 
-    sources, currents, grounds = [], [], []
+    sources, currents, grounds, devices = [], [], [], []
     for c in constraints:
         names = _trial_names(c)
+        if names == {current, potential}:  # a device: the only form naming BOTH
+            bare_d = _bare(c)
+            tie_d, extra = getattr(c, "_periodic_tie", None), getattr(c, "_tie_extra", None)
+            if tie_d is None or getattr(bare_d, "op", None) != "-":
+                raise ValueError(
+                    f"jno.peec: a constraint naming both {potential!r} and {current!r} is read as a "
+                    f"two-terminal device, `{potential}(A) - {potential}(B) - Z*{current}(A)`. This one "
+                    "is not in that form."
+                )
+            if tie_d[0] == tie_d[1]:
+                raise ValueError(
+                    f"jno.peec: a device from {tie_d[0]!r} to itself is a short across one terminal and "
+                    f"has no reading. Name the two terminals it sits between: `{potential}(A) - "
+                    f"{potential}(B) - Z*{current}(A)`."
+                )
+            if extra is not None and extra != tie_d[0]:
+                # The current must be measured at the terminal the voltage is measured FROM, or the
+                # sign is the reader's guess. The trace keeps only the pair plus this one newcomer, so
+                # a current written anywhere else is refused rather than folded into a pair it is not
+                # part of. (`extra is None` means the SAME bound terminal was reused for v and i,
+                # which is the same thing said more tersely.)
+                raise ValueError(
+                    f"jno.peec: device {tie_d[0]!r}-{tie_d[1]!r} takes its current at {extra!r}. Write "
+                    f"it at the terminal the voltage is measured from -- `{potential}({tie_d[0]}) - "
+                    f"{potential}({tie_d[1]}) - Z*{current}({tie_d[0]})` -- so the sign of Z is the "
+                    "passive one and not a guess."
+                    + (
+                        f" ({extra!r} is not one of this device's terminals at all, so what was written "
+                        "is a controlled source; those are not supported.)"
+                        if extra not in tie_d
+                        else ""
+                    )
+                )
+            devices.append((tie_d[0], tie_d[1], _device_impedance(bare_d.right, current, potential)))
+            continue
         if len(names) != 1:
             raise ValueError(
                 f"jno.peec: a constraint must be written on exactly one of {potential!r} (a terminal "
@@ -314,7 +356,26 @@ def port_spec(constraints, current="i", potential="v"):
                 "`p = e.variable('DC+', split=True)[:3]` and then `v(*p) - 0.0`."
             )
         (grounds if field == potential else currents).append((tag, complex(g if g is not None else 0.0)))
-    return sources, currents, grounds
+    return sources, currents, grounds, devices
+
+
+def _device_impedance(node, current, potential):
+    """The ``Z`` in ``Z * i(A)`` -- either factor order, and a bare ``i(A)`` is one ohm."""
+    from jno._fem import _scalar_const
+
+    if getattr(node, "op", None) == "*":
+        for a, b in ((getattr(node, "left", None), getattr(node, "right", None)), (node.right, node.left)):
+            z = _scalar_const(a) if a is not None else None
+            if z is not None and _trial_names(b) == {current}:
+                return complex(z)
+    elif _trial_names(node) == {current}:
+        return 1.0 + 0j
+    raise ValueError(
+        f"jno.peec: a device's impedance must be a CONSTANT times the terminal current, as in "
+        f"`{potential}(A) - {potential}(B) - 5e-3*{current}(A)` for a 5 milliohm on-resistance, or "
+        f"`(R + 1j*w*L)*{current}(A)` for a lumped R-L. A varying or field-dependent impedance is a "
+        "conductor, so give it geometry instead."
+    )
 
 
 def terminal_nodes(fil: Filaments, where):
@@ -343,6 +404,7 @@ def solve_network(
     sources,
     grounds=(),
     currents=(),
+    devices=(),
     omega=0.0,
     mu0=4e-7 * np.pi,
     matrix_free=None,
@@ -358,6 +420,7 @@ def solve_network(
         Z I - A' phi = 0                       Z = diag(R) + j w Lp,  A = incidence
         phi_n = phi_T      for n in T          a terminal is equipotential
         (A I)_n = 0                            at every node outside a terminal
+        phi_A - phi_B = -Z (A I)_A             a device, with (A I)_A + (A I)_B = 0
 
     and one row per terminal, from the ports: a source fixes ``phi_A - phi_B``, a ground fixes
     ``phi_T``, a current fixes the net current injected there, and a terminal named by nothing at
@@ -368,7 +431,9 @@ def solve_network(
         fil: the network.
         sigma: conductivity, scalar or per filament.
         terminals: ``{name: node indices}``, from :func:`terminal_nodes`.
-        sources/grounds/currents: as returned by :func:`port_spec`.
+        sources/grounds/currents/devices: as returned by :func:`port_spec`. A device is
+            ``(A, B, Z)``: a two-terminal impedance carrying no partial inductance and coupling to
+            nothing, which is how a component enters the network without being meshed as metal.
         omega: angular frequency, rad/s.
         mu0: permeability of the surrounding medium.
 
@@ -459,6 +524,13 @@ def solve_network(
         claim(t, ("a fixed potential", ("ground", t, g)))
     for t, g in currents:
         claim(t, ("a fixed current", ("current", t, g)))
+    # A two-terminal element needs TWO rows for its two terminals: its constitutive law at the
+    # positive one, and current continuity through it at the other. Grounding the far side -- what a
+    # source does -- would be wrong here: a device's terminal potential is set by the rest of the
+    # network, not chosen.
+    for a, b_, z in devices:
+        claim(a, ("a device", ("device", a, b_, z)))
+        claim(b_, ("the same device's return", ("devret", a, b_, z)))
 
     # a source breaks current balance at its negative side too, so that side needs a row of its own
     floating = [b for _a, b, _g in sources if b not in row]
@@ -505,6 +577,27 @@ def solve_network(
             rr.append(np.array([r0, r0]))
             cc.append(np.array([ne + int(idx[a][0]), ne + int(idx[b_][0])]))
             vv.append(np.array([1.0, -1.0]))
+        elif kind == "device":  # phi_A - phi_B = Z I_dev,  I_dev = -(A I)_A
+            a, b_, z = rest
+            g = 0.0 + 0j
+            # (A I)_T is the current injected INTO the metal at T, which is why a source's + terminal
+            # reads positive. A device is the other way round: it DRAWS its current out of the metal,
+            # so the current through it is -(A I)_A and the term enters with a plus. Getting this
+            # backwards gives a passive device a negative resistance, which is what the series oracle
+            # caught: 2 R_wire - R_dev instead of 2 R_wire + R_dev.
+            col = np.asarray(Asp0[idx[a]].sum(0)).reshape(-1)
+            k = np.flatnonzero(col)
+            rr.append(np.concatenate([np.array([r0, r0]), np.full(k.size, r0)]))
+            cc.append(np.concatenate([np.array([ne + int(idx[a][0]), ne + int(idx[b_][0])]), k]))
+            vv.append(np.concatenate([np.array([1.0, -1.0], dtype=complex), complex(z) * col[k]]))
+        elif kind == "devret":  # (A I)_A + (A I)_B = 0 -- what goes in comes out
+            a, b_, _z = rest
+            g = 0.0 + 0j
+            col = np.asarray(Asp0[np.concatenate([idx[a], idx[b_]])].sum(0)).reshape(-1)
+            k = np.flatnonzero(col)
+            rr.append(np.full(k.size, r0))
+            cc.append(k)
+            vv.append(col[k])
         elif kind == "ground":
             _t, g = rest
             rr.append(np.array([r0]))
@@ -523,7 +616,7 @@ def solve_network(
         raise ValueError(f"jno.peec: built {r0} constraint rows, expected {nn}; this is a bug.")
     crow, ccol, cval = np.concatenate(rr), np.concatenate(cc), np.concatenate(vv).astype(complex)
     b = jnp.asarray(np.concatenate(rhs))
-    _refuse_disconnected(Asp0, idx, sources, grounds, currents)
+    _refuse_disconnected(Asp0, idx, sources, grounds, currents, devices)
 
     if free_form:
         import scipy.sparse as sp
@@ -709,7 +802,7 @@ def solve_network(
     return cur, phi, inj
 
 
-def _refuse_disconnected(A, idx, sources, grounds, currents):
+def _refuse_disconnected(A, idx, sources, grounds, currents, devices=()):
     """A port pair with no metal between them is a modelling error, not an infinite impedance.
 
     ``jnp.linalg.solve`` on a singular system returns ``inf``/``nan`` without complaining, and an
@@ -737,6 +830,10 @@ def _refuse_disconnected(A, idx, sources, grounds, currents):
             ra, rb = find(int(ids[0])), find(int(n))
             if ra != rb:
                 root[ra] = rb
+    for a, b, _z in devices:  # and a device conducts, so it joins the two terminals it sits between
+        ra, rb = find(int(idx[a][0])), find(int(idx[b][0]))
+        if ra != rb:
+            root[ra] = rb
     for a, b, _g in sources:
         if find(int(idx[a][0])) != find(int(idx[b][0])):
             raise ValueError(
