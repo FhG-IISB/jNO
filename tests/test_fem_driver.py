@@ -271,11 +271,7 @@ def _elasticity_fem(eps_of, mesh_size=0.15):
     xL, yL, _ = d.variable("left", split=True)
     u, phi = d.fem_symbols(value_shape=(2,))
     eu, ep = eps_of(u, [xi, yi]), eps_of(phi, [xi, yi])
-    weak = (
-        lam * trace(eu) * trace(ep)
-        + 2.0 * mu * inner(eu, ep, n_contract=2)
-        - inner((0.0, -1.0), phi, n_contract=1)
-    )
+    weak = lam * trace(eu) * trace(ep) + 2.0 * mu * inner(eu, ep, n_contract=2) - inner((0.0, -1.0), phi, n_contract=1)
     return jno.fem([weak, u(xL, yL) - (0.0, 0.0)])
 
 
@@ -310,8 +306,10 @@ def test_antisym_is_linear_in_the_unknown():
     xL, yL, _ = d.variable("left", split=True)
     u, phi = d.fem_symbols(value_shape=(2,))
     wu, wp = antisym(grad(u, [xi, yi])), antisym(grad(phi, [xi, yi]))
-    weak = inner(wu, wp, n_contract=2) + inner(grad(u, [xi, yi]), grad(phi, [xi, yi]), n_contract=2) - inner(
-        (0.0, -1.0), phi, n_contract=1
+    weak = (
+        inner(wu, wp, n_contract=2)
+        + inner(grad(u, [xi, yi]), grad(phi, [xi, yi]), n_contract=2)
+        - inner((0.0, -1.0), phi, n_contract=1)
     )
     fem = jno.fem([weak, u(xL, yL) - (0.0, 0.0)])
     assert fem.is_linear
