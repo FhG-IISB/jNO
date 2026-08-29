@@ -198,6 +198,9 @@ def remesh_with_mmg(
     if field.shape[0] != pts.shape[0]:
         raise ValueError(f"metric field has {field.shape[0]} entries but the mesh has {pts.shape[0]} vertices.")
 
+    _n_elems = len(np.asarray(domain.mesh.cells_dict["triangle" if dim == 2 else "tetra"]))
+    mat_refs, ref_names = _material_refs(domain, _n_elems, dim)
+
     if dim == 2:
         elems = np.asarray(domain.mesh.cells_dict["triangle"]).astype(np.int32)
         bfacets = _boundary_edges_from_triangles(elems)
@@ -205,7 +208,10 @@ def remesh_with_mmg(
         m = mmgpy.MmgMesh2D()
         m.set_mesh_size(len(pts), len(elems), 0, len(bfacets))
         m.set_vertices(pts)
-        m.set_triangles(elems)
+        if mat_refs is None:
+            m.set_triangles(elems)
+        else:
+            m.set_triangles(elems, mat_refs)  # material references: mmg keeps the interfaces between them
         m.set_edges(bfacets, np.ones(len(bfacets), dtype=np.int32))
         if len(corners):  # pin polygonal corners so the geometry is preserved exactly
             m.set_corners(corners)
@@ -216,7 +222,8 @@ def remesh_with_mmg(
         m = mmgpy.MmgMesh3D()
         m.set_mesh_size(len(pts), len(elems), 0, len(bfacets), 0, 0)
         m.set_vertices(pts)
-        m.set_tetrahedra(elems, np.ones(len(elems), dtype=np.int32))
+        # Real material references, so mmg preserves the interfaces between them (see `_material_refs`).
+        m.set_tetrahedra(elems, mat_refs if mat_refs is not None else np.ones(len(elems), dtype=np.int32))
         m.set_triangles(bfacets, np.ones(len(bfacets), dtype=np.int32))
         # mmg3d auto-detects the boundary ridges/corners of a polyhedral surface and keeps
         # boundary vertices on it, so a polyhedral geometry is preserved without extra marking
@@ -241,12 +248,20 @@ def remesh_with_mmg(
 
     v_out = np.asarray(m.get_vertices())[:, :dim]
     if dim == 2:
-        t_out, _ = m.get_triangles_with_refs()
+        t_out, t_refs = m.get_triangles_with_refs()
         f_out, _ = m.get_edges_with_refs()
     else:
-        t_out, _ = m.get_tetrahedra_with_refs()
+        t_out, t_refs = m.get_tetrahedra_with_refs()
         f_out, _ = m.get_triangles_with_refs()
-    return _domain_from_arrays(domain, v_out, np.asarray(t_out), np.asarray(f_out), copy=copy)
+    return _domain_from_arrays(
+        domain,
+        v_out,
+        np.asarray(t_out),
+        np.asarray(f_out),
+        copy=copy,
+        cell_refs=None if mat_refs is None else np.asarray(t_refs),
+        ref_names=ref_names,
+    )
 
 
 def _remesh_line_1d(domain: Any, vertex_size: Any, *, hmin, hmax, hgrad: float, copy: bool):
@@ -302,7 +317,84 @@ def _remesh_line_1d(domain: Any, vertex_size: Any, *, hmin, hmax, hgrad: float, 
     return _domain_from_arrays(domain, new_x.reshape(-1, 1), new_cells, bfacets, copy=copy)
 
 
-def _domain_from_arrays(template: Any, points: np.ndarray, elems: np.ndarray, bfacets: np.ndarray, *, copy: bool):
+_RESERVED_CELL_SETS = ("interior", "boundary")
+
+
+def _material_refs(domain, n_elems: int, dim: int):
+    """Per-element integer material reference from the mesh's NAMED volume cell-sets.
+
+    Mmg is natively multi-domain: give each element its material reference and it keeps the surface
+    between differing references as a real interface, refining along it rather than moving nodes
+    through it. Passing a constant reference instead tells Mmg the whole mesh is one material, and a
+    thin inclusion is free to dissolve -- silently, since the result is still a valid mesh.
+
+    Returns ``(refs, name_of_ref)`` where ``name_of_ref`` maps each reference to the TUPLE of region
+    names that reference means (a cell can be in several -- see below), or ``(None, {})`` when the
+    mesh carries no named volume region,
+    in which case the caller keeps the single-material path. ``cell_sets`` indexes into each
+    ``mesh.cells`` block separately while mmg receives the concatenated ``cells_dict`` array, so the
+    per-block offset is applied here.
+    """
+    mesh = getattr(domain, "mesh", None)
+    cell_sets = getattr(mesh, "cell_sets", None) or {}
+    if not cell_sets:
+        return None, {}
+    want = "tetra" if dim == 3 else ("triangle" if dim == 2 else "line")
+    blocks = list(getattr(mesh, "cells", None) or [])
+    offset, seen = {}, 0
+    for bi, blk in enumerate(blocks):
+        if getattr(blk, "type", None) == want:
+            offset[bi] = seen
+            seen += len(blk.data)
+
+    # `gmsh:bounding_entities` and friends are reader METADATA, not materials: they carry negative
+    # sentinels and would both invent a spurious region and index `refs` from the wrong end.
+    names = sorted(
+        nm
+        for nm, entries in cell_sets.items()
+        if nm not in _RESERVED_CELL_SETS
+        and ":" not in nm
+        and any(arr is not None and len(arr) and bi in offset for bi, arr in enumerate(entries or []))
+    )
+    if not names:
+        return None, {}
+
+    # A gmsh physical group may NEST or OVERLAP another -- a generator commonly emits both the
+    # individual parts and a group spanning them, so a cell belongs to two names at once -- while mmg
+    # carries exactly one integer reference per element. Keying the reference
+    # on the NAME would let the last name written win and silently empty the others, so key it on the
+    # membership COMBINATION instead: cells belonging to the same set of names share a reference, and
+    # every name is recovered on the way out as the union of the references that contain it.
+    member = np.zeros((n_elems, len(names)), dtype=bool)
+    for k, nm in enumerate(names):
+        for bi, arr in enumerate(cell_sets[nm] or []):
+            if arr is None or len(arr) == 0 or bi not in offset:
+                continue
+            idx = np.asarray(arr, dtype=np.int64) + offset[bi]
+            member[idx[(idx >= 0) & (idx < n_elems)], k] = True  # never index from the wrong end
+
+    combos, inverse = np.unique(member, axis=0, return_inverse=True)
+    if len(combos) > 2048:
+        raise ValueError(
+            f"jno.domain.refine: the mesh's named volume regions form {len(combos)} distinct "
+            "overlap combinations, more material references than mmg is given here. Simplify the "
+            "region groups, or remesh with the overlapping groups removed."
+        )
+    refs = (np.asarray(inverse).reshape(-1) + 1).astype(np.int32)  # mmg references are 1-based
+    name_of_ref = {int(r + 1): tuple(np.asarray(names)[combos[r]].tolist()) for r in range(len(combos))}
+    return refs, name_of_ref
+
+
+def _domain_from_arrays(
+    template: Any,
+    points: np.ndarray,
+    elems: np.ndarray,
+    bfacets: np.ndarray,
+    *,
+    copy: bool,
+    cell_refs: np.ndarray | None = None,
+    ref_names: dict | None = None,
+):
     """Apply remeshed ``points / elements / boundary-facets`` to a domain.
 
     Builds a ``meshio.Mesh`` carrying ``interior`` (triangles in 2D / tetrahedra in 3D) and
@@ -336,6 +428,22 @@ def _domain_from_arrays(template: Any, points: np.ndarray, elems: np.ndarray, bf
         lo = int(np.argmin(points[:, 0][np.asarray(bfacets).reshape(-1)]))
         cell_sets["left"] = [empty.copy(), np.array([lo], dtype=np.int64)]
         cell_sets["right"] = [empty.copy(), np.array([1 - lo], dtype=np.int64)]
+    # Named volume regions, restored from the references mmg carried through the remesh. Without
+    # this the regions exist in the mesh mmg returned but not in the domain rebuilt from it, so a
+    # multi-material problem silently becomes single-material one step after the interfaces survived.
+    if cell_refs is not None and ref_names:
+        refs = np.asarray(cell_refs).reshape(-1)
+        if refs.shape[0] != n_e:
+            raise ValueError(
+                f"jno.domain.refine: mmg returned {refs.shape[0]} element references for {n_e} "
+                "elements — the material reference array and the element array disagree."
+            )
+        by_name: dict = {}
+        for r, nms in ref_names.items():
+            for nm in nms if isinstance(nms, (tuple, list)) else (nms,):
+                by_name.setdefault(nm, []).append(r)
+        for nm, rs in by_name.items():
+            cell_sets[nm] = [np.flatnonzero(np.isin(refs, rs)).astype(np.int64), empty.copy()]
     new_mesh = meshio.Mesh(pts3, cells, cell_sets=cell_sets)
 
     target = _shallow_copy(template) if copy else template
