@@ -46,6 +46,9 @@ path is unaffected.
 | `dom.cell_size` / `dom.cell_metric` | native 2-D/3-D **volume** terms only — a 1-D form or a non-nodal family packs no element Jacobian | raises |
 | Element order on RT / N1E / P0 / Hermite / Argyris / Morley | each family has one intrinsic order | raises |
 | `eigs` on a non-symmetric pencil | eigenvalues differentiate, **eigenvectors do not** | NaN, not a silent zero |
+| `eigs`: a Bloch/periodic tie **plus** a Dirichlet pin | the two constraint maps do not compose in the eigen path — so a *slab* (periodic in-plane, PEC or PML above and below) cannot be solved yet; a tie alone and a pin alone are both fine | raises |
+| `eigs` eigenvector gradients at an **exact degeneracy** | NaN at a repeated eigenvalue, where only *subspace-invariant* functionals have a derivative at all. `contour=` differentiates through the modes and is the way round it | NaN, not a silent zero |
+| `eigs` on a **runtime-parametric** form | a design parameter reaches the eigensolve only through `fem.operator.evaluate`, not through `fem.eigs` itself | raises |
 | **Curved-boundary geometry** | straight-sided **by default**; `shape.curved()` is the fix | **silent** |
 | **Axisymmetric vector forms** | the `2πr` measure is wrong for vectors | **silent** |
 
