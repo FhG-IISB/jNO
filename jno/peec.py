@@ -105,12 +105,30 @@ class PEECSolution:
     ``Z``/``R``/``L`` describe the source port; with an array ``freq`` each is an array over it.
     """
 
-    def __init__(self, freq, cur, part, terms, port, res, vol=None, owner=None, names=()):
+    def __init__(self, freq, cur, fil, terms, port, res, vol=None, owner=None, names=()):
         self._vol, self._owner, self._names = vol, owner, tuple(names)
         self.freq = freq
         self.i = cur  # (n_filament,) or (n_freq, n_filament) complex
-        self.partial = part  # (n_filament, n_filament) partial inductances, henry
+        self._fil = fil  # the discretisation; the partial-inductance MATRIX is formed only on demand
         self._terms, self._port, self._R = terms, port, res
+
+    @property
+    def partial(self):
+        """The dense ``(n, n)`` partial inductances, henry — formed HERE, not at solve time.
+
+        It is the one object in a partial-element method that is never sparse, and the solve is
+        built specifically to avoid it: a lattice applies it by FFT and a welded network by blocks.
+        Forming it anyway to compute one readout cost more than everything else put together --
+        measured on the example module at a 2 mm pitch, 3.7 GB of a 5.3 GB peak, against 0.84 GB for
+        the solve itself. It is quadratic in the SUB-POINT count, not the element count, so three
+        Gauss points per element make it nine times worse again.
+
+        Ask for it when you want the matrix. :attr:`L` no longer does.
+        """
+        from .utils.solver.kernel import pair_matrix
+
+        f = self._fil
+        return pair_matrix(f.pos, f.mom, lambda r: 1.0 / r, f.self_g, group=f.group) * (MU0 / (4 * jnp.pi))
 
     @property
     def Z(self):
@@ -130,11 +148,26 @@ class PEECSolution:
         the loop inductance the currents actually produce -- at a frequency where they redistribute,
         that is a different (smaller) number than the DC one, which is the effect worth seeing.
         """
+        from .utils.solver.kernel import pair_quadratic
+
+        f = self._fil
+        grp = jnp.asarray(f.group)
         cur = jnp.atleast_2d(self.i)
+
         # I^H Lp I, not I^T Lp I: the currents are complex, and the magnetic energy is the HERMITIAN
         # form. The transpose form is complex, and its real part goes negative once the phases spread
         # -- an inductance a passive loop cannot have.
-        num = jnp.real(jnp.einsum("fi,ij,fj->f", jnp.conj(cur), self.partial.astype(cur.dtype), cur))
+        #
+        # Computed as a QUADRATIC FORM, never through the matrix. Lp is real and symmetric, so
+        # I^H Lp I = Re(I)' Lp Re(I) + Im(I)' Lp Im(I) exactly -- the cross terms cancel by symmetry
+        # -- and each half is `pair_quadratic` with the current folded into the moments. That is the
+        # same sum the matrix would have given, evaluated in chunks that never hold an (N, N) array,
+        # and it rematerialises on the reverse pass so the gradient is bounded too.
+        def _energy(x):
+            m = jnp.asarray(f.mom) * x[grp][:, None]
+            return pair_quadratic(f.pos, m, lambda r: 1.0 / r, f.self_g, group=grp) * (MU0 / (4 * jnp.pi))
+
+        num = jnp.stack([_energy(jnp.real(c)) + _energy(jnp.imag(c)) for c in cur])
         out = num / jnp.abs(jnp.atleast_1d(self._port_current)) ** 2
         return out if jnp.ndim(self._port) else out[0]
 
@@ -435,9 +468,8 @@ class BuiltPEEC:
             a, _b, g = self.sources[0]
             drive.append(inj[a])
             port.append(g / inj[a])
-        from .utils.solver.kernel import internal_impedance, pair_matrix
+        from .utils.solver.kernel import internal_impedance
 
-        part = pair_matrix(fil.pos, fil.mom, lambda r: 1.0 / r, fil.self_g, group=fil.group) * (MU0 / (4 * jnp.pi))
         # the SURFACE resistance, so the Joule readout matches the solve rather than a DC restatement
         w = 2 * np.pi * float(self.freq[0])
         res = jnp.real(internal_impedance(fil.length, fil.area, fil.skin, fil.round_, w, sigma, MU0, fil.span))
@@ -447,7 +479,7 @@ class BuiltPEEC:
         sol = PEECSolution(
             self.freq[0] if self._scalar_freq else self.freq,
             cur[0] if self._scalar_freq else cur,
-            part,
+            fil,
             {
                 t: (
                     jnp.stack([jnp.asarray(m[t]) for m in inject])[0]

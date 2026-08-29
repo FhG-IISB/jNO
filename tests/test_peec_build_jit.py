@@ -310,3 +310,43 @@ def test_the_cache_still_serves_repeated_identical_solves():
     b = complex(built.solve().Z)
     assert a == b
     assert n_after_first >= 1 and len(_KRYLOV_CACHE) == n_after_first  # hit, not a second entry
+
+
+# --- the dense partial-inductance matrix is never formed to read an inductance ----------------------
+
+
+def test_L_agrees_with_the_matrix_it_no_longer_forms():
+    """The quadratic form and the matrix must give the same number, or the saving is a lie."""
+    sol = network(freq=1e6).build().solve()
+    cur = jnp.atleast_2d(sol.i)[0]
+    ref = jnp.real(jnp.conj(cur) @ sol.partial.astype(cur.dtype) @ cur) / abs(complex(sol._port_current)) ** 2
+    assert float(sol.L) == pytest.approx(float(ref), rel=1e-10)
+
+
+def test_reading_L_does_not_build_an_n_by_n_array(monkeypatch):
+    """Counted, not timed. `pair_matrix` is the one object a partial-element solve exists to avoid:
+    it is quadratic in the SUB-POINT count, so three Gauss points make it nine times worse than the
+    element count suggests. On the example module at a 2 mm pitch it was 3.7 GB of a 5.3 GB peak,
+    against 0.84 GB for the solve itself.
+    """
+    import jno.utils.solver.kernel as K
+
+    calls = []
+    orig = K.pair_matrix
+    monkeypatch.setattr(K, "pair_matrix", lambda *a, **k: (calls.append(1), orig(*a, **k))[1])
+
+    # a PLAIN lattice: the welded path legitimately forms this for its thin wire sub-block, which is
+    # a few hundred filaments against the lattice's thousands and is the point of the near/far split.
+    sol = network().build().solve()
+    assert len(calls) == 0, "solving formed the dense matrix"
+    _ = float(sol.L)
+    assert len(calls) == 0, "reading L formed the dense matrix"
+    _ = sol.partial  # asking for the matrix itself is the one thing that may build it
+    assert len(calls) == 1
+
+
+def test_L_is_still_the_hermitian_form_at_frequency():
+    """Re(I)'Lp Re(I) + Im(I)'Lp Im(I) is I^H Lp I exactly, and must stay positive once phases spread."""
+    for freq in (0.0, 1e6, 1e7):
+        assert float(network(freq=freq).build().solve().L) > 0
+    assert float(wire_network().build().solve().L) > 0  # and on a WELDED network too
