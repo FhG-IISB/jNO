@@ -701,7 +701,7 @@ def _axis_extent(var: Variable) -> int:
         raise ValueError(
             f"axis={var!r}: tag {getattr(var, 'tag', '?')!r} has no structured grid, so its points live on a "
             "single flat axis and no coordinate names one of them. `axis=<Variable>` is defined only on a "
-            "structured-grid domain (jno.domain.poseidon / equi_distant_rect / a structured mesh). "
+            "structured-grid domain (Geometries.poseidon / Geometries.equi_distant_rect / a structured mesh). "
             "Reduce the whole point axis with axis=None."
         )
     k = int(var.dim[0])

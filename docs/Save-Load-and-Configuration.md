@@ -26,8 +26,8 @@ jno.save(crux, "runs/crux.pkl")
 ### Loading
 
 ```python
-# Instance method (class method)
-crux = jno.core.load("runs/crux.pkl")
+# Module-level function
+crux = jno.load("runs/crux.pkl")
 
 # Module-level function
 crux = jno.load("runs/crux.pkl")
@@ -38,15 +38,63 @@ crux = jno.load("runs/crux.pkl")
 After loading, all Python variable references (e.g., `u_net`, `v_net`) no longer point to the models inside the loaded solver. Use `set_optimizer` to reassign optimisers to all models at once:
 
 ```python
-crux = jno.core.load("runs/crux.pkl")
+crux = jno.load("runs/crux.pkl")
 crux.set_optimizer(optax.adam, scale=lrs(1e-5))
 crux.solve(1000).plot("continued.png")
 ```
 
+### Checkpoints During Training — `restore_checkpoint`
+
+`crux.save()` above writes the whole solver in one file at a moment you choose. A **checkpoint** is
+the other thing: written periodically *during* `solve()` by a callback, holding weights, optimiser
+state and the RNG, so a long run survives an interruption.
+
+```python
+cb = jno.callbacks.checkpoint(
+    directory="runs/ckpt",
+    save_interval_epochs=500,
+    max_to_keep=3,
+    best_fn=lambda m: m["total_loss"],   # keep the best one regardless of age
+)
+crux.solve(20_000, callbacks=[cb])
+```
+
+Restoring is two lines, and the second is not optional:
+
+```python
+crux.restore_checkpoint("runs/ckpt")   # latest; or step=2000 for a specific one
+crux.solve(1)                          # the ARRAYS are restored here, not above
+```
+
+!!! warning "The restore is deferred to the next `solve()`"
+    `restore_checkpoint` reads the metadata immediately — the epoch counter moves straight away — but
+    schedules the weight restore for the next `solve()` call. Orbax needs the live Equinox/Optax tree
+    as a target, and that only exists inside `solve()` after the partition and optimiser setup. So a
+    `crux.eval(...)` between the two lines still sees the **old** weights.
+
+    The epoch counter is set to the **checkpoint's** step, not to where you were. Restoring step 500
+    of a 2000-epoch run and calling `solve(1)` leaves you at epoch 501.
+
+!!! danger "Restore into the solver that wrote it"
+    Restoring into a **freshly constructed** `jno.core` — even one built by the same code with the
+    same architecture — raises:
+
+    ```
+    ValueError: User-provided restore item and on-disk value metadata tree structures
+    do not match: opt_states.1: - Source: MISSING
+    ```
+
+    The optimiser-state tree is keyed by layer id, and a new solver assigns new ones. Use
+    `crux.save()` / `jno.load()` to move a run between processes; `restore_checkpoint` is for
+    rewinding the solver that produced the checkpoint.
+
+`jno.core(..., resume_from="runs/ckpt")` is the same mechanism as a constructor argument, consumed on
+the first `solve()`.
+
 ### Evaluation After Load
 
 ```python
-crux = jno.core.load("runs/crux.pkl")
+crux = jno.load("runs/crux.pkl")
 
 # Re-evaluate any constraint expression on the training domain
 pred = crux.eval(u)

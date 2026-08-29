@@ -1,3 +1,4 @@
+# --8<-- [start:code]
 """Reanalysis: does the optimised design report its own stiffness honestly?
 
 The optimiser moves nodes AND densities, so it can lower compliance either by improving the
@@ -126,3 +127,4 @@ print("  --")
 print(f"  thresholded at {args.threshold}: deformed {c_bin_def:.3e} -> clean {c_re_bin:.3e} ({gap_bin:+.2f} %)")
 print("  (paper: +17.6 % conventional, -0.5 % with E-FEM)")
 print("=" * 68)
+# --8<-- [end:code]

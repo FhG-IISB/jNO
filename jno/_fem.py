@@ -143,20 +143,54 @@ def _solve_linear_matrix_free(A, b, *, tol=1e-8, maxiter=20_000, shard=None):
         def _bicgstab(mv, rhs, M, x0):
             return jax.scipy.sparse.linalg.bicgstab(mv, rhs, x0=x0, tol=tol, atol=0.0, maxiter=maxiter, M=M)[0]
 
+        # NOT firewalled, unlike the single-device path below: `sharded_solve` owns the placement of
+        # both the operator and the iteration, and wrapping it in our own `custom_linear_solve` would
+        # mean deciding how the TRANSPOSED operator shards -- untested here, and a wrong sharding is
+        # worse than an unchecked one. So this branch keeps the eager-only guard, which means a
+        # multi-device solve differentiated under a trace still has an unchecked adjoint.
         u = sharded_solve(A, b, _bicgstab, devices, precond_fn=jacobi_from_diagonal)
         return _residual_check(A, b, u, "Jacobi-preconditioned BiCGStab (sharded)")
 
-    # COMPILED iteration, EAGER guard. `jax.scipy.sparse.linalg.bicgstab` was called from eager
-    # Python, so every one of its hundreds of iterations paid dispatch: measured 102.9 ms against
-    # 6.4 ms for the identical computation under `jit` at n=13861 -- a 16x tax on every default solve,
-    # and the reason the solve time barely moved between n=4641 and n=51843 (it was dispatch-bound,
-    # not compute-bound).
+    # COMPILED iteration, and the guard now compiles WITH it. `jax.scipy.sparse.linalg.bicgstab`
+    # was originally called from eager Python, so every one of its hundreds of iterations paid
+    # dispatch: measured 102.9 ms against 6.4 ms for the identical computation under `jit` at
+    # n=13861 -- a 16x tax on every default solve, and the reason the solve time barely moved
+    # between n=4641 and n=51843 (it was dispatch-bound, not compute-bound).
     #
-    # The guard stays OUTSIDE the jit deliberately. `_residual_check` needs a concrete residual, so
-    # wrapping the whole function would make it step aside and silently give up "raise rather than
-    # return garbage" in exchange for the speed. Split this way there is nothing to trade.
-    u = _bicgstab_jacobi(A, b, float(tol), int(maxiter))
-    return _residual_check(A, b, u, "Jacobi-preconditioned BiCGStab")
+    # That used to force a trade: `_residual_check` needs a CONCRETE residual, so it had to sit
+    # outside the jit, which left the transpose solve (inside) unguarded. `residual_gate` removes
+    # the trade by checking from inside the trace, so the whole thing -- iteration, firewall and
+    # both convergence checks -- is one compiled program. Measured faster than the split shape it
+    # replaces (1.90 ms against 2.73 ms at n=1441), because the eager check's own matvec and host
+    # sync go away.
+    return _firewalled_bicgstab(A, b, float(tol), int(maxiter))
+
+
+@partial(jax.jit, static_argnums=(2, 3))
+def _firewalled_bicgstab(A, b, tol: float, maxiter: int):
+    """The default solve inside our OWN ``custom_linear_solve``, so its adjoint is ours to check.
+
+    Called straight, ``jax.scipy.sparse.linalg.bicgstab`` supplies its own implicit-diff rule, and the
+    ``A^T`` solve that rule runs is out of reach -- unchecked, and unreachable by the eager
+    ``_residual_check`` above, which no-ops under a tracer anyway. That is not a hypothetical path:
+    ``jax.grad`` through a plain ``fem.solve()`` on an assembled operator lands here with ``A``
+    traced. Taking the firewall ourselves makes both directions explicit calls that
+    :func:`jno.utils.solver.solver_api.residual_gate` can gate -- which matters because a Krylov
+    method can break down on ``A^T`` while converging on ``A``, and the last iterate then comes back
+    as a plausible gradient.
+
+    ``_bicgstab_jacobi`` stays jitted and is called from inside the firewall's traced callbacks, so
+    the compiled-iteration win it exists for (16x at n=13861) is untouched. The transposed operator
+    keeps the same Jacobi preconditioner: ``diag(A^T) == diag(A)``.
+    """
+    from .utils.solver.solver_api import residual_gate
+
+    who = "fem.solve default (Jacobi-preconditioned BiCGStab)"
+    AT = A.T
+    mv, mvT = (lambda v: A @ v), (lambda v: AT @ v)
+    fwd = lambda _mv, rhs: residual_gate(mv, rhs, _bicgstab_jacobi(A, rhs, tol, maxiter), who, side="forward")
+    rev = lambda _mv, rhs: residual_gate(mvT, rhs, _bicgstab_jacobi(AT, rhs, tol, maxiter), who, side="transpose")
+    return jax.lax.custom_linear_solve(mv, b, fwd, transpose_solve=rev)
 
 
 def lag(expr: Any) -> Any:
@@ -583,7 +617,7 @@ def _element_for(dimension: int, order: int) -> str:
         return f"{ {1: 'INT', 2: 'TRI'}.get(int(dimension), 'TET') }-P{int(order)}"
     raise ValueError(
         f"jno.fem: no built-in element for dimension {dimension}, order {order} "
-        "(supported: 1D/2D/3D simplex at order >= 1; pass element_type=... to override)."
+        "(supported: 1D/2D/3D simplex at order >= 1)."
     )
 
 
@@ -1358,7 +1392,7 @@ class FEM:
         """Per-field DOF ``slice``s into the flat solution (``None`` without block structure).
 
         The structural handle block preconditioners build on: ``jno.precond.block_diag`` /
-        ``triangular`` resolve their field arguments to these slices (see ``docs/fem.md``)."""
+        ``triangular`` resolve their field arguments to these slices (see ``docs/solvers.md``)."""
         off = self.offsets
         if off is None:
             return None
@@ -4275,8 +4309,6 @@ def fem(
     constraints: Any,
     *,
     quad_degree: int = 2,
-    element_type: Optional[str] = None,
-    vec: Optional[int] = None,
     chunk: Any = None,
     _dd_overlap: bool = False,
 ) -> FEM:
@@ -4296,8 +4328,6 @@ def fem(
         out = _fem_impl(
             constraints,
             quad_degree=quad_degree,
-            element_type=element_type,
-            vec=vec,
             _dd_overlap=_dd_overlap,
         )
         if chunk is not None and not _fn._CHUNK_CONSUMED[0]:
@@ -4317,8 +4347,6 @@ def _fem_impl(
     constraints: Any,
     *,
     quad_degree: int = 2,
-    element_type: Optional[str] = None,
-    vec: Optional[int] = None,
     _dd_overlap: bool = False,
 ) -> FEM:
     """Assemble a flat list of traced residuals into an :class:`FEM`.
@@ -4328,11 +4356,9 @@ def _fem_impl(
     constraints:
         A residual expression or list of them. Weak terms (containing the test
         function) and essential conditions (``u(region) - g``) are auto-classified.
-    quad_degree, element_type:
-        FEM discretisation options (forwarded to the quadrature setup).
-    vec:
-        Vector size of the unknown. ``None`` (default) infers it from the trial's
-        ``value_shape`` (scalar → 1, ``(2,)`` → 2, …); pass an int to override.
+    quad_degree:
+        Quadrature degree (forwarded to the quadrature setup). The element type is
+        derived from the domain's dimension and the trial's ``order``.
     chunk:
         Cells per chunk in the element assembly loop. ``None`` (the default) sizes it from the
         device — see below; ``False`` runs one ``vmap`` over every cell (the old behaviour); a
@@ -4371,7 +4397,7 @@ def _fem_impl(
     # remeshed in place -- the constraints reference the domain (not a mesh snapshot),
     # so re-tracing them picks up the refined mesh automatically.
     _orig_constraints = list(constraints)
-    _orig_fem_kwargs = {"quad_degree": quad_degree, "element_type": element_type, "vec": vec}
+    _orig_fem_kwargs = {"quad_degree": quad_degree}
 
     # Gauge pins (`p.pin()`) remove a field's constant null space. Lower each to a single-node
     # Dirichlet `p(node) - value` *before* domain discovery and classification: a GaugePin is a
@@ -4556,8 +4582,10 @@ def _fem_impl(
                 )
 
     multifield = len(_field_keys(constraints)) > 1
-    if vec is None and not multifield:
-        vec = _infer_vec(constraints)  # single-field only (coupled fields carry per-field vec)
+    # Single field only -- a coupled form carries a per-field vec, resolved from each field's own
+    # value_shape downstream. There is no override: the trial's `value_shape` IS the vector size, the
+    # same way the domain's dimension and the trial's order fix the element type.
+    vec = None if multifield else _infer_vec(constraints)
 
     # Evolution terms ride the real, steady, native-Lagrange path — single field or coupled. The history
     # buffers are indexed by CELL, never by field, and the state readout gathers the concatenation of every
@@ -5069,8 +5097,10 @@ def _fem_impl(
                 )
             # Both legs share one Dirichlet row set, which imposes `Re u = g, Im u = 0` — right for a
             # real g, inexpressible for a complex one (see `complex_dirichlet_regions`). 2D/3D takes
-            # the same shared-row route but reaches it by casting g to float, so it *silently* drops
-            # Im(g); refuse instead. A complex essential value is the one thing 1D says no to here.
+            # the same shared-row route and refuses it the same way (verified: both raise on
+            # `u(xb, yb) - (0.5+0.25j)`); this comment used to say 2D/3D silently dropped Im(g),
+            # which is no longer true. The restriction is on the essential VALUE only — the operator
+            # and the source stay complex, and the solution has an imaginary part everywhere.
             if _cx_dbc := complex_dirichlet_regions(domain, dirichlet_values):
                 raise NotImplementedError(
                     f"jno.fem: a COMPLEX essential value on region(s) {sorted(set(_cx_dbc))} of a 1D complex "
@@ -5154,8 +5184,7 @@ def _fem_impl(
 
     # ---- single field: element defaults to the field order (P1->TRI3/TET4,
     # P2->TRI6/TET10); a higher-order field bumps the quadrature for exactness. ----
-    if element_type is None:
-        element_type = _element_for(domain.dimension, order)
+    element_type = _element_for(domain.dimension, order)
     quad_degree = max(quad_degree, 2 * order)  # factory uses 2*degree+1; bump to the field's order
 
     # ---- build IR with explicit regions, then detect transient vs steady. This is done so the

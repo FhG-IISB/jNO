@@ -113,6 +113,30 @@ cb = jno.callbacks.checkpoint(
 crux.solve(10000, callbacks=[cb])
 ```
 
+#### Resuming from a checkpoint — `jno.core(resume_from=...)`
+
+Checkpointing writes; `resume_from` reads. Point a fresh `jno.core` at the checkpoint directory and
+model parameters, optimizer states and the RNG key are restored before the next `solve()`:
+
+```python
+crux = jno.core(constraints, domain=dom, resume_from="runs/my_experiment/checkpoints")
+crux.solve(10_000)          # continues from the latest checkpoint, not from scratch
+```
+
+!!! measured "A crashed run picks up where it stopped"
+    Training 200 epochs to a loss of **0.231104**, then resuming in a **new process**: the resumed
+    run reports **0.236130** after one step. The same script with no `resume_from` starts at
+    **0.814328**.
+
+!!! warning "The resuming process must build the models the same way"
+    Optimizer states are keyed by a per-process model counter, so a script that constructs a
+    different number of `jno.nn(...)` models — or constructs them in a different order — before
+    resuming will fail with an Orbax *"tree structures do not match"* error naming a mismatched
+    `opt_states.N`. Re-run the same script; do not resume inside a process that already built other
+    models.
+
+    Requires the optional `orbax-checkpoint` package.
+
 #### Keeping the best checkpoint
 
 Pass `best_fn` to always retain the checkpoint with the lowest returned value, regardless of `max_to_keep`:
@@ -138,7 +162,7 @@ print(state["metadata"])      # {"epoch": 2000, "total_loss": ..., "timestamp": 
 To resume training from a restored checkpoint, reload the solver and re-attach the restored parameters:
 
 ```python
-crux = jno.core.load("runs/crux.pkl")
+crux = jno.load("runs/crux.pkl")
 crux.set_optimizer(optax.adam(1e-4))
 crux.solve(5000)
 ```

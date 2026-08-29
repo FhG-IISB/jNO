@@ -42,6 +42,8 @@ to match the trailing dimension of the expression you are adding noise to::
     xyz + jno.noise.gaussian(std=0.01, ndim=3)
 """
 
+from typing import Any
+
 import jax
 import jax.numpy as jnp
 
@@ -80,7 +82,7 @@ class _NoiseNamespace:
 
     def grf(
         self,
-        *coords,
+        *coords: Any,
         length_scale: float = 0.1,
         variance: float = 1.0,
         kernel: str = "matern",

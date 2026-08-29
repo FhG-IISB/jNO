@@ -96,6 +96,64 @@ and `-e dev` (adds matplotlib and the test tooling).
 
 ---
 
+## Check what you actually got
+
+Seven optional extras means a missing one usually surfaces much later, as an `ImportError` in the
+middle of a solve. This reports it up front — devices, precision, and which backends imported:
+
+```python
+import importlib.util as iu
+import jax, jno
+
+print(f"jNO {jno.__version__} · JAX {jax.__version__} · x64={jax.config.jax_enable_x64}")
+print("devices:", [f"{d.platform}:{d.id}" for d in jax.devices()])
+
+OPTIONAL = [
+    ("mmgpy",        "[fem]",  "adaptive remeshing — fem.solve(adapt=...)"),
+    ("pypardiso",    "[fem]",  'sparse-direct on CPU — jno.solve.lu(backend="pardiso")'),
+    ("nvmath",       "[fem]",  'sparse-direct on GPU — jno.solve.lu(backend="cudss")'),
+    ("jaxamg",       "[amg]",  "GPU algebraic multigrid — jno.solve.amg()"),
+    ("fmmax",        "[rcwa]", "anisotropic RCWA layers"),
+    ("iree.runtime", "[iree]", "ahead-of-time export — model.iree(...)"),
+    ("matfree",      "",       "matrix functions — jno.solve.logdet / applyfun"),
+    ("pyamg",        "",       "CPU algebraic multigrid — jno.precond.amg()"),
+]
+for mod, extra, unlocks in OPTIONAL:
+    try:
+        have = iu.find_spec(mod) is not None
+    except ModuleNotFoundError:          # a dotted name whose parent package is absent
+        have = False
+    print(f"  {'yes' if have else ' no'}  {mod:<13} {extra:<7} {unlocks}")
+```
+
+```text
+jNO 0.3.1 · JAX 0.10.1 · x64=False
+devices: ['cpu:0']
+  yes  mmgpy         [fem]   adaptive remeshing — fem.solve(adapt=...)
+   no  pypardiso     [fem]   sparse-direct on CPU — jno.solve.lu(backend="pardiso")
+   no  nvmath        [fem]   sparse-direct on GPU — jno.solve.lu(backend="cudss")
+  yes  jaxamg        [amg]   GPU algebraic multigrid — jno.solve.amg()
+   no  fmmax         [rcwa]  anisotropic RCWA layers
+   no  iree.runtime  [iree]  ahead-of-time export — model.iree(...)
+  yes  matfree               matrix functions — jno.solve.logdet / applyfun
+  yes  pyamg                 CPU algebraic multigrid — jno.precond.amg()
+```
+
+!!! warning "`x64=False` is the JAX default, and FEM needs `True`"
+    Data precision is JAX's flag, not a jNO setting — jNO only respects it (the per-model
+    `.dtype()` control is a separate thing). A FEM assembly accumulates in float64 and an
+    unstructured-mesh solve will not reach its tolerance without it:
+
+    ```python
+    import jax
+    jax.config.update("jax_enable_x64", True)   # before you build a domain
+    ```
+
+    Set it **before** creating arrays, domains or models: the flag affects only what is created
+    after it, so flipping it mid-script leaves you with a mix.
+
+---
+
 ## Docker
 
 CPU:
@@ -116,3 +174,14 @@ Build locally:
 docker build -t jno:latest .
 docker run --rm --gpus all jno:latest
 ```
+
+!!! note "What the image contains"
+    The **core** install plus a CUDA-capable JAX — the image's pixi environment carries
+    `jax-cuda12-plugin[with-cuda]`, so `--gpus all` needs only the host driver and the NVIDIA
+    Container Toolkit, no CUDA base image.
+
+    It does **not** carry the optional extras: no `mmgpy` (adaptive remeshing), no `pypardiso` /
+    `nvmath` (accelerated direct solvers), no `fmmax` (anisotropic RCWA), no `iree`. Run the
+    [verification snippet](#check-what-you-actually-got) inside the container if you are unsure what
+    you have. Tags are published per release (`{{version}}` and `latest`), so `latest` tracks the most
+    recent **release**, not `main`.

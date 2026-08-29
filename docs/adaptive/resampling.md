@@ -214,7 +214,7 @@ Measured on 4 000 points against a 20 000-point pool (CPU), jit against the same
 !!! note "CR3's gamma stays host-side"
     CR3 adapts a causal-gate parameter `gamma` between resamples. Advancing it inside a traced call
     would capture a tracer in the strategy object, so `resample()` uses the current value and
-    [`next_gamma`][] is the pure form the training loop advances with. Everything else about CR3
+    [`next_gamma`][jno.utils.adaptive.resampling.CR3.next_gamma] is the pure form the training loop advances with. Everything else about CR3
     traces.
 
 ## Tips

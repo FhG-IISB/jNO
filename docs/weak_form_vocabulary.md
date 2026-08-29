@@ -74,6 +74,8 @@ time-window integral.
 | Symbol | Meaning | Use |
 |---|---|---|
 | `d.variable(tag, normals=True, split=True)` → `nx, ny` | boundary outward normal | flux / Robin terms `nx*ui.x + ny*ui.y` |
+| `d.variable(tag, normals=True, reverse_normals=True, split=True)` | the same normals, **negated** | an enclosure or cavity where the meshed side faces inward |
+| `d.variable(tag, return_indices=True, split=True)` | one extra placeholder: the sampled point **indices** | scattering a result back onto the mesh, or tying a subset to data |
 | `d.cell_size` | element size `h` (\|detJ\|^(1/dim)) at quad points | **SUPG/GLS stabilization** `τ = h/(2·|β|)` |
 | `d.enclosure(tags)` | view-factor matrix + measures | grey-body radiation (`.view_factor`, `.field()`, `.load()`) |
 
@@ -103,4 +105,4 @@ conditionals, non-local integrals, the geometry symbols, and the full tensor cal
 
 `fem.term_kinds` (provisional) classifies each PDE term — `is_local` (pointwise reaction/mass) vs.
 global (neighbour-coupling diffusion/advection), its temporal order, trial/test gradient channel,
-and linearity — the basis for operator-splitting routing. See [`fem.md`](fem.md).
+and linearity — the basis for operator-splitting routing. See [`fem.md`](fem/index.md).

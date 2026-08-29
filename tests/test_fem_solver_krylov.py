@@ -397,6 +397,110 @@ def test_grad_through_firewall_nonsymmetric():
     assert abs(g - g_fd) / (abs(g_fd) + 1e-12) < 1e-5
 
 
+def test_transpose_solve_result_is_checked():
+    """The hole this closes: ``custom_linear_solve``'s ``transpose_solve`` -- the adjoint every
+    gradient flows through -- had no convergence check of any kind, and the eager check on the
+    forward is a no-op under tracers besides. So a Krylov method that broke down on ``A^T`` while
+    converging on ``A`` returned its last iterate silently, and the wrong gradient looked plausible.
+
+    Injected deterministically: a raw solver that always inverts ``A``. On a NON-symmetric ``A`` that
+    is exactly right forward and exactly wrong transposed -- no starved iteration counts, no
+    tolerance luck."""
+    from jno.solve import _firewalled
+
+    A = jnp.asarray(_nonsym(n=20, seed=21))
+    op = jno.solve.LinearOperator(A)
+    b = _b(20, seed=22)
+    raw = lambda mv, rhs, M, x0: jnp.linalg.solve(A, rhs)  # noqa: E731, ARG005
+    run = lambda rhs: _firewalled(raw, op, rhs, M=None, x0=None, symmetric=False, name="probe")  # noqa: E731
+
+    fwd = np.asarray(run(b))
+    assert float(jnp.linalg.norm(A @ fwd - b) / jnp.linalg.norm(b)) < 1e-10, "the forward must pass"
+
+    with pytest.raises(RuntimeError, match="ADJOINT"):
+        jax.grad(lambda rhs: jnp.sum(run(rhs) ** 2))(b)
+
+
+def test_the_gate_fires_from_inside_a_trace_and_never_spuriously():
+    """It has to fire under ``jit`` or it guards nothing -- every solve in anger runs under one. And
+    it must not fire *spuriously*: under ``vmap`` a ``lax.cond`` becomes a ``select`` that runs both
+    branches, which is why the host callback is unconditional rather than hidden behind a branch."""
+    A = jnp.asarray(_nonsym(n=24, seed=6))
+    op = jno.solve.LinearOperator(A)
+    solver = jno.solve.fgmres(tol=1e-12)
+
+    assert np.isfinite(np.asarray(jax.jit(lambda rhs: solver(op, rhs))(_b(24, seed=7)))).all()
+
+    rhs = jnp.stack([_b(24, seed=8), _b(24, seed=9), _b(24, seed=10)])
+    out = jax.vmap(lambda r: solver(op, r))(rhs)
+    for k in range(3):
+        assert float(jnp.linalg.norm(A @ out[k] - rhs[k]) / jnp.linalg.norm(rhs[k])) < 1e-8
+
+    starved = jno.solve.fgmres(tol=1e-13, restart=2, maxiter=1)
+    with pytest.raises(RuntimeError, match="did not solve the system"):
+        jax.jit(lambda rhs: starved(op, rhs))(_b(24, seed=7))
+
+
+def test_the_fem_default_solve_gates_its_own_adjoint():
+    """The most-used differentiable path in the library, and the one the slot fix did not reach.
+
+    ``fem.solve()`` with no slots runs a matrix-free Jacobi-BiCGStab, and calling
+    ``jax.scipy.sparse.linalg.bicgstab`` straight means JAX supplies the implicit-diff rule -- so the
+    ``A^T`` solve it runs was out of reach. Not hypothetical: ``jax.grad`` through a plain
+    ``fem.solve()`` on an assembled operator lands there with ``A`` traced, where the eager
+    ``_residual_check`` is a no-op by construction."""
+    pytest.importorskip("shapely", reason="shapely required for the box domain")
+    from shapely.geometry import box
+
+    from jno._fem import _solve_linear_matrix_free
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.15)
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+
+    def total(k):
+        fem = jno.fem([k * (ui.x * vi.x + ui.y * vi.y) - 1.0 * vi, u(xb, yb) - 0.0])
+        return jnp.sum(jnp.asarray(fem.solve()).reshape(-1))
+
+    value = float(total(2.0))  # u scales as 1/k, so d(Sum u)/dk == -Sum u / k exactly
+    assert abs(float(jax.grad(total)(2.0)) + value / 2.0) / (value / 2.0) < 1e-6
+
+    A, b = jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0]).operator
+    with pytest.raises(RuntimeError, match="did not solve the system"):
+        _solve_linear_matrix_free(A, b, maxiter=2)  # forward
+    with pytest.raises(RuntimeError, match="did not solve the system"):
+        jax.grad(lambda s: jnp.sum(_solve_linear_matrix_free(A, s * b, maxiter=2)))(1.0)  # adjoint
+
+
+def test_a_preconditioner_application_is_not_gated():
+    """A preconditioner is inexact BY DESIGN. ``jno.precond.inner(jno.solve.cg(tol=1e-2, maxiter=30))``
+    asks for two digits deliberately -- that is precisely why the outer Krylov has to be flexible --
+    so holding it to the solver gate would turn a correct, documented configuration into an error.
+    Caught by the transient suite the moment the gate went in, which is why it is pinned here: the
+    contract belongs to the OUTER solve, and that one stays gated."""
+    A = jnp.asarray(_spd(n=30, seed=15))
+    op = jno.solve.LinearOperator(A)
+    b = _b(30, seed=16)
+
+    loose = jno.solve.cg(tol=1e-2, maxiter=3)  # nowhere near the 1e-4 gate, on purpose
+    with pytest.raises(RuntimeError, match="did not solve the system"):
+        loose(op, b)  # as an OUTER solve it must still raise
+
+    x = jno.solve.fgmres(tol=1e-12)(op, b, M=jno.precond.inner(loose))
+    assert float(jnp.linalg.norm(A @ x - b) / jnp.linalg.norm(b)) < 1e-8
+
+
+def test_a_zero_right_hand_side_is_not_a_failure():
+    """The adjoint's "this output has no cotangent" case. The relative residual has no scale there
+    (``0/0``), and every solver returns zero, so the gate must skip it rather than read the
+    undefined ratio as a divergence and raise on a perfectly ordinary reverse pass."""
+    op = jno.solve.LinearOperator(jnp.asarray(_nonsym(n=16, seed=14)))
+    x = jno.solve.fgmres(tol=1e-13)(op, jnp.zeros(16))
+    assert float(jnp.linalg.norm(x)) < 1e-12
+
+
 # ---------------------------------------------------------------------------
 # end-to-end as fem.solve slots
 # ---------------------------------------------------------------------------

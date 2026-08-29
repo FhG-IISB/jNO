@@ -168,7 +168,7 @@ def test_diff_reproduces_the_hand_written_svk_stress():
 
 
 def test_diff_reproduces_the_hand_written_neo_hookean_stress():
-    """P = μ(F − F⁻ᵀ) + λ ln(J) F⁻ᵀ, the form documented in docs/fem.md, recovered from its energy."""
+    """P = μ(F − F⁻ᵀ) + λ ln(J) F⁻ᵀ, the form documented in docs/fem/formulations.md, recovered from its energy."""
     trace, inner, grad, det, inv = jno.np.trace, jno.np.inner, jno.np.grad, jno.np.det, jno.np.inv
     d = _box()
     u, phi = d.fem_symbols(value_shape=(3,))

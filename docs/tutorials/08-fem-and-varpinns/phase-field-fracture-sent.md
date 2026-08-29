@@ -90,3 +90,9 @@ that never happened.
 For the **fourth-order** regularization on a biharmonic (Morley/Argyris) element, see
 [Brittle Fracture — 4th-order phase-field](phase-field-fracture-2d.md); that model needs a $C^1$-ish
 space, which the load-path march does not yet carry.
+
+## Full script
+
+```python
+--8<-- "tutorial_examples/08_fem_and_varpinns/phase_field_fracture_sent.py:code"
+```

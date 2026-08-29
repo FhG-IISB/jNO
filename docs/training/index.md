@@ -47,7 +47,7 @@ u_net = jno.nn(foundax.mlp(2, key=key)).optimizer(optax.adam(1e-3))
 When loading a saved solver the `Model` references in the expression tree are disconnected from Python variables. Use `set_optimizer` to reassign:
 
 ```python
-crux = jno.core.load("runs/crux.pkl")
+crux = jno.load("runs/crux.pkl")
 crux.set_optimizer(optax.adam, scale=lrs(1e-4))
 crux.solve(1000)
 ```

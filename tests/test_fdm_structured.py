@@ -139,36 +139,25 @@ def test_grid_gradient_matches_analytic():
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_structured_poisson_function_form():
-    """-Δu = f on a structured grid, u = sin(πx)sin(πy). Function-form FDMSystem → grid stencil."""
-    d = _structured(0.0, 0.0, 1.0, 1.0, size=0.05)
-    p = _nodes(d)
-    exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
-    f = jnp.asarray(2 * np.pi**2 * exact)
-    sys = jno.fdm(d, residual=lambda u: -jno.fdm.laplacian(u, d) - f, dirichlet={"boundary": 0.0})
-    u = np.asarray(sys.solve()).reshape(-1)
-    assert float(np.linalg.norm(u - exact) / np.linalg.norm(exact)) < 1e-2
-
-
 def test_structured_matches_unstructured():
     """Same Poisson problem solved on a structured grid and an unstructured mesh both hit the analytic
     solution — the structured backend is not a different physics, only a faster discretisation."""
 
-    def rel_err_structured(size):
-        d = _structured(0.0, 0.0, 1.0, 1.0, size=size)
-        p = _nodes(d)
-        exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
-        f = jnp.asarray(2 * np.pi**2 * exact)
-        u = np.asarray(jno.fdm(d, residual=lambda u: -jno.fdm.laplacian(u, d) - f, dirichlet={"boundary": 0.0}).solve())
-        return float(np.linalg.norm(u.reshape(-1) - exact) / np.linalg.norm(exact))
+    import jno.jnp_ops as jnn
 
-    def rel_err_unstructured(size):
-        d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=size)
+    def rel_err(d):
         p = _nodes(d)
         exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
-        f = jnp.asarray(2 * np.pi**2 * exact)
-        u = np.asarray(jno.fdm(d, residual=lambda u: -jno.fdm.laplacian(u, d) - f, dirichlet={"boundary": 0.0}).solve())
-        return float(np.linalg.norm(u.reshape(-1) - exact) / np.linalg.norm(exact))
+        x, y, _ = d.variable("interior", split=True)
+        xb, yb, _ = d.variable("boundary", split=True)
+        u = d.unknown()
+        ui = u.bind(x=x, y=y)
+        f = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+        sol = jno.fdm([-ui.laplacian(x, y, scheme="finite_difference:cotangent") - f, u(xb, yb) - 0.0]).solve()
+        return float(np.linalg.norm(np.asarray(sol).reshape(-1) - exact) / np.linalg.norm(exact))
+
+    rel_err_structured = lambda size: rel_err(_structured(0.0, 0.0, 1.0, 1.0, size=size))
+    rel_err_unstructured = lambda size: rel_err(jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=size))
 
     assert rel_err_structured(0.05) < 1e-2
     assert rel_err_unstructured(0.05) < 1e-2
@@ -229,41 +218,6 @@ def test_structured_constraint_list_differentiable():
     g = float(jax.grad(loss)(1.5))
     assert np.isfinite(g) and g > 0.0  # at scale=1.5 (> true 1.0) the loss increases with scale
     assert float(loss(1.0)) < float(loss(1.5))
-
-
-def test_structured_differentiable_for_inverse():
-    """The structured solve is reverse-mode differentiable w.r.t. a residual parameter (inverse-problem
-    readiness) — the grid stencils keep gradients flowing."""
-    d = _structured(0.0, 0.0, 1.0, 1.0, size=0.08)
-    p = _nodes(d)
-    fbase = jnp.asarray(2 * np.pi**2 * np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]))
-    obs = jnp.asarray(np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]))
-
-    def loss(scale):
-        sys = jno.fdm(d, residual=lambda u: -jno.fdm.laplacian(u, d) - scale * fbase, dirichlet={"boundary": 0.0})
-        return jnp.mean((sys.solve() - obs) ** 2)
-
-    g = float(jax.grad(loss)(1.5))
-    assert np.isfinite(g)
-    assert g > 0.0  # at scale=1.5 (> true 1.0) the loss increases with scale
-    assert float(loss(1.0)) < float(loss(1.5))
-
-
-def test_structured_transient_heat():
-    """Method-of-lines transient on a structured grid: u_t = ν Δu, homogeneous Dirichlet → decays as
-    e^(−2νπ²t)·u0 for u0 = sin(πx)sin(πy)."""
-    nu, T = 0.05, 0.4
-    d = _structured(0.0, 0.0, 1.0, 1.0, size=0.06)
-    d = jno.domain(d, time=(0.0, T, 160))  # add time (grid descriptor carries through the clone)
-    assert d.mesh_connectivity.get("grid") is not None
-    p = _nodes(d)
-    u0 = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
-    sys = jno.fdm(d, residual=lambda u: -nu * jno.fdm.laplacian(u, d), dirichlet={"boundary": 0.0})
-    traj = np.asarray(sys.solve_transient(jnp.asarray(u0), (0.0, T), 160))
-    final = traj[-1]
-    expected = np.exp(-2 * nu * np.pi**2 * T) * u0
-    interior = (p[:, 0] > 1e-9) & (p[:, 0] < 1 - 1e-9) & (p[:, 1] > 1e-9) & (p[:, 1] < 1 - 1e-9)
-    assert float(np.linalg.norm(final[interior] - expected[interior]) / np.linalg.norm(expected[interior])) < 5e-2
 
 
 def test_structured_constraint_list_transient():
@@ -382,17 +336,6 @@ def test_structured_3d_laplacian_second_order():
     e_coarse, e_fine = err(0.25), err(0.125)
     assert e_fine < e_coarse
     assert e_fine / e_coarse < 0.4
-
-
-def test_structured_3d_poisson_function_form():
-    """-Δu = f on a structured 3-D grid, u = sin πx·sin πy·sin πz (function-form FDMSystem)."""
-    d = _structured_box(size=0.14)
-    p = np.asarray(d.mesh_connectivity["points"])[:, :3]
-    exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]) * np.sin(np.pi * p[:, 2])
-    f = jnp.asarray(3 * np.pi**2 * exact)
-    sys = jno.fdm(d, residual=lambda w: -jno.fdm.laplacian(w, d) - f, dirichlet={"boundary": 0.0})
-    u = np.asarray(sys.solve()).reshape(-1)
-    assert float(np.linalg.norm(u - exact) / np.linalg.norm(exact)) < 2e-2
 
 
 def test_structured_3d_constraint_list_solve():

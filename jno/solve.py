@@ -20,6 +20,7 @@ BiCGStab (steady linear) and Jacobian-free Newton-Krylov (nonlinear).
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any, Optional
 
 import jax
@@ -35,7 +36,6 @@ from .utils.solver.solver_api import (
     LinearSolver,
     NonlinearSolver,
     PrecondApplier,
-    _maybe_residual_check,
 )
 
 __all__ = [
@@ -154,7 +154,19 @@ def lu(*, backend: str = "device", host: bool | None = None) -> LinearSolver:
         if op.bcoo is not None:
             return solve(op.bcoo, b)
         # a dense operator gets the dense direct solve — BCOO.fromdense would need a concrete
-        # nse, which does not exist under jit/vmap tracing
+        # nse, which does not exist under jit/vmap tracing. SAY SO when that silently drops a
+        # backend the caller asked for by name: the answer is the same, but `backend="pardiso"`
+        # is chosen for speed, and getting LAPACK instead without a word is the kind of silent
+        # substitution that makes a benchmark meaningless. (The sparse path above raises a clear
+        # ImportError when the backend's stack is absent; this branch never reaches it.)
+        if backend not in ("device", "host"):
+            logging.getLogger("jno").info(
+                "jno.solve.lu(backend=%r): the operator is dense, so the backend is not used — a dense "
+                "operator cannot be handed to a sparse factorization without a concrete nse. Falling back "
+                "to jnp.linalg.solve (same answer, LAPACK not %s).",
+                backend,
+                backend,
+            )
         return jnp.linalg.solve(op.dense(), b)
 
     # No `key`, so the composer leaves this on the eager path. What compiling the composed solve buys
@@ -191,10 +203,16 @@ def dense() -> LinearSolver:
 
 
 def _krylov(name: str, tol: float, atol: float, maxiter: Optional[int], **fixed):
+    # Routed through `_firewalled` for the same reason the raw solvers are: `jax.scipy.sparse.linalg`
+    # wraps itself in `custom_linear_solve`, so its transpose solve is JAX's -- out of reach, and
+    # unchecked. Taking the firewall ourselves makes the adjoint an explicit call we can gate, and
+    # lets a non-symmetric preconditioner be transposed for it (see `_firewalled`). The extra
+    # `custom_linear_solve` costs nothing: the outer one intercepts differentiation, so the inner is
+    # never transposed.
     def _fn(op: LinearOperator, b, *, M, x0):
         method = getattr(jax.scipy.sparse.linalg, name)
-        x, _info = method(op.mv, b, x0=x0, tol=tol, atol=atol, maxiter=maxiter, M=M, **fixed)
-        return _maybe_residual_check(op, b, x, name)
+        raw = lambda mv, rhs, M, x0: method(mv, rhs, x0=x0, tol=tol, atol=atol, maxiter=maxiter, M=M, **fixed)[0]
+        return _firewalled(raw, op, b, M=M, x0=x0, symmetric=(name == "cg"), name=name)
 
     # `key` must name every argument that changes the iteration -- see LinearSolver. `fixed` is
     # per-method extra configuration (GMRES's restart), so it goes in sorted rather than by position.
@@ -232,7 +250,9 @@ def _firewalled(raw, op: LinearOperator, b, *, M, x0, symmetric: bool, name: str
     on ``A^T`` (on ``A`` itself when ``symmetric``), reusing ``M`` (legitimate: a preconditioner
     only affects convergence speed, never the converged solution).
     """
-    fwd = lambda _mv, rhs: raw(op.mv, rhs, M=M, x0=x0)
+    from .utils.solver.solver_api import residual_gate
+
+    fwd = lambda _mv, rhs: residual_gate(op.mv, rhs, raw(op.mv, rhs, M=M, x0=x0), f"jno.solve.{name}", side="forward")
     if symmetric:
         rev = fwd
     else:
@@ -244,9 +264,14 @@ def _firewalled(raw, op: LinearOperator, b, *, M, x0, symmetric: bool, name: str
         # step). jno.precond appliers carry a structural transpose (PrecondApplier.T); a bare
         # callable preconditioner has none, so we fall back to reusing M (correct, maybe slow).
         M_T = M.T if isinstance(M, PrecondApplier) else M
-        rev = lambda _mv, rhs: raw(op.T.mv, rhs, M=M_T, x0=None)
-    x = jax.lax.custom_linear_solve(op.mv, b, fwd, transpose_solve=rev, symmetric=symmetric)
-    return _maybe_residual_check(op, b, x, name)
+        # The adjoint every gradient flows through, and until now the one solve here with no
+        # convergence check of any kind: the check this replaced saw only the forward `x`, and was a
+        # no-op under tracers besides. A Krylov iteration that leaves on its step cap returns its last
+        # iterate silently, so a broken adjoint arrived as a perfectly plausible gradient.
+        rev = lambda _mv, rhs: residual_gate(
+            op.T.mv, rhs, raw(op.T.mv, rhs, M=M_T, x0=None), f"jno.solve.{name}", side="transpose"
+        )
+    return jax.lax.custom_linear_solve(op.mv, b, fwd, transpose_solve=rev, symmetric=symmetric)
 
 
 def fgmres(*, tol: float = 1e-8, restart: int = 30, maxiter: int = 1000) -> LinearSolver:
@@ -868,7 +893,9 @@ def trace(A, *, fun=None, samples: int = 32, order: int = 25, key=None):
 
 def applyfun(A, v, *, fun, order: int = 30, symmetric: bool = True):
     """Matrix-free ``f(A)·v`` — e.g. one exact exponential-integrator step ``exp(-dt·A)·v`` with
-    ``fun=lambda z: jnp.exp(-dt*z)``. ``symmetric=True`` (default, Lanczos) assumes ``A = Aᵀ``;
+    ``fun=lambda z: jnp.exp(-dt*z)``. ``order`` **bounds** the Krylov dimension rather than fixing it:
+    the iteration stops at the order that has actually converged, so raising it can only help (unlike
+    the stochastic estimators above, where ``order`` is a real request). ``symmetric=True`` (default, Lanczos) assumes ``A = Aᵀ``;
     ``symmetric=False`` (Arnoldi + an eigendecomposition of the Hessenberg with an analytic Daleckii–Krein
     derivative) handles a **non-symmetric** ``A`` (advection–diffusion). Both are **differentiable and
     GPU-capable** — the non-symmetric path for any **holomorphic** ``fun`` on a **diagonalizable** ``A``.

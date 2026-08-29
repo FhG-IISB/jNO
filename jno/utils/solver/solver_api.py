@@ -24,6 +24,7 @@ Contracts
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, Optional
@@ -221,11 +222,100 @@ def _slice_bcoo(src, si: slice, sj: slice):
         return None  # any exotic layout falls back to the matvec-only block
 
 
+#: Relative-residual gate shared by the eager and traced convergence checks.
+_GATE_RTOL = 1e-4
+
+#: Set while a ``jno.solve`` solver is being used as a PRECONDITIONER application. A preconditioner
+#: is inexact by definition -- ``jno.precond.inner(jno.solve.cg(tol=1e-2, maxiter=30))`` asks for two
+#: digits on purpose, which is the whole reason FGMRES exists -- so its inner solve has no
+#: convergence contract to check and :func:`residual_gate` must stand down. It is a property of the
+#: CALL, not of the solver: the same ``cg()`` spec gated as an outer solve is ungated as an inner one.
+_GATE_SUSPENDED = False
+
+
+@contextlib.contextmanager
+def gate_suspended():
+    """Run a solver call as a preconditioner application: inexact by design, so not gated."""
+    global _GATE_SUSPENDED
+    prev = _GATE_SUSPENDED
+    _GATE_SUSPENDED = True
+    try:
+        yield
+    finally:
+        _GATE_SUSPENDED = prev
+
+
+def _raise_unconverged(rel, who: str, side: str):
+    """Host side of :func:`residual_gate` -- raises so a bad solve cannot be mistaken for a good one."""
+    rel = float(rel)
+    if np.isfinite(rel) and rel <= _GATE_RTOL:
+        return
+    if side == "forward":
+        advice = (
+            "The problem may be singular/ill-posed or need a preconditioner: try jno.solve.lu(), a "
+            "precond= spec, or your own solve_fn."
+        )
+    else:
+        advice = (
+            "This is the ADJOINT (transpose) solve, not the forward one -- the solution itself is "
+            "fine and only the GRADIENT is affected. A Krylov method can break down on A^T where it "
+            "converges on A, so reach for a transposable-robust inner solver (jno.solve.gmres(), "
+            "jno.solve.lu()) or a preconditioner rather than loosening the tolerance."
+        )
+    raise RuntimeError(
+        f"{who} did not solve the system: relative residual {rel:.1e} against a {_GATE_RTOL:g} gate. {advice}"
+    )
+
+
+def residual_gate(mv, b, x, who: str, *, side: str = "forward"):
+    """Refuse a linear solve that did not converge -- **under a trace as well as eagerly**.
+
+    ``_maybe_residual_check`` below is concrete-only, and every iterative solve in the library runs
+    under ``jit``/``grad`` in anger, so its guard was off exactly when it was needed. Worse, it only
+    ever saw the FORWARD solve: ``lax.custom_linear_solve``'s ``transpose_solve`` -- the adjoint every
+    gradient flows through -- was unguarded end to end. A Krylov iteration that leaves on its step cap
+    returns its last iterate with no signal, so a broken adjoint came back as a plausible number.
+    Measured on a 2-D strong-form Poisson: BiCGStab converged on ``A`` (2.9e-05) and diverged to
+    5.5e+26 on ``A^T`` on the same problem, and the gradient it produced was wrong by twenty orders.
+
+    The check costs **one extra matvec** with the operator that was actually used -- which is why it
+    lives here, inside the solve callback, where ``custom_linear_solve`` has already handed us ``A``
+    or ``A^T`` as appropriate, rather than at a call site that only knows one of them.
+
+    Traced values are checked on the host through ``jax.debug.callback``, which raises. The callback
+    sits in the failing branch of a ``lax.cond`` so a converged solve never pays for a host
+    round-trip -- measured 0.40 ms against 0.26 ms per solve when it fires unconditionally on a small
+    dense GMRES, i.e. the transfer, not the extra matvec, is what costs. ``vmap`` turns that ``cond``
+    into a ``select`` that runs both branches, so under a batch the callback fires either way; that
+    is why :func:`_raise_unconverged` re-checks the residual on the host instead of trusting the
+    branch it was reached from. Degrading to "always transfer" under ``vmap`` is slower, not wrong.
+
+    An all-zero right-hand side is skipped: it is the adjoint's "this output has no cotangent" case,
+    the relative residual has no scale, and every solver returns zero for it.
+    """
+    if _GATE_SUSPENDED:  # a preconditioner application -- inexact on purpose, nothing to check
+        return x
+    bn = jnp.linalg.norm(b)
+    rel = jnp.linalg.norm(b - mv(x)) / jnp.where(bn > 0, bn, 1.0)
+    rel = jnp.where(bn > 0, rel, 0.0)
+    if not isinstance(rel, jax.core.Tracer):
+        _raise_unconverged(rel, who, side)
+        return x
+    jax.lax.cond(
+        jnp.isfinite(rel) & (rel <= _GATE_RTOL),
+        lambda _r: None,
+        lambda r: jax.debug.callback(_raise_unconverged, r, who, side),
+        rel,
+    )
+    return x
+
+
 def _maybe_residual_check(op: LinearOperator, b, x, who: str, *, rtol: float = 1e-4):
     """Eager-only convergence guard: raise on a garbage solution when values are concrete.
 
-    Under ``jit``/``vmap``/``grad`` (tracers) it is a no-op -- the check would either fail to
-    concretise or break the transform; there the solver's own iteration cap is the guard.
+    Under ``jit``/``vmap``/``grad`` (tracers) it is a no-op. Prefer :func:`residual_gate`, which
+    checks under a transform as well and covers the transpose solve; this remains for the callers
+    that hold an assembled ``op`` and only ever run eagerly.
     """
     if any(isinstance(v, jax.core.Tracer) for v in (x, b)):
         return x

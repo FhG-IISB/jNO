@@ -1,7 +1,7 @@
 """Base class for resampling strategies."""
 
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Any, Optional
 
 import jax
 import jax.numpy as jnp
@@ -134,7 +134,7 @@ class ResamplingStrategy(ABC):
         self,
         points: jnp.ndarray,
         residuals: jnp.ndarray,
-        domain,
+        domain: Any,
         tag: str,
         epoch: int,
         rng_key: jnp.ndarray,
@@ -273,7 +273,7 @@ class CR3(ResamplingStrategy):
         self,
         points: jnp.ndarray,
         residuals: jnp.ndarray,
-        domain,
+        domain: Any,
         tag: str,
         epoch: int,
         rng_key: jnp.ndarray,
@@ -395,7 +395,7 @@ class HA(ResamplingStrategy):
         self,
         points: jnp.ndarray,
         residuals: jnp.ndarray,
-        domain,
+        domain: Any,
         tag: str,
         epoch: int,
         rng_key: jnp.ndarray,
@@ -508,7 +508,7 @@ class PINNFluence(ResamplingStrategy):
         self,
         points: jnp.ndarray,
         residuals: jnp.ndarray,
-        domain,
+        domain: Any,
         tag: str,
         epoch: int,
         rng_key: jnp.ndarray,
@@ -645,7 +645,7 @@ class R3(ResamplingStrategy):
         self,
         points: jnp.ndarray,
         residuals: jnp.ndarray,
-        domain,
+        domain: Any,
         tag: str,
         epoch: int,
         rng_key: jnp.ndarray,
@@ -736,7 +736,7 @@ class RAD(ResamplingStrategy):
         self,
         points: jnp.ndarray,
         residuals: jnp.ndarray,
-        domain,
+        domain: Any,
         tag: str,
         epoch: int,
         rng_key: jnp.ndarray,
@@ -824,7 +824,7 @@ class RandomResampling(ResamplingStrategy):
         self,
         points: jnp.ndarray,
         residuals: jnp.ndarray,
-        domain,
+        domain: Any,
         tag: str,
         epoch: int,
         rng_key: jnp.ndarray,
@@ -901,7 +901,7 @@ class RARD(ResamplingStrategy):
         self,
         points: jnp.ndarray,
         residuals: jnp.ndarray,
-        domain,
+        domain: Any,
         tag: str,
         epoch: int,
         rng_key: jnp.ndarray,

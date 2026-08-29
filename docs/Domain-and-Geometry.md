@@ -463,7 +463,9 @@ Pass an array instead of a sampling spec to attach it as a **tensor tag** — th
 pattern, where each batch sample carries its own field:
 
 ```python
-dom = 256 * jno.domain(constructor=jno.domain.poseidon(nx=64, ny=64))
+from jno.domain.geometries import Geometries
+
+dom = 256 * jno.domain(constructor=Geometries.poseidon(nx=64, ny=64))
 dom.variable("_f", forcing)          # (256, 64, 64, 1) — the shape you actually have
 ```
 

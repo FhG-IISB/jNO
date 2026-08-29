@@ -1839,6 +1839,25 @@ class FieldView(ScalarView):
     bind = partials
 
 
+_WHOLE_LAPLACIAN_SUBSCHEMES = ("cotangent",)
+
+
+def _reject_whole_laplacian_scheme(scheme: str, method: str) -> None:
+    """A per-axis second derivative cannot carry a sub-scheme that computes the WHOLE Laplacian.
+
+    ``finite_difference:cotangent`` returns ∇²u for every requested dimension, so ``u.d2(x, ...)``
+    silently returns the full Laplacian and ``u.d2(x, ...) + u.d2(y, ...)`` silently returns **2∇²u**
+    — a solve that converges to half the right answer without raising.
+    """
+    sub = str(scheme).split(":", 1)[1] if ":" in str(scheme) else ""
+    if sub in _WHOLE_LAPLACIAN_SUBSCHEMES:
+        raise ValueError(
+            f"{method}(scheme={scheme!r}) is not meaningful: the {sub!r} sub-scheme computes the "
+            f"WHOLE Laplacian, not a per-axis second derivative, so summing one per axis doubles it. "
+            f"Write the Laplacian directly instead: u.laplacian(x, y, scheme={scheme!r})."
+        )
+
+
 class FieldViewWithPartials(ScalarView):
     """Field view with name → Variable bindings and FD-only derivatives.
 
@@ -2002,11 +2021,25 @@ class FieldViewWithPartials(ScalarView):
 
     def d2(self, v, scheme: str | None = None) -> "ScalarView":
         """``∂²self/∂v²`` — finite differences by default for a nodal field."""
+        if scheme is not None:
+            _reject_whole_laplacian_scheme(scheme, "d2")
         return self._rewrap(self._expr.d2(v, scheme=scheme or self._default_deriv_scheme()))
 
     def dd(self, v, w=None, scheme: str | None = None) -> "ScalarView":
         """Mixed second derivative ``∂²self/∂v∂w`` — finite differences by default for a nodal field."""
+        if scheme is not None:
+            _reject_whole_laplacian_scheme(scheme, "dd")
         return self._rewrap(self._expr.dd(v, w, scheme=scheme or self._default_deriv_scheme()))
+
+    def laplacian(self, *variables, scheme: str | None = None) -> "ScalarView":
+        """``∇²self`` — finite differences by default for a nodal field.
+
+        Without this override the call falls through to :meth:`Placeholder.laplacian`, whose default is
+        ``"automatic_differentiation"``. AD is meaningless on a discrete nodal field, and the AD Hessian
+        branch has no ``points`` to differentiate at, so it failed with an opaque ``AttributeError``
+        instead of doing the finite-difference thing ``.d`` / ``.d2`` / ``.dd`` already do here.
+        """
+        return self._rewrap(self._expr.laplacian(*variables, scheme=scheme or self._default_deriv_scheme()))
 
     # ------------------------------------------------------------------
     # Attribute access — derivative sequence parsing

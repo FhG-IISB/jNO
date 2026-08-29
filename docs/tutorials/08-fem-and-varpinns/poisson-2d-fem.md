@@ -29,7 +29,7 @@ u_fem = jnp.asarray(fem.solve(linear=jno.solve.cg(), precond=jno.precond.jacobi(
 - Boundary conditions are terms in the same list — no separate BC objects.
 - `fem.solve()` alone would also work (matrix-free Jacobi-BiCGStab on the sparse operator);
   the **solver slots** pick a structure-appropriate method — CG for this SPD system — without
-  ever densifying. See [Choosing the solver](../../fem.md) for the full `jno.solve` /
+  ever densifying. See [Choosing the solver](../../fem/index.md) for the full `jno.solve` /
   `jno.precond` namespaces.
 - The solution is audited against the manufactured field $u^\*=x(1-x)y(1-y)$ (rel-$L^2 \approx 8\times10^{-3}$).
 

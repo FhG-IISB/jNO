@@ -606,7 +606,7 @@ class GradientNormsCallback(_PerLossGradCallback):
         print(cb.result["norms"])   # (n_samples, n_constraints)
     """
 
-    def __init__(self, interval: int = 100, mask=None) -> None:
+    def __init__(self, interval: int = 100, mask: Any = None) -> None:
         super().__init__(interval, mask)
         self._norms: list = []
 
@@ -666,7 +666,7 @@ class CosSimilarityCallback(_PerLossGradCallback):
         print(cb.result["cos_sim_matrix"])   # (n_samples, N, N)
     """
 
-    def __init__(self, interval: int = 100, mask=None) -> None:
+    def __init__(self, interval: int = 100, mask: Any = None) -> None:
         super().__init__(interval, mask)
         self._cos: list = []
 
@@ -746,7 +746,7 @@ class GradientAlignmentCallback(_PerLossGradCallback):
         print(cb.result["alignment"])   # (n_samples,)
     """
 
-    def __init__(self, interval: int = 100, mask=None) -> None:
+    def __init__(self, interval: int = 100, mask: Any = None) -> None:
         super().__init__(interval, mask)
         self._align: list = []
 
@@ -812,7 +812,7 @@ class LossLandscapeCallback(Callback, _LiveValue):
     def __init__(
         self,
         interval: int = 500,
-        mask=None,
+        mask: Any = None,
         n_grid: int = 15,
         alpha_range: float = 1.0,
     ) -> None:
@@ -923,7 +923,7 @@ class ResidualStatsCallback(Callback, _LiveValue):
         print(cb.result["maxes"])   # (n_samples, 1)  — just pde_loss
     """
 
-    def __init__(self, interval: int = 100, constraints=None) -> None:
+    def __init__(self, interval: int = 100, constraints: Any = None) -> None:
         self._interval = interval
         self._user_constraints = constraints  # resolved in on_solve_begin
         self._indices: list[int] = []  # populated in on_solve_begin
@@ -1083,7 +1083,7 @@ class InputSensitivityCallback(Callback, _LiveValue):
         print(cb.result["values"].shape)   # (n_samples, *expr_shape)
     """
 
-    def __init__(self, expr, interval: int = 100) -> None:
+    def __init__(self, expr: Any, interval: int = 100) -> None:
         from jno.trace import Placeholder
 
         if not isinstance(expr, Placeholder):
@@ -1200,7 +1200,7 @@ class NTKSpectrumCallback(Callback, _LiveValue):
 
     def __init__(
         self,
-        grad_expr,
+        grad_expr: Any,
         n_points: int = 256,
         top_k: int = 10,
         interval: int = 500,
@@ -1343,8 +1343,8 @@ class HessianSpectrumCallback(Callback, _LiveValue):
         k: int = 10,
         n_iter: int = 30,
         interval: int = 500,
-        mask=None,
-        constraints=None,
+        mask: Any = None,
+        constraints: Any = None,
     ) -> None:
         self._k = k
         self._n_iter = n_iter
@@ -1750,7 +1750,7 @@ class callbacks:
     @staticmethod
     def loss_landscape(
         interval: int = 500,
-        mask=None,
+        mask: Any = None,
         n_grid: int = 15,
         alpha_range: float = 1.0,
     ) -> LossLandscapeCallback:
@@ -1775,8 +1775,8 @@ class callbacks:
         k: int = 10,
         n_iter: int = 30,
         interval: int = 500,
-        mask=None,
-        constraints=None,
+        mask: Any = None,
+        constraints: Any = None,
     ) -> HessianSpectrumCallback:
         """Create a :class:`HessianSpectrumCallback`.
 
@@ -1805,7 +1805,7 @@ class callbacks:
 
     @staticmethod
     def ntk_spectrum(
-        grad_expr,
+        grad_expr: Any,
         n_points: int = 256,
         top_k: int = 10,
         interval: int = 500,

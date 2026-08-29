@@ -23,6 +23,9 @@ misc/
 !docs/assets/*
 runs/
 traces/
+# Talks and decks: kept in the working tree so they survive a scratchpad clear, but NOT in the
+# repo — a beamer PDF plus its figures is several MB of binary that git would carry forever.
+presentations/
 
 !*.md
 !*.toml

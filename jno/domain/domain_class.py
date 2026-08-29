@@ -4340,7 +4340,7 @@ class domain(MeshIOMixin):
         returns a handle exposing the element-to-element view factor ``enclosure.view_factor`` (fully
         geometry-determined — self-view included), per-element ``areas``/``normals``, the global node
         ``elements``, and an F-quality gate (``.check()`` / ``.quality()``). Write the grey-body
-        radiosity in ``jno.np`` on top of ``enclosure.view_factor``; see ``docs/fem.md``.
+        radiosity in ``jno.np`` on top of ``enclosure.view_factor``; see ``docs/fem/geometry.md``.
 
         Args:
             tags: Boundary tags forming the enclosure (each a radiating surface; tags only group

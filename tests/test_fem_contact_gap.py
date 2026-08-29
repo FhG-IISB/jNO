@@ -136,7 +136,7 @@ def _vector_poisson(c=None, size=0.4, traction_sign=+1):
         terms.append(traction_sign * p * jno.np.inner(n, v.bind(x=sb[0], y=sb[1], z=sb[2]), n_contract=1))
     terms += [u(bb[0], bb[1], bb[2])[i] - 0.0 for i in range(3)]
 
-    sol = np.asarray(jno.fem(terms, element_type="TET4").solve()).reshape(-1, 3)
+    sol = np.asarray(jno.fem(terms).solve()).reshape(-1, 3)
     pts = np.asarray(d.built_mesh.points)
     lo = np.asarray(d.tag_indices[secondary]).reshape(-1)
     up = np.asarray(d.tag_indices[main]).reshape(-1)
@@ -188,7 +188,7 @@ def test_assembled_gap_tangent_matches_the_matrix_free_jvp():
     ]
     bb = d.variable("boundary", split=True)
     terms += [u(bb[0], bb[1], bb[2])[i] - 0.0 for i in range(3)]
-    fem = jno.fem(terms, element_type="TET4")
+    fem = jno.fem(terms)
     op = fem.operator
     ndofs = int(fem.dofs)
     key = _jax.random.PRNGKey(0)

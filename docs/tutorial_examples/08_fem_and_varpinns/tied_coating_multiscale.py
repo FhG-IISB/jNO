@@ -26,7 +26,7 @@ geometry, fragmenting the two bodies into one mesh gives:
 i.e. it under-resolves the layer you care about *and* over-refines the bulk you do not. Meshing each
 body independently and gluing them with a tie ``u(A) - u(B)`` gets both right. The two interface
 surfaces then carry different node layouts, so ``jno.fem`` couples them with a **mortar** (integrated)
-constraint rather than node-to-node matching -- see ``docs/fem.md``, "Tying two boundaries".
+constraint rather than node-to-node matching -- see ``docs/fem/boundary-conditions.md``, "Tying two boundaries".
 
 Verified against the exact series-resistance solution above, at the interface and at the top surface.
 """
@@ -104,3 +104,37 @@ print(
 assert abs(got_iface - exact_iface) / exact_top < 0.02
 assert abs(got_top - exact_top) / exact_top < 0.02
 # --8<-- [end:code]
+
+# --- figure: the through-thickness profile, FEM nodes against the exact piecewise line ---------
+from pathlib import Path  # noqa: E402
+
+import matplotlib.pyplot as plt  # noqa: E402
+
+plt.rcParams.update({"savefig.dpi": 150, "savefig.bbox": "tight", "axes.titleweight": "bold", "axes.titlesize": 10})
+TEAL, INK, GREY = "#0D9488", "#1A202C", "#94A3B8"
+
+y = pts[:, 1]
+fig, ax = plt.subplots(figsize=(5.6, 3.6))
+ax.axhspan(L_SUB, L_SUB + L_FILM, color=GREY, alpha=0.18, lw=0)
+ax.scatter(sol, y, s=6, color=TEAL, alpha=0.55, label="FEM nodes (both meshes)")
+y_exact = np.array([0.0, L_SUB, L_SUB + L_FILM])
+T_exact = np.array([0.0, exact_iface, exact_top])
+ax.plot(T_exact, y_exact, "--", color=INK, lw=1.4, label="exact piecewise-linear")
+ax.axhline(L_SUB, color=INK, lw=0.8)
+ax.annotate(
+    "ceramic coating\n$L=0.05$, $k=1$",
+    xy=(0.082, L_SUB + L_FILM / 2),
+    xytext=(0.058, 0.70),
+    fontsize=8,
+    arrowprops=dict(arrowstyle="->", lw=0.9, color=INK),
+)
+ax.annotate("metal substrate\n$L=1.0$, $k=20$", xy=(0.06, 0.45), fontsize=8, va="center")
+ax.set_xlabel("temperature $T$")
+ax.set_ylabel("height $y$")
+ax.set_title("Tied two-mesh solve — the coating carries half the temperature rise")
+ax.legend(loc="lower right", frameon=False, fontsize=8)
+ax.margins(y=0.02)
+assets = Path(__file__).resolve().parents[2] / "assets"
+assets.mkdir(exist_ok=True)
+fig.savefig(assets / "tied_coating_multiscale.png")
+print(f"  saved figure -> {assets / 'tied_coating_multiscale.png'}")

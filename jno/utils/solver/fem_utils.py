@@ -1113,7 +1113,7 @@ def _eval_integrand(domain, node, local):
                 f"jno.fem per-tag surface integration: the per-facet mask for tag '{node.tag}' was not "
                 f"threaded into this assembly path. `domain.by_tag` builds a coefficient for a SURFACE "
                 f"term -- one bound to a boundary tag's coordinates. Using it in a volume term, on a "
-                f"non-nodal space, or in 1-D is not supported (see docs/fem.md)."
+                f"non-nodal space, or in 1-D is not supported (see docs/fem/elements.md)."
             )
         return jnp.asarray(tag_masks[node.tag])
 
