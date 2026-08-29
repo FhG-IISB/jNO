@@ -564,8 +564,10 @@ def _converged(resid, limit):
     if not (resid < limit):
         raise ValueError(
             f"jno.peec: the matrix-free solve did not converge (relative residual {resid:.2e}). "
-            "Report it rather than trusting the numbers; the dense path is available as "
-            "matrix_free=False for a network small enough to form."
+            "Report it rather than trusting the numbers. A DEEPER RESTART is the usual fix, and it is "
+            "often faster than the shallower one that failed, because it stops instead of exhausting "
+            "its budget: `solve(restart=48)`, or higher. Failing that `solve(matrix_free=False)` forms "
+            "the dense operator, exact but O(N^2) memory and so for a network small enough to form."
         )
 
 
