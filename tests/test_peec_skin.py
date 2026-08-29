@@ -7,6 +7,7 @@ preconditioner, whose diagonal is Z_s + j w Lp_aa.
 """
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -204,3 +205,37 @@ def test_the_material_break_does_not_silence_the_stacked_copper_warning():
     post = jno.Shape.box(0.018, 0.003, 0.00057, 0.022, 0.007, 0.00157)
     f = bar_filaments([trace, post], size=(0.002, 0.002, 0.00057), sigma=[SIG, SIG])
     assert (np.asarray(f.span) > 1).any()  # the column under the post is more than one element
+
+
+def test_the_thickness_guard_runs_at_build_and_does_not_block_a_jit(caplog):
+    """A guard that stops guarding the moment you jit is worse than none, so it moved to `build()`.
+
+    It reads the conductivity, which inside a jit has no value at all. Running it once at build
+    against the DECLARED conductivity is the conservative case: the verdict turns on the skin depth,
+    a design variable only ever lowers sigma, and a lower sigma is a deeper skin depth and so a
+    milder verdict. On the example module this was the last thing keeping a welded network -- a
+    lattice plus bond wires -- out of a jit, worth 2.5x on a design iteration.
+    """
+    import logging
+
+    # The shape it was written for: a thin trace, one cell through, with a THICK POST standing on
+    # it -- a terminal post on a 0.57 mm trace is exactly this. A minority is unresolved, so the
+    # guard warns rather than refusing the package, which is the case worth keeping alive.
+    h = 0.0005
+    trace = jno.Shape.box(0, 0, 0, 0.02, 0.004, h, size=(0.001, 0.001, h)).attach(sigma=SIG).name("trace")
+    post = jno.Shape.box(0.009, 0.001, h, 0.011, 0.003, h + 0.0015).attach(sigma=SIG).name("post")
+    d = (trace + post).domain()
+    d.tag("A", lambda x, y, z: x < 0.0011)
+    d.tag("B", lambda x, y, z: x > 0.0189)
+    _i, v = d.peec_symbols()
+    at = lambda t: d.variable(t, split=True, sample=(4, None))[:3]  # noqa: E731
+
+    with caplog.at_level(logging.WARNING):
+        built = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e6).build()
+    assert "skin depth" in caplog.text, "the guard did not run at build"
+    caplog.clear()
+
+    # and the solve it guards now goes through a jit, with the same answer
+    f = lambda s: jnp.real(built.solve(sigma={"trace": SIG * s, "post": SIG * s}).Z)  # noqa: E731
+    assert float(jax.jit(f)(1.0)) == pytest.approx(float(f(1.0)), rel=1e-12)
+    assert "skin depth" not in caplog.text, "the guard repeated itself on every solve"

@@ -397,6 +397,14 @@ class BuiltPEEC:
         # Which nodes each pad owns is STRUCTURAL -- `terminal_nodes` reads coordinates, which are
         # tracers under a gradient -- so it is resolved once here, on the reference geometry.
         self.nodes = {t: terminal_nodes(fil, sh) for t, sh in terms.items()}
+        # The through-thickness guard, here rather than per solve: it reads the conductivity, which
+        # inside a jit has no value. The declared one is the conservative case (see the note there),
+        # and the geometry it also reads is frozen, so once is both enough and the only chance.
+        from .utils.solver.peec import _check_unresolved_thickness
+
+        sig0 = self._resolve(None)
+        for f in self.freq:
+            _check_unresolved_thickness(fil, sig0, 2 * np.pi * float(f), MU0)
 
     def solve(self, sigma=None, devices=None, weights=None, restart=None, matrix_free=None):
         """Solve at every frequency and return a :class:`PEECSolution`.
