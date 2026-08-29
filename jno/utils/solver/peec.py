@@ -1162,7 +1162,16 @@ def _check_unresolved_thickness(fil, sigma, omega, mu0):
     sub = span > 1
     if not sub.any():
         return
-    sig = np.broadcast_to(np.asarray(jax.lax.stop_gradient(jnp.asarray(sigma)), dtype=float), span.shape)
+    try:
+        sig = np.broadcast_to(np.asarray(jax.lax.stop_gradient(jnp.asarray(sigma)), dtype=float), span.shape)
+    except (jax.errors.TracerArrayConversionError, jax.errors.ConcretizationTypeError):
+        # Inside a jit there is no value to read. Rather than go silent -- a guard that stops
+        # guarding the moment you make the loop fast is worse than none -- `peec.build()` runs this
+        # ONCE at the declared conductivity, and that is the conservative case: the verdict turns on
+        # the skin depth, a design variable only ever lowers sigma, and a lower sigma is a DEEPER
+        # skin depth and so a milder verdict. Whatever a density field does to it later, the
+        # declared value already answered the worst case.
+        return
     delta = np.sqrt(2.0 / (w * mu0 * np.maximum(sig, 1e-300)))
     # non-differentiably: a traced wire GAUGE reaches here once radius is a design variable,
     # and this guard only decides whether to complain -- no gradient runs through it
@@ -1188,7 +1197,17 @@ def _check_unresolved_thickness(fil, sigma, omega, mu0):
         f"{float(cell[k]) / (0.5 * float(delta[k])):.0f}x finer so two cells fit in a skin depth."
     )
     if n * 2 > bad.size:
+        # A majority is the MODEL being wrong, so it is refused every time it is asked.
         raise ValueError(msg + " Most of this model is in that state, so it is refused rather than returned.")
+    # A minority is a detail, and a detail said once is a warning while a detail said a hundred times
+    # is noise: a design loop re-solves the same network every iteration and nothing about the
+    # geometry it is complaining about changes between them.
+    key = (id(fil), round(w, 6), n)
+    if key in _THICKNESS_WARNED:
+        return
+    if len(_THICKNESS_WARNED) > 64:
+        _THICKNESS_WARNED.clear()
+    _THICKNESS_WARNED.add(key)
     logging.getLogger(__name__).warning(
         "%s The resistance is understated by that much of the model; the inductance is unaffected.", msg
     )
@@ -1726,6 +1745,7 @@ def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3):
     return apply
 
 
+_THICKNESS_WARNED = set()  # (network, frequency, count) already reported; see the guard
 _KRYLOV_CACHE = {}  # one compiled Krylov solve per (network, size, tolerance), reused across frequencies
 _LU_HOLDER = {}  # the current host factorisation, so the callback closure does not change identity
 
