@@ -350,3 +350,37 @@ def test_L_is_still_the_hermitian_form_at_frequency():
     for freq in (0.0, 1e6, 1e7):
         assert float(network(freq=freq).build().solve().L) > 0
     assert float(wire_network().build().solve().L) > 0  # and on a WELDED network too
+
+
+# --- the solver knobs the failure message names --------------------------------------------------
+
+
+def test_the_dense_path_and_the_matrix_free_one_agree():
+    """`matrix_free=False` is the escape hatch, so it has to give the same answer, not merely run."""
+    built = wire_network().build()
+    auto = complex(built.solve().Z)
+    dense = complex(built.solve(matrix_free=False).Z)
+    assert dense == pytest.approx(auto, rel=1e-9)
+
+
+def test_a_deeper_restart_does_not_change_a_converged_answer():
+    """It buys convergence at scale; where the default already converges it must be a no-op."""
+    built = wire_network().build()
+    base = complex(built.solve().Z)
+    for r in (24, 48):
+        assert complex(built.solve(restart=r).Z) == pytest.approx(base, rel=1e-8)
+
+
+def test_the_non_convergence_message_names_a_reachable_knob():
+    """It used to point at `matrix_free=False`, which no caller could reach from the front door.
+
+    Measured on the example module at 21,980 bars: the default restart of 16 leaves 9.3e-06 where
+    1e-6 is wanted, and 48 converges in 176 s against the 290 s the shallower one spends failing.
+    """
+    from jno.utils.solver.peec import _converged
+
+    with pytest.raises(ValueError) as e:
+        _converged(1e-3, 1e-6)
+    msg = str(e.value)
+    assert "restart=48" in msg  # the knob, and a value that is known to work
+    assert "matrix_free=False" in msg
