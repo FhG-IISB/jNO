@@ -398,7 +398,7 @@ class BuiltPEEC:
         # tracers under a gradient -- so it is resolved once here, on the reference geometry.
         self.nodes = {t: terminal_nodes(fil, sh) for t, sh in terms.items()}
 
-    def solve(self, sigma=None, devices=None, weights=None):
+    def solve(self, sigma=None, devices=None, weights=None, restart=None, matrix_free=None):
         """Solve at every frequency and return a :class:`PEECSolution`.
 
         Args:
@@ -422,6 +422,15 @@ class BuiltPEEC:
                 all, and then by 8 % when a node crosses the boundary. Weighted, the support is a
                 frozen superset covering the travel and the weights are smooth in the position, so
                 the gradient exists -- the same structure-frozen, values-traced split as ``sigma``.
+            restart: GMRES restart depth on the matrix-free path. The default of 16 is where the
+                curve flattens for a few thousand elements, and it is not where it flattens for
+                twenty thousand: on the example module at a 0.7 mm pitch (21,980 bars) it leaves a
+                9.3e-06 residual where 1e-6 is wanted, while 48 converges -- and finishes SOONER,
+                176 s against the 290 s the shallower one spends failing. Raise it when the solve
+                refuses; a deeper restart holds ``restart`` more vectors, which is megabytes.
+            matrix_free: ``None`` decides by structure -- a network containing a bar lattice is
+                applied by FFT, anything else forms the dense operator. ``False`` forces the dense
+                path, exact but O(N^2) memory, so for small networks only.
         """
         fil, nodes, terms = self.fil, self.nodes, self.terminals
         if weights:
@@ -462,6 +471,8 @@ class BuiltPEEC:
                 # the DECLARED impedances, always concrete, for the host-built preconditioner
                 device_host={d[0]: d[2] for d in self.devices},
                 omega=2 * np.pi * float(f),
+                **({} if restart is None else {"restart": int(restart)}),
+                **({} if matrix_free is None else {"matrix_free": bool(matrix_free)}),
             )
             cur.append(c)
             inject.append(inj)
