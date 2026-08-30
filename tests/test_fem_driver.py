@@ -294,7 +294,11 @@ def test_sym_of_grad_is_linear_like_the_fused_symgrad():
     x_fused = np.asarray(fused.solve()).reshape(-1)
     x_composed = np.asarray(composed.solve()).reshape(-1)
     assert np.linalg.norm(x_fused) > 1e-6  # not the trivial all-zero solution
-    assert np.allclose(x_fused, x_composed, rtol=1e-10, atol=1e-12)
+    # Both go through the default matrix-free Jacobi-BiCGStab, which stops at `tol=1e-8`, so two
+    # equivalent-but-differently-assembled operators agree to about that -- not to machine epsilon.
+    # The oracle here is the mode assertions above plus agreement far tighter than a Newton-solved
+    # residual would give; comparing below the solver's own tolerance only tests its iterate noise.
+    assert np.allclose(x_fused, x_composed, rtol=1e-6, atol=1e-9)
 
 
 def test_antisym_is_linear_in_the_unknown():
