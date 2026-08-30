@@ -46,9 +46,11 @@ from .trace import (
     OperationCall,
     OperationDef,
     Placeholder,
+    TensorTag,
     Tracker,
     TunableModule,
     TunableModuleCall,
+    Variable,
     collect_operations,
     collect_tags,
     cse,
@@ -202,16 +204,26 @@ def _trivial_domain():
     return _TRIVIAL_DOMAIN
 
 
-def _infer_domain_from_constraints(constraints: List[Placeholder]):
-    """Walk the constraint trees and return the unique domain referenced by
-    every Variable / TensorTag inside, or ``None`` when there is no domain
-    Variable at all (a parameter-only fit — the caller supplies a trivial domain).
+def _infer_domain_from_constraints(constraints: List[Placeholder], info: Optional[dict] = None):
+    """Walk the constraint trees and return the domain core should collocate on, or ``None`` when
+    there is nothing to collocate (a parameter-only fit — the caller supplies a trivial domain).
 
-    Raises ``ValueError`` if more than one distinct domain is found — the caller
-    must then pass ``domain=`` explicitly.
+    Only a ``Variable`` / ``TensorTag`` is a *collocation* reference: it is a coordinate core draws
+    samples from. A solve node's domain (``fem.solve()`` / ``jno.fdm([...]).solve()``) is merely the
+    mesh its PDE is discretized on — the loss reads no coordinate from it. So a data-misfit loss over
+    two solves on two meshes is **not** ambiguous, and must not be rejected as if it were.
+
+    ``info``, when given, is populated with ``{"over_solves": bool}`` so the caller can tell a
+    deliberate parameter-only fit over one or more solves from a loss that references no domain at
+    all (where a missing Variable is more likely to be a mistake worth warning about).
+
+    Raises ``ValueError`` only when more than one distinct *collocation* domain is found — the
+    caller must then pass ``domain=`` explicitly.
     """
     domains: list = []  # preserve insertion order for nicer error messages
+    sampled: list = []  # the subset of `domains` core must actually draw coordinates from
     seen_domains: set = set()
+    seen_sampled: set = set()
     seen_nodes: set = set()
 
     def visit(node):
@@ -223,9 +235,13 @@ def _infer_domain_from_constraints(constraints: List[Placeholder]):
         # so a pure data-misfit loss `(solve() - obs).mse` — whose Variables are hidden inside the solve —
         # still resolves its domain from the graph, with no explicit `domain=` needed.
         d = getattr(node, "_domain", None)
-        if d is not None and id(d) not in seen_domains:
-            seen_domains.add(id(d))
-            domains.append(d)
+        if d is not None:
+            if id(d) not in seen_domains:
+                seen_domains.add(id(d))
+                domains.append(d)
+            if isinstance(node, (Variable, TensorTag)) and id(d) not in seen_sampled:
+                seen_sampled.add(id(d))
+                sampled.append(d)
         # Generic descent: visit every instance attribute that holds a
         # Placeholder (or a list/dict of them).  This covers GroupedAssembly
         # and any future Placeholder subclass without enumerating attr names.
@@ -248,15 +264,23 @@ def _infer_domain_from_constraints(constraints: List[Placeholder]):
     for expr in constraints:
         visit(expr)
 
-    if len(domains) == 1:
-        return domains[0]
     if not constraints:
         raise ValueError("jno.core requires at least one constraint.")
-    if not domains:
-        return None  # no domain Variable -> a parameter-only fit; the caller supplies a trivial domain
+    if info is not None:
+        info["over_solves"] = bool(domains) and not sampled
+    if len(domains) == 1:
+        return domains[0]
+    if len(sampled) == 1:
+        return sampled[0]  # several domains in the graph, but only one is collocated -> unambiguous
+    if not sampled:
+        # Nothing to collocate: either no domain in the graph at all, or the only domains are the
+        # meshes one or more solves are discretized on -- a parameter-only fit (an inverse problem,
+        # an ILT loss). The loss reads no coordinates, so which domain drives the epoch loop is
+        # irrelevant and several solve domains are NOT an ambiguity. Caller uses a trivial domain.
+        return None
     raise ValueError(
-        f"Cannot infer domain: constraints reference {len(domains)} distinct "
-        f"domains ({domains!r}). All constraints must share a single domain."
+        f"Cannot infer domain: constraints collocate on {len(sampled)} distinct "
+        f"domains ({sampled!r}). All constraints must share a single domain."
     )
 
 
@@ -460,12 +484,20 @@ class core:
                 data fitting terms).
 
             domain: Optional domain override.  When omitted (``None``), the
-                domain is auto-discovered by walking ``constraints`` and
-                collecting the unique ``Variable._domain`` reference.  Pass
-                ``domain=`` explicitly when the constraint tree contains no
-                standard ``Variable`` nodes — e.g. FEM/VPINN weak-form
-                assemblies or pure-parametric inverse losses built from
-                ``jno.domain.from_array``.
+                domain is auto-discovered by walking ``constraints`` for the
+                unique ``Variable`` / ``TensorTag`` the loss collocates on.
+
+                A **parameter-only fit** needs no domain of its own: an inverse
+                loss like ``(fem.solve() - u_obs).mse`` reads no collocation
+                coordinate (its Variables live inside the solve, consumed by the
+                assembler), so it is inferred automatically — including when the
+                loss spans several solves on *different* meshes.  Passing a
+                placeholder ``jno.domain.from_array({"_": np.zeros((1, 1))})``
+                is no longer necessary; it remains accepted and equivalent.
+
+                Pass ``domain=`` explicitly only to override the choice — e.g.
+                to collocate on a sensor point-cloud rather than the PDE mesh,
+                or when the loss genuinely samples two domains (which raises).
 
             mesh: Shape of the device mesh for hybrid parallelism as a tuple (batch, model).
                 Controls how computation is distributed across multiple GPUs/TPUs.
@@ -526,13 +558,17 @@ class core:
         if domain is not None:
             self.domain = domain
         elif constraints:
-            self.domain = _infer_domain_from_constraints(constraints)
+            _info: Dict[str, Any] = {}
+            self.domain = _infer_domain_from_constraints(constraints, _info)
             if self.domain is None:  # no domain Variable -> a parameter-only fit (e.g. an ILT/data-fit loss)
-                self.log.warning(
-                    "No domain Variable found in the constraints — treating this as a parameter-only fit and "
-                    "using a trivial domain. If the loss was meant to sample a domain, ensure it references a "
-                    "Variable or pass domain= explicitly."
-                )
+                # A fit whose only domains are solve meshes is unambiguous and intentional -- do not
+                # warn there, or the warning fires on every correct inverse problem.
+                if not _info.get("over_solves"):
+                    self.log.warning(
+                        "No domain Variable found in the constraints — treating this as a parameter-only fit "
+                        "and using a trivial domain. If the loss was meant to sample a domain, ensure it "
+                        "references a Variable or pass domain= explicitly."
+                    )
                 self.domain = _trivial_domain()
         else:
             self.domain = None

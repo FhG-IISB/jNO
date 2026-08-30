@@ -53,7 +53,7 @@ u_obs = np.asarray(_default_transient_integrate(blk, {"c2": c2_true}, ts))
 c2.dtype(jnp.float64)
 c2.initialize(jax.nn.initializers.constant(c2_guess))  # start at the wrong speed
 c2.optimizer(optax.adam(5e-2))
-crux = jno.core([(fem.solve() - u_obs).mse], domain=jno.domain.from_array({"_": np.zeros((1, 1))}))
+crux = jno.core([(fem.solve() - u_obs).mse])  # a parameter-only fit collocates nothing -> no domain needed
 crux.solve(220)
 rec = float(np.asarray(crux.eval([c2])).reshape(-1)[0])
 

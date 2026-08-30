@@ -98,6 +98,19 @@ crux = jno.core([(fem.solve() - u_obs).mse], domain=obs)
 crux.solve(200)                       # recovers k
 ```
 
+`domain=` is optional here. A pure data-misfit loss collocates nothing — its Variables live
+inside the solve, consumed by the assembler — so `jno.core` infers the domain from the graph, and
+`jno.core([(fem.solve() - u_obs).mse])` is enough. This holds even when the loss spans **several
+solves on different meshes**, which is how a coupled forward chain is written:
+
+```python
+crux = jno.core([(litho.solve() - img_obs).mse + (device.solve() - resp_obs).mse])
+```
+
+Pass `domain=` only to *override* the choice — above, `domain=obs` collocates on the sensor
+point-cloud instead of the PDE mesh. A placeholder `jno.domain.from_array({"_": np.zeros((1, 1))})`
+is no longer needed (it stays accepted, and gives bit-identical results).
+
 A **diffusivity field** `k(x)` is `jno.np.parameter(phi)` (one DOF per node); regularize it
 with `k.regularize("h1seminorm" | "l2" | "tv" | "nonneg" | "bounded")` — the same `.regularize()`
 method, assembled FE-exact on the element space for a nodal-parameter field. For a **transient**

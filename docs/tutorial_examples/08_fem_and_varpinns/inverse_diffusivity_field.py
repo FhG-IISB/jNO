@@ -42,10 +42,8 @@ fem = jno.fem([k * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_
 k.dtype(jnp.float64)
 k.initialize(jax.nn.initializers.constant(1.0))  # start from a uniform field
 k.optimizer(optax.adam(2e-2))
-crux = jno.core(
-    [(fem.solve() - u_obs).mse, 1e-3 * k.regularize("h1seminorm").mean],
-    domain=jno.domain.from_array({"_": np.zeros((1, 1))}),
-)
+# a parameter-only fit collocates nothing, so jno.core infers the domain -- none is passed
+crux = jno.core([(fem.solve() - u_obs).mse, 1e-3 * k.regularize("h1seminorm").mean])
 crux.solve(500)
 
 rec = np.asarray(crux.eval([k])).reshape(-1)  # the recovered nodal field (do NOT index [0])
