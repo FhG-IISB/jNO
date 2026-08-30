@@ -2371,7 +2371,13 @@ class Model(Placeholder):
 
         return self
 
-    def flow(self, x0, *cond, time, save=False):
+    def flow(
+        self,
+        x0: Any,
+        *cond: Any,
+        time: Any,
+        save: bool = False,
+    ) -> Any:
         r"""March this network as an ODE **velocity field**: :math:`dx/dt = v(x, t, \ldots)`.
 
         The network is called as ``v(x, t, *cond)`` -- state first, time second -- and must return the
@@ -2391,8 +2397,10 @@ class Model(Placeholder):
             save: Return the whole trajectory (leading axis ``len(time)``) instead of the endpoint.
 
         Returns:
-            The final state, or a :class:`Flow` node when *x0* or any *cond* is symbolic -- in which
-            case the march composes into a ``jno.core([...])`` term list::
+            Any: The final state (same pytree structure as *x0*), or the whole trajectory when
+                *save* is set -- each leaf gaining a leading axis of ``len(time)``. Returns a
+                :class:`Flow` node instead when *x0* or any *cond* is symbolic, in which case the
+                march composes into a ``jno.core([...])`` term list::
 
                 x  = v.flow(x0_array, time=ts)                        # sample after training
                 xg = v.flow(jno.noise.gaussian(ndim=2), time=ts)      # inside a constraint
