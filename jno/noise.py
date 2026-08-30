@@ -59,8 +59,31 @@ import jax.numpy as jnp
 from .trace import FunctionCall, Noise, Placeholder, _next_op_id
 
 
+def _param(name, dist, value):
+    """A distribution parameter: a number, or a **schedule** -- a callable of the march time.
+
+    A schedule is what an SDE sampler's ``sigma_t`` is, so ``jno.noise.*`` accepts one; it is only
+    meaningful inside ``Model.flow(..., noise=...)`` and raises anywhere else, at the point of use.
+    """
+    if callable(value):
+        return value
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise TypeError(
+            f"jno.noise.{dist}: {name}= expects a number or a schedule (a callable of the march "
+            f"time t, for use with Model.flow(noise=...)), got {type(value).__name__}."
+        ) from None
+
+
 def _resolve_shape_args(name, ndim, like):
-    """Validate the ``ndim`` / ``like`` pair and return the kwargs for the Noise node."""
+    """Validate the ``ndim`` / ``like`` pair and return the kwargs for the Noise node.
+
+    Also reports whether a shape was **explicitly asked for**, which the caller records on the node.
+    ``ndim`` defaults to 1, so the resulting params cannot distinguish "the user wants a trailing
+    axis of 1" from "nothing was said" -- and ``flow(noise=...)`` has to refuse the former (its
+    shape comes from the state) while accepting the latter.
+    """
     if like is not None:
         if ndim is not None:
             raise ValueError(
@@ -73,8 +96,8 @@ def _resolve_shape_args(name, ndim, like):
                 f"{type(like).__name__}. For a fixed shape use ndim=, or wrap the array with "
                 f"jno.np.function(lambda: arr, [], 'ref')."
             )
-        return {}, like
-    return {"ndim": 1 if ndim is None else int(ndim)}, None
+        return {}, like, True
+    return {"ndim": 1 if ndim is None else int(ndim)}, None, ndim is not None
 
 
 class _NoiseNamespace:
@@ -101,8 +124,8 @@ class _NoiseNamespace:
             stale under those and fail by broadcasting rather than by raising. Mutually exclusive
             with ``ndim``.
         """
-        shape_kw, like = _resolve_shape_args("gaussian", ndim, like)
-        return Noise("gaussian", like=like, std=float(std), **shape_kw)
+        shape_kw, like, shape_explicit = _resolve_shape_args("gaussian", ndim, like)
+        return Noise("gaussian", like=like, shape_explicit=shape_explicit, std=_param("std", "gaussian", std), **shape_kw)
 
     def uniform(self, low: float = -1.0, high: float = 1.0, ndim: int = None, *, like=None) -> Noise:
         """Uniform noise ~ U(low, high).
@@ -126,8 +149,15 @@ class _NoiseNamespace:
             stale under those and fail by broadcasting rather than by raising. Mutually exclusive
             with ``ndim``.
         """
-        shape_kw, like = _resolve_shape_args("uniform", ndim, like)
-        return Noise("uniform", like=like, low=float(low), high=float(high), **shape_kw)
+        shape_kw, like, shape_explicit = _resolve_shape_args("uniform", ndim, like)
+        return Noise(
+            "uniform",
+            like=like,
+            shape_explicit=shape_explicit,
+            low=_param("low", "uniform", low),
+            high=_param("high", "uniform", high),
+            **shape_kw,
+        )
 
     def grf(
         self,
@@ -246,8 +276,8 @@ class _NoiseNamespace:
             Draw with the shape of another traced expression instead of ``(N, ndim)``. See
             :meth:`gaussian` for the full explanation and an example.
         """
-        shape_kw, like = _resolve_shape_args("laplace", ndim, like)
-        return Noise("laplace", like=like, std=float(std), **shape_kw)
+        shape_kw, like, shape_explicit = _resolve_shape_args("laplace", ndim, like)
+        return Noise("laplace", like=like, shape_explicit=shape_explicit, std=_param("std", "laplace", std), **shape_kw)
 
 
 noise = _NoiseNamespace()

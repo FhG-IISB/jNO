@@ -2377,6 +2377,8 @@ class Model(Placeholder):
         *cond: Any,
         time: Any,
         save: bool = False,
+        noise: Any = None,
+        key: Any = None,
     ) -> Any:
         r"""March this network as an ODE **velocity field**: :math:`dx/dt = v(x, t, \ldots)`.
 
@@ -2395,6 +2397,17 @@ class Model(Placeholder):
                 latent. ``n`` counts points, matching ``domain(time=...)``, and must be a Python int
                 -- it is the scan length.
             save: Return the whole trajectory (leading axis ``len(time)``) instead of the endpoint.
+            noise: A ``jno.noise`` spec turning the march into an **SDE** -- the deterministic step
+                plus ``draw * sqrt(|dt|)``, redrawn independently at every step. Here the node names
+                a *distribution*, not a draw: its shape comes from the state, so ``ndim=`` and
+                ``like=`` are rejected. Its parameters may be **schedules** -- callables of the march
+                time -- which is what an SDE sampler's ``sigma_t`` needs::
+
+                    v.flow(x0, time=ts, key=k,
+                           noise=jno.noise.gaussian(std=lambda t: 0.3 * jnp.sqrt(t / (1 - t))))
+
+            key: PRNG key for *noise*. Required on the eager path, where there is no solver key to
+                inherit; inside a term list the solver's step key is used and this may be omitted.
 
         Returns:
             Any: The final state (same pytree structure as *x0*), or the whole trajectory when
@@ -2409,14 +2422,17 @@ class Model(Placeholder):
             Heun's method, fixed step, explicit -- no adaptive control and no error estimate, so the
             step count is the accuracy knob. No log-density: that needs the divergence of ``v`` with
             respect to the state, which :func:`jno.np.divergence` (defined over coordinate
-            ``Variable``\ s) does not provide. Dropout must be off; the march passes no PRNG key.
+            ``Variable``\ s) does not provide. Dropout must be off: the network is handed the evaluation key unchanged at every
+            step -- only the SDE increment folds in the step index -- so a mask would repeat
+            rather than resample.
             Reverse mode stores every step, so a march inside a training loss costs its step count in
             both compute and activation memory -- ``core.solve(checkpoint_gradients=True)`` trades
             ~30 % compute back for the memory.
         """
         ts = resolve_flow_times(time)
+        _validate_flow_noise(noise, key)
         if any(isinstance(a, Placeholder) for a in (x0, *cond)):
-            return Flow(self, x0, cond, ts, save)
+            return Flow(self, x0, cond, ts, save, noise=noise, key=key)
 
         # Concrete initial state: run it now. Routed through the evaluator rather than calling the
         # Equinox module directly so that freeze / lora / dtype apply exactly as they do in training.
@@ -2429,7 +2445,14 @@ class Model(Placeholder):
         def apply(state, t):
             return evaluator._apply_model(self, [state, t, *cond], [False] * n_args, ctx)
 
-        return march_velocity(apply, x0, ts, save)
+        if noise is not None and key is None:
+            raise ValueError(
+                "flow(noise=...) needs key= on the eager path. A concrete initial state marches "
+                "outside the solver, so there is no step key to inherit; without one the march would "
+                "silently drop the noise and return a deterministic ODE result labelled as an SDE. "
+                "Pass key=jax.random.PRNGKey(seed)."
+            )
+        return march_velocity(apply, x0, ts, save, diffusion=_diffusion_from_noise(noise), key=key)
 
     # ── finetuning helpers ───────────────────────────────────
 
@@ -3537,6 +3560,93 @@ class ModelCall(Placeholder):
         return self
 
 
+def _validate_flow_noise(noise, key):
+    """Reject the ways ``flow(noise=...)`` could quietly mean something other than an SDE."""
+    if noise is None:
+        if key is not None:
+            raise ValueError(
+                "flow(key=...) was given without noise=. The key exists only to drive the SDE "
+                "increment, so on a deterministic march it would do nothing -- which reads as "
+                "stochastic sampling that is not happening. Pass noise= too, or drop key=."
+            )
+        return
+    if not isinstance(noise, Noise):
+        raise TypeError(
+            f"flow(noise=...) expects a jno.noise spec (jno.noise.gaussian(...), .uniform(...), "
+            f".laplace(...)), got {type(noise).__name__}."
+        )
+    if getattr(noise, "shape_explicit", False):
+        raise ValueError(
+            "flow(noise=...) takes the DISTRIBUTION only -- its shape is the state's, resolved per "
+            "step from the pytree being marched. `ndim=`/`like=` describe a shape and would be "
+            "ignored here, so they are refused rather than silently dropped. Write "
+            "jno.noise.gaussian(std=...) with no shape argument."
+        )
+
+
+def _schedule_value(name, value, t, where):
+    """Resolve a distribution parameter that may be a **schedule** -- a callable of the march time.
+
+    A plain number passes through. A callable is the sigma_t of an SDE sampler and only has meaning
+    while marching, so it raises anywhere there is no march time rather than being silently called
+    with the wrong argument (or, worse, used as a float).
+    """
+    if not callable(value):
+        return value
+    if t is None:
+        raise ValueError(
+            f"{name}= was given a schedule (a callable of the march time t), but {where} there is no "
+            f"march time to evaluate it at. A schedule is only meaningful inside "
+            f"`Model.flow(..., noise=...)`; elsewhere pass a number."
+        )
+    return value(t)
+
+
+def draw_distribution(distribution, params, shape, key, t=None, where="at this noise node"):
+    """Draw one realisation of *distribution* with *shape*. The single implementation.
+
+    Shared by the evaluator's ``Noise`` handler and by the SDE increment inside
+    :func:`march_velocity`, so a noise node means the same thing in a term list and in a march.
+    Parameters may be schedules (callables of *t*) only where a march time exists.
+    """
+
+    def par(name, default):
+        return _schedule_value(name, params.get(name, default), t, where)
+
+    if distribution == "gaussian":
+        return jax.random.normal(key, shape) * par("std", 1.0)
+    if distribution == "uniform":
+        return jax.random.uniform(key, shape, minval=par("low", -1.0), maxval=par("high", 1.0))
+    if distribution == "laplace":
+        std = par("std", 1.0)
+        u = jax.random.uniform(key, shape, minval=1e-6, maxval=1.0 - 1e-6) - 0.5
+        return -jnp.sign(u) * jnp.log(1.0 - 2.0 * jnp.abs(u)) * std / jnp.sqrt(2.0)
+    raise ValueError(f"Unknown noise distribution {distribution!r}. Choose from: 'gaussian', 'uniform', 'laplace'.")
+
+
+def _diffusion_from_noise(noise):
+    """Build the per-step SDE increment from a ``jno.noise`` spec, or ``None`` for a plain ODE.
+
+    The increment is ``draw * sqrt(|dt|)`` -- Euler--Maruyama on top of the deterministic step. The
+    magnitude uses ``|dt|`` so a *decreasing* grid (marching data back to its latent) is a real
+    backward SDE rather than a NaN from ``sqrt`` of a negative step.
+    """
+    if noise is None:
+        return None
+
+    def diffusion(t0, dt, state, key):
+        leaves, treedef = jax.tree_util.tree_flatten(state)
+        keys = jax.random.split(key, len(leaves))
+        scale = jnp.sqrt(jnp.abs(dt))
+        drawn = [
+            draw_distribution(noise.distribution, noise.params, jnp.shape(leaf), k, t=t0, where="in this march") * scale
+            for leaf, k in zip(leaves, keys)
+        ]
+        return jax.tree_util.tree_unflatten(treedef, drawn)
+
+    return diffusion
+
+
 def resolve_flow_times(time):
     """Normalise the ``time=`` argument of :meth:`Model.flow` to the grid POINTS.
 
@@ -3560,7 +3670,7 @@ def resolve_flow_times(time):
     return ts
 
 
-def march_velocity(apply, x0, ts, save=False):
+def march_velocity(apply, x0, ts, save=False, diffusion=None, key=None):
     """March ``dx/dt = apply(x, t)`` over the grid points *ts*, returning the endpoint (or the path).
 
     Heun's method (explicit trapezoid): second order, two evaluations per step, and no state beyond
@@ -3572,6 +3682,13 @@ def march_velocity(apply, x0, ts, save=False):
     one both work with no flag. The state is any **pytree**; ``apply`` must return the same structure,
     which is checked at trace time. Written as one :func:`jax.lax.scan`, so the whole march is
     reverse-mode differentiable in ``x0``, in the weights ``apply`` closes over, and in *ts*.
+
+    With *diffusion* the march becomes an **SDE**: the deterministic Heun step is taken first and the
+    increment ``diffusion(t0, dt, x, subkey)`` is added after it (Euler--Maruyama). Each step draws
+    from ``fold_in(key, i)``, so the increments are **independent across steps** -- a single shared
+    draw would not be Brownian motion at all, and its endpoint variance would be wrong by a factor of
+    the step count. Mixing a second-order deterministic step with an Euler--Maruyama increment gives
+    strong order 1/2 overall, as any explicit fixed-step SDE scheme without Levy-area terms does.
     """
     ts = jnp.asarray(ts)
 
@@ -3588,6 +3705,12 @@ def march_velocity(apply, x0, ts, save=False):
         predictor = jax.tree_util.tree_map(lambda a, b: a + dt * b, x, k1)
         k2 = apply(predictor, t1)
         nxt = jax.tree_util.tree_map(lambda a, b, c: a + 0.5 * dt * (b + c), x, k1, k2)
+        if diffusion is not None:
+            # A fresh subkey PER STEP -- reusing one draw across the march is the failure this
+            # guards: the increments would be perfectly correlated and the endpoint variance would
+            # come out a factor of `len(ts) - 1` too large, worsening as the step count is raised.
+            increment = diffusion(t0, dt, nxt, jax.random.fold_in(key, i))
+            nxt = jax.tree_util.tree_map(lambda a, b: a + b, nxt, increment)
         return nxt, (nxt if save else None)
 
     x_end, path = jax.lax.scan(step, x0, jnp.arange(ts.shape[0] - 1))
@@ -3613,12 +3736,18 @@ class Flow(Placeholder):
     branch.
     """
 
-    def __init__(self, model, x0, cond, ts, save=False):
+    def __init__(self, model, x0, cond, ts, save=False, noise=None, key=None):
         self.model = model
         self.x0 = x0
         self.cond = list(cond)
         self.ts = ts
         self.save = bool(save)
+        # A `jno.noise` spec turns the march into an SDE. It is NOT exposed through `args`: it names
+        # a distribution rather than a sub-expression, has no children (shape arguments are refused),
+        # and evaluating it as an array would draw once for the whole march -- the one thing the
+        # per-step redraw exists to prevent.
+        self.noise = noise
+        self.key = key
         self.op_id = _next_op_id()
 
     @property
@@ -3627,7 +3756,8 @@ class Flow(Placeholder):
 
     def __repr__(self):
         cond = "".join(f", {c}" for c in self.cond)
-        return f"flow({self.model}, {self.x0}{cond}, steps={int(jnp.asarray(self.ts).shape[0]) - 1})"
+        sde = f", sde={self.noise.distribution}" if self.noise is not None else ""
+        return f"flow({self.model}, {self.x0}{cond}, steps={int(jnp.asarray(self.ts).shape[0]) - 1}{sde})"
 
 
 class TunableModule(Placeholder):
@@ -4243,10 +4373,14 @@ class Noise(Placeholder):
         Distribution-specific kwargs: ``std``, ``low``, ``high``, ``ndim``.
     """
 
-    def __init__(self, distribution: str, like=None, **params):
+    def __init__(self, distribution: str, like=None, shape_explicit: bool = False, **params):
         self.distribution = distribution
         self.params = params
         self.like = like
+        # Whether the caller actually asked for a shape. `ndim` defaults to 1, so params alone
+        # cannot tell that apart from silence -- and `flow(noise=...)` must refuse an explicit
+        # shape (its own comes from the state) without refusing every plain distribution.
+        self.shape_explicit = bool(shape_explicit)
         self._noise_id = _next_op_id()
 
     @property
@@ -5926,7 +6060,7 @@ def cse(expr: Placeholder) -> Placeholder:
             new_x0 = _visit(node.x0) if isinstance(node.x0, Placeholder) else node.x0
             new_cond = [_visit(c) if isinstance(c, Placeholder) else c for c in node.cond]
             if new_x0 is not node.x0 or any(n is not o for n, o in zip(new_cond, node.cond)):
-                new_node = Flow(node.model, new_x0, new_cond, node.ts, node.save)
+                new_node = Flow(node.model, new_x0, new_cond, node.ts, node.save, noise=node.noise, key=node.key)
                 new_node.op_id = node.op_id
                 node = new_node
         elif isinstance(node, OperationDef):

@@ -176,10 +176,53 @@ z = jno.np.parameter((n, D))
 crux = jno.core([(observe(v.flow(z, time=ts)) - y_obs).mse])
 ```
 
+### Sampling as an SDE — `flow(noise=..., key=...)`
+
+Passing a `jno.noise` spec turns the march into a stochastic one: the deterministic step, then
+`draw · √|dt|`, **redrawn independently at every step** (Euler–Maruyama).
+
+```python
+x = v.flow(x0, time=ts, key=k, noise=jno.noise.gaussian(std=0.3))
+```
+
+Here the noise node names a **distribution, not a draw** — the one place in jNO where it means that.
+Its shape comes from the state being marched, so `ndim=`/`like=` are *refused* rather than ignored.
+Parameters may be **schedules**, callables of the march time, which is what an SDE sampler's `σ_t`
+is:
+
+```python
+noise=jno.noise.gaussian(std=lambda t: 0.3 * jnp.sqrt(t / (1 - t)))
+```
+
+The per-step redraw is the property to rely on. A single draw shared across the march would not be
+Brownian motion at all — the increments would be perfectly correlated and the endpoint variance
+would come out a factor of the *step count* too large, getting worse as the step count is raised.
+Verified against the Itô isometry: with `std=σ` and zero drift the endpoint variance is `σ²T` and
+does not move as the step count goes 10 → 40 → 80.
+
+`key=` is **required on the eager path**. A concrete initial state marches outside the solver, where
+there is no step key to inherit, and a noise node evaluated without a key returns zeros — so
+omitting it would silently give a deterministic ODE labelled as an SDE. Inside a term list the
+solver's step key is used and `key=` may be omitted. A `key=` with no `noise=` also raises, since it
+would do nothing.
+
+A backward grid works: the increment scales with `√|dt|`, so a decreasing `time=` is a real backward
+SDE rather than a NaN.
+
+**Why this matters.** The per-step Gaussian transition is exactly the policy that RL post-training of
+flow models optimises — Flow-GRPO's policy is a per-step Gaussian, not a continuous-time density, so
+it needs no divergence. Together with `save=True` for the trajectory, that is the ingredient list.
+
+---
+
 **Limitations.** Heun's method, fixed step, explicit — no adaptive control and no error estimate, so
 the step count is the accuracy knob. No log-density: that needs the divergence of `v` with respect
-to the *state*, which `jno.np.divergence` (defined over coordinate `Variable`s) does not provide.
-Dropout must be off, since the march passes no PRNG key. Reverse mode stores every step, so a march
+to the *state*, which `jno.np.divergence` (defined over coordinate `Variable`s) does not provide —
+note this blocks *exact likelihoods*, not the per-step transition density an SDE sampler gives.
+Dropout must still be off. The network is handed `ctx.key`, which is the *same* key at every step of
+the march (only the SDE increment folds in the step index), so a dropout mask would be identical
+across all steps rather than resampled — and on the eager path that key is `None`. Reverse mode
+stores every step, so a march
 inside a training loss costs its step count in both compute and activation memory —
 `core.solve(checkpoint_gradients=True)` trades roughly 30 % compute back for the memory.
 

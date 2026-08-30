@@ -1378,7 +1378,7 @@ class TraceEvaluator:
         with the eager ``Model.flow`` path, so a march inside a constraint and one run after training
         are the same computation.
         """
-        from .trace import march_velocity
+        from .trace import _diffusion_from_noise, march_velocity
 
         x0 = self._dispatch(expr.x0, ctx) if isinstance(expr.x0, Placeholder) else expr.x0
         cond = [self._dispatch(c, ctx) if isinstance(c, Placeholder) else c for c in expr.cond]
@@ -1387,7 +1387,16 @@ class TraceEvaluator:
         def apply(state, t):
             return self._apply_model(expr.model, [state, t, *cond], [False] * n_args, ctx)
 
-        return march_velocity(apply, x0, expr.ts, expr.save)
+        diffusion = _diffusion_from_noise(expr.noise)
+        key = expr.key if expr.key is not None else ctx.key
+        if diffusion is not None and key is None:
+            raise ValueError(
+                "flow(noise=...) needs a PRNG key, and this evaluation has none -- `core.eval()` "
+                "without a key runs noise-free so post-training evaluation is deterministic. For a "
+                "march that would silently become a plain ODE, so it raises instead. Pass "
+                "key=jax.random.PRNGKey(seed) to flow(), or evaluate inside solve()."
+            )
+        return march_velocity(apply, x0, expr.ts, expr.save, diffusion=diffusion, key=key)
 
     def _eval_tunable_module(self, expr, ctx):
         if expr._current_instance is None:
@@ -1558,25 +1567,12 @@ class TraceEvaluator:
         # from the step key — reproducible when the solver seed is fixed.
         subkey = jax.random.fold_in(ctx.key, expr._noise_id)
 
-        dist = expr.distribution
-        if dist == "gaussian":
-            return jax.random.normal(subkey, shape) * expr.params.get("std", 1.0)
-        elif dist == "uniform":
-            return jax.random.uniform(
-                subkey,
-                shape,
-                minval=expr.params.get("low", -1.0),
-                maxval=expr.params.get("high", 1.0),
-            )
-        elif dist == "laplace":
-            std = expr.params.get("std", 1.0)
-            # Inverse-CDF of Laplace via Uniform(-0.5, 0.5)
-            u = jax.random.uniform(subkey, shape, minval=1e-6, maxval=1.0 - 1e-6) - 0.5
-            return -jnp.sign(u) * jnp.log(1.0 - 2.0 * jnp.abs(u)) * std / jnp.sqrt(2.0)
-        else:
-            raise ValueError(
-                f"Unknown noise distribution {expr.distribution!r}. Choose from: 'gaussian', 'uniform', 'laplace'."
-            )
+        # The one implementation, shared with the SDE increment inside `march_velocity`, so a noise
+        # node draws the same way in a term list and in a march. A schedule (callable) parameter has
+        # no march time here and raises rather than being misused as a number.
+        from .trace import draw_distribution
+
+        return draw_distribution(expr.distribution, expr.params, shape, subkey, t=None)
 
     def _eval_tunable_module_call(self, expr, ctx):
         tunable = expr.model
