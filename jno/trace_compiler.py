@@ -1136,9 +1136,12 @@ class TraceCompiler:
                     raise ValueError(
                         f"batchsize={batchsize} exceeds the number of stacked samples (B={B}). `batchsize` "
                         f"draws along the SAMPLE axis -- the one `n * domain` builds -- not the collocation "
-                        f"points inside one sample. This used to sample with replacement and silently "
-                        f"evaluate {batchsize} duplicate copies of the same {B} sample(s). Use batchsize<={B}, "
-                        f"or stack more samples (`{batchsize} * domain`)."
+                        f"points inside one sample, so there is nothing further to draw from. This used to "
+                        f"sample with replacement and silently evaluate {batchsize} duplicate copies of the "
+                        f"same {B} sample(s) at {batchsize}x the cost. To mini-batch the COLLOCATION POINTS "
+                        f"instead -- which is what a `jno.domain.from_array` dataset (B=1) needs -- use "
+                        f"`solve(points={batchsize})`. Otherwise use batchsize<={B}, or stack more samples "
+                        f"(`{batchsize} * domain`)."
                     )
                 elif batchsize < B:
                     indices = jax.random.choice(key, B, shape=(batchsize,), replace=False)
@@ -1490,8 +1493,10 @@ class TraceCompiler:
                         f"draws along the SAMPLE axis -- the one `n * domain` builds -- not the collocation "
                         f"points inside one sample, so there is nothing further to draw from. This used to "
                         f"sample with replacement and silently evaluate {batchsize} duplicate copies of the "
-                        f"same {B} sample(s) at {batchsize}x the cost. Use batchsize<={B}, stack more samples "
-                        f"(`{batchsize} * domain`), or pass `points=` to mini-batch the collocation points."
+                        f"same {B} sample(s) at {batchsize}x the cost. To mini-batch the COLLOCATION POINTS "
+                        f"instead -- which is what a `jno.domain.from_array` dataset (B=1) needs -- use "
+                        f"`solve(points={batchsize})`. Otherwise use batchsize<={B}, or stack more samples "
+                        f"(`{batchsize} * domain`)."
                     )
                 elif batchsize < B:
                     indices = jax.random.choice(key, B, shape=(batchsize,), replace=False)

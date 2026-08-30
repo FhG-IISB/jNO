@@ -152,8 +152,13 @@ class TestNoiseFollowsPoints:
 
 class TestGuards:
     def test_batchsize_beyond_the_sample_count_raises_and_names_points(self, point_cloud):
+        # Both halves matter. Raising stops the silent duplicate-evaluation path; naming `points=` is
+        # what makes the error actionable, since the caller who hits this on a `from_array` dataset
+        # (B = 1) wants the POINT axis and "stack more samples" would be the wrong fix.
         crux, _, _ = point_cloud
         with pytest.raises(ValueError, match=r"exceeds the number of stacked samples"):
+            crux.compiled_constraints_fn(crux.models, crux.domain_data.context, batchsize=16, key=jax.random.PRNGKey(0))
+        with pytest.raises(ValueError, match=r"solve\(points=16\)"):
             crux.compiled_constraints_fn(crux.models, crux.domain_data.context, batchsize=16, key=jax.random.PRNGKey(0))
 
     def test_points_below_one_raises(self, point_cloud):
