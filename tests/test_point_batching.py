@@ -23,16 +23,29 @@ from jno.trace_compiler import _requires_full_point_set
 N_POINTS = 64
 
 
-def _residual_shapes(crux, *, points, seed=0):
-    """Un-reduced per-point residuals — the direct view of how many points a step actually saw."""
+def _residuals(crux, *, points, seed=0):
+    """Un-reduced per-point residuals — the direct view of how many points a step actually saw.
+
+    Both operands are pinned to the default device exactly as ``core``'s own resample call site does
+    (``core.py``, the ``needs_residuals`` branch). ``compiled_resample_constraints_fn`` is not jitted
+    with explicit ``in_shardings``, so on a GPU the mesh-sharded model params become ARG_SHARDING
+    inside the function's internal vmap and cannot be reconciled with unpinned context arrays -- the
+    MLP matmul raises. Every call goes through here so no test can reintroduce a placement the
+    library itself never uses, which would fail on GPU while passing on CPU.
+    """
+    dev = jax.devices()[0]
     out = crux.compiled_resample_constraints_fn(
-        crux.models,
-        crux.domain_data.context,
+        jax.device_put(crux.models, dev),
+        jax.device_put(crux.domain_data.context, dev),
         batchsize=None,
         key=jax.random.PRNGKey(seed),
         points=points,
     )
-    return [np.asarray(o).shape for o in out]
+    return [np.asarray(o) for o in out]
+
+
+def _residual_shapes(crux, *, points, seed=0):
+    return [o.shape for o in _residuals(crux, points=points, seed=seed)]
 
 
 @pytest.fixture(scope="module")
@@ -67,23 +80,15 @@ class TestSubsampling:
 
     def test_same_key_draws_the_same_subset(self, point_cloud):
         crux, _, _ = point_cloud
-        a = crux.compiled_resample_constraints_fn(
-            crux.models, crux.domain_data.context, batchsize=None, key=jax.random.PRNGKey(3), points=8
-        )
-        b = crux.compiled_resample_constraints_fn(
-            crux.models, crux.domain_data.context, batchsize=None, key=jax.random.PRNGKey(3), points=8
-        )
-        assert np.allclose(np.asarray(a[0]), np.asarray(b[0]))
+        a = _residuals(crux, points=8, seed=3)
+        b = _residuals(crux, points=8, seed=3)
+        assert np.allclose(a[0], b[0])
 
     def test_different_keys_draw_different_subsets(self, point_cloud):
         crux, _, _ = point_cloud
-        a = crux.compiled_resample_constraints_fn(
-            crux.models, crux.domain_data.context, batchsize=None, key=jax.random.PRNGKey(1), points=8
-        )
-        b = crux.compiled_resample_constraints_fn(
-            crux.models, crux.domain_data.context, batchsize=None, key=jax.random.PRNGKey(2), points=8
-        )
-        assert not np.allclose(np.asarray(a[0]), np.asarray(b[0]))
+        a = _residuals(crux, points=8, seed=1)
+        b = _residuals(crux, points=8, seed=2)
+        assert not np.allclose(a[0], b[0])
 
 
 # ---------------------------------------------------------------------------
@@ -104,10 +109,8 @@ class TestTagsStayAligned:
         net.optimizer(optax.adam(1e-3))
         crux = jno.core([(net(a0, a1) - net(b0, b1)).mse])
 
-        out = crux.compiled_resample_constraints_fn(
-            crux.models, crux.domain_data.context, batchsize=None, key=jax.random.PRNGKey(0), points=8
-        )
-        assert np.max(np.abs(np.asarray(out[0]))) < 1e-6
+        out = _residuals(crux, points=8)
+        assert np.max(np.abs(out[0])) < 1e-6
 
 
 # ---------------------------------------------------------------------------
