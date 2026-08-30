@@ -24,6 +24,40 @@ domain, compiles them once, then exposes `solve()` / `eval()`.
         - eval
         - sweep
 
+### Mini-batching — `batchsize` and `points` are different axes
+
+A context tag is one `(B, [T,] N, D)` array. The two mini-batch arguments cut it along different
+axes and compose freely:
+
+| | draws along | built by | typical use |
+|---|---|---|---|
+| `batchsize` | the **sample** axis `B` | `n * domain` | many realisations of a parametric problem |
+| `points` | the **point** axis `N` | the collocation points / a dataset's rows | a large point cloud or dataset |
+
+```python
+crux.solve(epochs=4000, points=1024)              # 1024 of the N points per step
+crux.solve(epochs=4000, batchsize=8, points=1024) # both, independently
+```
+
+A dataset attached with `jno.domain.from_array` has exactly one sample, `B = 1`, so `batchsize`
+has nothing to draw from there — that is what `points=` is for. Asking for `batchsize > B`
+**raises** and names `points=` as the alternative; it used to sample with replacement and evaluate
+duplicate copies of the same full point set, returning the full-batch loss at `batchsize` times the
+cost with nothing said.
+
+Two properties worth relying on:
+
+- **Tags stay aligned.** Index sets are keyed on the point *count*, not the tag, so any two tags of
+  equal length are sliced identically. An input field and its target cannot drift apart — a failure
+  that would otherwise produce a wrong number while every shape still matched.
+- **`points` is refused, loudly, when a constraint needs the whole point set** — a finite-difference
+  derivative reads a node's neighbours and a FEM assembly integrates over cells. Dropping points
+  there would return a plausible wrong answer rather than raise.
+
+`jno.noise.*` follows the sub-sampled count automatically, and `offload_data` /
+`accumulation_steps` count `points` as sub-sampling, so neither is silently disabled when it is the
+point axis being split.
+
 ---
 
 ## Domain
@@ -728,6 +762,26 @@ Backs `model.bayesian(...)` / `model.vi(...)`; see [Bayesian Sampling](training/
         - uniform
         - laplace
         - grf
+
+### Shape by reference — `like=`
+
+`ndim=` gives a *pointwise* shape, `(N, ndim)` with `N` the active point count. That cannot describe
+a **field-valued** draw — the prior a flow-matching path needs when the state is a `(G, G, C)`
+tensor rather than a scalar column. `like=` takes a reference expression instead of a shape:
+
+```python
+x0 = jno.noise.gaussian(std=1.0, like=x1)     # draw shaped like whatever x1 evaluates to
+```
+
+The shape is resolved from the reference's own evaluated shape at evaluation time — only the shape;
+the value is dead and XLA drops it. Because it is measured rather than written down, it tracks
+`batchsize`, `solve(points=...)` and time windows automatically. A literal shape would go stale
+under any of those and fail by *broadcasting* rather than by raising: with `points=8`, a residual
+against a hand-written `(1024, 2)` shape silently becomes a `(1024, 8)` outer product, while
+`like=x1` already gives `(8, 2)` because `x1` itself was resliced.
+
+`ndim=` and `like=` are mutually exclusive — passing both raises. Two noise nodes sharing one
+`like=` reference remain **independent draws**.
 
 ---
 
