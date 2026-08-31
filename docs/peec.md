@@ -288,21 +288,33 @@ Every layer is checked against an oracle that does not go through the layer belo
 Measured on one CPU core-set, a copper bar discretised as a plain lattice. `build()` is the host pass;
 *first* includes the XLA compile; *warm* is a repeat solve on the built network.
 
-| bars | `build()` | first solve | warm solve (`R`) | `L` |
-|---|---|---|---|---|
-| 712 | 0.22 s | 1.7 s | 0.06 s | 0.02 s |
-| 6,688 | 0.44 s | 7.2 s | 0.24 s | 0.02 s |
-| 23,688 | 0.44 s | 17.9 s | 0.78 s | 0.03 s |
-| 57,472 | 0.52 s | 61 s | 2.30 s | 0.04 s |
+| bars | `build()` | warm solve (`R`), CPU | `L` |
+|---|---|---|---|
+| 712 | 0.22 s | 0.04 s | 0.02 s |
+| 6,688 | 0.19 s | 0.15 s | 0.02 s |
+| 23,688 | 0.21 s | 0.50 s | 0.03 s |
+| 57,472 | 0.52 s | 1.46 s | 0.04 s |
 
 Three things to read off it.
 
 - **`build()` is cheap and flat.** The host pass is well under a second even at 57k bars. Building once
   and solving many times is the intended shape, and it is why `build()` exists.
-- **The first solve is dominated by compilation**, not arithmetic — 61 s against a 2.30 s warm solve at
-  57k bars. For a one-shot answer that is the number you feel; in a design loop it is paid once.
-- **The solve is linear in the bars**, and the frequency does not change its cost: the same 57k-bar
-  network takes 2.29 s at DC and 2.30 s at 10 kHz.
+- **The first solve is dominated by compilation**, not arithmetic — a few seconds against a warm solve
+  of well under one. For a one-shot answer that is the number you feel; in a design loop it is paid once.
+- **The solve is linear in the bars**, and the frequency does not change its cost.
+
+!!! tip "The GPU is worth using, and was not always"
+    The solve is matrix-free and the partial-inductance apply is an FFT, so it belongs on a GPU: at
+    23,688 bars that apply is **3.2× quicker** there. It did not show up in the solve until the
+    constraint block stopped being assembled one jax op per node — thousands of eager dispatches that
+    cost the same whichever device they dispatch to, and hid the operator they were wrapped around.
+
+    | 23,688 bars, warm solve | CPU | GPU |
+    |---|---|---|
+    | before | 0.781 s | 0.801 s |
+    | after | 0.641 s | **0.317 s** |
+
+    Note the CPU column moved too: this was never a GPU-specific problem, only a GPU-visible one.
 
 !!! tip "`L` is a quadratic form, evaluated through the operator"
     `sol.L` used to walk every pair — `O(N²)` behind a solve that is linear — and cost **76 s at 57,472
