@@ -948,7 +948,13 @@ class _AMS(_Spec):
             # 1e-6, so the tolerance was never the limiter -- while AMG on the (complex, unreformulated)
             # blocks converges in 5-7 iterations. pyamg's own solve is used rather than the JAX V-cycle
             # in ``utils.solver.amg`` because that one smooths with Chebyshev, which needs real spectral
-            # bounds and has no meaning on a complex-symmetric spectrum. Applied through
+            # bounds and has no meaning on a complex-symmetric spectrum. MEASURED, on an A-V block with
+            # sigma = 0 outside the conductor: the auxiliaries span the whole first quadrant --
+            # arg(lambda) 0.1 to 89.7 degrees for G^T A G and 0.2 to 89.8 for each Pi^T A Pi -- so there
+            # is no real interval to fit. (With sigma UNIFORM and w*sigma >> nu they collapse onto a ray,
+            # ~1 degree of spread, which is why a uniform-sigma test says nothing about this.) Making the
+            # V-cycle usable here needs an ellipse-based complex polynomial instead: Manteuffel, *The
+            # Tchebychev iteration for nonsymmetric linear systems*, Numer. Math. 28 (1977). Applied through
             # ``pure_callback`` for the same reason the default SuperLU aux is: forward-only, and the
             # preconditioner is never differentiated.
             import jax
