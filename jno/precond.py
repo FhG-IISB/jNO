@@ -303,8 +303,16 @@ def real_equivalent(inner) -> _RealEquivalent:
     it matches the definite case. An ``eps`` mass term buys that conditioning by changing the physics;
     a tree-cotree gauge (``domain._extra_dof_pins``) buys it for free, and is the right pairing.
 
-    ``inner`` sees ``K + M`` and never sees a complex number, so anything real composes: ``amg()``,
-    ``jacobi()``, ``inner(jno.solve.lu())``.
+    ``inner`` sees ``K + M`` and never sees a complex number, so anything real composes -- but it must
+    MATCH THAT OPERATOR'S CHARACTER, which is the practical trap. Where ``M`` vanishes, ``K + M`` is a
+    bare curl-curl operator, and smoothed aggregation is the wrong tool for H(curl); that is what AMS
+    is for. Measured on a cube: with a mass term everywhere (eps-gauge 1) ``real_equivalent(amg())``
+    converges in ~20 iterations, and at eps 1e-4 -- so ``K + M`` is curl-curl in the non-conducting
+    region -- the same call fails. Conductor thickness and volume fraction are NOT the variable: 20
+    iterations from 60 % of the volume down to 0.86 %, and 4 elements thick down to 1.
+
+    So on an eddy problem with a non-conducting region, pair this with an H(curl) inner (``ams()``),
+    not ``amg()``. ``K + M`` being real is what keeps a GPU route open -- it wants a real AMS.
 
     References: Day & Heroux, *Solving complex-valued linear systems via equivalent real formulations*,
     SIAM J. Sci. Comput. 23(2):480-498, 2001 (which equivalent real form to pick); Axelsson & Kucherov,
