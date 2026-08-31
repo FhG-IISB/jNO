@@ -146,6 +146,8 @@ the geometry says the metal touches, not because anything declared a connection.
 .attach(sigma=5.8e7)                              # a material
 .attach(sigma=lambda x, y, z: SIG * rho(x, y))    # a FIELD: the density is the design
 .attach(sigma=SIG * rho)                          # one value per element
+.attach(sigma=(sx, sy, sz))                       # ANISOTROPIC — and each of the three may
+                                                  # itself be any of the above
 ```
 
 A callable is evaluated at each element — cell centres for a solid's lattice, midpoints for a wire —
@@ -167,6 +169,13 @@ as a shape** rather than assumed to be one.
 
 A conductivity may also be **traced**, which is what closes an electro-thermal loop — copper is about
 31 % more resistive at 100 °C than at 20 °C.
+
+!!! info "Anisotropy is diagonal, and a wire projects it"
+    The bars are axis-aligned, so an off-diagonal conductivity has nowhere to live in this
+    discretisation — `(sx, sy, sz)` is the whole vocabulary. A `Shape.line` is one-dimensional, so
+    what reaches it is the component along its own tangent, `t · σ · t`, which is the physically
+    right answer rather than a refusal: a transverse conductivity cannot drive current along a
+    filament. A `(3,)` array on a conductor with exactly three elements is ambiguous and raises.
 
 ## Frequency and the skin effect
 
@@ -225,11 +234,31 @@ the gradient, because the host pass, not the solve, was the cost.
 | `sol.dissipation()` | `{region: W/m³}` — per-conductor loss, shaped for `d.by_region` |
 | `sol.current(t)` | net current injected at terminal `t`, amp |
 | `sol.i` | the filament currents themselves |
+| `sol.field(points)` | magnetic flux density at `(n, 3)` positions, tesla — see below |
+| `sol.export_vtk(path)` | the solved currents as line cells, for ParaView |
 | `sol.partial` | the dense `(n, n)` partial inductances — **formed on demand**, never at solve time |
 
 `L` comes from the energy rather than `Im(Z)/ω` so that it is defined at DC too, and so that it stays
 the loop inductance the currents actually produce: at a frequency where they redistribute, that is a
 different (smaller) number than the DC one, which is the effect worth seeing.
+
+### The field off the metal
+
+A partial-element method never meshes the air, so the field away from the conductors is not a solved
+unknown — it is a Biot-Savart sum over the currents that **were** solved for:
+
+```python
+B = sol.field(probe_points)          # (n, 3) tesla, free space
+```
+
+It is a readout, not a second problem: no boundary condition, and differentiable in the currents
+**and** in the points — which is what an EMI objective over a keep-out volume needs.
+
+!!! warning "Free space, and off the metal"
+    There is no magnetic material in this solver, so a nearby core would change the answer and is not
+    represented. A probe inside a conductor's own cross-section is **refused**: the kernel is singular
+    there, and the field inside the metal is not what this computes. (A point on the *axis* of a
+    straight filament is not the dangerous case — the field vanishes there by symmetry.)
 
 ### Feeding a thermal solve
 
