@@ -294,7 +294,7 @@ Measured on one CPU core-set, a copper bar discretised as a plain lattice. `buil
 | 6,688 | 0.19 s | 0.16 s | 0.02 s |
 | 23,688 | 0.21 s | 0.46 s | 0.03 s |
 | 57,472 | 0.52 s | 1.16 s | 0.04 s |
-| 113,800 | 0.37 s | 2.28 s | 0.09 s |
+| 113,800 | 0.40 s | 2.03 s | 0.08 s |
 
 Three things to read off it.
 
@@ -323,8 +323,8 @@ Three things to read off it.
 
     | 113,800 bars (40,000 cells) | jNO CPU | jNO GPU |
     |---|---|---|
-    | DC | 2.28 s | **1.21 s** |
-    | 10 kHz | 2.30 s | **1.16 s** |
+    | DC | 2.03 s | **0.92 s** |
+    | 10 kHz | 2.12 s | **0.95 s** |
 
     The cache is keyed on the conductivity and the frequency, so a repeated solve and a gradient's
     adjoint pass are free — and a design loop that moves the conductivity every iteration is not.

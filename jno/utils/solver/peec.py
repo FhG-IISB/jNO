@@ -795,14 +795,18 @@ def solve_network(
     # near-field preconditioner is built from, which must stay concrete.
     rr, cc, vv, vv_h, rhs = [], [], [], [], [np.zeros(ne, dtype=complex)]
     r0 = 0
-    for n in free:  # current balance away from the terminals
-        k, v = rows_of(n), vals_of(n)
-        rr.append(np.full(k.size, r0))
-        cc.append(k)
-        vv.append(v)
-        vv_h.append(v)
-        r0 += 1
-        rhs.append(np.zeros(1, dtype=complex))
+    # Current balance away from the terminals: one row per free node, and the row IS that node's
+    # row of the incidence. Taken as a slice rather than a loop -- the loop was 40,000 python
+    # iterations on a 113,800-bar network, and `solve_network`'s own bytecode was 21 % of the solve.
+    if free.size:
+        sub = Asp0[free]
+        counts = np.diff(sub.indptr)
+        rr.append(np.repeat(np.arange(free.size), counts))
+        cc.append(sub.indices)
+        vv.append(sub.data)
+        vv_h.append(sub.data)
+        rhs.append(np.zeros(free.size, dtype=complex))
+        r0 += int(free.size)
     for t in names:
         ids = idx[t]
         w = wts.get(t)
@@ -1287,33 +1291,30 @@ def _refuse_disconnected(A, idx, sources, grounds, currents, devices=()):
     infinite resistance reads like a physical answer. Two conductors that were meant to touch but do
     not is the common way to get here, so the check names the terminals rather than the matrix.
     """
-    nn, ne = A.shape
-    Ac = A.tocsc()
-    root = np.arange(nn)
+    # This is a connected-components question, so it is asked as one. It used to be a python
+    # union-find over every filament and every node it touches: 685,194 calls to `find` on a
+    # 113,800-bar network, 0.186 s a solve and 14 % of it on a GPU, to answer a question about
+    # geometry that `build()` had already frozen. `connected_components` does the same in C.
+    from scipy.sparse.csgraph import connected_components
 
-    def find(a):
-        while root[a] != a:
-            root[a] = root[root[a]]
-            a = root[a]
-        return a
-
-    for k in range(ne):  # a filament joins the nodes it touches
-        touch = Ac.indices[Ac.indptr[k] : Ac.indptr[k + 1]]
-        for n in touch[1:]:
-            ra, rb = find(int(touch[0])), find(int(n))
-            if ra != rb:
-                root[ra] = rb
+    nn, _ne = A.shape
+    # A is nodes x filaments with two entries a column -- a filament's two ends -- so `A @ A.T` has
+    # an entry wherever one filament touches two nodes, which is exactly the union the loop did.
+    g = (A @ A.T).tocoo()
+    rows, cols = [g.row], [g.col]
     for ids in idx.values():  # a terminal is one electrical point
-        for n in ids[1:]:
-            ra, rb = find(int(ids[0])), find(int(n))
-            if ra != rb:
-                root[ra] = rb
+        ids = np.asarray(ids, dtype=int)
+        if ids.size > 1:
+            rows.append(np.full(ids.size - 1, ids[0]))
+            cols.append(ids[1:])
     for a, b, _z in devices:  # and a device conducts, so it joins the two terminals it sits between
-        ra, rb = find(int(idx[a][0])), find(int(idx[b][0]))
-        if ra != rb:
-            root[ra] = rb
+        rows.append(np.array([int(idx[a][0])]))
+        cols.append(np.array([int(idx[b][0])]))
+    r, c = np.concatenate(rows), np.concatenate(cols)
+    adj = sp.coo_matrix((np.ones(r.size, dtype=np.int8), (r, c)), shape=(nn, nn))
+    _ncomp, label = connected_components(adj, directed=False)
     for a, b, _g in sources:
-        if find(int(idx[a][0])) != find(int(idx[b][0])):
+        if label[int(idx[a][0])] != label[int(idx[b][0])]:
             raise ValueError(
                 f"jno.peec: no conducting path between terminals {a!r} and {b!r}, so no current can "
                 "flow and the impedance is not finite. Conductors are joined where the geometry says "
