@@ -1350,6 +1350,16 @@ def _occupied_runs(lab, ax):
     return np.moveaxis(np.where(live, fwd + bwd - 1, 0), -1, ax)
 
 
+#: Pitch-unification warnings already issued, so a swept solve says it once rather than per point.
+_PITCH_WARNED: set = set()
+
+
+def _warn_once(msg: str) -> None:
+    if msg not in _PITCH_WARNED:
+        _PITCH_WARNED.add(msg)
+        logging.getLogger("jno").warning(msg)
+
+
 def bar_filaments(shape, size=None, quad: int = 3, sigma=None):
     """Discretise a box conductor into a regular lattice of rectangular bars.
 
@@ -1416,6 +1426,26 @@ def bar_filaments(shape, size=None, quad: int = 3, sigma=None):
             "peec.bar_filaments: no cell pitch. Pass size=, or give the Shape a size= when you build "
             "it — a lattice count cannot be guessed from the geometry alone."
         )
+    # Taking the minimum DISCARDS every coarser pitch that was asked for, and the whole layout is
+    # then discretised at the finest one -- which is the most expensive option, arrived at by asking
+    # for something cheaper. Silent, it reads as local refinement having worked. It has not: the FFT
+    # needs one translation-invariant grid, so a solid lattice has exactly one pitch.
+    if size is None and len(declared) > 1:
+        want = [np.broadcast_to(np.asarray(v, float).reshape(-1), (3,)) for v in declared]
+        if not all(np.allclose(w, want[0]) for w in want):
+            names = [sh._region_name or "<unnamed>" for sh in shapes if sh._size is not None]
+            asked = ", ".join(
+                f"{n}={'x'.join(f'{1e3 * c:g}' for c in w)} mm" for n, w in zip(names, want)
+            )
+            _warn_once(
+                "peec.bar_filaments: these conductors ask for different cell pitches (%s), but solids "
+                "share ONE lattice and therefore one pitch -- the FFT that applies the partial "
+                "inductance needs a translation-invariant grid. The FINEST was used everywhere "
+                "(%s mm), so the coarser requests cost more rather than less. To refine only part of "
+                "a layout, model that part as a `Shape.line` -- a wire keeps its own discretisation "
+                "and welds where the metal touches."
+                % (asked, "x".join(f"{1e3 * c:g}" for c in h)),
+            )
     lo, hi = np.full(3, np.inf), np.full(3, -np.inf)
     for sh in shapes:
         bnd = np.asarray(sh.bounds(), dtype=float).reshape(2, -1)
