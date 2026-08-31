@@ -449,7 +449,11 @@ def _domain_from_arrays(
     target = _shallow_copy(template) if copy else template
     # Drop native-FEM caches keyed to the old mesh so they rebuild for the new one.
     for attr in list(vars(target)):
-        if attr.startswith("_fem_native") or attr in ("_fem_assembly_cache", "_integral_weight_cache"):
+        # `_fem_assembly_points` / `_fem_assembly_cells` are the assembly-mesh snapshot that
+        # `_cell_region_mask` classifies against. They match neither "_fem_native" nor the explicit
+        # tuple, so they used to SURVIVE the remesh and a per-region coefficient was then built
+        # against the old mesh -- measured 433 mask entries for a 3,712-cell mesh.
+        if attr.startswith(("_fem_native", "_fem_assembly")) or attr == "_integral_weight_cache":
             delattr(target, attr)
     # Give the mesh-generator's named boundary regions a predicate BEFORE the reset, so they are
     # re-derived on the new mesh exactly like a user `.tag()` (see `_capture_geometric_boundary_tags`).
@@ -478,7 +482,11 @@ def _apply_new_mesh(template: Any, new_mesh: Any, *, copy: bool):
     """
     target = _shallow_copy(template) if copy else template
     for attr in list(vars(target)):
-        if attr.startswith("_fem_native") or attr in ("_fem_assembly_cache", "_integral_weight_cache"):
+        # `_fem_assembly_points` / `_fem_assembly_cells` are the assembly-mesh snapshot that
+        # `_cell_region_mask` classifies against. They match neither "_fem_native" nor the explicit
+        # tuple, so they used to SURVIVE the remesh and a per-region coefficient was then built
+        # against the old mesh -- measured 433 mask entries for a 3,712-cell mesh.
+        if attr.startswith(("_fem_native", "_fem_assembly")) or attr == "_integral_weight_cache":
             delattr(target, attr)
     _capture_geometric_boundary_tags(target)
     if hasattr(target, "_reset_custom_tag_state"):

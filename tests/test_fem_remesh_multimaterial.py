@@ -208,3 +208,41 @@ def test_reader_metadata_cell_sets_are_not_treated_as_materials():
     flat = {nm for nms in name_of_ref.values() for nm in nms}
     assert flat == {"steel", "copper"}, f"metadata leaked in as a material: {flat}"
     assert refs.min() >= 1 and len(refs) == n
+
+
+def test_the_region_mask_follows_the_remesh():
+    """A region mask built AFTER a remesh must describe the NEW mesh.
+
+    `_cell_region_mask` classifies against `domain._fem_assembly_points/_fem_assembly_cells` when
+    they are set, preferring them over the domain mesh so the mask lines up with the cell order the
+    kernel vmaps over. Assembly stamps them; the remesh invalidation dropped only attributes
+    starting `_fem_native` plus `_fem_assembly_cache`, so `_fem_assembly_points`/`_fem_assembly_cells`
+    matched neither and survived.
+
+    The result is a coefficient of the wrong LENGTH for the mesh it is about to be integrated over --
+    measured 433 entries against 3,712 cells -- which is the same silent per-cell coefficient
+    corruption the `_shape_regions` priority subtraction exists to prevent.
+    """
+    from jno.utils.solver.fem_utils import _cell_region_mask
+
+    d = _two_material_ball_in_box(size=0.28)
+    u, v = d.fem_symbols(names=("u", "v"))
+    ci = d.variable("interior", split=True)
+    bnd = dict(zip("xyz", d.variable("boundary", split=True)[:3]))
+    k = d.by_region({"ball": 2.0, "block": 1.0})
+    fem = jno.fem(
+        [
+            k * (u.bind(x=ci[0], y=ci[1], z=ci[2]) * v.bind(x=ci[0], y=ci[1], z=ci[2])),
+            u.bind(**bnd) - 0.0,
+        ]
+    )
+    _ = fem.A  # assemble, so the assembly-mesh snapshot is stamped on the domain
+
+    d.refine(np.full(len(d.mesh.points), 0.20))
+    n_cells = len(d.mesh.cells_dict["tetra"])
+    for name in ("ball", "block"):
+        m = np.asarray(_cell_region_mask(d, name))
+        assert m.shape[0] == n_cells, (
+            f"region mask for {name!r} has {m.shape[0]} entries for a {n_cells}-cell mesh -- it was "
+            "built against the pre-remesh mesh"
+        )
