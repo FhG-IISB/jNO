@@ -67,6 +67,9 @@ may change a conductivity, never a shape, so build again for a new one.
 
 from __future__ import annotations
 
+import pathlib
+
+import jax
 import jax.numpy as jnp
 import numpy as np
 import scipy.sparse as sparse
@@ -236,6 +239,105 @@ class PEECSolution:
             out[name] = q[0] if jnp.ndim(self._port) == 0 else q
         return out
 
+    def field(self, points):
+        """Magnetic flux density at ``points``, tesla — ``(n, 3)``, or ``(n_freq, n, 3)`` swept.
+
+        A partial-element method never meshes the air, so the field off the metal is not a solved
+        unknown: it is the Biot-Savart sum over the currents that WERE solved for,
+
+            B(r) = (mu0 / 4 pi) * sum_k I_k * (dl_k x (r - r_k)) / |r - r_k|^3
+
+        evaluated on the same sub-point quadrature the operator uses, so a curved wire is integrated
+        rather than treated as one straight segment. That makes it a READOUT: no second problem, no
+        boundary condition, and differentiable in the currents and in ``points`` alike -- which is
+        what an EMI objective over a keep-out volume needs.
+
+        Free space only. There is no magnetic material in this solver, so a nearby core would change
+        the answer and is not represented; see the scope note on the module.
+
+        Args:
+            points: ``(n, 3)`` positions, in metres. May be traced.
+        """
+        pts = jnp.asarray(points, dtype=float)
+        if pts.ndim != 2 or pts.shape[1] != 3:
+            raise ValueError(
+                f"jno.peec: field() takes (n, 3) positions in metres, got shape {tuple(np.shape(points))}."
+            )
+        f = self._fil
+        src, mom, grp = jnp.asarray(f.pos), jnp.asarray(f.mom), jnp.asarray(f.group)
+        cur = jnp.atleast_2d(self.i)
+
+        # The kernel is singular ON a filament, and the field INSIDE metal is not what this computes
+        # either -- so a probe within a conductor's own cross-section is refused rather than answered.
+        # The scale is that cross-section, not an absolute tolerance: a busbar and a bond wire are
+        # both legal. (An on-AXIS point is not the dangerous case -- a straight filament's field
+        # vanishes there by symmetry; it is being inside and OFF axis that diverges.)
+        rad = np.sqrt(np.asarray(jax.lax.stop_gradient(jnp.asarray(f.area))) / np.pi)
+        if not isinstance(pts, jax.core.Tracer):
+            gap = np.linalg.norm(np.asarray(pts)[:, None, :] - np.asarray(jax.lax.stop_gradient(src))[None, :, :], axis=-1)
+            r_of = np.repeat(rad, np.asarray(np.bincount(np.asarray(f.group), minlength=rad.size)))
+            if np.any(gap < r_of[None, :]):
+                bad = int(np.argmin(gap.min(axis=1)))
+                raise ValueError(
+                    f"jno.peec: field() was asked for a point {tuple(np.asarray(pts)[bad])} lying INSIDE "
+                    "a conductor, where the Biot-Savart kernel is singular. This computes the free-space "
+                    "field the solved currents produce; the field inside the metal is not it. Evaluate "
+                    "off the conductor."
+                )
+
+        def _one(ik):
+            m = mom * ik[grp][:, None]  # the moment already carries dl and the quadrature weight
+            r = pts[:, None, :] - src[None, :, :]
+            inv = jnp.linalg.norm(r, axis=-1) ** -3
+            return (MU0 / (4 * jnp.pi)) * jnp.einsum("psi,ps->pi", jnp.cross(m[None, :, :], r), inv)
+
+        out = jnp.stack([_one(jnp.real(c)) + 1j * _one(jnp.imag(c)) for c in cur])
+        out = jnp.real(out) if not jnp.iscomplexobj(self.i) else out
+        return out if jnp.ndim(self._port) else out[0]
+
+    def export_vtk(self, save_path: str = "./runs/peec.vtk", freq_index: int | None = None):
+        """Write the solved currents to a file a viewer can open — the same verb as
+        :meth:`jno.domain.export_vtk`, and the same job.
+
+        A partial-element network is a set of straight segments, so it exports as one: each filament
+        a ``line`` cell between its two nodes, carrying its current magnitude, its phase, and the
+        current DENSITY (which is what tells a crowded corner from a wide one, since the elements are
+        not all the same size).
+
+        Args:
+            save_path: where to write. The extension picks the format, as meshio's do.
+            freq_index: which point of a swept solve to write. Required when ``freq`` was an array —
+                there is no single current field then, and picking one silently would be a guess.
+        """
+        import meshio
+
+        cur = np.asarray(jnp.atleast_2d(self.i))
+        if cur.shape[0] > 1 and freq_index is None:
+            raise ValueError(
+                f"jno.peec: this solution holds {cur.shape[0]} frequencies, so export_vtk cannot tell "
+                "which frequency to write. Say which: `export_vtk(path, freq_index=0)`."
+            )
+        ik = cur[0 if freq_index is None else int(freq_index)]
+
+        f = self._fil
+        nodes = np.asarray(f.nodes)
+        inc = f.incidence.tocsc()
+        # A filament's two ends are the two nonzeros of its incidence column: +1 leaves, -1 enters.
+        ends = np.zeros((inc.shape[1], 2), dtype=int)
+        for k in range(inc.shape[1]):
+            rows = inc.indices[inc.indptr[k] : inc.indptr[k + 1]]
+            vals = inc.data[inc.indptr[k] : inc.indptr[k + 1]]
+            ends[k] = (rows[np.argmax(vals)], rows[np.argmin(vals)])
+        area = np.asarray(jax.lax.stop_gradient(jnp.asarray(f.area)))
+        data = {
+            "current": [np.abs(ik)],
+            "current_density": [np.abs(ik) / np.maximum(area, 1e-300)],
+            "phase_deg": [np.degrees(np.angle(ik))],
+        }
+        pathlib.Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        meshio.write_points_cells(save_path, nodes, [("line", ends)], cell_data=data)
+        return save_path
+
     def current(self, terminal):
         """Net current injected at ``terminal``, amp."""
         if terminal not in self._terms:
@@ -329,9 +431,16 @@ class PEEC:
             inv = np.empty(len(fpart), dtype=int)
             inv[np.concatenate(sel)] = np.arange(len(fpart))
 
-            def line_resolve(vals, _s=sel, _i=inv, _c=cen, _n=tuple(line_names)):
+            # A wire is one-dimensional, so an anisotropic sigma reaches it as `t . sigma . t` along
+            # its own tangent rather than as a component -- see `resolve_sigma`.
+            _tan = np.asarray(fl.mom)[:: max(1, np.asarray(fl.mom).shape[0] // len(np.asarray(fl.length)))]
+
+            def line_resolve(vals, _s=sel, _i=inv, _c=cen, _n=tuple(line_names), _t=_tan):
                 return jnp.concatenate(
-                    [jnp.asarray(resolve_sigma(v, _c[q], f"conductor {nm!r}")) for v, q, nm in zip(vals, _s, _n)]
+                    [
+                        jnp.asarray(resolve_sigma(v, _c[q], f"conductor {nm!r}", tangent=_t[q]))
+                        for v, q, nm in zip(vals, _s, _n)
+                    ]
                 )[_i]
 
             blocks.append((tuple(line_names), line_resolve))

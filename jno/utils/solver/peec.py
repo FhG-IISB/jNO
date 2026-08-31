@@ -129,7 +129,39 @@ def _field_arity(fn) -> int:
     return 3 if n == 0 or n > 3 else n
 
 
-def resolve_sigma(value, xyz, what: str):
+def _is_anisotropic(value, n: int, what: str) -> bool:
+    """Is this the ``(sx, sy, sz)`` spelling rather than one of the scalar ones?
+
+    A tuple of three, or an array shaped ``(3,)`` or ``(n, 3)``. The one case that cannot be read
+    off the shape is ``(3,)`` on a conductor with exactly three elements, which is either three
+    components or three elements -- so it is refused rather than guessed.
+    """
+    if isinstance(value, (tuple, list)):
+        if len(value) == 3:
+            return True
+        raise ValueError(
+            f"peec: the conductivity attached to {what} is a sequence of {len(value)}. A tuple means "
+            "the ANISOTROPIC spelling `sigma=(sx, sy, sz)` and must have exactly three entries; for "
+            "one value per element pass an array instead."
+        )
+    if _is_field(value):
+        return False
+    shape = np.shape(value)
+    if shape == (n, 3):
+        return True
+    if shape == (3,):
+        if n == 3:
+            raise ValueError(
+                f"peec: the conductivity attached to {what} has shape (3,) and the conductor has "
+                "exactly 3 elements, so this is ambiguous -- three components, or three elements? "
+                "Spell it: `sigma=(sx, sy, sz)` for the anisotropic one, or reshape to (3, 1) and "
+                "broadcast for one value per element."
+            )
+        return True
+    return False
+
+
+def resolve_sigma(value, xyz, what: str, tangent=None):
     """Resolve one conductor's attached conductivity onto ``len(xyz)`` positions.
 
     A conductivity is a design variable as often as it is a material constant, and it arrives in
@@ -150,10 +182,37 @@ def resolve_sigma(value, xyz, what: str):
         xyz: ``(n, 3)`` positions -- cell centres for a lattice, element midpoints for a line.
         what: the conductor's name, for the error messages.
 
+    A fourth spelling makes the material **anisotropic**: ``(sx, sy, sz)``, where each component may
+    itself be any of the three above. The lattice already carries one current direction per bar
+    family, so a component only has to reach the family it belongs to.
+
+    Scope, up front: **diagonal** anisotropy only. The bars are axis-aligned, so an off-diagonal
+    conductivity has nowhere to live in this discretisation. A wire is one-dimensional, so what
+    reaches it is the component along its own tangent, ``t . sigma . t`` -- pass ``tangent``.
+
+    Args:
+        value: the attached conductivity, in any of the four forms above.
+        xyz: ``(n, 3)`` positions -- cell centres for a lattice, element midpoints for a line.
+        what: the conductor's name, for the error messages.
+        tangent: ``(n, 3)`` element directions. Given, an anisotropic value is contracted onto them
+            and a ``(n,)`` vector comes back; absent, the ``(n, 3)`` components are returned and the
+            caller picks per axis family (which is what a lattice does).
+
     Returns:
-        A ``(n,)`` array of conductivities.
+        ``(n,)``, or ``(n, 3)`` for an anisotropic value with no ``tangent``.
     """
     n = int(np.shape(xyz)[0])
+    if _is_anisotropic(value, n, what):
+        cols = [jnp.asarray(resolve_sigma(v, xyz, f"{what} (component {ax})")) for ax, v in zip("xyz", value)]
+        out = jnp.stack(cols, axis=1)
+        if tangent is None:
+            return out
+        # A filament carries one current along its own direction, and for a diagonal sigma the
+        # conductivity along a unit t is `t . sigma . t = sum_i t_i^2 sigma_i`. Transverse components
+        # cannot drive a current in a one-dimensional conductor, and this is what says so.
+        tan = jnp.asarray(tangent, dtype=out.dtype)
+        tan = tan / jnp.maximum(jnp.linalg.norm(tan, axis=1, keepdims=True), 1e-300)
+        return jnp.sum(out * tan**2, axis=1)
     if _is_field(value):
         k = _field_arity(value)
         out = jnp.asarray(value(*[jnp.asarray(xyz)[:, i] for i in range(k)]))
@@ -1580,6 +1639,13 @@ def bar_filaments(shape, size=None, quad: int = 3, sigma=None):
             [jnp.asarray(resolve_sigma(v, nodes[sl], f"conductor {nm!r}")) for v, sl, nm in zip(vals, _sel, _names)]
         )[_inv]
         s0, s1 = cell_sigma[end_a], cell_sigma[end_b]
+        if cell_sigma.ndim == 2:
+            # An anisotropic material: every bar belongs to exactly one axis family, so it takes the
+            # component of that axis from each of its two end cells. This is the whole of the
+            # anisotropic path -- the lattice already knew which direction each bar runs in.
+            ax = jnp.asarray(axis)[:, None]
+            s0 = jnp.take_along_axis(s0, ax, axis=1)[:, 0]
+            s1 = jnp.take_along_axis(s1, ax, axis=1)[:, 0]
         return 2.0 * s0 * s1 / (s0 + s1)
 
     bar_sigma = resolve(sigma) if sigma is not None else None
