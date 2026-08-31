@@ -335,43 +335,19 @@ def _material_refs(domain, n_elems: int, dim: int):
     ``mesh.cells`` block separately while mmg receives the concatenated ``cells_dict`` array, so the
     per-block offset is applied here.
     """
-    mesh = getattr(domain, "mesh", None)
-    cell_sets = getattr(mesh, "cell_sets", None) or {}
-    if not cell_sets:
-        return None, {}
-    want = "tetra" if dim == 3 else ("triangle" if dim == 2 else "line")
-    blocks = list(getattr(mesh, "cells", None) or [])
-    offset, seen = {}, 0
-    for bi, blk in enumerate(blocks):
-        if getattr(blk, "type", None) == want:
-            offset[bi] = seen
-            seen += len(blk.data)
+    from ...domain.mesh_utils import mesh_cell_region_membership
 
-    # `gmsh:bounding_entities` and friends are reader METADATA, not materials: they carry negative
-    # sentinels and would both invent a spurious region and index `refs` from the wrong end.
-    names = sorted(
-        nm
-        for nm, entries in cell_sets.items()
-        if nm not in _RESERVED_CELL_SETS
-        and ":" not in nm
-        and any(arr is not None and len(arr) and bi in offset for bi, arr in enumerate(entries or []))
-    )
+    membership = mesh_cell_region_membership(getattr(domain, "mesh", None), dim)
+    names = sorted(membership)
     if not names:
         return None, {}
-
-    # A gmsh physical group may NEST or OVERLAP another -- a generator commonly emits both the
-    # individual parts and a group spanning them, so a cell belongs to two names at once -- while mmg
-    # carries exactly one integer reference per element. Keying the reference
-    # on the NAME would let the last name written win and silently empty the others, so key it on the
-    # membership COMBINATION instead: cells belonging to the same set of names share a reference, and
-    # every name is recovered on the way out as the union of the references that contain it.
-    member = np.zeros((n_elems, len(names)), dtype=bool)
-    for k, nm in enumerate(names):
-        for bi, arr in enumerate(cell_sets[nm] or []):
-            if arr is None or len(arr) == 0 or bi not in offset:
-                continue
-            idx = np.asarray(arr, dtype=np.int64) + offset[bi]
-            member[idx[(idx >= 0) & (idx < n_elems)], k] = True  # never index from the wrong end
+    member = np.stack([membership[nm] for nm in names], axis=1)
+    if member.shape[0] != n_elems:
+        raise ValueError(
+            f"jno.domain.refine: the mesh's cell regions describe {member.shape[0]} cells but the "
+            f"remesh is operating on {n_elems} -- the region membership and the element array "
+            "disagree about which mesh this is."
+        )
 
     combos, inverse = np.unique(member, axis=0, return_inverse=True)
     if len(combos) > 2048:

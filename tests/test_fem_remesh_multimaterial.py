@@ -155,6 +155,9 @@ def test_a_single_material_mesh_is_unaffected():
 class _FakeMesh:
     def __init__(self, cells, cell_sets):
         self.cells, self.cell_sets = cells, cell_sets
+        # `cells_dict` AGGREGATES same-type blocks, exactly as meshio does; the membership helper
+        # reads it (through `p1_cells_dict`) to size the per-cell axis.
+        self.cells_dict = {"tetra": np.concatenate([b.data for b in cells], axis=0)}
 
 
 class _Blk:

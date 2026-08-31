@@ -21,12 +21,15 @@ from ..utils.dtypes import default_np_float_dtype
 from ..utils.logger import get_logger
 from .boundary_region import BoundaryRegion
 from .geometries import Geometries
+from .mesh_utils import VOLUME_BLOCKS_BY_DIM
 from .mesh_utils import base_cell_type as _base_cell_type
 from .meshio_mixin import MeshIOMixin
 from .simplex_pool import SimplexPool
 
 #: The space-filling cell blocks of each dimension. A mesh is expected to carry exactly one.
-_VOLUME_BLOCKS_BY_DIM = {1: ("line",), 2: ("triangle", "quad"), 3: ("tetra", "hexahedron")}
+#: Re-exported from :mod:`jno.domain.mesh_utils`, which is where the canonical list lives now that
+#: the region-membership helper needs it too. One definition, so the two cannot drift.
+_VOLUME_BLOCKS_BY_DIM = VOLUME_BLOCKS_BY_DIM
 
 
 def _refuse_mixed_cells(mesh, dim: int) -> None:
