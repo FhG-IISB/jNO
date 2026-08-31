@@ -733,18 +733,45 @@ class _AMS(_Spec):
             except Exception:  # noqa: BLE001 — a tracer / a parameter-incomplete operator: fall through,
                 pass  # and materialize either assembles from the concrete ctx or asks for an explicit .build
 
-    def build(self, fem) -> "_AMS":
+    def build(self, fem, *, field=None) -> "_AMS":
         """Eager host setup from a **concrete** ``fem`` — required to use AMS inside a **traced** solve
         (``jit`` / ``vmap`` / a **parametric-inverse** design loop), where the host scipy assembly of the
         nodal auxiliaries cannot run under the trace. It freezes the auxiliary operators once (from the
         operator at the current parameters); the frozen preconditioner stays valid while ``A(θ)`` drifts
         (speed degrades gracefully, correctness never), so the solve — **and its gradient**, which flows
         through the traced operator by implicit differentiation, not through the preconditioner — runs
-        differentiably. Returns ``self`` (chainable): ``fem.solve(precond=jno.precond.ams().build(fem))``."""
+        differentiably. Returns ``self`` (chainable): ``fem.solve(precond=jno.precond.ams().build(fem))``.
+
+        On a **mixed** system (an N1E x Lagrange A-V pair, say) the concrete operator covers every
+        field, so ``field=`` names the H(curl) trial symbol whose block AMS preconditions:
+        ``ams().build(fem, field=u)``. Without it the operator and the discrete gradient disagree and
+        this raises rather than failing inside the assembly."""
         self._transfer(fem.domain)
         from .utils.solver.solver_api import LinearOperator, PrecondContext
 
-        self._frozen = self._assemble_aux(PrecondContext(LinearOperator(_fem_concrete_operator(fem)), fem))
+        ctx = PrecondContext(LinearOperator(_fem_concrete_operator(fem)), fem)
+        # On a MIXED system the concrete operator is the whole thing -- (n_edges + n_verts) for an
+        # N1E x Lagrange pair -- while AMS's discrete gradient G is (n_edges, n_verts). Assembling the
+        # auxiliaries against it produced a bare `matmul: dimension mismatch` from inside the assembly,
+        # naming nothing the caller could act on, and that raise is exactly why `prepare`'s auto-freeze
+        # is a no-op inside a block composition. AMS cannot know which block is its own, so it is told.
+        n_edges = self._G.shape[0]
+        if int(ctx.A.shape[0]) != n_edges:
+            if field is None:
+                raise ValueError(
+                    f"jno.precond.ams().build: this operator is {int(ctx.A.shape[0])} x "
+                    f"{int(ctx.A.shape[0])} but the edge (H(curl)) space has {n_edges} DOFs, so it is a "
+                    "MIXED system and AMS cannot tell which block is its own. Name it: "
+                    "ams().build(fem, field=<the N1E trial symbol>)."
+                )
+            ctx = PrecondContext(ctx.sub(field), fem)
+            if int(ctx.A.shape[0]) != n_edges:
+                raise ValueError(
+                    f"jno.precond.ams().build: the block for the given field is {int(ctx.A.shape[0])} "
+                    f"DOFs but the edge space has {n_edges}. `field=` must name the H(curl) (N1E) "
+                    "trial symbol, not another field of the system."
+                )
+        self._frozen = self._assemble_aux(ctx)
         return self
 
     def _transfer(self, domain):
@@ -1155,6 +1182,25 @@ class _Cached(_Spec):
         self._applier = None
         self._key = _MISS
         self._count = 0  # materializations since construction, for the int-k policy
+
+    # `_Cached` wraps another spec's SETUP, not its nature. These two say what the inner spec IS --
+    # `complex_native` selects whether the solve runs on the genuinely complex n-sized operator or on
+    # the fused real-equivalent 2n block, and `complex_ok` whether a spec can be applied to a complex
+    # operator without reformulation -- so hiding them changes the ANSWER, not the speed. Left
+    # undeclared, `ams().cached()` reported False and quietly took the 2n path, where the block slices
+    # cover the wrong half of the operator and AMS is handed the skew-dominated block its own docs
+    # record diverging to 1e+20 on. That made `.cached()` and complex-native mutually exclusive, which
+    # is backwards: a complex block preconditioner is the one whose setup most wants reusing.
+    #
+    # Forwarded explicitly rather than through `__getattr__`, so only these descriptive flags pass and
+    # the wrapper keeps its own behaviour (`traceable`, `key`, `prepare`, `materialize`).
+    @property
+    def complex_native(self):
+        return bool(getattr(self.spec, "complex_native", False))
+
+    @property
+    def complex_ok(self):
+        return bool(getattr(self.spec, "complex_ok", False))
 
     @property
     def traceable(self):
