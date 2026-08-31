@@ -2303,7 +2303,7 @@ def _vertex_view(sol: np.ndarray, fem: Any, *, allow_vector: bool = False) -> np
     vertex view -- a traced criterion is assembled on the full vector, while the estimator wants the
     vertex one -- gets them from a single solve instead of solving the problem twice per round.
     """
-    from jno._fem import _infer_vec  # local import: fem_adapt is loaded lazily by the domain
+    from jno._fem import _infer_vec, _trial_spaces  # local: fem_adapt is loaded lazily by the domain
 
     sol = np.asarray(sol).reshape(-1)
     n_vert = int(np.asarray(fem.domain.mesh.points).shape[0])
@@ -2318,7 +2318,23 @@ def _vertex_view(sol: np.ndarray, fem: Any, *, allow_vector: bool = False) -> np
     if sol.shape[0] == n_vert:
         return sol
     if sol.shape[0] > n_vert:
-        return sol[:n_vert]  # higher-order scalar: the first n_vert DOFs are the vertex (nodal) values
+        # Only higher-order LAGRANGE keeps its P1 vertices as ids 0..n_vert-1 (`_promote_to_degree`).
+        # Every other scalar space jNO has orders its DOFs differently -- Hermite carries value and
+        # both derivatives per vertex with the VALUE at 3*v, Argyris six per vertex, P0 one per CELL
+        # and no vertex value at all -- so slicing the first n_vert entries returns unrelated numbers
+        # of the right length and finite value, and the estimator then refines on them. Guard on the
+        # SPACE, not on the DOF count.
+        _spaces = _trial_spaces(fem._constraints) if getattr(fem, "_constraints", None) else {"Lagrange"}
+        _bad = sorted(sp for sp in _spaces if sp != "Lagrange")
+        if _bad:
+            raise NotImplementedError(
+                f"the ZZ / Hessian estimator reads VERTEX values, and the {', '.join(_bad)} space does "
+                f"not store them as its first {n_vert} DOFs (only higher-order Lagrange does). Adapting "
+                "on this field would refine on a reinterpretation of unrelated DOFs. Drive the "
+                "refinement from a Lagrange readout of the solution instead -- FEM.solve(adapt=...) "
+                "takes a `criterion` expression."
+            )
+        return sol[:n_vert]  # higher-order Lagrange: the first n_vert DOFs are the vertex values
     raise NotImplementedError(f"got {sol.shape[0]} DOFs for {n_vert} vertices (fewer than one per vertex).")
 
 
