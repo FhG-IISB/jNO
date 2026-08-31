@@ -921,7 +921,7 @@ def solve_network(
     # The sparsity STRUCTURE is never traced, but a VALUE may be: a device impedance that depends on
     # the solved state is what an electro-thermal fixed point re-impresses every pass (a SiC die's
     # R_ds(on) rises ~0.5 %/K). So the values go through jnp and only the pattern stays numpy.
-    cval = jnp.concatenate([jnp.asarray(v, dtype=complex).reshape(-1) for v in vv])
+    cval = _fuse_triplets(vv)
     b = jnp.asarray(np.concatenate(rhs))
     _refuse_disconnected(Asp0, idx, sources, grounds, currents, devices)
 
@@ -1211,6 +1211,41 @@ def _check_unresolved_thickness(fil, sigma, omega, mu0):
     logging.getLogger(__name__).warning(
         "%s The resistance is understated by that much of the model; the inductance is unaffected.", msg
     )
+
+
+def _fuse_triplets(parts):
+    """Concatenate a mixed numpy/jax list with one jax op per RUN of concrete pieces, not per piece.
+
+    ``vv`` carries one entry per constraint ROW, and current balance writes a row per free node --
+    thousands on any real lattice. Sending each through ``jnp.asarray(v).reshape(-1)`` is two eager
+    dispatches apiece, and on a GPU two host-to-device transfers as well.
+
+    Measured at 8,640 nodes, three warm solves: 26,337 ``jnp.asarray`` calls, 52,887 lax binds and
+    28,326 eager primitive dispatches -- about 90 % of the solve, spent assembling a vector rather
+    than solving with it. It is also the reason the GPU was no faster than the CPU (0.801 s against
+    0.781 s): Python dispatch does not care which device it is dispatching to, and the FFT apply it
+    was hiding is 3.2x quicker there.
+
+    Almost every row is concrete -- only a traced device impedance or a placement weight is not --
+    so the concrete runs are fused in numpy and only the genuinely traced pieces stay jax. A network
+    with no traced values reduces to a single ``jnp.asarray`` of one numpy array.
+    """
+    out, buf = [], []
+    for piece in parts:
+        # numpy ONLY: a concrete jax array would have to come back off the device to join a numpy
+        # concatenate, which is the transfer this exists to avoid.
+        if isinstance(piece, np.ndarray):
+            buf.append(np.asarray(piece, dtype=complex).reshape(-1))
+            continue
+        if buf:
+            out.append(jnp.asarray(np.concatenate(buf)))
+            buf = []
+        out.append(jnp.asarray(piece, dtype=complex).reshape(-1))
+    if buf:
+        out.append(jnp.asarray(np.concatenate(buf)))
+    if not out:
+        return jnp.zeros(0, dtype=complex)
+    return out[0] if len(out) == 1 else jnp.concatenate(out)
 
 
 def _refuse_disconnected(A, idx, sources, grounds, currents, devices=()):
