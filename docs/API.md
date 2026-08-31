@@ -372,25 +372,39 @@ the right choice depends on how many times you solve, which only you know.
 Past a few hundred thousand DOFs, what stops a GPU solve is rarely the matrix. Three things bite
 first, and only the third is about size at all.
 
-**Assemble on the CPU, solve on the GPU.** jNO's element loop allocates temporaries far larger than
-the matrix it produces, so assembling on the device runs out of memory at roughly a third of the
-size the finished operator would happily occupy. Build the operator on the host and move it over:
+**Assembly runs on the host, automatically.** jNO's element loop allocates temporaries far larger
+than the matrix it produces, so assembling on the device runs out of memory at roughly a third of the
+size the finished operator would happily occupy. `jno.fem(...)` therefore builds on the CPU whenever
+a GPU is the default backend, and the solve moves the operator across:
 
 ```python
-with jax.default_device(jax.devices("cpu")[0]):
-    fem.operator                             # forces assembly here, and caches it
-u = fem.solve(linear=jno.solve.fgmres(), precond=M)   # moves the operator; solves on the GPU
+fem = jno.fem([...])                     # assembled on the host, whatever the default backend
+u = fem.solve(linear=jno.solve.fgmres(), precond=M)   # solved on the GPU
 ```
 
-Touching `fem.operator` inside the block is what pins the assembly to the host — the result is cached,
-so `solve` reuses it rather than rebuilding on the device. Measured on a 9,970-DOF Poisson: **0 MB of
-GPU memory during assembly**, against 104 MB for the same assembly on the device — and the solve
-still returns its solution on `cuda:0`, to the last digit.
+Nothing is given up for this. `jax.device_put` across backends is traceable and `jax.grad`
+differentiates through it, so topology optimisation, neural coefficients and trainable coordinates
+all still work across the split. Measured on a 9,970-DOF Poisson, assembly now costs **8 bytes** of
+device memory — flat from n=242 to n=3,797 — against 104 MB before. Budget roughly **6 GB of host RAM
+per million DOFs**; host memory, not the card, becomes the binding constraint.
 
-`jax.device_put` across backends is traceable and `jax.grad` differentiates through it, so this does
-not cost you the differentiable path — topology optimisation, neural coefficients and trainable
-coordinates all still work across the split. Budget roughly **6 GB of host RAM per million DOFs**;
-host memory, not the card, becomes the binding constraint.
+It is not slower for a one-shot build, either — the host wins on every first call, because it also
+compiles faster:
+
+| | assemble on host | on device |
+| --- | --- | --- |
+| Poisson, 43k DOFs | **4.02 s** | 4.98 s |
+| mixed N1E x Lagrange, 43k DOFs | **9.28 s** | 11.00 s |
+
+The device does win on *repeated* assembly of a heavy form once compilation has amortised (5.60 s on
+the host against 3.69 s on the device, mixed N1E at 43k DOFs), which matters in a Newton or
+optimisation loop that reassembles many times. There is no jNO argument for this — `jax.default_device`
+is JAX's own way of saying where work goes, and an explicit one wins:
+
+```python
+with jax.default_device(jax.devices("gpu")[0]):
+    fem = jno.fem([...])                 # assemble on the device instead
+```
 
 **Set the async allocator.** XLA's default BFC allocator fragments and will refuse an allocation
 about a gigabyte below the card's actual free memory — on a GPU shared with a desktop this is the

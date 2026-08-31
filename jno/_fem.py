@@ -26,6 +26,7 @@ matrix-free defaults (BiCGStab / Newton–Krylov / backward-Euler) you can overr
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import inspect
 import warnings
@@ -3794,6 +3795,32 @@ def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) ->
 # ---------------------------------------------------------------------------
 # the driver
 # ---------------------------------------------------------------------------
+def _host_assembly_scope():
+    """Assembly runs on the HOST unless the caller has said otherwise.
+
+    The element loop allocates temporaries far larger than the matrix it produces, so on a GPU it
+    exhausts the card at roughly a third of the size the finished operator occupies happily -- a
+    527k-DOF mixed N1E x Lagrange operator is 0.77 GB and fits easily, while assembling it on an 8 GB
+    card dies. Host RAM is the plentiful resource (~6 GB per million DOFs); the device's job is the
+    solve, and ``jax.device_put`` across backends is traceable with ``jax.grad`` differentiating
+    through it, so nothing about the split costs differentiability.
+
+    It is also no slower for a one-shot build: assembling a 43k-DOF Poisson takes 4.02 s on the host
+    against 4.98 s on the device, and the mixed N1E form 9.28 s against 11.00 s. The device wins only
+    on REPEATED assembly of a heavy form once compilation has amortised (5.60 s vs 3.69 s), which is
+    what the override is for -- an out-of-memory failure is fatal, a slower Newton loop is not.
+
+    Deliberately not a ``jno.fem`` argument. ``jax.default_device`` is JAX's own way of saying where
+    work goes, so an explicit one wins and this default applies only when none was expressed.
+    """
+    if jax.config.jax_default_device is not None:
+        return contextlib.nullcontext()  # the caller expressed a preference; it wins
+    if jax.default_backend() == "cpu":
+        return contextlib.nullcontext()  # nothing to move away from
+    hosts = jax.devices("cpu")
+    return jax.default_device(hosts[0]) if hosts else contextlib.nullcontext()
+
+
 def fem(
     constraints: Any,
     *,
@@ -3816,13 +3843,14 @@ def fem(
     _fn._CHUNK_OVERRIDE[0] = _fn.normalize_chunk(chunk)
     _fn._CHUNK_CONSUMED[0] = False
     try:
-        out = _fem_impl(
-            constraints,
-            quad_degree=quad_degree,
-            element_type=element_type,
-            vec=vec,
-            _dd_overlap=_dd_overlap,
-        )
+        with _host_assembly_scope():
+            out = _fem_impl(
+                constraints,
+                quad_degree=quad_degree,
+                element_type=element_type,
+                vec=vec,
+                _dd_overlap=_dd_overlap,
+            )
         if chunk is not None and not _fn._CHUNK_CONSUMED[0]:
             # Refuse rather than ignore: the 1-D and non-nodal assemblers have their own element
             # loops and none of them chunk, so an explicit request there would quietly do nothing.
