@@ -1360,6 +1360,33 @@ def _refuse_disconnected(A, idx, sources, grounds, currents, devices=()):
     # A is nodes x filaments with two entries a column -- a filament's two ends -- so `A @ A.T` has
     # an entry wherever one filament touches two nodes, which is exactly the union the loop did.
     g = (A @ A.T).tocoo()
+
+    # Before the terminal ties are added, so it sees the METAL as the geometry left it: a tag is a
+    # function of position, so `x < 3*mm` selects that column of the WHOLE model -- every layer of a
+    # stack, not only the one the pad sits on. Wiring a port into a ground plane that way is silent
+    # and gives plausible wrong answers: on a real DBC module a DC+ tag with no z filter returned
+    # 13.6 nH and 621 uOhm where the same model filtered to the trace layer gave 20.8 nH and
+    # 2180 uOhm, against a 21.7 nH reference.
+    #
+    # A warning, not a refusal: two pieces of metal that a bond wire joins later is a legitimate
+    # model, and so is a pad deliberately shorting two conductors.
+    _n_metal, _metal = connected_components(
+        sp.coo_matrix((np.ones(g.row.size, dtype=np.int8), (g.row, g.col)), shape=(nn, nn)), directed=False
+    )
+    if _n_metal > 1:
+        for _t, _ids in idx.items():
+            _ids = np.asarray(_ids, dtype=int)
+            _spans = sorted(set(_metal[_ids].tolist()))
+            if len(_spans) > 1:
+                _warn_once(
+                    f"peec: terminal {_t!r} covers {len(_ids)} nodes lying in {len(_spans)} pieces of "
+                    "metal that are not connected to each other, so it SHORTS them. That is usually a "
+                    "coordinate tag with no z filter picking up a second layer -- a ground plane under "
+                    "a trace, say -- which wires the port into it and quietly changes both the "
+                    "resistance and the loop inductance. If the short is deliberate, ignore this; "
+                    "otherwise restrict the tag in z."
+                )
+
     rows, cols = [g.row], [g.col]
     for ids in idx.values():  # a terminal is one electrical point
         ids = np.asarray(ids, dtype=int)
