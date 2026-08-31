@@ -367,6 +367,59 @@ Newton loop — where the setup amortises. For a single one-shot solve below ~10
 wins on wall clock: you would pay 419 ms of setup to save 64 ms. This is why AMG is not the default;
 the right choice depends on how many times you solve, which only you know.
 
+### Large systems on a GPU
+
+Past a few hundred thousand DOFs, what stops a GPU solve is rarely the matrix. Three things bite
+first, and only the third is about size at all.
+
+**Assemble on the CPU, solve on the GPU.** jNO's element loop allocates temporaries far larger than
+the matrix it produces, so assembling on the device runs out of memory at roughly a third of the
+size the finished operator would happily occupy. Build the operator on the host and move it over:
+
+```python
+with jax.default_device(jax.devices("cpu")[0]):
+    fem.operator                             # forces assembly here, and caches it
+u = fem.solve(linear=jno.solve.fgmres(), precond=M)   # moves the operator; solves on the GPU
+```
+
+Touching `fem.operator` inside the block is what pins the assembly to the host — the result is cached,
+so `solve` reuses it rather than rebuilding on the device. Measured on a 9,970-DOF Poisson: **0 MB of
+GPU memory during assembly**, against 104 MB for the same assembly on the device — and the solve
+still returns its solution on `cuda:0`, to the last digit.
+
+`jax.device_put` across backends is traceable and `jax.grad` differentiates through it, so this does
+not cost you the differentiable path — topology optimisation, neural coefficients and trainable
+coordinates all still work across the split. Budget roughly **6 GB of host RAM per million DOFs**;
+host memory, not the card, becomes the binding constraint.
+
+**Set the async allocator.** XLA's default BFC allocator fragments and will refuse an allocation
+about a gigabyte below the card's actual free memory — on a GPU shared with a desktop this is the
+difference between running and not:
+
+```
+XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async
+```
+
+A 2.70 GB operator that BFC rejected ran without complaint under `cuda_async`.
+
+**Sizing.** A BCOO operator costs **16 bytes per nonzero** in `float64` (an 8-byte value plus two
+`int32` indices), and peak device memory during a solve is about **1.3x** that, the extra being SpMV
+scratch. Measured on an RTX 3070 (7.81 GiB usable, ~3 GB held by a desktop), on the fused real
+`2n` block of a complex mixed N1E x Lagrange system at ~50 nonzeros per row:
+
+| DOFs | nonzeros | operator | peak | SpMV | effective |
+| --- | --- | --- | --- | --- | --- |
+| 1,215,312 | 60.3 M | 0.90 GB | 1.24 GB | 7.9 ms | 114 GB/s |
+| 2,216,184 | 113.3 M | 1.69 GB | 2.22 GB | 15.0 ms | 113 GB/s |
+
+Bandwidth holds flat across sizes, so a Krylov solve costs about *iterations x SpMV*: budget from the
+iteration count, not from the DOF count.
+
+**`float32` is not a lever.** The same 60.3 M-nonzero operator takes **8.05 ms in `float64` and
+9.09 ms in `float32`** — half the value bytes, and slightly slower. Indices stay `int32` either way
+and the gather of `x` dominates, so halving precision buys about a quarter of the memory and none of
+the time. Reach for a coarser mesh or a better preconditioner instead.
+
 **Preconditioners** (`jno.precond`, for the iterative solvers): `jacobi`, `chebyshev`,
 `nystrom` (randomized low-rank — the rung between `jacobi` and multigrid),
 `amg` (algebraic multigrid), `gmg` (geometric multigrid — a structured-grid V-cycle),
