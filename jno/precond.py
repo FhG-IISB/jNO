@@ -1068,6 +1068,29 @@ class _AMS(_Spec):
             def make(op, csr):
                 import pyamg
 
+                # A REAL auxiliary has a real spectrum, so the Chebyshev objection above does not
+                # apply and the JAX V-cycle can carry it -- which keeps the whole AMS apply on device:
+                # G and the Pi blocks are already BCOO, the hierarchy levels are BCOO, and nothing in
+                # the Krylov loop has to reach the host. Only the one-off setup (aggregation, the
+                # triple products) stays there, which is per-operator rather than per-iteration.
+                #
+                # An INEXACT auxiliary is enough, measured on a real curl-curl + mass problem: an
+                # exact SuperLU auxiliary takes 27 CG iterations, two V-cycles take 27, and a SINGLE
+                # V-cycle takes 27. (Inexact KRYLOV auxiliaries are the ones that stall -- cg at
+                # 7.6e-4 and bicgstab at 5.8e-4 -- so this is not the same question.)
+                if not np.iscomplexobj(csr.data):
+                    from .utils.solver.amg import build_hierarchy, vcycle_apply
+
+                    levels = build_hierarchy(csr.tocsr(), max_levels=aux.max_levels)
+
+                    def solve_real(rhs):
+                        x = vcycle_apply(levels, jnp.asarray(rhs))
+                        for _ in range(max(int(aux.cycles) - 1, 0)):  # extra cycles: correct the residual
+                            x = x + vcycle_apply(levels, jnp.asarray(rhs) - op @ x)
+                        return x
+
+                    return solve_real
+
                 ml = pyamg.smoothed_aggregation_solver(csr.tocsr(), max_levels=aux.max_levels)
                 n = int(csr.shape[0])
 

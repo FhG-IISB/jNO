@@ -55,10 +55,15 @@ def _require_pyamg():
 
 
 def _to_scipy_csr(A):
-    """Concrete BCOO / dense -> scipy CSR for the pyamg setup."""
+    """Concrete scipy sparse / BCOO / dense -> scipy CSR for the pyamg setup."""
     import scipy.sparse as sp
 
-    if hasattr(A, "todense") and hasattr(A, "indices"):  # BCOO
+    # scipy FIRST: a scipy CSR also has `.todense` and `.indices` (its 1-D column array), so the
+    # duck-typed BCOO test below matches it and then `idx[:, 0]` raises "too many indices". Already
+    # being the target type is not a case to fall through on.
+    if sp.issparse(A):
+        return A.tocsr()
+    if hasattr(A, "todense") and hasattr(A, "indices"):  # BCOO: 2-D (row, col) index array
         data = np.asarray(A.data)
         idx = np.asarray(A.indices)
         return sp.coo_matrix((data, (idx[:, 0], idx[:, 1])), shape=A.shape).tocsr()

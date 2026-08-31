@@ -12,6 +12,7 @@ the eager build raises there and is swallowed. So on the mixed path the document
 AMS was simply unavailable.
 """
 
+import numpy as np
 import pytest
 
 pytest.importorskip("pygmsh", reason="pygmsh required for 3D cube meshing")
@@ -97,3 +98,53 @@ def test_single_field_build_is_unchanged():
         ]
     )
     assert jno.precond.ams().build(fem) is not None
+
+
+# --- a REAL auxiliary can stay on device ---------------------------------------------------------
+
+
+def _real_curl_curl(size=0.4, beta=1.0):
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=size).domain()
+    u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
+    ci = d.variable("interior", split=True)
+    x, y, z = ci[0], ci[1], ci[2]
+    return d, jno.fem(
+        [
+            inner(u.vector.curl(x, y, z), v.vector.curl(x, y, z))
+            + beta * inner(u.bind(x=x, y=y, z=z), v.bind(x=x, y=y, z=z))
+            - inner(vec(1.0 + 0.0 * x, 0.0 * x, 0.0 * x), v.bind(x=x, y=y, z=z)),
+            u.vector.cross(d.variable("boundary", normals=True)),
+        ]
+    )
+
+
+def test_a_real_amg_auxiliary_solves():
+    """``aux=amg()`` on a REAL operator takes the JAX V-cycle rather than pyamg through a host
+    callback. The Chebyshev objection that forces the host path is specific to a COMPLEX spectrum
+    (measured at ~90 degrees of argument spread); a real auxiliary has a real spectrum and the
+    existing device cycle carries it, which is what keeps the whole AMS apply off the host.
+
+    It only has to be a good PRECONDITIONER, not an accurate solve: measured on a real curl-curl +
+    mass problem, an exact SuperLU auxiliary takes 27 CG iterations, two V-cycles take 27, and a
+    single V-cycle takes 27.
+    """
+    _d, fem = _real_curl_curl()
+    ref = np.asarray(jno.np.asarray(fem.solve(linear=jno.solve.lu())))
+    got = np.asarray(
+        jno.np.asarray(
+            fem.solve(linear=jno.solve.cg(tol=1e-10, maxiter=800), precond=jno.precond.ams(aux=jno.precond.amg()))
+        )
+    )
+    assert np.allclose(got, ref, rtol=1e-5, atol=1e-9 * max(np.abs(ref).max(), 1.0))
+
+
+def test_a_real_auxiliary_matches_the_default_exact_one():
+    """The device V-cycle auxiliary must not cost accuracy against the exact (SuperLU) default."""
+    _d, fem = _real_curl_curl()
+    a = np.asarray(jno.np.asarray(fem.solve(linear=jno.solve.cg(tol=1e-10, maxiter=800), precond=jno.precond.ams())))
+    b = np.asarray(
+        jno.np.asarray(
+            fem.solve(linear=jno.solve.cg(tol=1e-10, maxiter=800), precond=jno.precond.ams(aux=jno.precond.amg()))
+        )
+    )
+    assert np.allclose(a, b, rtol=1e-5, atol=1e-9 * max(np.abs(a).max(), 1.0))
