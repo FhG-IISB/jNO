@@ -1699,6 +1699,16 @@ def hessian_metric(
     Reference: Alauzet & Loseille, *Metric-based anisotropic mesh adaptation* (2010).
     """
     dim = int(domain.dimension)
+    if np.iscomplexobj(np.asarray(u_vertex)):
+        # `recover_hessian` keeps the complex dtype, giving a complex SYMMETRIC H -- which is not
+        # Hermitian, so the `eigh` below would read one triangle, conjugate it, and return the
+        # spectrum of a DIFFERENT matrix without complaining. Reduce to a real field first (the
+        # adaptive driver uses |u|); refusing here keeps a direct caller from getting silent numbers.
+        raise NotImplementedError(
+            "hessian_metric: the driving field is complex. The Hessian of a complex field is complex "
+            "symmetric, not Hermitian, so its eigendecomposition here would be silently wrong. Pass a "
+            "real field -- np.abs(u) is what FEM.solve(adapt=...) uses."
+        )
     H = recover_hessian(domain, u_vertex)  # (n_vert, dim, dim)
     evals, evecs = np.linalg.eigh(H)  # ascending eigenvalues, orthonormal eigenvectors
     lam = np.abs(evals)  # |H|: interpolation error ~ |curvature|
@@ -2400,10 +2410,16 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
             refine_domain(d, marked, copy=False)
         elif spec.anisotropic:
             if np.iscomplexobj(u):
-                raise NotImplementedError(
-                    "anisotropic (Hessian-metric) adaptation is real-only; use isotropic ZZ "
-                    "(AdaptSpec(anisotropic=False)) for a complex field."
-                )
+                # The metric is a SCALAR estimator, so a complex solution is reduced to |u| here --
+                # the same modulus the isotropic ZZ indicator and the transient driver already use.
+                # It has to happen before `hessian_metric`: `recover_hessian` preserves the complex
+                # dtype and the resulting H is complex SYMMETRIC but not Hermitian, which `eigh`
+                # would silently diagonalise as a different matrix.
+                #
+                # |u| tracks magnitude features. A feature carried purely in the PHASE of an
+                # otherwise flat-modulus field is invisible to it; metric intersection of Re and Im
+                # is the fuller answer (see `hessian_metric`'s reference) and is not wired.
+                u = np.abs(u)
             h_typ = _mean_edge_length(d)
             hmin = spec.hmin if spec.hmin is not None else h_typ / 50.0
             hmax = spec.hmax if spec.hmax is not None else h_typ * 2.0
