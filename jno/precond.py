@@ -125,8 +125,15 @@ class _RealEquivalent(_Spec):
         self.inner = inner
 
     def prepare(self, fem):
-        if hasattr(self.inner, "prepare"):
-            self.inner.prepare(fem)
+        # Deliberately does NOT forward to the inner spec. `prepare` is where a spec may eagerly
+        # freeze itself against `fem`'s own operator -- and this spec exists precisely because that
+        # operator is the WRONG one for the inner: the inner is handed K + M, assembled below. AMS
+        # froze complex auxiliaries here and then used them against a real K + M, which still
+        # converged (a preconditioner need not be exact) while quietly preconditioning the wrong
+        # matrix and casting complex aux solutions down to the real right-hand side -- 960
+        # "discards the imaginary part" warnings on one solve. The inner materialises from K + M
+        # instead, which is the operator it will actually be applied to.
+        return None
 
     def materialize(self, ctx: PrecondContext):
         from .utils.solver.solver_api import LinearOperator, _slice_bcoo, materialize_precond

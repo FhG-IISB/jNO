@@ -107,3 +107,30 @@ def test_an_odd_sized_operator_is_refused():
     op = LinearOperator(jsp.BCOO.fromdense(jnp.eye(7)))
     with pytest.raises(ValueError, match="EVEN"):
         _RealEquivalent(jno.precond.jacobi()).materialize(PrecondContext(op, None))
+
+
+def test_the_inner_is_built_from_K_plus_M_not_from_the_complex_operator():
+    """`prepare` must NOT be forwarded to the inner spec.
+
+    `prepare` is where a spec may eagerly freeze itself against the FEM's own operator -- and that is
+    the wrong operator here by construction, because this spec exists to hand the inner a real
+    ``K + M``. Forwarding it made AMS freeze COMPLEX auxiliaries and then apply them to a real
+    matrix: still convergent, since a preconditioner need not be exact, but preconditioning the wrong
+    operator and casting each complex auxiliary solution down to the real right-hand side -- 960
+    "discards the imaginary part" warnings in one solve.
+
+    Zero such warnings is the observable, and it is also what keeps the auxiliaries REAL, which is
+    what lets them run on device instead of through a host callback.
+    """
+    import warnings
+
+    _d, fem = _complex_eddy()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        x = fem.solve(
+            linear=jno.solve.fgmres(tol=1e-9, restart=120, maxiter=800),
+            precond=jno.precond.real_equivalent(jno.precond.ams(aux=jno.precond.amg())),
+        )
+        n_cast = sum("imaginary part" in str(m.message) for m in caught)
+    assert n_cast == 0, f"{n_cast} complex->real casts: the inner was built from the wrong operator"
+    assert _residual(fem, np.asarray(jno.np.asarray(x))) < 1e-6
