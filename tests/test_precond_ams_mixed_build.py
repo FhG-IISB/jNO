@@ -148,3 +148,29 @@ def test_a_real_auxiliary_matches_the_default_exact_one():
         )
     )
     assert np.allclose(a, b, rtol=1e-5, atol=1e-9 * max(np.abs(a).max(), 1.0))
+
+
+def test_unbuilt_ams_on_a_mixed_operator_names_the_problem():
+    """``real_equivalent(ams())`` on a MIXED system must say what is wrong, not die in a matmul.
+
+    ``build()`` already guards this, but an UNBUILT ``ams()`` reaches ``materialize`` instead, where
+    ``self._G`` is edge-sized and the operator it is handed is the whole mixed block. On the real A-V
+    transformer that surfaced as::
+
+        ValueError: matmul: dimension mismatch with signature (n,k=89920),(k=103385,m)->(n,m)
+
+    89,920 edges against 89,920 + 13,465 edge+node DOFs -- arithmetic the caller has to reverse-engineer
+    to discover that AMS needed to be told which block is its own. The composition that does work is
+    ``real_equivalent(triangular((u, ams()), (p, jacobi())))``, so the message names it.
+    """
+    d, u, p, fem = _av()
+    with pytest.raises(ValueError) as ei:
+        fem.solve(
+            linear=jno.solve.fgmres(tol=1e-8, maxiter=20),
+            precond=jno.precond.real_equivalent(jno.precond.ams()),
+        )
+    msg = str(ei.value)
+    assert "matmul" not in msg, f"still the raw matmul error: {msg}"
+    assert "ams" in msg.lower()
+    assert "triangular" in msg, "must name the composition that works on a mixed system"
+    assert "field=" in msg, "must name the other way out -- telling AMS which block is its own"

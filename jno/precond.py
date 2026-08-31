@@ -911,6 +911,22 @@ class _AMS(_Spec):
                 )
             self._transfer(ctx.fem.domain)
 
+        # `build()` guards this too, but an UNBUILT ams() never goes through it -- which is exactly what
+        # `real_equivalent(ams())` does. Checked HERE, before anything multiplies G against the operator:
+        # otherwise the mismatch surfaces far downstream as a bare `matmul: dimension mismatch with
+        # signature (n,k=89920),(k=103385,m)`, leaving the caller to work out that 103385 - 89920 is the
+        # Lagrange block and that AMS was never told which block is its own.
+        _ne = int(self._G.shape[0])
+        if int(ctx.A.shape[0]) != _ne:
+            raise ValueError(
+                f"jno.precond.ams: this operator is {int(ctx.A.shape[0])} x {int(ctx.A.shape[0])} but "
+                f"the edge (H(curl)) space has {_ne} DOFs, so it is a MIXED system and AMS cannot tell "
+                "which block is its own. Put it in a block preconditioner that names the field -- "
+                "jno.precond.triangular((u, jno.precond.ams()), (p, jno.precond.jacobi())) -- or build it "
+                "against the block directly with ams().build(fem, field=<the N1E trial symbol>). Both "
+                "compose inside jno.precond.real_equivalent(...)."
+            )
+
         A = ctx.A.bcoo if ctx.A.bcoo is not None else ctx.A.dense()
 
         def _csr(M):
