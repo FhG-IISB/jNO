@@ -291,9 +291,10 @@ Measured on one CPU core-set, a copper bar discretised as a plain lattice. `buil
 | bars | `build()` | warm solve (`R`), CPU | `L` |
 |---|---|---|---|
 | 712 | 0.22 s | 0.04 s | 0.02 s |
-| 6,688 | 0.19 s | 0.15 s | 0.02 s |
-| 23,688 | 0.21 s | 0.50 s | 0.03 s |
-| 57,472 | 0.52 s | 1.46 s | 0.04 s |
+| 6,688 | 0.19 s | 0.16 s | 0.02 s |
+| 23,688 | 0.21 s | 0.46 s | 0.03 s |
+| 57,472 | 0.52 s | 1.16 s | 0.04 s |
+| 113,800 | 0.37 s | 2.28 s | 0.09 s |
 
 Three things to read off it.
 
@@ -315,6 +316,20 @@ Three things to read off it.
     | after | 0.641 s | **0.317 s** |
 
     Note the CPU column moved too: this was never a GPU-specific problem, only a GPU-visible one.
+
+    The second thing in the way was the preconditioner's sparse LU, re-run on every `solve()` — at
+    40,000 nodes that was 1.5 s, **53 % of the whole solve**, all of it on the host. It is now cached
+    on content, which is what makes the GPU pull ahead at size:
+
+    | 113,800 bars (40,000 cells) | jNO CPU | jNO GPU |
+    |---|---|---|
+    | DC | 2.28 s | **1.21 s** |
+    | 10 kHz | 2.30 s | **1.16 s** |
+
+    The cache is keyed on the conductivity and the frequency, so a repeated solve and a gradient's
+    adjoint pass are free — and a design loop that moves the conductivity every iteration is not.
+    That miss is deliberate: reusing a factorisation built for a *different* conductivity is a claim
+    about preconditioning, not a caching decision, and this does not make it.
 
 !!! tip "`L` is a quadratic form, evaluated through the operator"
     `sol.L` used to walk every pair — `O(N²)` behind a solve that is linear — and cost **76 s at 57,472

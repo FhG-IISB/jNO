@@ -1015,6 +1015,20 @@ def solve_network(
         entry = None if traced else _KRYLOV_CACHE.get(key)
         cached = entry[1] if (entry is not None and entry[0] is fil) else None
 
+        # What the factorisation is OF, hashed once: the constraint blocks and the incidence are
+        # fixed inside this closure, so the only things that can change between calls are `zd` (the
+        # conductivity, through R) and the frequency. Cheap to compute here, and it makes the cache
+        # key below exact rather than an identity guess -- `id(CI)` is reusable after a collection,
+        # and a stale hit would silently precondition with the previous network's matrices.
+        _fact_static = (
+            ne,
+            nn,
+            hash(CI.data.tobytes()),
+            hash(Cp.data.tobytes()),
+            hash(AT.data.tobytes()),
+            hash(np.asarray(nv).tobytes()),
+        )
+
         def _factorise(zd, w_now):
             """Build and stash the preconditioner's factorisation for the CURRENT frequency.
 
@@ -1025,6 +1039,23 @@ def solve_network(
             whole sweep, so a value closed over here would be the first point's for every later one.
             """
             zdn = np.asarray(zd)
+            # The sparse LU is the single most expensive thing in the solve once the mesh is real:
+            # profiled on GPU at 40,000 nodes it was 1.515 s per solve, 53 % of the whole thing, and
+            # its fill-in (21x the nonzeros at 8,640 nodes, worse above) grows faster than the device
+            # work it is helping. Re-running it for values it has already seen buys nothing.
+            #
+            # Keyed on CONTENT, like `_FACTOR_CACHE` in utils/solver/linear.py, and holding exactly
+            # ONE entry -- the same one `_LU_HOLDER` was already keeping alive, so this costs no
+            # memory. An LU of a 40,000-node Schur complement is hundreds of megabytes; a cache that
+            # kept several would trade a solve's time for a machine's.
+            #
+            # What this does NOT do is reuse a factorisation across a CHANGING conductivity, which is
+            # what a design loop does every iteration. That would be a different claim -- that a
+            # stale preconditioner still accelerates -- and it is not made here.
+            ckey = (_fact_static, float(w_now), hash(zdn.tobytes()))
+            if _LU_HOLDER.get("key") == ckey and _LU_HOLDER.get("lu") is not None:
+                return np.zeros((), dtype=np.float64)
+            _LU_HOLDER["key"] = None  # a failed factorisation must not leave a key claiming success
             if nv.size:  # the near field, for a welded network
                 off = (1j * float(w_now)) * nv
                 zblk = sp.coo_matrix(
@@ -1039,6 +1070,7 @@ def solve_network(
             else:  # a plain lattice: the Schur complement of the diagonal, which is what suits it
                 _LU_HOLDER["lu"] = spla.splu((CI @ sp.diags(1.0 / zdn) @ AT + Cp).tocsc())
                 _LU_HOLDER["kind"] = "schur"
+            _LU_HOLDER["key"] = ckey
             return np.zeros((), dtype=np.float64)
 
         @jax.custom_jvp
