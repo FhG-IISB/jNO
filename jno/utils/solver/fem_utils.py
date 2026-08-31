@@ -3723,12 +3723,19 @@ def _array_digest(leaf):
     if isinstance(leaf, jax.Array):
         extra = (bool(getattr(leaf, "weak_type", False)), str(getattr(leaf, "sharding", "")))
     arr = np.ascontiguousarray(np.asarray(leaf))
+    # `memoryview(...).cast("B")` refuses a view with a zero in its shape, so an EMPTY array took
+    # the whole `jno.fem(...)` build down with a TypeError raised from inside a CACHE KEY -- a
+    # failure with no relation to what the user did. Empty arrays are ordinary here: a region
+    # predicate that resolves to no nodes, an axis with no free coordinates, a design whose
+    # non-design mask covers everything. Shape and dtype already identify such an array uniquely;
+    # there are no bytes to hash, so hash none.
+    _blob = b"" if arr.size == 0 else memoryview(arr).cast("B")
     digest = (
         "arr",
         arr.dtype.str,
         arr.shape,
         extra,
-        _hashlib.blake2b(memoryview(arr).cast("B"), digest_size=16).digest(),
+        _hashlib.blake2b(_blob, digest_size=16).digest(),
     )
     _LEAF_DIGEST_CACHE[key] = (leaf, digest)
     while len(_LEAF_DIGEST_CACHE) > _LEAF_DIGEST_CACHE_MAX:
