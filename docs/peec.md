@@ -99,6 +99,40 @@ Solids on the same lattice **share it**, and a line landing on a solid is **weld
 touches — so a bond wire arcing onto a trace carries current across the joint with no extra
 declaration.
 
+### Composing a layout — `+` is not union
+
+Two different operators, and mixing them up is the first thing that bites:
+
+| | |
+|---|---|
+| `a \| b`, `a - b`, `a & b` | **CSG**, within one conductor — an L-shaped trace, a hole through a plane |
+| `a.name(..) + b.name(..)` | **region composition** — separate conductors, each with its own `sigma` |
+
+A whole layout is therefore CSG for each part, `+` between them, and the cell pitch goes on the
+**Shape** (`size=`), not on `.domain()`:
+
+```python
+mm, P = 1e-3, 0.5e-3
+lower = (jno.Shape.box(0, 0, 0, 30*mm, 6*mm, 0.5*mm, size=(P, P, P))
+         - jno.Shape.cylinder(12*mm, 3*mm, -1*mm, 0, 0, 3*mm, r=1.2*mm)).name("lower")
+via   = jno.Shape.box(26*mm, 2*mm, 0.5*mm, 29*mm, 4*mm, 1.5*mm, size=(P, P, P)).name("via")
+upper = (jno.Shape.box(20*mm, 2*mm, 1.5*mm, 40*mm, 4*mm, 2.0*mm, size=(P, P, P))
+         | jno.Shape.box(36*mm, 2*mm, 1.5*mm, 40*mm, 10*mm, 2.0*mm)).name("upper")
+
+d = (lower.attach(sigma=CU) + via.attach(sigma=CU) + upper.attach(sigma=AL)).domain()
+d.tag("IN",  lambda x, y, z: x < 0.6*mm)
+d.tag("OUT", lambda x, y, z: (y > 9.4*mm) & (z > 1.4*mm))     # a pad on the OTHER layer
+```
+
+Two layers, a via between them, a cut-out, an L-shape and two materials — the via conducts because
+the geometry says the metal touches, not because anything declared a connection.
+
+!!! warning "One lattice, one pitch"
+    Every solid voxelises onto the **same** grid, so the pitch has to resolve the thinnest feature in
+    the whole layout. A 35 µm foil beside a 3 mm busbar is expensive for that reason, not because
+    either is hard on its own. Wires (`Shape.line`) are exempt — they carry their own analytic
+    cross-section and weld to whatever they land on.
+
 !!! warning "A lattice conducts centre-to-centre"
     Nodes sit at cell centres, so the conducting span of an `n`-cell run is `extent × (n-1)/n`, not
     `extent`. This is the standard convention (pypeec uses it too) and it converges as `1/n`, but on a
