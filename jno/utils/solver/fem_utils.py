@@ -638,10 +638,45 @@ def _cell_region_mask(domain, region):
                     f"shape."
                 ) from exc
     else:
-        raise ValueError(
-            f"jno.fem per-region integration: unknown region {region!r}. Define it with "
-            f"domain.tag(name, predicate), a Shape.regions() sub-region, or a geometry part."
-        )
+        # A NAMED VOLUME REGION OF THE MESH FILE (a gmsh physical volume). Resolved last, so a
+        # same-named `domain.tag` predicate keeps winning and nothing that worked before changes.
+        #
+        # Unlike every branch above this is exact membership, not centroid membership: the mesh
+        # already records which cell belongs to which material, so there is nothing to classify.
+        # That is the point -- a coordinate predicate evaluated at centroids for one purpose and at
+        # quadrature points for another disagrees on cells straddling a material boundary.
+        from ...domain.mesh_utils import mesh_cell_region_membership, p1_cells_dict, volume_cell_type
+
+        membership = mesh_cell_region_membership(getattr(domain, "mesh", None), dim)
+        if region not in membership:
+            raise ValueError(
+                f"jno.fem per-region integration: unknown region {region!r}. Define it with "
+                f"domain.tag(name, predicate), a Shape.regions() sub-region, or a geometry part, "
+                f"or name a volume region of the mesh file. Mesh volume regions here: "
+                f"{sorted(membership)}."
+            )
+        m = membership[region]
+        if a_cells is not None:
+            # The membership indexes the DOMAIN mesh; the mask must describe the cell order the
+            # kernel vmaps over. Equal length is not enough -- a rebuild can produce the same count
+            # in a different order, and the coefficient would then be permuted per cell rather than
+            # wrong in a way anything notices. Compare the connectivity itself.
+            _want = volume_cell_type(domain.mesh, dim)
+            _dom_cells = np.asarray(p1_cells_dict(domain.mesh)[_want]) if _want else None
+            if _dom_cells is None or not np.array_equal(np.asarray(a_cells), _dom_cells):
+                raise ValueError(
+                    f"jno.fem per-region integration: region {region!r} comes from the mesh file's "
+                    f"cell sets, but the assembly mesh ({len(np.asarray(a_cells))} cells) is not the "
+                    f"domain mesh it was read from "
+                    f"({0 if _dom_cells is None else len(_dom_cells)} cells). Re-assemble after the "
+                    "mesh change so the two agree."
+                )
+        if not m.any():
+            raise ValueError(
+                f"jno.fem per-region integration: the mesh region {region!r} owns NO cell on this "
+                "mesh, so its coefficient would contribute a silent zero. Check the region name "
+                "against domain.avaiable_mesh_tags."
+            )
     return np.asarray(m, dtype=bool).astype(np.float64)
 
 

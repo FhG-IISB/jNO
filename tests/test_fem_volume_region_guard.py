@@ -12,7 +12,8 @@ went one of two ways, both silent:
 
 Measured on a four-material mesh before the guard: a term on ``air`` integrated to the full
 69,694 mm^3 rather than the air's 66,445, and one on ``core`` produced b = 0. Both look like
-answers. Per-region materials belong in the COEFFICIENT (a P0 cell field), which restricts exactly.
+answers. Per-region materials belong in the COEFFICIENT -- ``d.by_region({...})``, which takes a
+named region of the mesh file and restricts exactly, one value per cell.
 """
 
 import numpy as np
@@ -69,7 +70,8 @@ def test_the_message_names_the_working_alternative(tmp_path):
         _mass_plus_load_on(d, "steel")
     msg = str(ei.value)
     assert "steel" in msg
-    assert "P0" in msg and "parameter" in msg, "must point at the coefficient route that works"
+    assert "by_region" in msg, "must point at the coefficient route that works"
+    assert "COEFFICIENT" in msg, "must say the fix is the coefficient, not the quadrature domain"
     assert "SURFACE" in msg, "must say why the surface case still works, so the asymmetry is not a mystery"
 
 

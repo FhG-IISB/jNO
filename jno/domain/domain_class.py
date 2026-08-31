@@ -21,7 +21,7 @@ from ..utils.dtypes import default_np_float_dtype
 from ..utils.logger import get_logger
 from .boundary_region import BoundaryRegion
 from .geometries import Geometries
-from .mesh_utils import VOLUME_BLOCKS_BY_DIM
+from .mesh_utils import VOLUME_BLOCKS_BY_DIM, mesh_cell_region_membership
 from .mesh_utils import base_cell_type as _base_cell_type
 from .meshio_mixin import MeshIOMixin
 from .simplex_pool import SimplexPool
@@ -1934,17 +1934,44 @@ class domain(MeshIOMixin):
         # plan. They belong here for the same reason geometry parts do -- ``RegionMask`` resolves them
         # through the same centroid-membership path (``_cell_region_mask``). Without them a
         # Shape-built multi-material domain could not use ``by_region`` at all.
+        # A mesh file declares its materials as gmsh physical volumes, which land in
+        # ``mesh.cell_sets``. They are a fourth source of regions, resolved LAST everywhere so a
+        # same-named tag predicate keeps winning.
+        mesh_regions = mesh_cell_region_membership(getattr(self, "mesh", None), int(self.dimension))
         valid = (
             set(getattr(self, "_source_regions", {}) or {})
             | set(getattr(self, "_tag_predicates", {}) or {})
             | set(getattr(self, "_shape_regions", {}) or {})
+            | set(mesh_regions)
         )
         unknown = [r for r in values if r not in valid]
         if unknown:
             raise ValueError(
                 f"domain.by_region: unknown region(s) {sorted(unknown)}; each key must be a geometry part, "
-                f"a Shape.regions sub-region, or a domain.tag predicate. Known regions: {sorted(valid)}."
+                f"a Shape.regions sub-region, a domain.tag predicate, or a named volume region of the mesh "
+                f"file. Known regions: {sorted(valid)}."
             )
+        # ``by_region`` is ``sum_r RegionMask(r) * values[r]``, so two keys covering the same cell ADD
+        # there -- and ``default`` is applied over ``1 - sum(masks)``, which goes negative on the
+        # overlap and subtracts twice over. A gmsh mesh commonly names both the individual parts and a
+        # group spanning them, so this is the ordinary case rather than a pathological one, and
+        # declaration order cannot resolve it: the user writing the enclosing group first would get
+        # the opposite of the intent. Refuse, and name the pair.
+        #
+        # Only checked for MESH regions: shapely / Shape.regions masks are disjoint by construction
+        # (the priority subtraction in `_cell_region_mask`), and evaluating those masks here would
+        # turn a symbolic O(1) call into a geometry query on every `d.<attr>` in a weak form.
+        _mr = [r for r in values if r in mesh_regions]
+        for _i, _a in enumerate(_mr):
+            for _b in _mr[_i + 1 :]:
+                _n = int((mesh_regions[_a] & mesh_regions[_b]).sum())
+                if _n:
+                    raise ValueError(
+                        f"domain.by_region: the mesh regions {_a!r} and {_b!r} overlap on {_n} cell(s), "
+                        "so their coefficients would be ADDED there rather than selected between "
+                        "(and a `default` subtracted twice). A group that spans other groups cannot be "
+                        "mixed with them in one call -- pass the parts, or pass the span, not both."
+                    )
         expr = _masked_sum(values, RegionMask, default, what="by_region", key="region")
         # NB: get_logger's first positional is a log *directory* -- get_logger(__name__) literally
         # creates a folder named `jno.domain.domain_class/` in the caller's cwd.
@@ -2033,13 +2060,24 @@ class domain(MeshIOMixin):
         picks the wrong mask -- a surface coefficient integrated over cells, or the reverse, which is
         wrong physics and not an error anywhere. Decide it once, here, and refuse the ambiguous case.
         """
-        if target in (getattr(self, "_shape_regions", {}) or {}) or target in (getattr(self, "_source_regions", {}) or {}):
+        # A NAMED VOLUME REGION OF THE MESH FILE owns cells by definition, so it is decided here
+        # rather than sent through the facets-vs-cells test below: such a region routinely reaches the
+        # outer boundary (the air box of any real device does), which would register it as a boundary
+        # region too and make it look ambiguous when it is not.
+        _mesh_regions = mesh_cell_region_membership(getattr(self, "mesh", None), int(self.dimension))
+        if (
+            target in (getattr(self, "_shape_regions", {}) or {})
+            or target in (getattr(self, "_source_regions", {}) or {})
+            or target in _mesh_regions
+        ):
             return "volume"
         if target not in (getattr(self, "_tag_predicates", {}) or {}) and target not in (
             getattr(self, "_boundary_regions", {}) or {}
         ):
             known_r = sorted(
-                set(getattr(self, "_shape_regions", {}) or {}) | set(getattr(self, "_source_regions", {}) or {})
+                set(getattr(self, "_shape_regions", {}) or {})
+                | set(getattr(self, "_source_regions", {}) or {})
+                | set(_mesh_regions)
             )
             known_t = sorted(getattr(self, "_tag_predicates", {}) or {})
             raise ValueError(f"domain.attach: unknown target {target!r}. Known regions: {known_r}; known tags: {known_t}.")

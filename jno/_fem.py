@@ -687,9 +687,10 @@ def _region_and_support(constraint: Any, domain: Any) -> Tuple[str, str]:
 _REGION_VOLUME_MSG = (
     "jno.fem: volume term on mesh cell region(s) {names}. Restricting a VOLUME term to a named cell "
     "region is not implemented -- the term is instead {how}, with no warning.\n"
-    "  Put the per-region material or source in the COEFFICIENT rather than the quadrature domain:\n"
-    '      p0, _ = d.fem_symbols(names=("m", "mt"), space="P0")   # one value per cell\n'
-    '      k = jno.np.parameter(p0, name="k")                       # supply per-cell values\n'
+    "  Put the per-region material or source in the COEFFICIENT rather than the quadrature domain.\n"
+    "  A named region of the mesh file is a valid key, so this reads straight off the physical volumes:\n"
+    '      k = d.by_region({{"steel": 16.0, "air": 0.026}})     # one value per cell, exact membership\n'
+    '      d.attach("steel", k=16.0)                          # or attach it and use d.k\n'
     "  A shapely sub-region or a d.tag(...) predicate also restricts correctly.\n"
     "  (d.variable(<region>) DOES restrict a SURFACE term; only the volume path is missing.)"
 )
