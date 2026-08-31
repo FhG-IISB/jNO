@@ -100,3 +100,31 @@ def test_a_missing_field_key_raises_instead_of_falling_back_to_p1():
     for fn in (_field_data, _field_space):
         with pytest.raises(KeyError, match="not in this problem's field table"):
             fn(local, _NotFrozen())
+
+
+def test_a_p0_cell_field_parameter_is_refused_rather_than_misread():
+    """A P0 ``(n_cells,)`` coefficient has no cell-field branch on the non-nodal assembler.
+
+    ``_field_param_names`` there is `_is_fem_field_parameter` only -- `_fem_field_kind` and the
+    `"cell"` gather live in `fem_native`. So a per-cell array reaches
+    ``_fv[name][cells_j[c]]``: gathered at VERTEX ids and interpolated with the P1 shape functions.
+    Wrong values, out-of-range indices clamped by JAX, and nothing raised.
+
+    ``RegionMask`` (``d.by_region``) is the mechanism that works here — one 0/1 per cell, threaded
+    through ``_cell_masks`` — so the guard names it.
+    """
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.6).domain()
+    u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
+    _p0_trial, p0 = d.fem_symbols(names=("m", "mt"), space="P0")
+    k = jno.np.parameter(p0, name="k")
+    ci = d.variable("interior", split=True)
+    x, y, z = ci[0], ci[1], ci[2]
+    with pytest.raises(NotImplementedError, match="by_region"):
+        jno.fem(
+            [
+                k * inner(u.vector.curl(x, y, z), v.vector.curl(x, y, z))
+                + inner(u.bind(x=x, y=y, z=z), v.bind(x=x, y=y, z=z))
+                - inner(vec(1.0 + 0.0 * x, 0.0 * x, 0.0 * x), v.bind(x=x, y=y, z=z)),
+                u.vector.cross(d.variable("boundary", normals=True)),
+            ]
+        )

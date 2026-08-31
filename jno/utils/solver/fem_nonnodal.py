@@ -320,6 +320,22 @@ def assemble_fem_nonnodal(
         return tuple(region_mask_arrays[_region_mask_index[r]][c] for r in rnames)
 
     _field_param_names = frozenset(n for n, e in _rt_param_exprs.items() if _is_fem_field_parameter(e))
+    # A P0 ("cell") field parameter has no gather on this path: `_field_param_names` is used below as
+    # if every field parameter were P1 VERTEX data (`_fv[name][cells_j[c]]`, interpolated with
+    # `p1_shape_vals`). Handing it a per-cell array reads the values at vertex ids -- wrong numbers,
+    # out-of-range indices clamped by JAX, and no error. Refuse it, and name what does work here.
+    from .parametric_helpers import _fem_field_kind
+
+    _cell_param_names = sorted(n for n in _field_param_names if _fem_field_kind(_rt_param_exprs[n]) == "cell")
+    if _cell_param_names:
+        raise NotImplementedError(
+            f"jno.fem (non-nodal): the P0 (per-cell) field parameter(s) {_cell_param_names} are not "
+            "wired on this assembler -- only nodal P1 field parameters are, and a per-cell array would "
+            "be gathered at VERTEX indices and silently give the wrong coefficient. For a per-region "
+            'material use d.by_region({"steel": 16.0, ...}) (or d.attach), which is one value per cell '
+            "and is threaded through the per-cell region masks; for a smooth field, use a P1 "
+            "(Lagrange) parameter."
+        )
 
     # Neural coefficients (``jno.nn.wrap(net)`` in the weak form) on a non-nodal element: like the native
     # path, the network is re-evaluated at the quad points and its weights ride the runtime ``args`` as a
