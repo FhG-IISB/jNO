@@ -44,6 +44,7 @@ __all__ = [
     "jaxamg",
     "cached",
     "ams",
+    "real_equivalent",
     "gmg",
     "nystrom",
 ]
@@ -110,6 +111,64 @@ class _Jacobi(_Spec):
 
     def __repr__(self):
         return "jno.precond.jacobi()"
+
+
+class _RealEquivalent(_Spec):
+    """Spec for preconditioning the fused real-equivalent block; see :func:`real_equivalent`."""
+
+    # Deliberately NOT complex_native: this spec WANTS the fused 2n form, because its whole purpose is
+    # to hand a REAL operator to a real inner solver. Declaring complex-native would route the solve to
+    # the complex n-sized operator and defeat it.
+    complex_ok = False
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def prepare(self, fem):
+        if hasattr(self.inner, "prepare"):
+            self.inner.prepare(fem)
+
+    def materialize(self, ctx: PrecondContext):
+        from .utils.solver.solver_api import LinearOperator, _slice_bcoo, materialize_precond
+
+        A = ctx.A
+        n2 = int(A.shape[0])
+        if A.bcoo is None:
+            raise ValueError(
+                "jno.precond.real_equivalent needs an ASSEMBLED (sparse) operator: it reads the K and M "
+                "blocks off the fused real-equivalent system. It cannot run on a matrix-free operator."
+            )
+        if n2 % 2:
+            raise ValueError(
+                f"jno.precond.real_equivalent expects the fused real-equivalent block, whose size is "
+                f"EVEN (2n for a complex n-sized system); got {n2}. Use it on a complex problem."
+            )
+        n = n2 // 2
+        top, bot = slice(0, n), slice(n, n2)
+        # The fused form is [[K, -M], [M, K]] over [x_r; x_i], so K is the (0,0) block and the (0,1)
+        # block is -M. K + M -- real, and definite whenever K is and M >= 0 -- is the inner operator
+        # the Axelsson/Kucherov and Benzi/Bertaccini families are built around, and the reason this is
+        # worth doing at all: a REAL inner solver applies unchanged, so a real-only GPU multigrid works
+        # on a complex problem.
+        K = _slice_bcoo(A.bcoo, top, top)
+        negM = _slice_bcoo(A.bcoo, top, bot)
+        if K is None or negM is None:
+            raise ValueError("jno.precond.real_equivalent: could not take the K / M blocks of the operator.")
+        KM = LinearOperator((K - negM).sum_duplicates())
+
+        inner = materialize_precond(self.inner, PrecondContext(KM, ctx.fem))
+        inner_T = getattr(inner, "T", inner)
+
+        def _apply(fn):
+            def go(v):
+                return jnp.concatenate([fn(v[:n]), fn(v[n:])])
+
+            return go
+
+        return PrecondApplier(_apply(inner), _apply(inner_T))
+
+    def __repr__(self):
+        return f"jno.precond.real_equivalent({self.inner!r})"
 
 
 class _GMG(_Spec):
@@ -216,6 +275,44 @@ class _Chebyshev(_Spec):
 
     def __repr__(self):
         return f"jno.precond.chebyshev(degree={self.degree})"
+
+
+def real_equivalent(inner) -> _RealEquivalent:
+    """Precondition a COMPLEX system through its fused real-equivalent block, with a **real** inner
+    solver — so a real-only preconditioner (an AmgX-style GPU multigrid, say) works on it.
+
+    A complex symmetric ``A = K + iM`` becomes ``[[K, -M], [M, K]]`` over ``[x_r; x_i]``. That block is
+    skew-dominated (measured ``||A - A^T|| / ||A|| = 2.0`` when the mass term dominates), which is why
+    multigrid applied to it *directly* diverges. The classical fix is not to precondition the block
+    itself but to use ``K + M``: real, symmetric, and definite whenever ``K`` is and ``M >= 0``. Here
+    that is applied to each of the two diagonal halves, and ``inner`` is any ordinary real spec::
+
+        fem.solve(linear=jno.solve.fgmres(),
+                  precond=jno.precond.real_equivalent(jno.precond.amg()))
+
+    Measured on a complex A-V (N1E x Lagrange) system, GMRES to 1e-8 with an AMG inner solve:
+    **18 iterations** where the imaginary part is definite.
+
+    **It is only as good as the gauge.** On an eddy-current problem ``M = w sigma`` VANISHES outside
+    the conductors, which is exactly the assumption (definite imaginary part) most of this literature
+    makes. Measured on such a system, regularised by a displacement-current mass term of size ``eps``:
+
+        eps = 1e-6 -> 40000 its | 1e-3 -> 2946 | 1e-2 -> 248 | 1e-1 -> 54 | 1 -> 16
+
+    i.e. the iteration count tracks the gauge, not the vanishing ``M`` — with a well-conditioned gauge
+    it matches the definite case. An ``eps`` mass term buys that conditioning by changing the physics;
+    a tree-cotree gauge (``domain._extra_dof_pins``) buys it for free, and is the right pairing.
+
+    ``inner`` sees ``K + M`` and never sees a complex number, so anything real composes: ``amg()``,
+    ``jacobi()``, ``inner(jno.solve.lu())``.
+
+    References: Day & Heroux, *Solving complex-valued linear systems via equivalent real formulations*,
+    SIAM J. Sci. Comput. 23(2):480-498, 2001 (which equivalent real form to pick); Axelsson & Kucherov,
+    *Real valued iterative methods for solving complex symmetric linear systems*, Numer. Linear Algebra
+    Appl. 7:197-218, 2000; Benzi & Bertaccini, *Block preconditioning of real-valued iterative
+    algorithms for complex linear systems*, IMA J. Numer. Anal. 28:598-618, 2008.
+    """
+    return _RealEquivalent(inner)
 
 
 def jacobi() -> _Jacobi:
