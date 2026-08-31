@@ -310,9 +310,17 @@ Three things to read off it.
     at all. On a lattice at AC, `diag(Z)` discards the inductive coupling that is the entire difficulty,
     and the Krylov iteration count is what you pay.
 
-    `restart=` is **not** a lever here: measured at 57,472 bars and 10 kHz, restart 8 / 16 / 32 give
-    76.3 s / 75.9 s / 79.7 s and bit-identical answers. Deepening the subspace does not help when the
-    preconditioner is the bottleneck. A stronger lattice preconditioner is the open work.
+    `restart=` is **not** a lever here — it is monotonically counterproductive. Measured at 57,472
+    bars and 10 kHz:
+
+    | restart | 8 | 16 | 32 | 64 | 128 |
+    |---|---|---|---|---|---|
+    | time | 76.3 s | 75.9 s | 79.7 s | 80.4 s | 94.7 s |
+
+    all five returning a bit-identical `R = 121.416 µΩ`, `L = 24.358 nH`. Deepening the subspace only
+    costs when the preconditioner is the bottleneck. A stronger lattice preconditioner is the open
+    work; `restart=` remains the right lever for a *welded* network, where it is what the refusal
+    message names.
 
 ## Limits, up front
 
