@@ -149,23 +149,50 @@ class PEECSolution:
         that is a different (smaller) number than the DC one, which is the effect worth seeing.
         """
         from .utils.solver.kernel import pair_quadratic
+        from .utils.solver.peec import lattice_apply, welded_apply
 
         f = self._fil
-        grp = jnp.asarray(f.group)
         cur = jnp.atleast_2d(self.i)
+        scale = MU0 / (4 * jnp.pi)
 
         # I^H Lp I, not I^T Lp I: the currents are complex, and the magnetic energy is the HERMITIAN
         # form. The transpose form is complex, and its real part goes negative once the phases spread
         # -- an inductance a passive loop cannot have.
         #
         # Computed as a QUADRATIC FORM, never through the matrix. Lp is real and symmetric, so
-        # I^H Lp I = Re(I)' Lp Re(I) + Im(I)' Lp Im(I) exactly -- the cross terms cancel by symmetry
-        # -- and each half is `pair_quadratic` with the current folded into the moments. That is the
-        # same sum the matrix would have given, evaluated in chunks that never hold an (N, N) array,
-        # and it rematerialises on the reverse pass so the gradient is bounded too.
-        def _energy(x):
-            m = jnp.asarray(f.mom) * x[grp][:, None]
-            return pair_quadratic(f.pos, m, lambda r: 1.0 / r, f.self_g, group=grp) * (MU0 / (4 * jnp.pi))
+        # I^H Lp I = Re(I)' Lp Re(I) + Im(I)' Lp Im(I) exactly -- the cross terms cancel by symmetry.
+        #
+        # Each half is `x . (Lp x)` through the SAME apply the matrix-free solve is built on. It used
+        # to be `pair_quadratic`, which also never forms the matrix but does walk every pair, and so
+        # is O(N^2) behind a solve that is linear in the bars. Measured, solve against readout:
+        #
+        #     bars      6,688    23,688    57,472
+        #     solve      0.24 s    0.79 s    2.29 s
+        #     pair sum   1.43 s   16.2  s   76.5  s
+        #
+        # -- the inductance cost thirty times the answer it was reporting on. A lattice's Lp is
+        # block-Toeplitz, so `lattice_apply` is the same quadrature in O(N log N); `test_peec_fft`
+        # already pins that apply against the dense `pair_matrix` on every case, which is what makes
+        # this a change of EVALUATION and not of value.
+        lat = getattr(f, "lattice", None)
+        welded = isinstance(lat, dict) and "welded" in lat
+        structured = lat is not None and (not welded or any(b[2] is not None for b in lat["welded"]))
+
+        if structured:
+            ap = (welded_apply if welded else lattice_apply)(f, lambda r: 1.0 / r, mu_scale=scale)
+
+            def _energy(x):
+                return jnp.vdot(x, ap(x)).real
+        else:
+            # A polyline's filaments are not Toeplitz and welding several conductors breaks the
+            # structure even when each part had it, so there is nothing to exploit. The pair sum
+            # stays: it is chunked, never holds an (N, N) array, and rematerialises on the reverse
+            # pass, so the gradient is bounded too.
+            grp = jnp.asarray(f.group)
+
+            def _energy(x):
+                m = jnp.asarray(f.mom) * x[grp][:, None]
+                return pair_quadratic(f.pos, m, lambda r: 1.0 / r, f.self_g, group=grp) * scale
 
         num = jnp.stack([_energy(jnp.real(c)) + _energy(jnp.imag(c)) for c in cur])
         out = num / jnp.abs(jnp.atleast_1d(self._port_current)) ** 2
