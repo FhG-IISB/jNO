@@ -58,9 +58,10 @@ differentiable end to end.
 | | | |
 |---|---|---|
 | [**FEM**](https://fhg-iisb.github.io/jNO/fem/) · stable | [Elements](https://fhg-iisb.github.io/jNO/fem/elements/) · H(div)/H(curl)/C¹ experimental | [**FDM**](https://fhg-iisb.github.io/jNO/fdm/) · stable |
-| [**RCWA**](https://fhg-iisb.github.io/jNO/rcwa/) · stable | [Solvers & preconditioners](https://fhg-iisb.github.io/jNO/solvers/) · stable | [Eigenproblems](https://fhg-iisb.github.io/jNO/API/#solvers-and-preconditioners) · beta |
-| [Time integration](https://fhg-iisb.github.io/jNO/fdm/) · stable | [Adaptive meshing](https://fhg-iisb.github.io/jNO/fem/geometry/) · beta | [Domain decomposition](https://fhg-iisb.github.io/jNO/domain-decomposition/) · beta |
-| [Geometry — `jno.Shape`](https://fhg-iisb.github.io/jNO/Domain-and-Geometry/) · stable | [Inverse & PDE-constrained](https://fhg-iisb.github.io/jNO/inverse-problems/) · stable | [Limits & build time](https://fhg-iisb.github.io/jNO/fem/limitations/) |
+| [**RCWA**](https://fhg-iisb.github.io/jNO/rcwa/) · stable | [**PEEC**](https://fhg-iisb.github.io/jNO/peec/) · beta | [Solvers & preconditioners](https://fhg-iisb.github.io/jNO/solvers/) · stable |
+| [Eigenproblems](https://fhg-iisb.github.io/jNO/API/#solvers-and-preconditioners) · beta | [Time integration](https://fhg-iisb.github.io/jNO/fdm/) · stable | [Adaptive meshing](https://fhg-iisb.github.io/jNO/fem/geometry/) · beta |
+| [Domain decomposition](https://fhg-iisb.github.io/jNO/domain-decomposition/) · beta | [Geometry — `jno.Shape`](https://fhg-iisb.github.io/jNO/Domain-and-Geometry/) · stable | [Inverse & PDE-constrained](https://fhg-iisb.github.io/jNO/inverse-problems/) · stable |
+| [Limits & build time](https://fhg-iisb.github.io/jNO/fem/limitations/) | | |
 
 **Pillar 2 — scientific machine learning.** All stable, and all composable with any solve above.
 
