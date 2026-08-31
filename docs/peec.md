@@ -281,46 +281,41 @@ Every layer is checked against an oracle that does not go through the layer belo
 | the FFT matrix-free apply | the **dense** operator built by `pair_matrix`, on every case |
 | every gradient | a central difference, to ~1e-6 relative |
 | the whole solve, end to end | **pypeec 5.8.0**, an independent PEEC code, on the same 20,480-cell grid: `R` agrees to 0.28 %, `L` to 0.08 % |
+| the `O(N log N)` inductance | the `O(N²)` pair sum it replaced, to 1e-11 relative |
 
 ## Cost — what to expect
 
 Measured on one CPU core-set, a copper bar discretised as a plain lattice. `build()` is the host pass;
 *first* includes the XLA compile; *warm* is a repeat solve on the built network.
 
-| bars | `build()` | first solve | warm, DC | warm, 10 kHz |
+| bars | `build()` | first solve | warm solve (`R`) | `L` |
 |---|---|---|---|---|
-| 58 | 0.30 s | 1.4 s | 0.026 s | — |
-| 6,688 | 0.44 s | 7.2 s | 0.21 s | — |
-| 23,688 | 0.44 s | 17.9 s | 0.76 s | — |
-| 57,472 | 0.52 s | 61 s | 2.15 s | **76 s** |
+| 712 | 0.22 s | 1.7 s | 0.06 s | 0.02 s |
+| 6,688 | 0.44 s | 7.2 s | 0.24 s | 0.02 s |
+| 23,688 | 0.44 s | 17.9 s | 0.78 s | 0.03 s |
+| 57,472 | 0.52 s | 61 s | 2.30 s | 0.04 s |
 
 Three things to read off it.
 
 - **`build()` is cheap and flat.** The host pass is well under a second even at 57k bars. Building once
   and solving many times is the intended shape, and it is why `build()` exists.
-- **The first solve is dominated by compilation**, not arithmetic — 61 s against a 2.15 s warm solve at
+- **The first solve is dominated by compilation**, not arithmetic — 61 s against a 2.30 s warm solve at
   57k bars. For a one-shot answer that is the number you feel; in a design loop it is paid once.
-- **AC on a plain lattice is the weak spot.** At 10 kHz the same 57k-bar network takes 76 s where DC
-  takes 2.15 s — a factor of 35 on an identical operator size.
+- **The solve is linear in the bars**, and the frequency does not change its cost: the same 57k-bar
+  network takes 2.29 s at DC and 2.30 s at 10 kHz.
 
-!!! warning "Why AC on a lattice is slow, and what does not fix it"
-    A **welded** network is preconditioned by a sparse LU of the whole block system with the near field
-    of `Z`; a **plain lattice** is preconditioned by a Schur complement of `diag(Z)` only. Each suits
-    its own case and neither suits both — the near-field preconditioner does not converge on a lattice
-    at all. On a lattice at AC, `diag(Z)` discards the inductive coupling that is the entire difficulty,
-    and the Krylov iteration count is what you pay.
+!!! tip "`L` is a quadratic form, evaluated through the operator"
+    `sol.L` used to walk every pair — `O(N²)` behind a solve that is linear — and cost **76 s at 57,472
+    bars against a 2.3 s solve**, thirty times the answer it was reporting on. It now contracts through
+    the same block-Toeplitz apply the matrix-free solve is built on, which is `O(N log N)`:
 
-    `restart=` is **not** a lever here — it is monotonically counterproductive. Measured at 57,472
-    bars and 10 kHz:
+    | bars | 6,688 | 23,688 | 57,472 |
+    |---|---|---|---|
+    | pair sum | 1.43 s | 16.2 s | 76.5 s |
+    | through the apply | 0.02 s | 0.03 s | 0.04 s |
 
-    | restart | 8 | 16 | 32 | 64 | 128 |
-    |---|---|---|---|---|---|
-    | time | 76.3 s | 75.9 s | 79.7 s | 80.4 s | 94.7 s |
-
-    all five returning a bit-identical `R = 121.416 µΩ`, `L = 24.358 nH`. Deepening the subspace only
-    costs when the preconditioner is the bottleneck. A stronger lattice preconditioner is the open
-    work; `restart=` remains the right lever for a *welded* network, where it is what the refusal
-    message names.
+    to the same value in every case. A network with no lattice — a polyline's filaments are not
+    Toeplitz — keeps the pair sum, which is the honest path when there is no structure to exploit.
 
 ## Limits, up front
 
