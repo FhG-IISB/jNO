@@ -240,6 +240,30 @@ def hanging_dofs(
     return out
 
 
+def _carry_cell_sets(domain, parent, n_input, base, empty):
+    """Add the domain's named volume cell regions to ``base``, mapped through ``parent``.
+
+    ``parent[i]`` is the input cell that output cell ``i`` came from, so a region owns a child
+    exactly when it owned its parent. Only the top-dimensional named regions travel: ``interior`` /
+    ``boundary`` are rebuilt from the new mesh by the caller, and facet regions are re-derived
+    geometrically by ``_capture_geometric_boundary_tags``.
+    """
+    from ...domain.mesh_utils import mesh_cell_region_membership
+
+    out = dict(base)
+    for name, mask in mesh_cell_region_membership(getattr(domain, "mesh", None), int(domain.dimension)).items():
+        if name in out:
+            continue
+        if len(mask) != n_input:
+            raise ValueError(
+                f"jno local refinement: the cell region {name!r} covers {len(mask)} cells but the mesh "
+                f"being refined has {n_input}. The region belongs to a different mesh, and mapping it "
+                "onto the children would assign materials to the wrong cells."
+            )
+        out[name] = [np.flatnonzero(np.asarray(mask)[parent]).astype(np.int64), empty.copy()]
+    return out
+
+
 def refine_domain(domain, marked, *, copy: bool = False):
     """Refine a quadrilateral or hexahedral domain's marked cells in place, keeping its geometry exactly.
 
@@ -277,6 +301,17 @@ def refine_domain(domain, marked, *, copy: bool = False):
     cells = np.asarray(domain.mesh.cells_dict[cell_type])
 
     split = refine_hexes if is_hex else refine_quads
+    # Which parent each output cell came from, so the mesh's NAMED CELL REGIONS survive the split: a
+    # child covers part of its parent and therefore has the parent's material by construction.
+    #
+    # `split` balances the marked set internally (a 2:1 level jump forces extra cells to be refined),
+    # so the caller cannot know the parentage from `marked` alone. `balance_marks` is a closure --
+    # balancing an already-balanced set adds nothing -- so running it here gives the same set the
+    # split will use, and the output order is then fixed: one cell per unmarked parent, `n_child` per
+    # marked one, in input order.
+    _balanced = balance_marks(pts, cells, marked, cell_type)
+    _n_child = 8 if is_hex else 4
+    _parent = np.repeat(np.arange(len(cells)), np.where(_balanced, _n_child, 1))
     new_pts, new_cells = split(pts, cells, marked)
     hang = hanging_nodes(new_pts, new_cells, cell_type)
     bfacets = boundary_facets(new_pts, new_cells, hang, cell_type)
@@ -287,10 +322,16 @@ def refine_domain(domain, marked, *, copy: bool = False):
     mesh = meshio.Mesh(
         pts3,
         [(cell_type, new_cells), (facet_type, bfacets)],
-        cell_sets={
-            "interior": [np.arange(len(new_cells), dtype=np.int64), empty],
-            "boundary": [empty, np.arange(len(bfacets), dtype=np.int64)],
-        },
+        cell_sets=_carry_cell_sets(
+            domain,
+            _parent,
+            len(cells),
+            {
+                "interior": [np.arange(len(new_cells), dtype=np.int64), empty],
+                "boundary": [empty, np.arange(len(bfacets), dtype=np.int64)],
+            },
+            empty,
+        ),
     )
     target = _apply_new_mesh(domain, mesh, copy=copy)
     # Re-materialise the named boundary regions on the new mesh. `_apply_new_mesh` gives each one a
