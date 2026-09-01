@@ -716,6 +716,26 @@ def assemble_fem_nonnodal(
                 )
         return per, verts[0][None, :] + qp @ J.T, jnp.abs(detJ)
 
+    # A complex COEFFICIENT with a real basis: the element residual is complex while the
+    # linearisation point stays real, so ONE data pass carries the full complex operator. The flag
+    # sizes every accumulator below; without it the scatter-add into a real buffer RAISES on dtype
+    # (it never silently casts), which is why the historic route split each term into Re/Im legs
+    # and assembled twice.
+    from ..._fem import _bares_have_complex_coeff as _cx_bares
+    from ...trace import FunctionCall as _FC_cx
+
+    def _provably_real(b):
+        # A top-level ``.real``/``.imag`` wrap is the historic two-leg split's leg shape: the value
+        # is real BY CONSTRUCTION even though the complex literal survives inside the wrapped tree.
+        # Without this the split's legs would assemble complex-dtype -- twice the data for a zero
+        # imaginary part, handed to consumers that expect real legs.
+        return isinstance(b, _FC_cx) and getattr(b, "_name", None) in ("real", "imag") and len(b.args) == 1
+
+    _cx_form = _cx_bares(
+        [b for b in volume_terms if not _provably_real(b)]
+        + [e for _bt in (boundary_terms or {}).values() for e in _bt if not _provably_real(e)]
+    )
+
     def _make_residual(terms):
         """Build a ``residual(u_flat)`` closure for the given weak ``terms`` over the shared field
         layout. Reused for the steady system (``jacfwd`` -> A, ``-residual(0)`` -> b), the steady
@@ -745,7 +765,7 @@ def assemble_fem_nonnodal(
                 if name not in _field_param_names
             }
             field_vals = {name: jnp.asarray(_a.get(name, _zero_field), dtype=u_flat.dtype) for name in _field_param_names}
-            R = jnp.zeros(total, dtype=u_flat.dtype)
+            R = jnp.zeros(total, dtype=jnp.result_type(u_flat.dtype, np.complex64) if _cx_form else u_flat.dtype)
             _nt = neural_local_table(_neural, args)  # once per call, not per (term × cell) inside `_cell`
             # Scatter trainable coordinates once per residual evaluation, not per (term x cell).
             # The steady linear operator is built FROM this residual (jacfwd -> A, -residual(0) -> b),
@@ -786,7 +806,7 @@ def assemble_fem_nonnodal(
                     (jnp.arange(n_cells),),
                     _cell_chunk_of(n_cells, int(cdofs[tfi].shape[1]), int(cdofs[tfi].shape[1]), _chunk_setting),
                 )
-                R = R.at[cdofs[tfi].reshape(-1)].add(elem.reshape(-1))
+                R = R.at[cdofs[tfi].reshape(-1)].add(elem.reshape(-1).astype(R.dtype))
             return R
 
         return residual
@@ -1091,7 +1111,8 @@ def assemble_fem_nonnodal(
 
             # values scatter into their final slots PER GROUP: the full-length data vector exists
             # only on the unplanned fallback, where the uncompressed triplet path still needs it
-            _acc = jnp.zeros((_vol_nse,), zeros.dtype) if _vinv is not None else None
+            _acc_dtype = jnp.result_type(zeros.dtype, np.complex64) if _cx_form else zeros.dtype
+            _acc = jnp.zeros((_vol_nse,), _acc_dtype) if _vinv is not None else None
             data_l = []  # fallback only; the (row, col) pattern is `_vol_idx`
             for gi, (tfi, terms_g) in enumerate(_groups):
 
@@ -1114,7 +1135,7 @@ def assemble_fem_nonnodal(
                     _cell_chunk_of(n_cells, int(cdofs[tfi].shape[1]), int(_cell_all_dofs.shape[1]), _chunk_setting),
                 )
                 if _acc is not None:
-                    _acc = _acc.at[_vinv[gi]].add(Ke.reshape(-1))
+                    _acc = _acc.at[_vinv[gi]].add(Ke.reshape(-1).astype(_acc.dtype))
                 else:
                     data_l.append(Ke.reshape(-1))
 

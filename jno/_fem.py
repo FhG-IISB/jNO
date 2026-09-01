@@ -916,6 +916,11 @@ def _is_complex_form(domain: Any, ir: Any) -> bool:
     return any(_node_has_complex_literal(node) for term in ir.terms for node in _walk(term.coeff))
 
 
+#: One-pass complex non-nodal assembly (see the gate in `assemble`). Module-level so a composition
+#: the gate mis-judges can be steered back to the historic Re/Im two-leg split without an upgrade.
+_COMPLEX_SINGLE_ASSEMBLY = True
+
+
 def _complex_block_bcoo(A_r: Any, A_i: Any, n: int) -> Any:
     """Assemble the real-equivalent block ``[[A_r, -A_i], [A_i, A_r]]`` (shape ``2n x 2n``) as one
     BCOO from the two sparse legs, by placing each sub-block's triplets at its ``n`` offset -- no
@@ -4576,6 +4581,78 @@ def _fem_impl(
                     "jno.fem: a complex non-nodal *nonlinear* form is not wired — complex forms assemble as "
                     "linear real-equivalent blocks. (Raises rather than silently dropping the imaginary part.)"
                 )
+            # --- ONE complex assembly when the complex data provably stays on the volume path ---
+            # The basis is real and only the coefficient is complex, so a single data pass with a
+            # real linearisation point yields the complex operator directly; the Re/Im legs every
+            # downstream consumer reads are derived from it. The historic split below runs the FULL
+            # assembler twice -- measured on a 275k-tet mixed N1E x Lagrange build, the second leg
+            # alone was +1.3 GB of peak. The gate fails CLOSED: parametric forms (runtime
+            # parameters, trainable coordinates), a complex literal in a BOUNDARY term
+            # (impedance / incident), and flux/rotation BCs keep the two-leg split until each is
+            # verified complex-clean on this path.
+            _cx_bd = any(_bares_have_complex_coeff(exprs) for exprs in boundary_terms.values())
+            from .utils.solver.parametric_helpers import _collect_runtime_parameter_exprs as _rt_collect
+
+            _rt_nn: dict = {}
+            for _b in _nn_bares:
+                _rt_collect(_b, _rt_nn)
+            # A REAL-valued flux/rotation entry is the ordinary essential trace pin (the PEC
+            # ``n x u = 0`` classifies here) and shares the dtype-generic pin machinery; only a
+            # complex VALUE would touch unverified ground (e.g. the host-assembled RT load).
+            _cx_fluxlike = any(
+                (isinstance(_e[-1], complex) and _e[-1].imag != 0) or _node_has_complex_literal(_e[-1])
+                for _e in tuple(flux_bcs) + tuple(rotation_bcs)
+            )
+            _single = _COMPLEX_SINGLE_ASSEMBLY and not (
+                _cx_bd or _cx_fluxlike or _rt_nn or (getattr(domain, "_trainable_coords", None) or [])
+            )
+            if _single:
+                domain._fem_problem = None
+                op_c, _mode_c, offsets = assemble_fem_nonnodal(
+                    domain,
+                    volume_terms,
+                    boundary_terms,
+                    dirichlet_raw,
+                    [],
+                    flux_bcs=flux_bcs,
+                    rotation_bcs=rotation_bcs,
+                    quad_degree=quad_degree,
+                )
+                if _mode_c == "linear" and isinstance(op_c, tuple):
+                    from jax.experimental import sparse as _jsp
+
+                    from .utils.solver.fem_utils import compress_eager as _ce
+
+                    A_c, b_c = op_c
+                    b_c = jnp.asarray(b_c)
+                    if not (jnp.iscomplexobj(A_c.data) and jnp.iscomplexobj(b_c)):
+                        raise RuntimeError(
+                            "jno.fem internal: the single-pass complex assembly returned a REAL system "
+                            "for a form with a complex coefficient -- the imaginary part was silently "
+                            "cast away somewhere in the element path. Refusing to build a half-cast "
+                            "operator; set jno._fem._COMPLEX_SINGLE_ASSEMBLY = False to use the "
+                            "two-leg split while this is reported."
+                        )
+                    _fl = dict(
+                        indices_sorted=bool(getattr(A_c, "indices_sorted", False)),
+                        unique_indices=bool(getattr(A_c, "unique_indices", False)),
+                    )
+                    # compress_eager drops each leg's explicit zeros (a term whose Re or Im part
+                    # vanishes keeps its slots in the shared complex pattern), reproducing the leg
+                    # sizes the split produced; the indices array is shared until then.
+                    op_r = (_ce(_jsp.BCOO((A_c.data.real, A_c.indices), shape=A_c.shape, **_fl)), b_c.real)
+                    op_i = (_ce(_jsp.BCOO((A_c.data.imag, A_c.indices), shape=A_c.shape, **_fl)), b_c.imag)
+                    return _finalize(
+                        FEM(
+                            domain=domain,
+                            op=(op_r, op_i),
+                            classification=classification,
+                            mode="complex",
+                            offsets=offsets,
+                        )
+                    )
+                # an unexpected shape (the gate mis-judged): the two-leg split below stays correct
+
             real_bd = {tag: [e.real for e in exprs] for tag, exprs in boundary_terms.items()}
             imag_bd = {tag: [e.imag for e in exprs] for tag, exprs in boundary_terms.items()}
             domain._fem_problem = None
