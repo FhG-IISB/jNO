@@ -920,17 +920,88 @@ def _complex_block_bcoo(A_r: Any, A_i: Any, n: int) -> Any:
     """Assemble the real-equivalent block ``[[A_r, -A_i], [A_i, A_r]]`` (shape ``2n x 2n``) as one
     BCOO from the two sparse legs, by placing each sub-block's triplets at its ``n`` offset -- no
     densification. The four sub-blocks occupy disjoint index ranges, so the result has no duplicate
-    coordinates. ``A_r`` appears at (0,0) and (n,n); ``A_i`` at (n,0) and, negated, at (0,n)."""
+    coordinates. ``A_r`` appears at (0,0) and (n,n); ``A_i`` at (n,0) and, negated, at (0,n).
+
+    The block's canonical (row-major sorted) order is decided host-side and the device work is one
+    O(nnz) gather -- emitted with ``indices_sorted``/``unique_indices`` set. A raw concatenation
+    instead makes every downstream CSR conversion re-sort the full ``2n`` pattern on device, and for
+    the complex TRANSIENT block that cost recurs every step of the march. When both legs are already
+    canonical (the planned assemblers' output) the order needs NO sort at all: within any fused row
+    every left-half column precedes every right-half column, so the permutation follows from
+    per-row entry COUNTS -- ``np.unique`` over the concatenated pattern (the first cut of this) cost
+    more transient workspace at the fuse than the emission saved, and pinned a plan-cache entry
+    sized by the mesh for a plan that is cheap to recompute. Legs that are concrete but not flagged
+    canonical take :func:`compress_plan`; traced leg indices (a jit-captured re-form) keep the plain
+    concatenation -- correctness never depends on either plan."""
     from jax.experimental import sparse as jsp
 
     ir, dr = A_r.indices, A_r.data
     ii, di = A_i.indices, A_i.data
+    canonical = all(getattr(L, "unique_indices", False) and getattr(L, "indices_sorted", False) for L in (A_r, A_i))
+    try:
+        hir, hii = np.asarray(ir), np.asarray(ii)  # raises on a tracer -> the concatenation below
+    except Exception:  # noqa: BLE001 -- traced indices: no host plan available
+        hir = None
+    if hir is not None and canonical:
+        # Counting merge, all int32 on the host (the transients here showed up at the fuse
+        # checkpoint of a 275k-tet build until they were trimmed): per source piece, `pos` maps its
+        # slots to their row-major positions in the fused block -- the top half interleaves
+        # (A_r row k | A_i row k at cols+n) per row, the bottom half (A_i row k | A_r row k).
+        nr, ni = hir.shape[0], hii.shape[0]
+        rows_r, rows_i = hir[:, 0], hii[:, 0]
+        cr = np.bincount(rows_r, minlength=n).astype(np.int32)
+        ci = np.bincount(rows_i, minlength=n).astype(np.int32)
+        rs_r = np.concatenate([[0], np.cumsum(cr, dtype=np.int32)[:-1]])  # row starts within each leg
+        rs_i = np.concatenate([[0], np.cumsum(ci, dtype=np.int32)[:-1]])
+        half = np.concatenate([[0], np.cumsum(cr + ci, dtype=np.int32)[:-1]])  # fused row starts
+        rank_r = np.arange(nr, dtype=np.int32) - rs_r[rows_r]  # in-row rank, preserved from the leg
+        rank_i = np.arange(ni, dtype=np.int32) - rs_i[rows_i]
+        pos_rt = half[rows_r] + rank_r  # A_r  at (0, 0)
+        pos_it = half[rows_i] + cr[rows_i] + rank_i  # -A_i at (0, n)
+        pos_ib = nr + ni + half[rows_i] + rank_i  # A_i  at (n, 0)
+        pos_rb = nr + ni + half[rows_r] + ci[rows_r] + rank_r  # A_r  at (n, n)
+        idx = np.empty((2 * (nr + ni), 2), dtype=np.int32)
+        idx[pos_rt] = hir
+        idx[pos_it] = hii + np.asarray([0, n], dtype=np.int32)
+        idx[pos_ib] = hii + np.asarray([n, 0], dtype=np.int32)
+        idx[pos_rb] = hir + np.asarray([n, n], dtype=np.int32)
+        try:  # concrete data: place values host-side too -- no concatenated copy, no device gather
+            hdr, hdi = np.asarray(dr), np.asarray(di)
+            dat = np.empty((2 * (nr + ni),), dtype=np.result_type(hdr, hdi))
+            dat[pos_rt] = hdr
+            dat[pos_it] = -hdi
+            dat[pos_ib] = hdi
+            dat[pos_rb] = hdr
+            data = jnp.asarray(dat)
+        except Exception:  # noqa: BLE001 -- traced data (parametric re-form): one device gather
+            perm = np.empty((2 * (nr + ni),), dtype=np.int32)
+            perm[np.concatenate([pos_rt, pos_it, pos_ib, pos_rb])] = np.arange(2 * (nr + ni), dtype=np.int32)
+            data = jnp.concatenate([dr, -di, di, dr])[jnp.asarray(perm)]
+        return jsp.BCOO(
+            (data, jnp.asarray(idx)),
+            shape=(2 * n, 2 * n),
+            indices_sorted=True,
+            unique_indices=True,
+        )
+    if hir is not None:
+        from .utils.solver.fem_utils import compress_plan
+
+        cat = np.concatenate(
+            [hir, hii + np.asarray([0, n]), hii + np.asarray([n, 0]), hir + np.asarray([n, n])], axis=0
+        ).astype(np.int32)
+        try:
+            plan = compress_plan(cat)
+        except Exception:  # noqa: BLE001 -- no host plan available
+            plan = None
+        if plan is not None:
+            uidx, inverse, nse = plan
+            data = jax.ops.segment_sum(jnp.concatenate([dr, -di, di, dr]), inverse, num_segments=nse)
+            return jsp.BCOO((data, uidx), shape=(2 * n, 2 * n), indices_sorted=True, unique_indices=True)
     off = jnp.asarray([n, n], dtype=ir.dtype)
     col = jnp.asarray([0, n], dtype=ir.dtype)
     row = jnp.asarray([n, 0], dtype=ir.dtype)
     indices = jnp.concatenate([ir, ii + col, ii + row, ir + off], axis=0)  # (0,0),(0,n),(n,0),(n,n)
-    data = jnp.concatenate([dr, -di, di, dr])
-    return jsp.BCOO((data, indices), shape=(2 * n, 2 * n))
+    return jsp.BCOO((jnp.concatenate([dr, -di, di, dr]), indices), shape=(2 * n, 2 * n))
 
 
 def _to_bcoo(A: Any) -> Any:
@@ -942,10 +1013,16 @@ def _to_bcoo(A: Any) -> Any:
 
 
 def _bcoo_empty(m: int, n: int, dtype: Any) -> Any:
-    """An all-zero ``(m, n)`` BCOO (no stored entries)."""
+    """An all-zero ``(m, n)`` BCOO (no stored entries) — vacuously canonical, and flagged so, which
+    lets :func:`_complex_block_bcoo` take its no-sort merge when one leg is this."""
     from jax.experimental import sparse as jsp
 
-    return jsp.BCOO((jnp.zeros((0,), dtype), jnp.zeros((0, 2), jnp.int32)), shape=(m, n))
+    return jsp.BCOO(
+        (jnp.zeros((0,), dtype), jnp.zeros((0, 2), jnp.int32)),
+        shape=(m, n),
+        indices_sorted=True,
+        unique_indices=True,
+    )
 
 
 def _bcoo_block(subblocks: Any, shape: Any, dtype: Any) -> Any:
@@ -969,12 +1046,28 @@ def _bcoo_block(subblocks: Any, shape: Any, dtype: Any) -> Any:
 def _complex_operator(A_r: Any, A_i: Any) -> Any:
     """Fuse the real/imag legs into one complex operator ``A_r + i·A_i`` — as a **complex BCOO** when
     the legs are sparse (so an iterative complex solve never densifies), else a dense complex array.
-    This is the operator a slot-composed complex solver (``linear=gmres, precond=ams``) runs on."""
+    This is the operator a slot-composed complex solver (``linear=gmres, precond=ams``) runs on.
+
+    The union pattern is decided host-side (:func:`compress_plan`) and applied as an O(nnz)
+    ``segment_sum``: ``sum_duplicates`` is an in-trace device argsort over the CONCATENATED legs,
+    whose workspace is the same spike the planned assembly path exists to avoid — paid here at the
+    exact moment a complex-native preconditioner build has both legs and the union live. Traced
+    indices fall back to the sorting path; correctness never depends on the plan."""
     if hasattr(A_r, "indices") and hasattr(A_i, "indices"):
         from jax.experimental import sparse as jsp
 
         indices = jnp.concatenate([A_r.indices, A_i.indices], axis=0)
         data = jnp.concatenate([A_r.data + 0j, 1j * A_i.data])  # +0j promotes to the complex dtype
+        try:
+            from .utils.solver.fem_utils import compress_plan
+
+            plan = compress_plan(indices)
+        except Exception:  # noqa: BLE001 -- traced indices: no host plan available
+            plan = None
+        if plan is not None:
+            idx, inverse, nse = plan
+            data = jax.ops.segment_sum(data, inverse, num_segments=nse)
+            return jsp.BCOO((data, idx), shape=A_r.shape, indices_sorted=True, unique_indices=True)
         return jsp.BCOO((data, indices), shape=A_r.shape).sum_duplicates()
     Ar = A_r.todense() if hasattr(A_r, "todense") else A_r
     Ai = A_i.todense() if hasattr(A_i, "todense") else A_i
