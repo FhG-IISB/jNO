@@ -982,32 +982,32 @@ def assemble_fem_nonnodal(
                 _groups.append((_tfi_p, []))
             _groups[_gpos[_tfi_p]][1].append((_cf_p, _rn_p))
 
-        _vol_rows_l, _vol_cols_l = [], []
-        for _tfi_p, _terms_p in _groups:
-            _kshape = (n_cells, int(cdofs[_tfi_p].shape[1]), _cell_all_dofs.shape[1])  # (n_cells, n_test, n_local_all)
-            _vol_rows_l.append(jnp.broadcast_to(cdofs[_tfi_p][:, :, None], _kshape).reshape(-1))
-            _vol_cols_l.append(jnp.broadcast_to(_cell_all_dofs[:, None, :], _kshape).reshape(-1))
-        _vol_idx = (
-            jnp.stack(
-                [jnp.concatenate(_vol_rows_l).astype(jnp.int32), jnp.concatenate(_vol_cols_l).astype(jnp.int32)], axis=1
-            )
-            if _vol_rows_l
-            else jnp.zeros((0, 2), jnp.int32)
-        )
-
-        # THE SYMBOLIC PASS, once, on the host: the unique sparsity pattern and the inverse map from
-        # every emitted entry to its final slot. Element values then SCATTER-ADD straight into a
-        # buffer of exactly the final size -- no stored duplicates, and no in-trace sort (the old
-        # `sum_duplicate_triplets` collapse, whose argsort workspace over the unreduced triplet
-        # array was the dominant assembly temporary). Assembly peak becomes pattern + values + one
-        # batch of element blocks: the same order as the matrix it produces.
-        _uidx = _vinv = None
+        # THE SYMBOLIC PASS, once, on the host, in numpy end to end: the unique sparsity pattern and
+        # the inverse map from every emitted entry to its final slot. Element values then SCATTER-ADD
+        # straight into a buffer of exactly the final size -- no stored duplicates, no in-trace sort
+        # (the old `sum_duplicate_triplets` collapse, whose argsort workspace over the unreduced
+        # triplet array was the dominant assembly temporary). The full jnp triplet pattern is built
+        # ONLY on the unplanned fallback: with a plan, nothing downstream needs it, and at ~20M
+        # triplets it alone is hundreds of MB. Intermediates are freed as soon as consumed -- the
+        # audit that motivated this found the peak made of stacked full-length copies, not one villain.
+        _uidx = _vinv = _vol_idx = None
         _vol_nse = None
-        if _vol_rows_l:
+        _grp_sizes = []
+        if _groups:
             try:
-                _idx_np = np.asarray(_vol_idx)
-                _enc = _idx_np[:, 0].astype(np.int64) * np.int64(total) + _idx_np[:, 1].astype(np.int64)
+                _enc_l = []
+                for _tfi_p, _terms_p in _groups:
+                    _nt = int(cdofs[_tfi_p].shape[1])
+                    _nl = int(_cell_all_dofs.shape[1])
+                    _r = np.broadcast_to(np.asarray(cdofs[_tfi_p])[:, :, None], (n_cells, _nt, _nl))
+                    _c = np.broadcast_to(np.asarray(_cell_all_dofs)[:, None, :], (n_cells, _nt, _nl))
+                    _enc_l.append((_r.astype(np.int64) * np.int64(total) + _c.astype(np.int64)).reshape(-1))
+                    _grp_sizes.append(n_cells * _nt * _nl)
+                    del _r, _c
+                _enc = np.concatenate(_enc_l) if len(_enc_l) > 1 else _enc_l[0]
+                del _enc_l
                 _unq, _inv = np.unique(_enc, return_inverse=True)
+                del _enc
                 _uidx = jnp.stack(
                     [
                         jnp.asarray((_unq // np.int64(total)).astype(np.int32)),
@@ -1015,11 +1015,29 @@ def assemble_fem_nonnodal(
                     ],
                     axis=1,
                 )  # sorted row-major by construction of np.unique
-                _vinv = jnp.asarray(_inv.astype(np.int32))
                 _vol_nse = int(_unq.size)
+                del _unq
+                _inv = _inv.astype(np.int32)
+                # per-group slices of the inverse map, so values scatter INSIDE the group loop and the
+                # full-length data vector never exists
+                _off = np.cumsum([0] + _grp_sizes)
+                _vinv = [jnp.asarray(_inv[_off[i] : _off[i + 1]]) for i in range(len(_grp_sizes))]
+                del _inv
             except Exception:  # noqa: BLE001 -- a traced pattern cannot be planned on the host
                 _uidx = _vinv = None
                 _vol_nse = None  # fall back to the uncompressed (still correct) operator
+        if _vinv is None and _groups:
+            _vol_rows_l, _vol_cols_l = [], []
+            for _tfi_p, _terms_p in _groups:
+                _kshape = (n_cells, int(cdofs[_tfi_p].shape[1]), _cell_all_dofs.shape[1])
+                _vol_rows_l.append(jnp.broadcast_to(cdofs[_tfi_p][:, :, None], _kshape).reshape(-1))
+                _vol_cols_l.append(jnp.broadcast_to(_cell_all_dofs[:, None, :], _kshape).reshape(-1))
+            _vol_idx = jnp.stack(
+                [jnp.concatenate(_vol_rows_l).astype(jnp.int32), jnp.concatenate(_vol_cols_l).astype(jnp.int32)],
+                axis=1,
+            )
+        elif not _groups:
+            _vol_idx = jnp.zeros((0, 2), jnp.int32)
 
         def assemble(args=None, *, surface=True, u_flat=None):
             # ``u_flat=None`` linearises at u=0, which is exact for a LINEAR form (the tangent does not
@@ -1071,8 +1089,11 @@ def assemble_fem_nonnodal(
                     local["neural_coefficients"] = _nt
                 return _integrate_term(domain, coeff, local, qw * meas)
 
-            data_l = []  # only the element data is args-dependent; the (row, col) pattern is `_vol_idx`
-            for tfi, terms_g in _groups:
+            # values scatter into their final slots PER GROUP: the full-length data vector exists
+            # only on the unplanned fallback, where the uncompressed triplet path still needs it
+            _acc = jnp.zeros((_vol_nse,), zeros.dtype) if _vinv is not None else None
+            data_l = []  # fallback only; the (row, col) pattern is `_vol_idx`
+            for gi, (tfi, terms_g) in enumerate(_groups):
 
                 def _ke(c, la, _g=tuple(terms_g), _t=tfi):
                     # ONE jacfwd of the SUMMED residual: linearity makes it equal to the sum of the
@@ -1092,17 +1113,18 @@ def assemble_fem_nonnodal(
                     (jnp.arange(n_cells), _local_u),
                     _cell_chunk_of(n_cells, int(cdofs[tfi].shape[1]), int(_cell_all_dofs.shape[1]), _chunk_setting),
                 )
-                data_l.append(Ke.reshape(-1))
+                if _acc is not None:
+                    _acc = _acc.at[_vinv[gi]].add(Ke.reshape(-1))
+                else:
+                    data_l.append(Ke.reshape(-1))
 
-            data = jnp.concatenate(data_l) if data_l else jnp.zeros((0,), zeros.dtype)
+            data = _acc if _acc is not None else (jnp.concatenate(data_l) if data_l else jnp.zeros((0,), zeros.dtype))
             # Tangential-trace surface mass (impedance BC), re-evaluated per args. Taken SPARSE: densifying it
             # would cost O(n_dof²) just to re-sparsify, the memory wall for a 3-D vector run.
             sm = _surf_mass_of(args, sparse=True) if surface else None
             if _vinv is not None:
-                # values land in their FINAL slots: a buffer of exactly nse entries, filled by one
-                # scatter-add through the host-planned inverse map. Nothing to sort, nothing to
-                # collapse, and the flags let every downstream matvec skip the lazy re-summation.
-                data = jnp.zeros((_vol_nse,), data.dtype).at[_vinv].add(data)
+                # values already landed in their FINAL slots inside the group loop; nothing to sort,
+                # nothing to collapse, and the flags let every matvec skip the lazy re-summation.
                 _emit_idx = _uidx
                 _emit_flags = dict(indices_sorted=True, unique_indices=True)
             else:
