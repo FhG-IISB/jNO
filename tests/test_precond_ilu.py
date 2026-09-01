@@ -94,3 +94,31 @@ def test_matrix_free_operator_is_refused():
     op = LinearOperator.from_matvec(lambda v: v, shape=(4, 4))
     with pytest.raises(ValueError, match="ASSEMBLED"):
         _ILU({}).materialize(PrecondContext(op, None))
+
+
+def test_the_diagonal_shift_ladder_engages_on_a_zero_pivot():
+    """A matrix with a zero pivot must be survived, not raised on.
+
+    The shift path had an undefined `get_logger` for a while and no test reached it, because every
+    problem tried factorised at alpha=0 — so the ladder was dead code that would have raised
+    NameError the first time it was genuinely needed. Ruff caught it; this pins it.
+    """
+    import jax.numpy as jnp
+    from jax.experimental import sparse as jsp
+
+    from jno.precond import PrecondContext, _ILU
+    from jno.utils.solver.solver_api import LinearOperator
+
+    n = 6
+    rows, cols, vals = [], [], []
+    for i in range(n):
+        rows.append(i); cols.append(i)
+        vals.append(0.0 if i == 3 else 2.0 + 0.5j)   # an exactly zero pivot at row 3
+        if i + 1 < n:
+            rows += [i, i + 1]; cols += [i + 1, i]; vals += [1.0 + 0j, 1.0 + 0j]
+    op = LinearOperator(jsp.BCOO(
+        (jnp.asarray(np.array(vals, complex)), jnp.asarray(np.stack([rows, cols], 1))), shape=(n, n)))
+
+    applier = _ILU({"drop_tol": 1e-8, "fill_factor": 20.0}).materialize(PrecondContext(op, None))
+    out = np.asarray(applier(jnp.asarray(np.ones(n, dtype=complex))))
+    assert np.isfinite(out).all(), "the shift ladder must produce a usable applier, not NaNs"

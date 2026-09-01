@@ -485,6 +485,8 @@ class _ILU(_Spec):
             except RuntimeError as _e:  # noqa: PERF203
                 _err = _e
         if _used:
+            from .utils.logger import get_logger
+
             get_logger().info(f"jno.precond.ilu: factorised with diagonal shift alpha={_used:g}")
         if lu is None:
             e = _err
