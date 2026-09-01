@@ -594,26 +594,60 @@ def form(terms, *, inner=None, quad_degree: int = 2) -> _Form:
 class _InnerSolve(_Spec):
     """Spec using a configured linear solver as the ``M^{-1}`` application; see :func:`inner`."""
 
-    def __init__(self, solver):
+    def __init__(self, solver, precond=None):
         self.solver = solver
+        self.precond = precond
 
     def materialize(self, ctx: PrecondContext):
+        from .utils.solver.solver_api import materialize_precond
+
         solver, op = self.solver, ctx.A
+        # The inner solve gets its OWN preconditioner, materialized against the SUB-operator this
+        # spec was handed -- not against the outer system. `ctx.fem` is carried through, because an
+        # inner AMS reads the edge topology off it and cannot be built from the matrix alone.
+        M = Mt = None
+        if self.precond is not None:
+            ap = materialize_precond(self.precond, PrecondContext(op, ctx.fem))
+            M, Mt = ap, ap.T  # PrecondApplier is callable; .T is its transpose applier
         # transpose applier solves the transposed (sub-)operator, so a non-symmetric block gets a
         # correctly-preconditioned adjoint solve (else reverse-mode stalls -- see PrecondApplier).
-        return PrecondApplier(lambda v: solver(op, v), lambda v: solver(op.T, v))
+        return PrecondApplier(lambda v: solver(op, v, M=M), lambda v: solver(op.T, v, M=Mt))
 
     def __repr__(self):
-        return f"jno.precond.inner({self.solver})"
+        p = f", precond={self.precond}" if self.precond is not None else ""
+        return f"jno.precond.inner({self.solver}{p})"
 
 
-def inner(solver) -> _InnerSolve:
+def inner(solver, *, precond=None) -> _InnerSolve:
     """Use a ``jno.solve`` linear solver as the preconditioner application ``M^{-1} v ≈ A^{-1} v``
     on whatever operator it is materialized against — the natural way to give a diagonal block of
     :func:`block_diag`/:func:`triangular` an (inexact) block solve, e.g.
     ``jno.precond.inner(jno.solve.cg(tol=1e-2, maxiter=50))``. With an iterative solver here the
-    outer Krylov must be flexible: ``jno.solve.fgmres()``."""
-    return _InnerSolve(solver)
+    outer Krylov must be flexible: ``jno.solve.fgmres()``.
+
+    ``precond`` preconditions that **inner** solve, materialized against the sub-operator this spec
+    is handed. Without it the inner Krylov runs unpreconditioned, which for anything harder than a
+    well-scaled mass matrix is no bargain — and the inner's accuracy is not a detail. Measured on a
+    complex A–V eddy system preconditioned through :func:`real_equivalent`, varying **only** how
+    accurately ``K + M`` is applied::
+
+        exact inner (sparse LU)        40 outer iterations
+        ONE algebraic-multigrid cycle  2200
+        multigrid solved to tol 1e-4   48
+
+    i.e. a *loosely solved* inner is worth **55x** over a single cycle, and recovers essentially
+    exact behaviour. So the useful shape is an inner solve that is cheap because its tolerance is
+    loose, not because it is a single sweep::
+
+        jno.precond.real_equivalent(
+            jno.precond.inner(jno.solve.fgmres(tol=1e-4, maxiter=50),
+                              precond=jno.precond.triangular((u, jno.precond.ams()),
+                                                             (p, jno.precond.amg()))))
+
+    Do not over-tighten it either: ``triangular``'s own note records ``tol=1e-2`` measuring 11x
+    slower end-to-end than ``1e-4`` on Taylor–Hood Stokes, the outer paying more extra iterations
+    than the cheaper block solve saves."""
+    return _InnerSolve(solver, precond)
 
 
 def _pairs_to_appliers(pairs, ctx: PrecondContext):
