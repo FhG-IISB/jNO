@@ -399,7 +399,7 @@ def hypre(kind: str = "ams", **options) -> _Hypre:
     none of that. Measured on an A–V eddy problem where it matters, hypre reached 8.6e-03 with
     interior nodes marked against no progress at all without them.
 
-    **It is not automatically faster.** On the same 89,920-DOF H(curl) block of a planar-transformer
+    **It is not automatically faster.** On the same 89,920-DOF H(curl) block of a production-scale
     A–V system, hypre reached 4.33e-09 and jNO's own ``ams()`` reached 8.03e-09 — equivalent. Reach
     for this as a **reference implementation** to check jNO against, or for the ``sigma = 0`` features,
     not on the assumption that a production library must win.
@@ -450,7 +450,7 @@ class _ILU(_Spec):
         # KEEP scipy's fill-reducing ordering. Forcing `permc_spec="NATURAL"` to preserve the
         # operator's complex symmetry is theoretically tidy and a disaster in practice: measured on
         # an A-V system from n=2,049 to n=12,216, NATURAL makes the factorisation scale as n^3.09
-        # against COLAMD's n^1.72 -- extrapolating to a 103k-DOF transformer, 5,451 s versus 7 s.
+        # against COLAMD's n^1.72 -- extrapolated to 103k DOFs, 5,451 s versus 7 s.
         # COLAMD needs more Krylov iterations (642 vs 228 at n=12,216) and still wins on TOTAL time
         # at every size measured (0.98 s vs 7.70 s). Pass permc_spec="NATURAL" explicitly if a
         # structure-preserving factorisation is worth that to you.
@@ -459,7 +459,7 @@ class _ILU(_Spec):
 
         # SYMMETRIC EQUILIBRATION FIRST, and it is not optional in practice. `drop_tol` is RELATIVE,
         # so on an operator whose rows span many orders the small rows are dropped to nothing and the
-        # factorisation reports "Factor is exactly singular". Measured on a gauged A-V transformer
+        # factorisation reports "Factor is exactly singular". Measured on a gauged A-V eddy-current
         # matrix: diagonal from 1.0 to 5.3e11 -- pinned rows sit at 1 while conductor rows run at
         # 1e11 -- and spilu fails outright. Scaling to a unit diagonal costs one pass and fixes it.
         # D^-1 A D^-1 with D = sqrt(|diag|) keeps a complex-SYMMETRIC matrix symmetric.

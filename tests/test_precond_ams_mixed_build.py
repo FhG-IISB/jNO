@@ -155,7 +155,7 @@ def test_unbuilt_ams_on_a_mixed_operator_names_the_problem():
 
     ``build()`` already guards this, but an UNBUILT ``ams()`` reaches ``materialize`` instead, where
     ``self._G`` is edge-sized and the operator it is handed is the whole mixed block. On the real A-V
-    transformer that surfaced as::
+    eddy-current system that surfaced as::
 
         ValueError: matmul: dimension mismatch with signature (n,k=89920),(k=103385,m)->(n,m)
 
