@@ -446,6 +446,12 @@ class _ILU(_Spec):
         opts = {"drop_tol": 1e-4, "fill_factor": 10.0}
         opts.update(self.options)
         equil = bool(opts.pop("equilibrate", True))
+        shifts = tuple(opts.pop("shifts", (0.0, 1e-4, 1e-3, 1e-2, 1e-1, 0.5)))
+        # No pivoting, no reordering. This operator is complex-SYMMETRIC, which is the property the
+        # incomplete-Cholesky methods in the eddy-current literature exploit; partial pivoting
+        # destroys it, and this is as close as scipy gets to their IC.
+        opts.setdefault("permc_spec", "NATURAL")
+        opts.setdefault("diag_pivot_thresh", 0.0)
         dtype = np.complex128 if np.iscomplexobj(csr.data) else np.float64
 
         # SYMMETRIC EQUILIBRATION FIRST, and it is not optional in practice. `drop_tol` is RELATIVE,
@@ -462,9 +468,26 @@ class _ILU(_Spec):
             fac = (D @ csr @ D).tocsc()
         else:
             dinv, fac = None, csr
-        try:
-            lu = spla.spilu(fac, **opts)
-        except RuntimeError as e:
+        # DIAGONAL SHIFT WITH RETRY (Manteuffel). The eddy-current operator is only positive
+        # SEMI-definite: sigma vanishes in the air, and an ungauged curl-curl carries its whole
+        # gradient null space. An incomplete factorisation hits a zero pivot there, where CG on a
+        # consistent singular system does not care -- which is how the ICCG literature factors this
+        # same matrix. Factoring `A + alpha*diag(A)` steps around it, and alpha is raised only until
+        # the factorisation succeeds, so a well-posed operator pays nothing.
+        _d0 = fac.diagonal()
+        lu = _used = None
+        _err = None
+        for _alpha in shifts:
+            _cand = fac if _alpha == 0.0 else (fac + sp.diags(_alpha * _d0)).tocsc()
+            try:
+                lu, _used = spla.spilu(_cand, **opts), _alpha
+                break
+            except RuntimeError as _e:  # noqa: PERF203
+                _err = _e
+        if _used:
+            get_logger().info(f"jno.precond.ilu: factorised with diagonal shift alpha={_used:g}")
+        if lu is None:
+            e = _err
             # scipy says only "Factor is exactly singular". Say WHICH rows, because on an eddy-current
             # operator the answer is nearly always structural: an UNGAUGED curl-curl carries the whole
             # gradient null space, and V has no equation at all where sigma = 0. An incomplete
@@ -481,7 +504,7 @@ class _ILU(_Spec):
                 "sigma = 0 leaves V with no equation. Either gauge the system (a tree-cotree gauge "
                 "through domain._extra_dof_pins) and pin V off the conductors, or use a "
                 "preconditioner that tolerates the null space -- jno.precond.ams() is built for "
-                "exactly that."
+                f"exactly that. Shifts tried: {[f'{a:g}' for a in shifts]}."
             ) from e
 
         def _host(r):
