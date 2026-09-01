@@ -3557,13 +3557,18 @@ _ELEM_MAP_CACHE_MAX = 128
 #: See :func:`compress_plan` for why content rather than identity (a remesh changes the content and
 #: misses, so staleness is impossible) and for the measured hash-vs-work ratio.
 #:
-#: Bounded at 4 because an entry pins DEVICE arrays, and the ``inverse`` leg is one int32 per RAW
-#: triplet -- the largest array the plan holds (38 MiB at 9.5M triplets, against ~3 MiB for the unique
-#: indices). Four covers the two-to-three patterns one build registers plus a neighbour, which is the
-#: repeated-build case this exists for; holding a dead problem's pattern any longer costs device
-#: memory for nothing.
+#: Bounded in BYTES first, count second. An entry pins DEVICE arrays sized by the MESH (the
+#: ``inverse`` leg is one int32 per raw triplet), so a count-only bound means nothing: 4 entries of
+#: a 1.3M-tet fused-block plan is ~4 GB, 4 entries of a toy is 4 kB. The byte bound keeps the
+#: repeated-build win for small and medium problems and simply skips caching where the plan itself
+#: is the memory problem -- a big mesh recomputes ``np.unique`` (~1-2 s at 22M triplets) on a
+#: rebuild instead of pinning a gigabyte for the whole session. The count bound is a secondary
+#: tidy-up for many tiny patterns; it is 12 because one COMPLEX build registers ~4 patterns (two
+#: legs, the fused 2n block, the complex union) and at the historical bound of 4 a single such
+#: build evicted its own entries before any rebuild could hit them.
 _PLAN_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
-_PLAN_CACHE_MAX = 4
+_PLAN_CACHE_MAX = 12
+_PLAN_CACHE_MAX_BYTES = 256 * 2**20
 
 
 #: Content digests of baked array leaves, keyed by object id. Each entry PINS the array it was
@@ -4128,9 +4133,13 @@ def compress_plan(indices):
     # int32 inverse: it is one entry per RAW triplet, so on a large 3-D operator it is the biggest
     # array the plan holds -- halving it against numpy's int64 default is worth the cast.
     plan = jnp.asarray(idx), jnp.asarray(inverse.reshape(-1).astype(np.int32)), int(uniq.shape[0])
-    _PLAN_CACHE[key] = plan
-    while len(_PLAN_CACHE) > _PLAN_CACHE_MAX:
-        _PLAN_CACHE.popitem(last=False)
+    entry_bytes = plan[0].nbytes + plan[1].nbytes
+    if entry_bytes <= _PLAN_CACHE_MAX_BYTES:  # an oversized plan is returned but never cached
+        _PLAN_CACHE[key] = plan
+        while len(_PLAN_CACHE) > _PLAN_CACHE_MAX or (
+            len(_PLAN_CACHE) > 1 and sum(p[0].nbytes + p[1].nbytes for p in _PLAN_CACHE.values()) > _PLAN_CACHE_MAX_BYTES
+        ):
+            _PLAN_CACHE.popitem(last=False)
     return plan
 
 
@@ -4147,9 +4156,25 @@ def compress_eager(A):
     but the check runs on the ALREADY-COMPRESSED values, which are ~16x smaller than the raw triplets,
     so it is a cheap transfer rather than a full round trip.
 
+    An operator that arrives with ``unique_indices`` and ``indices_sorted`` both set skips the plan
+    entirely -- the flags are set only by paths that guarantee them (the planned assemblers, and this
+    function). Recomputing a plan for one is a no-op that the cache then PINS: measured on a 275k-tet
+    complex build, ~70 MB of no-op inverse per leg. The explicit-zero drop still runs, because the
+    planned path emits canonical patterns WITH zero slots (a term whose Re or Im leg vanishes keeps
+    its pattern) -- on the same build the legs arrived 2.9M stored, 1.4M of them zero.
+
     Falls back to the sorting path for anything non-concrete -- correctness never depends on this."""
     if not hasattr(A, "indices"):
         return A
+    if getattr(A, "unique_indices", False) and getattr(A, "indices_sorted", False):
+        try:
+            keep = np.asarray(jnp.abs(A.data) > 0.0)
+            if bool(keep.all()):
+                return A
+            sel = jnp.asarray(np.flatnonzero(keep))
+            return jsparse.BCOO((A.data[sel], A.indices[sel]), shape=A.shape, indices_sorted=True, unique_indices=True)
+        except Exception:  # noqa: BLE001 -- traced data: keep the canonical operator as-is
+            return A
     try:
         plan = compress_plan(A.indices)
     except Exception:  # noqa: BLE001 -- traced operator: no host plan available
@@ -4162,7 +4187,7 @@ def compress_eager(A):
     if not bool(keep.all()):
         sel = jnp.asarray(np.flatnonzero(keep))
         data, idx = data[sel], idx[sel]
-    return jsparse.BCOO((data, idx), shape=A.shape)
+    return jsparse.BCOO((data, idx), shape=A.shape, indices_sorted=True, unique_indices=True)
 
 
 def apply_compress_plan(data, plan, shape):

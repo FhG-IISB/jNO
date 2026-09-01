@@ -223,8 +223,8 @@ def test_the_static_pattern_does_not_depend_on_the_state():
     count would drop entries at some other state — a wrong answer that no single-state test sees."""
     fem = _nonlinear("3d")
     n = int(fem.dofs)
-    J = jax.jit(fem._op.jacobian)
     rng = np.random.default_rng(0)
+    J = jax.jit(fem._op.jacobian)
     counts = {int(J(jax.numpy.asarray(rng.standard_normal(n) * s)).nse) for s in (0.0, 0.1, 1.0, 10.0)}
     assert len(counts) == 1, f"nse varies with the state: {sorted(counts)}"
 
@@ -527,8 +527,8 @@ def test_nonlinear_nonnodal_tangent_is_sparse_and_correct(kind):
     pytest.importorskip("shapely", reason="shapely required for the box/rect domains")
     fem = _nonlinear_nonnodal(kind)
     n = int(fem.dofs)
-    J, R = fem._op.jacobian, fem._op.residual
     rng = np.random.default_rng(0)
+    J, R = fem._op.jacobian, fem._op.residual
 
     for tag, u in (
         ("zero", np.zeros(n)),
@@ -576,8 +576,8 @@ def test_static_nse_must_be_exact_or_entries_are_dropped():
 
     from jno.utils.solver.fem_utils import sum_duplicate_triplets, unique_triplet_count
 
-    rng = np.random.default_rng(0)
     n, nnz = 40, 500
+    rng = np.random.default_rng(0)
     idx = np.stack([rng.integers(0, n, nnz), rng.integers(0, n, nnz)], axis=1).astype(np.int32)
     data = rng.standard_normal(nnz)
     raw = jsp.BCOO((jnp.asarray(data), jnp.asarray(idx)), shape=(n, n))
@@ -677,3 +677,98 @@ def test_non_bcoo_operators_pass_through():
     dense = jnp.arange(9.0).reshape(3, 3)
     assert sum_duplicate_triplets(dense) is dense
     assert sum_duplicate_triplets(None) is None
+
+
+# --- the plan cache: bounded by BYTES, and never consulted for an already-canonical operator ------
+#
+# Both policies come from the same measured build (a 275k-tet complex mixed N1E x Lagrange form): the planned assembly path
+# hands `compress_eager` legs that are ALREADY unique+sorted, and computing a plan for them pinned
+# ~70 MB of no-op inverse per leg; meanwhile the fused-block and complex-union plans landed in the
+# same 4-entry cache and THRASHED it (one complex build registers ~4 patterns). A count bound also
+# repeats the cuDSS-cache mistake: 4 entries of a 1.3M-tet mesh is ~4 GB, 4 entries of a toy is 4 kB.
+
+
+def test_compress_eager_trusts_canonical_flags(monkeypatch):
+    """unique+sorted flags are set only by paths that guarantee them; recomputing their plan is
+    pure waste that the cache then pins."""
+    import jax.numpy as jnp
+    from jax.experimental import sparse as jsp
+
+    from jno.utils.solver import fem_utils
+
+    idx = jnp.asarray([[0, 0], [0, 1], [1, 1]], jnp.int32)
+    A = jsp.BCOO((jnp.asarray([1.0, 2.0, 3.0]), idx), shape=(2, 2), indices_sorted=True, unique_indices=True)
+
+    def _boom(indices):
+        raise AssertionError("compress_plan ran on an already-canonical pattern")
+
+    monkeypatch.setattr(fem_utils, "compress_plan", _boom)
+    assert fem_utils.compress_eager(A) is A
+
+
+def test_canonical_flags_do_not_skip_the_zero_drop(monkeypatch):
+    """The planned assembly path emits canonical patterns WITH explicit zeros (a term whose Re or Im
+    leg vanishes keeps its slots) -- measured on that build's legs: 2.9M stored, 1.4M of them zero. The
+    flags shortcut must still drop them, or the fused 2n block doubles."""
+    import jax.numpy as jnp
+    from jax.experimental import sparse as jsp
+
+    from jno.utils.solver import fem_utils
+
+    idx = jnp.asarray([[0, 0], [0, 1], [1, 0], [1, 1]], jnp.int32)
+    A = jsp.BCOO((jnp.asarray([1.0, 0.0, 0.0, 3.0]), idx), shape=(2, 2), indices_sorted=True, unique_indices=True)
+
+    def _boom(indices):
+        raise AssertionError("compress_plan ran on an already-canonical pattern")
+
+    monkeypatch.setattr(fem_utils, "compress_plan", _boom)
+    out = fem_utils.compress_eager(A)
+    assert int(out.data.shape[0]) == 2, "explicit zeros survived the canonical shortcut"
+    assert bool(out.indices_sorted) and bool(out.unique_indices)
+    assert np.allclose(np.asarray(out.todense()), np.asarray(A.todense()))
+
+
+def test_compressed_operators_carry_the_canonical_flags():
+    """The plan's pattern IS sorted+unique; emitting without the flags makes the next consumer
+    re-sort for nothing (and defeats the shortcut above on a second pass)."""
+    import jax.numpy as jnp
+    from jax.experimental import sparse as jsp
+
+    from jno.utils.solver.fem_utils import compress_eager
+
+    idx = jnp.asarray([[1, 1], [0, 0], [1, 1], [0, 1]], jnp.int32)  # duplicated + unsorted
+    A = jsp.BCOO((jnp.asarray([1.0, 2.0, 3.0, 4.0]), idx), shape=(2, 2))
+    out = compress_eager(A)
+    assert bool(out.indices_sorted) and bool(out.unique_indices)
+    assert np.allclose(np.asarray(out.todense()), np.asarray(A.todense()))
+
+
+def test_plan_cache_is_bounded_by_bytes_not_only_count(monkeypatch):
+    """Entries pin device arrays sized by the MESH, so the bound must be in bytes: at 1.3M tets a
+    single fused-block plan is ~1 GB, and a count-only bound holds four of them."""
+    from collections import OrderedDict
+
+    from jno.utils.solver import fem_utils
+
+    monkeypatch.setattr(fem_utils, "_PLAN_CACHE", OrderedDict())
+
+    def _pattern(seed, n=4000):
+        r = np.random.default_rng(seed)
+        return np.stack([r.integers(0, 90, n), r.integers(0, 90, n)], axis=1).astype(np.int32)
+
+    one = fem_utils.compress_plan(_pattern(0))
+    entry = one[0].nbytes + one[1].nbytes
+    monkeypatch.setattr(fem_utils, "_PLAN_CACHE_MAX_BYTES", int(2.5 * entry))
+    fem_utils._PLAN_CACHE.clear()
+    for seed in range(4):
+        fem_utils.compress_plan(_pattern(seed))
+    total = sum(p[0].nbytes + p[1].nbytes for p in fem_utils._PLAN_CACHE.values())
+    assert total <= int(2.5 * entry), f"cache holds {total} bytes over the {int(2.5 * entry)} bound"
+    assert len(fem_utils._PLAN_CACHE) == 2, "byte bound should keep exactly the two newest entries"
+
+    # an entry larger than the whole bound is computed and returned but never cached
+    monkeypatch.setattr(fem_utils, "_PLAN_CACHE_MAX_BYTES", entry // 2)
+    fem_utils._PLAN_CACHE.clear()
+    plan = fem_utils.compress_plan(_pattern(9))
+    assert plan is not None
+    assert len(fem_utils._PLAN_CACHE) == 0, "an oversized plan must not evict the world to cache itself"
