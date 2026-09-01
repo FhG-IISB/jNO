@@ -420,6 +420,59 @@ def internal_impedance(length, area, skin, round_, omega, sigma, mu0=4e-7 * jnp.
     return jnp.where(dead, dc.astype(z.dtype), z)
 
 
+def slab_transfer_impedance(length, width, thickness, omega, sigma, mu0=4e-7 * jnp.pi):
+    """The 2-port form of the slab impedance: one current sheet per face, and their coupling.
+
+    :func:`internal_impedance` gives a slab ONE impedance, which forces its current to be a single
+    unknown. That is what makes the element's inductance disagree with its resistance: the resistance
+    knows the current is confined to a skin layer at the faces, but with one unknown there is nowhere
+    to put it except spread through the whole cell. A return plane's THICKNESS then changes L at a
+    frequency where the copper below the skin layer is invisible -- measured against pypeec 5.8.0,
+    which resolves the skin depth with volume cells, +21.3 % where pypeec gives -0.05 %.
+
+    Giving each face its own sheet current lets the SOLVE find the split rather than assuming it,
+    which is the whole point: on a 1.6 mm plane at 7.7 skin depths the answer is about 92/8, and no
+    fixed rule reproduces that (a 50/50 face split was measured 16 % out).
+
+    The two sheets are the ports of the conducting slab treated as a transmission line across its
+    own thickness (Ramo, Whinnery & Van Duzer, *Fields and Waves in Communication Electronics*,
+    3rd ed., sec. 3.16-3.17)::
+
+        [V1]   gamma rho l  [  coth(gamma t)   csch(gamma t) ] [I1]
+        [V2] = -----------  [  csch(gamma t)   coth(gamma t) ] [I2]
+                    w
+
+    Returns ``(z_self, z_mutual)`` -- the diagonal and the off-diagonal.
+
+    **It reduces exactly to the one-unknown model.** The sheets sit in parallel across the same pair
+    of nodes, so equal currents ``I1 = I2 = I/2`` give ``V = (z_self + z_mutual) I / 2``, and since
+    ``coth(x) + csch(x) = coth(x/2)`` that is ``(gamma rho l / 2w) coth(gamma t / 2)`` -- the slab
+    branch of :func:`internal_impedance`, to the last bit. So the ``delta >> t`` limit is not merely
+    close, it is the same number, which is what makes this safe to switch on.
+
+    At DC both entries are ``rho l / A``: the pair is then degenerate and the split is decided by the
+    partial inductance rather than here, which is why a sheet pair is only ever emitted where the
+    conductor is thick against the skin depth (there is no skin depth at all at DC).
+    """
+    rho = 1.0 / jnp.asarray(sigma)
+    length, width, thickness = jnp.asarray(length), jnp.asarray(width), jnp.asarray(thickness)
+    w = jnp.asarray(omega)
+    dc = rho * length / (width * thickness)
+    # as in `internal_impedance`: substitute BEFORE the sqrt, or differentiating the masked branch
+    # through sqrt(0) gives NaN even where the value is discarded
+    dead = w == 0
+    g = jnp.sqrt(jnp.where(dead, 1.0, 1j * w * mu0 / rho))
+    gt = g * thickness
+    # coth and csch both go as 1/gt as gt -> 0, and `pre / gt` is exactly `dc` there, so the small
+    # branch needs no series: it is the DC resistance on the nose.
+    small = jnp.abs(gt) < 1e-6
+    safe = jnp.where(small, 1.0, gt)
+    pre = g * rho * length / width
+    z_self = jnp.where(small, dc.astype(complex), pre / jnp.tanh(safe))
+    z_mut = jnp.where(small, dc.astype(complex), pre / jnp.sinh(safe))
+    return (jnp.where(dead, dc.astype(complex), z_self), jnp.where(dead, dc.astype(complex), z_mut))
+
+
 def _i0_over_i1(z):
     """``I0(z) / I1(z)`` for complex ``z``, over the whole range a conductor reaches.
 
