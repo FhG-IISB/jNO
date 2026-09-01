@@ -22,6 +22,7 @@ from jno.utils.solver.peec import line_filaments, solve_network, terminal_nodes
 jax.config.update("jax_enable_x64", True)
 
 SIG, MM, RW = 5.8e7, 1e-3, 1.9e-4
+QUAD_W = 3 * 2**2  # the sub-point count a bar lattice carries; see jno.peec._QUAD / _QUAD_T
 ARC = [(0, 0, 0), (5 * MM, 0, 2 * MM), (10 * MM, 0, 0)]
 
 
@@ -122,7 +123,10 @@ def _welded_case():
     nb = len(np.asarray(fb.length))
     arc = [(3 * MM, 3 * MM, 0.6 * MM), (10 * MM, 3 * MM, 4 * MM), (17 * MM, 3 * MM, 0.6 * MM)]
     sh = jno.Shape.line(arc, r=RW, size=2 * MM)
-    fl = line_filaments(sh)
+    # A welded network shares one near-field block, vectorised over a single sub-point count: a bar
+    # samples its VOLUME (quad x quad_t^2), so the wire asks for that many along its length. This is
+    # what `jno.peec._discretise` does; here the network is assembled by hand, so it does it here.
+    fl = line_filaments(sh, quad=QUAD_W)
     nl = len(np.asarray(fl.length))
     fil, sigma = _weld([(fb, fb.lattice["sigma"]), (fl, jnp.full(nl, SIG))], [[plate], [sh]])
     p = np.asarray(fil.nodes)
@@ -139,10 +143,10 @@ FIL, SIGMA, TERM2, SH, ARC2, NBAR = _welded_case()
 def _welded_L(apex_z):
     """Loop inductance with the wire's apex raised to `apex_z`; the lattice never moves."""
     pts = jnp.asarray(ARC2).at[1, 2].set(apex_z)
-    fl = line_filaments(SH, points=[pts])
+    fl = line_filaments(SH, points=[pts], quad=QUAD_W)
     fil = FIL._replace(  # the geometry moves, the structure -- incidence, weld, numbering -- does not
-        pos=jnp.concatenate([FIL.pos[: NBAR * 3], fl.pos]),
-        mom=jnp.concatenate([FIL.mom[: NBAR * 3], fl.mom]),
+        pos=jnp.concatenate([FIL.pos[: NBAR * QUAD_W], fl.pos]),
+        mom=jnp.concatenate([FIL.mom[: NBAR * QUAD_W], fl.mom]),
         self_g=jnp.concatenate([FIL.self_g[:NBAR], fl.self_g]),
         length=jnp.concatenate([FIL.length[:NBAR], fl.length]),
     )
@@ -177,7 +181,9 @@ def test_a_welded_wire_is_differentiable_in_its_shape():
 def test_only_the_wire_block_moves():
     """The lattice half of a welded network must be untouched by the wire being re-routed."""
     ref = np.asarray(FIL.length[:NBAR]).copy()
-    moved = jnp.concatenate([FIL.length[:NBAR], line_filaments(SH, points=[jnp.asarray(ARC2).at[1, 2].add(2e-3)]).length])
+    moved = jnp.concatenate(
+        [FIL.length[:NBAR], line_filaments(SH, points=[jnp.asarray(ARC2).at[1, 2].add(2e-3)], quad=QUAD_W).length]
+    )
     assert np.allclose(np.asarray(moved[:NBAR]), ref, rtol=0, atol=0)  # bit-identical, not merely close
     assert not np.allclose(np.asarray(moved[NBAR:]), np.asarray(FIL.length[NBAR:]))  # the wire did move
 

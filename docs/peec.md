@@ -390,6 +390,21 @@ Every layer is checked against an oracle that does not go through the layer belo
 | every gradient | a central difference, to ~1e-6 relative |
 | the whole solve, end to end | **pypeec 5.8.0**, an independent PEEC code, on the same 20,480-cell grid: `R` agrees to 0.28 %, `L` to 0.08 % |
 | the `O(N log N)` inductance | the `O(N²)` pair sum it replaced, to 1e-11 relative |
+| a rectangular bar's partial inductance | Grover's rectangular-bar formula, `L = (μ₀l/2π)[ln(2l/(w+t)) + ½ + 0.2235(w+t)/l]` |
+| a near-neighbour mutual between two cells | a volume Monte-Carlo of the Neumann double integral — wrong in a completely different way from a Gauss rule |
+
+!!! warning "A lattice element is a cube, and the quadrature costs what that implies"
+    Sub-points sample an element's **volume**: `quad` along its axis, `quad_t` across each transverse
+    direction, so `quad · quad_t²` = **12** per element at the defaults. Sampling only along the axis
+    leaves the cross-section a point, which over-counts every near-neighbour mutual — measured against
+    the volume integral, **+1.2 %** when an element is 8× longer than it is thick, **+15.3 %** at a
+    cube, **+48.8 %** at 8× shorter. That is a wrong *trend*, not just a wrong number: it survives a
+    convergence study, because refining a lattice adds exactly the mutuals that are over-counted.
+
+    The price is that the count rose from 3 to 12, and the **dense and welded** paths pay it
+    quadratically — a welded module that solved in 27 s can now take minutes. The FFT lattice path is
+    unaffected in `N`; only its one-off kernel build grows. Lower `quad_t` if a model is all wires,
+    where a filament is thin by construction and gains nothing from transverse sampling.
 
 ## Cost — what to expect
 
