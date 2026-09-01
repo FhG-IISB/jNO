@@ -1439,8 +1439,12 @@ def _check_unresolved_thickness(fil, sigma, omega, mu0):
         "skin depths through it. Neither model applies there: an element may only take the surface "
         "impedance when it IS the whole thickness, and cells this coarse cannot resolve the current "
         "distribution either, so those elements fall back to the DC resistance. Use ONE cell through "
-        "the thickness -- the surface impedance is exact there at any frequency -- or at least "
-        f"{float(cell[k]) / (0.5 * float(delta[k])):.0f}x finer so two cells fit in a skin depth."
+        "the thickness -- exact at any frequency, and a conductor this thick then carries a current "
+        "sheet per face -- or at least "
+        f"{float(cell[k]) / (0.5 * float(delta[k])):.0f}x finer so two cells fit in a skin depth. "
+        "If one cell is what you ASKED for, a thinner conductor sharing this lattice has overridden "
+        "it: solids share one pitch, in z as well as in plane, and the finest wins. Give the thick "
+        "conductor its own discretisation, or match the pitches."
     )
     if n * 2 > bad.size:
         # A majority is the MODEL being wrong, so it is refused every time it is asked.
