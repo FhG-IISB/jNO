@@ -41,6 +41,7 @@ __all__ = [
     "block_diag",
     "triangular",
     "amg",
+    "hypre",
     "jaxamg",
     "cached",
     "ams",
@@ -282,6 +283,133 @@ class _Chebyshev(_Spec):
 
     def __repr__(self):
         return f"jno.precond.chebyshev(degree={self.degree})"
+
+
+class _Hypre(_Spec):
+    """Spec for a hypre preconditioner reached through PETSc; see :func:`hypre`."""
+
+    traceable = False  # PETSc assembles on the host from a concrete matrix
+    complex_ok = False  # hypre's AMS/BoomerAMG are real-only
+
+    def __init__(self, kind, options):
+        self.kind = str(kind)
+        self.options = dict(options)
+
+    def materialize(self, ctx: PrecondContext):
+        import numpy as np
+        import scipy.sparse as sp
+
+        from .utils.solver.amg import _to_scipy_csr
+
+        try:
+            import petsc4py
+
+            petsc4py.init([])
+            from petsc4py import PETSc
+        except Exception as e:  # noqa: BLE001
+            raise ImportError(
+                "jno.precond.hypre needs petsc4py built with hypre. `pip install petsc4py`, then "
+                f"check `PETSc.PC().setType('hypre')` succeeds. Import failed with: {e}"
+            ) from e
+
+        A = ctx.A
+        if A.bcoo is None:
+            raise ValueError(
+                "jno.precond.hypre needs an ASSEMBLED (sparse) operator — PETSc builds its "
+                "preconditioner from the matrix entries. It cannot run on a matrix-free operator."
+            )
+        csr = _to_scipy_csr(A.bcoo).tocsr()
+        if np.iscomplexobj(csr.data):
+            raise ValueError(
+                "jno.precond.hypre: hypre's AMS and BoomerAMG are REAL-only, but this operator is "
+                "complex. Wrap it: jno.precond.real_equivalent(jno.precond.hypre(...)), which hands "
+                "the inner the real K + M block."
+            )
+        n = csr.shape[0]
+        mat = PETSc.Mat().createAIJ(size=csr.shape, csr=(csr.indptr, csr.indices, csr.data))
+
+        pc = PETSc.PC().create()
+        pc.setOperators(mat)
+        pc.setType("hypre")
+        pc.setHYPREType(self.kind)
+        if self.kind == "ams":
+            # AMS needs the H(curl) structure: the discrete gradient and the node coordinates. jNO
+            # already builds the gradient for its own AMS, from the same topology.
+            fem = ctx.fem
+            if fem is None:
+                raise TypeError(
+                    "jno.precond.hypre(kind='ams') needs the owning FEM to read the N1E edge "
+                    "topology — use it via fem.solve(precond=...), not on a bare operator."
+                )
+            from .utils.solver.ams import discrete_gradient
+
+            G = discrete_gradient(fem.domain._fem_nonnodal_topology)
+            gi, gd = np.asarray(G.indices), np.asarray(G.data)
+            Gs = sp.csr_matrix((gd, (gi[:, 0], gi[:, 1])), shape=tuple(int(x) for x in G.shape))
+            if Gs.shape[0] != n:
+                raise ValueError(
+                    f"jno.precond.hypre(kind='ams'): the operator is {n} x {n} but the edge "
+                    f"(H(curl)) space has {Gs.shape[0]} DOFs, so this is a MIXED system and AMS "
+                    "cannot tell which block is its own. Put it in a block preconditioner that names "
+                    "the field: jno.precond.triangular((u, jno.precond.hypre(kind='ams')), (p, ...))."
+                )
+            pc.setHYPREDiscreteGradient(PETSc.Mat().createAIJ(size=Gs.shape, csr=(Gs.indptr, Gs.indices, Gs.data)))
+            pts = np.ascontiguousarray(np.asarray(fem.domain.mesh.points)[:, :3], dtype=np.float64)
+            pc.setCoordinates(pts)
+        opts = PETSc.Options()
+        for k, v in self.options.items():
+            opts.setValue(f"pc_hypre_{self.kind}_{k}", v)
+        pc.setFromOptions()
+        pc.setUp()
+
+        xv, bv = mat.createVecRight(), mat.createVecLeft()
+
+        def _host(r):
+            bv.setArray(np.asarray(r, dtype=np.float64))
+            pc.apply(bv, xv)
+            return np.asarray(xv.getArray()).copy()
+
+        import jax as _jax
+
+        def apply(r):
+            return _jax.pure_callback(_host, _jax.ShapeDtypeStruct((n,), jnp.float64), r, vmap_method="sequential")
+
+        # Symmetric preconditioner -> the transpose applier is itself. A preconditioner never has to
+        # be differentiable: `lax.custom_linear_solve` puts d/dtheta on the OPERATOR, so nothing here
+        # is traced through. That is the same contract the SuperLU / PARDISO / pyamg paths ride on.
+        return PrecondApplier(apply, apply)
+
+
+def hypre(kind: str = "ams", **options) -> _Hypre:
+    """**hypre** preconditioners (AMS, BoomerAMG) via PETSc — a reference-grade H(curl) solver.
+
+    One duck-typed entry for the whole library rather than a wrapper per preconditioner: ``kind`` is
+    passed straight to ``PCHYPRE`` and keyword options become ``-pc_hypre_<kind>_<key>``::
+
+        fem.solve(linear=jno.solve.fgmres(),
+                  precond=jno.precond.real_equivalent(
+                      jno.precond.triangular((u, jno.precond.hypre(kind="ams")),
+                                             (p, jno.precond.amg()))))
+
+    ``kind="ams"`` is the auxiliary-space Maxwell solver (Hiptmair & Xu 2007; Kolev & Vassilevski
+    2009) — the same method as :func:`ams`, but hypre's production implementation, which additionally
+    carries the machinery for a **semidefinite** problem where ``sigma = 0`` over part of the domain
+    (interior-node marking, a restricted gradient, gradient projection). jNO's own :func:`ams` has
+    none of that. Measured on an A–V eddy problem where it matters, hypre reached 8.6e-03 with
+    interior nodes marked against no progress at all without them.
+
+    **It is not automatically faster.** On the same 89,920-DOF H(curl) block of a planar-transformer
+    A–V system, hypre reached 4.33e-09 and jNO's own ``ams()`` reached 8.03e-09 — equivalent. Reach
+    for this as a **reference implementation** to check jNO against, or for the ``sigma = 0`` features,
+    not on the assumption that a production library must win.
+
+    Requires ``petsc4py`` built with hypre, and runs on the **host** through ``pure_callback``.
+    That costs a device round-trip per apply and is not traceable, but it does **not** affect
+    differentiability: a preconditioner cannot change the solution, so
+    :func:`jax.lax.custom_linear_solve` differentiates through the *operator* and never through the
+    preconditioner — the same contract the SuperLU, PARDISO and pyamg paths already use.
+    """
+    return _Hypre(kind, options)
 
 
 def real_equivalent(inner) -> _RealEquivalent:
