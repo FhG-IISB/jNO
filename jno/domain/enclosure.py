@@ -26,6 +26,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from ..trace import Placeholder
 from .mesh_utils import MeshUtils
 
 
@@ -483,6 +484,96 @@ def _consistent_node_weights(areas: np.ndarray, endpoints, axisymmetric: bool) -
     return np.stack([w0, w1], axis=1)
 
 
+class PendingElementExpr:
+    """A per-element computation still waiting for the solution vector.
+
+    Produced by :meth:`Enclosure.field` when it is handed a *symbolic* trial function rather than a
+    concrete DOF vector, and consumed by :meth:`Enclosure.load`, which closes it into a
+    ``jno.Coupling``. Arithmetic records the operation instead of performing it, so a nonlocal term is
+    written as an expression in the ``jno.fem([...])`` list::
+
+        gap.load(G @ gap.field(u) ** 4)              # an expression, sits in the term list
+        lambda T: gap.load(G @ gap.field(T) ** 4)    # the same thing, written by hand
+
+    This is not radiation-specific. Every nonlocal term in jNO has the same **gather -> operate ->
+    scatter** shape -- integral and non-reflecting BCs, contact, peridynamics -- and ``field``/``load``
+    are already the gather and the scatter, so deferring them covers all of them with one mechanism.
+    The physics in between stays yours to write.
+
+    .. important::
+       The block this produces is **dense** in element space. It reads like a weak term and is not
+       one: its Jacobian couples every element to every other, which is why ``fem.solve`` stays on
+       matrix-free Newton-Krylov rather than assembling a sparse tangent.
+    """
+
+    __slots__ = ("_fn",)
+
+    # NumPy checks this before trying to coerce an unknown right operand, so `ndarray @ pending`
+    # reaches __rmatmul__ instead of being turned into an object array. JAX arrays already return
+    # NotImplemented for unrecognized operands, which routes there too.
+    __array_priority__ = 1000.0
+    __array_ufunc__ = None
+
+    def __init__(self, fn):
+        self._fn = fn
+
+    def __call__(self, u):
+        return self._fn(u)
+
+    def _lift(self, other, op, swap=False):
+        fn = self._fn
+        if isinstance(other, PendingElementExpr):
+            g = other._fn
+            return PendingElementExpr(lambda u: op(g(u), fn(u)) if swap else op(fn(u), g(u)))
+        return PendingElementExpr(lambda u: op(other, fn(u)) if swap else op(fn(u), other))
+
+    def __add__(self, o):
+        return self._lift(o, lambda a, b: a + b)
+
+    def __radd__(self, o):
+        return self._lift(o, lambda a, b: a + b, swap=True)
+
+    def __sub__(self, o):
+        return self._lift(o, lambda a, b: a - b)
+
+    def __rsub__(self, o):
+        return self._lift(o, lambda a, b: a - b, swap=True)
+
+    def __mul__(self, o):
+        return self._lift(o, lambda a, b: a * b)
+
+    def __rmul__(self, o):
+        return self._lift(o, lambda a, b: a * b, swap=True)
+
+    def __truediv__(self, o):
+        return self._lift(o, lambda a, b: a / b)
+
+    def __rtruediv__(self, o):
+        return self._lift(o, lambda a, b: a / b, swap=True)
+
+    def __matmul__(self, o):
+        return self._lift(o, lambda a, b: a @ b)
+
+    def __rmatmul__(self, o):
+        return self._lift(o, lambda a, b: a @ b, swap=True)
+
+    def __pow__(self, o):
+        return self._lift(o, lambda a, b: a**b)
+
+    def __neg__(self):
+        fn = self._fn
+        return PendingElementExpr(lambda u: -fn(u))
+
+    def apply(self, fn):
+        """Record an arbitrary elementwise/array function, for anything the operators do not cover
+        (``gap.field(u).apply(jnp.exp)``)."""
+        inner = self._fn
+        return PendingElementExpr(lambda u: fn(inner(u)))
+
+    def __repr__(self):
+        return "PendingElementExpr(<pending nonlocal term; pass to enclosure.load>)"
+
+
 class Enclosure:
     """Geometric handle for an enclosure-radiation surface set (see module docstring).
 
@@ -543,7 +634,14 @@ class Enclosure:
         """Per-element temperature ``(m,)`` from the global solution ``u`` — the **nonlocal gather**.
 
         Radiosity is piecewise-constant per boundary element, so each element's temperature is the mean
-        of its two endpoint (FEM node) values. Differentiable in ``u`` (used inside the Newton residual)."""
+        of its two endpoint (FEM node) values. Differentiable in ``u`` (used inside the Newton residual).
+
+        Handed a **symbolic** trial function (``u, v = d.fem_symbols()``) instead of a concrete DOF
+        vector, this returns a :class:`PendingElementExpr` instead: the gather is recorded, arithmetic
+        on it is recorded, and :meth:`load` closes it into a ``jno.Coupling``. That is what lets a
+        nonlocal term be written as an expression in the ``jno.fem([...])`` list rather than a lambda."""
+        if isinstance(u, Placeholder):
+            return PendingElementExpr(self.field)
         u = jnp.asarray(u).reshape(-1)
         return 0.5 * (u[self.elements[:, 0]] + u[self.elements[:, 1]])
 
@@ -560,7 +658,16 @@ class Enclosure:
            With ``axisymmetric=True`` this load is **per full revolution** (W, not W/m): the measure is
            ``2πr ds``. jNO does not weight the FEM forms for you, so the weak form this load is added to
            must carry the same ``2πr`` factor or the two sides differ by exactly that. See the
-           *Axisymmetric* section of ``docs/fem.md``."""
+           *Axisymmetric* section of ``docs/fem/geometry.md``.
+
+        Given a :class:`PendingElementExpr` (anything built from a symbolic ``field(u)``) this returns
+        the ``jno.Coupling`` that closes it over the solution vector, so the whole nonlocal term is an
+        expression that drops straight into the ``jno.fem([...])`` list."""
+        if isinstance(q, PendingElementExpr):
+            from .._fem import Coupling  # local: jno._fem imports the domain package
+
+            tags = ",".join(map(str, self.tags)) if getattr(self, "tags", None) else "enclosure"
+            return Coupling(lambda u: self.load(q(u), size=size), name=f"enclosure[{tags}]")
         q = jnp.asarray(q).reshape(-1)
         n = int(size) if size is not None else int(np.asarray(self.domain.mesh.points).shape[0])
         w = self._node_weights.astype(q.dtype)
@@ -835,6 +942,19 @@ def _classify_triangles(domain, triangles: np.ndarray, pts: np.ndarray) -> np.nd
     regions = getattr(domain, "_source_regions", {}) or {}
     cent = pts[triangles].mean(axis=1)
     region_of = np.full(triangles.shape[0], None, dtype=object)
+    if not regions:
+        # A ``Shape.regions`` domain carries its regions as Shapes, not shapely geometries. They answer
+        # the same question through ``Shape.contains`` (analytic CSG membership, already vectorised
+        # over points), and dict order is declaration order == region priority, matching the first-hit
+        # rule below. Without this an enclosure cannot be built on a Shape-built domain at all: every
+        # centroid stays unclassified, so no solid|medium interface edge is ever found.
+        for name, sub in (getattr(domain, "_shape_regions", {}) or {}).items():
+            try:
+                hit = np.asarray(sub.contains(cent[:, : sub.dim]), dtype=bool)
+            except NotImplementedError:
+                continue  # a swept/revolved region has no closed-form membership
+            region_of[hit & (region_of == None)] = name  # noqa: E711
+        return region_of
     try:
         from shapely.vectorized import contains as _vcontains
 
@@ -1056,6 +1176,27 @@ def build_enclosure(
         _regions = getattr(domain, "_source_regions", {}) or {}
         _transparent = {str(t) for t in medium_tags}
         solid_geoms = [g for name, g in _regions.items() if str(name) not in _transparent]
+        if not solid_geoms and getattr(domain, "_shape_regions", None):
+            # A Shape.regions domain has no shapely regions, so the line above yields NOTHING and the
+            # enclosure would be built with an empty occluder model -- every pair mutually visible,
+            # through solid metal and insulation alike. It fails silently: closure and reciprocity stay
+            # perfect (they are enforced), so the F that comes out looks entirely plausible. Measured on
+            # the cg furnace, one Quartz.1->WallO pair read 0.024 unoccluded against 0.363 occluded, and
+            # the coupled solve landed 620 K cold.
+            #
+            # The mesh already carries the answer: `tri_region` labels every cell, so each opaque
+            # region's meridian outline is the union of its own cells. Exact for straight-edged regions
+            # (the cells tile them), and it needs no shapely geometry from the caller.
+            from shapely.geometry import Polygon as _SPoly
+            from shapely.ops import unary_union as _uu
+
+            for _name in sorted({str(x) for x in tri_region if x is not None} - _transparent):
+                _sel = np.where(tri_region == _name)[0]
+                if not len(_sel):
+                    continue
+                _g = _uu([_SPoly(pts[triangles[t]][:, :2]) for t in _sel]).buffer(0)
+                if not _g.is_empty:
+                    solid_geoms.append(_g)
 
     # The AXISYMMETRIC path resolves visibility analytically inside the kernel, so none of the
     # sampled machinery below is built for it. That is where the speedup lives: the expensive step was

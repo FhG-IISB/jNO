@@ -142,27 +142,80 @@ def _plan_sizes(shape):
     return out
 
 
+def _interior_probes(dim: int, coarse: float) -> Dict[int, "object"]:
+    """One point per top-dimensional entity that is genuinely INSIDE it, as ``{tag: (1, 3) array}``.
+
+    ``occ.getCenterOfMass`` is not such a point. A fragmented multi-material domain routinely produces
+    non-simply-connected entities -- a crucible wrapped around its cavity, or the leftover void
+    enclosing everything -- and the centre of mass of a ring lies in its HOLE, that is, inside a
+    different region. Classifying by it therefore hands that entity the wrong region's mesh size.
+    Measured on a 17-region furnace: 2 of 17 surfaces misclassified, one of them the void that fills
+    most of the domain, which was meshed at the growth cavity's 0.96 mm instead of its own 2.70 mm.
+
+    A throwaway mesh at ``coarse`` gives every entity at least one cell, and a cell centroid is inside
+    the entity by construction. The mesh is cleared before returning, so the real generate() is
+    unaffected. Falls back to an empty result (leaving the caller on centre of mass) if meshing this
+    early fails for any reason -- a wrong size is better than no mesh.
+    """
+    import gmsh
+    import numpy as np
+
+    prev = gmsh.option.getNumber("Mesh.MeshSizeMax")
+    out: Dict[int, object] = {}
+    try:
+        gmsh.option.setNumber("Mesh.MeshSizeMax", float(coarse))
+        gmsh.model.mesh.generate(dim)
+        for _d, tag in gmsh.model.getEntities(dim):
+            _types, _tags, node_tags = gmsh.model.mesh.getElements(dim, tag)
+            if not node_tags or not len(node_tags[0]):
+                continue
+            first = np.asarray(node_tags[0])[: dim + 1]  # one simplex: 3 nodes in 2-D, 4 in 3-D
+            xyz = np.array([gmsh.model.mesh.getNode(int(n))[0] for n in first], dtype=float)
+            out[tag] = xyz.mean(axis=0).reshape(1, 3)
+    except Exception:  # noqa: BLE001 - any mesher failure just means we keep the old classification
+        out = {}
+    finally:
+        gmsh.model.mesh.clear()
+        gmsh.option.setNumber("Mesh.MeshSizeMax", prev)
+    return out
+
+
 def _apply_region_sizes(dim: int, shape) -> Optional[float]:
-    """Per-**region** mesh size for a ``conforming=False`` multi-material shape.
+    """Per-**region** mesh size for a multi-material (:meth:`Shape.regions`) shape.
 
     The ordinary path (:func:`_apply_size_fields`) turns each ``size=`` into a Distance+Threshold
-    *field*, which is a function of POSITION. Two coincident faces sit at the same position, so both
-    bodies of a non-conforming interface get the same target size and gmsh meshes them identically --
-    the two sides come out matching, the tie resolves node-to-node, and the mortar coupling is never
-    reached. Measured: a 3x size ratio between two stacked blocks still gave 41 nodes on each side.
+    *field*, which is a function of POSITION. That is wrong for a multi-material domain twice over.
 
-    Sizing each region's own OCC entities instead is what makes "coarse body, fine body" expressible.
-    Entities are attributed to regions by centroid containment -- the same test ``_to_meshio`` uses for
-    cells -- so no extra plumbing is needed from the emitter. Note this only makes sense when the
-    pieces are NOT fragmented: a conforming interface shares its points between both regions, so a
-    per-region size would just be whichever was written last.
+    **conforming=False.** Two coincident faces sit at the same position, so both bodies of a
+    non-conforming interface get the same target size and gmsh meshes them identically -- the two
+    sides come out matching, the tie resolves node-to-node, and the mortar coupling is never reached.
+    Measured: a 3x size ratio between two stacked blocks still gave 41 nodes on each side.
+
+    **conforming=True.** A Threshold field refines a *band* around the region's boundary and relaxes
+    to the background size beyond it, so a region wider than that band is fine only near its edges and
+    coarse in the middle -- the opposite of "this material is resolved at h". Sizing the region's own
+    OCC points and letting gmsh's ``MeshSizeExtendFromBoundary`` carry it inward keeps the whole
+    region at its requested size instead.
+
+    Measured on a 17-region furnace, 6 mm ambient with five regions overridden down to 0.6 mm: the
+    Threshold field left every region's interior at ambient (2644 nodes); point sizing reproduces the
+    polygon path (``PolygonDomain.build_mesh(region_mesh_sizes=..., interpolate=True)``) to within
+    5 nodes of 6921, with the achieved-vs-requested size ratio matching in all 17 regions.
+
+    Either way entities are attributed to regions by centroid containment -- the same test
+    ``_to_meshio`` uses for cells, so region priority (declaration order) is honoured and no extra
+    plumbing is needed from the emitter. A conforming interface *shares* its points between both
+    regions, so a shared point takes the **finest** of the sizes claiming it (never "whichever was
+    written last"), which is what makes a coarse region adjacent to a fine one grade rather than
+    quantise. Same min-wins rule as the polygon path's ``size_for_point``.
 
     Returns a representative ``ds``, or ``None`` when it does not apply (leaving the field path in
     charge).
     """
     node = shape._node
-    if node[0] != "regions" or (len(node) > 2 and node[2]):
-        return None  # not a regions shape, or conforming -> shared entities, per-region size is moot
+    if node[0] != "regions":
+        return None
+    conforming = bool(node[2]) if len(node) > 2 else True
     items = node[1]
     sizes = {name: sub._size for name, sub in items if isinstance(sub._size, (int, float))}
     if not sizes:
@@ -171,28 +224,56 @@ def _apply_region_sizes(dim: int, shape) -> Optional[float]:
     import gmsh
     import numpy as np
 
+    # The ambient size, for regions that declared none. It has to be applied EXPLICITLY rather than
+    # left unset: gmsh grows cells outward from whatever points do carry a size, so without a coarse
+    # anchor in the unsized regions the finest declared size bleeds across the whole domain. Measured
+    # on the furnace, before this: every unsized 6 mm region came out at 0.87 mm (ratio 0.14) because
+    # the only anchors in reach were the 0.6-0.96 mm crystal and cavity.
+    ambient = float(shape._size) if isinstance(shape._size, (int, float)) else max(sizes.values())
+
     applied: List[float] = []
+    finest: Dict[int, float] = {}  # point tag -> smallest size claiming it (conforming only)
+    probes = _interior_probes(dim, ambient)
     for edim, etag in gmsh.model.getEntities(dim):
-        centre = np.asarray(gmsh.model.occ.getCenterOfMass(edim, etag), dtype=float).reshape(1, 3)
+        centre = probes.get(etag)
+        if centre is None:
+            centre = np.asarray(gmsh.model.occ.getCenterOfMass(edim, etag), dtype=float).reshape(1, 3)
         for name, sub in items:
-            if name not in sizes:
-                continue
             try:
                 inside = bool(np.asarray(sub.contains(centre[:, : sub.dim]))[0])
             except NotImplementedError:
                 inside = False  # a swept/revolved region has no closed-form membership; skip it
             if inside:
+                # Priority is by CONTAINMENT, not by "declared a size". An unsized region still owns
+                # its cells and pins them at `ambient`; letting it fall through would hand them to
+                # some later region that merely encloses it (a background/void region typically does
+                # enclose everything) and silently impose that region's size on them.
                 pts = [e for e in gmsh.model.getBoundary([(edim, etag)], oriented=False, recursive=True) if e[0] == 0]
-                if pts:
-                    gmsh.model.mesh.setSize(pts, float(sizes[name]))
-                    applied.append(float(sizes[name]))
+                s = float(sizes.get(name, ambient))
+                if not pts:
+                    pass
+                elif conforming:
+                    for _pdim, ptag in pts:
+                        if s < finest.get(ptag, math.inf):
+                            finest[ptag] = s
+                else:
+                    gmsh.model.mesh.setSize(pts, s)
+                    applied.append(s)
                 break
+    for ptag, s in finest.items():
+        gmsh.model.mesh.setSize([(0, ptag)], s)
+        applied.append(s)
     if not applied:
         return None
     # The field path disables point sizes; this one depends on them.
     gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 1)
     gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 1)
     gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
+    # A scalar on the whole regions shape is the ambient cap -- the analogue of the polygon path's
+    # `mesh_size` argument, and the only way to coarsen a region that declared no size of its own.
+    top = shape._size if isinstance(shape._size, (int, float)) else None
+    if top is not None:
+        gmsh.option.setNumber("Mesh.MeshSizeMax", float(top))
     return float(min(applied))
 
 
@@ -223,7 +304,14 @@ def _apply_size_fields(dim: int, leaves, labels: Dict[int, Tuple[int, str]], sha
             field.setNumber(th, "SizeMin", float(s))
             field.setNumber(th, "SizeMax", float(background))
             field.setNumber(th, "DistMin", float(s))
-            field.setNumber(th, "DistMax", float(10.0 * s))
+            # How far the refined band reaches before relaxing to `background`. A fixed multiple of
+            # `s` cannot work: the distance a mesh NEEDS to coarsen is set by the size RATIO, since
+            # gmsh grows cells at ~1.1x per element. Ask for 6 mm ambient around a 0.96 mm region and
+            # 10*s = 9.6 mm is only half the ~19 cells that growth takes, so the region's interior
+            # falls back to ambient and the refinement is lost exactly where it was requested.
+            # Same rule as the polygon path's region_mesh_sizes grading (polygon_domain.py).
+            n_cells = max(3.0, math.log(max(float(background) / float(s), 1.001)) / math.log(1.1))
+            field.setNumber(th, "DistMax", float(n_cells * s))
             thresholds.append(th)
         if thresholds:
             mn = field.add("Min")
@@ -250,7 +338,7 @@ def _apply_size_fields(dim: int, leaves, labels: Dict[int, Tuple[int, str]], sha
         gmsh.option.setNumber("Mesh.MeshSizeMax", float(top))
 
     if thresholds or callables or top is not None:
-        gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
+        gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 1)
         gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 0)
         gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
 
