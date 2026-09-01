@@ -239,7 +239,7 @@ def resolve_sigma(value, xyz, what: str, tangent=None):
     return arr
 
 
-def line_filaments(shape, size: float = None, quad: int = 3, points=None, radii=None):
+def line_filaments(shape, size: float = None, quad: int = 3, points=None, radii=None, quad_t: int = 1):
     """Discretise :meth:`jno.Shape.line` conductors into filaments, with Gauss sub-points.
 
     Args:
@@ -351,12 +351,16 @@ def line_filaments(shape, size: float = None, quad: int = 3, points=None, radii=
     cen = a3 + u3 * (ln * (jj + 0.5))[:, None]
     nodes = PTS[ia[nfil]] + u3[nfil] * (ln[nfil] * (jj[nfil] + noff))[:, None]
 
-    gx, gw = np.polynomial.legendre.leggauss(int(quad))
+    # A filament is thin by construction, so it needs no TRANSVERSE sampling the way a lattice cell
+    # does -- but a welded network mixes the two, and the vectorised near-field block requires one
+    # sub-point count throughout. So a line gets the same COUNT, spent where it helps a wire: more
+    # points along its own length.
+    gx, gw = np.polynomial.legendre.leggauss(int(quad) * int(quad_t) ** 2)
     gx, gw = jnp.asarray(gx), jnp.asarray(gw)
     # sub-points along each filament, and moments that sum to `tangent * length` per filament
     pos = (cen[:, None, :] + 0.5 * ln[:, None, None] * gx[None, :, None] * u3[:, None, :]).reshape(-1, 3)
     mom = (u3[:, None, :] * (ln[:, None] * gw[None, :] * 0.5)[:, :, None]).reshape(-1, 3)
-    group = np.repeat(np.arange(n), int(quad))
+    group = np.repeat(np.arange(n), int(quad) * int(quad_t) ** 2)
     self_g = wire_self(ln, rad if isinstance(rad, jax.core.Tracer) else np.asarray(rad))
     area = jnp.pi * jnp.asarray(rad) ** 2
 
@@ -1493,7 +1497,29 @@ def _warn_once(msg: str) -> None:
         logging.getLogger("jno").warning(msg)
 
 
-def bar_filaments(shape, size=None, quad: int = 3, sigma=None):
+def _volume_rule(ln, wt, axis, quad: int, quad_t: int):
+    """Tensor-product Gauss points over each element's VOLUME.
+
+    Returns ``(offsets, weights)`` shaped ``(n_elem, quad * quad_t**2, 3)`` and
+    ``(n_elem, quad * quad_t**2)``. The offsets are relative to the cell centre; the weights are the
+    element's current moment split over them, so they sum to its LENGTH -- which is the invariant the
+    partial-inductance machinery rests on, and what the far field must still see.
+    """
+    gl, wl = np.polynomial.legendre.leggauss(quad)
+    gt, wtq = np.polynomial.legendre.leggauss(quad_t)
+    i, j, k = (a.reshape(-1) for a in np.meshgrid(np.arange(quad), np.arange(quad_t), np.arange(quad_t), indexing="ij"))
+    n = len(ln)
+    off = np.zeros((n, i.size, 3))
+    other = np.stack([[c for c in range(3) if c != ax] for ax in axis])  # the two transverse axes
+    rows = np.arange(n)[:, None]
+    off[rows, np.arange(i.size)[None, :], axis[:, None]] = 0.5 * ln[:, None] * gl[i][None, :]
+    off[rows, np.arange(i.size)[None, :], other[:, 0][:, None]] = 0.5 * wt[:, 0][:, None] * gt[j][None, :]
+    off[rows, np.arange(i.size)[None, :], other[:, 1][:, None]] = 0.5 * wt[:, 1][:, None] * gt[k][None, :]
+    w = ln[:, None] * (wl[i] * wtq[j] * wtq[k])[None, :] / 8.0
+    return off, w
+
+
+def bar_filaments(shape, size=None, quad: int = 3, quad_t: int = 2, sigma=None):
     """Discretise a box conductor into a regular lattice of rectangular bars.
 
     A solid does not have a centreline, so a line's discretisation does not apply. The volume is cut
@@ -1731,11 +1757,20 @@ def bar_filaments(shape, size=None, quad: int = 3, sigma=None):
             "series combination."
         )
 
-    gx, gw = np.polynomial.legendre.leggauss(int(quad))
-    pos = (cen[:, None, :] + 0.5 * ln[:, None, None] * gx[None, :, None] * tan[:, None, :]).reshape(-1, 3)
-    mom = (tan[:, None, :] * (ln[:, None] * gw[None, :] * 0.5)[:, :, None]).reshape(-1, 3)
-    group = np.repeat(np.arange(nb), int(quad))
     wt = np.stack([np.array([d[i] for i in range(3) if i != ax]) for ax in axis])
+    # A lattice element is a CUBE, so the quadrature samples it like one. Points only along the axis
+    # leave the cross-section a point, and neighbouring cells sit one pitch apart while extending a
+    # full pitch transversely -- so every near-neighbour mutual was over-counted. Measured against
+    # the volume integral: +1.2 % when the element is 8x longer than it is thick, +15.3 % at a cube,
+    # +48.8 % at 8x shorter. `quad_t` is separate from `quad` because the two buy different things
+    # and cost differently: the axis rule sets the along-length accuracy of FAR pairs, the transverse
+    # rule fixes NEAR over-counting, and the sub-point count -- which the dense and welded paths pay
+    # quadratically -- goes as quad * quad_t^2.
+    sub, wsub = _volume_rule(ln, wt, axis, int(quad), int(quad_t))
+    nsub = sub.shape[1]
+    pos = (cen[:, None, :] + sub).reshape(-1, 3)
+    mom = (tan[:, None, :] * wsub[:, :, None]).reshape(-1, 3)
+    group = np.repeat(np.arange(nb), nsub)
     self_g = bar_self(ln, wt[:, 0], wt[:, 1])  # numpy in, numpy out: a host constant of the grid
 
     ir, ic, iv, off = [], [], [], 0
@@ -1779,7 +1814,7 @@ def bar_filaments(shape, size=None, quad: int = 3, sigma=None):
     )
 
 
-def lattice_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3):
+def lattice_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3, quad_t: int = 2):
     """``apply(cur) -> Lp @ cur`` for a bar lattice, by FFT, without forming ``Lp``.
 
     Two facts about a bar lattice make this exact rather than approximate:
@@ -1819,9 +1854,11 @@ def lattice_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3):
         k = int((axis == ax).sum())
         shape = tuple(v - 1 if i == ax else v for i, v in enumerate(n))
         length = float(d[ax])  # a lattice element IS the pitch; see the note on lattice["self"]
-        sub = np.zeros((int(quad), 3))
-        sub[:, ax] = 0.5 * length * gx
-        w = length * gw * 0.5
+        wtx = np.array([d[c] for c in range(3) if c != ax])
+        sub, wq = _volume_rule(
+            np.array([length]), wtx[None, :], np.array([ax]), int(quad), int(quad_t)
+        )
+        sub, w = sub[0], wq[0]
         sg = float(lat["self"][int(ax)])
         ops.append(lattice_operator(shape, d, g, sg, sub=sub, w=w))
         slices.append(slice(start, start + k))
@@ -1915,7 +1952,7 @@ def cross_block(pos_a, mom_a, grp_a, na, pos_b, mom_b, grp_b, nb, g, scale=1.0, 
     return scale * jax.ops.segment_sum(blk, ga, num_segments=na)  # then a
 
 
-def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3):
+def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3, quad_t: int = 2):
     """``apply(cur) -> Lp @ cur`` for a network of several discretisations, still without forming Lp.
 
     Each block keeps whatever structure it has -- a lattice by FFT, a set of filaments densely -- and
@@ -1951,7 +1988,7 @@ def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3):
             k = pair_matrix(sub.pos, sub.mom, g, sub.self_g, group=sub.group) * mu_scale
             diag.append(lambda x, k=k: k @ x)
         else:
-            diag.append(lattice_apply(sub, g, mu_scale=mu_scale, quad=quad))
+            diag.append(lattice_apply(sub, g, mu_scale=mu_scale, quad=quad, quad_t=quad_t))
         sel.append((lo, hi, rows, gl, cnt))
 
     cross = {}

@@ -89,6 +89,10 @@ __all__ = ["peec"]
 
 MU0 = 4e-7 * np.pi
 
+#: Quadrature the discretisation is built at: `quad` points along an element and `quad_t` across it.
+#: They must agree between the line and bar halves of a welded network — see `_discretise`.
+_QUAD, _QUAD_T = 3, 2
+
 
 def _domain_of(constraints):
     for c in constraints:
@@ -423,7 +427,13 @@ class PEEC:
 
         parts, owners, blocks = [], [], []  # (Filaments, sigma), the shapes, and (names, resolver)
         if lines:
-            fl = line_filaments(lines)
+            # A WELDED network shares one near-field block, which is vectorised over a single
+            # sub-point count. A bar samples its VOLUME (quad x quad_t^2 points) because a lattice
+            # cell is a cube; a wire is thin and needs none of that, so it spends the matching count
+            # on points along its own length, where they do help it. With no solids there is nothing
+            # to match and a wire keeps the plain rule -- the count is a WELD constraint, not a
+            # property of a filament.
+            fl = line_filaments(lines, quad=_QUAD * _QUAD_T**2 if solids else _QUAD)
             # Each conductor's conductivity is resolved over ITS OWN filaments, so a field sees the
             # midpoints of the wire it belongs to and a per-element vector is that wire's own count.
             cen, fpart = element_centres(fl), np.asarray(fl.part)
