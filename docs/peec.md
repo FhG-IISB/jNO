@@ -298,6 +298,51 @@ sol = built.solve(restart=48, matrix_free=None, devices={"MD": 6.1e-3})
     It never returns the unconverged iterate. The message names both levers — `solve(restart=48)` and
     `solve(matrix_free=False)`.
 
+## A conductor with no terminal
+
+A body no port touches — a ground plane under a trace layer, a shield, a floating heatsink — carries
+only the currents the rest of the network induces in it. Its potential is undetermined (add any
+constant and every current is unchanged), so `jno.peec` **pins one of its nodes automatically** and
+says so:
+
+```
+peec: 1 conductor piece(s) carry no terminal, so their potential floats. One node of each has
+been pinned as a reference. This removes a singular direction and changes no current, impedance
+or loss -- the balance it replaces is implied by the others.
+```
+
+It changes nothing measurable: on an isolated body `1ᵀA = 0`, so the current balance it replaces is
+already implied by the others. **Just include the plane** — no ground constraint of your own.
+
+!!! tip "Ground it yourself only to say where zero is"
+    If you do add `v(GND) - 0.0`, tag exactly **one** node. A multi-node terminal ties its nodes
+    equipotential, which is a real short across that part of the conductor rather than a reference —
+    worth 0.5 % on a module's loop inductance, measured.
+
+## Stacked layers — one cell each
+
+A uniform lattice has one pitch per axis, so **one cell per conductor through the thickness** needs
+every layer to be `dz` thick *and* to start on a grid line. A real DBC stack (0.37 mm bottom metal,
+0.60 mm ceramic, 0.57 mm traces) is tiled by no single `dz`.
+
+Take `dz` from the layer whose thickness matters most and place the others an integer number of cells
+away:
+
+```python
+T   = (3.65 - 3.08) * mm            # the trace copper -> dz
+z1  = 3.08 * mm - T                 # the plane's top: one empty cell below the traces
+plane = jno.Shape.box(x0, y0, z1 - T, x1, y1, z1, size=(P, P, T))
+```
+
+That gives plane / gap / traces — three cells, one per conductor, so the surface impedance is exact
+at any frequency. The cost is a stated approximation to the geometry: the plane is modelled at the
+trace thickness and its separation snaps to a whole cell.
+
+!!! warning "It is worth the trouble"
+    On a real half-bridge module at 1 MHz, omitting the ground plane gave **28.3 nH** against the
+    module's own reference of 21.7 nH — **+31 %**. With the plane included on a snapped grid:
+    **20.9 nH, −3.6 %**. A return plane is not a detail.
+
 ## Geometry as a design variable
 
 Two things about the geometry *can* move under a gradient without rebuilding.

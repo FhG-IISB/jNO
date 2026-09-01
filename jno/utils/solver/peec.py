@@ -822,6 +822,46 @@ def solve_network(
 
     free = np.array([n for n in range(nn) if n not in owner], dtype=int)
 
+    # A conductor no terminal touches FLOATS: add any constant to its potential and every current is
+    # unchanged, so its block is singular by exactly one direction per floating piece. Whether that
+    # was fatal depended on which preconditioner the network happened to take -- a plain lattice's
+    # diag(Z) Schur complement absorbed it, a WELDED network's whole-system LU raised "Factor is
+    # exactly singular" from inside a callback, saying nothing about conductors.
+    #
+    # Pinning one node of each floating piece removes the null direction and changes NOTHING
+    # physical: `1' A = 0` on an isolated component, so the summed current balance is identically
+    # zero and the KCL row the pin replaces is implied by the others. Housekeeping, not a modelling
+    # choice -- which is why it is done rather than demanded, and only reported.
+    #
+    # A ground plane under a trace layer is exactly this case, and it is why it matters.
+    import scipy.sparse as _sps  # `sp` is rebound locally further down, so it is not usable here
+    from scipy.sparse.csgraph import connected_components as _cc
+
+    _gm = (Asp0 @ Asp0.T).tocoo()
+    _nc, _comp = _cc(
+        _sps.coo_matrix((np.ones(_gm.row.size, dtype=np.int8), (_gm.row, _gm.col)), shape=(nn, nn)),
+        directed=False,
+    )
+    pinned = []
+    if _nc > 1 and len(owner):
+        _held = set(_comp[np.asarray(sorted(owner), dtype=int)].tolist())
+        for _c in range(_nc):
+            if _c in _held:
+                continue
+            _members = np.flatnonzero(_comp == _c)
+            _cand = np.intersect1d(_members, free, assume_unique=False)
+            if _cand.size:
+                pinned.append(int(_cand[0]))
+    if pinned:
+        free = np.setdiff1d(free, np.asarray(pinned, dtype=int))
+        logging.getLogger("jno").info(
+            "peec: %d conductor piece(s) carry no terminal, so their potential floats. One node of "
+            "each has been pinned as a reference (nodes %s). This removes a singular direction and "
+            "changes no current, impedance or loss -- the balance it replaces is implied by the others.",
+            len(pinned),
+            ", ".join(str(n) for n in pinned[:6]) + (", ..." if len(pinned) > 6 else ""),
+        )
+
     # The constraint block is assembled as TRIPLETS, not rows. It is current balance plus a handful of
     # port conditions, so it carries a few entries per row against ne + nn columns: on a 12k-bar
     # lattice the incidence alone is 24,548 nonzeros in 61,271,808 slots -- 0.04 % -- and holding that
@@ -857,10 +897,17 @@ def solve_network(
     # Current balance away from the terminals: one row per free node, and the row IS that node's
     # row of the incidence. Taken as a slice rather than a loop -- the loop was 40,000 python
     # iterations on a 113,800-bar network, and `solve_network`'s own bytecode was 21 % of the solve.
+    for _n in pinned:  # phi = 0 at one node of each floating piece: a reference, nothing more
+        rr.append(np.array([r0]))
+        cc.append(np.array([ne + int(_n)]))
+        vv.append(np.array([1.0]))
+        vv_h.append(np.array([1.0]))
+        rhs.append(np.zeros(1, dtype=complex))
+        r0 += 1
     if free.size:
         sub = Asp0[free]
         counts = np.diff(sub.indptr)
-        rr.append(np.repeat(np.arange(free.size), counts))
+        rr.append(r0 + np.repeat(np.arange(free.size), counts))
         cc.append(sub.indices)
         vv.append(sub.data)
         vv_h.append(sub.data)
