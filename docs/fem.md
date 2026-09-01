@@ -1295,20 +1295,41 @@ an arbitrary-predicate interface). Region integration is a scalar mask on the in
 steady-linear, nonlinear, transient, coupled, and 3-D forms. A `jno.np.parameter` that multiplies a
 sub-region term is recovered **per sub-domain** through `crux`.
 
-### `domain.by_region` — many materials as one equation
+### Many materials as one equation — `.attach(...)`, then `by_region`
 
-For *many* regions, writing one term per region is noisy. `domain.by_region({region: value})` returns a
-single coefficient whose value is chosen, per cell, by the region the cell's centroid lies in — so the
-whole multi-material weak form is **one equation** over the whole `interior`:
+For *many* regions, writing one term per region is noisy. Both routes below collapse a multi-material
+weak form into **one equation** over the whole `interior`; they differ in where the material data lives.
+
+**Prefer `.attach(...)`.** Declare what each region *is*, once, and read the coefficient back off the
+domain. `d.k` is exactly the `by_region` assembled from every region that declared a `k`:
 
 ```python
 xi, yi, _ = d.variable("interior", split=True)        # whole domain, bound once
 ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
 
+d.attach("steel", k=16.0,  rho=7850.0)                # a material table, not indicator algebra
+d.attach("air",   k=0.026, rho=1.2)
+d.attach("core",  k=25.0,  rho=4900.0)
+
+fem = jno.fem([d.k * (ui.x*vi.x + ui.y*vi.y) - d.q * vi, u(xb, yb) - 0.0])
+```
+
+Each property is declared next to the region it belongs to, several properties travel together, and the
+weak form reads in physical names (`d.k`, `d.rho`) rather than in coefficients someone assembled
+earlier. On a `Shape` domain the properties can be attached at construction
+(`Shape.polygon(v).name("steel").attach(k=16.0)`); `d.attach(...)` is the runtime form, and the only
+one available for a `domain.tag` or a mesh-file domain.
+
+**Reach for `by_region` when the mapping is data, not a material** — a value per region computed
+elsewhere, a region deliberately left out, or anything needing an explicit `default`:
+
+```python
 k = d.by_region({"steel": 16.0, "air": 0.026, "core": 25.0})   # per-region conductivity
 Q = d.by_region(heat_source, default=0.0)                      # 0 in any unlisted region
-fem = jno.fem([k * (ui.x*vi.x + ui.y*vi.y) - Q * vi, u(xb, yb) - 0.0])
 ```
+
+`default=` is the real dividing line: `.attach` has none, because a material every region must have is
+the case it is for. If some regions genuinely have no value for a property, that is `by_region`.
 
 A value can be a scalar, a `jno.fn` field, or a trainable `jno.np.parameter`, so the same primitive
 expresses conductivity, a source, a density, a reaction rate, an elastic modulus — and trainable
