@@ -355,7 +355,9 @@ def test_a_welded_network_converges_in_a_mesh_independent_number_of_steps():
 
     plain = timed(fb, jnp.full(nb, SIGCU))
     wires = [jno.Shape.line([(0.01, 0.02, 0.0003), (0.01, 0.02, 0.004), (0.02, 0.03, 0.0003)], r=1.9e-4, size=0.001)]
-    fl = line_filaments(wires)
+    # welded to a bar lattice, so the wire must carry the SAME sub-point count (jno.peec
+    # ._QUAD * _QUAD_T**2); near_block needs one count across the whole system.
+    fl = line_filaments(wires, quad=3 * 2**2)
     nl = len(np.asarray(fl.length))
     fil, sg = _weld([(fb, jnp.full(nb, SIGCU)), (fl, jnp.full(nl, SIGCU))], [[box], wires])
     welded = timed(fil, sg)
