@@ -462,7 +462,10 @@ class PEEC:
             # that is ten coplanar traces of equal thickness, which is the case it fits exactly.
             shs = [sh for sh, _ in solids]
             sgs = [sg for _, sg in solids]
-            fb = bar_filaments(shs, sigma=sgs)
+            # The build frequency, so a conductor thick against the skin depth is discretised as a
+            # current sheet per FACE. Structure, so it is fixed for the built network and a sweep
+            # takes its highest frequency -- where a conductor is thickest against the skin depth.
+            fb = bar_filaments(shs, sigma=sgs, freq=float(np.max(self.freq)) if len(self.freq) else 0.0)
             blocks.append((tuple(solid_names), fb.lattice["resolve"]))
             parts.append((fb, fb.lattice["sigma"]))
             owners.append(shs)
