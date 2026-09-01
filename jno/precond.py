@@ -42,6 +42,7 @@ __all__ = [
     "triangular",
     "amg",
     "hypre",
+    "ilu",
     "jaxamg",
     "cached",
     "ams",
@@ -410,6 +411,136 @@ def hypre(kind: str = "ams", **options) -> _Hypre:
     preconditioner — the same contract the SuperLU, PARDISO and pyamg paths already use.
     """
     return _Hypre(kind, options)
+
+
+class _ILU(_Spec):
+    """Spec for an incomplete-LU preconditioner; see :func:`ilu`."""
+
+    traceable = False  # scipy factorises on the host from a concrete matrix
+    complex_ok = True  # SuperLU's ILU is complex-capable
+    # ...and it must see the COMPLEX operator, not the fused real 2n block. In [[K,-M],[M,K]] the
+    # diagonal is K's, and for the standard (symmetrised) A-V system K's scalar-potential rows are
+    # exactly ZERO -- measured 21,640 zero diagonal entries out of 206,770 -- which an incomplete
+    # factorisation cannot pivot around. The complex operator's diagonal is K + iM and is nonzero.
+    complex_native = True
+
+    def __init__(self, options):
+        self.options = dict(options)
+
+    def materialize(self, ctx: PrecondContext):
+        import jax as _jax
+        import numpy as np
+        import scipy.sparse as sp
+        import scipy.sparse.linalg as spla
+
+        from .utils.solver.amg import _to_scipy_csr
+
+        A = ctx.A
+        if A.bcoo is None:
+            raise ValueError(
+                "jno.precond.ilu needs an ASSEMBLED (sparse) operator — an incomplete factorisation "
+                "is built from the matrix entries. It cannot run on a matrix-free operator."
+            )
+        csr = _to_scipy_csr(A.bcoo).tocsc()
+        n = csr.shape[0]
+        opts = {"drop_tol": 1e-4, "fill_factor": 10.0}
+        opts.update(self.options)
+        equil = bool(opts.pop("equilibrate", True))
+        dtype = np.complex128 if np.iscomplexobj(csr.data) else np.float64
+
+        # SYMMETRIC EQUILIBRATION FIRST, and it is not optional in practice. `drop_tol` is RELATIVE,
+        # so on an operator whose rows span many orders the small rows are dropped to nothing and the
+        # factorisation reports "Factor is exactly singular". Measured on a gauged A-V transformer
+        # matrix: diagonal from 1.0 to 5.3e11 -- pinned rows sit at 1 while conductor rows run at
+        # 1e11 -- and spilu fails outright. Scaling to a unit diagonal costs one pass and fixes it.
+        # D^-1 A D^-1 with D = sqrt(|diag|) keeps a complex-SYMMETRIC matrix symmetric.
+        if equil:
+            d = np.abs(csr.diagonal())
+            d[d <= 0] = 1.0
+            dinv = 1.0 / np.sqrt(d)
+            D = sp.diags(dinv)
+            fac = (D @ csr @ D).tocsc()
+        else:
+            dinv, fac = None, csr
+        try:
+            lu = spla.spilu(fac, **opts)
+        except RuntimeError as e:
+            # scipy says only "Factor is exactly singular". Say WHICH rows, because on an eddy-current
+            # operator the answer is nearly always structural: an UNGAUGED curl-curl carries the whole
+            # gradient null space, and V has no equation at all where sigma = 0. An incomplete
+            # factorisation cannot pivot around either, where a Krylov method with AMS can.
+            rows = np.diff(csr.tocsr().indptr)
+            empty = int((rows == 0).sum())
+            dg = np.abs(csr.diagonal())
+            zero_diag = int((dg == 0).sum())
+            raise RuntimeError(
+                f"jno.precond.ilu: the incomplete factorisation is singular ({e}). This operator has "
+                f"{empty:,} structurally empty rows and {zero_diag:,} zero diagonal entries out of "
+                f"{n:,}. An incomplete factorisation needs a non-singular matrix: it cannot pivot "
+                "around the gradient null space of an UNGAUGED curl-curl, nor around nodes where "
+                "sigma = 0 leaves V with no equation. Either gauge the system (a tree-cotree gauge "
+                "through domain._extra_dof_pins) and pin V off the conductors, or use a "
+                "preconditioner that tolerates the null space -- jno.precond.ams() is built for "
+                "exactly that."
+            ) from e
+
+        def _host(r):
+            v = np.asarray(r, dtype=dtype)
+            if dinv is None:
+                return np.asarray(lu.solve(v), dtype=dtype)
+            return np.asarray(dinv * lu.solve(dinv * v), dtype=dtype)
+
+        def _host_T(r):
+            v = np.asarray(r, dtype=dtype)
+            if dinv is None:
+                return np.asarray(lu.solve(v, trans="T"), dtype=dtype)
+            return np.asarray(dinv * lu.solve(dinv * v, trans="T"), dtype=dtype)
+
+        def _wrap(fn):
+            def go(r):
+                return _jax.pure_callback(fn, _jax.ShapeDtypeStruct((n,), dtype), r, vmap_method="sequential")
+
+            return go
+
+        # A preconditioner is never differentiated through (`lax.custom_linear_solve` puts d/dtheta
+        # on the operator), so a host factorisation is free of consequences for AD.
+        return PrecondApplier(_wrap(_host), _wrap(_host_T))
+
+    def __repr__(self):
+        return f"jno.precond.ilu({self.options})"
+
+
+def ilu(**options) -> _ILU:
+    """**Incomplete LU** (SuperLU ``spilu``) — the classical preconditioner for the A–V eddy-current
+    system, and complex-capable, so it applies to the complex operator directly.
+
+    Keyword options pass through to :func:`scipy.sparse.linalg.spilu` (``drop_tol``, ``fill_factor``,
+    ``permc_spec``, …); the defaults here are ``drop_tol=1e-4, fill_factor=10``. ``equilibrate=False``
+    disables the symmetric diagonal scaling applied first — leave it on unless you know the operator
+    is already well scaled, because ``drop_tol`` is *relative* and a matrix whose rows span orders of
+    magnitude (a gauged A–V system runs from 1.0 on pinned rows to 1e11 on conductor rows) otherwise
+    fails outright with "Factor is exactly singular".
+
+    **Why this, on a mixed A–V system.** Igarashi & Honma (*IEEE Trans. Magn.* 38(2), 2002, 565–568)
+    solve exactly this system — edge elements for ``A``, nodal for ``V`` — with incomplete-Cholesky CG
+    and report **16–17 iterations, independent of frequency** (100 Hz down to static) and **29–31
+    independent of mesh size**. Their §IV gives the mechanism: the "floating singular values"
+    (proportional to ``omega*sigma*mu``) that wreck the condition number *disappear* after incomplete
+    factorisation in the A–V method, while they survive in the A-only method. That is the documented
+    reason A–V converges better than A, and it is a property of the *incomplete factorisation*, not of
+    multigrid::
+
+        fem.solve(linear=jno.solve.fgmres(tol=1e-9, maxiter=400), precond=jno.precond.ilu())
+
+    Do not gauge it. The same paper: "the tree–cotree gauging has not been applied because it is known
+    that the gauging makes the matrix condition worse."
+
+    Runs on the **host** and is not traceable; that costs a callback per apply but has no effect on
+    differentiability — see :func:`hypre` for the same contract. Memory is the real limit: ``spilu``
+    fill grows with ``fill_factor``, so on a large 3-D curl-curl expect to trade ``drop_tol`` against
+    RAM before it beats an auxiliary-space method.
+    """
+    return _ILU(options)
 
 
 def real_equivalent(inner) -> _RealEquivalent:
