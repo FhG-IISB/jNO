@@ -144,8 +144,6 @@ def assemble_fem_nonnodal(
         bcoo_eliminate_dirichlet,
         bcoo_zero_rows_cols,
         compress_eager,
-        sum_duplicate_triplets,
-        unique_triplet_count,
     )
     from .weak_form import (
         _apply_sign,
@@ -972,8 +970,20 @@ def assemble_fem_nonnodal(
         _field_splits = list(np.cumsum([0] + [int(cdofs[i].shape[1]) for i in range(len(fields))]))
         _asm_zero_field = jnp.zeros((n_verts,), dtype=zeros.dtype)  # placeholder for an absent field parameter
         _asm_local_zero = jnp.zeros((n_cells, _cell_all_dofs.shape[1]), zeros.dtype)  # u=0: the LINEAR default
-        _vol_rows_l, _vol_cols_l = [], []
+        # TERMS SHARING A TEST FIELD are one GROUP: their element blocks have identical (row, col)
+        # layout, so they are summed at the element level and emit ONE pattern block -- the old
+        # per-term emission stored an identical full triplet set for every additive term, which is
+        # a factor of ~n_terms in peak memory for nothing.
+        _groups: list = []  # (tfi, [(coeff, rnames), ...]) in first-occurrence order
+        _gpos: dict = {}
         for _cf_p, _tfi_p, _rn_p in _typed:
+            if _tfi_p not in _gpos:
+                _gpos[_tfi_p] = len(_groups)
+                _groups.append((_tfi_p, []))
+            _groups[_gpos[_tfi_p]][1].append((_cf_p, _rn_p))
+
+        _vol_rows_l, _vol_cols_l = [], []
+        for _tfi_p, _terms_p in _groups:
             _kshape = (n_cells, int(cdofs[_tfi_p].shape[1]), _cell_all_dofs.shape[1])  # (n_cells, n_test, n_local_all)
             _vol_rows_l.append(jnp.broadcast_to(cdofs[_tfi_p][:, :, None], _kshape).reshape(-1))
             _vol_cols_l.append(jnp.broadcast_to(_cell_all_dofs[:, None, :], _kshape).reshape(-1))
@@ -985,10 +995,31 @@ def assemble_fem_nonnodal(
             else jnp.zeros((0, 2), jnp.int32)
         )
 
-        try:
-            _vol_nse = unique_triplet_count(_vol_idx) if _vol_rows_l else None
-        except Exception:  # noqa: BLE001 -- a traced pattern breaks the static-count invariant
-            _vol_nse = None  # fall back to the uncompressed (still correct) operator
+        # THE SYMBOLIC PASS, once, on the host: the unique sparsity pattern and the inverse map from
+        # every emitted entry to its final slot. Element values then SCATTER-ADD straight into a
+        # buffer of exactly the final size -- no stored duplicates, and no in-trace sort (the old
+        # `sum_duplicate_triplets` collapse, whose argsort workspace over the unreduced triplet
+        # array was the dominant assembly temporary). Assembly peak becomes pattern + values + one
+        # batch of element blocks: the same order as the matrix it produces.
+        _uidx = _vinv = None
+        _vol_nse = None
+        if _vol_rows_l:
+            try:
+                _idx_np = np.asarray(_vol_idx)
+                _enc = _idx_np[:, 0].astype(np.int64) * np.int64(total) + _idx_np[:, 1].astype(np.int64)
+                _unq, _inv = np.unique(_enc, return_inverse=True)
+                _uidx = jnp.stack(
+                    [
+                        jnp.asarray((_unq // np.int64(total)).astype(np.int32)),
+                        jnp.asarray((_unq % np.int64(total)).astype(np.int32)),
+                    ],
+                    axis=1,
+                )  # sorted row-major by construction of np.unique
+                _vinv = jnp.asarray(_inv.astype(np.int32))
+                _vol_nse = int(_unq.size)
+            except Exception:  # noqa: BLE001 -- a traced pattern cannot be planned on the host
+                _uidx = _vinv = None
+                _vol_nse = None  # fall back to the uncompressed (still correct) operator
 
         def assemble(args=None, *, surface=True, u_flat=None):
             # ``u_flat=None`` linearises at u=0, which is exact for a LINEAR form (the tangent does not
@@ -1041,10 +1072,20 @@ def assemble_fem_nonnodal(
                 return _integrate_term(domain, coeff, local, qw * meas)
 
             data_l = []  # only the element data is args-dependent; the (row, col) pattern is `_vol_idx`
-            for coeff, tfi, rnames in _typed:
+            for tfi, terms_g in _groups:
 
-                def _ke(c, la, _e=coeff, _t=tfi, _rn=rnames):
-                    return jax.jacfwd(lambda v: _elem_res(c, v, _e, _t, _rn))(la)
+                def _ke(c, la, _g=tuple(terms_g), _t=tfi):
+                    # ONE jacfwd of the SUMMED residual: linearity makes it equal to the sum of the
+                    # per-term jacobians, at one element-block buffer per GROUP instead of per term
+                    # (and `_cell_fields` is shared across the group's terms instead of recomputed).
+                    def _res_sum(v):
+                        r = None
+                        for _e, _rn in _g:
+                            t = _elem_res(c, v, _e, _t, _rn)
+                            r = t if r is None else r + t
+                        return r
+
+                    return jax.jacfwd(_res_sum)(la)
 
                 Ke = _elem_map(  # (n_cells, n_test_tfi, n_local_all)
                     _ke,
@@ -1057,13 +1098,19 @@ def assemble_fem_nonnodal(
             # Tangential-trace surface mass (impedance BC), re-evaluated per args. Taken SPARSE: densifying it
             # would cost O(n_dof²) just to re-sparsify, the memory wall for a 3-D vector run.
             sm = _surf_mass_of(args, sparse=True) if surface else None
+            if _vinv is not None:
+                # values land in their FINAL slots: a buffer of exactly nse entries, filled by one
+                # scatter-add through the host-planned inverse map. Nothing to sort, nothing to
+                # collapse, and the flags let every downstream matvec skip the lazy re-summation.
+                data = jnp.zeros((_vol_nse,), data.dtype).at[_vinv].add(data)
+                _emit_idx = _uidx
+                _emit_flags = dict(indices_sorted=True, unique_indices=True)
+            else:
+                _emit_idx = _vol_idx  # unplanned fallback: uncompressed, still correct
+                _emit_flags = {}
             if sm is None:
-                A = _jsparse.BCOO((data, _vol_idx), shape=(total, total))
-                # `_vol_idx` is hoisted out of the trace already, so its unique count is host-static
-                # and the compression runs INSIDE the trace -- which is what reaches the parametric
-                # and per-step N1E/RT re-assemblies, the 3-D vector runs where memory is the wall.
-                return sum_duplicate_triplets(A, nse=_vol_nse) if _vol_nse is not None else A
-            idx = jnp.concatenate([_vol_idx, sm.indices], axis=0)  # BCOO sums duplicate (i, j) on materialisation
+                return _jsparse.BCOO((data, _emit_idx), shape=(total, total), **_emit_flags)
+            idx = jnp.concatenate([_emit_idx, sm.indices], axis=0)  # BCOO sums duplicate (i, j) on materialisation
             data = jnp.concatenate([data, sm.data])
             # Deliberately NOT compressed. The static count would have to cover `sm.indices`, which is
             # produced inside the trace by `_surf_mass_of(args)`; assuming it is args-independent and
