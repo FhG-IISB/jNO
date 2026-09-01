@@ -1299,6 +1299,61 @@ def solve_network(
     return cur, phi, inj
 
 
+def _skin_depth(sigma, freq, mu0=4e-7 * np.pi):
+    """The skin depth a discretisation should be gated on, or None when it cannot be read.
+
+    The GATE only, never a solved quantity: it decides structure, which must be fixed for the built
+    network, so a swept solve takes the highest frequency -- the conservative case, since that is
+    where a conductor is thickest against the skin depth. Unreadable conductivity (a traced design
+    variable with no value yet) means no pairing, which is the old model and never worse than it.
+    """
+    try:
+        f = float(np.max(np.asarray(freq, dtype=float)))
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(f) or f <= 0.0 or sigma is None:
+        return None
+    try:
+        s = np.asarray(jax.lax.stop_gradient(jnp.asarray(sigma)), dtype=float)
+    except (TypeError, ValueError, jax.errors.TracerArrayConversionError, jax.errors.ConcretizationTypeError):
+        return None
+    s = s[np.isfinite(s) & (s > 0)]
+    if s.size == 0:
+        return None
+    return float(np.sqrt(2.0 / (2.0 * np.pi * f * mu0 * float(np.max(s)))))
+
+
+def _sheet_families(axis, skin, span, d, delta):
+    """Which axis families should carry a current sheet per FACE, and the thickness between them.
+
+    Only a family that is entirely one conductor thickness can be split: the two sheets are a second
+    lattice family offset from the first, and a lattice family has ONE sub-point offset or it stops
+    being Toeplitz (see :func:`~jno.utils.solver.kernel.lattice_kernel`). A layout mixing thicknesses
+    on one grid -- traces over a plane -- therefore keeps the single-current model for now.
+
+    Returns ``{axis: (thin_axis, thickness)}``, empty when nothing qualifies, which is every network
+    holding no conductor thick against the skin depth.
+    """
+    out = {}
+    if delta is None or not np.isfinite(delta) or delta <= 0:
+        return out
+    for ax in sorted(set(np.asarray(axis).tolist())):
+        sel = np.asarray(axis) == ax
+        if not (np.asarray(span)[sel] == 1).all():
+            continue  # already split across its thickness: the elements resolve it themselves
+        th = np.unique(np.round(np.asarray(skin)[sel], 12))
+        if th.size != 1:
+            continue  # mixed thicknesses cannot share one offset
+        thick = float(th[0])
+        if thick <= 2.0 * delta:
+            continue  # the current fills the section, and one element already says so exactly
+        # span == 1, so the conductor IS one cell thick and the thin axis is the matching pitch
+        cand = [c for c in range(3) if c != ax and abs(float(d[c]) - thick) < 1e-12]
+        if len(cand) == 1:
+            out[int(ax)] = (int(cand[0]), thick)
+    return out
+
+
 def _element_impedance(fil, omega, sig, mu0):
     """Per-element impedance, and the coupling where a slab carries a current sheet on each face.
 
@@ -1564,7 +1619,7 @@ def _volume_rule(ln, wt, axis, quad: int, quad_t: int):
     return off, w
 
 
-def bar_filaments(shape, size=None, quad: int = 3, quad_t: int = 2, sigma=None):
+def bar_filaments(shape, size=None, quad: int = 3, quad_t: int = 2, sigma=None, freq: float = 0.0):
     """Discretise a box conductor into a regular lattice of rectangular bars.
 
     A solid does not have a centreline, so a line's discretisation does not apply. The volume is cut
@@ -1758,6 +1813,57 @@ def bar_filaments(shape, size=None, quad: int = 3, quad_t: int = 2, sigma=None):
     end_a = np.concatenate([ea for ea, _ in ends])
     end_b = np.concatenate([eb for _, eb in ends])
     nb = len(ln)
+
+    # A conductor thick against the skin depth carries a current SHEET PER FACE rather than one
+    # current spread through it -- otherwise its inductance contradicts its own surface impedance,
+    # and a return plane's thickness moves L where it physically cannot. The pair is a second lattice
+    # family on the same grid and masks, its current displaced to the opposite face; the split
+    # between them is found by the solve, through `slab_transfer_impedance`.
+    delta = _skin_depth(sigma, freq)
+    sheets = _sheet_families(axis, skin, span, d, delta) if delta else {}
+    pair = -np.ones(nb, dtype=int)
+    sheet_thin = -np.ones(nb, dtype=int)
+    sheet_ext = np.zeros(nb)
+    if sheets:
+        blocks, start = [], 0
+        for ax in sorted(set(axis.tolist())):
+            k = int((axis == ax).sum())
+            idx = np.arange(start, start + k)
+            if ax in sheets:
+                thin, thick = sheets[ax]
+                # the layer the current actually occupies: the whole half below 2 skin depths, and
+                # the skin layer itself above it, so the sheet sits where the current does
+                ext = float(min(0.5 * thick, 2.0 * delta))
+                shift = 0.5 * (thick - ext)
+                blocks.append((idx, +shift, ext, thin))
+                blocks.append((idx, -shift, ext, thin))
+            else:
+                blocks.append((idx, 0.0, 0.0, -1))
+            start += k
+        take = np.concatenate([b[0] for b in blocks])
+        offs = np.concatenate([np.full(len(b[0]), b[1]) for b in blocks])
+        sheet_ext = np.concatenate([np.full(len(b[0]), b[2]) for b in blocks])
+        sheet_thin = np.concatenate([np.full(len(b[0]), b[3], dtype=int) for b in blocks])
+        pair, at = -np.ones(len(take), dtype=int), 0
+        i = 0
+        while i < len(blocks):
+            k = len(blocks[i][0])
+            if blocks[i][3] >= 0:  # a paired axis contributes its two sheets back to back
+                pair[at : at + k] = np.arange(at + k, at + 2 * k)
+                pair[at + k : at + 2 * k] = np.arange(at, at + k)
+                at += 2 * k
+                i += 2
+            else:
+                at += k
+                i += 1
+        cen, skin, span = cen[take], skin[take], span[take]
+        tan, ln, area, axis = tan[take], ln[take], area[take], axis[take]
+        owner, part = owner[take], part[take]
+        end_a, end_b = end_a[take], end_b[take]
+        nb = len(take)
+        live = sheet_thin >= 0
+        cen = cen.copy()
+        cen[np.flatnonzero(live), sheet_thin[live]] += offs[live]
     # A bar joins two CELLS, and its two halves are in SERIES, so its conductivity is their harmonic
     # mean. That rule was written for a bar straddling two conductors -- a shorting strap touching
     # two plates is the normal case, not an error -- and it is the same rule a per-cell conductivity
@@ -1803,6 +1909,10 @@ def bar_filaments(shape, size=None, quad: int = 3, quad_t: int = 2, sigma=None):
         )
 
     wt = np.stack([np.array([d[i] for i in range(3) if i != ax]) for ax in axis])
+    if sheets:  # a sheet is as thick as the layer its current occupies, not as the conductor
+        for r in np.flatnonzero(sheet_thin >= 0):
+            cols = [c for c in range(3) if c != int(axis[r])]
+            wt[r, cols.index(int(sheet_thin[r]))] = sheet_ext[r]
     # A lattice element is a CUBE, so the quadrature samples it like one. Points only along the axis
     # leave the cross-section a point, and neighbouring cells sit one pitch apart while extending a
     # full pitch transversely -- so every near-neighbour mutual was over-counted. Measured against
@@ -1855,7 +1965,12 @@ def bar_filaments(shape, size=None, quad: int = 3, quad_t: int = 2, sigma=None):
             # which quietly required those to be concrete -- so splicing a traced block into a welded
             # network (a moving bond wire on a fixed trace layer) failed inside the lattice half.
             "self": {int(ax): float(np.asarray(self_g)[axis == ax][0]) for ax in sorted(set(axis.tolist()))},
+            # {axis: (thin axis, conductor thickness, the layer each sheet's current occupies)}.
+            # `lattice_apply` rebuilds the sub-points from this, so the FFT path and the assembled
+            # one place the sheets identically -- they must, or they stop being the same operator.
+            "sheets": {int(a): (int(v[0]), float(v[1]), float(min(0.5 * v[1], 2.0 * delta))) for a, v in sheets.items()},
         },
+        pair,
     )
 
 
@@ -1893,41 +2008,76 @@ def lattice_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3, quad_
     gx, gw = np.polynomial.legendre.leggauss(int(quad))
 
     masks = lat.get("masks") or {}
-    ops, slices, shapes, where = [], [], [], []
-    start = 0
+    sheets = lat.get("sheets") or {}
+    fams, start = [], 0
     for ax in sorted(set(axis.tolist())):
-        k = int((axis == ax).sum())
+        tot = int((axis == ax).sum())
         shape = tuple(v - 1 if i == ax else v for i, v in enumerate(n))
         length = float(d[ax])  # a lattice element IS the pitch; see the note on lattice["self"]
-        wtx = np.array([d[c] for c in range(3) if c != ax])
-        sub, wq = _volume_rule(
-            np.array([length]), wtx[None, :], np.array([ax]), int(quad), int(quad_t)
-        )
-        sub, w = sub[0], wq[0]
+        cols = [c for c in range(3) if c != ax]
+        wtx = np.array([d[c] for c in cols])
         sg = float(lat["self"][int(ax)])
-        ops.append(lattice_operator(shape, d, g, sg, sub=sub, w=w))
-        slices.append(slice(start, start + k))
-        shapes.append(shape)
         m = masks.get(ax)
-        where.append(None if m is None else jnp.asarray(np.flatnonzero(np.asarray(m).reshape(-1))))
-        start += k
+        idx = None if m is None else jnp.asarray(np.flatnonzero(np.asarray(m).reshape(-1)))
+        if int(ax) in sheets:
+            # Two sheets on one grid: same masks, same self term, currents displaced to opposite
+            # faces. AA and BB are the SAME operator -- a same-family generator sees sub[a] - sub[b],
+            # so the constant face shift cancels -- which is why this costs three kernels, not four.
+            thin, thick, ext = sheets[int(ax)]
+            k = tot // 2
+            wts = wtx.copy()
+            wts[cols.index(int(thin))] = ext  # a sheet is as thick as the layer its current occupies
+            base, wq = _volume_rule(np.array([length]), wts[None, :], np.array([ax]), int(quad), int(quad_t))
+            base, w = base[0], wq[0]
+            shift = np.zeros(3)
+            shift[int(thin)] = 0.5 * (float(thick) - float(ext))
+            sa, sb = base + shift, base - shift
+            fams.append(
+                (
+                    (
+                        lattice_operator(shape, d, g, sg, sub=base, w=w),
+                        lattice_operator(shape, d, g, 0.0, sub=sa, w=w, sub_b=sb, w_b=w),
+                        lattice_operator(shape, d, g, 0.0, sub=sa, w=w, sub_b=sb, w_b=w, transpose=True),
+                    ),
+                    slice(start, start + tot),
+                    shape,
+                    idx,
+                    k,
+                )
+            )
+            start += tot
+        else:
+            sub, wq = _volume_rule(np.array([length]), wtx[None, :], np.array([ax]), int(quad), int(quad_t))
+            fams.append((lattice_operator(shape, d, g, sg, sub=sub[0], w=wq[0]), slice(start, start + tot), shape, idx, None))
+            start += tot
     if start != len(axis):
         raise ValueError(f"peec.lattice_apply: the families cover {start} of {len(axis)} bars; this is a bug.")
 
+    def _one(op, x, sh, idx):
+        if idx is None:
+            return op(x.reshape(sh)).reshape(-1)
+        # Absent cells carry no current, so scatter into the FULL family grid, apply, and read
+        # back only the live slots. Masking this way is what lets a hole or an L-shape keep the
+        # translation invariance the FFT needs — the grid stays full, the current does not.
+        # unique/sorted are true by construction (flatnonzero), and saying so is what makes the
+        # scatter transposable — reverse mode refuses an unproven one.
+        full = jnp.zeros(int(np.prod(sh)), x.dtype).at[idx].set(x, unique_indices=True, indices_are_sorted=True)
+        return op(full.reshape(sh)).reshape(-1)[idx]
+
     def real_apply(cur):
         out = []
-        for op, sl, sh, idx in zip(ops, slices, shapes, where):
+        for op, sl, sh, idx, k in fams:
             x = cur[sl]
-            if idx is None:
-                out.append(op(x.reshape(sh)).reshape(-1))
-            else:
-                # Absent cells carry no current, so scatter into the FULL family grid, apply, and read
-                # back only the live slots. Masking this way is what lets a hole or an L-shape keep the
-                # translation invariance the FFT needs — the grid stays full, the current does not.
-                # unique/sorted are true by construction (flatnonzero), and saying so is what makes the
-                # scatter transposable — reverse mode refuses an unproven one.
-                full = jnp.zeros(int(np.prod(sh)), x.dtype).at[idx].set(x, unique_indices=True, indices_are_sorted=True)
-                out.append(op(full.reshape(sh)).reshape(-1)[idx])
+            if k is None:
+                out.append(_one(op, x, sh, idx))
+            else:  # the two sheets of one slab: a symmetric 2x2 of Toeplitz blocks
+                same, ab, ba = op
+                xa, xb = x[:k], x[k:]
+                out.append(
+                    jnp.concatenate(
+                        [_one(same, xa, sh, idx) + _one(ab, xb, sh, idx), _one(ba, xa, sh, idx) + _one(same, xb, sh, idx)]
+                    )
+                )
         return jnp.concatenate(out)
 
     def apply(cur):
