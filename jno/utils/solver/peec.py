@@ -29,7 +29,7 @@ import jax.numpy as jnp
 import numpy as np
 import scipy.sparse as sp
 
-from .kernel import bar_self, internal_impedance, wire_self
+from .kernel import bar_self, internal_impedance, slab_transfer_impedance, wire_self
 
 __all__ = [
     "Filaments",
@@ -72,6 +72,10 @@ class Filaments(NamedTuple):
     round_: object  # (N,) bool: a round section takes the cylindrical internal impedance, a bar the slab one
     span: object  # (N,) int: elements across the conductor's THICKNESS here; 1 = this element is all of it
     lattice: object = None  # grid description when the elements sit on one, which is what the FFT path needs
+    # (N,) int: the element carrying the OTHER face of the same slab, -1 where there is none. A
+    # conductor thick against the skin depth carries a current sheet per face rather than one
+    # current spread through it -- see `slab_transfer_impedance`.
+    pair: object = None
 
 
 def _leaf(shape, what):
@@ -417,9 +421,11 @@ def network_impedance(fil: Filaments, sigma, port, omega: float = 0.0, mu0: floa
     nn, ne = A.shape
     sig = jnp.broadcast_to(jnp.asarray(sigma, dtype=float), (ne,))
     _check_unresolved_thickness(fil, sig, omega, mu0)
-    R = internal_impedance(fil.length, fil.area, fil.skin, fil.round_, omega, sig, mu0, fil.span)
+    R, _pidx, _cz = _element_impedance(fil, omega, sig, mu0)
     Lp = pair_matrix(fil.pos, fil.mom, lambda r: 1.0 / r, fil.self_g, group=fil.group) * (mu0 / (4.0 * jnp.pi))
     Z = jnp.diag(R.astype(complex)) + 1j * omega * Lp
+    if _pidx is not None:  # the other face of the same slab
+        Z = Z.at[jnp.arange(R.shape[0]), jnp.asarray(_pidx)].add(_cz)
 
     nodes = np.asarray(fil.nodes)
     ia, ib = (int(np.argmin(((nodes - np.asarray(p, dtype=float)) ** 2).sum(1))) for p in port)
@@ -732,7 +738,8 @@ def solve_network(
     # value below the skin depth, so nothing changes at low frequency; above it, the current retreats
     # to the surface and a conductor no longer has to be split across its section to say so.
     _check_unresolved_thickness(fil, sig, omega, mu0)
-    R = internal_impedance(fil.length, fil.area, fil.skin, fil.round_, omega, sig, mu0, fil.span)
+    R, pidx, pair_z = _element_impedance(fil, omega, sig, mu0)
+    pidx_j = None if pidx is None else jnp.asarray(pidx)
     lat = getattr(fil, "lattice", None)
     welded = isinstance(lat, dict) and "welded" in lat
     has_lattice = lat is not None and (not welded or any(b[2] is not None for b in lat["welded"]))
@@ -754,6 +761,8 @@ def solve_network(
     else:
         Lp = pair_matrix(fil.pos, fil.mom, lambda r: 1.0 / r, fil.self_g, group=fil.group) * (mu0 / (4.0 * jnp.pi))
         Z = jnp.diag(R.astype(complex)) + 1j * float(omega) * Lp
+        if pidx is not None:  # the other face of the same slab
+            Z = Z.at[jnp.arange(R.shape[0]), pidx_j].add(pair_z)
 
     names = list(terminals)
     # A terminal is `{name: idx}`, or `{name: (idx, weights)}` to make it a prescribed current
@@ -1045,6 +1054,8 @@ def solve_network(
 
         w = float(omega)
         Rc = R.astype(complex)
+        # a dummy when nothing is paired, so `_run`'s arity does not depend on the network
+        czc = pair_z if pidx is not None else jnp.zeros(1, dtype=complex)
         zdiag = Rc + (1j * w) * jnp.asarray(_lattice_diag(fil, mu0))
 
         # The preconditioner is built on the host from concrete numbers -- it only has to accelerate,
@@ -1201,9 +1212,12 @@ def solve_network(
         def _precond_t(r):
             return jax.pure_callback(_holder_solve_t, shape_out, r)
 
-        def M_apply(x, w_, zd, Rc_):
+        def M_apply(x, w_, zd, Rc_, cz_):
             cur, phi = x[:ne], x[ne:]
-            return jnp.concatenate([Rc_ * cur + (1j * w_) * lp_apply(cur) - Acj @ phi, Cj @ x])
+            zi = Rc_ * cur
+            if pidx_j is not None:  # structural, so this branch is taken once at trace time
+                zi = zi + cz_ * cur[pidx_j]  # the sheet on the slab's other face
+            return jnp.concatenate([zi + (1j * w_) * lp_apply(cur) - Acj @ phi, Cj @ x])
 
         def P_inv(r, zd):
             if welded:
@@ -1242,7 +1256,7 @@ def solve_network(
         if cached is None:
 
             @jax.jit
-            def _run(rhs, w_, zd, Rc_):
+            def _run(rhs, w_, zd, Rc_, cz_):
                 # sequenced through the right-hand side so the factorisation is built before the
                 # solve that reads it, rather than relying on callback ordering
                 rhs = rhs + _token(zd, w_).astype(rhs.dtype)
@@ -1258,7 +1272,7 @@ def solve_network(
                     )[0]
 
                 return jax.lax.custom_linear_solve(
-                    lambda v: M_apply(v, w_, zd, Rc_),
+                    lambda v: M_apply(v, w_, zd, Rc_, cz_),
                     rhs,
                     _gm(lambda v: P_inv(v, zd)),
                     _gm(lambda v: P_inv_T(v, zd)),
@@ -1271,8 +1285,8 @@ def solve_network(
         else:
             _run = cached
 
-        x = _run(b, jnp.asarray(w), zdiag, Rc)
-        resid = jnp.linalg.norm(M_apply(x, w, zdiag, Rc) - b) / jnp.maximum(jnp.linalg.norm(b), 1e-300)
+        x = _run(b, jnp.asarray(w), zdiag, Rc, czc)
+        resid = jnp.linalg.norm(M_apply(x, w, zdiag, Rc, czc) - b) / jnp.maximum(jnp.linalg.norm(b), 1e-300)
         _check(resid, _converged, max(1e2 * float(tol), 1e-9))
     else:
         top = jnp.concatenate([Z, -jnp.asarray(Asp0.toarray()).T.astype(complex)], axis=1)
@@ -1283,6 +1297,37 @@ def solve_network(
     cur, phi = x[:ne], x[ne:]
     inj = {t: jnp.asarray(np.asarray(Asp0[idx[t]].sum(0)).reshape(-1), dtype=complex) @ cur for t in names}
     return cur, phi, inj
+
+
+def _element_impedance(fil, omega, sig, mu0):
+    """Per-element impedance, and the coupling where a slab carries a current sheet on each face.
+
+    Returns ``(R, pair_idx, pair_z)``, with ``pair_idx`` None when nothing is paired -- which is
+    every network holding no conductor thick against the skin depth, so the common case pays nothing
+    at all, not even a gather.
+
+    A paired element takes the DIAGONAL of the 2-port slab impedance rather than the one-unknown
+    form, and its partner supplies the off-diagonal. The two agree by construction where it matters:
+    equal sheet currents give back exactly what :func:`internal_impedance` would have returned (see
+    :func:`slab_transfer_impedance`), so switching a conductor to a pair cannot move an answer that
+    was already right.
+    """
+    R = internal_impedance(fil.length, fil.area, fil.skin, fil.round_, omega, sig, mu0, fil.span)
+    idx = getattr(fil, "pair", None)
+    if idx is None:
+        return R, None, None
+    idx = np.asarray(idx, dtype=int)
+    live = idx >= 0
+    if not live.any():
+        return R, None, None
+    # a paired element is a slab by construction, so area / thickness is its in-plane width
+    z_self, z_mut = slab_transfer_impedance(fil.length, fil.area / fil.skin, fil.skin, omega, sig, mu0)
+    keep = jnp.asarray(live)
+    return (
+        jnp.where(keep, z_self, R.astype(complex)),
+        np.where(live, idx, np.arange(idx.size)),
+        jnp.where(keep, z_mut, 0.0 + 0j),
+    )
 
 
 def _check_unresolved_thickness(fil, sigma, omega, mu0):
