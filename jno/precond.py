@@ -710,10 +710,54 @@ class _Form(_Spec):
         if self._op is None:
             self._op = ctx.assemble(self.terms, quad_degree=self.quad_degree)
         op = self._op
-        if self.inner is None:
-            from . import solve as _s
 
-            self.inner = _s.lu()
+        if self.inner is None:
+            # FACTOR ONCE, apply forever -- the same contract as AMS's default auxiliaries. The old
+            # default handed every application to `jno.solve.lu()`, which re-factorises per call:
+            # invisible on a small Schur block, hours on a 90k-edge auxiliary (a preconditioner is
+            # applied hundreds of times per solve). Host SuperLU behind a callback; a preconditioner
+            # is never differentiated through, so AD is unaffected.
+            import jax as _jax
+            import numpy as _np
+            import scipy.sparse.linalg as _spla
+
+            from .utils.solver.amg import _to_scipy_csr
+
+            if getattr(op, "bcoo", None) is None:
+                raise ValueError(
+                    "jno.precond.form: the assembled auxiliary operator is matrix-free, so it cannot "
+                    "be factored once. Pass an explicit iterative inner: form([...], inner=jno.solve.cg(...))."
+                )
+            _csr = _to_scipy_csr(op.bcoo).tocsc()
+            _lu = _spla.splu(_csr)
+            _dt = _np.complex128 if _np.iscomplexobj(_csr.data) else _np.float64
+            _n = _csr.shape[0]
+
+            def _fwd_h(r):
+                return _np.asarray(_lu.solve(_np.asarray(r, dtype=_dt)), dtype=_dt)
+
+            def _t_h(r):
+                return _np.asarray(_lu.solve(_np.asarray(r, dtype=_dt), trans="T"), dtype=_dt)
+
+            def _wrap(fn):
+                def go(r):
+                    return _jax.pure_callback(fn, _jax.ShapeDtypeStruct((_n,), _dt), r, vmap_method="sequential")
+
+                return go
+
+            return PrecondApplier(_wrap(_fwd_h), _wrap(_t_h))
+
+        if isinstance(self.inner, _Spec):
+            # A PRECOND SPEC as the inner: materialize it once against the assembled auxiliary and
+            # apply it (once) per call -- `form([...C_A terms...], inner=jno.precond.ams())` is an
+            # AMS application to an operator DECLARED as a weak form rather than taken from the
+            # system. `ctx.fem` is carried through so an inner AMS can read the edge topology.
+            from .utils.solver.solver_api import materialize_precond
+
+            ap = materialize_precond(self.inner, PrecondContext(op, ctx.fem))
+            # some specs materialize to a bare callable (no .T); a symmetric applier is its own T
+            return PrecondApplier(ap, ap.T if hasattr(ap, "T") else ap)
+
         solver = self.inner
         # M^{-T} v ~ (Â^{-1})^T v = (Â^T)^{-1} v: run the same inner solver on the transposed
         # auxiliary operator (for a symmetric Â -- e.g. a mass matrix -- op.T behaves like op).
@@ -731,6 +775,14 @@ def form(terms, *, inner=None, quad_degree: int = 2) -> _Form:
 
     This is how the classical physics-based preconditioners are written declaratively — in the
     *same language as the PDE*:
+
+    ``inner`` decides how ``Â^{-1}`` is applied. **Default (None): factored once** (host SuperLU)
+    and reused across every application — the AMS-auxiliary contract, and the only affordable
+    default (a per-application ``lu()`` re-factorises a 90k-DOF auxiliary hundreds of times per
+    solve). A ``jno.solve`` **solver** solves ``Â x = v`` per application (an inexact inner Krylov —
+    pair with a flexible outer). A ``jno.precond`` **spec** — ``form([...], inner=jno.precond.ams())``
+    — is materialized once against ``Â`` and applied once per call: a multigrid or auxiliary-space
+    method acting on an operator *declared as a weak form* rather than taken from the system.
 
     * a (weighted) **mass matrix** — e.g. the pressure Schur-complement approximation of a
       Stokes-type saddle system: ``jno.precond.form([w * pi * qi], inner=jno.solve.cg(...))``;
