@@ -447,11 +447,14 @@ class _ILU(_Spec):
         opts.update(self.options)
         equil = bool(opts.pop("equilibrate", True))
         shifts = tuple(opts.pop("shifts", (0.0, 1e-4, 1e-3, 1e-2, 1e-1, 0.5)))
-        # No pivoting, no reordering. This operator is complex-SYMMETRIC, which is the property the
-        # incomplete-Cholesky methods in the eddy-current literature exploit; partial pivoting
-        # destroys it, and this is as close as scipy gets to their IC.
-        opts.setdefault("permc_spec", "NATURAL")
-        opts.setdefault("diag_pivot_thresh", 0.0)
+        # KEEP scipy's fill-reducing ordering. Forcing `permc_spec="NATURAL"` to preserve the
+        # operator's complex symmetry is theoretically tidy and a disaster in practice: measured on
+        # an A-V system from n=2,049 to n=12,216, NATURAL makes the factorisation scale as n^3.09
+        # against COLAMD's n^1.72 -- extrapolating to a 103k-DOF transformer, 5,451 s versus 7 s.
+        # COLAMD needs more Krylov iterations (642 vs 228 at n=12,216) and still wins on TOTAL time
+        # at every size measured (0.98 s vs 7.70 s). Pass permc_spec="NATURAL" explicitly if a
+        # structure-preserving factorisation is worth that to you.
+        opts.setdefault("diag_pivot_thresh", 0.0)  # no partial pivoting; ordering is still applied
         dtype = np.complex128 if np.iscomplexobj(csr.data) else np.float64
 
         # SYMMETRIC EQUILIBRATION FIRST, and it is not optional in practice. `drop_tol` is RELATIVE,
