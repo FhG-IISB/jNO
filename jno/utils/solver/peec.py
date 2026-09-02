@@ -665,6 +665,51 @@ def _check(value, fn, *args):
         fn(np.asarray(value).item() if np.ndim(value) == 0 else value, *args)
 
 
+#: Built-once-per-network geometry, bounded. Each entry holds its Filaments so the id cannot be
+#: recycled underneath it, and the operator it keeps is the largest thing here -- two is plenty for a
+#: sweep over one network, and a third would cost more memory than the rebuild it saves.
+_GEOM_CACHE: dict = {}
+_GEOM_CACHE_MAX = 2
+
+
+def _frozen_geometry(fil) -> bool:
+    """Whether the metal's position is a value, AND we are not inside a trace.
+
+    `jnp.zeros(())` is the second half and it is not optional: inside a jit even a concrete geometry
+    produces TRACERS of that trace, so the apply built from it closes over them. Keeping that closure
+    and handing it to a later trace leaks them -- which is what `test_two_separate_traces_do_not_leak`
+    is for. The same probe guards `_KRYLOV_CACHE` a few hundred lines down, for the same reason.
+    """
+    probe = (jnp.zeros(()), fil.pos, fil.mom, fil.length, fil.self_g)
+    return not any(isinstance(x, jax.core.Tracer) for x in probe)
+
+
+def _geom_cached(fil, mu0, what, build):
+    """``build()`` once per network for things that depend on GEOMETRY alone, and keep them.
+
+    The partial-inductance apply and the near-field triplets are functions of where the metal is and
+    of nothing else -- not the conductivity, not the frequency. They were rebuilt on every
+    ``solve()`` regardless: about a quarter of a welded module solve, paid again at every point of a
+    frequency sweep and every iteration of a design loop, to produce the same arrays each time.
+
+    A TRACED geometry is never cached -- a bond wire being routed has no fixed value to keep -- so
+    the differentiable path is unaffected and keeps rebuilding, which is what it must do.
+    """
+    if not _frozen_geometry(fil):
+        return build()
+    key = (id(fil), float(mu0))
+    hit = _GEOM_CACHE.get(key)
+    if hit is not None and hit[0] is fil:
+        if what not in hit[1]:
+            hit[1][what] = build()
+        return hit[1][what]
+    if len(_GEOM_CACHE) >= _GEOM_CACHE_MAX:
+        _GEOM_CACHE.pop(next(iter(_GEOM_CACHE)))
+    val = build()
+    _GEOM_CACHE[key] = (fil, {what: val})
+    return val
+
+
 def solve_network(
     fil: Filaments,
     sigma,
@@ -678,7 +723,7 @@ def solve_network(
     mu0=4e-7 * np.pi,
     matrix_free=None,
     tol=1e-8,
-    restart=16,
+    restart=None,
 ):
     """Solve the PEEC circuit for a network whose terminals are node SETS.
 
@@ -707,7 +752,9 @@ def solve_network(
         mu0: permeability of the surrounding medium.
 
     Args (continued):
-        restart: Krylov subspace size. 16 is where the solve is cheapest, and the ADJOINT uses the
+        restart: Krylov subspace size. Defaults by structure -- 16 for a plain lattice, 64 for a
+            welded network, which needs the larger subspace and is 1.5x faster with it while a
+            lattice is 2.9x slower. 16 is where a LATTICE solve is cheapest, and the ADJOINT uses the
             same value -- it is preconditioned by ``P^T`` rather than by ``P``, so it converges like
             the primal. It did not always: with the forward preconditioner on the transposed
             operator the tangent system looked intractable, and at 592 elements the gradient came
@@ -750,12 +797,30 @@ def solve_network(
             "filaments have none. A polyline's filaments are not Toeplitz, so there is no structure to "
             "exploit and the dense path is the honest one."
         )
+    # Krylov subspace size, by STRUCTURE -- the same reasoning as the preconditioner above, and for
+    # the same reason. A welded network's port excitation spreads over far more of the operator's
+    # eigenmodes (see `near_block`), so it needs a higher-degree residual polynomial and a bigger
+    # subspace pays; a plain lattice converges in about 35 steps and a bigger subspace is just
+    # O(m^2) orthogonalisation it never uses. Measured, warm solve:
+    #
+    #     welded module, 27,533 elements    restart 16  49.5 s    restart 64  32.8 s   1.5x FASTER
+    #     plain lattice, 10,048 bars        restart 16   0.39 s   restart 64   1.12 s  2.9x SLOWER
+    #
+    # so neither value suits both, and picking one globally would have made every lattice 3x slower.
+    if restart is None:
+        restart = 64 if welded else 16
+
     if free_form:
         scale = mu0 / (4.0 * jnp.pi)
-        lp_apply = (
-            welded_apply(fil, lambda r: 1.0 / r, mu_scale=scale)
-            if welded
-            else lattice_apply(fil, lambda r: 1.0 / r, mu_scale=scale)
+        lp_apply = _geom_cached(
+            fil,
+            mu0,
+            "lp",
+            lambda: (
+                welded_apply(fil, lambda r: 1.0 / r, mu_scale=scale)
+                if welded
+                else lattice_apply(fil, lambda r: 1.0 / r, mu_scale=scale)
+            ),
         )
         Z = None
     else:
@@ -1097,7 +1162,7 @@ def solve_network(
         # its port excitation spreads over far more eigenmodes, and only a compressed spectrum makes
         # the residual polynomial cheap enough.
         nr, nc, nv = (
-            near_block(fil, lambda r: 1.0 / r, mu_scale=mu0 / (4.0 * jnp.pi))
+            _geom_cached(fil, mu0, "near", lambda: near_block(fil, lambda r: 1.0 / r, mu_scale=mu0 / (4.0 * jnp.pi)))
             if welded
             else (np.zeros(0, int), np.zeros(0, int), np.zeros(0))
         )
