@@ -2025,6 +2025,10 @@ def bar_filaments(shape, size=None, quad: int = 3, quad_t: int = 2, sigma=None, 
             "d": tuple(float(v) for v in d),
             "axis": axis,
             "masks": masks,
+            # which CELLS carry material, as opposed to which BARS exist between them. The magnetic
+            # potential matrix is a cell-to-cell operator, so it needs the occupancy the bar masks
+            # are derived from rather than the bar masks themselves.
+            "cells": (nid >= 0),
             "sigma": bar_sigma,
             # The conductivity RESOLVER, not just the value it produced: `.build()` keeps it and
             # calls it again per solve, so a design variable never re-runs the host discretisation.
@@ -2156,6 +2160,54 @@ def lattice_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3, quad_
         if jnp.iscomplexobj(cur):
             return mu_scale * (real_apply(jnp.real(cur)) + 1j * real_apply(jnp.imag(cur)))
         return mu_scale * real_apply(cur)
+
+    return apply
+
+
+def magnetic_potential_apply(fil: Filaments, mu0: float = 4e-7 * np.pi, quad: int = 2):
+    """``apply(q) -> P_m q`` over the lattice's CELLS, by FFT -- the scalar dual of `lattice_apply`.
+
+    The magnetic system reduces to ``(R_m + A' P_m A) I_fm = K_m I_c`` once the voxel potentials are
+    eliminated, so `P_m` maps a magnetic charge on each cell to the scalar potential it produces.
+    Its coefficient falls out exactly dual to the partial inductance:
+
+        Lp  =  (mu0 / 4 pi) * <1/r> * (mom . mom)        vector, over BARS
+        P_m =  (1 / 4 pi mu0) * <1/r>                    scalar, over CELLS
+
+    (pypeec `lib_solver/system_matrix.py`: ``scale = 1 / (mu_0 dx^2 dy^2 dz^2)`` against a Green
+    function ``vol^2 / (4 pi r)`` -- the volumes cancel and leave `1 / (4 pi mu0 r)`.)
+
+    Two things are reused rather than rebuilt. The operator is the same block-Toeplitz FFT as the
+    electric one, since cells sit on the same regular grid -- `lattice_kernel` never knew about
+    moments, the moment contraction lives a level up. And the self term, the volume-averaged ``1/r``
+    of a cell with itself, is precisely the six-fold integral `bar_self` already evaluates.
+    """
+    from .kernel import bar_self, lattice_operator
+
+    lat = getattr(fil, "lattice", None)
+    if lat is None or "cells" not in lat:
+        raise ValueError(
+            "peec.magnetic_potential_apply: these filaments carry no cell occupancy, so they did not "
+            "come from a bar lattice. A magnetic material is discretised as a solid; a polyline has "
+            "no cells for flux to divide between."
+        )
+    n, d = tuple(int(v) for v in lat["n"]), tuple(float(v) for v in lat["d"])
+    live = jnp.asarray(np.flatnonzero(np.asarray(lat["cells"]).reshape(-1)))
+
+    # sub-points over the cell VOLUME with weights summing to one: the double sum is then the
+    # volume-averaged 1/r the coefficient above expects, with the cell volumes already cancelled.
+    g1, w1 = np.polynomial.legendre.leggauss(int(quad))
+    i, j, k = (a.reshape(-1) for a in np.meshgrid(*(np.arange(quad),) * 3, indexing="ij"))
+    sub = np.stack([0.5 * d[0] * g1[i], 0.5 * d[1] * g1[j], 0.5 * d[2] * g1[k]], axis=1)
+    w = (w1[i] * w1[j] * w1[k]) / 8.0
+    self_g = float(bar_self(np.array([d[2]]), np.array([d[0]]), np.array([d[1]]))[0])
+    op = lattice_operator(n, d, lambda r: 1.0 / r, self_g, sub=sub, w=w)
+    scale = 1.0 / (4.0 * jnp.pi * mu0)
+
+    def apply(q):
+        q = jnp.asarray(q)
+        full = jnp.zeros(int(np.prod(n)), q.dtype).at[live].set(q, unique_indices=True, indices_are_sorted=True)
+        return scale * op(full.reshape(n)).reshape(-1)[live]
 
     return apply
 
