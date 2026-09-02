@@ -139,3 +139,37 @@ def test_a_unit_permeability_conductor_still_conducts():
     e = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e5).build()
     assert e.mag is None  # no magnetisation to carry, so no magnetic mesh and no refusal
     assert float(np.real(e.solve().R)) > 0
+
+
+def test_the_two_meshes_land_on_one_grid():
+    """The conductors and the core must share a lattice, or the coupling between them is not
+    Toeplitz and the FFT that applies it does not exist.
+
+    Built independently they do NOT share one: each call takes its extent and its pitch from its own
+    regions, so the grids come out different sizes and offset from each other -- measured (10,2,1)
+    against (10,3,1) on this very geometry. Each mesh is now framed by the other's shapes, which
+    fixes the grid without putting the other's cells into its occupancy.
+    """
+    e = _net(core=2000.0).build()
+    le, lm = e.fil.lattice, e.mag.lattice
+    assert le["n"] == lm["n"], (le["n"], lm["n"])
+    assert le["d"] == lm["d"], (le["d"], lm["d"])
+
+    # and the occupancies stay disjoint: framing is not meshing
+    ec = np.asarray(le["cells"])
+    mc = np.asarray(lm["cells"])
+    assert ec.shape == mc.shape
+    assert int((ec & mc).sum()) == 0
+    assert int(ec.sum()) > 0 and int(mc.sum()) > 0
+
+
+def test_a_conductor_only_network_keeps_the_grid_it_always_had():
+    """Framing must be inert when there is nothing to frame -- this is the regression guard for
+    every existing model, which must see byte-identical geometry."""
+    from jno.utils.solver.peec import bar_filaments
+
+    sh = jno.Shape.box(0, 0, 0, 0.020, 0.004, 0.002, size=(0.002,) * 3).attach(sigma=CU).name("bar")
+    a = bar_filaments(sh, sigma=CU)
+    b = bar_filaments(sh, sigma=CU, grid_shapes=())
+    assert a.lattice["n"] == b.lattice["n"] and a.lattice["d"] == b.lattice["d"]
+    assert np.allclose(np.asarray(a.nodes), np.asarray(b.nodes))
