@@ -1688,7 +1688,7 @@ def _volume_rule(ln, wt, axis, quad: int, quad_t: int):
     return off, w
 
 
-def bar_filaments(shape, size=None, quad: int = 3, quad_t: int = 2, sigma=None, freq: float = 0.0):
+def bar_filaments(shape, size=None, quad: int = 3, quad_t: int = 2, sigma=None, freq: float = 0.0, grid_shapes=()):
     """Discretise a box conductor into a regular lattice of rectangular bars.
 
     A solid does not have a centreline, so a line's discretisation does not apply. The volume is cut
@@ -1737,7 +1737,14 @@ def bar_filaments(shape, size=None, quad: int = 3, quad_t: int = 2, sigma=None, 
     by a whole number rather than ``size`` exactly -- a lattice has to close on the box.
     """
     shapes = list(shape) if isinstance(shape, (list, tuple)) else [shape]
-    declared = [sh._size for sh in shapes if sh._size is not None]
+    # `grid_shapes` size the GRID without being meshed into it. Two physics on one geometry -- the
+    # conductors and the core -- must share a lattice or the operator coupling them is not Toeplitz
+    # and the FFT does not apply. Built independently they do not: separate calls take their extent
+    # and their pitch from their own regions, so the grids come out different sizes AND offset from
+    # each other. Passing each the other's shapes here makes both agree, while occupancy below still
+    # sees only the shapes this mesh owns.
+    frame = list(grid_shapes)
+    declared = [sh._size for sh in shapes + frame if sh._size is not None]
     # several conductors share one grid, so they share one pitch: the finest asked for, per axis.
     h = (
         size
@@ -1775,7 +1782,7 @@ def bar_filaments(shape, size=None, quad: int = 3, quad_t: int = 2, sigma=None, 
                 % (asked, "x".join(f"{1e3 * c:g}" for c in h)),
             )
     lo, hi = np.full(3, np.inf), np.full(3, -np.inf)
-    for sh in shapes:
+    for sh in shapes + frame:
         bnd = np.asarray(sh.bounds(), dtype=float).reshape(2, -1)
         b0, b1 = np.zeros(3), np.zeros(3)
         b0[: bnd.shape[1]], b1[: bnd.shape[1]] = bnd[0], bnd[1]
