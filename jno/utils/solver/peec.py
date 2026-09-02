@@ -2164,8 +2164,17 @@ def cross_block(pos_a, mom_a, grp_a, na, pos_b, mom_b, grp_b, nb, g, scale=1.0, 
         # of machine, which is what put this solve on the OOM killer's list.
         for lo2 in range(0, pb.shape[0], cb):
             hi2 = min(lo2 + cb, pb.shape[0])
-            d = pa[lo:hi, None, :] - pb[None, lo2:hi2, :]
-            r = jnp.sqrt(jnp.clip((d * d).sum(-1), 1e-300))
+            # r^2 by expansion rather than a (chunk_a, chunk_b, 3) displacement: only the DISTANCE
+            # is wanted, so the third axis is pure overhead -- three quarters of this term's memory
+            # for nothing, and a matmul is quicker than a broadcast subtract besides. Both sides are
+            # centred on the chunk first: the cancellation in |a|^2 + |b|^2 - 2a.b is set by the
+            # coordinate MAGNITUDE, and centring makes that the chunk's own extent instead of the
+            # model's distance from the origin.
+            A, B = pa[lo:hi], pb[lo2:hi2]
+            c = 0.5 * (A.mean(0) + B.mean(0))
+            A, B = A - c, B - c
+            r2 = (A * A).sum(1)[:, None] + (B * B).sum(1)[None, :] - 2.0 * (A @ B.T)
+            r = jnp.sqrt(jnp.clip(r2, 1e-300))
             sub = (ma[lo:hi] @ mb[lo2:hi2].T) * g(r)  # (chunk_a, chunk_b)
             part = jax.ops.segment_sum(sub.T, gb[lo2:hi2], num_segments=nb).T  # contract b
             acc = part if acc is None else acc + part
@@ -2273,6 +2282,9 @@ def _bcoo(val, row, col, shape):
     return jsparse.BCOO((jnp.asarray(val), jnp.stack([jnp.asarray(row), jnp.asarray(col)], axis=1)), shape=shape)
 
 
+#: sub-point PAIRS held at once inside `near_block`; the displacement it builds is 24 bytes each.
+_NEAR_PAIR_BUDGET = 4_000_000
+
 def near_block(fil: Filaments, g, mu_scale=1.0, reach=2.0):
     """The NEAR-FIELD part of ``Lp`` as COO triplets: every pair closer than ``reach`` element sizes.
 
@@ -2371,9 +2383,18 @@ def near_block(fil: Filaments, g, mu_scale=1.0, reach=2.0):
     q = int(counts[0])
     P3 = pos[order].reshape(ne, q, 3)
     M3 = mom[order].reshape(ne, q, 3)
-    pa, pb = P3[pairs[:, 0]], P3[pairs[:, 1]]
-    ma, mb = M3[pairs[:, 0]], M3[pairs[:, 1]]
-    d = pa[:, :, None, :] - pb[:, None, :, :]
-    r = np.sqrt((d * d).sum(-1))
-    val = mu_scale * (np.einsum("pik,pjk->pij", ma, mb) * g(r)).sum((1, 2))
-    return pairs[:, 0], pairs[:, 1], val
+    # Chunked over PAIRS. The displacement is (n_pairs, q, q, 3), and q is twelve once a lattice
+    # element samples its volume, so the whole-array form is n_pairs * 3456 bytes before numpy's
+    # temporaries -- 3.4 GB on a 12,000-element module, for a result that is one scalar per pair.
+    # The sum over a pair is independent of every other pair, so chunking is exact, not an
+    # approximation. Same defect, same shape, as `cross_block` had.
+    out = np.empty(len(pairs))
+    step = max(1, int(_NEAR_PAIR_BUDGET // max(q * q, 1)))
+    for lo in range(0, len(pairs), step):
+        sl = slice(lo, min(lo + step, len(pairs)))
+        pa, pb = P3[pairs[sl, 0]], P3[pairs[sl, 1]]
+        ma, mb = M3[pairs[sl, 0]], M3[pairs[sl, 1]]
+        d = pa[:, :, None, :] - pb[:, None, :, :]
+        r = np.sqrt((d * d).sum(-1))
+        out[sl] = mu_scale * (np.einsum("pik,pjk->pij", ma, mb) * g(r)).sum((1, 2))
+    return pairs[:, 0], pairs[:, 1], out
