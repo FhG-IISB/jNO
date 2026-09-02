@@ -297,7 +297,7 @@ def lattice_kernel(n: Sequence[int], h: Sequence[float], g: Callable, self_g, su
     return jnp.where(valid, body, 0.0)
 
 
-def lattice_operator(n: Sequence[int], h: Sequence[float], g: Callable, self_g, sub=None, w=None, sub_b=None, w_b=None, transpose=False):
+def lattice_operator(n: Sequence[int], h: Sequence[float], g: Callable, self_g, sub=None, w=None, sub_b=None, w_b=None, transpose=False, generator=None):
     """Return ``apply(x)`` performing the BTTB matvec by FFT.
 
     ``x`` has the lattice shape ``n``. The generator's transform is computed once here and closed
@@ -305,7 +305,12 @@ def lattice_operator(n: Sequence[int], h: Sequence[float], g: Callable, self_g, 
     """
     n = tuple(int(v) for v in n)
     dbl = [2 * v for v in n]
-    ghat = jnp.fft.rfftn(lattice_kernel(n, h, g, self_g, sub=sub, w=w, sub_b=sub_b, w_b=w_b))
+    # `generator` lets a caller supply the BTTB generator itself rather than a kernel to build one
+    # from. The magnetic coupling needs that: it is the derivative of the Green function, obtained as
+    # a DIFFERENCE of two generators shifted half a cell apart, which no single `g(r)` expresses. The
+    # embedding, the FFT and the transpose stay here so there is one place that knows them.
+    kern = lattice_kernel(n, h, g, self_g, sub=sub, w=w, sub_b=sub_b, w_b=w_b) if generator is None else jnp.asarray(generator)
+    ghat = jnp.fft.rfftn(kern)
     # A cross generator is not even in the separation -- the offset between the two families has a
     # sign -- so the block is not symmetric and its transpose is a distinct operator. Reversing the
     # generator is conjugation in Fourier space, which is the whole cost of getting `K_BA` from
