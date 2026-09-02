@@ -67,13 +67,15 @@ def _inductance(mu_r=None, gap=0.0, freq=1e5):
     "criteria, kept red on purpose so they cannot be quietly forgotten.",
     strict=True,
 )
-def test_a_unit_permeability_core_is_the_coreless_answer():
-    """A mu_r = 1 region is magnetically transparent, so switching it on must move nothing.
+def test_a_barely_magnetic_core_is_the_coreless_answer():
+    """As chi -> 0 the core must fade out CONTINUOUSLY into the coreless answer.
 
-    The continuity guard. A magnetic discretisation that appears at some threshold and changes the
-    answer as it does is wrong however well it matches an absolute formula elsewhere.
+    The continuity guard, and the shape of test a sheet-pair model failed this week while passing
+    every absolute check written for it: a discretisation that switches on must not move the answer
+    as it does. Deliberately mu_r slightly ABOVE 1 rather than exactly 1 -- exactly 1 is dropped as
+    air at the front door, so it would test the bypass instead of the physics.
     """
-    assert abs(_inductance(mu_r=1.0) / _inductance(mu_r=None) - 1) < 0.02
+    assert abs(_inductance(mu_r=1.0001) / _inductance(mu_r=None) - 1) < 0.005
 
 
 @pytest.mark.xfail(

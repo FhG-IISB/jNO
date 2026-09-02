@@ -435,6 +435,34 @@ def internal_impedance(length, area, skin, round_, omega, sigma, mu0=4e-7 * jnp.
     return jnp.where(dead, dc.astype(z.dtype), z)
 
 
+def magnetic_reluctance(length, area, mu_r, mu0=4e-7 * jnp.pi):
+    """Per-element magnetic reluctance, ``1/H`` -- the dual of a conductor's resistance.
+
+    A magnetic material enters PEEC as a **magnetisation**, so what circulates in the magnetic mesh is
+    the flux the material *adds*, not the whole of it. The constitutive quantity is therefore the
+    susceptibility
+
+        chi = mu_r - 1
+
+    and the element's magnetic resistivity is ``1 / (mu0 chi)``, giving
+
+        R_m = length / (mu0 chi area)
+
+    (pypeec, ``lib_solver/problem_value.py``: ``rho = 1 / (cst.mu_0 * chi)``; the formulation is
+    Torchio et al., *A PEEC method with magnetic materials*, IEEE TMTT 66(5), 2018.)
+
+    **chi rather than mu_r is what makes a mu_r = 1 region vanish** instead of merely becoming weak.
+    Air adds no magnetisation, so it is not a magnetic element at all -- and a discretisation that
+    switched on at mu_r = 1 and moved the answer would be wrong however well it matched a formula
+    elsewhere. Such elements are dropped at the front door, so this never sees chi = 0.
+
+    A COMPLEX ``mu_r`` is allowed and is how core loss enters: the imaginary part of chi is the lossy
+    component of the magnetisation, exactly as a complex permittivity carries dielectric loss.
+    """
+    chi = jnp.asarray(mu_r) - 1.0
+    return jnp.asarray(length) / (mu0 * chi * jnp.asarray(area))
+
+
 def slab_transfer_impedance(length, width, thickness, omega, sigma, mu0=4e-7 * jnp.pi):
     """The 2-port form of the slab impedance: one current sheet per face, and their coupling.
 
