@@ -2120,7 +2120,7 @@ def _sub_slice(fil, lo, hi):
     return np.flatnonzero(m), grp[m] - lo, int(hi - lo)
 
 
-def cross_block(pos_a, mom_a, grp_a, na, pos_b, mom_b, grp_b, nb, g, scale=1.0, chunk=2048):
+def cross_block(pos_a, mom_a, grp_a, na, pos_b, mom_b, grp_b, nb, g, scale=1.0, chunk=2048, budget=32_000_000):
     """The ELEMENT-level coupling ``Lp_ab``, built once — ``(na, nb)``, dense.
 
     Two conductors on different discretisations couple through a block that is neither Toeplitz nor
@@ -2136,19 +2136,42 @@ def cross_block(pos_a, mom_a, grp_a, na, pos_b, mom_b, grp_b, nb, g, scale=1.0, 
 
     The sub-point double sum is contracted into elements here, so the returned block is indexed by
     element and an apply is one dense matvec.
+
+    BOTH sides are contracted inside the chunk loop. Contracting only ``b`` and concatenating first
+    builds an ``(n_a_subpoints, nb)`` intermediate, which is larger than the result by the sub-point
+    count -- twelve, once a lattice element samples its volume rather than its axis. That is a
+    quadratic cost on a term that is supposed to be the thin one: on a 12,000-element module it
+    allocated 2.7 GB to produce a 46 MB block, and the solve peaked at 14.7 GB against 18 GB of
+    machine. Accumulating instead is exact, not an approximation -- a segment sum over a partition
+    is additive across the chunks of that partition.
     """
     pa, ma = jnp.asarray(pos_a), jnp.asarray(mom_a)
     pb, mb = jnp.asarray(pos_b), jnp.asarray(mom_b)
     ga, gb = jnp.asarray(grp_a), jnp.asarray(grp_b)
-    rows = []
+    # The pair BLOCK is what has to be bounded, not either side on its own: `chunk` sets the `a`
+    # side and the `b` side then takes whatever keeps `chunk_a * chunk_b` within `budget` pairs.
+    # Chunking both at 2048 bounds the memory but makes the blocks far too small -- measured 27.7 s
+    # against 4.5 s, all of it dispatch -- so the budget buys the memory back without the tiling.
+    cb = max(1, int(budget // max(int(chunk), 1)))
+    out = None
     for lo in range(0, pa.shape[0], chunk):
         hi = min(lo + chunk, pa.shape[0])
-        d = pa[lo:hi, None, :] - pb[None, :, :]
-        r = jnp.sqrt(jnp.clip((d * d).sum(-1), 1e-300))
-        sub = (ma[lo:hi] @ mb.T) * g(r)  # (chunk, n_b_subpoints)
-        rows.append(jax.ops.segment_sum(sub.T, gb, num_segments=nb).T)  # contract b into elements
-    blk = jnp.concatenate(rows, axis=0)
-    return scale * jax.ops.segment_sum(blk, ga, num_segments=na)  # then a
+        acc = None
+        # BOTH sides are chunked. Chunking only `a` bounds nothing when `b` is the big one, and in a
+        # welded network it is exactly that way round: the thin side is the bond wire and the lattice
+        # it welds to is the wide one. A (chunk, n_b_subpoints, 3) displacement then reached 6.96 GB
+        # on a 12,000-element module -- with `r` and the kernel on top, a 14.6 GB peak against 18 GB
+        # of machine, which is what put this solve on the OOM killer's list.
+        for lo2 in range(0, pb.shape[0], cb):
+            hi2 = min(lo2 + cb, pb.shape[0])
+            d = pa[lo:hi, None, :] - pb[None, lo2:hi2, :]
+            r = jnp.sqrt(jnp.clip((d * d).sum(-1), 1e-300))
+            sub = (ma[lo:hi] @ mb[lo2:hi2].T) * g(r)  # (chunk_a, chunk_b)
+            part = jax.ops.segment_sum(sub.T, gb[lo2:hi2], num_segments=nb).T  # contract b
+            acc = part if acc is None else acc + part
+        part = jax.ops.segment_sum(acc, ga[lo:hi], num_segments=na)  # then a, once per a-chunk
+        out = part if out is None else out + part
+    return scale * out
 
 
 def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3, quad_t: int = 2):
