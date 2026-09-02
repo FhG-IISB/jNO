@@ -108,11 +108,16 @@ def test_current_leaves_the_low_resistance_path_at_high_frequency():
     assert rhf > 3.0 * rdc  # and that path is the thin, resistive one
 
 
-def test_a_conductor_without_a_conductivity_is_named():
+def test_a_region_with_no_material_at_all_is_named():
+    """Since a region may now carry a conductivity, a permeability, or both, the refusal says so.
+
+    The behaviour is unchanged -- a region drawn into a solve with no material is refused rather than
+    quietly excluded -- but a message naming only `sigma` would now be wrong half the time.
+    """
     wire = jno.Shape.line([(0, 0, 0), (0, 0, ELL)], r=RAD, size=ELL / 5).name("wire")  # no .attach
     d = (wire + jno.Shape.sphere(0, 0, 0.0, 2 * RAD).name("A") + jno.Shape.sphere(0, 0, ELL, 2 * RAD).name("B")).domain()
     _i, v, at = ports(d)
-    with pytest.raises(ValueError, match=r"conductor 'wire' has no conductivity"):
+    with pytest.raises(ValueError, match=r"'wire' declares neither a conductivity nor a permeability"):
         jno.peec([v(*at("A")) - v(*at("B")) - 1.0]).solve()
 
 
