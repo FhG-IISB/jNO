@@ -531,7 +531,7 @@ class PEEC:
             # it agrees with pypeec at 1 kHz (79.0 against 76.8 nH) and trends to its 51.3 nH at
             # 1 MHz. Inductance cannot be discontinuous in frequency, so the feature stays off the
             # front door until that is understood; the machinery and its tests are kept.
-            fb = bar_filaments(shs, sigma=sgs)
+            fb = bar_filaments(shs, sigma=sgs, grid_shapes=[s for s, _ in magnetic])
             blocks.append((tuple(solid_names), fb.lattice["resolve"]))
             parts.append((fb, fb.lattice["sigma"]))
             owners.append(shs)
@@ -586,7 +586,10 @@ class PEEC:
                     "adding a coupled magnetic system to that is untested -- so it is refused rather "
                     "than guessed at. Model the winding as a solid, or drop the core."
                 )
-            mag = bar_filaments([s for s, _ in magnetic], sigma=[m for _, m in magnetic])
+            # both meshes must land on ONE grid, or the coupling between them is not Toeplitz
+            mag = bar_filaments(
+                [s for s, _ in magnetic], sigma=[m for _, m in magnetic], grid_shapes=[s for s, _ in solids]
+            )
         return fil, terms, line_names + solid_names, resolve_all, mag, tuple(magnetic_names)
 
     def build(self) -> "BuiltPEEC":
