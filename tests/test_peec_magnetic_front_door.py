@@ -106,3 +106,36 @@ def test_a_core_in_a_welded_network_is_refused_for_now():
     system on top of that is untested, so it is refused rather than guessed at."""
     with pytest.raises(NotImplementedError, match="together with a Shape.line"):
         _net(core=2000.0, wire=True).build()
+
+
+def test_a_unit_permeability_region_is_air_and_says_so():
+    """chi = mu_r - 1 is zero, so the region adds no magnetisation and is not a core.
+
+    Dropping it is exact rather than an approximation. With nothing else attached it is air with a
+    name, which is a modelling slip worth refusing rather than solving around.
+    """
+    bar = jno.Shape.box(0, 0, 0, 0.020, 0.004, 0.002, size=(0.002,) * 3).attach(sigma=CU).name("bar")
+    air = jno.Shape.box(0, 0.008, 0, 0.020, 0.014, 0.002, size=(0.002,) * 3).attach(mu_r=1.0).name("air")
+    d = (bar + air).domain()
+    d.tag("A", lambda x, y, z: x < 0.0011)
+    d.tag("B", lambda x, y, z: x > 0.0189)
+    i, v = d.peec_symbols()
+    at = lambda t: d.variable(t, split=True, sample=(2, None))[:3]
+    with pytest.raises(ValueError, match="air with a name"):
+        jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e5).build()
+
+
+def test_a_unit_permeability_conductor_still_conducts():
+    """The same region carrying a sigma is a perfectly good conductor; only the core part is air."""
+    bar = jno.Shape.box(0, 0, 0, 0.020, 0.004, 0.002, size=(0.002,) * 3).attach(sigma=CU).name("bar")
+    both = jno.Shape.box(0, 0.008, 0, 0.020, 0.014, 0.002, size=(0.002,) * 3).attach(
+        mu_r=1.0, sigma=CU
+    ).name("both")
+    d = (bar + both).domain()
+    d.tag("A", lambda x, y, z: x < 0.0011)
+    d.tag("B", lambda x, y, z: x > 0.0189)
+    i, v = d.peec_symbols()
+    at = lambda t: d.variable(t, split=True, sample=(2, None))[:3]
+    e = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e5).build()
+    assert e.mag is None  # no magnetisation to carry, so no magnetic mesh and no refusal
+    assert float(np.real(e.solve().R)) > 0
