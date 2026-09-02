@@ -398,19 +398,41 @@ class PEEC:
                 "jno.peec: every region is named by a port, so there is no conductor left to carry current. "
                 "A terminal marks part of a conductor; it is not a conductor of its own."
             )
-        try:
-            sig = self.domain.attached("sigma")
-        except KeyError:  # nothing declared it at all, which is the same story as declaring it patchily
-            sig = {}
+        def _attached(name):
+            try:
+                return self.domain.attached(name)
+            except KeyError:  # nothing declared it at all: the same story as declaring it patchily
+                return {}
+
+        # WHAT A REGION CARRIES DECIDES WHAT IT IS -- there is no mode flag and no solver argument.
+        # `sigma` alone is a conductor; `mu_r` alone is a core that does not conduct, a ferrite or a
+        # powder; both together is a conducting magnetic material, a lamination or a lossy core.
+        sig, mur = _attached("sigma"), _attached("mu_r")
         lines, line_sig, solids = [], [], []
         line_names, solid_names = [], []
+        magnetic, magnetic_names = [], []
         for n, sh in conductors.items():
-            if n not in sig:
-                raise ValueError(f"jno.peec: conductor {n!r} has no conductivity. Give it one: .attach(sigma=...).")
+            if n not in sig and n not in mur:
+                raise ValueError(
+                    f"jno.peec: region {n!r} declares neither a conductivity nor a permeability, so "
+                    "there is nothing to solve on it. Give it one: `.attach(sigma=...)` for metal, "
+                    "`.attach(mu_r=...)` for a core that does not conduct, or both for a conducting "
+                    "magnetic material."
+                )
             node = getattr(sh, "_node", None)
             kind = type(node[1]).__name__ if (isinstance(node, tuple) and node and node[0] == "leaf") else None
             if kind != "Line" and not getattr(sh, "is_analytic", lambda: False)():
                 raise NotImplementedError(_shape_msg(n, kind))
+            if n in mur:
+                if kind == "Line":
+                    raise NotImplementedError(
+                        f"jno.peec: {n!r} attaches mu_r to a Shape.line. A core carries FLUX through a "
+                        "cross-section, which a filament does not have -- model it as a solid."
+                    )
+                magnetic.append((sh, mur[n]))
+                magnetic_names.append(n)
+            if n not in sig:
+                continue
             # NOT coerced to float: a conductivity may be a traced value, which is what closes the
             # electro-thermal loop — sigma(T) falls as the conductor heats, and copper is about 31 %
             # more resistive at 100 C than at 20 C.
@@ -518,7 +540,20 @@ class PEEC:
                 "joining a bond wire to a trace layer costs, not a mistake -- but a model built from "
                 "solids alone stays on the fast path, so it is worth knowing which one you are on."
             )
-        return fil, terms, line_names + solid_names, resolve_all
+        # The magnetic mesh is structurally the SAME object as the electric one: a core is voxels and
+        # the faces between them, exactly as a conductor is bars between cells. So `bar_filaments`
+        # builds it unchanged, carrying the permeability where a conductivity would sit.
+        mag = None
+        if magnetic:
+            if lines:
+                raise NotImplementedError(
+                    "jno.peec: a magnetic region together with a Shape.line is not supported yet. A "
+                    "welded network already needs a cross block and a whole-system factorisation, and "
+                    "adding a coupled magnetic system to that is untested -- so it is refused rather "
+                    "than guessed at. Model the winding as a solid, or drop the core."
+                )
+            mag = bar_filaments([s for s, _ in magnetic], sigma=[m for _, m in magnetic])
+        return fil, terms, line_names + solid_names, resolve_all, mag, tuple(magnetic_names)
 
     def build(self) -> "BuiltPEEC":
         """Freeze the discretisation and return the jittable :class:`BuiltPEEC`.
@@ -560,8 +595,11 @@ class BuiltPEEC:
     inside ``jax.jit``, ``jax.grad``, or a ``jno.fn`` term driven by ``jno.core``.
     """
 
-    def __init__(self, spec, fil, terms, part_names, resolve):
+    def __init__(self, spec, fil, terms, part_names, resolve, mag=None, mag_names=()):
         self.fil, self.terminals, self.part_names = fil, tuple(terms), tuple(part_names)
+        #: the magnetic mesh, when any region attached a `mu_r` -- a Filaments of the same shape as
+        #: the electric one, since a core is voxels and faces just as a conductor is.
+        self.mag, self.mag_names = mag, tuple(mag_names)
         self.freq, self._scalar_freq = spec.freq, spec._scalar_freq
         self.sources, self.currents, self.grounds, self.devices = (
             spec.sources,
@@ -626,6 +664,16 @@ class BuiltPEEC:
                         f"Its terminals are {sorted(nodes)}."
                     )
                 nodes[name] = (np.asarray(nodes[name]), w)
+        if self.mag is not None:
+            import numpy as _np
+
+            raise NotImplementedError(
+                f"jno.peec: {len(self.mag_names)} magnetic region(s) {sorted(self.mag_names)} were "
+                f"discretised into {int(_np.asarray(self.mag.length).size)} elements, but the COUPLED "
+                "magnetic solve is not wired yet. Solving anyway would return the coreless answer with "
+                "no sign that the core had been ignored, which is the one thing this solver will not "
+                "do. Drop the `mu_r` to solve the conductors alone; `built.mag` holds the mesh."
+            )
         sigma = self._resolve(sigma)
         dev = self.devices
         if devices:
