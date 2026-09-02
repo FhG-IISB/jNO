@@ -194,7 +194,7 @@ precond=…, time=…)` composes (see the [FEM guide](fem.md)). The families:
 | Kind | `jno.solve` |
 | --- | --- |
 | **Linear — direct** | `lu` (sparse LU), `dense` |
-| **Linear — iterative (Krylov)** | `cg`, `bicgstab`, `gmres`, `fgmres`, `minres`; `lstsq` (LSQR, least-squares); `chebyshev` (polynomial) |
+| **Linear — iterative (Krylov)** | `cg`, `bicgstab`, `gmres`, `fgmres`, `minres`, `cocg` (complex-symmetric); `lstsq` (LSQR, least-squares); `chebyshev` (polynomial) |
 | **Linear — multigrid** | `amg` (GPU AMG / NVIDIA AmgX via jaxamg) |
 | **Nonlinear** | `newton`, `picard` |
 | **Eigenproblem** | `eigs` (generalized `Kx = λMx`) — dense reduction, preconditioned LOBPCG with `precond=`, or interior modes nearest a shift with `sigma=` |

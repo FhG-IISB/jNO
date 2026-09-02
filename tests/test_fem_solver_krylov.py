@@ -483,3 +483,89 @@ def test_fgmres_real_path_is_unchanged_by_the_complex_fix():
     b = _b(Ad.shape[0])
     x = jno.solve.fgmres(tol=1e-12, restart=16, maxiter=400)(_op(Ad), b)
     assert np.abs(np.asarray(x) - np.linalg.solve(Ad, np.asarray(b))).max() < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# COCG — complex-symmetric
+# ---------------------------------------------------------------------------
+
+
+def _sym_complex(n=60, seed=5):
+    """A complex-SYMMETRIC matrix: ``A = A^T``, emphatically not ``A = A^H``.
+
+    Shifted so it is diagonally dominant enough for a short recurrence to converge in a test-sized
+    budget, and given a genuinely complex diagonal so the imaginary part is not a perturbation.
+    """
+    rng = np.random.default_rng(seed)
+    R = rng.standard_normal((n, n)) + 1j * rng.standard_normal((n, n))
+    A = R + R.T  # symmetric, NOT Hermitian (that would be R + R.conj().T)
+    return A + (n * 0.6) * np.eye(n) * (1.0 + 0.35j)
+
+
+def test_cocg_solves_a_complex_symmetric_system():
+    """The reason COCG exists: a short recurrence on ``A = A^T``, where CG's Hermitian inner product
+    does not apply and GMRES needs a growing basis."""
+    Ad = _sym_complex()
+    assert np.abs(Ad - Ad.T).max() == 0.0, "the fixture must be symmetric, not Hermitian"
+    assert np.abs(Ad - Ad.conj().T).max() > 1.0, "a Hermitian fixture would not test COCG at all"
+    b = _b_complex(Ad.shape[0])
+    ref = np.linalg.solve(Ad, np.asarray(b))
+    x = jno.solve.cocg(tol=1e-12, maxiter=2000)(_op(Ad), b)
+    assert np.abs(np.asarray(x) - ref).max() / np.abs(ref).max() < 1e-8
+
+
+def test_cocg_inner_product_is_bilinear_not_hermitian():
+    """The one line that would silently break this method.
+
+    ``fgmres`` conjugates its projections on purpose (``jnp.conj(V) @ w``); COCG must not. A
+    ``conj`` added here to "match" would compute the Hermitian form ``r^H z``, which is the
+    recurrence for a different matrix -- and on a symmetric-but-not-Hermitian operator it does not
+    converge. Pin it by solving with the real method and asserting the conjugated variant fails on
+    the same system, so the distinction is tested rather than commented.
+    """
+    from jno.utils.solver.krylov import cocg as _cocg
+
+    Ad = _sym_complex(seed=13)
+    op = _op(Ad)
+    b = _b_complex(Ad.shape[0])
+    ref = np.linalg.solve(Ad, np.asarray(b))
+
+    good = _cocg(op.mv, b, tol=1e-12, maxiter=2000)
+    assert np.abs(np.asarray(good) - ref).max() / np.abs(ref).max() < 1e-8
+
+    # The same iteration with Hermitian projections, written out: it is NOT the same method.
+    x = jnp.zeros_like(b)
+    r = b - op.mv(x)
+    p, rho = r, jnp.vdot(r, r)  # vdot conjugates — the wrong form here
+    for _ in range(2000):
+        q = op.mv(p)
+        pq = jnp.vdot(p, q)
+        if abs(complex(pq)) < 1e-300:
+            break
+        a = rho / pq
+        x, r = x + a * p, r - a * q
+        rho_new = jnp.vdot(r, r)
+        p, rho = r + (rho_new / rho) * p, rho_new
+    hermitian_err = np.abs(np.asarray(x) - ref).max() / np.abs(ref).max()
+    assert hermitian_err > 1e-4, (
+        f"the Hermitian variant reached {hermitian_err:.1e}; if it now works, this fixture no "
+        "longer distinguishes the two inner products and the test is not testing anything"
+    )
+
+
+def test_cocg_matches_cg_on_a_real_spd_system():
+    """On a real SPD matrix the bilinear form IS the inner product, so COCG degenerates to CG.
+    A method that cannot reproduce CG there has its recurrence wrong."""
+    Ad = _spd(n=50, seed=2)
+    b = _b(Ad.shape[0])
+    x = jno.solve.cocg(tol=1e-12, maxiter=1000)(_op(Ad), b)
+    assert np.abs(np.asarray(x) - np.linalg.solve(Ad, np.asarray(b))).max() < 1e-9
+
+
+def test_cocg_key_covers_every_parameter():
+    """A LinearSolver key that omits a parameter makes two different solvers compare equal, and the
+    compiled slot path then reuses the wrong one -- slow is recoverable, wrong is not."""
+    base = jno.solve.cocg(tol=1e-8, maxiter=2000)
+    assert base.key != jno.solve.cocg(tol=1e-10, maxiter=2000).key
+    assert base.key != jno.solve.cocg(tol=1e-8, maxiter=500).key
+    assert base.key == jno.solve.cocg(tol=1e-8, maxiter=2000).key
