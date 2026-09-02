@@ -462,10 +462,20 @@ class PEEC:
             # that is ten coplanar traces of equal thickness, which is the case it fits exactly.
             shs = [sh for sh, _ in solids]
             sgs = [sg for _, sg in solids]
-            # The build frequency, so a conductor thick against the skin depth is discretised as a
-            # current sheet per FACE. Structure, so it is fixed for the built network and a sweep
-            # takes its highest frequency -- where a conductor is thickest against the skin depth.
-            fb = bar_filaments(shs, sigma=sgs, freq=float(np.max(self.freq)) if len(self.freq) else 0.0)
+            # NOT passing the build frequency, so no sheet pairs are emitted. `bar_filaments(freq=)`
+            # discretises a conductor thick against the skin depth as a current sheet per face, which
+            # fixes a real defect (a return plane's thickness moving L where it cannot) -- but the
+            # model is WRONG for a conductor carrying the loop current, and by more than the defect
+            # it fixes. On a real power module, crossing the pairing threshold collapses the loop
+            # inductance discontinuously:
+            #
+            #     50 kHz, unpaired   60.5 nH        80 kHz, paired   20.1 nH
+            #
+            # where the physical change over that range is nil. The unpaired arm is the right one:
+            # it agrees with pypeec at 1 kHz (79.0 against 76.8 nH) and trends to its 51.3 nH at
+            # 1 MHz. Inductance cannot be discontinuous in frequency, so the feature stays off the
+            # front door until that is understood; the machinery and its tests are kept.
+            fb = bar_filaments(shs, sigma=sgs)
             blocks.append((tuple(solid_names), fb.lattice["resolve"]))
             parts.append((fb, fb.lattice["sigma"]))
             owners.append(shs)
@@ -724,6 +734,12 @@ def _weld(parts, owners):
         # couple through a cross term. That is what lets a trace layer stay an FFT while the bond
         # wires landing on it stay exact.
         {"welded": _spans(fils)},
+        # Element pairings survive the weld. Dropping them left the two current sheets of a slab in
+        # the network as INDEPENDENT elements -- each taking the whole conductor's surface impedance,
+        # two of them in parallel, with none of the coupling that makes them one conductor. The
+        # geometry still said "two sheets" while the physics said "two conductors", and the loop
+        # inductance of a real module fell 3.3x the moment the pairing threshold was crossed.
+        _pairs(fils),
     )
     # jnp, not numpy: a per-filament conductivity may be TRACED -- a density field, or sigma(T) --
     # and a welded network is exactly where that matters, since a real module is traces AND wires.
@@ -760,6 +776,25 @@ def _join_contacts(inc, nodes, bounds, owners):
     # merging rows is a left-multiply by the (kept x all) membership matrix, which keeps it sparse
     pick = sparse.coo_matrix((np.ones(len(nodes)), (inverse, np.arange(len(nodes)))), shape=(len(keep), len(nodes))).tocsr()
     return (pick @ inc).tocsr(), nodes[keep]
+
+
+def _pairs(fils):
+    """The sheet pairings, renumbered into the WELDED network's element numbering.
+
+    None when nothing anywhere is paired, which is what an unpaired network expects to see.
+    """
+    out, off, live = [], 0, False
+    for f in fils:
+        k = int(np.asarray(f.length).shape[0])
+        pr = getattr(f, "pair", None)
+        if pr is None:
+            out.append(-np.ones(k, dtype=int))
+        else:
+            pr = np.asarray(pr, dtype=int)
+            live = live or bool((pr >= 0).any())
+            out.append(np.where(pr >= 0, pr + off, -1))  # welding stacks the blocks, so shift
+        off += k
+    return np.concatenate(out) if live else None
 
 
 def _spans(fils):
