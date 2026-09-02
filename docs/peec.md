@@ -393,32 +393,35 @@ Every layer is checked against an oracle that does not go through the layer belo
 | a rectangular bar's partial inductance | Grover's rectangular-bar formula, `L = (μ₀l/2π)[ln(2l/(w+t)) + ½ + 0.2235(w+t)/l]` |
 | a near-neighbour mutual between two cells | a volume Monte-Carlo of the Neumann double integral — wrong in a completely different way from a Gauss rule |
 
-!!! tip "A thick conductor carries a current sheet per face"
-    A conductor more than two skin depths thick is discretised as **two current sheets**, one at each
-    face, rather than one current spread through it. Without that its inductance contradicts its own
-    surface impedance: `R` knows the current is confined to a skin layer, but a single current per
-    element has nowhere to sit except the middle of the cell, so a **return plane's thickness changed
-    `L`** at a frequency where the copper below the skin layer is electromagnetically invisible.
+!!! danger "A return plane's thickness moves `L` when it should not — open"
+    `R` uses a shape-aware **surface impedance**, so it knows the current is confined to a skin layer
+    at the conductor's faces. The **partial inductance does not**: a single current per element has
+    nowhere to sit but the middle of the cell. A return plane's *thickness* therefore changes `L` at
+    a frequency where the copper below the skin layer is electromagnetically invisible.
 
     Measured against [pypeec](https://github.com/otvam/pypeec) 5.8.0, which resolves the skin depth
-    with volume cells, taking a ground plane from 0.4 mm to 1.6 mm under a microstrip at 100 kHz
-    (1.9 → 7.7 skin depths):
+    with volume cells, taking a ground plane from 0.4 mm to 1.6 mm under a microstrip at 100 kHz:
 
-    | | pypeec | jNO before | jNO now |
-    |---|---|---|---|
-    | ΔL, skin-confined | −0.05 % | +21.3 % | **+0.25 %** |
+    | ΔL, skin-confined | pypeec | jNO |
+    |---|---|---|
+    | 0.4 → 1.6 mm | −0.05 % | **+21.3 %** |
 
-    The split between the two sheets is found by the **solve**, not assumed — at 7.7 skin depths it
-    comes out about 92/8, and no fixed rule reproduces that. The pair is emitted only where the
-    conductor is thick against the skin depth at the frequency the network is `build()`-ed at; below
-    that the current genuinely fills the section and one element already says so exactly. A swept
-    solve takes its highest frequency, since structure is fixed for the built network.
+    At the 0.49 mm plane of a real power module this is worth about 8 %.
 
-    **Limits.** Only a lattice family that is entirely *one* conductor thickness can be split — the
-    two sheets are a second family on the same grid, and a family carries one sub-point offset or the
-    operator stops being block-Toeplitz. A layout mixing thicknesses on one grid (traces over a
-    plane) keeps the single-current model. A conductor already split across its thickness keeps it
-    too: those elements resolve the distribution themselves.
+    **The remedy is not shipped, because it was worse than the disease.** Giving a thick conductor a
+    current **sheet per face** (`bar_filaments(freq=)`, and `slab_transfer_impedance`) fixes the
+    plane case exactly — but it is wrong for a conductor carrying the LOOP current. Since the pairing
+    is triggered by thickness against the skin depth, it engages at a particular frequency, and the
+    answer jumps there:
+
+        50 kHz, unpaired   60.5 nH        80 kHz, paired   20.1 nH
+
+    on a real module, where nothing physical happens in between. An inductance is continuous in
+    frequency. The unpaired arm is the right one — it agrees with pypeec at 1 kHz (79.0 against
+    76.8 nH) and trends toward its 51.3 nH at 1 MHz.
+
+    So `jno.peec` never emits sheet pairs today. The machinery, its tests, and a continuity guard are
+    kept, and `bar_filaments(freq=)` still builds them for anyone working on it.
 
 !!! warning "A lattice element is a cube, and the quadrature costs what that implies"
     Sub-points sample an element's **volume**: `quad` along its axis, `quad_t` across each transverse
