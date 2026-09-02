@@ -279,11 +279,20 @@ sol = built.solve(restart=48, matrix_free=None, devices={"MD": 6.1e-3})
 ```
 
 `restart`
-:   GMRES restart depth on the matrix-free path. The default of 16 is where the curve flattens for a
-    few thousand elements, and **not** where it flattens for twenty thousand: on a real module at a
-    0.7 mm pitch (21,980 bars) 16 leaves a 9.3e-06 residual where 1e-6 is wanted, while 48 converges —
-    and finishes *sooner*, 176 s against the 290 s the shallower one spends failing. Raise it when the
-    solve refuses.
+:   GMRES restart depth on the matrix-free path. The default is chosen **by structure**: `16` for a
+    plain lattice, `64` for a welded network. Neither suits both — a welded network's port excitation
+    spreads over far more of the operator's eigenmodes, so it needs the deeper subspace, while a
+    lattice converges in about 35 steps and a deeper one is only `O(m²)` orthogonalisation it never
+    uses:
+
+    | | restart 16 | restart 64 |
+    |---|---|---|
+    | welded module, 27,533 elements | 49.5 s | **32.8 s** |
+    | plain lattice, 10,048 bars | **0.39 s** | 1.12 s |
+
+    Raise it further when a solve refuses: at a 0.7 mm pitch (21,980 bars) 16 left a 9.3e-06 residual
+    where 1e-6 was wanted, while 48 converged *and* finished sooner — 176 s against the 290 s the
+    shallower one spent failing.
 
 `matrix_free`
 :   `None` decides by structure: a network containing a bar lattice is applied by **FFT**, anything
