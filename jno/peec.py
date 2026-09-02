@@ -94,6 +94,19 @@ MU0 = 4e-7 * np.pi
 _QUAD, _QUAD_T = 3, 2
 
 
+def _unit_permeability(v) -> bool:
+    """Whether a declared ``mu_r`` is concretely 1, so the region is air.
+
+    Only a CONCRETE one: a traced permeability has no value to compare, and a design variable that
+    happens to pass through 1 would divide by a zero susceptibility. That edge is documented rather
+    than guarded, because guarding it would mean changing the mesh mid-optimisation.
+    """
+    try:
+        return bool(np.asarray(v).shape == () and float(np.asarray(v)) == 1.0)
+    except (TypeError, ValueError):
+        return False
+
+
 def _domain_of(constraints):
     for c in constraints:
         for var in (getattr(c, "_coord_vars", None) or {}).values():
@@ -429,9 +442,30 @@ class PEEC:
                         f"jno.peec: {n!r} attaches mu_r to a Shape.line. A core carries FLUX through a "
                         "cross-section, which a filament does not have -- model it as a solid."
                     )
-                magnetic.append((sh, mur[n]))
-                magnetic_names.append(n)
+                # What circulates in the magnetic mesh is the MAGNETISATION, whose constitutive
+                # quantity is chi = mu_r - 1. Air adds none, so a mu_r of exactly 1 is not a magnetic
+                # region at all -- it is dropped, which is exact rather than an approximation, and is
+                # what lets a unit-permeability core reproduce the coreless answer to the last bit
+                # instead of merely closely. It also keeps an infinite reluctance out of the solve.
+                if _unit_permeability(mur[n]):
+                    from .utils.solver.peec import _warn_once
+
+                    _warn_once(
+                        f"jno.peec: {n!r} attaches mu_r = 1, which is air: chi = mu_r - 1 is zero, so "
+                        "it adds no magnetisation and is not discretised as a core. Nothing is lost -- "
+                        "the answer is the one you would get without it -- but if a core was intended, "
+                        "its permeability is not set."
+                    )
+                else:
+                    magnetic.append((sh, mur[n]))
+                    magnetic_names.append(n)
             if n not in sig:
+                if n not in {m for m in magnetic_names}:
+                    raise ValueError(
+                        f"jno.peec: region {n!r} declares mu_r = 1 and no conductivity, so it is air "
+                        "with a name. Give it a real permeability, give it a `sigma`, or leave it out "
+                        "of the network."
+                    )
                 continue
             # NOT coerced to float: a conductivity may be a traced value, which is what closes the
             # electro-thermal loop — sigma(T) falls as the conductor heats, and copper is about 31 %
