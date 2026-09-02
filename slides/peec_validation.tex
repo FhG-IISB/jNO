@@ -1,0 +1,107 @@
+% Build: lualatex peec_validation.tex (twice).  The theme also wants fraunhofer_iisb.png beside
+% this file for the title mark and footer; the repo ignores *.png, so copy it from the design
+% skill's assets/ when rebuilding.  Missing it is a silent no-op -- the deck just goes unbranded.
+\documentclass[aspectratio=169,8pt,t]{beamer}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\graphicspath{{./}{../figures/}}
+\usetheme{Modern}
+
+\title[PEEC validation]{Validating the jNO PEEC solver\\against analytical solutions}
+\subtitle{Three codes, three answers, and which one the mathematics supports}
+\author{Leon Armbruster}\institute{}\date{\today}
+
+\begin{document}
+{\setbeamertemplate{footline}{}\begin{frame}[plain]\titlepage\end{frame}}
+
+% ---------------------------------------------------------------- 1. the problem
+\begin{frame}{Three solvers disagree on the same power module}
+\vfill
+\hi{The measurement.}\quad Loop inductance between the DC$+$ and DC$-$ terminals of one layout,
+at $1$\,MHz, on geometry all three codes read from the same file.
+\vfill
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+ & loop inductance & \\
+\midrule
+Ansys Q3D \textnormal{(\texttt{ACLoop})} & $20.641$\,nH & reference \\
+\texttt{peec\_coarse} & $20.5$\,nH & unattributed \\
+pypeec 5.8.0 & $21.4$\,nH & not converged \\
+\hi{jNO} & \hi{$26.4$\,nH} & $+28\,\%$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+\vfill
+\hi{Why it is not obvious who is wrong.}\quad No reference here is authoritative: two are numbers
+without a method attached, and the third is still moving under mesh refinement.
+\vfill
+\end{frame}
+
+% ---------------------------------------------------------------- 2. the analytic test
+\begin{frame}{So test against something with a closed-form answer}
+\vfill
+\hi{The case.}\quad One straight copper bar, $40\times4\times0.51$\,mm, driven end to end at
+$1$\,kHz --- the current fills the section, so both the resistance and the inductance are known.
+\vfill
+\begin{center}
+\begin{tabular}{lrrrr}
+\toprule
+ & $R$ & error & $L$ & error \\
+\midrule
+analytic & $338.0\,\mu\Omega$ & --- & $27.207$\,nH\srcnote{Grover, \textit{Inductance Calculations}, 1946} & --- \\
+\hi{jNO} & \hi{$337.2\,\mu\Omega$} & \hi{$-0.2\,\%$} & \hi{$27.731$\,nH} & \hi{$+1.9\,\%$} \\
+pypeec & $332.7\,\mu\Omega$ & $-1.6\,\%$ & $26.673$\,nH & $-2.0\,\%$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+\vfill
+\hi{The result.}\quad jNO lands on the exact DC resistance and sits inside Grover's own accuracy.
+pypeec approaches from \hi{below} and is still $2\,\%$ short at its finest affordable grid.
+\vfill
+\end{frame}
+
+% ---------------------------------------------------------------- 3. what it changes
+\begin{frame}{The reference was biased, but jNO still saturates}
+\vfill
+\hi{What that corrects.}\quad pypeec under-estimates when under-converged, and its module numbers
+rose monotonically the whole way, $51.3\to53.6$\,nH. Most of the module gap was the reference.
+\vfill
+\hi{What survives.}\quad jNO's inductance stops moving above $1$\,MHz --- $26.448$, $26.435$,
+$26.430$\,nH at $1$, $3$, $10$\,MHz. A resolved solve would keep falling, so the mesh has stopped
+capturing current crowding rather than the physics having stopped.
+\vfill
+\hi{Open.}\quad What Q3D's \texttt{ACLoop} actually reports. Its mesh is $3416$ tetrahedra with a
+$3.4$\,mm RMS edge, against a $66\,\mu$m skin depth.
+\vfill
+\end{frame}
+
+% ---------------------------------------------------------------- 4. the accounting
+\begin{frame}{Corrected, the two PEEC codes agree}
+\vfill
+\begin{center}
+\begin{tabular}{lr}
+\toprule
+jNO, as run & $26.05$\,nH \\
+\midrule
+quantised plane gap --- one z-cell forces $0.44$\,mm where the stack has $0.37$ & $-0.73$ \\
+surface impedance knows the skin depth, the partial inductance does not & $-2.34$ \\
+\midrule
+\hi{jNO, corrected} & \hi{$22.97$\,nH} \\
+\hi{pypeec, converged} & \hi{$22.5$--$23.0$\,nH} \\
+\midrule
+Ansys Q3D \textnormal{(\texttt{ACLoop})} & $20.641$\,nH \\
+\bottomrule
+\end{tabular}
+\end{center}
+\vfill
+\hi{Priced and dismissed.}\quad Frequency (jNO is flat $1$--$10$\,MHz), capacitance ($663\times$ the
+inductive impedance), bond wires ($-5\,\%$ at $56\times$ the real cross-section).
+\vfill
+\hi{Where that leaves it.}\quad Two independent PEEC codes now agree. Ansys sits $\sim\!10\,\%$ below
+both, so the open question is what \texttt{ACLoop} reports --- not why jNO is high.
+\vfill
+\end{frame}
+
+\end{document}

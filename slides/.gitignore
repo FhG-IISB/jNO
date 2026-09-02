@@ -1,0 +1,9 @@
+# lualatex build artefacts and page renders
+*.aux
+*.log
+*.nav
+*.out
+*.snm
+*.toc
+pg-*.png
+acc-*.png

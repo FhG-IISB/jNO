@@ -1,0 +1,134 @@
+% Modern minimal beamer theme -- Noto Sans + Noto Sans Math, teal accent. Compile with lualatex.
+% Reusable: put next to the .tex, load amsmath first, then \usetheme{Modern}.
+\ProvidesPackage{beamerthemeModern}[2026/07/13 modern minimal]
+\mode<presentation>
+
+\RequirePackage{fontspec}
+\RequirePackage{unicode-math}
+\RequirePackage{tikz}
+\RequirePackage{graphicx}
+\RequirePackage{etoolbox}
+\RequirePackage{ragged2e}
+
+% ---- fonts ----
+\defaultfontfeatures{Ligatures=TeX}
+\setsansfont{Noto Sans}
+\renewcommand{\familydefault}{\sfdefault}
+\setmathfont{Noto Sans Math}
+\newfontfamily\lightfont{Noto Sans Light}
+\newfontfamily\medfont{Noto Sans Medium}
+
+% ---- palette ----
+\definecolor{ink}{HTML}{1A202C}
+\providecolor{accent}{HTML}{0D9488}
+\definecolor{muted}{HTML}{94A3B8}
+\definecolor{faint}{HTML}{EDF2F4}
+
+\setbeamercolor{normal text}{fg=ink,bg=white}
+\setbeamercolor{structure}{fg=accent}
+\setbeamercolor{alerted text}{fg=accent}
+\setbeamercolor{frametitle}{fg=ink}
+\setbeamercolor{title}{fg=ink}
+\setbeamercolor{block body}{fg=ink,bg=faint}
+\setbeamercolor{caption name}{fg=accent}
+
+% ---- fonts (small) ----
+\setbeamerfont{title}{size=\LARGE}
+\setbeamerfont{subtitle}{size=\normalsize}
+\setbeamerfont{frametitle}{size=\large}
+\setbeamerfont{footline}{size=\scriptsize}
+
+\setbeamertemplate{navigation symbols}{}
+\setbeamersize{text margin left=0.95cm, text margin right=0.95cm}
+\newcommand{\hi}[1]{{\medfont\color{accent}#1}}
+
+% ---- justified body text on every frame (right edges line up) ----
+% AtBeginEnvironment runs after the frame's [options]/title are parsed, so it
+% does not clobber \begin{frame}[plain] the way \apptocmd{\frame} does.
+\AtBeginEnvironment{frame}{\gdef\srcfooter{}\setcounter{srccnt}{0}\justifying}
+\setlength{\emergencystretch}{1.5em}   % let justification stretch before overflowing
+
+% ---- per-slide source citations ----------------------------------------------
+% \srcnote{ref} drops a small superscript at the point of use and appends the
+% reference to a per-frame footer line (reset each frame above). The number is
+% frozen at call time so multiple notes number correctly.
+\newcounter{srccnt}
+\gdef\srcfooter{}
+\newcommand{\srcnote}[1]{%
+  \stepcounter{srccnt}%
+  \textsuperscript{\thesrccnt}%
+  \protected@edef\@tmpsrc{%
+    \srcfooter
+    \ifnum\value{srccnt}>1\noexpand\quad\fi
+    \noexpand\textsuperscript{\thesrccnt}\noexpand\,\unexpanded{#1}%
+  }%
+  \global\let\srcfooter\@tmpsrc
+}
+
+% ---- equal spacing above and below display equations ----
+\AtBeginDocument{%
+  \g@addto@macro\normalsize{%
+    \setlength\abovedisplayskip{8pt plus 2pt minus 1pt}%
+    \setlength\belowdisplayskip{8pt plus 2pt minus 1pt}%
+    \setlength\abovedisplayshortskip{8pt plus 2pt minus 1pt}%
+    \setlength\belowdisplayshortskip{8pt plus 2pt minus 1pt}%
+  }%
+  \normalsize
+}
+
+% ---- no bullet glyphs: indentation carries the structure ----
+\setbeamertemplate{itemize item}{}
+\setbeamertemplate{itemize subitem}{}
+\setbeamertemplate{itemize subsubitem}{}
+\setlength{\leftmargini}{1.1em}
+\setlength{\leftmarginii}{1.1em}
+\setbeamertemplate{itemize/enumerate body begin}{\vskip-0.1em}
+
+% ---- titleless info box: subtle faint background, no title bar ----
+\setbeamertemplate{block begin}{%
+  \par\vskip2pt%
+  \begin{beamercolorbox}[sep=0.55em,rounded=true]{block body}%
+  \usebeamerfont{block body}}
+\setbeamertemplate{block end}{\end{beamercolorbox}\vskip3pt}
+
+% ---- frame title: no marker, sits high and left, light weight ----
+\setbeamertemplate{frametitle}{%
+  \vskip0.56cm%
+  {\lightfont\usebeamerfont{frametitle}\usebeamercolor[fg]{frametitle}\insertframetitle}%
+  \vskip0.20cm%
+}
+
+% ---- footline: date (+ institute) bottom-LEFT, sources centered, page number bottom-right ----
+% The institute rides next to the date on every slide. Override per deck with
+% \renewcommand{\footeraffil}{...}, or \renewcommand{\footeraffil}{} to drop it and its separator.
+\providecommand{\footeraffil}{Fraunhofer IISB}
+\setbeamertemplate{footline}{%
+  \hbox to \paperwidth{\hspace{0.95cm}%
+    {\usebeamerfont{footline}\color{muted}\insertdate
+      \ifdefempty{\footeraffil}{}{\hspace{0.9ex}\textperiodcentered\hspace{0.9ex}\footeraffil}}\hfill
+    {\color{muted}\tiny\srcfooter}\hfill
+    {\usebeamerfont{footline}\color{muted}\insertframenumber}\hspace{0.95cm}}\vskip0.30cm%
+}
+
+% ---- title page ----
+\setbeamertemplate{title page}{%
+  % The institute mark, top-right, IF the deck copied it in next to the .tex. Anchored to the PAGE so
+  % it never disturbs the title block's own centring, and skipped silently when the file is absent so
+  % a deck without it still compiles.
+  \IfFileExists{fraunhofer_iisb.png}{%
+    \begin{tikzpicture}[remember picture, overlay]
+      \node[anchor=north east, inner sep=0pt] at ([shift={(-9mm,-7mm)}]current page.north east)
+        {\includegraphics[height=8mm]{fraunhofer_iisb.png}};
+    \end{tikzpicture}%
+  }{}%
+  \vbox to \textheight{%
+    \vfill
+    {\color{accent}\rule{1.0cm}{2.2pt}}\par\vskip0.5cm%
+    {\lightfont\usebeamerfont{title}\usebeamercolor[fg]{title}\inserttitle\par}%
+    \ifx\insertsubtitle\empty\else\vskip0.35cm{\medfont\normalsize\color{accent}\insertsubtitle\par}\fi%
+    \vskip0.95cm{\color{muted}\normalsize\insertauthor\hspace{1.1ex}\textbullet\hspace{1.1ex}\insertdate\par}%
+    \vfill
+  }%
+}
+
+\mode<all>
