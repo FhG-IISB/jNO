@@ -2212,6 +2212,66 @@ def magnetic_potential_apply(fil: Filaments, mu0: float = 4e-7 * np.pi, quad: in
     return apply
 
 
+def _bar_rule(d, axis, quad):
+    """Sub-points over one lattice bar's volume, weights summing to ONE (an average, not a moment).
+
+    Offset from the bar's LOWER cell centre, which is how a bar family is indexed: a bar along `axis`
+    sits half a pitch further along it than the cell that names it.
+    """
+    g1, w1 = np.polynomial.legendre.leggauss(int(quad))
+    i, j, k = (a.reshape(-1) for a in np.meshgrid(*(np.arange(quad),) * 3, indexing="ij"))
+    off = np.stack([0.5 * d[0] * g1[i], 0.5 * d[1] * g1[j], 0.5 * d[2] * g1[k]], axis=1)
+    off[:, axis] += 0.5 * d[axis]
+    return off, (w1[i] * w1[j] * w1[k]) / 8.0
+
+
+def coupling_generator(n, d, a, b, quad=2):
+    """The BTTB generator coupling an electric bar family along `a` to a magnetic one along `b`.
+
+    An electric element drives a magnetomotive force around a magnetic one by Ampere's law, so the
+    kernel is the CURL of the Green function rather than the Green function itself:
+
+        K[m, e] = (1 / 4 pi) L_e L_m < (e_a x r_hat) . e_b / r^2 >
+
+    averaged over both element volumes. Equivalently `-d(1/r)/dx_c` with the Levi-Civita sign, which
+    is the form pypeec builds by differencing two half-cell-shifted Green evaluations.
+
+    Built here rather than through `lattice_kernel` because that takes a scalar function of DISTANCE
+    and this needs the separation's components. `lattice_operator(generator=...)` then owns the
+    embedding and the FFT, so only the kernel differs.
+
+    Zero when ``a == b``: a bar drives no circulation around a face of its own orientation.
+    """
+    if a == b:
+        return np.zeros(tuple(2 * int(v) for v in n))
+    axes = []
+    for ni in n:
+        q = np.arange(2 * ni)
+        axes.append(np.where(q < ni, q, q - 2 * ni))
+    off = np.meshgrid(*axes, indexing="ij")
+    valid = np.ones(off[0].shape, bool)
+    for o, ni in zip(off, n):
+        valid &= np.abs(o) < ni
+    sep = [o * hi for o, hi in zip(off, d)]
+
+    sub_a, w_a = _bar_rule(d, a, quad)
+    sub_b, w_b = _bar_rule(d, b, quad)
+    ea = np.eye(3)[a]
+    eb = np.eye(3)[b]
+    body = np.zeros(off[0].shape)
+    for p in range(sub_a.shape[0]):
+        for q in range(sub_b.shape[0]):
+            ds = sub_b[q] - sub_a[p]  # from the electric element to the magnetic one
+            r = [v + ds[i] for i, v in enumerate(sep)]
+            rn = np.sqrt(sum(v * v for v in r))
+            safe = np.where(rn > 0, rn, 1.0)
+            rh = [v / safe for v in r]
+            cross = np.cross(ea, np.stack(rh, axis=-1))  # (e_a x r_hat)
+            body = body + w_a[p] * w_b[q] * np.where(rn > 0, (cross @ eb) / safe**2, 0.0)
+    body = body * (d[a] * d[b]) / (4.0 * np.pi)
+    return np.where(valid, body, 0.0)
+
+
 def _lattice_diag(fil: Filaments, mu0: float):
     """``Lp_aa`` for every bar -- the diagonal a Jacobi preconditioner needs, without forming ``Lp``.
 
