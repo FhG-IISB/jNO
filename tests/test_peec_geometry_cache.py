@@ -148,3 +148,45 @@ def test_the_krylov_subspace_is_chosen_by_structure():
     # claim under test is that the two DIFFER by structure, not the exact value on a toy problem.
     assert lattice_rs == 16, lattice_rs
     assert welded_rs > lattice_rs, (lattice_rs, welded_rs)
+
+
+def _module(with_wire):
+    """A small network, optionally with a line conductor welded to the solid."""
+    CU = 5.8e7
+    sh = jno.Shape.box(0, 0, 0, 0.012, 0.006, 0.001, size=(0.002, 0.002, 0.001)).attach(sigma=CU).name("bar")
+    if with_wire:
+        sh = sh + jno.Shape.line(
+            [(0.001, 0.003, 0.001), (0.001, 0.003, 0.003), (0.011, 0.003, 0.001)], r=2e-4, size=0.002
+        ).attach(sigma=CU).name("w")
+    d = sh.domain()
+    d.tag("A", lambda x, y, z: (x < 0.0011) & (z < 0.0011))
+    d.tag("B", lambda x, y, z: (x > 0.0109) & (z < 0.0011))
+    i, v = d.peec_symbols()
+    at = lambda t: d.variable(t, split=True, sample=(2, None))[:3]
+    return jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e6)
+
+
+def test_welding_says_so_because_it_changes_the_solver(caplog):
+    """A single Shape.line moves the whole network onto a much more expensive path, silently.
+
+    Nothing else in the model announces that -- the geometry looks like one more conductor -- so the
+    build says it once, with the measured cost, rather than letting a bond wire quietly cost 30x.
+    """
+    P._PITCH_WARNED.clear()  # `_warn_once` dedupes on the message text, for the whole process
+    with caplog.at_level("WARNING", logger="jno"):
+        _module(with_wire=True).build()
+    assert any("WELDED" in r.message for r in caplog.records)
+
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="jno"):
+        _module(with_wire=False).build()
+    assert not any("WELDED" in r.message for r in caplog.records), "a solids-only model is not welded"
+
+
+def test_the_welded_warning_is_said_once(caplog):
+    """A design loop rebuilds the same network every iteration; the warning must not scroll."""
+    P._PITCH_WARNED.clear()
+    with caplog.at_level("WARNING", logger="jno"):
+        for _ in range(3):
+            _module(with_wire=True).build()
+    assert sum("WELDED" in r.message for r in caplog.records) == 1
