@@ -115,7 +115,7 @@ def test_the_operator_is_differentiable_in_the_positions():
     """
     pos, mom, group, self_g = _elements(120, nsub=2, spread="scattered")
     h = build(pos, mom, group, G, tol=1e-10, leaf=32)
-    x = jnp.asarray(np.random.default_rng(3).normal(size=h.ne))
+    x = jnp.asarray(np.random.default_rng(3).normal(size=h.shape[0]))
 
     def f(p):
         return jnp.sum(materialize(h, p, mom, self_g, G)(x) ** 2)
@@ -159,7 +159,7 @@ def test_the_blocks_cover_the_whole_matrix_exactly_once():
     the diagonal carried by the self term. Overlap would double-count a coupling."""
     pos, mom, group, self_g = _elements(160, nsub=2)
     h = build(pos, mom, group, G, tol=1e-6, leaf=32)
-    cover = np.zeros((h.ne, h.ne), dtype=int)
+    cover = np.zeros(h.shape, dtype=int)
     for r, c in h.near:
         cover[np.ix_(r, c)] += 1
     for r, c, _i, _j in h.far:
@@ -188,3 +188,39 @@ def test_ragged_sub_points_are_refused():
     bad[-1] = 8  # element 9 now has 3 sub-points, element 8 has 5
     with pytest.raises(ValueError, match="different numbers of sub-points"):
         build(pos, mom, bad, G)
+
+
+def test_a_rectangular_block_matches_cross_block():
+    """Two DIFFERENT element sets, which is what the welded path forms densely today.
+
+    `cross_block` is the exact reference, and it is the operator that makes welding expensive: a
+    6,806-bar lattice solves in 0.213 s and adding one 19-filament wire takes it to 33.4 s, because
+    this block is stored dense. There is no diagonal here -- two separate parts share no element --
+    so the self term must NOT be applied, which is what `square=False` carries.
+    """
+    from jno.utils.solver.peec import cross_block
+
+    pa, ma, ga, _sa = _elements(180, nsub=2, spread="scattered", seed=11)
+    pb, mb, gb, _sb = _elements(140, nsub=2, spread="scattered", seed=12)
+    pb = pb + np.array([4.0, 0.0, 0.0])  # a second part, displaced
+    want = np.asarray(cross_block(pa, ma, ga, 180, pb, mb, gb, 140, G))
+    h = build(pa, ma, ga, G, b=(pb, mb, gb), tol=1e-8, leaf=32)
+    assert not h.square
+    assert h.shape == (180, 140)
+    ap = materialize(h, pa, ma, None, G, b=(pb, mb))
+    x = np.random.default_rng(13).normal(size=140)
+    got = np.asarray(ap(jnp.asarray(x)))
+    assert np.linalg.norm(got - want @ x) / np.linalg.norm(want @ x) < 1e-6
+
+
+def test_mixing_the_two_shapes_is_refused():
+    """The block indices address whichever sets built them, so materializing a rectangular structure
+    against one element set would silently read the wrong elements -- a plausible wrong answer."""
+    pa, ma, ga, sa = _elements(80, nsub=2, seed=14)
+    pb, mb, gb, _sb = _elements(60, nsub=2, seed=15)
+    h = build(pa, ma, ga, G, b=(pb, mb, gb), tol=1e-6, leaf=32)
+    with pytest.raises(ValueError, match="built for two"):
+        materialize(h, pa, ma, sa, G)
+    hs = build(pa, ma, ga, G, tol=1e-6, leaf=32)
+    with pytest.raises(ValueError, match="built for one element set"):
+        materialize(hs, pa, ma, sa, G, b=(pb, mb))
