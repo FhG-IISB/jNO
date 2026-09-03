@@ -86,6 +86,28 @@ derivatives, so a biharmonic / plate / Cahn–Hilliard form is written directly,
 Always-available: `fem.dofs`, `fem.points` (the coordinates the DOFs live on — use these for P2,
 where they differ from the mesh vertices), `fem.operator`, and `fem.classification`.
 
+### Looking at the answer — `fem.export`
+
+`d.export_vtk()` writes the mesh; `fem.export(sol, path)` writes the **solution**, as VTK or any meshio
+format:
+
+```python
+u_h = fem.solve()
+fem.export(u_h, "runs/flow.vtu")      # -> runs/flow.v.vtu, runs/flow.p.vtu
+```
+
+**One file per field**, because a coupled problem's fields do not share a point set — Taylor–Hood
+velocity is P2 (vertices *and* edge midpoints) while its pressure is P1 (vertices only). Putting them in
+one file would mean interpolating one of them, and a field in a viewer that is not the field that was
+computed is worse than an extra file. Each file carries that field's own points and its own cells (a P2
+field is written on `triangle6` / `tetra10`, not sampled at vertices), taken from the assembler's own
+connectivity. A single-field problem writes the path you gave it, unchanged; the return value is the
+list of paths written. Vector fields are written `(n_nodes, vec)` so a viewer reads them as vectors.
+
+Two things it refuses rather than guesses: a **transient trajectory** `(n_steps, n_dofs)` — export one
+step, `fem.export(traj[-1], ...)` — and a **complex** solution, where silently picking a part is exactly
+the sort of quiet choice that hides a wrong answer (`sol.real` / `sol.imag`).
+
 ??? note "Operator storage — why `nse` is smaller than you expect"
     **Operator storage.** The assembled BCOO stores each `(row, col)` pair **once**. The assemblers
     emit one triplet block per additive weak-form term and every interior DOF pair receives a

@@ -646,6 +646,111 @@ def _field_keys(constraints: List[Any]) -> List[Any]:
     return keys
 
 
+def _field_names(constraints: List[Any]) -> Dict[Any, str]:
+    """``{field_key: symbol name}`` — so a diagnostic can say ``'v'`` rather than a block index."""
+    out: Dict[Any, str] = {}
+    for c in constraints:
+        for n in _walk(_bare(c)):
+            if isinstance(n, TrialFunction):
+                out.setdefault(getattr(n, "field_key", n.op_id), str(getattr(n, "name", "?")))
+    return out
+
+
+def _term_row_reach(classified: List[Any]) -> List[Tuple[Any, str, Any]]:
+    """``[(field_key, support, region)]`` — whose ROWS each weak term populates, and over what.
+
+    A term's row block is set by its **test** function, not its trial: ``-p * div(phi)`` populates the
+    displacement rows and the pressure *columns*. A ``(trial, test)`` pair from one ``fem_symbols()``
+    call shares a ``field_key`` (``domain_class.py``), so these index the same blocks as
+    :attr:`FEM.offsets`.
+
+    Read from ``classified``, which is built **before** ``_retag_coords_for_quadrature`` mutates the
+    shared coordinate Variables in place — asking a constraint for its region afterwards returns the
+    quadrature tag rather than the region the user wrote it on.
+
+    ``region`` is ``None`` for a volume term over the whole domain, which reaches every DOF of its field.
+    """
+    reach: List[Tuple[Any, str, Any]] = []
+    for c, has_test, _has_trial, support, region in classified:
+        if not has_test:
+            continue  # a Dirichlet pin or an initial condition PRESCRIBES rows rather than populating them
+        whole = support == "volume" and region == "volume"
+        for nd in _walk(_bare(c)):
+            if isinstance(nd, TestFunction):
+                reach.append((getattr(nd, "field_key", nd.op_id), support, None if whole else region))
+    return sorted(set(reach), key=lambda t: (str(t[0]), t[1], str(t[2])))
+
+
+def _starved_dofs(fem_obj: Any, domain: Any, reach: List[Any], field_keys: List[Any]) -> List[Tuple[int, List[Any], int]]:
+    """``[(block index, regions, n_dead)]`` for fields carrying DOFs that no term reaches.
+
+    When every term touching a field is restricted to a sub-region, that field's DOFs on the rest of
+    the mesh sit in no equation at all and the system is structurally singular. Today that surfaces as
+    a generic "may be singular/ill-posed" from the matrix-free solver, or as garbage from a direct one.
+
+    Reach is measured with the assembler's OWN region resolution, :func:`fem_utils._cell_region_mask`
+    (a cell is in a region iff its centroid is), intersected with each field's own connectivity — so
+    this cannot disagree with what was actually assembled. ``domain.tag_node_mask`` is deliberately NOT
+    used for volume regions: measured on a two-block domain it returns a mutually **exclusive** and
+    incomplete partition (40 + 32 of 78 nodes, 0 shared at the interface, 6 interior nodes in neither),
+    which would report well-posed DOFs as starved.
+
+    **Structural only.** This finds a DOF that appears in no term. It does not find general rank
+    deficiency — a missing pressure gauge, an unrestrained rigid-body mode — and must not be described
+    as if it did. Conservative by construction: any region it cannot resolve skips that field silently
+    rather than guessing.
+    """
+    if not reach or not field_keys:
+        return []
+    by_key: Dict[Any, set] = {}
+    for k, support, r in reach:
+        by_key.setdefault(k, set()).add((support, r))
+    # Only a region-restricted form can starve a DOF this way. If every field is reached by at least one
+    # whole-domain term there is nothing structural to find -- which is every ordinary single-region
+    # problem, so the scan cannot regress them.
+    if all(any(r is None for _sp, r in by_key.get(k, {("volume", None)})) for k in field_keys):
+        return []
+    pts, offs = fem_obj.field_points, fem_obj.offsets
+    cells_all = getattr(domain, "_fem_native_assembly_cells_all", None)
+    if pts is None or offs is None or cells_all is None:
+        return []  # a route that does not publish per-field DOF coordinates; nothing to check against
+
+    from .utils.solver.fem_utils import _cell_region_mask, _value_shape_num_components
+
+    _dp, _tv = _prescribed_dofs(domain)
+    pinned = {int(d) for d, _g in _dp} | {int(d) for d in _tv}
+    out: List[Tuple[int, List[Any], int]] = []
+    for i, key in enumerate(field_keys):
+        spec = by_key.get(key)
+        if spec is None or any(r is None for _sp, r in spec) or i >= len(cells_all) or i >= len(pts):
+            continue
+        pts_i, cells_i = np.asarray(pts[i]), np.asarray(cells_all[i])
+        reached = np.zeros(len(pts_i), dtype=bool)
+        try:
+            for support, r in spec:
+                if support == "volume":
+                    m = np.asarray(_cell_region_mask(domain, r)).reshape(-1)
+                    if m.shape[0] != cells_i.shape[0]:
+                        raise LookupError(r)
+                    reached[np.unique(cells_i[m > 0])] = True
+                else:
+                    # a surface term reaches its facet's nodes; `tag_node_mask` IS reliable for a
+                    # boundary tag (it is what `FEM.region_dofs` resolves with)
+                    bm = domain.tag_node_mask(r, pts_i)
+                    if bm is None:
+                        raise LookupError(r)
+                    reached |= np.asarray(bm, dtype=bool)
+        except LookupError:
+            continue  # unresolvable region: stay quiet rather than report a DOF as dead on a guess
+        vec = int(_value_shape_num_components(fem_obj._field_value_shape(i)))
+        base = int(offs[i])
+        dead = [base + int(nd) * vec + c for nd in np.flatnonzero(~reached) for c in range(vec)]
+        dead = [dd for dd in dead if dd not in pinned]
+        if dead:
+            out.append((i, sorted((r for _sp, r in spec), key=str), len(dead)))
+    return out
+
+
 def _field_key_of(constraint: Any) -> Any:
     """The trial ``field_key`` of an essential (Dirichlet) constraint."""
     for n in _walk(_bare(constraint)):
@@ -2675,6 +2780,99 @@ class FEM:
         base = int(offs[idx]) if offs is not None else 0
         comps = range(vec) if component is None else [int(component)]
         return np.concatenate([base + nodes * vec + c for c in comps])
+
+    _MESHIO_CELLS = {
+        (1, 2): "line", (1, 3): "line3",
+        (2, 3): "triangle", (2, 6): "triangle6", (2, 4): "quad", (2, 8): "quad8", (2, 9): "quad9",
+        (3, 4): "tetra", (3, 10): "tetra10", (3, 8): "hexahedron", (3, 20): "hexahedron20", (3, 27): "hexahedron27",
+    }  # fmt: skip
+
+    def export(self, solution, save_path: str, *, file_format=None):
+        """Write a solution to VTK (or any meshio format) — **one file per field**.
+
+        ``d.export_vtk()`` writes geometry only; this writes the answer. Each field goes to its own file
+        on its **own** point set, because a coupled problem's fields do not share one: Taylor-Hood
+        velocity is P2 (vertices + edge midpoints) while its pressure is P1 (vertices only). Writing
+        them together would mean interpolating one of them, and an exported field that is not the
+        solution is worse than several files::
+
+            u_h = fem.solve()
+            fem.export(u_h, "runs/flow.vtu")      # -> runs/flow.v.vtu, runs/flow.p.vtu
+
+        The per-field connectivity comes from the assembler's own tables
+        (``domain._fem_native_assembly_cells_all``), so each file carries real cells rather than a point
+        cloud, and a P2 field is written on quadratic elements rather than silently sampled at vertices.
+        A single-field problem writes ``save_path`` unchanged. Returns the list of paths written.
+
+        Vector fields are reshaped ``(n_nodes, vec)`` so a viewer reads them as vectors, not as
+        interleaved scalars.
+
+        Refused by name rather than guessed: a **transient trajectory** ``(n_steps, n_dofs)`` — pass one
+        step, ``fem.export(traj[k], ...)`` — and a **complex** solution, where taking a part silently is
+        exactly the kind of quiet choice that hides a wrong answer; pass ``sol.real`` / ``sol.imag``.
+        """
+        import os
+
+        import meshio
+
+        arr = np.asarray(solution)
+        if np.iscomplexobj(arr):
+            raise ValueError(
+                "fem.export: the solution is complex and no viewer format carries that. Export the part "
+                "you mean explicitly -- `fem.export(sol.real, ...)` / `fem.export(sol.imag, ...)` -- or "
+                "the magnitude, rather than having one picked for you."
+            )
+        if arr.ndim > 1:
+            raise ValueError(
+                f"fem.export: expected a single solution vector, got shape {tuple(arr.shape)}. A transient "
+                "march returns a trajectory (n_steps, n_dofs); export one step, e.g. "
+                "`fem.export(traj[-1], ...)`."
+            )
+        pts_all = self.field_points
+        cells_all = getattr(self.domain, "_fem_native_assembly_cells_all", None)
+        if pts_all is None or cells_all is None:
+            raise NotImplementedError(
+                "fem.export: this assembly route does not publish per-field DOF coordinates and "
+                "connectivity, so a field cannot be placed on a mesh. The native Lagrange path does."
+            )
+        offs = self.offsets if self.offsets is not None else [0, int(arr.size)]
+        if int(offs[-1]) != int(arr.size):
+            raise ValueError(
+                f"fem.export: the solution has {int(arr.size)} entries but this problem has {int(offs[-1])} "
+                "DOFs. Pass the solve's own output, not a slice of it."
+            )
+        from .utils.solver.fem_utils import _value_shape_num_components
+
+        names = _field_names(self._constraints or [])
+        # the assembler's field order -- what `offsets` indexes. `_trial_field_keys` is trace-walk
+        # order and does not always agree (see `_finalize`).
+        keys = list(getattr(self, "_block_field_keys", None) or self._trial_field_keys or [])
+        dim = int(self.domain.dimension)
+        root, ext = os.path.splitext(save_path)
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+
+        written = []
+        n_fields = len(offs) - 1
+        for i in range(n_fields):
+            pts_i = np.asarray(pts_all[i])[:, :dim]
+            cells_i = np.asarray(cells_all[i])
+            ctype = self._MESHIO_CELLS.get((dim, int(cells_i.shape[1])))
+            if ctype is None:
+                raise NotImplementedError(
+                    f"fem.export: no meshio cell type for a {dim}-D element with {int(cells_i.shape[1])} "
+                    "nodes. Export the mesh with `d.export_vtk()` and the field separately."
+                )
+            vec = int(_value_shape_num_components(self._field_value_shape(i)))
+            block = arr[int(offs[i]) : int(offs[i + 1])].reshape(-1, vec)
+            nm = names.get(keys[i], f"field{i}") if i < len(keys) else f"field{i}"
+            out = save_path if n_fields == 1 else f"{root}.{nm}{ext}"
+            meshio.write(
+                out,
+                meshio.Mesh(points=pts_i, cells=[(ctype, cells_i)], point_data={nm: block}),
+                file_format=file_format,
+            )
+            written.append(out)
+        return written
 
     def _field_value_shape(self, idx):
         """The ``value_shape`` of block ``idx`` — from the assembler's own field list."""
@@ -4970,6 +5168,36 @@ def _fem_impl(
         _saddle_pos = _saddle_block_positions(out, domain, volume_terms)
         out._saddle_blocks = tuple(nm for _i, nm in _saddle_pos)
         out._saddle_block_indices = tuple(i for i, _nm in _saddle_pos)
+        # A field whose every term is region-restricted has DOFs on the rest of the mesh that sit in no
+        # equation. Caught at BUILD, naming the field and the region -- the alternative is a generic
+        # "may be singular/ill-posed" from the matrix-free solver, or silent garbage from a direct one.
+        # `_block_field_keys` is the assembler's own field order and is what `offsets` indexes;
+        # `_field_keys` walks the trace and can order them differently (measured: a Taylor-Hood form
+        # whose momentum term mentions `v` first still assembles `p` as block 0). Using the walk order
+        # would compare one field's regions against another field's points.
+        _bkeys = list(getattr(out, "_block_field_keys", None) or _field_keys(_orig_constraints))
+        _starved = _starved_dofs(out, domain, _row_reach, _bkeys)
+        if _starved:
+            _nm = _field_names(_orig_constraints)
+            _keys = _bkeys
+            _lines = []
+            for _i, _regions, _n in _starved:
+                _rs = ", ".join(repr(str(r)) for r in _regions)
+                _lines.append(
+                    f"  field {_nm.get(_keys[_i], '?')!r} (block {_i}): {_n} DOFs, "
+                    f"every term reaching it is restricted to {_rs}"
+                )
+            raise ValueError(
+                "jno.fem: these DOFs appear in no term and carry no prescribed value, so the system is "
+                "structurally singular:\n" + "\n".join(_lines) + "\n"
+                "Give the field a term over the region it is missing from -- for a field that carries no "
+                "physics there, a cheap `eps * u * phi` on that region is enough. A Dirichlet pin on the "
+                "region is NOT a reliable substitute: an essential condition resolves its nodes through "
+                "`domain.tag_node_mask`, which for a VOLUME region is a proximity test against sampled "
+                "points and can miss interior nodes (measured: 32 of 33 on a two-block domain). This "
+                "checks only that every DOF is REACHED by some term -- it does not detect a missing "
+                "gauge or an unrestrained rigid-body mode."
+            )
         return out
 
     volume_terms: List[Any] = []
@@ -4992,6 +5220,9 @@ def _fem_impl(
     classified = [
         (c, _contains(c, TestFunction), _contains(c, TrialFunction), *_region_and_support(c, domain)) for c in constraints
     ]
+    # Whose rows each term populates, captured HERE because `_retag_coords_for_quadrature` below
+    # rewrites the coordinate tags in place and the region is unrecoverable afterwards.
+    _row_reach = _term_row_reach(classified)
 
     for c, has_test, has_trial, support, region in classified:
         if support == "initial":
