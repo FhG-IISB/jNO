@@ -724,6 +724,9 @@ def solve_network(
     matrix_free=None,
     tol=1e-8,
     restart=None,
+    mag=None,
+    chi=None,
+    quad_m=2,
 ):
     """Solve the PEEC circuit for a network whose terminals are node SETS.
 
@@ -750,11 +753,27 @@ def solve_network(
             nothing, which is how a component enters the network without being meshed as metal.
         omega: angular frequency, rad/s.
         mu0: permeability of the surrounding medium.
+        mag: the magnetic mesh, on the SAME lattice as ``fil`` (see
+            :func:`bar_filaments`'s ``grid_shapes``). ``None`` -- the default and every network
+            without a core -- takes a structural branch that leaves the operator exactly as it was.
+        chi: susceptibility ``mu_r - 1`` per magnetic element. Complex is allowed, and is core loss.
+        quad_m: sub-points per cell axis in the magnetic potential and the coupling.
+
+    With a core the unknowns grow to ``[I_c, phi, I_m]`` and the system is Torchio's dual pair
+    (*A PEEC method with magnetic materials*, IEEE TMTT 66(5), 2018)::
+
+        Z I_c + j w K' I_m - A' phi = 0         the magnetisation's flux links the circuit
+        (R_m + A_m' P_m A_m) I_m = K I_c        the mmf the current drives around the core
+
+    ``phi_m`` is eliminated rather than carried: the magnetic charge is ``-A_m I_m`` and its
+    potential is ``P_m`` times that, so substituting leaves three blocks instead of four and the
+    magnetic operator is the exact dual of the electric ``R + j w Lp``.
 
     Args (continued):
         restart: Krylov subspace size. Defaults by structure -- 16 for a plain lattice, 64 for a
-            welded network, which needs the larger subspace and is 1.5x faster with it while a
-            lattice is 2.9x slower. 16 is where a LATTICE solve is cheapest, and the ADJOINT uses the
+            welded network OR one carrying a magnetic core, both of which need the larger subspace
+            and are faster with it (1.5x welded, 3x with a core) while a plain lattice is 2.9x
+            slower. 16 is where a LATTICE solve is cheapest, and the ADJOINT uses the
             same value -- it is preconditioned by ``P^T`` rather than by ``P``, so it converges like
             the primal. It did not always: with the forward preconditioner on the transposed
             operator the tangent system looked intractable, and at 592 elements the gradient came
@@ -797,6 +816,45 @@ def solve_network(
             "filaments have none. A polyline's filaments are not Toeplitz, so there is no structure to "
             "exploit and the dense path is the honest one."
         )
+    # The magnetic system, when there is one. Structural: with `mag=None` not one line below this
+    # executes, `nm` stays 0, and every branch guarded by it is not taken -- which is what keeps the
+    # assembled operator identical to the one every existing network already solves.
+    nm, mmf, flux, mag_apply, mag_diag = 0, None, None, None, None
+    if mag is not None:
+        if not free_form:
+            raise ValueError(
+                "peec.solve_network: a magnetic system needs the lattice path. The dense path forms "
+                "Lp as a matrix, and the magnetic blocks are applied by FFT on the shared cell grid, "
+                "so there is no assembled operator for them to join. Drop matrix_free=False."
+            )
+        if float(omega) == 0.0:
+            raise ValueError(
+                "peec.solve_network: a magnetic core at DC. The magnetisation reaches the circuit "
+                "only through `j w K'`, which is identically zero at omega = 0 -- so the core would "
+                "be solved for and then have no effect, and the port inductance returned would be "
+                "the coreless one with nothing to show that the core had been dropped. Solve at a "
+                "frequency; the inductance is flat well below the first resonance, so any small one "
+                "gives the magnetostatic answer."
+            )
+        if chi is None:
+            raise ValueError("peec.solve_network: mag= was given without chi=, so the core has no material.")
+        nm = int(np.asarray(mag.length).size)
+        mmf, flux = magnetic_coupling_apply(fil, mag, quad_m)
+        mag_apply, mag_diag = magnetic_system_apply(mag, chi, mu0, quad_m)
+        # SYMMETRIC SCALING of the magnetic block, and it is not cosmetic. A reluctance is
+        # `l / (mu0 chi A)`, so the magnetic diagonal is order 1e8 where the electric one is order
+        # 1e-4 -- twelve decades apart in one operator. Left-preconditioned GMRES then converges
+        # happily in the PRECONDITIONED norm while the residual this function checks, which is the
+        # unpreconditioned one, stays orders of magnitude above the tolerance: measured 2.3e-05
+        # against a 1e-6 limit at mu_r = 10, and no restart depth fixed it (16, 64 and 200 all
+        # failed identically) because the subspace was never the problem.
+        #
+        # Solving instead for `x_m = sqrt(|g|) I_m` and scaling the magnetic row by `1/sqrt(|g|)`
+        # puts that diagonal at unit modulus, which balances the two norms so that converging in one
+        # means converging in the other. The magnetic half of the preconditioner is then a phase.
+        mag_s = jnp.sqrt(jnp.abs(mag_diag))
+        mag_pre = mag_diag / jnp.abs(mag_diag)
+
     # Krylov subspace size, by STRUCTURE -- the same reasoning as the preconditioner above, and for
     # the same reason. A welded network's port excitation spreads over far more of the operator's
     # eigenmodes (see `near_block`), so it needs a higher-degree residual polynomial and a bigger
@@ -807,8 +865,20 @@ def solve_network(
     #     plain lattice, 10,048 bars        restart 16   0.39 s   restart 64   1.12 s  2.9x SLOWER
     #
     # so neither value suits both, and picking one globally would have made every lattice 3x slower.
+    #
+    # A MAGNETIC network goes with the welded case, and for the same reason: the preconditioner
+    # neglects the electric-magnetic coupling entirely (see `P_inv`), so the residual polynomial has
+    # more to do and the subspace has to be deep enough to hold it. Measured on the square-ring core,
+    # mu_r = 2000, refining the core from 2 mm to 1 x 2 x 2 mm (1,044 -> 2,160 magnetic elements):
+    #
+    #     restart 16   FAILS at 5.08e-06 after 30.5 s
+    #     restart 64   converges in  9.5 s      <- and it is 3x FASTER for converging at all
+    #     restart 128  converges in 10.8 s
+    #
+    # Core STRENGTH is not what costs: mu_r = 2000, 20,000 and 200,000 all converge at restart 16 on
+    # the coarse mesh in 1.7 s, with L linear in mu_r to four digits. It is the mesh that costs.
     if restart is None:
-        restart = 64 if welded else 16
+        restart = 64 if (welded or nm) else 16
 
     if free_form:
         scale = mu0 / (4.0 * jnp.pi)
@@ -1111,6 +1181,8 @@ def solve_network(
     # R_ds(on) rises ~0.5 %/K). So the values go through jnp and only the pattern stays numpy.
     cval = _fuse_triplets(vv)
     b = jnp.asarray(np.concatenate(rhs))
+    if nm:  # the magnetic rows are homogeneous: the core is driven by the current, not by a port
+        b = jnp.concatenate([b, jnp.zeros(nm, b.dtype)])
     _refuse_disconnected(Asp0, idx, sources, grounds, currents, devices)
 
     if free_form:
@@ -1200,8 +1272,18 @@ def solve_network(
         # Caching then stored a closure holding LinearizeTracers, and the next eager call reusing it
         # raised UnexpectedTracerError far from here. So the values the closure can capture are what
         # gets checked, not a probe.
-        traced = any(isinstance(x, jax.core.Tracer) for x in (jnp.zeros(()), cval, R, fil.pos, fil.length, fil.area))
-        key = (id(fil), ne, nn, float(tol), int(restart), hash(cval_h.tobytes()))
+        # `chi` joins the probe for the same reason `cval` and `R` are in it: the compiled closure
+        # captures the magnetic operator, which is built from chi. Under `jax.grad` through a
+        # permeability nothing else here stages, so without chi the guard would let a closure holding
+        # LinearizeTracers into the cache and the next eager call would raise far from here.
+        traced = any(
+            isinstance(x, jax.core.Tracer)
+            for x in (jnp.zeros(()), cval, R, fil.pos, fil.length, fil.area, *(() if chi is None else (chi,)))
+        )
+        # ...and the key carries the core, so re-solving one network against a different permeability
+        # cannot reuse the first call's operator. Same failure shape as the device impedance above.
+        mag_tag = 0 if (traced or not nm) else hash(np.asarray(chi).tobytes())
+        key = (id(fil), ne, nn, float(tol), int(restart), hash(cval_h.tobytes()), nm, mag_tag)
         entry = None if traced else _KRYLOV_CACHE.get(key)
         cached = entry[1] if (entry is not None and entry[0] is fil) else None
 
@@ -1278,20 +1360,39 @@ def solve_network(
             return jax.pure_callback(_holder_solve_t, shape_out, r)
 
         def M_apply(x, w_, zd, Rc_, cz_):
-            cur, phi = x[:ne], x[ne:]
+            cur, phi = x[:ne], x[ne : ne + nn]
             zi = Rc_ * cur
             if pidx_j is not None:  # structural, so this branch is taken once at trace time
                 zi = zi + cz_ * cur[pidx_j]  # the sheet on the slab's other face
-            return jnp.concatenate([zi + (1j * w_) * lp_apply(cur) - Acj @ phi, Cj @ x])
+            top = zi + (1j * w_) * lp_apply(cur) - Acj @ phi
+            if not nm:
+                return jnp.concatenate([top, Cj @ x])
+            # The magnetisation links flux into the circuit (top) and the circuit drives an mmf
+            # around the core (bottom). ONE block, applied both ways round -- see
+            # `magnetic_coupling_apply` -- so the coupled operator is symmetric by construction
+            # rather than by two matrices that have to be kept in agreement.
+            im = x[ne + nn :] / mag_s  # the unknown is the SCALED magnetisation; see mag_s above
+            return jnp.concatenate(
+                [top + (1j * w_) * flux(im), Cj @ x[: ne + nn], (mag_apply(im) - mmf(cur)) / mag_s]
+            )
 
-        def P_inv(r, zd):
+        def _elec_pre(r, zd):
             if welded:
                 return _precond(r)  # one factorisation of the whole block system
             ri, rp = r[:ne], r[ne:]  # the Schur split, for a plain lattice
             dphi = _precond(rp - CIj @ (ri / zd))
             return jnp.concatenate([(ri + Acj @ dphi) / zd, dphi])
 
-        def P_inv_T(r, zd):
+        def P_inv(r, zd):
+            if not nm:
+                return _elec_pre(r, zd)
+            # The coupling is NEGLECTED in the preconditioner and the two halves are preconditioned
+            # independently -- pypeec's choice, and it is what keeps the electric preconditioner the
+            # one that is already measured and tuned rather than a new one built around a core.
+            # The magnetic half takes its own diagonal, which for `R_m + A' P_m A` is exact.
+            return jnp.concatenate([_elec_pre(r[: ne + nn], zd), r[ne + nn :] / mag_pre])
+
+        def _elec_pre_t(r, zd):
             """``P^-T``, written out rather than obtained by transposing ``P_inv`` automatically.
 
             The host factorisation is a callback, which jax cannot transpose on its own, so the block
@@ -1309,6 +1410,12 @@ def solve_network(
             u = _precond_t(Aj @ (ri / zd) + rp)
             return jnp.concatenate([(ri - CIjT @ u) / zd, u])
 
+        def P_inv_T(r, zd):
+            # a diagonal is its own transpose, so only the electric half needs the block algebra
+            if not nm:
+                return _elec_pre_t(r, zd)
+            return jnp.concatenate([_elec_pre_t(r[: ne + nn], zd), r[ne + nn :] / mag_pre])
+
         # A SHORT restart. The block preconditioner is strong -- measured against an EXACT Z^-1
         # preconditioner, which converges in one iteration, diag(Z) takes two -- so the solve needs a
         # couple of cycles and jax builds the whole basis whether or not it is needed. Per swept point
@@ -1316,7 +1423,7 @@ def solve_network(
         # 4 -> 0.754 s, all to the same impedance. Below ten the cycles outnumber what they save. The
         # ADJOINT uses the same value, which it could not before: it was the wrong preconditioner that
         # made the tangent system hard, not the subspace size.
-        _RS = min(int(restart), ne + nn)
+        _RS = min(int(restart), ne + nn + nm)
 
         if cached is None:
 
@@ -1359,7 +1466,7 @@ def solve_network(
         M = jnp.concatenate([top, bot], axis=0)
         x = jnp.linalg.solve(M, b)
     _check(jnp.all(jnp.isfinite(x)), _finite)
-    cur, phi = x[:ne], x[ne:]
+    cur, phi = x[:ne], x[ne : ne + nn]
     inj = {t: jnp.asarray(np.asarray(Asp0[idx[t]].sum(0)).reshape(-1), dtype=complex) @ cur for t in names}
     return cur, phi, inj
 
