@@ -65,6 +65,7 @@ __all__ = [
     "theta",
     "exponential",
     "adaptive",
+    "arclength",
     "remesh",
     "refine",
     "relocate",
@@ -1385,3 +1386,68 @@ def adaptive(
     from .utils.solver.timeschemes import _AdaptiveScheme
 
     return _AdaptiveScheme(None, rtol, atol, max_steps, dt0, limit=limit, shrink=shrink, grow=grow)
+
+
+def arclength(*, psi: float = 0.0, ds: float | None = None):
+    """Arc-length continuation for the load path — a spec for the ``fem.solve(tau=...)`` slot.
+
+    Load control cannot pass a limit point: past the peak there is no equilibrium at a higher load, so
+    no amount of step cutting finds one, and :func:`adaptive` says exactly that when it hits its floor.
+    Arc-length advances **along the equilibrium path** instead of along the load, so the path may turn
+    around — snap-through and snap-back, post-buckling, a softening damage or plasticity branch.
+
+    Nothing in the term list changes. The load is still written as a formula in ``tau``; what changes is
+    that ``tau`` becomes an **unknown** solved alongside ``u``, subject to Crisfield's constraint on the
+    increment from the last converged point (Crisfield, *Computers & Structures* 13 (1981) 55-62;
+    *Non-linear FEA of Solids and Structures* Vol. 1 §9.3.2)::
+
+        Du . Du + psi^2 Dlam^2 = ds^2
+
+    Because ``tau`` reaches the residual as a plain argument rather than as a DOF, this adds no unknown
+    to the operator — the border rides a residual wrapper, the way ``field.bounds(lo, hi)`` does.
+
+    Args:
+        psi: weight on the load term. ``0.0`` (default) is the **cylindrical** constraint, i.e. a pure
+            displacement measure, which Crisfield §9.3.2 reports works well in practice; a positive
+            value is the spherical one. NOTE the deviation from the textbook: Crisfield weights this by
+            the reference load vector ``qᵀq``, which jNO does not have (the load is an arbitrary formula
+            in ``tau``, and a ``tau``-dependent Dirichlet is not a load vector at all). ``psi`` is
+            therefore a plain weight carrying units of displacement per unit load factor; nothing is
+            silently substituted for ``qᵀq``.
+        ds: the arc length per step. ``None`` (default) calibrates it from the declared path — the
+            march takes one load-controlled step of ``(end - start)/(n - 1)`` and measures the arc it
+            covered. That first step also fixes the traversal **direction**, which is why a zero-width
+            declared span is refused even when ``ds`` is given explicitly. A consequence worth knowing: on a **linear** problem this reproduces the declared
+            uniform grid exactly, so ``arclength()`` degrades gracefully to the march it replaces.
+            With ``psi=0`` (the default) ``ds`` is a pure displacement, i.e. the same quantity
+            :func:`adaptive`'s ``limit=`` bounds (in the 2-norm here, the max-norm there).
+
+    The declared ``domain(tau=(start, end, n))`` is **reinterpreted**, and this is a real change of
+    meaning: ``start`` is the first (load-controlled) solve, ``n`` is the number of output rows, and
+    ``end`` sets the traversal direction and the default ``ds``. It is not a target — the march takes
+    ``n`` steps and stops wherever the path has reached, which is the point, since where the path goes
+    is the answer. So ``n`` buys **resolution, not reach**: to follow the path further, widen ``end``;
+    adding steps at a fixed ``end`` re-resolves the same total arc more finely.
+
+    The load factors actually reached are recorded on ``fem.tau_schedule`` — that, against a reaction
+    read with ``fem.eval``, is the force-displacement curve::
+
+        sol = fem.solve(tau=jno.solve.arclength(ds=1e-3))
+        load = fem.tau_schedule                       # non-monotone across a snap-back, by design
+        force = [fem.eval(momentum, sol[k])[grip].sum() for k in range(len(load))]
+
+    Scope, stated up front:
+
+    * **Matrix-free drivers only.** The bordered system goes to an unchanged Newton-Krylov, whose
+      ``jax.linearize`` builds the bordered JVP for free. ``jno.solve.newton(direct=True)`` and
+      ``jno.solve.staggered(...)`` are refused by name — the latter because freezing the load factor
+      while sweeping a block IS load control, which has no equilibrium past the fold.
+    * **The trajectory is differentiable; the load factors are not.** ``fem.tau_schedule`` is concrete,
+      for plotting and for reading the curve. A runtime-parametric form is refused for the same reason.
+    * Same assembly scope as the rest of the load-path march: real, steady, native Lagrange.
+    * Adaptive ``ds`` is not implemented — it would reintroduce step rejection, which is what the
+      pilot/freeze/replay split exists to keep out of a differentiable scan.
+    """
+    from .utils.solver.arclength import ArcLengthSpec
+
+    return ArcLengthSpec(psi=float(psi), ds=None if ds is None else float(ds))

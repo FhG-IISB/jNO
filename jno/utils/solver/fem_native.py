@@ -790,10 +790,15 @@ def assemble_fem_native(
 
     ctx = dict(getattr(domain, "context", {}) or {})
     ctx.pop("cell_size", None)  # `dom.cell_size` placeholder; the real per-cell h is packed per volume element below
-    # Same for every `u.gap(secondary, main)` placeholder: dropping it means a gap that assembly has not
-    # packed raises as an unresolved symbol instead of silently evaluating to the zero placeholder --
-    # which would read as "everywhere exactly in contact" and be believed.
-    for _k in [k for k in ctx if str(k).startswith("gap_")]:
+    # Same for every `u.gap` / `u.slide` placeholder: dropping it means a contact symbol that assembly
+    # has not packed raises as an unresolved symbol instead of silently evaluating to the zero
+    # placeholder -- which would read as "everywhere exactly in contact, and not sliding" and be believed.
+    # Record which SLIDE symbols the user actually declared, before dropping the placeholders. The
+    # packer writes the tangential entry only for these: an extra `domain_context` entry on every contact
+    # form is not inert (the same lesson as `quad_weights` -- it perturbs the assembled numerics), so a
+    # form that only asks for the gap must pack exactly what it packed before.
+    _declared_slides = {str(k) for k in ctx if str(k).startswith("slide_")}
+    for _k in [k for k in ctx if str(k).startswith(("gap_", "slide_"))]:
         ctx.pop(_k, None)
 
     # -------------------------------------------------------------------------
@@ -928,6 +933,13 @@ def assemble_fem_native(
         )
 
     region_mask_names: Tuple[str, ...] = _collect_masks(volume_terms)
+    # Does any volume term read `jno.np.cellwise`? The per-cell quadrature weights are threaded into
+    # the element kernel only when something consumes them: adding an extra traced array to every
+    # kernel's `loc` is not inert (it perturbed a plain load-path march into a NaN), so a form that
+    # never projects must assemble exactly as it did before.
+    from ...trace import contains_cellwise as _contains_cellwise
+
+    _uses_cellwise = any(_contains_cellwise(_b) for _b in volume_terms)
     region_mask_arrays = [
         jnp.asarray(_cell_region_mask(domain, r), dtype=qw_shared.dtype).reshape(-1) for r in region_mask_names
     ]
@@ -1695,6 +1707,9 @@ def assemble_fem_native(
             "trial_value_shape": fields[tfi]["value_shape"],
             "trial_vec": vecs[tfi],
         }
+        if _uses_cellwise:
+            # |K| is their sum, so `jno.np.cellwise` divides by the true cell measure.
+            loc["quad_weights"] = qw_shared * meas
         if _field_param_names:
             # The field parameter's nodal slice is interpolated to the quad points with its field's shape
             # functions (field 0 single-field; the resolved field for a coupled problem).
@@ -1741,6 +1756,9 @@ def assemble_fem_native(
             "trial_value_shape": fields[0]["value_shape"],
             "trial_vec": vecs[0],
         }
+        if _uses_cellwise:
+            # |K| is their sum, so `jno.np.cellwise` divides by the true cell measure.
+            loc["quad_weights"] = qw_shared * meas
         if _field_param_names:
             loc["shape_vals"] = per[_field_param_field_idx]["shape_vals"]
         _nt = neural_local_table(_neural, args)
@@ -1812,7 +1830,13 @@ def assemble_fem_native(
                 return True
             return any(_refs(c, tag) for c in iter_children(node) or ())
 
-        return [k for k, tb in _gap_tables.items() if tb["secondary"] == region and _refs(expr, k)]
+        # A form may read the interface through the gap, the slide, or both -- all three must engage
+        # the same table, so match either symbol's tag.
+        return [
+            k
+            for k, tb in _gap_tables.items()
+            if tb["secondary"] == region and (_refs(expr, k) or _refs(expr, "slide_" + tb["secondary"]))
+        ]
 
     def _contact_reaction(R, keys, fids, lv, gslice, bcoeff, btfi, region, t, args, pts_dyn, normals_dyn):
         """Add the equal-and-opposite interface traction to the MAIN body's DOFs.
@@ -1861,10 +1885,15 @@ def assemble_fem_native(
     def _pack_gaps(loc, per_f, n_vec, gaps):
         """Write each contact gap's per-quadrature-point value into ``loc["domain_context"]``.
 
-        ``g = g0 - n . (u_s - u_m . Phi)``. Shared by the residual and by the surface-state readout, so
-        an augmented-Lagrangian update ``lam.evolves(max(0, lam.i(-1) - c*g))`` sees exactly the gap the
-        traction term saw -- if the two drifted apart the multiplier would converge to the wrong
-        pressure, and nothing would report it.
+        Two symbols, ONE packed relative displacement ``D = u_s - u_m . Phi``:
+        ``u.gap`` -> ``g = g0 - n . D`` (scalar), ``u.slide`` -> ``s = D - (n . D) n`` (vector, global
+        frame). Splitting the computation would let the normal and tangential reads disagree about the
+        geometry; sharing it makes that impossible.
+
+        Shared by the residual and by the surface-state readout, so an augmented-Lagrangian update
+        ``lam.evolves(max(0, lam.i(-1) - c*g))`` -- or a friction slip update -- sees exactly the values
+        the traction term saw. If the two drifted apart the state would converge to the wrong traction,
+        and nothing would report it.
         """
         for _k, (_g0_f, _um_f) in (gaps or {}).items():
             _gfi = _gap_tables[_k]["field"]
@@ -1881,7 +1910,15 @@ def assemble_fem_native(
                 )
             # `n_vec` is (dim,) on a straight facet and (n_q, dim) on a curved one; `atleast_2d`
             # makes both broadcast against `_jump` (n_q, vec) without a shape branch.
-            loc["domain_context"][_k] = _g0_f - (_jump * jnp.atleast_2d(n_vec)).sum(axis=1)
+            _nrm2 = jnp.atleast_2d(n_vec)
+            _jn = (_jump * _nrm2).sum(axis=1)  # n . D, the normal component of the relative displacement
+            loc["domain_context"][_k] = _g0_f - _jn
+            # `u.slide` is the SAME relative displacement read tangentially -- one packed quantity, two
+            # reads, so the normal and tangential parts cannot disagree about the geometry. Only for a
+            # slide the form actually declared: see `_declared_slides` above for why not unconditionally.
+            _sk = "slide_" + _gap_tables[_k]["secondary"]
+            if _sk in _declared_slides:
+                loc["domain_context"][_sk] = _jump - _jn[:, None] * _nrm2
 
     def _facet_geometry(c, k, pts_src):
         """``(J, K, xq)`` for facet ``k`` of cell ``c`` -- one per quadrature point when the cell's

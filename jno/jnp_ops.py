@@ -9,6 +9,7 @@ from .architectures.models import nn, parameter  # noqa: F401
 # Keep import so people can use jno.numpy as jno -> jno.model, jno.tune
 from .integration_operators import IntegrationOperators  # noqa: F401
 from .trace import (
+    Cellwise,
     Choice,
     ConstantNamespace,
     Diff,
@@ -603,6 +604,61 @@ def diff(target, wrt) -> Diff:
     strictive coupling.
     """
     return Diff(_u(target), _u(wrt))
+
+
+def cellwise(x) -> Cellwise:
+    """Project an expression onto the **piecewise constants**: its quadrature-weighted mean over each
+    cell, ``(∫_K x dx)/(∫_K dx)``, broadcast back to that cell's quadrature points.
+
+    This is the one primitive the locking-free strain measures are built from. Volumetric locking is
+    what a standard displacement element does as ``nu -> 0.5`` — and J2 plastic flow is isochoric, so it
+    is the *default* regime for plasticity, not an edge case. B-bar replaces the volumetric part of the
+    strain by its cell mean; written the way the elastic forms in this codebase are written, as a scalar
+    contraction rather than with an identity tensor (``sigma(ebar) : ebar(phi)``, using
+    ``dev(A):dev(B) = A:B - tr(A)tr(B)/dim``)::
+
+        eps = lambda w: sym(w, X)
+        eu, ev   = eps(ui), eps(vi)
+        tru, trv = trace(eu), trace(ev)
+        cu, cv   = cellwise(tru), cellwise(trv)          # <- the projection, and the whole change
+        dev_uv   = inner(eu, ev, 2) - tru * trv / dim    # dev(eu) : dev(ev)
+        mech     = lam * cu * cv + 2 * mu * (dev_uv + cu * cv / dim)
+
+    Dropping the two ``cellwise`` calls recovers the standard form, so B-bar is a one-line edit to a
+    form you already have. Note the identity-tensor spelling ``e - vol*I + cellwise(vol)*I`` works on
+    the *trial* side but not the test side: a test-bearing quantity carries an extra DOF axis that a
+    constant ``(1, d, d)`` tensor will not broadcast against. Contract to a scalar, as above.
+
+    F-bar is the finite-strain counterpart — project the determinant instead::
+
+        F    = I + grad(u, X)
+        Fbar = (cellwise(det(F)) / det(F)) ** (1 / dim) * F
+        mech = inner(diff(psi(Fbar), Fbar), grad(phi, X), 2)
+
+    **It is quadrature-weighted, not a plain mean over quadrature points.** The two coincide only when
+    the rule's weights are equal — false for higher-degree simplex rules, and false on curved
+    (``Shape.curved()``) or tensor-product cells, where the measure varies inside the cell. The weighted
+    form is the actual L2 projection, so it is the actual B-bar.
+
+    **Where it does and does not help, measured.** B-bar cures locking only where the strain is not
+    already constant within a cell, so it is for **quadrilateral / hexahedral** cells and higher-order
+    simplices. On **P1 triangles and tets the strain is element-wise constant, so this projection is
+    the identity and changes nothing** — that is not a defect, but it means B-bar is not the cure for
+    P1 volumetric locking (use Q1/hex cells, a higher order, or a mixed u-p formulation there). On a
+    plane-strain Q1 cantilever at ``nu = 0.4999`` (measured, 16x4 cells): standard ``2.68e-02`` against
+    B-bar ``3.03e-01``, an 11.3x difference, where B-bar is already converged (it moves 0.7% out to
+    128x32) and the standard element is still 2.3x too stiff at 128x32 — refinement does not cure
+    locking, which is why this exists. At ``nu = 0.3`` the same comparison differs by 5.6%.
+
+    Scope, enforced rather than documented around: **native-Lagrange volume terms**. The 1-D, non-nodal
+    (Argyris/Morley/RT/N1E) and VPINN assemblers do not thread the per-cell quadrature weights, and a
+    collocation/PINN residual has no cells at all — each raises rather than averaging over the wrong set
+    of points. Boundary/surface terms raise for the same reason. It also may not appear inside a
+    :func:`diff` target (that would make ``diff`` return a cell-summed derivative);
+    ``cellwise(diff(...))`` and the F-bar spelling above are the supported orderings, and the error
+    says so.
+    """
+    return _attach_coords(Cellwise(_u(x)), [x])
 
 
 def eigvalsh(x) -> FunctionCall:

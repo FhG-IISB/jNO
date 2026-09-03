@@ -33,11 +33,13 @@ from jno.utils.solver.fem_utils import (
     _edge_shape,
     _faces_span_the_same_extent,
     _facet_dual_coeffs,
+    _facet_rim_nodes,
     _interface_frame,
     _main_covers_secondary_3d,
     _mortar_rows_2d,
     _mortar_rows_3d,
     _periodic_facet_weights,
+    _rim_redistribution,
     _signed_area,
     _tri_bary,
     _tri_dual_available,
@@ -267,9 +269,29 @@ def _edge_faces(n_main, n_secondary, *, order=1):
     return pts, tags, {"r": mf, "l": sf}
 
 
-def _apply(rows, main_vals_by_id):
-    """Evaluate a row dict {secondary: [(main, w)]} against main nodal values keyed by node id."""
-    return {s: sum(w * main_vals_by_id[m] for m, w in ws) for s, ws in rows.items()}
+def _apply(rows, vals_by_id):
+    """Evaluate a row dict {secondary: [(node, w)]} against nodal values keyed by node id.
+
+    Under the boundary-modified multiplier space a row references main-side nodes *and* the rim
+    secondaries, which are kept DOFs rather than eliminated ones -- so ``vals_by_id`` must cover both.
+    :func:`_supply_rim` is how the tests below produce the rim half.
+    """
+    return {s: sum(w * vals_by_id[m] for m, w in ws) for s, ws in rows.items()}
+
+
+def _supply_rim(rows, vals, m_facets, loc):
+    """Extend ``vals`` to every node the rows reference, using the main field's trace at that point.
+
+    Rim secondaries carry no multiplier, so the tie does not determine them -- in a solve they stay free.
+    A *transfer* comparison therefore has to supply them, and the main trace is the choice that feeds
+    mortar and collocation **identical** data: collocation uses exactly this value at every secondary
+    node, so any difference the tests below measure comes from the coupling and not from the input.
+    """
+    for ws in rows.values():
+        for node, _w in ws:
+            if node not in vals:
+                vals[node] = sum(w * vals[k] for k, w in _periodic_facet_weights(loc[node], m_facets, loc))
+    return vals
 
 
 def test_dual_basis_is_biorthogonal():
@@ -320,7 +342,7 @@ def test_mortar_is_the_l2_projection_not_collocation():
         pts, _tags, fc = _edge_faces(n_main, n_secondary)
         loc = pts[:, 1:2]
         rows = _mortar_rows_2d(fc["l"], fc["r"], loc, span=1.0)
-        vals = {int(i): f(pts[i, 1]) for i in np.unique(fc["r"])}
+        vals = _supply_rim(rows, {int(i): f(pts[i, 1]) for i in np.unique(fc["r"])}, fc["r"], loc)
         mortar = _apply(rows, vals)
         colloc = _apply({int(s): _periodic_facet_weights(loc[int(s)], fc["r"], loc) for s in np.unique(fc["l"])}, vals)
         exact = {s: f(pts[s, 1]) for s in mortar}
@@ -368,12 +390,58 @@ def test_mortar_rows_match_an_independent_fine_quadrature():
             n_m = _edge_shape((x[sel] - c) / (d - c), km)
             M[np.ix_(r, [m_at[int(v)] for v in fc["r"][g]])] += np.einsum("qi,qj->ij", psi[sel], n_m) * h
 
+    # Wohlmuth's boundary modification, restated here independently of the implementation so this stays
+    # an oracle: the chain's two end nodes carry no multiplier, and each is redistributed with c = 1 onto
+    # its single interior neighbour (SIAM J. Numer. Anal. 38(3):989-1012, 2000, section 3). An interior
+    # row is then (M_i + sum_p M_p) / D_i on the main block, with a -D_p / D_i entry at each rim node p.
+    used = np.bincount(fc["l"][:, :2].ravel(), minlength=len(pts))
+    rim = {int(v) for v in s_nodes if used[int(v)] == 1}
+    assert len(rim) == 2, "a 1-D secondary chain has exactly two ends"
+    nbr = {}
+    for a, b in fc["l"][:, :2]:
+        for x, y in ((int(a), int(b)), (int(b), int(a))):
+            if x in rim:
+                nbr[x] = y
+
     for node, i in s_at.items():
-        ref = M[i] / D[i]
-        got = np.zeros(len(m_nodes))
+        if node in rim:
+            assert node not in rows, "a rim node must be kept, not eliminated"
+            continue
+        ref, ref_rim = M[i].copy(), {}
+        for p in rim:
+            if nbr[p] == node:
+                ref += M[s_at[p]]
+                ref_rim[p] = -D[s_at[p]] / D[i]
+        ref /= D[i]
+        got, got_rim = np.zeros(len(m_nodes)), {}
         for m, w in rows[node]:
-            got[m_at[m]] = w
+            if m in m_at:
+                got[m_at[m]] = w
+            else:
+                got_rim[m] = w
         assert np.allclose(got, ref, atol=2e-4), f"secondary {node}: {got} vs {ref}"
+        assert set(got_rim) == set(ref_rim), f"secondary {node}: rim entries {set(got_rim)} vs {set(ref_rim)}"
+        for pnode, w in ref_rim.items():
+            assert abs(got_rim[pnode] - w) < 2e-4, f"secondary {node} rim {pnode}: {got_rim[pnode]} vs {w}"
+
+
+def test_rim_redistribution_preserves_the_partition_of_unity():
+    """The single condition the boundary-modified multiplier space has to satisfy, asserted directly.
+
+    Consistency of the tie is ``sum_i psi~_i == 1`` over the secondary patch. The rim multipliers are
+    dropped, so that reduces to a **column** sum on the redistribution: each rim node's weight must land
+    in full on interior nodes. Dropping without redistributing (``C == 0``) satisfies every other
+    property the suite checks -- diagonal ``D``, an elimination, exact rows -- and fails only this.
+    """
+    for facets, edges in ((_edge_faces(4, 7)[2]["l"], True), (_tri_faces(3, 5)[2]["bot"], False)):
+        s_nodes = np.unique(facets)
+        s_at = {int(v): i for i, v in enumerate(s_nodes)}
+        is_rim, c = _rim_redistribution(facets, s_at, len(s_nodes), edges=edges)
+        assert is_rim.any() and not is_rim.all(), "this patch must have both a rim and an interior"
+        assert set(np.flatnonzero(is_rim).tolist()) == {s_at[int(v)] for v in _facet_rim_nodes(facets, edges=edges)}
+        assert np.allclose(c[:, is_rim].sum(axis=0), 1.0), "every rim multiplier must be fully redistributed"
+        assert not c[:, ~is_rim].any(), "only rim multipliers are redistributed"
+        assert not c[is_rim].any(), "a rim node is never a redistribution TARGET -- it carries no multiplier"
 
 
 def test_extent_mismatch_keeps_collocation():
@@ -532,7 +600,12 @@ def _mortar_residual(rows, s_facets, m_facets, loc, field, nq=20):
 
     The integrand is only piecewise smooth (the main field kinks at every main facet edge), so
     this converges in ``nq`` rather than being exact -- which is why the test below asserts a ratio
-    and a convergence trend instead of an absolute threshold."""
+    and a convergence trend instead of an absolute threshold.
+
+    The constraint the tie actually enforces is over the **modified** multipliers, so the raw per-node
+    integrals are combined as ``r~_i = r_i + sum_p C[i,p] r_p`` and only the interior rows -- the ones
+    carrying a multiplier -- are returned. Contracting against the unmodified ``psi`` would measure a
+    constraint the method does not impose."""
     xy = np.asarray(loc, float)
     ks, km = s_facets.shape[1], m_facets.shape[1]
     bary, w = _tri_quadrature(nq)
@@ -555,7 +628,11 @@ def _mortar_residual(rows, s_facets, m_facets, loc, field, nq=20):
         contrib = psi.T @ ((u_s - u_m) * w * (area / 0.5))
         for a, n in enumerate(s_facets[e]):
             resid[int(n)] += float(contrib[a])
-    return np.array([resid[int(n)] for n in np.unique(s_facets)])
+    s_nodes = np.unique(s_facets)
+    s_at = {int(v): i for i, v in enumerate(s_nodes)}
+    is_rim, c = _rim_redistribution(s_facets, s_at, len(s_nodes), edges=False)
+    r = np.array([resid[int(n)] for n in s_nodes])
+    return (r + c @ r)[~is_rim]
 
 
 def test_mortar_satisfies_the_integral_constraint_and_collocation_does_not():
@@ -567,11 +644,14 @@ def test_mortar_satisfies_the_integral_constraint_and_collocation_does_not():
     field = {int(i): np.sin(3.0 * pts[i, 0]) * np.cos(2.5 * pts[i, 1]) for i in np.unique(fc["top"])}
 
     rows = _mortar_rows_3d(fc["bot"], fc["top"], loc, span=1.0)
-    u_mortar = {s: sum(w * field[m] for m, w in ws) for s, ws in rows.items()}
     u_colloc = {
         int(s): sum(w * field[m] for m, w in _periodic_facet_weights(loc[int(s)], fc["top"], loc))
         for s in np.unique(fc["bot"])
     }
+    # The rim halves of the two secondary fields are IDENTICAL (the main trace) -- only the interior,
+    # where the multipliers live, is allowed to differ. Otherwise the comparison below would be
+    # measuring the rim datum rather than the coupling.
+    u_mortar = {**u_colloc, **_apply(rows, _supply_rim(rows, dict(field), fc["top"], loc))}
     r_mortar, r_colloc = ({}, {})
     for nq in (8, 20):
         r_mortar[nq] = np.abs(_mortar_residual(u_mortar, fc["bot"], fc["top"], loc, field, nq)).max()
@@ -594,8 +674,9 @@ def test_mortar_3d_is_more_accurate_than_collocation(n_main, n_secondary):
     f = lambda p: np.sin(3.0 * p[0]) * np.cos(2.5 * p[1])  # noqa: E731
     field = {int(i): f(pts[i]) for i in np.unique(fc["top"])}
     rows = _mortar_rows_3d(fc["bot"], fc["top"], loc, span=1.0)
-    ids = sorted(rows)
-    mortar = np.array([sum(w * field[m] for m, w in rows[s]) for s in ids])
+    ids = sorted(rows)  # interior secondaries: the rim carries no multiplier and stays a free DOF
+    vals = _supply_rim(rows, dict(field), fc["top"], loc)
+    mortar = np.array([sum(w * vals[m] for m, w in rows[s]) for s in ids])
     colloc = np.array([sum(w * field[m] for m, w in _periodic_facet_weights(loc[s], fc["top"], loc)) for s in ids])
     exact = np.array([f(pts[s]) for s in ids])
     rms = lambda e: float(np.sqrt(np.mean(e**2)))  # noqa: E731
@@ -663,7 +744,12 @@ def test_mortar_3d_survives_a_high_density_ratio():
     assert res["coupling"] == "mortar"
     P = np.asarray(res["P_node"].todense())
     kept = np.asarray(res["kept_nodes"])
-    assert len(kept) == 4 and np.allclose(P.sum(axis=1), 1.0)
+    # Everything the tie eliminates is a secondary INTERIOR node; the main face and the secondary's
+    # perimeter survive. Stated from the geometry (the patch is the unit square) rather than as a count.
+    sec = tags["bot"]
+    on_perimeter = np.isclose(pts[sec, :2], 0.0) | np.isclose(pts[sec, :2], 1.0)
+    assert set(kept.tolist()) == set(tags["top"].tolist()) | set(sec[on_perimeter.any(axis=1)].tolist())
+    assert np.allclose(P.sum(axis=1), 1.0)
     field = 1.3 * pts[:, 0] - 0.7 * pts[:, 1] + 2.0
     assert np.allclose(P @ field[kept], field, atol=1e-10)
 

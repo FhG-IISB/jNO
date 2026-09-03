@@ -28,6 +28,16 @@ import numpy as np
 from jax import lax
 
 
+def _roll_buffer(buf, nv):
+    """Push the just-computed state ``nv`` (n_cell, n_quad, *shape) into slot 0 — the next step's
+    ``.i(-1)`` — and drop the oldest slot, keeping the buffer exactly ``depth`` deep. Depth 1 simply
+    replaces; depth >= 2 (e.g. a BDF2 ``u.i(-2)``) shifts the tail back one.
+
+    Module level so the arc-length march (:mod:`jno.utils.solver.arclength`) advances state by exactly
+    the same operation as the fixed-grid one — a second copy is how the two would silently diverge."""
+    return jnp.concatenate([nv[:, :, None, ...], buf[:, :, :-1, ...]], axis=2)
+
+
 def run_history_march(fem, solve_fn=None, path=None, **kwargs):
     """March ``fem`` over its domain's pseudo-time grid and return the ``(n_steps, n_dofs)`` trajectory.
 
@@ -96,10 +106,7 @@ def run_history_march(fem, solve_fn=None, path=None, **kwargs):
         return prep(res, u_prev) if prep is not None else (res, u_prev)
 
     def _roll(buf, nv):
-        """Push the just-computed state ``nv`` (n_cell, n_quad, *shape) into slot 0 — the next step's
-        ``.i(-1)`` — and drop the oldest slot, keeping the buffer exactly ``depth`` deep. Depth 1 simply
-        replaces; depth ≥ 2 (e.g. a BDF2 ``u.i(-2)``) shifts the tail back one."""
-        return jnp.concatenate([nv[:, :, None, ...], buf[:, :, :-1, ...]], axis=2)
+        return _roll_buffer(buf, nv)
 
     def _step_once(u_prev, buffers, sbuffers, tau_k, path_k, param_args):
         """One accepted load step: equilibrium at ``tau_k``, then advance every buffered state.
@@ -165,6 +172,35 @@ def run_history_march(fem, solve_fn=None, path=None, **kwargs):
     # The schedule is a PIECEWISE-CONSTANT function of the parameters (perturb one infinitesimally and
     # the same steps are accepted), so the gradient over a frozen schedule is the true derivative almost
     # everywhere -- the same contract `adapt=` already makes for a frozen mesh sequence.
+    if _is_arclength(path):
+        if path_frames:
+            raise NotImplementedError(
+                "jno.fem: `tau=jno.solve.arclength(...)` does not compose with a per-load-step field "
+                "(`freeze_path(frames)`) — those frames are indexed by the DECLARED load step, and under "
+                "arc-length the load factor is solved for, not prescribed, so there is no step to index "
+                "them by. Use the fixed `domain(tau=...)` march for a path that carries prescribed data."
+            )
+        if getattr(op, "runtime_parameter_exprs", {}):
+            raise NotImplementedError(
+                "jno.fem: `tau=jno.solve.arclength(...)` on a form carrying a runtime parameter is not "
+                "wired yet — the load factor recorded on `fem.tau_schedule` is a concrete array, and a "
+                "parametric solve has only tracers. Run the study forward at the values you want."
+            )
+        from .arclength import march_arclength
+
+        return march_arclength(
+            fem,
+            path,
+            solve_fn=solve_fn,
+            op=op,
+            readout=readout,
+            surf_readout=surf_readout,
+            buffers0=buffers0,
+            sbuffers0=sbuffers0,
+            u0=u0,
+            tau_pts=tau_pts,
+            dtype=dtype,
+        )
     if path is not None:
         if _is_explicit_schedule(path):
             # `tau=<array>`: replay a schedule the caller already has — from an earlier pilot
@@ -250,9 +286,17 @@ def run_history_march(fem, solve_fn=None, path=None, **kwargs):
     return FunctionCall(lambda *values: _march(dict(zip(names, values))), params, name="fem_history_march")
 
 
+def _is_arclength(path):
+    """Is ``tau=`` an arc-length spec? Checked BEFORE :func:`_is_explicit_schedule`, which keys on the
+    absence of ``.limit`` and would otherwise try to read the spec as an array of tau values."""
+    from .arclength import ArcLengthSpec
+
+    return isinstance(path, ArcLengthSpec)
+
+
 def _is_explicit_schedule(path):
     """Is ``tau=`` a recorded schedule to replay rather than a spec to discover one with?"""
-    return path is not None and not hasattr(path, "limit")
+    return path is not None and not _is_arclength(path) and not hasattr(path, "limit")
 
 
 def _as_schedule(path, tau_pts):
@@ -488,6 +532,9 @@ def _pilot_schedule(
                 f"(overshoot x{ratio:.3g}). That is the signature of an UNSTABLE branch, not of a step "
                 "that is merely too big: under load control a snap-back has no nearby equilibrium, so no "
                 "amount of load-step refinement finds one. Loosen `limit` to accept the jump, or drive "
-                "the path by a displacement/arc-length measure instead of the load."
+                "the path by arc length instead of by the load: fem.solve(tau=jno.solve.arclength(ds=...)), "
+                "which solves for the load factor and can turn around. Note arc-length does not yet "
+                "compose with nonlinear=jno.solve.staggered(...) -- an alternate-minimization energy "
+                "(phase-field fracture) still has no instrument here."
             )
     return np.asarray(schedule, dtype=float), states

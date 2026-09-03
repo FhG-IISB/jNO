@@ -165,163 +165,125 @@ d.tag("right", lambda x, y: x > 1 - 1e-9)  # which matters — see below
 fem = jno.fem([weak_form, u("left") - u("right")])
 ```
 
-How the two faces are identified depends on their meshes:
-
-* **Conforming** (the node layouts match) — an exact node-to-node 0/1 map. This is the cheap path and
-  it keeps the fast selection-based reduction.
-* **Non-matching**, when both faces carry facet connectivity and the main face covers the secondary —
-  a **dual-mortar** coupling (Bernardi/Maday/Patera 1994; dual multiplier spaces from Wohlmuth 2000):
-  the tie is imposed in the integral sense `∫ ψ (u_A − u_B∘Φ) = 0` over the secondary face, segmented
-  against the main facets. Interval clipping in 2-D, polygon clipping in 3-D.
-* **Non-matching, otherwise** (native 1-D chains, a tag that selects nodes but no whole facet, or two
-  faces that do not cover each other) — node-to-segment **collocation**: each secondary node takes the
-  main facet value at its own location.
-
-Worth being precise about what the mortar coupling buys, because it is less than the usual framing
-suggests. jNO enforces a tie by main–secondary **elimination** through a prolongation `P`, and such a
-scheme passes the linear patch test whenever `P` reproduces linear fields — which node-to-segment
-interpolation does, in 2-D *and* 3-D. So **the patch test does not separate the two couplings here**;
-the textbook "node-to-segment fails the patch test" result is about contact formulations that
-distribute nodal forces, not about a linearly-complete MPC elimination.
-
-What does differ: for a field the main space cannot represent, mortar returns the integral (L²)
-projection and collocation the pointwise value. Measured on a non-matching 3-D interface, mortar's RMS
-error is 4–40 % lower across a range of mesh ratios. The two also coincide exactly when the main
-nodes are a subset of the secondary nodes, since the main basis then lies inside the secondary space.
-
-**P2 triangular interfaces (3-D quadratic) stay collocated**, and this is a theorem rather than a gap
-in the implementation. The dual basis is built from the facet mass matrix as `A = diag(∫N)·Mass⁻¹`, and
-the P2 triangle's vertex functions integrate to *exactly zero* (`∫L(2L−1) = 2/12 − 1/6`), so the
-scaling is singular. Rescaling does produce a biorthogonal basis, but not one whose span contains the
-linear functions — and Lemma 3.4 of Lamichhane's thesis proves no locally supported dual space of that
-dimension can, which is precisely what the optimal error estimate requires. The published remedy uses
-*fewer* multipliers than secondary DOFs, making the tie a constrained solve rather than an elimination,
-which a prolongation cannot express. P2 **edges** (2-D) are unaffected — there `∫N = 1/6` — and the
-same source confirms the 2-D quadratic dual space does contain the linear hats.
-
-Two practical consequences: tag periodic faces with a **predicate** (`d.tag(name, lambda ...)`) so each
-face includes its corner nodes — a face tagged from geometry may drop them, leaving the two sides with
-different extents, which both disqualifies mortar and leaves the corner DOFs untied. And multidirectional
-periodicity *requires* shared corners; `jno.fem` raises rather than silently mis-solving if they are absent.
-
-### Gluing two independently meshed bodies
-
-`Shape.regions` fragments its pieces, so a shared interface meshes **conforming** — one node set, no tie
-needed. `conforming=False` skips the fragment: each piece is meshed on its own, and two touching regions
-end up with two coincident but non-matching surfaces and duplicated nodes. That is how you join bodies
-meshed at different resolutions, or couple subdomains you would rather mesh separately.
-
-The two sides are spatially *identical*, so no `d.tag` predicate can separate them — the emitter names
-them, extending the `"a|b"` convention it already uses for material interfaces:
+A tie works on a **scalar or a vector** field. On a vector field the mortar rows are unchanged — they
+are node-pair weights — and the prolongation is expanded componentwise, `kron(P_node, I_vec)`. That is
+what lets one interface be **tied** while another is in **contact** on the same displacement field, which
+is the ordinary two-body setup:
 
 ```python
-d = jno.Shape.regions(
-        lower=jno.Shape.box(0, 0, 0, 1, 1, 1),
-        upper=jno.Shape.box(0, 0, 1, 1, 1, 2.5),
-        conforming=False,
-    ).sized(0.18).domain()
-
-a = d.variable("lower|upper.lower", split=True)     # one tag per side
-b = d.variable("lower|upper.upper", split=True)
-
-fem = jno.fem([
-    weak_form,
-    u(*a) - u(*b),                                  # glue them
-    u(xb, yb, zb) - 0.0,
-])
+u, phi = d.fem_symbols(value_shape=(3,))
+fem = jno.fem([mech,
+               u(*d.variable(seam1_a, split=True)) - u(*d.variable(seam1_b, split=True)),   # bonded
+               maximum(0.0, -c * u.gap(seam2_a, seam2_b, domain=d)) * inner(n, phi_s, 1)])  # contact
 ```
 
-The tie then resolves as above — conforming node-to-node where the layouts happen to match, mortar where
-they do not.
+!!! warning "Scope"
+    A **transient** tie is still scalar-only (that route pre-builds its own reduction), and refuses by
+    name. A tie combined with `u.gap` assembles but solves to a **deferred trace node** rather than an
+    array, because the gap marks the form structurally nonlinear and a reduced nonlinear system stays
+    lazy so its node can flow into `jno.core` for an inverse problem. Evaluate it the way
+    `tests/test_fem_periodic_unstructured.py::test_periodic_nonlinear_reaction_diffusion` does, via a
+    throwaway `jno.core([...]).eval([node])` — note that `np.asarray` on it yields a 0-d **object**
+    array, not the solution.
 
-One subtlety worth knowing, because it is invisible: each interface face **is** a facet of exactly one
-cell, so it is topologically part of the boundary. The catch-all `"boundary"` region therefore excludes
-nodes that lie *only* on an interface — otherwise `u(boundary) - g` would pin the interface and silently
-solve two disconnected bodies. Nodes where the interface meets the outer wall lie on a genuine outer
-facet too and stay pinned.
+!!! measured "The mortar tie passes the patch test — and what it took"
+    A dual-mortar coupling reproduces a linear field exactly across a non-matching interface: measured
+    **1.0e-17** on the linear-field patch test, against a field of order 3e-02, and
+    `P^T (A u* - b)` = 3.0e-18 on every free reduced row. It did not always, and the two defects behind
+    that are worth knowing because they are easy to reintroduce.
 
-Because the two sides are spatially identical, **name them by the mesh's own tags** (above) or by
-`d.tag(pred, region=...)`, which says which body owns the facets:
+    **One formula per interface.** The builder used to take an exact node-to-node shortcut whenever a
+    secondary node happened to coincide with a main node, and fall back to a mortar row otherwise — 8 of
+    12 secondaries on a typical stacked-block interface. Mixing weight-1 collocation rows into a dual
+    operator destroys the biorthogonality the method's consistency rests on. The interface is now
+    classified **once** (`conforming` / `mortar` / `collocated`, reported as `tie_counts`) and every
+    secondary takes that formula.
+
+    **The multipliers at the interface rim.** With one formula throughout, the normal mode became exact
+    but the two tangential ones broke (1.1e-02), because perimeter secondaries drag outer-boundary flux
+    into interior interface equations. jNO uses Wohlmuth's boundary-modified multiplier space (SIAM J.
+    Numer. Anal. 38(3):989-1012, 2000, §3): rim multipliers are dropped and redistributed onto their
+    interior neighbours, `psi~_i = psi_i + sum_p c_ip psi_p`, with the column sum `sum_i c_ip = 1` that
+    keeps `sum psi~ == 1`. Rim secondaries then carry no multiplier and stay **free DOFs** — they are
+    kept, not eliminated, which is visible in `kept_nodes`.
+
+    Two consequences worth expecting: mortar weights are no longer non-negative (rim entries are
+    negative), and a one-element-wide secondary patch has no interior node at all, so it falls back to
+    collocation. `P.sum(axis=1) == 1` and linear reproduction both still hold exactly.
+
+    Pinned in `tests/test_fem_tie_dirichlet_conflict.py` and `tests/test_fem_mortar.py`.
+
+!!! measured "A prescribed value on a tied face — imposed after the reduction, on every path"
+    A tie is imposed as `u = P x` and the system reduced as `P^T A P`. `P^T` **sums** each eliminated
+    DOF's equation into the rows it ties to — so a prescribed DOF that is a tie target loses the unit row
+    holding its value, and `P^T b` loses `b[d] = g` with it. Nothing raised; the boundary condition
+    simply stopped being imposed.
+
+    Two things fix it, and both are needed. A prescribed DOF is excluded from the elimination (per **DOF**,
+    not per node, so a roller keeps the tie on its free components), and the rows the congruence pollutes
+    are re-imposed in the reduced space — symmetrically, because restoring the row alone leaves the
+    reduced column populated and silently downgrades LDL^T to general LU.
+
+    Every reduced-space path goes through one helper for this (`impose_reduced_dirichlet`, or
+    `wrap_reduced_dirichlet` for the residual-form paths). That matters: the steady real path was fixed
+    first and the others stayed wrong for exactly as long as they had their own copy of the logic —
+    5.8e-04 on the fused-complex path, whose `blkdiag(P, P)` transform dropped the record entirely, and
+    4.2e-04 on the transient, which built its reduction through a second construction site that never
+    annotated it. Both are now at round-off and are measured against their conforming controls.
+
+    A **time-varying** essential value on a polluted interface row is refused by name: its held value is
+    written into the full row every step and there is no constant to put back.
+
+### The tangential companion — `u.slide`
+
+`u.gap(secondary, main, domain=d)` gives the **normal** separation of a contact pair as a scalar,
+`g = g0 + n·(u_s - u_m∘Phi)`. `u.slide(secondary, main, domain=d)` is its sibling: the **tangential**
+part of the same relative displacement, as a vector,
+
+```
+s = (u_s - u_m∘Phi) - n (n·(u_s - u_m∘Phi))
+```
+
+— the jump with its normal component projected out. Same pair, same frozen mortar weights, same frame;
+the two together decompose the relative displacement completely, which is why they are separate symbols
+rather than one bundled return.
+
+It exists because the normal traction alone is frictionless: a body held only by `u.gap` can slide freely
+along the interface and its system is **singular**. A tangential term built from `u.slide` is what closes
+that null space — a bonded (stick) interface at penalty stiffness `ct`:
 
 ```python
-d.tag("cap_face",  lambda x, y: jnp.abs(y - 1.0) < 1e-9, region="cap")
-d.tag("base_face", lambda x, y: jnp.abs(y - 1.0) < 1e-9, region="base")
+sv  = d.variable(sec, split=True)
+vs  = phi.bind(x=sv[0], y=sv[1], z=sv[2])
+nrm = d.variable(sec, normals=True)
+g, s = u.gap(sec, main, domain=d), u.slide(sec, main, domain=d)
+
+terms = [mech,
+         (-cn * g) * inner(nrm, vs, 1)      # normal:     no interpenetration
+         + (-ct) * inner(s, vs, 1)]         # tangential: no sliding
 ```
 
-A bare coordinate predicate cannot tell them apart, and a surface term written on such a tag is applied
-to **both** bodies.
+Coulomb friction is the same term with `ct` replaced by a formula in the trace — a radial return on the
+surface state, written out as a `state.evolves(...)` update, not a material object.
 
-### Contact — `u.gap(secondary, main)`
+!!! warning "Scope — `u.slide`"
+    `s` is a **displacement**, not a velocity or a plastic slip: it measures the tangential offset from
+    the frozen pairing built at assembly, so it is meaningful for small sliding only, on the same terms as
+    `u.gap`. Reading it through `fem.eval` returns zeros — interface symbols are not evaluable that way —
+    so measure it through the mechanics (the displacement it produces), which is what
+    `tests/test_fem_contact_slide.py` does.
 
-A tie makes two surfaces move together. Contact lets them separate and push, and the difference is one
-term. `u.gap` is the signed normal gap at the secondary face's quadrature points:
-
-$$g = g_0 - n \cdot (u_s - u_m \circ \Phi)$$
-
-`g0` is the initial along-normal separation and `Φ` the mortar projection onto the main surface — the
-same projection a tie uses, so a gap and a tie are the same machinery read two ways. The gap is a
-symbol, so the contact traction is an ordinary boundary term and **nothing is passed to `fem.solve()`**:
-
-```python
-n = d.variable(secondary, normals=True)          # the secondary's OUTWARD normal
-g = u.gap(secondary, main, domain=d)
-p = jno.np.maximum(0.0, -c * g)              # pressure: positive only when penetrating
-fem = jno.fem([..., p * jno.np.inner(n, phi.bind(x=sv[0], y=sv[1]), n_contract=1)])
-```
-
-**The sign convention, spelled out**, because every downstream sign follows it:
-
-| quantity | meaning |
-|---|---|
-| `n` | the **secondary's outward** normal — on a contacting pair it points *at* the main |
-| `g > 0` | separated (open) |
-| `g < 0` | interpenetrating |
-| `p = max(0, -c*g)` | contact pressure, `≥ 0`, active only in penetration |
-| `+p * inner(n, phi)` | the traction term — **not** `-p * ...` |
-
-The `+` is not a convention you may flip: since `∂g/∂u_s = -n`, it is the sign that adds a
-positive-definite `+c (n·δu)(n·φ)` to the tangent. The opposite sign is anti-stabilising and, measured
-on a weakly penalised interface, leaves the jump *larger* than not penalising at all.
-
-You write **one** term, on the secondary face. The equal-and-opposite traction on the main body is
-supplied by the pairing — it is the same integrand tested against the main's projected trace — so
-Newton's third law holds without you restating it. Ablating that reaction leaves the main body
-identically zero.
-
-For a bonded (tied) interface use the two-sided penalty `p = -c*g` instead of the `max`; it is smooth,
-and stiffening `c` converges to the tie: two bonded unit blocks squeezed by 0.02 reproduce the single-bar
-answer `uy(y=1) = -0.01` to 1.5e-05 at `c = 1e6`.
-
-**One-sided (separating, Signorini) contact works** with the `max(0, -c*g)` spelling above, and the
-earlier "the kink stalls Newton" note was re-measured and re-classified: the stall was a **float32
-residual floor** (~2e-5 on the reference stack), not active-set cycling — `jax.linearize` through
-`max` selects the active branch, which *is* the semismooth Jacobian, and under x64 the identical
-iteration meets `rtol=1e-8` at residual 4e-10, superlinearly. Practical guidance: set tolerances the
-precision can reach (`newton(line_search=True, rtol=1e-6, atol=1e-6)` in float32; anything tighter
-wants x64), press converges to the bonded answer like `1/c`, and release separates exactly — no
-adhesion, measured `max|u| < 1e-9` on the far body.
-
-To remove the penalty's `O(1/c)` penetration error, add the **augmented-Lagrangian** multiplier — a
-scalar *surface state* on the secondary face riding the existing `evolves` + `tau=` march machinery,
-no new API:
-
-```python
-lam, _ = d.fem_symbols(value_shape=())            # the multiplier, per face quadrature point
-p = jno.np.maximum(0.0, lam.i(-1) + c*(-g))       # AL pressure
-fem = jno.fem([..., p * inner(n, phi_s, 1), lam.evolves(p), *bcs])   # tau march = Uzawa updates
-```
-
-Measured on the reference stack at the *same* `c = 1e3`: penalty error 3.4e-3, AL error **1.1e-5**
-after 8 updates, falling monotonically. Differentiable through *closed* contact: `jax.grad` of a
-response w.r.t. a load or (parametric-Dirichlet) grip displacement runs through the driver's
-`custom_root` on the branch-selected operator and FD-checks; at contact *onset* the derivative is a
-subgradient (the `max` kink).
+    Two independently meshed blocks pressed together **do** register a non-zero slide even under a purely
+    normal load: they bulge laterally by slightly different amounts, which is a real ~1% tangential
+    mismatch, not a numerical artefact. Add roller conditions on the side faces if you want a genuinely
+    uniaxial press.
 
 !!! warning "Scope — small sliding"
     Small sliding — the pairing is frozen at build time, so a configuration that slides must be
     rebuilt per load step. Differentiable in the DOF values but **not** in the mesh coordinates (the
-    projection weights are host-computed). Frictionless: no tangential traction, so a body held *only* by
-    contact is free to slide and its system is singular — constrain the tangential direction independently.
+    projection weights are host-computed). The gap alone is **frictionless** — a body held *only* by a
+    normal traction is free to slide and its system is singular; give it a tangential term built from
+    [`u.slide`](#the-tangential-companion-uslide) or constrain that direction independently.
     The **assembled tangent now carries the gap's nonlocal blocks** — `(s,m)` from `jacfwd` w.r.t. the
     gathered main values chained through the frozen mortar weights, plus the reaction rows' `(m,s)` and
     `(m,m)` — verified against the matrix-free JVP on random probes in both the active and separated

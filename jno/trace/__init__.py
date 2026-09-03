@@ -47,6 +47,8 @@ __all__ = [
     "Jacobian",
     "Diff",
     "DiffSlot",
+    "Cellwise",
+    "contains_cellwise",
     "BoundConstraint",
     "bound_constraints",
     "NormalDerivative",
@@ -3408,6 +3410,20 @@ class Diff(Placeholder):
                 "derivative would be identically zero. `wrt` is matched by IDENTITY: bind it once "
                 "(`F = I + grad(u, X)`) and pass that same object, rather than rebuilding it inline."
             )
+        if contains_cellwise(rewritten):
+            # `Diff` evaluates as `grad(sum(target))`, which IS the per-point derivative only because the
+            # quadrature axis is a batch axis. A `cellwise` left in the differentiated expression couples
+            # the points, so the sum's gradient would be the CELL-summed derivative, silently. Note the
+            # check is on the REWRITTEN target: a `cellwise` living entirely inside `wrt` (F-bar's
+            # `Fbar = (cellwise(det F)/det F)**(1/3) F`) is replaced by the value slot and is fine.
+            raise ValueError(
+                "jno.np.diff: the differentiated expression contains a `jno.np.cellwise` projection. "
+                "`diff` is POINTWISE — it relies on the quadrature axis being a batch axis — and a "
+                "per-cell mean couples the points, so the result would be the cell-summed derivative "
+                "rather than the per-point one. Project the DERIVATIVE instead: `cellwise(diff(psi, F))`, "
+                "or move the projection inside `wrt` (`Fbar = (cellwise(det(F))/det(F))**(1/3) * F`, then "
+                "`diff(psi, Fbar)`), which is the F-bar form and is supported."
+            )
         del rewritten  # built only to validate; the evaluator rebuilds it from the CURRENT children,
         # because `substitute` may later rewrite this node's own target/wrt and a cached copy would go stale.
         self.target = target  # kept so trial/field/region detection walks the ORIGINAL expression
@@ -3421,6 +3437,62 @@ class Diff(Placeholder):
 
     def __repr__(self):
         return f"Diff({self.target}, wrt={self.wrt})"
+
+
+class Cellwise(Placeholder):
+    """``expr`` projected onto the piecewise constants — its quadrature-weighted mean over one cell,
+    broadcast back to that cell's quadrature points.
+
+    This is the L2 projection onto P0 restricted to an element, ``(∫_K expr dx) / (∫_K dx)``, and it is
+    what the locking-free strain measures are written with: B-bar replaces the volumetric strain by its
+    cell mean, F-bar does the same to ``det F``. See :func:`jno.np.cellwise`.
+
+    It is **weighted**, not a plain mean over quadrature points. The two agree only when the rule's
+    weights are equal — false for higher-degree simplex rules, and false on curved or tensor-product
+    cells where the measure varies within the cell.
+
+    The reduction is over the quadrature axis of a *single* cell: the element kernel is a function of one
+    cell index, so it cannot average across cells.
+    """
+
+    def __init__(self, target: "Placeholder"):
+        target = target._expr if hasattr(target, "_expr") else target
+        if not isinstance(target, Placeholder):
+            raise TypeError(f"jno.np.cellwise: expected a trace expression, got {type(target).__name__}.")
+        if contains_integral(target):
+            raise ValueError(
+                "jno.np.cellwise: the projected expression contains an Integral. `cellwise` is a "
+                "PER-CELL projection of a pointwise quantity — an already-reduced target has no "
+                "quadrature axis left to average over. Project the integrand, then integrate."
+            )
+        self.target = target
+        self.value_shape = tuple(getattr(target, "value_shape", ()))
+        _propagate_weak(self, target)
+
+    def __repr__(self):
+        return f"Cellwise({self.target})"
+
+
+def contains_cellwise(expr) -> bool:
+    """True if ``expr`` contains a :class:`Cellwise` per-cell projection anywhere."""
+    seen: set = set()
+
+    def walk(node) -> bool:
+        if not isinstance(node, Placeholder) or id(node) in seen:
+            return False
+        seen.add(id(node))
+        if isinstance(node, Cellwise):
+            return True
+        for _kind, _attr, val in _iter_placeholder_children(node):
+            if isinstance(val, Placeholder):
+                if walk(val):
+                    return True
+            else:
+                if any(walk(c) for c in val if isinstance(c, Placeholder)):
+                    return True
+        return False
+
+    return walk(expr)
 
 
 def contains_integral(expr) -> bool:
@@ -3642,7 +3714,8 @@ class FemLinearSystem:
         ``solve_fn`` if you hit it on GPU.)
 
         ``periodic`` (a periodic-reduction dict) reduces the system *per call*, after ``A(θ), b(θ)`` are
-        re-formed: ``u = P · solve_fn(PᵀA(θ)P, Pᵀb(θ))``. The reduction must run here (not statically on
+        re-formed: ``u = P · solve_fn(PᵀA(θ)P, Pᵀb(θ))``, and re-imposes the prescribed rows the
+        congruence destroys (:func:`impose_reduced_dirichlet`). The reduction must run here (not statically on
         ``self.A``) because ``operator_fn``/``rhs_fn`` re-evaluate the operator on every ``θ`` -- a static
         reduction would be silently re-overwritten. The reduction stays sparse (BCOO triplet-remap), so
         ``∂u/∂θ`` still flows through ``solve_fn`` on the reduced operator.
@@ -3659,11 +3732,20 @@ class FemLinearSystem:
             A, b = self.evaluate(dict(zip(names, values)))
             b = jnp.asarray(b).reshape(-1)
             if periodic is not None:
-                from ..utils.solver.fem_utils import prolong_periodic, reduce_matrix_periodic, reduce_vector_periodic
+                from ..utils.solver.fem_utils import (
+                    impose_reduced_dirichlet,
+                    prolong_periodic,
+                    reduce_matrix_periodic,
+                    reduce_vector_periodic,
+                )
 
                 A = reduce_matrix_periodic(periodic, A)  # PᵀA(θ)P (stays BCOO when A is BCOO)
                 b = reduce_vector_periodic(periodic, b)  # Pᵀb(θ)
                 A = A if hasattr(A, "todense") else jnp.asarray(A)
+                # `Pᵀ` sums an eliminated DOF's equation into the rows it ties to, destroying the unit
+                # row of a prescribed DOF that is a tie target. Re-imposed per θ, because the operator
+                # is re-formed per θ -- doing it once on `self.A` would be overwritten by the next call.
+                A, b = impose_reduced_dirichlet(periodic, A, b)
                 return prolong_periodic(periodic, solve_fn(A, b))
             # keep a BCOO ``A`` sparse for the sparse solver (only coerce a plain dense operator)
             A = A if hasattr(A, "todense") else jnp.asarray(A)
@@ -4039,38 +4121,90 @@ class TrialFunction(_FieldComponentIndex, Placeholder):
         dom = domain
         if not hasattr(dom, "context") or not hasattr(dom, "_boundary_regions"):
             raise TypeError(f"u.gap: `domain=` must be a jno domain, got {type(dom).__name__}.")
-        breg = getattr(dom, "_boundary_regions", {}) or {}
-        for tag in (secondary, main):
-            if tag not in breg:
-                raise ValueError(
-                    f"u.gap: {tag!r} is not a boundary region on this domain. Known: {sorted(breg)}. "
-                    "Tag each side of the interface first -- a non-conforming Shape.regions names them "
-                    "'a|b.a' / 'a|b.b' automatically."
-                )
-        if secondary == main:
-            raise ValueError("u.gap: the secondary and main faces must be different regions.")
-        _dim = int(getattr(dom, "dimension", 0) or 0)
-        if self.value_shape != (_dim,):
-            raise ValueError(
-                f"u.gap: a normal gap `n . (u_s - u_m)` needs a vector field with one component per "
-                f"dimension, but this field has value_shape={self.value_shape} on a {_dim}-D domain. "
-                f"Contact is a vector concept -- build the field with fem_symbols(value_shape=({_dim},))."
-            )
-
+        self._register_contact_pair(secondary, main, dom, who="u.gap")
         key = f"gap_{secondary}"
-        pairs = dom.__dict__.setdefault("_contact_pairs", {})
-        prev = pairs.get(key)
-        if prev is not None and prev[:2] != (secondary, main):
-            raise ValueError(
-                f"u.gap: {secondary!r} is already the secondary face of a gap against {prev[1]!r}; a face "
-                "carries at most one gap. Use a distinct secondary tag for the second pair."
-            )
-        pairs[key] = (secondary, main, self.field_key)
         if key not in dom.context:  # placeholder so the Variable constructs; assembly packs the real g
             import numpy as _np
 
             dom.context[key] = _np.zeros((1, 1))
         return Variable(tag=key, dim=[0, 1], domain=dom, axis="spatial")
+
+    def _register_contact_pair(self, secondary, main, dom, *, who):
+        """Validate an interface and record the ``(secondary, main)`` pairing assembly reads.
+
+        Shared by :meth:`gap` and :meth:`slide` so both resolve to the SAME entry: the normal gap and
+        the tangential slide are two reads of one relative displacement through one mortar projection.
+        A second entry would also be ambiguous downstream -- the tangent's block geometry looks the pair
+        up by secondary region and takes the first match."""
+        breg = getattr(dom, "_boundary_regions", {}) or {}
+        for tag in (secondary, main):
+            if tag not in breg:
+                raise ValueError(
+                    f"{who}: {tag!r} is not a boundary region on this domain. Known: {sorted(breg)}. "
+                    "Tag each side of the interface first -- a non-conforming Shape.regions names them "
+                    "'a|b.a' / 'a|b.b' automatically."
+                )
+        if secondary == main:
+            raise ValueError(f"{who}: the secondary and main faces must be different regions.")
+        _dim = int(getattr(dom, "dimension", 0) or 0)
+        if self.value_shape != (_dim,):
+            raise ValueError(
+                f"{who}: a contact interface needs a vector field with one component per dimension, but "
+                f"this field has value_shape={self.value_shape} on a {_dim}-D domain. Contact is a vector "
+                f"concept -- build the field with fem_symbols(value_shape=({_dim},))."
+            )
+        key = f"gap_{secondary}"
+        pairs = dom.__dict__.setdefault("_contact_pairs", {})
+        prev = pairs.get(key)
+        if prev is not None and prev[:2] != (secondary, main):
+            raise ValueError(
+                f"{who}: {secondary!r} is already the secondary face of a contact pair against "
+                f"{prev[1]!r}; a face carries at most one. Use a distinct secondary tag for the second pair."
+            )
+        pairs[key] = (secondary, main, self.field_key)
+        return _dim
+
+    def slide(self, secondary: str, main: str, *, domain):
+        """Tangential **relative displacement** across a contact interface — the sibling of :meth:`gap`.
+
+        ``s = D - (n . D) n``  with  ``D = u_secondary - u_main . Phi``, at the same quadrature points,
+        through the same mortar projection ``Phi`` as the gap. Where ``gap`` returns the scalar normal
+        component, ``slide`` returns the **vector** that is left in the tangent plane, in global
+        coordinates (not an ``(t1, t2)`` local frame — a consistent tangent basis is discontinuous on a
+        curved surface, and the global form composes with ``n`` and ``inner`` like the rest of the
+        vocabulary).
+
+        Both come from one packed relative displacement, so they cannot disagree about the geometry.
+
+        This is what lets **Coulomb friction be a formula** — the plasticity return map, read on a
+        surface, with the accumulated slip as an ordinary surface state::
+
+            n  = d.variable(sec, normals=True)
+            g  = u.gap(sec, main, domain=d)
+            st = u.slide(sec, main, domain=d)
+            sl, _ = d.fem_symbols(value_shape=(3,))            # the slip STATE
+            p    = mx(0.0, -c_n * g)                           # normal pressure
+            t_tr = c_t * (st - sl.i(-1))                       # elastic trial traction
+            dgam = mx(norm(t_tr) - mu_f * p, 0.0) / c_t        # the return map
+            fem = jno.fem([...,
+                           p * inner(n, phi, 1) + inner(t_tr * (1 - dgam*c_t/norm(t_tr)), phi, 1),
+                           sl.evolves(sl.i(-1) + dgam * t_tr / norm(t_tr))])
+
+        Like :meth:`gap` (and ``domain.cell_size``) this is a placeholder symbol whose real
+        per-quadrature-point value is packed during assembly; an unpacked one raises rather than reading
+        as zero. Same scope as the gap: **small sliding** — the pairing and the projection are frozen at
+        build time, so a configuration that slides far must be rebuilt.
+        """
+        dom = domain
+        if not hasattr(dom, "context") or not hasattr(dom, "_boundary_regions"):
+            raise TypeError(f"u.slide: `domain=` must be a jno domain, got {type(dom).__name__}.")
+        _dim = self._register_contact_pair(secondary, main, dom, who="u.slide")
+        key = f"slide_{secondary}"
+        if key not in dom.context:  # placeholder so the Variable constructs; assembly packs the real s
+            import numpy as _np
+
+            dom.context[key] = _np.zeros((1, _dim))
+        return Variable(tag=key, dim=[0, _dim], domain=dom, axis="spatial")
 
     def pin(self, value=0.0, mean=False):
         """Gauge-fix this field's constant null space by pinning one arbitrary DOF to ``value``.

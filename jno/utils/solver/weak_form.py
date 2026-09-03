@@ -598,7 +598,11 @@ def _is_obviously_nonlinear_in_unknown(domain, expr):
     # on the unknown -- a contact form would look LINEAR and be routed to the assembled path, whose
     # per-element tangent cannot express the gap's coupling to the main body at all. The dependence
     # is structural (a gap is by definition a function of the displacement), so mark it here.
-    if isinstance(expr, Variable) and isinstance(getattr(expr, "tag", None), str) and expr.tag.startswith("gap_"):
+    if (
+        isinstance(expr, Variable)
+        and isinstance(getattr(expr, "tag", None), str)
+        and expr.tag.startswith(("gap_", "slide_"))
+    ):
         return True
 
     # `diff(psi, F)` is a derivative of the unknown's energy, so it is nonlinear in the unknown whenever

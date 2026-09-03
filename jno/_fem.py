@@ -688,10 +688,13 @@ def _region_and_support(constraint: Any, domain: Any) -> Tuple[str, str]:
         # to its region, not a separate one -- so `g*(v·n)` on a boundary is a single-region term.
         if tag.startswith("n_") and tag[2:] in _bregions:
             tag = tag[2:]
-        # a contact-gap Variable `gap_<secondary>` (from u.gap(secondary, main)) likewise belongs to the secondary
-        # face, not a region of its own -- so `p(g) * (n·v)` on that face stays a single-region term.
+        # a contact Variable `gap_<secondary>` / `slide_<secondary>` (from u.gap / u.slide) likewise belongs
+        # to the secondary face, not a region of its own -- so `p(g) * (n·v)` on that face stays a
+        # single-region term.
         if tag.startswith("gap_") and tag[4:] in _bregions:
             tag = tag[4:]
+        if tag.startswith("slide_") and tag[6:] in _bregions:
+            tag = tag[6:]
         return _normalize_quad_tag(tag, _bregions)
 
     def _effective_tag(v) -> str:
@@ -794,7 +797,7 @@ def _retag_coords_for_quadrature(constraint: Any, support: str, region_id: str) 
         if (
             isinstance(v.tag, str)
             and v.tag not in ("fem_gauss", "cell_size")
-            and not v.tag.startswith(("gauss_", "n_", "gap_"))
+            and not v.tag.startswith(("gauss_", "n_", "gap_", "slide_"))
         ):
             # Remember the region before rebinding to the quadrature pool. The retag must persist for
             # lazy operators (nonlinear/transient re-read `.tag` at call time), but the SAME coord object
@@ -1972,6 +1975,30 @@ class FEM:
             # (complex) recovered-gradient gap; only the anisotropic Hessian metric is real-only (guarded in
             # run_adaptive_solve).
             return run_adaptive_solve(self, adapt, solve_fn=solve_fn, **kwargs)
+        # ---- ARC-LENGTH refuses the drivers it cannot serve, BEFORE the slots are composed (a composed
+        # solve_fn no longer says which spec it came from). Both refusals are correctness, not scope:
+        # a staggered sweep freezes the load factor, which IS load control, and load control has no
+        # equilibrium past the fold arc-length exists to pass. ----
+        if getattr(tau, "name", None) == "arclength":
+            _nl_name = getattr(nonlinear, "name", None)
+            if _nl_name == "staggered":
+                raise NotImplementedError(
+                    "fem.solve(tau=jno.solve.arclength(...), nonlinear=jno.solve.staggered(...)) is not "
+                    "supported. Alternate minimization sweeps one field at a time with the others held "
+                    "fixed, and holding the load factor fixed while solving for u IS load control — which "
+                    "has no equilibrium past the limit point, the exact configuration arc-length exists to "
+                    "get through. Giving the load factor its own 1x1 block does not help; that is a "
+                    "Gauss-Seidel update that stalls precisely at the fold. Use "
+                    "nonlinear=jno.solve.newton(line_search=True)."
+                )
+            if getattr(nonlinear, "direct", False):
+                raise NotImplementedError(
+                    "fem.solve(tau=jno.solve.arclength(...), nonlinear=jno.solve.newton(direct=True)) is "
+                    "not supported: the bordered (N+1) tangent is not assembled — arc-length presents the "
+                    "bordered system to a MATRIX-FREE Newton-Krylov, whose jax.linearize builds the border "
+                    "row and column for free. Drop direct=True."
+                )
+
         # `tau=` sizes the load-path steps; it configures the MARCH, not the per-step solve, so it is
         # consumed below rather than composed into `solve_fn` (and on its own it must not force the
         # composition, which would replace the operator's default driver with an explicit equivalent).
@@ -2046,10 +2073,19 @@ class FEM:
                 # The reduction stays sparse (BCOO triplet-remap) -- it never materialises the dense
                 # full operator, so it is GPU-able at large N. The *_periodic helpers reduce block-wise
                 # per field, so this serves coupled problems too.
-                from .utils.solver.fem_utils import prolong_periodic, reduce_matrix_periodic, reduce_vector_periodic
+                from .utils.solver.fem_utils import (
+                    impose_reduced_dirichlet,
+                    prolong_periodic,
+                    reduce_matrix_periodic,
+                    reduce_vector_periodic,
+                )
 
                 A_red = reduce_matrix_periodic(_per, A)
                 b_red = reduce_vector_periodic(_per, b)
+                # `P^T` sums an eliminated DOF's equation into the rows it ties to, destroying the
+                # unit row of a prescribed DOF that is a tie target. Put those rows back, in the
+                # reduced space -- the one helper every reduced solve path shares.
+                A_red, b_red = impose_reduced_dirichlet(_per, A_red, b_red)
                 if solve_fn is not None:
                     u_red = solve_fn(A_red, b_red)  # user solver receives the (BCOO) reduced operator
                 elif hasattr(A_red, "todense"):
@@ -2150,13 +2186,19 @@ class FEM:
                     def red_jac(ur):  # noqa: F811  -- PᵀJP at the prolonged iterate
                         return reduce_matrix_periodic(periodic, jacobian(prolong_periodic(periodic, ur)))
 
-                ur = _base(
-                    lambda ur: reduce_vector_periodic(
+                def _r_free_red(ur):
+                    return reduce_vector_periodic(
                         periodic, jnp.asarray(residual_fn(prolong_periodic(periodic, ur))).reshape(-1)
-                    ),
-                    restrict_state_periodic(periodic, y0),
-                    red_jac,
-                )
+                    )
+
+                # `Pᵀ` sums an eliminated DOF's equation into the rows it ties to, so a prescribed DOF
+                # that is a tie target loses the row holding its value. Re-impose in the reduced space --
+                # the same helper the matrix paths use, in its residual form.
+                from .utils.solver.fem_utils import wrap_reduced_dirichlet
+
+                _r_red, red_jac = wrap_reduced_dirichlet(periodic, _r_free_red, red_jac)
+
+                ur = _base(_r_red, restrict_state_periodic(periodic, y0), red_jac)
                 return prolong_periodic(periodic, ur)
 
             # Propagate the flag so the operator hands `_reduced` the full tangent to reduce.
@@ -3163,7 +3205,9 @@ def _assembly_cells(prob: Any) -> Tuple[Optional[np.ndarray], int]:
     return np.asarray(am.cells, dtype=int), order
 
 
-def _build_periodic_reduction(domain: Any, ties: List[Any], points: Any, cells: Any, ele_order: int, vec: int) -> dict:
+def _build_periodic_reduction(
+    domain: Any, ties: List[Any], points: Any, cells: Any, ele_order: int, vec: int, exclude_dofs: Any = None
+) -> dict:
     """Build the prolongation ``P`` for the collected ties on the **assembly** mesh (``points`` +
     ``cells``; ``cells=None`` for the native 1D route falls back to flat-chain facets)."""
     from .utils.solver.fem_utils import build_periodic_prolongation
@@ -3236,7 +3280,9 @@ def _build_periodic_reduction(domain: Any, ties: List[Any], points: Any, cells: 
             if (ff := _chain_facets(points, faces.get(t, ()))) is not None
         }
 
-    return build_periodic_prolongation(points, pairs, faces, vec=vec, facets=facets, phases=phases)
+    return build_periodic_prolongation(
+        points, pairs, faces, vec=vec, facets=facets, phases=phases, exclude_dofs=exclude_dofs
+    )
 
 
 def _build_periodic_reduction_n1e(domain: Any, ties: List[Any], offsets: Any) -> dict:
@@ -3803,6 +3849,81 @@ def _fuse_complex_steady(fem_obj: "FEM") -> "FEM":
     return fem_obj
 
 
+def _prescribed_dofs(domain: Any) -> Tuple[list, list]:
+    """``(constant (dof, value) pairs, time-varying dofs)`` for this assembly.
+
+    Snapshotted from the domain because ``_fem_native_dirichlet_pairs`` lives on the SHARED domain and a
+    later assembly overwrites it (``FEM.eigs`` snapshots-and-restores for the same reason). Both halves
+    drive the same two things -- which DOFs a tie must not eliminate, and which reduced rows the
+    congruence then has to have put back -- so they are read in one place rather than per call site.
+    """
+    pairs = list(getattr(domain, "_fem_native_dirichlet_pairs", None) or [])
+    tv = [int(d) for e in (getattr(domain, "_fem_native_dirichlet_tv", None) or []) for d in np.asarray(e[0]).reshape(-1)]
+    return pairs, tv
+
+
+def _annotate_reduced_dirichlet(periodic: Any, pairs: list, tv: list) -> Any:
+    """Record on ``periodic`` which prescribed rows the congruence ``PᵀAP`` destroys, and refuse the ones
+    the restoration cannot express.
+
+    ``pairs``/``tv`` are passed in rather than re-read from the domain, because the caller snapshotted
+    them BEFORE building the reduction and the stash they came from is shared and overwritable.
+
+    **Every** periodic reduction is annotated here, whatever mode built it. The transient path used to
+    build its reduction through its own call and skip this, so a tied transient with a prescribed value
+    on the interface marched a boundary condition that had silently stopped being imposed (measured on
+    the mortar patch test: 4.2e-04, against 0.0 conforming) -- the same defect the steady path had, kept
+    alive by a second construction site.
+    """
+    if periodic is None:
+        return periodic
+    from .utils.solver.fem_utils import reduced_dirichlet_pairs
+
+    if not periodic.get("dirichlet_reduced"):
+        red = reduced_dirichlet_pairs(periodic, pairs)
+        if red:
+            periodic["dirichlet_reduced"] = red
+    # The restoration carries a CONSTANT value into the reduced row. A time-varying value is written by
+    # the marcher into the FULL row every step, and `Pᵀ` destroys that row just the same -- with no
+    # constant to put back. Refuse rather than march a condition that stopped being imposed.
+    if tv and reduced_dirichlet_pairs(periodic, [(d, 0.0) for d in tv]):
+        raise NotImplementedError(
+            "jno.fem: a node carrying a TIME-VARYING essential value sits on a non-matching tied/periodic "
+            "interface, where the tie reduction destroys the row that holds it. The constant-value "
+            "restoration cannot be used, because the held value changes every step. Either make the "
+            "interface conforming (`jno.Shape.regions(..., conforming=True)`), or move the time-varying "
+            "condition off the tied face."
+        )
+    return periodic
+
+
+def _duplicate_reduced_dirichlet(periodic: dict, n_red: int) -> list:
+    """``dirichlet_reduced`` carried onto a 2n real-equivalent state, for the transforms below.
+
+    Both stacked forms put the reduced space at ``r`` in the first leg and ``n_red + r`` in the second,
+    so one prescribed row becomes two — and the second leg's value is ``0`` in **both** cases, for
+    reasons that happen to coincide rather than by accident:
+
+    * complex (``x = [x_r; x_i]``): the value is ``Im g``, and a prescribed value carried through the
+      real assembly is real;
+    * second order (``y = [u; v]``): the assembly imposes ``u[d] = g`` on the displacement rows and
+      ``v[d] = 0`` on the velocity rows (``fem_1d._assemble_1d_multifield_second_order``), which is the
+      right velocity for a constant ``g``.
+
+    Writing it as ``(Re g, Im g)`` covers both without branching. Dropping it instead — which is what
+    these transforms did — leaves the dict with no record that any row needs re-imposing, so
+    :func:`impose_reduced_dirichlet` becomes a silent no-op on every complex and second-order tie.
+    """
+    pairs = periodic.get("dirichlet_reduced")
+    if not pairs:
+        return []
+    out = []
+    for r, g in pairs:
+        gc = complex(g)
+        out += [(int(r), float(gc.real)), (int(n_red) + int(r), float(gc.imag))]
+    return out
+
+
 def _duplicate_periodic(periodic: dict) -> dict:
     """``blkdiag(P, P)`` — the periodic reduction for a state that is TWO stacked copies of the field.
 
@@ -3834,6 +3955,7 @@ def _duplicate_periodic(periodic: dict) -> dict:
         "blocks": list(b) + list(b),
         "off_full": np.concatenate([of[:-1], of + nf]),
         "off_red": np.concatenate([orr[:-1], orr + nr]),
+        "dirichlet_reduced": _duplicate_reduced_dirichlet(periodic, nr),
     }
 
 
@@ -3909,6 +4031,7 @@ def _bloch_realify_periodic(periodic: dict) -> dict:
         "vec": 1,  # kept_nodes is already DOF-level
         "is_selection": False,  # a secondary row ties to two mains (Re, Im) — the weighted remap path
         "is_bloch": False,  # B(P) is REAL: no conj, no complex branch downstream
+        "dirichlet_reduced": _duplicate_reduced_dirichlet(periodic, m),
     }
 
 
@@ -3929,10 +4052,12 @@ def _reduce_transient_block_periodic(block: Any, periodic: dict) -> Any:
 
     from .utils.solver.fem_utils import (
         _periodic_blocks,
+        impose_reduced_dirichlet,
         prolong_periodic,
         reduce_matrix_periodic,
         reduce_vector_periodic,
         restrict_state_periodic,
+        wrap_reduced_dirichlet,
     )
 
     # A block whose state is TWO stacked copies of the field reduces by P on each half; see
@@ -3975,6 +4100,11 @@ def _reduce_transient_block_periodic(block: Any, periodic: dict) -> Any:
             def jac_red(u_red, t, args=None, _p=periodic, _j=_jac):
                 return reduce_matrix_periodic(_p, _j(prolong_periodic(_p, u_red), t, args))
 
+        # `Pᵀ` sums an eliminated DOF's equation into the rows it ties to, so a prescribed DOF that is a
+        # tie target loses the row holding its value -- in the reduced residual exactly as in the reduced
+        # matrix. Same pairs, same helper as every other reduced path.
+        residual_red, jac_red = wrap_reduced_dirichlet(periodic, residual_red, jac_red)
+
         return dataclasses.replace(
             block,
             mass=mass_red,
@@ -3997,14 +4127,45 @@ def _reduce_transient_block_periodic(block: Any, periodic: dict) -> Any:
         def f_red(t, args=None, _p=periodic, _f=block.forcing_vector_fn):
             return reduce_vector_periodic(_p, jnp.asarray(_f(t, args)).reshape(-1))
 
+    M_red = reduce_matrix_periodic(periodic, block.M)
+    A_red = reduce_matrix_periodic(periodic, block.A) if block.A is not None else None
+    c_red = (
+        reduce_vector_periodic(periodic, jnp.asarray(block.affine_bias).reshape(-1))
+        if block.affine_bias is not None
+        else None
+    )
+    if periodic.get("dirichlet_reduced"):
+        # The reduction destroyed the prescribed rows of BOTH operators: `PᵀAP` loses the unit row and
+        # `PᵀMP` refills the mass row that was zeroed so the DOF carries no time derivative. Repair the
+        # semidiscrete triple together -- the symmetric elimination of `A` lifts into `c`, so they cannot
+        # be repaired separately.
+        if A_red is None or c_red is None:
+            raise NotImplementedError(
+                "jno.fem: a prescribed DOF sits on a non-matching tied/periodic interface of a transient "
+                "whose operator or load is rebuilt every step (a runtime-parametric march). The tie "
+                "reduction destroys the row holding the prescribed value and the constant-payload repair "
+                "does not reach a per-step operator. Make the interface conforming "
+                "(`jno.Shape.regions(..., conforming=True)`), or move the condition off the tied face."
+            )
+        M_red, A_red, c_red = impose_reduced_dirichlet(periodic, A_red, c_red, mass=M_red)
+        if f_red is not None:
+            # The load carries the prescribed value in `c`; the per-step forcing must stay zero on those
+            # rows, and `Pᵀ` has just summed free-row source terms into them.
+            _fmask = (
+                jnp.ones((n_red,), dtype=jnp.asarray(c_red).dtype)
+                .at[jnp.asarray([int(d) for d, _v in periodic["dirichlet_reduced"]], dtype=jnp.int32)]
+                .set(0.0)
+            )
+
+            def f_red(t, args=None, _inner=f_red, _m=_fmask):  # noqa: F811
+                return _m * jnp.asarray(_inner(t, args)).reshape(-1)
+
     return dataclasses.replace(
         block,
-        M=reduce_matrix_periodic(periodic, block.M),
-        A=reduce_matrix_periodic(periodic, block.A) if block.A is not None else None,
+        M=M_red,
+        A=A_red,
         operator_fn=op_red,
-        affine_bias=reduce_vector_periodic(periodic, jnp.asarray(block.affine_bias).reshape(-1))
-        if block.affine_bias is not None
-        else None,
+        affine_bias=c_red,
         forcing_vector_fn=f_red,
         state0=restrict_state_periodic(periodic, jnp.asarray(block.state0).reshape(-1)),
         prolongation=prol,
@@ -4723,6 +4884,10 @@ def _fem_impl(
             cells = getattr(domain, "_fem_native_assembly_cells", None)
             ele_order = int(getattr(domain, "_fem_native_assembly_order", 1))
         _nonnodal_topo = getattr(domain, "_fem_nonnodal_topology", None)
+        # Prescribed DOFs, snapshotted before any later assembly can overwrite the domain's stash.
+        # Empty unless this form has essential conditions; drives both the elimination exclusion and
+        # the post-reduction row restoration below.
+        _dpairs, _tvdofs = _prescribed_dofs(domain)
         if slip_bcs:
             # Exact slip elimination. Built in the periodic dict shape so the whole reduce / solve /
             # prolong / restrict path below is reused with no new branch.
@@ -4738,7 +4903,20 @@ def _fem_impl(
                 domain, periodic_ties, fem_obj.points, cells, ele_order, fem_obj.offsets
             )
         else:
-            periodic = _build_periodic_reduction(domain, periodic_ties, fem_obj.points, cells, ele_order, vec or 1)
+            # A prescribed DOF must not be eliminated by the tie, and a prescribed DOF that the tie
+            # SUMS INTO must have its row re-imposed after the reduction. Both need the Dirichlet DOFs,
+            # snapshotted here: `_fem_native_dirichlet_pairs` lives on the shared domain and a later
+            # assembly overwrites it (see FEM.eigs, which snapshots-and-restores for the same reason).
+            periodic = _build_periodic_reduction(
+                domain,
+                periodic_ties,
+                fem_obj.points,
+                cells,
+                ele_order,
+                vec or 1,
+                exclude_dofs=[int(d) for d, _g in _dpairs] + _tvdofs,
+            )
+        periodic = _annotate_reduced_dirichlet(periodic, _dpairs, _tvdofs)
         if periodic.get("is_bloch") and fem_obj._mode in ("linear", "nonlinear"):
             # A REAL form with a Bloch tie: the complex phase makes the field complex anyway, and the
             # real path would reduce with the bilinear Pᵀ A P — which for a complex P is NOT a Galerkin
@@ -5237,11 +5415,13 @@ def _fem_impl(
     # below. ----
     from .utils.solver.parametric_helpers import _contains_runtime_parameter as _crp
 
-    # Native periodic is wired for the steady, scalar single-field case that ``_finalize`` reduces --
-    # both non-parametric (reduced eagerly at solve) and runtime-parametric (reduced per-call inside
-    # FemLinearSystem.solve, after A(θ) is re-formed). Vector and the transient route pre-build the
-    # reduction in their own branches, so they fall through here.
-    _native_periodic_ok = not periodic_ties or (not is_transient and (vec or 1) == 1)
+    # Native periodic is wired for the STEADY single-field case that ``_finalize`` reduces -- scalar or
+    # vector, both non-parametric (reduced eagerly at solve) and runtime-parametric (reduced per-call
+    # inside FemLinearSystem.solve, after A(θ) is re-formed). A vector tie needs no new weight math: the
+    # mortar rows are node-pair weights (`_mortar_rows_2d/3d`) and `prolongation_from_ties` expands them
+    # by `kron(P_node, I_vec)`, which `_finalize` already asks for with `vec or 1`. Only the TRANSIENT
+    # route pre-builds its reduction in its own branch, so it still falls through here.
+    _native_periodic_ok = not periodic_ties or not is_transient
     if (
         not is_vpinn
         and _native_lagrange_ok(domain, constraints, weak_bares, periodic_ties)
@@ -5490,6 +5670,7 @@ def _fem_impl(
             raise NotImplementedError(
                 f"jno.fem: native periodic transient expected a transient block but assembled mode={mode!r}."
             )
+        _tdp, _ttv = _prescribed_dofs(domain)
         periodic = _build_periodic_reduction(
             domain,
             periodic_ties,
@@ -5497,8 +5678,9 @@ def _fem_impl(
             domain._fem_native_assembly_cells,
             int(getattr(domain, "_fem_native_assembly_order", 1)),
             1,
+            exclude_dofs=[int(d) for d, _g in _tdp] + _ttv,
         )
-        reduced = _reduce_transient_block_periodic(op, periodic)
+        reduced = _reduce_transient_block_periodic(op, _annotate_reduced_dirichlet(periodic, _tdp, _ttv))
         fem_obj = FEM(domain=domain, op=reduced, classification=classification, mode="transient", offsets=offs)
         # The time block is already reduced and carries P (transient solve() uses the block directly);
         # expose the reduction on the FEM too, mirroring the steady periodic path (P / n_red / n_full).
@@ -5561,10 +5743,11 @@ def _fem_impl(
     _nonlinear = any(_nlin(domain, b) for b in weak_bares)
     if periodic_ties:
         raise NotImplementedError(
-            "jno.fem: a periodic tie is supported natively on a steady or transient SCALAR single field "
-            f"(linear, with optional runtime parameters for the transient case). This form has "
-            f"vec={vec or 1}, nonlinear={_nonlinear}, parametric+steady={_parametric and not is_transient}. "
-            "Write the periodic field as a scalar, linearize it, or drop the periodic tie."
+            "jno.fem: a periodic tie on a TRANSIENT form is supported on a scalar single field only "
+            f"(the transient route pre-builds its own reduction). This form has vec={vec or 1}, "
+            f"nonlinear={_nonlinear}, parametric+steady={_parametric and not is_transient}. A STEADY "
+            "vector tie is supported — drop the time derivative, write the field as a scalar, or drop "
+            "the periodic tie."
         )
     if is_transient and any(_is_temporal_value_node(vnode) for *_rest, vnode in dirichlet_raw):
         raise NotImplementedError(
