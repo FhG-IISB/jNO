@@ -38,28 +38,35 @@ kernel evaluations plus one small pseudo-inverse, so the whole apply differentia
 the element POSITIONS -- which `pair_matrix` already does, deliberately (see the NaN guard there),
 and which an inverse design that moves metal depends on.
 
-**STATUS: does not yet compress a PEEC bar lattice. Read this before using it.**
+**STATUS: correct and verified, but NOT yet worth switching on. Measured.**
 
-The compression ratios first recorded here -- 2.88x at 1,540 elements rising to 14.45x at 16,705 --
-were measured on blocks that were NUMERICALLY WRONG, and are withdrawn. ACA silently failed on them
-and the storage of a wrong block means nothing. With the failures now detected and rejected
-(see `_aca`), a bar lattice compresses **1.00x**: every block is stored densely.
+Compression of a bar lattice is real once the elements are partitioned by moment direction (below):
+3.27x at 1,540 elements, 4.38x at 2,782, 5.76x at 4,589, accurate to 8.2e-09 at ``tol=1e-8``. An
+earlier claim of 2.88x rising to 14.45x is **withdrawn** -- it measured blocks ACA had silently got
+wrong, which the check in `_aca` now rejects.
 
-The cause is structural, and it is specific to this operator. `mom_a . mom_b` vanishes *exactly*
-between perpendicular bar families, so any block spanning both has a 2x2 structure with zero
-off-diagonal parts. ACA's pivot chain stays inside one part, drives its residual small, stops, and
-leaves the rest untouched. Clusters here are geometric and x- and y-bars are interleaved in space, so
-essentially every block spans both families and essentially every block fails.
+But a whole welded solve is SLOWER with it, at every size tested, and uses more memory:
 
-**The fix, not yet implemented:** build one hierarchical operator PER MOMENT DIRECTION and skip the
-cross-family blocks entirely, since they are exactly zero. Within a family every moment is parallel,
-the structural zeros are gone, and ACA has nothing to trip over. That is the same block-diagonal
-structure `lattice_apply` already exploits and `bar_filaments` already documents -- "a bar's current
-runs along ONE axis, and mom_i . mom_j vanishes between perpendicular bars, so the partial-inductance
-operator is block diagonal by direction".
+    elements        764     1,764    3,276
+    exact          2.4 s    3.1 s    3.9 s     1.93 / 3.42 / 4.89 GB peak
+    hierarchical   7.5 s   14.8 s   20.0 s     2.48 / 3.97 / 5.51 GB peak
 
-Until then this module is correct -- verified against `pair_matrix` to round-off on a real lattice --
-and offers no speedup, so `jno.solve.hierarchical(...)` should not be switched on.
+The answers agree to the last digit, so this is economics, not correctness. Two reasons, both
+structural rather than sloppy:
+
+* **A dense matvec is one BLAS call; a compressed one is hundreds of small matmuls.** Measured at
+  1,540 elements: 0.018 s dense against 0.186 s compressed -- 10x slower per apply, even though the
+  compressed form stores 3x less. Removing redundancy does not pay until ``O(N^2)`` genuinely hurts,
+  and at a few thousand elements it does not: a 1,540-square matvec is 2.4 Mflop.
+* **The operator is not the memory bottleneck at these sizes.** At 3,276 elements the dense matrix is
+  86 MB against a 4.9 GB peak, so compressing it 5x is invisible. The recorded pathology this was
+  aimed at -- 2.7 GB allocated to produce a 46 MB block -- is at 12,000 elements, beyond what has
+  been measured here.
+
+**So: do not enable `jno.solve.hierarchical(...)` on the strength of the compression ratio.** Where
+the crossover is has not been established, and the honest reading is that memory pays before time and
+neither pays yet. What is established is that the machinery is correct, that ACA's failures are
+caught rather than silently returned, and that the compression is genuine where it applies.
 
 **Scope limits, up front.** ACA is for *asymptotically smooth* kernels: ``1/r`` and its derivatives
 are fine, an oscillatory ``exp(ikr)/r`` at high ``kr`` is not, and this module makes no attempt to
