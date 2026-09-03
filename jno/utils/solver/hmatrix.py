@@ -85,6 +85,7 @@ larger N, not as a measured improvement.
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Callable, NamedTuple
 
 import jax
@@ -402,28 +403,102 @@ def build(
     )
 
 
+def _pad_stack(idx_lists, width, fill=0):
+    """Index lists of differing length into one ``(B, width)`` array, padded with `fill`."""
+    out = np.full((len(idx_lists), width), fill, dtype=np.int64)
+    for b, v in enumerate(idx_lists):
+        out[b, : len(v)] = v
+    return out
+
+
+@partial(jax.jit, static_argnums=(6,))
+def _blocks_chunk(P, M, Pb, Mb, R, C, g):
+    """One chunk of element-element sub-blocks. JITTED: eagerly, each intermediate here is a fresh
+    allocation XLA never gets to reuse, and the peak is the sum of them rather than the largest."""
+    # The separation by EXPANSION, |a-b|^2 = |a|^2 + |b|^2 - 2 a.b, which never forms the
+    # (b, m, n, nsub, nsub, 3) component tensor -- 11 GB at leaf 64. Splitting the sub-point axis to
+    # shrink the remaining (b, m, n, nsub, nsub) further was tried and is WORSE (0.90 GB / 7.6 s
+    # against 0.73 / 4.7): XLA fuses the single large einsum better than twelve accumulation steps.
+    A, Bp = P[R], Pb[C]
+    a2 = (A * A).sum(-1)
+    b2 = (Bp * Bp).sum(-1)
+    dot = jnp.einsum("bmpc,bnqc->bmnpq", A, Bp)
+    r2 = a2[:, :, None, :, None] + b2[:, None, :, None, :] - 2.0 * dot
+    mm = jnp.einsum("bmpc,bnqc->bmnpq", M[R], Mb[C])
+    return (mm * g(jnp.sqrt(jnp.clip(r2, 1e-300)))).sum((3, 4))
+
+
+@partial(jax.jit, static_argnums=(0,))
+def _replay_group(k, C, R, ipos, jpos):
+    """ACA's recursion at frozen pivots, for a whole rank group. JITTED for the same reason: the
+    per-step functional updates are buffer reuse under XLA and fresh allocations without it."""
+    Uc = jnp.zeros((C.shape[0], C.shape[1], k), C.dtype)
+    Vc = jnp.zeros((C.shape[0], k, R.shape[2]), C.dtype)
+    ar = jnp.arange(k)
+    for t in range(k):
+        past = (ar < t).astype(C.dtype)
+        urow = jnp.take_along_axis(Uc, ipos[:, t : t + 1, None], axis=1)[:, 0, :]
+        row = R[:, t, :] - jnp.einsum("bk,bkn->bn", urow * past, Vc)
+        vcol = jnp.take_along_axis(Vc, jpos[:, None, t : t + 1], axis=2)[:, :, 0]
+        col = C[:, :, t] - jnp.einsum("bk,bmk->bm", vcol * past, Uc)
+        piv = jnp.take_along_axis(row, jpos[:, t : t + 1], axis=1)
+        Uc = Uc.at[:, :, t].set(col)
+        Vc = Vc.at[:, t, :].set(row / piv)
+    return Uc, Vc
+
+
+def _batched_blocks(P, M, Pb, Mb, rows, cols, g, chunk=16):
+    """The exact element-element sub-blocks for a STACK of index pairs, in one jax pass.
+
+    ``rows`` is ``(B, m)`` and ``cols`` is ``(B, n)``, both zero-padded; padded entries are masked to
+    zero afterwards so they contribute nothing.
+
+    Two things make this affordable. The separation is taken by EXPANSION, ``|a-b|^2 = |a|^2 + |b|^2
+    - 2 a.b``, which avoids ever forming the ``(B, m, n, nsub, nsub, 3)`` component tensor -- that
+    alone is 11 GB at leaf 64 -- and blocks are processed in chunks so the peak is bounded by
+    ``chunk`` rather than by the block count.
+    """
+    # Every distinct ARRAY SHAPE compiles its own executable and jax keeps it, so a short final
+    # chunk or a per-group width doubles the compilation count for nothing. Padding the last chunk to
+    # full width means one compiled kernel per (width, depth) rather than one per call -- the padded
+    # rows index element 0 and are masked to zero by the caller, so they cost arithmetic and never
+    # correctness.
+    nb = rows.shape[0]
+    pad = (-nb) % chunk
+    if pad:
+        rows = np.concatenate([rows, np.zeros((pad, rows.shape[1]), rows.dtype)])
+        cols = np.concatenate([cols, np.zeros((pad, cols.shape[1]), cols.dtype)])
+    outs = []
+    for lo in range(0, rows.shape[0], chunk):
+        outs.append(_blocks_chunk(P, M, Pb, Mb, rows[lo : lo + chunk], cols[lo : lo + chunk], g))
+    return jnp.concatenate(outs, axis=0)[:nb]
+
+
 def materialize(h: HMatrix, pos, mom, self_g, g: Callable, scale=1.0, b=None, transpose=False):
     """``apply(x) -> K @ x`` in pure jax, rebuilding the block values from the frozen structure.
 
-    Differentiable in ``pos`` and ``mom``: every value here is a kernel evaluation at frozen indices,
-    and the only linear algebra is a small `pinv` per far block.
+    Differentiable in ``pos`` and ``mom``: every value here is a kernel evaluation at frozen indices.
+
+    **Everything is jax, and everything is batched.** The first version issued one small op per block
+    -- about a thousand of them -- and paid for it twice: ~76 ms of dispatch each while building, and
+    an unrolled graph of the same width when applying. Measured at 4,589 elements, that held 0.38 GB
+    to store 0.025 GB of values and added 0.55 GB more on the first apply, for an operator whose
+    DENSE form is 0.17 GB. Blocks are therefore padded and stacked, so the whole operator is a
+    handful of arrays and the apply is four `einsum`s regardless of how many blocks there are.
 
     ``b`` is ``(pos, mom)`` of the second element set for a rectangular operator, and must be given
-    exactly when the structure was built with one. ``self_g`` is then unused and may be ``None``:
-    two different parts have no diagonal to carry.
+    exactly when the structure was built with one. ``self_g`` is then unused and may be ``None``.
 
-    ``transpose`` gives ``K^T @ x`` from the SAME structure rather than a second build. A welded
-    network needs both directions of every cross block -- the coupling appears once in each part's
-    row -- and the skeleton transposes exactly: ``(U R)^T = R^T U^T``. Building twice would cost
-    twice and, worse, could choose different pivots for the two directions, so the operator would
-    stop being symmetric.
+    ``transpose`` gives ``K^T @ x`` from the SAME structure rather than a second build -- a welded
+    network needs both directions of every cross block, and building twice could choose different
+    pivots for the two, so the operator would stop being symmetric.
     """
 
-    def _resh(p, m, ne, nsub):
-        p, m = jnp.asarray(p), jnp.asarray(m)
-        if m.ndim == 1:
-            m = m[:, None]
-        return p.reshape(ne, nsub, 3), m.reshape(ne, nsub, -1)
+    def _resh(p_, m_, ne, nsub):
+        p_, m_ = jnp.asarray(p_), jnp.asarray(m_)
+        if m_.ndim == 1:
+            m_ = m_[:, None]
+        return p_.reshape(ne, nsub, 3), m_.reshape(ne, nsub, -1)
 
     if (b is None) != h.square:
         raise ValueError(
@@ -435,83 +510,77 @@ def materialize(h: HMatrix, pos, mom, self_g, g: Callable, scale=1.0, b=None, tr
     P, M = _resh(pos, mom, h.shape[0], h.nsub[0])
     Pb, Mb = (P, M) if h.square else _resh(b[0], b[1], h.shape[1], h.nsub[1])
 
-    # CONCRETE geometry evaluates the blocks in numpy; only a TRACED one needs jax.
-    #
-    # Not a micro-optimisation. There are three kernel evaluations per compressed block and one per
-    # dense block -- about a thousand small arrays on a 1,540-element network -- and issuing each as
-    # its own eager jax op costs ~76 ms of DISPATCH against microseconds of arithmetic: measured 35.6
-    # s to materialize what took 1.75 s to choose. The same pathology this file's `cross_block` note
-    # records for the PEEC assembly, where eager dispatch was 90 % of the solve. Values built on the
-    # host arrive as jaxpr constants and the apply is then pure arithmetic.
-    _host = not any(isinstance(x, jax.core.Tracer) for x in (P, M, Pb, Mb))
-    xp = np if _host else jnp
-    Pn, Mn, Pbn, Mbn = (np.asarray(P), np.asarray(M), np.asarray(Pb), np.asarray(Mb)) if _host else (P, M, Pb, Mb)
+    # ---- near blocks: one padded stack -------------------------------------------------------
+    # Width PER GROUP, not one width for everything. Blocks are not all leaf-sized: the ACA-rejection
+    # path in `build` stores a whole admissible cluster pair densely, and those sit at any level of
+    # the tree, so the largest near block can be thousands of elements wide. Padding every block to
+    # that measured a 17.44 GB peak against 1.72 GB per-group -- the padding is quadratic and the
+    # saving in compilations is not worth any of it.
+    near = []
+    if h.near:
+        mw = max(len(r) for r, _c in h.near)
+        nw = max(len(c) for _r, c in h.near)
+        rows = _pad_stack([r for r, _c in h.near], mw)
+        cols = _pad_stack([c for _r, c in h.near], nw)
+        vals = _batched_blocks(P, M, Pb, Mb, rows, cols, g)
+        live = jnp.asarray(
+            (np.arange(mw)[None, :] < np.array([[len(r)] for r, _c in h.near]))[:, :, None]
+            & (np.arange(nw)[None, :] < np.array([[len(c)] for _r, c in h.near]))[:, None, :]
+        )
+        vals = jnp.where(live, vals, 0.0)
+        if h.square:  # an element never couples to itself here; the diagonal is the self term
+            same = jnp.asarray(rows)[:, :, None] == jnp.asarray(cols)[:, None, :]
+            vals = jnp.where(same & live, 0.0, vals)
+        near = [(jnp.asarray(rows), jnp.asarray(cols), vals)]
 
-    def blk(rows, cols):
-        d = Pn[rows][:, None, :, None, :] - Pbn[cols][None, :, None, :, :]
-        r2 = (d * d).sum(-1)
-        r = xp.sqrt(r2 if _host else jnp.clip(r2, 1e-300))
-        mm = xp.einsum("apc,bqc->abpq", Mn[rows], Mbn[cols])
-        return (mm * g(r)).sum((2, 3))
+    # ---- far blocks: one padded stack PER RANK, so the ACA replay batches exactly -------------
+    far = []
+    by_rank: dict = {}
+    for (r, c, ip, jp), k in zip(h.far, h.ranks):
+        by_rank.setdefault(int(k), []).append((r, c, ip, jp))
+    for k, group in by_rank.items():
+        mw = max(len(r) for r, _c, _i, _j in group)
+        nw = max(len(c) for _r, c, _i, _j in group)
+        rows = _pad_stack([r for r, _c, _i, _j in group], mw)
+        cols = _pad_stack([c for _r, c, _i, _j in group], nw)
+        # the pivot ROWS and COLUMNS, as element indices, and their positions within the block
+        prow = _pad_stack([r[i] for r, _c, i, _j in group], k)
+        pcol = _pad_stack([c[j] for _r, c, _i, j in group], k)
+        ipos = jnp.asarray(_pad_stack([i for _r, _c, i, _j in group], k))
+        jpos = jnp.asarray(_pad_stack([j for _r, _c, _i, j in group], k))
+        C = _batched_blocks(P, M, Pb, Mb, rows, pcol, g)  # (B, m, k)
+        R = _batched_blocks(P, M, Pb, Mb, prow, cols, g)  # (B, k, n)
+        live_m = jnp.asarray(np.arange(mw)[None, :] < np.array([[len(r)] for r, _c, _i, _j in group]))
+        live_n = jnp.asarray(np.arange(nw)[None, :] < np.array([[len(c)] for _r, c, _i, _j in group]))
+        # ACA's recursion replayed at the frozen pivots -- k steps, batched across the whole group.
+        # The skeleton form `A[:,J] pinv(A[I,J]) A[I,:]` is NOT equivalent: it needs `A[I,J]` well
+        # conditioned, which fails on this operator's structural zeros. See `_aca`.
+        #
+        # The inner `sum over s < t` is a MATMUL against the factors built so far, not a loop over
+        # them. Written as a loop it emits one op per (t, s) pair -- O(k^2), about a thousand ops per
+        # rank group, which measured 2.66 GB and 45.9 s where the unbatched version took 0.38 GB.
+        # As a masked matmul it is two ops per step, so O(k), and the factors are written into
+        # preallocated arrays that are exactly the output.
+        Uc, Vc = _replay_group(k, C, R, ipos, jpos)
+        U = jnp.where(live_m[:, :, None], Uc, 0.0)  # (B, m, k)
+        V = jnp.where(live_n[:, None, :], Vc, 0.0)  # (B, k, n)
+        far.append((jnp.asarray(rows), jnp.asarray(cols), U, V))
 
-    # A near block straddling the diagonal contains entries where the row and column element are the
-    # SAME one. `pair_matrix` zeroes those -- sub-point pairs inside one element do not contribute --
-    # and carries the whole diagonal in `self_g` instead. Leaving them in would double-count the
-    # element against itself with a singular kernel, which is a large wrong number, not a small one.
-    dense = []
-    for r, c in h.near:
-        rj, cj = jnp.asarray(r), jnp.asarray(c)
-        B = blk(r, c)
-        if h.square:
-            B = xp.where(np.asarray(r)[:, None] == np.asarray(c)[None, :], 0.0, B)
-        dense.append((rj, cj, jnp.asarray(B)))
-    low = []
-    for r, c, ip, jp in h.far:
-        C = blk(r, c[jp])  # (m, k) -- the pivot COLUMNS of the block
-        R = blk(r[ip], c)  # (k, n) -- the pivot ROWS
-        # REPLAY ACA's recursion at the frozen pivots, rather than reconstructing from a skeleton.
-        #
-        # The skeleton `A[:,J] pinv(A[I,J]) A[I,:]` looks equivalent and is not. It matches ACA only
-        # where `A[I,J]` is well conditioned, which holds for a generic smooth kernel and FAILS on a
-        # structurally sparse one -- and the partial inductance is structurally sparse, because
-        # `mom_a . mom_b` vanishes exactly between perpendicular bar families. On a real bar lattice a
-        # block's pivot rows can land on x-bars while its pivot columns land on y-bars, making
-        # `A[I,J]` singular, `pinv` zero, and the whole block vanish: measured 100 % error on one
-        # block and 18 % overall, while random scattered points stayed accurate to 1e-6.
-        #
-        # With the pivot SEQUENCE fixed, ACA is a deterministic chain of rank-1 updates, so replaying
-        # it is pure arithmetic on `C` and `R` -- differentiable exactly as the skeleton was, and
-        # equal to what the host chose rather than merely close to it.
-        us, vs = [], []
-        for t in range(len(ip)):
-            row = R[t]
-            col = C[:, t]
-            for sdx in range(t):
-                row = row - us[sdx][ip[t]] * vs[sdx]
-                col = col - vs[sdx][jp[t]] * us[sdx]
-            vs.append(row / row[jp[t]])
-            us.append(col)
-        U = xp.stack(us, axis=1)  # (m, k)
-        V = xp.stack(vs, axis=0)  # (k, n)
-        low.append((jnp.asarray(r), jnp.asarray(c), jnp.asarray(U), jnp.asarray(V)))
-    # the diagonal is the self term alone: `pair_matrix` zeroes sub-point pairs within one element
-    diag = jnp.asarray(np.asarray(self_g) * (Mn.sum(1) ** 2).sum(-1)) if (h.square and _host) else (
-        (jnp.asarray(self_g) * (M.sum(1) ** 2).sum(-1)) if h.square else None
-    )
+    diag = (jnp.asarray(self_g) * (M.sum(1) ** 2).sum(-1)) if h.square else None
     nout = h.shape[1] if transpose else h.shape[0]
 
     def _one(x):
         y = diag * x if h.square else jnp.zeros(nout, x.dtype)
-        if transpose:  # the diagonal is symmetric, so only the off-diagonal blocks flip
-            for r, c, B in dense:
-                y = y.at[c].add(B.T @ x[r])
-            for r, c, U, R in low:
-                y = y.at[c].add(R.T @ (U.T @ x[r]))
-            return y
-        for r, c, B in dense:
-            y = y.at[r].add(B @ x[c])
-        for r, c, U, R in low:
-            y = y.at[r].add(U @ (R @ x[c]))
+        for rows, cols, vals in near:
+            if transpose:
+                y = y.at[cols].add(jnp.einsum("bmn,bm->bn", vals, x[rows]))
+            else:
+                y = y.at[rows].add(jnp.einsum("bmn,bn->bm", vals, x[cols]))
+        for rows, cols, U, V in far:
+            if transpose:
+                y = y.at[cols].add(jnp.einsum("bkn,bk->bn", V, jnp.einsum("bmk,bm->bk", U, x[rows])))
+            else:
+                y = y.at[rows].add(jnp.einsum("bmk,bk->bm", U, jnp.einsum("bkn,bn->bk", V, x[cols])))
         return y
 
     def apply(x):
@@ -541,8 +610,8 @@ class HierarchicalSpec:
     def worth_it(self, na: int, nb: int) -> bool:
         """Whether a block this size is worth compressing at all.
 
-        Below the floor the dense block is both exact and faster -- measured, the ratio is 1.38x at
-        370 elements and under 3x at 1,540 -- so this returns False and the caller keeps the exact
-        path. A compression that is slower than what it replaces is a defect, not a tuning choice.
+        Below the floor the dense block is both exact and faster, so this returns False and the
+        caller keeps the exact path. A compression slower than what it replaces is a defect, not a
+        tuning choice.
         """
         return min(na, nb) >= self.floor
