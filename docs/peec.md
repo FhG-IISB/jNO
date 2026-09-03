@@ -335,8 +335,9 @@ the gradient, because the host pass, not the solve, was the cost.
 | `sol.Z` / `sol.R` | terminal impedance of the source port, ohm |
 | `sol.L` | loop inductance from the **field energy**, `Iᴴ Lp I / \|I_port\|²`, henry |
 | `sol.joule` | ohmic dissipation at the solved excitation, `Σ R_k \|I_k\|²`, watt |
-| `sol.dissipation()` | `{region: W/m³}` — per-conductor loss, shaped for `d.by_region` |
+| `sol.dissipation()` | `{region: W/m³}` — total loss, shaped for `d.by_region`; `.sigma` / `.mu_r` split it |
 | `sol.current(t)` | net current injected at terminal `t`, amp |
+| `sol.voltage(a, b=None)` | potential at terminal `a`, or the difference `a - b`, volt |
 | `sol.i` | the filament currents themselves |
 | `sol.field(points)` | magnetic flux density at `(n, 3)` positions, tesla — see below |
 | `sol.export_vtk(path)` | the solved currents as line cells, for ParaView |
@@ -365,6 +366,53 @@ It is a readout, not a second problem: no boundary condition, and differentiable
     **refused**: the kernel is singular
     there, and the field inside the metal is not what this computes. (A point on the *axis* of a
     straight filament is not the dangerous case — the field vanishes there by symmetry.)
+
+### An open terminal
+
+A terminal that carries no current is invisible to `current` and to the port impedance — a
+transformer's unloaded secondary is the case that matters. Its induced voltage is in the nodal
+potentials, and `voltage` is how they are read:
+
+```python
+sol = jno.peec([
+    v(*at("P+")) - v(*at("P-")) - 1.0,   # drive the primary
+    i(*at("S+")) - 0.0,                  # secondary open: no current
+    v(*at("S-")) - 0.0,                  # and a reference to measure against
+], freq=100e3).solve()
+
+ratio = abs(complex(sol.voltage("S+", "S-")))    # volts per volt in
+```
+
+Prefer the two-terminal form. A single potential is defined only against whatever the solve pinned —
+a declared ground, or the source's negative side when there is exactly one source and no ground — so
+it moves if that reference changes, while a difference does not.
+
+A terminal's potential is its pad's, exactly as the source and device rows define it: an unweighted
+pad is shorted, so any of its nodes carries it; a `weights=` pad is deliberately not shorted and is
+then the weighted sum, with the same unnormalised weights the constraint rows use.
+
+### Core loss
+
+A **complex** `mu_r` is a lossy core — the imaginary part of χ is the lossy component of the
+magnetisation, exactly as a complex permittivity carries dielectric loss:
+
+```python
+core = Shape.box(...).attach(mu_r=2000 - 200j).name("core")
+...
+d = sol.dissipation()
+d["core"]        # W/m³, everything that region dissipates
+d.mu_r["core"]   # the core-loss part alone
+d.sigma["bar"]   # the ohmic part of a conductor
+```
+
+The mapping itself is the **total**, so the thermal path below is unchanged and a region that is
+both conductor and core never contributes half of itself by accident. The channels are named after
+the property that caused them — the same spelling in and out, as with `.attach(k=...)` and `d.k`.
+
+!!! note "Checked by power balance"
+    Driven by 1 V a passive network takes in `Re(1/Z)`, and that comes back out as ohmic loss plus
+    core loss and nothing else. That is the oracle the core-loss channel is tested against, so it
+    carries no convention of its own.
 
 ### Feeding a thermal solve
 
