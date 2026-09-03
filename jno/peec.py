@@ -76,6 +76,7 @@ import scipy.sparse as sparse
 
 from .utils.solver.peec import (
     Filaments,
+    GradedGrid,
     bar_filaments,
     element_centres,
     line_filaments,
@@ -507,8 +508,9 @@ class PEECSolution:
 class PEEC:
     """A partial-element problem: built from the constraint list, solved by :meth:`solve`."""
 
-    def __init__(self, constraints, freq=0.0):
+    def __init__(self, constraints, freq=0.0, grid=None):
         self.constraints = list(constraints)
+        self.grid = grid
         if not self.constraints:
             raise ValueError("jno.peec: no constraints. A network with nothing impressed on it carries no current.")
         self.freq = np.atleast_1d(np.asarray(freq, dtype=float))
@@ -674,7 +676,7 @@ class PEEC:
             # it agrees with pypeec at 1 kHz (79.0 against 76.8 nH) and trends to its 51.3 nH at
             # 1 MHz. Inductance cannot be discontinuous in frequency, so the feature stays off the
             # front door until that is understood; the machinery and its tests are kept.
-            fb = bar_filaments(shs, sigma=sgs, grid_shapes=[s for s, _ in magnetic])
+            fb = bar_filaments(shs, sigma=sgs, grid_shapes=[s for s, _ in magnetic], edges=self.grid)
             blocks.append((tuple(solid_names), fb.lattice["resolve"]))
             parts.append((fb, fb.lattice["sigma"]))
             owners.append(shs)
@@ -1102,11 +1104,16 @@ def _renumber(blocks):
     return np.concatenate(out)
 
 
-def peec(constraints, *, freq=0.0):
+def peec(constraints, *, freq=0.0, grid=None):
     """Build a partial-element circuit problem from its port constraints.
 
     Args:
         constraints: the ports — ``v(A) - v(B) - g``, ``v(A) - g``, ``i(A) - g``.
+        grid: how to discretise the solids. ``None`` is one uniform pitch from each shape's own
+            ``size=``, which keeps the operator translation-invariant and therefore an FFT.
+            :func:`jno.peec.graded` instead refines toward every conductor face, which is where the
+            current crowds — and gives up the FFT, so the solve then needs
+            ``operator=jno.solve.hierarchical(...)`` and says so if it is missing.
         freq: frequency in Hz, scalar or array (``omega = 2 pi f`` inside). An array solves at each
             and every port readout becomes an array over it.
 
@@ -1118,4 +1125,53 @@ def peec(constraints, *, freq=0.0):
     Returns:
         :class:`PEEC` — call ``.solve()``.
     """
-    return PEEC(constraints, freq=freq)
+    return PEEC(constraints, freq=freq, grid=grid)
+
+
+def _graded(fine, halo):
+    """Refine the grid toward every conductor face: ``grid=jno.peec.graded(fine=..., halo=...)``.
+
+    One pitch cannot serve a real layout. Every module here puts a 1.00 mm minimum trace on a plate
+    tens of millimetres across, and resolving that trace uniformly costs one to three million
+    elements — so the runs that could be afforded had ONE cell across the narrowest conductor, and
+    current crowding has no edge to crowd against in a discretisation with no edge.
+
+    Grading toward the faces puts the elements where that happens. Measured on layout1's plate-less
+    loop against a converged Ansys Q3D reference of 54.505 nH::
+
+        uniform 1.0 mm    13 381 elements    58.803 nH    +7.88 %
+        uniform 0.5 mm    53 458 elements    57.957 nH    +6.33 %
+        uniform 0.4 mm    83 705 elements    57.340 nH    +5.20 %
+        graded             8 192 elements    57.299 nH    +5.13 %
+        graded            14 111 elements    56.604 nH    +3.85 %
+
+    8 192 graded elements match 83 705 uniform ones, and 14 111 beat them while still falling —
+    where the uniform sequence had flattened.
+
+    Args:
+        fine: cell size near a conductor face, metres.
+        halo: how far that fine spacing reaches either side of a face, metres. The base spacing away
+            from every face stays each shape's own ``size=``.
+
+    Returns:
+        A grid spec for ``jno.peec(..., grid=...)``.
+
+    Note:
+        A graded grid is **not** translation-invariant, so there is no FFT for it. Pass
+        ``operator=jno.solve.hierarchical(...)`` to ``solve()``; `lattice_apply` refuses a graded
+        lattice rather than returning the uniform-grid answer, which would be right where the
+        spacing is constant and wrong everywhere it changes.
+    """
+    fine, halo = float(fine), float(halo)
+    if fine <= 0 or halo <= 0:
+        raise ValueError(f"jno.peec.graded: fine={fine} and halo={halo} must both be positive lengths in metres.")
+    if halo < fine:
+        raise ValueError(
+            f"jno.peec.graded: halo={halo} is smaller than fine={fine}, so the refined band around a "
+            "face is narrower than one refined cell and nothing is resolved. Give halo at least a few "
+            "times fine -- it is the distance the fine spacing reaches, not the cell size."
+        )
+    return GradedGrid(fine=fine, halo=halo)
+
+
+peec.graded = _graded
