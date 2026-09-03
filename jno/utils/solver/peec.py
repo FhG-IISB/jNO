@@ -1923,6 +1923,37 @@ def bar_filaments(shape, size=None, quad: int = 3, quad_t: int = 2, sigma=None, 
             "smaller "
             "size=; a cell has to fit within the geometry for the lattice to see it at all."
         )
+    # ...and the same question PER CONDUCTOR, which the check above does not ask. A lattice takes a
+    # cell when its CENTRE is inside the geometry, so a solid thinner than the pitch can fall between
+    # two rows of centres and contribute nothing at all -- while every other conductor meshes
+    # normally and the network solves, with that piece simply absent.
+    #
+    # This is not hypothetical and it is not rare. On a power module whose 0.57 mm traces force a
+    # one-cell-thick z pitch (which the surface-impedance guard REQUIRES at MHz), the 0.18 mm dies
+    # land between cell centres at 3.34 / 3.86 / 4.39 mm and all four vanish. The solve then reports
+    # a loop inductance for a circuit that has no switches in it, and nothing anywhere says so --
+    # the same conductivity applied to the die changed the answer by not one bit, which is how it
+    # was found.
+    #
+    # Raised rather than warned: a conductor that is in the drawing and not in the model is a
+    # different circuit, not a less accurate one.
+    lost = [si for si in range(len(shapes)) if not (own == si).any()]
+    if lost:
+        nm = [getattr(shapes[si], "_region_name", None) or f"#{si}" for si in lost]
+        ext = np.asarray(shapes[lost[0]].bounds(), dtype=float).reshape(2, -1)
+        thin = (ext[1] - ext[0]) / np.asarray(h)[: ext.shape[1]]
+        raise ValueError(
+            f"peec.bar_filaments: {len(lost)} conductor(s) {nm} got no cell of this lattice, so they "
+            "would be absent from the network while everything else solved normally. A cell belongs "
+            "to a solid when its CENTRE is inside it, so a solid thinner than the pitch can fall "
+            f"between two rows of centres: {nm[0]!r} spans "
+            f"{tuple(round(float(v), 6) for v in ext[1] - ext[0])} m against a pitch of {tuple(h)}, "
+            f"which is {tuple(round(float(v), 2) for v in thin)} cells across.\n"
+            "Either use a finer size= so the thin part gets a row of centres, or -- if a thin solid "
+            "sits ON another and was meant to be part of it -- merge them, because a lattice cannot "
+            "give one part its own pitch. Overlapping solids are the other cause: cells go to the "
+            "FIRST solid containing them, so a piece drawn inside another never gets any."
+        )
     nid = np.full(int(np.prod(n)), -1)
     nid[np.flatnonzero(keep)] = np.arange(int(keep.sum()))
     nid = nid.reshape(tuple(n))
