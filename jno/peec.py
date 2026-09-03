@@ -125,8 +125,11 @@ class PEECSolution:
     ``Z``/``R``/``L`` describe the source port; with an array ``freq`` each is an array over it.
     """
 
-    def __init__(self, freq, cur, fil, terms, port, res, vol=None, owner=None, names=()):
+    def __init__(self, freq, cur, fil, terms, port, res, vol=None, owner=None, names=(), link=None):
         self._vol, self._owner, self._names = vol, owner, tuple(names)
+        #: total flux linkage per element, magnetisation included -- set only when a core is in the
+        #: model. `L` reads it instead of `Lp I`, which is the same number when there is no core.
+        self._link = link
         self.freq = freq
         self.i = cur  # (n_filament,) or (n_freq, n_filament) complex
         self._fil = fil  # the discretisation; the partial-inductance MATRIX is formed only on demand
@@ -167,6 +170,12 @@ class PEECSolution:
         Computed from the energy rather than ``Im(Z)/w`` so it is defined at DC too, and so it stays
         the loop inductance the currents actually produce -- at a frequency where they redistribute,
         that is a different (smaller) number than the DC one, which is the effect worth seeing.
+
+        With a CORE the flux a circuit links is not ``Lp I`` alone -- the magnetisation links its own,
+        and that is the entire reason for putting a core there. The energy is then ``Re(I^H Lambda)``
+        against the total linkage, which the coupled solve already knows. It is the same number as
+        ``I^H Lp I`` when there is no core, exactly and not approximately: the circuit equation says
+        ``j w Lambda = A' phi - Z_int I``, which reduces to ``j w Lp I`` with the coupling absent.
         """
         from .utils.solver.kernel import pair_quadratic
         from .utils.solver.peec import lattice_apply, welded_apply
@@ -174,6 +183,11 @@ class PEECSolution:
         f = self._fil
         cur = jnp.atleast_2d(self.i)
         scale = MU0 / (4 * jnp.pi)
+        if self._link is not None:
+            lam = jnp.atleast_2d(self._link)
+            num = jnp.stack([jnp.vdot(c, lk).real for c, lk in zip(cur, lam)])
+            out = num / jnp.abs(jnp.atleast_1d(self._port_current)) ** 2
+            return out if jnp.ndim(self._port) else out[0]
 
         # I^H Lp I, not I^T Lp I: the currents are complex, and the magnetic energy is the HERMITIAN
         # form. The transpose form is complex, and its real part goes negative once the phases spread
@@ -587,8 +601,14 @@ class PEEC:
                     "than guessed at. Model the winding as a solid, or drop the core."
                 )
             # both meshes must land on ONE grid, or the coupling between them is not Toeplitz
+            # CHI, not mu_r. The lattice series-averages whatever it is handed along an element,
+            # and what adds in series is the reluctance -- so it is 1/chi that has to be averaged,
+            # which is the harmonic mean of chi. Handing it mu_r would average the wrong quantity,
+            # silently and only where two different core materials touch.
             mag = bar_filaments(
-                [s for s, _ in magnetic], sigma=[m for _, m in magnetic], grid_shapes=[s for s, _ in solids]
+                [s for s, _ in magnetic],
+                sigma=[jnp.asarray(m) - 1.0 for _, m in magnetic],
+                grid_shapes=[s for s, _ in solids],
             )
         return fil, terms, line_names + solid_names, resolve_all, mag, tuple(magnetic_names)
 
@@ -701,16 +721,6 @@ class BuiltPEEC:
                         f"Its terminals are {sorted(nodes)}."
                     )
                 nodes[name] = (np.asarray(nodes[name]), w)
-        if self.mag is not None:
-            import numpy as _np
-
-            raise NotImplementedError(
-                f"jno.peec: {len(self.mag_names)} magnetic region(s) {sorted(self.mag_names)} were "
-                f"discretised into {int(_np.asarray(self.mag.length).size)} elements, but the COUPLED "
-                "magnetic solve is not wired yet. Solving anyway would return the coreless answer with "
-                "no sign that the core had been ignored, which is the one thing this solver will not "
-                "do. Drop the `mu_r` to solve the conductors alone; `built.mag` holds the mesh."
-            )
         sigma = self._resolve(sigma)
         dev = self.devices
         if devices:
@@ -727,9 +737,9 @@ class BuiltPEEC:
                 dev[at[name]] = (a, b, z)
             dev = tuple(dev)
 
-        cur, port, drive, inject = [], [], [], []
+        cur, port, drive, inject, link = [], [], [], [], []
         for f in self.freq:
-            c, _phi, inj = solve_network(
+            c, phi, inj = solve_network(
                 fil,
                 sigma,
                 nodes,
@@ -742,9 +752,25 @@ class BuiltPEEC:
                 omega=2 * np.pi * float(f),
                 **({} if restart is None else {"restart": int(restart)}),
                 **({} if matrix_free is None else {"matrix_free": bool(matrix_free)}),
+                **({} if self.mag is None else {"mag": self.mag, "chi": self.mag.lattice["sigma"]}),
             )
             cur.append(c)
             inject.append(inj)
+            if self.mag is not None:
+                # The TOTAL flux linkage, magnetisation included, read straight off the circuit
+                # equation `Z_int I + j w (Lp I + K' I_m) = A' phi`. So it needs no magnetic unknown
+                # of its own, and with no core it is `Lp I` to the last bit -- which is what
+                # `test_the_two_inductance_forms_agree_without_a_core` pins.
+                from .utils.solver.kernel import internal_impedance as _zint
+                from .utils.solver.peec import _bcoo
+
+                w_f = 2 * np.pi * float(f)
+                z = _zint(fil.length, fil.area, fil.skin, fil.round_, w_f, sigma, MU0, fil.span)
+                inc = fil.incidence.tocoo()
+                # sparse, like everywhere else the incidence is applied: dense it is an
+                # (elements x nodes) complex matrix, which on a real core model is gigabytes
+                at = _bcoo(inc.data.astype(complex), inc.col, inc.row, inc.shape[::-1])
+                link.append((at @ phi - z * c) / (1j * w_f))
             a, _b, g = self.sources[0]
             drive.append(inj[a])
             port.append(g / inj[a])
@@ -770,6 +796,7 @@ class BuiltPEEC:
             },
             port[0] if self._scalar_freq else port,
             res,
+            link=(None if not link else (link[0] if self._scalar_freq else jnp.stack(link))),
             vol=jnp.asarray(fil.area) * jnp.asarray(fil.length),
             owner=np.asarray(fil.part),
             names=self.part_names,

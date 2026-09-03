@@ -201,6 +201,110 @@ That gives a hard rule, and `jno.peec` enforces it at `build()` rather than retu
     A power-module trace is 0.3 mm of copper and `δ` at 100 kHz is 0.21 mm, so **one cell through the
     thickness is the right model** for almost every layout problem — and it is also the cheap one.
 
+## Magnetic materials
+
+**What a region carries decides what it is.** There is no mode flag, no solver argument and no second
+entry point — `Shape.attach` is already generic, so declaring a core needs no new mechanism:
+
+| a region attaching | is |
+|---|---|
+| `sigma=` | a conductor |
+| `mu_r=` | a core that does not conduct — ferrite, a powder core |
+| both | a conducting magnetic material — a lamination, a lossy core |
+| neither | refused: there is nothing to solve on it |
+
+The four constraint forms are **unchanged**. A port is electric whether or not there is a core in the
+picture, so nothing you already know stops being true:
+
+```python
+core = (jno.Shape.box(0, 0, 0, 0.024, 0.024, 0.008, size=(0.002,) * 3)
+        - jno.Shape.box(0.006, 0.006, -0.002, 0.018, 0.018, 0.010)).attach(mu_r=1000.0).name("core")
+
+d = (core + turn).domain()       # `turn`: one solid turn threading the window, elided here
+...
+sol = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e5).build().solve()
+print(float(sol.L) * 1e9)        # 916.7 nH, against mu0 mu_r A / l = 837.8 nH
+```
+
+Delete the `.attach(mu_r=...)` and the same script solves the air-cored inductor, which is the
+comparison a designer wants anyway. Here that is 18.3 nH — the core is worth a factor of 50.
+
+!!! warning "That 2 mm pitch is a demonstration pitch, not a converged one"
+    Refining the core to `1 x 2 x 2` mm moves `L` by **16 %** — and moves it from 9 % *above* the
+    reluctance law to 10 % *below*. A core mesh converges no faster than a conductor mesh does, so
+    treat a single run as an order-of-magnitude answer until you have refined it twice.
+
+    What **is** sharp on a coarse mesh is the *scaling*. `L` approaches proportionality to `mu_r`
+    from below as the core takes over from the air path in series with it — 1803.2 / 17759.7 /
+    177324.8 nH at 2000 / 20000 / 200000, so decade ratios of 9.849 then 9.985 — and it is flat in
+    frequency over two decades. Trust the trends before the absolute value.
+
+Both numbers, and the winding this elides, are `tests/test_peec_magnetic_oracle.py`.
+
+### What the core actually is, in the solve
+
+A magnetic material is not a coefficient on the conductor solve. It is a **second unknown field** —
+magnetisation fluxes on the core's own mesh — coupled to the electric one (Torchio et al., *A PEEC
+method with magnetic materials*, IEEE TMTT **66**(5), 2018):
+
+$$ \mathbf{Z}\,\mathbf{I}_c + j\omega \mathbf{K}^{\!\top} \mathbf{I}_m - \mathbf{A}^{\!\top}\boldsymbol{\varphi} = 0,
+\qquad \left(\mathbf{R}_m + \mathbf{A}_m^{\!\top} \mathbf{P}_m \mathbf{A}_m\right) \mathbf{I}_m = \mathbf{K}\,\mathbf{I}_c $$
+
+Two consequences are worth knowing about rather than discovering:
+
+- **The constitutive quantity is the susceptibility** `chi = mu_r - 1`, not `mu_r`. What circulates in
+  the magnetic mesh is the magnetisation, and air adds none — so `mu_r = 1` is not a weak core, it is
+  *no* core, and it is dropped at the front door with a warning rather than solved as one.
+- **`sol.L` includes the magnetisation's flux**; `sol.field(points)` does not. The port inductance is
+  the total linkage, but a probed `B` sums the conductor currents only.
+
+A complex `mu_r` is accepted and is how core loss will enter — the imaginary part of `chi` is the lossy
+component of the magnetisation, exactly as a complex permittivity carries dielectric loss.
+
+!!! danger "Three limits, and each is refused rather than approximated"
+    **Not at DC.** The magnetisation reaches the circuit only through `j w K'`, which is identically
+    zero at `omega = 0` — so the core would be solved for and then have no effect, and the inductance
+    returned would be the coreless one. Solve at a frequency; `L` is flat well below the first
+    resonance, so any small one gives the magnetostatic answer.
+
+    **Not welded to a `Shape.line`.** A weld already needs a dense cross block and a whole-system
+    factorisation; a coupled magnetic system on top of that is untested. Model the winding as a solid.
+
+    **Linear.** There is no saturation and no B-H curve — `mu_r` is a constant of the material.
+
+### What a core costs to solve
+
+The preconditioner treats the electric and magnetic halves independently and **neglects the coupling
+between them** — pypeec's choice, and it keeps the electric preconditioner the one already measured
+and tuned. That is why a core defaults to `restart=64` rather than a lattice's 16, exactly as a welded
+network does: the residual polynomial has more to do, and the deeper subspace is *faster*, not slower.
+
+Measured on the square-ring core, `mu_r = 2000`, refining 1,044 → 2,160 magnetic elements:
+
+| | restart 16 | restart 64 | restart 128 |
+|---|---|---|---|
+| 2,160 magnetic elements | **fails** at 5.1e-06, 30.5 s | 9.5 s | 10.8 s |
+
+**Core strength is not what costs.** `mu_r` of 2,000, 20,000 and 200,000 all converge at the *shallow*
+subspace in 1.7 s on the coarse mesh. It is the mesh that costs. If a refined core stalls, `restart=`
+deeper is the first thing to try — the error message says so, and here it is also three times faster.
+
+A frequency sweep is nearly free per extra point: three frequencies cost about what one does, because
+the geometry-dependent operators are rebuilt once per solve rather than per point.
+
+### The gap is quantised, like every other lattice dimension
+
+A core is a solid, so it is cut into whole cells, and a **gap is a whole number of cells**. Asking for
+0.5 mm on a 2 mm pitch silently cuts nothing at all. Worse, cutting about a cell *centre* catches an
+odd number of rows and about a cell *face* an even number, so the reachable gaps are not what a naive
+sweep assumes. Pitch the lattice to the gap you mean to resolve, and check the element count moves
+when you widen it.
+
+This is the same quantisation that applies to a trace-to-plane spacing, and it is the reason a gap
+sweep is a rebuild per point rather than a gradient — see [Geometry as a design
+variable](#geometry-as-a-design-variable). The **permeability**, by contrast, is differentiable like
+any other material value: `jax.grad` through `mu_r` matches a central difference to five digits.
+
 ## Freeze the geometry once — `build()`
 
 `solve()` redoes all of the host work — which cells are metal, which nodes a pad owns, which filaments
@@ -255,8 +359,10 @@ It is a readout, not a second problem: no boundary condition, and differentiable
 **and** in the points — which is what an EMI objective over a keep-out volume needs.
 
 !!! warning "Free space, and off the metal"
-    There is no magnetic material in this solver, so a nearby core would change the answer and is not
-    represented. A probe inside a conductor's own cross-section is **refused**: the kernel is singular
+    `field()` sums the **conductor** currents only. With a core in the model its magnetisation also
+    produces flux, and that part is not in this readout — the port inductance from `sol.L` does
+    include it, but a probed `B` does not. A probe inside a conductor's own cross-section is
+    **refused**: the kernel is singular
     there, and the field inside the metal is not what this computes. (A point on the *axis* of a
     straight filament is not the dangerous case — the field vanishes there by symmetry.)
 
@@ -516,4 +622,6 @@ Three things to read off it.
 - A **built** network freezes its geometry. A conductivity may be traced; a lattice shape may not.
 - A network of wires alone has no lattice structure, so it forms the **dense** operator — that is the
   small-network path.
-- There is no magnetic material and no dielectric: this is a conductor solver, not a full-wave one.
+- There is no dielectric and no displacement current: this is a conductor solver, not a full-wave one.
+- A magnetic core is solved (see [Magnetic materials](#magnetic-materials)), with three limits of its
+  own: **not at DC**, **not welded to a `Shape.line`**, and **linear** — there is no saturation.

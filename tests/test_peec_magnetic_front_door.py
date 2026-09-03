@@ -7,12 +7,14 @@
     both         a conducting magnetic material -- a lamination, a lossy core
     neither      not solvable, and said so
 
-The coupled magnetic solve is not wired yet. Until it is, a network carrying `mu_r` is REFUSED at
-solve time rather than answered: returning the coreless number with no sign the core was dropped is
-precisely the silent-wrong-answer this solver exists not to give.
+What a network carrying `mu_r` may NOT do is quietly return the coreless number. Where the coupled
+solve does not apply -- at DC, on the dense path, welded to a `Shape.line` -- it is refused, because
+an answer with no sign that the core was dropped is precisely the silent-wrong-answer this solver
+exists not to give.
 """
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -91,14 +93,64 @@ def test_a_core_on_a_filament_is_refused():
         jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e5).build()
 
 
-def test_solving_with_a_core_refuses_rather_than_dropping_it():
-    """The whole point of landing the front door before the physics.
+def test_a_core_beside_a_conductor_in_its_own_plane_does_exactly_nothing():
+    """And it must be EXACTLY nothing, not nearly nothing.
 
-    A coreless answer returned for a model with a core would be wrong with nothing to show for it.
+    A bar carrying x-current produces a field perpendicular to its own plane, so a core lying in that
+    plane -- whose elements are all in-plane too -- sees `(e_x x r_hat) . e_in_plane = 0` at every
+    pair. The mmf is identically zero, the magnetisation is zero, and the conductor answer is the
+    coreless one to the last bit. A transposed cross product or a flipped separation would break this
+    while leaving every absolute check in this file passing.
     """
+    bare = float(np.real(_net().build().solve().L))
+    with_core = float(np.real(_net(core=2000.0).build().solve().L))
+    assert abs(with_core / bare - 1) < 1e-6, (bare, with_core)
+
+
+def test_a_core_above_a_conductor_raises_the_inductance():
+    """Placed where it can actually link flux, a core does what a core is for."""
+
+    def stacked(mu=None):
+        bar = jno.Shape.box(0, 0, 0, 0.020, 0.004, 0.002, size=(0.002,) * 3).attach(sigma=CU).name("bar")
+        sh = bar if mu is None else bar + jno.Shape.box(
+            0, 0, 0.004, 0.020, 0.012, 0.006, size=(0.002,) * 3
+        ).attach(mu_r=mu).name("core")
+        d = sh.domain()
+        d.tag("A", lambda x, y, z: x < 0.0011)
+        d.tag("B", lambda x, y, z: x > 0.0189)
+        i, v = d.peec_symbols()
+        at = lambda t: d.variable(t, split=True, sample=(2, None))[:3]
+        return float(np.real(jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e5).build().solve().L))
+
+    bare = stacked()
+    assert stacked(2.0) > bare  # even a barely magnetic core adds, and it adds monotonically
+    assert stacked(1000.0) > stacked(100.0) > stacked(10.0) > stacked(2.0)
+
+
+def test_a_core_at_DC_is_refused():
+    """The magnetisation reaches the circuit only through `j w K'`, which is zero at omega = 0.
+
+    Solving anyway would return the coreless inductance with nothing to say the core had been
+    dropped -- which is exactly the failure the front-door refusal existed to prevent, so it does not
+    stop being refused merely because the rest now works.
+    """
+    bar = jno.Shape.box(0, 0, 0, 0.020, 0.004, 0.002, size=(0.002,) * 3).attach(sigma=CU).name("bar")
+    core = jno.Shape.box(0, 0, 0.004, 0.020, 0.012, 0.006, size=(0.002,) * 3).attach(mu_r=2000.0).name("core")
+    d = (bar + core).domain()
+    d.tag("A", lambda x, y, z: x < 0.0011)
+    d.tag("B", lambda x, y, z: x > 0.0189)
+    i, v = d.peec_symbols()
+    at = lambda t: d.variable(t, split=True, sample=(2, None))[:3]
+    with pytest.raises(ValueError, match="at DC"):
+        jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=0.0).build().solve()
+
+
+def test_a_core_on_the_dense_path_is_refused():
+    """The magnetic blocks are applied by FFT on the shared cell grid; the dense path forms Lp as a
+    matrix and has no assembled operator for them to join. Refused rather than silently ignored."""
     e = _net(core=2000.0).build()
-    with pytest.raises(NotImplementedError, match="COUPLED"):
-        e.solve()
+    with pytest.raises(ValueError, match="lattice path"):
+        e.solve(matrix_free=False)
 
 
 def test_a_core_in_a_welded_network_is_refused_for_now():
@@ -173,3 +225,27 @@ def test_a_conductor_only_network_keeps_the_grid_it_always_had():
     b = bar_filaments(sh, sigma=CU, grid_shapes=())
     assert a.lattice["n"] == b.lattice["n"] and a.lattice["d"] == b.lattice["d"]
     assert np.allclose(np.asarray(a.nodes), np.asarray(b.nodes))
+
+
+def test_a_magnetic_network_still_jits():
+    """`.build()` exists so the host discretisation runs once and the solve is traceable.
+
+    A core must not quietly cost that: its mesh, its potential and its coupling are all functions of
+    geometry, which `.build()` has already frozen. Only the conductivity is traced here -- which is
+    what an electro-thermal loop or a density optimisation does every pass.
+    """
+    bar = jno.Shape.box(0, 0, 0, 0.020, 0.004, 0.002, size=(0.002,) * 3).attach(sigma=CU).name("bar")
+    core = jno.Shape.box(0, 0, 0.004, 0.020, 0.012, 0.006, size=(0.002,) * 3).attach(mu_r=500.0).name("core")
+    d = (bar + core).domain()
+    d.tag("A", lambda x, y, z: x < 0.0011)
+    d.tag("B", lambda x, y, z: x > 0.0189)
+    i, v = d.peec_symbols()
+    at = lambda t: d.variable(t, split=True, sample=(2, None))[:3]
+    e = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e5).build()
+
+    f = jax.jit(lambda s: e.solve(sigma={"bar": s}).L)
+    hot, cold = float(np.real(f(CU))), float(np.real(e.solve(sigma={"bar": CU}).L))
+    assert abs(hot / cold - 1) < 1e-7, (hot, cold)  # a Krylov solve at tol 1e-8, not bit-identical
+    # and the conductivity carries a gradient through the coupled solve, not merely a value
+    g = float(jax.grad(lambda s: jnp.real(e.solve(sigma={"bar": s}).L))(CU))
+    assert np.isfinite(g)
