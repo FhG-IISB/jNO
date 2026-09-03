@@ -88,13 +88,18 @@ class HMatrix(NamedTuple):
     Everything here is numpy and integral: which elements each block couples, and which rows and
     columns ACA chose for the admissible ones. The values are rebuilt from this by :func:`materialize`
     every time the geometry changes, which is what keeps the operator differentiable.
+
+    Covers both shapes the welded path needs. ``square`` is one element set against itself -- the
+    partial inductance of a conductor, whose diagonal is the self term. Not square is one set against
+    a DIFFERENT one, which is `cross_block`: two welded parts coupling, with no diagonal at all.
     """
 
-    ne: int  #: number of elements
-    nsub: int  #: sub-points per element (uniform; see the guard in `build`)
+    shape: tuple  #: (n_row_elements, n_col_elements)
+    nsub: tuple  #: sub-points per element on each side (uniform; see the guard in `build`)
     near: tuple  #: ((rows, cols), ...) inadmissible blocks, evaluated densely
     far: tuple  #: ((rows, cols, ipiv, jpiv), ...) admissible blocks, as skeletons
     ranks: tuple  #: the rank ACA needed for each far block, for reporting
+    square: bool  #: whether row and column elements are the same set
 
 
 def _uniform_groups(group, ne: int) -> int:
@@ -114,6 +119,29 @@ def _uniform_groups(group, ne: int) -> int:
             "same values."
         )
     return int(counts[0])
+
+
+def _prep(what: str, pos, mom, group):
+    """Sub-points reshaped per element, plus centroids. HOST ONLY -- a tracer raises here."""
+    for name, arr in (("pos", pos), ("mom", mom)):
+        if isinstance(arr, jax.core.Tracer):
+            raise ValueError(
+                f"{what}: {name} is a tracer. The cluster tree and the ACA pivots are structural -- "
+                "they are chosen once from concrete geometry and then held fixed, the same split "
+                "`.build()` uses for the PEEC discretisation and `precond.ams.build` for its "
+                "auxiliaries. Build outside the trace and apply inside it."
+            )
+    pos = np.asarray(pos, dtype=float)
+    mom = np.asarray(mom, dtype=float)
+    if mom.ndim == 1:
+        mom = mom[:, None]
+    grp = np.asarray(group)
+    ne = int(grp.max()) + 1
+    nsub = _uniform_groups(grp, ne)
+    order = np.argsort(grp, kind="stable")
+    P = pos[order].reshape(ne, nsub, 3)
+    M = mom[order].reshape(ne, nsub, -1)
+    return P, M, P.mean(1)
 
 
 def _boxes(cen: np.ndarray, idx: np.ndarray):
@@ -219,7 +247,9 @@ def _aca(entry_rows, entry_cols, m: int, n: int, tol: float, maxrank: int):
     return np.array(ipiv, dtype=int), np.array(jpiv, dtype=int)
 
 
-def build(pos, mom, group, g: Callable, *, tol: float = 1e-6, leaf: int = 64, eta: float = 2.0) -> HMatrix:
+def build(
+    pos, mom, group, g: Callable, *, b=None, tol: float = 1e-6, leaf: int = 64, eta: float = 2.0
+) -> HMatrix:
     """Choose the block structure and the ACA pivots. HOST ONLY -- concrete geometry required.
 
     Args:
@@ -227,6 +257,9 @@ def build(pos, mom, group, g: Callable, *, tol: float = 1e-6, leaf: int = 64, et
         mom: ``(N_sub, d)`` sub-point moments.
         group: ``(N_sub,)`` element index per sub-point.
         g: the kernel, a callable of scalar distance.
+        b: ``(pos, mom, group)`` of a SECOND element set, for a rectangular block coupling two
+            different discretisations -- which is what `cross_block` forms densely today. ``None``
+            (the default) is one set against itself, and only that case carries a self diagonal.
         tol: relative accuracy asked of each admissible block.
         leaf: cluster size at which bisection stops.
         eta: admissibility constant; larger admits more blocks at higher rank.
@@ -234,43 +267,35 @@ def build(pos, mom, group, g: Callable, *, tol: float = 1e-6, leaf: int = 64, et
     A traced argument raises rather than falling back, because the pivots ARE the structure and
     choosing them per trace would mean a different operator on every call.
     """
-    for name, arr in (("pos", pos), ("mom", mom)):
-        if isinstance(arr, jax.core.Tracer):
-            raise ValueError(
-                f"hmatrix.build: {name} is a tracer. The cluster tree and the ACA pivots are "
-                "structural -- they are chosen once from concrete geometry and then held fixed, the "
-                "same split `.build()` uses for the PEEC discretisation and `precond.ams.build` for "
-                "its auxiliaries. Build outside the trace and apply inside it."
-            )
-    pos = np.asarray(pos, dtype=float)
-    mom = np.asarray(mom, dtype=float)
-    if mom.ndim == 1:
-        mom = mom[:, None]
-    grp = np.asarray(group)
-    ne = int(grp.max()) + 1
-    nsub = _uniform_groups(grp, ne)
-    order = np.argsort(grp, kind="stable")
-    P = pos[order].reshape(ne, nsub, 3)
-    M = mom[order].reshape(ne, nsub, -1)
-    cen = P.mean(1)
+    other = None if b is None else _prep("hmatrix.build (the second set)", *b)
+    A = _prep("hmatrix.build", pos, mom, group)
+    B = A if other is None else other
+    square = other is None
+    P, M, cen = A
+    Pb, Mb, cenb = B
 
     def blk(rows, cols):
         """The exact element-element sub-block, on the host."""
-        d = P[rows][:, None, :, None, :] - P[cols][None, :, None, :, :]
+        d = P[rows][:, None, :, None, :] - Pb[cols][None, :, None, :, :]
         r = np.sqrt((d * d).sum(-1))
-        mm = np.einsum("apc,bqc->abpq", M[rows], M[cols])
+        mm = np.einsum("apc,bqc->abpq", M[rows], Mb[cols])
         return (mm * g(r)).sum((2, 3))
 
     nodes, children = cluster(cen, leaf)
     box = [_boxes(cen, idx) for idx in nodes]  # once per NODE, not once per block pair
+    if square:
+        nodes_b, children_b, box_b = nodes, children, box
+    else:
+        nodes_b, children_b = cluster(cenb, leaf)
+        box_b = [_boxes(cenb, idx) for idx in nodes_b]
     near: list = []
     far: list = []
     ranks: list = []
     stack = [(0, 0)]
     while stack:
-        a, b = stack.pop()
-        ia, ib = nodes[a], nodes[b]
-        if _admissible(box[a], box[b], eta):
+        a, bb = stack.pop()
+        ia, ib = nodes[a], nodes_b[bb]
+        if _admissible(box[a], box_b[bb], eta):
             rows = lambda i, ia=ia, ib=ib: blk(ia[i : i + 1], ib)[0]
             cols = lambda j, ia=ia, ib=ib: blk(ia, ib[j : j + 1])[:, 0]
             ip, jp = _aca(rows, cols, len(ia), len(ib), tol, maxrank=min(len(ia), len(ib)))
@@ -282,35 +307,51 @@ def build(pos, mom, group, g: Callable, *, tol: float = 1e-6, leaf: int = 64, et
                 far.append((ia, ib, ip, jp))
                 ranks.append(len(ip))
             continue
-        ca, cb = children[a], children[b]
+        ca, cb = children[a], children_b[bb]
         if ca is None and cb is None:
             near.append((ia, ib))
         elif ca is None:
             stack += [(a, cb[0]), (a, cb[1])]
         elif cb is None:
-            stack += [(ca[0], b), (ca[1], b)]
+            stack += [(ca[0], bb), (ca[1], bb)]
         else:
             stack += [(ca[0], cb[0]), (ca[0], cb[1]), (ca[1], cb[0]), (ca[1], cb[1])]
-    return HMatrix(ne, nsub, tuple(near), tuple(far), tuple(ranks))
+    return HMatrix(
+        (len(cen), len(cenb)), (P.shape[1], Pb.shape[1]), tuple(near), tuple(far), tuple(ranks), square
+    )
 
 
-def materialize(h: HMatrix, pos, mom, self_g, g: Callable, scale=1.0):
+def materialize(h: HMatrix, pos, mom, self_g, g: Callable, scale=1.0, b=None):
     """``apply(x) -> K @ x`` in pure jax, rebuilding the block values from the frozen structure.
 
     Differentiable in ``pos`` and ``mom``: every value here is a kernel evaluation at frozen indices,
     and the only linear algebra is a small `pinv` per far block.
+
+    ``b`` is ``(pos, mom)`` of the second element set for a rectangular operator, and must be given
+    exactly when the structure was built with one. ``self_g`` is then unused and may be ``None``:
+    two different parts have no diagonal to carry.
     """
-    pos = jnp.asarray(pos)
-    mom = jnp.asarray(mom)
-    if mom.ndim == 1:
-        mom = mom[:, None]
-    P = pos.reshape(h.ne, h.nsub, 3)
-    M = mom.reshape(h.ne, h.nsub, -1)
+
+    def _resh(p, m, ne, nsub):
+        p, m = jnp.asarray(p), jnp.asarray(m)
+        if m.ndim == 1:
+            m = m[:, None]
+        return p.reshape(ne, nsub, 3), m.reshape(ne, nsub, -1)
+
+    if (b is None) != h.square:
+        raise ValueError(
+            "hmatrix.materialize: the structure was built "
+            f"{'for one element set' if h.square else 'for two'} but materialize was given "
+            f"{'one' if b is None else 'two'}. The block indices address whichever sets built them, "
+            "so mixing the two silently addresses the wrong elements."
+        )
+    P, M = _resh(pos, mom, h.shape[0], h.nsub[0])
+    Pb, Mb = (P, M) if h.square else _resh(b[0], b[1], h.shape[1], h.nsub[1])
 
     def blk(rows, cols):
-        d = P[rows][:, None, :, None, :] - P[cols][None, :, None, :, :]
+        d = P[rows][:, None, :, None, :] - Pb[cols][None, :, None, :, :]
         r = jnp.sqrt(jnp.clip((d * d).sum(-1), 1e-300))
-        mm = jnp.einsum("apc,bqc->abpq", M[rows], M[cols])
+        mm = jnp.einsum("apc,bqc->abpq", M[rows], Mb[cols])
         return (mm * g(r)).sum((2, 3))
 
     # A near block straddling the diagonal contains entries where the row and column element are the
@@ -320,7 +361,9 @@ def materialize(h: HMatrix, pos, mom, self_g, g: Callable, scale=1.0):
     dense = []
     for r, c in h.near:
         rj, cj = jnp.asarray(r), jnp.asarray(c)
-        B = jnp.where(np.asarray(r)[:, None] == np.asarray(c)[None, :], 0.0, blk(r, c))
+        B = blk(r, c)
+        if h.square:
+            B = jnp.where(np.asarray(r)[:, None] == np.asarray(c)[None, :], 0.0, B)
         dense.append((rj, cj, B))
     low = []
     for r, c, ip, jp in h.far:
@@ -329,10 +372,11 @@ def materialize(h: HMatrix, pos, mom, self_g, g: Callable, scale=1.0):
         G = blk(r[ip], c[jp])  # (k, k)
         low.append((jnp.asarray(r), jnp.asarray(c), C @ jnp.linalg.pinv(G), R))
     # the diagonal is the self term alone: `pair_matrix` zeroes sub-point pairs within one element
-    diag = jnp.asarray(self_g) * (M.sum(1) ** 2).sum(-1)
+    diag = (jnp.asarray(self_g) * (M.sum(1) ** 2).sum(-1)) if h.square else None
+    nrow = h.shape[0]
 
     def _one(x):
-        y = diag * x
+        y = diag * x if h.square else jnp.zeros(nrow, x.dtype)
         for r, c, B in dense:
             y = y.at[r].add(B @ x[c])
         for r, c, U, R in low:
