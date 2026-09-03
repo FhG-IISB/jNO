@@ -147,6 +147,27 @@ def _prep(what: str, pos, mom, group):
     return P, M, P.mean(1)
 
 
+def _families(M: np.ndarray, tol: float = 1e-9):
+    """Element indices grouped by moment DIRECTION, or None when they do not group.
+
+    A PEEC bar carries a moment along one axis, so a lattice has two or three families and the
+    operator is block diagonal across them. Returns None when every element points a different way --
+    a curved wire, say -- in which case there is nothing to partition and the general path applies.
+    """
+    v = M.sum(1)
+    n = np.linalg.norm(v, axis=1)
+    live = n > 0
+    if not live.any():
+        return None
+    u = np.zeros_like(v)
+    u[live] = v[live] / n[live, None]
+    keys = np.round(np.abs(u) / (np.abs(u).max(1, keepdims=True) + 1e-300), 6)
+    uniq, inv = np.unique(keys, axis=0, return_inverse=True)
+    if len(uniq) > 8:  # not a family structure; do not pay for a partition that buys nothing
+        return None
+    return [np.flatnonzero(inv == k) for k in range(len(uniq))]
+
+
 def _boxes(cen: np.ndarray, idx: np.ndarray):
     lo, hi = cen[idx].min(0), cen[idx].max(0)
     return lo, hi, float(np.linalg.norm(hi - lo))
@@ -277,7 +298,7 @@ def _aca(entry_rows, entry_cols, m: int, n: int, tol: float, maxrank: int):
 
 
 def build(
-    pos, mom, group, g: Callable, *, b=None, tol: float = 1e-6, leaf: int = 64, eta: float = 2.0
+    pos, mom, group, g: Callable, *, b=None, tol: float = 1e-6, leaf: int = 64, eta: float = 2.0, _only=None
 ) -> HMatrix:
     """Choose the block structure and the ACA pivots. HOST ONLY -- concrete geometry required.
 
@@ -302,6 +323,9 @@ def build(
     square = other is None
     P, M, cen = A
     Pb, Mb, cenb = B
+    if _only is not None:  # one moment direction of a larger set; indices are remapped by the caller
+        P, M, cen = P[_only], M[_only], cen[_only]
+        Pb, Mb, cenb = P, M, cen
 
     def blk(rows, cols):
         """The exact element-element sub-block, on the host."""
@@ -309,6 +333,27 @@ def build(
         r = np.sqrt((d * d).sum(-1))
         mm = np.einsum("apc,bqc->abpq", M[rows], Mb[cols])
         return (mm * g(r)).sum((2, 3))
+
+    # PARTITION BY MOMENT DIRECTION before clustering.
+    #
+    # `mom_a . mom_b` vanishes exactly between perpendicular bar families, so the operator is block
+    # diagonal by direction -- the same structure `lattice_apply` exploits and `bar_filaments`
+    # documents. Clustering geometrically mixes the families into every block, and ACA cannot survive
+    # the zero sub-blocks that creates: measured 1.00x compression, every block rejected. Splitting
+    # first means each tree holds one direction, every moment in it is parallel, the structural zeros
+    # are gone, and the cross-family blocks are not built at all because they are identically zero.
+    fam = _families(M) if square else None
+    if fam is not None and len(fam) > 1:
+        near, far, ranks = [], [], []
+        for sel in fam:
+            sub = build(
+                pos, mom, group, g, tol=tol, leaf=leaf, eta=eta, _only=sel
+            )
+            near += [(sel[r], sel[c]) for r, c in sub.near]
+            far += [(sel[r], sel[c], i, j) for r, c, i, j in sub.far]
+            ranks += list(sub.ranks)
+        # every cross-family pair is exactly zero and is simply absent from the block list
+        return HMatrix((len(cen), len(cenb)), (P.shape[1], Pb.shape[1]), tuple(near), tuple(far), tuple(ranks), True)
 
     nodes, children = cluster(cen, leaf)
     box = [_boxes(cen, idx) for idx in nodes]  # once per NODE, not once per block pair
