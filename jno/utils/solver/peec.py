@@ -728,6 +728,7 @@ def solve_network(
     chi=None,
     quad_m=2,
     operator=None,
+    magnetic_current=False,
 ):
     """Solve the PEEC circuit for a network whose terminals are node SETS.
 
@@ -759,6 +760,11 @@ def solve_network(
             without a core -- takes a structural branch that leaves the operator exactly as it was.
         chi: susceptibility ``mu_r - 1`` per magnetic element. Complex is allowed, and is core loss.
         quad_m: sub-points per cell axis in the magnetic potential and the coupling.
+        magnetic_current: also return the magnetisation current ``I_m``, unscaled, as a fourth
+            value -- ``None`` when the model has no core. It is what core loss is computed from,
+            and it is otherwise dropped: the solve carries it as the scaled `x_m` and unpacks only
+            the electric slices. Gated rather than always returned so the ``cur, phi, inj`` unpack
+            every caller uses keeps working.
         operator: ``jno.solve.hierarchical(...)`` to compress the DENSE blocks of a welded network --
             a non-lattice part's own partial inductance and every cross block between parts. ``None``
             keeps the exact path, so this changes no existing answer. A plain lattice ignores it: the
@@ -1308,9 +1314,16 @@ def solve_network(
         # cannot reuse the first call's operator. Same failure shape as the device impedance above.
         mag_tag = 0 if (traced or not nm) else hash(np.asarray(chi).tobytes())
         key = (
-        id(fil), ne, nn, float(tol), int(restart), hash(cval_h.tobytes()), nm, mag_tag,
-        None if operator is None else (operator.tol, operator.leaf, operator.eta, operator.floor),
-    )
+            id(fil),
+            ne,
+            nn,
+            float(tol),
+            int(restart),
+            hash(cval_h.tobytes()),
+            nm,
+            mag_tag,
+            None if operator is None else (operator.tol, operator.leaf, operator.eta, operator.floor),
+        )
         entry = None if traced else _KRYLOV_CACHE.get(key)
         cached = entry[1] if (entry is not None and entry[0] is fil) else None
 
@@ -1493,6 +1506,11 @@ def solve_network(
     _check(jnp.all(jnp.isfinite(x)), _finite)
     cur, phi = x[:ne], x[ne : ne + nn]
     inj = {t: jnp.asarray(np.asarray(Asp0[idx[t]].sum(0)).reshape(-1), dtype=complex) @ cur for t in names}
+    if magnetic_current:
+        # UNSCALED. The unknown solved for is `x_m = sqrt(|g|) I_m` (see the symmetric scaling
+        # above), so handing back the raw slice would be the magnetisation current times a
+        # twelve-decade factor -- right shape, wrong number, and nothing downstream could tell.
+        return cur, phi, inj, (None if mag is None else x[ne + nn :] / mag_s)
     return cur, phi, inj
 
 
@@ -2834,8 +2852,13 @@ def _hier_apply(fil: Filaments, g, mu_scale, operator):
     from .hmatrix import materialize as hmat
 
     hm = hbuild(
-        fil.pos, fil.mom, np.asarray(fil.group), g,
-        tol=operator.tol, leaf=operator.leaf, eta=operator.eta,
+        fil.pos,
+        fil.mom,
+        np.asarray(fil.group),
+        g,
+        tol=operator.tol,
+        leaf=operator.leaf,
+        eta=operator.eta,
     )
     return hmat(hm, fil.pos, fil.mom, fil.self_g, g, scale=mu_scale)
 
@@ -2885,8 +2908,13 @@ def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3, quad_t
                 # passed through as they are: `hmatrix.build` refuses a tracer by name, which is a
                 # better error than whatever `np.asarray` would raise three frames deeper
                 hm = hbuild(
-                    sub.pos, sub.mom, np.asarray(sub.group), g,
-                    tol=operator.tol, leaf=operator.leaf, eta=operator.eta,
+                    sub.pos,
+                    sub.mom,
+                    np.asarray(sub.group),
+                    g,
+                    tol=operator.tol,
+                    leaf=operator.leaf,
+                    eta=operator.eta,
                 )
                 diag.append(hmat(hm, sub.pos, sub.mom, sub.self_g, g, scale=mu_scale))
             else:
