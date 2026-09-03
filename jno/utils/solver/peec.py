@@ -813,9 +813,14 @@ def solve_network(
     pidx_j = None if pidx is None else jnp.asarray(pidx)
     lat = getattr(fil, "lattice", None)
     welded = isinstance(lat, dict) and "welded" in lat
+    if welded and operator is None and any(b[2] is not None and b[2].get("graded") for b in lat["welded"]):
+        raise ValueError(
+            "peec.solve_network: a welded part is a GRADED lattice, which is not block-Toeplitz and "
+            "has no FFT. Pass `operator=jno.solve.hierarchical(...)`."
+        )
     has_lattice = lat is not None and (not welded or any(b[2] is not None for b in lat["welded"]))
     free_form = has_lattice if matrix_free is None else bool(matrix_free)
-    if lat is not None and lat.get("graded") and not welded and operator is None:
+    if lat is not None and lat.get("graded") and operator is None:
         raise ValueError(
             "peec.solve_network: this lattice is GRADED, which is what makes local refinement "
             "possible -- and it is not block-Toeplitz, so there is no FFT for it. Pass "
@@ -1885,7 +1890,9 @@ def bar_filaments(
         )
     )
     h = np.broadcast_to(np.asarray(h, dtype=float).reshape(-1), (3,)) if h is not None else np.zeros(3)
-    if np.any(h <= 0):
+    # `edges=` STATES the grid, so it needs no pitch to derive one from -- the requirement applies to
+    # the uniform path alone.
+    if edges is None and np.any(h <= 0):
         raise ValueError(
             "peec.bar_filaments: no cell pitch. Pass size=, or give the Shape a size= when you build "
             "it — a lattice count cannot be guessed from the geometry alone."
@@ -1914,7 +1921,7 @@ def bar_filaments(
         b0[: bnd.shape[1]], b1[: bnd.shape[1]] = bnd[0], bnd[1]
         lo, hi = np.minimum(lo, b0), np.maximum(hi, b1)
     ext = hi - lo
-    ext = np.where(ext > 0, ext, h)  # a flat axis is one cell thick
+    ext = np.where(ext > 0, ext, np.where(h > 0, h, 1.0))  # a flat axis is one cell thick
     if edges is None:
         n = np.maximum(1, np.round(ext / h).astype(int))
         d = ext / n  # cell pitch per axis, closing exactly on the box
@@ -2885,6 +2892,15 @@ def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3, quad_t
             else:
                 k = pair_matrix(sub.pos, sub.mom, g, sub.self_g, group=sub.group) * mu_scale
                 diag.append(lambda x, k=k: k @ x)
+        elif lat.get("graded"):
+            # a graded block is not Toeplitz either, so it takes the same hierarchical path as an
+            # unstructured one -- the FFT below would silently return the uniform-grid answer
+            if operator is None:
+                raise ValueError(
+                    "peec.welded_apply: one of these parts is a GRADED lattice, which has no FFT. "
+                    "Pass `operator=jno.solve.hierarchical(...)`."
+                )
+            diag.append(_hier_apply(sub, g, mu_scale, operator))
         else:
             diag.append(lattice_apply(sub, g, mu_scale=mu_scale, quad=quad, quad_t=quad_t))
         sel.append((lo, hi, rows, gl, cnt))
