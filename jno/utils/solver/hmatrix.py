@@ -447,7 +447,7 @@ def _replay_group(k, C, R, ipos, jpos):
     return Uc, Vc
 
 
-def _batched_blocks(P, M, Pb, Mb, rows, cols, g, chunk=16):
+def _batched_blocks(P, M, Pb, Mb, rows, cols, g, budget=64_000_000):
     """The exact element-element sub-blocks for a STACK of index pairs, in one jax pass.
 
     ``rows`` is ``(B, m)`` and ``cols`` is ``(B, n)``, both zero-padded; padded entries are masked to
@@ -455,14 +455,24 @@ def _batched_blocks(P, M, Pb, Mb, rows, cols, g, chunk=16):
 
     Two things make this affordable. The separation is taken by EXPANSION, ``|a-b|^2 = |a|^2 + |b|^2
     - 2 a.b``, which avoids ever forming the ``(B, m, n, nsub, nsub, 3)`` component tensor -- that
-    alone is 11 GB at leaf 64 -- and blocks are processed in chunks so the peak is bounded by
-    ``chunk`` rather than by the block count.
+    alone is 11 GB at leaf 64 -- and blocks are processed in chunks so the peak is bounded by the
+    chunk rather than by the block count.
+
+    **The chunk is sized to a memory BUDGET, not fixed.** It sets the whole working set, and the
+    working set is what decides where this method starts winning: the intermediates are four
+    ``(chunk, m, n, nsub, nsub)`` tensors, so a fixed ``chunk=16`` at leaf 64 costs 302 MB, and the
+    dense operator it replaces is only 168 MB until about 4,600 elements. Below that crossover the
+    compression cannot win however good it is -- and measuring there is what made an earlier profile
+    read "memory neutral". Budgeting the chunk instead moves the crossover down with the problem
+    rather than leaving it at a number nobody chose.
     """
     # Every distinct ARRAY SHAPE compiles its own executable and jax keeps it, so a short final
     # chunk or a per-group width doubles the compilation count for nothing. Padding the last chunk to
     # full width means one compiled kernel per (width, depth) rather than one per call -- the padded
     # rows index element 0 and are masked to zero by the caller, so they cost arithmetic and never
     # correctness.
+    per = max(1, 4 * rows.shape[1] * cols.shape[1] * P.shape[1] * Pb.shape[1] * 8)
+    chunk = int(min(max(1, budget // per), 64))
     nb = rows.shape[0]
     pad = (-nb) % chunk
     if pad:
@@ -537,10 +547,16 @@ def materialize(h: HMatrix, pos, mom, self_g, g: Callable, scale=1.0, b=None, tr
     far = []
     by_rank: dict = {}
     for (r, c, ip, jp), k in zip(h.far, h.ranks):
-        by_rank.setdefault(int(k), []).append((r, c, ip, jp))
-    for k, group in by_rank.items():
-        mw = max(len(r) for r, _c, _i, _j in group)
-        nw = max(len(c) for _r, c, _i, _j in group)
+        # Grouped by rank AND by a power-of-two WIDTH bucket. Rank alone is not enough: far-block
+        # widths span 64 to 594 on a real lattice, because the blocks ACA rejects sit high in the
+        # tree, and padding a group to its widest member then inflates two hundred 64-wide blocks to
+        # 594. Measured, that was 3.17 GB of working set to produce 0.174 GB of factors at 19,810
+        # elements -- and it grows with the block count rather than staying bounded. Bucketing caps
+        # the waste at 2x while keeping the number of distinct compiled shapes small.
+        w = 1 << max(int(np.ceil(np.log2(max(len(r), len(c), 1)))), 3)
+        by_rank.setdefault((int(k), w), []).append((r, c, ip, jp))
+    for (k, w), group in by_rank.items():
+        mw = nw = w
         rows = _pad_stack([r for r, _c, _i, _j in group], mw)
         cols = _pad_stack([c for _r, c, _i, _j in group], nw)
         # the pivot ROWS and COLUMNS, as element indices, and their positions within the block
