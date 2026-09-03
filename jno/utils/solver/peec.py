@@ -21,6 +21,7 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
+from dataclasses import dataclass
 from typing import NamedTuple
 
 import jax
@@ -1816,6 +1817,57 @@ def _warn_once(msg: str) -> None:
         logging.getLogger("jno").warning(msg)
 
 
+@dataclass(frozen=True)
+class GradedGrid:
+    """Ask `bar_filaments` for a grid refined toward every conductor face.
+
+    Built by :func:`jno.peec.graded`. Carries only the two numbers the user chooses -- how fine to
+    get and how far that reaches -- because everything else (the extent, the base pitch, which
+    coordinates are features) is already in the geometry.
+    """
+
+    fine: float
+    halo: float
+
+
+def _graded_edges(shapes, lo, hi, base, fine, halo):
+    """Cell boundaries at `base` spacing, refined to `fine` within `halo` of any conductor face.
+
+    The features worth resolving are the conductor FACES: current crowds at a trace edge, and every
+    real layout here puts a 1.0 mm trace on a plate tens of millimetres across, so no single pitch
+    serves both. Each shape contributes the six faces of its own bounding box.
+
+    Boundaries that differ by less than a twentieth of `fine` are MERGED. Unioning coordinate sets
+    is the natural way to grade a grid and `np.unique` will not do it: two `arange` calls that both
+    contain the same face disagree in the last bits, and the union then holds a cell 1e-19 wide,
+    with no volume and a singular operator. `bar_filaments` refuses such a cell by name; this makes
+    sure it never has to.
+    """
+    faces = [[], [], []]
+    for sh in shapes:
+        bnd = np.asarray(sh.bounds(), dtype=float).reshape(2, -1)
+        for a in range(bnd.shape[1]):
+            faces[a] += [float(bnd[0, a]), float(bnd[1, a])]
+    out = []
+    for a in range(3):
+        b = float(np.atleast_1d(base)[a] if np.ndim(base) else base)
+        if not (hi[a] > lo[a]):  # a flat axis is one cell thick, exactly as the uniform path has it
+            out.append(np.array([lo[a], lo[a] + (b if b > 0 else 1.0)]))
+            continue
+        sets = [np.arange(lo[a], hi[a] + 0.5 * b, b), np.array([lo[a], hi[a]])]
+        for e in faces[a]:
+            if lo[a] < e < hi[a]:
+                sets.append(np.arange(max(lo[a], e - halo), min(hi[a], e + halo) + 0.5 * fine, fine))
+        v = np.sort(np.concatenate([np.asarray(x, dtype=float).reshape(-1) for x in sets]))
+        v = v[(v >= lo[a]) & (v <= hi[a])]
+        keep = np.concatenate([[True], np.diff(v) > 0.05 * fine])
+        v = v[keep]
+        # the ends are the grid, not a suggestion: a merge must never move them
+        v[0], v[-1] = lo[a], hi[a]
+        out.append(v)
+    return out
+
+
 def _volume_rule(ln, wt, axis, quad: int, quad_t: int):
     """Tensor-product Gauss points over each element's VOLUME.
 
@@ -1940,6 +1992,10 @@ def bar_filaments(
         lo, hi = np.minimum(lo, b0), np.maximum(hi, b1)
     ext = hi - lo
     ext = np.where(ext > 0, ext, np.where(h > 0, h, 1.0))  # a flat axis is one cell thick
+    if isinstance(edges, GradedGrid):
+        # resolved HERE rather than by the caller, because the extent, the base pitch and the faces
+        # are all already in scope -- a caller would have to rederive all three to agree with them
+        edges = _graded_edges(shapes + frame, lo, lo + ext, h, edges.fine, edges.halo)
     if edges is None:
         n = np.maximum(1, np.round(ext / h).astype(int))
         d = ext / n  # cell pitch per axis, closing exactly on the box

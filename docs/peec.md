@@ -328,6 +328,48 @@ the gradient, because the host pass, not the solve, was the cost.
     A design variable may change a **conductivity**, never a **shape**. Build again for a new shape.
     The exception is the wire path — see below.
 
+## Grading the mesh
+
+By default every solid shares **one pitch**, taken from its own `size=`. That is what keeps the
+operator translation-invariant, and therefore what lets the apply be an FFT — but it cannot serve a
+real layout. A power module puts a 1.00 mm minimum trace on a plate tens of millimetres across, and
+resolving that trace uniformly costs one to three million elements, so the runs you can afford have
+**one cell across the narrowest conductor** — and current crowding has no edge to crowd against in a
+discretisation with no edge.
+
+`grid=` refines toward every conductor face instead:
+
+```python
+emag = jno.peec(
+    [v(*at("DC+")) - v(*at("DC-")) - 1.0],
+    freq=1e6,
+    grid=jno.peec.graded(fine=0.4e-3, halo=1.0e-3),
+)
+sol = emag.solve(operator=jno.solve.hierarchical(tol=1e-6))
+```
+
+Measured on layout1's plate-less loop against a converged Ansys Q3D reference of **54.505 nH**:
+
+| mesh | elements | `L` | error |
+|---|---:|---:|---:|
+| uniform 1.0 mm | 13 381 | 58.803 nH | +7.88 % |
+| uniform 0.5 mm | 53 458 | 57.957 nH | +6.33 % |
+| uniform 0.4 mm | 83 705 | 57.340 nH | +5.20 % |
+| **graded** | **8 192** | 57.299 nH | +5.13 % |
+| **graded** | **14 111** | 56.604 nH | **+3.85 %** |
+
+8 192 graded elements match 83 705 uniform ones, and 14 111 beat them outright while still falling —
+where the uniform sequence had flattened. The elements were never the problem; their placement was.
+
+!!! warning "A graded grid has no FFT"
+    Grading gives up translation invariance, so `lattice_apply` **refuses** a graded lattice rather
+    than returning the uniform-grid answer — which would be right where the spacing is constant and
+    wrong everywhere it changes. Pass `operator=jno.solve.hierarchical(...)` to `solve()`.
+
+`fine` is the cell size at a face and `halo` how far that reaches either side of one; the base
+spacing away from every face stays each shape's own `size=`. An axis with no interior face is left
+alone, so a grid is only refined where there is something to resolve.
+
 ## Reading the solution
 
 | readout | what it is |
