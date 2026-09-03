@@ -330,6 +330,47 @@ def _real_dirichlet_values(gs: Any, region: str) -> np.ndarray:
     return gs
 
 
+def _region_node_ids_from_cells(domain, region: str, cells: np.ndarray) -> Any:
+    """Node ids of a **volume sub-region** or an internal **interface**, from mesh topology.
+
+    ``None`` when ``region`` is neither, so the caller falls through to the boundary-facet path.
+
+    Both cases have no boundary facets of their own, and resolving them through the boundary path (or
+    through a proximity test against a region's sampled points) drops most of the node set **silently**
+    — an essential condition that stops being imposed. Measured on a two-region channel:
+    ``v("fluid|solid") - 0`` pinned **4 of 21** interface nodes (only the two endpoints that happen to
+    lie on the outer boundary), and a pin on a volume sub-region reached **32 of 33**.
+
+    Resolved instead from the cells the assembler actually integrates over, through the same
+    :func:`fem_utils._cell_region_mask` the region masking uses (a cell is in a region iff its centroid
+    is), so this cannot disagree with what was assembled. ``cells`` is the FIELD's connectivity, so a P2
+    edge midpoint on the interface is included: it belongs to a cell on each side, and the intersection
+    below keeps exactly the nodes both sides share.
+    """
+    src = set(getattr(domain, "_source_regions", None) or {}) | set(getattr(domain, "_shape_regions", None) or {})
+    if not src:
+        return None
+    cells = np.asarray(cells)
+
+    def _nodes(r):
+        m = np.asarray(_cell_region_mask(domain, r)).reshape(-1)
+        return np.unique(cells[m > 0]) if m.shape[0] == cells.shape[0] else None
+
+    if region in src:
+        return _nodes(region)
+    # The CONFORMING interface tag `A|B` — shared nodes, so the intersection of the two cell node sets.
+    # The non-conforming side tags (`A|B.A`) are deliberately not handled here: those faces are
+    # duplicated rather than shared, the tie machinery owns them, and a Dirichlet on one is the
+    # tie-overlap case that is refused elsewhere.
+    if region.count("|") == 1 and "." not in region:
+        a, b = region.split("|")
+        if a in src and b in src:
+            na, nb = _nodes(a), _nodes(b)
+            if na is not None and nb is not None:
+                return np.intersect1d(na, nb)
+    return None
+
+
 def _region_node_ids_from_pts(domain, region: str, pts_all: np.ndarray) -> List[int]:
     """Node ids in ``pts_all`` for ``region`` — a **geometric interior sub-region**
     (``domain.region(name, polygon)``) by point-in-polygon, else the region's location function.
@@ -2657,6 +2698,11 @@ def assemble_fem_native(
         ptags = getattr(domain, "_polygon_tags", {})
         if region in (getattr(domain, "_source_regions", {}) or {}) and ptags.get(region, (None,))[0] == "interior":
             return list(_region_node_ids_from_pts(domain, region, pts_all))
+        # A volume sub-region or an internal interface has no boundary facets, so the facet path below
+        # would resolve it to almost nothing. Take it from topology instead.
+        _topo = _region_node_ids_from_cells(domain, region, np.asarray(cells_f_all[fidx]))
+        if _topo is not None:
+            return [int(i) for i in _topo]
         bf = _boundary_facets(pts_all, np.asarray(cells_f_all[fidx]), dim, fields[fidx]["order"], _cell_type)
         if bf is None:
             return list(_region_node_ids_from_pts(domain, region, pts_all))
