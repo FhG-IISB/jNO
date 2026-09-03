@@ -36,7 +36,6 @@ import time
 
 import numpy as np
 
-logging.disable(logging.CRITICAL)
 
 
 def _paths():
@@ -243,6 +242,11 @@ if __name__ == "__main__":
     pitch = float(sys.argv[2]) if len(sys.argv) > 2 else 1.0
     wires = (sys.argv[3] != "0") if len(sys.argv) > 3 else True
     with_plane = (sys.argv[4] != "0") if len(sys.argv) > 4 else True
+    # Quieting the log is a SCRIPT concern and lives here rather than at module scope. At module
+    # scope it silenced the whole process on import, and this file is imported by a test -- which
+    # took out every other test in the suite that asserts on a warning. Three of them, silently.
+    logging.disable(logging.CRITICAL)
+
     # imported HERE, not at module scope: the geometry rule above is what regressed and what a test
     # has to reach, and it must not need a pypeec install to do it
     import pypeec
