@@ -291,9 +291,7 @@ class PEECSolution:
         """
         pts = jnp.asarray(points, dtype=float)
         if pts.ndim != 2 or pts.shape[1] != 3:
-            raise ValueError(
-                f"jno.peec: field() takes (n, 3) positions in metres, got shape {tuple(np.shape(points))}."
-            )
+            raise ValueError(f"jno.peec: field() takes (n, 3) positions in metres, got shape {tuple(np.shape(points))}.")
         f = self._fil
         src, mom, grp = jnp.asarray(f.pos), jnp.asarray(f.mom), jnp.asarray(f.group)
         cur = jnp.atleast_2d(self.i)
@@ -425,6 +423,7 @@ class PEEC:
                 "jno.peec: every region is named by a port, so there is no conductor left to carry current. "
                 "A terminal marks part of a conductor; it is not a conductor of its own."
             )
+
         def _attached(name):
             try:
                 return self.domain.attached(name)
@@ -677,7 +676,7 @@ class BuiltPEEC:
         for f in self.freq:
             _check_unresolved_thickness(fil, sig0, 2 * np.pi * float(f), MU0)
 
-    def solve(self, sigma=None, devices=None, weights=None, restart=None, matrix_free=None):
+    def solve(self, sigma=None, devices=None, weights=None, restart=None, matrix_free=None, operator=None):
         """Solve at every frequency and return a :class:`PEECSolution`.
 
         Args:
@@ -710,6 +709,12 @@ class BuiltPEEC:
             matrix_free: ``None`` decides by structure -- a network containing a bar lattice is
                 applied by FFT, anything else forms the dense operator. ``False`` forces the dense
                 path, exact but O(N^2) memory, so for small networks only.
+            operator: ``jno.solve.hierarchical(...)`` to compress a WELDED network's dense blocks --
+                the cross coupling between parts and a non-lattice part's own partial inductance.
+                Opt in: without it the operator is exact, so no existing answer moves. **It does
+                not yet pay on a bar lattice** -- ACA fails on the structural zeros between
+                perpendicular bar families, those blocks are detected and stored densely, and the
+                measured compression is 1.00x. See :mod:`~jno.utils.solver.hmatrix`.
         """
         fil, nodes, terms = self.fil, self.nodes, self.terminals
         if weights:
@@ -752,6 +757,7 @@ class BuiltPEEC:
                 omega=2 * np.pi * float(f),
                 **({} if restart is None else {"restart": int(restart)}),
                 **({} if matrix_free is None else {"matrix_free": bool(matrix_free)}),
+                **({} if operator is None else {"operator": operator}),
                 **({} if self.mag is None else {"mag": self.mag, "chi": self.mag.lattice["sigma"]}),
             )
             cur.append(c)

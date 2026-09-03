@@ -38,25 +38,28 @@ kernel evaluations plus one small pseudo-inverse, so the whole apply differentia
 the element POSITIONS -- which `pair_matrix` already does, deliberately (see the NaN guard there),
 and which an inverse design that moves metal depends on.
 
-**What it actually buys.** Measured on a trace layer -- a flat one-cell-thick plate of bars, which is
-the shape of every real power-module conductor -- at ``tol=1e-4``, ``leaf=64``, ``eta=2``:
+**STATUS: does not yet compress a PEEC bar lattice. Read this before using it.**
 
-    elements     1,540    3,510    7,965   16,705
-    compression   2.88x    4.85x    8.73x   14.45x
-    mean rank       8.5      9.0      8.5      8.7
-    far blocks      222      664    2,102    4,788
-    build         1.1 s    4.0 s   14.0 s   39.7 s
+The compression ratios first recorded here -- 2.88x at 1,540 elements rising to 14.45x at 16,705 --
+were measured on blocks that were NUMERICALLY WRONG, and are withdrawn. ACA silently failed on them
+and the storage of a wrong block means nothing. With the failures now detected and rejected
+(see `_aca`), a bar lattice compresses **1.00x**: every block is stored densely.
 
-The rank is flat across an 11x size range, which is the kernel behaving as theory says; the ratio
-goes as about ``N^0.68`` and the build as about ``O(N^1.34)``. Extrapolated to the ~100,000 elements
-a converged real layout needs, that is roughly **48x** and about seven minutes -- against a dense
-operator of 80 GB, which is the difference between impossible and routine. The build depends on
-geometry alone, so `_geom_cached` amortises it over a frequency sweep or a design iteration.
+The cause is structural, and it is specific to this operator. `mom_a . mom_b` vanishes *exactly*
+between perpendicular bar families, so any block spanning both has a 2x2 structure with zero
+off-diagonal parts. ACA's pivot chain stays inside one part, drives its residual small, stops, and
+leaves the rest untouched. Clusters here are geometric and x- and y-bars are interleaved in space, so
+essentially every block spans both families and essentially every block fails.
 
-Two parameter findings worth not re-deriving. ``leaf=64`` compresses better than ``leaf=256`` (4.85x
-against 2.46x at 3,510): larger leaves mean coarser blocks and *less* of the matrix reaches an
-admissible pair. And ``eta`` barely matters here -- 4.85x at ``eta=2`` against 4.93x at ``eta=4`` --
-so it is one fewer knob anyone needs to tune.
+**The fix, not yet implemented:** build one hierarchical operator PER MOMENT DIRECTION and skip the
+cross-family blocks entirely, since they are exactly zero. Within a family every moment is parallel,
+the structural zeros are gone, and ACA has nothing to trip over. That is the same block-diagonal
+structure `lattice_apply` already exploits and `bar_filaments` already documents -- "a bar's current
+runs along ONE axis, and mom_i . mom_j vanishes between perpendicular bars, so the partial-inductance
+operator is block diagonal by direction".
+
+Until then this module is correct -- verified against `pair_matrix` to round-off on a real lattice --
+and offers no speedup, so `jno.solve.hierarchical(...)` should not be switched on.
 
 **Scope limits, up front.** ACA is for *asymptotically smooth* kernels: ``1/r`` and its derivatives
 are fine, an oscillatory ``exp(ikr)/r`` at high ``kr`` is not, and this module makes no attempt to
@@ -244,6 +247,32 @@ def _aca(entry_rows, entry_cols, m: int, n: int, tol: float, maxrank: int):
         colr = np.abs(col)
         colr[np.array(ipiv, dtype=int)] = -1.0
         i = int(np.argmax(colr))
+
+    # VERIFY on rows ACA never visited, instead of trusting its stopping rule.
+    #
+    # ACA's rule watches the size of its own updates, which says nothing about a part of the block it
+    # never reached. On a matrix with ZERO SUB-BLOCKS the pivot chain can stay inside one part, drive
+    # that part's residual small, stop, and leave the rest at full magnitude -- and the partial
+    # inductance is exactly such a matrix, because `mom_a . mom_b` vanishes between perpendicular bar
+    # families. Measured on a real bar lattice: one block 100 % wrong, 18 % overall, while random
+    # scattered points stayed accurate to 1e-6 and every synthetic test passed.
+    #
+    # So a handful of unvisited rows are checked against the factorisation. Sampling rows rather than
+    # the whole block keeps this ~m/8 of the cost of forming what ACA exists to avoid forming, and a
+    # wholly missed sub-block cannot hide from it. Failing the check returns NO pivots, which the
+    # caller reads as "store this densely".
+    if not ipiv:
+        return np.array([], dtype=int), np.array([], dtype=int)
+    unseen = [t for t in range(m) if t not in seen_i]
+    probe = (unseen or list(range(m)))[:: max(1, len(unseen or range(m)) // 8)][:8]
+    for t in probe:
+        exact = np.array(entry_rows(t), dtype=float)
+        approx = np.zeros_like(exact)
+        for u, v in zip(us, vs):
+            approx = approx + u[t] * v
+        scale = np.abs(exact).max()
+        if scale > 0 and np.abs(approx - exact).max() > max(1e-8, 100.0 * tol) * scale:
+            return np.array([], dtype=int), np.array([], dtype=int)
     return np.array(ipiv, dtype=int), np.array(jpiv, dtype=int)
 
 
@@ -321,7 +350,7 @@ def build(
     )
 
 
-def materialize(h: HMatrix, pos, mom, self_g, g: Callable, scale=1.0, b=None):
+def materialize(h: HMatrix, pos, mom, self_g, g: Callable, scale=1.0, b=None, transpose=False):
     """``apply(x) -> K @ x`` in pure jax, rebuilding the block values from the frozen structure.
 
     Differentiable in ``pos`` and ``mom``: every value here is a kernel evaluation at frozen indices,
@@ -330,6 +359,12 @@ def materialize(h: HMatrix, pos, mom, self_g, g: Callable, scale=1.0, b=None):
     ``b`` is ``(pos, mom)`` of the second element set for a rectangular operator, and must be given
     exactly when the structure was built with one. ``self_g`` is then unused and may be ``None``:
     two different parts have no diagonal to carry.
+
+    ``transpose`` gives ``K^T @ x`` from the SAME structure rather than a second build. A welded
+    network needs both directions of every cross block -- the coupling appears once in each part's
+    row -- and the skeleton transposes exactly: ``(U R)^T = R^T U^T``. Building twice would cost
+    twice and, worse, could choose different pivots for the two directions, so the operator would
+    stop being symmetric.
     """
 
     def _resh(p, m, ne, nsub):
@@ -348,10 +383,23 @@ def materialize(h: HMatrix, pos, mom, self_g, g: Callable, scale=1.0, b=None):
     P, M = _resh(pos, mom, h.shape[0], h.nsub[0])
     Pb, Mb = (P, M) if h.square else _resh(b[0], b[1], h.shape[1], h.nsub[1])
 
+    # CONCRETE geometry evaluates the blocks in numpy; only a TRACED one needs jax.
+    #
+    # Not a micro-optimisation. There are three kernel evaluations per compressed block and one per
+    # dense block -- about a thousand small arrays on a 1,540-element network -- and issuing each as
+    # its own eager jax op costs ~76 ms of DISPATCH against microseconds of arithmetic: measured 35.6
+    # s to materialize what took 1.75 s to choose. The same pathology this file's `cross_block` note
+    # records for the PEEC assembly, where eager dispatch was 90 % of the solve. Values built on the
+    # host arrive as jaxpr constants and the apply is then pure arithmetic.
+    _host = not any(isinstance(x, jax.core.Tracer) for x in (P, M, Pb, Mb))
+    xp = np if _host else jnp
+    Pn, Mn, Pbn, Mbn = (np.asarray(P), np.asarray(M), np.asarray(Pb), np.asarray(Mb)) if _host else (P, M, Pb, Mb)
+
     def blk(rows, cols):
-        d = P[rows][:, None, :, None, :] - Pb[cols][None, :, None, :, :]
-        r = jnp.sqrt(jnp.clip((d * d).sum(-1), 1e-300))
-        mm = jnp.einsum("apc,bqc->abpq", M[rows], Mb[cols])
+        d = Pn[rows][:, None, :, None, :] - Pbn[cols][None, :, None, :, :]
+        r2 = (d * d).sum(-1)
+        r = xp.sqrt(r2 if _host else jnp.clip(r2, 1e-300))
+        mm = xp.einsum("apc,bqc->abpq", Mn[rows], Mbn[cols])
         return (mm * g(r)).sum((2, 3))
 
     # A near block straddling the diagonal contains entries where the row and column element are the
@@ -363,20 +411,51 @@ def materialize(h: HMatrix, pos, mom, self_g, g: Callable, scale=1.0, b=None):
         rj, cj = jnp.asarray(r), jnp.asarray(c)
         B = blk(r, c)
         if h.square:
-            B = jnp.where(np.asarray(r)[:, None] == np.asarray(c)[None, :], 0.0, B)
-        dense.append((rj, cj, B))
+            B = xp.where(np.asarray(r)[:, None] == np.asarray(c)[None, :], 0.0, B)
+        dense.append((rj, cj, jnp.asarray(B)))
     low = []
     for r, c, ip, jp in h.far:
-        C = blk(r, c[jp])  # (m, k)
-        R = blk(r[ip], c)  # (k, n)
-        G = blk(r[ip], c[jp])  # (k, k)
-        low.append((jnp.asarray(r), jnp.asarray(c), C @ jnp.linalg.pinv(G), R))
+        C = blk(r, c[jp])  # (m, k) -- the pivot COLUMNS of the block
+        R = blk(r[ip], c)  # (k, n) -- the pivot ROWS
+        # REPLAY ACA's recursion at the frozen pivots, rather than reconstructing from a skeleton.
+        #
+        # The skeleton `A[:,J] pinv(A[I,J]) A[I,:]` looks equivalent and is not. It matches ACA only
+        # where `A[I,J]` is well conditioned, which holds for a generic smooth kernel and FAILS on a
+        # structurally sparse one -- and the partial inductance is structurally sparse, because
+        # `mom_a . mom_b` vanishes exactly between perpendicular bar families. On a real bar lattice a
+        # block's pivot rows can land on x-bars while its pivot columns land on y-bars, making
+        # `A[I,J]` singular, `pinv` zero, and the whole block vanish: measured 100 % error on one
+        # block and 18 % overall, while random scattered points stayed accurate to 1e-6.
+        #
+        # With the pivot SEQUENCE fixed, ACA is a deterministic chain of rank-1 updates, so replaying
+        # it is pure arithmetic on `C` and `R` -- differentiable exactly as the skeleton was, and
+        # equal to what the host chose rather than merely close to it.
+        us, vs = [], []
+        for t in range(len(ip)):
+            row = R[t]
+            col = C[:, t]
+            for sdx in range(t):
+                row = row - us[sdx][ip[t]] * vs[sdx]
+                col = col - vs[sdx][jp[t]] * us[sdx]
+            vs.append(row / row[jp[t]])
+            us.append(col)
+        U = xp.stack(us, axis=1)  # (m, k)
+        V = xp.stack(vs, axis=0)  # (k, n)
+        low.append((jnp.asarray(r), jnp.asarray(c), jnp.asarray(U), jnp.asarray(V)))
     # the diagonal is the self term alone: `pair_matrix` zeroes sub-point pairs within one element
-    diag = (jnp.asarray(self_g) * (M.sum(1) ** 2).sum(-1)) if h.square else None
-    nrow = h.shape[0]
+    diag = jnp.asarray(np.asarray(self_g) * (Mn.sum(1) ** 2).sum(-1)) if (h.square and _host) else (
+        (jnp.asarray(self_g) * (M.sum(1) ** 2).sum(-1)) if h.square else None
+    )
+    nout = h.shape[1] if transpose else h.shape[0]
 
     def _one(x):
-        y = diag * x if h.square else jnp.zeros(nrow, x.dtype)
+        y = diag * x if h.square else jnp.zeros(nout, x.dtype)
+        if transpose:  # the diagonal is symmetric, so only the off-diagonal blocks flip
+            for r, c, B in dense:
+                y = y.at[c].add(B.T @ x[r])
+            for r, c, U, R in low:
+                y = y.at[c].add(R.T @ (U.T @ x[r]))
+            return y
         for r, c, B in dense:
             y = y.at[r].add(B @ x[c])
         for r, c, U, R in low:
@@ -390,3 +469,28 @@ def materialize(h: HMatrix, pos, mom, self_g, g: Callable, scale=1.0, b=None):
         return scale * _one(x)
 
     return apply
+
+
+class HierarchicalSpec:
+    """What ``jno.solve.hierarchical(...)`` returns: how to compress, not what to compress.
+
+    A value object, deliberately -- it carries no geometry, so one spec serves every block of a
+    welded network and the same spec can be reused across a frequency sweep.
+    """
+
+    __slots__ = ("tol", "leaf", "eta", "floor")
+
+    def __init__(self, tol: float, leaf: int, eta: float, floor: int):
+        self.tol, self.leaf, self.eta, self.floor = float(tol), int(leaf), float(eta), int(floor)
+
+    def __repr__(self):
+        return f"hierarchical(tol={self.tol:g}, leaf={self.leaf}, eta={self.eta:g}, floor={self.floor})"
+
+    def worth_it(self, na: int, nb: int) -> bool:
+        """Whether a block this size is worth compressing at all.
+
+        Below the floor the dense block is both exact and faster -- measured, the ratio is 1.38x at
+        370 elements and under 3x at 1,540 -- so this returns False and the caller keeps the exact
+        path. A compression that is slower than what it replaces is a defect, not a tuning choice.
+        """
+        return min(na, nb) >= self.floor
