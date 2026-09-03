@@ -354,9 +354,7 @@ def build(
     if fam is not None and len(fam) > 1:
         near, far, ranks = [], [], []
         for sel in fam:
-            sub = build(
-                pos, mom, group, g, tol=tol, leaf=leaf, eta=eta, _only=sel
-            )
+            sub = build(pos, mom, group, g, tol=tol, leaf=leaf, eta=eta, _only=sel)
             near += [(sel[r], sel[c]) for r, c in sub.near]
             far += [(sel[r], sel[c], i, j) for r, c, i, j in sub.far]
             ranks += list(sub.ranks)
@@ -398,9 +396,7 @@ def build(
             stack += [(ca[0], bb), (ca[1], bb)]
         else:
             stack += [(ca[0], cb[0]), (ca[0], cb[1]), (ca[1], cb[0]), (ca[1], cb[1])]
-    return HMatrix(
-        (len(cen), len(cenb)), (P.shape[1], Pb.shape[1]), tuple(near), tuple(far), tuple(ranks), square
-    )
+    return HMatrix((len(cen), len(cenb)), (P.shape[1], Pb.shape[1]), tuple(near), tuple(far), tuple(ranks), square)
 
 
 def _pad_stack(idx_lists, width, fill=0):
@@ -429,21 +425,31 @@ def _blocks_chunk(P, M, Pb, Mb, R, C, g):
 
 
 @partial(jax.jit, static_argnums=(0,))
-def _replay_group(k, C, R, ipos, jpos):
-    """ACA's recursion at frozen pivots, for a whole rank group. JITTED for the same reason: the
-    per-step functional updates are buffer reuse under XLA and fresh allocations without it."""
+def _replay_group(k, C, R, ipos, jpos, kb):
+    """ACA's recursion at frozen pivots, for a whole width bucket. JITTED for the same reason: the
+    per-step functional updates are buffer reuse under XLA and fresh allocations without it.
+
+    ``kb`` is each block's OWN rank. The bucket is padded to its maximum so that one stack serves
+    every rank in it, and a block's steps beyond its own rank write zeros into both factors -- so
+    they contribute nothing to ``U @ V`` and nothing to any later step, which reads those same
+    zeros through ``past``.
+    """
     Uc = jnp.zeros((C.shape[0], C.shape[1], k), C.dtype)
     Vc = jnp.zeros((C.shape[0], k, R.shape[2]), C.dtype)
     ar = jnp.arange(k)
     for t in range(k):
         past = (ar < t).astype(C.dtype)
+        alive = (kb > t)[:, None]
         urow = jnp.take_along_axis(Uc, ipos[:, t : t + 1, None], axis=1)[:, 0, :]
         row = R[:, t, :] - jnp.einsum("bk,bkn->bn", urow * past, Vc)
         vcol = jnp.take_along_axis(Vc, jpos[:, None, t : t + 1], axis=2)[:, :, 0]
         col = C[:, :, t] - jnp.einsum("bk,bmk->bm", vcol * past, Uc)
         piv = jnp.take_along_axis(row, jpos[:, t : t + 1], axis=1)
-        Uc = Uc.at[:, :, t].set(col)
-        Vc = Vc.at[:, t, :].set(row / piv)
+        # The guard on `piv` is for the DEAD steps only -- a live pivot is what ACA selected and is
+        # nonzero by construction. Dividing first and masking after would put an inf through the
+        # `where`, which is fine forward and NaN in the gradient.
+        Uc = Uc.at[:, :, t].set(jnp.where(alive, col, 0.0))
+        Vc = Vc.at[:, t, :].set(jnp.where(alive, row / jnp.where(alive, piv, 1.0), 0.0))
     return Uc, Vc
 
 
@@ -482,6 +488,32 @@ def _batched_blocks(P, M, Pb, Mb, rows, cols, g, budget=64_000_000):
     for lo in range(0, rows.shape[0], chunk):
         outs.append(_blocks_chunk(P, M, Pb, Mb, rows[lo : lo + chunk], cols[lo : lo + chunk], g))
     return jnp.concatenate(outs, axis=0)[:nb]
+
+
+def _far_buckets(h: "HMatrix") -> dict:
+    """Far blocks grouped into the padded stacks `materialize` replays, keyed by width.
+
+    Lifted out of `materialize` because the GROUP COUNT is the quantity this batching exists to
+    minimise, and it is otherwise invisible: a regression here keeps every answer correct and only
+    costs memory, which no accuracy oracle can catch.
+    """
+    out: dict = {}
+    for (r, c, ip, jp), k in zip(h.far, h.ranks):
+        # Bucketed by a power-of-two WIDTH. Far-block widths span 64 to 594 on a real lattice,
+        # because the blocks ACA rejects sit high in the tree, and padding a group to its widest
+        # member then inflates two hundred 64-wide blocks to 594. Measured, that was 3.17 GB of
+        # working set to produce 0.174 GB of factors at 19,810 elements -- and it grows with the
+        # block count rather than staying bounded. Bucketing caps the waste at 2x while keeping the
+        # number of distinct compiled shapes small.
+        #
+        # RANK is padded WITHIN the bucket rather than keyed on as well. Keying on it split a real
+        # lattice into 40 groups where width alone gives 5, and `_replay_group` is jitted on `k`, so
+        # each distinct rank also compiled its own executable -- 15 against 5. Measured at 6,280
+        # elements; the padded steps are masked and cost 1.33x the ACA arithmetic, a ratio stable
+        # against problem size (1.30x at 1,540).
+        w = 1 << max(int(np.ceil(np.log2(max(len(r), len(c), 1)))), 3)
+        out.setdefault(w, []).append((r, c, ip, jp, int(k)))
+    return out
 
 
 def materialize(h: HMatrix, pos, mom, self_g, g: Callable, scale=1.0, b=None, transpose=False):
@@ -543,31 +575,31 @@ def materialize(h: HMatrix, pos, mom, self_g, g: Callable, scale=1.0, b=None, tr
             vals = jnp.where(same & live, 0.0, vals)
         near = [(jnp.asarray(rows), jnp.asarray(cols), vals)]
 
-    # ---- far blocks: one padded stack PER RANK, so the ACA replay batches exactly -------------
+    # ---- far blocks: one padded stack PER WIDTH, so the ACA replay batches exactly ------------
     far = []
-    by_rank: dict = {}
-    for (r, c, ip, jp), k in zip(h.far, h.ranks):
-        # Grouped by rank AND by a power-of-two WIDTH bucket. Rank alone is not enough: far-block
-        # widths span 64 to 594 on a real lattice, because the blocks ACA rejects sit high in the
-        # tree, and padding a group to its widest member then inflates two hundred 64-wide blocks to
-        # 594. Measured, that was 3.17 GB of working set to produce 0.174 GB of factors at 19,810
-        # elements -- and it grows with the block count rather than staying bounded. Bucketing caps
-        # the waste at 2x while keeping the number of distinct compiled shapes small.
-        w = 1 << max(int(np.ceil(np.log2(max(len(r), len(c), 1)))), 3)
-        by_rank.setdefault((int(k), w), []).append((r, c, ip, jp))
-    for (k, w), group in by_rank.items():
+    for w, group in _far_buckets(h).items():
         mw = nw = w
-        rows = _pad_stack([r for r, _c, _i, _j in group], mw)
-        cols = _pad_stack([c for _r, c, _i, _j in group], nw)
+        kb = np.array([k for _r, _c, _i, _j, k in group])
+        k = int(kb.max())
+        rows = _pad_stack([r for r, _c, _i, _j, _k in group], mw)
+        cols = _pad_stack([c for _r, c, _i, _j, _k in group], nw)
         # the pivot ROWS and COLUMNS, as element indices, and their positions within the block
-        prow = _pad_stack([r[i] for r, _c, i, _j in group], k)
-        pcol = _pad_stack([c[j] for _r, c, _i, j in group], k)
-        ipos = jnp.asarray(_pad_stack([i for _r, _c, i, _j in group], k))
-        jpos = jnp.asarray(_pad_stack([j for _r, _c, _i, j in group], k))
+        prow = _pad_stack([r[i] for r, _c, i, _j, _k in group], k)
+        pcol = _pad_stack([c[j] for _r, c, _i, j, _k in group], k)
+        ipos = _pad_stack([i for _r, _c, i, _j, _k in group], k)
+        jpos = _pad_stack([j for _r, _c, _i, j, _k in group], k)
+        # A block shorter than its bucket's rank repeats its FIRST pivot in the dead slots. Those
+        # steps are masked out of the factors anyway; the point is that `_pad_stack`'s zero would
+        # pair element 0 with itself, and a coincident pair is the one place this kernel is 1e150
+        # rather than an ordinary number. Repeating a real pivot keeps the arithmetic in range.
+        dead = np.arange(k)[None, :] >= kb[:, None]
+        prow, pcol = np.where(dead, prow[:, :1], prow), np.where(dead, pcol[:, :1], pcol)
+        ipos, jpos = np.where(dead, ipos[:, :1], ipos), np.where(dead, jpos[:, :1], jpos)
+        ipos, jpos = jnp.asarray(ipos), jnp.asarray(jpos)
         C = _batched_blocks(P, M, Pb, Mb, rows, pcol, g)  # (B, m, k)
         R = _batched_blocks(P, M, Pb, Mb, prow, cols, g)  # (B, k, n)
-        live_m = jnp.asarray(np.arange(mw)[None, :] < np.array([[len(r)] for r, _c, _i, _j in group]))
-        live_n = jnp.asarray(np.arange(nw)[None, :] < np.array([[len(c)] for _r, c, _i, _j in group]))
+        live_m = jnp.asarray(np.arange(mw)[None, :] < np.array([[len(r)] for r, _c, _i, _j, _k in group]))
+        live_n = jnp.asarray(np.arange(nw)[None, :] < np.array([[len(c)] for _r, c, _i, _j, _k in group]))
         # ACA's recursion replayed at the frozen pivots -- k steps, batched across the whole group.
         # The skeleton form `A[:,J] pinv(A[I,J]) A[I,:]` is NOT equivalent: it needs `A[I,J]` well
         # conditioned, which fails on this operator's structural zeros. See `_aca`.
@@ -577,7 +609,7 @@ def materialize(h: HMatrix, pos, mom, self_g, g: Callable, scale=1.0, b=None, tr
         # rank group, which measured 2.66 GB and 45.9 s where the unbatched version took 0.38 GB.
         # As a masked matmul it is two ops per step, so O(k), and the factors are written into
         # preallocated arrays that are exactly the output.
-        Uc, Vc = _replay_group(k, C, R, ipos, jpos)
+        Uc, Vc = _replay_group(k, C, R, ipos, jpos, jnp.asarray(kb))
         U = jnp.where(live_m[:, :, None], Uc, 0.0)  # (B, m, k)
         V = jnp.where(live_n[:, None, :], Vc, 0.0)  # (B, k, n)
         far.append((jnp.asarray(rows), jnp.asarray(cols), U, V))
