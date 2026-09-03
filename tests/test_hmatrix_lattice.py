@@ -110,3 +110,38 @@ def test_the_tolerance_holds_on_a_lattice(tol):
     got = np.asarray(materialize(build(pos, mom, grp, G, tol=tol, leaf=64), pos, mom, sg, G)(x))
     rel = np.linalg.norm(got - want) / np.linalg.norm(want)
     assert rel < max(1e-9, 1e3 * tol), (tol, rel)
+
+
+def test_the_far_blocks_batch_into_one_stack_per_width():
+    """The group count is what the batching exists to minimise, and no accuracy oracle can see it.
+
+    Every far block is replayed inside a padded stack, and each stack is alive at once while
+    `materialize` runs -- so the number of stacks, not the number of blocks, is what sets the peak.
+    Keying those stacks on rank as well as width split a real lattice into 40 groups where width
+    alone gives 5, and `_replay_group` is jitted on the rank, so each distinct rank compiled its own
+    executable too. This pins both: one bucket per width, and every block in a bucket replayed at
+    the bucket's rank.
+    """
+    from jno.utils.solver.hmatrix import _far_buckets
+
+    f = _plate(pitch_mm=0.5)
+    pos, mom, grp, _sg = _arrays(f)
+    h = build(pos, mom, grp, G, tol=1e-6, leaf=64)
+    buckets = _far_buckets(h)
+
+    assert len(buckets) == len({w for w in buckets}), "a width must key exactly one bucket"
+    widths = {1 << max(int(np.ceil(np.log2(max(len(r), len(c), 1)))), 3) for r, c, _i, _j in h.far}
+    assert set(buckets) == widths
+    # the fragmentation this replaced: one group per (rank, width) pair
+    by_rank_and_width = {
+        (k, w)
+        for (r, c, _i, _j), k, w in zip(
+            h.far, h.ranks, (1 << max(int(np.ceil(np.log2(max(len(r), len(c), 1)))), 3) for r, c, _i, _j in h.far)
+        )
+    }
+    assert len(buckets) < len(by_rank_and_width) / 3, (len(buckets), len(by_rank_and_width))
+    # and every block landed in exactly one bucket, with its own rank carried alongside
+    assert sum(len(g) for g in buckets.values()) == len(h.far)
+    for w, group in buckets.items():
+        assert all(len(r) <= w and len(c) <= w for r, c, _i, _j, _k in group)
+        assert all(k <= max(kk for *_r, kk in group) for *_r, k in group)
