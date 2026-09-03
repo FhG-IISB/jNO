@@ -37,7 +37,6 @@ import time
 import numpy as np
 
 
-
 def _paths():
     """The two inputs, NAMED rather than hard-coded -- neither lives in this repo.
 
