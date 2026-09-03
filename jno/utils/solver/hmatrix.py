@@ -38,12 +38,39 @@ kernel evaluations plus one small pseudo-inverse, so the whole apply differentia
 the element POSITIONS -- which `pair_matrix` already does, deliberately (see the NaN guard there),
 and which an inverse design that moves metal depends on.
 
+**What it actually buys.** Measured on a trace layer -- a flat one-cell-thick plate of bars, which is
+the shape of every real power-module conductor -- at ``tol=1e-4``, ``leaf=64``, ``eta=2``:
+
+    elements     1,540    3,510    7,965   16,705
+    compression   2.88x    4.85x    8.73x   14.45x
+    mean rank       8.5      9.0      8.5      8.7
+    far blocks      222      664    2,102    4,788
+    build         1.1 s    4.0 s   14.0 s   39.7 s
+
+The rank is flat across an 11x size range, which is the kernel behaving as theory says; the ratio
+goes as about ``N^0.68`` and the build as about ``O(N^1.34)``. Extrapolated to the ~100,000 elements
+a converged real layout needs, that is roughly **48x** and about seven minutes -- against a dense
+operator of 80 GB, which is the difference between impossible and routine. The build depends on
+geometry alone, so `_geom_cached` amortises it over a frequency sweep or a design iteration.
+
+Two parameter findings worth not re-deriving. ``leaf=64`` compresses better than ``leaf=256`` (4.85x
+against 2.46x at 3,510): larger leaves mean coarser blocks and *less* of the matrix reaches an
+admissible pair. And ``eta`` barely matters here -- 4.85x at ``eta=2`` against 4.93x at ``eta=4`` --
+so it is one fewer knob anyone needs to tune.
+
 **Scope limits, up front.** ACA is for *asymptotically smooth* kernels: ``1/r`` and its derivatives
 are fine, an oscillatory ``exp(ikr)/r`` at high ``kr`` is not, and this module makes no attempt to
 detect that -- it reports the rank it needed, and a rank that grows to the block size is the signal.
 The accuracy is a tolerance you choose, unlike the FFT which is exact to round-off. And the build is
 host work that only pays for itself above a few thousand elements; below that the dense
-`pair_matrix` is both exact and faster.
+`pair_matrix` is both exact and faster -- at 1,540 elements the ratio is under 3x and at 370 it is
+1.38x, so this is not the small-network path and does not try to be.
+
+The build cost is dominated by the per-block ACA kernel evaluations, at a near-constant 5-8 ms a
+block; the block count is what grows. Caching the cluster boxes (below) removes an ``O(|cluster|)``
+cost from every admissibility test but did **not** move the measured build time at these sizes,
+because that was never the bottleneck -- it is kept as the algorithmically correct thing to do at
+larger N, not as a measured improvement.
 """
 
 from __future__ import annotations
@@ -125,14 +152,17 @@ def cluster(cen: np.ndarray, leaf: int):
     return nodes, children
 
 
-def _admissible(cen, a, b, eta: float) -> bool:
+def _admissible(box_a, box_b, eta: float) -> bool:
     """``min(diam A, diam B) <= eta * dist(A, B)`` -- the standard condition.
 
     Two clusters are far enough apart, relative to their own size, that the kernel is smooth across
     the block and a low-rank approximation converges. `eta` trades rank against block count.
+
+    Takes PRECOMPUTED boxes. Recomputing them per test costs ``O(|cluster|)`` each and ``O(N)`` at
+    the root, which turned the build into ``O(N^1.7)`` -- measured 4.0 s at 3,510 elements and
+    extrapolating to ~18 minutes at 100,000, where the tree itself is ``O(N log N)``.
     """
-    la, ha, da = _boxes(cen, a)
-    lb, hb, db = _boxes(cen, b)
+    (la, ha, da), (lb, hb, db) = box_a, box_b
     gap = np.maximum(0.0, np.maximum(lb - ha, la - hb))
     dist = float(np.linalg.norm(gap))
     if dist <= 0.0:
@@ -232,6 +262,7 @@ def build(pos, mom, group, g: Callable, *, tol: float = 1e-6, leaf: int = 64, et
         return (mm * g(r)).sum((2, 3))
 
     nodes, children = cluster(cen, leaf)
+    box = [_boxes(cen, idx) for idx in nodes]  # once per NODE, not once per block pair
     near: list = []
     far: list = []
     ranks: list = []
@@ -239,7 +270,7 @@ def build(pos, mom, group, g: Callable, *, tol: float = 1e-6, leaf: int = 64, et
     while stack:
         a, b = stack.pop()
         ia, ib = nodes[a], nodes[b]
-        if _admissible(cen, ia, ib, eta):
+        if _admissible(box[a], box[b], eta):
             rows = lambda i, ia=ia, ib=ib: blk(ia[i : i + 1], ib)[0]
             cols = lambda j, ia=ia, ib=ib: blk(ia, ib[j : j + 1])[:, 0]
             ip, jp = _aca(rows, cols, len(ia), len(ib), tol, maxrank=min(len(ia), len(ib)))
