@@ -815,6 +815,13 @@ def solve_network(
     welded = isinstance(lat, dict) and "welded" in lat
     has_lattice = lat is not None and (not welded or any(b[2] is not None for b in lat["welded"]))
     free_form = has_lattice if matrix_free is None else bool(matrix_free)
+    if lat is not None and lat.get("graded") and not welded and operator is None:
+        raise ValueError(
+            "peec.solve_network: this lattice is GRADED, which is what makes local refinement "
+            "possible -- and it is not block-Toeplitz, so there is no FFT for it. Pass "
+            "`operator=jno.solve.hierarchical(...)`, which applies an unstructured operator by "
+            "hierarchical compression. The dense path is the other option and costs O(N^2) memory."
+        )
     if free_form and lat is None:
         raise ValueError(
             "peec.solve_network: matrix_free=True needs a lattice somewhere in the network, and these "
@@ -897,7 +904,11 @@ def solve_network(
             lambda: (
                 welded_apply(fil, lambda r: 1.0 / r, mu_scale=scale, operator=operator)
                 if welded
-                else lattice_apply(fil, lambda r: 1.0 / r, mu_scale=scale)
+                else (
+                    _hier_apply(fil, lambda r: 1.0 / r, scale, operator)
+                    if lat.get("graded")
+                    else lattice_apply(fil, lambda r: 1.0 / r, mu_scale=scale)
+                )
             ),
         )
         Z = None
@@ -1804,7 +1815,9 @@ def _volume_rule(ln, wt, axis, quad: int, quad_t: int):
     return off, w
 
 
-def bar_filaments(shape, size=None, quad: int = 3, quad_t: int = 2, sigma=None, freq: float = 0.0, grid_shapes=()):
+def bar_filaments(
+    shape, size=None, quad: int = 3, quad_t: int = 2, sigma=None, freq: float = 0.0, grid_shapes=(), edges=None
+):
     """Discretise a box conductor into a regular lattice of rectangular bars.
 
     A solid does not have a centreline, so a line's discretisation does not apply. The volume is cut
@@ -1902,8 +1915,55 @@ def bar_filaments(shape, size=None, quad: int = 3, quad_t: int = 2, sigma=None, 
         lo, hi = np.minimum(lo, b0), np.maximum(hi, b1)
     ext = hi - lo
     ext = np.where(ext > 0, ext, h)  # a flat axis is one cell thick
-    n = np.maximum(1, np.round(ext / h).astype(int))
-    d = ext / n  # cell pitch per axis, closing exactly on the box
+    if edges is None:
+        n = np.maximum(1, np.round(ext / h).astype(int))
+        d = ext / n  # cell pitch per axis, closing exactly on the box
+        # a GRADED grid is the same arrays with a per-cell pitch, so the whole of the rest of this
+        # function is written against `dax` and the uniform case simply repeats one value
+        dax = [np.full(int(n[a]), float(d[a])) for a in range(3)]
+        org = lo.copy()
+    else:
+        # A GRADED RECTILINEAR grid: per-axis cell boundaries instead of one pitch.
+        #
+        # Cells stay axis-aligned boxes, so `bar_self` and `_volume_rule` are unchanged, and the grid
+        # stays logically structured (i, j, k) -- so there are no hanging nodes, the incidence is the
+        # same, and nothing needs a tie. What it gives up is translation invariance: the kernel no
+        # longer depends on the index offset alone, so the FFT does NOT apply and the operator has to
+        # be `jno.solve.hierarchical(...)`. What it buys is resolution where the features are, which
+        # a single pitch cannot give -- every real layout here has a 1.0 mm minimum trace on a
+        # 96 x 74 mm plate, and resolving it uniformly costs 1-3 M elements.
+        if len(edges) != 3:
+            raise ValueError(f"peec.bar_filaments: edges= needs one array of cell boundaries per axis, got {len(edges)}.")
+        eax = [np.asarray(e, dtype=float).reshape(-1) for e in edges]
+        for a, e in enumerate(eax):
+            if e.size < 2 or not np.all(np.diff(e) > 0):
+                raise ValueError(
+                    f"peec.bar_filaments: edges[{a}] must be at least two STRICTLY INCREASING cell "
+                    f"boundaries; got {e.size} values. A repeated boundary is a zero-width cell, which "
+                    "has no volume and no self term."
+                )
+            # ...and a boundary that is merely ALMOST repeated is just as bad, which `> 0` does not
+            # catch. Building edges by unioning two coordinate sets is the natural way to grade a
+            # grid, and `np.unique` does not merge floats that differ in the last bit -- so 0.8 mm
+            # from two different `linspace` calls yields a cell 1e-19 wide, zero volume, and a
+            # singular operator reported from inside a preconditioner callback with nothing pointing
+            # back here. Measured: exactly that, on the first graded solve attempted.
+            step = np.diff(e)
+            span = float(e[-1] - e[0])
+            if span > 0 and step.min() < 1e-6 * span:
+                k = int(np.argmin(step))
+                raise ValueError(
+                    f"peec.bar_filaments: edges[{a}] has a cell of width {step.min():.3e} between "
+                    f"{e[k]:.9g} and {e[k + 1]:.9g}, which is {step.min() / span:.1e} of the axis span. "
+                    "A cell that thin has no usable volume and makes the operator singular. If these "
+                    "edges came from merging two coordinate sets, round them to a common tolerance "
+                    "before taking the union -- `np.unique` keeps values that differ in the last bit."
+                )
+        dax = [np.diff(e) for e in eax]
+        n = np.array([len(v) for v in dax], dtype=int)
+        d = np.array([float(v.mean()) for v in dax])  # nominal, for reporting only
+        org = np.array([float(e[0]) for e in eax])
+        lo = org
     if not np.all(np.isfinite(d)) or np.any(d <= 0):
         raise ValueError(f"peec.bar_filaments: the box has a zero or non-finite extent {tuple(ext)}.")
     if int(n.max()) < 2:
@@ -1911,12 +1971,16 @@ def bar_filaments(shape, size=None, quad: int = 3, quad_t: int = 2, sigma=None, 
             f"peec.bar_filaments: a pitch of {h} puts one cell across every axis of this box, so no bar "
             "joins two cells and no current can flow. Use a smaller size=."
         )
+    # cell centres per axis, from the cumulative boundaries -- identical to lo + (i + 0.5) * d when
+    # the spacing is uniform, so the uniform path is unchanged to the last bit
+    cax = [org[a] + np.cumsum(dax[a]) - 0.5 * dax[a] for a in range(3)]
 
     # A regular grid over the BOUNDING BOX, then a mask: the grid deliberately ignores the shape, so
     # an L-shaped trace or a slot is a pattern of absent cells rather than a distorted mesh. That is
     # what keeps the operator translation-invariant, and therefore what keeps the FFT applicable.
     ijk = np.stack(np.meshgrid(*[np.arange(v) for v in n], indexing="ij"), axis=-1).reshape(-1, 3)
-    centres = lo + (ijk + 0.5) * d
+    centres = np.stack([cax[a][ijk[:, a]] for a in range(3)], axis=1)
+    cell_d = np.stack([dax[a][ijk[:, a]] for a in range(3)], axis=1)  # this cell's own size per axis
     # which conductor owns each cell: the first one containing it, matching how Shape.regions resolves
     own = np.full(len(centres), -1, dtype=int)
     for si, sh in enumerate(shapes):
@@ -1964,6 +2028,7 @@ def bar_filaments(shape, size=None, quad: int = 3, quad_t: int = 2, sigma=None, 
     nid[np.flatnonzero(keep)] = np.arange(int(keep.sum()))
     nid = nid.reshape(tuple(n))
     nodes = centres[keep]
+    node_d = cell_d[keep]  # each live cell's own size per axis; one value repeated when uniform
     cell_part = own[keep]
 
     # How thick the CONDUCTOR is across each direction, and into how many cells that is divided.
@@ -2002,17 +2067,25 @@ def bar_filaments(shape, size=None, quad: int = 3, quad_t: int = 2, sigma=None, 
         k = len(na)
         u = np.zeros((k, 3))
         u[:, ax] = 1.0
-        w, t = [d[i] for i in range(3) if i != ax]
         t0, t1 = [i for i in range(3) if i != ax]
+        # A bar joins two cells adjacent along `ax`, so they share their transverse extent and the
+        # bar's cross-section is that cell's own. Its LENGTH is centre to centre, which is half of
+        # each cell's size along the axis -- equal to the pitch when uniform, and not when graded.
+        w, t = node_d[na][:, t0], node_d[na][:, t1]
+        blen = 0.5 * (node_d[na][:, ax] + node_d[nb][:, ax])
         r0, r1 = runs[t0][a][live].reshape(-1), runs[t1][a][live].reshape(-1)
-        e0, e1 = r0 * d[t0], r1 * d[t1]
+        # The conductor's thickness across each transverse direction. On a graded grid the run is a
+        # COUNT of cells that need not be equal, so this takes the local cell size as representative
+        # -- exact when uniform, and an approximation for the skin-depth gate otherwise. It decides
+        # which impedance model applies, never a solved value.
+        e0, e1 = r0 * w, r1 * t
         thin = e0 <= e1
         skin.append(np.where(thin, e0, e1))  # the conductor's THICKNESS, not the cell pitch
         span.append(np.where(thin, r0, r1))  # 1 means this element is the whole thickness
         cen.append(0.5 * (pa + pb))
         tan.append(u)
-        ln.append(np.full(k, d[ax]))
-        area.append(np.full(k, w * t))
+        ln.append(blen)
+        area.append(w * t)
         ends.append((na, nb))
         axis.append(np.full(k, ax))
         owner.append(np.stack([cell_part[na], cell_part[nb]], axis=1))
@@ -2128,7 +2201,8 @@ def bar_filaments(shape, size=None, quad: int = 3, quad_t: int = 2, sigma=None, 
             "series combination."
         )
 
-    wt = np.stack([np.array([d[i] for i in range(3) if i != ax]) for ax in axis])
+    # the two transverse sizes of each bar's own cell, which on a graded grid vary bar to bar
+    wt = np.stack([np.array([node_d[e][i] for i in range(3) if i != int(ax)]) for e, ax in zip(end_a, axis)])
     if sheets:  # a sheet is as thick as the layer its current occupies, not as the conductor
         for r in np.flatnonzero(sheet_thin >= 0):
             cols = [c for c in range(3) if c != int(axis[r])]
@@ -2174,6 +2248,12 @@ def bar_filaments(shape, size=None, quad: int = 3, quad_t: int = 2, sigma=None, 
         {
             "n": tuple(int(v) for v in n),
             "d": tuple(float(v) for v in d),
+            # A GRADED grid is not translation invariant: the kernel depends on where the cells are,
+            # not just on their index offset, so it is NOT block-Toeplitz and the FFT does not apply.
+            # Carried explicitly rather than inferred, because every consumer of this dict assumes
+            # uniformity and would otherwise be silently wrong rather than absent.
+            "graded": edges is not None,
+            "dax": None if edges is None else tuple(np.asarray(v) for v in dax),
             # The grid's ORIGIN -- the lower corner of cell (0,0,0)'s box. Two meshes are the same
             # lattice only if all three agree: same shape, same pitch, SAME ORIGIN. Shape and pitch
             # alone are not enough and it is not a corner case -- a conductor and a core of equal
@@ -2194,7 +2274,13 @@ def bar_filaments(shape, size=None, quad: int = 3, quad_t: int = 2, sigma=None, 
             # both are constants of the grid. They used to be sampled out of the per-element arrays,
             # which quietly required those to be concrete -- so splicing a traced block into a welded
             # network (a moving bond wire on a fixed trace layer) failed inside the lattice half.
-            "self": {int(ax): float(np.asarray(self_g)[axis == ax][0]) for ax in sorted(set(axis.tolist()))},
+            # one self term per family is a constant of a UNIFORM grid; on a graded one every bar
+            # has its own, so the shortcut is absent rather than wrong
+            "self": (
+                {}
+                if edges is not None
+                else {int(ax): float(np.asarray(self_g)[axis == ax][0]) for ax in sorted(set(axis.tolist()))}
+            ),
             # {axis: (thin axis, conductor thickness, the layer each sheet's current occupies)}.
             # `lattice_apply` rebuilds the sub-points from this, so the FFT path and the assembled
             # one place the sheets identically -- they must, or they stop being the same operator.
@@ -2233,6 +2319,14 @@ def lattice_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3, quad_
             "peec.lattice_apply: these filaments do not sit on a lattice. Only a bar lattice from "
             "bar_filaments is block-Toeplitz; a polyline's filaments are not, and welding several "
             "conductors together breaks the structure even when each part had it."
+        )
+    if lat.get("graded"):
+        raise ValueError(
+            "peec.lattice_apply: this lattice is GRADED, so it is not translation invariant and the "
+            "FFT does not apply to it -- the kernel depends on where the cells are, not only on their "
+            "index offset. Apply it with `jno.solve.hierarchical(...)` instead, which needs no such "
+            "structure. Refusing rather than returning the uniform-grid answer, which would be wrong "
+            "everywhere the spacing changes and right everywhere else."
         )
     n, d, axis = lat["n"], lat["d"], np.asarray(lat["axis"])
     gx, gw = np.polynomial.legendre.leggauss(int(quad))
@@ -2722,6 +2816,23 @@ def cross_block(pos_a, mom_a, grp_a, na, pos_b, mom_b, grp_b, nb, g, scale=1.0, 
     return scale * out
 
 
+def _hier_apply(fil: Filaments, g, mu_scale, operator):
+    """``apply(cur)`` for a lattice with no translation invariance -- a GRADED grid.
+
+    The whole operator through one hierarchical compression, with no FFT and no dense block. This is
+    the path that makes local refinement affordable: a uniform grid fine enough for the narrowest
+    trace is fine everywhere, and on a real layout that is 1-3 million elements.
+    """
+    from .hmatrix import build as hbuild
+    from .hmatrix import materialize as hmat
+
+    hm = hbuild(
+        fil.pos, fil.mom, np.asarray(fil.group), g,
+        tol=operator.tol, leaf=operator.leaf, eta=operator.eta,
+    )
+    return hmat(hm, fil.pos, fil.mom, fil.self_g, g, scale=mu_scale)
+
+
 def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3, quad_t: int = 2, operator=None):
     """``apply(cur) -> Lp @ cur`` for a network of several discretisations, still without forming Lp.
 
@@ -2764,8 +2875,10 @@ def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3, quad_t
         )
         if lat is None:
             if operator is not None and operator.worth_it(cnt, cnt):
+                # passed through as they are: `hmatrix.build` refuses a tracer by name, which is a
+                # better error than whatever `np.asarray` would raise three frames deeper
                 hm = hbuild(
-                    np.asarray(sub.pos), np.asarray(sub.mom), np.asarray(sub.group), g,
+                    sub.pos, sub.mom, np.asarray(sub.group), g,
                     tol=operator.tol, leaf=operator.leaf, eta=operator.eta,
                 )
                 diag.append(hmat(hm, sub.pos, sub.mom, sub.self_g, g, scale=mu_scale))
@@ -2781,8 +2894,12 @@ def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3, quad_t
         for j, (loj, hij, rj, gj, cj) in enumerate(sel):
             if j <= i:
                 continue
-            pi, mi = np.asarray(fil.pos)[ri], np.asarray(fil.mom)[ri]
-            pj, mj = np.asarray(fil.pos)[rj], np.asarray(fil.mom)[rj]
+            # jnp, NOT np: a welded wire whose SHAPE is a design variable arrives here as a tracer,
+            # and `np.asarray` on it raises. The hierarchical path needs host arrays and says so
+            # itself (`hmatrix.build` refuses a tracer by name); the dense path must stay traceable,
+            # which is what `test_a_welded_wire_is_differentiable_in_its_shape` pins.
+            pi, mi = jnp.asarray(fil.pos)[ri], jnp.asarray(fil.mom)[ri]
+            pj, mj = jnp.asarray(fil.pos)[rj], jnp.asarray(fil.mom)[rj]
             if operator is not None and operator.worth_it(ci, cj):
                 # ONE structure, applied both ways: a cross block appears in each part's row, and
                 # building it twice could pick different pivots for the two directions -- the
