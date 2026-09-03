@@ -1474,13 +1474,12 @@ def hierarchical(*, tol: float = 1e-6, leaf: int = 64, eta: float = 2.0, floor: 
     answer; ask for it and the operator becomes approximate to ``tol``, which the solver's residual
     check still guards.
 
-    **Not yet useful on a bar lattice, and it says so rather than pretending.** The compression
-    ratios first claimed here were measured on blocks ACA had silently got wrong; with those failures
-    now detected and rejected, a PEEC lattice compresses 1.00x -- every block stored densely, correct
-    and no faster. The partial inductance is structurally sparse (``mom_a . mom_b`` vanishes exactly
-    between perpendicular bar families) and ACA cannot see a sub-block it never visits. The fix is one
-    operator per moment direction, which is not implemented yet; see
-    :mod:`~jno.utils.solver.hmatrix`.
+    **Correct and verified, but not yet worth switching on.** A bar lattice compresses 3.27x at
+    1,540 elements rising to 5.76x at 4,589, accurate to 8.2e-09 -- and yet a whole welded solve is
+    3-5x SLOWER with it at every size measured, and peaks higher. A dense matvec is one BLAS call
+    where a compressed one is hundreds of small matmuls (0.018 s against 0.186 s at 1,540 elements),
+    and at a few thousand elements the operator is not the memory bottleneck either. Where the
+    crossover lies is not established; see :mod:`~jno.utils.solver.hmatrix` for the numbers.
 
     Args:
         tol: relative accuracy asked of each compressed block.
