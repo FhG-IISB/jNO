@@ -119,14 +119,84 @@ def _domain_of(constraints):
     )
 
 
+class Dissipation(dict):
+    """``{region: W/m^3}`` of heat, and the same split by the property that CAUSED it.
+
+    The mapping itself is the total, so the thermal side is unchanged and a region that dissipates
+    two ways never contributes half of itself by accident::
+
+        q = d.by_region(emag.dissipation(), default=0.0)
+
+    ``.sigma`` is the ohmic loss and ``.mu_r`` the core loss, each named after what the region
+    attached -- the same spelling in and out, as with ``.attach(k=...)`` and ``d.k``, so no channel
+    needs a vocabulary invented for it. A region declaring both appears in both, under its own name.
+    """
+
+    def __init__(self, channels):
+        self._channels = dict(channels)
+        total: dict = {}
+        for ch in self._channels.values():
+            for region, q in ch.items():
+                total[region] = total[region] + q if region in total else q
+        super().__init__(total)
+
+    def _channel(self, name):
+        ch = self._channels.get(name) or {}
+        if not ch:
+            have = sorted(k for k, v in self._channels.items() if v)
+            raise ValueError(
+                f"jno.peec: nothing in this model dissipates through {name!r}, so there is no "
+                f"{name} loss to read. Dissipating properties here: {have or 'none'}. Attach "
+                f"{name}= on the region that should carry it."
+            )
+        return dict(ch)
+
+    @property
+    def sigma(self):
+        """``{region: W/m^3}`` of OHMIC loss -- the conductors, from the currents solved for."""
+        return self._channel("sigma")
+
+    @property
+    def mu_r(self):
+        """``{region: W/m^3}`` of CORE loss -- the magnetisation working against a complex ``mu_r``.
+
+        A real permeability is lossless and there is nothing here; the imaginary part of ``mu_r`` is
+        the lossy component, exactly as a complex permittivity carries dielectric loss.
+        """
+        return self._channel("mu_r")
+
+
 class PEECSolution:
     """What a solved network hands back.
 
     ``Z``/``R``/``L`` describe the source port; with an array ``freq`` each is an array over it.
     """
 
-    def __init__(self, freq, cur, fil, terms, port, res, vol=None, owner=None, names=(), link=None):
+    def __init__(
+        self,
+        freq,
+        cur,
+        fil,
+        terms,
+        port,
+        res,
+        vol=None,
+        owner=None,
+        names=(),
+        link=None,
+        pot=None,
+        pads=None,
+        mag=(None, None, None, None, ()),
+    ):
         self._vol, self._owner, self._names = vol, owner, tuple(names)
+        #: nodal potentials, and the node set each terminal owns -- what `voltage` reads. Kept
+        #: because an OPEN terminal carries no current, so `current`/`Z` say nothing about it: the
+        #: induced voltage on a transformer's unloaded secondary is only in `phi`.
+        self._pot, self._pads = pot, dict(pads or {})
+        #: the magnetic mesh's own breakdown -- current, reluctance, volume, owner, names. It is a
+        #: SECOND mesh, so it needs all five: a region that is both conductor and core is meshed
+        #: twice and its two losses are summed per unit of each mesh's own volume.
+        self._mag_cur, self._mag_res, self._mag_vol, self._mag_owner, self._mag_names = mag
         #: total flux linkage per element, magnetisation included -- set only when a core is in the
         #: model. `L` reads it instead of `Lp I`, which is the same number when there is no core.
         self._link = link
@@ -258,17 +328,40 @@ class PEECSolution:
         """
         if self._owner is None:
             raise ValueError("jno.peec: this solution carries no per-conductor breakdown.")
+
+        def _per_region(power, owner, vol, names):
+            """`sum P / sum V` over each region's own elements, on the region's own mesh."""
+            own, vol = np.asarray(owner), jnp.asarray(vol)
+            out = {}
+            for k, name in enumerate(names):
+                sel = np.flatnonzero(own == k)
+                if sel.size == 0:  # a region the discretisation gave no elements owns no loss
+                    continue
+                q = jnp.sum(power[:, sel], axis=1) / jnp.sum(vol[sel])
+                out[name] = q[0] if jnp.ndim(self._port) == 0 else q
+            return out
+
         cur = jnp.atleast_2d(self.i)
-        pw = jnp.einsum("k,fk->fk", self._R, jnp.abs(cur) ** 2)
-        own, vol = np.asarray(self._owner), jnp.asarray(self._vol)
-        out = {}
-        for k, name in enumerate(self._names):
-            sel = np.flatnonzero(own == k)
-            if sel.size == 0:  # a conductor the discretisation gave no elements owns no loss
-                continue
-            q = jnp.sum(pw[:, sel], axis=1) / jnp.sum(vol[sel])
-            out[name] = q[0] if jnp.ndim(self._port) == 0 else q
-        return out
+        channels = {
+            "sigma": _per_region(jnp.einsum("k,fk->fk", self._R, jnp.abs(cur) ** 2), self._owner, self._vol, self._names)
+        }
+        if self._mag_cur is not None:
+            # `w Im(R_m) |I_m|^2`, and every part of that spelling is load-bearing.
+            #
+            # IMAGINARY, not real: a reluctance is `l / (mu0 chi A)`, so a lossless core has a real
+            # chi and a real R_m, and this channel is then identically zero -- which is the physics.
+            # The lossy component of `mu_r` is what puts an imaginary part in chi, and `1/chi` turns
+            # it into the imaginary part of the reluctance.
+            #
+            # And times OMEGA: R_m is a reluctance, so `R_m |I_m|^2` is not a power at all. The
+            # first version of this readout omitted the factor and took the real part, and it gave
+            # 1.36e-06 W where the port was delivering 8.58e-02 W more than the conductors were
+            # dissipating -- a number with the right shape, the right sign and no relation to the
+            # energy. The power balance below is what caught it.
+            w = 2 * np.pi * jnp.atleast_1d(jnp.asarray(self.freq))[:, None]
+            pm = w * jnp.einsum("k,fk->fk", jnp.imag(self._mag_res), jnp.abs(jnp.atleast_2d(self._mag_cur)) ** 2)
+            channels["mu_r"] = _per_region(pm, self._mag_owner, self._mag_vol, self._mag_names)
+        return Dissipation(channels)
 
     def field(self, points):
         """Magnetic flux density at ``points``, tesla — ``(n, 3)``, or ``(n_freq, n, 3)`` swept.
@@ -372,6 +465,43 @@ class PEECSolution:
         if terminal not in self._terms:
             raise ValueError(f"jno.peec: no terminal {terminal!r}. Known: {sorted(self._terms)}.")
         return self._terms[terminal]
+
+    def voltage(self, a, b=None):
+        """Potential at terminal ``a``, or the difference ``a - b``, volt.
+
+        This is the readout an OPEN terminal needs. A transformer's unloaded secondary carries no
+        current, so ``current`` and the port impedance say nothing about it -- the induced voltage
+        is in the nodal potentials alone, and it is what a turns ratio is measured from.
+
+        Prefer the TWO-terminal form. A single potential is only defined against whatever the solve
+        pinned -- a declared ground, or the source's negative side when there is exactly one source
+        and no ground -- so it moves if that reference changes, while a difference does not.
+
+        A terminal's potential is its pad's, exactly as the source and device rows define it: the
+        pad's nodes are shorted to each other, so any of them carries it. A WEIGHTED terminal is
+        not shorted, and is then the weighted sum over the pad -- the same unnormalised weights the
+        constraint rows use, so ``voltage`` and the circuit agree by construction.
+        """
+        if self._pot is None:
+            raise ValueError(
+                "jno.peec: this solution carries no nodal potentials, so there is no voltage to "
+                "read. They are kept by `BuiltPEEC.solve`; a solution built by hand has none."
+            )
+        for t in (a, b):
+            if t is not None and t not in self._pads:
+                raise ValueError(f"jno.peec: no terminal {t!r}. Known: {sorted(self._pads)}.")
+        phi = jnp.atleast_2d(self._pot)
+
+        def at(t):
+            spec = self._pads[t]
+            ids, w = spec if isinstance(spec, tuple) else (spec, None)
+            ids = np.asarray(ids, dtype=int)
+            if w is None:  # shorted pad: every node carries the same potential
+                return phi[:, ids[0]]
+            return phi[:, ids] @ jnp.asarray(w).reshape(-1).astype(complex)
+
+        out = at(a) - (0.0 if b is None else at(b))
+        return out if jnp.ndim(self._port) else out[0]
 
 
 class PEEC:
@@ -742,9 +872,9 @@ class BuiltPEEC:
                 dev[at[name]] = (a, b, z)
             dev = tuple(dev)
 
-        cur, port, drive, inject, link = [], [], [], [], []
+        cur, port, drive, inject, link, pot, mcur = [], [], [], [], [], [], []
         for f in self.freq:
-            c, phi, inj = solve_network(
+            c, phi, inj, im = solve_network(
                 fil,
                 sigma,
                 nodes,
@@ -759,9 +889,13 @@ class BuiltPEEC:
                 **({} if matrix_free is None else {"matrix_free": bool(matrix_free)}),
                 **({} if operator is None else {"operator": operator}),
                 **({} if self.mag is None else {"mag": self.mag, "chi": self.mag.lattice["sigma"]}),
+                magnetic_current=True,
             )
             cur.append(c)
             inject.append(inj)
+            pot.append(phi)
+            if im is not None:
+                mcur.append(im)
             if self.mag is not None:
                 # The TOTAL flux linkage, magnetisation included, read straight off the circuit
                 # equation `Z_int I + j w (Lp I + K' I_m) = A' phi`. So it needs no magnetic unknown
@@ -788,6 +922,19 @@ class BuiltPEEC:
 
         cur = jnp.stack(cur)
         port = jnp.stack([jnp.asarray(p) for p in port])
+        mag_break = (None, None, None, None, ())
+        if mcur:
+            from .utils.solver.kernel import magnetic_reluctance
+
+            mc = jnp.stack(mcur)
+            chi = self.mag.lattice["sigma"]
+            mag_break = (
+                mc[0] if self._scalar_freq else mc,
+                magnetic_reluctance(self.mag.length, self.mag.area, jnp.asarray(chi) + 1.0, MU0),
+                jnp.asarray(self.mag.area) * jnp.asarray(self.mag.length),
+                np.asarray(self.mag.part),
+                self.mag_names,
+            )
         sol = PEECSolution(
             self.freq[0] if self._scalar_freq else self.freq,
             cur[0] if self._scalar_freq else cur,
@@ -806,6 +953,10 @@ class BuiltPEEC:
             vol=jnp.asarray(fil.area) * jnp.asarray(fil.length),
             owner=np.asarray(fil.part),
             names=self.part_names,
+            pot=(jnp.stack(pot)[0] if self._scalar_freq else jnp.stack(pot)),
+            # the pads AFTER `weights=` was applied, so `voltage` reads the terminal the solve saw
+            pads=nodes,
+            mag=mag_break,
         )
         drive = jnp.stack([jnp.asarray(x) for x in drive])
         sol._port_current = drive[0] if self._scalar_freq else drive
