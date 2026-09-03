@@ -727,6 +727,7 @@ def solve_network(
     mag=None,
     chi=None,
     quad_m=2,
+    operator=None,
 ):
     """Solve the PEEC circuit for a network whose terminals are node SETS.
 
@@ -758,6 +759,10 @@ def solve_network(
             without a core -- takes a structural branch that leaves the operator exactly as it was.
         chi: susceptibility ``mu_r - 1`` per magnetic element. Complex is allowed, and is core loss.
         quad_m: sub-points per cell axis in the magnetic potential and the coupling.
+        operator: ``jno.solve.hierarchical(...)`` to compress the DENSE blocks of a welded network --
+            a non-lattice part's own partial inductance and every cross block between parts. ``None``
+            keeps the exact path, so this changes no existing answer. A plain lattice ignores it: the
+            FFT is exact and already O(N log N), so there is nothing to win.
 
     With a core the unknowns grow to ``[I_c, phi, I_m]`` and the system is Torchio's dual pair
     (*A PEEC method with magnetic materials*, IEEE TMTT 66(5), 2018)::
@@ -885,9 +890,12 @@ def solve_network(
         lp_apply = _geom_cached(
             fil,
             mu0,
-            "lp",
+            # the operator spec is part of the KEY, not just the value: a compressed apply and an
+            # exact one are different operators over identical geometry, and a cache that ignored
+            # that would hand a `solve(operator=...)` the previous exact apply, or the reverse
+            ("lp", None if operator is None else (operator.tol, operator.leaf, operator.eta, operator.floor)),
             lambda: (
-                welded_apply(fil, lambda r: 1.0 / r, mu_scale=scale)
+                welded_apply(fil, lambda r: 1.0 / r, mu_scale=scale, operator=operator)
                 if welded
                 else lattice_apply(fil, lambda r: 1.0 / r, mu_scale=scale)
             ),
@@ -1283,7 +1291,10 @@ def solve_network(
         # ...and the key carries the core, so re-solving one network against a different permeability
         # cannot reuse the first call's operator. Same failure shape as the device impedance above.
         mag_tag = 0 if (traced or not nm) else hash(np.asarray(chi).tobytes())
-        key = (id(fil), ne, nn, float(tol), int(restart), hash(cval_h.tobytes()), nm, mag_tag)
+        key = (
+        id(fil), ne, nn, float(tol), int(restart), hash(cval_h.tobytes()), nm, mag_tag,
+        None if operator is None else (operator.tol, operator.leaf, operator.eta, operator.floor),
+    )
         entry = None if traced else _KRYLOV_CACHE.get(key)
         cached = entry[1] if (entry is not None and entry[0] is fil) else None
 
@@ -1372,9 +1383,7 @@ def solve_network(
             # `magnetic_coupling_apply` -- so the coupled operator is symmetric by construction
             # rather than by two matrices that have to be kept in agreement.
             im = x[ne + nn :] / mag_s  # the unknown is the SCALED magnetisation; see mag_s above
-            return jnp.concatenate(
-                [top + (1j * w_) * flux(im), Cj @ x[: ne + nn], (mag_apply(im) - mmf(cur)) / mag_s]
-            )
+            return jnp.concatenate([top + (1j * w_) * flux(im), Cj @ x[: ne + nn], (mag_apply(im) - mmf(cur)) / mag_s])
 
         def _elec_pre(r, zd):
             if welded:
@@ -1876,17 +1885,14 @@ def bar_filaments(shape, size=None, quad: int = 3, quad_t: int = 2, sigma=None, 
         want = [np.broadcast_to(np.asarray(v, float).reshape(-1), (3,)) for v in declared]
         if not all(np.allclose(w, want[0]) for w in want):
             names = [sh._region_name or "<unnamed>" for sh in shapes if sh._size is not None]
-            asked = ", ".join(
-                f"{n}={'x'.join(f'{1e3 * c:g}' for c in w)} mm" for n, w in zip(names, want)
-            )
+            asked = ", ".join(f"{n}={'x'.join(f'{1e3 * c:g}' for c in w)} mm" for n, w in zip(names, want))
             _warn_once(
                 "peec.bar_filaments: these conductors ask for different cell pitches (%s), but solids "
                 "share ONE lattice and therefore one pitch -- the FFT that applies the partial "
                 "inductance needs a translation-invariant grid. The FINEST was used everywhere "
                 "(%s mm), so the coarser requests cost more rather than less. To refine only part of "
                 "a layout, model that part as a `Shape.line` -- a wire keeps its own discretisation "
-                "and welds where the metal touches."
-                % (asked, "x".join(f"{1e3 * c:g}" for c in h)),
+                "and welds where the metal touches." % (asked, "x".join(f"{1e3 * c:g}" for c in h)),
             )
     lo, hi = np.full(3, np.inf), np.full(3, -np.inf)
     for sh in shapes + frame:
@@ -2272,7 +2278,9 @@ def lattice_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3, quad_
             start += tot
         else:
             sub, wq = _volume_rule(np.array([length]), wtx[None, :], np.array([ax]), int(quad), int(quad_t))
-            fams.append((lattice_operator(shape, d, g, sg, sub=sub[0], w=wq[0]), slice(start, start + tot), shape, idx, None))
+            fams.append(
+                (lattice_operator(shape, d, g, sg, sub=sub[0], w=wq[0]), slice(start, start + tot), shape, idx, None)
+            )
             start += tot
     if start != len(axis):
         raise ValueError(f"peec.lattice_apply: the families cover {start} of {len(axis)} bars; this is a bug.")
@@ -2714,13 +2722,21 @@ def cross_block(pos_a, mom_a, grp_a, na, pos_b, mom_b, grp_b, nb, g, scale=1.0, 
     return scale * out
 
 
-def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3, quad_t: int = 2):
+def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3, quad_t: int = 2, operator=None):
     """``apply(cur) -> Lp @ cur`` for a network of several discretisations, still without forming Lp.
 
     Each block keeps whatever structure it has -- a lattice by FFT, a set of filaments densely -- and
     the blocks couple through :func:`cross_apply`. So a trace layer of a hundred thousand bars stays
     O(N) while the bond wires landing on it stay exact.
+
+    ``operator=jno.solve.hierarchical(...)`` compresses the two DENSE pieces -- a non-lattice block's
+    own `pair_matrix` and every `cross_block` between parts. Those are what make welding expensive:
+    a 6,806-bar lattice solves in 0.213 s and one welded 19-filament wire takes it to 33.4 s, and a
+    12,000-element module allocated 2.7 GB to produce a 46 MB coupling block. The lattice blocks keep
+    their FFT untouched -- it is exact and already O(N log N), so there is nothing to win there.
     """
+    from .hmatrix import build as hbuild
+    from .hmatrix import materialize as hmat
     from .kernel import pair_matrix
 
     blocks = getattr(fil, "lattice", None)
@@ -2747,8 +2763,15 @@ def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3, quad_t
             lat,
         )
         if lat is None:
-            k = pair_matrix(sub.pos, sub.mom, g, sub.self_g, group=sub.group) * mu_scale
-            diag.append(lambda x, k=k: k @ x)
+            if operator is not None and operator.worth_it(cnt, cnt):
+                hm = hbuild(
+                    np.asarray(sub.pos), np.asarray(sub.mom), np.asarray(sub.group), g,
+                    tol=operator.tol, leaf=operator.leaf, eta=operator.eta,
+                )
+                diag.append(hmat(hm, sub.pos, sub.mom, sub.self_g, g, scale=mu_scale))
+            else:
+                k = pair_matrix(sub.pos, sub.mom, g, sub.self_g, group=sub.group) * mu_scale
+                diag.append(lambda x, k=k: k @ x)
         else:
             diag.append(lattice_apply(sub, g, mu_scale=mu_scale, quad=quad, quad_t=quad_t))
         sel.append((lo, hi, rows, gl, cnt))
@@ -2758,25 +2781,38 @@ def welded_apply(fil: Filaments, g, mu_scale: float = 1.0, quad: int = 3, quad_t
         for j, (loj, hij, rj, gj, cj) in enumerate(sel):
             if j <= i:
                 continue
-            cross[(i, j)] = cross_block(
-                jnp.asarray(fil.pos)[ri],
-                jnp.asarray(fil.mom)[ri],
-                gi,
-                ci,
-                jnp.asarray(fil.pos)[rj],
-                jnp.asarray(fil.mom)[rj],
-                gj,
-                cj,
-                g,
-                scale=mu_scale,
-            )
+            pi, mi = np.asarray(fil.pos)[ri], np.asarray(fil.mom)[ri]
+            pj, mj = np.asarray(fil.pos)[rj], np.asarray(fil.mom)[rj]
+            if operator is not None and operator.worth_it(ci, cj):
+                # ONE structure, applied both ways: a cross block appears in each part's row, and
+                # building it twice could pick different pivots for the two directions -- the
+                # operator would then stop being symmetric, which a partial inductance must be.
+                hm = hbuild(pi, mi, gi, g, b=(pj, mj, gj), tol=operator.tol, leaf=operator.leaf, eta=operator.eta)
+                cross[(i, j)] = (
+                    hmat(hm, pi, mi, None, g, scale=mu_scale, b=(pj, mj)),
+                    hmat(hm, pi, mi, None, g, scale=mu_scale, b=(pj, mj), transpose=True),
+                )
+            else:
+                K = cross_block(
+                    jnp.asarray(fil.pos)[ri],
+                    jnp.asarray(fil.mom)[ri],
+                    gi,
+                    ci,
+                    jnp.asarray(fil.pos)[rj],
+                    jnp.asarray(fil.mom)[rj],
+                    gj,
+                    cj,
+                    g,
+                    scale=mu_scale,
+                )
+                cross[(i, j)] = (lambda x, K=K: K @ x, lambda x, K=K: K.T @ x)
 
     def apply(cur):
         cur = jnp.asarray(cur)
         out = [d(cur[lo:hi]) for d, (lo, hi, *_r) in zip(diag, sel)]
-        for (i, j), K in cross.items():
-            out[i] = out[i] + K @ cur[sel[j][0] : sel[j][1]]
-            out[j] = out[j] + K.T @ cur[sel[i][0] : sel[i][1]]
+        for (i, j), (fwd, adj) in cross.items():
+            out[i] = out[i] + fwd(cur[sel[j][0] : sel[j][1]])
+            out[j] = out[j] + adj(cur[sel[i][0] : sel[i][1]])
         return jnp.concatenate(out)
 
     return apply
@@ -2815,6 +2851,7 @@ def _bcoo(val, row, col, shape):
 
 #: sub-point PAIRS held at once inside `near_block`; the displacement it builds is 24 bytes each.
 _NEAR_PAIR_BUDGET = 4_000_000
+
 
 def near_block(fil: Filaments, g, mu_scale=1.0, reach=2.0):
     """The NEAR-FIELD part of ``Lp`` as COO triplets: every pair closer than ``reach`` element sizes.
