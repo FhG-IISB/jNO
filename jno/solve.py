@@ -649,9 +649,23 @@ def staggered(
     free upgrade, and it is not the default.
 
     Scope: composes through ``fem.solve(nonlinear=...)`` on a multifield problem, which is where the
-    block layout comes from; it has no meaning on a single field and says so. Each field is solved on
-    its own — solving a GROUP of fields together (a Stokes velocity/pressure pair inside one sweep) is
-    not wired.
+    block layout comes from; it has no meaning on a single field and says so.
+
+    **Groups.** An entry of ``fields`` may be a LIST of trial symbols, which are then solved *together*
+    inside one sweep rather than alternated against each other::
+
+        fem.solve(nonlinear=jno.solve.staggered([[v, p], [T]], direct=True))
+
+    That is not a convenience. A velocity/pressure pair **cannot** be swept apart: the pressure block is
+    the constraint block (no diagonal — the one :func:`jno.precond.saddle` finds structurally), so
+    solving ``p`` with ``v`` frozen is not a well-posed sub-problem. Any flow staggered against a solid
+    or a temperature therefore has to group its Stokes pair. A bare symbol among lists is its own group,
+    so ``[[v, p], T]`` is legal and ``[u, dm]`` keeps meaning exactly what it did — one field per sweep.
+
+    A group holding a constraint field is **indefinite**, so it wants ``direct=True``: the matrix-free
+    default puts *unpreconditioned* BiCGStab on a saddle block, for the reason given above — a sub-solve
+    is a restriction closure and a ``precond=`` spec has no operator to materialize against. This is
+    documented rather than enforced; ``fem.solve``'s own saddle warning already fires on that shape.
     """
     resolved: dict = {"blocks": None, "names": None, "constrained": None}
 
@@ -662,19 +676,37 @@ def staggered(
                 "jno.solve.staggered: this problem has a single field block, so there is nothing to "
                 "alternate between. Use jno.solve.newton() (or picard) instead."
             )
-        want = list(fields)
-        idxs = [fem.block_index(f) for f in want]
-        if len(set(idxs)) != len(idxs):
-            raise ValueError(f"jno.solve.staggered: a field is listed twice (resolved block indices {idxs}).")
-        if set(idxs) != set(range(len(blocks))):
-            missing = sorted(set(range(len(blocks))) - set(idxs))
+        # A group is a list of symbols swept together; a bare symbol is a group of one. `[u, dm]` is
+        # therefore unchanged, and `[[v, p], [T]]` groups the Stokes pair.
+        groups = [list(g) if isinstance(g, (list, tuple)) else [g] for g in fields]
+        for gi, g in enumerate(groups):
+            if not g:
+                raise ValueError(
+                    f"jno.solve.staggered: group {gi} is empty. A group is the set of fields solved "
+                    "together in one sweep; an empty one has nothing to solve."
+                )
+        gidx = [[fem.block_index(f) for f in g] for g in groups]
+        flat = [i for g in gidx for i in g]
+        if len(set(flat)) != len(flat):
+            raise ValueError(
+                f"jno.solve.staggered: a field is listed twice (resolved block indices {gidx}). "
+                "Each block must belong to exactly one group."
+            )
+        if set(flat) != set(range(len(blocks))):
+            missing = sorted(set(range(len(blocks))) - set(flat))
             raise ValueError(
                 f"jno.solve.staggered: every field block must be swept, but blocks {missing} were not "
-                f"listed (got {idxs} of {len(blocks)}). An unlisted field's equations would never be "
+                f"listed (got {gidx} of {len(blocks)}). An unlisted field's equations would never be "
                 "solved — list all of them, in the order you want them swept."
             )
-        resolved["blocks"] = [_np.arange(int(blocks[i].start), int(blocks[i].stop), dtype=_np.int32) for i in idxs]
-        resolved["names"] = idxs
+        # One index array per GROUP. `staggered_newton` consumes these as plain index arrays (`u[b]`,
+        # `u.at[b].set`, `setdiff1d`) and its direct path zeroes the COMPLEMENT rather than slicing a
+        # submatrix out, so a group spanning non-adjacent DOF ranges needs nothing special there.
+        resolved["blocks"] = [
+            _np.concatenate([_np.arange(int(blocks[i].start), int(blocks[i].stop), dtype=_np.int32) for i in g])
+            for g in gidx
+        ]
+        resolved["names"] = gidx
         # Essential-condition dofs, so over-relaxation can leave them alone (see staggered_newton).
         _dd = getattr(getattr(fem, "_op", None), "dirichlet_dofs", None)
         resolved["constrained"] = None if _dd is None else _np.asarray(_dd, dtype=_np.int64)

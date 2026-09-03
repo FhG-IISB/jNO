@@ -306,7 +306,7 @@ marker, `picard(damping=…)` is exactly damped Newton (`jno.solve.newton(dampin
 problems: implicit differentiation then also uses the lagged Jacobian — drop `lag` when exact parameter
 gradients matter more than per-step solvability.
 
-### Alternate minimization — `jno.solve.staggered([u, d])`
+### Alternate minimization — `jno.solve.staggered([u, d])` / `staggered([[v, p], [T]])`
  Some coupled energies are **non-convex in
 the fields jointly but convex in each separately**. A monolithic Newton then has no descent guarantee
 and simply diverges; solving one field at a time turns the problem into a sequence of convex solves:
@@ -324,6 +324,27 @@ poroelasticity and thermo-mechanical staggering have the same shape.
 Algorithm: Bourdin, Francfort & Marigo, *Numerical experiments in revisited brittle fracture*, JMPS
 **48** (2000), §3 — as the staggered operator split with a history field, Miehe, Welschinger & Hofacker,
 IJNME **83** (2010).
+
+**Groups — fields solved together inside one sweep.** An entry of the field list may itself be a list:
+
+```python
+fem.solve(nonlinear=jno.solve.staggered([[v, p], [T]], direct=True), linear=jno.solve.lu())
+```
+
+This is not a convenience. A velocity/pressure pair **cannot be swept apart**: the pressure block is the
+constraint block, with no diagonal of its own — the block [`jno.precond.saddle`](#saddle) locates
+structurally — so "solve `p` with `v` frozen" is not a well-posed sub-problem. Any flow staggered
+against a solid or a temperature therefore has to group its Stokes pair. Measured on a three-field
+Stokes/temperature problem (`tests/test_fem_staggered_groups.py`): the grouped sweep lands on the
+monolithic root to 1e-7 relative, and the flat `staggered([v, p, T])` does not converge at all.
+
+A bare symbol among lists is its own group, so `[[v, p], T]` is legal and `[u, dm]` keeps meaning exactly
+what it always did — one field per sweep. Every block must still appear, in exactly one group.
+
+A group holding a constraint field is **indefinite**, so it wants `direct=True` for the reason in the
+next paragraph: a matrix-free sub-solve cannot be preconditioned, and unpreconditioned BiCGStab on a
+saddle block is not a solve. That is documented rather than enforced — `fem.solve`'s own saddle warning
+already fires on the shape.
 
 **`direct=True` factorizes each field's diagonal block** rather than solving it matrix-free, and pairs
 with a `linear=` slot:
