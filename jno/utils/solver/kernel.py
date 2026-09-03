@@ -318,10 +318,21 @@ def lattice_operator(n: Sequence[int], h: Sequence[float], g: Callable, self_g, 
     if transpose:
         ghat = jnp.conjugate(ghat)
 
-    def apply(x):
+    def _real(x):
         xp = jnp.zeros(dbl, x.dtype).at[tuple(slice(0, v) for v in n)].set(x)
         y = jnp.fft.irfftn(ghat * jnp.fft.rfftn(xp), s=dbl)
         return y[tuple(slice(0, v) for v in n)]
+
+    def apply(x):
+        x = jnp.asarray(x)
+        # The generator is REAL and the embedding uses `rfftn`, which will not take a complex array.
+        # A complex argument is therefore applied through its parts -- the operator is real-linear,
+        # so `op(a + ib) = op(a) + i op(b)` exactly. `lattice_apply` already did this a level up for
+        # the partial inductance; the magnetic potential and the coupling need it too, and one place
+        # that knows the FFT should be the one place that knows this.
+        if jnp.iscomplexobj(x):
+            return _real(jnp.real(x)) + 1j * _real(jnp.imag(x))
+        return _real(x)
 
     return apply
 

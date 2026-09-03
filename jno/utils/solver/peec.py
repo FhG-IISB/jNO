@@ -2030,6 +2030,12 @@ def bar_filaments(shape, size=None, quad: int = 3, quad_t: int = 2, sigma=None, 
         {
             "n": tuple(int(v) for v in n),
             "d": tuple(float(v) for v in d),
+            # The grid's ORIGIN -- the lower corner of cell (0,0,0)'s box. Two meshes are the same
+            # lattice only if all three agree: same shape, same pitch, SAME ORIGIN. Shape and pitch
+            # alone are not enough and it is not a corner case -- a conductor and a core of equal
+            # extent sitting one above the other produce identical `n` and `d` on grids offset by
+            # their whole separation, and a coupling convolved across them is silently wrong.
+            "lo": tuple(float(v) for v in lo),
             "axis": axis,
             "masks": masks,
             # which CELLS carry material, as opposed to which BARS exist between them. The magnetic
@@ -2277,6 +2283,209 @@ def coupling_generator(n, d, a, b, quad=2):
             body = body + w_a[p] * w_b[q] * np.where(rn > 0, (cross @ eb) / safe**2, 0.0)
     body = body * (d[a] * d[b]) / (4.0 * np.pi)
     return np.where(valid, body, 0.0)
+
+
+def _grid_families(lat, what):
+    """Where each axis family's elements sit in the FULL cell grid, as flat indices.
+
+    A bar is named by its LOWER cell (see :func:`_bar_rule`), so a family along ``ax`` is a subset of
+    the cell grid with the last slice along ``ax`` missing. Both the magnetic potential and the
+    coupling are Toeplitz on the CELL grid rather than on a family's own shape, so each family has to
+    be lifted into it -- a re-ravel of the same multi-index, and purely structural, so it stays on
+    the host like every other "which element is where" question in this file.
+
+    Returns ``[(axis, slice into the element vector, flat cell indices)]``, in the order
+    :func:`bar_filaments` concatenates its families.
+    """
+    n = tuple(int(v) for v in lat["n"])
+    axis = np.asarray(lat["axis"])
+    if lat.get("sheets"):
+        raise NotImplementedError(
+            "peec: a magnetic system on a network discretised into current SHEETS is not supported. "
+            "A sheet family carries its own sub-point offset, so the coupling to it is a different "
+            "generator from the one built here -- and a coupling built on the wrong offsets is a "
+            "plausible wrong answer, not a visible failure. The sheet model is off the front door."
+        )
+    masks = lat.get("masks") or {}
+    out, start = [], 0
+    for ax in sorted(set(axis.tolist())):
+        tot = int((axis == ax).sum())
+        shape = tuple(v - 1 if i == ax else v for i, v in enumerate(n))
+        m = masks.get(ax)
+        sub = np.arange(int(np.prod(shape))) if m is None else np.flatnonzero(np.asarray(m).reshape(-1))
+        if sub.size != tot:
+            raise ValueError(
+                f"peec: the {what} family along axis {ax} holds {tot} elements for {sub.size} live "
+                "lattice slots; this is a bug."
+            )
+        flat = np.ravel_multi_index(np.unravel_index(sub, shape), n)
+        out.append((int(ax), slice(start, start + tot), jnp.asarray(flat)))
+        start += tot
+    if start != axis.size:
+        raise ValueError(f"peec: the {what} families cover {start} of {axis.size} elements; this is a bug.")
+    return out
+
+
+def _same_lattice(fil: Filaments, mag: Filaments):
+    """Both meshes on one grid, or the coupling between them is not Toeplitz and the FFT is a lie."""
+    le, lm = getattr(fil, "lattice", None), getattr(mag, "lattice", None)
+    if le is None or lm is None or "n" not in le or "n" not in lm:
+        raise ValueError(
+            "peec: a magnetic system needs both meshes on a bar lattice. A polyline's filaments are "
+            "not Toeplitz, so there is no shared grid for the coupling to be a convolution on."
+        )
+    same = (
+        tuple(le["n"]) == tuple(lm["n"])
+        and np.allclose(le["d"], lm["d"])
+        and np.allclose(le.get("lo", 0.0), lm.get("lo", 1.0))
+    )
+    if not same:
+        raise ValueError(
+            f"peec: the conductors sit on a {tuple(le['n'])} grid of pitch {tuple(le['d'])} at "
+            f"{tuple(le.get('lo', ()))} and the core on a {tuple(lm['n'])} grid of pitch "
+            f"{tuple(lm['d'])} at {tuple(lm.get('lo', ()))}. The coupling between them is Toeplitz "
+            "only on a COMMON grid -- same shape, same pitch and same origin -- so build both with "
+            "`bar_filaments(grid_shapes=...)`, each framed by the other's regions."
+        )
+    return tuple(int(v) for v in le["n"]), tuple(float(v) for v in le["d"])
+
+
+def magnetic_coupling_apply(fil: Filaments, mag: Filaments, quad: int = 2):
+    """``(mmf, flux)`` -- the two faces of ONE coupling block, applied by FFT.
+
+    Ampere's law gives the magnetomotive force a conductor's current drives around a magnetic
+    element, ``mmf = K I_c``; reciprocity gives the flux that magnetisation links back into the
+    conductor, ``flux = K' I_m``. They are the same block applied the two ways round, which is what
+    keeps the assembled system symmetric -- and why both come out of one generator here rather than
+    from two independently-built matrices that could disagree.
+
+    Structure: one Toeplitz block per (electric axis ``a``, magnetic axis ``b``), zero when
+    ``a == b`` because ``e_a x r_hat`` has no component along ``e_a``. So six blocks, not nine, and
+    :func:`~jno.utils.solver.kernel.lattice_operator` owns the embedding and the FFT for each --
+    ``transpose=True`` on the same generator is the reciprocal direction, at no extra kernel.
+
+    Both element vectors are lifted into the full CELL grid before the convolution, because a bar
+    family's own shape is one cell short along its axis and the two families are short along
+    DIFFERENT axes. See :func:`_grid_families`.
+    """
+    from .kernel import lattice_operator
+
+    n, d = _same_lattice(fil, mag)
+    ne, nm = int(np.asarray(fil.length).size), int(np.asarray(mag.length).size)
+    fams_e = _grid_families(fil.lattice, "conductor")
+    fams_m = _grid_families(mag.lattice, "core")
+    ncell = int(np.prod(n))
+
+    # One generator per orientation pair, built once. `a == b` is identically zero and is simply not
+    # built -- a block of zeros costs a full FFT per apply and buys nothing.
+    ops = {}
+    for ax_e, _se, _ie in fams_e:
+        for ax_m, _sm, _im in fams_m:
+            if ax_e == ax_m or (ax_e, ax_m) in ops:
+                continue
+            gen = coupling_generator(n, d, ax_e, ax_m, quad)
+            ops[(ax_e, ax_m)] = (
+                lattice_operator(n, d, None, None, generator=gen),
+                lattice_operator(n, d, None, None, generator=gen, transpose=True),
+            )
+
+    def _scatter(x, idx, dtype):
+        return jnp.zeros(ncell, dtype).at[idx].set(x, unique_indices=True, indices_are_sorted=True)
+
+    def mmf(cur):
+        """The magnetomotive force each magnetic element sees, from every conductor current."""
+        cur = jnp.asarray(cur)
+        out = jnp.zeros(nm, cur.dtype)
+        for ax_m, sl_m, idx_m in fams_m:
+            acc = None
+            for ax_e, sl_e, idx_e in fams_e:
+                if ax_e == ax_m:
+                    continue
+                y = ops[(ax_e, ax_m)][0](_scatter(cur[sl_e], idx_e, cur.dtype).reshape(n)).reshape(-1)
+                acc = y if acc is None else acc + y
+            if acc is not None:
+                out = out.at[sl_m].set(acc[idx_m])
+        return out
+
+    def flux(im):
+        """The flux the magnetisation links into each conductor element -- the same block, transposed."""
+        im = jnp.asarray(im)
+        out = jnp.zeros(ne, im.dtype)
+        for ax_e, sl_e, idx_e in fams_e:
+            acc = None
+            for ax_m, sl_m, idx_m in fams_m:
+                if ax_e == ax_m:
+                    continue
+                y = ops[(ax_e, ax_m)][1](_scatter(im[sl_m], idx_m, im.dtype).reshape(n)).reshape(-1)
+                acc = y if acc is None else acc + y
+            if acc is not None:
+                out = out.at[sl_e].set(acc[idx_e])
+        return out
+
+    return mmf, flux
+
+
+def magnetic_system_apply(mag: Filaments, chi, mu0: float = 4e-7 * np.pi, quad: int = 2):
+    """``(apply, diag)`` for the magnetic operator ``R_m + A' P_m A`` -- the dual of ``R + jw Lp``.
+
+    The magnetic unknown is the magnetisation flux ``I_m = mu0 M A`` on each element. Two statements
+    close the system, and both are the mirror of an electric one:
+
+        R_m I_m - A' phi_m = mmf          the mmf balance along an element (Ohm's law's dual)
+        phi_m = -P_m A I_m                the potential of the magnetic charge the divergence leaves
+
+    The sign in the second is the one worth writing down. Magnetic charge is ``rho_m = -div M``, so
+    a positive magnetisation flowing OUT of a cell leaves NEGATIVE charge there, while the incidence
+    reports ``+I`` at the cell an element starts from. The two minus signs cancel on substitution and
+    the operator comes out ``R_m + A' P_m A`` -- symmetric and positive, as an energy must be. Had
+    the charge sign been dropped it would have come out ``R_m - A' P_m A``, which is a demagnetising
+    field that ADDS to the magnetisation driving it: a core that amplifies itself.
+
+    ``chi = mu_r - 1`` per element, already series-averaged along the element by the lattice.
+
+    Args:
+        mag: the magnetic mesh, from :func:`bar_filaments` over the ``mu_r`` regions.
+        chi: susceptibility per element. Complex is allowed and is how core loss enters.
+        quad: sub-points per cell axis in the potential's volume average.
+
+    Returns ``(apply, diag)``. The diagonal is exact -- ``P_aa + P_bb - 2 P_ab`` with both ends
+    cells of the same grid, so it is two constants of the pitch, not a sampled approximation.
+    """
+    from .kernel import bar_self, magnetic_reluctance
+
+    lat = mag.lattice
+    d = tuple(float(v) for v in lat["d"])
+    axis = np.asarray(lat["axis"])
+    # chi + 1 is mu_r, and `magnetic_reluctance` is the one place the constitutive law is written.
+    # The round trip is deliberate: what the lattice series-averages along an element has to be chi
+    # (reluctances add in series, so 1/chi does), and what the formula is stated in terms of is mu_r.
+    Rm = magnetic_reluctance(mag.length, mag.area, jnp.asarray(chi) + 1.0, mu0)
+    P = magnetic_potential_apply(mag, mu0, quad)
+    inc = mag.incidence.tocoo()
+    A = _bcoo(inc.data.astype(complex), inc.row, inc.col, inc.shape)
+    AT = _bcoo(inc.data.astype(complex), inc.col, inc.row, inc.shape[::-1])
+
+    def apply(im):
+        im = jnp.asarray(im)
+        return Rm.astype(im.dtype) * im + AT @ P(A @ im)
+
+    # The diagonal, for the preconditioner. An element joins two cells of one grid, so its self terms
+    # are the SAME constant and its mutual is the volume-averaged 1/r one pitch apart along its own
+    # axis -- one number per axis, evaluated here rather than read back out of the operator.
+    g1, w1 = np.polynomial.legendre.leggauss(int(quad))
+    i, j, k = (a.reshape(-1) for a in np.meshgrid(*(np.arange(quad),) * 3, indexing="ij"))
+    pts = np.stack([0.5 * d[0] * g1[i], 0.5 * d[1] * g1[j], 0.5 * d[2] * g1[k]], axis=1)
+    wq = (w1[i] * w1[j] * w1[k]) / 8.0
+    self_g = float(bar_self(np.array([d[2]]), np.array([d[0]]), np.array([d[1]]))[0])
+    nb_g = {}
+    for ax in sorted(set(axis.tolist())):
+        shift = np.zeros(3)
+        shift[int(ax)] = d[int(ax)]
+        rr = np.linalg.norm((pts[:, None, :] + shift) - pts[None, :, :], axis=-1)
+        nb_g[int(ax)] = float((wq[:, None] * wq[None, :] / rr).sum())
+    scale = 1.0 / (4.0 * np.pi * mu0)
+    lap = scale * np.array([2.0 * self_g - 2.0 * nb_g[int(a)] for a in axis])
+    return apply, Rm + jnp.asarray(lap)
 
 
 def _lattice_diag(fil: Filaments, mu0: float):
