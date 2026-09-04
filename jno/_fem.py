@@ -3355,7 +3355,9 @@ def _edges_on_tag(edge_vertices: np.ndarray, tag_vertex_ids: np.ndarray) -> np.n
     return np.flatnonzero(on_tag[ev[:, 0]] & on_tag[ev[:, 1]]).astype(int)
 
 
-def _face_nodes(domain: Any, points: Any, bnodes: Optional[np.ndarray], tag: str) -> Optional[np.ndarray]:
+def _face_nodes(
+    domain: Any, points: Any, bnodes: Optional[np.ndarray], tag: str, cells: Any = None
+) -> Optional[np.ndarray]:
     """Global node ids on a periodic face, taken from the tag's **predicate** (the user's intent),
     evaluated over the **assembly** boundary nodes ``bnodes`` (so P2 midpoints and 3D face nodes are
     included). ``domain.tag`` partitions each boundary node into a single tag, so a corner shared by
@@ -3373,8 +3375,26 @@ def _face_nodes(domain: Any, points: Any, bnodes: Optional[np.ndarray], tag: str
             # non-conforming interface, since they share coordinates. Without the ownership filter the
             # tie sees each face twice and the mortar segmentation covers a secondary facet twice over.
             owner = (getattr(domain, "_tag_regions", {}) or {}).get(tag)
-            if owner is not None and owner in ti:
-                sel = np.intersect1d(sel, np.asarray(ti[owner], dtype=int).reshape(-1))
+            if owner is not None:
+                # Own the nodes by CELL TOPOLOGY, inclusively. `tag_indices` is an EXCLUSIVE partition:
+                # a node lying on both bodies is handed to one of them, so intersecting with it drops
+                # that node from the other side's tag and the facet using it fails the subset test
+                # below. Measured on an annular tie split into arcs, that punched a one-facet hole at
+                # 16.7-20.0 degrees, and the arc arrived as two chains with four loose ends instead of
+                # one -- which is the same partition-versus-topology error `_region_node_ids_from_cells`
+                # was written for.
+                own = None
+                if cells is not None:
+                    from .utils.solver.fem_utils import _cell_region_mask
+
+                    _c = np.asarray(cells)
+                    _m = np.asarray(_cell_region_mask(domain, owner)).reshape(-1)
+                    if _m.shape[0] == _c.shape[0]:
+                        own = np.unique(_c[_m > 0])
+                if own is None and owner in ti:  # no assembly cells here: the partition is all there is
+                    own = np.asarray(ti[owner], dtype=int).reshape(-1)
+                if own is not None:
+                    sel = np.intersect1d(sel, own)
             if len(sel):
                 return sel
     return np.asarray(ti[tag], dtype=int).reshape(-1) if tag in ti else None
@@ -3455,7 +3475,7 @@ def _build_periodic_reduction(
     faces: dict = {}
     for main, secondary, *_ignore in ties:
         for tag in (main, secondary):
-            if tag not in faces and (f := _face_nodes(domain, points, bnodes, tag)) is not None:
+            if tag not in faces and (f := _face_nodes(domain, points, bnodes, tag, cells)) is not None:
                 faces[tag] = f
 
     # Facet connectivity per tied face. The main side alone is enough for node-to-segment

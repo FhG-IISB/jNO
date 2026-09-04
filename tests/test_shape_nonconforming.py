@@ -256,6 +256,11 @@ def test_the_mortar_ties_a_graded_interface_above_order_one(order):
     assert abs(got - ref) / ref < 0.05, f"order-{order} mortar {got:.6f} vs conforming {ref:.6f}"
 
 
+def _lap2(u, phi, r):
+    a, b = u.bind(x=r[0], y=r[1]), phi.bind(x=r[0], y=r[1])
+    return a.x * b.x + a.y * b.y
+
+
 def _graded_stack():
     """Coarse base under a finer film, meshed independently — a genuinely non-matching interface."""
     return jno.Shape.regions(
@@ -285,6 +290,58 @@ def test_tag_region_separates_two_coincident_faces():
     b = _face_nodes(d, pts[:, :2], bn, "base_face")
     assert len(set(f.tolist()) & set(b.tolist())) == 0, "the two sides must not share nodes"
     assert len(f) != len(b), "a graded interface should give the two sides different node counts"
+
+
+def test_a_region_scoped_tag_resolves_in_the_ASSEMBLY_numbering():
+    """The same tag, but resolved the way the TIE resolves it -- against the assembly mesh.
+
+    The test above hands `_face_nodes` the P1 mesh, where node ids happen to agree with the ones
+    `tag_indices` is keyed on. The tie does not: it passes the ASSEMBLY mesh, which at order 2 has its
+    own numbering and roughly twice the nodes. Ownership was applied by intersecting with
+    ``tag_indices[region]`` -- an EXCLUSIVE partition of the *P1* mesh -- so P2 ids were intersected
+    against P1 ids and the survivors were whichever collided by accident.
+
+    Exclusivity is the second half of it: a node lying on both bodies is handed to one of them, so
+    intersecting drops it from the other side's tag and the facet using it fails the subset test. On
+    an annular tie split into arcs that punched a one-facet hole and the arc arrived as two chains.
+
+    Owning by cell topology fixes both: the numbering is the assembly's, and a shared node belongs to
+    every region whose cells contain it.
+    """
+    d = _graded_stack()
+    on = lambda x, y: np.abs(y - 1.0) < 1e-9  # noqa: E731
+    d.tag("film_face", on, region="film")
+    d.tag("base_face", on, region="base")
+
+    u, v = d.fem_symbols(order=2)
+    c = d.variable("interior", split=True)
+    jno.fem([_lap2(u, v, c)])  # force the order-2 assembly mesh into existence
+
+    from jno._fem import _boundary_facets, _face_nodes
+    from jno.utils.solver.fem_utils import _cell_region_mask
+
+    pts = np.asarray(d._fem_native_dof_points_all[0])
+    cells = np.asarray(d._fem_native_assembly_cells_all[0])
+    assert len(pts) > len(np.asarray(d.built_mesh.points)), "order 2 must add nodes to resolve against"
+    bn = np.unique(_boundary_facets(pts, cells, 2, 2, "triangle"))
+
+    got = {}
+    for tag, region in (("film_face", "film"), ("base_face", "base")):
+        sel = np.asarray(_face_nodes(d, pts, bn, tag, cells), dtype=int).reshape(-1)
+        own = np.unique(cells[np.asarray(_cell_region_mask(d, region)).reshape(-1) > 0])
+        assert len(sel) > 0, f"{tag} resolved to nothing in the assembly numbering"
+        assert set(sel.tolist()) <= set(own.tolist()), f"{tag} reached outside {region}'s own cells"
+        got[tag] = sel
+
+    assert not (set(got["film_face"].tolist()) & set(got["base_face"].tolist())), "sides must stay apart"
+    # and neither side may be truncated. Compare each side against ITS OWN P1 count -- the seam holds
+    # two coincident node sets, so the combined count is not the bar. Order 2 adds a midpoint per edge,
+    # so a side with `n` P1 nodes must come back with about `2n - 1`.
+    p1pts = np.asarray(d.built_mesh.points)[:, :2]
+    bn1 = np.unique(np.asarray(d.built_mesh.cells_dict["line"]))
+    for tag, sel in got.items():
+        n1 = len(np.asarray(_face_nodes(d, p1pts, bn1, tag), dtype=int).reshape(-1))
+        assert len(sel) >= 2 * n1 - 1, f"{tag} kept {len(sel)} of the ~{2*n1-1} nodes its P1 side implies"
 
 
 def test_tag_region_reaches_the_interface_at_all():
