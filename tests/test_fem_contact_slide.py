@@ -181,10 +181,34 @@ def test_the_slide_term_transmits_shear_and_converges_to_the_bonded_body():
     assert tied == pytest.approx(bonded, rel=0.10)
 
 
+#: The default 0.5 is too coarse for the penalty-insensitivity measurement below -- see that test.
+_PENALTY_SIZE = 0.3
+
+
 def test_the_transmitted_shear_is_insensitive_to_the_penalty_over_four_decades():
     """What separates 'the penalty is converged' from 'the number happens to look right'. If the answer
-    still depended on `ct`, the agreement above would be a coincidence of the stiffness chosen."""
-    vals = [_stack(conforming=False, ct=ct, drive=(SHEAR, 0.0, 0.0))[0] for ct in (1e2, 1e4, 1e6)]
+    still depended on `ct`, the agreement above would be a coincidence of the stiffness chosen.
+
+    **Meshed finer than the rest of the file, on purpose.** At the default 0.5 the spread is not a
+    property of the penalty at all -- the quantity is not mesh-converged there, so the number measures
+    which tetrahedralisation gmsh happened to produce. Two trees that differ only in meshing, on
+    identical physics:
+
+        size    tets / spread (A)      tets / spread (B)
+        0.50     194 / 0.00358          188 / 0.01927     <- disagree; neither is converged
+        0.40     417 / 0.00098          384 / 0.00110
+        0.30     811 / 0.00095          670 / 0.00094
+        0.22    1460 / 0.00091         1146 / 0.00091     <- same answer either way
+
+    Both converge to 0.00091, eleven times inside this gate; only the coarse mesh disagrees, and it
+    passed on one tree by luck. The fix is therefore to measure where the quantity has converged, not
+    to widen the tolerance until the unconverged number fits -- that would keep the test green while
+    it went on measuring the mesh.
+    """
+    vals = [
+        _stack(conforming=False, ct=ct, drive=(SHEAR, 0.0, 0.0), size=_PENALTY_SIZE)[0]
+        for ct in (1e2, 1e4, 1e6)
+    ]
     spread = (max(vals) - min(vals)) / abs(np.mean(vals))
     assert spread < 0.01, f"transmitted shear still depends on the penalty: {vals}"
 
