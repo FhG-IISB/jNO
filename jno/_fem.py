@@ -4716,6 +4716,27 @@ def fem(
         _fn._CHUNK_OVERRIDE[0], _fn._CHUNK_CONSUMED[0] = prev, prev_consumed
 
 
+def _is_volume_region(domain, name: str) -> bool:
+    """Is ``name`` a ``Shape.regions`` BODY — a cell set carrying volume cells?
+
+    ``_source_regions`` only ever holds the *polygon* domain's regions (``polygon_domain`` writes it);
+    a ``Shape.regions(...)`` domain is built through the gmsh emitter and never appears there. Keying
+    the sub-region pin on that dict alone therefore rejected ``v(flap) - 0`` on exactly the domains the
+    tie machinery exists for, while ``_region_node_ids_from_cells`` was already able to resolve such a
+    region's nodes from cell topology -- the resolution existed and the gate would not let it be
+    reached.
+
+    A cell set stores ``[volume_cells, facets]``, so a body has entries in the first and a boundary tag
+    in the second. That distinction is what separates a legitimate volumetric pin from a term whose
+    test function was forgotten, which is what this gate is really for.
+    """
+    cs = getattr(getattr(domain, "built_mesh", None), "cell_sets", None) or {}
+    ent = cs.get(name)
+    if ent is None or not len(ent):
+        return False
+    return bool(np.asarray(ent[0]).reshape(-1).size)
+
+
 def _fem_impl(
     constraints: Any,
     *,
@@ -5268,12 +5289,15 @@ def _fem_impl(
             # keyed in `_source_regions`) — pinning that region's whole node set, a volumetric hard
             # constraint used by subdomain / domain-decomposition solves. The default whole-domain
             # `volume` is still rejected (that signals a forgotten test function).
-            is_subregion_pin = support == "volume" and region in (getattr(domain, "_source_regions", {}) or {})
+            is_subregion_pin = support == "volume" and (
+                region in (getattr(domain, "_source_regions", {}) or {}) or _is_volume_region(domain, region)
+            )
             if support != "boundary" and not is_subregion_pin:
                 raise ValueError(
                     "jno.fem: a residual with the trial but no test function must live on a boundary "
-                    "region (Dirichlet), the 'initial' region (IC), or a named interior sub-region "
-                    "(domain.region(...)). Got the whole-domain volume — did you forget the test function?"
+                    "region (Dirichlet), the 'initial' region (IC), a named interior sub-region "
+                    "(domain.region(...)), or a Shape.regions body. Got the whole-domain volume — did "
+                    "you forget the test function?"
                 )
             comp, value, value_node = _dirichlet_spec(_bare(c))
             fk = _field_key_of(c)

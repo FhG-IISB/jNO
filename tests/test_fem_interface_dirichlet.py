@@ -96,6 +96,42 @@ def test_a_volume_region_dirichlet_reaches_every_node_of_that_region():
     assert (np.asarray(d._fem_native_dof_points_all[0])[truth, 1] < 1e-9).all(), "all at or below y=0"
 
 
+def test_a_volume_region_dirichlet_works_on_independently_meshed_bodies():
+    """The same pin, on the OTHER kind of multi-region domain -- and it was refused outright.
+
+    ``_two_region`` above composes with ``+``, which builds through the polygon domain and populates
+    ``domain._source_regions``. The classifier gated the volumetric pin on exactly that dict. But
+    ``Shape.regions(..., conforming=False)`` is built by the gmsh emitter, which never writes it, so
+    the pin raised "did you forget the test function?" on precisely the domains the tie machinery
+    exists for -- while ``_region_node_ids_from_cells`` was already able to resolve the region's nodes
+    from cell topology. The resolution existed; the gate would not let it be reached.
+
+    A cell set stores ``[volume_cells, facets]``, so a body has entries in the first and a boundary tag
+    in the second. Gating on that keeps the guard that matters -- a whole-domain trial-only term really
+    is a forgotten test function -- which the last assertion pins.
+    """
+    d = jno.Shape.regions(
+        fluid=jno.Shape.rect(0.0, 0.0, L, H).sized(0.22),
+        solid=jno.Shape.rect(X0, -T, X1, 0.0).sized(0.22),
+        conforming=False,
+    ).domain()
+    v, psi = d.fem_symbols(value_shape=(2,), names=("v", "psi"), order=2)
+    ci, sv = d.variable("interior", split=True), d.variable("solid", split=True)
+    got = _pinned_nodes(d, [_lap(v, psi, ci), v(sv[0], sv[1]) - 0.0])
+
+    from jno.utils.solver.fem_utils import _cell_region_mask
+
+    cells = np.asarray(d._fem_native_assembly_cells_all[0])
+    truth = np.unique(cells[np.asarray(_cell_region_mask(d, "solid")).reshape(-1) > 0])
+    assert len(truth) > 10, "sanity: the body must own a node set worth pinning"
+    assert set(truth.tolist()) == set(got.tolist()), (len(truth), len(got))
+
+    # ...and the guard it must NOT weaken: no region name at all is still a forgotten test function
+    ci2 = d.variable("interior", split=True)
+    with pytest.raises(ValueError, match="forget the test function"):
+        jno.fem([_lap(v, psi, ci), v(ci2[0], ci2[1]) - 0.0])
+
+
 def test_a_boundary_tag_is_unchanged():
     """The no-regression side: an ordinary boundary tag must resolve exactly as it always did."""
     d = _two_region()
