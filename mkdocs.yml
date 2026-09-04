@@ -206,6 +206,7 @@ nav:
       - "Two-Wire Loop — R and L with nothing meshed": tutorials/13-peec/two-wire-loop.md
       - "Busbar Pair — skin and proximity effect": tutorials/13-peec/busbar-frequency.md
       - "Cored Transformer — open secondary and core loss": tutorials/13-peec/cored-transformer.md
+      - "Inverse Corrosion — recovering a parameter": tutorials/13-peec/inverse-corrosion.md
   - Reference:
     - API Reference: API.md
     - Hyperparameter Tuning: Hyperparameter-Tuning.md
