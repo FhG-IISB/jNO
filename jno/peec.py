@@ -505,6 +505,170 @@ class PEECSolution:
         return out if jnp.ndim(self._port) else out[0]
 
 
+def _model_calls(node):
+    """Trainable-parameter nodes inside an attached value, or nothing if it is a plain number."""
+    from jno.trace import Placeholder
+
+    if not isinstance(node, Placeholder):
+        return []
+    from jno._fem import _walk
+
+    return [n for n in _walk(node) if type(n).__name__ == "ModelCall"]
+
+
+def _parameters_in(values):
+    """``{name: ModelCall}`` for every ``jno.np.parameter`` reachable from these attached values."""
+    out = {}
+    for v in values:
+        for mc in _model_calls(v):
+            name = getattr(getattr(mc, "model", None), "_parameter_name", None)
+            if name is not None:
+                out[name] = mc
+    return out
+
+
+def _eval_material(expr, params):
+    """An attached material expression at concrete parameter values -- a JAX array, differentiable.
+
+    The same substitution `jno.rcwa` makes for its permittivity: swap each trainable parameter's
+    value into the trace and evaluate. Position-dependent parameters are refused rather than
+    silently evaluated somewhere arbitrary -- a lattice conductivity is one value per CELL, and the
+    cell centres are not in scope here.
+    """
+    import equinox as eqx
+
+    from jno.trace import Placeholder, Variable
+    from jno.trace_evaluator import TraceEvaluator
+
+    if not isinstance(expr, Placeholder):
+        return expr
+    from jno._fem import _walk
+
+    if any(isinstance(n, Variable) for n in _walk(expr)):
+        raise ValueError(
+            "jno.peec: this network's material depends on both a trainable parameter and POSITION, "
+            "which is not supported. A lattice conductivity is one value per cell, so give the "
+            "parameter that shape -- `jno.np.parameter((n_cells,))` -- and keep the spatial part in "
+            "its initial value, or use a plain callable of position with no parameter in it."
+        )
+    table = {}
+    for mc in _model_calls(expr):
+        mod = mc.model.module
+        name = getattr(mc.model, "_parameter_name", None)
+        val = params.get(name) if name is not None else None
+        if val is None:
+            val = _initial_value(mc)
+        if val is not None:
+            mod = eqx.tree_at(lambda m: m.value, mod, jnp.asarray(val))
+        table[mc.model.layer_id] = mod
+    return TraceEvaluator(table).evaluate(expr, context={})
+
+
+def _initial_value(mc):
+    """A parameter's INITIALISED value, not the zeros it is born with.
+
+    `.initialize(...)` only records the initializer -- the training loop applies it -- so reading
+    `module.value` during the eager build gives zeros. A conductivity of zero is not a small number
+    here, it is a singular operator, and the failure surfaces as `Factor is exactly singular` from
+    inside a preconditioner callback with nothing pointing back to the material. So the initializer
+    is applied here instead.
+    """
+    m = getattr(mc, "model", None)
+    fn = getattr(m, "_initializer_fn", None)
+    if fn is None:
+        return None
+    v = jnp.asarray(m.module.value)
+    key = getattr(m, "_initializer_key", None)
+    if key is None:
+        key = jax.random.PRNGKey(0)
+    try:
+        return jnp.asarray(fn(key, v.shape, v.dtype))
+    except TypeError:
+        return jnp.asarray(fn(v.shape))
+
+
+class ParametricSolution:
+    r"""A solved network whose material carries ``jno.np.parameter``\ s.
+
+    Every readout is a **trace node** over those parameters rather than a number, so an objective is
+    written the way the rest of jNO writes one -- ``emag.solve().R`` straight into ``jno.core`` --
+    and crux threads the values. It is the same treatment :class:`jno.rcwa` gives its readouts, and
+    it fits PEEC unusually well: the geometry is frozen at ``build()`` already, so only values are
+    ever traced.
+
+    ``solve(sigma=...)`` with concrete values is the way back to a plain number.
+    """
+
+    def __init__(self, built, exprs, params):
+        self._b, self._exprs, self._params = built, dict(exprs), dict(params)
+
+    def _node(self, kind, *args, key=None, label=None):
+        from jno.trace import FunctionCall
+
+        names = list(self._params)
+        exprs = [self._params[n] for n in names]
+
+        def fn(*values):  # crux threads the current parameter values in here
+            at = dict(zip(names, values))
+            sol = self._b.solve(sigma={r: _eval_material(e, at) for r, e in self._exprs.items()})
+            out = getattr(sol, kind)
+            if callable(out):
+                out = out(*args)
+            return out[key] if key is not None else out
+
+        return FunctionCall(fn, exprs, name=label or f"peec_{kind}")
+
+    @property
+    def Z(self):
+        """Terminal impedance of the source port, as a trace node."""
+        return self._node("Z")
+
+    @property
+    def R(self):
+        """Port resistance, as a trace node."""
+        return self._node("R")
+
+    @property
+    def L(self):
+        """Loop inductance from the field energy, as a trace node."""
+        return self._node("L")
+
+    @property
+    def joule(self):
+        """Total ohmic dissipation, as a trace node."""
+        return self._node("joule")
+
+    @property
+    def i(self):
+        """The filament currents, as a trace node."""
+        return self._node("i")
+
+    def current(self, terminal):
+        """Net current injected at ``terminal``, as a trace node."""
+        return self._node("current", terminal, label=f"peec_current_{terminal}")
+
+    def voltage(self, a, b=None):
+        """Terminal potential, or the difference ``a - b``, as a trace node."""
+        return self._node("voltage", a, b, label=f"peec_voltage_{a}")
+
+    def field(self, points):
+        """Magnetic flux density at ``points``, as a trace node."""
+        return self._node("field", points)
+
+    def dissipation(self):
+        """``{region: node}`` of W/m^3 -- one trace node per region, so a thermal objective composes.
+
+        The keys are read from the discretisation rather than from a solve, because which conductor
+        owns which element is structural and already frozen.
+        """
+        own = np.asarray(self._b.fil.part)
+        return {
+            name: self._node("dissipation", key=name, label=f"peec_dissipation_{name}")
+            for k, name in enumerate(self._b.part_names)
+            if np.any(own == k)
+        }
+
+
 class PEEC:
     """A partial-element problem: built from the constraint list, solved by :meth:`solve`."""
 
@@ -566,6 +730,7 @@ class PEEC:
         # `sigma` alone is a conductor; `mu_r` alone is a core that does not conduct, a ferrite or a
         # powder; both together is a conducting magnetic material, a lamination or a lossy core.
         sig, mur = _attached("sigma"), _attached("mu_r")
+        param_exprs: dict = {}  # region -> attached expression, for the ones carrying a parameter
         lines, line_sig, solids = [], [], []
         line_names, solid_names = [], []
         magnetic, magnetic_names = [], []
@@ -623,7 +788,23 @@ class PEEC:
                 # ANY closed-form solid, not just a box: the lattice covers its bounding box and a
                 # mask says which cells are metal, so a cylinder, a sphere, a union or a CSG
                 # difference all voxelise the same way and all stay one Toeplitz block.
-                solids.append((sh, sig[n]))
+                # A trainable parameter is recorded and replaced by its CURRENT value here: the
+                # discretisation is structure, it is frozen at build() anyway, and it must be
+                # concrete for the lattice's occupancy test. Only the VALUES are traced later.
+                val = sig[n]
+                if _model_calls(val):
+                    param_exprs[n] = val
+                    val = _eval_material(val, {})
+                    a = np.asarray(jax.lax.stop_gradient(jnp.asarray(val)))
+                    if not np.all(np.isfinite(a)) or not np.any(np.abs(a) > 0):
+                        raise ValueError(
+                            f"jno.peec: the conductivity of {n!r} is a trainable parameter whose "
+                            "initial value makes it zero everywhere, so the network has no metal to "
+                            "carry current and the solve is singular. A `jno.np.parameter` starts as "
+                            "ZEROS -- give it a starting point with "
+                            "`.initialize(jax.nn.initializers.constant(0.5))` before attaching it."
+                        )
+                solids.append((sh, val))
                 solid_names.append(n)
 
         parts, owners, blocks = [], [], []  # (Filaments, sigma), the shapes, and (names, resolver)
@@ -741,7 +922,7 @@ class PEEC:
                 sigma=[jnp.asarray(m) - 1.0 for _, m in magnetic],
                 grid_shapes=[s for s, _ in solids],
             )
-        return fil, terms, line_names + solid_names, resolve_all, mag, tuple(magnetic_names)
+        return fil, terms, line_names + solid_names, resolve_all, mag, tuple(magnetic_names), param_exprs
 
     def build(self) -> "BuiltPEEC":
         """Freeze the discretisation and return the jittable :class:`BuiltPEEC`.
@@ -783,7 +964,7 @@ class BuiltPEEC:
     inside ``jax.jit``, ``jax.grad``, or a ``jno.fn`` term driven by ``jno.core``.
     """
 
-    def __init__(self, spec, fil, terms, part_names, resolve, mag=None, mag_names=()):
+    def __init__(self, spec, fil, terms, part_names, resolve, mag=None, mag_names=(), param_exprs=None):
         self.fil, self.terminals, self.part_names = fil, tuple(terms), tuple(part_names)
         #: the magnetic mesh, when any region attached a `mu_r` -- a Filaments of the same shape as
         #: the electric one, since a core is voxels and faces just as a conductor is.
@@ -796,6 +977,10 @@ class BuiltPEEC:
             spec.devices,
         )
         self._resolve = resolve
+        #: region -> attached material expression, for the regions whose material carries a
+        #: `jno.np.parameter`. Non-empty makes `solve()` hand back trace nodes instead of numbers.
+        self._param_exprs = dict(param_exprs or {})
+        self._params = _parameters_in(self._param_exprs.values())
         # Which nodes each pad owns is STRUCTURAL -- `terminal_nodes` reads coordinates, which are
         # tracers under a gradient -- so it is resolved once here, on the reference geometry.
         self.nodes = {t: terminal_nodes(fil, sh) for t, sh in terms.items()}
@@ -848,6 +1033,11 @@ class BuiltPEEC:
                 perpendicular bar families, those blocks are detected and stored densely, and the
                 measured compression is 1.00x. See :mod:`~jno.utils.solver.hmatrix`.
         """
+        if self._param_exprs and sigma is None:
+            # The material carries a trainable parameter, so the readouts are trace nodes over it and
+            # crux threads the values -- the same treatment `jno.rcwa` gives its readouts. Naming
+            # concrete values in `sigma=` is the way back to a number.
+            return ParametricSolution(self, self._param_exprs, self._params)
         fil, nodes, terms = self.fil, self.nodes, self.terminals
         if weights:
             nodes = dict(nodes)
