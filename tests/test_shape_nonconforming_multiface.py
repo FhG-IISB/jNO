@@ -125,19 +125,17 @@ def test_a_dirichlet_on_the_interface_reaches_the_whole_wetted_surface():
     assert wetted <= pinned, f"{len(wetted - pinned)} of {len(wetted)} wall nodes were left free"
 
 
-@pytest.mark.xfail(
-    raises=ValueError,
-    strict=True,
-    reason="The mortar parametrises an interface by ONE tangent plane (see `_interface_frame`), so a "
-    "cornered interface folds its parallel faces onto the same interval and every secondary edge is "
-    "covered twice. Reaching this is progress: while the tag held only one face the projection was "
-    "flat and the tie 'worked' -- on a third of the interface. Remove the marker when the interface "
-    "is parametrised by arc length along its facet chain instead.",
-)
 def test_the_tie_glues_across_every_face():
     """The physics oracle, and the one that would have caught the Navier-Stokes divergence: a tied
     two-body solve must reproduce the conforming single-mesh one. With two of three faces missing the
-    bodies are joined along a single line and the peak is wrong, not merely less accurate."""
+    bodies are joined along a single line and the peak is wrong, not merely less accurate.
+
+    This was `xfail(strict=True)` while the mortar parametrised an interface by ONE fitted tangent
+    plane: a beam embedded in a channel touches the fluid on three faces, and the two parallel sides
+    folded onto the same interval so every secondary edge was covered exactly 2.00x. Parametrising by
+    ARC LENGTH along the interface chain removed the fold, and the strict marker announced it by
+    XPASSing rather than sitting green on a stale reason.
+    """
 
     def solve(conforming):
         notch = jno.Shape.rect(_X0, -0.1, _X1, _TOP)

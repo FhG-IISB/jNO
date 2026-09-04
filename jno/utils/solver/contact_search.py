@@ -216,3 +216,106 @@ def project_points(
     w = np.where(active[:, None], w, 0.0)
     g0 = np.where(active, g0, OPEN_GAP)
     return ids, w, g0, active
+
+
+# ----------------------------------------------------------------------------------------------
+# Arc length along an interface chain -- the parametrisation a CURVED tie needs
+# ----------------------------------------------------------------------------------------------
+def chain_order(facets: np.ndarray, points: np.ndarray) -> Tuple[np.ndarray, bool]:
+    """Order edge facets into a connected chain: ``(facet_order, is_closed)``.
+
+    The mortar parametrises a 2-D interface by ONE scalar and clips secondary against main edges in
+    it. Projecting onto a fitted tangent plane supplies that scalar only while the interface is flat:
+    a corner folds its two arms onto the same interval, and a closed loop folds everything. Arc length
+    along the chain is the coordinate that cannot fold, because it is monotone along the interface by
+    construction.
+
+    Returns the facet indices in traversal order. ``is_closed`` distinguishes a loop -- an annular air
+    gap between a rotor and a stator -- from an open chain, which matters because a loop's coordinate
+    is periodic and a facet may straddle the seam.
+
+    Raises if the facets do not form a single chain: a branching or disjoint interface has no arc
+    length, and silently picking one branch is exactly the class of error this module exists to end.
+    """
+    f = np.asarray(facets, dtype=int)
+    ends = f[:, :2]
+    adj: dict = {}
+    for i, (a, b) in enumerate(ends):
+        adj.setdefault(int(a), []).append(i)
+        adj.setdefault(int(b), []).append(i)
+    deg = {v: len(e) for v, e in adj.items()}
+    if any(d > 2 for d in deg.values()):
+        raise ValueError(
+            f"interface facets do not form a simple chain: {sum(d > 2 for d in deg.values())} node(s) "
+            "join three or more edges. Arc length is undefined on a branching interface."
+        )
+    tips = [v for v, d in deg.items() if d == 1]
+    closed = len(tips) == 0
+    if not closed and len(tips) != 2:
+        raise ValueError(f"interface has {len(tips)} loose end(s); expected 0 (a loop) or 2 (an open chain).")
+
+    start_v = min(tips) if tips else int(ends[0, 0])
+    order, seen_f, v = [], set(), start_v
+    while True:
+        nxt = [i for i in adj[v] if i not in seen_f]
+        if not nxt:
+            break
+        i = nxt[0]
+        seen_f.add(i)
+        order.append(i)
+        a, b = int(ends[i, 0]), int(ends[i, 1])
+        v = b if a == v else a
+    if len(order) != len(f):
+        raise ValueError(
+            f"interface facets are disjoint: walked {len(order)} of {len(f)} from one end, so this is "
+            "more than one connected piece. Tie each piece as its own interface."
+        )
+    return np.asarray(order, dtype=int), closed
+
+
+def chain_arclength(facets: np.ndarray, points: np.ndarray):
+    """Arc-length coordinate of an interface chain: ``(order, closed, starts, lengths, total)``.
+
+    ``starts[k]`` is the arc length at the first endpoint of the ``k``-th facet in traversal order, so
+    a point at local parameter ``t`` on that facet sits at ``starts[k] + t * lengths[k]``.
+    """
+    f = np.asarray(facets, dtype=int)
+    pts = np.asarray(points, dtype=float)
+    order, closed = chain_order(f, pts)
+    # walk again to get each facet's traversal ORIENTATION, so `t` runs the same way along the chain
+    ends = f[order][:, :2]
+    v = int(ends[0, 0]) if len(order) == 1 else (
+        int(ends[0, 0]) if int(ends[0, 0]) not in ends[1, :2].tolist() else int(ends[0, 1]))
+    a_list, b_list = [], []
+    for a, b in ends:
+        a, b = int(a), int(b)
+        if a == v:
+            a_list.append(a); b_list.append(b); v = b
+        else:
+            a_list.append(b); b_list.append(a); v = a
+    A, B = np.asarray(a_list), np.asarray(b_list)
+    lengths = np.linalg.norm(pts[B] - pts[A], axis=1)
+    starts = np.concatenate([[0.0], np.cumsum(lengths)[:-1]])
+    return order, closed, A, B, starts, lengths, float(lengths.sum())
+
+
+def arclength_of(query: np.ndarray, facets: np.ndarray, points: np.ndarray) -> Tuple[np.ndarray, float, bool]:
+    """Arc-length coordinate of arbitrary points, by closest point on the chain.
+
+    Both sides of a tie must be measured on the SAME ruler, so the main chain supplies it and every
+    node -- main or secondary -- is located on it. Reuses the closest-point pairing above, which is
+    why this lives here rather than in the tie module.
+    """
+    _o, closed, A, B, starts, lengths, total = chain_arclength(facets, points)
+    pts = np.asarray(points, dtype=float)
+    q = np.asarray(query, dtype=float).reshape(-1, pts.shape[1])
+    a, b = pts[A], pts[B]
+    best_s = np.zeros(len(q))
+    best_d = np.full(len(q), np.inf)
+    for k in range(len(A)):  # chains are short (an interface, not a mesh); clarity over vectorising
+        p, t = closest_point_on_segment(q, np.repeat(a[k][None], len(q), 0), np.repeat(b[k][None], len(q), 0))
+        d = np.linalg.norm(p - q, axis=1)
+        take = d < best_d
+        best_d = np.where(take, d, best_d)
+        best_s = np.where(take, starts[k] + t * lengths[k], best_s)
+    return best_s, total, closed

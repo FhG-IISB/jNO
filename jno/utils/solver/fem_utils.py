@@ -3242,6 +3242,35 @@ def build_periodic_prolongation(
         # (tied) -- the axis-dropping this replaces could only express the former. See _interface_frame.
         frame, origin = _interface_frame(m_pts, s_pts)
         loc = (pts - origin) @ frame.T  # (n_nodes, dim-1) in-interface coordinates
+
+        # A CURVED 2-D interface is parametrised by ARC LENGTH along its own chain instead. Projecting
+        # onto one fitted tangent plane is a coordinate only while the interface is flat: a corner
+        # folds its two arms onto the same interval, so every secondary edge finds main edges on the
+        # far arm and each is covered twice -- measured 2.00x on a beam standing in a channel, which is
+        # why that interface had to be hand-decomposed into three flat ties. Arc length is monotone
+        # along the interface by construction and cannot fold.
+        #
+        # Flat interfaces keep the projected coordinate BIT-FOR-BIT: the switch is gated on the main
+        # facets' own normals disagreeing, so every existing conforming and periodic tie is untouched.
+        _mfc0 = facets.get(main_tag)
+        if loc.shape[1] == 1 and _mfc0 is not None and len(np.asarray(_mfc0)) > 1:
+            _e = np.asarray(pts)[np.asarray(_mfc0, dtype=int)[:, 1]] - np.asarray(pts)[np.asarray(_mfc0, dtype=int)[:, 0]]
+            _n = _e[:, ::-1] * np.array([1.0, -1.0])  # the 2-D normal of each edge
+            _n = _n / np.maximum(np.linalg.norm(_n, axis=1, keepdims=True), 1e-300)
+            _spread = float(np.abs(np.abs(_n @ _n.mean(axis=0)) / max(np.linalg.norm(_n.mean(axis=0)), 1e-300) - 1.0).max())
+            if _spread > 1.0e-3:  # ~2.6 degrees of normal variation: not one tangent plane
+                from .contact_search import arclength_of
+
+                _s_all, _tot, _closed = arclength_of(np.asarray(pts), _mfc0, np.asarray(pts))
+                if _closed:
+                    raise NotImplementedError(
+                        f"tie ({main_tag!r}, {secondary_tag!r}): the interface is a CLOSED loop (an "
+                        "annular air gap, say). Its arc-length coordinate is periodic, and the "
+                        "segmentation below clips in an open interval, so a facet straddling the seam "
+                        "would be miscounted. Split the loop into two or more arcs and tie each -- "
+                        "each arc may be curved, which is what this parametrisation buys."
+                    )
+                loc = _s_all[:, None]
         m_loc, s_loc = loc[m_ids], loc[s_ids]
 
         # Nearest in-interface main node for every secondary node.
