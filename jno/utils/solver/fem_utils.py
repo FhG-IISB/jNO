@@ -2832,10 +2832,27 @@ def _mortar_rows_2d(
             diag[rows] += np.einsum("qi,qi,q->i", psi, n_s, w)
             cross[np.ix_(rows, cols)] += np.einsum("qi,qj,q->ij", psi, n_m, w)
 
-        if abs(covered - (e_hi - e_lo)) > 1.0e-8 * max(e_hi - e_lo, seg_tol):
+        _len = e_hi - e_lo
+        if abs(covered - _len) > 1.0e-8 * max(_len, seg_tol):
+            # OVER-coverage and UNDER-coverage have opposite causes, and calling both a "hole" sent
+            # the reader looking for a gap that was not there. Covering a facet more than once means
+            # the interface FOLDS onto itself under the single tangent-plane projection this method
+            # parametrises by (see `_interface_frame`): a beam standing in a channel touches the fluid
+            # on three faces, and its two parallel sides land on the same interval, so every secondary
+            # edge finds main edges on the far face too. Measured there: 0.1059 covered of a 0.0529
+            # facet -- exactly twice.
+            if covered > _len:
+                raise ValueError(
+                    f"Mortar segmentation covered {covered:.6g} of a secondary facet of length "
+                    f"{_len:.6g} -- {covered / _len:.2f}x, so the main face overlaps ITSELF once "
+                    "projected onto the interface. The mortar parametrises an interface by a single "
+                    "tangent plane, so it needs a (near-)flat one; this interface turns a corner "
+                    "(e.g. a body embedded in another, touching it on several faces) and folds. Tie "
+                    "each flat face as its own interface, or use a conforming mesh there."
+                )
             raise ValueError(
                 f"Mortar segmentation covered {covered:.6g} of a secondary facet of length "
-                f"{e_hi - e_lo:.6g}. The two faces span the same extent, so this is a HOLE in the "
+                f"{_len:.6g}. The two faces span the same extent, so this is a HOLE in the "
                 "main face -- its facets do not tile it. Check the main tag selects a connected "
                 "set of whole boundary facets."
             )
