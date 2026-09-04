@@ -610,7 +610,28 @@ class ParametricSolution:
 
         def fn(*values):  # crux threads the current parameter values in here
             at = dict(zip(names, values))
-            sol = self._b.solve(sigma={r: _eval_material(e, at) for r, e in self._exprs.items()})
+            mats = {r: _eval_material(e, at) for r, e in self._exprs.items()}
+            for r, m in mats.items():
+                # A degenerate material is a SINGULAR network, and the failure it produces is
+                # `Factor is exactly singular` raised from inside a preconditioner callback with
+                # nothing pointing back here. Checked only when the value is concrete -- under a
+                # trace there is nothing to look at, and the guard must not force one.
+                a = np.asarray(m) if isinstance(m, (int, float, np.ndarray)) else None
+                if a is None:
+                    try:
+                        a = np.asarray(jax.lax.stop_gradient(jnp.asarray(m)))
+                    except Exception:  # a tracer: no value to check, and none is required
+                        continue
+                if not np.all(np.isfinite(a)) or not np.any(np.abs(a) > 0):
+                    raise ValueError(
+                        f"jno.peec: the conductivity of {r!r} evaluated to zero (or non-finite) at "
+                        "the parameter values it was handed, so the network has no metal and the "
+                        "solve is singular. A `jno.np.parameter` is ZEROS until its initializer runs "
+                        "-- if this came from a solver that evaluates coefficients before "
+                        "initialising, that is the cause, and giving the material a non-zero floor "
+                        "(`CU * (0.01 + 0.99 * rho**3)`) both fixes it and is better conditioned."
+                    )
+            sol = self._b.solve(sigma=mats)
             out = getattr(sol, kind)
             if callable(out):
                 out = out(*args)
