@@ -4844,12 +4844,31 @@ class core:
         )
 
     def _log_constraint_shapes(self, batchsize, min_consecutive: Optional[int] = 1):
-        """Log the output shape of each constraint by doing a test evaluation.
+        """Log each constraint's output shape, or say why it could not be read.
 
-        When the log level is DEBUG, prints a full shape-annotated tree
-        for each constraint so users can see how shapes evolve through
-        every node of the expression.
+        DIAGNOSTIC ONLY -- it logs, and nothing downstream consumes it. So a constraint this cannot
+        probe must not take the solve down with it, which is what used to happen: the probe is
+        `jax.eval_shape`, which supplies no values, and a constraint holding a solver that runs on
+        the HOST cannot run without them. `jno.peec`'s sparse factorisation is one; a constraint
+        holding a PEEC solve *and* a FEM solve -- an electro-thermal objective -- died here while
+        either one alone was fine.
+
+        The failure is reported rather than swallowed: losing the shape log is a small, named cost,
+        and the alternative was an abstract-evaluation traceback from a run that would otherwise
+        have trained.
         """
+        try:
+            self._log_constraint_shapes_probe(batchsize, min_consecutive=min_consecutive)
+        except Exception as exc:  # noqa: BLE001 -- any abstract-evaluation failure, and it is a log
+            self.log.info(
+                f"Constraint shapes unavailable ({type(exc).__name__}: {str(exc).splitlines()[0][:160]}). "
+                "This is the shape LOG only and the solve is unaffected -- it happens when a "
+                "constraint holds a solver that runs on the host, which `jax.eval_shape` cannot "
+                "supply values for."
+            )
+
+    def _log_constraint_shapes_probe(self, batchsize, min_consecutive: Optional[int] = 1):
+        """The probe itself. See :meth:`_log_constraint_shapes` for why it is allowed to fail."""
 
         # Create dummy inputs for shape inference
         test_rng = jax.random.PRNGKey(0)
