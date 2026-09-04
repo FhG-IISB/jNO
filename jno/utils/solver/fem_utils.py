@@ -2940,58 +2940,54 @@ def interface_gap_data(
     m_facets: np.ndarray,
     points: np.ndarray,
     secondary_normals: np.ndarray,
-    *,
-    frame: np.ndarray | None = None,
-    origin: np.ndarray | None = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Everything a signed contact gap needs, precomputed on the host: ``(ids, w, g0)``.
 
     The gap between two surfaces is ``g = g0 - n . (u_s - u_m . Phi)``, split into a part fixed by the
     geometry and a part that moves with the solution:
 
-    * ``g0 = n . (Phi(x_s) - x_s)`` — the **initial** separation at each secondary quadrature point, i.e.
+    * ``g0 = n . (Phi(x_s) - x_s)`` -- the **initial** separation at each secondary quadrature point, i.e.
       how far it stands off the main surface along the normal. Positive = a gap, negative = initial
       penetration. Zero for two coincident (tied) faces.
-    * ``(ids, w)`` — the :func:`main_trace_weights` gather, so ``u_m . Phi`` at those points is a
-      plain weighted sum of main DOFs and therefore differentiable in the solution.
+    * ``(ids, w)`` -- the gather, so ``u_m . Phi`` at those points is a plain weighted sum of main DOFs
+      and therefore differentiable in the solution.
 
-    **Orientation — the one thing to get right.** ``n`` is the **secondary face's outward normal**, which on
+    **Orientation -- the one thing to get right.** ``n`` is the **secondary face's outward normal**, which on
     a contacting pair points *toward* the main body. Secondary motion along ``n`` therefore *closes* the
     gap, which is where the minus sign on the displacement term comes from. Handed the opposite normal
     this returns ``-g``, and every downstream sign follows it: a penetrating body reads as open, and
-    ``max(0, -c*g)`` never activates, so free interpenetration is an exact root of the residual and
+    ``max(0, .)`` never activates, so free interpenetration is an exact root of the residual and
     Newton converges to it without complaint. The parameter is named ``secondary_normals`` rather than
     ``normals`` because there is nothing in the arrays themselves that distinguishes the two cases.
 
     The convention that follows is ``g > 0`` separated, ``g < 0`` interpenetrating, contact pressure
-    ``p = max(0, -c*g) >= 0``, and a traction term ``+p * inner(n, phi)`` — the sign that adds a
+    ``p = max(0, -c*g) >= 0``, and a traction term ``+p * inner(n, phi)`` -- the sign that adds a
     *positive*-definite ``+c (n.du)(n.phi)`` to the tangent, since ``dg/du_s = -n``.
 
-    ``secondary_qp`` is ``(..., dim)`` physical quadrature points on the secondary face; ``secondary_normals`` is the
-    matching outward unit normal per point (or one per face, broadcast by the caller). ``frame`` /
-    ``origin`` default to a fit of the **main** facets' own tangent plane (:func:`_interface_frame`),
-    which is what makes this work for coincident faces where no separating axis exists.
+    The pairing is :func:`~.contact_search.project_points`: each query point is matched with the facet
+    **nearest to it in space**. It used to be matched in a coordinate obtained by flattening the whole
+    main face onto one fitted tangent plane, which is exact for a flat interface and wrong in
+    proportion to curvature -- on two concentric arcs of true separation 0.3 it reported 0.43, and
+    since it over-reports separation the resulting free interpenetration is silent. The ``frame`` /
+    ``origin`` arguments that supplied that plane are gone with it: there is no single frame in a local
+    projection, and accepting them while ignoring them would be worse than removing them. A flat
+    interface is unaffected -- the trace agrees to 1.4e-15 and ``g0`` bit-exactly.
 
     Host/NumPy: locating each point on the main face is a discrete search, frozen at build time. So
     the gap is differentiable in the DOF values but **not** in the mesh coordinates -- shape-optimising
     through a contact gap would need the projection re-derived in JAX. It also assumes **small
     sliding**: the pairing is fixed, so a caller that slides must rebuild it per load step.
     """
-    q = np.asarray(secondary_qp, dtype=float)
-    pts = np.asarray(points, dtype=float)
-    m_facets = np.asarray(m_facets, dtype=int)
-    flat = q.reshape(-1, q.shape[-1])
-    if frame is None or origin is None:
-        m_pts = pts[np.unique(m_facets)]
-        frame, origin = _interface_frame(m_pts, flat if flat.size else m_pts)
+    from .contact_search import project_points  # deferred: contact_search imports this module's shapes
 
-    ids, w = main_trace_weights((flat - origin) @ np.asarray(frame).T, m_facets, (pts - origin) @ np.asarray(frame).T)
-    proj = np.einsum("qk,qkd->qd", w, pts[ids])  # Phi(x_s): the main-surface point under each query
-    n = np.asarray(secondary_normals, dtype=float).reshape(-1, q.shape[-1])
-    # Measured from the secondary TOWARD the main (``proj - x_s``), because ``n`` points that way -- see
-    # the orientation paragraph above, which is the whole reason this line is not the other way round.
-    g0 = np.einsum("qd,qd->q", n, proj - flat)
+    q = np.asarray(secondary_qp, dtype=float)
     lead = q.shape[:-1]
+    ids, w, g0, _active = project_points(
+        q.reshape(-1, q.shape[-1]),
+        m_facets,
+        points,
+        np.asarray(secondary_normals, dtype=float).reshape(-1, q.shape[-1]),
+    )
     return ids.reshape(*lead, -1), w.reshape(*lead, -1), g0.reshape(*lead)
 
 
