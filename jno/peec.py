@@ -608,7 +608,28 @@ class ParametricSolution:
         names = list(self._params)
         exprs = [self._params[n] for n in names]
 
+        shapes = {n: tuple(np.shape(self._params[n].model.module.value)) for n in names}
+
         def fn(*values):  # crux threads the current parameter values in here
+            for nm, val in zip(names, values):
+                # A parameter arriving with the wrong SHAPE means this node is being evaluated
+                # somewhere that slices it -- a FEM region coefficient is evaluated PER QUADRATURE
+                # POINT, and hands each point a scalar. A PEEC readout is one value for the whole
+                # region, so evaluating it there would run an entire network solve per point, and
+                # the first thing it does instead is fail: `Factor is exactly singular`, raised from
+                # a preconditioner callback with nothing pointing back here.
+                got = tuple(np.shape(val))
+                if got != shapes[nm]:
+                    raise ValueError(
+                        f"jno.peec: the readout was handed {nm!r} with shape {got} where the "
+                        f"parameter is {shapes[nm]}, which means it is being evaluated per point -- "
+                        "typically `d.by_region({region: sol.dissipation()[region]})`. A PEEC "
+                        "readout is ONE value per region, not a field, so evaluate it once and pass "
+                        "the number:\n\n"
+                        "    q = sol.dissipation()['bar']            # a trace node\n"
+                        "    loss = jno.fn(lambda qb: <fem solve using d.by_region({'bar': qb})>, [q])\n\n"
+                        "The FEM takes a traced scalar there and stays differentiable through it."
+                    )
             at = dict(zip(names, values))
             mats = {r: _eval_material(e, at) for r, e in self._exprs.items()}
             for r, m in mats.items():
