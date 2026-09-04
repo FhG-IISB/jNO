@@ -160,6 +160,14 @@ def test_dissipation_and_field_are_nodes_too():
     b = sol.field(np.array([[0.008, 0.010, 0.0]]))
     assert isinstance(b, Placeholder)
 
+    # ...and they must EVALUATE. Asserting the type alone passes on a node that raises the moment
+    # anything asks it for a number, which is most of what a readout is for.
+    v = jnp.full((_ncell(),), 0.5)
+    heat = np.asarray(np.real(_value_of(q["bar"], "rho", v))).reshape(-1)
+    assert heat.size == 1 and np.isfinite(heat).all() and heat[0] > 0, heat
+    bb = np.asarray(np.real(_value_of(b, "rho", v)))
+    assert bb.shape[-1] == 3 and np.isfinite(bb).all(), bb.shape
+
 
 def test_an_explicit_sigma_override_still_solves_concretely():
     """`solve(sigma=...)` names concrete values, so it is an escape hatch back to a number -- which
