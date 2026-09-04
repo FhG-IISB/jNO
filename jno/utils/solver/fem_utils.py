@@ -2518,6 +2518,34 @@ def _tri_dual_available(k: int) -> bool:
     return bool(d.min() > 1.0e-12 * float(d.max()))
 
 
+def _covers_local_3d(s_facets: np.ndarray, m_facets: np.ndarray, pts3: np.ndarray) -> bool:
+    """Does the main surface actually lie under the secondary one, measured IN SPACE?
+
+    The global-frame test below asks whether each secondary vertex falls inside some main triangle
+    after both are flattened onto one plane. On a curved interface that flattening folds, the
+    containment fails for reasons that have nothing to do with the surfaces, and the tie degrades to
+    collocation without a word -- measured on nested spheres, `coupling='collocated'` and a
+    constant-gradient patch-test error of 9.8e-01.
+
+    Here the question is asked directly: every secondary vertex must sit on the main surface, i.e. its
+    closest point on the main facets must be nearer than a fraction of a facet radius. Two coincident
+    surfaces pass however they curve; two genuinely mismatched ones still fail, which is what keeps a
+    ragged interface on the collocated path.
+    """
+    from .contact_search import facet_geometry, project_points
+
+    P = np.asarray(pts3, dtype=float)
+    sf = np.asarray(s_facets, dtype=int)
+    mf = np.asarray(m_facets, dtype=int)
+    if sf.size == 0 or mf.size == 0:
+        return False
+    q = P[np.unique(sf[:, :3])]
+    ids, w, _g0, _a = project_points(q, mf, P, np.tile(np.eye(1, P.shape[1], 0), (len(q), 1)))
+    proj = np.einsum("qk,qkd->qd", w, P[ids])
+    _V, _c, rad = facet_geometry(mf, P)
+    return bool(np.linalg.norm(proj - q, axis=1).max() <= 0.25 * float(np.median(rad)))
+
+
 def _main_covers_secondary_3d(s_facets: np.ndarray, m_facets: np.ndarray, loc: np.ndarray) -> bool:
     """Does every secondary facet vertex lie inside some main triangle? The 3-D counterpart of
     :func:`_faces_span_the_same_extent`.
@@ -2648,6 +2676,7 @@ def _mortar_rows_3d(
     *,
     span: float,
     rim_nodes: Any = None,
+    pts3: Any = None,
 ) -> Dict[int, List[Tuple[int, float]]]:
     """Dual-mortar prolongation rows for a **3-D** interface, whose facets are triangles.
 
@@ -2661,9 +2690,20 @@ def _mortar_rows_3d(
     projection on a surface, so it fails the constant-stress patch test in 3-D where the 2-D edge case
     happens to pass it.
 
-    **Areas are measured in the interface frame**, so the interface must be (near-)planar -- the same
-    assumption :func:`_interface_frame` already makes. A curved tied surface is projected, and its
-    segment areas are the projected ones.
+    ``pts3`` switches the geometry into a frame built **per secondary facet** from that facet's own
+    vertices, rather than one plane fitted to the whole interface. That is what a curved interface
+    needs: with a single global frame the areas are PROJECTED areas, and on a sphere the projection
+    folds -- measured, a secondary facet of area 0.0189193 came back covered 0.0378387, exactly twice,
+    and at a coarser mesh the containment gate failed instead and the tie degraded silently to
+    collocation with a constant-gradient patch-test error of 9.8e-01.
+
+    Projecting each candidate main triangle into the secondary facet's own plane is the standard
+    mortar projection and is second-order accurate in the facet size for any smooth surface. Nothing
+    else changes: the clipping, the fan triangulation, the quadrature and the dual basis never knew
+    where their coordinates came from.
+
+    Without ``pts3`` the old global-frame path is used unchanged, which keeps a planar interface
+    bit-identical.
     """
     s_facets = np.asarray(s_facets, dtype=int)
     m_facets = np.asarray(m_facets, dtype=int)
@@ -2682,21 +2722,49 @@ def _mortar_rows_3d(
 
     # Bounding boxes make the facet pairing O(n_s + n_m) per secondary in practice instead of a full
     # O(n_s * n_m) Python double loop, which a face of a few thousand triangles would not survive.
-    m_v = xy[m_facets[:, :3]]  # (n_m, 3, 2)
-    m_lo, m_hi = m_v.min(axis=1), m_v.max(axis=1)
+    P3 = None if pts3 is None else np.asarray(pts3, dtype=float)
+    if P3 is None:
+        m_v = xy[m_facets[:, :3]]  # (n_m, 3, 2)
+        m_lo, m_hi = m_v.min(axis=1), m_v.max(axis=1)
+    else:
+        # A box overlap in the flattened coordinate is meaningless once the surface curves, so pair by
+        # PROXIMITY in space instead -- the same centroid/radius + KD-tree the contact pairing uses.
+        from scipy.spatial import cKDTree
+
+        from .contact_search import facet_geometry
+
+        _mV, m_cent, m_rad = facet_geometry(m_facets, P3)
+        m_tree, m_reach = cKDTree(m_cent), float(m_rad.max())
 
     for e in range(s_facets.shape[0]):
-        sv = xy[s_facets[e, :3]]
-        area_e = abs(_signed_area(sv))
-        if area_e <= area_tol:
-            continue
-        s_lo, s_hi = sv.min(axis=0), sv.max(axis=0)
-        near = np.flatnonzero(np.all(m_lo <= s_hi, axis=1) & np.all(m_hi >= s_lo, axis=1))
+        if P3 is None:
+            sv = xy[s_facets[e, :3]]
+            area_e = abs(_signed_area(sv))
+            if area_e <= area_tol:
+                continue
+            s_lo, s_hi = sv.min(axis=0), sv.max(axis=0)
+            near = np.flatnonzero(np.all(m_lo <= s_hi, axis=1) & np.all(m_hi >= s_lo, axis=1))
+        else:
+            V3 = P3[s_facets[e, :3]]
+            e1, e2 = V3[1] - V3[0], V3[2] - V3[0]
+            nrm = np.cross(e1, e2)
+            n2 = float(np.linalg.norm(nrm))
+            if 0.5 * n2 <= area_tol:  # a sliver: its local frame is ill-conditioned. Skip on the TRUE
+                continue              # 3-D area, never the projected one, which can vanish spuriously.
+            t1 = e1 / np.linalg.norm(e1)
+            t2 = np.cross(nrm / n2, t1)
+            org, F = V3[0], np.stack([t1, t2])            # the secondary facet's OWN plane
+            sv = (V3 - org) @ F.T
+            area_e = abs(_signed_area(sv))                # == the true 3-D area, by construction
+            cen = V3.mean(axis=0)
+            near = np.asarray(m_tree.query_ball_point(
+                cen, float(np.linalg.norm(V3 - cen, axis=1).max()) + m_reach + 1e-9 * max(span, 1.0)),
+                dtype=int)
         rows = [s_at[int(v)] for v in s_facets[e]]
         sv_ccw = _as_ccw(sv)
         covered = 0.0
         for f in near:
-            mv = xy[m_facets[f, :3]]
+            mv = xy[m_facets[f, :3]] if P3 is None else (P3[m_facets[f, :3]] - org) @ F.T
             poly = _clip_convex(sv_ccw, _as_ccw(mv))
             if poly.shape[0] < 3:
                 continue
@@ -3310,8 +3378,37 @@ def build_periodic_prolongation(
                     mortar = _mortar_rows_2d(s_fc, m_fc, loc, span=span, rim_nodes=_rim)
             # 3-D: triangle facets, polygon clipping. P2 triangles have no dual basis of this form
             # (their vertex functions integrate to zero) -- see _tri_dual_available.
-            elif _tri_dual_available(int(np.shape(s_fc)[1])) and _main_covers_secondary_3d(s_fc, m_fc, loc):
-                mortar = _mortar_rows_3d(s_fc, m_fc, loc, span=span, rim_nodes=_rim)
+            elif _tri_dual_available(int(np.shape(s_fc)[1])):
+                # Is the interface CURVED? Compare the main facets' own normals. A planar interface
+                # keeps the global-frame path bit-for-bit; only a curved one takes the local frames.
+                _mv3 = np.asarray(pts)[np.asarray(m_fc, dtype=int)[:, :3]]
+                _n3 = np.cross(_mv3[:, 1] - _mv3[:, 0], _mv3[:, 2] - _mv3[:, 0])
+                _n3 = _n3 / np.maximum(np.linalg.norm(_n3, axis=1, keepdims=True), 1e-300)
+                _mu = _n3.mean(axis=0)
+                _mu = _mu / max(float(np.linalg.norm(_mu)), 1e-300)
+                _curved3 = bool((1.0 - np.abs(_n3 @ _mu)).max() > 1.0e-3)
+                # The local path needs the two faces to be COINCIDENT, which a tie is and a PERIODIC
+                # pair is not: periodic faces sit a lattice vector apart, and removing that offset is
+                # exactly what `_interface_frame` is for. `_covers_local_3d` measures in space, so it
+                # says no for a translated pair -- and the `and` here makes that a fall-through to the
+                # global path rather than no mortar at all. Without the fall-through a triply-periodic
+                # P2 cube lost its coupling entirely.
+                if _curved3 and _covers_local_3d(s_fc, m_fc, np.asarray(pts)):
+                    mortar = _mortar_rows_3d(s_fc, m_fc, loc, span=span, rim_nodes=_rim,
+                                             pts3=np.asarray(pts))
+                elif _main_covers_secondary_3d(s_fc, m_fc, loc):
+                    mortar = _mortar_rows_3d(s_fc, m_fc, loc, span=span, rim_nodes=_rim)
+            elif int(np.shape(s_fc)[1]) == 6:
+                # A P2 TRIANGLE has no dual basis of this form and never will -- Lamichhane, thesis
+                # 2006, Lemma 3.4 -- so this interface silently becomes collocated, which ties but does
+                # NOT pass the patch test. Say so: the alternative is discovering it from a wrong answer.
+                _log.warning(
+                    f"tie ({main_tag!r}, {secondary_tag!r}): order-2 triangular facets have no "
+                    "biorthogonal dual basis in 3-D (Lamichhane 2006, Lemma 3.4 -- the P2 vertex "
+                    "functions integrate to zero), so this interface uses the COLLOCATED coupling, "
+                    "which does not pass the constant-stress patch test. Use order-1 tetrahedra for a "
+                    "variationally consistent 3-D tie."
+                )
 
         # ONE formula for the whole interface, decided HERE and applied to every secondary below.
         # Choosing per node is what broke the patch test: a weight-1 collocation row sitting inside a
