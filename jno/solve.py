@@ -50,6 +50,7 @@ __all__ = [
     "gmres",
     "fgmres",
     "minres",
+    "cocg",
     "chebyshev",
     "amg",
     "newton",
@@ -304,6 +305,30 @@ def minres(*, tol: float = 1e-8, maxiter: int = 2000) -> LinearSolver:
         return _firewalled(raw, op, b, M=M, x0=x0, symmetric=True, name="minres")
 
     return LinearSolver(_fn, name="minres", key=(tol, maxiter))
+
+
+def cocg(*, tol: float = 1e-8, maxiter: int = 2000) -> LinearSolver:
+    """COCG (van der Vorst & Melissen 1990; see :func:`jno.utils.solver.krylov.cocg`) — the Krylov
+    method for **complex-symmetric** systems, ``A = A^T`` and not ``A = A^H``: time-harmonic
+    eddy-current (A-V), Helmholtz, RCWA. Replacing the Hermitian inner product by the bilinear
+    ``x^T y`` keeps CG's short recurrence, so this costs ``O(n)`` memory and one matvec per
+    iteration where GMRES needs a ``(restart, n)`` basis and a restart parameter.
+
+    Use it only when the operator really is complex-symmetric — ``jno.fem`` gives that after the
+    ``V = jw*Vt`` column scaling of an A-V system, and a Helmholtz form is symmetric as assembled.
+    On a Hermitian or non-symmetric operator the recurrence is not valid; use ``minres`` or
+    ``fgmres``. Unlike CG on an SPD matrix, COCG can break down (the bilinear form is indefinite);
+    it then returns its last iterate and the residual guard raises."""
+
+    def _fn(op: LinearOperator, b, *, M, x0):
+        from .utils.solver.krylov import cocg as _raw
+
+        raw = lambda mv, rhs, M, x0: _raw(mv, rhs, M=M, x0=x0, tol=tol, maxiter=maxiter)
+        # symmetric=True means A == A^T, which is exactly COCG's precondition — so
+        # lax.custom_linear_solve reuses the forward solve for the transpose (adjoint) solve.
+        return _firewalled(raw, op, b, M=M, x0=x0, symmetric=True, name="cocg")
+
+    return LinearSolver(_fn, name="cocg", key=(tol, maxiter))
 
 
 def chebyshev(

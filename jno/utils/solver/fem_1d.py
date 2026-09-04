@@ -59,6 +59,7 @@ from typing import Any, Dict, List, NamedTuple, Tuple
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.experimental import sparse as jsp
 from jax.flatten_util import ravel_pytree
 
 from .fem_utils import (
@@ -677,8 +678,20 @@ def _apply_dirichlet_symmetric(A, b, dirichlet_pairs: List[Tuple[int, float]]):
     if hasattr(A, "indices"):  # BCOO (native 2D/3D assembler) — keep it sparse, never densify
         e = jnp.zeros(A.shape[0], b.dtype).at[dofs].set(vals)  # the known-column lift
         b = b - A @ e  # carry the known columns to the load (a BCOO matvec, no dense column slice)
+        ii, jj = A.indices[:, 0], A.indices[:, 1]
+        diag0 = jnp.zeros(A.shape[0], jnp.abs(A.data).dtype).at[ii].add(jnp.where(ii == jj, jnp.abs(A.data), 0.0))
+        fallback = jnp.mean(jnp.abs(A.data))
+        s_all = jnp.ones(A.shape[0], diag0.dtype)
+        s_all = s_all.at[dofs].set(jnp.where(diag0[dofs] > 0.0, diag0[dofs], fallback))
         A = bcoo_set_unit_diag(bcoo_zero_rows_cols(A, dofs), dofs)
-        b = b.at[dofs].set(vals)
+        A = jsp.BCOO(
+            (
+                jnp.where(A.indices[:, 0] == A.indices[:, 1], A.data * s_all[A.indices[:, 0]].astype(A.data.dtype), A.data),
+                A.indices,
+            ),
+            shape=A.shape,
+        )
+        b = b.at[dofs].set(vals * s_all[dofs].astype(b.dtype))
         return A, b
     b = b - A[:, dofs] @ vals  # carry the known columns to the load
     A = A.at[dofs, :].set(0.0).at[:, dofs].set(0.0).at[dofs, dofs].set(1.0)

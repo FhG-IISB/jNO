@@ -42,9 +42,12 @@ __all__ = [
     "triangular",
     "saddle",
     "amg",
+    "hypre",
+    "ilu",
     "jaxamg",
     "cached",
     "ams",
+    "real_equivalent",
     "gmg",
     "nystrom",
 ]
@@ -111,6 +114,71 @@ class _Jacobi(_Spec):
 
     def __repr__(self):
         return "jno.precond.jacobi()"
+
+
+class _RealEquivalent(_Spec):
+    """Spec for preconditioning the fused real-equivalent block; see :func:`real_equivalent`."""
+
+    # Deliberately NOT complex_native: this spec WANTS the fused 2n form, because its whole purpose is
+    # to hand a REAL operator to a real inner solver. Declaring complex-native would route the solve to
+    # the complex n-sized operator and defeat it.
+    complex_ok = False
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def prepare(self, fem):
+        # Deliberately does NOT forward to the inner spec. `prepare` is where a spec may eagerly
+        # freeze itself against `fem`'s own operator -- and this spec exists precisely because that
+        # operator is the WRONG one for the inner: the inner is handed K + M, assembled below. AMS
+        # froze complex auxiliaries here and then used them against a real K + M, which still
+        # converged (a preconditioner need not be exact) while quietly preconditioning the wrong
+        # matrix and casting complex aux solutions down to the real right-hand side -- 960
+        # "discards the imaginary part" warnings on one solve. The inner materialises from K + M
+        # instead, which is the operator it will actually be applied to.
+        return None
+
+    def materialize(self, ctx: PrecondContext):
+        from .utils.solver.solver_api import LinearOperator, _slice_bcoo, materialize_precond
+
+        A = ctx.A
+        n2 = int(A.shape[0])
+        if A.bcoo is None:
+            raise ValueError(
+                "jno.precond.real_equivalent needs an ASSEMBLED (sparse) operator: it reads the K and M "
+                "blocks off the fused real-equivalent system. It cannot run on a matrix-free operator."
+            )
+        if n2 % 2:
+            raise ValueError(
+                f"jno.precond.real_equivalent expects the fused real-equivalent block, whose size is "
+                f"EVEN (2n for a complex n-sized system); got {n2}. Use it on a complex problem."
+            )
+        n = n2 // 2
+        top, bot = slice(0, n), slice(n, n2)
+        # The fused form is [[K, -M], [M, K]] over [x_r; x_i], so K is the (0,0) block and the (0,1)
+        # block is -M. K + M -- real, and definite whenever K is and M >= 0 -- is the inner operator
+        # the Axelsson/Kucherov and Benzi/Bertaccini families are built around, and the reason this is
+        # worth doing at all: a REAL inner solver applies unchanged, so a real-only GPU multigrid works
+        # on a complex problem.
+        K = _slice_bcoo(A.bcoo, top, top)
+        negM = _slice_bcoo(A.bcoo, top, bot)
+        if K is None or negM is None:
+            raise ValueError("jno.precond.real_equivalent: could not take the K / M blocks of the operator.")
+        KM = LinearOperator((K - negM).sum_duplicates())
+
+        inner = materialize_precond(self.inner, PrecondContext(KM, ctx.fem))
+        inner_T = getattr(inner, "T", inner)
+
+        def _apply(fn):
+            def go(v):
+                return jnp.concatenate([fn(v[:n]), fn(v[n:])])
+
+            return go
+
+        return PrecondApplier(_apply(inner), _apply(inner_T))
+
+    def __repr__(self):
+        return f"jno.precond.real_equivalent({self.inner!r})"
 
 
 class _GMG(_Spec):
@@ -219,6 +287,337 @@ class _Chebyshev(_Spec):
         return f"jno.precond.chebyshev(degree={self.degree})"
 
 
+class _Hypre(_Spec):
+    """Spec for a hypre preconditioner reached through PETSc; see :func:`hypre`."""
+
+    traceable = False  # PETSc assembles on the host from a concrete matrix
+    complex_ok = False  # hypre's AMS/BoomerAMG are real-only
+
+    def __init__(self, kind, options):
+        self.kind = str(kind)
+        self.options = dict(options)
+
+    def materialize(self, ctx: PrecondContext):
+        import numpy as np
+        import scipy.sparse as sp
+
+        from .utils.solver.amg import _to_scipy_csr
+
+        try:
+            import petsc4py
+
+            petsc4py.init([])
+            from petsc4py import PETSc
+        except Exception as e:  # noqa: BLE001
+            raise ImportError(
+                "jno.precond.hypre needs petsc4py built with hypre. `pip install petsc4py`, then "
+                f"check `PETSc.PC().setType('hypre')` succeeds. Import failed with: {e}"
+            ) from e
+
+        A = ctx.A
+        if A.bcoo is None:
+            raise ValueError(
+                "jno.precond.hypre needs an ASSEMBLED (sparse) operator — PETSc builds its "
+                "preconditioner from the matrix entries. It cannot run on a matrix-free operator."
+            )
+        csr = _to_scipy_csr(A.bcoo).tocsr()
+        if np.iscomplexobj(csr.data):
+            raise ValueError(
+                "jno.precond.hypre: hypre's AMS and BoomerAMG are REAL-only, but this operator is "
+                "complex. Wrap it: jno.precond.real_equivalent(jno.precond.hypre(...)), which hands "
+                "the inner the real K + M block."
+            )
+        n = csr.shape[0]
+        mat = PETSc.Mat().createAIJ(size=csr.shape, csr=(csr.indptr, csr.indices, csr.data))
+
+        pc = PETSc.PC().create()
+        pc.setOperators(mat)
+        pc.setType("hypre")
+        pc.setHYPREType(self.kind)
+        if self.kind == "ams":
+            # AMS needs the H(curl) structure: the discrete gradient and the node coordinates. jNO
+            # already builds the gradient for its own AMS, from the same topology.
+            fem = ctx.fem
+            if fem is None:
+                raise TypeError(
+                    "jno.precond.hypre(kind='ams') needs the owning FEM to read the N1E edge "
+                    "topology — use it via fem.solve(precond=...), not on a bare operator."
+                )
+            from .utils.solver.ams import discrete_gradient
+
+            G = discrete_gradient(fem.domain._fem_nonnodal_topology)
+            gi, gd = np.asarray(G.indices), np.asarray(G.data)
+            Gs = sp.csr_matrix((gd, (gi[:, 0], gi[:, 1])), shape=tuple(int(x) for x in G.shape))
+            if Gs.shape[0] != n:
+                raise ValueError(
+                    f"jno.precond.hypre(kind='ams'): the operator is {n} x {n} but the edge "
+                    f"(H(curl)) space has {Gs.shape[0]} DOFs, so this is a MIXED system and AMS "
+                    "cannot tell which block is its own. Put it in a block preconditioner that names "
+                    "the field: jno.precond.triangular((u, jno.precond.hypre(kind='ams')), (p, ...))."
+                )
+            pc.setHYPREDiscreteGradient(PETSc.Mat().createAIJ(size=Gs.shape, csr=(Gs.indptr, Gs.indices, Gs.data)))
+            pts = np.ascontiguousarray(np.asarray(fem.domain.mesh.points)[:, :3], dtype=np.float64)
+            pc.setCoordinates(pts)
+        opts = PETSc.Options()
+        for k, v in self.options.items():
+            opts.setValue(f"pc_hypre_{self.kind}_{k}", v)
+        pc.setFromOptions()
+        pc.setUp()
+
+        xv, bv = mat.createVecRight(), mat.createVecLeft()
+
+        def _host(r):
+            bv.setArray(np.asarray(r, dtype=np.float64))
+            pc.apply(bv, xv)
+            return np.asarray(xv.getArray()).copy()
+
+        import jax as _jax
+
+        def apply(r):
+            return _jax.pure_callback(_host, _jax.ShapeDtypeStruct((n,), jnp.float64), r, vmap_method="sequential")
+
+        # Symmetric preconditioner -> the transpose applier is itself. A preconditioner never has to
+        # be differentiable: `lax.custom_linear_solve` puts d/dtheta on the OPERATOR, so nothing here
+        # is traced through. That is the same contract the SuperLU / PARDISO / pyamg paths ride on.
+        return PrecondApplier(apply, apply)
+
+
+def hypre(kind: str = "ams", **options) -> _Hypre:
+    """**hypre** preconditioners (AMS, BoomerAMG) via PETSc — a reference-grade H(curl) solver.
+
+    One duck-typed entry for the whole library rather than a wrapper per preconditioner: ``kind`` is
+    passed straight to ``PCHYPRE`` and keyword options become ``-pc_hypre_<kind>_<key>``::
+
+        fem.solve(linear=jno.solve.fgmres(),
+                  precond=jno.precond.real_equivalent(
+                      jno.precond.triangular((u, jno.precond.hypre(kind="ams")),
+                                             (p, jno.precond.amg()))))
+
+    ``kind="ams"`` is the auxiliary-space Maxwell solver (Hiptmair & Xu 2007; Kolev & Vassilevski
+    2009) — the same method as :func:`ams`, but hypre's production implementation, which additionally
+    carries the machinery for a **semidefinite** problem where ``sigma = 0`` over part of the domain
+    (interior-node marking, a restricted gradient, gradient projection). jNO's own :func:`ams` has
+    none of that. Measured on an A–V eddy problem where it matters, hypre reached 8.6e-03 with
+    interior nodes marked against no progress at all without them.
+
+    **It is not automatically faster.** On the same 89,920-DOF H(curl) block of a production-scale
+    A–V system, hypre reached 4.33e-09 and jNO's own ``ams()`` reached 8.03e-09 — equivalent. Reach
+    for this as a **reference implementation** to check jNO against, or for the ``sigma = 0`` features,
+    not on the assumption that a production library must win.
+
+    Requires ``petsc4py`` built with hypre, and runs on the **host** through ``pure_callback``.
+    That costs a device round-trip per apply and is not traceable, but it does **not** affect
+    differentiability: a preconditioner cannot change the solution, so
+    :func:`jax.lax.custom_linear_solve` differentiates through the *operator* and never through the
+    preconditioner — the same contract the SuperLU, PARDISO and pyamg paths already use.
+    """
+    return _Hypre(kind, options)
+
+
+class _ILU(_Spec):
+    """Spec for an incomplete-LU preconditioner; see :func:`ilu`."""
+
+    traceable = False  # scipy factorises on the host from a concrete matrix
+    complex_ok = True  # SuperLU's ILU is complex-capable
+    # ...and it must see the COMPLEX operator, not the fused real 2n block. In [[K,-M],[M,K]] the
+    # diagonal is K's, and for the standard (symmetrised) A-V system K's scalar-potential rows are
+    # exactly ZERO -- measured 21,640 zero diagonal entries out of 206,770 -- which an incomplete
+    # factorisation cannot pivot around. The complex operator's diagonal is K + iM and is nonzero.
+    complex_native = True
+
+    def __init__(self, options):
+        self.options = dict(options)
+
+    def materialize(self, ctx: PrecondContext):
+        import jax as _jax
+        import numpy as np
+        import scipy.sparse as sp
+        import scipy.sparse.linalg as spla
+
+        from .utils.solver.amg import _to_scipy_csr
+
+        A = ctx.A
+        if A.bcoo is None:
+            raise ValueError(
+                "jno.precond.ilu needs an ASSEMBLED (sparse) operator — an incomplete factorisation "
+                "is built from the matrix entries. It cannot run on a matrix-free operator."
+            )
+        csr = _to_scipy_csr(A.bcoo).tocsc()
+        n = csr.shape[0]
+        opts = {"drop_tol": 1e-4, "fill_factor": 10.0}
+        opts.update(self.options)
+        equil = bool(opts.pop("equilibrate", True))
+        shifts = tuple(opts.pop("shifts", (0.0, 1e-4, 1e-3, 1e-2, 1e-1, 0.5)))
+        # KEEP scipy's fill-reducing ordering. Forcing `permc_spec="NATURAL"` to preserve the
+        # operator's complex symmetry is theoretically tidy and a disaster in practice: measured on
+        # an A-V system from n=2,049 to n=12,216, NATURAL makes the factorisation scale as n^3.09
+        # against COLAMD's n^1.72 -- extrapolated to 103k DOFs, 5,451 s versus 7 s.
+        # COLAMD needs more Krylov iterations (642 vs 228 at n=12,216) and still wins on TOTAL time
+        # at every size measured (0.98 s vs 7.70 s). Pass permc_spec="NATURAL" explicitly if a
+        # structure-preserving factorisation is worth that to you.
+        opts.setdefault("diag_pivot_thresh", 0.0)  # no partial pivoting; ordering is still applied
+        dtype = np.complex128 if np.iscomplexobj(csr.data) else np.float64
+
+        # SYMMETRIC EQUILIBRATION FIRST, and it is not optional in practice. `drop_tol` is RELATIVE,
+        # so on an operator whose rows span many orders the small rows are dropped to nothing and the
+        # factorisation reports "Factor is exactly singular". Measured on a gauged A-V eddy-current
+        # matrix: diagonal from 1.0 to 5.3e11 -- pinned rows sit at 1 while conductor rows run at
+        # 1e11 -- and spilu fails outright. Scaling to a unit diagonal costs one pass and fixes it.
+        # D^-1 A D^-1 with D = sqrt(|diag|) keeps a complex-SYMMETRIC matrix symmetric.
+        if equil:
+            d = np.abs(csr.diagonal())
+            d[d <= 0] = 1.0
+            dinv = 1.0 / np.sqrt(d)
+            D = sp.diags(dinv)
+            fac = (D @ csr @ D).tocsc()
+        else:
+            dinv, fac = None, csr
+        # DIAGONAL SHIFT WITH RETRY (Manteuffel). The eddy-current operator is only positive
+        # SEMI-definite: sigma vanishes in the air, and an ungauged curl-curl carries its whole
+        # gradient null space. An incomplete factorisation hits a zero pivot there, where CG on a
+        # consistent singular system does not care -- which is how the ICCG literature factors this
+        # same matrix. Factoring `A + alpha*diag(A)` steps around it, and alpha is raised only until
+        # the factorisation succeeds, so a well-posed operator pays nothing.
+        _d0 = fac.diagonal()
+        lu = _used = None
+        _err = None
+        for _alpha in shifts:
+            _cand = fac if _alpha == 0.0 else (fac + sp.diags(_alpha * _d0)).tocsc()
+            try:
+                lu, _used = spla.spilu(_cand, **opts), _alpha
+                break
+            except RuntimeError as _e:  # noqa: PERF203
+                _err = _e
+        if _used:
+            from .utils.logger import get_logger
+
+            get_logger().info(f"jno.precond.ilu: factorised with diagonal shift alpha={_used:g}")
+        if lu is None:
+            e = _err
+            # scipy says only "Factor is exactly singular". Say WHICH rows, because on an eddy-current
+            # operator the answer is nearly always structural: an UNGAUGED curl-curl carries the whole
+            # gradient null space, and V has no equation at all where sigma = 0. An incomplete
+            # factorisation cannot pivot around either, where a Krylov method with AMS can.
+            rows = np.diff(csr.tocsr().indptr)
+            empty = int((rows == 0).sum())
+            dg = np.abs(csr.diagonal())
+            zero_diag = int((dg == 0).sum())
+            raise RuntimeError(
+                f"jno.precond.ilu: the incomplete factorisation is singular ({e}). This operator has "
+                f"{empty:,} structurally empty rows and {zero_diag:,} zero diagonal entries out of "
+                f"{n:,}. An incomplete factorisation needs a non-singular matrix: it cannot pivot "
+                "around the gradient null space of an UNGAUGED curl-curl, nor around nodes where "
+                "sigma = 0 leaves V with no equation. Either gauge the system (a tree-cotree gauge "
+                "through domain._extra_dof_pins) and pin V off the conductors, or use a "
+                "preconditioner that tolerates the null space -- jno.precond.ams() is built for "
+                f"exactly that. Shifts tried: {[f'{a:g}' for a in shifts]}."
+            ) from e
+
+        def _host(r):
+            v = np.asarray(r, dtype=dtype)
+            if dinv is None:
+                return np.asarray(lu.solve(v), dtype=dtype)
+            return np.asarray(dinv * lu.solve(dinv * v), dtype=dtype)
+
+        def _host_T(r):
+            v = np.asarray(r, dtype=dtype)
+            if dinv is None:
+                return np.asarray(lu.solve(v, trans="T"), dtype=dtype)
+            return np.asarray(dinv * lu.solve(dinv * v, trans="T"), dtype=dtype)
+
+        def _wrap(fn):
+            def go(r):
+                return _jax.pure_callback(fn, _jax.ShapeDtypeStruct((n,), dtype), r, vmap_method="sequential")
+
+            return go
+
+        # A preconditioner is never differentiated through (`lax.custom_linear_solve` puts d/dtheta
+        # on the operator), so a host factorisation is free of consequences for AD.
+        return PrecondApplier(_wrap(_host), _wrap(_host_T))
+
+    def __repr__(self):
+        return f"jno.precond.ilu({self.options})"
+
+
+def ilu(**options) -> _ILU:
+    """**Incomplete LU** (SuperLU ``spilu``) — the classical preconditioner for the A–V eddy-current
+    system, and complex-capable, so it applies to the complex operator directly.
+
+    Keyword options pass through to :func:`scipy.sparse.linalg.spilu` (``drop_tol``, ``fill_factor``,
+    ``permc_spec``, …); the defaults here are ``drop_tol=1e-4, fill_factor=10``. ``equilibrate=False``
+    disables the symmetric diagonal scaling applied first — leave it on unless you know the operator
+    is already well scaled, because ``drop_tol`` is *relative* and a matrix whose rows span orders of
+    magnitude (a gauged A–V system runs from 1.0 on pinned rows to 1e11 on conductor rows) otherwise
+    fails outright with "Factor is exactly singular".
+
+    **Why this, on a mixed A–V system.** Igarashi & Honma (*IEEE Trans. Magn.* 38(2), 2002, 565–568)
+    solve exactly this system — edge elements for ``A``, nodal for ``V`` — with incomplete-Cholesky CG
+    and report **16–17 iterations, independent of frequency** (100 Hz down to static) and **29–31
+    independent of mesh size**. Their §IV gives the mechanism: the "floating singular values"
+    (proportional to ``omega*sigma*mu``) that wreck the condition number *disappear* after incomplete
+    factorisation in the A–V method, while they survive in the A-only method. That is the documented
+    reason A–V converges better than A, and it is a property of the *incomplete factorisation*, not of
+    multigrid::
+
+        fem.solve(linear=jno.solve.fgmres(tol=1e-9, maxiter=400), precond=jno.precond.ilu())
+
+    Do not gauge it. The same paper: "the tree–cotree gauging has not been applied because it is known
+    that the gauging makes the matrix condition worse."
+
+    Runs on the **host** and is not traceable; that costs a callback per apply but has no effect on
+    differentiability — see :func:`hypre` for the same contract. Memory is the real limit: ``spilu``
+    fill grows with ``fill_factor``, so on a large 3-D curl-curl expect to trade ``drop_tol`` against
+    RAM before it beats an auxiliary-space method.
+    """
+    return _ILU(options)
+
+
+def real_equivalent(inner) -> _RealEquivalent:
+    """Precondition a COMPLEX system through its fused real-equivalent block, with a **real** inner
+    solver — so a real-only preconditioner (an AmgX-style GPU multigrid, say) works on it.
+
+    A complex symmetric ``A = K + iM`` becomes ``[[K, -M], [M, K]]`` over ``[x_r; x_i]``. That block is
+    skew-dominated (measured ``||A - A^T|| / ||A|| = 2.0`` when the mass term dominates), which is why
+    multigrid applied to it *directly* diverges. The classical fix is not to precondition the block
+    itself but to use ``K + M``: real, symmetric, and definite whenever ``K`` is and ``M >= 0``. Here
+    that is applied to each of the two diagonal halves, and ``inner`` is any ordinary real spec::
+
+        fem.solve(linear=jno.solve.fgmres(),
+                  precond=jno.precond.real_equivalent(jno.precond.amg()))
+
+    Measured on a complex A-V (N1E x Lagrange) system, GMRES to 1e-8 with an AMG inner solve:
+    **18 iterations** where the imaginary part is definite.
+
+    **It is only as good as the gauge.** On an eddy-current problem ``M = w sigma`` VANISHES outside
+    the conductors, which is exactly the assumption (definite imaginary part) most of this literature
+    makes. Measured on such a system, regularised by a displacement-current mass term of size ``eps``:
+
+        eps = 1e-6 -> 40000 its | 1e-3 -> 2946 | 1e-2 -> 248 | 1e-1 -> 54 | 1 -> 16
+
+    i.e. the iteration count tracks the gauge, not the vanishing ``M`` — with a well-conditioned gauge
+    it matches the definite case. An ``eps`` mass term buys that conditioning by changing the physics;
+    a tree-cotree gauge (``domain._extra_dof_pins``) buys it for free, and is the right pairing.
+
+    ``inner`` sees ``K + M`` and never sees a complex number, so anything real composes -- but it must
+    MATCH THAT OPERATOR'S CHARACTER, which is the practical trap. Where ``M`` vanishes, ``K + M`` is a
+    bare curl-curl operator, and smoothed aggregation is the wrong tool for H(curl); that is what AMS
+    is for. Measured on a cube: with a mass term everywhere (eps-gauge 1) ``real_equivalent(amg())``
+    converges in ~20 iterations, and at eps 1e-4 -- so ``K + M`` is curl-curl in the non-conducting
+    region -- the same call fails. Conductor thickness and volume fraction are NOT the variable: 20
+    iterations from 60 % of the volume down to 0.86 %, and 4 elements thick down to 1.
+
+    So on an eddy problem with a non-conducting region, pair this with an H(curl) inner (``ams()``),
+    not ``amg()``. ``K + M`` being real is what keeps a GPU route open -- it wants a real AMS.
+
+    References: Day & Heroux, *Solving complex-valued linear systems via equivalent real formulations*,
+    SIAM J. Sci. Comput. 23(2):480-498, 2001 (which equivalent real form to pick); Axelsson & Kucherov,
+    *Real valued iterative methods for solving complex symmetric linear systems*, Numer. Linear Algebra
+    Appl. 7:197-218, 2000; Benzi & Bertaccini, *Block preconditioning of real-valued iterative
+    algorithms for complex linear systems*, IMA J. Numer. Anal. 28:598-618, 2008.
+    """
+    return _RealEquivalent(inner)
+
+
 def jacobi() -> _Jacobi:
     """Diagonal (Jacobi) preconditioner ``M^{-1} v = v / diag(A)``.
 
@@ -312,10 +711,54 @@ class _Form(_Spec):
         if self._op is None:
             self._op = ctx.assemble(self.terms, quad_degree=self.quad_degree)
         op = self._op
-        if self.inner is None:
-            from . import solve as _s
 
-            self.inner = _s.lu()
+        if self.inner is None:
+            # FACTOR ONCE, apply forever -- the same contract as AMS's default auxiliaries. The old
+            # default handed every application to `jno.solve.lu()`, which re-factorises per call:
+            # invisible on a small Schur block, hours on a 90k-edge auxiliary (a preconditioner is
+            # applied hundreds of times per solve). Host SuperLU behind a callback; a preconditioner
+            # is never differentiated through, so AD is unaffected.
+            import jax as _jax
+            import numpy as _np
+            import scipy.sparse.linalg as _spla
+
+            from .utils.solver.amg import _to_scipy_csr
+
+            if getattr(op, "bcoo", None) is None:
+                raise ValueError(
+                    "jno.precond.form: the assembled auxiliary operator is matrix-free, so it cannot "
+                    "be factored once. Pass an explicit iterative inner: form([...], inner=jno.solve.cg(...))."
+                )
+            _csr = _to_scipy_csr(op.bcoo).tocsc()
+            _lu = _spla.splu(_csr)
+            _dt = _np.complex128 if _np.iscomplexobj(_csr.data) else _np.float64
+            _n = _csr.shape[0]
+
+            def _fwd_h(r):
+                return _np.asarray(_lu.solve(_np.asarray(r, dtype=_dt)), dtype=_dt)
+
+            def _t_h(r):
+                return _np.asarray(_lu.solve(_np.asarray(r, dtype=_dt), trans="T"), dtype=_dt)
+
+            def _wrap(fn):
+                def go(r):
+                    return _jax.pure_callback(fn, _jax.ShapeDtypeStruct((_n,), _dt), r, vmap_method="sequential")
+
+                return go
+
+            return PrecondApplier(_wrap(_fwd_h), _wrap(_t_h))
+
+        if isinstance(self.inner, _Spec):
+            # A PRECOND SPEC as the inner: materialize it once against the assembled auxiliary and
+            # apply it (once) per call -- `form([...C_A terms...], inner=jno.precond.ams())` is an
+            # AMS application to an operator DECLARED as a weak form rather than taken from the
+            # system. `ctx.fem` is carried through so an inner AMS can read the edge topology.
+            from .utils.solver.solver_api import materialize_precond
+
+            ap = materialize_precond(self.inner, PrecondContext(op, ctx.fem))
+            # some specs materialize to a bare callable (no .T); a symmetric applier is its own T
+            return PrecondApplier(ap, ap.T if hasattr(ap, "T") else ap)
+
         solver = self.inner
         # M^{-T} v ~ (Â^{-1})^T v = (Â^T)^{-1} v: run the same inner solver on the transposed
         # auxiliary operator (for a symmetric Â -- e.g. a mass matrix -- op.T behaves like op).
@@ -333,6 +776,14 @@ def form(terms, *, inner=None, quad_degree: int = 2) -> _Form:
 
     This is how the classical physics-based preconditioners are written declaratively — in the
     *same language as the PDE*:
+
+    ``inner`` decides how ``Â^{-1}`` is applied. **Default (None): factored once** (host SuperLU)
+    and reused across every application — the AMS-auxiliary contract, and the only affordable
+    default (a per-application ``lu()`` re-factorises a 90k-DOF auxiliary hundreds of times per
+    solve). A ``jno.solve`` **solver** solves ``Â x = v`` per application (an inexact inner Krylov —
+    pair with a flexible outer). A ``jno.precond`` **spec** — ``form([...], inner=jno.precond.ams())``
+    — is materialized once against ``Â`` and applied once per call: a multigrid or auxiliary-space
+    method acting on an operator *declared as a weak form* rather than taken from the system.
 
     * a (weighted) **mass matrix** — e.g. the pressure Schur-complement approximation of a
       Stokes-type saddle system: ``jno.precond.form([w * pi * qi], inner=jno.solve.cg(...))``;
@@ -355,40 +806,77 @@ def form(terms, *, inner=None, quad_degree: int = 2) -> _Form:
 class _InnerSolve(_Spec):
     """Spec using a configured linear solver as the ``M^{-1}`` application; see :func:`inner`."""
 
-    def __init__(self, solver):
+    def __init__(self, solver, precond=None):
         self.solver = solver
+        self.precond = precond
 
     def materialize(self, ctx: PrecondContext):
+        from .utils.solver.solver_api import materialize_precond
+
         solver, op = self.solver, ctx.A
+        # The inner solve gets its OWN preconditioner, materialized against the SUB-operator this
+        # spec was handed -- not against the outer system. `ctx.fem` is carried through, because an
+        # inner AMS reads the edge topology off it and cannot be built from the matrix alone.
+        M = Mt = None
+        if self.precond is not None:
+            ap = materialize_precond(self.precond, PrecondContext(op, ctx.fem))
+            M, Mt = ap, ap.T  # PrecondApplier is callable; .T is its transpose applier
         # transpose applier solves the transposed (sub-)operator, so a non-symmetric block gets a
         # correctly-preconditioned adjoint solve (else reverse-mode stalls -- see PrecondApplier).
-        return PrecondApplier(lambda v: _as_precond(solver, op, v), lambda v: _as_precond(solver, op.T, v))
+        return PrecondApplier(lambda v: _as_precond(solver, op, v, M), lambda v: _as_precond(solver, op.T, v, Mt))
 
     def __repr__(self):
-        return f"jno.precond.inner({self.solver})"
+        p = f", precond={self.precond}" if self.precond is not None else ""
+        return f"jno.precond.inner({self.solver}{p})"
 
 
-def _as_precond(solver, op, v):
+def _as_precond(solver, op, v, M=None):
     """Apply a ``jno.solve`` solver as ``M^{-1} v``, with the convergence gate suspended.
 
     A preconditioner is inexact BY DESIGN -- ``inner(jno.solve.cg(tol=1e-2, maxiter=30))`` asks for
     two digits deliberately, which is exactly why the outer Krylov must be flexible. Holding such a
     call to the solver gate's 1e-4 would turn a correct configuration into an error; the contract
     belongs to the outer solve, which IS gated.
+
+    ``M`` is the inner solve's OWN preconditioner (``inner(..., precond=...)``), already materialized
+    against this sub-operator; ``None`` runs the inner Krylov unpreconditioned.
     """
     from .utils.solver.solver_api import gate_suspended
 
     with gate_suspended():
-        return solver(op, v)
+        return solver(op, v, M=M)
 
 
-def inner(solver) -> _InnerSolve:
+def inner(solver, *, precond=None) -> _InnerSolve:
     """Use a ``jno.solve`` linear solver as the preconditioner application ``M^{-1} v ≈ A^{-1} v``
     on whatever operator it is materialized against — the natural way to give a diagonal block of
     :func:`block_diag`/:func:`triangular` an (inexact) block solve, e.g.
     ``jno.precond.inner(jno.solve.cg(tol=1e-2, maxiter=50))``. With an iterative solver here the
-    outer Krylov must be flexible: ``jno.solve.fgmres()``."""
-    return _InnerSolve(solver)
+    outer Krylov must be flexible: ``jno.solve.fgmres()``.
+
+    ``precond`` preconditions that **inner** solve, materialized against the sub-operator this spec
+    is handed. Without it the inner Krylov runs unpreconditioned, which for anything harder than a
+    well-scaled mass matrix is no bargain — and the inner's accuracy is not a detail. Measured on a
+    complex A–V eddy system preconditioned through :func:`real_equivalent`, varying **only** how
+    accurately ``K + M`` is applied::
+
+        exact inner (sparse LU)        40 outer iterations
+        ONE algebraic-multigrid cycle  2200
+        multigrid solved to tol 1e-4   48
+
+    i.e. a *loosely solved* inner is worth **55x** over a single cycle, and recovers essentially
+    exact behaviour. So the useful shape is an inner solve that is cheap because its tolerance is
+    loose, not because it is a single sweep::
+
+        jno.precond.real_equivalent(
+            jno.precond.inner(jno.solve.fgmres(tol=1e-4, maxiter=50),
+                              precond=jno.precond.triangular((u, jno.precond.ams()),
+                                                             (p, jno.precond.amg()))))
+
+    Do not over-tighten it either: ``triangular``'s own note records ``tol=1e-2`` measuring 11x
+    slower end-to-end than ``1e-4`` on Taylor–Hood Stokes, the outer paying more extra iterations
+    than the cheaper block solve saves."""
+    return _InnerSolve(solver, precond)
 
 
 def _pairs_to_appliers(pairs, ctx: PrecondContext):
@@ -435,6 +923,25 @@ class _BlockDiag(_Spec):
     def __init__(self, pairs):
         self.pairs = pairs
 
+    @property
+    def complex_native(self):
+        """A block composition is complex-native iff any child is (i.e. contains AMS).
+
+        Without this, ``triangular((u, ams()), (p, amg()))`` on a complex A-V system silently fell
+        through to the fused real-equivalent 2n block, where two things break at once:
+        ``fem.blocks`` describes the n-sized COMPLEX layout, so every slice covered the wrong half
+        of the operator — and AMS was applied to the skew-dominated 2n block its own docs say it
+        diverges on (measured symptom: fgmres returned x ~ 0, relative residual exactly 1.0).
+        Declaring it routes the composition through ``_solve_complex_block``: the outer Krylov runs
+        on the sparse COMPLEX operator ``A_r + i·A_i``, whose n-layout the block slices are correct
+        for; ``ctx.sub(i)`` hands each child its assembled complex diagonal sub-block (AMS is
+        complex-native by design; pyamg builds complex hierarchies natively, see ``_AMG.complex_ok``).
+        Note ``_AMS.prepare``'s auto-freeze intentionally no-ops here — ``_fem_concrete_operator``
+        returns the full MIXED operator, whose size does not match G, so the eager build raises and
+        is swallowed; AMS then assembles from the correctly-sized sub-block at materialize time.
+        """
+        return any(getattr(spec, "complex_native", False) for _f, spec in self.pairs)
+
     def prepare(self, fem):
         _prepare_pairs(self.pairs, fem)
 
@@ -462,6 +969,13 @@ class _BlockDiag(_Spec):
 class _Triangular(_Spec):
     def __init__(self, pairs):
         self.pairs = pairs
+
+    @property
+    def complex_native(self):
+        """See ``_BlockDiag.complex_native`` — identical reasoning; the triangular sweep additionally
+        applies the off-diagonal couplings ``ctx.sub(i, j)``, which on this path are matvecs through
+        the complex operator and therefore also correctly sized."""
+        return any(getattr(spec, "complex_native", False) for _f, spec in self.pairs)
 
     def prepare(self, fem):
         _prepare_pairs(self.pairs, fem)
@@ -980,18 +1494,45 @@ class _AMS(_Spec):
             except Exception:  # noqa: BLE001 — a tracer / a parameter-incomplete operator: fall through,
                 pass  # and materialize either assembles from the concrete ctx or asks for an explicit .build
 
-    def build(self, fem) -> "_AMS":
+    def build(self, fem, *, field=None) -> "_AMS":
         """Eager host setup from a **concrete** ``fem`` — required to use AMS inside a **traced** solve
         (``jit`` / ``vmap`` / a **parametric-inverse** design loop), where the host scipy assembly of the
         nodal auxiliaries cannot run under the trace. It freezes the auxiliary operators once (from the
         operator at the current parameters); the frozen preconditioner stays valid while ``A(θ)`` drifts
         (speed degrades gracefully, correctness never), so the solve — **and its gradient**, which flows
         through the traced operator by implicit differentiation, not through the preconditioner — runs
-        differentiably. Returns ``self`` (chainable): ``fem.solve(precond=jno.precond.ams().build(fem))``."""
+        differentiably. Returns ``self`` (chainable): ``fem.solve(precond=jno.precond.ams().build(fem))``.
+
+        On a **mixed** system (an N1E x Lagrange A-V pair, say) the concrete operator covers every
+        field, so ``field=`` names the H(curl) trial symbol whose block AMS preconditions:
+        ``ams().build(fem, field=u)``. Without it the operator and the discrete gradient disagree and
+        this raises rather than failing inside the assembly."""
         self._transfer(fem.domain)
         from .utils.solver.solver_api import LinearOperator, PrecondContext
 
-        self._frozen = self._assemble_aux(PrecondContext(LinearOperator(_fem_concrete_operator(fem)), fem))
+        ctx = PrecondContext(LinearOperator(_fem_concrete_operator(fem)), fem)
+        # On a MIXED system the concrete operator is the whole thing -- (n_edges + n_verts) for an
+        # N1E x Lagrange pair -- while AMS's discrete gradient G is (n_edges, n_verts). Assembling the
+        # auxiliaries against it produced a bare `matmul: dimension mismatch` from inside the assembly,
+        # naming nothing the caller could act on, and that raise is exactly why `prepare`'s auto-freeze
+        # is a no-op inside a block composition. AMS cannot know which block is its own, so it is told.
+        n_edges = self._G.shape[0]
+        if int(ctx.A.shape[0]) != n_edges:
+            if field is None:
+                raise ValueError(
+                    f"jno.precond.ams().build: this operator is {int(ctx.A.shape[0])} x "
+                    f"{int(ctx.A.shape[0])} but the edge (H(curl)) space has {n_edges} DOFs, so it is a "
+                    "MIXED system and AMS cannot tell which block is its own. Name it: "
+                    "ams().build(fem, field=<the N1E trial symbol>)."
+                )
+            ctx = PrecondContext(ctx.sub(field), fem)
+            if int(ctx.A.shape[0]) != n_edges:
+                raise ValueError(
+                    f"jno.precond.ams().build: the block for the given field is {int(ctx.A.shape[0])} "
+                    f"DOFs but the edge space has {n_edges}. `field=` must name the H(curl) (N1E) "
+                    "trial symbol, not another field of the system."
+                )
+        self._frozen = self._assemble_aux(ctx)
         return self
 
     def _transfer(self, domain):
@@ -1018,6 +1559,22 @@ class _AMS(_Spec):
                     "use it via fem.solve(precond=jno.precond.ams()), not on a bare operator."
                 )
             self._transfer(ctx.fem.domain)
+
+        # `build()` guards this too, but an UNBUILT ams() never goes through it -- which is exactly what
+        # `real_equivalent(ams())` does. Checked HERE, before anything multiplies G against the operator:
+        # otherwise the mismatch surfaces far downstream as a bare `matmul: dimension mismatch with
+        # signature (n,k=89920),(k=103385,m)`, leaving the caller to work out that 103385 - 89920 is the
+        # Lagrange block and that AMS was never told which block is its own.
+        _ne = int(self._G.shape[0])
+        if int(ctx.A.shape[0]) != _ne:
+            raise ValueError(
+                f"jno.precond.ams: this operator is {int(ctx.A.shape[0])} x {int(ctx.A.shape[0])} but "
+                f"the edge (H(curl)) space has {_ne} DOFs, so it is a MIXED system and AMS cannot tell "
+                "which block is its own. Put it in a block preconditioner that names the field -- "
+                "jno.precond.triangular((u, jno.precond.ams()), (p, jno.precond.jacobi())) -- or build it "
+                "against the block directly with ams().build(fem, field=<the N1E trial symbol>). Both "
+                "compose inside jno.precond.real_equivalent(...)."
+            )
 
         A = ctx.A.bcoo if ctx.A.bcoo is not None else ctx.A.dense()
 
@@ -1168,7 +1725,13 @@ class _AMS(_Spec):
             # 1e-6, so the tolerance was never the limiter -- while AMG on the (complex, unreformulated)
             # blocks converges in 5-7 iterations. pyamg's own solve is used rather than the JAX V-cycle
             # in ``utils.solver.amg`` because that one smooths with Chebyshev, which needs real spectral
-            # bounds and has no meaning on a complex-symmetric spectrum. Applied through
+            # bounds and has no meaning on a complex-symmetric spectrum. MEASURED, on an A-V block with
+            # sigma = 0 outside the conductor: the auxiliaries span the whole first quadrant --
+            # arg(lambda) 0.1 to 89.7 degrees for G^T A G and 0.2 to 89.8 for each Pi^T A Pi -- so there
+            # is no real interval to fit. (With sigma UNIFORM and w*sigma >> nu they collapse onto a ray,
+            # ~1 degree of spread, which is why a uniform-sigma test says nothing about this.) Making the
+            # V-cycle usable here needs an ellipse-based complex polynomial instead: Manteuffel, *The
+            # Tchebychev iteration for nonsymmetric linear systems*, Numer. Math. 28 (1977). Applied through
             # ``pure_callback`` for the same reason the default SuperLU aux is: forward-only, and the
             # preconditioner is never differentiated.
             import jax
@@ -1176,6 +1739,29 @@ class _AMS(_Spec):
 
             def make(op, csr):
                 import pyamg
+
+                # A REAL auxiliary has a real spectrum, so the Chebyshev objection above does not
+                # apply and the JAX V-cycle can carry it -- which keeps the whole AMS apply on device:
+                # G and the Pi blocks are already BCOO, the hierarchy levels are BCOO, and nothing in
+                # the Krylov loop has to reach the host. Only the one-off setup (aggregation, the
+                # triple products) stays there, which is per-operator rather than per-iteration.
+                #
+                # An INEXACT auxiliary is enough, measured on a real curl-curl + mass problem: an
+                # exact SuperLU auxiliary takes 27 CG iterations, two V-cycles take 27, and a SINGLE
+                # V-cycle takes 27. (Inexact KRYLOV auxiliaries are the ones that stall -- cg at
+                # 7.6e-4 and bicgstab at 5.8e-4 -- so this is not the same question.)
+                if not np.iscomplexobj(csr.data):
+                    from .utils.solver.amg import build_hierarchy, vcycle_apply
+
+                    levels = build_hierarchy(csr.tocsr(), max_levels=aux.max_levels)
+
+                    def solve_real(rhs):
+                        x = vcycle_apply(levels, jnp.asarray(rhs))
+                        for _ in range(max(int(aux.cycles) - 1, 0)):  # extra cycles: correct the residual
+                            x = x + vcycle_apply(levels, jnp.asarray(rhs) - op @ x)
+                        return x
+
+                    return solve_real
 
                 ml = pyamg.smoothed_aggregation_solver(csr.tocsr(), max_levels=aux.max_levels)
                 n = int(csr.shape[0])
@@ -1409,6 +1995,25 @@ class _Cached(_Spec):
         self._applier = None
         self._key = _MISS
         self._count = 0  # materializations since construction, for the int-k policy
+
+    # `_Cached` wraps another spec's SETUP, not its nature. These two say what the inner spec IS --
+    # `complex_native` selects whether the solve runs on the genuinely complex n-sized operator or on
+    # the fused real-equivalent 2n block, and `complex_ok` whether a spec can be applied to a complex
+    # operator without reformulation -- so hiding them changes the ANSWER, not the speed. Left
+    # undeclared, `ams().cached()` reported False and quietly took the 2n path, where the block slices
+    # cover the wrong half of the operator and AMS is handed the skew-dominated block its own docs
+    # record diverging to 1e+20 on. That made `.cached()` and complex-native mutually exclusive, which
+    # is backwards: a complex block preconditioner is the one whose setup most wants reusing.
+    #
+    # Forwarded explicitly rather than through `__getattr__`, so only these descriptive flags pass and
+    # the wrapper keeps its own behaviour (`traceable`, `key`, `prepare`, `materialize`).
+    @property
+    def complex_native(self):
+        return bool(getattr(self.spec, "complex_native", False))
+
+    @property
+    def complex_ok(self):
+        return bool(getattr(self.spec, "complex_ok", False))
 
     @property
     def traceable(self):

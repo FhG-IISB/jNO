@@ -26,6 +26,7 @@ matrix-free defaults (BiCGStab / Newton–Krylov / backward-Euler) you can overr
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import inspect
 import warnings
@@ -725,6 +726,28 @@ def _region_and_support(constraint: Any, domain: Any) -> Tuple[str, str]:
     tag_preds = getattr(domain, "_tag_predicates", {}) or {}
     shape_regions = getattr(domain, "_shape_regions", {}) or {}
 
+    _VOL_CELLS = {"tetra", "tetra10", "hexahedron", "wedge", "pyramid", "triangle", "triangle6", "quad"}
+
+    def _volume_cell_regions():
+        """Names in the mesh's ``cell_sets`` that select TOP-DIMENSIONAL cells (a gmsh physical
+        volume in 3-D / surface in 2-D), i.e. the ones a *volume* term could plausibly mean."""
+        _m = getattr(domain, "mesh", None)
+        _cs = getattr(_m, "cell_sets", None) or {}
+        if not _cs:
+            return set()
+        _dim = int(getattr(domain, "dimension", 3))
+        _want = {"tetra", "tetra10", "hexahedron", "wedge", "pyramid"} if _dim == 3 else {"triangle", "triangle6", "quad"}
+        _blocks = list(getattr(_m, "cells", None) or [])
+        _out = set()
+        for _nm, _entries in _cs.items():
+            for _bi, _arr in enumerate(_entries or []):
+                if _arr is None or len(_arr) == 0 or _bi >= len(_blocks):
+                    continue
+                if _blocks[_bi].type in _want:
+                    _out.add(_nm)
+                    break
+        return _out
+
     def _subregion_id(t: str):
         # `from_regions` registers a geometry part's interior under the tag ``interior_<name>`` (see
         # PolygonDomain._register_interior_tag) while the part itself is keyed *bare* in
@@ -767,6 +790,16 @@ def _region_and_support(constraint: Any, domain: Any) -> Tuple[str, str]:
             f"jno.fem: a residual spans multiple regions {sorted(tags)}; each residual must live on a single region."
         )
     if boundary_tags:
+        # A gmsh physical VOLUME also registers a node set, so it can land in `_boundary_regions` and
+        # be read as a (face-less) surface term -- which assembles to exactly nothing. Measured: a
+        # term on `core` produced b = 0 with no warning. Catch it here as well as in the volume
+        # branch below; the two misreadings differ but both are silent.
+        _volnames = _volume_cell_regions()
+        _bad = sorted(t for t in boundary_tags if t in _volnames and t != "boundary")
+        if _bad:
+            raise ValueError(
+                _REGION_VOLUME_MSG.format(names=_bad, how="read as a surface term, assembling to exactly zero")
+            )
         return "boundary", next(iter(boundary_tags))
 
     subregions = {r for r in (_subregion_id(t) for t in interiorish) if r is not None}
@@ -777,7 +810,30 @@ def _region_and_support(constraint: Any, domain: Any) -> Tuple[str, str]:
         )
     if subregions:
         return "volume", next(iter(subregions))
+
+    # A named cell region read from a mesh file (a gmsh physical VOLUME) resolves as a coordinate
+    # view -- `d.variable("core")` returns exactly that region's points -- but it has no
+    # `_subregion_id`, because that only knows shapely parts and tag predicates. It would therefore
+    # fall through to whole-domain "volume" below and integrate over the ENTIRE mesh: silently, and
+    # wrong by whatever fraction of the mesh the region is not (measured on a 4-material mesh:
+    # a term on `air` integrated to the full 69,694 mm^3 instead of the air's 66,445, and one on
+    # `core` produced 0). Refuse rather than return a plausible wrong number.
+    _named = sorted(t for t in interiorish if t != "interior" and t in _volume_cell_regions())
+    if _named:
+        raise ValueError(_REGION_VOLUME_MSG.format(names=_named, how="integrated over the WHOLE mesh"))
     return "volume", "volume"
+
+
+_REGION_VOLUME_MSG = (
+    "jno.fem: volume term on mesh cell region(s) {names}. Restricting a VOLUME term to a named cell "
+    "region is not implemented -- the term is instead {how}, with no warning.\n"
+    "  Put the per-region material or source in the COEFFICIENT rather than the quadrature domain.\n"
+    "  A named region of the mesh file is a valid key, so this reads straight off the physical volumes:\n"
+    '      k = d.by_region({{"steel": 16.0, "air": 0.026}})     # one value per cell, exact membership\n'
+    '      d.attach("steel", k=16.0)                          # or attach it and use d.k\n'
+    "  A shapely sub-region or a d.tag(...) predicate also restricts correctly.\n"
+    "  (d.variable(<region>) DOES restrict a SURFACE term; only the volume path is missing.)"
+)
 
 
 def _retag_coords_for_quadrature(constraint: Any, support: str, region_id: str) -> None:
@@ -999,21 +1055,97 @@ def _is_complex_form(domain: Any, ir: Any) -> bool:
     return any(_node_has_complex_literal(node) for term in ir.terms for node in _walk(term.coeff))
 
 
+#: One-pass complex non-nodal assembly (see the gate in `assemble`). Module-level so a composition
+#: the gate mis-judges can be steered back to the historic Re/Im two-leg split without an upgrade.
+_COMPLEX_SINGLE_ASSEMBLY = True
+
+
 def _complex_block_bcoo(A_r: Any, A_i: Any, n: int) -> Any:
     """Assemble the real-equivalent block ``[[A_r, -A_i], [A_i, A_r]]`` (shape ``2n x 2n``) as one
     BCOO from the two sparse legs, by placing each sub-block's triplets at its ``n`` offset -- no
     densification. The four sub-blocks occupy disjoint index ranges, so the result has no duplicate
-    coordinates. ``A_r`` appears at (0,0) and (n,n); ``A_i`` at (n,0) and, negated, at (0,n)."""
+    coordinates. ``A_r`` appears at (0,0) and (n,n); ``A_i`` at (n,0) and, negated, at (0,n).
+
+    The block's canonical (row-major sorted) order is decided host-side and the device work is one
+    O(nnz) gather -- emitted with ``indices_sorted``/``unique_indices`` set. A raw concatenation
+    instead makes every downstream CSR conversion re-sort the full ``2n`` pattern on device, and for
+    the complex TRANSIENT block that cost recurs every step of the march. When both legs are already
+    canonical (the planned assemblers' output) the order needs NO sort at all: within any fused row
+    every left-half column precedes every right-half column, so the permutation follows from
+    per-row entry COUNTS -- ``np.unique`` over the concatenated pattern (the first cut of this) cost
+    more transient workspace at the fuse than the emission saved, and pinned a plan-cache entry
+    sized by the mesh for a plan that is cheap to recompute. Legs that are concrete but not flagged
+    canonical take :func:`compress_plan`; traced leg indices (a jit-captured re-form) keep the plain
+    concatenation -- correctness never depends on either plan."""
     from jax.experimental import sparse as jsp
 
     ir, dr = A_r.indices, A_r.data
     ii, di = A_i.indices, A_i.data
+    canonical = all(getattr(L, "unique_indices", False) and getattr(L, "indices_sorted", False) for L in (A_r, A_i))
+    try:
+        hir, hii = np.asarray(ir), np.asarray(ii)  # raises on a tracer -> the concatenation below
+    except Exception:  # noqa: BLE001 -- traced indices: no host plan available
+        hir = None
+    if hir is not None and canonical:
+        # Counting merge, all int32 on the host (the transients here showed up at the fuse
+        # checkpoint of a 275k-tet build until they were trimmed): per source piece, `pos` maps its
+        # slots to their row-major positions in the fused block -- the top half interleaves
+        # (A_r row k | A_i row k at cols+n) per row, the bottom half (A_i row k | A_r row k).
+        nr, ni = hir.shape[0], hii.shape[0]
+        rows_r, rows_i = hir[:, 0], hii[:, 0]
+        cr = np.bincount(rows_r, minlength=n).astype(np.int32)
+        ci = np.bincount(rows_i, minlength=n).astype(np.int32)
+        rs_r = np.concatenate([[0], np.cumsum(cr, dtype=np.int32)[:-1]])  # row starts within each leg
+        rs_i = np.concatenate([[0], np.cumsum(ci, dtype=np.int32)[:-1]])
+        half = np.concatenate([[0], np.cumsum(cr + ci, dtype=np.int32)[:-1]])  # fused row starts
+        rank_r = np.arange(nr, dtype=np.int32) - rs_r[rows_r]  # in-row rank, preserved from the leg
+        rank_i = np.arange(ni, dtype=np.int32) - rs_i[rows_i]
+        pos_rt = half[rows_r] + rank_r  # A_r  at (0, 0)
+        pos_it = half[rows_i] + cr[rows_i] + rank_i  # -A_i at (0, n)
+        pos_ib = nr + ni + half[rows_i] + rank_i  # A_i  at (n, 0)
+        pos_rb = nr + ni + half[rows_r] + ci[rows_r] + rank_r  # A_r  at (n, n)
+        idx = np.empty((2 * (nr + ni), 2), dtype=np.int32)
+        idx[pos_rt] = hir
+        idx[pos_it] = hii + np.asarray([0, n], dtype=np.int32)
+        idx[pos_ib] = hii + np.asarray([n, 0], dtype=np.int32)
+        idx[pos_rb] = hir + np.asarray([n, n], dtype=np.int32)
+        try:  # concrete data: place values host-side too -- no concatenated copy, no device gather
+            hdr, hdi = np.asarray(dr), np.asarray(di)
+            dat = np.empty((2 * (nr + ni),), dtype=np.result_type(hdr, hdi))
+            dat[pos_rt] = hdr
+            dat[pos_it] = -hdi
+            dat[pos_ib] = hdi
+            dat[pos_rb] = hdr
+            data = jnp.asarray(dat)
+        except Exception:  # noqa: BLE001 -- traced data (parametric re-form): one device gather
+            perm = np.empty((2 * (nr + ni),), dtype=np.int32)
+            perm[np.concatenate([pos_rt, pos_it, pos_ib, pos_rb])] = np.arange(2 * (nr + ni), dtype=np.int32)
+            data = jnp.concatenate([dr, -di, di, dr])[jnp.asarray(perm)]
+        return jsp.BCOO(
+            (data, jnp.asarray(idx)),
+            shape=(2 * n, 2 * n),
+            indices_sorted=True,
+            unique_indices=True,
+        )
+    if hir is not None:
+        from .utils.solver.fem_utils import compress_plan
+
+        cat = np.concatenate(
+            [hir, hii + np.asarray([0, n]), hii + np.asarray([n, 0]), hir + np.asarray([n, n])], axis=0
+        ).astype(np.int32)
+        try:
+            plan = compress_plan(cat)
+        except Exception:  # noqa: BLE001 -- no host plan available
+            plan = None
+        if plan is not None:
+            uidx, inverse, nse = plan
+            data = jax.ops.segment_sum(jnp.concatenate([dr, -di, di, dr]), inverse, num_segments=nse)
+            return jsp.BCOO((data, uidx), shape=(2 * n, 2 * n), indices_sorted=True, unique_indices=True)
     off = jnp.asarray([n, n], dtype=ir.dtype)
     col = jnp.asarray([0, n], dtype=ir.dtype)
     row = jnp.asarray([n, 0], dtype=ir.dtype)
     indices = jnp.concatenate([ir, ii + col, ii + row, ir + off], axis=0)  # (0,0),(0,n),(n,0),(n,n)
-    data = jnp.concatenate([dr, -di, di, dr])
-    return jsp.BCOO((data, indices), shape=(2 * n, 2 * n))
+    return jsp.BCOO((jnp.concatenate([dr, -di, di, dr]), indices), shape=(2 * n, 2 * n))
 
 
 def _to_bcoo(A: Any) -> Any:
@@ -1025,10 +1157,16 @@ def _to_bcoo(A: Any) -> Any:
 
 
 def _bcoo_empty(m: int, n: int, dtype: Any) -> Any:
-    """An all-zero ``(m, n)`` BCOO (no stored entries)."""
+    """An all-zero ``(m, n)`` BCOO (no stored entries) — vacuously canonical, and flagged so, which
+    lets :func:`_complex_block_bcoo` take its no-sort merge when one leg is this."""
     from jax.experimental import sparse as jsp
 
-    return jsp.BCOO((jnp.zeros((0,), dtype), jnp.zeros((0, 2), jnp.int32)), shape=(m, n))
+    return jsp.BCOO(
+        (jnp.zeros((0,), dtype), jnp.zeros((0, 2), jnp.int32)),
+        shape=(m, n),
+        indices_sorted=True,
+        unique_indices=True,
+    )
 
 
 def _bcoo_block(subblocks: Any, shape: Any, dtype: Any) -> Any:
@@ -1052,12 +1190,28 @@ def _bcoo_block(subblocks: Any, shape: Any, dtype: Any) -> Any:
 def _complex_operator(A_r: Any, A_i: Any) -> Any:
     """Fuse the real/imag legs into one complex operator ``A_r + i·A_i`` — as a **complex BCOO** when
     the legs are sparse (so an iterative complex solve never densifies), else a dense complex array.
-    This is the operator a slot-composed complex solver (``linear=gmres, precond=ams``) runs on."""
+    This is the operator a slot-composed complex solver (``linear=gmres, precond=ams``) runs on.
+
+    The union pattern is decided host-side (:func:`compress_plan`) and applied as an O(nnz)
+    ``segment_sum``: ``sum_duplicates`` is an in-trace device argsort over the CONCATENATED legs,
+    whose workspace is the same spike the planned assembly path exists to avoid — paid here at the
+    exact moment a complex-native preconditioner build has both legs and the union live. Traced
+    indices fall back to the sorting path; correctness never depends on the plan."""
     if hasattr(A_r, "indices") and hasattr(A_i, "indices"):
         from jax.experimental import sparse as jsp
 
         indices = jnp.concatenate([A_r.indices, A_i.indices], axis=0)
         data = jnp.concatenate([A_r.data + 0j, 1j * A_i.data])  # +0j promotes to the complex dtype
+        try:
+            from .utils.solver.fem_utils import compress_plan
+
+            plan = compress_plan(indices)
+        except Exception:  # noqa: BLE001 -- traced indices: no host plan available
+            plan = None
+        if plan is not None:
+            idx, inverse, nse = plan
+            data = jax.ops.segment_sum(data, inverse, num_segments=nse)
+            return jsp.BCOO((data, idx), shape=A_r.shape, indices_sorted=True, unique_indices=True)
         return jsp.BCOO((data, indices), shape=A_r.shape).sum_duplicates()
     Ar = A_r.todense() if hasattr(A_r, "todense") else A_r
     Ai = A_i.todense() if hasattr(A_i, "todense") else A_i
@@ -4305,6 +4459,32 @@ def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) ->
 # ---------------------------------------------------------------------------
 # the driver
 # ---------------------------------------------------------------------------
+def _host_assembly_scope():
+    """Assembly runs on the HOST unless the caller has said otherwise.
+
+    The element loop allocates temporaries far larger than the matrix it produces, so on a GPU it
+    exhausts the card at roughly a third of the size the finished operator occupies happily -- a
+    527k-DOF mixed N1E x Lagrange operator is 0.77 GB and fits easily, while assembling it on an 8 GB
+    card dies. Host RAM is the plentiful resource (~6 GB per million DOFs); the device's job is the
+    solve, and ``jax.device_put`` across backends is traceable with ``jax.grad`` differentiating
+    through it, so nothing about the split costs differentiability.
+
+    It is also no slower for a one-shot build: assembling a 43k-DOF Poisson takes 4.02 s on the host
+    against 4.98 s on the device, and the mixed N1E form 9.28 s against 11.00 s. The device wins only
+    on REPEATED assembly of a heavy form once compilation has amortised (5.60 s vs 3.69 s), which is
+    what the override is for -- an out-of-memory failure is fatal, a slower Newton loop is not.
+
+    Deliberately not a ``jno.fem`` argument. ``jax.default_device`` is JAX's own way of saying where
+    work goes, so an explicit one wins and this default applies only when none was expressed.
+    """
+    if jax.config.jax_default_device is not None:
+        return contextlib.nullcontext()  # the caller expressed a preference; it wins
+    if jax.default_backend() == "cpu":
+        return contextlib.nullcontext()  # nothing to move away from
+    hosts = jax.devices("cpu")
+    return jax.default_device(hosts[0]) if hosts else contextlib.nullcontext()
+
+
 def fem(
     constraints: Any,
     *,
@@ -4325,11 +4505,12 @@ def fem(
     _fn._CHUNK_OVERRIDE[0] = _fn.normalize_chunk(chunk)
     _fn._CHUNK_CONSUMED[0] = False
     try:
-        out = _fem_impl(
-            constraints,
-            quad_degree=quad_degree,
-            _dd_overlap=_dd_overlap,
-        )
+        with _host_assembly_scope():
+            out = _fem_impl(
+                constraints,
+                quad_degree=quad_degree,
+                _dd_overlap=_dd_overlap,
+            )
         if chunk is not None and not _fn._CHUNK_CONSUMED[0]:
             # Refuse rather than ignore: the 1-D and non-nodal assemblers have their own element
             # loops and none of them chunk, so an explicit request there would quietly do nothing.
@@ -5014,6 +5195,78 @@ def _fem_impl(
                     "jno.fem: a complex non-nodal *nonlinear* form is not wired — complex forms assemble as "
                     "linear real-equivalent blocks. (Raises rather than silently dropping the imaginary part.)"
                 )
+            # --- ONE complex assembly when the complex data provably stays on the volume path ---
+            # The basis is real and only the coefficient is complex, so a single data pass with a
+            # real linearisation point yields the complex operator directly; the Re/Im legs every
+            # downstream consumer reads are derived from it. The historic split below runs the FULL
+            # assembler twice -- measured on a 275k-tet mixed N1E x Lagrange build, the second leg
+            # alone was +1.3 GB of peak. The gate fails CLOSED: parametric forms (runtime
+            # parameters, trainable coordinates), a complex literal in a BOUNDARY term
+            # (impedance / incident), and flux/rotation BCs keep the two-leg split until each is
+            # verified complex-clean on this path.
+            _cx_bd = any(_bares_have_complex_coeff(exprs) for exprs in boundary_terms.values())
+            from .utils.solver.parametric_helpers import _collect_runtime_parameter_exprs as _rt_collect
+
+            _rt_nn: dict = {}
+            for _b in _nn_bares:
+                _rt_collect(_b, _rt_nn)
+            # A REAL-valued flux/rotation entry is the ordinary essential trace pin (the PEC
+            # ``n x u = 0`` classifies here) and shares the dtype-generic pin machinery; only a
+            # complex VALUE would touch unverified ground (e.g. the host-assembled RT load).
+            _cx_fluxlike = any(
+                (isinstance(_e[-1], complex) and _e[-1].imag != 0) or _node_has_complex_literal(_e[-1])
+                for _e in tuple(flux_bcs) + tuple(rotation_bcs)
+            )
+            _single = _COMPLEX_SINGLE_ASSEMBLY and not (
+                _cx_bd or _cx_fluxlike or _rt_nn or (getattr(domain, "_trainable_coords", None) or [])
+            )
+            if _single:
+                domain._fem_problem = None
+                op_c, _mode_c, offsets = assemble_fem_nonnodal(
+                    domain,
+                    volume_terms,
+                    boundary_terms,
+                    dirichlet_raw,
+                    [],
+                    flux_bcs=flux_bcs,
+                    rotation_bcs=rotation_bcs,
+                    quad_degree=quad_degree,
+                )
+                if _mode_c == "linear" and isinstance(op_c, tuple):
+                    from jax.experimental import sparse as _jsp
+
+                    from .utils.solver.fem_utils import compress_eager as _ce
+
+                    A_c, b_c = op_c
+                    b_c = jnp.asarray(b_c)
+                    if not (jnp.iscomplexobj(A_c.data) and jnp.iscomplexobj(b_c)):
+                        raise RuntimeError(
+                            "jno.fem internal: the single-pass complex assembly returned a REAL system "
+                            "for a form with a complex coefficient -- the imaginary part was silently "
+                            "cast away somewhere in the element path. Refusing to build a half-cast "
+                            "operator; set jno._fem._COMPLEX_SINGLE_ASSEMBLY = False to use the "
+                            "two-leg split while this is reported."
+                        )
+                    _fl = dict(
+                        indices_sorted=bool(getattr(A_c, "indices_sorted", False)),
+                        unique_indices=bool(getattr(A_c, "unique_indices", False)),
+                    )
+                    # compress_eager drops each leg's explicit zeros (a term whose Re or Im part
+                    # vanishes keeps its slots in the shared complex pattern), reproducing the leg
+                    # sizes the split produced; the indices array is shared until then.
+                    op_r = (_ce(_jsp.BCOO((A_c.data.real, A_c.indices), shape=A_c.shape, **_fl)), b_c.real)
+                    op_i = (_ce(_jsp.BCOO((A_c.data.imag, A_c.indices), shape=A_c.shape, **_fl)), b_c.imag)
+                    return _finalize(
+                        FEM(
+                            domain=domain,
+                            op=(op_r, op_i),
+                            classification=classification,
+                            mode="complex",
+                            offsets=offsets,
+                        )
+                    )
+                # an unexpected shape (the gate mis-judged): the two-leg split below stays correct
+
             real_bd = {tag: [e.real for e in exprs] for tag, exprs in boundary_terms.items()}
             imag_bd = {tag: [e.imag for e in exprs] for tag, exprs in boundary_terms.items()}
             domain._fem_problem = None

@@ -194,7 +194,7 @@ precond=…, time=…)` composes (see the [FEM guide](fem/index.md)). The famili
 | Kind | `jno.solve` |
 | --- | --- |
 | **Linear — direct** | `lu` (sparse LU), `dense` |
-| **Linear — iterative (Krylov)** | `cg`, `bicgstab`, `gmres`, `fgmres`, `minres`; `lstsq` (LSQR, least-squares); `chebyshev` (polynomial) |
+| **Linear — iterative (Krylov)** | `cg`, `bicgstab`, `gmres`, `fgmres`, `minres`, `cocg` (complex-symmetric); `lstsq` (LSQR, least-squares); `chebyshev` (polynomial) |
 | **Linear — multigrid** | `amg` (GPU AMG / NVIDIA AmgX via jaxamg) |
 | **Nonlinear** | `newton`, `picard` |
 | **Eigenproblem** | `eigs` (generalized `Kx = λMx`) — dense reduction, preconditioned LOBPCG with `precond=`, or interior modes nearest a shift with `sigma=` |
@@ -433,6 +433,73 @@ So AMG is for **repeated solves against the same operator** — a transient run,
 Newton loop — where the setup amortises. For a single one-shot solve below ~100k DOFs, Jacobi still
 wins on wall clock: you would pay 419 ms of setup to save 64 ms. This is why AMG is not the default;
 the right choice depends on how many times you solve, which only you know.
+
+### Large systems on a GPU
+
+Past a few hundred thousand DOFs, what stops a GPU solve is rarely the matrix. Three things bite
+first, and only the third is about size at all.
+
+**Assembly runs on the host, automatically.** jNO's element loop allocates temporaries far larger
+than the matrix it produces, so assembling on the device runs out of memory at roughly a third of the
+size the finished operator would happily occupy. `jno.fem(...)` therefore builds on the CPU whenever
+a GPU is the default backend, and the solve moves the operator across:
+
+```python
+fem = jno.fem([...])                     # assembled on the host, whatever the default backend
+u = fem.solve(linear=jno.solve.fgmres(), precond=M)   # solved on the GPU
+```
+
+Nothing is given up for this. `jax.device_put` across backends is traceable and `jax.grad`
+differentiates through it, so topology optimisation, neural coefficients and trainable coordinates
+all still work across the split. Measured on a 9,970-DOF Poisson, assembly now costs **8 bytes** of
+device memory — flat from n=242 to n=3,797 — against 104 MB before. Budget roughly **6 GB of host RAM
+per million DOFs**; host memory, not the card, becomes the binding constraint.
+
+It is not slower for a one-shot build, either — the host wins on every first call, because it also
+compiles faster:
+
+| | assemble on host | on device |
+| --- | --- | --- |
+| Poisson, 43k DOFs | **4.02 s** | 4.98 s |
+| mixed N1E x Lagrange, 43k DOFs | **9.28 s** | 11.00 s |
+
+The device does win on *repeated* assembly of a heavy form once compilation has amortised (5.60 s on
+the host against 3.69 s on the device, mixed N1E at 43k DOFs), which matters in a Newton or
+optimisation loop that reassembles many times. There is no jNO argument for this — `jax.default_device`
+is JAX's own way of saying where work goes, and an explicit one wins:
+
+```python
+with jax.default_device(jax.devices("gpu")[0]):
+    fem = jno.fem([...])                 # assemble on the device instead
+```
+
+**Set the async allocator.** XLA's default BFC allocator fragments and will refuse an allocation
+about a gigabyte below the card's actual free memory — on a GPU shared with a desktop this is the
+difference between running and not:
+
+```
+XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async
+```
+
+A 2.70 GB operator that BFC rejected ran without complaint under `cuda_async`.
+
+**Sizing.** A BCOO operator costs **16 bytes per nonzero** in `float64` (an 8-byte value plus two
+`int32` indices), and peak device memory during a solve is about **1.3x** that, the extra being SpMV
+scratch. Measured on an RTX 3070 (7.81 GiB usable, ~3 GB held by a desktop), on the fused real
+`2n` block of a complex mixed N1E x Lagrange system at ~50 nonzeros per row:
+
+| DOFs | nonzeros | operator | peak | SpMV | effective |
+| --- | --- | --- | --- | --- | --- |
+| 1,215,312 | 60.3 M | 0.90 GB | 1.24 GB | 7.9 ms | 114 GB/s |
+| 2,216,184 | 113.3 M | 1.69 GB | 2.22 GB | 15.0 ms | 113 GB/s |
+
+Bandwidth holds flat across sizes, so a Krylov solve costs about *iterations x SpMV*: budget from the
+iteration count, not from the DOF count.
+
+**`float32` is not a lever.** The same 60.3 M-nonzero operator takes **8.05 ms in `float64` and
+9.09 ms in `float32`** — half the value bytes, and slightly slower. Indices stay `int32` either way
+and the gather of `x` dominates, so halving precision buys about a quarter of the memory and none of
+the time. Reach for a coarser mesh or a better preconditioner instead.
 
 **Preconditioners** (`jno.precond`, for the iterative solvers): `jacobi`, `chebyshev`,
 `nystrom` (randomized low-rank — the rung between `jacobi` and multigrid),

@@ -55,10 +55,15 @@ def _require_pyamg():
 
 
 def _to_scipy_csr(A):
-    """Concrete BCOO / dense -> scipy CSR for the pyamg setup."""
+    """Concrete scipy sparse / BCOO / dense -> scipy CSR for the pyamg setup."""
     import scipy.sparse as sp
 
-    if hasattr(A, "todense") and hasattr(A, "indices"):  # BCOO
+    # scipy FIRST: a scipy CSR also has `.todense` and `.indices` (its 1-D column array), so the
+    # duck-typed BCOO test below matches it and then `idx[:, 0]` raises "too many indices". Already
+    # being the target type is not a case to fall through on.
+    if sp.issparse(A):
+        return A.tocsr()
+    if hasattr(A, "todense") and hasattr(A, "indices"):  # BCOO: 2-D (row, col) index array
         data = np.asarray(A.data)
         idx = np.asarray(A.indices)
         return sp.coo_matrix((data, (idx[:, 0], idx[:, 1])), shape=A.shape).tocsr()
@@ -99,7 +104,9 @@ def build_hierarchy(
         A_l = jsp.BCOO.from_scipy_sparse(lvl.A.tocoo())
         P = jsp.BCOO.from_scipy_sparse(lvl.P.tocoo())
         R = jsp.BCOO.from_scipy_sparse(lvl.R.tocoo())
-        lmax = float(safety * power_iteration_bound(lambda v: A_l @ v, A_l.shape[0], iters=bound_iters))
+        lmax = float(
+            safety * power_iteration_bound(lambda v: A_l @ v, A_l.shape[0], dtype=A_l.data.dtype, iters=bound_iters)
+        )
         levels.append({"A": A_l, "P": P, "R": R, "lmin": lmin_ratio * lmax, "lmax": lmax, "degree": smoother_degree})
     A_c = np.asarray(ml.levels[-1].A.todense())
     levels.append({"Ainv": jnp.asarray(np.linalg.pinv(A_c))})  # pinv: robust to a gauge null space
