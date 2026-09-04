@@ -2036,7 +2036,7 @@ def _promote_to_quadratic(points, cells_p1, edge_local):
     return pts, cells_p2
 
 
-def _promote_to_degree(points, cells_p1, ref_pts, cell_type=None):
+def _promote_to_degree(points, cells_p1, ref_pts, cell_type=None, *, entity_keys=False):
     """Promote a linear mesh to a degree-``k`` Lagrange node mesh (P1 -> P{k} / Q1 -> Q{k}, any ``k``).
 
     ``cell_type`` names the cell for a tensor-product mesh (``"quad"`` / ``"hexahedron"``), whose
@@ -2082,22 +2082,66 @@ def _promote_to_degree(points, cells_p1, ref_pts, cell_type=None):
     extent = float(np.max(points.max(axis=0) - points.min(axis=0))) if points.shape[0] else 1.0
     tol = 1e-7 * (extent or 1.0)
 
-    def _key(p):
-        return tuple(np.round(np.asarray(p) / tol).astype(np.int64))
+    # Dedup on the TOPOLOGICAL ENTITY, not the physical coordinate. A reference point's non-zero
+    # weights name exactly the P1 vertices whose entity it lies on (one -> a vertex, two -> an edge,
+    # three -> a face), so `(sorted global vertex ids, the weights in that same order)` identifies the
+    # entity independently of either cell's local orientation -- and distinguishes two entities that
+    # merely COINCIDE in space.
+    #
+    # Coordinate keying was the right conformity test for one body and the wrong one for two. On a
+    # `Shape.regions(..., conforming=False)` mesh the interface is coincident *on purpose*: the seeding
+    # loop below used to collapse the two bodies' duplicated vertices into one map entry (last writer
+    # wins), and every midpoint synthesised there then resolved to a single node -- welding the bodies,
+    # silently. Measured on a two-body bar: 37 nodes referenced by BOTH bodies, all on the interface.
+    # Harmless for a tie, wrong for contact, where those DOFs could never separate.
+    #
+    # For a CONFORMING mesh this is the same partition as before: a shared entity carries the same
+    # global vertex ids from either side, so it still collapses to one node.
+    # `entity_keys` picks WHICH non-conformity this mesh has, because the two want opposite
+    # answers:
+    #
+    #   two independently meshed BODIES -- coincident on purpose, so merging WELDS them.
+    #                                      -> key on the entity
+    #   a 2:1 HANGING-NODE refinement    -- a coarse edge's node coincides with the fine edges'
+    #                                      shared vertex, and merging them is exactly what makes
+    #                                      the constrained refinement continuous.
+    #                                      -> key on the coordinate
+    #
+    # Measured, keying the refined case on entities: order-3 on a refined mesh came out 1.8e-02
+    # off against a 1e-5 gate. So this is not a better key, it is a different question, and the
+    # caller -- which knows whether the domain carries a non-conforming interface -- must say which.
+    _wtol = 1e-9
+    _wround = 1e-6
 
-    coord_to_gid: dict = {}
+    def _coord_key(c, d):
+        return tuple(np.round(np.asarray(phys[c, d]) / tol).astype(np.int64))
+
+    def _entity_key(c, d):
+        w = weights[d]
+        nz = np.flatnonzero(np.abs(w) > _wtol)
+        vids = np.asarray(cells_p1[c])[nz]
+        order = np.argsort(vids, kind="stable")
+        return (tuple(int(v) for v in vids[order]), tuple(np.round(w[nz][order] / _wround).astype(np.int64)))
+
+    _key = _entity_key if entity_keys else _coord_key
+    ent_to_gid: dict = {}
     out_pts: List[Any] = []
     for vid in range(points.shape[0]):  # seed with the original vertices so they keep ids 0..nv-1
-        coord_to_gid[_key(points[vid])] = vid
+        _seed = (
+            ((vid,), (int(round(1.0 / _wround)),))
+            if entity_keys
+            else tuple(np.round(np.asarray(points[vid]) / tol).astype(np.int64))
+        )
+        ent_to_gid[_seed] = vid
         out_pts.append(points[vid])
     cells_k = np.zeros((ncell, ndof), dtype=np.int64)
     nid = points.shape[0]
     for c in range(ncell):
         for d in range(ndof):
-            k = _key(phys[c, d])
-            gid = coord_to_gid.get(k)
+            k = _key(c, d)
+            gid = ent_to_gid.get(k)
             if gid is None:
-                gid, coord_to_gid[k] = nid, nid
+                gid, ent_to_gid[k] = nid, nid
                 out_pts.append(phys[c, d])
                 nid += 1
             cells_k[c, d] = gid

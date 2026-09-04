@@ -205,14 +205,26 @@ def _refuse_nonconforming_promotion(domain, order: int) -> None:
     fix (key on the topological entity instead); refused until then. Shared by the simplex and
     tensor-product promotion paths, since the dedup they run is the same one.
     """
-    if any(_is_nonconforming_side(t) for t in (getattr(domain, "_interface_registry", {}) or {})):
+    # Lifted: `_promote_to_degree(entity_keys=True)` keys on the topological entity, so two
+    # coincident bodies no longer weld. The one combination still refused is a non-conforming
+    # interface on a HANGING-NODE mesh: those need opposite dedup rules (see `_promote_to_degree`)
+    # and one mesh cannot have both.
+    if (
+        order > 1
+        and getattr(domain, "_fem_hanging_nodes", None)
+        and any(_is_nonconforming_side(t) for t in (getattr(domain, "_interface_registry", {}) or {}))
+    ):
         raise NotImplementedError(
-            f"order-{order} elements on a Shape.regions(..., conforming=False) domain: the higher-order "
-            "node promotion deduplicates by coordinate, so it would silently WELD the two bodies at "
-            "every interface node it adds -- which a contact gap could then never open. Use order-1 "
-            "elements for a non-conforming interface, or Shape.curved() (which reads gmsh's nodes "
-            "instead of synthesising them, and is unaffected)."
+            f"order-{order} elements on a mesh that is BOTH locally refined (hanging nodes) and has "
+            "a Shape.regions(..., conforming=False) interface: the higher-order promotion must MERGE "
+            "coincident nodes across a 2:1 refinement and must NOT merge them across two coincident "
+            "bodies, and those cannot both hold on one mesh. Use order-1, or drop one of the two."
         )
+
+
+def _ek(domain) -> bool:
+    """Key the higher-order promotion on entities? Only when two bodies are coincident ON PURPOSE."""
+    return any(_is_nonconforming_side(t) for t in (getattr(domain, "_interface_registry", {}) or {}))
 
 
 def _get_mesh(domain, dim: int, order: int):
@@ -235,7 +247,9 @@ def _get_mesh(domain, dim: int, order: int):
         if order == 1:
             return pts_all, cells_p1, pts_all, cells_b
         _refuse_nonconforming_promotion(domain, order)
-        pts_f, cells_f = _promote_to_degree(pts_all, cells_b, lagrange_interp_points(dim, order, cell_type), cell_type)
+        pts_f, cells_f = _promote_to_degree(
+            pts_all, cells_b, lagrange_interp_points(dim, order, cell_type), cell_type, entity_keys=_ek(domain)
+        )
         # Both arrays share one id space, as on the curved path: `_promote_to_degree` keeps the
         # original vertices at ids 0..nv-1, so the P1 connectivity still indexes `pts_f` correctly.
         # That matters because the geometry gather reads the ASSEMBLY connectivity against `pts_p1`
@@ -284,7 +298,7 @@ def _get_mesh(domain, dim: int, order: int):
         raise NotImplementedError(f"Dimension {dim} not supported by native assembler.")
     # P{order} node mesh: place the element's reference interpolation points (basix DOF order) on each
     # cell and dedup by coordinate. One code path for P2 and P3+ (the P2 midpoints are the k=2 case).
-    pts_f, cells_f = _promote_to_degree(pts_p1, cells_p1, lagrange_interp_points(dim, order))
+    pts_f, cells_f = _promote_to_degree(pts_p1, cells_p1, lagrange_interp_points(dim, order), entity_keys=_ek(domain))
     return pts_p1, cells_p1, pts_f, cells_f
 
 

@@ -283,14 +283,18 @@ def test_a_coarse_secondary_is_reordered_rather_than_left_wrong():
             assert abs(got - ref) / ref < 1e-3, f"both orderings must agree: {got:.6f} vs {ref:.6f}"
 
 
-def test_p2_on_a_nonconforming_domain_is_refused():
-    """``_promote_to_degree`` deduplicates synthesised nodes by physical COORDINATE — the right
-    conformity test for one body, the wrong one for two. A ``conforming=False`` interface is coincident
-    *on purpose*, so every P2 node added there is merged across the bodies and welds them: measured on
-    a two-body bar, 37 nodes were referenced by cells of BOTH bodies, all at the interface. Benign for a
-    tie, wrong for contact (those DOFs can then never separate), and silent either way — so it is
-    refused until the promotion keys on topological entities instead. See
-    ``plans/p2-promotion-entity-keys.md``."""
+def test_p2_on_a_nonconforming_domain_keeps_the_bodies_apart():
+    """``_promote_to_degree`` used to deduplicate synthesised nodes by physical COORDINATE -- the right
+    conformity test for one body and the wrong one for two. A ``conforming=False`` interface is
+    coincident *on purpose*, so every P2 node added there was merged across the bodies and welded them:
+    measured on this two-body bar, **37 nodes were referenced by cells of BOTH bodies**, all at the
+    interface. Benign for a tie, wrong for contact (those DOFs could then never separate), and silent
+    either way -- so it was refused outright, which also put Taylor-Hood (P2 velocity / P1 pressure)
+    out of reach on independently meshed bodies.
+
+    The promotion now keys on the topological ENTITY (the P1 vertices its reference point's non-zero
+    weights span), which separates entities that merely coincide in space while still collapsing a
+    genuinely shared one from either neighbouring cell."""
 
     def build(conforming, order):
         d = _bar(conforming, 0.6)
@@ -298,12 +302,18 @@ def test_p2_on_a_nonconforming_domain_is_refused():
         c = d.variable("interior", split=True)
         b = d.variable("boundary", split=True)
         ui, vi = u.bind(x=c[0], y=c[1], z=c[2]), v.bind(x=c[0], y=c[1], z=c[2])
-        return jno.fem([ui.x * vi.x + ui.y * vi.y + ui.z * vi.z - 1.0 * vi, u(b[0], b[1], b[2]) - 0.0])
+        fem = jno.fem([ui.x * vi.x + ui.y * vi.y + ui.z * vi.z - 1.0 * vi, u(b[0], b[1], b[2]) - 0.0])
+        return d, fem
 
-    with pytest.raises(NotImplementedError, match="would silently WELD"):
-        build(False, 2)
-    assert build(True, 2) is not None  # a conforming interface shares its surface anyway — unaffected
-    assert build(False, 1) is not None  # P1 duplicates the interface nodes correctly
+    d, fem = build(False, 2)  # previously raised
+    from jno.utils.solver.fem_utils import _cell_region_mask
+
+    cells = np.asarray(d._fem_native_assembly_cells_all[0])
+    na, nb = (np.unique(cells[np.asarray(_cell_region_mask(d, n)).reshape(-1) > 0]) for n in ("lower", "upper"))
+    assert len(np.intersect1d(na, nb)) == 0, "the two bodies must not share a node -- that is the weld"
+
+    assert build(True, 2)[1] is not None  # a conforming interface shares its surface anyway
+    assert build(False, 1)[1] is not None  # P1 duplicated the interface nodes correctly all along
 
 
 def test_conforming_is_a_reserved_region_name():
