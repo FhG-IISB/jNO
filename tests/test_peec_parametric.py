@@ -20,6 +20,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import pytest
 
 import jno
 
@@ -175,3 +176,17 @@ def test_an_explicit_sigma_override_still_solves_concretely():
     e = _net(CU * _rho() ** 3).build()
     sol = e.solve(sigma={"bar": CU})
     assert isinstance(complex(sol.Z), complex)
+
+
+def test_a_readout_evaluated_per_point_says_so_instead_of_going_singular():
+    """A FEM region coefficient is evaluated PER QUADRATURE POINT, and hands each point a scalar.
+
+    A PEEC readout is one value for the whole region, not a field, so `d.by_region({r: node})` runs
+    a network solve per point -- and what it actually produced was `Factor is exactly singular` from
+    inside a preconditioner callback, with nothing naming the material or the composition. The wrong
+    SHAPE is the reliable signal that this has happened, and it is worth catching precisely because
+    the composition that works is a one-liner away.
+    """
+    node = _net(CU * _rho() ** 3).solve().R
+    with pytest.raises(ValueError, match="per point"):
+        _value_of(node, "rho", jnp.asarray(0.5))  # a scalar where the parameter is (n_cells,)
