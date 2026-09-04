@@ -202,6 +202,10 @@ nav:
       - Bayesian Inverse Coefficient: tutorials/10-bayesian-pinns/bayesian-inverse-coefficient.md
     - RCWA:
       - "Binary Grating — diffraction orders": tutorials/12-rcwa/binary-grating-orders.md
+    - PEEC:
+      - "Two-Wire Loop — R and L with nothing meshed": tutorials/13-peec/two-wire-loop.md
+      - "Busbar Pair — skin and proximity effect": tutorials/13-peec/busbar-frequency.md
+      - "Cored Transformer — open secondary and core loss": tutorials/13-peec/cored-transformer.md
   - Reference:
     - API Reference: API.md
     - Hyperparameter Tuning: Hyperparameter-Tuning.md
