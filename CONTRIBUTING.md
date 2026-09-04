@@ -96,6 +96,26 @@ pixi run fmt && pixi run lint && pixi run test
 | `pixi run ci-lint` | `ruff check .` | Lint check (no auto-fix, used by CI) |
 | `pixi run ci-test` | `pytest -x --tb=short -m 'not slow'` | Test suite without slow tests (used by CI) |
 
+## Writing docs
+
+Docs live in `docs/` and build with `mkdocs build --strict`, which **must pass with zero warnings**
+before a PR. `--strict` catches dead internal links, unresolved cross-references, and malformed
+docstrings (a documented parameter with no annotation on the signature will fail it).
+
+Two conventions keep the pages readable as they grow:
+
+- **Callouts are typed.** Seven types, each with one job — `abstract`, `note`, `tip`, `measured`,
+  `fun-fact`, `warning`, `danger`. A reader should be able to tell from the colour alone whether a
+  block is skippable background, advice to take, or a trap. The full convention, with each type
+  rendered, is at [Docs style — callouts](docs/misc/callouts.md).
+- **Collapse depth, don't cut it.** Swap `!!!` for `???` and the block folds. Derivations, benchmark
+  tables and rationale go there — write as much as you want, and the page stays scannable. A page
+  should read completely with every collapsed block shut. The one exception: a `danger` block never
+  collapses.
+
+Keep paragraphs under ~90 words. Anything enumerable — element families, what a slot supports, which
+forms are parametric — is a table, not prose.
+
 ## CI/CD
 
 Pull requests are checked by `.github/workflows/ci.yml`, which runs `ci-fmt`, `ci-lint`, and `ci-test` via pixi. The CI environment is identical to local — same lock file, same tool versions, no surprises.

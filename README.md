@@ -6,12 +6,6 @@
     <a href="https://fhg-iisb.github.io/jNO/">
         <img src="https://img.shields.io/badge/docs-GitHub%20Pages-0aa?style=for-the-badge" alt="Dev Docs"/>
     </a>
-    <a href="https://github.com/FhG-IISB/jno/actions/workflows/ci.yml">
-        <img src="https://img.shields.io/github/actions/workflow/status/FhG-IISB/jno/ci.yml?branch=main&style=for-the-badge&label=tests" alt="Tests"/>
-    </a>
-    <a href="https://codecov.io/gh/FhG-IISB/jno">
-        <img src="https://img.shields.io/codecov/c/github/FhG-IISB/jno/main?style=for-the-badge&label=coverage" alt="Coverage"/>
-    </a>
     <a href="LICENSE">
         <img src="https://img.shields.io/badge/license-EPL--2.0-2ea44f?style=for-the-badge" alt="License"/>
     </a>
@@ -31,51 +25,60 @@ numerical methods**. Classical solvers — finite elements, finite differences,
 and spectral (RCWA) — and scientific machine learning — PINNs, neural operators,
 Bayesian inference — are two pillars on **one substrate**: you write the math
 (a weak form, a strong-form stencil, a PDE residual, a data loss), and it lowers
-to a single GPU-ready, end-to-end reverse-mode-differentiable, `jit`-compiled graph.
+to a single GPU-ready, end-to-end differentiable, `jit`-compiled graph.
 
-Because every solve is differentiable, the things that are usually separate
-frameworks are the *same tool* here: an inverse problem, a PDE-constrained
-optimization, and a neural-network coefficient are one composition away from a
+Because every solve is differentiable, an inverse problem, a PDE-constrained
+optimization and a neural-network coefficient are one composition away from a
 forward solve — no glue code, no finite differences, no leaving JAX.
 
 > [!NOTE]
-> Research-level repository under active development. The public API is stabilising but may change between minor versions. Parts of the numerical-methods stack are marked *experimental* below — the scope and known limitations are stated on each docs page.
+> Research-level repository under active development. The public API is stabilising but may change between minor versions. Parts of the numerical-methods stack are marked *experimental* in the feature matrix below — the scope and known limitations are stated on each docs page.
 
 ## What you can do with jNO
 
-### Pillar 1 — Differentiable numerical methods
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/overview-dark.svg">
+    <img src="assets/overview-light.svg" width="100%"
+         alt="jNO overview: the five-stage workflow from geometry to result, and the modules of the two pillars"/>
+  </picture>
+</p>
 
-| Capability | Maturity | Notes |
-|------------|----------|-------|
-| **FEM, nodal** — `jno.fem` | [stable](https://fhg-iisb.github.io/jNO/fem/) | Lagrange P1 / P2 / P3+, **2-D & 3-D**; steady (linear + Newton), transient (θ-method), **second-order-in-time** (wave / elastodynamics), complex, periodic, coupled multifield |
-| **FEM, non-nodal** — H(div) / H(curl) / C¹ | [experimental](https://fhg-iisb.github.io/jNO/fem/#non-nodal-element-families-hdiv-and-hcurl) | **Raviart–Thomas** (H(div)) and **Nédélec edge** (H(curl) — Maxwell, eddy currents) elements; **C¹ Hermite / Argyris / Morley** (plates, biharmonic) |
-| **FDM** — `jno.fdm` | [stable](https://fhg-iisb.github.io/jNO/fdm/) | Strong-form collocation from a term list; **structured grids + geometric multigrid**; unstructured meshes; periodic, coupled, flux BCs; 2-D & 3-D |
-| **Spectral / RCWA** — `jno.rcwa` | [stable](https://fhg-iisb.github.io/jNO/rcwa/) | Vector-Maxwell RCWA, anisotropic media, Jones / polarization readout |
-| **Linear & nonlinear solvers** — `jno.solve` / `jno.precond` | [stable](https://fhg-iisb.github.io/jNO/) | Sparse-direct LU, Jacobi-BiCGStab, GMRES, CG, MINRES, Chebyshev, geometric multigrid, optional GPU **AMG** — matrix-free and differentiable |
-| **Generalized eigenproblems** — `fem.eigs` | [beta](https://fhg-iisb.github.io/jNO/) | `K x = λ M x`, differentiable, M-orthonormal |
-| **Time integration** | [stable](https://fhg-iisb.github.io/jNO/) | θ-method (backward-Euler / Crank–Nicolson), exponential integrators, adaptive step size |
-| **Adaptive meshing** — `jno.solve.remesh` / `relocate`, and `coord.d(t) - v` as a term | [beta](https://fhg-iisb.github.io/jNO/) | Hessian-metric remeshing (AFEM), r-adaptivity, moving meshes stated in the term list |
-| **Differentiable inverse / PDE-constrained** | [stable](https://fhg-iisb.github.io/jNO/tutorials/05-coupled-and-inverse/inverse-parameter/) | Recover a scalar, a field `k(x)`, the geometry, or a **neural coefficient** through any solve — the gradient flows through the whole march |
-| **Geometry** — `jno.Shape` / `jno.Path` | [stable](https://fhg-iisb.github.io/jNO/) | CSG via gmsh-OCC; conforming multi-material regions |
+Five stages, four front doors, one graph. Every module named above is public API; the matrix
+below is the same map, with a maturity label and a docs page per feature.
 
-### Pillar 2 — Scientific machine learning
+<details>
+<summary><strong>Feature matrix</strong> — maturity and per-feature docs (click to expand)</summary>
 
-| Capability | Maturity | Notes |
-|------------|----------|-------|
-| Forward PINNs (residual minimisation) | [stable](https://fhg-iisb.github.io/jNO/tutorials/01-basics/poisson-1d/) | Hard or soft BC enforcement |
-| Variational PINNs (weak-form losses) | [stable](https://fhg-iisb.github.io/jNO/tutorials/08-fem-and-varpinns/poisson-2d-fem/) | Network trial functions against the FEM weak form |
-| Operator learning (DeepONet, FNO, U-Net, PROSE via [foundax](https://github.com/FhG-IISB/foundax)) | [stable](https://fhg-iisb.github.io/jNO/tutorials/11-operator-learning/) | PDE-residual or data-driven |
-| Adaptive resampling (RAD, RARD, CR3, R3, pinnfluence) | [stable](https://fhg-iisb.github.io/jNO/adaptive/resampling/) | |
-| Stochastic PDEs & noise nodes (gaussian / uniform / laplace) | [stable](https://fhg-iisb.github.io/jNO/tutorials/07-stochastic/fokker-planck-2d/) | Fokker–Planck, stochastic forcing |
-| Bayesian PINNs (NUTS, HMC, MALA, SGLD, SGHMC, VI) | [stable](https://fhg-iisb.github.io/jNO/tutorials/10-bayesian-pinns/) | `model.bayesian(kernel_factory)` mirrors `.optimizer()` — per-parameter, mixed freely |
-| Parameter-efficient fine-tuning (LoRA, DoRA, rsLoRA, PiSSA, VeRA, LoKr, OFT, IA3) | [stable](https://fhg-iisb.github.io/jNO/model-controls/lora/) | Chain `.lora(...)` on any wrapped model |
-| Training explainability (gradient conflict, NTK, Hessian, loss landscape, input sensitivity) | [stable](https://fhg-iisb.github.io/jNO/tutorials/07-analysis/gradient-conflict/) | |
-| Foundation-model integration ([foundax](https://github.com/FhG-IISB/foundax) MLPs, transformers, DeepONet, FNO, PROSE) | [stable](https://fhg-iisb.github.io/jNO/foundation_models/) | Wrap any Equinox module via `jno.nn(...)` |
-| Hybrid data + model parallelism | [stable](https://fhg-iisb.github.io/jNO/training/parallelism/) | `jno.core(..., mesh=(batch, model))` |
-| W&B logging + Orbax checkpointing | [stable](https://fhg-iisb.github.io/jNO/tutorials/09-wandb/wandb-integration/) | |
-| IREE / MLIR compiled inference for deployment | [stable](https://fhg-iisb.github.io/jNO/model-controls/iree/) | |
+<br>
 
-**One tracing language bridges the two.** A weak form, a strong-form stencil, a PDE residual for a network, and a supervised loss all lower to the same differentiable, `jit`-compiled graph — so a classical solve, a PINN, and an inverse problem *compose* rather than living in separate stacks. 29 worked tutorials span elliptic, parabolic, hyperbolic, coupled, inverse, integral, stochastic, FEM / variational, Bayesian, and operator-learning problems — browse the [tutorials index](https://fhg-iisb.github.io/jNO/#tutorials).
+**Pillar 1 — differentiable numerical methods.** Every entry is matrix-free, GPU-ready and
+differentiable end to end.
+
+| | | |
+|---|---|---|
+| [**FEM**](https://fhg-iisb.github.io/jNO/fem/) · stable | [Elements](https://fhg-iisb.github.io/jNO/fem/elements/) · H(div)/H(curl)/C¹ experimental | [**FDM**](https://fhg-iisb.github.io/jNO/fdm/) · stable |
+| [**RCWA**](https://fhg-iisb.github.io/jNO/rcwa/) · stable | [Solvers & preconditioners](https://fhg-iisb.github.io/jNO/solvers/) · stable | [Eigenproblems](https://fhg-iisb.github.io/jNO/API/#solvers-and-preconditioners) · beta |
+| [Time integration](https://fhg-iisb.github.io/jNO/fdm/) · stable | [Adaptive meshing](https://fhg-iisb.github.io/jNO/fem/geometry/) · beta | [Domain decomposition](https://fhg-iisb.github.io/jNO/domain-decomposition/) · beta |
+| [Geometry — `jno.Shape`](https://fhg-iisb.github.io/jNO/Domain-and-Geometry/) · stable | [Inverse & PDE-constrained](https://fhg-iisb.github.io/jNO/inverse-problems/) · stable | [Limits & build time](https://fhg-iisb.github.io/jNO/fem/limitations/) |
+
+**Pillar 2 — scientific machine learning.** All stable, and all composable with any solve above.
+
+| | | |
+|---|---|---|
+| [Forward PINNs](https://fhg-iisb.github.io/jNO/tutorials/01-basics/laplace-1d/) | [Variational PINNs](https://fhg-iisb.github.io/jNO/tutorials/08-fem-and-varpinns/poisson-2d-fem/) | [Operator learning](https://fhg-iisb.github.io/jNO/tutorials/11-operator-learning/) |
+| [Bayesian PINNs](https://fhg-iisb.github.io/jNO/tutorials/10-bayesian-pinns/) | [Stochastic PDEs](https://fhg-iisb.github.io/jNO/tutorials/07-stochastic/fokker-planck-2d/) | [Adaptive resampling](https://fhg-iisb.github.io/jNO/adaptive/resampling/) |
+| [LoRA & PEFT](https://fhg-iisb.github.io/jNO/model-controls/lora/) | [Explainability](https://fhg-iisb.github.io/jNO/tutorials/07-analysis/gradient-conflict/) | [Foundation models](https://fhg-iisb.github.io/jNO/foundation_models/) |
+| [Parallelism](https://fhg-iisb.github.io/jNO/training/parallelism/) | [W&B + checkpointing](https://fhg-iisb.github.io/jNO/misc/wandb/) | [IREE deployment](https://fhg-iisb.github.io/jNO/model-controls/iree/) |
+
+Architectures come from [foundax](https://github.com/FhG-IISB/foundax) — MLPs, transformers,
+DeepONet, FNO, PROSE — wrapped with `jno.nn(...)`.
+
+</details>
+
+**35 worked tutorials** span elliptic, parabolic, hyperbolic, coupled, inverse, integral, stochastic,
+FEM / variational, Bayesian and operator-learning problems — browse the
+[tutorials index](https://fhg-iisb.github.io/jNO/#tutorials).
 
 ## Install
 
@@ -120,6 +123,104 @@ u_fdm = jno.fdm([-wi.d2(xi) - wi.d2(yi) - 1.0,           # −Δu = 1
 </details>
 
 <details>
+<summary><strong>Inverse — recover a coefficient by differentiating through the solve</strong> (click to expand)</summary>
+
+```python
+import jax.numpy as jnp
+import optax
+import jno
+
+d = jno.Shape.rect(0, 0, 1, 1, size=0.2).domain()
+xi, yi, _ = d.variable("interior", split=True)
+xb, yb, _ = d.variable("boundary", split=True)
+u, v = d.fem_symbols()
+ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+
+# Name the bilinear and linear forms once, then write the weak form as it reads on paper.
+a = lambda k, w, z: k * (w.x * z.x + w.y * z.y)      # ∫ k ∇u·∇v
+L = lambda z: 1.0 * z                                 # ∫ f v
+const = lambda c: (lambda *a, **kw: jnp.array([c]))
+
+# Synthetic observations from the true coefficient.
+k_true = jno.np.parameter((1,)).initialize(const(2.5)).freeze()
+u_obs = jnp.asarray(jno.fem([a(k_true, ui, vi) - L(vi), u(xb, yb) - 0.0]).solve())
+
+# The unknown coefficient — a trainable parameter sitting inside the weak form.
+k = jno.np.parameter((1,), name="k").initialize(const(1.0))
+k.optimizer(optax.adam(5e-2))
+
+fem  = jno.fem([a(k, ui, vi) - L(vi), u(xb, yb) - 0.0])
+crux = jno.core([(fem.solve() - u_obs).mse], domain=d)   # the solve IS the forward model
+crux.solve(400)                                          # k → 2.4999  (truth 2.5)
+```
+
+No adjoint derived, no finite differences, no second implementation of the physics — the gradient
+flows back through the assembly and the linear solve. Swap `k` for a spatially varying field, for the
+mesh coordinates, or for `jno.nn(net)` and nothing about the structure changes.
+
+</details>
+
+<details>
+<summary><strong>Coupled multiphysics — Rayleigh–Bénard convection in one term list</strong> (click to expand)</summary>
+
+```python
+import jax
+jax.config.update("jax_enable_x64", True)          # the assembler builds in float64
+
+import numpy as np
+import jno
+
+Pr, Ra = 1.0, 1.0e4                                 # Ra >> Ra_c ≈ 1708 → vigorous convection
+Lx, Ly, dt, nsteps = 2.0, 1.0, 0.009, 26
+
+d = jno.Shape.rect(0, 0, Lx, Ly, size=0.11).domain(time=(0.0, nsteps * dt, nsteps + 1))
+u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)   # P2 velocity  ┐ inf-sup
+p, q = d.fem_symbols(names=("p", "q"), order=1)                     # P1 pressure  ┘ stable pair
+T, s = d.fem_symbols(names=("T", "sT"), order=1)                    # P1 temperature
+xi, yi, ti = d.variable("interior", split=True)
+xb, yb, _  = d.variable("boundary", split=True)
+ci = d.variable("initial", split=True)
+ub, vb = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+pb, qb = p.bind(x=xi, y=yi, t=ti), q.bind(x=xi, y=yi, t=ti)
+Tb, sb = T.bind(x=xi, y=yi, t=ti), s.bind(x=xi, y=yi, t=ti)
+
+ux, uy, vx, vy = ub[0], ub[1], vb[0], vb[1]
+uxx, uxy, uyx, uyy = ub.x[0], ub.y[0], ub.x[1], ub.y[1]             # grad-then-index: ∂uᵢ/∂xⱼ
+vxx, vxy, vyx, vyy = vb.x[0], vb.y[0], vb.x[1], vb.y[1]
+
+momentum = ((ub.t[0] * vx + ub.t[1] * vy)                           # ∂u/∂t
+            + ((ux * uxx + uy * uxy) * vx + (ux * uyx + uy * uyy) * vy)   # (u·∇)u  — nonlinear
+            + Pr * (uxx * vxx + uxy * vxy + uyx * vyx + uyy * vyy)  # Pr ∇u : ∇v
+            - pb * (vxx + vyy)                                      # −p ∇·v
+            - Pr * Ra * Tb * vy)                                    # buoyancy:  T → momentum
+continuity = qb * (uxx + uyy)                                       # ∇·u = 0
+energy = Tb.t * sb + (ux * Tb.x + uy * Tb.y) * sb + (Tb.x * sb.x + Tb.y * sb.y)   # u → T
+
+Tcond = 1.0 - ci[1] / Ly                                            # hot floor, cold lid
+T0 = Tcond + 0.05 * jno.np.sin(2 * np.pi * ci[0] / Lx) * jno.np.sin(np.pi * ci[1] / Ly)
+
+fem = jno.fem([momentum, continuity, energy,
+               u(xb, yb) - 0.0,                     # no-slip walls
+               T(xb, yb) - (1.0 - yb / Ly),         # conductive profile held on the walls
+               p.pin(),                             # gauge-fix the pressure null space
+               u(*ci) - 0.0, T(*ci) - T0])          # start at rest, seeded
+
+assert fem.is_transient and not fem.is_linear       # both DETECTED from the terms, not configured
+
+sol  = fem.solve(linear=jno.solve.lu())             # a saddle system: name a direct solver
+traj = np.asarray(jno.core([sol.mse]).eval([sol]))  # (27, 2398) — one row per step
+uu, pp, TT = (traj[:, a:b] for a, b in zip(fem.offsets[:-1], fem.offsets[1:]))
+# T range 0.000..1.000   peak |u| 27.7   — started at rest, ended in counter-rotating rolls
+```
+
+Three fields, coupled **both ways**: buoyancy `Pr·Ra·T` drives the momentum balance, and `u·∇T`
+carries the flow back into the energy balance — a product of two *different* unknowns, so the system
+is nonlinear. Nothing above selects a mode: `fem.solve()` reads `u.t` and the nonlinearity off the
+term list and marches backward-Euler with Newton per step.
+
+</details>
+
+<details>
 <summary><strong>RCWA — a periodic metasurface, from the same constraint list</strong> (click to expand)</summary>
 
 ```python
@@ -160,40 +261,7 @@ sol.order(+1, 0)        # a chosen diffraction order
 </details>
 
 <details>
-<summary><strong>Operator learning — a DeepONet trained on a PDE residual</strong> (click to expand)</summary>
-
-```python
-import jno
-import jax
-import optax
-import foundax
-
-dir = jno.setup("./runs/test")
-
-# Domain: `500 *` batches 500 random-coefficient samples of the same geometry
-dom = 500 * jno.Shape.rect(0, 0, 2, 1, size=0.05).domain()
-x, y, _ = dom.variable("interior")
-xb, yb, _ = dom.variable("boundary")
-k = dom.variable("k", jax.random.uniform(jax.random.PRNGKey(0), shape=(500, 1, 1), minval=0.5, maxval=1.5))
-
-# Network + optimizer
-fx = foundax.deeponet(n_sensors=1, coord_dim=2, basis_functions=32, hidden_dim=128, activation=jax.numpy.tanh)
-net = jno.nn(fx)
-net.optimizer(optax.adam(optax.schedules.cosine_decay_schedule(1e-3, 20_000, alpha=1e-5)))
-
-# Hard BC enforcement via an output transform; the PDE residual is the loss
-u = net(k, jno.np.concat([x, y], axis=-1)) * x * (2 - x) * y * (1 - y)
-pde = k * (u.dd(x) + u.dd(y)) + 1.0
-
-crux = jno.core(constraints=[pde.mse], domain=dom)
-crux.solve(epochs=20_000, batchsize=32).plot(f"{dir}/training.png")
-jno.save(crux, f"{dir}/model.pkl")
-```
-
-</details>
-
-<details>
-<summary><strong>PINO — an FNO trained on the PDE residual, with no labelled solutions</strong> (click to expand)</summary>
+<summary><strong>Operator learning — an FNO trained on the PDE residual, with no labelled solutions</strong> (click to expand)</summary>
 
 ```python
 import jno

@@ -33,6 +33,125 @@ def _x64():
         jax.config.update("jax_enable_x64", prev)
 
 
+def test_krylov_breakdown_raises_instead_of_returning_nan():
+    """The failure the suite's own fixture never saw, because it uses no Dirichlet term and a fine mesh.
+
+    Lanczos can only build a subspace as large as the number of DISTINCT eigenvalues, and a pinned jNO
+    FEM operator has far fewer than it has rows: every Dirichlet DOF is an identity row, so eigenvalue
+    1.0 carries the pinned count as its multiplicity. Measured at mesh 0.25 -- n=30, 16 pinned rows,
+    15 distinct eigenvalues -- the DEFAULT ``order=25`` overran that and ``logdet`` returned NaN while
+    ``applyfun`` returned inf. Both must raise, and must do so under a trace too: these estimators
+    exist to be differentiated, so an eager-only check would guard nothing."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.25)
+    u, v = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    A, _ = jno.fem([ui * vi + ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0]).operator
+    S = jnp.asarray(np.asarray(A.todense()))
+    n = S.shape[0]
+    ev = np.linalg.eigvalsh(np.asarray(S))
+    assert len(np.unique(np.round(ev, 9))) < n, "the premise: pinning collapses the distinct spectrum"
+
+    with pytest.raises(FloatingPointError, match="Krylov"):
+        jno.solve.logdet(S, samples=8)  # default order=25 -> NaN before the guard
+    with pytest.raises(Exception, match="Krylov"):
+        jax.grad(lambda c: jno.solve.logdet(c * S, samples=8))(1.0)  # and under a trace
+
+    # below the Krylov dimension it works, and stays differentiable
+    exact = float(np.linalg.slogdet(np.asarray(S))[1])
+    assert abs(float(jno.solve.logdet(S, samples=64, order=8)) - exact) / abs(exact) < 0.25
+    assert np.isfinite(float(jax.grad(lambda c: jno.solve.logdet(c * S, samples=32, order=8))(1.0)))
+
+
+def test_applyfun_is_order_independent_past_the_krylov_dimension():
+    """``order`` is an upper BOUND on the Krylov dimension, not an exact request.
+
+    Same collapsed spectrum as the test above (mesh 0.25 pins 16 of 30 rows, leaving 15 distinct
+    eigenvalues). Running past that dimension used to degrade catastrophically and silently — the
+    sub-diagonal does not collapse to zero as a textbook happy breakdown would, it EXPLODES (0.27 →
+    2.2 → ... → 184.7) because the residual is pure round-off and normalising it gives basis vectors
+    of noise, whose Ritz values leave the spectrum entirely (measured [-244, +254] against a true
+    [0.99, 5.44]). Before the nested-convergence rule:
+
+        order 15  rel 3.35e-15        order 25  rel 5.11e+35
+        order 20  rel 1.44e-10        order 29  rel 1.85e+74
+
+    Every order must now land on the same answer. Note order 20: this is not only a fix for the
+    catastrophic end, it is more accurate wherever round-off has begun to contaminate the basis."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.25)
+    u, v = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    A, _ = jno.fem([ui * vi + ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0]).operator
+    S = jnp.asarray(np.asarray(A.todense()))
+    n = S.shape[0]
+    ones = jnp.ones(n)
+    ref = np.asarray(jax.scipy.linalg.expm(S)) @ np.ones(n)
+
+    for order in (8, 15, 20, 25, 29, 30):
+        got = np.asarray(jno.solve.applyfun(S, ones, fun=jnp.exp, order=order))
+        rel = np.linalg.norm(got - ref) / np.linalg.norm(ref)
+        # order=8 is genuinely below the Krylov dimension, so it is approximate but not broken
+        assert rel < (1e-5 if order == 8 else 1e-12), f"order={order} gave rel {rel:.2e}"
+
+
+def test_applyfun_arnoldi_path_and_expmv_agree_with_a_dense_expm():
+    """The non-symmetric paths, which carry a scaling trap.
+
+    ``matfree``'s two decompositions disagree on the fourth return value: ``tridiag_sym`` gives
+    ``||v||`` and ``hessenberg`` gives ``1/||v||``. Using it directly scales the Arnoldi answer by
+    ``||v||²`` — measured 1.634 against a true 49.020 on this operator, exactly a factor n. Both
+    build ``Q[0] = v/||v||``, so the norm is taken from ``v`` itself and this pins that it is."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.25)
+    u, v = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    A, _ = jno.fem([ui * vi + ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0]).operator
+    S = jnp.asarray(np.asarray(A.todense()))
+    n = S.shape[0]
+    ones = jnp.ones(n)
+    ref = np.asarray(jax.scipy.linalg.expm(S)) @ np.ones(n)
+
+    from jno.utils.solver.matfun import expmv
+
+    for order, tol in ((10, 1e-6), (20, 1e-10), (29, 1e-10)):
+        # order=10 is genuinely below this operator's Krylov dimension (15 distinct eigenvalues), so
+        # it is approximate; the point is that 20 and 29 -- past it -- are not WRONG.
+        arn = np.asarray(jno.solve.applyfun(S, ones, fun=jnp.exp, order=order, symmetric=False))
+        pade = np.asarray(expmv(S, ones, order=order))
+        assert np.linalg.norm(arn - ref) / np.linalg.norm(ref) < tol, f"arnoldi order={order}"
+        assert np.linalg.norm(pade - ref) / np.linalg.norm(ref) < tol, f"expmv order={order}"
+
+
+def test_applyfun_stays_differentiable_where_it_used_to_blow_up():
+    """The rule must not cost differentiability — an exponential integrator is differentiated through.
+
+    A discarded rung's ``f`` can legitimately overflow (``exp`` of a Ritz value at +254), so the
+    rungs are zeroed when non-finite: a rung that cannot be selected must not poison the gradient of
+    the one that is. Checked at orders that used to return 1e+35 and 1e+74."""
+    n = 40
+    rng = np.random.default_rng(7)
+    ev = np.concatenate([np.linspace(1.0, 4.0, 12), np.repeat(1.0, n - 12)])  # Krylov dimension 12
+    Q0, _ = np.linalg.qr(rng.standard_normal((n, n)))
+    S = jnp.asarray(Q0 @ np.diag(ev) @ Q0.T)
+    vec = jnp.asarray(rng.standard_normal(n))
+
+    def total(c, order):
+        return jnp.sum(jno.solve.applyfun(c * S, vec, fun=lambda z: jnp.exp(-0.05 * z), order=order))
+
+    for order in (10, 25, 35):
+        g = float(jax.grad(total)(1.0, order))
+        eps = 1e-6
+        fd = (float(total(1.0 + eps, order)) - float(total(1.0 - eps, order))) / (2 * eps)
+        assert np.isfinite(g), f"order={order} gradient is not finite"
+        assert abs(g - fd) / (abs(fd) + 1e-30) < 1e-5, f"order={order}: AD {g} vs FD {fd}"
+
+    assert np.isfinite(float(jax.jit(lambda c: total(c, 25))(1.0))), "and it must survive jit"
+
+
 def _spd_fem():
     """An SPD FEM operator (mass + stiffness) and its dense form."""
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.09)

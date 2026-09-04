@@ -41,6 +41,19 @@ fem = jno.fem([ui.t*vi + D*(ui.x*vi.x + ui.y*vi.y) + react - f*vi, ...])
 | vector / tensor | `inner(a, b, n_contract=)`, `dot cross outer trace sym`; vector `.norm() .dot() .cross()` |
 | matrix / Voigt / complex | `MatrixView` (`.det .inv .eigvals .sym`), `VoigtView` (`.von_mises .deviatoric .invariants`), `ComplexView` (`.real .imag .conj`) |
 
+Ordinary Python arithmetic over components composes too, so a vector source can be written either
+way — `inner` when the whole vector is to hand, a plain sum when the components are:
+
+```python
+f_dot_v = jno.np.inner(f, vi, n_contract=1)          # f is a vector expression
+f_dot_v = sum(f[k] * vi[k] for k in range(3))        # components, built one at a time
+```
+
+Both assemble to the same operator (to assembly round-off — the products reduce in a different
+order). The builtin `sum()` seeds with a literal `0`; that zero belongs to no equation block and is
+dropped. Every *other* additive piece of a form must carry exactly one test field, since the test
+field is what selects the block: a source term is `-f * vi`, never `-f`.
+
 ## Integrals (local **and** non-local)
 
 ```python
@@ -61,6 +74,8 @@ time-window integral.
 | Symbol | Meaning | Use |
 |---|---|---|
 | `d.variable(tag, normals=True, split=True)` → `nx, ny` | boundary outward normal | flux / Robin terms `nx*ui.x + ny*ui.y` |
+| `d.variable(tag, normals=True, reverse_normals=True, split=True)` | the same normals, **negated** | an enclosure or cavity where the meshed side faces inward |
+| `d.variable(tag, return_indices=True, split=True)` | one extra placeholder: the sampled point **indices** | scattering a result back onto the mesh, or tying a subset to data |
 | `d.cell_size` | element size `h` (\|detJ\|^(1/dim)) at quad points | **SUPG/GLS stabilization** `τ = h/(2·|β|)` |
 | `d.enclosure(tags)` | view-factor matrix + measures | grey-body radiation (`.view_factor`, `.field()`, `.load()`) |
 
@@ -90,4 +105,4 @@ conditionals, non-local integrals, the geometry symbols, and the full tensor cal
 
 `fem.term_kinds` (provisional) classifies each PDE term — `is_local` (pointwise reaction/mass) vs.
 global (neighbour-coupling diffusion/advection), its temporal order, trial/test gradient channel,
-and linearity — the basis for operator-splitting routing. See [`fem.md`](fem.md).
+and linearity — the basis for operator-splitting routing. See [`fem.md`](fem/index.md).

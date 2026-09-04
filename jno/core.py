@@ -46,9 +46,11 @@ from .trace import (
     OperationCall,
     OperationDef,
     Placeholder,
+    TensorTag,
     Tracker,
     TunableModule,
     TunableModuleCall,
+    Variable,
     collect_operations,
     collect_tags,
     cse,
@@ -123,6 +125,24 @@ def _auto_gram_terms(constraints, fm) -> list:
     return gram_terms
 
 
+def _optimizer_states_match(a, b) -> bool:
+    """Whether two optax states have the same tree, leaf shapes and dtypes.
+
+    The test for "this is the same optimizer over the same parameters", and so for whether a state
+    carried over from a previous :meth:`core.solve` can be reused instead of re-initialised.
+    """
+    leaves_a, def_a = jax.tree_util.tree_flatten(a)
+    leaves_b, def_b = jax.tree_util.tree_flatten(b)
+    if def_a != def_b:
+        return False
+    for x, y in zip(leaves_a, leaves_b):
+        if getattr(x, "shape", None) != getattr(y, "shape", None):
+            return False
+        if getattr(x, "dtype", None) != getattr(y, "dtype", None):
+            return False
+    return True
+
+
 def _cpu_device():
     """Return a CPU JAX device.
 
@@ -184,16 +204,26 @@ def _trivial_domain():
     return _TRIVIAL_DOMAIN
 
 
-def _infer_domain_from_constraints(constraints: List[Placeholder]):
-    """Walk the constraint trees and return the unique domain referenced by
-    every Variable / TensorTag inside, or ``None`` when there is no domain
-    Variable at all (a parameter-only fit — the caller supplies a trivial domain).
+def _infer_domain_from_constraints(constraints: List[Placeholder], info: Optional[dict] = None):
+    """Walk the constraint trees and return the domain core should collocate on, or ``None`` when
+    there is nothing to collocate (a parameter-only fit — the caller supplies a trivial domain).
 
-    Raises ``ValueError`` if more than one distinct domain is found — the caller
-    must then pass ``domain=`` explicitly.
+    Only a ``Variable`` / ``TensorTag`` is a *collocation* reference: it is a coordinate core draws
+    samples from. A solve node's domain (``fem.solve()`` / ``jno.fdm([...]).solve()``) is merely the
+    mesh its PDE is discretized on — the loss reads no coordinate from it. So a data-misfit loss over
+    two solves on two meshes is **not** ambiguous, and must not be rejected as if it were.
+
+    ``info``, when given, is populated with ``{"over_solves": bool}`` so the caller can tell a
+    deliberate parameter-only fit over one or more solves from a loss that references no domain at
+    all (where a missing Variable is more likely to be a mistake worth warning about).
+
+    Raises ``ValueError`` only when more than one distinct *collocation* domain is found — the
+    caller must then pass ``domain=`` explicitly.
     """
     domains: list = []  # preserve insertion order for nicer error messages
+    sampled: list = []  # the subset of `domains` core must actually draw coordinates from
     seen_domains: set = set()
+    seen_sampled: set = set()
     seen_nodes: set = set()
 
     def visit(node):
@@ -205,9 +235,13 @@ def _infer_domain_from_constraints(constraints: List[Placeholder]):
         # so a pure data-misfit loss `(solve() - obs).mse` — whose Variables are hidden inside the solve —
         # still resolves its domain from the graph, with no explicit `domain=` needed.
         d = getattr(node, "_domain", None)
-        if d is not None and id(d) not in seen_domains:
-            seen_domains.add(id(d))
-            domains.append(d)
+        if d is not None:
+            if id(d) not in seen_domains:
+                seen_domains.add(id(d))
+                domains.append(d)
+            if isinstance(node, (Variable, TensorTag)) and id(d) not in seen_sampled:
+                seen_sampled.add(id(d))
+                sampled.append(d)
         # Generic descent: visit every instance attribute that holds a
         # Placeholder (or a list/dict of them).  This covers GroupedAssembly
         # and any future Placeholder subclass without enumerating attr names.
@@ -230,15 +264,23 @@ def _infer_domain_from_constraints(constraints: List[Placeholder]):
     for expr in constraints:
         visit(expr)
 
-    if len(domains) == 1:
-        return domains[0]
     if not constraints:
         raise ValueError("jno.core requires at least one constraint.")
-    if not domains:
-        return None  # no domain Variable -> a parameter-only fit; the caller supplies a trivial domain
+    if info is not None:
+        info["over_solves"] = bool(domains) and not sampled
+    if len(domains) == 1:
+        return domains[0]
+    if len(sampled) == 1:
+        return sampled[0]  # several domains in the graph, but only one is collocated -> unambiguous
+    if not sampled:
+        # Nothing to collocate: either no domain in the graph at all, or the only domains are the
+        # meshes one or more solves are discretized on -- a parameter-only fit (an inverse problem,
+        # an ILT loss). The loss reads no coordinates, so which domain drives the epoch loop is
+        # irrelevant and several solve domains are NOT an ambiguity. Caller uses a trivial domain.
+        return None
     raise ValueError(
-        f"Cannot infer domain: constraints reference {len(domains)} distinct "
-        f"domains ({domains!r}). All constraints must share a single domain."
+        f"Cannot infer domain: constraints collocate on {len(sampled)} distinct "
+        f"domains ({sampled!r}). All constraints must share a single domain."
     )
 
 
@@ -442,12 +484,20 @@ class core:
                 data fitting terms).
 
             domain: Optional domain override.  When omitted (``None``), the
-                domain is auto-discovered by walking ``constraints`` and
-                collecting the unique ``Variable._domain`` reference.  Pass
-                ``domain=`` explicitly when the constraint tree contains no
-                standard ``Variable`` nodes — e.g. FEM/VPINN weak-form
-                assemblies or pure-parametric inverse losses built from
-                ``jno.domain.from_array``.
+                domain is auto-discovered by walking ``constraints`` for the
+                unique ``Variable`` / ``TensorTag`` the loss collocates on.
+
+                A **parameter-only fit** needs no domain of its own: an inverse
+                loss like ``(fem.solve() - u_obs).mse`` reads no collocation
+                coordinate (its Variables live inside the solve, consumed by the
+                assembler), so it is inferred automatically — including when the
+                loss spans several solves on *different* meshes.  Passing a
+                placeholder ``jno.domain.from_array({"_": np.zeros((1, 1))})``
+                is no longer necessary; it remains accepted and equivalent.
+
+                Pass ``domain=`` explicitly only to override the choice — e.g.
+                to collocate on a sensor point-cloud rather than the PDE mesh,
+                or when the loss genuinely samples two domains (which raises).
 
             mesh: Shape of the device mesh for hybrid parallelism as a tuple (batch, model).
                 Controls how computation is distributed across multiple GPUs/TPUs.
@@ -497,6 +547,7 @@ class core:
             self._dd_subdomains, self._dd_interfaces = _detected
             self.domain = self._dd_subdomains[0].domain
             self.models = {}
+            self._module_refs = {}
             return
 
         # An empty-constraint core is eval-only (no training); its domain is
@@ -507,13 +558,17 @@ class core:
         if domain is not None:
             self.domain = domain
         elif constraints:
-            self.domain = _infer_domain_from_constraints(constraints)
+            _info: Dict[str, Any] = {}
+            self.domain = _infer_domain_from_constraints(constraints, _info)
             if self.domain is None:  # no domain Variable -> a parameter-only fit (e.g. an ILT/data-fit loss)
-                self.log.warning(
-                    "No domain Variable found in the constraints — treating this as a parameter-only fit and "
-                    "using a trivial domain. If the loss was meant to sample a domain, ensure it references a "
-                    "Variable or pass domain= explicitly."
-                )
+                # A fit whose only domains are solve meshes is unambiguous and intentional -- do not
+                # warn there, or the warning fires on every correct inverse problem.
+                if not _info.get("over_solves"):
+                    self.log.warning(
+                        "No domain Variable found in the constraints — treating this as a parameter-only fit "
+                        "and using a trivial domain. If the loss was meant to sample a domain, ensure it "
+                        "references a Variable or pass domain= explicitly."
+                    )
                 self.domain = _trivial_domain()
         else:
             self.domain = None
@@ -531,6 +586,9 @@ class core:
         super().__init__()
 
         self._total_epochs = 0
+        # optax states from the last solve(). A second solve() CONTINUES the first, so these are
+        # carried over rather than re-initialised -- see the note where they are used.
+        self._opt_states: Optional[Dict[str, Any]] = None
         seed = int(get_seed())
         self.seed = seed
         self.rng = jax.random.PRNGKey(seed)
@@ -1756,9 +1814,19 @@ class core:
 
             # === Apply sharding to model arrays ===
             self.models = self._shard_params(self.models)
+
+            # The core keeps its OWN copy of every model from here on: `self.models` is what
+            # training updates and what eval reads, and `_shard_params` already returns fresh
+            # trees, so the objects hanging off the expression (`param.model.module`) are no
+            # longer the ones being evaluated. Remember which module object each layer carried
+            # when the core last read it -- `solve()` refreshes this at its write-back -- so a
+            # swap the core has NOT seen can be caught instead of silently ignored (see
+            # `_check_modules_unchanged`).
+            self._module_refs = {lid: layer.module for lid, layer in self._collect_flax_modules().items()}
         else:
             self.domain_data = None
             self.models = {}
+            self._module_refs = {}
 
         # === Compile constraints and trackers ===
         self.compiled_trackers = []
@@ -2835,6 +2903,21 @@ class core:
                 state = jno_bayesian.init_state(bayesian_handles[k], trainable[lid], _bay_init_key)
             else:
                 state = per_model_opts[k].init(trainable[lid])
+                # A second solve() CONTINUES the first. optax carries its own step count inside
+                # this state, so re-initialising it silently restarts every optax SCHEDULE --
+                # warmup, decay, join_schedules -- and a training loop that calls solve() in
+                # chunks (to checkpoint, to diagnose, to move a curriculum on) never leaves the
+                # first few steps of its schedule. Nothing warns; the run simply trains at the
+                # wrong rate. jNO's own LearningRateSchedule is already immune, because it reads
+                # the persistent ``self._total_epochs`` (see ``base_epoch``).
+                #
+                # Reuse is conditional on the freshly built state having the same tree, shapes and
+                # dtypes, which is exactly the condition for it to be the same optimizer over the
+                # same parameters; change either and the fresh state is used. To ask for a genuine
+                # restart, build a new ``jno.core`` -- states live on the instance.
+                _prev = (self._opt_states or {}).get(k)
+                if _prev is not None and _optimizer_states_match(_prev, state):
+                    state = _prev
             # Copy every array leaf so that aliased buffers (e.g. from
             # L-BFGS zero-initialised history arrays that share the same
             # underlying allocation) become distinct.  Without this,
@@ -3160,20 +3243,19 @@ class core:
                 _single = step_fn
 
                 def step_fn(trainable, opt_states, rng, context, start_epoch, prev_losses):
-                    def body(i, carry):
-                        tr, opt, rn, ep, _total, _indv = carry
-                        tr, opt, rn, ep_next, total, indv = _single(tr, opt, rn, context, ep, _indv)
-                        return tr, opt, rn, ep_next, total, indv
+                    # The first step runs OUTSIDE the loop, and that is not an optimisation -- it is
+                    # how the carry gets its structure. `_single` returns SEVEN values, the last being
+                    # `bayesian_info`, a dict whose pytree cannot be built blind here. Unpacking six
+                    # (as this did) made `inner_steps > 1` raise "too many values to unpack (expected
+                    # 6)" on every call, so the argument could not run at all; seeding the carry from
+                    # a real step keeps it correct whatever that dict contains.
+                    carry = _single(trainable, opt_states, rng, context, start_epoch, prev_losses)
 
-                    init = (
-                        trainable,
-                        opt_states,
-                        rng,
-                        start_epoch,
-                        jnp.zeros(()),
-                        prev_losses,
-                    )
-                    return jax.lax.fori_loop(0, _K, body, init)
+                    def body(_i, c):
+                        tr, opt, rn, ep, _total, indv, _bayesian = c
+                        return _single(tr, opt, rn, context, ep, indv)
+
+                    return jax.lax.fori_loop(0, _K - 1, body, carry)  # _K >= 2 in this branch
 
         # ── 7b. Build gradient accumulation functions (if needed) ──
         _use_accumulation = accumulation_steps > 1
@@ -4049,12 +4131,24 @@ class core:
                             if normal_tag in full_context and candidates_pts is not None and candidates_nrms is not None:
                                 cand_pts_j = jnp.array(candidates_pts)  # (N_pool, D)
                                 cand_nrm_j = jnp.array(candidates_nrms)  # (N_pool, D)
+                                prev_nrm_bn = jnp.array(full_context[normal_tag])[:, 0]  # (B, N, D)
                                 new_nrm_batches = []
                                 for b in range(n_batch):
-                                    # Each new point is an exact row from the pool → argmin recovers its index.
-                                    diffs = new_points_bn[b, :, None, :] - cand_pts_j[None, :, :]
+                                    # A strategy returns a MIX: points freshly drawn from the pool, and
+                                    # points RETAINED from the previous set. Look both up together, so every
+                                    # returned point has an exact match and keeps its own normal.
+                                    #
+                                    # Searching the pool alone is only correct when the pool is frozen (a
+                                    # meshed domain, where the retained points are nodes and so are in it).
+                                    # A mesh-free domain redraws the pool every event, so a retained point is
+                                    # in it only by accident and would snap to whichever pool point is
+                                    # nearest -- measured 3e-3 on a circular hole, and a full 90° across an
+                                    # edge of a box, where the nearest sample sits on the adjoining face.
+                                    ref_pts = jnp.concatenate([points_bn[b], cand_pts_j], axis=0)
+                                    ref_nrm = jnp.concatenate([prev_nrm_bn[b], cand_nrm_j], axis=0)
+                                    diffs = new_points_bn[b, :, None, :] - ref_pts[None, :, :]
                                     nearest = jnp.argmin(jnp.sum(diffs**2, axis=-1), axis=-1)
-                                    new_nrm_batches.append(cand_nrm_j[nearest])
+                                    new_nrm_batches.append(ref_nrm[nearest])
                                 new_nrms_bn = jnp.stack(new_nrm_batches, axis=0)  # (B, N, D)
                                 full_context[normal_tag] = jnp.tile(new_nrms_bn[:, None, :, :], (1, T, 1, 1))
                                 self.domain.context[normal_tag] = np.asarray(full_context[normal_tag])
@@ -4503,6 +4597,9 @@ class core:
             # Update every Model to point at the trained model.
             for lid, fm in flax_mods.items():
                 fm.module = trained_models[lid]
+            # ...and that sync IS the core reading the module again, so it is not a swap behind
+            # the core's back -- record it, or every eval after a solve would be refused.
+            self._module_refs.update({lid: fm.module for lid, fm in flax_mods.items()})
 
             # ── 9c. Flush Bayesian sample buffers (Pattern D + E aware) ──
             #
@@ -4676,6 +4773,8 @@ class core:
                 wandb_log_model(self)
 
         self._total_epochs += epochs
+        # Hand the optimizer states to the next solve() so schedules continue across the call.
+        self._opt_states = opt_states
 
         # --- callbacks: on_training_end ---
         if callbacks:
@@ -4744,6 +4843,41 @@ class core:
     def _unwrapped_models(self):
         """Models with all paramax wrappers resolved — safe for inference / shape queries."""
         return _paramax.unwrap(self.models)
+
+    def _check_modules_unchanged(self):
+        """Refuse to evaluate against a module that was replaced after this core last read it.
+
+        ``jno.core(...)`` reads ``layer.module`` once, through ``build_single_layer_params``, and
+        keeps its own copy — ``solve()`` writes that copy and syncs it back onto the module, so
+        the two agree until someone swaps the module themselves. The eager idiom
+
+            g.model.module = eqx.tree_at(lambda m: m.value, g.model.module, jnp.asarray(vals))
+
+        is such a swap. A bare ``jno.fem([...]).solve()`` honours it, because it reads the module
+        at solve time; a core does not, and the sweep it is meant to drive read the same number at
+        every value.
+
+        Reading the module live *here* is not the fix, because it would only patch ``eval``:
+        ``self.models`` — what training starts from and what every other read uses — would still
+        hold the old value, so eval and solve would disagree about the same parameter. It would
+        also skip the build the module goes through on the way in (pretrained weights, a callable
+        initializer, an ``_initialize_mask``, a dtype cast, sharding)."""
+        stale = []
+        refs = getattr(self, "_module_refs", {})
+        for lid, layer in self._collect_flax_modules().items():
+            if lid not in refs:
+                continue
+            if layer.module is not refs[lid]:
+                stale.append(getattr(layer, "name", None) or f"layer {lid}")
+        if not stale:
+            return
+        raise RuntimeError(
+            f"crux.eval: {', '.join(map(str, stale))} was given a new module after this core was built, "
+            "and the core evaluates its own copy — the new value would be ignored and you would read the "
+            "value at construction. Set the value BEFORE `jno.core(...)` (build one core per value to "
+            "sweep), or drive the sweep through the eager `jno.fem([...]).solve()` / `jno.fdm([...]).solve()` "
+            "path, which reads the module at solve time."
+        )
 
     def _log_constraint_shapes(self, batchsize, min_consecutive: Optional[int] = 1):
         """Log the output shape of each constraint by doing a test evaluation.
@@ -5135,6 +5269,8 @@ class core:
 
         if samples not in ("auto", "chain", "point"):
             raise ValueError(f"crux.eval(samples=...) expects 'auto' | 'chain' | 'point', got {samples!r}.")
+
+        self._check_modules_unchanged()
 
         domain_data = self.domain_data if domain is None else self.prepare_domain_data(domain)
         _models = eqx.tree_inference(self._unwrapped_models)

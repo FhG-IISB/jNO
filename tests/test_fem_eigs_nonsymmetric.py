@@ -34,9 +34,27 @@ def _nonsym(n, seed=0):
     return A
 
 
-def _dense_nearest(A, sigma, k):
-    lam = np.linalg.eigvals(A)
-    return np.sort_complex(lam[np.argsort(np.abs(lam - sigma))[:k]])
+def _assert_is_the_k_nearest(got, spectrum, sigma, k, *, rtol, atol):
+    """Assert ``got`` is the k eigenvalues nearest ``sigma`` -- without asking a tie to break one way.
+
+    A REAL shift is exactly equidistant from both members of a conjugate pair, so when a pair straddles
+    the k-th place "the k nearest" has two equally correct answers and which one comes back is up to the
+    LAPACK/Arnoldi build. That is not a property of the solver under test. It bites here: for the k=4,
+    sigma=10 case below the 4th and 5th distances are 0.585741862153150 and 0.585741862153150 -- equal to
+    the last bit, being 9.4764172570573 -/+ 0.2625921559590811j. Comparing signed values therefore failed
+    intermittently on CI (and in the nightly on main) while passing locally, on a spectrum that was right.
+
+    What is well defined, and asserted instead: the multiset of DISTANCES is the k smallest; every value
+    returned is genuinely in the spectrum, not merely at the right radius; and no value is returned twice
+    (which distances alone would not catch, since the tied pair makes a repeat look plausible)."""
+    got = np.asarray(got)
+    spectrum = np.asarray(spectrum)
+    np.testing.assert_allclose(np.sort(np.abs(got - sigma)), np.sort(np.abs(spectrum - sigma))[:k], rtol=rtol, atol=atol)
+    for z in got:
+        near = np.min(np.abs(spectrum - z))
+        assert near <= atol + rtol * abs(z), f"{z} sits at a correct distance from {sigma} but is not in the spectrum"
+    gap = np.abs(got[:, None] - got[None, :]) + np.eye(len(got))
+    assert gap.min() > atol, "the same eigenvalue was returned more than once"
 
 
 # ---------------------------------------------------------------------------------
@@ -72,7 +90,7 @@ def test_interior_eigenvalues_match_a_dense_reference_and_are_complex():
     A = _nonsym(n)
     lam, V = jno.solve.eigs(k=4, sigma=10.0)(jnp.asarray(A))
     got = np.sort_complex(np.asarray(lam))
-    np.testing.assert_allclose(got, _dense_nearest(A, 10.0, 4), rtol=1e-8, atol=1e-9)
+    _assert_is_the_k_nearest(got, np.linalg.eigvals(A), 10.0, 4, rtol=1e-8, atol=1e-9)
     assert np.any(np.abs(got.imag) > 1e-6), "spectrum came back real; the surrogate would too"
     resid = np.max(np.abs(A @ np.asarray(V) - np.asarray(V) * np.asarray(lam)[None, :]))
     assert resid < 1e-10
@@ -111,15 +129,13 @@ def test_generalized_pencil_against_a_dense_reference():
     A = _nonsym(n, seed=7)
     M = np.diag(np.linspace(1.0, 2.0, n))
     lam = np.asarray(nonsymmetric_geneigh(jnp.asarray(A), jnp.asarray(M), 3, 9.0)[0])
-    ref = sla.eig(A, M)[0]
-    ref = np.sort_complex(ref[np.argsort(np.abs(ref - 9.0))[:3]])
-    np.testing.assert_allclose(np.sort_complex(lam), ref, rtol=1e-7, atol=1e-8)
+    _assert_is_the_k_nearest(lam, sla.eig(A, M)[0], 9.0, 3, rtol=1e-7, atol=1e-8)
 
 
 def test_small_pencil_takes_the_exact_dense_path():
     A = _nonsym(12, seed=9)
     lam = np.asarray(jno.solve.eigs(k=3, sigma=5.0)(jnp.asarray(A))[0])
-    np.testing.assert_allclose(np.sort_complex(lam), _dense_nearest(A, 5.0, 3), rtol=1e-10, atol=1e-12)
+    _assert_is_the_k_nearest(lam, np.linalg.eigvals(A), 5.0, 3, rtol=1e-10, atol=1e-12)
 
 
 # ---------------------------------------------------------------------------------

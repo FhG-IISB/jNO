@@ -58,5 +58,5 @@ data.*  Journal of Computational Physics, 425, 109913.
 ## Script
 
 ```python
---8<-- "tutorial_examples/10_bayesian_pinns/01_bayesian_inverse_coefficient.py"
+--8<-- "tutorial_examples/10_bayesian_pinns/01_bayesian_inverse_coefficient.py:code"
 ```

@@ -717,3 +717,75 @@ def build(shape, periodic=None, *, algorithm=None, threads=None, order=1):
         if "periodic" in str(exc).lower() and _has_full_revolve(shape._node):
             return _build_once(shape, split_full=True, periodic=periodic, **opts)
         raise
+
+
+def _boundary_once(shape, split_full, *, algorithm=None, threads=None):
+    """One attempt at a boundary-only mesh -> ``(points (P,3), facets (F,k))``."""
+    import gmsh
+    import numpy as np
+
+    started = not gmsh.isInitialized()
+    if started:
+        gmsh.initialize()
+        gmsh.option.setNumber("General.Terminal", 0)
+    gmsh.option.setNumber("Mesh.Algorithm", MESH_ALGORITHM_2D)
+    gmsh.option.setNumber("Mesh.Algorithm3D", MESH_ALGORITHM_3D)
+    if algorithm is not None:
+        gmsh.option.setNumber("Mesh.Algorithm3D" if shape.dim == 3 else "Mesh.Algorithm", int(algorithm))
+    n_threads = MESH_THREADS if threads is None else int(threads)
+    gmsh.option.setNumber("General.NumThreads", n_threads)
+    gmsh.option.setNumber("Mesh.MaxNumThreads3D", n_threads)
+    gmsh.model.add(f"jno_tess_{next(_MODEL_SEQ)}")
+    try:
+        occ = gmsh.model.occ
+        _emit_node(shape._node, occ, split_full)
+        occ.synchronize()
+        dim = shape.dim
+        labels = classify_boundary(dim, shape)
+        # Same size controls as a full build, so `.size(h)` means the same thing on both paths.
+        _apply_region_sizes(dim, shape) or _apply_size_fields(dim, shape.leaves(), labels, shape)
+        gmsh.model.mesh.generate(dim - 1)
+
+        node_tags, coords, _ = gmsh.model.mesh.getNodes()
+        node_tags = np.asarray(node_tags, dtype=np.int64)
+        pts = np.asarray(coords, dtype=float).reshape(-1, 3)
+        # gmsh tags are 1-based but not necessarily contiguous; map tag -> row.
+        lookup = np.full(int(node_tags.max()) + 1, -1, dtype=np.int64)
+        lookup[node_tags] = np.arange(len(node_tags))
+
+        types, _etags, enodes = gmsh.model.mesh.getElements(dim - 1)
+        per_type = {_LINE: 2, _TRI: 3}
+        blocks = []
+        for etype, nodes in zip(types, enodes):
+            k = per_type.get(int(etype))
+            if k is None:
+                raise NotImplementedError(
+                    f"the boundary mesher returned gmsh element type {int(etype)}, which "
+                    f"jno.Shape.tessellate does not read. It reads 2-node lines and 3-node "
+                    f"triangles -- the straight-sided facets a normal is constant over."
+                )
+            blocks.append(lookup[np.asarray(nodes, dtype=np.int64).reshape(-1, k)])
+        if not blocks:
+            raise RuntimeError(f"the boundary mesher produced no {dim - 1}-D elements for this plan.")
+        return pts, np.concatenate(blocks, axis=0)
+    finally:
+        gmsh.model.remove()
+        if started:
+            gmsh.finalize()
+
+
+def boundary_tessellation(shape, *, algorithm=None, threads=None):
+    """Mesh ONLY the boundary manifold -> ``(points (P,3), facets (F,k))``.
+
+    ``generate(dim - 1)`` stops after the perimeter of a 2-D shape or the surface of a 3-D one, so
+    the volume fill -- the expensive half in 3-D -- never runs. Facets are straight-sided, which is
+    what lets a single normal stand for a whole facet.
+
+    Carries the same full-revolve retry as :func:`build`, for the same reason.
+    """
+    try:
+        return _boundary_once(shape, split_full=False, algorithm=algorithm, threads=threads)
+    except Exception as exc:  # noqa: BLE001 - narrow retry on the periodic-surface mesher failure
+        if "periodic" in str(exc).lower() and _has_full_revolve(shape._node):
+            return _boundary_once(shape, split_full=True, algorithm=algorithm, threads=threads)
+        raise

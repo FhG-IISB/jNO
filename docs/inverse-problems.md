@@ -85,7 +85,7 @@ crux = jno.core([pde.mse, reg.mean])
 ## Inverse problems through a FEM forward (`fem.solve`)
 
 When the forward model is a finite-element solve rather than a neural network, use
-`fem.solve()` as the differentiable forward (see [Finite Element Method](fem.md)). Put a
+`fem.solve()` as the differentiable forward (see [Finite Element Method](fem/index.md)). Put a
 `jno.np.parameter` in the weak form, compare the solve to data, and train through
 `crux.solve` — the gradient flows through the assembled solve to the parameter.
 
@@ -97,6 +97,19 @@ fem = jno.fem([k * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0])
 crux = jno.core([(fem.solve() - u_obs).mse], domain=obs)
 crux.solve(200)                       # recovers k
 ```
+
+`domain=` is optional here. A pure data-misfit loss collocates nothing — its Variables live
+inside the solve, consumed by the assembler — so `jno.core` infers the domain from the graph, and
+`jno.core([(fem.solve() - u_obs).mse])` is enough. This holds even when the loss spans **several
+solves on different meshes**, which is how a coupled forward chain is written:
+
+```python
+crux = jno.core([(litho.solve() - img_obs).mse + (device.solve() - resp_obs).mse])
+```
+
+Pass `domain=` only to *override* the choice — above, `domain=obs` collocates on the sensor
+point-cloud instead of the PDE mesh. A placeholder `jno.domain.from_array({"_": np.zeros((1, 1))})`
+is no longer needed (it stays accepted, and gives bit-identical results).
 
 A **diffusivity field** `k(x)` is `jno.np.parameter(phi)` (one DOF per node); regularize it
 with `k.regularize("h1seminorm" | "l2" | "tv" | "nonneg" | "bounded")` — the same `.regularize()`

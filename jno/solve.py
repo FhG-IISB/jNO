@@ -20,6 +20,7 @@ BiCGStab (steady linear) and Jacobian-free Newton-Krylov (nonlinear).
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any, Optional
 
 import jax
@@ -30,14 +31,15 @@ if TYPE_CHECKING:  # runtime import stays lazy inside remesh()/relocate()
     from .utils.solver.fem_adapt import AdaptSpec
 
 from .utils.solver.solver_api import (
+    ContinuationSpec,
     LinearOperator,
     LinearSolver,
     NonlinearSolver,
     PrecondApplier,
-    _maybe_residual_check,
 )
 
 __all__ = [
+    "continuation",
     "LinearOperator",
     "LinearSolver",
     "NonlinearSolver",
@@ -153,7 +155,19 @@ def lu(*, backend: str = "device", host: bool | None = None) -> LinearSolver:
         if op.bcoo is not None:
             return solve(op.bcoo, b)
         # a dense operator gets the dense direct solve — BCOO.fromdense would need a concrete
-        # nse, which does not exist under jit/vmap tracing
+        # nse, which does not exist under jit/vmap tracing. SAY SO when that silently drops a
+        # backend the caller asked for by name: the answer is the same, but `backend="pardiso"`
+        # is chosen for speed, and getting LAPACK instead without a word is the kind of silent
+        # substitution that makes a benchmark meaningless. (The sparse path above raises a clear
+        # ImportError when the backend's stack is absent; this branch never reaches it.)
+        if backend not in ("device", "host"):
+            logging.getLogger("jno").info(
+                "jno.solve.lu(backend=%r): the operator is dense, so the backend is not used — a dense "
+                "operator cannot be handed to a sparse factorization without a concrete nse. Falling back "
+                "to jnp.linalg.solve (same answer, LAPACK not %s).",
+                backend,
+                backend,
+            )
         return jnp.linalg.solve(op.dense(), b)
 
     # No `key`, so the composer leaves this on the eager path. What compiling the composed solve buys
@@ -190,10 +204,16 @@ def dense() -> LinearSolver:
 
 
 def _krylov(name: str, tol: float, atol: float, maxiter: Optional[int], **fixed):
+    # Routed through `_firewalled` for the same reason the raw solvers are: `jax.scipy.sparse.linalg`
+    # wraps itself in `custom_linear_solve`, so its transpose solve is JAX's -- out of reach, and
+    # unchecked. Taking the firewall ourselves makes the adjoint an explicit call we can gate, and
+    # lets a non-symmetric preconditioner be transposed for it (see `_firewalled`). The extra
+    # `custom_linear_solve` costs nothing: the outer one intercepts differentiation, so the inner is
+    # never transposed.
     def _fn(op: LinearOperator, b, *, M, x0):
         method = getattr(jax.scipy.sparse.linalg, name)
-        x, _info = method(op.mv, b, x0=x0, tol=tol, atol=atol, maxiter=maxiter, M=M, **fixed)
-        return _maybe_residual_check(op, b, x, name)
+        raw = lambda mv, rhs, M, x0: method(mv, rhs, x0=x0, tol=tol, atol=atol, maxiter=maxiter, M=M, **fixed)[0]
+        return _firewalled(raw, op, b, M=M, x0=x0, symmetric=(name == "cg"), name=name)
 
     # `key` must name every argument that changes the iteration -- see LinearSolver. `fixed` is
     # per-method extra configuration (GMRES's restart), so it goes in sorted rather than by position.
@@ -231,7 +251,9 @@ def _firewalled(raw, op: LinearOperator, b, *, M, x0, symmetric: bool, name: str
     on ``A^T`` (on ``A`` itself when ``symmetric``), reusing ``M`` (legitimate: a preconditioner
     only affects convergence speed, never the converged solution).
     """
-    fwd = lambda _mv, rhs: raw(op.mv, rhs, M=M, x0=x0)
+    from .utils.solver.solver_api import residual_gate
+
+    fwd = lambda _mv, rhs: residual_gate(op.mv, rhs, raw(op.mv, rhs, M=M, x0=x0), f"jno.solve.{name}", side="forward")
     if symmetric:
         rev = fwd
     else:
@@ -243,9 +265,14 @@ def _firewalled(raw, op: LinearOperator, b, *, M, x0, symmetric: bool, name: str
         # step). jno.precond appliers carry a structural transpose (PrecondApplier.T); a bare
         # callable preconditioner has none, so we fall back to reusing M (correct, maybe slow).
         M_T = M.T if isinstance(M, PrecondApplier) else M
-        rev = lambda _mv, rhs: raw(op.T.mv, rhs, M=M_T, x0=None)
-    x = jax.lax.custom_linear_solve(op.mv, b, fwd, transpose_solve=rev, symmetric=symmetric)
-    return _maybe_residual_check(op, b, x, name)
+        # The adjoint every gradient flows through, and until now the one solve here with no
+        # convergence check of any kind: the check this replaced saw only the forward `x`, and was a
+        # no-op under tracers besides. A Krylov iteration that leaves on its step cap returns its last
+        # iterate silently, so a broken adjoint arrived as a perfectly plausible gradient.
+        rev = lambda _mv, rhs: residual_gate(
+            op.T.mv, rhs, raw(op.T.mv, rhs, M=M_T, x0=None), f"jno.solve.{name}", side="transpose"
+        )
+    return jax.lax.custom_linear_solve(op.mv, b, fwd, transpose_solve=rev, symmetric=symmetric)
 
 
 def fgmres(*, tol: float = 1e-8, restart: int = 30, maxiter: int = 1000) -> LinearSolver:
@@ -557,6 +584,37 @@ def picard(
     )
 
 
+def continuation(keep: str = "last", **params: Any) -> ContinuationSpec:
+    """**Parameter continuation** for ``fem.solve(continuation=...)``: march runtime parameters across
+    a value sequence, warm-starting each solve from the previous one::
+
+        cap = jno.np.parameter((1,), name="cap")
+        fem = jno.fem([... cap ...])                      # built ONCE
+        u = fem.solve(continuation=jno.solve.continuation(cap=np.geomspace(G / 2000, G, 8)))
+
+    One driver, three names for one mechanism: a **frequency or material sweep** in EM, **load
+    stepping** in mechanics, **homotopy** in numerics -- reaching a parameter value the cold solve
+    cannot. Sequences given together are marched **zipped**, not as a grid, so two coefficients can
+    ramp in step.
+
+    ``keep="last"`` returns the final solution (homotopy); ``keep="all"`` returns the whole family,
+    ``(n_values, n_dofs)`` -- a sweep.
+
+    **Why this instead of a Python loop that rebuilds the form.** The form is traced and compiled once
+    and the parameter arrives as a runtime argument, so an 8-step ramp is 8 solves, not 8 rebuilds
+    and 8 XLA compilations. That is the difference between a continuation being a tool and being the
+    dominant cost of a run.
+
+    Fixed (unswept) parameter values are passed as ordinary keywords to ``fem.solve`` alongside this
+    spec; naming one in both places raises rather than silently picking a winner.
+
+    Scope, refused by name elsewhere: **steady** problems (linear or nonlinear), real or
+    fused-complex. A transient sweep is a plain loop over ``fem.solve()`` -- there is no warm start to
+    carry between independent trajectories, so this driver would add nothing.
+    """
+    return ContinuationSpec(params=dict(params), keep=keep)
+
+
 def staggered(
     fields,
     *,
@@ -860,7 +918,9 @@ def trace(A, *, fun=None, samples: int = 32, order: int = 25, key=None):
 
 def applyfun(A, v, *, fun, order: int = 30, symmetric: bool = True):
     """Matrix-free ``f(A)·v`` — e.g. one exact exponential-integrator step ``exp(-dt·A)·v`` with
-    ``fun=lambda z: jnp.exp(-dt*z)``. ``symmetric=True`` (default, Lanczos) assumes ``A = Aᵀ``;
+    ``fun=lambda z: jnp.exp(-dt*z)``. ``order`` **bounds** the Krylov dimension rather than fixing it:
+    the iteration stops at the order that has actually converged, so raising it can only help (unlike
+    the stochastic estimators above, where ``order`` is a real request). ``symmetric=True`` (default, Lanczos) assumes ``A = Aᵀ``;
     ``symmetric=False`` (Arnoldi + an eigendecomposition of the Hessenberg with an analytic Daleckii–Krein
     derivative) handles a **non-symmetric** ``A`` (advection–diffusion). Both are **differentiable and
     GPU-capable** — the non-symmetric path for any **holomorphic** ``fun`` on a **diagonalizable** ``A``.
@@ -941,6 +1001,28 @@ def remesh(
 
     Second derivatives in a criterion (a Löhner-style ``|D2u|/|Du|`` detector) need ``order >= 2``:
     a P1 Hessian is identically zero, so at order 1 such a criterion evaluates to nothing.
+
+    **A criterion may instead be a per-CELL geometry quantity** -- ``d.cell_aspect()``,
+    ``d.cell_volume()``, or anything built from them. It carries no trial or test function, which is
+    how it is told apart, and it is evaluated rather than assembled. It must be one value per cell;
+    reduce a multi-component one yourself (``jno.np.min(d.cell_angles(), axis=1)``).
+
+    **A criterion may be a CONDITION rather than a ranking** -- ``jno.le(expr, bound)`` /
+    ``jno.ge(...)``. Then its signed margin marks every cell that breaks it (not a ``theta`` fraction,
+    and ``theta`` is refused), and the march stops when none does. This is what lets a mesh condition
+    be its own trigger, with no cadence or threshold argument::
+
+        remesh(criterion=lambda d: jno.le(d.cell_aspect(), 2.0))   # keep every element decent
+
+    Measured on a deliberately stretched mesh: worst aspect 2.87 -> 1.57 in one round, 0 marked on the
+    next. Set a bound the mesher can reach -- an unstructured 2-D mesh bottoms out near 1.2-1.5, and a
+    tighter bound never settles. A bare comparison (``q > 2.0``) is refused: it says which cells are
+    bad but not by how much, so marking would take a fraction of them and leave the rest.
+
+    **Pass a callable** (``criterion=lambda d: ...``) for a geometry criterion. A geometry node
+    captures the cell table when it is constructed, so a single node keeps answering for the mesh it
+    was built on; once refinement changes the topology it is refused by name rather than read as a
+    shape mistake.
 
     On a **steady** problem this is the refine loop — solve, estimate (Zienkiewicz–Zhu), mark
     (Dörfler ``theta``), refine by ``refine_factor``, repeat up to ``max_iters`` — growing the mesh
@@ -1063,7 +1145,7 @@ def refine(
 
 def relocate(
     *,
-    objective: str = "equidistribution",
+    objective: Any = "equidistribution",
     method: str = "descent",
     max_iters: int = 8,
     lr: float = 3e-3,
@@ -1094,6 +1176,32 @@ def relocate(
       ``E_h - E_exact = 1/2 ||u - u_h||_E^2``, so on a steady problem the energy *is* the error norm and
       descending it minimises the error directly.
     - ``"huang"`` is Huang's equidistribution–alignment functional (see :class:`AdaptSpec`).
+
+    **Or a weak-form expression**, when the mesh has a job the three functionals cannot state. They are
+    mesh-*quality* measures: they see the solution only through a monitor, so they can ask for
+    resolution but not for a physical condition. An expression is assembled exactly as ``criterion=``
+    is and summed to a scalar, over a **volume or a boundary** region::
+
+        xs, ys, ns = domain.variable("side", normals=True, split=True)
+        ys.trainable()                                   # the wall may move along y only
+        us = u.bind(x=xs, y=ys)
+        fem.solve(adapt=jno.solve.relocate(objective=jno.np.inner(us, ns) ** 2))
+
+    That is a **free surface**: the wall is moved until the flow through it vanishes. The facet normals
+    are rebuilt from the moving vertices, so ``n`` is the current mesh's normal, not the initial one.
+    The gradient runs through the solve, as it does for the strings — matched to central differences at
+    7.5e-09 on a Stokes channel whose no-slip bottom couples the flow to the wall's position, where the
+    through-flow falls 11.4x over 60 rounds (12.5x at 120: this is a descent, not a root-find).
+
+    Two things to know. The objective is a **scalar**, so it needs a scalar test function: on a
+    velocity/pressure saddle the pressure test is picked automatically. And when the expression reaches
+    its region only through a **bound view** (``u.bind(x=xr, y=yr)``, which absorbs its coordinates),
+    the test function cannot be auto-bound — carry it yourself, ``objective=<expr> * v_r[0]``. That
+    case raises with this instruction rather than a trace-level binding error.
+
+    The region's facet quadrature tables are built only when the **form** carries a surface term, so a
+    surface objective needs the boundary term to be in the ``jno.fem([...])`` list (a traction-free
+    wall, ``0.0 * v_r[0]``, is enough).
 
     Neither dominates, measured on the two problem types the test suite pins:
 

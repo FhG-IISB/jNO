@@ -230,11 +230,68 @@ def bicgstab(matvec, b, *, tol=1e-10, maxit=2000):
     return x
 
 
-def _linsolve(matvec, b, *, tol, maxit):
+def _gated(solve, who: str, side: str):
+    """Wrap a ``(mv, rhs) -> x`` solve so its result is residual-checked before it is returned.
+
+    ``custom_linear_solve`` calls ``solve`` with ``A`` and ``transpose_solve`` with ``A^T``, so
+    wrapping the two SEPARATELY (rather than counting calls on one shared wrapper) is what makes the
+    side label exact -- the same routine serves both, and a Newton march calls the forward one many
+    times. The transpose is the case that matters: nothing checked it before, BiCGStab can break down
+    on ``A^T`` while converging on ``A`` -- measured 5.5e+26 against 2.9e-05 on one 2-D Poisson
+    operator -- and the last iterate then came back as a perfectly plausible gradient."""
+    from .solver_api import residual_gate
+
+    return lambda mv, rhs: residual_gate(mv, rhs, solve(mv, rhs), who, side=side)
+
+
+def _gated_direct(J, rhs, solve, who: str, side: str):
+    """:func:`_gated` for an ASSEMBLED tangent: check ``J x = rhs`` with the matrix in hand."""
+    from .solver_api import residual_gate
+
+    return residual_gate(lambda v: J @ v, rhs, solve(J, rhs), who, side=side)
+
+
+def _linsolve(matvec, b, *, tol, maxit, gate_forward=True):
     """Transposable black-box linear solve: BiCGStab forward, BiCGStab on ``J^T`` for the
-    reverse rule (via ``custom_linear_solve``) -- so it never differentiates the loop."""
+    reverse rule (via ``custom_linear_solve``) -- so it never differentiates the loop.
+
+    ``gate_forward=False`` for the solve that produces a NEWTON STEP: see :func:`_step_and_tangent`.
+    The transpose is gated either way -- it is only ever a gradient."""
     solve = lambda mv, rhs: bicgstab(mv, rhs, tol=tol, maxit=maxit)
-    return jax.lax.custom_linear_solve(matvec, b, solve, transpose_solve=solve)
+    who = "the newton_krylov inner BiCGStab"
+    fwd = _gated(solve, who, "forward") if gate_forward else solve
+    return jax.lax.custom_linear_solve(matvec, b, fwd, transpose_solve=_gated(solve, who, "transpose"))
+
+
+def _step_and_tangent(linear_solve, who, *, tol, maxit):
+    """Build the two inner solves a Newton driver needs, which differ only in whether the FORWARD
+    residual is gated.  Returns ``(step, tangent)``.
+
+    One solver serves two call sites with two different contracts, and gating both was wrong:
+
+    * as a **Newton step** it is inexact *by design*.  That is what inexact Newton IS (Dembo,
+      Eisenstat & Steihaug 1982): the inner solve is truncated on purpose and only has to produce a
+      descent-ish direction, because the contract is on the OUTER residual, which
+      ``_convergence_check`` already enforces at the end of the drive.  Gating it at ``1e-4`` refused
+      solves that were converging perfectly well -- measured 1.2e-04 and 1.5e-04 against the gate on
+      problems whose outer Newton then hit its 1e-08 tolerance.  It also misattributed: a diverged
+      iterate makes the OPERATOR non-finite, so the gate blamed a user ``linear_solve`` that was an
+      exact 1x1 divide and advised a preconditioner for a problem that needed a line search.
+    * as ``custom_root``'s **tangent/adjoint** it IS the gradient, with nothing downstream to catch
+      it.  That is the hole this firewall exists to close, and it stays closed on both sides.
+
+    This is the same distinction :func:`~jno.utils.solver.solver_api.gate_suspended` already draws for
+    a preconditioner application -- a property of the CALL, not of the solver."""
+    if linear_solve is None:
+        return (
+            lambda mv, rhs: _linsolve(mv, rhs, tol=tol, maxit=maxit, gate_forward=False),
+            lambda mv, rhs: _linsolve(mv, rhs, tol=tol, maxit=maxit, gate_forward=True),
+        )
+    rev = _gated(linear_solve, who, "transpose")
+    step = lambda mv, rhs: jax.lax.custom_linear_solve(mv, rhs, linear_solve, transpose_solve=rev)
+    fwd = _gated(linear_solve, who, "forward")
+    tangent = lambda mv, rhs: jax.lax.custom_linear_solve(mv, rhs, fwd, transpose_solve=rev)
+    return step, tangent
 
 
 def newton_krylov(
@@ -287,11 +344,9 @@ def newton_krylov(
     # solve that runs the *same* solver on ``A^T`` (custom_linear_solve hands ``transpose_solve`` the
     # transposed matvec). This makes the adjoint well-defined for every inner solver, not just the
     # default -- the fix is at the single point where transposability is actually required.
-    if linear_solve is None:
-        inner = lambda mv, rhs: _linsolve(mv, rhs, tol=inner_tol, maxit=inner_maxit)
-    else:
-        _slot = linear_solve
-        inner = lambda mv, rhs: jax.lax.custom_linear_solve(mv, rhs, _slot, transpose_solve=_slot)
+    inner_step, inner_tangent = _step_and_tangent(
+        linear_solve, "the newton_krylov inner linear_solve slot", tol=inner_tol, maxit=inner_maxit
+    )
 
     def _backtrack(f, u, delta, rn):
         """First ``alpha`` in ``damping * 0.5^i`` meeting residual-norm Armijo; else the last (tiny)."""
@@ -307,7 +362,7 @@ def newton_krylov(
         def body(state):
             u, _r, k = state
             ru, jvp = jax.linearize(f, u)  # ru = f(u); jvp(v) = J @ v, reused across inner iters
-            delta = inner(jvp, -ru)
+            delta = inner_step(jvp, -ru)
             alpha = _backtrack(f, u, delta, jnp.linalg.norm(ru)) if line_search else damping
             u = u + alpha * delta
             return u, f(u), k + 1
@@ -315,7 +370,7 @@ def newton_krylov(
         u, _r, _k = jax.lax.while_loop(cond, body, (x0, f(x0), 0))
         return u
 
-    tangent_solve = lambda g, y: inner(g, y)
+    tangent_solve = lambda g, y: inner_tangent(g, y)
     root = jax.lax.custom_root(f0, u0, solve, tangent_solve)
     # Checked OUTSIDE custom_root: everything inside `solve` is traced, so an in-loop guard could
     # never concretise. Here `root` is concrete whenever the caller was eager, which is exactly when
@@ -396,8 +451,11 @@ def newton_direct(
 
     def _tangent(g, y):  # solve J_root x = y (and Jᵀ on the reverse pass) DIRECTLY at the converged root
         J = jacobian_fn(root)
-        fwd = lambda _mv, rhs: linear_solve(J, rhs)  # noqa: E731
-        tsp = lambda _mv, rhs: linear_solve(J.T, rhs)  # noqa: E731
+        # Gated on both sides like the Krylov tangents: a direct solve fails differently (a singular
+        # or near-singular tangent, not a step cap) but fails just as quietly, and the transpose is
+        # the half no caller ever inspects.
+        fwd = lambda _mv, rhs: _gated_direct(J, rhs, linear_solve, "the newton_direct tangent", "forward")  # noqa: E731
+        tsp = lambda _mv, rhs: _gated_direct(J.T, rhs, linear_solve, "the newton_direct tangent", "transpose")  # noqa: E731
         return jax.lax.custom_linear_solve(g, y, fwd, transpose_solve=tsp)
 
     return jax.lax.custom_root(f0, root, lambda _f, _x0: root, _tangent)
@@ -540,12 +598,11 @@ def staggered_newton(
         # problem's DOF layout), so this is a host-side set operation, not a traced one.
         _all = np.arange(n_dofs)
         comps = [jnp.asarray(np.setdiff1d(_all, np.asarray(b)), dtype=jnp.int32) for b in blocks]
-        inner = None
-    elif linear_solve is None:
-        inner = lambda mv, rhs: _linsolve(mv, rhs, tol=inner_tol, maxit=inner_maxit)  # noqa: E731
+        inner_step = inner_tangent = None
     else:
-        _slot = linear_solve
-        inner = lambda mv, rhs: jax.lax.custom_linear_solve(mv, rhs, _slot, transpose_solve=_slot)  # noqa: E731
+        inner_step, inner_tangent = _step_and_tangent(
+            linear_solve, "the staggered_newton inner linear_solve slot", tol=inner_tol, maxit=inner_maxit
+        )
 
     def _block_step(u_full, b, comp):
         """The sparse-direct Newton step for one block: freeze the complement to the identity, solve."""
@@ -612,7 +669,7 @@ def staggered_newton(
             x, _r, k = state
             if step is None:
                 rx, jvp = jax.linearize(f, x)
-                dx = inner(jvp, -rx)
+                dx = inner_step(jvp, -rx)
             else:
                 rx = f(x)
                 dx = step(x, rx)
@@ -662,12 +719,12 @@ def staggered_newton(
 
         def _tangent(g, y):
             J = jacobian(root_val)
-            fwd = lambda _mv, rhs: _dsolve(J, rhs)  # noqa: E731
-            tsp = lambda _mv, rhs: _dsolve(J.T, rhs)  # noqa: E731
+            fwd = lambda _mv, rhs: _gated_direct(J, rhs, _dsolve, "the staggered_newton tangent", "forward")  # noqa: E731
+            tsp = lambda _mv, rhs: _gated_direct(J.T, rhs, _dsolve, "the staggered_newton tangent", "transpose")  # noqa: E731
             return jax.lax.custom_linear_solve(g, y, fwd, transpose_solve=tsp)
 
         root = jax.lax.custom_root(f0, root_val, lambda _f, _x0: root_val, _tangent)
     else:
-        tangent_solve = lambda g, y: inner(g, y)  # noqa: E731
+        tangent_solve = lambda g, y: inner_tangent(g, y)  # noqa: E731
         root = jax.lax.custom_root(f0, u0, solve, tangent_solve)
     return _convergence_check(f0, u0, root, rtol=rtol, atol=atol, max_steps=max_sweeps, who="staggered")

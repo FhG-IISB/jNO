@@ -33,7 +33,7 @@ def _x64():
 
 
 def _grid(n=16, x1=1.0, y1=1.0):
-    d = jno.domain(jno.Shape.rect(0.0, 0.0, x1, y1, size=min(x1, y1) / n), structured=True)
+    d = jno.Shape.rect(0.0, 0.0, x1, y1, size=min(x1, y1) / n).structured().domain()
     shape, spacing = _uniform_grid_spec(d, d.mesh_connectivity["points"].shape[0])
     P = np.asarray(d.mesh_connectivity["points"])[:, :2]
     return d, shape, spacing, P
@@ -113,7 +113,7 @@ class TestGridConventions:
 class TestRefusals:
     def test_unstructured_domain_raises_and_names_the_fix(self):
         d = jno.domain(jno.Shape.disk(0.0, 0.0, 1.0, size=0.3))
-        with pytest.raises(ValueError, match="structured=True"):
+        with pytest.raises(ValueError, match=r"structured\(\)"):
             _uniform_grid_spec(d, d.mesh_connectivity["points"].shape[0])
 
     def test_wrong_value_count_raises(self):
@@ -211,7 +211,7 @@ class TestSecondDerivatives:
     def test_three_dimensional_laplacian(self):
         from jno.trace_evaluator import _spectral_second_moments, _uniform_grid_spec
 
-        d = jno.domain(jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=1 / 6), structured=True)
+        d = jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=1 / 6).structured().domain()
         shape, spacing = _uniform_grid_spec(d, d.mesh_connectivity["points"].shape[0])
         P = np.asarray(d.mesh_connectivity["points"])[:, :3]
         u = np.sin(2 * np.pi * P[:, 0]) * np.sin(2 * np.pi * P[:, 1]) * np.sin(2 * np.pi * P[:, 2])
@@ -234,7 +234,7 @@ class TestCosineVariant:
     """
 
     def _line(self, n=32):
-        d = jno.Shape.rect(0, 0, 1, 1, size=1 / n).domain(structured=True)
+        d = jno.Shape.rect(0, 0, 1, 1, size=1 / n).structured().domain()
         shape, spacing = _uniform_grid_spec(d, d.mesh_connectivity["points"].shape[0])
         P = np.asarray(d.mesh_connectivity["points"])[:, :2]
         return shape, spacing, P
@@ -285,7 +285,7 @@ def test_finite_difference_also_reaches_a_stored_field():
     distinction so the docs cannot drift back to the stronger claim.
     """
     _, shape, spacing, P = _grid(n=16)
-    d = jno.Shape.rect(0, 0, 1, 1, size=1 / 16).domain(structured=True)
+    d = jno.Shape.rect(0, 0, 1, 1, size=1 / 16).structured().domain()
     x, y = P[:, 0], P[:, 1]
     u = np.sin(2 * np.pi * x) * np.cos(4 * np.pi * y)
     ux = 2 * np.pi * np.cos(2 * np.pi * x) * np.cos(4 * np.pi * y)

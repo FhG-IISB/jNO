@@ -1,3 +1,4 @@
+# --8<-- [start:code]
 """Deep Ritz / Deep Energy Method: solve a PDE by **minimising an energy functional** with a network.
 
 Where a VPINN (`vpinn_poisson_2d.py`) minimises the *weak residual* test-projected onto the FE basis,
@@ -74,6 +75,8 @@ exact = np.asarray(crux.eval([exact_expr], domain=test_dom)).reshape(-1)
 rel = float(np.linalg.norm(pred - exact) / np.linalg.norm(exact))
 print(f"\nDeep Ritz Poisson 2D: minimised energy functional; dofs={dom.mesh.points.shape[0]}")
 print(f"  trained Deep-Ritz vs analytic x(1-x)y(1-y):  rel-L2 = {rel:.3e}")
+
+# --8<-- [end:code]
 
 # ---- plot the learned field and the error (the actual computed prediction) -----------------
 pts = np.asarray(test_dom.mesh.points)[:, :2]

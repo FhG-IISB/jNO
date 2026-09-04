@@ -658,7 +658,7 @@ class Enclosure:
            With ``axisymmetric=True`` this load is **per full revolution** (W, not W/m): the measure is
            ``2πr ds``. jNO does not weight the FEM forms for you, so the weak form this load is added to
            must carry the same ``2πr`` factor or the two sides differ by exactly that. See the
-           *Axisymmetric* section of ``docs/fem.md``.
+           *Axisymmetric* section of ``docs/fem/geometry.md``.
 
         Given a :class:`PendingElementExpr` (anything built from a symbolic ``field(u)``) this returns
         the ``jno.Coupling`` that closes it over the solution vector, so the whole nonlocal term is an

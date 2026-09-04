@@ -491,12 +491,12 @@ def _infer_fields(expr) -> Tuple[List[Dict[str, Any]], Dict[Any, int]]:
     return fields, dict(seen)
 
 
-def _test_field_index(expr, field_index: Dict[Any, int]) -> Optional[int]:
-    """Index of the single test field in an additive weak term (or ``None``).
+def _test_field_keys(expr) -> set:
+    """The distinct test-field keys an additive weak term mentions.
 
-    Each additive term must contain exactly one test field (it determines the
-    equation/row block); a term with zero or several distinct test fields is
-    ambiguous and the caller errors."""
+    Split out of :func:`_test_field_index` so a caller that has to *report* the ambiguity can say
+    which one it hit -- no test field reads very differently from several, and the fix differs too.
+    """
     keys = set()
 
     def walk(node):
@@ -509,9 +509,43 @@ def _test_field_index(expr, field_index: Dict[Any, int]) -> Optional[int]:
             walk(child)
 
     walk(expr)
+    return keys
+
+
+def _test_field_index(expr, field_index: Dict[Any, int]) -> Optional[int]:
+    """Index of the single test field in an additive weak term (or ``None``).
+
+    Each additive term must contain exactly one test field (it determines the
+    equation/row block); a term with zero or several distinct test fields is
+    ambiguous and the caller errors."""
+    keys = _test_field_keys(expr)
     if len(keys) != 1:
         return None
     return field_index.get(next(iter(keys)))
+
+
+def _is_structural_zero(node) -> bool:
+    """Is this additive sub-term identically zero by construction?
+
+    The builtin ``sum()`` seeds its accumulation with the integer ``0``, so the most natural
+    spelling of a vector source term -- ``sum(f[k] * v[k] for k in range(dim))`` -- reaches the
+    classifier carrying a literal-zero sub-term alongside the real ones. Zero belongs to no
+    equation block and changes no residual, so it is dropped rather than refused; refusing it
+    rejects the spelling users reach for first and blames the absent test function for it.
+
+    Deliberately narrow. Only a **concrete** literal zero counts, or a product with one. A value
+    that is not known at build time (a tracer, a runtime parameter) is never structural even if it
+    happens to be zero during a solve: that is a real term whose coefficient vanishes, and
+    discarding it would drop physics rather than punctuation.
+    """
+    if isinstance(node, Literal):
+        value = node.value
+        if isinstance(value, jax.core.Tracer):
+            return False
+        return bool(np.all(np.asarray(value) == 0))
+    if isinstance(node, BinaryOp) and node.op == "*":
+        return _is_structural_zero(node.left) or _is_structural_zero(node.right)
+    return False
 
 
 def _expand_product_terms(node, sign: float = 1.0):
@@ -1153,7 +1187,7 @@ def _eval_integrand(domain, node, local):
                 f"jno.fem per-tag surface integration: the per-facet mask for tag '{node.tag}' was not "
                 f"threaded into this assembly path. `domain.by_tag` builds a coefficient for a SURFACE "
                 f"term -- one bound to a boundary tag's coordinates. Using it in a volume term, on a "
-                f"non-nodal space, or in 1-D is not supported (see docs/fem.md)."
+                f"non-nodal space, or in 1-D is not supported (see docs/fem/elements.md)."
             )
         return jnp.asarray(tag_masks[node.tag])
 
@@ -3266,6 +3300,159 @@ def prolongation_from_ties(
     }
 
 
+def build_slip_prolongation(n_full: int, node_dofs, coeffs, *, tol: float = 1e-12) -> Dict[str, object]:
+    """Master–slave prolongation ``P`` for homogeneous linear constraints ``C·u_node = 0`` at nodes.
+
+    One row of ``C`` per condition; the canonical case is a slip / no-penetration wall, where the row
+    is the surface normal and ``n·u = 0`` says the material does not cross the boundary. Unlike a
+    Cartesian pin, such a row **couples** a node's components, so it cannot be applied by replacing a
+    single DOF row — but it is still an exact linear relation, so it can be *eliminated*: solve the
+    ``m`` conditions at a node for ``m`` of its components in terms of the remaining ``d - m``, and
+    carry that as a prolongation ``u = P ũ``. The reduced system ``PᵀAP ũ = Pᵀb`` is then solved on the
+    constraint manifold, so the condition holds **exactly** — no penalty parameter, no added unknowns,
+    and the operator keeps whatever definiteness it had (a Lagrange multiplier would not).
+
+    ``node_dofs`` is ``(K, d)``: the global DOF ids of each constrained node's ``d`` components.
+    ``coeffs`` is ``(K, m, d)`` (or ``(K, d)`` for the common single-condition case): the rows of ``C``.
+
+    Which components are eliminated is chosen by **partial pivoting** on ``|C|`` — the largest-magnitude
+    entry pivots — so the eliminated block is the best-conditioned choice available (for a single row
+    this makes ``|C_pivot| >= 1/sqrt(d)``, bounding the amplification by ``sqrt(d)``). A near-singular
+    pivot block means the conditions at that node are numerically parallel, which is a modelling error
+    rather than something to work around, and raises.
+
+    Returns the same dict shape the periodic reduction consumes (``reduce_matrix_periodic`` /
+    ``prolong_periodic`` / ``restrict_state_periodic``), at **DOF level** (``vec = 1``, ``kept_nodes``
+    holding retained DOF ids), so the whole reduce/solve/prolong path is reused unchanged.
+
+    Scope: homogeneous conditions only (``C·u = 0``). A non-homogeneous ``C·u = g`` needs an affine
+    offset ``u = P ũ + u_0``, which this prolongation cannot carry — the caller must reject it.
+    """
+    node_dofs = np.asarray(node_dofs, dtype=np.int64)
+    if node_dofs.ndim != 2:
+        raise ValueError(f"build_slip_prolongation: node_dofs must be (K, d); got {node_dofs.shape}.")
+    K, d = node_dofs.shape
+    # `coeffs` may be a dense (K, d) / (K, m, d) array, or a RAGGED sequence of (m_a, d) blocks — a
+    # node on the edge between two slip surfaces carries two conditions where its neighbours carry one.
+    if isinstance(coeffs, (list, tuple)):
+        blocks_in = [np.atleast_2d(np.asarray(c, dtype=np.float64)) for c in coeffs]
+    else:
+        arr = np.asarray(coeffs, dtype=np.float64)
+        if arr.ndim == 2:  # (K, d) -> one condition per node
+            arr = arr[:, None, :]
+        if arr.ndim != 3 or arr.shape[0] != K:
+            raise ValueError(
+                f"build_slip_prolongation: coeffs must be (K, d), (K, m, d) or a length-K sequence of "
+                f"(m_a, d) blocks; got {arr.shape} against node_dofs {node_dofs.shape}."
+            )
+        blocks_in = [arr[a] for a in range(K)]
+    if len(blocks_in) != K:
+        raise ValueError(f"build_slip_prolongation: {len(blocks_in)} coefficient blocks for {K} nodes.")
+    for a, C in enumerate(blocks_in):
+        if C.shape[1] != d:
+            raise ValueError(f"build_slip_prolongation: condition block {a} has {C.shape[1]} components, expected {d}.")
+
+    rows: List[int] = []
+    cols: List[int] = []
+    data: List[float] = []
+    eliminated: List[int] = []
+    per_node: List[Tuple[np.ndarray, np.ndarray]] = []  # (pivot local ids, reduced coefficient block)
+
+    for a in range(K):
+        C = blocks_in[a].copy()  # (m, d)
+        scale = np.linalg.norm(C, axis=1)
+        if np.any(scale <= tol * max(float(scale.max(initial=0.0)), 1.0)):
+            raise ValueError(
+                f"build_slip_prolongation: a constraint row at node index {a} (DOFs {node_dofs[a].tolist()}) "
+                "is numerically zero. A slip condition needs a non-degenerate direction — a zero row "
+                "usually means the coefficient expression collapsed, or the node has no incident facet "
+                "to take a normal from."
+            )
+        C = C / scale[:, None]
+        m = C.shape[0]
+        if m > d:
+            raise ValueError(
+                f"build_slip_prolongation: {m} conditions on a node with only {d} components "
+                f"(DOFs {node_dofs[a].tolist()}) — the node is over-constrained."
+            )
+        # Gaussian elimination with partial pivoting on the columns: choose which components to eliminate.
+        R = C.copy()
+        pivots: List[int] = []
+        free = list(range(d))
+        for i in range(m):
+            cand = [(abs(R[i, j]), j) for j in free]
+            mag, j = max(cand)
+            if mag <= 1e-8:
+                raise ValueError(
+                    f"build_slip_prolongation: the conditions at the node with DOFs {node_dofs[a].tolist()} "
+                    f"are numerically parallel (pivot {mag:.3e} after eliminating {pivots}). Two slip "
+                    "surfaces meeting at a near-tangent angle cannot both be imposed exactly; tag the "
+                    "shared edge into one region, or impose one of them weakly."
+                )
+            pivots.append(j)
+            free.remove(j)
+            R[i] = R[i] / R[i, j]
+            for i2 in range(m):
+                if i2 != i:
+                    R[i2] = R[i2] - R[i2, j] * R[i]
+        # After full reduction: u_pivot[i] = -sum_j R[i, j] * u_free[j]
+        per_node.append((np.array(pivots, dtype=np.int64), R))
+        eliminated.extend(int(node_dofs[a, j]) for j in pivots)
+
+    if len(set(eliminated)) != len(eliminated):
+        raise ValueError(
+            "build_slip_prolongation: the same DOF was selected for elimination twice — the caller must "
+            "merge all conditions acting on one node into a single coefficient block before calling."
+        )
+    keep_mask = np.ones(n_full, dtype=bool)
+    keep_mask[np.asarray(eliminated, dtype=np.int64)] = False
+    kept = np.flatnonzero(keep_mask)
+    col_of = np.full(n_full, -1, dtype=np.int64)
+    col_of[kept] = np.arange(kept.size, dtype=np.int64)
+
+    rows.extend(kept.tolist())  # retained DOFs pass straight through
+    cols.extend(range(kept.size))
+    data.extend([1.0] * kept.size)
+    for a in range(K):
+        pivots, R = per_node[a]
+        free = [j for j in range(d) if j not in set(pivots.tolist())]
+        for i, p in enumerate(pivots.tolist()):
+            r = int(node_dofs[a, p])
+            for j in free:
+                w = -float(R[i, j])
+                if w == 0.0:
+                    continue
+                c = int(col_of[int(node_dofs[a, j])])
+                if c < 0:  # the free component was itself eliminated: caller merged the node wrongly
+                    raise ValueError(
+                        "build_slip_prolongation: a component referenced as free was also eliminated at "
+                        f"the node with DOFs {node_dofs[a].tolist()}."
+                    )
+                rows.append(r)
+                cols.append(c)
+                data.append(w)
+
+    P = jsparse.BCOO(
+        (
+            jnp.asarray(np.asarray(data, dtype=np.float64)),
+            jnp.asarray(np.stack([np.asarray(rows, np.int64), np.asarray(cols, np.int64)], axis=1)),
+        ),
+        shape=(int(n_full), int(kept.size)),
+    )
+    return {
+        "P": P,
+        "P_node": P,
+        "kept_nodes": kept.astype(np.int64),  # DOF-level (vec == 1), so restrict_state gathers directly
+        "secondary_to_main": {int(e): -1 for e in eliminated},  # eliminated DOFs have no single main
+        "n_full": int(n_full),
+        "n_red": int(kept.size),
+        "vec": 1,
+        "is_selection": False,  # an eliminated row is a weighted combination, never a plain selection
+        "is_bloch": False,
+        "coupling": "slip",
+    }
+
+
 def build_periodic_prolongation_nonnodal(
     n_verts: int,
     n_edges: int,
@@ -4296,17 +4483,58 @@ def _remap_bcoo_weighted(mat, P, conj=False):
     main[rows, slot] = cols
     weight = np.zeros((n_full, D), np.complex128 if np.iscomplexobj(pdat) else np.float64)
     weight[rows, slot] = wts
-    main, weight = jnp.asarray(main), jnp.asarray(weight)
-    r, c, v = mat.indices[:, 0], mat.indices[:, 1], mat.data
-    mr, wr, mc, wc = main[r], weight[r], main[c], weight[c]  # (nnz, D)
+    deg = np.bincount(rows, minlength=n_full)  # entries of P per full DOF (1 almost everywhere)
+
+    # Expand each mat triplet (r, c, v) over the REAL (a, b) pairs of its row and column only.
+    #
+    # The dense form -- broadcasting every triplet to D x D and letting the zero-weight slots cancel --
+    # allocates nnz * D^2 regardless of how sparse P actually is. For a near-selection P (a slip
+    # elimination: one entry per row except at constrained nodes) that is ~9x more memory than the
+    # result needs, and it is what put a 37k-DOF solve into RESOURCE_EXHAUSTED on an 8 GB card while
+    # trying to allocate 1.05 GiB. P's pattern is host-static, so the real pair list is known here:
+    # build it once on the host and keep the traced work to one gather and one multiply.
+    try:
+        r_h = np.asarray(mat.indices[:, 0])
+        c_h = np.asarray(mat.indices[:, 1])
+    except Exception:  # noqa: BLE001 -- the assembler could not hoist this pattern, so it is a tracer.
+        # Fall back to the dense D x D broadcast, which needs no concrete indices. It costs nnz*D^2
+        # (the memory this branch exists to avoid), but it is correct, and duplicates are left in place
+        # exactly as `_remap_bcoo` leaves them -- fine for a matvec, and the only option under trace.
+        mj, wj = jnp.asarray(main), jnp.asarray(weight)
+        r, c, v = mat.indices[:, 0], mat.indices[:, 1], mat.data
+        mr, wr, mc, wc = mj[r], wj[r], mj[c], wj[c]
+        if conj:
+            wr = jnp.conj(wr)
+        nnz = r.shape[0]
+        a = jnp.broadcast_to(mr[:, :, None], (nnz, D, D)).reshape(-1)
+        b = jnp.broadcast_to(mc[:, None, :], (nnz, D, D)).reshape(-1)
+        dd = (v[:, None, None] * wr[:, :, None] * wc[:, None, :]).reshape(-1)
+        return jsparse.BCOO((dd, jnp.stack([a, b], axis=1).astype(mat.indices.dtype)), shape=(n_red, n_red))
+    dr, dc = deg[r_h], deg[c_h]
+    counts = dr * dc
+    total = int(counts.sum())
+    src = np.repeat(np.arange(len(r_h), dtype=np.int64), counts)  # which triplet each output came from
+    off = np.concatenate([[0], np.cumsum(counts)[:-1]])
+    pos = np.arange(total, dtype=np.int64) - np.repeat(off, counts)  # index within this triplet's block
+    ai = pos // np.repeat(dc, counts)  # slot in the row's P entries
+    bi = pos % np.repeat(dc, counts)  # slot in the column's P entries
+    out_r = main[r_h[src], ai]
+    out_c = main[c_h[src], bi]
+    w_row = weight[r_h[src], ai]
     if conj:  # P^H mat P conjugates the row (left) weights
-        wr = jnp.conj(wr)
-    nnz = r.shape[0]
-    a = jnp.broadcast_to(mr[:, :, None], (nnz, D, D)).reshape(-1)
-    b = jnp.broadcast_to(mc[:, None, :], (nnz, D, D)).reshape(-1)
-    data = (v[:, None, None] * wr[:, :, None] * wc[:, None, :]).reshape(-1)
-    idx = jnp.stack([a, b], axis=1).astype(mat.indices.dtype)
-    return jsparse.BCOO((data, idx), shape=(n_red, n_red)).sum_duplicates()
+        w_row = np.conj(w_row)
+    w_prod = w_row * weight[c_h[src], bi]
+
+    data = mat.data[jnp.asarray(src)] * jnp.asarray(w_prod)
+    idx = jnp.asarray(np.stack([out_r, out_c], axis=1)).astype(mat.indices.dtype)
+    # `sum_duplicates()` decides `nse` from the DATA, so under trace it has no concrete count and the
+    # result poisons anything downstream that needs one -- `sparse_lu_solve` raised
+    # ConcretizationTypeError on the reduced tangent inside a jitted Newton. The output pattern is a
+    # pure function of `mat`'s pattern and `P`'s, both host-static, so compress it host-side instead.
+    plan = compress_plan(np.stack([out_r, out_c], axis=1))
+    if plan is None:
+        return jsparse.BCOO((data, idx), shape=(n_red, n_red))
+    return apply_compress_plan(data, plan, (n_red, n_red))
 
 
 def reduce_matrix(P, mat, is_selection=None, conj=False):
@@ -4491,6 +4719,33 @@ def build_periodic_prolongation_n1e(n_edges, edge_midpoints, edge_dirs, etags, p
     }
 
 
+def _blockdiag_bcoo(Ps, off_f, off_r):
+    """Concatenate per-field prolongations into one block-diagonal BCOO (index arithmetic only).
+
+    Returns ``None`` if any block's indices are not concrete (built under trace), so the caller can
+    fall back — the reductions that need this are all built eagerly.
+    """
+    rows, cols, data = [], [], []
+    for i, P in enumerate(Ps):
+        try:
+            idx = np.asarray(P.indices)
+            dat = np.asarray(P.data)
+        except Exception:
+            return None
+        rows.append(idx[:, 0] + int(off_f[i]))
+        cols.append(idx[:, 1] + int(off_r[i]))
+        data.append(dat)
+    if not rows:
+        return None
+    r = np.concatenate(rows)
+    c = np.concatenate(cols)
+    v = np.concatenate(data)
+    return jsparse.BCOO(
+        (jnp.asarray(v), jnp.asarray(np.stack([r, c], axis=1))),
+        shape=(int(off_f[-1]), int(off_r[-1])),
+    )
+
+
 def reduce_matrix_periodic(periodic, mat, conj=False):
     """``P^T mat P`` (or Hermitian ``P^H mat P`` when ``conj``) for a single- or multi-field reduction.
 
@@ -4518,9 +4773,28 @@ def reduce_matrix_periodic(periodic, mat, conj=False):
             gpval = gpval.at[int(off_f[i]) + full_local].set(jnp.asarray(Pi.data, pdtype))
         prow = jnp.conj(gpval) if conj else gpval
         return _remap_bcoo(mat, gmain, prow, gmain, gpval, (n_red, n_red))
+    if hasattr(mat, "indices") and all(hasattr(b["P"], "indices") for b in blocks):
+        # MIXED blocks (e.g. a slip elimination on the velocity field beside an identity on the
+        # pressure): not a selection, so the remap above does not apply — but each row still has a
+        # bounded fan-out, so the weighted remap does. Assemble the block-diagonal P once (index
+        # arithmetic only, no densification) and reduce in one pass. Without this a Taylor-Hood slip
+        # solve would fall through to the dense branch below and materialise n_full x n_full.
+        # Prefer the block-diagonal P the builder cached EAGERLY. Rebuilding it here would happen
+        # inside the traced Newton body, where its arrays are no longer concrete -- `_remap_bcoo_weighted`
+        # then bails to None and the whole reduction silently falls through to the dense branch.
+        Pg = periodic.get("P_blockdiag") if isinstance(periodic, dict) else None
+        if Pg is None:
+            Pg = _blockdiag_bcoo([b["P"] for b in blocks], off_f, off_r)
+        if Pg is not None:
+            remapped = _remap_bcoo_weighted(mat, Pg, conj=conj)
+            if remapped is not None:
+                return remapped
     mat = jnp.asarray(mat.todense()) if hasattr(mat, "todense") else jnp.asarray(mat)
+    # Read the dtype OFF each P. `np.asarray(P.todense())` would materialise an n_full x n_red dense
+    # block purely to look at `.dtype` -- and throw TracerArrayConversionError the moment P is traced.
+    # (`reduce_matrix` already documents this trap for its own `_dt`; the multifield path missed it.)
     pdtype = np.result_type(
-        *[np.asarray(b["P"].todense() if hasattr(b["P"], "todense") else b["P"]).dtype for b in blocks], mat.dtype
+        *[(b["P"].dtype if hasattr(b["P"], "dtype") else np.asarray(b["P"]).dtype) for b in blocks], mat.dtype
     )
     out = jnp.zeros((int(off_r[-1]), int(off_r[-1])), pdtype)
     _sp = lambda P: P if hasattr(P, "todense") else jnp.asarray(P, pdtype)  # keep BCOO sparse  # noqa: E731

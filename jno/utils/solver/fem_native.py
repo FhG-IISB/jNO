@@ -1286,8 +1286,32 @@ def assemble_fem_native(
         frozenset(int(conn.face_nodes[fi, j]) for j in range(conn.face_nodes.shape[1])): fi for fi in range(conn.n_bfaces)
     }
 
+    _region_faces_cache: Dict[str, np.ndarray] = {}
+
     def _region_faces(region: str) -> np.ndarray:
-        """Boundary-face ids owned by ``region`` (``(n,) int32``, possibly empty)."""
+        """Boundary-face ids owned by ``region`` (``(n,) int32``, possibly empty).
+
+        Memoized for this assembly. The selection is a property of the MESH, not of any solution, so
+        recomputing it can only ever return the same answer -- but *when* it is computed matters: the
+        resolution walks `tag_node_mask`, which intersects the tag with the catch-all "boundary"
+        region under `jax.vmap`. Run once at build time that is concrete; run again from inside a
+        traced objective -- which is what happens, because `FEM.eval` builds a fresh term list on each
+        call and so never hits `_preprocess_terms`'s own memo -- it produces a traced mask, and
+        converting one raises `TracerArrayConversionError`. That is what stopped a SURFACE objective
+        (a free surface, `(u.n)^2` on a moving wall) from surviving the rebuild after a remesh: the
+        region resolved cleanly twice, then a third time under trace. Caching here removes the third.
+
+        The cache lives in this assembly's closure, so a rebuilt problem starts with an empty one and
+        fills it from its own build -- it cannot serve a stale mesh's facets.
+        """
+        _hit_cached = _region_faces_cache.get(region)
+        if _hit_cached is not None:
+            return _hit_cached
+        out = _region_faces_uncached(region)
+        _region_faces_cache[region] = out
+        return out
+
+    def _region_faces_uncached(region: str) -> np.ndarray:
         _named = domain.tag_facets(region) if hasattr(domain, "tag_facets") else None
         if _named is not None and region != "boundary":
             # `"boundary"` keeps the mask: it is the catch-all, with its own interface-dropping semantics.
@@ -2049,16 +2073,20 @@ def assemble_fem_native(
         ``c·(u_r·w_r − u_i·w_i)``) is distributed over its sums into single-test sub-terms, so one
         complex form lowers onto the coupled blocks."""
         from ...trace import BinaryOp, Literal
-        from .fem_utils import _expand_product_terms
+        from .fem_utils import _expand_product_terms, _is_structural_zero, _test_field_keys
 
         tfi = _test_field_index(coeff, field_index)
         if tfi is not None:
             return [(coeff, tfi)]
+        if _is_structural_zero(coeff):
+            return []  # the `0` that builtin sum() seeds with: no block owns it, nothing to assemble
         expanded = _expand_product_terms(coeff)
         if len(expanded) > 1:
             split: List[Tuple[Any, int]] = []
             for s, sub in expanded:
                 sub_signed = sub if s >= 0 else BinaryOp("*", Literal(-1.0), sub)
+                if _is_structural_zero(sub_signed):
+                    continue
                 sfi = _test_field_index(sub_signed, field_index)
                 if sfi is None:
                     split = None
@@ -2066,9 +2094,19 @@ def assemble_fem_native(
                 split.append((sub_signed, sfi))
             if split is not None:
                 return split
+        # Say which of the two ambiguities this is: they have different fixes, and the old message
+        # asserted "exactly one" even when the sub-term carried none.
+        n_test = len(_test_field_keys(coeff))
+        if n_test == 0:
+            raise ValueError(
+                f"jno.fem (native): a {where} weak-form sub-term carries no test field, so there is no "
+                f"equation block to assemble it into -- {coeff!r}. Every additive piece of a weak form "
+                "pairs with a test function: a source term is `-f * v`, not `-f`."
+            )
         raise ValueError(
-            f"jno.fem (native): each {where} weak-form term must contain exactly one test field "
-            "(it determines the equation block)."
+            f"jno.fem (native): a {where} weak-form sub-term welds {n_test} test fields and could not be "
+            f"distributed into single-test pieces -- {coeff!r}. Each additive term must carry exactly one "
+            "test field (it determines the equation block)."
         )
 
     _preprocess_cache: Dict[Tuple[int, int], Tuple[Any, Any]] = {}
@@ -3179,6 +3217,11 @@ def assemble_fem_native(
     # the linear system, row replacement for Newton -- which zeroes exactly the rows a reaction/flux
     # readout needs. Snapshotted onto the FEM in `_finalize`, like the field keys and DOF points.
     domain._fem_native_term_residual = _make_residual
+    # Whether the FACET tables exist. They are tabulated only when the FORM carries a surface term
+    # (see `face_tables_per_field`), so a later `fem.eval` of a surface term on a problem with no
+    # boundary terms has nothing to integrate against -- it must say so rather than fail deep inside
+    # the element kernel on `NoneType` unpacking.
+    domain._fem_native_has_facet_tables = bool(boundary_terms)
     jacobian = _make_jacobian(volume_terms, boundary_terms)
     nonlinear = any(_is_obviously_nonlinear_in_unknown(domain, t) for t in all_terms)
     # A form that is LINEAR in the unknown but READS step history is still a march: every load step is a

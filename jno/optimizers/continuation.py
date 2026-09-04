@@ -27,7 +27,7 @@ exactly. Its own loss gradient never applies, because this hook replaces that en
 
 from __future__ import annotations
 
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional
 
 import numpy as np
 
@@ -48,7 +48,7 @@ class SIMPContinuation(_Callback):
         tol: float = 1e-4,
         window: int = 3,
         mnd_tol: float = 1e-2,
-        physical=None,
+        physical: Optional[Callable] = None,
         watch: Optional[int] = None,
         every: int = 1,
         patience: Optional[int] = None,
@@ -152,7 +152,7 @@ def simp_continuation(
     tol: float = 1e-4,
     window: int = 3,
     mnd_tol: float = 1e-2,
-    physical=None,
+    physical: Optional[Callable] = None,
     watch: Optional[int] = None,
     every: int = 1,
     patience: Optional[int] = None,

@@ -36,7 +36,6 @@ def init_vpinn_fem(dom, with_neumann_tags=True):
     # Native FEM context: the same quadrature / shape-function / boundary tensors the
     # grouped-weak-form evaluator reads, built from the native Lagrange + facet machinery.
     dom.init_fem_native(
-        element_type="TRI3",
         quad_degree=2,
         bcs=bcs,
     )

@@ -19,6 +19,7 @@ import jax.numpy as jnp
 from ..trace import Model, ModelCall, TunableModule
 from ..tuner import ArchSpace
 from ..utils.config import get_seed
+from .common import _default_float_dtype
 from .linear import Linear
 
 _DEFAULT_NN_KEY: jax.Array | None = None
@@ -122,7 +123,14 @@ def parameter(shape: tuple, *, key: jax.Array | None = None, name: str | None = 
         def __call__(self):
             return self.value
 
-    model = nn.wrap(_Parameter(value=jnp.zeros(shape, dtype=jnp.float32)), name=name or "")
+    # dtype follows JAX's own x64 flag -- jNO must not leak float32 into an x64 run. A hardcoded
+    # float32 here silently ROUNDED the unknown on every residual evaluation of a strong-form
+    # solve (``jno.fdm`` injects the DOF vector into this module and casts to its dtype), which
+    # made the operator non-linear at the 6e-8 level: the forward Krylov solve stalled near 1e-5
+    # while its recursive residual claimed 1e-10, and the ADJOINT BiCGStab broke down outright
+    # (measured 5.5e26 relative residual, a gradient wrong by 20 orders). Per-model precision
+    # stays the ``.dtype()`` control; the data default belongs to JAX.
+    model = nn.wrap(_Parameter(value=jnp.zeros(shape, dtype=_default_float_dtype())), name=name or "")
     # Metadata used by the FEM-time lowering route to distinguish trainable
     # physical coefficients from ordinary neural-network ModelCall nodes.
     model._is_parameter = True

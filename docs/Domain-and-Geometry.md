@@ -359,6 +359,78 @@ For 2-D/3-D geometry build the shape with `Shape` — `Shape.rect(...).domain()`
 
 ---
 
+## Mesh-free sampling — what a PINN actually needs
+
+`shape.domain()` does **not** mesh. A `Shape` knows its own extent, its own membership test and its
+own boundary in closed form, so collocation points are drawn from the geometry directly:
+
+```python
+d = jno.Shape.box(0, 0, 0, 1, 1, 1).domain()          # no gmsh, in 1-D, 2-D or 3-D
+x, y, z, t = d.variable("interior", sample=(20_000, None), split=True)
+```
+
+Two things differ from sampling a mesh. `20_000` means twenty thousand — there is no node set to be
+clipped to — and every draw is **fresh**, so an adaptive strategy explores the region instead of
+reshuffling one fixed cloud. Tagging is unchanged, and works on the boundary as well as the interior:
+
+```python
+d.tag("hot",   lambda x, y, z: (x-.5)**2 + (y-.5)**2 + (z-.5)**2 < .04)   # a lump of interior
+d.tag("inlet", lambda x, y, z: x < 1e-9)                                  # a face
+bx, by, bz, t, nx, ny, nz = d.variable("inlet", sample=(500, None), normals=True, split=True)
+```
+
+Which of the two a predicate means is *measured* — jNO draws from both and sees which one it accepts
+— because a boundary predicate applied to an interior draw matches nothing and would look like an
+empty region. Boundary points land on the analytic surface, so a disk's samples lie on the circle to
+machine precision with exactly radial normals, not on a chord with a per-facet normal. The
+primitives' auto-names (`left`, `arc`, `surface`, …) are available before any mesh exists.
+
+!!! note "When a mesh does get built"
+    Some things are defined *on* a mesh, not on the geometry: `jno.fem` and `fem_symbols()`,
+    `.integrate()`, the finite-difference schemes, `.points` / `normals_by_tag` / `tag_indices`, and
+    a facet predicate `f(x, n, names)`. Reading any of them builds the mesh once, and says so:
+
+    ```
+    INFO: _fem.__init__ needs a mesh; this domain was mesh-free — building it now.
+    ```
+
+    Nothing you write has to change; a tag declared while mesh-free gains its mesh-derived half at
+    that point.
+
+!!! note "Shapes with no closed form — the boundary tessellation"
+    `fillet` has no analytic membership: it *removes* material near edges, so recursing to the child
+    would answer for the un-filleted solid — a wrong-but-plausible mask. It is served by meshing the
+    **boundary only** — the perimeter in 2-D, the surface in 3-D — which `Shape.tessellate()` does
+    once and caches. No volume fill runs, and `contains`, `sample_interior` and `sample_boundary`
+    fall back to it automatically. The domain says which path it took:
+
+    ```
+    INFO: Mesh-free domain from fillet plan (dim 3); tags [...] sample from a 372-facet boundary
+    tessellation.
+    ```
+
+    **What this costs.** A facet is straight, so on a *curved* boundary the normal is piecewise
+    constant and O(h) wrong — 7.5° median on a unit sphere at `h=0.5`, 2.2° at `h=0.15`, halving
+    with `h`. Tighten it with `.size(h)`. At a *crease* the facet normal is exact, because a facet
+    lies wholly on one face. Membership is the polyhedron's rather than the true solid's; the two
+    differ by the sagitta, O(h²).
+
+    **`sweep` is not served this way.** A sweep along a straight line is rewritten as an `extrude`
+    and stays fully analytic, so it never needed the tessellation. A sweep along an **arc** is
+    refused by name: gmsh returns that surface with its seam unsewn, and refining makes it worse —
+    measured across `h` = 0.5 → 0.08 the number of edges bounding a single facet runs 7, 7, 7, 10,
+    13, 16, 24. Without a closed surface there is no inside to test for, so that one meshes eagerly
+    through `.build()`, and the domain logs why rather than doing it silently.
+
+!!! warning "Plans that stay eager"
+    `.name(...)` / `Shape.regions(...)` (region and interface tags are the mesher's conforming
+    sub-bodies) and `.structured()` (already a lattice) mesh at construction as before, rather than
+    being half-served.
+
+    `translate`, `rotate`, `extrude` and `revolve` are covered analytically — the query point is
+    mapped into the child's frame, and a revolved boundary is drawn from the profile weighted by its
+    swept radius (Pappus), so the inner rim of a ring is not over-sampled relative to the outer.
+
 ## Sampling, time, and batching
 
 ```python
@@ -366,6 +438,27 @@ x, y, z, t = d.variable("interior")                        # all interior mesh n
 x, y, z, t = d.variable("interior", sample=(500, None))    # 500 sampled points
 xb, yb, zb, tb, nx, ny, nz = d.variable("top", normals=True, split=True)   # boundary + outward normals
 ```
+
+The first line — no count — is read from whether you declared a resolution. **`size=` is that
+declaration:** asking for a mesh of a given density and then for "the interior" unambiguously means
+its nodes, so it builds that mesh and hands them back, exactly as before. A convergence study that
+varies `size` therefore keeps working unchanged.
+
+With **no** `size=` there is no declared resolution and no node set, and "no count" could equally
+mean collocation points or nodes — which depends on what you do afterwards. Neither is chosen for
+you:
+
+```
+ValueError: domain.variable('interior'): this domain is mesh-free and no mesh size was declared,
+so the tag has no node set to hand back and no natural point count. Say which you want:
+  - continuous collocation points:  variable('interior', sample=(n, None))
+  - a mesh's nodes:                 give the shape a size, e.g. Shape.rect(..., size=0.05),
+                                    or read d.mesh first
+```
+
+Guessing would be silent rather than wrong-looking: finite differences over a single collocation
+point return a number, it is just not the one you asked for. An explicit `sample=(n, None)` always
+means mesh-free, `size=` or not.
 
 `variable` always returns a trailing time coordinate `t` (a constant for steady domains), so a 3-D
 domain unpacks as `(x, y, z, t)`. Time-dependent domains take `time=(t0, t1, n)`; `variable("initial")`
@@ -381,7 +474,9 @@ Pass an array instead of a sampling spec to attach it as a **tensor tag** — th
 pattern, where each batch sample carries its own field:
 
 ```python
-dom = 256 * jno.domain(constructor=jno.domain.poseidon(nx=64, ny=64))
+from jno.domain.geometries import Geometries
+
+dom = 256 * jno.domain(constructor=Geometries.poseidon(nx=64, ny=64))
 dom.variable("_f", forcing)          # (256, 64, 64, 1) — the shape you actually have
 ```
 

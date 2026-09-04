@@ -24,6 +24,7 @@ Contracts
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, Optional
@@ -221,11 +222,100 @@ def _slice_bcoo(src, si: slice, sj: slice):
         return None  # any exotic layout falls back to the matvec-only block
 
 
+#: Relative-residual gate shared by the eager and traced convergence checks.
+_GATE_RTOL = 1e-4
+
+#: Set while a ``jno.solve`` solver is being used as a PRECONDITIONER application. A preconditioner
+#: is inexact by definition -- ``jno.precond.inner(jno.solve.cg(tol=1e-2, maxiter=30))`` asks for two
+#: digits on purpose, which is the whole reason FGMRES exists -- so its inner solve has no
+#: convergence contract to check and :func:`residual_gate` must stand down. It is a property of the
+#: CALL, not of the solver: the same ``cg()`` spec gated as an outer solve is ungated as an inner one.
+_GATE_SUSPENDED = False
+
+
+@contextlib.contextmanager
+def gate_suspended():
+    """Run a solver call as a preconditioner application: inexact by design, so not gated."""
+    global _GATE_SUSPENDED
+    prev = _GATE_SUSPENDED
+    _GATE_SUSPENDED = True
+    try:
+        yield
+    finally:
+        _GATE_SUSPENDED = prev
+
+
+def _raise_unconverged(rel, who: str, side: str):
+    """Host side of :func:`residual_gate` -- raises so a bad solve cannot be mistaken for a good one."""
+    rel = float(rel)
+    if np.isfinite(rel) and rel <= _GATE_RTOL:
+        return
+    if side == "forward":
+        advice = (
+            "The problem may be singular/ill-posed or need a preconditioner: try jno.solve.lu(), a "
+            "precond= spec, or your own solve_fn."
+        )
+    else:
+        advice = (
+            "This is the ADJOINT (transpose) solve, not the forward one -- the solution itself is "
+            "fine and only the GRADIENT is affected. A Krylov method can break down on A^T where it "
+            "converges on A, so reach for a transposable-robust inner solver (jno.solve.gmres(), "
+            "jno.solve.lu()) or a preconditioner rather than loosening the tolerance."
+        )
+    raise RuntimeError(
+        f"{who} did not solve the system: relative residual {rel:.1e} against a {_GATE_RTOL:g} gate. {advice}"
+    )
+
+
+def residual_gate(mv, b, x, who: str, *, side: str = "forward"):
+    """Refuse a linear solve that did not converge -- **under a trace as well as eagerly**.
+
+    ``_maybe_residual_check`` below is concrete-only, and every iterative solve in the library runs
+    under ``jit``/``grad`` in anger, so its guard was off exactly when it was needed. Worse, it only
+    ever saw the FORWARD solve: ``lax.custom_linear_solve``'s ``transpose_solve`` -- the adjoint every
+    gradient flows through -- was unguarded end to end. A Krylov iteration that leaves on its step cap
+    returns its last iterate with no signal, so a broken adjoint came back as a plausible number.
+    Measured on a 2-D strong-form Poisson: BiCGStab converged on ``A`` (2.9e-05) and diverged to
+    5.5e+26 on ``A^T`` on the same problem, and the gradient it produced was wrong by twenty orders.
+
+    The check costs **one extra matvec** with the operator that was actually used -- which is why it
+    lives here, inside the solve callback, where ``custom_linear_solve`` has already handed us ``A``
+    or ``A^T`` as appropriate, rather than at a call site that only knows one of them.
+
+    Traced values are checked on the host through ``jax.debug.callback``, which raises. The callback
+    sits in the failing branch of a ``lax.cond`` so a converged solve never pays for a host
+    round-trip -- measured 0.40 ms against 0.26 ms per solve when it fires unconditionally on a small
+    dense GMRES, i.e. the transfer, not the extra matvec, is what costs. ``vmap`` turns that ``cond``
+    into a ``select`` that runs both branches, so under a batch the callback fires either way; that
+    is why :func:`_raise_unconverged` re-checks the residual on the host instead of trusting the
+    branch it was reached from. Degrading to "always transfer" under ``vmap`` is slower, not wrong.
+
+    An all-zero right-hand side is skipped: it is the adjoint's "this output has no cotangent" case,
+    the relative residual has no scale, and every solver returns zero for it.
+    """
+    if _GATE_SUSPENDED:  # a preconditioner application -- inexact on purpose, nothing to check
+        return x
+    bn = jnp.linalg.norm(b)
+    rel = jnp.linalg.norm(b - mv(x)) / jnp.where(bn > 0, bn, 1.0)
+    rel = jnp.where(bn > 0, rel, 0.0)
+    if not isinstance(rel, jax.core.Tracer):
+        _raise_unconverged(rel, who, side)
+        return x
+    jax.lax.cond(
+        jnp.isfinite(rel) & (rel <= _GATE_RTOL),
+        lambda _r: None,
+        lambda r: jax.debug.callback(_raise_unconverged, r, who, side),
+        rel,
+    )
+    return x
+
+
 def _maybe_residual_check(op: LinearOperator, b, x, who: str, *, rtol: float = 1e-4):
     """Eager-only convergence guard: raise on a garbage solution when values are concrete.
 
-    Under ``jit``/``vmap``/``grad`` (tracers) it is a no-op -- the check would either fail to
-    concretise or break the transform; there the solver's own iteration cap is the guard.
+    Under ``jit``/``vmap``/``grad`` (tracers) it is a no-op. Prefer :func:`residual_gate`, which
+    checks under a transform as well and covers the transpose solve; this remains for the callers
+    that hold an assembled ``op`` and only ever run eagerly.
     """
     if any(isinstance(v, jax.core.Tracer) for v in (x, b)):
         return x
@@ -850,6 +940,11 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
     _traits = getattr(nonlinear, "traits", None) or {}
     if "rtol" in _traits and "atol" in _traits:
         _composed.tolerances = (float(_traits["rtol"]), float(_traits["atol"]))
+    # A stable identity for the composed solver, by VALUE rather than by object. `fem.solve` composes a
+    # fresh one on every call, so anything caching a compiled solve against `id(solve_fn)` would miss
+    # every time and re-stage -- which is exactly what happened, and cost the parametric solve its whole
+    # advantage. The specs' reprs describe the solver completely, which is what "the same solver" means.
+    _composed.cache_key = ("nl", repr(nonlinear), repr(linear), repr(precond))
     return _composed
 
 
@@ -962,6 +1057,61 @@ class ContinuationSpec:
     keep: str = "last"
 
 
+def _reduced_size(periodic):
+    """Width of the reduced space. The key differs by builder -- a single-field reduction carries
+    ``n_red``, a multifield one only the block offsets -- so it is read in that order rather than
+    assumed, which is how this first showed up as a bare ``KeyError: 'n_red'``."""
+    if "n_red" in periodic:
+        return int(periodic["n_red"])
+    if periodic.get("off_red") is not None:
+        return int(periodic["off_red"][-1])
+    return int(periodic["P"].shape[1])
+
+
+def record_nonlinear_verdict(residual_at, u, u0, nonlinear, who: str) -> tuple:
+    """Judge a nonlinear solve OUTSIDE the trace, and record it for ``fem.stats``.
+
+    The drivers' own ``_convergence_check`` needs a concrete residual, so it self-disables under jit --
+    and a solve that is jitted precisely to avoid re-staging is then the case with no verdict at all,
+    leaving ``fem.stats`` holding whatever an earlier eager solve left behind. This makes the same
+    judgement here, against the tolerances the ``nonlinear=`` spec carries for exactly this reason, and
+    returns ``(residual, bound, converged)``.
+
+    ``residual_at`` must be the residual the SOLVER worked on: on a reduced system that is the reduced
+    one, ``Pᵀr``. The full residual of a constrained problem keeps the constraint's reaction, which is
+    physical and stays O(1) however well converged the solve is, so a verdict read off it never sees
+    success.
+    """
+    from .newton_krylov import LAST_NEWTON_STATS
+
+    traits = getattr(nonlinear, "traits", None) or {}
+    rtol, atol = float(traits.get("rtol", 1e-8)), float(traits.get("atol", 1e-8))
+    if any(isinstance(v, jax.core.Tracer) for v in (u, u0)):
+        # The CALLER is tracing (jit/grad/vmap over the solve). The verdict needs a concrete residual,
+        # so it cannot be made here -- the same trade, and the same guard, as the driver's own check in
+        # `newton_krylov`. Recording nothing would leave `fem.stats` holding an earlier eager solve's
+        # verdict, which is worse than none, so the verdict is cleared and says why. Without this the
+        # `float()` below raises a ConcretizationTypeError and a differentiable parametric solve --
+        # `jax.grad` of `fem.solve(param=value)`, the whole point of fitting a coefficient through the
+        # solve -- is impossible.
+        LAST_NEWTON_STATS.clear()
+        LAST_NEWTON_STATS.update(
+            driver=who,
+            residual=None,
+            bound=None,
+            steps=None,
+            converged=None,
+            note="no verdict: the solve was traced (jit/grad/vmap); the solver's iteration cap is all there is",
+        )
+        return None, None, None
+    r_end = float(jnp.linalg.norm(jnp.asarray(residual_at(u)).reshape(-1)))
+    bound = atol + rtol * float(jnp.linalg.norm(jnp.asarray(residual_at(u0)).reshape(-1)))
+    ok = bool(np.isfinite(r_end)) and r_end <= bound
+    LAST_NEWTON_STATS.clear()
+    LAST_NEWTON_STATS.update(driver=who, residual=r_end, bound=bound, steps=None, converged=ok)
+    return r_end, bound, ok
+
+
 def run_continuation(fem, spec, *, nonlinear=None, linear=None, precond=None, x0=None, kwargs=None):
     """Drive ``fem.solve(continuation=...)``: solve the steady problem at each parameter value in turn,
     warm-starting from the previous solution.
@@ -980,9 +1130,19 @@ def run_continuation(fem, spec, *, nonlinear=None, linear=None, precond=None, x0
     step); ``x0=`` seeds the *first* step. A **direct** linear solve ignores warm starts by nature --
     the sweep still buys the family collection and per-step failure localization.
 
-    Every step is checked finite on the host (this driver is eager, like ``adapt=``): a step that
-    diverges or hits a singular operator raises naming the parameter values and the step index, instead
-    of returning NaN from three steps later. Returns concrete arrays -- ``(n_dofs,)`` for
+    **The march is staged once.** The per-step solve is a single ``jax.jit`` taking the parameter
+    values as a *traced* argument, so an N-value ramp costs one compilation and N executions rather
+    than N compilations -- which is the whole reason to prefer this over a Python loop that rebuilds
+    the form. jit keys on shape and dtype, not value, so no enumeration of the sweep is involved: one
+    executable serves any value, including ones chosen adaptively. **Nonlinear only** -- the linear
+    branch re-assembles ``A, b`` per value and still stages per step.
+
+    Every step is checked finite on the host (the *loop* stays eager; only the step is traced): a step
+    that diverges or hits a singular operator raises naming the parameter values and the step index,
+    instead of returning NaN from three steps later. The nonlinear driver's own stalled-solve guard
+    goes blind inside that jit -- it needs a concrete residual -- so the equivalent check is made out
+    here against the tolerances the ``nonlinear=`` spec carries, and ``fem.stats`` reports the rung
+    that was actually last solved. Returns concrete arrays -- ``(n_dofs,)`` for
     ``keep="last"``, ``(n_values, n_dofs)`` for ``keep="all"`` -- complex-valued when the problem is.
     """
     kwargs = dict(kwargs or {})
@@ -993,8 +1153,18 @@ def run_continuation(fem, spec, *, nonlinear=None, linear=None, precond=None, x0
             f"{mode!r}. Sweep a transient by looping over fem.solve() yourself -- a warm start has no "
             "meaning across independent trajectories."
         )
-    if getattr(fem, "_periodic", None) is not None:
-        raise NotImplementedError("fem.solve(continuation=...) with periodic ties is not supported yet.")
+    # A REDUCED system (a periodic/mortar tie, or a slip elimination -- they share this format) is
+    # solved on the constraint manifold: u = P u~. This driver talks to `op` directly rather than
+    # through FEM.solve, so it has to apply that reduction itself, exactly as `_fem._reduced` does --
+    # residual reduced by Pᵀ, iterate carried in the REDUCED space, prolonged on the way out. It used
+    # to refuse instead, which is why a slip-constrained problem could not be continued at all.
+    periodic = getattr(fem, "_periodic", None)
+    if periodic is not None and mode != "nonlinear":
+        raise NotImplementedError(
+            "fem.solve(continuation=...) on a reduced system (a periodic tie or a slip condition) "
+            "supports the NONLINEAR path; this problem is steady-linear. The linear path assembles "
+            "A and b directly, and reducing those is PᵀAP / Pᵀb -- wire it there if you need it."
+        )
     if spec.keep not in ("last", "all"):
         raise ValueError(f"continuation keep={spec.keep!r}: expected 'last' or 'all'.")
     if not spec.params:
@@ -1048,7 +1218,63 @@ def run_continuation(fem, spec, *, nonlinear=None, linear=None, precond=None, x0
 
     if mode == "nonlinear":
         nl = compose_nonlinear_solve_fn(nonlinear, linear, precond, fem)
-        prev = jnp.zeros((int(op.size),))
+        prev = jnp.zeros((_reduced_size(periodic) if periodic is not None else int(op.size),))
+
+        # ONE staging for the whole march. Nothing on the steady nonlinear path is jitted, and
+        # `lax.while_loop`/`custom_root`/`linearize` stage their bodies on every Python call -- so
+        # without this the form is re-traced at every rung (MEASURED: 6 traces per step, and a
+        # hoisted stable closure does not help, because there is no jit cache to hit). The parameter
+        # values enter as a TRACED argument, so every rung shares one executable: jit keys on shape
+        # and dtype, not value, and each rung passes the same shapes. The warm start rides along as
+        # the second argument.
+        if periodic is None:
+
+            def _residual_at(vals, uu):
+                return jnp.asarray(op.residual(uu, vals)).reshape(-1)
+
+        else:
+            from .fem_utils import prolong_periodic, reduce_vector_periodic
+
+            def _residual_at(vals, ur):
+                # reduced system: solve on the constraint manifold, u = P u~
+                full = op.residual(prolong_periodic(periodic, ur), vals)
+                return reduce_vector_periodic(periodic, jnp.asarray(full).reshape(-1))
+
+        # A sparse-direct Newton (`newton(direct=True)`, or any direct `linear=` slot, which selects it)
+        # flags `wants_jacobian` and factorizes the ASSEMBLED tangent. The march used to hand its driver a
+        # residual closure and nothing else, and a closure has no tangent to give -- so a direct Newton
+        # under a continuation REFUSED outright, which is exactly the pairing a stiff homotopy wants:
+        # reach a parameter value the cold solve cannot, on a saddle where the matrix-free Newton has no
+        # preconditioner. The steady path already threads the tangent this way (`FemResidualOperator`),
+        # and the load-path march was fixed to match; this is the third caller. On a REDUCED system the
+        # tangent is reduced with the same prolongation as the residual, P^T J P.
+        _jac_at = None
+        if getattr(nl, "wants_jacobian", False) and getattr(op, "jacobian", None) is not None:
+            if periodic is None:
+
+                def _jac_at(vals, uu):
+                    return op.jacobian(uu, vals)
+
+            else:
+                from .fem_utils import reduce_matrix_periodic
+
+                def _jac_at(vals, ur):
+                    full = op.jacobian(prolong_periodic(periodic, ur), vals)
+                    return reduce_matrix_periodic(periodic, full)
+
+        if _jac_at is None:
+            _step = jax.jit(lambda vals, u_prev: nl(lambda uu: _residual_at(vals, uu), u_prev))
+        else:
+            _step = jax.jit(
+                lambda vals, u_prev: nl(lambda uu: _residual_at(vals, uu), u_prev, jacobian=lambda uu: _jac_at(vals, uu))
+            )
+
+        # `_convergence_check` inside the driver self-disables under jit (it needs a concrete
+        # residual), so the stalled-solve guard it provides would be lost -- and `fem.stats` would
+        # keep a stale entry. Re-checked here instead, eagerly, against the tolerances the spec
+        # carries for precisely this case. One extra residual evaluation per rung, against a Newton
+        # solve: negligible.
+        _who = f"continuation/{getattr(nonlinear, 'name', None) or 'newton'}"
     else:
         nl = None
         A0, b0 = op.evaluate({**fixed, **{k: _step_value(s, 0) for k, s in seqs.items()}})
@@ -1065,7 +1291,21 @@ def run_continuation(fem, spec, *, nonlinear=None, linear=None, precond=None, x0
         at = ", ".join(f"{name}={np.asarray(s[k])!r}" for name, s in seqs.items())
         try:
             if mode == "nonlinear":
-                u = nl(lambda uu, _v=vals: op.residual(uu, _v), prev)
+                step = _step(vals, prev)
+                # The in-driver guard is blind under jit; judge this rung's solve out here, where the
+                # residual is concrete, and record it so `fem.stats` describes the step just taken.
+                # Verdict is computed inside the try (it forces the sync) but RAISED below, next to
+                # the finiteness check, so a stalled rung reports as itself rather than being
+                # re-wrapped as the surrounding "failed to converge".
+                _r_end, _bound, _conv = record_nonlinear_verdict(
+                    lambda uu: _residual_at(vals, uu), step, prev, nonlinear, _who
+                )
+                # `None` means the rung was TRACED, so no verdict could be made -- that is not a stall.
+                _stalled = _conv is False
+                if periodic is None:
+                    u = step
+                else:
+                    prev_red, u = step, prolong_periodic(periodic, step)
             else:
                 A, b = op.evaluate(vals)
                 b = jnp.asarray(b).reshape(-1)
@@ -1086,12 +1326,22 @@ def run_continuation(fem, spec, *, nonlinear=None, linear=None, precond=None, x0
                 f"Refine the value sequence around this point, or pass "
                 f"nonlinear=jno.solve.newton(line_search=True). Original error: {e}"
             ) from e
+        if mode == "nonlinear" and _stalled:
+            raise RuntimeError(
+                f"fem.solve(continuation=...): step {k + 1}/{n_steps} at {at} did not converge: "
+                f"residual norm {_r_end:.3e} against the tolerance atol + rtol*||r(x0)|| = "
+                f"{_bound:.3e}. The rung's iterate is NOT a root -- the march would carry it into "
+                "every later step as a warm start. Refine the value sequence around this point, "
+                "raise max_steps, or pass nonlinear=jno.solve.newton(line_search=True)."
+            )
         if not bool(np.isfinite(u_host).all()):
             raise RuntimeError(
                 f"fem.solve(continuation=...): step {k + 1}/{n_steps} at {at} produced a non-finite "
                 "solution (a singular or diverging system). Refine the value sequence around this point."
             )
-        prev = u
+        prev = prev_red if periodic is not None and mode == "nonlinear" else u
         if spec.keep == "all":
             outs.append(_fin(u))
-    return jnp.stack(outs) if spec.keep == "all" else _fin(prev)
+    if spec.keep == "all":
+        return jnp.stack(outs)
+    return _fin(u)  # `prev` may be the REDUCED iterate; `u` is always the full-space solution

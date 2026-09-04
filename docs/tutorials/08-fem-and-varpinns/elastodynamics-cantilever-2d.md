@@ -29,12 +29,33 @@ state is $y=[u;v]$ of size $2N$, split with `fem.offsets` (`[0, N, 2N]`).
 
 The trapezoidal rule conserves a quadratic invariant of **any** linear block — even a
 frequency-wrong one — so energy conservation alone says nothing about the physics. To check the
-*frequency* we do a small modal analysis on the assembled operators: the generalized eigenproblem
+*frequency* we do a small modal analysis: the generalized eigenproblem
 $K\varphi=\omega^2 M\varphi$ gives the fundamental bending mode $(\omega_1,\varphi_1)$. Released from
 that mode at rest, the exact solution is $u(t)=\varphi_1\cos(\omega_1 t)$, so the tip must trace a
 clean cosine — a direct check that the augmented $[u,v]$ block reproduces $M\ddot u + Ku = 0$ at the
 right speed. As a bonus $\omega_1$ matches Euler–Bernoulli beam theory
 $\omega_1\approx(1.875/L)^2\sqrt{EI/\rho A}$.
+
+That eigenproblem is stated the way every other problem here is — a term list, plus the mass form on
+`mass=`. `fem.eigs` needs a **steady, source-less** bilinear form, so the stiffness is restated on its
+own (the same $\lambda\,\mathrm{tr}\,\varepsilon\,\mathrm{tr}\,\varepsilon' + 2\mu\,\varepsilon\!:\!\varepsilon'$,
+without the $\rho\,u_{tt}$ term) on the same symbols and the same clamped root:
+
+```python
+uxy, vxy = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)   # the same P2 space, read without t
+K = jno.fem([lam * trace(eu) * trace(ep) + 2.0 * mu * inner(eu, ep, n_contract=2),
+             u(xl, yl) - (0.0, 0.0)])                 # stiffness alone + the clamped root
+lam1, X1 = K.eigs(mass=[rho * inner(uxy, vxy, n_contract=1)], k=1)   # λ = ω²
+omega1 = float(jnp.sqrt(jnp.asarray(lam1).reshape(-1)[0]))
+phi1 = np.asarray(X1)[:, 0]
+```
+
+The clamped DOFs are eliminated by the solver, so $\varphi_1$ comes back already satisfying the
+essential BC (zero at the root to machine precision) on the same DOF layout as the transient state —
+no free/constrained index bookkeeping, and no dense reduction. The eigenvalues are **differentiable**,
+so $\omega_1$ can itself be an objective: tune a thickness to hit a target frequency, or invert for a
+stiffness from a measured spectrum. Pass `precond=` for preconditioned LOBPCG on meshes too large to
+densify, or `sigma=` to target interior modes.
 
 !!! warning "Soft modes need float64"
     The fundamental bending mode of a slender beam is *soft* — its modal stiffness is orders of

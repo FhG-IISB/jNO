@@ -58,7 +58,7 @@ def _poisson(d, tie):
         terms.append(u(a[0], a[1], a[2]) - u(b[0], b[1], b[2]))
     zb = d.variable("boundary", split=True)
     terms.append(u(zb[0], zb[1], zb[2]) - 0.0)
-    return np.asarray(jno.fem(terms, element_type="TET4").solve()).reshape(-1)
+    return np.asarray(jno.fem(terms).solve()).reshape(-1)
 
 
 def _interface_interior(pts):

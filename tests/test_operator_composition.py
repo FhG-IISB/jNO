@@ -36,7 +36,7 @@ class _Lazy:
 
 
 def _grid_domain(batch=None):
-    base = jno.domain(constructor=jno.domain.poseidon(nx=G, ny=G), compute_mesh_connectivity=True)
+    base = jno.Shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=(G - 1, G - 1)).domain(compute_mesh_connectivity=True)
     dom = batch * base if batch else base
     return dom
 

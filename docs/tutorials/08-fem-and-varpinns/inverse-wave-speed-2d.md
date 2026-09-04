@@ -31,7 +31,7 @@ in a vector (elastodynamic) form: the machinery behind full-waveform inversion a
 ```python
 c2.initialize(jax.nn.initializers.constant(1.0))     # start at the wrong speed
 c2.optimizer(optax.adam(5e-2))
-crux = jno.core([(fem.solve() - u_obs).mse], domain=jno.domain.from_array({"_": np.zeros((1, 1))}))
+crux = jno.core([(fem.solve() - u_obs).mse])        # a parameter-only fit needs no domain
 crux.solve(220)                                       # fit c² to the seismogram
 ```
 

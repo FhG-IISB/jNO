@@ -263,7 +263,7 @@ def apply_lora(
     target: Optional[str] = None,
     specs: Sequence[LoRASpec] | None = None,
     wrappers: type[LoRAWrapper] | Sequence[type[LoRAWrapper]] | None = None,
-    param_mask=None,
+    param_mask: Any = None,
 ) -> eqx.Module:
     """Apply LoRA adapters to matching layers in *model*.
 

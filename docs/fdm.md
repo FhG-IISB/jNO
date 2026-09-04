@@ -1,6 +1,6 @@
 # Finite Difference Method
 
-`jno.fdm` is the **strong-form sibling** of [`jno.fem`](fem.md). You write the PDE and its boundary
+`jno.fdm` is the **strong-form sibling** of [`jno.fem`](fem/index.md). You write the PDE and its boundary
 and initial conditions as the *same* kind of constraint list — but instead of a weak form with test
 functions and quadrature, the **strong residual** is collocated at the mesh nodes with
 finite-difference stencils. There is no test function, no mass matrix, and no quadrature, so it is
@@ -47,10 +47,41 @@ views therefore default to **finite differences**:
 | `ui.d2(x)`       | `∂²u/∂x²` by finite differences                               |
 | `ui.d2(x) + ui.d2(y)` | the FD Laplacian, one direction at a time               |
 
-!!! warning "Do not split the whole-Laplacian stencils"
-    `"finite_difference:cotangent"` and `"finite_difference:lsq"` compute the **whole** Laplacian
-    `Δu` in one shot. Writing `ui.d2(x, scheme="finite_difference:cotangent") + ui.d2(y, …)` therefore
-    **doubles** it. Use the default per-direction stencil for `.d2(x) + .d2(y)`.
+!!! danger "`:cotangent` is a whole-Laplacian stencil — and `.d2` now refuses it"
+    `"finite_difference:cotangent"` computes the **whole** Laplacian `Δu` for any dimension you ask
+    for, so `ui.d2(x, scheme=…) + ui.d2(y, scheme=…)` used to **double** it — silently. The solve
+    converged to half the true answer (relative error 0.494 → 0.498 → 0.499 under refinement, never
+    converging, never raising).
+
+    `.d2` and `.dd` now **raise** on that sub-scheme. Write the Laplacian as one term instead, which
+    takes every coordinate at once and so cannot be double-counted:
+
+    ```python
+    lap = ui.laplacian(x, y, scheme="finite_difference:cotangent")   # ✅ one term, cannot double
+    lap = ui.d2(x, scheme="finite_difference:cotangent") + ui.d2(y, …)   # ❌ raises
+    ```
+
+    `"finite_difference:lsq"` is **not** affected — it is a genuine per-direction stencil, so
+    `.d2(x, scheme=":lsq") + .d2(y, scheme=":lsq")` is correct and equals
+    `.laplacian(x, y, scheme=":lsq")` (both 1.978e-02 on the study below; the single `.d2(x, ":lsq")`
+    alone is 1.046, as a per-axis derivative should be).
+
+!!! measured "Every stencil's adjoint is exact"
+    A strong-form solve is differentiable through whichever stencil you author. Measured on
+    `−Δu = s·f` over the unit square (mesh 0.08, x64), where `u` is linear in `s` so `d(Σu)/ds`
+    has a closed form:
+
+    | stencil | `d(Σu)/ds` (AD) | closed form |
+    |---|---|---|
+    | `.laplacian(x, y, ":cotangent")` | +8.171969e+01 | +8.171969e+01 |
+    | `.d2(x) + .d2(y)` (default) | +8.336520e+01 | +8.336520e+01 |
+    | `.laplacian(x, y, ":lsq")` | +8.334671e+01 | +8.334671e+01 |
+
+    This needed a fix: `jno.np.parameter` hardcoded `float32`, and `jno.fdm` casts the DOF vector to
+    the unknown's dtype on every residual evaluation — so under x64 the operator silently rounded to
+    single precision. That made it *non-linear* at the 6e-08 level, which capped the forward solve
+    near 1e-05 and broke the adjoint Krylov solve outright (a gradient wrong by twenty orders). The
+    dtype now follows `jax_enable_x64`, and every stencil above is linear to 2e-16.
 
 ### Choosing the stencil
 
@@ -64,6 +95,16 @@ The built-in stencils (parsed from the scheme string) are:
 | `"finite_difference:cotangent"`        | area-weighted        | cotangent (whole-Δ)      |
 | `"finite_difference:uniform"`          | uniform              | gradient-of-gradient     |
 | `"finite_difference:inverse_distance"` | inverse-distance     | gradient-of-gradient     |
+
+!!! measured "How much the cotangent stencil buys — unit square, −Δu = f, float64"
+    | mesh `h` | `.laplacian(x, y, scheme=":cotangent")` | `.d2(x) + .d2(y)` (default) |
+    |---|---|---|
+    | 0.10 | **1.164e-02** | 4.942e-02 |
+    | 0.06 | **4.058e-03** | 1.674e-02 |
+    | 0.035 | **1.417e-03** | 5.780e-03 |
+
+    A stable ~4× at every resolution — the same convergence *rate*, a better constant. Worth the one
+    extra word on the term whenever the mesh is unstructured.
 
 The `cotangent` Laplacian is the most accurate and is symmetric; the gradient methods trade accuracy
 for locality. The scheme stays on the operator it describes — `ui.d2(x, scheme=…)` — so different
@@ -318,9 +359,10 @@ uh, vh = jno.fdm([
 ]).solve()                              # returns (2, N): uh = row 0, vh = row 1
 ```
 
-Coupled fields are v1-limited to steady + Dirichlet (transient / flux on coupled fields are planned). A geometric sub-region for a subdomain /
-domain-decomposition solve (`jno.dd.couple([(problem, region)])`) resolves to a mesh-node subset via
-the analytic, shapely-free [`Shape.contains`](Domain-and-Geometry.md) — in 2-D **and** 3-D.
+Coupled fields are v1-limited to steady + Dirichlet (transient / flux on coupled fields are planned). A
+`jno.fdm` problem can also be **one subdomain of a larger solve** — coupled to a FEM or PINN region by
+overlapping Schwarz or Dirichlet–Neumann, and differentiable through the converged fixed point. See
+[Domain decomposition](domain-decomposition.md).
 
 An axis-aligned 2-D rectangle or 3-D box can use a fast [structured grid](#structured-grid-fast-stencils)
 (`.structured()`) with direct finite-difference stencils in place of the unstructured mesh.

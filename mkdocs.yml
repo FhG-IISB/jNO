@@ -1,5 +1,9 @@
-site_name: Documentation
+site_name: jNO
 site_url: https://fhg-iisb.github.io/jNO/
+site_description: >-
+  jNO (jax Numerical Operators) — a JAX-native library for differentiable numerical
+  methods. FEM, FDM and RCWA solvers and scientific machine learning on one
+  end-to-end differentiable, jit-compiled substrate.
 repo_url: https://github.com/FhG-IISB/jno
 repo_name: FhG-IISB/jno
 docs_dir: docs
@@ -10,8 +14,40 @@ theme:
   name: material
   logo: assets/logo.svg
   favicon: assets/favicon.svg
+  icon:
+    repo: fontawesome/brands/github
+  palette:
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/brightness-4
+        name: Switch to system preference
   features:
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.indexes
+    - navigation.tracking
     - navigation.top
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
 
 plugins:
   - search
@@ -49,6 +85,9 @@ markdown_extensions:
   - pymdownx.inlinehilite
   - pymdownx.snippets:
       base_path: docs
+      # Without this a mistyped section name renders an EMPTY code block and --strict
+      # still passes, so a broken transclusion is invisible. Verified: it does.
+      check_paths: true
   - pymdownx.tabbed:
       alternate_style: true
   - pymdownx.arithmatex:
@@ -72,44 +111,52 @@ not_in_nav: |
   /model-controls/mask-freeze.md
   /model-controls/initialize-dtype-tune.md
   /model-controls/diagnostics.md
+  /misc.md
 
 nav:
   - Home: index.md
-  - Installation: Installation.md
-  - Getting Started: Getting-Started.md
-  - Getting to Know jNO:
+  - Start here:
+    - Installation: Installation.md
+    - Getting Started: Getting-Started.md
     - Concepts: concepts.md
+    - Glossary: Glossary.md
+  - Build a problem:
     - Domain and Geometry: Domain-and-Geometry.md
     - Operations: operations.md
+    - Weak-form vocabulary: weak_form_vocabulary.md
     - jno.numpy Reference: operators/numpy-reference.md
-    - Miscellaneous:
-      - Overview: misc.md
-      - Weights & Biases: misc/wandb.md
-      - Glossary: Glossary.md
-      - Hyperparameter Tuning: Hyperparameter-Tuning.md
-      - Save, Load and Configuration: Save-Load-and-Configuration.md
-  - PINN & NN Training:
+  - Numerical methods:
+    - Finite Element Method:
+      - fem/index.md
+      - Boundary conditions: fem/boundary-conditions.md
+      - One-dimensional problems: fem/one-dimensional.md
+      - Element families: fem/elements.md
+      - Geometry, regions & moving meshes: fem/geometry.md
+      - Differentiable solve & inverse: fem/inverse.md
+      - Vector, coupled & nonlinear: fem/formulations.md
+      - Limits & build time: fem/limitations.md
+    - Finite Difference Method: fdm.md
+    - Rigorous Coupled-Wave Analysis: rcwa.md
+    - Solvers & preconditioners: solvers.md
+    - Domain decomposition: domain-decomposition.md
+    - Inverse Problems: inverse-problems.md
+  - Machine learning:
     - Overview: training/index.md
     - Models: foundation_models/index.md
+    - Running Training: training/running.md
     - Schedules, Resampling & Callbacks:
       - Schedules: adaptive/schedules.md
       - Adaptive Resampling: adaptive/resampling.md
       - Callbacks: adaptive/callbacks.md
-    - Running Training: training/running.md
     - Parallelism: training/parallelism.md
     - Evaluation & Debugging:
       - Evaluation: training/evaluation.md
       - Explainability: training/explainability.md
     - Bayesian Sampling: training/bayesian.md
-    - Inverse Problems: inverse-problems.md
     - Advanced Model Controls:
       - Optimizer & LR: model-controls/optimizer-lr.md
       - LoRA: model-controls/lora.md
       - IREE Deployment: model-controls/iree.md
-  - Traditional Solvers:
-    - Finite Element Method: fem.md
-    - Finite Difference Method: fdm.md
-    - Rigorous Coupled-Wave Analysis: rcwa.md
   - Tutorials:
     - PINN:
       - Laplace 1D: tutorials/01-basics/laplace-1d.md
@@ -131,6 +178,9 @@ nav:
       - Helmholtz + PML (complex): tutorials/08-fem-and-varpinns/helmholtz-pml-2d.md
       - Linear Elasticity (Cantilever): tutorials/08-fem-and-varpinns/linear-elasticity-cantilever.md
       - Navier-Stokes Lid-Driven Cavity: tutorials/08-fem-and-varpinns/navier-stokes-cavity-2d.md
+      - "Navier-Stokes Cylinder (DFG 2D-1)": tutorials/08-fem-and-varpinns/navier-stokes-cylinder-dfg.md
+      - "Stokes 3D (Duct Past a Sphere)": tutorials/08-fem-and-varpinns/stokes-3d-duct-sphere.md
+      - "Thermal Barrier Coating (tied, two meshes)": tutorials/08-fem-and-varpinns/tied-coating-multiscale.md
       - "Rayleigh–Bénard (heat + flow)": tutorials/08-fem-and-varpinns/rayleigh-benard-2d.md
       - "Brittle Fracture (4th-order phase-field, coupled)": tutorials/08-fem-and-varpinns/phase-field-fracture-2d.md
       - "Phase-Field Fracture SENT (the whole study as a term list)": tutorials/08-fem-and-varpinns/phase-field-fracture-sent.md
@@ -149,5 +199,13 @@ nav:
     - Bayesian:
       - Overview: tutorials/10-bayesian-pinns/index.md
       - Bayesian Inverse Coefficient: tutorials/10-bayesian-pinns/bayesian-inverse-coefficient.md
-  - API Reference: API.md
-  - For LLMs: llm.md
+    - RCWA:
+      - "Binary Grating — diffraction orders": tutorials/12-rcwa/binary-grating-orders.md
+  - Reference:
+    - API Reference: API.md
+    - Hyperparameter Tuning: Hyperparameter-Tuning.md
+    - Save, Load and Configuration: Save-Load-and-Configuration.md
+    - Weights & Biases: misc/wandb.md
+    - Troubleshooting: troubleshooting.md
+    - Docs style — callouts: misc/callouts.md
+    - For LLMs: llm.md

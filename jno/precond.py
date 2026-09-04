@@ -40,6 +40,7 @@ __all__ = [
     "inner",
     "block_diag",
     "triangular",
+    "saddle",
     "amg",
     "hypre",
     "ilu",
@@ -761,7 +762,7 @@ class _Form(_Spec):
         solver = self.inner
         # M^{-T} v ~ (Â^{-1})^T v = (Â^T)^{-1} v: run the same inner solver on the transposed
         # auxiliary operator (for a symmetric Â -- e.g. a mass matrix -- op.T behaves like op).
-        return PrecondApplier(lambda v: solver(op, v), lambda v: solver(op.T, v))
+        return PrecondApplier(lambda v: _as_precond(solver, op, v), lambda v: _as_precond(solver, op.T, v))
 
     def __repr__(self):
         what = "<solution-dependent>" if self._terms_fn is not None else f"<{len(self.terms)} terms>"
@@ -822,11 +823,28 @@ class _InnerSolve(_Spec):
             M, Mt = ap, ap.T  # PrecondApplier is callable; .T is its transpose applier
         # transpose applier solves the transposed (sub-)operator, so a non-symmetric block gets a
         # correctly-preconditioned adjoint solve (else reverse-mode stalls -- see PrecondApplier).
-        return PrecondApplier(lambda v: solver(op, v, M=M), lambda v: solver(op.T, v, M=Mt))
+        return PrecondApplier(lambda v: _as_precond(solver, op, v, M), lambda v: _as_precond(solver, op.T, v, Mt))
 
     def __repr__(self):
         p = f", precond={self.precond}" if self.precond is not None else ""
         return f"jno.precond.inner({self.solver}{p})"
+
+
+def _as_precond(solver, op, v, M=None):
+    """Apply a ``jno.solve`` solver as ``M^{-1} v``, with the convergence gate suspended.
+
+    A preconditioner is inexact BY DESIGN -- ``inner(jno.solve.cg(tol=1e-2, maxiter=30))`` asks for
+    two digits deliberately, which is exactly why the outer Krylov must be flexible. Holding such a
+    call to the solver gate's 1e-4 would turn a correct configuration into an error; the contract
+    belongs to the outer solve, which IS gated.
+
+    ``M`` is the inner solve's OWN preconditioner (``inner(..., precond=...)``), already materialized
+    against this sub-operator; ``None`` runs the inner Krylov unpreconditioned.
+    """
+    from .utils.solver.solver_api import gate_suspended
+
+    with gate_suspended():
+        return solver(op, v, M=M)
 
 
 def inner(solver, *, precond=None) -> _InnerSolve:
@@ -1028,6 +1046,264 @@ def triangular(*pairs) -> _Triangular:
     *Finite Elements and Fast Iterative Solvers*, 2nd ed., OUP 2014, §9.2). With inexact
     (iterative) block solves the outer Krylov must be flexible: ``jno.solve.fgmres()``."""
     return _Triangular(list(pairs))
+
+
+class _CahouetChabard(_Spec):
+    """Schur applier ``S^-1 ~ (1/mass_weight) M_p^-1 + (1/laplace_weight) L_p^+``; see :func:`saddle`.
+
+    A **sum of inverses**, not the inverse of a sum -- which is exactly why it cannot be written as
+    one :func:`form`: the pressure mass and the pressure Laplacian are inverted separately and their
+    applications added (Cahouet & Chabard, *Int. J. Numer. Methods Fluids* **8**, 869-895, 1988,
+    section 3). Each limit recovers the approximation that is right there: with no reaction term the
+    Laplacian leg is switched off entirely and this IS the pressure-mass recipe; with no viscosity
+    the Schur complement of ``alpha*M_u`` really is ``(1/alpha) L_p``.
+
+    The pressure Laplacian is a **pure-Neumann** operator: the constant is an exact null vector, and
+    a sparse LU of it does not fail -- it factors happily and then applies garbage. So the auxiliary
+    carries its own gauge (``pin()``, the same one a pressure field uses) to make the factorisation
+    well-posed, and the applier projects the constant out on both sides to recover the pseudo-inverse
+    the approximation actually calls for.
+    """
+
+    def __init__(self, mass_weight, laplace_weight):
+        self.mass_weight = float(mass_weight)
+        self.laplace_weight = float(laplace_weight)
+        self._mass = None
+        self._lap = None
+
+    def _build(self, fem):
+        if self._mass is not None:
+            return
+        from . import solve as _s
+        from ._fem import _fe_symbols_bound
+
+        ui, vi, _axes = _fe_symbols_bound(fem.domain)
+        self._mass = form([self.mass_weight * ui * vi], inner=_s.lu(backend="host"))
+
+        # The Laplacian needs the UNBOUND symbol as well as the bound one -- `pin()` is a gauge on
+        # the field, not on a coordinate-bound expression -- so it builds its own pair rather than
+        # reusing the mass form's.
+        domain = fem.domain
+        u_sym, v_sym = domain.fem_symbols()
+        coords = domain.variable("interior", split=True)
+        axes = ("x", "y", "z")[: int(domain.dimension)]
+        ub = u_sym.bind(**{ax: coords[i] for i, ax in enumerate(axes)})
+        vb = v_sym.bind(**{ax: coords[i] for i, ax in enumerate(axes)})
+        stiff = None
+        for ax in axes:
+            leg = getattr(ub, ax) * getattr(vb, ax)
+            stiff = leg if stiff is None else stiff + leg
+        self._lap = form([self.laplace_weight * stiff, u_sym.pin()], inner=_s.lu(backend="host"))
+
+    def prepare(self, fem):
+        self._build(fem)
+        self._mass.prepare(fem)
+        self._lap.prepare(fem)
+
+    def materialize(self, ctx: PrecondContext):
+        if self._mass is None:
+            if ctx.fem is None:
+                raise TypeError(
+                    "jno.precond.saddle(laplace_weight=...) needs the owning FEM to assemble the "
+                    "pressure auxiliaries (use it via fem.solve(precond=...))."
+                )
+            self._build(ctx.fem)
+        m_apply = self._mass.materialize(ctx)
+        l_apply = self._lap.materialize(ctx)
+
+        def lap_pinv(v):
+            # Project into range(L) going in and out of null(L) coming back. The gauge pin makes the
+            # FACTORISATION well-posed; it does not make the solve the pseudo-inverse, because the
+            # answer is still free by the constant the pin happened to fix. Both projections are
+            # needed: the first so the pinned system is consistent, the second so the returned
+            # correction carries no constant of its own.
+            w = v - jnp.mean(v)
+            x = l_apply(w)
+            return x - jnp.mean(x)
+
+        # Both legs are symmetric (a mass matrix, and a symmetrically-pinned Laplacian -- measured
+        # exactly symmetric), so the sum is too and needs no separate transpose applier.
+        return PrecondApplier(lambda v: m_apply(v) + lap_pinv(v))
+
+    def __repr__(self):
+        return f"jno.precond._CahouetChabard(mass_weight={self.mass_weight}, laplace_weight={self.laplace_weight})"
+
+
+class _Saddle(_Spec):
+    """Spec for the standard saddle-point recipe; see :func:`saddle`.
+
+    Resolution is deferred to ``prepare``/``materialize`` because the blocks are a property of the
+    OWNING system, not of the spec: which block is the constraint is read from the FEM's structural
+    saddle detection, so the same ``saddle()`` object composes onto any saddle system.
+    """
+
+    def __init__(self, mass_weight, laplace_weight=None):
+        self.mass_weight = float(mass_weight)
+        self.laplace_weight = None if laplace_weight is None else float(laplace_weight)
+        self._resolved = None
+
+    def _compose(self, fem):
+        """The ``triangular`` composition this spec stands for, built once against ``fem``."""
+        if self._resolved is not None:
+            return self._resolved
+        if fem is None:
+            raise TypeError(
+                "jno.precond.saddle() needs the owning FEM to find the constraint block "
+                "(use it via fem.solve(precond=...))."
+            )
+        idx = tuple(getattr(fem, "_saddle_block_indices", ()) or ())
+        blocks = fem.blocks
+        if not idx:
+            raise ValueError(
+                "jno.precond.saddle(): this system has no saddle block -- every field has a diagonal "
+                "block, so there is no zero-diagonal constraint for a pressure-mass Schur approximation "
+                "to stand in for. Use a preconditioner for the structure you do have "
+                "(jno.precond.amg(), jno.precond.jacobi()), or compose the blocks yourself with "
+                "jno.precond.triangular((field, spec), ...)."
+            )
+        # The Schur approximation assembled here is the P1 mass matrix on the domain's scalar space,
+        # so it only stands for a constraint field discretised on THAT space (Taylor-Hood pressure).
+        # A multiplier on any other space would silently get a matrix of the wrong size -- refuse by
+        # name instead, and say which block and what the sizes were.
+        n_p1 = int(getattr(fem.domain, "mesh").points.shape[0])
+        names = tuple(getattr(fem, "_saddle_blocks", ()) or ())
+        for j, i in enumerate(idx):
+            size = int(blocks[i].stop - blocks[i].start)
+            if size != n_p1:
+                who = names[j] if j < len(names) else f"block {i}"
+                raise NotImplementedError(
+                    f"jno.precond.saddle(): the constraint block {who!r} has {size} dofs but the "
+                    f"domain's P1 space has {n_p1} -- the weighted pressure MASS matrix this builds is "
+                    "a P1 Gram matrix, so it is only the right Schur approximation for a constraint "
+                    "field of P1 (Taylor-Hood pressure). Compose the right auxiliary explicitly: "
+                    "jno.precond.triangular((u, jno.precond.amg()), (p, jno.precond.form([...])))."
+                )
+        from . import solve as _s
+        from ._fem import _fe_symbols_bound
+
+        # The auxiliaries are inverted EXACTLY, on the host, in float64. That is what keeps the whole
+        # preconditioner a fixed linear operator -- an inexact inner solve would make it vary between
+        # applications, which a non-flexible Krylov method (gmres) is not allowed to see.
+        if self.laplace_weight is None:
+            ui, vi, _axes = _fe_symbols_bound(fem.domain)
+            schur = form([self.mass_weight * ui * vi], inner=_s.lu(backend="host"))
+        else:
+            schur = _CahouetChabard(self.mass_weight, self.laplace_weight)
+        pairs = []
+        for i in range(len(blocks)):
+            pairs.append((i, schur if i in idx else amg()))
+        self._resolved = _Triangular(pairs)
+        return self._resolved
+
+    def prepare(self, fem):
+        self._compose(fem).prepare(fem)
+
+    def materialize(self, ctx: PrecondContext):
+        return self._compose(ctx.fem).materialize(ctx)
+
+    def __repr__(self):
+        lw = "" if self.laplace_weight is None else f", laplace_weight={self.laplace_weight}"
+        return f"jno.precond.saddle(mass_weight={self.mass_weight}{lw})"
+
+
+def saddle(*, mass_weight: float = 1.0, laplace_weight: float | None = None) -> _Saddle:
+    """The standard **saddle-point** preconditioner, as one call.
+
+    Composes the classical Stokes recipe over the system's own block structure -- algebraic multigrid
+    on the momentum block, a weighted pressure **mass** matrix as the Schur-complement approximation,
+    assembled block-upper-triangularly (Elman, Silvester & Wathen, *Finite Elements and Fast Iterative
+    Solvers*, 2nd ed., OUP 2014, section 9.2)::
+
+        fem.solve(linear=jno.solve.fgmres(tol=1e-10, restart=150),
+                  precond=jno.precond.saddle(mass_weight=1.0 / mu))
+
+    which is the one-line form of::
+
+        jno.precond.triangular((u, jno.precond.amg()), (p, jno.precond.form([(1 / mu) * pi * qi])))
+
+    The constraint block is found structurally -- the field whose test function never meets its own
+    trial function, so the operator has no diagonal there -- which is exactly the block a diagonal
+    (Jacobi) preconditioner cannot touch, and the reason ``fem.solve()``'s matrix-free default warns
+    on a saddle system. No symbols are passed: the pressure mass is assembled on the domain's own P1
+    space, so this reads the same on 2-D and 3-D Taylor-Hood.
+
+    ``mass_weight`` scales that mass matrix and is **explicit, never inferred**. The pressure-mass
+    Schur approximation wants ``1/mu``; recovering ``mu`` from an arbitrary weak form is fragile, and
+    a variable or solution-dependent viscosity would silently take the wrong weight and cost
+    iterations without ever failing. The default ``1.0`` is right for ``mu = 1``; pass the reciprocal
+    viscosity otherwise. A wrong weight changes convergence SPEED only, never the answer.
+
+    Give ``fgmres`` enough restart. Its default ``restart=30`` **stagnates** on a 3-D Taylor-Hood
+    block preconditioner, and the failure is quiet -- it still returns, just slower and less
+    accurate. Measured at 4302 dofs, ``tol=1e-10``: ``restart=30`` took 2.30 s to reach 3.3e-06,
+    ``restart=150`` took 0.49 s to reach 3.3e-09 -- 4.7x faster for a thousand times the accuracy,
+    because restarting discards the Krylov subspace the preconditioner just earned. Larger systems
+    want a larger restart still.
+
+    Pair it with ``jno.solve.fgmres`` -- the pairing the block preconditioners are verified against.
+    ``jno.solve.minres`` does not apply: block-upper-triangular is nonsymmetric by construction and
+    MINRES's short recurrence assumes symmetry, so it stalls (loudly, on the residual guard, rather
+    than returning a plausible wrong field); use :func:`block_diag` if a symmetric preconditioner is
+    required. The non-flexible ``jno.solve.gmres`` is admissible in principle -- the mass block is
+    inverted exactly, so this is a fixed linear operator -- but breaks down in the default float32
+    build, exactly as the explicit :func:`triangular` composition does; prefer ``fgmres``.
+
+    **The mass matrix alone is the pure-Stokes approximation, and it degrades on a
+    reaction-dominated system.** The pressure mass stands in for the Schur complement of
+    ``-mu*Lap(u) + grad(p)``; add a strong reaction term -- a Brinkman/Darcy drag ``alpha*u``, as
+    porous-medium flow and fluid topology optimisation both do, or the ``1/dt`` mass of a small
+    implicit time step -- and the Schur complement stops looking like a mass matrix. It still
+    converges, but the mesh-robustness the recipe exists for is gone.
+
+    ``laplace_weight`` is the fix: it switches the Schur approximation to **Cahouet-Chabard**, a
+    pressure mass PLUS a pressure Laplacian, ``S^-1 ~ mu*M_p^-1 + alpha*L_p^-1`` (Cahouet & Chabard,
+    *Int. J. Numer. Methods Fluids* **8**, 869-895, 1988, section 3)::
+
+        fem.solve(linear=jno.solve.fgmres(tol=1e-10, restart=150),
+                  precond=jno.precond.saddle(mass_weight=1.0 / mu, laplace_weight=1.0 / alpha))
+
+    Both weights follow the same convention -- **the reciprocal of the coefficient the term stands
+    for** -- so ``mass_weight=1/mu`` applies ``mu*M_p^-1`` and ``laplace_weight=1/alpha`` applies
+    ``alpha*L_p^-1``. Measured through this spec on a 2-D Brinkman channel (``mu = 1``,
+    ``mesh_size=0.12``, preconditioned GMRES to ``1e-8``, ``restart=200``):
+
+    ==========  ===========  ================
+    ``alpha``   mass only    Cahouet-Chabard
+    ==========  ===========  ================
+    ``0``       83           83
+    ``1e2``     135          60
+    ``1e3``     503          76
+    ``1e4``     2312         74
+    ==========  ===========  ================
+
+    The point is not the 31x at ``alpha = 1e4`` but the **flatness**: the count stops tracking
+    ``alpha``. The same collapse shows with the momentum block inverted exactly rather than by AMG
+    (``31 / 63 / 134 / 189`` becoming ``31 / 26 / 25 / 24`` over the same four values), which is how
+    one can tell it is the Schur approximation doing the work and not the multigrid.
+
+    At ``alpha = 0`` the Laplacian leg contributes nothing and the two are the same preconditioner --
+    the table's first row is one number measured twice. So there is no reason to pass
+    ``laplace_weight`` on a pure Stokes problem; it only buys an extra factorisation. Left ``None``
+    (the default) the Laplacian is never assembled at all.
+
+    The pressure Laplacian is **pure-Neumann and therefore singular** -- the constant is an exact
+    null vector. That is a quiet failure mode, not a loud one: a sparse LU of it factors without
+    complaint and then applies nonsense. The auxiliary carries its own gauge pin so the
+    factorisation is well-posed, and the applier projects the constant out on both sides to give the
+    pseudo-inverse. There is no user knob for this and no tolerance to tune.
+
+    Scope: needs ``pyamg`` for the momentum block (a clear ``ImportError`` otherwise), and the
+    constraint field must be P1 -- both refuse by name rather than mis-solving. Cahouet-Chabard is
+    derived for a **constant** ``alpha``; with a spatially varying drag (the ``alpha(rho)`` of a
+    topology optimisation, which is the case that most wants this) a single scalar weight is a
+    compromise, and the sensible choice is a representative value such as the mean over the design
+    field -- it degrades gracefully rather than failing, but it is no longer the sharp approximation
+    the table above measures. For anything else (a different momentum solver, an inexact inner solve
+    on a very large pressure block, more than one constraint field on mixed spaces, a genuinely
+    variable-coefficient Laplacian) compose :func:`triangular` directly; this is a shorthand for the
+    common cases, not a replacement for it.
+    """
+    return _Saddle(mass_weight, laplace_weight)
 
 
 class _AMG(_Spec):
@@ -1508,7 +1784,14 @@ class _AMS(_Spec):
         # per apply. A one-shot solver re-runs its own setup each iteration; to amortize a jaxamg
         # hierarchy across the Krylov loop it needs a setup-once handle (a jaxamg AmgX setup/solve split) —
         # wire that here once exposed. ``csr`` is unused on this path.
-        return lambda op, csr: lambda rhs: aux(op, rhs)
+        #
+        # Through :func:`_as_precond`, so the convergence gate stands down exactly as it does for
+        # :func:`inner`. An auxiliary solve IS a preconditioner application: ``aux=jno.solve.cg(tol=1e-3)``
+        # asks for three digits on purpose and is driven by a flexible outer solver for that reason. A
+        # Krylov aux also has a floor of its own here -- cg stalls at ~6e-4 on the curl-curl auxiliary
+        # whether it is asked for 1e-3 or 1e-6 (see the ``_AMG`` branch above) -- so gating it at 1e-4
+        # refused a configuration the library documents and tests as correct.
+        return lambda op, csr: lambda rhs: _as_precond(aux, op, rhs)
 
     def materialize(self, ctx: PrecondContext):
         f = self._frozen if self._frozen is not None else self._assemble_aux(ctx)  # frozen (built) or eager

@@ -83,8 +83,9 @@ def _uniform_grid_spec(domain, n_values: int):
         if not shape:
             raise ValueError(
                 "scheme='spectral' requires a uniform grid, and this domain has none. Build it with "
-                "jno.domain(..., structured=True) (which records the spacing), or use "
-                "scheme='finite_difference' on an unstructured mesh."
+                "Shape.structured() -- e.g. jno.Shape.rect(0, 0, 1, 1, size=h).structured().domain() "
+                "-- which records the grid descriptor, or use scheme='finite_difference' on an "
+                "unstructured mesh."
             )
         shape = tuple(int(s) for s in shape)
         pts = np.asarray(domain.mesh_connectivity["points"])[:, : len(shape)]

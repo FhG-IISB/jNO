@@ -3,7 +3,9 @@
 The fastest path from a fresh install to a first PDE solve. Complete
 [Installation](Installation.md) first, then build the example up one step at a time.
 
-We solve a **2-D Poisson** problem on the unit square with a physics-informed network (PINN):
+We solve a **2-D Poisson** problem on the unit square — first with a physics-informed network
+(PINN), then, at the end, the *same problem* through the FEM and FDM front doors. All three are
+written in one language and checked against the same exact solution:
 
 $$-\nabla^2 u = 2\pi^2 \sin(\pi x)\sin(\pi y), \quad u\big|_{\partial\Omega}=0
 \quad\Rightarrow\quad u^\ast = \sin(\pi x)\sin(\pi y).$$
@@ -87,11 +89,55 @@ print(pred.shape)                       # the learned field, sampled on the fine
 
 ---
 
+## The same problem, the other two ways
+
+Nothing above was PINN-specific except the trial function. The identical BVP — same domain, same
+forcing, same boundary condition — goes through `jno.fem` as a **weak** form and `jno.fdm` as a
+**strong** one. The forcing `fq` is the same expression, now bound to quadrature coordinates:
+
+```python
+xi, yi, _ = dom.variable("interior", split=True)
+xb, yb, _ = dom.variable("boundary", split=True)
+fq = 2 * pi**2 * jnn.sin(pi * xi) * jnn.sin(pi * yi)
+
+# FEM — the weak form, with a test function v
+U, V = dom.fem_symbols()
+Ui, Vi = U.bind(x=xi, y=yi), V.bind(x=xi, y=yi)
+u_fem = jno.fem([Ui.x * Vi.x + Ui.y * Vi.y - fq * Vi,    # ∫∇u·∇v − ∫f·v = 0
+                 U(xb, yb) - 0.0]).solve()
+
+# FDM — the strong form, collocated at the nodes, no test function
+w  = dom.unknown()
+wi = w.bind(x=xi, y=yi)
+u_fdm = jno.fdm([-wi.d2(xi) - wi.d2(yi) - fq,            # −Δu = f
+                 w(xb, yb) - 0.0]).solve()
+```
+
+Measured against the exact $u^\ast=\sin(\pi x)\sin(\pi y)$ on the same `size=0.04` mesh:
+
+| Method | What you wrote | relative $L^2$ error |
+|---|---|---|
+| PINN | a network + the strong-form residual as a loss | `0.0002` |
+| FEM | the weak form as a term list | `0.0002` |
+| FDM | the strong form as a term list | `0.0078` |
+
+The FDM number is the honest one to notice: strong-form collocation on an *unstructured* triangular
+mesh is less accurate here than P1 FEM on the same nodes. Use `structured=True` on the domain for
+the regular-grid stencils FDM is really built for.
+
+The point is not the ranking — it is that switching method changed the *term list*, not the
+framework. And because each of these is a differentiable node, any of them can be dropped into an
+objective to recover a coefficient or a shape; see [Concepts](concepts.md#composition-concretely).
+
+---
+
 ## Where to go next
 
 - **Geometry** — build real shapes (CSG, curved boundaries, mesh density): [Domain & Geometry](Domain-and-Geometry.md).
 - **Operators** — every derivative / integral you can write into a residual: [Operations](operations.md#differentiation).
-- **Training** — schedules, resampling, callbacks, parallelism: [PINN & NN Training](training/index.md).
+- **Training** — schedules, resampling, callbacks, parallelism: [Machine learning](training/index.md).
 - **Model controls** — freeze, mask, LoRA, dtype, tuning: [Operations → Part B](operations.md#part-b-operations-that-require-trainable-parameters).
-- **Traditional solvers** — assemble and solve a weak form: [Finite Element Method](fem.md).
+- **Numerical methods** — assemble and solve a weak form or a stencil:
+  [FEM](fem/index.md), [FDM](fdm.md), [RCWA](rcwa.md), and
+  [solvers & preconditioners](solvers.md).
 - **Tutorials** — worked end-to-end examples (PINN, operator learning, FEM, Bayesian): [Tutorials](tutorials/01-basics/laplace-1d.md).

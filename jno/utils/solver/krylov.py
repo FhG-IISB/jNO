@@ -3,7 +3,7 @@
 These are the *only* iteration loops jNO implements itself (design rule: reuse
 ``jax.scipy.sparse.linalg`` / ``sparse_lu_solve`` for everything that exists upstream — see
 ``plans/fem-solver-api.md``). Each is textbook-grade with a published pseudocode origin, cited in
-its docstring and in ``docs/fem.md``, and is pinned against a scipy/dense oracle in
+its docstring and in ``docs/solvers.md``, and is pinned against a scipy/dense oracle in
 ``tests/test_fem_solver_krylov.py``.
 
 All three are fixed-shape ``lax.while_loop``/``fori_loop`` implementations: ``jit``- and

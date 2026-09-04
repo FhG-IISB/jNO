@@ -61,9 +61,19 @@ def _stokes(pin_mode: str, pin_value: float = 0.0):
         d.point_region("ppin", (0.0, 0.0))
         xpn, ypn, _ = d.variable("ppin", split=True)
         cons.append(p(xpn, ypn) - 0.0)
+    elif pin_mode == "mean":
+        cons.append(p.pin(mean=True))
     else:
         cons.append(p.pin(pin_value))
     return d, jno.fem(cons)
+
+
+def _pressure_load(d):
+    """``L_i = int phi_i dx`` on the P1 space -- the weights the zero-mean gauge integrates with."""
+    a, b = d.fem_symbols(order=1, names=("_la", "_lb"))
+    xi, yi, _ = d.variable("interior", split=True)
+    ai, bi = a.bind(x=xi, y=yi), b.bind(x=xi, y=yi)
+    return np.asarray(jno.fem([ai * bi - 1.0 * bi]).b).reshape(-1)
 
 
 def test_pin_matches_explicit_point_region_steady():
@@ -125,6 +135,8 @@ def _cavity(pin_mode: str, nu: float = 0.05):
         d.point_region("ppin", (0.0, 0.0))
         xpn, ypn, _ = d.variable("ppin", split=True)
         cons.append(p(xpn, ypn) - 0.0)
+    elif pin_mode == "mean":
+        cons.append(p.pin(mean=True))
     else:
         cons.append(p.pin())
     return jno.fem(cons)
@@ -206,3 +218,77 @@ def test_pin_idempotent_across_two_fem_calls():
     s1 = np.linalg.solve(_dense(fem1.A), np.asarray(fem1.b).reshape(-1))
     s2 = np.linalg.solve(_dense(fem2.A), np.asarray(fem2.b).reshape(-1))
     assert np.allclose(s1, s2, atol=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# Zero-mean gauge -- p.pin(mean=True)
+#
+# A point pin fixes one vertex's DISCRETE value to a CONTINUOUS one, and the constant it leaves
+# behind does not shrink with the mesh. Measured in 3-D on a manufactured Stokes solution, that is
+# enough to stop the pressure converging at all (the L2 error rises again under refinement) while
+# the field is correct up to that constant. `mean=True` re-levels to `int p dx == 0` instead.
+# ---------------------------------------------------------------------------
+def test_mean_gauge_zeroes_the_pressure_integral():
+    """The defining property, read through the public solve path."""
+    d_m, fem_m = _stokes("mean")
+    d_v, fem_v = _stokes("pin", 0.0)
+    L = _pressure_load(d_m)
+    off = fem_m.offsets
+
+    s_m = np.asarray(fem_m.solve(linear=jno.solve.lu(backend="host")))
+    s_v = np.asarray(fem_v.solve(linear=jno.solve.lu(backend="host")))
+    vol = float(L.sum())
+    assert abs(float(s_m[off[1] :] @ L)) < 1e-12 * max(vol, 1.0)
+    # ...and the point pin genuinely does not have it, so the assertion above has teeth
+    assert abs(float(s_v[off[1] :] @ L)) > 1e-6
+
+
+def test_mean_gauge_moves_only_the_pressure_and_only_by_a_constant():
+    """It is a re-levelling, not a different solve: the velocity cannot move (the correction is
+    masked to the pressure block) and the pressure moves by ONE constant, not a field."""
+    _, fem_m = _stokes("mean")
+    _, fem_v = _stokes("pin", 0.0)
+    off = fem_m.offsets
+    s_m = np.asarray(fem_m.solve(linear=jno.solve.lu(backend="host")))
+    s_v = np.asarray(fem_v.solve(linear=jno.solve.lu(backend="host")))
+
+    np.testing.assert_allclose(s_m[: off[1]], s_v[: off[1]], rtol=0, atol=1e-12)
+    delta = s_m[off[1] :] - s_v[off[1] :]
+    # The gate is on the SPREAD, not the size: a re-levelling adds one number to every node, so any
+    # spread is the direct-solve's own round-off (measured 2e-12 here) rather than a change of field.
+    assert np.ptp(delta) < 1e-9, f"the shift is not constant across the field: spread {np.ptp(delta):.2e}"
+
+
+def test_mean_gauge_and_a_pin_value_are_two_gauges_and_refuse_to_combine():
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.4)
+    p, _ = d.fem_symbols(names=("p", "q"), order=1)
+    with pytest.raises(ValueError, match="two different gauges"):
+        p.pin(2.0, mean=True)
+    p.pin(0.0, mean=True)  # the default value is not a conflict
+
+
+def test_mean_gauge_projection_is_pure_jax():
+    """The correction is written as mask * (L . u) / sum(L) precisely so it survives the transforms
+    -- a gauge that silently stepped aside under `jit` would be the bug this feature exists to fix."""
+    _, fem_m = _stokes("mean")
+    u = jnp.asarray(fem_m.solve(linear=jno.solve.lu(backend="host")))
+
+    eager = np.asarray(fem_m._gauge_project(u))
+    jitted = np.asarray(jax.jit(fem_m._gauge_project)(u))
+    np.testing.assert_allclose(jitted, eager, rtol=0, atol=1e-14)
+
+    g = jax.grad(lambda w: jnp.sum(fem_m._gauge_project(w) ** 2))(u)
+    assert np.all(np.isfinite(np.asarray(g))) and g.shape == u.shape
+
+
+def test_mean_gauge_normalises_every_frame_of_a_transient():
+    """The projection contracts the DOF axis with `keepdims`, so a trajectory is normalised
+    per step by the same expression the steady vector uses -- no per-driver plumbing."""
+    fem = _cavity("mean")
+    L = _pressure_load(fem.domain)
+    off = fem.offsets
+    sol = fem.solve()
+    traj = np.asarray(jno.core([sol.mse]).eval([sol])) if hasattr(sol, "mse") else np.asarray(sol)
+    assert traj.ndim == 2, f"expected a trajectory, got shape {traj.shape}"
+    ip = traj[:, off[1] :] @ L
+    assert np.abs(ip).max() < 1e-10, f"a frame kept a non-zero pressure integral: {np.abs(ip).max():.2e}"

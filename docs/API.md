@@ -189,7 +189,7 @@ accuracy numbers and the periodicity caveat.
 ## Solvers and preconditioners
 
 `jno.solve` and `jno.precond` are the slots that `fem.solve(linear=…, nonlinear=…,
-precond=…, time=…)` composes (see the [FEM guide](fem.md)). The families:
+precond=…, time=…)` composes (see the [FEM guide](fem/index.md)). The families:
 
 | Kind | `jno.solve` |
 | --- | --- |
@@ -201,6 +201,73 @@ precond=…, time=…)` composes (see the [FEM guide](fem.md)). The families:
 | **Singular values** | `svd` (partial SVD of a **rectangular**, matrix-free operator — POD bases, inverse-problem ill-posedness) |
 | **Matrix functions** (stochastic Lanczos, matrix-free) | `logdet`, `trace`, `applyfun` (`f(A)·v`), `diagonal` |
 | **Time integration** | `theta` (θ-method), `exponential` (exponential integrator), `adaptive` (step-doubling adaptive step size) |
+
+### Matrix functions — what `Ax = b` cannot express
+
+`logdet`, `trace`, `applyfun` and `diagonal` touch the operator only through its matvec, so they scale
+where a factorization cannot, and they are differentiable. They answer questions a linear solve
+cannot: the Bayesian **log-evidence** of a FEM precision, an **effective-degrees-of-freedom** count, a
+per-DOF **uncertainty map**, and one exact **exponential-integrator step**.
+
+```python
+A, _ = jno.fem([ui * vi + ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0]).operator
+
+jno.solve.logdet(A, samples=64)                          # log det A          — log-evidence
+jno.solve.trace(A, fun=lambda z: 1 / z, samples=64)      # tr(A⁻¹)            — effective DOFs
+jno.solve.diagonal(A, fun=lambda z: 1 / z, samples=256)  # diag(A⁻¹) as a FIELD, plottable on the mesh
+jno.solve.applyfun(A, u0, fun=lambda z: jnp.exp(-dt * z))  # exp(-dt·A)·u₀    — one exact step
+```
+
+!!! measured "Accuracy on a 198-DOF FEM precision operator (cond 45)"
+    | quantity | estimate | exact | rel |
+    |---|---|---|---|
+    | `logdet` (samples=64) | 168.99 | 167.22 | 1.1e-02 |
+    | `trace(1/z)` (samples=64) | 119.65 | 118.20 | 1.2e-02 |
+    | `diagonal(1/z)` (samples=256) | — | — | 1.1e-01 (L2 over the field) |
+    | `applyfun` exp step | — | — | **1.1e-15** |
+
+    The first three are **stochastic** — Hutchinson probes plus Lanczos quadrature — so a percent or
+    so is the expected accuracy, not a defect: variance falls with `samples`, bias with `order`.
+    `applyfun` is **deterministic** (a Krylov approximation, no probes) and essentially exact.
+
+    Differentiating works through the estimator: `d(log det cA)/dc` came back **152.198** against the
+    closed form `n/c = 152.308`.
+
+!!! danger "`order` must stay below the Krylov dimension — and a pinned FEM operator's is small"
+    Lanczos can only build a subspace as large as the number of **distinct** eigenvalues the probe
+    sees. A jNO FEM operator has far fewer than it has rows: every Dirichlet-pinned DOF is an identity
+    row, so eigenvalue 1.0 carries the pinned count as its multiplicity.
+
+    Measured on 2-D Poisson at mesh 0.25 — n=30, 16 pinned rows, only **15 distinct** eigenvalues —
+    the default `order=25` overran that and `logdet` returned `NaN`. It now raises instead, naming the
+    cause. The operator above is fine (198 rows, 151 distinct); a coarse mesh with a large boundary
+    fraction is not. Lower `order`, or apply the estimator to the free-DOF operator.
+
+    `applyfun` is **not** affected: its `order` is an upper bound, and it stops at the order that has
+    actually converged (see below). The stochastic three have no such ladder, so `order` is a real
+    request there.
+
+!!! measured "`applyfun` picks its own order"
+    `order` is an upper **bound** on the Krylov dimension, not an exact request — the same meaning
+    `maxiter` has for every iterative solver here. Running past the dimension a problem supports used
+    to degrade catastrophically and silently, because the Lanczos sub-diagonal does not collapse to
+    zero as a textbook "happy breakdown" would; it **explodes** (0.27 → 2.2 → … → 184.7), the
+    residual being pure round-off whose normalisation gives basis vectors of noise. On the 30-DOF
+    operator above, `exp(A)·1` against a true 49.02:
+
+    | `order` | before | now |
+    |---|---|---|
+    | 15 | 3.35e-15 | 3.26e-15 |
+    | 20 | 1.44e-10 | **3.26e-15** |
+    | 25 | **5.11e+35** | **3.17e-15** |
+    | 29 | **1.85e+74** | **3.17e-15** |
+
+    Note order 20 — this is not only a fix for the catastrophic end, it is *more accurate* wherever
+    round-off has begun to contaminate the basis. The rule is the standard a-posteriori one (Saad,
+    *SIAM J. Numer. Anal.* **29**(1), 1992, §4): accept the first order whose approximation agrees
+    with its predecessor. Every nested approximation comes from the **same** decomposition, so it
+    costs small dense eigendecompositions and **no extra matvecs** — measured overhead 0.17 ms at
+    n=513 and 0.41 ms at n=8355.
 
 ### Eigenproblems at scale
 
@@ -457,3 +524,182 @@ authors of custom operators.
 ::: jno.trace.Integral
 
 ::: jno.trace.Noise
+
+---
+
+## Numerical-method front doors
+
+Each takes a **term list** and returns an object carrying the assembled problem. The narrative
+guides are [FEM](fem/index.md), [FDM](fdm.md) and [RCWA](rcwa.md); this is the signature-level
+reference.
+
+### `jno.fem`
+
+::: jno._fem.fem
+
+### The `FEM` object
+
+::: jno._fem.FEM
+    options:
+      members:
+        - solve
+        - eigs
+        - eval
+        - residual
+        - jacobian
+        - operator
+        - offsets
+        - blocks
+        - block_index
+        - region_dofs
+        - points
+        - field_points
+        - dofs
+        - stats
+        - is_linear
+        - is_transient
+        - is_complex
+
+### `jno.fdm`
+
+::: jno.fdm.fdm
+
+### `jno.rcwa`
+
+::: jno.rcwa.rcwa
+
+::: jno.rcwa.Rcwa
+    options:
+      members:
+        - solve
+        - spec
+
+::: jno.rcwa.RcwaSpec
+
+#### The RCWA solution
+
+Returned by `rcwa(...).solve()`. Every readout is a differentiable JAX array, so a transmission or
+per-order objective can be optimised straight through the modal solve.
+
+::: jno.rcwa._Sol
+    options:
+      heading_level: 5
+      members:
+        - efficiency
+        - order
+        - jones
+        - field
+        - field3d
+        - aerial
+
+::: jno.rcwa.RcwaError
+
+---
+
+## Geometry
+
+::: jno.geometry.shape.Shape
+
+::: jno.geometry.path.Path
+
+---
+
+## Optimizers (`jno.optimizers`)
+
+Optax-compatible transformations. Anything optax exposes works too — these are the additions jNO
+needs for PDE-constrained and topology-optimisation work.
+
+::: jno.optimizers
+
+---
+
+## Bayesian inference (`jno.bayesian`)
+
+Backs `model.bayesian(...)` / `model.vi(...)`; see [Bayesian Sampling](training/bayesian.md).
+
+::: jno.bayesian
+    options:
+      members:
+        - rhat
+        - ess
+        - priors
+        - default_gaussian_prior
+        - laplace
+        - pathfinder
+        - LaplaceInitializer
+        - PathfinderInitializer
+        - SVGDInitializer
+
+---
+
+## Noise nodes (`jno.noise`)
+
+::: jno.noise._NoiseNamespace
+    options:
+      members:
+        - gaussian
+        - uniform
+        - laplace
+        - grf
+
+---
+
+## Units & non-dimensionalization (`jno.units`)
+
+Annotate the dimension and characteristic magnitude of a leaf with `.unit(...)` / `.scale(...)`, then
+audit consistency, extract the dimensionless groups (Fourier, Péclet, …) of a residual, and rewrite
+it to a well-scaled `O(1)` form. Worked usage: [Operations → Units &
+non-dimensionalization](operations.md#units-non-dimensionalization).
+
+::: jno.trace.units
+    options:
+      members:
+        - check
+        - infer
+        - nondimensionalize
+        - rescale
+        - Unit
+        - Rescaler
+        - NondimReport
+        - UnitLogger
+
+---
+
+## Adaptive resampling (`jno.sampler`)
+
+Residual-adaptive collocation strategies — see [Adaptive Resampling](adaptive/resampling.md).
+
+::: jno.utils.adaptive.resampling
+    options:
+      members:
+        - sampler
+        - ResamplingStrategy
+        - RAD
+        - RARD
+        - CR3
+        - R3
+        - PINNFluence
+        - HA
+        - RandomResampling
+
+---
+
+## Parameter-efficient fine-tuning (`jno.lora`)
+
+Attached with `.lora(...)` on a wrapped model — see [LoRA](model-controls/lora.md).
+
+::: jno.lora
+
+---
+
+## Training trackers (`jno.trackers`)
+
+Diagnostics attachable as callbacks — see [Explainability](training/explainability.md).
+
+::: jno.trackers
+
+---
+
+## Deployment (`jno.iree`)
+
+::: jno.utils.iree.IREEModel
