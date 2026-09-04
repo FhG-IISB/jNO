@@ -179,8 +179,8 @@ def test_each_region_is_meshed_at_its_own_resolution():
     assert hi > 2 * lo, f"a 3x size ratio must give genuinely different node counts, got {lo} vs {hi}"
 
 
-def _poisson_2d(d):
-    u, v = d.fem_symbols()
+def _poisson_2d(d, order=1):
+    u, v = d.fem_symbols(order=order)
     s, m = _interface_tags(d)
     c = d.variable("interior", split=True)
     b = d.variable("boundary", split=True)
@@ -209,6 +209,51 @@ def test_a_graded_interface_uses_the_mortar_coupling():
     finally:
         fu.build_periodic_prolongation = orig
     assert abs(graded - same) / same < 0.05, f"graded {graded:.6f} vs uniform {same:.6f}"
+
+
+@pytest.mark.parametrize(
+    "order",
+    [
+        2,
+        pytest.param(
+            3,
+            marks=pytest.mark.xfail(
+                raises=ValueError,
+                strict=True,
+                reason="A cubic edge carries 4 nodes and `_facet_dual_coeffs` derives the biorthogonal "
+                "dual basis for 2 (P1) and 3 (P2) only -- a separate gap, and it says so rather than "
+                "quietly using the wrong basis. Kept as a parameter so it stays visible.",
+            ),
+        ),
+    ],
+)
+def test_the_mortar_ties_a_graded_interface_above_order_one(order):
+    """A mortar between independently meshed bodies was unreachable above P1.
+
+    A facet belongs to a tag by its **vertices**. The tie resolved one through ``tag_indices``, a P1
+    node list, then asked whether ALL of a facet's nodes were in it -- so at P2 every facet was
+    rejected on its absent midside node, ``facets[tag]`` came out empty, and the tie died with "no
+    main facet connectivity was supplied for interpolation". Taylor-Hood over two independently meshed
+    bodies needs exactly this, so it was the standing blocker on two-body flow.
+
+    Order 3 is carried as an xfail: it has TWO nodes per edge, so it would catch a fix that merely
+    allowed one extra node per facet -- but it stops earlier, on a dual basis that exists for P1 and
+    P2 edges only. Selecting the facet and integrating over it are different gaps; this pins the
+    first and names the second."""
+    import jno.utils.solver.fem_utils as fu
+
+    seen = {}
+    orig = fu.build_periodic_prolongation
+    fu.build_periodic_prolongation = lambda *a, **k: (lambda r: (seen.__setitem__("coupling", r["coupling"]), r)[1])(
+        orig(*a, **k)
+    )
+    try:
+        got = _poisson_2d(_stack(0.25, 0.08), order=order)
+    finally:
+        fu.build_periodic_prolongation = orig
+    assert seen["coupling"] == "mortar", "a graded interface must reach the integrated coupling"
+    ref = _poisson_2d(_stack(0.25, 0.25), order=1)
+    assert abs(got - ref) / ref < 0.05, f"order-{order} mortar {got:.6f} vs conforming {ref:.6f}"
 
 
 def _graded_stack():

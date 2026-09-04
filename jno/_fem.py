@@ -3462,14 +3462,28 @@ def _build_periodic_reduction(
     # collocation, but a *mortar* coupling integrates over the secondary face, so both sides are needed.
     facets: dict = {}
     if bfacets is not None and bfacets.size:
+        # A facet belongs to a tag by its VERTICES, not by all of its nodes. `_face_nodes` resolves a
+        # tag with no stored predicate -- which is every geometry-derived interface tag, `"a|b.a"` --
+        # through `tag_indices`, a P1 node list. At P2/P3 the midside nodes are therefore absent, an
+        # all-nodes subset test rejects EVERY facet, and the tie fails with "no main facet connectivity
+        # was supplied for interpolation": a MORTAR coupling between two independently meshed bodies
+        # was unreachable above order 1.
+        # vertices per FACET, from the cell type -- not from `dim` alone: a hexahedron's facet is a
+        # quad with FOUR vertices, and testing only three of them would admit facets that merely share
+        # a corner triangle with the tag.
+        _nv = 2 if dim == 2 else (4 if str(_ct or "").startswith(("hex", "quad")) else 3)
         for main, secondary, *_ignore in ties:
             for tag in (main, secondary):
                 if tag in facets:
                     continue
                 fn = set(np.asarray(faces.get(tag, np.empty(0, int))).tolist())
-                keep = np.array([set(row.tolist()).issubset(fn) for row in bfacets], dtype=bool)
+                keep = np.array([set(row[:_nv].tolist()).issubset(fn) for row in bfacets], dtype=bool)
                 if keep.any():
                     facets[tag] = bfacets[keep]
+                    # ...and the face's node set gains the higher-order nodes those facets carry, which
+                    # is what the mortar integrates over. `union1d` so this can only ADD: at order 1 a
+                    # facet IS its vertices, so the set is unchanged and P1 ties do not move.
+                    faces[tag] = np.union1d(np.asarray(faces.get(tag, np.empty(0, int))), np.unique(facets[tag]))
     else:  # native 1D / no assembly cells -> flat-chain fallback
         facets = {
             t: ff
