@@ -90,10 +90,16 @@ Two ceilings worth knowing before you plan a run:
   (0.60 s at 9.1k) and then turns over sharply — 4.02 s at 18.5k, i.e. roughly `O(N^2.7)`. That puts
   the practical ceiling for `lu()` around 30–60k DOF; past it use the block/Schur preconditioners in
   `jno.precond` (verified in 3-D), or `lu(backend="pardiso"/"cudss")`.
-* **No stabilisation.** There is no SUPG/GLS/grad-div term in the library, so convection-dominated
-  flow is unaddressed. The cavity tutorial sits at Re = 200; the practical ceiling for unstabilised
-  P2/P1 is somewhere in the low hundreds and has not been measured. `dom.cell_size` gives you the
-  element size `h` if you want to write a stabilised form yourself.
+* **Stabilisation is a formula, not a feature.** SUPG / PSPG / grad-div are terms you write in the
+  term list, and the two pieces they need are there: `jno.np.laplacian` accepts a **vector** field
+  (the momentum strong residual carries `nu*lap(u)`), and `dom.cell_metric` gives the element metric
+  `G = J^-T J^-1` that a direction-aware `tau` is built on (`dom.cell_size` is isotropic and cannot
+  see a stretched cell). Verified: SUPG cuts the upstream oscillation of a Peclet-1000 transport
+  problem by 3300x, and PSPG makes **equal-order P1/P1** flow converge (Kovasznay, observed rates
+  1.78 velocity / 1.70 pressure, a 4.3x better pressure than unstabilised) — see the
+  [stabilised-flow tutorial](../tutorials/08-fem-and-varpinns/navier-stokes-stabilised-2d.md).
+  What is **not** settled: the grad-div/LSIC coefficient made both errors worse at Re = 20 and is
+  left uncalibrated, and no unstabilised-P2/P1 Reynolds ceiling has been measured.
 * **Higher-order Lagrange** — `order=k` gives degree-`k` elements (P2, P3, P4, … on triangles and tets);
   read the solution at `fem.points`. The geometry stays affine-P1 (straight-sided), so on a *curved*
   boundary the geometric error caps the observed order regardless of `k` — measure high-order convergence
