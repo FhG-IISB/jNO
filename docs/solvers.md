@@ -99,6 +99,66 @@ warm start — it is smooth, and it is *wrong in the same modes* the operator is
     automatically, and rejects `x0=` for that reason), or a Newton loop. Those are smooth by
     construction and free.
 
+### A learned **subspace** is worth far more than a learned point
+
+The failure above is a failure of *regression*, not of learning. Fit a network to predict a point and
+it optimises the wrong norm; CG minimises `‖e‖_A`, and an `L2` fit is blind to how the error sits on
+the spectrum. Give it a **subspace** instead and there are two much better things to do with it, both
+already expressible with the slots on this page.
+
+**1. Solve in the subspace** rather than regressing into it. The A-orthogonal projection
+`U(UᵀAU)⁻¹Uᵀb` is the *provably best* starting point from `span(U)` — and it is exactly what
+[`fem.solve(basis=U)`](fem/inverse.md#reduced-order-solves-fembasisu) computes, certificate included.
+
+**2. Put the subspace in the preconditioner**, as a coarse-space correction
+`M⁻¹ = diag⁻¹ + U(UᵀAU)⁻¹Uᵀ` (Nicolaides, *SINUM* **24**(2), 1987, 355; Frank & Vuik, *SISC*
+**23**(2), 2001, 442). This needs no new API — `precond=` takes a bare `ctx -> applier`:
+
+```python
+def coarse_jacobi(U):                       # Jacobi + a coarse solve on span(U)
+    def spec(ctx):
+        AU   = jnp.stack([ctx.A @ U[:, j] for j in range(U.shape[1])], axis=1)
+        Einv = jnp.linalg.inv(U.T @ AU)
+        dinv = 1.0 / ctx.diag()
+        return lambda v: dinv * v + U @ (Einv @ (U.T @ v))
+    return spec
+
+u = fem.solve(linear=jno.solve.cg(), precond=coarse_jacobi(U), basis=None)
+```
+
+!!! measured "Same problem, same rank-8 POD subspace, iterations against a cold Jacobi-CG"
+    | what the subspace is used for | saved |
+    |---|---|
+    | MLP regressing **DOF values** → `x0` | **−2.7 %** |
+    | MLP regressing **POD coefficients** → `x0` | +3.9 % |
+    | nearest stored snapshot → `x0` | +8.6 % |
+    | **`basis=U`** (A-optimal projection) → `x0` | +18.0 % |
+    | **coarse-space preconditioner** | +27.5 % |
+    | both together | **+39.8 %** |
+
+    The L2-fitted network's *energy*-norm error was **17–77× larger** than the A-optimal projection
+    from the very same subspace — the whole gap between the first rows and the fourth is the wrong
+    norm, not a weak network.
+
+!!! measured "And the two are different in kind — only one improves with size"
+    | `h` | DOFs | cold | `x0` saves | coarse-space saves |
+    |---|---|---|---|---|
+    | 0.060 | 377 | 60 | 21.7 % | 21.7 % |
+    | 0.040 | 791 | 86 | 17.4 % | 25.6 % |
+    | 0.030 | 1394 | 113 | 17.7 % | 28.3 % |
+    | 0.022 | 2522 | 151 | 17.2 % | **29.8 %** |
+
+    A warm start is a **constant offset** — it removes decades of residual and the log law fixes the
+    fraction, so it stays flat under refinement. A coarse space removes the slow modes from the
+    **spectrum**, so its benefit *grows* with the problem. Prefer it wherever the subspace is worth
+    building at all.
+
+    Scope, since this was measured on one problem class: SPD + CG, a rank-8 POD subspace from
+    snapshots, a 10× conductivity contrast. Non-symmetric and saddle-point systems are not covered
+    here, the rank/cost trade-off is unexplored (each application costs two `n × k` products and a
+    `k × k` solve), and POD alone already delivers the table — a *learned* subspace has to beat POD to
+    earn its place, which is not shown.
+
 ### Two that are not `Ax = b` on a square, definite operator
 
 `minres` and `lstsq` cover the cases the table's other rows cannot, and both take a

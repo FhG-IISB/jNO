@@ -652,3 +652,73 @@ def test_warm_start_payoff_is_set_by_the_error_spectrum_not_its_norm():
         f"a rough {eps:g} guess bought {1 - n_rough / n_cold:.0%} of the iterations; the documented "
         "claim is that it buys essentially nothing"
     )
+
+
+def test_a_subspace_is_worth_more_in_the_preconditioner_than_in_x0():
+    """A subspace buys more as a COARSE SPACE than as a warm start, and the two differ in kind.
+
+    Documented in ``docs/solvers.md`` ("A learned subspace is worth far more than a learned point").
+    ``x0`` removes decades of initial residual -- a constant offset, fixed by the log law. A
+    coarse-space correction ``M^-1 = diag^-1 + U (U^T A U)^-1 U^T`` (Nicolaides, SINUM 24(2), 1987,
+    355; Frank & Vuik, SISC 23(2), 2001, 442) removes those modes from the SPECTRUM instead, which is
+    a rate change. Both are expressible with the existing slots -- ``precond=`` takes a bare
+    ``ctx -> applier`` -- so this pins behaviour, not a new API.
+    """
+    scipy_sparse = pytest.importorskip("scipy.sparse")
+    spla = pytest.importorskip("scipy.sparse.linalg")
+
+    fem = _poisson(mesh_size=0.06)  # fine enough that the iteration counts discriminate
+    op = fem.operator
+    A = op[0] if isinstance(op, tuple) else op
+    idx, val = np.asarray(A.indices), np.asarray(A.data)
+    n = fem.dofs
+    K = scipy_sparse.csr_matrix((val, (idx[:, 0], idx[:, 1])), shape=(n, n))
+    b = np.asarray(fem.b).reshape(-1)
+
+    # An APPROXIMATING subspace of smooth modes -- deliberately NOT containing the exact solution,
+    # which would make the projection the answer and the comparison vacuous. (The docs table uses a
+    # POD basis from a parameter sweep; the property under test is the same, this keeps it cheap.)
+    pts = np.asarray(fem.points)
+    cols = [
+        np.sin(i * np.pi * pts[:, 0]) * np.sin(j * np.pi * pts[:, 1])
+        for i, j in ((1, 1), (3, 1), (1, 3), (3, 3), (5, 1), (1, 5))
+    ]
+    U, _ = np.linalg.qr(np.stack(cols, axis=1))
+
+    AU = K @ U
+    Einv = np.linalg.inv(U.T @ AU)
+
+    def iters(x0, coarse):
+        dinv = 1.0 / K.diagonal()
+        mv = (lambda v: dinv * v) if not coarse else (lambda v: dinv * v + U @ (Einv @ (U.T @ v)))
+        c = [0]
+        spla.cg(
+            K,
+            b,
+            x0=x0,
+            rtol=1e-10,
+            maxiter=5000,
+            M=spla.LinearOperator(K.shape, matvec=mv),
+            callback=lambda _xk: c.__setitem__(0, c[0] + 1),
+        )
+        return c[0]
+
+    zero = np.zeros(n)
+    x_proj = U @ (Einv @ (U.T @ b))  # the A-orthogonal projection: best possible x0 from span(U)
+    n_cold, n_x0, n_coarse = iters(zero, False), iters(x_proj.copy(), False), iters(zero, True)
+
+    assert n_x0 < n_cold, f"the A-optimal projection must beat a cold start ({n_x0} vs {n_cold})"
+    assert n_coarse < n_x0, (
+        f"the same subspace must buy MORE in the preconditioner ({n_coarse}) than in x0 ({n_x0}) -- "
+        "a spectrum change beats an offset"
+    )
+
+    # and the coarse-space preconditioner must not change the ANSWER -- it is still a preconditioner
+    def coarse_spec(ctx):
+        dinv = 1.0 / ctx.diag()
+        Uj, Ej = jnp.asarray(U), jnp.asarray(Einv)
+        return lambda v: dinv * v + Uj @ (Ej @ (Uj.T @ v))
+
+    ref = np.asarray(fem.solve(linear=jno.solve.lu())).reshape(-1)
+    got = np.asarray(fem.solve(linear=jno.solve.cg(tol=1e-10), precond=coarse_spec)).reshape(-1)
+    assert np.abs(got - ref).max() < 1e-8, "a preconditioner may not change the answer"
