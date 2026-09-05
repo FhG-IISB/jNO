@@ -280,7 +280,18 @@ def infer_term_bucket(domain, term):
         return support, region_id
 
     if contains_node_type(term, TrialFunction) or contains_node_type(term, TestFunction):
-        return "volume", "volume"
+        # No variational meta -- which is exactly what a BOUND test function looks like:
+        # ``phi.bind(x=xr, y=yr)`` carries its region on the coordinate Variables, not on a registry
+        # entry. Falling straight through to ("volume", "volume") filed a Neumann flux term under the
+        # VOLUME channel, where the boundary assembler never saw it and the flux was silently dropped.
+        #
+        # The FEM path already classifies this correctly, from the coordinate tags rather than the
+        # registry, so ask it rather than growing a second rule here (they had already drifted -- this
+        # bug IS that drift). Deferred import: jno._fem imports this module.
+        from ..._fem import _region_and_support
+
+        support, region_id = _region_and_support(term, domain)
+        return support, region_id
 
     raise ValueError(
         "Could not infer weak-form support for term. "

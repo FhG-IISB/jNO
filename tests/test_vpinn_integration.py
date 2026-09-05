@@ -150,17 +150,15 @@ class TestVpinnScalarAssembly:
 
 
 class TestVpinnBoundaryAssembly:
-    @pytest.mark.xfail(
-        reason=(
-            "jno.fem VPINN does not yet lower a Neumann *flux* boundary term: a bound-test boundary "
-            "value term's region is not propagated into the VPINN channel bucketing. The FEM path "
-            "classifies it via _region_and_support, but the VPINN path buckets on Variable.fem_meta, "
-            "which a bound test does not carry -- so the flux is filed under the volume channel. This "
-            "is a pre-existing jno.fem VPINN-lowering gap, orthogonal to the native fem_context."
-        ),
-        strict=True,
-    )
     def test_volume_plus_boundary_weak_form_assembles(self):
+        """A Neumann (boundary-test) flux term must reach its OWN region's channel.
+
+        It used to land in the volume channel and be silently dropped: a bound test function
+        ``phi.bind(x=xr, y=yr)`` carries its region on the coordinate Variables, not in the
+        variational-sampling registry that ``infer_term_bucket`` consulted, so the term fell through
+        that function's ``("volume", "volume")`` default. The bucketing now defers to the FEM path's
+        ``_region_and_support`` -- one classifier, read from the coordinate tags.
+        """
         dom = make_domain()
         u, phi = dom.fem_symbols()
         xi, yi, _ = dom.variable("interior", split=True)
@@ -175,7 +173,34 @@ class TestVpinnBoundaryAssembly:
         pde = jno.fem([vol, surf, u(xb, yb) - 0.0])
 
         assert hasattr(pde, "mse")
-        assert "right" in pde.boundary_value_exprs  # <-- the gap: lands in the volume channel instead
+        assert "right" in pde.boundary_value_exprs, "the flux must reach its own region's channel"
+        assert set(pde.boundary_value_exprs) == {"right"}, "and no other region's"
+
+    def test_a_boundary_flux_does_not_pollute_the_volume_channel(self):
+        """The other half of the bug: when the flux was mis-filed it was ADDED to the volume channel.
+
+        Oracle: assembling with and without the surface term must leave the volume channels
+        untouched, since the flux belongs to neither of them. Comparing against the same form
+        without the term is what distinguishes "routed correctly" from "routed anywhere else".
+        """
+        dom = make_domain()
+        u, phi = dom.fem_symbols()
+        xi, yi, _ = dom.variable("interior", split=True)
+        xb, yb, _ = dom.variable("boundary", split=True)
+        xr, yr, _ = dom.variable("right", split=True)
+        vi, vr = phi.bind(x=xi, y=yi), phi.bind(x=xr, y=yr)
+        u_net = make_scalar_net()(xi, yi)
+
+        vol = jnn.grad(u_net, xi) * jnn.grad(vi, xi) + jnn.grad(u_net, yi) * jnn.grad(vi, yi)
+        without = jno.fem([vol, u(xb, yb) - 0.0])
+        with_flux = jno.fem([vol, (1.0 + 0.0 * xr) * vr, u(xb, yb) - 0.0])
+
+        assert not without.boundary_value_exprs, "the control carries no boundary term"
+        assert set(with_flux.boundary_value_exprs) == {"right"}
+        # the volume channels must be structurally the same: a pure boundary term changes neither
+        for chan in ("volume_value_expr", "volume_grad_expr"):
+            a, b = getattr(without, chan), getattr(with_flux, chan)
+            assert (a is None) == (b is None), f"{chan} gained/lost content from a pure BOUNDARY term"
 
 
 # ============================================================
