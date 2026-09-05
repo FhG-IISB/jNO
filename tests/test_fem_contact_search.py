@@ -497,3 +497,75 @@ def test_hertz_half_width_scales_as_the_square_root_of_the_load():
     assert abs((a2 / a1) / np.sqrt(P2 / P1) - 1.0) < 0.12, (
         f"a should scale as sqrt(P): measured ratio {a2/a1:.4f}, Hertz {np.sqrt(P2/P1):.4f}"
     )
+
+
+# ----------------------------------------------------------------------------------------------
+# The same statement in 3-D
+# ----------------------------------------------------------------------------------------------
+R_BALL, Z0_3D, SLIDE_3D, H_3D = 1.0, 1.06, 0.75, 0.20
+
+
+def test_the_search_follows_a_large_slide_in_three_dimensions():
+    """The 2-D sliding check above pins edges against a circle; this pins TRIANGLES against a sphere.
+
+    The closed form is the same with ``x^2 -> x^2 + y^2``: the block's bottom is a horizontal plane at
+    ``z = Z0`` with outward normal ``(0, 0, -1)``, the main surface is a sphere of radius ``R``, so the
+    closest point is ``R (x, y, Z0) / |(x, y, Z0)|`` and
+
+        g0 = Z0 - R Z0 / sqrt(x^2 + y^2 + Z0^2)
+
+    A purely horizontal rigid slide keeps ``n . D`` at zero, so the re-paired ``g0`` is the deformed
+    gap outright. Worth having separately from the 2-D case because the 3-D path is different code --
+    :func:`~.contact_search.closest_point_on_triangle` and ``_tri_shape`` rather than the segment and
+    edge routines -- and "the implementation looks dimension-generic" is not evidence.
+    """
+    from jno.utils.solver.contact_search import OPEN_GAP
+    from jno.utils.solver.fem_utils import _cell_region_mask
+
+    blk = jno.Shape.box(-0.35, -0.35, Z0_3D, 0.35, 0.35, Z0_3D + 0.4)
+    d = jno.Shape.regions(ball=jno.Shape.sphere(0, 0, 0, R_BALL).sized(H_3D),
+                          blk=blk.sized(H_3D), conforming=False).domain()
+    _ = d.built_mesh
+    e = 1e-6
+    d.tag("s_blk", lambda x, y, z: z < Z0_3D + e, region="blk")
+    d.tag("s_ball", lambda x, y, z: z > -R_BALL + e, region="ball")
+
+    u, v = d.fem_symbols(value_shape=(3,))
+    Rg = {k: d.variable(k, split=True) for k in ("ball", "blk")}
+    terms = []
+    for k in Rg:
+        ui, vi = u.bind(x=Rg[k][0], y=Rg[k][1], z=Rg[k][2]), v.bind(x=Rg[k][0], y=Rg[k][1], z=Rg[k][2])
+        eu = jno.np.symgrad(ui, [Rg[k][0], Rg[k][1], Rg[k][2]])
+        ev = jno.np.symgrad(vi, [Rg[k][0], Rg[k][1], Rg[k][2]])
+        terms.append(jno.np.inner(eu, ev, n_contract=2))
+    sb, nb = d.variable("s_blk", split=True), d.variable("s_blk", normals=True)
+    g = u.gap("s_blk", "s_ball", domain=d)
+    terms.append(jno.np.maximum(0.0, -1.0e3 * g) * jno.np.inner(nb, v.bind(x=sb[0], y=sb[1], z=sb[2]), 1))
+    terms += [u(Rg["ball"][0], Rg["ball"][1], Rg["ball"][2]) - 0.0]
+    op = jno.fem(terms)._op
+
+    tet = np.asarray(d.built_mesh.cells_dict["tetra"])
+    blk_nodes = np.unique(tet[np.asarray(_cell_region_mask(d, "blk")).reshape(-1) > 0])
+    uu = np.zeros((int(np.asarray(d.built_mesh.points).shape[0]), 3))
+    uu[blk_nodes, 0] = SLIDE_3D
+
+    def live(tb):
+        gg = np.concatenate([np.asarray(t["g0"]).reshape(-1) for t in tb.values()])
+        return gg[np.abs(gg) < 0.5 * OPEN_GAP]
+
+    exact = lambda x, y: Z0_3D - R_BALL * Z0_3D / np.sqrt(x**2 + y**2 + Z0_3D**2)  # noqa: E731
+    frozen = live(op.repair_contact(np.zeros(int(op.size)))).min()
+    slid = live(op.repair_contact(uu.reshape(-1))).min()
+
+    sag = H_3D**2 / (8 * R_BALL)
+    assert abs(frozen - exact(0.0, 0.0)) < sag + 1e-3, (
+        f"the reference gap at the crown should be {exact(0.0, 0.0):.4f}, got {frozen:.4f}"
+    )
+    lo, hi = exact(SLIDE_3D - 0.35, 0.0), exact(SLIDE_3D - 0.35 + H_3D, 0.0)
+    assert lo - sag - 1e-3 <= slid <= hi + sag + 1e-3, (
+        f"after sliding {SLIDE_3D} the gap should be in [{lo:.4f}, {hi:.4f}], got {slid:.4f}"
+    )
+    assert slid > 1.8 * frozen, (
+        f"the frozen pairing reports {frozen:.4f} where the truth is ~{lo:.4f}; if the 3-D search were "
+        "doing nothing these would agree"
+    )
