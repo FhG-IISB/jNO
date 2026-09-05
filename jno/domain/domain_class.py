@@ -3440,6 +3440,7 @@ class domain(MeshIOMixin):
         resampling_strategy=None,
         normals: bool = False,
         reverse_normals: bool = False,
+        follow_normals: bool = False,
         view_factor: bool = False,
         point_data: bool = False,
         split: bool = False,
@@ -3457,6 +3458,7 @@ class domain(MeshIOMixin):
         resampling_strategy=None,
         normals: bool = False,
         reverse_normals: bool = False,
+        follow_normals: bool = False,
         view_factor: bool = False,
         point_data: bool = False,
         split: bool = False,
@@ -3877,6 +3879,7 @@ class domain(MeshIOMixin):
         resampling_strategy=None,
         normals: bool = False,
         reverse_normals: bool = False,
+        follow_normals: bool = False,
         view_factor: bool = False,
         point_data: bool = False,
         split: bool = False,
@@ -3914,6 +3917,25 @@ class domain(MeshIOMixin):
             resampling_strategy: Optional ResamplingStrategy for adaptive point selection
             normals: If True, also compute and return normal vectors for this tag
             reverse_normals: If True, flip the sign of the normal vectors
+            follow_normals: If True, the normal is the **deformed** surface's normal, recomputed from
+                ``x = X + u`` each time the residual is evaluated, instead of the reference surface's.
+                That is the difference between a **dead** load and a **follower** load: gravity still
+                points down after a body tips over (reference), while pressure stays perpendicular to
+                the skin however the skin moves (deformed). Contact belongs with pressure — the contact
+                force is normal to the surfaces that are actually touching.
+
+                **Use it with finite-strain kinematics, not with** ``sym(grad u)``. The reference and
+                deformed normals differ by ``O(theta)`` for a surface rotation ``theta``, and that is
+                exactly the regime where the small-strain measure also fails: ``sym(grad u)`` is not
+                rotation invariant, so a pure rotation manufactures ``cos(theta) - 1`` of strain out of
+                nothing. Measured on a sheet-forming march at 38 degrees, ``||sym(grad u)|| = 0.300``
+                against a Green-Lagrange strain of ``1.9e-17``. Following the normal there buys a better
+                force *direction* applied to a materially wrong *stress*, which is worse than either
+                mistake alone because it looks more correct. Write ``F = I + grad u``,
+                ``E = (F^T F - I)/2`` and a PK stress, and then follow the normal.
+
+                It makes the form **nonlinear**: the traction direction now depends on the solution, so
+                a form that assembles as ``linear`` without it needs a Newton solve with it.
             return_indices: Wether or not to return the indices of the sampled points
 
         Returns:
@@ -4130,6 +4152,10 @@ class domain(MeshIOMixin):
                 )
             if reverse_normals:
                 self.context[f"n_{tag}"] = -self.context[f"n_{tag}"]
+            if follow_normals:
+                # Recorded on the DOMAIN, not on the returned symbol: the assembler binds `n_{region}`
+                # per boundary facet when it walks the surface terms, so this is where it has to look.
+                self.__dict__.setdefault("_follow_normals", set()).add(tag)
             # ``split`` controls the *shape* of the normal (mirroring the tensor-tag path): ``split=True``
             # appends the normal's scalar components to the flat ``(x, y, [z], t, nx, ny, [nz])`` tuple;
             # ``split=False`` (the default) returns the boundary normal as a **single vector** so it drops

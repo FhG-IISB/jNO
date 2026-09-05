@@ -1884,6 +1884,43 @@ def assemble_fem_native(
             return normals_j
         return _face_normals_jax(pts, _facet_verts_j, _facet_sign_j)
 
+    _follow_tags = set(getattr(domain, "_follow_normals", ()) or ())
+
+    def _follow_field_index():
+        """Which field carries the displacement that moves the surface.
+
+        A follower normal is the normal of ``x = X + u``, so it needs to know which field ``u`` is.
+        Exactly one field with one component per spatial dimension is unambiguous; anything else is
+        refused rather than guessed, because guessing wrong here rotates every traction on that surface.
+        """
+        cand = [i for i in range(len(fields)) if int(vecs[i]) == dim]
+        if len(cand) != 1:
+            raise ValueError(
+                "domain.variable(..., follow_normals=True) needs exactly one field with one component "
+                f"per dimension to say which displacement moves the surface; this form has {len(cand)} "
+                f"({[fields[i]['name'] for i in cand]}). Drop follow_normals=, or split the solve."
+            )
+        return cand[0]
+
+    def _deformed_normals(pts, u_flat):
+        """Facet normals of the DEFORMED surface ``x = X + u`` -- a FOLLOWER normal.
+
+        The reference normal is right for a dead load (gravity still points down after the body tips);
+        a follower normal is right for pressure and for contact, whose force is normal to the surfaces
+        that are actually touching. The two agree to O(theta) and diverge as the surface rotates.
+
+        **This belongs with finite-strain kinematics.** ``sym(grad u)`` is not rotation invariant -- a
+        pure rotation by theta manufactures ``cos(theta) - 1`` of strain -- so following the normal in a
+        small-strain form buys a better force direction on a materially wrong stress. Measured on a
+        sheet-forming march at 38 degrees: 0.300 of spurious strain against a Green-Lagrange strain of
+        1.9e-17. Use this with ``F = I + grad u`` and a PK stress, not with ``sym(grad u)``.
+        """
+        fidx = _follow_field_index()
+        n_geom = int(pts.shape[0])  # the GEOMETRY points the facets index, not the boundary subset
+        vt = vecs[fidx]
+        un = jax.lax.dynamic_slice(u_flat, (offs[fidx],), (n_geom * vt,)).reshape(n_geom, vt)
+        return _face_normals_jax(pts.at[:, :dim].add(un[:, :dim]), _facet_verts_j, _facet_sign_j)
+
     def _vol_elem_res(c, local_all, coeff, tfi, rnames, t=0.0, args=None, pts=None):
         """Element residual of one volume term on cell ``c`` as a function of that cell's gathered
         all-field local DOFs ``local_all`` -> ``(n_test_dofs_tfi,)``. Driving the AD off this
@@ -2452,6 +2489,11 @@ def assemble_fem_native(
                 R = R.at[cdofs[tfi].reshape(-1)].add(elem.reshape(-1))
 
             normals_dyn = _surface_normals(pts_dyn)  # differentiable facet normals under coordinate motion
+            # A region tagged `follow_normals=True` uses the DEFORMED surface's normal instead: the
+            # traction then rotates with the surface (a follower load) rather than staying put (a dead
+            # load). Computed once, alongside, so an unmarked region is bit-identical to before.
+            normals_fol = _deformed_normals(pts_dyn, u_flat) if _follow_tags else None
+            _nrm_for = (lambda _r: normals_fol if _r in _follow_tags else normals_dyn)
             # Main-side values for every contact gap, gathered ONCE over the whole secondary face: the
             # nodes read live on the other body's cells, so this cannot happen inside the per-face map.
             gap_um = {k: _gap_gather(u_flat, k, args) for k in _gap_tables}
@@ -2463,7 +2505,7 @@ def assemble_fem_native(
                 for bcoeff, btfi in btyped:
                     contribs = _elem_map(
                         lambda fi, la, gp, _e=bcoeff, _t=btfi, _r=region: _surf_elem_res(
-                            fi, la, _e, _t, _r, t, args, pts_dyn, normals_dyn, gp
+                            fi, la, _e, _t, _r, t, args, pts_dyn, _nrm_for(_r), gp
                         ),
                         (fids, lv, gslice),
                         _cell_chunk(int(fids.shape[0]), cdofs[btfi].shape[1], cell_all_dofs.shape[1]),
@@ -2471,7 +2513,10 @@ def assemble_fem_native(
                     R = R.at[cdofs[btfi][pcells].reshape(-1)].add(contribs.reshape(-1))
                     _rk = _gaps_in(bcoeff, region)
                     if _rk:
-                        R = _contact_reaction(R, _rk, fids, lv, gslice, bcoeff, btfi, region, t, args, pts_dyn, normals_dyn)
+                        R = _contact_reaction(
+                            R, _rk, fids, lv, gslice, bcoeff, btfi, region, t, args, pts_dyn,
+                            _nrm_for(region),
+                        )
             return R
 
         return residual
@@ -2682,6 +2727,11 @@ def assemble_fem_native(
                 )
 
             normals_dyn = _surface_normals(pts_dyn)  # differentiable facet normals under coordinate motion
+            # A region tagged `follow_normals=True` uses the DEFORMED surface's normal instead: the
+            # traction then rotates with the surface (a follower load) rather than staying put (a dead
+            # load). Computed once, alongside, so an unmarked region is bit-identical to before.
+            normals_fol = _deformed_normals(pts_dyn, u_flat) if _follow_tags else None
+            _nrm_for = (lambda _r: normals_fol if _r in _follow_tags else normals_dyn)
             # Main-side values for every contact gap -- the residual's own gather, reused so the
             # assembled tangent linearizes the SAME function the residual evaluates.
             gap_um_j = {k: _gap_gather(u_flat, k, args) for k in _gap_tables}
@@ -2693,7 +2743,8 @@ def assemble_fem_native(
                 gslice = _gap_slices(region, fids, gap_um_j, args)  # {key: (g0, u_m)} or None
                 for bcoeff, btfi in btyped:
 
-                    def _kef(fi, la, gp=None, _e=bcoeff, _t=btfi, _r=region, _p=pts_dyn, _n=normals_dyn):
+                    def _kef(fi, la, gp=None, _e=bcoeff, _t=btfi, _r=region, _p=pts_dyn, _n=None):
+                        _n = _nrm_for(_r) if _n is None else _n
                         # gaps PACKED: the local block then carries d(traction)/du_s THROUGH the gap,
                         # exactly as `jax.linearize` of the residual would.
                         return jax.jacfwd(lambda v: _surf_elem_res(fi, v, _e, _t, _r, t, args, _p, _n, gp))(la)
@@ -2727,7 +2778,8 @@ def assemble_fem_native(
 
                         # (s,m): jacfwd of the SAME face residual w.r.t. the gathered main values,
                         # chained through the frozen mortar weights to global main columns.
-                        def _kem(fi, la, g0f, umf, _e=bcoeff, _t=btfi, _r=region, _p=pts_dyn, _n=normals_dyn, _k=gk):
+                        def _kem(fi, la, g0f, umf, _e=bcoeff, _t=btfi, _r=region, _p=pts_dyn, _n=None, _k=gk):
+                            _n = _nrm_for(_r) if _n is None else _n
                             return jax.jacfwd(
                                 lambda um: _surf_elem_res(fi, la, _e, _t, _r, t, args, _p, _n, {_k: (g0f, um)})
                             )(umf)

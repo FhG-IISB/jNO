@@ -605,6 +605,19 @@ def _is_obviously_nonlinear_in_unknown(domain, expr):
     ):
         return True
 
+    # A FOLLOWING normal (`domain.variable(tag, normals=True, follow_normals=True)`) is the normal of
+    # `x = X + u`, so it depends on the unknown -- but it reaches the form as an ordinary `n_{tag}`
+    # Variable, exactly like a fixed normal, and nothing downstream can tell them apart. Left unmarked
+    # the form routes to the assembled-LINEAR path, which builds A and b once at u = 0 where the two
+    # normals coincide, and the flag would silently do nothing. Structural, like the gap above.
+    #
+    # Keyed on the DOMAIN, not on the expression: with `split=True` the normal arrives as a component of
+    # the region's split tuple rather than as an `n_{tag}` Variable, so an expression-level test is
+    # evadable by an argument that has nothing to do with the physics. A form that asked for a follower
+    # load has one, and follower loads are nonlinear.
+    if getattr(domain, "_follow_normals", None):
+        return True
+
     # `diff(psi, F)` is a derivative of the unknown's energy, so it is nonlinear in the unknown whenever
     # `F` is (a hyperelastic P = dpsi/dF always is). Structural, like the gap above: the assembled-linear
     # path would build a tangent at u=0 and be silently wrong for every stretch but zero.

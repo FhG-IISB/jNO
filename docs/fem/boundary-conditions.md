@@ -342,6 +342,16 @@ path is not the one that was right in the middle of it:
 u = fem.solve(contact=jno.solve.contact())     # the march is triggered by the form, not by a slot
 ```
 
+!!! warning "Scope — surface ROTATION, not sliding"
+    `u.gap` handles a surface that slides arbitrarily far; it does **not** handle one that ROTATES far.
+    The traction is written on `d.variable(sec, normals=True)`, the *reference* normal, so once the
+    contacting surface turns by `theta` the force is misdirected by `sin(theta)` — 0.62 at 38°.
+    `follow_normals=True` gives the deformed normal instead, but use it **with finite-strain
+    kinematics**: `sym(grad u)` is not rotation invariant, and at 38° it manufactures 0.300 of strain
+    where Green–Lagrange gives 1.9e-17. Following the normal in a small-strain form buys a better force
+    direction on a materially wrong stress. Write `F = I + grad u`, `E = (FᵀF − I)/2` and a PK stress,
+    then follow the normal.
+
 !!! warning "Scope — `contact=`"
     A contact march is a **host loop, not a `lax.scan`**, so it gives up the load path's reverse-mode
     differentiability — the scanned march keeps that, at a frozen pairing. `tau=jno.solve.adaptive(...)`
