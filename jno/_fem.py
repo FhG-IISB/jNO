@@ -1983,16 +1983,25 @@ class FEM:
                     "one answer to freeze, and picking one silently is exactly the failure this "
                     "mechanism exists to remove. Pass `contact=`, or name a single main surface."
                 )
-        if contact is not None:
+        _marches = bool(
+            getattr(self._op, "history_specs", None) or getattr(self._op, "surface_history_specs", None)
+        )
+        if contact is not None and not _marches:
             # The contact search owns the sequence of solves the way continuation does: each round is an
             # ordinary solve with the current pairing threaded on ``args``, and the loop re-runs the
             # search at ``x + u`` between them. Dispatched ahead of the mode branches so every slot below
             # composes unchanged -- the driver re-enters this method with ``contact=None``.
+            #
+            # On a form that MARCHES it is the march that owns the loop instead, re-pairing at every
+            # load step: wrapping the whole march in this driver would re-solve the entire path with the
+            # final configuration's pairing applied to every step. The trigger is step history, not
+            # ``tau=`` -- the march runs with nothing passed -- so that is what the test above keys on.
+            # That branch falls through to the march below, which takes ``contact=`` directly.
             from .utils.solver.contact_search import run_contact_solve
 
             return run_contact_solve(
                 self, contact, solve_fn=solve_fn, adapt=adapt, x0=x0, nonlinear=nonlinear,
-                linear=linear, precond=precond, time=time, tau=tau, shard=shard,
+                linear=linear, precond=precond, time=time, shard=shard,
                 continuation=continuation, **kwargs,
             )
         if continuation is not None:
@@ -2182,7 +2191,7 @@ class FEM:
                 )
             from .utils.solver.history_march import run_history_march
 
-            return run_history_march(self, solve_fn if from_slots else solve_fn, path=tau)
+            return run_history_march(self, solve_fn if from_slots else solve_fn, path=tau, contact=contact)
         if tau is not None:
             raise ValueError(
                 "fem.solve(tau=...) sizes the steps of a pseudo-time LOAD-PATH march, but this form does "

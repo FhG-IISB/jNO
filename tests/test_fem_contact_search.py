@@ -129,21 +129,144 @@ def test_contact_refuses_a_form_that_declares_no_gap():
         fem.solve(contact=jno.solve.contact())
 
 
-def test_contact_refuses_the_assembled_tangent_by_name():
-    """The assembled tangent hoists the contact block's sparsity pattern ONCE, from the pairing's
-    concrete node ids. Re-pairing changes which main nodes each point reads, so that pattern is stale —
-    and a stale pattern does not error, it silently drops the new couplings."""
+def test_the_assembled_tangent_follows_a_re_pairing():
+    """The assembled tangent derives its sparsity pattern from the pairing's concrete node ids, so a
+    re-pairing moves it. This used to be refused outright; the pattern is now rebuilt per pairing,
+    which is sound because the block's SIZE is fixed — ``(n_face, n_q, K)`` is set by the declaration
+    — so only the index values change and the compressed plan keeps its static ``nse``.
+
+    The check that matters: against a RE-PAIRED table set, the assembled Jacobian must agree with
+    ``jax.linearize`` of the residual, which is exact by construction. A stale pattern would put the
+    new couplings at the old (i, j) slots and show up here as a mismatch.
+
+    Note what a stale tangent would *not* do: change the answer. The root is fixed by the residual,
+    which reads the live tables, so a wrong tangent costs convergence rate, not correctness — which is
+    why the equivalence has to be asserted directly rather than inferred from a converged solve.
+    """
+    import jax as _jax
+    import jax.numpy as jnp
+
     _, fem = _stacked_bars()
-    with pytest.raises(NotImplementedError, match="newton\\(direct=True\\)"):
-        fem.solve(contact=jno.solve.contact(), nonlinear=jno.solve.newton(direct=True))
+    op = fem._op
+    n = int(op.size)
+    rng = np.random.default_rng(3)
+    # a genuinely DIFFERENT pairing: re-paired at a deformed state, not at u = 0
+    tb = op.repair_contact(np.asarray(fem.solve()).reshape(-1))
+    args = {"__gap_tables__": tb}
+
+    for scale, label in ((-1e-3, "active (pressed)"), (+1e-3, "inactive (separated)")):
+        u0 = jnp.zeros(n).reshape(-1, 3).at[:, 2].set(scale).reshape(-1)
+        r = lambda w: jnp.asarray(op.residual(w, args)).reshape(-1)  # noqa: E731
+        J = op.jacobian(u0, args)
+        _r0, jvp = _jax.linearize(r, u0)
+        for i in range(3):
+            probe = jnp.asarray(rng.standard_normal(n))
+            a, b = np.asarray(J @ probe), np.asarray(jvp(probe))
+            sc = max(np.abs(b).max(), 1e-8)
+            assert np.abs(a - b).max() < 5e-4 * sc, (
+                f"{label}: assembled J and matrix-free JVP disagree under a re-paired table set "
+                f"(max diff {np.abs(a - b).max():.3e} vs scale {sc:.3e})"
+            )
 
 
-def test_contact_refuses_a_load_path_march_by_name():
-    """The march compiles one step and replays it under ``lax.scan`` — which is what keeps a load path
-    reverse-mode differentiable — and a host-side search cannot run inside a scan."""
-    _, fem = _stacked_bars()
-    with pytest.raises(NotImplementedError, match="lax.scan"):
-        fem.solve(contact=jno.solve.contact(), tau=jno.solve.adaptive())
+def test_contact_composes_with_the_assembled_tangent():
+    """``newton(direct=True)`` must reach the same solution as the matrix-free default. It is the
+    faster path — measured 3.6x on a gear pair — and refusing it was over-conservative."""
+    _, fem_a = _stacked_bars()
+    u_free = np.asarray(fem_a.solve(contact=jno.solve.contact())).reshape(-1)
+    _, fem_b = _stacked_bars()
+    u_dir = np.asarray(
+        fem_b.solve(contact=jno.solve.contact(), nonlinear=jno.solve.newton(direct=True))
+    ).reshape(-1)
+    scale = max(float(np.abs(u_free).max()), 1e-12)
+    assert np.abs(u_free - u_dir).max() < 1e-6 * scale, (
+        f"the two tangents reach different solutions: max diff "
+        f"{np.abs(u_free - u_dir).max():.3e} against |u| {scale:.3e}"
+    )
+
+
+E_AL, NU_AL = 1.0, 0.3
+LAM_AL = E_AL * NU_AL / ((1 + NU_AL) * (1 - 2 * NU_AL))
+MU_AL = E_AL / (2 * (1 + NU_AL))
+
+
+def _al_contact_march(nsteps=4, c=1.0e3):
+    """Augmented-Lagrangian contact on a load path: a cap pressed onto a base, the Uzawa multiplier
+    carried as a scalar SURFACE state through the tau march. This is the canonical form that marches
+    (``lam.i(-1)`` step history plus a ``domain(tau=...)`` grid), so it is what ``contact=`` has to
+    compose with. The bonded oracle is ``-0.01`` -- half the platen's ``-0.02``, by symmetry."""
+    inner, sym, trace = jno.np.inner, jno.np.symgrad, jno.np.trace
+    d = jno.Shape.regions(base=jno.Shape.rect(0, 0, 1, 1, size=0.30),
+                          cap=jno.Shape.rect(0, 1, 1, 2, size=0.16),
+                          conforming=False).domain(tau=(0.0, 1.0, nsteps))
+    sides = sorted(t for t in d.built_mesh.cell_sets if "|" in t)
+    secondary = next(t for t in sides if t.endswith(".cap"))
+    main = next(t for t in sides if t.endswith(".base"))
+    u, phi = d.fem_symbols(value_shape=(2,))
+    lam, _ = d.fem_symbols(value_shape=())
+    X = d.variable("interior", split=True)[:2]
+    eu, ep = sym(u, list(X)), sym(phi, list(X))
+    sv = d.variable(secondary, split=True)
+    nrm = d.variable(secondary, normals=True)
+    g = u.gap(secondary, main, domain=d)
+    p = jno.np.maximum(0.0, lam.i(-1) + c * (-g))
+    xb, yb, _ = d.variable("bottom", split=True)
+    xt, yt, _ = d.variable("top", split=True)
+    fem = jno.fem([
+        LAM_AL * trace(eu) * trace(ep) + 2 * MU_AL * inner(eu, ep, n_contract=2),
+        p * inner(nrm, phi.bind(x=sv[0], y=sv[1]), n_contract=1),
+        lam.evolves(p),
+        u(xb, yb)[0] - 0.0, u(xb, yb)[1] - 0.0,
+        u(xt, yt)[0] - 0.0, u(xt, yt)[1] - (-0.02),
+    ])
+    return d, fem, main
+
+
+@pytest.mark.slow  # a march of 4 load steps, each iterating its own contact search
+def test_contact_composes_with_a_load_path_march():
+    """``contact=`` and ``tau=`` compose, and the search runs at EVERY load step.
+
+    Per step, not per march: the pairing that is right at the end of the path is not the one that was
+    right in the middle of it, so wrapping the whole march in the steady re-pairing loop would re-solve
+    the entire path with the final configuration's pairing applied throughout — a plausible-looking
+    trajectory for a contact history that never happened. The march is therefore a host loop rather
+    than a ``lax.scan``, which costs the load path its reverse-mode differentiability.
+
+    What this pins is COMPOSITION -- that the march runs, iterates a search per step, keeps the step
+    history rolling correctly, and lands on the physics. It is deliberately not a sliding test: the cap
+    presses straight down, so the pairing barely moves and the search has little to do. That the search
+    itself follows a slide is pinned by the closed-form block-over-disk and block-over-sphere tests.
+
+    The oracle is the one the frozen AL march is held to: the interface settles at ``-0.01``, half the
+    platen displacement, by symmetry.
+    """
+    nl = jno.solve.newton(line_search=True, rtol=1e-5, atol=3e-5)
+    d, fem, main = _al_contact_march()
+    # the march is triggered by the form's step history, with nothing passed -- as `u.t` triggers
+    # the transient stepper -- so `contact=` is the only slot this needs.
+    traj = np.asarray(fem.solve(contact=jno.solve.contact(rounds=6), nonlinear=nl))
+    m = np.asarray(d.tag_indices[main]).reshape(-1)
+    errs = [abs(traj[k].reshape(-1, 2)[m, 1].mean() - (-0.01)) for k in range(traj.shape[0])]
+    assert traj.shape[0] == 4, f"one row per declared load step, got {traj.shape[0]}"
+    assert errs[-1] < 5e-4, f"the marched interface must sit on the bonded oracle: errors {errs}"
+    assert errs[-1] <= errs[0] * 1.05, f"the error must not grow along the path: {errs}"
+
+    # and the same problem WITHOUT the search must agree -- this configuration does not slide, so
+    # re-pairing may not change the answer. A difference here would mean the march broke something.
+    d2, fem2, main2 = _al_contact_march()
+    frozen = np.asarray(fem2.solve(nonlinear=nl))
+    m2 = np.asarray(d2.tag_indices[main2]).reshape(-1)
+    a = traj[-1].reshape(-1, 2)[m, 1].mean()
+    b = frozen[-1].reshape(-1, 2)[m2, 1].mean()
+    assert abs(a - b) < 1e-4, f"searched march {a:.6f} vs frozen march {b:.6f} on a non-sliding problem"
+
+
+def test_contact_refuses_an_adaptive_load_path_by_name():
+    """The adaptive path pilots a schedule and REPLAYS it under a scan; the replay cannot run a
+    host-side search. Refused by name rather than marched with a frozen pairing."""
+    _, fem, _m = _al_contact_march()
+    with pytest.raises(NotImplementedError, match="adaptive"):
+        fem.solve(tau=jno.solve.adaptive(), contact=jno.solve.contact())
 
 
 # ----------------------------------------------------------------------------------------------

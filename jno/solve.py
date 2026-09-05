@@ -1535,16 +1535,27 @@ def contact(*, capture: float | None = None, rounds: int = 12, tol: float = 1e-4
 
     Scope, stated up front:
 
-    * **Matrix-free tangent only.** ``nonlinear=jno.solve.newton(direct=True)`` is refused by name: the
-      assembled tangent hoists the contact block's sparsity pattern once, from the pairing's concrete
-      node ids, and a re-pairing changes that pattern. The default JFNK tangent is ``jax.linearize`` of
-      the residual, so it re-pairs with it.
+    * **Either tangent works, and they trade speed against memory.** The matrix-free default re-pairs
+      for free (its tangent is ``jax.linearize`` of the residual). ``nonlinear=jno.solve.newton(direct=
+      True)`` assembles the tangent instead and rebuilds the contact block's sparsity pattern per
+      round — sound because the block's SIZE is fixed by the declaration, so only the index values
+      move. Measured on a 12:20 gear pair, 11k DOF, 5 rounds::
+
+          matrix-free (default)      41.8 s     1830 MB
+          newton(direct=True)        13.4 s     2611 MB     <- 3.1x faster, 43% more memory
+
+      Neither is the right default for every problem, which is why this stays on the ``nonlinear=``
+      slot that already owns the choice rather than becoming an argument here.
     * **The search is host-side and not differentiable in the mesh coordinates.** As with the frozen
       pairing, the gap is differentiable in the DOF *values*; ``d(pairing)/d(x)`` does not exist.
       Each round is its own solve, so a gradient through the *loop* is not provided either.
-    * **Steady solves.** Composition with a ``tau=`` load-path march is not implemented — the march
-      compiles one step and replays it under ``lax.scan``, and a host-side search cannot run inside a
-      scan. It raises rather than marching with a frozen pairing.
+    * **A load path re-pairs per STEP, and is not differentiable.** On a form that marches (step
+      history plus a ``domain(tau=...)`` grid) the march owns the loop and runs the search at every
+      load step — because the pairing that is right at the end of the path is not the one that was
+      right in the middle of it. That march is a host loop rather than a ``lax.scan``, so it gives up
+      the load path's reverse-mode differentiability; the scanned march keeps it, at a frozen pairing.
+      ``tau=jno.solve.adaptive(...)`` and ``tau=jno.solve.arclength(...)`` are refused by name: both
+      replay or root-find under a scan, where a host-side search cannot run.
     * The pairing is closest-point; there is no smoothing (no NTS-to-mortar blending, no C1 surface),
       so a secondary point crossing a main facet edge moves discontinuously. That is what ``rounds``
       iterates on and what the raise reports when it oscillates.

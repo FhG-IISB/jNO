@@ -38,7 +38,7 @@ def _roll_buffer(buf, nv):
     return jnp.concatenate([nv[:, :, None, ...], buf[:, :, :-1, ...]], axis=2)
 
 
-def run_history_march(fem, solve_fn=None, path=None, **kwargs):
+def run_history_march(fem, solve_fn=None, path=None, contact=None, **kwargs):
     """March ``fem`` over its domain's pseudo-time grid and return the ``(n_steps, n_dofs)`` trajectory.
 
     ``solve_fn`` (if given) is a nonlinear solver ``(residual_fn, u0) -> u`` — e.g. the one composed from
@@ -47,6 +47,11 @@ def run_history_march(fem, solve_fn=None, path=None, **kwargs):
     ``path`` (``fem.solve(tau=jno.solve.adaptive(limit=...))``) sizes the steps adaptively instead of
     taking the domain's uniform grid — see :func:`_pilot_schedule`. The output is resampled back
     onto the domain's grid either way, so the returned shape does not depend on the step sizes taken.
+
+    ``contact`` (``fem.solve(tau=..., contact=jno.solve.contact())``) re-runs the contact search at
+    **every load step** — see :func:`_march_eager_contact`. That march is a host loop rather than a
+    ``lax.scan``, which costs the load path its reverse-mode differentiability; the alternative would
+    be to march with one frozen pairing, which is the wrong answer rather than a slower one.
     """
     op = fem._op
     domain = fem.domain
@@ -172,6 +177,117 @@ def run_history_march(fem, solve_fn=None, path=None, **kwargs):
     # The schedule is a PIECEWISE-CONSTANT function of the parameters (perturb one infinitesimally and
     # the same steps are accepted), so the gradient over a frozen schedule is the true derivative almost
     # everywhere -- the same contract `adapt=` already makes for a frozen mesh sequence.
+    def _march_eager_contact(spec, param_args):
+        """The load path with a contact search PER LOAD STEP.
+
+        Why per step, and not per march: the pairing that is right at the end of the path is not the one
+        that was right in the middle of it. Wrapping the whole march in the steady re-pairing loop would
+        re-solve the entire path with the FINAL configuration's pairing applied to every step — a
+        plausible-looking trajectory for a contact history that never happened.
+
+        Why eager: the search is a host-side closest-point projection and cannot run inside ``lax.scan``.
+        The cost is stated rather than hidden — this march is **not** reverse-mode differentiable, where
+        the scanned one is.
+
+        Each step iterates to the same two conditions the steady driver uses: the pairing stops moving
+        AND the solution stops moving. The pairing carries over from the previous step, so a step whose
+        contact configuration is unchanged usually settles in the minimum two rounds.
+        """
+        from .contact_search import _pairing_moved, _stalled
+        from .fem_utils import _log
+
+        repair = getattr(op, "repair_contact", None)
+        if repair is None or not getattr(op, "contact_pairs", None):
+            raise ValueError(
+                "fem.solve(tau=..., contact=...) but this form declares no contact pair. `contact=` "
+                "re-runs the search behind `u.gap(secondary, main)`; without one there is nothing to "
+                "re-pair. Add the gap to the term list, or drop `contact=`."
+            )
+        n_steps = int(tau_grid.shape[0])
+        # The search applies from the FIRST step, for the same reason it does in the steady driver: the
+        # build-time tables are unbounded, so on a closed body the far side pairs through the body.
+        tables = repair(np.zeros(n_dofs), capture=spec.capture)
+        u, bufs, sbufs = u0, buffers0, sbuffers0
+        traj = []
+        for k in range(n_steps):
+            tau_k = tau_grid[k]
+            path_k = {fid: fr[k] for fid, fr in path_frames.items()}
+            u_prev, settled, moved, rel, quiet, hist = None, False, None, float("inf"), 0, []
+            for rnd in range(int(spec.rounds)):
+                u_new, nb, nsb = _step_once(
+                    u, bufs, sbufs, tau_k, path_k, {**param_args, "__gap_tables__": tables}
+                )
+                un = np.asarray(u_new)
+                new = repair(un, capture=spec.capture)
+                moved = _pairing_moved(tables, new)
+                du = np.inf if u_prev is None else float(np.abs(un - u_prev).max())
+                scale = max(float(np.abs(un).max()), 1e-30)
+                tables, u_prev, rel = new, un, du / scale
+                if np.isfinite(du):
+                    hist.append(du / scale)
+                _log.info(
+                    f"contact march step {k + 1}/{n_steps} (tau={float(tau_k):.4g}) "
+                    f"round {rnd + 1}/{int(spec.rounds)}: {moved} slot(s) re-paired, "
+                    f"|du|/|u| = {du / scale:.3e}"
+                )
+                # See `run_contact_solve`: a slot on the seam between two adjacent main facets can
+                # flip forever without changing the surface it describes, so the test is that the
+                # SOLUTION has gone quiet twice running, not that every facet label agrees.
+                quiet = quiet + 1 if du <= spec.tol * scale else 0
+                if quiet >= 2 or (moved == 0 and du <= spec.tol * scale):
+                    settled = True
+                    break
+            if not settled and _stalled(hist, spec.tol):
+                raise RuntimeError(
+                    f"fem.solve(tau=..., contact=...): load step {k + 1}/{n_steps} (tau = "
+                    f"{float(tau_k):.4g}) is OSCILLATING, not converging -- over {int(spec.rounds)} "
+                    f"rounds |du|/|u| cycled between {min(hist):.2e} and "
+                    f"{max(hist[len(hist)//2:]):.2e} with no downward trend. More rounds will not help. "
+                    "Take smaller load steps so each starts nearer its own equilibrium, refine the "
+                    "contacting surface, or loosen `tol=`."
+                )
+            if not settled:
+                raise RuntimeError(
+                    f"fem.solve(tau=..., contact=...): load step {k + 1}/{n_steps} (tau = "
+                    f"{float(tau_k):.4g}) did not settle in {int(spec.rounds)} round(s) -- "
+                    + (f"{moved} quadrature slot(s) still change which main facet they read"
+                       if moved else f"the pairing is settled but the solution still moves by {rel:.2e} "
+                       f"relative against a tolerance of {spec.tol:.0e}")
+                    + ". Raise `rounds=`, loosen `tol=`, or take smaller load steps so each one starts "
+                    "closer to its own equilibrium."
+                )
+            u, bufs, sbufs = u_new, nb, nsb
+            traj.append(u)
+        return jnp.stack(traj)
+
+    if contact is not None:
+        if _is_arclength(path):
+            raise NotImplementedError(
+                "fem.solve(tau=jno.solve.arclength(...), contact=...) is not wired: arc-length solves "
+                "for the load factor alongside u on a bordered system, and the contact search would "
+                "have to re-pair inside that root-find rather than between load steps. Use the fixed "
+                "`domain(tau=...)` march with `contact=`."
+            )
+        if path is not None and not _is_explicit_schedule(path):
+            raise NotImplementedError(
+                "fem.solve(tau=jno.solve.adaptive(...), contact=...) is not wired: the adaptive path "
+                "pilots a step schedule and then REPLAYS it under a scan, and the replay cannot run a "
+                "host-side search. Pilot the schedule first without contact, then replay it explicitly "
+                "with `tau=fem.tau_schedule, contact=...`."
+            )
+        if _is_explicit_schedule(path):
+            raise NotImplementedError(
+                "fem.solve(tau=<schedule>, contact=...) is not wired yet: the contact march walks the "
+                "domain's declared `domain(tau=...)` grid. Declare the grid you want and march it."
+            )
+        if getattr(op, "runtime_parameter_exprs", {}):
+            raise NotImplementedError(
+                "fem.solve(tau=..., contact=...) on a form carrying a runtime parameter is not wired: "
+                "the search needs a concrete displacement to project, and a differentiable solve hands "
+                "it tracers. Run the march forward at the values you want."
+            )
+        return _march_eager_contact(contact, {})
+
     if _is_arclength(path):
         if path_frames:
             raise NotImplementedError(

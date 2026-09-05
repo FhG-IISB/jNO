@@ -2503,22 +2503,42 @@ def assemble_fem_native(
             return ks[0] if ks else None
 
         _gap_static_cache: Dict[Any, Any] = {}
+        _gap_static_for = [None]  # the `__gap_tables__` payload `_gap_static_cache` was built from
 
-        def _gap_static(region, face_ids, btfi):
-            """Concrete index/weight geometry of a region's gap blocks — computed ONCE from the frozen
-            pairing tables and shared by the pattern hoist and the traced assembly, so the two cannot
-            drift. The three nonlocal blocks, flat index arrays in emission order:
+        def _pairing_of(args):
+            """The pairing payload in ``args``, or ``None`` for the build-time (frozen) pairing.
+
+            Used as a cache TAG by identity: ``fem.solve(contact=...)`` hands down one payload object
+            per round and reuses it for every residual/Jacobian evaluation within that round, so
+            identity is exactly "the pairing this evaluation belongs to". Comparing by ``is`` also
+            avoids hashing arrays.
+            """
+            return args.get("__gap_tables__") if isinstance(args, dict) else None
+
+        def _gap_static(region, face_ids, btfi, args=None):
+            """Concrete index/weight geometry of a region's gap blocks, for the pairing in ``args`` —
+            shared by the pattern hoist and the traced assembly so the two cannot drift. The three
+            nonlocal blocks, flat index arrays in emission order:
 
             * ``(s,m)``: secondary test rows x main columns (one column per (q, mortar-node, comp));
             * ``(m,s)``: reaction rows (main dofs, one per (q, mortar-node, comp)) x parent-local cols;
             * ``(m,m)``: reaction rows x main columns.
+
+            Re-pairing changes WHICH main node each quadrature point reads, so these indices move with
+            it. Their SHAPES do not: ``(n_face, n_q, K)`` is fixed by the declaration, so the block's
+            entry count is invariant and only the values differ — which is what lets the compressed
+            pattern be rebuilt per pairing instead of the whole path being refused.
             """
+            live = _pairing_of(args)
+            if _gap_static_for[0] is not live:
+                _gap_static_cache.clear()
+                _gap_static_for[0] = live
             k = _gap_key_of(region)
             cache_key = (region, int(btfi))
             hit = _gap_static_cache.get(cache_key)
             if hit is not None:
                 return hit
-            tb = _gap_tables[k]
+            tb = _gap_tb(k, args)
             fidx_m, vt = tb["field"], vecs[tb["field"]]
             fids_np = np.asarray(face_ids, dtype=np.int64)
             ids_f = np.asarray(tb["ids_full"])[fids_np]  # (n_face, n_q, K)
@@ -2557,43 +2577,64 @@ def assemble_fem_native(
             _gap_static_cache[cache_key] = out
             return out
 
-        _idx_rows, _idx_cols = [], []
-        for _coeff_s, _tfi_s, _rn_s in typed_with_masks:
-            _sh = (n_cells, int(cdofs[_tfi_s].shape[1]), int(cell_all_dofs.shape[1]))
-            _idx_rows.append(jnp.broadcast_to(cdofs[_tfi_s][:, :, None], _sh).reshape(-1))
-            _idx_cols.append(jnp.broadcast_to(cell_all_dofs[:, None, :], _sh).reshape(-1))
-        for _region_s, _face_ids_s, _btyped_s in surface_work:
-            _pc = parent_j[jnp.asarray(_face_ids_s, dtype=jnp.int32)]
-            _fcols = cell_all_dofs[_pc]
-            for _bcoeff_s, _btfi_s in _btyped_s:
-                _sh = (int(_pc.shape[0]), int(cdofs[_btfi_s].shape[1]), int(cell_all_dofs.shape[1]))
-                _idx_rows.append(jnp.broadcast_to(cdofs[_btfi_s][_pc][:, :, None], _sh).reshape(-1))
-                _idx_cols.append(jnp.broadcast_to(_fcols[:, None, :], _sh).reshape(-1))
-                # The gap's nonlocal blocks, in the SAME append order the traced assembly emits
-                # them: (s,m) always when the region carries a gap; (m,s) and (m,m) when this term
-                # also drives the main-side reaction. The indices come from the frozen pairing
-                # tables, so the pattern stays static; inactive contact contributes zeros in DATA.
-                if _gap_key_of(_region_s) is not None:
-                    _gs = _gap_static(_region_s, _face_ids_s, _btfi_s)
-                    _idx_rows.append(_gs["rows_sm"])
-                    _idx_cols.append(_gs["cols_sm"])
-                    if _gaps_in(_bcoeff_s, _region_s):
-                        _idx_rows.append(_gs["rows_ms"])
-                        _idx_cols.append(_gs["cols_ms"])
-                        _idx_rows.append(_gs["rows_mm"])
-                        _idx_cols.append(_gs["cols_mm"])
-        _blk_sizes = [int(r.shape[0]) for r in _idx_rows]  # per-term flat lengths, in append order
-        _idx_static = (
-            jnp.stack([jnp.concatenate(_idx_rows).astype(jnp.int32), jnp.concatenate(_idx_cols).astype(jnp.int32)], axis=1)
-            if _idx_rows
-            else None
-        )
-        try:
-            _plan = compress_plan(_idx_static) if _idx_static is not None else None
-        except Exception:  # noqa: BLE001 -- a traced pattern would break the static-count invariant
-            _idx_static, _plan = None, None  # fall back to the uncompressed (still correct) path
+        _pattern_cache: Dict[str, Any] = {"tag": object(), "val": None}
+
+        def _pattern(args=None):
+            """``(idx_static, plan, blk_sizes)`` for the pairing in ``args``.
+
+            The sparsity pattern is derived from the pairing's concrete node ids, so it moves when the
+            pairing does. It is rebuilt once per pairing rather than per evaluation -- the driver hands
+            down one payload object per round, so the tag below changes exactly when the pattern must.
+            Sizes are invariant across pairings (see ``_gap_static``), so the compressed plan keeps its
+            static ``nse`` and the traced assembly is unaffected.
+            """
+            live = _pairing_of(args)
+            if _pattern_cache["val"] is not None and _pattern_cache["tag"] is live:
+                return _pattern_cache["val"]
+            _idx_rows, _idx_cols = [], []
+            for _coeff_s, _tfi_s, _rn_s in typed_with_masks:
+                _sh = (n_cells, int(cdofs[_tfi_s].shape[1]), int(cell_all_dofs.shape[1]))
+                _idx_rows.append(jnp.broadcast_to(cdofs[_tfi_s][:, :, None], _sh).reshape(-1))
+                _idx_cols.append(jnp.broadcast_to(cell_all_dofs[:, None, :], _sh).reshape(-1))
+            for _region_s, _face_ids_s, _btyped_s in surface_work:
+                _pc = parent_j[jnp.asarray(_face_ids_s, dtype=jnp.int32)]
+                _fcols = cell_all_dofs[_pc]
+                for _bcoeff_s, _btfi_s in _btyped_s:
+                    _sh = (int(_pc.shape[0]), int(cdofs[_btfi_s].shape[1]), int(cell_all_dofs.shape[1]))
+                    _idx_rows.append(jnp.broadcast_to(cdofs[_btfi_s][_pc][:, :, None], _sh).reshape(-1))
+                    _idx_cols.append(jnp.broadcast_to(_fcols[:, None, :], _sh).reshape(-1))
+                    # The gap's nonlocal blocks, in the SAME append order the traced assembly emits
+                    # them: (s,m) always when the region carries a gap; (m,s) and (m,m) when this term
+                    # also drives the main-side reaction. Inactive contact contributes zeros in DATA.
+                    if _gap_key_of(_region_s) is not None:
+                        _gs = _gap_static(_region_s, _face_ids_s, _btfi_s, args)
+                        _idx_rows.append(_gs["rows_sm"])
+                        _idx_cols.append(_gs["cols_sm"])
+                        if _gaps_in(_bcoeff_s, _region_s):
+                            _idx_rows.append(_gs["rows_ms"])
+                            _idx_cols.append(_gs["cols_ms"])
+                            _idx_rows.append(_gs["rows_mm"])
+                            _idx_cols.append(_gs["cols_mm"])
+            _blk_sizes = [int(r.shape[0]) for r in _idx_rows]  # per-term flat lengths, in append order
+            _idx_static = (
+                jnp.stack(
+                    [jnp.concatenate(_idx_rows).astype(jnp.int32),
+                     jnp.concatenate(_idx_cols).astype(jnp.int32)], axis=1
+                )
+                if _idx_rows
+                else None
+            )
+            try:
+                _plan = compress_plan(_idx_static) if _idx_static is not None else None
+            except Exception:  # noqa: BLE001 -- a traced pattern would break the static-count invariant
+                _idx_static, _plan = None, None  # fall back to the uncompressed (still correct) path
+            _pattern_cache["tag"], _pattern_cache["val"] = live, (_idx_static, _plan, _blk_sizes)
+            return _pattern_cache["val"]
 
         def jacobian(u_flat, t=0.0, args=None):
+            # The pattern belongs to the PAIRING, not to the build: `fem.solve(contact=...)` re-pairs
+            # between rounds and the contact block's indices move with it.
+            _idx_static, _plan, _blk_sizes = _pattern(args)
             # Assemble into COO triplets and build a BCOO -- never materialises the dense (total, total)
             # matrix (O(nnz), GPU-able at large N). Each per-element block is element-sized; duplicate
             # (i, j) triplets from neighbouring cells are summed by BCOO on matvec / todense, so the
@@ -2679,21 +2720,7 @@ def assemble_fem_native(
 
                     if gslice:
                         # ---- the gap's NONLOCAL blocks (same append order as the pattern hoist) ----
-                        if isinstance(args, dict) and args.get("__gap_tables__"):
-                            # The ASSEMBLED tangent hoists its sparsity pattern from the pairing's
-                            # concrete node ids, once, before any solve. Re-pairing changes WHICH main
-                            # nodes each point reads, so that pattern is stale -- and a stale pattern
-                            # does not error, it silently drops the new couplings and keeps the old
-                            # ones, giving a tangent for a contact configuration that is not the one
-                            # being solved. Refuse by name instead.
-                            raise NotImplementedError(
-                                "fem.solve(contact=...) does not compose with an assembled tangent "
-                                "(`nonlinear=jno.solve.newton(direct=True)`): re-pairing changes the "
-                                "contact block's sparsity pattern, which is hoisted once and cannot "
-                                "follow it. Use the matrix-free default, `jno.solve.newton()`, whose "
-                                "tangent is `jax.linearize` of the residual and re-pairs with it."
-                            )
-                        gs = _gap_static(region, face_ids, btfi)
+                        gs = _gap_static(region, face_ids, btfi, args)
                         n_q, vt, gk = gs["n_q"], gs["vt"], gs["key"]
                         w_f = gs["w_f"]
                         g0_sl, um_sl = gslice[gk]
@@ -2778,7 +2805,17 @@ def assemble_fem_native(
         # in force, not the raw one it was derived from. Publishing the raw pattern here silently
         # mismatched the wrapper's `inverse` against the compressed data length: the recurring shape
         # of bug in this repo is a representation changing while one of its readers does not move.
-        jacobian._jno_static_idx = _plan[0] if _plan is not None else _idx_static  # type: ignore[attr-defined]
+        def _static_idx_for(args=None):
+            """The assembled pattern's published index array, for the pairing in ``args``.
+
+            Consumed by :func:`_dirichlet_jac_rows` to plan the compression of the Dirichlet-augmented
+            matrix. It has to follow the pairing for the same reason the pattern does.
+            """
+            _is, _pl, _ = _pattern(args)
+            return _pl[0] if _pl is not None else _is
+
+        jacobian._jno_static_idx_for = _static_idx_for  # type: ignore[attr-defined]
+        jacobian._jno_static_idx = _static_idx_for()  # type: ignore[attr-defined]  -- frozen pairing
         return jacobian
 
     def _dirichlet_jac_rows(jac_fn, pairs):
@@ -2931,15 +2968,18 @@ def assemble_fem_native(
         # ownership is the only thing that separates them, and it lives in the node ids.
         _owner = (getattr(domain, "_tag_regions", {}) or {}).get(region)
         if _owner is not None and bnodes.size:
-            own = np.asarray(_region_node_ids(domain, _owner), dtype=np.int64)
+            # Ownership comes from the cells the assembler integrates over, expressed in THIS FIELD's
+            # connectivity -- so it is order-agnostic. Resolving it against the P1 numbering instead
+            # (which is what this did) cannot place a P2 edge midpoint at all: those nodes do not exist
+            # in P1, so the intersection dropped every one of them and a region-scoped tag on a P2 field
+            # had to be refused outright. `cells_f_all[fidx]` carries the midpoints, and a midpoint
+            # belongs to the body whose cell it sits on, which is the same rule the vertices follow.
+            own = _region_node_ids_from_cells(domain, _owner, np.asarray(cells_f_all[fidx]))
+            if own is None:
+                own = np.asarray(_region_node_ids(domain, _owner), dtype=np.int64)
+            own = np.asarray(own, dtype=np.int64)
             if own.size == 0:
                 raise ValueError(f"tag region {_owner!r} has no nodes on this mesh; cannot restrict {region!r}.")
-            if int(fields[fidx]["order"]) != 1:
-                raise NotImplementedError(
-                    f"tag({region!r}, region={_owner!r}) is resolved against the P1 node numbering, but "
-                    f"this field is P{fields[fidx]['order']}. Use order-1 elements for a region-restricted "
-                    "tag, or tag the two sides by their auto names from domain.interface_tags()."
-                )
             bnodes = np.intersect1d(bnodes, own)
             if bnodes.size == 0:
                 raise ValueError(
@@ -3685,7 +3725,14 @@ def assemble_fem_native(
             return _apply_dirichlet_projected(lambda uu: residual(uu, 0.0, args), dirichlet_pairs)(jnp.asarray(u))
 
         def _jac_np(u, args=None):
-            return _dirichlet_jac_rows(lambda uu: jacobian(uu, 0.0, args), dirichlet_pairs)(jnp.asarray(u))
+            # Carry the pattern across the wrapper. `_dirichlet_jac_rows` plans its compression from
+            # `_jno_static_idx`, and a bare lambda has no such attribute -- so without this the
+            # Dirichlet duplicates were left uncompressed on every non-parametric solve, silently.
+            _f = lambda uu: jacobian(uu, 0.0, args)  # noqa: E731
+            _idx_for = getattr(jacobian, "_jno_static_idx_for", None)
+            if _idx_for is not None:
+                _f._jno_static_idx = _idx_for(args)
+            return _dirichlet_jac_rows(_f, dirichlet_pairs)(jnp.asarray(u))
 
         _op_np = FemResidualOperator(_res_np, _jac_np, total)
         _op_np.repair_contact = _repair_contact  # host-side contact search; see `fem.solve(contact=...)`

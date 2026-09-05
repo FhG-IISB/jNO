@@ -350,6 +350,22 @@ class ContactSpec:
     tol: float = 1e-4
 
 
+def _stalled(hist, tol_rel):
+    """Is a round history a LIMIT CYCLE rather than slow convergence?
+
+    A contact search that keeps re-pairing between a small set of configurations shows `|du|/|u|`
+    cycling through the same values instead of falling. Telling that caller to raise `rounds=` sends
+    them to wait for something that will never happen -- measured on a sheet-forming march, where the
+    ratio cycled 2.2e-2 / 1.3e-2 / 1.4e-2 / 2.0e-2 for 25 rounds with no downward trend. The test is
+    whether the recent best is meaningfully below the earlier best; if it is not, more rounds are the
+    wrong advice and a smaller load step is the right one.
+    """
+    if len(hist) < 6:
+        return False
+    half = len(hist) // 2
+    return min(hist[half:]) > 0.5 * min(hist[:half])
+
+
 def _pairing_moved(a, b):
     """How many quadrature-point slots changed which main nodes they read, between two payloads."""
     n = 0
@@ -401,21 +417,6 @@ def run_contact_solve(fem, spec, *, solve_fn=None, **kwargs):
             "search behind `u.gap(secondary, main)` / `u.slide(...)`; without one there is nothing to "
             "re-pair. Add the gap to the term list, or drop `contact=`."
         )
-    if kwargs.get("tau") is not None:
-        raise NotImplementedError(
-            "fem.solve(contact=..., tau=...) is not implemented. The load-path march compiles ONE step "
-            "and replays it under `lax.scan` -- which is what keeps a load path reverse-mode "
-            "differentiable end to end -- and a host-side search cannot run inside a scan. Solve the "
-            "steady problem at each load level yourself with `contact=`, or accept the frozen pairing "
-            "and drop `contact=`."
-        )
-    if getattr(kwargs.get("nonlinear"), "direct", False):
-        raise NotImplementedError(
-            "fem.solve(contact=..., nonlinear=jno.solve.newton(direct=True)) is not supported: the "
-            "assembled tangent hoists the contact block's sparsity pattern once, from the pairing's "
-            "concrete node ids, and re-pairing changes which main nodes each point reads. Use the "
-            "matrix-free default `jno.solve.newton()`, whose tangent is `jax.linearize` of the residual."
-        )
     rounds = int(spec.rounds)
     if rounds < 1:
         raise ValueError(f"fem.solve(contact=...): rounds must be at least 1, got {rounds}.")
@@ -432,9 +433,11 @@ def run_contact_solve(fem, spec, *, solve_fn=None, **kwargs):
         ``FemResidualOperator.solve`` caches a ``jax.jit`` of a closure that reads ``self.residual`` at
         TRACE time, keyed only on the solver identity and the argument shapes -- none of which change
         between rounds. Left alone it would replay round 1's pairing for every later round, and worse,
-        an ordinary ``fem.solve()`` afterwards would silently get the searched answer. Re-pairing
-        changes what the residual IS, so its compilation cannot be reused; that retrace is the real cost
-        of the search on a runtime-parametric form.
+        an ordinary ``fem.solve()`` afterwards would silently get the searched answer.
+
+        Measured cost: **none** on the ordinary (non-parametric) path, which never populates that cache
+        -- ``FemResidualOperator.solve`` returns a ``FunctionCall`` and never reaches it. On a
+        runtime-parametric form it does force a retrace per round; that has not been measured.
         """
         op.__dict__.pop("_eager_solve_cache", None)
 
@@ -451,7 +454,7 @@ def run_contact_solve(fem, spec, *, solve_fn=None, **kwargs):
         # interpenetration. Measured on a gear pair: |u|max 5.9e-01 where the rigid drive is 6e-03, and
         # the torque ratio 0.82 against an exact 1.667. `capture` is what excludes those points, and a
         # caller who passed `contact=` asked for the search -- so it applies from the first solve.
-        u_prev, moved, du, rel = None, None, float("inf"), float("inf")
+        u_prev, moved, du, rel, quiet, hist = None, None, float("inf"), float("inf"), 0, []
         cell["tb"] = repair(np.zeros(int(op.size)), capture=spec.capture)
         for rnd in range(rounds):
             _drop_compiled()
@@ -474,10 +477,19 @@ def run_contact_solve(fem, spec, *, solve_fn=None, **kwargs):
                 f"contact round {rnd + 1}/{rounds}: "
                 f"{moved} slot(s) re-paired, |du| = {du:.3e}"
             )
-            if moved == 0 and du <= spec.tol * scale:
+            # Settled = the SOLUTION has stopped moving, twice running. Not `moved == 0`: a quadrature
+            # point sitting on the seam between two adjacent main facets can flip between them forever,
+            # and both describe the same surface, so the gap it sees is the same either way. Measured on
+            # a sheet-forming march, one such slot chattered for 25 rounds while |du|/|u| sat at 1e-3 --
+            # the physics was settled and the facet label was not. Patience (two consecutive quiet
+            # rounds) is what separates that from a solution still genuinely drifting.
+            quiet = quiet + 1 if du <= spec.tol * scale else 0
+            if quiet >= 2 or (moved == 0 and du <= spec.tol * scale):
                 fem.contact_rounds = rnd + 1
                 return u
             cell["tb"], u_prev, rel = new, u, du / scale
+            if np.isfinite(du):
+                hist.append(du / scale)
     finally:
         fem._in_contact_loop = False
         op.residual, op.jacobian = base_res, base_jac
@@ -489,7 +501,17 @@ def run_contact_solve(fem, spec, *, solve_fn=None, **kwargs):
             "against a previous one -- a single round cannot show that the search has settled, however "
             "good its answer looks. Use rounds >= 2."
         )
-    if moved == 0:
+    if _stalled(hist, spec.tol):
+        raise RuntimeError(
+            f"fem.solve(contact=...): the search is OSCILLATING, not converging -- over {rounds} rounds "
+            f"|du|/|u| cycled between {min(hist):.2e} and {max(hist[len(hist)//2:]):.2e} with no downward "
+            f"trend, against a tolerance of {spec.tol:.0e}. More rounds will not help: the pairing is "
+            "alternating between a small set of configurations. Take a smaller load step (or a smaller "
+            "load) so the search starts nearer its own equilibrium, refine the contacting surface so a "
+            "quadrature point is less able to straddle two facets, or loosen `tol=` if this precision "
+            "is more than the answer needs."
+        )
+    if moved == 0 or quiet:
         raise RuntimeError(
             f"fem.solve(contact=...): after {rounds} round(s) the PAIRING has settled -- no quadrature "
             f"point changes which main facet it reads -- but the solution is still moving, by "

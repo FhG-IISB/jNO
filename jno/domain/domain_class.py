@@ -1104,7 +1104,7 @@ class domain(MeshIOMixin):
 
         points = self._mesh_pool[tag]
         normals = self.normals_by_tag.get(tag)
-        if for_normals and normals is not None and np.asarray(points).ndim < 3:
+        if for_normals and normals is not None:
             # A tag's point pool is interior + boundary (see `_populate_mesh_pool_for_tag`) while its
             # normals are one per BOUNDARY point -- different sets, and the sampler draws indices from
             # the first to index the second. On a two-body mesh that was a pool of 89 against 16
@@ -1113,10 +1113,20 @@ class domain(MeshIOMixin):
             # BOTH readings are legitimate: the same tag may be a volume region for one term and a
             # surface for its normals. So the pool is NOT narrowed in general -- only for a caller that
             # has said it will index the two together, which is the one place they must agree.
+            #
+            # A PSEUDO-TIME / transient pool is `(T, N, D)` and the normals stay `(N_boundary, D)`: the
+            # sampler indexes the spatial axis of one with indices drawn from the other, so the two must
+            # agree on that axis alone. Skipping the 3-D case (which this did) let the same IndexError
+            # straight back in on any `domain(tau=...)` form -- found on a forming march, where a
+            # region-scoped surface tag met a load path.
             reg = (getattr(self, "_boundary_regions", {}) or {}).get(tag)
             rp = None if reg is None else getattr(reg, "points", None)
-            if rp is not None and len(np.asarray(normals)) != np.asarray(points).shape[0]:
-                points = np.asarray(rp)
+            if rp is not None:
+                _p = np.asarray(points)
+                _rp = np.asarray(rp)
+                _axis = 1 if _p.ndim >= 3 else 0  # the SPATIAL axis, whichever layout the pool is in
+                if len(np.asarray(normals)) != _p.shape[_axis]:
+                    points = np.broadcast_to(_rp, (_p.shape[0],) + _rp.shape) if _p.ndim >= 3 else _rp
         count = int(getattr(self, "_batch_count", getattr(self, "total_samples", 1))) if self.same_domain else 1
         return [(max(1, count), points, normals)]
 

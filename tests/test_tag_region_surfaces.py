@@ -167,3 +167,60 @@ def test_touching_bodies_keep_their_own_interface_side(hB, label):
             f"[{label} seam] {tag} has {got} facets where body {region} has {want} — "
             f"{'it absorbed the other side of the interface' if got > want else 'it lost facets'}"
         )
+
+
+# ----------------------------------------------------------------------------------------------
+# Higher-order fields
+# ----------------------------------------------------------------------------------------------
+@pytest.mark.parametrize("order", [1, 2])
+def test_a_region_scoped_dirichlet_works_at_any_element_order(order):
+    """``u(tag) - g`` on a ``region=``-scoped tag, for P1 and P2 alike.
+
+    P2 used to be refused by name: ownership was resolved against the **P1** node numbering, in which a
+    P2 edge midpoint does not exist, so the intersection dropped every midside node. Ownership now comes
+    from the cells the assembler integrates over, expressed in the FIELD's own connectivity.
+
+    The oracle has to defeat two different ways of passing by accident:
+
+    * the two bodies are held to **different harmonic functions**, so a tag that ignored ``region=``
+      would impose both conditions on every boundary node and the two would fight;
+    * those functions are **quadratic**, so a midside node's value is not the average of its two
+      vertices. A constant or linear ``g`` cannot catch a dropped midpoint at all — the remaining
+      vertex conditions plus the PDE put the free node back exactly where it belonged, which is how an
+      earlier version of this test passed against the unfixed code.
+
+    Both ``x^2 - y^2`` and ``2xy`` are harmonic and lie in the P2 space, so the discrete solution is the
+    exact one and any deviation is a condition that was not imposed.
+    """
+    d = jno.Shape.regions(A=jno.Shape.rect(*BOX["A"][:1], 0, BOX["A"][1], 1).sized(0.34),
+                          B=jno.Shape.rect(BOX["B"][0], 0, BOX["B"][1], 1).sized(0.34),
+                          conforming=False).domain()
+    _ = d.built_mesh
+    everywhere = lambda x, y: x**2 >= -1.0  # noqa: E731
+    d.tag("sA", everywhere, region="A")
+    d.tag("sB", everywhere, region="B")
+
+    u, v = d.fem_symbols(order=order)
+    ci = d.variable("interior", split=True)
+    a, b = d.variable("sA", split=True), d.variable("sB", split=True)
+    gu, gv = jno.np.grad(u, [ci[0], ci[1]]), jno.np.grad(v, [ci[0], ci[1]])
+    fem = jno.fem([
+        jno.np.inner(gu, gv, n_contract=1),
+        u(a[0], a[1]) - (a[0] * a[0] - a[1] * a[1]),   # harmonic, quadratic
+        u(b[0], b[1]) - (2.0 * b[0] * b[1]),           # a DIFFERENT harmonic function
+    ])
+    sol = np.asarray(fem.solve()).reshape(-1)
+    pts = np.asarray(fem.field_points[0])
+
+    inA = pts[:, 0] <= 1.0 + 1e-9
+    xa, ya = pts[inA, 0], pts[inA, 1]
+    xb, yb = pts[~inA, 0], pts[~inA, 1]
+    # P1 cannot represent a quadratic, so it is held only to the coarse-mesh interpolation error;
+    # P2 contains both functions exactly and must reproduce them.
+    tol = 0.06 if order == 1 else 1e-6
+    eA = float(np.abs(sol[inA] - (xa**2 - ya**2)).max())
+    eB = float(np.abs(sol[~inA] - (2.0 * xb * yb)).max())
+    assert eA < tol, f"P{order}: body A should be x^2-y^2, worst node off by {eA:.2e}"
+    assert eB < tol, f"P{order}: body B should be 2xy, worst node off by {eB:.2e}"
+    if order == 2:
+        assert pts.shape[0] > int(np.asarray(d.built_mesh.points).shape[0]), "P2 adds midside nodes"

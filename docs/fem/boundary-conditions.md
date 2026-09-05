@@ -324,13 +324,30 @@ barred from pairing with its own neighbours *and* from pairing with a facet whos
 it, which is what stops a flat stretch from reading as touching itself everywhere. A candidate list
 requires `contact=` and is refused without it.
 
+**Either tangent works**, and the choice is a speed/memory trade rather than a restriction. The
+matrix-free default re-pairs for free; `nonlinear=jno.solve.newton(direct=True)` assembles the tangent
+and rebuilds the contact block's sparsity pattern each round. Measured on a 12:20 gear pair, 11k DOF,
+5 rounds:
+
+| tangent | time | peak RSS |
+|---|---|---|
+| matrix-free (default) | 41.8 s | 1830 MB |
+| `newton(direct=True)` | **13.4 s** | 2611 MB |
+
+On a form that **marches** — step history (`.i(k)`) plus a `domain(tau=...)` grid — the march owns the
+loop and re-runs the search at *every load step*, because the pairing that is right at the end of the
+path is not the one that was right in the middle of it:
+
+```python
+u = fem.solve(contact=jno.solve.contact())     # the march is triggered by the form, not by a slot
+```
+
 !!! warning "Scope — `contact=`"
-    **Matrix-free tangent only.** `nonlinear=jno.solve.newton(direct=True)` is refused by name: the
-    assembled tangent hoists the contact block's sparsity pattern once, from the pairing's concrete
-    node ids, and re-pairing changes it. The default JFNK tangent is `jax.linearize` of the residual,
-    so it re-pairs with it. **Steady solves only** — composition with a `tau=` load-path march is not
-    implemented, because that march replays one compiled step under `lax.scan` and a host-side search
-    cannot run inside a scan. And each round is its own solve, so there is no gradient through the loop.
+    A contact march is a **host loop, not a `lax.scan`**, so it gives up the load path's reverse-mode
+    differentiability — the scanned march keeps that, at a frozen pairing. `tau=jno.solve.adaptive(...)`
+    and `tau=jno.solve.arclength(...)` are refused by name: both replay or root-find under a scan, where
+    a host-side search cannot run. Each round is its own solve, so there is no gradient through the
+    round loop either, and the search itself is host-side and not differentiable in the mesh coordinates.
 
 !!! warning "Scope — the frozen pairing (without `contact=`)"
     Small sliding — the pairing is frozen at build time, so a configuration that slides must be
@@ -342,8 +359,8 @@ requires `contact=` and is refused without it.
     The **assembled tangent carries the gap's nonlocal blocks** — `(s,m)` from `jacfwd` w.r.t. the
     gathered main values chained through the frozen mortar weights, plus the reaction rows' `(m,s)` and
     `(m,m)` — verified against the matrix-free JVP on random probes in both the active and separated
-    branches, so `newton(direct=True)` + `lu`/cuDSS works with a **frozen** pairing (the pattern is
-    static; inactive contact contributes zeros in the data, which keeps the sparsity-keyed
-    factorization caches valid). It is that static pattern which `contact=` cannot reuse.
+    branches, so `newton(direct=True)` + `lu`/cuDSS works here (inactive contact contributes zeros in
+    the data, which keeps the sparsity-keyed factorization caches valid). Under `contact=` the same
+    blocks are rebuilt per round, and the equivalence is asserted against a **re-paired** table set.
 
 ---
