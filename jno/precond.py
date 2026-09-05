@@ -41,6 +41,7 @@ __all__ = [
     "block_diag",
     "triangular",
     "lsc",
+    "pcd",
     "saddle",
     "amg",
     "jaxamg",
@@ -126,6 +127,17 @@ class _Combination(_Spec):
         for side in (self.left, self.right):
             if hasattr(side, "prepare"):
                 side.prepare(fem)
+
+    def refresh_from(self, sol, fem):
+        """Forward the Picard lag to both operands.
+
+        Without this a solution-dependent factor inside a composition -- `form(<callable>)`, or a
+        `pcd()` whose F_p tracks the iterate -- would be prepared once and then never updated, and the
+        composition would silently keep preconditioning with the coefficient from the first solve.
+        """
+        for side in (self.left, self.right):
+            if hasattr(side, "refresh_from"):
+                side.refresh_from(sol, fem)
 
     def _appliers(self, ctx: PrecondContext):
         from .utils.solver.solver_api import materialize_precond
@@ -973,6 +985,240 @@ def lsc(*, inner=None, scaled: bool = True, velocity=None) -> _LSC:
     return _LSC(inner, scaled, velocity)
 
 
+def _symbols_for_block(fem, idx, *, value_shape=(), tag="aux"):
+    """Fresh trial/test symbols on the SAME element as block ``idx``, plus their bound pair.
+
+    The element order is not recorded on the FEM, so it is recovered by assembling a mass on each
+    candidate order and keeping the one whose size matches the block. Shared by the built-in Schur
+    approximations so they size themselves off the system instead of assuming P1.
+    """
+    from . import np as _jnp_ops
+    from .utils.solver.solver_api import PrecondContext as _Ctx
+
+    dom = fem.domain
+    blocks = fem.blocks
+    n_blk = int(blocks[idx].stop - blocks[idx].start)
+    own_shape = tuple(getattr(fem, "_block_value_shapes", ()) or ())[idx]
+    n_scalar = n_blk // max(1, _value_shape_components(own_shape))
+    coords = dom.variable("interior", split=True)
+    axes = ("x", "y", "z")[: int(dom.dimension)]
+    want = n_scalar * max(1, _value_shape_components(value_shape))
+    for order in (1, 2, 3):
+        a, b = dom.fem_symbols(value_shape=value_shape, order=order, names=(f"{tag}_t", f"{tag}_s"))
+        ai = a.bind(**{ax: coords[i] for i, ax in enumerate(axes)})
+        bi = b.bind(**{ax: coords[i] for i, ax in enumerate(axes)})
+        try:
+            terms = [_jnp_ops.inner(ai, bi, n_contract=1) if value_shape else ai * bi]
+            op = _Ctx(None, fem).assemble(terms)
+        except Exception:  # noqa: BLE001 -- a mismatched order can fail in several ways
+            continue
+        if op.shape is not None and int(op.shape[0]) == int(want):
+            # Hand back the coordinates too: `dom.variable("interior", split=True)` mints a FRESH
+            # Variable on every call, and combining views bound to two of them is a binding conflict.
+            return a, b, ai, bi, order, coords
+    raise NotImplementedError(
+        f"jno.precond: could not build symbols matching block {idx} ({n_blk} dofs) -- tried Lagrange "
+        "orders 1-3. The built-in Schur approximations size themselves off the constraint block; an "
+        "exotic space needs the factors written out by hand and composed with `@` / `+`."
+    )
+
+
+def _value_shape_components(shape) -> int:
+    n = 1
+    for s in tuple(shape or ()):
+        n *= int(s)
+    return n
+
+
+class _PCD(_Spec):
+    """Pressure convection-diffusion Schur approximation; see :func:`pcd`.
+
+    ``S^-1 ~ A_p^-1 F_p M_p^-1`` with the pressure Laplacian ``A_p``, the pressure
+    convection-diffusion operator ``F_p = nu*(grad p, grad q) + (w.grad p, q)`` and the pressure mass
+    ``M_p``. Every factor is an ordinary weak form, so this spec is a CONVENIENCE -- the same thing is
+    writable by hand as ``form([...]) @ form([...], inner=False) @ form([...])``, which is the route to
+    take for a variant this does not cover.
+
+    ``w`` is the lagged velocity, re-read from the outer solve's entry iterate (:meth:`refresh_from`)
+    and carried into the form as a KNOWN field, so ``A_p`` and ``M_p`` are built once and only ``F_p``
+    is rebuilt.
+
+    Reference: Kay, Loghin & Wathen, *SIAM J. Sci. Comput.* **24** (2002) 237; Elman, Silvester &
+    Wathen, *Finite Elements and Fast Iterative Solvers*, 2nd ed., OUP 2014, Sec. 9.2.3 (the boundary
+    conditions, which decide whether it works at all).
+    """
+
+    def __init__(self, viscosity, inflow=None, velocity=None, inner_solver=None):
+        self.viscosity = float(viscosity)
+        self.inflow = inflow
+        self.velocity = velocity
+        self.inner = inner_solver
+        self._ap = self._mp = self._fp = None
+        self._ctx = None  # (ip, iu, symbols, coords) captured at prepare
+
+    def _bc(self, sym):
+        """The inflow Dirichlet row on a pressure-space operator, or nothing for a Neumann one.
+
+        ``inflow`` is the COORDINATE TUPLE the caller already built, not a region name -- because
+        `domain.variable("inlet", split=True)` mints a FRESH region on every call (`inlet_3`,
+        `inlet_4`, ...). A name would therefore resolve to a different region than the one the primal
+        form constrained, and the Dirichlet row would silently fail to land on the boundary.
+        """
+        if self.inflow is None:
+            return []
+        if isinstance(self.inflow, str):
+            raise TypeError(
+                f"jno.precond.pcd(inflow={self.inflow!r}): pass the COORDINATE TUPLE, not a region "
+                "name -- `xin, yin, _ = d.variable('inlet', split=True)` then `inflow=(xin, yin)`. A "
+                "name cannot work: `domain.variable(...)` mints a fresh region on every call, so "
+                "re-resolving it here would give a different region than the one your form "
+                "constrained, and the Dirichlet row would quietly miss the boundary."
+            )
+        co = tuple(self.inflow)
+        dim = int(self._ctx["dom"].dimension)
+        if len(co) < dim:
+            raise ValueError(
+                f"jno.precond.pcd(inflow=...): expected at least {dim} coordinate variables for a "
+                f"{dim}-D domain, got {len(co)}. Pass the tuple you already have, e.g. "
+                "`xin, yin, _ = d.variable('inlet', split=True)` then `inflow=(xin, yin)`."
+            )
+        return [sym(*co[:dim]) - 0.0]
+
+    def prepare(self, fem):
+        if self._ap is not None:
+            return
+        from . import solve as _s
+
+        idx = tuple(getattr(fem, "_saddle_block_indices", ()) or ())
+        if len(idx) != 1:
+            raise NotImplementedError(
+                f"jno.precond.pcd(): expects ONE constraint field, this system has {len(idx)}. "
+                "Compose per constraint with jno.precond.triangular((field, spec), ...)."
+            )
+        ip = int(idx[0])
+        iu = self.velocity if self.velocity is not None else _LSC._coupled_block(fem, ip)
+        if not isinstance(iu, int):
+            iu = fem.block_index(iu)
+        a, b, ai, bi, order, coords = _symbols_for_block(fem, ip, tag="pcd")
+        dom = fem.domain
+        self._ctx = {"ip": ip, "iu": iu, "a": a, "ai": ai, "bi": bi, "order": order, "dom": dom, "co": coords}
+        axes = ("x", "y", "z")[: int(dom.dimension)]
+        lap = sum(getattr(ai, ax) * getattr(bi, ax) for ax in axes)
+        self._lap = lap
+        solver = self.inner or _s.lu(backend="host")
+        self._ap = form([lap, *self._bc(a)], inner=solver)
+        self._mp = form([ai * bi], inner=solver)
+        self._ap.prepare(fem)
+        self._mp.prepare(fem)
+        self._build_fp(fem, None)
+
+    def _build_fp(self, fem, sol):
+        """``F_p`` at the lagged velocity. With no iterate yet it is the pure diffusion operator."""
+        import numpy as _np
+
+        c = self._ctx
+        dom, ai, bi, a = c["dom"], c["ai"], c["bi"], c["a"]
+        dim = int(dom.dimension)
+        axes = ("x", "y", "z")[:dim]
+        terms = [self.viscosity * self._lap, *self._bc(a)]
+        if sol is not None:
+            blocks = fem.blocks
+            s_u = blocks[c["iu"]]
+            uv = _np.asarray(sol).reshape(-1)[s_u.start : s_u.stop].reshape(-1, dim)
+            # Sample the velocity on the CONSTRAINT field's nodes. For Taylor-Hood the pressure nodes
+            # are a subset of the velocity nodes, so this is exact; the guard below is what makes that
+            # a checked fact rather than an assumption.
+            v_pts = _np.asarray(fem.field_points[c["iu"]])[:, :dim]
+            p_pts = _np.asarray(fem.field_points[c["ip"]])[:, :dim]
+            from scipy.spatial import cKDTree
+
+            dist, who = cKDTree(v_pts).query(p_pts)
+            scale = float(_np.ptp(v_pts, axis=0).max()) or 1.0
+            if float(dist.max()) > 1e-8 * scale:
+                raise NotImplementedError(
+                    "jno.precond.pcd(): the constraint field's nodes are not a subset of the momentum "
+                    f"field's (largest gap {float(dist.max()):.3e}), so the lagged velocity cannot be "
+                    "read onto them exactly. That holds for Taylor-Hood and for an equal-order pair; "
+                    "for anything else, build F_p yourself and compose it with `@`."
+                )
+            wsym, _z = dom.fem_symbols(value_shape=(dim,), names=("pcd_w", "pcd_wz"), order=c["order"])
+            co = c["co"]  # the SAME interior coordinates the pressure symbols were bound to
+            w = wsym.bind(**{ax: co[i] for i, ax in enumerate(axes)}).freeze(uv[who])
+            conv = sum(w[i] * getattr(ai, ax) for i, ax in enumerate(axes)) * bi
+            terms = [self.viscosity * self._lap + conv, *self._bc(a)]
+        self._fp = form(terms, inner=False)  # APPLIED, not inverted -- the middle factor
+        self._fp.prepare(fem)
+
+    def refresh_from(self, sol, fem):
+        """Rebuild ``F_p`` at the outer iterate. ``A_p`` and ``M_p`` are solution-independent."""
+        self._build_fp(fem, sol)
+
+    def materialize(self, ctx: PrecondContext):
+        if self._ap is None:
+            raise NotImplementedError(
+                "jno.precond.pcd(): never prepared -- it needs the owning FEM to find the constraint "
+                "block. Use it through fem.solve(precond=...)."
+            )
+        return (self._ap @ self._fp @ self._mp).materialize(ctx)
+
+    def __repr__(self):
+        return f"jno.precond.pcd(viscosity={self.viscosity}, inflow={self.inflow!r})"
+
+
+def pcd(*, viscosity, inflow=None, velocity=None, inner=None) -> _PCD:
+    """**Pressure convection-diffusion** Schur approximation — ``S^-1 ~ A_p^-1 F_p M_p^-1``.
+
+    The convection-aware alternative to :func:`lsc`, and the stronger one on the problems it suits::
+
+        fem.solve(linear=jno.solve.fgmres(),
+                  precond=jno.precond.saddle(schur=jno.precond.pcd(viscosity=nu, inflow="inlet")))
+
+    ``viscosity`` is the diffusion coefficient of ``F_p`` and has to be given — it is physics, not
+    something the assembled system reveals. ``inflow`` is the **coordinate tuple** of the inflow
+    boundary, the same one the primal form used::
+
+        xin, yin, _ = d.variable("inlet", split=True)
+        ...
+        jno.precond.pcd(viscosity=nu, inflow=(xin, yin))
+
+    A region *name* would not do: ``domain.variable("inlet", split=True)`` mints a fresh region on
+    every call (``inlet_3``, ``inlet_4``, …), so a name re-resolved inside the spec would point at a
+    different region than the one the form constrained, and the Dirichlet row would quietly miss the
+    boundary.
+
+    **Two conditions decide whether PCD works at all**, both measured:
+
+    * an **inflow/outflow** problem. On an *enclosed* flow (a lid-driven cavity) PCD fails outright —
+      400 iterations, the solver cap, at every Reynolds number, with eigenvalues straddling zero. The
+      commutator argument leans on boundary behaviour an enclosed flow does not provide. Use
+      :func:`lsc` there.
+    * **inflow-Dirichlet** conditions on ``A_p`` and ``F_p``. With Neumann pressure operators PCD also
+      fails (400); with ``inflow=`` given it takes **77** on the same problem and mesh. Leaving
+      ``inflow`` unset is therefore the Neumann variant and is expected to be poor — it is allowed
+      because it is what the literature calls the enclosed-flow form, not because it is a good default.
+
+    Measured on channel flow, momentum block solved exactly so the count isolates the Schur factor:
+
+    ==========  ====  ====  ====  ====  ====
+    Re            10    50   100   400  1000
+    ==========  ====  ====  ====  ====  ====
+    mass          41   184   301   284   318
+    ``lsc()``     63   158   150   291   263
+    ``pcd()``     37    75    77   237   355
+    ==========  ====  ====  ====  ====  ====
+
+    PCD is 4x the pressure mass at Re = 100 and loses its edge by Re = 400, where everything degrades.
+
+    Every factor is an ordinary weak form, so this spec is a **convenience**: the same thing is
+    ``form([...]) @ form([...], inner=False) @ form([...])``, which is where to go for a variant this
+    does not cover (a different boundary treatment, a Robin condition, a scaled commutator).
+
+    Reference: Kay, Loghin & Wathen, *SIAM J. Sci. Comput.* **24** (2002) 237; Elman, Silvester &
+    Wathen, 2nd ed., Sec. 9.2.3 for the boundary conditions.
+    """
+    return _PCD(viscosity, inflow, velocity, inner)
+
+
 class _Saddle(_Spec):
     """Spec for the standard saddle-point recipe; see :func:`saddle`.
 
@@ -984,10 +1230,12 @@ class _Saddle(_Spec):
     def __init__(self, mass_weight, laplace_weight=None, schur="mass"):
         self.mass_weight = float(mass_weight)
         self.laplace_weight = None if laplace_weight is None else float(laplace_weight)
-        if schur not in ("mass", "lsc"):
+        if not isinstance(schur, _Spec) and schur not in ("mass", "lsc"):
             raise ValueError(
-                f"jno.precond.saddle(schur={schur!r}): expected 'mass' (the pressure-mass recipe, "
-                "the default) or 'lsc' (the convection-aware least-squares commutator)."
+                f"jno.precond.saddle(schur={schur!r}): expected 'mass' (the pressure-mass recipe, the "
+                "default), 'lsc' (the least-squares commutator), or ANY preconditioner spec -- e.g. "
+                "jno.precond.pcd(viscosity=nu, inflow='inlet'), or a Schur factor you composed "
+                "yourself out of form(...) with `@` and `+`."
             )
         self.schur = schur
         self._resolved = None
@@ -1019,7 +1267,8 @@ class _Saddle(_Spec):
         names = tuple(getattr(fem, "_saddle_blocks", ()) or ())
         # The P1 check below is about the pressure-MASS auxiliary, which is a P1 Gram matrix.
         # LSC builds every factor from the system's own blocks, so it sizes itself.
-        for j, i in enumerate(idx if self.schur != "lsc" else ()):
+        _sized_by_p1 = self.schur == "mass"  # only the P1 pressure-mass auxiliary needs this check
+        for j, i in enumerate(idx if _sized_by_p1 else ()):
             size = int(blocks[i].stop - blocks[i].start)
             if size != n_p1:
                 who = names[j] if j < len(names) else f"block {i}"
@@ -1036,7 +1285,11 @@ class _Saddle(_Spec):
         # The auxiliaries are inverted EXACTLY, on the host, in float64. That is what keeps the whole
         # preconditioner a fixed linear operator -- an inexact inner solve would make it vary between
         # applications, which a non-flexible Krylov method (gmres) is not allowed to see.
-        if self.schur == "lsc":
+        if isinstance(self.schur, _Spec):  # any user-supplied Schur factor, including pcd()
+            schur = self.schur
+            if hasattr(schur, "prepare"):
+                schur.prepare(fem)
+        elif self.schur == "lsc":
             schur = _LSC(None, True, None)
             schur.prepare(fem)
         elif self.laplace_weight is None:

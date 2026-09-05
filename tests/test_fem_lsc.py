@@ -288,3 +288,128 @@ def test_lsc_finds_the_momentum_block_in_a_three_field_system():
     _s_u, _s_p, iu, ip = spec._blocks
     assert ip == fem.block_index(p), "the constraint block must be the pressure"
     assert iu == fem.block_index(u), f"the momentum block must be the velocity, got block {iu}"
+
+
+# ======================================================================================
+# pcd() -- supplied, but the same thing the user can write by hand
+# ======================================================================================
+def _channel(mesh_size=0.16):
+    """Inflow/outflow flow. PCD needs one: on an ENCLOSED flow it fails outright."""
+    pytest.importorskip("shapely", reason="shapely required for the box domain")
+    from shapely.geometry import box
+
+    nu_p = jno.np.parameter((1,), name="nu")
+    d = jno.domain(box(0.0, 0.0, 3.0, 1.0), mesh_size=mesh_size)
+    d.tag("inlet", lambda x, y: x < 1e-9)
+    d.tag("wall", lambda x, y: (y < 1e-9) | (y > 1 - 1e-9))
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)
+    p, q = d.fem_symbols(names=("p", "q"), order=1)
+    xi, yi, _ = d.variable("interior", split=True)
+    xin, yin, _ = d.variable("inlet", split=True)
+    xw, yw, _ = d.variable("wall", split=True)
+    ub, vv = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    gu, gv = grad(u, [xi, yi]), grad(v, [xi, yi])
+    pp, qq = p.bind(x=xi, y=yi), q.bind(x=xi, y=yi)
+    mom = inner_(inner_(gu, ub, n_contract=1), vv, n_contract=1) + nu_p * inner_(gu, gv, n_contract=2) - pp * trace(gv)
+    fem = jno.fem(
+        [
+            mom,
+            -qq * trace(gu),
+            u(xin, yin)[0] - 4.0 * yin * (1 - yin),
+            u(xin, yin)[1] - 0.0,
+            u(xw, yw)[0] - 0.0,
+            u(xw, yw)[1] - 0.0,
+        ]  # do-nothing outlet, which also sets the pressure level
+    )
+    return fem, u, p, pp, qq, xi, yi, xin, yin
+
+
+def test_pcd_is_the_hand_written_composition():
+    """`pcd()` is a CONVENIENCE, not a capability: it must equal `Ap @ Fp @ Mp` written out by hand.
+    If it ever diverges from that, the spec has grown behaviour the user cannot reproduce."""
+    pytest.importorskip("scipy")
+    fem, u, p, pp, qq, xi, yi, xin, yin = _channel()
+    host = jno.solve.lu(backend="host")
+    nu = 0.1
+    sol = np.asarray(
+        fem.solve(
+            nonlinear=jno.solve.newton(direct=True, rtol=1e-9, atol=1e-9),
+            linear=host,
+            continuation=jno.solve.continuation(nu=[nu]),
+        )
+    )
+    J = fem._op.jacobian(sol, args={"nu": np.array([nu])})
+    n_p = int(fem.blocks[1].stop - fem.blocks[1].start)
+    from scipy.spatial import cKDTree
+
+    uv = sol[fem.offsets[0] : fem.offsets[1]].reshape(-1, 2)
+    who = cKDTree(np.asarray(fem.field_points[0])).query(np.asarray(fem.field_points[1])[:, :2])[1]
+    wv, _z = fem.domain.fem_symbols(value_shape=(2,), names=("wh", "zh"))
+    w = wv.bind(x=xi, y=yi).freeze(uv[who])
+    lap_p = pp.x * qq.x + pp.y * qq.y
+    hand = (
+        jno.precond.form([lap_p, p(xin, yin) - 0.0], inner=host)
+        @ jno.precond.form([nu * lap_p + (w[0] * pp.x + w[1] * pp.y) * qq, p(xin, yin) - 0.0], inner=False)
+        @ jno.precond.form([pp * qq], inner=host)
+    )
+    mats = {}
+    for name, spec in (("hand", hand), ("spec", jno.precond.pcd(viscosity=nu, inflow=(xin, yin)))):
+        spec.prepare(fem)
+        spec.refresh_from(sol, fem)
+        M = materialize_precond(spec, PrecondContext(LinearOperator(J), fem))
+        mats[name] = np.column_stack([np.asarray(M(jax.numpy.asarray(e))) for e in np.eye(n_p)])
+    rel = np.abs(mats["hand"] - mats["spec"]).max() / np.abs(mats["hand"]).max()
+    assert rel < 1e-12, f"pcd() diverged from the hand-written composition by {rel:.2e}"
+
+
+@pytest.mark.slow
+def test_pcd_beats_the_pressure_mass_on_an_inflow_outflow_problem():
+    """Channel flow at Re = 100, momentum block exact. Measured: mass 301, lsc 150, PCD 77.
+
+    And the condition that decides it -- with NO inflow Dirichlet (`inflow=None`, the Neumann variant)
+    PCD does not converge at all. That is not a tuning detail; it is the difference between 400 and 77.
+    """
+    pytest.importorskip("scipy")
+    fem, u, p, pp, qq, xi, yi, xin, yin = _channel()
+    host = jno.solve.lu(backend="host")
+    nu = 0.01
+    sol = np.asarray(
+        fem.solve(
+            nonlinear=jno.solve.newton(direct=True, rtol=1e-9, atol=1e-9),
+            linear=host,
+            continuation=jno.solve.continuation(nu=[0.1, 0.02, nu]),
+        )
+    )
+    J = fem._op.jacobian(sol, args={"nu": np.array([nu])})
+    ex = jno.precond.inner(host)
+    n_mass = _gmres_iterations(
+        fem, jno.precond.triangular((u, ex), (p, jno.precond.form([(1 / nu) * pp * qq], inner=host))), J, sol
+    )
+    n_pcd = _gmres_iterations(
+        fem, jno.precond.triangular((u, ex), (p, jno.precond.pcd(viscosity=nu, inflow=(xin, yin)))), J, sol
+    )
+    n_neu = _gmres_iterations(fem, jno.precond.triangular((u, ex), (p, jno.precond.pcd(viscosity=nu))), J, sol)
+    assert n_pcd < n_mass / 2.0, f"PCD should beat the mass here: pcd {n_pcd}, mass {n_mass}"
+    assert n_neu > 2 * n_pcd, f"without the inflow condition PCD should fail: neumann {n_neu}, pcd {n_pcd}"
+
+
+def test_a_region_name_as_inflow_is_refused_by_name():
+    """The natural mistake. `domain.variable(...)` mints a FRESH region per call, so a name would
+    resolve to a different region than the form constrained and the Dirichlet would miss the boundary
+    silently -- which is exactly how this was discovered."""
+    fem, _u, _p, _pp, _qq, _xi, _yi, _xin, _yin = _channel(mesh_size=0.4)
+    spec = jno.precond.pcd(viscosity=0.1, inflow="inlet")
+    with pytest.raises(TypeError, match="COORDINATE TUPLE"):
+        spec.prepare(fem)
+
+
+def test_saddle_accepts_any_schur_spec():
+    """`saddle(schur=...)` takes 'mass', 'lsc', or ANY spec -- so a research Schur factor composed out
+    of `form(...)` with `@`/`+` drops into the same one-call recipe."""
+    fem, _u, p, pp, qq, _xi, _yi, xin, yin = _channel(mesh_size=0.4)
+    mine = jno.precond.form([pp * qq], inner=jno.solve.lu(backend="host"))
+    composed = jno.precond.saddle(schur=mine)._compose(fem)
+    kinds = {i: type(s).__name__ for i, s in composed.pairs}
+    assert kinds[fem.block_index(p)] == "_Form", kinds
+    with pytest.raises(ValueError, match="schur="):
+        jno.precond.saddle(schur="not-a-thing")

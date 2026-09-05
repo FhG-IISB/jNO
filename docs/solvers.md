@@ -253,8 +253,23 @@ and every Newton step; only `F` varies, and it is only ever applied.
 ### PCD — and the boundary condition that decides it
 
 **PCD** (Kay, Loghin & Wathen 2002) is the other convection-aware Schur approximation,
-`S⁻¹ ≈ A_p⁻¹ F_p M_p⁻¹`. Unlike LSC every factor *is* a weak form, so with the spec algebra and a
-known coefficient field it is written entirely by the user — the library gains nothing:
+`S⁻¹ ≈ A_p⁻¹ F_p M_p⁻¹`. It ships as `jno.precond.pcd()`:
+
+```python
+xin, yin, _ = d.variable("inlet", split=True)
+fem.solve(linear=jno.solve.fgmres(),
+          precond=jno.precond.triangular((u, jno.precond.amg()),
+                                         (p, jno.precond.pcd(viscosity=nu, inflow=(xin, yin)))))
+```
+
+`inflow` is the **coordinate tuple**, not a region name — `domain.variable(...)` mints a *fresh*
+region on every call (`inlet_3`, `inlet_4`, …), so a name re-resolved inside the spec would point at
+a different region than the one your form constrained and the Dirichlet row would quietly miss the
+boundary. Passing a string is refused by name.
+
+Unlike LSC every factor *is* a weak form, so the supplied spec is a **convenience**, not a
+capability — it is verified equal (to 7e-16) to the same thing written by hand, which is where to go
+for a variant it does not cover:
 
 ```python
 w  = wv.bind(x=xi, y=yi).freeze(u_lagged)          # the convecting field, as KNOWN nodal data
