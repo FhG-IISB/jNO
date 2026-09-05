@@ -75,8 +75,11 @@ P1's 4.
 ## Scope
 
 - Re = 5000 is where this run stopped, not a proven ceiling — nothing was tried above it.
-- Steady solutions only. The physical cavity is unsteady well below Re = 5000; a converged steady
-  solution at high Re is a solution of the steady equations, not a claim about the physics.
+- Steady solutions only, and what that means depends on the dimension. In **2-D** the steady branch
+  is reported stable up to Re ≈ 8000 (the first Hopf bifurcation), so these *are* legitimate steady
+  solutions of the 2-D equations. A real, **three-dimensional** cavity is a different story — it
+  develops spanwise (Taylor–Görtler) instabilities from Re ~ 10³ — so the Re = 5000 panel should not
+  be read as a picture of a physical flow.
 - The mesh is fixed at 48×48. No mesh-convergence study was run, so the *values* are resolution-
   dependent even where the two discretisations agree with each other.
 
