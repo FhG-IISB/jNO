@@ -204,3 +204,46 @@ cb.ax.tick_params(length=0)
 cb.set_ticks([0, 0.25, 0.5, 0.75, 1.0])
 fig.tight_layout()
 fig.savefig(Path(__file__).parents[2] / "assets" / "cavity_high_reynolds.png")
+
+# ---- animation: the same sweep, every rung of the ladder in order --------------------------------
+# Frames are rendered one at a time and assembled by PIL: `streamplot` cannot be updated in place,
+# so a FuncAnimation over it silently produces an empty GIF.
+import io  # noqa: E402
+
+from PIL import Image  # noqa: E402
+
+imgs = []
+for re in RE_LADDER:
+    _, uv = velocity(fem_s, reached[re])
+    fig, ax = plt.subplots(figsize=(4.0, 4.0), dpi=130)
+    tp = ax.tripcolor(ctri, np.hypot(uv[:, 0], uv[:, 1]), cmap="viridis", vmin=0.0, vmax=1.0, shading="gouraud")
+    ui = np.asarray(mtri.LinearTriInterpolator(ctri, uv[:, 0])(gx, gy))
+    vi = np.asarray(mtri.LinearTriInterpolator(ctri, uv[:, 1])(gx, gy))
+    ax.streamplot(gx, gy, ui, vi, color="white", linewidth=0.5, density=1.0, arrowsize=0.55)
+    ax.set_axis_off()
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.text(0.03, 0.94, f"Re = {re:.0f}", transform=ax.transAxes, fontsize=11, color="white", fontweight="bold")
+    cax = make_axes_locatable(ax).append_axes("right", size="3.5%", pad=0.05)
+    cb = plt.colorbar(tp, cax=cax)
+    cb.outline.set_visible(False)
+    cb.minorticks_off()
+    cb.ax.tick_params(length=0)
+    cb.set_ticks([0, 0.25, 0.5, 0.75, 1.0])
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    buf.seek(0)
+    imgs.append(Image.open(buf).convert("P", palette=Image.ADAPTIVE, colors=128))
+
+seq = imgs + imgs[-2:0:-1]  # ping-pong, so the sweep reads in both directions
+dur = [900] + [650] * (len(imgs) - 2) + [1400] + [420] * (len(imgs) - 2)
+seq[0].save(
+    Path(__file__).parents[2] / "assets" / "cavity_high_reynolds.gif",
+    save_all=True,
+    append_images=seq[1:],
+    duration=dur,
+    loop=0,
+    optimize=True,
+)

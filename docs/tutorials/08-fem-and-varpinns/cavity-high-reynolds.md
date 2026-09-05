@@ -34,8 +34,13 @@ convergence statement: there is no quietly-unconverged rung.
 
 ## Measured
 
-![Speed with streamlines at Re = 100, 1000 and 5000: the primary vortex centre migrates toward the
-geometric centre and the corner eddies grow.](../../assets/cavity_high_reynolds.png)
+![The cavity across the whole Reynolds ladder, 100 to 5000: the primary vortex centre migrates toward
+the geometric centre while the corner eddies grow.](../../assets/cavity_high_reynolds.gif)
+
+Every rung of the continuation ladder, in order. The three that the table below quotes, side by side
+for direct comparison:
+
+![Speed with streamlines at Re = 100, 1000 and 5000.](../../assets/cavity_high_reynolds.png)
 
 48×48 structured mesh, 7,203 DOFs. The primary vortex strengthens monotonically with Re — the classic
 cavity signature, and the vortex centre migrates toward the middle as the corner eddies grow:
