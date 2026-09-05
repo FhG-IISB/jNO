@@ -87,6 +87,25 @@ def _as_flat(x):
 _COMPONENT_NAMES = {0: "x", 1: "y", 2: "z"}
 
 
+def _relative_residual(A, b, u):
+    """``||A u - b|| / ||b||`` -- the one definition, for every path that certifies a linear answer.
+
+    Returns ``None`` when any input is a tracer: the value is only meaningful concretely, and every
+    caller is an eager-only guard that must step aside under ``jit``/``vmap``/``grad`` rather than
+    force a device->host sync it cannot perform. Accepts a sparse ``A`` (BCOO) and never densifies --
+    one matvec, ``O(nnz)``.
+
+    This existed three times over before it lived here, and the copies had already drifted (see the
+    note in :func:`_residual_check`). A number that decides whether an answer is returned or refused
+    should have exactly one spelling.
+    """
+    if any(isinstance(v, jax.core.Tracer) for v in (u, b)):
+        return None
+    matvec = (lambda v: A @ v) if hasattr(A, "__matmul__") else (lambda v: jnp.asarray(A) @ v)
+    b = _as_flat(b)
+    return float(jnp.linalg.norm(b - matvec(_as_flat(u))) / (jnp.linalg.norm(b) + 1e-30))
+
+
 def _residual_check(A, b, u, who):
     """Raise (eagerly) if ``A u = b`` is not solved -- a hard fail beats silently returning garbage.
 
@@ -95,10 +114,9 @@ def _residual_check(A, b, u, who):
     ``jax.jit(fem.solve)`` raised ``ConcretizationTypeError`` from the ``float()`` below rather than
     simply skipping the check. Mirrors ``solver_api._maybe_residual_check``, which already does this;
     the two had drifted apart. There the solver's own iteration cap is the guard."""
-    if any(isinstance(v, jax.core.Tracer) for v in (u, b)):
+    rel = _relative_residual(A, b, u)
+    if rel is None:
         return u
-    matvec = (lambda v: A @ v) if hasattr(A, "__matmul__") else (lambda v: jnp.asarray(A) @ v)
-    rel = float(jnp.linalg.norm(b - matvec(u)) / (jnp.linalg.norm(b) + 1e-30))
     if not np.isfinite(rel) or rel > 1e-4:
         raise RuntimeError(
             f"fem.solve default ({who}) did not solve the system (relative residual {rel:.1e}); the "
@@ -1822,10 +1840,9 @@ class FEM:
         if uc is None:
             return  # traced (jax.grad/jit through the basis) — nothing to check yet
         A, b = self._op
-        b = jnp.asarray(b).reshape(-1)
-        r = _concrete(jnp.asarray(A @ jnp.asarray(uc, b.dtype)).reshape(-1) - b)
-        nb = float(np.linalg.norm(np.asarray(b)))
-        rel = float(np.linalg.norm(r)) / (nb if nb > 0 else 1.0)
+        rel = _relative_residual(A, b, jnp.asarray(uc, jnp.asarray(b).dtype))
+        if rel is None:
+            return
         self.basis_residual = rel
         if not np.isfinite(rel) or rel > self.BASIS_RESIDUAL_LIMIT:
             k = int(np.asarray(reduction["P"]).shape[1])
@@ -2532,15 +2549,38 @@ class FEM:
     def residual(self):
         """Residual callable for a custom solver, returning a flat ``(n_dofs,)`` JAX array.
 
-        Steady nonlinear: ``residual(u)``. Transient: ``residual(u, t)`` — the per-step
-        semidiscrete residual (pass ``args=`` only for a runtime-parametric solve). Use
-        ``fem.operator`` for the raw (unflattened) form."""
+        Steady linear: ``residual(u)`` is ``A u - b`` (pass ``args=`` for a runtime-parametric form).
+        Steady nonlinear: ``residual(u)``. Transient: ``residual(u, t)`` — the per-step semidiscrete
+        residual (pass ``args=`` only for a runtime-parametric solve). Use ``fem.operator`` for the raw
+        (unflattened) form.
+
+        **Scoring a field this FEM did not produce.** The residual is the only thing that can say
+        whether a field *not* obtained from ``fem.solve()`` — a reduced-basis answer, a coarse-mesh
+        interpolant, a neural operator's prediction — actually satisfies this system, and it costs one
+        sparse matvec against the ``O(N^3)`` of the solve it would certify::
+
+            rel = jnp.linalg.norm(fem.residual(u_pred)) / jnp.linalg.norm(fem.b)
+
+        That is exactly the check ``fem.solve(basis=...)`` already runs on itself (``fem.basis_residual``).
+        It is a **certificate, not a bound**: a small residual does not bound the error without the
+        operator's conditioning, and on an ill-conditioned system a plausible-looking residual can still
+        hide a large error. It does reliably catch a field that is simply not a solution.
+
+        The linear branch never densifies — ``A`` stays the assembled BCOO, so this is ``O(nnz)``.
+        """
+        if self._mode == "linear":
+
+            def _linear_residual(u, args=None):
+                A, b = self._op.evaluate(args) if isinstance(self._op, FemLinearSystem) else self._op
+                return _as_flat(A @ _as_flat(u)) - _as_flat(b)
+
+            return _linear_residual
         if self._mode == "nonlinear":
             r = self._op.residual
             return lambda u: _as_flat(r(u))
         if self._mode == "transient":
             return lambda u, t, args=None: _as_flat(self._op.residual(u, t, args or {}))
-        raise AttributeError(f"FEM is {self._mode}; .residual is for a steady-nonlinear or transient problem.")
+        raise AttributeError(f"FEM is {self._mode}; .residual is for a steady (linear or nonlinear) or transient problem.")
 
     def eval(self, term, u, *, args=None):
         """Assemble one **weak term** at the solution ``u`` — the free ``(n_dofs,)`` vector, with **no**
