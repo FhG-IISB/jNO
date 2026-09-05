@@ -3396,7 +3396,9 @@ class domain(MeshIOMixin):
         if "cell_size" not in self.context:
             # Placeholder so the Variable constructs; the real per-cell h is packed at assembly time
             # (jno/utils/solver/fem_native.py) and overrides this everywhere it is actually used.
-            self.context["cell_size"] = np.ones((1, 1), dtype=default_np_float_dtype())
+            # NEGATIVE on purpose: an element size is strictly positive, so a path that packs no h is
+            # unmistakable. It used to be `ones`, which read as a silent h = 1.0 off the native path.
+            self.context["cell_size"] = np.full((1, 1), -1.0, dtype=default_np_float_dtype())
         return Variable(tag="cell_size", dim=[0, 1], domain=self, axis="spatial")
 
     @property

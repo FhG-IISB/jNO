@@ -1143,6 +1143,19 @@ def _eval_integrand(domain, node, local):
             if node.tag == "fem_gauss":
                 return local["physical_quad_points"][..., dim_start:dim_end]
 
+        if node.tag == "cell_size":
+            arr = local["domain_context"].get("cell_size")
+            # The placeholder is the concrete negative sentinel above; a packed h is a positive traced
+            # array. Concrete-only, so this never inspects a tracer.
+            if arr is None or (isinstance(arr, np.ndarray) and arr.size == 1 and float(arr.reshape(-1)[0]) < 0.0):
+                raise NotImplementedError(
+                    "jno.fem: `dom.cell_size` is resolved on the native 2-D/3-D assembler's VOLUME terms "
+                    "only -- this path (a 1-D form, or a non-nodal element family such as Hermite / "
+                    "Argyris / Morley / RT / N1E) packs no element size. It used to read as a silent "
+                    "h = 1.0 here. Use it in a volume term of a 2-D/3-D nodal-Lagrange form."
+                )
+            return jnp.asarray(arr)
+
         # A per-quadrature-point TENSOR symbol (`dom.cell_metric`). It needs its own branch: the
         # generic context fallback below squeezes a leading singleton axis and slices the LAST one,
         # and both are wrong for a (n_quad, dim, dim) array -- the first would eat the quadrature
