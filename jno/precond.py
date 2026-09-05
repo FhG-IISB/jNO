@@ -95,6 +95,89 @@ class _Spec:
     def __hash__(self):
         return id(self) if self.key is None else hash(self.key)
 
+    # -- an algebra over preconditioners ----------------------------------------------------------
+    # A materialized spec IS a linear map `v -> M^-1 v`, so the classical Schur approximations are
+    # arithmetic on specs rather than a menu of built-ins. `Mp + Ap` is Cahouet-Chabard; `Ap @ Fp @ Mp`
+    # with `Fp = form(..., inner=False)` is PCD (Kay, Loghin & Wathen, *SIAM J. Sci. Comput.* 24
+    # (2002) 237). Neither needs a `schur=` argument, and both read like the paper.
+    def __add__(self, other):
+        """``M v = M1 v + M2 v`` -- two approximations applied in parallel and summed."""
+        return _Sum(self, other) if isinstance(other, _Spec) else NotImplemented
+
+    def __matmul__(self, other):
+        """``M v = M1(M2 v)`` -- applied right to left, as the operator product reads."""
+        return _Product(self, other) if isinstance(other, _Spec) else NotImplemented
+
+
+class _Combination(_Spec):
+    """Shared plumbing for :class:`_Sum` / :class:`_Product`: both prepare and materialize every
+    operand against the SAME context, and differ only in how the appliers are combined."""
+
+    _OP = "?"
+
+    def __init__(self, left, right):
+        for side in (left, right):
+            if not isinstance(side, _Spec):
+                raise TypeError(f"jno.precond: cannot combine a preconditioner spec with {type(side).__name__}.")
+        self.left, self.right = left, right
+
+    def prepare(self, fem):
+        for side in (self.left, self.right):
+            if hasattr(side, "prepare"):
+                side.prepare(fem)
+
+    def _appliers(self, ctx: PrecondContext):
+        from .utils.solver.solver_api import materialize_precond
+
+        return materialize_precond(self.left, ctx), materialize_precond(self.right, ctx)
+
+    def __repr__(self):
+        return f"({self.left!r} {self._OP} {self.right!r})"
+
+
+class _Sum(_Combination):
+    """``M^-1 v = M1^-1 v + M2^-1 v``; see :meth:`_Spec.__add__`."""
+
+    _OP = "+"
+
+    def materialize(self, ctx: PrecondContext):
+        a, b = self._appliers(ctx)
+        at, bt = _applier_transpose(a), _applier_transpose(b)
+        return PrecondApplier(lambda v: a(v) + b(v), lambda v: at(v) + bt(v))
+
+
+class _Product(_Combination):
+    """``M^-1 v = M1^-1 (M2^-1 v)``; see :meth:`_Spec.__matmul__`.
+
+    The transpose REVERSES the order -- ``(AB)^T = B^T A^T`` -- which is the whole reason this is a
+    spec and not a lambda: the reverse pass of a differentiable solve preconditions ``A^T`` and would
+    otherwise run almost unpreconditioned.
+
+    Note the product of two symmetric factors is **not** symmetric, so drive the outer solve with
+    ``jno.solve.gmres()`` / ``fgmres()``, not ``cg``/``minres``. A short-recurrence method on a
+    non-symmetric preconditioner will simply fail to reach the residual gate, loudly.
+    """
+
+    _OP = "@"
+
+    def materialize(self, ctx: PrecondContext):
+        a, b = self._appliers(ctx)
+        at, bt = _applier_transpose(a), _applier_transpose(b)
+        return PrecondApplier(lambda v: a(b(v)), lambda v: bt(at(v)))
+
+
+def _dense_mv(op, v):
+    """``op @ v`` as a dense vector. The transposed matvec of a sparse operator is ``v @ A``, which
+    stays inside the sparse dispatch; a preconditioner application must hand back a plain array."""
+    out = op @ v
+    return out.todense() if hasattr(out, "todense") else jnp.asarray(out)
+
+
+def _applier_transpose(applier):
+    """``applier.T`` when it carries one, else the applier itself (a bare callable is reused, which is
+    what every other consumer already does -- correct, just weaker on a non-symmetric factor)."""
+    return applier.T if isinstance(applier, PrecondApplier) else applier
+
 
 class _Jacobi(_Spec):
     """Spec for the diagonal (Jacobi) preconditioner; see :func:`jacobi`."""
@@ -312,6 +395,11 @@ class _Form(_Spec):
         if self._op is None:
             self._op = ctx.assemble(self.terms, quad_degree=self.quad_degree)
         op = self._op
+        if self.inner is False:
+            # APPLY, don't invert: `M v = A v`. This is the middle factor of a product like PCD,
+            # where `F_p` is applied between two inverses. It is a preconditioner FACTOR, not a
+            # preconditioner -- on its own it makes the system worse, not better.
+            return PrecondApplier(lambda v: _dense_mv(op, v), lambda v: _dense_mv(op.T, v))
         if self.inner is None:
             from . import solve as _s
 
@@ -324,6 +412,9 @@ class _Form(_Spec):
     def __repr__(self):
         what = "<solution-dependent>" if self._terms_fn is not None else f"<{len(self.terms)} terms>"
         return f"jno.precond.form({what}, inner={self.inner})"
+
+    def _needs_inner(self):
+        return self.inner is not False
 
 
 def form(terms, *, inner=None, quad_degree: int = 2) -> _Form:
@@ -341,6 +432,12 @@ def form(terms, *, inner=None, quad_degree: int = 2) -> _Form:
       outer matvec);
     * a **shifted/damped twin** of an indefinite operator (shifted-Laplacian Helmholtz);
     * a **low-order proxy** preconditioning a high-order discretisation.
+
+    ``inner=False`` **applies** the assembled form instead of inverting it (``M v = A v``). That is
+    the middle factor of a product like PCD — ``A_p^-1 F_p M_p^-1``, written
+    ``form([...]) @ form([...], inner=False) @ form([...])`` — where the convection–diffusion
+    operator is applied between two inverses. On its own such a factor is not a preconditioner and
+    will make a solve worse; it exists to be composed.
 
     The auxiliary system is assembled once with the ordinary ``jno.fem`` machinery (cached on
     the spec — it is parameter-independent) and must be steady linear. Its size must match the

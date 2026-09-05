@@ -113,6 +113,7 @@ changes the converged solution, only the speed, so specs need no gradient path.
 | `jno.precond.amg(cycles=…)` | hybrid algebraic multigrid — host setup (`pyamg`), device apply | large SPD systems; needs the optional `pyamg` |
 | `jno.precond.jaxamg(symmetric=…)` | GPU AMG via NVIDIA AmgX — setup and apply both on device | large systems on a GPU; needs the optional stack |
 | `.cached(refresh=…)` | reuse an expensive setup across solves | Newton loops and transients, where the operator barely changes between solves |
+| `M1 + M2` / `M1 @ M2` | **arithmetic on specs** — applied in parallel and summed, or in sequence right-to-left | writing your own Schur approximation instead of asking for one |
 
 Every one of them is passed the same way — `fem.solve(precond=…)`, alongside whichever `linear=`
 solver it is accelerating. Nothing else about the problem changes:
@@ -179,6 +180,36 @@ fem.solve(linear=jno.solve.fgmres(tol=1e-10, restart=40),
     system: 124 CG iterations for `jacobi`, 98 unpreconditioned, **46** for `nystrom(rank=20)`). **SPD
     only** — the sketch takes a Cholesky, so an indefinite operator gives NaN rather than a quiet wrong
     answer.
+
+### Preconditioners compose like the operators they stand for
+
+A materialized spec **is** a linear map `v ↦ M⁻¹v`, so the classical physics-based Schur
+approximations are arithmetic on specs rather than a menu of built-in names:
+
+```python
+Ap = jno.precond.form([inner(gp, gq, n_contract=2), p_sym.pin()])   # A_p⁻¹  (gauged Laplacian)
+Mp = jno.precond.form([pp * qq])                                    # M_p⁻¹  (pressure mass)
+Fp = jno.precond.form(F_terms, inner=False)                         # F_p    APPLIED, not inverted
+
+schur = Mp + Ap        # Cahouet & Chabard (1988) — which `saddle(laplace_weight=…)` already is
+schur = Ap @ Fp @ Mp   # PCD — Kay, Loghin & Wathen, SIAM J. Sci. Comput. 24 (2002) 237
+
+fem.solve(linear=jno.solve.fgmres(),
+          precond=jno.precond.triangular((u, jno.precond.amg()), (p, schur)))
+```
+
+`inner=False` is the piece that makes a *product* expressible: it applies the assembled form
+(`M v = A v`) instead of inverting it, which is what the middle factor of PCD needs. On its own such a
+factor is not a preconditioner and will make a solve worse — it exists to be composed.
+
+!!! warning "A product is not symmetric"
+    `(AB)ᵀ = BᵀAᵀ`, and a product of two SPD inverses is **not** SPD. Drive a product with
+    `jno.solve.gmres()` / `fgmres()`, never `cg`/`minres` — a short-recurrence method will simply
+    fail to reach the residual gate, loudly. (The transpose applier reverses the factor order for
+    you, which is what keeps the reverse pass of a differentiable solve preconditioned.)
+
+This is why `jno.precond.saddle()` has no `schur=` argument: the approximations that would populate
+such a menu are things you can write.
 
 ??? note "`jno.precond.form([...terms], inner=…)`"
     **preconditioners as weak forms**: assemble an auxiliary
