@@ -182,6 +182,7 @@ nav:
       - "Navier-Stokes Stabilised (P1/P1)": tutorials/08-fem-and-varpinns/navier-stokes-stabilised-2d.md
       - "Cavity to Re=5000 (continuation)": tutorials/08-fem-and-varpinns/cavity-high-reynolds.md
       - "Equal-Order Flow in 3-D": tutorials/08-fem-and-varpinns/cavity-3d-equal-order.md
+      - "Vortex Shedding (DFG 2D-2)": tutorials/08-fem-and-varpinns/vortex-shedding-dfg-2d2.md
       - "Stokes 3D (Duct Past a Sphere)": tutorials/08-fem-and-varpinns/stokes-3d-duct-sphere.md
       - "Thermal Barrier Coating (tied, two meshes)": tutorials/08-fem-and-varpinns/tied-coating-multiscale.md
       - "Rayleigh–Bénard (heat + flow)": tutorials/08-fem-and-varpinns/rayleigh-benard-2d.md
