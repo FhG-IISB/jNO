@@ -568,6 +568,13 @@ def _trial_spaces(constraints: List[Any]) -> set:
     }
 
 
+# Families the NATIVE (nodal Lagrange) assembler serves. ``"cover"`` is interpolation-cover
+# enrichment: ordinary P1 hats plus extra DOFs at the same nodes, so it is nodal and belongs here,
+# not on the non-nodal push-forward path that RT/N1E/Argyris/Morley/Hermite take. Naming the set
+# once keeps the routing sites below from drifting apart.
+_NATIVE_SPACES = {"Lagrange", "cover"}
+
+
 def _native_lagrange_ok(domain: Any, constraints: List[Any], weak_bares: List[Any], periodic_ties: List[Any]) -> bool:
     """Whether the native Lagrange assembler should handle this problem.
 
@@ -589,7 +596,7 @@ def _native_lagrange_ok(domain: Any, constraints: List[Any], weak_bares: List[An
     """
     if getattr(domain, "dimension", None) not in (2, 3):
         return False
-    if _trial_spaces(constraints) - {"Lagrange"}:
+    if _trial_spaces(constraints) - _NATIVE_SPACES:
         return False
     # complex=True fields: the real-equivalent form couples re/im test functions within one term,
     # which the native one-test-field-per-term classifier rejects -> route to the complex branch.
@@ -1672,8 +1679,15 @@ class FEM:
                     **kwargs,
                 )
             finally:
-                # the basis is per-CALL; neither the reduction nor the reduced block sticks to the object
-                self._periodic, self._op = prev_periodic, prev_op
+                # the basis is per-CALL; neither the reduction nor the reduced block sticks to the object.
+                # ONLY when this call installed one, though. Restoring unconditionally also undid a
+                # rebinding the call itself asked for: every adapt= driver ends by rebinding the caller's
+                # FEM to the final adapted state, and `_op` is what a later `fem.solve()` dispatches on --
+                # so `fem.A` was the adapted matrix while `fem.solve()` silently re-solved the ORIGINAL
+                # problem. Measured on p-adaptivity, where the space (not just the mesh) changes and the
+                # two answers differ by 6%; the h- and r-drivers carried the same staleness.
+                if reduction is not None:
+                    self._periodic, self._op = prev_periodic, prev_op
             if reduction is not None:
                 self._check_basis_residual(result, reduction)
             # Zero-mean gauges are applied HERE, at the one point every mode funnels through, so a
@@ -1929,6 +1943,21 @@ class FEM:
                     "For a fixed graded mesh instead, put the refinement in the geometry: "
                     "`Shape.box(...).sized(lambda x, y, z: fine if <in band> else coarse)`."
                 )
+            if getattr(adapt, "enrich", False):
+                # p-adaptivity: raise the local order by switching interpolation covers on at the marked
+                # NODES. The mesh -- points, cells, connectivity -- is untouched, so the DOF *nodes* are
+                # the same every round and only the coefficient count per node changes.
+                if self._mode == "transient":
+                    raise NotImplementedError(
+                        "jno.solve.enrich() is wired on the steady adaptive loop; this problem is "
+                        "transient. Enriching mid-march changes the DOF layout under the stepper, and the "
+                        "state transfer that carries a solution across a mesh change is written for a "
+                        "change of MESH, not of space. Enrich on a steady solve, or march on a fixed "
+                        "uniformly-enriched space (space='cover' with no adapt=)."
+                    )
+                from .utils.solver.fem_adapt import run_adaptive_enrich
+
+                return run_adaptive_enrich(self, adapt, solve_fn=solve_fn, **kwargs)
             if getattr(adapt, "relocate", False):
                 # r-adaptivity: relocate the .trainable() vertices (fixed connectivity), not h-refinement.
                 from .utils.solver.fem_adapt import run_adaptive_relocate
@@ -4520,7 +4549,7 @@ def _fem_impl(
     for c in constraints:
         (_geometry if mesh_velocity(c) is not None else _rest).append(c)
     constraints = _rest
-    if rotation_bcs and not (_trial_spaces(constraints) - {"Lagrange"}):
+    if rotation_bcs and not (_trial_spaces(constraints) - _NATIVE_SPACES):
         raise NotImplementedError(
             "jno.fem: a rotation BC `u.dn(region) - h` is a 4th-order plate essential BC — it requires a field "
             "on the Argyris or Morley element (`space='Argyris'`/`'Morley'`), not C⁰ Lagrange (which has no "
@@ -4561,7 +4590,7 @@ def _fem_impl(
                     "condition) — a compound expression (e.g. 1 + net(x)) is not supported."
                 )
         if _net_trial_only:
-            if _trial_spaces(constraints) - {"Lagrange"}:
+            if _trial_spaces(constraints) - _NATIVE_SPACES:
                 raise NotImplementedError("jno.fem: a net-valued essential value is supported on Lagrange elements only.")
             if len(_field_keys(constraints)) > 1:
                 raise NotImplementedError("jno.fem: a net-valued essential value is single-field only.")
@@ -4594,7 +4623,10 @@ def _fem_impl(
     # structurally-incompatible routes up front — fail loud, never a silently dropped update.
     # (transient / complex are rejected below, once the IR reveals them.)
     if _evolution and (
-        is_vpinn or getattr(domain, "dimension", None) == 1 or (_trial_spaces(constraints) - {"Lagrange"}) or periodic_ties
+        is_vpinn
+        or getattr(domain, "dimension", None) == 1
+        or (_trial_spaces(constraints) - _NATIVE_SPACES)
+        or periodic_ties
     ):
         raise NotImplementedError(
             "jno.fem: `state.evolves(...)` evolution terms are supported on the real, steady, "
@@ -4907,7 +4939,7 @@ def _fem_impl(
     # 1D u_tt falls through to the native 1D branch (its assembler builds the augmented [u, v] block);
     # only the 2D/3D nodal-Lagrange route is intercepted here (a non-nodal / 1D u_tt has its own path).
     _second_order = any(_max_temporal_order(_bare(c)) >= 2 for c in constraints)
-    if _second_order and getattr(domain, "dimension", None) != 1 and not (_trial_spaces(constraints) - {"Lagrange"}):
+    if _second_order and getattr(domain, "dimension", None) != 1 and not (_trial_spaces(constraints) - _NATIVE_SPACES):
         _so_bares = (
             list(volume_terms) + [e for exprs in boundary_terms.values() for e in exprs] + [_bare(c) for c in ic_residuals]
         )
@@ -4962,7 +4994,7 @@ def _fem_impl(
     # ---- non-nodal element families (RT / Nedelec / Argyris): native push-forward assembler ----
     # These families need a basis push-forward, so -- like the 1D path -- assemble natively and reuse
     # the shared integrand evaluator (which carries space-guarded branches for the physical basis).
-    _nonnodal_families = _trial_spaces(constraints) - {"Lagrange"}
+    _nonnodal_families = _trial_spaces(constraints) - _NATIVE_SPACES
     # A 1D Hermite field is NOT routed here: its element is the classical cubic beam, which the 1D
     # assembler builds directly (no push-forward — a straight interval has a constant Jacobian).
     _hermite_1d = getattr(domain, "dimension", None) == 1 and _nonnodal_families == {"Hermite"}

@@ -66,6 +66,7 @@ __all__ = [
     "exponential",
     "adaptive",
     "remesh",
+    "enrich",
     "refine",
     "relocate",
 ]
@@ -1147,8 +1148,16 @@ def relocate(
 
     - ``"equidistribution"`` (default) equidistributes an **arclength monitor** — it targets *resolution*,
       and wins where a feature is under-resolved or moving.
-    - ``"energy"`` descends the **FE Dirichlet energy**. For a Ritz method
-      ``E_h - E_exact = 1/2 ||u - u_h||_E^2``, so on a steady problem the energy *is* the error norm and
+    - ``"energy"`` descends the **FE Dirichlet energy**, and it is the error norm **only on a
+      SOURCE-FREE problem**. The Ritz functional is ``J(v) = 1/2 a(v,v) - (f,v)``, and it is ``J`` that
+      satisfies ``J_h - J_exact = 1/2 ||u - u_h||_E^2``. With no body load ``J = E``, so descending the
+      energy descends the error -- that is the L-shape column below. Add a source and ``J_h = -E_h`` at
+      the discrete solution, so minimising the error means **maximising** ``E``: descending it walks
+      away from the solution, and squashing elements is the cheapest way to lower ``∫|∇u|²``. Measured
+      on an L-shape driven by a compact bump: the optimiser duly cut ``E`` from 0.12252 to 0.10788
+      while the true error ROSE 3.6x and the mesh's smallest angle collapsed 40.8° -> 3.2°. Until this
+      is fixed, use the default on any problem carrying a source or reaction term. For a Ritz method
+      ``E_h - E_exact = 1/2 ||u - u_h||_E^2`` (source-free), so there the energy *is* the error norm and
       descending it minimises the error directly.
     - ``"huang"`` is Huang's equidistribution–alignment functional (see :class:`AdaptSpec`).
 
@@ -1262,6 +1271,120 @@ def relocate(
         quality_floor=quality_floor,
         ma_relax=relax,
         ma_dt=relax_step,
+    )
+
+
+def enrich(
+    *,
+    criterion,
+    theta: float = 0.5,
+    max_iters: int = 8,
+    max_dofs: int | None = None,
+    tol: float | None = None,
+    eps: float | None = None,
+    metric_field: int = 0,
+):
+    """**p-adaptivity** for ``fem.solve(adapt=...)``: raise the polynomial order where it is needed,
+    leaving the mesh alone.
+
+    The fourth adaptivity beside :func:`remesh` (rebuild finer), :func:`refine` (split cells) and
+    :func:`relocate` (move nodes). This one changes neither the points nor the connectivity: it
+    switches **interpolation covers** on at the marked nodes, so the field gains coefficients where
+    the solution needs them and stays P1 elsewhere. Requires a field declared ``space="cover"``::
+
+        u, phi = d.fem_symbols(space="cover")
+        fem = jno.fem([...])
+        fem.solve(adapt=jno.solve.enrich(criterion=jno.np.sqrt(ui.x**2 + ui.y**2)))
+
+    Why this is the cheap route to variable ``p``: enrichment rides the partition of unity, so an
+    enriched node next to an unenriched one blends automatically. There are no constraint equations
+    at an order interface and no edge-mode bookkeeping, which is what a hierarchical p-basis needs.
+    Compose with :func:`refine` across successive solves for **hp** — h where the solution is rough,
+    p where it is smooth.
+
+    **A criterion is required, and that is a deliberate refusal to guess.** Two built-in estimators
+    were measured against a hand-written one and both lost::
+
+        driver                       L2 x DOFs (lower is better)
+        Zienkiewicz-Zhu recovery         2.74      and ANTI-CORRELATED with the error: it rose
+                                                   1.3353e-01 -> 1.3377e-01 over eight rounds while
+                                                   the true L2 fell 4.692e-03 -> 2.677e-03
+        hierarchical residual            2.67      honest (it vanishes where enrichment is already
+                                                   on, by Galerkin orthogonality) but no better at
+                                                   marking, and it left a sharp spike untouched
+        criterion=sqrt(ui.x**2+ui.y**2)  1.37
+
+    ZZ recovers its gradient from the VERTEX VALUES, and enrichment lives in the cover coefficients,
+    so it cannot see the space it is estimating. Rather than pick a heuristic on the caller's behalf
+    -- gradient of which field, reduced how, for a coupled system? -- this asks for the one thing
+    only the caller knows.
+
+    Example -- a gradient-magnitude criterion, the general-purpose choice::
+
+        d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.02).domain()
+        d.tag("walls", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
+        co, cw = d.variable("interior", split=True), d.variable("walls", split=True)
+
+        u, phi = d.fem_symbols(space="cover")          # the enriched space p-adaptivity needs
+        ui, vi = u.bind(x=co[0], y=co[1]), phi.bind(x=co[0], y=co[1])
+        fem = jno.fem([ui.x * vi.x + ui.y * vi.y - f * vi, u(cw[0], cw[1]) - 0.0])
+
+        fem.solve(
+            solve_fn,                                   # adapt= does not take linear=; pass it here
+            adapt=jno.solve.enrich(
+                criterion=jno.np.sqrt(ui.x**2 + ui.y**2),
+                theta=0.5,
+                max_iters=6,
+            ),
+        )
+
+    Note ``ui.xx`` is NOT available: the assembler takes gradients of a trial function only, so the
+    curvature that would be the textbook p-indicator cannot be written. A first-derivative criterion
+    is the practical stand-in.
+
+    Args:
+        criterion: **Required.** A traced expression marking where to enrich, exactly as in
+            :func:`remesh` -- a field, carrying no test function
+            (``jno.np.sqrt(ui.x**2 + ui.y**2)``, ``phi*(1-phi)``, ``d.by_region({...})``).
+        theta: Dörfler bulk-marking fraction, over NODES rather than cells: the fewest nodes whose
+            indicator reaches ``theta`` of the total are enriched each round.
+        max_iters: Maximum enrich-solve rounds.
+        max_dofs: Stop once the system reaches this many ACTIVE DOFs. Active, not total: the padded
+            layout gives every node its cover slots and an unenriched node simply has them pinned, so
+            the total never changes and only the free count tracks the enrichment.
+        tol: Stop once the global indicator falls below this. **Requires an explicit ``criterion``** --
+            with the built-in estimator this is refused by name, because the Zienkiewicz-Zhu recovery
+            is computed from the vertex values and so cannot see the cover coefficients enrichment
+            adds: the estimate reads the same number every round while the true error falls.
+        eps: Stop when the indicator plateaus for two consecutive rounds. Same requirement, and the
+            same reason with a sharper edge -- against a frozen estimate the relative change is
+            exactly 0.0, so this would declare a plateau on a loop that is still converging.
+        metric_field: Which field of a coupled problem drives the marking. Note a **coupled form
+            carrying a cover field is refused by `jno.fem` itself**, before this is reached -- covers
+            do not compose with the coupled multi-field assembly, and the refusal misattributes the
+            reason. A single enriched field, linear or nonlinear, is the supported shape.
+
+    Calling this twice **resumes**: the mask is state on the domain, so a second run continues from
+    the first instead of discarding it, and two budgeted calls land where one run to the larger budget
+    would. A fresh run starts from plain P1 -- an unmasked ``space="cover"`` field is already enriched
+    everywhere, and a loop that begins maximal has nothing left to select.
+
+    Scope: simplices only, first-order covers, and the enriched field must be ``space="cover"``.
+    Scalar and VECTOR fields are both supported, in 2-D and 3-D; a vector field gets ``vec`` cover
+    slots per node and every component of an unenriched node is pinned.
+    ``fem.adapt_history`` records ``n_enriched`` per round beside the usual ``n_dofs``/``estimate``.
+    """
+    from .utils.solver.fem_adapt import AdaptSpec
+
+    return AdaptSpec(
+        enrich=True,
+        criterion=criterion,
+        theta=theta,
+        max_iters=max_iters,
+        max_dofs=max_dofs,
+        tol=tol,
+        eps=eps,
+        metric_field=metric_field,
     )
 
 

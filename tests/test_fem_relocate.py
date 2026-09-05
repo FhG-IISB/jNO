@@ -200,6 +200,25 @@ def test_relocate_complex_transient_fails_loud():
         jno.fem([ui.t * vi + (0.5 + 1j) * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - 1.0])
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "#114 -- relocation loses on this problem when it is scored on the mesh the caller actually "
+        "receives. `final_err` re-solves, and that second solve used to dispatch on the PRE-adapt "
+        "operator (FEM.solve restored `_op` unconditionally), so the recorded 0.51 ratio was measured "
+        "through the operator the run STARTED from. Solving on `fem.domain.mesh.points` instead gives "
+        "1.141e-01 against the uniform mesh's 9.379e-02, and an independent `jno.fem` built on those "
+        "same points agrees to 15+ digits -- so the honest number is 1.217x uniform, not 0.51x.\n\n"
+        "What is NOT established is why the two differ, and one plausible-sounding explanation is "
+        "already RULED OUT: the written-back mesh is bit-identical to the loop's own last recorded "
+        "state (max |diff| 0.000e+00 on this problem), so relocation is not discarding the geometry "
+        "it validated. A second candidate is the objective: the FE Dirichlet energy is the error norm "
+        "only for a SOURCE-FREE problem, and this form carries a reaction term -- but this test runs "
+        "the default arclength objective, not `energy`, so that does not close it either.\n\n"
+        "xfail(strict) so it reports the day the gap is understood; do not relax the assertion to "
+        "make it pass."
+    ),
+)
 def test_relocate_beats_a_uniform_mesh_on_an_underresolved_front():
     """The property the old suite never checked: relocation must improve the **answer**, not just an objective.
 

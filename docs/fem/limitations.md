@@ -26,6 +26,7 @@ path is unaffected.
 | Affine parameter lowering | one trainable scalar per additive term, not nested | raises |
 | Enclosure radiation | 2-D / axisymmetric, needs a direct solve; you write the radiosity yourself | manual composition |
 | Plasticity | small-strain, isotropic, linear-hardening, whole-domain | raises |
+| Interpolation covers (`space="cover"`) | first order, simplices only; the layout is padded so memory scales by `1+dim` even where enrichment is off; `jno.solve.enrich` is steady-only | raises |
 | Element order on RT / N1E / P0 / Hermite / Argyris / Morley | each family has one intrinsic order | raises |
 | `eigs` on a non-symmetric pencil | eigenvalues differentiate, **eigenvectors do not** | NaN, not a silent zero |
 | **Curved-boundary geometry** | straight-sided **by default**; `Shape.curved()` is the fix | **silent** |
@@ -121,6 +122,22 @@ path is unaffected.
     study. It is order 2 and simplices only, and non-nodal families keep affine geometry, so where it
     does not apply the advice above still stands: prefer `h`-refinement (or the adaptive loop) over
     `order ≥ 2`. See [Curved geometry](geometry.md#curved-isoparametric-geometry-shapecurved).
+
+??? note "Interpolation covers — the padding, and the Dirichlet trace"
+    A cover field's node array is the mesh nodes repeated `1+dim` times, so **memory scales by that
+    factor even where enrichment is switched off** — an unenriched node's slots exist and are pinned
+    to zero (the Dirichlet mechanism, eliminated exactly). That is the price of the padded layout, and
+    it is what buys a rebuild that changes no points and no connectivity.
+
+    An **inhomogeneous** Dirichlet trace stays the P1 interpolant of `g`: the tangential covers pin to
+    zero, not to `dg/ds`. On a curved or non-constant boundary value that is a real accuracy limit, not
+    a formality.
+
+    `jno.solve.enrich(...)` is wired on the **steady** loop only — enriching mid-march would change the
+    DOF layout under the stepper, and the state transfer that carries a solution across an adapt round
+    is written for a change of mesh, not of space. A transient problem is refused by name, as is
+    `order=` (the cover supplies the extra order) and a non-simplex cell (the cover gradient assumes an
+    affine map). See [Interpolation covers](elements.md#interpolation-covers-the-missing-p-spacecover).
 
 ??? note "Element order on a non-nodal family — refused, not applied"
     RT / N1E / P0 / Hermite / Argyris / Morley each have one intrinsic order. `space="N1E", order=2`

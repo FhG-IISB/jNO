@@ -15,15 +15,39 @@ that returns numbers and refines uniformly would pass any smoke test and be wort
 
 from __future__ import annotations
 
+import jax
 import numpy as np
 import pytest
 
 pytest.importorskip("mmgpy", reason="mmgpy required for adaptive remeshing")
 
 import jno
-from jno.utils.solver.fem_adapt import _criterion_indicators, _element_gradients, zz_error_indicators
+from jno.utils.solver.fem_adapt import (
+    _criterion_indicators,
+    _criterion_nodal,
+    _element_gradients,
+    zz_error_indicators,
+)
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
+
+
+@pytest.fixture(autouse=True)
+def _x64():
+    """Two tests here assert the vector and scalar projections agree EXACTLY (rtol=1e-10).
+
+    That is a real claim -- every component of a vector Lagrange field rides the same scalar nodal
+    basis, so the projection cannot depend on the field's width -- but it is only assertable in
+    float64: float32 carries eps = 1.2e-7, and the same two checks measure 5.96e-08 and 1 ULP above
+    1.0 there. Without this the file passes only when some earlier test in the session happens to
+    have left x64 on, and fails whenever it is run alone.
+    """
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
 
 
 def _ridge_problem(cell="simplex", size=0.09):
@@ -161,6 +185,76 @@ def test_a_bound_field_criterion_binds_to_the_form_s_own_coordinates():
     sol = np.asarray(fem.solve()).reshape(-1)
     eta, _ = _criterion_indicators(fem, ui * (1.0 - ui), sol)
     assert eta.shape[0] == len(np.asarray(fem.domain.mesh.cells_dict["triangle"]))
+
+
+# ------------------------------------------------------------------ vector fields
+
+
+def _vector_ridge_problem(size=0.09):
+    """The same ridge, carried by a VECTOR field: plane-strain elasticity pulled along the ridge.
+
+    Written the way a vector form is always written -- componentwise, `t[0].x` and `t[1]`, never a bare
+    `t` -- because that is exactly what the assembler supports and what makes the criterion's own test
+    binding the odd one out."""
+    d = jno.Shape.rect(0, 0, 1, 1, size=size).domain()
+    u, v = d.fem_symbols(value_shape=(2,))
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    a, t = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    lam, mu = 1.0, 1.0
+    exx, eyy, exy = a[0].x, a[1].y, 0.5 * (a[0].y + a[1].x)
+    tr = exx + eyy
+    sxx, syy, sxy = lam * tr + 2 * mu * exx, lam * tr + 2 * mu * eyy, 2 * mu * exy
+    f = jno.np.exp(-(((xi + yi - 1.0) / 0.06) ** 2))
+    fem = jno.fem([sxx * t[0].x + sxy * t[0].y + sxy * t[1].x + syy * t[1].y - f * t[1], u(xb, yb) - 0.0])
+    return d, fem, xi, yi
+
+
+def test_a_criterion_on_a_vector_field_is_the_exact_scalar_projection():
+    """A vector field must not change what a criterion MEANS. Same mesh, same criterion, scalar field
+    vs vector field: the nodal projection has to come out identical, not merely finite.
+
+    The criterion is tested against ONE component, and that is what makes this exact rather than
+    approximate -- every component of a vector Lagrange field rides the same scalar nodal basis, so
+    `int g phi_i / int phi_i` is the same number whatever the field's width. Hanging the criterion on
+    the whole vector test instead handed the assembler a vector-valued integrand, which it met with a
+    bare broadcast mismatch of exactly `vec`."""
+    ds, fs, _ui, _vi, xs, ys = _ridge_problem(size=0.13)
+    dv, fv, xv, yv = _vector_ridge_problem(size=0.13)
+    ps, pv = np.asarray(ds.mesh.points), np.asarray(dv.mesh.points)
+    assert ps.shape == pv.shape and np.allclose(ps, pv), "the two problems are not on the same mesh"
+
+    sol_s = np.asarray(fs.solve()).reshape(-1)
+    sol_v = np.asarray(fv.solve(jno.solve.lu(backend="host"))).reshape(-1)
+    assert sol_v.size == 2 * sol_s.size
+
+    g_s = _criterion_nodal(fs, jno.np.exp(-(((xs + ys - 1.0) / 0.06) ** 2)), sol_s)
+    g_v = _criterion_nodal(fv, jno.np.exp(-(((xv + yv - 1.0) / 0.06) ** 2)), sol_v)
+    assert g_v.shape == g_s.shape == (ps.shape[0],)
+    assert np.allclose(g_v, g_s, rtol=1e-10, atol=1e-12), f"vector and scalar disagree by {np.abs(g_v - g_s).max():.3e}"
+    assert g_s.max() > 0.5, "the criterion is flat; the comparison would be vacuous"
+
+
+def test_a_constant_criterion_on_a_vector_field_is_exactly_one():
+    """The projection is normalised by the same basis it integrates, so `g = 1` must return exactly 1
+    at every node -- mesh, field width and quadrature all cancel. A component-mixing read (norm over an
+    interleaved layout) returns sqrt(2) here instead, and nothing downstream would notice."""
+    _d, fem, _xi, _yi = _vector_ridge_problem(size=0.16)
+    sol = np.asarray(fem.solve(jno.solve.lu(backend="host"))).reshape(-1)
+    g = _criterion_nodal(fem, 1.0 + 0.0 * _yi, sol)
+    assert np.allclose(g, 1.0, rtol=1e-10), f"constant criterion came back in [{g.min():.6f}, {g.max():.6f}]"
+
+
+def test_a_vector_field_refines_where_the_criterion_peaks():
+    """End to end through the public slot: the vector problem must put its small cells on the ridge,
+    the same assertion the scalar headline test makes."""
+    _d, fem, xi, yi = _vector_ridge_problem()
+    crit = jno.np.exp(-(((xi + yi - 1.0) / 0.06) ** 2))
+    fem.solve(
+        jno.solve.lu(backend="host"), adapt=jno.solve.remesh(criterion=crit, theta=0.4, max_iters=3, refine_factor=2.0)
+    )
+    on, off = _size_on_and_off_ridge(fem.domain)
+    assert off / on > 1.5, f"cells are not concentrated on the ridge (off/on = {off / on:.2f})"
 
 
 def test_an_out_of_range_metric_field_is_refused():

@@ -485,3 +485,140 @@ Read those numbers with two caveats, both real:
   the domain, budget accordingly.
 
 ---
+
+---
+
+## Interpolation covers — the missing `p` (`space="cover"`)
+
+jNO adapts a mesh three ways: `remesh` rebuilds it finer, `refine` splits its cells, `relocate`
+moves its nodes. All three change the geometry. The fourth — raise the polynomial order and leave
+the mesh alone — needs an element that can carry a *variable* order, and that is what this is.
+
+Each node carries, besides its value, a first-order polynomial **cover** multiplied by its own hat
+(Kim & Bathe, *Comput. Struct.* **115** (2013) 1–11; used for deformable-mesh topology optimisation
+by Jung, Yun & Kim, *Comput. Struct.* **331** (2026) 108403):
+
+```
+u_h(x) = Σ_i h_i(x) ( u_i + (x − x_i)·a_i / s_i )
+```
+
+with `s_i` a nodal length scale. Declared on the symbol, and nothing else in the form changes:
+
+```python
+u, phi = d.fem_symbols(space="cover")          # 1 + dim DOFs per node, at the P1 nodes
+fem = jno.fem([inner(grad(u, X), grad(phi, X), 1) - f * phi, u(cw[0], cw[1]) - 0.0])
+```
+
+Because the enrichment rides the **partition of unity**, an enriched node beside an unenriched one
+already blends correctly. That is the property the whole feature rests on: switching a node's order
+needs no constraint equations and no edge-mode matching, which is what a hierarchical p-basis has to
+do wherever the order changes.
+
+**Accuracy, measured** on `-Δu = f` with `u = sin(πx)sin(πy)`, L² error against *actual* mesh spacing
+(the P1 control was measured in the same harness — fitting against the nominal `size=` instead put
+even P1 at 1.59, so the control is what makes the band meaningful):
+
+| space | fitted order | error at `h = 0.103` |
+|---|---|---|
+| P1 | 2.00 | 8.70e-3 |
+| cover, all covers pinned at the wall | 1.86 | 6.94e-3 |
+| cover, tangential-only pinning | **3.13** | **2.31e-4** |
+
+The middle row is the one worth keeping: pinning *all* covers at a Dirichlet node collapses the
+boundary layer to P1, and a layer of width `h` caps the global rate **below P1's own**. On a straight
+facet through node `i`, `(x − x_i)` is tangential, so only the tangential cover components enter the
+trace — the normal one is the `∂u/∂n` freedom and pinning it was pure loss. A cover slot is freed
+exactly when its axis is orthogonal to every region tangent at the node; an oblique facet frees
+nothing, which over-constrains but never violates the condition.
+
+**Against P2, honestly.** On straight-sided simplices the enriched span *is* elementwise P2 — the
+element reproduces every global quadratic exactly (tested), so the same order and the same errors are
+the expected result, not a disappointment. What differs is the count and the composition:
+
+* **Fewer DOFs for that span.** `(1+dim)·n_v` against P2's `n_v + n_e` — about `3n_v` vs `4n_v` in
+  2-D and `4n_v` vs `8n_v` in 3-D, since a triangulation has ~3 edges per vertex and a tetrahedral
+  mesh ~7.
+* **The DOFs ride the P1 nodes**, which are the nodes `.trainable()` moves. P2's edge midpoints are
+  not mesh vertices, so a moving-mesh problem has to manage them; a cover field has nothing extra to
+  move.
+* **Selective enrichment has no P2 analogue** — see `jno.solve.enrich` below.
+
+One expectation that did **not** materialise: extra robustness to element distortion over P2. Against
+P1 yes; against P2 the two behave the same on affine simplices. The enriched basis contains the exact
+quadratic on any straight-sided cell, so what distortion costs is conditioning, not consistency.
+
+**Differentiable**, including with respect to the node positions — the combination a deformable-mesh
+optimisation needs. One caveat, stated because it is invisible otherwise: the nodal length scale `s_i`
+is computed on the host at build time (like the facet orientation signs) and does **not** track moving
+coordinates. That is a conditioning drift, not a wrong gradient.
+
+**It marches in time**, and the initial condition is the part that had to be got right. A cover node
+carries its value *and* the coefficients of `(x − x_i)/s_i`, so an IC interpolated onto "the nodes"
+must fill the latter with `a_i = ½∇g(x_i)·s_i` — writing `g(x_i)` into every slot of the node hands
+the cover coefficients a function value where a scaled gradient belongs. That is not a mild
+inconsistency: the enriched DOFs are stiff (the generalized spectrum splits into a handful of
+value-dominated modes at `λ ≈ 2–5` and dozens of cover-dominated ones reaching `λ ≈ 185`), so a
+θ-stepper damps the bad start by `1/(1+Δt·λ)` and annihilates it in a single step rather than
+relaxing it — measured, the cover coefficients collapsed to 0.17 of their initial size while the node
+values correctly reached 0.86. With the enriched interpolation in place they decay together, and on
+the analytic heat benchmark at a converged time step the enriched space is **49.8× more accurate than
+P1 in L2** at the same mesh. Note the corollary for benchmarking: at a *coarse* `Δt`, P1 can look
+better than it is through cancellation between its temporal and spatial errors — refine `Δt` before
+comparing spaces.
+
+**The null space is structural, and it is gauged.** Since `Σ_i h_i (x − x_i) ≡ 0`, the coefficients
+`a_i = S·x_i + c` with `S` skew are the zero *function* — `dim(dim+1)/2` modes per component,
+mesh-independent. Whatever the boundary pins leave alive is removed exactly like a pressure gauge: one
+extra cover DOF per surviving mode, chosen by Gaussian pivoting. Every member of the solution family
+is the same physical field, so the gauge moves nothing.
+
+### p-adaptivity — `fem.solve(adapt=jno.solve.enrich(...))`
+
+The loop that puts the order where it is needed. Same round as the h-adaptive one — solve, estimate,
+mark, rebuild — except that marking is per **node** and the rebuild changes the *space* rather than
+the geometry:
+
+```python
+u, phi = d.fem_symbols(space="cover")
+ui = u.bind(x=xi, y=yi)
+fem = jno.fem([...])
+u = fem.solve(solve_fn, adapt=jno.solve.enrich(
+    criterion=jno.np.sqrt(ui.x**2 + ui.y**2), theta=0.5, max_iters=6))
+```
+
+`theta`, `criterion`, `max_iters` and `max_dofs` mean what they do for `remesh` — a criterion is the
+same traced, test-function-free field, and `metric_field` picks which field of a coupled problem
+drives the marking. **A `criterion` is required and `tol`/`eps` are refused**, both for the same reason: nothing
+available here is an error estimate. A recovery estimator reconstructs its gradient from the *vertex
+values*, so it is blind to the cover coefficients enrichment adds — measured, it ROSE from 1.3353e-01
+to 1.3377e-01 across eight rounds while the true L2 error fell 4.692e-03 → 2.677e-03. A hierarchical
+residual is honest (it vanishes where enrichment is already on) but marked no better and left a sharp
+spike untouched. A hand-written `sqrt(ui.x**2 + ui.y**2)` beat both by ~2× per DOF — so the loop asks
+for the criterion rather than guessing one, and bounds itself with `max_iters`/`max_dofs`. `start=` pre-enriches a fraction before the first solve (default
+0, i.e. begin at plain P1).
+
+Three things follow from changing the space instead of the mesh, and each shows up in the API:
+
+* **Marking is over the *unenriched* nodes.** Splitting a cell drops its indicator, so an h-loop can
+  re-rank the whole field each round; enriching a node does not move a geometric criterion at all, so
+  ranking globally would re-mark the same top nodes forever and the loop would stop after one round.
+  Each round asks which of the *remaining* nodes carry `theta` of the error still on the table.
+* **`n_dofs` in `fem.adapt_history` is the ACTIVE count**, not the total. The padded layout gives every
+  node its cover slots and an unenriched node simply has them pinned, so the total never changes;
+  `max_dofs` budgets against the free count, which is what the eliminated system actually costs. The
+  history also records `n_enriched` and the per-node `enriched` mask, so a run's order distribution is
+  a fact you can plot rather than infer.
+* **There is no field transfer between rounds.** The mesh, the DOF nodes and the connectivity are
+  identical throughout — only how many coefficients each node carries changes.
+
+The [adaptivity tutorial](../tutorials/08-fem-and-varpinns/adaptive-l-shape.md) compares h, r and p on
+the same problem. Compose with `refine`/`remesh` across successive `fem.solve` calls for **hp**: h where the solution is
+rough, p where it is smooth.
+
+**Scope**, refused by name rather than discovered: the field must be declared `space="cover"` (there is
+nothing to switch on in a Lagrange field); first-order covers only (`order=` is refused — the cover
+supplies the extra order); simplices only, since the cover gradient assumes an affine map; and the loop
+is **steady** — enriching mid-march would change the DOF layout under the stepper, and the state
+transfer that carries a solution across an adapt round is written for a change of mesh, not of space.
+An **inhomogeneous** Dirichlet trace stays the P1 interpolant of `g` (the tangential covers pin to zero,
+not to `dg/ds`), which is a real accuracy limit on a curved or non-constant boundary value.

@@ -1414,6 +1414,15 @@ def _criterion_weak_terms(fem: Any, criterion: Any, field: int = 0):
         coords = [seen_axis[a] for a in sorted(seen_axis)][:dim]
     else:  # nothing carries coordinates (a criterion of pure constants): fall back to the region's own
         coords = list(fem.domain.variable(tags[0], split=True))[:dim]
+    # A VECTOR field's test function must be reduced to ONE COMPONENT before the criterion is hung on
+    # it. The assembler only ever meets a vector test componentwise -- every form writes `t[0].x`,
+    # `t[1]`, never a bare `t` -- so `criterion * t` hands it a vector-valued integrand and it dies
+    # deep in the quadrature reduction with a bare shape mismatch of exactly `vec`
+    # ("input type=float64[2208] and requested type=float64[1104]"), naming neither the criterion nor
+    # the field. Component 0 is not a choice of direction: each component of a vector Lagrange field is
+    # carried by the SAME scalar nodal basis, so `int g phi_i / int phi_i` on component 0 is the exact
+    # scalar nodal projection of `g`, and `_criterion_nodal`'s per-node norm then reads it back
+    # untouched (the other components are structurally zero in both the numerator and the mass).
     test_bound = tests[int(field)](*coords)
     # Retag the TEST function's coordinates before combining it with the criterion, not after. When the
     # criterion exposes no free coordinates of its own -- a bound view absorbs them, which is what
@@ -1449,6 +1458,27 @@ def _criterion_weak_terms(fem: Any, criterion: Any, field: int = 0):
                 f"Original error: {e}"
             ) from e
     mass_term = 1.0 * test_bound
+
+    # A VECTOR field's test function has to be reduced to ONE COMPONENT: the assembler only ever meets
+    # a vector test componentwise -- every form writes `t[0].x`, `t[1]`, never a bare `t` -- so a
+    # vector-valued integrand dies in the quadrature reduction with a bare shape mismatch of exactly
+    # `vec` ("input type=float64[2208] and requested type=float64[1104]"), naming nothing useful.
+    #
+    # The reduction is taken on the PRODUCT rather than on the test function, and the order is the
+    # whole trick: indexing a bound view copies its coordinate Variables, and the binder compares
+    # identity rather than tag, so reducing first makes the multiply raise "coord binding conflict for
+    # 'x'" between two Variables that both read `gauss_top`. Multiplying first keeps every coordinate
+    # object shared, and `(g * t)[0]` is the same expression as `g * t[0]` either way.
+    #
+    # Component 0 is not a choice of direction: each component of a vector Lagrange field rides the
+    # SAME scalar nodal basis, so `int g phi_i / int phi_i` on component 0 is the exact scalar nodal
+    # projection of `g`, and `_criterion_nodal`'s per-node norm reads it back untouched (the other
+    # components are structurally zero in both the numerator and the mass). A criterion that CARRIES
+    # its own test function is left alone -- the user chose that spelling, components included.
+    if _field_vec(fem, int(field))[1] > 1:
+        mass_term = mass_term[0]
+        if not contains_node_type(node, TestFunction):
+            crit_term = crit_term[0]
 
     # Point the coordinates at the quadrature pool, exactly as `jno.fem` does to a form's coordinates at
     # build time. Without it a criterion built from FRESHLY fetched coordinates samples the mesh pool
@@ -1580,21 +1610,40 @@ def _criterion_percell(fem: Any, node: Any) -> np.ndarray:
     return vals
 
 
-def _criterion_nodal(fem: Any, criterion: Any, u: np.ndarray, field: int = 0) -> np.ndarray:
-    """A field criterion as a nodal array scaled like ``g`` itself, not like ``g x volume``."""
+def _field_vec(fem: Any, field: int = 0) -> tuple:
+    """``(n_nodes, vec)`` for one field: how many mesh nodes it has, and components per node."""
+    offs = list(getattr(fem, "offsets", None) or [0, int(getattr(fem, "dofs", 0))])
+    lo, hi = int(offs[field]), int(offs[field + 1])
+    pts = getattr(fem, "field_points", None)
+    n_nodes = int(np.asarray(pts[field]).shape[0]) if pts is not None else max(hi - lo, 1)
+    return n_nodes, max(1, (hi - lo) // max(n_nodes, 1))
+
+
+def _criterion_nodal(fem: Any, criterion: Any, u: np.ndarray, field: int = 0, stride: int = 1) -> np.ndarray:
+    """A field criterion as a nodal array scaled like ``g`` itself, not like ``g x volume``.
+
+    Also the quantity a NODE-based adaptivity wants unreduced: h-refinement collapses it to cells to
+    decide which to split, `jno.solve.enrich` marks on it directly to decide which nodes carry covers.
+    ``stride`` skips the padded slots of an enriched field, whose DOF nodes are the mesh nodes repeated.
+    """
     weak, mass_term = _criterion_weak_terms(fem, criterion, field)
     num = np.asarray(fem.eval(weak, u)).reshape(-1)
     mass = np.asarray(fem.eval(mass_term, u)).reshape(-1)
-    n_vert = int(np.asarray(fem.domain.mesh.points).shape[0])
     # The criterion is tested against FIELD `field`, so its contributions land on THAT block's DOFs.
     # Reading the first `n_vert` entries assumes the tested field starts at 0 -- true only for field 0.
     # With `metric_field=1` this read the untouched velocity rows: every indicator came back exactly
     # zero, nothing was marked, and the driver reported a clean run having refined nothing.
-    _off = list(fem.offsets) if getattr(fem, "offsets", None) is not None else [0]
-    _b = int(_off[field]) if field < len(_off) else 0
-    num, mass = num[_b : _b + n_vert], mass[_b : _b + n_vert]
-    g = np.abs(num) / np.maximum(np.abs(mass), 1e-30)
-    return np.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0)
+    #
+    # A VECTOR field then needs reducing over its components by the per-node norm. Slicing the block
+    # and taking its first `n_vert` entries walks an INTERLEAVED (node, component) layout instead, so
+    # it mixes components together and stops at node n_vert/vec.
+    offs = list(getattr(fem, "offsets", None) or [0, num.size])
+    lo, hi = int(offs[field]), int(offs[field + 1])
+    n_nodes, vec = _field_vec(fem, field)
+    a = np.linalg.norm(num[lo:hi].reshape(n_nodes, vec), axis=1)
+    b = np.linalg.norm(mass[lo:hi].reshape(n_nodes, vec), axis=1)
+    g = np.nan_to_num(a / np.maximum(b, 1e-30), nan=0.0, posinf=0.0, neginf=0.0)
+    return g[::stride] if stride > 1 else g
 
 
 def _criterion_margin(fem: Any, constraint: Any, u: np.ndarray, field: int = 0) -> np.ndarray:
@@ -1631,7 +1680,8 @@ def _criterion_indicators(fem: Any, criterion: Any, u: np.ndarray, field: int = 
         eta = np.abs(_criterion_percell(fem, criterion))
         return eta, float(np.sqrt(np.sum(eta**2)))
     g = _criterion_nodal(fem, criterion, u, field)
-    eta = np.abs(_integrate_nodal_per_cell(fem.domain, g))
+    n_vert = int(np.asarray(fem.domain.mesh.points).shape[0])
+    eta = np.abs(_integrate_nodal_per_cell(fem.domain, g[:n_vert]))
     return eta, float(np.sqrt(np.sum(eta**2)))
 
 
@@ -2360,6 +2410,29 @@ class AdaptSpec:
     ``max_dofs``, ``tol`` and ``eps`` all mean exactly what they do for remeshing; ``refine_factor``
     does not apply, because a split halves the cell by construction.
     """
+    # --- p-adaptivity (enrichment on a fixed mesh) ----------------------------------------------------
+    enrich: bool = False
+    """Switch ``FEM.solve(adapt=...)`` from h- or r-adaptivity to **p-adaptivity**: raise the local
+    polynomial order by switching on interpolation covers at the marked NODES, leaving the mesh --
+    points, cells, connectivity -- untouched. Requires a field declared ``space="cover"``.
+
+    This is the one adaptivity here that changes the *space* rather than the geometry, and the reason
+    it is cheap is the partition of unity: an enriched node beside an unenriched one already blends
+    correctly, so switching a node on needs no constraint equations and no interface bookkeeping. A
+    hierarchical p-basis would have to reconcile edge modes wherever the order changes.
+
+    ``theta``, ``criterion``, ``max_iters``, ``max_dofs``, ``tol`` and ``eps`` mean exactly what they
+    do for remeshing, except that marking is per NODE rather than per cell -- p-refinement decides
+    where to add DOFs, not where to split. ``refine_factor`` does not apply. Compose with
+    :attr:`split` in successive ``fem.solve`` calls for hp.
+
+    A FRESH loop starts from plain P1 -- an unmasked ``space="cover"`` field is enriched everywhere,
+    and a loop that begins maximal has nothing left to select. A SECOND call resumes from the mask the
+    first one left, so two budgeted runs compose. There is deliberately no "enrich this fraction up
+    front" knob: which nodes that would pick is a question about the mesh's node ORDER, not about the
+    solution, and a starting space chosen by node index is not a choice anyone can defend. The first
+    round costs one P1 solve, which is what an h-adaptive loop pays too."""
+
     # --- r-adaptivity (mesh relocation) --------------------------------------------------------------
     relocate: bool = False
     """Switch ``FEM.solve(adapt=...)`` from h-refinement (add elements) to **r-adaptivity**: relocate the
@@ -2465,6 +2538,25 @@ def _solve_vertex_values(fem: Any, solve_fn: Any = None, *, allow_vector: bool =
     return _vertex_view(np.asarray(fem.solve(solve_fn, **kwargs)).reshape(-1), fem, allow_vector=allow_vector)
 
 
+def _cover_block_stride(fem: Any) -> int:
+    """``1 + dim`` if the field is an interpolation cover, else ``1`` -- the DOFs one node carries.
+
+    Needed because a cover field's DOFs **interleave**: node ``i`` owns its value and then its ``dim``
+    cover coefficients, so the nodal values are every ``blk``-th entry. The "a higher-order scalar
+    keeps its vertex values in the first ``n_vert`` DOFs" convention that :func:`_vertex_view` applies
+    to a P2 field reads a mixture of values and cover coefficients here -- silently, since the slice
+    has the right length. Detected from the term list, which is where ``space='cover'`` is declared.
+    """
+    cons = getattr(fem, "_constraints", None)
+    if not cons:
+        return 1
+    if not any(str(getattr(n, "space", "")).lower() == "cover" for c in cons for n in _walk_trials(c)):
+        return 1
+    from .fem_cover import cover_block
+
+    return int(cover_block(int(fem.domain.dimension)))
+
+
 def _vertex_view(sol: np.ndarray, fem: Any, *, allow_vector: bool = False) -> np.ndarray:
     """The vertex part of an already-computed solution vector.
 
@@ -2477,6 +2569,16 @@ def _vertex_view(sol: np.ndarray, fem: Any, *, allow_vector: bool = False) -> np
     sol = np.asarray(sol).reshape(-1)
     n_vert = int(np.asarray(fem.domain.mesh.points).shape[0])
     vec = _infer_vec(fem._constraints) if getattr(fem, "_constraints", None) else 1
+    blk = _cover_block_stride(fem)
+    if blk > 1:  # interleaved (value, cover...) per node -- the values are every blk-th entry
+        if vec == 1 and sol.shape[0] >= n_vert * blk:
+            return sol[: n_vert * blk : blk]
+        if vec != 1 and allow_vector and sol.shape[0] >= n_vert * blk * vec:
+            return sol[: n_vert * blk * vec].reshape(n_vert, blk, vec)[:, 0, :]
+        raise NotImplementedError(
+            f"space='cover' with vec={vec}: got {sol.shape[0]} DOFs for {n_vert} nodes at {blk} DOFs "
+            "per node per component, which is not the interleaved cover layout this reads."
+        )
     if vec != 1:
         if allow_vector and sol.shape[0] == n_vert * vec:
             return sol.reshape(n_vert, vec)  # node-major P1 vector: (n_vert, vec), one column per component
@@ -2635,6 +2737,177 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
     fem.__dict__.update(cur.__dict__)
     fem.adapt_history = history
     return u
+
+
+def run_adaptive_enrich(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwargs: Any) -> np.ndarray:
+    """p-adaptive loop: enrich the marked NODES, keep the mesh.
+
+    Structurally the same round as :func:`run_adaptive_solve` -- solve, estimate, mark, rebuild via
+    ``jno.fem(cons, **kw)`` -- with two differences that follow from changing the space instead of
+    the geometry:
+
+    * marking is per NODE (``dorfler_mark`` is index-agnostic, so it takes the nodal indicator
+      directly) rather than per cell;
+    * instead of remeshing, the round stashes the enrichment mask on the domain and lets the
+      assembler widen the space, the same seam ``refine_domain`` uses for hanging nodes.
+
+    Because the mesh never changes, there is no field transfer between rounds and the DOF *nodes*
+    are identical throughout -- only how many coefficients each carries changes.
+    """
+    import jno
+
+    if fem._constraints is None:
+        raise ValueError(
+            "FEM.solve(adapt=jno.solve.enrich(...)) requires a FEM built by jno.fem(...): the loop "
+            "re-assembles the same constraint list each round on the widened space, and a "
+            "hand-constructed FEM has no recipe to re-assemble."
+        )
+    d = fem.domain
+    cons, kw = fem._constraints, fem._fem_kwargs
+    n_vert = int(np.asarray(d.mesh.points).shape[0])
+    if not any(str(getattr(n, "space", "")).lower() == "cover" for c in cons for n in _walk_trials(c)):
+        raise ValueError(
+            "jno.solve.enrich(...) needs a field declared with space='cover': p-adaptivity switches "
+            "that field's interpolation covers on and off per node, and a plain Lagrange field has "
+            "none to switch. Declare it as d.fem_symbols(space='cover')."
+        )
+
+    # `tol` and `eps` both read the global estimate, and with the DEFAULT estimator that number cannot
+    # move: the ZZ recovery is built from the vertex values (`zz_error_indicators` takes `u_vertex` and
+    # differentiates the P1 basis), so it never sees a cover coefficient -- and cover coefficients are
+    # what enrichment adds. Measured on the heat-plate problem: the estimate reads 1.1965e+00 in EVERY
+    # round, bit-identical, while the true L2 error falls 1.948e-02 -> 8.480e-04 across six rounds.
+    #
+    # A frozen estimate does not make these knobs merely useless, it makes them wrong in opposite
+    # directions: `tol` can never be crossed that was not already crossed at round 0, and `eps` sees a
+    # relative change of exactly 0.0 every round, so it declares a plateau after `_EPS_PATIENCE` rounds
+    # and stops a loop that is still converging. Refuse them rather than let either happen quietly. A
+    # user `criterion=` is a different matter -- it is whatever the caller wrote, and it is their
+    # business whether it moves -- so this guard is scoped to the built-in estimator.
+    if spec.criterion is None:
+        raise ValueError(
+            "jno.solve.enrich(criterion=...) is required. The recovery estimator that would be the "
+            "obvious default is blind here -- it reconstructs a gradient from the VERTEX VALUES, and "
+            "enrichment lives in the cover coefficients -- so it reports a number anti-correlated "
+            "with the error. See jno.solve.enrich for the measurements and a worked criterion."
+        )
+    if spec.tol is not None or spec.eps is not None:
+        raise NotImplementedError(
+            "jno.solve.enrich(tol=/eps=) has nothing to compare against. `estimate` is the norm of "
+            "whatever drives the marking, and a criterion is a FIELD MAGNITUDE, not an error: measured "
+            "on a plate problem it rose 4.2967e+01 -> 4.3068e+01 across eight rounds while the true L2 "
+            "error fell by a factor of three. `eps` would read that as a plateau and stop a converging "
+            "loop; `tol` would compare against a number with no relation to accuracy. Bound the run "
+            "with `max_iters`/`max_dofs` instead."
+        )
+
+    # RESUME from whatever enrichment the domain already carries. A second `enrich` call continues
+    # where the first stopped instead of throwing its covers away, which is what makes budgeted runs
+    # composable -- `enrich(max_dofs=A)` then `enrich(max_dofs=B)` lands where one run to B would.
+    # An absent mask means a FRESH run, and that starts from plain P1 by design: a `space="cover"`
+    # field with no mask is already enriched everywhere, and a loop that begins maximal has nothing
+    # left to select. That asymmetry is the honest one -- resume a selection, do not resume a space.
+    _prev = getattr(d, "_fem_enriched_nodes", None)
+    _prev = np.asarray(_prev, dtype=bool).reshape(-1) if _prev is not None else None
+    mask = _prev.copy() if (_prev is not None and _prev.size == n_vert) else np.zeros(n_vert, dtype=bool)
+    d._fem_enriched_nodes = mask.copy()
+    history: list[dict] = []
+    # Skip the opening rebuild when the caller's FEM was already assembled against THIS mask -- which
+    # is precisely the resumed run, since the mask it resumes from is the one the caller last built
+    # with. Proven by the stamp the assembler leaves, not inferred from the mask sitting on the domain
+    # (a caller may write that attribute between builds, and then the stale operator would be wrong).
+    #
+    # A round's rebuild is the loop's dominant cost and it is NOT amortised by JAX's compile cache:
+    # `compress_eager` drops explicit zeros, so the operator's nnz depends on WHICH DOFs the mask pins,
+    # every round presents new shapes, and XLA lowers the assembly afresh (~10 lowerings a round).
+    # Measured on 2-D Poisson, 640-6106 vertices, the rebuild is a flat 60-65% of wall regardless of
+    # size. Keeping the zeros makes nnz mask-independent and the recompiles vanish -- and is a LOSS at
+    # scale: at 18k padded DOFs the operator doubles (2.7 -> 5.8 MiB) and the extra matvec work costs
+    # more than the compiles saved (solves 0.79 -> 1.34 s, total 2.26 -> 2.61 s). So the cost stands
+    # deliberately; removing it needs the pins applied as a projector in the matvec rather than by
+    # elimination, which is a different design and not a tuning knob.
+    _built = getattr(d, "_fem_cover_mask_built", None)
+    reused = _built is not None and np.asarray(_built).shape == mask.shape and np.array_equal(_built, mask)
+    cur = fem if reused else jno.fem(cons, **kw)
+    u = None
+    prev_est, n_converged = None, 0
+
+    for it in range(spec.max_iters):
+        _full = np.asarray(cur.solve(solve_fn, **kwargs)).reshape(-1)
+        u = _vertex_view(_full, cur, allow_vector=True)
+        fld = int(spec.metric_field)
+        stride = max(1, int(np.asarray(cur.field_points[fld]).shape[0]) // max(n_vert, 1))
+        g = _criterion_nodal(cur, spec.criterion, _full, fld, stride=stride)
+        g = np.asarray(g).reshape(-1)[:n_vert]
+        est = float(np.sqrt(np.sum(g**2)))
+        # The padded layout is UNIFORM -- every node owns cover slots whether or not it is enriched --
+        # so `cur.dofs` is the same number every round, and reporting it would make both the history
+        # and `max_dofs` meaningless. What grows is how many of those DOFs are FREE: an unenriched
+        # node has its cover slots pinned (the Dirichlet mechanism), and the eliminated system is that
+        # much smaller. So the count here is the ACTIVE one, and `max_dofs` budgets against it.
+        _pins = getattr(d, "_fem_native_dirichlet_pairs", None) or []
+        n_dofs = int(cur.dofs) - len({int(i) for i, _ in _pins})
+        # Bulk-mark over the UNENRICHED nodes only. h-refinement can mark on the whole field because
+        # splitting a cell drops its indicator, so the next round ranks different cells; enriching a
+        # node does not move a geometric criterion at all, so marking globally would re-mark the same
+        # top nodes every round, find nothing fresh, and stop after one. Zeroing what is already
+        # enriched asks the question the round is actually asking -- which of the REMAINING nodes
+        # carry theta of the error still on the table -- and makes the loop progressive.
+        marked = dorfler_mark(np.where(mask, 0.0, g), spec.theta)  # index-agnostic: nodal in, nodal out
+        history.append(
+            {
+                "n_dofs": n_dofs,
+                "estimate": est,
+                "n_enriched": int(mask.sum()),
+                "n_marked": int(marked.size),
+                "points": np.asarray(d.mesh.points)[:, : int(d.dimension)].copy(),
+                "enriched": mask.copy(),
+            }
+        )
+
+        if spec.eps is not None and prev_est is not None:
+            n_converged = n_converged + 1 if _rel_change(est, prev_est) < spec.eps else 0
+        prev_est = est
+
+        fresh = marked[~mask[marked]] if marked.size else marked  # already true by the masking above
+        last = it == spec.max_iters - 1
+        below_tol = spec.tol is not None and est < spec.tol
+        over_budget = spec.max_dofs is not None and n_dofs >= spec.max_dofs
+        plateaued = spec.eps is not None and n_converged >= _EPS_PATIENCE
+        if last or below_tol or over_budget or plateaued or fresh.size == 0:
+            break
+
+        mask[fresh] = True
+        d._fem_enriched_nodes = mask.copy()
+        cur = jno.fem(cons, **kw)  # same mesh, wider space
+
+    # REPLACE the caller's state, not merge into it. `update` leaves behind any key `cur` does not
+    # carry, and the caller's `_A` / `_b` -- assembled at its own build, before the mask existed, i.e.
+    # with every node enriched -- are exactly such keys when `cur` never materialised its own. The
+    # measured symptom: `fem.solve()` after the loop re-solved the FULLY enriched system while the
+    # returned field was the adapted one, an inconsistency with nothing to indicate it.
+    if cur is not fem:  # `clear()` on the shared dict would wipe the state it is about to copy back
+        fem.__dict__.clear()
+        fem.__dict__.update(cur.__dict__)
+    fem.adapt_history = history
+    return u
+
+
+def _walk_trials(constraint):
+    """The TrialFunction nodes inside one constraint (used to check a cover field is present)."""
+    from ...trace import TrialFunction
+    from .solver_helper import iter_children
+
+    seen = []
+
+    def go(n):
+        if isinstance(n, TrialFunction):
+            seen.append(n)
+        for ch in iter_children(n) or ():
+            go(ch)
+
+    go(getattr(constraint, "expr", constraint))
+    return seen
 
 
 def _dirichlet_energy_jax(pts, u_nodal, cells, dim):
