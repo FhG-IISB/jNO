@@ -11,7 +11,7 @@ today's default; `solve_fn=` stays the total override (passing both is an error)
 
 ```python
 u = fem.solve(
-    x0        = u_guess,                 # warm start (previous solve, coarse solve, a surrogate…)
+    x0        = u_guess,                 # warm start — see "What a warm start buys" below
     nonlinear = jno.solve.newton(),      # linearization driver (nonlinear problems)
     linear    = jno.solve.gmres(),       # inner linear solve: lu / dense / cg / bicgstab / gmres
     precond   = jno.precond.jacobi(),    # v -> M⁻¹v spec, materialized against the assembled A
@@ -48,6 +48,56 @@ Pick by structure:
     `jit`/`vmap`/`grad` — which matters, because the runtime residual guard needs a concrete residual
     and steps aside on a tracer, leaving a transformed solve otherwise unguarded.
 
+
+### Warm starts — what `x0=` actually buys
+
+`x0=` is free to pass and easy to misjudge, so here is the rule, measured. A Krylov solve has to
+cover the distance from its initial residual down to `rtol`. A warm start removes the decades it
+already starts below, so the **fraction of iterations saved is a ratio of logarithms** — not a
+ratio of errors:
+
+$$\text{saved} \;\approx\; \frac{\log_{10}(1/\varepsilon)}{\log_{10}(1/\texttt{rtol})}$$
+
+with `ε` the *relative* error of the guess. At `rtol = 1e-10`, a guess good to 1 % removes one fifth
+of the work — and a guess good to 10 % removes one tenth, which is usually not worth arranging.
+
+!!! measured "Jacobi-CG, 2-D diffusion with a 10× conductivity blob, 791 DOFs, `rtol = 1e-10`"
+    Cold (`x0 = 0`) is **85 iterations**. Two initial errors of the *same norm* were compared: a
+    **smooth** one (a low-frequency field) and a **rough** one (white noise).
+
+    | rel. error `ε` | smooth `x0` | rough `x0` | law predicts |
+    |---|---|---|---|
+    | 3e-01 | 78 | 93 | 81 |
+    | 1e-01 | 74 | 90 | 76 |
+    | 1e-02 | 67 | 85 | 68 |
+    | 1e-03 | 61 | 76 | 59 |
+    | 1e-04 | 52 | 67 | 51 |
+    | 1e-06 | 35 | 53 | 34 |
+
+    The law tracks the **smooth** column to within 1–3 iterations across five decades. The **rough**
+    column does not follow it at all: a rough guess accurate to 1 % costs exactly what a cold start
+    costs, and a rough guess at 30 % is **worse than starting from zero**.
+
+**The spectrum of the initial error matters, not its norm.** Krylov convergence is governed by how the
+error is distributed over the spectrum (Greenbaum, *Iterative Methods for Solving Linear Systems*,
+SIAM 1997, ch. 3), and a guess that is pointwise close but rough injects high-frequency error the
+method must then remove. This is why the previous solve in a sweep or a time step is such a good
+warm start — it is smooth, and it is *wrong in the same modes* the operator is about to correct.
+
+!!! warning "A neural surrogate is a poor warm start, measured"
+    The tempting idea — train a network to predict the solution, feed it as `x0` — does not clear the
+    bar. On the sweep above, against a cold start: an MLP predicting **DOF values** directly came in at
+    **−2 %** (i.e. *slower* than cold, its output being spectrally rough), and predicting **POD
+    coefficients** instead — whose output is smooth by construction, being a combination of smooth
+    modes — recovered only **+5 %**. Both lost to the trivial baseline of reusing the **nearest stored
+    snapshot** (+9 %), which costs nothing to build.
+
+    The arithmetic is why, and it is not an engineering problem: at a realistic surrogate accuracy of
+    1e-2 to 1e-3 the law caps the prize at 20–30 %, and collecting it needs an output that is smooth as
+    well as accurate. Reach for `x0=` where a *nearby solve* already exists — a continuation sweep
+    (`jno.solve.continuation`, which warm-starts for you), a transient step (which warm-starts
+    automatically, and rejects `x0=` for that reason), or a Newton loop. Those are smooth by
+    construction and free.
 
 ### Two that are not `Ax = b` on a square, definite operator
 

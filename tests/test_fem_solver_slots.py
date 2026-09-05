@@ -595,3 +595,60 @@ def test_repeated_solves_do_not_recompile():
 
     assert np.abs(u1 - u2).max() < 1e-12, "repeated solves disagree"
     assert n["c"] - first_repeat <= 1, f"a repeat solve recompiled {n['c'] - first_repeat} programs"
+
+
+def test_warm_start_payoff_is_set_by_the_error_spectrum_not_its_norm():
+    """A warm start is worth what its error's SPECTRUM is worth, not what its norm is.
+
+    Documented in ``docs/solvers.md`` ("Warm starts -- what ``x0=`` actually buys"): the fraction of
+    Krylov iterations saved is ``log10(1/eps) / log10(1/rtol)`` for a *smooth* guess, and a *rough*
+    guess of the same norm buys nothing at all. That second half is the one that matters -- it is why
+    a neural surrogate makes a poor ``x0`` -- so it is pinned here rather than left to the prose.
+
+    The oracle is a controlled perturbation of the exact solution: same relative norm, two different
+    spectra. Iterations are counted with SciPy's callback on the assembled operator, which is the
+    bring-your-own-solver contract ``docs/solvers.md`` already documents.
+    """
+    scipy_sparse = pytest.importorskip("scipy.sparse")
+    spla = pytest.importorskip("scipy.sparse.linalg")
+
+    fem = _poisson()
+    op = fem.operator
+    A = op[0] if isinstance(op, tuple) else op
+    idx, val = np.asarray(A.indices), np.asarray(A.data)
+    n = fem.dofs
+    K = scipy_sparse.csr_matrix((val, (idx[:, 0], idx[:, 1])), shape=(n, n))
+    b = np.asarray(fem.b).reshape(-1)
+    Minv = spla.LinearOperator(K.shape, matvec=lambda v: v / K.diagonal())
+    rtol = 1e-10
+
+    def iters(x0):
+        c = [0]
+        spla.cg(K, b, x0=x0, rtol=rtol, maxiter=5000, M=Minv, callback=lambda _xk: c.__setitem__(0, c[0] + 1))
+        return c[0]
+
+    u_star = spla.spsolve(K.tocsc(), b)
+    pts = np.asarray(fem.points)
+    eps = 1e-2
+
+    smooth = np.sin(np.pi * pts[:, 0]) * np.sin(np.pi * pts[:, 1])
+    rough = np.random.default_rng(0).standard_normal(n)
+    scale = eps * np.linalg.norm(u_star)
+    x_smooth = u_star + scale * smooth / np.linalg.norm(smooth)
+    x_rough = u_star + scale * rough / np.linalg.norm(rough)
+    # same relative error, by construction -- so norm alone cannot explain any difference below
+    assert abs(np.linalg.norm(x_smooth - u_star) - np.linalg.norm(x_rough - u_star)) < 1e-12 * np.linalg.norm(u_star)
+
+    n_cold, n_smooth, n_rough = iters(np.zeros(n)), iters(x_smooth), iters(x_rough)
+
+    # the smooth guess pays roughly what the law says: log10(1/1e-2)/log10(1/1e-10) = 20%
+    predicted = np.log10(1 / eps) / np.log10(1 / rtol)
+    assert n_smooth < n_cold, f"a smooth {eps:g} guess should beat a cold start ({n_smooth} vs {n_cold})"
+    assert abs((1 - n_smooth / n_cold) - predicted) < 0.10, (
+        f"smooth saving {1 - n_smooth / n_cold:.2f} is far from the predicted {predicted:.2f}"
+    )
+    # the rough guess of the SAME norm buys nothing -- this is the claim that kills learned warm starts
+    assert n_rough >= 0.95 * n_cold, (
+        f"a rough {eps:g} guess bought {1 - n_rough / n_cold:.0%} of the iterations; the documented "
+        "claim is that it buys essentially nothing"
+    )
