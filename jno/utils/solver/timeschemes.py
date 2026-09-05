@@ -111,6 +111,105 @@ class _ExponentialScheme(_TimeScheme):
         return f"jno.solve.exponential(order={self.order}, mass={self.mass!r}, symmetric={self.symmetric})"
 
 
+class _BDF2Scheme(_TimeScheme):
+    """Second-order backward differentiation formula; see :func:`jno.solve.bdf2`.
+
+    ``(3u^{n+1} - 4u^n + u^{n-1}) / (2 dt) M + R(u^{n+1}) = 0``.
+
+    Implemented by REDUCTION rather than by a second stepper: scaled by ``2dt/3`` the BDF2 step is
+    *exactly* a backward-Euler step with step ``dt_eff = 2dt/3`` taken from the shifted state
+    ``u* = (4u^n - u^{n-1})/3``, landing at the same ``t + dt``::
+
+        (M + (2dt/3) A) u^{n+1} = M (4u^n - u^{n-1})/3 + (2dt/3)(c + f)
+
+    So it reuses :meth:`SemidiscreteTimeBlock.step` unchanged, and inherits everything that lives
+    there: the Dirichlet/DAE row handling, the solver-slot injection, the ``metadata["krylov"]``
+    complex path and the verified BiCGStab->GMRES rescue. Nothing is duplicated, so nothing can drift.
+
+    That scaling is also the correctness argument. The equation is never divided by the mass, so a
+    ZERO mass row survives it: a Dirichlet row reduces to ``u^{n+1}[d] = g`` (unconditionally --
+    cleaner than the theta-step's ``(g - (1-theta) u[d])/theta``), and a PRESSURE row of a saddle
+    system, whose mass block is structurally empty, reduces to the incompressibility constraint
+    evaluated at the new time.
+
+    **Startup** is one backward-Euler step taken outside the scan, so the scan keeps a static trip
+    count and no branch in its checkpointed body. BE's local error is O(dt^2), which is what a
+    second-order global rate needs.
+
+    Reference: Curtiss & Hirschfelder, *PNAS* **38** (1952) 235; Hairer & Wanner, *Solving Ordinary
+    Differential Equations II*, 2nd ed., Sec. V.1.
+    """
+
+    step_order = 2
+
+    def step_scales(self, block):
+        """The coefficients of ``A`` in every step operator this scheme forms: the full-``dt`` startup
+        step and the ``2dt/3`` BDF2 steps. Read at compose time so both are built eagerly."""
+        dt = float(block.dt)
+        return (dt, 2.0 * dt / 3.0)
+
+    def adaptive(self, **kwargs):
+        raise NotImplementedError(
+            "jno.solve.bdf2().adaptive(...) is not available: the adaptive controller sizes a ONE-step "
+            "method by step doubling, and BDF2 needs two previous states, so its step cannot be "
+            "re-sized that way (a multistep method wants a BDF2/BDF1 difference estimate instead). "
+            "Use jno.solve.theta(0.5).adaptive(...) for an adaptively-sized second-order march."
+        )
+
+    def integrate(self, block, args, save_ts, *, linear_solve=None, nonlinear_solve=None):
+        import jax
+        import jax.numpy as jnp
+
+        from .backend_blocks import _block_time_grid, _resample_trajectory
+
+        md = block.metadata or {}
+        if getattr(block, "mass_residual", None) is not None:
+            raise NotImplementedError(
+                "jno.solve.bdf2(): a state-dependent (nonlinear) transient mass `c(u)*u_t` is backward "
+                "Euler only -- its mass action is assembled as a residual against ONE previous state, so "
+                "there is nowhere for the second BDF2 level to enter. Use the default theta scheme."
+            )
+        if md.get("second_order"):
+            raise NotImplementedError(
+                "jno.solve.bdf2(): a second-order-in-time (u_tt) block is assembled with theta=1/2 "
+                "(trapezoidal) precisely because it must NOT be damped, and BDF2 is L-stable -- it "
+                "would damp an undamped wave silently. Use the block's own scheme, or "
+                "jno.solve.theta(0.5) explicitly."
+            )
+
+        s0 = block.state0_fn(args) if getattr(block, "state0_fn", None) is not None else block.state0
+        s0 = jnp.asarray(s0).reshape(-1)
+        dtype = s0.dtype
+        grid_ts = _block_time_grid(block)
+        dt = float(block.dt)
+
+        def _advance(u_prev, t_land, h):
+            """One implicit step landing at ``t_land`` from ``u_prev`` over an effective step ``h``."""
+            return block.step(
+                u_prev, t_land - h, h, args=args, theta=1.0, linear_solve=linear_solve, nonlinear_solve=nonlinear_solve
+            )
+
+        # Startup: plain backward Euler, OUTSIDE the scan.
+        s1 = _advance(s0, float(grid_ts[1]), dt)
+
+        dt_eff = 2.0 * dt / 3.0
+
+        def step(carry, t_next):
+            u_n, u_nm1 = carry
+            u_star = (4.0 * u_n - u_nm1) / 3.0
+            wn = _advance(u_star, t_next, dt_eff)
+            return (wn, u_n), wn
+
+        # Checkpointed for the same reason the theta march is: reverse mode would otherwise keep every
+        # step's internal Krylov/Newton residuals.
+        _, ys = jax.lax.scan(jax.checkpoint(step), (s1, s0), grid_ts[2:])
+        traj = jnp.concatenate([s0[None, :], s1[None, :], ys], axis=0)
+        return _resample_trajectory(traj, grid_ts, save_ts, dtype)
+
+    def __repr__(self):
+        return "jno.solve.bdf2()"
+
+
 class _AdaptiveScheme(_TimeScheme):
     """Step-size **policy** wrapping a base scheme — step-doubling (Richardson) error control on that
     scheme's implicit step, so it inherits the block's DAE handling and works for a linear or nonlinear

@@ -627,6 +627,29 @@ The same flag exists on `jno.core(...).solve(profile=True)` (see
     the repo's `.gitignore`, so the trace directory will show up as untracked.
 
 ## Transient problems
+
+### Time schemes — `fem.solve(time=…)`
+
+| Scheme | Order | Stability | Use |
+|---|---|---|---|
+| `jno.solve.theta(1.0)` | 1 | L-stable | the default — robust, damps everything |
+| `jno.solve.theta(0.5)` | 2 | A-stable only | smooth problems; **rings** on stiff modes |
+| `jno.solve.bdf2()` | 2 | **L-stable** | stiff / saddle-point systems — flow's workhorse |
+| `jno.solve.exponential()` | exact in time | unconditional | linear, autonomous blocks |
+| `…​.adaptive(rtol=…)` | wraps a one-step scheme | — | multi-rate transients |
+
+`bdf2` exists because `theta` cannot be second order *and* L-stable at once. Crank–Nicolson's
+amplification factor tends to `-1` for a stiff mode, so the mode does not decay — it alternates in
+sign. Measured on a heat problem whose initial condition is incompatible with its boundary (8 steps,
+`T = 0.5`, so the exact field is long dead): Crank–Nicolson reaches `min u = -1.00`, the *undecayed*
+initial amplitude with the sign flipped; BDF2 reaches `-0.023`. On a Navier–Stokes saddle system,
+where the pressure has no time derivative at all, that ringing is exactly what you do not want.
+
+The first BDF2 step is plain backward Euler — a multistep method has no second level to start from.
+Refused loudly rather than mis-integrated: a state-dependent mass `c(u)·u_t`, a second-order-in-time
+(`u_tt`) block (assembled at θ=½ *so that* it is not damped), and `.adaptive()` (step doubling sizes
+a one-step method).
+
  The slots configure the *per-step* solves of the default theta-method integrator:
 `linear`/`precond` see the step operator `M + θ·dt·A` — when it is time-independent the step matrix is
 formed **once** and the preconditioner materialized **once before the time loop** — and `nonlinear` drives

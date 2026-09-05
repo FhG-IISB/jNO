@@ -2262,7 +2262,7 @@ class FEM:
             from .utils.solver.backend_blocks import _default_transient_integrate
             from .utils.solver.solver_api import compose_transient_step_solvers
 
-            lin_s, nonlin_s = compose_transient_step_solvers(nonlinear, linear, precond, self, self._op)
+            lin_s, nonlin_s = compose_transient_step_solvers(nonlinear, linear, precond, self, self._op, time)
 
             def _stepper(block, args, save_ts):
                 if time is not None:  # jno.solve.theta(...) / jno.solve.exponential(...)

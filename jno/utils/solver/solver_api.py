@@ -973,7 +973,7 @@ def _add_step_operator(M, A, scale):
     return dense(M) + scale * dense(A)
 
 
-def compose_transient_step_solvers(nonlinear, linear, precond, fem, block):
+def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, scheme=None):
     """Compose the slots into per-step solvers for the transient integrator.
 
     Returns ``(linear_step_solve, nonlinear_step_solve)`` (one is ``None``), matching
@@ -1012,19 +1012,39 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block):
     if precond is not None:
         prepare_precond(precond, fem)
 
-    # constant-operator fast path: one step matrix, one preconditioner, reused by every step
-    static_op = None
-    static_M = None
-    if block.operator_fn is None and block.A is not None and block.dt is not None:
-        theta = float(block.metadata.get("theta", 1.0)) if block.metadata else 1.0
-        static_op = LinearOperator(_add_step_operator(block.M, block.A, theta * float(block.dt)))
-        if precond is not None:
-            static_M = materialize_precond(precond, PrecondContext(static_op, fem))
+    # Constant-operator fast path: one step matrix, one preconditioner, reused by every step -- and
+    # keyed by the step SCALE (the coefficient of A), because a scheme need not take the block's own
+    # theta*dt. BDF2 takes 2dt/3 after a full-dt startup step, so it uses two; building the block's
+    # default for both would silently solve the wrong system.
+    _static: dict = {}
+    _constant_operator = block.operator_fn is None and block.A is not None and block.dt is not None
+    _default_scale = (float(block.metadata.get("theta", 1.0)) if block.metadata else 1.0) * float(block.dt or 0.0)
 
-    def step_solve(matvec, rhs, x0, diag_fn):
-        if static_op is not None:
-            op, M = static_op, static_M
-        else:
+    def _build(key):
+        op = LinearOperator(_add_step_operator(block.M, block.A, key))
+        _static[key] = (op, materialize_precond(precond, PrecondContext(op, fem)) if precond is not None else None)
+
+    if _constant_operator:
+        # EAGERLY, outside any trace: an AMG/ILU setup needs a concrete matrix, and `step_solve` runs
+        # inside the march's scan. A scheme that takes a step other than the block's own theta*dt says
+        # so here (BDF2: a full-dt startup step, then 2dt/3), so every operator it will ask for is
+        # built now rather than discovered mid-trace.
+        _scales = getattr(scheme, "step_scales", None)
+        for _k in (_scales(block) if _scales is not None else ()) or (_default_scale,):
+            _build(float(_k))
+
+    def _static_for(scale):
+        if not _constant_operator:
+            return None, None
+        try:
+            key = float(scale) if scale is not None else _default_scale
+        except (TypeError, ValueError):
+            key = _default_scale  # a TRACED step size (an adaptive march): keep the previous behaviour
+        return _static.get(key) or _static.get(_default_scale) or (None, None)
+
+    def step_solve(matvec, rhs, x0, diag_fn, scale=None):
+        op, M = _static_for(scale)
+        if op is None:
             op = LinearOperator.from_matvec(matvec, diag_fn=diag_fn, shape=(rhs.shape[0], rhs.shape[0]))
             M = materialize_precond(precond, PrecondContext(op, fem)) if precond is not None else None
         if getattr(solver, "direct", False):

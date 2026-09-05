@@ -234,7 +234,7 @@ class SemidiscreteTimeBlock:
         The defaults above are overridable — this is where ``fem.solve``'s solver slots plug in
         (see ``jno.utils.solver.solver_api.compose_transient_step_solvers``):
 
-        * ``linear_solve(matvec, rhs, x0, diag_fn) -> x`` replaces the theta-step linear solve
+        * ``linear_solve(matvec, rhs, x0, diag_fn, scale=…) -> x`` replaces the theta-step linear solve
           (``matvec`` applies ``M + theta dt A``; ``diag_fn()`` is its exact diagonal; ``x0`` the
           previous state as warm start);
         * ``nonlinear_solve(G, u0) -> u`` replaces the per-step Newton solve.
@@ -345,7 +345,11 @@ class SemidiscreteTimeBlock:
         step_op = lambda wn: M @ wn + th * dt * (A @ wn)  # noqa: E731  the theta-method step operator
         if linear_solve is not None:
             # slot-composed per-step solve; the exact step diagonal keeps jacobi-type specs exact
-            return linear_solve(step_op, rhs, u, lambda: matrix_diagonal(M) + th * dt * matrix_diagonal(A))
+            # ``scale`` is the coefficient of A in the step operator (M + scale*A). A scheme may take a
+            # step that is not the block's own theta*dt -- BDF2 uses 2dt/3, and an adaptive march
+            # re-sizes dt every step -- and the composed solver needs it to build the RIGHT operator
+            # rather than the block's default one.
+            return linear_solve(step_op, rhs, u, lambda: matrix_diagonal(M) + th * dt * matrix_diagonal(A), scale=th * dt)
         # diagonal (Jacobi) preconditioner 1/diag(M + theta dt A); zero diagonals left unscaled
         d = matrix_diagonal(M) + th * dt * matrix_diagonal(A)
         inv = 1.0 / jnp.where(jnp.abs(d) > 1e-30, d, 1.0)
@@ -494,7 +498,6 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
     """
     import jax
     import jax.numpy as jnp
-    import numpy as np
 
     _s0f = getattr(block, "state0_fn", None)  # parametric initial state (net-valued IC): re-form from args
     s0 = jnp.asarray(_s0f(args) if _s0f is not None else block.state0).reshape(-1)
@@ -528,6 +531,15 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
     _, ys = jax.lax.scan(jax.checkpoint(step), s0, grid_ts[1:])
 
     traj = jnp.concatenate([s0[None, :], ys], axis=0)  # (n_grid, n_dofs) at grid_ts
+    return _resample_trajectory(traj, grid_ts, save_ts, dtype)
+
+
+def _resample_trajectory(traj, grid_ts, save_ts, dtype):
+    """Sample a march's own-grid trajectory at ``save_ts``. Shared by every scheme's ``integrate``,
+    so they cannot drift apart on the fast path or the clamping convention."""
+    import jax.numpy as jnp
+    import numpy as np
+
     save_ts = jnp.asarray(save_ts, dtype)
 
     # The DEFAULT save_ts is the block's own grid (``solve`` fills it from ``_block_time_grid``), so
