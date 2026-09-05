@@ -827,7 +827,7 @@ def assemble_fem_native(
     # Interpolation-cover enrichment (space="cover"): each node carries its value plus `M` cover
     # coefficients, so the field's DOF nodes are the mesh nodes REPEATED (1+M) times. That keeps the
     # global map `offs + node*vec + comp` and the rectangular `cells_f` intact -- every formula below
-    # is unchanged -- at the cost of allocating the slots everywhere (docs/fem.md, Known limitations).
+    # is unchanged -- at the cost of allocating the slots everywhere (docs/fem/limitations.md).
     # Scope limits are raised here rather than discovered downstream.
     _cover = [str(f.get("space", "") or "").lower() == "cover" for f in fields]
     if any(_cover):
