@@ -750,7 +750,6 @@ class _LSC(_Spec):
         """
         import numpy as _np
 
-        from .utils.solver.mass import lumped_diagonal
         from .utils.solver.solver_api import PrecondContext as _Ctx
 
         dom = fem.domain
@@ -769,7 +768,11 @@ class _LSC(_Spec):
             except Exception:  # noqa: BLE001 -- a mismatched order can fail in several ways
                 continue
             if op.shape is not None and int(op.shape[0]) == int(n_u):
-                d = _np.asarray(lumped_diagonal(op.bcoo if op.bcoo is not None else op.dense()))
+                # The lump is a ROW SUM, so take it as a matvec against ones. The obvious
+                # `lumped_diagonal(op.dense())` fallback densifies an n_u x n_u operator -- 1.74 GB at
+                # 14,739 velocity dofs, which is what made this the memory wall of the whole iterative
+                # path while every other stage stayed sparse.
+                d = _np.asarray(op @ jnp.ones((int(n_u),), dtype=jnp.float64))
                 return _np.where(_np.abs(d) > 1e-30, d, 1.0)
         raise NotImplementedError(
             f"jno.precond.lsc(): could not build a velocity mass matching the {n_u}-dof momentum block "

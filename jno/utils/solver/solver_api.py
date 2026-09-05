@@ -532,7 +532,17 @@ class PrecondContext:
                     "PrecondContext.assemble: a complex auxiliary form with periodic ties is not supported "
                     "(the outer P-reduction is not mirrored onto the preconditioner block)."
                 )
-
+        if aux.is_complex:
+            return LinearOperator(_bcoo(aux.A))  # the fused 2n real-equivalent block IS `.A`
+        # `.A` is DOCUMENTED dense ("use fem.operator for the raw sparse form on large problems"), so
+        # reaching for it here cost n^2 on every auxiliary -- 1.74 GB for a velocity-space mass at
+        # 14,739 dofs, which is a preconditioner running out of memory doing the one thing it exists
+        # to avoid. Take the sparse operator and only fall back to the dense property.
+        raw = getattr(aux, "operator", None)
+        if raw is not None:
+            A_raw = raw.evaluate(None)[0] if hasattr(raw, "evaluate") else (raw[0] if isinstance(raw, tuple) else raw)
+            if hasattr(A_raw, "indices"):  # already a BCOO -- keep it sparse end to end
+                return LinearOperator(A_raw)
         return LinearOperator(_bcoo(aux.A))
 
 

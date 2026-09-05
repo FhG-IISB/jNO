@@ -196,3 +196,18 @@ def test_a_user_written_schur_solves_the_saddle_system():
     )
     rel = float(np.linalg.norm(got - ref) / max(np.linalg.norm(ref), 1e-30))
     assert rel < 5e-3, f"a preconditioner changes speed, never the answer (rel {rel:.2e})"
+
+
+def test_an_auxiliary_form_is_assembled_sparse():
+    """`PrecondContext.assemble` reached for `fem.A`, which is DOCUMENTED dense ("use fem.operator for
+    the raw sparse form on large problems"). So every auxiliary cost n^2 -- measured at 1.74 GB for a
+    velocity-space mass at 14,739 dofs, i.e. a preconditioner running out of memory doing the one
+    thing it exists to avoid. It was the memory wall of the whole iterative path while every other
+    stage stayed sparse.
+
+    A mass matrix has O(n) entries; anything near n^2 means the dense path came back."""
+    fem, ui, vi, _xi, _yi = _poisson(mesh_size=0.12)
+    op = PrecondContext(None, fem).assemble([ui * vi])
+    assert op.bcoo is not None, "the auxiliary must be sparse, not a densified array"
+    n = int(op.shape[0])
+    assert int(op.bcoo.nse) < 40 * n, f"{op.bcoo.nse} entries for an {n}-dof mass is not sparse"

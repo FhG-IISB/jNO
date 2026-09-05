@@ -182,6 +182,40 @@ fem.solve(linear=jno.solve.fgmres(tol=1e-10, restart=40),
     only** — the sketch takes a Cholesky, so an indefinite operator gives NaN rather than a quiet wrong
     answer.
 
+### The momentum block: Picard, not Newton
+
+A block preconditioner needs an approximate `F⁻¹` on the momentum block, and which **linearisation**
+you pick decides whether one exists. The full Newton tangent carries the reaction term `(δu·∇)u`,
+which is indefinite — measured on a lid-driven cavity, the smallest eigenvalue of its symmetric part
+goes negative by Re = 100:
+
+| Re = 100 | min eig of sym(F) | AMG on that block |
+|---|---|---|
+| Newton tangent | **−6.4e-04** | rel-resid 1.2e-03, diverges by Re = 400 |
+| **Picard / Oseen** (`jno.lag` on the convecting velocity) | **+8.5e-04** | **6.5e-11** |
+
+Smoothed aggregation assumes a positive diagonal, so on the Newton tangent it builds a degenerate
+hierarchy — `jno.precond.amg()` now refuses that by name rather than returning a V-cycle that
+silently does nothing. Lag the convecting velocity and the block is definite and AMG-friendly. This
+is why the Navier–Stokes preconditioning literature builds on Picard.
+
+### Does it scale?
+
+3-D Stokes, lid-driven cube, `lu(backend="host")` against
+`fgmres + triangular((u, amg()), (p, lsc()))`, one 8 GB card:
+
+| DOFs | direct | iterative | |
+|---|---|---|---|
+| 15,468 | 2.1 s | 2.9 s | direct still wins |
+| 29,114 | 11.5 s | 4.6 s | 2.5× |
+| 49,072 | 53.3 s | 6.5 s | 8.2× |
+| 76,542 | 166.4 s | 11.4 s | **14.6×** |
+| 112,724 | 431.3 s | 52.0 s | 8.3× |
+
+The crossover is around 15–20k DOFs. Note what the direct solve is *not* doing: it does not run out of
+memory — it scales as roughly `O(N³)` in time and simply loses. Below the crossover it is the right
+choice and stays the default.
+
 ### When the pressure mass is not enough
 
 `saddle()`'s pressure-mass Schur approximation stands in for the Schur complement of a **viscous**
