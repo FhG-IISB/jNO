@@ -245,3 +245,38 @@ def test_lsc_never_densifies_the_operator():
         blk = getattr(spec, name)
         assert hasattr(blk, "nse"), f"{name} is not sparse"
         assert int(blk.nse) < n * n / 4, f"{name} carries {blk.nse} entries for an {n}-dof system"
+
+
+def test_lsc_finds_the_momentum_block_in_a_three_field_system():
+    """Generality: the momentum block is the one the constraint COUPLES to, read off the operator --
+    not "the other one". A Boussinesq-style system carries a third field (temperature) and the
+    commutator still applies to the velocity/pressure pair."""
+    pytest.importorskip("shapely", reason="shapely required for the box domain")
+    from shapely.geometry import box
+
+    d = jno.domain(box(0.0, 0.0, 2.0, 1.0), mesh_size=0.4)
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)
+    p, q = d.fem_symbols(names=("p", "q"), order=1)
+    T, S = d.fem_symbols(names=("T", "S"), order=1)
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    gu, gv = grad(u, [xi, yi]), grad(v, [xi, yi])
+    pp, qq = p.bind(x=xi, y=yi), q.bind(x=xi, y=yi)
+    Ti, Si = T.bind(x=xi, y=yi), S.bind(x=xi, y=yi)
+    fem = jno.fem(
+        [
+            inner_(gu, gv, n_contract=2) - pp * trace(gv) + Ti * v.bind(x=xi, y=yi)[1],  # buoyancy
+            -qq * trace(gu),
+            Ti.x * Si.x + Ti.y * Si.y,
+            u(xb, yb)[0] - yb * (1 - yb),
+            u(xb, yb)[1] - 0.0,
+            T(xb, yb) - 0.0,
+            p.pin(),
+        ]
+    )
+    assert len(fem.blocks) == 3, "this fixture must actually have three fields"
+    spec = jno.precond.lsc()
+    spec.prepare(fem)
+    _s_u, _s_p, iu, ip = spec._blocks
+    assert ip == fem.block_index(p), "the constraint block must be the pressure"
+    assert iu == fem.block_index(u), f"the momentum block must be the velocity, got block {iu}"

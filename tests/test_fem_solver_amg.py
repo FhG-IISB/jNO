@@ -183,3 +183,26 @@ def test_two_amg_hierarchies_do_not_share_a_compilation():
         ref = np.asarray(fem.solve(linear=jno.solve.lu()))
         got = np.asarray(fem.solve(linear=jno.solve.cg(tol=1e-10, maxiter=5000), precond=spec))
         assert np.abs(got - ref).max() < 1e-8
+
+
+def test_amg_refuses_an_indefinite_operator_instead_of_building_a_dead_hierarchy():
+    """Smoothed aggregation assumes a POSITIVE diagonal -- its strength-of-connection graph and its
+    smoothers both do. Handed an operator with negative diagonal entries it does not fail: it builds a
+    degenerate hierarchy whose coarsest operator is NaN, or exactly zero. A zero coarse matrix has a
+    perfectly good pseudo-inverse, so the V-cycle silently contributes nothing and the only symptom is
+    an outer Krylov that converges slowly for no visible reason.
+
+    Measured on the velocity block of a Navier-Stokes Newton tangent: 213 of 538 diagonal entries
+    negative, coarse operator all zeros. Notably this is NOT about non-symmetry (that block is 1.9%
+    non-symmetric), nor about Reynolds number, nor about the field being vector-valued -- AMG handles
+    vector elasticity to 1e-11.
+    """
+    pytest.importorskip("pyamg")
+    import numpy as _np
+
+    n = 40
+    A = _np.diag(2.0 * _np.ones(n)) - _np.diag(_np.ones(n - 1), 1) - _np.diag(_np.ones(n - 1), -1)
+    A[: n // 2] *= -1.0  # flip half the rows -> half the diagonal goes negative
+    spec = jno.precond.amg()
+    with pytest.raises(ValueError, match="negative diagonal"):
+        spec.build(A)

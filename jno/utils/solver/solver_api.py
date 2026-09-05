@@ -1208,7 +1208,9 @@ def run_continuation(fem, spec, *, nonlinear=None, linear=None, precond=None, x0
 
     seqs = {k: np.asarray(v) for k, v in spec.params.items()}
     lengths = {k: int(s.shape[0]) if s.ndim else -1 for k, s in seqs.items()}
-    if -1 in lengths.values() or len(set(lengths.values())) != 1:
+    # `>= 1` is not decoration: with an EMPTY sequence every length agrees (they are all 0), the march
+    # loop below never runs, and the return hit an unbound local instead of saying what was wrong.
+    if -1 in lengths.values() or len(set(lengths.values())) != 1 or next(iter(lengths.values()), 0) < 1:
         raise ValueError(
             f"jno.solve.continuation(): all parameter sequences must share one length >= 1; got "
             f"{ {k: (int(s.shape[0]) if s.ndim else 'scalar') for k, s in seqs.items()} }."

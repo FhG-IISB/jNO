@@ -730,9 +730,10 @@ class _LSC(_Spec):
     Elman, Silvester & Wathen, *Finite Elements and Fast Iterative Solvers*, 2nd ed., OUP 2014, §9.2.
     """
 
-    def __init__(self, inner_solver=None, scaled: bool = True):
+    def __init__(self, inner_solver=None, scaled: bool = True, velocity=None):
         self.inner = inner_solver
         self.scaled = bool(scaled)
+        self.velocity = velocity  # None -> found from the operator's coupling
         self._p_apply = None  # v -> (B M^-1 B^T)^-1 v
         self._minv = None  # the velocity mass lump, inverted
         self._blocks = None  # (velocity slice, pressure slice, iu, ip)
@@ -839,17 +840,56 @@ class _LSC(_Spec):
         p_op = LinearOperator(P)
         self._p_apply = lambda v: _as_precond(solver, p_op, v)
 
+    @staticmethod
+    def _coupled_block(fem, ip):
+        """The block the constraint field actually couples to -- the momentum block.
+
+        Read from the assembled operator (which off-diagonal row-block of the constraint carries
+        entries), not assumed to be "the other one", so a system with more than two fields still
+        resolves. Ties are broken by entry count, which is the divergence coupling by construction.
+        """
+        import numpy as _np
+
+        from .utils.solver.solver_api import _slice_bcoo
+
+        A = _fem_concrete_operator(fem) if fem.is_linear else fem._op.jacobian(_np.zeros(fem.dofs))
+        A = A.bcoo if getattr(A, "bcoo", None) is not None else A
+        blocks = fem.blocks
+        if len(blocks) == 2:
+            return 1 - ip
+        best, best_nnz = None, 0
+        for j in range(len(blocks)):
+            if j == ip:
+                continue
+            blk = _slice_bcoo(A, blocks[ip], blocks[j])
+            nnz = 0 if blk is None else int(_np.count_nonzero(_np.asarray(blk.data)))
+            if nnz > best_nnz:
+                best, best_nnz = j, nnz
+        if best is None:
+            raise NotImplementedError(
+                "jno.precond.lsc(): the constraint block couples to no other field, so there is no "
+                "momentum block to build the commutator from. Name it explicitly: lsc(velocity=u)."
+            )
+        return best
+
     def prepare(self, fem):
         idx = tuple(getattr(fem, "_saddle_block_indices", ()) or ())
         blocks = fem.blocks
-        if len(idx) != 1 or len(blocks) != 2:
+        if len(idx) != 1:
             raise NotImplementedError(
-                "jno.precond.lsc(): expects exactly one constraint block and one momentum block "
-                f"(this system has {len(blocks)} blocks, {len(idx)} of them constraints). The "
-                "commutator argument is written for the velocity/pressure pair."
+                "jno.precond.lsc(): the commutator argument is written for ONE constraint field "
+                f"(this system has {len(idx)}). Compose per constraint with "
+                "jno.precond.triangular((field, spec), ...) instead."
             )
         ip = int(idx[0])
-        iu = 1 - ip
+        # The momentum block is the one the constraint COUPLES to, found from the operator rather than
+        # assumed to be "the other one" -- a Boussinesq system (u, p, T) has three fields and the
+        # commutator still applies to the velocity/pressure pair.
+        iu = self.velocity if self.velocity is not None else self._coupled_block(fem, ip)
+        if isinstance(iu, int):
+            pass
+        else:
+            iu = fem.block_index(iu)
         self._blocks = (blocks[iu], blocks[ip], iu, ip)
         self._capture(fem)
 
@@ -899,7 +939,7 @@ class _LSC(_Spec):
         return f"jno.precond.lsc(scaled={self.scaled})"
 
 
-def lsc(*, inner=None, scaled: bool = True) -> _LSC:
+def lsc(*, inner=None, scaled: bool = True, velocity=None) -> _LSC:
     """**Least-squares commutator** Schur-complement approximation — the convection-aware one.
 
     ``S^-1 ~ (B M^-1 B^T)^-1 (B M^-1 F M^-1 B^T) (B M^-1 B^T)^-1``, where ``B`` is the discrete
@@ -927,7 +967,7 @@ def lsc(*, inner=None, scaled: bool = True) -> _LSC:
 
     Reference: Elman, Howle, Shadid, Shuttleworth & Tuminaro, *J. Comput. Phys.* **227** (2008) 1790.
     """
-    return _LSC(inner, scaled)
+    return _LSC(inner, scaled, velocity)
 
 
 class _Saddle(_Spec):
@@ -994,7 +1034,7 @@ class _Saddle(_Spec):
         # preconditioner a fixed linear operator -- an inexact inner solve would make it vary between
         # applications, which a non-flexible Krylov method (gmres) is not allowed to see.
         if self.schur == "lsc":
-            schur = _LSC(None, True)
+            schur = _LSC(None, True, None)
             schur.prepare(fem)
         elif self.laplace_weight is None:
             ui, vi, _axes = _fe_symbols_bound(fem.domain)

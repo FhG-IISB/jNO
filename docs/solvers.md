@@ -207,6 +207,29 @@ and every Newton step; only `F` varies, and it is only ever applied.
     mass approximation degrades. Read the table as a resolved-discretisation result, not an
     unconditional one.
 
+### PCD, and what still blocks it
+
+The other convection-aware Schur approximation is **PCD** (Kay, Loghin & Wathen 2002),
+`S⁻¹ ≈ A_p⁻¹ F_p M_p⁻¹`. Unlike LSC every factor *is* a weak form, so with the spec algebra it would
+be user-written math needing no library support:
+
+```python
+pcd = Ap @ Fp @ Mp          # Ap, Mp: form([...]);  Fp: form([...], inner=False)
+```
+
+Two of the three assemble today. `F_p = ν(∇p,∇q) + (u·∇p, q)` does not, because it needs the lagged
+**velocity as a coefficient field on the pressure space**, and every route to that currently fails:
+
+| route | outcome |
+|---|---|
+| `u.bind(...).freeze(values)` — a known field from the velocity space | `KeyError` — the auxiliary form's only unknown is pressure, so the velocity field is not in its field registry |
+| `jno.np.parameter(<P1 symbol>).initialize(...).freeze()` on the pressure space | assembles, but the coefficient is not gathered per cell: shapes `(n_p,)` against `(3,)` |
+| `grad(sym, [x, y])` on fresh auxiliary symbols | shape mismatch; the component spelling `ai.x * bi.x` works and is the one to use |
+
+So PCD is blocked on field-valued coefficients in an auxiliary form — the same gap that blocks a
+lagged eddy viscosity and a reusable wall-distance field. `lsc()` needs none of it, which is why it
+landed first.
+
 ### Preconditioners compose like the operators they stand for
 
 A materialized spec **is** a linear map `v ↦ M⁻¹v`, so the classical physics-based Schur
