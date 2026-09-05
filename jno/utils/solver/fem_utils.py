@@ -3008,6 +3008,10 @@ def interface_gap_data(
     m_facets: np.ndarray,
     points: np.ndarray,
     secondary_normals: np.ndarray,
+    *,
+    capture: float | None = None,
+    exclude_nodes=None,
+    main_normals=None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Everything a signed contact gap needs, precomputed on the host: ``(ids, w, g0)``.
 
@@ -3041,10 +3045,17 @@ def interface_gap_data(
     projection, and accepting them while ignoring them would be worse than removing them. A flat
     interface is unaffected -- the trace agrees to 1.4e-15 and ``g0`` bit-exactly.
 
-    Host/NumPy: locating each point on the main face is a discrete search, frozen at build time. So
-    the gap is differentiable in the DOF values but **not** in the mesh coordinates -- shape-optimising
-    through a contact gap would need the projection re-derived in JAX. It also assumes **small
-    sliding**: the pairing is fixed, so a caller that slides must rebuild it per load step.
+    ``capture`` and ``exclude_nodes`` pass straight to :func:`~.contact_search.project_points`:
+    a finite ``capture`` makes a far-away query **inactive** (slot kept, ``w = 0``, ``g0 = OPEN_GAP``)
+    instead of clamping it to the nearest facet however distant, and ``exclude_nodes`` keeps a facet
+    from pairing with its own neighbours. Both are what a re-running search needs and neither changes
+    the build-time defaults, which stay unbounded and unfiltered.
+
+    Host/NumPy: locating each point on the main face is a discrete search. So the gap is differentiable
+    in the DOF values but **not** in the mesh coordinates -- shape-optimising through a contact gap
+    would need the projection re-derived in JAX. Called once at build time the pairing is **frozen**,
+    which assumes **small sliding**; ``fem.solve(contact=...)`` calls it again per round from the
+    deformed configuration, which is what lifts that assumption.
     """
     from .contact_search import project_points  # deferred: contact_search imports this module's shapes
 
@@ -3055,6 +3066,9 @@ def interface_gap_data(
         m_facets,
         points,
         np.asarray(secondary_normals, dtype=float).reshape(-1, q.shape[-1]),
+        capture=capture,
+        exclude_nodes=exclude_nodes,
+        main_normals=main_normals,
     )
     return ids.reshape(*lead, -1), w.reshape(*lead, -1), g0.reshape(*lead)
 

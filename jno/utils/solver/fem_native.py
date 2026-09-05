@@ -1470,9 +1470,159 @@ def assemble_fem_native(
     # separation (`g0`). At solve time the moving part is a plain gather, so the gap is differentiable
     # in the DOFs; the pairing itself is frozen, which is what limits this to SMALL SLIDING.
     _gap_tables: Dict[str, dict] = {}
+    _gap_geom: Dict[str, dict] = {}  # per-pair inputs a re-pairing needs; see `_pair_at`
     _contact_pairs = dict(getattr(domain, "_contact_pairs", {}) or {})
-    if _contact_pairs and conn.n_bfaces > 0:
+
+    from .contact_search import OPEN_GAP
+
+    def _adjacency_ring(sf, mfaces):
+        """For each secondary facet, the node ids it may NOT pair against — its own, and its neighbours'.
+
+        Self-contact only. Without this every facet contacts the facet next to it: they share a node, so
+        the separation between them is exactly zero and the search reports the surface in contact with
+        itself everywhere. One ring is the smallest exclusion that removes that and still lets a fold
+        close, because the two sides of a fold are many facets apart along the surface.
+        """
+        fn = np.asarray(conn.face_nodes, dtype=np.int64)
+        mfn = fn[mfaces]
+        touch: Dict[int, list] = {}
+        for j, row in enumerate(mfn):
+            for nd in row:
+                touch.setdefault(int(nd), []).append(j)
+        out = []
+        for row in fn[sf]:
+            ex = {int(x) for x in row}
+            for nd in row:
+                for j in touch.get(int(nd), ()):
+                    ex.update(int(x) for x in mfn[j])
+            out.append(np.fromiter(sorted(ex), dtype=np.int64))
+        return out
+
+    def _facet_normals_np(pts, faces):
+        """Unit outward facet normals from a (possibly deformed) point set, oriented like the reference.
+
+        The reference orientation is the arbiter of sign: a facet's own cross product flips with node
+        order, and a normal that flips mid-solve turns a gap into a penetration without any error.
+        """
+        fn = np.asarray(conn.face_nodes)[faces]
+        if dim == 2:
+            e = pts[fn[:, 1]] - pts[fn[:, 0]]
+            n = np.stack([e[:, 1], -e[:, 0]], axis=-1)
+        else:
+            n = np.cross(pts[fn[:, 1]] - pts[fn[:, 0]], pts[fn[:, 2]] - pts[fn[:, 0]])
+        n = n / np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-300)
+        ref = np.asarray(normals_np)[faces][:, :dim]
+        return n * np.sign(np.sum(n * ref, axis=1, keepdims=True) + 1e-300)
+
+    def _pair_at(_key, disp, capture=None):  # noqa: C901
+        """``(ids, w, g0)`` for one contact pair at a configuration: ``None`` = reference, else ``x+u``.
+
+        This is the whole of the contact search. Everything else about a gap -- which facets are
+        secondary, which field it reads -- is fixed by the declaration; re-pairing means calling this
+        again with the current displacement, which is what ``fem.solve(contact=...)`` does between
+        rounds. Frozen at the reference configuration it is valid only while displacements are far
+        below the element size.
+        """
         from .fem_utils import interface_gap_data
+
+        g = _gap_geom[_key]
+
+        def _qp(pp):
+            """Physical quadrature points of each secondary face, formed exactly as `_surf_elem_res` does."""
+            verts = pp[np.asarray(cells_f_all[g["fidx"]])[g["pc"]][:, : dim + 1]]
+            J = np.stack([verts[:, i + 1] - verts[:, 0] for i in range(dim)], axis=-1)  # (n_s, dim, dim)
+            return verts[:, 0][:, None, :] + np.einsum("fqd,fDd->fqD", g["fp_qp"][g["lk"]], J)
+
+        ref = np.asarray(pts_f_all[g["fidx"]], dtype=float)
+        pts = ref
+        if disp is not None:
+            pts = ref.copy()
+            pts[:, :dim] += np.asarray(disp)[:, :dim]
+        xq = _qp(pts)
+        # The secondary normals move with the body, so a re-pairing that kept the REFERENCE normals
+        # would measure the gap along a direction the surface no longer has -- the error grows exactly
+        # where the search matters, at large rotation.
+        nrm = _facet_normals_np(pts, g["sf"]) if disp is not None else np.asarray(normals_np)[g["sf"]][:, :dim]
+        nrm = np.broadcast_to(nrm[:, None, :], xq[..., : nrm.shape[-1]].shape)
+        exc, mnrm = g["exclude"], None
+        if exc is not None:  # self-contact: one entry per FLATTENED query, facet-major like `xq`
+            exc = [exc[i] for i in range(xq.shape[0]) for _ in range(xq.shape[1])]
+            mnrm = _facet_normals_np(pts, g["mfaces"])
+        ids, w, g0 = interface_gap_data(
+            xq, g["mf"], pts, nrm, capture=capture, exclude_nodes=exc, main_normals=mnrm
+        )
+        if disp is not None:
+            # `g0` is what the residual STARTS from, and it then subtracts `n . D(u)` with `u` measured
+            # from the REFERENCE configuration. Taking g0 from the deformed frame would subtract that
+            # displacement a second time, so the gap would read roughly double and contact would never
+            # close. Re-evaluate the SAME definition, `g0 = n . (Phi(x_s) - x_s)`, on reference
+            # coordinates using the pairing and the normal just found in the deformed one: then
+            # `g0 - n . D(u*)` reproduces the measured deformed gap exactly, and stays right as u moves.
+            xq_ref = _qp(ref)
+            phi_ref = np.einsum("sqk,sqkd->sqd", w, ref[ids][..., :dim])
+            g0_ref = np.einsum("sqd,sqd->sq", nrm, phi_ref - xq_ref[..., :dim])
+            # An INACTIVE slot (nothing within `capture`) carries `w = 0`, so `phi_ref` collapses to the
+            # ORIGIN and the formula above would return `-n . x_q` -- a fabricated penetration the size
+            # of the body, which a penalty reads as an enormous contact force. Keep such a slot open.
+            g0 = np.where(w.sum(axis=-1) > 0.0, g0_ref, OPEN_GAP)
+        return ids, w, g0
+
+    def _capture_default(_key):
+        """A search radius from the LOCAL facet size, because a literal is wrong at every scale but one.
+
+        Three times the mean secondary facet diameter: wide enough that a point still finds the facet it
+        is about to touch after a step, narrow enough that it cannot pair with the far side of the body.
+        A caller who knows the closing distance passes ``capture=`` instead.
+        """
+        g = _gap_geom[_key]
+        V = np.asarray(pts_f_all[g["fidx"]], dtype=float)[np.asarray(conn.face_nodes)[g["sf"]]]
+        return 3.0 * float(np.mean(np.linalg.norm(V.max(axis=1) - V.min(axis=1), axis=-1)))
+
+    def _repair_contact(u_flat, capture=None):
+        """Re-pair every declared gap from the deformed configuration ``x + u``.
+
+        Returns the ``args["__gap_tables__"]`` payload -- only the entries a pairing owns, so the shapes
+        never move. This is the host-side search that ``fem.solve(contact=...)`` runs between rounds.
+        ``capture=None`` derives the search radius per pair from the local facet size.
+        """
+        out = {}
+        for _key, g in _gap_geom.items():
+            fidx = g["fidx"]
+            vt, n_nodes = vecs[fidx], int(np.asarray(pts_f_all[fidx]).shape[0])
+            un = np.asarray(u_flat).reshape(-1)[offs[fidx] : offs[fidx] + n_nodes * vt].reshape(n_nodes, vt)
+            disp = np.zeros((n_nodes, dim))
+            disp[:, : min(vt, dim)] = un[:, : min(vt, dim)]
+            cap = float(capture) if capture is not None else _capture_default(_key)
+            ids, w, g0 = _pair_at(_key, disp, capture=cap)
+            if not int(np.sum(np.asarray(g0) < 0.5 * OPEN_GAP)):
+                raise ValueError(
+                    "fem.solve(contact=...): re-pairing u.gap({!r}, {!r}) left every one of {} secondary "
+                    "quadrature points outside the search radius {:.4g}, so the surfaces would read as "
+                    "open everywhere and the contact term would contribute nothing. The bodies are "
+                    "further apart than the search looks -- pass an explicit `capture=` covering the "
+                    "closing distance.".format(g["secondary"], g["main"], np.asarray(g0).size, cap)
+                )
+            sf = g["sf"]
+            ids_full = np.zeros((conn.n_bfaces,) + np.asarray(ids).shape[1:], dtype=np.int64)
+            w_full = np.zeros((conn.n_bfaces,) + np.asarray(w).shape[1:])
+            g0_full = np.zeros((conn.n_bfaces, np.asarray(g0).shape[1]))
+            ids_full[sf], w_full[sf], g0_full[sf] = ids, w, g0
+            out[_key] = {
+                "ids": jnp.asarray(ids, dtype=jnp.int32),
+                "w": jnp.asarray(w),
+                "ids_full": jnp.asarray(ids_full, dtype=jnp.int32),
+                "w_full": jnp.asarray(w_full),
+                "g0_full": jnp.asarray(g0_full),
+                # The `_full` arrays are scattered up to ALL boundary faces and are ZERO off the
+                # secondary ones, so a caller reading a gap out of them would count padding as perfect
+                # contact. `g0` and `faces` carry the same numbers on the secondary faces alone, which
+                # is what an inspecting caller (and the driver's own reporting) should read.
+                "g0": jnp.asarray(g0),
+                "faces": jnp.asarray(sf, dtype=jnp.int32),
+            }
+        return out
+
+    if _contact_pairs and conn.n_bfaces > 0:
 
         for _key, (_secondary, _main, _fkey) in _contact_pairs.items():
             _fidx = field_index.get(_fkey)
@@ -1487,15 +1637,17 @@ def assemble_fem_native(
                 )
             if _fidx is None:  # the gap's field is not in this system -> nothing to pack
                 continue
+            _mains = _main if isinstance(_main, tuple) else (_main,)
+            _selfc = _secondary in _mains  # self-contact: a surface searching against itself
             _sf = np.asarray(_region_faces(_secondary), dtype=np.int32)
-            _mfaces = np.asarray(_region_faces(_main), dtype=np.int32)
+            _mfaces = np.unique(np.concatenate([np.asarray(_region_faces(m), dtype=np.int32) for m in _mains]))
             _mf = np.asarray(conn.face_nodes, dtype=np.int64)[_mfaces]
             if _sf.size == 0 or _mf.size == 0:
                 raise ValueError(
                     f"u.gap({_secondary!r}, {_main!r}): found {_sf.size} secondary and {len(_mf)} main boundary "
                     "facets. Both faces must select whole boundary facets -- check the tag predicates."
                 )
-            if np.intersect1d(_sf, _mfaces).size:
+            if not _selfc and np.intersect1d(_sf, _mfaces).size:
                 # The two sides must be DISJOINT facet sets. They are not when a tag resolves through a
                 # coordinate predicate, because the two sides of a non-conforming interface are
                 # coincident -- the gap would then project the secondary face onto itself and read g0 == 0
@@ -1509,11 +1661,10 @@ def assemble_fem_native(
             # Physical quadrature points of each secondary face, formed exactly as `_surf_elem_res` does.
             _fp_qp = np.asarray(face_tables_per_field[_fidx][2])  # (n_faces_local, n_q, dim)
             _pc, _lk = np.asarray(conn.parent_cell)[_sf], np.asarray(conn.local_face)[_sf]
-            _verts = np.asarray(pts_f_all[_fidx])[np.asarray(cells_f_all[_fidx])[_pc][:, : dim + 1]]
-            _J = np.stack([_verts[:, i + 1] - _verts[:, 0] for i in range(dim)], axis=-1)  # (n_s, dim, dim)
-            _xq = _verts[:, 0][:, None, :] + np.einsum("fqd,fDd->fqD", _fp_qp[_lk], _J)
-            _nrm = np.broadcast_to(np.asarray(normals_np)[_sf][:, None, :], _xq.shape)
-            _ids, _w, _g0 = interface_gap_data(_xq, _mf, np.asarray(pts_f_all[_fidx]), _nrm)
+            _gap_geom[_key] = {"sf": _sf, "mf": _mf, "mfaces": _mfaces, "fidx": _fidx, "pc": _pc, "lk": _lk,
+                               "fp_qp": _fp_qp, "secondary": _secondary, "main": _main, "mains": _mains,
+                               "exclude": _adjacency_ring(_sf, _mfaces) if _selfc else None}
+            _ids, _w, _g0 = _pair_at(_key, None)
             _g0_full = np.zeros((conn.n_bfaces, np.asarray(_g0).shape[1]))
             _g0_full[_sf] = np.asarray(_g0)
             # Scattered up to ALL boundary faces for the same reason ``_gap_gather`` does it: a term's
@@ -1853,7 +2004,22 @@ def assemble_fem_native(
             )
         return out
 
-    def _gap_gather(u_flat, key):
+    # Which entries of a gap table a re-pairing may replace. `faces` (which facets are secondary),
+    # `field` and `secondary` are properties of the DECLARATION and never move; everything else is the
+    # pairing itself -- which main nodes each quadrature point reads, with what weights, at what initial
+    # separation -- and that is exactly what `fem.solve(contact=...)` recomputes from the deformed
+    # configuration. Threading the values (rather than rebuilding the operator) keeps the shapes fixed,
+    # so a re-paired round reuses the compiled residual instead of retracing it.
+    _GAP_REPAIRED = ("ids", "w", "ids_full", "w_full", "g0_full")
+
+    def _gap_tb(key, args=None):
+        """A gap's tables, with any re-paired values from ``args["__gap_tables__"]`` taking precedence."""
+        tb = _gap_tables[key]
+        live = args.get("__gap_tables__") if isinstance(args, dict) else None
+        upd = (live or {}).get(key)
+        return {**tb, **upd} if upd else tb
+
+    def _gap_gather(u_flat, key, args=None):
         """``u_m . Phi`` at every secondary-face quadrature point: ``(n_secondary_faces, n_q, vec)``.
 
         Done GLOBALLY, outside the per-face vmap, because the main nodes live on the other body's
@@ -1862,7 +2028,7 @@ def assemble_fem_native(
         with no assembled Jacobian block needed. (The ASSEMBLED tangent builds its own explicit
         nonlocal blocks from these same tables -- see the gap emission in `_make_jacobian`.)
         """
-        tb = _gap_tables[key]
+        tb = _gap_tb(key, args)
         fidx, vt = tb["field"], vecs[tb["field"]]
         dofs = offs[fidx] + tb["ids"][..., None] * vt + jnp.arange(vt)  # (n_s, n_q, k, vec)
         um = jnp.einsum("sqk,sqkv->sqv", tb["w"], u_flat[dofs])
@@ -1915,7 +2081,7 @@ def assemble_fem_native(
             _cell_chunk(int(fids.shape[0]), n_q * vecs[btfi], cell_all_dofs.shape[1]),
         )
         for k in keys:
-            tb = _gap_tables[k]
+            tb = _gap_tb(k, args)
             fidx, vt = tb["field"], vecs[tb["field"]]
             if fidx != btfi:
                 raise NotImplementedError(
@@ -1929,10 +2095,10 @@ def assemble_fem_native(
             R = R.at[dofs.reshape(-1)].add(-jnp.einsum("fqk,fqv->fqkv", w_f, tau_f).reshape(-1))
         return R
 
-    def _gap_slices(region, fids, gap_um):
+    def _gap_slices(region, fids, gap_um, args=None):
         """``{key: (g0, u_m)}`` for every gap whose SECONDARY face is this region, aligned with ``fids``."""
         return {
-            k: (_gap_tables[k]["g0_full"][fids], gap_um[k][fids])
+            k: (_gap_tb(k, args)["g0_full"][fids], gap_um[k][fids])
             for k in _gap_tables
             if _gap_tables[k]["secondary"] == region
         } or None
@@ -2148,7 +2314,7 @@ def assemble_fem_native(
             lv = u_flat[cell_all_dofs[parent_j[fids]]]  # (n_face_R, n_local_all)
             # An augmented-Lagrangian update `lam.evolves(max(0, lam.i(-1) - c*g))` reads the gap here,
             # so the same main-side gather the residual uses has to reach the readout.
-            gsl = _gap_slices(region, fids, {k: _gap_gather(u_flat, k) for k in _gap_tables})
+            gsl = _gap_slices(region, fids, {k: _gap_gather(u_flat, k, args) for k in _gap_tables}, args)
             vals = jax.vmap(lambda fi, la, gp, _f=formula, _r=region: _surf_elem_readout(fi, la, _f, _r, t, args, gp))(
                 fids, lv, gsl if gsl else {}
             )
@@ -2288,12 +2454,12 @@ def assemble_fem_native(
             normals_dyn = _surface_normals(pts_dyn)  # differentiable facet normals under coordinate motion
             # Main-side values for every contact gap, gathered ONCE over the whole secondary face: the
             # nodes read live on the other body's cells, so this cannot happen inside the per-face map.
-            gap_um = {k: _gap_gather(u_flat, k) for k in _gap_tables}
+            gap_um = {k: _gap_gather(u_flat, k, args) for k in _gap_tables}
             for region, face_ids, btyped in surface_work:
                 fids = jnp.asarray(face_ids, dtype=jnp.int32)
                 pcells = parent_j[fids]
                 lv = u_flat[cell_all_dofs[pcells]]  # (n_face, n_local_all)
-                gslice = _gap_slices(region, fids, gap_um)  # {key: (g0, u_m)} for THIS region's faces
+                gslice = _gap_slices(region, fids, gap_um, args)  # {key: (g0, u_m)} for THIS region's faces
                 for bcoeff, btfi in btyped:
                     contribs = _elem_map(
                         lambda fi, la, gp, _e=bcoeff, _t=btfi, _r=region: _surf_elem_res(
@@ -2477,13 +2643,13 @@ def assemble_fem_native(
             normals_dyn = _surface_normals(pts_dyn)  # differentiable facet normals under coordinate motion
             # Main-side values for every contact gap -- the residual's own gather, reused so the
             # assembled tangent linearizes the SAME function the residual evaluates.
-            gap_um_j = {k: _gap_gather(u_flat, k) for k in _gap_tables}
+            gap_um_j = {k: _gap_gather(u_flat, k, args) for k in _gap_tables}
             for region, face_ids, btyped in surface_work:
                 fids = jnp.asarray(face_ids, dtype=jnp.int32)
                 pcells = parent_j[fids]
                 lv = u_flat[cell_all_dofs[pcells]]  # (n_face, n_local_all)
                 fcols = cell_all_dofs[pcells]  # (n_face, n_local_all)
-                gslice = _gap_slices(region, fids, gap_um_j)  # {key: (g0, u_m)} or None
+                gslice = _gap_slices(region, fids, gap_um_j, args)  # {key: (g0, u_m)} or None
                 for bcoeff, btfi in btyped:
 
                     def _kef(fi, la, gp=None, _e=bcoeff, _t=btfi, _r=region, _p=pts_dyn, _n=normals_dyn):
@@ -2513,6 +2679,20 @@ def assemble_fem_native(
 
                     if gslice:
                         # ---- the gap's NONLOCAL blocks (same append order as the pattern hoist) ----
+                        if isinstance(args, dict) and args.get("__gap_tables__"):
+                            # The ASSEMBLED tangent hoists its sparsity pattern from the pairing's
+                            # concrete node ids, once, before any solve. Re-pairing changes WHICH main
+                            # nodes each point reads, so that pattern is stale -- and a stale pattern
+                            # does not error, it silently drops the new couplings and keeps the old
+                            # ones, giving a tangent for a contact configuration that is not the one
+                            # being solved. Refuse by name instead.
+                            raise NotImplementedError(
+                                "fem.solve(contact=...) does not compose with an assembled tangent "
+                                "(`nonlinear=jno.solve.newton(direct=True)`): re-pairing changes the "
+                                "contact block's sparsity pattern, which is hoisted once and cannot "
+                                "follow it. Use the matrix-free default, `jno.solve.newton()`, whose "
+                                "tangent is `jax.linearize` of the residual and re-pairs with it."
+                            )
                         gs = _gap_static(region, face_ids, btfi)
                         n_q, vt, gk = gs["n_q"], gs["vt"], gs["key"]
                         w_f = gs["w_f"]
@@ -3446,6 +3626,8 @@ def assemble_fem_native(
             _op.state_readout = state_readout  # (u, t, args) -> {key: next per-QP VOLUME state}; march driver
             _op.surface_state_readout = surface_state_readout  # (u, t, args) -> {key: next per-FACE state}
             _op.path_specs = path_specs  # {fid: {frames (n_steps, n_nodes), ...}} — per-step load-path fields
+            _op.repair_contact = _repair_contact  # host-side contact search; see `fem.solve(contact=...)`
+            _op.contact_pairs = dict(_contact_pairs)
             return (_op, "nonlinear", offs)
 
         def _assemble_at(args):
@@ -3495,17 +3677,20 @@ def assemble_fem_native(
 
     # nonlinear (non-parametric)
     if nonlinear:
-        res_bc = _apply_dirichlet_projected(residual, dirichlet_pairs)
-        jac = _dirichlet_jac_rows(jacobian, dirichlet_pairs)
-        return (
-            FemResidualOperator(
-                lambda u, args=None: res_bc(jnp.asarray(u)),
-                lambda u, args=None: jac(jnp.asarray(u)),
-                total,
-            ),
-            "nonlinear",
-            offs,
-        )
+        # Wrapped PER CALL rather than once, so `args` reaches the free residual: `fem.solve(contact=...)`
+        # hands the re-paired tables down that way, and a wrapper built once would drop them silently and
+        # keep solving against the frozen pairing. (`_apply_dirichlet_projected` takes a one-argument
+        # residual by design -- forwarding a second positional would bind it to `t`.)
+        def _res_np(u, args=None):
+            return _apply_dirichlet_projected(lambda uu: residual(uu, 0.0, args), dirichlet_pairs)(jnp.asarray(u))
+
+        def _jac_np(u, args=None):
+            return _dirichlet_jac_rows(lambda uu: jacobian(uu, 0.0, args), dirichlet_pairs)(jnp.asarray(u))
+
+        _op_np = FemResidualOperator(_res_np, _jac_np, total)
+        _op_np.repair_contact = _repair_contact  # host-side contact search; see `fem.solve(contact=...)`
+        _op_np.contact_pairs = dict(_contact_pairs)
+        return (_op_np, "nonlinear", offs)
 
     # linear (non-parametric)
     A = jacobian(zeros)

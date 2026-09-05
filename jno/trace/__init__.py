@@ -4080,7 +4080,7 @@ class TrialFunction(_FieldComponentIndex, Placeholder):
 
     bind = partials
 
-    def gap(self, secondary: str, main: str, *, domain):
+    def gap(self, secondary: str, main, *, domain):
         """Signed **contact gap** between two tagged boundary faces, as a symbol usable in a weak form.
 
         ``g = g0 - n . (u_secondary - u_main . Phi)`` at the secondary face's quadrature points: ``g0`` is the
@@ -4108,11 +4108,21 @@ class TrialFunction(_FieldComponentIndex, Placeholder):
         Like ``domain.cell_size`` this is a placeholder symbol: the real per-quadrature-point value is
         packed during assembly and overrides the context entry everywhere it is used.
 
-        **Scope:** small sliding (the pairing is frozen at build time, so a sliding configuration must
-        be rebuilt per load step); differentiable in the DOF values but **not** in the mesh coordinates,
-        since the projection weights are host-computed; and non-differentiable at contact onset --
-        ``max(0, .)`` gives a subgradient, which is what a semismooth Newton wants but an optimizer
-        differentiating through contact will see as a kink.
+        ``main`` may also be a **list of candidate surfaces**, and each secondary quadrature point then
+        pairs with the nearest facet across all of them -- which is what a body that may strike any of
+        several others needs. Listing the secondary itself is **self-contact** (``u.gap("strip",
+        ["strip"])``): a facet is then barred from pairing with itself or its immediate neighbours, so a
+        folding surface can close on itself without every facet trivially contacting its own ring. A
+        list requires ``fem.solve(contact=...)`` and is refused without it -- a frozen pairing can only
+        ever be built against one configuration, and silently choosing a candidate is the failure this
+        whole mechanism exists to remove.
+
+        **Scope:** by default small sliding -- the pairing is frozen at build time, so a configuration
+        that slides far must be rebuilt; ``fem.solve(contact=jno.solve.contact())`` is what lifts that,
+        re-running the search from ``x + u`` until it settles. Differentiable in the DOF values but
+        **not** in the mesh coordinates, since the projection weights are host-computed; and
+        non-differentiable at contact onset -- ``max(0, .)`` gives a subgradient, which is what a
+        semismooth Newton wants but an optimizer differentiating through contact will see as a kink.
         """
         # ``domain`` is required and keyword-only ON PURPOSE. A fem symbol carries no domain, and
         # ``Placeholder`` synthesises attribute access into trace nodes -- so a ``getattr(self,
@@ -4137,15 +4147,31 @@ class TrialFunction(_FieldComponentIndex, Placeholder):
         A second entry would also be ambiguous downstream -- the tangent's block geometry looks the pair
         up by secondary region and takes the first match."""
         breg = getattr(dom, "_boundary_regions", {}) or {}
-        for tag in (secondary, main):
+        # `main` may name ONE surface or a list of candidates; a list containing the secondary itself is
+        # how self-contact is asked for (a folding strip, a tooth closing on its neighbour). Each
+        # secondary quadrature point then pairs with the nearest facet ACROSS the candidates.
+        listed = isinstance(main, (list, tuple))
+        mains = tuple(main) if listed else (main,)
+        if not mains:
+            raise ValueError(f"{who}: `main` is an empty list -- name at least one candidate surface.")
+        if len(set(mains)) != len(mains):
+            raise ValueError(f"{who}: main={main!r} repeats a surface; each candidate must appear once.")
+        for tag in (secondary, *mains):
+            if not isinstance(tag, str):
+                raise TypeError(f"{who}: surface names must be strings, got {type(tag).__name__} in {main!r}.")
             if tag not in breg:
                 raise ValueError(
                     f"{who}: {tag!r} is not a boundary region on this domain. Known: {sorted(breg)}. "
                     "Tag each side of the interface first -- a non-conforming Shape.regions names them "
                     "'a|b.a' / 'a|b.b' automatically."
                 )
-        if secondary == main:
-            raise ValueError(f"{who}: the secondary and main faces must be different regions.")
+        if secondary in mains and not listed:
+            raise ValueError(
+                f"{who}: the secondary and main faces must be different regions. For SELF-contact -- one "
+                f"surface searching against itself -- pass it as a list, {who}({secondary!r}, "
+                f"[{secondary!r}]), which also says you accept the adjacency exclusion and the "
+                "re-pairing loop it requires."
+            )
         _dim = int(getattr(dom, "dimension", 0) or 0)
         if self.value_shape != (_dim,):
             raise ValueError(
@@ -4161,10 +4187,12 @@ class TrialFunction(_FieldComponentIndex, Placeholder):
                 f"{who}: {secondary!r} is already the secondary face of a contact pair against "
                 f"{prev[1]!r}; a face carries at most one. Use a distinct secondary tag for the second pair."
             )
-        pairs[key] = (secondary, main, self.field_key)
+        # Stored as given for a single surface (so `pairs[key][:2] == (secondary, main)` still reads
+        # naturally) and as a tuple for a list; assembly normalises either to a tuple of candidates.
+        pairs[key] = (secondary, mains if listed else main, self.field_key)
         return _dim
 
-    def slide(self, secondary: str, main: str, *, domain):
+    def slide(self, secondary: str, main, *, domain):
         """Tangential **relative displacement** across a contact interface — the sibling of :meth:`gap`.
 
         ``s = D - (n . D) n``  with  ``D = u_secondary - u_main . Phi``, at the same quadrature points,
@@ -4192,8 +4220,10 @@ class TrialFunction(_FieldComponentIndex, Placeholder):
 
         Like :meth:`gap` (and ``domain.cell_size``) this is a placeholder symbol whose real
         per-quadrature-point value is packed during assembly; an unpacked one raises rather than reading
-        as zero. Same scope as the gap: **small sliding** — the pairing and the projection are frozen at
-        build time, so a configuration that slides far must be rebuilt.
+        as zero. Same scope as the gap, and the same ``main`` forms: one surface, or a list of candidates
+        (which requires ``fem.solve(contact=...)``). By default **small sliding** — the pairing and the
+        projection are frozen at build time; ``fem.solve(contact=jno.solve.contact())`` re-runs the
+        search from ``x + u`` and is what a configuration that slides far needs.
         """
         dom = domain
         if not hasattr(dom, "context") or not hasattr(dom, "_boundary_regions"):

@@ -1483,3 +1483,72 @@ def arclength(*, psi: float = 0.0, ds: float | None = None):
     from .utils.solver.arclength import ArcLengthSpec
 
     return ArcLengthSpec(psi=float(psi), ds=None if ds is None else float(ds))
+
+
+def contact(*, capture: float | None = None, rounds: int = 12, tol: float = 1e-4):
+    """Let the contact pairing follow the solution — a spec for the ``fem.solve(contact=...)`` slot.
+
+    ``u.gap(secondary, main)`` precomputes, for every secondary quadrature point, which main nodes it
+    reads and how far it stands off them. That pairing is built **once**, from the reference
+    configuration, and is correct only while displacements stay far below the element size. Past that
+    a point is still tied to the facet it faced before anything moved::
+
+        u = fem.solve(contact=jno.solve.contact())     # re-pair from x + u until it settles
+
+    **Why this is not a refinement detail.** Nothing reports a stale pairing. The solve converges
+    perfectly well; it just converges for a contact configuration that is not the one being solved, and
+    **refining makes it worse**. On a 12:20 involute gear pair, against the kinematic oracle
+    ``|T_B/T_A| = z_B/z_A`` — which holds because the line of action is common, so each moment arm is
+    that gear's base radius — the same problem solved both ways as the rim mesh went 0.050 -> 0.018::
+
+        frozen pairing   1.97%   2.33%   2.66%   2.83%      <- grows as h falls
+        re-paired        2.24%   2.27%   2.30%   2.30%      <- settles
+
+    Only a check like that ratio exposes it; the animation looks right throughout. (The ~2.3% the two
+    share at that drive is the demo's tooth geometry, not the pairing — it is flat in h, grows with the
+    penalty toward 3.6%, and does not move when the involute flank is sampled twice as finely.)
+
+    Where the pairing does go stale the error is gross rather than subtle: a flat-bottomed block slid
+    0.9 across a disk of radius 1 keeps reporting the 0.05 separation it had at its starting position,
+    where the truth is 0.182 — nearly four times larger, and silent.
+
+    Each round solves the ordinary system, then re-runs the search at ``x + u``. It stops when the
+    pairing is unchanged *and* the solution has stopped moving; exhausting ``rounds`` **raises** and
+    names how many slots are still oscillating.
+
+    Args:
+        capture: search radius. ``None`` (default) derives one per pair from the local facet size
+            (3x the mean secondary facet diameter) — a literal is wrong at every scale but one. Beyond
+            it a point is **inactive**: it keeps its slot with zero weight, so the tables never change
+            shape. Widen it when bodies must close a distance larger than a few elements before
+            touching; the driver raises rather than silently reporting every point open.
+        rounds: maximum solve/re-pair rounds. Reaching it without settling raises, and says which of
+            the two conditions failed. The default is generous because a round that settles returns
+            immediately, so the only cost of a high ceiling is paid by a problem that was going to
+            raise anyway — whereas a ceiling set just at the edge turns a converging solve into an
+            error. Measured on the gear pair: the pairing freezes by round 4 and the displacement
+            reaches ``tol`` around round 9.
+        tol: tolerance on ``|u_k - u_{k-1}|_inf / |u_k|_inf`` — "the solution stopped moving",
+            **relative to the solution's own size**. Once the pairing stops changing this is an
+            ordinary fixed point and contracts by roughly 0.2-0.3 per round, so a tolerance an order
+            tighter costs two or three more rounds.
+
+    Scope, stated up front:
+
+    * **Matrix-free tangent only.** ``nonlinear=jno.solve.newton(direct=True)`` is refused by name: the
+      assembled tangent hoists the contact block's sparsity pattern once, from the pairing's concrete
+      node ids, and a re-pairing changes that pattern. The default JFNK tangent is ``jax.linearize`` of
+      the residual, so it re-pairs with it.
+    * **The search is host-side and not differentiable in the mesh coordinates.** As with the frozen
+      pairing, the gap is differentiable in the DOF *values*; ``d(pairing)/d(x)`` does not exist.
+      Each round is its own solve, so a gradient through the *loop* is not provided either.
+    * **Steady solves.** Composition with a ``tau=`` load-path march is not implemented — the march
+      compiles one step and replays it under ``lax.scan``, and a host-side search cannot run inside a
+      scan. It raises rather than marching with a frozen pairing.
+    * The pairing is closest-point; there is no smoothing (no NTS-to-mortar blending, no C1 surface),
+      so a secondary point crossing a main facet edge moves discontinuously. That is what ``rounds``
+      iterates on and what the raise reports when it oscillates.
+    """
+    from .utils.solver.contact_search import ContactSpec
+
+    return ContactSpec(capture=None if capture is None else float(capture), rounds=int(rounds), tol=float(tol))

@@ -278,16 +278,72 @@ surface state, written out as a `state.evolves(...)` update, not a material obje
     mismatch, not a numerical artefact. Add roller conditions on the side faces if you want a genuinely
     uniaxial press.
 
-!!! warning "Scope — small sliding"
+### Naming one body's surface — `domain.tag(..., region=...)`
+
+A contact pair needs two surfaces that genuinely differ, and a coordinate predicate often cannot supply
+them: two gears' rims span the same radii about their own centres, and the two sides of a non-conforming
+interface are coincident. `region=` says which **body** owns the face, and ownership is decided from cell
+topology — the same thing that decides which cells a region's terms integrate over:
+
+```python
+d.tag("sA", lambda x, y: x**2 + y**2 > r_hub**2, region="rimA")   # gear A's outer flank
+d.tag("sB", lambda x, y: (x - c)**2 + y**2 > r_hub**2, region="rimB")
+g = u.gap("sA", "sB", domain=d)
+```
+
+Without `region=` a predicate true on both bodies hands **both** tags the whole boundary, and the
+resulting "pair" is a body against itself. The tag's normals follow the same restriction, so
+`d.variable("sA", normals=True)` gives gear A's outward normals and nothing else.
+
+### Letting the pairing follow the solution — `fem.solve(contact=...)`
+
+The pairing above is built **once**, from the reference configuration, and is correct only while
+displacements stay far below the element size. Past that a secondary point is still tied to the facet
+it faced before anything moved. Nothing reports it: the solve converges perfectly well, just for a
+contact configuration that is not the one being solved — and **refining makes it worse**. Measured on
+a 12:20 involute gear pair against the kinematic oracle `|T_B/T_A| = z_B/z_A`, as the rim mesh went
+0.050 → 0.018:
+
+| h_rim | 0.050 | 0.035 | 0.025 | 0.018 |
+|---|---|---|---|---|
+| frozen pairing | 1.97% | 2.33% | 2.66% | **2.83%** |
+| `contact=` | 2.24% | 2.27% | 2.30% | 2.30% |
+
+```python
+u = fem.solve(contact=jno.solve.contact())      # re-pair from x + u until it settles
+```
+
+Each round solves the ordinary system with the current pairing, then re-runs the search at `x + u`,
+warm-started from the last round. It stops when the pairing is unchanged **and** the solution has
+stopped moving; exhausting `rounds` raises and says which of the two failed, rather than returning a
+half-converged answer.
+
+`main` may also be a **list of candidate surfaces** — each point pairs with the nearest across them —
+and listing the secondary itself is **self-contact**, `u.gap("strip", ["strip"])`. A facet is then
+barred from pairing with its own neighbours *and* from pairing with a facet whose normal does not face
+it, which is what stops a flat stretch from reading as touching itself everywhere. A candidate list
+requires `contact=` and is refused without it.
+
+!!! warning "Scope — `contact=`"
+    **Matrix-free tangent only.** `nonlinear=jno.solve.newton(direct=True)` is refused by name: the
+    assembled tangent hoists the contact block's sparsity pattern once, from the pairing's concrete
+    node ids, and re-pairing changes it. The default JFNK tangent is `jax.linearize` of the residual,
+    so it re-pairs with it. **Steady solves only** — composition with a `tau=` load-path march is not
+    implemented, because that march replays one compiled step under `lax.scan` and a host-side search
+    cannot run inside a scan. And each round is its own solve, so there is no gradient through the loop.
+
+!!! warning "Scope — the frozen pairing (without `contact=`)"
     Small sliding — the pairing is frozen at build time, so a configuration that slides must be
-    rebuilt per load step. Differentiable in the DOF values but **not** in the mesh coordinates (the
-    projection weights are host-computed). The gap alone is **frictionless** — a body held *only* by a
-    normal traction is free to slide and its system is singular; give it a tangential term built from
+    rebuilt per load step, or driven with `contact=` above. Differentiable in the DOF values but
+    **not** in the mesh coordinates (the projection weights are host-computed). The gap alone is
+    **frictionless** — a body held *only* by a normal traction is free to slide and its system is
+    singular; give it a tangential term built from
     [`u.slide`](#the-tangential-companion-uslide) or constrain that direction independently.
-    The **assembled tangent now carries the gap's nonlocal blocks** — `(s,m)` from `jacfwd` w.r.t. the
+    The **assembled tangent carries the gap's nonlocal blocks** — `(s,m)` from `jacfwd` w.r.t. the
     gathered main values chained through the frozen mortar weights, plus the reaction rows' `(m,s)` and
     `(m,m)` — verified against the matrix-free JVP on random probes in both the active and separated
-    branches, so `newton(direct=True)` + `lu`/cuDSS works with contact (the pattern is static; inactive
-    contact contributes zeros in the data, which keeps the sparsity-keyed factorization caches valid).
+    branches, so `newton(direct=True)` + `lu`/cuDSS works with a **frozen** pairing (the pattern is
+    static; inactive contact contributes zeros in the data, which keeps the sparsity-keyed
+    factorization caches valid). It is that static pattern which `contact=` cannot reuse.
 
 ---

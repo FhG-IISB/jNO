@@ -36,11 +36,12 @@ differentiable in the DOF values -- though not yet in the mesh coordinates.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .fem_utils import _edge_shape, _tri_shape
+from .fem_utils import _edge_shape, _log, _tri_shape
 
 #: Reported for a query with no facet inside the capture distance: wide open, so a contact pressure
 #: ``max(0, -g)`` yields exactly zero. Chosen over ``inf`` so a stray multiplication cannot make a NaN.
@@ -133,6 +134,7 @@ def project_points(
     *,
     capture: Optional[float] = None,
     exclude_nodes: Optional[Sequence[Any]] = None,
+    main_normals: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Pair each query point with the nearest main facet: ``(ids, w, g0, active)``.
 
@@ -152,6 +154,13 @@ def project_points(
     ``exclude_nodes`` is a per-query iterable of node ids the pairing may not use -- a secondary
     facet's own adjacency ring, which is what lets a surface search against *itself* without every
     facet trivially contacting its own neighbour.
+
+    ``main_normals`` (one outward normal per main facet) restricts the pairing to facets that FACE the
+    query, ``n_s . n_m < 0``. Adjacency exclusion alone is not enough for self-contact: two facets a
+    few rings apart on a flat stretch are collinear, so ``Phi(x) - x`` lies along the surface, ``g0``
+    comes out ~0, and the surface reads as touching itself everywhere. Their normals are *parallel*,
+    not opposed, which is what separates them from the two sides of a genuine fold. Omitted (the
+    default) nothing is filtered, so two-body pairing is unchanged.
     """
     pts = np.asarray(points, dtype=float)
     facets = np.asarray(m_facets, dtype=int)
@@ -162,12 +171,16 @@ def project_points(
         return (np.zeros((0, k), int), np.zeros((0, k)), np.zeros(0), np.zeros(0, bool))
 
     V, cent, rad = facet_geometry(facets, pts)
+    nrm_q = np.asarray(secondary_normals, dtype=float).reshape(-1, dim)
     best_i = np.zeros(len(q), dtype=int)
     best_d = np.full(len(q), np.inf)
     best_p = np.zeros((len(q), dim))
     best_loc = np.zeros((len(q), 3 if dim == 3 else 1))
 
-    if capture is None and exclude_nodes is None:
+    mn = None if main_normals is None else np.asarray(main_normals, dtype=float).reshape(-1, dim)
+    if mn is not None and len(mn) != len(facets):
+        raise ValueError(f"project_points: main_normals has {len(mn)} rows for {len(facets)} main facets.")
+    if capture is None and exclude_nodes is None and mn is None:
         # Unbounded and unfiltered: every facet is a candidate, so scan them all. Same O(n_q * n_f) the
         # flattened path already paid, just chunked so a large interface cannot exhaust memory.
         for lo in range(0, len(q), _CHUNK):
@@ -201,6 +214,10 @@ def project_points(
                 ex = np.asarray(list(exclude_nodes[n]), dtype=int)
                 if ex.size:
                     cs = cs[~np.isin(facets[cs], ex).any(axis=1)]
+                if not len(cs):
+                    continue
+            if mn is not None:
+                cs = cs[mn[cs] @ nrm_q[n] < 0.0]  # keep only facets whose outward normal faces the query
                 if not len(cs):
                     continue
             p, loc, d = _narrow(np.repeat(q[n][None, :], len(cs), axis=0), V[cs], dim)
@@ -319,3 +336,171 @@ def arclength_of(query: np.ndarray, facets: np.ndarray, points: np.ndarray) -> T
         best_d = np.where(take, d, best_d)
         best_s = np.where(take, starts[k] + t * lengths[k], best_s)
     return best_s, total, closed
+
+
+# ---------------------------------------------------------------------------------------------------
+# The re-pairing driver -- `fem.solve(contact=...)`
+# ---------------------------------------------------------------------------------------------------
+@dataclass(frozen=True)
+class ContactSpec:
+    """Controls for the contact-search loop (``FEM.solve(contact=...)``). See :func:`jno.solve.contact`."""
+
+    capture: Optional[float] = None
+    rounds: int = 12
+    tol: float = 1e-4
+
+
+def _pairing_moved(a, b):
+    """How many quadrature-point slots changed which main nodes they read, between two payloads."""
+    n = 0
+    for k, tb in b.items():
+        prev = (a or {}).get(k)
+        if prev is None:  # the driver seeds a pairing before round 1, so there is always one to compare
+            raise KeyError(f"contact pairing {k!r} has no previous state to compare against")
+        ia, ib = np.asarray(prev["ids_full"]), np.asarray(tb["ids_full"])
+        wa, wb = np.asarray(prev["w_full"]), np.asarray(tb["w_full"])
+        # A slot counts as moved when it reads a different node OR when an ACTIVE/inactive flip happened
+        # (an inactive slot keeps its ids and only zeroes its weights, so ids alone would miss it).
+        moved = (ia != ib).any(axis=-1) | ((wa.sum(-1) > 0) != (wb.sum(-1) > 0))
+        n += int(moved.sum())
+    return n
+
+
+def run_contact_solve(fem, spec, *, solve_fn=None, **kwargs):
+    """Solve, re-pair from the deformed configuration, repeat until the pairing settles.
+
+    The frozen pairing built at ``jno.fem(...)`` time is valid only while displacements are far below
+    the element size. Past that a secondary point is still tied to the facet it faced in the REFERENCE
+    configuration -- and nothing reports it, because the solve converges perfectly well, just for a
+    contact configuration that is not the one being solved.
+
+    The signature is that refining makes it WORSE. On a 12:20 involute gear pair, against the kinematic
+    oracle ``|T_B/T_A| = z_B/z_A``, the same problem solved both ways as the rim mesh went 0.050 ->
+    0.018::
+
+        frozen pairing   1.97%   2.33%   2.66%   2.83%      <- grows as h falls
+        re-paired        2.24%   2.27%   2.30%   2.30%      <- settles
+
+    (The ~2.3% both share at that drive is the demo geometry, not the pairing: it is flat in h, GROWS
+    with the penalty toward 3.6%, and does not move when the involute flank is sampled twice as finely.)
+    Where the pairing genuinely goes stale the error is not subtle -- a flat-bottomed block slid 0.9
+    across a disk of radius 1 reads a separation of 0.05, the value at its starting position, where the
+    truth is 0.182.
+
+    Each round solves the ordinary system with the current pairing threaded on ``args``, then calls the
+    operator's host-side search at ``x + u``. Two things must hold to stop: the pairing is unchanged
+    (no quadrature point moved to a different main facet, none flipped active) and the solution stopped
+    moving. Exhausting ``rounds`` without both **raises**, naming how many slots are still oscillating
+    -- a contact solve that quietly stops iterating is the classic plausible-wrong answer.
+    """
+    op = getattr(fem, "_op", None)
+    repair = getattr(op, "repair_contact", None)
+    if repair is None or not getattr(op, "contact_pairs", None):
+        raise ValueError(
+            "fem.solve(contact=...) but this form declares no contact pair. `contact=` re-runs the "
+            "search behind `u.gap(secondary, main)` / `u.slide(...)`; without one there is nothing to "
+            "re-pair. Add the gap to the term list, or drop `contact=`."
+        )
+    if kwargs.get("tau") is not None:
+        raise NotImplementedError(
+            "fem.solve(contact=..., tau=...) is not implemented. The load-path march compiles ONE step "
+            "and replays it under `lax.scan` -- which is what keeps a load path reverse-mode "
+            "differentiable end to end -- and a host-side search cannot run inside a scan. Solve the "
+            "steady problem at each load level yourself with `contact=`, or accept the frozen pairing "
+            "and drop `contact=`."
+        )
+    if getattr(kwargs.get("nonlinear"), "direct", False):
+        raise NotImplementedError(
+            "fem.solve(contact=..., nonlinear=jno.solve.newton(direct=True)) is not supported: the "
+            "assembled tangent hoists the contact block's sparsity pattern once, from the pairing's "
+            "concrete node ids, and re-pairing changes which main nodes each point reads. Use the "
+            "matrix-free default `jno.solve.newton()`, whose tangent is `jax.linearize` of the residual."
+        )
+    rounds = int(spec.rounds)
+    if rounds < 1:
+        raise ValueError(f"fem.solve(contact=...): rounds must be at least 1, got {rounds}.")
+
+    base_res, base_jac = op.residual, op.jacobian
+    cell: dict = {"tb": None}
+
+    def _inject(args):
+        return {**(args or {}), "__gap_tables__": cell["tb"]} if cell["tb"] else args
+
+    def _drop_compiled():
+        """Discard the operator's compiled-solve cache.
+
+        ``FemResidualOperator.solve`` caches a ``jax.jit`` of a closure that reads ``self.residual`` at
+        TRACE time, keyed only on the solver identity and the argument shapes -- none of which change
+        between rounds. Left alone it would replay round 1's pairing for every later round, and worse,
+        an ordinary ``fem.solve()`` afterwards would silently get the searched answer. Re-pairing
+        changes what the residual IS, so its compilation cannot be reused; that retrace is the real cost
+        of the search on a runtime-parametric form.
+        """
+        op.__dict__.pop("_eager_solve_cache", None)
+
+    try:
+        fem._in_contact_loop = True  # the rounds re-enter `_solve_dispatch` with contact=None, by design
+        op.residual = lambda u, args=None, _b=base_res: _b(u, _inject(args))
+        if base_jac is not None:
+            op.jacobian = lambda u, args=None, _b=base_jac: _b(u, _inject(args))
+
+        # Round 1 must ALREADY use a searched pairing, not the frozen one. The build-time tables are
+        # built unbounded -- every secondary point clamps to its nearest main facet however far away --
+        # so on a closed body the points on the FAR side pair with a main surface that sits behind them,
+        # `g0 = n . (Phi(x) - x)` comes out large and negative, and a penalty reads that as a huge
+        # interpenetration. Measured on a gear pair: |u|max 5.9e-01 where the rigid drive is 6e-03, and
+        # the torque ratio 0.82 against an exact 1.667. `capture` is what excludes those points, and a
+        # caller who passed `contact=` asked for the search -- so it applies from the first solve.
+        u_prev, moved, du, rel = None, None, float("inf"), float("inf")
+        cell["tb"] = repair(np.zeros(int(op.size)), capture=spec.capture)
+        for rnd in range(rounds):
+            _drop_compiled()
+            # Warm-start from the previous round: consecutive rounds differ only in which facets a few
+            # quadrature points read, so the last solution is a far better guess than the caller's x0
+            # and Newton reaches the new equilibrium in a fraction of the steps.
+            kw = dict(kwargs) if u_prev is None else {**kwargs, "x0": u_prev}
+            u = np.asarray(fem._solve_dispatch(solve_fn=solve_fn, **kw)).reshape(-1)
+            new = repair(u, capture=spec.capture)
+            moved = _pairing_moved(cell["tb"], new)
+            du = np.inf if u_prev is None else float(np.abs(u - u_prev).max())
+            # RELATIVE to the solution's own size. A floor of 1.0 here turned this into an absolute
+            # 1e-6 test, which on a gear whose displacement is 6e-3 asked for four digits more than the
+            # answer has -- the pairing had settled (0 slots moving for two rounds) and the loop still
+            # raised. The floor exists only to keep 0/0 finite when nothing moved at all.
+            scale = max(float(np.abs(u).max()), 1e-30)
+            # One argument: `PrintFallback.info` (the no-logging-configured path) takes exactly one,
+            # so %-style args would raise here and only here -- in the branch nobody runs under pytest.
+            _log.info(
+                f"contact round {rnd + 1}/{rounds}: "
+                f"{moved} slot(s) re-paired, |du| = {du:.3e}"
+            )
+            if moved == 0 and du <= spec.tol * scale:
+                fem.contact_rounds = rnd + 1
+                return u
+            cell["tb"], u_prev, rel = new, u, du / scale
+    finally:
+        fem._in_contact_loop = False
+        op.residual, op.jacobian = base_res, base_jac
+        _drop_compiled()
+
+    if not np.isfinite(du):  # only ever true after a single round: nothing to difference against
+        raise RuntimeError(
+            f"fem.solve(contact=...): only {rounds} round was run, so the solution was never compared "
+            "against a previous one -- a single round cannot show that the search has settled, however "
+            "good its answer looks. Use rounds >= 2."
+        )
+    if moved == 0:
+        raise RuntimeError(
+            f"fem.solve(contact=...): after {rounds} round(s) the PAIRING has settled -- no quadrature "
+            f"point changes which main facet it reads -- but the solution is still moving, by "
+            f"{rel:.2e} relative on the last round against a tolerance of {spec.tol:.0e}. The gap keeps "
+            "shifting inside the facets it already pairs with, which is an ordinary fixed point and "
+            "contracts by roughly 0.2-0.3 per round: raise `rounds=`, or loosen `tol=` if that "
+            "precision is more than the answer needs."
+        )
+    raise RuntimeError(
+        f"fem.solve(contact=...): the pairing had not settled after {rounds} round(s) -- {moved} "
+        f"quadrature slot(s) still change which main facet they read, and the solution last moved by "
+        f"{du:.3e}. Either the search is still converging or it is oscillating between two pairings. "
+        f"Raise `rounds=`, or widen `capture=` if points are flickering in and out of the search radius."
+    )
