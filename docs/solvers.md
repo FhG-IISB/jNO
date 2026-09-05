@@ -222,16 +222,25 @@ choice and stays the default.
 operator. Once convection dominates it degrades. Measured on the Newton tangent of a lid-driven
 cavity (812 DOFs, momentum block solved exactly so the count isolates the Schur factor):
 
-| Re | 10 | 100 | 400 | 1000 |
-|---|---|---|---|---|
-| `saddle()` pressure mass | 99 | 100 | 103 | **210** |
-| `lsc()` | 104 | 104 | 104 | **104** |
+| Re | 10 | 50 | 100 | 400 | 1000 |
+|---|---|---|---|---|---|
+| `saddle()` pressure mass | 26 | 38 | 82 | **212** | 105 |
+| `lsc()` | 112 | 108 | 106 | **104** | 284 |
 
-LSC is flat across two decades. It is built from the system's own blocks —
+Over Re = 10 → 400 the mass degrades **8×** while LSC is flat. The robustness **ends**: by Re = 1000
+LSC has jumped to 284 and the mass has (non-monotonically) improved, so LSC is no longer ahead. This
+is a result about a range, not an unconditional one. It is built from the system's own blocks —
 `S⁻¹ ≈ (BM⁻¹Bᵀ)⁻¹(BM⁻¹FM⁻¹Bᵀ)(BM⁻¹Bᵀ)⁻¹` — so unlike the `form()`-based approximations it cannot be
 written by the user as weak forms, which is why it ships as a built-in. `B` and `M` do not depend on
 the solution, so `P = BM⁻¹Bᵀ` is assembled **sparsely** and factorised once, for every application
 and every Newton step; only `F` varies, and it is only ever applied.
+
+!!! danger "Measuring this at all needs `args=`"
+    These counts come from `fem._op.jacobian(sol, args={"nu": …})`. If the viscosity is a runtime
+    parameter and you call `jacobian(sol)` **without** `args`, it evaluates at an unset parameter and
+    returns a matrix that is 25 % wrong — silently. The operator then does not change with Reynolds
+    number at all, and every preconditioner looks perfectly robust on it. An earlier version of this
+    table was measured that way and was wrong.
 
 !!! warning "What LSC does not give you"
     **It is not mesh-independent here.** At fixed Re = 100 on a cavity, iterations grow 36 → 67 as the
@@ -241,28 +250,39 @@ and every Newton step; only `F` varies, and it is only ever applied.
     mass approximation degrades. Read the table as a resolved-discretisation result, not an
     unconditional one.
 
-### PCD, and what still blocks it
+### PCD — and the boundary condition that decides it
 
-The other convection-aware Schur approximation is **PCD** (Kay, Loghin & Wathen 2002),
-`S⁻¹ ≈ A_p⁻¹ F_p M_p⁻¹`. Unlike LSC every factor *is* a weak form, so with the spec algebra it would
-be user-written math needing no library support:
+**PCD** (Kay, Loghin & Wathen 2002) is the other convection-aware Schur approximation,
+`S⁻¹ ≈ A_p⁻¹ F_p M_p⁻¹`. Unlike LSC every factor *is* a weak form, so with the spec algebra and a
+known coefficient field it is written entirely by the user — the library gains nothing:
 
 ```python
-pcd = Ap @ Fp @ Mp          # Ap, Mp: form([...]);  Fp: form([...], inner=False)
+w  = wv.bind(x=xi, y=yi).freeze(u_lagged)          # the convecting field, as KNOWN nodal data
+lap_p, conv_p = pp.x*qq.x + pp.y*qq.y, (w[0]*pp.x + w[1]*pp.y)*qq
+
+Ap = jno.precond.form([lap_p,              p(x_in, y_in) - 0.0], inner=host)   # A_p⁻¹
+Fp = jno.precond.form([nu*lap_p + conv_p,  p(x_in, y_in) - 0.0], inner=False)  # F_p, APPLIED
+Mp = jno.precond.form([pp*qq],                                    inner=host)   # M_p⁻¹
+schur = Ap @ Fp @ Mp
 ```
 
-Two of the three assemble today. `F_p = ν(∇p,∇q) + (u·∇p, q)` does not, because it needs the lagged
-**velocity as a coefficient field on the pressure space**, and every route to that currently fails:
+**Two conditions decide whether it works at all**, and both are easy to get wrong:
 
-| route | outcome |
+| | |
 |---|---|
-| `u.bind(...).freeze(values)` — a known field from the velocity space | `KeyError` — the auxiliary form's only unknown is pressure, so the velocity field is not in its field registry |
-| `jno.np.parameter(<P1 symbol>).initialize(...).freeze()` on the pressure space | assembles, but the coefficient is not gathered per cell: shapes `(n_p,)` against `(3,)` |
-| `grad(sym, [x, y])` on fresh auxiliary symbols | shape mismatch; the component spelling `ai.x * bi.x` works and is the one to use |
+| **Inflow/outflow problem** | On an *enclosed* flow (a lid-driven cavity) PCD fails outright — 400 iterations, the cap, at every Reynolds number, and its eigenvalues straddle zero. The commutator argument leans on boundary behaviour an enclosed flow does not provide. Use `lsc()` there. |
+| **Inflow-Dirichlet on `A_p` and `F_p`** | With Neumann pressure operators PCD also fails (400). With a Dirichlet condition on the *inflow* boundary it takes **77**. Same problem, same mesh, same everything else. |
 
-So PCD is blocked on field-valued coefficients in an auxiliary form — the same gap that blocks a
-lagged eddy viscosity and a reusable wall-distance field. `lsc()` needs none of it, which is why it
-landed first.
+Channel flow, momentum block exact, per Reynolds number:
+
+| Re | 10 | 50 | 100 | 400 | 1000 |
+|---|---|---|---|---|---|
+| pressure mass | 41 | 184 | 301 | 284 | 318 |
+| `lsc()` | 63 | 158 | 150 | 291 | 263 |
+| **PCD** | **37** | **75** | **77** | 237 | 355 |
+
+PCD is decisively best from Re = 10 to 100 — **4× the mass** at Re = 100 — and loses its edge by
+Re = 400, where everything degrades. Neither method is Reynolds-robust at the top of that range.
 
 ### Preconditioners compose like the operators they stand for
 

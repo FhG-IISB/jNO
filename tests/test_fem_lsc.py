@@ -162,26 +162,32 @@ def test_the_pinned_pressure_row_is_passed_through():
 # ======================================================================================
 @pytest.mark.slow
 def test_lsc_is_reynolds_robust_where_the_pressure_mass_is_not():
-    """The headline. At mesh_size=0.14 (812 dofs), sweeping Re over two decades on the Newton tangent:
+    """LSC's iteration count is flat in Reynolds number where the pressure mass degrades.
 
-        Re      10    100    400   1000
-        mass    99    100    103    210
-        lsc    104    104    104    104
+    Lid-driven cavity, mesh 0.14, momentum block solved exactly so the count isolates the Schur factor,
+    and the Jacobian evaluated AT the parameter values:
 
-    The pressure-mass recipe approximates the Schur complement of a VISCOUS operator, so it degrades
-    once convection dominates. LSC is built from the momentum block itself and does not.
+        Re       10     50    100    400   1000
+        mass     26     38     82    212    105
+        lsc     112    108    106    104    284
 
-    The momentum block is solved exactly in both, so the count measures the SCHUR factor alone.
+    Over Re = 10 -> 400 the mass degrades 8x while LSC is FLAT (112 -> 104): the mass approximates the
+    Schur complement of a VISCOUS operator and stops being one as convection takes over, while LSC is
+    built from the momentum block itself. That is the property, and it is what this test pins.
 
-    **The mesh matters, and not in a way to paper over.** At mesh_size=0.16 (613 dofs) the same sweep
-    gives mass 76 -> 81 and lsc 158 -> 226 -- the ordering REVERSES. At Re = 1000 that mesh does not
-    resolve the flow, so neither approximation is measuring the property it is supposed to; the mass
-    never enters the regime where it degrades. The claim here is therefore about a resolved
-    discretisation, not about LSC unconditionally, and the resolution is pinned in the fixture."""
+    Stated because it bounds the claim: **the robustness ends.** By Re = 1000 LSC has jumped to 284
+    and the mass has (non-monotonically) improved to 105, so LSC is no longer ahead. This is a result
+    about a range, not an unconditional one.
+
+    An earlier version of this test asserted flatness all the way to Re = 1000 and PASSED -- because
+    the Jacobian was taken as `fem._op.jacobian(sol)` on a form whose viscosity is a runtime
+    parameter. Without `args=` that silently evaluates at an unset parameter, so the operator never
+    changed with Re at all and every preconditioner looked constant on it. The `args=` below is the
+    whole difference between measuring this and measuring nothing."""
     pytest.importorskip("scipy")
     host = jno.solve.lu(backend="host")
     counts = {}
-    for re in (10.0, 1000.0):
+    for re in (10.0, 400.0):
         fem, u, p, pp, qq, nu = _cavity_ns(0.14, re)
         # Cold Newton does not reach Re = 1000 on this problem -- the tangent goes singular. Climb.
         ladder = [r for r in (10.0, 50.0, 100.0, 400.0, 1000.0) if r <= re]
@@ -192,17 +198,19 @@ def test_lsc_is_reynolds_robust_where_the_pressure_mass_is_not():
                 continuation=jno.solve.continuation(nu=[1.0 / r for r in ladder]),
             )
         )
-        J = fem._op.jacobian(sol)
+        # `args=` is NOT optional: without it the Jacobian is evaluated at an unset `nu` and is 25%
+        # wrong, silently -- the operator then does not change with Re and this test measures nothing.
+        J = fem._op.jacobian(sol, args={"nu": np.array([1.0 / re])})
         exact_u = jno.precond.inner(host)
         mass = jno.precond.form([(1.0 / nu) * pp * qq], inner=host)
         counts[("mass", re)] = _gmres_iterations(fem, jno.precond.triangular((u, exact_u), (p, mass)), J, sol)
         counts[("lsc", re)] = _gmres_iterations(fem, jno.precond.triangular((u, exact_u), (p, jno.precond.lsc())), J, sol)
 
-    grow_mass = counts[("mass", 1000.0)] / max(counts[("mass", 10.0)], 1)
-    grow_lsc = counts[("lsc", 1000.0)] / max(counts[("lsc", 10.0)], 1)
-    assert grow_lsc < 1.25, f"LSC must stay flat in Re, grew {grow_lsc:.2f}x  ({counts})"
-    assert grow_mass > 1.5, f"the pressure mass must degrade, grew only {grow_mass:.2f}x  ({counts})"
-    assert counts[("lsc", 1000.0)] < counts[("mass", 1000.0)], counts
+    grow_mass = counts[("mass", 400.0)] / max(counts[("mass", 10.0)], 1)
+    grow_lsc = counts[("lsc", 400.0)] / max(counts[("lsc", 10.0)], 1)
+    assert grow_lsc < 1.1, f"LSC must stay flat over this range, grew {grow_lsc:.2f}x  ({counts})"
+    assert grow_mass > 3.0, f"the pressure mass must degrade here, grew only {grow_mass:.2f}x  ({counts})"
+    assert counts[("lsc", 400.0)] < counts[("mass", 400.0)], counts
 
 
 # ======================================================================================
