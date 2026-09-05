@@ -1560,7 +1560,33 @@ def assemble_fem_native(
     # connectivity as the live state, so its shape-gradient contraction matches the trial gradient.
     _frozen_gathered: Dict[Any, Any] = {}
     for _fid, _fnode in _frozen_nodes.items():
-        _ffidx = field_index[_fnode.field_key]
+        _fkey = _fnode.field_key
+        if _fkey not in field_index:
+            # A frozen field whose SOURCE is not one of THIS form's unknowns: a KNOWN COEFFICIENT FIELD.
+            # That is the lagged velocity of a PCD auxiliary, a wall distance, an eddy viscosity -- data
+            # computed elsewhere and read here as a coefficient. It has no assembled basis of its own, so
+            # it borrows the nodal basis and connectivity of a live field with the same element, exactly
+            # as a load-path field does below. Without this the kernel raised a bare `KeyError` on the
+            # field id, which says nothing about the cause.
+            _want_order = int(getattr(_fnode, "order", 1) or 1)
+            _want_space = str(getattr(_fnode, "space", "Lagrange") or "Lagrange")
+            _alias = next(
+                (
+                    i
+                    for i, f in enumerate(fields)
+                    if int(f["order"]) == _want_order and str(f.get("space", "Lagrange")) == _want_space
+                ),
+                None,
+            )
+            if _alias is None:
+                raise NotImplementedError(
+                    f"jno.fem: a frozen coefficient field of order {_want_order} ({_want_space}) is not one "
+                    "of this form's unknowns, so it must borrow the nodal basis of a live field with the "
+                    "same element -- and this form has none. Give one of the unknowns that element, or "
+                    "resample the known field onto a space the form already uses."
+                )
+            field_index[_fkey] = _alias  # alias: same nodes, same shape functions, no DOFs of its own
+        _ffidx = field_index[_fkey]
         _fconn = cells_f_j[_ffidx]  # (n_cell, n_local)
         _fvals = jnp.asarray(_fnode.values)
         # scalar frozen field (n_nodes,) -> per-cell (n_local, 1); VECTOR (n_nodes, vec) -> (n_local, vec).
