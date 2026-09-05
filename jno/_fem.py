@@ -789,11 +789,12 @@ def _retag_coords_for_quadrature(constraint: Any, support: str, region_id: str) 
     """
     target = "fem_gauss" if support == "volume" else f"gauss_{region_id}"
     for v in _spatial_coord_vars(constraint):
-        # outward-normal Variables (`n_<region>`) and the element-size symbol (`cell_size`) are not
+        # outward-normal Variables (`n_<region>`) and the element geometry symbols (`cell_size`,
+        # `cell_metric`) are not
         # quadrature coordinates -- leave their tag so they stay resolvable from the domain context.
         if (
             isinstance(v.tag, str)
-            and v.tag not in ("fem_gauss", "cell_size")
+            and v.tag not in ("fem_gauss", "cell_size", "cell_metric")
             and not v.tag.startswith(("gauss_", "n_", "gap_"))
         ):
             # Remember the region before rebinding to the quadrature pool. The retag must persist for

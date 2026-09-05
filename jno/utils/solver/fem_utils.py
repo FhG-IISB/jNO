@@ -1143,6 +1143,25 @@ def _eval_integrand(domain, node, local):
             if node.tag == "fem_gauss":
                 return local["physical_quad_points"][..., dim_start:dim_end]
 
+        # A per-quadrature-point TENSOR symbol (`dom.cell_metric`). It needs its own branch: the
+        # generic context fallback below squeezes a leading singleton axis and slices the LAST one,
+        # and both are wrong for a (n_quad, dim, dim) array -- the first would eat the quadrature
+        # axis whenever a cell has one quadrature point.
+        if node.tag == "cell_metric":
+            arr = local["domain_context"].get("cell_metric")
+            # A packed metric is always rank 3, `(n_quad, dim, dim)`; the domain-level placeholder is
+            # rank 2. Anything else means this kernel never packed one.
+            if arr is None or jnp.ndim(arr) != 3:
+                raise NotImplementedError(
+                    "jno.fem: `dom.cell_metric` is resolved on the native 2-D/3-D assembler's VOLUME "
+                    "terms only -- this path (a 1-D form, or a non-nodal element family such as "
+                    "Hermite / Argyris / Morley / RT / N1E) packs no element Jacobian, so there is no "
+                    "metric to read. Use it in a volume term of a 2-D/3-D nodal-Lagrange form; "
+                    "`dom.cell_size` has the same scope. (In a BOUNDARY term it is refused earlier, by "
+                    "the region resolver -- a geometry symbol names no region.)"
+                )
+            return jnp.asarray(arr)
+
         # Temporal variable in assembly:
         # prefer the batched volume_vars arrays (pure JAX / no domain mutation),
         # then fall back to domain.context for the steady-context path.
