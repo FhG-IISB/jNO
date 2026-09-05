@@ -15,6 +15,13 @@ $$\partial_t\mathbf u + (\mathbf u\!\cdot\!\nabla)\mathbf u - \nu\Delta\mathbf u
 
 Configuration is Schäfer & Turek (1996), benchmark 2D-2.
 
+![Vorticity through one shedding cycle: alternating vortices form on the cylinder and convect down the
+channel as a von Karman street.](../../assets/vortex_shedding_dfg_2d2.gif)
+
+Vorticity `w = dv/dx - du/dy`, computed from the P1 element gradients — the exact derivative of the
+velocity the run solved for, one value per cell. Near field only (`x < 1.4`); the colour range is set
+from the **wake**, so the attached shear layer on the cylinder (which reaches `|w| ~ 380`) saturates.
+
 ## Why the Strouhal number and not the drag
 
 The 2D-1 tutorial reads drag and lift as the **reaction** conjugate to the cylinder's no-slip
@@ -30,6 +37,10 @@ in the wake, read straight out of the trajectory — so this benchmark is reacha
 
 Equal-order P1/P1, BDF2, quasi-static `tau`. `St` converges **monotonically from below** under both
 mesh and step refinement:
+
+![Left: the transverse velocity at a wake probe, growing from rest into a limit cycle. Right: the
+Strouhal number against DOF count for two step sizes, approaching the published reference
+band.](../../assets/vortex_shedding_dfg_2d2_strouhal.png)
 
 | mesh size | DOFs | `dt` | scheme | St | vs 0.30 |
 |---|---|---|---|---|---|

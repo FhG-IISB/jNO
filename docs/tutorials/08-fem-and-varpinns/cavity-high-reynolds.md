@@ -34,8 +34,11 @@ convergence statement: there is no quietly-unconverged rung.
 
 ## Measured
 
+![Speed with streamlines at Re = 100, 1000 and 5000: the primary vortex centre migrates toward the
+geometric centre and the corner eddies grow.](../../assets/cavity_high_reynolds.png)
+
 48×48 structured mesh, 7,203 DOFs. The primary vortex strengthens monotonically with Re — the classic
-cavity signature:
+cavity signature, and the vortex centre migrates toward the middle as the corner eddies grow:
 
 | Re | min `u_x` on x = 0.5 | `u_y` range on y = 0.5 |
 |---|---|---|

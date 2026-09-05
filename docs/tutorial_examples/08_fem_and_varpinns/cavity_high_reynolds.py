@@ -173,3 +173,34 @@ assert e_u < 0.10 * span, f"equal-order disagrees with the stable pair by {e_u:.
 assert e_v < 0.10 * span, f"equal-order disagrees with the stable pair by {e_v:.3f}"
 print(f"\nStabilised equal-order P1/P1 reached Re = {max(reached):.0f} and tracks the stable pair at Re = 1000.")
 # --8<-- [end:code]
+
+# ---- figure: speed with streamlines as Re climbs -------------------------------------------------
+os.environ["MPLBACKEND"] = "Agg"
+from pathlib import Path  # noqa: E402
+
+import matplotlib.pyplot as plt  # noqa: E402
+import matplotlib.tri as mtri  # noqa: E402
+from mpl_toolkits.axes_grid1 import make_axes_locatable  # noqa: E402
+
+ctri = mtri.Triangulation(pts_s[:, 0], pts_s[:, 1], np.asarray(d_s._cells_p1()))
+gx, gy = np.meshgrid(np.linspace(0, 1, 200), np.linspace(0, 1, 200))
+fig, axs = plt.subplots(1, 3, figsize=(9, 3.2), dpi=140)
+for ax, re in zip(axs, (100.0, 1000.0, 5000.0)):
+    _, uv = velocity(fem_s, reached[re])
+    tp = ax.tripcolor(ctri, np.hypot(uv[:, 0], uv[:, 1]), cmap="viridis", vmin=0.0, vmax=1.0, shading="gouraud")
+    ui = np.asarray(mtri.LinearTriInterpolator(ctri, uv[:, 0])(gx, gy))
+    vi = np.asarray(mtri.LinearTriInterpolator(ctri, uv[:, 1])(gx, gy))
+    ax.streamplot(gx, gy, ui, vi, color="white", linewidth=0.45, density=0.9, arrowsize=0.5)
+    ax.set_axis_off()
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.set_title(f"Re = {re:.0f}", pad=6)  # a label naming the panel's data, not a describing title
+cax = make_axes_locatable(axs[-1]).append_axes("right", size="3.5%", pad=0.05)
+cb = plt.colorbar(tp, cax=cax)
+cb.outline.set_visible(False)
+cb.minorticks_off()
+cb.ax.tick_params(length=0)
+cb.set_ticks([0, 0.25, 0.5, 0.75, 1.0])
+fig.tight_layout()
+fig.savefig(Path(__file__).parents[2] / "assets" / "cavity_high_reynolds.png")

@@ -136,3 +136,51 @@ assert tail.max() - tail.min() > 0.1, "no sustained oscillation -- the wake did 
 assert 0.24 < st < 0.31, f"St = {st:.4f} is outside the band this discretisation converges through"
 print("\nA von Karman street, at the right frequency to within the resolution of this run.")
 # --8<-- [end:code]
+
+# ---- figure: vorticity through one shedding cycle -----------------------------------------------
+# w = dv/dx - du/dy is computed from the P1 element gradients -- the exact derivative of the velocity
+# this run solved for, per cell, with nothing smoothed or interpolated in.
+os.environ["MPLBACKEND"] = "Agg"
+from pathlib import Path  # noqa: E402
+
+import matplotlib.pyplot as plt  # noqa: E402
+import matplotlib.tri as mtri  # noqa: E402
+from matplotlib.animation import FuncAnimation, PillowWriter  # noqa: E402
+from mpl_toolkits.axes_grid1 import make_axes_locatable  # noqa: E402
+
+cells = np.asarray(d._cells_p1())
+tri = mtri.Triangulation(pts[:, 0], pts[:, 1], cells)
+P = pts[cells]
+X, Y = P[..., 0], P[..., 1]
+bg = np.stack([Y[:, 1] - Y[:, 2], Y[:, 2] - Y[:, 0], Y[:, 0] - Y[:, 1]], axis=1)
+cg = np.stack([X[:, 2] - X[:, 1], X[:, 0] - X[:, 2], X[:, 1] - X[:, 0]], axis=1)
+A2 = (X[:, 1] - X[:, 0]) * (Y[:, 2] - Y[:, 0]) - (X[:, 2] - X[:, 0]) * (Y[:, 1] - Y[:, 0])
+U = np.stack([s[: fem.offsets[1]].reshape(len(pts), 2) for s in traj])
+vort = lambda k: np.sum(bg * U[k][cells, 1], 1) / A2 - np.sum(cg * U[k][cells, 0], 1) / A2  # noqa: E731
+
+per = int(round(period / dt))
+frames = np.arange(len(ts) - per, len(ts), max(1, per // 30))  # one cycle
+w = np.stack([vort(k) for k in frames])
+# Scale to the WAKE: the attached shear layer reaches |w| ~ 380 while the shed vortices peak near 50,
+# so a full-range scale renders the street invisible. The shear layer saturates -- said in the caption.
+cxc = P[..., 0].mean(1)
+vmax = float(np.ceil(np.abs(w[:, cxc > 0.35]).max() / 10.0) * 10.0)
+
+fig, ax = plt.subplots(figsize=(7.2, 1.55), dpi=110)
+tpc = ax.tripcolor(tri, facecolors=w[0], cmap="RdBu_r", vmin=-vmax, vmax=vmax, shading="flat")
+ax.set_axis_off()
+ax.set_xlim(0, 1.4)  # near field: the street lives here
+ax.set_ylim(0, H)
+ax.set_aspect("equal")
+cax = make_axes_locatable(ax).append_axes("right", size="3.5%", pad=0.05)
+cb = plt.colorbar(tpc, cax=cax)
+cb.outline.set_visible(False)
+cb.minorticks_off()
+cb.ax.tick_params(length=0)
+cb.set_ticks([-vmax, 0, vmax])
+assets = Path(__file__).parents[2] / "assets"
+FuncAnimation(fig, lambda i: (tpc.set_array(w[i]),), frames=len(frames)).save(
+    assets / "vortex_shedding_dfg_2d2.gif", writer=PillowWriter(fps=12)
+)
+tpc.set_array(w[len(frames) // 4])
+fig.savefig(assets / "vortex_shedding_dfg_2d2.png", dpi=135)
