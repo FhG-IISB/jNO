@@ -110,6 +110,7 @@ changes the converged solution, only the speed, so specs need no gradient path.
 | `jno.precond.form([...terms], inner=…)` | an auxiliary operator assembled from ordinary traced terms | when you can write the preconditioner as a weak form |
 | `jno.precond.block_diag((field, spec), …)` | per-field composition over `fem.blocks` (also `triangular`) | multifield problems |
 | `jno.precond.saddle(mass_weight=…, laplace_weight=…)` | the standard saddle recipe as **one call** | Stokes / Biot — the common case |
+| `jno.precond.lsc()` / `saddle(schur="lsc")` | least-squares commutator — the **convection-aware** Schur factor | Navier–Stokes, where the pressure-mass recipe degrades with Re |
 | `jno.precond.amg(cycles=…)` | hybrid algebraic multigrid — host setup (`pyamg`), device apply | large SPD systems; needs the optional `pyamg` |
 | `jno.precond.jaxamg(symmetric=…)` | GPU AMG via NVIDIA AmgX — setup and apply both on device | large systems on a GPU; needs the optional stack |
 | `.cached(refresh=…)` | reuse an expensive setup across solves | Newton loops and transients, where the operator barely changes between solves |
@@ -180,6 +181,31 @@ fem.solve(linear=jno.solve.fgmres(tol=1e-10, restart=40),
     system: 124 CG iterations for `jacobi`, 98 unpreconditioned, **46** for `nystrom(rank=20)`). **SPD
     only** — the sketch takes a Cholesky, so an indefinite operator gives NaN rather than a quiet wrong
     answer.
+
+### When the pressure mass is not enough
+
+`saddle()`'s pressure-mass Schur approximation stands in for the Schur complement of a **viscous**
+operator. Once convection dominates it degrades. Measured on the Newton tangent of a lid-driven
+cavity (812 DOFs, momentum block solved exactly so the count isolates the Schur factor):
+
+| Re | 10 | 100 | 400 | 1000 |
+|---|---|---|---|---|
+| `saddle()` pressure mass | 99 | 100 | 103 | **210** |
+| `lsc()` | 104 | 104 | 104 | **104** |
+
+LSC is flat across two decades. It is built from the system's own blocks —
+`S⁻¹ ≈ (BM⁻¹Bᵀ)⁻¹(BM⁻¹FM⁻¹Bᵀ)(BM⁻¹Bᵀ)⁻¹` — so unlike the `form()`-based approximations it cannot be
+written by the user as weak forms, which is why it ships as a built-in. `B` and `M` do not depend on
+the solution, so `P = BM⁻¹Bᵀ` is assembled **sparsely** and factorised once, for every application
+and every Newton step; only `F` varies, and it is only ever applied.
+
+!!! warning "What LSC does not give you"
+    **It is not mesh-independent here.** At fixed Re = 100 on a cavity, iterations grow 36 → 67 as the
+    pressure space grows 30 → 198 (the pressure mass grows 32 → 91 over the same range, so LSC is
+    better but neither is flat). And the Reynolds result above is **resolution-dependent**: at 613
+    DOFs the same sweep reverses the ordering, because that mesh never enters the regime where the
+    mass approximation degrades. Read the table as a resolved-discretisation result, not an
+    unconditional one.
 
 ### Preconditioners compose like the operators they stand for
 
