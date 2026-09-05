@@ -348,6 +348,7 @@ class ContactSpec:
     capture: Optional[float] = None
     rounds: int = 12
     tol: float = 1e-4
+    relax: float = 1.0
 
 
 def _stalled(hist, tol_rel):
@@ -420,6 +421,13 @@ def run_contact_solve(fem, spec, *, solve_fn=None, **kwargs):
     rounds = int(spec.rounds)
     if rounds < 1:
         raise ValueError(f"fem.solve(contact=...): rounds must be at least 1, got {rounds}.")
+    relax = float(getattr(spec, "relax", 1.0))
+    if not (0.0 < relax <= 1.0):
+        raise ValueError(
+            f"fem.solve(contact=...): relax must lie in (0, 1], got {relax}. It is the weight on the "
+            "newly solved iterate in u <- (1-relax)*u_prev + relax*u_new; 1.0 is the undamped "
+            "iteration, and a value at or below 0 would freeze or reverse the search."
+        )
 
     base_res, base_jac = op.residual, op.jacobian
     cell: dict = {"tb": None}
@@ -463,6 +471,19 @@ def run_contact_solve(fem, spec, *, solve_fn=None, **kwargs):
             # and Newton reaches the new equilibrium in a fraction of the steps.
             kw = dict(kwargs) if u_prev is None else {**kwargs, "x0": u_prev}
             u = np.asarray(fem._solve_dispatch(solve_fn=solve_fn, **kw)).reshape(-1)
+            # UNDER-RELAX the fixed point before searching from it. The round map is
+            # `u_{k+1} = G(u_k)` with `G = solve . repair`, and it is only a contraction while the
+            # pairing barely feeds back into the solution. A FOLLOWER contact normal
+            # (`variable(..., follow_normals=True)`) closes that loop -- the normal is a function of
+            # `u`, and the traction it carries moves `u` -- and the iteration can then stop
+            # contracting entirely: measured on a sheet drawn over a die radius, the pairing settled
+            # (0 slots re-paired for four rounds running) while |du|/|u| sat at 5.0e-3, 1.2e-2,
+            # 7.0e-3, 8.2e-3 with no downward trend. Damping to `u <- (1-r) u_k + r G(u_k)` leaves
+            # the fixed point untouched -- at convergence `G(u) = u` makes the blend the identity --
+            # and only changes whether the iteration reaches it.
+            u_raw = u
+            if u_prev is not None and relax != 1.0:
+                u = (1.0 - relax) * u_prev + relax * u_raw
             new = repair(u, capture=spec.capture)
             moved = _pairing_moved(cell["tb"], new)
             du = np.inf if u_prev is None else float(np.abs(u - u_prev).max())
@@ -486,7 +507,10 @@ def run_contact_solve(fem, spec, *, solve_fn=None, **kwargs):
             quiet = quiet + 1 if du <= spec.tol * scale else 0
             if quiet >= 2 or (moved == 0 and du <= spec.tol * scale):
                 fem.contact_rounds = rnd + 1
-                return u
+                # the raw solve, never the blend: the returned field must be one that actually
+                # satisfies the residual. At convergence the two agree to within `tol` anyway, and
+                # at relax=1.0 they are the same array.
+                return u_raw
             cell["tb"], u_prev, rel = new, u, du / scale
             if np.isfinite(du):
                 hist.append(du / scale)
@@ -506,10 +530,13 @@ def run_contact_solve(fem, spec, *, solve_fn=None, **kwargs):
             f"fem.solve(contact=...): the search is OSCILLATING, not converging -- over {rounds} rounds "
             f"|du|/|u| cycled between {min(hist):.2e} and {max(hist[len(hist)//2:]):.2e} with no downward "
             f"trend, against a tolerance of {spec.tol:.0e}. More rounds will not help: the pairing is "
-            "alternating between a small set of configurations. Take a smaller load step (or a smaller "
-            "load) so the search starts nearer its own equilibrium, refine the contacting surface so a "
-            "quadrature point is less able to straddle two facets, or loosen `tol=` if this precision "
-            "is more than the answer needs."
+            "alternating between a small set of configurations. Damp the iteration with "
+            "`jno.solve.contact(relax=0.5)` (lower it further if 0.5 still cycles) -- that is the "
+            "direct remedy when the pairing feeds back into the solution, as it does with a follower "
+            "contact normal. Otherwise take a smaller load step (or a smaller load) so the search "
+            "starts nearer its own equilibrium, refine the contacting surface so a quadrature point "
+            "is less able to straddle two facets, or loosen `tol=` if this precision is more than the "
+            "answer needs."
         )
     if moved == 0 or quiet:
         raise RuntimeError(

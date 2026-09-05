@@ -1485,7 +1485,8 @@ def arclength(*, psi: float = 0.0, ds: float | None = None):
     return ArcLengthSpec(psi=float(psi), ds=None if ds is None else float(ds))
 
 
-def contact(*, capture: float | None = None, rounds: int = 12, tol: float = 1e-4):
+def contact(*, capture: float | None = None, rounds: int = 12, tol: float = 1e-4,
+            relax: float = 1.0):
     """Let the contact pairing follow the solution — a spec for the ``fem.solve(contact=...)`` slot.
 
     ``u.gap(secondary, main)`` precomputes, for every secondary quadrature point, which main nodes it
@@ -1532,6 +1533,18 @@ def contact(*, capture: float | None = None, rounds: int = 12, tol: float = 1e-4
             **relative to the solution's own size**. Once the pairing stops changing this is an
             ordinary fixed point and contracts by roughly 0.2-0.3 per round, so a tolerance an order
             tighter costs two or three more rounds.
+        relax: damping on the round-to-round update, ``u <- (1-relax)*u_prev + relax*u_new``. The
+            default ``1.0`` is the undamped iteration and is bit-identical to not passing it. Lower it
+            when the search **oscillates**: the round map is only a contraction while the pairing
+            barely feeds back into the solution, and a follower contact normal
+            (``variable(..., follow_normals=True)``) closes that loop, because the normal is a
+            function of ``u`` and the traction it carries moves ``u``. Measured on a sheet drawn over
+            a die radius, undamped: the pairing settled — 0 slots re-paired for four rounds running —
+            while ``|du|/|u|`` sat at 5.0e-3, 1.2e-2, 7.0e-3, 8.2e-3 with no downward trend, so more
+            rounds could not have helped. Damping does **not** move the fixed point (at convergence
+            ``G(u) = u``, so the blend is the identity); it only changes whether the iteration reaches
+            it, and it costs roughly ``1/relax`` times as many rounds when the undamped iteration
+            would have converged anyway. Start at ``0.5``.
 
     Scope, stated up front:
 
@@ -1562,4 +1575,5 @@ def contact(*, capture: float | None = None, rounds: int = 12, tol: float = 1e-4
     """
     from .utils.solver.contact_search import ContactSpec
 
-    return ContactSpec(capture=None if capture is None else float(capture), rounds=int(rounds), tol=float(tol))
+    return ContactSpec(capture=None if capture is None else float(capture), rounds=int(rounds),
+                       tol=float(tol), relax=float(relax))

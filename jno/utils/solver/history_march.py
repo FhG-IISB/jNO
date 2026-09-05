@@ -206,6 +206,11 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, **kwargs):
         n_steps = int(tau_grid.shape[0])
         # The search applies from the FIRST step, for the same reason it does in the steady driver: the
         # build-time tables are unbounded, so on a closed body the far side pairs through the body.
+        relax = float(getattr(spec, "relax", 1.0))
+        if not (0.0 < relax <= 1.0):
+            raise ValueError(
+                f"fem.solve(tau=..., contact=...): relax must lie in (0, 1], got {relax}."
+            )
         tables = repair(np.zeros(n_dofs), capture=spec.capture)
         u, bufs, sbufs = u0, buffers0, sbuffers0
         traj = []
@@ -217,7 +222,12 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, **kwargs):
                 u_new, nb, nsb = _step_once(
                     u, bufs, sbufs, tau_k, path_k, {**param_args, "__gap_tables__": tables}
                 )
-                un = np.asarray(u_new)
+                un_raw = np.asarray(u_new)
+                # UNDER-RELAX before searching, exactly as the steady loop does -- see
+                # `run_contact_solve`. A follower contact normal makes the round map stop contracting,
+                # and a load path is where that bites hardest: every step pays for it.
+                un = (un_raw if u_prev is None or relax == 1.0
+                      else (1.0 - relax) * u_prev + relax * un_raw)
                 new = repair(un, capture=spec.capture)
                 moved = _pairing_moved(tables, new)
                 du = np.inf if u_prev is None else float(np.abs(un - u_prev).max())
@@ -243,8 +253,10 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, **kwargs):
                     f"{float(tau_k):.4g}) is OSCILLATING, not converging -- over {int(spec.rounds)} "
                     f"rounds |du|/|u| cycled between {min(hist):.2e} and "
                     f"{max(hist[len(hist)//2:]):.2e} with no downward trend. More rounds will not help. "
-                    "Take smaller load steps so each starts nearer its own equilibrium, refine the "
-                    "contacting surface, or loosen `tol=`."
+                    "Damp the search with `jno.solve.contact(relax=0.5)` -- the direct remedy when the "
+                    "pairing feeds back into the solution, as it does with a follower contact normal. "
+                    "Otherwise take smaller load steps so each starts nearer its own equilibrium, "
+                    "refine the contacting surface, or loosen `tol=`."
                 )
             if not settled:
                 raise RuntimeError(
@@ -256,7 +268,9 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, **kwargs):
                     + ". Raise `rounds=`, loosen `tol=`, or take smaller load steps so each one starts "
                     "closer to its own equilibrium."
                 )
-            u, bufs, sbufs = u_new, nb, nsb
+            # advance on the iterate the final tables were built from, so the state carried into the
+            # next load step and the pairing that produced it describe the same configuration
+            u, bufs, sbufs = (u_new if relax == 1.0 else jnp.asarray(u_prev).reshape(-1)), nb, nsb
             traj.append(u)
         return jnp.stack(traj)
 
