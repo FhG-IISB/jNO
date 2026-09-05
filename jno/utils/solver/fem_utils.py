@@ -867,6 +867,38 @@ def _prefix_align(a, b):
     return a, b
 
 
+def _resolve_field_slot(local, node):
+    """Index into ``local["fields"]`` supplying ``node``'s basis, resolving a FOREIGN field by space.
+
+    Normally a node's ``field_key`` is one of this form's unknowns and resolves directly. A frozen
+    coefficient carrying another form's solved values (``jno.precond.form`` over one field, with a
+    second field's values as data) has a key this form never registered. It declares its own
+    ``space``/``order``, and any field here with the same pair has identical nodes, connectivity and
+    shape functions on this mesh -- so borrowing that slot is exact.
+
+    Raises rather than guessing when no such field exists: gathering P2 values through a P1 slot
+    would read the wrong nodes and return a plausible, wrong operator. The companion check in
+    ``fem_native._frozen_field_basis_index`` refuses the same case at gather time with the fuller
+    message; this is the kernel-side guard for the paths that reach here first.
+    """
+    fields = local["fields"]
+    key = getattr(node, "field_key", getattr(node, "op_id", None))
+    idx = local["field_index"].get(key)
+    if idx is not None:
+        return idx
+    want_space = str(getattr(node, "space", "Lagrange")) or "Lagrange"
+    want_order = int(getattr(node, "order", 1))
+    for i, f in enumerate(fields):
+        if int(f.get("order", 1)) == want_order and (str(f.get("space", "Lagrange")) or "Lagrange") == want_space:
+            return i
+    raise NotImplementedError(
+        f"jno.fem: a field on a {want_space} order-{want_order} space is used in a form whose own "
+        "fields do not include that space, so there is no basis to evaluate it on. This is usually a "
+        "frozen coefficient (ui.freeze(values)) from a different space than the auxiliary form's "
+        "unknown -- project it onto the form's space first, or write the form over a matching field."
+    )
+
+
 def _field_data(local, node):
     """``(shape_vals, shape_grads, cell_sol)`` for ``node``'s field.
 
@@ -877,8 +909,7 @@ def _field_data(local, node):
     fields = local.get("fields")
     if fields is None:
         return local["shape_vals"], local.get("shape_grads"), local.get("cell_sol")
-    key = getattr(node, "field_key", getattr(node, "op_id", None))
-    fd = fields[local["field_index"][key]]
+    fd = fields[_resolve_field_slot(local, node)]
     return fd["shape_vals"], fd["shape_grads"], fd["cell_sol"]
 
 
@@ -904,8 +935,7 @@ def _field_hess(local, node):
     fields = local.get("fields")
     if fields is None:
         return local.get("shape_hess")
-    key = getattr(node, "field_key", getattr(node, "op_id", None))
-    return fields[local["field_index"][key]].get("shape_hess")
+    return fields[_resolve_field_slot(local, node)].get("shape_hess")
 
 
 def _field_space(local, node):
@@ -918,8 +948,7 @@ def _field_space(local, node):
     fields = local.get("fields")
     if fields is None:
         return local.get("space", "Lagrange")
-    key = getattr(node, "field_key", getattr(node, "op_id", None))
-    return fields[local["field_index"][key]].get("space", "Lagrange")
+    return fields[_resolve_field_slot(local, node)].get("space", "Lagrange")
 
 
 def _eval_frozen_coefficient(domain, model, local):

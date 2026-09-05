@@ -754,6 +754,48 @@ class _CellFieldData(dict):
             return default
 
 
+def _frozen_field_basis_index(node, fields, field_index):
+    """Which of this form's fields supplies the basis a frozen field is gathered on.
+
+    Normally the frozen field IS one of this form's unknowns and its ``field_key`` resolves directly.
+    It need not be: a frozen field is *known data*, and the natural way to write an auxiliary operator
+    -- ``jno.precond.form`` for a Schur approximation, a lagged coefficient -- is a form over ONE
+    field that carries another field's solved values as a coefficient. That form never declares the
+    foreign field as an unknown, so its key is absent and the lookup used to die on a bare
+    ``KeyError: <n>`` naming an index the user never chose.
+
+    A frozen field carries its own ``space``/``order``/``value_shape``, so the basis is resolvable
+    without the key: any field here with the SAME space and order has the same nodes, the same
+    connectivity and the same shape functions on this mesh, so gathering the foreign values on it is
+    exact, not an approximation. That is the same borrowing ``freeze_path`` already does below, with
+    "a P1 Lagrange field" generalised to "a field of the matching space".
+
+    A foreign field whose space is NOT present is refused by name: gathering P2 values on P1
+    connectivity would silently read the wrong entries (a P2 field has edge nodes a P1 gather never
+    indexes), and it is exactly the plausible-but-wrong answer this stack does not return.
+    """
+    key = getattr(node, "field_key", None)
+    if key in field_index:
+        return field_index[key]
+
+    want_space = str(getattr(node, "space", "Lagrange")) or "Lagrange"
+    want_order = int(getattr(node, "order", 1))
+    for i, f in enumerate(fields):
+        if int(f["order"]) == want_order and (str(f.get("space", "Lagrange")) or "Lagrange") == want_space:
+            return i
+
+    have = ", ".join(sorted({f"{f.get('space', 'Lagrange') or 'Lagrange'} order {int(f['order'])}" for f in fields}))
+    raise NotImplementedError(
+        f"jno.fem: this form carries a frozen field ({node.name}) on a {want_space} order-{want_order} "
+        f"space, but no field in the form uses that space (it has: {have}). A frozen field is gathered "
+        "on its own space's connectivity, and gathering it on a different one would read the wrong "
+        "nodes -- a P2 field has edge nodes a P1 gather never gets to. This is the usual shape of an "
+        "auxiliary operator (jno.precond.form) whose coefficient comes from a different space than its "
+        "unknown -- a P2 velocity in a P1 pressure form, say. Project the field onto the form's own "
+        "space first and freeze that, or write the auxiliary form over a field of the matching space."
+    )
+
+
 def assemble_fem_native(
     domain,
     volume_terms: List[Any],
@@ -1542,7 +1584,7 @@ def assemble_fem_native(
     # connectivity as the live state, so its shape-gradient contraction matches the trial gradient.
     _frozen_gathered: Dict[Any, Any] = {}
     for _fid, _fnode in _frozen_nodes.items():
-        _ffidx = field_index[_fnode.field_key]
+        _ffidx = _frozen_field_basis_index(_fnode, fields, field_index)
         _fconn = cells_f_j[_ffidx]  # (n_cell, n_local)
         _fvals = jnp.asarray(_fnode.values)
         # scalar frozen field (n_nodes,) -> per-cell (n_local, 1); VECTOR (n_nodes, vec) -> (n_local, vec).

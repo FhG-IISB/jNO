@@ -243,6 +243,29 @@ fem.solve(linear=jno.solve.fgmres(tol=1e-10, restart=40),
     fully traced solve that never supplies a concrete iterate gets a loud `NotImplementedError`, not a
     garbage preconditioner.
 
+    **A coefficient from another field.** An auxiliary form is written over *one* field, and the
+    coefficient it needs often lives on another — PCD's `F_p` carries the velocity into a pressure
+    form, a lagged eddy viscosity carries the previous velocity, a wall-distance field is reused
+    across forms. Freeze the foreign field and use it like any other coefficient:
+
+    ```python
+    w_frozen = w.bind(x=xi, y=yi).freeze(w_values)          # another form's solved field, as data
+    Fp = jno.precond.form([(nu + w_frozen) * (pi.x * qi.x + pi.y * qi.y), p(xb, yb) - 0.0])
+    ```
+
+    The auxiliary form never declares that field as an unknown, so it is resolved by **space** rather
+    than by identity: a field of the same space and order has the same nodes and connectivity on this
+    mesh, so the gather is exact, not an interpolation.
+
+    !!! warning "Matching space only — a mismatch is refused, not approximated"
+        The foreign field's space must be one the auxiliary form already uses. A **P2** field in a
+        **P1** form raises: P2 values carry edge nodes a P1 gather never indexes, and reading them
+        through a P1 slot would produce a plausible, wrong operator rather than a visible failure.
+        Project onto the form's own space first, or write the form over a field of the matching space.
+
+        This is what still blocks **PCD** on a Taylor–Hood pair, where the velocity is P2 and the
+        pressure P1. `lsc()` needs no such coefficient, which is why it exists.
+
 ??? note "`jno.precond.block_diag((field, spec), …)`"
     / `jno.precond.triangular((field, spec), …)` — per-field
     composition over `fem.blocks`. `triangular` is the standard saddle-point shape: last block solved
