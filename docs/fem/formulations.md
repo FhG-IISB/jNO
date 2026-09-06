@@ -477,6 +477,14 @@ keeps falling while the solution degrades.
     differing, not the weak-form language.
 
 !!! warning "Scope — refused by name"
+    * **Steady only.** The lowering test-projects onto a *spatial* FE basis, so a form carrying the
+      time coordinate is refused. It used to build and evaluate, and the number meant nothing:
+      measured on a heat form over `domain(time=(0, 0.1, 5))`, the spatial quadrature carried 120
+      points against the time coordinate's 5, the declared grid never reached the residual (5 steps
+      and 17 gave a bit-identical value), and the initial condition was discarded entirely
+      (`u(initial) - 0` and `u(initial) - 7` also bit-identical). Use an FE trial for a transient weak
+      form, or drive a time-dependent network as a **collocation PINN** through `jno.core`, where the
+      residual and the initial condition are both explicit losses.
     * **1-D and 2-D meshes only.** The network-trial lowering builds its quadrature through the
       1-D/2-D native context; a 3-D domain raises. Use an FE trial, or a collocation PINN.
     * **Single field.** The lowering wraps one primary unknown, so two separate fields raise —

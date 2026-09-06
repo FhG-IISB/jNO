@@ -756,3 +756,56 @@ class TestVpinnOperatorParity:
         a = np.asarray(jno.fem([base + jnn.trace(gu) * jnn.trace(gv), u(xb, yb) - (0.0, 0.0)]).solve(linear=jno.solve.lu()))
         b = np.asarray(jno.fem([base + div_long(ui) * div_long(vi), u(xb, yb) - (0.0, 0.0)]).solve(linear=jno.solve.lu()))
         assert np.linalg.norm(a - b) <= 1e-10 * max(1.0, np.linalg.norm(b)), "trace(jac) is not div"
+
+
+class TestVpinnTransientRefusal:
+    """A transient network trial used to BUILD and EVALUATE, and the number meant nothing."""
+
+    @staticmethod
+    def _heat(with_ic, ic_value=0.0, nsteps=5):
+        dom = jno.Shape.rect(0, 0, 1, 1, size=0.25).domain(time=(0.0, 0.1, nsteps))
+        u, phi = dom.fem_symbols()
+        si = dom.variable("interior", split=True)
+        xi, yi, ti = si[0], si[1], si[2]
+        sb = dom.variable("boundary", split=True)
+        ci = dom.variable("initial", split=True)
+        vi = phi.bind(x=xi, y=yi, t=ti)
+        net = jnn.nn.wrap(foundax.mlp(3, hidden_dims=8, num_layers=2, activation=jax.nn.tanh, key=jax.random.PRNGKey(0)))
+        un = net(xi, yi, ti) * (xi * (1 - xi) * yi * (1 - yi))
+        term = jnn.grad(un, ti) * vi + jnn.grad(un, xi) * jnn.grad(vi, xi) - 1.0 * vi
+        cons = [term, u(sb[0], sb[1]) - 0.0]
+        if with_ic:
+            cons.append(u(*ci) - ic_value)
+        return dom, cons
+
+    def test_a_transient_network_trial_is_refused_by_name(self):
+        """It is refused because the residual it produced was not the problem the user wrote: the
+        lowering test-projects onto a SPATIAL basis, so the declared time grid never entered it and
+        the initial condition was discarded. Training on that converges to something confidently
+        wrong, which is the one outcome this stack does not return."""
+        _dom, cons = self._heat(with_ic=True)
+        with pytest.raises(NotImplementedError, match=r"VPINN.*steady only"):
+            jno.fem(cons)
+
+    def test_the_refusal_names_both_escape_routes(self):
+        _dom, cons = self._heat(with_ic=True)
+        with pytest.raises(NotImplementedError) as ei:
+            jno.fem(cons)
+        msg = str(ei.value)
+        assert "u.t" in msg, "must point at the FE-trial transient path"
+        assert "jno.core" in msg, "must point at the collocation-PINN path"
+
+    def test_a_steady_vpinn_on_a_plain_domain_still_builds(self):
+        """The refusal keys on the TIME COORDINATE appearing in the form, not on the network trial,
+        so ordinary steady VPINNs are untouched."""
+        dom = make_domain()
+        u, phi = dom.fem_symbols()
+        xi, yi, _ = dom.variable("interior", split=True)
+        xb, yb, _ = dom.variable("boundary", split=True)
+        vi = phi.bind(x=xi, y=yi)
+        un = make_scalar_net()(xi, yi) * (xi * (1 - xi) * yi * (1 - yi))
+        pde = jno.fem(
+            [jnn.grad(un, xi) * jnn.grad(vi, xi) + jnn.grad(un, yi) * jnn.grad(vi, yi) - 1.0 * vi, u(xb, yb) - 0.0]
+        )
+        r = float(np.asarray(jno.core([pde.mse], domain=dom).eval([pde.mse])).reshape(()))
+        assert np.isfinite(r) and r > 0.0

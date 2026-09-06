@@ -5573,6 +5573,29 @@ def _fem_impl(
     # It builds the native fem_context (init_fem_native) and test-projects the weak form. Every
     # standard single-field FEM problem has already returned natively above; anything else is rejected
     # explicitly below (fail loud -- never silently mis-assemble). ----
+    if is_vpinn and any(_is_temporal_value_node(_bare(c)) for c in constraints):
+        # A transient network trial BUILDS and EVALUATES today, and the number it produces is
+        # meaningless. Measured on a heat form over `domain(time=(0, 0.1, 5))`:
+        #   * the spatial quadrature carries 120 points while the temporal coordinate carries 5 --
+        #     different lengths, so nothing aligns into a space-time residual;
+        #   * the declared time grid does not reach it at all (5 steps and 17 steps give a
+        #     bit-identical residual);
+        #   * the initial condition is silently discarded (`u(initial) - 0` and `u(initial) - 7`
+        #     give a bit-identical residual), so the problem the network trains on has no initial
+        #     state and is not the one that was written.
+        #
+        # Refuse it. The lowering test-projects onto a SPATIAL FE basis; making this real needs a
+        # decided treatment of time -- space-time test functions, or collocation on the declared grid
+        # with the IC as its own loss term -- and that is a design choice, not an implementation gap.
+        raise NotImplementedError(
+            "jno.fem: a VPINN (network trial) is steady only -- this form carries the time coordinate. "
+            "The lowering test-projects onto a spatial FE basis, so the time grid never enters the "
+            "residual and an initial condition is discarded: it would train, on a problem that is not "
+            "the one you wrote. Use an FE trial for a transient weak form (`u.t` with "
+            "`d.fem_symbols()`), or drive a time-dependent network as a collocation PINN through "
+            "`jno.core`, where the residual and the initial condition are both explicit losses."
+        )
+
     if is_vpinn and getattr(domain, "dimension", None) not in (1, 2):
         # A 3-D VPINN falls past the branch below and dies further in on `Tag 'fem_gauss' is not in
         # the mesh pool` -- an internal tag name, for a scope limit the user cannot infer from it.

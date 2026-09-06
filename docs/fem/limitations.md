@@ -26,7 +26,7 @@ path is unaffected.
 | Affine parameter lowering | one trainable scalar per additive term, not nested | raises |
 | Enclosure radiation | 2-D / axisymmetric, needs a direct solve; you write the radiosity yourself | manual composition |
 | Plasticity | small-strain, isotropic, linear-hardening, whole-domain | raises |
-| VPINN (network trial) | 1-D / 2-D meshes, single field (scalar or vector), no periodic ties | raises |
+| VPINN (network trial) | **steady only**, 1-D / 2-D meshes, single field (scalar or vector), no periodic ties | raises |
 | Element order on RT / N1E / P0 / Hermite / Argyris / Morley | each family has one intrinsic order | raises |
 | `eigs` on a non-symmetric pencil | eigenvalues differentiate, **eigenvectors do not** | NaN, not a silent zero |
 | **Curved-boundary geometry** | straight-sided **by default**; `Shape.curved()` is the fix | **silent** |
@@ -124,8 +124,15 @@ path is unaffected.
     `order ≥ 2`. See [Curved geometry](geometry.md#curved-isoparametric-geometry-shapecurved).
 
 ??? note "VPINN (network trial) — where the lowering stops"
-    A network trial is test-projected onto the FE basis, and that projection is built through the
-    **1-D/2-D** native quadrature context, so a 3-D domain raises rather than proceeding. It is also
+    A network trial is test-projected onto the FE basis, and that projection is **spatial** — so a
+    form carrying the time coordinate is refused. It used to build and evaluate on a meaningless
+    number: the time grid never reached the residual and the initial condition was silently dropped
+    (measured: `u(initial) - 0` and `u(initial) - 7` gave bit-identical residuals). Making it real
+    needs a decided treatment of time — space-time test functions, or collocation on the declared grid
+    with the IC as its own loss — which is a design choice rather than an implementation gap.
+
+    The same projection is built through the **1-D/2-D** native quadrature context, so a 3-D domain
+    raises rather than proceeding. It is also
     **single-field**: a vector unknown is fine (one field with `value_shape=(d,)`, and all four source
     spellings lower identically), but a coupled multi-field system is not. **Periodic ties** are
     refused because a tie is an algebraic reduction of FE trial DOFs and a network trial has none —
