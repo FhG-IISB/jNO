@@ -25,6 +25,8 @@ not via an assemble target.
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Tuple, cast
 
+import numpy as np
+
 from ...trace import (
     Assembly,
     BinaryOp,
@@ -94,6 +96,9 @@ from .weak_form_helpers import (
 )
 from .weak_form_helpers import (
     substitute_trial_for_vpinn as _substitute_trial_for_vpinn,
+)
+from .weak_form_helpers import (
+    test_component_index as _test_component_index,
 )
 
 # -----------------------------------------------------------------------------
@@ -318,6 +323,28 @@ def _extract_test_channel(domain, expr) -> Tuple[str, Placeholder, Dict[str, Any
                 "value_shape": getattr(expr, "value_shape", ()),
                 "variable_id": 0,
             },
+        )
+
+    # a COMPONENT of a vector test function, ``phi[k]``
+    #
+    # Lowered to the vector channel that already works: ``phi[k]`` is ``inner(e_k, phi)``, so the
+    # coefficient is the one-hot ``e_k`` and everything downstream treats it as an ordinary vector
+    # test-value term. The product recursion below then covers ``c * phi[k]`` for free -- it recurses
+    # onto this case and multiplies, giving ``c * e_k``.
+    #
+    # Without this, the natural component spelling assembled on the FEM path (whose kernel evaluates
+    # the accessor numerically) and raised "could not extract a canonical test channel" on the VPINN
+    # path -- the same weak form accepted by one and refused by the other.
+    _comp = _test_component_index(expr)
+    if _comp is not None:
+        _tf = expr.args[0]
+        _shape = tuple(getattr(_tf, "value_shape", ()) or ())
+        _onehot = np.zeros(_shape, dtype=float)
+        _onehot[_comp] = 1.0
+        return (
+            "test_value",
+            Literal(_onehot),
+            {"value_shape": _shape, "variable_id": 0},
         )
 
     # pure grad(test)

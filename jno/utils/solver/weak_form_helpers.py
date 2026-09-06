@@ -154,6 +154,35 @@ def value_shape_num_components(value_shape) -> int:
     return n
 
 
+def test_component_index(node):
+    """Component index ``k`` if ``node`` is ``phi[k]`` on a VECTOR test function, else ``None``.
+
+    A component view lowers to ``FunctionCall(getitem, [TestFunction])`` whose index lives in the
+    accessor's own closure rather than in ``args`` -- the FEM kernel never needs it (it evaluates the
+    accessor numerically, ``node.fn(*args)``), so nothing ever put it on the node. The VPINN path
+    does need it, because it extracts the test channel *symbolically* before any values exist.
+
+    Recovered by applying the accessor to ``arange(dim)``, which returns the index it selects. That
+    reads the closure through its own public behaviour instead of poking at ``__closure__``, and it
+    stays correct if the accessor is ever rebuilt differently.
+    """
+    if not isinstance(node, FunctionCall) or function_name(node) != "getitem":
+        return None
+    if len(node.args) != 1 or not isinstance(node.args[0], TestFunction):
+        return None
+    shape = tuple(getattr(node.args[0], "value_shape", ()) or ())
+    if len(shape) != 1 or shape[0] < 1:
+        return None  # not a plain vector test function
+    try:
+        import numpy as _np
+
+        probe = node.fn(_np.arange(int(shape[0])))
+        k = int(_np.asarray(probe).reshape(()))
+    except Exception:
+        return None
+    return k if 0 <= k < shape[0] else None
+
+
 def is_test_value(node):
     return isinstance(node, TestFunction)
 

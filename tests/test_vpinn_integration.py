@@ -6,6 +6,7 @@ pytest.importorskip("foundax", reason="foundax required for neural VPINN tests")
 
 import foundax
 import jax
+import numpy as np
 
 import jno
 import jno.jnp_ops as jnn
@@ -441,3 +442,58 @@ class TestVpinnScopeRefusals:
                     u(*sb) - 0.0,
                 ]
             )
+
+
+class TestVpinnVectorSource:
+    """A load term on a VECTOR VPINN, written either way, must lower to the same residual."""
+
+    def _build(self, spelling):
+        dom = make_domain()
+        u, phi = dom.fem_symbols(value_shape=(2,))
+        xi, yi, _ = dom.variable("interior", split=True)
+        xb, yb, _ = dom.variable("boundary", split=True)
+        net = jnn.nn.wrap(
+            foundax.mlp(2, output_dim=2, hidden_dims=8, num_layers=2, activation=jax.nn.tanh, key=jax.random.PRNGKey(0))
+        )
+        vi = phi.bind(x=xi, y=yi)
+        u_net = net(xi, yi)
+        gu, gv = jnn.jacobian(u_net, [xi, yi]), jnn.jacobian(vi, [xi, yi])
+        g = 1.0 + 0.0 * xi  # a coordinate-carried constant, so the source is a real traced expression
+        src = (
+            jnn.inner(g * np.array([1.0, 2.0]), vi, n_contract=1) if spelling == "inner" else g * vi[0] + (2.0 * g) * vi[1]
+        )
+        return dom, jno.fem([jnn.inner(gu, gv, n_contract=2) - src, u(xb, yb) - (0.0, 0.0)])
+
+    def test_component_source_lowers_like_the_inner_spelling(self):
+        """``c * phi[k]`` used to raise "could not extract a canonical test channel" on the VPINN
+        path while assembling fine on the FEM path -- the same weak form accepted by one and refused
+        by the other. It now lowers to the vector channel that already worked, ``inner(c*e_k, phi)``,
+        and the oracle is that both spellings give the SAME residual, not merely that both build.
+        """
+        dom_i, pde_i = self._build("inner")
+        dom_c, pde_c = self._build("component")
+        r_i = float(np.asarray(jno.core([pde_i.mse], domain=dom_i).eval([pde_i.mse])).reshape(()))
+        r_c = float(np.asarray(jno.core([pde_c.mse], domain=dom_c).eval([pde_c.mse])).reshape(()))
+        assert r_i > 0.0, "a non-trivial residual is needed for the comparison to mean anything"
+        assert abs(r_i - r_c) <= 1e-12 * max(1.0, abs(r_i)), (
+            f"the two spellings of one source must lower identically: inner={r_i:.12e} component={r_c:.12e}"
+        )
+
+    def test_a_component_source_actually_enters_the_residual(self):
+        """Guard against the lowering quietly producing a zero coefficient (which would also make the
+        two spellings 'agree'): dropping the source must change the residual."""
+        dom_c, pde_c = self._build("component")
+        r_with = float(np.asarray(jno.core([pde_c.mse], domain=dom_c).eval([pde_c.mse])).reshape(()))
+
+        dom = make_domain()
+        u, phi = dom.fem_symbols(value_shape=(2,))
+        xi, yi, _ = dom.variable("interior", split=True)
+        xb, yb, _ = dom.variable("boundary", split=True)
+        net = jnn.nn.wrap(
+            foundax.mlp(2, output_dim=2, hidden_dims=8, num_layers=2, activation=jax.nn.tanh, key=jax.random.PRNGKey(0))
+        )
+        vi = phi.bind(x=xi, y=yi)
+        gu, gv = jnn.jacobian(net(xi, yi), [xi, yi]), jnn.jacobian(vi, [xi, yi])
+        pde0 = jno.fem([jnn.inner(gu, gv, n_contract=2), u(xb, yb) - (0.0, 0.0)])
+        r_without = float(np.asarray(jno.core([pde0.mse], domain=dom).eval([pde0.mse])).reshape(()))
+        assert abs(r_with - r_without) > 1e-9, "the component source is not reaching the residual at all"
