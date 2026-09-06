@@ -443,9 +443,20 @@ def run_contact_solve(fem, spec, *, solve_fn=None, **kwargs):
         between rounds. Left alone it would replay round 1's pairing for every later round, and worse,
         an ordinary ``fem.solve()`` afterwards would silently get the searched answer.
 
-        Measured cost: **none** on the ordinary (non-parametric) path, which never populates that cache
-        -- ``FemResidualOperator.solve`` returns a ``FunctionCall`` and never reaches it. On a
-        runtime-parametric form it does force a retrace per round; that has not been measured.
+        This POP costs nothing on the ordinary (non-parametric) path, which never populates that cache
+        -- ``FemResidualOperator.solve`` returns a ``FunctionCall`` and never reaches it. Do not read
+        that as "a round is free": the steady loop re-enters ``_solve_dispatch`` each round, which
+        builds fresh closures, so the round is RETRACED regardless of this cache. Measured on the
+        stacked-bars fixture, the residual is entered 8 times per round at Python level and the total
+        scales linearly with the rounds actually run (16 for 2 rounds, 24 for 3).
+
+        The load-path march does not pay this -- ``_march_eager_contact`` compiles its step once and
+        passes the tables as traced arguments (see :mod:`jno.utils.solver.history_march`), which took
+        that path from 583 compilations / 18.0 s to 127 / 1.4 s. The steady loop cannot do the same as
+        written, because it injects the tables by CLOSURE (``_inject`` above) rather than threading
+        them through ``_solve_dispatch``, and a captured table is baked in at trace time -- which is
+        the very thing this pop exists to defeat. Fixing it means threading ``args`` through the steady
+        solve entry point; not done.
         """
         op.__dict__.pop("_eager_solve_cache", None)
 
