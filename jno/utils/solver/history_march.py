@@ -205,6 +205,24 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, **kwargs):
                 "re-pair. Add the gap to the term list, or drop `contact=`."
             )
         n_steps = int(tau_grid.shape[0])
+        # Compile the step ONCE. `_step_once` builds a fresh `args` dict and fresh residual/jacobian
+        # lambdas on every call, so handing those straight to the solver gave JAX a new function object
+        # each round and it retraced: measured on a load-path contact march, 22 new XLA compilations per
+        # round with the assembled tangent and 26 matrix-free, forever. Each retained executable pins
+        # that round's gap tables as constants, which is the memory growth (~65 MB per load step) and a
+        # large part of the slowdown, one cause. Wrapping the step in a single `jax.jit` makes the tables
+        # traced ARGUMENTS of a cached executable, which is what threading them on `args` was for; their
+        # shapes are fixed by the declaration, so only values change between rounds. The scanned march
+        # already traces this same function inside `lax.scan`, so it is known to be traceable.
+        #
+        # NOT with the assembled tangent. `newton(direct=True)` hoists the contact block's sparsity
+        # pattern from the pairing's CONCRETE node ids, so the tables have to be real arrays there, and
+        # under `jit` they arrive as tracers (`TracerArrayConversionError` on the ids). That path keeps
+        # the per-round retrace it always had; the trade it already documents -- faster per solve, more
+        # memory -- now also includes this. Measured on a 10-step load-path march, matrix-free:
+        # 583 compilations / 18.0 s before, 127 / 1.4 s after, with a BIT-IDENTICAL trajectory.
+        _wants_jac = bool(getattr(solve_fn, "wants_jacobian", False))
+        _step_compiled = _step_once if _wants_jac else jax.jit(_step_once)
         # The search applies from the FIRST step, for the same reason it does in the steady driver: the
         # build-time tables are unbounded, so on a closed body the far side pairs through the body.
         relax = float(getattr(spec, "relax", 1.0))
@@ -220,7 +238,7 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, **kwargs):
             path_k = {fid: fr[k] for fid, fr in path_frames.items()}
             u_prev, settled, moved, rel, quiet, hist = None, False, None, float("inf"), 0, []
             for rnd in range(int(spec.rounds)):
-                u_new, nb, nsb = _step_once(
+                u_new, nb, nsb = _step_compiled(
                     u, bufs, sbufs, tau_k, path_k, {**param_args, "__gap_tables__": tables}
                 )
                 un_raw = np.asarray(u_new)

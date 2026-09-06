@@ -692,3 +692,39 @@ def test_the_search_follows_a_large_slide_in_three_dimensions():
         f"the frozen pairing reports {frozen:.4f} where the truth is ~{lo:.4f}; if the 3-D search were "
         "doing nothing these would agree"
     )
+
+
+def test_the_marched_step_is_compiled_once_not_once_per_round():
+    """A load-path contact march must not retrace every round.
+
+    ``_step_once`` builds a fresh ``args`` dict and fresh residual/jacobian lambdas on each call, so
+    handing those straight to the solver gave JAX a new function object per round and it retraced:
+    measured, 22 new XLA compilations per round with the assembled tangent and 26 matrix-free, forever.
+    Every retained executable pins that round's gap tables as constants, so the cost is both memory
+    (~65 MB per load step on a sheet-forming march, growing linearly) and time.
+
+    The oracle is version-independent: count how many times the residual is entered at PYTHON level.
+    Inside a compiled step that happens once, at trace time, so the count cannot depend on how many
+    load steps were marched. Before the fix it was exactly 18 per step -- 72 for 4 steps, 216 for 12.
+    """
+    counts = []
+    for nsteps in (4, 12):
+        _, fem, _ = _al_contact_march(nsteps=nsteps)
+        op = fem.operator
+        base, cnt = op.residual, [0]
+
+        def counted(u, args=None, t=None, _b=base, _c=cnt):
+            _c[0] += 1
+            return _b(u, args, t)
+
+        op.residual = counted
+        u = np.asarray(fem.solve(contact=jno.solve.contact(rounds=12, tol=1e-4),
+                                 nonlinear=jno.solve.newton(line_search=True)))
+        assert np.isfinite(u).all()
+        counts.append(cnt[0])
+
+    assert counts[1] <= counts[0], (
+        f"tracing scales with the load path: {counts[0]} entries for 4 steps, {counts[1]} for 12 -- "
+        "the step is being retraced per round rather than compiled once"
+    )
+    assert counts[1] < 20, f"the step is traced {counts[1]} times; it should be a small constant"
