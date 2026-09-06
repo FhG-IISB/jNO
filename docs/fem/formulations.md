@@ -339,3 +339,83 @@ Any energy-derived law works the same way — Mooney-Rivlin, Ogden, Gent, anisot
 does a chemical potential `mu = diff(f, c)` or an electro/magnetostrictive coupling.
 
 ---
+
+
+---
+
+## The trial may be a network — VPINN and Deep Ritz
+
+Everything above solves for FE coefficients. The same term list also accepts a **neural trial**: write
+the network where the unknown would go and `jno.fem` detects it, test-projects the weak form onto the
+FE basis, and returns a trainable residual instead of an operator. Nothing else about the authoring
+changes — same domain, same symbols, same `jno.fem([...])`.
+
+```python
+net    = jno.nn(foundax.mlp(2, hidden_dims=32, num_layers=3, activation=jax.nn.tanh, key=key))
+ansatz = xi * (1 - xi) * yi * (1 - yi)          # hard-BC ansatz: vanishes on the boundary
+u_net  = net(xi, yi) * ansatz                   # the trial IS the network
+vi     = phi.bind(x=xi, y=yi)                   # the test function is still the FE basis
+
+pde = jno.fem([grad(u_net, xi) * grad(vi, xi) + grad(u_net, yi) * grad(vi, yi) - f * vi,
+               u(xb, yb) - 0.0])                # declares WHICH test functions vanish
+jno.core([pde.mse], domain=dom).solve(2500)     # train the weights
+```
+
+This is the Petrov–Galerkin variational PINN of Kharazmi, Zhang & Karniadakis (*hp-VPINNs*, **CMAME**
+374 (2021) 113547). The Dirichlet term is not optional decoration: it tells `jno.fem` which test
+functions vanish on the boundary, so their irreducible `∂u/∂n` flux is masked out of the loss.
+Without it the loss minimum is *not* the PDE solution.
+
+!!! measured "What the network trial actually reaches, against analytic solutions"
+    | problem | rel L2 |
+    |---|---|
+    | Poisson, hard-BC ansatz | 4.2e-05 |
+    | Neumann flux (`u = x`) | 6.8e-04 |
+    | cubic nonlinearity (`+ u³`) | 9.8e-05 |
+    | vector Poisson, `u* = (a, 2a)` | 1.3e-04 / 2.8e-04 |
+    | Deep Ritz (energy, Gauss quadrature) | 8.8e-04 |
+    | network trial **+ inverse parameter** | `k`: 1.00 → 2.901 (truth 3.00), field 3.4e-02 |
+
+    The last row is the combination worth knowing: a network trial and a `jno.np.parameter` train in
+    the same loss, so the field and an unknown coefficient are recovered together. Note it needs a
+    **data** term — the residual alone is degenerate, since `k·a(u,v) = (f,v)` with `u` free is
+    satisfied by any `k` with `u` rescaled.
+
+### A source on a vector field — four spellings, one meaning
+
+A value-channel coefficient is a scalar per quadrature point, or one vector per point. Constants and
+stacks do not naturally arrive in that layout, so all of these are accepted and lower **identically**:
+
+```python
+g * vi[0] + (2 * g) * vi[1]                  # per component
+jno.np.inner(jnp.array([1.0, 2.0]), vi, 1)   # a CONSTANT vector (no quadrature axis)
+jno.np.inner(g * jnp.array([1.0, 2.0]), vi, 1)
+jno.np.inner(jno.np.stack([g, 2 * g]), vi, 1)   # component-first, as `stack` builds it
+```
+
+One corner is resolved by precedence rather than a guess: a bare `(k,)` coefficient with `k` equal to
+the quadrature-point count is read as a per-point **scalar**, that being the ordinary case. A constant
+vector of exactly that length therefore needs an explicit quadrature axis (`(1 + 0*x) * jnp.array(...)`).
+
+### Deep Ritz — and the quadrature that makes it honest
+
+For an energy-minimising formulation there are no test functions at all: write the functional and
+minimise it.
+
+```python
+energy = (0.5 * (ux**2 + uy**2) - f * uu).integrate(quadrature="gauss")
+jno.core([energy], domain=dom).solve(4000)
+```
+
+E & Yu, *Commun. Math. Stat.* **6**(1) (2018). Use `quadrature="gauss"`: the default nodal rule samples
+the energy only at mesh vertices, and a network expressive enough to develop structure *between* them
+drives the discrete energy below the true minimum — a variational crime in which the reported loss
+keeps falling while the solution degrades.
+
+!!! warning "Scope — refused by name"
+    * **1-D and 2-D meshes only.** The network-trial lowering builds its quadrature through the
+      1-D/2-D native context; a 3-D domain raises. Use an FE trial, or a collocation PINN.
+    * **Single field.** A coupled multi-field VPINN raises. Scalar and vector fields are both fine —
+      a vector field is one field with `value_shape=(d,)`.
+    * **No periodic ties.** A tie is an algebraic reduction of FE trial DOFs, and a network trial has
+      none. Impose periodicity inside the network instead (a periodic input embedding).
