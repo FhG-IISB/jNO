@@ -796,6 +796,31 @@ def _frozen_field_basis_index(node, fields, field_index):
     )
 
 
+def _declared_parameter_size(expr):
+    """Number of components a runtime parameter was declared with, or ``None`` if unreadable.
+
+    ``None`` means "cannot tell", and every caller must then leave behaviour unchanged -- guessing
+    would turn a working form into a false refusal. Read from the parameter module's own leaves, which
+    is where ``jno.np.parameter(shape)`` records what the user asked for.
+    """
+    model = getattr(expr, "model", None)
+    module = getattr(model, "module", None)
+    if module is None:
+        return None
+    try:
+        import jax as _jax
+
+        leaves = [lf for lf in _jax.tree_util.tree_leaves(module) if hasattr(lf, "shape")]
+    except Exception:
+        return None
+    if len(leaves) != 1:
+        return None  # not the single-array parameter this guard is about
+    try:
+        return int(np.prod(leaves[0].shape))
+    except Exception:
+        return None
+
+
 def assemble_fem_native(
     domain,
     volume_terms: List[Any],
@@ -1009,6 +1034,31 @@ def assemble_fem_native(
     from .parametric_helpers import _fem_field_kind
 
     _cell_field_names: set = {n for n, expr in _rt_param_exprs.items() if _fem_field_kind(expr) == "cell"}
+
+    # A BARE (non-field) runtime parameter is packed as a single scalar -- ``flat[:1]`` in
+    # ``_runtime_vals`` below -- and read back as one. A multi-component one therefore had every entry
+    # past the first SILENTLY DISCARDED: `parameter((2,))` initialised to [2.0, 999.0] and to
+    # [2.0, 0.001] assembled bit-identical operators. Indexing it (`k[1] * ...`, the natural spelling
+    # for an anisotropic coefficient) instead died deep in the trace layer on a bare
+    # ``IndexError: array is 0-dimensional``, naming nothing the user wrote.
+    #
+    # Refuse it here, where the declared shape is still visible. Only when the size is *known* to
+    # exceed one: a shape this cannot read stays on the existing path rather than becoming a false
+    # refusal. Field (nodal) and cell (P0) parameters are exempt -- they are many-valued by
+    # construction and have their own gather.
+    for _pname in runtime_parameter_tags:
+        if _pname in _field_param_names or _pname in _cell_field_names:
+            continue
+        _psize = _declared_parameter_size(_rt_param_exprs.get(_pname))
+        if _psize is not None and _psize > 1:
+            raise NotImplementedError(
+                f"jno.fem: the runtime parameter {_pname!r} was declared with {_psize} components, but a "
+                "bare (non-field) parameter reaches the element kernel as a single scalar -- the "
+                "remaining components would be silently dropped, and indexing it (k[1]) fails inside the "
+                "trace layer. Use one scalar parameter per component (`kx = jno.np.parameter((1,)); ky = "
+                "jno.np.parameter((1,))`, then `kx * ui.x * vi.x + ky * ui.y * vi.y`), or a FIELD "
+                "parameter `jno.np.parameter(<P1 symbol>)` for one value per node."
+            )
 
     # Neural coefficients (``jno.nn.wrap(net)`` called inside the weak form, e.g. ``net(x,y)*u.dx*v.dx``).
     # Unlike scalar/nodal parameters they never enter the per-cell ``volume_vars`` -- a weight pytree is

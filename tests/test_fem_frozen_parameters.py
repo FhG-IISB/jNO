@@ -255,3 +255,45 @@ def test_a_frozen_field_on_a_space_the_form_lacks_is_refused_by_name():
     with pytest.raises(NotImplementedError, match=r"order-2"):
         aux = jno.precond.form([(1.0 + v2_frozen) * (pi.x * qi.x + pi.y * qi.y), p(xb, yb) - 0.0])
         main.solve(linear=jno.solve.fgmres(), precond=aux)
+
+
+# =================================================================================================
+# A multi-component BARE parameter is refused, not silently truncated
+# =================================================================================================
+
+
+def test_multicomponent_bare_parameter_is_refused_by_name():
+    """A bare (non-field) parameter reaches the kernel as ONE scalar (``flat[:1]``), so a
+    multi-component one had every entry past the first silently discarded.
+
+    Measured before the guard: ``parameter((2,))`` initialised to ``[2.0, 999.0]`` and to
+    ``[2.0, 0.001]`` assembled **bit-identical** operators. Indexing it -- ``k[1] * ui.y * vi.y``,
+    the natural spelling for an anisotropic coefficient -- instead died inside the trace layer on a
+    bare ``IndexError: array is 0-dimensional``, naming nothing the user wrote. Both are now one
+    build-time refusal that names the parameter, its size, and the spelling that works.
+    """
+    d, u, phi, xi, yi, xb, yb, ui, vi = _setup()
+    k = jno.np.parameter((2,), name="k")
+    k.initialize(lambda key, s, dtype=jnp.float64: jnp.asarray([2.0, 999.0], dtype).reshape(s))
+    with pytest.raises(NotImplementedError, match=r"2 components"):
+        jno.fem([k * (ui.x * vi.x + ui.y * vi.y) - 1.0 * vi, u(xb, yb) - 0.0])
+
+    # the indexed spelling is the same refusal, not an IndexError from three layers down
+    k2 = jno.np.parameter((2,), name="k2")
+    k2.initialize(lambda key, s, dtype=jnp.float64: jnp.full(s, 1.0, dtype))
+    with pytest.raises(NotImplementedError, match=r"2 components"):
+        jno.fem([k2[0] * ui.x * vi.x + k2[1] * ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0])
+
+
+def test_the_guard_does_not_fire_on_scalar_or_field_parameters():
+    """No false refusals: a scalar parameter is size 1, and a nodal FIELD parameter is many-valued
+    by construction with its own per-cell gather. Both must still assemble."""
+    d, u, phi, xi, yi, xb, yb, ui, vi = _setup()
+
+    s = jno.np.parameter((1,), name="s").initialize(lambda key, sh, dtype=jnp.float64: jnp.full(sh, 2.0, dtype))
+    fem_s = jno.fem([s * (ui.x * vi.x + ui.y * vi.y) - 1.0 * vi, u(xb, yb) - 0.0])
+    assert isinstance(fem_s._op, FemLinearSystem) and fem_s._op.is_parametric
+
+    fld = jno.np.parameter(phi, name="fld").initialize(lambda key, sh, dtype=jnp.float64: jnp.full(sh, 2.0, dtype))
+    fem_f = jno.fem([fld * (ui.x * vi.x + ui.y * vi.y) - 1.0 * vi, u(xb, yb) - 0.0])
+    assert isinstance(fem_f._op, FemLinearSystem) and fem_f._op.is_parametric
