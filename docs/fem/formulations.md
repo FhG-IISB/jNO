@@ -452,6 +452,30 @@ the energy only at mesh vertices, and a network expressive enough to develop str
 drives the discrete energy below the true minimum — a variational crime in which the reported loss
 keeps falling while the solution degrades.
 
+!!! note "One DSL, either trial — swept operator by operator"
+    A weak form should mean the same thing whichever trial it carries, so the operators were checked
+    side by side: the same form built once with `d.fem_symbols()` and once with a network, comparing
+    what each lowering accepts. `grad·grad`, `inner(grad, grad)`, reaction, `u³`, `exp(u)`,
+    `laplacian(u)·v`, a coefficient `k(x)`, a Neumann boundary term, `inner(jac, jac, 2)`,
+    `symgrad : symgrad`, `div(u)·div(v)` and component terms (`u[0]·v[0]`, `u[1]·v[0]`) all lower on
+    both.
+
+    Two of those did not, until this sweep found them. A **constant scalar source** — `- 1.0 * phi`,
+    the plainest one there is — raised on the network trial, because a constant carries no quadrature
+    axis and the value channel demanded one per point; every shipped VPINN happens to write a
+    *coordinate* source, which does. And **`div`**, which has no node of its own (it is
+    `trace(jacobian(phi, X))`, the way a book writes it), was not recognised by the channel extractor,
+    so grad-div stabilisation and an incompressibility penalty assembled on the FEM path only.
+
+    `div(v)` is `I : grad(v)`, so it lowers to the grad channel with the identity as its coefficient.
+    Checked end to end: a VPINN trained on a grad-div form (`γ = 5`) matches the FEM solve of the
+    identical form to **1.3e-02**, and on the FEM trial `trace(jac(w))` equals the longhand
+    `∂w₀/∂x + ∂w₁/∂y` exactly.
+
+    One asymmetry is inherent rather than a gap: a bound field view offers `ui.x`, while a network
+    expression is not a field view and takes `jno.np.grad(u_net, xi)`. That is the trial object
+    differing, not the weak-form language.
+
 !!! warning "Scope — refused by name"
     * **1-D and 2-D meshes only.** The network-trial lowering builds its quadrature through the
       1-D/2-D native context; a 3-D domain raises. Use an FE trial, or a collocation PINN.

@@ -83,6 +83,9 @@ from .weak_form_helpers import (
     infer_term_bucket as _infer_term_bucket,
 )
 from .weak_form_helpers import (
+    is_div_test as _is_div_test,
+)
+from .weak_form_helpers import (
     is_symgrad_test as _is_symgrad_test,
 )
 from .weak_form_helpers import (
@@ -294,6 +297,26 @@ def _split_additive_terms(domain, node, sign=1.0):
     )
 
 
+def _div_test_coeff(coeff, dim: int):
+    """``c * div(phi)`` as a grad-channel coefficient: ``c`` times the ``dim x dim`` identity.
+
+    ``div(v) = I : grad(v)``, so the grad channel is the right home -- but ``c`` is one value per
+    quadrature point, shape ``(Nq,)``, and the identity is ``(dim, dim)``. Right-aligned those do not
+    broadcast (``Nq`` would meet ``dim``); the value axes belong at the END, which is the convention
+    everywhere else in the assemblers. So the product is formed explicitly, ``c[..., None, None] * I``,
+    rather than left to generic broadcasting that would either fail or align the wrong axes.
+    """
+    eye = np.eye(int(dim))
+
+    def _fn(c, _eye=eye):
+        import jax.numpy as _jnp
+
+        c = _jnp.asarray(c)
+        return c[..., None, None] * _eye
+
+    return FunctionCall(_fn, [coeff], name="div_test_coeff")
+
+
 def _extract_test_channel(domain, expr) -> Tuple[str, Placeholder, Dict[str, Any]]:
     """
     Extract the VPINN test-function channel from a signed weak-form term.
@@ -345,6 +368,21 @@ def _extract_test_channel(domain, expr) -> Tuple[str, Placeholder, Dict[str, Any
             "test_value",
             Literal(_onehot),
             {"value_shape": _shape, "variable_id": 0},
+        )
+
+    # div(test), spelled trace(grad(phi))
+    #
+    # ``div(v)`` is ``I : grad(v)``, so it IS the grad channel with the identity as its coefficient.
+    # The product recursion below then covers ``c * div(v)`` for free, giving ``c * I``. Written this
+    # way there is no new channel and no second code path -- and it matches the FEM assembler, which
+    # has always taken this spelling.
+    if _is_div_test(expr):
+        _tf = expr.args[0].target
+        _d = int(getattr(domain, "dimension", 2) or 2)
+        return (
+            "test_grad",
+            Literal(np.eye(_d)),
+            {"value_shape": getattr(_tf, "value_shape", ()), "variable_id": 0},
         )
 
     # pure grad(test)
@@ -409,6 +447,19 @@ def _extract_test_channel(domain, expr) -> Tuple[str, Placeholder, Dict[str, Any
                 left,
                 {
                     "value_shape": getattr(right, "value_shape", ()),
+                    "variable_id": 0,
+                },
+            )
+
+        if _is_div_test(left) or _is_div_test(right):
+            div_node = left if _is_div_test(left) else right
+            other = right if _is_div_test(left) else left
+            _d = int(getattr(domain, "dimension", 2) or 2)
+            return (
+                "test_grad",
+                _div_test_coeff(other, _d),
+                {
+                    "value_shape": getattr(div_node.args[0].target, "value_shape", ()),
                     "variable_id": 0,
                 },
             )

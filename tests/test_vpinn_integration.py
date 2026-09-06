@@ -663,3 +663,96 @@ class TestVpinnCoupledAsVector:
                     b(xb, yb) - 0.0,
                 ]
             )
+
+
+class TestVpinnOperatorParity:
+    """The weak-form DSL is one language: an operator the FEM trial accepts, the network trial must
+    accept too. Each case here was a divergence found by sweeping the operators side by side."""
+
+    @staticmethod
+    def _scalar(source, trial_is_net):
+        dom = make_domain()
+        u, phi = dom.fem_symbols()
+        xi, yi, _ = dom.variable("interior", split=True)
+        xb, yb, _ = dom.variable("boundary", split=True)
+        vi = phi.bind(x=xi, y=yi)
+        if trial_is_net:
+            trial = make_scalar_net()(xi, yi) * (xi * (1 - xi) * yi * (1 - yi))
+        else:
+            trial = u.bind(x=xi, y=yi)
+        term = jnn.grad(trial, xi) * jnn.grad(vi, xi) + jnn.grad(trial, yi) * jnn.grad(vi, yi)
+        return dom, jno.fem([term - source(vi, xi), u(xb, yb) - 0.0])
+
+    def test_a_constant_scalar_source_is_accepted_on_the_network_trial(self):
+        """``- 1.0 * phi``, the plainest source there is, used to raise ``coeff shape (1,)
+        incompatible with shape_vals_flat``: a constant has no quadrature axis, and the value channel
+        demanded one per point. It went unnoticed because every shipped VPINN writes a *coordinate*
+        source, which does carry that axis.
+
+        Oracle: it must equal the same constant written as a (constant-valued) coordinate expression.
+        """
+        dom_c, pde_c = self._scalar(lambda vi, xi: 1.0 * vi, trial_is_net=True)
+        dom_x, pde_x = self._scalar(lambda vi, xi: (1.0 + 0.0 * xi) * vi, trial_is_net=True)
+        r_c = float(np.asarray(jno.core([pde_c.mse], domain=dom_c).eval([pde_c.mse])).reshape(()))
+        r_x = float(np.asarray(jno.core([pde_x.mse], domain=dom_x).eval([pde_x.mse])).reshape(()))
+        assert r_c > 0.0
+        assert abs(r_c - r_x) <= 1e-12 * max(1.0, abs(r_x)), (
+            f"a constant source must lower like its coordinate spelling: {r_c:.12e} vs {r_x:.12e}"
+        )
+
+    def test_the_fem_trial_takes_that_source_too(self):
+        _dom, fem = self._scalar(lambda vi, xi: 1.0 * vi, trial_is_net=False)
+        sol = np.asarray(fem.solve(linear=jno.solve.lu()))
+        assert np.all(np.isfinite(sol)) and np.linalg.norm(sol) > 0.0
+
+    @staticmethod
+    def _graddiv(trial_is_net):
+        dom = make_domain()
+        u, phi = dom.fem_symbols(value_shape=(2,))
+        xi, yi, _ = dom.variable("interior", split=True)
+        xb, yb, _ = dom.variable("boundary", split=True)
+        vi = phi.bind(x=xi, y=yi)
+        if trial_is_net:
+            net = jnn.nn.wrap(
+                foundax.mlp(2, output_dim=2, hidden_dims=8, num_layers=2, activation=jax.nn.tanh, key=jax.random.PRNGKey(0))
+            )
+            trial = net(xi, yi) * (xi * (1 - xi) * yi * (1 - yi))
+        else:
+            trial = u.bind(x=xi, y=yi)
+        gu, gv = jnn.jacobian(trial, [xi, yi]), jnn.jacobian(vi, [xi, yi])
+        term = (
+            jnn.inner(gu, gv, n_contract=2)
+            + jnn.trace(gu) * jnn.trace(gv)  # div(u) * div(v)
+            - jnn.inner(np.array([1.0, 1.0]), vi, n_contract=1)
+        )
+        return dom, jno.fem([term, u(xb, yb) - (0.0, 0.0)])
+
+    def test_grad_div_is_accepted_on_both_trials(self):
+        """``div`` has no node of its own -- it is ``trace(jacobian(phi, X))``, the way a book writes
+        it -- and the VPINN channel extractor did not recognise the composition. So grad-div
+        stabilisation and an incompressibility penalty assembled on the FEM path and raised on the
+        network one. ``div(v)`` is ``I : grad(v)``, so it lowers to the grad channel with the identity
+        as its coefficient."""
+        _d1, fem = self._graddiv(trial_is_net=False)
+        sol = np.asarray(fem.solve(linear=jno.solve.lu()))
+        assert np.all(np.isfinite(sol)) and np.linalg.norm(sol) > 0.0
+
+        dom, pde = self._graddiv(trial_is_net=True)
+        r = float(np.asarray(jno.core([pde.mse], domain=dom).eval([pde.mse])).reshape(()))
+        assert np.isfinite(r) and r > 0.0
+
+    def test_trace_of_the_jacobian_really_is_the_divergence(self):
+        """Guard the lowering's premise: ``trace(jac(w))`` must equal the longhand
+        ``dw0/dx + dw1/dy``. Checked on the FEM trial, where both spellings assemble."""
+        dom = make_domain()
+        u, phi = dom.fem_symbols(value_shape=(2,))
+        xi, yi, _ = dom.variable("interior", split=True)
+        xb, yb, _ = dom.variable("boundary", split=True)
+        vi, ui = phi.bind(x=xi, y=yi), u.bind(x=xi, y=yi)
+        gu, gv = jnn.jacobian(ui, [xi, yi]), jnn.jacobian(vi, [xi, yi])
+        base = jnn.inner(gu, gv, n_contract=2) - jnn.inner(np.array([1.0, 2.0]), vi, n_contract=1)
+        div_long = lambda w: jnn.grad(w[0], xi) + jnn.grad(w[1], yi)
+
+        a = np.asarray(jno.fem([base + jnn.trace(gu) * jnn.trace(gv), u(xb, yb) - (0.0, 0.0)]).solve(linear=jno.solve.lu()))
+        b = np.asarray(jno.fem([base + div_long(ui) * div_long(vi), u(xb, yb) - (0.0, 0.0)]).solve(linear=jno.solve.lu()))
+        assert np.linalg.norm(a - b) <= 1e-10 * max(1.0, np.linalg.norm(b)), "trace(jac) is not div"

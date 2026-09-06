@@ -2494,11 +2494,16 @@ class TraceEvaluator:
             )
 
         if coeff.ndim == 0:
-            return coeff[None]
+            # a CONSTANT scalar -- `- 1.0 * phi`, the plainest source there is. It has no quadrature
+            # axis because it does not vary over the points, so it broadcasts. This used to become
+            # `(1,)` and then fail the per-point length check against Nq.
+            return jnp.broadcast_to(coeff, (n_q_total,))
         if coeff.ndim == 1:
             if coeff.shape[0] == n_q_total:
                 return coeff  # per-quadrature-point scalar, the ordinary case
-            # a constant vector coefficient: no quadrature axis, broadcast it over the points
+            if coeff.shape[0] == 1:
+                return jnp.broadcast_to(coeff[0], (n_q_total,))  # a constant scalar, written (1,)
+            # a constant VECTOR coefficient: no quadrature axis, broadcast it over the points
             return jnp.broadcast_to(coeff[None, :], (n_q_total, coeff.shape[0]))
         if coeff.ndim == 2:
             if coeff.shape[1] == 1:

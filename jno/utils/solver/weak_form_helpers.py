@@ -183,6 +183,22 @@ def test_component_index(node):
     return k if 0 <= k < shape[0] else None
 
 
+def is_div_test(node) -> bool:
+    """Whether ``node`` is ``div(phi)`` written as ``trace(grad(phi))`` on a vector test function.
+
+    ``div`` has no node of its own in the trace -- it is spelled ``trace(jacobian(phi, X))``, the way
+    a book writes it. The VPINN channel extractor therefore has to recognise the composition, which
+    it did not: ``div(u)*div(v)`` (grad-div stabilisation, an incompressibility penalty) assembled on
+    the FEM path and raised "could not extract a canonical test channel" on the network-trial path.
+    """
+    if not isinstance(node, FunctionCall) or function_name(node) != "trace":
+        return False
+    if len(node.args) != 1:
+        return False
+    inner_node = node.args[0]
+    return isinstance(inner_node, Jacobian) and isinstance(inner_node.target, TestFunction)
+
+
 def is_test_value(node):
     return isinstance(node, TestFunction)
 
