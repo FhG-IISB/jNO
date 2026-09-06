@@ -4711,7 +4711,13 @@ def compress_plan(indices):
     idx = np.stack([uniq // stride, uniq % stride], axis=1).astype(np.int32)
     # int32 inverse: it is one entry per RAW triplet, so on a large 3-D operator it is the biggest
     # array the plan holds -- halving it against numpy's int64 default is worth the cast.
-    plan = jnp.asarray(idx), jnp.asarray(inverse.reshape(-1).astype(np.int32)), int(uniq.shape[0])
+    # NUMPY, not jnp. This plan is pure host data -- it comes from mesh connectivity -- and it is kept
+    # in a module-level cache. Building it with `jnp.asarray` while inside a trace produced trace-bound
+    # arrays, cached them, and handed them back to a later trace: JAX raised UnexpectedTracerError from
+    # a staggered sweep, which builds its Jacobian wrapper inside a `while_body`. `apply_compress_plan`
+    # feeds these straight to `segment_sum` and the BCOO constructor, both of which take numpy, so
+    # nothing downstream needs the conversion -- it only ever created the hazard.
+    plan = idx, inverse.reshape(-1).astype(np.int32), int(uniq.shape[0])
     _PLAN_CACHE[key] = plan
     while len(_PLAN_CACHE) > _PLAN_CACHE_MAX:
         _PLAN_CACHE.popitem(last=False)
