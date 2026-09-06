@@ -2461,17 +2461,18 @@ class TraceEvaluator:
         """Put a value-channel coefficient into the layout assembly expects: ``(Nq,)`` for a scalar
         test function, ``(Nq, vec)`` for a vector one -- quadrature first, component second.
 
-        Two spellings a user reasonably writes do not arrive that way, and both used to die on a raw
-        shape error naming internal arrays:
+        One spelling a user reasonably writes does not arrive that way and used to die on a raw shape
+        error naming internal arrays: a **constant vector** coefficient,
+        ``inner(jnp.array([1.0, 2.0]), phi)`` -- shape ``(vec,)``, with no quadrature axis at all,
+        because a constant does not vary over the points. It has exactly one sensible reading, so it
+        broadcasts rather than being refused.
 
-        * a **constant vector** coefficient, ``inner(jnp.array([1.0, 2.0]), phi)`` -- shape ``(vec,)``,
-          with no quadrature axis at all, because a constant does not vary over the points. It
-          broadcasts.
-        * a **stacked** one, ``inner(jnn.stack([f0, f1]), phi)`` -- shape ``(vec, Nq, 1)``, component
-          first, because that is what ``stack`` builds. It transposes.
-
-        Both are rewrites with exactly one sensible reading, so they are performed rather than
-        refused.
+        A **component-first** array is NOT rewritten. ``jnp.stack([f0, f1])`` builds ``(vec, Nq)``
+        because ``stack`` defaults to ``axis=0``, and the value axis is trailing everywhere in this
+        stack -- so that spelling really is the wrong one, and ``stack([...], axis=-1)`` is the right
+        one. Transposing it silently would be guessing at intent, and would make this path accept
+        something the FEM assembler rejects. It is named instead, on both paths, so one weak form
+        means one thing.
 
         One corner is genuinely ambiguous and is resolved by precedence, not by a guess: a bare
         ``(k,)`` with ``k == Nq`` is read as a per-point **scalar**, because that is the ordinary
@@ -2481,11 +2482,16 @@ class TraceEvaluator:
         """
         coeff = jnp.asarray(coeff)
 
-        # component-first stacks: (vec, Nq, 1) / (vec, Nq) -> (Nq, vec)
         while coeff.ndim > 2 and coeff.shape[-1] == 1:
             coeff = coeff[..., 0]
         if coeff.ndim == 2 and coeff.shape[0] != n_q_total and coeff.shape[1] == n_q_total:
-            coeff = coeff.T
+            raise ValueError(
+                f"value-channel coefficient of shape {tuple(coeff.shape)} is COMPONENT-FIRST: the "
+                f"{n_q_total} quadrature points are on its second axis, not its first. That is what "
+                "`jno.np.stack([f0, f1])` builds, since stack defaults to axis=0. The value axis is "
+                "trailing here, so write `jno.np.stack([f0, f1], axis=-1)` -- the FEM assembler takes "
+                "that spelling too."
+            )
 
         if coeff.ndim == 0:
             return coeff[None]

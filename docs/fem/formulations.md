@@ -381,21 +381,31 @@ Without it the loss minimum is *not* the PDE solution.
     **data** term — the residual alone is degenerate, since `k·a(u,v) = (f,v)` with `u` free is
     satisfied by any `k` with `u` rescaled.
 
-### A source on a vector field — four spellings, one meaning
+### A source on a vector field — one DSL, either trial
 
-A value-channel coefficient is a scalar per quadrature point, or one vector per point. Constants and
-stacks do not naturally arrive in that layout, so all of these are accepted and lower **identically**:
+A value-channel coefficient is a scalar per quadrature point, or one vector per point — **quadrature
+first, value axis trailing**. A constant carries no quadrature axis at all, so it broadcasts. All of
+these lower **identically**, and are accepted by the FEM trial and the network trial alike:
 
 ```python
-g * vi[0] + (2 * g) * vi[1]                  # per component
-jno.np.inner(jnp.array([1.0, 2.0]), vi, 1)   # a CONSTANT vector (no quadrature axis)
+g * vi[0] + (2 * g) * vi[1]                          # per component
+jno.np.inner(jnp.array([1.0, 2.0]), vi, 1)           # a CONSTANT vector
 jno.np.inner(g * jnp.array([1.0, 2.0]), vi, 1)
-jno.np.inner(jno.np.stack([g, 2 * g]), vi, 1)   # component-first, as `stack` builds it
+jno.np.inner(jno.np.stack([g, 2 * g], axis=-1), vi, 1)
 ```
 
-One corner is resolved by precedence rather than a guess: a bare `(k,)` coefficient with `k` equal to
-the quadrature-point count is read as a per-point **scalar**, that being the ordinary case. A constant
-vector of exactly that length therefore needs an explicit quadrature axis (`(1 + 0*x) * jnp.array(...)`).
+!!! warning "`stack` defaults to `axis=0`, which is the wrong axis here"
+    `jno.np.stack([f0, f1])` builds a **component-first** `(vec, Nq)` array, and the value axis is
+    trailing throughout the assemblers. Both lowerings refuse it by name and point at `axis=-1`,
+    rather than transposing it silently — a silent transpose is a guess at intent, and it would make
+    one lowering accept a weak form the other rejects.
+
+Two conventions worth stating once, since they are the only places the layout is not inferable:
+
+* a bare `(k,)` coefficient with `k` equal to the quadrature-point count is read as a per-point
+  **scalar**, that being the ordinary case — so a constant vector of exactly that length needs an
+  explicit quadrature axis, `(1 + 0*x) * jnp.array(...)`;
+* the value axis is **trailing**, everywhere, for both trials.
 
 ### A coupled system, as one vector field
 

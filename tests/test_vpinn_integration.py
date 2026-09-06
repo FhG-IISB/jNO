@@ -480,7 +480,7 @@ class TestVpinnVectorSource:
             "component": lambda: g * vi[0] + (2.0 * g) * vi[1],
             "const_array": lambda: jnn.inner(np.array([1.0, 2.0]), vi, n_contract=1),
             "scaled_array": lambda: jnn.inner(g * np.array([1.0, 2.0]), vi, n_contract=1),
-            "stacked": lambda: jnn.inner(jnn.stack([g, 2.0 * g]), vi, n_contract=1),
+            "stacked": lambda: jnn.inner(jnn.stack([g, 2.0 * g], axis=-1), vi, n_contract=1),
         }[spelling]()
         return dom, jno.fem([jnn.inner(gu, gv, n_contract=2) - src, u(xb, yb) - (0.0, 0.0)])
 
@@ -488,10 +488,9 @@ class TestVpinnVectorSource:
     def test_every_vector_source_spelling_lowers_identically(self, spelling):
         """A value-channel coefficient may arrive as a per-point vector, a bare CONSTANT vector (no
         quadrature axis -- a constant does not vary over the points), or component-first from
-        ``stack``. Only the per-point form used to assemble; the other two died on raw shape errors
-        naming internal arrays (``coeff shape (2,) incompatible with shape_vals_flat``, ``unsupported
-        coeff rank 3``). They are layout rewrites with one sensible reading each, so they are now
-        performed. The oracle is that all four give the SAME residual.
+        ``stack(..., axis=-1)``. Only the per-point form used to assemble; the others died on raw
+        shape errors naming internal arrays. The oracle is that all four give the SAME residual --
+        and, in the parity test below, the same acceptance as the FEM trial.
         """
         dom_ref, pde_ref = self._build_spelling("scaled_array")
         r_ref = float(np.asarray(jno.core([pde_ref.mse], domain=dom_ref).eval([pde_ref.mse])).reshape(()))
@@ -502,6 +501,58 @@ class TestVpinnVectorSource:
         assert abs(r - r_ref) <= 1e-12 * max(1.0, abs(r_ref)), (
             f"spelling {spelling!r} lowered differently: {r:.12e} vs reference {r_ref:.12e}"
         )
+
+    def test_a_component_first_stack_is_refused_on_both_lowerings(self):
+        """``stack`` defaults to ``axis=0``, which builds a component-FIRST array while the value
+        axis is trailing everywhere in the assemblers. Neither lowering rewrites it -- transposing
+        silently would be guessing at intent -- and both name the fix, so one spelling means one
+        thing whichever trial is used."""
+        dom = make_domain()
+        u, phi = dom.fem_symbols(value_shape=(2,))
+        xi, yi, _ = dom.variable("interior", split=True)
+        xb, yb, _ = dom.variable("boundary", split=True)
+        vi = phi.bind(x=xi, y=yi)
+        g = 1.0 + 0.0 * xi
+        bad = jnn.inner(jnn.stack([g, 2.0 * g]), vi, n_contract=1)
+
+        # FEM trial
+        ui = u.bind(x=xi, y=yi)
+        gu, gv = jnn.jacobian(ui, [xi, yi]), jnn.jacobian(vi, [xi, yi])
+        with pytest.raises(ValueError, match=r"axis=-1"):
+            jno.fem([jnn.inner(gu, gv, n_contract=2) - bad, u(xb, yb) - (0.0, 0.0)]).solve(linear=jno.solve.lu())
+
+        # network trial -- same weak form, same refusal
+        net = jnn.nn.wrap(
+            foundax.mlp(2, output_dim=2, hidden_dims=8, num_layers=2, activation=jax.nn.tanh, key=jax.random.PRNGKey(0))
+        )
+        gn = jnn.jacobian(net(xi, yi), [xi, yi])
+        with pytest.raises(ValueError, match=r"axis=-1"):
+            pde = jno.fem([jnn.inner(gn, gv, n_contract=2) - bad, u(xb, yb) - (0.0, 0.0)])
+            jno.core([pde.mse], domain=dom).eval([pde.mse])
+
+    @pytest.mark.parametrize("spelling", ["component", "const_array", "scaled_array", "stacked"])
+    def test_the_fem_trial_accepts_the_same_spellings(self, spelling):
+        """One DSL: whatever the network trial takes, the FEM trial must take too. Before this the
+        two lowerings accepted different subsets -- the VPINN path a strict superset -- so a weak
+        form was not portable between them."""
+        dom, _ = self._build_spelling(spelling)  # network trial: must not raise
+        d2 = make_domain()
+        u, phi = d2.fem_symbols(value_shape=(2,))
+        xi, yi, _ = d2.variable("interior", split=True)
+        xb, yb, _ = d2.variable("boundary", split=True)
+        vi, ui = phi.bind(x=xi, y=yi), u.bind(x=xi, y=yi)
+        g = 1.0 + 0.0 * xi
+        src = {
+            "component": lambda: g * vi[0] + (2.0 * g) * vi[1],
+            "const_array": lambda: jnn.inner(np.array([1.0, 2.0]), vi, n_contract=1),
+            "scaled_array": lambda: jnn.inner(g * np.array([1.0, 2.0]), vi, n_contract=1),
+            "stacked": lambda: jnn.inner(jnn.stack([g, 2.0 * g], axis=-1), vi, n_contract=1),
+        }[spelling]()
+        gu, gv = jnn.jacobian(ui, [xi, yi]), jnn.jacobian(vi, [xi, yi])
+        sol = np.asarray(
+            jno.fem([jnn.inner(gu, gv, n_contract=2) - src, u(xb, yb) - (0.0, 0.0)]).solve(linear=jno.solve.lu())
+        )
+        assert np.all(np.isfinite(sol)) and np.linalg.norm(sol) > 0.0
 
     def test_component_source_lowers_like_the_inner_spelling(self):
         """``c * phi[k]`` used to raise "could not extract a canonical test channel" on the VPINN
