@@ -8,6 +8,27 @@ from typing import Any, Callable, Dict, Optional
 # ---------------------------------------------------------------------
 
 
+def _verdict(G, u_prev, wn, report):
+    """The step's own residual norms, for a march that wants to judge its steps afterwards.
+
+    ``G`` is the function the driver actually root-finds, so both norms are for the SAME equation --
+    one at the incoming iterate and one at the solved state. That is what lets the caller apply the
+    driver's own ``atol + rtol*||r(u_prev)||`` test outside the trace, where it can concretise.
+
+    Costs two residual evaluations per step, and only when asked. Same arrangement, for the same
+    reason, as the load-path march in ``history_march.py``.
+    """
+    if not report:
+        return wn
+    import jax.numpy as jnp
+
+    return (
+        wn,
+        jnp.linalg.norm(jnp.asarray(G(wn)).reshape(-1)),
+        jnp.linalg.norm(jnp.asarray(G(u_prev)).reshape(-1)),
+    )
+
+
 @dataclass
 class SemidiscreteTimeBlock:
     """
@@ -215,7 +236,7 @@ class SemidiscreteTimeBlock:
             self.mass_residual is not None and self.residual is not None
         )
 
-    def step(self, u, t, dt, args=None, theta=None, *, linear_solve=None, nonlinear_solve=None):
+    def step(self, u, t, dt, args=None, theta=None, *, linear_solve=None, nonlinear_solve=None, report=False):
         """Advance the semidiscrete state by one implicit step: ``u(t) -> u(t + dt)``.
 
         The composable one-step primitive behind :func:`_default_transient_integrate` (which is just
@@ -238,6 +259,9 @@ class SemidiscreteTimeBlock:
           (``matvec`` applies ``M + theta dt A``; ``diag_fn()`` is its exact diagonal; ``x0`` the
           previous state as warm start);
         * ``nonlinear_solve(G, u0) -> u`` replaces the per-step Newton solve.
+        * ``report=True`` additionally returns ``(u, ||G(u)||, ||G(u_prev)||)`` on a NONLINEAR
+          step, so a marcher can judge the step outside the trace -- see :func:`_verdict`. A
+          linear step is a linear solve with its own guard and ignores the flag.
         """
         import jax
         import jax.numpy as jnp
@@ -296,9 +320,9 @@ class SemidiscreteTimeBlock:
                                 self.jacobian(wn, t_next, args), self.mass_residual_jac(wn, t_next, _ap), 1.0 / dt
                             )
 
-                        return nonlinear_solve(G, u, jacobian=jac_step)
-                    return nonlinear_solve(G, u)
-                return newton_krylov(G, u)
+                        return _verdict(G, u, nonlinear_solve(G, u, jacobian=jac_step), report)
+                    return _verdict(G, u, nonlinear_solve(G, u), report)
+                return _verdict(G, u, newton_krylov(G, u), report)
 
             M_t = _operand(self.mass(t_next, args))
             r_now = (1.0 - thn) * jnp.asarray(self.residual(u, t, args), dtype).reshape(-1) if thn < 1.0 else None
@@ -320,9 +344,9 @@ class SemidiscreteTimeBlock:
                     def jac_step(wn):
                         return _add_step_operator(self.jacobian(wn, t_next, args), M_t, 1.0 / dt)
 
-                    return nonlinear_solve(G, u, jacobian=jac_step)
-                return nonlinear_solve(G, u)
-            return newton_krylov(G, u)
+                    return _verdict(G, u, nonlinear_solve(G, u, jacobian=jac_step), report)
+                return _verdict(G, u, nonlinear_solve(G, u), report)
+            return _verdict(G, u, newton_krylov(G, u), report)
 
         from .linear import matrix_diagonal
 
@@ -512,11 +536,27 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
     if theta is None:  # jno.solve.theta(...) overrides the assembly's default (1 backward-Euler / ½ trapezoidal)
         theta = float(block.metadata.get("theta", 1.0)) if getattr(block, "metadata", None) else 1.0
 
+    # A NONLINEAR step is a Newton solve, and the driver's own convergence guard cannot fire inside
+    # this scan (it needs a concrete residual). So the step hands its residual norms back and they are
+    # judged below, outside the trace -- the arrangement the load-path march already uses. A linear
+    # step is a linear solve with its own guard and is not judged here.
+    _judge = bool(block.is_nonlinear())
+
     def step(w, t_next):
-        wn = block.step(
-            w, t_next - dt, dt, args=args, theta=theta, linear_solve=linear_solve, nonlinear_solve=nonlinear_solve
+        out = block.step(
+            w,
+            t_next - dt,
+            dt,
+            args=args,
+            theta=theta,
+            linear_solve=linear_solve,
+            nonlinear_solve=nonlinear_solve,
+            report=_judge,
         )
-        return wn, wn
+        if not _judge:
+            return out, out
+        wn, r_end, r_start = out
+        return wn, (wn, r_end, r_start)
 
     # ``jax.checkpoint`` on the scan body: reverse-mode otherwise saves every step's *internal*
     # residuals (the rhs, the θ-combination, the Krylov solve's saved primals — measured ~32 vectors
@@ -529,6 +569,19 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
     # on an 8 GB card — see the sampling note below). A pure forward solve pays nothing — checkpoint
     # is the identity outside differentiation.
     _, ys = jax.lax.scan(jax.checkpoint(step), s0, grid_ts[1:])
+    if _judge:
+        from .history_march import _TRANSIENT_ADVICE, _check_march_converged
+
+        ys, _r_end, _r_start = ys
+        _check_march_converged(
+            _r_end,
+            _r_start,
+            grid_ts[1:],
+            nonlinear_solve,
+            what="transient march",
+            coord="t",
+            advice=_TRANSIENT_ADVICE,
+        )
 
     traj = jnp.concatenate([s0[None, :], ys], axis=0)  # (n_grid, n_dofs) at grid_ts
     return _resample_trajectory(traj, grid_ts, save_ts, dtype)

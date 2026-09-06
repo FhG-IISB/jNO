@@ -718,6 +718,45 @@ jax.grad(loss)(theta)
     got *faster* — 1.90 ms against 2.73 ms at 1441 DOFs — because checking from inside the trace
     replaced an eager check that cost its own matvec plus a host sync.
 
+### A transient march judges every step, not just the last one
+
+A nonlinear transient step is a Newton solve, and every one of them runs inside the march's
+`lax.scan` — precisely where the driver's own convergence check disables itself, because it needs a
+concrete residual. So the step carries its residual norms out of the scan and `fem.solve()` tests
+them where they *are* concrete, against the driver's own `rtol`/`atol`:
+
+```python
+fem.solve(nonlinear=jno.solve.newton(direct=True, rtol=1e-6, atol=1e-6))
+# RuntimeError: fem.solve: the transient march did not converge at step 35 of 120 (t=0.00036):
+# residual norm 3.658e+02 against the tolerance atol + rtol*||r(u_prev)|| = 1.011e-02
+# (atol=1e-06, rtol=1e-06). That step is NOT a root, and every later step inherited it as its
+# starting state — the whole trajectory past this point is unreliable. Globalize the per-step solve
+# (jno.solve.newton(line_search=True), or damping<1), take smaller time steps (a finer
+# domain(time=(...)) grid), or raise the driver's max_steps.
+```
+
+This is the same check the [load-path march](fem/formulations.md) already applied, on the same
+numbers; only the label and the advice differ. It covers the default θ march and `jno.solve.bdf2()`.
+
+!!! measured "Why a silent transient failure is worse than it sounds"
+    Two properties make a capped march genuinely hard to spot, both measured on a coupled melt-pool
+    model (laser + phase change + Marangoni convection):
+
+    * **It is not reproducible.** Two runs of the same command reported peak melt velocities of
+      2.98 and 33.5 m/s — an unconverged iterate is whatever the step cap happened to leave.
+    * **A diverged march is *faster* than a healthy one.** Once the residual is NaN the loop
+      condition `||r|| > tol` is False, so Newton exits on its first iteration and every remaining
+      step is nearly free. The usual "it got slow, something is wrong" signal is inverted: the run
+      that finished quickly was the broken one, and it returned 2e+200 K with nothing raised.
+
+    Cost is two residual evaluations per step, and only on a nonlinear block — a linear step is a
+    linear solve with its own gate and is not judged here.
+
+!!! warning "Under a transform the guard is off"
+    Inside `jax.jit`/`grad`/`vmap` of a whole march the norms are themselves traced, so the test
+    cannot concretise and no-ops — the same trade every eager check in jNO makes. There, the
+    driver's `max_steps` is all there is.
+
 !!! note "A preconditioner is exempt — it is inexact on purpose"
     `jno.precond.inner(jno.solve.cg(tol=1e-2, maxiter=30))` asks for two digits deliberately; that
     is the whole reason the outer solver must be flexible (`jno.solve.fgmres()`). The gate is a

@@ -322,8 +322,22 @@ def _resolve_limits(limit, fem, n_dofs):
 _MARCH_FALLBACK_TOL = (1e-8, 1e-8)
 
 
-def _check_march_converged(r_end, r_start, grid, solve_fn=None):
-    """Raise if any load step of the ``lax.scan`` march returned a non-root.
+_LOADPATH_ADVICE = (
+    "Globalize the per-step solve (jno.solve.newton(line_search=True) / staggered(line_search=True), "
+    "or damping<1), take smaller load steps (a finer domain(tau=(...)) grid, or "
+    "tau=jno.solve.adaptive(limit=...)), or raise the driver's max_steps."
+)
+
+#: The time march reaches the same check through ``backend_blocks``; only the label, the coordinate
+#: and the advice differ, so they are parameters rather than a second copy of the test.
+_TRANSIENT_ADVICE = (
+    "Globalize the per-step solve (jno.solve.newton(line_search=True), or damping<1), take smaller "
+    "time steps (a finer domain(time=(...)) grid), or raise the driver's max_steps."
+)
+
+
+def _check_march_converged(r_end, r_start, grid, solve_fn=None, *, what="load-path march", coord="τ", advice=None):
+    """Raise if any step of a ``lax.scan`` march returned a non-root.
 
     The per-step driver already knows how to refuse a stalled solve — ``newton_krylov``'s
     ``_convergence_check`` does exactly that — but it needs a *concrete* residual, so it disables itself
@@ -354,13 +368,10 @@ def _check_march_converged(r_end, r_start, grid, solve_fn=None):
     k = int(np.argmax(bad))
     tau_k = float(np.asarray(grid)[k]) if np.asarray(grid).size > k else float("nan")
     raise RuntimeError(
-        f"fem.solve: the load-path march did not converge at step {k} of {int(r_end.size)} (τ={tau_k:.6g}): "
+        f"fem.solve: the {what} did not converge at step {k} of {int(r_end.size)} ({coord}={tau_k:.6g}): "
         f"residual norm {r_end[k]:.3e} against the tolerance atol + rtol*||r(u_prev)|| = {bound[k]:.3e} "
-        f"(atol={atol:g}, rtol={rtol:g}). That step is NOT an equilibrium, and every later step inherited "
-        "it as its starting state and history — the whole trajectory past this point is unreliable. "
-        "Globalize the per-step solve (jno.solve.newton(line_search=True) / staggered(line_search=True), "
-        "or damping<1), take smaller load steps (a finer domain(tau=(...)) grid, or "
-        "tau=jno.solve.adaptive(limit=...)), or raise the driver's max_steps."
+        f"(atol={atol:g}, rtol={rtol:g}). That step is NOT a root, and every later step inherited "
+        "it as its starting state — the whole trajectory past this point is unreliable. " + (advice or _LOADPATH_ADVICE)
     )
 
 

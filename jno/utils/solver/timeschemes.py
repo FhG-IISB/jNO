@@ -161,6 +161,7 @@ class _BDF2Scheme(_TimeScheme):
         import jax.numpy as jnp
 
         from .backend_blocks import _block_time_grid, _resample_trajectory
+        from .history_march import _TRANSIENT_ADVICE, _check_march_converged
 
         md = block.metadata or {}
         if getattr(block, "mass_residual", None) is not None:
@@ -183,26 +184,56 @@ class _BDF2Scheme(_TimeScheme):
         grid_ts = _block_time_grid(block)
         dt = float(block.dt)
 
+        # A nonlinear step's own convergence guard cannot fire inside the scan, so the step reports
+        # its residual norms and they are judged below -- as in the theta march and the load path.
+        _judge = bool(block.is_nonlinear())
+
         def _advance(u_prev, t_land, h):
             """One implicit step landing at ``t_land`` from ``u_prev`` over an effective step ``h``."""
             return block.step(
-                u_prev, t_land - h, h, args=args, theta=1.0, linear_solve=linear_solve, nonlinear_solve=nonlinear_solve
+                u_prev,
+                t_land - h,
+                h,
+                args=args,
+                theta=1.0,
+                linear_solve=linear_solve,
+                nonlinear_solve=nonlinear_solve,
+                report=_judge,
             )
 
-        # Startup: plain backward Euler, OUTSIDE the scan.
+        # Startup: plain backward Euler, OUTSIDE the scan. Being outside it, its iterate is CONCRETE,
+        # so the driver's own `_convergence_check` fires there in the ordinary eager path and this
+        # march needs no second check for it -- only the norms discarded. (Under an outer jit both
+        # self-disable together, which is the documented limit, not a hole this could plug.)
         s1 = _advance(s0, float(grid_ts[1]), dt)
+        if _judge:
+            s1 = s1[0]
 
         dt_eff = 2.0 * dt / 3.0
 
         def step(carry, t_next):
             u_n, u_nm1 = carry
             u_star = (4.0 * u_n - u_nm1) / 3.0
-            wn = _advance(u_star, t_next, dt_eff)
-            return (wn, u_n), wn
+            out = _advance(u_star, t_next, dt_eff)
+            if not _judge:
+                return (out, u_n), out
+            wn, r_end, r_start = out
+            return (wn, u_n), (wn, r_end, r_start)
 
         # Checkpointed for the same reason the theta march is: reverse mode would otherwise keep every
         # step's internal Krylov/Newton residuals.
         _, ys = jax.lax.scan(jax.checkpoint(step), (s1, s0), grid_ts[2:])
+        if _judge:
+            ys, _r_end, _r_start = ys
+            _check_march_converged(
+                _r_end,
+                _r_start,
+                grid_ts[2:],
+                nonlinear_solve,
+                what="transient march (BDF2)",
+                coord="t",
+                advice=_TRANSIENT_ADVICE,
+            )
         traj = jnp.concatenate([s0[None, :], s1[None, :], ys], axis=0)
         return _resample_trajectory(traj, grid_ts, save_ts, dtype)
 
