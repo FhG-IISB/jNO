@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import pytest
 import numpy as np
 
 from jno.utils.explainability import make_residual_stats_fn
@@ -552,9 +553,31 @@ def test_engd_callback_rejects_bad_inputs():
         ENGDCallback(gram_terms=[])
 
 
-def test_engd_callback_compiles_and_reduces_loss():
-    """ENGDCallback runs end-to-end on 1-D Poisson; loss after 20 ENGD steps
-    is lower than after 20 plain-GD steps with the same learning rate.
+@pytest.fixture
+def _engd_x64():
+    """float64 for the ENGD tests, restored afterwards.
+
+    The flag is process-wide, so setting it and walking away changes whatever module pytest runs next
+    -- this repo already has order-dependent failures and does not need another. Same save/restore
+    shape the FEM suites use.
+    """
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
+
+def test_engd_callback_compiles_and_reduces_loss(_engd_x64):
+    """ENGDCallback runs end-to-end on 1-D Poisson; 20 ENGD steps beat 20 plain-GD steps by orders
+    of magnitude.
+
+    In **float64**, which the callback documents as a requirement rather than a nicety: in float32 the
+    energy Gram solve is ill-conditioned enough that `sgd(1.0)` diverges outright (loss 24 -> 34 -> 154
+    over 20 steps), and this test ran that way for as long as it has been failing. The learning rates
+    differ on purpose -- lr=1 for the natural-gradient direction against lr=1e-3 for raw GD -- because
+    the point is the DIRECTION, not the step size.
     """
     import foundax
     import optax
@@ -599,8 +622,12 @@ def test_engd_callback_compiles_and_reduces_loss():
     loss_engd = float(stats_e.total_loss)
     loss_gd = float(stats_g.total_loss)
 
-    # ENGD with lr=1 should outperform GD with lr=1e-3 on the same problem.
-    assert loss_engd < loss_gd, f"ENGD loss {loss_engd:.3e} should be < GD loss {loss_gd:.3e}"
+    # Not "a bit lower": ENGD's claim is orders of magnitude (Zeinhofer et al., ICML 2023). Measured
+    # here, 2.1e-14 against GD's 2.4e+01. A bare `<` passed for years on a run that was really only
+    # marginally better, and would pass again if the preconditioner silently degraded to plain GD.
+    assert loss_engd < loss_gd / 1e6, (
+        f"ENGD loss {loss_engd:.3e} should be orders below GD loss {loss_gd:.3e}"
+    )
     # Loss must be finite.
     assert np.isfinite(loss_engd), f"ENGD loss is not finite: {loss_engd}"
 
