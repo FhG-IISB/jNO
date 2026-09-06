@@ -2456,6 +2456,61 @@ class TraceEvaluator:
         eye = jnp.eye(n_comp, dtype=shape_vals.dtype)
         return shape_vals[:, :, None, None] * eye[None, None, :, :]
 
+    @staticmethod
+    def _normalize_value_coeff(coeff, n_q_total):
+        """Put a value-channel coefficient into the layout assembly expects: ``(Nq,)`` for a scalar
+        test function, ``(Nq, vec)`` for a vector one -- quadrature first, component second.
+
+        Two spellings a user reasonably writes do not arrive that way, and both used to die on a raw
+        shape error naming internal arrays:
+
+        * a **constant vector** coefficient, ``inner(jnp.array([1.0, 2.0]), phi)`` -- shape ``(vec,)``,
+          with no quadrature axis at all, because a constant does not vary over the points. It
+          broadcasts.
+        * a **stacked** one, ``inner(jnn.stack([f0, f1]), phi)`` -- shape ``(vec, Nq, 1)``, component
+          first, because that is what ``stack`` builds. It transposes.
+
+        Both are rewrites with exactly one sensible reading, so they are performed rather than
+        refused.
+
+        One corner is genuinely ambiguous and is resolved by precedence, not by a guess: a bare
+        ``(k,)`` with ``k == Nq`` is read as a per-point **scalar**, because that is the ordinary
+        scalar-test case and by far the common one. The consequence is that a constant vector
+        coefficient whose length happens to equal the quadrature-point count cannot be spelled this
+        way -- give it a quadrature axis (``(1.0 + 0.0*x) * jnp.array([...])``) if you ever hit it.
+        """
+        coeff = jnp.asarray(coeff)
+
+        # component-first stacks: (vec, Nq, 1) / (vec, Nq) -> (Nq, vec)
+        while coeff.ndim > 2 and coeff.shape[-1] == 1:
+            coeff = coeff[..., 0]
+        if coeff.ndim == 2 and coeff.shape[0] != n_q_total and coeff.shape[1] == n_q_total:
+            coeff = coeff.T
+
+        if coeff.ndim == 0:
+            return coeff[None]
+        if coeff.ndim == 1:
+            if coeff.shape[0] == n_q_total:
+                return coeff  # per-quadrature-point scalar, the ordinary case
+            # a constant vector coefficient: no quadrature axis, broadcast it over the points
+            return jnp.broadcast_to(coeff[None, :], (n_q_total, coeff.shape[0]))
+        if coeff.ndim == 2:
+            if coeff.shape[1] == 1:
+                return coeff[:, 0]
+            if coeff.shape[0] == n_q_total:
+                return coeff
+            raise ValueError(
+                f"value-channel coefficient of shape {tuple(coeff.shape)} does not match the "
+                f"{n_q_total} quadrature points on either axis, so neither axis can be the "
+                "quadrature one. Write the coefficient as a per-point expression (a constant times a "
+                "coordinate, e.g. `(1.0 + 0.0*x) * jnp.array([...])`) or as a constant vector."
+            )
+        raise ValueError(
+            f"Unsupported coeff rank {coeff.ndim} for value assembly; got shape {tuple(coeff.shape)}. "
+            "A value-channel coefficient is a scalar per quadrature point, or one vector per "
+            "quadrature point."
+        )
+
     def _assemble_value_basis_integrand(self, coeff, shape_vals_flat, weights, flat_entity_nodes, num_total_nodes):
         coeff = jnp.asarray(coeff)
         shape_vals_flat = jnp.asarray(shape_vals_flat)
@@ -2466,17 +2521,11 @@ class TraceEvaluator:
         while coeff.ndim > 2 and coeff.shape[0] == 1:
             coeff = jnp.squeeze(coeff, axis=0)
 
-        if coeff.ndim == 0:
-            coeff = coeff[None]
-        elif coeff.ndim == 2 and coeff.shape[1] == 1:
-            coeff = coeff[:, 0]
-        elif coeff.ndim > 2:
-            raise ValueError(f"Unsupported coeff rank {coeff.ndim} for value assembly; got shape {coeff.shape}")
-
         if shape_vals_flat.ndim != 2:
             raise ValueError(f"Expected shape_vals_flat.ndim == 2, got shape {shape_vals_flat.shape}")
 
         n_q_total, n_loc = shape_vals_flat.shape
+        coeff = self._normalize_value_coeff(coeff, n_q_total)
         n_cell_times_nloc = flat_entity_nodes.shape[0]
 
         if n_cell_times_nloc % n_loc != 0:
