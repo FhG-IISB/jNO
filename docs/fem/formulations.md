@@ -66,9 +66,45 @@ velocity = sol[st.blocks[st.block_index(u)]]
 ### What the fluid path is verified to do — and what it is not
 
 Scope first, since it is not obvious from the API: jNO's FEM fluid path is **laminar incompressible**
-flow and nothing else. There is no turbulence model (no RANS, no LES), no compressible or Euler path,
+flow. There is no RANS model (no k–ε, no k–ω SST, no wall functions), no compressible or Euler path,
 no free surface / VOF / level set, and no fluid–structure interaction. Nothing about `jno.fem` stops
 you writing those terms; nothing in the library implements or verifies them.
+
+The one qualification is **algebraic (zero-equation) LES**, below: a subgrid eddy viscosity is a
+formula of the resolved velocity gradient, so it is written in the term list like any other
+coefficient. Those formulas are unit-verified against a textbook oracle — they are *not* a validated
+LES capability, which would need a turbulent benchmark (channel flow, decaying isotropic turbulence)
+this library has not run.
+
+#### Subgrid eddy viscosity — a formula, not an API
+
+An algebraic LES model adds `ν_t(∇u)` to the molecular viscosity. It needs no new API: the filter
+width is `d.cell_size` (or `d.cell_metric` if you want it direction-aware), and the model is
+arithmetic on `grad(u)`. Vreman (*Phys. Fluids* **16** (2004) 3670, eq. 5), written through
+invariants so it reads the same in 2-D and 3-D:
+
+```python
+g     = grad(u, ax)
+tr_b  = delta**2 * inner(g, g, n_contract=2)                       # tr(beta),  beta = delta^2 g gᵀ
+tr_b2 = delta**4 * einsum("...ik,...jk,...jl,...il->...", g, g, g, g)   # tr(beta^2)
+B     = where(0.5 * (tr_b**2 - tr_b2) > 0, 0.5 * (tr_b**2 - tr_b2), 0.0)
+nu_t  = jno.lag(0.07 * sqrt(B / (inner(g, g, n_contract=2) + 1e-30) + 1e-30))
+
+mom = (MU / RHO + nu_t) * inner(g, grad(v, ax), n_contract=2) + ...   # into the viscous term
+```
+
+!!! danger "Three things that will bite, all measured"
+    * **`ν_t` must be lagged.** It is a square root, so its slope at `u = 0` is infinite and Newton
+      diverges from a rest state outright. `jno.lag` freezes it within each linearisation — the same
+      treatment a Carman–Kozeny drag needs.
+    * **Clamp the invariant.** `B_β` and WALE's `S_d:S_d` are non-negative in exact arithmetic but are
+      computed as a *difference of nearly equal numbers*. Measured in pure shear: `B_β` lands at
+      1.4e-20 where it should be 0, from a relative cancellation of 2.7e-16. Unclamped, one round-off
+      excursion below zero is not a small error — `sqrt` and `**1.5` return **NaN**.
+    * **Smagorinsky does not vanish in laminar shear**, and that is a modelling defect, not a detail:
+      `|S|` is non-zero in any shear, so it invents eddy viscosity throughout a laminar boundary layer
+      and needs Van Driest damping. Vreman and WALE (Nicoud & Ducros, *Flow Turb. Combust.* **62**
+      (1999) 183) vanish identically there. `tests/test_fem_les.py` pins exactly that difference.
 
 Within that scope, measured rather than asserted:
 
