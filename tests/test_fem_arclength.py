@@ -201,3 +201,38 @@ def test_a_degenerate_declared_span_is_refused_even_with_an_explicit_ds():
         fem = _bratu(6, hi=0.0, size=0.25)
         with pytest.raises(ValueError, match="zero width"):
             fem.solve(tau=spec)
+
+
+def test_the_form_is_staged_once_across_the_arclength_march():
+    """Arc length walks its steps on the HOST, so it can re-stage the form per step if it hands the
+    solver a fresh closure each time — which is exactly what the contact march did (22-26 XLA
+    compilations per round, each retained) and what `continuation` did before its step was jitted.
+    Neither is visible in an answer; both only show up as time and memory.
+
+    The invariant is that staging cannot scale with the number of steps. Asserted by comparing two
+    step counts rather than against a magic number, so it stays true if the Newton body changes how
+    many times it stages internally.
+    """
+    counts = []
+    for nsteps in (5, 15):
+        fem = _bratu(nsteps)
+        op = fem._op
+        real = op.residual
+        tr = {"n": 0}
+
+        def counting(u, *a, _r=real, _t=tr, **kw):
+            if isinstance(u, jax.core.Tracer):  # a traced u means the form is being staged out
+                _t["n"] += 1
+            return _r(u, *a, **kw)
+
+        op.residual = counting
+        try:
+            fem.solve(tau=jno.solve.arclength(ds=0.35))
+        finally:
+            op.residual = real
+        counts.append(tr["n"])
+
+    assert counts[0] > 0, "the residual was never staged — the counter is not wired to the solve"
+    assert counts[1] <= counts[0], (
+        f"staging scales with the march: {counts[0]} traces for 5 steps, {counts[1]} for 15"
+    )
