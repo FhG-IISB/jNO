@@ -185,3 +185,42 @@ def test_the_march_refuses_a_relax_outside_the_unit_interval(bad):
     _, fem, _ = _al_contact_march()
     with pytest.raises(ValueError, match="relax must lie in"):
         fem.solve(contact=jno.solve.contact(relax=bad))
+
+
+# ----------------------------------------------------------------------------------------------
+# The oscillation diagnostic must not fire on slow-but-monotone convergence
+# ----------------------------------------------------------------------------------------------
+def test_slow_monotone_convergence_is_not_reported_as_oscillation():
+    """`_stalled` asked only whether the recent best beat the earlier best by 2x. A geometric decay
+    slower than that ratio -- r = 0.90 over 12 rounds, which still reduces |du| by 0.31x and never once
+    goes back up -- was therefore reported as a LIMIT CYCLE.
+
+    That matters most for exactly the case `relax=` exists to fix: damping multiplies the contraction
+    factor, so a correctly damped solve converges monotonically but slowly, and the old test would tell
+    a caller who had already damped to "damp the iteration with relax=0.5". A cycle is distinguished by
+    going back UP, not by going down slowly.
+    """
+    from jno.utils.solver.contact_search import _stalled
+
+    for r in (0.90, 0.95, 0.99):
+        hist = [r**k for k in range(12)]
+        assert not _stalled(hist, 1e-4), f"monotone decay at r={r} reported as oscillating"
+
+
+def test_a_real_limit_cycle_is_still_caught():
+    """The other side of the same coin -- loosening the test must not blind it. Both sequences here
+    were measured, not invented: the first from a sheet-forming march, the second from the gear sweep."""
+    from jno.utils.solver.contact_search import _stalled
+
+    forming = [5.0e-3, 1.2e-2, 7.0e-3, 8.2e-3, 5.0e-3, 1.2e-2, 7.0e-3, 8.2e-3]
+    gears = [2.2e-2, 1.3e-2, 1.4e-2, 2.0e-2, 2.2e-2, 1.3e-2, 1.4e-2, 2.0e-2]
+    assert _stalled(forming, 1e-4), "the measured forming limit cycle is no longer caught"
+    assert _stalled(gears, 1e-4), "the measured gear limit cycle is no longer caught"
+
+
+def test_a_flat_history_is_still_caught():
+    """Not contracting at all, and not rising either -- the degenerate case between the two above. It
+    is not converging, so it must still raise rather than run out the rounds silently."""
+    from jno.utils.solver.contact_search import _stalled
+
+    assert _stalled([1e-2] * 10, 1e-4), "a perfectly flat history is not converging"

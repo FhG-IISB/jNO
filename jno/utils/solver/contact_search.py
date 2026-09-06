@@ -357,14 +357,23 @@ def _stalled(hist, tol_rel):
     A contact search that keeps re-pairing between a small set of configurations shows `|du|/|u|`
     cycling through the same values instead of falling. Telling that caller to raise `rounds=` sends
     them to wait for something that will never happen -- measured on a sheet-forming march, where the
-    ratio cycled 2.2e-2 / 1.3e-2 / 1.4e-2 / 2.0e-2 for 25 rounds with no downward trend. The test is
-    whether the recent best is meaningfully below the earlier best; if it is not, more rounds are the
-    wrong advice and a smaller load step is the right one.
+    ratio cycled 2.2e-2 / 1.3e-2 / 1.4e-2 / 2.0e-2 for 25 rounds with no downward trend.
+
+    Two conditions, not one. "The recent best does not beat the earlier best by 2x" alone is a test of
+    SPEED, and it convicts a sequence that is converging perfectly well but slowly: a geometric decay
+    at r = 0.90 still reduces |du| by 0.31x over 12 rounds and never once goes back up, yet fails that
+    ratio. That is the common case for a correctly DAMPED solve -- `relax=r` multiplies the contraction
+    factor -- so the old test told callers who had already damped to damp again. A limit cycle is
+    distinguished by going back UP, so this also requires the history to rise at least twice; a
+    monotone sequence, however slow, is left alone to converge or to exhaust `rounds` and be reported
+    by the (accurate) "still moving" message instead.
     """
     if len(hist) < 6:
         return False
     half = len(hist) // 2
-    return min(hist[half:]) > 0.5 * min(hist[:half])
+    no_progress = min(hist[half:]) > 0.5 * min(hist[:half])
+    rises = sum(1 for a, b in zip(hist, hist[1:]) if b > a)
+    return no_progress and (rises >= 2 or max(hist) <= min(hist) * (1.0 + 1e-12))
 
 
 def _pairing_moved(a, b):
