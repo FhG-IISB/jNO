@@ -411,3 +411,33 @@ def test_vpinn_1d_trains_and_solves_poisson():
     exact = np.asarray(crux.eval([xt * (1 - xt)], domain=test_dom)).reshape(-1)
     rel = float(np.linalg.norm(pred - exact) / np.linalg.norm(exact))
     assert rel < 1e-2, f"1D VPINN did not solve Poisson: rel-L2={rel:.3e}"
+
+
+# ============================================================
+# VPINN scope — refused by name, not by an internal tag error
+# ============================================================
+
+
+class TestVpinnScopeRefusals:
+    def test_three_d_vpinn_is_refused_by_name(self):
+        """A 3-D network trial used to die on ``Tag 'fem_gauss' is not in the mesh pool or context``
+        -- an internal tag name, for a scope limit no user can infer from it. The lowering builds its
+        quadrature through the 1-D/2-D native context; say so where the decision is made."""
+        dom = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.5).domain()
+        u, phi = dom.fem_symbols()
+        si = dom.variable("interior", split=True)
+        xi, yi, zi = si[0], si[1], si[2]
+        sb = dom.variable("boundary", split=True)
+        net = jnn.nn.wrap(foundax.mlp(3, hidden_dims=8, num_layers=2, activation=jax.nn.tanh, key=jax.random.PRNGKey(0)))
+        vi = phi.bind(x=xi, y=yi, z=zi)
+        u_net = net(xi, yi, zi) * xi * (1 - xi) * yi * (1 - yi) * zi * (1 - zi)
+        with pytest.raises(NotImplementedError, match=r"VPINN.*1-D and 2-D"):
+            jno.fem(
+                [
+                    jnn.grad(u_net, xi) * jnn.grad(vi, xi)
+                    + jnn.grad(u_net, yi) * jnn.grad(vi, yi)
+                    + jnn.grad(u_net, zi) * jnn.grad(vi, zi)
+                    - 1.0 * vi,
+                    u(*sb) - 0.0,
+                ]
+            )

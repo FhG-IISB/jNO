@@ -5556,6 +5556,22 @@ def _fem_impl(
     # It builds the native fem_context (init_fem_native) and test-projects the weak form. Every
     # standard single-field FEM problem has already returned natively above; anything else is rejected
     # explicitly below (fail loud -- never silently mis-assemble). ----
+    if is_vpinn and getattr(domain, "dimension", None) not in (1, 2):
+        # A 3-D VPINN falls past the branch below and dies further in on `Tag 'fem_gauss' is not in
+        # the mesh pool` -- an internal tag name, for a scope limit the user cannot infer from it.
+        # Say what is actually unsupported, at the point the decision is made.
+        raise NotImplementedError(
+            f"jno.fem: a VPINN (network trial) is supported on 1-D and 2-D meshes only; this domain is "
+            f"{getattr(domain, 'dimension', None)}-D. The network-trial lowering builds its quadrature "
+            "through the 1-D/2-D native context. Use a 3-D FEM trial (`d.fem_symbols()` written against "
+            "the same weak form), or a collocation PINN, which has no such restriction."
+        )
+    if is_vpinn and periodic_ties:
+        raise NotImplementedError(
+            "jno.fem: a VPINN (network trial) does not compose with periodic ties -- the tie is imposed "
+            "by an algebraic reduction of FE trial DOFs, and a network trial has none. Impose the "
+            "periodicity in the network instead (a periodic input embedding), or use an FE trial."
+        )
     if is_vpinn and getattr(domain, "dimension", None) in (1, 2) and not periodic_ties:
         bcs = [domain.dirichlet(tag, value) for tag, value in dirichlet_values.items()]
         if boundary_terms:
