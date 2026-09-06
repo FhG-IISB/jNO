@@ -515,6 +515,18 @@ class domain(MeshIOMixin):
         keep_orphan_nodes: bool = False,
         **_ignored_kwargs,
     ):
+        if "mesh_size" in _ignored_kwargs:
+            raise ValueError(
+                "jno.domain(<Shape or callable>, mesh_size=...) does not read `mesh_size`. It is only "
+                "honoured on the POLYGON path -- `domain.__new__` routes there for a constructor that "
+                "is not callable, and a `jno.Shape` defines `__call__`, so a Shape goes to the generic "
+                "domain instead and the size lands in **_ignored_kwargs. Measured on a unit box: "
+                "mesh_size=0.5, 0.3, 0.18 and 0.1 ALL returned the same 340-node mesh, with nothing "
+                "reported -- a refinement study that never refined. Put the size on the shape, which is "
+                "where it belongs: `jno.Shape.box(0, 0, 0, 1, 1, 1).sized(h).domain()`, or "
+                "`jno.Shape.rect(0, 0, 1, 1, size=h).domain()`. Passing raw polygon points instead of a "
+                "Shape keeps `mesh_size=` working, because that is the path it was written for."
+            )
         if "structured" in _ignored_kwargs:
             raise ValueError(
                 "jno.domain(..., structured=True) was replaced by Shape.structured() and is no longer "

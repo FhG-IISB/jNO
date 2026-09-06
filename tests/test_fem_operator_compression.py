@@ -99,7 +99,7 @@ def test_compression_does_not_move_the_solution():
 
 
 def _heat_2d(h=0.12, nsteps=6):
-    d = jno.domain(jno.Shape.rect(0, 0, 1, 1), mesh_size=h, time=(0.0, 0.03, nsteps))
+    d = jno.Shape.rect(0, 0, 1, 1).sized(h).domain(time=(0.0, 0.03, nsteps))
     u, v = d.fem_symbols()
     xi, yi, ti = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
@@ -164,12 +164,12 @@ def test_1d_steady_operator_is_compressed():
 def _nonlinear(kind):
     """``(1 + u²)∇u·∇v`` — nonlinear in the unknown, so the Jacobian is re-assembled per Newton step."""
     if kind == "3d":
-        d = jno.domain(jno.Shape.box(0, 0, 0, 1, 1, 1), mesh_size=0.3)
+        d = jno.Shape.box(0, 0, 0, 1, 1, 1).sized(0.3).domain()
         u, v = d.fem_symbols()
         i, b = d.variable("interior", split=True), d.variable("boundary", split=True)
         a, c = u.bind(x=i[0], y=i[1], z=i[2]), v.bind(x=i[0], y=i[1], z=i[2])
         return jno.fem([(1.0 + a**2) * (a.x * c.x + a.y * c.y + a.z * c.z) - 1.0 * c, u(b[0], b[1], b[2]) - 0.0])
-    d = jno.domain(jno.Shape.rect(0, 0, 1, 1), mesh_size=0.18)
+    d = jno.Shape.rect(0, 0, 1, 1).sized(0.18).domain()
     u, v = d.fem_symbols()
     i = d.variable("interior", split=True)
     r, ln = d.variable("right", split=True), d.variable("left", split=True)
