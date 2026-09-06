@@ -155,6 +155,46 @@ def test_each_model_matches_a_textbook_numpy_oracle(name):
     assert got == pytest.approx(_models_numpy(g)[name], rel=1e-9), f"{name}: {got} vs oracle"
 
 
+def _nu_t_3d(model, G):
+    """Same reading, in 3-D: u_i = G_ij x_j on a unit cube, so grad(u) = G exactly on every tet."""
+    d = jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=0.7).domain()
+    co = d.variable("interior", split=True)
+    ax = [co[0], co[1], co[2]]
+    u, v = d.fem_symbols(value_shape=(3,), names=("u3", "v3"), order=1)
+    s, w = d.fem_symbols(names=("s3", "w3"), order=1)
+    si, wi = s.bind(x=ax[0], y=ax[1], z=ax[2]), w.bind(x=ax[0], y=ax[1], z=ax[2])
+    fem = jno.fem([inner_(grad(u, ax), grad(v, ax), n_contract=2), si * wi - model(grad(u, ax)) * wi])
+    pts = np.asarray(fem.points)[:, :3]
+    uk = np.zeros(fem.dofs)
+    bu = fem.blocks[fem.block_index(u)]
+    uk[bu.start : bu.stop] = (pts @ np.asarray(G).T).reshape(-1)
+    r = np.asarray(fem.residual(uk))
+    bs = fem.blocks[fem.block_index(s)]
+    return -float(r[bs.start : bs.stop].sum())
+
+
+@pytest.mark.parametrize("name", ["smagorinsky", "vreman", "wale"])
+def test_each_model_is_dimension_generic(name):
+    """The models are written through second invariants precisely so one spelling serves 2-D and 3-D.
+    In 2-D that is cheap to satisfy by accident -- several distinct expressions collapse onto the same
+    number on a 2x2 tensor -- so the claim is only worth anything when checked on a full 3x3 gradient,
+    including a case with no symmetry at all."""
+    rng = np.random.default_rng(3)
+    cases = {
+        "shear": np.array([[0.0, 1.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]),
+        "random": rng.normal(scale=2.0, size=(3, 3)),
+        "incompressible strain": np.diag([2.0, -1.0, -1.0]),
+    }
+    models3 = {"smagorinsky": smagorinsky, "vreman": vreman, "wale": lambda g: wale(g, 3)}
+    for label, G in cases.items():
+        got = _nu_t_3d(models3[name], G)
+        # abs= as well as rel=: where the exact answer is 0 (Vreman in shear) the invariant is a
+        # difference of equal numbers, so it lands on the cancellation floor -- 7e-12 here -- and a
+        # bare rel= against 0 would demand an exactness float64 cannot deliver. nu_t is O(1e-3), so
+        # 1e-10 is still five orders below anything the model reports.
+        assert got == pytest.approx(_models_numpy(G, dim=3)[name], rel=1e-9, abs=1e-10), f"{name} on {label}: {got}"
+
+
 @pytest.mark.parametrize("name", ["smagorinsky", "vreman", "wale"])
 def test_the_eddy_viscosity_is_never_negative(name):
     """A negative nu_t is anti-diffusion: it would add energy and destabilise the march. Checked on a

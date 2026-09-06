@@ -110,7 +110,15 @@ def test_a_capped_march_under_a_trace_is_not_silently_rescued():
     fem = _heat()
     capped = jno.solve.newton(max_steps=1, rtol=1e-14, atol=1e-14)
     got = np.asarray(jax.jit(lambda: fem.solve(nonlinear=capped).fn())())
-    assert got.shape[0] == 6, "the traced march returns a trajectory, unjudged"
+    ref = np.asarray(fem.solve(nonlinear=jno.solve.newton(rtol=1e-10, atol=1e-10)).fn())
+    # Not just "it did not raise": the returned trajectory must actually BE the non-root, or this
+    # test would pass equally well if the traced path had quietly converged and there were no limit
+    # to document. Same capped solve raises eagerly (test above); under the trace it comes back.
+    assert got.shape == ref.shape
+    assert np.abs(got - ref).max() > 1e-6, (
+        "the traced capped march returned something indistinguishable from the converged answer; "
+        "the documented limit would then not be real"
+    )
 
 
 def test_the_bdf2_march_is_judged_too():

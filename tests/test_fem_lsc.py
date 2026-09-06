@@ -231,15 +231,34 @@ def test_an_unknown_schur_is_refused_by_name():
         jno.precond.saddle(schur="pcd")
 
 
-def test_a_matrix_free_operator_is_refused():
-    """LSC slices the assembled system; a matrix-free path has no blocks to take, and says so."""
-    fem, _u, _p, _pp, _qq = _stokes()
-    spec = jno.precond.lsc()
-    spec.prepare(fem)
-    op = LinearOperator.from_matvec(lambda v: v, shape=(fem.dofs, fem.dofs))
-    # prepare() captured real blocks, so materialize succeeds; the refusal is on a system whose
-    # operator never assembles -- exercised by prepare on a matrix-free FEM, which no fixture builds.
-    assert materialize_precond(spec, PrecondContext(op, fem)) is not None
+def test_the_lsc_applier_depends_on_the_operator_it_was_built_for():
+    """LSC reads the OPERATOR, not just the FEM -- the velocity mass lump comes from ``op @ ones``.
+
+    This replaces a test called "a matrix-free operator is refused", which asserted only that the
+    call returned non-None. Two things were wrong with it: `_LSC` contains no refusal at all, so the
+    name described behaviour that does not exist; and `is not None` could not fail whatever the code
+    did. Its own docstring admitted the case it named was never built.
+
+    What is true, and worth pinning, is that the applier is a function of the operator. If it ever
+    stopped reading the operator, an LSC built for one system would be silently reused for another --
+    a Newton tangent, or a transient step matrix M + dt A -- and would still return plausible numbers.
+    Here an identity stand-in of the same shape yields a demonstrably different applier."""
+    fem, _u, pfield, _pp, _qq = _stokes()
+    blk = fem.blocks[fem.block_index(pfield)]
+    rng = np.random.default_rng(0)
+    x = jax.numpy.asarray(rng.standard_normal(blk.stop - blk.start))
+
+    def _apply(op):
+        spec = jno.precond.lsc()
+        spec.prepare(fem)
+        return np.asarray(materialize_precond(spec, PrecondContext(op, fem))(x))
+
+    real = _apply(LinearOperator(fem.A))
+    stand_in = _apply(LinearOperator.from_matvec(lambda v: v, shape=(fem.dofs, fem.dofs)))
+
+    assert np.isfinite(real).all() and np.abs(real).max() > 0, "the real applier must do something"
+    rel = np.abs(real - stand_in).max() / np.abs(real).max()
+    assert rel > 1e-3, f"the applier ignored the operator it was built for (relative change {rel:.2e})"
 
 
 def test_lsc_never_densifies_the_operator():
