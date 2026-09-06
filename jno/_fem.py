@@ -1749,6 +1749,14 @@ class FEM:
         Profile a *concrete* forward solve; a parametric solve returns a deferred trace node with no numeric
         work to time.
         """
+        # Structural singularity is checked at BUILD and reported HERE. A form whose terms cover only
+        # part of the mesh is a legitimate object -- `jno.core([femL, fdmR, ...])` and `jno.dd.couple`
+        # are built from exactly those, one per subdomain -- so refusing to construct it is wrong. It
+        # is only an error for a system solved on its own, which is this call. The decomposition drives
+        # `prob._op` directly and never arrives here.
+        _starved = getattr(self, "_starved_message", None)
+        if _starved:
+            raise ValueError(_starved)
         # Cleared on EVERY solve, not only a reduced one: a leftover value from an earlier
         # ``basis=`` call would read as "this answer was certified" on an answer that never was.
         self.basis_residual = None
@@ -5284,16 +5292,26 @@ def _fem_impl(
                     f"  field {_nm.get(_keys[_i], '?')!r} (block {_i}): {_n} DOFs, "
                     f"every term reaching it is restricted to {_rs}"
                 )
-            raise ValueError(
+            # Recorded, NOT raised here. A `jno.fem` whose terms cover one region is a legitimate
+            # INTERMEDIATE: `jno.core([femL, fdmR, ...])` and `jno.dd.couple` build exactly that, one
+            # sub-problem per subdomain, and the DOFs outside each one are governed by its partner
+            # through the coupling. Raising at build time made those unbuildable and broke five
+            # domain-decomposition tests that pass on main. Structural singularity only matters for a
+            # system somebody SOLVES on its own, so the check moved to `FEM.solve` -- which the
+            # decomposition never calls (it drives `prob._op` directly).
+            out._starved_message = (
                 "jno.fem: these DOFs appear in no term and carry no prescribed value, so the system is "
                 "structurally singular:\n" + "\n".join(_lines) + "\n"
                 "Give the field a term over the region it is missing from -- for a field that carries no "
                 "physics there, a cheap `eps * u * phi` on that region is enough. A Dirichlet pin on the "
-                "region is NOT a reliable substitute: an essential condition resolves its nodes through "
-                "`domain.tag_node_mask`, which for a VOLUME region is a proximity test against sampled "
-                "points and can miss interior nodes (measured: 32 of 33 on a two-block domain). This "
-                "checks only that every DOF is REACHED by some term -- it does not detect a missing "
-                "gauge or an unrestrained rigid-body mode."
+                "region is a different model, not a cheaper spelling of the same one: it prescribes the "
+                "field there rather than letting the physics set it. (It does now COVER the region -- a "
+                "region's Dirichlet nodes resolve from mesh topology; the earlier warning here, that a "
+                "pin reached only 32 of 33 nodes through a proximity test, described behaviour that has "
+                "since been fixed.) This checks only that every DOF is REACHED by some term -- it does "
+                "not detect a missing gauge or an unrestrained rigid-body mode. If this form is one "
+                "subdomain of a coupling, it is not an error: build it, and let `jno.core` / "
+                "`jno.dd.couple` solve it together with its partner."
             )
         return out
 

@@ -57,15 +57,36 @@ def _pieces(d):
 
 
 def test_a_field_restricted_to_one_region_is_refused_by_name():
-    """The defect. ``u`` is governed only on `lower`, so its DOFs on `upper` have no equation."""
+    """The defect. ``u`` is governed only on `lower`, so its DOFs on `upper` have no equation.
+
+    Refused at SOLVE, not at build. A form covering one region is a legitimate intermediate --
+    ``jno.core([femL, fdmR, ...])`` and ``jno.dd.couple`` are built from exactly those, one per
+    subdomain, with each partner governing what the other omits. Raising in ``jno.fem`` made those
+    unbuildable and broke five domain-decomposition tests; structural singularity is a property of a
+    system somebody solves alone, so that is where it is reported.
+    """
     d = _two_region()
     u, phi, lo, _up, ob, lap = _pieces(d)
+    fem = jno.fem([lap(u, phi, lo), u(ob[0], ob[1], ob[2]) - 0.0])  # builds: it may be a subdomain
     with pytest.raises(ValueError, match="appear in no term") as e:
-        jno.fem([lap(u, phi, lo), u(ob[0], ob[1], ob[2]) - 0.0])
+        fem.solve()
     msg = str(e.value)
     assert "'u'" in msg, msg  # names the FIELD, not just a block index
     assert "'lower'" in msg, msg  # and the region its terms are restricted to
     assert "rigid-body" in msg  # and states the limit: this is structural, not a rank test
+    assert "couple" in msg, msg  # and points a subdomain author at the coupling entry points
+
+
+def test_a_one_region_form_still_builds_for_use_as_a_subdomain():
+    """The reason the refusal moved: `jno.dd.couple` needs to CONSTRUCT such a form.
+
+    Reduced to the essential shape, so it fails for the right reason if the build-time raise ever
+    returns -- the domain-decomposition suite would catch it too, but only through a much longer path.
+    """
+    d = _two_region()
+    u, phi, lo, _up, ob, lap = _pieces(d)
+    fem = jno.fem([lap(u, phi, lo), u(ob[0], ob[1], ob[2]) - 0.0])
+    assert fem is not None and int(fem.dofs) > 0
 
 
 def test_a_term_over_the_missing_region_makes_it_build_and_solve():
