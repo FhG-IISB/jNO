@@ -80,30 +80,42 @@ def test_a_term_over_the_missing_region_makes_it_build_and_solve():
     assert np.isfinite(np.asarray(fem.solve(linear=jno.solve.lu(backend="host")))).all()
 
 
-def test_a_volume_region_pin_does_not_cover_the_whole_region():
-    """Why the message does NOT lead with "pin the region" — the pin itself has a hole.
+def test_a_volume_region_pin_covers_the_whole_region():
+    """A Dirichlet pin on a volume sub-region reaches every ungoverned DOF of that region.
 
-    An essential condition resolves its nodes through ``domain.tag_node_mask``, which for a volume
-    region is a proximity test against the region's *sampled* points rather than a containment test.
-    On this domain the ungoverned set is 33 DOFs and the pin reaches 32 of them; the survivor is an
-    interior node of `upper` (z ~ 1.407) that sampling missed. Pre-existing and independent of this
-    check — recorded here because it means a Dirichlet condition on a volume sub-region can silently
-    fail to constrain part of that region.
+    It did not always. The pin fell through to ``domain.tag_node_mask``, which for a volume region is
+    a proximity test against the region's *sampled* points rather than a containment test, and reached
+    **32 of 33** nodes -- one interior node of `upper` that sampling missed stayed unconstrained, with
+    nothing raised. ``_region_node_ids_from_cells`` resolves it from mesh topology instead, on the same
+    ``_cell_region_mask`` the assembler integrates over, so the Dirichlet node set cannot disagree with
+    the cells the terms were applied to.
+
+    This test previously asserted the DEFECT (``n_dead == 33 and n_pin == 32``) and read the pin
+    through ``tag_node_mask("upper", ...)``. That returns ``None`` for anything that is not a
+    ``domain.tag`` -- and "upper" is a ``Shape.name`` region -- so it raised ``TypeError`` from the
+    commit that introduced it and never once ran its assertions. The behaviour it was guarding was
+    then fixed, leaving it wrong twice over.
     """
+    from jno.utils.solver.fem_native import _region_node_ids_from_cells
     from jno.utils.solver.fem_utils import _cell_region_mask
 
     d = _two_region()
     u, phi, lo, up, ob, lap = _pieces(d)
-    co = d.variable("interior", split=True)
-    jno.fem([lap(u, phi, co), u(ob[0], ob[1], ob[2]) - 0.0])  # whole-domain build: publishes the layout
+    jno.fem([lap(u, phi, d.variable("interior", split=True)), u(ob[0], ob[1], ob[2]) - 0.0])
     pts = np.asarray(d._fem_native_dof_points_all[0])
     cells = np.asarray(d._fem_native_assembly_cells_all[0])
     reached = np.zeros(len(pts), dtype=bool)
     reached[np.unique(cells[np.asarray(_cell_region_mask(d, "lower")).reshape(-1) > 0])] = True
-    n_dead = int((~reached).sum())
-    n_pin = int(np.asarray(d.tag_node_mask("upper", pts)).sum())
-    assert n_dead == 33 and n_pin == 32, (n_dead, n_pin)
-    assert n_pin < n_dead, "the pin under-covers the ungoverned set -- this is the defect"
+    dead = set(np.flatnonzero(~reached).tolist())
+    assert dead, "the fixture must leave part of `upper` ungoverned, or this test asserts nothing"
+
+    ids = set(np.asarray(_region_node_ids_from_cells(d, "upper", cells)).tolist())
+    assert dead <= ids, f"the pin misses {len(dead - ids)} of the {len(dead)} ungoverned DOFs"
+
+    assert d.tag_node_mask("upper", pts) is None, (
+        "tag_node_mask now resolves a Shape-region name; this test's premise -- that a volume-region "
+        "pin must NOT be resolved through it -- needs rechecking"
+    )
 
 
 def test_terms_covering_every_region_do_not_raise():
