@@ -2916,7 +2916,15 @@ def assemble_fem_native(
         _dir_plan = None
         if _inner_idx is not None:
             try:
-                _d_np = np.asarray(dofs, dtype=np.int64).reshape(-1)
+                # From `pairs` -- Python ints -- NOT from `dofs`. Which DOFs are constrained is
+                # structural, decided host-side before anything is traced, but `dirichlet_projection`
+                # hands it back as a jnp array, and when this wrapper is built INSIDE a trace (which is
+                # where it is built since the jacobian became a per-call wrapper) that array is a
+                # tracer. `np.asarray` on it raised, the except below swallowed it, `_dir_plan` came out
+                # None, and every Dirichlet duplicate survived -- 648 triplets for 616 unique pairs on
+                # the 2-D fixture, exactly the 32 constrained DOFs. Eager assembly was unaffected, so
+                # only the traced path silently lost its compression.
+                _d_np = np.asarray([int(_p[0]) for _p in pairs], dtype=np.int64).reshape(-1)
                 _dir_plan = compress_plan(
                     np.concatenate([np.asarray(_inner_idx), np.stack([_d_np, _d_np], axis=1)], axis=0)
                 )
