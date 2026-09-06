@@ -1143,10 +1143,19 @@ def assemble_fem_native(
     _is_march = bool(getattr(domain, "_is_pseudo_time", False))
     history_roles: Dict[Any, str] = {}
     readout_formulas: Dict[Any, Any] = {}
+    # Per-key cell mask for a REGION-restricted update (``state.evolves(f, region=...)``). Built once,
+    # on the host, in the assembly mesh's own cell order -- the same order the readout vmaps over -- so
+    # the mask lines up with the cells it gates. ``None`` means whole-domain, the historical behaviour.
+    readout_masks: Dict[Any, Any] = {}
     for key, (base, _depth) in _history_raw.items():
         if key in _evolution:
             history_roles[key] = "internal"
             readout_formulas[key] = _lower_statefield_to_trial(_evolution[key].formula, {})
+            _rg = getattr(_evolution[key], "region", None)
+            if _rg is not None:
+                # `_cell_region_mask` raises a named ValueError for an unknown region, which is the
+                # error the caller should see -- do not soften it into a whole-domain fallback.
+                readout_masks[key] = np.asarray(_cell_region_mask(domain, _rg)).reshape(-1) > 0
         elif getattr(base, "field_key", None) in _solved_field_keys:
             history_roles[key] = "primary"  # auto-buffered from the solved unknown (the bare field at QPs)
             readout_formulas[key] = _lower_statefield_to_trial(base, {})
@@ -2021,8 +2030,13 @@ def assemble_fem_native(
         quadrature points, given the just-solved ``u_flat`` and the current history buffers (on
         ``args['__history__']``). Returns ``{history_key: (n_cells, n_quad, *value_shape)}`` — the value
         that becomes each state's ``.i(-1)`` at the NEXT step. The load-step march rolls these into the
-        depth buffers. Whole-domain: the readout runs on every cell (sub-region-restricted plasticity is
-        not wired — a future masked readout)."""
+        depth buffers.
+
+        A state declared ``state.evolves(f, region=...)`` is advanced only on that region's cells; on the
+        rest its next value is the value it already has, read straight back out of slot 0 of the incoming
+        buffer. Freezing rather than zeroing is what lets a zero-initialised plastic strain leave the
+        unrestricted region elastic without a second constitutive branch, and it keeps the formula from
+        ever being evaluated on cells carrying another material's constants."""
         local_all = u_flat[cell_all_dofs]  # (n_cell, n_local_all)
         out: Dict[Any, Any] = {}
         for key, formula in readout_formulas.items():
@@ -2034,11 +2048,22 @@ def assemble_fem_native(
             # runs inside the march's differentiated scan, so those intermediates are retained for the
             # backward pass. One test-DOF's worth of cost per cell is the honest proxy: the readout carries
             # no test function, so there is no element block -- only the per-quadrature-point value.
-            out[key] = _elem_map(
+            nxt = _elem_map(
                 lambda c, la, _f=formula: _vol_elem_readout(c, la, _f, t, args),
                 (jnp.arange(n_cells), local_all),
                 _cell_chunk(n_cells, 1, cell_all_dofs.shape[1]),
             )
+            _mask = readout_masks.get(key)
+            if _mask is not None:
+                hb = (args or {}).get("__history__") if isinstance(args, dict) else None
+                prev = None if hb is None else hb.get(key)
+                if prev is not None:
+                    # slot 0 IS this state's `.i(-1)` (see `_roll_buffer`), so writing it back leaves the
+                    # cell exactly where it was -- bit-identical, not merely close.
+                    keep = jnp.asarray(prev)[:, :, 0, ...]
+                    m = jnp.asarray(_mask).reshape((-1,) + (1,) * (nxt.ndim - 1))
+                    nxt = jnp.where(m, nxt, keep)
+            out[key] = nxt
         return out
 
     # Which entries of a gap table a re-pairing may replace. `faces` (which facets are secondary),

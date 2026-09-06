@@ -16,8 +16,9 @@ Scope (stated up front): real, steady native-Lagrange forms, **single-field or c
 solved to equilibrium at each τ with the previous state frozen (a fully implicit return map when the
 constitutive stress embeds it), then the state advances. Nothing here is per-field: ``n_dofs`` is the whole
 block vector and the buffers are indexed by cell, so a state written by one field and read by another (a
-phase-field history coupling damage to displacement) marches identically. Whole-domain state only (the
-readout runs on every cell; sub-region-restricted plasticity is not wired yet).
+phase-field history coupling damage to displacement) marches identically. A state advances on every cell
+unless its update names a region -- ``state.evolves(formula, region=...)`` masks the readout, freezing the
+state outside that region at the value it already has.
 """
 
 from typing import Any, Dict

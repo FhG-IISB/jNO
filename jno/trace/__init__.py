@@ -946,14 +946,30 @@ class Placeholder:
         with the opposite sign states a different inequality — see ``docs/fem/boundary-conditions.md``."""
         return BoundConstraint(self, lo, hi)
 
-    def evolves(self, formula) -> "StateUpdate":
+    def evolves(self, formula, *, region=None) -> "StateUpdate":
         """Declare a per-step **state update** for this (internal-state) field: at the current step it
         *becomes* ``formula`` — which typically reads its own past via ``self.i(-1)`` and the solved
         unknown (e.g. ``ep.evolves(ep.i(-1) + rt*dg*n)``). Put it in the ``jno.fem([...])`` list beside the
         equations; the load-step march evaluates ``formula`` at the quadrature points after each solve to
         advance the buffer that ``self.i(-1)`` reads. Reads use ``.i(-k)``, writes use ``.evolves`` — a
-        *named* update, not an operator (``==`` is reserved for identity, ``<`` for comparison)."""
-        return StateUpdate(self, formula)
+        *named* update, not an operator (``==`` is reserved for identity, ``<`` for comparison).
+
+        Args:
+            region: restrict the update to one region — a ``domain.tag`` name, a ``Shape.regions()``
+                sub-region, or a geometry part. ``None`` (default) advances the state on every cell, and
+                is what the update did before this argument existed. Outside the region the state is
+                **frozen**: its next value is the value it already has. That is what makes an ordinary
+                multi-material problem expressible — a plastic strip drawn over an elastic die is
+
+                    ep.evolves(ep.i(-1) + rt * dg * n, region="strip")
+
+                and the die's cells never evaluate the strip's return map at all. A zero-initialised
+                state left frozen stays zero, so the unrestricted region simply stays elastic, with no
+                second constitutive branch to write. Note for a state kept deeper than one step: freezing
+                writes the current value forward, so a frozen cell's ``.i(-2)`` also converges to it —
+                the state is constant there, which is what not evolving means.
+        """
+        return StateUpdate(self, formula, region=region)
 
     def laplacian(
         self,
@@ -4595,10 +4611,13 @@ class StateUpdate(Placeholder):
     ``expr`` = the update formula) are walked, so any ``.i(k)`` *inside* the formula still contributes to
     the inferred keep-depth (see :func:`history_variables`)."""
 
-    def __init__(self, base, formula):
+    def __init__(self, base, formula, region=None):
         base = base._expr if hasattr(base, "_expr") else base  # unwrap a typed view
         self.target = base  # the state field advanced (reached via _iter_placeholder_children)
         self.expr = formula  # the RHS update expression (also a walked child)
+        # Where the update applies; None = every cell. Consumed by the assembler, which masks the
+        # readout so cells outside keep the value they already had (see Placeholder.evolves).
+        self.region = region
         self.name = f"{getattr(base, 'name', 'state')}.evolves(...)"
         self.value_shape = tuple(getattr(base, "value_shape", ()))
         self.order = int(getattr(base, "order", 1))
