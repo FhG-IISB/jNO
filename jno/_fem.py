@@ -4932,7 +4932,24 @@ def _fem_impl(
     classification.extend(f"slip@{spec[1]}" for spec in slip_bcs)
 
     if is_vpinn and multifield:
-        raise NotImplementedError("jno.fem VPINN (network trial) is currently single-field only.")
+        # Single-field is a real boundary, not a guard: the network-trial lowering wraps ONE primary
+        # unknown (`detect_primary_state_field` / `wrap_primary_state`), and carrying several would
+        # mean threading a field identity through that wrapping. The IR already reserves the slot for
+        # it -- `LoweredChannelTerm.variable_id`, filterable in `select`/`sum_coeffs` -- but the
+        # extractor assigns 0 everywhere and the consumer only reads field 0.
+        #
+        # Say what to do instead, because there IS a route: a coupled system whose fields share a test
+        # space IS one vector field, and a vector VPINN works. Verified on
+        # `-Lap a = fa + b, -Lap b = fb`: written as `u = (a, b)` it trains, against an FEM solve of
+        # the identical form (tests/test_vpinn_integration.py::TestVpinnCoupledAsVector).
+        raise NotImplementedError(
+            "jno.fem: a VPINN (network trial) is single-field -- the lowering wraps one primary "
+            "unknown. Write the coupled system as ONE VECTOR field instead: `d.fem_symbols("
+            "value_shape=(n,))` with an n-output network, inter-field coupling as component terms "
+            "(`u[1] * v[0]`) and per-component sources (`f0 * v[0] + f1 * v[1]`). That is the same "
+            "system and it trains. Fields needing DIFFERENT test spaces (a Taylor-Hood pair, say) "
+            "have no route yet."
+        )
 
     # ---- second-order in time (`u_tt`): reduce to a first-order augmented (u, v=u_t) block ----
     # A weak term carrying a SECOND temporal derivative is lowered to the equivalent first-order

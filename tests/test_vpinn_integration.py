@@ -536,3 +536,79 @@ class TestVpinnVectorSource:
         pde0 = jno.fem([jnn.inner(gu, gv, n_contract=2), u(xb, yb) - (0.0, 0.0)])
         r_without = float(np.asarray(jno.core([pde0.mse], domain=dom).eval([pde0.mse])).reshape(()))
         assert abs(r_with - r_without) > 1e-9, "the component source is not reaching the residual at all"
+
+
+class TestVpinnCoupledAsVector:
+    """A coupled system whose fields share a test space IS one vector field -- the route the
+    single-field refusal points at, pinned so the message cannot rot into a false promise.
+
+    System:  -Lap a = fa + b,  -Lap b = fb,  a = b = 0 on the boundary,
+    manufactured with a* = s, b* = 2s for s = x(1-x)y(1-y), so fa = lap_s - 2s and fb = 2*lap_s.
+    The inter-field coupling ``- b*va`` is a cross-component term ``u[1]*v[0]``.
+    """
+
+    @staticmethod
+    def _terms(dom, u, phi, trial, xi, yi):
+        vi = phi.bind(x=xi, y=yi)
+        s = xi * (1 - xi) * yi * (1 - yi)
+        lap = 2.0 * (xi * (1 - xi) + yi * (1 - yi))
+        gu, gv = jnn.jacobian(trial, [xi, yi]), jnn.jacobian(vi, [xi, yi])
+        return [
+            jnn.inner(gu, gv, n_contract=2)
+            - (lap - 2.0 * s) * vi[0]  # fa
+            - (2.0 * lap) * vi[1]  # fb
+            - trial[1] * vi[0]  # the coupling: b enters a's equation
+        ]
+
+    def test_the_coupled_system_is_expressible_and_correct_as_a_vector_field(self):
+        """Oracle: solve the SAME form with an FEM trial. If FEM recovers (s, 2s), the vector
+        rewrite of the coupled system is right -- which is what the refusal message asserts."""
+        dom = jno.Shape.rect(0, 0, 1, 1, size=0.12).domain()
+        u, phi = dom.fem_symbols(value_shape=(2,))
+        xi, yi, _ = dom.variable("interior", split=True)
+        xb, yb, _ = dom.variable("boundary", split=True)
+        ui = u.bind(x=xi, y=yi)
+
+        fem = jno.fem(self._terms(dom, u, phi, ui, xi, yi) + [u(xb, yb) - (0.0, 0.0)])
+        sol = np.asarray(fem.solve(linear=jno.solve.lu())).reshape(-1, 2)
+        pts = np.asarray(fem.points)
+        ex = pts[:, 0] * (1 - pts[:, 0]) * pts[:, 1] * (1 - pts[:, 1])
+        for i, scale in enumerate((1.0, 2.0)):
+            rel = float(np.linalg.norm(sol[:, i] - scale * ex) / np.linalg.norm(scale * ex))
+            assert rel < 5e-3, f"component {i} of the coupled system is wrong: rel-L2 {rel:.2e}"
+
+    def test_a_network_trial_assembles_on_that_same_coupled_form(self):
+        """And the network-trial version of the identical form builds a trainable residual, so the
+        route the refusal names is actually open (training quality is a separate, documented matter --
+        the two component residuals compete under an equal-weight loss)."""
+        dom = make_domain()
+        u, phi = dom.fem_symbols(value_shape=(2,))
+        xi, yi, _ = dom.variable("interior", split=True)
+        xb, yb, _ = dom.variable("boundary", split=True)
+        net = jnn.nn.wrap(
+            foundax.mlp(2, output_dim=2, hidden_dims=8, num_layers=2, activation=jax.nn.tanh, key=jax.random.PRNGKey(0))
+        )
+        s = xi * (1 - xi) * yi * (1 - yi)
+        pde = jno.fem(self._terms(dom, u, phi, net(xi, yi) * s, xi, yi) + [u(xb, yb) - (0.0, 0.0)])
+        r = float(np.asarray(jno.core([pde.mse], domain=dom).eval([pde.mse])).reshape(()))
+        assert np.isfinite(r) and r > 0.0, "the coupled-as-vector VPINN residual must be finite and non-trivial"
+
+    def test_two_separate_fields_are_refused_with_the_route_named(self):
+        """The refusal must point somewhere, not just say no."""
+        dom = make_domain()
+        a, ta = dom.fem_symbols(names=("a", "ta"))
+        b, tb = dom.fem_symbols(names=("b", "tb"))
+        xi, yi, _ = dom.variable("interior", split=True)
+        xb, yb, _ = dom.variable("boundary", split=True)
+        n1, n2 = make_scalar_net(), make_scalar_net()
+        tai, tbi = ta.bind(x=xi, y=yi), tb.bind(x=xi, y=yi)
+        s = xi * (1 - xi) * yi * (1 - yi)
+        with pytest.raises(NotImplementedError, match=r"value_shape"):
+            jno.fem(
+                [
+                    jnn.grad(n1(xi, yi) * s, xi) * jnn.grad(tai, xi) - 1.0 * tai,
+                    jnn.grad(n2(xi, yi) * s, xi) * jnn.grad(tbi, xi) - 1.0 * tbi,
+                    a(xb, yb) - 0.0,
+                    b(xb, yb) - 0.0,
+                ]
+            )

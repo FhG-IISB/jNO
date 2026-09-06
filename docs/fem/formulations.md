@@ -397,6 +397,36 @@ One corner is resolved by precedence rather than a guess: a bare `(k,)` coeffici
 the quadrature-point count is read as a per-point **scalar**, that being the ordinary case. A constant
 vector of exactly that length therefore needs an explicit quadrature axis (`(1 + 0*x) * jnp.array(...)`).
 
+### A coupled system, as one vector field
+
+Two separate `fem_symbols` calls raise. That is a real boundary — the lowering wraps a single primary
+unknown — but it is rarely the end of the road, because a coupled system whose fields share a test
+space is *the same system* as one vector field. Inter-field coupling becomes a cross-component term:
+
+```python
+u, phi = d.fem_symbols(value_shape=(2,))         # u = (a, b), one field
+net    = jno.nn(foundax.mlp(2, output_dim=2, ...))   # one network, two outputs
+u_net  = net(xi, yi) * ansatz
+vi     = phi.bind(x=xi, y=yi)
+
+#  -Δa = fa + b ,  -Δb = fb
+jno.fem([inner(jac(u_net, X), jac(vi, X), 2)
+         - fa * vi[0] - fb * vi[1]      # per-component sources
+         - u_net[1] * vi[0],            # the coupling: b enters a's equation
+         u(xb, yb) - (0.0, 0.0)])
+```
+
+!!! measured "The rewrite is exact; the training is the limit"
+    Solving that *identical form* with an FEM trial recovers the manufactured `(s, 2s)` to **9.3e-04 /
+    9.2e-04**, so the vector rewrite of the coupled system is correct. The network trial on the same
+    form reaches **6.8e-02** on the coupled component and **5.0e-05** on the uncoupled one, and does
+    not improve with more steps — the two component residuals compete under an equal-weight loss.
+    That is loss balancing, a standard PINN concern, not a formulation error; weight the terms if you
+    need the coupled component tighter.
+
+Fields that genuinely need **different** test spaces — a Taylor–Hood velocity/pressure pair — have no
+route yet, since the lowering builds one test context.
+
 ### Deep Ritz — and the quadrature that makes it honest
 
 For an energy-minimising formulation there are no test functions at all: write the functional and
@@ -415,7 +445,8 @@ keeps falling while the solution degrades.
 !!! warning "Scope — refused by name"
     * **1-D and 2-D meshes only.** The network-trial lowering builds its quadrature through the
       1-D/2-D native context; a 3-D domain raises. Use an FE trial, or a collocation PINN.
-    * **Single field.** A coupled multi-field VPINN raises. Scalar and vector fields are both fine —
-      a vector field is one field with `value_shape=(d,)`.
+    * **Single field.** The lowering wraps one primary unknown, so two separate fields raise —
+      but a coupled system whose fields share a test space **is** one vector field, and that works.
+      See below.
     * **No periodic ties.** A tie is an algebraic reduction of FE trial DOFs, and a network trial has
       none. Impose periodicity inside the network instead (a periodic input embedding).
