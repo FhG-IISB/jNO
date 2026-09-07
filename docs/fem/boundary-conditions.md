@@ -299,19 +299,41 @@ resulting "pair" is a body against itself. The tag's normals follow the same res
 
 The pairing above is built **once**, from the reference configuration, and is correct only while
 displacements stay far below the element size. Past that a secondary point is still tied to the facet
-it faced before anything moved. Nothing reports it: the solve converges perfectly well, just for a
-contact configuration that is not the one being solved — and **refining makes it worse**. Measured on
-a 12:20 involute gear pair against the kinematic oracle `|T_B/T_A| = z_B/z_A`, as the rim mesh went
-0.050 → 0.018:
+it faced before anything moved, and **nothing reports it** — the solve converges perfectly well, just
+for a contact configuration that is not the one being solved.
+
+How wrong that gets: a block resting on a disk's crown, slid right by 0.9 — ten element widths. Its
+nearest point is now over `x = 0.6`, where the disk has fallen away and the true separation is
+**0.182**. The frozen pairing still reports **0.05**, the value it measured at the crown, because the
+slide is tangential and nothing in `g0 − n·D` moves it. Nearly four times wrong, and silent
+(`tests/test_fem_contact_search.py::test_the_search_follows_a_slide_of_many_facet_widths`).
+
+Where the surfaces do *not* slide far, the two agree closely — the other half of the picture, and the
+reason this is a slot rather than the default. A 12:20 involute gear pair against the kinematic oracle
+`|T_B/T_A| = z_B/z_A`, rim mesh 0.050 → 0.018 (6856 → 16418 DOF):
 
 | h_rim | 0.050 | 0.035 | 0.025 | 0.018 |
 |---|---|---|---|---|
-| frozen pairing | 1.97% | 2.33% | 2.66% | **2.83%** |
-| `contact=` | 2.24% | 2.27% | 2.30% | 2.30% |
+| frozen pairing | 0.84% | 0.85% | 0.85% | 0.85% |
+| `contact=` | 0.64% | 0.64% | 0.65% | 0.64% |
+
+Both are flat under refinement and the search buys about 0.2 points, so on a rolling contact that
+barely slides it is an accuracy refinement, not a rescue. Reach for it when the surfaces genuinely
+move against each other.
 
 ```python
 u = fem.solve(contact=jno.solve.contact())      # re-pair from x + u until it settles
 ```
+
+All four knobs are optional. `capture=` is the search radius: `None` (the default) derives one per
+pair from the local facet size — 3× the mean secondary facet diameter — which is right unless the
+bodies must close several elements' worth of distance before they touch. Beyond it a point is
+**inactive**: it keeps its slot with zero weight, so the tables never change shape. `rounds=` caps the
+loop (12); `tol=` is the relative movement `|u_k − u_{k−1}|∞ / |u_k|∞` that counts as settled (1e-4);
+`relax=` damps the round-to-round update when the search oscillates, which a follower normal can
+cause. Damping does not move the fixed point, but converging under it is **not** the same as
+converging to the right branch — check a damped result against something independent, such as the
+same solve with the pairing frozen.
 
 Each round solves the ordinary system with the current pairing, then re-runs the search at `x + u`,
 warm-started from the last round. It stops when the pairing is unchanged **and** the solution has
@@ -324,15 +346,20 @@ barred from pairing with its own neighbours *and* from pairing with a facet whos
 it, which is what stops a flat stretch from reading as touching itself everywhere. A candidate list
 requires `contact=` and is refused without it.
 
-**Either tangent works**, and the choice is a speed/memory trade rather than a restriction. The
-matrix-free default re-pairs for free; `nonlinear=jno.solve.newton(direct=True)` assembles the tangent
-and rebuilds the contact block's sparsity pattern each round. Measured on a 12:20 gear pair, 11k DOF,
-5 rounds:
+**Either tangent works**, and on this problem the assembled one is simply faster. The matrix-free
+default re-pairs for free; `nonlinear=jno.solve.newton(direct=True)` assembles the tangent and
+rebuilds the contact block's sparsity pattern each round. Measured on a 12:20 gear pair, 11 682 DOF,
+5 rounds, median of three runs:
 
 | tangent | time | peak RSS |
 |---|---|---|
-| matrix-free (default) | 41.8 s | 1830 MB |
-| `newton(direct=True)` | **13.4 s** | 2611 MB |
+| matrix-free (default) | 44.2 s | 1848 MB |
+| `newton(direct=True)` | **14.7 s** | 1894 MB |
+
+Peak RSS is *comparable* here, not a trade: the assembled contact block is small next to the ~1.8 GB
+the JAX/XLA runtime already holds at this size, so its cost does not surface. Expect that to change as
+the interface grows — the time difference is the robust part of this measurement (matrix-free spanned
+42.7–48.6 s across runs, direct 14.5–15.1 s).
 
 On a form that **marches** — step history (`.i(k)`) plus a `domain(tau=...)` grid — the march owns the
 loop and re-runs the search at *every load step*, because the pairing that is right at the end of the

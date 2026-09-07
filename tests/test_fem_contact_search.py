@@ -3,8 +3,10 @@
 ``u.gap(secondary, main)`` precomputes, once, which main nodes every secondary quadrature point reads.
 That is correct only while displacements stay far below the element size; past it a point is still tied
 to the facet it faced before anything moved. **Nothing reports this.** The solve converges perfectly
-well, just for a contact configuration that is not the one being solved — measured on an involute gear
-pair the torque ratio drifted up to 43% off the kinematic oracle and got *worse* under refinement.
+well, just for a contact configuration that is not the one being solved — a block slid ten element
+widths across a disk keeps reporting the 0.05 separation it had before it moved, where the truth is
+0.182. (Gear figures quoted elsewhere as motivation were measured on a pair whose own geometry was
+inadmissible; see ``tests/test_fem_contact_gear_ratio.py`` for what a cuttable one gives.)
 
 The slot solves, re-runs the search at ``x + u``, and repeats until the pairing and the solution both
 stop moving. What has to be true for that to be sound is pinned below: re-pairing at zero displacement

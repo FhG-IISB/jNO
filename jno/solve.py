@@ -1497,16 +1497,18 @@ def contact(*, capture: float | None = None, rounds: int = 12, tol: float = 1e-4
 
     **Why this is not a refinement detail.** Nothing reports a stale pairing. The solve converges
     perfectly well; it just converges for a contact configuration that is not the one being solved, and
-    **refining makes it worse**. On a 12:20 involute gear pair, against the kinematic oracle
-    ``|T_B/T_A| = z_B/z_A`` — which holds because the line of action is common, so each moment arm is
-    that gear's base radius — the same problem solved both ways as the rim mesh went 0.050 -> 0.018::
+    only a check like a kinematic oracle exposes it — the animation looks right throughout. On a 12:20
+    involute gear pair, against ``|T_B/T_A| = z_B/z_A`` — which holds because the line of action is
+    common, so each moment arm is that gear's base radius — as the rim mesh went 0.050 -> 0.018
+    (6856 -> 16418 DOF)::
 
-        frozen pairing   1.97%   2.33%   2.66%   2.83%      <- grows as h falls
-        re-paired        2.24%   2.27%   2.30%   2.30%      <- settles
+        frozen pairing   0.84%   0.85%   0.85%   0.85%
+        re-paired        0.64%   0.64%   0.65%   0.64%
 
-    Only a check like that ratio exposes it; the animation looks right throughout. (The ~2.3% the two
-    share at that drive is the demo's tooth geometry, not the pairing — it is flat in h, grows with the
-    penalty toward 3.6%, and does not move when the involute flank is sampled twice as finely.)
+    Both are flat, and the search buys about 0.2 points: on a rolling contact that barely slides this
+    is an accuracy refinement rather than a rescue. (The ~0.6% the two share is NOT the pairing — it is
+    flat in h across a 2.4x DOF range and non-monotone in the penalty, 0.57/0.64/0.73/0.20% over
+    ``C_N = 4e4..4e7``, so it is neither discretisation nor contact compliance.)
 
     Where the pairing does go stale the error is gross rather than subtle: a flat-bottomed block slid
     0.9 across a disk of radius 1 keeps reporting the 0.05 separation it had at its starting position,
@@ -1526,8 +1528,8 @@ def contact(*, capture: float | None = None, rounds: int = 12, tol: float = 1e-4
             the two conditions failed. The default is generous because a round that settles returns
             immediately, so the only cost of a high ceiling is paid by a problem that was going to
             raise anyway — whereas a ceiling set just at the edge turns a converging solve into an
-            error. Measured on the gear pair: the pairing freezes by round 4 and the displacement
-            reaches ``tol`` around round 9.
+            error. Measured on the gear pair: the whole loop settles in 3 to 4 rounds, the pairing
+            freezing a round before the displacement reaches ``tol``.
         tol: tolerance on ``|u_k - u_{k-1}|_inf / |u_k|_inf`` — "the solution stopped moving",
             **relative to the solution's own size**. Once the pairing stops changing this is an
             ordinary fixed point and contracts by roughly 0.2-0.3 per round, so a tolerance an order
@@ -1560,17 +1562,20 @@ def contact(*, capture: float | None = None, rounds: int = 12, tol: float = 1e-4
 
     Scope, stated up front:
 
-    * **Either tangent works, and they trade speed against memory.** The matrix-free default re-pairs
+    * **Either tangent works, and the assembled one is faster here.** The matrix-free default re-pairs
       for free (its tangent is ``jax.linearize`` of the residual). ``nonlinear=jno.solve.newton(direct=
       True)`` assembles the tangent instead and rebuilds the contact block's sparsity pattern per
       round — sound because the block's SIZE is fixed by the declaration, so only the index values
-      move. Measured on a 12:20 gear pair, 11k DOF, 5 rounds::
+      move. Measured on a 12:20 gear pair, 11 682 DOF, 5 rounds, median of three::
 
-          matrix-free (default)      41.8 s     1830 MB
-          newton(direct=True)        13.4 s     2611 MB     <- 3.1x faster, 43% more memory
+          matrix-free (default)      44.2 s     1848 MB
+          newton(direct=True)        14.7 s     1894 MB     <- 3.0x faster, same memory
 
-      Neither is the right default for every problem, which is why this stays on the ``nonlinear=``
-      slot that already owns the choice rather than becoming an argument here.
+      Peak RSS is comparable at this size rather than a trade: the assembled contact block is small
+      next to the ~1.8 GB the JAX/XLA runtime already holds, so its cost does not surface. Expect that
+      to change as the interface grows — the time gap is the robust part (matrix-free spanned
+      42.7-48.6 s across runs, direct 14.5-15.1 s). Neither is the right default for every problem,
+      which is why this stays on the ``nonlinear=`` slot that already owns the choice.
     * **The search is host-side and not differentiable in the mesh coordinates.** As with the frozen
       pairing, the gap is differentiable in the DOF *values*; ``d(pairing)/d(x)`` does not exist.
       Each round is its own solve, so a gradient through the *loop* is not provided either.

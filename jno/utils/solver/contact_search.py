@@ -407,15 +407,15 @@ def run_contact_solve(fem, spec, *, solve_fn=None, **kwargs):
     configuration -- and nothing reports it, because the solve converges perfectly well, just for a
     contact configuration that is not the one being solved.
 
-    The signature is that refining makes it WORSE. On a 12:20 involute gear pair, against the kinematic
-    oracle ``|T_B/T_A| = z_B/z_A``, the same problem solved both ways as the rim mesh went 0.050 ->
-    0.018::
+    On a 12:20 involute gear pair, against the kinematic oracle ``|T_B/T_A| = z_B/z_A``, the same
+    problem solved both ways as the rim mesh went 0.050 -> 0.018 (6856 -> 16418 DOF)::
 
-        frozen pairing   1.97%   2.33%   2.66%   2.83%      <- grows as h falls
-        re-paired        2.24%   2.27%   2.30%   2.30%      <- settles
+        frozen pairing   0.84%   0.85%   0.85%   0.85%
+        re-paired        0.64%   0.64%   0.65%   0.64%
 
-    (The ~2.3% both share at that drive is the demo geometry, not the pairing: it is flat in h, GROWS
-    with the penalty toward 3.6%, and does not move when the involute flank is sampled twice as finely.)
+    Both flat: where the surfaces barely slide, re-pairing is an accuracy refinement worth about 0.2
+    points, not a rescue. (The ~0.6% both share is NOT the pairing -- flat in h across a 2.4x DOF range
+    and non-monotone in the penalty, 0.57/0.64/0.73/0.20% over C_N = 4e4..4e7.)
     Where the pairing genuinely goes stale the error is not subtle -- a flat-bottomed block slid 0.9
     across a disk of radius 1 reads a separation of 0.05, the value at its starting position, where the
     truth is 0.182.
