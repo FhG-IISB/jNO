@@ -668,9 +668,30 @@ def _make_residual(
 def _apply_dirichlet_symmetric(A, b, dirichlet_pairs: List[Tuple[int, float]]):
     """Symmetric Dirichlet elimination on a linear system ``A u = b``.
 
-    Moves known columns to the RHS, then zeros the constrained rows *and* columns
-    and sets a unit diagonal — so ``A`` stays symmetric (as in the 2D/3D
-    path), unlike a row-only replacement."""
+    Moves known columns to the RHS, then zeros the constrained rows *and* columns and pins the
+    diagonal — so ``A`` stays symmetric (as in the 2D/3D path), unlike a row-only replacement.
+
+    **The pinned row is SCALED to the local diagonal magnitude, not set to one.** On the sparse
+    (BCOO) path the constrained equation is written ``s·u_i = s·g`` with ``s = |A_ii|`` before
+    elimination (the mean ``|A|`` where that diagonal vanished), rather than the ``1·u_i = g`` a
+    row replacement would give. The two are algebraically identical and the solution is unchanged
+    -- but they are not equivalent numerically:
+
+    a unit row sitting among rows of magnitude 1e5 is a badly scaled matrix, and the condition
+    number it produces is felt directly by every iterative solver and preconditioner downstream.
+    That is why this exists at all: the H(curl) / AMS stack cannot afford it. Keeping the pinned
+    row at the local scale leaves the operator uniformly scaled.
+
+    Two consequences worth knowing before "fixing" this back:
+
+    * ``A[i, i]`` on a pinned row is **not 1.0**. A test that identifies pinned rows by that value
+      is reading a convention, not a property -- identify them by structure instead (every
+      off-diagonal zero, diagonal non-zero), which is what "this row pins exactly this DOF" means.
+    * ``b[i]`` carries ``s·g``, not ``g``. Read the imposed value off the SOLUTION, never off the
+      load vector.
+
+    The dense fallback below still uses a unit diagonal: it exists for small systems that go to a
+    direct solve, where scaling buys nothing."""
     if not dirichlet_pairs:
         return A, b
     dofs = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32)

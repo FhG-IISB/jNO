@@ -167,8 +167,13 @@ def test_extra_dof_pins_are_applied():
     s0 = np.asarray(jno.np.asarray(free.solve())).reshape(-1)
     assert abs(s0[3]) > 1e-6 and abs(s0[7]) > 1e-6, "unpinned DOFs are already ~0; pick different ones"
 
+    # Solved DIRECTLY, so the bar tests the pin rather than the Krylov tolerance. A pin is imposed
+    # exactly -- measured 0.0e+00 for both under `lu()` and `dense()` -- while the default iterative
+    # solver leaves 3.7e-11 on the non-zero one, which is its own 1e-8 tolerance doing its job and
+    # says nothing about whether the pin was applied. (A ZERO pin comes back exact either way, so
+    # asserting only that one would pass without testing anything.)
     _d, pinned = _curl_curl(pins=[(3, 0.0), (7, 0.5)])
-    s1 = np.asarray(jno.np.asarray(pinned.solve())).reshape(-1)
+    s1 = np.asarray(jno.np.asarray(pinned.solve(linear=jno.solve.lu()))).reshape(-1)
     assert abs(s1[3] - 0.0) < 1e-12
     assert abs(s1[7] - 0.5) < 1e-12
 
