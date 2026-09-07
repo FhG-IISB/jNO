@@ -74,3 +74,16 @@ def test_supg_changes_the_assembled_operator(_x64):
     A_supg = dense(jno.fem([galerkin + supg, u(xb, yb) - 0.0]).A)
     assert not np.allclose(A_galerkin, A_supg)  # the stabilization changed the operator
     assert np.abs(A_supg - A_galerkin).max() > 0
+
+
+def test_a_path_that_packs_no_element_size_refuses(_x64):
+    """Off the native 2-D/3-D volume kernel there is no element size to read, and saying so is the whole
+    point: this used to return the placeholder as a silent ``h = 1.0``. Measured on the unit interval
+    with ``mesh_size=0.2`` it gave ``int h = 1.0`` where the true ``h`` is 0.2 -- a 5x error, with a
+    plausible-looking number and nothing said."""
+    dom = jno.domain(constructor=jno.domain.line(mesh_size=0.2))
+    u, v = dom.fem_symbols()
+    xi = dom.variable("interior", split=True)[0]
+    ui, vi = u.bind(x=xi), v.bind(x=xi)
+    with pytest.raises(NotImplementedError, match="silent"):
+        _ = jno.fem([ui.x * vi.x - dom.cell_size * vi]).b

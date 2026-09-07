@@ -228,3 +228,12 @@ def _residual_takes_values(fem):
         return True
     except TypeError:
         return False
+
+
+def test_an_empty_value_sequence_is_refused_by_name():
+    """The length check promised `>= 1` but only enforced agreement, so an EMPTY sequence passed it:
+    every length agreed (all zero), the march loop never ran, and the return hit an unbound local --
+    an `UnboundLocalError` from inside the solver instead of a statement about the input."""
+    fem = _nonlinear_diffusion()
+    with pytest.raises(ValueError, match="length >= 1"):
+        fem.solve(continuation=jno.solve.continuation(k=[]))

@@ -2,6 +2,22 @@
 
 ## Coefficient fields — known (`.freeze()`) vs trainable
 
+!!! tip "A known coefficient from nodal DATA, not a formula"
+    `parameter(sym).initialize(lambda x, y: …)` takes a **coordinate function**. For a coefficient
+    that is *computed* rather than written down — a lagged velocity, a solved wall distance, an eddy
+    viscosity from the previous iterate — use a **frozen field** instead:
+
+    ```python
+    w, _ = d.fem_symbols(value_shape=(2,), names=("w", "z"))
+    u_known = w.bind(x=xi, y=yi).freeze(nodal_values)      # arbitrary per-node data
+    fem = jno.fem([(u_known[0]*ui.x + u_known[1]*ui.y)*vi + …])
+    ```
+
+    The known field need **not** be an unknown of the form. It borrows the nodal basis of a live field
+    with the same element (the same aliasing a load-path field uses), so it costs no DOFs. Scalar and
+    vector both work, and a form with no field of that element refuses by name.
+
+
 A coefficient in the weak form (a conductivity `k`, an emissivity, a source weight) can be a plain
 constant, a **coordinate function** `jno.fn(lambda x, y: ...)`, or a `jno.np.parameter` — written
 straight into the math like any other value:

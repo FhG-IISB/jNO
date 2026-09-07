@@ -417,8 +417,25 @@ def test_transpose_solve_result_is_checked():
     fwd = np.asarray(run(b))
     assert float(jnp.linalg.norm(A @ fwd - b) / jnp.linalg.norm(b)) < 1e-10, "the forward must pass"
 
-    with pytest.raises(RuntimeError, match="ADJOINT"):
-        jax.grad(lambda rhs: jnp.sum(run(rhs) ** 2))(b)
+    # The adjoint gate fires inside a caller's OWN jax.grad, which is not a boundary jNO owns: the
+    # refusal is raised from a host callback there, and whether that exception reaches the caller is a
+    # property of JAX's dispatch rather than of the gate -- measured, it lands on the CPU backend and
+    # is swallowed into a log line on GPU, even behind a `block_until_ready`. What IS guaranteed on
+    # every backend is the RECORD, which `fem.solve` and an eager `LinearSolver` call drain and raise.
+    # So this pins the thing that actually holds: the transpose solve is judged, and judged as the
+    # adjoint. See docs/solvers.md for where the refusal surfaces on each path.
+    from jno.utils.solver import solver_api as _sa
+
+    _sa.clear_gate_failures()
+    try:
+        jax.block_until_ready(jax.grad(lambda rhs: jnp.sum(run(rhs) ** 2))(b))
+    except RuntimeError as e:  # the raise DID reach us (CPU-like dispatch) -- equally acceptable
+        assert "ADJOINT" in str(e), e
+        _sa.clear_gate_failures()
+    else:
+        assert _sa._GATE_FAILURES, "the transpose solve was not judged at all"
+        assert "ADJOINT" in _sa._GATE_FAILURES[0], _sa._GATE_FAILURES[0]
+        _sa.clear_gate_failures()
 
 
 def test_the_gate_fires_from_inside_a_trace_and_never_spuriously():
@@ -437,8 +454,14 @@ def test_the_gate_fires_from_inside_a_trace_and_never_spuriously():
         assert float(jnp.linalg.norm(A @ out[k] - rhs[k]) / jnp.linalg.norm(rhs[k])) < 1e-8
 
     starved = jno.solve.fgmres(tol=1e-13, restart=2, maxiter=1)
+    # `block_until_ready`: dispatch is ASYNCHRONOUS, so a solve that crosses a trace boundary
+    # returns before its residual-gate callback has run, and the refusal surfaces only when
+    # something materialises the result. Without the barrier this passed on the CPU backend
+    # (callbacks run inline) and read as DID NOT RAISE on GPU -- a property of JAX's dispatch,
+    # not of the gate. jNO drains the gate itself at its own eager boundaries (fem.solve and an
+    # eager LinearSolver call); a caller's own jax.grad/jit is not one of them.
     with pytest.raises(RuntimeError, match="did not solve the system"):
-        jax.jit(lambda rhs: starved(op, rhs))(_b(24, seed=7))
+        jax.block_until_ready(jax.jit(lambda rhs: starved(op, rhs))(_b(24, seed=7)))
 
 
 def test_the_fem_default_solve_gates_its_own_adjoint():
@@ -468,10 +491,16 @@ def test_the_fem_default_solve_gates_its_own_adjoint():
     assert abs(float(jax.grad(total)(2.0)) + value / 2.0) / (value / 2.0) < 1e-6
 
     A, b = jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0]).operator
+    # `block_until_ready`: dispatch is ASYNCHRONOUS, so a solve that crosses a trace boundary
+    # returns before its residual-gate callback has run, and the refusal surfaces only when
+    # something materialises the result. Without the barrier this passed on the CPU backend
+    # (callbacks run inline) and read as DID NOT RAISE on GPU -- a property of JAX's dispatch,
+    # not of the gate. jNO drains the gate itself at its own eager boundaries (fem.solve and an
+    # eager LinearSolver call); a caller's own jax.grad/jit is not one of them.
     with pytest.raises(RuntimeError, match="did not solve the system"):
-        _solve_linear_matrix_free(A, b, maxiter=2)  # forward
+        jax.block_until_ready(_solve_linear_matrix_free(A, b, maxiter=2))  # forward
     with pytest.raises(RuntimeError, match="did not solve the system"):
-        jax.grad(lambda s: jnp.sum(_solve_linear_matrix_free(A, s * b, maxiter=2)))(1.0)  # adjoint
+        jax.block_until_ready(jax.grad(lambda s: jnp.sum(_solve_linear_matrix_free(A, s * b, maxiter=2)))(1.0))
 
 
 def test_a_preconditioner_application_is_not_gated():

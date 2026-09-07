@@ -98,7 +98,25 @@ def build_hierarchy(
             "spec = jno.precond.amg(); spec.build(fem.A); then reuse the spec."
         )
 
-    ml = pyamg.smoothed_aggregation_solver(_to_scipy_csr(A), max_levels=max_levels, max_coarse=coarse_size)
+    # Smoothed aggregation assumes a POSITIVE diagonal: its strength-of-connection graph and its
+    # smoothers both do. On an operator with negative diagonal entries the aggregation degenerates and
+    # the Galerkin coarse operator comes out NaN, or exactly zero -- and a zero coarse matrix does not
+    # raise. `pinv` of it "succeeds", the V-cycle silently contributes nothing, and the outer Krylov
+    # just converges slowly for no visible reason. Measured on the velocity block of a Navier-Stokes
+    # tangent: 213 of 538 diagonal entries negative, coarse operator all zeros.
+    _A_csr = _to_scipy_csr(A)
+    _diag = np.asarray(_A_csr.diagonal())
+    _neg = int((_diag < 0).sum())
+    if _neg:
+        raise ValueError(
+            f"jno.precond.amg(): this operator has {_neg} negative diagonal entries out of {_diag.size}. "
+            "Smoothed aggregation assumes a positive diagonal, and on an indefinite operator it builds a "
+            "degenerate hierarchy (a NaN or all-zero coarse grid) that fails silently rather than loudly. "
+            "This is the usual shape of a SADDLE-POINT or Newton-tangent block -- precondition the "
+            "structure you have instead: jno.precond.saddle() / jno.precond.lsc() for the saddle system, "
+            "or jno.precond.jacobi() / inner(...) on the block."
+        )
+    ml = pyamg.smoothed_aggregation_solver(_A_csr, max_levels=max_levels, max_coarse=coarse_size)
     levels: List[dict] = []
     for lvl in ml.levels[:-1]:
         A_l = jsp.BCOO.from_scipy_sparse(lvl.A.tocoo())
@@ -109,6 +127,13 @@ def build_hierarchy(
         )
         levels.append({"A": A_l, "P": P, "R": R, "lmin": lmin_ratio * lmax, "lmax": lmax, "degree": smoother_degree})
     A_c = np.asarray(ml.levels[-1].A.todense())
+    if not np.isfinite(A_c).all() or not np.abs(A_c).max() > 0:
+        raise ValueError(
+            "jno.precond.amg(): the coarsest-grid operator came out "
+            f"{'non-finite' if not np.isfinite(A_c).all() else 'identically zero'} ({A_c.shape}), so the "
+            "coarse-grid correction would contribute nothing. The aggregation did not find usable "
+            "structure in this operator -- see the diagonal check above for the usual cause."
+        )
     levels.append({"Ainv": jnp.asarray(np.linalg.pinv(A_c))})  # pinv: robust to a gauge null space
     return levels
 
